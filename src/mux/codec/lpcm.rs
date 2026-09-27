@@ -196,6 +196,9 @@ pub struct LpcmParser {
     /// is stamped at the anchor plus the emitted duration — never 0 or a duplicate.
     anchor_ns: i64,
     samples_since_anchor: u64,
+    /// Last BD header byte 2 (channel_assignment|rate), reported as codec_private so
+    /// an M2TS re-mux keeps the exact layout (e.g. 2/2 vs 3/1).
+    bd_layout_byte: Option<u8>,
 }
 
 impl Default for LpcmParser {
@@ -212,6 +215,7 @@ impl LpcmParser {
             carry: Vec::new(),
             anchor_ns: 0,
             samples_since_anchor: 0,
+            bd_layout_byte: None,
         }
     }
 
@@ -251,6 +255,9 @@ impl CodecParser for LpcmParser {
         let Some(format) = parsed else {
             return Vec::new();
         };
+        if self.bd {
+            self.bd_layout_byte = Some(pes.data[2]);
+        }
         let predicted = self.predicted_pts();
         if Some(format) != self.format || pes.discontinuity {
             self.carry.clear();
@@ -258,10 +265,8 @@ impl CodecParser for LpcmParser {
         self.format = Some(format);
         let (unit, unit_frames) = format.unit();
         let (channels, rate) = format.channels_rate();
-        // The PTS belongs to the first unit STARTING in this PES; a carried partial
-        // unit leads the output, so the run starts one unit earlier. DVD's
-        // first_access_unit_pointer is not applied (ffmpeg/VLC don't either): the
-        // PTS lands at most one LPCM audio frame late.
+        // PTS belongs to the first unit STARTING here, so a carried unit starts one earlier.
+        // DVD first_access_unit_pointer is ignored (as ffmpeg/VLC): <= 1 audio frame late.
         let lead = if self.carry.is_empty() {
             0
         } else {
@@ -302,14 +307,29 @@ impl CodecParser for LpcmParser {
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
-        None
+        self.bd_layout_byte.map(|b| vec![b])
     }
 }
 
+/// Channel count and rate from a BD LPCM PES payload's header (scan-time probe).
+pub(crate) fn bd_probe(pes_data: &[u8]) -> Option<(u8, u32)> {
+    if pes_data.len() < BD_LPCM_HEADER_SIZE {
+        return None;
+    }
+    let (channels, rate) = Format::bd(pes_data)?.channels_rate();
+    Some((channels as u8, rate))
+}
+
 /// BD LPCM header bytes 2-3 for re-muxing parser output (24-bit) to M2TS, or `None`
-/// when BD LPCM can't carry the layout/rate. Channel count picks the ffmpeg default
-/// layout (pcm-blurayenc.c codes).
-pub(crate) fn bd_header(channels: u8, rate_hz: u32) -> Option<[u8; 2]> {
+/// when BD LPCM can't carry it. Reuses the source layout byte (the parser's
+/// codec_private) when it agrees; else the ffmpeg pcm-blurayenc.c default for the count.
+pub(crate) fn bd_header(channels: u8, rate_hz: u32, source: Option<u8>) -> Option<[u8; 2]> {
+    if let Some(b) = source
+        && bd_layout(b >> 4).map(|(c, _)| c) == Some(usize::from(channels))
+        && bd_rate(b & 0x0F) == Some(rate_hz)
+    {
+        return Some([b, 3 << 6]);
+    }
     let assign = match channels {
         1 => 1,
         2 => 3,
@@ -331,7 +351,7 @@ pub(crate) fn bd_header(channels: u8, rate_hz: u32) -> Option<[u8; 2]> {
 }
 
 /// Re-pack 24-bit WAVE-order PCM as BD LPCM PES payloads (header + BD order + pad
-/// channel), split so each fits the 16-bit payload_size. Returns
+/// channel) of 5 ms each (rate/200 samples), as BD authoring does. Returns
 /// `(ns offset of the payload, payload)`; a trailing partial frame is dropped.
 pub(crate) fn bd_payloads(pcm: &[u8], header: [u8; 2]) -> Vec<(i64, Vec<u8>)> {
     let (Some((channels, map)), Some(rate)) =
@@ -340,7 +360,7 @@ pub(crate) fn bd_payloads(pcm: &[u8], header: [u8; 2]) -> Vec<(i64, Vec<u8>)> {
         return Vec::new();
     };
     let coded = (channels + (channels & 1)) * 3;
-    let per_pes = usize::from(u16::MAX) / coded;
+    let per_pes = rate as usize / 200;
     let mut out = Vec::new();
     for (n, chunk) in pcm.chunks(per_pes * channels * 3).enumerate() {
         let frames = chunk.len() / (channels * 3);
@@ -524,11 +544,6 @@ mod tests {
             d.parse(&make_pes(dvd(0xC1, &pcm), Some(0))).is_empty(),
             "quant 3"
         );
-    }
-
-    #[test]
-    fn codec_private_none() {
-        assert!(LpcmParser::new().codec_private().is_none());
     }
 
     #[test]
@@ -722,19 +737,42 @@ mod tests {
 
     #[test]
     fn bd_payloads_split_to_fit_payload_size_and_round_trip() {
-        let h = bd_header(8, 48_000).unwrap();
-        assert!(bd_header(2, 44_100).is_none(), "BD LPCM has no 44.1 kHz");
-        assert!(bd_header(0, 48_000).is_none());
+        let h = bd_header(8, 48_000, None).unwrap();
+        assert!(
+            bd_header(2, 44_100, None).is_none(),
+            "BD LPCM has no 44.1 kHz"
+        );
+        assert!(bd_header(0, 48_000, None).is_none());
         let pcm: Vec<u8> = (0..3000 * 8 * 3).map(|i| (i % 253) as u8).collect();
         let parts = bd_payloads(&pcm, h);
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[1].0, samples_to_ns(65535 / 24, 48_000));
+        assert_eq!(parts.len(), 13, "12 x 240 + 120 samples");
+        assert_eq!(parts[1].0, 5_000_000);
         let mut p = LpcmParser::new();
         let got: Vec<u8> = parts
             .into_iter()
             .flat_map(|(_, d)| all(&p.parse(&make_pes(d, Some(0)))))
             .collect();
         assert_eq!(got, pcm);
+    }
+
+    #[test]
+    fn bd_payloads_are_5ms_pes_like_ffmpeg_blurayenc() {
+        // 20000 stereo samples @ 48 kHz -> 83 full 240-sample PES + one of 80.
+        let h = bd_header(2, 48_000, None).unwrap();
+        let parts = bd_payloads(&vec![0u8; 20_000 * 2 * 3], h);
+        assert_eq!(parts.len(), 84);
+        assert!(parts[..83].iter().all(|(_, p)| p.len() == 4 + 240 * 6));
+        assert_eq!(parts[83].1.len(), 4 + 80 * 6);
+        assert_eq!(parts[1].0, 5_000_000, "second PES 5 ms later");
+    }
+
+    #[test]
+    fn bd_parser_reports_the_channel_assignment() {
+        let mut p = LpcmParser::new();
+        assert_eq!(p.codec_private(), None);
+        p.parse(&make_pes(bd(7, 1, &[0; 8]), Some(0)));
+        assert_eq!(p.codec_private(), Some(vec![0x71]));
+        assert_eq!(LpcmParser::new_dvd().codec_private(), None);
     }
 
     #[test]

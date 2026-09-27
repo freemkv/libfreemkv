@@ -935,7 +935,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::write_uint(&mut writer, ebml::FLAG_FORCED, 1)?;
             }
 
-            if let Some(ref cp) = track.codec_private {
+            // A_PCM defines no CodecPrivate; the LPCM parser's is BD re-mux metadata.
+            if let Some(ref cp) = track.codec_private
+                && track.codec_id != ebml::CODEC_PCM_BE
+            {
                 match mvc_record.as_ref() {
                     // MVC (Blu-ray 3D) base track: CodecPrivate = base-view avcC + `mvcC`
                     // extension, the track-level signal decoders read to recognise the
@@ -2486,6 +2489,21 @@ mod tests {
         assert!(
             bytes.windows(4).any(|w| w == [0x62, 0x64, 0x81, 24]),
             "BitDepth=24 element present"
+        );
+    }
+
+    #[test]
+    fn lpcm_track_omits_codec_private() {
+        // The LPCM parser's codec_private is BD re-mux metadata (channel_assignment);
+        // A_PCM defines no CodecPrivate, so it must not reach the track header.
+        let mut track = MkvTrack::audio(&audio_stream(Codec::Lpcm));
+        track.codec_private = Some(vec![0x91]);
+        let mut buf = Cursor::new(Vec::new());
+        MkvMuxer::new(&mut buf, &[track], None, 0.0, &[]).unwrap();
+        let bytes = buf.into_inner();
+        assert!(
+            !bytes.windows(2).any(|w| w == [0x63, 0xA2]),
+            "no CodecPrivate"
         );
     }
 
