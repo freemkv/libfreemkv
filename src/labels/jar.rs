@@ -10,7 +10,7 @@
 use super::class_reader::ClassFile;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use zip::ZipArchive;
 
 // Cap on bytes read from one `.class` entry — the jar's declared size is attacker-controlled,
@@ -35,33 +35,157 @@ pub fn for_each_jar<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, mut f: F) 
 where
     F: FnMut(&str, &mut Jar) -> Option<R>,
 {
-    visit_jars(reader, udf, |name, jar| f(name, jar?))
+    let jar_dir = udf.find_dir("/BDMV/JAR")?;
+    for entry in jar_dir.entries.iter().filter(|e| is_jar(e)) {
+        let path = format!("/BDMV/JAR/{}", entry.name);
+        let Ok(bytes) = udf.read_file(reader, &path) else {
+            continue;
+        };
+        let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
+            continue;
+        };
+        if let Some(r) = f(&entry.name, &mut archive) {
+            return Some(r);
+        }
+    }
+    None
 }
 
+fn is_jar(e: &crate::udf::DirEntry) -> bool {
+    !e.is_dir && e.name.to_lowercase().ends_with(".jar")
+}
+
+/// A seekable byte source for a jar: in memory, or read from disc on demand.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// A jar opened by [`visit_jars`].
+pub type DiscJar<'a> = ZipArchive<Box<dyn ReadSeek + 'a>>;
+
+// Jars up to this size are read whole; larger ones (image-heavy menus, past the
+// UDF whole-file cap) are opened in place, reading only the directory and entries used.
+const IN_MEMORY_JAR_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Like [`for_each_jar`] but also yields jars that could not be read or opened
-/// (as `None`), so a caller can tell a skipped jar from an absent one.
-pub fn visit_jars<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, mut f: F) -> Option<R>
+/// (as `None`), so a caller can tell a skipped jar from an absent one. Large jars
+/// are read in place rather than skipped.
+pub fn visit_jars<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, f: F) -> Option<R>
 where
-    F: FnMut(&str, Option<&mut Jar>) -> Option<R>,
+    F: FnMut(&str, Option<&mut DiscJar<'_>>) -> Option<R>,
+{
+    visit_jars_limited(reader, udf, IN_MEMORY_JAR_BYTES, f)
+}
+
+pub(crate) fn visit_jars_limited<R, F>(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    in_memory_max: u64,
+    mut f: F,
+) -> Option<R>
+where
+    F: FnMut(&str, Option<&mut DiscJar<'_>>) -> Option<R>,
 {
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
-    for entry in &jar_dir.entries {
-        if entry.is_dir {
-            continue;
-        }
-        if !entry.name.to_lowercase().ends_with(".jar") {
-            continue;
-        }
+    for entry in jar_dir.entries.iter().filter(|e| is_jar(e)) {
         let path = format!("/BDMV/JAR/{}", entry.name);
-        let mut archive = udf
-            .read_file(reader, &path)
-            .ok()
-            .and_then(|bytes| ZipArchive::new(Cursor::new(bytes)).ok());
+        let src: Option<Box<dyn ReadSeek + '_>> = if entry.size <= in_memory_max {
+            udf.read_file(reader, &path)
+                .ok()
+                .map(|b| Box::new(Cursor::new(b)) as Box<dyn ReadSeek>)
+        } else {
+            udf.file_extents(reader, &path).ok().map(|x| {
+                Box::new(ExtentReader::new(&mut *reader, x, entry.size)) as Box<dyn ReadSeek>
+            })
+        };
+        let mut archive = src.and_then(|s| ZipArchive::new(s).ok());
         if let Some(r) = f(&entry.name, archive.as_mut()) {
             return Some(r);
         }
     }
     None
+}
+
+// Sectors fetched per on-demand read.
+const CHUNK_SECTORS: u32 = 32;
+
+/// `Read + Seek` over a UDF file's absolute `(lba, sectors)` extents, fetching
+/// sectors on demand (one cached chunk). Reads end at the file's byte `size`.
+pub struct ExtentReader<'a> {
+    reader: &'a mut dyn SectorSource,
+    extents: Vec<(u32, u32)>,
+    size: u64,
+    pos: u64,
+    buf: Vec<u8>,
+    buf_start: u64,
+}
+
+impl<'a> ExtentReader<'a> {
+    pub fn new(reader: &'a mut dyn SectorSource, extents: Vec<(u32, u32)>, size: u64) -> Self {
+        Self {
+            reader,
+            extents,
+            size,
+            pos: 0,
+            buf: Vec::new(),
+            buf_start: 0,
+        }
+    }
+
+    // Load the chunk holding `self.pos`.
+    fn fill(&mut self) -> std::io::Result<()> {
+        let mut base = 0u64;
+        for &(lba, secs) in &self.extents {
+            let len = secs as u64 * 2048;
+            if self.pos < base + len {
+                let sec_off = ((self.pos - base) / 2048) as u32;
+                let count = (secs - sec_off).min(CHUNK_SECTORS);
+                let start = lba
+                    .checked_add(sec_off)
+                    .ok_or(std::io::ErrorKind::InvalidData)?;
+                let mut buf = vec![0u8; count as usize * 2048];
+                self.reader
+                    .read_sectors(start, count as u16, &mut buf, true)?;
+                self.buf = buf;
+                self.buf_start = base + sec_off as u64 * 2048;
+                return Ok(());
+            }
+            base += len;
+        }
+        Err(std::io::ErrorKind::UnexpectedEof.into())
+    }
+}
+
+impl Read for ExtentReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.size || out.is_empty() {
+            return Ok(0);
+        }
+        let cached =
+            self.pos >= self.buf_start && self.pos < self.buf_start + self.buf.len() as u64;
+        if !cached {
+            self.fill()?;
+        }
+        let off = (self.pos - self.buf_start) as usize;
+        let n = out
+            .len()
+            .min(self.buf.len() - off)
+            .min((self.size - self.pos) as usize);
+        out[..n].copy_from_slice(&self.buf[off..off + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for ExtentReader<'_> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.size.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos = pos.ok_or(std::io::ErrorKind::InvalidInput)?;
+        Ok(self.pos)
+    }
 }
 
 /// True if any entry in this jar's central directory starts with
@@ -105,7 +229,11 @@ where
 
 /// [`try_each_class`] charging every inflated byte to `budget`; stops (None)
 /// once it is spent, so a caller sweeping many jars bounds total inflation.
-pub fn try_each_class_budgeted<R, F>(archive: &mut Jar, budget: &mut u64, mut f: F) -> Option<R>
+pub fn try_each_class_budgeted<Z: Read + Seek, R, F>(
+    archive: &mut ZipArchive<Z>,
+    budget: &mut u64,
+    mut f: F,
+) -> Option<R>
 where
     F: FnMut(&str, &ClassFile) -> Option<R>,
 {
@@ -122,8 +250,8 @@ where
 /// This is the Tier-1 menu-walk sweep: newer discs embed the same
 /// `dcx.xml`/`playlists.xml` manifests INSIDE a jar rather than as loose
 /// `/BDMV/JAR/<id>/` files. Unreadable entries are silently ignored.
-pub fn try_each_resource<R, F>(
-    archive: &mut Jar,
+pub fn try_each_resource<Z: Read + Seek, R, F>(
+    archive: &mut ZipArchive<Z>,
     want: impl Fn(&str) -> bool,
     cap: u64,
     budget: &mut u64,
@@ -137,11 +265,11 @@ where
     try_each_entry(archive, is_resource, cap, budget, f)
 }
 
-// Shared entry loop: filter by central-directory name, then inflate at most
-// min(cap, budget) bytes into a growing buffer (the declared size is untrusted).
-// A spent budget stops the walk without offering the possibly truncated entry.
-fn try_each_entry<R>(
-    archive: &mut Jar,
+// Shared entry loop: filter by central-directory name, then inflate at most `cap`
+// bytes into a growing buffer (the declared size is untrusted). An entry the budget
+// cannot cover is not offered and stops the walk; one that exactly fits is complete.
+fn try_each_entry<Z: Read + Seek, R>(
+    archive: &mut ZipArchive<Z>,
     want: impl Fn(&str) -> bool,
     cap: u64,
     budget: &mut u64,
@@ -160,9 +288,15 @@ fn try_each_entry<R>(
         };
         let name = entry.name().to_string();
         let mut bytes = Vec::new();
-        let read = entry.take(cap.min(*budget)).read_to_end(&mut bytes);
-        *budget = budget.saturating_sub(bytes.len() as u64);
-        if read.is_err() || *budget == 0 {
+        let read = entry
+            .take(cap.min(budget.saturating_add(1)))
+            .read_to_end(&mut bytes);
+        if bytes.len() as u64 > *budget {
+            *budget = 0;
+            return None;
+        }
+        *budget -= bytes.len() as u64;
+        if read.is_err() {
             continue;
         }
         if let Some(r) = f(&name, &bytes) {
@@ -422,12 +556,20 @@ mod tests {
         });
         assert_eq!((visited, budget), (0, 0));
 
+        // An entry that exactly fills the remaining budget is complete: offered.
+        let mut budget = payload.len() as u64;
+        let _: Option<()> = try_each_class_budgeted(&mut jar, &mut budget, |_, _| {
+            visited += 1;
+            None
+        });
+        assert_eq!((visited, budget), (1, 0));
+
         let mut budget = 1_000_000u64;
         let _: Option<()> = try_each_class_budgeted(&mut jar, &mut budget, |_, _| {
             visited += 1;
             None
         });
-        assert_eq!(visited, 1);
+        assert_eq!(visited, 2);
         assert_eq!(budget, 1_000_000 - payload.len() as u64);
     }
 }

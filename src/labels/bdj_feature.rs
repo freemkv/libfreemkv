@@ -94,7 +94,7 @@ const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
 // The first embedded manifest in this jar that names a real playlist.
 fn tier1_manifest_sweep(
-    archive: &mut jar::Jar,
+    archive: &mut jar::DiscJar<'_>,
     real: &HashSet<u16>,
     budget: &mut u64,
 ) -> Option<FeaturePlaylistHint> {
@@ -300,7 +300,7 @@ fn autostart_jar_ids(reader: &mut dyn SectorSource, udf: &UdfFs) -> HashSet<Stri
 
 // Harvest playlist-id candidates from one jar's `.class` constant pools, stopping
 // at MAX_CANDIDATES or when the inflation budget is spent.
-fn harvest_candidates(archive: &mut jar::Jar, ids: &mut HashSet<u16>, budget: &mut u64) {
+fn harvest_candidates(archive: &mut jar::DiscJar<'_>, ids: &mut HashSet<u16>, budget: &mut u64) {
     let _: Option<()> = jar::try_each_class_budgeted(archive, budget, |_class_name, class| {
         for (_, cp) in class.constant_pool.iter() {
             if let CpInfo::Utf8(s) = cp {
@@ -920,6 +920,24 @@ mod tests {
         let jar_lba = udf.partition_start() + 2000;
         let reads = counting.1.iter().filter(|&&l| l == jar_lba).count();
         assert_eq!(reads, 1);
+    }
+
+    // A jar too large to read whole is opened in place (directory + used entries
+    // only), not treated as unreadable.
+    #[test]
+    fn large_jar_is_read_in_place() {
+        let class = build_class(&["bd://JAR:00000/00800.mpls"]);
+        let mut pad = vec![0u8; 3 * 2048 + 17];
+        pad[0] = 1;
+        let jar = build_jar(&[("assets/bg.png", pad), ("com/studio/MainXlet.class", class)]);
+        let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", jar)], vec![]);
+        let (mut ids, mut budget) = (HashSet::new(), u64::MAX);
+        let seen = jar::visit_jars_limited(&mut disc, &udf, 0, |_, archive| {
+            harvest_candidates(archive?, &mut ids, &mut budget);
+            Some(())
+        });
+        assert_eq!(seen, Some(()));
+        assert!(ids.contains(&800), "{ids:?}");
     }
 
     // A spent inflation budget abstains instead of scanning on.
