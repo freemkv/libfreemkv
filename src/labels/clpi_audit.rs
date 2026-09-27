@@ -5,8 +5,8 @@
 //! `(coding_type, language)` seen per source, then classifies each key as CLPI-only,
 //! MPLS-only, Match, or Divergent.
 //!
-//! Each PlayItem has its own STN_table and only the first item's is parsed, so only
-//! clips that are some playlist's first play item are auditable; other clips are
+//! Each PlayItem has its own STN_table and only the first item's is parsed, so only a
+//! playlist's first-item clip whose STN kept a stream is auditable; other clips are
 //! left out entirely (CLPI-only means a real orphan PID, not "never compared").
 //!
 //! [`audit`] returns [`ClpiVsMplsAudit`]; diagnostic only, not used by
@@ -138,7 +138,10 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
         let Ok(pl) = crate::mpls::parse(&data) else {
             continue;
         };
-        if let Some(pi) = pl.play_items.first() {
+        // A first clip is covered only if its STN kept a stream to compare.
+        if let Some(pi) = pl.play_items.first()
+            && pl.streams.iter().any(|s| s.pid != 0)
+        {
             mpls_clips.push(pi.clip_id.clone());
             for s in pl.streams.iter().filter(|s| s.pid != 0) {
                 mpls_by_key
@@ -441,6 +444,11 @@ mod tests {
 
     // As `build_mpls`, over several play items (STN on the first, as parsed).
     fn build_mpls_items(clips: &[&[u8; 5]], pid: u16, coding: u8, lang: &[u8; 3]) -> Vec<u8> {
+        build_mpls_stn(clips, Some((pid, coding, lang)))
+    }
+
+    // As above; `None` builds a first item whose STN keeps no stream.
+    fn build_mpls_stn(clips: &[&[u8; 5]], stream: Option<(u16, u8, &[u8; 3])>) -> Vec<u8> {
         let mut item = Vec::new();
         item.extend_from_slice(clips[0]);
         item.extend_from_slice(b"M2TS");
@@ -448,11 +456,14 @@ mod tests {
         item.extend_from_slice(&0u32.to_be_bytes());
         item.extend_from_slice(&(7000u32 * 45000).to_be_bytes());
         item.extend_from_slice(&[0u8; 12]); // UO mask, misc, still
-        let mut stn = vec![0u8, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        stn.extend_from_slice(&[3, 0x01]);
-        stn.extend_from_slice(&pid.to_be_bytes());
-        stn.extend_from_slice(&[5, coding, 0x61]);
-        stn.extend_from_slice(lang);
+        let n_audio = u8::from(stream.is_some());
+        let mut stn = vec![0u8, 0, 0, 0, 0, n_audio, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        if let Some((pid, coding, lang)) = stream {
+            stn.extend_from_slice(&[3, 0x01]);
+            stn.extend_from_slice(&pid.to_be_bytes());
+            stn.extend_from_slice(&[5, coding, 0x61]);
+            stn.extend_from_slice(lang);
+        }
         item.extend_from_slice(&stn);
         let mut pl = vec![0u8; 6];
         pl.extend_from_slice(&(clips.len() as u16).to_be_bytes());
@@ -588,5 +599,65 @@ mod tests {
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         let a = audit(&mut disc, &udf);
         assert_eq!(a.class_counts(), (0, 0, 1, 0), "{:?}", a.rows);
+    }
+
+    // A covered clip's orphan PID is a real CLPI-only row; a first clip whose STN
+    // kept no stream is not covered, so its CLPI streams get no row.
+    #[test]
+    fn covered_clip_orphan_is_clpi_only_and_streamless_stn_covers_nothing() {
+        use crate::consts::coding_type as c;
+        use crate::udf::fixture::*;
+        let build_clpi = super::super::clpi_orphan_tests::build_clpi;
+        let dir = |name: &str, icb: u32, files| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs: vec![],
+        };
+        let one = build_clpi(&[(0x1100, c::TRUEHD, "eng"), (0x1200, c::PG, "eng")]);
+        let two = build_clpi(&[(0x1100, c::AC3, "fra")]);
+        let clipinf = dir(
+            "CLIPINF",
+            24,
+            vec![
+                file_with("00001.clpi", 26, 8000, one, false),
+                file_with("00002.clpi", 27, 8100, two, false),
+            ],
+        );
+        let a = build_mpls_stn(&[b"00001"], Some((0x1100, c::TRUEHD, b"eng")));
+        let b = build_mpls_stn(&[b"00002"], None);
+        let playlist = dir(
+            "PLAYLIST",
+            30,
+            vec![
+                file_with("00800.mpls", 32, 8200, a, false),
+                file_with("00801.mpls", 33, 8300, b, false),
+            ],
+        );
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![clipinf, playlist],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let a = audit(&mut disc, &udf);
+        let orphan = a.rows.iter().find(|r| r.pid == 0x1200).expect("orphan row");
+        assert_eq!(
+            (orphan.clip.as_str(), orphan.class()),
+            ("00001", ClpiVsMplsClass::ClpiOnly)
+        );
+        assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
     }
 }
