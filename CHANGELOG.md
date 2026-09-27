@@ -11,6 +11,7 @@
 
 ### Added
 
+- `AudioChannels` gains 3.0, 3.1, 4.1, 6.0 and 7.0; TrueHD layouts keep their LFE split. An older network:// receiver parses these layout strings as unknown, so keep both ends on the same version.
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
 
 ## [1.7.7] — 2026-09-26

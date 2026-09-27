@@ -640,7 +640,10 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
         // (1) Channels — only when the major sync resolves a different layout.
         if let Some(count) = truehd_channels(info.format_info) {
             let lfe = truehd_lfe(info.format_info);
-            let new_ch = AudioChannels::from_layout(count.saturating_sub(lfe), lfe);
+            let new_ch = match AudioChannels::from_layout(count.saturating_sub(lfe), lfe) {
+                AudioChannels::Unknown => AudioChannels::from_count(count),
+                named => named,
+            };
             if new_ch != AudioChannels::Unknown && new_ch != a.channels {
                 a.channels = new_ch;
             }
@@ -1130,8 +1133,8 @@ impl AudioChannels {
         }
     }
 
-    /// Exact layout from full-range and LFE channel counts (the `N.M` label);
-    /// `Unknown` when no variant names it, rather than a count-based guess.
+    /// Exact layout from full-range (heights included) and LFE channel counts,
+    /// the `N.M` label; `Unknown` when no variant names it.
     pub(crate) fn from_layout(full: u8, lfe: u8) -> Self {
         match (full, lfe) {
             (1, 0) => AudioChannels::Mono,
@@ -8307,7 +8310,7 @@ mod tests {
     #[test]
     fn correct_truehd_channels_leaves_channels_when_count_unmapped() {
         let pid = 0x1100u16;
-        // All 13 8ch bits set -> 18 full + 2 LFE -> from_layout(18, 2)
+        // All 13 8ch bits set -> 20 channels: no N.M variant, from_count(20)
         // -> Unknown. Rate nibble 0x0 -> 48 kHz (matches the container, so
         // this test isolates the channels guard from the rate guard).
         let format_info = 0x1FFF;
@@ -8407,7 +8410,8 @@ mod tests {
             (0x8B, "6.0"),
             (0x4B, "7.0"),
             (0x0F, "5.1"),
-            (0x1F, "7.1"),
+            (0x4F, "7.1"),
+            (0x1F, "7.1"), // 5.1.2: heights flatten to full-range
         ] {
             let a = truehd_corrected(mask);
             assert_eq!(a.channels.to_string(), want, "mask {mask:#x}");
@@ -8415,12 +8419,13 @@ mod tests {
         }
     }
 
-    // A layout with no N.M variant (5.2 via LFE2) keeps the container value
-    // rather than asserting a wrong one ("6.1" by count).
+    // A layout with no N.M variant (5.2 via LFE2) falls back to the count, so
+    // the MKV Channels element stays 7 rather than the container's 6.
     #[test]
-    fn correct_truehd_channels_keeps_container_for_unnameable_layout() {
+    fn correct_truehd_channels_counts_unnameable_layout() {
         let a = truehd_corrected(0x100F);
-        assert_eq!(a.channels.to_string(), "5.1");
+        assert_eq!(a.channels.count(), 7);
+        assert_eq!(a.channels.to_string(), "6.1");
     }
 
     // bytes_bad_in_title empty-input guard: the `||`-to-`&&` mutant here is
