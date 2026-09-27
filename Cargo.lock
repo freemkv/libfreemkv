@@ -328,6 +328,7 @@ dependencies = [
  "memchr",
  "rayon",
  "roxmltree",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

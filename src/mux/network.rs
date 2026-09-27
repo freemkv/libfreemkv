@@ -9,6 +9,7 @@
 use super::meta;
 use crate::disc::DiscTitle;
 use crate::halt::{Halt, POLL_INTERVAL};
+use rustix::event::{PollFd, PollFlags, Timespec};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 
@@ -48,26 +49,45 @@ fn arm_keepalive(stream: &TcpStream) {
     }
 }
 
-// Read-timeout expiry: EAGAIN on Unix, WSAETIMEDOUT on Windows. A Unix TimedOut is
-// a dead peer. Windows SO_ERROR on keepalive failure is unverified; the next read
-// still surfaces a dead peer as WSAENETRESET.
-fn is_poll_tick(kind: io::ErrorKind, windows: bool, socket_failed: bool) -> bool {
-    match kind {
-        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => true,
-        io::ErrorKind::TimedOut => windows && !socket_failed,
-        _ => false,
+// Poll outcome: `Ok(true)` reads now (data, EOF or a socket error for `read` to
+// surface), `Ok(false)` is a halt-check tick. Readiness, not SO_RCVTIMEO: on
+// Windows a receive timeout can cancel a completing recv and lose its data.
+fn poll_says_read(res: io::Result<usize>, revents: PollFlags) -> io::Result<bool> {
+    match res {
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(e) => Err(e),
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(!revents.is_empty()),
     }
 }
 
-// Receive side: polls the socket every POLL_INTERVAL so a halt is observed
+// Receive side: waits for readability in `tick` slices so a halt is observed
 // instead of blocking in `read` forever.
 struct HaltRead {
     stream: TcpStream,
     halt: Option<Halt>,
     halted: bool,
+    tick: Timespec,
 }
 
 impl HaltRead {
+    fn new(stream: TcpStream, halt: Option<Halt>) -> Self {
+        Self::with_tick(stream, halt, POLL_INTERVAL)
+    }
+
+    fn with_tick(stream: TcpStream, halt: Option<Halt>, tick: std::time::Duration) -> Self {
+        let tick = Timespec {
+            tv_sec: tick.as_secs() as _,
+            tv_nsec: tick.subsec_nanos() as _,
+        };
+        Self {
+            stream,
+            halt,
+            halted: false,
+            tick,
+        }
+    }
+
     // `e`, or `Error::Halted` when the read was aborted by the halt.
     fn halted_or(&self, e: io::Error) -> io::Error {
         if self.halted {
@@ -80,23 +100,20 @@ impl HaltRead {
 
 impl Read for HaltRead {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(halt) = &self.halt else {
+            return self.stream.read(buf);
+        };
         loop {
-            if self.halt.as_ref().is_some_and(Halt::is_cancelled) {
+            if halt.is_cancelled() {
                 // Halted maps to ErrorKind::Interrupted, which std's read_exact
                 // retries forever; abort with another kind and remap in `halted_or`.
                 self.halted = true;
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
-            match self.stream.read(buf) {
-                Err(e) if self.halt.is_some() => {
-                    let failed = cfg!(windows)
-                        && e.kind() == io::ErrorKind::TimedOut
-                        && !matches!(self.stream.take_error(), Ok(None));
-                    if !is_poll_tick(e.kind(), cfg!(windows), failed) {
-                        return Err(e);
-                    }
-                }
-                r => return r,
+            let mut fds = [PollFd::new(&self.stream, PollFlags::IN)];
+            let res = rustix::event::poll(&mut fds, Some(&self.tick)).map_err(io::Error::from);
+            if poll_says_read(res, fds[0].revents())? {
+                return self.stream.read(buf);
             }
         }
     }
@@ -291,24 +308,16 @@ impl NetworkStream {
                 Err(e) => return Err(e),
             }
         };
-        // Accepted sockets can inherit O_NONBLOCK (BSD/macOS); reads use a timeout.
+        // Accepted sockets can inherit O_NONBLOCK (BSD/macOS); reads wait on readiness.
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(POLL_INTERVAL))?;
         arm_keepalive(&stream);
         Self::read_from(stream, halt)
     }
 
     // Wrap an accepted connection and read its FMKV header.
     fn read_from(stream: TcpStream, halt: Option<Halt>) -> io::Result<Self> {
-        let mut reader = BufReader::with_capacity(
-            NET_BUF_SIZE,
-            HaltRead {
-                stream,
-                halt,
-                halted: false,
-            },
-        );
+        let mut reader = BufReader::with_capacity(NET_BUF_SIZE, HaltRead::new(stream, halt));
 
         // Read FMKV metadata header
         let meta = meta::read_header(&mut reader)
@@ -1029,25 +1038,88 @@ mod tests {
         assert!(handle.join().unwrap(), "keepalive must be armed");
     }
 
-    // A TimedOut is a read-timeout tick only on Windows and only while the
-    // socket holds no error; a keepalive failure (or any Unix TimedOut) surfaces.
+    // Windows may drop data when SO_RCVTIMEO cancels a recv, so a halt-aware
+    // receiver waits on readiness instead and never arms a read timeout.
     #[test]
-    fn timed_out_is_a_poll_tick_only_on_a_healthy_windows_socket() {
+    fn a_halt_aware_receiver_sets_no_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let halt = crate::halt::Halt::new();
+            let ns = NetworkStream::accept_from_with_halt(listener, Some(halt)).unwrap();
+            match &ns.mode {
+                Mode::Read { reader, .. } => reader.get_ref().stream.read_timeout().unwrap(),
+                Mode::Write { .. } => None,
+            }
+        });
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        crate::pes::Stream::finish(&mut writer).unwrap();
+        assert_eq!(handle.join().unwrap(), None);
+    }
+
+    // Only a readiness report reads; a timeout or EINTR ticks; a poll failure surfaces.
+    #[test]
+    fn poll_says_read_only_when_the_socket_reports_readiness() {
         use io::ErrorKind::{ConnectionReset, Interrupted, TimedOut, WouldBlock};
-        for (kind, windows, failed, tick) in [
-            (WouldBlock, false, false, true),
-            (Interrupted, true, false, true),
-            (TimedOut, true, false, true),
-            (TimedOut, true, true, false),
-            (TimedOut, false, false, false),
-            (ConnectionReset, true, false, false),
+        let ok = |n: usize, f: PollFlags| poll_says_read(Ok(n), f).unwrap();
+        assert!(!ok(0, PollFlags::empty()), "timeout is a tick");
+        assert!(!ok(1, PollFlags::empty()));
+        for f in [
+            PollFlags::IN,
+            PollFlags::HUP,
+            PollFlags::ERR,
+            PollFlags::NVAL,
         ] {
-            assert_eq!(
-                is_poll_tick(kind, windows, failed),
-                tick,
-                "{kind:?} windows={windows} failed={failed}"
-            );
+            assert!(ok(1, f), "{f:?} must hand over to read");
         }
+        assert!(!poll_says_read(Err(Interrupted.into()), PollFlags::empty()).unwrap());
+        for kind in [WouldBlock, TimedOut, ConnectionReset] {
+            let e = poll_says_read(Err(kind.into()), PollFlags::empty()).unwrap_err();
+            assert_eq!(e.kind(), kind);
+        }
+    }
+
+    // A sender dribbling bytes with gaps many ticks long is read byte-identically.
+    #[test]
+    fn a_slow_sender_across_many_poll_ticks_arrives_byte_identical() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        let sent = data.clone();
+        let sender = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let mut off = 0;
+            for i in 0usize.. {
+                if off == sent.len() {
+                    break;
+                }
+                let n = (1 + i * 37 % 4093).min(sent.len() - off);
+                s.write_all(&sent[off..off + n]).unwrap();
+                off += n;
+                if i % 8 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(6));
+                }
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let tick = std::time::Duration::from_millis(1);
+        let mut r = HaltRead::with_tick(stream, Some(crate::halt::Halt::new()), tick);
+        let mut got = Vec::new();
+        let mut small = [0u8; 1500];
+        loop {
+            match r.read(&mut small).unwrap() {
+                0 => break,
+                n => got.extend_from_slice(&small[..n]),
+            }
+        }
+        sender.join().unwrap();
+        assert_eq!(got.len(), data.len());
+        assert!(
+            got == data,
+            "stream bytes must survive the poll ticks unchanged"
+        );
     }
 
     // A halt-aware receiver arms keepalive (dead-peer detection) and sets no
