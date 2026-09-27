@@ -1,10 +1,13 @@
 //! CLPI vs MPLS cross-validation diagnostic.
 //!
-//! Walks per-clip CLPI program info and per-playlist MPLS STN tables (each PlayItem has
-//! its own; only the first item's is parsed, so it is compared with that item's clip),
-//! keys streams by `(clip, PID)` — a PID is only unique within one clip — keeping the first
+//! Walks per-clip CLPI program info and per-playlist MPLS STN tables, keys streams by
+//! `(clip, PID)` — a PID is only unique within one clip — keeping the first
 //! `(coding_type, language)` seen per source, then classifies each key as CLPI-only,
 //! MPLS-only, Match, or Divergent.
+//!
+//! Each PlayItem has its own STN_table and only the first item's is parsed, so only
+//! clips that are some playlist's first play item are auditable; other clips are
+//! left out entirely (CLPI-only means a real orphan PID, not "never compared").
 //!
 //! [`audit`] returns [`ClpiVsMplsAudit`]; diagnostic only, not used by
 //! label selection.
@@ -130,11 +133,13 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
 
     // MPLS: `streams` is the first PlayItem's STN_table, so it describes that clip.
     let mut mpls_by_key: BTreeMap<(String, u16), (u8, String)> = BTreeMap::new();
+    let mut mpls_clips: Vec<String> = Vec::new();
     for (_, data) in read_dir_files(reader, udf, "/BDMV/PLAYLIST", ".mpls") {
         let Ok(pl) = crate::mpls::parse(&data) else {
             continue;
         };
         if let Some(pi) = pl.play_items.first() {
+            mpls_clips.push(pi.clip_id.clone());
             for s in pl.streams.iter().filter(|s| s.pid != 0) {
                 mpls_by_key
                     .entry((pi.clip_id.clone(), s.pid))
@@ -143,8 +148,12 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
         }
     }
 
-    // Merge views: every key seen anywhere gets a row.
-    let mut keys: std::collections::BTreeSet<&(String, u16)> = clpi_by_key.keys().collect();
+    // Merge views over auditable clips (those an MPLS STN describes).
+    let covered: std::collections::BTreeSet<&str> = mpls_clips.iter().map(String::as_str).collect();
+    let mut keys: std::collections::BTreeSet<&(String, u16)> = clpi_by_key
+        .keys()
+        .filter(|k| covered.contains(k.0.as_str()))
+        .collect();
     keys.extend(mpls_by_key.keys());
     let rows = keys
         .into_iter()
@@ -528,11 +537,11 @@ mod tests {
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
 
         let a = audit(&mut disc, &udf);
-        assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
+        assert_eq!(a.class_counts(), (0, 0, 1, 0), "{:?}", a.rows);
     }
 
-    // Each PlayItem has its own STN_table; the parsed (first) one describes only
-    // the first item's clip, so a later clip is not credited with it.
+    // Each PlayItem has its own STN_table; the parsed (first) one describes only the
+    // first item's clip, so a later clip is unauditable and gets no row at all.
     #[test]
     fn mpls_streams_are_keyed_by_the_first_play_item_clip_only() {
         use crate::consts::coding_type as c;
@@ -578,6 +587,6 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         let a = audit(&mut disc, &udf);
-        assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
+        assert_eq!(a.class_counts(), (0, 0, 1, 0), "{:?}", a.rows);
     }
 }
