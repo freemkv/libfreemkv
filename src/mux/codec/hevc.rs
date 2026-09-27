@@ -265,9 +265,8 @@ impl HevcParser {
     // Scans an SEI NAL for the two HDR10 payload types, capturing each the FIRST time it
     // appears.
     fn scan_sei(&mut self, nal: &[u8]) {
-        // Both HDR10 messages are sticky (first wins); once both are captured,
-        // return before `strip_emulation_prevention` (alloc+copy) — an HDR10 UHD
-        // stream carries a prefix SEI per AU, saving ~200k discarded copies per title.
+        // Both HDR10 messages are sticky (first wins); once both are captured, skip the
+        // walk entirely — an HDR10 UHD stream carries a prefix SEI per AU.
         if self.sei_mastering.is_some() && self.sei_content_light.is_some() {
             return;
         }
@@ -1179,7 +1178,7 @@ mod tests {
         );
     }
 
-    // MEASURED: `scan_sei` must stop copying the RBSP once both HDR10 messages are captured.
+    // MEASURED: `scan_sei` makes no RBSP copy once both HDR10 messages are captured.
     #[test]
     fn scan_sei_stops_copying_once_both_hdr10_messages_are_captured() {
         let pps = {
@@ -1209,7 +1208,7 @@ mod tests {
         };
 
         let mut parser = HevcParser::new();
-        // First AU: both messages captured, so this one legitimately copies.
+        // First AU captures both messages.
         parser.parse(&make_pes(au(), Some(0)));
         assert!(
             parser.sei_mastering.is_some() && parser.sei_content_light.is_some(),

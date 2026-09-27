@@ -58,15 +58,54 @@ const MPEG2_L1: [u32; 15] = [
 ];
 const MPEG2_L23: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 
-// Free-format frames carry no size: it is the spacing to the next header with the same
-// version/layer/bitrate/rate, learned once per stream (excluding padding).
-fn free_format_spacing(data: &[u8]) -> Option<usize> {
-    (4..data.len().saturating_sub(2)).find(|&i| {
-        data[i] == 0xFF && data[i + 1] == data[1] && data[i + 2] & 0xFC == data[2] & 0xFC
+// Free-format search ceiling in bit/s: above every table bitrate (max 448 kbit/s), so a
+// real free-format frame is always found within it and a false header is given up on.
+const MAX_FREE_FORMAT_BITRATE: u32 = 640_000;
+
+// Does a header continuing this free-format stream (same version/layer/bitrate/rate,
+// padding and private bits ignored) start at `i`?
+fn free_format_next_at(data: &[u8], i: usize) -> bool {
+    data.get(i..i + 3)
+        .is_some_and(|h| h[0] == 0xFF && h[1] == data[1] && h[2] & 0xFC == data[2] & 0xFC)
+}
+
+// Size of the free-format frame at `data[0]` (its size is the spacing to the next header),
+// or `bytes > data.len()` to wait. `free_size` is the learned size without padding, trusted
+// only while the next header is where it predicts. At `eos`, a lone last frame is emitted.
+fn free_format_bytes(
+    data: &[u8],
+    free_size: &mut Option<usize>,
+    pad: usize,
+    max: usize,
+    eos: bool,
+) -> Option<usize> {
+    let wait = data.len().saturating_add(1);
+    if let Some(n) = *free_size {
+        let b = n + pad;
+        if free_format_next_at(data, b) {
+            return Some(b);
+        }
+        if data.len() < b + 3 {
+            return Some(if eos && data.len() >= b { b } else { wait });
+        }
+        *free_size = None; // no header where predicted: relearn
+    }
+    let last = max.min(data.len().saturating_sub(3));
+    if let Some(d) = (pad + 5..=last).find(|&i| free_format_next_at(data, i)) {
+        *free_size = Some(d - pad);
+        return Some(d);
+    }
+    if data.len() >= max + 3 {
+        return None; // no successor within the largest legal frame: not a real header
+    }
+    Some(if eos && data.len() > pad + 4 {
+        data.len()
+    } else {
+        wait
     })
 }
 
-fn frame_header(data: &[u8], free_size: &mut Option<usize>) -> Option<Header> {
+fn frame_header(data: &[u8], free_size: &mut Option<usize>, eos: bool) -> Option<Header> {
     if !matches!(mpa_verdict(data), MpaVerdict::Valid) {
         return None;
     }
@@ -92,24 +131,19 @@ fn frame_header(data: &[u8], free_size: &mut Option<usize>) -> Option<Header> {
         1 if version != 3 => 576,
         _ => 1152,
     };
-    let bytes = if bitrate == 0 {
-        let slot = if layer == 3 { 4 } else { 1 };
-        let pad = padding as usize * slot;
-        match *free_size {
-            Some(n) => n + pad,
-            None => match free_format_spacing(data) {
-                Some(d) if d > pad + 4 => {
-                    *free_size = Some(d - pad);
-                    d
-                }
-                // Next header not buffered yet: ask the framer to wait.
-                _ => data.len().saturating_add(1),
-            },
+    let size = |bitrate: u32, padding: u32| -> usize {
+        if layer == 3 {
+            ((12 * bitrate / rate + padding) * 4) as usize
+        } else {
+            ((samples / 8) * bitrate / rate + padding) as usize
         }
-    } else if layer == 3 {
-        ((12 * bitrate / rate + padding) * 4) as usize
+    };
+    let bytes = if bitrate == 0 {
+        let pad = size(0, padding);
+        let max = size(MAX_FREE_FORMAT_BITRATE, 1);
+        free_format_bytes(data, free_size, pad, max, eos)?
     } else {
-        ((samples / 8) * bitrate / rate + padding) as usize
+        size(bitrate, padding)
     };
     Some(Header {
         bytes,
@@ -145,11 +179,17 @@ impl MpegAudioParser {
 }
 impl CodecParser for MpegAudioParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
+        if pes.discontinuity {
+            self.free_size = None;
+        }
         let free_size = &mut self.free_size;
-        self.frames.parse(pes, 4, |d| frame_header(d, free_size))
+        self.frames
+            .parse(pes, 4, |d| frame_header(d, free_size, false))
     }
     fn flush(&mut self) -> Vec<Frame> {
-        self.frames.flush()
+        let free_size = &mut self.free_size;
+        self.frames
+            .flush_with(4, |d| frame_header(d, free_size, true))
     }
     fn codec_private(&self) -> Option<Vec<u8>> {
         None
@@ -185,7 +225,10 @@ mod tests {
     #[test]
     fn mp3_frame_fixture_is_exactly_one_frame() {
         let f = mp3_frame();
-        assert_eq!(frame_header(&f, &mut None).map(|h| h.bytes), Some(f.len()));
+        assert_eq!(
+            frame_header(&f, &mut None, false).map(|h| h.bytes),
+            Some(f.len())
+        );
     }
 
     #[test]
@@ -287,8 +330,9 @@ mod tests {
         let mut p = MpegAudioParser::new();
         let mut frame = mp3_frame();
         frame[2] = 0x00; // bitrate_index = 0000 (free format); sync/layer/rate ok
-        // Its size is the spacing to the next header, so it emits once that arrives.
-        let f = p.parse(&make_pes(frame.repeat(2), Some(0)));
+        // Its size is the spacing to the next header: the last frame waits for EOS.
+        let mut f = p.parse(&make_pes(frame.repeat(2), Some(0)));
+        f.extend(p.flush());
         assert_eq!(f.len(), 2, "free-format frames kept");
         assert_eq!(p.dropped_frames(), 0);
     }
@@ -305,12 +349,10 @@ mod tests {
     #[test]
     fn free_format_frames_in_one_pes_are_split_with_distinct_pts() {
         let mut p = MpegAudioParser::new();
-        let f = p.parse(&make_pes(free_frame().repeat(3), Some(0)));
-        assert_eq!(
-            f.len(),
-            3,
-            "two sync-bounded frames plus the known-size third"
-        );
+        let mut f = p.parse(&make_pes(free_frame().repeat(3), Some(0)));
+        assert_eq!(f.len(), 2, "the third awaits a confirming header");
+        f.extend(p.flush());
+        assert_eq!(f.len(), 3, "EOS emits the known-size third");
         for (i, fr) in f.iter().enumerate() {
             assert_eq!(fr.data, free_frame());
             assert_eq!(fr.pts_ns, i as i64 * (1152 * 1_000_000_000i64 / 44100));
@@ -325,9 +367,78 @@ mod tests {
             let mut f = p.parse(&make_pes(data[..split].to_vec(), Some(0)));
             f.extend(p.parse(&make_pes(data[split..].to_vec(), None)));
             f.extend(p.parse(&make_pes(free_frame(), None)));
+            f.extend(p.flush());
             assert_eq!(f.len(), 3, "split {split}");
             assert!(f.iter().all(|fr| fr.data == free_frame()), "split {split}");
         }
+    }
+
+    // A false free-format header in a CBR stream never finds a matching successor; the
+    // wait is capped at the largest legal free-format frame, so CBR framing resumes.
+    #[test]
+    fn false_free_format_header_does_not_stall_cbr() {
+        let mut p = MpegAudioParser::new();
+        let mut first = vec![0xFF, 0xFB, 0x00, 0x00];
+        first.extend_from_slice(&mp3_frame());
+        let mut n = p.parse(&make_pes(first, Some(0))).len();
+        for _ in 0..9 {
+            n += p.parse(&make_pes(mp3_frame(), None)).len();
+        }
+        assert_eq!(
+            n, 10,
+            "every CBR frame emitted without waiting for the buffer cap"
+        );
+    }
+
+    // A matching header closer than a minimal frame is not the spacing; keep looking.
+    #[test]
+    fn too_close_free_format_match_is_skipped() {
+        let mut data = vec![0xFF, 0xFB, 0x00, 0x00];
+        data.extend_from_slice(&free_frame().repeat(3));
+        let f = MpegAudioParser::new().parse(&make_pes(data, Some(0)));
+        assert!(f.len() >= 2, "framing proceeds, got {} frames", f.len());
+    }
+
+    // The learned size is re-checked against the next header: a new stream after a gap
+    // (or a size change) is relearned rather than misframed.
+    #[test]
+    fn free_format_size_is_relearned() {
+        let short = |n: usize| {
+            let mut f = free_frame();
+            f.truncate(n);
+            f
+        };
+        let mut p = MpegAudioParser::new();
+        assert!(
+            !p.parse(&make_pes(free_frame().repeat(3), Some(0)))
+                .is_empty()
+        );
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes(short(200).repeat(3), Some(900_000))
+        };
+        let f = p.parse(&gap);
+        assert!(!f.is_empty());
+        assert!(
+            f.iter().all(|fr| fr.data.len() == 200),
+            "relearned after the gap"
+        );
+        let mut p = MpegAudioParser::new();
+        let mut data = free_frame().repeat(2);
+        data.extend_from_slice(&short(200).repeat(3));
+        let f = p.parse(&make_pes(data, Some(0)));
+        let sizes: Vec<usize> = f.iter().map(|fr| fr.data.len()).collect();
+        assert_eq!(sizes, [300, 300, 200, 200], "relearned on a size change");
+    }
+
+    // A lone free-format frame has no successor to size it; EOS emits it.
+    #[test]
+    fn lone_free_format_frame_is_emitted_at_flush() {
+        let mut p = MpegAudioParser::new();
+        assert!(p.parse(&make_pes(free_frame(), Some(0))).is_empty());
+        let f = p.flush();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, free_frame());
     }
 
     #[test]
@@ -431,7 +542,7 @@ mod tests {
             ([0xff, 0xf3, 0x80, 0], 208, 576, 22050),
             ([0xff, 0xe3, 0x80, 0], 417, 576, 11025),
         ] {
-            let h = frame_header(&header, &mut None).unwrap();
+            let h = frame_header(&header, &mut None, false).unwrap();
             assert_eq!((h.bytes, h.samples, h.rate), (bytes, samples, rate));
         }
     }

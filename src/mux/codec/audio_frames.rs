@@ -41,7 +41,7 @@ impl AudioFrames {
         &mut self,
         pes: &PesPacket,
         min_header: usize,
-        mut header: impl FnMut(&[u8]) -> Option<Header>,
+        header: impl FnMut(&[u8]) -> Option<Header>,
     ) -> Vec<Frame> {
         if pes.data.is_empty() {
             return Vec::new();
@@ -89,6 +89,16 @@ impl AudioFrames {
             return Vec::new();
         }
         self.buf.push(pes);
+        self.frame_buffered(min_header, header)
+    }
+
+    // Frames every complete unit at the buffer front; a header callback asks to wait by
+    // returning `bytes` beyond what is buffered.
+    fn frame_buffered(
+        &mut self,
+        min_header: usize,
+        mut header: impl FnMut(&[u8]) -> Option<Header>,
+    ) -> Vec<Frame> {
         let mut frames = Vec::new();
         let mut consumed = 0;
         while self.buf.len() - consumed >= min_header {
@@ -130,9 +140,23 @@ impl AudioFrames {
     }
 
     pub fn flush(&mut self) -> Vec<Frame> {
-        // A trailing partial syncframe is not decodable; never manufacture one.
+        self.flush_with(0, |_| None)
+    }
+
+    // EOS: frame what `header` can size now that no more data is coming, then drop the
+    // rest. A trailing partial syncframe is not decodable; never manufacture one.
+    pub fn flush_with(
+        &mut self,
+        min_header: usize,
+        header: impl FnMut(&[u8]) -> Option<Header>,
+    ) -> Vec<Frame> {
+        let frames = if min_header > 0 {
+            self.frame_buffered(min_header, header)
+        } else {
+            Vec::new()
+        };
         self.buf.clear();
         self.tally.log_summary();
-        Vec::new()
+        frames
     }
 }
