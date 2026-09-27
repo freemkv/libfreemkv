@@ -81,9 +81,12 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     ///
     /// [`set_unit_base`]: Self::set_unit_base
     unit_base: u32,
-    /// Encrypted-content extent map — the disc's m2ts ranges as sorted/merged
-    /// `(start_lba, sector_count)` (see
-    /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
+    /// Encrypted-content extent map — every stream file's ranges as sorted/merged
+    /// `(start_lba, sector_count)` (e.g. [`BusMap::covered_ranges`]; note
+    /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)
+    /// covers kept titles only).
+    ///
+    /// [`BusMap::covered_ranges`]: crate::sector::bus_removal::BusMap::covered_ranges
     /// When `Some`, a unit whose absolute LBA is OUTSIDE these ranges is clear
     /// (UDF filesystem / BDMV nav) and is passed through untouched: never
     /// decrypted, verified, or counted as loss. `None` means "the caller only
@@ -140,8 +143,11 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     }
 
     /// Restrict decrypt to the disc's encrypted-content extents
-    /// (sorted/merged `(start_lba, sector_count)` — see
+    /// (sorted/merged `(start_lba, sector_count)` over every stream file, e.g.
+    /// [`BusMap::covered_ranges`] — not the title-only
     /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
+    ///
+    /// [`BusMap::covered_ranges`]: crate::sector::bus_removal::BusMap::covered_ranges
     /// Units outside content (UDF filesystem / BDMV nav) pass through untouched,
     /// so the TS-sync content check is never consulted
     /// about non-content bytes. Whole-disc readers (sweep / patch) set this; the
