@@ -153,7 +153,8 @@ const LK_CN: u8 = 7;
 
 // SetSystem (type 2) op code — `byte0` bits 3-0.
 const SS_SET_GPRMMD: u8 = 3;
-// Link sub-instruction codes (byte7 bits 4-0): 0 = LinkNoLink, above 0x10 unknown.
+// Link sub-instruction codes (byte7 bits 4-0); above 0x10 unknown (no link). Even
+// LinkNoLink (0) ends the command list in libdvdnav (eval_link_subins returns cond).
 const LINKSUB_MAX: u8 = 0x10;
 
 // JumpSS sub-domain selector — `byte5` bits 7-6.
@@ -303,7 +304,7 @@ pub(crate) fn decode(b: &[u8; 8]) -> Command {
     // Set commands (types 2/3) carry a link in byte1 bits 3-0 (same codes as type 1).
     let link = matches!(typ, TYPE_SET_SYSTEM | TYPE_SET_GPRM)
         && match cmd {
-            LK_SUB => (1..=LINKSUB_MAX).contains(&(b[7] & MASK_LINKOP)),
+            LK_SUB => (b[7] & MASK_LINKOP) <= LINKSUB_MAX,
             LK_PGCN..=LK_CN => true,
             _ => false,
         };

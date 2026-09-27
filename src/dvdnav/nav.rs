@@ -182,7 +182,7 @@ impl Vm {
             }
             3 => (cur.saturating_add(v), t),
             4 => (cur.saturating_sub(v), t),
-            5 => (cur.saturating_mul(v), t),
+            5 => (cur.saturating_mul(v), t), // libdvdnav's i32 product overflows (C UB) past 0x7FFF_FFFF
             6 => (cur.checked_div(v).unwrap_or(0xFFFF), t),
             7 => (cur.checked_rem(v).unwrap_or(0xFFFF), t),
             8 => (cur, true), // rnd: non-deterministic
@@ -598,13 +598,14 @@ mod tests {
             let vmgi = build_vmgi(&[h(set), h("3002000000020000")], 1, &[(2, 1), (3, 1)]);
             assert_eq!(resolve_from_vmg(&vmgi), None, "{set}");
         }
-        // LinkNoLink (sub-op 0) is not a transfer.
+        // LinkNoLink (sub-op 0) still ends the command list (libdvdnav
+        // eval_link_subins returns cond), so the next line never runs.
         let vmgi = build_vmgi(
             &[h("7101000000010000"), h("3002000000020000")],
             1,
             &[(2, 1), (3, 1)],
         );
-        assert_eq!(resolve_from_vmg(&vmgi).map(|r| r.title), Some(2));
+        assert_eq!(resolve_from_vmg(&vmgi), None);
     }
 
     // A SetSystem (SPRM write, type 2) in the First-Play list is a no-op FOR
