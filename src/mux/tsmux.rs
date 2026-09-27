@@ -27,6 +27,10 @@ fn is_video_pid(pid: u16) -> bool {
     VIDEO_PID_RANGE.contains(&pid)
 }
 
+// Headroom below the first frame's PTS for frames presented before it but
+// emitted after it (BD T-STD bounds that audio/video skew to about 1 s).
+pub(crate) const ORIGIN_HEADROOM_NS: i64 = 1_000_000_000;
+
 /// BD-TS muxer: PES frames in, 192-byte BD-TS packets out.
 ///
 /// Constructed over an output writer and a slice of per-track PIDs. The `track` index passed to
@@ -45,8 +49,8 @@ pub struct TsMuxer<W: Write> {
     video_codec: Vec<Codec>,
     /// Global PTS origin (nanoseconds), seeded by the FIRST frame of any kind
     /// (video or audio) so a single fixed origin rebases every frame and the
-    /// audio/video offset is preserved. A frame earlier than the origin (e.g.
-    /// audio reordered before the seeding frame) saturates to 0.
+    /// audio/video offset is preserved. It lies [`ORIGIN_HEADROOM_NS`] before
+    /// the seeding frame; only a frame earlier than that saturates to 0.
     base_pts_ns: Option<i64>,
     /// Count of PES frames actually emitted (a frame dropped as non-key
     /// before the first keyframe does NOT count). `finish()` returns
@@ -156,7 +160,11 @@ impl<W: Write> TsMuxer<W> {
         // Seed the global PTS origin from the FIRST frame of ANY kind, so one fixed
         // origin rebases every frame and the a/v offset is preserved. Video-ONLY seeding
         // made pre-video audio fall back to `base = unwrap_or(pts_ns)` (own pts) → PTS 0, spacing lost.
-        let base = *self.base_pts_ns.get_or_insert(pts_ns);
+        // The origin sits ORIGIN_HEADROOM_NS before that frame: a frame emitted
+        // later but presented earlier (video behind its GOP) keeps its offset.
+        let base = *self
+            .base_pts_ns
+            .get_or_insert(pts_ns.saturating_sub(ORIGIN_HEADROOM_NS));
         let pts_ns = pts_ns.saturating_sub(base);
 
         // NAL video (HEVC/H.264): convert length-prefixed NALUs to Annex B and prepend
@@ -438,6 +446,9 @@ fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The origin headroom in 90 kHz ticks: the seeding frame's encoded PTS.
+    const H: u64 = ORIGIN_HEADROOM_NS as u64 * 9 / 100_000;
 
     use crate::consts::BD_SOURCE_PACKET_BYTES;
     const VIDEO_PID: u16 = 0x1011;
@@ -747,12 +758,12 @@ mod tests {
     #[test]
     fn av_offset_preserved_with_audio_before_first_video() {
         // Audio at t=0 before the first video keyframe at t=1s. The FIRST frame of any
-        // kind fixes the origin, so audio becomes origin (PTS 0), video lands 1s=90_000
+        // kind fixes the origin, so audio lands at the headroom, video 1s=90_000
         // ticks later. OLD video-only seeding made both fall back to own pts → collapse to 0, offset lost.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
-            // Audio frame first, at PTS 0 — this seeds the origin.
+            // Audio frame first, at t=0 — this seeds the origin.
             mux.write_frame(1, 0, false, &[0x0B, 0x77, 0x00, 0x00])
                 .unwrap();
             // Video keyframe at PTS 1s — 1s after the origin.
@@ -763,14 +774,12 @@ mod tests {
         let packets = parse_bd_ts(&sink);
         let video_pts = first_pts_90k(&packets, VIDEO_PID);
         let audio_pts = first_pts_90k(&packets, AUDIO_PID);
-        // The leading audio frame is the origin ⇒ its relative PTS is 0.
+        // The leading audio frame seeds the origin one headroom below itself.
+        assert_eq!(audio_pts, H, "the first (audio) frame seeds the origin");
+        // Video is 1s after the audio ⇒ the audio→video offset is preserved.
         assert_eq!(
-            audio_pts, 0,
-            "the first (audio) frame seeds the origin at 0"
-        );
-        // Video is 1s after the origin ⇒ the audio→video offset is preserved.
-        assert_eq!(
-            video_pts, 90_000,
+            video_pts,
+            H + 90_000,
             "video 1s after the origin must stay 90_000 ticks ahead, not collapse to 0"
         );
     }
@@ -1010,13 +1019,13 @@ mod tests {
     #[test]
     fn pts_encoded_at_90khz_decodes_correctly() {
         // pts_ns → 90 kHz ticks = pts_ns * 9 / 100_000. 1 second (1e9 ns)
-        // = 90_000 ticks. The first (base) video frame rebases to 0, so use
+        // = 90_000 ticks. The first (base) video frame lands at the headroom, so use
         // a second frame at a known offset and check its encoded PTS.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
             let idr = fake_hevc_nal(19, 50);
-            mux.write_frame(0, 0, true, &idr).unwrap(); // base = 0
+            mux.write_frame(0, 0, true, &idr).unwrap(); // seeds the origin
             let p = fake_hevc_nal(1, 50);
             // +1 second relative to base.
             mux.write_frame(0, 1_000_000_000, false, &p).unwrap();
@@ -1035,7 +1044,7 @@ mod tests {
             | (((p[11] >> 1) as u64) << 15)
             | ((p[12] as u64) << 7)
             | ((p[13] >> 1) as u64);
-        assert_eq!(pts, 90_000, "1s offset encodes to 90000 ticks @ 90 kHz");
+        assert_eq!(pts, H + 90_000, "1s offset encodes to 90000 ticks @ 90 kHz");
     }
 
     #[test]
@@ -1082,8 +1091,8 @@ mod tests {
     #[test]
     fn negative_relative_pts_saturates_to_zero() {
         // A frame earlier than the origin (negative relative PTS) must encode PTS 0, not
-        // an underflowed huge value. Video keyframe at t=2s seeds the origin; a later
-        // audio frame at t=0 is 2s BEFORE it → -2s, which must floor to 0.
+        // an underflowed huge value. Video keyframe at t=2s seeds the origin at t=1s; a
+        // later audio frame at t=0 is 1s BEFORE it, which must floor to 0.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
@@ -1120,9 +1129,13 @@ mod tests {
         let packets = parse_bd_ts(&sink);
         let pts = all_pts_90k(&packets, AUDIO_PID);
         assert_eq!(pts.len(), 2, "two audio frames → two PTS-bearing PES");
-        assert_eq!(pts[0], 0, "the first audio frame is the origin → 0");
         assert_eq!(
-            pts[1], 90_000,
+            pts[0], H,
+            "the first audio frame sits one headroom past the origin"
+        );
+        assert_eq!(
+            pts[1],
+            H + 90_000,
             "the second frame (1s later) must keep its 1s spacing, not collapse to 0"
         );
     }
@@ -1341,10 +1354,30 @@ mod tests {
             | (((p[11] >> 1) as u64) << 15)
             | ((p[12] as u64) << 7)
             | ((p[13] >> 1) as u64);
-        assert_eq!(decoded, 0, "base video frame stays at relative PTS 0");
+        assert_eq!(decoded, H, "base video frame stays at the headroom");
         assert_eq!(
-            pts, big_pts_ticks,
+            pts,
+            H + big_pts_ticks,
             "the high bits (29..32) of a large PTS must round-trip through encoding"
         );
+    }
+
+    // Audio emitted first but presented AFTER the first video frame (the video
+    // parser holds its opening GOP) must not clamp that video onto the audio's PTS.
+    #[test]
+    fn video_presented_before_the_seeding_audio_keeps_its_offset() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.write_frame(1, 100_000_000, false, &[0x0B, 0x77, 0x00, 0x00])
+                .unwrap();
+            let idr = fake_hevc_nal(19, 100);
+            mux.write_frame(0, 50_000_000, true, &idr).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let video = first_pts_90k(&packets, VIDEO_PID);
+        let audio = first_pts_90k(&packets, AUDIO_PID);
+        assert_eq!(audio - video, 4_500, "50 ms apart, video first");
     }
 }

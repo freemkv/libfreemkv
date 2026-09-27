@@ -356,6 +356,15 @@ impl std::fmt::Debug for InputOptions {
 
 /// Open a PES input stream (produces PES frames).
 pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
+    input_with_halt(url, opts, None)
+}
+
+// `input` whose blocking network receive (`network://`) a halt can interrupt.
+pub(crate) fn input_with_halt(
+    url: &str,
+    opts: &InputOptions,
+    halt: Option<&crate::halt::Halt>,
+) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
         StreamUrl::Disc { .. } => {
@@ -415,7 +424,10 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         }
         StreamUrl::Network { ref addr } => {
             validate_network_addr(addr)?;
-            Ok(Box::new(NetworkStream::listen(addr)?))
+            Ok(Box::new(NetworkStream::listen_with_halt(
+                addr,
+                halt.cloned(),
+            )?))
         }
         StreamUrl::Stdio => Ok(Box::new(StdioStream::input())),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),

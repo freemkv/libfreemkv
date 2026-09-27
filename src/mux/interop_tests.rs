@@ -477,8 +477,7 @@ fn ffmpeg_mkv_roundtrip_preserves_vfr_and_multiple_audio_tracks() {
 }
 
 // Discovered while building the gate; retain executable, strict reproducers.
-// These deliberately do NOT have the ffmpeg_ prefix: run ffmpeg_ explicitly
-// to investigate them. Promote each into the QA gate when its fix lands.
+// They carry the ffmpeg_ prefix, so the QA gate runs them with the rest.
 
 #[test]
 #[ignore = "requires ffmpeg and ffprobe"]

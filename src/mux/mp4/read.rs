@@ -165,13 +165,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     // `as u8` (a crafted 256 would alias to 0/Mono).
                     channels: AudioChannels::from_count(channels.min(u8::MAX as u16) as u8),
                     language: language.clone().unwrap_or_else(|| "und".into()),
-                    // Prefer the AudioSampleEntry's own samplerate; the mdhd media
-                    // timescale is only a fallback when the entry omits it (0).
-                    sample_rate: SampleRate::from_hz(if entry_sample_rate != 0 {
-                        entry_sample_rate
-                    } else {
-                        timescale
-                    }),
+                    sample_rate: SampleRate::from_hz(audio_rate(entry_sample_rate, timescale)),
                     secondary: false,
                     purpose: LabelPurpose::Normal,
                     label: String::new(),
@@ -729,20 +723,30 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             sample_rate: 0,
         })
     } else {
-        // AudioSampleEntry header is 28 bytes, then child boxes. AAC (mp4a) carries
-        // its AudioSpecificConfig in an `esds` box — the MKV CodecPrivate for
-        // A_AAC. AC-3/DTS are self-describing in-band (None).
-        let channels = if body.len() >= 28 { be16(body, 16) } else { 2 };
-        // Real audio sample rate: AudioSampleEntry 16.16 samplerate field at body
-        // offset 24 (ISO/IEC 14496-12 §12.2.3), integer rate = high 16 bits. The mdhd
-        // media timescale is only a fallback (USUALLY the rate, but need not be).
-        let sample_rate = if body.len() >= 28 {
-            be16(body, 24) as u32
-        } else {
-            0
+        // AudioSampleEntry: 28-byte fixed part (ISO/IEC 14496-12 §12.2.3), then child
+        // boxes. AAC (mp4a) carries its AudioSpecificConfig in an `esds` box — the
+        // MKV CodecPrivate for A_AAC. AC-3/DTS are self-describing in-band (None).
+        // QuickTime SoundDescription v1 adds 16 bytes; v2 moves the rate to a
+        // float64 at 32 and channels to a u32 at 40, children at 64.
+        let version = if body.len() >= 28 { be16(body, 8) } else { 0 };
+        let (channels, sample_rate, children) = match version {
+            2 if body.len() >= 64 => {
+                let rate = f64::from_bits(u64::from_be_bytes(body[32..40].try_into().ok()?));
+                let rate = if rate.is_finite() && rate >= 1.0 && rate <= u32::MAX as f64 {
+                    rate.round() as u32
+                } else {
+                    0
+                };
+                let ch = be32(body, 40).min(u16::MAX as u32) as u16;
+                (ch, rate, 64)
+            }
+            // The 16.16 field's integer part; `audio_rate` falls back to mdhd.
+            1 if body.len() >= 44 => (be16(body, 16), be16(body, 24) as u32, 44),
+            _ if body.len() >= 28 => (be16(body, 16), be16(body, 24) as u32, 28),
+            _ => (2, 0, body.len()),
         };
-        let config = if matches!(codec, Codec::Aac) && body.len() >= 28 {
-            find_box(&body[28..], b"esds").and_then(parse_esds_asc)
+        let config = if matches!(codec, Codec::Aac) {
+            find_box(&body[children..], b"esds").and_then(parse_esds_asc)
         } else {
             None
         };
@@ -753,6 +757,20 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             channels,
             sample_rate,
         })
+    }
+}
+
+// Audio sample rate from the sample-entry rate and the mdhd timescale. The entry
+// wins unless it is absent (0), the v1/v2 placeholder (1), saturated (65535), or
+// the timescale is a real rate the 16-bit entry field cannot hold (e.g. 96 kHz
+// DTS-HD whose entry carries the 48 kHz core rate).
+fn audio_rate(entry: u32, timescale: u32) -> u32 {
+    let unusable = matches!(entry, 0 | 1 | 0xFFFF);
+    let wide = timescale > 0xFFFF && SampleRate::from_hz(timescale) != SampleRate::Unknown;
+    if unusable || (wide && entry <= 0xFFFF) {
+        timescale
+    } else {
+        entry
     }
 }
 
@@ -2251,13 +2269,12 @@ mod tests {
     /// (mdhd timescale = 90_000, AudioSampleEntry samplerate = 48_000); the
     /// entry value must win. Old code read the rate from the timescale, so a
     /// 90 kHz mdhd yielded SampleRate::Unknown, dropping the real 48 kHz.
-    #[test]
-    fn audio_sample_entry_samplerate_wins_over_mdhd_timescale() {
-        use std::io::Cursor;
+    // One-sample audio moov whose mdhd timescale and sample entry are given.
+    fn audio_moov(timescale: u32, fourcc: &[u8; 4], entry: &[u8]) -> Vec<u8> {
         let mdhd = {
             // v0: version+flags(4) creation(4) modification(4) timescale(4) duration(4).
             let mut p = vec![0u8; 24];
-            p[12..16].copy_from_slice(&90_000u32.to_be_bytes()); // NOT the audio rate
+            p[12..16].copy_from_slice(&timescale.to_be_bytes());
             mp4_box(b"mdhd", &p)
         };
         let hdlr = {
@@ -2265,8 +2282,7 @@ mod tests {
             p[8..12].copy_from_slice(b"soun");
             mp4_box(b"hdlr", &p)
         };
-        // Full AudioSampleEntry: samplerate 48_000 in the 16.16 field at body 24.
-        let stsd = mp4_box(b"stsd", &stsd_with(b"ac-3", &audio_entry(6, 0, &[])));
+        let stsd = mp4_box(b"stsd", &stsd_with(fourcc, entry));
         // stsz: sample_size=10, count=1 (one 10-byte sample).
         let stsz = {
             let mut p = vec![0u8, 0, 0, 0];
@@ -2305,17 +2321,68 @@ mod tests {
         mdia.extend_from_slice(&hdlr);
         mdia.extend_from_slice(&minf);
         let trak = mp4_box(b"trak", &mp4_box(b"mdia", &mdia));
-        let moov = mp4_box(b"moov", &trak);
+        mp4_box(b"moov", &trak)
+    }
 
-        let rd = Mp4Reader::from_reader(Cursor::new(moov), "sr".into()).unwrap();
+    fn read_audio(moov: Vec<u8>) -> AudioStream {
+        let rd = Mp4Reader::from_reader(std::io::Cursor::new(moov), "sr".into()).unwrap();
         match &rd.info().streams[0] {
-            DiscStream::Audio(a) => assert_eq!(
-                a.sample_rate,
-                SampleRate::S48,
-                "the AudioSampleEntry 48 kHz must win over the 90 kHz mdhd timescale"
-            ),
+            DiscStream::Audio(a) => a.clone(),
             other => panic!("expected an audio stream, got {other:?}"),
         }
+    }
+
+    /// Regression: audio sample rate must come from the AudioSampleEntry 16.16
+    /// samplerate field, NOT the mdhd media timescale, when they merely differ
+    /// (a 90 kHz mdhd is not an audio rate).
+    #[test]
+    fn audio_sample_entry_samplerate_wins_over_mdhd_timescale() {
+        let a = read_audio(audio_moov(90_000, b"ac-3", &audio_entry(6, 0, &[])));
+        assert_eq!(a.sample_rate, SampleRate::S48);
+    }
+
+    // The 16-bit entry field cannot hold 96 kHz: our own Mp4Sink saturates it to
+    // 65535, and a DTS-HD entry may carry the 48 kHz core rate. mdhd wins then.
+    #[test]
+    fn a_high_rate_mdhd_timescale_beats_an_unrepresentable_entry_rate() {
+        for entry_rate in [0xFFFFu32, 48_000] {
+            let mut e = audio_entry(6, 0, &[]);
+            e[24..28].copy_from_slice(&(entry_rate << 16).to_be_bytes());
+            let a = read_audio(audio_moov(96_000, b"dtsh", &e));
+            assert_eq!(a.sample_rate, SampleRate::S96, "entry {entry_rate}");
+        }
+    }
+
+    // QuickTime SoundDescription v2: the 16.16 field is fixed at 1.0 and the real
+    // rate is a float64 at body offset 32; channels at 40; children at 64.
+    #[test]
+    fn a_quicktime_v2_sound_description_reads_its_float_rate_and_channels() {
+        let mut e = vec![0u8; 64];
+        e[8..10].copy_from_slice(&2u16.to_be_bytes());
+        e[16..18].copy_from_slice(&3u16.to_be_bytes());
+        e[24..28].copy_from_slice(&(1u32 << 16).to_be_bytes());
+        e[32..40].copy_from_slice(&44_100f64.to_bits().to_be_bytes());
+        e[40..44].copy_from_slice(&6u32.to_be_bytes());
+        let a = read_audio(audio_moov(1_000, b"ac-3", &e));
+        assert_eq!(a.sample_rate, SampleRate::S44_1);
+        assert_eq!(a.channels, AudioChannels::from_count(6));
+    }
+
+    // QuickTime SoundDescription v1 inserts 16 bytes before the child boxes, so an
+    // mp4a esds must be looked up at body offset 44, not 28.
+    #[test]
+    fn a_quicktime_v1_sound_description_finds_its_esds_after_the_v1_fields() {
+        let asc = [0x12u8, 0x10];
+        let mut esds = vec![0u8, 0, 0, 0, 0x03, 22, 0, 1, 0, 0x04, 17, 0x40, 0x15];
+        esds.extend_from_slice(&[0u8; 11]);
+        esds.extend_from_slice(&[0x05, 2]);
+        esds.extend_from_slice(&asc);
+        let mut e = audio_entry(2, 0, &[]);
+        e[8..10].copy_from_slice(&1u16.to_be_bytes());
+        e.extend_from_slice(&[0u8; 16]);
+        e.extend_from_slice(&mp4_box(b"esds", &esds));
+        let info = parse_stsd(&stsd_with(b"mp4a", &e)).expect("mp4a parses");
+        assert_eq!(info.config.as_deref(), Some(&asc[..]));
     }
 
     // ============================================================

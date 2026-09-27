@@ -548,6 +548,9 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// track type (mirroring `track_is_video`) so the invariant holds for every
     /// subtitle track — including a sparse forced-narrative second track.
     track_is_subtitle: Vec<bool>,
+    /// Per-track-index flag: true for an `S_VOBSUB` track, whose SPU carries its
+    /// own display duration.
+    track_is_vobsub: Vec<bool>,
     /// Index of the PRIMARY video track — the first track whose type is video.
     /// This (not the literal index 0) is the clip-boundary epoch driver: the
     /// M2TS/PMT path orders streams by PMT declaration order and may list an
@@ -705,10 +708,46 @@ struct InterlacedRewrite {
 // AUs.
 const TIMESTAMP_SCALE_NS: i64 = 100_000;
 
-// Last-resort BlockDuration (1 s) for a SUBTITLE frame that reaches the muxer with
-// no duration. Parsers (PGS) already synthesize one; this only fires if another
-// subtitle path forgets, keeping every subtitle block durated (issue #52).
-const MIN_SUBTITLE_BLOCK_DURATION_NS: i64 = 1_000_000_000;
+// BlockDuration for a SUBTITLE frame that reaches the muxer with no duration and
+// (VobSub) no SPU stop command, so every subtitle block stays durated (issue #52).
+// PGS and VobSub cues end at the next display set / SPU, so a long bound only
+// caps a cue that is already replaced, while a short one hid real cues early.
+const SUBTITLE_FALLBACK_BLOCK_DURATION_NS: i64 = 30_000_000_000;
+
+// VobSub SP_DCSQ delays count 1024 ticks of the 90 kHz clock.
+const SPU_DELAY_NS: u64 = 1024 * 1_000_000_000 / 90_000;
+
+// Display time of a VobSub SPU: the delay of its first STP_DSP (0x02) command,
+// walking the SP_DCSQ chain. `None` when the SPU has no stop or is malformed.
+fn vobsub_display_ns(spu: &[u8]) -> Option<u64> {
+    let be16 = |at: usize| -> Option<usize> {
+        Some(u16::from_be_bytes([*spu.get(at)?, *spu.get(at + 1)?]) as usize)
+    };
+    let mut dcsq = be16(2)?;
+    // Each DCSQ is at least 5 bytes, so a well-formed chain has bounded length.
+    for _ in 0..spu.len() / 5 + 1 {
+        let delay = be16(dcsq)? as u64;
+        let next = be16(dcsq + 2)?;
+        let mut at = dcsq + 4;
+        loop {
+            let args = match *spu.get(at)? {
+                0x02 => return Some(delay * SPU_DELAY_NS),
+                0x00 | 0x01 => 0,
+                0x03 | 0x04 => 2,
+                0x05 => 6,
+                0x06 => 4,
+                0x07 => be16(at + 1)?,
+                _ => break,
+            };
+            at += 1 + args;
+        }
+        if next == dcsq {
+            return None;
+        }
+        dcsq = next;
+    }
+    None
+}
 
 // Nominal new-cluster interval (2 s) in TimestampScale ticks; a keyframe only opens a new
 // cluster once this much has elapsed.
@@ -898,10 +937,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::write_uint(&mut writer, ebml::TRACK_TYPE, track.track_type)?;
             if let Some(timing) = timings.get(i) {
                 if timing.codec_delay_ns > 0 {
-                    ebml::write_uint(&mut writer, 0x56AA, timing.codec_delay_ns)?;
+                    ebml::write_uint(&mut writer, ebml::CODEC_DELAY, timing.codec_delay_ns)?;
                 }
                 if timing.seek_preroll_ns > 0 {
-                    ebml::write_uint(&mut writer, 0x56BB, timing.seek_preroll_ns)?;
+                    ebml::write_uint(&mut writer, ebml::SEEK_PRE_ROLL, timing.seek_preroll_ns)?;
                 }
             }
 
@@ -1166,6 +1205,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
             track_is_subtitle: tracks
                 .iter()
                 .map(|t| t.track_type == ebml::TRACK_TYPE_SUBTITLE)
+                .collect(),
+            track_is_vobsub: tracks
+                .iter()
+                .map(|t| t.codec_id == ebml::CODEC_VOBSUB)
                 .collect(),
             primary_video_track: tracks
                 .iter()
@@ -1455,7 +1498,16 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let duration_ticks = match duration_ticks {
             Some(dt) => Some(dt),
             None if is_subtitle => {
-                Some((MIN_SUBTITLE_BLOCK_DURATION_NS / TIMESTAMP_SCALE_NS).max(1) as u64)
+                let spu_ns = self
+                    .track_is_vobsub
+                    .get(track_idx)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| vobsub_display_ns(data))
+                    .flatten()
+                    .filter(|&ns| ns > 0);
+                let ns = spu_ns.map_or(SUBTITLE_FALLBACK_BLOCK_DURATION_NS, |ns| ns as i64);
+                Some((ns / TIMESTAMP_SCALE_NS).max(1) as u64)
             }
             None => None,
         };
@@ -1983,7 +2035,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         buf.push(flags);
         buf.extend_from_slice(data);
         if discard_padding_ns != 0 {
-            ebml::write_int(buf, 0x75A2, discard_padding_ns)?;
+            ebml::write_int(buf, ebml::DISCARD_PADDING, discard_padding_ns)?;
         }
         if let Some(dt) = duration_ticks {
             ebml::write_uint(buf, ebml::BLOCK_DURATION, dt)?;
@@ -5070,6 +5122,42 @@ mod tests {
         // Both subtitle tracks (Matroska TrackNumbers 1 and 2) are represented.
         assert!(groups.iter().any(|g| g.track == 1), "dense track present");
         assert!(groups.iter().any(|g| g.track == 2), "sparse track present");
+    }
+
+    // A VobSub SPU: 4-byte header, 2 pixel bytes, then a STA_DSP DCSQ (delay 0)
+    // chained to a STP_DSP DCSQ at `stop_delay` (units of 1024/90000 s).
+    fn vobsub_spu(stop_delay: u16) -> Vec<u8> {
+        let mut spu = vec![0, 18, 0, 6, 0xAB, 0xCD];
+        spu.extend_from_slice(&[0, 0, 0, 12, 0x01, 0xFF]);
+        spu.extend_from_slice(&stop_delay.to_be_bytes());
+        spu.extend_from_slice(&[0, 12, 0x02, 0xFF]);
+        spu
+    }
+
+    #[test]
+    fn vobsub_block_duration_comes_from_the_spu_stop_command() {
+        let mut track = make_subtitle_track();
+        track.codec_id = ebml::CODEC_VOBSUB;
+        // 0x0100 * 1024 / 90 kHz = 2.9127 s -> 29_127 ticks at 0.1 ms.
+        let data = mux_with_durations(&[track], &[(0, 0, true, vobsub_spu(0x0100), None)]);
+        let groups = all_block_groups(&data);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].duration, 29_127, "SPU stop time, not a 1 s guess");
+    }
+
+    #[test]
+    fn a_durationless_pgs_block_is_not_cut_to_one_second() {
+        let data = mux_with_durations(
+            &[make_subtitle_track()],
+            &[(0, 0, true, vec![0x16, 0xAA], None)],
+        );
+        let groups = all_block_groups(&data);
+        assert_eq!(groups.len(), 1);
+        assert!(
+            groups[0].duration > 10_000,
+            "a self-terminating cue must not be hidden after 1 s (got {} ticks)",
+            groups[0].duration
+        );
     }
 
     // Cluster boundary (CLUSTER_DURATION_TICKS): a new cluster opens on a video
