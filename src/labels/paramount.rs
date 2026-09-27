@@ -232,6 +232,13 @@ fn names_feature(name: &str) -> bool {
         "previews",
         "extra",
         "extras",
+        "making",
+        "deleted",
+        "scenes",
+        "behind",
+        "interview",
+        "recap",
+        "sneak",
     ];
     let words = super::name_words(name);
     words.iter().any(|w| w == "feature") && !words.iter().any(|w| EXTRAS.contains(&w.as_str()))
@@ -913,6 +920,12 @@ mod tests {
             "Featurette",
             "Feature_Promo",
             "FeaturePreview",
+            "Feature_Making",
+            "FeatureDeletedScenes",
+            "BehindTheFeature",
+            "FeatureInterview",
+            "FeatureRecap",
+            "SneakFeature",
         ] {
             assert!(!names_feature(name), "{name}");
         }
