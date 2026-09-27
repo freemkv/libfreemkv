@@ -460,24 +460,7 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     // Anchor on the largest TITLE's FIRST extent (video preferred, skipping an
     // obfuscated decoy), never the largest extent anywhere: AACS units are 3 sectors,
     // aligned only at a clip's START — misalignment risks a false clean/encrypted verdict.
-    let Some(extent) = disc
-        .titles
-        .iter()
-        .filter(|t| t.has_probable_video())
-        .max_by_key(|t| {
-            t.extents
-                .iter()
-                .fold(0u64, |a, e| a.saturating_add(e.sector_count as u64))
-        })
-        .or_else(|| {
-            disc.titles.iter().max_by_key(|t| {
-                t.extents
-                    .iter()
-                    .fold(0u64, |a, e| a.saturating_add(e.sector_count as u64))
-            })
-        })
-        .and_then(|t| t.extents.first())
-    else {
+    let Some(extent) = disc.main_title().and_then(|t| t.extents.first()) else {
         // No content to judge. A folder with an AACS directory and no titles
         // has nothing to rip either way; leave the structural verdict alone.
         return Ok(true);

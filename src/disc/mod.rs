@@ -1869,10 +1869,12 @@ impl Disc {
                         disc.css_error = Some(crate::error::Error::CssKeyMissing);
                     }
                     crate::css::CrackOutcome::Unencrypted => {}
-                    // A Stop mid-scan, or nothing readable: no verdict, so no scan
-                    // result — report the Stop / read fault itself.
                     crate::css::CrackOutcome::Halted => return Err(Error::Halted),
-                    crate::css::CrackOutcome::Unreadable(e) => return Err(e),
+                    // No verdict, but the image stays listable: the per-title crack
+                    // (the mux always re-cracks) reports the read fault for that title.
+                    crate::css::CrackOutcome::Unreadable(e) => {
+                        tracing::warn!(target: "freemkv::scan", code = e.code(), "image css: crack extent unreadable");
+                    }
                 }
             }
         }
@@ -3010,17 +3012,21 @@ impl Disc {
         Some(inputs)
     }
 
-    // Encrypted sample units from the LARGEST title that HAS video (the main feature
-    // carries the most units, and skips size-inflated streamless decoys on some
-    // obfuscated UHDs); the largest title outright when none has video.
+    // Encrypted sample units from the main feature (see `main_title`).
     pub(crate) fn content_samples(&self, reader: &mut dyn SectorSource, n: usize) -> Vec<Vec<u8>> {
+        self.main_title()
+            .map(|t| crate::keysource::read_encrypted_units(reader, t, n))
+            .unwrap_or_default()
+    }
+
+    // The LARGEST title that HAS video (skips size-inflated streamless decoys on
+    // some obfuscated UHDs); the largest title outright when none has video.
+    pub(crate) fn main_title(&self) -> Option<&DiscTitle> {
         self.titles
             .iter()
             .filter(|t| t.has_probable_video())
             .max_by_key(|t| t.size_bytes)
             .or_else(|| self.titles.iter().max_by_key(|t| t.size_bytes))
-            .map(|t| crate::keysource::read_encrypted_units(reader, t, n))
-            .unwrap_or_default()
     }
 
     /// Apply a caller-resolved [`Key`] so [`Self::decrypt_keys`] yields usable
@@ -3456,9 +3462,8 @@ mod tests {
         assert_eq!(err.code(), Error::Halted.code());
     }
 
-    // A truncated (already-decrypted) DVD ISO whose feature lies past EOF: every
-    // crack read fails, so there is no verdict. Report the read fault, never a
-    // missing CSS key.
+    // A truncated DVD ISO whose feature lies past EOF: the scan still lists it, and
+    // the per-title crack reports the read fault, never a missing CSS key.
     #[test]
     fn scan_image_unreadable_crack_extent_reports_the_read_error() {
         use crate::udf::fixture::*;
@@ -3495,14 +3500,31 @@ mod tests {
         };
         build_udf_skeleton(&mut disc, 10);
         lay_dir(&mut disc, &root);
-        let err = Disc::scan_image(&mut Truncated(&mut disc), 500_000, &ScanOptions::default())
-            .expect_err("no crack verdict");
+        let mut src = Truncated(&mut disc);
+        let scanned = Disc::scan_image(&mut src, 500_000, &ScanOptions::default())
+            .expect("an unreadable crack extent must not make the image unlistable");
+        assert!(scanned.css.is_none() && scanned.css_error.is_none());
+        let title = &scanned.titles[0];
         let read_fault = Error::DiscRead {
-            sector: 0,
+            sector: title.extents[0].start_lba as u64,
             status: None,
             sense: None,
         };
-        assert_eq!(err.code(), read_fault.code(), "got {err:?}");
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        let err = crate::css::resolve_dvd_title_key(
+            &mut src,
+            &title.extents,
+            &mut keys,
+            32,
+            title.content_format,
+            false,
+            None,
+        )
+        .expect_err("the per-title crack reports the fault");
+        assert_eq!(
+            err.to_string(),
+            std::io::Error::from(read_fault).to_string()
+        );
     }
 
     // An HD-DVD image is also MPEG-PS but must NEVER enter the CSS crack.
