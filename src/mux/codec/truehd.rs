@@ -518,6 +518,18 @@ pub fn truehd_channels(format_info: u32) -> Option<u8> {
     }
 }
 
+/// LFE channels (bit 2 LFE, 8ch bit 12 LFE2) within the presentation
+/// `truehd_channels` counts, so the caller can split `N.M`.
+pub fn truehd_lfe(format_info: u32) -> u8 {
+    let ch8 = format_info & 0x1FFF;
+    let ch6 = (format_info >> 15) & 0x1F;
+    if ch8 != 0 {
+        u8::from(ch8 & (1 << 2) != 0) + u8::from(ch8 & (1 << 12) != 0)
+    } else {
+        u8::from(ch6 & (1 << 2) != 0)
+    }
+}
+
 /// Scan a demuxed TrueHD elementary-stream chunk for the first major sync and
 /// decode its true channel count. The stream may interleave AC-3; we scan for
 /// the major-sync word anywhere and read the following `format_info`.
@@ -1435,6 +1447,16 @@ mod tests {
         // 8ch count, proving the `if ch8 != 0` branch wins.
         let fi = (1u32 << 0) | (0x1F << 15);
         assert_eq!(truehd_channels(fi), Some(2));
+    }
+
+    #[test]
+    fn truehd_lfe_reads_the_chosen_presentation() {
+        assert_eq!(truehd_lfe(0x0F), 1, "8ch LFE bit");
+        assert_eq!(truehd_lfe(0x100F), 2, "8ch LFE + LFE2");
+        assert_eq!(truehd_lfe(0x4B), 0, "7.0 has no LFE");
+        assert_eq!(truehd_lfe(0xF << 15), 1, "6ch LFE bit when 8ch is empty");
+        assert_eq!(truehd_lfe(0x03 | (0xF << 15)), 0, "8ch wins over 6ch");
+        assert_eq!(truehd_lfe(0), 0);
     }
 
     #[test]

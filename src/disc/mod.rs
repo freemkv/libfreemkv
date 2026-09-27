@@ -398,14 +398,24 @@ pub enum AudioChannels {
     Stereo,
     /// 2.1 (stereo + LFE)
     Stereo21,
+    /// 3.0 (L C R, or L R S), no LFE
+    Surround30,
+    /// 3.1 (3.0 + LFE)
+    Surround31,
     /// 4.0 quadraphonic
     Quad,
+    /// 4.1 (4.0 + LFE)
+    Surround41,
     /// 5.0 surround (no LFE)
     Surround50,
     /// 5.1 surround — standard BD/DVD surround
     Surround51,
+    /// 6.0 surround (no LFE)
+    Surround60,
     /// 6.1 surround (DTS-ES, Dolby EX)
     Surround61,
+    /// 7.0 surround (no LFE)
+    Surround70,
     /// 7.1 surround — UHD Atmos beds, DTS:X
     Surround71,
     /// Unknown channel layout
@@ -563,7 +573,7 @@ fn bus_map(
 // sync (`reader` must yield DECRYPTED sectors: mux time, not scan).
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
     use crate::mux::codec::truehd::{
-        truehd_channels, truehd_sample_rate_hz, truehd_sync_info_from_stream,
+        truehd_channels, truehd_lfe, truehd_sample_rate_hz, truehd_sync_info_from_stream,
     };
 
     let pids: Vec<u16> = title
@@ -629,7 +639,8 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
 
         // (1) Channels — only when the major sync resolves a different layout.
         if let Some(count) = truehd_channels(info.format_info) {
-            let new_ch = AudioChannels::from_count(count);
+            let lfe = truehd_lfe(info.format_info);
+            let new_ch = AudioChannels::from_layout(count.saturating_sub(lfe), lfe);
             if new_ch != AudioChannels::Unknown && new_ch != a.channels {
                 a.channels = new_ch;
             }
@@ -1091,11 +1102,11 @@ impl AudioChannels {
         match self {
             AudioChannels::Mono => 1,
             AudioChannels::Stereo => 2,
-            AudioChannels::Stereo21 => 3,
-            AudioChannels::Quad => 4,
-            AudioChannels::Surround50 => 5,
-            AudioChannels::Surround51 => 6,
-            AudioChannels::Surround61 => 7,
+            AudioChannels::Stereo21 | AudioChannels::Surround30 => 3,
+            AudioChannels::Quad | AudioChannels::Surround31 => 4,
+            AudioChannels::Surround50 | AudioChannels::Surround41 => 5,
+            AudioChannels::Surround51 | AudioChannels::Surround60 => 6,
+            AudioChannels::Surround61 | AudioChannels::Surround70 => 7,
             AudioChannels::Surround71 => 8,
             // 0, not a plausible guess like 6 — a fake count once let the json://
             // sink report a confident 5.1 for audio its own fields called "unknown".
@@ -1115,6 +1126,27 @@ impl AudioChannels {
             6 => AudioChannels::Surround51,
             7 => AudioChannels::Surround61,
             8 => AudioChannels::Surround71,
+            _ => AudioChannels::Unknown,
+        }
+    }
+
+    /// Exact layout from full-range and LFE channel counts (the `N.M` label);
+    /// `Unknown` when no variant names it, rather than a count-based guess.
+    pub(crate) fn from_layout(full: u8, lfe: u8) -> Self {
+        match (full, lfe) {
+            (1, 0) => AudioChannels::Mono,
+            (2, 0) => AudioChannels::Stereo,
+            (2, 1) => AudioChannels::Stereo21,
+            (3, 0) => AudioChannels::Surround30,
+            (3, 1) => AudioChannels::Surround31,
+            (4, 0) => AudioChannels::Quad,
+            (4, 1) => AudioChannels::Surround41,
+            (5, 0) => AudioChannels::Surround50,
+            (5, 1) => AudioChannels::Surround51,
+            (6, 0) => AudioChannels::Surround60,
+            (6, 1) => AudioChannels::Surround61,
+            (7, 0) => AudioChannels::Surround70,
+            (7, 1) => AudioChannels::Surround71,
             _ => AudioChannels::Unknown,
         }
     }
@@ -1329,10 +1361,15 @@ enum_str!(
         ("mono", AudioChannels::Mono),
         ("stereo", AudioChannels::Stereo),
         ("2.1", AudioChannels::Stereo21),
+        ("3.0", AudioChannels::Surround30),
+        ("3.1", AudioChannels::Surround31),
         ("4.0", AudioChannels::Quad),
+        ("4.1", AudioChannels::Surround41),
         ("5.0", AudioChannels::Surround50),
         ("5.1", AudioChannels::Surround51),
+        ("6.0", AudioChannels::Surround60),
         ("6.1", AudioChannels::Surround61),
+        ("7.0", AudioChannels::Surround70),
         ("7.1", AudioChannels::Surround71),
     ]
 );
@@ -2608,18 +2645,7 @@ impl Disc {
                 ) {
                     lossless = 1;
                 }
-                let ch = match a.channels {
-                    AudioChannels::Surround71 => 8,
-                    AudioChannels::Surround61 => 7,
-                    AudioChannels::Surround51 => 6,
-                    AudioChannels::Surround50 => 5,
-                    AudioChannels::Quad => 4,
-                    AudioChannels::Stereo21 => 3,
-                    AudioChannels::Stereo => 2,
-                    AudioChannels::Mono => 1,
-                    AudioChannels::Unknown => 0,
-                };
-                max_ch = max_ch.max(ch);
+                max_ch = max_ch.max(a.channels.count());
             }
         }
         (lossless, max_ch, count)
@@ -8281,7 +8307,7 @@ mod tests {
     #[test]
     fn correct_truehd_channels_leaves_channels_when_count_unmapped() {
         let pid = 0x1100u16;
-        // All 13 8ch bits set -> truehd_channels sums to 20 -> from_count(20)
+        // All 13 8ch bits set -> 18 full + 2 LFE -> from_layout(18, 2)
         // -> Unknown. Rate nibble 0x0 -> 48 kHz (matches the container, so
         // this test isolates the channels guard from the rate guard).
         let format_info = 0x1FFF;
@@ -8344,6 +8370,57 @@ mod tests {
             SampleRate::S48,
             "an unrecognised major-sync rate nibble must not overwrite the container's sample rate"
         );
+    }
+
+    fn truehd_corrected(format_info: u32) -> AudioStream {
+        let pid = 0x1100u16;
+        let ts = thd_bd_pes(pid, &thd_major_sync_es(format_info, 0));
+        let mut title = DiscTitle::empty();
+        title.streams = vec![truehd_audio_stream(
+            pid,
+            AudioChannels::Surround51,
+            SampleRate::S48,
+        )];
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 1,
+        }];
+        let mut reader = ThdSpyReader {
+            calls: std::cell::RefCell::new(Vec::new()),
+            data: ts,
+        };
+        correct_truehd_channels(&mut reader, &mut title);
+        match title.streams.remove(0) {
+            Stream::Audio(a) => a,
+            other => panic!("stream type must be preserved, got {other:?}"),
+        }
+    }
+
+    // The TrueHD mask's LFE bit decides N.M; summing it into a count mislabelled
+    // 3.0 as "2.1", 7.0 as "6.1", etc.
+    #[test]
+    fn correct_truehd_channels_keeps_lfe_split_from_the_mask() {
+        for (mask, want) in [
+            (0x03u32, "3.0"),
+            (0x07, "3.1"),
+            (0x0D, "4.1"),
+            (0x8B, "6.0"),
+            (0x4B, "7.0"),
+            (0x0F, "5.1"),
+            (0x1F, "7.1"),
+        ] {
+            let a = truehd_corrected(mask);
+            assert_eq!(a.channels.to_string(), want, "mask {mask:#x}");
+            assert_eq!(a.label, format!("Dolby TrueHD {want}"), "mask {mask:#x}");
+        }
+    }
+
+    // A layout with no N.M variant (5.2 via LFE2) keeps the container value
+    // rather than asserting a wrong one ("6.1" by count).
+    #[test]
+    fn correct_truehd_channels_keeps_container_for_unnameable_layout() {
+        let a = truehd_corrected(0x100F);
+        assert_eq!(a.channels.to_string(), "5.1");
     }
 
     // bytes_bad_in_title empty-input guard: the `||`-to-`&&` mutant here is
@@ -8626,6 +8703,39 @@ mod tests {
         assert_eq!(AudioChannels::from_count(8), AudioChannels::Surround71);
         assert_eq!(AudioChannels::from_count(0), AudioChannels::Unknown);
         assert_eq!(AudioChannels::from_count(9), AudioChannels::Unknown);
+    }
+
+    // FMKV metadata / json:// carry the Display string; every layout must round-trip.
+    #[test]
+    fn audio_channels_layout_strings_round_trip() {
+        for s in ["3.0", "3.1", "4.1", "6.0", "7.0", "2.1", "5.1", "7.1"] {
+            let parsed: AudioChannels = s.parse().unwrap();
+            assert_eq!(parsed.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn audio_channels_from_layout_names_or_unknown() {
+        for full in 0..=8u8 {
+            for lfe in 0..=2u8 {
+                let c = AudioChannels::from_layout(full, lfe);
+                if c == AudioChannels::Unknown {
+                    continue;
+                }
+                assert_eq!(c.count(), full + lfe, "{full}.{lfe}");
+                assert_eq!(
+                    c.to_string(),
+                    format!("{full}.{lfe}")
+                        .replace("1.0", "mono")
+                        .replace("2.0", "stereo")
+                );
+            }
+        }
+        assert_eq!(AudioChannels::from_layout(3, 0), AudioChannels::Surround30);
+        assert_eq!(AudioChannels::from_layout(7, 0), AudioChannels::Surround70);
+        assert_eq!(AudioChannels::from_layout(5, 2), AudioChannels::Unknown);
+        assert_eq!(AudioChannels::from_layout(1, 1), AudioChannels::Unknown);
+        assert_eq!(AudioChannels::from_layout(8, 0), AudioChannels::Unknown);
     }
 
     // ── SampleRate::from_hz ───────────────────────────────────────────────
