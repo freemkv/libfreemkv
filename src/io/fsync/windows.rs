@@ -10,4 +10,6 @@
 
 use std::path::Path;
 
-pub(super) fn fsync_dir(_dir: &Path) {}
+pub(super) fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}

@@ -68,11 +68,14 @@ pub(crate) fn open_for_mkv(
 // Filesystem type of the output location. statfs needs an existing path and
 // `dest` usually is not created yet, so probe its directory.
 fn classify_dest(dest: &std::path::Path) -> crate::platform::fs_type::FsType {
-    let dir = match dest.parent() {
+    crate::platform::fs_type::detect(probe_dir(dest))
+}
+
+fn probe_dir(dest: &std::path::Path) -> &std::path::Path {
+    match dest.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => std::path::Path::new("."),
-    };
-    crate::platform::fs_type::detect(dir)
+    }
 }
 
 #[cfg(test)]
@@ -83,18 +86,13 @@ mod tests {
     // NFS branch was unreachable. The classification must come from its directory.
     #[test]
     fn classify_dest_probes_the_directory_of_a_new_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let new_file = dir.path().join("not-yet-created.mkv");
-        assert!(!new_file.exists());
+        use std::path::Path;
         assert_eq!(
-            classify_dest(&new_file),
-            crate::platform::fs_type::detect(dir.path())
+            probe_dir(Path::new("/mnt/nfs/out/Movie.mkv")),
+            Path::new("/mnt/nfs/out")
         );
         // A bare file name lives in the current directory.
-        assert_eq!(
-            classify_dest(std::path::Path::new("bare.mkv")),
-            crate::platform::fs_type::detect(std::path::Path::new("."))
-        );
+        assert_eq!(probe_dir(Path::new("bare.mkv")), Path::new("."));
     }
 
     // Type-level assertion: the concrete sinks satisfy the trait

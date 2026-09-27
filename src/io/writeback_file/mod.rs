@@ -156,8 +156,12 @@ impl Write for WritebackFile {
         Ok(())
     }
 
+    // Drains the in-flight chunk so its writeback verdict is known: sinks finished
+    // by `flush` alone (m2ts behind a BufWriter) must still see a latched error.
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.file.flush()?;
+        self.pipeline.finalize();
+        self.check_writeback()
     }
 }
 
@@ -206,6 +210,9 @@ impl Drop for WritebackFile {
         // without `sync_all` leaves the trailing chunk in cache. No `self.file.sync_all()`
         // here — `Drop`-triggered fsync would swallow errors; `finalize` is idempotent.
         self.pipeline.finalize();
+        if let Some(e) = self.pipeline.error() {
+            tracing::error!(target: "mux", error = %e, "WritebackFile dropped with a writeback error");
+        }
     }
 }
 
@@ -324,6 +331,22 @@ mod tests {
         );
         assert!(w.write(b"more").is_err(), "write after a latched error");
         assert!(w.sync_all().is_err(), "the error is sticky");
+    }
+
+    // Sinks that only flush (m2ts: BufWriter<WritebackFile>, finished by flush)
+    // must still see a latched writeback error.
+    #[test]
+    fn latched_writeback_error_fails_flush_through_bufwriter() {
+        const EIO: i32 = 5;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("wb-flush.bin");
+        let mut w = std::io::BufWriter::new(WritebackFile::create(&p).unwrap());
+        w.write_all(b"frames").unwrap();
+        // Buffer drained: the final flush issues no write, only `flush`.
+        w.flush().unwrap();
+        w.get_mut().pipeline.inject_error(EIO);
+        let e = w.flush().expect_err("flush must surface the latched error");
+        assert_eq!(e.raw_os_error(), Some(EIO));
     }
 
     // ── Added hardening tests ───────────────────────────────────────

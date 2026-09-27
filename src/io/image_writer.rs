@@ -80,10 +80,11 @@ pub fn write_image(
     file.sync_all()
         .map_err(|source| Error::IoError { source })?;
     // The file was just created: its directory entry needs its own fsync.
-    match dest.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => crate::io::fsync::dir(dir),
-        _ => crate::io::fsync::dir(Path::new(".")),
-    }
+    let dir = match dest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    crate::io::fsync::dir_checked(dir).map_err(|source| Error::IoError { source })?;
     Ok(written)
 }
 
@@ -131,6 +132,32 @@ mod tests {
 
     /// The written image is byte-for-byte what the source presented, at the
     /// right offsets — not merely the right length.
+    // A new file is only durable once its directory entry is: a directory that
+    // can't be opened for fsync (mode 0o300) must fail write_image, not report Ok.
+    #[cfg(unix)]
+    #[test]
+    fn unsyncable_parent_directory_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("wx-only");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(&dir).is_ok() {
+            // Running as root: permissions don't bite, nothing to assert.
+            return;
+        }
+        let mut src = PatternSource {
+            sectors: 4,
+            short_after: None,
+        };
+        let res = write_image(&mut src, &dir.join("x.iso"), 4, &Halt::new(), |_| {});
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(res, Err(Error::IoError { .. })),
+            "a failed directory fsync must not report success: {res:?}"
+        );
+    }
+
     #[test]
     fn writes_every_sector_in_order() {
         let dest = tmp("order");

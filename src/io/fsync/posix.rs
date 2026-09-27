@@ -4,15 +4,6 @@
 
 use std::path::Path;
 
-pub(super) fn fsync_dir(dir: &Path) {
-    match std::fs::File::open(dir) {
-        Ok(f) => {
-            if let Err(e) = f.sync_all() {
-                tracing::warn!(path = %dir.display(), error = %e, "failed to fsync directory");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "could not open directory to fsync");
-        }
-    }
+pub(super) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }

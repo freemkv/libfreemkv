@@ -63,8 +63,11 @@ pub(crate) struct WritebackPipeline {
     /// reads or writes it). `AtomicBool` over `bool` only because the
     /// load/store sites read cleanly; no sharing is needed today.
     degraded: AtomicBool,
-    /// First errno a `WAIT_AFTER` reported. Sticky: that call advanced the shared
-    /// `f_wb_err` cursor, so a later `fsync` returns 0 and this is the only record.
+    /// False for fds `sync_file_range` rejects (pipes, char devices such as
+    /// `/dev/null`): those skip kickoff, WAIT_AFTER and DONTNEED entirely.
+    waitable: bool,
+    /// First writeback errno a `WAIT_AFTER` reported. Sticky: that call may
+    /// consume the file's error state, so a later `fsync` can return 0.
     wb_errno: Option<i32>,
     /// The `WAIT_AFTER` syscall; a seam so tests can inject a writeback error.
     wait_op: WaitOp,
@@ -98,6 +101,7 @@ impl WritebackPipeline {
     pub(crate) fn new(file: &File, start_pos: u64, chunk_bytes: u64) -> Self {
         let fd = file.as_raw_fd();
         let is_nfs = detect_nfs(fd);
+        let waitable = fd_is_waitable(file);
         // Clone the fd so any leaked WAIT_AFTER worker thread keeps the
         // file description alive. Log but continue on clone failure.
         let wait_file = match file.try_clone() {
@@ -126,6 +130,7 @@ impl WritebackPipeline {
             chunk_count: 0,
             is_nfs,
             degraded: AtomicBool::new(false),
+            waitable,
             wb_errno: None,
             wait_op: sys_wait_after,
         }
@@ -141,7 +146,17 @@ impl WritebackPipeline {
         self.wb_errno.get_or_insert(errno);
     }
 
+    // Latch data-loss errnos; anything else (EINVAL, ESPIPE, ...) says the call
+    // itself was unsupported, not that written data was lost.
     fn latch_error(&mut self, errno: i32, off: u64, len: u64) {
+        if !is_writeback_errno(errno) {
+            tracing::warn!(
+                target: "mux",
+                errno,
+                "WritebackPipeline WAIT_AFTER rejected on chunk off={off} len={len}"
+            );
+            return;
+        }
         tracing::error!(
             target: "mux",
             errno,
@@ -159,7 +174,7 @@ impl WritebackPipeline {
     /// pipeline has flipped to degraded after a WAIT_AFTER timeout.
     #[inline]
     fn skip_wait(&self) -> bool {
-        self.is_nfs || self.degraded.load(Ordering::Relaxed)
+        !self.waitable || self.is_nfs || self.degraded.load(Ordering::Relaxed)
     }
 
     // Fresh per-call `File` clone for the WAIT_AFTER worker so the worker
@@ -184,26 +199,10 @@ impl WritebackPipeline {
         let chunk_len: u64 = pos.saturating_sub(self.last_flush_pos);
         let mut wait_ms: u64 = 0;
         let mut fadvise_ms: u64 = 0;
-        // Async kickoff for the just-completed chunk runs on every path (NFS,
-        // degraded, normal) — non-blocking by spec, an early hint that this
-        // range is ready to flush.
-        let kickoff_rc = unsafe {
-            libc::sync_file_range(
-                self.fd,
-                chunk_off as i64,
-                chunk_len as i64,
-                libc::SYNC_FILE_RANGE_WRITE,
-            )
-        };
-        if kickoff_rc != 0 {
-            // Non-fatal: the async write-out hint failed, but the data is
-            // still in the page cache and will be flushed by later fsync /
-            // kernel writeback. Surface it for diagnosability.
-            tracing::warn!(
-                target: "freemkv::io",
-                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                "sync_file_range(WRITE) kickoff failed"
-            );
+        // Async kickoff for the just-completed chunk runs on every waitable path
+        // (NFS, degraded, normal): non-blocking, a hint that the range can flush.
+        if self.waitable {
+            self.kickoff(chunk_off, chunk_len);
         }
         if let Some((prev_off, prev_len)) = self.pending.take() {
             if self.skip_wait() {
@@ -269,6 +268,27 @@ impl WritebackPipeline {
                 self.chunk_count,
                 self.is_nfs,
                 self.degraded.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    fn kickoff(&self, chunk_off: u64, chunk_len: u64) {
+        let kickoff_rc = unsafe {
+            libc::sync_file_range(
+                self.fd,
+                chunk_off as i64,
+                chunk_len as i64,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+        if kickoff_rc != 0 {
+            // Non-fatal: the async write-out hint failed, but the data is
+            // still in the page cache and will be flushed by later fsync /
+            // kernel writeback. Surface it for diagnosability.
+            tracing::warn!(
+                target: "freemkv::io",
+                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                "sync_file_range(WRITE) kickoff failed"
             );
         }
     }
@@ -354,6 +374,19 @@ impl WritebackPipeline {
             }
         }
     }
+}
+
+fn is_writeback_errno(errno: i32) -> bool {
+    matches!(errno, libc::EIO | libc::ENOSPC | libc::EDQUOT)
+}
+
+// Regular files and block devices support `sync_file_range`; anything else
+// (or an fstat failure) does not.
+fn fd_is_waitable(file: &File) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file.metadata()
+        .map(|m| m.file_type().is_file() || m.file_type().is_block_device())
+        .unwrap_or(false)
 }
 
 // Probe whether `fd` lives on an NFS mount via `crate::platform::fs_type::detect_fd`.
@@ -540,6 +573,47 @@ mod tests {
         p.note_progress(CHUNK_BYTES_MIN);
         p.finalize();
         assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EIO));
+    }
+
+    fn espipe_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        libc::ESPIPE
+    }
+
+    // Only data-loss errnos latch: ESPIPE/EINVAL mean the call was unsupported.
+    #[test]
+    fn non_writeback_errno_is_not_latched() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = espipe_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.note_progress(2 * CHUNK_BYTES_MIN);
+        p.finalize();
+        assert!(p.error().is_none());
+    }
+
+    // `/dev/null` (a sweep target) is a char device: sync_file_range rejects it,
+    // so the pipeline must skip the wait path instead of failing the write.
+    #[test]
+    fn char_device_skips_wait_and_never_latches() {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        let mut p = WritebackPipeline::new(&f, 0, CHUNK_BYTES_MIN);
+        p.wait_op = failing_wait;
+        assert!(p.skip_wait(), "a char device must not be waited on");
+        for i in 1..=4 {
+            p.note_progress(i * CHUNK_BYTES_MIN);
+        }
+        p.finalize();
+        assert!(p.error().is_none());
+    }
+
+    #[test]
+    fn regular_file_is_waitable() {
+        let f = NamedTempFile::new().expect("tempfile create");
+        assert!(fd_is_waitable(f.as_file()));
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert!(!fd_is_waitable(&null));
     }
 
     #[test]

@@ -511,6 +511,12 @@ impl DiscStream {
                 return Err(crate::error::Error::SourceTerminated.into());
             }
 
+            // The image file ends before this read: every later sector is missing
+            // too, so neither shrink/retry nor skip_errors applies.
+            if let Err(e @ crate::error::Error::ImageEndsBeforeRead { .. }) = res {
+                return Err(e.into());
+            }
+
             if (sectors as u32) <= align {
                 // Bottomed out with no later pass to recover — give the drive one
                 // full ECC recovery read (~60s) before skip/bail. A single bounded
@@ -1211,6 +1217,42 @@ mod tests {
             }],
             ..DiscTitle::empty()
         }
+    }
+
+    // A truncated ISO is not a bad sector: even with skip_errors the missing tail
+    // must abort with the image error, not be zero-filled and reported as success.
+    #[test]
+    fn truncated_image_aborts_even_with_skip_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("short.iso");
+        std::fs::write(&iso, vec![0u8; 4 * 2048]).unwrap();
+        let src = crate::io::file_sector_source::FileSectorSource::open(&iso).unwrap();
+        let mut stream = DiscStream::new(
+            Box::new(src),
+            synthetic_title(16),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
+        stream.skip_errors = true;
+        let mut outcome = Ok(true);
+        for _ in 0..64 {
+            outcome = stream.fill_extents();
+            if !matches!(outcome, Ok(true)) {
+                break;
+            }
+        }
+        let err = outcome.expect_err("a truncated image must abort the read");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("E{}", crate::error::E_IMAGE_ENDS_BEFORE_READ)),
+            "got {err}"
+        );
+        assert_eq!(stream.errors, 0, "must not count as a skipped sector");
+        assert_eq!(stream.lost_bytes, 0, "must not zero-fill the missing tail");
     }
 
     /// Smallest credible witness that `DiscStream` flows through `dyn Stream`:

@@ -61,6 +61,7 @@ pub const E_UDF_EMBEDDED_DATA: u16 = 6018;
 /// It has no [`Error`] variant on purpose: `UdfFs::file_extents` returns `Ok(vec![])` here and
 /// the CALLER detects the condition.
 pub const E_UDF_NO_USABLE_EXTENT: u16 = 6019;
+pub const E_IMAGE_ENDS_BEFORE_READ: u16 = 6020;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -474,9 +475,15 @@ pub enum Error {
     /// The image a mapfile describes is shorter than the mapfile's own total
     /// size, so the two no longer agree about the same disc. Resuming against
     /// it would treat the absent tail as already recovered. `have` and `want`
-    /// are byte lengths; a missing file reports `have == 0`. Also returned
-    /// when an image read ends past EOF (`want` = the read's end offset).
+    /// are byte lengths; a missing file reports `have == 0`.
     ImageTruncated {
+        have: u64,
+        want: u64,
+    },
+    /// A sector read from an image file runs past its end. `lba` is the read's
+    /// first sector; `have`/`want` are the file length and the read's end offset.
+    ImageEndsBeforeRead {
+        lba: u32,
         have: u64,
         want: u64,
     },
@@ -878,6 +885,7 @@ impl Error {
             Error::SelectionPidUnknown { .. } => E_SELECTION_PID_UNKNOWN,
             Error::MapfileInvalid { .. } => E_MAPFILE_INVALID,
             Error::ImageTruncated { .. } => E_IMAGE_TRUNCATED,
+            Error::ImageEndsBeforeRead { .. } => E_IMAGE_ENDS_BEFORE_READ,
             Error::AacsNoKeys => E_AACS_NO_KEYS,
             Error::AacsCertShort => E_AACS_CERT_SHORT,
             Error::AacsAgidAlloc => E_AACS_AGID_ALLOC,
@@ -1137,6 +1145,9 @@ impl std::fmt::Display for Error {
             // actual mismatch, not just the bare code.
             Error::ImageTruncated { have, want } => {
                 write!(f, "E{} {have}/{want}", self.code())
+            }
+            Error::ImageEndsBeforeRead { lba, have, want } => {
+                write!(f, "E{}: {lba} {have}/{want}", self.code())
             }
             _ => write!(f, "E{}", self.code()),
         }
@@ -1568,6 +1579,13 @@ mod tests {
             }
             .code(),
             Error::EmptyImage.code(),
+            Error::ImageTruncated { have: 0, want: 1 }.code(),
+            Error::ImageEndsBeforeRead {
+                lba: 0,
+                have: 0,
+                want: 1,
+            }
+            .code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
@@ -1617,6 +1635,14 @@ mod tests {
                     want: 1024,
                 },
                 E_IMAGE_TRUNCATED,
+            ),
+            (
+                Error::ImageEndsBeforeRead {
+                    lba: 7,
+                    have: 0,
+                    want: 1024,
+                },
+                E_IMAGE_ENDS_BEFORE_READ,
             ),
             (Error::DiscUrlNotDirect, E_DISC_URL_NOT_DIRECT),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
@@ -1936,6 +1962,7 @@ mod tests {
         assert!((6000..7000).contains(&E_HALTED));
         assert!((6000..7000).contains(&E_MAPFILE_INVALID));
         assert!((6000..7000).contains(&E_IMAGE_TRUNCATED));
+        assert!((6000..7000).contains(&E_IMAGE_ENDS_BEFORE_READ));
         // AACS (7xxx)
         assert!((7000..8000).contains(&E_AACS_NO_KEYS));
         assert!((7000..8000).contains(&E_NO_DISC_KEY));
