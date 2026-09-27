@@ -912,6 +912,27 @@ impl crate::pes::Stream for MkvStream {
         }
     }
 
+    fn set_codec_private(&mut self, track: usize, data: &[u8]) -> io::Result<bool> {
+        let track = match &self.mvc {
+            Some(m) => match m.stream_to_track.get(track).copied().flatten() {
+                Some(t) => t,
+                None => return Ok(false),
+            },
+            None => track,
+        };
+        match &mut self.mode {
+            Mode::Write(WriteMode::Pending(p)) => match p.tracks.get_mut(track) {
+                Some(t) if t.codec_private.is_none() => {
+                    t.codec_private = Some(data.to_vec());
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            Mode::Write(WriteMode::Active(m)) => m.set_codec_private(track, data),
+            _ => Ok(false),
+        }
+    }
+
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         if let Mode::Read(ref rs) = self.mode {
             // `track` is a stream index but `codec_privates` is keyed by Matroska

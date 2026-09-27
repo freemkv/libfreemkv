@@ -253,6 +253,12 @@ pub trait Stream: Send {
         Vec::new()
     }
 
+    /// Supply a codec_private that resolved after the header was written (late
+    /// AAC config). `Ok(true)` when the sink recorded it; default `Ok(false)`.
+    fn set_codec_private(&mut self, _track: usize, _data: &[u8]) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Cumulative count of read errors the stream skipped past (e.g.
     /// zero-filled bad sectors on a live drive). Default `0` for
     /// streams that don't have a notion of skip-on-error (file ISO,
@@ -354,6 +360,10 @@ impl Stream for CountingStream {
 
     fn config_changes(&self) -> Vec<(usize, u64)> {
         self.inner.config_changes()
+    }
+
+    fn set_codec_private(&mut self, track: usize, data: &[u8]) -> std::io::Result<bool> {
+        self.inner.set_codec_private(track, data)
     }
 
     fn errors(&self) -> u64 {
