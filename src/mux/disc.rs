@@ -2411,6 +2411,68 @@ mod tests {
             assert!(PesStream::headers_ready(&s));
         }
 
+        fn aac_only_stream() -> DiscStream {
+            use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate};
+            let mut title = audio_then_video_title();
+            title.content_format = ContentFormat::BdTs;
+            title.streams = vec![crate::disc::Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::Aac,
+                channels: AudioChannels::Stereo,
+                language: "eng".to_string(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: String::new(),
+            })];
+            DiscStream::new(
+                Box::new(ZeroReader { capacity: 8 }),
+                title,
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap()
+        }
+
+        // read() must feed the header gate: EOF releases a silent AAC track.
+        #[test]
+        fn read_eof_releases_a_silent_aac_track() {
+            let mut s = aac_only_stream();
+            assert!(!PesStream::headers_ready(&s));
+            assert!(
+                PesStream::read(&mut s).unwrap().is_none(),
+                "all-zero source"
+            );
+            assert!(PesStream::headers_ready(&s), "EOF expires the AAC wait");
+        }
+
+        // read() must feed the header gate every frame it returns.
+        #[test]
+        fn read_frames_advance_the_aac_wait() {
+            let mut s = aac_only_stream();
+            for sec in 0..=5i64 {
+                s.pending_frames.push_back(crate::pes::PesFrame {
+                    discard_padding_ns: 0,
+                    coding: None,
+                    source: None,
+                    track: 0,
+                    pts: sec * 1_000_000_000,
+                    keyframe: true,
+                    data: vec![0; 4],
+                    duration_ns: None,
+                });
+            }
+            for sec in 0..5 {
+                assert!(PesStream::read(&mut s).unwrap().is_some());
+                assert!(!PesStream::headers_ready(&s), "{sec} s: still waiting");
+            }
+            assert!(PesStream::read(&mut s).unwrap().is_some());
+            assert!(PesStream::headers_ready(&s), "5 s of source time elapsed");
+        }
+
         // ── on_event() / emit() ───────────────────────────────────────────
 
         /// `on_event()` installs the sink and `emit()` feeds it. If either is a

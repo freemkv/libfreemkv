@@ -52,7 +52,7 @@ fn effective_send_deadline(send_deadline: Option<Duration>) -> Duration {
 
 // Ceiling on bytes buffered while waiting for `headers_ready()`, so a damaged title whose
 // `codec_private` never resolves fails fast instead of OOM-killing the process.
-const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
 
 /// Where [`mux_stream`] reads its PES frames from. The driver owns the
 /// construction of the underlying [`Stream`] so consumers stop hand-rolling
@@ -599,9 +599,9 @@ fn drive_mux(
                         target: "mux",
                         buffered_bytes,
                         cap = HEADER_BUFFER_CAP_BYTES,
-                        "header buffer cap exceeded: the title keeps yielding frames but no \
-                         video track's codec_private ever resolved; refusing rather than \
-                         buffering the whole stream into RAM"
+                        "header buffer cap exceeded: the title keeps yielding frames but a \
+                         required codec_private (video or AAC) never resolved; refusing \
+                         rather than buffering the whole stream into RAM"
                     );
                     return Err(Error::MuxHeaderBufferExceeded {
                         bytes: buffered_bytes as u64,
@@ -613,24 +613,24 @@ fn drive_mux(
         }
     }
 
-    // ── Header gate ── The pump can break on EOF without headers resolving.
-    // Finalising then would write a track header with no CODEC_PRIVATE — a
-    // structurally-invalid MKV the zero-output guard does not catch. Refuse.
+    // ── Header gate ── Halt first, whatever headers_ready() says: on the
+    // highway path a halt can end the stream as `Ok(None)`, and that EOF also
+    // releases the AAC wait, so a ready gate does not mean the pump finished.
+    if halt.is_cancelled() {
+        return Ok(MuxOutcome {
+            completed: false,
+            output_opened: false,
+            bytes_written: 0,
+            errors: stream.errors(),
+            lost_bytes: stream.lost_bytes(),
+            streams: 0,
+            undelivered_streams: Vec::new(),
+        });
+    }
+    // The pump can break on EOF without headers resolving. Finalising then would
+    // write a track header with no CODEC_PRIVATE — a structurally-invalid MKV the
+    // zero-output guard does not catch. Refuse.
     if !stream.headers_ready() {
-        // Re-check halt FIRST: on the highway path a halt can end the stream as
-        // `Ok(None)` rather than `Err(Halted)`, breaking the loop with headers
-        // unresolved through no fault of the data — not a malformed disc.
-        if halt.is_cancelled() {
-            return Ok(MuxOutcome {
-                completed: false,
-                output_opened: false,
-                bytes_written: 0,
-                errors: stream.errors(),
-                lost_bytes: stream.lost_bytes(),
-                streams: 0,
-                undelivered_streams: Vec::new(),
-            });
-        }
         return Err(Error::MkvInvalid.into());
     }
 
@@ -849,6 +849,9 @@ mod tests {
         /// value — simulating a halt landing DURING a blocking `fill_extents` read
         /// (the common operator-stop case).
         halt_err_at_read: Option<usize>,
+        /// If set, `headers_ready` also flips once `read()` has returned `None`.
+        ready_on_eof: bool,
+        eof_seen: bool,
     }
 
     fn audio_stream() -> crate::disc::Stream {
@@ -879,6 +882,8 @@ mod tests {
                 cancel_halt: None,
                 read_observer: None,
                 halt_err_at_read: None,
+                ready_on_eof: false,
+                eof_seen: false,
             }
         }
         /// After `after` successful reads, the next `read()` returns
@@ -926,6 +931,7 @@ mod tests {
                 return Err(crate::error::Error::Halted.into());
             }
             let f = self.frames.pop_front();
+            self.eof_seen |= f.is_none();
             if f.is_some() {
                 self.reads += 1;
                 if let Some(obs) = &self.read_observer {
@@ -947,7 +953,7 @@ mod tests {
             self.codec_private_ready.then(|| vec![1, 2, 3])
         }
         fn headers_ready(&self) -> bool {
-            self.reads >= self.headers_ready_after
+            self.reads >= self.headers_ready_after || (self.ready_on_eof && self.eof_seen)
         }
     }
 
@@ -1143,6 +1149,30 @@ mod tests {
         .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
         assert!(out.output_opened, "the sink was opened before the halt");
+    }
+
+    // A halt that ends the stream as Ok(None) can also release the header gate
+    // (EOF expires the AAC wait); it must still stop before the sink opens.
+    #[test]
+    fn halt_ending_the_header_pump_never_opens_the_output() {
+        let halt = Halt::new();
+        let mut fs = FakeStream::new(1).with_frames(1).cancels(halt.clone(), 1);
+        fs.headers_ready_after = usize::MAX;
+        fs.ready_on_eof = true;
+        let events = SpyEvents::new();
+        let out = drive_mux(
+            Box::new(fs),
+            "null://",
+            &halt,
+            &events,
+            None,
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("halt is a clean stop");
+        assert!(!out.completed);
+        assert!(!out.output_opened, "no sink may be opened after a halt");
+        assert!(!events.opened.load(Ordering::SeqCst));
     }
 
     // ── A halt landing mid-read (Err(Halted), the common operator-stop case)

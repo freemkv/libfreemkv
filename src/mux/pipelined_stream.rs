@@ -1148,19 +1148,17 @@ mod tests {
     #[test]
     fn silent_aac_track_stops_blocking_headers_after_the_wait_bound() {
         let (mut stream, tx) = video_plus_aac();
-        tx.send(DemuxBatch::Ts(vec![pes_at(0x1011, vec![0; 8], 0)]))
+        // CountingParser passes PES pts through as ns: 1 s steps.
+        for sec in 0..5i64 {
+            tx.send(DemuxBatch::Ts(vec![pes_at(
+                0x1011,
+                vec![0; 8],
+                sec * 1_000_000_000,
+            )]))
             .unwrap();
-        stream.read().unwrap();
-        assert!(!stream.headers_ready());
-        // 4 s of source time: still waiting.
-        tx.send(DemuxBatch::Ts(vec![pes_at(
-            0x1011,
-            vec![0; 8],
-            4_000_000_000,
-        )]))
-        .unwrap();
-        stream.read().unwrap();
-        assert!(!stream.headers_ready());
+            stream.read().unwrap();
+            assert!(!stream.headers_ready(), "{sec} s: still waiting");
+        }
         tx.send(DemuxBatch::Ts(vec![pes_at(
             0x1011,
             vec![0; 8],
