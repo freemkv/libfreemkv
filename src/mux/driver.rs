@@ -2756,18 +2756,22 @@ mod tests {
     // full JOIN_TIMEOUT (600 s).
     #[test]
     fn a_send_timeout_bounds_the_final_join() {
-        struct Stuck;
+        // The wedged write returns only after finish has given up; the leaked
+        // consumer must then not finalise the output it was abandoned with.
+        struct Stuck(Arc<std::sync::atomic::AtomicBool>);
         impl Sink<u32> for Stuck {
             type Output = ();
             fn apply(&mut self, _: u32) -> Result<Flow, Error> {
-                std::thread::sleep(Duration::from_secs(3600));
+                std::thread::sleep(Duration::from_secs(7));
                 Ok(Flow::Continue)
             }
             fn close(self) -> Result<(), Error> {
+                self.0.store(true, Ordering::SeqCst);
                 Ok(())
             }
         }
-        let pipe = Pipeline::spawn(1, Stuck).unwrap();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(1, Stuck(closed.clone())).unwrap();
         let halt = Halt::new();
         let mut timed_out = false;
         for i in 0..4 {
@@ -2788,6 +2792,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("the join must be bounded by the grace, not JOIN_TIMEOUT");
         assert!(failed);
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "an abandoned consumer must not finalise the output late"
+        );
     }
 
     // An Opus-style CodecDelay/SeekPreRoll on an mkv:// source must reach the

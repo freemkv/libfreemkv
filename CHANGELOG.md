@@ -14,6 +14,8 @@
 - `list_drives` on Linux without sysfs keeps an sg node unless INQUIRY says it is not optical or open() fails with no device (ENOENT/ENXIO/ENODEV) or no permission (EACCES/EPERM), so a wedged or busy drive is still listed.
 - Dropping a transport or `Drive` unlocks the tray only if it locked it.
 - `Error::ImageTruncated` displays as `E<code>: have/want`.
+- `json://` audio `sample_rate` is now a number in Hz (`null` when unknown) instead of a display string such as `"48kHz"`; a new `sample_rates` array lists every rate a stream carries (e.g. `[48000, 96000]` for a 48/96 kHz combo).
+- `network://` / `stdio://` FMKV headers use version 2 when a track carries decoder timing (Opus CodecDelay/SeekPreRoll), adding per-frame DiscardPadding; streams without timing stay version 1.
 
 ### Removed
 

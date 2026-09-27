@@ -27,8 +27,8 @@ fn is_video_pid(pid: u16) -> bool {
     VIDEO_PID_RANGE.contains(&pid)
 }
 
-// Headroom below the first frame's PTS for frames presented before it but
-// emitted after it (BD T-STD bounds that audio/video skew to about 1 s).
+// Headroom below the first frame's PTS for frames presented before it but emitted
+// after it. ISO/IEC 13818-1 T-STD (§2.4.2.3) caps elementary-buffer delay at 1 s.
 pub(crate) const ORIGIN_HEADROOM_NS: i64 = 1_000_000_000;
 
 /// BD-TS muxer: PES frames in, 192-byte BD-TS packets out.
@@ -157,11 +157,9 @@ impl<W: Write> TsMuxer<W> {
             return Ok(());
         }
 
-        // Seed the global PTS origin from the FIRST frame of ANY kind, so one fixed
-        // origin rebases every frame and the a/v offset is preserved. Video-ONLY seeding
-        // made pre-video audio fall back to `base = unwrap_or(pts_ns)` (own pts) → PTS 0, spacing lost.
-        // The origin sits ORIGIN_HEADROOM_NS before that frame: a frame emitted
-        // later but presented earlier (video behind its GOP) keeps its offset.
+        // One origin for every track, seeded by the FIRST frame of any kind and set
+        // ORIGIN_HEADROOM_NS below it, so a frame emitted later but presented
+        // earlier (video behind its GOP) keeps its offset.
         let base = *self
             .base_pts_ns
             .get_or_insert(pts_ns.saturating_sub(ORIGIN_HEADROOM_NS));

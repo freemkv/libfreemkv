@@ -140,7 +140,7 @@ impl crate::pes::Stream for StdioStream {
             return Err(crate::error::Error::StreamReadOnly.into());
         }
         if self.header_written {
-            return Err(crate::error::Error::NoMetadata.into());
+            return Err(crate::error::Error::StreamHeaderWritten.into());
         }
         let tracks = self.disc_title.streams.len();
         super::network::set_timing(&mut self.timings, track, timing, tracks)

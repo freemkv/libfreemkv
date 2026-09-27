@@ -106,7 +106,7 @@ const MAX_PENDING_BYTES: usize = 64 << 20;
 
 enum Mode {
     Write(WriteMode),
-    Read(ReadState),
+    Read(Box<ReadState>),
 }
 
 // MKV write state with DEFERRED muxer construction: the track header
@@ -128,7 +128,7 @@ enum WriteMode {
 
 // Error for writing into a muxer that is finished or whose output already failed.
 fn muxer_unusable() -> io::Error {
-    crate::error::Error::MkvUnencodable.into()
+    crate::error::Error::StreamClosed.into()
 }
 
 /// Everything needed to build the muxer, held until the first coded picture
@@ -150,6 +150,41 @@ struct PendingMux {
     /// only frame count. Maintained on push; `buffered` is drained exactly once,
     /// at activation, after which neither field is consulted again.
     buffered_bytes: usize,
+    /// How far before the first IDR the timeline origin sits (mkvmerge-style).
+    origin_lead_ns: i64,
+    /// Audio/video frames dropped for lying before the reachable origin.
+    dropped_pre_origin: u64,
+}
+
+// Furthest an origin may precede the first IDR: its cluster opens at the IDR,
+// and a block's signed 16-bit relative timestamp reaches ~3.27 s back.
+const MAX_ORIGIN_LEAD_NS: i64 = 3_000_000_000;
+
+impl PendingMux {
+    // Origin = earliest buffered audio/video frame at or after the first clip's
+    // IN time, within MAX_ORIGIN_LEAD_NS of the IDR. Audio/video before it are
+    // dropped (counted); subtitles are kept and clamp to the origin.
+    fn set_origin(&mut self, idr_pts: i64, in_ns: Option<i64>) {
+        let floor = idr_pts.saturating_sub(MAX_ORIGIN_LEAD_NS);
+        let is_av = |tracks: &[MkvTrack], t: usize| {
+            tracks
+                .get(t)
+                .is_some_and(|t| t.track_type != ebml::TRACK_TYPE_SUBTITLE)
+        };
+        let origin = self
+            .buffered
+            .iter()
+            .filter(|(f, _)| is_av(&self.tracks, f.track))
+            .map(|(f, _)| f.pts)
+            .filter(|&pts| pts >= floor && in_ns.is_none_or(|i| pts >= i))
+            .fold(idr_pts, i64::min);
+        self.origin_lead_ns = idr_pts - origin;
+        let tracks = &self.tracks;
+        let before = self.buffered.len();
+        self.buffered
+            .retain(|(f, _)| !is_av(tracks, f.track) || f.pts >= floor);
+        self.dropped_pre_origin = (before - self.buffered.len()) as u64;
+    }
 }
 
 /// Matroska container stream.
@@ -455,6 +490,8 @@ impl MkvStream {
                 opening_capture_path: output_path.map(|p| p.to_path_buf()),
                 buffered: Vec::new(),
                 buffered_bytes: 0,
+                origin_lead_ns: 0,
+                dropped_pre_origin: 0,
             }))),
         })
     }
@@ -521,6 +558,7 @@ impl MkvStream {
         )?;
         // Seam correction from the playlist's marks where the title has them.
         muxer.set_clips(&self.disc_title.clips, self.disc_title.content_format);
+        muxer.set_origin_lead_ns(pending.origin_lead_ns, pending.dropped_pre_origin);
         if let Some(path) = &pending.opening_capture_path {
             muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
         }
@@ -582,15 +620,13 @@ impl MkvStream {
             // audio already buffered while its parser assembled the opening GOP.
             // Replaying the audio first made the muxer drop that entire prefix.
             if use_coding && frame.keyframe {
+                let in_ns = self
+                    .disc_title
+                    .clips
+                    .first()
+                    .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
                 if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
-                    // Frames presented before the IDR precede the timeline origin; the
-                    // muxer would clamp them all onto t=0, so drop them instead.
-                    let before = p.buffered.len();
-                    p.buffered.retain(|(f, _)| f.pts >= frame.pts);
-                    let dropped = before - p.buffered.len();
-                    if dropped > 0 {
-                        tracing::debug!(target: "mux", dropped, "frames before the first IDR dropped");
-                    }
+                    p.set_origin(frame.pts, in_ns);
                     let mut f = frame.clone();
                     f.track = track;
                     p.buffered.insert(0, (f, additional.map(<[u8]>::to_vec)));
@@ -622,10 +658,10 @@ impl MkvStream {
     /// Open an MKV file for reading → PES frames.
     pub fn open(mut reader: impl Read + Send + 'static) -> io::Result<Self> {
         let (disc_title, codec_privates, ts_scale_ns, tracks) = parse_mkv_header(&mut reader)?;
-        Ok(Self {
+        let mut stream = Self {
             disc_title,
             mvc: None,
-            mode: Mode::Read(ReadState {
+            mode: Mode::Read(Box::new(ReadState {
                 reader: Box::new(reader),
                 cluster_ts_ticks: 0,
                 ts_scale_ns,
@@ -634,8 +670,119 @@ impl MkvStream {
                 pending: std::collections::VecDeque::new(),
                 additions_dropped: 0,
                 additions_dropped_bytes: 0,
-            }),
-        })
+            })),
+        };
+        stream.resolve_pcm_depths()?;
+        Ok(stream)
+    }
+
+    // Decide the depth of each PCM track without BitDepth from its first blocks
+    // (bytes over duration). Undecidable tracks are exposed as Unknown, not LPCM.
+    fn resolve_pcm_depths(&mut self) -> io::Result<()> {
+        const MAX_FRAMES: usize = 512;
+        let unresolved = |s: &Self| match &s.mode {
+            Mode::Read(rs) => rs.tracks.pcm_infer.iter().any(Option::is_some),
+            Mode::Write(_) => false,
+        };
+        let mut buffered = Vec::new();
+        while unresolved(self) {
+            let decided = self.try_infer_pcm(&buffered, buffered.len() >= MAX_FRAMES);
+            if !decided.is_empty() {
+                self.apply_pcm_decisions(&decided, &mut buffered);
+                continue;
+            }
+            match self.read_parsed()? {
+                Some(f) => buffered.push(f),
+                None => {
+                    let decided = self.try_infer_pcm(&buffered, true);
+                    self.apply_pcm_decisions(&decided, &mut buffered);
+                }
+            }
+        }
+        if let Mode::Read(rs) = &mut self.mode {
+            for f in buffered.into_iter().rev() {
+                rs.pending.push_front(f);
+            }
+        }
+        Ok(())
+    }
+
+    // `(track, Some(depth) | None=undecidable)` for tracks decidable from
+    // `frames`; with `last`, every still-open track is decided.
+    fn try_infer_pcm(
+        &self,
+        frames: &[crate::pes::PesFrame],
+        last: bool,
+    ) -> Vec<(usize, Option<u64>)> {
+        let Mode::Read(rs) = &self.mode else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (idx, info) in rs.tracks.pcm_infer.iter().enumerate() {
+            let Some(info) = info else { continue };
+            let mine: Vec<_> = frames.iter().filter(|f| f.track == idx).collect();
+            let dur = |i: usize| -> Option<i64> {
+                let f = mine.get(i)?;
+                f.duration_ns
+                    .and_then(|d| i64::try_from(d).ok())
+                    .or_else(|| mine.get(i + 1).map(|n| n.pts - f.pts))
+            };
+            let depth = (0..mine.len()).find_map(|i| {
+                pcm_bytes_per_sample(mine[i].data.len(), dur(i)?, info.rate, info.channels)
+            });
+            match depth {
+                Some(w) => out.push((idx, Some(w * 8))),
+                None if last => out.push((idx, None)),
+                None => {}
+            }
+        }
+        out
+    }
+
+    // Record inferred depths, convert already-read frames, or demote the track.
+    fn apply_pcm_decisions(
+        &mut self,
+        decided: &[(usize, Option<u64>)],
+        buffered: &mut [crate::pes::PesFrame],
+    ) {
+        let Mode::Read(rs) = &mut self.mode else {
+            return;
+        };
+        for &(idx, depth) in decided {
+            let Some(Some(info)) = rs.tracks.pcm_infer.get_mut(idx).map(Option::take) else {
+                continue;
+            };
+            match depth.map(|d| PcmIn::for_track(info.le, d)) {
+                Some(Ok(layout)) => {
+                    if let Some(slot) = rs.tracks.pcm.get_mut(idx) {
+                        *slot = layout;
+                    }
+                    if let Some(layout) = layout {
+                        let pending = rs.pending.iter_mut();
+                        for f in buffered
+                            .iter_mut()
+                            .chain(pending)
+                            .filter(|f| f.track == idx)
+                        {
+                            f.data = layout.to_be24(&f.data);
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        target: "mux",
+                        code = crate::error::E_MKV_SOURCE_INVALID,
+                        track = idx,
+                        "mkv read-back: PCM track has no BitDepth and none can be inferred"
+                    );
+                    if let Some(crate::disc::Stream::Audio(a)) =
+                        self.disc_title.streams.get_mut(idx)
+                    {
+                        a.codec = Codec::Unknown(0);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -695,8 +842,9 @@ fn apply_coding_to_track(
     }
 }
 
-impl crate::pes::Stream for MkvStream {
-    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+impl MkvStream {
+    // One parsed frame (PCM samples already converted where the layout is known).
+    fn read_parsed(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         let rs = match self.mode {
             Mode::Read(ref mut rs) => rs,
             Mode::Write(_) => return Err(crate::error::Error::StreamWriteOnly.into()),
@@ -870,6 +1018,12 @@ impl crate::pes::Stream for MkvStream {
             }
         }
     }
+}
+
+impl crate::pes::Stream for MkvStream {
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        self.read_parsed()
+    }
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         if matches!(self.mode, Mode::Read(_)) {
@@ -959,7 +1113,7 @@ impl crate::pes::Stream for MkvStream {
             Mode::Write(WriteMode::Pending(p)) => p,
             Mode::Read(_) => return Err(crate::error::Error::StreamReadOnly.into()),
             // The TrackEntry is already written: the timing can no longer be encoded.
-            Mode::Write(_) => return Err(muxer_unusable()),
+            Mode::Write(_) => return Err(crate::error::Error::StreamHeaderWritten.into()),
         };
         let range = || -> io::Error {
             crate::error::Error::MuxTrackRange {
@@ -1135,13 +1289,14 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                     }
                     remaining -= consumed;
                     if cid == ebml::TRACK_ENTRY {
-                        let (stream, tnum, cp, default_dur, timing, pcm) = parse_track(r, cs)?;
+                        let (stream, tnum, cp, default_dur, timing, pcm, infer) =
+                            parse_track(r, cs)?;
                         if let Some(s) = stream {
                             // Record the TrackNumber alongside the stream it maps
                             // to, in the SAME order, so block routing never has to
                             // guess that TrackNumbers are 1..=N.
                             streams.push(s);
-                            tracks.push(tnum, default_dur, timing, pcm);
+                            tracks.push(tnum, default_dur, timing, pcm, infer);
                         }
                         if let Some(cp) = cp {
                             codec_privates.push((tnum, cp));
@@ -1209,7 +1364,29 @@ type ParsedTrack = (
     Option<u64>,
     crate::pes::TrackTiming,
     Option<PcmIn>,
+    Option<PcmInfer>,
 );
+
+// A PCM track that declares no BitDepth: the depth is inferred from the first
+// blocks' byte counts over their duration (see `MkvStream::resolve_pcm_depths`).
+#[derive(Clone, Copy, Debug)]
+struct PcmInfer {
+    le: bool,
+    rate: f64,
+    channels: u8,
+}
+
+// Bytes per sample implied by `bytes` of `channels`-channel audio lasting `dur_ns`.
+fn pcm_bytes_per_sample(bytes: usize, dur_ns: i64, rate: f64, channels: u8) -> Option<u64> {
+    let samples = dur_ns as f64 / 1e9 * rate * f64::from(channels);
+    if dur_ns <= 0 || samples < 1.0 {
+        return None;
+    }
+    let bps = bytes as f64 / samples;
+    [2u64, 3]
+        .into_iter()
+        .find(|&w| (bps - w as f64).abs() < 0.05 * w as f64)
+}
 
 // Source layout of a PCM track whose samples are rewritten to the 24-bit
 // big-endian form every LPCM consumer expects. `None` = already 24-bit BE.
@@ -1222,12 +1399,12 @@ enum PcmIn {
 
 impl PcmIn {
     // Layout for a PCM codec ID + BitDepth: `Ok(None)` = already 24-bit BE,
-    // `Err(())` = not representable as LPCM. Absent BitDepth reads as 16.
+    // `Err(())` = not representable as LPCM.
     fn for_track(le: bool, bit_depth: u64) -> Result<Option<Self>, ()> {
         match (le, bit_depth) {
-            (false, 0 | 16) => Ok(Some(PcmIn::Be16)),
+            (false, 16) => Ok(Some(PcmIn::Be16)),
             (false, 24) => Ok(None),
-            (true, 0 | 16) => Ok(Some(PcmIn::Le16)),
+            (true, 16) => Ok(Some(PcmIn::Le16)),
             (true, 24) => Ok(Some(PcmIn::Le24)),
             _ => Err(()),
         }
@@ -1360,8 +1537,16 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     // &str consts can't be `match` patterns, so compare via guards — this keeps
     // the single source of truth in `ebml::CODEC_*` shared with the muxer.
     let cid = codec_id.as_str();
-    let mut pcm = None;
-    let codec = if cid == ebml::CODEC_PCM_BE || cid == ebml::CODEC_PCM_LE {
+    let (mut pcm, mut infer) = (None, None);
+    let is_pcm = cid == ebml::CODEC_PCM_BE || cid == ebml::CODEC_PCM_LE;
+    let codec = if is_pcm && bit_depth == 0 {
+        infer = Some(PcmInfer {
+            le: cid == ebml::CODEC_PCM_LE,
+            rate: sr,
+            channels: ch,
+        });
+        Codec::Lpcm
+    } else if is_pcm {
         match PcmIn::for_track(cid == ebml::CODEC_PCM_LE, bit_depth) {
             Ok(layout) => {
                 pcm = layout;
@@ -1466,7 +1651,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         })),
         _ => None,
     };
-    Ok((stream, tnum, codec_priv, default_dur, timing, pcm))
+    Ok((stream, tnum, codec_priv, default_dur, timing, pcm, infer))
 }
 
 // Read-side map from Matroska TrackNumber to the index of the corresponding entry in
@@ -1483,6 +1668,8 @@ struct TrackTable {
     timings: Vec<crate::pes::TrackTiming>,
     /// PCM tracks whose samples are rewritten to 24-bit big-endian on read.
     pcm: Vec<Option<PcmIn>>,
+    /// PCM tracks whose depth is still to be inferred from their blocks.
+    pcm_infer: Vec<Option<PcmInfer>>,
 }
 
 impl TrackTable {
@@ -1492,11 +1679,13 @@ impl TrackTable {
         default_duration_ns: Option<u64>,
         timing: crate::pes::TrackTiming,
         pcm: Option<PcmIn>,
+        infer: Option<PcmInfer>,
     ) {
         self.nums.push(num);
         self.timings.push(timing);
         self.default_durations.push(default_duration_ns);
         self.pcm.push(pcm);
+        self.pcm_infer.push(infer);
     }
 
     /// Stream index carrying blocks with this TrackNumber, or `None` when the
@@ -1523,6 +1712,7 @@ impl TrackTable {
             default_durations: vec![None; n],
             timings: vec![Default::default(); n],
             pcm: vec![None; n],
+            pcm_infer: vec![None; n],
         }
     }
 }
@@ -2041,11 +2231,8 @@ mod tests {
         );
     }
 
-    // Blu-ray 3D case: base (left-eye) + dependent (right-eye) video. The
-    // dependent must NOT become its own track (folds into base as
-    // BlockAdditional) — a silently-disabled merge yields two H.264 tracks, not 3D.
-    #[test]
-    fn a_base_and_dependent_video_pair_builds_the_mvc_merge_and_skips_the_dependent_track() {
+    // Blu-ray 3D title: base (0), MVC dependent (1) and AC-3 audio (2).
+    fn mvc_title() -> crate::disc::DiscTitle {
         use crate::disc::{
             AudioStream, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream,
             VideoStream,
@@ -2068,10 +2255,10 @@ mod tests {
                 measured_cicp: None,
             })
         };
-        let title = DiscTitle {
+        DiscTitle {
             streams: vec![
-                view(false), // 0: base (left eye)
-                view(true),  // 1: dependent (right eye)
+                view(false),
+                view(true),
                 Stream::Audio(AudioStream {
                     pid: 0x1100,
                     codec: Codec::Ac3,
@@ -2081,11 +2268,36 @@ mod tests {
                     secondary: false,
                     purpose: crate::disc::LabelPurpose::Normal,
                     label: String::new(),
-                }), // 2: audio
+                }),
             ],
             ..DiscTitle::empty()
-        };
-        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title, None).unwrap();
+        }
+    }
+
+    // write()-level: an audio frame on a 3D title takes the pass-through fast
+    // path and lands on its remapped muxer track with its payload intact.
+    #[test]
+    fn mvc_title_audio_passes_through_to_its_remapped_track() {
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &mvc_title(), None).unwrap();
+        s.write(&av_frame(0, 0, true, vec![0x11; 16])).unwrap();
+        s.write(&av_frame(2, 10_000_000, true, vec![0xA5; 8]))
+            .unwrap();
+        s.write(&av_frame(2, 42_000_000, true, vec![0xA6; 8]))
+            .unwrap();
+        s.finish().unwrap();
+        let back = drain(&mut MkvStream::open(Cursor::new(out.bytes())).unwrap());
+        let audio: Vec<_> = back.iter().filter(|f| f.track == 1).collect();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(audio[0].data, vec![0xA5; 8]);
+        assert_eq!(audio[1].pts, 42_000_000);
+    }
+
+    // The dependent must NOT become its own track (it folds into the base as
+    // BlockAdditional): a silently-disabled merge yields two H.264 tracks, not 3D.
+    #[test]
+    fn a_base_and_dependent_video_pair_builds_the_mvc_merge_and_skips_the_dependent_track() {
+        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &mvc_title(), None).unwrap();
         let mvc = s
             .mvc
             .as_ref()
@@ -2741,6 +2953,7 @@ mod tests {
                 default_durations: vec![None],
                 timings: vec![Default::default()],
                 pcm: vec![None],
+                pcm_infer: vec![None],
             }
             .index_of(65535),
             Some(0),
@@ -3985,7 +4198,8 @@ mod tests {
             (2, ebml::CODEC_EAC3, Codec::Ac3Plus),
             (2, ebml::CODEC_TRUEHD, Codec::TrueHd),
             (2, ebml::CODEC_DTS, Codec::Dts),
-            (2, ebml::CODEC_PCM_BE, Codec::Lpcm),
+            // No BitDepth and no blocks to infer it from: not presented as LPCM.
+            (2, ebml::CODEC_PCM_BE, Codec::Unknown(0)),
             (2, ebml::CODEC_AAC, Codec::Aac),
             (2, ebml::CODEC_MP2, Codec::Mp2),
             (2, ebml::CODEC_MP3, Codec::Mp3),
@@ -5100,6 +5314,24 @@ mod tests {
         }
     }
 
+    // Timing set on one track lands on that track only; the others read default.
+    #[test]
+    fn track_timing_is_per_track() {
+        let out = SharedOut::new();
+        let timing = crate::pes::TrackTiming {
+            codec_delay_ns: 6_500_000,
+            seek_preroll_ns: 80_000_000,
+        };
+        let mut w = MkvStream::create(Box::new(out.clone()), &three_track_title(), None).unwrap();
+        w.set_track_timing(1, timing).unwrap();
+        w.write(&av_frame(0, 0, true, vec![1, 2, 3])).unwrap();
+        w.finish().unwrap();
+        let r = MkvStream::open(Cursor::new(out.bytes())).unwrap();
+        assert_eq!(r.track_timing(1), timing);
+        assert_eq!(r.track_timing(0), Default::default());
+        assert_eq!(r.track_timing(2), Default::default());
+    }
+
     #[test]
     fn laced_padding_applies_only_to_the_appropriate_edge_frame() {
         for padding in [-1_000_000i64, 1_000_000] {
@@ -5170,38 +5402,55 @@ mod tests {
         assert_eq!(frames[0].discard_padding_ns, 0);
     }
 
-    // Audio buffered while the video parser assembled its first GOP, but earlier
-    // than the first IDR, must not be squashed onto t=0 on replay.
+    fn pts_of(frames: &[crate::pes::PesFrame], track: usize) -> Vec<i64> {
+        frames
+            .iter()
+            .filter(|f| f.track == track)
+            .map(|f| f.pts)
+            .collect()
+    }
+
+    // mkvmerge-style origin: the earliest audio/video frame, not the first IDR.
+    // Audio 40 ms before the IDR keeps its spacing; an earlier subtitle cue is
+    // kept (clamped to the origin), never dropped.
     #[test]
-    fn audio_before_the_first_idr_keeps_its_spacing_on_replay() {
+    fn frames_before_the_first_idr_are_kept_relative_to_the_earliest() {
         let out = SharedOut::new();
         let mut s = MkvStream::create(Box::new(out.clone()), &three_track_title(), None).unwrap();
-        let idr = 160_000_000i64;
-        for i in 0..8i64 {
-            s.write(&av_frame(1, i * 32_000_000, true, vec![0xA0 + i as u8; 8]))
-                .unwrap();
-        }
-        s.write(&av_frame(0, idr, true, vec![0x11; 16])).unwrap();
-        s.write(&av_frame(1, 256_000_000, true, vec![0xB0; 8]))
+        s.write(&av_frame(
+            2,
+            100_000_000,
+            true,
+            vec![0, 8, 0, 4, 0xAA, 0xBB, 0, 4],
+        ))
+        .unwrap();
+        s.write(&av_frame(1, 120_000_000, true, vec![0xA0; 8]))
+            .unwrap();
+        s.write(&av_frame(0, 160_000_000, true, vec![0x11; 16]))
+            .unwrap();
+        s.write(&av_frame(1, 192_000_000, true, vec![0xB0; 8]))
             .unwrap();
         s.finish().unwrap();
         let back = drain(&mut MkvStream::open(Cursor::new(out.bytes())).unwrap());
-        let audio: Vec<i64> = back
-            .iter()
-            .filter(|f| f.track == 1)
-            .map(|f| f.pts)
-            .collect();
-        let video: Vec<i64> = back
-            .iter()
-            .filter(|f| f.track == 0)
-            .map(|f| f.pts)
-            .collect();
-        assert_eq!(video, vec![0]);
-        assert_eq!(
-            audio,
-            vec![0, 32_000_000, 64_000_000, 96_000_000],
-            "audio keeps its offset from the first IDR"
-        );
+        assert_eq!(pts_of(&back, 0), vec![40_000_000]);
+        assert_eq!(pts_of(&back, 1), vec![0, 72_000_000]);
+        assert_eq!(pts_of(&back, 2), vec![0], "the early cue is kept, clamped");
+    }
+
+    // Audio further before the IDR than a block can reach from its cluster is dropped.
+    #[test]
+    fn audio_far_before_the_first_idr_is_dropped_not_squashed() {
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &three_track_title(), None).unwrap();
+        s.write(&av_frame(1, 0, true, vec![0xA0; 8])).unwrap();
+        s.write(&av_frame(1, 4_000_000_000, true, vec![0xA1; 8]))
+            .unwrap();
+        s.write(&av_frame(0, 5_000_000_000, true, vec![0x11; 16]))
+            .unwrap();
+        s.finish().unwrap();
+        let back = drain(&mut MkvStream::open(Cursor::new(out.bytes())).unwrap());
+        assert_eq!(pts_of(&back, 1), vec![0]);
+        assert_eq!(pts_of(&back, 0), vec![1_000_000_000]);
     }
 
     struct FailingWriter;
@@ -5224,10 +5473,9 @@ mod tests {
         let mut s = MkvStream::create(Box::new(FailingWriter), &h264_title(), None).unwrap();
         let kf = av_frame(0, 0, true, vec![1, 2, 3]);
         assert!(s.write(&kf).is_err(), "the header write failure surfaces");
-        assert!(
-            s.write(&kf).is_err(),
-            "a later write must not report success"
-        );
+        let err = s.write(&kf).unwrap_err();
+        let code = format!("E{}", crate::error::E_STREAM_CLOSED);
+        assert!(err.to_string().starts_with(&code), "{err}");
         assert!(s.finish().is_err(), "a truncated MKV must not finish Ok");
     }
 
@@ -5244,7 +5492,8 @@ mod tests {
         assert!(err.to_string().starts_with(&code), "{err}");
         s.write(&av_frame(0, 0, true, vec![1])).unwrap();
         let err = s.set_track_timing(0, timing).unwrap_err();
-        assert!(err.to_string().starts_with('E'), "numeric code, got {err}");
+        let code = format!("E{}", crate::error::E_STREAM_HEADER_WRITTEN);
+        assert!(err.to_string().starts_with(&code), "{err}");
     }
 
     // mkv -> mkv: an A_FLAC track must come back as FLAC with its STREAMINFO
@@ -5286,12 +5535,24 @@ mod tests {
 
     // One PCM audio track (`codec_id`, optional BitDepth) with one SimpleBlock.
     fn pcm_mkv(codec_id: &str, bit_depth: Option<u64>, samples: &[u8]) -> Vec<u8> {
+        pcm_mkv_blocks(codec_id, bit_depth, &[(0, samples.to_vec())])
+    }
+
+    // Stereo 48 kHz PCM track with one SimpleBlock per `(timestamp_ms, samples)`.
+    fn pcm_mkv_blocks(
+        codec_id: &str,
+        bit_depth: Option<u64>,
+        blocks: &[(u64, Vec<u8>)],
+    ) -> Vec<u8> {
         let mut entry = Vec::new();
         ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
         ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 2).unwrap();
         ebml::write_string(&mut entry, ebml::CODEC_ID, codec_id).unwrap();
         let mut audio = Vec::new();
         ebml::write_uint(&mut audio, ebml::CHANNELS, 2).unwrap();
+        ebml::write_id(&mut audio, ebml::SAMPLING_FREQUENCY).unwrap();
+        ebml::write_size(&mut audio, 8).unwrap();
+        audio.extend_from_slice(&48_000f64.to_be_bytes());
         if let Some(d) = bit_depth {
             ebml::write_uint(&mut audio, ebml::BIT_DEPTH, d).unwrap();
         }
@@ -5304,10 +5565,40 @@ mod tests {
         ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
         ebml::write_unknown_size(&mut out).unwrap();
         ebml::write_binary(&mut out, ebml::TRACKS, &tracks).unwrap();
-        let mut block = vec![0x81, 0, 0, 0x80];
-        block.extend_from_slice(samples);
-        out.extend(cluster_with_simple_block(0, &block));
+        for (ms, samples) in blocks {
+            let mut block = vec![0x81, 0, 0, 0x80];
+            block.extend_from_slice(samples);
+            out.extend(cluster_with_simple_block(*ms, &block));
+        }
         out
+    }
+
+    // No BitDepth: the depth is inferred from bytes per block over its duration;
+    // an undecidable track is not presented as LPCM.
+    #[test]
+    fn pcm_without_bit_depth_infers_the_depth_from_block_sizes() {
+        // Blocks 2 ms apart: 96 stereo sample frames at 48 kHz.
+        let b24: Vec<u8> = (0..96 * 2 * 3).map(|i| i as u8).collect();
+        let bytes = pcm_mkv_blocks(
+            ebml::CODEC_PCM_BE,
+            None,
+            &[(0, b24.clone()), (2, b24.clone())],
+        );
+        let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(stream_codec(&s.info().streams[0]), Codec::Lpcm);
+        let frames = drain(&mut s);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, b24, "24-bit big-endian passes through");
+
+        let b16 = [0x12u8, 0x34].repeat(96 * 2);
+        let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &[(0, b16.clone()), (2, b16)]);
+        let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(drain(&mut s)[0].data[..3], [0x12, 0x34, 0]);
+
+        let odd = vec![0u8; 250];
+        let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &[(0, odd.clone()), (2, odd)]);
+        let s = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(stream_codec(&s.info().streams[0]), Codec::Unknown(0));
     }
 
     // LPCM frames downstream are 24-bit big-endian: 16-bit and little-endian
@@ -5323,12 +5614,6 @@ mod tests {
                 Some(16),
                 &[0x12, 0x34, 0xAB, 0xCD],
                 Some(&[0x12, 0x34, 0, 0xAB, 0xCD, 0]),
-            ),
-            (
-                ebml::CODEC_PCM_BE,
-                None,
-                &[0x12, 0x34],
-                Some(&[0x12, 0x34, 0]),
             ),
             (ebml::CODEC_PCM_BE, Some(24), &[1, 2, 3], Some(&[1, 2, 3])),
             (

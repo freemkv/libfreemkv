@@ -48,6 +48,7 @@ rip = [
     "dep:crossbeam-channel",
     "dep:rayon",
     "dep:memchr",
+    "dep:socket2",
 ]
 
 [dependencies]
@@ -62,6 +63,8 @@ aes = { version = "0.9", optional = true }
 freemkv-unlock = { path = "../freemkv-unlock", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
 base64 = { version = "0.23", optional = true }
+# Safe TCP keepalive setup for `network://` receive (dead-peer detection).
+socket2 = { version = "0.6", features = ["all"], optional = true }
 # Read-only XML DOM parser (pure Rust, forbid(unsafe_code), entity-expansion
 # bounded). Parses the HD-DVD Advanced-Content playlist `ADV_OBJ/VPLST000.XPL`
 # — untrusted disc bytes — into authoritative titles/clips/chapters. A real

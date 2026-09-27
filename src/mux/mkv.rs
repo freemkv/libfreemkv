@@ -573,6 +573,11 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// `finish()` via `frame_count == 0`, not this counter; a PARTIAL drop is normal and is
     /// only logged, not an error — `finish()` is this field's only reader, so keep that log.
     dropped_pre_cluster: u64,
+    /// Ticks the timeline origin sits before the first video keyframe.
+    origin_lead_ticks: i64,
+    /// Per VobSub track: file offset of an open-ended block's 3-byte
+    /// BlockDuration value, and that block's timestamp in ticks.
+    vobsub_open_end: std::collections::HashMap<usize, (u64, i64)>,
     seek_fixups: Vec<SeekPositionFixup>,
     /// Absolute file offset of the CUES SeekHead entry (a fixed 21-byte Seek
     /// element). When `finish()` writes no Cues element (zero cue points), this
@@ -708,11 +713,13 @@ struct InterlacedRewrite {
 // AUs.
 const TIMESTAMP_SCALE_NS: i64 = 100_000;
 
-// BlockDuration for a SUBTITLE frame that reaches the muxer with no duration and
-// (VobSub) no SPU stop command, so every subtitle block stays durated (issue #52).
-// PGS and VobSub cues end at the next display set / SPU, so a long bound only
-// caps a cue that is already replaced, while a short one hid real cues early.
-const SUBTITLE_FALLBACK_BLOCK_DURATION_NS: i64 = 30_000_000_000;
+// BlockDuration for a durationless PGS block (issue #52): a PGS cue ends at the
+// next display set, so a long bound only caps a cue that is already replaced.
+const PGS_FALLBACK_BLOCK_DURATION_NS: i64 = 30_000_000_000;
+
+// A VobSub SPU with no stop command ends at the next SPU on its track (patched
+// in place), or after this cap. 100_000 ticks keeps the field 3 bytes wide.
+const VOBSUB_OPEN_END_TICKS: u64 = 100_000;
 
 // VobSub SP_DCSQ delays count 1024 ticks of the 90 kHz clock.
 const SPU_DELAY_NS: u64 = 1024 * 1_000_000_000 / 90_000;
@@ -1218,6 +1225,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             cues: Vec::new(),
             frame_count: 0,
             dropped_pre_cluster: 0,
+            origin_lead_ticks: 0,
+            vobsub_open_end: std::collections::HashMap::new(),
             seek_fixups,
             cues_seek_entry_pos,
             info_offset,
@@ -1266,6 +1275,22 @@ impl<W: Write + Seek> MkvMuxer<W> {
         self.writer.seek(std::io::SeekFrom::Start(here))?;
         self.codec_private_reserves.remove(&track);
         Ok(true)
+    }
+
+    // Overwrite a 3-byte big-endian value at `pos`, then return to the end.
+    fn patch_u24(&mut self, pos: u64, val: u64) -> io::Result<()> {
+        let end = self.writer.stream_position()?;
+        self.writer.seek(io::SeekFrom::Start(pos))?;
+        self.writer.write_all(&val.to_be_bytes()[5..])?;
+        self.writer.seek(io::SeekFrom::Start(end))?;
+        Ok(())
+    }
+
+    /// Put the timeline origin `lead_ns` before the first video keyframe (the
+    /// earliest audio/video frame), and count `dropped` frames that lay before it.
+    pub(crate) fn set_origin_lead_ns(&mut self, lead_ns: i64, dropped: u64) {
+        self.origin_lead_ticks = lead_ns.max(0) / TIMESTAMP_SCALE_NS;
+        self.dropped_pre_cluster += dropped;
     }
 
     /// Attach an opening-frame capture (`--log-level 3`). The capture writes the
@@ -1422,8 +1447,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     self.dropped_pre_cluster += 1;
                     return Ok(());
                 }
-                self.base_pts_ticks = Some(raw_ticks);
-                raw_ticks
+                let base = raw_ticks - self.origin_lead_ticks;
+                self.base_pts_ticks = Some(base);
+                base
             }
         };
         // Floor at 0: a frame earlier than base (pre-keyframe audio, or a stream
@@ -1495,19 +1521,27 @@ impl<W: Write + Seek> MkvMuxer<W> {
             .get(track_idx)
             .copied()
             .unwrap_or(false);
+        let is_vobsub = self
+            .track_is_vobsub
+            .get(track_idx)
+            .copied()
+            .unwrap_or(false);
+        if is_vobsub && let Some((pos, start)) = self.vobsub_open_end.remove(&track_idx) {
+            let ticks = ((pts_ticks - start).max(1) as u64).min(VOBSUB_OPEN_END_TICKS);
+            self.patch_u24(pos, ticks)?;
+        }
+        let mut vobsub_open = false;
         let duration_ticks = match duration_ticks {
             Some(dt) => Some(dt),
+            None if is_vobsub => match vobsub_display_ns(data).filter(|&ns| ns > 0) {
+                Some(ns) => Some((ns as i64 / TIMESTAMP_SCALE_NS).max(1) as u64),
+                None => {
+                    vobsub_open = true;
+                    Some(VOBSUB_OPEN_END_TICKS)
+                }
+            },
             None if is_subtitle => {
-                let spu_ns = self
-                    .track_is_vobsub
-                    .get(track_idx)
-                    .copied()
-                    .unwrap_or(false)
-                    .then(|| vobsub_display_ns(data))
-                    .flatten()
-                    .filter(|&ns| ns > 0);
-                let ns = spu_ns.map_or(SUBTITLE_FALLBACK_BLOCK_DURATION_NS, |ns| ns as i64);
-                Some((ns / TIMESTAMP_SCALE_NS).max(1) as u64)
+                Some((PGS_FALLBACK_BLOCK_DURATION_NS / TIMESTAMP_SCALE_NS) as u64)
             }
             None => None,
         };
@@ -1584,6 +1618,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     }
                 },
             }
+        }
+        // BlockDuration is the group's last element: its 3 value bytes end the write.
+        if vobsub_open {
+            let end = self.writer.stream_position()?;
+            self.vobsub_open_end.insert(track_idx, (end - 3, pts_ticks));
         }
         // Recorded per track (not a single global slot) so a later non-keyframe
         // references a keyframe on its OWN track — a shared slot produced cross-track
@@ -5143,6 +5182,27 @@ mod tests {
         let groups = all_block_groups(&data);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].duration, 29_127, "SPU stop time, not a 1 s guess");
+    }
+
+    // A VobSub SPU with no stop command ends at the next SPU on its track, else
+    // after a 10 s cap.
+    #[test]
+    fn vobsub_without_a_stop_ends_at_the_next_spu_or_the_cap() {
+        let mut track = make_subtitle_track();
+        track.codec_id = ebml::CODEC_VOBSUB;
+        // One DCSQ at offset 6: delay 0, next = itself, STA_DSP, CMD_END.
+        let spu = vec![0, 12, 0, 6, 0xAB, 0xCD, 0, 0, 0, 6, 0x01, 0xFF];
+        let data = mux_with_durations(
+            &[track],
+            &[
+                (0, 0, true, spu.clone(), None),
+                (0, 2_000_000_000, true, spu, None),
+            ],
+        );
+        let groups = all_block_groups(&data);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].duration, 20_000, "ends at the next SPU");
+        assert_eq!(groups[1].duration, 100_000, "last one capped at 10 s");
     }
 
     #[test]

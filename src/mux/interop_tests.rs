@@ -67,6 +67,30 @@ fn generate(
     bframes: bool,
     multi_audio: bool,
 ) -> PathBuf {
+    generate_with(
+        dir,
+        video,
+        audio,
+        transport,
+        vfr,
+        bframes,
+        multi_audio,
+        false,
+    )
+}
+
+// `video_late`: video starts 0.3 s in, so the 0.1 s audio precedes the first IDR.
+#[allow(clippy::too_many_arguments)]
+fn generate_with(
+    dir: &Path,
+    video: &str,
+    audio: Option<&str>,
+    transport: bool,
+    vfr: bool,
+    bframes: bool,
+    multi_audio: bool,
+    video_late: bool,
+) -> PathBuf {
     let path = dir.join(if transport { "input.m2ts" } else { "input.mkv" });
     let mut command = Command::new("ffmpeg");
     command.args([
@@ -144,6 +168,9 @@ fn generate(
             "-fps_mode",
             "vfr",
         ]);
+    }
+    if video_late {
+        command.args(["-vf", "setpts=PTS+0.3/TB"]);
     }
     if transport {
         command.args(["-f", "mpegts", "-mpegts_m2ts_mode", "0"]);
@@ -537,4 +564,23 @@ fn ffmpeg_generic_transport_audio_discovery() {
         remux(&input, &output, true);
         validate(dir.path(), &input, &output, 2, false);
     }
+}
+
+#[test]
+#[ignore = "requires ffmpeg and ffprobe"]
+fn ffmpeg_audio_before_the_first_video_frame_keeps_its_offset() {
+    let dir = fixture_dir("audio-first");
+    let input = generate_with(
+        dir.path(),
+        "libx264",
+        Some("ac3"),
+        true,
+        false,
+        false,
+        false,
+        true,
+    );
+    let output = dir.path().join("output.mkv");
+    remux(&input, &output, true);
+    validate(dir.path(), &input, &output, 2, false);
 }

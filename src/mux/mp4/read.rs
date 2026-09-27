@@ -723,12 +723,14 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             sample_rate: 0,
         })
     } else {
-        // AudioSampleEntry: 28-byte fixed part (ISO/IEC 14496-12 §12.2.3), then child
-        // boxes. AAC (mp4a) carries its AudioSpecificConfig in an `esds` box — the
-        // MKV CodecPrivate for A_AAC. AC-3/DTS are self-describing in-band (None).
-        // QuickTime SoundDescription v1 adds 16 bytes; v2 moves the rate to a
-        // float64 at 32 and channels to a u32 at 40, children at 64.
-        let version = if body.len() >= 28 { be16(body, 8) } else { 0 };
+        // AudioSampleEntry (ISO/IEC 14496-12 §12.2.3): 28 bytes then children. Under
+        // a v0 stsd, entry v1 is QuickTime (+16 bytes) and v2 has a float64 rate at
+        // 32, u32 channels at 40, children at 64.
+        let version = if b[0] == 0 && body.len() >= 28 {
+            be16(body, 8)
+        } else {
+            0
+        };
         let (channels, sample_rate, children) = match version {
             2 if body.len() >= 64 => {
                 let rate = f64::from_bits(u64::from_be_bytes(body[32..40].try_into().ok()?));
@@ -750,6 +752,10 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
         } else {
             None
         };
+        // ISO AudioSampleEntryV1 carries rates above 65535 in `srat`.
+        let sample_rate = find_box(&body[children..], b"srat")
+            .filter(|b| b.len() >= 8)
+            .map_or(sample_rate, |b| be32(b, 4));
         Some(StsdInfo {
             codec,
             height: 0,
@@ -760,18 +766,18 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
     }
 }
 
-// Audio sample rate from the sample-entry rate and the mdhd timescale. The entry
-// wins unless it is absent (0), the v1/v2 placeholder (1), saturated (65535), or
-// the timescale is a real rate the 16-bit entry field cannot hold (e.g. 96 kHz
-// DTS-HD whose entry carries the 48 kHz core rate).
+// Sample rate from the entry rate and the mdhd timescale. The entry wins when
+// it is a known rate; the timescale replaces a placeholder (0, 1, saturated
+// 65535) or an unknown entry rate the >65535 timescale is a multiple of.
 fn audio_rate(entry: u32, timescale: u32) -> u32 {
-    let unusable = matches!(entry, 0 | 1 | 0xFFFF);
-    let wide = timescale > 0xFFFF && SampleRate::from_hz(timescale) != SampleRate::Unknown;
-    if unusable || (wide && entry <= 0xFFFF) {
-        timescale
-    } else {
-        entry
+    let known = |hz| SampleRate::from_hz(hz) != SampleRate::Unknown;
+    if matches!(entry, 0 | 1 | 0xFFFF) {
+        return timescale;
     }
+    if !known(entry) && timescale > 0xFFFF && known(timescale) && timescale.is_multiple_of(entry) {
+        return timescale;
+    }
+    entry
 }
 
 /// Read an MPEG-4 expandable descriptor length (ISO/IEC 14496-1), advancing `pos`.
@@ -2345,12 +2351,40 @@ mod tests {
     // 65535, and a DTS-HD entry may carry the 48 kHz core rate. mdhd wins then.
     #[test]
     fn a_high_rate_mdhd_timescale_beats_an_unrepresentable_entry_rate() {
-        for entry_rate in [0xFFFFu32, 48_000] {
-            let mut e = audio_entry(6, 0, &[]);
-            e[24..28].copy_from_slice(&(entry_rate << 16).to_be_bytes());
-            let a = read_audio(audio_moov(96_000, b"dtsh", &e));
-            assert_eq!(a.sample_rate, SampleRate::S96, "entry {entry_rate}");
-        }
+        let mut e = audio_entry(6, 0, &[]);
+        e[24..28].copy_from_slice(&(0xFFFFu32 << 16).to_be_bytes());
+        let a = read_audio(audio_moov(96_000, b"dtsh", &e));
+        assert_eq!(a.sample_rate, SampleRate::S96);
+    }
+
+    // A valid known entry rate is kept even when mdhd uses a higher timescale.
+    #[test]
+    fn a_known_entry_rate_beats_a_higher_timescale() {
+        let a = read_audio(audio_moov(96_000, b"ac-3", &audio_entry(2, 0, &[])));
+        assert_eq!(a.sample_rate, SampleRate::S48);
+    }
+
+    // ISO AudioSampleEntryV1 (stsd version 1): not a QuickTime layout; children
+    // follow the 28-byte part and `srat` carries a rate above 65535.
+    #[test]
+    fn an_iso_v1_sample_entry_reads_srat_and_keeps_its_children() {
+        let asc = [0x11u8, 0x90];
+        let mut esds = vec![0u8, 0, 0, 0, 0x03, 22, 0, 1, 0, 0x04, 17, 0x40, 0x15];
+        esds.extend_from_slice(&[0u8; 11]);
+        esds.extend_from_slice(&[0x05, 2]);
+        esds.extend_from_slice(&asc);
+        let mut srat = vec![0u8; 4];
+        srat.extend_from_slice(&96_000u32.to_be_bytes());
+        let mut e = audio_entry(2, 0, &[]);
+        e[8..10].copy_from_slice(&1u16.to_be_bytes());
+        e[24..28].copy_from_slice(&(1u32 << 16).to_be_bytes());
+        e.extend_from_slice(&mp4_box(b"esds", &esds));
+        e.extend_from_slice(&mp4_box(b"srat", &srat));
+        let mut stsd = stsd_with(b"mp4a", &e);
+        stsd[0] = 1;
+        let info = parse_stsd(&stsd).expect("mp4a parses");
+        assert_eq!(info.config.as_deref(), Some(&asc[..]));
+        assert_eq!(info.sample_rate, 96_000);
     }
 
     // QuickTime SoundDescription v2: the 16.16 field is fixed at 1.0 and the real

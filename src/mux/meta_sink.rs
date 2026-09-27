@@ -144,6 +144,18 @@ pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
     doc
 }
 
+// Every rate a stream carries, in Hz: a BD combo (48/96, 48/192) lists both,
+// Unknown is empty.
+fn sample_rates(rate: crate::disc::SampleRate) -> Vec<u32> {
+    use crate::disc::SampleRate::*;
+    match rate {
+        S48_96 => vec![48_000, 96_000],
+        S48_192 => vec![48_000, 192_000],
+        Unknown => Vec::new(),
+        r => vec![r.hz() as u32],
+    }
+}
+
 /// Compact id for an audio stream's editorial purpose (no localized prose —
 /// the app maps it to display text). Mirrors the `Codec::id()` convention.
 fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
@@ -223,6 +235,7 @@ fn enrich_streams(doc: &mut serde_json::Value, title: &DiscTitle) {
                 // Numeric Hz (null when unknown), not the "48kHz" display form.
                 let hz = a.sample_rate.hz() as u32;
                 e["sample_rate"] = if hz == 0 { json!(null) } else { json!(hz) };
+                e["sample_rates"] = json!(sample_rates(a.sample_rate));
                 e["purpose"] = json!(purpose_id(a.purpose));
                 ai += 1;
             }
@@ -467,6 +480,7 @@ mod tests {
         assert_eq!(a["pid"], 0x1100);
         assert_eq!(a["secondary"], true);
         assert_eq!(a["sample_rate"], 48_000);
+        assert_eq!(a["sample_rates"], serde_json::json!([48_000]));
         assert_eq!(a["purpose"], "commentary");
 
         let s = &v["subtitles"][0];
@@ -538,5 +552,13 @@ mod tests {
             title_json(&t)["audio"][0]["sample_rate"],
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn combo_sample_rates_keep_both_rates() {
+        use crate::disc::SampleRate;
+        assert_eq!(sample_rates(SampleRate::S48_96), vec![48_000, 96_000]);
+        assert_eq!(sample_rates(SampleRate::S48_192), vec![48_000, 192_000]);
+        assert!(sample_rates(SampleRate::Unknown).is_empty());
     }
 }
