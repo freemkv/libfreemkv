@@ -171,11 +171,15 @@ impl FeaturePlaylistHint {
     /// Hint from an authoring id attribute (digits only). The filename is
     /// formatted from the one parsed u16, so the two fields cannot disagree.
     pub(crate) fn from_authoring_id(id: &str) -> Option<Self> {
-        let playlist_id = digits(id).parse::<u16>().ok()?;
-        Some(Self {
-            playlist_id: Some(playlist_id),
-            filename: Some(format!("{playlist_id:05}.mpls")),
-        })
+        Some(Self::for_playlist(digits(id).parse::<u16>().ok()?))
+    }
+
+    /// Hint naming playlist `id` by number and canonical `NNNNN.mpls` filename.
+    pub(crate) fn for_playlist(id: u16) -> Self {
+        Self {
+            playlist_id: Some(id),
+            filename: Some(format!("{id:05}.mpls")),
+        }
     }
 }
 
@@ -287,7 +291,7 @@ pub fn apply(
     // produced labels (like bdmt): a jar-only disc still yields a hint. Wrapped
     // separately so a menu-walk fault can't lose an already-extracted hint.
     let hint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        resolve_feature_hint(reader, udf, winner_hint)
+        resolve_feature_hint(reader, udf, winner_hint, titles)
     }))
     .ok()
     .flatten();
@@ -301,11 +305,25 @@ fn resolve_feature_hint(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
     winner_hint: Option<FeaturePlaylistHint>,
+    titles: &[DiscTitle],
 ) -> Option<FeaturePlaylistHint> {
     if let Some(hint) = winner_hint.filter(|h| !h.is_empty()) {
         return Some(hint);
     }
-    bdj_feature::resolve(reader, udf)
+    // Reuse the scan's parsed playlists instead of re-reading them for Tier 2.
+    let known: Vec<bdj_feature::PlaylistStat> = titles
+        .iter()
+        .map(|t| bdj_feature::PlaylistStat {
+            id: t.playlist_id,
+            secs: t.duration_secs as u64,
+            audio: t
+                .streams
+                .iter()
+                .filter(|s| matches!(s, crate::disc::Stream::Audio(a) if !a.secondary))
+                .count(),
+        })
+        .collect();
+    bdj_feature::resolve(reader, udf, &known)
 }
 
 // Min streams of one type before a language sequence anchors the label
@@ -1170,15 +1188,8 @@ fn collect_chapter_summary(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<Ch
         if chapter_count == 0 {
             continue;
         }
-        // Duration: sum of (out_time - in_time) across play items, in 45kHz PTS
-        // ticks. Approximates the disc module's per-title duration; not
-        // sample-accurate, just enough to identify "the long one" (main movie).
-        let duration_ticks: u64 = playlist
-            .play_items
-            .iter()
-            .map(|pi| pi.out_time.saturating_sub(pi.in_time) as u64)
-            .sum();
-        let duration_secs = duration_ticks as f64 / 45000.0;
+        // Not sample-accurate, just enough to identify "the long one" (main movie).
+        let duration_secs = playlist.duration_ticks() as f64 / 45000.0;
         out.push(ChapterSummary {
             playlist: name,
             chapter_count,
@@ -3417,6 +3428,17 @@ mod feature_hint_pass_tests {
         buf
     }
 
+    // /BDMV/PLAYLIST holding 00800.mpls: a menu-walk hint must name a real playlist.
+    fn playlist_dir() -> DirSpec {
+        DirSpec {
+            name: "PLAYLIST".to_string(),
+            icb_lba: 40,
+            dir_data_lba: 41,
+            files: vec![file_with("00800.mpls", 42, 4100, vec![0u8; 16], true)],
+            subdirs: vec![],
+        }
+    }
+
     /// A jar-only disc — no loose manifest, no vendor labels, no parser matches —
     /// still yields a feature hint, because the menu-walk hint pass runs
     /// independently of `labels.is_empty()`. This is the whole point of routing
@@ -3444,7 +3466,7 @@ mod feature_hint_pass_tests {
             icb_lba: 20,
             dir_data_lba: 21,
             files: Vec::new(),
-            subdirs: vec![jar_dir],
+            subdirs: vec![jar_dir, playlist_dir()],
         };
         let root = DirSpec {
             name: String::new(),
@@ -3467,9 +3489,9 @@ mod feature_hint_pass_tests {
     }
 
     /// The winner_hint early-return: when the winning parser already carried a
-    /// non-empty hint, resolve_feature_hint returns it verbatim and never runs
-    /// the Tier-2 menu-walk. The disc's bdj_feature::resolve would yield 00800,
-    /// but the supplied winner_hint (00042) must win — proving the short-circuit.
+    /// non-empty hint, resolve_feature_hint returns it verbatim. The disc's
+    /// menu-walk (Tier 1, embedded playlists.xml) would yield 00800, but the
+    /// supplied winner_hint (00042) must win.
     #[test]
     fn resolve_feature_hint_returns_winner_hint_over_menu_walk() {
         let xml = br#"<playlists>
@@ -3488,7 +3510,7 @@ mod feature_hint_pass_tests {
             icb_lba: 20,
             dir_data_lba: 21,
             files: Vec::new(),
-            subdirs: vec![jar_dir],
+            subdirs: vec![jar_dir, playlist_dir()],
         };
         let root = DirSpec {
             name: String::new(),
@@ -3502,8 +3524,8 @@ mod feature_hint_pass_tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
 
-        // Sanity: the Tier-2 menu-walk on this disc resolves to 00800.
-        let tier2 = bdj_feature::resolve(&mut disc, &udf);
+        // Sanity: the menu-walk (Tier 1) on this disc resolves to 00800.
+        let tier2 = bdj_feature::resolve(&mut disc, &udf, &[]);
         assert_eq!(tier2.and_then(|h| h.playlist_id), Some(800));
 
         // A DIFFERENT non-empty winner_hint must short-circuit before Tier-2.
@@ -3511,11 +3533,11 @@ mod feature_hint_pass_tests {
             playlist_id: Some(42),
             filename: Some("00042.mpls".to_string()),
         };
-        let got = resolve_feature_hint(&mut disc, &udf, Some(winner.clone()));
+        let got = resolve_feature_hint(&mut disc, &udf, Some(winner.clone()), &[]);
         assert_eq!(
             got,
             Some(winner),
-            "a non-empty winner_hint wins over the Tier-2 menu-walk result"
+            "a non-empty winner_hint wins over the menu-walk result"
         );
     }
 }

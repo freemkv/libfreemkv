@@ -334,7 +334,7 @@ mod tests {
             <playlist name="Bonus" aud="deu,ita,jpn" sub="deu,ita,jpn"/>
         "#;
         let feature = find_feature_playlist(doc).expect("feature playlist found");
-        let labels = labels_from_feature(&feature);
+        let labels = labels_from_feature(feature);
         let got: Vec<(StreamLabelType, u16, &str)> = labels
             .iter()
             .map(|l| (l.stream_type, l.stream_number, l.language.as_str()))

@@ -17,11 +17,6 @@ use zip::ZipArchive;
 // so the buffer grows incrementally instead of pre-sizing.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 
-// Cap on bytes read from one non-`.class` resource entry (the dcx.xml / playlists.xml /
-// *.properties manifests the Tier-1 sweep reads). Same attacker-controlled-size defence as
-// MAX_CLASS_BYTES.
-const MAX_RESOURCE_BYTES: u64 = 16 * 1024 * 1024;
-
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
 /// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class`],
 /// etc.
@@ -40,6 +35,15 @@ pub fn for_each_jar<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, mut f: F) 
 where
     F: FnMut(&str, &mut Jar) -> Option<R>,
 {
+    visit_jars(reader, udf, |name, jar| f(name, jar?))
+}
+
+/// Like [`for_each_jar`] but also yields jars that could not be read or opened
+/// (as `None`), so a caller can tell a skipped jar from an absent one.
+pub fn visit_jars<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, mut f: F) -> Option<R>
+where
+    F: FnMut(&str, Option<&mut Jar>) -> Option<R>,
+{
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
     for entry in &jar_dir.entries {
         if entry.is_dir {
@@ -49,13 +53,11 @@ where
             continue;
         }
         let path = format!("/BDMV/JAR/{}", entry.name);
-        let Ok(bytes) = udf.read_file(reader, &path) else {
-            continue;
-        };
-        let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-            continue;
-        };
-        if let Some(r) = f(&entry.name, &mut archive) {
+        let mut archive = udf
+            .read_file(reader, &path)
+            .ok()
+            .and_then(|bytes| ZipArchive::new(Cursor::new(bytes)).ok());
+        if let Some(r) = f(&entry.name, archive.as_mut()) {
             return Some(r);
         }
     }
@@ -93,64 +95,75 @@ where
 
 /// Like [`for_each_class`] but allows the callback to short-circuit
 /// iteration. Returns the first `Some(R)` the callback produces.
-pub fn try_each_class<R, F>(archive: &mut Jar, mut f: F) -> Option<R>
+pub fn try_each_class<R, F>(archive: &mut Jar, f: F) -> Option<R>
 where
     F: FnMut(&str, &ClassFile) -> Option<R>,
 {
-    for i in 0..archive.len() {
-        let Ok(entry) = archive.by_index(i) else {
-            continue;
-        };
-        if !entry.name().ends_with(".class") {
-            continue;
-        }
-        let name = entry.name().to_string();
-        // The declared uncompressed size is attacker-controlled, so the
-        // buffer grows incrementally and the read is capped at
-        // MAX_CLASS_BYTES rather than pre-sized from entry.size().
-        let mut bytes = Vec::new();
-        if entry.take(MAX_CLASS_BYTES).read_to_end(&mut bytes).is_err() {
-            continue;
-        }
-        let Ok(class) = ClassFile::parse(&bytes) else {
-            continue;
-        };
-        if let Some(r) = f(&name, &class) {
-            return Some(r);
-        }
-    }
-    None
+    let mut unbounded = u64::MAX;
+    try_each_class_budgeted(archive, &mut unbounded, f)
 }
 
-/// Iterate every NON-`.class` entry in the jar, read its bytes (bounded by
-/// [`MAX_RESOURCE_BYTES`]), and call `f` with `(entry_name, &bytes)`. Returns
-/// the first `Some(R)` the callback produces, or `None` when every resource was
-/// visited without a hit.
+/// [`try_each_class`] charging every inflated byte to `budget`; stops (None)
+/// once it is spent, so a caller sweeping many jars bounds total inflation.
+pub fn try_each_class_budgeted<R, F>(archive: &mut Jar, budget: &mut u64, mut f: F) -> Option<R>
+where
+    F: FnMut(&str, &ClassFile) -> Option<R>,
+{
+    let is_class = |n: &str| n.ends_with(".class");
+    try_each_entry(archive, is_class, MAX_CLASS_BYTES, budget, |name, bytes| {
+        f(name, &ClassFile::parse(bytes).ok()?)
+    })
+}
+
+/// Iterate the NON-`.class`, non-directory entries whose name satisfies `want`
+/// (checked BEFORE anything is inflated), reading at most `cap` bytes of each
+/// and charging them to `budget`. Returns the first `Some(R)` from `f`.
 ///
 /// This is the Tier-1 menu-walk sweep: newer discs embed the same
 /// `dcx.xml`/`playlists.xml` manifests INSIDE a jar rather than as loose
-/// `/BDMV/JAR/<id>/` files. Directory entries and `.class` files are skipped;
-/// unreadable entries are silently ignored (robustness over completeness).
-pub fn try_each_resource<R, F>(archive: &mut Jar, mut f: F) -> Option<R>
+/// `/BDMV/JAR/<id>/` files. Unreadable entries are silently ignored.
+pub fn try_each_resource<R, F>(
+    archive: &mut Jar,
+    want: impl Fn(&str) -> bool,
+    cap: u64,
+    budget: &mut u64,
+    f: F,
+) -> Option<R>
 where
     F: FnMut(&str, &[u8]) -> Option<R>,
 {
+    let is_resource =
+        |n: &str| !n.ends_with('/') && !n.to_ascii_lowercase().ends_with(".class") && want(n);
+    try_each_entry(archive, is_resource, cap, budget, f)
+}
+
+// Shared entry loop: filter by name from the central directory, then inflate at
+// most min(cap, budget) bytes. The declared uncompressed size is attacker-controlled,
+// so the buffer grows incrementally rather than being pre-sized from it. Once the
+// budget is spent the walk stops without offering the (possibly truncated) entry.
+fn try_each_entry<R>(
+    archive: &mut Jar,
+    want: impl Fn(&str) -> bool,
+    cap: u64,
+    budget: &mut u64,
+    mut f: impl FnMut(&str, &[u8]) -> Option<R>,
+) -> Option<R> {
     for i in 0..archive.len() {
+        if *budget == 0 {
+            return None;
+        }
+        match archive.name_for_index(i) {
+            Some(n) if want(n) => {}
+            _ => continue,
+        }
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
         let name = entry.name().to_string();
-        if name.ends_with('/') || name.to_ascii_lowercase().ends_with(".class") {
-            continue;
-        }
-        // Declared uncompressed size is attacker-controlled — grow the buffer
-        // incrementally and cap the read rather than pre-sizing from it.
         let mut bytes = Vec::new();
-        if entry
-            .take(MAX_RESOURCE_BYTES)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
+        let read = entry.take(cap.min(*budget)).read_to_end(&mut bytes);
+        *budget = budget.saturating_sub(bytes.len() as u64);
+        if read.is_err() || *budget == 0 {
             continue;
         }
         if let Some(r) = f(&name, &bytes) {
@@ -352,14 +365,70 @@ mod tests {
         };
 
         let mut seen: Vec<String> = Vec::new();
-        let found: Option<Vec<u8>> = try_each_resource(&mut jar, |name, bytes| {
-            seen.push(name.to_string());
-            name.ends_with("dcx.xml").then(|| bytes.to_vec())
-        });
+        let mut budget = u64::MAX;
+        let found: Option<Vec<u8>> = try_each_resource(
+            &mut jar,
+            |_| true,
+            1024,
+            &mut budget,
+            |name, bytes| {
+                seen.push(name.to_string());
+                name.ends_with("dcx.xml").then(|| bytes.to_vec())
+            },
+        );
         assert_eq!(found.as_deref(), Some(&xml[..]));
         assert!(
             !seen.iter().any(|n| n.ends_with(".class")),
             "a .class entry must never be offered as a resource"
         );
+    }
+
+    // An entry the name filter rejects is never inflated: it costs no budget.
+    #[test]
+    fn unwanted_resources_are_not_inflated() {
+        let payload = vec![0u8; 64 * 1024];
+        let mut jar = open(build_stored_zip(
+            "menu/bg.png",
+            &payload,
+            payload.len() as u32,
+        ));
+        let mut budget = 1_000_000u64;
+        let r: Option<()> = try_each_resource(
+            &mut jar,
+            |n| n.ends_with(".xml"),
+            1024,
+            &mut budget,
+            |_, _| Some(()),
+        );
+        assert!(r.is_none());
+        assert_eq!(budget, 1_000_000, "a filtered-out entry must not be read");
+    }
+
+    // Inflated bytes are charged to the shared budget; once it is spent the walk
+    // stops and the truncated entry is not offered.
+    #[test]
+    fn budget_bounds_total_inflation() {
+        let mut payload = MINIMAL_CLASS.to_vec();
+        payload.extend(std::iter::repeat_n(0u8, 4096));
+        let mut jar = open(build_stored_zip(
+            "Big.class",
+            &payload,
+            payload.len() as u32,
+        ));
+        let mut budget = 100u64;
+        let mut visited = 0usize;
+        let _: Option<()> = try_each_class_budgeted(&mut jar, &mut budget, |_, _| {
+            visited += 1;
+            None
+        });
+        assert_eq!((visited, budget), (0, 0));
+
+        let mut budget = 1_000_000u64;
+        let _: Option<()> = try_each_class_budgeted(&mut jar, &mut budget, |_, _| {
+            visited += 1;
+            None
+        });
+        assert_eq!(visited, 1);
+        assert_eq!(budget, 1_000_000 - payload.len() as u64);
     }
 }

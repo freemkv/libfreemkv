@@ -322,6 +322,16 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     })
 }
 
+impl Playlist {
+    /// Total play-item running time in 45 kHz ticks (out_time - in_time, summed).
+    pub fn duration_ticks(&self) -> u64 {
+        self.play_items
+            .iter()
+            .map(|pi| pi.out_time.saturating_sub(pi.in_time) as u64)
+            .sum()
+    }
+}
+
 // Parse one stream entry from the STN table.
 // Returns (StreamEntry, next position) or None. BD `stream_entry()` type
 // codes (`stream_entry_type` field); determine where the PID sits — see `parse_stream_entry`.

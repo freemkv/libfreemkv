@@ -4,28 +4,86 @@
 //! Xlet jars for playlist string constants and intersect them with actual playlists.
 //! Emit a hint only for one dominant-duration candidate with multiple audio streams;
 //! integer constants alone are insufficient evidence. Return `None` on ambiguity
-//! so the caller can use its chapter-based fallback.
+//! (including unreadable evidence or a spent work budget) so the caller can use its
+//! chapter-based fallback. Heuristic over application-defined space, not a spec.
 
 use super::class_reader::CpInfo;
 use super::{FeaturePlaylistHint, fox, jar, paramount};
 use crate::bdnav::bdjo;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// A playlist's (duration, primary-audio count) as already scanned by the caller.
+pub(crate) struct PlaylistStat {
+    pub id: u16,
+    pub secs: u64,
+    pub audio: usize,
+}
+
+// Total bytes the menu-walk may inflate across every jar (both tiers). A hostile
+// jar (decompression bomb, overlapping entries) spends it and the walk abstains.
+const INFLATE_BUDGET: u64 = 256 * 1024 * 1024;
 
 /// Resolve the disc's feature playlist by walking the BD-J jar space. Returns a
 /// hint only when one is unambiguously recoverable; `None` otherwise (defer to
-/// the failsafe).
-pub(crate) fn resolve(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<FeaturePlaylistHint> {
-    if let Some(hint) = tier1_manifest_sweep(reader, udf).filter(|h| !h.is_empty()) {
-        tracing::info!(?hint, "bdj menu-walk: Tier-1 embedded manifest hint");
-        return Some(hint);
+/// the failsafe). `known` supplies stats for playlists the scan already parsed.
+pub(crate) fn resolve(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    known: &[PlaylistStat],
+) -> Option<FeaturePlaylistHint> {
+    resolve_with_budget(reader, udf, known, INFLATE_BUDGET)
+}
+
+// Why the single jar pass stopped early.
+enum Stop {
+    Tier1(FeaturePlaylistHint),
+    BudgetSpent,
+}
+
+fn resolve_with_budget(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    known: &[PlaylistStat],
+    mut budget: u64,
+) -> Option<FeaturePlaylistHint> {
+    udf.find_dir("/BDMV/JAR")?;
+    let real = real_playlist_ids(udf);
+    // AUTOSTART app's jar(s) from the BDJO AMT. Empty → Tier 2 harvests every jar.
+    let targets = autostart_jar_ids(reader, udf);
+
+    // One pass: each jar is read once, swept for a Tier-1 manifest, then (when it
+    // is a Tier-2 target) harvested for playlist locators.
+    let mut candidates = HashSet::new();
+    let mut complete = true;
+    let stop = jar::visit_jars(reader, udf, |name, archive| {
+        let is_target = targets.is_empty() || targets.contains(jar_stem(name));
+        let Some(archive) = archive else {
+            complete &= !is_target; // an unreadable target hides candidates
+            return None;
+        };
+        if let Some(hint) = tier1_manifest_sweep(archive, &real, &mut budget) {
+            return Some(Stop::Tier1(hint));
+        }
+        if is_target && candidates.len() < MAX_CANDIDATES {
+            harvest_candidates(archive, &mut candidates, &mut budget);
+        }
+        (budget == 0).then_some(Stop::BudgetSpent)
+    });
+    match stop {
+        Some(Stop::Tier1(hint)) => {
+            tracing::info!(?hint, "bdj menu-walk: Tier-1 embedded manifest hint");
+            Some(hint)
+        }
+        Some(Stop::BudgetSpent) => None,
+        None if !complete => None,
+        None => {
+            let hint = tier2_score(reader, udf, &candidates, &real, known)?;
+            tracing::info!(?hint, "bdj menu-walk: Tier-2 autostart-Xlet locator hint");
+            Some(hint)
+        }
     }
-    if let Some(hint) = tier2_locator_scan(reader, udf).filter(|h| !h.is_empty()) {
-        tracing::info!(?hint, "bdj menu-walk: Tier-2 autostart-Xlet locator hint");
-        return Some(hint);
-    }
-    None
 }
 
 // ── Tier 1 ───────────────────────────────────────────────────────────────────
@@ -34,55 +92,115 @@ pub(crate) fn resolve(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Feat
 // small; a hostile jar entry can't force an unbounded scan.
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
-fn tier1_manifest_sweep(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<FeaturePlaylistHint> {
-    jar::for_each_jar(reader, udf, |_entry, archive| {
-        jar::try_each_resource(archive, |name, bytes| {
-            if bytes.len() > MAX_MANIFEST_BYTES {
-                return None;
-            }
-            let text = std::str::from_utf8(bytes).ok()?;
-            hint_from_manifest(name, text)
-        })
+// The first embedded manifest in this jar that names a real playlist.
+fn tier1_manifest_sweep(
+    archive: &mut jar::Jar,
+    real: &HashSet<u16>,
+    budget: &mut u64,
+) -> Option<FeaturePlaylistHint> {
+    // Read one byte past the cap so an oversized manifest is recognised and skipped.
+    let cap = MAX_MANIFEST_BYTES as u64 + 1;
+    jar::try_each_resource(archive, is_manifest_name, cap, budget, |name, bytes| {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return None;
+        }
+        let text = std::str::from_utf8(bytes).ok()?;
+        hint_from_manifest(name, text)
+            .filter(|h| h.playlist_id.is_some_and(|id| real.contains(&id)))
     })
 }
 
-// Derive a feature hint from one embedded manifest, dispatched by filename.
-fn hint_from_manifest(name: &str, text: &str) -> Option<FeaturePlaylistHint> {
+// Manifest kinds, by filename suffix (lower-case).
+#[derive(PartialEq)]
+enum Manifest {
+    FoxDcx,
+    ParamountPlaylists,
+    Properties,
+}
+
+fn manifest_kind(name: &str) -> Option<Manifest> {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with("dcx.xml") {
-        fox::feature_hint(text)
+        Some(Manifest::FoxDcx)
     } else if lower.ends_with("playlists.xml") {
-        paramount::feature_hint(text)
+        Some(Manifest::ParamountPlaylists)
     } else if lower.ends_with(".properties") || lower.ends_with(".version") {
-        props_hint(text)
+        Some(Manifest::Properties)
     } else {
         None
     }
 }
 
-// Scan a `key=value` properties/version manifest for a feature-playlist id. A
-// key naming both a feature/playlist AND an id (or playlist) whose value carries
-// a u16 playlist number yields the canonical `NNNNN.mpls` hint.
+fn is_manifest_name(name: &str) -> bool {
+    manifest_kind(name).is_some()
+}
+
+// Derive a feature hint from one embedded manifest, dispatched by filename.
+fn hint_from_manifest(name: &str, text: &str) -> Option<FeaturePlaylistHint> {
+    match manifest_kind(name)? {
+        Manifest::FoxDcx => fox::feature_hint(text),
+        Manifest::ParamountPlaylists => paramount::feature_hint(text),
+        Manifest::Properties => props_hint(text),
+    }
+}
+
+// Scan a `key=value` properties/version manifest for a feature-playlist id. The
+// key must be made only of feature/playlist-identity words and name the feature
+// (`feature.playlist.id`, `featurePlaylistId`, `main_feature_pl`); the value
+// must be a bare playlist number (optionally quoted or `.mpls`-suffixed).
 fn props_hint(text: &str) -> Option<FeaturePlaylistHint> {
-    for line in text.lines() {
+    text.lines().find_map(|line| {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with('!') {
-            continue;
+            return None;
         }
-        let Some((key, val)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        let names_playlist = key.contains("feature") || key.contains("playlist");
-        let names_id = key.contains("id") || key.contains("playlist");
-        if !(names_playlist && names_id) {
-            continue;
+        let (key, val) = line.split_once('=')?;
+        let words = key_words(key);
+        let names_feature = words.iter().any(|w| w == "feature");
+        let identity_only = words.iter().all(|w| {
+            matches!(
+                w.as_str(),
+                "feature" | "main" | "movie" | "playlist" | "pl" | "id" | "mpls" | "file"
+            )
+        });
+        if !(names_feature && identity_only && words.len() > 1) {
+            return None;
         }
-        if let Some(id) = playlist_id_from_str(val.trim()) {
-            return Some(hint_for(id));
+        playlist_number(val).map(FeaturePlaylistHint::for_playlist)
+    })
+}
+
+// Lower-cased words of a properties key: split on non-alphanumerics and camelCase.
+fn key_words(key: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for part in key.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let mut word = String::new();
+        let mut prev_lower = false;
+        for c in part.chars() {
+            if c.is_ascii_uppercase() && prev_lower {
+                words.push(std::mem::take(&mut word));
+            }
+            prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+            word.push(c.to_ascii_lowercase());
+        }
+        if !word.is_empty() {
+            words.push(word);
         }
     }
-    None
+    words
+}
+
+// A bare playlist number: 1-5 digits, optionally quoted and/or `.mpls`-suffixed.
+fn playlist_number(v: &str) -> Option<u16> {
+    let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+    let v = match v.len().checked_sub(".mpls".len()) {
+        Some(at) if v.is_char_boundary(at) && v[at..].eq_ignore_ascii_case(".mpls") => &v[..at],
+        _ => v,
+    };
+    if v.is_empty() || v.len() > 5 || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse().ok()
 }
 
 // ── Tier 2 ───────────────────────────────────────────────────────────────────
@@ -91,43 +209,45 @@ fn props_hint(text: &str) -> Option<FeaturePlaylistHint> {
 // jar. Real menus reference a handful.
 const MAX_CANDIDATES: usize = 1024;
 
+// Cap on candidate playlists re-read from disc for scoring (those the scan did not
+// already parse — e.g. sub-30 s). More than this is not a resolvable field.
+const MAX_STAT_READS: usize = 32;
+
 // The feature must run at least this many times longer than the runner-up to be
 // unambiguous; a closer field is not resolvable here and defers to the failsafe.
 const DOMINANCE_RATIO: f64 = 1.5;
 
-fn tier2_locator_scan(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<FeaturePlaylistHint> {
-    // 1. AUTOSTART app's jar(s) from the BDJO AMT. Empty → scan every jar.
-    let targets = autostart_jar_ids(reader, udf);
-
-    // 2. Harvest playlist-id candidates from those jars' `.class` constant pools.
-    let candidates = harvest_candidates(reader, udf, &targets);
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // 3. Intersect with the playlists that actually exist on the disc.
-    let real = real_playlist_ids(udf);
-    let hits: Vec<u16> = candidates
-        .into_iter()
-        .filter(|id| real.contains(id))
-        .collect();
-    if hits.is_empty() {
-        return None;
-    }
-
-    // 4. Score each survivor by (duration secs, primary-audio count).
-    let mut scored: Vec<(u16, u64, usize)> = hits
-        .into_iter()
-        .filter_map(|id| mpls_stats(reader, udf, id).map(|(secs, aud)| (id, secs, aud)))
-        .collect();
-    if scored.is_empty() {
-        return None;
+// Score the harvested candidates that are real playlists and pick a dominant one.
+// Any candidate that cannot be scored makes the field unknown → abstain.
+fn tier2_score(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    candidates: &HashSet<u16>,
+    real: &HashSet<u16>,
+    known: &[PlaylistStat],
+) -> Option<FeaturePlaylistHint> {
+    let known: HashMap<u16, (u64, usize)> =
+        known.iter().map(|s| (s.id, (s.secs, s.audio))).collect();
+    let mut hits: Vec<u16> = candidates.intersection(real).copied().collect();
+    hits.sort_unstable();
+    let mut reads = 0usize;
+    let mut scored: Vec<(u16, u64, usize)> = Vec::with_capacity(hits.len());
+    for id in hits {
+        let (secs, aud) = match known.get(&id) {
+            Some(&stat) => stat,
+            None => {
+                reads += 1;
+                if reads > MAX_STAT_READS {
+                    return None;
+                }
+                mpls_stats(reader, udf, id)?
+            }
+        };
+        scored.push((id, secs, aud));
     }
     // Longest first; lowest id breaks a duration tie (deterministic).
     scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
-    // 5. Emit only a single dominant, multi-audio candidate.
-    choose_dominant(&scored).map(hint_for)
+    choose_dominant(&scored).map(FeaturePlaylistHint::for_playlist)
 }
 
 // The dominant feature id, or None when the field is ambiguous. Requires the top
@@ -147,7 +267,7 @@ fn choose_dominant(scored: &[(u16, u64, usize)]) -> Option<u16> {
 }
 
 // The jar ids of every AUTOSTART application across all `.bdjo` files. Empty when
-// there is no readable BDJO — Tier-2 then scans every jar.
+// any BDJO is unreadable (a partial set would hide jars) — Tier 2 then scans all.
 fn autostart_jar_ids(reader: &mut dyn SectorSource, udf: &UdfFs) -> HashSet<String> {
     let mut out = HashSet::new();
     let Some(dir) = udf.find_dir("/BDMV/BDJO") else {
@@ -161,11 +281,12 @@ fn autostart_jar_ids(reader: &mut dyn SectorSource, udf: &UdfFs) -> HashSet<Stri
         .collect();
     for name in names {
         let path = format!("/BDMV/BDJO/{name}");
-        let Ok(data) = udf.read_file(reader, &path) else {
-            continue;
-        };
-        let Some(apps) = bdjo::parse(&data) else {
-            continue;
+        let Some(apps) = udf
+            .read_file(reader, &path)
+            .ok()
+            .and_then(|data| bdjo::parse(&data))
+        else {
+            return HashSet::new();
         };
         for app in apps.iter().filter(|a| a.is_autostart()) {
             for id in app.jar_ids() {
@@ -176,29 +297,17 @@ fn autostart_jar_ids(reader: &mut dyn SectorSource, udf: &UdfFs) -> HashSet<Stri
     out
 }
 
-// Harvest playlist-id candidates from `.class` constant pools. When `targets` is
-// non-empty, only jars whose id is in it are scanned (the autostart classpath);
-// otherwise every jar is scanned.
-fn harvest_candidates(
-    reader: &mut dyn SectorSource,
-    udf: &UdfFs,
-    targets: &HashSet<String>,
-) -> HashSet<u16> {
-    let mut ids = HashSet::new();
-    let _: Option<()> = jar::for_each_jar(reader, udf, |entry_name, archive| {
-        if !targets.is_empty() && !targets.contains(jar_stem(entry_name)) {
-            return None;
-        }
-        jar::for_each_class(archive, |_class_name, class| {
-            for (_, cp) in class.constant_pool.iter() {
-                if let CpInfo::Utf8(s) = cp {
-                    scan_locator_ids(s, &mut ids);
-                }
+// Harvest playlist-id candidates from one jar's `.class` constant pools, stopping
+// at MAX_CANDIDATES or when the inflation budget is spent.
+fn harvest_candidates(archive: &mut jar::Jar, ids: &mut HashSet<u16>, budget: &mut u64) {
+    let _: Option<()> = jar::try_each_class_budgeted(archive, budget, |_class_name, class| {
+        for (_, cp) in class.constant_pool.iter() {
+            if let CpInfo::Utf8(s) = cp {
+                scan_locator_ids(s, ids);
             }
-        });
-        None
+        }
+        (ids.len() >= MAX_CANDIDATES).then_some(())
     });
-    ids
 }
 
 // The jar id of a `/BDMV/JAR/*.jar` entry name ("00000.jar" -> "00000").
@@ -211,52 +320,49 @@ fn jar_stem(entry_name: &str) -> &str {
     }
 }
 
+// Byte offsets of ASCII-case-insensitive matches of `needle_lower` in `hay`.
+fn find_ci<'a>(hay: &'a [u8], needle_lower: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    hay.windows(needle_lower.len())
+        .enumerate()
+        .filter(|(_, w)| w.eq_ignore_ascii_case(needle_lower))
+        .map(|(i, _)| i)
+}
+
 // Harvest playlist ids from one string: `NNNNN.mpls` filenames and
 // `PLAYLIST:NNNNN` locator constants. Integer-only evidence is intentionally NOT
 // harvested here — the design leaves bare integers to the failsafe.
 fn scan_locator_ids(s: &str, out: &mut HashSet<u16>) {
-    if out.len() >= MAX_CANDIDATES {
-        return;
-    }
-    let lower = s.to_ascii_lowercase();
-    let bytes = s.as_bytes(); // same byte positions as `lower` (ASCII case only)
-
+    let bytes = s.as_bytes();
     // `NNNNN.mpls`: digits immediately preceding a ".mpls".
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find(".mpls") {
-        let at = from + rel;
-        let mut start = at;
-        while start > 0 && bytes[start - 1].is_ascii_digit() {
-            start -= 1;
+    for at in find_ci(bytes, b".mpls") {
+        let start = bytes[..at]
+            .iter()
+            .rposition(|b| !b.is_ascii_digit())
+            .map_or(0, |p| p + 1);
+        if out.len() >= MAX_CANDIDATES {
+            return;
         }
         if start < at
             && let Ok(id) = s[start..at].parse::<u16>()
         {
             out.insert(id);
-            if out.len() >= MAX_CANDIDATES {
-                return;
-            }
         }
-        from = at + ".mpls".len();
     }
-
     // `PLAYLIST:NNNNN`: digits immediately following a "playlist:" token.
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find("playlist:") {
-        let at = from + rel + "playlist:".len();
-        let mut end = at;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
+    for at in find_ci(bytes, b"playlist:") {
+        let at = at + "playlist:".len();
+        let end = bytes[at..]
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .map_or(bytes.len(), |p| at + p);
+        if out.len() >= MAX_CANDIDATES {
+            return;
         }
         if end > at
             && let Ok(id) = s[at..end].parse::<u16>()
         {
             out.insert(id);
-            if out.len() >= MAX_CANDIDATES {
-                return;
-            }
         }
-        from = at.max(from + 1);
     }
 }
 
@@ -284,35 +390,12 @@ fn mpls_stats(reader: &mut dyn SectorSource, udf: &UdfFs, id: u16) -> Option<(u6
     let path = format!("/BDMV/PLAYLIST/{id:05}.mpls");
     let data = udf.read_file(reader, &path).ok()?;
     let pl = crate::mpls::parse(&data).ok()?;
-    let ticks: u64 = pl
-        .play_items
+    let audio = pl
+        .streams
         .iter()
-        .map(|pi| pi.out_time.saturating_sub(pi.in_time) as u64)
-        .sum();
-    let secs = ticks / 45_000;
-    // stream_type 2 == primary audio (see mpls::StreamEntry).
-    let audio = pl.streams.iter().filter(|s| s.stream_type == 2).count();
-    Some((secs, audio))
-}
-
-// ── Shared helpers ───────────────────────────────────────────────────────────
-
-fn hint_for(id: u16) -> FeaturePlaylistHint {
-    FeaturePlaylistHint {
-        playlist_id: Some(id),
-        filename: Some(format!("{id:05}.mpls")),
-    }
-}
-
-// A playlist id from a free-form string value: keep leading digits, parse u16.
-fn playlist_id_from_str(v: &str) -> Option<u16> {
-    let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let digits = if digits.is_empty() {
-        v.chars().filter(|c| c.is_ascii_digit()).collect()
-    } else {
-        digits
-    };
-    digits.parse::<u16>().ok()
+        .filter(|s| s.stream_type == crate::mpls::STREAM_CATEGORY_AUDIO)
+        .count();
+    Some((pl.duration_ticks() / 45_000, audio))
 }
 
 #[cfg(test)]
@@ -389,6 +472,37 @@ mod tests {
     #[test]
     fn props_hint_ignores_unrelated_keys() {
         assert!(props_hint("version=1\nbuild=42\n").is_none());
+    }
+
+    // Keys that merely mention "playlist"/"feature" (or contain "id" inside another
+    // word) are not a feature-playlist id; values must be a bare playlist number.
+    #[test]
+    fn props_hint_rejects_loose_keys_and_values() {
+        for text in [
+            "playlist.count=12",
+            "playlistCount=12",
+            "feature.video.width=1920",
+            "trailer.playlist=00010",
+            "menu_playlist=00005",
+            "playlist.api.version=2",
+            "playlist.version=v2.1",
+            "feature.playlist=PL_2_v10",
+            "feature.audio.id=2",
+        ] {
+            assert_eq!(props_hint(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn props_hint_accepts_feature_playlist_id_spellings() {
+        for text in [
+            "featurePlaylistId=00800",
+            "feature_playlist=00800.mpls",
+            "main.feature.id = \"00800\"",
+        ] {
+            let h = props_hint(text).unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(h.playlist_id, Some(800), "{text}");
+        }
     }
 
     // ── mpls fixture builder (compact single-play-item playlist) ─────────────
@@ -566,8 +680,12 @@ mod tests {
             ("com/studio/Menu.class", build_class(&["unrelated"])),
             ("00000/playlists.xml", xml.to_vec()),
         ]);
-        let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", jar)], vec![]);
-        let hint = resolve(&mut disc, &udf).expect("Tier-1 hint");
+        let (mut disc, udf) = build_disc(
+            vec![("00800.mpls", build_mpls(7000, 3))],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        let hint = resolve(&mut disc, &udf, &[]).expect("Tier-1 hint");
         assert_eq!(hint.playlist_id, Some(800));
     }
 
@@ -586,7 +704,7 @@ mod tests {
             vec![("00000.jar", jar)],
             vec![], // no BDJO → scan all jars
         );
-        let hint = resolve(&mut disc, &udf).expect("Tier-2 hint");
+        let hint = resolve(&mut disc, &udf, &[]).expect("Tier-2 hint");
         assert_eq!(hint.playlist_id, Some(800));
         assert_eq!(hint.filename.as_deref(), Some("00800.mpls"));
     }
@@ -601,7 +719,7 @@ mod tests {
             vec![("00000.jar", jar)],
             vec![],
         );
-        assert!(resolve(&mut disc, &udf).is_none());
+        assert!(resolve(&mut disc, &udf, &[]).is_none());
     }
 
     #[test]
@@ -623,7 +741,7 @@ mod tests {
             vec![("00000.jar", jar)],
             vec![],
         );
-        assert!(resolve(&mut disc, &udf).is_none());
+        assert!(resolve(&mut disc, &udf, &[]).is_none());
     }
 
     #[test]
@@ -646,12 +764,139 @@ mod tests {
             vec![("00000.jar", auto_jar), ("00009.jar", decoy_jar)],
             vec![("00000.bdjo", bdjo)],
         );
-        let hint = resolve(&mut disc, &udf).expect("Tier-2 hint via BDJO targeting");
+        let hint = resolve(&mut disc, &udf, &[]).expect("Tier-2 hint via BDJO targeting");
         assert_eq!(
             hint.playlist_id,
             Some(800),
             "only the autostart jar's candidate should be considered"
         );
+    }
+
+    // A Tier-1 hint naming a playlist that is not on the disc is not evidence:
+    // the sweep continues and Tier 2 decides.
+    #[test]
+    fn tier1_hint_must_name_a_real_playlist() {
+        let jar = build_jar(&[
+            ("app.properties", b"feature.playlist.id=00012\n".to_vec()),
+            ("com/studio/MainXlet.class", build_class(&["00800.mpls"])),
+        ]);
+        let (mut disc, udf) = build_disc(
+            vec![("00800.mpls", build_mpls(7000, 6))],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        let hint = resolve(&mut disc, &udf, &[]).expect("Tier-2 hint");
+        assert_eq!(hint.playlist_id, Some(800));
+    }
+
+    // A candidate that cannot be read/parsed makes the field unknown: abstain
+    // rather than crown the lone readable survivor.
+    #[test]
+    fn tier2_abstains_when_a_candidate_cannot_be_scored() {
+        let class = build_class(&["00800.mpls", "00801.mpls"]);
+        let jar = build_jar(&[("com/studio/MainXlet.class", class)]);
+        let (mut disc, udf) = build_disc(
+            vec![
+                ("00800.mpls", b"not an mpls".to_vec()),
+                ("00801.mpls", build_mpls(6500, 6)),
+            ],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        assert_eq!(resolve(&mut disc, &udf, &[]), None);
+    }
+
+    // Stats for playlists the scan already parsed are reused, not re-read.
+    #[test]
+    fn tier2_uses_known_playlist_stats() {
+        let class = build_class(&["00800.mpls"]);
+        let jar = build_jar(&[("com/studio/MainXlet.class", class)]);
+        let (mut disc, udf) = build_disc(
+            vec![("00800.mpls", b"unreadable here".to_vec())],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        let known = [PlaylistStat {
+            id: 800,
+            secs: 7000,
+            audio: 6,
+        }];
+        let hint = resolve(&mut disc, &udf, &known).expect("hint from known stats");
+        assert_eq!(hint.playlist_id, Some(800));
+    }
+
+    // An unreadable Tier-2 jar may hold the real feature's locator: abstain.
+    #[test]
+    fn tier2_abstains_when_a_target_jar_is_unreadable() {
+        let jar = build_jar(&[("com/studio/MainXlet.class", build_class(&["00800.mpls"]))]);
+        let (mut disc, udf) = build_disc(
+            vec![("00800.mpls", build_mpls(7000, 6))],
+            vec![("00000.jar", b"not a zip".to_vec()), ("00001.jar", jar)],
+            vec![],
+        );
+        assert_eq!(resolve(&mut disc, &udf, &[]), None);
+    }
+
+    // One unreadable BDJO makes the autostart set partial: scan every jar instead,
+    // so the decoy jar's longer 00801 keeps the field ambiguous.
+    #[test]
+    fn unreadable_bdjo_widens_tier2_to_every_jar() {
+        let auto_jar = build_jar(&[("com/studio/MainXlet.class", build_class(&["00800.mpls"]))]);
+        let other_jar = build_jar(&[("com/studio/Other.class", build_class(&["00801.mpls"]))]);
+        let (mut disc, udf) = build_disc(
+            vec![
+                ("00800.mpls", build_mpls(7000, 6)),
+                ("00801.mpls", build_mpls(9000, 6)),
+            ],
+            vec![("00000.jar", auto_jar), ("00009.jar", other_jar)],
+            vec![
+                ("00000.bdjo", bdjo_with_autostart("00000")),
+                ("00001.bdjo", b"garbage".to_vec()),
+            ],
+        );
+        assert_eq!(resolve(&mut disc, &udf, &[]), None);
+    }
+
+    // A sector source that records every LBA it is asked for.
+    struct Counting<'a>(&'a mut MemDisc, Vec<u32>);
+    impl SectorSource for Counting<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.1.extend(lba..lba + count as u32);
+            self.0.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // Both tiers share one pass over /BDMV/JAR: each jar is read from disc once.
+    #[test]
+    fn menu_walk_reads_each_jar_once() {
+        let jar = build_jar(&[("com/studio/MainXlet.class", build_class(&["09999.mpls"]))]);
+        let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", jar)], vec![]);
+        let mut counting = Counting(&mut disc, Vec::new());
+        assert_eq!(resolve(&mut counting, &udf, &[]), None);
+        // No playlists, so the jar's data extent is the first one laid out (2000).
+        let jar_lba = udf.partition_start() + 2000;
+        let reads = counting.1.iter().filter(|&&l| l == jar_lba).count();
+        assert_eq!(reads, 1);
+    }
+
+    // A spent inflation budget abstains instead of scanning on.
+    #[test]
+    fn exhausted_inflate_budget_abstains() {
+        let class = build_class(&["00800.mpls"]);
+        let jar = build_jar(&[("com/studio/MainXlet.class", class)]);
+        let (mut disc, udf) = build_disc(
+            vec![("00800.mpls", build_mpls(7000, 6))],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        assert!(resolve_with_budget(&mut disc, &udf, &[], 1 << 20).is_some());
+        assert_eq!(resolve_with_budget(&mut disc, &udf, &[], 8), None);
     }
 
     // Build a minimal single-app BDJO whose AUTOSTART app has the given base_dir.

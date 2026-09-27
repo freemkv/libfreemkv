@@ -79,8 +79,9 @@ fn element_hint(feature: &str) -> Option<super::FeaturePlaylistHint> {
     super::FeaturePlaylistHint::from_authoring_id(&xml::attr(feature, "id")?)
 }
 
-// Build stream labels from a `dcx.xml` doc; split out from `parse` for unit testing. Scoped to
-// the richest `<playlist name="feature">` element.
+// Build stream labels from a `dcx.xml` doc (test/harness entry). Scoped to the
+// richest `<playlist name="feature">` element.
+#[cfg(test)]
 pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
     select_feature_playlist(text)
         .map(labels_from_feature)
