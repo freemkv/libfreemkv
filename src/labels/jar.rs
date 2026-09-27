@@ -114,6 +114,11 @@ const CHUNK_SECTORS: u64 = 32;
 // A zip's end-of-central-directory record: signature, within the last 64 KiB + 22 bytes.
 const EOCD_SIG: &[u8; 4] = b"PK\x05\x06";
 const EOCD_SEARCH: u64 = 65_535 + 22;
+// Cap on EOCD candidates checked (each may read the CD start): stray signatures
+// in a hostile tail cannot multiply reads.
+const MAX_EOCD_PROBES: usize = 4;
+// Central-directory file header signature.
+const CDFH_SIG: &[u8; 4] = b"PK\x01\x02";
 
 /// `Read + Seek` over a UDF file's absolute `(lba, byte length)` extents, fetching
 /// sectors on demand (one cached chunk, aligned to the read direction). Reads end at
@@ -139,14 +144,52 @@ impl<'a> ExtentReader<'a> {
         }
     }
 
-    /// Whether the file's tail holds an EOCD signature. Checked before the zip
-    /// reader's backward search, so a damaged jar costs one tail read, not a scan.
+    /// Whether the tail holds a consistent EOCD: comment within the file, central
+    /// directory before it and starting with a CDFH signature. Checked before the zip
+    /// reader's backward search (which rescans the whole file on a bad EOCD), so a
+    /// damaged jar costs a few bounded reads. Leaves the last chunk cached.
     pub fn has_zip_tail(&mut self) -> bool {
+        let mut ok = self.find_eocd().is_some();
+        if ok && self.size > 0 {
+            self.pos = self.size - 1;
+            ok = self.fill(true).is_ok();
+        }
+        ok && self.seek(SeekFrom::Start(0)).is_ok()
+    }
+
+    // Offset of the last EOCD in the tail that passes the consistency checks.
+    fn find_eocd(&mut self) -> Option<u64> {
         let n = self.size.min(EOCD_SEARCH);
+        let tail_start = self.size - n;
         let mut tail = vec![0u8; n as usize];
-        let ok =
-            self.seek(SeekFrom::End(-(n as i64))).is_ok() && self.read_exact(&mut tail).is_ok();
-        ok && tail.windows(4).any(|w| w == EOCD_SIG) && self.seek(SeekFrom::Start(0)).is_ok()
+        self.seek(SeekFrom::Start(tail_start)).ok()?;
+        self.read_exact(&mut tail).ok()?;
+        let le32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut probes = 0;
+        for at in (0..tail.len().saturating_sub(21)).rev() {
+            let rec = &tail[at..];
+            if &rec[..4] != EOCD_SIG {
+                continue;
+            }
+            probes += 1;
+            if probes > MAX_EOCD_PROBES {
+                return None;
+            }
+            let eocd = tail_start + at as u64;
+            let comment = u16::from_le_bytes([rec[20], rec[21]]) as u64;
+            let (cd_size, cd_offset) = (le32(rec, 12) as u64, le32(rec, 16) as u64);
+            if eocd + 22 + comment > self.size || cd_offset + cd_size > eocd {
+                continue;
+            }
+            let mut sig = [0u8; 4];
+            let cdfh = self.seek(SeekFrom::Start(cd_offset)).is_ok()
+                && self.read_exact(&mut sig).is_ok()
+                && &sig == CDFH_SIG;
+            if cdfh {
+                return Some(eocd);
+            }
+        }
+        None
     }
 
     // Load a chunk holding `self.pos`: ending at it when reading backwards, else
@@ -188,7 +231,11 @@ impl Read for ExtentReader<'_> {
         let cached =
             self.pos >= self.buf_start && self.pos < self.buf_start + self.buf.len() as u64;
         if !cached {
-            let backward = !self.buf.is_empty() && self.pos < self.buf_start;
+            // Fill backwards only for a seek just below the cached chunk (a backward
+            // scan); any other jump fills forward from the target.
+            let backward = !self.buf.is_empty()
+                && self.pos < self.buf_start
+                && self.buf_start - self.pos <= CHUNK_SECTORS * 2048;
             self.fill(backward)?;
         }
         let off = (self.pos - self.buf_start) as usize;

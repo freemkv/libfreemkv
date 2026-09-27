@@ -980,6 +980,21 @@ mod tests {
         assert!(counting.1.len() < 64, "read {} sectors", counting.1.len());
     }
 
+    // A present EOCD whose central-directory offset is corrupt is rejected up front,
+    // not handed to the zip reader's whole-file backward scan.
+    #[test]
+    fn large_jar_with_corrupt_cd_offset_reads_a_bounded_tail() {
+        let mut jar = build_jar(&[("assets/bg.png", vec![0x5Au8; 512 * 1024])]);
+        let eocd = jar.len() - 22;
+        assert_eq!(&jar[eocd..eocd + 4], b"PK\x05\x06");
+        jar[eocd + 16..eocd + 20].copy_from_slice(&0x10u32.to_le_bytes());
+        let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", jar)], vec![]);
+        let mut counting = Counting(&mut disc, Vec::new());
+        let opened = jar::visit_jars_limited(&mut counting, &udf, 0, |_, a| Some(a.is_some()));
+        assert_eq!(opened, Some(false));
+        assert!(counting.1.len() < 128, "read {} sectors", counting.1.len());
+    }
+
     // A spent inflation budget abstains instead of scanning on.
     #[test]
     fn exhausted_inflate_budget_abstains() {
