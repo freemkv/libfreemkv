@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- HD DVD XPL timecodes at a 60fps timeBase run at 60000/1001; title, clip and chapter times were 0.1% short.
 - TrueHD channel labels keep the LFE split (3.0 was labelled "2.1", 7.0 "6.1"), and a 6-channel presentation counts its Lvh/Rvh pair as 2. An older network:// receiver parses the new layout strings as unknown and omits the MKV Channels element for those tracks; keep both ends on the same version.
 - `mp4://` DTS tracks write the stream's maximum rate in `ddts` and read back as 96 kHz where the source is 96 kHz.
 - `mkv://` PCM tracks without BitDepth: bounded read-ahead and a multi-block depth estimate.
