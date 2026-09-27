@@ -47,6 +47,21 @@ fn bus_encryption_removed(bus_encryption: bool, handshake: Option<&HandshakeResu
     }
 }
 
+// Positive UHD evidence independent of the cert: index.bdmv version "0300"
+// (BD-ROM Part 3) or an AACS2 MKB. Unknown is `false`.
+fn disc_is_uhd(udf_fs: &udf::UdfFs, reader: &mut dyn SectorSource) -> bool {
+    use crate::aacs::mkb::{AacsVersion, mkb_type};
+    let index = udf_fs.read_file_prefix(reader, "/BDMV/index.bdmv", 8);
+    if index.is_ok_and(|d| d.get(..8) == Some(&b"INDX0300"[..])) {
+        return true;
+    }
+    udf_fs
+        .read_file_prefix(reader, crate::aacs::PATH_MKB_RO, 64)
+        .ok()
+        .and_then(|m| mkb_type(&m).map(|t| t.generation()))
+        .is_some_and(|g| matches!(g, AacsVersion::V20 | AacsVersion::V21))
+}
+
 // libfreemkv-side driver for the AACS cert route: owns host-cert collection, dispatches
 // mutual-auth to the freemkv-unlock AACS unlocker.
 struct AacsCertUnlocker<'a> {
@@ -304,13 +319,11 @@ impl Disc {
             .as_ref()
             .map(|c| c.version.major())
             .unwrap_or(aacs::mkb::AACS_MAJOR_UHD);
-        // Fail safe: an unparseable cert, or none on a live (assumed UHD) drive,
-        // may mean bus encryption.
+        // Fail safe: an unparseable cert, or none on a live drive with a disc
+        // positively known to be UHD, may mean bus encryption.
         let bus_encryption = match &cc {
             Some(c) => c.bus_encryption,
-            None => {
-                cc_raw.is_some() || (handshake.is_some() && version == aacs::mkb::AACS_MAJOR_UHD)
-            }
+            None => cc_raw.is_some() || (handshake.is_some() && disc_is_uhd(udf_fs, reader)),
         };
 
         // Bus-encryption gate: removed by a drive unlock (`drive_unlocked`) or a
@@ -517,6 +530,15 @@ mod tests {
     /// Build a UDF tree with a single /AACS directory holding the given
     /// files. Returns the navigable UdfFs over `disc`.
     fn build_aacs_fs(disc: &mut MemDisc, files: &[AacsFile]) -> udf::UdfFs {
+        build_aacs_fs_with_index(disc, files, None)
+    }
+
+    // As `build_aacs_fs`, plus `/BDMV/index.bdmv` holding `index` when given.
+    fn build_aacs_fs_with_index(
+        disc: &mut MemDisc,
+        files: &[AacsFile],
+        index: Option<&[u8]>,
+    ) -> udf::UdfFs {
         let mut aacs_fids = Vec::new();
         push_fid(&mut aacs_fids, "", 50, true, true);
         for f in files {
@@ -533,6 +555,16 @@ mod tests {
         let mut root_fids = Vec::new();
         push_fid(&mut root_fids, "", 10, true, true);
         push_fid(&mut root_fids, "AACS", 50, true, false);
+        if let Some(index) = index {
+            let mut bdmv_fids = Vec::new();
+            push_fid(&mut bdmv_fids, "", 70, true, true);
+            push_fid(&mut bdmv_fids, "index.bdmv", 72, false, false);
+            disc.put(PART_START + 72, build_file_icb(index.len() as u32, 7000));
+            disc.put_bytes(PART_START + 7000, index);
+            disc.put(PART_START + 70, build_file_icb(bdmv_fids.len() as u32, 71));
+            disc.put_bytes(PART_START + 71, &bdmv_fids);
+            push_fid(&mut root_fids, "BDMV", 70, true, false);
+        }
         disc.put(PART_START + 10, build_file_icb(root_fids.len() as u32, 11));
         disc.put_bytes(PART_START + 11, &root_fids);
         build_udf_skeleton(disc, 10);
@@ -874,32 +906,39 @@ mod tests {
         assert!(matches!(err, Error::AacsBusKeyUnavailable), "got {err:?}");
     }
 
-    // No cert at all on a live drive: the version defaults to UHD, so bus encryption
-    // is assumed and a missing Read Data Key refuses keys; an ISO still resolves.
+    // No cert on a live drive without a Read Data Key: refuse keys only when the
+    // disc is positively UHD (index.bdmv version "0300"); a BD ("0200") resolves.
     #[test]
-    fn resolve_vid_only_missing_cert_live_drive_is_treated_as_bus_encrypted() {
-        let mut disc = MemDisc::new();
-        let udf = build_aacs_fs(
-            &mut disc,
-            &[AacsFile {
-                name: "Unit_Key_RO.inf",
-                icb_lba: 60,
-                data_lba: 5000,
-                contents: vec![0xAB; 32],
-            }],
-        );
+    fn resolve_vid_only_missing_cert_refuses_only_on_a_known_uhd_disc() {
+        let uk = [AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: vec![0xAB; 32],
+        }];
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: None,
             read_data_key_err: None,
             drive_unlocked: false,
         };
-        let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).unwrap_err();
-        assert!(matches!(err, Error::AacsBusKeyUnavailable), "got {err:?}");
+        let mut uhd = MemDisc::new();
+        let udf = build_aacs_fs_with_index(&mut uhd, &uk, Some(b"INDX0300"));
+        let err = Disc::resolve_vid_only(&udf, &mut uhd, Some(&hs)).unwrap_err();
         assert!(
-            Disc::resolve_vid_only(&udf, &mut disc, None).is_ok(),
+            matches!(err, Error::AacsBusKeyUnavailable),
+            "UHD: got {err:?}"
+        );
+        assert!(
+            Disc::resolve_vid_only(&udf, &mut uhd, None).is_ok(),
             "ISO path"
         );
+        for index in [Some(&b"INDX0200"[..]), None] {
+            let mut bd = MemDisc::new();
+            let udf = build_aacs_fs_with_index(&mut bd, &uk, index);
+            let st = Disc::resolve_vid_only(&udf, &mut bd, Some(&hs));
+            assert!(st.is_ok(), "BD / unknown must resolve: {index:?}");
+        }
     }
 
     /// ISO scan (handshake None) of a bus_encryption disc → Ok. Bus encryption
