@@ -113,11 +113,11 @@ pub enum MuxInput<'a> {
         key_map: Option<Arc<AacsKeyMap>>,
     },
     /// Any URL-addressed source (`iso://`, `mkv://`, `m2ts://`, `network://`,
-    /// stdio) opened via [`input`].
+    /// stdio) opened via [`input`](super::resolve::input).
     Url {
         /// The source URL.
         url: &'a str,
-        /// Input options forwarded to [`input`].
+        /// Input options forwarded to [`input`](super::resolve::input).
         opts: InputOptions,
     },
 }
