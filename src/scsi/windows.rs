@@ -224,8 +224,6 @@ impl SptiTransport {
 /// modules — `scsi` builds without `rip` (freemkv-firmware), where the old
 /// `crate::drive::windows::find_drives()` delegation failed to compile.
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
-    // SCSI peripheral device type 5 = MMC / optical, low 5 bits of INQUIRY byte 0.
-
     fn probe(path: &str, out: &mut Vec<super::DriveInfo>) {
         let Ok(mut transport) = crate::scsi::open(Path::new(path)) else {
             return;
@@ -261,19 +259,16 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
     let mut transport = SptiTransport::open(path)?;
     let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
-    let mut buf = [0u8; 0];
-    match transport.execute(
-        &cdb,
-        crate::scsi::DataDirection::None,
-        &mut buf,
-        crate::scsi::TUR_TIMEOUT_MS,
-    ) {
-        Ok(_) => Ok(true),
-        Err(e) => match e.scsi_sense().and_then(super::tur_disc_present) {
-            Some(present) => Ok(present),
-            None => Err(e),
-        },
-    }
+    super::tur_presence(|| {
+        transport
+            .execute(
+                &cdb,
+                crate::scsi::DataDirection::None,
+                &mut [],
+                crate::scsi::TUR_TIMEOUT_MS,
+            )
+            .map(|_| ())
+    })
 }
 
 impl Drop for SptiTransport {
@@ -494,6 +489,8 @@ impl ScsiTransport for SptiTransport {
 mod tests {
     use super::*;
 
+    // Regression guard: `StorageAdapterDescriptor` must match `STORAGE_ADAPTER_DESCRIPTOR`
+    // (winioctl.h) field-for-field.
     #[test]
     fn storage_adapter_descriptor_matches_sdk_layout() {
         use std::mem::{offset_of, size_of};

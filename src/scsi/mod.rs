@@ -500,11 +500,11 @@ pub fn list_drives() -> Vec<DriveInfo> {
 
 /// True if the drive at `path` currently has a disc inserted.
 ///
-/// Issues a single TEST UNIT READY (cheapest SCSI op, no data transfer).
-/// GOOD, NOT READY 04/01 (becoming ready) or UNIT ATTENTION 28h (medium
-/// changed) → `Ok(true)`; any other NOT READY (e.g. 3Ah, medium not present)
-/// → `Ok(false)`; other sense → `Err`. Suitable for poll-loop tick
-/// (~50 ms / drive on a healthy bus).
+/// Issues TEST UNIT READY (cheapest SCSI op, no data transfer), a second one
+/// after a UNIT ATTENTION. GOOD, or NOT READY 04/02, 04/07 or 30h (loaded, not
+/// usable yet) → `Ok(true)`; NOT READY 3Ah (medium not present) → `Ok(false)`;
+/// anything else, including 04/01 (becoming ready), → `Err`: poll again.
+/// Suitable for poll-loop tick (~50 ms / drive on a healthy bus).
 ///
 /// **No internal recovery.** A wedged target surfaces as `Err(Error::ScsiError)` with `status
 /// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None` — no bus/USB reset, no retry.
@@ -670,31 +670,44 @@ pub(crate) fn is_optical_peripheral(inquiry: &[u8]) -> bool {
         .is_some_and(|b| b & PERIPHERAL_TYPE_MASK == PERIPHERAL_TYPE_OPTICAL)
 }
 
-/// TEST UNIT READY sense -> disc present? `None` when the sense says nothing
-/// about presence. Only ASC 3Ah is MEDIUM NOT PRESENT (SPC-4 Annex D); 04/01 is
-/// a disc spinning up and 06/28 the not-ready-to-ready (medium changed) event.
-#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
-pub(crate) fn tur_disc_present(sense: &ScsiSense) -> Option<bool> {
-    const ASC_NOT_READY: u8 = 0x04;
-    const ASCQ_BECOMING_READY: u8 = 0x01;
-    const ASC_MEDIUM_MAY_HAVE_CHANGED: u8 = 0x28;
-    match (sense.sense_key, sense.asc, sense.ascq) {
-        (SENSE_KEY_NOT_READY, ASC_NOT_READY, ASCQ_BECOMING_READY) => Some(true),
-        // 3Ah, and NOT READY causes we cannot place: as before, "no disc".
-        (SENSE_KEY_NOT_READY, _, _) => Some(false),
-        (SENSE_KEY_UNIT_ATTENTION, ASC_MEDIUM_MAY_HAVE_CHANGED, _) => Some(true),
+/// PREVENT ALLOW MEDIUM REMOVAL (1Eh): `Some` of the PREVENT field (CDB byte 4
+/// bits 1:0; 01 = prevent, 00 = allow, 1x = persistent), `None` otherwise.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn prevent_allow_request(cdb: &[u8]) -> Option<u8> {
+    const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
+    match cdb {
+        [PREVENT_ALLOW_MEDIUM_REMOVAL, _, _, _, b4, ..] => Some(b4 & 0b11),
         _ => None,
     }
 }
 
-/// PREVENT ALLOW MEDIUM REMOVAL (1Eh): `Some(prevent)` from CDB byte 4 bit 0,
-/// `None` for any other command.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn prevent_allow_request(cdb: &[u8]) -> Option<bool> {
-    const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
-    match cdb {
-        [PREVENT_ALLOW_MEDIUM_REMOVAL, _, _, _, b4, ..] => Some(b4 & 0x01 != 0),
-        _ => None,
+/// Disc presence from TEST UNIT READY, `tur` issuing one TUR (Ok = GOOD). Only
+/// ASC 3Ah is MEDIUM NOT PRESENT; 04/02, 04/07 and 30h mean a disc is loaded
+/// but not usable yet (SPC-4 Annex D, MMC-6). A UNIT ATTENTION says nothing
+/// about the medium, so TUR is re-issued once; anything else is `Err`.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+pub(crate) fn tur_presence(mut tur: impl FnMut() -> Result<()>) -> Result<bool> {
+    const ASC_NOT_READY: u8 = 0x04;
+    const ASCQ_INIT_REQUIRED: u8 = 0x02;
+    const ASCQ_OPERATION_IN_PROGRESS: u8 = 0x07;
+    const ASC_INCOMPATIBLE_MEDIUM: u8 = 0x30;
+    const ASC_MEDIUM_NOT_PRESENT: u8 = 0x3A;
+    let mut attention_seen = false;
+    loop {
+        let Err(e) = tur() else {
+            return Ok(true);
+        };
+        let Some(s) = e.scsi_sense().copied() else {
+            return Err(e);
+        };
+        match (s.sense_key, s.asc, s.ascq) {
+            (SENSE_KEY_NOT_READY, ASC_MEDIUM_NOT_PRESENT, _) => return Ok(false),
+            (SENSE_KEY_NOT_READY, ASC_NOT_READY, ASCQ_INIT_REQUIRED)
+            | (SENSE_KEY_NOT_READY, ASC_NOT_READY, ASCQ_OPERATION_IN_PROGRESS)
+            | (SENSE_KEY_NOT_READY, ASC_INCOMPATIBLE_MEDIUM, _) => return Ok(true),
+            (SENSE_KEY_UNIT_ATTENTION, _, _) if !attention_seen => attention_seen = true,
+            _ => return Err(e),
+        }
     }
 }
 
@@ -730,31 +743,91 @@ mod transport_helper_tests {
         }
     }
 
-    // SPC-4 Annex D: only ASC 3Ah is MEDIUM NOT PRESENT; 04/01 is a disc spinning up
-    // and 06/28 is the not-ready-to-ready (medium may have changed) attention.
+    fn tur_err(sense_key: u8, asc: u8, ascq: u8) -> Result<()> {
+        Err(Error::ScsiError {
+            opcode: SCSI_TEST_UNIT_READY,
+            status: SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(sense(sense_key, asc, ascq)),
+        })
+    }
+
+    // Runs `tur_presence` over scripted TUR outcomes; returns the verdict and
+    // how many TURs it issued.
+    fn presence(replies: Vec<Result<()>>) -> (Result<bool>, usize) {
+        let mut replies = replies.into_iter();
+        let mut calls = 0;
+        let r = tur_presence(|| {
+            calls += 1;
+            replies.next().unwrap_or(Ok(()))
+        });
+        (r, calls)
+    }
+
+    // SPC-4 Annex D / MMC-6: only ASC 3Ah is MEDIUM NOT PRESENT. A disc that is
+    // loaded but not usable yet (04/02, 04/07, 30h) is present; other NOT READY
+    // causes are not a presence answer.
     #[test]
     fn tur_presence_reads_the_asc_not_just_the_sense_key() {
-        assert_eq!(tur_disc_present(&sense(0x02, 0x3A, 0x00)), Some(false));
-        assert_eq!(tur_disc_present(&sense(0x02, 0x3A, 0x02)), Some(false));
-        assert_eq!(tur_disc_present(&sense(0x02, 0x04, 0x01)), Some(true));
-        assert_eq!(tur_disc_present(&sense(0x06, 0x28, 0x00)), Some(true));
-        assert_eq!(tur_disc_present(&sense(0x06, 0x29, 0x00)), None);
-        assert_eq!(tur_disc_present(&sense(0x03, 0x11, 0x00)), None);
+        assert!(matches!(presence(vec![Ok(())]), (Ok(true), 1)));
+        assert!(matches!(
+            presence(vec![tur_err(2, 0x3A, 0)]),
+            (Ok(false), 1)
+        ));
+        assert!(matches!(
+            presence(vec![tur_err(2, 0x3A, 2)]),
+            (Ok(false), 1)
+        ));
+        assert!(matches!(
+            presence(vec![tur_err(2, 0x04, 0x02)]),
+            (Ok(true), 1)
+        ));
+        assert!(matches!(
+            presence(vec![tur_err(2, 0x04, 0x07)]),
+            (Ok(true), 1)
+        ));
+        assert!(matches!(
+            presence(vec![tur_err(2, 0x30, 0x00)]),
+            (Ok(true), 1)
+        ));
+        assert!(matches!(
+            presence(vec![tur_err(2, 0x04, 0x01)]),
+            (Err(_), 1)
+        ));
+        assert!(matches!(presence(vec![tur_err(3, 0x11, 0)]), (Err(_), 1)));
+    }
+
+    // A UNIT ATTENTION (06/28 after an insert, 06/29 after a reset) is reported
+    // once and says nothing about the medium: re-issue TUR and answer from that,
+    // never Ok(true) off the attention itself (autorip rips on the first true).
+    #[test]
+    fn tur_presence_retries_once_after_a_unit_attention() {
+        let ua = || tur_err(6, 0x28, 0);
+        assert!(matches!(
+            presence(vec![ua(), tur_err(2, 0x3A, 0)]),
+            (Ok(false), 2)
+        ));
+        assert!(matches!(presence(vec![ua(), Ok(())]), (Ok(true), 2)));
+        assert!(matches!(
+            presence(vec![ua(), tur_err(2, 0x04, 0x01)]),
+            (Err(_), 2)
+        ));
+        assert!(matches!(
+            presence(vec![ua(), tur_err(6, 0x29, 0)]),
+            (Err(_), 2)
+        ));
     }
 
     // Drop unlocks the tray only for a transport that issued a PREVENT; the
     // CDB decode is what tracks that.
     #[test]
     fn prevent_allow_request_decodes_only_1eh() {
-        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x01, 0]), Some(true));
-        assert_eq!(
-            prevent_allow_request(&[0x1E, 0, 0, 0, 0x00, 0]),
-            Some(false)
-        );
-        assert_eq!(
-            prevent_allow_request(&[0x1E, 0, 0, 0, 0x02, 0]),
-            Some(false)
-        );
+        // SPC-4 §6.13 PREVENT field, bits 1:0: 00 allow, 01 prevent,
+        // 10 persistent allow, 11 persistent prevent. Upper bits are reserved.
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x00, 0]), Some(0b00));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x01, 0]), Some(0b01));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x02, 0]), Some(0b10));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x03, 0]), Some(0b11));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0xFD, 0]), Some(0b01));
         assert_eq!(prevent_allow_request(&[0x12, 0, 0, 0, 0x01, 0]), None);
         assert_eq!(prevent_allow_request(&[0x1E, 0, 0]), None, "short CDB");
     }

@@ -36,6 +36,21 @@ pub(crate) fn release_recovery_slot(counter: &std::sync::atomic::AtomicUsize) {
     counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 }
 
+/// The fd `Drop` should send ALLOW MEDIUM REMOVAL on, if any: only when this
+/// transport holds a PREVENT, only on an fd it already owns (the live one, else
+/// a published recovery fd), and never after an ALLOW already hit a dead bus.
+pub(crate) fn drop_unlock_fd(
+    prevent_held: bool,
+    allow_transport_failed: bool,
+    fd: i32,
+    recovered: Option<i32>,
+) -> Option<i32> {
+    if !prevent_held || allow_transport_failed {
+        return None;
+    }
+    if fd >= 0 { Some(fd) } else { recovered }
+}
+
 /// The empty slot. Not a valid fd; `open()` never returns a negative value.
 pub(crate) const EMPTY: i32 = -1;
 
@@ -116,6 +131,38 @@ mod tests {
     /// Fresh slot + liveness flag, as `SgIoTransport::open` builds them.
     fn slot() -> (AtomicI32, AtomicBool) {
         (AtomicI32::new(EMPTY), AtomicBool::new(false))
+    }
+
+    // ── Drop-time tray unlock ──────────────────────────────────────────────
+
+    /// Drop sends ALLOW only for a transport that holds a PREVENT, only on an fd
+    /// it already owns (never an inline reopen of a possibly wedged node), and
+    /// not again after an ALLOW already died on the transport.
+    #[test]
+    fn drop_unlock_fd_uses_only_an_owned_fd_and_only_after_prevent() {
+        assert_eq!(
+            drop_unlock_fd(false, false, 5, None),
+            None,
+            "never PREVENTed"
+        );
+        assert_eq!(drop_unlock_fd(false, false, -1, Some(7)), None);
+        assert_eq!(drop_unlock_fd(true, false, 5, None), Some(5));
+        assert_eq!(drop_unlock_fd(true, false, 5, Some(7)), Some(5));
+        assert_eq!(
+            drop_unlock_fd(true, false, -1, Some(7)),
+            Some(7),
+            "recovered fd"
+        );
+        assert_eq!(
+            drop_unlock_fd(true, false, -1, None),
+            None,
+            "no inline reopen"
+        );
+        assert_eq!(
+            drop_unlock_fd(true, true, 5, None),
+            None,
+            "ALLOW hit a dead bus"
+        );
     }
 
     // ── Recovery-thread cap ────────────────────────────────────────────────

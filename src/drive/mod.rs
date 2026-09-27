@@ -106,6 +106,9 @@ pub struct Drive {
     oem_vid: Option<[u8; 16]>,
     /// True once `init()` has run (whether or not an unlocker matched).
     init_ran: bool,
+    /// `lock_tray` was called and no `unlock_tray` since: only then does Drop
+    /// send ALLOW (never clear a lock another process holds).
+    tray_locked: bool,
     /// Lazily-computed registry-match name for `platform_name()`'s `&str`
     /// return before `init()` has run.
     matched_name_cache: std::sync::OnceLock<String>,
@@ -163,6 +166,7 @@ impl Drive {
             unlocker_name: None,
             oem_vid: None,
             init_ran: false,
+            tray_locked: false,
             matched_name_cache: std::sync::OnceLock::new(),
             drive_id,
             device_path: device.to_string_lossy().to_string(),
@@ -228,6 +232,7 @@ impl Drive {
             unlocker_name: None,
             oem_vid: None,
             init_ran: false,
+            tray_locked: false,
             matched_name_cache: std::sync::OnceLock::new(),
             drive_id: DriveId {
                 vendor_id: String::new(),
@@ -315,7 +320,9 @@ impl Drive {
 
     /// Shared cleanup — called by Drop (and thus by close).
     fn cleanup(&mut self) {
-        self.unlock_tray();
+        if self.tray_locked {
+            self.unlock_tray();
+        }
     }
 
     /// Whether an unlocker claims this drive by identity (i.e. it can be
@@ -353,10 +360,11 @@ impl Drive {
         // The poll can take up to 30s (60 × 500ms). Heartbeat it so a slow
         // spin-up is visible as steady beats rather than a silent stall.
         let mut hb = crate::progress::Heartbeat::new("wait_ready");
-        let mut transport_failures = 0u32;
+        let mut failing_since: Option<std::time::Instant> = None;
         for attempt in 0..60u64 {
             hb.tick(attempt, 60);
             let mut buf = [0u8; 0];
+            let sent = std::time::Instant::now();
             // `checked_exec`, not bare `execute`: this poll (60 x 500 ms = ~30 s) must
             // see `self.halt`, or a Stop during cold spin-up is ignored for half a
             // minute. A TUR that FAILS is just not-ready-yet and keeps the loop going.
@@ -372,16 +380,16 @@ impl Drive {
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                // One transport failure can be a bus hiccup (DID_TIME_OUT/DID_RESET, or
-                // the Linux fd-reopen gap), so ride it out; a run of them is a dead bus
-                // that will never spin up — surface it rather than poll for 30 s.
+                // Transport failures can be a hiccup (DID_TIME_OUT/DID_RESET, the Linux
+                // fd-reopen gap): ride them out, but an unbroken run lasting the whole
+                // budget is a dead bus, surfaced rather than polled for 30 s.
                 Err(e) if e.is_scsi_transport_failure() => {
-                    transport_failures += 1;
-                    if transport_failures >= WAIT_READY_MAX_TRANSPORT_FAILURES {
+                    let since = *failing_since.get_or_insert(sent);
+                    if since.elapsed() >= WAIT_READY_DEAD_BUS_BUDGET {
                         return Err(e);
                     }
                 }
-                Err(_) => transport_failures = 0,
+                Err(_) => failing_since = None,
             }
             // Halt-aware backoff: the flag can also flip DURING the 500 ms
             // gap, which is where most of the 30 s is actually spent.
@@ -1072,6 +1080,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
+        self.tray_locked = true;
         if let Err(e) =
             self.scsi
                 .as_mut()
@@ -1092,6 +1101,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
+        self.tray_locked = false;
         // Best-effort (the tray-unlock is advisory), but a failure is worth a warn!
         // rather than a silent `let _`: a stuck PREVENT lock is a real symptom the
         // operator otherwise never sees until the tray won't open.
@@ -1364,9 +1374,9 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
     last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
 }
 
-// Consecutive transport-class TUR failures after which wait_ready gives up on a
-// dead bus (~1 s of 500 ms backoff: long enough for the Linux fd reopen).
-const WAIT_READY_MAX_TRANSPORT_FAILURES: u32 = 3;
+// How long an unbroken run of transport-class TUR failures may last before
+// wait_ready calls the bus dead (covers the Linux fd reopen and bridge resets).
+const WAIT_READY_DEAD_BUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 // Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true, returning
 // Error::Halted. Used by wait_ready's poll backoff and spin_cycle's spin-down/settle pauses.
@@ -2922,9 +2932,9 @@ mod command_tests {
     }
 
     // A dead bus (transport failures in a row) will never spin up, so wait_ready
-    // must surface it within a few polls rather than poll a phantom for ~30 s.
+    // must surface it once the ~5 s budget is spent, not poll a phantom for ~30 s.
     #[test]
-    fn wait_ready_breaks_immediately_on_a_dead_bus() {
+    fn wait_ready_breaks_out_on_a_dead_bus() {
         struct DeadBus;
         impl ScsiTransport for DeadBus {
             fn execute(
@@ -2949,8 +2959,8 @@ mod command_tests {
             "a dead bus must surface the transport failure, not DeviceNotReady: {r:?}"
         );
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
-            "a dead bus must break out at once, not run the ~30 s poll"
+            t0.elapsed() < std::time::Duration::from_secs(8),
+            "a dead bus must break out after the budget, not run the ~30 s poll"
         );
     }
 
@@ -2990,6 +3000,70 @@ mod command_tests {
         assert!(
             r.is_ok(),
             "a transient transport failure must not abort wait_ready: {r:?}"
+        );
+    }
+
+    // Fails with a transport error for the first `fails` TURs, each taking
+    // `delay`, then answers GOOD.
+    struct FlakyBus {
+        fails: usize,
+        delay: std::time::Duration,
+    }
+    impl ScsiTransport for FlakyBus {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            std::thread::sleep(self.delay);
+            if self.fails == 0 {
+                return Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                });
+            }
+            self.fails -= 1;
+            Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            })
+        }
+    }
+
+    // The dead-bus budget is TIME, not a count: several quick transport
+    // failures within it (a bridge reset storm) must still ride through.
+    #[test]
+    fn wait_ready_tolerates_quick_transport_failures_within_the_budget() {
+        let mut d = Drive::from_transport_for_test(Box::new(FlakyBus {
+            fails: 4,
+            delay: std::time::Duration::ZERO,
+        }));
+        let r = d.wait_ready();
+        assert!(r.is_ok(), "4 fast failures (~2 s) are within budget: {r:?}");
+    }
+
+    // Slow failing TURs (each eating its timeout) must not stretch the dead-bus
+    // verdict to count x timeout.
+    #[test]
+    fn wait_ready_bounds_slow_transport_failures_by_elapsed_time() {
+        let mut d = Drive::from_transport_for_test(Box::new(FlakyBus {
+            fails: usize::MAX,
+            delay: std::time::Duration::from_millis(2_600),
+        }));
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(
+            matches!(&r, Err(e) if e.is_scsi_transport_failure()),
+            "{r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(8),
+            "dead bus must surface after ~5 s of failures, took {:?}",
+            t0.elapsed()
         );
     }
 
@@ -3248,6 +3322,33 @@ mod command_tests {
         let c = cdb.lock().unwrap();
         assert_eq!(c[0], crate::scsi::SCSI_SET_CD_SPEED);
         assert_eq!(&c[2..4], &[0x12, 0x34], "read speed big-endian");
+    }
+
+    // Dropping a drive must not clear a tray lock it never took: find_drive opens
+    // and drops candidates, and another process may hold the PREVENT.
+    #[test]
+    fn drop_unlocks_the_tray_only_if_this_drive_locked_it() {
+        let seq = |f: &dyn Fn(&mut Drive)| {
+            let cdbs = Arc::new(Mutex::new(Vec::new()));
+            let mut d = Drive::from_transport_for_test(Box::new(SequenceTransport {
+                cdbs: cdbs.clone(),
+                ok: true,
+            }));
+            f(&mut d);
+            cdbs.lock().unwrap().clear();
+            drop(d);
+            cdbs.lock().unwrap().clone()
+        };
+        assert!(seq(&|_| {}).is_empty(), "never locked: Drop sends nothing");
+        let after_lock = seq(&|d| d.lock_tray());
+        assert_eq!(after_lock.len(), 1, "locked: Drop unlocks {after_lock:?}");
+        assert_eq!(after_lock[0][0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+        assert_eq!(after_lock[0][4], 0x00, "ALLOW");
+        let unlocked = seq(&|d| {
+            d.lock_tray();
+            d.unlock_tray();
+        });
+        assert!(unlocked.is_empty(), "already unlocked: {unlocked:?}");
     }
 
     #[test]

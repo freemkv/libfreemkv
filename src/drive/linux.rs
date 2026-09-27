@@ -24,13 +24,29 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     drives
 }
 
-/// Candidate optical `/dev/sg*` paths from sysfs alone — nothing is opened.
+/// Candidate optical `/dev/sg*` paths: from sysfs alone (nothing opened), or,
+/// when sysfs is unreadable, nodes whose INQUIRY reports an optical device.
 pub(crate) fn candidate_paths() -> Vec<String> {
-    crate::scsi::linux::enumerate_sg_names()
+    let (names, type_filtered) = crate::scsi::linux::enumerate_sg_names();
+    let paths = names
         .into_iter()
         .map(|name| format!("/dev/{name}"))
-        .filter(|path| std::path::Path::new(path).exists())
-        .collect()
+        .filter(|path| std::path::Path::new(path).exists());
+    optical_candidates(paths, type_filtered, |path| {
+        crate::scsi::open(std::path::Path::new(path))
+            .and_then(|mut t| crate::scsi::inquiry(t.as_mut()))
+            .is_ok_and(|r| crate::scsi::is_optical_peripheral(&r.raw))
+    })
+}
+
+// Keep `paths` as-is if sysfs already type-filtered them, else only those
+// `is_optical` confirms.
+fn optical_candidates(
+    paths: impl Iterator<Item = String>,
+    type_filtered: bool,
+    mut is_optical: impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    paths.filter(|p| type_filtered || is_optical(p)).collect()
 }
 
 /// Resolve a device path to its raw `/dev/sg*` SCSI-generic node.
@@ -75,4 +91,25 @@ pub fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
         });
     }
     Ok((path.to_string(), DeviceResolution::Direct))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unfiltered sg nodes (sysfs unreadable) must be INQUIRY-checked before a
+    // Drive::open; sysfs-filtered ones are not probed at all.
+    #[test]
+    fn optical_candidates_probes_only_when_sysfs_did_not_filter() {
+        let paths = || ["/dev/sg0", "/dev/sg1"].map(String::from).into_iter();
+        let mut probed = Vec::new();
+        let kept = optical_candidates(paths(), true, |p| {
+            probed.push(p.to_string());
+            false
+        });
+        assert_eq!(kept, ["/dev/sg0", "/dev/sg1"]);
+        assert!(probed.is_empty(), "type-filtered paths need no INQUIRY");
+        let kept = optical_candidates(paths(), false, |p| p == "/dev/sg1");
+        assert_eq!(kept, ["/dev/sg1"], "non-optical sg0 dropped");
+    }
 }
