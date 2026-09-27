@@ -58,9 +58,13 @@ const MPEG2_L1: [u32; 15] = [
 ];
 const MPEG2_L23: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 
-// Free-format search ceiling in bit/s: above every table bitrate (max 448 kbit/s), so a
-// real free-format frame is always found within it and a false header is given up on.
-const MAX_FREE_FORMAT_BITRATE: u32 = 640_000;
+// Free-format search ceilings in bytes (a practical bound from the frame syntax, not a spec
+// limit): Layer I/II never usefully exceed their raw 16-bit stereo PCM (samples x 4); Layer III
+// is header + CRC + side info + max part2_3_length for every granule/channel + reservoir.
+const MAX_FREE_L1_BYTES: usize = 384 * 4;
+const MAX_FREE_L2_BYTES: usize = 1152 * 4;
+const MAX_FREE_L3_MPEG1_BYTES: usize = 4 + 2 + 32 + 2 * 2 * 4095 / 8 + 1 + 511;
+const MAX_FREE_L3_MPEG2_BYTES: usize = 4 + 2 + 17 + 2 * 4095 / 8 + 1 + 255;
 
 // Does a header continuing this free-format stream (same version/layer/bitrate/rate,
 // padding and private bits ignored) start at `i`?
@@ -82,13 +86,14 @@ fn free_format_bytes(
     let wait = data.len().saturating_add(1);
     if let Some(n) = *free_size {
         let b = n + pad;
-        if free_format_next_at(data, b) {
+        // At EOS the learned size frames the last unit; trailing junk (ID3v1) stays out.
+        if free_format_next_at(data, b) || (eos && data.len() >= b) {
             return Some(b);
         }
         if data.len() < b + 3 {
-            return Some(if eos && data.len() >= b { b } else { wait });
+            return Some(wait);
         }
-        *free_size = None; // no header where predicted: relearn
+        // No header where predicted: relearn below (the old size stands until replaced).
     }
     let last = max.min(data.len().saturating_sub(3));
     if let Some(d) = (pad + 5..=last).find(|&i| free_format_next_at(data, i)) {
@@ -140,7 +145,12 @@ fn frame_header(data: &[u8], free_size: &mut Option<usize>, eos: bool) -> Option
     };
     let bytes = if bitrate == 0 {
         let pad = size(0, padding);
-        let max = size(MAX_FREE_FORMAT_BITRATE, 1);
+        let max = match layer {
+            3 => MAX_FREE_L1_BYTES,
+            2 => MAX_FREE_L2_BYTES,
+            _ if version == 3 => MAX_FREE_L3_MPEG1_BYTES,
+            _ => MAX_FREE_L3_MPEG2_BYTES,
+        };
         free_format_bytes(data, free_size, pad, max, eos)?
     } else {
         size(bitrate, padding)
@@ -179,12 +189,21 @@ impl MpegAudioParser {
 }
 impl CodecParser for MpegAudioParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
+        let mut out = Vec::new();
         if pes.discontinuity {
+            // Emit the complete frame still awaiting its successor before the gap clears it.
+            let free_size = &mut self.free_size;
+            out = self
+                .frames
+                .drain_before_gap(4, |d| frame_header(d, free_size, true));
             self.free_size = None;
         }
         let free_size = &mut self.free_size;
-        self.frames
-            .parse(pes, 4, |d| frame_header(d, free_size, false))
+        out.extend(
+            self.frames
+                .parse(pes, 4, |d| frame_header(d, free_size, false)),
+        );
+        out
     }
     fn flush(&mut self) -> Vec<Frame> {
         let free_size = &mut self.free_size;
@@ -418,9 +437,14 @@ mod tests {
             ..make_pes(short(200).repeat(3), Some(900_000))
         };
         let f = p.parse(&gap);
-        assert!(!f.is_empty());
+        assert_eq!(
+            f[0].data.len(),
+            300,
+            "the pending pre-gap frame is emitted first"
+        );
+        assert!(f.len() > 1);
         assert!(
-            f.iter().all(|fr| fr.data.len() == 200),
+            f[1..].iter().all(|fr| fr.data.len() == 200),
             "relearned after the gap"
         );
         let mut p = MpegAudioParser::new();
@@ -439,6 +463,51 @@ mod tests {
         let f = p.flush();
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].data, free_frame());
+    }
+
+    // Layer II free format at 768 kbit/s, 48 kHz: 2304-byte frames, above any table rate.
+    #[test]
+    fn high_rate_layer2_free_format_frames() {
+        let mut frame = vec![0xFF, 0xFD, 0x04, 0x00];
+        frame.resize(2304, 0xAA);
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(frame.repeat(3), Some(0)));
+        f.extend(p.flush());
+        assert_eq!(f.len(), 3);
+        assert!(f.iter().all(|fr| fr.data == frame));
+    }
+
+    // The complete free-format frame awaiting its successor is emitted before a gap
+    // clears the buffer, not silently lost.
+    #[test]
+    fn pending_free_format_frame_survives_a_discontinuity() {
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(free_frame().repeat(2), Some(0)));
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes(free_frame().repeat(2), Some(900_000))
+        };
+        f.extend(p.parse(&gap));
+        assert_eq!(
+            f.len(),
+            3,
+            "both pre-gap frames plus the first post-gap one"
+        );
+        assert_eq!(p.dropped_frames(), 0);
+    }
+
+    // At EOS the learned size frames the last unit; trailing ID3v1 "TAG" bytes are not
+    // absorbed into it.
+    #[test]
+    fn eos_uses_learned_size_not_trailing_junk() {
+        let mut data = free_frame().repeat(2);
+        data.extend_from_slice(b"TAG");
+        data.resize(data.len() + 125, b' ');
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(data, Some(0)));
+        f.extend(p.flush());
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|fr| fr.data == free_frame()));
     }
 
     #[test]

@@ -143,6 +143,18 @@ impl AudioFrames {
         self.flush_with(0, |_| None)
     }
 
+    // Before a discontinuity clears the buffer: frame what `header` can size with no more
+    // data coming (as at EOS), then drop the rest.
+    pub fn drain_before_gap(
+        &mut self,
+        min_header: usize,
+        header: impl FnMut(&[u8]) -> Option<Header>,
+    ) -> Vec<Frame> {
+        let frames = self.frame_buffered(min_header, header);
+        self.buf.clear();
+        frames
+    }
+
     // EOS: frame what `header` can size now that no more data is coming, then drop the
     // rest. A trailing partial syncframe is not decodable; never manufacture one.
     pub fn flush_with(
