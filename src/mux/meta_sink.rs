@@ -144,6 +144,18 @@ pub(crate) fn title_json(title: &DiscTitle) -> serde_json::Value {
     doc
 }
 
+// Every rate a stream carries, in Hz: a BD combo (48/96, 48/192) lists both,
+// Unknown is empty.
+fn sample_rates(rate: crate::disc::SampleRate) -> Vec<u32> {
+    use crate::disc::SampleRate::*;
+    match rate {
+        S48_96 => vec![48_000, 96_000],
+        S48_192 => vec![48_000, 192_000],
+        Unknown => Vec::new(),
+        r => vec![r.hz() as u32],
+    }
+}
+
 /// Compact id for an audio stream's editorial purpose (no localized prose —
 /// the app maps it to display text). Mirrors the `Codec::id()` convention.
 fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
@@ -157,6 +169,22 @@ fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
     }
 }
 
+// `doc[key][i]` as a mutable object, or `dummy` (reset to an object) if absent.
+fn entry<'a>(
+    doc: &'a mut serde_json::Value,
+    key: &str,
+    i: usize,
+    dummy: &'a mut serde_json::Value,
+) -> &'a mut serde_json::Value {
+    match doc.get_mut(key).and_then(|v| v.get_mut(i)) {
+        Some(e) if e.is_object() => e,
+        _ => {
+            *dummy = serde_json::json!({});
+            dummy
+        }
+    }
+}
+
 /// Merge the per-stream fields `TitleProfile` drops back into the `json://`
 /// document, straight from the source Title. Walks `title.streams` in declared
 /// order with a per-kind cursor so each raw stream lines up with the profile's
@@ -165,10 +193,12 @@ fn enrich_streams(doc: &mut serde_json::Value, title: &DiscTitle) {
     use crate::disc::Stream;
     use serde_json::json;
     let (mut vi, mut ai, mut si) = (0usize, 0usize, 0usize);
+    // `doc[key][i]` panics on a missing array; skip an entry the profile lacks.
+    let mut dummy = serde_json::Value::Null;
     for s in &title.streams {
         match s {
             Stream::Video(v) => {
-                let e = &mut doc["video"][vi];
+                let e = entry(doc, "video", vi, &mut dummy);
                 e["pid"] = json!(v.pid);
                 e["color_space"] = json!(v.color_space.id());
                 e["display_aspect"] = match v.display_aspect {
@@ -199,15 +229,18 @@ fn enrich_streams(doc: &mut serde_json::Value, title: &DiscTitle) {
                 vi += 1;
             }
             Stream::Audio(a) => {
-                let e = &mut doc["audio"][ai];
+                let e = entry(doc, "audio", ai, &mut dummy);
                 e["pid"] = json!(a.pid);
                 e["secondary"] = json!(a.secondary);
-                e["sample_rate"] = json!(a.sample_rate.to_string());
+                // Numeric Hz (null when unknown), not the "48kHz" display form.
+                let hz = a.sample_rate.hz() as u32;
+                e["sample_rate"] = if hz == 0 { json!(null) } else { json!(hz) };
+                e["sample_rates"] = json!(sample_rates(a.sample_rate));
                 e["purpose"] = json!(purpose_id(a.purpose));
                 ai += 1;
             }
             Stream::Subtitle(sub) => {
-                let e = &mut doc["subtitles"][si];
+                let e = entry(doc, "subtitles", si, &mut dummy);
                 e["pid"] = json!(sub.pid);
                 e["descriptive_service"] =
                     json!(sub.qualifier == crate::disc::LabelQualifier::DescriptiveService);
@@ -446,7 +479,8 @@ mod tests {
         let a = &v["audio"][0];
         assert_eq!(a["pid"], 0x1100);
         assert_eq!(a["secondary"], true);
-        assert_eq!(a["sample_rate"], "48kHz");
+        assert_eq!(a["sample_rate"], 48_000);
+        assert_eq!(a["sample_rates"], serde_json::json!([48_000]));
         assert_eq!(a["purpose"], "commentary");
 
         let s = &v["subtitles"][0];
@@ -496,5 +530,35 @@ mod tests {
             "expected {code}, got {err}"
         );
         let _ = std::fs::remove_file(&jpath);
+    }
+
+    // A document missing the per-kind arrays must not panic the enrichment.
+    #[test]
+    fn enriching_a_document_without_stream_arrays_does_not_panic() {
+        let mut t = DiscTitle::empty();
+        t.streams = vec![crate::disc::Stream::Audio(crate::disc::AudioStream {
+            pid: 0x1100,
+            codec: crate::disc::Codec::Ac3,
+            channels: crate::disc::AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: crate::disc::SampleRate::Unknown,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        })];
+        let mut doc = serde_json::json!({});
+        enrich_streams(&mut doc, &t);
+        assert_eq!(
+            title_json(&t)["audio"][0]["sample_rate"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn combo_sample_rates_keep_both_rates() {
+        use crate::disc::SampleRate;
+        assert_eq!(sample_rates(SampleRate::S48_96), vec![48_000, 96_000]);
+        assert_eq!(sample_rates(SampleRate::S48_192), vec![48_000, 192_000]);
+        assert!(sample_rates(SampleRate::Unknown).is_empty());
     }
 }

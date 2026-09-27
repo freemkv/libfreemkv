@@ -57,7 +57,7 @@ pub struct PesFrame {
     /// preserved across network:// and stdio:// hops.
     pub duration_ns: Option<u64>,
     /// Matroska DiscardPadding in nanoseconds: positive trims the end, negative
-    /// trims the beginning. Local container remux metadata; not on the PES wire.
+    /// trims the beginning. On the PES wire only for FMKV header v2 streams.
     pub discard_padding_ns: i64,
     /// Byte-exact source provenance of this frame's first byte, stamped at the
     /// demux seam. `None` for synthetic sources / the `skip_parse` path and for
@@ -81,6 +81,10 @@ impl PesFrame {
     ///
     /// `duration_ns` is encoded as `u64::MAX` when `None`, or the value when `Some`.
     pub fn serialize(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.serialize_inner(w, false)
+    }
+
+    fn serialize_inner(&self, w: &mut dyn std::io::Write, padded: bool) -> std::io::Result<()> {
         if self.track > 255 {
             return Err(crate::error::Error::PesTrackTooLarge { track: self.track }.into());
         }
@@ -98,7 +102,32 @@ impl PesFrame {
         w.write_all(&[if self.keyframe { 1 } else { 0 }])?;
         w.write_all(&duration_wire.to_le_bytes())?;
         w.write_all(&(self.data.len() as u32).to_le_bytes())?;
+        if padded {
+            w.write_all(&self.discard_padding_ns.to_le_bytes())?;
+        }
         w.write_all(&self.data)
+    }
+
+    /// [`serialize`](Self::serialize) plus, when `padded` (FMKV header v2), an
+    /// 8-byte LE `discard_padding_ns` after the fixed header.
+    pub(crate) fn serialize_ext(
+        &self,
+        w: &mut dyn std::io::Write,
+        padded: bool,
+    ) -> std::io::Result<()> {
+        self.serialize_inner(w, padded)
+    }
+
+    /// [`deserialize`](Self::deserialize) for a stream whose FMKV header says
+    /// frames carry the `discard_padding_ns` extension (`padded`).
+    pub(crate) fn deserialize_ext(
+        r: &mut dyn std::io::Read,
+        padded: bool,
+    ) -> std::io::Result<Option<Self>> {
+        if !padded {
+            return Self::deserialize(r);
+        }
+        Self::deserialize_inner(r, true)
     }
 
     /// Deserialize from bytes. Returns None at a clean end of stream.
@@ -108,6 +137,10 @@ impl PesFrame {
     /// error (`UnexpectedEof`), not silently treated as EOF — otherwise
     /// truncated `.pes` data would be accepted as a graceful end.
     pub fn deserialize(r: &mut dyn std::io::Read) -> std::io::Result<Option<Self>> {
+        Self::deserialize_inner(r, false)
+    }
+
+    fn deserialize_inner(r: &mut dyn std::io::Read, padded: bool) -> std::io::Result<Option<Self>> {
         // Probe one byte first to distinguish clean EOF from a truncated header.
         // Loop on EINTR so a recoverable interrupted read doesn't fail — symmetric
         // with read_exact's internal retry for the rest of the header and data.
@@ -141,6 +174,12 @@ impl PesFrame {
             Some(duration_wire)
         };
         let len = u32::from_le_bytes([header[18], header[19], header[20], header[21]]) as usize;
+        let mut discard_padding_ns = 0;
+        if padded {
+            let mut ext = [0u8; 8];
+            r.read_exact(&mut ext)?;
+            discard_padding_ns = i64::from_le_bytes(ext);
+        }
         if len > MAX_FRAME_SIZE {
             return Err(crate::error::Error::PesFrameTooLarge { size: len }.into());
         }
@@ -157,7 +196,7 @@ impl PesFrame {
             filled += want;
         }
         Ok(Some(Self {
-            discard_padding_ns: 0,
+            discard_padding_ns,
             track,
             pts,
             keyframe,
@@ -226,8 +265,9 @@ pub trait Stream: Send {
         TrackTiming::default()
     }
 
-    /// Set timing before the first frame is written. Sinks without this metadata
-    /// retain their existing behavior.
+    /// Set timing before the first frame is written. Carried by `mkv://` and the
+    /// FMKV `network://` / `stdio://` wire; `m2ts://` has no field for it and
+    /// `mp4://` carries no Opus track, so those keep the no-op default.
     fn set_track_timing(&mut self, _track: usize, _timing: TrackTiming) -> std::io::Result<()> {
         Ok(())
     }

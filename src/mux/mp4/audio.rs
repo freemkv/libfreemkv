@@ -349,7 +349,7 @@ fn dts_channel_layout(amode: usize, lfe: bool) -> u16 {
 /// The `ddts` config box (ETSI TS 102 114 Annex; DTS-in-ISO registration).
 /// Describes the DTS core; whole access units (core + any extension) are passed
 /// through as samples, so a DTS-HD-aware decoder still finds the extension.
-fn ddts_box(c: &DtsConfig) -> Vec<u8> {
+fn ddts_box(c: &DtsConfig, max_rate: u32) -> Vec<u8> {
     // avg/max bitrate: derived from core frame size × frame rate (core RATE reads
     // "open/variable" for lossless, so unusable directly). Rate isn't integral
     // (e.g. 93.75 frames/s), so multiply before dividing, rounding to nearest.
@@ -362,14 +362,18 @@ fn ddts_box(c: &DtsConfig) -> Vec<u8> {
     };
 
     let mut out = Vec::new();
-    out.extend_from_slice(&c.sample_rate.to_be_bytes()); // DTSSamplingFrequency
+    out.extend_from_slice(&max_rate.to_be_bytes()); // DTSSamplingFrequency
     out.extend_from_slice(&bitrate.to_be_bytes()); // maxBitrate
     out.extend_from_slice(&bitrate.to_be_bytes()); // avgBitrate
     out.push(if c.has_extension { 24 } else { 16 }); // pcmSampleDepth
+    // FrameDuration counts samples at DTSSamplingFrequency, not the core rate.
+    let at_max = (u64::from(c.frame_samples) * u64::from(max_rate))
+        .checked_div(u64::from(c.sample_rate))
+        .unwrap_or(u64::from(c.frame_samples));
     // Bit-packed tail (56 bits): FrameDuration2 StreamConstruction5 CoreLFEPresent1
     // CoreLayout6 CoreSize14 StereoDownmix1 RepresentationType3 ChannelLayout16
     // MultiAssetFlag1 LBRDurationMod1 ReservedBoxPresent1 Reserved5
-    let frame_duration = match c.frame_samples {
+    let frame_duration = match at_max {
         0..=512 => 0,
         513..=1024 => 1,
         1025..=2048 => 2,
@@ -404,10 +408,26 @@ fn ddts_box(c: &DtsConfig) -> Vec<u8> {
     bx(b"ddts", &out)
 }
 
+// DTS sample-entry samplerate: the family base of the maximum rate (ETSI TS 102 114
+// E.2.2.2); the 4x core rates join their family per Table 5-6.
+fn dts_entry_rate(max_rate: u32) -> u32 {
+    match max_rate {
+        12_000 | 24_000 | 48_000 | 96_000 | 192_000 => 48_000,
+        11_025 | 22_050 | 44_100 | 88_200 | 176_400 => 44_100,
+        8_000 | 16_000 | 32_000 | 64_000 | 128_000 => 32_000,
+        other => other,
+    }
+}
+
 /// The MP4 fourcc + config box for an audio frame, or `None` if the codec has no
 /// MP4 mapping here. Together with [`audio_fits`] this is the fit oracle for
 /// audio: only what returns `Some` is muxable.
-pub(super) fn dolby_sample_entry(codec: Codec, first_frame: &[u8]) -> Option<Vec<u8>> {
+/// `stream_hz` is the title's rate for the track (0 if unknown).
+pub(super) fn dolby_sample_entry(
+    codec: Codec,
+    first_frame: &[u8],
+    stream_hz: u32,
+) -> Option<Vec<u8>> {
     match codec {
         Codec::Ac3 => {
             let c = parse_dolby(first_frame)?;
@@ -439,11 +459,17 @@ pub(super) fn dolby_sample_entry(codec: Codec, first_frame: &[u8]) -> Option<Vec
             let c = parse_dts(first_frame)?;
             // `dtsc` = DTS core; `dtsh` = DTS-HD (core + extension substreams).
             let fourcc: &[u8; 4] = if c.has_extension { b"dtsh" } else { b"dtsc" };
+            // The core may run at a divisor of the stream rate (48 kHz core in 96 kHz MA).
+            let max_rate = if stream_hz > c.sample_rate && stream_hz.is_multiple_of(c.sample_rate) {
+                stream_hz
+            } else {
+                c.sample_rate
+            };
             Some(audio_sample_entry(
                 fourcc,
                 c.channels,
-                c.sample_rate,
-                &ddts_box(&c),
+                dts_entry_rate(max_rate),
+                &ddts_box(&c, max_rate),
             ))
         }
         _ => None,
@@ -549,7 +575,7 @@ mod tests {
         // A Codec::Ac3Plus track whose first syncframe is legacy AC-3 (bsid 8 < 11)
         // has no nominal data rate; an `ec-3` entry built from it would declare
         // 0 kbps, violating ETSI TS 102 366 F.6.1 — emit ac-3/dac3 (Annex F.4) instead.
-        let e = dolby_sample_entry(Codec::Ac3Plus, &ac3_frame_5_1()).expect("entry built");
+        let e = dolby_sample_entry(Codec::Ac3Plus, &ac3_frame_5_1(), 0).expect("entry built");
         assert_eq!(
             &e[4..8],
             b"ac-3",
@@ -570,7 +596,7 @@ mod tests {
         // A real Annex-E syncframe still gets `ec-3` + `dec3`, and the data_rate
         // read back out of the emitted box is the frame's nominal rate, not 0.
         // 128 B / 1536 samples @ 48 kHz = 32 kbit/s.
-        let e = dolby_sample_entry(Codec::Ac3Plus, &eac3_frame_5_1()).expect("entry built");
+        let e = dolby_sample_entry(Codec::Ac3Plus, &eac3_frame_5_1(), 0).expect("entry built");
         assert_eq!(&e[4..8], b"ec-3");
         let i = e
             .windows(4)
@@ -642,7 +668,7 @@ mod tests {
         assert_eq!(c.core_size, 96);
         assert_eq!(c.frame_samples, 512);
 
-        let ddts = ddts_box(&c);
+        let ddts = ddts_box(&c, c.sample_rate);
         assert_eq!(&ddts[4..8], b"ddts");
         // DTSSamplingFrequency (first field) = 48000.
         assert_eq!(
@@ -650,8 +676,55 @@ mod tests {
             48_000
         );
         // Sample entry uses dtsc (no extension in this synthetic frame).
-        let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f, 0).unwrap();
         assert_eq!(&e[4..8], b"dtsc");
+    }
+
+    // ETSI TS 102 114 E.2.2: a 48 kHz core in a 96 kHz stream → entry 48000, ddts 96000.
+    #[test]
+    fn a_96k_dts_stream_writes_its_max_rate_in_ddts_and_the_family_base_in_the_entry() {
+        let f = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x3C, 0x05, 0xF2, 0x77, 0x00, 0x02, 0x00,
+        ];
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f, 96_000).unwrap();
+        assert_eq!(&e[32..34], &48_000u16.to_be_bytes(), "entry samplerate");
+        let ddts = e.windows(4).position(|w| w == b"ddts").unwrap();
+        assert_eq!(&e[ddts + 4..ddts + 8], &96_000u32.to_be_bytes());
+        // FrameDuration counts samples at DTSSamplingFrequency: 512 core samples
+        // at 48 kHz are 1024 at 96 kHz → code 1.
+        let c = parse_dts(&f).unwrap();
+        assert_eq!(ddts_tail(&ddts_box(&c, 96_000))[0] >> 6, 1);
+        assert_eq!(ddts_tail(&ddts_box(&c, 48_000))[0] >> 6, 0);
+        // A title rate that is not a multiple of the core rate is ignored.
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f, 44_100).unwrap();
+        let ddts = e.windows(4).position(|w| w == b"ddts").unwrap();
+        assert_eq!(&e[ddts + 4..ddts + 8], &48_000u32.to_be_bytes());
+    }
+
+    // ETSI TS 102 114 E.2.2.2 families, with the 4x-interpolated core rates of
+    // Table 5-6 (8/11.025/12 kHz) in the same family as their 2x siblings.
+    #[test]
+    fn dts_entry_rate_maps_every_rate_to_its_family_base() {
+        for (rate, base) in [
+            (12_000, 48_000),
+            (24_000, 48_000),
+            (48_000, 48_000),
+            (96_000, 48_000),
+            (192_000, 48_000),
+            (11_025, 44_100),
+            (22_050, 44_100),
+            (44_100, 44_100),
+            (88_200, 44_100),
+            (176_400, 44_100),
+            (8_000, 32_000),
+            (16_000, 32_000),
+            (32_000, 32_000),
+            (64_000, 32_000),
+            (128_000, 32_000),
+            (36_000, 36_000),
+        ] {
+            assert_eq!(dts_entry_rate(rate), base, "{rate}");
+        }
     }
 
     #[test]
@@ -665,7 +738,7 @@ mod tests {
         ];
         let c = parse_dts(&f).expect("parses");
         assert!(!c.has_extension, "ext-sync inside core is not an extension");
-        let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f, 0).unwrap();
         assert_eq!(&e[4..8], b"dtsc");
     }
 
@@ -679,7 +752,7 @@ mod tests {
         let c = parse_dts(&f).expect("parses");
         assert_eq!(c.core_size, 9);
         assert!(c.has_extension, "EXSS sync at core end is a real extension");
-        let e = dolby_sample_entry(Codec::DtsHdMa, &f).unwrap();
+        let e = dolby_sample_entry(Codec::DtsHdMa, &f, 0).unwrap();
         assert_eq!(&e[4..8], b"dtsh");
     }
 
@@ -723,7 +796,7 @@ mod tests {
             has_extension: false,
             channel_layout: dts_channel_layout(9, true),
         };
-        let b = ddts_box(&c);
+        let b = ddts_box(&c, c.sample_rate);
         // Decode CoreSize back out of the emitted box: 8-byte header + 13 bytes
         // (freq/bitrates/depth) precede the 56-bit tail, where CoreSize sits after
         // FrameDuration(2)+StreamConstruction(5)+CoreLFEPresent(1)+CoreLayout(6) = bits 14..28.
@@ -752,7 +825,7 @@ mod tests {
         // Decode the flag from the emitted box: 8-byte header + 13 bytes precede the
         // 56-bit tail, where MultiAssetFlag is bit 48 — after FrameDuration+
         // StreamConstruction+CoreLFEPresent+CoreLayout+CoreSize+StereoDownmix+RepType+ChannelLayout — MSB of byte 7.
-        let b = ddts_box(&c);
+        let b = ddts_box(&c, c.sample_rate);
         let tail = &b[8 + 13..];
         assert_eq!(tail.len(), 7, "56-bit packed tail");
         assert_eq!(
@@ -1114,7 +1187,7 @@ mod tests {
             !c.has_extension,
             "the pattern ends at the core's last byte, inside it"
         );
-        let e = dolby_sample_entry(Codec::Dts, &f).expect("entry built");
+        let e = dolby_sample_entry(Codec::Dts, &f, 0).expect("entry built");
         assert_eq!(&e[4..8], b"dtsc");
     }
 
@@ -1133,7 +1206,7 @@ mod tests {
             has_extension: false,
             channel_layout: dts_channel_layout(9, true),
         };
-        let (max, avg) = ddts_bitrates(&ddts_box(&c));
+        let (max, avg) = ddts_bitrates(&ddts_box(&c, c.sample_rate));
         assert_eq!(max, 5513, "2822400/512 = 5512.5 → 5513");
         assert_eq!(avg, 5513, "both fields carry the same computed rate");
     }
@@ -1152,7 +1225,7 @@ mod tests {
             has_extension: false,
             channel_layout: dts_channel_layout(9, true),
         };
-        assert_eq!(ddts_bitrates(&ddts_box(&c)), (0, 0));
+        assert_eq!(ddts_bitrates(&ddts_box(&c, c.sample_rate)), (0, 0));
     }
 
     #[test]
@@ -1171,7 +1244,7 @@ mod tests {
                 has_extension: false,
                 channel_layout: dts_channel_layout(9, true),
             };
-            ddts_tail(&ddts_box(&c))[0] >> 6
+            ddts_tail(&ddts_box(&c, c.sample_rate))[0] >> 6
         };
         assert_eq!(dur(512), 0, "512 samples");
         assert_eq!(dur(1024), 1, "1024 samples");

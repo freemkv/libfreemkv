@@ -8,11 +8,116 @@
 
 use super::meta;
 use crate::disc::DiscTitle;
-use std::io::{self, BufReader, BufWriter, Write};
+use crate::halt::{Halt, POLL_INTERVAL};
+use rustix::event::{PollFd, PollFlags, Timespec};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 
 /// I/O buffer size for network reads/writes.
 const NET_BUF_SIZE: usize = 256 * 1024;
+
+// Accept poll period while waiting for the sender (a halt is checked each tick).
+const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+// A slow sender (bad-sector retries) may be silent for minutes, so there is no
+// data-idle limit; a vanished peer is detected by TCP keepalive instead.
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const KEEPALIVE_RETRIES: u32 = 6;
+
+// Enable keepalive probes so a crashed or unplugged sender fails the read.
+fn enable_keepalive(stream: &TcpStream) -> io::Result<()> {
+    let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let ka = ka
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+}
+
+// Keepalive is best effort: a stack that rejects an option (e.g. TCP_KEEPCNT on
+// old Windows) still receives, just without dead-peer detection.
+fn arm_keepalive(stream: &TcpStream) {
+    if let Err(e) = enable_keepalive(stream) {
+        tracing::warn!(
+            target: "mux",
+            error = %e,
+            "network: TCP keepalive unavailable"
+        );
+    }
+}
+
+// Poll outcome: `Ok(true)` reads now (data, EOF or a socket error for `read` to
+// surface), `Ok(false)` is a halt-check tick. Readiness, not SO_RCVTIMEO: on
+// Windows a receive timeout can cancel a completing recv and lose its data.
+fn poll_says_read(res: io::Result<usize>, revents: PollFlags) -> io::Result<bool> {
+    match res {
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(e) => Err(e),
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(!revents.is_empty()),
+    }
+}
+
+// Receive side: waits for readability in `tick` slices so a halt is observed
+// instead of blocking in `read` forever.
+struct HaltRead {
+    stream: TcpStream,
+    halt: Option<Halt>,
+    halted: bool,
+    tick: Timespec,
+}
+
+impl HaltRead {
+    fn new(stream: TcpStream, halt: Option<Halt>) -> Self {
+        Self::with_tick(stream, halt, POLL_INTERVAL)
+    }
+
+    fn with_tick(stream: TcpStream, halt: Option<Halt>, tick: std::time::Duration) -> Self {
+        let tick = Timespec {
+            tv_sec: tick.as_secs() as _,
+            tv_nsec: tick.subsec_nanos() as _,
+        };
+        Self {
+            stream,
+            halt,
+            halted: false,
+            tick,
+        }
+    }
+
+    // `e`, or `Error::Halted` when the read was aborted by the halt.
+    fn halted_or(&self, e: io::Error) -> io::Error {
+        if self.halted {
+            crate::error::Error::Halted.into()
+        } else {
+            e
+        }
+    }
+}
+
+impl Read for HaltRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(halt) = &self.halt else {
+            return self.stream.read(buf);
+        };
+        loop {
+            if halt.is_cancelled() {
+                // Halted maps to ErrorKind::Interrupted, which std's read_exact
+                // retries forever; abort with another kind and remap in `halted_or`.
+                self.halted = true;
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let mut fds = [PollFd::new(&self.stream, PollFlags::IN)];
+            let res = rustix::event::poll(&mut fds, Some(&self.tick)).map_err(io::Error::from);
+            if poll_says_read(res, fds[0].revents())? {
+                return self.stream.read(buf);
+            }
+        }
+    }
+}
 
 // True if `ip` must never be a `network://` connect target (loopback, private, link-local,
 // unspecified, multicast). Re-checked here at connect time to close a DNS-rebinding TOCTOU.
@@ -94,9 +199,12 @@ enum Mode {
     Write {
         writer: BufWriter<TcpStream>,
         header_written: bool,
+        timings: Vec<crate::pes::TrackTiming>,
+        padded: bool,
     },
     Read {
-        reader: BufReader<TcpStream>,
+        reader: BufReader<HaltRead>,
+        meta: meta::M2tsMeta,
     },
 }
 
@@ -135,6 +243,8 @@ impl NetworkStream {
             mode: Mode::Write {
                 writer: BufWriter::with_capacity(NET_BUF_SIZE, stream),
                 header_written: false,
+                timings: Vec::new(),
+                padded: false,
             },
         })
     }
@@ -158,7 +268,13 @@ impl NetworkStream {
     /// `accept`, so the bound port is freed and any subsequent connection
     /// attempt to the same address is refused.
     pub fn listen(addr: &str) -> io::Result<Self> {
-        Self::accept_from(TcpListener::bind(addr)?)
+        Self::listen_with_halt(addr, None)
+    }
+
+    /// [`listen`](Self::listen) that a [`Halt`] can interrupt, while waiting for
+    /// the sender to connect and while blocked on a stalled sender.
+    pub fn listen_with_halt(addr: &str, halt: Option<Halt>) -> io::Result<Self> {
+        Self::accept_from_with_halt(TcpListener::bind(addr)?, halt)
     }
 
     /// Accept one connection from an already-bound listener and read from it.
@@ -166,33 +282,69 @@ impl NetworkStream {
     /// `:0` bind) and hand the listener in, closing the bind/drop/re-bind race
     /// that `listen(addr)` would otherwise have.
     pub fn accept_from(listener: TcpListener) -> io::Result<Self> {
-        let (stream, _peer) = listener.accept()?;
+        Self::accept_from_with_halt(listener, None)
+    }
+
+    /// [`accept_from`](Self::accept_from) that a [`Halt`] can interrupt.
+    pub fn accept_from_with_halt(listener: TcpListener, halt: Option<Halt>) -> io::Result<Self> {
+        let Some(h) = halt else {
+            let (stream, _peer) = listener.accept()?;
+            stream.set_nodelay(true)?;
+            arm_keepalive(&stream);
+            return Self::read_from(stream, None);
+        };
+        listener.set_nonblocking(true)?;
+        let halt = Some(h);
+        let stream = loop {
+            if halt.as_ref().is_some_and(Halt::is_cancelled) {
+                return Err(crate::error::Error::Halted.into());
+            }
+            match listener.accept() {
+                Ok((stream, _peer)) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        };
+        // Accepted sockets can inherit O_NONBLOCK (BSD/macOS); reads wait on readiness.
+        stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
-        let mut reader = BufReader::with_capacity(NET_BUF_SIZE, stream);
+        arm_keepalive(&stream);
+        Self::read_from(stream, halt)
+    }
+
+    // Wrap an accepted connection and read its FMKV header.
+    fn read_from(stream: TcpStream, halt: Option<Halt>) -> io::Result<Self> {
+        let mut reader = BufReader::with_capacity(NET_BUF_SIZE, HaltRead::new(stream, halt));
 
         // Read FMKV metadata header
-        let disc_title = meta::read_header(&mut reader)?
-            .ok_or_else(|| -> io::Error { crate::error::Error::NoMetadata.into() })?
-            .to_title();
+        let meta = meta::read_header(&mut reader)
+            .map_err(|e| reader.get_ref().halted_or(e))?
+            .ok_or_else(|| -> io::Error { crate::error::Error::NoMetadata.into() })?;
 
         Ok(Self {
-            disc_title,
-            mode: Mode::Read { reader },
+            disc_title: meta.to_title(),
+            mode: Mode::Read { reader, meta },
         })
     }
 }
 
-// Write the FMKV header exactly once, before any frames. Always writes
-// (even for a title with no streams) so read_header() finds the magic
-// and doesn't fall into NoMetadata on a zero-frame stream.
+// Write the FMKV header once, before any frames, even for a zero-frame stream
+// (else read_header() reports NoMetadata). Sets `padded` when frames carry the
+// DiscardPadding extension (header v2).
 fn ensure_header_written(
     writer: &mut BufWriter<TcpStream>,
     header_written: &mut bool,
     disc_title: &DiscTitle,
+    timings: &[crate::pes::TrackTiming],
+    padded: &mut bool,
 ) -> io::Result<()> {
     if !*header_written {
-        let m = meta::M2tsMeta::from_title(disc_title);
+        let m = meta::M2tsMeta::from_title(disc_title).with_timings(timings);
         meta::write_header(writer, &m)?;
+        *padded = m.frame_padding;
         *header_written = true;
     }
     Ok(())
@@ -201,7 +353,10 @@ fn ensure_header_written(
 impl crate::pes::Stream for NetworkStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         match &mut self.mode {
-            Mode::Read { reader } => crate::pes::PesFrame::deserialize(reader),
+            Mode::Read { reader, meta } => {
+                crate::pes::PesFrame::deserialize_ext(reader, meta.frame_padding)
+                    .map_err(|e| reader.get_ref().halted_or(e))
+            }
             _ => Err(crate::error::Error::StreamWriteOnly.into()),
         }
     }
@@ -210,9 +365,11 @@ impl crate::pes::Stream for NetworkStream {
             Mode::Write {
                 writer,
                 header_written,
+                timings,
+                padded,
             } => {
-                ensure_header_written(writer, header_written, &self.disc_title)?;
-                frame.serialize(writer)
+                ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
+                frame.serialize_ext(writer, *padded)
             }
             _ => Err(crate::error::Error::StreamReadOnly.into()),
         }
@@ -221,12 +378,14 @@ impl crate::pes::Stream for NetworkStream {
         if let Mode::Write {
             writer,
             header_written,
+            timings,
+            padded,
         } = &mut self.mode
         {
             // Always emit the FMKV header before shutdown, even for a zero-frame stream,
             // or the receiver's read_header() sees a clean EOF and rejects the stream
             // with NoMetadata.
-            ensure_header_written(writer, header_written, &self.disc_title)?;
+            ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
             writer.flush()?;
             writer.get_ref().shutdown(std::net::Shutdown::Write)?;
         }
@@ -235,6 +394,49 @@ impl crate::pes::Stream for NetworkStream {
     fn info(&self) -> &DiscTitle {
         &self.disc_title
     }
+    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
+        match &self.mode {
+            Mode::Read { meta, .. } => meta.timing(track),
+            Mode::Write { .. } => Default::default(),
+        }
+    }
+    fn set_track_timing(
+        &mut self,
+        track: usize,
+        timing: crate::pes::TrackTiming,
+    ) -> io::Result<()> {
+        match &mut self.mode {
+            Mode::Write {
+                header_written: false,
+                timings,
+                ..
+            } => set_timing(timings, track, timing, self.disc_title.streams.len()),
+            // The header (which carries it) is already on the wire.
+            Mode::Write { .. } => Err(crate::error::Error::StreamHeaderWritten.into()),
+            Mode::Read { .. } => Err(crate::error::Error::StreamReadOnly.into()),
+        }
+    }
+    // The sender's codec privates travel in the FMKV header (as for stdio).
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        self.disc_title.codec_privates.get(track).cloned().flatten()
+    }
+}
+
+// Record `timing` for stream `track` of a `tracks`-stream title.
+pub(crate) fn set_timing(
+    timings: &mut Vec<crate::pes::TrackTiming>,
+    track: usize,
+    timing: crate::pes::TrackTiming,
+    tracks: usize,
+) -> io::Result<()> {
+    if track >= tracks {
+        return Err(crate::error::Error::MuxTrackRange { track, tracks }.into());
+    }
+    if timings.len() < tracks {
+        timings.resize(tracks, Default::default());
+    }
+    timings[track] = timing;
+    Ok(())
 }
 
 // NetworkStream is PES-only — no IOStream/Read/Write byte interface.
@@ -728,5 +930,342 @@ mod tests {
         // E_NO_METADATA (9008) maps to InvalidInput.
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         handle.join().unwrap();
+    }
+
+    // A Stop must interrupt a receiver still waiting for its sender to connect.
+    #[test]
+    fn a_halt_interrupts_a_pending_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let halt = crate::halt::Halt::new();
+        let h = halt.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = NetworkStream::accept_from_with_halt(listener, Some(h)).map(|_| ());
+            let _ = tx.send(r);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        halt.cancel();
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("accept must observe the halt");
+        assert!(crate::error::is_halt(&r.unwrap_err()));
+    }
+
+    // ... and a receiver blocked on a sender that stalled mid-stream.
+    #[test]
+    fn a_halt_interrupts_a_stalled_read() {
+        use crate::pes;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let halt = crate::halt::Halt::new();
+        let h = halt.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ns = NetworkStream::accept_from_with_halt(listener, Some(h)).unwrap();
+            let _ = tx.send(pes::Stream::read(&mut ns).map(|_| ()));
+        });
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        if let Mode::Write {
+            writer: w,
+            header_written,
+            padded,
+            ..
+        } = &mut writer.mode
+        {
+            ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
+            w.flush().unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        halt.cancel();
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read must observe the halt");
+        assert!(crate::error::is_halt(&r.unwrap_err()));
+        drop(writer);
+    }
+
+    // A halt while the sender has connected but not finished its header.
+    #[test]
+    fn a_halt_interrupts_a_stalled_header_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let halt = crate::halt::Halt::new();
+        let h = halt.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = NetworkStream::accept_from_with_halt(listener, Some(h)).map(|_| ());
+            let _ = tx.send(r);
+        });
+        let mut sender = TcpStream::connect(addr).unwrap();
+        sender.write_all(b"FM").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        halt.cancel();
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the header read must observe the halt");
+        assert!(crate::error::is_halt(&r.unwrap_err()));
+    }
+
+    // A receiver without a halt (`listen`/`accept_from`) arms keepalive too.
+    #[test]
+    fn a_receiver_without_a_halt_arms_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let ns = NetworkStream::accept_from(listener).unwrap();
+            match &ns.mode {
+                Mode::Read { reader, .. } => socket2::SockRef::from(&reader.get_ref().stream)
+                    .keepalive()
+                    .unwrap(),
+                Mode::Write { .. } => false,
+            }
+        });
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        if let Mode::Write {
+            writer: w,
+            header_written,
+            padded,
+            ..
+        } = &mut writer.mode
+        {
+            ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
+            w.flush().unwrap();
+        }
+        assert!(handle.join().unwrap(), "keepalive must be armed");
+    }
+
+    // Windows may drop data when SO_RCVTIMEO cancels a recv, so a halt-aware
+    // receiver waits on readiness instead and never arms a read timeout.
+    #[test]
+    fn a_halt_aware_receiver_sets_no_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let halt = crate::halt::Halt::new();
+            let ns = NetworkStream::accept_from_with_halt(listener, Some(halt)).unwrap();
+            match &ns.mode {
+                Mode::Read { reader, .. } => reader.get_ref().stream.read_timeout().unwrap(),
+                Mode::Write { .. } => None,
+            }
+        });
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        crate::pes::Stream::finish(&mut writer).unwrap();
+        assert_eq!(handle.join().unwrap(), None);
+    }
+
+    // Only a readiness report reads; a timeout or EINTR ticks; a poll failure surfaces.
+    #[test]
+    fn poll_says_read_only_when_the_socket_reports_readiness() {
+        use io::ErrorKind::{ConnectionReset, Interrupted, TimedOut, WouldBlock};
+        let ok = |n: usize, f: PollFlags| poll_says_read(Ok(n), f).unwrap();
+        assert!(!ok(0, PollFlags::empty()), "timeout is a tick");
+        assert!(!ok(1, PollFlags::empty()));
+        for f in [
+            PollFlags::IN,
+            PollFlags::HUP,
+            PollFlags::ERR,
+            PollFlags::NVAL,
+        ] {
+            assert!(ok(1, f), "{f:?} must hand over to read");
+        }
+        assert!(!poll_says_read(Err(Interrupted.into()), PollFlags::empty()).unwrap());
+        for kind in [WouldBlock, TimedOut, ConnectionReset] {
+            let e = poll_says_read(Err(kind.into()), PollFlags::empty()).unwrap_err();
+            assert_eq!(e.kind(), kind);
+        }
+    }
+
+    // A sender dribbling bytes with gaps many ticks long is read byte-identically.
+    #[test]
+    fn a_slow_sender_across_many_poll_ticks_arrives_byte_identical() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        let sent = data.clone();
+        let sender = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let mut off = 0;
+            for i in 0usize.. {
+                if off == sent.len() {
+                    break;
+                }
+                let n = (1 + i * 37 % 4093).min(sent.len() - off);
+                s.write_all(&sent[off..off + n]).unwrap();
+                off += n;
+                if i % 8 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(6));
+                }
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let tick = std::time::Duration::from_millis(1);
+        let mut r = HaltRead::with_tick(stream, Some(crate::halt::Halt::new()), tick);
+        let mut got = Vec::new();
+        let mut small = [0u8; 1500];
+        loop {
+            match r.read(&mut small).unwrap() {
+                0 => break,
+                n => got.extend_from_slice(&small[..n]),
+            }
+        }
+        sender.join().unwrap();
+        assert_eq!(got.len(), data.len());
+        assert!(
+            got == data,
+            "stream bytes must survive the poll ticks unchanged"
+        );
+    }
+
+    // A halt-aware receiver arms keepalive (dead-peer detection) and sets no
+    // data-idle limit: a sender silent for a while is still read afterwards.
+    #[test]
+    fn a_halt_aware_receiver_uses_keepalive_not_an_idle_limit() {
+        use crate::pes;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let halt = crate::halt::Halt::new();
+            let mut ns = NetworkStream::accept_from_with_halt(listener, Some(halt)).unwrap();
+            let keepalive = match &ns.mode {
+                Mode::Read { reader, .. } => socket2::SockRef::from(&reader.get_ref().stream)
+                    .keepalive()
+                    .unwrap(),
+                Mode::Write { .. } => false,
+            };
+            (
+                keepalive,
+                pes::Stream::read(&mut ns).map(|f| f.map(|f| f.data)),
+            )
+        });
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        if let Mode::Write {
+            writer: w,
+            header_written,
+            padded,
+            ..
+        } = &mut writer.mode
+        {
+            ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
+            w.flush().unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let frame = pes::PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![7; 4],
+            duration_ns: None,
+        };
+        pes::Stream::write(&mut writer, &frame).unwrap();
+        pes::Stream::finish(&mut writer).unwrap();
+        let (keepalive, read) = handle.join().unwrap();
+        assert!(keepalive, "keepalive must be armed");
+        assert_eq!(read.unwrap(), Some(vec![7; 4]));
+    }
+
+    // The FMKV header's codec privates (e.g. FLAC STREAMINFO, OpusHead, avcC)
+    // must be exposed on the receive side, or the MKV writer drops them.
+    #[test]
+    fn the_receiver_exposes_the_header_codec_privates() {
+        use crate::pes;
+        let mut title = sample_title();
+        title.codec_privates = vec![Some(vec![1, 2, 3]), Some(b"OpusHead".to_vec())];
+        let (addr, handle) = spawn_codec_private_reader();
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&title);
+        pes::Stream::finish(&mut writer).unwrap();
+        let cps = handle.join().unwrap();
+        assert_eq!(cps, title.codec_privates);
+    }
+
+    fn spawn_codec_private_reader() -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<Vec<Option<Vec<u8>>>>,
+    ) {
+        use crate::pes::Stream as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let ns = NetworkStream::accept_from(listener).unwrap();
+            (0..2).map(|i| ns.codec_private(i)).collect()
+        });
+        (addr, handle)
+    }
+
+    // mkv(opus) -> network -> mkv: CodecDelay/SeekPreRoll and DiscardPadding
+    // survive the PES wire hop.
+    #[test]
+    fn opus_track_timing_and_padding_survive_network_to_mkv() {
+        use crate::pes::{self, Stream as _};
+        let mut title = sample_title();
+        title.streams.truncate(1);
+        title.streams[0] = Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::Opus,
+            channels: AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        });
+        title.codec_privates = vec![Some(b"OpusHead\x01\x02".to_vec())];
+        let timing = pes::TrackTiming {
+            codec_delay_ns: 6_500_000,
+            seek_preroll_ns: 80_000_000,
+        };
+        let frame = pes::PesFrame {
+            discard_padding_ns: -2_500_000,
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xFC, 1, 2, 3],
+            duration_ns: Some(20_000_000),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut ns = NetworkStream::accept_from(listener).unwrap();
+            let got = ns.track_timing(0);
+            let f = ns.read().unwrap().unwrap();
+            (ns.info().clone(), got, f)
+        });
+        let mut w = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&title);
+        w.set_track_timing(0, timing).unwrap();
+        w.write(&frame).unwrap();
+        w.finish().unwrap();
+        let (rx_title, rx_timing, rx_frame) = handle.join().unwrap();
+        assert_eq!(rx_timing, timing);
+        assert_eq!(rx_frame.discard_padding_ns, frame.discard_padding_ns);
+        assert_eq!(rx_frame.data, frame.data);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.mkv");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut mkv =
+            crate::mux::mkvstream::MkvStream::create(Box::new(file), &rx_title, None).unwrap();
+        mkv.set_track_timing(0, rx_timing).unwrap();
+        mkv.write(&rx_frame).unwrap();
+        mkv.finish().unwrap();
+        let mut back =
+            crate::mux::mkvstream::MkvStream::open(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(back.track_timing(0), timing);
+        assert_eq!(back.read().unwrap().unwrap().discard_padding_ns, -2_500_000);
     }
 }

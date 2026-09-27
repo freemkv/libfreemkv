@@ -563,6 +563,11 @@ pub const BLOCK_ADD_ID: u32 = 0xEE;
 /// (a keyframe Block in a BlockGroup carries none). Written for non-keyframe
 /// video frames that must live in a BlockGroup to carry an MVC BlockAdditional.
 pub const REFERENCE_BLOCK: u32 = 0xFB;
+/// DiscardPadding (RFC 9559 §5.1.3.5.7): signed ns of decoded audio to drop.
+pub const DISCARD_PADDING: u32 = 0x75A2;
+/// CodecDelay / SeekPreRoll (RFC 9559 §5.1.4.1.18/19), TrackEntry children, ns.
+pub const CODEC_DELAY: u32 = 0x56AA;
+pub const SEEK_PRE_ROLL: u32 = 0x56BB;
 
 // Audio
 pub const AUDIO: u32 = 0xE1;
@@ -629,6 +634,8 @@ pub const CODEC_EAC3: &str = "A_EAC3";
 pub const CODEC_TRUEHD: &str = "A_TRUEHD";
 pub const CODEC_DTS: &str = "A_DTS";
 pub const CODEC_PCM_BE: &str = "A_PCM/INT/BIG";
+/// Little-endian integer PCM (read side only; converted to big-endian).
+pub const CODEC_PCM_LE: &str = "A_PCM/INT/LIT";
 /// AAC. The generic registered ID; the AudioSpecificConfig travels in
 /// CodecPrivate, so no profile suffix is needed (and the `A_AAC/MPEG4/*`
 /// suffixed forms are legacy).

@@ -611,6 +611,37 @@ fn psi_payload_base(pkt: &[u8]) -> Option<usize> {
     }
 }
 
+// MPEG audio layer (1-3) from the first frame header at the start of `pid`'s
+// first PES in `data`; `None` when no such PES or header is in the scan window.
+fn mpeg_audio_layer(data: &[u8], pid: u16) -> Option<u8> {
+    let mut offset = 0;
+    while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
+        if !is_resync_point(data, offset) {
+            offset += 1;
+            continue;
+        }
+        let pkt = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
+        let pkt_pid = (((pkt[5] & 0x1F) as u16) << 8) | pkt[6] as u16;
+        if pkt_pid == pid && pkt[5] & 0x40 != 0 {
+            let pes = &pkt[psi_payload_base(pkt)?..];
+            if pes.get(..3)? != [0, 0, 1] {
+                return None;
+            }
+            let es = pes.get(9 + *pes.get(8)? as usize..)?;
+            let (b0, b1) = (*es.first()?, *es.get(1)?);
+            if b0 != 0xFF || b1 & 0xE0 != 0xE0 {
+                return None;
+            }
+            return match (b1 >> 1) & 0x03 {
+                0 => None,
+                l => Some(4 - l),
+            };
+        }
+        offset += BD_SOURCE_PACKET_BYTES;
+    }
+    None
+}
+
 // Reassemble a single PSI section (PAT/PMT) for `target_pid`/`table_id` across TS-packet
 // boundaries. Returns the section bytes (from table_id) or None.
 fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec<u8>> {
@@ -767,6 +798,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
             // PMTs may also carry ISO/IEC 13818-1 audio stream types that are
             // absent from Blu-ray's STN table. Keep that distinction local to TS.
             let codec = match stream_type {
+                // MPEG-1/2 audio covers Layers I-III; only the ES says which.
+                0x03 | 0x04 if mpeg_audio_layer(data, es_pid) == Some(3) => Codec::Mp3,
                 0x03 | 0x04 => Codec::Mp2,
                 0x0f => Codec::Aac,
                 0x87 => Codec::Ac3Plus,
@@ -1413,6 +1446,26 @@ mod tests {
             data.extend(pmt_packet(0x100, &[(0x1b, 0x1011), (kind, 0x1100)]));
             let streams = scan_streams(&data).unwrap();
             assert!(matches!(&streams[1], Stream::Audio(a) if a.codec == expected));
+        }
+    }
+
+    // stream_type 0x03/0x04 covers Layers I-III; the layer comes from the ES.
+    #[test]
+    fn scan_streams_labels_mpeg_audio_by_the_es_layer() {
+        use crate::disc::{Codec, Stream};
+        for (header, expected) in [([0xFF, 0xFB], Codec::Mp3), ([0xFF, 0xFD], Codec::Mp2)] {
+            let mut pes = vec![0x00, 0x00, 0x01, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00];
+            pes.extend_from_slice(&header);
+            pes.extend_from_slice(&[0x90, 0x64]);
+            let mut data = pat_packet(0x100);
+            data.extend(pmt_packet(0x100, &[(0x1b, 0x1011), (0x03, 0x1100)]));
+            data.extend(es_packet_exact(0x1100, true, &pes));
+            data.extend(pat_packet(0x100));
+            let streams = scan_streams(&data).unwrap();
+            assert!(
+                matches!(&streams[1], Stream::Audio(a) if a.codec == expected),
+                "{expected:?}"
+            );
         }
     }
 

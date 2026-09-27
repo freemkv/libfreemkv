@@ -14,6 +14,8 @@
 - `list_drives` on Linux without sysfs keeps an sg node unless INQUIRY says it is not optical or open() fails with no device (ENOENT/ENXIO/ENODEV) or no permission (EACCES/EPERM), so a wedged or busy drive is still listed.
 - Dropping a transport or `Drive` unlocks the tray only if it locked it.
 - `Error::ImageTruncated` displays as `E<code>: have/want`.
+- `json://` audio `sample_rate` is now a number in Hz (`null` when unknown) instead of a display string such as `"48kHz"`; a new `sample_rates` array lists every rate a stream carries (e.g. `[48000, 96000]` for a 48/96 kHz combo).
+- `network://` / `stdio://` FMKV headers use version 2 when a track carries decoder timing (Opus CodecDelay/SeekPreRoll), adding per-frame DiscardPadding; streams without timing stay version 1.
 
 ### Removed
 
@@ -28,6 +30,9 @@
 ### Fixed
 
 - TrueHD channel labels keep the LFE split (3.0 was labelled "2.1", 7.0 "6.1"), and a 6-channel presentation counts its Lvh/Rvh pair as 2. An older network:// receiver parses the new layout strings as unknown and omits the MKV Channels element for those tracks; keep both ends on the same version.
+- `mp4://` DTS tracks write the stream's maximum rate in `ddts` and read back as 96 kHz where the source is 96 kHz.
+- `mkv://` PCM tracks without BitDepth: bounded read-ahead and a multi-block depth estimate.
+- `network://` receive arms TCP keepalive on every accepted socket; a rejected keepalive option only warns.
 
 ## [1.7.7] — 2026-09-26
 

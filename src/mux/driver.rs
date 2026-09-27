@@ -22,7 +22,8 @@ use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
 use crate::session::DiscSession;
 
 use super::resolve::{
-    InputOptions, StreamUrl, build_iso_pipeline, input, output, parse_url, resolve_mux_key_map,
+    InputOptions, StreamUrl, build_iso_pipeline, input_with_halt, output, parse_url,
+    resolve_mux_key_map,
 };
 use super::videomap::{Medium, SourceInfo};
 
@@ -112,11 +113,11 @@ pub enum MuxInput<'a> {
         key_map: Option<Arc<AacsKeyMap>>,
     },
     /// Any URL-addressed source (`iso://`, `mkv://`, `m2ts://`, `network://`,
-    /// stdio) opened via [`input`].
+    /// stdio) opened via [`input`](super::resolve::input).
     Url {
         /// The source URL.
         url: &'a str,
-        /// Input options forwarded to [`input`].
+        /// Input options forwarded to [`input`](super::resolve::input).
         opts: InputOptions,
     },
 }
@@ -245,7 +246,22 @@ pub fn mux_stream(
                     title: in_opts.title_index.unwrap_or(0),
                     ..SourceInfo::default()
                 };
-                let stream = input(url, &in_opts)?;
+                // A Stop while `network://` waits for its sender is a clean interrupt.
+                let stream = match input_with_halt(url, &in_opts, Some(halt)) {
+                    Ok(s) => s,
+                    Err(e) if crate::error::is_halt(&e) => {
+                        return Ok(MuxOutcome {
+                            completed: false,
+                            output_opened: false,
+                            bytes_written: 0,
+                            errors: 0,
+                            lost_bytes: 0,
+                            streams: 0,
+                            undelivered_streams: Vec::new(),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                };
                 let source = SourceInfo {
                     playlist: stream.info().playlist.clone(),
                     ..source
@@ -507,6 +523,21 @@ fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::Eve
     })
 }
 
+// Join the write consumer after the pump. A send that hit its deadline means the
+// consumer is wedged, so the join gets only the short grace, not JOIN_TIMEOUT.
+fn finish_pumped<I: Send + 'static, R: Send + 'static>(
+    pipe: Pipeline<I, R>,
+    halt: &Halt,
+    send_timed_out: bool,
+) -> Result<R, Error> {
+    if send_timed_out {
+        let wedged = Halt::new();
+        wedged.cancel();
+        return pipe.finish_with_halt(Some(&wedged));
+    }
+    pipe.finish_with_halt(Some(halt))
+}
+
 // Whether a finished mux counts as COMPLETED: interrupted, finalize_failed, or halt_cancelled
 // each force `false`. Pure fn so this mapping is unit-tested directly.
 fn mux_run_completed(interrupted: bool, finalize_failed: bool, halt_cancelled: bool) -> bool {
@@ -704,11 +735,14 @@ fn drive_mux(
     // every `POLL_INTERVAL`, so Ctrl-C / `/api/stop` stays responsive.
     let deadline = send_deadline;
     let mut interrupted = false;
+    // A send refused with no halt and a healthy consumer ran out its deadline.
+    let mut send_timed_out = false;
 
     // Buffered header frames first, in order.
     for frame in buffered {
         if pipe.send_with_halt(frame, halt, deadline).is_err() {
             interrupted = true;
+            send_timed_out = !halt.is_cancelled() && !pipe.consumer_failed();
             break;
         }
         // Feed write-side progress during the drain exactly as the steady-state
@@ -732,6 +766,7 @@ fn drive_mux(
                     }
                     if pipe.send_with_halt(frame, halt, deadline).is_err() {
                         interrupted = true;
+                        send_timed_out = !halt.is_cancelled() && !pipe.consumer_failed();
                         break;
                     }
                     events.on_write_progress(bytes.load(Ordering::Relaxed), total_bytes);
@@ -785,7 +820,7 @@ fn drive_mux(
     // the container. On halt/wedge this returns an error variant, translated
     // to `completed = false` rather than a hard failure.
     let (bytes_written, undelivered_streams, finalize_failed) =
-        match pipe.finish_with_halt(Some(halt)) {
+        match finish_pumped(pipe, halt, send_timed_out) {
             Ok((b, undelivered)) => (b, undelivered, false),
             Err(Error::Halted | Error::PipelineJoinTimeout) => {
                 (bytes.load(Ordering::Relaxed), Vec::new(), true)
@@ -796,7 +831,8 @@ fn drive_mux(
         tracing::warn!(
             target: "mux",
             streams = ?undelivered_streams,
-            "output sink could not deliver every planned stream; the file does not match              the pre-mux plan (surfaced as MuxOutcome::undelivered_streams)"
+            "output sink could not deliver every planned stream; the file does not match \
+             the pre-mux plan (surfaced as MuxOutcome::undelivered_streams)"
         );
     }
 
@@ -2714,5 +2750,137 @@ mod tests {
             matches!(session_mux_keys(&bd), DecryptKeys::Css { .. }),
             "a non-DVD passes decrypt_keys() through unchanged"
         );
+    }
+
+    // A consumer wedged past the send deadline must not hold the finish for the
+    // full JOIN_TIMEOUT (600 s).
+    #[test]
+    fn a_send_timeout_bounds_the_final_join() {
+        // Only the first write wedges, returning after finish has given up; the
+        // leaked consumer must then neither apply the queued item nor close.
+        struct Stuck {
+            closed: Arc<std::sync::atomic::AtomicBool>,
+            woke: std::sync::mpsc::Sender<()>,
+            first: bool,
+            applied: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Sink<u32> for Stuck {
+            type Output = ();
+            fn apply(&mut self, _: u32) -> Result<Flow, Error> {
+                self.applied.fetch_add(1, Ordering::SeqCst);
+                if std::mem::take(&mut self.first) {
+                    std::thread::sleep(Duration::from_secs(7));
+                    let _ = self.woke.send(());
+                }
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> Result<(), Error> {
+                self.closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (woke_tx, woke) = std::sync::mpsc::channel();
+        let stuck = Stuck {
+            closed: closed.clone(),
+            woke: woke_tx,
+            first: true,
+            applied: applied.clone(),
+        };
+        let pipe = Pipeline::spawn(1, stuck).unwrap();
+        let halt = Halt::new();
+        let mut timed_out = false;
+        for i in 0..4 {
+            if pipe
+                .send_with_halt(i, &halt, Duration::from_millis(50))
+                .is_err()
+            {
+                timed_out = true;
+                break;
+            }
+        }
+        assert!(timed_out, "the stuck consumer trips the send deadline");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(finish_pumped(pipe, &halt, true).is_err());
+        });
+        let failed = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the join must be bounded by the grace, not JOIN_TIMEOUT");
+        assert!(failed);
+        woke.recv_timeout(Duration::from_secs(30))
+            .expect("the wedged write returns");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "an abandoned consumer must not finalise the output late"
+        );
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            1,
+            "nor apply the queued item"
+        );
+    }
+
+    // An Opus-style CodecDelay/SeekPreRoll on an mkv:// source must reach the
+    // mkv:// output through the driver (the sink's set_track_timing wiring).
+    #[test]
+    fn track_timing_propagates_from_source_to_mkv_output() {
+        use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+        use crate::mux::mkvstream::MkvStream;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src.mkv");
+        let dst = dir.path().join("dst.mkv");
+        let mut title = DiscTitle {
+            streams: vec![crate::disc::Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F24,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })],
+            ..DiscTitle::empty()
+        };
+        title.codec_privates = vec![Some(vec![0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1])];
+        let timing = crate::pes::TrackTiming {
+            codec_delay_ns: 6_500_000,
+            seek_preroll_ns: 80_000_000,
+        };
+        let mut w = MkvStream::create(Box::new(std::fs::File::create(&src).unwrap()), &title, None)
+            .unwrap();
+        w.set_track_timing(0, timing).unwrap();
+        w.write(&PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0xA1; 16],
+            duration_ns: None,
+        })
+        .unwrap();
+        w.finish().unwrap();
+
+        let stream = Box::new(MkvStream::open(std::fs::File::open(&src).unwrap()).unwrap());
+        let out = drive_mux(
+            stream,
+            &format!("mkv://{}", dst.display()),
+            &Halt::new(),
+            &SpyEvents::new(),
+            None,
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("mkv remux runs");
+        assert!(out.completed);
+        let back = MkvStream::open(std::fs::File::open(&dst).unwrap()).unwrap();
+        assert_eq!(back.track_timing(0), timing);
     }
 }

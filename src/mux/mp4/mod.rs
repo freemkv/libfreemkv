@@ -428,7 +428,11 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
         // here used to lose audio silently — finish() now reports that case loudly.
         if self.tracks[slot].media == Media::Audio
             && self.tracks[slot].audio_entry.is_none()
-            && let Some(entry) = audio::dolby_sample_entry(self.tracks[slot].codec, &frame.data)
+            && let Some(entry) = audio::dolby_sample_entry(
+                self.tracks[slot].codec,
+                &frame.data,
+                self.tracks[slot].audio_timescale,
+            )
         {
             self.tracks[slot].audio_entry = Some(entry);
         }

@@ -286,6 +286,9 @@ struct PgsSupWriter {
     // Delay a duration-derived clear until the next frame, so an original
     // clear (or replacement PCS) at that timestamp takes precedence.
     pending_clear: Option<(i64, u16, u16)>,
+    // Bytes of truncated trailing segments not written (a partial segment would
+    // desync the `.sup` framing); reported at finish.
+    truncated_bytes: u64,
 }
 
 // ── PGS / HDMV segment framing constants ─────────────────────────────────────
@@ -320,13 +323,14 @@ fn ns_to_90k(pts_ns: i64) -> u32 {
 
 impl PgsSupWriter {
     /// Walk the concatenated segments in `data`, emitting each with a `PG`
-    /// header carrying `pts90k`/`dts90k`. Returns bytes written.
+    /// header carrying `pts90k`/`dts90k`. Returns `(bytes written, trailing
+    /// bytes of a truncated segment left unwritten)`.
     fn emit_segments(
         data: &[u8],
         pts90k: u32,
         dts90k: u32,
         w: &mut dyn Write,
-    ) -> io::Result<usize> {
+    ) -> io::Result<(usize, usize)> {
         let mut pos = 0;
         let mut written = 0;
         // Each PGS segment in the payload is: type(1) + size(2 BE) + size bytes.
@@ -343,7 +347,7 @@ impl PgsSupWriter {
             written += SUP_HEADER_LEN + PGS_SEG_HEADER_LEN + size;
             pos = seg_end;
         }
-        Ok(written)
+        Ok((written, data.len() - pos))
     }
 
     // Synthetic "clear" display set (empty PCS + END) re-emitted at `display_pts + duration`;
@@ -402,14 +406,16 @@ impl EsWriter for PgsSupWriter {
             if end < pts_ns || (end == pts_ns && !is_pcs) {
                 let clear = Self::synthetic_clear_display_set(width, height);
                 let pts = ns_to_90k(end);
-                written += Self::emit_segments(&clear, pts, pts, w)?;
+                written += Self::emit_segments(&clear, pts, pts, w)?.0;
                 self.pending_clear = None;
             } else if is_pcs {
                 // A real clear/replacement at or before the computed end wins.
                 self.pending_clear = None;
             }
         }
-        written += Self::emit_segments(&f.data, pts90, pts90, w)?;
+        let (n, truncated) = Self::emit_segments(&f.data, pts90, pts90, w)?;
+        written += n;
+        self.truncated_bytes += truncated as u64;
         // Retain fallback support for old MKVs that only carry durations, and
         // for a final display without a clear. Never synthesize a clear OF a
         // clear (nor of a standalone WDS/END segment).
@@ -426,6 +432,13 @@ impl EsWriter for PgsSupWriter {
             let clear = Self::synthetic_clear_display_set(width, height);
             let pts = ns_to_90k(end);
             Self::emit_segments(&clear, pts, pts, w)?;
+        }
+        if self.truncated_bytes > 0 {
+            tracing::warn!(
+                target: "mux",
+                bytes = self.truncated_bytes,
+                "PGS .sup: truncated trailing segments were not written"
+            );
         }
         Ok(())
     }
@@ -1347,7 +1360,7 @@ mod tests {
         // One segment: type=0x16, size=2, payload=[0xDE,0xAD].
         let payload = [SEG_PCS, 0x00, 0x02, 0xDE, 0xAD];
         let mut out = Vec::new();
-        let written = PgsSupWriter::emit_segments(&payload, 0x10, 0x10, &mut out).unwrap();
+        let (written, _) = PgsSupWriter::emit_segments(&payload, 0x10, 0x10, &mut out).unwrap();
         assert_eq!(&out[0..2], &SUP_MAGIC);
         assert_eq!(&out[2..6], &0x10u32.to_be_bytes()); // PTS
         assert_eq!(&out[6..10], &0x10u32.to_be_bytes()); // DTS
@@ -1581,10 +1594,18 @@ mod tests {
             let mut bytes = Vec::new();
             assert_eq!(
                 PgsSupWriter::emit_segments(data, 0, 0, &mut bytes).unwrap(),
-                0
+                (0, data.len())
             );
             assert!(bytes.is_empty());
         }
+        // A frame ending in a truncated segment is accounted, not silently lost.
+        let mut writer = PgsSupWriter::default();
+        let mut frame = sup_frame(0, None, true);
+        frame.data.extend_from_slice(&[SEG_PCS, 0, 9, 1]);
+        writer
+            .write_frame(&mut Vec::new(), &frame, frame.pts)
+            .unwrap();
+        assert_eq!(writer.truncated_bytes, 4);
     }
 
     #[test]
@@ -2061,6 +2082,56 @@ mod tests {
         assert!(
             wrote_audio,
             "the persisted audio track must have received bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `audio://` where every AUDIO frame falls outside the marks but video frames
+    // map: filtered video must not count as written, so the export fails loudly.
+    #[test]
+    fn a_filtered_export_whose_persisted_track_was_emptied_fails() {
+        let dir = tempdir();
+        let mut title = title_with(
+            vec![video_stream(Codec::H264), audio_stream(Codec::Ac3, "eng")],
+            vec![None, None],
+        );
+        title.clips = (0..2u32)
+            .map(|i| crate::disc::Clip {
+                feed_span: None,
+                clip_id: format!("0000{i}"),
+                in_time: (100 + 100 * i) * 45_000,
+                out_time: (200 + 100 * i) * 45_000,
+                duration_secs: 100.0,
+                source_packets: 0,
+            })
+            .collect();
+        let opts = DemuxOptions {
+            base: "Empty".to_string(),
+            kind_filter: Some(TrackKind::Audio),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        let frame = |track: usize, pts: i64| PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track,
+            pts,
+            keyframe: true,
+            data: vec![0x0B, 0x77],
+            duration_ns: None,
+        };
+        for s in [150i64, 151, 152] {
+            let _ = Stream::write(&mut sink, &frame(0, s * 1_000_000_000));
+        }
+        for s in [0i64, 1] {
+            let _ = Stream::write(&mut sink, &frame(1, s * 1_000_000_000));
+        }
+        let err = Stream::finish(&mut sink).expect_err("no audio was written");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_SINK_WROTE_NOTHING)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

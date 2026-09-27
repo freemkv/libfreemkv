@@ -119,6 +119,8 @@ pub struct M2tsMux<W: Write> {
     /// onto the very first video PES so a receiver tuning at stream start
     /// has a clock reference (the PMT advertises the video PID as PCR_PID).
     first_video_written: bool,
+    /// Last PCR stamped (90 kHz); the PCR is held monotonic against it.
+    last_pcr_90k: u64,
 }
 
 impl<W: Write> M2tsMux<W> {
@@ -140,6 +142,7 @@ impl<W: Write> M2tsMux<W> {
             packets_written: 0,
             video_packets_since_pcr: 0,
             first_video_written: false,
+            last_pcr_90k: 0,
         }
     }
 
@@ -173,11 +176,16 @@ impl<W: Write> M2tsMux<W> {
     /// drives the random_access_indicator bit on the first packet of this
     /// PES (and gates codec_private NAL prepending — those only attach to
     /// the first keyframe).
+    ///
+    /// Frames carry no DTS, so the PCR leads the PTS by `PCR_LEAD_90KHZ` and is
+    /// held monotonic; reordering deeper than that lead can still let it pass a
+    /// B-frame's PTS.
     pub fn write_video(&mut self, pts_ns: i64, keyframe: bool, data: &[u8]) -> io::Result<()> {
         let pts_90k = self.base_relative_pts(pts_ns, /* may_seed_base */ true);
-        // PCR comes "before" the PTS it timestamps; clamp at 0 for the
-        // first frame so we don't underflow.
-        let pcr = pts_90k.saturating_sub(PCR_LEAD_90KHZ);
+        let pcr = pts_90k
+            .saturating_sub(PCR_LEAD_90KHZ)
+            .max(self.last_pcr_90k);
+        self.last_pcr_90k = pcr;
 
         // Annex-B-ify the frame and prepend VPS/SPS/PPS once, on the
         // FIRST keyframe (not first frame — non-key frames before the
@@ -256,7 +264,11 @@ impl<W: Write> M2tsMux<W> {
             0
         };
         if may_seed_base {
-            self.base_pts_90k.get_or_insert(raw_90k);
+            // Seeded one headroom early (see tsmux) so a slightly earlier frame
+            // arriving second keeps its offset.
+            let headroom = (super::tsmux::ORIGIN_HEADROOM_NS as u64) * 9 / 100_000;
+            self.base_pts_90k
+                .get_or_insert(raw_90k.wrapping_sub(headroom) & 0x1_FFFF_FFFF);
         }
         let base = self.base_pts_90k.unwrap_or(raw_90k);
         // Modular 33-bit subtraction: the PTS clock wraps every 2^33 ticks
@@ -568,6 +580,9 @@ fn mpegts_crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The origin headroom in 90 kHz ticks: the seeding frame's encoded PTS.
+    const H: u64 = super::super::tsmux::ORIGIN_HEADROOM_NS as u64 * 9 / 100_000;
 
     // Golden vector for an audio PES header (ISO/IEC 13818-1 §2.4.3.7).
     #[test]
@@ -1280,9 +1295,7 @@ mod tests {
             let mut frame = Vec::new();
             frame.extend_from_slice(&4u32.to_be_bytes());
             frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
-            // 1s → 90000 ticks; base is this same frame, so relative PTS=0
-            // and PCR clamps to 0. Use a single frame: PTS rebases to 0,
-            // so PCR = 0.saturating_sub(lead) = 0.
+            // A single frame: it seeds the origin one headroom below itself.
             mux.write_video(1_000_000_000, true, &frame).unwrap();
             mux.finish().unwrap();
         }
@@ -1295,16 +1308,16 @@ mod tests {
             | ((af[3] as u64) << 9)
             | ((af[4] as u64) << 1)
             | ((af[5] as u64 >> 7) & 0x01);
-        // Single frame rebases its own PTS to 0; PCR = 0 - lead clamped to 0.
-        assert_eq!(base, 0, "first frame PCR clamps to 0 (no underflow)");
+        // The seeding frame sits one headroom past the origin; PCR leads it.
+        assert_eq!(base, H - PCR_LEAD_90KHZ, "first frame PCR leads its PTS");
     }
 
     // ── base_relative_pts overflow / saturation ───────────────────────────
 
     #[test]
     fn extreme_pts_does_not_overflow_and_clamps_to_33bit() {
-        // Two frames are required: a single frame always rebases to PTS 0, making
-        // the only assertion the vacuous `0 < 2^33`. Bit 32 is unreachable (the
+        // Two frames are required: a single frame always encodes the headroom, making
+        // the only assertion vacuous. Bit 32 is unreachable (the
         // signed-33-bit delta rule floors the upper half to 0), so this pins encoding.
         let decode_pts = |pkt: &[u8]| -> u64 {
             // Payload after the AF: AF area = 1 (length byte) + af_len.
@@ -1328,7 +1341,8 @@ mod tests {
         {
             let mut mux = M2tsMux::new(&mut sink);
             mux.write_video(0, true, &frame).unwrap();
-            mux.write_video(477_218_477 * 100_000, true, &frame)
+            // Less one headroom (10_000 x 100 us), which the origin already adds.
+            mux.write_video((477_218_477 - 10_000) * 100_000, true, &frame)
                 .unwrap();
             mux.finish().unwrap();
         }
@@ -1398,7 +1412,7 @@ mod tests {
     #[test]
     fn negative_pts_ns_encodes_zero() {
         // base_relative_pts treats pts_ns <= 0 as raw 0. A negative input
-        // must encode PTS 0, not a wrapped value.
+        // must encode as t=0 (the headroom), not a wrapped value.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = M2tsMux::new(&mut sink);
@@ -1416,7 +1430,7 @@ mod tests {
             | (((pes[11] >> 1) as u64) << 15)
             | ((pes[12] as u64) << 7)
             | ((pes[13] >> 1) as u64);
-        assert_eq!(pts, 0, "negative pts_ns encodes PTS 0");
+        assert_eq!(pts, H, "negative pts_ns is treated as 0, the seeding frame");
     }
 
     #[test]
@@ -1454,12 +1468,12 @@ mod tests {
         assert_eq!(pkts.len(), 2, "one PUSI packet per small audio frame");
         assert_eq!(
             decode_audio_pts(pkts[0]),
-            0,
-            "the first (audio) frame seeds the origin → 0"
+            H,
+            "the first (audio) frame seeds the origin one headroom below it"
         );
         assert_eq!(
             decode_audio_pts(pkts[1]),
-            90_000,
+            H + 90_000,
             "the second audio frame (1s later) must keep its spacing, not collapse to 0"
         );
     }
@@ -1517,5 +1531,50 @@ mod tests {
             0x0000,
             "first packet is PAT on PID 0"
         );
+    }
+
+    // Same for the 188-byte muxer: a frame shortly before the seeding one keeps
+    // its offset instead of flooring to the origin.
+    #[test]
+    fn a_frame_shortly_before_the_seeding_frame_keeps_its_offset() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        let audio = mux.base_relative_pts(100_000_000, true);
+        let video = mux.base_relative_pts(50_000_000, true);
+        assert_eq!(audio - video, 4_500);
+    }
+
+    fn all_pcrs(buf: &[u8]) -> Vec<u64> {
+        find_all_pkts(buf, PID_VIDEO, false)
+            .into_iter()
+            .filter_map(af_body)
+            .filter(|af| af.first().is_some_and(|f| f & 0x10 != 0))
+            .map(|af| {
+                ((af[1] as u64) << 25)
+                    | ((af[2] as u64) << 17)
+                    | ((af[3] as u64) << 9)
+                    | ((af[4] as u64) << 1)
+                    | ((af[5] as u64 >> 7) & 0x01)
+            })
+            .collect()
+    }
+
+    // B-frames arrive with PTS below an earlier P-frame's: the PCR must still
+    // never step backwards (ISO/IEC 13818-1 §2.4.2.2).
+    #[test]
+    fn pcr_never_goes_backwards_with_b_frames() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&8000u32.to_be_bytes());
+        frame.extend(std::iter::repeat_n(0x41u8, 8000));
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            for (i, ms) in [80i64, 200, 120, 160].into_iter().enumerate() {
+                mux.write_video(ms * 1_000_000, i == 0, &frame).unwrap();
+            }
+        }
+        let pcrs = all_pcrs(&sink);
+        assert!(pcrs.len() >= 4, "{pcrs:?}");
+        assert!(pcrs.windows(2).all(|w| w[1] >= w[0]), "{pcrs:?}");
     }
 }

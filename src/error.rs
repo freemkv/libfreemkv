@@ -198,6 +198,10 @@ pub const E_DIR_IMAGE_FANOUT: u16 = 9068;
 pub const E_SEAM_PLAN_DROPPED_MOST: u16 = 9069;
 /// A sink finished having written no frames at all.
 pub const E_SINK_WROTE_NOTHING: u16 = 9070;
+/// A write or finish reached a stream that is already finished or whose output failed.
+pub const E_STREAM_CLOSED: u16 = 9071;
+/// Per-track metadata was set after the stream header was already written.
+pub const E_STREAM_HEADER_WRITTEN: u16 = 9072;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
 /// A `network://` output target resolved to no address that is safe to
 /// connect to (every resolved IP was loopback / private / link-local /
@@ -841,6 +845,10 @@ pub enum Error {
     },
     /// A sink finished having written no frames at all.
     SinkWroteNothing,
+    /// See [`E_STREAM_CLOSED`].
+    StreamClosed,
+    /// See [`E_STREAM_HEADER_WRITTEN`].
+    StreamHeaderWritten,
 }
 
 impl Error {
@@ -972,6 +980,8 @@ impl Error {
             Error::DirImageFanout { .. } => E_DIR_IMAGE_FANOUT,
             Error::SeamPlanDroppedMost { .. } => E_SEAM_PLAN_DROPPED_MOST,
             Error::SinkWroteNothing => E_SINK_WROTE_NOTHING,
+            Error::StreamClosed => E_STREAM_CLOSED,
+            Error::StreamHeaderWritten => E_STREAM_HEADER_WRITTEN,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
@@ -1572,6 +1582,8 @@ mod tests {
             }
             .code(),
             Error::SinkWroteNothing.code(),
+            Error::StreamClosed.code(),
+            Error::StreamHeaderWritten.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -2006,6 +2018,8 @@ mod tests {
             (Error::MkvLacingInvalid, E_MKV_LACING_INVALID),
             (Error::MkvSourceInvalid, E_MKV_SOURCE_INVALID),
             (Error::MkvUnencodable, E_MKV_UNENCODABLE),
+            (Error::StreamClosed, E_STREAM_CLOSED),
+            (Error::StreamHeaderWritten, E_STREAM_HEADER_WRITTEN),
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),

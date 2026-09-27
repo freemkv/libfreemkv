@@ -25,6 +25,8 @@ pub struct PipelinedPesStream {
     parsers: Vec<(u16, Box<dyn CodecParser>)>,
     pid_to_track: Vec<(u16, usize)>,
 
+    /// Declared BEFORE `demux_thread`: dropped first, so a worker blocked on a
+    /// full channel exits before `DemuxThread::drop` joins it.
     demux_rx: Receiver<DemuxBatch>,
     /// Kept alive so dropping this stream joins the demux + producer
     /// workers deterministically. Never poked directly after spawn.
@@ -412,6 +414,8 @@ impl Stream for PipelinedPesStream {
             .iter()
             .find(|(p, _)| *p == pid)
             .and_then(|(_, parser)| parser.codec_private())
+            // FLAC/Opus ES carry no init data: keep what the source header supplied.
+            .or_else(|| self.title.codec_privates.get(track).cloned().flatten())
     }
 
     // `lost_bytes` uses the trait default (0): the file-backed highway has no
@@ -1028,6 +1032,24 @@ mod tests {
             stream.headers_ready(),
             "secondary video is exempt from the codec_private gate"
         );
+    }
+
+    /// A codec whose ES carries no init data (FLAC, Opus) keeps the CodecPrivate
+    /// the source header supplied (FMKV `m2ts://`) when its parser has none.
+    #[test]
+    fn codec_private_falls_back_to_the_source_title() {
+        let mut title = video_title(false);
+        title.codec_privates = vec![Some(b"fLaC".to_vec())];
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1011,
+            Box::new(CountingParser {
+                per_pes: 0,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let (stream, _tx) = make_stream(title, parsers, vec![(0x1011u16, 0usize)]);
+        assert_eq!(stream.codec_private(0).as_deref(), Some(&b"fLaC"[..]));
     }
 
     /// codec_private(track) returns None for a track index not present in

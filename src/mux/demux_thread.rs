@@ -4,8 +4,9 @@
 //! consumer thread so feed and codec parse pipeline instead of serialise.
 //!
 //! [`DemuxThread::spawn_zero_copy`] returns a handle plus a
-//! `Receiver<DemuxBatch>`; dropping the handle closes the channel and
-//! `Drop::drop` joins the worker.
+//! `Receiver<DemuxBatch>`. `Drop::drop` joins the worker, which exits only once
+//! that receiver is gone: drop the receiver FIRST (an owner declares it before
+//! the handle), or a worker blocked on a full channel deadlocks the join.
 
 use crate::halt::Halt;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -585,5 +586,39 @@ mod tests {
             rc_rx.recv().is_err(),
             "recycle_rx recv must fail after recycle_tx drop"
         );
+    }
+
+    // PipelinedPesStream must drop its receiver before this handle (field order):
+    // a worker blocked on the full channel then exits instead of deadlocking.
+    #[test]
+    fn dropping_a_stream_with_a_blocked_worker_does_not_hang() {
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(16);
+        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(16);
+        let pid = 0x1011;
+        let ts = super::super::ts::TsDemuxer::new(&[pid]);
+        let (dt, rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        for i in 0..8u8 {
+            let mut chunk = bdts_pes_packet(pid, &[i]);
+            chunk.extend(bdts_pes_packet(pid, &[i, i]));
+            pf_tx.send(Ok(chunk)).unwrap();
+        }
+        drop(pf_tx);
+        std::thread::sleep(Duration::from_millis(200));
+        let stream = super::super::pipelined_stream::PipelinedPesStream::new(
+            dt,
+            rx,
+            crate::disc::DiscTitle::empty(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(stream);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("drop must not deadlock on the blocked demux worker");
     }
 }

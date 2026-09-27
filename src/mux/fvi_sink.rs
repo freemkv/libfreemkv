@@ -4,7 +4,7 @@
 //! *video-index* record per coded picture of the title's primary video
 //! track, instead of muxing frames into a container.
 //!
-//! On-disk shape: the freemkv FVI format  — JSON Lines, a header object on line 1, then one
+//! On-disk shape: the freemkv FVI format — JSON Lines, a header object on line 1, then one
 //! record per picture. The sink is purely additive: it does NOT touch the MKV mux path.
 
 use crate::disc::{DiscTitle, Stream as DiscStream};
@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-/// Write the FVI header row  into `w`.
+/// Write the FVI header row into `w`.
 fn write_fvi_header(w: &mut dyn Write, h: &MapHeader) -> io::Result<()> {
     let mut source = serde_json::json!({
         "medium": h.source.medium.as_str(),
