@@ -46,6 +46,8 @@ pub(crate) struct WritebackPipeline {
     chunk_bytes: u64,
     last_flush_pos: u64,
     pending: Option<(u64, u64)>,
+    /// Latest write position; `[last_flush_pos, pos)` is the unflushed tail.
+    pos: u64,
     /// Rolling window of recent `WAIT_AFTER` elapsed_ms measurements.
     wait_after_window: VecDeque<u64>,
     /// Count of chunks emitted (used to space out periodic
@@ -125,6 +127,7 @@ impl WritebackPipeline {
             wait_file,
             chunk_bytes,
             last_flush_pos: start_pos,
+            pos: start_pos,
             pending: None,
             wait_after_window: VecDeque::with_capacity(ADAPTIVE_WINDOW),
             chunk_count: 0,
@@ -146,8 +149,7 @@ impl WritebackPipeline {
         self.wb_errno.get_or_insert(errno);
     }
 
-    // Latch data-loss errnos; anything else (EINVAL, ESPIPE, ...) says the call
-    // itself was unsupported, not that written data was lost.
+    // Latch possible data loss; an "unsupported call" errno is only a warning.
     fn latch_error(&mut self, errno: i32, off: u64, len: u64) {
         if !is_writeback_errno(errno) {
             tracing::warn!(
@@ -189,6 +191,7 @@ impl WritebackPipeline {
     /// was crossed, kick async writeback for the just-completed chunk
     /// and finalise the previous one.
     pub(crate) fn note_progress(&mut self, pos: u64) {
+        self.pos = pos;
         if pos < self.last_flush_pos.saturating_add(self.chunk_bytes) {
             return;
         }
@@ -334,50 +337,69 @@ impl WritebackPipeline {
     pub(crate) fn handle_seek(&mut self, new_pos: u64) {
         self.finalize();
         self.last_flush_pos = new_pos;
+        self.pos = new_pos;
     }
 
     /// Drain any in-flight chunk. Idempotent. Call before `sync_all()`
     /// or when discarding the pipeline.
     pub(crate) fn finalize(&mut self) {
-        if let Some((prev_off, prev_len)) = self.pending.take() {
-            tracing::debug!(
-                target: "mux",
-                "WritebackPipeline finalize chunk off={prev_off} len={prev_len} skip_wait={} is_nfs={} degraded={}",
-                self.skip_wait(),
-                self.is_nfs,
-                self.degraded.load(Ordering::Relaxed),
-            );
-            if self.skip_wait() {
-                // NFS / degraded: skip WAIT_AFTER + DONTNEED. close()
-                // / sync_all() handle commit through their normal
-                // paths.
-                return;
-            }
-            match self.wait_after(prev_off, prev_len) {
-                WaitOutcome::Done(_ms) => unsafe {
-                    libc::posix_fadvise(
-                        self.fd,
-                        prev_off as i64,
-                        prev_len as i64,
-                        libc::POSIX_FADV_DONTNEED,
-                    );
-                },
-                WaitOutcome::Failed(errno) => self.latch_error(errno, prev_off, prev_len),
-                WaitOutcome::TimedOut => {
-                    self.degraded.store(true, Ordering::Relaxed);
-                    tracing::error!(
-                        target: "mux",
-                        "WritebackPipeline finalize WAIT_AFTER timed out after {}s on chunk off={prev_off} len={prev_len}, marking writeback degraded",
-                        WAIT_AFTER_TIMEOUT.as_secs(),
-                    );
-                }
+        // The partial tail below a chunk boundary is waited on too, so a small
+        // file or the last partial chunk still reports its writeback error.
+        let tail_off = self.last_flush_pos;
+        let tail_len = self.pos.saturating_sub(tail_off);
+        if tail_len > 0 && !self.skip_wait() {
+            self.kickoff(tail_off, tail_len);
+        }
+        self.last_flush_pos = self.last_flush_pos.max(self.pos);
+        let tail = (tail_len > 0).then_some((tail_off, tail_len));
+        for (off, len) in [self.pending.take(), tail].into_iter().flatten() {
+            self.finalize_range(off, len);
+        }
+    }
+
+    fn finalize_range(&mut self, prev_off: u64, prev_len: u64) {
+        tracing::debug!(
+            target: "mux",
+            "WritebackPipeline finalize chunk off={prev_off} len={prev_len} skip_wait={} is_nfs={} degraded={}",
+            self.skip_wait(),
+            self.is_nfs,
+            self.degraded.load(Ordering::Relaxed),
+        );
+        if self.skip_wait() {
+            // NFS / degraded: skip WAIT_AFTER + DONTNEED. close()
+            // / sync_all() handle commit through their normal
+            // paths.
+            return;
+        }
+        match self.wait_after(prev_off, prev_len) {
+            WaitOutcome::Done(_ms) => unsafe {
+                libc::posix_fadvise(
+                    self.fd,
+                    prev_off as i64,
+                    prev_len as i64,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            },
+            WaitOutcome::Failed(errno) => self.latch_error(errno, prev_off, prev_len),
+            WaitOutcome::TimedOut => {
+                self.degraded.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    target: "mux",
+                    "WritebackPipeline finalize WAIT_AFTER timed out after {}s on chunk off={prev_off} len={prev_len}, marking writeback degraded",
+                    WAIT_AFTER_TIMEOUT.as_secs(),
+                );
             }
         }
     }
 }
 
+// Denylist: these mean the call itself is unsupported on this fd/fs. Every
+// other errno (EIO, ENOSPC, EROFS, ESTALE, ENOTCONN, ...) may mean lost data.
 fn is_writeback_errno(errno: i32) -> bool {
-    matches!(errno, libc::EIO | libc::ENOSPC | libc::EDQUOT)
+    !matches!(
+        errno,
+        libc::EINVAL | libc::ESPIPE | libc::EBADF | libc::ENOSYS | libc::EOPNOTSUPP
+    )
 }
 
 // Regular files and block devices support `sync_file_range`; anything else
@@ -577,6 +599,42 @@ mod tests {
 
     fn espipe_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
         libc::ESPIPE
+    }
+
+    fn erofs_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        libc::EROFS
+    }
+
+    fn einval_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        libc::EINVAL
+    }
+
+    // EROFS (aborted ext4 journal, btrfs abort) is data loss and must latch.
+    #[test]
+    fn erofs_is_latched_einval_is_not() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = erofs_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.finalize();
+        assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EROFS));
+
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = einval_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.finalize();
+        assert!(p.error().is_none());
+    }
+
+    // A write smaller than one chunk never crosses a boundary; finalize must
+    // still wait on it, or a small file's writeback error is never seen.
+    #[test]
+    fn finalize_waits_on_the_partial_tail() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = failing_wait;
+        p.note_progress(4096);
+        assert!(p.pending.is_none());
+        p.finalize();
+        assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EIO));
     }
 
     // Only data-loss errnos latch: ESPIPE/EINVAL mean the call was unsupported.
