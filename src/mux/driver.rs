@@ -755,6 +755,13 @@ fn drive_mux(
         }
     }
 
+    if !late_aac.is_empty() {
+        collect_late_configs(&*stream, &mut late_aac, &late_configs);
+        if !late_aac.is_empty() {
+            tracing::debug!(target: "mux", tracks = ?late_aac, "AAC tracks never yielded an AudioSpecificConfig");
+        }
+    }
+
     // ── Finish ── Drop the producer, join the consumer; `close()` finalises
     // the container. On halt/wedge this returns an error variant, translated
     // to `completed = false` rather than a hard failure.
@@ -849,7 +856,8 @@ impl WriteSink {
                 .set_codec_private(track, &cp)
                 .map_err(Error::from)?
             {
-                tracing::warn!(target: "mux", track, "sink cannot record a late codec_private; the track header lacks it");
+                // Most such sinks (m2ts/stdio/network) carry config in-band anyway.
+                tracing::debug!(target: "mux", track, "sink does not record a late codec_private");
             }
         }
         Ok(())
@@ -2149,6 +2157,49 @@ mod tests {
         assert_eq!(back.codec_private(4), None, "unfilled reserve is a Void");
         assert_eq!(back.codec_private(5), Some(vec![0x11, 0x90]));
         assert_eq!(back.info().streams.len(), 6);
+    }
+
+    // MVC folds the dependent view into the base track, shifting later stream
+    // indices down: a late config must land on the remapped AAC track.
+    #[test]
+    fn mkv_late_codec_private_follows_the_mvc_track_remap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mvc.mkv");
+        let mut title = LateAacStream::new().info;
+        let crate::disc::Stream::Video(base) = title.streams[0].clone() else {
+            unreachable!()
+        };
+        let dep = crate::disc::VideoStream {
+            pid: 0x1012,
+            label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+            ..base
+        };
+        title.streams.insert(1, crate::disc::Stream::Video(dep));
+        title.codec_privates = vec![Some(vec![1, 0x64, 0, 0x28, 0xFF, 0xE0, 0, 0])];
+        let file = std::fs::File::create(&path).expect("create");
+        let mut mkv = crate::mux::mkvstream::MkvStream::create(Box::new(file), &title, None)
+            .expect("create mkv");
+        assert!(
+            !mkv.set_codec_private(1, &[1])
+                .expect("dependent has no track")
+        );
+        assert!(mkv.set_codec_private(2, &[0x12, 0x10]).expect("aac"));
+        mkv.write(&PesFrame {
+            discard_padding_ns: 0,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0x11; 32],
+            duration_ns: None,
+            source: None,
+            coding: None,
+        })
+        .expect("video");
+        mkv.finish().expect("finish");
+        let back = crate::mux::mkvstream::MkvStream::open(std::fs::File::open(&path).unwrap())
+            .expect("parses");
+        assert_eq!(back.info().streams.len(), 2, "dependent folded into base");
+        assert_eq!(back.codec_private(1), Some(vec![0x12, 0x10]));
     }
 
     // Non-seekable/other sinks keep the old behaviour: no late patch, no error.

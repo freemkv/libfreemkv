@@ -947,9 +947,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
             } else if track.codec_id == ebml::CODEC_AAC {
                 codec_private_reserves.insert(i, writer.stream_position()?);
-                ebml::write_id(&mut writer, ebml::VOID)?;
-                ebml::write_size(&mut writer, (CODEC_PRIVATE_RESERVE - 2) as u64)?;
-                writer.write_all(&[0u8; CODEC_PRIVATE_RESERVE - 2])?;
+                writer.write_all(&ebml::void_element(CODEC_PRIVATE_RESERVE))?;
             }
             // Pre-0.13's deferred codecPrivate path was removed as dead code.
 
@@ -1201,19 +1199,18 @@ impl<W: Write + Seek> MkvMuxer<W> {
             Some(r) => r,
             None => return Ok(false),
         };
-        let mut el = vec![0x63, 0xA2];
+        let mut el = Vec::with_capacity(CODEC_PRIVATE_RESERVE);
+        ebml::write_id(&mut el, ebml::CODEC_PRIVATE)?;
         // A 1-byte remainder cannot hold a Void, so widen the size VINT instead.
         if rest == 1 {
             el.extend_from_slice(&[0x40, cp.len() as u8]);
             rest = 0;
         } else {
-            el.push(0x80 | cp.len() as u8);
+            ebml::write_size(&mut el, cp.len() as u64)?;
         }
         el.extend_from_slice(cp);
         if rest >= 2 {
-            el.push(ebml::VOID as u8);
-            el.push(0x80 | (rest - 2) as u8);
-            el.resize(CODEC_PRIVATE_RESERVE, 0);
+            el.extend_from_slice(&ebml::void_element(rest));
         }
         let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(pos))?;
