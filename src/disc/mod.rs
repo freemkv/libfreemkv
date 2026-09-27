@@ -1834,10 +1834,9 @@ impl Disc {
         Ok(disc)
     }
 
-    // Drops the cert-route Read Data Key when the content certificate's Bus Encryption
-    // Enabled flag (AACS spec; libaacs gates on `bee && bec`) is clear. An unreadable
-    // cert keeps the key: the drive serving one is the only remaining signal.
-    // HD DVD CONTENT_CERT.AACS BEE semantics are unverified; same rule applies.
+    // Drops the Read Data Key when the content cert's BEE flag is clear (AACS spec;
+    // libaacs gates on `bee && bec`). An unreadable cert keeps the key. HD DVD
+    // CONTENT_CERT.AACS BEE semantics are unverified; the same rule applies.
     pub(crate) fn bus_key_for_disc(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,

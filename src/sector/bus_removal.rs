@@ -505,10 +505,9 @@ mod tests {
         );
     }
 
-    // Two aligned units: unit 0 encrypted (CPI set, bus-encrypted on the wire),
-    // unit 1 clear (CPI 0, never bus-encrypted). libaacs gates bus decrypt per
-    // unit on `buf[0] & 0xC0` (aacs.c aacs_decrypt_bus): the clear unit must
-    // pass through, not be de-bussed into garbage.
+    // Unit 0 encrypted (CPI set, bus-encrypted), unit 1 clear (CPI 0). libaacs
+    // gates bus decrypt per unit on `buf[0] & 0xC0` (aacs.c aacs_decrypt_bus), so
+    // the clear unit must pass through untouched.
     #[test]
     fn host_key_debusses_only_units_whose_cpi_is_set() {
         let rdk = [0x21u8; 16];
