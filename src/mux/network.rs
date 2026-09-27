@@ -36,12 +36,26 @@ fn enable_keepalive(stream: &TcpStream) -> io::Result<()> {
     socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
 }
 
-// Read-timeout expiry: EAGAIN on Unix, WSAETIMEDOUT on Windows. On Unix a
-// TimedOut is a keepalive failure (dead peer) and must surface.
-fn is_poll_tick(kind: io::ErrorKind) -> bool {
-    kind == io::ErrorKind::WouldBlock
-        || kind == io::ErrorKind::Interrupted
-        || (cfg!(windows) && kind == io::ErrorKind::TimedOut)
+// Keepalive is best effort: a stack that rejects an option (e.g. TCP_KEEPCNT on
+// old Windows) still receives, just without dead-peer detection.
+fn arm_keepalive(stream: &TcpStream) {
+    if let Err(e) = enable_keepalive(stream) {
+        tracing::warn!(
+            target: "mux",
+            error = %e,
+            "network: TCP keepalive unavailable"
+        );
+    }
+}
+
+// Read-timeout expiry: EAGAIN on Unix, WSAETIMEDOUT on Windows. A TimedOut on
+// Unix, or on a Windows socket holding an error, is a dead peer and must surface.
+fn is_poll_tick(kind: io::ErrorKind, windows: bool, socket_failed: bool) -> bool {
+    match kind {
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => true,
+        io::ErrorKind::TimedOut => windows && !socket_failed,
+        _ => false,
+    }
 }
 
 // Receive side: polls the socket every POLL_INTERVAL so a halt is observed
@@ -73,7 +87,14 @@ impl Read for HaltRead {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
             match self.stream.read(buf) {
-                Err(e) if self.halt.is_some() && is_poll_tick(e.kind()) => {}
+                Err(e) if self.halt.is_some() => {
+                    let failed = cfg!(windows)
+                        && e.kind() == io::ErrorKind::TimedOut
+                        && !matches!(self.stream.take_error(), Ok(None));
+                    if !is_poll_tick(e.kind(), cfg!(windows), failed) {
+                        return Err(e);
+                    }
+                }
                 r => return r,
             }
         }
@@ -246,12 +267,12 @@ impl NetworkStream {
         Self::accept_from_with_halt(listener, None)
     }
 
-    /// [`accept_from`](Self::accept_from) that a [`Halt`] can interrupt. With a
-    /// halt the socket also gets TCP keepalive, so a dead sender fails the read.
+    /// [`accept_from`](Self::accept_from) that a [`Halt`] can interrupt.
     pub fn accept_from_with_halt(listener: TcpListener, halt: Option<Halt>) -> io::Result<Self> {
         let Some(h) = halt else {
             let (stream, _peer) = listener.accept()?;
             stream.set_nodelay(true)?;
+            arm_keepalive(&stream);
             return Self::read_from(stream, None);
         };
         listener.set_nonblocking(true)?;
@@ -273,7 +294,7 @@ impl NetworkStream {
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(POLL_INTERVAL))?;
-        enable_keepalive(&stream)?;
+        arm_keepalive(&stream);
         Self::read_from(stream, halt)
     }
 
@@ -953,6 +974,79 @@ mod tests {
             .expect("read must observe the halt");
         assert!(crate::error::is_halt(&r.unwrap_err()));
         drop(writer);
+    }
+
+    // A halt while the sender has connected but not finished its header.
+    #[test]
+    fn a_halt_interrupts_a_stalled_header_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let halt = crate::halt::Halt::new();
+        let h = halt.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = NetworkStream::accept_from_with_halt(listener, Some(h)).map(|_| ());
+            let _ = tx.send(r);
+        });
+        let mut sender = TcpStream::connect(addr).unwrap();
+        sender.write_all(b"FM").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        halt.cancel();
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the header read must observe the halt");
+        assert!(crate::error::is_halt(&r.unwrap_err()));
+    }
+
+    // A receiver without a halt (`listen`/`accept_from`) arms keepalive too.
+    #[test]
+    fn a_receiver_without_a_halt_arms_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let ns = NetworkStream::accept_from(listener).unwrap();
+            match &ns.mode {
+                Mode::Read { reader, .. } => socket2::SockRef::from(&reader.get_ref().stream)
+                    .keepalive()
+                    .unwrap(),
+                Mode::Write { .. } => false,
+            }
+        });
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        if let Mode::Write {
+            writer: w,
+            header_written,
+            padded,
+            ..
+        } = &mut writer.mode
+        {
+            ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
+            w.flush().unwrap();
+        }
+        assert!(handle.join().unwrap(), "keepalive must be armed");
+    }
+
+    // A TimedOut is a read-timeout tick only on Windows and only while the
+    // socket holds no error; a keepalive failure (or any Unix TimedOut) surfaces.
+    #[test]
+    fn timed_out_is_a_poll_tick_only_on_a_healthy_windows_socket() {
+        use io::ErrorKind::{ConnectionReset, Interrupted, TimedOut, WouldBlock};
+        for (kind, windows, failed, tick) in [
+            (WouldBlock, false, false, true),
+            (Interrupted, true, false, true),
+            (TimedOut, true, false, true),
+            (TimedOut, true, true, false),
+            (TimedOut, false, false, false),
+            (ConnectionReset, true, false, false),
+        ] {
+            assert_eq!(
+                is_poll_tick(kind, windows, failed),
+                tick,
+                "{kind:?} windows={windows} failed={failed}"
+            );
+        }
     }
 
     // A halt-aware receiver arms keepalive (dead-peer detection) and sets no
