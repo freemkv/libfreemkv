@@ -282,10 +282,9 @@ pub trait Stream: Send {
 
     /// Sink side: `info().streams` indices this sink PLANNED to carry (and
     /// accepted frames for) but could not put in the finished container, valid
-    /// after [`finish`](Self::finish). Empty for every sink that writes
-    /// everything it accepted — which is all of them except `mp4://`, whose
-    /// `finish()` must drop an audio track no frame of which yielded a parseable
-    /// sample entry (an `stsd` cannot describe it).
+    /// after [`finish`](Self::finish). Empty for every sink that writes everything
+    /// it accepted, except `mp4://` (audio with no parseable sample entry, known at
+    /// finish) and `m2ts://` (LPCM BD LPCM can't carry, known from creation).
     fn undelivered_streams(&self) -> Vec<usize> {
         // Without this, such a drop would silently contradict the pre-mux
         // plan the crate publishes (`mp4_fit_report`); the driver folds

@@ -307,17 +307,50 @@ impl CodecParser for LpcmParser {
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
-        self.bd_layout_byte.map(|b| vec![b])
+        self.bd_layout_byte
+            .map(|b| [LAYOUT_TAG.as_slice(), &[b]].concat())
     }
 }
 
-/// Channel count and rate from a BD LPCM PES payload's header (scan-time probe).
-pub(crate) fn bd_probe(pes_data: &[u8]) -> Option<(u8, u32)> {
-    if pes_data.len() < BD_LPCM_HEADER_SIZE {
-        return None;
+/// Tag on the parser's codec_private, so a foreign MKV `A_PCM` CodecPrivate never
+/// passes for a BD layout byte.
+const LAYOUT_TAG: &[u8; 4] = b"BDLP";
+
+/// The BD layout byte (channel_assignment|rate) from a tagged LPCM codec_private.
+pub(crate) fn layout_byte(cp: &[u8]) -> Option<u8> {
+    match cp.strip_prefix(LAYOUT_TAG.as_slice()) {
+        Some(&[b]) => Some(b),
+        _ => None,
     }
-    let (channels, rate) = Format::bd(pes_data)?.channels_rate();
-    Some((channels as u8, rate))
+}
+
+/// Correct each BD LPCM track's channels/rate (and a default label) from its parser
+/// layout byte: playlists label every multi-channel LPCM "5.1".
+pub(crate) fn correct_title_layout(title: &mut crate::disc::DiscTitle) {
+    use crate::disc::{AudioChannels, SampleRate, Stream};
+    for (i, s) in title.streams.iter_mut().enumerate() {
+        let Stream::Audio(a) = s else { continue };
+        if a.codec != crate::disc::Codec::Lpcm {
+            continue;
+        }
+        let Some(b) = title
+            .codec_privates
+            .get(i)
+            .and_then(|c| c.as_deref())
+            .and_then(layout_byte)
+        else {
+            continue;
+        };
+        let (Some((count, _)), Some(hz)) = (bd_layout(b >> 4), bd_rate(b & 0x0F)) else {
+            continue;
+        };
+        let basic = crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
+        a.channels = AudioChannels::from_count(count as u8);
+        a.sample_rate = SampleRate::from_hz(hz);
+        if a.label == basic {
+            a.label = crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
+        }
+    }
 }
 
 /// BD LPCM header bytes 2-3 for re-muxing parser output (24-bit) to M2TS, or `None`
@@ -771,7 +804,18 @@ mod tests {
         let mut p = LpcmParser::new();
         assert_eq!(p.codec_private(), None);
         p.parse(&make_pes(bd(7, 1, &[0; 8]), Some(0)));
-        assert_eq!(p.codec_private(), Some(vec![0x71]));
+        let cp = p.codec_private().unwrap();
+        assert_eq!(
+            cp,
+            b"BDLP\x71".to_vec(),
+            "tagged so foreign CodecPrivate never matches"
+        );
+        assert_eq!(layout_byte(&cp), Some(0x71));
+        assert_eq!(
+            layout_byte(&[0x71]),
+            None,
+            "untagged (foreign MKV) byte ignored"
+        );
         assert_eq!(LpcmParser::new_dvd().codec_private(), None);
     }
 

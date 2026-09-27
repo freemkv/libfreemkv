@@ -34,7 +34,7 @@ impl M2tsStream {
             let cp = title.codec_privates.get(i).cloned().flatten();
             let lpcm = match s {
                 DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => {
-                    let src = cp.as_deref().and_then(|c| c.first().copied());
+                    let src = cp.as_deref().and_then(super::codec::lpcm::layout_byte);
                     let h = super::codec::lpcm::bd_header(
                         a.channels.count(),
                         a.sample_rate.hz() as u32,
@@ -135,6 +135,13 @@ impl crate::pes::Stream for M2tsStream {
 
     fn info(&self) -> &crate::disc::DiscTitle {
         &self.disc_title
+    }
+
+    fn undelivered_streams(&self) -> Vec<usize> {
+        // Known from create: LPCM BD LPCM can't carry is never written.
+        (0..self.route.len())
+            .filter(|&i| self.route[i].is_none())
+            .collect()
     }
 
     fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {
@@ -512,7 +519,7 @@ mod tests {
         // A source 2/2 (assignment 7) must not be re-labelled 3/1 (4ch default 6).
         use crate::disc::{AudioChannels, SampleRate};
         let mut title = lpcm_title(AudioChannels::Quad, SampleRate::S48);
-        title.codec_privates = vec![None, Some(vec![0x71])];
+        title.codec_privates = vec![None, Some(b"BDLP\x71".to_vec())];
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
         stream
@@ -538,5 +545,45 @@ mod tests {
             pes[0].data[2], 0x71,
             "BD header keeps channel_assignment 7 (2/2)"
         );
+    }
+    #[test]
+    fn lpcm_ignores_an_untagged_foreign_layout_byte() {
+        use crate::disc::{AudioChannels, SampleRate};
+        let mut title = lpcm_title(AudioChannels::Quad, SampleRate::S48);
+        title.codec_privates = vec![None, Some(vec![0x71])];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        stream
+            .write(&PesFrame {
+                discard_padding_ns: 0,
+                coding: None,
+                source: None,
+                track: 1,
+                pts: 0,
+                keyframe: true,
+                data: vec![0; 240 * 4 * 3],
+                duration_ns: None,
+            })
+            .unwrap();
+        stream.finish().unwrap();
+        drop(stream);
+        let buf = shared.lock().unwrap().clone();
+        let (_, ts) = ts_after_header(&buf);
+        let mut demux = crate::mux::ts::TsDemuxer::new(&[0x1100]);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        assert_eq!(
+            pes[0].data[2], 0x61,
+            "count default (4.0), not the foreign byte"
+        );
+    }
+
+    #[test]
+    fn dropped_lpcm_is_reported_undelivered() {
+        use crate::disc::{AudioChannels, SampleRate};
+        let title = lpcm_title(AudioChannels::Stereo, SampleRate::S44_1);
+        let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let stream = M2tsStream::create(sink, &title).unwrap();
+        assert_eq!(stream.undelivered_streams(), vec![1]);
     }
 }
