@@ -28,7 +28,7 @@ fn is_video_pid(pid: u16) -> bool {
 }
 
 // Headroom below the first frame's PTS for frames presented before it but emitted
-// after it. ISO/IEC 13818-1 T-STD (§2.4.2.3) caps elementary-buffer delay at 1 s.
+// after it. ISO/IEC 13818-1 §2.4.2.6 caps T-STD buffer delay at 1 s.
 pub(crate) const ORIGIN_HEADROOM_NS: i64 = 1_000_000_000;
 
 /// BD-TS muxer: PES frames in, 192-byte BD-TS packets out.

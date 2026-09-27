@@ -176,24 +176,13 @@ impl<W: Write> M2tsMux<W> {
     /// drives the random_access_indicator bit on the first packet of this
     /// PES (and gates codec_private NAL prepending — those only attach to
     /// the first keyframe).
+    ///
+    /// Frames carry no DTS, so the PCR leads the PTS by `PCR_LEAD_90KHZ` and is
+    /// held monotonic; reordering deeper than that lead can still let it pass a
+    /// B-frame's PTS.
     pub fn write_video(&mut self, pts_ns: i64, keyframe: bool, data: &[u8]) -> io::Result<()> {
-        self.write_video_dts(pts_ns, pts_ns, keyframe, data)
-    }
-
-    /// [`write_video`](Self::write_video) with the frame's decode timestamp. The
-    /// PCR leads the DTS and never steps back, so B-frame reordering cannot
-    /// run the clock backwards; the PES carries DTS when it differs from PTS.
-    pub fn write_video_dts(
-        &mut self,
-        pts_ns: i64,
-        dts_ns: i64,
-        keyframe: bool,
-        data: &[u8],
-    ) -> io::Result<()> {
         let pts_90k = self.base_relative_pts(pts_ns, /* may_seed_base */ true);
-        let dts_90k = (dts_ns != pts_ns).then(|| self.base_relative_pts(dts_ns, false));
-        let pcr = dts_90k
-            .unwrap_or(pts_90k)
+        let pcr = pts_90k
             .saturating_sub(PCR_LEAD_90KHZ)
             .max(self.last_pcr_90k);
         self.last_pcr_90k = pcr;
@@ -237,7 +226,7 @@ impl<W: Write> M2tsMux<W> {
         );
         super::hevc::append_length_prefixed_as_annex_b_sized(&mut es, data, length_size);
 
-        let pes = build_video_pes(pts_90k, dts_90k, &es);
+        let pes = build_video_pes(pts_90k, &es);
         self.write_pes(PID_VIDEO, &pes, Some(pcr), keyframe)
     }
 
@@ -429,11 +418,10 @@ impl<W: Write> M2tsMux<W> {
 }
 
 /// Build a PES packet for a video access unit.
-fn build_video_pes(pts_90k: u64, dts_90k: Option<u64>, es: &[u8]) -> Vec<u8> {
+fn build_video_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
     build_pes_packet(
         crate::consts::pes_stream_id::VIDEO,
         pts_90k,
-        dts_90k,
         es,
         /* length_in_header */ false,
     )
@@ -447,25 +435,18 @@ fn build_audio_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
     build_pes_packet(
         crate::consts::pes_stream_id::PRIVATE_STREAM_1,
         pts_90k,
-        None,
         es,
         /* length_in_header */ true,
     )
 }
 
-fn build_pes_packet(
-    stream_id: u8,
-    pts_90k: u64,
-    dts_90k: Option<u64>,
-    es: &[u8],
-    length_in_header: bool,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(es.len() + 19);
+fn build_pes_packet(stream_id: u8, pts_90k: u64, es: &[u8], length_in_header: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(es.len() + 14);
     out.extend_from_slice(&[0x00, 0x00, 0x01, stream_id]);
-    // PES_packet_length: bytes after this field (3 flag bytes + 5/10 timestamp
-    // bytes + es). Zero = "unbounded", used for video where PES can exceed u16.
-    let ts_len = if dts_90k.is_some() { 10 } else { 5 };
-    let pes_len = 3 + ts_len + es.len();
+    // PES_packet_length: total bytes after this field. 3 flag bytes + 5
+    // PTS bytes + es.len(). Zero means "unbounded" — used for video
+    // where PES can exceed u16.
+    let pes_len = 8 + es.len();
     if length_in_header && pes_len <= u16::MAX as usize {
         out.extend_from_slice(&(pes_len as u16).to_be_bytes());
     } else {
@@ -473,26 +454,17 @@ fn build_pes_packet(
     }
     // Flags byte 1: 10 = MPEG-2 marker, then scrambling/priority/etc 0.
     out.push(0x80);
-    // Flags byte 2: PTS_DTS_flags ('10' = PTS, '11' = PTS + DTS).
-    out.push(if dts_90k.is_some() { 0xC0 } else { 0x80 });
-    out.push(ts_len as u8);
-    // 33-bit timestamps split across 5 bytes with marker bits; the prefix
-    // nibble is '0010' (PTS only), '0011' (PTS of a pair) or '0001' (DTS).
-    let push_ts = |out: &mut Vec<u8>, prefix: u8, ts: u64| {
-        let ts = ts & 0x1_FFFF_FFFF;
-        out.push(prefix | 0x01 | (((ts >> 29) & 0x0E) as u8));
-        out.push(((ts >> 22) & 0xFF) as u8);
-        out.push(0x01 | (((ts >> 14) & 0xFE) as u8));
-        out.push(((ts >> 7) & 0xFF) as u8);
-        out.push(0x01 | (((ts << 1) & 0xFE) as u8));
-    };
-    match dts_90k {
-        Some(dts) => {
-            push_ts(&mut out, 0x30, pts_90k);
-            push_ts(&mut out, 0x10, dts);
-        }
-        None => push_ts(&mut out, 0x20, pts_90k),
-    }
+    // Flags byte 2: PTS flag (bit 7).
+    out.push(0x80);
+    // PES_header_data_length = 5 (just PTS).
+    out.push(5);
+    // PTS bytes — 33-bit timestamp split across 5 bytes with marker bits.
+    let pts = pts_90k & 0x1_FFFF_FFFF;
+    out.push(0x21 | (((pts >> 29) & 0x0E) as u8));
+    out.push(((pts >> 22) & 0xFF) as u8);
+    out.push(0x01 | (((pts >> 14) & 0xFE) as u8));
+    out.push(((pts >> 7) & 0xFF) as u8);
+    out.push(0x01 | (((pts << 1) & 0xFE) as u8));
     out.extend_from_slice(es);
     out
 }
@@ -635,7 +607,7 @@ mod tests {
 
         // The video builder over the SAME inputs differs in exactly the two
         // fields above — proving neither is incidental.
-        let vid = build_video_pes(90_000, None, &es);
+        let vid = build_video_pes(90_000, &es);
         assert_eq!(vid[3], 0xE0, "video uses the video stream_id");
         assert_eq!(
             &vid[4..6],
@@ -1604,24 +1576,5 @@ mod tests {
         let pcrs = all_pcrs(&sink);
         assert!(pcrs.len() >= 4, "{pcrs:?}");
         assert!(pcrs.windows(2).all(|w| w[1] >= w[0]), "{pcrs:?}");
-    }
-
-    // With an explicit DTS the PCR is derived from it and the PES carries DTS.
-    #[test]
-    fn write_video_dts_leads_the_pcr_from_dts_and_signals_it() {
-        let mut sink: Vec<u8> = Vec::new();
-        {
-            let mut mux = M2tsMux::new(&mut sink);
-            let mut frame = Vec::new();
-            frame.extend_from_slice(&4u32.to_be_bytes());
-            frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
-            mux.write_video_dts(80_000_000, 0, true, &frame).unwrap();
-        }
-        let pkt = find_pkt(&sink, PID_VIDEO, true).unwrap();
-        let af_len = pkt[4] as usize;
-        let pes = &pkt[4 + 1 + af_len..];
-        assert_eq!(pes[7] & 0xC0, 0xC0, "PTS and DTS flags");
-        assert_eq!(pes[8], 10);
-        assert_eq!(all_pcrs(&sink)[0], H - 7_200 - PCR_LEAD_90KHZ);
     }
 }
