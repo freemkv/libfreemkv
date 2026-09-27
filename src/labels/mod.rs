@@ -183,6 +183,26 @@ impl FeaturePlaylistHint {
     }
 }
 
+// Lower-cased words of an identifier: letter runs, also split at camelCase
+// boundaries (`MainFeature_A` → main, feature, a).
+pub(crate) fn name_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for part in s.split(|c: char| !c.is_ascii_alphabetic()) {
+        let mut word = String::new();
+        for c in part.chars() {
+            if c.is_ascii_uppercase() && word.chars().last().is_some_and(|l| l.is_ascii_lowercase())
+            {
+                words.push(std::mem::take(&mut word));
+            }
+            word.push(c.to_ascii_lowercase());
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+    }
+    words
+}
+
 // The ASCII digits of `s`, in order (tolerates stray quotes/spaces/units).
 fn digits(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()

@@ -154,7 +154,7 @@ fn props_hint(text: &str) -> Option<FeaturePlaylistHint> {
             return None;
         }
         let (key, val) = line.split_once('=')?;
-        let words = key_words(key);
+        let words = super::name_words(key);
         let names_feature = words.iter().any(|w| w == "feature");
         let identity_only = words.iter().all(|w| {
             matches!(
@@ -167,26 +167,6 @@ fn props_hint(text: &str) -> Option<FeaturePlaylistHint> {
         }
         playlist_number(val).map(FeaturePlaylistHint::for_playlist)
     })
-}
-
-// Lower-cased words of a properties key: split on non-alphanumerics and camelCase.
-fn key_words(key: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    for part in key.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let mut word = String::new();
-        let mut prev_lower = false;
-        for c in part.chars() {
-            if c.is_ascii_uppercase() && prev_lower {
-                words.push(std::mem::take(&mut word));
-            }
-            prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
-            word.push(c.to_ascii_lowercase());
-        }
-        if !word.is_empty() {
-            words.push(word);
-        }
-    }
-    words
 }
 
 // A bare playlist number: 1-5 digits, optionally quoted and/or `.mpls`-suffixed.

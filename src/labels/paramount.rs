@@ -217,11 +217,24 @@ fn playlist_duration_secs(element: &str) -> Option<u64> {
     )
 }
 
-// Whether a playlist name contains the WORD "feature" (`_Feature`, `Feature_A`,
-// `Feature2`) — letter runs only, so `Featurette`/`Bonus_Features` do not match.
+// Whether a playlist name has the WORD "feature" (`_Feature`, `MainFeature`) and no
+// extras word (`Feature_Trailer`, `FeatureCommentary`); `Featurette` is not "feature".
 fn names_feature(name: &str) -> bool {
-    name.split(|c: char| !c.is_ascii_alphabetic())
-        .any(|w| w.eq_ignore_ascii_case("feature"))
+    const EXTRAS: &[&str] = &[
+        "trailer",
+        "trailers",
+        "teaser",
+        "commentary",
+        "bonus",
+        "featurette",
+        "promo",
+        "preview",
+        "previews",
+        "extra",
+        "extras",
+    ];
+    let words = super::name_words(name);
+    words.iter().any(|w| w == "feature") && !words.iter().any(|w| EXTRAS.contains(&w.as_str()))
 }
 
 // A feature-selection candidate: the element text, its non-empty audio-slot
@@ -857,11 +870,11 @@ mod tests {
     #[test]
     fn sub_minute_feature_name_is_rejected() {
         let xml = r#"
-            <playlist name="Feature_Trailer" id="00050" aud="eng,fra,spa" duration="30" />
+            <playlist name="Feature_B"       id="00050" aud="eng,fra,spa" duration="30" />
             <playlist name="MainMovie"       id="00800" aud="eng,fra,spa" duration="7000" />
         "#;
         let feature = find_feature_playlist(xml).expect("a feature is found");
-        // Feature_Trailer is /feature/i but sub-minute → rejected; tier 3 picks
+        // Feature_B names the feature but is sub-minute → rejected; tier 3 picks
         // MainMovie (equal audio, far longer duration).
         assert!(feature.contains(r#"id="00800""#), "got {feature}");
     }
@@ -877,6 +890,31 @@ mod tests {
             );
             let h = feature_hint(&xml).expect("hint");
             assert_eq!(h.playlist_id, Some(800), "{name}");
+        }
+    }
+
+    // "feature" as a camelCase word counts; a compound with an extras word does not.
+    #[test]
+    fn feature_word_matching_handles_camel_case_and_extras() {
+        for name in [
+            "MainFeature",
+            "FeatureFilm",
+            "TheatricalFeature",
+            "ExtendedFeature",
+            "_Feature",
+            "Feature_A",
+        ] {
+            assert!(names_feature(name), "{name}");
+        }
+        for name in [
+            "Feature_Trailer",
+            "FeatureCommentary",
+            "BonusFeature",
+            "Featurette",
+            "Feature_Promo",
+            "FeaturePreview",
+        ] {
+            assert!(!names_feature(name), "{name}");
         }
     }
 
