@@ -140,8 +140,8 @@ pub trait ResolveCtx {
     fn vid(&self) -> Option<Vid>;
     /// Raw MKB bytes (may be empty when not captured).
     fn mkb(&self) -> Result<&[u8], Error>;
-    /// The disc's encrypted title keys, parsed from `Unit_Key_RO.inf` the same
-    /// way the library's resolver parses them ([`crate::aacs::inf::parse_unit_key_ro`]),
+    /// The disc's encrypted title keys, parsed from `Unit_Key_RO.inf` (or an HD DVD
+    /// VTKF) the same way the library's resolver parses them ([`crate::aacs::inf::parse_title_keys`]),
     /// in on-disc order. Feed straight into [`crate::aacs::derive::decrypt_unit_key`].
     fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error>;
     /// Up to `n` encrypted on-disc content sample units, for a source that
@@ -172,16 +172,17 @@ impl<'a> DiscInputsCtx<'a> {
     /// Build a context over `inputs`, parsing the encrypted title keys at the
     /// stride for the disc's own AACS major (`inputs.version`: 1 → 48-byte V10
     /// stride, else 64-byte V20/V21) — the single source of truth, no separate
-    /// version argument to drift from it.
+    /// version argument to drift from it. An HD DVD `VTKF*.AACS` is detected by
+    /// its magic ([`crate::aacs::inf::parse_title_keys`]).
     ///
     /// A malformed `unit_key_ro` parses to an empty key set rather than an error.
     pub fn new(inputs: &'a DiscInputs) -> Self {
-        use crate::aacs::inf::parse_unit_key_ro;
+        use crate::aacs::inf::parse_title_keys;
         use crate::aacs::mkb::AacsVersion;
         let enc_keys = if inputs.unit_key_ro.is_empty() {
             Vec::new()
         } else {
-            parse_unit_key_ro(&inputs.unit_key_ro, AacsVersion::from_major(inputs.version))
+            parse_title_keys(&inputs.unit_key_ro, AacsVersion::from_major(inputs.version))
                 .map(|f| f.encrypted_keys.into_iter().map(|(_, k)| k).collect())
                 .unwrap_or_default()
         };
@@ -321,9 +322,9 @@ pub fn resolve_and_apply(
 /// [`crate::aacs::trace::ResolutionTrace`] recording, per source, what happened — for
 /// applications to render. ZERO English; the trace is typed enums only.
 ///
-/// One-shot per source: each source's [`KeySource::get_unit_keys`] is called exactly once;
+/// One-shot per source: each source's [`KeySource::resolve_unit_keys`] is called exactly once;
 /// non-empty Unit Keys are applied via [`crate::Disc::decrypt_with`], which validates against
-/// `inputs.samples` and only mutates the disc on success. CPS-unit ORDER is load-bearing  even
+/// `inputs.samples` and only mutates the disc on success. CPS-unit ORDER is load-bearing even
 /// though the carried number is not.
 pub fn resolve_and_apply_traced(
     sources: &[Box<dyn KeySource>],
@@ -333,11 +334,24 @@ pub fn resolve_and_apply_traced(
     use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep};
 
     let mut trace = crate::aacs::trace::ResolutionTrace::new();
+    // A bus-blocked disc refuses every key: don't query sources, record why.
+    if disc.bus_blocked_error().is_some() {
+        trace.keys.push(KeyStep {
+            who: crate::aacs::trace::BUS_BLOCKED.to_string(),
+            path: Vec::new(),
+            outcome: KeyOutcome::NoKey,
+            matched_entry: None,
+            store_entries: None,
+        });
+        return (false, trace);
+    }
 
     // The FIRST source failure seen, if any. An `Err` means the source could not
     // answer at all (not "no key"), so its reason is stamped onto `disc.aacs_error`
     // below, reporting the ordered sources' most-preferred failure to the operator.
     let mut source_failure: Option<crate::error::Error> = None;
+    // The first validation rejection (keys produced, but they don't open the disc).
+    let mut rejection: Option<crate::error::Error> = None;
 
     // The ctx parses Unit_Key_RO.inf at the stride for `inputs.version` (the
     // disc's own AACS major), so the stride is the disc's single source of truth.
@@ -354,10 +368,10 @@ pub fn resolve_and_apply_traced(
                     .iter()
                     .map(|uk| (uk.idx.saturating_add(1), uk.key))
                     .collect();
-                if disc
-                    .decrypt_with(Key::Unit(unit_keys), &inputs.samples)
-                    .is_ok()
-                {
+                let applied = disc.decrypt_with(Key::Unit(unit_keys), &inputs.samples);
+                if let Err(e) = applied {
+                    rejection.get_or_insert(e);
+                } else {
                     trace.keys.push(KeyStep {
                         who,
                         path: vec![KeyNode::FoundUnitKeys, KeyNode::DerivedUnitKeys],
@@ -416,10 +430,10 @@ pub fn resolve_and_apply_traced(
             }
         }
     }
-    // Nothing resolved. If a source FAILED rather than answered, stamp that reason
-    // onto the disc for the decrypt gate — but never clobber a reason the scan
+    // Nothing resolved. Stamp why — a source FAILURE first, else a key rejection —
+    // onto the disc for the decrypt gate, but never clobber a reason the scan
     // already captured (e.g. `AacsVidUnavailable`), which is closer to the disc.
-    if let Some(e) = source_failure
+    if let Some(e) = source_failure.or(rejection)
         && disc.aacs_error.is_none()
     {
         disc.aacs_error = Some(e);
@@ -427,42 +441,91 @@ pub fn resolve_and_apply_traced(
     (false, trace)
 }
 
-/// THE single key-fetch: drive `sources` in order and return the first non-empty Unit Key set.
-/// Same sources, same call for both disc-open and read-miss paths — there is no separate
-/// "fetch", only the samples in `ctx` differ. Unlike [`resolve_and_apply`] this does not
-/// validate/commit to a disc — the read's decorator re-decrypts with the returned keys, which
-/// is the validation.
+/// THE single key-fetch: drive `sources` in order and return the first non-empty Unit Key set
+/// that opens the ctx's samples. Same sources, same call for both disc-open and read-miss
+/// paths — only the samples in `ctx` differ. A source whose keys open none of the encrypted
+/// samples is skipped (the next source is asked); with no encrypted sample there is nothing
+/// to disprove and the first non-empty set wins. Does not commit to a disc. Empty on a miss
+/// or a source failure (see [`key_fetch`] for the failure-reporting form).
 pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
-    drive_unit_keys(sources, ctx).keys
+    drive_unit_keys(sources, ctx).unwrap_or_default()
 }
 
-// Whether a driver run resolved keys, and — if not — whether that's a genuine absence (`errored
-// == false`, safe to cache) or a source FAILURE (`errored == true`, must not be cached).
-struct FetchOutcome {
-    keys: Vec<UnitKey>,
-    errored: bool,
-}
+// One source call: a `KeySource` op over a ctx.
+type SourceOp = fn(&dyn KeySource, &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error>;
 
-// [`fetch_unit_keys`] plus the error signal (`Err` = source failure, empty
-// `Ok` = genuine absence — see [`KeySource::get_unit_keys`]).
-fn drive_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> FetchOutcome {
-    let mut errored = false;
+// Drive `sources` in order: the first non-empty set `accept`ed wins. When none wins,
+// `Err` = the FIRST source failure, else `AacsKeyRejected` if keys were produced but
+// none accepted (neither is cached); empty `Ok` = a genuine absence.
+fn drive_sources(
+    sources: &[Box<dyn KeySource>],
+    ctx: &dyn ResolveCtx,
+    op: SourceOp,
+    accept: &dyn Fn(&[UnitKey]) -> bool,
+) -> Result<Vec<UnitKey>, Error> {
+    let mut failure: Option<Error> = None;
+    let mut rejected = false;
     for source in sources {
-        match source.get_unit_keys(ctx) {
-            Ok(uks) if !uks.is_empty() => {
-                return FetchOutcome {
-                    keys: uks,
-                    errored: false,
-                };
+        match op(source.as_ref(), ctx) {
+            Ok(uks) if uks.is_empty() => {}
+            Ok(uks) if accept(&uks) => return Ok(uks),
+            Ok(_) => rejected = true,
+            Err(e) => {
+                failure.get_or_insert(e);
             }
-            Ok(_) => {}
-            Err(_) => errored = true,
         }
     }
-    FetchOutcome {
-        keys: Vec::new(),
-        errored,
+    match failure {
+        Some(e) => Err(e),
+        None if rejected => Err(Error::AacsKeyRejected),
+        None => Ok(Vec::new()),
     }
+}
+
+// Base Unit Keys, validated against the ctx's samples (see [`keys_open_samples`]).
+fn drive_unit_keys(
+    sources: &[Box<dyn KeySource>],
+    ctx: &dyn ResolveCtx,
+) -> Result<Vec<UnitKey>, Error> {
+    let samples = ctx.samples(usize::MAX).unwrap_or_default();
+    drive_sources(sources, ctx, |s, c| s.get_unit_keys(c), &|uks| {
+        keys_open_samples(uks, &samples)
+    })
+}
+
+// Forensic index set: the caller probes each index's phase itself (an anchor batch
+// may be the wrong parity), so the first non-empty set is trusted as-is.
+fn drive_fmts_indexes(
+    sources: &[Box<dyn KeySource>],
+    ctx: &dyn ResolveCtx,
+) -> Result<Vec<UnitKey>, Error> {
+    drive_sources(sources, ctx, |s, c| s.get_fmts_indexes(c), &|_| true)
+}
+
+// Does any key open any still-encrypted sample? The read-time ctx carries no content
+// format, so each sample is judged under both; no encrypted sample ⇒ nothing to disprove.
+// Callers must pass only samples already filtered by the REAL format's encrypted flag.
+fn keys_open_samples(keys: &[UnitKey], samples: &[Vec<u8>]) -> bool {
+    use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_unit, is_clean};
+    use crate::disc::ContentFormat;
+    let mut probe = vec![0u8; ALIGNED_UNIT_LEN];
+    let mut evidence = false;
+    for format in [ContentFormat::BdTs, ContentFormat::MpegPs] {
+        for s in samples
+            .iter()
+            .filter(|s| aacs_unit_needs_decrypt(s, format))
+        {
+            evidence = true;
+            for k in keys {
+                probe.copy_from_slice(&s[..ALIGNED_UNIT_LEN]);
+                decrypt_unit(&mut probe, &k.key);
+                if is_clean(&probe, format) {
+                    return true;
+                }
+            }
+        }
+    }
+    !evidence
 }
 
 /// The forensic counterpart to [`fetch_unit_keys`]: drive `sources` in order and
@@ -472,29 +535,7 @@ fn drive_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Fetc
 /// keying on `disc_hash`) ignores them. Whatever the winning source returns —
 /// ≥ 1 key — is trusted as the COMPLETE ordered set; no fixed count is assumed.
 pub fn fetch_fmts_indexes(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
-    drive_fmts_indexes(sources, ctx).keys
-}
-
-/// [`fetch_fmts_indexes`] plus the error signal (see [`drive_unit_keys`]): the
-/// forensic counterpart that flags whether any source `Err`ed during the miss.
-fn drive_fmts_indexes(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> FetchOutcome {
-    let mut errored = false;
-    for source in sources {
-        match source.get_fmts_indexes(ctx) {
-            Ok(uks) if !uks.is_empty() => {
-                return FetchOutcome {
-                    keys: uks,
-                    errored: false,
-                };
-            }
-            Ok(_) => {}
-            Err(_) => errored = true,
-        }
-    }
-    FetchOutcome {
-        keys: Vec::new(),
-        errored,
-    }
+    drive_fmts_indexes(sources, ctx).unwrap_or_default()
 }
 
 /// Build the read-time [`crate::sector::KeyFetch`] from the disc's public AACS inputs and a way
@@ -509,8 +550,8 @@ pub fn key_fetch(
 ) -> crate::sector::KeyFetch {
     // One driver behind both operations, memoized per sample-batch fingerprint
     // (keys are disc-level, so repeats hit cache). A genuinely-empty reply is
-    // cached, but a source FAILURE is not — a transient miss (see `errored`).
-    type FetchDriver = fn(&[Box<dyn KeySource>], &dyn ResolveCtx) -> FetchOutcome;
+    // cached, but a source FAILURE is not — it is returned, never memoized.
+    type FetchDriver = fn(&[Box<dyn KeySource>], &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error>;
     fn make_op(
         inputs: DiscInputs,
         make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
@@ -518,7 +559,7 @@ pub fn key_fetch(
     ) -> crate::sector::KeyFetchFn {
         let cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<[u8; 16]>>>> =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        std::sync::Arc::new(move |samples: &[Vec<u8>]| -> Vec<[u8; 16]> {
+        std::sync::Arc::new(move |samples: &[Vec<u8>]| -> Result<Vec<[u8; 16]>, Error> {
             let fp = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -529,7 +570,7 @@ pub fn key_fetch(
                 h.finish()
             };
             if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&fp) {
-                return hit.clone();
+                return Ok(hit.clone());
             }
             let sources = make_sources();
             let mut di = inputs.clone();
@@ -538,18 +579,14 @@ pub fn key_fetch(
             // a V10 disc parses `enc_title_keys` at the 48-byte stride, so
             // hardcoding the V20 stride here would corrupt the derived unit keys.
             let ctx = DiscInputsCtx::new(&di);
-            let outcome = drive(&sources, &ctx);
-            let keys: Vec<[u8; 16]> = outcome.keys.into_iter().map(|u| u.key).collect();
-            // Memoize a positive result always; memoize a NEGATIVE (empty) result
-            // only when it is a genuine absence, never when a source errored — a
-            // transient outage must not permanently poison this fingerprint.
-            if !keys.is_empty() || !outcome.errored {
-                cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(fp, keys.clone());
-            }
-            keys
+            // A source failure propagates un-memoized: a transient outage must not
+            // permanently poison this fingerprint.
+            let keys: Vec<[u8; 16]> = drive(&sources, &ctx)?.into_iter().map(|u| u.key).collect();
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(fp, keys.clone());
+            Ok(keys)
         })
     }
     let unit = make_op(inputs.clone(), make_sources.clone(), drive_unit_keys);
@@ -580,14 +617,19 @@ pub fn read_encrypted_units(
         if total_units == 0 {
             continue;
         }
+        // First unit not yet covered by an earlier probe: on a small extent the
+        // probe windows overlap, and a re-read unit would be a duplicate sample.
+        let mut next_unit = 0u32;
         for p in 1..=PROBES_PER_EXTENT {
             // Probe at p/(P+1) of the extent — spreads P points across it while
             // skipping the clear nav at the very head.
-            let unit = ((total_units as u64 * p as u64) / (PROBES_PER_EXTENT as u64 + 1)) as u32;
+            let probe = ((total_units as u64 * p as u64) / (PROBES_PER_EXTENT as u64 + 1)) as u32;
+            let unit = probe.max(next_unit);
             if unit >= total_units {
                 continue;
             }
             let units_this = CHUNK_UNITS.min(total_units - unit);
+            next_unit = unit + units_this;
             // Saturate: start_lba comes from attacker-controlled UDF/MPLS extents;
             // near u32::MAX it would otherwise panic (debug) or wrap (release).
             // An over-capacity LBA fails cleanly via the is_err() skip below.
@@ -862,8 +904,9 @@ mod tests {
         });
 
         let cb = key_fetch(empty_inputs(), make);
-        let samples = vec![vec![0xEEu8; crate::aacs::content::ALIGNED_UNIT_LEN]];
-        let got = cb.unit_keys(&samples);
+        // A real unit the source's key opens (a key that opens none is skipped).
+        let samples = vec![encrypted_unit(&key)];
+        let got = cb.unit_keys(&samples).unwrap();
         assert_eq!(
             got,
             vec![key],
@@ -894,8 +937,8 @@ mod tests {
         let b = vec![vec![0xBBu8; 8]];
 
         // First resolve for `a` builds sources; the identical repeat is cached.
-        assert_eq!(cb.unit_keys(&a), vec![key]);
-        assert_eq!(cb.unit_keys(&a), vec![key]);
+        assert_eq!(cb.unit_keys(&a).unwrap(), vec![key]);
+        assert_eq!(cb.unit_keys(&a).unwrap(), vec![key]);
         assert_eq!(
             *builds.lock().unwrap(),
             1,
@@ -903,7 +946,7 @@ mod tests {
         );
 
         // A different sample batch is a cache miss → one more build.
-        assert_eq!(cb.unit_keys(&b), vec![key]);
+        assert_eq!(cb.unit_keys(&b).unwrap(), vec![key]);
         assert_eq!(
             *builds.lock().unwrap(),
             2,
@@ -912,13 +955,13 @@ mod tests {
 
         // The forensic op has its OWN cache (HasKey has no forensic keys → empty),
         // so `a` builds once more here; its empty reply is then cached too.
-        assert!(cb.fmts_indexes(&a).is_empty());
+        assert!(cb.fmts_indexes(&a).unwrap().is_empty());
         assert_eq!(
             *builds.lock().unwrap(),
             3,
             "unit/fmts caches are independent"
         );
-        assert!(cb.fmts_indexes(&a).is_empty());
+        assert!(cb.fmts_indexes(&a).unwrap().is_empty());
         assert_eq!(
             *builds.lock().unwrap(),
             3,
@@ -962,15 +1005,16 @@ mod tests {
         let cb = key_fetch(empty_inputs(), make);
         let samples = vec![vec![0xCDu8; 8]];
 
-        // First fetch: the source errors → empty, but the miss must NOT be cached.
-        assert!(
-            cb.unit_keys(&samples).is_empty(),
-            "source down → empty this time"
+        // First fetch: the source errors → reported as a failure, NOT cached.
+        assert_eq!(
+            cb.unit_keys(&samples).expect_err("source down").code(),
+            Error::AacsNoKeys.code(),
+            "source down → its failure, this time"
         );
         // Second fetch, SAME samples: not blocked by a cached empty → the now-
         // recovered source resolves the key.
         assert_eq!(
-            cb.unit_keys(&samples),
+            cb.unit_keys(&samples).unwrap(),
             vec![key],
             "recovered source resolves — errored empty was not memoized"
         );
@@ -1005,8 +1049,8 @@ mod tests {
         let cb = key_fetch(empty_inputs(), make);
         let samples = vec![vec![0xEFu8; 8]];
 
-        assert!(cb.unit_keys(&samples).is_empty());
-        assert!(cb.unit_keys(&samples).is_empty());
+        assert!(cb.unit_keys(&samples).unwrap().is_empty());
+        assert!(cb.unit_keys(&samples).unwrap().is_empty());
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1039,12 +1083,12 @@ mod tests {
         let samples = vec![vec![0x01u8; 4]];
 
         assert_eq!(
-            cb.unit_keys(&samples),
+            cb.unit_keys(&samples).unwrap(),
             vec![BASE],
             "unit_keys resolves the base Unit Key via get_unit_keys"
         );
         assert_eq!(
-            cb.fmts_indexes(&samples),
+            cb.fmts_indexes(&samples).unwrap(),
             vec![F1, F2],
             "fmts_indexes resolves the forensic set (any length) via get_fmts_indexes"
         );
@@ -1055,10 +1099,10 @@ mod tests {
     /// units only). Its `fmts_indexes` is unconditionally empty.
     #[test]
     fn key_fetch_unit_only_never_serves_forensic() {
-        let f = crate::sector::KeyFetch::unit_only(std::sync::Arc::new(|_| vec![[0xAA; 16]]));
-        assert_eq!(f.unit_keys(&[vec![0u8; 4]]), vec![[0xAA; 16]]);
+        let f = crate::sector::KeyFetch::unit_only(std::sync::Arc::new(|_| Ok(vec![[0xAA; 16]])));
+        assert_eq!(f.unit_keys(&[vec![0u8; 4]]).unwrap(), vec![[0xAA; 16]]);
         assert!(
-            f.fmts_indexes(&[vec![0u8; 4]]).is_empty(),
+            f.fmts_indexes(&[vec![0u8; 4]]).unwrap().is_empty(),
             "unit_only resolver yields no forensic keys"
         );
     }
@@ -1447,5 +1491,182 @@ mod tests {
         for s in &samples {
             assert!(aacs_unit_encrypted(s, crate::disc::ContentFormat::BdTs));
         }
+    }
+
+    // ── codeaudit keys cluster ────────────────────────────────────────────────
+
+    // A real encrypted BD-TS unit under `key` (clear TS structure, CPI flag set).
+    fn encrypted_unit(key: &[u8; 16]) -> Vec<u8> {
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut off = 0;
+        while off + 192 <= ALIGNED_UNIT_LEN {
+            u[off + 4] = 0x47;
+            u[off + 5..off + 192].fill(0xAB);
+            off += 192;
+        }
+        u[0] |= 0xC0;
+        assert!(crate::aacs::content::encrypt_unit(&mut u, key));
+        u
+    }
+
+    fn keyless_disc() -> crate::Disc {
+        crate::Disc {
+            volume_id: String::new(),
+            meta_title: None,
+            format: crate::DiscFormat::BluRay,
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            layers: 1,
+            titles: Vec::new(),
+            region: crate::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: crate::ContentFormat::BdTs,
+        }
+    }
+
+    // Read-time fetch: a source whose keys do NOT open the samples must not win —
+    // the next source (holding the right key) is asked.
+    #[test]
+    fn fetch_unit_keys_skips_a_source_whose_keys_do_not_open_the_samples() {
+        let right = [0x21u8; 16];
+        let mut inputs = empty_inputs();
+        inputs.samples = vec![encrypted_unit(&right)];
+        let ctx = DiscInputsCtx::new(&inputs);
+        let sources: Vec<Box<dyn KeySource>> =
+            vec![Box::new(HasKey([0x99; 16])), Box::new(HasKey(right))];
+        let got: Vec<[u8; 16]> = fetch_unit_keys(&sources, &ctx)
+            .into_iter()
+            .map(|u| u.key)
+            .collect();
+        assert_eq!(got, vec![right], "the wrong first key must fall through");
+    }
+
+    // A source FAILURE (no source resolved) surfaces the source's own error from
+    // both read-time ops — not an empty "no key" that reads as key-missing.
+    #[test]
+    fn key_fetch_surfaces_source_failure_from_both_ops() {
+        struct Down;
+        impl KeySource for Down {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Err(Error::KeyServiceUnavailable)
+            }
+            fn get_fmts_indexes(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Err(Error::KeyServiceUnavailable)
+            }
+        }
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> =
+            Arc::new(|| vec![Box::new(EmptySource) as Box<dyn KeySource>, Box::new(Down)]);
+        let cb = key_fetch(empty_inputs(), make);
+        let s = vec![vec![1u8; 4]];
+        let code = Error::KeyServiceUnavailable.code();
+        assert_eq!(cb.unit_keys(&s).expect_err("unit op").code(), code);
+        assert_eq!(cb.fmts_indexes(&s).expect_err("fmts op").code(), code);
+    }
+
+    // Every source produced keys, none opens the samples: that is a rejection
+    // (AacsKeyRejected), not a quiet "no key" — and it is not memoized.
+    #[test]
+    fn key_fetch_reports_all_rejected_keys_and_does_not_cache_it() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_c = Arc::clone(&calls);
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> = Arc::new(move || {
+            *calls_c.lock().unwrap() += 1;
+            vec![Box::new(HasKey([0x99; 16])) as Box<dyn KeySource>]
+        });
+        let cb = key_fetch(empty_inputs(), make);
+        let samples = vec![encrypted_unit(&[0x21; 16])];
+        for _ in 0..2 {
+            let err = cb.unit_keys(&samples).expect_err("wrong key");
+            assert_eq!(err.code(), Error::AacsKeyRejected.code());
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "a rejection is re-asked, not cached"
+        );
+    }
+
+    // HD DVD: `unit_key_ro` carries a VTKF (DVD_HD_V_TKF); the ctx must parse it
+    // with the magic-dispatching parser, not the BD-only Unit_Key_RO layout.
+    #[test]
+    fn disc_inputs_ctx_parses_hddvd_vtkf_title_keys() {
+        use crate::aacs::inf::VTKF_MAGIC;
+        let key = [0x3Cu8; 16];
+        let mut vtkf = Vec::new();
+        vtkf.extend_from_slice(VTKF_MAGIC);
+        vtkf.resize(0x80, 0);
+        let mut entry = [0u8; 0x24];
+        entry[0] = 0x80; // AV_FLG: present
+        entry[4..20].copy_from_slice(&key);
+        vtkf.extend_from_slice(&entry);
+        vtkf.resize(0x80 + 64 * 0x24, 0);
+        let mut inputs = empty_inputs();
+        inputs.version = crate::aacs::mkb::AACS_MAJOR_BD;
+        inputs.unit_key_ro = vtkf;
+        let ctx = DiscInputsCtx::new(&inputs);
+        assert_eq!(ctx.enc_title_keys().unwrap(), &[key]);
+    }
+
+    // A key produced but REJECTED by sample validation leaves its reason on the
+    // disc (AacsKeyRejected) instead of a reasonless "no key".
+    #[test]
+    fn rejected_keys_stamp_the_rejection_reason() {
+        let mut disc = keyless_disc();
+        let mut inputs = empty_inputs();
+        inputs.samples = vec![encrypted_unit(&[0x21; 16])];
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(HasKey([0x99; 16]))];
+        let (ok, _) = resolve_and_apply_traced(&sources, &inputs, &mut disc);
+        assert!(!ok);
+        assert_eq!(
+            disc.aacs_error.as_ref().map(Error::code),
+            Some(Error::AacsKeyRejected.code())
+        );
+    }
+
+    // A small extent's probe windows overlap: each aligned unit must still be
+    // sampled at most once (duplicates dilute the request's evidence).
+    #[test]
+    fn read_encrypted_units_never_returns_the_same_unit_twice() {
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS};
+        struct Stamped;
+        impl crate::sector::SectorSource for Stamped {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _r: bool,
+            ) -> crate::error::Result<usize> {
+                let bytes = count as usize * 2048;
+                for (i, s) in buf[..bytes].chunks_mut(2048).enumerate() {
+                    s.fill(0xC0);
+                    s[8..12].copy_from_slice(&(lba + i as u32).to_be_bytes());
+                }
+                Ok(bytes)
+            }
+        }
+        let units = 30u32;
+        let title = title_with_extents(vec![crate::disc::Extent {
+            start_lba: 900,
+            sector_count: units * ALIGNED_UNIT_SECTORS,
+        }]);
+        let got = read_encrypted_units(&mut Stamped, &title, 1000);
+        let mut lbas: Vec<u32> = got
+            .iter()
+            .map(|u| {
+                assert_eq!(u.len(), ALIGNED_UNIT_LEN);
+                u32::from_be_bytes([u[8], u[9], u[10], u[11]])
+            })
+            .collect();
+        let n = lbas.len();
+        lbas.sort_unstable();
+        lbas.dedup();
+        assert_eq!(lbas.len(), n, "no unit may be sampled twice");
+        assert!(n as u32 <= units);
     }
 }

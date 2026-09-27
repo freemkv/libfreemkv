@@ -15,10 +15,26 @@ use super::types::*;
 /// terminal PK), use [`derive_media_key_from_dk`] instead — only that path
 /// walks the Subset-Difference tree.
 pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Option<[u8; 16]> {
-    let mk_dv = mkb_find_mk_dv(mkb)?;
-    let uvs = mkb_find_subdiff_records(mkb)?;
-    let cvalues = mkb_find_cvalues(mkb)?;
-    try_pk_against_tables(processing_keys, &uvs, &cvalues, &mk_dv)
+    let t = MkbTables::parse(mkb)?;
+    try_pk_against_tables(processing_keys, t.uvs, t.cvalues, &t.mk_dv)
+}
+
+// The three MKB tables every DK/PK derivation reads, located once and BORROWED
+// from the MKB (the cvalue table alone is MBs on a UHD MKB).
+pub(crate) struct MkbTables<'a> {
+    mk_dv: [u8; 16],
+    uvs: &'a [u8],
+    cvalues: &'a [u8],
+}
+
+impl<'a> MkbTables<'a> {
+    pub(crate) fn parse(mkb: &'a [u8]) -> Option<Self> {
+        Some(Self {
+            mk_dv: mkb_find_mk_dv(mkb)?,
+            uvs: find_record_slice(mkb, REC_SUBSET_DIFFERENCE)?,
+            cvalues: find_record_slice(mkb, REC_MEDIA_KEY_DATA)?,
+        })
+    }
 }
 
 // Core terminal-PK table scan: each PK tried directly against every (uv, cvalue) pair, no tree
@@ -160,9 +176,12 @@ pub fn derive_media_key_and_pk_from_dk(
     mkb: &[u8],
     device_keys: &[DeviceKey],
 ) -> Option<([u8; 16], [u8; 16])> {
-    let mk_dv = mkb_find_mk_dv(mkb)?;
-    let uvs = mkb_find_subdiff_records(mkb)?;
-    let cvalues = mkb_find_cvalues(mkb)?;
+    dk_walk(&MkbTables::parse(mkb)?, device_keys)
+}
+
+// The subset-difference DK walk over already-located tables.
+fn dk_walk(t: &MkbTables<'_>, device_keys: &[DeviceKey]) -> Option<([u8; 16], [u8; 16])> {
+    let (mk_dv, uvs, cvalues) = (&t.mk_dv, t.uvs, t.cvalues);
 
     // Count UV entries
     let num_uvs = uvs
@@ -215,7 +234,7 @@ pub fn derive_media_key_and_pk_from_dk(
                     if uvs_idx < cvalues.len() / 16 {
                         let cv = &cvalues[uvs_idx * 16..(uvs_idx + 1) * 16];
                         if let Some(mk) =
-                            validate_processing_key(&pk, cv, &uvs[1 + uvs_idx * 5..], &mk_dv)
+                            validate_processing_key(&pk, cv, &uvs[1 + uvs_idx * 5..], mk_dv)
                         {
                             return Some((mk, pk));
                         }
@@ -236,9 +255,8 @@ pub fn derive_media_key_and_pk_from_dk(
 /// [`DeviceKey`] ready to bank and reuse on every future disc via
 /// [`derive_media_key_from_dk`]. `None` if the key does not apply to this MKB.
 pub fn recover_dk_position(mkb: &[u8], key: &[u8; 16]) -> Option<DeviceKey> {
-    let mk_dv = mkb_find_mk_dv(mkb)?;
-    let uvs = mkb_find_subdiff_records(mkb)?;
-    let cvalues = mkb_find_cvalues(mkb)?;
+    let t = MkbTables::parse(mkb)?;
+    let (mk_dv, uvs, cvalues) = (t.mk_dv, t.uvs, t.cvalues);
     let num_uvs = uvs
         .chunks(5)
         .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
@@ -300,9 +318,9 @@ pub(crate) fn resolve_dk_node(
     uv: u32,
     u_mask_shift: u8,
 ) -> Option<DeviceKey> {
-    // `u_mask_shift` is disc/keydb-controlled: `1u32 << b` with b >= 32 panics
-    // (debug) / wraps (release), so cap the search at the 32 real u32 bit positions
-    // (same >= 32 guard the mask shifts above use) — a bad disc can't trip the shift.
+    // `u_mask_shift` is disc/keydb-controlled: cap at the 32 real u32 bit positions
+    // so `1u32 << b` can't overflow. Tables are located once, not per candidate node.
+    let tables = MkbTables::parse(mkb);
     for b in 0..u_mask_shift.min(32) {
         let dk = DeviceKey {
             key: *key,
@@ -310,7 +328,10 @@ pub(crate) fn resolve_dk_node(
             uv,
             u_mask_shift,
         };
-        if derive_media_key_from_dk(mkb, std::slice::from_ref(&dk)).is_some() {
+        if tables
+            .as_ref()
+            .is_some_and(|t| dk_walk(t, std::slice::from_ref(&dk)).is_some())
+        {
             return Some(dk);
         }
     }
@@ -336,15 +357,13 @@ pub mod probe {
         super::mkb_find_mk_dv(mkb)
     }
 
-    /// Body of the MKB's Subset-Difference Index record (type 0x04).
+    /// Body of the MKB's Explicit Subset-Difference record (type 0x04).
     pub fn mkb_subdiff(mkb: &[u8]) -> Option<Vec<u8>> {
         super::mkb_find_subdiff_records(mkb)
     }
 
-    /// Body of the MKB's Media-Key-Data (cvalues) record. Selects record
-    /// `0x05` (the large cvalue table, 1:1 with the `0x04` Subset-Difference
-    /// index on AACS 2.x UHD MKBs), falling back to `0x07` only when `0x05`
-    /// is absent.
+    /// Body of the MKB's Media-Key-Data (cvalues) record `0x05` (1:1 with the
+    /// `0x04` Explicit Subset-Difference list). `0x07` is an index, never read.
     pub fn mkb_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
         super::mkb_find_cvalues(mkb)
     }
@@ -836,6 +855,7 @@ mod resolve_candidate_tests {
 
         let vuk = [0x33u8; 16];
         let boiled = derive_unit_keys(&ukf, &vuk);
+        assert_eq!(boiled.len(), 4, "every CPS unit boils to a key");
         for (i, (num, key)) in boiled.iter().enumerate() {
             assert_eq!(*num, (i + 1) as u32, "CPS number is the 1-based slot index");
             assert_eq!(
@@ -1163,9 +1183,12 @@ mod position_recovery_tests {
     fn resolve_dk_node_does_not_shift_past_u32_on_a_huge_u_mask_shift() {
         // Empty MKB → the inner derive returns None every iteration, so the loop runs
         // its full range; with u_mask_shift = 200 the unguarded loop panics at b = 32.
-        let dk = resolve_dk_node(&[], &[0u8; 16], 0, 200)
+        let dk = resolve_dk_node(&[], &[0u8; 16], 0x0001_2345, 200)
             .expect("must fall back to the node itself, not panic on the shift");
-        assert_eq!(dk.u_mask_shift, 200);
+        assert_eq!(
+            dk.node, 0x2345,
+            "no gating bit → the fallback is uv's own node"
+        );
     }
 
     // probe::mkb_mk_dv feeds km_verifies for reproduction harnesses; a fixed

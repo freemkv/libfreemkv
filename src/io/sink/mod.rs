@@ -43,8 +43,8 @@ pub(crate) fn open_for_mkv(
 ) -> std::io::Result<Box<dyn RandomAccessSink>> {
     #[cfg(target_os = "linux")]
     {
-        use crate::platform::fs_type::{FsType, detect};
-        if detect(dest) == FsType::Nfs {
+        use crate::platform::fs_type::FsType;
+        if classify_dest(dest) == FsType::Nfs {
             let wf = match size_hint {
                 Some(n) => crate::io::WritebackFile::create_with_size_hint(dest, n)?,
                 None => crate::io::WritebackFile::create(dest)?,
@@ -53,10 +53,10 @@ pub(crate) fn open_for_mkv(
         }
     }
     // Only Linux differentiates the sink by filesystem type; other OSes always use
-    // `LocalFileSink`. Reference `detect` as a value (no call/syscall) so it isn't
-    // flagged dead on non-Linux while avoiding a wasted probe.
+    // `LocalFileSink`. Reference `classify_dest` as a value (no call/syscall) so it
+    // isn't flagged dead on non-Linux while avoiding a wasted probe.
     #[cfg(not(target_os = "linux"))]
-    let _ = crate::platform::fs_type::detect;
+    let _ = classify_dest;
 
     let sink = match size_hint {
         Some(n) => LocalFileSink::with_size_hint(dest, n)?,
@@ -65,9 +65,35 @@ pub(crate) fn open_for_mkv(
     Ok(Box::new(sink))
 }
 
+// Filesystem type of the output location. statfs needs an existing path and
+// `dest` usually is not created yet, so probe its directory.
+fn classify_dest(dest: &std::path::Path) -> crate::platform::fs_type::FsType {
+    crate::platform::fs_type::detect(probe_dir(dest))
+}
+
+fn probe_dir(dest: &std::path::Path) -> &std::path::Path {
+    match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `dest` normally does not exist yet, so statfs on it fails (Unknown) and the
+    // NFS branch was unreachable. The classification must come from its directory.
+    #[test]
+    fn classify_dest_probes_the_directory_of_a_new_file() {
+        use std::path::Path;
+        assert_eq!(
+            probe_dir(Path::new("/mnt/nfs/out/Movie.mkv")),
+            Path::new("/mnt/nfs/out")
+        );
+        // A bare file name lives in the current directory.
+        assert_eq!(probe_dir(Path::new("bare.mkv")), Path::new("."));
+    }
 
     // Type-level assertion: the concrete sinks satisfy the trait
     // objects. These functions never run; they just have to type-check.

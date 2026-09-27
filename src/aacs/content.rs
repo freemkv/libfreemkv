@@ -251,12 +251,9 @@ pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
 
 /// Remove bus encryption from an aligned unit (AACS 2.0 / UHD).
 /// Bus encryption uses read_data_key, decrypting bytes 16..2048 of each 2048-byte sector.
-///
-/// Widened from `pub(crate)` to `pub` (behavior unchanged) so an out-of-tree
-/// diagnostic tool can invert AACS 2.0 bus encryption on sampled units after an
-/// OEM host-cert AKE yields the Read Data Key — the same de-bus step the rip
-/// path applies internally.
-pub fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
+/// Test-only unit-granular form; production de-busses via [`decrypt_bus_in_content`].
+#[cfg(test)]
+pub(crate) fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
     // Expand the key schedule ONCE for the whole unit: `read_data_key` is
     // loop-invariant, but per-sector `aes_cbc_decrypt` rebuilt it 3x per unit
     // (~29M redundant expansions over a 90GB read) on the decrypt hot path.
@@ -273,49 +270,13 @@ pub fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
     }
 }
 
-/// Remove bus encryption across a sector-aligned `buf`, gated to the disc's
-/// encrypted-content ranges. `base_lba` is the LBA of `buf`'s first 2048-byte
-/// sector (sector `i` = `base_lba + i`). A sector is de-bussed only when `ranges`
-/// is `None` (content-only caller) or its LBA falls inside a sorted
-/// `(start_lba, sector_count)` range — a clear UDF/nav sector outside content is
-/// left untouched (de-bussing it would corrupt plaintext). Key schedule expanded
-/// once. Single de-bus entry point (see the `sector::bus_removal` module doc).
-pub(crate) fn decrypt_bus_in_content(
-    buf: &mut [u8],
-    read_data_key: &[u8; 16],
-    base_lba: u32,
-    ranges: Option<&[(u32, u32)]>,
-) {
-    debug_assert!(
-        ranges.is_none_or(|rs| rs.windows(2).all(|w| w[0].0 <= w[1].0)),
-        "content ranges must be sorted ascending by start LBA for the binary search"
-    );
-    let in_content = |lba: u32| -> bool {
-        match ranges {
-            None => true,
-            // `rs` is sorted ascending by start and non-overlapping (merged
-            // extents), so binary-search the last range with start <= lba and
-            // test containment — O(log n) per sector, not O(ranges).
-            Some(rs) => {
-                let i = rs.partition_point(|&(start, _)| start <= lba);
-                i > 0 && {
-                    let (start, cnt) = rs[i - 1];
-                    (lba as u64) < start as u64 + cnt as u64
-                }
-            }
-        }
-    };
+/// Remove bus encryption from every whole 2048-byte sector of `buf` (bytes
+/// 16..2048 of each; the first 16 are plaintext on the wire). For content-only
+/// callers; whole-disc readers gate through `sector::bus_removal::BusMap`.
+pub(crate) fn decrypt_bus_sectors(buf: &mut [u8], read_data_key: &[u8; 16]) {
     let cipher = crate::aacs::crypto::new_cipher_for(read_data_key);
-    for (i, sector) in buf.chunks_mut(SECTOR_BYTES).enumerate() {
-        if sector.len() < SECTOR_BYTES {
-            break; // trailing partial sector (never on a whole-sector read)
-        }
-        let lba = base_lba.saturating_add(i as u32);
-        if !in_content(lba) {
-            continue;
-        }
-        // First 16 bytes of each sector are plaintext on the wire.
-        crate::aacs::crypto::cbc_decrypt_blocks(&cipher, &mut sector[16..SECTOR_BYTES]);
+    for sector in buf.as_chunks_mut::<SECTOR_BYTES>().0 {
+        crate::aacs::crypto::cbc_decrypt_blocks(&cipher, &mut sector[16..]);
     }
 }
 

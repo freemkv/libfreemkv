@@ -71,16 +71,8 @@ pub struct FileSectorSource {
     /// Total file size in sectors. Constant after construction;
     /// surfaced via [`SectorSource::capacity_sectors`].
     capacity: u32,
-    /// Bytes read since the last DONTNEED drop. Drives the per-
-    /// [`read_drop_chunk_bytes`] page-cache eviction in read_sectors.
-    bytes_read_since_drop: u64,
-    /// File offset at which the current drop window starts. The next
-    /// DONTNEED drops from `drop_window_start` for
-    /// `bytes_read_since_drop` bytes. This advances monotonically with
-    /// the byte count, so it tracks the actual reads only under the
-    /// forward-sequential access the mux highway uses; under random
-    /// access it degrades to a harmless, imprecise advisory hint.
-    drop_window_start: u64,
+    /// `(start, end)` file range read contiguously and not yet dropped.
+    drop_window: (u64, u64),
     /// Cached drop chunk size (resolved from env once at open).
     drop_chunk_bytes: u64,
 }
@@ -116,8 +108,7 @@ impl FileSectorSource {
         Ok(Self {
             file,
             capacity,
-            bytes_read_since_drop: 0,
-            drop_window_start: 0,
+            drop_window: (0, 0),
             drop_chunk_bytes: read_drop_chunk_bytes(),
         })
     }
@@ -154,9 +145,9 @@ impl SectorSource for FileSectorSource {
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|e| Error::IoError { source: e })?;
-        self.file
-            .read_exact(&mut out[..bytes])
-            .map_err(|e| Error::IoError { source: e })?;
+        if let Err(e) = self.file.read_exact(&mut out[..bytes]) {
+            return Err(self.read_error(e, lba, offset + bytes as u64));
+        }
 
         // Queue the next batch's read before the caller processes what we returned.
         // readahead() is non-blocking; the kernel pulls pages into cache while the
@@ -166,16 +157,55 @@ impl SectorSource for FileSectorSource {
         // Periodic page-cache eviction on the read side: an 85 GB streaming ISO
         // read would otherwise pin the whole file in cache, starving concurrent
         // writes. Mirrors WritebackPipeline's DONTNEED policy on the write side.
-        self.bytes_read_since_drop += bytes as u64;
-        if self.bytes_read_since_drop >= self.drop_chunk_bytes {
-            let drop_start = self.drop_window_start;
-            let drop_len = self.bytes_read_since_drop;
-            platform::drop_window(&self.file, drop_start, drop_len);
-            self.drop_window_start = drop_start + drop_len;
-            self.bytes_read_since_drop = 0;
-        }
+        let file = &self.file;
+        take_drop_window(
+            &mut self.drop_window,
+            self.drop_chunk_bytes,
+            offset,
+            bytes as u64,
+            |start, len| platform::drop_window(file, start, len),
+        );
 
         Ok(bytes)
+    }
+}
+
+impl FileSectorSource {
+    // A short read means the image ends before `want` (a truncated rip), not a dead bus.
+    fn read_error(&self, e: std::io::Error, lba: u32, want: u64) -> Error {
+        if e.kind() != std::io::ErrorKind::UnexpectedEof {
+            return Error::IoError { source: e };
+        }
+        let have = self
+            .file
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(self.capacity as u64 * SECTOR_BYTES_U64);
+        Error::ImageEndsBeforeRead { lba, have, want }
+    }
+}
+
+// Extend the contiguous read window `(start, end)` by `[offset, offset+len)`, calling
+// `drop(start, len)` for each range to evict.
+fn take_drop_window(
+    window: &mut (u64, u64),
+    chunk: u64,
+    offset: u64,
+    len: u64,
+    mut drop: impl FnMut(u64, u64),
+) {
+    if offset != window.1 {
+        // A jump: evict what was read so far, then restart at `offset`.
+        if window.1 > window.0 {
+            drop(window.0, window.1 - window.0);
+        }
+        window.0 = offset;
+    }
+    window.1 = offset.saturating_add(len);
+    let span = window.1 - window.0;
+    if span >= chunk {
+        drop(window.0, span);
+        window.0 = window.1;
     }
 }
 
@@ -184,6 +214,56 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+
+    // The DONTNEED window must cover the bytes actually read. It used to start at
+    // offset 0 and advance by byte count, so a read stream beginning deep in the
+    // image (every title) evicted pages it never read.
+    #[test]
+    fn drop_window_tracks_actual_read_offsets() {
+        let s = SECTOR_BYTES_U64;
+        let mut w = (0, 0);
+        let mut read = |off: u64, len: u64| {
+            let mut dropped = Vec::new();
+            take_drop_window(&mut w, 4 * s, off * s, len * s, |a, l| {
+                dropped.push((a / s, l / s))
+            });
+            dropped
+        };
+        assert_eq!(read(1000, 2), vec![]);
+        assert_eq!(
+            read(1002, 2),
+            vec![(1000, 4)],
+            "must drop what was read, not [0, 4 sectors)"
+        );
+        assert_eq!(read(1004, 2), vec![]);
+        // A jump evicts the partial window before restarting at the new offset.
+        assert_eq!(read(5000, 2), vec![(1004, 2)]);
+        assert_eq!(read(5002, 2), vec![(5000, 4)]);
+        // A jump whose read fills a chunk by itself evicts both ranges.
+        assert_eq!(read(9000, 1), vec![]);
+        assert_eq!(read(20, 4), vec![(9000, 1), (20, 4)]);
+    }
+
+    // Reading past EOF of a truncated image is a typed error carrying the LBA and
+    // end offset, not a bare IoError (classified as a dead-bus failure).
+    #[test]
+    fn read_past_eof_is_image_truncated_not_io_error() {
+        let dir = tempdir().unwrap();
+        let iso = dir.path().join("short.iso");
+        make_iso(&iso, 4);
+        let mut src = FileSectorSource::open(&iso).unwrap();
+        let mut out = vec![0u8; 2 * SECTOR_BYTES];
+        let err = src.read_sectors(3, 2, &mut out, false).unwrap_err();
+        assert!(!err.is_scsi_transport_failure(), "got {err:?}");
+        match err {
+            Error::ImageEndsBeforeRead { lba, have, want } => {
+                assert_eq!(lba, 3);
+                assert_eq!(have, 4 * SECTOR_BYTES_U64);
+                assert_eq!(want, 5 * SECTOR_BYTES_U64);
+            }
+            other => panic!("expected ImageEndsBeforeRead, got {other:?}"),
+        }
+    }
 
     // Undersized `out` must error, not panic: `debug_assert!` alone is compiled out in release,
     // letting `out[..bytes]` panic.
@@ -382,13 +462,11 @@ mod tests {
              only observable proof that no I/O was issued"
         );
         // And the drop-window accounting must not have advanced either.
-        assert_eq!(src.bytes_read_since_drop, 0);
-        assert_eq!(src.drop_window_start, 0);
+        assert_eq!(src.drop_window, (0, 0));
     }
 
-    // Reading past EOF must ERROR (read_exact's UnexpectedEof), never a
-    // partial/short count — the "never silently truncate" SectorSource
-    // contract, backed by read_exact failing on a short span.
+    // Reading past EOF must ERROR, never a partial/short count — the "never
+    // silently truncate" SectorSource contract, backed by read_exact failing.
     #[test]
     fn read_past_eof_errors_not_truncates() {
         let dir = tempdir().unwrap();
@@ -401,11 +479,10 @@ mod tests {
         let mut buf = vec![0u8; 2 * SECTOR_BYTES];
         let r = src.read_sectors(3, 2, &mut buf, false);
         let err = r.expect_err("reading past EOF must error, not short-read");
-        let io: std::io::Error = err.into();
         assert_eq!(
-            io.kind(),
-            std::io::ErrorKind::UnexpectedEof,
-            "partial read at EOF must surface read_exact's UnexpectedEof"
+            err.code(),
+            crate::error::E_IMAGE_ENDS_BEFORE_READ,
+            "partial read at EOF must surface as a truncated image"
         );
     }
 

@@ -1070,3 +1070,52 @@ fn a_multi_clip_playlist_produces_feed_spans_that_tile_the_feed() {
         "the spans must cover exactly the feed, or a byte offset lands in the wrong clip"
     );
 }
+
+// ── Disc::read_structure_files (info --share) ───────────────────────────────
+
+/// A Stop during the file reads is a cancellation, not "file missing".
+#[test]
+fn read_structure_files_propagates_halt() {
+    use crate::sector::SectorSource;
+    use std::collections::HashSet;
+
+    // Records every LBA read while parsing the filesystem; later reads of any other
+    // LBA (the file data) are answered with Halted.
+    struct HaltOnData<'a> {
+        inner: &'a mut DirImage,
+        seen: HashSet<u32>,
+        recording: bool,
+    }
+    impl SectorSource for HaltOnData<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if self.recording {
+                self.seen.extend(lba..lba + count as u32);
+            } else if !self.seen.contains(&lba) {
+                return Err(crate::error::Error::Halted);
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    let (s, _, _) = bdmv_scratch();
+    let mut img = DirImage::open(s.path()).unwrap();
+    let mut rec = HaltOnData {
+        inner: &mut img,
+        seen: HashSet::new(),
+        recording: true,
+    };
+    udf::read_filesystem(&mut rec).unwrap();
+    rec.recording = false;
+    let res = crate::disc::Disc::read_structure_files(&mut rec);
+    assert!(
+        matches!(res, Err(crate::error::Error::Halted)),
+        "got {:?}",
+        res.map(|f| f.len())
+    );
+}

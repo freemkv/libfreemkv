@@ -25,6 +25,14 @@ use windows as platform;
 /// bytes are already synced and the caller's write itself succeeded. No-op on
 /// Windows (see module docs).
 pub fn dir(path: &Path) {
+    if let Err(e) = dir_checked(path) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to fsync directory");
+    }
+}
+
+/// Like [`dir`] but returns the failure, for callers whose success claim
+/// depends on a new directory entry being durable. `Ok` on Windows.
+pub fn dir_checked(path: &Path) -> io::Result<()> {
     platform::fsync_dir(path)
 }
 
@@ -70,5 +78,13 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         dir(td.path());
         dir(&td.path().join("does-not-exist"));
+    }
+
+    #[test]
+    fn dir_checked_reports_failure() {
+        let td = tempfile::tempdir().unwrap();
+        assert!(dir_checked(td.path()).is_ok());
+        #[cfg(not(windows))]
+        assert!(dir_checked(&td.path().join("does-not-exist")).is_err());
     }
 }

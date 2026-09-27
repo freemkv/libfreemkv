@@ -12,12 +12,13 @@
 
 /// Type-and-Version — carries the 32-bit MKBType / AACS generation.
 pub(crate) const REC_TYPE_AND_VERSION: u8 = 0x10;
-/// Subset-Difference index — the per-slot `(u_mask_shift, uv)` table.
+/// Explicit Subset-Difference — the per-slot `(u_mask_shift, uv)` table.
 pub(crate) const REC_SUBSET_DIFFERENCE: u8 = 0x04;
 /// Media Key Data — the classical (1.0 / 2.0) per-subset cvalue table.
 pub(crate) const REC_MEDIA_KEY_DATA: u8 = 0x05;
-/// Explicit Subset-Difference — the smaller cvalue table some MKBs use.
-pub(crate) const REC_EXPLICIT_SUBSET_DIFF: u8 = 0x07;
+/// Subset-Difference Index — a search index into `0x04`, NOT a cvalue table.
+#[cfg(test)]
+pub(crate) const REC_SUBSET_DIFFERENCE_INDEX: u8 = 0x07;
 /// Media Key Variant Data (AACS 2.1) — the per-subset-difference `C` table
 /// (one 16-byte C per slot); the `Kmp` step reads C from HERE, not `0x2d`.
 pub(crate) const REC_MEDIA_KEY_VARIANT_DATA: u8 = 0x0c;
@@ -93,11 +94,9 @@ pub(crate) fn mkb_find_body(records: &[MkbRecord], rec_type: u8) -> Option<&[u8]
 
 /// AACS protection generation a disc carries.
 ///
-/// The content cert byte distinguishes V10 (`0x00`) from V20 (`0x01`). V21
-/// cannot be detected from the cert alone — a V21 disc carries a V20 cert
-/// and is upgraded to `V21` only after the MKB walk turns up the real Variant
-/// records `0x2d` / `0x2f` (Encrypted Media Key Variant Data and the Variant
-/// Key Data table).
+/// The content cert type byte distinguishes V10 (`0x00`) from V20 (`0x10`; any
+/// non-zero, see [`super::inf::parse_content_cert`]). A V21 disc carries a V20
+/// cert and is upgraded to `V21` only when the MKB has Variant records `0x2d`/`0x2f`.
 ///
 /// Key-storage stride in `Unit_Key_RO.inf` is 48 bytes for V10 and 64
 /// bytes for V20 / V21.
@@ -183,25 +182,27 @@ pub(crate) fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
 
 /// Find Subset-Difference records (type 0x04) in MKB. `[C]` §3.2.5.1.5.
 pub(crate) fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
-    find_record_body(mkb, 0x04)
+    find_record_body(mkb, REC_SUBSET_DIFFERENCE)
 }
 
 // Find the Media Key Data Record (cvalues table) in an MKB. `[C]` §3.2.4 / §3.2.5.1.7. 0x05 is
-// the canonical cvalue table on both AACS 1.0 and 2.x; 0x07 is a smaller fallback only.
+// the only cvalue table (libaacs `mkb_cvalues`); 0x07 is the Subset-Difference Index.
 pub(crate) fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
-    if let Some(body) = find_record_body(mkb, 0x05) {
-        return Some(body);
-    }
-    find_record_body(mkb, 0x07)
+    find_record_body(mkb, REC_MEDIA_KEY_DATA)
 }
 
 /// Walk an MKB and return the payload (header stripped) of the first
 /// record matching `rec_type`. Returns `None` if no such record exists or
 /// the record is empty.
 pub(crate) fn find_record_body(mkb: &[u8], rec_type_wanted: u8) -> Option<Vec<u8>> {
+    find_record_slice(mkb, rec_type_wanted).map(<[u8]>::to_vec)
+}
+
+// Borrowing form of [`find_record_body`]: the body in place, no copy.
+pub(crate) fn find_record_slice(mkb: &[u8], rec_type_wanted: u8) -> Option<&[u8]> {
     mkb_records(mkb)
         .find(|&(_, rt, len)| rt == rec_type_wanted && len > 4)
-        .map(|(o, _, len)| mkb[o + 4..o + len].to_vec())
+        .map(|(o, _, len)| &mkb[o + 4..o + len])
 }
 
 /// Real content length of an MKB: the byte offset where the record stream

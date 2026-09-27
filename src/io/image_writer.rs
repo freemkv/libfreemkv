@@ -35,7 +35,26 @@ pub fn write_image(
     dest: &Path,
     total_sectors: u32,
     halt: &Halt,
+    on_progress: impl FnMut(u64),
+) -> Result<u64> {
+    write_image_with(
+        reader,
+        dest,
+        total_sectors,
+        halt,
+        on_progress,
+        crate::io::fsync::dir_checked,
+    )
+}
+
+// `sync_dir` is a seam so tests can make the parent-directory fsync fail.
+fn write_image_with(
+    reader: &mut dyn SectorSource,
+    dest: &Path,
+    total_sectors: u32,
+    halt: &Halt,
     mut on_progress: impl FnMut(u64),
+    sync_dir: fn(&Path) -> std::io::Result<()>,
 ) -> Result<u64> {
     if total_sectors == 0 {
         return Err(Error::EmptyImage);
@@ -79,6 +98,12 @@ pub fn write_image(
     })?;
     file.sync_all()
         .map_err(|source| Error::IoError { source })?;
+    // The file was just created: its directory entry needs its own fsync.
+    let dir = match dest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    sync_dir(dir).map_err(|source| Error::IoError { source })?;
     Ok(written)
 }
 
@@ -122,6 +147,25 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("fmkv-image-writer-{name}-{}", std::process::id()));
         p
+    }
+
+    // A failing parent-directory fsync must fail write_image, not report Ok.
+    #[test]
+    fn failed_parent_directory_fsync_is_an_error() {
+        let td = tempfile::tempdir().unwrap();
+        let mut src = PatternSource {
+            sectors: 4,
+            short_after: None,
+        };
+        let res = write_image_with(
+            &mut src,
+            &td.path().join("x.iso"),
+            4,
+            &Halt::new(),
+            |_| {},
+            |_| Err(std::io::Error::from(std::io::ErrorKind::Other)),
+        );
+        assert!(matches!(res, Err(Error::IoError { .. })), "{res:?}");
     }
 
     /// The written image is byte-for-byte what the source presented, at the

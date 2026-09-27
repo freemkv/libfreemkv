@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- `sector::KeyFetchFn`, `KeyFetch::unit_keys` and `KeyFetch::fmts_indexes` return `Result`: a key-source failure or an all-rejected reply is an `Err`, not an empty key set.
+- `css::CrackOutcome` is `#[non_exhaustive]` and gains `Halted` and `Unreadable(Error)`; it no longer derives `Clone`.
+- `Disc::decrypt_keys_for_title` takes a halt token and returns `Result`.
+- `aacs::content::decrypt_bus` is no longer public.
+
+### Added
+
+- `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
+
 ## [1.7.7] — 2026-09-26
 
 ### Maintenance

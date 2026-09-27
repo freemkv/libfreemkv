@@ -545,6 +545,20 @@ fn merged_extents<'a>(extents: impl Iterator<Item = &'a Extent>) -> Vec<(u32, u3
     crate::udf::merge_ranges(&ranges)
 }
 
+// The whole-disc bus map: every stream file, plus title extents no stream file
+// covers as content of unknown unit alignment (always de-bussed).
+fn bus_map(
+    files: Vec<Vec<(Option<u32>, u32)>>,
+    titles: &[DiscTitle],
+) -> crate::sector::bus_removal::BusMap {
+    let unknown: Vec<(u32, u32)> = titles
+        .iter()
+        .flat_map(|t| &t.extents)
+        .map(|e| (e.start_lba, e.sector_count))
+        .collect();
+    crate::sector::bus_removal::BusMap::new(files, &unknown)
+}
+
 // Corrects a title's TrueHD channels/sample-rate/Atmos by probing the first decrypted major
 // sync (`reader` must yield DECRYPTED sectors: mux time, not scan).
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
@@ -1648,12 +1662,18 @@ impl Disc {
         // READ CAPACITY is the sole authoritative whole-disc size (the UDF partition
         // is a subset — 288 sectors short on a real BD, truncating the backup anchor).
         // Its sporadic failures are ridden out by `read_capacity_retrying` (0 on hard fail).
-        let capacity = Self::read_capacity_retrying(session);
+        let capacity = Self::read_capacity_retrying(session)?;
+        let (buffered, udf_fs) = Self::open_udf(session)?;
+        Ok((capacity, buffered, udf_fs))
+    }
+
+    // UDF filesystem + metadata-prefetched reader, without the READ CAPACITY step.
+    fn open_udf(session: &mut Drive) -> Result<(udf::BufferedSectorReader<'_>, udf::UdfFs)> {
         let batch = detect_max_batch_sectors(session.device_path());
         let mut buffered = udf::BufferedSectorReader::new(session, batch);
         let udf_fs = udf::read_filesystem(&mut buffered)?;
         buffered.prefetch(udf_fs.metadata_start(), udf_fs.metadata_sectors());
-        Ok((capacity, buffered, udf_fs))
+        Ok((buffered, udf_fs))
     }
 
     /// Number of READ CAPACITY attempts before giving up. The command answers
@@ -1675,27 +1695,42 @@ impl Disc {
     /// comfortably inside a cold spin-up + one re-enumeration.
     const READ_CAPACITY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// READ CAPACITY with retry. Returns the hardware sector count, or 0 if every
-    /// attempt failed. It is the only authoritative whole-disc size for an image and its
-    /// failures are sporadic (a transient USB/UAS + spin-up fault), so ride one out with
-    /// exponential backoff rather than substitute a UDF partition size (a subset that
-    /// would truncate the image). No readiness poke: the only ready helper
-    /// (`Drive::wait_ready`) is a ~30s TUR loop that would blow this budget, and a cheap
-    /// single-shot TUR is out of scope. A final 0 keeps the shared scan/identify/MKV path
-    /// lenient (titles read by extent); image output makes it a hard [`Error::EmptyImage`] via `image_read_sectors`.
-    fn read_capacity_retrying(session: &mut Drive) -> u32 {
+    /// READ CAPACITY with retry: the hardware sector count, or 0 once retries are
+    /// exhausted or the drive refuses deterministically (`read_capacity_is_permanent`).
+    /// It is the only authoritative whole-disc size (a UDF partition size would
+    /// truncate an image), and its field failures are sporadic, so they are ridden out
+    /// with exponential backoff. A 0 keeps scan/identify/MKV lenient; imaging turns it
+    /// into [`Error::EmptyImage`] via `image_read_sectors`. A Stop ([`Error::Halted`],
+    /// including one during a backoff sleep) is returned, never retried.
+    fn read_capacity_retrying(session: &mut Drive) -> Result<u32> {
+        Self::read_capacity_retrying_with(session, |d, t| {
+            crate::drive::sleep_until_halted(&d.halt_flag(), t)
+        })
+    }
+
+    // `sleep` is the backoff wait (injectable for tests); it returns Halted on a Stop.
+    fn read_capacity_retrying_with(
+        session: &mut Drive,
+        mut sleep: impl FnMut(&Drive, std::time::Duration) -> Result<()>,
+    ) -> Result<u32> {
         let mut backoff = Self::READ_CAPACITY_BACKOFF_START;
         for attempt in 1..=Self::READ_CAPACITY_ATTEMPTS {
             match Self::read_capacity(session) {
-                Ok(sectors) => return sectors,
-                Err(e) if attempt == Self::READ_CAPACITY_ATTEMPTS => {
+                Ok(sectors) => return Ok(sectors),
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(e)
+                    if attempt == Self::READ_CAPACITY_ATTEMPTS
+                        || Self::read_capacity_is_permanent(&e) =>
+                {
+                    let permanent = Self::read_capacity_is_permanent(&e);
                     tracing::warn!(
                         target: "freemkv::scan",
                         error = %e,
-                        attempts = Self::READ_CAPACITY_ATTEMPTS,
-                        "READ CAPACITY failed after all retries; disc capacity unavailable (image/ISO output disabled; scan/identify/MKV read by extent and continue)"
+                        attempts = attempt,
+                        reason = if permanent { "permanent" } else { "retries_exhausted" },
+                        "READ CAPACITY gave up; disc capacity unavailable (image/ISO output disabled; scan/identify/MKV read by extent and continue)"
                     );
-                    return 0;
+                    return Ok(0);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1705,12 +1740,20 @@ impl Disc {
                         backoff_ms = backoff.as_millis() as u64,
                         "READ CAPACITY failed; retrying after backoff"
                     );
-                    std::thread::sleep(backoff);
+                    sleep(session, backoff)?;
                     backoff = (backoff * 2).min(Self::READ_CAPACITY_BACKOFF_CAP);
                 }
             }
         }
-        0
+        Ok(0)
+    }
+
+    // Retrying cannot change these: the drive rejects the command, or has no medium.
+    fn read_capacity_is_permanent(e: &Error) -> bool {
+        e.scsi_sense().is_some_and(|s| {
+            s.sense_key == crate::scsi::SENSE_KEY_ILLEGAL_REQUEST
+                || (s.sense_key == crate::scsi::SENSE_KEY_NOT_READY && s.asc == 0x3A)
+        })
     }
 
     /// Scan a disc — parse filesystem, playlists, streams, and set up AACS
@@ -1732,7 +1775,18 @@ impl Disc {
             Self::do_handshake(session, opts)
         };
         tracing::info!(target: "freemkv::scan", handshake = handshake.is_some(), "phase: handshake done");
+        Self::scan_after_handshake(session, handshake, handshake_error, opts)
+    }
 
+    // Everything in `scan` after the AACS handshake; split out so the bus wiring is
+    // testable against a mock transport with a synthetic handshake.
+    fn scan_after_handshake(
+        session: &mut Drive,
+        handshake: Option<encrypt::HandshakeResult>,
+        handshake_error: Option<Error>,
+        opts: &ScanOptions,
+    ) -> Result<Self> {
+        let firmware_unlocked = session.unlocker_name().is_some();
         // Request max read speed — removes riplock on DVD
         // (BD/UHD speed is set by drive unlock/init, but DVD needs explicit SET CD SPEED)
         session.set_speed(0xFFFF);
@@ -1776,7 +1830,15 @@ impl Disc {
 
         // The AACS bus stage is decided ONCE from the handshake result, captured
         // before `handshake` is moved into `scan_with` (see `BusStage`).
-        let bus_key = handshake.as_ref().and_then(|h| h.read_data_key);
+        let bus_key = Self::bus_key_for_disc(
+            &mut buffered,
+            &udf_fs,
+            handshake.as_ref().and_then(|h| h.read_data_key),
+        );
+        let stream_files = match bus_key {
+            Some(_) => Self::stream_file_extents(&mut buffered, &udf_fs),
+            None => Vec::new(),
+        };
 
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
         let disc = Self::scan_with(
@@ -1784,6 +1846,7 @@ impl Disc {
             capacity,
             handshake,
             handshake_error,
+            firmware_unlocked,
             opts,
             udf_fs,
         )?;
@@ -1792,7 +1855,7 @@ impl Disc {
         // Wire the SINGLE de-bus point onto the drive from the handshake result,
         // BEFORE the caller samples keys or muxes (the earlier UDF/metadata reads
         // ran under default Passthrough).
-        Self::wire_bus_removal(session, bus_key, disc.encrypted_content_ranges());
+        Self::wire_bus_removal(session, bus_key, bus_map(stream_files, &disc.titles));
 
         // No CSS key recovery at scan time: DVD CSS keys are per-title and are
         // re-cracked keylessly at read/decrypt time (`disc.css` stays unset),
@@ -1801,23 +1864,92 @@ impl Disc {
         Ok(disc)
     }
 
+    // Drops the Read Data Key when the content cert's BEE flag is clear (AACS spec;
+    // libaacs gates on `bee && bec`). An unreadable cert keeps the key. HD DVD
+    // CONTENT_CERT.AACS BEE semantics are unverified; the same rule applies.
+    pub(crate) fn bus_key_for_disc(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        read_data_key: Option<[u8; 16]>,
+    ) -> Option<[u8; 16]> {
+        read_data_key?;
+        let bee = crate::aacs::read_first(
+            &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
+            |p| udf_fs.read_file(reader, p),
+        )
+        .ok()
+        .as_deref()
+        .and_then(crate::aacs::inf::parse_content_cert)
+        .map(|c| c.bus_encryption);
+        if bee == Some(false) {
+            tracing::info!(target: "freemkv::scan", "content cert BEE=0: bus removal off");
+            return None;
+        }
+        read_data_key
+    }
+
+    /// The AACS stream files' sectors (every file under `/BDMV/STREAM`: m2ts,
+    /// SSIF, fmts) as sorted, merged `(start_lba, sector_count)` ranges — the
+    /// whole-disc encrypted-content map, unlike the title-only
+    /// [`Self::encrypted_content_ranges`]. Reads the UDF tree from `reader`.
+    pub fn stream_content_ranges(reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
+        let udf_fs = udf::read_filesystem(reader)?;
+        let files = Self::stream_file_extents(reader, &udf_fs);
+        Ok(crate::sector::bus_removal::BusMap::new(files, &[]).covered_ranges())
+    }
+
+    // Extents, in file order, of every file under /BDMV/STREAM (the AACS Clip AV
+    // stream files); an unrecorded extent is a `None` hole that keeps file offsets.
+    pub(crate) fn stream_file_extents(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+    ) -> Vec<Vec<(Option<u32>, u32)>> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&udf::DirEntry> = udf_fs.find_dir("/BDMV/STREAM").into_iter().collect();
+        while let Some(dir) = stack.pop() {
+            for e in &dir.entries {
+                if e.is_dir {
+                    stack.push(e);
+                    continue;
+                }
+                match udf_fs.extents_abs_at(reader, e.meta_lba) {
+                    Ok(exts) => out.push(
+                        exts.iter()
+                            .filter(|x| x.len > 0)
+                            .map(|x| {
+                                let n = (x.len as u64).div_ceil(2048) as u32;
+                                (x.recorded.then_some(x.lba), n)
+                            })
+                            .collect(),
+                    ),
+                    Err(err) => tracing::warn!(
+                        target: "freemkv::scan",
+                        file = %e.name,
+                        code = err.code(),
+                        "stream file extents unreadable; excluded from bus removal"
+                    ),
+                }
+            }
+        }
+        out
+    }
+
     /// Wire the SINGLE AACS bus-removal de-bus point onto `session` from a
     /// completed handshake. The cert-route Read Data Key (`bus_key`, `None` on
-    /// the firmware/vendor route) picks the `BusStage`; the encrypted-content
-    /// ranges gate it. ALWAYS install the ranges even when empty: `None` means
-    /// "de-bus every sector", `Some([])` means "de-bus none" — so a host-key disc
-    /// that parsed zero content extents fails SAFE (untouched) instead of de-bussing
-    /// clear UDF/nav bytes to garbage. Extracted from [`Self::scan`] so it is
-    /// unit-testable without a live SCSI handshake.
+    /// the firmware/vendor route) picks the `BusStage`; the stream-file bus map
+    /// gates it. ALWAYS install the map even when empty: no map means "de-bus
+    /// every sector", an empty map means "de-bus none" — so a host-key disc with
+    /// no stream files fails SAFE (untouched) instead of de-bussing clear UDF/nav
+    /// bytes to garbage.
     pub(crate) fn wire_bus_removal(
         session: &mut Drive,
         bus_key: Option<[u8; 16]>,
-        content_ranges: Vec<(u32, u32)>,
+        map: crate::sector::bus_removal::BusMap,
     ) {
         session.set_bus_stage(crate::sector::bus_removal::BusStage::from_read_data_key(
             bus_key,
         ));
-        session.set_bus_content_ranges(std::sync::Arc::from(content_ranges.into_boxed_slice()));
+        session.set_bus_map(std::sync::Arc::new(map));
     }
 
     // The extents an image-time CSS crack scans, in the crate's CANONICAL order (main feature's
@@ -1842,7 +1974,7 @@ impl Disc {
         opts: &ScanOptions,
     ) -> Result<Self> {
         let udf_fs = udf::read_filesystem(reader)?;
-        let mut disc = Self::scan_with(reader, capacity, None, None, opts, udf_fs)?;
+        let mut disc = Self::scan_with(reader, capacity, None, None, false, opts, udf_fs)?;
 
         // CSS for a raw (still-scrambled) DVD image: recover the title key via
         // known-plaintext crack (no SCSI auth needed). Gated on `DiscFormat::Dvd`,
@@ -1854,7 +1986,7 @@ impl Disc {
             let main_extents = Self::image_crack_extents(&disc.titles).to_vec();
             if !main_extents.is_empty() {
                 // Image reads aren't drive-batch-limited; use a generous batch.
-                match crate::css::crack_key_outcome(reader, &main_extents, 32, None) {
+                match crate::css::crack_key_outcome(reader, &main_extents, 32, opts.halt.as_ref()) {
                     crate::css::CrackOutcome::Cracked(state) => {
                         tracing::info!(target: "freemkv::scan", "image css: title key recovered via known-plaintext crack");
                         disc.css = Some(state);
@@ -1869,6 +2001,12 @@ impl Disc {
                         disc.css_error = Some(crate::error::Error::CssKeyMissing);
                     }
                     crate::css::CrackOutcome::Unencrypted => {}
+                    crate::css::CrackOutcome::Halted => return Err(Error::Halted),
+                    // No verdict, but the image stays listable: the per-title crack
+                    // (the mux always re-cracks) reports the read fault for that title.
+                    crate::css::CrackOutcome::Unreadable(e) => {
+                        tracing::warn!(target: "freemkv::scan", code = e.code(), "image css: crack extent unreadable");
+                    }
                 }
             }
         }
@@ -1972,40 +2110,44 @@ impl Disc {
     /// `PLAYLIST/*.mpls`, `CLIPINF/*.clpi`, `BDJO/*.bdjo`, `META/DL/*.xml`, DVD
     /// `VIDEO_TS/*.IFO`. No audio/video essence and no AACS keys are read, so the
     /// result is safe to share in a bug report (a few hundred KB); missing files
-    /// are skipped and empty = no readable structure. Powers `freemkv info …
-    /// --share` over any [`SectorSource`] (drive, ISO, `dir://`) — issue #45.
+    /// are skipped. Capped at 8192 files / 64 MiB; unsafe disc names are dropped; a
+    /// Stop returns [`Error::Halted`]. Powers `freemkv info … --share` (issue #45).
     pub fn read_structure_files(reader: &mut dyn SectorSource) -> Result<Vec<(String, Vec<u8>)>> {
+        // Aggregate caps: a crafted image can list thousands of large files.
+        const MAX_FILES: usize = 8192;
+        const MAX_BYTES: u64 = 64 * 1024 * 1024;
+
         let udf_fs = udf::read_filesystem(reader)?;
-        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
 
-        // Read one named file into `out` under `rel`, skipping if absent.
-        let mut grab = |udf_fs: &udf::UdfFs, reader: &mut dyn SectorSource, rel: &str| {
-            if let Ok(bytes) = udf_fs.read_file(reader, &format!("/{rel}")) {
-                out.push((rel.to_string(), bytes));
+        // `(rel, declared size, ICB)` of the plain-named files in `dir` matching `pred`, sorted.
+        // Of case variants keep the first in directory order: the one a read resolves to,
+        // and the only one a case-insensitive host can hold.
+        let list = |dir: &str, pred: &dyn Fn(&str) -> bool| -> Vec<(String, u64, u32)> {
+            let mut seen = std::collections::HashSet::new();
+            let mut v: Vec<(String, u64, u32)> = udf_fs
+                .find_dir(&format!("/{dir}"))
+                .map(|d| {
+                    d.entries
+                        .iter()
+                        .filter(|e| !e.is_dir && is_plain_file_name(&e.name) && pred(&e.name))
+                        .filter(|e| seen.insert(e.name.to_ascii_lowercase()))
+                        .map(|e| (format!("{dir}/{}", e.name), e.size, e.meta_lba))
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+
+        // Nav files are bundled under their canonical names, whatever the disc casing.
+        let mut wanted = Vec::new();
+        for top in ["index.bdmv", "MovieObject.bdmv"] {
+            if let Some((_, size, icb)) =
+                list("BDMV", &|n: &str| n.eq_ignore_ascii_case(top)).first()
+            {
+                wanted.push((format!("BDMV/{top}"), *size, *icb));
             }
-        };
-
-        // Top-level BD nav files.
-        grab(&udf_fs, reader, "BDMV/index.bdmv");
-        grab(&udf_fs, reader, "BDMV/MovieObject.bdmv");
-
-        // List a directory's files by extension first (immutable borrow of
-        // udf_fs), then read them (needs &mut reader) — so the directory borrow
-        // is released before the reads. Sorted for deterministic bundles.
-        let list = |udf_fs: &udf::UdfFs, dir: &str, ext: &str| -> Vec<String> {
-            let mut names: Vec<String> = match udf_fs.find_dir(&format!("/{dir}")) {
-                Some(d) => d
-                    .entries
-                    .iter()
-                    .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(ext))
-                    .map(|e| e.name.clone())
-                    .collect(),
-                None => Vec::new(),
-            };
-            names.sort();
-            names
-        };
-
+        }
         for (dir, ext) in [
             ("BDMV/PLAYLIST", ".mpls"),
             ("BDMV/CLIPINF", ".clpi"),
@@ -2013,11 +2155,38 @@ impl Disc {
             ("BDMV/META/DL", ".xml"),
             ("VIDEO_TS", ".ifo"),
         ] {
-            for name in list(&udf_fs, dir, ext) {
-                grab(&udf_fs, reader, &format!("{dir}/{name}"));
-            }
+            wanted.extend(list(dir, &|n: &str| n.to_ascii_lowercase().ends_with(ext)));
         }
 
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut total: u64 = 0;
+        let mut omitted: usize = 0;
+        let wanted_count = wanted.len();
+        for (i, (rel, size, icb)) in wanted.into_iter().enumerate() {
+            if out.len() >= MAX_FILES {
+                omitted += wanted_count - i;
+                break;
+            }
+            if total.saturating_add(size) > MAX_BYTES {
+                omitted += 1;
+                continue;
+            }
+            // Bounded by the declared size, so a lying ICB cannot exceed the budget.
+            let read = FileReadAhead::new(reader, &udf_fs, icb).and_then(|mut ra| {
+                udf_fs.read_file_prefix(&mut ra, &format!("/{rel}"), size as usize)
+            });
+            match read {
+                Ok(bytes) => {
+                    total += bytes.len() as u64;
+                    out.push((rel, bytes));
+                }
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(_) => {} // unreadable file: skipped, as when absent
+            }
+        }
+        if omitted > 0 {
+            tracing::warn!(target: "freemkv::scan", omitted, files = out.len(), bytes = total, "structure bundle caps reached; files omitted");
+        }
         Ok(out)
     }
 
@@ -2027,7 +2196,8 @@ impl Disc {
     /// [`Disc::decrypt_with`]. These files are plaintext UDF metadata — no
     /// AACS handshake or keys are required to read them.
     pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>, u8)> {
-        let (_, mut reader, udf_fs) = Self::read_udf(drive)?;
+        // No READ CAPACITY: the key files do not need the disc size.
+        let (mut reader, udf_fs) = Self::open_udf(drive)?;
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
@@ -2039,6 +2209,7 @@ impl Disc {
         capacity: u32,
         handshake: Option<HandshakeResult>,
         handshake_error: Option<Error>,
+        firmware_unlocked: bool,
         opts: &ScanOptions,
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
@@ -2053,11 +2224,26 @@ impl Disc {
             // Lookup-free: capture the disc's AACS inputs (MKB, VID, Unit_Key_RO.inf)
             // but resolve no key — the caller resolves one and applies it via
             // `Disc::decrypt_with`; until then the disc reports "encrypted, no keys".
-            match Self::resolve_vid_only(&udf_fs, reader, handshake.as_ref()) {
-                Ok(state) => (Some(state), None),
-                // A handshake failure (no VID) is more actionable than the
-                // generic capture error, so surface it when present.
-                Err(e) => (None, Some(handshake_error.unwrap_or(e))),
+            let source = encrypt::BusSource::classify(
+                handshake.as_ref(),
+                handshake_error.is_some(),
+                firmware_unlocked,
+            );
+            match Self::resolve_vid_only(&udf_fs, reader, source) {
+                Ok(state) => {
+                    let err =
+                        encrypt::aacs_scan_error(state.bus_encryption, source, handshake_error);
+                    (Some(state), err)
+                }
+                // The capture error is surfaced, except that a handshake-class failure
+                // is kept: it is what makes `bus_blocked_error` refuse keys fail-safe.
+                Err(e) => match handshake_error {
+                    Some(h) if encrypt::handshake_class_error(&h).is_some() => {
+                        tracing::warn!(target: "freemkv::scan", capture_error = e.code(), handshake_error = h.code(), "AACS inputs unreadable after a failed handshake");
+                        (None, Some(h))
+                    }
+                    _ => (None, Some(e)),
+                },
             }
         };
 
@@ -2511,7 +2697,7 @@ impl Disc {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        let result = session.scsi_execute(
+        let result = session.checked_exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
@@ -2625,12 +2811,147 @@ fn aligned_unit_keys_validate(
     true
 }
 
+// Read-ahead confined to one file's recorded extents: a single-sector read inside an
+// extent fetches up to a batch of THAT extent only (never adjacent essence). Other
+// single reads (the ICB) are memoised; the caller's `recovery` flag is forwarded.
+struct FileReadAhead<'a> {
+    inner: &'a mut dyn SectorSource,
+    extents: Vec<(u32, u32)>,
+    cache: Vec<u8>,
+    cache_lba: u32,
+    cached: u32,
+    // After a failed batch, read the rest of the file sector by sector.
+    batching: bool,
+    last: Option<(u32, Box<[u8; 2048]>)>,
+}
+
+impl<'a> FileReadAhead<'a> {
+    const BATCH: u32 = DEFAULT_BATCH_SECTORS_OPTICAL as u32;
+
+    fn new(inner: &'a mut dyn SectorSource, fs: &udf::UdfFs, icb: u32) -> Result<Self> {
+        let mut ra = Self {
+            inner,
+            extents: Vec::new(),
+            cache: Vec::new(),
+            cache_lba: 0,
+            cached: 0,
+            batching: true,
+            last: None,
+        };
+        // No extent list (e.g. ICB-embedded data) just means no read-ahead.
+        ra.extents = match fs.extents_abs_at(&mut ra, icb) {
+            Ok(v) => v
+                .into_iter()
+                .filter(|e| e.recorded)
+                .map(|e| (e.lba, (e.len as u64).div_ceil(2048) as u32))
+                .collect(),
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => Vec::new(),
+        };
+        Ok(ra)
+    }
+
+    fn read_one(&mut self, lba: u32, buf: &mut [u8], recovery: bool) -> Result<usize> {
+        if let Some((at, data)) = &self.last
+            && *at == lba
+        {
+            buf[..2048].copy_from_slice(&data[..]);
+            return Ok(2048);
+        }
+        self.inner.read_sectors(lba, 1, buf, recovery)?;
+        let mut data = Box::new([0u8; 2048]);
+        data.copy_from_slice(&buf[..2048]);
+        self.last = Some((lba, data));
+        Ok(2048)
+    }
+}
+
+impl SectorSource for FileReadAhead<'_> {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> Result<usize> {
+        if count != 1 || buf.len() < 2048 {
+            return self.inner.read_sectors(lba, count, buf, recovery);
+        }
+        if lba >= self.cache_lba && lba - self.cache_lba < self.cached {
+            let off = (lba - self.cache_lba) as usize * 2048;
+            buf[..2048].copy_from_slice(&self.cache[off..off + 2048]);
+            return Ok(2048);
+        }
+        let left = self
+            .extents
+            .iter()
+            .find(|&&(start, n)| lba >= start && lba - start < n)
+            .map(|&(start, n)| n - (lba - start));
+        let want = if self.batching {
+            left.unwrap_or(1).min(Self::BATCH)
+        } else {
+            1
+        };
+        self.cached = 0;
+        if want <= 1 {
+            return self.read_one(lba, buf, recovery);
+        }
+        self.cache.resize(want as usize * 2048, 0);
+        match self
+            .inner
+            .read_sectors(lba, want as u16, &mut self.cache, recovery)
+        {
+            Ok(_) => {
+                self.cache_lba = lba;
+                self.cached = want;
+                buf[..2048].copy_from_slice(&self.cache[..2048]);
+                Ok(2048)
+            }
+            Err(Error::Halted) => Err(Error::Halted),
+            // A bad sector later in the batch must not fail this one: retry it alone.
+            Err(_) => {
+                self.batching = false;
+                self.read_one(lba, buf, recovery)
+            }
+        }
+    }
+}
+
+// A disc-supplied name safe to use as one path component on any host (incl. Windows).
+fn is_plain_file_name(name: &str) -> bool {
+    if name.is_empty() || name.ends_with('.') || name.ends_with(' ') {
+        return false; // also rejects "." and ".."
+    }
+    if name.chars().any(|c| {
+        matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') || c.is_control()
+    }) {
+        return false;
+    }
+    // Windows reserved device names, matched on the stem with trailing spaces ignored.
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let stem = stem.to_ascii_uppercase();
+    let numbered = |p: &str| {
+        stem.strip_prefix(p).is_some_and(|d| {
+            let mut c = d.chars();
+            matches!(
+                (c.next(), c.next()),
+                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+            )
+        })
+    };
+    !(matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered("COM")
+        || numbered("LPT"))
+}
+
 impl Disc {
     /// Sector count for a whole-disc image read (`disc:// → iso://` / raw
     /// image), validated non-zero.
     ///
-    /// `capacity_sectors` is 0 only when both READ CAPACITY and the UDF
-    /// partition-size fallback failed (see `read_udf`). Imaging paths size their
+    /// `capacity_sectors` is 0 only when READ CAPACITY failed on every retry
+    /// (see `read_capacity_retrying`). Imaging paths size their
     /// read domain through this accessor so that empty case is a hard
     /// [`Error::EmptyImage`], not a silent 0-byte ISO reported as success;
     /// scan/identify/MKV paths read the field directly and stay lenient.
@@ -2700,14 +3021,11 @@ impl Disc {
         ))
     }
 
-    /// The disc's AACS-encrypted content as a sorted, merged, disjoint set of
-    /// `(start_lba, sector_count)` ranges — the union of every title's m2ts
-    /// stream extents. The authoritative "which sectors are encrypted" map:
-    /// a sector is encrypted content **iff** it falls inside one of these
-    /// ranges; everything else (UDF filesystem, BDMV nav, PLAYLIST/CLIPINF)
-    /// is always clear. The in-read decrypt-verify gate uses this so it never
-    /// mistakes non-content bytes (no TS sync) for ciphertext. Empty when the
-    /// disc has no parsed titles; callers fall back to "no content gate".
+    /// The scanned titles' encrypted content as a sorted, merged, disjoint set
+    /// of `(start_lba, sector_count)` ranges — the union of every title's
+    /// stream extents. Covers kept titles ONLY: stream files no title plays
+    /// are absent, so this is not a whole-disc map (the live drive's bus gate
+    /// also covers every `/BDMV/STREAM` file). Empty when no titles parsed.
     pub fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
         merged_extents(self.titles.iter().flat_map(|t| &t.extents))
     }
@@ -2744,10 +3062,16 @@ impl Disc {
                     "freemkv" => prep == Some("freemkv"),
                     "LD" => prep == Some("LD"),
                     "Renesas" => prep == Some("Renesas"),
-                    // The AACS host-cert route removed the bus ONLY when NO
-                    // firmware route did (stock or Renesas drive) AND AACS state
-                    // was actually obtained.
-                    "AACS" => self.aacs.is_some() && !fw_removed_bus,
+                    // The AACS host-cert route did work only when NO firmware route
+                    // ran, its handshake yielded a VID, and no handshake error stands.
+                    "AACS" => {
+                        self.aacs.as_ref().is_some_and(|a| a.volume_id != [0u8; 16])
+                            && !fw_removed_bus
+                            && !self
+                                .aacs_error
+                                .as_ref()
+                                .is_some_and(|e| encrypt::handshake_class_error(e).is_some())
+                    }
                     // DVD read-unlock (CSS bus-auth) runs for EVERY DVD during scan
                     // and isn't tracked separately, so this reports the MEDIUM
                     // engaged, not a per-rip success bit — failures surface downstream.
@@ -2804,8 +3128,14 @@ impl Disc {
                 // E7017 vs E7022 split: with derivation material but no VID, report
                 // `AacsVidUnavailable`, not generic `NoDiscKey`. Likewise a key SOURCE
                 // failure surfaces as ITSELF, else operators hunt a VUK during an outage.
+                if let Some(e) = self
+                    .aacs_error
+                    .as_ref()
+                    .and_then(encrypt::handshake_class_error)
+                {
+                    return Err(e);
+                }
                 match self.aacs_error {
-                    Some(Error::AacsVidUnavailable) => return Err(Error::AacsVidUnavailable),
                     Some(Error::KeyServiceUnavailable) => {
                         return Err(Error::KeyServiceUnavailable);
                     }
@@ -2834,22 +3164,25 @@ impl Disc {
     /// PLAYBACK ORDER (never largest-cell-first, the 1.5.1 bug). The crack path does NOT gate
     /// on `self.css`, so a detection miss can never route the mux into raw passthrough of
     /// scrambled sectors. Non-DVD schemes return [`Self::decrypt_keys`] unchanged.
+    /// `halt` cancels the crack. `Err` is a crack that reached no verdict: `Halted`,
+    /// or the read error when no sector could be read.
     pub fn decrypt_keys_for_title(
         &self,
         idx: usize,
         reader: &mut dyn SectorSource,
         batch_sectors: u16,
-    ) -> (crate::decrypt::DecryptKeys, bool) {
+        halt: Option<&crate::halt::Halt>,
+    ) -> Result<(crate::decrypt::DecryptKeys, bool)> {
         // Non-DVD (AACS / FMTS / genuinely unencrypted): disc-wide keys, unchanged.
         if self.format != DiscFormat::Dvd {
-            return (self.decrypt_keys(), false);
+            return Ok((self.decrypt_keys(), false));
         }
         let title = match self.titles.get(idx) {
             Some(t) if !t.extents.is_empty() => t,
             // No extents to crack from: mark it clear (`true`). Returning `false`
             // would let the gate's "None keys + not clear = scrambled-uncracked"
             // rule wrongly hard-fail a genuinely-unencrypted extentless title.
-            _ => return (self.decrypt_keys(), true),
+            _ => return Ok((self.decrypt_keys(), true)),
         };
         // Fast path: reuse the scan's cracked key if its span covers this title's
         // VTS. `crack_span: None` (unknown provenance) is treated as covering.
@@ -2862,31 +3195,35 @@ impl Disc {
                     .any(|e| e.start_lba < ce && cs < e.start_lba.saturating_add(e.sector_count)),
             };
             if covers {
-                return (
+                return Ok((
                     crate::decrypt::DecryptKeys::Css {
                         title_key: css.title_key,
                     },
                     false,
-                );
+                ));
             }
         }
         // Detection miss or different VTS: crack this title's own extents in a
         // SINGLE scan, in playback order (never largest-cell-first — the 1.5.1
         // garbage bug). One call, so a locked title isn't re-hammered (rule #2).
-        match crate::css::crack_key_outcome(reader, &title.extents, batch_sectors, None) {
-            crate::css::CrackOutcome::Cracked(state) => (
-                crate::decrypt::DecryptKeys::Css {
-                    title_key: state.title_key,
-                },
-                false,
-            ),
-            // Scrambled but no key recoverable → hard failure.
-            crate::css::CrackOutcome::ScrambledUncracked => {
-                (crate::decrypt::DecryptKeys::None, false)
-            }
-            // No scrambled sector anywhere in the whole title → genuinely clear.
-            crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
-        }
+        Ok(
+            match crate::css::crack_key_outcome(reader, &title.extents, batch_sectors, halt) {
+                crate::css::CrackOutcome::Cracked(state) => (
+                    crate::decrypt::DecryptKeys::Css {
+                        title_key: state.title_key,
+                    },
+                    false,
+                ),
+                // Scrambled but no key recoverable → hard failure.
+                crate::css::CrackOutcome::ScrambledUncracked => {
+                    (crate::decrypt::DecryptKeys::None, false)
+                }
+                // No scrambled sector anywhere in the whole title → genuinely clear.
+                crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
+                crate::css::CrackOutcome::Unreadable(e) => return Err(e),
+                crate::css::CrackOutcome::Halted => return Err(Error::Halted),
+            },
+        )
     }
 
     /// Per-title decrypt gate that honours the `title_is_clear` verdict from
@@ -2929,7 +3266,10 @@ impl Disc {
 
     // Injects pre-resolved AACS unit keys into a scanned disc — the deferred-mux/resume path
     // (keys from the mapfile's `# freemkv-uk:` header).
-    pub(crate) fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) {
+    pub(crate) fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) -> Result<()> {
+        if let Some(e) = self.bus_blocked_error() {
+            return Err(e);
+        }
         if let Some(aacs) = self.aacs.as_mut() {
             aacs.unit_keys = keys;
             aacs.key_source = KeyOrigin::ExternalUk;
@@ -2957,6 +3297,7 @@ impl Disc {
             // keyless on the stale error.
             self.aacs_error = None;
         }
+        Ok(())
     }
 
     /// The public AACS inputs for this disc, for a [`crate::KeySource`] to look
@@ -2986,6 +3327,36 @@ impl Disc {
         })
     }
 
+    /// [`Self::inputs`] with `samples` filled: up to `n` encrypted units read via
+    /// `reader` from the main feature, so a key source's answer can be validated
+    /// against real ciphertext. `None` for a disc with no AACS inputs.
+    pub fn inputs_with_samples(
+        &self,
+        reader: &mut dyn SectorSource,
+        n: usize,
+    ) -> Option<crate::keysource::DiscInputs> {
+        let mut inputs = self.inputs()?;
+        inputs.samples = self.content_samples(reader, n);
+        Some(inputs)
+    }
+
+    // Encrypted sample units from the main feature (see `main_title`).
+    pub(crate) fn content_samples(&self, reader: &mut dyn SectorSource, n: usize) -> Vec<Vec<u8>> {
+        self.main_title()
+            .map(|t| crate::keysource::read_encrypted_units(reader, t, n))
+            .unwrap_or_default()
+    }
+
+    // The LARGEST title that HAS video (skips size-inflated streamless decoys on
+    // some obfuscated UHDs); the largest title outright when none has video.
+    pub(crate) fn main_title(&self) -> Option<&DiscTitle> {
+        self.titles
+            .iter()
+            .filter(|t| t.has_probable_video())
+            .max_by_key(|t| t.size_bytes)
+            .or_else(|| self.titles.iter().max_by_key(|t| t.size_bytes))
+    }
+
     /// Apply a caller-resolved [`Key`] so [`Self::decrypt_keys`] yields usable
     /// decryption state. **Lookup-free**: the caller does all resolution and
     /// hands the key in here. For [`Key::Unit`] this is the deferred-mux /
@@ -2995,6 +3366,9 @@ impl Disc {
     /// rejected key (`Err(AacsKeyRejected)`) falls through to the caller's
     /// next candidate. Pass `&[]` to skip validation (resume / mapfile cache).
     pub fn decrypt_with(&mut self, key: Key, samples: &[Vec<u8>]) -> Result<()> {
+        if let Some(e) = self.bus_blocked_error() {
+            return Err(e);
+        }
         // Samples arrive already de-bussed (drive's single bus-removal point), so
         // validation needs no bus key. Resolve the key DOWN to candidate unit keys
         // WITHOUT committing — a wrong higher key is rejected before it poisons state.
@@ -3081,7 +3455,7 @@ impl Disc {
             }
             // A Unit key for an AACS disc whose scan built no state (keyless
             // scan, no keydb): synthesize a minimal ExternalUk state.
-            None => self.inject_unit_keys(candidate_unit_keys),
+            None => self.inject_unit_keys(candidate_unit_keys)?,
         }
         // A prior scan-time resolution error (e.g. keyless scan) is now moot.
         self.aacs_error = None;
@@ -3365,6 +3739,125 @@ mod tests {
         );
     }
 
+    // An operator Stop during scan_image's CSS crack must end the scan as Halted —
+    // the token in `opts.halt` has to reach the crack, not a hardcoded `None`.
+    #[test]
+    fn scan_image_css_crack_honours_the_halt_token() {
+        use crate::udf::fixture::*;
+        // Cancels the token on the first read inside the crack extent.
+        struct StopInVob<'a> {
+            inner: &'a mut MemDisc,
+            halt: crate::halt::Halt,
+        }
+        impl SectorSource for StopInVob<'_> {
+            fn capacity_sectors(&self) -> u32 {
+                self.inner.capacity_sectors()
+            }
+            fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], r: bool) -> Result<usize> {
+                if lba >= 9010 {
+                    self.halt.cancel();
+                }
+                self.inner.read_sectors(lba, c, b, r)
+            }
+        }
+        let vts = dvd_vts_bytes(1000, 10, 200); // a ~190-sector clear extent
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, dvd_vmg_bytes(), true),
+                    file_with("VTS_01_0.IFO", 62, 6000, vts, true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let halt = crate::halt::Halt::new();
+        let opts = ScanOptions {
+            halt: Some(halt.clone()),
+            ..ScanOptions::default()
+        };
+        let mut src = StopInVob {
+            inner: &mut disc,
+            halt,
+        };
+        let err = Disc::scan_image(&mut src, 500_000, &opts).expect_err("stopped mid-crack");
+        assert_eq!(err.code(), Error::Halted.code());
+    }
+
+    // A truncated DVD ISO whose feature lies past EOF: the scan still lists it, and
+    // the per-title crack reports the read fault, never a missing CSS key.
+    #[test]
+    fn scan_image_unreadable_crack_extent_reports_the_read_error() {
+        use crate::udf::fixture::*;
+        struct Truncated<'a>(&'a mut MemDisc);
+        impl SectorSource for Truncated<'_> {
+            fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], r: bool) -> Result<usize> {
+                if lba >= 9010 {
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.0.read_sectors(lba, c, b, r)
+            }
+        }
+        let vts = dvd_vts_bytes(1000, 10, 200);
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, dvd_vmg_bytes(), true),
+                    file_with("VTS_01_0.IFO", 62, 6000, vts, true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let mut src = Truncated(&mut disc);
+        let scanned = Disc::scan_image(&mut src, 500_000, &ScanOptions::default())
+            .expect("an unreadable crack extent must not make the image unlistable");
+        assert!(scanned.css.is_none() && scanned.css_error.is_none());
+        let title = &scanned.titles[0];
+        let read_fault = Error::DiscRead {
+            sector: title.extents[0].start_lba as u64,
+            status: None,
+            sense: None,
+        };
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        let err = crate::css::resolve_dvd_title_key(
+            &mut src,
+            &title.extents,
+            &mut keys,
+            32,
+            title.content_format,
+            false,
+            None,
+        )
+        .expect_err("the per-title crack reports the fault");
+        assert_eq!(
+            err.to_string(),
+            std::io::Error::from(read_fault).to_string()
+        );
+    }
+
     // An HD-DVD image is also MPEG-PS but must NEVER enter the CSS crack.
     // The HD-DVD clip's own extent carries a genuinely crackable CSS sector,
     // so if the gate wrongly let the crack run, `disc.css` would be `Some`.
@@ -3547,7 +4040,7 @@ mod tests {
             inner: &mut disc,
             clip_reads: 0,
         };
-        let res = Disc::scan_with(&mut reader, 3_997_952, None, None, &opts, udf);
+        let res = Disc::scan_with(&mut reader, 3_997_952, None, None, false, &opts, udf);
         let clip_reads = reader.clip_reads;
 
         assert!(
@@ -3589,7 +4082,16 @@ mod tests {
         // Sanity: the same disc scans clean when nothing is cancelled, so a
         // pass below cannot be some unrelated failure wearing Halted.
         assert!(
-            Disc::scan_with(&mut disc, 500_000, None, None, &ScanOptions::default(), udf).is_ok(),
+            Disc::scan_with(
+                &mut disc,
+                500_000,
+                None,
+                None,
+                false,
+                &ScanOptions::default(),
+                udf
+            )
+            .is_ok(),
             "fixture must scan successfully when not cancelled"
         );
 
@@ -3600,7 +4102,7 @@ mod tests {
             halt: Some(halt),
             ..Default::default()
         };
-        let res = Disc::scan_with(&mut disc, 500_000, None, None, &opts, udf);
+        let res = Disc::scan_with(&mut disc, 500_000, None, None, false, &opts, udf);
         assert!(
             matches!(res, Err(Error::Halted)),
             "a cancelled BD scan must say so; returning a title list built \
@@ -3637,7 +4139,16 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         assert!(
-            Disc::scan_with(&mut disc, 500_000, None, None, &ScanOptions::default(), udf).is_ok(),
+            Disc::scan_with(
+                &mut disc,
+                500_000,
+                None,
+                None,
+                false,
+                &ScanOptions::default(),
+                udf
+            )
+            .is_ok(),
             "fixture must scan successfully when not cancelled"
         );
 
@@ -3648,7 +4159,7 @@ mod tests {
             halt: Some(halt),
             ..Default::default()
         };
-        let res = Disc::scan_with(&mut disc, 500_000, None, None, &opts, udf);
+        let res = Disc::scan_with(&mut disc, 500_000, None, None, false, &opts, udf);
         assert!(
             matches!(res, Err(Error::Halted)),
             "a cancelled DVD scan must say so, not hand back whatever it had \
@@ -3692,6 +4203,7 @@ mod tests {
             3_997_952,
             None,
             None,
+            false,
             &ScanOptions::default(),
             udf,
         );
@@ -3719,6 +4231,7 @@ mod tests {
             CAPACITY_SECTORS,
             None,
             None,
+            false,
             &ScanOptions::default(),
             udf,
         )
@@ -3746,6 +4259,7 @@ mod tests {
             CAPACITY_SECTORS,
             None,
             None,
+            false,
             &ScanOptions::default(),
             udf,
         )
@@ -5409,7 +5923,10 @@ mod tests {
             fail_first: 2,
             last_lba: 9_997_279,
         }));
-        assert_eq!(Disc::read_capacity_retrying(&mut drive), 9_997_280);
+        assert_eq!(
+            Disc::read_capacity_retrying(&mut drive).expect("capacity"),
+            9_997_280
+        );
     }
 
     #[test]
@@ -5436,7 +5953,7 @@ mod tests {
         }
 
         let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(AlwaysEmpty));
-        let capacity = Disc::read_capacity_retrying(&mut drive);
+        let capacity = Disc::read_capacity_retrying(&mut drive).expect("not halted");
         assert_eq!(
             capacity, 0,
             "exhausted retries must yield 0, not a bad value"
@@ -5464,6 +5981,596 @@ mod tests {
             matches!(disc.image_read_sectors(), Err(Error::EmptyImage)),
             "capacity 0 must block imaging with EmptyImage, got {:?}",
             disc.image_read_sectors()
+        );
+    }
+
+    // READ CAPACITY transport that counts attempts and answers every one with `err`.
+    struct CountingCapacityFail {
+        calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        err: fn() -> Error,
+    }
+    impl crate::scsi::ScsiTransport for CountingCapacityFail {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: crate::scsi::DataDirection,
+            _buf: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::error::Result<crate::scsi::ScsiResult> {
+            if cdb[0] == crate::scsi::SCSI_READ_CAPACITY {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err((self.err)());
+            }
+            Ok(crate::scsi::ScsiResult {
+                status: 0,
+                sense: [0u8; 32],
+                bytes_transferred: 0,
+            })
+        }
+    }
+
+    fn capacity_fail_drive(
+        err: fn() -> Error,
+    ) -> (Drive, std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let drive = Drive::from_transport_for_test(Box::new(CountingCapacityFail {
+            calls: calls.clone(),
+            err,
+        }));
+        (drive, calls)
+    }
+
+    // A Stop requested before the scan must not be ridden out as a flaky READ CAPACITY.
+    #[test]
+    fn read_udf_honours_halt_before_read_capacity() {
+        let (mut drive, calls) = capacity_fail_drive(|| Error::ScsiError {
+            opcode: crate::scsi::SCSI_READ_CAPACITY,
+            status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        });
+        drive.halt();
+        let t0 = std::time::Instant::now();
+        let res = Disc::read_udf(&mut drive).map(|_| ());
+        assert!(matches!(res, Err(Error::Halted)), "got {res:?}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a halted drive must not issue READ CAPACITY"
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    // ILLEGAL REQUEST is deterministic: retrying it only burns the backoff budget.
+    #[test]
+    fn read_capacity_does_not_retry_illegal_request() {
+        let (mut drive, calls) = capacity_fail_drive(|| Error::ScsiError {
+            opcode: crate::scsi::SCSI_READ_CAPACITY,
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_ILLEGAL_REQUEST,
+                asc: 0x20,
+                ascq: 0,
+            }),
+        });
+        let _ = Disc::read_udf(&mut drive).map(|_| ());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // NOT READY / MEDIUM NOT PRESENT (asc 0x3A) will not clear within the retry budget.
+    #[test]
+    fn read_capacity_does_not_retry_medium_not_present() {
+        let (mut drive, calls) = capacity_fail_drive(|| Error::ScsiError {
+            opcode: crate::scsi::SCSI_READ_CAPACITY,
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_NOT_READY,
+                asc: 0x3A,
+                ascq: 0,
+            }),
+        });
+        let _ = Disc::read_udf(&mut drive).map(|_| ());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // A Stop that lands during the backoff sleep ends the retry loop as Halted.
+    #[test]
+    fn read_capacity_stop_during_backoff_is_halted() {
+        let (mut drive, calls) = capacity_fail_drive(|| Error::ScsiError {
+            opcode: crate::scsi::SCSI_READ_CAPACITY,
+            status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        });
+        let halt = drive.halt_flag();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            halt.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let t0 = std::time::Instant::now();
+        let res = Disc::read_udf(&mut drive).map(|_| ());
+        let _ = stopper.join();
+        assert!(matches!(res, Err(Error::Halted)), "got {res:?}");
+        // The Stop can land before or after the second attempt on a loaded runner.
+        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) <= 2);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    // Deterministic: a Stop raised as the backoff sleep begins ends the loop before the
+    // next attempt.
+    #[test]
+    fn read_capacity_stop_before_backoff_prevents_next_attempt() {
+        let (mut drive, calls) = capacity_fail_drive(|| Error::ScsiError {
+            opcode: crate::scsi::SCSI_READ_CAPACITY,
+            status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        });
+        let res = Disc::read_capacity_retrying_with(&mut drive, |d, t| {
+            d.halt();
+            crate::drive::sleep_until_halted(&d.halt_flag(), t)
+        });
+        assert!(matches!(res, Err(Error::Halted)), "got {res:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // The key files do not need the disc size: no READ CAPACITY (and no retry budget).
+    #[test]
+    fn read_aacs_inputs_from_drive_issues_no_read_capacity() {
+        let (mut drive, calls) = capacity_fail_drive(|| Error::ScsiError {
+            opcode: crate::scsi::SCSI_READ_CAPACITY,
+            status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        });
+        let _ = Disc::read_aacs_inputs_from_drive(&mut drive);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    // In-memory BDMV tree for read_structure_files: `bdmv` files at /BDMV, plus
+    // PLAYLIST / CLIPINF / BDJO subdirectories.
+    fn structure_image(
+        bdmv: Vec<udf::fixture::FileSpec>,
+        playlist: Vec<udf::fixture::FileSpec>,
+        clipinf: Vec<udf::fixture::FileSpec>,
+        bdjo: Vec<udf::fixture::FileSpec>,
+    ) -> udf::fixture::MemDisc {
+        use udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, lay_dir};
+        let sub = |name: &str, icb: u32, files| DirSpec {
+            name: name.into(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs: vec![],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![],
+            subdirs: vec![DirSpec {
+                name: "BDMV".into(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: bdmv,
+                subdirs: vec![
+                    sub("PLAYLIST", 30, playlist),
+                    sub("CLIPINF", 40, clipinf),
+                    sub("BDJO", 50, bdjo),
+                ],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        lay_dir(&mut disc, &root);
+        build_udf_skeleton(&mut disc, 10);
+        disc
+    }
+
+    // Counts inner read commands, to prove per-file reads are coalesced.
+    struct CountingSource<'a> {
+        inner: &'a mut udf::fixture::MemDisc,
+        calls: usize,
+    }
+    impl SectorSource for CountingSource<'_> {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            self.calls += 1;
+            self.inner.read_sectors(lba, count, buf, r)
+        }
+    }
+
+    // A 64-sector CLPI must not cost 64 single-sector commands.
+    #[test]
+    fn read_structure_files_batches_file_reads() {
+        use udf::fixture::file_with;
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![file_with(
+                "00000.clpi",
+                100,
+                1000,
+                vec![9; 64 * 2048],
+                false,
+            )],
+            vec![],
+        );
+        let mut baseline = CountingSource {
+            inner: &mut disc,
+            calls: 0,
+        };
+        udf::read_filesystem(&mut baseline).expect("fs");
+        let fs_calls = baseline.calls;
+        let mut src = CountingSource {
+            inner: &mut disc,
+            calls: 0,
+        };
+        let files = Disc::read_structure_files(&mut src).expect("structure");
+        assert_eq!(files.len(), 1);
+        let file_calls = src.calls.saturating_sub(fs_calls);
+        assert!(
+            file_calls < 16,
+            "{file_calls} read commands for a 64-sector file"
+        );
+    }
+
+    // Read-ahead must stay inside the file: sectors right after a small structure file
+    // are essence (possibly scrambled) and must never be requested.
+    #[test]
+    fn read_structure_files_read_ahead_stays_inside_the_file() {
+        use udf::fixture::{PART_START, file_with};
+        struct Fenced<'a> {
+            inner: &'a mut udf::fixture::MemDisc,
+            touched_fence: usize,
+        }
+        impl SectorSource for Fenced<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                r: bool,
+            ) -> Result<usize> {
+                let fence = PART_START + 1003..PART_START + 1100;
+                if lba < fence.end && lba + count as u32 > fence.start {
+                    self.touched_fence += 1;
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.inner.read_sectors(lba, count, buf, r)
+            }
+        }
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![file_with("00000.clpi", 100, 1000, vec![5; 3 * 2048], false)],
+            vec![],
+        );
+        let mut src = Fenced {
+            inner: &mut disc,
+            touched_fence: 0,
+        };
+        let files = Disc::read_structure_files(&mut src).expect("structure");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1.len(), 3 * 2048);
+        assert_eq!(
+            src.touched_fence, 0,
+            "read-ahead spilled past the file extent"
+        );
+    }
+
+    // The read-ahead forwards the caller's recovery flag instead of forcing it on.
+    #[test]
+    fn file_read_ahead_forwards_recovery_flag() {
+        use udf::fixture::{PART_START, file_with};
+        struct Flags<'a> {
+            inner: &'a mut udf::fixture::MemDisc,
+            forced: bool,
+        }
+        impl SectorSource for Flags<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                r: bool,
+            ) -> Result<usize> {
+                // Only file data; the ICB lookup is udf's own read.
+                self.forced |= r && lba >= udf::fixture::PART_START + 1000;
+                self.inner.read_sectors(lba, count, buf, r)
+            }
+        }
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![file_with("00000.clpi", 100, 1000, vec![5; 3 * 2048], false)],
+            vec![],
+        );
+        let fs = udf::read_filesystem(&mut disc).expect("fs");
+        let icb = fs.find_dir("/BDMV/CLIPINF").expect("dir").entries[0].meta_lba;
+        let mut src = Flags {
+            inner: &mut disc,
+            forced: false,
+        };
+        let mut ra = FileReadAhead::new(&mut src, &fs, icb).expect("extents");
+        let mut buf = [0u8; 2048];
+        ra.read_sectors(PART_START + 1000, 1, &mut buf, false)
+            .expect("read");
+        drop(ra);
+        assert!(!src.forced, "recovery was forced on");
+        assert_eq!(buf[0], 5);
+    }
+
+    // An ICB-embedded (AD type 3) structure file is bundled like any other.
+    #[test]
+    fn read_structure_files_keeps_embedded_data_files() {
+        use udf::fixture::{PART_START, file_with};
+        let payload = b"INDX0200-embedded".to_vec();
+        let mut disc = structure_image(
+            vec![file_with("index.bdmv", 100, 1000, payload.clone(), false)],
+            vec![],
+            vec![],
+            vec![],
+        );
+        // Rewrite the file's ICB as an Extended File Entry with embedded data.
+        let mut icb = [0u8; 2048];
+        icb[0..2].copy_from_slice(&266u16.to_le_bytes());
+        icb[34..36].copy_from_slice(&3u16.to_le_bytes());
+        icb[56..64].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        icb[212..216].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        icb[216..216 + payload.len()].copy_from_slice(&payload);
+        disc.put_bytes(PART_START + 100, &icb);
+        let files = Disc::read_structure_files(&mut disc).expect("structure");
+        assert_eq!(files, vec![("BDMV/index.bdmv".to_string(), payload)]);
+    }
+
+    // Once a batch inside a file fails, the rest of that file is read sector by
+    // sector: no repeated multi-sector reads over the bad area.
+    #[test]
+    fn read_structure_files_stops_batching_after_a_failed_batch() {
+        use udf::fixture::{PART_START, file_with};
+        struct BadSector<'a> {
+            inner: &'a mut udf::fixture::MemDisc,
+            failed_batches: usize,
+        }
+        impl SectorSource for BadSector<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                r: bool,
+            ) -> Result<usize> {
+                let bad = PART_START + 1008;
+                if lba <= bad && lba + count as u32 > bad {
+                    if count > 1 {
+                        self.failed_batches += 1;
+                    }
+                    return Err(Error::DiscRead {
+                        sector: bad as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.inner.read_sectors(lba, count, buf, r)
+            }
+        }
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![file_with(
+                "00000.clpi",
+                100,
+                1000,
+                vec![5; 16 * 2048],
+                false,
+            )],
+            vec![],
+        );
+        let mut src = BadSector {
+            inner: &mut disc,
+            failed_batches: 0,
+        };
+        let files = Disc::read_structure_files(&mut src).expect("structure");
+        assert!(files.is_empty(), "the unreadable file is skipped");
+        assert_eq!(
+            src.failed_batches, 1,
+            "batching must stop after the first failure"
+        );
+    }
+
+    // Each file's ICB is read from the source once, not once per UDF lookup.
+    #[test]
+    fn read_structure_files_reads_each_icb_once() {
+        use udf::fixture::{PART_START, file_with};
+        struct IcbCount<'a> {
+            inner: &'a mut udf::fixture::MemDisc,
+            icb_reads: usize,
+        }
+        impl SectorSource for IcbCount<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                r: bool,
+            ) -> Result<usize> {
+                let icb = PART_START + 100;
+                if lba <= icb && lba + count as u32 > icb {
+                    self.icb_reads += 1;
+                }
+                self.inner.read_sectors(lba, count, buf, r)
+            }
+        }
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![file_with("00000.clpi", 100, 1000, vec![5; 2048], false)],
+            vec![],
+        );
+        let mut base = IcbCount {
+            inner: &mut disc,
+            icb_reads: 0,
+        };
+        udf::read_filesystem(&mut base).expect("fs");
+        let parse_reads = base.icb_reads;
+        let mut src = IcbCount {
+            inner: &mut disc,
+            icb_reads: 0,
+        };
+        Disc::read_structure_files(&mut src).expect("structure");
+        assert_eq!(src.icb_reads - parse_reads, 1);
+    }
+
+    fn structure_names(disc: &mut udf::fixture::MemDisc) -> Vec<String> {
+        Disc::read_structure_files(disc)
+            .expect("structure")
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    // Disc FID names are untrusted; the caller joins them under a profile dir.
+    #[test]
+    fn read_structure_files_drops_unsafe_names() {
+        use udf::fixture::file_with;
+        let mut disc = structure_image(
+            vec![],
+            vec![
+                file_with("00000.mpls", 100, 1000, vec![1; 10], false),
+                file_with("..\\..\\evil.mpls", 101, 1001, vec![2; 10], false),
+                file_with("a/b.mpls", 102, 1002, vec![3; 10], false),
+                file_with("CON.mpls", 103, 1003, vec![4; 10], false),
+                file_with("a?b.mpls", 104, 1004, vec![5; 10], false),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(structure_names(&mut disc), vec!["BDMV/PLAYLIST/00000.mpls"]);
+    }
+
+    #[test]
+    fn plain_file_name_rejects_windows_invalid_names() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a:b",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "a\u{1}b",
+            "CON",
+            "con.mpls",
+            "PRN.x",
+            "AUX",
+            "NUL.clpi",
+            "COM1.mpls",
+            "lpt9.xml",
+            "x.mpls.",
+            "x.mpls ",
+        ] {
+            assert!(!is_plain_file_name(bad), "{bad:?} must be rejected");
+        }
+        for bad in [
+            "CON .mpls",
+            "COM\u{B9}.mpls",
+            "lpt\u{B3}.x",
+            "CONIN$.xml",
+            "conout$",
+            "COM0.mpls",
+            "LPT0",
+        ] {
+            assert!(!is_plain_file_name(bad), "{bad:?} must be rejected");
+        }
+        for good in [
+            "COMX.mpls",
+            "00000.mpls",
+            "index.bdmv",
+            "CONSOLE.xml",
+            "LPT10.x",
+        ] {
+            assert!(is_plain_file_name(good), "{good:?} must be accepted");
+        }
+    }
+
+    // Hitting the byte budget skips that file only; later, smaller files survive.
+    #[test]
+    fn read_structure_files_byte_cap_skips_only_the_oversized_file() {
+        use udf::fixture::{file, file_with};
+        const MIB: u64 = 1024 * 1024;
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![
+                file("00000.clpi", 100, 10_000, 40 * MIB, false),
+                file("00001.clpi", 101, 10_000, 40 * MIB, false),
+            ],
+            vec![file_with("00000.bdjo", 102, 1000, vec![7; 10], false)],
+        );
+        let files = Disc::read_structure_files(&mut disc).expect("structure");
+        let total: usize = files.iter().map(|(_, b)| b.len()).sum();
+        assert!(total <= 64 * MIB as usize, "bundle not capped: {total}");
+        let names: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["BDMV/CLIPINF/00000.clpi", "BDMV/BDJO/00000.bdjo"]
+        );
+    }
+
+    // The bundled bytes come from the variant that is actually read (first in directory
+    // order), with that variant's own size — not a sibling's.
+    #[test]
+    fn read_structure_files_case_variants_use_the_read_variants_size() {
+        use udf::fixture::file_with;
+        let mut disc = structure_image(
+            vec![
+                file_with("index.bdmv", 100, 1000, vec![1; 20], false),
+                file_with("INDEX.BDMV", 101, 1001, vec![2; 10], false),
+            ],
+            vec![
+                file_with("00000.mpls", 102, 1002, vec![3; 20], false),
+                file_with("00000.MPLS", 103, 1003, vec![4; 10], false),
+            ],
+            vec![],
+            vec![],
+        );
+        let files = Disc::read_structure_files(&mut disc).expect("structure");
+        let got: Vec<(&str, usize)> = files.iter().map(|(p, b)| (p.as_str(), b.len())).collect();
+        assert_eq!(
+            got,
+            vec![("BDMV/index.bdmv", 20), ("BDMV/PLAYLIST/00000.mpls", 20)]
+        );
+    }
+
+    // Nav files use canonical names whatever the disc casing, and case variants
+    // (which collide on case-insensitive hosts) are bundled once.
+    #[test]
+    fn read_structure_files_canonical_nav_names_and_case_dedupe() {
+        use udf::fixture::file_with;
+        let mut disc = structure_image(
+            vec![
+                file_with("INDEX.BDMV", 100, 1000, vec![1; 10], false),
+                file_with("movieobject.bdmv", 101, 1001, vec![2; 10], false),
+            ],
+            vec![
+                file_with("00000.MPLS", 102, 1002, vec![3; 10], false),
+                file_with("00000.mpls", 103, 1003, vec![4; 10], false),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            structure_names(&mut disc),
+            vec![
+                "BDMV/index.bdmv",
+                "BDMV/MovieObject.bdmv",
+                "BDMV/PLAYLIST/00000.MPLS"
+            ]
         );
     }
 
@@ -5523,7 +6630,7 @@ mod tests {
         );
 
         let uk = vec![(0u32, [0x11u8; 16])];
-        disc.inject_unit_keys(uk.clone());
+        disc.inject_unit_keys(uk.clone()).expect("inject");
 
         match disc.decrypt_keys() {
             crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
@@ -5549,7 +6656,8 @@ mod tests {
         let mut disc = make_test_disc(1000, "FMTS");
         disc.format = DiscFormat::Fmts;
         disc.encrypted = true;
-        disc.inject_unit_keys(vec![(0u32, [0x22u8; 16])]);
+        disc.inject_unit_keys(vec![(0u32, [0x22u8; 16])])
+            .expect("inject");
         let aacs = disc.aacs.as_ref().expect("aacs state synthesized");
         assert_eq!(
             aacs.version,
@@ -6142,7 +7250,9 @@ mod tests {
         let mut reader = ClearStubReader {
             clear_range: (0, 100_000),
         };
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(stub_idx, &mut reader, 8);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(stub_idx, &mut reader, 8, None)
+            .expect("crack verdict");
         assert!(
             matches!(keys, crate::decrypt::DecryptKeys::None),
             "a clear stub in a disjoint VTS cracks to no key"
@@ -6471,7 +7581,9 @@ mod tests {
     fn inject_unit_keys_is_noop_without_aacs_on_unencrypted_or_css() {
         // Unencrypted disc: nothing to inject into, stays None.
         let mut plain = make_test_disc(1000, "PLAIN");
-        plain.inject_unit_keys(vec![(0, [0x22; 16])]);
+        plain
+            .inject_unit_keys(vec![(0, [0x22; 16])])
+            .expect("inject");
         assert!(plain.aacs.is_none());
         assert!(matches!(
             plain.decrypt_keys(),
@@ -6486,7 +7598,7 @@ mod tests {
             title_key: [0u8; 5],
             crack_span: None,
         });
-        dvd.inject_unit_keys(vec![(0, [0x33; 16])]);
+        dvd.inject_unit_keys(vec![(0, [0x33; 16])]).expect("inject");
         assert!(dvd.aacs.is_none(), "CSS disc must not gain an AACS state");
     }
 
@@ -6610,7 +7722,9 @@ mod tests {
             scrambled: (100, 164),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         assert!(!title_is_clear, "a scrambled title is not clear");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => {
@@ -6644,7 +7758,9 @@ mod tests {
             scrambled: (100, 132),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6682,6 +7798,33 @@ mod tests {
         }
     }
 
+    // A Stop during the per-title crack ends it after the current batch.
+    #[test]
+    fn decrypt_keys_for_title_crack_honours_the_halt_token() {
+        struct StopOnRead(crate::halt::Halt, u32);
+        impl SectorSource for StopOnRead {
+            fn read_sectors(&mut self, _l: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+                self.1 += 1;
+                self.0.cancel();
+                let n = c as usize * 2048;
+                b[..n].fill(0);
+                Ok(n)
+            }
+        }
+        let disc = css_dvd_with_extents(vec![Extent {
+            start_lba: 100,
+            sector_count: 64,
+        }]);
+        let halt = crate::halt::Halt::new();
+        let mut src = StopOnRead(halt.clone(), 0);
+        let got = disc.decrypt_keys_for_title(0, &mut src, 16, Some(&halt));
+        assert!(
+            matches!(got, Err(Error::Halted)),
+            "a stopped crack is no verdict"
+        );
+        assert_eq!(src.1, 1, "no read after the Stop");
+    }
+
     // End-to-end: a scrambled-but-uncrackable DVD title with NO up-front
     // detection drives decrypt_keys_for_title to (None, false), and the
     // gate MUST hard-fail (CssKeyMissing), never pass it to the muxer.
@@ -6693,7 +7836,9 @@ mod tests {
         }]);
         assert!(disc.css.is_none(), "fixture: no up-front detection");
         let mut reader = LockedReader;
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(0, &mut reader, 8);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(0, &mut reader, 8, None)
+            .expect("crack verdict");
         assert!(
             matches!(keys, crate::decrypt::DecryptKeys::None) && !title_is_clear,
             "a locked/uncrackable scrambled title resolves to (None, false)"
@@ -6714,7 +7859,9 @@ mod tests {
             reads: std::cell::RefCell::new(Vec::new()),
         };
         // Title 0's extents (100..200) overlap the cracked span → reuse.
-        let (keys, clear) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, clear) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         assert!(!clear);
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => {
@@ -6740,7 +7887,9 @@ mod tests {
             scrambled: (5000, 5100),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(1, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(1, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6778,7 +7927,9 @@ mod tests {
             scrambled: (100, 2_100),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6805,7 +7956,9 @@ mod tests {
             scrambled: (100 + 9_000, 100 + 20_000),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6827,7 +7980,9 @@ mod tests {
         disc.titles
             .push(title_with_video(Codec::Mpeg2, Resolution::R480p)); // idx 1: no extents
         let mut reader = LockedReader;
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(1, &mut reader, 8);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(1, &mut reader, 8, None)
+            .expect("crack verdict");
         assert!(
             title_is_clear,
             "an empty-extents title is clear (nothing to descramble)"
@@ -7883,6 +9038,221 @@ mod tests {
         );
     }
 
+    // ── whole-disc bus-removal gate ───────────────────────────────────────
+    // BD tree: two m2ts (only one in a title), an SSIF, a clear index.bdmv, and
+    // an AACS content cert whose byte 1 carries the BEE flag.
+    fn bus_fixture(cert_byte1: u8) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
+        let mut cert = vec![0u8; 32];
+        cert[0] = 0x10;
+        cert[1] = cert_byte1;
+        bus_fixture_with(Some(cert), Vec::new())
+    }
+
+    // `cert` None = no content cert on disc; `m2ts2` = 00002.m2ts bytes (6 sectors).
+    fn bus_fixture_with(
+        cert: Option<Vec<u8>>,
+        m2ts2: Vec<u8>,
+    ) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
+        use crate::udf::fixture::*;
+        let mut m2 = file_with("00002.m2ts", 41, 2_000, m2ts2, true);
+        m2.size = 6 * 2048;
+        let aacs_files = cert
+            .map(|c| vec![file_with("Content000.cer", 44, 600, c, true)])
+            .unwrap_or_default();
+        let stream = DirSpec {
+            name: "STREAM".into(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![file("00001.m2ts", 40, 1_000, 3 * 2048, true), m2],
+            subdirs: vec![DirSpec {
+                name: "SSIF".into(),
+                icb_lba: 32,
+                dir_data_lba: 33,
+                files: vec![file("00003.ssif", 42, 3_000, 3 * 2048, true)],
+                subdirs: vec![],
+            }],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "BDMV".into(),
+                    icb_lba: 20,
+                    dir_data_lba: 21,
+                    files: vec![file("index.bdmv", 43, 500, 2048, true)],
+                    subdirs: vec![stream],
+                },
+                DirSpec {
+                    name: "AACS".into(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: aacs_files,
+                    subdirs: vec![],
+                },
+            ],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    // Regression (v1.7.0 de-bussed every encrypted unit): the cert-route bus gate
+    // must cover EVERY stream file, not just kept titles, else dir:// / ISO / sweep
+    // leave non-title clips bus-encrypted. Clear nav (index.bdmv) stays outside.
+    #[test]
+    fn bus_content_ranges_cover_every_stream_file_not_just_titles() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, udf) = bus_fixture(0x80);
+        let mut feature = DiscTitle::empty();
+        feature.extents = vec![ext(PART_START + 1_000, 3)];
+        let stream = Disc::stream_file_extents(&mut mem, &udf);
+        assert_eq!(
+            bus_map(stream, &[feature]).covered_ranges(),
+            vec![
+                (PART_START + 1_000, 3),
+                (PART_START + 2_000, 6),
+                (PART_START + 3_000, 3)
+            ],
+            "non-title m2ts and SSIF must be de-bussed too; nav stays clear"
+        );
+    }
+
+    // The public whole-disc stream map: every /BDMV/STREAM file, nav excluded.
+    #[test]
+    fn stream_content_ranges_lists_every_stream_file() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, _) = bus_fixture(0x80);
+        assert_eq!(
+            Disc::stream_content_ranges(&mut mem).unwrap(),
+            vec![
+                (PART_START + 1_000, 3),
+                (PART_START + 2_000, 6),
+                (PART_START + 3_000, 3)
+            ]
+        );
+    }
+
+    // libaacs gates bus decrypt on the content cert BEE flag (`bee && bec`): a
+    // BEE=0 disc must not be de-bussed even when the drive served a Read Data Key.
+    #[test]
+    fn bus_key_dropped_when_content_cert_bee_is_clear() {
+        let rdk = Some([0x5Au8; 16]);
+        let (mut mem, udf) = bus_fixture(0x00);
+        assert_eq!(
+            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            None,
+            "BEE=0 content cert must force Passthrough"
+        );
+        let (mut mem, udf) = bus_fixture(0x80);
+        assert_eq!(
+            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            rdk,
+            "BEE=1 keeps the cert-route Read Data Key"
+        );
+    }
+
+    // Keep-key contract: no cert, a too-short cert, or an unknown cert type gives
+    // no BEE verdict, so the drive-served Read Data Key is kept.
+    #[test]
+    fn bus_key_kept_when_content_cert_absent_or_unparseable() {
+        let rdk = Some([0x5Au8; 16]);
+        let (mut mem, udf) = bus_fixture_with(None, Vec::new());
+        assert_eq!(Disc::bus_key_for_disc(&mut mem, &udf, rdk), rdk, "no cert");
+        let (mut mem, udf) = bus_fixture_with(Some(vec![0x10, 0x00, 0x00]), Vec::new());
+        assert_eq!(
+            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            rdk,
+            "short cert"
+        );
+        let mut odd = vec![0u8; 32];
+        odd[0] = 0x55;
+        let (mut mem, udf) = bus_fixture_with(Some(odd), Vec::new());
+        assert_eq!(
+            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            rdk,
+            "unknown type"
+        );
+        assert_eq!(
+            Disc::bus_key_for_disc(&mut mem, &udf, None),
+            None,
+            "no key stays none"
+        );
+    }
+
+    // A mock drive serving a MemDisc over READ(10) / READ CAPACITY; every other
+    // CDB answers zeros.
+    struct MemTransport(crate::udf::fixture::MemDisc);
+    impl crate::scsi::ScsiTransport for MemTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _direction: crate::scsi::DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<crate::scsi::ScsiResult> {
+            data.fill(0);
+            match cdb[0] {
+                crate::scsi::SCSI_READ_10 => {
+                    let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+                    let count = u16::from_be_bytes([cdb[7], cdb[8]]);
+                    self.0.read_sectors(lba, count, data, false)?;
+                }
+                crate::scsi::SCSI_READ_CAPACITY => {
+                    data[..4].copy_from_slice(&9_999u32.to_be_bytes());
+                    data[4..8].copy_from_slice(&2048u32.to_be_bytes());
+                }
+                _ => {}
+            }
+            Ok(crate::scsi::ScsiResult {
+                status: 0,
+                bytes_transferred: data.len(),
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    // scan() wiring end to end (post-handshake): the handshake's Read Data Key and
+    // the content cert's BEE flag pick the drive's bus stage, and the bus map covers
+    // a stream file no title plays. Reverting either scan() line goes red.
+    #[test]
+    fn scan_wires_handshake_key_and_stream_map_onto_the_drive() {
+        use crate::sector::SectorSource;
+        use crate::udf::fixture::PART_START;
+        let rdk = [0x6Du8; 16];
+        let mut clear: Vec<u8> = (0..6 * 2048).map(|i| (i * 13 % 251) as u8).collect();
+        clear[0] |= 0xC0;
+        clear[3 * 2048] |= 0xC0;
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire[..3 * 2048], &rdk);
+        crate::aacs::content::encrypt_bus(&mut wire[3 * 2048..], &rdk);
+        let handshake = || {
+            Some(encrypt::HandshakeResult {
+                volume_id: [0x11; 16],
+                read_data_key: Some(rdk),
+                read_data_key_err: None,
+                drive_unlocked: false,
+            })
+        };
+        let lba = PART_START + 2_000;
+        for (bee, want) in [(0x80u8, &clear), (0x00u8, &wire)] {
+            let mut cert = vec![0u8; 32];
+            cert[0] = 0x10;
+            cert[1] = bee;
+            let (mem, _) = bus_fixture_with(Some(cert), wire.clone());
+            let mut d = Drive::from_transport_for_test(Box::new(MemTransport(mem)));
+            Disc::scan_after_handshake(&mut d, handshake(), None, &ScanOptions::default())
+                .expect("scan");
+            let mut got = vec![0u8; 6 * 2048];
+            d.read_sectors(lba, 6, &mut got, false).unwrap();
+            assert_eq!(&got, want, "BEE byte {bee:#04x}: non-title m2ts bus state");
+        }
+    }
+
     // ── encrypted_content_ranges ──────────────────────────────────────────
     // The content map is the UNION of every title's extents, merged into a
     // disjoint set. Fixture has OVERLAP, ADJACENT, and DISJOINT, out of order.
@@ -7977,7 +9347,9 @@ mod tests {
         };
 
         for idx in [0usize, 1] {
-            let (keys, title_is_clear) = disc.decrypt_keys_for_title(idx, &mut clear, 16);
+            let (keys, title_is_clear) = disc
+                .decrypt_keys_for_title(idx, &mut clear, 16, None)
+                .expect("crack verdict");
             assert!(
                 matches!(keys, crate::decrypt::DecryptKeys::None),
                 "title {idx} only ABUTS the crack span — it shares no sector with it, so the \
@@ -7989,7 +9361,9 @@ mod tests {
             );
         }
 
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(2, &mut clear, 16);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(2, &mut clear, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, KEY,
@@ -8002,7 +9376,9 @@ mod tests {
         // A title with NO extents has nothing to crack from: it short-circuits
         // to the disc-wide keys and is marked clear, so the decrypt gate's
         // "None keys + not clear" rule cannot hard-fail it.
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(3, &mut clear, 16);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(3, &mut clear, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(title_key, KEY),
             _ => panic!("an extent-less title must return the disc-wide keys"),

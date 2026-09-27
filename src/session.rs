@@ -11,9 +11,7 @@ use crate::aacs::trace::ResolutionTrace;
 use crate::disc::{Disc, DiscId, DriveCredentials, ScanOptions};
 use crate::drive::{Drive, find_drive};
 use crate::error::{Error, Result};
-use crate::keysource::{
-    KeySource, MIN_SAMPLE_UNITS, key_fetch, read_encrypted_units, resolve_and_apply_traced,
-};
+use crate::keysource::{KeySource, MIN_SAMPLE_UNITS, key_fetch, resolve_and_apply_traced};
 use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,24 +68,9 @@ pub fn resolve_keys_for(
     // sample step when there is no source to validate against (a dropped / SSRF-
     // rejected online-only source) — resolution is a miss regardless; the read is waste.
     let src_vec = sources();
-    inputs.samples = if src_vec.is_empty() {
-        Vec::new()
-    } else {
-        // Sample from the LARGEST title that HAS video — the main feature carries the
-        // most validation units, avoiding a size-inflated STREAMLESS decoy on some
-        // obfuscated UHDs. Falls back to largest title outright when none has video.
-        match disc
-            .titles
-            .iter()
-            .filter(|t| t.has_probable_video())
-            .max_by_key(|t| t.size_bytes)
-            .or_else(|| disc.titles.iter().max_by_key(|t| t.size_bytes))
-            .cloned()
-        {
-            Some(title) => read_encrypted_units(reader, &title, MIN_SAMPLE_UNITS),
-            None => Vec::new(),
-        }
-    };
+    if !src_vec.is_empty() {
+        inputs.samples = disc.content_samples(reader, MIN_SAMPLE_UNITS);
+    }
 
     // Ordered, first-valid-wins; banks the winning unit keys onto `disc`.
     let (_resolved, trace) = resolve_and_apply_traced(&src_vec, &inputs, disc);
@@ -477,24 +460,7 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     // Anchor on the largest TITLE's FIRST extent (video preferred, skipping an
     // obfuscated decoy), never the largest extent anywhere: AACS units are 3 sectors,
     // aligned only at a clip's START — misalignment risks a false clean/encrypted verdict.
-    let Some(extent) = disc
-        .titles
-        .iter()
-        .filter(|t| t.has_probable_video())
-        .max_by_key(|t| {
-            t.extents
-                .iter()
-                .fold(0u64, |a, e| a.saturating_add(e.sector_count as u64))
-        })
-        .or_else(|| {
-            disc.titles.iter().max_by_key(|t| {
-                t.extents
-                    .iter()
-                    .fold(0u64, |a, e| a.saturating_add(e.sector_count as u64))
-            })
-        })
-        .and_then(|t| t.extents.first())
-    else {
+    let Some(extent) = disc.main_title().and_then(|t| t.extents.first()) else {
         // No content to judge. A folder with an AACS directory and no titles
         // has nothing to rip either way; leave the structural verdict alone.
         return Ok(true);
@@ -808,6 +774,34 @@ mod tests {
             resolved.key_fetch.is_some(),
             "an AACS disc still retains a read-time fetch"
         );
+    }
+
+    // `inputs_with_samples` carries real encrypted units from the main feature, so
+    // a source's key is validated at disc open (bare `inputs()` has none).
+    #[test]
+    fn inputs_with_samples_fills_encrypted_units_from_the_main_title() {
+        use crate::disc::{DiscTitle, Extent};
+        struct Encrypted;
+        impl SectorSource for Encrypted {
+            fn read_sectors(&mut self, _l: u32, c: u16, b: &mut [u8], _: bool) -> Result<usize> {
+                let n = c as usize * 2048;
+                b[..n].fill(0xC0); // CPI-flagged: encrypted
+                Ok(n)
+            }
+        }
+        let mut disc = aacs_disc();
+        let mut t = DiscTitle::empty();
+        t.size_bytes = 1;
+        t.extents = vec![Extent {
+            start_lba: 3_000,
+            sector_count: 3_000,
+        }];
+        disc.titles = vec![t];
+        assert!(disc.inputs().expect("aacs").samples.is_empty());
+        let inputs = disc
+            .inputs_with_samples(&mut Encrypted, MIN_SAMPLE_UNITS)
+            .expect("aacs");
+        assert_eq!(inputs.samples.len(), MIN_SAMPLE_UNITS);
     }
 
     /// A non-AACS disc (CSS / unencrypted — `inputs()` is `None`): resolution is a

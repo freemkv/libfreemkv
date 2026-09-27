@@ -46,6 +46,8 @@ pub(crate) struct WritebackPipeline {
     chunk_bytes: u64,
     last_flush_pos: u64,
     pending: Option<(u64, u64)>,
+    /// Latest write position; `[last_flush_pos, pos)` is the unflushed tail.
+    pos: u64,
     /// Rolling window of recent `WAIT_AFTER` elapsed_ms measurements.
     wait_after_window: VecDeque<u64>,
     /// Count of chunks emitted (used to space out periodic
@@ -63,6 +65,36 @@ pub(crate) struct WritebackPipeline {
     /// reads or writes it). `AtomicBool` over `bool` only because the
     /// load/store sites read cleanly; no sharing is needed today.
     degraded: AtomicBool,
+    /// False for fds `sync_file_range` rejects (pipes, char devices such as
+    /// `/dev/null`): those skip kickoff, WAIT_AFTER and DONTNEED entirely.
+    waitable: bool,
+    /// First writeback errno a `WAIT_AFTER` reported. Sticky: that call may
+    /// consume the file's error state, so a later `fsync` can return 0.
+    wb_errno: Option<i32>,
+    /// The `WAIT_AFTER` syscall; a seam so tests can inject a writeback error.
+    wait_op: WaitOp,
+}
+
+/// `(fd, off, len) -> 0 or errno`.
+type WaitOp = fn(RawFd, u64, u64) -> i32;
+
+fn sys_wait_after(fd: RawFd, off: u64, len: u64) -> i32 {
+    let rc = unsafe {
+        libc::sync_file_range(fd, off as i64, len as i64, libc::SYNC_FILE_RANGE_WAIT_AFTER)
+    };
+    if rc == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    }
+}
+
+enum WaitOutcome {
+    Done(u64),
+    Failed(i32),
+    TimedOut,
 }
 
 impl WritebackPipeline {
@@ -71,6 +103,7 @@ impl WritebackPipeline {
     pub(crate) fn new(file: &File, start_pos: u64, chunk_bytes: u64) -> Self {
         let fd = file.as_raw_fd();
         let is_nfs = detect_nfs(fd);
+        let waitable = fd_is_waitable(file);
         // Clone the fd so any leaked WAIT_AFTER worker thread keeps the
         // file description alive. Log but continue on clone failure.
         let wait_file = match file.try_clone() {
@@ -94,12 +127,48 @@ impl WritebackPipeline {
             wait_file,
             chunk_bytes,
             last_flush_pos: start_pos,
+            pos: start_pos,
             pending: None,
             wait_after_window: VecDeque::with_capacity(ADAPTIVE_WINDOW),
             chunk_count: 0,
             is_nfs,
             degraded: AtomicBool::new(false),
+            waitable,
+            wb_errno: None,
+            wait_op: sys_wait_after,
         }
+    }
+
+    /// The latched writeback error, if any `WAIT_AFTER` failed.
+    pub(crate) fn error(&self) -> Option<std::io::Error> {
+        self.wb_errno.map(std::io::Error::from_raw_os_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_error(&mut self, errno: i32) {
+        self.wb_errno.get_or_insert(errno);
+    }
+
+    // Latch possible data loss; an "unsupported call" errno is only a warning.
+    fn latch_error(&mut self, errno: i32, off: u64, len: u64) {
+        if !is_writeback_errno(errno) {
+            tracing::warn!(
+                target: "mux",
+                errno,
+                "WritebackPipeline WAIT_AFTER rejected on chunk off={off} len={len}"
+            );
+            return;
+        }
+        tracing::error!(
+            target: "mux",
+            errno,
+            "WritebackPipeline WAIT_AFTER failed on chunk off={off} len={len}"
+        );
+        self.wb_errno.get_or_insert(errno);
+    }
+
+    fn wait_after(&self, off: u64, len: u64) -> WaitOutcome {
+        wait_after_with_timeout(self.clone_for_worker(), self.fd, off, len, self.wait_op)
     }
 
     /// True if we should bypass the WAIT_AFTER + DONTNEED finalisation
@@ -107,7 +176,7 @@ impl WritebackPipeline {
     /// pipeline has flipped to degraded after a WAIT_AFTER timeout.
     #[inline]
     fn skip_wait(&self) -> bool {
-        self.is_nfs || self.degraded.load(Ordering::Relaxed)
+        !self.waitable || self.is_nfs || self.degraded.load(Ordering::Relaxed)
     }
 
     // Fresh per-call `File` clone for the WAIT_AFTER worker so the worker
@@ -122,6 +191,7 @@ impl WritebackPipeline {
     /// was crossed, kick async writeback for the just-completed chunk
     /// and finalise the previous one.
     pub(crate) fn note_progress(&mut self, pos: u64) {
+        self.pos = pos;
         if pos < self.last_flush_pos.saturating_add(self.chunk_bytes) {
             return;
         }
@@ -132,26 +202,10 @@ impl WritebackPipeline {
         let chunk_len: u64 = pos.saturating_sub(self.last_flush_pos);
         let mut wait_ms: u64 = 0;
         let mut fadvise_ms: u64 = 0;
-        // Async kickoff for the just-completed chunk runs on every path (NFS,
-        // degraded, normal) — non-blocking by spec, an early hint that this
-        // range is ready to flush.
-        let kickoff_rc = unsafe {
-            libc::sync_file_range(
-                self.fd,
-                chunk_off as i64,
-                chunk_len as i64,
-                libc::SYNC_FILE_RANGE_WRITE,
-            )
-        };
-        if kickoff_rc != 0 {
-            // Non-fatal: the async write-out hint failed, but the data is
-            // still in the page cache and will be flushed by later fsync /
-            // kernel writeback. Surface it for diagnosability.
-            tracing::warn!(
-                target: "freemkv::io",
-                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                "sync_file_range(WRITE) kickoff failed"
-            );
+        // Async kickoff for the just-completed chunk runs on every waitable path
+        // (NFS, degraded, normal): non-blocking, a hint that the range can flush.
+        if self.waitable {
+            self.kickoff(chunk_off, chunk_len);
         }
         if let Some((prev_off, prev_len)) = self.pending.take() {
             if self.skip_wait() {
@@ -162,9 +216,8 @@ impl WritebackPipeline {
                 // Normal local-storage branch with belt-and-braces timeout: if
                 // WAIT_AFTER hangs > WAIT_AFTER_TIMEOUT, mark degraded, log loudly,
                 // and fall through to the skip path on subsequent calls.
-                match wait_after_with_timeout(self.clone_for_worker(), self.fd, prev_off, prev_len)
-                {
-                    Some(ms) => {
+                match self.wait_after(prev_off, prev_len) {
+                    WaitOutcome::Done(ms) => {
                         wait_ms = ms;
                         let t_fadv = Instant::now();
                         unsafe {
@@ -178,7 +231,8 @@ impl WritebackPipeline {
                         fadvise_ms = t_fadv.elapsed().as_millis() as u64;
                         self.record_wait(wait_ms);
                     }
-                    None => {
+                    WaitOutcome::Failed(errno) => self.latch_error(errno, prev_off, prev_len),
+                    WaitOutcome::TimedOut => {
                         // Timeout branch: switch to NFS-style skip for the rest of the
                         // pipeline's life. Do NOT call DONTNEED — if WAIT_AFTER hasn't
                         // returned, the pages aren't safely flushed.
@@ -221,6 +275,27 @@ impl WritebackPipeline {
         }
     }
 
+    fn kickoff(&self, chunk_off: u64, chunk_len: u64) {
+        let kickoff_rc = unsafe {
+            libc::sync_file_range(
+                self.fd,
+                chunk_off as i64,
+                chunk_len as i64,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+        if kickoff_rc != 0 {
+            // Non-fatal: the async write-out hint failed, but the data is
+            // still in the page cache and will be flushed by later fsync /
+            // kernel writeback. Surface it for diagnosability.
+            tracing::warn!(
+                target: "freemkv::io",
+                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                "sync_file_range(WRITE) kickoff failed"
+            );
+        }
+    }
+
     /// Push a new `WAIT_AFTER` measurement into the rolling window
     /// and, if the window is full, adapt `chunk_bytes` based on p95.
     fn record_wait(&mut self, wait_ms: u64) {
@@ -259,48 +334,94 @@ impl WritebackPipeline {
 
     /// Caller is about to seek away from the current write region.
     /// Drain any in-flight chunk and reset tracking.
+    // MKV seeks every cluster, so never wait here: kick the tail and let the
+    // pending chunk wait at the next boundary. An un-waited range keeps its error
+    // for the final fsync.
     pub(crate) fn handle_seek(&mut self, new_pos: u64) {
-        self.finalize();
+        let tail_len = self.pos.saturating_sub(self.last_flush_pos);
+        if tail_len > 0 && self.waitable {
+            self.kickoff(self.last_flush_pos, tail_len);
+        }
         self.last_flush_pos = new_pos;
+        self.pos = new_pos;
     }
 
     /// Drain any in-flight chunk. Idempotent. Call before `sync_all()`
     /// or when discarding the pipeline.
     pub(crate) fn finalize(&mut self) {
-        if let Some((prev_off, prev_len)) = self.pending.take() {
-            tracing::debug!(
-                target: "mux",
-                "WritebackPipeline finalize chunk off={prev_off} len={prev_len} skip_wait={} is_nfs={} degraded={}",
-                self.skip_wait(),
-                self.is_nfs,
-                self.degraded.load(Ordering::Relaxed),
-            );
-            if self.skip_wait() {
-                // NFS / degraded: skip WAIT_AFTER + DONTNEED. close()
-                // / sync_all() handle commit through their normal
-                // paths.
-                return;
-            }
-            match wait_after_with_timeout(self.clone_for_worker(), self.fd, prev_off, prev_len) {
-                Some(_ms) => unsafe {
-                    libc::posix_fadvise(
-                        self.fd,
-                        prev_off as i64,
-                        prev_len as i64,
-                        libc::POSIX_FADV_DONTNEED,
-                    );
-                },
-                None => {
-                    self.degraded.store(true, Ordering::Relaxed);
-                    tracing::error!(
-                        target: "mux",
-                        "WritebackPipeline finalize WAIT_AFTER timed out after {}s on chunk off={prev_off} len={prev_len}, marking writeback degraded",
-                        WAIT_AFTER_TIMEOUT.as_secs(),
-                    );
-                }
+        // The partial tail below a chunk boundary is waited on too, so a small
+        // file or the last partial chunk still reports its writeback error.
+        let tail_off = self.last_flush_pos;
+        let tail_len = self.pos.saturating_sub(tail_off);
+        if tail_len > 0 && !self.skip_wait() {
+            self.kickoff(tail_off, tail_len);
+        }
+        self.last_flush_pos = self.last_flush_pos.max(self.pos);
+        let tail = (tail_len > 0).then_some((tail_off, tail_len));
+        for (off, len) in [self.pending.take(), tail].into_iter().flatten() {
+            self.finalize_range(off, len);
+        }
+    }
+
+    fn finalize_range(&mut self, prev_off: u64, prev_len: u64) {
+        tracing::debug!(
+            target: "mux",
+            "WritebackPipeline finalize chunk off={prev_off} len={prev_len} skip_wait={} is_nfs={} degraded={}",
+            self.skip_wait(),
+            self.is_nfs,
+            self.degraded.load(Ordering::Relaxed),
+        );
+        if self.skip_wait() {
+            // NFS / degraded: skip WAIT_AFTER + DONTNEED. close()
+            // / sync_all() handle commit through their normal
+            // paths.
+            return;
+        }
+        match self.wait_after(prev_off, prev_len) {
+            WaitOutcome::Done(_ms) => unsafe {
+                libc::posix_fadvise(
+                    self.fd,
+                    prev_off as i64,
+                    prev_len as i64,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            },
+            WaitOutcome::Failed(errno) => self.latch_error(errno, prev_off, prev_len),
+            WaitOutcome::TimedOut => {
+                self.degraded.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    target: "mux",
+                    "WritebackPipeline finalize WAIT_AFTER timed out after {}s on chunk off={prev_off} len={prev_len}, marking writeback degraded",
+                    WAIT_AFTER_TIMEOUT.as_secs(),
+                );
             }
         }
     }
+}
+
+// Denylist: these mean the call was unsupported or transiently refused. Every
+// other errno (EIO, ENOSPC, EROFS, ESTALE, ENOTCONN, ...) may mean lost data.
+fn is_writeback_errno(errno: i32) -> bool {
+    !matches!(
+        errno,
+        libc::EINVAL
+            | libc::ESPIPE
+            | libc::EBADF
+            | libc::ENOSYS
+            | libc::EOPNOTSUPP
+            | libc::ENOMEM
+            | libc::EINTR
+            | libc::EAGAIN
+    )
+}
+
+// Regular files and block devices support `sync_file_range`; anything else
+// (or an fstat failure) does not.
+fn fd_is_waitable(file: &File) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file.metadata()
+        .map(|m| m.file_type().is_file() || m.file_type().is_block_device())
+        .unwrap_or(false)
 }
 
 // Probe whether `fd` lives on an NFS mount via `crate::platform::fs_type::detect_fd`.
@@ -313,45 +434,33 @@ fn detect_nfs(fd: RawFd) -> bool {
     )
 }
 
-// Runs `sync_file_range(WAIT_AFTER)` on a worker thread, waiting up to WAIT_AFTER_TIMEOUT;
-// `Some(elapsed_ms)` on success, `None` on timeout (worker leaked).
+// Runs `op` (`sync_file_range(WAIT_AFTER)`) on a worker thread, waiting up to
+// WAIT_AFTER_TIMEOUT. On timeout the worker is leaked.
 fn wait_after_with_timeout(
     worker_file: Option<File>,
     fallback_fd: RawFd,
     off: u64,
     len: u64,
-) -> Option<u64> {
+    op: WaitOp,
+) -> WaitOutcome {
     let started = Instant::now();
-    let result = if let Some(owned) = worker_file {
-        // Happy path: the closure owns a cloned File that keeps the
-        // file description alive until the worker drops it.
-        crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || unsafe {
-            let fd = owned.as_raw_fd();
-            libc::sync_file_range(fd, off as i64, len as i64, libc::SYNC_FILE_RANGE_WAIT_AFTER);
-            // `owned` drops here, closing the cloned fd.
-        })
-    } else {
-        // Fallback: try_clone failed at construction; use the raw fd.
-        // This carries the pre-fix fd-reuse risk on timeout, but is no
-        // regression from the original behaviour.
-        crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || unsafe {
-            libc::sync_file_range(
-                fallback_fd,
-                off as i64,
-                len as i64,
-                libc::SYNC_FILE_RANGE_WAIT_AFTER,
-            );
-        })
-    };
+    // The owned clone keeps the file description alive until the worker drops it;
+    // without one (try_clone failed) the raw fd carries the fd-reuse risk on timeout.
+    let result = crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || {
+        let fd = worker_file
+            .as_ref()
+            .map(|f| f.as_raw_fd())
+            .unwrap_or(fallback_fd);
+        op(fd, off, len)
+    });
     match result {
-        Ok(()) => Some(started.elapsed().as_millis() as u64),
+        Ok(0) => WaitOutcome::Done(started.elapsed().as_millis() as u64),
+        Ok(errno) => WaitOutcome::Failed(errno),
         Err(crate::io::bounded::BoundedError::Timeout)
-        | Err(crate::io::bounded::BoundedError::Halted) => None,
-        Err(crate::io::bounded::BoundedError::WorkerLost) => {
-            // Worker thread spawn failed or panicked before sending. Treat as benign
-            // success (no syscall ran), not a degrade trigger — elapsed_ms=0 matches no-op.
-            Some(0)
-        }
+        | Err(crate::io::bounded::BoundedError::Halted) => WaitOutcome::TimedOut,
+        // Worker spawn failed or panicked before sending: no syscall ran, so
+        // nothing was consumed. Benign, not a degrade trigger.
+        Err(crate::io::bounded::BoundedError::WorkerLost) => WaitOutcome::Done(0),
     }
 }
 
@@ -468,6 +577,155 @@ mod tests {
     }
 
     // ── Bug-fix regression tests ────────────────────────────────────────
+
+    fn failing_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        libc::EIO
+    }
+
+    // A failed WAIT_AFTER consumes the file's writeback error, so the pipeline must
+    // latch it; dropping the rc let the final fsync report success.
+    #[test]
+    fn failed_wait_after_is_latched_in_note_progress() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = failing_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        assert!(
+            p.error().is_none(),
+            "first chunk has no predecessor to wait on"
+        );
+        p.note_progress(2 * CHUNK_BYTES_MIN);
+        assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EIO));
+        assert!(
+            !p.skip_wait(),
+            "an I/O error is not a timeout; must not degrade"
+        );
+    }
+
+    #[test]
+    fn failed_wait_after_is_latched_in_finalize() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = failing_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.finalize();
+        assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EIO));
+    }
+
+    fn espipe_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        libc::ESPIPE
+    }
+
+    fn erofs_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        libc::EROFS
+    }
+
+    fn einval_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        libc::EINVAL
+    }
+
+    // EROFS (aborted ext4 journal, btrfs abort) is data loss and must latch.
+    #[test]
+    fn erofs_is_latched_einval_is_not() {
+        for errno in [libc::ENOMEM, libc::EINTR, libc::EAGAIN] {
+            assert!(!is_writeback_errno(errno), "errno {errno} is transient");
+        }
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = erofs_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.finalize();
+        assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EROFS));
+
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = einval_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.finalize();
+        assert!(p.error().is_none());
+    }
+
+    static SEEK_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        SEEK_WAITS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    // Seeks happen every MKV cluster: they must not block on WAIT_AFTER.
+    #[test]
+    fn seek_never_waits() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.note_progress(CHUNK_BYTES_MIN + 4096);
+        assert!(p.pending.is_some());
+        p.wait_op = counting_wait;
+        p.handle_seek(0);
+        assert_eq!(
+            SEEK_WAITS.load(Ordering::SeqCst),
+            0,
+            "seek called WAIT_AFTER"
+        );
+        assert!(
+            p.pending.is_some(),
+            "the pending chunk waits at a later boundary"
+        );
+        assert!(p.error().is_none());
+    }
+
+    // A write smaller than one chunk never crosses a boundary; finalize must
+    // still wait on it, or a small file's writeback error is never seen.
+    #[test]
+    fn finalize_waits_on_the_partial_tail() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = failing_wait;
+        p.note_progress(4096);
+        assert!(p.pending.is_none());
+        p.finalize();
+        assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EIO));
+    }
+
+    // Only data-loss errnos latch: ESPIPE/EINVAL mean the call was unsupported.
+    #[test]
+    fn non_writeback_errno_is_not_latched() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = espipe_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.note_progress(2 * CHUNK_BYTES_MIN);
+        p.finalize();
+        assert!(p.error().is_none());
+    }
+
+    // `/dev/null` (a sweep target) is a char device: sync_file_range rejects it,
+    // so the pipeline must skip the wait path instead of failing the write.
+    #[test]
+    fn char_device_skips_wait_and_never_latches() {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        let mut p = WritebackPipeline::new(&f, 0, CHUNK_BYTES_MIN);
+        p.wait_op = failing_wait;
+        assert!(p.skip_wait(), "a char device must not be waited on");
+        for i in 1..=4 {
+            p.note_progress(i * CHUNK_BYTES_MIN);
+        }
+        p.finalize();
+        assert!(p.error().is_none());
+    }
+
+    #[test]
+    fn regular_file_is_waitable() {
+        let f = NamedTempFile::new().expect("tempfile create");
+        assert!(fd_is_waitable(f.as_file()));
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert!(!fd_is_waitable(&null));
+    }
+
+    #[test]
+    fn successful_wait_after_latches_nothing() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.note_progress(2 * CHUNK_BYTES_MIN);
+        p.finalize();
+        assert!(p.error().is_none());
+    }
 
     // Regression for the fd-reuse fix: `new` clones the fd into `wait_file`,
     // so `clone_for_worker` gives the worker an owned `File`, not a raw fd.

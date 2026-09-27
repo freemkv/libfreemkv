@@ -93,24 +93,38 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
 // AES-128-CBC decrypt in place under AACS_IV with an already-expanded key schedule. Split out
 // of aes_cbc_decrypt for callers that share one key across several regions.
 pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
-    let num_blocks = data.len() / 16;
-    // Process blocks in reverse to avoid clobbering ciphertext needed for XOR
-    for i in (0..num_blocks).rev() {
-        let offset = i * 16;
-        let prev = if i == 0 {
-            AACS_IV
-        } else {
-            let mut p = [0u8; 16];
-            p.copy_from_slice(&data[(i - 1) * 16..i * 16]);
-            p
-        };
-        let mut chunk = [0u8; 16];
-        chunk.copy_from_slice(&data[offset..offset + 16]);
-        let mut block: Array<u8, _> = chunk.into();
-        cipher.decrypt_block(&mut block);
-        for j in 0..16 {
-            data[offset + j] = block[j] ^ prev[j];
+    // CBC decrypt parallelises: AES-decrypt a batch of blocks in one call (the
+    // backend pipelines them), then XOR each with its preceding ciphertext.
+    const BATCH: usize = 32;
+    let len = data.len() / 16 * 16;
+    let mut prev = AACS_IV;
+    let mut blocks = [aes::Block::default(); BATCH];
+    for chunk in data[..len].chunks_mut(16 * BATCH) {
+        let n = chunk.len() / 16;
+        for (b, c) in blocks.iter_mut().zip(chunk.as_chunks::<16>().0) {
+            b.copy_from_slice(c);
         }
+        cipher.decrypt_blocks(&mut blocks[..n]);
+        // The next batch chains off this batch's last CIPHERTEXT block.
+        let mut last = [0u8; 16];
+        last.copy_from_slice(&chunk[(n - 1) * 16..]);
+        // Walk backwards so each block's preceding ciphertext is still intact.
+        for i in (0..n).rev() {
+            let iv = if i == 0 {
+                prev
+            } else {
+                let mut p = [0u8; 16];
+                p.copy_from_slice(&chunk[(i - 1) * 16..i * 16]);
+                p
+            };
+            for (d, (x, v)) in chunk[i * 16..(i + 1) * 16]
+                .iter_mut()
+                .zip(blocks[i].iter().zip(iv.iter()))
+            {
+                *d = x ^ v;
+            }
+        }
+        prev = last;
     }
 }
 
@@ -203,5 +217,20 @@ mod tests {
         let mut other = K;
         other[0] ^= 0x01;
         assert_ne!(aesg3(&K, 1), aesg3(&other, 1));
+    }
+
+    // The batched CBC decrypt inverts the (block-at-a-time) CBC encrypt at every
+    // batch-boundary shape: one block, exactly one batch, a batch plus one, and a
+    // whole de-bussed sector body.
+    #[test]
+    fn batched_cbc_decrypt_inverts_cbc_encrypt_across_batch_boundaries() {
+        for blocks in [1usize, 31, 32, 33, 64, 383] {
+            let plain: Vec<u8> = (0..blocks * 16).map(|i| (i * 7 + 3) as u8).collect();
+            let mut data = plain.clone();
+            aes_cbc_encrypt(&K, &mut data);
+            assert_ne!(data, plain);
+            aes_cbc_decrypt(&K, &mut data);
+            assert_eq!(data, plain, "{blocks} blocks must round-trip");
+        }
     }
 }
