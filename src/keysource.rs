@@ -334,6 +334,10 @@ pub fn resolve_and_apply_traced(
     use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep};
 
     let mut trace = crate::aacs::trace::ResolutionTrace::new();
+    // A bus-blocked disc refuses every key: don't query sources for it.
+    if disc.bus_blocked_error().is_some() {
+        return (false, trace);
+    }
 
     // The FIRST source failure seen, if any. An `Err` means the source could not
     // answer at all (not "no key"), so its reason is stamped onto `disc.aacs_error`

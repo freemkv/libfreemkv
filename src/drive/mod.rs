@@ -290,7 +290,7 @@ impl Drive {
 
     // Halt-aware SCSI execute: returns `Err(Halted)` if the flag is set before
     // dispatch or by completion. Keeps Drive::read free of explicit halt checks.
-    fn checked_exec(
+    pub(crate) fn checked_exec(
         &mut self,
         cdb: &[u8],
         dir: crate::scsi::DataDirection,
@@ -1375,7 +1375,7 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
 
 // Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true, returning
 // Error::Halted. Used by wait_ready's poll backoff and spin_cycle's spin-down/settle pauses.
-fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
+pub(crate) fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
     const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
     let deadline = std::time::Instant::now() + total;
     loop {
