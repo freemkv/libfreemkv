@@ -298,7 +298,8 @@ struct XplTitle {
 }
 
 /// Parse an `HH:MM:SS:FF` (or `MM:SS:FF`) timecode at `tick_base` frames/sec into
-/// seconds. `None` on a malformed field.
+/// seconds. `None` on a malformed field. A `60fps` tick base is the NTSC 60000/1001
+/// rate (non-drop), so its timecodes stretch by 1001/1000 into real seconds.
 fn parse_timecode(s: &str, tick_base: u32) -> Option<f64> {
     let n: Vec<u32> = s
         .split(':')
@@ -311,7 +312,12 @@ fn parse_timecode(s: &str, tick_base: u32) -> Option<f64> {
         [m, s, f] => (0, *m, *s, *f),
         _ => return None,
     };
-    Some(h as f64 * 3600.0 + m as f64 * 60.0 + sec as f64 + f as f64 / tb)
+    let nominal = h as f64 * 3600.0 + m as f64 * 60.0 + sec as f64 + f as f64 / tb;
+    Some(if tick_base == 60 {
+        nominal * 1.001
+    } else {
+        nominal
+    })
 }
 
 /// `tickBase="60fps"` → 60. Defaults to 60 when absent/unparseable.
@@ -1691,15 +1697,36 @@ mod tests {
 
     #[test]
     fn parse_timecode_hhmmssff_at_60fps() {
-        // 01:37:20:00 = 5840 s exactly.
-        assert!((parse_timecode("01:37:20:00", 60).unwrap() - 5840.0).abs() < 1e-6);
+        // 01:37:20:00 = 5840 nominal seconds, x1.001 at the NTSC tick rate.
+        assert!((parse_timecode("01:37:20:00", 60).unwrap() - 5840.0 * 1.001).abs() < 1e-6);
         // 00:48:29:50 = 48m29s + 50/60 frames.
-        let want = 48.0 * 60.0 + 29.0 + 50.0 / 60.0;
+        let want = (48.0 * 60.0 + 29.0 + 50.0 / 60.0) * 1.001;
         assert!((parse_timecode("00:48:29:50", 60).unwrap() - want).abs() < 1e-6);
         // MM:SS:FF short form (hours omitted).
-        assert!((parse_timecode("02:05:15", 60).unwrap() - (125.0 + 15.0 / 60.0)).abs() < 1e-6);
+        let want = (125.0 + 15.0 / 60.0) * 1.001;
+        assert!((parse_timecode("02:05:15", 60).unwrap() - want).abs() < 1e-6);
         assert_eq!(parse_timecode("garbage", 60), None);
         assert_eq!(parse_timecode("", 60), None);
+    }
+
+    // A real HD DVD (VPLST000.XPL, tickBase="60fps") against its own EVOs' measured
+    // lengths: title time runs at 60000/1001, so 60 exact reads every title 0.1% short.
+    #[test]
+    fn xpl_60fps_timecodes_run_at_ntsc_rate() {
+        for (tc, evo_secs) in [
+            ("00:49:08:40", 2951.54), // PEVOB_1, feature clip 1
+            ("00:14:49:00", 889.888), // hazards
+            ("00:04:42:00", 282.272), // daisy
+            ("00:02:01:56", 122.064), // intro
+        ] {
+            let got = parse_timecode(tc, 60).unwrap();
+            assert!(
+                (got - evo_secs).abs() < 0.1,
+                "{tc}: {got} vs EVO {evo_secs}"
+            );
+        }
+        // PAL tick base is exact.
+        assert!((parse_timecode("00:14:49:00", 50).unwrap() - 889.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1727,7 +1754,7 @@ mod tests {
         assert_eq!(mm.number, 2);
         assert_eq!(mm.name, "Main Movie");
         assert!(
-            (mm.duration_secs - 5840.0).abs() < 1e-6,
+            (mm.duration_secs - 5840.0 * 1.001).abs() < 1e-6,
             "97:20 from titleDuration"
         );
         // The layer-break split is ONE title with TWO clips, contiguous timeline.
@@ -1743,7 +1770,7 @@ mod tests {
             "second clip carries a title-time offset"
         );
         assert_eq!(mm.chapters.len(), 2);
-        assert!((mm.chapters[1] - (3.0 * 60.0 + 40.0 + 30.0 / 60.0)).abs() < 1e-6);
+        assert!((mm.chapters[1] - (3.0 * 60.0 + 40.0 + 30.0 / 60.0) * 1.001).abs() < 1e-6);
 
         let del = &titles[1];
         assert_eq!(del.name, "Deleted Scenes - Veronica Past");
@@ -2005,7 +2032,7 @@ mod tests {
             .expect("MainMovie composed from the playlist");
         assert_eq!(mm.playlist_id, 2);
         assert!(
-            (mm.duration_secs - 5840.0).abs() < 1.0,
+            (mm.duration_secs - 5840.0 * 1.001).abs() < 1.0,
             "97:20 duration from titleDuration, not 0/unknown"
         );
         assert_eq!(
