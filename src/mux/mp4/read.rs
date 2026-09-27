@@ -678,7 +678,7 @@ struct StsdInfo {
     /// field (high 16 bits). `0` when absent/video — the caller then falls
     /// back to the mdhd media timescale.
     sample_rate: u32,
-    /// DTS `ddts` DTSSamplingFrequency when it is a known rate.
+    /// DTS `ddts` DTSSamplingFrequency when present and non-zero.
     dts_max_rate: Option<u32>,
     /// `Some(dtsh|dtsl)` for a DTS entry; `None` otherwise.
     dts_hd: Option<bool>,
@@ -768,11 +768,12 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             .filter(|b| b.len() >= 8)
             .map_or(sample_rate, |b| be32(b, 4));
         // ETSI TS 102 114 E.2.2.3: DTSSamplingFrequency is the stream's maximum rate.
+        // An unnameable rate stays Unknown; the entry holds only its family base.
         let dts_max_rate = match codec {
             Codec::Dts => find_box(&body[children..], b"ddts")
                 .filter(|b| b.len() >= 4)
                 .map(|b| be32(b, 0))
-                .filter(|&hz| SampleRate::from_hz(hz) != SampleRate::Unknown),
+                .filter(|&hz| hz != 0),
             _ => None,
         };
         Some(StsdInfo {
@@ -2413,6 +2414,19 @@ mod tests {
         let e = audio_entry(6, 0, &mp4_box(b"ddts", &ddts));
         let a = read_audio(audio_moov(90_000, b"dtsh", &e));
         assert_eq!(a.sample_rate, SampleRate::S96);
+    }
+
+    // A ddts rate SampleRate cannot name reads as Unknown, never the entry's family base.
+    #[test]
+    fn a_dts_ddts_rate_outside_sample_rate_is_not_read_as_its_family_base() {
+        for hz in [12_000u32, 24_000, 32_000] {
+            let mut ddts = hz.to_be_bytes().to_vec();
+            ddts.extend_from_slice(&[0u8; 15]);
+            // audio_entry's samplerate is 48000, the family base of 12/24 kHz.
+            let e = audio_entry(6, 0, &mp4_box(b"ddts", &ddts));
+            let a = read_audio(audio_moov(48_000, b"dtsc", &e));
+            assert_eq!(a.sample_rate, SampleRate::Unknown, "{hz}");
+        }
     }
 
     // A 96 kHz DTS-HD MA track written by Mp4Sink reads back as 96 kHz.

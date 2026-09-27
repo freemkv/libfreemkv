@@ -408,12 +408,13 @@ fn ddts_box(c: &DtsConfig, max_rate: u32) -> Vec<u8> {
     bx(b"ddts", &out)
 }
 
-// DTS sample-entry samplerate: the family base of the maximum rate (ETSI TS 102 114 E.2.2.2).
+// DTS sample-entry samplerate: the family base of the maximum rate (ETSI TS 102 114
+// E.2.2.2); the 4x core rates join their family per Table 5-6.
 fn dts_entry_rate(max_rate: u32) -> u32 {
     match max_rate {
-        24_000 | 48_000 | 96_000 | 192_000 => 48_000,
-        22_050 | 44_100 | 88_200 | 176_400 => 44_100,
-        16_000 | 32_000 | 64_000 | 128_000 => 32_000,
+        12_000 | 24_000 | 48_000 | 96_000 | 192_000 => 48_000,
+        11_025 | 22_050 | 44_100 | 88_200 | 176_400 => 44_100,
+        8_000 | 16_000 | 32_000 | 64_000 | 128_000 => 32_000,
         other => other,
     }
 }
@@ -698,10 +699,32 @@ mod tests {
         let e = dolby_sample_entry(Codec::DtsHdMa, &f, 44_100).unwrap();
         let ddts = e.windows(4).position(|w| w == b"ddts").unwrap();
         assert_eq!(&e[ddts + 4..ddts + 8], &48_000u32.to_be_bytes());
-        assert_eq!(dts_entry_rate(192_000), 48_000);
-        assert_eq!(dts_entry_rate(88_200), 44_100);
-        assert_eq!(dts_entry_rate(64_000), 32_000);
-        assert_eq!(dts_entry_rate(12_000), 12_000);
+    }
+
+    // ETSI TS 102 114 E.2.2.2 families, with the 4x-interpolated core rates of
+    // Table 5-6 (8/11.025/12 kHz) in the same family as their 2x siblings.
+    #[test]
+    fn dts_entry_rate_maps_every_rate_to_its_family_base() {
+        for (rate, base) in [
+            (12_000, 48_000),
+            (24_000, 48_000),
+            (48_000, 48_000),
+            (96_000, 48_000),
+            (192_000, 48_000),
+            (11_025, 44_100),
+            (22_050, 44_100),
+            (44_100, 44_100),
+            (88_200, 44_100),
+            (176_400, 44_100),
+            (8_000, 32_000),
+            (16_000, 32_000),
+            (32_000, 32_000),
+            (64_000, 32_000),
+            (128_000, 32_000),
+            (36_000, 36_000),
+        ] {
+            assert_eq!(dts_entry_rate(rate), base, "{rate}");
+        }
     }
 
     #[test]
