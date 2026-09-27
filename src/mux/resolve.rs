@@ -2239,7 +2239,7 @@ mod tests {
         let mut t = DiscTitle::empty();
         t.streams.push(Stream::Audio(AudioStream {
             pid,
-            codec: Codec::Aac, // → all-keyframe PassthroughParser (1 PES = 1 frame)
+            codec: Codec::Aac, // → AdtsParser
             channels: AudioChannels::Stereo,
             language: "eng".into(),
             sample_rate: SampleRate::S48,
@@ -2510,7 +2510,7 @@ mod tests {
             .read()
             .expect("read ok")
             .expect("one frame emitted from the single PES");
-        // PassthroughParser routes the audio stream (PID 0x1100) to track 0.
+        // AdtsParser passes the unsynced ES through; PID 0x1100 routes to track 0.
         assert_eq!(frame.track, 0);
         // TS PesAssembler delivers every byte after the 9-byte PES header to
         // the end of the 184-byte TS payload (PES is closed by next PUSI or

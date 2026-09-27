@@ -147,6 +147,8 @@ impl DtsParser {
 
     /// Drop `n` bytes from the front, rebasing attribution onto the new front.
     fn drain_front(&mut self, n: usize) {
+        #[cfg(test)]
+        DRAIN_CALLS.with(|c| c.set(c.get() + 1));
         self.acc.drain(n);
     }
 
@@ -164,6 +166,12 @@ impl DtsParser {
     fn front_source(&self) -> Option<crate::pes::SourcePos> {
         self.acc.front().source
     }
+}
+
+// Test-only count of `drain_front` calls, proving a bogus-sync resync is one drain.
+#[cfg(test)]
+thread_local! {
+    static DRAIN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Hard cap on a buffered access unit (core + all its extension substreams).
@@ -187,6 +195,13 @@ const PTS_UNSET: i64 = -1;
 
 impl CodecParser for DtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
+        // A PTS-less PES after a gap continues from the pre-gap projection, not 0. Best
+        // effort: the lost span is unknown, so such a PES lands early by the gap's length.
+        let gap_carry = if self.next_pts_ns != PTS_UNSET {
+            self.next_pts_ns
+        } else {
+            self.continuation_base_ns()
+        };
         // B1: a concealed/lost gap means the buffered DTS AU is TRUNCATED; splicing
         // post-gap bytes onto it corrupts the framing. Drop the partial AU and its
         // PTS marks (DTS frames independently resync, unlike TrueHD/MLP).
@@ -205,7 +220,13 @@ impl CodecParser for DtsParser {
         // timeline to 0 — continue from the most recent known base.
         let pts_ns = super::pesbuf::PesFacts::of(pes)
             .presentation_ns()
-            .unwrap_or_else(|| self.continuation_base_ns());
+            .unwrap_or_else(|| {
+                if pes.discontinuity {
+                    gap_carry
+                } else {
+                    self.continuation_base_ns()
+                }
+            });
 
         // Blu-ray DTS-HD MA/HRA: core frame + extension substreams (lossless data)
         // arrive in SEPARATE, later PES packets, so assemble core-to-next-core
@@ -224,9 +245,10 @@ impl CodecParser for DtsParser {
         let mut frames = Vec::new();
 
         loop {
-            // Resync to the first core sync; drop any leading junk.
-            let Some(start) = find_sync(self.acc.as_slice(), &DTS_CORE_SYNC) else {
-                // No core sync at all yet — keep at most a 3-byte tail so a
+            // Resync to the first candidate core sync; drop leading junk and any run of
+            // bogus (implausibly sized) syncs in ONE drain rather than 4 bytes at a time.
+            let Some(start) = first_core_candidate(self.acc.as_slice(), 0) else {
+                // No candidate core sync yet — keep at most a 3-byte tail so a
                 // sync split across PES packets can still be found next time.
                 if self.acc.len() > 3 {
                     let tail = self.acc.len() - 3;
@@ -250,15 +272,8 @@ impl CodecParser for DtsParser {
             if self.acc.len() < CORE_HEADER_MIN_BYTES {
                 break;
             }
+            // Plausible by construction: `first_core_candidate` skipped bogus sizes.
             let core_size = dts_core_frame_size(self.acc.as_slice());
-            // A real core frame is at least MIN_CORE_FRAME_BYTES (96, ETSI floor);
-            // a smaller size came from a false sync, so reject it (drain 4 bytes,
-            // resync) rather than close the AU at a junk boundary.
-            if !(MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&core_size) {
-                // Bogus core sync — skip past it and resync.
-                self.drain_front(4);
-                continue;
-            }
             if self.acc.len() < core_size {
                 break; // core frame not fully buffered yet — wait
             }
@@ -378,35 +393,78 @@ impl DtsParser {
     }
 }
 
-/// Offset where the FINAL access unit ends at end-of-stream, dropping a truncated trailing
-/// core. Trailing DTS-HD extension substreams belong to this AU and are skipped precisely
-/// (kept); a trailing CORE sync — complete or truncated — begins a NEW AU that never closed
-/// during `parse()`, so the AU ends there. A tail too short to identify, or non-sync garbage,
-/// is kept with the AU.
+/// Offset where the FINAL access unit ends at end-of-stream, mirroring `next_core_boundary`.
+/// Complete extension substreams are kept; a plausible or truncated trailing core begins a
+/// NEW AU that never closed, so the AU ends there; garbage or a truncated extension leaves
+/// the core alone.
 fn final_au_end(buf: &[u8], core_size: usize) -> usize {
-    let mut pos = core_size;
+    let mut pos = exss_start(buf, core_size);
     loop {
-        if buf.len().saturating_sub(pos) < SYNCWORD_BYTES {
-            // Fewer than a syncword of trailing bytes: nothing identifiable —
-            // keep them with this AU (the same 3-byte-tail tolerance as parse).
+        let tail = &buf[pos..];
+        if tail.is_empty() {
             return buf.len();
+        }
+        if tail.len() < SYNCWORD_BYTES {
+            // A core-sync prefix is a truncated new AU (dropped); anything else is a
+            // truncated extension or garbage, which leaves the core alone.
+            return if DTS_CORE_SYNC.starts_with(tail) {
+                pos
+            } else {
+                core_size
+            };
         }
         if buf[pos..].starts_with(&DTS_HD_EXT_SYNC) {
             match exss_frame_size(&buf[pos..]) {
                 // A fully-buffered extension substream belongs to this AU.
                 Some(sz) if sz >= SYNCWORD_BYTES && buf.len() >= pos + sz => pos += sz,
-                // Truncated/unsizeable extension at EOS: still part of this AU.
-                _ => return buf.len(),
+                // Sized but truncated at EOS: a decoder would read past it; core only.
+                Some(sz) if sz >= SYNCWORD_BYTES => return core_size,
+                // Unsizeable: scan for the next core, as parse() does.
+                _ => return first_core_candidate(buf, pos).unwrap_or(buf.len()),
             }
         } else if buf[pos..].starts_with(&DTS_CORE_SYNC) {
-            // A trailing core (truncated — a complete one would have closed the
-            // AU during parse) is a new AU that never completed: drop it.
-            return pos;
+            // A trailing core (truncated — a complete one would have closed the AU during
+            // parse) is a new AU that never completed: drop it. Plausibility as in
+            // `next_core_boundary`: a false sync stays with this AU.
+            return first_core_candidate(buf, pos).unwrap_or(buf.len());
         } else {
-            // Non-sync garbage after the core is not a further AU; keep it.
-            return buf.len();
+            // Garbage at the extension boundary: parse() emits the core alone.
+            return core_size;
         }
     }
+}
+
+// Where extensions after a core begin: an EXSS is 4-byte aligned after a core whose size is
+// not a multiple of 4 (as ffmpeg's dcadec frames it), so skip up to 3 padding bytes to it.
+fn exss_start(buf: &[u8], core_size: usize) -> usize {
+    let aligned = core_size.next_multiple_of(4);
+    let padded_exss = buf
+        .get(aligned..)
+        .is_some_and(|t| t.starts_with(&DTS_HD_EXT_SYNC));
+    let direct = buf
+        .get(core_size..)
+        .is_some_and(|t| t.starts_with(&DTS_CORE_SYNC) || t.starts_with(&DTS_HD_EXT_SYNC));
+    if padded_exss && !direct {
+        aligned
+    } else {
+        core_size
+    }
+}
+
+// First core sync at or after `from` whose header is truncated (undecidable) or whose size is
+// plausible; bogus syncs before it are skipped in one pass.
+fn first_core_candidate(buf: &[u8], from: usize) -> Option<usize> {
+    let mut from = from;
+    while let Some(rel) = find_sync(&buf[from..], &DTS_CORE_SYNC) {
+        let pos = from + rel;
+        if buf.len() - pos < CORE_HEADER_MIN_BYTES
+            || (MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&dts_core_frame_size(&buf[pos..]))
+        {
+            return Some(pos);
+        }
+        from = pos + SYNCWORD_BYTES;
+    }
+    None
 }
 
 fn find_sync(data: &[u8], pattern: &[u8; 4]) -> Option<usize> {
@@ -483,7 +541,11 @@ fn exss_frame_size(buf: &[u8]) -> Option<usize> {
 // skipped PRECISELY by declared size, so a false core sync in XLL payload can't be mistaken for
 // the boundary.
 fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
-    let mut pos = core_size;
+    // Up to 3 alignment bytes may precede the EXSS; decide only once they are buffered.
+    if buf.len() < core_size.next_multiple_of(4) + SYNCWORD_BYTES {
+        return NextCore::NeedMore;
+    }
+    let mut pos = exss_start(buf, core_size);
     loop {
         if buf.len() < pos + SYNCWORD_BYTES {
             return NextCore::NeedMore; // need a syncword to identify the next chunk
@@ -933,6 +995,131 @@ mod tests {
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 512);
+    }
+
+    // A fully-buffered trailing core sync whose size is implausible is not a new AU in
+    // parse() (next_core_boundary rejects it), so EOS must keep it with the AU too.
+    #[test]
+    fn implausible_trailing_core_sync_is_kept_at_eos() {
+        let mut buf = make_dts_core(512);
+        buf.extend_from_slice(&make_exss(64, None));
+        let mut fake = make_dts_core(17); // fsize decodes below MIN_CORE_FRAME_BYTES
+        fake.resize(40, 0x11);
+        buf.extend_from_slice(&fake);
+        assert!(matches!(next_core_boundary(&buf, 512), NextCore::None));
+        assert_eq!(final_au_end(&buf, 512), buf.len());
+    }
+
+    // An unsizeable extension (declared size < a syncword) makes parse() fall back to
+    // scanning for the next core; EOS must do the same and drop a truncated next core.
+    #[test]
+    fn truncated_core_after_unsizeable_ext_is_dropped_at_eos() {
+        let mut ext = make_exss(64, None);
+        ext[6] &= 0xE0; // nuExtSSFsize = 0 -> size 1: unsizeable
+        ext[7] = 0;
+        ext[8] = 0;
+        let mut buf = make_dts_core(512);
+        buf.extend_from_slice(&ext);
+        let trunc = buf.len();
+        buf.extend_from_slice(&DTS_CORE_SYNC);
+        buf.extend_from_slice(&[0x00, 0x00]);
+        assert_eq!(final_au_end(&buf, 512), trunc);
+    }
+
+    // Garbage at the extension boundary: parse() emits the core alone, and so must EOS.
+    #[test]
+    fn garbage_after_core_is_dropped_at_eos() {
+        let mut buf = make_dts_core(512);
+        buf.extend(std::iter::repeat_n(0xAB, 300));
+        assert!(matches!(
+            next_core_boundary(&buf, 512),
+            NextCore::None
+                | NextCore::Found {
+                    ext_clean: false,
+                    ..
+                }
+        ));
+        assert_eq!(final_au_end(&buf, 512), 512);
+    }
+
+    // A run of bogus core syncs must be skipped in one drain, not one memmove per sync.
+    #[test]
+    fn bogus_sync_run_is_skipped_in_one_drain() {
+        let mut data = Vec::new();
+        for _ in 0..200 {
+            data.extend_from_slice(&make_dts_core(17)); // size 17 < MIN: bogus
+        }
+        data.extend_from_slice(&make_dts_core(512));
+        data.extend_from_slice(&make_dts_core(512));
+        let mut parser = DtsParser::new();
+        DRAIN_CALLS.with(|c| c.set(0));
+        let frames = parser.parse(&make_pes(data, Some(90_000)));
+        assert_eq!(frames.len(), 1);
+        let drains = DRAIN_CALLS.with(|c| c.get());
+        assert!(drains <= 3, "{drains} drains for one resync");
+    }
+
+    // Through parse(): a PTS-less PES after a discontinuity continues from the
+    // pre-gap projection instead of restarting the timeline at 0.
+    #[test]
+    fn pts_less_pes_after_gap_continues_the_timeline() {
+        let mut parser = DtsParser::new();
+        let mut first = make_dts_core(512);
+        first.extend_from_slice(&make_dts_core(512));
+        assert_eq!(parser.parse(&make_pes(first, Some(90_000))).len(), 1);
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes(make_dts_core(512), None)
+        };
+        assert!(parser.parse(&gap).is_empty());
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].pts_ns, pts_to_ns(90_000) + DTS_CORE_DUR_NS);
+    }
+
+    // A core whose size is not a multiple of 4 is padded to a 4-byte boundary before its
+    // EXSS (ffmpeg dcadec aligns the same way); the extension must still be kept.
+    #[test]
+    fn exss_after_unaligned_core_is_kept() {
+        let core = make_dts_core(2013);
+        let mut au = core.clone();
+        au.extend_from_slice(&[0, 0, 0]); // pad to 2016
+        au.extend_from_slice(&make_exss(64, None));
+        let mut buf = au.clone();
+        buf.extend_from_slice(&make_dts_core(512));
+        assert!(matches!(
+            next_core_boundary(&buf, 2013),
+            NextCore::Found {
+                end: 2080,
+                ext_clean: true
+            }
+        ));
+        assert_eq!(
+            final_au_end(&au, 2013),
+            au.len(),
+            "EOS keeps the extension too"
+        );
+        let f = DtsParser::new().parse(&make_pes(buf, Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, au, "parse() keeps pad + EXSS with the core");
+    }
+
+    // At EOS a truncated extension (sized or 1-3 unidentified bytes) leaves the core alone,
+    // like garbage; a 1-3 byte core-sync prefix is a truncated new AU and is dropped.
+    #[test]
+    fn eos_truncated_tail_is_handled_consistently() {
+        let core = make_dts_core(512);
+        let exss = make_exss(64, None);
+        let mut buf = core.clone();
+        buf.extend_from_slice(&exss[..30]);
+        assert_eq!(final_au_end(&buf, 512), 512, "truncated sized EXSS dropped");
+        let mut buf = core.clone();
+        buf.extend_from_slice(&[0xAB, 0xCD]);
+        assert_eq!(final_au_end(&buf, 512), 512, "short garbage tail dropped");
+        let mut buf = core.clone();
+        buf.extend_from_slice(&exss);
+        buf.extend_from_slice(&DTS_CORE_SYNC[..2]);
+        assert_eq!(final_au_end(&buf, 512), 576, "truncated next core dropped");
     }
 
     #[test]

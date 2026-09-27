@@ -238,11 +238,25 @@ pub trait Stream: Send {
         None
     }
 
-    /// True when `codec_private` is available for every video track —
+    /// True when `codec_private` is available for every primary video track
+    /// and every AAC track (the latter bounded by a short wait and EOF) —
     /// callers buffer input frames until this flips, since some output
     /// formats (MKV) can't write frames without codec init data.
     fn headers_ready(&self) -> bool {
         true
+    }
+
+    /// `(track, frames)` for tracks whose in-band codec config changed after
+    /// the track header was fixed (e.g. AAC stereo↔5.1); those frames keep the
+    /// first config. Empty when none.
+    fn config_changes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
+    /// Supply a codec_private that resolved after the header was written (late
+    /// AAC config). `Ok(true)` when the sink recorded it; default `Ok(false)`.
+    fn set_codec_private(&mut self, _track: usize, _data: &[u8]) -> std::io::Result<bool> {
+        Ok(false)
     }
 
     /// Cumulative count of read errors the stream skipped past (e.g.
@@ -342,6 +356,14 @@ impl Stream for CountingStream {
 
     fn headers_ready(&self) -> bool {
         self.inner.headers_ready()
+    }
+
+    fn config_changes(&self) -> Vec<(usize, u64)> {
+        self.inner.config_changes()
+    }
+
+    fn set_codec_private(&mut self, track: usize, data: &[u8]) -> std::io::Result<bool> {
+        self.inner.set_codec_private(track, data)
     }
 
     fn errors(&self) -> u64 {

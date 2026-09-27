@@ -634,7 +634,14 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// diagnosable from a future log without the disc. `None` on normal runs
     /// (diag off) — the muxer pays nothing.
     opening_capture: Option<crate::diag::OpeningCapture>,
+    /// Per track: file offset of a Void reserved for a CodecPrivate that was not
+    /// known at header time (AAC), filled by [`Self::set_codec_private`].
+    codec_private_reserves: std::collections::HashMap<usize, u64>,
 }
+
+// Bytes reserved for a late AAC CodecPrivate: ID (2) + size (1-2) + an ASC of
+// up to 12 bytes, all inside one Void so the Tracks size never changes.
+const CODEC_PRIVATE_RESERVE: usize = 16;
 
 /// Deferred AC-3 channel-count correction: the track header's `Channels` byte
 /// is written up-front from the (unreliable) IFO count; on the first AC-3 frame
@@ -864,6 +871,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             std::collections::HashMap::new();
         let mut pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup> =
             std::collections::HashMap::new();
+        let mut codec_private_reserves: std::collections::HashMap<usize, u64> =
+            std::collections::HashMap::new();
         let mut flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup> =
             std::collections::HashMap::new();
         // Per track: whether it emitted a conforming `mvcC` BlockAdditionMapping.
@@ -936,6 +945,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     // Non-MVC (2D/UHD/audio/…): write codec_private verbatim, unchanged.
                     None => ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, cp)?,
                 }
+            } else if track.codec_id == ebml::CODEC_AAC {
+                codec_private_reserves.insert(i, writer.stream_position()?);
+                writer.write_all(&ebml::void_element(CODEC_PRIVATE_RESERVE))?;
             }
             // Pre-0.13's deferred codecPrivate path was removed as dead code.
 
@@ -1173,7 +1185,39 @@ impl<W: Write + Seek> MkvMuxer<W> {
             pgs_forced_fixups,
             flag_interlaced_fixups,
             opening_capture: None,
+            codec_private_reserves,
         })
+    }
+
+    /// Fill a CodecPrivate reserved at header time. `Ok(false)` when the track
+    /// had no reservation (already set, or not AAC) or `cp` does not fit.
+    pub(crate) fn set_codec_private(&mut self, track: usize, cp: &[u8]) -> io::Result<bool> {
+        let Some(&pos) = self.codec_private_reserves.get(&track) else {
+            return Ok(false);
+        };
+        let mut rest = match CODEC_PRIVATE_RESERVE.checked_sub(3 + cp.len()) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let mut el = Vec::with_capacity(CODEC_PRIVATE_RESERVE);
+        ebml::write_id(&mut el, ebml::CODEC_PRIVATE)?;
+        // A 1-byte remainder cannot hold a Void, so widen the size VINT instead.
+        if rest == 1 {
+            el.extend_from_slice(&[0x40, cp.len() as u8]);
+            rest = 0;
+        } else {
+            ebml::write_size(&mut el, cp.len() as u64)?;
+        }
+        el.extend_from_slice(cp);
+        if rest >= 2 {
+            el.extend_from_slice(&ebml::void_element(rest));
+        }
+        let here = self.writer.stream_position()?;
+        self.writer.seek(std::io::SeekFrom::Start(pos))?;
+        self.writer.write_all(&el)?;
+        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        self.codec_private_reserves.remove(&track);
+        Ok(true)
     }
 
     /// Attach an opening-frame capture (`--log-level 3`). The capture writes the

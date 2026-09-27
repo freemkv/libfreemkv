@@ -14,10 +14,9 @@ pub mod adts;
 mod audio_frames;
 /// Codec-agnostic per-picture coding carrier (`PictureInfo` + accessors).
 pub mod coding;
-/// DTS / DTS-HD elementary-stream parser.
 pub(crate) mod crc;
 pub(crate) mod dropgate;
-
+/// DTS / DTS-HD elementary-stream parser.
 pub mod dts;
 /// DVD bitmap subtitle (VobSub) parser.
 pub mod dvdsub;
@@ -119,6 +118,11 @@ pub trait CodecParser: Send {
     /// Get codec initialization data (e.g., SPS+PPS for H.264).
     /// Returns None until enough data has been seen.
     fn codec_private(&self) -> Option<Vec<u8>>;
+
+    /// Frames whose in-band config differs from the kept first config.
+    fn config_changes(&self) -> u64 {
+        0
+    }
 }
 
 /// Passthrough parser — treats each PES as one frame, no parsing.
@@ -268,12 +272,10 @@ mod tests {
     // interchangeable.
     #[test]
     fn parsers_that_derive_no_config_report_absent_never_an_empty_codec_private() {
-        // Codecs whose parsers do no configuration extraction, paired with a
-        // payload that is a REAL frame of that codec so the gate takes its
-        // keep-path (a rejected frame proves nothing about the config answer).
-        let cases: [(Codec, Vec<u8>); 5] = [
-            // ADTS: syncword FFF1, MPEG-4 AAC-LC, 44.1 kHz, stereo, 7-byte frame.
-            (Codec::Aac, vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0xBF, 0xFC]),
+        // Parsers with no config extraction, each fed a REAL frame so the gate
+        // keeps it (a rejected frame proves nothing). AAC derives an ASC, so
+        // it is tested separately below.
+        let cases: [(Codec, Vec<u8>); 4] = [
             // MPEG-1 Layer II, 44.1 kHz, 128 kbit/s, stereo.
             (Codec::Mp2, vec![0xFF, 0xFD, 0x70, 0x00, 0x00, 0x00]),
             // MPEG-1 Layer III, 44.1 kHz, 128 kbit/s, stereo.
@@ -307,6 +309,20 @@ mod tests {
         }
     }
 
+    // A valid ADTS frame (AAC-LC, 44.1 kHz, stereo, frame_length 7) must yield
+    // its AudioSpecificConfig as soon as the frame is parsed.
+    #[test]
+    fn aac_parser_derives_audio_specific_config_from_first_frame() {
+        let mut parser = parser_for_codec(Codec::Aac, None, false);
+        assert_eq!(parser.codec_private(), None);
+        let frames = parser.parse(&pes(
+            Some(0),
+            vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0xFF, 0xFC],
+        ));
+        assert_eq!(frames.len(), 1, "the frame is valid, not dropped");
+        assert_eq!(parser.codec_private(), Some(vec![0x12, 0x10]));
+    }
+
     #[test]
     fn audio_codecs_emit_keyframe_frames() {
         // PES = frame audio: every frame is independently decodable → keyframe.
@@ -336,6 +352,7 @@ mod provenance_guard {
         ("mod.rs", include_str!("mod.rs")),
         ("ac3.rs", include_str!("ac3.rs")),
         ("adts.rs", include_str!("adts.rs")),
+        ("audio_frames.rs", include_str!("audio_frames.rs")),
         ("dts.rs", include_str!("dts.rs")),
         ("dvdsub.rs", include_str!("dvdsub.rs")),
         ("flac.rs", include_str!("flac.rs")),
@@ -443,9 +460,9 @@ mod provenance_guard {
             .lines()
             .filter_map(|l| {
                 let l = l.trim();
-                let rest = l
-                    .strip_prefix("pub mod ")
-                    .or_else(|| l.strip_prefix("pub(crate) mod "))?;
+                let rest = ["pub mod ", "pub(crate) mod ", "mod "]
+                    .iter()
+                    .find_map(|p| l.strip_prefix(p))?;
                 rest.strip_suffix(';')
             })
             .collect();

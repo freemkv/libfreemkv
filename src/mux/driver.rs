@@ -52,7 +52,7 @@ fn effective_send_deadline(send_deadline: Option<Duration>) -> Duration {
 
 // Ceiling on bytes buffered while waiting for `headers_ready()`, so a damaged title whose
 // `codec_private` never resolves fails fast instead of OOM-killing the process.
-const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
 
 /// Where [`mux_stream`] reads its PES frames from. The driver owns the
 /// construction of the underlying [`Stream`] so consumers stop hand-rolling
@@ -552,8 +552,8 @@ fn drive_mux(
         });
     }
 
-    // ── Header pump ── Buffer frames until every video track's codec_private
-    // has resolved; MKV can't write a track header without codec init data.
+    // ── Header pump ── Buffer frames until every video (and AAC) track's
+    // codec_private has resolved; MKV can't write a track header without codec init data.
     // The loop breaks on EOF/None too, so the gate below re-checks.
     let mut buffered: Vec<PesFrame> = Vec::new();
     let mut buffered_bytes: usize = 0;
@@ -599,9 +599,9 @@ fn drive_mux(
                         target: "mux",
                         buffered_bytes,
                         cap = HEADER_BUFFER_CAP_BYTES,
-                        "header buffer cap exceeded: the title keeps yielding frames but no \
-                         video track's codec_private ever resolved; refusing rather than \
-                         buffering the whole stream into RAM"
+                        "header buffer cap exceeded: the title keeps yielding frames but a \
+                         required codec_private (video or AAC) never resolved; refusing \
+                         rather than buffering the whole stream into RAM"
                     );
                     return Err(Error::MuxHeaderBufferExceeded {
                         bytes: buffered_bytes as u64,
@@ -613,24 +613,24 @@ fn drive_mux(
         }
     }
 
-    // ── Header gate ── The pump can break on EOF without headers resolving.
-    // Finalising then would write a track header with no CODEC_PRIVATE — a
-    // structurally-invalid MKV the zero-output guard does not catch. Refuse.
+    // ── Header gate ── Halt first, whatever headers_ready() says: on the
+    // highway path a halt can end the stream as `Ok(None)`, and that EOF also
+    // releases the AAC wait, so a ready gate does not mean the pump finished.
+    if halt.is_cancelled() {
+        return Ok(MuxOutcome {
+            completed: false,
+            output_opened: false,
+            bytes_written: 0,
+            errors: stream.errors(),
+            lost_bytes: stream.lost_bytes(),
+            streams: 0,
+            undelivered_streams: Vec::new(),
+        });
+    }
+    // The pump can break on EOF without headers resolving. Finalising then would
+    // write a track header with no CODEC_PRIVATE — a structurally-invalid MKV the
+    // zero-output guard does not catch. Refuse.
     if !stream.headers_ready() {
-        // Re-check halt FIRST: on the highway path a halt can end the stream as
-        // `Ok(None)` rather than `Err(Halted)`, breaking the loop with headers
-        // unresolved through no fault of the data — not a malformed disc.
-        if halt.is_cancelled() {
-            return Ok(MuxOutcome {
-                completed: false,
-                output_opened: false,
-                bytes_written: 0,
-                errors: stream.errors(),
-                lost_bytes: stream.lost_bytes(),
-                streams: 0,
-                undelivered_streams: Vec::new(),
-            });
-        }
         return Err(Error::MkvInvalid.into());
     }
 
@@ -641,6 +641,22 @@ fn drive_mux(
     out_title.codec_privates = (0..info.streams.len())
         .map(|i| stream.codec_private(i))
         .collect();
+    // AAC tracks whose ASC was unknown at header time: handed to the sink when
+    // it resolves (a seekable MKV backpatches it).
+    let mut late_aac: Vec<usize> = info
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(track, s)| {
+            matches!(s, crate::disc::Stream::Audio(a) if matches!(a.codec, crate::disc::Codec::Aac))
+                && out_title
+                    .codec_privates
+                    .get(*track)
+                    .is_none_or(Option::is_none)
+        })
+        .map(|(track, _)| track)
+        .collect();
+    let late_configs: LateConfigs = Arc::default();
     let total_bytes = info.size_bytes;
     let num_streams = info.streams.len();
 
@@ -659,6 +675,7 @@ fn drive_mux(
     let sink = WriteSink {
         output: output_stream,
         bytes: bytes.clone(),
+        late_configs: late_configs.clone(),
     };
     let pipe = Pipeline::spawn_named("freemkv-mux-consumer", WRITE_PIPELINE_DEPTH, sink)
         .map_err(std::io::Error::from)?;
@@ -690,6 +707,10 @@ fn drive_mux(
             }
             match stream.read() {
                 Ok(Some(frame)) => {
+                    // Queued before the frame is sent, so the sink applies it first.
+                    if !late_aac.is_empty() {
+                        collect_late_configs(&*stream, &mut late_aac, &late_configs);
+                    }
                     if pipe.send_with_halt(frame, halt, deadline).is_err() {
                         interrupted = true;
                         break;
@@ -734,6 +755,13 @@ fn drive_mux(
         }
     }
 
+    if !late_aac.is_empty() {
+        collect_late_configs(&*stream, &mut late_aac, &late_configs);
+        if !late_aac.is_empty() {
+            tracing::debug!(target: "mux", tracks = ?late_aac, "AAC tracks never yielded an AudioSpecificConfig");
+        }
+    }
+
     // ── Finish ── Drop the producer, join the consumer; `close()` finalises
     // the container. On halt/wedge this returns an error variant, translated
     // to `completed = false` rather than a hard failure.
@@ -750,6 +778,15 @@ fn drive_mux(
             target: "mux",
             streams = ?undelivered_streams,
             "output sink could not deliver every planned stream; the file does not match              the pre-mux plan (surfaced as MuxOutcome::undelivered_streams)"
+        );
+    }
+
+    for (track, frames) in stream.config_changes() {
+        tracing::warn!(
+            target: "mux",
+            track,
+            frames,
+            "in-band codec config changed mid-track; those frames keep the first config"
         );
     }
 
@@ -783,18 +820,55 @@ fn drive_mux(
     })
 }
 
+// Late `(track, codec_private)` pairs from the reader, drained by the sink.
+type LateConfigs = Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>;
+
+fn lock_late(q: &LateConfigs) -> std::sync::MutexGuard<'_, Vec<(usize, Vec<u8>)>> {
+    q.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// Move tracks whose codec_private has now resolved from `pending` to the queue.
+fn collect_late_configs(stream: &dyn Stream, pending: &mut Vec<usize>, out: &LateConfigs) {
+    pending.retain(|&track| match stream.codec_private(track) {
+        Some(cp) => {
+            lock_late(out).push((track, cp));
+            false
+        }
+        None => true,
+    });
+}
+
 // Write-side `Sink`: applies each frame to the counting output stream and
 // finalises the container on close. `close()` returns the payload-byte count
 // plus any undelivered streams (see `MuxOutcome::undelivered_streams`).
 struct WriteSink {
     output: CountingStream,
     bytes: Arc<AtomicU64>,
+    late_configs: LateConfigs,
+}
+
+impl WriteSink {
+    fn apply_late_configs(&mut self) -> Result<(), Error> {
+        let late = std::mem::take(&mut *lock_late(&self.late_configs));
+        for (track, cp) in late {
+            if !self
+                .output
+                .set_codec_private(track, &cp)
+                .map_err(Error::from)?
+            {
+                // Most such sinks (m2ts/stdio/network) carry config in-band anyway.
+                tracing::debug!(target: "mux", track, "sink does not record a late codec_private");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Sink<PesFrame> for WriteSink {
     type Output = (u64, Vec<usize>);
 
     fn apply(&mut self, frame: PesFrame) -> Result<Flow, Error> {
+        self.apply_late_configs()?;
         self.output.write(&frame).map_err(Error::from)?;
         self.bytes
             .store(self.output.bytes_written(), Ordering::Relaxed);
@@ -802,6 +876,7 @@ impl Sink<PesFrame> for WriteSink {
     }
 
     fn close(mut self) -> Result<(u64, Vec<usize>), Error> {
+        self.apply_late_configs()?;
         self.output.finish().map_err(Error::from)?;
         // Sample AFTER finish(): the mp4 sink decides its drops there.
         Ok((
@@ -838,6 +913,9 @@ mod tests {
         /// value — simulating a halt landing DURING a blocking `fill_extents` read
         /// (the common operator-stop case).
         halt_err_at_read: Option<usize>,
+        /// If set, `headers_ready` also flips once `read()` has returned `None`.
+        ready_on_eof: bool,
+        eof_seen: bool,
     }
 
     fn audio_stream() -> crate::disc::Stream {
@@ -868,6 +946,8 @@ mod tests {
                 cancel_halt: None,
                 read_observer: None,
                 halt_err_at_read: None,
+                ready_on_eof: false,
+                eof_seen: false,
             }
         }
         /// After `after` successful reads, the next `read()` returns
@@ -915,6 +995,7 @@ mod tests {
                 return Err(crate::error::Error::Halted.into());
             }
             let f = self.frames.pop_front();
+            self.eof_seen |= f.is_none();
             if f.is_some() {
                 self.reads += 1;
                 if let Some(obs) = &self.read_observer {
@@ -936,7 +1017,7 @@ mod tests {
             self.codec_private_ready.then(|| vec![1, 2, 3])
         }
         fn headers_ready(&self) -> bool {
-            self.reads >= self.headers_ready_after
+            self.reads >= self.headers_ready_after || (self.ready_on_eof && self.eof_seen)
         }
     }
 
@@ -1132,6 +1213,30 @@ mod tests {
         .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
         assert!(out.output_opened, "the sink was opened before the halt");
+    }
+
+    // A halt that ends the stream as Ok(None) can also release the header gate
+    // (EOF expires the AAC wait); it must still stop before the sink opens.
+    #[test]
+    fn halt_ending_the_header_pump_never_opens_the_output() {
+        let halt = Halt::new();
+        let mut fs = FakeStream::new(1).with_frames(1).cancels(halt.clone(), 1);
+        fs.headers_ready_after = usize::MAX;
+        fs.ready_on_eof = true;
+        let events = SpyEvents::new();
+        let out = drive_mux(
+            Box::new(fs),
+            "null://",
+            &halt,
+            &events,
+            None,
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("halt is a clean stop");
+        assert!(!out.completed);
+        assert!(!out.output_opened, "no sink may be opened after a halt");
+        assert!(!events.opened.load(Ordering::SeqCst));
     }
 
     // ── A halt landing mid-read (Err(Halted), the common operator-stop case)
@@ -1887,6 +1992,233 @@ mod tests {
         assert!(map_none.is_none(), "CSS/clear must NOT resolve an AACS map");
     }
 
+    // Video + a secondary AAC track whose first frame (and so its ASC) arrives at
+    // 10 s, long after headers were finalised.
+    struct LateAacStream {
+        info: DiscTitle,
+        frames: std::collections::VecDeque<PesFrame>,
+        aac_seen: bool,
+    }
+
+    impl LateAacStream {
+        fn new() -> Self {
+            use crate::disc::{
+                AudioChannels, AudioStream, Codec, ColorSpace, FrameRate, HdrFormat, LabelPurpose,
+                Resolution, SampleRate, Stream as S, VideoStream,
+            };
+            let mut info = DiscTitle::empty();
+            info.streams = vec![
+                S::Video(VideoStream {
+                    pid: 0x1011,
+                    codec: Codec::H264,
+                    resolution: Resolution::R1080p,
+                    frame_rate: FrameRate::F25,
+                    hdr: HdrFormat::Sdr,
+                    color_space: ColorSpace::Bt709,
+                    display_aspect: None,
+                    secondary: false,
+                    label: String::new(),
+                    measured_cicp: None,
+                }),
+                S::Audio(AudioStream {
+                    pid: 0x1100,
+                    codec: Codec::Aac,
+                    channels: AudioChannels::Stereo,
+                    language: "eng".into(),
+                    sample_rate: SampleRate::S44_1,
+                    secondary: true,
+                    purpose: LabelPurpose::Commentary,
+                    label: String::new(),
+                }),
+            ];
+            let frame = |track: usize, pts: i64| PesFrame {
+                discard_padding_ns: 0,
+                track,
+                pts,
+                keyframe: true,
+                data: vec![0x11; 32],
+                duration_ns: None,
+                source: None,
+                coding: None,
+            };
+            let mut frames = std::collections::VecDeque::new();
+            for i in 0..300i64 {
+                let pts = i * 40_000_000;
+                frames.push_back(frame(0, pts));
+                if pts >= 10_000_000_000 {
+                    frames.push_back(frame(1, pts));
+                }
+            }
+            LateAacStream {
+                info,
+                frames,
+                aac_seen: false,
+            }
+        }
+    }
+
+    impl Stream for LateAacStream {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            let f = self.frames.pop_front();
+            self.aac_seen |= f.as_ref().is_some_and(|f| f.track == 1);
+            Ok(f)
+        }
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+        fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+            match track {
+                0 => Some(vec![1, 0x64, 0, 0x28, 0xFF, 0xE0, 0, 0]),
+                _ => self.aac_seen.then(|| vec![0x12, 0x10]),
+            }
+        }
+    }
+
+    // A seekable MKV must end up with the late AAC track's CodecPrivate.
+    #[test]
+    fn late_aac_config_is_backpatched_into_a_seekable_mkv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("late.mkv");
+        let halt = Halt::new();
+        let out = drive_mux(
+            Box::new(LateAacStream::new()),
+            &format!("mkv://{}", path.display()),
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("mux succeeds");
+        assert!(out.completed);
+        let back = crate::mux::mkvstream::MkvStream::open(
+            std::fs::File::open(&path).expect("output exists"),
+        )
+        .expect("output parses");
+        assert_eq!(
+            back.codec_private(1),
+            Some(vec![0x12, 0x10]),
+            "late AudioSpecificConfig must reach the track header"
+        );
+    }
+
+    // Reserve fill covers every remainder shape (Void, none, the 1-byte case
+    // absorbed by a wider size VINT); an unfilled reserve stays a valid Void.
+    #[test]
+    fn mkv_late_codec_private_fills_every_reserve_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shapes.mkv");
+        let mut title = LateAacStream::new().info;
+        let aac = title.streams[1].clone();
+        title
+            .streams
+            .extend([aac.clone(), aac.clone(), aac.clone(), aac]);
+        title.codec_privates = vec![Some(vec![1, 0x64, 0, 0x28, 0xFF, 0xE0, 0, 0])];
+        let file = std::fs::File::create(&path).expect("create");
+        let mut mkv = crate::mux::mkvstream::MkvStream::create(Box::new(file), &title, None)
+            .expect("create mkv");
+        let frame = |track: usize| PesFrame {
+            discard_padding_ns: 0,
+            track,
+            pts: 0,
+            keyframe: true,
+            data: vec![0x11; 32],
+            duration_ns: None,
+            source: None,
+            coding: None,
+        };
+        // Before activation the config lands in the pending track header.
+        assert!(mkv.set_codec_private(5, &[0x11, 0x90]).expect("pending"));
+        mkv.write(&frame(0)).expect("video activates the muxer");
+        let cps: [Vec<u8>; 3] = [vec![0x12, 0x10], (0..12).collect(), (0..13).collect()];
+        for (i, cp) in cps.iter().enumerate() {
+            assert!(mkv.set_codec_private(i + 1, cp).expect("patch"));
+            assert!(!mkv.set_codec_private(i + 1, cp).expect("second patch"));
+        }
+        assert!(!mkv.set_codec_private(1, &[0; 14]).expect("too big"));
+        mkv.write(&frame(1)).expect("audio frame");
+        mkv.finish().expect("finish");
+        let back = crate::mux::mkvstream::MkvStream::open(std::fs::File::open(&path).unwrap())
+            .expect("parses");
+        for (i, cp) in cps.iter().enumerate() {
+            assert_eq!(
+                back.codec_private(i + 1).as_ref(),
+                Some(cp),
+                "track {}",
+                i + 1
+            );
+        }
+        assert_eq!(back.codec_private(4), None, "unfilled reserve is a Void");
+        assert_eq!(back.codec_private(5), Some(vec![0x11, 0x90]));
+        assert_eq!(back.info().streams.len(), 6);
+    }
+
+    // MVC folds the dependent view into the base track, shifting later stream
+    // indices down: a late config must land on the remapped AAC track.
+    #[test]
+    fn mkv_late_codec_private_follows_the_mvc_track_remap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mvc.mkv");
+        let mut title = LateAacStream::new().info;
+        let crate::disc::Stream::Video(base) = title.streams[0].clone() else {
+            unreachable!()
+        };
+        let dep = crate::disc::VideoStream {
+            pid: 0x1012,
+            label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+            ..base
+        };
+        title.streams.insert(1, crate::disc::Stream::Video(dep));
+        title.codec_privates = vec![Some(vec![1, 0x64, 0, 0x28, 0xFF, 0xE0, 0, 0])];
+        let file = std::fs::File::create(&path).expect("create");
+        let mut mkv = crate::mux::mkvstream::MkvStream::create(Box::new(file), &title, None)
+            .expect("create mkv");
+        assert!(
+            !mkv.set_codec_private(1, &[1])
+                .expect("dependent has no track")
+        );
+        assert!(mkv.set_codec_private(2, &[0x12, 0x10]).expect("aac"));
+        mkv.write(&PesFrame {
+            discard_padding_ns: 0,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0x11; 32],
+            duration_ns: None,
+            source: None,
+            coding: None,
+        })
+        .expect("video");
+        mkv.finish().expect("finish");
+        let back = crate::mux::mkvstream::MkvStream::open(std::fs::File::open(&path).unwrap())
+            .expect("parses");
+        assert_eq!(back.info().streams.len(), 2, "dependent folded into base");
+        assert_eq!(back.codec_private(1), Some(vec![0x12, 0x10]));
+    }
+
+    // Non-seekable/other sinks keep the old behaviour: no late patch, no error.
+    #[test]
+    fn late_aac_config_is_harmless_on_a_sink_without_backpatch() {
+        let halt = Halt::new();
+        let out = drive_mux(
+            Box::new(LateAacStream::new()),
+            "null://",
+            &halt,
+            &NoopEvents,
+            None,
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("mux succeeds");
+        assert!(out.completed);
+    }
+
     /// A sink that accepts every frame but reports one stream it could not put in
     /// the finished container — the `mp4://` shape (an audio track dropped at
     /// `finish()` because no frame yielded a parseable sample entry).
@@ -1922,6 +2254,7 @@ mod tests {
                 info: DiscTitle::empty(),
             })),
             bytes: Arc::new(AtomicU64::new(0)),
+            late_configs: LateConfigs::default(),
         };
         let (bytes, undelivered) = sink.close().expect("close succeeds");
         assert_eq!(bytes, 0);

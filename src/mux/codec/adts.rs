@@ -53,6 +53,7 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
 pub struct AdtsParser {
     frames: AudioFrames,
     config: Option<Vec<u8>>,
+    config_changes: u64,
 }
 
 impl Default for AdtsParser {
@@ -66,6 +67,7 @@ impl AdtsParser {
         Self {
             frames: AudioFrames::new("aac"),
             config: None,
+            config_changes: 0,
         }
     }
     pub fn dropped_frames(&self) -> u64 {
@@ -79,6 +81,8 @@ impl AdtsParser {
 impl CodecParser for AdtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         let config = &mut self.config;
+        let changes = &mut self.config_changes;
+        let pid = pes.pid;
         self.frames.parse(pes, 7, |data| {
             if !matches!(adts_verdict(data), AdtsVerdict::Valid) {
                 return None;
@@ -86,14 +90,23 @@ impl CodecParser for AdtsParser {
             let rate_index = (data[2] >> 2) & 15;
             let object_type = (data[2] >> 6) + 1;
             let channels = ((data[2] & 1) << 2) | (data[3] >> 6);
-            // MPEG-4 AudioSpecificConfig replaces the ADTS transport header in
-            // Matroska. The raw AAC payload must not retain that header or CRC.
-            config.get_or_insert_with(|| {
-                vec![
-                    (object_type << 3) | (rate_index >> 1),
-                    (rate_index << 7) | (channels << 3),
-                ]
-            });
+            // The ASC replaces the ADTS header (payload carries no header/CRC).
+            // CodecPrivate is fixed per track: a later config change keeps the
+            // first ASC and is counted.
+            let asc = [
+                (object_type << 3) | (rate_index >> 1),
+                (rate_index << 7) | (channels << 3),
+            ];
+            match config {
+                None => *config = Some(asc.to_vec()),
+                Some(first) if first[..] != asc => {
+                    if *changes == 0 {
+                        tracing::warn!(target: "mux", pid, "AAC config changed mid-stream; keeping the first");
+                    }
+                    *changes += 1;
+                }
+                Some(_) => {}
+            }
             Some(Header {
                 bytes: (usize::from(data[3] & 3) << 11)
                     | (usize::from(data[4]) << 3)
@@ -110,6 +123,9 @@ impl CodecParser for AdtsParser {
     }
     fn codec_private(&self) -> Option<Vec<u8>> {
         self.config.clone()
+    }
+    fn config_changes(&self) -> u64 {
+        self.config_changes
     }
 }
 
@@ -328,6 +344,27 @@ mod tests {
             assert_eq!(f.data, data[7..]);
         }
         assert_eq!(p.codec_private(), Some(vec![0x12, 0x10]));
+    }
+
+    // Matroska CodecPrivate is fixed per track: a later ADTS header with a
+    // different config keeps the first ASC and is counted, not silently adopted.
+    #[test]
+    fn mid_stream_config_change_keeps_first_config_and_is_counted() {
+        let stereo = adts_frame(20);
+        let mut surround = adts_frame(20);
+        surround[2] = (surround[2] & !1) | 1; // channel_configuration = 6 (5.1)
+        surround[3] = (surround[3] & 0x3F) | (2 << 6);
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(stereo.clone(), Some(0)));
+        assert_eq!(p.config_changes(), 0);
+        let f = p.parse(&make_pes(surround.clone(), Some(9000)));
+        assert_eq!(f.len(), 1, "the frame is still emitted");
+        assert_eq!(p.codec_private(), Some(vec![0x12, 0x10]), "first ASC kept");
+        assert_eq!(p.config_changes(), 1);
+        p.parse(&make_pes(surround, Some(18000)));
+        assert_eq!(p.config_changes(), 2, "every mismatching frame counts");
+        p.parse(&make_pes(stereo, Some(27000)));
+        assert_eq!(p.config_changes(), 2);
     }
 
     #[test]

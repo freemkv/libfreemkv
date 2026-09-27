@@ -206,11 +206,12 @@ impl CodecParser for H264Parser {
         let mut keyframe = false;
         // Picture coding type, MEASURED from the first coded slice's header.
         let mut coding_type: Option<CodingType> = None;
-        // Open-GOP promotion needs EVERY VCL slice intra, not just the first: a picture
-        // whose first slice is I but later slices are P/B is not a clean random-access
-        // point. `all_vcl_intra` holds only while every slice header parses AND codes as I/SI; `saw_vcl` guards against promoting a param-set-only access unit.
+        // Open-GOP promotion needs every slice of the FIRST picture intra. A later slice with
+        // first_mb_in_slice == 0 starts the next picture (the P second field of a 1080i
+        // anchor), which doesn't veto it. `saw_vcl` guards a param-set-only access unit.
         let mut all_vcl_intra = true;
         let mut saw_vcl = false;
+        let mut first_pic_done = false;
         // Did this access unit already carry each param-set type in-band?
         let mut emitted_sps = false;
         let mut emitted_pps = false;
@@ -246,26 +247,32 @@ impl CodecParser for H264Parser {
                     if nal_type == NAL_SLICE_IDR {
                         keyframe = true;
                     }
-                    // Measure coding type from each slice header (§7.3.3: first_mb_in_slice,
-                    // slice_type, both ue(v)) after unescaping EBSP (§7.3.1) — large
-                    // first_mb_in_slice needs escaped 0x00 0x00. The FIRST slice sets the picture's `coding_type`; EVERY slice feeds `all_vcl_intra` for the open-GOP promotion below.
-                    if nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR {
-                        saw_vcl = true;
+                    // Slice header (§7.3.3: first_mb_in_slice, slice_type, both ue(v)), read
+                    // after unescaping EBSP (§7.3.1). The first slice sets `coding_type`; each
+                    // slice of the first picture feeds `all_vcl_intra`.
+                    let is_slice = nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR;
+                    // Once the first picture is over (or already non-intra with its coding
+                    // type known), no later slice can change the outcome: skip the parse.
+                    let settled = first_pic_done || (coding_type.is_some() && !all_vcl_intra);
+                    if is_slice && !settled {
                         let header = unescape_ebsp_prefix(&nal[1..]);
                         let mut br = BitReader::new(&header);
-                        if let (Some(_first_mb), Some(slice_type)) = (br.read_ue(), br.read_ue()) {
-                            let ct = h264_slice_coding_type(slice_type);
-                            if coding_type.is_none() {
-                                coding_type = ct;
+                        match (br.read_ue(), br.read_ue()) {
+                            (Some(0), _) if saw_vcl => first_pic_done = true,
+                            (Some(_first_mb), Some(slice_type)) => {
+                                let ct = h264_slice_coding_type(slice_type);
+                                if coding_type.is_none() {
+                                    coding_type = ct;
+                                }
+                                if ct != Some(CodingType::I) {
+                                    all_vcl_intra = false;
+                                }
                             }
-                            if ct != Some(CodingType::I) {
-                                all_vcl_intra = false;
-                            }
-                        } else {
                             // An unparseable slice header cannot be proven intra.
-                            all_vcl_intra = false;
+                            _ => all_vcl_intra = false,
                         }
                     }
+                    saw_vcl |= is_slice;
                     // A NAL longer than u32::MAX can't be length-prefixed in the
                     // 4-byte field; skip it rather than mis-frame the output.
                     // Unreachable in practice (no real AU is >4 GiB).
@@ -282,9 +289,9 @@ impl CodecParser for H264Parser {
             return Vec::new();
         }
 
-        // Open-GOP resync anchor: BD titles use open GOPs whose random-access point is a
-        // non-IDR I-frame. H.264 signals it with a recovery_point SEI, which this parser
-        // does NOT read — it infers the anchor from the slices. Without treating it as a keyframe the resync gate (`mux/resync.rs`) can miss it and drop frames to EOF. Promote only when EVERY VCL slice is intra (a picture with a P/B slice is not a random-access point) and only on the base view (`!mvc`): a dependent MVC view is never an independent anchor.
+        // Open-GOP anchor heuristic (recovery_point SEI §D.2.8 is authoritative, not read):
+        // promote when every slice of the first picture is intra, a following P field
+        // allowed, base view only. Else the resync gate can drop frames to EOF.
         if saw_vcl && all_vcl_intra && !mvc {
             keyframe = true;
         }
@@ -613,15 +620,15 @@ mod tests {
     }
 
     // A picture whose FIRST slice is I but whose LATER slice is P/B is not a
-    // clean random-access point: the open-GOP promotion must require EVERY VCL
-    // slice to be intra, not trust the first slice alone.
+    // clean random-access point: the open-GOP promotion must require EVERY slice
+    // of the picture to be intra, not trust the first slice alone.
     #[test]
     fn a_mixed_slice_picture_with_a_p_slice_is_not_promoted() {
-        // AU with two coded slices: slice 1 is I (0x88, slice_type=7), slice 2
-        // is P (0xC0, slice_type=0). Both NAL type 1, nal_ref_idc 3 -> 0x61.
+        // One picture, two slices: I at first_mb 0 (0x88, slice_type=7), then P at
+        // first_mb 1 (ue '010', slice_type '1', stop '1' -> 0x58). NAL type 1 -> 0x61.
         let au = vec![
-            0x00, 0x00, 0x01, 0x61, 0x88, // I slice
-            0x00, 0x00, 0x01, 0x61, 0xC0, // P slice
+            0x00, 0x00, 0x01, 0x61, 0x88, // I slice, first_mb 0
+            0x00, 0x00, 0x01, 0x61, 0x58, // P slice, first_mb 1 (same picture)
             0x00,
         ];
         let mut parser = H264Parser::new();
@@ -635,6 +642,45 @@ mod tests {
         assert!(
             !frames[0].keyframe,
             "a picture with a P slice is not a random-access point and must not promote",
+        );
+    }
+
+    // 1080i open-GOP anchor (heuristic, not spec-guaranteed; recovery_point SEI §D.2.8 is
+    // authoritative): an I first field with a P second field is promoted.
+    #[test]
+    fn field_coded_i_then_p_pair_is_a_keyframe() {
+        // I field: slices at first_mb 0 (0x88) and 1 ('010'+'0001000'+stop -> 0x42 0x20);
+        // P field: slices at first_mb 0 (0xC0) and 1 (0x58). NAL type 1 -> 0x61.
+        let au = vec![
+            0x00, 0x00, 0x01, 0x61, 0x88, // I field, first_mb 0
+            0x00, 0x00, 0x01, 0x61, 0x42, 0x20, // I field, first_mb 1
+            0x00, 0x00, 0x01, 0x61, 0xC0, // P field, first_mb 0
+            0x00, 0x00, 0x01, 0x61, 0x58, // P field, first_mb 1
+            0x00,
+        ];
+        let frames = H264Parser::new().parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].coding.map(|c| c.coding_type()),
+            Some(CodingType::I)
+        );
+        assert!(
+            frames[0].keyframe,
+            "an I/P field pair is an open-GOP anchor"
+        );
+    }
+
+    // A second-field slice whose slice_type is truncated still starts a new picture
+    // (first_mb 0), so it must not veto the I first field.
+    #[test]
+    fn truncated_second_field_slice_type_does_not_block_promotion() {
+        // I field (0x88), then first_mb 0 with nothing after it (0x80: '1', then zeros).
+        let au = vec![0x00, 0x00, 0x01, 0x61, 0x88, 0x00, 0x00, 0x01, 0x61, 0x80];
+        let frames = H264Parser::new().parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].keyframe,
+            "second-field header truncation is not a veto"
         );
     }
 
