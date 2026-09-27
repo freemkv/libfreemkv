@@ -15,9 +15,9 @@ use std::sync::Arc;
 use super::SectorSource;
 
 /// A closure resolving keys from encrypted-content samples — the shape of both
-/// [`KeyFetch`] operations. Named so the two constructors (and the struct fields)
-/// read clearly.
-pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
+/// [`KeyFetch`] operations. `Ok(empty)` = no key; `Err` = the key source failed
+/// (reported as itself, not as a missing key).
+pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Result<Vec<[u8; 16]>> + Send + Sync>;
 
 /// Resolves keys from encrypted-content samples for [`DecryptingSectorSource`].
 ///
@@ -25,7 +25,7 @@ pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send 
 /// Key(s) for a CPS unit from real encrypted samples; [`fmts_indexes`](Self::fmts_indexes)
 /// resolves the disc's AACS 2.1 forensic index key set from an index-1
 /// anchor batch. Both return additional keys to add to the pool and retry
-/// with; empty if the source can't help. The library does no key lookup or
+/// with; empty if the source can't help, `Err` if it failed. The library does no key lookup or
 /// network I/O itself — this is the caller's seam to its key source.
 #[derive(Clone)]
 pub struct KeyFetch {
@@ -45,20 +45,20 @@ impl KeyFetch {
     /// is always empty. For read paths that never resolve forensic keys — the
     /// sweep/patch recovery decorator, which handles CPS units only.
     pub fn unit_only(unit: KeyFetchFn) -> Self {
-        Self::new(unit, std::sync::Arc::new(|_| Vec::new()))
+        Self::new(unit, std::sync::Arc::new(|_| Ok(Vec::new())))
     }
 
     /// Resolve the base Unit Key(s) for a CPS unit from `samples` (real encrypted
     /// units drawn from it). Normally one key; the caller adds whatever it returns
     /// to the pool.
-    pub fn unit_keys(&self, samples: &[Vec<u8>]) -> Vec<[u8; 16]> {
+    pub fn unit_keys(&self, samples: &[Vec<u8>]) -> Result<Vec<[u8; 16]>> {
         (self.unit)(samples)
     }
 
     /// Resolve the disc's AACS 2.1 forensic index keys from an index-1 single-
     /// phase `anchor` batch. The source returns the COMPLETE ordered set (index i
     /// = element i); the caller trusts any non-empty result as all of them.
-    pub fn fmts_indexes(&self, anchor: &[Vec<u8>]) -> Vec<[u8; 16]> {
+    pub fn fmts_indexes(&self, anchor: &[Vec<u8>]) -> Result<Vec<[u8; 16]>> {
         (self.fmts)(anchor)
     }
 }
@@ -105,17 +105,7 @@ pub struct DecryptingSectorSource<S: SectorSource> {
 /// readers), a span touching NO content range is clear filesystem/nav and must be
 /// exempt from the alignment gate — it will pass through undecrypted.
 fn span_touches_content(content: Option<&[(u32, u32)]>, lba: u32, count: u16) -> bool {
-    match content {
-        None => true,
-        Some(ranges) => {
-            let end = lba as u64 + count as u64;
-            ranges.iter().any(|&(start, cnt)| {
-                let rs = start as u64;
-                let re = rs + cnt as u64;
-                (lba as u64) < re && rs < end
-            })
-        }
-    }
+    content.is_none_or(|r| crate::decrypt::span_in_content_ranges(lba, count as u32, r))
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
@@ -366,9 +356,6 @@ mod tests {
         assert_eq!(wrapped.inner().last, Some(7200));
     }
 
-    // TODO: AACS round-trip test needs a fixture-encrypted unit + matching key
-    // (`crate::aacs` tests already exercise the cipher itself).
-
     // Additional coverage:
 
     use std::sync::{Arc, Mutex};
@@ -552,12 +539,11 @@ mod tests {
     }
 
     // AACS reaching decrypt without an installed key map must fail loud
-    // (DecryptFailed), not silently return still-encrypted bytes — the
-    // map-only model: decrypt_sectors' AACS arm always errors without one.
+    // (DecryptFailed), not silently return still-encrypted bytes — even with an
+    // empty key pool (the map-only model: no map ⇒ always an error).
     #[test]
-    fn aacs_missing_unit_key_errors() {
+    fn aacs_without_key_map_and_empty_pool_errors() {
         let src = PatternedSource { capacity: 16 };
-        // idx 0 requested, but unit_keys is empty → get(0) == None.
         let mut wrapped = DecryptingSectorSource::new(
             src,
             DecryptKeys::Aacs {
@@ -849,5 +835,53 @@ mod tests {
         let mut expected = vec![0u8; 2048];
         PatternedSource::fill(1, 1, &mut expected);
         assert_eq!(buf, expected, "clear out-of-content bytes pass through");
+    }
+
+    // Records whether the inner source was read at all.
+    struct CountingSource(Arc<std::sync::atomic::AtomicUsize>);
+    impl SectorSource for CountingSource {
+        fn read_sectors(&mut self, _l: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = c as usize * 2048;
+            b[..n].fill(0);
+            Ok(n)
+        }
+    }
+
+    // The AACS unit-alignment gate rejects a misaligned content read BEFORE the
+    // inner read (misaligned units would silently mis-decrypt), measured from
+    // `unit_base`, not absolute LBA 0.
+    #[test]
+    fn aacs_alignment_gate_rejects_misaligned_reads_relative_to_unit_base() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0u8; 16])],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+            0,
+            u32::MAX,
+            0,
+        )]));
+        let mut dec =
+            DecryptingSectorSource::new(CountingSource(reads.clone()), keys).with_key_map(map);
+        let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        let err = dec
+            .read_sectors(1, 3, &mut buf, false)
+            .expect_err("LBA 1 is misaligned against base 0");
+        assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "rejected before touching the drive"
+        );
+
+        // Base 1: LBA 4 is aligned (4 - 1 = 3), LBA 3 is not.
+        dec.set_unit_base(1);
+        dec.read_sectors(4, 3, &mut buf, false)
+            .expect("aligned relative to unit_base");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(dec.read_sectors(3, 3, &mut buf, false).is_err());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

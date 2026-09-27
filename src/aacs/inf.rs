@@ -276,7 +276,8 @@ const MKB_DISC_STRUCTURE_FORMAT: u8 = 0x83;
 const MKB_PACK_SIZE: usize = 32772;
 
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
-/// Returns the concatenated MKB data from all packs.
+/// Returns the concatenated MKB data from all packs. A pack declaring more than
+/// the response buffer holds is a drive fault (`AacsKeyRead`), never a holed MKB.
 pub fn read_mkb_from_drive(
     session: &mut dyn crate::scsi::ScsiTransport,
 ) -> crate::error::Result<Vec<u8>> {
@@ -306,10 +307,11 @@ pub fn read_mkb_from_drive(
     let len = data_len - 2;
     let num_packs = buf[3] as usize;
 
-    let mut mkb = Vec::with_capacity(32768 * num_packs.max(1));
-    if len > 0 && len <= 32768 {
-        mkb.extend_from_slice(&buf[4..4 + len]);
+    if len > 32768 {
+        return Err(crate::error::Error::AacsKeyRead);
     }
+    let mut mkb = Vec::with_capacity(32768 * num_packs.max(1));
+    mkb.extend_from_slice(&buf[4..4 + len]);
 
     // Read remaining packs
     for pack in 1..num_packs {
@@ -338,10 +340,11 @@ pub fn read_mkb_from_drive(
         // (the prior `.is_ok()`) silently truncated the MKB and returned the
         // partial data as Ok, corrupting the root of the whole AACS ladder.
         session.execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)?;
-        let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        if len > 2 && len - 2 <= 32768 {
-            mkb.extend_from_slice(&buf[4..4 + len - 2]);
+        let len = (u16::from_be_bytes([buf[0], buf[1]]) as usize).saturating_sub(2);
+        if len > 32768 {
+            return Err(crate::error::Error::AacsKeyRead);
         }
+        mkb.extend_from_slice(&buf[4..4 + len]);
     }
 
     Ok(mkb)
@@ -683,9 +686,10 @@ mod read_mkb_tests {
         assert!(mkb == vec![0xABu8; 32], "and the bytes are pack 1's");
     }
 
-    // A drive-declared length past the 32772-byte buffer must not be trusted.
+    // A drive-declared length past the 32772-byte buffer is a drive fault: the MKB
+    // would have a hole, so fail rather than return a corrupt MKB as Ok.
     #[test]
-    fn read_mkb_from_drive_ignores_a_pack_declaring_more_than_the_buffer_holds() {
+    fn read_mkb_from_drive_rejects_a_pack_declaring_more_than_the_buffer_holds() {
         /// Pack 0 is honest; pack 1 declares a 60000-byte payload it never sent.
         struct LyingDrive {
             honest: Vec<u8>,
@@ -716,24 +720,17 @@ mod read_mkb_tests {
             }
         }
 
-        let honest = vec![0xC7u8; 256];
         let mut drive = LyingDrive {
-            honest: honest.clone(),
+            honest: vec![0xC7u8; 256],
         };
-        let mkb = read_mkb_from_drive(&mut drive).expect("an over-declared pack is not an error");
-        assert_eq!(
-            mkb.len(),
-            honest.len(),
-            "only the honest pack's bytes may be taken; the over-declared pack \
-             contributes nothing and must not be read past the buffer"
-        );
-        assert!(mkb == honest, "and those bytes are pack 0's");
+        let err = read_mkb_from_drive(&mut drive).expect_err("a holed MKB is not Ok");
+        assert_eq!(err.code(), crate::error::Error::AacsKeyRead.code());
     }
 
     /// The same over-declaration on the FIRST pack, which uses a separate bound
     /// from the loop's.
     #[test]
-    fn read_mkb_from_drive_ignores_a_first_pack_declaring_more_than_the_buffer() {
+    fn read_mkb_from_drive_rejects_a_first_pack_declaring_more_than_the_buffer() {
         struct LyingFirst;
         impl ScsiTransport for LyingFirst {
             fn execute(
@@ -752,11 +749,8 @@ mod read_mkb_tests {
                 })
             }
         }
-        let mkb = read_mkb_from_drive(&mut LyingFirst).expect("not an error");
-        assert!(
-            mkb.is_empty(),
-            "a first pack declaring more than the buffer holds yields no bytes"
-        );
+        let err = read_mkb_from_drive(&mut LyingFirst).expect_err("over-declared first pack");
+        assert_eq!(err.code(), crate::error::Error::AacsKeyRead.code());
     }
 
     /// A single-pack disc still yields that pack's bytes — the common case, and

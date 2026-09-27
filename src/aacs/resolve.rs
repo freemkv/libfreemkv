@@ -320,17 +320,18 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
     // either is absent so operators see one reason, not two.
     if has_vid {
         if let Some(mkb) = ctx.mkb {
+            // Borrowed views: only the lengths are logged, so copy nothing.
             let mk_dv = mkb_find_mk_dv(mkb);
-            let subdiff = mkb_find_subdiff_records(mkb);
-            let cvalues = mkb_find_cvalues(mkb);
+            let subdiff = find_record_slice(mkb, REC_SUBSET_DIFFERENCE);
+            let cvalues = find_record_slice(mkb, REC_MEDIA_KEY_DATA);
             tracing::debug!(
                 target: "freemkv::disc",
                 phase = "resolve_keys_mkb_records",
                 mk_dv_found = mk_dv.is_some(),
                 subdiff_found = subdiff.is_some(),
-                subdiff_len = subdiff.as_ref().map(|s| s.len()).unwrap_or(0),
+                subdiff_len = subdiff.map_or(0, <[u8]>::len),
                 cvalues_found = cvalues.is_some(),
-                cvalues_len = cvalues.as_ref().map(|c| c.len()).unwrap_or(0),
+                cvalues_len = cvalues.map_or(0, <[u8]>::len),
                 "MKB record scan results"
             );
 
@@ -918,9 +919,9 @@ mod tests {
     }
 
     #[test]
-    fn cvalue_selection_falls_back_to_0x07_when_no_0x05() {
-        // Malformed/legacy MKB with only a 0x07 record and no 0x05: the
-        // selector falls back to 0x07 rather than returning None.
+    fn cvalue_selection_never_falls_back_to_the_0x07_index() {
+        // Only a 0x07 record and no 0x05: 0x07 is the Subset-Difference INDEX
+        // (libaacs reads cvalues from 0x05 only), so there is no cvalue table.
         let mut mkb = Vec::new();
         mkb.extend_from_slice(&mkb_record(0x10, &[0, 0, 0, 0x10, 0, 0, 0, 1]));
         mkb.extend_from_slice(&mkb_record(0x86, &[0xCDu8; 16]));
@@ -929,8 +930,11 @@ mod tests {
         mkb.extend_from_slice(&mkb_record(0x07, &only07));
 
         assert!(probe::mkb_record_body(&mkb, 0x05).is_none());
-        let selected = mkb_find_cvalues(&mkb).expect("falls back to 0x07");
-        assert_eq!(selected, only07, "fallback returns the 0x07 body");
+        assert!(probe::mkb_record_body(&mkb, 0x07) == Some(only07));
+        assert!(
+            mkb_find_cvalues(&mkb).is_none(),
+            "0x07 is never a cvalue table"
+        );
     }
 
     /// Locate a captured MKB sample under the optional `MKB_SAMPLE_DIR`.

@@ -319,6 +319,7 @@ impl Disc {
             // (unlike MUX, which skips on it) is `?`-propagated here, aborting
             // the whole extract rather than reusing the wrong key silently.
             crate::css::CrackOutcome::ScrambledUncracked => Err(Error::CssKeyMissing),
+            crate::css::CrackOutcome::Halted => Err(Error::Halted),
         }
     }
 }

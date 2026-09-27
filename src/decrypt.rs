@@ -347,31 +347,39 @@ pub(crate) fn decrypt_sectors_mapped_in_content(
     map: &AacsKeyMap,
     content: Option<&[(u32, u32)]>,
 ) -> Result<(), crate::error::Error> {
-    let mut keys = keys.clone();
-    decrypt_span(
-        buf,
-        &mut keys,
-        base_lba,
-        Some(map),
-        content.map(|r| (base_lba, r)),
-    )
-    .map(|_| ())
+    match keys {
+        // The AACS arm only reads the keys: no per-batch deep clone.
+        DecryptKeys::Aacs { .. } => apply_aacs_map(buf, keys, base_lba, map, content),
+        // CSS re-cracks into its title key, so it needs its own mutable copy.
+        _ => {
+            let mut keys = keys.clone();
+            decrypt_span(buf, &mut keys, base_lba, Some(map), content).map(|_| ())
+        }
+    }
 }
 
 /// Is `lba` inside any `(start_lba, sector_count)` content range? Used to gate the
 /// mapped decrypt so clear filesystem/nav units outside every encrypted-content
 /// extent are passed through untouched.
 fn lba_in_content_ranges(lba: u32, ranges: &[(u32, u32)]) -> bool {
+    span_in_content_ranges(lba, 1, ranges)
+}
+
+/// Does the sector span `[lba, lba + count)` intersect any content range? The ONE
+/// range lookup the decrypt paths share. `ranges` must be sorted and merged
+/// (non-overlapping), as [`crate::Disc::encrypted_content_ranges`] returns them.
+pub(crate) fn span_in_content_ranges(lba: u32, count: u32, ranges: &[(u32, u32)]) -> bool {
     debug_assert!(
         ranges.windows(2).all(|w| w[0].0 <= w[1].0),
         "content ranges must be sorted ascending by start LBA for the binary search"
     );
-    // Sorted, non-overlapping (merged extents): binary-search the last range
-    // whose start <= lba and test containment — O(log n), not O(ranges).
-    let i = ranges.partition_point(|&(start, _)| start <= lba);
+    let end = lba as u64 + count as u64;
+    // Merged ranges have ascending ends too, so the last range starting before
+    // `end` is the only candidate — O(log n), not O(ranges).
+    let i = ranges.partition_point(|&(start, _)| (start as u64) < end);
     i > 0 && {
-        let (start, count) = ranges[i - 1];
-        (lba - start) < count
+        let (start, cnt) = ranges[i - 1];
+        (lba as u64) < start as u64 + cnt as u64
     }
 }
 
@@ -519,7 +527,7 @@ pub fn decrypt_sectors_in_content(
     content_ranges: &[(u32, u32)],
 ) -> Result<usize, crate::error::Error> {
     let _ = unit_key_idx;
-    decrypt_span(buf, keys, base_lba, None, Some((base_lba, content_ranges)))
+    decrypt_span(buf, keys, base_lba, None, Some(content_ranges))
 }
 
 // THE decrypt orchestrator: every path into this crate's decryption goes through here. Resolve
@@ -529,7 +537,7 @@ fn decrypt_span(
     keys: &mut DecryptKeys,
     base_lba: u32,
     map: Option<&AacsKeyMap>,
-    content: Option<(u32, &[(u32, u32)])>,
+    content: Option<&[(u32, u32)]>,
 ) -> Result<usize, crate::error::Error> {
     let dropped: usize = match keys {
         DecryptKeys::None => 0,
@@ -542,7 +550,7 @@ fn decrypt_span(
             };
             // Honour the content-extent gate when present: units outside the disc's
             // encrypted-content ranges are clear filesystem/nav and pass through.
-            apply_aacs_map(buf, keys, base_lba, map, content.map(|(_, r)| r))?;
+            apply_aacs_map(buf, keys, base_lba, map, content)?;
             0
         }
         DecryptKeys::Css { title_key } => {
@@ -1601,27 +1609,37 @@ mod tests {
         let key = [0x77u8; 16];
         let ul = aacs::content::ALIGNED_UNIT_LEN;
         let usz = (ul / 2048) as u32;
+        let key2 = [0x78u8; 16];
         let n = PARALLEL_MIN_UNITS * 4; // well past the parallel threshold
-        let mut clear = clear_ts_unit();
-        clear[0] |= 0xC0; // the CPI/encrypted flag is part of the preserved clear seed
+        let half = n / 2;
+        // DISTINCT plaintext per unit and a second key for the upper half, so a
+        // unit landing at the wrong index or under the wrong key is detectable.
+        let clear_of = |i: usize| {
+            let mut c = clear_ts_unit();
+            c[0] |= 0xC0; // the CPI/encrypted flag is part of the preserved clear seed
+            c[1] = i as u8; // per-unit seed byte → a distinct block key
+            c[200] = i as u8; // and a distinct payload byte
+            c
+        };
         let mut buf = vec![0u8; n * ul];
         for i in 0..n {
-            let mut u = clear.clone();
-            aacs_encrypt_unit_for_test(&mut u, &key);
+            let mut u = clear_of(i);
+            aacs_encrypt_unit_for_test(&mut u, if i < half { &key } else { &key2 });
             buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
         }
         let keys = DecryptKeys::Aacs {
-            unit_keys: vec![(0, key)],
+            unit_keys: vec![(0, key), (1, key2)],
             format: ContentFormat::BdTs,
         };
-        let map = AacsKeyMap::from_ranges(vec![(0, (n as u32) * usz, 0)]);
+        let split = (half as u32) * usz;
+        let map = AacsKeyMap::from_ranges(vec![(0, split, 0), (split, (n as u32) * usz, 1)]);
         decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
             .expect("the parallel mapped decrypt must succeed");
         for i in 0..n {
             assert_eq!(
                 &buf[i * ul..(i + 1) * ul],
-                clear.as_slice(),
-                "unit {i} must recover to the known plaintext on the parallel path"
+                clear_of(i).as_slice(),
+                "unit {i} must recover to its own plaintext on the parallel path"
             );
         }
     }
@@ -1797,5 +1815,44 @@ mod tests {
         assert!(unit_is_our_phase(100, 30, 0, Phase::Even));
         // Both malformations at once: offset 0 over divisor 1 is unit 0, even.
         assert!(unit_is_our_phase(5, 5, 0, Phase::Even));
+    }
+
+    // Content-range lookup over SEVERAL sorted ranges: before the first, inside
+    // each, in the gaps, on every boundary, and past the last.
+    #[test]
+    fn content_range_lookup_handles_multiple_ranges_and_their_boundaries() {
+        let ranges = [(10u32, 5u32), (20, 1), (100, 50)];
+        let inside = [10, 14, 20, 100, 149];
+        let outside = [0, 9, 15, 19, 21, 99, 150, u32::MAX];
+        for lba in inside {
+            assert!(lba_in_content_ranges(lba, &ranges), "{lba} is content");
+        }
+        for lba in outside {
+            assert!(!lba_in_content_ranges(lba, &ranges), "{lba} is not content");
+        }
+    }
+
+    // The per-unit content gate inside ONE multi-unit buffer: units in content
+    // decrypt, the unit in the gap between two ranges passes through untouched.
+    #[test]
+    fn content_gate_is_per_unit_within_a_multi_unit_buffer() {
+        let key = [0x44u8; 16];
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let mut clear = clear_ts_unit();
+        clear[0] |= 0xC0;
+        let mut enc = clear.clone();
+        aacs_encrypt_unit_for_test(&mut enc, &key);
+        let mut buf = [enc.clone(), enc.clone(), enc.clone()].concat();
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+        // Units at LBA 300, 303, 306: content is 300..303 and 306..309.
+        decrypt_sectors_mapped_in_content(&mut buf, &keys, 300, &map, Some(&[(300, 3), (306, 3)]))
+            .expect("mixed buffer decrypts");
+        assert_eq!(&buf[..ul], clear.as_slice(), "unit 0 is content");
+        assert_eq!(&buf[ul..2 * ul], enc.as_slice(), "unit 1 sits in the gap");
+        assert_eq!(&buf[2 * ul..], clear.as_slice(), "unit 2 is content");
     }
 }

@@ -229,12 +229,9 @@ mod tests {
             vec!["freemkv", "LD", "Renesas", "AACS", "DVD"],
             "the matrix is the firmware set then the disc set, in dispatch order"
         );
-        let derived: Vec<&str> = firmware_unlockers()
-            .iter()
-            .chain(disc_unlockers(Vec::new()).iter())
-            .map(|u| u.name())
-            .collect();
-        assert_eq!(unlocker_names(), derived);
+        // Split point: the leading names are exactly the firmware set.
+        let fw: Vec<&str> = firmware_unlockers().iter().map(|u| u.name()).collect();
+        assert_eq!(fw, vec!["freemkv", "LD", "Renesas"]);
     }
 
     // `is_drive_unlocker` classifies a matched unlocker name against the real

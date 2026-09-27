@@ -1869,6 +1869,10 @@ impl Disc {
                         disc.css_error = Some(crate::error::Error::CssKeyMissing);
                     }
                     crate::css::CrackOutcome::Unencrypted => {}
+                    // A Stop mid-scan: no verdict, never "clear".
+                    crate::css::CrackOutcome::Halted => {
+                        disc.css_error = Some(crate::error::Error::Halted);
+                    }
                 }
             }
         }
@@ -2880,8 +2884,8 @@ impl Disc {
                 },
                 false,
             ),
-            // Scrambled but no key recoverable → hard failure.
-            crate::css::CrackOutcome::ScrambledUncracked => {
+            // Scrambled but no key recoverable (or a Stop mid-scan) → hard failure.
+            crate::css::CrackOutcome::ScrambledUncracked | crate::css::CrackOutcome::Halted => {
                 (crate::decrypt::DecryptKeys::None, false)
             }
             // No scrambled sector anywhere in the whole title → genuinely clear.

@@ -31,7 +31,7 @@ const KEY_CORRECTION_DATA: [u8; 16] = [0u8; 16];
 /// The real AACS 2.1 Variant markers — confirmed against a live variant MKB —
 /// are `0x2d` (Encrypted Media Key Variant Data / C) and `0x2f` (Variant Key
 /// Data table, 65,535×16). Both are absent from non-variant 1.0/2.0 MKBs (which
-/// instead carry `0x05` host-revocation-signature and no `0x0c`/`0x2d`/`0x2f`).
+/// carry only the classical `0x05` Media Key Data and no `0x0c`/`0x2d`/`0x2f`).
 /// The earlier `0x82`/`0x83` guess was speculative and never appeared in any
 /// real MKB.
 pub fn is_variant_mkb(records: &[MkbRecord]) -> bool {
@@ -123,9 +123,8 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 /// `device_keys` covers. Returns `None` if no DK walks any uv.
 ///
 /// This is the AACS-2.1 **variant** walk (classical walk: [`super::derive`]). Kept separate on
-/// purpose — different cvalue-record order and input framing; do NOT route the classical DK
-/// path through this function, or the `0x07`-first selection picks the wrong cvalue and returns
-/// `None`.
+/// purpose — different cvalue-record order (`0x0c` first) and input framing; do NOT route the
+/// classical DK path through this function.
 pub fn walk_processing_key(
     records: &[MkbRecord],
     device_keys: &[DeviceKey],
@@ -133,9 +132,8 @@ pub fn walk_processing_key(
     let mk_dv = mkb_find_mk_dv(records)?;
     let uvs = mkb_find_body(records, REC_SUBSET_DIFFERENCE)?;
     // Real variant MKBs carry per-uv cvalues in record `0x0c` (46,101x16, one
-    // per `0x04` slot); fall back to `0x07`/`0x05` for synthetic fixtures.
+    // per `0x04` slot); fall back to `0x05` (never the `0x07` SD index).
     let cvalues = mkb_find_body(records, REC_MEDIA_KEY_VARIANT_DATA)
-        .or_else(|| mkb_find_body(records, REC_EXPLICIT_SUBSET_DIFF))
         .or_else(|| mkb_find_body(records, REC_MEDIA_KEY_DATA))?;
 
     let num_uvs = uvs
@@ -415,9 +413,8 @@ pub fn derive_media_key_variant(
     let vkd_table = variant_key_data(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     // C for Kmp is the per-slot `0x0c` table, same source/index as
     // `walk_processing_key` uses; `0x2d` holds VARIANTS + Nonce, not C. Fall
-    // back to `0x07`/`0x05` for synthetic fixtures with a single cvalue.
+    // back to `0x05` (never the `0x07` SD index).
     let cvalues = mkb_find_body(mkb_records, REC_MEDIA_KEY_VARIANT_DATA)
-        .or_else(|| mkb_find_body(mkb_records, REC_EXPLICIT_SUBSET_DIFF))
         .or_else(|| mkb_find_body(mkb_records, REC_MEDIA_KEY_DATA))
         .ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
@@ -431,9 +428,10 @@ pub fn derive_media_key_variant(
     };
 
     // Try `pk` against each slot; return the first verified Km. If none verify,
-    // surface a correction-mode error over the generic miss so a disc that needs
-    // the soft/online path is distinguishable from a non-covering key.
+    // surface a correction-mode error, then a key-independent STRUCTURAL fault (the
+    // MKB's tables are short for a slot), over the generic miss.
     let mut correction: Option<MediaKeyVariantError> = None;
+    let mut structural: Option<MediaKeyVariantError> = None;
     for (uv, slot_index) in slots {
         match variant_km_for_slot(&m, pk, uv, slot_index) {
             Ok(km) => return Ok(km),
@@ -441,10 +439,17 @@ pub fn derive_media_key_variant(
             | Err(e @ MediaKeyVariantError::OnlineChallengeRequired) => {
                 correction.get_or_insert(e);
             }
+            Err(e @ MediaKeyVariantError::MkbIncomplete)
+            | Err(e @ MediaKeyVariantError::VariantsTableUnavailable) => {
+                structural.get_or_insert(e);
+            }
+            // Verify failure / VKD index out of range depend on `pk`: a plain miss.
             Err(_) => {}
         }
     }
-    Err(correction.unwrap_or(MediaKeyVariantError::ProcessingKeyUnavailable))
+    Err(correction
+        .or(structural)
+        .unwrap_or(MediaKeyVariantError::ProcessingKeyUnavailable))
 }
 
 /// Run the variant chain from a caller-supplied Processing Key and EXPLICIT
@@ -560,7 +565,7 @@ mod tests {
         let mut mkb = vec![
             0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
         ];
-        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xAB; 16]);
         mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xCD; 16]);
@@ -588,7 +593,7 @@ mod tests {
         let recs = walk_mkb(&mkb);
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[0].rec_type, 0x10);
-        assert_eq!(recs[1].rec_type, 0x07);
+        assert_eq!(recs[1].rec_type, 0x05);
         assert_eq!(recs[2].rec_type, 0x86);
     }
 
@@ -710,10 +715,10 @@ mod tests {
         aes_d_result[15] ^= 0x02;
         let c_block = aes_ecb_encrypt(&kp, &aes_d_result);
 
-        // cvalues record (0x07): no `0x0c` here, so walk and chain both fall
-        // back to `0x07` — plant `c_block` so AES-D(Kp,C)^uv == Kmp. Magic
+        // cvalues record (0x05): no `0x0c` here, so walk and chain both fall
+        // back to `0x05` — plant `c_block` so AES-D(Kp,C)^uv == Kmp. Magic
         // check fails on variant MKBs, but `variant_present` lets it match.
-        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&c_block);
 
         // Verify Media Key (0x86): body content is don't-care.
@@ -722,7 +727,7 @@ mod tests {
 
         // 0x2d record: VARIANTS table (head, don't-care for these tests) then the
         // trailing 16-byte Nonce (`variant_nonce` reads the tail), 32-byte body.
-        // (C is NOT here — it is the `0x07`/`0x0c` cvalue above.)
+        // (C is NOT here — it is the `0x05`/`0x0c` cvalue above.)
         mkb.extend_from_slice(&[0x2d, 0x00, 0x00, 0x24]);
         mkb.extend_from_slice(&[0x11; 16]);
         mkb.extend_from_slice(&[0x77; 16]);
@@ -933,7 +938,7 @@ mod tests {
         // 0x04: u_mask_shift=0x20 (32), uv=2.
         mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
         mkb.extend_from_slice(&[0x20, 0x00, 0x00, 0x00, 0x02]);
-        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xAB; 16]);
         mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xCD; 16]);
@@ -959,7 +964,7 @@ mod tests {
         ];
         mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
         mkb.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x00]); // uv = 0
-        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xAB; 16]);
         mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xCD; 16]);
@@ -1223,6 +1228,46 @@ mod tests {
             "a non-covering Kp must never produce a Media Key, got {got:?}"
         );
         assert_ne!(got, Ok(p.km));
+    }
+
+    /// `0x07` is the Subset-Difference INDEX, never a cvalue table: with no `0x0c`,
+    /// C comes from `0x05` even when an index record precedes it.
+    #[test]
+    fn a_subset_difference_index_record_is_never_read_as_cvalues() {
+        let p = plant_variant_mkb();
+        let mut recs: Vec<MkbRecord> = Vec::new();
+        for r in &p.records {
+            if r.rec_type == REC_MEDIA_KEY_VARIANT_DATA {
+                let mut idx = r.clone();
+                idx.rec_type = REC_SUBSET_DIFFERENCE_INDEX;
+                idx.body = vec![0xAB; 16];
+                recs.push(idx);
+                let mut cv = r.clone();
+                cv.rec_type = REC_MEDIA_KEY_DATA;
+                recs.push(cv);
+            } else {
+                recs.push(r.clone());
+            }
+        }
+        assert_eq!(derive_media_key_variant(&recs, &p.kp), Ok(p.km));
+    }
+
+    /// A variant MKB whose `0x2d` carries only the Nonce (no VARIANTS table) is
+    /// structurally short for every slot: surface that code, not a generic miss.
+    #[test]
+    fn a_structurally_short_variant_mkb_reports_its_specific_code() {
+        let p = plant_variant_mkb();
+        let mut recs = p.records.clone();
+        for r in recs
+            .iter_mut()
+            .filter(|r| r.rec_type == REC_VARIANT_DATA_AND_NONCE)
+        {
+            r.body = p.nonce.to_vec();
+        }
+        assert_eq!(
+            derive_media_key_variant(&recs, &p.kp),
+            Err(MediaKeyVariantError::VariantsTableUnavailable)
+        );
     }
 
     /// `mkb_find_mk_dv` must supply the ACTUAL `0x86` bytes, not a fixed block.

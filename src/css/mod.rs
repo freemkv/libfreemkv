@@ -75,18 +75,22 @@ pub fn crack_key(
 /// - [`CrackOutcome::Cracked`] — a scrambled sector yielded a title key.
 /// - [`CrackOutcome::Unencrypted`] — no scrambled sector was seen; genuinely
 ///   plaintext.
-/// - [`CrackOutcome::ScrambledUncracked`] — scrambled sectors seen but no key
-///   recovered; callers MUST hard-error, never fall through.
+/// - [`CrackOutcome::ScrambledUncracked`] — scrambled sectors seen, or no sector
+///   could be read at all, and no key recovered; callers MUST hard-error, never
+///   fall through.
+/// - [`CrackOutcome::Halted`] — the scan was cancelled (halt token or a read
+///   returning `Halted`); a truncated scan is no verdict.
 #[derive(Debug, Clone)]
 pub enum CrackOutcome {
     Cracked(CssState),
     Unencrypted,
     ScrambledUncracked,
+    Halted,
 }
 
 impl CrackOutcome {
-    /// The cracked `CssState`, if any. `None` for `Unencrypted` /
-    /// `ScrambledUncracked`. Lets the `Option`-returning wrappers stay thin.
+    /// The cracked `CssState`, if any. `None` for every other outcome. Lets the
+    /// `Option`-returning wrappers stay thin.
     pub fn into_state(self) -> Option<CssState> {
         match self {
             CrackOutcome::Cracked(s) => Some(s),
@@ -145,7 +149,7 @@ pub(crate) fn resolve_dvd_title_key(
         // A cancelled crack's outcome is a TRUNCATED scan, not a real verdict —
         // surface it as `Halted` rather than trusting a partial `Unencrypted`
         // or `ScrambledUncracked` and taking the wrong path.
-        if halt.map(|h| h.is_cancelled()).unwrap_or(false) {
+        if matches!(outcome, CrackOutcome::Halted) || halt.is_some_and(|h| h.is_cancelled()) {
             return Err(crate::error::Error::Halted.into());
         }
         match outcome {
@@ -157,7 +161,7 @@ pub(crate) fn resolve_dvd_title_key(
             CrackOutcome::ScrambledUncracked => {
                 return Err(crate::error::Error::CssKeyMissing.into());
             }
-            CrackOutcome::Unencrypted => {}
+            CrackOutcome::Unencrypted | CrackOutcome::Halted => {}
         }
     }
     Ok(())
@@ -197,17 +201,19 @@ fn crack_key_scan(
     // this resets on any readable batch, so an open-gate title never trips it.
     let mut saw_locked = false;
     let mut consecutive_locked = 0u32;
+    // Sectors actually inspected: zero means no verdict (never Unencrypted).
+    let mut inspected = 0u32;
 
     'outer: for (extent_idx, ext) in extents.iter().enumerate() {
         let mut i = 0u32;
         while i < ext.sector_count && tried < max_tries {
             // Cooperative cancellation — poll once per batch, the same cadence
             // sweep/patch use, so a Stop / watchdog can interrupt the scan.
-            if let Some(h) = halt
-                && h.is_cancelled()
-            {
-                break 'outer;
+            if halt.is_some_and(|h| h.is_cancelled()) {
+                return CrackOutcome::Halted;
             }
+            // Saturating: `start_lba` comes from a crafted IFO/UDF extent.
+            let lba = ext.start_lba.saturating_add(i);
             // Liveness beacon: a long scan over a damaged disc stays visible.
             // The heartbeat is time-throttled; only when it actually beats do
             // we emit the crack-specific context (tried/lba/extent_idx).
@@ -216,7 +222,7 @@ fn crack_key_scan(
                     target: "freemkv::heartbeat",
                     phase = "css_crack",
                     tried,
-                    lba = ext.start_lba + i,
+                    lba,
                     extent_idx,
                     "scanning"
                 );
@@ -227,7 +233,7 @@ fn crack_key_scan(
             // RETRIED from where it stopped, not skipped — else those sectors
             // go unexamined on exactly the damaged media a key needs most.
             let mut advance = n;
-            match reader.read_sectors(ext.start_lba + i, n as u16, &mut buf[..want], true) {
+            match reader.read_sectors(lba, n as u16, &mut buf[..want], true) {
                 Ok(got) => {
                     // A readable batch: the gate is open — reset the locked run.
                     consecutive_locked = 0;
@@ -245,6 +251,7 @@ fn crack_key_scan(
                     }
                     for s in 0..usable {
                         tried += 1;
+                        inspected += 1;
                         let sect = &buf[s * 2048..(s + 1) * 2048];
                         // HARDENED pack-gated check: a clear stub sector with
                         // stray bits at 0x14 must NOT count as scramble evidence,
@@ -266,6 +273,8 @@ fn crack_key_scan(
                 // A failed batch still counts toward the budget so a damaged
                 // region can't loop forever. A CSS-locked failure proves
                 // encryption; a long enough run means the gate is shut.
+                // A drive-level Stop ends the scan now — it is not a failed batch.
+                Err(crate::error::Error::Halted) => return CrackOutcome::Halted,
                 Err(e) => {
                     tried += n;
                     if e.scsi_sense().is_some_and(|s| s.is_css_locked()) {
@@ -283,10 +292,10 @@ fn crack_key_scan(
         }
     }
 
-    // ENCRYPTED-but-uncracked (hard failure) if a scrambled sector was seen or
-    // every read was CSS-locked; only a scan seeing neither is unencrypted. A
-    // prior "soft" `fail_on_locked` toggle was removed as dead/unsafe.
-    if saw_scrambled || saw_locked {
+    // ENCRYPTED-but-uncracked (hard failure) if a scrambled sector was seen, every
+    // read was CSS-locked, or nothing at all could be inspected (no verdict: fail
+    // closed). Only a scan that READ sectors and saw no scramble is unencrypted.
+    if saw_scrambled || saw_locked || (inspected == 0 && tried > 0) {
         CrackOutcome::ScrambledUncracked
     } else {
         CrackOutcome::Unencrypted
@@ -728,8 +737,8 @@ mod tests {
         }];
         let outcome = crack_key_scan(&mut src, &ext, 4, None);
         assert!(
-            matches!(outcome, CrackOutcome::Unencrypted),
-            "nothing was read, so nothing scrambled was seen"
+            outcome.is_scrambled_uncracked(),
+            "nothing was read → no verdict, fail closed (never Unencrypted)"
         );
         assert!(
             src.reads.borrow().len() <= 8,
@@ -904,11 +913,10 @@ mod tests {
         assert_eq!(pack[..0x14], scrambled[..0x14]);
     }
 
-    // Even when every read FAILS, a scan that never observed a scrambled
-    // sector reports Unencrypted — encryption can't be proven from
-    // unreadable data alone.
+    // Every read FAILS: nothing was inspected, so there is no verdict. Must fail
+    // closed, never Unencrypted (that muxes scrambled VOBs as clear).
     #[test]
-    fn crack_outcome_all_reads_fail_is_unencrypted() {
+    fn crack_outcome_all_reads_fail_is_not_unencrypted() {
         let mut src = MockSource::new(0x30);
         src.fail_all = true; // no sector is ever inspected
         let extents = [Extent {
@@ -917,8 +925,8 @@ mod tests {
         }];
         let outcome = crack_key_outcome(&mut src, &extents, 1, None);
         assert!(
-            matches!(outcome, CrackOutcome::Unencrypted),
-            "no readable scrambled sector → Unencrypted, got {outcome:?}"
+            outcome.is_scrambled_uncracked(),
+            "nothing inspected → fail closed, got {outcome:?}"
         );
     }
 
@@ -1422,5 +1430,71 @@ mod tests {
             Some((9000, 9020)),
             "re-crack span must reflect the OTHER VTS extents, not a reused span"
         );
+    }
+
+    // Reader whose every read fails with a NON-CSS-locked error.
+    struct AlwaysFails;
+    impl SectorSource for AlwaysFails {
+        fn read_sectors(&mut self, lba: u32, _c: u16, _b: &mut [u8], _r: bool) -> Result<usize> {
+            Err(Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            })
+        }
+    }
+
+    // Cancelled mid-scan after only CLEAR sectors: the scan is truncated and must
+    // not hand a public caller an Unencrypted verdict.
+    #[test]
+    fn a_halted_scan_is_not_unencrypted() {
+        struct ClearThenStop(crate::halt::Halt);
+        impl SectorSource for ClearThenStop {
+            fn read_sectors(&mut self, _l: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+                let n = c as usize * 2048;
+                b[..n].fill(0);
+                self.0.cancel(); // operator Stop lands during the scan
+                Ok(n)
+            }
+        }
+        let halt = crate::halt::Halt::new();
+        let ext = [Extent {
+            start_lba: 100,
+            sector_count: 64,
+        }];
+        let mut src = ClearThenStop(halt.clone());
+        let out = crack_key_outcome(&mut src, &ext, 16, Some(&halt));
+        assert!(matches!(out, CrackOutcome::Halted), "got {out:?}");
+    }
+
+    // A drive-level Stop (a read returning `Halted`) ends the scan at once and
+    // reports Halted — not a failed batch that grinds on into ScrambledUncracked.
+    #[test]
+    fn a_halted_read_stops_the_scan_and_reports_halted() {
+        struct StopsDrive(u32);
+        impl SectorSource for StopsDrive {
+            fn read_sectors(&mut self, _l: u32, _c: u16, _b: &mut [u8], _r: bool) -> Result<usize> {
+                self.0 += 1;
+                Err(Error::Halted)
+            }
+        }
+        let ext = [Extent {
+            start_lba: 100,
+            sector_count: 64,
+        }];
+        let mut src = StopsDrive(0);
+        let out = crack_key_outcome(&mut src, &ext, 16, None);
+        assert!(matches!(out, CrackOutcome::Halted), "got {out:?}");
+        assert_eq!(src.0, 1, "no read after the Stop");
+    }
+
+    // A crafted extent near u32::MAX must not overflow `start_lba + i`.
+    #[test]
+    fn crack_scan_does_not_overflow_an_extent_near_u32_max() {
+        let ext = [Extent {
+            start_lba: u32::MAX - 1,
+            sector_count: 8,
+        }];
+        let _ = crack_key_outcome(&mut AlwaysFails, &ext, 1, None);
     }
 }

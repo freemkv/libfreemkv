@@ -29,6 +29,8 @@ pub mod variant;
 pub const PATH_UNIT_KEY_RO: &str = "/AACS/Unit_Key_RO.inf";
 pub const PATH_UNIT_KEY_RO_DUPLICATE: &str = "/AACS/DUPLICATE/Unit_Key_RO.inf";
 pub const PATH_MKB_RO: &str = "/AACS/MKB_RO.inf";
+pub const PATH_MKB_RO_DUPLICATE: &str = "/AACS/DUPLICATE/MKB_RO.inf";
+/// The recordable-media MKB — a DIFFERENT MKB, never a fallback for `MKB_RO`.
 pub const PATH_MKB_RW: &str = "/AACS/MKB_RW.inf";
 pub const PATH_CONTENT_CERT: &str = "/AACS/Content000.cer";
 pub const PATH_CONTENT_CERT_ALT: &str = "/AACS/Content001.cer";
@@ -40,7 +42,7 @@ pub enum AacsRole {
     /// Title-key file: BD/UHD `Unit_Key_RO.inf`, HD DVD `VTKF*.AACS`
     /// (magic `DVD_HD_V_TKF`). The disc_hash is `SHA1` of this file.
     UnitKey,
-    /// Media Key Block: BD/UHD `MKB_RO/RW.inf`, HD DVD `MKBROM.AACS`.
+    /// Media Key Block: BD/UHD `MKB_RO.inf` (then its DUPLICATE copy), HD DVD `MKBROM.AACS`.
     Mkb,
     /// Content certificate: BD/UHD `Content000/001.cer`, HD DVD
     /// `CONTENT_CERT.AACS` (byte 0 gives the AACS major).
@@ -65,7 +67,7 @@ pub(crate) fn find_hddvd_aacs_dir(udf: &crate::udf::UdfFs) -> Option<&crate::udf
 pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String> {
     let mut v: Vec<String> = match role {
         AacsRole::UnitKey => vec![PATH_UNIT_KEY_RO, PATH_UNIT_KEY_RO_DUPLICATE],
-        AacsRole::Mkb => vec![PATH_MKB_RO, PATH_MKB_RW],
+        AacsRole::Mkb => vec![PATH_MKB_RO, PATH_MKB_RO_DUPLICATE],
         AacsRole::ContentCert => vec![PATH_CONTENT_CERT, PATH_CONTENT_CERT_ALT],
     }
     .into_iter()
@@ -388,6 +390,15 @@ mod tests {
             vec![
                 super::PATH_UNIT_KEY_RO.to_string(),
                 super::PATH_UNIT_KEY_RO_DUPLICATE.to_string(),
+            ]
+        );
+        // MKB fallback is the DUPLICATE copy of MKB_RO (libaacs `_mkb_open`), never
+        // MKB_RW.inf — a different MKB that derives a different Media Key.
+        assert_eq!(
+            super::role_paths(&udf, super::AacsRole::Mkb),
+            vec![
+                "/AACS/MKB_RO.inf".to_string(),
+                "/AACS/DUPLICATE/MKB_RO.inf".to_string(),
             ]
         );
     }

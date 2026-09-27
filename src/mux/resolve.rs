@@ -880,7 +880,8 @@ fn base_slot_for_extent(
         && let Some(f) = fetch
         && !samples.is_empty()
     {
-        let fresh = f.unit_keys(&samples);
+        // A key-source failure is reported as itself, not as "no key" (DecryptFailed).
+        let fresh = f.unit_keys(&samples)?;
         if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
             for k in fresh {
                 if !unit_keys.iter().any(|(_, h)| *h == k) {
@@ -1183,6 +1184,8 @@ fn probe_fmts_index_keys(
         Some(batch)
     };
     let mut index_keys: Vec<[u8; 16]> = Vec::new();
+    // First key-source failure: reported instead of FmtsKeyMissing if nothing anchors.
+    let mut fetch_err: Option<crate::error::Error> = None;
     'anchor: for seg in segments
         .iter()
         .filter(|s| s.index == 1)
@@ -1193,7 +1196,13 @@ fn probe_fmts_index_keys(
             let Some(batch) = read_phase_batch(reader, seg, phase_off) else {
                 continue; // read fault on this phase — try the other / next segment
             };
-            let fresh = fetch.fmts_indexes(&batch);
+            let fresh = match fetch.fmts_indexes(&batch) {
+                Ok(f) => f,
+                Err(e) => {
+                    fetch_err.get_or_insert(e);
+                    continue;
+                }
+            };
             // Any non-empty reply is the source's COMPLETE ordered forensic set;
             // trust it and stop. An empty reply = this phase/segment did not anchor.
             if !fresh.is_empty() {
@@ -1210,7 +1219,9 @@ fn probe_fmts_index_keys(
     // disc from any source — fail loud like a missing Unit Key rather than emit
     // forensic-holed output.
     if index_keys.is_empty() {
-        return Err(crate::error::Error::FmtsKeyMissing.into());
+        return Err(fetch_err
+            .unwrap_or(crate::error::Error::FmtsKeyMissing)
+            .into());
     }
 
     // PROBE each index's phase: only ONE parity is real content, found by
@@ -1625,7 +1636,7 @@ pub(crate) fn resolve_mux_key_map_cached(
             && let Some(f) = fetch
             && !samples.is_empty()
         {
-            let fresh = f.unit_keys(&samples);
+            let fresh = f.unit_keys(&samples)?; // a source failure reports as itself
             if let crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } = keys {
                 for k in fresh {
                     if !unit_keys.iter().any(|(_, h)| *h == k) {
@@ -3204,11 +3215,11 @@ mod tests {
         // A unit-only KeyFetch that hands back key_x for any non-empty sample batch.
         let fetch = crate::sector::KeyFetch::unit_only(std::sync::Arc::new(
             move |samples: &[Vec<u8>]| {
-                if samples.is_empty() {
+                Ok(if samples.is_empty() {
                     Vec::new()
                 } else {
                     vec![key_x]
-                }
+                })
             },
         ));
         let map = super::resolve_mux_key_map(
@@ -3939,19 +3950,19 @@ mod tests {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> crate::sector::KeyFetch {
         crate::sector::KeyFetch::new(
-            std::sync::Arc::new(|_| Vec::new()),
+            std::sync::Arc::new(|_| Ok(Vec::new())),
             std::sync::Arc::new(move |batch: &[Vec<u8>]| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let Some(first) = batch.first() else {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 };
                 let mut u = first.clone();
                 crate::aacs::content::decrypt_unit(&mut u, &FMTS_INDEX_KEYS[0]);
-                if crate::aacs::content::is_clean(&u, ContentFormat::BdTs) {
+                Ok(if crate::aacs::content::is_clean(&u, ContentFormat::BdTs) {
                     FMTS_INDEX_KEYS.to_vec()
                 } else {
                     Vec::new()
-                }
+                })
             }),
         )
     }
@@ -4663,6 +4674,60 @@ mod tests {
             buf[..want].copy_from_slice(&self.unit[..want]);
             Ok(want)
         }
+    }
+
+    // A read-time key-source FAILURE must surface as the source's own error, not
+    // be flattened into DecryptFailed ("no key for this unit").
+    #[test]
+    fn base_slot_reports_a_key_source_failure_as_itself() {
+        struct Down;
+        impl crate::keysource::KeySource for Down {
+            fn get_unit_keys(
+                &self,
+                _ctx: &dyn crate::keysource::ResolveCtx,
+            ) -> Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error> {
+                Err(crate::error::Error::KeyServiceUnavailable)
+            }
+        }
+        let mut src = RecordingSource {
+            reads: Vec::new(),
+            unit: encrypted_clean_unit(&[0x5Au8; 16]),
+        };
+        let inputs = crate::keysource::DiscInputs {
+            disc_hash: String::new(),
+            volume_id: [0u8; 16],
+            version: 2,
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        let fetch = crate::keysource::key_fetch(
+            inputs,
+            std::sync::Arc::new(|| vec![Box::new(Down) as Box<dyn crate::keysource::KeySource>]),
+        );
+        let mut keys = crate::decrypt::DecryptKeys::Aacs {
+            unit_keys: Vec::new(),
+            format: ContentFormat::BdTs,
+        };
+        let ext = crate::disc::Extent {
+            start_lba: 3000,
+            sector_count: 270,
+        };
+        let err = super::base_slot_for_extent(
+            &mut src,
+            &ext,
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            &mut super::CpsUnitCache::new(),
+            0,
+        )
+        .expect_err("no key resolved");
+        assert_eq!(
+            err.to_string(),
+            std::io::Error::from(crate::error::Error::KeyServiceUnavailable).to_string()
+        );
     }
 
     // sample_encrypted_units: 8 probes at total*p/9 for p in 1..=8, pinned exactly.
