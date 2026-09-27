@@ -54,22 +54,20 @@ pub(crate) fn drop_unlock_fd(
 /// How `Drop` sends its ALLOW MEDIUM REMOVAL.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DropUnlock {
-    /// No PREVENT of ours to clear (or no owned fd): just close.
+    /// No PREVENT of ours to clear, or the thread cap is full (SG_IO already
+    /// stuck): just close.
     Skip,
     /// On a capped detached thread: SG_IO on a wedged node can block for long.
+    /// If the spawn itself fails, the caller sends ALLOW inline instead.
     Detached(i32),
-    /// No thread to be had: closing an sg fd does not release PREVENT, so send
-    /// it here rather than strand the lock.
-    Inline(i32),
 }
 
 /// Pick the [`DropUnlock`] for `unlock_fd` (from [`drop_unlock_fd`]), given
-/// whether a detached thread is available.
-pub(crate) fn drop_unlock_plan(unlock_fd: Option<i32>, thread: bool) -> DropUnlock {
+/// whether a recovery-thread slot was reserved.
+pub(crate) fn drop_unlock_plan(unlock_fd: Option<i32>, slot: bool) -> DropUnlock {
     match unlock_fd {
-        None => DropUnlock::Skip,
-        Some(fd) if thread => DropUnlock::Detached(fd),
-        Some(fd) => DropUnlock::Inline(fd),
+        Some(fd) if slot => DropUnlock::Detached(fd),
+        _ => DropUnlock::Skip,
     }
 }
 
@@ -187,14 +185,15 @@ mod tests {
         );
     }
 
-    /// Closing an sg fd does not release PREVENT, so when no unlock thread can
-    /// be had (cap full, or spawn failed) the ALLOW is sent inline instead.
+    /// A full recovery-thread cap means SG_IO calls are already stuck: Drop
+    /// closes at once rather than block on an inline ALLOW. Only a failed spawn
+    /// (checked by the caller) falls back to an inline ALLOW.
     #[test]
-    fn drop_unlock_plan_falls_back_inline_without_a_thread() {
+    fn drop_unlock_plan_skips_when_the_thread_cap_is_full() {
         assert_eq!(drop_unlock_plan(None, true), DropUnlock::Skip);
         assert_eq!(drop_unlock_plan(None, false), DropUnlock::Skip);
         assert_eq!(drop_unlock_plan(Some(5), true), DropUnlock::Detached(5));
-        assert_eq!(drop_unlock_plan(Some(5), false), DropUnlock::Inline(5));
+        assert_eq!(drop_unlock_plan(Some(5), false), DropUnlock::Skip);
     }
 
     // ── Recovery-thread cap ────────────────────────────────────────────────

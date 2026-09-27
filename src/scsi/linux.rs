@@ -259,11 +259,13 @@ impl Drop for SgIoTransport {
             let _ = Self::raw_command(fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
             close_all(&owned);
         };
-        let thread =
+        // Cap full = SG_IO calls already stuck: close without ALLOW rather than
+        // block here on the kernel EH ladder. Only a failed spawn (a resource
+        // limit, not a wedge) sends ALLOW inline.
+        let slot =
             unlock.is_some() && reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS);
-        match drop_unlock_plan(unlock, thread) {
+        match drop_unlock_plan(unlock, slot) {
             DropUnlock::Skip => close_all(&owned),
-            DropUnlock::Inline(fd) => unlock_inline(fd),
             DropUnlock::Detached(fd) => {
                 let fds = owned.clone();
                 let spawned = std::thread::Builder::new().spawn(move || {
@@ -548,10 +550,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
                 Ok(Ok(r)) if super::is_optical_peripheral(&r.raw) => super::NodeProbe::Optical,
                 Ok(Ok(_)) => super::NodeProbe::NotOptical,
                 Ok(Err(_)) => super::NodeProbe::Unresponsive,
-                Err((_, Some(libc::ENOENT | libc::ENXIO | libc::ENODEV))) => {
-                    super::NodeProbe::Absent
-                }
-                Err(_) => super::NodeProbe::Unresponsive,
+                Err((_, errno)) => super::open_failure_probe(*errno),
             };
             if !super::keep_unfiltered_node(probe) {
                 continue;
@@ -564,8 +563,8 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
                 model: pick_identity(r.model, &sysfs_model),
                 firmware: pick_identity(r.firmware, &sysfs_firmware),
             },
-            // Present but unresponsive (wedged, busy, no permission): listed from
-            // what sysfs knows, so autorip reports it rather than an unplug.
+            // Present but unresponsive (wedged, busy, or sysfs-typed but denied):
+            // listed from what sysfs knows, so autorip reports it, not an unplug.
             _ => super::DriveInfo {
                 path: path.clone(),
                 vendor: sysfs_vendor,

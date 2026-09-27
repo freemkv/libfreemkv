@@ -501,8 +501,8 @@ pub fn list_drives() -> Vec<DriveInfo> {
 /// Whether the drive at `path` holds a disc ([`DiscPresence`]).
 ///
 /// Issues TEST UNIT READY (cheapest SCSI op, no data transfer), re-issued after
-/// a UNIT ATTENTION (up to 4 times), and classifies the sense per MMC-6 Table
-/// F.3. On macOS the answer comes from IOKit and is only `Present`/`Absent`.
+/// a UNIT ATTENTION (up to 4 times), and classifies the sense (derived from
+/// MMC-6 Table F.3). On macOS the answer comes from IOKit and is only `Present`/`Absent`.
 ///
 /// **No internal recovery.** A wedged target surfaces as `Err(Error::ScsiError)` with `status
 /// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None`, no bus/USB reset, no retry. Other
@@ -687,7 +687,8 @@ pub(crate) fn prevent_allow_request(cdb: &[u8]) -> Option<u8> {
     }
 }
 
-/// Whether a drive holds a disc, from TEST UNIT READY sense (MMC-6 Table F.3).
+/// Whether a drive holds a disc, from TEST UNIT READY sense. The split is our
+/// reading of MMC-6 Table F.3 (derived, not spec text).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiscPresence {
@@ -731,7 +732,7 @@ pub(crate) fn tur_disc_presence(mut tur: impl FnMut() -> Result<()>) -> Result<D
     }
 }
 
-// MMC-6 Table F.3 / F.10 NOT READY ASC/ASCQ -> presence.
+// NOT READY ASC/ASCQ -> presence, derived from MMC-6 Tables F.3 / F.10.
 fn not_ready_presence(asc: u8, ascq: u8) -> DiscPresence {
     match (asc, ascq) {
         (0x3A, _) => DiscPresence::Absent,
@@ -755,10 +756,23 @@ pub(crate) enum NodeProbe {
     Optical,
     /// INQUIRY says another peripheral type.
     NotOptical,
-    /// Opened but INQUIRY failed, or open failed with e.g. EBUSY/EACCES.
+    /// Opened but INQUIRY failed, or open failed with e.g. EBUSY.
     Unresponsive,
     /// open() found no device (ENOENT, ENXIO, ENODEV).
     Absent,
+    /// open() refused (EACCES, EPERM): nothing says it is optical.
+    Denied,
+}
+
+/// [`NodeProbe`] for an sg node whose open(2) failed with `errno`.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn open_failure_probe(errno: Option<i32>) -> NodeProbe {
+    match errno {
+        Some(libc::ENOENT | libc::ENXIO | libc::ENODEV) => NodeProbe::Absent,
+        Some(libc::EACCES | libc::EPERM) => NodeProbe::Denied,
+        _ => NodeProbe::Unresponsive,
+    }
 }
 
 /// Kept unless definitively not an optical drive or not there: a wedged or busy
@@ -904,6 +918,24 @@ mod transport_helper_tests {
         assert!(keep_unfiltered_node(NodeProbe::Unresponsive));
         assert!(!keep_unfiltered_node(NodeProbe::NotOptical));
         assert!(!keep_unfiltered_node(NodeProbe::Absent));
+        // Without sysfs a non-root user sees EACCES on every root-owned sg node
+        // (disks, tapes): unprovable as optical, so not listed.
+        assert!(!keep_unfiltered_node(NodeProbe::Denied));
+    }
+
+    // How a failed open(2) of an unfiltered sg node is classified.
+    #[cfg(unix)]
+    #[test]
+    fn unfiltered_open_errno_classification() {
+        use NodeProbe::*;
+        let probe = |e| open_failure_probe(Some(e));
+        assert!(matches!(probe(libc::ENOENT), Absent));
+        assert!(matches!(probe(libc::ENXIO), Absent));
+        assert!(matches!(probe(libc::ENODEV), Absent));
+        assert!(matches!(probe(libc::EACCES), Denied));
+        assert!(matches!(probe(libc::EPERM), Denied));
+        assert!(matches!(probe(libc::EBUSY), Unresponsive));
+        assert!(matches!(open_failure_probe(None), Unresponsive));
     }
 
     // Drop unlocks the tray only for a transport that issued a PREVENT; the

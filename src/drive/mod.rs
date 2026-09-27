@@ -363,6 +363,8 @@ impl Drive {
         // (when the first failure of the current run completed, failures in it)
         let mut failing: Option<(std::time::Instant, u32)> = None;
         let mut start_sent = false;
+        // Consecutive 3Ah answers, and whether 04/01 (a disc being identified) was seen.
+        let (mut empty_run, mut becoming_ready_seen) = (0u32, false);
         for attempt in 0..60u64 {
             hb.tick(attempt, 60);
             let mut buf = [0u8; 0];
@@ -385,6 +387,7 @@ impl Drive {
                 // a hiccup; a run of 2+ lasting the budget past the first one's
                 // completion is a dead bus, surfaced rather than polled for 30 s.
                 Err(e) if e.is_scsi_transport_failure() => {
+                    empty_run = 0;
                     let (since, n) = failing.get_or_insert((std::time::Instant::now(), 0));
                     *n += 1;
                     if *n >= 2 && since.elapsed() >= WAIT_READY_DEAD_BUS_BUDGET {
@@ -394,6 +397,14 @@ impl Drive {
                 Err(e) => {
                     failing = None;
                     let sense = e.scsi_sense().map(|s| (s.sense_key, s.asc, s.ascq));
+                    let empty = matches!(sense, Some((crate::scsi::SENSE_KEY_NOT_READY, 0x3A, _)));
+                    empty_run = if empty { empty_run + 1 } else { 0 };
+                    becoming_ready_seen |=
+                        sense == Some((crate::scsi::SENSE_KEY_NOT_READY, 0x04, 0x01));
+                    // An empty drive that never said 04/01 will not become ready.
+                    if !becoming_ready_seen && empty_run >= WAIT_READY_MAX_EMPTY_POLLS {
+                        return Err(e);
+                    }
                     match sense {
                         // Incompatible / unreadable medium (MMC-6 Table F.3) never
                         // becomes ready: surface its sense now, not after 30 s.
@@ -1150,14 +1161,6 @@ impl Drive {
         Ok(())
     }
 
-    /// Soft power-cycle the drive mechanism WITHOUT ejecting: spin the disc
-    /// down (`START STOP UNIT`, START=0, **LOEJ=0**) then back up (START=1).
-    /// This clears the BU40N/Initio fast-fail *wedge* state that a run of
-    /// `HARDWARE_ERROR` reads leaves the drive in — the non-eject equivalent of
-    /// the power-cycle our notes say the wedge needs. The disc stays loaded (the
-    /// BU40N is slot-loading; we NEVER eject to recover — a hands-on eject is a
-    /// failure for an unattended service). Validated live 2026-07-01: took the
-    /// drive from failing-every-read back to reading at MB/s.
     // START STOP UNIT with START=1, LoEj=0 (never ejects). Only Halted propagates;
     // a rejected START just leaves wait_ready polling.
     fn start_unit(&mut self) -> Result<()> {
@@ -1173,6 +1176,14 @@ impl Drive {
         }
     }
 
+    /// Soft power-cycle the drive mechanism WITHOUT ejecting: spin the disc
+    /// down (`START STOP UNIT`, START=0, **LOEJ=0**) then back up (START=1).
+    /// This clears the BU40N/Initio fast-fail *wedge* state that a run of
+    /// `HARDWARE_ERROR` reads leaves the drive in — the non-eject equivalent of
+    /// the power-cycle our notes say the wedge needs. The disc stays loaded (the
+    /// BU40N is slot-loading; we NEVER eject to recover — a hands-on eject is a
+    /// failure for an unattended service). Validated live 2026-07-01: took the
+    /// drive from failing-every-read back to reading at MB/s.
     pub fn spin_cycle(&mut self) -> Result<()> {
         let stop = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x00, 0]; // START=0, LOEJ=0 → spin down
         let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0]; // START=1, LOEJ=0 → spin up
@@ -1405,6 +1416,10 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
     let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
 }
+
+// Consecutive MEDIUM NOT PRESENT (3Ah) TURs, with no 04/01 seen, after which
+// wait_ready reports the empty drive (~5 s of polling).
+const WAIT_READY_MAX_EMPTY_POLLS: u32 = 10;
 
 // How long an unbroken run of transport-class TUR failures may last, from the
 // first one's completion, before wait_ready calls the bus dead.
@@ -3165,6 +3180,69 @@ mod command_tests {
             t0.elapsed()
         );
         assert!(starts.lock().unwrap().is_empty(), "no START for 30h");
+    }
+
+    // Answers each TUR from a script of NOT READY (asc, ascq) pairs, then GOOD.
+    struct ScriptedNotReady(
+        std::collections::VecDeque<(u8, u8)>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+    impl ScsiTransport for ScriptedNotReady {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            let Some((asc, ascq)) = self.0.pop_front() else {
+                return Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                });
+            };
+            Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense: Some(crate::scsi::ScsiSense {
+                    sense_key: crate::scsi::SENSE_KEY_NOT_READY,
+                    asc,
+                    ascq,
+                }),
+            })
+        }
+    }
+
+    fn scripted(script: &[(u8, u8)]) -> (Drive, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = ScriptedNotReady(script.iter().copied().collect(), calls.clone());
+        (Drive::from_transport_for_test(Box::new(t)), calls)
+    }
+
+    // An empty drive (3Ah on every TUR, never 04/01) will not become ready:
+    // surface MEDIUM NOT PRESENT after a bounded run, not after ~30 s.
+    #[test]
+    fn wait_ready_fails_fast_on_an_empty_drive() {
+        let (mut d, calls) = scripted(&[(0x3A, 0x00); 100]);
+        let r = d.wait_ready();
+        assert!(
+            matches!(&r, Err(e) if e.scsi_sense().is_some_and(|s| s.asc == 0x3A)),
+            "{r:?}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 10, "bounded 3Ah run");
+    }
+
+    // Once the drive has said 04/01 (a disc is being identified), 3Ah is not
+    // final: keep polling rather than give up on the 3Ah run.
+    #[test]
+    fn wait_ready_keeps_polling_3a_after_becoming_ready() {
+        let mut script = vec![(0x04, 0x01)];
+        script.extend([(0x3A, 0x00); 11]);
+        let (mut d, _calls) = scripted(&script);
+        let r = d.wait_ready();
+        assert!(r.is_ok(), "{r:?}");
     }
 
     // One DID_TIME_OUT TUR eats its whole 5 s timeout; that single hiccup must
