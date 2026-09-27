@@ -8419,8 +8419,8 @@ mod tests {
         }
     }
 
-    // A layout with no N.M variant (5.2 via LFE2) falls back to the count, so
-    // the MKV Channels element stays 7 rather than the container's 6.
+    // Known limitation: unnamed layouts (5.2, 8.0 no-LFE, LFE-only) fall back to
+    // the count-based name; here 5.2 reads "6.1" but Channels stays 7, not 6.
     #[test]
     fn correct_truehd_channels_counts_unnameable_layout() {
         let a = truehd_corrected(0x100F);
