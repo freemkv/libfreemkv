@@ -23,6 +23,7 @@ pub(super) fn fsync_dir(dir: &Path) -> io::Result<()> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const OPEN_TOLERATED: &[i32] = &[libc::EACCES, libc::EISDIR];
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+// ENOTSUP goes beyond PostgreSQL's list on purpose: some FUSE/network mounts return it.
 const SYNC_TOLERATED: &[i32] = &[libc::EBADF, libc::EINVAL, libc::ENOTSUP];
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const OPEN_TOLERATED: &[i32] = &[];

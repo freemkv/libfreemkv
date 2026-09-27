@@ -334,8 +334,14 @@ impl WritebackPipeline {
 
     /// Caller is about to seek away from the current write region.
     /// Drain any in-flight chunk and reset tracking.
+    // MKV seeks every cluster, so never wait here: kick the tail and let the
+    // pending chunk wait at the next boundary. An un-waited range keeps its error
+    // for the final fsync.
     pub(crate) fn handle_seek(&mut self, new_pos: u64) {
-        self.finalize();
+        let tail_len = self.pos.saturating_sub(self.last_flush_pos);
+        if tail_len > 0 && self.waitable {
+            self.kickoff(self.last_flush_pos, tail_len);
+        }
         self.last_flush_pos = new_pos;
         self.pos = new_pos;
     }
@@ -393,12 +399,19 @@ impl WritebackPipeline {
     }
 }
 
-// Denylist: these mean the call itself is unsupported on this fd/fs. Every
+// Denylist: these mean the call was unsupported or transiently refused. Every
 // other errno (EIO, ENOSPC, EROFS, ESTALE, ENOTCONN, ...) may mean lost data.
 fn is_writeback_errno(errno: i32) -> bool {
     !matches!(
         errno,
-        libc::EINVAL | libc::ESPIPE | libc::EBADF | libc::ENOSYS | libc::EOPNOTSUPP
+        libc::EINVAL
+            | libc::ESPIPE
+            | libc::EBADF
+            | libc::ENOSYS
+            | libc::EOPNOTSUPP
+            | libc::ENOMEM
+            | libc::EINTR
+            | libc::EAGAIN
     )
 }
 
@@ -612,6 +625,9 @@ mod tests {
     // EROFS (aborted ext4 journal, btrfs abort) is data loss and must latch.
     #[test]
     fn erofs_is_latched_einval_is_not() {
+        for errno in [libc::ENOMEM, libc::EINTR, libc::EAGAIN] {
+            assert!(!is_writeback_errno(errno), "errno {errno} is transient");
+        }
         let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
         p.wait_op = erofs_wait;
         p.note_progress(CHUNK_BYTES_MIN);
@@ -622,6 +638,34 @@ mod tests {
         p.wait_op = einval_wait;
         p.note_progress(CHUNK_BYTES_MIN);
         p.finalize();
+        assert!(p.error().is_none());
+    }
+
+    static SEEK_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        SEEK_WAITS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    // Seeks happen every MKV cluster: they must not block on WAIT_AFTER.
+    #[test]
+    fn seek_never_waits() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.note_progress(CHUNK_BYTES_MIN + 4096);
+        assert!(p.pending.is_some());
+        p.wait_op = counting_wait;
+        p.handle_seek(0);
+        assert_eq!(
+            SEEK_WAITS.load(Ordering::SeqCst),
+            0,
+            "seek called WAIT_AFTER"
+        );
+        assert!(
+            p.pending.is_some(),
+            "the pending chunk waits at a later boundary"
+        );
         assert!(p.error().is_none());
     }
 
