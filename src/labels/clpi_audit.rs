@@ -1,8 +1,9 @@
 //! CLPI vs MPLS cross-validation diagnostic.
 //!
-//! Walks per-clip CLPI program info and per-playlist MPLS STN tables, dedups streams by PID
-//! alone (keeping the first `(coding_type, language)` seen per source), then compares those
-//! fields to classify each PID as CLPI-only, MPLS-only, Match, or Divergent.
+//! Walks per-clip CLPI program info and per-playlist MPLS STN tables, keys streams by
+//! `(clip, PID)` — a PID is only unique within one clip's transport stream — keeping the
+//! first `(coding_type, language)` seen per source, then classifies each key as CLPI-only,
+//! MPLS-only, Match, or Divergent.
 //!
 //! [`audit`] returns [`ClpiVsMplsAudit`]; diagnostic only, not used by
 //! label selection.
@@ -15,6 +16,8 @@ use std::collections::BTreeMap;
 /// both, with the fields each source reported.
 #[derive(Debug, Clone)]
 pub struct ClpiVsMplsRow {
+    /// Clip id (e.g. "00001") the PID belongs to.
+    pub clip: String,
     pub pid: u16,
     pub clpi_coding_type: Option<u8>,
     pub clpi_language: Option<String>,
@@ -103,91 +106,90 @@ impl ClpiVsMplsAudit {
 }
 
 /// Walk `/BDMV/CLIPINF/*.clpi` and `/BDMV/PLAYLIST/*.mpls`, build a
-/// dedup-by-PID table of (CLPI fields, MPLS fields), return the
+/// `(clip, PID)`-keyed table of (CLPI fields, MPLS fields), return the
 /// merged view. Missing files (read errors, parse failures) are
 /// silently skipped — this is diagnostic, not correctness-critical.
 pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
-    // Aggregate by PID across all CLPI files. A PID commonly repeats across
-    // clips (main movie + trailers sharing audio PIDs); first encountered
-    // wins, since they should all agree per BD spec.
-    let mut clpi_by_pid: BTreeMap<u16, (u8, String)> = BTreeMap::new();
-    if let Some(dir) = udf.find_dir("/BDMV/CLIPINF") {
-        let names: Vec<String> = dir
-            .entries
-            .iter()
-            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".clpi"))
-            .map(|e| e.name.clone())
-            .collect();
-        for name in names {
-            let path = format!("/BDMV/CLIPINF/{}", name);
-            let Ok(data) = udf.read_file(reader, &path) else {
-                continue;
-            };
-            let Ok(clip) = crate::clpi::parse(&data) else {
-                continue;
-            };
-            for s in clip.streams {
-                if s.pid == 0 {
-                    // PID 0 means "no PID in stream entry" — skip rather
-                    // than collide, mirroring the MPLS side below.
-                    continue;
-                }
-                clpi_by_pid
-                    .entry(s.pid)
+    // CLPI: the clip id is the file stem.
+    let mut clpi_by_key: BTreeMap<(String, u16), (u8, String)> = BTreeMap::new();
+    for (name, data) in read_dir_files(reader, udf, "/BDMV/CLIPINF", ".clpi") {
+        let Ok(clip) = crate::clpi::parse(&data) else {
+            continue;
+        };
+        let clip_id = name[..name.len() - ".clpi".len()].to_string();
+        for s in clip.streams {
+            // PID 0 means "no PID in stream entry" — skip rather than collide.
+            if s.pid != 0 {
+                clpi_by_key
+                    .entry((clip_id.clone(), s.pid))
                     .or_insert((s.coding_type, s.language));
             }
         }
     }
 
-    // Same for MPLS streams.
-    let mut mpls_by_pid: BTreeMap<u16, (u8, String)> = BTreeMap::new();
-    if let Some(dir) = udf.find_dir("/BDMV/PLAYLIST") {
-        let names: Vec<String> = dir
-            .entries
-            .iter()
-            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".mpls"))
-            .map(|e| e.name.clone())
-            .collect();
-        for name in names {
-            let path = format!("/BDMV/PLAYLIST/{}", name);
-            let Ok(data) = udf.read_file(reader, &path) else {
-                continue;
-            };
-            let Ok(pl) = crate::mpls::parse(&data) else {
-                continue;
-            };
-            for s in pl.streams {
-                if s.pid == 0 {
-                    // PID 0 means "no PID in stream entry" — skip rather
-                    // than collide with other entries.
-                    continue;
-                }
-                mpls_by_pid
-                    .entry(s.pid)
+    // MPLS: the STN table describes the first play item's clip.
+    let mut mpls_by_key: BTreeMap<(String, u16), (u8, String)> = BTreeMap::new();
+    for (_, data) in read_dir_files(reader, udf, "/BDMV/PLAYLIST", ".mpls") {
+        let Ok(pl) = crate::mpls::parse(&data) else {
+            continue;
+        };
+        let Some(clip_id) = pl.play_items.first().map(|pi| pi.clip_id.clone()) else {
+            continue;
+        };
+        for s in pl.streams {
+            if s.pid != 0 {
+                mpls_by_key
+                    .entry((clip_id.clone(), s.pid))
                     .or_insert((s.coding_type, s.language));
             }
         }
     }
 
-    // Merge views: every PID seen anywhere gets a row.
-    let mut all_pids: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-    all_pids.extend(clpi_by_pid.keys().copied());
-    all_pids.extend(mpls_by_pid.keys().copied());
-
-    let mut rows = Vec::with_capacity(all_pids.len());
-    for pid in all_pids {
-        let clpi = clpi_by_pid.get(&pid);
-        let mpls = mpls_by_pid.get(&pid);
-        rows.push(ClpiVsMplsRow {
-            pid,
-            clpi_coding_type: clpi.map(|(c, _)| *c),
-            clpi_language: clpi.map(|(_, l)| l.clone()),
-            mpls_coding_type: mpls.map(|(c, _)| *c),
-            mpls_language: mpls.map(|(_, l)| l.clone()),
-        });
-    }
+    // Merge views: every key seen anywhere gets a row.
+    let mut keys: std::collections::BTreeSet<&(String, u16)> = clpi_by_key.keys().collect();
+    keys.extend(mpls_by_key.keys());
+    let rows = keys
+        .into_iter()
+        .map(|key| {
+            let clpi = clpi_by_key.get(key);
+            let mpls = mpls_by_key.get(key);
+            ClpiVsMplsRow {
+                clip: key.0.clone(),
+                pid: key.1,
+                clpi_coding_type: clpi.map(|(c, _)| *c),
+                clpi_language: clpi.map(|(_, l)| l.clone()),
+                mpls_coding_type: mpls.map(|(c, _)| *c),
+                mpls_language: mpls.map(|(_, l)| l.clone()),
+            }
+        })
+        .collect();
 
     ClpiVsMplsAudit { rows }
+}
+
+// (file name, bytes) of every readable `*<ext>` file directly under `dir`.
+fn read_dir_files(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    dir: &str,
+    ext: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let Some(d) = udf.find_dir(dir) else {
+        return Vec::new();
+    };
+    let names: Vec<String> = d
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(ext))
+        .map(|e| e.name.clone())
+        .collect();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let data = udf.read_file(reader, &format!("{dir}/{name}")).ok()?;
+            Some((name, data))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -197,6 +199,7 @@ mod tests {
     #[test]
     fn class_match_when_identical() {
         let r = ClpiVsMplsRow {
+            clip: String::new(),
             pid: 0x1100,
             clpi_coding_type: Some(0x83),
             clpi_language: Some("eng".into()),
@@ -209,6 +212,7 @@ mod tests {
     #[test]
     fn class_clpi_only_when_mpls_missing() {
         let r = ClpiVsMplsRow {
+            clip: String::new(),
             pid: 0x1100,
             clpi_coding_type: Some(0x83),
             clpi_language: Some("eng".into()),
@@ -221,6 +225,7 @@ mod tests {
     #[test]
     fn class_mpls_only_when_clpi_missing() {
         let r = ClpiVsMplsRow {
+            clip: String::new(),
             pid: 0x1100,
             clpi_coding_type: None,
             clpi_language: None,
@@ -233,6 +238,7 @@ mod tests {
     #[test]
     fn class_divergent_on_lang_disagreement() {
         let r = ClpiVsMplsRow {
+            clip: String::new(),
             pid: 0x1100,
             clpi_coding_type: Some(0x83),
             clpi_language: Some("eng".into()),
@@ -247,6 +253,7 @@ mod tests {
         // Caller-built row with neither coding_type but disagreeing
         // languages must classify Divergent, not Match.
         let r = ClpiVsMplsRow {
+            clip: String::new(),
             pid: 0x1100,
             clpi_coding_type: None,
             clpi_language: Some("eng".into()),
@@ -259,6 +266,7 @@ mod tests {
     #[test]
     fn class_both_coding_missing_match_on_equal_lang() {
         let r = ClpiVsMplsRow {
+            clip: String::new(),
             pid: 0x1100,
             clpi_coding_type: None,
             clpi_language: Some("eng".into()),
@@ -273,6 +281,7 @@ mod tests {
         let audit = ClpiVsMplsAudit {
             rows: vec![
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 0x1100,
                     clpi_coding_type: Some(0x83),
                     clpi_language: Some("eng".into()),
@@ -280,6 +289,7 @@ mod tests {
                     mpls_language: Some("eng".into()),
                 }, // Match
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 0x1101,
                     clpi_coding_type: Some(0x83),
                     clpi_language: Some("fra".into()),
@@ -287,6 +297,7 @@ mod tests {
                     mpls_language: None,
                 }, // ClpiOnly
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 0x1102,
                     clpi_coding_type: None,
                     clpi_language: None,
@@ -294,6 +305,7 @@ mod tests {
                     mpls_language: Some("eng".into()),
                 }, // MplsOnly
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 0x1103,
                     clpi_coding_type: Some(0x86),
                     clpi_language: Some("spa".into()),
@@ -317,6 +329,7 @@ mod tests {
     #[test]
     fn class_divergent_on_coding_type_mismatch_same_lang() {
         let r = ClpiVsMplsRow {
+            clip: String::new(),
             pid: 0x1100,
             clpi_coding_type: Some(0x83), // TrueHD
             clpi_language: Some("eng".into()),
@@ -345,6 +358,7 @@ mod tests {
             rows: vec![
                 // 2 ClpiOnly
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 1,
                     clpi_coding_type: Some(0x83),
                     clpi_language: None,
@@ -352,6 +366,7 @@ mod tests {
                     mpls_language: None,
                 },
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 2,
                     clpi_coding_type: Some(0x82),
                     clpi_language: None,
@@ -360,6 +375,7 @@ mod tests {
                 },
                 // 1 MplsOnly
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 3,
                     clpi_coding_type: None,
                     clpi_language: None,
@@ -368,6 +384,7 @@ mod tests {
                 },
                 // 3 Match
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 4,
                     clpi_coding_type: Some(0x83),
                     clpi_language: Some("eng".into()),
@@ -375,6 +392,7 @@ mod tests {
                     mpls_language: Some("eng".into()),
                 },
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 5,
                     clpi_coding_type: Some(0x82),
                     clpi_language: Some("fra".into()),
@@ -382,6 +400,7 @@ mod tests {
                     mpls_language: Some("fra".into()),
                 },
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 6,
                     clpi_coding_type: Some(0x86),
                     clpi_language: Some("deu".into()),
@@ -390,6 +409,7 @@ mod tests {
                 },
                 // 1 Divergent
                 ClpiVsMplsRow {
+                    clip: String::new(),
                     pid: 7,
                     clpi_coding_type: Some(0x83),
                     clpi_language: Some("eng".into()),
@@ -404,5 +424,97 @@ mod tests {
         assert_eq!(m, 3, "matches slot");
         assert_eq!(d, 1, "divergent slot");
         assert_eq!(co + mo + m + d, audit.rows.len(), "all rows accounted for");
+    }
+
+    // Minimal MPLS: one play item on `clip` whose STN lists one primary audio
+    // stream `(pid, coding_type, lang)`.
+    fn build_mpls(clip: &[u8; 5], pid: u16, coding: u8, lang: &[u8; 3]) -> Vec<u8> {
+        let mut item = Vec::new();
+        item.extend_from_slice(clip);
+        item.extend_from_slice(b"M2TS");
+        item.extend_from_slice(&[0u8; 3]);
+        item.extend_from_slice(&0u32.to_be_bytes());
+        item.extend_from_slice(&(7000u32 * 45000).to_be_bytes());
+        item.extend_from_slice(&[0u8; 12]); // UO mask, misc, still
+        let mut stn = vec![0u8, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        stn.extend_from_slice(&[3, 0x01]);
+        stn.extend_from_slice(&pid.to_be_bytes());
+        stn.extend_from_slice(&[5, coding, 0x61]);
+        stn.extend_from_slice(lang);
+        item.extend_from_slice(&stn);
+        let mut pl = vec![0u8; 6];
+        pl.extend_from_slice(&1u16.to_be_bytes());
+        pl.extend_from_slice(&[0u8; 2]);
+        pl.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        pl.extend_from_slice(&item);
+        let pl_len = (pl.len() - 4) as u32;
+        pl[0..4].copy_from_slice(&pl_len.to_be_bytes());
+        let mut buf = b"MPLS0200".to_vec();
+        buf.extend_from_slice(&40u32.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 28]);
+        buf.extend_from_slice(&pl);
+        buf
+    }
+
+    // A PID is scoped to its clip: the same PID in two clips is two streams, and
+    // each playlist entry is compared with its own clip's CLPI.
+    #[test]
+    fn same_pid_in_two_clips_is_compared_per_clip() {
+        use crate::consts::coding_type as c;
+        use crate::udf::fixture::*;
+        let build_clpi = super::super::clpi_orphan_tests::build_clpi;
+        let dir = |name: &str, icb: u32, files| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs: vec![],
+        };
+        let clipinf = dir(
+            "CLIPINF",
+            24,
+            vec![
+                file_with(
+                    "00000.clpi",
+                    26,
+                    8000,
+                    build_clpi(&[(0x1100, c::AC3, "eng")]),
+                    false,
+                ),
+                file_with(
+                    "00001.clpi",
+                    27,
+                    8100,
+                    build_clpi(&[(0x1100, c::TRUEHD, "eng")]),
+                    false,
+                ),
+            ],
+        );
+        let mpls = build_mpls(b"00001", 0x1100, c::TRUEHD, b"eng");
+        let playlist = dir(
+            "PLAYLIST",
+            30,
+            vec![file_with("00800.mpls", 32, 8200, mpls, false)],
+        );
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![clipinf, playlist],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let a = audit(&mut disc, &udf);
+        assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
     }
 }

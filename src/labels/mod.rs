@@ -3215,7 +3215,7 @@ mod clpi_orphan_tests {
 
     // Build a full CLPI buffer (HDMV header + ProgramInfo) for (pid, coding_type, lang)
     // streams.
-    fn build_clpi(streams: &[(u16, u8, &str)]) -> Vec<u8> {
+    pub(super) fn build_clpi(streams: &[(u16, u8, &str)]) -> Vec<u8> {
         use crate::consts::coding_type as c;
         let sci_streams: Vec<(u16, Vec<u8>)> = streams
             .iter()
