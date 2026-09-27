@@ -31,7 +31,7 @@ impl M2tsStream {
         out.codec_privates.clear();
         let mut route = Vec::with_capacity(title.streams.len());
         for (i, s) in title.streams.iter().enumerate() {
-            let cp = title.codec_privates.get(i).cloned().flatten();
+            let mut cp = title.codec_privates.get(i).cloned().flatten();
             let lpcm = match s {
                 DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => {
                     let src = cp.as_deref().and_then(super::codec::lpcm::layout_byte);
@@ -49,6 +49,8 @@ impl M2tsStream {
                         route.push(None);
                         continue;
                     }
+                    // Advertise the layout actually packed, not a rejected source byte.
+                    cp = h.map(|h| super::codec::lpcm::tagged_layout(h[0]));
                     h
                 }
                 _ => None,
@@ -585,5 +587,21 @@ mod tests {
         let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         let stream = M2tsStream::create(sink, &title).unwrap();
         assert_eq!(stream.undelivered_streams(), vec![1]);
+    }
+    #[test]
+    fn fmkv_header_carries_the_layout_byte_actually_used() {
+        // 2ch stream with a stale 5.1 layout byte: packing falls back to stereo, so
+        // the FMKV header must carry the stereo byte, not the rejected 5.1 one.
+        use crate::disc::{AudioChannels, SampleRate};
+        let mut title = lpcm_title(AudioChannels::Stereo, SampleRate::S48);
+        title.codec_privates = vec![None, Some(b"BDLP\x91".to_vec())];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        drop(stream);
+        let buf = shared.lock().unwrap().clone();
+        let mut cursor = std::io::Cursor::new(&buf);
+        let meta = super::meta::read_header(&mut cursor).unwrap().unwrap();
+        let back = meta.to_title();
+        assert_eq!(back.codec_privates[1], Some(b"BDLP\x31".to_vec()));
     }
 }

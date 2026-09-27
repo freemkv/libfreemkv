@@ -601,7 +601,7 @@ fn drive_mux(
                         buffered_bytes,
                         cap = HEADER_BUFFER_CAP_BYTES,
                         "header buffer cap exceeded: the title keeps yielding frames but a \
-                         required codec_private (video or AAC) never resolved; refusing \
+                         required codec_private (video, AAC or BD LPCM) never resolved; refusing \
                          rather than buffering the whole stream into RAM"
                     );
                     return Err(Error::MuxHeaderBufferExceeded {
@@ -616,7 +616,7 @@ fn drive_mux(
 
     // ── Header gate ── Halt first, whatever headers_ready() says: on the
     // highway path a halt can end the stream as `Ok(None)`, and that EOF also
-    // releases the AAC wait, so a ready gate does not mean the pump finished.
+    // releases the in-band config wait, so a ready gate does not mean the pump finished.
     if halt.is_cancelled() {
         return Ok(MuxOutcome {
             completed: false,

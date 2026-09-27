@@ -3,15 +3,15 @@
 use crate::disc::{Codec, DiscTitle, Stream};
 use crate::pes::PesFrame;
 
-// Source time an AAC track may take to deliver its first frame (the only source
-// of its AudioSpecificConfig) before headers are finalised without it.
-const AAC_CONFIG_WAIT_NS: i64 = 5_000_000_000;
+// Source time an AAC (ASC) or BD LPCM (layout byte) track may take to deliver its
+// first frame, the only source of that config, before headers finalise without it.
+const CONFIG_WAIT_NS: i64 = 5_000_000_000;
 // Larger PTS steps are discontinuities/wraps, not elapsed time.
 const MAX_PTS_STEP_NS: i64 = 1_000_000_000;
 // Backstops, well inside the driver's cap: per-track frames that did not
 // advance PTS (a stuck clock), and total buffered bytes.
-const AAC_CONFIG_WAIT_FRAMES: u32 = 2048;
-const AAC_CONFIG_WAIT_BYTES: usize = super::driver::HEADER_BUFFER_CAP_BYTES / 2;
+const CONFIG_WAIT_FRAMES: u32 = 2048;
+const CONFIG_WAIT_BYTES: usize = super::driver::HEADER_BUFFER_CAP_BYTES / 2;
 
 // One track's view of source time, so interleaved tracks far apart in PTS
 // neither rebase nor double-count each other.
@@ -64,9 +64,9 @@ impl HeaderGate {
                 clock.max_pts = pts;
             }
         }
-        if clock.stalled >= AAC_CONFIG_WAIT_FRAMES
-            || clock.elapsed_ns >= AAC_CONFIG_WAIT_NS
-            || self.bytes >= AAC_CONFIG_WAIT_BYTES
+        if clock.stalled >= CONFIG_WAIT_FRAMES
+            || clock.elapsed_ns >= CONFIG_WAIT_NS
+            || self.bytes >= CONFIG_WAIT_BYTES
         {
             self.expired = true;
         }
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn frame_count_backstop_expires_when_pts_never_advances() {
         let mut g = HeaderGate::default();
-        for _ in 0..AAC_CONFIG_WAIT_FRAMES - 1 {
+        for _ in 0..CONFIG_WAIT_FRAMES - 1 {
             g.account(0, 0, 0);
         }
         assert!(waiting(&g));
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn byte_bound_expires_before_the_driver_cap() {
         let mut g = HeaderGate::default();
-        g.account(0, 0, AAC_CONFIG_WAIT_BYTES - 1);
+        g.account(0, 0, CONFIG_WAIT_BYTES - 1);
         assert!(waiting(&g));
         g.account(0, 0, 1);
         assert!(!waiting(&g));

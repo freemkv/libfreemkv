@@ -317,6 +317,11 @@ impl CodecParser for LpcmParser {
 /// untagged value falls back to the count-default layout.
 const LAYOUT_TAG: &[u8; 4] = b"BDLP";
 
+/// Tagged codec_private for BD layout byte `b`.
+pub(crate) fn tagged_layout(b: u8) -> Vec<u8> {
+    [LAYOUT_TAG.as_slice(), &[b]].concat()
+}
+
 /// The BD layout byte (channel_assignment|rate) from a tagged LPCM codec_private.
 pub(crate) fn layout_byte(cp: &[u8]) -> Option<u8> {
     match cp.strip_prefix(LAYOUT_TAG.as_slice()) {
