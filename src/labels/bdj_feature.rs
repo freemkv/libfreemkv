@@ -980,19 +980,76 @@ mod tests {
         assert!(counting.1.len() < 64, "read {} sectors", counting.1.len());
     }
 
-    // A present EOCD whose central-directory offset is corrupt is rejected up front,
-    // not handed to the zip reader's whole-file backward scan.
+    // A present EOCD whose central directory is found neither at cd_offset nor at
+    // eocd - cd_size is rejected up front, not handed to the zip reader's
+    // whole-file backward scan.
     #[test]
-    fn large_jar_with_corrupt_cd_offset_reads_a_bounded_tail() {
+    fn large_jar_with_corrupt_cd_location_reads_a_bounded_tail() {
         let mut jar = build_jar(&[("assets/bg.png", vec![0x5Au8; 512 * 1024])]);
         let eocd = jar.len() - 22;
         assert_eq!(&jar[eocd..eocd + 4], b"PK\x05\x06");
-        jar[eocd + 16..eocd + 20].copy_from_slice(&0x10u32.to_le_bytes());
+        jar[eocd + 12..eocd + 16].copy_from_slice(&0x10u32.to_le_bytes()); // cd_size
+        jar[eocd + 16..eocd + 20].copy_from_slice(&0x10u32.to_le_bytes()); // cd_offset
         let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", jar)], vec![]);
         let mut counting = Counting(&mut disc, Vec::new());
         let opened = jar::visit_jars_limited(&mut counting, &udf, 0, |_, a| Some(a.is_some()));
         assert_eq!(opened, Some(false));
         assert!(counting.1.len() < 128, "read {} sectors", counting.1.len());
+    }
+
+    // Open a jar in place and harvest its locators (None when it did not open).
+    fn harvest_in_place(jar: Vec<u8>) -> Option<HashSet<u16>> {
+        let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", jar)], vec![]);
+        let (mut ids, mut budget) = (HashSet::new(), u64::MAX);
+        jar::visit_jars_limited(&mut disc, &udf, 0, |_, archive| {
+            harvest_candidates(archive?, &mut ids, &mut budget);
+            Some(())
+        })?;
+        Some(ids)
+    }
+
+    fn locator_jar() -> Vec<u8> {
+        let class = build_class(&["00800.mpls"]);
+        build_jar(&[
+            ("assets/bg.png", vec![1u8; 8192]),
+            ("com/studio/MainXlet.class", class),
+        ])
+    }
+
+    // With data prepended, cd_offset is stale but the CD sits at eocd - cd_size
+    // (how zip readers and the JDK locate it): the jar still opens.
+    #[test]
+    fn prepended_data_jar_opens_in_place() {
+        let mut jar = vec![0xEEu8; 100_000];
+        jar.extend(locator_jar());
+        assert!(harvest_in_place(jar).is_some_and(|ids| ids.contains(&800)));
+    }
+
+    // Append `comment` to a jar as its zip comment.
+    fn with_comment(mut jar: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+        let eocd = jar.len() - 22;
+        jar[eocd + 20..eocd + 22].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        jar.extend_from_slice(comment);
+        jar
+    }
+
+    // Whether a jar opens in place (the EOCD pre-check passed and zip accepted it).
+    fn opens_in_place(jar: Vec<u8>) -> bool {
+        let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", jar)], vec![]);
+        jar::visit_jars_limited(&mut disc, &udf, 0, |_, a| Some(a.is_some())) == Some(true)
+    }
+
+    // A fake EOCD signature inside the zip comment is probed, fails its checks and
+    // is skipped; more fakes than MAX_EOCD_PROBES are refused, not probed without
+    // bound. (zip itself then reads the fake as an empty archive — harmless.)
+    #[test]
+    fn fake_eocd_signatures_in_the_comment_are_bounded() {
+        let fake = [b"PK\x05\x06".as_slice(), &[0u8; 18]].concat();
+        assert!(opens_in_place(with_comment(locator_jar(), &fake)));
+        let many = fake.repeat(jar::MAX_EOCD_PROBES + 1);
+        assert!(!opens_in_place(with_comment(locator_jar(), &many)));
+        let at_cap = fake.repeat(jar::MAX_EOCD_PROBES - 1);
+        assert!(opens_in_place(with_comment(locator_jar(), &at_cap)));
     }
 
     // A spent inflation budget abstains instead of scanning on.
