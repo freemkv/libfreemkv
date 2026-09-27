@@ -268,10 +268,9 @@ mod tests {
     // interchangeable.
     #[test]
     fn parsers_that_derive_no_config_report_absent_never_an_empty_codec_private() {
-        // Codecs whose parsers do no configuration extraction, paired with a
-        // payload that is a REAL frame of that codec so the gate takes its
-        // keep-path (a rejected frame proves nothing about the config answer).
-        // AAC is absent here: it derives an AudioSpecificConfig (see below).
+        // Parsers with no config extraction, each fed a REAL frame so the gate
+        // keeps it (a rejected frame proves nothing). AAC derives an ASC, so
+        // it is tested separately below.
         let cases: [(Codec, Vec<u8>); 4] = [
             // MPEG-1 Layer II, 44.1 kHz, 128 kbit/s, stereo.
             (Codec::Mp2, vec![0xFF, 0xFD, 0x70, 0x00, 0x00, 0x00]),

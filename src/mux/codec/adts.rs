@@ -93,10 +93,9 @@ impl CodecParser for AdtsParser {
             let rate_index = (data[2] >> 2) & 15;
             let object_type = (data[2] >> 6) + 1;
             let channels = ((data[2] & 1) << 2) | (data[3] >> 6);
-            // MPEG-4 AudioSpecificConfig replaces the ADTS transport header in
-            // Matroska. The raw AAC payload must not retain that header or CRC.
-            // CodecPrivate is fixed per track, so a later config change keeps the
-            // first ASC (as ffmpeg's aac_adtstoasc does) and is counted.
+            // The ASC replaces the ADTS header (payload carries no header/CRC).
+            // CodecPrivate is fixed per track: a later config change keeps the
+            // first ASC and is counted.
             let asc = [
                 (object_type << 3) | (rate_index >> 1),
                 (rate_index << 7) | (channels << 3),

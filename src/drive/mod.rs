@@ -1294,10 +1294,9 @@ fn discover_drives() -> Vec<(String, DriveId)> {
     platform::find_drives()
 }
 
-// Pick a drive preferring DiscPresent status, falling back to the first that
-// opened. At most one drive is open at a time (macOS allows one live handle),
-// so the no-media fallback is released before the next candidate is opened
-// and reopened by path at the end. Split from find_drive for unit tests.
+// Prefer a drive with media, else the first that opened. Only one drive is open
+// at a time (macOS allows one live handle): the fallback is released before the
+// next open and reopened by path. Split from find_drive for unit tests.
 fn select_drive_with_media<P>(
     candidates: impl IntoIterator<Item = P>,
     mut open: impl FnMut(&P) -> Option<Drive>,
