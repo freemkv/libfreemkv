@@ -2756,22 +2756,39 @@ mod tests {
     // full JOIN_TIMEOUT (600 s).
     #[test]
     fn a_send_timeout_bounds_the_final_join() {
-        // The wedged write returns only after finish has given up; the leaked
-        // consumer must then not finalise the output it was abandoned with.
-        struct Stuck(Arc<std::sync::atomic::AtomicBool>);
+        // Only the first write wedges, returning after finish has given up; the
+        // leaked consumer must then neither apply the queued item nor close.
+        struct Stuck {
+            closed: Arc<std::sync::atomic::AtomicBool>,
+            woke: std::sync::mpsc::Sender<()>,
+            first: bool,
+            applied: Arc<std::sync::atomic::AtomicUsize>,
+        }
         impl Sink<u32> for Stuck {
             type Output = ();
             fn apply(&mut self, _: u32) -> Result<Flow, Error> {
-                std::thread::sleep(Duration::from_secs(7));
+                self.applied.fetch_add(1, Ordering::SeqCst);
+                if std::mem::take(&mut self.first) {
+                    std::thread::sleep(Duration::from_secs(7));
+                    let _ = self.woke.send(());
+                }
                 Ok(Flow::Continue)
             }
             fn close(self) -> Result<(), Error> {
-                self.0.store(true, Ordering::SeqCst);
+                self.closed.store(true, Ordering::SeqCst);
                 Ok(())
             }
         }
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pipe = Pipeline::spawn(1, Stuck(closed.clone())).unwrap();
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (woke_tx, woke) = std::sync::mpsc::channel();
+        let stuck = Stuck {
+            closed: closed.clone(),
+            woke: woke_tx,
+            first: true,
+            applied: applied.clone(),
+        };
+        let pipe = Pipeline::spawn(1, stuck).unwrap();
         let halt = Halt::new();
         let mut timed_out = false;
         for i in 0..4 {
@@ -2792,10 +2809,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("the join must be bounded by the grace, not JOIN_TIMEOUT");
         assert!(failed);
-        std::thread::sleep(Duration::from_secs(3));
+        woke.recv_timeout(Duration::from_secs(30))
+            .expect("the wedged write returns");
+        std::thread::sleep(Duration::from_millis(500));
         assert!(
             !closed.load(Ordering::SeqCst),
             "an abandoned consumer must not finalise the output late"
+        );
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            1,
+            "nor apply the queued item"
         );
     }
 
