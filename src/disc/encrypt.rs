@@ -120,8 +120,8 @@ pub(super) fn handshake_class_error(e: &Error) -> Option<Error> {
 
 impl Disc {
     // Sticky refusal: a bus-encrypted disc whose handshake failed reads ciphertext
-    // through the bus, so no supplied key may commit or clear the reason. With no AACS
-    // state the bus flag is unknown, so a handshake failure blocks too.
+    // through the bus, so no supplied key may commit or clear the reason.
+    // Fail-safe: with no AACS state the bus flag is unknown, so assume bus encryption.
     pub(crate) fn bus_blocked_error(&self) -> Option<Error> {
         let bus = self.aacs.as_ref().is_none_or(|a| a.bus_encryption);
         if !bus {
@@ -1171,6 +1171,29 @@ mod tests {
         assert!(matches!(d.aacs_error, Some(Error::AacsNoHostCert { .. })));
     }
 
+    /// Unreadable Unit_Key_RO.inf with a non-handshake-class handshake error: the
+    /// capture error is the one surfaced.
+    #[test]
+    fn capture_error_surfaces_over_a_non_handshake_error() {
+        let mut disc = MemDisc::new();
+        let udf = build_aacs_fs(&mut disc, &[]);
+        let d = Disc::scan_with(
+            &mut disc,
+            10_000,
+            None,
+            Some(Error::Halted),
+            false,
+            &ScanOptions::default(),
+            udf,
+        )
+        .expect("scan");
+        assert!(
+            matches!(d.aacs_error, Some(Error::AacsNoKeys)),
+            "{:?}",
+            d.aacs_error
+        );
+    }
+
     /// A bus-blocked disc does not query key sources at all.
     #[test]
     fn bus_blocked_disc_skips_key_sources() {
@@ -1192,7 +1215,9 @@ mod tests {
         let (ok, trace) = crate::keysource::resolve_and_apply_traced(&sources, &inputs, &mut d);
         assert!(!ok);
         assert_eq!(CALLS.load(Ordering::Relaxed), 0, "no source may be queried");
-        assert!(trace.keys.is_empty());
+        // One step names the block, so a UI can tell it from "no sources".
+        assert_eq!(trace.keys.len(), 1);
+        assert_eq!(trace.keys[0].who, crate::aacs::trace::BUS_BLOCKED);
     }
 
     /// A handshake with no bus key and no drive unlock keeps the metadata and

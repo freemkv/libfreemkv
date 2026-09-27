@@ -334,8 +334,15 @@ pub fn resolve_and_apply_traced(
     use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep};
 
     let mut trace = crate::aacs::trace::ResolutionTrace::new();
-    // A bus-blocked disc refuses every key: don't query sources for it.
+    // A bus-blocked disc refuses every key: don't query sources, record why.
     if disc.bus_blocked_error().is_some() {
+        trace.keys.push(KeyStep {
+            who: crate::aacs::trace::BUS_BLOCKED.to_string(),
+            path: Vec::new(),
+            outcome: KeyOutcome::NoKey,
+            matched_entry: None,
+            store_entries: None,
+        });
         return (false, trace);
     }
 

@@ -2235,9 +2235,15 @@ impl Disc {
                         encrypt::aacs_scan_error(state.bus_encryption, source, handshake_error);
                     (Some(state), err)
                 }
-                // A handshake failure (no VID) is more actionable than the
-                // generic capture error, so surface it when present.
-                Err(e) => (None, Some(handshake_error.unwrap_or(e))),
+                // The capture error is surfaced, except that a handshake-class failure
+                // is kept: it is what makes `bus_blocked_error` refuse keys fail-safe.
+                Err(e) => match handshake_error {
+                    Some(h) if encrypt::handshake_class_error(&h).is_some() => {
+                        tracing::warn!(target: "freemkv::scan", capture_error = e.code(), handshake_error = h.code(), "AACS inputs unreadable after a failed handshake");
+                        (None, Some(h))
+                    }
+                    _ => (None, Some(e)),
+                },
             }
         };
 
@@ -2806,33 +2812,57 @@ fn aligned_unit_keys_validate(
 }
 
 // Read-ahead confined to one file's recorded extents: a single-sector read inside an
-// extent fetches up to a batch of THAT extent only (never adjacent essence); every other
-// read passes through. The caller's `recovery` flag is forwarded unchanged.
+// extent fetches up to a batch of THAT extent only (never adjacent essence). Other
+// single reads (the ICB) are memoised; the caller's `recovery` flag is forwarded.
 struct FileReadAhead<'a> {
     inner: &'a mut dyn SectorSource,
     extents: Vec<(u32, u32)>,
     cache: Vec<u8>,
     cache_lba: u32,
     cached: u32,
+    // After a failed batch, read the rest of the file sector by sector.
+    batching: bool,
+    last: Option<(u32, Box<[u8; 2048]>)>,
 }
 
 impl<'a> FileReadAhead<'a> {
     const BATCH: u32 = DEFAULT_BATCH_SECTORS_OPTICAL as u32;
 
     fn new(inner: &'a mut dyn SectorSource, fs: &udf::UdfFs, icb: u32) -> Result<Self> {
-        let extents = fs
-            .extents_abs_at(inner, icb)?
-            .into_iter()
-            .filter(|e| e.recorded)
-            .map(|e| (e.lba, (e.len as u64).div_ceil(2048) as u32))
-            .collect();
-        Ok(Self {
+        let mut ra = Self {
             inner,
-            extents,
+            extents: Vec::new(),
             cache: Vec::new(),
             cache_lba: 0,
             cached: 0,
-        })
+            batching: true,
+            last: None,
+        };
+        // No extent list (e.g. ICB-embedded data) just means no read-ahead.
+        ra.extents = match fs.extents_abs_at(&mut ra, icb) {
+            Ok(v) => v
+                .into_iter()
+                .filter(|e| e.recorded)
+                .map(|e| (e.lba, (e.len as u64).div_ceil(2048) as u32))
+                .collect(),
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => Vec::new(),
+        };
+        Ok(ra)
+    }
+
+    fn read_one(&mut self, lba: u32, buf: &mut [u8], recovery: bool) -> Result<usize> {
+        if let Some((at, data)) = &self.last
+            && *at == lba
+        {
+            buf[..2048].copy_from_slice(&data[..]);
+            return Ok(2048);
+        }
+        self.inner.read_sectors(lba, 1, buf, recovery)?;
+        let mut data = Box::new([0u8; 2048]);
+        data.copy_from_slice(&buf[..2048]);
+        self.last = Some((lba, data));
+        Ok(2048)
     }
 }
 
@@ -2857,10 +2887,14 @@ impl SectorSource for FileReadAhead<'_> {
             .iter()
             .find(|&&(start, n)| lba >= start && lba - start < n)
             .map(|&(start, n)| n - (lba - start));
-        let want = left.unwrap_or(1).min(Self::BATCH);
+        let want = if self.batching {
+            left.unwrap_or(1).min(Self::BATCH)
+        } else {
+            1
+        };
         self.cached = 0;
         if want <= 1 {
-            return self.inner.read_sectors(lba, 1, buf, recovery);
+            return self.read_one(lba, buf, recovery);
         }
         self.cache.resize(want as usize * 2048, 0);
         match self
@@ -2875,7 +2909,10 @@ impl SectorSource for FileReadAhead<'_> {
             }
             Err(Error::Halted) => Err(Error::Halted),
             // A bad sector later in the batch must not fail this one: retry it alone.
-            Err(_) => self.inner.read_sectors(lba, 1, buf, recovery),
+            Err(_) => {
+                self.batching = false;
+                self.read_one(lba, buf, recovery)
+            }
         }
     }
 }
@@ -6261,6 +6298,127 @@ mod tests {
         drop(ra);
         assert!(!src.forced, "recovery was forced on");
         assert_eq!(buf[0], 5);
+    }
+
+    // An ICB-embedded (AD type 3) structure file is bundled like any other.
+    #[test]
+    fn read_structure_files_keeps_embedded_data_files() {
+        use udf::fixture::{PART_START, file_with};
+        let payload = b"INDX0200-embedded".to_vec();
+        let mut disc = structure_image(
+            vec![file_with("index.bdmv", 100, 1000, payload.clone(), false)],
+            vec![],
+            vec![],
+            vec![],
+        );
+        // Rewrite the file's ICB as an Extended File Entry with embedded data.
+        let mut icb = [0u8; 2048];
+        icb[0..2].copy_from_slice(&266u16.to_le_bytes());
+        icb[34..36].copy_from_slice(&3u16.to_le_bytes());
+        icb[56..64].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        icb[212..216].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        icb[216..216 + payload.len()].copy_from_slice(&payload);
+        disc.put_bytes(PART_START + 100, &icb);
+        let files = Disc::read_structure_files(&mut disc).expect("structure");
+        assert_eq!(files, vec![("BDMV/index.bdmv".to_string(), payload)]);
+    }
+
+    // Once a batch inside a file fails, the rest of that file is read sector by
+    // sector: no repeated multi-sector reads over the bad area.
+    #[test]
+    fn read_structure_files_stops_batching_after_a_failed_batch() {
+        use udf::fixture::{PART_START, file_with};
+        struct BadSector<'a> {
+            inner: &'a mut udf::fixture::MemDisc,
+            failed_batches: usize,
+        }
+        impl SectorSource for BadSector<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                r: bool,
+            ) -> Result<usize> {
+                let bad = PART_START + 1008;
+                if lba <= bad && lba + count as u32 > bad {
+                    if count > 1 {
+                        self.failed_batches += 1;
+                    }
+                    return Err(Error::DiscRead {
+                        sector: bad as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.inner.read_sectors(lba, count, buf, r)
+            }
+        }
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![file_with(
+                "00000.clpi",
+                100,
+                1000,
+                vec![5; 16 * 2048],
+                false,
+            )],
+            vec![],
+        );
+        let mut src = BadSector {
+            inner: &mut disc,
+            failed_batches: 0,
+        };
+        let files = Disc::read_structure_files(&mut src).expect("structure");
+        assert!(files.is_empty(), "the unreadable file is skipped");
+        assert_eq!(
+            src.failed_batches, 1,
+            "batching must stop after the first failure"
+        );
+    }
+
+    // Each file's ICB is read from the source once, not once per UDF lookup.
+    #[test]
+    fn read_structure_files_reads_each_icb_once() {
+        use udf::fixture::{PART_START, file_with};
+        struct IcbCount<'a> {
+            inner: &'a mut udf::fixture::MemDisc,
+            icb_reads: usize,
+        }
+        impl SectorSource for IcbCount<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                r: bool,
+            ) -> Result<usize> {
+                let icb = PART_START + 100;
+                if lba <= icb && lba + count as u32 > icb {
+                    self.icb_reads += 1;
+                }
+                self.inner.read_sectors(lba, count, buf, r)
+            }
+        }
+        let mut disc = structure_image(
+            vec![],
+            vec![],
+            vec![file_with("00000.clpi", 100, 1000, vec![5; 2048], false)],
+            vec![],
+        );
+        let mut base = IcbCount {
+            inner: &mut disc,
+            icb_reads: 0,
+        };
+        udf::read_filesystem(&mut base).expect("fs");
+        let parse_reads = base.icb_reads;
+        let mut src = IcbCount {
+            inner: &mut disc,
+            icb_reads: 0,
+        };
+        Disc::read_structure_files(&mut src).expect("structure");
+        assert_eq!(src.icb_reads - parse_reads, 1);
     }
 
     fn structure_names(disc: &mut udf::fixture::MemDisc) -> Vec<String> {

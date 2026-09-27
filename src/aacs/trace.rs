@@ -129,6 +129,10 @@ pub enum KeyNode {
     DerivedUnitKeys,
 }
 
+/// [`KeyStep::who`] of the single step recorded when no source was consulted because
+/// the disc is bus-blocked (its reason is on `Disc::aacs_error`).
+pub const BUS_BLOCKED: &str = "bus_blocked";
+
 /// The terminal outcome of a source's resolution attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOutcome {
