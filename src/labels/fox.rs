@@ -53,7 +53,8 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     let data = super::read_jar_file(reader, udf, "dcx.xml")?;
     let text = std::str::from_utf8(&data).ok()?;
 
-    let labels = labels_from_dcx(text);
+    let feature = select_feature_playlist(text)?;
+    let labels = labels_from_feature(feature);
     if labels.is_empty() {
         return None;
     }
@@ -64,32 +65,31 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // Surface the feature playlist's authoring id (e.g. "00800") so title
     // selection can prefer the disc's own feature over a size-inflated decoy —
     // the same signal `paramount::parse` provides.
-    result.feature_playlist = feature_hint(text);
+    result.feature_playlist = element_hint(feature);
     Some(result)
 }
 
-/// The feature playlist hint for a `dcx.xml` doc. Derives the numeric id and the
-/// filename from ONE parsed number so they can never disagree: `format!("{id}")`
-/// on a 5-digit id above u16::MAX (65536..=99999) left playlist_id `None` while
-/// the filename stayed `Some`, a half-hint whose two fields named different
-/// things. Require a valid u16 playlist number, then format the canonical
-/// 5-digit `NNNNN.mpls` from it.
+/// The feature playlist hint for a `dcx.xml` doc: the selected feature's
+/// authoring id (see [`super::FeaturePlaylistHint::from_authoring_id`]).
 pub(crate) fn feature_hint(text: &str) -> Option<super::FeaturePlaylistHint> {
-    let id = feature_playlist_id(text)?;
-    let playlist_id = id.parse::<u16>().ok()?;
-    Some(super::FeaturePlaylistHint {
-        playlist_id: Some(playlist_id),
-        filename: Some(format!("{playlist_id:05}.mpls")),
-    })
+    element_hint(select_feature_playlist(text)?)
 }
 
-// Build stream labels from a `dcx.xml` doc; split out from `parse` for unit testing. Scoped to
-// the richest `<playlist name="feature">` element.
-pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
-    let Some(feature) = select_feature_playlist(text) else {
-        return Vec::new();
-    };
+fn element_hint(feature: &str) -> Option<super::FeaturePlaylistHint> {
+    super::FeaturePlaylistHint::from_authoring_id(&xml::attr(feature, "id")?)
+}
 
+// Build stream labels from a `dcx.xml` doc (test/harness entry). Scoped to the
+// richest `<playlist name="feature">` element.
+#[cfg(test)]
+pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
+    select_feature_playlist(text)
+        .map(labels_from_feature)
+        .unwrap_or_default()
+}
+
+// Stream labels from the selected `<playlist name="feature">` element.
+fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
     let mut labels = Vec::new();
 
     // Audio streams.
@@ -159,9 +159,7 @@ use super::MIN_FEATURE_SECS;
 
 // The `durs` (seconds) of a `<playlist>` element, digits only, when stated.
 fn playlist_duration_secs(element: &str) -> Option<u64> {
-    let v = xml::attr(element, "durs")?;
-    let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u64>().ok().filter(|&d| d > 0)
+    super::stated_duration_secs(element, &["durs"])
 }
 
 // Pick the richest `<playlist name="feature">` (most nested streams; a `durs` tiebreak breaks a
@@ -198,18 +196,6 @@ fn select_feature_playlist(text: &str) -> Option<&str> {
         }
     }
     best.map(|(el, _)| el)
-}
-
-/// The authoring id (digits only, e.g. "00800") of the selected feature
-/// playlist, or `None` when no feature playlist / no id is present.
-fn feature_playlist_id(text: &str) -> Option<String> {
-    let feature = select_feature_playlist(text)?;
-    let id = xml::attr(feature, "id")?;
-    let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    Some(digits)
 }
 
 /// Count `<tag>` elements inside `element`.
@@ -347,9 +333,16 @@ mod tests {
     #[test]
     fn selects_richest_feature_playlist_and_its_id() {
         assert_eq!(
-            feature_playlist_id(FOX_DCX_SAMPLE),
-            Some("00800".to_string())
+            feature_hint(FOX_DCX_SAMPLE).and_then(|h| h.playlist_id),
+            Some(800)
         );
+    }
+
+    // An id above u16::MAX yields no hint at all, never a filename-only half-hint.
+    #[test]
+    fn feature_hint_rejects_an_id_above_u16() {
+        let doc = r#"<playlist name="feature" id="70000" durs="7000"><audio id="1" lang="eng"/></playlist>"#;
+        assert_eq!(feature_hint(doc), None);
     }
 
     /// The feature hint's numeric id and filename are derived from ONE parsed
@@ -497,7 +490,7 @@ mod tests {
             labels_from_dcx(menus_only).is_empty(),
             "no <playlist name=\"feature\"> → nothing to label"
         );
-        assert_eq!(feature_playlist_id(menus_only), None);
+        assert_eq!(feature_hint(menus_only), None);
     }
 
     /// On an equal nested-stream count, the longer `durs` (seconds) wins the
@@ -514,7 +507,7 @@ mod tests {
                 <subtitle id="01" lang="eng" type="feature"/>
             </playlist>
         </disc></dcx>"#;
-        assert_eq!(feature_playlist_id(doc), Some("00900".to_string()));
+        assert_eq!(feature_hint(doc).and_then(|h| h.playlist_id), Some(900));
     }
 
     /// A stated sub-minute `name="feature"` is a decoy and is skipped in favour
@@ -532,7 +525,7 @@ mod tests {
             </playlist>
         </disc></dcx>"#;
         // 00050 has more nested streams but is sub-minute → rejected; 00800 wins.
-        assert_eq!(feature_playlist_id(doc), Some("00800".to_string()));
+        assert_eq!(feature_hint(doc).and_then(|h| h.playlist_id), Some(800));
     }
 
     /// A feature playlist with no nested streams (an authoring edge) produces
@@ -544,6 +537,6 @@ mod tests {
         </disc></dcx>"#;
         assert!(labels_from_dcx(doc).is_empty());
         // ...but the id is still recoverable for the feature hint.
-        assert_eq!(feature_playlist_id(doc), Some("00800".to_string()));
+        assert_eq!(feature_hint(doc).and_then(|h| h.playlist_id), Some(800));
     }
 }

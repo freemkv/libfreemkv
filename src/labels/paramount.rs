@@ -32,7 +32,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // Find the feature playlist — longest duration or name="Feature"
     let feature = find_feature_playlist(text)?;
 
-    let labels = labels_from_feature(&feature);
+    let labels = labels_from_feature(feature);
 
     if labels.is_empty() {
         return None;
@@ -42,25 +42,14 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // every field whose meaning the corpus establishes. "Documented" would
     // be the wrong word — see the module note; nothing about it is.
     let mut result = ParseResult::high(labels);
-    result.feature_playlist = feature_hint(&feature);
+    result.feature_playlist = element_hint(feature);
     Some(result)
 }
 
-/// The feature playlist hint for a `playlists.xml` `<playlist>` element. Surface
-/// its identity so title selection can prefer it over a size-inflated decoy.
-/// Derive the numeric id and the filename from ONE parsed number so they cannot
-/// disagree: keep only the digits (resisting a stray quote/space), require a
-/// valid u16 playlist number, and format the canonical 5-digit `NNNNN.mpls`.
-/// (`format!("{digits}.mpls")` on a 5-digit id above u16::MAX left playlist_id
-/// None while the filename stayed Some — a half-hint.)
-fn feature_hint(feature: &str) -> Option<super::FeaturePlaylistHint> {
-    let id = super::xml::attr(feature, "id")?;
-    let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
-    let playlist_id = digits.parse::<u16>().ok()?;
-    Some(super::FeaturePlaylistHint {
-        playlist_id: Some(playlist_id),
-        filename: Some(format!("{playlist_id:05}.mpls")),
-    })
+/// The feature playlist hint for a `playlists.xml` `<playlist>` element: its
+/// authoring id, surfaced so title selection can prefer it over a size-inflated decoy.
+fn element_hint(feature: &str) -> Option<super::FeaturePlaylistHint> {
+    super::FeaturePlaylistHint::from_authoring_id(&xml::attr(feature, "id")?)
 }
 
 // One cell of the `forced_sub` CSV. Reads like a boolean but is an enumeration.
@@ -209,9 +198,8 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
 /// feature element and derives its id/filename. Exposed for the generic BD-J
 /// menu-walk (`bdj_feature`) Tier-1 sweep, which finds this manifest embedded
 /// inside a jar rather than as a loose file.
-pub(crate) fn feature_hint_from_xml(text: &str) -> Option<super::FeaturePlaylistHint> {
-    let feature = find_feature_playlist(text)?;
-    feature_hint(&feature)
+pub(crate) fn feature_hint(text: &str) -> Option<super::FeaturePlaylistHint> {
+    element_hint(find_feature_playlist(text)?)
 }
 
 // A playlist must run at least this long (seconds) to be the feature — kills the
@@ -221,30 +209,51 @@ use super::MIN_FEATURE_SECS;
 
 // A `<playlist>` element's stated running time in seconds, if any. Read from the
 // first present of a set of duration-like attributes (the corpus is not a spec;
-// `durs` matches the sibling Fox manifest's seconds convention). Digits only.
+// `durs` matches the sibling Fox manifest's seconds convention).
 fn playlist_duration_secs(element: &str) -> Option<u64> {
-    for key in ["duration", "durs", "dur", "runtime", "length", "len"] {
-        if let Some(v) = xml::attr(element, key) {
-            let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
-            if let Ok(secs) = digits.parse::<u64>()
-                && secs > 0
-            {
-                return Some(secs);
-            }
-        }
-    }
-    None
+    super::stated_duration_secs(
+        element,
+        &["duration", "durs", "dur", "runtime", "length", "len"],
+    )
+}
+
+// Whether a playlist name has the WORD "feature" (`_Feature`, `MainFeature`) and no
+// extras word (`Feature_Trailer`, `FeatureCommentary`); `Featurette` is not "feature".
+fn names_feature(name: &str) -> bool {
+    const EXTRAS: &[&str] = &[
+        "trailer",
+        "trailers",
+        "teaser",
+        "commentary",
+        "bonus",
+        "featurette",
+        "promo",
+        "preview",
+        "previews",
+        "extra",
+        "extras",
+        "making",
+        "deleted",
+        "scenes",
+        "behind",
+        "interview",
+        "recap",
+        "sneak",
+    ];
+    let words = super::name_words(name);
+    words.iter().any(|w| w == "feature") && !words.iter().any(|w| EXTRAS.contains(&w.as_str()))
 }
 
 // A feature-selection candidate: the element text, its non-empty audio-slot
 // count, and its stated duration (seconds) when known.
-struct Candidate {
-    element: String,
+#[derive(Clone, Copy)]
+struct Candidate<'a> {
+    element: &'a str,
     aud: usize,
     dur: Option<u64>,
 }
 
-impl Candidate {
+impl Candidate<'_> {
     // A candidate whose duration is stated AND sub-minute can never be the
     // feature — the _Start_Angle decoy guard.
     fn is_sub_minute(&self) -> bool {
@@ -255,13 +264,13 @@ impl Candidate {
 /// Find the feature playlist element. Order, refined for Sony SM3 UHD:
 ///   1. exact `name="Feature"` (case-insensitive) — longest-duration among any,
 ///      else first;
-///   2. else any name matching `/feature/i` (`_Feature`, `Feature_A`, …) —
-///      longest-duration among them, else the most-audio one;
+///   2. else any name containing the word "feature" (`_Feature`, `Feature_A`, …)
+///      with at least one audio slot — longest-duration, else most audio;
 ///   3. else the most-audio playlist overall, breaking ties by longest duration.
 ///
 /// A playlist whose stated duration is sub-minute is never returned (the
 /// `_Start_Angle` decoy).
-fn find_feature_playlist(text: &str) -> Option<String> {
+fn find_feature_playlist(text: &str) -> Option<&str> {
     let mut exact: Vec<Candidate> = Vec::new();
     let mut feature_like: Vec<Candidate> = Vec::new();
     let mut all: Vec<Candidate> = Vec::new();
@@ -277,20 +286,14 @@ fn find_feature_playlist(text: &str) -> Option<String> {
             .map(|a| a.split(',').filter(|s| !s.trim().is_empty()).count())
             .unwrap_or(0);
         let dur = playlist_duration_secs(element);
-        let make = || Candidate {
-            element: element.to_string(),
-            aud,
-            dur,
-        };
+        let cand = Candidate { element, aud, dur };
 
         match xml::attr(element, "name") {
-            Some(name) if name.eq_ignore_ascii_case("Feature") => exact.push(make()),
-            Some(name) if name.to_ascii_lowercase().contains("feature") => {
-                feature_like.push(make())
-            }
+            Some(name) if name.eq_ignore_ascii_case("Feature") => exact.push(cand),
+            Some(name) if names_feature(&name) => feature_like.push(cand),
             _ => {}
         }
-        all.push(make());
+        all.push(cand);
     }
 
     // Tier 1: exact name="Feature" — longest duration, else first. A
@@ -298,8 +301,9 @@ fn find_feature_playlist(text: &str) -> Option<String> {
     if let Some(el) = pick(&exact, Key::Duration, false) {
         return Some(el);
     }
-    // Tier 2: /feature/i names (Sony `_Feature`, `Feature_A`, `Feature_B`) —
-    // longest duration among them, else most audio.
+    // Tier 2: "feature"-word names (Sony `_Feature`, `Feature_A`, `Feature_B`) —
+    // longest duration, else most audio. Unlike the exact tier, a fuzzy name needs
+    // audio: a zero-audio `_Feature` is weaker evidence than tier 3's audio count.
     if let Some(el) = pick(&feature_like, Key::Duration, true) {
         return Some(el);
     }
@@ -318,12 +322,12 @@ enum Key {
 // Choose the best candidate under `key`: skip sub-minute decoys; first-wins on a
 // full tie (strict `>`). When `require_audio`, a candidate needs at least one
 // audio slot to be eligible. `None` duration sorts below any stated duration.
-fn pick(cands: &[Candidate], key: Key, require_audio: bool) -> Option<String> {
+fn pick<'a>(cands: &[Candidate<'a>], key: Key, require_audio: bool) -> Option<&'a str> {
     let rank = |c: &Candidate| match key {
         Key::Duration => (c.dur, c.aud as u64),
         Key::Audio => (Some(c.aud as u64), c.dur.unwrap_or(0)),
     };
-    let mut best: Option<&Candidate> = None;
+    let mut best: Option<&Candidate<'a>> = None;
     for c in cands {
         if c.is_sub_minute() {
             continue;
@@ -335,7 +339,7 @@ fn pick(cands: &[Candidate], key: Key, require_audio: bool) -> Option<String> {
             best = Some(c);
         }
     }
-    best.map(|c| c.element.clone())
+    best.map(|c| c.element)
 }
 
 #[cfg(test)]
@@ -350,7 +354,7 @@ mod tests {
             <playlist name="Bonus" aud="deu,ita,jpn" sub="deu,ita,jpn"/>
         "#;
         let feature = find_feature_playlist(doc).expect("feature playlist found");
-        let labels = labels_from_feature(&feature);
+        let labels = labels_from_feature(feature);
         let got: Vec<(StreamLabelType, u16, &str)> = labels
             .iter()
             .map(|l| (l.stream_type, l.stream_number, l.language.as_str()))
@@ -807,14 +811,14 @@ mod tests {
     #[test]
     fn feature_hint_id_and_filename_agree() {
         let feature = r#"<playlist name="Feature" id="00222" duration="7000" />"#;
-        let h = feature_hint(feature).expect("a numeric id yields a hint");
+        let h = element_hint(feature).expect("a numeric id yields a hint");
         assert_eq!(h.playlist_id, Some(222));
         assert_eq!(h.filename.as_deref(), Some("00222.mpls"));
         assert!(h.matches(222, "00222.mpls"), "the two fields agree");
 
         // No id / non-numeric id → no hint (not a filename-only half-hint).
-        assert!(feature_hint(r#"<playlist name="Feature" />"#).is_none());
-        assert!(feature_hint(r#"<playlist id="menu" />"#).is_none());
+        assert!(element_hint(r#"<playlist name="Feature" />"#).is_none());
+        assert!(element_hint(r#"<playlist id="menu" />"#).is_none());
     }
 
     // Spec: on a tie in audio-slot count, the FIRST playlist wins. Mutation: `count >
@@ -833,8 +837,8 @@ mod tests {
     }
 
     // Sony SM3 UHD regression: `_Start_Angle` (id 00243, 2s) shares the
-    // feature's audio slots and comes first — `/feature/i` matching plus the
-    // sub-minute guard now reject the decoy the old rule picked.
+    // feature's audio slots and comes first — `/feature/i` matching prefers the
+    // `_Feature` playlist (the sub-minute guard is pinned separately below).
     #[test]
     fn feature_selection_rejects_start_angle_decoy() {
         let xml = r#"
@@ -848,7 +852,7 @@ mod tests {
             "the 2-second angle decoy must never be the feature: {feature}"
         );
         // Tie between the two /feature/i playlists → first wins (_Feature, 00800).
-        let h = feature_hint_from_xml(xml).expect("hint");
+        let h = feature_hint(xml).expect("hint");
         assert_eq!(h.playlist_id, Some(800));
         assert_eq!(h.filename.as_deref(), Some("00800.mpls"));
     }
@@ -860,7 +864,7 @@ mod tests {
             <playlist name="_Feature"  id="00800" aud="eng,fra" duration="6000" />
             <playlist name="Feature_B" id="00802" aud="eng,fra" duration="8000" />
         "#;
-        let h = feature_hint_from_xml(xml).expect("hint");
+        let h = feature_hint(xml).expect("hint");
         assert_eq!(
             h.playlist_id,
             Some(802),
@@ -873,13 +877,76 @@ mod tests {
     #[test]
     fn sub_minute_feature_name_is_rejected() {
         let xml = r#"
-            <playlist name="Feature_Trailer" id="00050" aud="eng,fra,spa" duration="30" />
+            <playlist name="Feature_B"       id="00050" aud="eng,fra,spa" duration="30" />
             <playlist name="MainMovie"       id="00800" aud="eng,fra,spa" duration="7000" />
         "#;
         let feature = find_feature_playlist(xml).expect("a feature is found");
-        // Feature_Trailer is /feature/i but sub-minute → rejected; tier 3 picks
+        // Feature_B names the feature but is sub-minute → rejected; tier 3 picks
         // MainMovie (equal audio, far longer duration).
         assert!(feature.contains(r#"id="00800""#), "got {feature}");
+    }
+
+    // "Featurette"/"Bonus_Features" are not the word "feature": the most-audio
+    // tier must still pick the real feature.
+    #[test]
+    fn featurette_names_do_not_match_the_feature_tier() {
+        for name in ["Featurette", "Bonus_Features", "FeatureCommentary"] {
+            let xml = format!(
+                r#"<playlist name="MainMovie" id="00800" aud="eng,fra,spa,deu" duration="7000"/>
+                <playlist name="{name}" id="00100" aud="eng" duration="900"/>"#
+            );
+            let h = feature_hint(&xml).expect("hint");
+            assert_eq!(h.playlist_id, Some(800), "{name}");
+        }
+    }
+
+    // "feature" as a camelCase word counts; a compound with an extras word does not.
+    #[test]
+    fn feature_word_matching_handles_camel_case_and_extras() {
+        for name in [
+            "MainFeature",
+            "FeatureFilm",
+            "TheatricalFeature",
+            "ExtendedFeature",
+            "_Feature",
+            "Feature_A",
+        ] {
+            assert!(names_feature(name), "{name}");
+        }
+        for name in [
+            "Feature_Trailer",
+            "FeatureCommentary",
+            "BonusFeature",
+            "Featurette",
+            "Feature_Promo",
+            "FeaturePreview",
+            "Feature_Making",
+            "FeatureDeletedScenes",
+            "BehindTheFeature",
+            "FeatureInterview",
+            "FeatureRecap",
+            "SneakFeature",
+        ] {
+            assert!(!names_feature(name), "{name}");
+        }
+    }
+
+    // The sub-minute guard in the exact name="Feature" tier: a lone 2 s exact
+    // "Feature" is skipped and selection falls through to the real feature.
+    #[test]
+    fn sub_minute_exact_feature_is_rejected() {
+        let xml = r#"
+            <playlist name="Feature"   id="00243" aud="eng,fra,spa" duration="2" />
+            <playlist name="MainMovie" id="00800" aud="eng,fra,spa" duration="7000" />
+        "#;
+        assert_eq!(feature_hint(xml).and_then(|h| h.playlist_id), Some(800));
+    }
+
+    // An id above u16::MAX yields no hint at all, never a filename-only half-hint.
+    #[test]
+    fn feature_hint_rejects_an_id_above_u16() {
+        let xml = r#"<playlist name="Feature" id="70000" aud="eng" duration="7000" />"#;
+        assert_eq!(feature_hint(xml), None);
     }
 
     // Duration attribute reading: several key spellings, digits only, zero → None.

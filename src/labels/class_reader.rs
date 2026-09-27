@@ -595,9 +595,7 @@ impl<'a> Iterator for Instructions<'a> {
         let pc = self.pos;
         let opcode = self.code[pc];
         let size = instruction_size(self.code, pc)?;
-        // `size` can reach `usize::MAX` on a 32-bit target (saturated switch-table
-        // math on adversarial bytecode), so `pc + size` must be a CHECKED add: a
-        // wrapping add could yield a small `end` that passes the bounds check below, then slices out of range / panics.
+        // Defence in depth: a wrapped `end` would pass the bounds check below.
         let end = pc.checked_add(size)?;
         if end > self.code.len() {
             return None;
@@ -1167,10 +1165,9 @@ mod tests {
     }
 
     /// A `tableswitch` whose declared jump table spans the full i32 index range
-    /// drives `instruction_size` to a saturated, buffer-exceeding size. `next()`
-    /// must add `pc + size` with a CHECKED add (no wrap on a 32-bit `usize`, no
-    /// panic on any target) and simply stop the walk — malformed disc bytecode
-    /// yields no instruction, never a panic.
+    /// has a size far past the buffer: the walk stops, yielding nothing, never
+    /// panicking. (The checked `pc + size` in `next()` is defence in depth: no
+    /// target reaches a wrapping size, so this test cannot pin that add.)
     #[test]
     fn instructions_iter_rejects_oversized_switch_without_panicking() {
         let mut code = vec![TABLESWITCH, 0, 0, 0]; // opcode + 3 pad bytes

@@ -86,8 +86,10 @@ fn is_sprm(idx: u8) -> bool {
 struct Vm {
     gprm: [u16; 16],
     sprm: [u16; 24],
-    // Per-GPRM taint: set when SPRM-derived.
+    // Per-GPRM taint: set when SPRM-derived (or random).
     gprm_tainted: [bool; 16],
+    // Counter-mode GPRMs count elapsed time, so their value is never decidable.
+    gprm_counter: [bool; 16],
 }
 
 impl Vm {
@@ -96,6 +98,7 @@ impl Vm {
             gprm: [0; 16],
             sprm: [0; 24],
             gprm_tainted: [false; 16],
+            gprm_counter: [false; 16],
         }
     }
 
@@ -106,7 +109,8 @@ impl Vm {
         if is_sprm(idx) {
             true
         } else {
-            self.gprm_tainted[(idx & 0x0F) as usize]
+            let i = (idx & 0x0F) as usize;
+            self.gprm_tainted[i] || self.gprm_counter[i]
         }
     }
 
@@ -152,9 +156,9 @@ impl Vm {
         (result, tainted)
     }
 
-    /// Apply a `SetGPRM`. Only the arithmetic/logic set-ops that a First-Play
-    /// routine uses to prepare a dispatch are modelled; unmodelled ops
-    /// (swap/rnd) leave the register unchanged (best-effort, never panic).
+    /// Apply a `SetGPRM` per libdvdnav eval_set_op (reverse-engineered player
+    /// behaviour): add/mul saturate at 0xFFFF, sub clamps at 0, ÷0 and mod 0
+    /// yield 0xFFFF, swap also writes the source register, rnd taints.
     fn set(&mut self, reg: u8, op: u8, immediate: bool, imm: u16, src: u8) {
         let idx = (reg & 0x0F) as usize;
         let v = if immediate { imm } else { self.reg(src) };
@@ -163,27 +167,29 @@ impl Vm {
         // covers both a direct SPRM read and a laundered GPRM).
         let src_tainted = !immediate && self.reg_tainted(src);
         let cur = self.gprm[idx];
-        let cur_tainted = self.gprm_tainted[idx];
+        let cur_tainted = self.reg_tainted(reg & 0x0F);
+        let t = cur_tainted || src_tainted;
         // Each arm sets (new value, new taint). `mov` overwrites with the source's
-        // taint alone (clearing prior taint); accumulating ops union current and
-        // source taint. Unmodelled ops leave value and taint intact.
+        // taint alone (clearing prior taint); accumulating ops union both.
         let (nv, nt) = match op {
-            1 => (v, src_tainted),                                  // mov
-            3 => (cur.wrapping_add(v), cur_tainted || src_tainted), // add
-            4 => (cur.wrapping_sub(v), cur_tainted || src_tainted), // sub
-            5 => (cur.wrapping_mul(v), cur_tainted || src_tainted), // mul
-            6 => (
-                cur.checked_div(v).unwrap_or(cur),
-                cur_tainted || src_tainted,
-            ), // div (÷0 → unchanged)
-            7 => (
-                cur.checked_rem(v).unwrap_or(cur),
-                cur_tainted || src_tainted,
-            ), // mod (÷0 → unchanged)
-            9 => (cur & v, cur_tainted || src_tainted),             // and
-            10 => (cur | v, cur_tainted || src_tainted),            // or
-            11 => (cur ^ v, cur_tainted || src_tainted),            // xor
-            _ => (cur, cur_tainted),                                // swap/rnd/unmodelled
+            1 => (v, src_tainted), // mov
+            2 => {
+                // swap: reg2 (byte5 low nibble) takes the old value first.
+                let reg2 = (src & 0x0F) as usize;
+                self.gprm[reg2] = cur;
+                self.gprm_tainted[reg2] = cur_tainted;
+                (v, src_tainted)
+            }
+            3 => (cur.saturating_add(v), t),
+            4 => (cur.saturating_sub(v), t),
+            5 => (cur.saturating_mul(v), t), // libdvdnav's i32 product overflows (C UB) past 0x7FFF_FFFF
+            6 => (cur.checked_div(v).unwrap_or(0xFFFF), t),
+            7 => (cur.checked_rem(v).unwrap_or(0xFFFF), t),
+            8 => (cur, true), // rnd: non-deterministic
+            9 => (cur & v, t),
+            10 => (cur | v, t),
+            11 => (cur ^ v, t),
+            _ => (cur, self.gprm_tainted[idx]), // unknown op: no-op
         };
         self.gprm[idx] = nv;
         self.gprm_tainted[idx] = nt;
@@ -266,6 +272,12 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
             None => (true, false),
         };
 
+        // SetGPRMMD sets the register mode even when its predicate is false
+        // (libdvdnav eval_system_set; reverse-engineered).
+        if let Instr::SetGprmMd { reg, counter, .. } = cmd.instr {
+            vm.gprm_counter[(reg & 0x0F) as usize] = counter;
+        }
+
         // A decidable false predicate skips this line — no effect, taint
         // unchanged. When the predicate is tainted we cannot decide `taken`, so
         // we do not skip; the per-instruction handling below is conservative.
@@ -311,20 +323,42 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
             } => {
                 if tainted {
                     vm.taint_gprm(reg);
+                    if op == 2 {
+                        vm.taint_gprm(src); // swap also writes its source
+                    }
                 } else {
                     vm.set(reg, op, immediate, imm, src);
                 }
             }
 
-            // No-effect (for resolution) instructions: keep executing. SetSystem
-            // writes an SPRM (never a GPRM in this decoder), and SPRM reads are
-            // caught at read time, so no GPRM taint is needed here.
+            // SetGPRMMD stores like a `mov` (mode was applied above).
+            Instr::SetGprmMd {
+                reg,
+                immediate,
+                imm,
+                src,
+                ..
+            } => {
+                if tainted {
+                    vm.taint_gprm(reg);
+                } else {
+                    vm.set(reg, 1, immediate, imm, src);
+                }
+            }
+
+            // No-effect (for resolution) instructions: keep executing. Other
+            // SetSystem ops write SPRMs only, and SPRM reads are caught at read time.
             Instr::Nop | Instr::SetSystem => {}
 
             // Everything else leaves the deterministically-followable path: Break/Exit
             // end the pre list with no title; JumpSS/Link land in a menu or depend on
             // an interactive button selection that can't be resolved statically.
             _ => return None,
+        }
+
+        // A set's trailing link leaves the pre list (or might): not followable.
+        if cmd.link {
+            return None;
         }
 
         pc += 1;
@@ -444,12 +478,10 @@ mod tests {
 
     // ── Executor: convergence to a title ────────────────────────────────────
 
-    /// Unconditional-dispatch shape: First-Play is an unconditional `JumpTT 1`,
-    // Vm::set arithmetic/logic ops, including the ÷0 and mod-0 guards: a divide
-    // or modulo by zero must leave the register INTACT (checked_div/rem → cur),
-    // never panic, and an unmodelled op must be a no-op.
+    // Vm::set per libdvdnav eval_set_op (reverse-engineered): add/mul saturate,
+    // sub clamps at 0, div/mod by 0 yields 0xFFFF, an unknown op is a no-op.
     #[test]
-    fn set_ops_including_divide_and_mod_by_zero_leave_the_register_intact() {
+    fn set_ops_saturate_and_divide_by_zero_yields_ffff() {
         let mut vm = Vm::new();
         vm.set(0, 1, true, 42, 0); // mov
         assert_eq!(vm.gprm[0], 42);
@@ -460,25 +492,23 @@ mod tests {
         vm.set(0, 5, true, 3, 0); // mul → 150
         assert_eq!(vm.gprm[0], 150);
 
-        // mul wraps (u16), never panics.
         vm.set(1, 1, true, 0xFFFF, 0);
         vm.set(1, 5, true, 2, 0);
-        assert_eq!(vm.gprm[1], 0xFFFE, "0xFFFF * 2 wraps in u16");
+        assert_eq!(vm.gprm[1], 0xFFFF, "mul saturates");
+        vm.set(1, 3, true, 1, 0);
+        assert_eq!(vm.gprm[1], 0xFFFF, "add saturates");
+        vm.set(3, 4, true, 1, 0);
+        assert_eq!(vm.gprm[3], 0, "sub clamps at 0");
 
         vm.set(0, 6, true, 7, 0); // div → 150/7 = 21
         assert_eq!(vm.gprm[0], 21);
-        vm.set(0, 6, true, 0, 0); // ÷0 → unchanged
-        assert_eq!(
-            vm.gprm[0], 21,
-            "divide by zero must leave the register intact"
-        );
+        vm.set(0, 6, true, 0, 0);
+        assert_eq!(vm.gprm[0], 0xFFFF, "divide by zero yields 0xFFFF");
+        vm.set(0, 1, true, 21, 0);
         vm.set(0, 7, true, 5, 0); // mod → 21 % 5 = 1
         assert_eq!(vm.gprm[0], 1);
-        vm.set(0, 7, true, 0, 0); // mod 0 → unchanged
-        assert_eq!(
-            vm.gprm[0], 1,
-            "modulo by zero must leave the register intact"
-        );
+        vm.set(0, 7, true, 0, 0);
+        assert_eq!(vm.gprm[0], 0xFFFF, "modulo by zero yields 0xFFFF");
 
         vm.set(2, 1, true, 0b1100, 0);
         vm.set(2, 9, true, 0b1010, 0); // and → 0b1000
@@ -488,9 +518,94 @@ mod tests {
         vm.set(2, 11, true, 0b1111, 0); // xor → 0b0100
         assert_eq!(vm.gprm[2], 0b0100);
 
-        // An unmodelled op (swap/rnd/…) leaves the register intact.
         vm.set(2, 13, true, 99, 0);
-        assert_eq!(vm.gprm[2], 0b0100, "an unmodelled set op is a no-op");
+        assert_eq!(vm.gprm[2], 0b0100, "an unknown set op is a no-op");
+        assert!(!vm.gprm_tainted[2]);
+    }
+
+    // swp g0,g1 moves g1 into g0 and the old g0 into g1 (libdvdnav eval_set_op case 2).
+    #[test]
+    fn swap_exchanges_both_registers() {
+        // g1 = 2; g2 = 2; swp g0,g1; if g0 == g2 JumpTT 2; JumpTT 1.
+        let vmgi = build_vmgi(
+            &[
+                h("7100000100020000"),
+                h("7100000200020000"),
+                h("6200000000010000"),
+                h("3022000000020002"),
+                h("3002000000010000"),
+            ],
+            1,
+            &[(2, 1), (3, 1)],
+        );
+        assert_eq!(resolve_from_vmg(&vmgi).map(|r| r.title), Some(2));
+    }
+
+    // rnd is non-deterministic: a branch on its result must abstain.
+    #[test]
+    fn branch_on_rnd_result_abstains() {
+        // g0 = rnd 3; if g0 == g1 JumpTT 2; JumpTT 3.
+        let vmgi = build_vmgi(
+            &[
+                h("7800000000030000"),
+                h("3022000000020001"),
+                h("3002000000030000"),
+            ],
+            1,
+            &[(2, 1), (3, 1), (4, 1)],
+        );
+        assert_eq!(resolve_from_vmg(&vmgi), None);
+    }
+
+    // SetSystem op 3 (SetGPRMMD) stores into a GPRM (libdvdnav eval_system_set case 3).
+    #[test]
+    fn setgprmmd_writes_the_gprm() {
+        // SetGPRMMD g0 = 2; g1 = 2; if g0 == g1 JumpTT 3; JumpTT 1.
+        let vmgi = build_vmgi(
+            &[
+                h("5300000200000000"),
+                h("7100000100020000"),
+                h("3022000000030001"),
+                h("3002000000010000"),
+            ],
+            1,
+            &[(2, 1), (3, 1), (4, 1)],
+        );
+        assert_eq!(resolve_from_vmg(&vmgi).map(|r| r.title), Some(3));
+    }
+
+    // A counter-mode GPRM counts elapsed time: a branch on it must abstain.
+    #[test]
+    fn counter_mode_gprm_taints_later_compares() {
+        // SetGPRMMD g0 = 0 (counter mode, byte5 bit 7); if g0 == g1 JumpTT 3; JumpTT 1.
+        let vmgi = build_vmgi(
+            &[
+                h("5300000000800000"),
+                h("3022000000030001"),
+                h("3002000000010000"),
+            ],
+            1,
+            &[(2, 1), (3, 1), (4, 1)],
+        );
+        assert_eq!(resolve_from_vmg(&vmgi), None);
+    }
+
+    // A set followed by a link sub-instruction (here LinkTailPGC) leaves the pre list:
+    // the next line never runs, so the resolver must abstain.
+    #[test]
+    fn set_with_link_subinstruction_abstains() {
+        for set in ["7101000000010002", "4001000000000002", "7104000000000005"] {
+            let vmgi = build_vmgi(&[h(set), h("3002000000020000")], 1, &[(2, 1), (3, 1)]);
+            assert_eq!(resolve_from_vmg(&vmgi), None, "{set}");
+        }
+        // LinkNoLink (sub-op 0) still ends the command list (libdvdnav
+        // eval_link_subins returns cond), so the next line never runs.
+        let vmgi = build_vmgi(
+            &[h("7101000000010000"), h("3002000000020000")],
+            1,
+            &[(2, 1), (3, 1)],
+        );
+        assert_eq!(resolve_from_vmg(&vmgi), None);
     }
 
     // A SetSystem (SPRM write, type 2) in the First-Play list is a no-op FOR
@@ -514,6 +629,7 @@ mod tests {
         );
     }
 
+    /// Unconditional-dispatch shape: First-Play is an unconditional `JumpTT 1`,
     /// and TT_SRPT maps title 1 to the feature title set (here VTS_02, title 1).
     /// The resolver must return that title.
     #[test]

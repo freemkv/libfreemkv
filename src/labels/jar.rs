@@ -10,17 +10,12 @@
 use super::class_reader::ClassFile;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use zip::ZipArchive;
 
 // Cap on bytes read from one `.class` entry — the jar's declared size is attacker-controlled,
 // so the buffer grows incrementally instead of pre-sizing.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
-
-// Cap on bytes read from one non-`.class` resource entry (the dcx.xml / playlists.xml /
-// *.properties manifests the Tier-1 sweep reads). Same attacker-controlled-size defence as
-// MAX_CLASS_BYTES.
-const MAX_RESOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
 /// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class`],
@@ -41,13 +36,7 @@ where
     F: FnMut(&str, &mut Jar) -> Option<R>,
 {
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
-    for entry in &jar_dir.entries {
-        if entry.is_dir {
-            continue;
-        }
-        if !entry.name.to_lowercase().ends_with(".jar") {
-            continue;
-        }
+    for entry in jar_dir.entries.iter().filter(|e| is_jar(e)) {
         let path = format!("/BDMV/JAR/{}", entry.name);
         let Ok(bytes) = udf.read_file(reader, &path) else {
             continue;
@@ -60,6 +49,266 @@ where
         }
     }
     None
+}
+
+fn is_jar(e: &crate::udf::DirEntry) -> bool {
+    !e.is_dir && e.name.to_lowercase().ends_with(".jar")
+}
+
+/// A seekable byte source for a jar: in memory, or read from disc on demand.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// A jar opened by [`visit_jars`].
+pub type DiscJar<'a> = ZipArchive<Box<dyn ReadSeek + 'a>>;
+
+// Jars up to this size are read whole; larger ones (image-heavy menus, past the
+// UDF whole-file cap) are opened in place, reading only the directory and entries used.
+const IN_MEMORY_JAR_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Like [`for_each_jar`] but also yields jars that could not be read or opened
+/// (as `None`), so a caller can tell a skipped jar from an absent one. Large jars
+/// are read in place rather than skipped.
+pub fn visit_jars<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, f: F) -> Option<R>
+where
+    F: FnMut(&str, Option<&mut DiscJar<'_>>) -> Option<R>,
+{
+    visit_jars_limited(reader, udf, IN_MEMORY_JAR_BYTES, f)
+}
+
+pub(crate) fn visit_jars_limited<R, F>(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    in_memory_max: u64,
+    mut f: F,
+) -> Option<R>
+where
+    F: FnMut(&str, Option<&mut DiscJar<'_>>) -> Option<R>,
+{
+    let jar_dir = udf.find_dir("/BDMV/JAR")?;
+    for entry in jar_dir.entries.iter().filter(|e| is_jar(e)) {
+        let path = format!("/BDMV/JAR/{}", entry.name);
+        let src: Option<Box<dyn ReadSeek + '_>> = if entry.size <= in_memory_max {
+            udf.read_file(reader, &path)
+                .ok()
+                .map(|b| Box::new(Cursor::new(b)) as Box<dyn ReadSeek>)
+        } else {
+            udf.extents_abs_at(reader, entry.meta_lba)
+                .ok()
+                .filter(|x| x.iter().all(|e| e.recorded || e.len == 0))
+                .map(|x| x.iter().map(|e| (e.lba, e.len as u64)).collect())
+                .map(|x| ExtentReader::new(&mut *reader, x, entry.size))
+                .and_then(|mut r| r.has_zip_tail().then(|| Box::new(r) as Box<dyn ReadSeek>))
+        };
+        let mut archive = src.and_then(|s| ZipArchive::new(s).ok());
+        if let Some(r) = f(&entry.name, archive.as_mut()) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+// Sectors fetched per on-demand read.
+const CHUNK_SECTORS: u64 = 32;
+
+// A zip's end-of-central-directory record: signature, within the last 64 KiB + 22 bytes.
+const EOCD_SIG: &[u8; 4] = b"PK\x05\x06";
+const EOCD_SEARCH: u64 = 65_535 + 22;
+// Cap on EOCD candidates checked (each may read the CD start): stray signatures
+// in a hostile tail cannot multiply reads.
+pub(crate) const MAX_EOCD_PROBES: usize = 4;
+// Central-directory file header signature.
+const CDFH_SIG: &[u8; 4] = b"PK\x01\x02";
+
+/// `Read + Seek` over a UDF file's absolute `(lba, byte length)` extents, fetching
+/// sectors on demand (one cached chunk, aligned to the read direction). Reads end at
+/// the file's byte `size`.
+pub struct ExtentReader<'a> {
+    reader: &'a mut dyn SectorSource,
+    extents: Vec<(u32, u64)>,
+    size: u64,
+    pos: u64,
+    buf: Vec<u8>,
+    buf_start: u64,
+}
+
+impl<'a> ExtentReader<'a> {
+    pub fn new(reader: &'a mut dyn SectorSource, extents: Vec<(u32, u64)>, size: u64) -> Self {
+        Self {
+            reader,
+            extents,
+            size,
+            pos: 0,
+            buf: Vec::new(),
+            buf_start: 0,
+        }
+    }
+
+    /// Whether the tail holds a consistent EOCD: comment within the file and a CDFH
+    /// signature at `cd_offset` or at `eocd - cd_size` (prepended data). Checked before
+    /// the zip reader's backward search (which rescans the whole file on a bad EOCD),
+    /// so a damaged jar costs a few bounded reads. Leaves the tail cached.
+    pub fn has_zip_tail(&mut self) -> bool {
+        self.find_eocd().is_some() && self.seek(SeekFrom::Start(0)).is_ok()
+    }
+
+    // Offset of the last EOCD in the tail that passes the consistency checks.
+    fn find_eocd(&mut self) -> Option<u64> {
+        let n = self.size.min(EOCD_SEARCH);
+        let tail_start = self.size - n;
+        let tail = self.cache_span(tail_start)?;
+        let le32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut probes = 0;
+        for at in (0..tail.len().saturating_sub(21)).rev() {
+            let rec = &tail[at..];
+            if &rec[..4] != EOCD_SIG {
+                continue;
+            }
+            probes += 1;
+            if probes > MAX_EOCD_PROBES {
+                return None;
+            }
+            let eocd = tail_start + at as u64;
+            let comment = u16::from_le_bytes([rec[20], rec[21]]) as u64;
+            let (cd_size, cd_offset) = (le32(rec, 12) as u64, le32(rec, 16) as u64);
+            if eocd + 22 + comment > self.size {
+                continue;
+            }
+            let at_offset = cd_offset + cd_size <= eocd;
+            if (at_offset && self.cdfh_at(cd_offset, &tail, tail_start))
+                || (cd_size <= eocd && self.cdfh_at(eocd - cd_size, &tail, tail_start))
+            {
+                self.cache_span(tail_start)?;
+                return Some(eocd);
+            }
+        }
+        None
+    }
+
+    // Whether a CDFH signature sits at `off` (from the cached tail when inside it).
+    fn cdfh_at(&mut self, off: u64, tail: &[u8], tail_start: u64) -> bool {
+        if off >= tail_start {
+            let i = (off - tail_start) as usize;
+            return tail.get(i..i + 4) == Some(CDFH_SIG.as_slice());
+        }
+        let mut sig = [0u8; 4];
+        self.seek(SeekFrom::Start(off)).is_ok()
+            && self.read_exact(&mut sig).is_ok()
+            && &sig == CDFH_SIG
+    }
+
+    // Cache the sectors covering [from, size) as one chunk and return those bytes.
+    fn cache_span(&mut self, from: u64) -> Option<Vec<u8>> {
+        let covered = self.buf_start <= from
+            && self.buf_start + self.buf.len() as u64 >= self.size
+            && !self.buf.is_empty();
+        if !covered {
+            self.fill_sectors(from, self.size).ok()?;
+        }
+        if self.buf_start <= from && self.buf_start + self.buf.len() as u64 >= self.size {
+            return self
+                .buf
+                .get((from - self.buf_start) as usize..)
+                .map(<[u8]>::to_vec);
+        }
+        // Tail straddles extents: read it through the chunked path.
+        let mut tail = vec![0u8; (self.size - from) as usize];
+        self.seek(SeekFrom::Start(from)).ok()?;
+        self.read_exact(&mut tail).ok()?;
+        Some(tail)
+    }
+
+    // Load the sectors covering [from, to) when they lie in one extent; otherwise a
+    // regular forward chunk at `from`.
+    fn fill_sectors(&mut self, from: u64, to: u64) -> std::io::Result<()> {
+        let mut base = 0u64;
+        for &(lba, len) in &self.extents {
+            if from < base + len {
+                if to > base + len {
+                    return self.fill(false);
+                }
+                let first = (from - base) / 2048;
+                let end = (to - base).div_ceil(2048);
+                return self.load(lba, base, len, first, end);
+            }
+            base += len;
+        }
+        Err(std::io::ErrorKind::UnexpectedEof.into())
+    }
+
+    // Load a chunk holding `self.pos`: ending at it when reading backwards, else
+    // starting at it. Only the extent's own bytes are exposed.
+    fn fill(&mut self, backward: bool) -> std::io::Result<()> {
+        let mut base = 0u64;
+        for &(lba, len) in &self.extents {
+            if self.pos < base + len {
+                let sec = (self.pos - base) / 2048;
+                let first = if backward {
+                    sec.saturating_sub(CHUNK_SECTORS - 1)
+                } else {
+                    sec
+                };
+                let end = (first + CHUNK_SECTORS).min(len.div_ceil(2048));
+                return self.load(lba, base, len, first, end);
+            }
+            base += len;
+        }
+        Err(std::io::ErrorKind::UnexpectedEof.into())
+    }
+
+    // Read sectors [first, end) of the extent at `lba` (file offset `base`, `len`
+    // bytes) into the cache, exposing only the extent's own bytes.
+    fn load(&mut self, lba: u32, base: u64, len: u64, first: u64, end: u64) -> std::io::Result<()> {
+        let count = u16::try_from(end - first).map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let start = u32::try_from(first)
+            .ok()
+            .and_then(|f| lba.checked_add(f))
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        let mut buf = vec![0u8; count as usize * 2048];
+        self.reader.read_sectors(start, count, &mut buf, true)?;
+        buf.truncate((len - first * 2048).min(buf.len() as u64) as usize);
+        self.buf = buf;
+        self.buf_start = base + first * 2048;
+        Ok(())
+    }
+}
+
+impl Read for ExtentReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.size || out.is_empty() {
+            return Ok(0);
+        }
+        let cached =
+            self.pos >= self.buf_start && self.pos < self.buf_start + self.buf.len() as u64;
+        if !cached {
+            // Fill backwards only for a seek just below the cached chunk (a backward
+            // scan); any other jump fills forward from the target.
+            let backward = !self.buf.is_empty()
+                && self.pos < self.buf_start
+                && self.buf_start - self.pos <= CHUNK_SECTORS * 2048;
+            self.fill(backward)?;
+        }
+        let off = (self.pos - self.buf_start) as usize;
+        let n = out
+            .len()
+            .min(self.buf.len() - off)
+            .min((self.size - self.pos) as usize);
+        out[..n].copy_from_slice(&self.buf[off..off + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for ExtentReader<'_> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.size.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos = pos.ok_or(std::io::ErrorKind::InvalidInput)?;
+        Ok(self.pos)
+    }
 }
 
 /// True if any entry in this jar's central directory starts with
@@ -93,64 +342,84 @@ where
 
 /// Like [`for_each_class`] but allows the callback to short-circuit
 /// iteration. Returns the first `Some(R)` the callback produces.
-pub fn try_each_class<R, F>(archive: &mut Jar, mut f: F) -> Option<R>
+pub fn try_each_class<R, F>(archive: &mut Jar, f: F) -> Option<R>
 where
     F: FnMut(&str, &ClassFile) -> Option<R>,
 {
-    for i in 0..archive.len() {
-        let Ok(entry) = archive.by_index(i) else {
-            continue;
-        };
-        if !entry.name().ends_with(".class") {
-            continue;
-        }
-        let name = entry.name().to_string();
-        // The declared uncompressed size is attacker-controlled, so the
-        // buffer grows incrementally and the read is capped at
-        // MAX_CLASS_BYTES rather than pre-sized from entry.size().
-        let mut bytes = Vec::new();
-        if entry.take(MAX_CLASS_BYTES).read_to_end(&mut bytes).is_err() {
-            continue;
-        }
-        let Ok(class) = ClassFile::parse(&bytes) else {
-            continue;
-        };
-        if let Some(r) = f(&name, &class) {
-            return Some(r);
-        }
-    }
-    None
+    let mut unbounded = u64::MAX;
+    try_each_class_budgeted(archive, &mut unbounded, f)
 }
 
-/// Iterate every NON-`.class` entry in the jar, read its bytes (bounded by
-/// [`MAX_RESOURCE_BYTES`]), and call `f` with `(entry_name, &bytes)`. Returns
-/// the first `Some(R)` the callback produces, or `None` when every resource was
-/// visited without a hit.
+/// [`try_each_class`] charging every inflated byte to `budget`; stops (None)
+/// once it is spent, so a caller sweeping many jars bounds total inflation.
+pub fn try_each_class_budgeted<Z: Read + Seek, R, F>(
+    archive: &mut ZipArchive<Z>,
+    budget: &mut u64,
+    mut f: F,
+) -> Option<R>
+where
+    F: FnMut(&str, &ClassFile) -> Option<R>,
+{
+    let is_class = |n: &str| n.ends_with(".class");
+    try_each_entry(archive, is_class, MAX_CLASS_BYTES, budget, |name, bytes| {
+        f(name, &ClassFile::parse(bytes).ok()?)
+    })
+}
+
+/// Iterate the NON-`.class`, non-directory entries whose name satisfies `want`
+/// (checked BEFORE anything is inflated), reading at most `cap` bytes of each
+/// and charging them to `budget`. Returns the first `Some(R)` from `f`.
 ///
 /// This is the Tier-1 menu-walk sweep: newer discs embed the same
 /// `dcx.xml`/`playlists.xml` manifests INSIDE a jar rather than as loose
-/// `/BDMV/JAR/<id>/` files. Directory entries and `.class` files are skipped;
-/// unreadable entries are silently ignored (robustness over completeness).
-pub fn try_each_resource<R, F>(archive: &mut Jar, mut f: F) -> Option<R>
+/// `/BDMV/JAR/<id>/` files. Unreadable entries are silently ignored.
+pub fn try_each_resource<Z: Read + Seek, R, F>(
+    archive: &mut ZipArchive<Z>,
+    want: impl Fn(&str) -> bool,
+    cap: u64,
+    budget: &mut u64,
+    f: F,
+) -> Option<R>
 where
     F: FnMut(&str, &[u8]) -> Option<R>,
 {
+    let is_resource =
+        |n: &str| !n.ends_with('/') && !n.to_ascii_lowercase().ends_with(".class") && want(n);
+    try_each_entry(archive, is_resource, cap, budget, f)
+}
+
+// Shared entry loop: filter by central-directory name, then inflate at most `cap`
+// bytes into a growing buffer (the declared size is untrusted). An entry the budget
+// cannot cover is not offered and stops the walk; one that exactly fits is complete.
+fn try_each_entry<Z: Read + Seek, R>(
+    archive: &mut ZipArchive<Z>,
+    want: impl Fn(&str) -> bool,
+    cap: u64,
+    budget: &mut u64,
+    mut f: impl FnMut(&str, &[u8]) -> Option<R>,
+) -> Option<R> {
     for i in 0..archive.len() {
+        if *budget == 0 {
+            return None;
+        }
+        match archive.name_for_index(i) {
+            Some(n) if want(n) => {}
+            _ => continue,
+        }
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
         let name = entry.name().to_string();
-        if name.ends_with('/') || name.to_ascii_lowercase().ends_with(".class") {
-            continue;
-        }
-        // Declared uncompressed size is attacker-controlled — grow the buffer
-        // incrementally and cap the read rather than pre-sizing from it.
         let mut bytes = Vec::new();
-        if entry
-            .take(MAX_RESOURCE_BYTES)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
+        let read = entry
+            .take(cap.min(budget.saturating_add(1)))
+            .read_to_end(&mut bytes);
+        if bytes.len() as u64 > *budget {
+            *budget = 0;
+            return None;
+        }
+        *budget -= bytes.len() as u64;
+        if read.is_err() {
             continue;
         }
         if let Some(r) = f(&name, &bytes) {
@@ -352,14 +621,78 @@ mod tests {
         };
 
         let mut seen: Vec<String> = Vec::new();
-        let found: Option<Vec<u8>> = try_each_resource(&mut jar, |name, bytes| {
-            seen.push(name.to_string());
-            name.ends_with("dcx.xml").then(|| bytes.to_vec())
-        });
+        let mut budget = u64::MAX;
+        let found: Option<Vec<u8>> = try_each_resource(
+            &mut jar,
+            |_| true,
+            1024,
+            &mut budget,
+            |name, bytes| {
+                seen.push(name.to_string());
+                name.ends_with("dcx.xml").then(|| bytes.to_vec())
+            },
+        );
         assert_eq!(found.as_deref(), Some(&xml[..]));
         assert!(
             !seen.iter().any(|n| n.ends_with(".class")),
             "a .class entry must never be offered as a resource"
         );
+    }
+
+    // An entry the name filter rejects is never inflated: it costs no budget.
+    #[test]
+    fn unwanted_resources_are_not_inflated() {
+        let payload = vec![0u8; 64 * 1024];
+        let mut jar = open(build_stored_zip(
+            "menu/bg.png",
+            &payload,
+            payload.len() as u32,
+        ));
+        let mut budget = 1_000_000u64;
+        let r: Option<()> = try_each_resource(
+            &mut jar,
+            |n| n.ends_with(".xml"),
+            1024,
+            &mut budget,
+            |_, _| Some(()),
+        );
+        assert!(r.is_none());
+        assert_eq!(budget, 1_000_000, "a filtered-out entry must not be read");
+    }
+
+    // Inflated bytes are charged to the shared budget; once it is spent the walk
+    // stops and the truncated entry is not offered.
+    #[test]
+    fn budget_bounds_total_inflation() {
+        let mut payload = MINIMAL_CLASS.to_vec();
+        payload.extend(std::iter::repeat_n(0u8, 4096));
+        let mut jar = open(build_stored_zip(
+            "Big.class",
+            &payload,
+            payload.len() as u32,
+        ));
+        let mut budget = 100u64;
+        let mut visited = 0usize;
+        let _: Option<()> = try_each_class_budgeted(&mut jar, &mut budget, |_, _| {
+            visited += 1;
+            None
+        });
+        assert_eq!((visited, budget), (0, 0));
+
+        // An entry that exactly fills the remaining budget is complete: offered.
+        let mut budget = payload.len() as u64;
+        let _: Option<()> = try_each_class_budgeted(&mut jar, &mut budget, |_, _| {
+            visited += 1;
+            None
+        });
+        assert_eq!((visited, budget), (1, 0));
+
+        let mut budget = 1_000_000u64;
+        let _: Option<()> = try_each_class_budgeted(&mut jar, &mut budget, |_, _| {
+            visited += 1;
+            None
+        });
+        assert_eq!(visited, 2);
+        assert_eq!(budget, 1_000_000 - payload.len() as u64);
     }
 }

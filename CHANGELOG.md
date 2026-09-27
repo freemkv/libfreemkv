@@ -11,7 +11,12 @@
 
 ### Added
 
+- `AudioChannels` gains 3.0, 3.1, 4.1, 6.0 and 7.0.
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
+
+### Fixed
+
+- TrueHD channel labels keep the LFE split (3.0 was labelled "2.1", 7.0 "6.1"), and a 6-channel presentation counts its Lvh/Rvh pair as 2. An older network:// receiver parses the new layout strings as unknown and omits the MKV Channels element for those tracks; keep both ends on the same version.
 
 ## [1.7.7] — 2026-09-26
 

@@ -492,7 +492,7 @@ impl CodecParser for TrueHdParser {
 /// channel-assignment masks (per the MLP/TrueHD bitstream spec). Some
 /// bits denote a stereo pair (2), others a single channel (1).
 const THD_8CH: [u8; 13] = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
-const THD_6CH: [u8; 5] = [2, 1, 1, 2, 1];
+const THD_6CH: [u8; 5] = [2, 1, 1, 2, 2];
 
 /// Decode the true channel count from a TrueHD major-sync `format_info` word
 /// (the 32 bits immediately after the 0xF8726FBA sync). Returns the richest
@@ -515,6 +515,18 @@ pub fn truehd_channels(format_info: u32) -> Option<u8> {
         Some(count(ch6, &THD_6CH))
     } else {
         None
+    }
+}
+
+/// LFE channels (bit 2 LFE, 8ch bit 12 LFE2) within the presentation
+/// `truehd_channels` counts, so the caller can split `N.M`.
+pub fn truehd_lfe(format_info: u32) -> u8 {
+    let ch8 = format_info & 0x1FFF;
+    let ch6 = (format_info >> 15) & 0x1F;
+    if ch8 != 0 {
+        u8::from(ch8 & (1 << 2) != 0) + u8::from(ch8 & (1 << 12) != 0)
+    } else {
+        u8::from(ch6 & (1 << 2) != 0)
     }
 }
 
@@ -1421,11 +1433,11 @@ mod tests {
     #[test]
     fn truehd_channels_6ch_used_only_when_8ch_zero() {
         // The 8ch presentation takes priority; the 6ch field (bits 15-19) is read
-        // ONLY when ch8 == 0. THD_6CH = [2,1,1,2,1]. Set 6ch bit 0 (→2) while
+        // ONLY when ch8 == 0. THD_6CH = [2,1,1,2,2]. Set 6ch bit 0 (→2) while
         // 8ch is zero: 6ch field value 1 at shift 15.
         assert_eq!(truehd_channels(1 << 15), Some(2));
-        // All 5 6ch bits = 2+1+1+2+1 = 7. 0x1F << 15.
-        assert_eq!(truehd_channels(0x1F << 15), Some(7));
+        // All 5 6ch bits = 2+1+1+2+2 = 8 (bit 4 is the Lvh/Rvh pair). 0x1F << 15.
+        assert_eq!(truehd_channels(0x1F << 15), Some(8));
     }
 
     #[test]
@@ -1435,6 +1447,16 @@ mod tests {
         // 8ch count, proving the `if ch8 != 0` branch wins.
         let fi = (1u32 << 0) | (0x1F << 15);
         assert_eq!(truehd_channels(fi), Some(2));
+    }
+
+    #[test]
+    fn truehd_lfe_reads_the_chosen_presentation() {
+        assert_eq!(truehd_lfe(0x0F), 1, "8ch LFE bit");
+        assert_eq!(truehd_lfe(0x100F), 2, "8ch LFE + LFE2");
+        assert_eq!(truehd_lfe(0x4B), 0, "7.0 has no LFE");
+        assert_eq!(truehd_lfe(0xF << 15), 1, "6ch LFE bit when 8ch is empty");
+        assert_eq!(truehd_lfe(0x03 | (0xF << 15)), 0, "8ch wins over 6ch");
+        assert_eq!(truehd_lfe(0), 0);
     }
 
     #[test]

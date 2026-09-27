@@ -903,8 +903,18 @@ mod tests {
         buf.extend_from_slice(&u64::MAX.to_le_bytes()); // duration None sentinel
         buf.extend_from_slice(&declared.to_le_bytes()); // len
         buf.extend_from_slice(&[0xAB; 10]); // far fewer than declared
-        let mut cursor = std::io::Cursor::new(buf);
-        let err = PesFrame::deserialize(&mut cursor).expect_err("truncated body must error");
+        // Record the largest buffer the reader is handed: a pre-sized body read
+        // would ask for the whole declared length in one go.
+        struct MaxAsk(std::io::Cursor<Vec<u8>>, usize);
+        impl std::io::Read for MaxAsk {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.1 = self.1.max(b.len());
+                self.0.read(b)
+            }
+        }
+        let mut src = MaxAsk(std::io::Cursor::new(buf), 0);
+        let err = PesFrame::deserialize(&mut src).expect_err("truncated body must error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(src.1 <= 1024 * 1024, "asked for {} bytes at once", src.1);
     }
 }

@@ -24,7 +24,7 @@ pub(crate) struct BdjoApp {
     pub control_code: u8,
     /// `base_directory` — the primary jar id (e.g. "00000"), naming
     /// `/BDMV/JAR/<base_directory>.jar`.
-    pub base_dir: String,
+    pub base_directory: String,
     /// `classpath_extension` — additional `;`-separated jar ids on the
     /// classpath, or empty.
     pub classpath_extension: String,
@@ -44,7 +44,7 @@ impl BdjoApp {
     /// dropped. These name `/BDMV/JAR/<id>.jar`.
     pub fn jar_ids(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let base = self.base_dir.trim();
+        let base = self.base_directory.trim();
         if !base.is_empty() {
             out.push(base.to_string());
         }
@@ -148,7 +148,7 @@ fn parse_app(r: &mut BitReader<'_>) -> Option<BdjoApp> {
     read_app_string(r)?;
     r.skip(16)?;
 
-    let base_dir = read_app_string(r)?;
+    let base_directory = read_app_string(r)?;
     let classpath_extension = read_app_string(r)?;
     let initial_class = read_app_string(r)?;
 
@@ -161,7 +161,7 @@ fn parse_app(r: &mut BitReader<'_>) -> Option<BdjoApp> {
 
     Some(BdjoApp {
         control_code,
-        base_dir,
+        base_directory,
         classpath_extension,
         initial_class,
     })
@@ -268,6 +268,18 @@ mod tests {
         initial_class: &'static str,
     }
 
+    // Optional content the minimal fixture leaves empty, laid out per the BDJO
+    // format (libbluray bdjo_parse.c): cache items, accessible playlists, and
+    // per-app profiles / application_name bytes / parameter bytes.
+    #[derive(Default)]
+    struct Extras {
+        cache_items: usize,
+        playlists: usize,
+        profiles: usize,
+        name_bytes: usize,
+        param_bytes: usize,
+    }
+
     fn push_app_string(buf: &mut Vec<u8>, s: &str) {
         buf.push(s.len() as u8);
         buf.extend_from_slice(s.as_bytes());
@@ -277,6 +289,10 @@ mod tests {
     }
 
     fn build_bdjo(apps: &[AppSpec]) -> Vec<u8> {
+        build_bdjo_with(apps, &Extras::default())
+    }
+
+    fn build_bdjo_with(apps: &[AppSpec], x: &Extras) -> Vec<u8> {
         let mut b = Vec::new();
         // Header
         b.extend_from_slice(b"BDJO");
@@ -289,14 +305,24 @@ mod tests {
         // 4+1+1 = 6 bits then 34 bits padding = 40 bits = 5 bytes total.
         b.extend_from_slice(&[0u8; 5]);
 
-        // AppCacheInfo: length(4) + num_item(1)=0 + pad(1)
+        // AppCacheInfo: length(4) + num_item(1) + pad(1), then 12-byte items:
+        // type(1) + ref_to_name(5) + lang_code(3) + pad(3).
         b.extend_from_slice(&[0u8; 4]);
+        b.push(x.cache_items as u8);
         b.push(0);
-        b.push(0);
+        for _ in 0..x.cache_items {
+            b.push(1);
+            b.extend_from_slice(b"00007eng");
+            b.extend_from_slice(&[0u8; 3]);
+        }
 
-        // AccessiblePlaylists: length(4) + [num_pl(11)+flags(2)+pad(19)] = 4 bytes, num_pl=0
+        // AccessiblePlaylists: length(4) + [num_pl(11)+flags(2)+pad(19)], then
+        // 6-byte entries: name(5) + pad(1).
         b.extend_from_slice(&[0u8; 4]);
-        b.extend_from_slice(&[0u8; 4]);
+        b.extend_from_slice(&(((x.playlists as u32) << 21) | (1 << 20)).to_be_bytes());
+        for _ in 0..x.playlists {
+            b.extend_from_slice(b"00800\0");
+        }
 
         // AppManagementTable: length(4) + num_app(1) + pad(1)
         b.extend_from_slice(&[0u8; 4]);
@@ -309,23 +335,72 @@ mod tests {
             b.extend_from_slice(&[0u8; 4]); // org_id(32)
             b.extend_from_slice(&[0u8; 2]); // app_id(16)
             b.extend_from_slice(&[0u8; 10]); // descriptor tag+length(80)
-            b.push(0); // num_profile(4)+pad(4)... wait 4+12=16 bits
-            b.push(0); // (num_profile nibble high, then 12 bits pad) => 2 bytes, 0 profiles
+            // num_profile(4) + pad(12), then 6-byte profiles:
+            // profile(2) + major(1) + minor(1) + micro(1) + pad(1).
+            b.push((x.profiles as u8) << 4);
+            b.push(0);
+            for _ in 0..x.profiles {
+                b.extend_from_slice(&[0, 1, 1, 0, 0, 0]);
+            }
             b.push(0); // priority(8)
             b.push(0); // binding(2)+visibility(2)+reserved(4)
-            // application_name: data_length(16)=0, no word-align (even 0)
-            b.extend_from_slice(&[0u8; 2]);
+            // application_name: data_length(16) + bytes, word-aligned (pad when odd).
+            b.extend_from_slice(&(x.name_bytes as u16).to_be_bytes());
+            b.extend(std::iter::repeat_n(b'n', x.name_bytes));
+            if !x.name_bytes.is_multiple_of(2) {
+                b.push(0);
+            }
             // icon_locator (empty word-aligned string): len=0 + pad
             push_app_string(&mut b, "");
             b.extend_from_slice(&[0u8; 2]); // icon_flags(16)
             push_app_string(&mut b, a.base_dir);
             push_app_string(&mut b, a.classpath_extension);
             push_app_string(&mut b, a.initial_class);
-            // application_parameters: data_length(8)=0 + word-align (even) pad
-            b.push(0);
-            b.push(0);
+            // application_parameters: data_length(8) + bytes, word-aligned (pad when even).
+            b.push(x.param_bytes as u8);
+            b.extend(std::iter::repeat_n(b'p', x.param_bytes));
+            if x.param_bytes.is_multiple_of(2) {
+                b.push(0);
+            }
         }
         b
+    }
+
+    // Every skipped-by-width region populated (odd and even name/param lengths):
+    // a wrong item/profile/padding width misaligns the strings that follow.
+    #[test]
+    fn parses_apps_with_cache_items_playlists_profiles_names_and_params() {
+        for (name_bytes, param_bytes) in [(5, 3), (6, 4)] {
+            let x = Extras {
+                cache_items: 2,
+                playlists: 3,
+                profiles: 2,
+                name_bytes,
+                param_bytes,
+            };
+            let bytes = build_bdjo_with(
+                &[
+                    AppSpec {
+                        control_code: 2,
+                        base_dir: "00009",
+                        classpath_extension: "",
+                        initial_class: "com.studio.Helper",
+                    },
+                    AppSpec {
+                        control_code: 1,
+                        base_dir: "00000",
+                        classpath_extension: "00001",
+                        initial_class: "com.studio.MainXlet",
+                    },
+                ],
+                &x,
+            );
+            let apps = parse(&bytes).expect("parses");
+            assert_eq!(apps.len(), 2);
+            assert_eq!(apps[0].initial_class, "com.studio.Helper");
+            assert_eq!(apps[1].jar_ids(), vec!["00000", "00001"]);
+            assert_eq!(apps[1].initial_class, "com.studio.MainXlet");
+        }
     }
 
     #[test]
@@ -341,7 +416,7 @@ mod tests {
         let a = &apps[0];
         assert!(a.is_autostart());
         assert_eq!(a.initial_class, "com.foxbd.StandardMenuXlet");
-        assert_eq!(a.base_dir, "00000");
+        assert_eq!(a.base_directory, "00000");
         assert_eq!(a.jar_ids(), vec!["00000", "00001", "00002"]);
     }
 
@@ -389,9 +464,9 @@ mod tests {
             classpath_extension: "",
             initial_class: "com.studio.MainXlet",
         }]);
-        // Every truncation length must return None (or Some), never panic.
+        // Every truncation length must return None, never panic or a partial Some.
         for cut in 0..bytes.len() {
-            let _ = parse(&bytes[..cut]);
+            assert_eq!(parse(&bytes[..cut]), None, "cut={cut}");
         }
     }
 
@@ -422,7 +497,7 @@ mod tests {
     fn jar_ids_dedups_and_skips_empties() {
         let a = BdjoApp {
             control_code: 1,
-            base_dir: "00000".into(),
+            base_directory: "00000".into(),
             classpath_extension: "00000;;00003; ".into(),
             initial_class: "X".into(),
         };

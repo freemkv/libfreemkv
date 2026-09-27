@@ -137,51 +137,51 @@ fn detect_studio(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<String> {
     None
 }
 
-// Extracts studio="..." from config.xml via tolerant substring scan, not a
-// full XML parse: the file is tiny attacker-controlled metadata and this is
-// the only field of interest. Rejects empty or implausibly long values.
+// studio="..." from config.xml via a tolerant tag scan: a WHOLE attribute name in a
+// tag, outside any closed quoted value. A bad candidate (unterminated, empty, too
+// long) is skipped so a later well-formed `studio="..."` is still found.
 fn parse_studio_attr(xml: &[u8]) -> Option<String> {
-    const MAX_STUDIO_LEN: usize = 32;
     let text = std::str::from_utf8(xml).ok()?;
     let bytes = text.as_bytes();
-    // Anchor `studio` as a WHOLE attribute name, not a bare substring: the old
-    // `find("studio")` also fired on `substudio=`, `studioId=`, or "studio" inside
-    // another attribute's value. Require a word boundary before it and an `=` (after optional whitespace) immediately after.
-    let mut from = 0;
-    while let Some(rel) = text[from..].find("studio") {
-        let start = from + rel;
-        let end = start + "studio".len();
-        from = start + 1;
-        let boundary =
-            start == 0 || matches!(bytes[start - 1], b' ' | b'\t' | b'\r' | b'\n' | b'<' | b'/');
-        if !boundary {
-            continue;
+    let mut in_tag = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => in_tag = true,
+            b'>' => in_tag = false,
+            // A closed quoted value is opaque; an unterminated quote is ignored.
+            q @ (b'"' | b'\'') if in_tag => {
+                if let Some(close) = bytes[i + 1..].iter().position(|&b| b == q) {
+                    i += close + 2;
+                    continue;
+                }
+            }
+            b's' if in_tag && bytes[i..].starts_with(b"studio") => {
+                let boundary =
+                    i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n' | b'/');
+                if boundary && let Some(val) = studio_value(&text[i + "studio".len()..]) {
+                    return Some(val);
+                }
+            }
+            _ => {}
         }
-        let after_eq = text[end..].trim_start();
-        let Some(after_eq) = after_eq.strip_prefix('=') else {
-            continue;
-        };
-        let after_eq = after_eq.trim_start();
-        let Some(quote) = after_eq.as_bytes().first().copied() else {
-            continue;
-        };
-        if quote != b'"' && quote != b'\'' {
-            continue;
-        }
-        let rest = &after_eq[1..];
-        // An unterminated quote on THIS candidate must not abort the whole scan
-        // (the old `?` did): skip the bad item and keep looking so a later,
-        // well-formed `studio="..."` is still found.
-        let Some(close) = rest.find(quote as char) else {
-            continue;
-        };
-        let val = rest[..close].trim();
-        if val.is_empty() || val.len() > MAX_STUDIO_LEN {
-            return None;
-        }
-        return Some(val.to_ascii_lowercase());
+        i += 1;
     }
     None
+}
+
+// The value of a `studio` attribute given the text after its name: `= "value"`
+// (either quote), trimmed, 1..=32 bytes, lower-cased. None when malformed.
+fn studio_value(after_name: &str) -> Option<String> {
+    const MAX_STUDIO_LEN: usize = 32;
+    let rest = after_name.trim_start().strip_prefix('=')?.trim_start();
+    let quote = *rest.as_bytes().first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let rest = &rest[1..];
+    let val = rest[..rest.find(quote as char)?].trim();
+    (!val.is_empty() && val.len() <= MAX_STUDIO_LEN).then(|| val.to_ascii_lowercase())
 }
 
 /// One identified master enum class.
@@ -3001,6 +3001,27 @@ mod tests {
         // A `studio`-containing value with no real attribute anywhere → None,
         // not the value's own quotes.
         assert_eq!(parse_studio_attr(b"<C title=\"studio ghibli\">"), None);
+    }
+
+    // "studio=" inside another attribute's quoted value is not the attribute, and
+    // an empty or over-long studio value is skipped rather than ending the scan.
+    #[test]
+    fn studio_inside_a_quoted_value_and_bad_values_are_skipped() {
+        assert_eq!(
+            parse_studio_attr(b"<C title='see studio=\"evil\"' studio=\"fox\">").as_deref(),
+            Some("fox")
+        );
+        assert_eq!(
+            parse_studio_attr(
+                b"<A studio=\"thisvalueiswaymorethanthirtytwocharacterslong\"> <B studio=\"fox\">"
+            )
+            .as_deref(),
+            Some("fox")
+        );
+        assert_eq!(
+            parse_studio_attr(b"<A studio=\"\"> <B studio=\"uni\">").as_deref(),
+            Some("uni")
+        );
     }
 
     /// A malformed `studio=` candidate whose quote is never closed must be

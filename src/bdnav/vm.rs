@@ -62,9 +62,29 @@ struct Vm<'a> {
     index: &'a Index,
     gpr: [u32; 4096],
     psr: [u32; 128],
+    // Per-GPR: value derived from RND, so any branch on it is undecidable.
+    gpr_random: Box<[bool; 4096]>,
 }
 
-impl Vm<'_> {
+impl<'a> Vm<'a> {
+    fn new(mobjs: &'a [MovieObject], index: &'a Index) -> Self {
+        Self {
+            mobjs,
+            index,
+            gpr: [0; 4096],
+            psr: psr_init(),
+            gpr_random: Box::new([false; 4096]),
+        }
+    }
+    // Whether a non-immediate operand reads an RND-derived GPR.
+    fn random(&self, imm: bool, raw: u32) -> bool {
+        !imm && raw & PSR_FLAG == 0 && self.gpr_random[(raw & 0xfff) as usize]
+    }
+    fn set_random(&mut self, raw: u32, r: bool) {
+        if raw & PSR_FLAG == 0 {
+            self.gpr_random[(raw & 0xfff) as usize] = r;
+        }
+    }
     fn rd(&self, val: u32) -> u32 {
         if val & PSR_FLAG != 0 {
             self.psr[(val & 0x7f) as usize]
@@ -115,12 +135,7 @@ pub(crate) fn resolve(
         PlaybackObj::Hdmv { id_ref } if (id_ref as usize) < mobjs.len() => id_ref as usize,
         _ => return None,
     };
-    let mut vm = Vm {
-        mobjs,
-        index,
-        gpr: [0; 4096],
-        psr: psr_init(),
-    };
+    let mut vm = Vm::new(mobjs, index);
     run(&mut vm, start, is_feature)
 }
 
@@ -147,6 +162,12 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
         } else {
             0
         };
+        let dst_rnd = c.op_cnt > 0 && vm.random(c.imm_op1, c.dst);
+        let src_rnd = c.op_cnt > 1 && vm.random(c.imm_op2, c.src);
+        // A branch, play or compare on an RND-derived value is undecidable.
+        if (c.grp == 0 && dst_rnd) || (c.grp == 1 && (dst_rnd || src_rnd)) {
+            return None;
+        }
         match c.grp {
             // BRANCH
             0 => match c.sub_grp {
@@ -227,31 +248,36 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
                         // PSR stores.
                         if !c.imm_op1 {
                             vm.wr(c.dst, src);
+                            vm.set_random(c.dst, src_rnd);
                         }
                         if !c.imm_op2 {
                             vm.wr(c.src, dst);
+                            vm.set_random(c.src, dst_rnd);
                         }
                         None
                     }
-                    0x03 => Some(dst.wrapping_add(src)),
+                    0x03 => Some(dst.saturating_add(src)), // libbluray ADD_u32 saturates
                     0x04 => Some(dst.saturating_sub(src)),
-                    0x05 => Some(dst.wrapping_mul(src)),
+                    0x05 => Some(dst.saturating_mul(src)), // libbluray MUL_u32 saturates
                     0x06 => Some(dst.checked_div(src).unwrap_or(0xffff_ffff)),
                     0x07 => Some(dst.checked_rem(src).unwrap_or(0xffff_ffff)),
-                    0x08 => Some(dst), // RND — deterministic stand-in
+                    0x08 => Some(dst), // RND: value unknown, tainted below
                     0x09 => Some(dst & src),
                     0x0a => Some(dst | src),
                     0x0b => Some(dst ^ src),
-                    0x0c => Some(dst | (1u32 << (src & 31))),
-                    0x0d => Some(dst & !(1u32 << (src & 31))),
-                    0x0e => Some(dst.wrapping_shl(src & 31)),
-                    0x0f => Some(dst.wrapping_shr(src & 31)),
+                    // libbluray: bit numbers / shift counts >= 32 are not masked.
+                    0x0c => Some(1u32.checked_shl(src).map_or(dst, |b| dst | b)),
+                    0x0d => Some(1u32.checked_shl(src).map_or(dst, |b| dst & !b)),
+                    0x0e => Some(dst.checked_shl(src).unwrap_or(0)),
+                    0x0f => Some(dst.checked_shr(src).unwrap_or(0)),
                     _ => None,
                 };
                 if let Some(r) = r
                     && !c.imm_op1
                 {
                     vm.wr(c.dst, r);
+                    let rnd = c.set_opt == 0x08 || src_rnd || (c.set_opt != 0x01 && dst_rnd);
+                    vm.set_random(c.dst, rnd);
                 }
             }
             _ => {}
@@ -380,12 +406,7 @@ mod tests {
             PlaybackObj::Hdmv { id_ref: 7 },
             vec![PlaybackObj::Hdmv { id_ref: 1 }],
         );
-        let vm = Vm {
-            mobjs: &[],
-            index: &index,
-            gpr: [0; 4096],
-            psr: psr_init(),
-        };
+        let vm = Vm::new(&[], &index);
         assert_eq!(vm.title_obj(0), Some(index.top_menu), "title 0 = Top Menu");
         assert_eq!(
             vm.title_obj(1),
@@ -446,6 +467,27 @@ mod tests {
         assert_eq!(resolve(&index, &mobjs, &|id| id == 42), Some(42));
     }
 
+    // ADD/MUL saturate at 0xFFFFFFFF (libbluray hdmv_vm.c ADD_u32/MUL_u32,
+    // reverse-engineered player behaviour), like SUB and DIV/MOD by 0 already do.
+    #[test]
+    fn add_and_mul_saturate() {
+        let set = |opt: u8, reg: u32, imm: u32| cmd((2 << 5) | (2 << 3), 0x40, 0, opt, reg, imm);
+        let cmp_eq_0 = |reg: u32| cmd((2 << 5) | (1 << 3), 0x40, 0x02, 0, reg, 0);
+        for ops in [
+            [set(0x01, 0, 0xffff_ffff), set(0x03, 0, 1)],
+            [set(0x01, 0, 0x1_0000), set(0x05, 0, 0x1_0000)],
+        ] {
+            // A wrap to 0 makes the compare true and plays 1; saturation plays 800.
+            let d = build(&[&[ops[0], ops[1], cmp_eq_0(0), play_pl(1), play_pl(800)]]);
+            let mobjs = mobj::parse(&d).unwrap();
+            let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+            assert_eq!(
+                resolve(&index, &mobjs, &|id| id == 1 || id == 800),
+                Some(800)
+            );
+        }
+    }
+
     #[test]
     fn swap_exchanges_two_registers() {
         // MOVE g0=11; MOVE g1=22; SWAP g0<->g1; PlayPL GPR[0]. SWAP: grp=SET(2),
@@ -459,12 +501,7 @@ mod tests {
         ]]);
         let mobjs = mobj::parse(&d).unwrap();
         let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
-        let mut vm = Vm {
-            mobjs: &mobjs,
-            index: &index,
-            gpr: [0; 4096],
-            psr: psr_init(),
-        };
+        let mut vm = Vm::new(&mobjs, &index);
         // After the swap GPR0 holds the old GPR1 (22) and PlayPL plays it.
         assert_eq!(run(&mut vm, 0, &|id| id == 22), Some(22));
         // Full exchange: GPR1 now holds the old GPR0 (11).
@@ -492,12 +529,7 @@ mod tests {
         let d = build(&[&[set_move_gpr(5, 77), swap_imm]]);
         let mobjs = mobj::parse(&d).unwrap();
         let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
-        let mut vm = Vm {
-            mobjs: &mobjs,
-            index: &index,
-            gpr: [0; 4096],
-            psr: psr_init(),
-        };
+        let mut vm = Vm::new(&mobjs, &index);
         // No PlayPL → program runs off the end (None); inspect registers after.
         assert_eq!(run(&mut vm, 0, &|_| false), None);
         assert_eq!(
@@ -505,5 +537,43 @@ mod tests {
             "immediate operand must not be a write target"
         );
         assert_eq!(vm.gpr[0], 5, "register operand receives the immediate");
+    }
+
+    // libbluray hdmv_vm.c: BITSET/BITCLR with a bit number >= 32 are no-ops and
+    // SHL/SHR by >= 32 give 0 (no `& 31` masking).
+    #[test]
+    fn bit_ops_and_shifts_past_31_follow_libbluray() {
+        let set = |opt: u8, reg: u32, imm: u32| cmd((2 << 5) | (2 << 3), 0x40, 0, opt, reg, imm);
+        let d = build(&[&[
+            set(0x0c, 0, 32),
+            set(0x01, 1, 1),
+            set(0x0e, 1, 32),
+            set(0x01, 2, 0x8000_0000),
+            set(0x0f, 2, 40),
+            set(0x01, 3, 0xffff_ffff),
+            set(0x0d, 3, 33),
+        ]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        let mut vm = Vm::new(&mobjs, &index);
+        assert_eq!(run(&mut vm, 0, &|_| false), None);
+        assert_eq!(vm.gpr[..4], [0, 0, 0, 0xffff_ffff]);
+    }
+
+    // RND is non-deterministic: a compare on its result abstains.
+    #[test]
+    fn compare_on_rnd_result_abstains() {
+        let set = |opt: u8, reg: u32, imm: u32| cmd((2 << 5) | (2 << 3), 0x40, 0, opt, reg, imm);
+        let cmp_eq = cmd((2 << 5) | (1 << 3), 0x40, 0x02, 0, 0, 5);
+        let d = build(&[&[
+            set(0x01, 0, 5),
+            set(0x08, 0, 10),
+            cmp_eq,
+            play_pl(1),
+            play_pl(800),
+        ]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(resolve(&index, &mobjs, &|id| id == 1 || id == 800), None);
     }
 }

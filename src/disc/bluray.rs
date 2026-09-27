@@ -310,6 +310,8 @@ impl Disc {
                             }))
                         }
                     }
+                    // PiP PG belongs to the secondary-video overlay, not the feature.
+                    3 if s.secondary => None,
                     3 => Some(Stream::Subtitle(SubtitleStream {
                         pid: s.pid,
                         codec,
@@ -1592,6 +1594,36 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].codec, Codec::Pgs);
         assert_eq!(subs[0].language, "fra");
+    }
+
+    /// A PiP (secondary) PG entry is picture-in-picture commentary graphics, not a
+    /// main-feature subtitle track: it is kept out of the subtitle list.
+    #[test]
+    fn parse_playlist_skips_pip_pg_subtitles() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 1, 0, 0, 0, 1, 0), // one PG, one PiP PG
+            &[se_pg(0x1200, 0x90, b"fra"), se_pg(0x1a20, 0x90, b"eng")],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        let subs: Vec<u16> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Subtitle(sub) => Some(sub.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subs, vec![0x1200]);
     }
 
     // ---------------------------------------------------------------
