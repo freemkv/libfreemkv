@@ -2,7 +2,7 @@
 //!
 //! Both origins carry a per-PES audio header this parser consumes: 4 bytes on BD-TS,
 //! 3 on DVD-PS (`PsDemuxer` strips only the sub_id/frames/pointer bytes). Output is
-//! always interleaved 24-bit big-endian PCM ([`OUTPUT_BIT_DEPTH`]) in
+//! always interleaved 24-bit big-endian PCM ([`OUTPUT_BIT_DEPTH`](crate::mux::codec::lpcm::OUTPUT_BIT_DEPTH)) in
 //! WAVE_FORMAT_EXTENSIBLE channel order, so "A_PCM/INT/BIG" gets a fixed BitDepth that
 //! survives every hop. Layouts follow ffmpeg pcm-bluray.c (pad channel, LFE/surround
 //! remap) and pcm-dvd.c (20/24-bit sample groups and blocks).
