@@ -137,10 +137,9 @@ where
     try_each_entry(archive, is_resource, cap, budget, f)
 }
 
-// Shared entry loop: filter by name from the central directory, then inflate at
-// most min(cap, budget) bytes. The declared uncompressed size is attacker-controlled,
-// so the buffer grows incrementally rather than being pre-sized from it. Once the
-// budget is spent the walk stops without offering the (possibly truncated) entry.
+// Shared entry loop: filter by central-directory name, then inflate at most
+// min(cap, budget) bytes into a growing buffer (the declared size is untrusted).
+// A spent budget stops the walk without offering the possibly truncated entry.
 fn try_each_entry<R>(
     archive: &mut Jar,
     want: impl Fn(&str) -> bool,

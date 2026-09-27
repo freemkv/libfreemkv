@@ -478,9 +478,8 @@ mod tests {
 
     // ── Executor: convergence to a title ────────────────────────────────────
 
-    // Vm::set arithmetic/logic ops per libdvdnav eval_set_op (reverse-engineered
-    // player behaviour): add/mul saturate at 0xFFFF, sub clamps at 0, and a divide or
-    // modulo by zero yields 0xFFFF. Never panics; an unknown op is a no-op.
+    // Vm::set per libdvdnav eval_set_op (reverse-engineered): add/mul saturate,
+    // sub clamps at 0, div/mod by 0 yields 0xFFFF, an unknown op is a no-op.
     #[test]
     fn set_ops_saturate_and_divide_by_zero_yields_ffff() {
         let mut vm = Vm::new();

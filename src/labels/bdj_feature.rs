@@ -144,10 +144,9 @@ fn hint_from_manifest(name: &str, text: &str) -> Option<FeaturePlaylistHint> {
     }
 }
 
-// Scan a `key=value` properties/version manifest for a feature-playlist id. The
-// key must be made only of feature/playlist-identity words and name the feature
-// (`feature.playlist.id`, `featurePlaylistId`, `main_feature_pl`); the value
-// must be a bare playlist number (optionally quoted or `.mpls`-suffixed).
+// Feature-playlist id from a `key=value` manifest: the key is only feature/playlist
+// identity words and names the feature (`featurePlaylistId`); the value is a bare
+// playlist number (optionally quoted or `.mpls`-suffixed).
 fn props_hint(text: &str) -> Option<FeaturePlaylistHint> {
     text.lines().find_map(|line| {
         let line = line.trim();

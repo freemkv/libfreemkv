@@ -137,11 +137,9 @@ fn detect_studio(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<String> {
     None
 }
 
-// Extracts studio="..." from config.xml via a tolerant tag scan, not a full XML
-// parse: the file is tiny attacker-controlled metadata and this is the only field
-// of interest. `studio` must be a WHOLE attribute name inside a tag and outside any
-// closed quoted value. A bad candidate (unterminated, empty, implausibly long) is
-// skipped so a later well-formed `studio="..."` is still found.
+// studio="..." from config.xml via a tolerant tag scan: a WHOLE attribute name in a
+// tag, outside any closed quoted value. A bad candidate (unterminated, empty, too
+// long) is skipped so a later well-formed `studio="..."` is still found.
 fn parse_studio_attr(xml: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(xml).ok()?;
     let bytes = text.as_bytes();
