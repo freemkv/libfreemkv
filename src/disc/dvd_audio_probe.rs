@@ -80,8 +80,8 @@ fn max_substream_channels(data: &[u8]) -> Option<u8> {
 /// stream (in IFO order), picks the physical `0x8x` sub-stream whose probed channel count
 /// equals the declared count, never reusing a claimed sub-stream, and writes its PID (`0xBD00 |
 /// sub_id`) back onto the `Stream::Audio`. Conservative: only reassigns when a better match
-/// exists or keeping the ordinal sub would share a PID. Returns the number of streams whose
-/// PID was changed.
+/// exists or keeping the ordinal sub would share a PID. Sharing is left (and logged) only when
+/// there are more AC-3 streams than sub-streams. Returns the number of changed PIDs.
 pub fn remap_audio_pids(streams: &mut [Stream], probed: &BTreeMap<u8, u8>) -> usize {
     if probed.is_empty() {
         return 0;
@@ -128,7 +128,7 @@ pub fn remap_audio_pids(streams: &mut [Stream], probed: &BTreeMap<u8, u8>) -> us
         }
     }
     // Pass 3: no physical match — keep the ordinal sub when still free, else take a
-    // free one (a sub vacated by a re-routed stream) rather than share a PID.
+    // free one rather than share a PID.
     let mut displaced: Vec<usize> = Vec::new();
     for i in unmatched {
         let (_, current) = info(&streams[i]);
@@ -139,14 +139,22 @@ pub fn remap_audio_pids(streams: &mut [Stream], probed: &BTreeMap<u8, u8>) -> us
         }
     }
     for i in displaced {
-        let free = ordinal
-            .iter()
+        // Prefer a sub-stream that physically carries data, then a vacated ordinal one.
+        let free = probed
+            .keys()
             .copied()
-            .chain(probed.keys().copied())
+            .chain(ordinal.iter().copied())
             .find(|sub| !claimed.contains(sub));
-        if let Some(sub) = free {
-            claimed.push(sub);
-            changed += set_sub(&mut streams[i], sub);
+        match free {
+            Some(sub) => {
+                claimed.push(sub);
+                changed += set_sub(&mut streams[i], sub);
+            }
+            None => tracing::warn!(
+                target: "freemkv::scan",
+                pid = 0xBD00 | u16::from(info(&streams[i]).1),
+                "dvd: no free AC-3 sub-stream; audio track shares a PID with another"
+            ),
         }
     }
     changed
@@ -434,6 +442,50 @@ mod tests {
             })
             .collect();
         assert_eq!(pids, vec![0xBD80, 0xBD81], "no two tracks on one PID");
+    }
+
+    /// A displaced stream (its ordinal sub taken by a re-route) prefers an unclaimed
+    /// sub-stream that physically exists over a vacated ordinal one with no data.
+    #[test]
+    fn remap_displaced_stream_prefers_a_probed_sub() {
+        let mut probed = BTreeMap::new();
+        probed.insert(0x80u8, 2u8);
+        probed.insert(0x81u8, 6u8);
+        let mut streams = vec![
+            ac3_stream(0xBD82, AudioChannels::Surround51),
+            ac3_stream(0xBD81, AudioChannels::Mono),
+        ];
+        remap_audio_pids(&mut streams, &probed);
+        let pids: Vec<u16> = streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pids,
+            vec![0xBD81, 0xBD80],
+            "displaced -> probed 0x80, not empty 0x82"
+        );
+    }
+
+    /// More AC-3 streams than sub-streams: nothing is free, so the extra stream keeps
+    /// its (shared) ordinal PID — logged, never re-routed onto a random sub.
+    #[test]
+    fn remap_exhausted_subs_leave_the_ordinal_pid() {
+        let mut probed = BTreeMap::new();
+        probed.insert(0x80u8, 2u8);
+        let mut streams = vec![
+            ac3_stream(0xBD80, AudioChannels::Stereo),
+            ac3_stream(0xBD80, AudioChannels::Stereo),
+        ];
+        assert_eq!(remap_audio_pids(&mut streams, &probed), 0);
+        assert!(
+            streams
+                .iter()
+                .all(|s| matches!(s, Stream::Audio(a) if a.pid == 0xBD80))
+        );
     }
 
     /// Empty probe (unreadable / scrambled VOB) is a no-op — the ordinal

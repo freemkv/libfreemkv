@@ -16,6 +16,9 @@ use std::io::{self, Write};
 pub struct M2tsStream {
     disc_title: DiscTitle,
     muxer: super::tsmux::TsMuxer<Box<dyn Write + Send>>,
+    /// Per track: `Some(Ok(header))` for LPCM BD-LPCM can carry (re-packed on write),
+    /// `Some(Err(warned))` for LPCM it can't (frames dropped, warned once).
+    lpcm: Vec<Option<Result<[u8; 2], bool>>>,
 }
 
 impl M2tsStream {
@@ -56,9 +59,21 @@ impl M2tsStream {
                 muxer.set_codec_private(i, data.clone())?;
             }
         }
+        let lpcm = title
+            .streams
+            .iter()
+            .map(|s| match s {
+                DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => Some(
+                    super::codec::lpcm::bd_header(a.channels.count(), a.sample_rate.hz() as u32)
+                        .ok_or(false),
+                ),
+                _ => None,
+            })
+            .collect();
         Ok(Self {
             disc_title: title.clone(),
             muxer,
+            lpcm,
         })
     }
 }
@@ -72,8 +87,35 @@ impl crate::pes::Stream for M2tsStream {
     }
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
-        self.muxer
-            .write_frame(frame.track, frame.pts, frame.keyframe, &frame.data)
+        match self.lpcm.get_mut(frame.track) {
+            // Parser output is plain 24-bit PCM; BD-TS needs the BD LPCM framing back.
+            Some(Some(Ok(header))) => {
+                let header = *header;
+                for (offset_ns, payload) in super::codec::lpcm::bd_payloads(&frame.data, header) {
+                    self.muxer.write_frame(
+                        frame.track,
+                        frame.pts.saturating_add(offset_ns),
+                        frame.keyframe,
+                        &payload,
+                    )?;
+                }
+                Ok(())
+            }
+            Some(Some(Err(warned))) => {
+                if !*warned {
+                    *warned = true;
+                    tracing::warn!(
+                        target: "mux",
+                        track = frame.track,
+                        "LPCM layout/rate not representable as BD LPCM; dropping track from M2TS"
+                    );
+                }
+                Ok(())
+            }
+            _ => self
+                .muxer
+                .write_frame(frame.track, frame.pts, frame.keyframe, &frame.data),
+        }
     }
 
     fn finish(&mut self) -> io::Result<()> {
@@ -310,5 +352,69 @@ mod tests {
         assert!(af_len >= 1, "AF length must include flags byte");
         let flags = h[5];
         assert_eq!(flags & 0x40, 0x40, "RAI bit set");
+    }
+    #[test]
+    fn lpcm_round_trips_through_m2ts_write_and_read() {
+        // The parser emits 24-bit WAVE-order PCM; the M2TS writer must re-synthesise
+        // the BD LPCM header, pad channel and BD channel order so our own m2ts://
+        // reader (LpcmParser::new) recovers identical PCM.
+        use crate::disc::{AudioChannels, AudioStream, LabelPurpose, SampleRate};
+        use crate::mux::codec::CodecParser;
+        const AUDIO_PID: u16 = 0x1100;
+        for channels in [
+            AudioChannels::Mono,
+            AudioChannels::Stereo21,
+            AudioChannels::Surround51,
+            AudioChannels::Surround71,
+        ] {
+            let mut title = make_title();
+            title.streams.push(DiscStream::Audio(AudioStream {
+                pid: AUDIO_PID,
+                codec: Codec::Lpcm,
+                channels,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: String::new(),
+            }));
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+            let ch = channels.count() as usize;
+            let pcm: Vec<u8> = (0..240 * ch * 3).map(|i| (i % 251) as u8).collect();
+            for (i, chunk) in [&pcm[..], &pcm[..]].iter().enumerate() {
+                stream
+                    .write(&PesFrame {
+                        discard_padding_ns: 0,
+                        coding: None,
+                        source: None,
+                        track: 1,
+                        pts: i as i64 * 5_000_000,
+                        keyframe: true,
+                        data: chunk.to_vec(),
+                        duration_ns: None,
+                    })
+                    .unwrap();
+            }
+            stream.finish().unwrap();
+            drop(stream);
+
+            let buf = shared.lock().unwrap().clone();
+            let mut cursor = std::io::Cursor::new(&buf);
+            super::meta::read_header(&mut cursor).unwrap().unwrap();
+            let ts = &buf[cursor.position() as usize..];
+            let mut demux = crate::mux::ts::TsDemuxer::new(&[AUDIO_PID]);
+            let mut pes = demux.feed(ts);
+            pes.extend(demux.flush());
+            let mut parser = crate::mux::codec::lpcm::LpcmParser::new();
+            let got: Vec<u8> = pes
+                .iter()
+                .flat_map(|p| parser.parse(p))
+                .flat_map(|f| f.data)
+                .collect();
+            let mut want = pcm.clone();
+            want.extend_from_slice(&pcm);
+            assert_eq!(got, want, "{channels:?}: PCM survives m2ts write -> read");
+        }
     }
 }

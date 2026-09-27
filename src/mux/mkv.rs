@@ -450,10 +450,12 @@ impl MkvTrack {
             field_duration_ns: 0,
             sample_rate: sr,
             channels: ch,
-            // KNOWN GAP, not deliberate: Matroska requires BitDepth for `A_PCM/INT/*`,
-            // but `LpcmParser` strips the BD/DVD framing that carries it and
-            // `AudioStream` has no bit-depth field; guessing 16 would be worse than 0.
-            bit_depth: 0,
+            // Matroska requires BitDepth for `A_PCM/INT/*`; `LpcmParser` always emits 24-bit.
+            bit_depth: if a.codec == Codec::Lpcm {
+                super::codec::lpcm::OUTPUT_BIT_DEPTH
+            } else {
+                0
+            },
             dv_config: None,
             hdr10: None,
             mvc_params: None,
@@ -2469,6 +2471,22 @@ mod tests {
             purpose: LabelPurpose::Normal,
             label: String::new(),
         }
+    }
+
+    #[test]
+    fn lpcm_track_writes_bitdepth_24() {
+        // `LpcmParser` always emits 24-bit BE PCM; without BitDepth players assume
+        // 16-bit and decode noise. Check the element is actually written.
+        let track = MkvTrack::audio(&audio_stream(Codec::Lpcm));
+        assert_eq!(track.bit_depth, 24);
+        let mut buf = Cursor::new(Vec::new());
+        MkvMuxer::new(&mut buf, &[track], None, 0.0, &[]).unwrap();
+        let bytes = buf.into_inner();
+        // BitDepth (0x6264), size 1, value 24.
+        assert!(
+            bytes.windows(4).any(|w| w == [0x62, 0x64, 0x81, 24]),
+            "BitDepth=24 element present"
+        );
     }
 
     #[test]
