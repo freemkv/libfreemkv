@@ -492,7 +492,7 @@ impl CodecParser for TrueHdParser {
 /// channel-assignment masks (per the MLP/TrueHD bitstream spec). Some
 /// bits denote a stereo pair (2), others a single channel (1).
 const THD_8CH: [u8; 13] = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
-const THD_6CH: [u8; 5] = [2, 1, 1, 2, 1];
+const THD_6CH: [u8; 5] = [2, 1, 1, 2, 2];
 
 /// Decode the true channel count from a TrueHD major-sync `format_info` word
 /// (the 32 bits immediately after the 0xF8726FBA sync). Returns the richest
@@ -1433,11 +1433,11 @@ mod tests {
     #[test]
     fn truehd_channels_6ch_used_only_when_8ch_zero() {
         // The 8ch presentation takes priority; the 6ch field (bits 15-19) is read
-        // ONLY when ch8 == 0. THD_6CH = [2,1,1,2,1]. Set 6ch bit 0 (→2) while
+        // ONLY when ch8 == 0. THD_6CH = [2,1,1,2,2]. Set 6ch bit 0 (→2) while
         // 8ch is zero: 6ch field value 1 at shift 15.
         assert_eq!(truehd_channels(1 << 15), Some(2));
-        // All 5 6ch bits = 2+1+1+2+1 = 7. 0x1F << 15.
-        assert_eq!(truehd_channels(0x1F << 15), Some(7));
+        // All 5 6ch bits = 2+1+1+2+2 = 8 (bit 4 is the Lvh/Rvh pair). 0x1F << 15.
+        assert_eq!(truehd_channels(0x1F << 15), Some(8));
     }
 
     #[test]
