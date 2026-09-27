@@ -135,6 +135,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 config,
                 channels,
                 sample_rate: entry_sample_rate,
+                dts_max_rate,
             }) = parse_stsd(stsd)
             else {
                 tracing::warn!(
@@ -165,7 +166,10 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     // `as u8` (a crafted 256 would alias to 0/Mono).
                     channels: AudioChannels::from_count(channels.min(u8::MAX as u16) as u8),
                     language: language.clone().unwrap_or_else(|| "und".into()),
-                    sample_rate: SampleRate::from_hz(audio_rate(entry_sample_rate, timescale)),
+                    sample_rate: SampleRate::from_hz(
+                        dts_max_rate
+                            .unwrap_or_else(|| audio_rate(entry_sample_rate, timescale, codec)),
+                    ),
                     secondary: false,
                     purpose: LabelPurpose::Normal,
                     label: String::new(),
@@ -673,6 +677,8 @@ struct StsdInfo {
     /// field (high 16 bits). `0` when absent/video — the caller then falls
     /// back to the mdhd media timescale.
     sample_rate: u32,
+    /// DTS `ddts` DTSSamplingFrequency when it is a known rate.
+    dts_max_rate: Option<u32>,
 }
 
 /// stsd → codec + dimensions + codec_private + channel count (first entry).
@@ -721,6 +727,7 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             config,
             channels: 0,
             sample_rate: 0,
+            dts_max_rate: None,
         })
     } else {
         // AudioSampleEntry (ISO/IEC 14496-12 §12.2.3): 28 bytes then children. Under
@@ -756,25 +763,34 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
         let sample_rate = find_box(&body[children..], b"srat")
             .filter(|b| b.len() >= 8)
             .map_or(sample_rate, |b| be32(b, 4));
+        // ETSI TS 102 114 E.2.2.3: DTSSamplingFrequency is the stream's maximum rate.
+        let dts_max_rate = match codec {
+            Codec::Dts => find_box(&body[children..], b"ddts")
+                .filter(|b| b.len() >= 4)
+                .map(|b| be32(b, 0))
+                .filter(|&hz| SampleRate::from_hz(hz) != SampleRate::Unknown),
+            _ => None,
+        };
         Some(StsdInfo {
             codec,
             height: 0,
             config,
             channels,
             sample_rate,
+            dts_max_rate,
         })
     }
 }
 
 // Sample rate from the entry rate and the mdhd timescale. The entry wins when
-// it is a known rate; the timescale replaces a placeholder (0, 1, saturated
-// 65535) or an unknown entry rate the >65535 timescale is a multiple of.
-fn audio_rate(entry: u32, timescale: u32) -> u32 {
+// it is known, except DTS, whose entry holds the 48/44.1/32 kHz family base.
+fn audio_rate(entry: u32, timescale: u32, codec: Codec) -> u32 {
     let known = |hz| SampleRate::from_hz(hz) != SampleRate::Unknown;
     if matches!(entry, 0 | 1 | 0xFFFF) {
         return timescale;
     }
-    if !known(entry) && timescale > 0xFFFF && known(timescale) && timescale.is_multiple_of(entry) {
+    let multiple = timescale > entry && known(timescale) && timescale.is_multiple_of(entry);
+    if multiple && (codec == Codec::Dts || (!known(entry) && timescale > 0xFFFF)) {
         return timescale;
     }
     entry
@@ -2351,10 +2367,96 @@ mod tests {
     // 65535, and a DTS-HD entry may carry the 48 kHz core rate. mdhd wins then.
     #[test]
     fn a_high_rate_mdhd_timescale_beats_an_unrepresentable_entry_rate() {
-        let mut e = audio_entry(6, 0, &[]);
-        e[24..28].copy_from_slice(&(0xFFFFu32 << 16).to_be_bytes());
-        let a = read_audio(audio_moov(96_000, b"dtsh", &e));
+        for entry_rate in [0xFFFFu32, 48_000] {
+            let mut e = audio_entry(6, 0, &[]);
+            e[24..28].copy_from_slice(&(entry_rate << 16).to_be_bytes());
+            let a = read_audio(audio_moov(96_000, b"dtsh", &e));
+            assert_eq!(a.sample_rate, SampleRate::S96, "entry {entry_rate}");
+        }
+    }
+
+    // ETSI TS 102 114 E.2.2.3: ddts DTSSamplingFrequency is the stream's maximum rate.
+    #[test]
+    fn a_dts_ddts_max_rate_beats_the_family_entry_rate() {
+        let mut ddts = 96_000u32.to_be_bytes().to_vec();
+        ddts.extend_from_slice(&[0u8; 15]);
+        let e = audio_entry(6, 0, &mp4_box(b"ddts", &ddts));
+        let a = read_audio(audio_moov(90_000, b"dtsh", &e));
         assert_eq!(a.sample_rate, SampleRate::S96);
+    }
+
+    // A 96 kHz DTS-HD MA track written by Mp4Sink reads back as 96 kHz.
+    #[test]
+    fn a_96k_dts_hd_track_round_trips_its_rate() {
+        use crate::disc::{AudioChannels, AudioStream, Codec, DiscTitle, LabelPurpose};
+        use crate::mux::mp4::Mp4Sink;
+        use crate::pes::{PesFrame, Stream as _};
+        use std::io::Cursor;
+
+        let mut t = DiscTitle::empty();
+        t.streams = vec![
+            DiscStream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::Hevc,
+                resolution: Resolution::R1080p,
+                frame_rate: crate::disc::FrameRate::F23_976,
+                hdr: crate::disc::HdrFormat::Sdr,
+                color_space: crate::disc::ColorSpace::Unknown,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            }),
+            DiscStream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::DtsHdMa,
+                channels: AudioChannels::Surround51,
+                language: "eng".into(),
+                sample_rate: SampleRate::S96,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: String::new(),
+            }),
+        ];
+        t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC]), None];
+        // 48 kHz DTS core (SFREQ=13), as on a 96 kHz DTS-HD MA disc track.
+        let core = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x3C, 0x05, 0xF2, 0x77, 0x00, 0x02, 0x00,
+        ];
+        let mut buf = Vec::new();
+        {
+            let mut sink = Mp4Sink::create(Cursor::new(&mut buf), &t).unwrap();
+            for i in 0..2i64 {
+                sink.write(&PesFrame {
+                    discard_padding_ns: 0,
+                    track: 0,
+                    pts: i * 41_708_333,
+                    keyframe: i == 0,
+                    data: vec![0x11; 64],
+                    duration_ns: None,
+                    source: None,
+                    coding: None,
+                })
+                .unwrap();
+                sink.write(&PesFrame {
+                    discard_padding_ns: 0,
+                    track: 1,
+                    pts: i * 5_333_333,
+                    keyframe: true,
+                    data: core.clone(),
+                    duration_ns: None,
+                    source: None,
+                    coding: None,
+                })
+                .unwrap();
+            }
+            sink.finish().unwrap();
+        }
+        let rd = Mp4Reader::from_reader(Cursor::new(buf), "dts96".into()).unwrap();
+        match &rd.info().streams[1] {
+            DiscStream::Audio(a) => assert_eq!(a.sample_rate, SampleRate::S96),
+            other => panic!("expected audio, got {other:?}"),
+        }
     }
 
     // A valid known entry rate is kept even when mdhd uses a higher timescale.
