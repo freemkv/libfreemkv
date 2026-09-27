@@ -724,8 +724,8 @@ impl MkvStream {
         Ok(())
     }
 
-    // `(track, Some(depth) | None=contradicted)` for tracks decidable from `frames`.
-    // Past the probe budget an undecided depth takes ffmpeg's 16-bit default.
+    // `(track, Some(depth) | None=undecidable)` for tracks decidable from `frames`.
+    // Past the budget, a measured but ambiguous span takes ffmpeg's 16-bit default.
     fn try_infer_pcm(
         &self,
         frames: &[crate::pes::PesFrame],
@@ -741,11 +741,21 @@ impl MkvStream {
             let depth = match pcm_depth_fit(&mine, *info, rs.ts_scale_ns) {
                 PcmFit::One(w) => Some(w * 8),
                 PcmFit::Neither => None,
-                PcmFit::Both if end == ProbeEnd::Reading && mine.len() < PCM_PROBE_FRAMES => {
+                PcmFit::Both | PcmFit::Unmeasured
+                    if end == ProbeEnd::Reading && mine.len() < PCM_PROBE_FRAMES =>
+                {
                     continue;
                 }
-                PcmFit::Both if end == ProbeEnd::Eof && mine.is_empty() => None,
-                PcmFit::Both => Some(16),
+                PcmFit::Unmeasured => None,
+                PcmFit::Both => {
+                    tracing::warn!(
+                        target: "mux",
+                        code = crate::error::E_MKV_SOURCE_INVALID,
+                        track = idx,
+                        "mkv read-back: PCM depth ambiguous, assuming 16-bit"
+                    );
+                    Some(16)
+                }
             };
             out.push((idx, depth));
         }
@@ -1403,6 +1413,8 @@ enum ProbeEnd {
 enum PcmFit {
     One(u64),
     Both,
+    // Both fit only because no span could be measured: no evidence.
+    Unmeasured,
     Neither,
 }
 
@@ -1415,8 +1427,9 @@ fn pcm_depth_fit(frames: &[&crate::pes::PesFrame], info: PcmInfer, tick_ns: i64)
             .iter()
             .all(|f| (f.data.len() as u64).is_multiple_of(ch * w))
     });
-    if let Some((bytes, span_ns)) = pcm_span(frames) {
-        let err = tick_ns.max(1).saturating_mul(2);
+    let err = tick_ns.max(1).saturating_mul(2);
+    let span = pcm_span(frames);
+    if let Some((bytes, span_ns)) = span {
         let per_ns = info.rate * ch as f64 / 1e9;
         for (fit, w) in fits.iter_mut().zip([2.0f64, 3.0]) {
             let lo = span_ns.saturating_sub(err).max(0) as f64 * per_ns * w * 0.99;
@@ -1427,7 +1440,8 @@ fn pcm_depth_fit(frames: &[&crate::pes::PesFrame], info: PcmInfer, tick_ns: i64)
     match fits {
         [true, false] => PcmFit::One(2),
         [false, true] => PcmFit::One(3),
-        [true, true] => PcmFit::Both,
+        [true, true] if span.is_some_and(|(_, ns)| ns > err) => PcmFit::Both,
+        [true, true] => PcmFit::Unmeasured,
         [false, false] => PcmFit::Neither,
     }
 }
@@ -5703,9 +5717,15 @@ mod tests {
         assert_eq!(frames[0].data, b24, "24-bit big-endian passes through");
 
         let b16 = [0x12u8, 0x34].repeat(96 * 2);
-        let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &[(0, b16.clone()), (2, b16)]);
+        let blocks: Vec<_> = (0..10u64).map(|i| (i * 2, b16.clone())).collect();
+        let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &blocks);
         let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
         assert_eq!(drain(&mut s)[0].data[..3], [0x12, 0x34, 0]);
+
+        // Two blocks 2 ms apart are within timestamp error: no evidence, not LPCM.
+        let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &[(0, b16.clone()), (2, b16)]);
+        let s = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(stream_codec(&s.info().streams[0]), Codec::Unknown(0));
 
         let odd = vec![0u8; 250];
         let bytes = pcm_mkv_blocks(ebml::CODEC_PCM_BE, None, &[(0, odd.clone()), (2, odd)]);
@@ -5814,15 +5834,23 @@ mod tests {
             }
         }
         let block = simple_block(1, 0, &vec![0u8; 256 << 10]);
-        let r = Lazy {
-            head: Cursor::new(video_then_pcm_header()),
-            at: block.len(),
-            block,
-            left: 1000,
-        };
-        let s = MkvStream::open(r).unwrap();
-        assert!(pending_bytes(&s) <= PCM_PROBE_BYTES + (256 << 10));
-        assert_eq!(stream_codec(&s.info().streams[1]), Codec::Lpcm);
+        // No PCM frame, or one whose size fits 16 and 24 bit: no evidence, so
+        // the track is not presented as LPCM rather than guessed.
+        for pcm in [None, Some(vec![0u8; 96 * 2 * 3])] {
+            let mut head = video_then_pcm_header();
+            if let Some(p) = &pcm {
+                head.extend(simple_block(2, 0, p));
+            }
+            let r = Lazy {
+                head: Cursor::new(head),
+                at: block.len(),
+                block: block.clone(),
+                left: 1000,
+            };
+            let s = MkvStream::open(r).unwrap();
+            assert!(pending_bytes(&s) <= PCM_PROBE_BYTES + (256 << 10) + (1 << 10));
+            assert_eq!(stream_codec(&s.info().streams[1]), Codec::Unknown(0));
+        }
     }
 
     // LPCM frames downstream are 24-bit big-endian: 16-bit and little-endian
