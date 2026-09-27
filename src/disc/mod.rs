@@ -545,19 +545,18 @@ fn merged_extents<'a>(extents: impl Iterator<Item = &'a Extent>) -> Vec<(u32, u3
     crate::udf::merge_ranges(&ranges)
 }
 
-// The whole-disc bus map: every stream file, then each title extent as its own
-// file (only sectors no stream file already covers survive).
+// The whole-disc bus map: every stream file, plus title extents no stream file
+// covers as content of unknown unit alignment (always de-bussed).
 fn bus_map(
-    mut files: Vec<Vec<(u32, u32)>>,
+    files: Vec<Vec<(Option<u32>, u32)>>,
     titles: &[DiscTitle],
 ) -> crate::sector::bus_removal::BusMap {
-    files.extend(
-        titles
-            .iter()
-            .flat_map(|t| &t.extents)
-            .map(|e| vec![(e.start_lba, e.sector_count)]),
-    );
-    crate::sector::bus_removal::BusMap::from_files(files)
+    let unknown: Vec<(u32, u32)> = titles
+        .iter()
+        .flat_map(|t| &t.extents)
+        .map(|e| (e.start_lba, e.sector_count))
+        .collect();
+    crate::sector::bus_removal::BusMap::new(files, &unknown)
 }
 
 // Corrects a title's TrueHD channels/sample-rate/Atmos by probing the first decrypted major
@@ -1858,12 +1857,22 @@ impl Disc {
         read_data_key
     }
 
-    // Recorded extents, in file order, of every file under /BDMV/STREAM (m2ts,
-    // SSIF, fmts): the AACS Clip AV stream files the drive bus-encrypts on a BEE disc.
+    /// The AACS stream files' sectors (every file under `/BDMV/STREAM`: m2ts,
+    /// SSIF, fmts) as sorted, merged `(start_lba, sector_count)` ranges — the
+    /// whole-disc encrypted-content map, unlike the title-only
+    /// [`Self::encrypted_content_ranges`]. Reads the UDF tree from `reader`.
+    pub fn stream_content_ranges(reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
+        let udf_fs = udf::read_filesystem(reader)?;
+        let files = Self::stream_file_extents(reader, &udf_fs);
+        Ok(crate::sector::bus_removal::BusMap::new(files, &[]).covered_ranges())
+    }
+
+    // Extents, in file order, of every file under /BDMV/STREAM (the AACS Clip AV
+    // stream files); an unrecorded extent is a `None` hole that keeps file offsets.
     pub(crate) fn stream_file_extents(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
-    ) -> Vec<Vec<(u32, u32)>> {
+    ) -> Vec<Vec<(Option<u32>, u32)>> {
         let mut out = Vec::new();
         let mut stack: Vec<&udf::DirEntry> = udf_fs.find_dir("/BDMV/STREAM").into_iter().collect();
         while let Some(dir) = stack.pop() {
@@ -1875,8 +1884,11 @@ impl Disc {
                 match udf_fs.extents_abs_at(reader, e.meta_lba) {
                     Ok(exts) => out.push(
                         exts.iter()
-                            .filter(|x| x.recorded && x.len > 0)
-                            .map(|x| (x.lba, (x.len as u64).div_ceil(2048) as u32))
+                            .filter(|x| x.len > 0)
+                            .map(|x| {
+                                let n = (x.len as u64).div_ceil(2048) as u32;
+                                (x.recorded.then_some(x.lba), n)
+                            })
                             .collect(),
                     ),
                     Err(err) => tracing::warn!(
@@ -8257,6 +8269,21 @@ mod tests {
                 (PART_START + 3_000, 3)
             ],
             "non-title m2ts and SSIF must be de-bussed too; nav stays clear"
+        );
+    }
+
+    // The public whole-disc stream map: every /BDMV/STREAM file, nav excluded.
+    #[test]
+    fn stream_content_ranges_lists_every_stream_file() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, _) = bus_fixture(0x80);
+        assert_eq!(
+            Disc::stream_content_ranges(&mut mem).unwrap(),
+            vec![
+                (PART_START + 1_000, 3),
+                (PART_START + 2_000, 6),
+                (PART_START + 3_000, 3)
+            ]
         );
     }
 

@@ -297,11 +297,6 @@ impl Disc {
         )
         .ok();
         let cc = cc_raw.as_deref().and_then(aacs::inf::parse_content_cert);
-        // Fail safe: a cert that reads but does not parse may declare bus encryption.
-        let bus_encryption = match &cc {
-            Some(c) => c.bus_encryption,
-            None => cc_raw.is_some(),
-        };
         // No-cert default = UHD (V20 stride), matching `read_aacs_version` so
         // scanned/out-of-band versions agree; the main path fails loudly on a
         // wrong stride, so this conservative default is safe here too.
@@ -309,6 +304,14 @@ impl Disc {
             .as_ref()
             .map(|c| c.version.major())
             .unwrap_or(aacs::mkb::AACS_MAJOR_UHD);
+        // Fail safe: an unparseable cert, or none on a live (assumed UHD) drive,
+        // may mean bus encryption.
+        let bus_encryption = match &cc {
+            Some(c) => c.bus_encryption,
+            None => {
+                cc_raw.is_some() || (handshake.is_some() && version == aacs::mkb::AACS_MAJOR_UHD)
+            }
+        };
 
         // Bus-encryption gate: removed by a drive unlock (`drive_unlocked`) or a
         // cert handshake `read_data_key`. The old gate credited only the latter,
@@ -869,6 +872,34 @@ mod tests {
         };
         let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).unwrap_err();
         assert!(matches!(err, Error::AacsBusKeyUnavailable), "got {err:?}");
+    }
+
+    // No cert at all on a live drive: the version defaults to UHD, so bus encryption
+    // is assumed and a missing Read Data Key refuses keys; an ISO still resolves.
+    #[test]
+    fn resolve_vid_only_missing_cert_live_drive_is_treated_as_bus_encrypted() {
+        let mut disc = MemDisc::new();
+        let udf = build_aacs_fs(
+            &mut disc,
+            &[AacsFile {
+                name: "Unit_Key_RO.inf",
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vec![0xAB; 32],
+            }],
+        );
+        let hs = HandshakeResult {
+            volume_id: [0x11u8; 16],
+            read_data_key: None,
+            read_data_key_err: None,
+            drive_unlocked: false,
+        };
+        let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).unwrap_err();
+        assert!(matches!(err, Error::AacsBusKeyUnavailable), "got {err:?}");
+        assert!(
+            Disc::resolve_vid_only(&udf, &mut disc, None).is_ok(),
+            "ISO path"
+        );
     }
 
     /// ISO scan (handshake None) of a bus_encryption disc → Ok. Bus encryption

@@ -82,7 +82,7 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// [`set_unit_base`]: Self::set_unit_base
     unit_base: u32,
     /// Encrypted-content map: every stream file's sorted/merged `(start_lba,
-    /// sector_count)` (e.g. [`BusMap::covered_ranges`](crate::sector::bus_removal::BusMap::covered_ranges)).
+    /// sector_count)` (e.g. [`Disc::stream_content_ranges`](crate::Disc::stream_content_ranges)).
     /// When `Some`, a unit outside these ranges is clear and passed through
     /// untouched: never decrypted, verified, or counted as loss. `None` means
     /// the caller reads only encrypted content, so every unit is content.
@@ -137,7 +137,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     }
 
     /// Restrict decrypt to every stream file's extents (e.g.
-    /// [`BusMap::covered_ranges`](crate::sector::bus_removal::BusMap::covered_ranges),
+    /// [`Disc::stream_content_ranges`](crate::Disc::stream_content_ranges),
     /// not the title-only [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
     /// Units outside pass through untouched, never TS-sync checked. Whole-disc
     /// readers (sweep / patch) set this; the mux, reading title extents, does not.

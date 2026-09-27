@@ -202,14 +202,15 @@ impl Drive {
     /// by the bus map. `Passthrough` is a no-op, so the raw
     /// `read`/`read_fua` used by internal callers stay bus-encrypted while
     /// `SectorSource` readers above see plaintext content.
-    fn remove_bus_encryption(&mut self, lba: u32, data: &mut [u8], recovery: bool) {
+    fn remove_bus_encryption(&mut self, lba: u32, data: &mut [u8]) {
         let crate::sector::bus_removal::BusStage::AacsHostKey(rdk) = self.bus_stage.clone() else {
             return;
         };
         let mut gate = self.bus_gate.take();
+        // Head fetch is fast-timeout (never recovery): a failure caches as encrypted.
         crate::sector::bus_removal::debus_read(gate.as_mut(), data, &rdk, lba, &mut |h| {
             let mut s = [0u8; 2048];
-            match self.read_fua(h, 1, &mut s, recovery, false) {
+            match self.read_fua(h, 1, &mut s, false, false) {
                 Ok(n) if n >= 2048 => Some(s[0]),
                 _ => None,
             }
@@ -1225,7 +1226,7 @@ impl SectorSource for Drive {
         recovery: bool,
     ) -> Result<usize> {
         let n = self.read(lba, count, buf, recovery)?;
-        self.remove_bus_encryption(lba, &mut buf[..n], recovery);
+        self.remove_bus_encryption(lba, &mut buf[..n]);
         Ok(n)
     }
 
@@ -1238,7 +1239,7 @@ impl SectorSource for Drive {
         fua: bool,
     ) -> Result<usize> {
         let n = self.read_fua(lba, count, buf, recovery, fua)?;
-        self.remove_bus_encryption(lba, &mut buf[..n], recovery);
+        self.remove_bus_encryption(lba, &mut buf[..n]);
         Ok(n)
     }
 

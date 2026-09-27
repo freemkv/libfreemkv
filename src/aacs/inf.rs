@@ -371,9 +371,9 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
         return None;
     }
 
-    // Content Certificate layout: [0] cert type (0x00 AACS1/0x10 AACS2),
-    // [1] bit7 bus_encryption_enabled_flag, [14..20] cc_id (6 bytes).
-    // Only the observed types parse; an unknown/corrupt type is None, not a guess.
+    // Layout: [0] type, [1] bit7 BEE flag, [14..20] cc_id. Only observed types
+    // parse: 0x10 AACS2, 0x00 AACS1 (HD DVD's 0x00 is reverse-engineered from
+    // retail discs); anything else is None.
     let version = match data[0] {
         0x00 => AacsVersion::V10,
         0x10 => AacsVersion::V20,
