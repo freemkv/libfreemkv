@@ -1,8 +1,8 @@
 //! CLPI vs MPLS cross-validation diagnostic.
 //!
-//! Walks per-clip CLPI program info and per-playlist MPLS STN tables (an STN entry
-//! applies to every clip the playlist plays), keys streams by `(clip, PID)` — a PID is
-//! only unique within one clip's transport stream — keeping the first
+//! Walks per-clip CLPI program info and per-playlist MPLS STN tables (each PlayItem has
+//! its own; only the first item's is parsed, so it is compared with that item's clip),
+//! keys streams by `(clip, PID)` — a PID is only unique within one clip — keeping the first
 //! `(coding_type, language)` seen per source, then classifies each key as CLPI-only,
 //! MPLS-only, Match, or Divergent.
 //!
@@ -128,13 +128,13 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
         }
     }
 
-    // MPLS: the STN table covers every clip the playlist plays.
+    // MPLS: `streams` is the first PlayItem's STN_table, so it describes that clip.
     let mut mpls_by_key: BTreeMap<(String, u16), (u8, String)> = BTreeMap::new();
     for (_, data) in read_dir_files(reader, udf, "/BDMV/PLAYLIST", ".mpls") {
         let Ok(pl) = crate::mpls::parse(&data) else {
             continue;
         };
-        for pi in &pl.play_items {
+        if let Some(pi) = pl.play_items.first() {
             for s in pl.streams.iter().filter(|s| s.pid != 0) {
                 mpls_by_key
                     .entry((pi.clip_id.clone(), s.pid))
@@ -531,9 +531,10 @@ mod tests {
         assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
     }
 
-    // A playlist's STN covers every clip it plays, not only the first.
+    // Each PlayItem has its own STN_table; the parsed (first) one describes only
+    // the first item's clip, so a later clip is not credited with it.
     #[test]
-    fn mpls_streams_are_keyed_by_every_play_item_clip() {
+    fn mpls_streams_are_keyed_by_the_first_play_item_clip_only() {
         use crate::consts::coding_type as c;
         use crate::udf::fixture::*;
         let build_clpi = super::super::clpi_orphan_tests::build_clpi;
@@ -577,6 +578,6 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         let a = audit(&mut disc, &udf);
-        assert_eq!(a.class_counts(), (0, 0, 2, 0), "{:?}", a.rows);
+        assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
     }
 }
