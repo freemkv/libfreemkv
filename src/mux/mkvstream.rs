@@ -163,8 +163,8 @@ struct PendingMux {
 const MAX_ORIGIN_LEAD_NS: i64 = 3_000_000_000;
 
 impl PendingMux {
-    // Origin = earliest buffered audio/video frame at or after the first clip's
-    // IN time, within MAX_ORIGIN_LEAD_NS of the IDR. Audio/video before it are
+    // Origin = earliest buffered audio/video frame at or after `in_ns` (Blu-ray
+    // clip IN), within MAX_ORIGIN_LEAD_NS of the IDR. Audio/video before it are
     // dropped (counted); subtitles are kept and clamp to the origin.
     fn set_origin(&mut self, idr_pts: i64, in_ns: Option<i64>) {
         let floor = idr_pts.saturating_sub(MAX_ORIGIN_LEAD_NS);
@@ -184,7 +184,7 @@ impl PendingMux {
         let tracks = &self.tracks;
         let before = self.buffered.len();
         self.buffered
-            .retain(|(f, _)| !is_av(tracks, f.track) || f.pts >= floor);
+            .retain(|(f, _)| !is_av(tracks, f.track) || f.pts >= origin);
         self.dropped_pre_origin = (before - self.buffered.len()) as u64;
     }
 }
@@ -622,11 +622,12 @@ impl MkvStream {
             // audio already buffered while its parser assembled the opening GOP.
             // Replaying the audio first made the muxer drop that entire prefix.
             if use_coding && frame.keyframe {
-                let in_ns = self
-                    .disc_title
-                    .clips
-                    .first()
-                    .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
+                // Only Blu-ray marks share the PES clock (see `TimelineContinuity::with_clips`).
+                let in_ns = match self.disc_title.content_format {
+                    crate::disc::ContentFormat::BdTs => self.disc_title.clips.first(),
+                    crate::disc::ContentFormat::MpegPs => None,
+                }
+                .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
                 if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
                     p.set_origin(frame.pts, in_ns);
                     let mut f = frame.clone();
@@ -5497,6 +5498,58 @@ mod tests {
         assert_eq!(pts_of(&back, 0), vec![40_000_000]);
         assert_eq!(pts_of(&back, 1), vec![0, 72_000_000]);
         assert_eq!(pts_of(&back, 2), vec![0], "the early cue is kept, clamped");
+    }
+
+    // DVD/HD-DVD clip marks run on another clock: the origin ignores them, and no
+    // kept frame lands before the origin (squashed to t=0).
+    #[test]
+    fn an_mpeg_ps_origin_ignores_clip_marks_and_squashes_nothing() {
+        let mut t = three_track_title();
+        t.content_format = crate::disc::ContentFormat::MpegPs;
+        t.clips = vec![crate::disc::Clip {
+            clip_id: String::new(),
+            in_time: 36_000,
+            out_time: 450_000,
+            duration_secs: 9.2,
+            source_packets: 0,
+            feed_span: None,
+        }];
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &t, None).unwrap();
+        for (track, pts) in [(1, 500), (1, 900), (0, 1_000), (1, 1_032)] {
+            s.write(&av_frame(track, pts * 1_000_000, true, vec![0xA0; 8]))
+                .unwrap();
+        }
+        s.finish().unwrap();
+        let back = drain(&mut MkvStream::open(Cursor::new(out.bytes())).unwrap());
+        assert_eq!(pts_of(&back, 1), vec![0, 400_000_000, 532_000_000]);
+        assert_eq!(pts_of(&back, 0), vec![500_000_000]);
+    }
+
+    // Blu-ray with unusable marks (no seam plan): A/V before the clip IN is
+    // dropped, not squashed onto the origin.
+    #[test]
+    fn a_bd_frame_before_the_clip_in_is_dropped_without_a_seam_plan() {
+        let mut t = three_track_title();
+        t.content_format = crate::disc::ContentFormat::BdTs;
+        t.clips = vec![crate::disc::Clip {
+            clip_id: String::new(),
+            in_time: 36_000,
+            out_time: 0,
+            duration_secs: 0.0,
+            source_packets: 0,
+            feed_span: None,
+        }];
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &t, None).unwrap();
+        for (track, pts) in [(1, 500), (1, 900), (0, 1_000), (1, 1_032)] {
+            s.write(&av_frame(track, pts * 1_000_000, true, vec![0xA0; 8]))
+                .unwrap();
+        }
+        s.finish().unwrap();
+        let back = drain(&mut MkvStream::open(Cursor::new(out.bytes())).unwrap());
+        assert_eq!(pts_of(&back, 1), vec![0, 132_000_000]);
+        assert_eq!(pts_of(&back, 0), vec![100_000_000]);
     }
 
     // Audio further before the IDR than a block can reach from its cluster is dropped.
