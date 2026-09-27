@@ -695,11 +695,12 @@ pub enum DiscPresence {
     /// A medium is loaded: GOOD, or a NOT READY state that only exists with one
     /// (04/02, 04/04, 04/07, 04/08, 0Ch, 30h other than cleaning cartridges).
     Present,
-    /// NOT READY 3Ah, MEDIUM NOT PRESENT (tray open or closed and empty).
+    /// NOT READY 3Ah, MEDIUM NOT PRESENT (tray open or closed and empty), or a
+    /// cleaning cartridge / cleaning failure (30/03, 30/07): nothing to rip.
     Absent,
     /// Not ready for a reason that does not settle presence: 04/01 (a mounted
     /// disc spinning up or changing Format-layer, MMC-6 §6.22.3), 04/00, 04/03,
-    /// 04/09, 3Eh, cleaning cartridge, or another NOT READY. Poll again.
+    /// 04/09, 3Eh, or another NOT READY. Poll again.
     Settling,
 }
 
@@ -741,7 +742,7 @@ fn not_ready_presence(asc: u8, ascq: u8) -> DiscPresence {
         // Write error recovery needed, defects in error window.
         (0x0C, 0x07 | 0x0F) => DiscPresence::Present,
         // Cleaning cartridge installed / cleaning failure: no disc to rip.
-        (0x30, 0x03 | 0x07) => DiscPresence::Settling,
+        (0x30, 0x03 | 0x07) => DiscPresence::Absent,
         // Incompatible / unreadable medium installed.
         (0x30, _) => DiscPresence::Present,
         _ => DiscPresence::Settling,
@@ -866,11 +867,11 @@ mod transport_helper_tests {
                 "{asc:02x}/{ascq:02x}"
             );
         }
-        for (asc, ascq) in [(0x3E, 0x00), (0x30, 0x03), (0x30, 0x07)] {
-            assert!(
-                matches!(one(2, asc, ascq), Ok(Settling)),
-                "{asc:02x}/{ascq:02x}"
-            );
+        assert!(matches!(one(2, 0x3E, 0x00), Ok(Settling)), "3E/00");
+        // A cleaning cartridge (30/03) or cleaning failure (30/07) is nothing to
+        // rip and does not resolve like a spin-up: no disc.
+        for ascq in [0x03, 0x07] {
+            assert!(matches!(one(2, 0x30, ascq), Ok(Absent)), "30/{ascq:02x}");
         }
         assert!(one(3, 0x11, 0).is_err(), "not a NOT READY key");
     }
