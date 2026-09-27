@@ -313,7 +313,8 @@ impl CodecParser for LpcmParser {
 }
 
 /// Tag on the parser's codec_private, so a foreign MKV `A_PCM` CodecPrivate never
-/// passes for a BD layout byte.
+/// passes for a BD layout byte. No released build wrote an untagged byte; any
+/// untagged value falls back to the count-default layout.
 const LAYOUT_TAG: &[u8; 4] = b"BDLP";
 
 /// The BD layout byte (channel_assignment|rate) from a tagged LPCM codec_private.
@@ -344,6 +345,7 @@ pub(crate) fn correct_title_layout(title: &mut crate::disc::DiscTitle) {
         let (Some((count, _)), Some(hz)) = (bd_layout(b >> 4), bd_rate(b & 0x0F)) else {
             continue;
         };
+        // AudioChannels has no 3.0 / 7.0 variant: 3ch (3/0, 2/1) reads "2.1", 7ch "6.1".
         let basic = crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
         a.channels = AudioChannels::from_count(count as u8);
         a.sample_rate = SampleRate::from_hz(hz);
