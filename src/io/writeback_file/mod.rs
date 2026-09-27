@@ -113,7 +113,8 @@ impl WritebackFile {
     /// by [`crate::io::bounded::bounded_syscall`] on Linux/macOS (60 s), so a wedged NFS server
     /// cannot trap the caller indefinitely; `Ok(())` is a durability barrier. Failure is
     /// [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT), [`E_HALTED`](crate::error::E_HALTED),
-    /// or [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST).
+    /// or [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST), or the OS error of a failed
+    /// chunk writeback (sticky: later writes fail with it too).
     pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(
@@ -124,12 +125,23 @@ impl WritebackFile {
             );
         }
         self.pipeline.finalize();
-        platform::durable_sync(&self.file)
+        let synced = platform::durable_sync(&self.file);
+        // A latched writeback error outranks fsync's verdict: the failed
+        // WAIT_AFTER consumed it, so fsync can return 0 over lost data.
+        match self.pipeline.error() {
+            Some(e) => Err(e),
+            None => synced,
+        }
+    }
+
+    fn check_writeback(&self) -> io::Result<()> {
+        self.pipeline.error().map_or(Ok(()), Err)
     }
 }
 
 impl Write for WritebackFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_writeback()?;
         let n = self.file.write(buf)?;
         self.pos += n as u64;
         self.pipeline.note_progress(self.pos);
@@ -137,6 +149,7 @@ impl Write for WritebackFile {
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.check_writeback()?;
         self.file.write_all(buf)?;
         self.pos += buf.len() as u64;
         self.pipeline.note_progress(self.pos);
@@ -289,6 +302,28 @@ mod tests {
         boxed.write_all(b"durable-tail").unwrap();
         boxed.finish().unwrap();
         assert_eq!(read_back(&p), b"durable-tail");
+    }
+
+    // A writeback error the pipeline latched (Linux: a failed WAIT_AFTER already
+    // consumed it, so fsync returns 0) must fail sync_all and every later write.
+    #[test]
+    fn latched_writeback_error_fails_sync_all_and_later_writes() {
+        const EIO: i32 = 5;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("wb-err.bin");
+        let mut w = WritebackFile::create(&p).unwrap();
+        w.write_all(b"chunk").unwrap();
+        w.pipeline.inject_error(EIO);
+        let e = w
+            .sync_all()
+            .expect_err("sync_all must surface the latched error");
+        assert_eq!(e.raw_os_error(), Some(EIO));
+        assert!(
+            w.write_all(b"more").is_err(),
+            "write_all after a latched error"
+        );
+        assert!(w.write(b"more").is_err(), "write after a latched error");
+        assert!(w.sync_all().is_err(), "the error is sticky");
     }
 
     // ── Added hardening tests ───────────────────────────────────────

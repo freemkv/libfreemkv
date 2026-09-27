@@ -79,6 +79,11 @@ pub fn write_image(
     })?;
     file.sync_all()
         .map_err(|source| Error::IoError { source })?;
+    // The file was just created: its directory entry needs its own fsync.
+    match dest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => crate::io::fsync::dir(dir),
+        _ => crate::io::fsync::dir(Path::new(".")),
+    }
     Ok(written)
 }
 

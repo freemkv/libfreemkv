@@ -470,7 +470,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// [`Pipeline::send`] despite the name.
     pub fn send_with_halt(&self, item: I, halt: &Halt, deadline: Duration) -> Result<(), I> {
         use crossbeam_channel::SendTimeoutError;
-        let end = Instant::now() + deadline;
+        // `None` = a deadline past `Instant`'s range (e.g. `Duration::MAX`): unbounded.
+        let end = Instant::now().checked_add(deadline);
         let mut pending = item;
         loop {
             // The consumer's `apply` failed fatally: hand the item back now, since
@@ -496,7 +497,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 return Err(pending);
             }
             let now = Instant::now();
-            if now >= end {
+            if end.is_some_and(|end| now >= end) {
                 if debug_enabled() {
                     tracing::debug!(
                         "Pipeline send_with_halt: deadline elapsed, returning item={}",
@@ -508,7 +509,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             // Wait for space-available or halt-check tick, whichever is sooner.
             // send_timeout is kernel-wakeup based: recv on a saturated channel
             // signals this thread the moment a slot opens up.
-            let slice = SEND_HALT_CHECK_INTERVAL.min(end.saturating_duration_since(now));
+            let slice = end.map_or(SEND_HALT_CHECK_INTERVAL, |end| {
+                SEND_HALT_CHECK_INTERVAL.min(end.saturating_duration_since(now))
+            });
             match self.tx.send_timeout(pending, slice) {
                 Ok(()) => return Ok(()),
                 Err(SendTimeoutError::Timeout(returned)) => {
@@ -959,6 +962,40 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "halt observation took too long: {elapsed:?}"
         );
+    }
+
+    // `Duration::MAX` (a natural "no deadline") overflowed `Instant + Duration`
+    // and panicked; it must mean unbounded, still halt-aware.
+    #[test]
+    fn send_with_halt_accepts_duration_max_as_unbounded() {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            1,
+            NeverDrainsSink {
+                cancel: cancel.clone(),
+                started: started.clone(),
+            },
+        )
+        .expect("spawn should succeed");
+        pipe.send(0u64).expect("first send hands off to consumer");
+        wait_for_started(&started, Duration::from_secs(2));
+        pipe.send(1u64).expect("second send fills the buffer");
+
+        let halt = crate::halt::Halt::new();
+        let halt2 = halt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            halt2.cancel();
+        });
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pipe.send_with_halt(7u64, &halt, Duration::MAX)
+        }));
+
+        cancel.store(true, Ordering::SeqCst);
+        let _ = pipe.finish();
+        let res = res.expect("Duration::MAX must not panic");
+        assert!(matches!(res, Err(7)), "expected item returned on halt");
     }
 
     #[test]

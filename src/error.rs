@@ -474,7 +474,8 @@ pub enum Error {
     /// The image a mapfile describes is shorter than the mapfile's own total
     /// size, so the two no longer agree about the same disc. Resuming against
     /// it would treat the absent tail as already recovered. `have` and `want`
-    /// are byte lengths; a missing file reports `have == 0`.
+    /// are byte lengths; a missing file reports `have == 0`. Also returned
+    /// when an image read ends past EOF (`want` = the read's end offset).
     ImageTruncated {
         have: u64,
         want: u64,
