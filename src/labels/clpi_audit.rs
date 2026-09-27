@@ -1,8 +1,9 @@
 //! CLPI vs MPLS cross-validation diagnostic.
 //!
-//! Walks per-clip CLPI program info and per-playlist MPLS STN tables, keys streams by
-//! `(clip, PID)` — a PID is only unique within one clip's transport stream — keeping the
-//! first `(coding_type, language)` seen per source, then classifies each key as CLPI-only,
+//! Walks per-clip CLPI program info and per-playlist MPLS STN tables (an STN entry
+//! applies to every clip the playlist plays), keys streams by `(clip, PID)` — a PID is
+//! only unique within one clip's transport stream — keeping the first
+//! `(coding_type, language)` seen per source, then classifies each key as CLPI-only,
 //! MPLS-only, Match, or Divergent.
 //!
 //! [`audit`] returns [`ClpiVsMplsAudit`]; diagnostic only, not used by
@@ -127,20 +128,17 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
         }
     }
 
-    // MPLS: the STN table describes the first play item's clip.
+    // MPLS: the STN table covers every clip the playlist plays.
     let mut mpls_by_key: BTreeMap<(String, u16), (u8, String)> = BTreeMap::new();
     for (_, data) in read_dir_files(reader, udf, "/BDMV/PLAYLIST", ".mpls") {
         let Ok(pl) = crate::mpls::parse(&data) else {
             continue;
         };
-        let Some(clip_id) = pl.play_items.first().map(|pi| pi.clip_id.clone()) else {
-            continue;
-        };
-        for s in pl.streams {
-            if s.pid != 0 {
+        for pi in &pl.play_items {
+            for s in pl.streams.iter().filter(|s| s.pid != 0) {
                 mpls_by_key
-                    .entry((clip_id.clone(), s.pid))
-                    .or_insert((s.coding_type, s.language));
+                    .entry((pi.clip_id.clone(), s.pid))
+                    .or_insert_with(|| (s.coding_type, s.language.clone()));
             }
         }
     }
@@ -429,8 +427,13 @@ mod tests {
     // Minimal MPLS: one play item on `clip` whose STN lists one primary audio
     // stream `(pid, coding_type, lang)`.
     fn build_mpls(clip: &[u8; 5], pid: u16, coding: u8, lang: &[u8; 3]) -> Vec<u8> {
+        build_mpls_items(&[clip], pid, coding, lang)
+    }
+
+    // As `build_mpls`, over several play items (STN on the first, as parsed).
+    fn build_mpls_items(clips: &[&[u8; 5]], pid: u16, coding: u8, lang: &[u8; 3]) -> Vec<u8> {
         let mut item = Vec::new();
-        item.extend_from_slice(clip);
+        item.extend_from_slice(clips[0]);
         item.extend_from_slice(b"M2TS");
         item.extend_from_slice(&[0u8; 3]);
         item.extend_from_slice(&0u32.to_be_bytes());
@@ -443,10 +446,20 @@ mod tests {
         stn.extend_from_slice(lang);
         item.extend_from_slice(&stn);
         let mut pl = vec![0u8; 6];
-        pl.extend_from_slice(&1u16.to_be_bytes());
+        pl.extend_from_slice(&(clips.len() as u16).to_be_bytes());
         pl.extend_from_slice(&[0u8; 2]);
         pl.extend_from_slice(&(item.len() as u16).to_be_bytes());
         pl.extend_from_slice(&item);
+        for clip in &clips[1..] {
+            let mut more = clip.to_vec();
+            more.extend_from_slice(b"M2TS");
+            more.extend_from_slice(&[0u8; 3]);
+            more.extend_from_slice(&0u32.to_be_bytes());
+            more.extend_from_slice(&(60u32 * 45000).to_be_bytes());
+            more.extend_from_slice(&[0u8; 12]);
+            pl.extend_from_slice(&(more.len() as u16).to_be_bytes());
+            pl.extend_from_slice(&more);
+        }
         let pl_len = (pl.len() - 4) as u32;
         pl[0..4].copy_from_slice(&pl_len.to_be_bytes());
         let mut buf = b"MPLS0200".to_vec();
@@ -516,5 +529,54 @@ mod tests {
 
         let a = audit(&mut disc, &udf);
         assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
+    }
+
+    // A playlist's STN covers every clip it plays, not only the first.
+    #[test]
+    fn mpls_streams_are_keyed_by_every_play_item_clip() {
+        use crate::consts::coding_type as c;
+        use crate::udf::fixture::*;
+        let build_clpi = super::super::clpi_orphan_tests::build_clpi;
+        let dir = |name: &str, icb: u32, files| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs: vec![],
+        };
+        let clpi = || build_clpi(&[(0x1100, c::TRUEHD, "eng")]);
+        let clipinf = dir(
+            "CLIPINF",
+            24,
+            vec![
+                file_with("00001.clpi", 26, 8000, clpi(), false),
+                file_with("00002.clpi", 27, 8100, clpi(), false),
+            ],
+        );
+        let mpls = build_mpls_items(&[b"00001", b"00002"], 0x1100, c::TRUEHD, b"eng");
+        let playlist = dir(
+            "PLAYLIST",
+            30,
+            vec![file_with("00800.mpls", 32, 8200, mpls, false)],
+        );
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![clipinf, playlist],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let a = audit(&mut disc, &udf);
+        assert_eq!(a.class_counts(), (0, 0, 2, 0), "{:?}", a.rows);
     }
 }
