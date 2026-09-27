@@ -77,8 +77,9 @@ fn finish_with_grace<R: Send + 'static>(
     grace: Duration,
     leak_err: Error,
 ) -> Result<R, Error> {
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
+    // `None` = a grace past `Instant`'s range: wait unbounded.
+    let deadline = Instant::now().checked_add(grace);
+    while deadline.is_none_or(|d| Instant::now() < d) {
         if handle.is_finished() {
             return match handle.join() {
                 Ok(result) => result,
@@ -105,8 +106,8 @@ fn finish_with_grace<R: Send + 'static>(
             "pipeline consumer had already committed to finalising the output; \
              waiting for it rather than reporting an unfinalised output"
         );
-        let close_deadline = Instant::now() + grace;
-        while Instant::now() < close_deadline {
+        let close_deadline = Instant::now().checked_add(grace);
+        while close_deadline.is_none_or(|d| Instant::now() < d) {
             if handle.is_finished() {
                 return match handle.join() {
                     Ok(result) => result,
@@ -604,6 +605,17 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An overflowing grace (`Duration::MAX`) must not panic `Instant + Duration`.
+    #[test]
+    fn finish_with_grace_accepts_duration_max() {
+        let handle = thread::spawn(|| Ok::<u32, Error>(3));
+        let state = Arc::new(AtomicU8::new(state::RUNNING));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finish_with_grace(handle, &state, Duration::MAX, Error::Halted)
+        }));
+        assert!(matches!(r.expect("must not panic"), Ok(3)));
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};

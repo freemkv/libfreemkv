@@ -7,6 +7,9 @@
 //! NFS writes) where a cooperative [`Halt`] can't interrupt. The worker thread is leaked on
 //! timeout or halt.
 
+// Only the Linux/macOS writeback paths call this; Windows has no bounded syscall yet.
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,11 +64,13 @@ where
             let _ = tx.send(op());
         });
 
-    let deadline = Instant::now() + timeout;
+    // `None` = a timeout past `Instant`'s range: unbounded.
+    let deadline = Instant::now().checked_add(timeout);
     loop {
         let now = Instant::now();
-        let remaining = deadline.saturating_duration_since(now);
-        let slice = remaining.min(POLL_INTERVAL);
+        let slice = deadline.map_or(POLL_INTERVAL, |d| {
+            d.saturating_duration_since(now).min(POLL_INTERVAL)
+        });
         match rx.recv_timeout(slice) {
             Ok(v) => return Ok(v),
             Err(RecvTimeoutError::Timeout) => {
@@ -74,7 +79,7 @@ where
                 {
                     return Err(BoundedError::Halted);
                 }
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
                     return Err(BoundedError::Timeout);
                 }
                 // Otherwise: another slice.
@@ -94,6 +99,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    // `Duration::MAX` overflowed `Instant + Duration` and panicked; it means unbounded.
+    #[test]
+    fn duration_max_timeout_is_unbounded_not_a_panic() {
+        let r = bounded_syscall(None, Duration::MAX, || 7u32);
+        assert!(matches!(r, Ok(7)));
+    }
 
     #[test]
     fn op_completes_quickly() {
