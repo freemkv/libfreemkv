@@ -380,6 +380,17 @@ impl Stream for PipelinedPesStream {
         &self.title
     }
 
+    fn config_changes(&self) -> Vec<(usize, u64)> {
+        self.pid_to_track
+            .iter()
+            .filter_map(|&(pid, track)| {
+                let (_, parser) = self.parsers.iter().find(|(p, _)| *p == pid)?;
+                let n = parser.config_changes();
+                (n > 0).then_some((track, n))
+            })
+            .collect()
+    }
+
     fn headers_ready(&self) -> bool {
         // Match DiscStream semantics: video tracks need codec_private before the
         // consumer can write the container header. FREEMKV_SKIP_PARSE forces ready
@@ -1125,6 +1136,24 @@ mod tests {
         assert_eq!(stream.read().unwrap().map(|f| f.track), Some(1));
         assert!(stream.headers_ready());
         assert_eq!(stream.codec_private(1), Some(vec![0x12, 0x10]));
+    }
+
+    // A mid-stream AAC config change must be visible per track, not only in
+    // the parser.
+    #[test]
+    fn mid_stream_aac_config_change_is_reported_per_track() {
+        let (mut stream, tx) = video_plus_aac();
+        let mut surround = adts(16);
+        surround[2] |= 1; // channel_configuration = 6
+        surround[3] = (surround[3] & 0x3F) | (2 << 6);
+        tx.send(DemuxBatch::Ts(vec![
+            pes_at(0x1100, adts(16), 0),
+            pes_at(0x1100, surround, 1920),
+        ]))
+        .unwrap();
+        assert!(stream.read().unwrap().is_some());
+        assert!(stream.read().unwrap().is_some());
+        assert_eq!(stream.config_changes(), vec![(1, 1)]);
     }
 
     #[test]

@@ -8,16 +8,25 @@ use crate::pes::PesFrame;
 const AAC_CONFIG_WAIT_NS: i64 = 5_000_000_000;
 // Larger PTS steps are discontinuities/wraps, not elapsed time.
 const MAX_PTS_STEP_NS: i64 = 1_000_000_000;
-// Backstops for sources whose PTS never advances, well inside the driver's cap.
+// Backstops, well inside the driver's cap: per-track frames that did not
+// advance PTS (a stuck clock), and total buffered bytes.
 const AAC_CONFIG_WAIT_FRAMES: u32 = 2048;
 const AAC_CONFIG_WAIT_BYTES: usize = super::driver::HEADER_BUFFER_CAP_BYTES / 2;
+
+// One track's view of source time, so interleaved tracks far apart in PTS
+// neither rebase nor double-count each other.
+#[derive(Debug)]
+struct TrackClock {
+    track: usize,
+    max_pts: i64,
+    elapsed_ns: i64,
+    stalled: u32,
+}
 
 /// Tracks how long the header pump has waited on in-band codec configs.
 #[derive(Debug, Default)]
 pub(crate) struct HeaderGate {
-    max_pts: Option<i64>,
-    elapsed_ns: i64,
-    frames: u32,
+    clocks: Vec<TrackClock>,
     bytes: usize,
     expired: bool,
 }
@@ -25,29 +34,39 @@ pub(crate) struct HeaderGate {
 impl HeaderGate {
     /// Account for a frame handed to the caller.
     pub(crate) fn observe(&mut self, frame: &PesFrame) {
-        self.account(frame.pts, frame.data.len());
+        self.account(frame.track, frame.pts, frame.data.len());
     }
 
-    // Elapsed time sums plausible forward PTS steps past the highest PTS seen:
-    // small backward steps are reordering; large steps either way rebase.
-    fn account(&mut self, pts: i64, bytes: usize) {
-        self.frames = self.frames.saturating_add(1);
+    // Per track, elapsed time sums plausible forward PTS steps past the highest
+    // PTS seen: small backward steps are reordering; large steps either way rebase.
+    fn account(&mut self, track: usize, pts: i64, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes);
-        match self.max_pts {
-            None => self.max_pts = Some(pts),
-            Some(max) => {
-                let step = pts.saturating_sub(max);
-                if step > 0 && step <= MAX_PTS_STEP_NS {
-                    self.elapsed_ns = self.elapsed_ns.saturating_add(step);
-                    self.max_pts = Some(pts);
-                } else if step.saturating_abs() > MAX_PTS_STEP_NS {
-                    self.max_pts = Some(pts);
-                }
+        let clock = match self.clocks.iter().position(|c| c.track == track) {
+            Some(i) => &mut self.clocks[i],
+            None => {
+                self.clocks.push(TrackClock {
+                    track,
+                    max_pts: pts,
+                    elapsed_ns: 0,
+                    stalled: 0,
+                });
+                let last = self.clocks.len() - 1;
+                &mut self.clocks[last]
+            }
+        };
+        let step = pts.saturating_sub(clock.max_pts);
+        if step > 0 && step <= MAX_PTS_STEP_NS {
+            clock.elapsed_ns = clock.elapsed_ns.saturating_add(step);
+            clock.max_pts = pts;
+        } else {
+            clock.stalled = clock.stalled.saturating_add(1);
+            if step.saturating_abs() > MAX_PTS_STEP_NS {
+                clock.max_pts = pts;
             }
         }
-        if self.frames >= AAC_CONFIG_WAIT_FRAMES
+        if clock.stalled >= AAC_CONFIG_WAIT_FRAMES
+            || clock.elapsed_ns >= AAC_CONFIG_WAIT_NS
             || self.bytes >= AAC_CONFIG_WAIT_BYTES
-            || self.elapsed_ns >= AAC_CONFIG_WAIT_NS
         {
             self.expired = true;
         }
@@ -111,10 +130,10 @@ mod tests {
     fn frame_count_backstop_expires_when_pts_never_advances() {
         let mut g = HeaderGate::default();
         for _ in 0..AAC_CONFIG_WAIT_FRAMES - 1 {
-            g.account(0, 0);
+            g.account(0, 0, 0);
         }
         assert!(waiting(&g));
-        g.account(0, 0);
+        g.account(0, 0, 0);
         assert!(!waiting(&g), "backstop reached");
     }
 
@@ -124,7 +143,7 @@ mod tests {
     fn elapsed_time_survives_a_pts_backstep() {
         let mut g = HeaderGate::default();
         for pts in [0, S, 2 * S, 3 * S, S / 100, S + S / 100, 2 * S + S / 100] {
-            g.account(pts, 0);
+            g.account(0, pts, 0);
         }
         assert!(!waiting(&g));
     }
@@ -134,7 +153,7 @@ mod tests {
     fn a_forward_pts_jump_is_not_counted_as_waiting_time() {
         let mut g = HeaderGate::default();
         for pts in [0, S, 100 * S, 101 * S] {
-            g.account(pts, 0);
+            g.account(0, pts, 0);
         }
         assert!(waiting(&g));
     }
@@ -149,17 +168,48 @@ mod tests {
             pts.extend([b + S, b + S / 3, b + 2 * S / 3]);
         }
         for p in pts {
-            g.account(p, 0);
+            g.account(0, p, 0);
         }
-        assert!(waiting(&g), "about 4 s of content, not 5+");
+        assert!(waiting(&g), "PTS 1 s -> 4 s is 3 s of content, not 5+");
+    }
+
+    // Two dense tracks 1.2 s apart in PTS, muxed in bursts: 3 s of content
+    // must count as 3 s, not the sum over both tracks.
+    #[test]
+    fn interleaved_tracks_far_apart_in_pts_do_not_double_count() {
+        let mut g = HeaderGate::default();
+        let step = S / 25;
+        for burst in 0..7i64 {
+            for i in 0..10 {
+                let t = (burst * 10 + i) * step;
+                g.account(0, S + S / 5 + t, 0);
+            }
+            for i in 0..10 {
+                let t = (burst * 10 + i) * step;
+                g.account(1, t, 0);
+            }
+        }
+        assert!(waiting(&g), "about 2.8 s of content per track");
+    }
+
+    // A high-rate track (TrueHD, ~1200 frames/s) advancing normally is not a
+    // stuck-PTS source: 2 s of it must not trip the frame backstop.
+    #[test]
+    fn high_frame_rate_track_does_not_trip_the_frame_backstop() {
+        let mut g = HeaderGate::default();
+        let step = S / 1200;
+        for i in 0..2400 {
+            g.account(0, i * step, 0);
+        }
+        assert!(waiting(&g));
     }
 
     #[test]
     fn byte_bound_expires_before_the_driver_cap() {
         let mut g = HeaderGate::default();
-        g.account(0, AAC_CONFIG_WAIT_BYTES - 1);
+        g.account(0, 0, AAC_CONFIG_WAIT_BYTES - 1);
         assert!(waiting(&g));
-        g.account(0, 1);
+        g.account(0, 0, 1);
         assert!(!waiting(&g));
     }
 

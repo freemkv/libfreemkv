@@ -76,16 +76,13 @@ impl AdtsParser {
     pub fn dropped_duration_ns(&self) -> u64 {
         self.frames.dropped_duration_ns()
     }
-    /// Frames whose ADTS config differs from the track's first (kept) config.
-    pub fn config_changes(&self) -> u64 {
-        self.config_changes
-    }
 }
 
 impl CodecParser for AdtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         let config = &mut self.config;
         let changes = &mut self.config_changes;
+        let pid = pes.pid;
         self.frames.parse(pes, 7, |data| {
             if !matches!(adts_verdict(data), AdtsVerdict::Valid) {
                 return None;
@@ -104,7 +101,7 @@ impl CodecParser for AdtsParser {
                 None => *config = Some(asc.to_vec()),
                 Some(first) if first[..] != asc => {
                     if *changes == 0 {
-                        tracing::warn!(target: "mux", "AAC config changed mid-stream; keeping the first");
+                        tracing::warn!(target: "mux", pid, "AAC config changed mid-stream; keeping the first");
                     }
                     *changes += 1;
                 }
@@ -126,6 +123,9 @@ impl CodecParser for AdtsParser {
     }
     fn codec_private(&self) -> Option<Vec<u8>> {
         self.config.clone()
+    }
+    fn config_changes(&self) -> u64 {
+        self.config_changes
     }
 }
 

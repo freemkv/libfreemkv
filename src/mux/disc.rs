@@ -994,6 +994,17 @@ impl crate::pes::Stream for DiscStream {
             .and_then(|(_, parser)| parser.codec_private())
     }
 
+    fn config_changes(&self) -> Vec<(usize, u64)> {
+        self.pid_to_track
+            .iter()
+            .filter_map(|&(pid, track)| {
+                let (_, parser) = self.parsers.iter().find(|(p, _)| *p == pid)?;
+                let n = parser.config_changes();
+                (n > 0).then_some((track, n))
+            })
+            .collect()
+    }
+
     fn headers_ready(&self) -> bool {
         // FREEMKV_SKIP_PARSE bypasses codec parsers entirely, so
         // codec_private is never populated — pretend headers are ready

@@ -118,6 +118,11 @@ pub trait CodecParser: Send {
     /// Get codec initialization data (e.g., SPS+PPS for H.264).
     /// Returns None until enough data has been seen.
     fn codec_private(&self) -> Option<Vec<u8>>;
+
+    /// Frames whose in-band config differs from the kept first config.
+    fn config_changes(&self) -> u64 {
+        0
+    }
 }
 
 /// Passthrough parser — treats each PES as one frame, no parsing.

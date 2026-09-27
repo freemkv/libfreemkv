@@ -764,6 +764,15 @@ fn drive_mux(
         );
     }
 
+    for (track, frames) in stream.config_changes() {
+        tracing::warn!(
+            target: "mux",
+            track,
+            frames,
+            "in-band codec config changed mid-track; those frames keep the first config"
+        );
+    }
+
     if !mux_run_completed(interrupted, finalize_failed, halt.is_cancelled()) {
         return Ok(MuxOutcome {
             completed: false,

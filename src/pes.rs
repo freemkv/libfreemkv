@@ -246,6 +246,13 @@ pub trait Stream: Send {
         true
     }
 
+    /// `(track, frames)` for tracks whose in-band codec config changed after
+    /// the track header was fixed (e.g. AAC stereo↔5.1); those frames keep the
+    /// first config. Empty when none.
+    fn config_changes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
     /// Cumulative count of read errors the stream skipped past (e.g.
     /// zero-filled bad sectors on a live drive). Default `0` for
     /// streams that don't have a notion of skip-on-error (file ISO,
@@ -343,6 +350,10 @@ impl Stream for CountingStream {
 
     fn headers_ready(&self) -> bool {
         self.inner.headers_ready()
+    }
+
+    fn config_changes(&self) -> Vec<(usize, u64)> {
+        self.inner.config_changes()
     }
 
     fn errors(&self) -> u64 {
