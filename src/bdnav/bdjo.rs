@@ -347,7 +347,7 @@ mod tests {
             // application_name: data_length(16) + bytes, word-aligned (pad when odd).
             b.extend_from_slice(&(x.name_bytes as u16).to_be_bytes());
             b.extend(std::iter::repeat_n(b'n', x.name_bytes));
-            if x.name_bytes % 2 == 1 {
+            if !x.name_bytes.is_multiple_of(2) {
                 b.push(0);
             }
             // icon_locator (empty word-aligned string): len=0 + pad
@@ -359,7 +359,7 @@ mod tests {
             // application_parameters: data_length(8) + bytes, word-aligned (pad when even).
             b.push(x.param_bytes as u8);
             b.extend(std::iter::repeat_n(b'p', x.param_bytes));
-            if x.param_bytes % 2 == 0 {
+            if x.param_bytes.is_multiple_of(2) {
                 b.push(0);
             }
         }
