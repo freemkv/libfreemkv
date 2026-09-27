@@ -69,22 +69,21 @@ pub fn crack_key(
     crack_key_scan(reader, extents, batch_sectors, None).into_state()
 }
 
-/// Outcome of a CSS crack scan: distinguishes the THREE cases a bare `Option<CssState>`
-/// conflated.
+/// Outcome of a CSS crack scan. Only `Unencrypted` lets a caller treat the data as
+/// clear; every other non-`Cracked` outcome MUST hard-error.
 ///
-/// - [`CrackOutcome::Cracked`] — a scrambled sector yielded a title key.
-/// - [`CrackOutcome::Unencrypted`] — no scrambled sector was seen; genuinely
-///   plaintext.
-/// - [`CrackOutcome::ScrambledUncracked`] — scrambled sectors seen, or no sector
-///   could be read at all, and no key recovered; callers MUST hard-error, never
-///   fall through.
-/// - [`CrackOutcome::Halted`] — the scan was cancelled (halt token or a read
-///   returning `Halted`); a truncated scan is no verdict.
-#[derive(Debug, Clone)]
+/// - `Cracked` — a scrambled sector yielded a title key.
+/// - `Unencrypted` — sectors were read and none was scrambled.
+/// - `ScrambledUncracked` — scrambled (or CSS-locked) sectors, no key recovered.
+/// - `Unreadable` — no sector could be read; carries the first read error.
+/// - `Halted` — cancelled by the halt token or a read returning `Halted`.
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum CrackOutcome {
     Cracked(CssState),
     Unencrypted,
     ScrambledUncracked,
+    Unreadable(crate::error::Error),
     Halted,
 }
 
@@ -145,14 +144,7 @@ pub(crate) fn resolve_dvd_title_key(
     {
         // `halt` threads the caller's cancellation token so /api/stop can
         // interrupt a long crack scan (the old scan-time crack honored it too).
-        let outcome = crack_key_outcome(reader, extents, batch_sectors, halt);
-        // A cancelled crack's outcome is a TRUNCATED scan, not a real verdict —
-        // surface it as `Halted` rather than trusting a partial `Unencrypted`
-        // or `ScrambledUncracked` and taking the wrong path.
-        if matches!(outcome, CrackOutcome::Halted) || halt.is_some_and(|h| h.is_cancelled()) {
-            return Err(crate::error::Error::Halted.into());
-        }
-        match outcome {
+        match crack_key_outcome(reader, extents, batch_sectors, halt) {
             CrackOutcome::Cracked(state) => {
                 *keys = crate::decrypt::DecryptKeys::Css {
                     title_key: state.title_key,
@@ -161,7 +153,10 @@ pub(crate) fn resolve_dvd_title_key(
             CrackOutcome::ScrambledUncracked => {
                 return Err(crate::error::Error::CssKeyMissing.into());
             }
-            CrackOutcome::Unencrypted | CrackOutcome::Halted => {}
+            CrackOutcome::Unreadable(e) => return Err(e.into()),
+            // A cancelled crack is a TRUNCATED scan, not a verdict.
+            CrackOutcome::Halted => return Err(crate::error::Error::Halted.into()),
+            CrackOutcome::Unencrypted => {}
         }
     }
     Ok(())
@@ -203,6 +198,7 @@ fn crack_key_scan(
     let mut consecutive_locked = 0u32;
     // Sectors actually inspected: zero means no verdict (never Unencrypted).
     let mut inspected = 0u32;
+    let mut first_err: Option<crate::error::Error> = None;
 
     'outer: for (extent_idx, ext) in extents.iter().enumerate() {
         let mut i = 0u32;
@@ -270,11 +266,11 @@ fn crack_key_scan(
                         }
                     }
                 }
+                // A drive-level Stop ends the scan now — it is not a failed batch.
+                Err(crate::error::Error::Halted) => return CrackOutcome::Halted,
                 // A failed batch still counts toward the budget so a damaged
                 // region can't loop forever. A CSS-locked failure proves
                 // encryption; a long enough run means the gate is shut.
-                // A drive-level Stop ends the scan now — it is not a failed batch.
-                Err(crate::error::Error::Halted) => return CrackOutcome::Halted,
                 Err(e) => {
                     tried += n;
                     if e.scsi_sense().is_some_and(|s| s.is_css_locked()) {
@@ -285,6 +281,7 @@ fn crack_key_scan(
                         }
                     } else {
                         consecutive_locked = 0;
+                        first_err.get_or_insert(e);
                     }
                 }
             }
@@ -292,11 +289,13 @@ fn crack_key_scan(
         }
     }
 
-    // ENCRYPTED-but-uncracked (hard failure) if a scrambled sector was seen, every
-    // read was CSS-locked, or nothing at all could be inspected (no verdict: fail
-    // closed). Only a scan that READ sectors and saw no scramble is unencrypted.
-    if saw_scrambled || saw_locked || (inspected == 0 && tried > 0) {
+    // ENCRYPTED-but-uncracked if a scrambled sector was seen or reads were
+    // CSS-locked. Nothing inspected is no verdict: fail closed with the read error
+    // (else as uncracked). Only a scan that READ sectors and saw no scramble is clear.
+    if saw_scrambled || saw_locked {
         CrackOutcome::ScrambledUncracked
+    } else if inspected == 0 && tried > 0 {
+        first_err.map_or(CrackOutcome::ScrambledUncracked, CrackOutcome::Unreadable)
     } else {
         CrackOutcome::Unencrypted
     }
@@ -925,8 +924,8 @@ mod tests {
         }];
         let outcome = crack_key_outcome(&mut src, &extents, 1, None);
         assert!(
-            outcome.is_scrambled_uncracked(),
-            "nothing inspected → fail closed, got {outcome:?}"
+            matches!(&outcome, CrackOutcome::Unreadable(e) if e.code() == Error::DecryptFailed.code()),
+            "nothing inspected → fail closed with the first read error, got {outcome:?}"
         );
     }
 

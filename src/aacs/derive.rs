@@ -318,10 +318,8 @@ pub(crate) fn resolve_dk_node(
     uv: u32,
     u_mask_shift: u8,
 ) -> Option<DeviceKey> {
-    // `u_mask_shift` is disc/keydb-controlled: `1u32 << b` with b >= 32 panics
-    // (debug) / wraps (release), so cap the search at the 32 real u32 bit positions
-    // (same >= 32 guard the mask shifts above use) — a bad disc can't trip the shift.
-    // Tables located once, not re-walked and re-copied per candidate node.
+    // `u_mask_shift` is disc/keydb-controlled: cap at the 32 real u32 bit positions
+    // so `1u32 << b` can't overflow. Tables are located once, not per candidate node.
     let tables = MkbTables::parse(mkb);
     for b in 0..u_mask_shift.min(32) {
         let dk = DeviceKey {

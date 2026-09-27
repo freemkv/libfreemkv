@@ -444,8 +444,8 @@ pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> 
 type SourceOp = fn(&dyn KeySource, &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error>;
 
 // Drive `sources` in order: the first non-empty set `accept`ed wins. When none wins,
-// `Err` = the FIRST source failure (must not be cached, must not read as key-missing),
-// empty `Ok` = a genuine absence.
+// `Err` = the FIRST source failure, else `AacsKeyRejected` if keys were produced but
+// none accepted (neither is cached); empty `Ok` = a genuine absence.
 fn drive_sources(
     sources: &[Box<dyn KeySource>],
     ctx: &dyn ResolveCtx,
@@ -453,16 +453,22 @@ fn drive_sources(
     accept: &dyn Fn(&[UnitKey]) -> bool,
 ) -> Result<Vec<UnitKey>, Error> {
     let mut failure: Option<Error> = None;
+    let mut rejected = false;
     for source in sources {
         match op(source.as_ref(), ctx) {
-            Ok(uks) if !uks.is_empty() && accept(&uks) => return Ok(uks),
-            Ok(_) => {}
+            Ok(uks) if uks.is_empty() => {}
+            Ok(uks) if accept(&uks) => return Ok(uks),
+            Ok(_) => rejected = true,
             Err(e) => {
                 failure.get_or_insert(e);
             }
         }
     }
-    failure.map_or(Ok(Vec::new()), Err)
+    match failure {
+        Some(e) => Err(e),
+        None if rejected => Err(Error::AacsKeyRejected),
+        None => Ok(Vec::new()),
+    }
 }
 
 // Base Unit Keys, validated against the ctx's samples (see [`keys_open_samples`]).
@@ -487,6 +493,7 @@ fn drive_fmts_indexes(
 
 // Does any key open any still-encrypted sample? The read-time ctx carries no content
 // format, so each sample is judged under both; no encrypted sample ⇒ nothing to disprove.
+// Callers must pass only samples already filtered by the REAL format's encrypted flag.
 fn keys_open_samples(keys: &[UnitKey], samples: &[Vec<u8>]) -> bool {
     use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_unit, is_clean};
     use crate::disc::ContentFormat;
@@ -1548,6 +1555,29 @@ mod tests {
         let code = Error::KeyServiceUnavailable.code();
         assert_eq!(cb.unit_keys(&s).expect_err("unit op").code(), code);
         assert_eq!(cb.fmts_indexes(&s).expect_err("fmts op").code(), code);
+    }
+
+    // Every source produced keys, none opens the samples: that is a rejection
+    // (AacsKeyRejected), not a quiet "no key" — and it is not memoized.
+    #[test]
+    fn key_fetch_reports_all_rejected_keys_and_does_not_cache_it() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_c = Arc::clone(&calls);
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> = Arc::new(move || {
+            *calls_c.lock().unwrap() += 1;
+            vec![Box::new(HasKey([0x99; 16])) as Box<dyn KeySource>]
+        });
+        let cb = key_fetch(empty_inputs(), make);
+        let samples = vec![encrypted_unit(&[0x21; 16])];
+        for _ in 0..2 {
+            let err = cb.unit_keys(&samples).expect_err("wrong key");
+            assert_eq!(err.code(), Error::AacsKeyRejected.code());
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "a rejection is re-asked, not cached"
+        );
     }
 
     // HD DVD: `unit_key_ro` carries a VTKF (DVD_HD_V_TKF); the ctx must parse it

@@ -320,6 +320,7 @@ impl Disc {
             // the whole extract rather than reusing the wrong key silently.
             crate::css::CrackOutcome::ScrambledUncracked => Err(Error::CssKeyMissing),
             crate::css::CrackOutcome::Halted => Err(Error::Halted),
+            crate::css::CrackOutcome::Unreadable(e) => Err(e),
         }
     }
 }

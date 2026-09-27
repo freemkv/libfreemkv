@@ -1854,7 +1854,7 @@ impl Disc {
             let main_extents = Self::image_crack_extents(&disc.titles).to_vec();
             if !main_extents.is_empty() {
                 // Image reads aren't drive-batch-limited; use a generous batch.
-                match crate::css::crack_key_outcome(reader, &main_extents, 32, None) {
+                match crate::css::crack_key_outcome(reader, &main_extents, 32, opts.halt.as_ref()) {
                     crate::css::CrackOutcome::Cracked(state) => {
                         tracing::info!(target: "freemkv::scan", "image css: title key recovered via known-plaintext crack");
                         disc.css = Some(state);
@@ -1869,10 +1869,10 @@ impl Disc {
                         disc.css_error = Some(crate::error::Error::CssKeyMissing);
                     }
                     crate::css::CrackOutcome::Unencrypted => {}
-                    // A Stop mid-scan: no verdict, never "clear".
-                    crate::css::CrackOutcome::Halted => {
-                        disc.css_error = Some(crate::error::Error::Halted);
-                    }
+                    // A Stop mid-scan, or nothing readable: no verdict, so no scan
+                    // result — report the Stop / read fault itself.
+                    crate::css::CrackOutcome::Halted => return Err(Error::Halted),
+                    crate::css::CrackOutcome::Unreadable(e) => return Err(e),
                 }
             }
         }
@@ -2838,22 +2838,25 @@ impl Disc {
     /// PLAYBACK ORDER (never largest-cell-first, the 1.5.1 bug). The crack path does NOT gate
     /// on `self.css`, so a detection miss can never route the mux into raw passthrough of
     /// scrambled sectors. Non-DVD schemes return [`Self::decrypt_keys`] unchanged.
+    /// `halt` cancels the crack. `Err` is a crack that reached no verdict: `Halted`,
+    /// or the read error when no sector could be read.
     pub fn decrypt_keys_for_title(
         &self,
         idx: usize,
         reader: &mut dyn SectorSource,
         batch_sectors: u16,
-    ) -> (crate::decrypt::DecryptKeys, bool) {
+        halt: Option<&crate::halt::Halt>,
+    ) -> Result<(crate::decrypt::DecryptKeys, bool)> {
         // Non-DVD (AACS / FMTS / genuinely unencrypted): disc-wide keys, unchanged.
         if self.format != DiscFormat::Dvd {
-            return (self.decrypt_keys(), false);
+            return Ok((self.decrypt_keys(), false));
         }
         let title = match self.titles.get(idx) {
             Some(t) if !t.extents.is_empty() => t,
             // No extents to crack from: mark it clear (`true`). Returning `false`
             // would let the gate's "None keys + not clear = scrambled-uncracked"
             // rule wrongly hard-fail a genuinely-unencrypted extentless title.
-            _ => return (self.decrypt_keys(), true),
+            _ => return Ok((self.decrypt_keys(), true)),
         };
         // Fast path: reuse the scan's cracked key if its span covers this title's
         // VTS. `crack_span: None` (unknown provenance) is treated as covering.
@@ -2866,31 +2869,35 @@ impl Disc {
                     .any(|e| e.start_lba < ce && cs < e.start_lba.saturating_add(e.sector_count)),
             };
             if covers {
-                return (
+                return Ok((
                     crate::decrypt::DecryptKeys::Css {
                         title_key: css.title_key,
                     },
                     false,
-                );
+                ));
             }
         }
         // Detection miss or different VTS: crack this title's own extents in a
         // SINGLE scan, in playback order (never largest-cell-first — the 1.5.1
         // garbage bug). One call, so a locked title isn't re-hammered (rule #2).
-        match crate::css::crack_key_outcome(reader, &title.extents, batch_sectors, None) {
-            crate::css::CrackOutcome::Cracked(state) => (
-                crate::decrypt::DecryptKeys::Css {
-                    title_key: state.title_key,
-                },
-                false,
-            ),
-            // Scrambled but no key recoverable (or a Stop mid-scan) → hard failure.
-            crate::css::CrackOutcome::ScrambledUncracked | crate::css::CrackOutcome::Halted => {
-                (crate::decrypt::DecryptKeys::None, false)
-            }
-            // No scrambled sector anywhere in the whole title → genuinely clear.
-            crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
-        }
+        Ok(
+            match crate::css::crack_key_outcome(reader, &title.extents, batch_sectors, halt) {
+                crate::css::CrackOutcome::Cracked(state) => (
+                    crate::decrypt::DecryptKeys::Css {
+                        title_key: state.title_key,
+                    },
+                    false,
+                ),
+                // Scrambled but no key recoverable → hard failure.
+                crate::css::CrackOutcome::ScrambledUncracked => {
+                    (crate::decrypt::DecryptKeys::None, false)
+                }
+                // No scrambled sector anywhere in the whole title → genuinely clear.
+                crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
+                crate::css::CrackOutcome::Unreadable(e) => return Err(e),
+                crate::css::CrackOutcome::Halted => return Err(Error::Halted),
+            },
+        )
     }
 
     /// Per-title decrypt gate that honours the `title_is_clear` verdict from
@@ -2988,6 +2995,32 @@ impl Disc {
                 }
             },
         })
+    }
+
+    /// [`Self::inputs`] with `samples` filled: up to `n` encrypted units read via
+    /// `reader` from the main feature, so a key source's answer can be validated
+    /// against real ciphertext. `None` for a disc with no AACS inputs.
+    pub fn inputs_with_samples(
+        &self,
+        reader: &mut dyn SectorSource,
+        n: usize,
+    ) -> Option<crate::keysource::DiscInputs> {
+        let mut inputs = self.inputs()?;
+        inputs.samples = self.content_samples(reader, n);
+        Some(inputs)
+    }
+
+    // Encrypted sample units from the LARGEST title that HAS video (the main feature
+    // carries the most units, and skips size-inflated streamless decoys on some
+    // obfuscated UHDs); the largest title outright when none has video.
+    pub(crate) fn content_samples(&self, reader: &mut dyn SectorSource, n: usize) -> Vec<Vec<u8>> {
+        self.titles
+            .iter()
+            .filter(|t| t.has_probable_video())
+            .max_by_key(|t| t.size_bytes)
+            .or_else(|| self.titles.iter().max_by_key(|t| t.size_bytes))
+            .map(|t| crate::keysource::read_encrypted_units(reader, t, n))
+            .unwrap_or_default()
     }
 
     /// Apply a caller-resolved [`Key`] so [`Self::decrypt_keys`] yields usable
@@ -3367,6 +3400,109 @@ mod tests {
             disc_scan.encrypted,
             "a cracked CSS DVD must be reported encrypted"
         );
+    }
+
+    // An operator Stop during scan_image's CSS crack must end the scan as Halted —
+    // the token in `opts.halt` has to reach the crack, not a hardcoded `None`.
+    #[test]
+    fn scan_image_css_crack_honours_the_halt_token() {
+        use crate::udf::fixture::*;
+        // Cancels the token on the first read inside the crack extent.
+        struct StopInVob<'a> {
+            inner: &'a mut MemDisc,
+            halt: crate::halt::Halt,
+        }
+        impl SectorSource for StopInVob<'_> {
+            fn capacity_sectors(&self) -> u32 {
+                self.inner.capacity_sectors()
+            }
+            fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], r: bool) -> Result<usize> {
+                if lba >= 9010 {
+                    self.halt.cancel();
+                }
+                self.inner.read_sectors(lba, c, b, r)
+            }
+        }
+        let vts = dvd_vts_bytes(1000, 10, 200); // a ~190-sector clear extent
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, dvd_vmg_bytes(), true),
+                    file_with("VTS_01_0.IFO", 62, 6000, vts, true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let halt = crate::halt::Halt::new();
+        let opts = ScanOptions {
+            halt: Some(halt.clone()),
+            ..ScanOptions::default()
+        };
+        let mut src = StopInVob {
+            inner: &mut disc,
+            halt,
+        };
+        let err = Disc::scan_image(&mut src, 500_000, &opts).expect_err("stopped mid-crack");
+        assert_eq!(err.code(), Error::Halted.code());
+    }
+
+    // A truncated (already-decrypted) DVD ISO whose feature lies past EOF: every
+    // crack read fails, so there is no verdict. Report the read fault, never a
+    // missing CSS key.
+    #[test]
+    fn scan_image_unreadable_crack_extent_reports_the_read_error() {
+        use crate::udf::fixture::*;
+        struct Truncated<'a>(&'a mut MemDisc);
+        impl SectorSource for Truncated<'_> {
+            fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], r: bool) -> Result<usize> {
+                if lba >= 9010 {
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.0.read_sectors(lba, c, b, r)
+            }
+        }
+        let vts = dvd_vts_bytes(1000, 10, 200);
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, dvd_vmg_bytes(), true),
+                    file_with("VTS_01_0.IFO", 62, 6000, vts, true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let err = Disc::scan_image(&mut Truncated(&mut disc), 500_000, &ScanOptions::default())
+            .expect_err("no crack verdict");
+        let read_fault = Error::DiscRead {
+            sector: 0,
+            status: None,
+            sense: None,
+        };
+        assert_eq!(err.code(), read_fault.code(), "got {err:?}");
     }
 
     // An HD-DVD image is also MPEG-PS but must NEVER enter the CSS crack.
@@ -6146,7 +6282,9 @@ mod tests {
         let mut reader = ClearStubReader {
             clear_range: (0, 100_000),
         };
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(stub_idx, &mut reader, 8);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(stub_idx, &mut reader, 8, None)
+            .expect("crack verdict");
         assert!(
             matches!(keys, crate::decrypt::DecryptKeys::None),
             "a clear stub in a disjoint VTS cracks to no key"
@@ -6614,7 +6752,9 @@ mod tests {
             scrambled: (100, 164),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         assert!(!title_is_clear, "a scrambled title is not clear");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => {
@@ -6648,7 +6788,9 @@ mod tests {
             scrambled: (100, 132),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6686,6 +6828,33 @@ mod tests {
         }
     }
 
+    // A Stop during the per-title crack ends it after the current batch.
+    #[test]
+    fn decrypt_keys_for_title_crack_honours_the_halt_token() {
+        struct StopOnRead(crate::halt::Halt, u32);
+        impl SectorSource for StopOnRead {
+            fn read_sectors(&mut self, _l: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+                self.1 += 1;
+                self.0.cancel();
+                let n = c as usize * 2048;
+                b[..n].fill(0);
+                Ok(n)
+            }
+        }
+        let disc = css_dvd_with_extents(vec![Extent {
+            start_lba: 100,
+            sector_count: 64,
+        }]);
+        let halt = crate::halt::Halt::new();
+        let mut src = StopOnRead(halt.clone(), 0);
+        let got = disc.decrypt_keys_for_title(0, &mut src, 16, Some(&halt));
+        assert!(
+            matches!(got, Err(Error::Halted)),
+            "a stopped crack is no verdict"
+        );
+        assert_eq!(src.1, 1, "no read after the Stop");
+    }
+
     // End-to-end: a scrambled-but-uncrackable DVD title with NO up-front
     // detection drives decrypt_keys_for_title to (None, false), and the
     // gate MUST hard-fail (CssKeyMissing), never pass it to the muxer.
@@ -6697,7 +6866,9 @@ mod tests {
         }]);
         assert!(disc.css.is_none(), "fixture: no up-front detection");
         let mut reader = LockedReader;
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(0, &mut reader, 8);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(0, &mut reader, 8, None)
+            .expect("crack verdict");
         assert!(
             matches!(keys, crate::decrypt::DecryptKeys::None) && !title_is_clear,
             "a locked/uncrackable scrambled title resolves to (None, false)"
@@ -6718,7 +6889,9 @@ mod tests {
             reads: std::cell::RefCell::new(Vec::new()),
         };
         // Title 0's extents (100..200) overlap the cracked span → reuse.
-        let (keys, clear) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, clear) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         assert!(!clear);
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => {
@@ -6744,7 +6917,9 @@ mod tests {
             scrambled: (5000, 5100),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(1, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(1, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6782,7 +6957,9 @@ mod tests {
             scrambled: (100, 2_100),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6809,7 +6986,9 @@ mod tests {
             scrambled: (100 + 9_000, 100 + 20_000),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let (keys, _) = disc.decrypt_keys_for_title(0, &mut src, 16);
+        let (keys, _) = disc
+            .decrypt_keys_for_title(0, &mut src, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, key,
@@ -6831,7 +7010,9 @@ mod tests {
         disc.titles
             .push(title_with_video(Codec::Mpeg2, Resolution::R480p)); // idx 1: no extents
         let mut reader = LockedReader;
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(1, &mut reader, 8);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(1, &mut reader, 8, None)
+            .expect("crack verdict");
         assert!(
             title_is_clear,
             "an empty-extents title is clear (nothing to descramble)"
@@ -7981,7 +8162,9 @@ mod tests {
         };
 
         for idx in [0usize, 1] {
-            let (keys, title_is_clear) = disc.decrypt_keys_for_title(idx, &mut clear, 16);
+            let (keys, title_is_clear) = disc
+                .decrypt_keys_for_title(idx, &mut clear, 16, None)
+                .expect("crack verdict");
             assert!(
                 matches!(keys, crate::decrypt::DecryptKeys::None),
                 "title {idx} only ABUTS the crack span — it shares no sector with it, so the \
@@ -7993,7 +8176,9 @@ mod tests {
             );
         }
 
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(2, &mut clear, 16);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(2, &mut clear, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
                 title_key, KEY,
@@ -8006,7 +8191,9 @@ mod tests {
         // A title with NO extents has nothing to crack from: it short-circuits
         // to the disc-wide keys and is marked clear, so the decrypt gate's
         // "None keys + not clear" rule cannot hard-fail it.
-        let (keys, title_is_clear) = disc.decrypt_keys_for_title(3, &mut clear, 16);
+        let (keys, title_is_clear) = disc
+            .decrypt_keys_for_title(3, &mut clear, 16, None)
+            .expect("crack verdict");
         match keys {
             crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(title_key, KEY),
             _ => panic!("an extent-less title must return the disc-wide keys"),
