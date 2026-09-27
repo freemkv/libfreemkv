@@ -291,14 +291,17 @@ impl Disc {
             })?;
         let dh = aacs::inf::disc_hash(&uk_ro_data);
 
-        let cc = aacs::read_first(
+        let cc_raw = aacs::read_first(
             &aacs::role_paths(udf_fs, aacs::AacsRole::ContentCert),
             |p| udf_fs.read_file(reader, p),
         )
-        .ok()
-        .as_deref()
-        .and_then(aacs::inf::parse_content_cert);
-        let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
+        .ok();
+        let cc = cc_raw.as_deref().and_then(aacs::inf::parse_content_cert);
+        // Fail safe: a cert that reads but does not parse may declare bus encryption.
+        let bus_encryption = match &cc {
+            Some(c) => c.bus_encryption,
+            None => cc_raw.is_some(),
+        };
         // No-cert default = UHD (V20 stride), matching `read_aacs_version` so
         // scanned/out-of-band versions agree; the main path fails loudly on a
         // wrong stride, so this conservative default is safe here too.
@@ -851,6 +854,21 @@ mod tests {
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs))
             .expect("a drive-unlocked disc removes bus encryption even without a read_data_key");
         assert!(st.bus_encryption);
+    }
+
+    // Fail safe: a cert that reads but does not parse (unknown type byte) may
+    // declare bus encryption, so a live drive without a Read Data Key refuses keys.
+    #[test]
+    fn resolve_vid_only_unparseable_cert_is_treated_as_bus_encrypted() {
+        let (mut disc, udf) = disc_with_cert(0x55, false);
+        let hs = HandshakeResult {
+            volume_id: [0x11u8; 16],
+            read_data_key: None,
+            read_data_key_err: None,
+            drive_unlocked: false,
+        };
+        let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).unwrap_err();
+        assert!(matches!(err, Error::AacsBusKeyUnavailable), "got {err:?}");
     }
 
     /// ISO scan (handshake None) of a bus_encryption disc → Ok. Bus encryption
