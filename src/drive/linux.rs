@@ -4,13 +4,8 @@ use crate::drive::DeviceResolution;
 use crate::error::{Error, Result};
 use crate::identity::DriveId;
 
-/// SCSI peripheral device type 5 = MMC / optical (CD/DVD/BD), held in the
-/// low 5 bits of INQUIRY byte 0 (the high 3 bits are the peripheral
-/// qualifier, masked off here).
-const SCSI_PERIPHERAL_TYPE_OPTICAL: u8 = 0x05;
-
-/// Discover optical drives by enumerating `/dev/sg*` SCSI-generic nodes,
-/// opening each, running INQUIRY, and keeping only devices whose
+/// Discover optical drives: `/dev/sg*` nodes sysfs reports as type 5 (all
+/// nodes if sysfs is unreadable), each opened and kept only if its INQUIRY
 /// peripheral device type is optical (MMC, type 0x05).
 ///
 /// Devices where `scsi::open` or `DriveId::from_drive` fail are silently
@@ -18,15 +13,10 @@ const SCSI_PERIPHERAL_TYPE_OPTICAL: u8 = 0x05;
 /// shouldn't abort discovery of the others).
 pub fn find_drives() -> Vec<(String, DriveId)> {
     let mut drives = Vec::new();
-    for name in enumerate_sg_names() {
-        let path = format!("/dev/{name}");
-        if !std::path::Path::new(&path).exists() {
-            continue;
-        }
+    for path in candidate_paths() {
         if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path))
             && let Ok(id) = DriveId::from_drive(transport.as_mut())
-            && !id.raw_inquiry.is_empty()
-            && (id.raw_inquiry[0] & 0x1F) == SCSI_PERIPHERAL_TYPE_OPTICAL
+            && id.is_optical()
         {
             drives.push((path, id));
         }
@@ -34,27 +24,13 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     drives
 }
 
-// Enumerate `sg*` names via `/sys/class/scsi_generic/` (exact present-device list); fall back
-// to a bounded `sg0..15` probe if sysfs is unreadable.
-fn enumerate_sg_names() -> Vec<String> {
-    let mut names = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("sg") {
-                names.push(name);
-            }
-        }
-    } else {
-        for i in 0..16 {
-            let name = format!("sg{i}");
-            if std::path::Path::new(&format!("/dev/{name}")).exists() {
-                names.push(name);
-            }
-        }
-    }
-    names.sort();
-    names
+/// Candidate optical `/dev/sg*` paths from sysfs alone — nothing is opened.
+pub(crate) fn candidate_paths() -> Vec<String> {
+    crate::scsi::linux::enumerate_sg_names()
+        .into_iter()
+        .map(|name| format!("/dev/{name}"))
+        .filter(|path| std::path::Path::new(path).exists())
+        .collect()
 }
 
 /// Resolve a device path to its raw `/dev/sg*` SCSI-generic node.

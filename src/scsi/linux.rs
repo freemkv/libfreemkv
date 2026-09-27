@@ -1,13 +1,14 @@
 //! Linux SCSI transport via synchronous blocking SG_IO ioctl.
 //!
 //! `execute()` is one syscall: `ioctl(fd, SG_IO, &hdr)` blocks until the
-//! kernel completes the command (success, error, or its own timeout).
-//! No userspace abort, no fd close+reopen, no SG_SCSI_RESET escalation —
-//! the kernel SCSI mid-layer's own error-handling ladder runs internally
-//! when `hdr.timeout` expires.
+//! kernel completes the command (success, error, or its own timeout). No
+//! userspace abort or SG_SCSI_RESET: the kernel mid-layer runs its own error
+//! ladder. On a transport-level failure the fd is closed and reopened (on
+//! detached threads, see `fd_handoff`), so the fd is NOT stable across one.
 
 use super::fd_handoff::{
-    AtomicBool, AtomicI32, claim_for_teardown, publish_recovered_fd, take_recovered_fd,
+    AtomicBool, AtomicI32, claim_for_teardown, publish_recovered_fd, release_recovery_slot,
+    reserve_recovery_slot, take_recovered_fd,
 };
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -70,13 +71,18 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 88);
 const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 
 pub struct SgIoTransport {
-    pub fd: i32,
+    // Private: execute()/Drop close whatever these hold, so safe code outside
+    // must never be able to plant a descriptor it does not own (I/O safety).
+    fd: i32,
     device_path: std::path::PathBuf,
     /// Single-slot mailbox a background recovery thread publishes a freshly
     /// opened fd into. Drained by `execute()`, or claimed by `Drop` if the
     /// transport dies first. The protocol — and the memory ordering that makes
     /// it leak-free — lives in `super::fd_handoff`.
-    pub fd_recovery: Arc<AtomicI32>,
+    fd_recovery: Arc<AtomicI32>,
+    /// A PREVENT MEDIUM REMOVAL was issued and not yet cleared by an ALLOW;
+    /// only then does `Drop` unlock the tray (enumeration probes never do).
+    prevent_held: bool,
     /// Set to `true` by `Drop` before it claims the slot. A recovery thread
     /// that publishes after that point sees it and closes its own fd, since
     /// nothing will ever drain the slot again.
@@ -87,13 +93,7 @@ impl SgIoTransport {
     /// Open a SCSI device for use.
     pub fn open(device: &Path) -> Result<Self> {
         let device = Self::resolve_to_sg(device);
-        let c_path = Self::to_c_path(&device);
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
+        let fd = Self::open_fd(&device);
         if fd < 0 {
             return Self::open_error(&device);
         }
@@ -101,8 +101,20 @@ impl SgIoTransport {
             fd,
             device_path: device,
             fd_recovery: Arc::new(AtomicI32::new(super::fd_handoff::EMPTY)),
+            prevent_held: false,
             dead: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    // open(2) the sg node the way every path here does; negative on failure.
+    fn open_fd(device: &Path) -> i32 {
+        let c_path = Self::to_c_path(device);
+        unsafe {
+            libc::open(
+                c_path.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        }
     }
 
     // Map errno from a failed open(): permission-denied -> DevicePermission,
@@ -208,15 +220,29 @@ impl SgIoTransport {
 
 impl Drop for SgIoTransport {
     fn drop(&mut self) {
-        if self.fd >= 0 {
-            // Unlock tray before closing — don't leave it locked.
-            let _ = Self::raw_command(self.fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
-            unsafe { libc::close(self.fd) };
-        }
         // A failed execute() spawns a thread that opens a fresh fd into
         // fd_recovery, normally drained at the top of the next execute(). If
-        // dropped first (abort-on-wedge), claim and close it here.
-        if let Some(recovered) = claim_for_teardown(&self.fd_recovery, &self.dead) {
+        // dropped first (abort-on-wedge), claim it here.
+        let recovered = claim_for_teardown(&self.fd_recovery, &self.dead);
+        // Unlock a tray WE locked before closing. Mid-recovery (fd == -1) use
+        // the recovered fd, or reopen, so the PREVENT is not stranded.
+        if self.prevent_held {
+            let fd = match (self.fd, recovered) {
+                (fd, _) if fd >= 0 => fd,
+                (_, Some(r)) => r,
+                _ => {
+                    self.fd = Self::open_fd(&self.device_path);
+                    self.fd
+                }
+            };
+            if fd >= 0 {
+                let _ = Self::raw_command(fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
+            }
+        }
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd) };
+        }
+        if let Some(recovered) = recovered {
             unsafe { libc::close(recovered) };
         }
     }
@@ -237,6 +263,11 @@ impl ScsiTransport for SgIoTransport {
         let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
         let exec_t0 = std::time::Instant::now();
         let opcode = cdb[0];
+        // Held from the moment a PREVENT is attempted: its outcome may be unknown.
+        let removal = super::prevent_allow_request(cdb);
+        if removal == Some(true) {
+            self.prevent_held = true;
+        }
         tracing::trace!(
             target: "freemkv::scsi",
             phase = "enter",
@@ -331,24 +362,19 @@ impl ScsiTransport for SgIoTransport {
             let dead = self.dead.clone();
 
             // Cap outstanding recovery threads (past MAX a sustained wedge spawns
-            // unbounded threads): reserve the slot ATOMICALLY via fetch_add, act on
-            // the pre-increment value, and give the slot back if it overshoots.
-            use std::sync::atomic::Ordering;
-            if RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel) < MAX_RECOVERY_THREADS {
+            // unbounded threads); the atomic reservation lives in `fd_handoff`.
+            if reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS) {
                 std::thread::spawn(move || {
                     if old_fd >= 0 {
                         unsafe { libc::close(old_fd) };
                     }
-                    RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                    release_recovery_slot(&RECOVERY_THREADS);
                 });
-            } else {
-                RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
-                if old_fd >= 0 {
-                    unsafe { libc::close(old_fd) };
-                }
+            } else if old_fd >= 0 {
+                unsafe { libc::close(old_fd) };
             }
 
-            if RECOVERY_THREADS.fetch_add(1, Ordering::AcqRel) < MAX_RECOVERY_THREADS {
+            if reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS) {
                 std::thread::spawn(move || {
                     // Don't unwrap: a device path with an interior NUL would
                     // panic this detached thread (silently swallowed). Bail
@@ -356,7 +382,7 @@ impl ScsiTransport for SgIoTransport {
                     let c_path = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
                         Ok(c) => c,
                         Err(_) => {
-                            RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                            release_recovery_slot(&RECOVERY_THREADS);
                             return;
                         }
                     };
@@ -374,12 +400,11 @@ impl ScsiTransport for SgIoTransport {
                             unsafe { libc::close(orphan) };
                         }
                     }
-                    RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                    release_recovery_slot(&RECOVERY_THREADS);
                 });
             } else {
-                // Over the cap: give the reservation back, then reopen inline
-                // (blocking this call briefly) instead of spawning a 9th thread.
-                RECOVERY_THREADS.fetch_sub(1, Ordering::AcqRel);
+                // Over the cap: reopen inline (blocking this call briefly)
+                // instead of spawning a 9th thread.
                 if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
                     let new_fd = unsafe {
                         libc::open(
@@ -426,6 +451,9 @@ impl ScsiTransport for SgIoTransport {
         // Compute in usize so 2-4 GiB transfers don't wrap through an i32
         // cast and report a large read as ~0 bytes. Negative resid is
         // clamped to 0 before subtracting.
+        if removal == Some(false) {
+            self.prevent_held = false;
+        }
         let resid = hdr.resid.max(0) as usize;
         let bytes_transferred = data.len().saturating_sub(resid);
         tracing::trace!(
@@ -527,7 +555,7 @@ fn sysfs_identity(name: &str) -> (String, String, String) {
 // Enumerate `sg*` names via `/sys/class/scsi_generic/`, filtered to type 5
 // (optical). Falls back to a `sg0..15` probe when sysfs is unreadable.
 // Names sorted lexically so caller iteration is deterministic.
-fn enumerate_sg_names() -> Vec<String> {
+pub(crate) fn enumerate_sg_names() -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") {
         for entry in entries.flatten() {
@@ -612,14 +640,56 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
     }
 
     let parsed = super::parse_sense(&sense, hdr.sb_len_wr);
-    if parsed.is_not_ready() {
-        Ok(false)
-    } else {
-        Err(Error::ScsiError {
-            opcode: cdb[0],
-            status: hdr.status,
-            sense: Some(parsed),
-        })
+    super::tur_disc_present(&parsed).ok_or(Error::ScsiError {
+        opcode: cdb[0],
+        status: hdr.status,
+        sense: Some(parsed),
+    })
+}
+
+// After a transport failure the fd is reopened in the background and the next
+// execute() adopts it. Needs a real device: FREEMKV_TEST_SG_DEVICE (default sg2).
+#[cfg(test)]
+mod recovery_device_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    #[ignore]
+    fn timeout_does_not_kill_transport() {
+        let device =
+            std::env::var("FREEMKV_TEST_SG_DEVICE").unwrap_or_else(|_| "/dev/sg2".to_string());
+        let mut transport = SgIoTransport::open(Path::new(&device)).expect("open device");
+        let fd_before = transport.fd;
+        // READ(10) with a 1 ms timeout forces a kernel timeout.
+        let cdb = [0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+        let mut data = vec![0u8; 2048];
+        let err = transport
+            .execute(&cdb, DataDirection::FromDevice, &mut data, 1)
+            .expect_err("1 ms timeout must fail");
+        assert!(err.is_scsi_transport_failure(), "got {err:?}");
+        assert_eq!(transport.fd, -1, "fd handed to recovery");
+
+        let mut published = false;
+        for _ in 0..100 {
+            if transport
+                .fd_recovery
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= 0
+            {
+                published = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(published, "recovery thread should have produced a new fd");
+
+        let t0 = std::time::Instant::now();
+        let r = transport.execute(&cdb, DataDirection::FromDevice, &mut data, 5_000);
+        assert!(r.is_ok(), "recovered fd should work: {r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_ne!(transport.fd, -1, "fd valid after recovery");
+        assert_ne!(transport.fd, fd_before, "fd fresh after recovery");
     }
 }
 

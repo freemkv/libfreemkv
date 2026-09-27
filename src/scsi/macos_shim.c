@@ -33,6 +33,8 @@ typedef struct {
     DADiskRef                  da_disk;
     dispatch_queue_t           da_queue;
     int                        da_claimed;
+    // Claim whose callback had not arrived by the 5 s timeout; resolved in da_release.
+    struct DAClaimResult      *da_pending;
 } ShimHandle;
 
 typedef struct {
@@ -332,7 +334,9 @@ static DADissenterRef da_claim_release(DADiskRef disk, void *ctx) {
 // other side may still touch it. This matters on the 5 s timeout path, where
 // da_hold returns but da_claim_done can still fire later — a stack DAClaimResult
 // would be a use-after-free, and never releasing the semaphore would leak it.
-typedef struct { dispatch_semaphore_t sem; int ok; volatile int rc; } DAClaimResult;
+typedef struct DAClaimResult {
+    dispatch_semaphore_t sem; int ok; volatile int done; volatile int rc;
+} DAClaimResult;
 
 static void da_claim_result_release(DAClaimResult *r) {
     if (__sync_sub_and_fetch(&r->rc, 1) == 0) {
@@ -345,6 +349,7 @@ static void da_claim_done(DADiskRef disk, DADissenterRef dissenter, void *ctx) {
     (void)disk;
     DAClaimResult *r = (DAClaimResult *)ctx;
     r->ok = (dissenter == NULL);
+    __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
     dispatch_semaphore_signal(r->sem);
     da_claim_result_release(r);
 }
@@ -375,51 +380,69 @@ static int da_hold(const char *bsd_name) {
     if (!r) { pthread_mutex_unlock(&g_handle_lock); return 0; }
     r->sem = dispatch_semaphore_create(0);
     r->ok = 0;
+    r->done = 0;
     r->rc = 2; // one ref held here, one for the async da_claim_done callback
     DADiskClaim(g_handle.da_disk, kDADiskClaimOptionDefault,
         da_claim_release, NULL, da_claim_done, r);
     pthread_mutex_unlock(&g_handle_lock);
 
-    // Bounded wait for the async claim callback (5 s), so a wedged DA can't
-    // hang open() forever. On timeout the callback may still fire later, so we
-    // must NOT read r->ok or free r here — releasing our ref hands ownership to
-    // whichever side finishes last (see da_claim_result_release).
-    int claimed;
-    if (dispatch_semaphore_wait(r->sem,
-            dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0) {
-        claimed = 0;
-    } else {
+    // Bounded wait (5 s) so a wedged DA can't hang open(). On timeout the
+    // callback may still fire: keep our ref in da_pending for da_release,
+    // which reaps it (and unclaims a late success) once callbacks are stopped.
+    int claimed = 0;
+    int timed_out = dispatch_semaphore_wait(r->sem,
+        dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0;
+    if (!timed_out) {
         claimed = r->ok;
+        da_claim_result_release(r);
     }
-    da_claim_result_release(r);
 
     pthread_mutex_lock(&g_handle_lock);
     g_handle.da_claimed = claimed;
+    if (timed_out) {
+        if (g_handle.da_pending) da_claim_result_release(g_handle.da_pending);
+        g_handle.da_pending = r;
+    }
     pthread_mutex_unlock(&g_handle_lock);
     return claimed;
 }
 
+static void da_noop(void *ctx) { (void)ctx; }
+
 static void da_release(void) {
+    // Detach the DA state under the lock, tear it down outside it: draining the
+    // queue runs da_mount_approval, which takes g_handle_lock itself.
     pthread_mutex_lock(&g_handle_lock);
-    if (g_handle.da_session) {
-        DAUnregisterCallback(g_handle.da_session, (void *)da_mount_approval, NULL);
-    }
-    if (g_handle.da_disk) {
-        if (g_handle.da_claimed) DADiskUnclaim(g_handle.da_disk);
-        CFRelease(g_handle.da_disk);
-        g_handle.da_disk = NULL;
-    }
-    if (g_handle.da_session) {
-        DASessionSetDispatchQueue(g_handle.da_session, NULL);
-        CFRelease(g_handle.da_session);
-        g_handle.da_session = NULL;
-    }
-    if (g_handle.da_queue) {
-        dispatch_release(g_handle.da_queue);
-        g_handle.da_queue = NULL;
-    }
+    DASessionRef session = g_handle.da_session;
+    DADiskRef disk = g_handle.da_disk;
+    dispatch_queue_t queue = g_handle.da_queue;
+    int claimed = g_handle.da_claimed;
+    DAClaimResult *pending = g_handle.da_pending;
+    g_handle.da_session = NULL;
+    g_handle.da_disk = NULL;
+    g_handle.da_queue = NULL;
     g_handle.da_claimed = 0;
+    g_handle.da_pending = NULL;
     pthread_mutex_unlock(&g_handle_lock);
+
+    if (session) DAUnregisterCallback(session, (void *)da_mount_approval, NULL);
+    if (disk && claimed) DADiskUnclaim(disk);
+    if (session) DASessionSetDispatchQueue(session, NULL);
+    // No callback is scheduled past this point; flush any already in flight.
+    if (queue) dispatch_sync_f(queue, NULL, da_noop);
+    if (pending) {
+        if (__atomic_load_n(&pending->done, __ATOMIC_ACQUIRE)) {
+            // Late success: the claim is held even though da_hold gave up.
+            if (disk && pending->ok) DADiskUnclaim(disk);
+        } else {
+            // Never delivered now: drop the callback's reference too.
+            da_claim_result_release(pending);
+        }
+        da_claim_result_release(pending);
+    }
+    if (disk) CFRelease(disk);
+    if (session) CFRelease(session);
+    if (queue) dispatch_release(queue);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────

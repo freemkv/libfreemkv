@@ -1144,7 +1144,7 @@ impl std::fmt::Display for Error {
             // pair) — surface them so a truncated-resume report carries the
             // actual mismatch, not just the bare code.
             Error::ImageTruncated { have, want } => {
-                write!(f, "E{} {have}/{want}", self.code())
+                write!(f, "E{}: {have}/{want}", self.code())
             }
             Error::ImageEndsBeforeRead { lba, have, want } => {
                 write!(f, "E{}: {lba} {have}/{want}", self.code())
@@ -1728,6 +1728,8 @@ mod tests {
             s.contains("67890"),
             "want value missing from ImageTruncated display `{s}`"
         );
+        // The documented `E<code>: <args>` shape the app layer splits on.
+        assert_eq!(s, format!("E{}: 12345/67890", E_IMAGE_TRUNCATED));
     }
 
     #[test]

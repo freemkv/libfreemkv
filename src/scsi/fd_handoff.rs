@@ -13,11 +13,28 @@
 //! ```
 //! Under `all(loom, test)`, callers must execute inside `loom::model`.
 
-// See "Building the model" above for why this is gated on `test` too.
+// Gated on `test` too: a `--cfg loom` build of the library alone keeps std atomics.
 #[cfg(all(loom, test))]
 pub(crate) use loom::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+/// Reserve one of `max` recovery-thread slots on `counter`, atomically (no
+/// load-then-add TOCTOU). `false` past the cap, with nothing left reserved.
+pub(crate) fn reserve_recovery_slot(counter: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
+    use std::sync::atomic::Ordering::AcqRel;
+    if counter.fetch_add(1, AcqRel) < max {
+        true
+    } else {
+        counter.fetch_sub(1, AcqRel);
+        false
+    }
+}
+
+/// Give back a slot taken by [`reserve_recovery_slot`].
+pub(crate) fn release_recovery_slot(counter: &std::sync::atomic::AtomicUsize) {
+    counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+}
 
 /// The empty slot. Not a valid fd; `open()` never returns a negative value.
 pub(crate) const EMPTY: i32 = -1;
@@ -99,6 +116,58 @@ mod tests {
     /// Fresh slot + liveness flag, as `SgIoTransport::open` builds them.
     fn slot() -> (AtomicI32, AtomicBool) {
         (AtomicI32::new(EMPTY), AtomicBool::new(false))
+    }
+
+    // ── Recovery-thread cap ────────────────────────────────────────────────
+
+    /// Past the cap nothing stays reserved (a leaked reservation would ratchet the
+    /// counter to the cap and force every later reopen inline), and a release
+    /// frees the slot again.
+    #[test]
+    fn recovery_slot_cap_gives_back_an_over_cap_reservation() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let counter = AtomicUsize::new(0);
+        assert!(reserve_recovery_slot(&counter, 2));
+        assert!(reserve_recovery_slot(&counter, 2));
+        for _ in 0..5 {
+            assert!(!reserve_recovery_slot(&counter, 2), "over the cap");
+        }
+        assert_eq!(counter.load(Relaxed), 2, "over-cap attempts must not leak");
+        release_recovery_slot(&counter);
+        assert!(
+            reserve_recovery_slot(&counter, 2),
+            "a released slot is reusable"
+        );
+    }
+
+    /// Concurrent reservers never hold more than `max` slots at once.
+    #[test]
+    fn recovery_slot_cap_holds_under_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        const MAX: usize = 3;
+        let counter = AtomicUsize::new(0);
+        let held = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| {
+                    for _ in 0..2_000 {
+                        if reserve_recovery_slot(&counter, MAX) {
+                            let now = held.fetch_add(1, Relaxed) + 1;
+                            peak.fetch_max(now, Relaxed);
+                            held.fetch_sub(1, Relaxed);
+                            release_recovery_slot(&counter);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(
+            peak.load(Relaxed) <= MAX,
+            "cap exceeded: {}",
+            peak.load(Relaxed)
+        );
+        assert_eq!(counter.load(Relaxed), 0, "every reservation returned");
     }
 
     // ── Positive: the ordinary hand-off ────────────────────────────────────

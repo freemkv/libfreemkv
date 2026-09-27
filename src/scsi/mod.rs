@@ -501,8 +501,9 @@ pub fn list_drives() -> Vec<DriveInfo> {
 /// True if the drive at `path` currently has a disc inserted.
 ///
 /// Issues a single TEST UNIT READY (cheapest SCSI op, no data transfer).
-/// Sense-key 2 ("not ready, medium not present") → `Ok(false)`; any other
-/// ready/not-ready response → `Ok(true)`. Suitable for poll-loop tick
+/// GOOD, NOT READY 04/01 (becoming ready) or UNIT ATTENTION 28h (medium
+/// changed) → `Ok(true)`; any other NOT READY (e.g. 3Ah, medium not present)
+/// → `Ok(false)`; other sense → `Err`. Suitable for poll-loop tick
 /// (~50 ms / drive on a healthy bus).
 ///
 /// **No internal recovery.** A wedged target surfaces as `Err(Error::ScsiError)` with `status
@@ -557,8 +558,11 @@ pub fn inquiry(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
     })
 }
 
-/// Send GET CONFIGURATION for feature 0x010C (Firmware Information).
+/// Send GET CONFIGURATION for feature 0x010C (Firmware Information). Returns
+/// the reply (8-byte header + descriptor) cut to what the drive actually sent.
 pub fn get_config_010c(scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
+    // 8-byte header + 20-byte 010Ch descriptor (MMC-6 §5.3.10).
+    const ALLOC: u8 = 28;
     let cdb = [
         SCSI_GET_CONFIGURATION,
         0x02,
@@ -568,12 +572,38 @@ pub fn get_config_010c(scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
         0x00,
         0x00,
         0x00,
-        0x10,
+        ALLOC,
         0x00,
     ];
-    let mut buf = [0u8; 16];
-    scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
-    Ok(buf.to_vec())
+    let mut buf = [0u8; ALLOC as usize];
+    let r = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
+    Ok(buf[..gc_reply_len(&buf, r.bytes_transferred)].to_vec())
+}
+
+/// Valid length of a GET CONFIGURATION reply: the transfer count, clamped to the
+/// buffer and to the header's Data Length + 4 (MMC-6 §5.3.1).
+pub(crate) fn gc_reply_len(buf: &[u8], transferred: usize) -> usize {
+    let end = transferred.min(buf.len());
+    match buf.get(..4) {
+        Some(h) if end >= 4 => {
+            let data_len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+            end.min(data_len.saturating_add(4))
+        }
+        _ => end,
+    }
+}
+
+/// The descriptor for `feature` in a GET CONFIGURATION (RT=10b) reply, feature
+/// header included, bounded by [`gc_reply_len`] and its Additional Length. `None`
+/// when the drive answered header-only (feature absent) or with another feature.
+#[cfg_attr(not(feature = "rip"), allow(dead_code))]
+pub(crate) fn gc_feature_descriptor(buf: &[u8], transferred: usize, feature: u16) -> Option<&[u8]> {
+    let reply = &buf[..gc_reply_len(buf, transferred)];
+    let desc = reply.get(8..)?;
+    if desc.len() < 4 || u16::from_be_bytes([desc[0], desc[1]]) != feature {
+        return None;
+    }
+    Some(&desc[..desc.len().min(4 + usize::from(desc[3]))])
 }
 
 /// Build a READ BUFFER CDB.
@@ -627,6 +657,161 @@ pub fn build_read10_fua(lba: u32, count: u16) -> [u8; 10] {
         count as u8,
         0x00,
     ]
+}
+
+/// True if INQUIRY byte 0's peripheral device type (low 5 bits; the high 3
+/// are the qualifier) is 05h, an MMC optical drive (SPC-4 §6.4.2).
+#[cfg_attr(not(any(feature = "rip", target_os = "windows")), allow(dead_code))]
+pub(crate) fn is_optical_peripheral(inquiry: &[u8]) -> bool {
+    const PERIPHERAL_TYPE_MASK: u8 = 0x1F;
+    const PERIPHERAL_TYPE_OPTICAL: u8 = 0x05;
+    inquiry
+        .first()
+        .is_some_and(|b| b & PERIPHERAL_TYPE_MASK == PERIPHERAL_TYPE_OPTICAL)
+}
+
+/// TEST UNIT READY sense -> disc present? `None` when the sense says nothing
+/// about presence. Only ASC 3Ah is MEDIUM NOT PRESENT (SPC-4 Annex D); 04/01 is
+/// a disc spinning up and 06/28 the not-ready-to-ready (medium changed) event.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+pub(crate) fn tur_disc_present(sense: &ScsiSense) -> Option<bool> {
+    const ASC_NOT_READY: u8 = 0x04;
+    const ASCQ_BECOMING_READY: u8 = 0x01;
+    const ASC_MEDIUM_MAY_HAVE_CHANGED: u8 = 0x28;
+    match (sense.sense_key, sense.asc, sense.ascq) {
+        (SENSE_KEY_NOT_READY, ASC_NOT_READY, ASCQ_BECOMING_READY) => Some(true),
+        // 3Ah, and NOT READY causes we cannot place: as before, "no disc".
+        (SENSE_KEY_NOT_READY, _, _) => Some(false),
+        (SENSE_KEY_UNIT_ATTENTION, ASC_MEDIUM_MAY_HAVE_CHANGED, _) => Some(true),
+        _ => None,
+    }
+}
+
+/// PREVENT ALLOW MEDIUM REMOVAL (1Eh): `Some(prevent)` from CDB byte 4 bit 0,
+/// `None` for any other command.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn prevent_allow_request(cdb: &[u8]) -> Option<bool> {
+    const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
+    match cdb {
+        [PREVENT_ALLOW_MEDIUM_REMOVAL, _, _, _, b4, ..] => Some(b4 & 0x01 != 0),
+        _ => None,
+    }
+}
+
+/// Upper bound on an adapter AlignmentMask (page alignment).
+pub(crate) const MAX_ALIGNMENT_MASK: usize = 0xFFF;
+
+/// Adapter-reported SPTI AlignmentMask made safe to size a bounce buffer with:
+/// widened to the next 2^n-1 if malformed, capped at [`MAX_ALIGNMENT_MASK`].
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn sanitize_alignment_mask(raw: u32) -> usize {
+    let smeared = match raw.checked_ilog2() {
+        Some(top) => u32::MAX >> (31 - top),
+        None => 0,
+    };
+    (smeared as usize).min(MAX_ALIGNMENT_MASK)
+}
+
+/// SPTI TimeOutValue: whole seconds, rounded up, at least 1, never wrapping.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn spti_timeout_secs(timeout_ms: u32) -> u32 {
+    timeout_ms.div_ceil(1000).max(1)
+}
+
+#[cfg(test)]
+mod transport_helper_tests {
+    use super::*;
+
+    fn sense(sense_key: u8, asc: u8, ascq: u8) -> ScsiSense {
+        ScsiSense {
+            sense_key,
+            asc,
+            ascq,
+        }
+    }
+
+    // SPC-4 Annex D: only ASC 3Ah is MEDIUM NOT PRESENT; 04/01 is a disc spinning up
+    // and 06/28 is the not-ready-to-ready (medium may have changed) attention.
+    #[test]
+    fn tur_presence_reads_the_asc_not_just_the_sense_key() {
+        assert_eq!(tur_disc_present(&sense(0x02, 0x3A, 0x00)), Some(false));
+        assert_eq!(tur_disc_present(&sense(0x02, 0x3A, 0x02)), Some(false));
+        assert_eq!(tur_disc_present(&sense(0x02, 0x04, 0x01)), Some(true));
+        assert_eq!(tur_disc_present(&sense(0x06, 0x28, 0x00)), Some(true));
+        assert_eq!(tur_disc_present(&sense(0x06, 0x29, 0x00)), None);
+        assert_eq!(tur_disc_present(&sense(0x03, 0x11, 0x00)), None);
+    }
+
+    // Drop unlocks the tray only for a transport that issued a PREVENT; the
+    // CDB decode is what tracks that.
+    #[test]
+    fn prevent_allow_request_decodes_only_1eh() {
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x01, 0]), Some(true));
+        assert_eq!(
+            prevent_allow_request(&[0x1E, 0, 0, 0, 0x00, 0]),
+            Some(false)
+        );
+        assert_eq!(
+            prevent_allow_request(&[0x1E, 0, 0, 0, 0x02, 0]),
+            Some(false)
+        );
+        assert_eq!(prevent_allow_request(&[0x12, 0, 0, 0, 0x01, 0]), None);
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0]), None, "short CDB");
+    }
+
+    // AlignmentMask is adapter-reported: it must be 2^n-1 and bounded, or a bogus
+    // 0xFFFF_FFFF sizes every bounce buffer at data.len() + 4 GiB.
+    #[test]
+    fn alignment_mask_is_validated_and_capped() {
+        assert_eq!(sanitize_alignment_mask(0), 0);
+        assert_eq!(sanitize_alignment_mask(0x3), 0x3);
+        assert_eq!(sanitize_alignment_mask(0x1FF), 0x1FF);
+        assert_eq!(sanitize_alignment_mask(0x5), 0x7, "not 2^n-1: widen");
+        assert_eq!(sanitize_alignment_mask(0xFFFF_FFFF), MAX_ALIGNMENT_MASK);
+        assert_eq!(sanitize_alignment_mask(0x0010_0000), MAX_ALIGNMENT_MASK);
+    }
+
+    // SPTI's TimeOutValue is whole seconds, rounded up, never 0 — and a huge
+    // timeout must saturate, not wrap to 1 s (or panic in debug).
+    #[test]
+    fn spti_timeout_rounds_up_without_overflow() {
+        assert_eq!(spti_timeout_secs(0), 1);
+        assert_eq!(spti_timeout_secs(1_500), 2);
+        assert_eq!(spti_timeout_secs(5_000), 5);
+        assert_eq!(spti_timeout_secs(u32::MAX), u32::MAX.div_ceil(1000));
+    }
+
+    // Feature 010Ch is an 8-byte header plus a 20-byte descriptor (Additional
+    // Length 10h): the allocation length must cover all 28 bytes.
+    #[test]
+    fn get_config_010c_returns_the_whole_descriptor() {
+        struct Fw(Vec<u8>);
+        impl ScsiTransport for Fw {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                let alloc = usize::from(u16::from_be_bytes([cdb[7], cdb[8]]));
+                let mut reply = vec![0, 0, 0, 24, 0, 0, 0, 0, 0x01, 0x0C, 0x00, 0x10];
+                reply.extend_from_slice(b"202101311259\0\0\0\0");
+                let n = reply.len().min(alloc).min(data.len());
+                data[..n].copy_from_slice(&reply[..n]);
+                self.0 = cdb.to_vec();
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = Fw(Vec::new());
+        let v = get_config_010c(&mut t).unwrap();
+        assert_eq!(v.len(), 28, "header + full 010Ch descriptor");
+        assert_eq!(&v[12..24], b"202101311259", "date through the minute");
+    }
 }
 
 // Round `p` up to satisfy an SPTI AlignmentMask (`(p + mask) & !mask`); mask=0 means no

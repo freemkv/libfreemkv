@@ -15,9 +15,6 @@ const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x4D014;
 /// IOCTL_STORAGE_QUERY_PROPERTY — CTL_CODE(IOCTL_STORAGE_BASE(0x2D),
 /// 0x500, METHOD_BUFFERED(0), FILE_ANY_ACCESS(0)) = 0x002D1400.
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
-// IOCTL_STORAGE_RESET_DEVICE (ntddstor.h) = 0x002D5004. Two earlier values silently no-op'd the
-// reset (ERROR_INVALID_FUNCTION) instead of failing loud.
-const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D_5004;
 /// STORAGE_PROPERTY_ID::StorageAdapterProperty.
 const STORAGE_ADAPTER_PROPERTY: u32 = 1;
 /// STORAGE_QUERY_TYPE::PropertyStandardQuery.
@@ -146,11 +143,13 @@ pub struct SptiTransport {
     /// alongside `max_transfer`. `0` (common on USB bridges) means no alignment requirement; a
     /// nonzero mask (SCSI/SAS HBAs) means a misaligned `DataBuffer` makes `DeviceIoControl`
     /// fail. When set and the caller's buffer is misaligned, `execute()` bounces through an
-    /// aligned scratch buffer (see there).
-    alignment_mask: u32,
+    /// aligned scratch buffer (see there). Sanitized by `sanitize_alignment_mask`.
+    alignment_mask: usize,
+    /// Reused aligned scratch for misaligned buffers; grows to the largest transfer seen.
+    bounce: Vec<u8>,
 }
 
-// SptiTransport's only field is an isize HANDLE: Send+Sync auto-derive;
+// SptiTransport's fields are an isize HANDLE plus owned data: Send+Sync auto-derive;
 // `&mut self` on execute() enforces exclusive use, not absence of Sync.
 
 // Normalize a device path to \\.\X: format.
@@ -210,74 +209,9 @@ impl SptiTransport {
         Ok(SptiTransport {
             handle,
             max_transfer,
-            alignment_mask,
+            alignment_mask: super::sanitize_alignment_mask(alignment_mask),
+            bounce: Vec::new(),
         })
-    }
-
-    /// Reset the drive to a known good state.
-    /// Opens the device, sends IOCTL_STORAGE_RESET_DEVICE to reset
-    /// the USB/SCSI bus, then closes. Same concept as SG_SCSI_RESET on Linux.
-    pub fn reset(device: &Path) -> Result<()> {
-        let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
-            path: device.display().to_string(),
-        })?;
-        let win_path = normalize_device_path(dev_str);
-        let wide: Vec<u16> = win_path.encode_utf16().chain(std::iter::once(0)).collect();
-
-        // Open
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Ok(()); // can't open — skip reset, not fatal
-        }
-
-        // Send device reset. Result must be checked: a wrong/unsupported
-        // IOCTL fails with ERROR_INVALID_FUNCTION and no-ops silently —
-        // surface failures so a non-functional reset isn't masked below.
-        let mut returned: u32 = 0;
-        let ok = unsafe {
-            DeviceIoControl(
-                handle,
-                IOCTL_STORAGE_RESET_DEVICE,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                0,
-                &mut returned,
-                std::ptr::null_mut(),
-            )
-        };
-        let reset_ok = ok != 0;
-        if reset_ok {
-            tracing::debug!("IOCTL_STORAGE_RESET_DEVICE succeeded");
-        } else {
-            let err = unsafe { GetLastError() };
-            // Not fatal — reset is best-effort — but a failing reset means
-            // the device was NOT reset, so skip the settle-sleep below.
-            tracing::warn!(
-                last_error = err,
-                ioctl = format_args!("{IOCTL_STORAGE_RESET_DEVICE:#010x}"),
-                "IOCTL_STORAGE_RESET_DEVICE failed; drive not reset"
-            );
-        }
-
-        // Close the handle, then — only if the reset actually happened — wait
-        // for the drive to settle. A failed IOCTL reset performed no reset, so
-        // sleeping would burn 2 s for nothing.
-        unsafe { CloseHandle(handle) };
-        if reset_ok {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        Ok(())
     }
 }
 
@@ -291,7 +225,6 @@ impl SptiTransport {
 /// `crate::drive::windows::find_drives()` delegation failed to compile.
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     // SCSI peripheral device type 5 = MMC / optical, low 5 bits of INQUIRY byte 0.
-    const SCSI_PERIPHERAL_TYPE_OPTICAL: u8 = 0x05;
 
     fn probe(path: &str, out: &mut Vec<super::DriveInfo>) {
         let Ok(mut transport) = crate::scsi::open(Path::new(path)) else {
@@ -300,7 +233,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
         let Ok(r) = super::inquiry(transport.as_mut()) else {
             return;
         };
-        if !r.raw.is_empty() && (r.raw[0] & 0x1F) == SCSI_PERIPHERAL_TYPE_OPTICAL {
+        if super::is_optical_peripheral(&r.raw) {
             out.push(super::DriveInfo {
                 path: normalize_device_path(path),
                 vendor: r.vendor_id,
@@ -336,8 +269,10 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
         crate::scsi::TUR_TIMEOUT_MS,
     ) {
         Ok(_) => Ok(true),
-        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
-        Err(e) => Err(e),
+        Err(e) => match e.scsi_sense().and_then(super::tur_disc_present) {
+            Some(present) => Ok(present),
+            None => Err(e),
+        },
     }
 }
 
@@ -445,21 +380,24 @@ impl ScsiTransport for SptiTransport {
         // Round up to the next whole second (SPTI's TimeOutValue has no
         // sub-second resolution) rather than truncating — truncation
         // broke 1500ms fast-reads on Drive::read.
-        sptwb.spt.TimeOutValue = ((timeout_ms + 999) / 1000).max(1);
+        sptwb.spt.TimeOutValue = super::spti_timeout_secs(timeout_ms);
 
         // AlignmentMask bounce buffer: `DataBuffer` must satisfy the
         // adapter's `AlignmentMask` (0 on USB — zero-copy; nonzero on
         // SCSI/SAS HBAs, where misalignment fails the IOCTL outright).
-        let mask = self.alignment_mask as usize;
+        let mask = self.alignment_mask;
         let needs_bounce =
             !data.is_empty() && mask != 0 && (data.as_mut_ptr() as usize) & mask != 0;
-        let mut bounce: Vec<u8> = Vec::new();
         let data_ptr: *mut u8 = if data.is_empty() {
             std::ptr::null_mut()
         } else if needs_bounce {
-            // Over-allocate by `mask` so an aligned start exists within.
-            bounce = vec![0u8; data.len() + mask];
-            let base = bounce.as_mut_ptr() as usize;
+            // Over-allocate by `mask` so an aligned start exists within. Reused
+            // across commands; not resized again until the copy-back below.
+            let want = data.len() + mask;
+            if self.bounce.len() < want {
+                self.bounce.resize(want, 0);
+            }
+            let base = self.bounce.as_mut_ptr() as usize;
             let aligned = crate::scsi::align_up(base, mask);
             let aligned_ptr = aligned as *mut u8;
             // For writes (ToDevice) prime the aligned region with the
@@ -535,13 +473,11 @@ impl ScsiTransport for SptiTransport {
         // If we bounced a FROM-device read, copy the aligned scratch back
         // into the caller's buffer (only the bytes actually transferred).
         if needs_bounce && direction == DataDirection::FromDevice {
-            let aligned_ptr = data_ptr; // points inside `bounce`
+            let aligned_ptr = data_ptr; // points inside `self.bounce`
             unsafe {
                 std::ptr::copy_nonoverlapping(aligned_ptr, data.as_mut_ptr(), transferred);
             }
         }
-        // `bounce` is dropped here, after the last use of `data_ptr`.
-        drop(bounce);
 
         let mut sense = [0u8; 32];
         sense.copy_from_slice(&sptwb.sense);
@@ -558,39 +494,6 @@ impl ScsiTransport for SptiTransport {
 mod tests {
     use super::*;
 
-    // Regression guard for `SptiTransport::reset()`: recomputes IOCTL_STORAGE_RESET_DEVICE from
-    // the CTL_CODE formula, independently of the hardcoded constant.
-    #[test]
-    fn ioctl_storage_reset_device_value_is_correct() {
-        // CTL_CODE(DeviceType, Function, Method, Access) =
-        //   (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
-        const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
-            (device_type << 16) | (access << 14) | (function << 2) | method
-        }
-        const IOCTL_STORAGE_BASE: u32 = 0x2D;
-        const METHOD_BUFFERED: u32 = 0;
-        const FILE_READ_ACCESS: u32 = 1;
-        let expected = ctl_code(
-            IOCTL_STORAGE_BASE,
-            0x0401,
-            METHOD_BUFFERED,
-            FILE_READ_ACCESS,
-        );
-
-        assert_eq!(
-            IOCTL_STORAGE_RESET_DEVICE, expected,
-            "IOCTL_STORAGE_RESET_DEVICE must equal CTL_CODE(0x2D, 0x0401, \
-             METHOD_BUFFERED, FILE_READ_ACCESS); a wrong value fails \
-             ERROR_INVALID_FUNCTION and silently no-ops the reset"
-        );
-        assert_eq!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_5004);
-        // The two historically wrong values must never reappear.
-        assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_1004);
-        assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_D000);
-    }
-
-    // Regression guard: `StorageAdapterDescriptor` must match `STORAGE_ADAPTER_DESCRIPTOR`
-    // (winioctl.h) field-for-field.
     #[test]
     fn storage_adapter_descriptor_matches_sdk_layout() {
         use std::mem::{offset_of, size_of};
@@ -668,8 +571,6 @@ mod tests {
         );
         // winioctl.h: CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, ANY)
         assert_eq!(IOCTL_STORAGE_QUERY_PROPERTY, ctl_code(0x2D, 0x500, 0, 0));
-        // winioctl.h: CTL_CODE(IOCTL_STORAGE_BASE, 0x0401, METHOD_BUFFERED, READ)
-        assert_eq!(IOCTL_STORAGE_RESET_DEVICE, ctl_code(0x2D, 0x401, 0, 1));
 
         // winioctl.h STORAGE_PROPERTY_ID / STORAGE_QUERY_TYPE enums.
         assert_eq!(STORAGE_ADAPTER_PROPERTY, 1); // StorageAdapterProperty (Device=0, Adapter=1)
