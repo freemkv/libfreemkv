@@ -48,8 +48,9 @@ fn arm_keepalive(stream: &TcpStream) {
     }
 }
 
-// Read-timeout expiry: EAGAIN on Unix, WSAETIMEDOUT on Windows. A TimedOut on
-// Unix, or on a Windows socket holding an error, is a dead peer and must surface.
+// Read-timeout expiry: EAGAIN on Unix, WSAETIMEDOUT on Windows. A Unix TimedOut is
+// a dead peer. Windows SO_ERROR on keepalive failure is unverified; the next read
+// still surfaces a dead peer as WSAENETRESET.
 fn is_poll_tick(kind: io::ErrorKind, windows: bool, socket_failed: bool) -> bool {
     match kind {
         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => true,
