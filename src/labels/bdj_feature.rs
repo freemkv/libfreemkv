@@ -179,20 +179,25 @@ fn props_hint(text: &str, exists: &dyn Fn(u16) -> bool) -> Option<FeaturePlaylis
             return None;
         }
         let (id, locator) = playlist_number(val)?;
-        (exists(id) && (locator || has(&["playlist", "pl", "mpls", "file"])))
+        (exists(id) && (locator || has(&["playlist", "pl", "mpls"])))
             .then(|| FeaturePlaylistHint::for_playlist(id))
     })
 }
 
 // A playlist number: 1-5 digits, optionally quoted, `.mpls`-suffixed or after a
-// `PLAYLIST:` locator. `.1` is true when the value itself names a playlist.
+// `PLAYLIST:` locator (which may continue, e.g. `.MARK:00001`). `.1` is true when
+// the value itself names a playlist.
 fn playlist_number(v: &str) -> Option<(u16, bool)> {
     let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
-    let lower = v.to_ascii_lowercase();
-    let (v, after_locator) = match lower.rfind("playlist:") {
-        Some(at) => (&v[at + "playlist:".len()..], true),
-        None => (v, false),
-    };
+    if let Some(at) = v.to_ascii_lowercase().rfind("playlist:") {
+        let rest = &v[at + "playlist:".len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let tail = &rest[digits..];
+        if !(1..=5).contains(&digits) || !(tail.is_empty() || tail.starts_with('.')) {
+            return None;
+        }
+        return Some((rest[..digits].parse().ok()?, true));
+    }
     let (v, mpls) = match v.len().checked_sub(".mpls".len()) {
         Some(at) if v.is_char_boundary(at) && v[at..].eq_ignore_ascii_case(".mpls") => {
             (&v[..at], true)
@@ -202,7 +207,7 @@ fn playlist_number(v: &str) -> Option<(u16, bool)> {
     if v.is_empty() || v.len() > 5 || !v.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((v.parse().ok()?, after_locator || mpls))
+    Some((v.parse().ok()?, mpls))
 }
 
 // ── Tier 2 ───────────────────────────────────────────────────────────────────
@@ -211,8 +216,8 @@ fn playlist_number(v: &str) -> Option<(u16, bool)> {
 // jar. Real menus reference a handful.
 const MAX_CANDIDATES: usize = 1024;
 
-// Cap on candidate playlists read from disc for scoring when the caller has no scan
-// stats; past it, candidates score as short.
+// Cap on candidate playlists re-read from disc for scoring (those missing from the
+// scan's stats); past it, Tier 2 abstains.
 const MAX_STAT_READS: usize = 32;
 
 // The feature must run at least this many times longer than the runner-up to be
@@ -220,8 +225,7 @@ const MAX_STAT_READS: usize = 32;
 const DOMINANCE_RATIO: f64 = 1.5;
 
 // Score the harvested candidates that are real playlists and pick a dominant one.
-// With scan stats, a playlist the scan dropped (sub-30 s or unparseable) scores as
-// short. Without them, candidates are read; an unreadable one → abstain.
+// A candidate missing from the scan's stats is re-read; an unreadable one → abstain.
 fn tier2_score(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
@@ -238,7 +242,9 @@ fn tier2_score(
     for id in hits {
         let (secs, aud) = match stats.get(&id) {
             Some(&stat) => stat,
-            None if !known.is_empty() || reads >= MAX_STAT_READS => (0, 0),
+            // Past the read budget the field is not resolvable.
+            None if reads >= MAX_STAT_READS => return None,
+            // The scan may have dropped it for a read failure: confirm by re-reading.
             None => {
                 reads += 1;
                 mpls_stats(reader, udf, id)?
@@ -502,7 +508,8 @@ mod tests {
             "main.feature.playlist.id = \"00800\"",
             "feature.playlist=bd://0.PLAYLIST:00800",
             "title.feature=00800.mpls",
-            "disc.feature.file=00800",
+            "disc.feature.file=00800.mpls",
+            "feature.playlist=bd://0.PLAYLIST:00800.MARK:00001",
         ] {
             let h = props_hint(text, &|_| true).unwrap_or_else(|| panic!("{text}"));
             assert_eq!(h.playlist_id, Some(800), "{text}");
@@ -514,6 +521,8 @@ mod tests {
     #[test]
     fn props_hint_needs_a_playlist_and_skips_missing_ones() {
         assert_eq!(props_hint("main.feature.id=00800", &|_| true), None);
+        // `file` alone may name a clip, not a playlist.
+        assert_eq!(props_hint("disc.feature.file=00800", &|_| true), None);
         let text = "feature.playlist=00012\nmain.feature.playlist=00800\n";
         let h = props_hint(text, &|id| id == 800).expect("later real playlist");
         assert_eq!(h.playlist_id, Some(800));
@@ -820,27 +829,46 @@ mod tests {
         assert_eq!(resolve(&mut disc, &udf, &[]), None);
     }
 
-    // With scan stats available, a candidate the scan dropped (sub-30 s or
-    // unparseable) scores as short without being re-read.
+    // A candidate missing from the scan stats is re-read: a confirmed short playlist
+    // scores normally, an unreadable one (the scan may have failed on it) abstains.
     #[test]
-    fn candidates_missing_from_scan_stats_score_as_short() {
-        let class = build_class(&["00800.mpls", "00801.mpls"]);
-        let jar = build_jar(&[("com/studio/MainXlet.class", class)]);
-        let (mut disc, udf) = build_disc(
-            vec![
-                ("00800.mpls", build_mpls(7000, 6)),
-                ("00801.mpls", b"garbage".to_vec()),
-            ],
-            vec![("00000.jar", jar)],
-            vec![],
-        );
+    fn candidates_missing_from_scan_stats_are_confirmed_by_a_re_read() {
         let known = [PlaylistStat {
             id: 800,
             secs: 7000,
             audio: 6,
         }];
-        let hint = resolve(&mut disc, &udf, &known).expect("hint");
-        assert_eq!(hint.playlist_id, Some(800));
+        for (other, want) in [(build_mpls(20, 2), Some(800)), (b"garbage".to_vec(), None)] {
+            let class = build_class(&["00800.mpls", "00801.mpls"]);
+            let jar = build_jar(&[("com/studio/MainXlet.class", class)]);
+            let (mut disc, udf) = build_disc(
+                vec![("00800.mpls", build_mpls(7000, 6)), ("00801.mpls", other)],
+                vec![("00000.jar", jar)],
+                vec![],
+            );
+            let got = resolve(&mut disc, &udf, &known).and_then(|h| h.playlist_id);
+            assert_eq!(got, want);
+        }
+    }
+
+    // More unscored candidates than the read budget is not a resolvable field.
+    #[test]
+    fn candidates_past_the_read_budget_abstain() {
+        let names: Vec<String> = (0..=MAX_STAT_READS as u16)
+            .map(|i| format!("{:05}.mpls", 100 + i))
+            .collect();
+        let mut refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        refs.push("00800.mpls");
+        let jar = build_jar(&[("com/studio/MainXlet.class", build_class(&refs))]);
+        let mut playlists = vec![("00800.mpls", build_mpls(7000, 6))];
+        playlists.extend(names.iter().map(|n| (n.as_str(), build_mpls(20, 2))));
+        let (mut disc, udf) = build_disc(playlists, vec![("00000.jar", jar)], vec![]);
+        let known = [PlaylistStat {
+            id: 800,
+            secs: 7000,
+            audio: 6,
+        }];
+        assert_eq!(resolve(&mut disc, &udf, &known), None);
     }
 
     // Stats for playlists the scan already parsed are reused, not re-read.
@@ -938,6 +966,18 @@ mod tests {
         });
         assert_eq!(seen, Some(()));
         assert!(ids.contains(&800), "{ids:?}");
+    }
+
+    // A damaged large jar with no end-of-central-directory record is rejected after
+    // reading only its tail, not scanned backwards chunk by chunk.
+    #[test]
+    fn large_jar_without_eocd_reads_only_its_tail() {
+        let junk = vec![0xAAu8; 512 * 1024];
+        let (mut disc, udf) = build_disc(vec![], vec![("00000.jar", junk)], vec![]);
+        let mut counting = Counting(&mut disc, Vec::new());
+        let opened = jar::visit_jars_limited(&mut counting, &udf, 0, |_, a| Some(a.is_some()));
+        assert_eq!(opened, Some(false));
+        assert!(counting.1.len() < 64, "read {} sectors", counting.1.len());
     }
 
     // A spent inflation budget abstains instead of scanning on.

@@ -93,9 +93,12 @@ where
                 .ok()
                 .map(|b| Box::new(Cursor::new(b)) as Box<dyn ReadSeek>)
         } else {
-            udf.file_extents(reader, &path).ok().map(|x| {
-                Box::new(ExtentReader::new(&mut *reader, x, entry.size)) as Box<dyn ReadSeek>
-            })
+            udf.extents_abs_at(reader, entry.meta_lba)
+                .ok()
+                .filter(|x| x.iter().all(|e| e.recorded || e.len == 0))
+                .map(|x| x.iter().map(|e| (e.lba, e.len as u64)).collect())
+                .map(|x| ExtentReader::new(&mut *reader, x, entry.size))
+                .and_then(|mut r| r.has_zip_tail().then(|| Box::new(r) as Box<dyn ReadSeek>))
         };
         let mut archive = src.and_then(|s| ZipArchive::new(s).ok());
         if let Some(r) = f(&entry.name, archive.as_mut()) {
@@ -106,13 +109,18 @@ where
 }
 
 // Sectors fetched per on-demand read.
-const CHUNK_SECTORS: u32 = 32;
+const CHUNK_SECTORS: u64 = 32;
 
-/// `Read + Seek` over a UDF file's absolute `(lba, sectors)` extents, fetching
-/// sectors on demand (one cached chunk). Reads end at the file's byte `size`.
+// A zip's end-of-central-directory record: signature, within the last 64 KiB + 22 bytes.
+const EOCD_SIG: &[u8; 4] = b"PK\x05\x06";
+const EOCD_SEARCH: u64 = 65_535 + 22;
+
+/// `Read + Seek` over a UDF file's absolute `(lba, byte length)` extents, fetching
+/// sectors on demand (one cached chunk, aligned to the read direction). Reads end at
+/// the file's byte `size`.
 pub struct ExtentReader<'a> {
     reader: &'a mut dyn SectorSource,
-    extents: Vec<(u32, u32)>,
+    extents: Vec<(u32, u64)>,
     size: u64,
     pos: u64,
     buf: Vec<u8>,
@@ -120,7 +128,7 @@ pub struct ExtentReader<'a> {
 }
 
 impl<'a> ExtentReader<'a> {
-    pub fn new(reader: &'a mut dyn SectorSource, extents: Vec<(u32, u32)>, size: u64) -> Self {
+    pub fn new(reader: &'a mut dyn SectorSource, extents: Vec<(u32, u64)>, size: u64) -> Self {
         Self {
             reader,
             extents,
@@ -131,22 +139,39 @@ impl<'a> ExtentReader<'a> {
         }
     }
 
-    // Load the chunk holding `self.pos`.
-    fn fill(&mut self) -> std::io::Result<()> {
+    /// Whether the file's tail holds an EOCD signature. Checked before the zip
+    /// reader's backward search, so a damaged jar costs one tail read, not a scan.
+    pub fn has_zip_tail(&mut self) -> bool {
+        let n = self.size.min(EOCD_SEARCH);
+        let mut tail = vec![0u8; n as usize];
+        let ok =
+            self.seek(SeekFrom::End(-(n as i64))).is_ok() && self.read_exact(&mut tail).is_ok();
+        ok && tail.windows(4).any(|w| w == EOCD_SIG) && self.seek(SeekFrom::Start(0)).is_ok()
+    }
+
+    // Load a chunk holding `self.pos`: ending at it when reading backwards, else
+    // starting at it. Only the extent's own bytes are exposed.
+    fn fill(&mut self, backward: bool) -> std::io::Result<()> {
         let mut base = 0u64;
-        for &(lba, secs) in &self.extents {
-            let len = secs as u64 * 2048;
+        for &(lba, len) in &self.extents {
             if self.pos < base + len {
-                let sec_off = ((self.pos - base) / 2048) as u32;
-                let count = (secs - sec_off).min(CHUNK_SECTORS);
-                let start = lba
-                    .checked_add(sec_off)
+                let sec = (self.pos - base) / 2048;
+                let first = if backward {
+                    sec.saturating_sub(CHUNK_SECTORS - 1)
+                } else {
+                    sec
+                };
+                let end = (first + CHUNK_SECTORS).min(len.div_ceil(2048));
+                let start = u32::try_from(first)
+                    .ok()
+                    .and_then(|f| lba.checked_add(f))
                     .ok_or(std::io::ErrorKind::InvalidData)?;
-                let mut buf = vec![0u8; count as usize * 2048];
+                let mut buf = vec![0u8; ((end - first) * 2048) as usize];
                 self.reader
-                    .read_sectors(start, count as u16, &mut buf, true)?;
+                    .read_sectors(start, (end - first) as u16, &mut buf, true)?;
+                buf.truncate((len - first * 2048).min(buf.len() as u64) as usize);
                 self.buf = buf;
-                self.buf_start = base + sec_off as u64 * 2048;
+                self.buf_start = base + first * 2048;
                 return Ok(());
             }
             base += len;
@@ -163,7 +188,8 @@ impl Read for ExtentReader<'_> {
         let cached =
             self.pos >= self.buf_start && self.pos < self.buf_start + self.buf.len() as u64;
         if !cached {
-            self.fill()?;
+            let backward = !self.buf.is_empty() && self.pos < self.buf_start;
+            self.fill(backward)?;
         }
         let off = (self.pos - self.buf_start) as usize;
         let n = out
