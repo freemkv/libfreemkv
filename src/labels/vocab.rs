@@ -378,7 +378,7 @@ const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[("iw", "he"), ("in", "id"), ("ji
 /// aliases for their replacements.
 ///
 /// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only spans the languages
-/// seen in Blu-ray menu-graphic filenames. Case- insensitive and trimmed. Returns `None` for
+/// seen in Blu-ray menu-graphic filenames. Case-insensitive and trimmed. Returns `None` for
 /// anything that is not an ISO 639-1 code — callers decide the fallback.
 pub fn iso639_1_to_iso639_2(code: &str) -> Option<&'static str> {
     let c = code.trim().to_ascii_lowercase();

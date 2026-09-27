@@ -936,8 +936,8 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
     };
 
     // Subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cr, Cb].
-    // Chroma order is Cr (byte 2) BEFORE Cb (byte 3) per the DVD-Video PGC CLUT format,
-    // NOT Cb first; consumer `mux::codec::dvdsub::ycbcr_to_rgb` must stay in lockstep or subtitle colours channel-swap.
+    // Chroma order is Cr (byte 2) BEFORE Cb (byte 3) per the DVD-Video PGC CLUT format;
+    // `mux::codec::dvdsub::ycbcr_to_rgb` must read it the same way.
     let palette = if pgc_offset + 0xA4 + 64 <= data.len() {
         let mut colors = Vec::with_capacity(16);
         for i in 0..16 {
@@ -1742,11 +1742,13 @@ mod tests {
             [0x00, 0x40, 0x11, 0x22],
             "stored as [pad, Y, Cr, Cb]"
         );
-        // The consumer interprets index 2 as Cr and index 3 as Cb (see
-        // dvdsub::ycbcr_to_rgb). Cross-check the same entry both ways.
-        let rgb = crate::mux::codec::dvdsub::ycbcr_to_rgb(&pal[0]);
-        let expected = crate::mux::codec::dvdsub::ycbcr_to_rgb(&[0x00, 0x40, 0x11, 0x22]);
-        assert_eq!(rgb, expected, "ifo and dvdsub must read Cr/Cb the same way");
+        // Consumer lockstep, checked against colour meaning rather than itself:
+        // a CLUT entry with high Cr (byte 2) and neutral Cb must render red.
+        let red = crate::mux::codec::dvdsub::ycbcr_to_rgb(&[0x00, 0x80, 0xF0, 0x80]);
+        assert!(
+            red[0] > 0xE0 && red[2] < 0x90,
+            "byte 2 must be read as Cr: {red:?}"
+        );
     }
 
     /// parse_pgc palette layout: each color is [padding, Y, Cr, Cb] and the
