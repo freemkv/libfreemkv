@@ -51,6 +51,28 @@ pub(crate) fn drop_unlock_fd(
     if fd >= 0 { Some(fd) } else { recovered }
 }
 
+/// How `Drop` sends its ALLOW MEDIUM REMOVAL.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DropUnlock {
+    /// No PREVENT of ours to clear (or no owned fd): just close.
+    Skip,
+    /// On a capped detached thread: SG_IO on a wedged node can block for long.
+    Detached(i32),
+    /// No thread to be had: closing an sg fd does not release PREVENT, so send
+    /// it here rather than strand the lock.
+    Inline(i32),
+}
+
+/// Pick the [`DropUnlock`] for `unlock_fd` (from [`drop_unlock_fd`]), given
+/// whether a detached thread is available.
+pub(crate) fn drop_unlock_plan(unlock_fd: Option<i32>, thread: bool) -> DropUnlock {
+    match unlock_fd {
+        None => DropUnlock::Skip,
+        Some(fd) if thread => DropUnlock::Detached(fd),
+        Some(fd) => DropUnlock::Inline(fd),
+    }
+}
+
 /// The empty slot. Not a valid fd; `open()` never returns a negative value.
 pub(crate) const EMPTY: i32 = -1;
 
@@ -163,6 +185,16 @@ mod tests {
             None,
             "ALLOW hit a dead bus"
         );
+    }
+
+    /// Closing an sg fd does not release PREVENT, so when no unlock thread can
+    /// be had (cap full, or spawn failed) the ALLOW is sent inline instead.
+    #[test]
+    fn drop_unlock_plan_falls_back_inline_without_a_thread() {
+        assert_eq!(drop_unlock_plan(None, true), DropUnlock::Skip);
+        assert_eq!(drop_unlock_plan(None, false), DropUnlock::Skip);
+        assert_eq!(drop_unlock_plan(Some(5), true), DropUnlock::Detached(5));
+        assert_eq!(drop_unlock_plan(Some(5), false), DropUnlock::Inline(5));
     }
 
     // ── Recovery-thread cap ────────────────────────────────────────────────

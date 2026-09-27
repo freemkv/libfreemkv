@@ -8,10 +8,21 @@
 - `css::CrackOutcome` is `#[non_exhaustive]` and gains `Halted` and `Unreadable(Error)`; it no longer derives `Clone`.
 - `Disc::decrypt_keys_for_title` takes a halt token and returns `Result`.
 - `aacs::content::decrypt_bus` is no longer public.
+- `scsi::linux::SgIoTransport`'s `fd` and `fd_recovery` fields are private.
+- `drive_has_disc` (Linux, Windows) classifies TEST UNIT READY sense per MMC-6 Table F.3: `Ok(false)` only for NOT READY 3Ah (medium not present); other NOT READY states, including 04/01 (becoming ready, MMC-6 §6.22.3), are `Ok(true)`; UNIT ATTENTION is re-polled up to 4 times; other sense is `Err`. macOS still answers from IOKit media presence.
+- `Drive::wait_ready` rides out transport failures until a run of 2+ has lasted 5 s past the first one's completion, sends one START UNIT on NOT READY 04/02, and fails at once on NOT READY 30h (incompatible medium) with that sense.
+- `list_drives` on Linux without sysfs keeps an sg node unless INQUIRY says it is not optical or open() finds no device, so a wedged or busy drive is still listed.
+- Dropping a transport or `Drive` unlocks the tray only if it locked it.
+- `Error::ImageTruncated` displays as `E<code>: have/want`.
+
+### Removed
+
+- `SptiTransport::reset` (Windows; unused).
 
 ### Added
 
 - `AudioChannels` gains 3.0, 3.1, 4.1, 6.0 and 7.0.
+- `DiscPresence` (`Present` / `Absent` / `Settling`) and `disc_presence(path)`: the tri-state answer `drive_has_disc` collapses (`Settling` counts as a disc).
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
 
 ### Fixed

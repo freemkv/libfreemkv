@@ -360,11 +360,12 @@ impl Drive {
         // The poll can take up to 30s (60 × 500ms). Heartbeat it so a slow
         // spin-up is visible as steady beats rather than a silent stall.
         let mut hb = crate::progress::Heartbeat::new("wait_ready");
-        let mut failing_since: Option<std::time::Instant> = None;
+        // (when the first failure of the current run completed, failures in it)
+        let mut failing: Option<(std::time::Instant, u32)> = None;
+        let mut start_sent = false;
         for attempt in 0..60u64 {
             hb.tick(attempt, 60);
             let mut buf = [0u8; 0];
-            let sent = std::time::Instant::now();
             // `checked_exec`, not bare `execute`: this poll (60 x 500 ms = ~30 s) must
             // see `self.halt`, or a Stop during cold spin-up is ignored for half a
             // minute. A TUR that FAILS is just not-ready-yet and keeps the loop going.
@@ -380,16 +381,32 @@ impl Drive {
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                // Transport failures can be a hiccup (DID_TIME_OUT/DID_RESET, the Linux
-                // fd-reopen gap): ride them out, but an unbroken run lasting the whole
-                // budget is a dead bus, surfaced rather than polled for 30 s.
+                // Transport failures (DID_TIME_OUT/DID_RESET, fd<0 DeviceNotFound) may be
+                // a hiccup; a run of 2+ lasting the budget past the first one's
+                // completion is a dead bus, surfaced rather than polled for 30 s.
                 Err(e) if e.is_scsi_transport_failure() => {
-                    let since = *failing_since.get_or_insert(sent);
-                    if since.elapsed() >= WAIT_READY_DEAD_BUS_BUDGET {
+                    let (since, n) = failing.get_or_insert((std::time::Instant::now(), 0));
+                    *n += 1;
+                    if *n >= 2 && since.elapsed() >= WAIT_READY_DEAD_BUS_BUDGET {
                         return Err(e);
                     }
                 }
-                Err(_) => failing_since = None,
+                Err(e) => {
+                    failing = None;
+                    let sense = e.scsi_sense().map(|s| (s.sense_key, s.asc, s.ascq));
+                    match sense {
+                        // Incompatible / unreadable medium (MMC-6 Table F.3) never
+                        // becomes ready: surface its sense now, not after 30 s.
+                        Some((crate::scsi::SENSE_KEY_NOT_READY, 0x30, _)) => return Err(e),
+                        // 04/02, initializing command required: nothing else spins the
+                        // unit up, so send START UNIT once, then keep polling.
+                        Some((crate::scsi::SENSE_KEY_NOT_READY, 0x04, 0x02)) if !start_sent => {
+                            start_sent = true;
+                            self.start_unit()?;
+                        }
+                        _ => {}
+                    }
+                }
             }
             // Halt-aware backoff: the flag can also flip DURING the 500 ms
             // gap, which is where most of the 30 s is actually spent.
@@ -1141,6 +1158,21 @@ impl Drive {
     /// BU40N is slot-loading; we NEVER eject to recover — a hands-on eject is a
     /// failure for an unattended service). Validated live 2026-07-01: took the
     /// drive from failing-every-read back to reading at MB/s.
+    // START STOP UNIT with START=1, LoEj=0 (never ejects). Only Halted propagates;
+    // a rejected START just leaves wait_ready polling.
+    fn start_unit(&mut self) -> Result<()> {
+        let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0];
+        let mut buf = [0u8; 0];
+        match self.checked_exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000) {
+            Err(Error::Halted) => Err(Error::Halted),
+            Err(e) => {
+                tracing::warn!(target: "freemkv::drive", phase = "wait_ready", error_code = e.code(), "START UNIT rejected");
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+        }
+    }
+
     pub fn spin_cycle(&mut self) -> Result<()> {
         let stop = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x00, 0]; // START=0, LOEJ=0 → spin down
         let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0]; // START=1, LOEJ=0 → spin up
@@ -1374,8 +1406,8 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
     last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
 }
 
-// How long an unbroken run of transport-class TUR failures may last before
-// wait_ready calls the bus dead (covers the Linux fd reopen and bridge resets).
+// How long an unbroken run of transport-class TUR failures may last, from the
+// first one's completion, before wait_ready calls the bus dead.
 const WAIT_READY_DEAD_BUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 // Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true, returning
@@ -3046,24 +3078,191 @@ mod command_tests {
         assert!(r.is_ok(), "4 fast failures (~2 s) are within budget: {r:?}");
     }
 
-    // Slow failing TURs (each eating its timeout) must not stretch the dead-bus
-    // verdict to count x timeout.
+    // TUR answers NOT READY with `sense` until a START STOP UNIT (START=1)
+    // arrives, then `after_start` more times, then GOOD. Counts the STARTs.
+    struct NeedsStart {
+        sense: crate::scsi::ScsiSense,
+        after_start: usize,
+        started: bool,
+        starts: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+    impl ScsiTransport for NeedsStart {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            let good = Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: 0,
+                sense: [0u8; 32],
+            });
+            if cdb[0] == SCSI_START_STOP_UNIT {
+                self.starts.lock().unwrap().push(cdb.to_vec());
+                self.started = true;
+                return good;
+            }
+            if self.started && self.after_start == 0 {
+                return good;
+            }
+            if self.started {
+                self.after_start -= 1;
+            }
+            Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense: Some(self.sense),
+            })
+        }
+    }
+
+    fn needs_start(asc: u8, ascq: u8, after_start: usize) -> (Drive, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let t = NeedsStart {
+            sense: crate::scsi::ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_NOT_READY,
+                asc,
+                ascq,
+            },
+            after_start,
+            started: false,
+            starts: starts.clone(),
+        };
+        (Drive::from_transport_for_test(Box::new(t)), starts)
+    }
+
+    // 02/04/02 (initializing command required): nothing spins the unit up unless
+    // wait_ready sends START UNIT, once, never ejecting, then keeps polling.
+    #[test]
+    fn wait_ready_sends_one_start_unit_on_initializing_command_required() {
+        let (mut d, starts) = needs_start(0x04, 0x02, 2);
+        let r = d.wait_ready();
+        assert!(
+            r.is_ok(),
+            "START UNIT must bring a stopped unit ready: {r:?}"
+        );
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 1, "exactly one START UNIT: {starts:?}");
+        assert_eq!(starts[0][4], 0x01, "START=1, LoEj=0");
+    }
+
+    // 02/30/xx (incompatible or blank medium) never becomes ready: surface it at
+    // once with its sense, not DeviceNotReady after ~30 s of polling.
+    #[test]
+    fn wait_ready_fails_fast_on_incompatible_medium() {
+        let (mut d, starts) = needs_start(0x30, 0x00, usize::MAX);
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(
+            matches!(&r, Err(e) if e.scsi_sense().is_some_and(|s| s.asc == 0x30)),
+            "incompatible medium must surface its sense: {r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(starts.lock().unwrap().is_empty(), "no START for 30h");
+    }
+
+    // One DID_TIME_OUT TUR eats its whole 5 s timeout; that single hiccup must
+    // not spend the dead-bus budget before the next TUR can succeed.
+    #[test]
+    fn wait_ready_rides_out_one_slow_transport_failure() {
+        struct SlowHiccup(bool);
+        impl ScsiTransport for SlowHiccup {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                if std::mem::replace(&mut self.0, false) {
+                    std::thread::sleep(std::time::Duration::from_millis(5_100));
+                    return Err(Error::ScsiError {
+                        opcode: cdb[0],
+                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                        sense: None,
+                    });
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(SlowHiccup(true)));
+        let r = d.wait_ready();
+        assert!(r.is_ok(), "one timed-out TUR is a hiccup: {r:?}");
+    }
+
+    // An unplugged drive (DeviceNotFound on every TUR, the Linux fd<0 state once
+    // the reopen fails) is a dead bus and must fail fast, not poll for ~30 s.
+    #[test]
+    fn wait_ready_fails_fast_on_an_unplugged_drive() {
+        struct Unplugged;
+        impl ScsiTransport for Unplugged {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                Err(Error::DeviceNotFound {
+                    path: "/dev/sg0".into(),
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(Unplugged));
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(matches!(r, Err(Error::DeviceNotFound { .. })), "{r:?}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(8),
+            "unplug must fail fast, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // Slow failing TURs: the verdict comes when the run has lasted the 5 s budget
+    // past the first failure's completion. With 1.2 s failures + 0.5 s backoff
+    // that is exactly the 4th failure, so any count rule (2, 3, ...) shows up.
     #[test]
     fn wait_ready_bounds_slow_transport_failures_by_elapsed_time() {
-        let mut d = Drive::from_transport_for_test(Box::new(FlakyBus {
-            fails: usize::MAX,
-            delay: std::time::Duration::from_millis(2_600),
-        }));
-        let t0 = std::time::Instant::now();
+        struct SlowDeadBus(Arc<std::sync::atomic::AtomicUsize>);
+        impl ScsiTransport for SlowDeadBus {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(1_200));
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                    sense: None,
+                })
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut d = Drive::from_transport_for_test(Box::new(SlowDeadBus(calls.clone())));
         let r = d.wait_ready();
         assert!(
             matches!(&r, Err(e) if e.is_scsi_transport_failure()),
             "{r:?}"
         );
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(8),
-            "dead bus must surface after ~5 s of failures, took {:?}",
-            t0.elapsed()
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            4,
+            "gives up on the first failure completing >= 5 s after the first"
         );
     }
 

@@ -52,7 +52,7 @@ unsafe extern "C" {
 
 // Strip the /dev/ (or raw-device /dev/r) prefix off a device path,
 // yielding the BSD name the shim's IOKit lookups take. Shared by
-// MacScsiTransport::open and drive_has_disc so they can't disagree.
+// MacScsiTransport::open and disc_presence so they can't disagree.
 fn bsd_name_of(device: &Path) -> Result<&str> {
     let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
         path: device.display().to_string(),
@@ -256,13 +256,13 @@ fn cstr_to_str(bytes: &[u8]) -> &str {
 // Media-presence probe via the IOKit registry only — no exclusive access, no unmount, no SCSI
 // command (open() force-unmounts the disc; a probe documented as side-effect-free must never do
 // that).
-pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
+pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
     let bsd_name = bsd_name_of(path)?;
     let mut bsd_c = bsd_name.as_bytes().to_vec();
     bsd_c.push(0);
     match unsafe { shim_media_present(bsd_c.as_ptr()) } {
-        1 => Ok(true),
-        0 => Ok(false),
+        1 => Ok(super::DiscPresence::Present),
+        0 => Ok(super::DiscPresence::Absent),
         // -1: IOKit itself is unavailable (IOMainPort / matching-dictionary
         // failure). That is not "no disc" — surface it rather than report a
         // false negative the caller would act on.
@@ -276,7 +276,7 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
 mod tests {
     use super::{
         K_MAX_CDB_SIZE, OPEN, ShimDriveInfo, bsd_name_of, cstr_to_str, device_path_for_selector,
-        drive_has_disc, drive_info_from_shim, map_shim_open_error,
+        disc_presence, drive_info_from_shim, map_shim_open_error,
     };
     use crate::error::Error;
     use std::path::Path;
@@ -377,8 +377,8 @@ mod tests {
         assert_eq!(cstr_to_str(&bytes), "");
     }
 
-    // Regression test: drive_has_disc used to open a FULL exclusive transport (force-unmount +
-    // 500ms sleep) on every poll tick. Checks it now answers Ok(false) fast with no lock held.
+    // Regression test: the presence probe used to open a FULL exclusive transport (force-unmount +
+    // 500ms sleep) on every poll tick. Checks it now answers Absent fast with no lock held.
     #[test]
     fn presence_probe_does_not_open_a_transport() {
         let path = Path::new("/dev/freemkv-no-such-device");
@@ -387,11 +387,11 @@ mod tests {
         // scopes the check to this call, can't flake, still catches a held lock.
         let open_before = OPEN.load(Ordering::Acquire);
         let t0 = std::time::Instant::now();
-        let r = drive_has_disc(path);
+        let r = disc_presence(path);
         let elapsed = t0.elapsed();
 
         assert!(
-            matches!(r, Ok(false)),
+            matches!(r, Ok(crate::scsi::DiscPresence::Absent)),
             "a device with no IOMedia must report absent media, got {r:?}"
         );
         assert!(

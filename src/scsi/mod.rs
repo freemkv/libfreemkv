@@ -498,30 +498,29 @@ pub fn list_drives() -> Vec<DriveInfo> {
     }
 }
 
-/// True if the drive at `path` currently has a disc inserted.
+/// Whether the drive at `path` holds a disc ([`DiscPresence`]).
 ///
-/// Issues TEST UNIT READY (cheapest SCSI op, no data transfer), a second one
-/// after a UNIT ATTENTION. GOOD, or NOT READY 04/02, 04/07 or 30h (loaded, not
-/// usable yet) → `Ok(true)`; NOT READY 3Ah (medium not present) → `Ok(false)`;
-/// anything else, including 04/01 (becoming ready), → `Err`: poll again.
-/// Suitable for poll-loop tick (~50 ms / drive on a healthy bus).
+/// Issues TEST UNIT READY (cheapest SCSI op, no data transfer), re-issued after
+/// a UNIT ATTENTION (up to 4 times), and classifies the sense per MMC-6 Table
+/// F.3. On macOS the answer comes from IOKit and is only `Present`/`Absent`.
 ///
 /// **No internal recovery.** A wedged target surfaces as `Err(Error::ScsiError)` with `status
-/// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None` — no bus/USB reset, no retry.
-pub fn drive_has_disc(path: &Path) -> Result<bool> {
+/// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None`, no bus/USB reset, no retry. Other
+/// non-NOT-READY sense is also `Err`.
+pub fn disc_presence(path: &Path) -> Result<DiscPresence> {
     #[cfg(target_os = "linux")]
     {
-        linux::drive_has_disc(path)
+        linux::disc_presence(path)
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos::drive_has_disc(path)
+        macos::disc_presence(path)
     }
 
     #[cfg(target_os = "windows")]
     {
-        windows::drive_has_disc(path)
+        windows::disc_presence(path)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -531,6 +530,13 @@ pub fn drive_has_disc(path: &Path) -> Result<bool> {
             target: std::env::consts::OS.to_string(),
         })
     }
+}
+
+/// True if the drive at `path` holds a disc: [`disc_presence`] with `Settling`
+/// counted as a disc ([`DiscPresence::has_disc`]). Suitable for a poll-loop tick
+/// (~50 ms / drive on a healthy bus).
+pub fn drive_has_disc(path: &Path) -> Result<bool> {
+    disc_presence(path).map(DiscPresence::has_disc)
 }
 
 // ── CDB builders (platform-agnostic) ────────────────────────────────────────
@@ -670,8 +676,8 @@ pub(crate) fn is_optical_peripheral(inquiry: &[u8]) -> bool {
         .is_some_and(|b| b & PERIPHERAL_TYPE_MASK == PERIPHERAL_TYPE_OPTICAL)
 }
 
-/// PREVENT ALLOW MEDIUM REMOVAL (1Eh): `Some` of the PREVENT field (CDB byte 4
-/// bits 1:0; 01 = prevent, 00 = allow, 1x = persistent), `None` otherwise.
+/// PREVENT ALLOW MEDIUM REMOVAL (1Eh): `Some` of CDB byte 4 bits 1:0 (MMC-6:
+/// bit 1 Persistent, bit 0 Prevent; SPC-4 §6.13), `None` for other commands.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn prevent_allow_request(cdb: &[u8]) -> Option<u8> {
     const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
@@ -681,34 +687,85 @@ pub(crate) fn prevent_allow_request(cdb: &[u8]) -> Option<u8> {
     }
 }
 
-/// Disc presence from TEST UNIT READY, `tur` issuing one TUR (Ok = GOOD). Only
-/// ASC 3Ah is MEDIUM NOT PRESENT; 04/02, 04/07 and 30h mean a disc is loaded
-/// but not usable yet (SPC-4 Annex D, MMC-6). A UNIT ATTENTION says nothing
-/// about the medium, so TUR is re-issued once; anything else is `Err`.
+/// Whether a drive holds a disc, from TEST UNIT READY sense (MMC-6 Table F.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DiscPresence {
+    /// A medium is loaded: GOOD, or a NOT READY state that only exists with one
+    /// (04/02, 04/04, 04/07, 04/08, 0Ch, 30h other than cleaning cartridges).
+    Present,
+    /// NOT READY 3Ah, MEDIUM NOT PRESENT (tray open or closed and empty).
+    Absent,
+    /// Not ready for a reason that does not settle presence: 04/01 (a mounted
+    /// disc spinning up or changing Format-layer, MMC-6 §6.22.3), 04/00, 04/03,
+    /// 04/09, 3Eh, cleaning cartridge, or another NOT READY. Poll again.
+    Settling,
+}
+
+impl DiscPresence {
+    /// The [`drive_has_disc`] answer: `Settling` counts as a disc, so a poll loop
+    /// never drops a session while a mounted disc re-spins.
+    pub fn has_disc(self) -> bool {
+        self != DiscPresence::Absent
+    }
+}
+
+/// [`DiscPresence`] from TEST UNIT READY, `tur` issuing one TUR (Ok = GOOD).
+/// UNIT ATTENTIONs are re-polled (up to 4); non-NOT-READY sense is `Err`.
 #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
-pub(crate) fn tur_presence(mut tur: impl FnMut() -> Result<()>) -> Result<bool> {
-    const ASC_NOT_READY: u8 = 0x04;
-    const ASCQ_INIT_REQUIRED: u8 = 0x02;
-    const ASCQ_OPERATION_IN_PROGRESS: u8 = 0x07;
-    const ASC_INCOMPATIBLE_MEDIUM: u8 = 0x30;
-    const ASC_MEDIUM_NOT_PRESENT: u8 = 0x3A;
-    let mut attention_seen = false;
+pub(crate) fn tur_disc_presence(mut tur: impl FnMut() -> Result<()>) -> Result<DiscPresence> {
+    const MAX_ATTENTION_RETRIES: u32 = 4;
+    let mut retries = 0;
     loop {
         let Err(e) = tur() else {
-            return Ok(true);
+            return Ok(DiscPresence::Present);
         };
         let Some(s) = e.scsi_sense().copied() else {
             return Err(e);
         };
-        match (s.sense_key, s.asc, s.ascq) {
-            (SENSE_KEY_NOT_READY, ASC_MEDIUM_NOT_PRESENT, _) => return Ok(false),
-            (SENSE_KEY_NOT_READY, ASC_NOT_READY, ASCQ_INIT_REQUIRED)
-            | (SENSE_KEY_NOT_READY, ASC_NOT_READY, ASCQ_OPERATION_IN_PROGRESS)
-            | (SENSE_KEY_NOT_READY, ASC_INCOMPATIBLE_MEDIUM, _) => return Ok(true),
-            (SENSE_KEY_UNIT_ATTENTION, _, _) if !attention_seen => attention_seen = true,
+        match s.sense_key {
+            SENSE_KEY_NOT_READY => return Ok(not_ready_presence(s.asc, s.ascq)),
+            SENSE_KEY_UNIT_ATTENTION if retries < MAX_ATTENTION_RETRIES => retries += 1,
             _ => return Err(e),
         }
     }
+}
+
+// MMC-6 Table F.3 / F.10 NOT READY ASC/ASCQ -> presence.
+fn not_ready_presence(asc: u8, ascq: u8) -> DiscPresence {
+    match (asc, ascq) {
+        (0x3A, _) => DiscPresence::Absent,
+        // Initializing cmd required, format / operation / long write in progress.
+        (0x04, 0x02 | 0x04 | 0x07 | 0x08) => DiscPresence::Present,
+        // Write error recovery needed, defects in error window.
+        (0x0C, 0x07 | 0x0F) => DiscPresence::Present,
+        // Cleaning cartridge installed / cleaning failure: no disc to rip.
+        (0x30, 0x03 | 0x07) => DiscPresence::Settling,
+        // Incompatible / unreadable medium installed.
+        (0x30, _) => DiscPresence::Present,
+        _ => DiscPresence::Settling,
+    }
+}
+
+/// Whether a no-sysfs (unfiltered) sg node belongs in `list_drives`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NodeProbe {
+    /// INQUIRY says peripheral type 05h.
+    Optical,
+    /// INQUIRY says another peripheral type.
+    NotOptical,
+    /// Opened but INQUIRY failed, or open failed with e.g. EBUSY/EACCES.
+    Unresponsive,
+    /// open() found no device (ENOENT, ENXIO, ENODEV).
+    Absent,
+}
+
+/// Kept unless definitively not an optical drive or not there: a wedged or busy
+/// drive must list as present (autorip: "unresponsive"), not as unplugged.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn keep_unfiltered_node(p: NodeProbe) -> bool {
+    matches!(p, NodeProbe::Optical | NodeProbe::Unresponsive)
 }
 
 /// Upper bound on an adapter AlignmentMask (page alignment).
@@ -751,70 +808,102 @@ mod transport_helper_tests {
         })
     }
 
-    // Runs `tur_presence` over scripted TUR outcomes; returns the verdict and
-    // how many TURs it issued.
-    fn presence(replies: Vec<Result<()>>) -> (Result<bool>, usize) {
+    // Runs `tur_disc_presence` over scripted TUR outcomes; returns the verdict
+    // and how many TURs it issued.
+    fn presence(replies: Vec<Result<()>>) -> (Result<DiscPresence>, usize) {
         let mut replies = replies.into_iter();
         let mut calls = 0;
-        let r = tur_presence(|| {
+        let r = tur_disc_presence(|| {
             calls += 1;
             replies.next().unwrap_or(Ok(()))
         });
         (r, calls)
     }
 
-    // SPC-4 Annex D / MMC-6: only ASC 3Ah is MEDIUM NOT PRESENT. A disc that is
-    // loaded but not usable yet (04/02, 04/07, 30h) is present; other NOT READY
-    // causes are not a presence answer.
-    #[test]
-    fn tur_presence_reads_the_asc_not_just_the_sense_key() {
-        assert!(matches!(presence(vec![Ok(())]), (Ok(true), 1)));
-        assert!(matches!(
-            presence(vec![tur_err(2, 0x3A, 0)]),
-            (Ok(false), 1)
-        ));
-        assert!(matches!(
-            presence(vec![tur_err(2, 0x3A, 2)]),
-            (Ok(false), 1)
-        ));
-        assert!(matches!(
-            presence(vec![tur_err(2, 0x04, 0x02)]),
-            (Ok(true), 1)
-        ));
-        assert!(matches!(
-            presence(vec![tur_err(2, 0x04, 0x07)]),
-            (Ok(true), 1)
-        ));
-        assert!(matches!(
-            presence(vec![tur_err(2, 0x30, 0x00)]),
-            (Ok(true), 1)
-        ));
-        assert!(matches!(
-            presence(vec![tur_err(2, 0x04, 0x01)]),
-            (Err(_), 1)
-        ));
-        assert!(matches!(presence(vec![tur_err(3, 0x11, 0)]), (Err(_), 1)));
+    fn one(sense_key: u8, asc: u8, ascq: u8) -> Result<DiscPresence> {
+        presence(vec![tur_err(sense_key, asc, ascq)]).0
     }
 
-    // A UNIT ATTENTION (06/28 after an insert, 06/29 after a reset) is reported
-    // once and says nothing about the medium: re-issue TUR and answer from that,
-    // never Ok(true) off the attention itself (autorip rips on the first true).
+    // MMC-6 Table F.3: only 3Ah is MEDIUM NOT PRESENT. 04/01 is a mounted disc
+    // spinning up or changing Format-layer (§6.22.3), so it is Settling, never
+    // Absent; states that only exist with a medium loaded are Present.
     #[test]
-    fn tur_presence_retries_once_after_a_unit_attention() {
-        let ua = || tur_err(6, 0x28, 0);
+    fn tur_disc_presence_follows_the_mmc6_readiness_table() {
+        use DiscPresence::*;
+        assert!(matches!(presence(vec![Ok(())]), (Ok(Present), 1)));
+        for ascq in [0x00, 0x01, 0x02] {
+            assert!(matches!(one(2, 0x3A, ascq), Ok(Absent)), "3A/{ascq:02x}");
+        }
+        for (asc, ascq) in [(0x04, 0x02), (0x04, 0x04), (0x04, 0x07), (0x04, 0x08)] {
+            assert!(
+                matches!(one(2, asc, ascq), Ok(Present)),
+                "{asc:02x}/{ascq:02x}"
+            );
+        }
+        for (asc, ascq) in [(0x0C, 0x07), (0x0C, 0x0F), (0x30, 0x00), (0x30, 0x02)] {
+            assert!(
+                matches!(one(2, asc, ascq), Ok(Present)),
+                "{asc:02x}/{ascq:02x}"
+            );
+        }
+        for (asc, ascq) in [(0x04, 0x00), (0x04, 0x01), (0x04, 0x03), (0x04, 0x09)] {
+            assert!(
+                matches!(one(2, asc, ascq), Ok(Settling)),
+                "{asc:02x}/{ascq:02x}"
+            );
+        }
+        for (asc, ascq) in [(0x3E, 0x00), (0x30, 0x03), (0x30, 0x07)] {
+            assert!(
+                matches!(one(2, asc, ascq), Ok(Settling)),
+                "{asc:02x}/{ascq:02x}"
+            );
+        }
+        assert!(one(3, 0x11, 0).is_err(), "not a NOT READY key");
+    }
+
+    // A UNIT ATTENTION says nothing about the medium, and several can be queued
+    // (06/29 reset, then 06/28 medium change): re-issue TUR up to 4 times.
+    #[test]
+    fn tur_disc_presence_retries_queued_unit_attentions() {
+        use DiscPresence::*;
+        let ua = |asc| tur_err(6, asc, 0);
         assert!(matches!(
-            presence(vec![ua(), tur_err(2, 0x3A, 0)]),
-            (Ok(false), 2)
-        ));
-        assert!(matches!(presence(vec![ua(), Ok(())]), (Ok(true), 2)));
-        assert!(matches!(
-            presence(vec![ua(), tur_err(2, 0x04, 0x01)]),
-            (Err(_), 2)
+            presence(vec![ua(0x28), tur_err(2, 0x3A, 0)]),
+            (Ok(Absent), 2)
         ));
         assert!(matches!(
-            presence(vec![ua(), tur_err(6, 0x29, 0)]),
-            (Err(_), 2)
+            presence(vec![ua(0x29), ua(0x28), Ok(())]),
+            (Ok(Present), 3)
         ));
+        assert!(matches!(
+            presence(vec![ua(0x28), tur_err(2, 4, 1)]),
+            (Ok(Settling), 2)
+        ));
+        let five = (0..5).map(|_| ua(0x28)).collect();
+        assert!(
+            matches!(presence(five), (Err(_), 5)),
+            "attentions never clear"
+        );
+    }
+
+    // drive_has_disc keeps its bool: Settling reads as "still there", so a poll
+    // loop never tears down a session while a mounted disc re-spins.
+    #[test]
+    fn drive_has_disc_maps_settling_to_present() {
+        assert!(DiscPresence::Present.has_disc());
+        assert!(DiscPresence::Settling.has_disc());
+        assert!(!DiscPresence::Absent.has_disc());
+    }
+
+    // Without sysfs, an sg node stays listed unless it is definitively not an
+    // optical drive or not there: a wedged or busy drive must read as present
+    // but unresponsive (autorip's "firmware unresponsive"), not as unplugged.
+    #[test]
+    fn unfiltered_sg_node_is_dropped_only_when_definitively_not_a_drive() {
+        assert!(keep_unfiltered_node(NodeProbe::Optical));
+        assert!(keep_unfiltered_node(NodeProbe::Unresponsive));
+        assert!(!keep_unfiltered_node(NodeProbe::NotOptical));
+        assert!(!keep_unfiltered_node(NodeProbe::Absent));
     }
 
     // Drop unlocks the tray only for a transport that issued a PREVENT; the

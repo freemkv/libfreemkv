@@ -7,8 +7,8 @@
 //! detached threads, see `fd_handoff`), so the fd is NOT stable across one.
 
 use super::fd_handoff::{
-    AtomicBool, AtomicI32, claim_for_teardown, drop_unlock_fd, publish_recovered_fd,
-    release_recovery_slot, reserve_recovery_slot, take_recovered_fd,
+    AtomicBool, AtomicI32, DropUnlock, claim_for_teardown, drop_unlock_fd, drop_unlock_plan,
+    publish_recovered_fd, release_recovery_slot, reserve_recovery_slot, take_recovered_fd,
 };
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -97,10 +97,16 @@ pub struct SgIoTransport {
 impl SgIoTransport {
     /// Open a SCSI device for use.
     pub fn open(device: &Path) -> Result<Self> {
+        Self::open_with_errno(device).map_err(|(e, _)| e)
+    }
+
+    // `open`, also handing back the failed open(2)'s errno.
+    fn open_with_errno(device: &Path) -> std::result::Result<Self, (Error, Option<i32>)> {
         let device = Self::resolve_to_sg(device);
         let fd = Self::open_fd(&device);
         if fd < 0 {
-            return Self::open_error(&device);
+            let err = std::io::Error::last_os_error();
+            return Err((Self::map_open_error(&err, &device), err.raw_os_error()));
         }
         Ok(SgIoTransport {
             fd,
@@ -127,8 +133,14 @@ impl SgIoTransport {
     // else DeviceNotFound. Path carried in the error; no English text (app
     // layer localizes).
     fn open_error<T>(device: &Path) -> Result<T> {
-        let err = std::io::Error::last_os_error();
-        Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
+        Err(Self::map_open_error(
+            &std::io::Error::last_os_error(),
+            device,
+        ))
+    }
+
+    fn map_open_error(err: &std::io::Error, device: &Path) -> Error {
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
             Error::DevicePermission {
                 path: device.display().to_string(),
             }
@@ -136,11 +148,11 @@ impl SgIoTransport {
             Error::DeviceNotFound {
                 path: device.display().to_string(),
             }
-        })
+        }
     }
 
     /// Send a no-data SCSI command on a bare fd, for callers with no transport
-    /// to route through `execute()`: `Drop`'s tray unlock and `drive_has_disc`.
+    /// to route through `execute()`: `Drop`'s tray unlock and `disc_presence`.
     /// The CDB goes through the shared [`super::checked_cdb_len`] guard.
     fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> Result<()> {
         let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
@@ -243,17 +255,29 @@ impl Drop for SgIoTransport {
             self.fd,
             recovered,
         );
-        // SG_IO on a wedged node returns only after the kernel EH ladder, so the
-        // ALLOW (and the close after it) run on a capped detached thread.
-        match unlock {
-            Some(fd) if reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS) => {
-                std::thread::spawn(move || {
+        let unlock_inline = |fd: i32| {
+            let _ = Self::raw_command(fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
+            close_all(&owned);
+        };
+        let thread =
+            unlock.is_some() && reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS);
+        match drop_unlock_plan(unlock, thread) {
+            DropUnlock::Skip => close_all(&owned),
+            DropUnlock::Inline(fd) => unlock_inline(fd),
+            DropUnlock::Detached(fd) => {
+                let fds = owned.clone();
+                let spawned = std::thread::Builder::new().spawn(move || {
                     let _ = Self::raw_command(fd, &ALLOW_MEDIUM_REMOVAL, 3_000);
-                    close_all(&owned);
+                    close_all(&fds);
                     release_recovery_slot(&RECOVERY_THREADS);
                 });
+                // Spawn failed: the slot is ours to give back, and the lock still
+                // needs clearing (closing the fd does not release PREVENT).
+                if spawned.is_err() {
+                    release_recovery_slot(&RECOVERY_THREADS);
+                    unlock_inline(fd);
+                }
             }
-            _ => close_all(&owned),
         }
     }
 }
@@ -487,9 +511,9 @@ impl ScsiTransport for SgIoTransport {
     }
 }
 
-// Lightweight discovery + presence (Linux): `list_drives` walks sysfs
-// type-5 nodes with an INQUIRY each. `drive_has_disc` sends TEST UNIT
-// READY; on the wedge signature (status `0xff`, no sense) it bubbles up.
+// Discovery + presence (Linux): `list_drives` walks sysfs type-5 nodes with an
+// INQUIRY each; without sysfs it keeps every sg node `keep_unfiltered_node` keeps.
+// `disc_presence` sends TEST UNIT READY; a wedge (0xFF, no sense) bubbles up.
 
 /// SCSI peripheral type 5 = "CD-ROM device" (covers DVD, BD-ROM, BD-RE, etc.).
 /// Stored in `/sys/class/scsi_generic/sgN/device/type` as ASCII decimal.
@@ -517,23 +541,32 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
         // INQUIRY-only probe — open transport, run INQUIRY, drop. No
         // identify, no init, no firmware reset preamble's secondary
         // commands beyond what `SgIoTransport::open` already does.
-        let info = match SgIoTransport::open(std::path::Path::new(&path)) {
-            Ok(mut transport) => match super::inquiry(&mut transport) {
-                Ok(r) if !type_filtered && !super::is_optical_peripheral(&r.raw) => continue,
-                Ok(r) => super::DriveInfo {
-                    path: path.clone(),
-                    vendor: pick_identity(r.vendor_id, &sysfs_vendor),
-                    model: pick_identity(r.model, &sysfs_model),
-                    firmware: pick_identity(r.firmware, &sysfs_firmware),
-                },
-                Err(_) => super::DriveInfo {
-                    path: path.clone(),
-                    vendor: sysfs_vendor,
-                    model: sysfs_model,
-                    firmware: sysfs_firmware,
-                },
+        let probed = SgIoTransport::open_with_errno(std::path::Path::new(&path))
+            .map(|mut t| super::inquiry(&mut t));
+        if !type_filtered {
+            let probe = match &probed {
+                Ok(Ok(r)) if super::is_optical_peripheral(&r.raw) => super::NodeProbe::Optical,
+                Ok(Ok(_)) => super::NodeProbe::NotOptical,
+                Ok(Err(_)) => super::NodeProbe::Unresponsive,
+                Err((_, Some(libc::ENOENT | libc::ENXIO | libc::ENODEV))) => {
+                    super::NodeProbe::Absent
+                }
+                Err(_) => super::NodeProbe::Unresponsive,
+            };
+            if !super::keep_unfiltered_node(probe) {
+                continue;
+            }
+        }
+        let info = match probed {
+            Ok(Ok(r)) => super::DriveInfo {
+                path: path.clone(),
+                vendor: pick_identity(r.vendor_id, &sysfs_vendor),
+                model: pick_identity(r.model, &sysfs_model),
+                firmware: pick_identity(r.firmware, &sysfs_firmware),
             },
-            Err(_) => super::DriveInfo {
+            // Present but unresponsive (wedged, busy, no permission): listed from
+            // what sysfs knows, so autorip reports it rather than an unplug.
+            _ => super::DriveInfo {
                 path: path.clone(),
                 vendor: sysfs_vendor,
                 model: sysfs_model,
@@ -606,15 +639,16 @@ pub(crate) fn enumerate_sg_names() -> (Vec<String>, bool) {
 }
 
 /// Send TEST UNIT READY directly — no transport, no reset, no side effects.
-pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
+pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
     let device = SgIoTransport::resolve_to_sg(path);
     let fd = SgIoTransport::open_fd(&device);
     if fd < 0 {
         return SgIoTransport::open_error(&device);
     }
     let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
-    let r =
-        super::tur_presence(|| SgIoTransport::raw_command(fd, &cdb, crate::scsi::TUR_TIMEOUT_MS));
+    let r = super::tur_disc_presence(|| {
+        SgIoTransport::raw_command(fd, &cdb, crate::scsi::TUR_TIMEOUT_MS)
+    });
     unsafe { libc::close(fd) };
     r
 }
