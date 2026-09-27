@@ -1071,11 +1071,16 @@ fn metadata_file_extents(
         let o = ad_off + i * ad_size;
         let raw = u32::from_le_bytes([fe[o], fe[o + 1], fe[o + 2], fe[o + 3]]);
         let len = raw & 0x3FFF_FFFF;
-        if len == 0 && i > 0 {
+        // Metadata lives only in recorded (type 0) ADs: a bad first AD is fatal,
+        // a later one ends the map.
+        if raw >> 30 != 0 {
+            if i == 0 {
+                return Err(bad);
+            }
             break;
         }
-        if raw >> 30 != 0 {
-            return Err(bad);
+        if len == 0 && i > 0 {
+            break;
         }
         let lba_off = if ad_size == 20 { o + 12 } else { o + 4 };
         let pos = u32::from_le_bytes([
@@ -1193,9 +1198,8 @@ fn read_directory(
         }
         (icb[ad_off..ad_off + l_ad].to_vec(), l_ad as u32)
     } else {
-        // Out-of-line: the FID list may span MULTIPLE ADs (only extent_type 0 is FID data);
-        // reading just the first AD truncated dirs whose FIDs cross an extent boundary, or
-        // misread a sparse/type-3 descriptor's (length,LBA) as FIDs. Walk the list, gathering every extent's sectors into one buffer, following type-3 continuations like `read_icb_extents`.
+        // Out-of-line: the FID list may span several ADs (only type 0 holds FIDs). Gather
+        // every recorded extent into one buffer, following type-3 continuations.
         let ad_size: usize = match ad_type {
             0 => 8,  // short_ad
             1 => 16, // long_ad
@@ -1394,7 +1398,7 @@ fn read_directory(
                         // Recurse into subdirectory. The depth cap guards against pathological
                         // nesting on a corrupt disc while covering real BD-ROM nesting
                         // (e.g. BDMV/BACKUP/BDJO/*.bdjo is 3 levels deep).
-                        let subdir = read_directory(
+                        let subdir = match read_directory(
                             reader,
                             part_start,
                             meta,
@@ -1403,7 +1407,20 @@ fn read_directory(
                             depth + 1,
                             budget,
                             visited,
-                        )?;
+                        ) {
+                            // Unfollowable AD chain: lose only this dir, as Linux/libudfread do.
+                            Err(e @ Error::UdfAdChainTooLong) => {
+                                tracing::warn!(target: "freemkv::udf", code = e.code(), icb_lba, "subdirectory listed empty");
+                                DirEntry {
+                                    name: entry_name,
+                                    is_dir: true,
+                                    meta_lba: icb_lba,
+                                    size: file_size,
+                                    entries: Vec::new(),
+                                }
+                            }
+                            other => other?,
+                        };
                         entries.push(subdir);
                     }
                 } else {
@@ -1727,8 +1744,8 @@ fn read_sector(reader: &mut dyn SectorSource, lba: u32, buf: &mut [u8]) -> Resul
 }
 
 // Load the continuation block a type-3 AD points at: an Allocation Extent Descriptor
-// (ECMA-167 4/14.5, tag 258, L_AD @20, ADs from 24). Returns (ad_start, ad_bytes);
-// `seen` rejects a chain that revisits a block.
+// (ECMA-167 4/14.5, tag 258, L_AD @20, ADs from 24). Returns (ad_start, ad_bytes).
+// A revisited, non-AED or overrunning block is an unfollowable chain (UdfAdChainTooLong).
 fn read_aed(
     reader: &mut dyn SectorSource,
     abs: u32,
@@ -1740,15 +1757,11 @@ fn read_aed(
     }
     seen.push(abs);
     read_sector(reader, abs, block)?;
-    if u16::from_le_bytes([block[0], block[1]]) != 258 {
-        return Err(Error::DiscRead {
-            sector: abs as u64,
-            status: None,
-            sense: None,
-        });
-    }
     let l_ad = u32::from_le_bytes([block[20], block[21], block[22], block[23]]) as usize;
-    Ok((24, l_ad.min(2048 - 24)))
+    if u16::from_le_bytes([block[0], block[1]]) != 258 || l_ad > block.len() - 24 {
+        return Err(Error::UdfAdChainTooLong);
+    }
+    Ok((24, l_ad))
 }
 
 #[cfg(test)]
@@ -4570,9 +4583,8 @@ mod tests {
 
     #[test]
     fn read_directory_reads_fids_spanning_multiple_allocation_descriptors() {
-        // A directory's FID list can span MORE than one AD (ECMA-167 4/14.14.1); reading
-        // only the first AD truncated it at the extent boundary, so every recorded extent
-        // must be gathered and walked. Extent 0 (sector 60) is packed to exactly 2048 bytes so the walk flows into extent 1 (sector 61), where the second file's FID lives.
+        // A FID list can span several ADs (ECMA-167 4/14.14.1). Extent 0 (sector 60) fills
+        // exactly 2048 bytes so the walk flows into extent 1 (sector 61) for the 2nd FID.
         let mut e0 = Vec::new();
         push_fid_iu(&mut e0, "", 5, true, true, 0); // parent (..), 40 bytes
         // Pad FIRST.CLPI's implementation-use area so e0 ends exactly at 2048.
@@ -4840,10 +4852,9 @@ mod tests {
 
     #[test]
     fn read_directory_masks_type_bits_so_a_zero_length_typed_ad_terminates() {
-        // ECMA-167 4/14.14.1.1: the head field is a 30-bit length plus a 2-bit extent type.
-        // Covers masking + the zero-length terminator only: a type-1 AD of length 0 ends
-        // the list; unmasked it reads non-zero and the walk runs on into GHOST. (The type
-        // 1/2 skip is covered by read_directory_does_not_read_unrecorded_extents_as_fids.)
+        // ECMA-167 4/14.14.1.1: masking + the zero-length terminator only. A type-1 AD of
+        // length 0 ends the list; unmasked it reads non-zero and the walk reaches GHOST.
+        // (The type 1/2 skip: read_directory_does_not_read_unrecorded_extents_as_fids.)
         let mut fids = Vec::new();
         push_fid_iu(&mut fids, "", 5, true, true, 0);
         push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 1959);
@@ -5750,6 +5761,74 @@ mod tests {
         disc.put_bytes(34, &lvd);
         let fs = super::read_filesystem(&mut disc).expect("FSD at LVD-recorded block mounts");
         assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+    }
+
+    // Only the FIRST Metadata File AD must be recorded; a later unrecorded AD ends
+    // the map rather than failing a mount that worked before extents were honoured.
+    #[test]
+    fn read_filesystem_mounts_a_metadata_file_with_a_trailing_unrecorded_extent() {
+        let spec = conformant_meta_vol();
+        let (mut disc, _) = build_meta_vol(&spec);
+        put_meta_fe(
+            &mut disc,
+            &spec,
+            &[(0, spec.meta_bytes, spec.meta_pos), (1, 2048, 5)],
+        );
+        let fs = super::read_filesystem(&mut disc).expect("trailing type-1 AD mounts");
+        assert_eq!(child_names(&fs.root), vec!["INDEX.BDMV".to_string()]);
+    }
+
+    // A subdirectory whose AD chain can't be followed is listed empty (as Linux and
+    // libudfread lose only that dir), so e.g. a broken BACKUP can't block the mount.
+    #[test]
+    fn read_directory_lists_a_subdirectory_with_a_broken_ad_chain_as_empty() {
+        let mut fids = Vec::new();
+        push_fid_iu(&mut fids, "", 5, true, true, 0);
+        push_fid_iu(&mut fids, "BACKUP", 9, true, false, 0);
+        push_fid_iu(&mut fids, "INDEX.BDMV", 7, false, false, 0);
+        let mut sec = [0u8; 2048];
+        sec[..fids.len()].copy_from_slice(&fids);
+        let mut reader = MemReader::new();
+        reader.put(
+            5,
+            build_dir_icb_flagged(0, &short_ads(&[(0, fids.len() as u32, 60)])),
+        );
+        reader.put(60, sec);
+        reader.put(7, build_efe_icb(11, 2048, 0));
+        reader.put(9, build_dir_icb_flagged(0, &short_ads(&[(3, 2048, 50)])));
+        let mut not_aed = build_cont_block(&[(0, 2048, 61)]);
+        not_aed[0..2].copy_from_slice(&0u16.to_le_bytes());
+        reader.put(50, not_aed);
+        let parsed = read_directory(
+            &mut reader,
+            0,
+            &MetaMap::contiguous(0),
+            5,
+            "ROOT",
+            0,
+            &mut 0,
+            &mut HashSet::new(),
+        )
+        .expect("a broken subdirectory must not fail the parent");
+        assert_eq!(
+            child_names(&parsed),
+            vec!["BACKUP".to_string(), "INDEX.BDMV".to_string()]
+        );
+        assert!(parsed.entries[0].is_dir && parsed.entries[0].entries.is_empty());
+    }
+
+    // An AED whose L_AD runs past its block is corrupt (Linux/libudfread reject it).
+    #[test]
+    fn icb_extents_reject_an_aed_whose_l_ad_overruns_the_block() {
+        let icb = build_efe(4096, &[(0, 2048, 10), (3, 2048, 50)]);
+        let mut cont = build_cont_block(&[(0, 2048, 20)]);
+        cont[20..24].copy_from_slice(&2025u32.to_le_bytes());
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        reader.put(50, cont);
+        let fs = fs_with(0, 0, file_entry("F", 5, 4096));
+        let res = fs.read_icb_extents(&mut reader, 5);
+        assert!(res.is_err(), "overrunning L_AD accepted: {res:?}");
     }
 }
 
