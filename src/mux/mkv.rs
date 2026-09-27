@@ -450,10 +450,12 @@ impl MkvTrack {
             field_duration_ns: 0,
             sample_rate: sr,
             channels: ch,
-            // KNOWN GAP, not deliberate: Matroska requires BitDepth for `A_PCM/INT/*`,
-            // but `LpcmParser` strips the BD/DVD framing that carries it and
-            // `AudioStream` has no bit-depth field; guessing 16 would be worse than 0.
-            bit_depth: 0,
+            // Matroska requires BitDepth for `A_PCM/INT/*`; `LpcmParser` always emits 24-bit.
+            bit_depth: if a.codec == Codec::Lpcm {
+                super::codec::lpcm::OUTPUT_BIT_DEPTH
+            } else {
+                0
+            },
             dv_config: None,
             hdr10: None,
             mvc_params: None,
@@ -933,7 +935,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::write_uint(&mut writer, ebml::FLAG_FORCED, 1)?;
             }
 
-            if let Some(ref cp) = track.codec_private {
+            // A_PCM defines no CodecPrivate; the LPCM parser's is BD re-mux metadata.
+            if let Some(ref cp) = track.codec_private
+                && track.codec_id != ebml::CODEC_PCM_BE
+            {
                 match mvc_record.as_ref() {
                     // MVC (Blu-ray 3D) base track: CodecPrivate = base-view avcC + `mvcC`
                     // extension, the track-level signal decoders read to recognise the
@@ -2469,6 +2474,37 @@ mod tests {
             purpose: LabelPurpose::Normal,
             label: String::new(),
         }
+    }
+
+    #[test]
+    fn lpcm_track_writes_bitdepth_24() {
+        // `LpcmParser` always emits 24-bit BE PCM; without BitDepth players assume
+        // 16-bit and decode noise. Check the element is actually written.
+        let track = MkvTrack::audio(&audio_stream(Codec::Lpcm));
+        assert_eq!(track.bit_depth, 24);
+        let mut buf = Cursor::new(Vec::new());
+        MkvMuxer::new(&mut buf, &[track], None, 0.0, &[]).unwrap();
+        let bytes = buf.into_inner();
+        // BitDepth (0x6264), size 1, value 24.
+        assert!(
+            bytes.windows(4).any(|w| w == [0x62, 0x64, 0x81, 24]),
+            "BitDepth=24 element present"
+        );
+    }
+
+    #[test]
+    fn lpcm_track_omits_codec_private() {
+        // The LPCM parser's codec_private is BD re-mux metadata (channel_assignment);
+        // A_PCM defines no CodecPrivate, so it must not reach the track header.
+        let mut track = MkvTrack::audio(&audio_stream(Codec::Lpcm));
+        track.codec_private = Some(vec![0x91]);
+        let mut buf = Cursor::new(Vec::new());
+        MkvMuxer::new(&mut buf, &[track], None, 0.0, &[]).unwrap();
+        let bytes = buf.into_inner();
+        assert!(
+            !bytes.windows(2).any(|w| w == [0x63, 0xA2]),
+            "no CodecPrivate"
+        );
     }
 
     #[test]

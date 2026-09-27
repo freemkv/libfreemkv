@@ -8,7 +8,7 @@
 //!   MMC-6 §5.3.10 — Feature 010Ch (Firmware Information)
 
 use crate::error::Result;
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{DataDirection, ScsiTransport, gc_feature_descriptor, gc_reply_len};
 
 /// Drive identity from standard SCSI commands.
 ///
@@ -69,25 +69,18 @@ impl DriveId {
         // Never decode past what the drive actually sent.
         inquiry.truncate(inq.bytes_transferred.min(inquiry.len()));
 
-        // GET CONFIGURATION Feature 010Ch — MMC-6 §6.6. Best-effort: an optional
-        // feature a drive may lack (CHECK CONDITION), so failure here is
-        // feature-absent (empty firmware date + raw bytes), not a probe abort.
+        // GET CONFIGURATION Feature 010Ch — MMC-6 §6.6. Best-effort: a drive may
+        // lack it, so failure is feature-absent, not a probe abort. Fields are
+        // bounded by the reply's own Data/Additional Length, not the transfer count.
         let mut gc = vec![0u8; 256];
         let cdb_gc = [0x46, 0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
-        // `bytes_transferred` is device-reported and untrusted; clamp every
-        // slice end to the actual buffer length before indexing.
         let (firmware_date, raw_gc_010c) =
             match transport.execute(&cdb_gc, DataDirection::FromDevice, &mut gc, 5000) {
-                Ok(result) => {
-                    let end = result.bytes_transferred.min(gc.len());
-                    let date = if end > 12 {
-                        String::from_utf8_lossy(&gc[12..24.min(end)])
-                            .trim()
-                            .to_string()
-                    } else {
-                        String::new()
-                    };
-                    (date, gc[..end].to_vec())
+                Ok(r) => {
+                    let date = gc_feature_descriptor(&gc, r.bytes_transferred, 0x010C)
+                        .map(|d| gc_text(&d[4..d.len().min(16)]))
+                        .unwrap_or_default();
+                    (date, gc[..gc_reply_len(&gc, r.bytes_transferred)].to_vec())
                 }
                 Err(_) => (String::new(), Vec::new()),
             };
@@ -97,23 +90,13 @@ impl DriveId {
         // bytes deliberately yields an empty serial rather than failing.
         let mut gc_serial = vec![0u8; 256];
         let cdb_serial = [0x46, 0x02, 0x01, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
-        let serial_number = if let Ok(r) =
-            transport.execute(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000)
-        {
-            if r.bytes_transferred > 12 {
-                // `bytes_transferred` is device-reported and untrusted; clamp
-                // the slice end to the buffer length to avoid an out-of-range
-                // panic on an oversized reported count.
-                let end = r.bytes_transferred.min(gc_serial.len());
-                String::from_utf8_lossy(&gc_serial[12..end])
-                    .trim()
-                    .to_string()
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
+        let serial_number =
+            match transport.execute(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000) {
+                Ok(r) => gc_feature_descriptor(&gc_serial, r.bytes_transferred, 0x0108)
+                    .map(|d| gc_text(&d[4..]))
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            };
 
         Ok(DriveId {
             vendor_id: ascii_field(&inquiry, 8, 16),
@@ -142,6 +125,11 @@ impl DriveId {
         }
     }
 
+    /// True if this is an MMC optical drive (INQUIRY peripheral device type 05h).
+    pub(crate) fn is_optical(&self) -> bool {
+        crate::scsi::is_optical_peripheral(&self.raw_inquiry)
+    }
+
     /// Profile match key: "VENDOR|PRODUCT|REVISION|VENDOR_SPECIFIC"
     ///
     /// Used to look up this drive in the profile database.
@@ -168,6 +156,13 @@ impl std::fmt::Display for DriveId {
             self.vendor_specific.trim()
         )
     }
+}
+
+// A GET CONFIGURATION text field: trims spaces and the NUL padding `trim` keeps.
+fn gc_text(field: &[u8]) -> String {
+    String::from_utf8_lossy(field)
+        .trim_matches(|c: char| c.is_whitespace() || c == '\0')
+        .to_string()
 }
 
 /// Extract an ASCII string field from raw SCSI data.
@@ -223,6 +218,22 @@ mod tests {
         let id = DriveId::from_drive(&mut t).expect("from_drive must not error");
         // raw_gc_010c is clamped to the 256-byte buffer, never the lie.
         assert_eq!(id.raw_gc_010c.len(), 256);
+    }
+
+    // INQUIRY byte 0: low 5 bits are the peripheral device type (5 = MMC), the
+    // high 3 the qualifier. The shared optical filter behind every find_drive(s).
+    #[test]
+    fn is_optical_reads_the_peripheral_device_type() {
+        let with_byte0 = |b0: u8| DriveId::from_inquiry(&[b0; 36], "");
+        assert!(with_byte0(0x05).is_optical());
+        assert!(with_byte0(0x25).is_optical(), "qualifier bits masked off");
+        assert!(!with_byte0(0x00).is_optical(), "direct-access disk");
+        assert!(!with_byte0(0x01).is_optical(), "tape");
+        assert!(!with_byte0(0x15).is_optical(), "type 0x15, not 0x05");
+        assert!(
+            !DriveId::from_inquiry(&[], "").is_optical(),
+            "no INQUIRY data"
+        );
     }
 
     #[test]
@@ -425,6 +436,16 @@ mod tests {
             for b in buf.iter_mut() {
                 *b = b'Z';
             }
+            // Well-formed GC header + descriptor for the requested feature, so
+            // only the transfer count bounds the decoded field.
+            if cdb.first() == Some(&0x46) && buf.len() >= 12 {
+                let dl = (buf.len() - 4) as u32;
+                buf[0..4].copy_from_slice(&dl.to_be_bytes());
+                buf[4..8].fill(0);
+                buf[8..10].copy_from_slice(&cdb[2..4]);
+                buf[10] = 0;
+                buf[11] = u8::try_from(buf.len() - 12).unwrap_or(u8::MAX);
+            }
             let bytes_transferred = match cdb.first() {
                 Some(&0x12) => buf.len(),
                 Some(&0x46) if cdb[3] == 0x0C => self.firmware_bytes,
@@ -485,6 +506,84 @@ mod tests {
         };
         let id = DriveId::from_drive(&mut t).unwrap();
         assert_eq!(id.serial_number, "Z");
+    }
+
+    // A GET CONFIGURATION (RT=10b) reply for `feature`: 8-byte header whose Data
+    // Length covers exactly the descriptor, then the 4-byte feature header.
+    fn gc_reply(feature: u16, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0u8; 12];
+        v[0..4].copy_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        v[8..10].copy_from_slice(&feature.to_be_bytes());
+        v[11] = payload.len() as u8;
+        v.extend_from_slice(payload);
+        v
+    }
+
+    // Answers INQUIRY honestly and each GET CONFIGURATION with a scripted reply,
+    // reporting the WHOLE buffer as transferred (resid unreported by the LLD).
+    struct GcReplyTransport {
+        firmware: Vec<u8>,
+        serial: Vec<u8>,
+    }
+
+    impl ScsiTransport for GcReplyTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            buf: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            buf.fill(0);
+            let reply: &[u8] = match (cdb[0], cdb[3]) {
+                (0x46, 0x0C) => &self.firmware,
+                (0x46, 0x08) => &self.serial,
+                _ => &[],
+            };
+            let n = reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&reply[..n]);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: buf.len(),
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    // MMC-6 §5.3: the field ends at the feature's Additional Length / the header
+    // Data Length, not at a transfer count the transport may over-report.
+    #[test]
+    fn from_drive_honours_gc_data_length_and_additional_length() {
+        let mut t = GcReplyTransport {
+            firmware: gc_reply(0x010C, b"201604250000\0\0\0\0"),
+            serial: gc_reply(0x0108, b"ABCD1234"),
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.serial_number, "ABCD1234");
+        assert_eq!(id.firmware_date, "201604250000");
+        assert_eq!(id.raw_gc_010c.len(), 28, "header + 20-byte descriptor");
+    }
+
+    // A drive lacking the feature answers RT=10b with only the 8-byte header.
+    #[test]
+    fn from_drive_absent_or_foreign_gc_feature_yields_empty_fields() {
+        let header_only = vec![0, 0, 0, 4, 0, 0, 0, 0];
+        let mut t = GcReplyTransport {
+            firmware: header_only.clone(),
+            serial: header_only,
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.serial_number, "", "absent 0108h is no serial");
+        assert_eq!(id.firmware_date, "", "absent 010Ch is no date");
+
+        // A descriptor for some OTHER feature is not the one asked for.
+        let mut t = GcReplyTransport {
+            firmware: gc_reply(0x0001, b"201604250000"),
+            serial: gc_reply(0x0001, b"ABCD1234"),
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.serial_number, "");
+        assert_eq!(id.firmware_date, "");
     }
 
     #[test]

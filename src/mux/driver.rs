@@ -159,7 +159,9 @@ pub struct MuxOptions {
 /// `'static` `EventFn`. Progress is split into read-side and write-side callbacks (CLI renders
 /// WRITE, autorip READ).
 pub trait MuxEvents: Send + Sync + 'static {
-    /// Fired once, immediately after the output sink is created.
+    /// Fired once, immediately after the output sink is created. The title lists
+    /// only streams the sink will write (tracks it refused are removed, so indices
+    /// compact); `MuxOutcome::undelivered_streams` keeps source-title indices.
     fn on_output_opened(&self, _title: &DiscTitle) {}
     /// Fired periodically from the reader side with the running read-byte count
     /// and the source extents' total byte estimate.
@@ -201,9 +203,8 @@ pub struct MuxOutcome {
     /// Number of streams in the muxed title.
     pub streams: usize,
     /// `title.streams` indices the output sink accepted frames for but could not
-    /// put in the finished container (`Stream::undelivered_streams`) — today only
-    /// the `mp4://` sink, which must drop an audio track no frame of which
-    /// yielded a parseable sample entry.
+    /// put in the finished container (`Stream::undelivered_streams`): `mp4://` audio
+    /// with no parseable sample entry, and `m2ts://` LPCM that BD LPCM can't carry.
     ///
     /// Non-empty means the file does NOT match the pre-mux plan even with `completed = true`. A
     /// caller reporting a successful export must report these too — a lossy outcome is never
@@ -600,7 +601,7 @@ fn drive_mux(
                         buffered_bytes,
                         cap = HEADER_BUFFER_CAP_BYTES,
                         "header buffer cap exceeded: the title keeps yielding frames but a \
-                         required codec_private (video or AAC) never resolved; refusing \
+                         required codec_private (video, AAC or BD LPCM) never resolved; refusing \
                          rather than buffering the whole stream into RAM"
                     );
                     return Err(Error::MuxHeaderBufferExceeded {
@@ -615,7 +616,7 @@ fn drive_mux(
 
     // ── Header gate ── Halt first, whatever headers_ready() says: on the
     // highway path a halt can end the stream as `Ok(None)`, and that EOF also
-    // releases the AAC wait, so a ready gate does not mean the pump finished.
+    // releases the in-band config wait, so a ready gate does not mean the pump finished.
     if halt.is_cancelled() {
         return Ok(MuxOutcome {
             completed: false,
@@ -641,6 +642,7 @@ fn drive_mux(
     out_title.codec_privates = (0..info.streams.len())
         .map(|i| stream.codec_private(i))
         .collect();
+    crate::mux::codec::lpcm::correct_title_layout(&mut out_title);
     // AAC tracks whose ASC was unknown at header time: handed to the sink when
     // it resolves (a seekable MKV backpatches it).
     let mut late_aac: Vec<usize> = info
@@ -665,8 +667,25 @@ fn drive_mux(
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
+    // A sink may refuse a stream at open (m2ts: LPCM BD LPCM can't carry); the
+    // opened title lists only what will be written.
+    let refused = output_stream.undelivered_streams();
+    if refused.is_empty() {
+        events.on_output_opened(&out_title);
+    } else {
+        let mut opened = out_title.clone();
+        let keep = |i: &usize| !refused.contains(i);
+        opened.streams = (0..opened.streams.len())
+            .filter(keep)
+            .map(|i| out_title.streams[i].clone())
+            .collect();
+        opened.codec_privates = (0..out_title.codec_privates.len())
+            .filter(keep)
+            .map(|i| out_title.codec_privates[i].clone())
+            .collect();
+        events.on_output_opened(&opened);
+    }
     let output_stream = CountingStream::new(output_stream);
-    events.on_output_opened(&out_title);
 
     // The write consumer runs on its own thread so the latency-bound sink write
     // overlaps the next `stream.read()`. `bytes` mirrors the consumer's running
@@ -2242,6 +2261,231 @@ mod tests {
         fn undelivered_streams(&self) -> Vec<usize> {
             vec![1]
         }
+    }
+
+    /// A source stream carrying one BD LPCM track, declared per `channels`/`rate`,
+    /// whose parser reported `layout` (the tagged BD header byte) as codec_private.
+    struct LpcmSource {
+        info: DiscTitle,
+        layout: Option<Vec<u8>>,
+        frames: usize,
+    }
+    impl LpcmSource {
+        fn new(
+            channels: crate::disc::AudioChannels,
+            rate: crate::disc::SampleRate,
+            layout: Option<Vec<u8>>,
+        ) -> Self {
+            let lpcm = crate::disc::Codec::Lpcm;
+            let mut info = DiscTitle::empty();
+            info.streams = vec![crate::disc::Stream::Audio(crate::disc::AudioStream {
+                pid: 0x1100,
+                codec: lpcm,
+                channels,
+                language: "eng".into(),
+                sample_rate: rate,
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: crate::labels::generate_audio_label(&lpcm, &channels, false),
+            })];
+            LpcmSource {
+                info,
+                layout,
+                frames: 1,
+            }
+        }
+    }
+    impl Stream for LpcmSource {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            if self.frames == 0 {
+                return Ok(None);
+            }
+            self.frames -= 1;
+            Ok(Some(PesFrame {
+                discard_padding_ns: 0,
+                track: 0,
+                pts: 0,
+                keyframe: true,
+                data: vec![0; 240 * 8 * 3],
+                duration_ns: None,
+                source: None,
+                coding: None,
+            }))
+        }
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+        fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {
+            self.layout.clone()
+        }
+    }
+
+    /// Keeps the title handed to `on_output_opened`.
+    #[derive(Default)]
+    struct TitleSpy(std::sync::Mutex<Option<DiscTitle>>);
+    impl MuxEvents for TitleSpy {
+        fn on_output_opened(&self, title: &DiscTitle) {
+            *self.0.lock().unwrap() = Some(title.clone());
+        }
+    }
+
+    fn run(src: LpcmSource, url: &str, spy: &TitleSpy) -> MuxOutcome {
+        let d = Duration::from_secs(60);
+        drive_mux(Box::new(src), url, &Halt::new(), spy, None, d, None).unwrap()
+    }
+
+    // Every entry point (Url/Session/Iso/Live) funnels into drive_mux: the BD LPCM
+    // layout byte must override the playlist's "5.1" for 7.1 audio there.
+    #[test]
+    fn drive_mux_corrects_lpcm_channels_from_the_parser_layout() {
+        use crate::disc::{AudioChannels, SampleRate};
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("mkv://{}", dir.path().join("o.mkv").display());
+        let layout = Some(b"BDLP\xB4".to_vec());
+        let src = LpcmSource::new(AudioChannels::Surround51, SampleRate::S48, layout);
+        let spy = TitleSpy::default();
+        run(src, &url, &spy);
+        let t = spy.0.lock().unwrap().clone().unwrap();
+        let crate::disc::Stream::Audio(a) = &t.streams[0] else {
+            panic!("audio")
+        };
+        assert_eq!(a.channels, AudioChannels::Surround71);
+        assert_eq!(a.sample_rate, SampleRate::S96);
+        let want = crate::labels::generate_audio_label(&a.codec, &AudioChannels::Surround71, false);
+        assert_eq!(a.label, want);
+    }
+
+    /// BD source whose LPCM layout byte exists only once the first PES has been
+    /// parsed, gated by the real `HeaderGate` (as DiscStream/PipelinedPesStream are).
+    struct GatedLpcm {
+        info: DiscTitle,
+        parser: crate::mux::codec::lpcm::LpcmParser,
+        gate: crate::mux::header_gate::HeaderGate,
+        pes: std::collections::VecDeque<Vec<u8>>,
+    }
+    impl GatedLpcm {
+        fn new(with_video: bool) -> Self {
+            use crate::mux::codec::CodecParser as _;
+            let src = LpcmSource::new(
+                crate::disc::AudioChannels::Surround51,
+                crate::disc::SampleRate::S48,
+                None,
+            );
+            let mut info = src.info;
+            if with_video {
+                let v = LateAacStream::new().info.streams[0].clone();
+                info.streams.insert(0, v);
+            }
+            // 7.1 (assignment 11) @ 96 kHz, 24-bit: 480 samples = 5 ms.
+            let mut pes = vec![0x00, 0x00, 0xB4, 0xC0];
+            pes.extend(vec![0u8; 480 * 8 * 3]);
+            let parser = crate::mux::codec::lpcm::LpcmParser::new();
+            assert!(parser.codec_private().is_none());
+            GatedLpcm {
+                info,
+                parser,
+                gate: Default::default(),
+                pes: [pes.clone(), pes].into(),
+            }
+        }
+        fn lpcm_track(&self) -> usize {
+            self.info.streams.len() - 1
+        }
+    }
+    impl Stream for GatedLpcm {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            use crate::mux::codec::CodecParser as _;
+            let Some(data) = self.pes.pop_front() else {
+                self.gate.expire();
+                return Ok(None);
+            };
+            let pkt = crate::mux::ts::PesPacket {
+                source: None,
+                pid: 0x1100,
+                pts: Some(0),
+                dts: None,
+                data,
+                discontinuity: false,
+            };
+            let f = self.parser.parse(&pkt).remove(0);
+            let frame = PesFrame {
+                discard_padding_ns: 0,
+                track: self.lpcm_track(),
+                pts: f.pts_ns,
+                keyframe: true,
+                data: f.data,
+                duration_ns: None,
+                source: None,
+                coding: None,
+            };
+            self.gate.observe(&frame);
+            Ok(Some(frame))
+        }
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+        fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+            use crate::mux::codec::CodecParser as _;
+            if track == self.lpcm_track() {
+                self.parser.codec_private()
+            } else {
+                Some(vec![1, 0x64, 0, 0x28, 0xFF, 0xE0, 0, 0]) // minimal avcC
+            }
+        }
+        fn headers_ready(&self) -> bool {
+            self.gate.ready(&self.info, |i| self.codec_private(i))
+        }
+    }
+
+    // The layout byte arrives only after the first read: the header gate must wait
+    // for it, or a 7.1/96k track is declared as the playlist's 5.1/48k.
+    #[test]
+    fn late_lpcm_layout_byte_still_corrects_the_header() {
+        use crate::disc::{AudioChannels, SampleRate};
+        for with_video in [false, true] {
+            let src = GatedLpcm::new(with_video);
+            assert!(!src.headers_ready(), "BD LPCM waits for its layout byte");
+            let dir = tempfile::tempdir().unwrap();
+            // m2ts: an MKV with a declared but frameless video track is refused.
+            let url = format!("m2ts://{}", dir.path().join("o.m2ts").display());
+            let spy = TitleSpy::default();
+            let d = Duration::from_secs(60);
+            drive_mux(Box::new(src), &url, &Halt::new(), &spy, None, d, None).unwrap();
+            let t = spy.0.lock().unwrap().clone().unwrap();
+            let crate::disc::Stream::Audio(a) = t.streams.last().unwrap() else {
+                panic!("audio")
+            };
+            assert_eq!(a.channels, AudioChannels::Surround71, "video={with_video}");
+            assert_eq!(a.sample_rate, SampleRate::S96, "video={with_video}");
+        }
+    }
+
+    #[test]
+    fn m2ts_dropped_lpcm_is_undelivered_and_not_in_the_opened_title() {
+        use crate::disc::{AudioChannels, SampleRate};
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("m2ts://{}", dir.path().join("o.m2ts").display());
+        // Track 0 (48 kHz) is written; track 1 (44.1 kHz) cannot be BD LPCM.
+        let mut src = LpcmSource::new(AudioChannels::Stereo, SampleRate::S48, None);
+        let other = LpcmSource::new(AudioChannels::Stereo, SampleRate::S44_1, None);
+        src.info.streams.extend(other.info.streams);
+        let spy = TitleSpy::default();
+        let out = run(src, &url, &spy);
+        assert_eq!(out.undelivered_streams, vec![1]);
+        let opened = spy.0.lock().unwrap().clone().unwrap();
+        assert_eq!(opened.streams.len(), 1, "only the carried track is listed");
     }
 
     // The sink lives in the consumer thread and is destroyed with it, so an

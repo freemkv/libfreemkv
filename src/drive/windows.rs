@@ -5,10 +5,6 @@ use crate::error::Result;
 use crate::identity::DriveId;
 use std::path::Path;
 
-/// SCSI peripheral device type 5 = MMC / optical, in the low 5 bits of
-/// INQUIRY byte 0.
-const SCSI_PERIPHERAL_TYPE_OPTICAL: u8 = 0x05;
-
 /// Discover optical drives. Probes `\\.\CdRom0..15` first; only if none
 /// are found does it fall back to scanning drive letters `D..Z`. Each
 /// candidate is opened, INQUIRY'd, and kept only if its peripheral device
@@ -19,14 +15,11 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     // Try CdRom0..CdRom15
     for i in 0..16 {
         let path = format!("\\\\.\\CdRom{}", i);
-        if let Ok(mut transport) = crate::scsi::open(Path::new(&path)) {
-            if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                if !id.raw_inquiry.is_empty()
-                    && (id.raw_inquiry[0] & 0x1F) == SCSI_PERIPHERAL_TYPE_OPTICAL
-                {
-                    drives.push((path, id));
-                }
-            }
+        if let Ok(mut transport) = crate::scsi::open(Path::new(&path))
+            && let Ok(id) = DriveId::from_drive(transport.as_mut())
+            && id.is_optical()
+        {
+            drives.push((path, id));
         }
     }
 
@@ -34,21 +27,23 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     if drives.is_empty() {
         for letter in b'D'..=b'Z' {
             let path = format!("{}:", letter as char);
-            if let Ok(mut transport) = crate::scsi::open(Path::new(&path)) {
-                if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                    if !id.raw_inquiry.is_empty()
-                        && (id.raw_inquiry[0] & 0x1F) == SCSI_PERIPHERAL_TYPE_OPTICAL
-                    {
-                        // Normalize so returned paths are consistently in
-                        // \\.\ form regardless of which loop matched.
-                        drives.push((normalize_path(&path), id));
-                    }
-                }
+            if let Ok(mut transport) = crate::scsi::open(Path::new(&path))
+                && let Ok(id) = DriveId::from_drive(transport.as_mut())
+                && id.is_optical()
+            {
+                // Normalize so returned paths are consistently in
+                // \\.\ form regardless of which loop matched.
+                drives.push((normalize_path(&path), id));
             }
         }
     }
 
     drives
+}
+
+/// Candidate drive paths for `find_drive`.
+pub(crate) fn candidate_paths() -> Vec<String> {
+    find_drives().into_iter().map(|(path, _)| path).collect()
 }
 
 /// Resolve a device path to its normalized Windows `\\.\` form. Windows

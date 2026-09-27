@@ -498,29 +498,29 @@ pub fn list_drives() -> Vec<DriveInfo> {
     }
 }
 
-/// True if the drive at `path` currently has a disc inserted.
+/// Whether the drive at `path` holds a disc ([`DiscPresence`]).
 ///
-/// Issues a single TEST UNIT READY (cheapest SCSI op, no data transfer).
-/// Sense-key 2 ("not ready, medium not present") → `Ok(false)`; any other
-/// ready/not-ready response → `Ok(true)`. Suitable for poll-loop tick
-/// (~50 ms / drive on a healthy bus).
+/// Issues TEST UNIT READY (cheapest SCSI op, no data transfer), re-issued after
+/// a UNIT ATTENTION (up to 4 times), and classifies the sense (derived from
+/// MMC-6 Table F.3). On macOS the answer comes from IOKit and is only `Present`/`Absent`.
 ///
 /// **No internal recovery.** A wedged target surfaces as `Err(Error::ScsiError)` with `status
-/// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None` — no bus/USB reset, no retry.
-pub fn drive_has_disc(path: &Path) -> Result<bool> {
+/// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None`, no bus/USB reset, no retry. Other
+/// non-NOT-READY sense is also `Err`.
+pub fn disc_presence(path: &Path) -> Result<DiscPresence> {
     #[cfg(target_os = "linux")]
     {
-        linux::drive_has_disc(path)
+        linux::disc_presence(path)
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos::drive_has_disc(path)
+        macos::disc_presence(path)
     }
 
     #[cfg(target_os = "windows")]
     {
-        windows::drive_has_disc(path)
+        windows::disc_presence(path)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -530,6 +530,13 @@ pub fn drive_has_disc(path: &Path) -> Result<bool> {
             target: std::env::consts::OS.to_string(),
         })
     }
+}
+
+/// True if the drive at `path` holds a disc: [`disc_presence`] with `Settling`
+/// counted as a disc ([`DiscPresence::has_disc`]). Suitable for a poll-loop tick
+/// (~50 ms / drive on a healthy bus).
+pub fn drive_has_disc(path: &Path) -> Result<bool> {
+    disc_presence(path).map(DiscPresence::has_disc)
 }
 
 // ── CDB builders (platform-agnostic) ────────────────────────────────────────
@@ -557,8 +564,11 @@ pub fn inquiry(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
     })
 }
 
-/// Send GET CONFIGURATION for feature 0x010C (Firmware Information).
+/// Send GET CONFIGURATION for feature 0x010C (Firmware Information). Returns
+/// the reply (8-byte header + descriptor) cut to what the drive actually sent.
 pub fn get_config_010c(scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
+    // 8-byte header + 20-byte 010Ch descriptor (MMC-6 §5.3.10).
+    const ALLOC: u8 = 28;
     let cdb = [
         SCSI_GET_CONFIGURATION,
         0x02,
@@ -568,12 +578,38 @@ pub fn get_config_010c(scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
         0x00,
         0x00,
         0x00,
-        0x10,
+        ALLOC,
         0x00,
     ];
-    let mut buf = [0u8; 16];
-    scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
-    Ok(buf.to_vec())
+    let mut buf = [0u8; ALLOC as usize];
+    let r = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
+    Ok(buf[..gc_reply_len(&buf, r.bytes_transferred)].to_vec())
+}
+
+/// Valid length of a GET CONFIGURATION reply: the transfer count, clamped to the
+/// buffer and to the header's Data Length + 4 (MMC-6 §5.3.1).
+pub(crate) fn gc_reply_len(buf: &[u8], transferred: usize) -> usize {
+    let end = transferred.min(buf.len());
+    match buf.get(..4) {
+        Some(h) if end >= 4 => {
+            let data_len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+            end.min(data_len.saturating_add(4))
+        }
+        _ => end,
+    }
+}
+
+/// The descriptor for `feature` in a GET CONFIGURATION (RT=10b) reply, feature
+/// header included, bounded by [`gc_reply_len`] and its Additional Length. `None`
+/// when the drive answered header-only (feature absent) or with another feature.
+#[cfg_attr(not(feature = "rip"), allow(dead_code))]
+pub(crate) fn gc_feature_descriptor(buf: &[u8], transferred: usize, feature: u16) -> Option<&[u8]> {
+    let reply = &buf[..gc_reply_len(buf, transferred)];
+    let desc = reply.get(8..)?;
+    if desc.len() < 4 || u16::from_be_bytes([desc[0], desc[1]]) != feature {
+        return None;
+    }
+    Some(&desc[..desc.len().min(4 + usize::from(desc[3]))])
 }
 
 /// Build a READ BUFFER CDB.
@@ -627,6 +663,350 @@ pub fn build_read10_fua(lba: u32, count: u16) -> [u8; 10] {
         count as u8,
         0x00,
     ]
+}
+
+/// True if INQUIRY byte 0's peripheral device type (low 5 bits; the high 3
+/// are the qualifier) is 05h, an MMC optical drive (SPC-4 §6.4.2).
+#[cfg_attr(not(any(feature = "rip", target_os = "windows")), allow(dead_code))]
+pub(crate) fn is_optical_peripheral(inquiry: &[u8]) -> bool {
+    const PERIPHERAL_TYPE_MASK: u8 = 0x1F;
+    const PERIPHERAL_TYPE_OPTICAL: u8 = 0x05;
+    inquiry
+        .first()
+        .is_some_and(|b| b & PERIPHERAL_TYPE_MASK == PERIPHERAL_TYPE_OPTICAL)
+}
+
+/// PREVENT ALLOW MEDIUM REMOVAL (1Eh): `Some` of CDB byte 4 bits 1:0 (MMC-6:
+/// bit 1 Persistent, bit 0 Prevent; SPC-4 §6.13), `None` for other commands.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn prevent_allow_request(cdb: &[u8]) -> Option<u8> {
+    const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
+    match cdb {
+        [PREVENT_ALLOW_MEDIUM_REMOVAL, _, _, _, b4, ..] => Some(b4 & 0b11),
+        _ => None,
+    }
+}
+
+/// Whether a drive holds a disc, from TEST UNIT READY sense. The split is our
+/// reading of MMC-6 Table F.3 (derived, not spec text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DiscPresence {
+    /// A medium is loaded: GOOD, or a NOT READY state that only exists with one
+    /// (04/02, 04/04, 04/07, 04/08, 0Ch, 30h other than cleaning cartridges).
+    Present,
+    /// NOT READY 3Ah, MEDIUM NOT PRESENT (tray open or closed and empty), or a
+    /// cleaning cartridge / cleaning failure (30/03, 30/07): nothing to rip.
+    Absent,
+    /// Not ready for a reason that does not settle presence: 04/01 (a mounted
+    /// disc spinning up or changing Format-layer, MMC-6 §6.22.3), 04/00, 04/03,
+    /// 04/09, 3Eh, or another NOT READY. Poll again.
+    Settling,
+}
+
+impl DiscPresence {
+    /// The [`drive_has_disc`] answer: `Settling` counts as a disc, so a poll loop
+    /// never drops a session while a mounted disc re-spins.
+    pub fn has_disc(self) -> bool {
+        self != DiscPresence::Absent
+    }
+}
+
+/// [`DiscPresence`] from TEST UNIT READY, `tur` issuing one TUR (Ok = GOOD).
+/// UNIT ATTENTIONs are re-polled (up to 4); non-NOT-READY sense is `Err`.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+pub(crate) fn tur_disc_presence(mut tur: impl FnMut() -> Result<()>) -> Result<DiscPresence> {
+    const MAX_ATTENTION_RETRIES: u32 = 4;
+    let mut retries = 0;
+    loop {
+        let Err(e) = tur() else {
+            return Ok(DiscPresence::Present);
+        };
+        let Some(s) = e.scsi_sense().copied() else {
+            return Err(e);
+        };
+        match s.sense_key {
+            SENSE_KEY_NOT_READY => return Ok(not_ready_presence(s.asc, s.ascq)),
+            SENSE_KEY_UNIT_ATTENTION if retries < MAX_ATTENTION_RETRIES => retries += 1,
+            _ => return Err(e),
+        }
+    }
+}
+
+// NOT READY ASC/ASCQ -> presence, derived from MMC-6 Tables F.3 / F.10.
+fn not_ready_presence(asc: u8, ascq: u8) -> DiscPresence {
+    match (asc, ascq) {
+        (0x3A, _) => DiscPresence::Absent,
+        // Initializing cmd required, format / operation / long write in progress.
+        (0x04, 0x02 | 0x04 | 0x07 | 0x08) => DiscPresence::Present,
+        // Write error recovery needed, defects in error window.
+        (0x0C, 0x07 | 0x0F) => DiscPresence::Present,
+        // Cleaning cartridge installed / cleaning failure: no disc to rip.
+        (0x30, 0x03 | 0x07) => DiscPresence::Absent,
+        // Incompatible / unreadable medium installed.
+        (0x30, _) => DiscPresence::Present,
+        _ => DiscPresence::Settling,
+    }
+}
+
+/// Whether a no-sysfs (unfiltered) sg node belongs in `list_drives`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NodeProbe {
+    /// INQUIRY says peripheral type 05h.
+    Optical,
+    /// INQUIRY says another peripheral type.
+    NotOptical,
+    /// Opened but INQUIRY failed, or open failed with e.g. EBUSY.
+    Unresponsive,
+    /// open() found no device (ENOENT, ENXIO, ENODEV).
+    Absent,
+    /// open() refused (EACCES, EPERM): nothing says it is optical.
+    Denied,
+}
+
+/// [`NodeProbe`] for an sg node whose open(2) failed with `errno`.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn open_failure_probe(errno: Option<i32>) -> NodeProbe {
+    match errno {
+        Some(libc::ENOENT | libc::ENXIO | libc::ENODEV) => NodeProbe::Absent,
+        Some(libc::EACCES | libc::EPERM) => NodeProbe::Denied,
+        _ => NodeProbe::Unresponsive,
+    }
+}
+
+/// Kept unless definitively not an optical drive or not there: a wedged or busy
+/// drive must list as present (autorip: "unresponsive"), not as unplugged.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn keep_unfiltered_node(p: NodeProbe) -> bool {
+    matches!(p, NodeProbe::Optical | NodeProbe::Unresponsive)
+}
+
+/// Upper bound on an adapter AlignmentMask (page alignment).
+pub(crate) const MAX_ALIGNMENT_MASK: usize = 0xFFF;
+
+/// Adapter-reported SPTI AlignmentMask made safe to size a bounce buffer with:
+/// widened to the next 2^n-1 if malformed, capped at [`MAX_ALIGNMENT_MASK`].
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn sanitize_alignment_mask(raw: u32) -> usize {
+    let smeared = match raw.checked_ilog2() {
+        Some(top) => u32::MAX >> (31 - top),
+        None => 0,
+    };
+    (smeared as usize).min(MAX_ALIGNMENT_MASK)
+}
+
+/// SPTI TimeOutValue: whole seconds, rounded up, at least 1, never wrapping.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn spti_timeout_secs(timeout_ms: u32) -> u32 {
+    timeout_ms.div_ceil(1000).max(1)
+}
+
+#[cfg(test)]
+mod transport_helper_tests {
+    use super::*;
+
+    fn sense(sense_key: u8, asc: u8, ascq: u8) -> ScsiSense {
+        ScsiSense {
+            sense_key,
+            asc,
+            ascq,
+        }
+    }
+
+    fn tur_err(sense_key: u8, asc: u8, ascq: u8) -> Result<()> {
+        Err(Error::ScsiError {
+            opcode: SCSI_TEST_UNIT_READY,
+            status: SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(sense(sense_key, asc, ascq)),
+        })
+    }
+
+    // Runs `tur_disc_presence` over scripted TUR outcomes; returns the verdict
+    // and how many TURs it issued.
+    fn presence(replies: Vec<Result<()>>) -> (Result<DiscPresence>, usize) {
+        let mut replies = replies.into_iter();
+        let mut calls = 0;
+        let r = tur_disc_presence(|| {
+            calls += 1;
+            replies.next().unwrap_or(Ok(()))
+        });
+        (r, calls)
+    }
+
+    fn one(sense_key: u8, asc: u8, ascq: u8) -> Result<DiscPresence> {
+        presence(vec![tur_err(sense_key, asc, ascq)]).0
+    }
+
+    // MMC-6 Table F.3: only 3Ah is MEDIUM NOT PRESENT. 04/01 is a mounted disc
+    // spinning up or changing Format-layer (§6.22.3), so it is Settling, never
+    // Absent; states that only exist with a medium loaded are Present.
+    #[test]
+    fn tur_disc_presence_follows_the_mmc6_readiness_table() {
+        use DiscPresence::*;
+        assert!(matches!(presence(vec![Ok(())]), (Ok(Present), 1)));
+        for ascq in [0x00, 0x01, 0x02] {
+            assert!(matches!(one(2, 0x3A, ascq), Ok(Absent)), "3A/{ascq:02x}");
+        }
+        for (asc, ascq) in [(0x04, 0x02), (0x04, 0x04), (0x04, 0x07), (0x04, 0x08)] {
+            assert!(
+                matches!(one(2, asc, ascq), Ok(Present)),
+                "{asc:02x}/{ascq:02x}"
+            );
+        }
+        for (asc, ascq) in [(0x0C, 0x07), (0x0C, 0x0F), (0x30, 0x00), (0x30, 0x02)] {
+            assert!(
+                matches!(one(2, asc, ascq), Ok(Present)),
+                "{asc:02x}/{ascq:02x}"
+            );
+        }
+        for (asc, ascq) in [(0x04, 0x00), (0x04, 0x01), (0x04, 0x03), (0x04, 0x09)] {
+            assert!(
+                matches!(one(2, asc, ascq), Ok(Settling)),
+                "{asc:02x}/{ascq:02x}"
+            );
+        }
+        assert!(matches!(one(2, 0x3E, 0x00), Ok(Settling)), "3E/00");
+        // A cleaning cartridge (30/03) or cleaning failure (30/07) is nothing to
+        // rip and does not resolve like a spin-up: no disc.
+        for ascq in [0x03, 0x07] {
+            assert!(matches!(one(2, 0x30, ascq), Ok(Absent)), "30/{ascq:02x}");
+        }
+        assert!(one(3, 0x11, 0).is_err(), "not a NOT READY key");
+    }
+
+    // A UNIT ATTENTION says nothing about the medium, and several can be queued
+    // (06/29 reset, then 06/28 medium change): re-issue TUR up to 4 times.
+    #[test]
+    fn tur_disc_presence_retries_queued_unit_attentions() {
+        use DiscPresence::*;
+        let ua = |asc| tur_err(6, asc, 0);
+        assert!(matches!(
+            presence(vec![ua(0x28), tur_err(2, 0x3A, 0)]),
+            (Ok(Absent), 2)
+        ));
+        assert!(matches!(
+            presence(vec![ua(0x29), ua(0x28), Ok(())]),
+            (Ok(Present), 3)
+        ));
+        assert!(matches!(
+            presence(vec![ua(0x28), tur_err(2, 4, 1)]),
+            (Ok(Settling), 2)
+        ));
+        let five = (0..5).map(|_| ua(0x28)).collect();
+        assert!(
+            matches!(presence(five), (Err(_), 5)),
+            "attentions never clear"
+        );
+    }
+
+    // drive_has_disc keeps its bool: Settling reads as "still there", so a poll
+    // loop never tears down a session while a mounted disc re-spins.
+    #[test]
+    fn drive_has_disc_maps_settling_to_present() {
+        assert!(DiscPresence::Present.has_disc());
+        assert!(DiscPresence::Settling.has_disc());
+        assert!(!DiscPresence::Absent.has_disc());
+    }
+
+    // Without sysfs, an sg node stays listed unless it is definitively not an
+    // optical drive or not there: a wedged or busy drive must read as present
+    // but unresponsive (autorip's "firmware unresponsive"), not as unplugged.
+    #[test]
+    fn unfiltered_sg_node_is_dropped_only_when_definitively_not_a_drive() {
+        assert!(keep_unfiltered_node(NodeProbe::Optical));
+        assert!(keep_unfiltered_node(NodeProbe::Unresponsive));
+        assert!(!keep_unfiltered_node(NodeProbe::NotOptical));
+        assert!(!keep_unfiltered_node(NodeProbe::Absent));
+        // Without sysfs a non-root user sees EACCES on every root-owned sg node
+        // (disks, tapes): unprovable as optical, so not listed.
+        assert!(!keep_unfiltered_node(NodeProbe::Denied));
+    }
+
+    // How a failed open(2) of an unfiltered sg node is classified.
+    #[cfg(unix)]
+    #[test]
+    fn unfiltered_open_errno_classification() {
+        use NodeProbe::*;
+        let probe = |e| open_failure_probe(Some(e));
+        assert!(matches!(probe(libc::ENOENT), Absent));
+        assert!(matches!(probe(libc::ENXIO), Absent));
+        assert!(matches!(probe(libc::ENODEV), Absent));
+        assert!(matches!(probe(libc::EACCES), Denied));
+        assert!(matches!(probe(libc::EPERM), Denied));
+        assert!(matches!(probe(libc::EBUSY), Unresponsive));
+        assert!(matches!(open_failure_probe(None), Unresponsive));
+    }
+
+    // Drop unlocks the tray only for a transport that issued a PREVENT; the
+    // CDB decode is what tracks that.
+    #[test]
+    fn prevent_allow_request_decodes_only_1eh() {
+        // SPC-4 §6.13 PREVENT field, bits 1:0: 00 allow, 01 prevent,
+        // 10 persistent allow, 11 persistent prevent. Upper bits are reserved.
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x00, 0]), Some(0b00));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x01, 0]), Some(0b01));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x02, 0]), Some(0b10));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0x03, 0]), Some(0b11));
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0, 0, 0xFD, 0]), Some(0b01));
+        assert_eq!(prevent_allow_request(&[0x12, 0, 0, 0, 0x01, 0]), None);
+        assert_eq!(prevent_allow_request(&[0x1E, 0, 0]), None, "short CDB");
+    }
+
+    // AlignmentMask is adapter-reported: it must be 2^n-1 and bounded, or a bogus
+    // 0xFFFF_FFFF sizes every bounce buffer at data.len() + 4 GiB.
+    #[test]
+    fn alignment_mask_is_validated_and_capped() {
+        assert_eq!(sanitize_alignment_mask(0), 0);
+        assert_eq!(sanitize_alignment_mask(0x3), 0x3);
+        assert_eq!(sanitize_alignment_mask(0x1FF), 0x1FF);
+        assert_eq!(sanitize_alignment_mask(0x5), 0x7, "not 2^n-1: widen");
+        assert_eq!(sanitize_alignment_mask(0xFFFF_FFFF), MAX_ALIGNMENT_MASK);
+        assert_eq!(sanitize_alignment_mask(0x0010_0000), MAX_ALIGNMENT_MASK);
+    }
+
+    // SPTI's TimeOutValue is whole seconds, rounded up, never 0 — and a huge
+    // timeout must saturate, not wrap to 1 s (or panic in debug).
+    #[test]
+    fn spti_timeout_rounds_up_without_overflow() {
+        assert_eq!(spti_timeout_secs(0), 1);
+        assert_eq!(spti_timeout_secs(1_500), 2);
+        assert_eq!(spti_timeout_secs(5_000), 5);
+        assert_eq!(spti_timeout_secs(u32::MAX), u32::MAX.div_ceil(1000));
+    }
+
+    // Feature 010Ch is an 8-byte header plus a 20-byte descriptor (Additional
+    // Length 10h): the allocation length must cover all 28 bytes.
+    #[test]
+    fn get_config_010c_returns_the_whole_descriptor() {
+        struct Fw(Vec<u8>);
+        impl ScsiTransport for Fw {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                let alloc = usize::from(u16::from_be_bytes([cdb[7], cdb[8]]));
+                let mut reply = vec![0, 0, 0, 24, 0, 0, 0, 0, 0x01, 0x0C, 0x00, 0x10];
+                reply.extend_from_slice(b"202101311259\0\0\0\0");
+                let n = reply.len().min(alloc).min(data.len());
+                data[..n].copy_from_slice(&reply[..n]);
+                self.0 = cdb.to_vec();
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = Fw(Vec::new());
+        let v = get_config_010c(&mut t).unwrap();
+        assert_eq!(v.len(), 28, "header + full 010Ch descriptor");
+        assert_eq!(&v[12..24], b"202101311259", "date through the minute");
+    }
 }
 
 // Round `p` up to satisfy an SPTI AlignmentMask (`(p + mask) & !mask`); mask=0 means no

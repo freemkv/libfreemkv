@@ -13,11 +13,63 @@
 //! ```
 //! Under `all(loom, test)`, callers must execute inside `loom::model`.
 
-// See "Building the model" above for why this is gated on `test` too.
+// Gated on `test` too: a `--cfg loom` build of the library alone keeps std atomics.
 #[cfg(all(loom, test))]
 pub(crate) use loom::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+/// Reserve one of `max` recovery-thread slots on `counter`, atomically (no
+/// load-then-add TOCTOU). `false` past the cap, with nothing left reserved.
+pub(crate) fn reserve_recovery_slot(counter: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
+    use std::sync::atomic::Ordering::AcqRel;
+    if counter.fetch_add(1, AcqRel) < max {
+        true
+    } else {
+        counter.fetch_sub(1, AcqRel);
+        false
+    }
+}
+
+/// Give back a slot taken by [`reserve_recovery_slot`].
+pub(crate) fn release_recovery_slot(counter: &std::sync::atomic::AtomicUsize) {
+    counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// The fd `Drop` should send ALLOW MEDIUM REMOVAL on, if any: only when this
+/// transport holds a PREVENT, only on an fd it already owns (the live one, else
+/// a published recovery fd), and never after an ALLOW already hit a dead bus.
+pub(crate) fn drop_unlock_fd(
+    prevent_held: bool,
+    allow_transport_failed: bool,
+    fd: i32,
+    recovered: Option<i32>,
+) -> Option<i32> {
+    if !prevent_held || allow_transport_failed {
+        return None;
+    }
+    if fd >= 0 { Some(fd) } else { recovered }
+}
+
+/// How `Drop` sends its ALLOW MEDIUM REMOVAL.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DropUnlock {
+    /// No PREVENT of ours to clear, or the thread cap is full (SG_IO already
+    /// stuck): just close.
+    Skip,
+    /// On a capped detached thread: SG_IO on a wedged node can block for long.
+    /// If the spawn itself fails, the caller sends ALLOW inline instead.
+    Detached(i32),
+}
+
+/// Pick the [`DropUnlock`] for `unlock_fd` (from [`drop_unlock_fd`]), given
+/// whether a recovery-thread slot was reserved.
+pub(crate) fn drop_unlock_plan(unlock_fd: Option<i32>, slot: bool) -> DropUnlock {
+    match unlock_fd {
+        Some(fd) if slot => DropUnlock::Detached(fd),
+        _ => DropUnlock::Skip,
+    }
+}
 
 /// The empty slot. Not a valid fd; `open()` never returns a negative value.
 pub(crate) const EMPTY: i32 = -1;
@@ -99,6 +151,101 @@ mod tests {
     /// Fresh slot + liveness flag, as `SgIoTransport::open` builds them.
     fn slot() -> (AtomicI32, AtomicBool) {
         (AtomicI32::new(EMPTY), AtomicBool::new(false))
+    }
+
+    // ── Drop-time tray unlock ──────────────────────────────────────────────
+
+    /// Drop sends ALLOW only for a transport that holds a PREVENT, only on an fd
+    /// it already owns (never an inline reopen of a possibly wedged node), and
+    /// not again after an ALLOW already died on the transport.
+    #[test]
+    fn drop_unlock_fd_uses_only_an_owned_fd_and_only_after_prevent() {
+        assert_eq!(
+            drop_unlock_fd(false, false, 5, None),
+            None,
+            "never PREVENTed"
+        );
+        assert_eq!(drop_unlock_fd(false, false, -1, Some(7)), None);
+        assert_eq!(drop_unlock_fd(true, false, 5, None), Some(5));
+        assert_eq!(drop_unlock_fd(true, false, 5, Some(7)), Some(5));
+        assert_eq!(
+            drop_unlock_fd(true, false, -1, Some(7)),
+            Some(7),
+            "recovered fd"
+        );
+        assert_eq!(
+            drop_unlock_fd(true, false, -1, None),
+            None,
+            "no inline reopen"
+        );
+        assert_eq!(
+            drop_unlock_fd(true, true, 5, None),
+            None,
+            "ALLOW hit a dead bus"
+        );
+    }
+
+    /// A full recovery-thread cap means SG_IO calls are already stuck: Drop
+    /// closes at once rather than block on an inline ALLOW. Only a failed spawn
+    /// (checked by the caller) falls back to an inline ALLOW.
+    #[test]
+    fn drop_unlock_plan_skips_when_the_thread_cap_is_full() {
+        assert_eq!(drop_unlock_plan(None, true), DropUnlock::Skip);
+        assert_eq!(drop_unlock_plan(None, false), DropUnlock::Skip);
+        assert_eq!(drop_unlock_plan(Some(5), true), DropUnlock::Detached(5));
+        assert_eq!(drop_unlock_plan(Some(5), false), DropUnlock::Skip);
+    }
+
+    // ── Recovery-thread cap ────────────────────────────────────────────────
+
+    /// Past the cap nothing stays reserved (a leaked reservation would ratchet the
+    /// counter to the cap and force every later reopen inline), and a release
+    /// frees the slot again.
+    #[test]
+    fn recovery_slot_cap_gives_back_an_over_cap_reservation() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let counter = AtomicUsize::new(0);
+        assert!(reserve_recovery_slot(&counter, 2));
+        assert!(reserve_recovery_slot(&counter, 2));
+        for _ in 0..5 {
+            assert!(!reserve_recovery_slot(&counter, 2), "over the cap");
+        }
+        assert_eq!(counter.load(Relaxed), 2, "over-cap attempts must not leak");
+        release_recovery_slot(&counter);
+        assert!(
+            reserve_recovery_slot(&counter, 2),
+            "a released slot is reusable"
+        );
+    }
+
+    /// Concurrent reservers never hold more than `max` slots at once.
+    #[test]
+    fn recovery_slot_cap_holds_under_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        const MAX: usize = 3;
+        let counter = AtomicUsize::new(0);
+        let held = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| {
+                    for _ in 0..2_000 {
+                        if reserve_recovery_slot(&counter, MAX) {
+                            let now = held.fetch_add(1, Relaxed) + 1;
+                            peak.fetch_max(now, Relaxed);
+                            held.fetch_sub(1, Relaxed);
+                            release_recovery_slot(&counter);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(
+            peak.load(Relaxed) <= MAX,
+            "cap exceeded: {}",
+            peak.load(Relaxed)
+        );
+        assert_eq!(counter.load(Relaxed), 0, "every reservation returned");
     }
 
     // ── Positive: the ordinary hand-off ────────────────────────────────────

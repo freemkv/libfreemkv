@@ -106,6 +106,9 @@ pub struct Drive {
     oem_vid: Option<[u8; 16]>,
     /// True once `init()` has run (whether or not an unlocker matched).
     init_ran: bool,
+    /// `lock_tray` was called and no `unlock_tray` since: only then does Drop
+    /// send ALLOW (never clear a lock another process holds).
+    tray_locked: bool,
     /// Lazily-computed registry-match name for `platform_name()`'s `&str`
     /// return before `init()` has run.
     matched_name_cache: std::sync::OnceLock<String>,
@@ -163,6 +166,7 @@ impl Drive {
             unlocker_name: None,
             oem_vid: None,
             init_ran: false,
+            tray_locked: false,
             matched_name_cache: std::sync::OnceLock::new(),
             drive_id,
             device_path: device.to_string_lossy().to_string(),
@@ -228,6 +232,7 @@ impl Drive {
             unlocker_name: None,
             oem_vid: None,
             init_ran: false,
+            tray_locked: false,
             matched_name_cache: std::sync::OnceLock::new(),
             drive_id: DriveId {
                 vendor_id: String::new(),
@@ -315,7 +320,9 @@ impl Drive {
 
     /// Shared cleanup — called by Drop (and thus by close).
     fn cleanup(&mut self) {
-        self.unlock_tray();
+        if self.tray_locked {
+            self.unlock_tray();
+        }
     }
 
     /// Whether an unlocker claims this drive by identity (i.e. it can be
@@ -353,6 +360,11 @@ impl Drive {
         // The poll can take up to 30s (60 × 500ms). Heartbeat it so a slow
         // spin-up is visible as steady beats rather than a silent stall.
         let mut hb = crate::progress::Heartbeat::new("wait_ready");
+        // (when the first failure of the current run completed, failures in it)
+        let mut failing: Option<(std::time::Instant, u32)> = None;
+        let mut start_sent = false;
+        // Consecutive 3Ah answers, and whether 04/01 (a disc being identified) was seen.
+        let (mut empty_run, mut becoming_ready_seen) = (0u32, false);
         for attempt in 0..60u64 {
             hb.tick(attempt, 60);
             let mut buf = [0u8; 0];
@@ -371,11 +383,41 @@ impl Drive {
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                // A dead bus (transport failure / disconnected drive) will never spin
-                // up — surface it immediately instead of polling a phantom for 30 s. A
-                // plain not-ready TUR failure falls through and keeps the loop going.
-                Err(e) if e.is_scsi_transport_failure() => return Err(e),
-                Err(_) => {}
+                // Transport failures (DID_TIME_OUT/DID_RESET, fd<0 DeviceNotFound) may be
+                // a hiccup; a run of 2+ lasting the budget past the first one's
+                // completion is a dead bus, surfaced rather than polled for 30 s.
+                Err(e) if e.is_scsi_transport_failure() => {
+                    empty_run = 0;
+                    let (since, n) = failing.get_or_insert((std::time::Instant::now(), 0));
+                    *n += 1;
+                    if *n >= 2 && since.elapsed() >= WAIT_READY_DEAD_BUS_BUDGET {
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    failing = None;
+                    let sense = e.scsi_sense().map(|s| (s.sense_key, s.asc, s.ascq));
+                    let empty = matches!(sense, Some((crate::scsi::SENSE_KEY_NOT_READY, 0x3A, _)));
+                    empty_run = if empty { empty_run + 1 } else { 0 };
+                    becoming_ready_seen |=
+                        sense == Some((crate::scsi::SENSE_KEY_NOT_READY, 0x04, 0x01));
+                    // An empty drive that never said 04/01 will not become ready.
+                    if !becoming_ready_seen && empty_run >= WAIT_READY_MAX_EMPTY_POLLS {
+                        return Err(e);
+                    }
+                    match sense {
+                        // Incompatible / unreadable medium (MMC-6 Table F.3) never
+                        // becomes ready: surface its sense now, not after 30 s.
+                        Some((crate::scsi::SENSE_KEY_NOT_READY, 0x30, _)) => return Err(e),
+                        // 04/02, initializing command required: nothing else spins the
+                        // unit up, so send START UNIT once, then keep polling.
+                        Some((crate::scsi::SENSE_KEY_NOT_READY, 0x04, 0x02)) if !start_sent => {
+                            start_sent = true;
+                            self.start_unit()?;
+                        }
+                        _ => {}
+                    }
+                }
             }
             // Halt-aware backoff: the flag can also flip DURING the 500 ms
             // gap, which is where most of the 30 s is actually spent.
@@ -627,7 +669,8 @@ impl Drive {
     }
 
     /// Query a specific GET CONFIGURATION feature by code.
-    /// Returns the feature data (without the 8-byte header), or None if not available.
+    /// Returns the feature descriptor (without the 8-byte header), or None if the
+    /// drive does not report that feature.
     pub fn get_config_feature(&mut self, feature_code: u16) -> Option<Vec<u8>> {
         let cdb = [
             crate::scsi::SCSI_GET_CONFIGURATION,
@@ -652,15 +695,8 @@ impl Drive {
                 5_000,
             )
             .ok()?;
-        // Clamp the transport-reported count to the buffer length: a
-        // misbehaving driver/bridge could report more bytes than the
-        // buffer holds, which would panic the slice.
-        let end = r.bytes_transferred.min(buf.len());
-        if end > 8 {
-            Some(buf[8..end].to_vec())
-        } else {
-            None
-        }
+        crate::scsi::gc_feature_descriptor(&buf, r.bytes_transferred, feature_code)
+            .map(<[u8]>::to_vec)
     }
 
     /// Read REPORT KEY RPC state (region playback control).
@@ -1072,6 +1108,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
+        self.tray_locked = true;
         if let Err(e) =
             self.scsi
                 .as_mut()
@@ -1092,6 +1129,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
+        self.tray_locked = false;
         // Best-effort (the tray-unlock is advisory), but a failure is worth a warn!
         // rather than a silent `let _`: a stuck PREVENT lock is a real symptom the
         // operator otherwise never sees until the tray won't open.
@@ -1121,6 +1159,21 @@ impl Drive {
             30_000,
         )?;
         Ok(())
+    }
+
+    // START STOP UNIT with START=1, LoEj=0 (never ejects). Only Halted propagates;
+    // a rejected START just leaves wait_ready polling.
+    fn start_unit(&mut self) -> Result<()> {
+        let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0];
+        let mut buf = [0u8; 0];
+        match self.checked_exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000) {
+            Err(Error::Halted) => Err(Error::Halted),
+            Err(e) => {
+                tracing::warn!(target: "freemkv::drive", phase = "wait_ready", error_code = e.code(), "START UNIT rejected");
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+        }
     }
 
     /// Soft power-cycle the drive mechanism WITHOUT ejecting: spin the disc
@@ -1263,19 +1316,11 @@ pub fn find_drive() -> Option<Drive> {
         .collect::<Vec<_>>();
 
     #[cfg(not(target_os = "macos"))]
-    let candidates = discover_drives()
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect::<Vec<_>>();
+    let candidates = platform::candidate_paths();
 
     select_drive_with_media(candidates, |path| {
         match Drive::open(std::path::Path::new(path)) {
-            Ok(drive)
-                if !drive.drive_id.raw_inquiry.is_empty()
-                    && (drive.drive_id.raw_inquiry[0] & 0x1F) == 0x05 =>
-            {
-                Some(drive)
-            }
+            Ok(drive) if drive.drive_id.is_optical() => Some(drive),
             Ok(drive) => {
                 tracing::debug!(
                     target: "freemkv::drive",
@@ -1296,11 +1341,6 @@ pub fn find_drive() -> Option<Drive> {
             }
         }
     })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn discover_drives() -> Vec<(String, DriveId)> {
-    platform::find_drives()
 }
 
 // Prefer a drive with media, else the first that opened. Only one drive is open
@@ -1338,6 +1378,10 @@ fn select_drive_with_media<P>(
 // recovered-error reporting (PER/TB set, DTE/PS cleared), other bits kept.
 // None if too short or not the error-recovery page.
 fn build_error_recovery_select_payload(sense: &[u8]) -> Option<Vec<u8>> {
+    // SPC-4 §7.5.5: the mode parameter list is Mode Data Length + 2 bytes; the
+    // transfer count may over-report (ignored residue) and pad with zeros.
+    let mode_data_len = usize::from(u16::from_be_bytes([*sense.first()?, *sense.get(1)?]));
+    let sense = &sense[..sense.len().min(mode_data_len + 2)];
     if sense.len() < MODE10_HEADER_LEN {
         return None;
     }
@@ -1372,6 +1416,14 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
     let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
 }
+
+// Consecutive MEDIUM NOT PRESENT (3Ah) TURs, with no 04/01 seen, after which
+// wait_ready reports the empty drive (~5 s of polling).
+const WAIT_READY_MAX_EMPTY_POLLS: u32 = 10;
+
+// How long an unbroken run of transport-class TUR failures may last, from the
+// first one's completion, before wait_ready calls the bus dead.
+const WAIT_READY_DEAD_BUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 // Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true, returning
 // Error::Halted. Used by wait_ready's poll backoff and spin_cycle's spin-down/settle pauses.
@@ -1553,6 +1605,7 @@ mod command_tests {
         // With an 8-byte block descriptor between header and page, the function
         // must locate the page at header+desc, not a fixed offset.
         let mut sense = vec![0u8; MODE10_HEADER_LEN + 8 + 12];
+        sense[1] = (MODE10_HEADER_LEN + 8 + 12 - 2) as u8; // mode data length
         sense[7] = 8; // block descriptor length
         let po = MODE10_HEADER_LEN + 8;
         sense[po] = MODE_PAGE_ERROR_RECOVERY;
@@ -1580,6 +1633,21 @@ mod command_tests {
         assert!(build_error_recovery_select_payload(&bad).is_none());
     }
 
+    // A bridge that ignores residue reports the whole 252-byte allocation; the
+    // SELECT parameter list must stop at Mode Data Length + 2 (SPC-4 §7.5.5), or
+    // the trailing zeros are sent as bogus page-0 descriptors and rejected.
+    #[test]
+    fn error_recovery_payload_stops_at_mode_data_length() {
+        let mut sense = mode_sense_error_recovery(0, 0x05, false);
+        sense[1] = (MODE10_HEADER_LEN + 12 - 2) as u8;
+        sense.resize(252, 0);
+        let out = build_error_recovery_select_payload(&sense).expect("valid page");
+        assert_eq!(out.len(), MODE10_HEADER_LEN + 12, "parameter list length");
+        // A Mode Data Length that cuts the page header short is malformed.
+        sense[1] = (MODE10_HEADER_LEN + 2 - 2) as u8;
+        assert!(build_error_recovery_select_payload(&sense).is_none());
+    }
+
     // Boundary for the 3-byte page header guard (page_off + 3 > sense.len()):
     // exactly-enough length must be accepted, not rejected by a `>=` mutation.
     #[test]
@@ -1587,6 +1655,7 @@ mod command_tests {
         // No block descriptors: page starts right after the 8-byte header.
         // Page needs exactly 3 bytes (code, length, flags) -> total 11.
         let mut sense = vec![0u8; MODE10_HEADER_LEN + 3];
+        sense[1] = (MODE10_HEADER_LEN + 3 - 2) as u8; // mode data length
         let po = MODE10_HEADER_LEN;
         sense[po] = MODE_PAGE_ERROR_RECOVERY;
         sense[po + 1] = 0x00; // page length field (unused by this function)
@@ -2771,23 +2840,28 @@ mod command_tests {
 
     #[test]
     fn get_config_feature_strips_8_byte_header() {
-        // GET CONFIGURATION reply has an 8-byte Feature Header (MMC-6
-        // §5.2.2). get_config_feature returns buf[8..end]. Provide a
-        // 12-byte reply → returns the 4 payload bytes.
-        let mut payload = vec![0u8; 8];
-        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        // GET CONFIGURATION reply: 8-byte Feature Header (MMC-6 §5.3.1), then the
+        // descriptor. Returns the descriptor only, bounded by its Additional
+        // Length even when the transport reports the whole zero-padded buffer.
+        let mut payload = vec![0, 0, 0, 12, 0, 0, 0, 0];
+        payload.extend_from_slice(&[0x01, 0x0D, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]);
+        payload.resize(256, 0);
         let mut d = drive_with(payload);
         assert_eq!(
             d.get_config_feature(0x010D),
-            Some(vec![0xDE, 0xAD, 0xBE, 0xEF])
+            Some(vec![0x01, 0x0D, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF])
         );
     }
 
     #[test]
-    fn get_config_feature_at_exactly_8_bytes_returns_none() {
-        // end == 8 means header only, no descriptor → None (the `end > 8`
-        // guard). Boundary against an off-by-one that would return an
-        // empty Vec instead of None.
+    fn get_config_feature_absent_feature_returns_none() {
+        // RT=10b for an unsupported feature: header only (Data Length 4), even if
+        // the transport over-reports the transfer as the full 256 bytes.
+        let mut header_only = vec![0, 0, 0, 4, 0, 0, 0, 0];
+        header_only.resize(256, 0);
+        let mut d = drive_with(header_only);
+        assert_eq!(d.get_config_feature(0x010D), None);
+        // Exactly 8 bytes transferred is also header-only.
         let mut d = drive_with(vec![0u8; 8]);
         assert_eq!(d.get_config_feature(0x0000), None);
     }
@@ -2904,10 +2978,10 @@ mod command_tests {
         );
     }
 
-    // A dead bus (transport failure) will never spin up, so wait_ready must
-    // surface it AT ONCE rather than poll a phantom for the full ~30 s.
+    // A dead bus (transport failures in a row) will never spin up, so wait_ready
+    // must surface it once the ~5 s budget is spent, not poll a phantom for ~30 s.
     #[test]
-    fn wait_ready_breaks_immediately_on_a_dead_bus() {
+    fn wait_ready_breaks_out_on_a_dead_bus() {
         struct DeadBus;
         impl ScsiTransport for DeadBus {
             fn execute(
@@ -2932,8 +3006,341 @@ mod command_tests {
             "a dead bus must surface the transport failure, not DeviceNotReady: {r:?}"
         );
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
-            "a dead bus must break out at once, not run the ~30 s poll"
+            t0.elapsed() < std::time::Duration::from_secs(8),
+            "a dead bus must break out after the budget, not run the ~30 s poll"
+        );
+    }
+
+    // One bus hiccup (DID_TIME_OUT, then the Linux fd-reopen gap) during spin-up
+    // must not abort the poll: the next TUR on the recovered fd succeeds.
+    #[test]
+    fn wait_ready_rides_out_a_transient_transport_failure() {
+        struct Hiccup(usize);
+        impl ScsiTransport for Hiccup {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Err(Error::ScsiError {
+                        opcode: cdb[0],
+                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                        sense: None,
+                    }),
+                    2 => Err(Error::DeviceNotFound {
+                        path: "/dev/sg0".into(),
+                    }),
+                    _ => Ok(ScsiResult {
+                        status: 0,
+                        bytes_transferred: 0,
+                        sense: [0u8; 32],
+                    }),
+                }
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(Hiccup(0)));
+        let r = d.wait_ready();
+        assert!(
+            r.is_ok(),
+            "a transient transport failure must not abort wait_ready: {r:?}"
+        );
+    }
+
+    // Fails with a transport error for the first `fails` TURs, each taking
+    // `delay`, then answers GOOD.
+    struct FlakyBus {
+        fails: usize,
+        delay: std::time::Duration,
+    }
+    impl ScsiTransport for FlakyBus {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            std::thread::sleep(self.delay);
+            if self.fails == 0 {
+                return Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                });
+            }
+            self.fails -= 1;
+            Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            })
+        }
+    }
+
+    // The dead-bus budget is TIME, not a count: several quick transport
+    // failures within it (a bridge reset storm) must still ride through.
+    #[test]
+    fn wait_ready_tolerates_quick_transport_failures_within_the_budget() {
+        let mut d = Drive::from_transport_for_test(Box::new(FlakyBus {
+            fails: 4,
+            delay: std::time::Duration::ZERO,
+        }));
+        let r = d.wait_ready();
+        assert!(r.is_ok(), "4 fast failures (~2 s) are within budget: {r:?}");
+    }
+
+    // TUR answers NOT READY with `sense` until a START STOP UNIT (START=1)
+    // arrives, then `after_start` more times, then GOOD. Counts the STARTs.
+    struct NeedsStart {
+        sense: crate::scsi::ScsiSense,
+        after_start: usize,
+        started: bool,
+        starts: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+    impl ScsiTransport for NeedsStart {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            let good = Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: 0,
+                sense: [0u8; 32],
+            });
+            if cdb[0] == SCSI_START_STOP_UNIT {
+                self.starts.lock().unwrap().push(cdb.to_vec());
+                self.started = true;
+                return good;
+            }
+            if self.started && self.after_start == 0 {
+                return good;
+            }
+            if self.started {
+                self.after_start -= 1;
+            }
+            Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense: Some(self.sense),
+            })
+        }
+    }
+
+    fn needs_start(asc: u8, ascq: u8, after_start: usize) -> (Drive, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let t = NeedsStart {
+            sense: crate::scsi::ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_NOT_READY,
+                asc,
+                ascq,
+            },
+            after_start,
+            started: false,
+            starts: starts.clone(),
+        };
+        (Drive::from_transport_for_test(Box::new(t)), starts)
+    }
+
+    // 02/04/02 (initializing command required): nothing spins the unit up unless
+    // wait_ready sends START UNIT, once, never ejecting, then keeps polling.
+    #[test]
+    fn wait_ready_sends_one_start_unit_on_initializing_command_required() {
+        let (mut d, starts) = needs_start(0x04, 0x02, 2);
+        let r = d.wait_ready();
+        assert!(
+            r.is_ok(),
+            "START UNIT must bring a stopped unit ready: {r:?}"
+        );
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 1, "exactly one START UNIT: {starts:?}");
+        assert_eq!(starts[0][4], 0x01, "START=1, LoEj=0");
+    }
+
+    // 02/30/xx (incompatible or blank medium) never becomes ready: surface it at
+    // once with its sense, not DeviceNotReady after ~30 s of polling.
+    #[test]
+    fn wait_ready_fails_fast_on_incompatible_medium() {
+        let (mut d, starts) = needs_start(0x30, 0x00, usize::MAX);
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(
+            matches!(&r, Err(e) if e.scsi_sense().is_some_and(|s| s.asc == 0x30)),
+            "incompatible medium must surface its sense: {r:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(starts.lock().unwrap().is_empty(), "no START for 30h");
+    }
+
+    // Answers each TUR from a script of NOT READY (asc, ascq) pairs, then GOOD.
+    struct ScriptedNotReady(
+        std::collections::VecDeque<(u8, u8)>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+    impl ScsiTransport for ScriptedNotReady {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            let Some((asc, ascq)) = self.0.pop_front() else {
+                return Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                });
+            };
+            Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense: Some(crate::scsi::ScsiSense {
+                    sense_key: crate::scsi::SENSE_KEY_NOT_READY,
+                    asc,
+                    ascq,
+                }),
+            })
+        }
+    }
+
+    fn scripted(script: &[(u8, u8)]) -> (Drive, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = ScriptedNotReady(script.iter().copied().collect(), calls.clone());
+        (Drive::from_transport_for_test(Box::new(t)), calls)
+    }
+
+    // An empty drive (3Ah on every TUR, never 04/01) will not become ready:
+    // surface MEDIUM NOT PRESENT after a bounded run, not after ~30 s.
+    #[test]
+    fn wait_ready_fails_fast_on_an_empty_drive() {
+        let (mut d, calls) = scripted(&[(0x3A, 0x00); 100]);
+        let r = d.wait_ready();
+        assert!(
+            matches!(&r, Err(e) if e.scsi_sense().is_some_and(|s| s.asc == 0x3A)),
+            "{r:?}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 10, "bounded 3Ah run");
+    }
+
+    // Once the drive has said 04/01 (a disc is being identified), 3Ah is not
+    // final: keep polling rather than give up on the 3Ah run.
+    #[test]
+    fn wait_ready_keeps_polling_3a_after_becoming_ready() {
+        let mut script = vec![(0x04, 0x01)];
+        script.extend([(0x3A, 0x00); 11]);
+        let (mut d, _calls) = scripted(&script);
+        let r = d.wait_ready();
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    // One DID_TIME_OUT TUR eats its whole 5 s timeout; that single hiccup must
+    // not spend the dead-bus budget before the next TUR can succeed.
+    #[test]
+    fn wait_ready_rides_out_one_slow_transport_failure() {
+        struct SlowHiccup(bool);
+        impl ScsiTransport for SlowHiccup {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                if std::mem::replace(&mut self.0, false) {
+                    std::thread::sleep(std::time::Duration::from_millis(5_100));
+                    return Err(Error::ScsiError {
+                        opcode: cdb[0],
+                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                        sense: None,
+                    });
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(SlowHiccup(true)));
+        let r = d.wait_ready();
+        assert!(r.is_ok(), "one timed-out TUR is a hiccup: {r:?}");
+    }
+
+    // An unplugged drive (DeviceNotFound on every TUR, the Linux fd<0 state once
+    // the reopen fails) is a dead bus and must fail fast, not poll for ~30 s.
+    #[test]
+    fn wait_ready_fails_fast_on_an_unplugged_drive() {
+        struct Unplugged;
+        impl ScsiTransport for Unplugged {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                Err(Error::DeviceNotFound {
+                    path: "/dev/sg0".into(),
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(Unplugged));
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready();
+        assert!(matches!(r, Err(Error::DeviceNotFound { .. })), "{r:?}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(8),
+            "unplug must fail fast, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // Slow failing TURs: the verdict comes when the run has lasted the 5 s budget
+    // past the first failure's completion. With 1.2 s failures + 0.5 s backoff
+    // that is exactly the 4th failure, so any count rule (2, 3, ...) shows up.
+    #[test]
+    fn wait_ready_bounds_slow_transport_failures_by_elapsed_time() {
+        struct SlowDeadBus(Arc<std::sync::atomic::AtomicUsize>);
+        impl ScsiTransport for SlowDeadBus {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(1_200));
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                    sense: None,
+                })
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut d = Drive::from_transport_for_test(Box::new(SlowDeadBus(calls.clone())));
+        let r = d.wait_ready();
+        assert!(
+            matches!(&r, Err(e) if e.is_scsi_transport_failure()),
+            "{r:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            4,
+            "gives up on the first failure completing >= 5 s after the first"
         );
     }
 
@@ -3194,6 +3601,33 @@ mod command_tests {
         assert_eq!(&c[2..4], &[0x12, 0x34], "read speed big-endian");
     }
 
+    // Dropping a drive must not clear a tray lock it never took: find_drive opens
+    // and drops candidates, and another process may hold the PREVENT.
+    #[test]
+    fn drop_unlocks_the_tray_only_if_this_drive_locked_it() {
+        let seq = |f: &dyn Fn(&mut Drive)| {
+            let cdbs = Arc::new(Mutex::new(Vec::new()));
+            let mut d = Drive::from_transport_for_test(Box::new(SequenceTransport {
+                cdbs: cdbs.clone(),
+                ok: true,
+            }));
+            f(&mut d);
+            cdbs.lock().unwrap().clear();
+            drop(d);
+            cdbs.lock().unwrap().clone()
+        };
+        assert!(seq(&|_| {}).is_empty(), "never locked: Drop sends nothing");
+        let after_lock = seq(&|d| d.lock_tray());
+        assert_eq!(after_lock.len(), 1, "locked: Drop unlocks {after_lock:?}");
+        assert_eq!(after_lock[0][0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+        assert_eq!(after_lock[0][4], 0x00, "ALLOW");
+        let unlocked = seq(&|d| {
+            d.lock_tray();
+            d.unlock_tray();
+        });
+        assert!(unlocked.is_empty(), "already unlocked: {unlocked:?}");
+    }
+
     #[test]
     fn lock_tray_sends_prevent_with_removal_bit_set() {
         let RecordingHarness {
@@ -3220,29 +3654,37 @@ mod command_tests {
         assert_eq!(c[4], 0x00, "PREVENT bit clear (unlocked)");
     }
 
-    // SET CD SPEED and PREVENT/ALLOW MEDIUM REMOVAL are best-effort tray/speed
-    // control: a drive that REJECTS them must be warned about, never fail the
-    // rip. Each returns () on a transport error and still issues its CDB.
+    // SET CD SPEED and PREVENT/ALLOW MEDIUM REMOVAL are best-effort: a CHECK
+    // CONDITION or a transport failure still issues the CDB, never fails the
+    // rip, and a failed unlock is warned about (a stuck PREVENT is a real symptom).
     #[test]
-    fn set_speed_and_tray_control_swallow_a_drive_rejection() {
-        let RecordingHarness {
-            drive: mut d,
-            cdb,
-            timeouts: _to,
-        } = recording(TransportOutcome::Scsi(0x02, None));
-        // None of these may panic or propagate the ScsiError.
-        d.set_speed(0x1234);
-        assert_eq!(
-            cdb.lock().unwrap()[0],
-            crate::scsi::SCSI_SET_CD_SPEED,
-            "SET CD SPEED still issued despite the rejection"
-        );
-        d.lock_tray();
-        assert_eq!(cdb.lock().unwrap()[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
-        assert_eq!(cdb.lock().unwrap()[4], 0x01, "PREVENT bit still set");
-        d.unlock_tray();
-        assert_eq!(cdb.lock().unwrap()[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
-        assert_eq!(cdb.lock().unwrap()[4], 0x00, "ALLOW bit still clear");
+    fn set_speed_and_tray_control_swallow_rejection_and_transport_failure() {
+        for status in [0x02, crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE] {
+            let RecordingHarness {
+                drive: mut d,
+                cdb,
+                timeouts: _to,
+            } = recording(TransportOutcome::Scsi(status, None));
+            d.set_speed(0x1234);
+            assert_eq!(
+                cdb.lock().unwrap()[0],
+                crate::scsi::SCSI_SET_CD_SPEED,
+                "SET CD SPEED still issued despite status {status:#x}"
+            );
+            d.lock_tray();
+            assert_eq!(cdb.lock().unwrap()[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+            assert_eq!(cdb.lock().unwrap()[4], 0x01, "PREVENT bit still set");
+            let ((), events) = crate::testlog::capture(|| d.unlock_tray());
+            assert_eq!(cdb.lock().unwrap()[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
+            assert_eq!(cdb.lock().unwrap()[4], 0x00, "ALLOW bit still clear");
+            let warned = events.iter().any(|e| {
+                e.level == tracing::Level::WARN && e.field("phase") == Some("unlock_tray")
+            });
+            assert!(
+                warned,
+                "failed unlock must warn (status {status:#x}): {events:?}"
+            );
+        }
     }
 
     #[test]

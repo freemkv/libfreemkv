@@ -80,60 +80,102 @@ fn max_substream_channels(data: &[u8]) -> Option<u8> {
 /// stream (in IFO order), picks the physical `0x8x` sub-stream whose probed channel count
 /// equals the declared count, never reusing a claimed sub-stream, and writes its PID (`0xBD00 |
 /// sub_id`) back onto the `Stream::Audio`. Conservative: only reassigns when a better match
-/// exists. Returns the number of streams whose PID was changed.
+/// exists or keeping the ordinal sub would share a PID. Sharing is left (and logged) only when
+/// there are more AC-3 streams than sub-streams. Returns the number of changed PIDs.
 pub fn remap_audio_pids(streams: &mut [Stream], probed: &BTreeMap<u8, u8>) -> usize {
     if probed.is_empty() {
         return 0;
     }
-    // Sub-streams already claimed by a remapped (or matching) earlier stream,
-    // so two declared streams never collide on one physical sub-stream.
-    let mut claimed: Vec<u8> = Vec::new();
+    let ac3: Vec<usize> = streams
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Stream::Audio(a) if a.codec == crate::disc::Codec::Ac3))
+        .map(|(i, _)| i)
+        .collect();
+    let info = |s: &Stream| match s {
+        Stream::Audio(a) => (a.channels.count(), (a.pid & 0x00FF) as u8),
+        _ => (0, 0),
+    };
+    // Ordinal subs before any re-route: candidates for a displaced stream in pass 3.
+    let ordinal: Vec<u8> = ac3.iter().map(|&i| info(&streams[i]).1).collect();
     let mut changed = 0usize;
-
-    for s in streams.iter_mut() {
-        let Stream::Audio(a) = s else { continue };
-        if a.codec != crate::disc::Codec::Ac3 {
-            continue;
+    // Each physical sub-stream is claimed at most once, so two declared streams
+    // never collide on one PID. Pass 1: streams already on a matching sub-stream stay.
+    let mut claimed: Vec<u8> = Vec::new();
+    let mut pending: Vec<usize> = Vec::new();
+    for &i in &ac3 {
+        let (declared, current) = info(&streams[i]);
+        if probed.get(&current) == Some(&declared) && !claimed.contains(&current) {
+            claimed.push(current);
+        } else {
+            pending.push(i);
         }
-        let declared = a.channels.count();
-        // The sub-id this stream currently routes by (low byte of its PID).
-        let current_sub = (a.pid & 0x00FF) as u8;
-
-        // If the stream's current physical sub-stream already matches its
-        // declared channel count, keep it and claim it.
-        if probed.get(&current_sub) == Some(&declared) {
-            claimed.push(current_sub);
-            continue;
-        }
-
-        // Otherwise find an unclaimed physical sub-stream whose REAL channel
-        // count equals the declared count.
+    }
+    // Pass 2: route the rest to an unclaimed sub-stream with the declared count.
+    let mut unmatched: Vec<usize> = Vec::new();
+    for i in pending {
+        let (declared, _) = info(&streams[i]);
         let pick = probed
             .iter()
             .find(|(sub, ch)| **ch == declared && !claimed.contains(*sub))
             .map(|(sub, _)| *sub);
-
-        if let Some(sub) = pick {
-            let new_pid = 0xBD00 | sub as u16;
-            if new_pid != a.pid {
-                tracing::debug!(
-                    target: "freemkv::scan",
-                    old_pid = a.pid,
-                    new_pid,
-                    declared_channels = declared,
-                    "dvd: re-routed AC-3 audio to physical sub-stream matching channel count"
-                );
-                a.pid = new_pid;
-                changed += 1;
+        match pick {
+            Some(sub) => {
+                claimed.push(sub);
+                changed += set_sub(&mut streams[i], sub);
             }
-            claimed.push(sub);
+            None => unmatched.push(i),
+        }
+    }
+    // Pass 3: no physical match — keep the ordinal sub when still free, else take a
+    // free one rather than share a PID.
+    let mut displaced: Vec<usize> = Vec::new();
+    for i in unmatched {
+        let (_, current) = info(&streams[i]);
+        if claimed.contains(&current) {
+            displaced.push(i);
         } else {
-            // No physical match — leave the ordinal assignment, but claim its
-            // current sub so later streams don't steal a slot it may still use.
-            claimed.push(current_sub);
+            claimed.push(current);
+        }
+    }
+    for i in displaced {
+        // Prefer a sub-stream that physically carries data, then a vacated ordinal one.
+        let free = probed
+            .keys()
+            .copied()
+            .chain(ordinal.iter().copied())
+            .find(|sub| !claimed.contains(sub));
+        match free {
+            Some(sub) => {
+                claimed.push(sub);
+                changed += set_sub(&mut streams[i], sub);
+            }
+            None => tracing::warn!(
+                target: "freemkv::scan",
+                pid = 0xBD00 | u16::from(info(&streams[i]).1),
+                "dvd: no free AC-3 sub-stream; audio track shares a PID with another"
+            ),
         }
     }
     changed
+}
+
+// Route an AC-3 stream to physical sub-stream `sub`; returns 1 when its PID changed.
+fn set_sub(s: &mut Stream, sub: u8) -> usize {
+    let Stream::Audio(a) = s else { return 0 };
+    let new_pid = 0xBD00 | sub as u16;
+    if new_pid == a.pid {
+        return 0;
+    }
+    tracing::debug!(
+        target: "freemkv::scan",
+        old_pid = a.pid,
+        new_pid,
+        declared_channels = a.channels.count(),
+        "dvd: re-routed AC-3 audio to physical sub-stream matching channel count"
+    );
+    a.pid = new_pid;
+    1
 }
 
 /// Probe the first feature extent of a DVD title through a (decrypted) sector
@@ -376,6 +418,73 @@ mod tests {
             pids,
             vec![0xBD81, 0xBD80],
             "5.1→0x81, 2.0→0x80, no collision"
+        );
+    }
+
+    /// A stream already sitting on its matching sub-stream must not share it with
+    /// an earlier stream that was re-routed there: 0x80=5.1, 0x81=2.0, both
+    /// declared 2.0 must stay on distinct sub-streams.
+    #[test]
+    fn remap_keep_current_respects_claimed() {
+        let mut probed = BTreeMap::new();
+        probed.insert(0x80u8, 6u8);
+        probed.insert(0x81u8, 2u8);
+        let mut streams = vec![
+            ac3_stream(0xBD80, AudioChannels::Stereo),
+            ac3_stream(0xBD81, AudioChannels::Stereo),
+        ];
+        remap_audio_pids(&mut streams, &probed);
+        let pids: Vec<u16> = streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pids, vec![0xBD80, 0xBD81], "no two tracks on one PID");
+    }
+
+    /// A displaced stream (its ordinal sub taken by a re-route) prefers an unclaimed
+    /// sub-stream that physically exists over a vacated ordinal one with no data.
+    #[test]
+    fn remap_displaced_stream_prefers_a_probed_sub() {
+        let mut probed = BTreeMap::new();
+        probed.insert(0x80u8, 2u8);
+        probed.insert(0x81u8, 6u8);
+        let mut streams = vec![
+            ac3_stream(0xBD82, AudioChannels::Surround51),
+            ac3_stream(0xBD81, AudioChannels::Mono),
+        ];
+        remap_audio_pids(&mut streams, &probed);
+        let pids: Vec<u16> = streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pids,
+            vec![0xBD81, 0xBD80],
+            "displaced -> probed 0x80, not empty 0x82"
+        );
+    }
+
+    /// More AC-3 streams than sub-streams: nothing is free, so the extra stream keeps
+    /// its (shared) ordinal PID — logged, never re-routed onto a random sub.
+    #[test]
+    fn remap_exhausted_subs_leave_the_ordinal_pid() {
+        let mut probed = BTreeMap::new();
+        probed.insert(0x80u8, 2u8);
+        let mut streams = vec![
+            ac3_stream(0xBD80, AudioChannels::Stereo),
+            ac3_stream(0xBD80, AudioChannels::Stereo),
+        ];
+        assert_eq!(remap_audio_pids(&mut streams, &probed), 0);
+        assert!(
+            streams
+                .iter()
+                .all(|s| matches!(s, Stream::Audio(a) if a.pid == 0xBD80))
         );
     }
 
