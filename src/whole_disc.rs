@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::sector::{DecryptingSectorSource, KeyFetch, SectorSource};
 
 /// Sectors in one AACS aligned unit (6144 bytes).
-const UNIT: u64 = (crate::aacs::content::ALIGNED_UNIT_LEN / 2048) as u64;
+pub(crate) const UNIT: u64 = (crate::aacs::content::ALIGNED_UNIT_LEN / 2048) as u64;
 
 /// Units probed per unplayed content file: its first unit, then evenly across it.
 const PROBES: u64 = 32;
@@ -92,8 +92,16 @@ pub fn whole_disc_reader<S: SectorSource>(
 // Every AACS content file's extents, one entry per file (contiguous extents joined):
 // `/BDMV/STREAM` (m2ts before SSIF, which re-lists them) or else HD DVD `/HVDVD_TS/*.EVO`.
 // An unreadable UDF or unmappable file fails loud: it would otherwise ship as ciphertext.
-fn content_files(reader: &mut dyn SectorSource) -> Result<Vec<Vec<(u32, u32)>>> {
+pub(crate) fn content_files(reader: &mut dyn SectorSource) -> Result<Vec<Vec<(u32, u32)>>> {
     let fs = crate::udf::read_filesystem(reader)?;
+    content_files_in(&fs, reader)
+}
+
+// `content_files` over an already-read filesystem.
+pub(crate) fn content_files_in(
+    fs: &crate::udf::UdfFs,
+    reader: &mut dyn SectorSource,
+) -> Result<Vec<Vec<(u32, u32)>>> {
     let (top, evo_only) = if fs.find_dir("/BDMV/STREAM").is_some() {
         ("/BDMV/STREAM", false)
     } else if fs.find_dir("/HVDVD_TS").is_some() {
@@ -137,12 +145,12 @@ fn content_files(reader: &mut dyn SectorSource) -> Result<Vec<Vec<(u32, u32)>>> 
 
 /// A content extent `(start, count)` and the LBA its unit grid is anchored at: the
 /// owning file's first sector, carried across extents by file offset.
-type UnitSpan = (u32, u32, u64);
+pub(crate) type UnitSpan = (u32, u32, u64);
 
 // The unit grid of every content extent: per file by file offset (never a merged run:
 // adjacent files each start their own grid), then title extents no file covers (anchored
 // at the extent start). Sorted, disjoint; on overlap the earlier-listed source wins.
-fn unit_spans(files: &[Vec<(u32, u32)>], title_extents: &[(u32, u32)]) -> Vec<UnitSpan> {
+pub(crate) fn unit_spans(files: &[Vec<(u32, u32)>], title_extents: &[(u32, u32)]) -> Vec<UnitSpan> {
     let mut raw: Vec<(UnitSpan, usize)> = Vec::new();
     for (i, file) in files.iter().enumerate() {
         let mut off = 0u64;
@@ -171,7 +179,7 @@ fn unit_spans(files: &[Vec<(u32, u32)>], title_extents: &[(u32, u32)]) -> Vec<Un
 }
 
 // The span holding `lba`, if any.
-fn span_at(spans: &[UnitSpan], lba: u64) -> Option<UnitSpan> {
+pub(crate) fn span_at(spans: &[UnitSpan], lba: u64) -> Option<UnitSpan> {
     let i = spans
         .partition_point(|&(s, _, _)| s as u64 <= lba)
         .checked_sub(1)?;
@@ -180,7 +188,7 @@ fn span_at(spans: &[UnitSpan], lba: u64) -> Option<UnitSpan> {
 }
 
 // The first unit head at or after `lba` on the grid anchored at `anchor`.
-fn unit_head(lba: u32, anchor: u64) -> u64 {
+pub(crate) fn unit_head(lba: u32, anchor: u64) -> u64 {
     lba as u64 + (UNIT - (lba as u64).saturating_sub(anchor) % UNIT) % UNIT
 }
 
@@ -393,7 +401,7 @@ impl Probe<'_> {
 
 // Which of a piece's `units` to probe, in order: all of them when few, else the
 // first unit, then `PROBES - 1` more spread evenly to the end.
-fn probe_units(units: u64) -> Vec<u64> {
+pub(crate) fn probe_units(units: u64) -> Vec<u64> {
     if units <= PROBES {
         return (0..units).collect();
     }
@@ -440,7 +448,7 @@ fn merge_key_ranges(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Vec<(u32, u32,
 
 // `content` `(start, count)` ranges minus the sorted, disjoint `[start, end)` `keyed`
 // ranges, as `[start, end)` pieces.
-fn subtract_ranges(content: &[(u32, u32)], keyed: &[(u32, u32)]) -> Vec<(u32, u32)> {
+pub(crate) fn subtract_ranges(content: &[(u32, u32)], keyed: &[(u32, u32)]) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     for &(start, count) in content {
         let end = start.saturating_add(count);
@@ -463,7 +471,7 @@ fn subtract_ranges(content: &[(u32, u32)], keyed: &[(u32, u32)]) -> Vec<(u32, u3
 
 // Sort + coalesce overlapping/adjacent `(start, count)` ranges (the content gate's
 // binary search needs them sorted and disjoint); empty ranges are dropped.
-fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+pub(crate) fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     ranges.retain(|&(_, count)| count > 0);
     ranges.sort_unstable();
     let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
@@ -508,7 +516,7 @@ pub struct UnitAligned<S> {
 }
 
 impl<S: SectorSource> UnitAligned<S> {
-    fn new(inner: S, spans: Vec<UnitSpan>) -> Self {
+    pub(crate) fn new(inner: S, spans: Vec<UnitSpan>) -> Self {
         Self {
             inner,
             spans,
@@ -564,6 +572,9 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
 
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.inner.unmapped_stream_files()
+    }
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
     }
 
     fn read_sectors(

@@ -307,4 +307,4 @@ impl SectorSource for DirImage {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

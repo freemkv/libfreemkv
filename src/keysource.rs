@@ -236,7 +236,8 @@ pub struct UnitKeyResolution {
     /// When `matched` and `keys` is empty: the derivation nodes walked AFTER the
     /// implicit `MatchedDisc` node — e.g. `[NoVid]` (had a Media Key, no VID) or
     /// `[NoDerivableKey]` (no material at all). Empty ⇒ the caller supplies a
-    /// bare `NoDerivableKey`. Ignored unless `matched` and `keys` is empty.
+    /// bare `NoDerivableKey`. Rendered only when `matched` and `keys` is empty; a `NoVid`
+    /// beside partial keys still tells `resolve` the VID would help (KU J23).
     pub miss_path: Vec<crate::aacs::trace::KeyNode>,
     /// When `matched`: a booleans-and-lengths shape of the matched entry (no key
     /// material), for the application to log. `None` for a miss or a source kind
@@ -303,6 +304,28 @@ pub trait KeySource {
     /// composition/ordering. A format string, not user-facing English.
     fn label(&self) -> &'static str {
         "source"
+    }
+
+    /// Whether this source's answer depends on the content samples it is sent. `true` (the
+    /// default): `ResolvedKeySet::resolve` asks it once per unopened piece, with that piece's
+    /// samples. `false` (a keydb keyed by disc hash): asked once per resolve (KU §2.3 step 8).
+    fn answer_depends_on_samples(&self) -> bool {
+        true
+    }
+
+    /// Whether this source's most recent failed request got NO answer at all (DNS, connect or
+    /// idle stall: transport class). Only then does `resolve` retry it, until 60 s pass with no
+    /// answer (KU §2.3 step 8, J13, J15). Default `false`: never retried, so a source that
+    /// answered (a 5xx, 401, 429) is never asked twice.
+    fn last_failure_was_transport(&self) -> bool {
+        false
+    }
+
+    /// Whether this source derives keys from the disc's Volume ID it is sent (an online key
+    /// service: Kvu = AES-G(Km, IDv), KS-16), so a Missing piece might open with the VID in
+    /// hand (KU J23, E7034). Default `false`.
+    fn uses_vid(&self) -> bool {
+        false
     }
 }
 

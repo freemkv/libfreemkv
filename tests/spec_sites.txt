@@ -26,3 +26,13 @@ src/drive/allow.rs	is_eject	SS-6
 src/drive/mod.rs	eject	SS-6
 src/drive/mod.rs	start_unit	SS-6
 src/drive/mod.rs	note_ledger	SS-7
+src/keys/resolve.rs	resolve	KS-14
+src/keys/resolve.rs	borrow_samples	KS-10
+src/keys/resolve.rs	apply_single_unit_rule	KS-14
+src/keys/arrival.rs	decrypt_proven	KS-5
+src/keys/arrival.rs	side_partners	KS-1
+src/keys/arrival.rs	side_partners	KS-2
+src/keys/arrival.rs	side_partners	KS-7
+src/keys/fmts.rs	anchor	KS-26
+src/keys/fmts.rs	phases	KS-25
+src/keys/fmts.rs	phases	KS-26

@@ -664,6 +664,9 @@ impl SectorSource for RecoveryReads<'_> {
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.inner.unmapped_stream_files()
     }
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
 }
 
 // A read fault a re-read may clear: not a dead transport, a gone source or an image's end.
@@ -3097,6 +3100,10 @@ impl SectorSource for FileReadAhead<'_> {
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.inner.unmapped_stream_files()
     }
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
+
     fn read_sectors(
         &mut self,
         lba: u32,

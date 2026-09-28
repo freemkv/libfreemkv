@@ -42,6 +42,11 @@ pub struct ExtractOptions<'a> {
     /// the in-flight file is left as `.partial` — never a half-written file
     /// that looks complete. `None` disables cancellation.
     pub halt: Option<crate::halt::Halt>,
+    /// The rip's up-front key set (KU §3.1), scope `WholeDisc`. For an AACS disc every file
+    /// is read through the set's reader: proven files by its map, the rest proven on
+    /// arrival, and a readable unit no held key opens stops the run (E7032). `None` keeps
+    /// the legacy disc-banked keys (until KU-X2).
+    pub keys: Option<&'a crate::keys::ResolvedKeySet>,
 }
 
 impl ExtractOptions<'_> {
@@ -190,11 +195,23 @@ impl Disc {
         // when a scrambled VOB group needs it. AACS / None discs keep the
         // disc-wide keys for every file.
         let mut base_keys = self.decrypt_keys();
+        // The rip's key set replaces the disc-banked keys and the count rule below (K-2).
+        let keyed = opts.keys.filter(|s| s.is_aacs());
+        if let Some(set) = keyed {
+            crate::keys::check_decryptable(
+                self,
+                false,
+                Some(set),
+                &crate::keys::KeyScope::WholeDisc,
+            )?;
+            base_keys = set.decrypt_keys();
+        }
 
         // AACS key map, by CPS-unit count. Single-CPS: one Unit Key opens
         // everything, so a blanket key-0 map covers even orphan clips. Multi-CPS
         // builds an exact per-title map instead (a blanket map would mis-decrypt).
         let key_map = match &base_keys {
+            _ if keyed.is_some() => None,
             DecryptKeys::Aacs { unit_keys, .. } if unit_keys.len() <= 1 => {
                 Some(std::sync::Arc::new(
                     crate::decrypt::AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
@@ -220,7 +237,12 @@ impl Disc {
         // Phase 2: stream each file through the decrypting decorator, which owns a
         // borrowing wrapper so the caller keeps `reader`. Keys swap per CSS VTS
         // group via `set_keys`; AACS/None keep `base_keys` throughout.
-        let mut dec = DecryptingSectorSource::new(Borrowed(reader), base_keys.clone());
+        let mut dec = match keyed {
+            Some(set) => {
+                set.decrypting(Borrowed(reader), None, crate::keys::StopKind::Image, false)?
+            }
+            None => DecryptingSectorSource::new(Borrowed(reader), base_keys.clone()),
+        };
         if let Some(map) = key_map {
             dec = dec.with_key_map(map);
         }
@@ -395,6 +417,9 @@ impl SectorSource for Borrowed<'_> {
     }
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.0.unmapped_stream_files()
+    }
+    fn random_access(&self) -> bool {
+        self.0.random_access()
     }
 }
 
@@ -758,6 +783,8 @@ fn read_batch<S: SectorSource>(
             Ok(_) if attempt < READ_RETRIES => continue,
             Ok(_) => return Ok(false),
             Err(Error::Halted) => return Err(Error::Halted),
+            // The key set's loud stop (KU §2.4): never a hole, the run stops `.partial`.
+            Err(e @ (Error::WholeDiscKeyMissing | Error::NoDiscKey { .. })) => return Err(e),
             Err(Error::DecryptFailed) => return Ok(false),
             Err(_) if attempt < READ_RETRIES => continue,
             Err(_) => return Ok(false),

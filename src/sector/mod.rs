@@ -90,6 +90,14 @@ pub trait SectorSource: Send {
     fn unmapped_stream_files(&self) -> &[bus_removal::UnmappedStreamFile] {
         &[]
     }
+
+    /// Whether `read_sectors` honours the requested `lba`/`count` (random access). `false`
+    /// for a prefetcher, whose "lba/count are advisory". The key set's decrypting readers
+    /// side-read neighbouring units, so they refuse a non-random-access inner source (KU
+    /// §2.4); wrappers must forward it.
+    fn random_access(&self) -> bool {
+        true
+    }
 }
 
 // Forwarding impls so `Box<dyn SectorSource>` and `&mut dyn SectorSource`
@@ -132,6 +140,10 @@ impl SectorSource for Box<dyn SectorSource> {
     fn unmapped_stream_files(&self) -> &[bus_removal::UnmappedStreamFile] {
         (**self).unmapped_stream_files()
     }
+
+    fn random_access(&self) -> bool {
+        (**self).random_access()
+    }
 }
 
 impl SectorSource for &mut (dyn SectorSource + '_) {
@@ -170,6 +182,10 @@ impl SectorSource for &mut (dyn SectorSource + '_) {
 
     fn unmapped_stream_files(&self) -> &[bus_removal::UnmappedStreamFile] {
         (**self).unmapped_stream_files()
+    }
+
+    fn random_access(&self) -> bool {
+        (**self).random_access()
     }
 }
 

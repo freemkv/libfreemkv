@@ -337,6 +337,10 @@ pub struct InputOptions {
     /// after the title-index bounds check. Default keeps every stream (video is
     /// always kept). See [`crate::StreamSelection`].
     pub selection: crate::StreamSelection,
+    /// The rip's up-front key set (KU §3.1). For an AACS image it replaces `unit_keys` and
+    /// `key_fetch`: the title is read through the set's reader, with no lookup here.
+    /// `None` keeps the legacy disc-banked keys (until KU-X2).
+    pub keys: Option<crate::keys::ResolvedKeySet>,
 }
 
 // `KeyFetchFactory` holds a trait object that is not `Debug`; hand-roll the
@@ -350,6 +354,7 @@ impl std::fmt::Debug for InputOptions {
             .field("raw", &self.raw)
             .field("key_fetch", &self.key_fetch.is_some())
             .field("selection", &self.selection)
+            .field("keys", &self.keys.is_some())
             .finish()
     }
 }
@@ -472,6 +477,9 @@ where
     if is_folder {
         crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)
             .map_err(|e| -> io::Error { e.into() })?;
+    }
+    if let Some(set) = opts.keys.as_ref().filter(|s| s.is_aacs() && !opts.raw) {
+        return keyed_image_input(reader, disc, opts, set, reopen);
     }
     // Apply the caller-resolved keys (lookup-free); decrypt_keys() then
     // yields them for the stream below. Propagate a failed application
@@ -607,6 +615,50 @@ where
         fetch,
     )?;
     Ok(stream)
+}
+
+// `image_input` over the rip's key set (KU §3.1, §3.5): the gate is `check_decryptable`,
+// and the TrueHD probe and the mux read through the set's reader. No lookup, no banking.
+fn keyed_image_input<S, F>(
+    reader: S,
+    mut disc: crate::disc::Disc,
+    opts: &InputOptions,
+    set: &crate::keys::ResolvedKeySet,
+    reopen: F,
+) -> io::Result<PipelinedPesStream>
+where
+    S: SectorSource + Send + 'static,
+    F: FnOnce() -> io::Result<S>,
+{
+    if disc.titles.is_empty() {
+        return Err(crate::error::Error::NoStreams.into());
+    }
+    let idx = opts.title_index.unwrap_or(0);
+    if idx >= disc.titles.len() {
+        return Err(crate::error::Error::DiscTitleRange {
+            index: idx,
+            count: disc.titles.len(),
+        }
+        .into());
+    }
+    let scope = crate::keys::KeyScope::Titles(vec![idx]);
+    crate::keys::check_decryptable(&disc, false, Some(set), &scope)
+        .map_err(|e| -> io::Error { e.into() })?;
+    opts.selection
+        .apply(&mut disc.titles[idx])
+        .map_err(|e| -> io::Error { e.into() })?;
+    match reopen() {
+        Ok(probe) => match set.title_reader(&disc, idx, probe) {
+            Ok(mut dec) => crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]),
+            Err(e) => tracing::debug!(target: "mux", error = %e, "TrueHD probe reader refused"),
+        },
+        Err(e) => {
+            tracing::debug!(target: "mux", error = %e, "TrueHD channel-correction probe re-open failed")
+        }
+    }
+    const ISO_MUX_BATCH_SECTORS: u16 = 8192;
+    let title = disc.titles[idx].clone();
+    build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, None, None)
 }
 
 /// Open a PES output stream (consumes PES frames).
@@ -823,7 +875,7 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
 
 // Tag for an FMTS forensic index key banked into the key pool (base + slot); separates disc
 // BASE CPS unit keys (< this) from forensic ones (>= this).
-const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
+pub(crate) const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
 
 // Pool slot of the disc's ONE base CPS Unit Key, or None for a genuine multi-CPS disc; excludes
 // forensic index keys.
@@ -1322,7 +1374,7 @@ fn probe_fmts_index_keys(
 
 // FMTS forensic feature clip's own extents — the byte space every `IndividualSegment.tbl` SPN
 // is relative to — or None if not exactly one such clip.
-fn forensic_clip_extents(
+pub(crate) fn forensic_clip_extents(
     udf: &crate::udf::UdfFs,
     reader: &mut dyn SectorSource,
 ) -> io::Result<Option<Vec<crate::disc::Extent>>> {
@@ -1373,7 +1425,7 @@ fn extents_overlap(a: &[crate::disc::Extent], b: &[crate::disc::Extent]) -> bool
 // Keep only forensic segments addressable within the FORENSIC CLIP's extents; stale/foreign
 // records past the clip's end are dropped. Extracted from resolve_fmts_key_map for direct
 // testing.
-fn filter_addressable_segments(
+pub(crate) fn filter_addressable_segments(
     segments: Vec<crate::aacs::segment::Segment>,
     extents: &[crate::disc::Extent],
 ) -> Vec<crate::aacs::segment::Segment> {
@@ -1401,7 +1453,7 @@ fn resolve_tie_phase(even_clean: usize, odd_clean: usize) -> io::Result<crate::d
 // Outcome of probing ONE forensic index's decrypt phase; the load-bearing split is WrongKey vs
 // ReadFault — only the former is a real FmtsKeyMissing.
 #[derive(Debug, PartialEq, Eq)]
-enum IndexProbe {
+pub(crate) enum IndexProbe {
     /// A parity decrypted clean under this index's key (or a padding tie) → its phase.
     Phase(crate::decrypt::Phase),
     /// At least one unit was READ and decrypt-attempted, yet NEITHER parity came up
@@ -1415,7 +1467,7 @@ enum IndexProbe {
 
 // Probe one forensic index's decrypt phase (EVEN vs ODD aligned units) under `key`, tolerating
 // read faults without masking a genuine wrong key.
-fn probe_index_phase(
+pub(crate) fn probe_index_phase(
     segments: &[crate::aacs::segment::Segment],
     tag: u16,
     batch_units: usize,
@@ -1466,7 +1518,7 @@ fn probe_index_phase(
 
 // Back-fill LBA gaps NOT covered by forensic segment ranges with the base Unit Key, so the map
 // is a COMPLETE positive list over the title's content extents.
-fn fill_base_key_gaps(
+pub(crate) fn fill_base_key_gaps(
     extents: &[crate::disc::Extent],
     forensic_ranges: &[(u32, u32, usize, crate::decrypt::Phase)],
     base_idx: usize,
@@ -1785,15 +1837,93 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         Some(map) => map.read_plan(&extents, unit_align as u32),
         None => extents,
     };
-    // The plan and clip feed spans must describe the SAME bytes: if the plan
-    // drops alternate-phase units, frames drift out of place near a join —
-    // undetectable by the tile check. Fall back to timestamps if mismatched.
-    let feed_matches_spans = extents == full_extents;
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     if let Some(map) = key_map {
         decrypting = decrypting.with_key_map(map);
     }
+    let plan = IsoPlan {
+        extents,
+        full_extents,
+        batch_sectors,
+        unit_align,
+        format,
+    };
+    iso_pipeline_tail(decrypting, plan, title, halt, event_fn)
+}
+
+// The read plan of an ISO title mux: the extents read (FMTS alternate phase dropped), the
+// title's full extents, and the read geometry.
+struct IsoPlan {
+    extents: Vec<crate::disc::Extent>,
+    full_extents: Vec<crate::disc::Extent>,
+    batch_sectors: u16,
+    unit_align: u16,
+    format: ContentFormat,
+}
+
+/// The ISO title mux over a [`ResolvedKeySet`](crate::keys::ResolvedKeySet) (KU §3.1): the
+/// set's decrypting reader (its map and on-arrival proof) under the prefetcher, with no
+/// resolution here. `title` is an already-scanned title; E7013 if the set does not cover
+/// its extents or the image is not a sector-exact copy of the set's disc.
+pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
+    reader: S,
+    title: DiscTitle,
+    set: &crate::keys::ResolvedKeySet,
+    batch_sectors: u16,
+    halt: Option<crate::halt::Halt>,
+    event_fn: Option<crate::sector::prefetched::EventFn>,
+) -> io::Result<PipelinedPesStream> {
+    let cap = reader.capacity_sectors();
+    if (cap != 0 && set.capacity() != 0 && cap != set.capacity())
+        || !set.covers_extents(&title.extents)
+    {
+        tracing::error!(target: "freemkv::keys", "key set does not cover this image title");
+        debug_assert!(false, "key set does not cover this image title");
+        return Err(crate::error::Error::DecryptFailed.into());
+    }
+    let full_extents = title.extents.clone();
+    let ranges: Vec<(u32, u32)> = full_extents
+        .iter()
+        .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
+        .collect();
+    let decrypting = set
+        .decrypting(
+            Box::new(reader) as Box<dyn SectorSource>,
+            Some(&ranges),
+            set.title_stop(),
+            false,
+        )
+        .map_err(io::Error::from)?;
+    let plan = IsoPlan {
+        extents: set.key_map().read_plan(&full_extents, 3),
+        full_extents,
+        batch_sectors,
+        unit_align: 3,
+        format: set.content_format(),
+    };
+    iso_pipeline_tail(decrypting, plan, title, halt, event_fn)
+}
+
+// The shared tail of the ISO title mux: decrypting reader → prefetcher → demux → parse.
+fn iso_pipeline_tail(
+    mut decrypting: crate::sector::DecryptingSectorSource<Box<dyn SectorSource>>,
+    plan: IsoPlan,
+    title: DiscTitle,
+    halt: Option<crate::halt::Halt>,
+    event_fn: Option<crate::sector::prefetched::EventFn>,
+) -> io::Result<PipelinedPesStream> {
+    let IsoPlan {
+        extents,
+        full_extents,
+        batch_sectors,
+        unit_align,
+        format,
+    } = plan;
+    // The plan and clip feed spans must describe the SAME bytes: if the plan
+    // drops alternate-phase units, frames drift out of place near a join —
+    // undetectable by the tile check. Fall back to timestamps if mismatched.
+    let feed_matches_spans = extents == full_extents;
     // The mux does not tally decrypt-quality misses (`lost_bytes()` is read-loss
     // only); a missing key is an up-front resolve failure. Wrong-substream fix
     // below: re-route declared AC-3 audio onto correct `0x8x` sub-streams.

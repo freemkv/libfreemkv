@@ -100,6 +100,8 @@ pub(crate) mod ifo;
 #[cfg(feature = "rip")]
 pub mod io;
 #[cfg(feature = "rip")]
+pub mod keys;
+#[cfg(feature = "rip")]
 pub mod keysource;
 #[cfg(feature = "rip")]
 pub mod labels;
@@ -246,7 +248,7 @@ pub use mux::resolve_mux_key_map;
 #[cfg(feature = "rip")]
 pub use mux::select::{PidFilter, StreamSelection};
 #[cfg(feature = "rip")]
-pub use mux::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, mux_stream};
+pub use mux::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, MuxSource, mux_stream, mux_with_keys};
 pub use scsi::{
     DiscPresence, DriveInfo, ScsiSense, ScsiTransport, SenseFamily, disc_presence, drive_has_disc,
     list_drives,

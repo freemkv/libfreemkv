@@ -82,7 +82,9 @@ pub(crate) mod videomap;
 // The provenance types ARE public: `output()` takes a `SourceInfo` so an `fvi://`
 // destination records the INPUT it was built from (§6.2), not the file written.
 pub use disc::DiscStream;
-pub use driver::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, mux_stream};
+pub use driver::{
+    MuxEvents, MuxInput, MuxOptions, MuxOutcome, MuxSource, mux_stream, mux_with_keys,
+};
 pub use m2ts::M2tsStream;
 pub use mkvstream::{
     MkvProbe, MkvProbeTrack, MkvStream, MkvTrackKind, parse_freemkv_version, probe_mkv,

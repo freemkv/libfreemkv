@@ -1821,6 +1821,9 @@ impl<S: SectorSource + ?Sized> SectorSource for BufferedSectorReader<'_, S> {
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.inner.unmapped_stream_files()
     }
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
 }
 
 /// Read a single 2048-byte sector from the drive.

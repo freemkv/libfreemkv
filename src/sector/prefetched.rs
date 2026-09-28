@@ -342,6 +342,11 @@ impl SectorSource for PrefetchedSectorSource {
         &self.unmapped
     }
 
+    // The producer decides the next batch; "lba/count are advisory" (read_sectors below).
+    fn random_access(&self) -> bool {
+        false
+    }
+
     fn read_sectors(
         &mut self,
         _lba: u32,

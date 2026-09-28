@@ -266,6 +266,33 @@ impl DiscSession {
         Ok(resolved.trace)
     }
 
+    /// Resolve the rip's key set for `scope` up front (KU §3.1): one
+    /// [`ResolvedKeySet::resolve`](crate::keys::ResolvedKeySet::resolve) through the
+    /// session's staged reader, else its drive. The session keeps nothing: the set is the
+    /// caller's, and no source is retained. Requires [`Self::scan`] to have run.
+    pub fn resolve_key_set(
+        &mut self,
+        scope: crate::keys::KeyScope,
+        sources: &KeySourceFactory,
+        opts: crate::keys::ResolveKeysOptions,
+    ) -> Result<crate::keys::KeyResolution> {
+        let Some(disc) = self.disc.as_ref() else {
+            return Err(Error::DeviceNotReady {
+                path: self.device.clone(),
+            });
+        };
+        let reader: &mut dyn SectorSource = match (self.reader.as_mut(), self.drive.as_mut()) {
+            (Some(r), _) => r.as_mut(),
+            (None, Some(d)) => d,
+            (None, None) => {
+                return Err(Error::DeviceNotReady {
+                    path: self.device.clone(),
+                });
+            }
+        };
+        crate::keys::ResolvedKeySet::resolve(disc, reader, scope, sources, opts)
+    }
+
     /// The read-time AACS fetch closure retained by [`Self::resolve_keys`], for a
     /// later mux (step 4) to install into the decrypt decorator. `None` before
     /// keys are resolved, or for a non-AACS disc.
