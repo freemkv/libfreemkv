@@ -685,13 +685,37 @@ fn hddvd_disc() -> MemDisc {
     mem
 }
 
+const VTKF_LBA: u32 = PART_START + 910;
+
+// An HD DVD's `X!` AACS dir is an AACS dir: identified as encrypted, its VTKF captured
+// before the handshake, and a keyless rip refused instead of writing ciphertext.
 #[test]
-fn hddvd_scan_output_unchanged_and_no_aacs_scsi() {
+fn hddvd_aacs_dir_is_captured_and_handshaked() {
     let mut rig = Rig::new(hddvd_disc(), |_| {});
+    assert!(Disc::identify(&mut rig.drive).expect("identify").encrypted);
     let d = Disc::scan(&mut rig.drive, &with_hc()).expect("scan");
-    assert!(d.aacs.is_none() && d.aacs_error.is_none());
-    assert!(!d.titles.is_empty());
-    assert_eq!(rig.count(is_aacs_cdb), 0, "{:02x?}", rig.cdbs());
+    assert!(d.encrypted && !d.titles.is_empty());
+    let a = d.aacs.as_ref().expect("HD DVD AACS state");
+    assert!(
+        !a.bus_encryption && d.aacs_error.is_none(),
+        "{:?}",
+        d.aacs_error
+    );
+    assert!(matches!(
+        d.ensure_decryptable(false),
+        Err(Error::NoDiscKey { .. })
+    ));
+    let cdbs = rig.cdbs();
+    let first_aacs = cdbs.iter().position(|c| is_aacs_cdb(c)).expect("AACS CDBs");
+    let vtkf = cdbs.iter().rposition(|c| touches(c, &[VTKF_LBA]));
+    assert!(vtkf.is_some_and(|i| i < first_aacs), "{cdbs:02x?}");
+}
+
+#[test]
+fn hddvd_image_aacs_dir_is_captured() {
+    let mut mem = hddvd_disc();
+    let d = Disc::scan_image(&mut mem, 9_999, &ScanOptions::default()).expect("scan");
+    assert!(d.encrypted && d.aacs.is_some() && d.aacs_error.is_none());
 }
 
 #[test]

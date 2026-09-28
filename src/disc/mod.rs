@@ -496,9 +496,12 @@ pub struct Extent {
 }
 
 // THE ONE definition of "structurally AACS-encrypted" — shared by the fast identify and the
-// full scan so they can't silently desync. Structural, not cryptographic.
+// full scan so they can't silently desync. Structural, not cryptographic; HD DVD's `X!` dir
+// is found by the same discovery the key-file reads use.
 pub(crate) fn aacs_dir_present(udf_fs: &crate::udf::UdfFs) -> bool {
-    udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some()
+    udf_fs.find_dir("/AACS").is_some()
+        || udf_fs.find_dir("/BDMV/AACS").is_some()
+        || crate::aacs::find_hddvd_aacs_dir(udf_fs).is_some()
 }
 
 // Title-ranking heuristic thresholds. Each gates a DISTINCT decision — several share a value
