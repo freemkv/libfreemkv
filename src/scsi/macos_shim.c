@@ -32,35 +32,54 @@ extern char **environ;
 // DiskArbitration claim wait, so a wedged DA can't hang open().
 #define SHIM_DA_CLAIM_MS 5000
 
+void shim_close(void);
+
 // The cancel byte is the Rust Halt's AtomicBool; the Acquire load pairs with its Release (SS-23).
 static int shim_cancelled(const volatile uint8_t *cancel) {
     return cancel && __atomic_load_n(cancel, __ATOMIC_ACQUIRE) != 0;
 }
 
-static uint64_t shim_now_ms(void) {
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull;
+static uint64_t shim_now_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+// The next wait until `end_ns`: at most one slice, in nanoseconds.
+static uint64_t shim_slice_ns(uint64_t now_ns, uint64_t end_ns) {
+    uint64_t left = end_ns - now_ns;
+    uint64_t slice = (uint64_t)SHIM_WAIT_SLICE_MS * NSEC_PER_MSEC;
+    return left < slice ? left : slice;
 }
 
 // Sleep `ms`. 0 once slept out, SHIM_CANCELLED on cancel.
 static int sliced_sleep(uint32_t ms, const volatile uint8_t *cancel) {
-    (void)cancel;
-    usleep((useconds_t)ms * 1000);
-    return 0;
+    uint64_t end = shim_now_ns() + (uint64_t)ms * NSEC_PER_MSEC;
+    for (;;) {
+        if (shim_cancelled(cancel)) return SHIM_CANCELLED;
+        uint64_t now = shim_now_ns();
+        if (now >= end) return 0;
+        usleep((useconds_t)((shim_slice_ns(now, end) + NSEC_PER_USEC - 1) / NSEC_PER_USEC));
+    }
 }
 
 // Wait up to `ms` for `sem`. 0 signalled, 1 timed out, SHIM_CANCELLED on cancel.
 static int sliced_sem_wait(dispatch_semaphore_t sem, uint32_t ms, const volatile uint8_t *cancel) {
-    (void)cancel;
-    // Apple dispatch/semaphore.h: "Returns zero on success, or non-zero if the timeout occurred."
-    return dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-        (int64_t)ms * NSEC_PER_MSEC)) == 0 ? 0 : 1;
+    uint64_t end = shim_now_ns() + (uint64_t)ms * NSEC_PER_MSEC;
+    for (;;) {
+        if (shim_cancelled(cancel)) return SHIM_CANCELLED;
+        uint64_t now = shim_now_ns();
+        if (now >= end) return 1;
+        int64_t slice = (int64_t)shim_slice_ns(now, end);
+        // Apple dispatch/semaphore.h: "Returns zero on success, or non-zero if the timeout occurred."
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, slice)) == 0) {
+            return 0;
+        }
+    }
 }
 
 // Run `path argv` (no shell; stdout/stderr to /dev/null) and wait for it, killing it on
 // budget or cancel. 0 exited, 1 budget spent, SHIM_CANCELLED, -1 spawn failed.
 static int run_and_reap(const char *path, char *const argv[], uint32_t budget_ms,
                         const volatile uint8_t *cancel, pid_t *pid_out) {
-    (void)cancel;
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
@@ -70,21 +89,29 @@ static int run_and_reap(const char *path, char *const argv[], uint32_t budget_ms
     posix_spawn_file_actions_destroy(&fa);
     if (spawned != 0) return -1;
     if (pid_out) *pid_out = pid;
-    const int poll_us = 50000;
-    const uint32_t max_polls = budget_ms / 50;
+    uint64_t end = shim_now_ns() + (uint64_t)budget_ms * NSEC_PER_MSEC;
     int status;
-    for (uint32_t i = 0; i <= max_polls; i++) {
+    int outcome;
+    for (;;) {
+        // wait(2): "The WNOHANG option is used to indicate that the call should not block if
+        // there are no processes that wish to report status." r < 0 (ECHILD): already gone.
         pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r < 0 && errno == EINTR) continue;
         if (r == pid || r < 0) return 0;
-        if (i == max_polls) break;
-        usleep(poll_us);
+        if (shim_cancelled(cancel)) { outcome = SHIM_CANCELLED; break; }
+        uint64_t now = shim_now_ns();
+        if (now >= end) { outcome = 1; break; }
+        usleep((useconds_t)((shim_slice_ns(now, end) + NSEC_PER_USEC - 1) / NSEC_PER_USEC));
     }
+    // signal(3): "Except for the SIGKILL and SIGSTOP signals, the signal() function allows for
+    // a signal to be caught" — so the reap converges; still bounded (1 s) and sliced.
     kill(pid, SIGKILL);
-    for (int i = 0; i < 100; i++) {
-        if (waitpid(pid, &status, WNOHANG) != 0) break;
-        usleep(10000);
+    for (int i = 0; i < 1000 / SHIM_WAIT_SLICE_MS; i++) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || (r < 0 && errno != EINTR)) break;
+        usleep(SHIM_WAIT_SLICE_MS * 1000);
     }
-    return 1;
+    return outcome;
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -525,6 +552,12 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     // mmc/plugin mid-setup. Released before the self-locking da_hold (5 s wait).
     pthread_mutex_lock(&g_handle_lock);
 
+    // A Stop before the open does nothing at all: no unmount is started.
+    if (shim_cancelled(cancel)) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return SHIM_CANCELLED;
+    }
+
     if (g_handle.exclusive && g_handle.scsi) {
         pthread_mutex_unlock(&g_handle_lock);
         return 0;
@@ -559,8 +592,14 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         char *const argv[] = {
             "diskutil", "unmountDisk", "force", bsd_name, NULL
         };
-        run_and_reap("/usr/sbin/diskutil", argv, SHIM_DISKUTIL_BUDGET_MS, cancel, NULL);
-        sliced_sleep(SHIM_SETTLE_MS, cancel);
+        // On cancel run_and_reap has killed and reaped diskutil (§2.9 M2).
+        if (run_and_reap("/usr/sbin/diskutil", argv, SHIM_DISKUTIL_BUDGET_MS, cancel, NULL)
+                == SHIM_CANCELLED
+            || sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) {
+            if (svc) IOObjectRelease(svc);
+            pthread_mutex_unlock(&g_handle_lock);
+            return SHIM_CANCELLED;
+        }
     }
 
     // Check the return before using the port. On failure IOMainPort leaves `mp`
@@ -637,10 +676,11 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         return -4;
     }
 
+    int cancelled = 0;
     for (int retry = 0; retry < 10; retry++) {
         kr = (*g_handle.scsi)->ObtainExclusiveAccess(g_handle.scsi);
         if (kr == kIOReturnSuccess) break;
-        sliced_sleep(SHIM_SETTLE_MS, cancel);
+        if (sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) { cancelled = 1; break; }
     }
     if (kr != kIOReturnSuccess) {
         (*g_handle.scsi)->Release(g_handle.scsi);
@@ -650,7 +690,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         g_handle.mmc = NULL;
         g_handle.plugin = NULL;
         pthread_mutex_unlock(&g_handle_lock);
-        return -5;
+        return cancelled ? SHIM_CANCELLED : -5;
     }
 
     g_handle.exclusive = 1;
@@ -670,7 +710,11 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     // allocations fails it returns early (0 → no claim). The lock is deliberately
     // NOT held across da_hold's ~5 s self-locking claim wait, which would
     // serialize every open behind it.
-    if (bsd_name[0]) da_hold(bsd_name, cancel);
+    // A cancel during the claim wait undoes the whole open; da_release reaps the pending claim.
+    if (bsd_name[0] && da_hold(bsd_name, cancel) == SHIM_CANCELLED) {
+        shim_close();
+        return SHIM_CANCELLED;
+    }
 
     return 0;
 }
@@ -702,7 +746,6 @@ int shim_execute(const unsigned char *cdb, unsigned char cdb_len,
                  unsigned char *sense_out, unsigned int sense_len,
                  unsigned char *task_status_out, unsigned long long *transfer_count,
                  unsigned int timeout_ms) {
-    (void)timeout_ms;
     if (!g_handle.scsi) return -1;
 
     SCSITaskInterface **task = (*g_handle.scsi)->CreateSCSITask(g_handle.scsi);
@@ -726,7 +769,9 @@ int shim_execute(const unsigned char *cdb, unsigned char cdb_len,
             kSCSIDataTransfer_NoDataTransfer);
     }
 
-    (*task)->SetTimeoutDuration(task, 30000);
+    // §2.9 M1: the caller's timeout_ms, not a fixed 30 s. SCSITaskLib.h SetTimeoutDuration:
+    // "The timeout duration is counted in milliseconds."
+    (*task)->SetTimeoutDuration(task, timeout_ms);
 
     SCSI_Sense_Data sense;
     memset(&sense, 0, sizeof(sense));

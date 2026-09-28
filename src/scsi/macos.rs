@@ -556,13 +556,19 @@ mod tests {
     fn shim_selftest_cancel_ends_the_settle_sleep() {
         let (rc, wake) = cancel_during(|c| unsafe { shim_selftest_sleep(LONG_MS, c) });
         assert_eq!(rc, SHIM_CANCELLED);
-        assert!(wake <= WAKE_BOUND, "settle sleep woke {wake:?} after the cancel");
+        assert!(
+            wake <= WAKE_BOUND,
+            "settle sleep woke {wake:?} after the cancel"
+        );
 
         let halt = Halt::new();
         halt.cancel();
         let t0 = Instant::now();
         let rc = unsafe { shim_selftest_sleep(LONG_MS, cancel_byte(&halt)) };
-        assert_eq!(rc, SHIM_CANCELLED, "a token cancelled before the wait ends it at once");
+        assert_eq!(
+            rc, SHIM_CANCELLED,
+            "a token cancelled before the wait ends it at once"
+        );
         assert!(t0.elapsed() <= WAKE_BOUND);
 
         let t0 = Instant::now();
@@ -577,7 +583,10 @@ mod tests {
     fn shim_selftest_cancel_ends_the_da_claim_wait() {
         let (rc, wake) = cancel_during(|c| unsafe { shim_selftest_sem_wait(LONG_MS, 0, c) });
         assert_eq!(rc, SHIM_CANCELLED);
-        assert!(wake <= WAKE_BOUND, "DA claim wait woke {wake:?} after the cancel");
+        assert!(
+            wake <= WAKE_BOUND,
+            "DA claim wait woke {wake:?} after the cancel"
+        );
 
         let never = Halt::new();
         let rc = unsafe { shim_selftest_sem_wait(60, 0, cancel_byte(&never)) };
@@ -603,11 +612,18 @@ mod tests {
             )
         });
         assert_eq!(rc, SHIM_CANCELLED);
-        assert!(wake <= WAKE_BOUND, "unmount wait woke {wake:?} after the cancel");
+        assert!(
+            wake <= WAKE_BOUND,
+            "unmount wait woke {wake:?} after the cancel"
+        );
         assert!(pid > 0, "the child was spawned");
         // wait(2) ECHILD: "The process specified by pid does not exist or is not a child of
         // the calling process" — the shim reaped it, leaving no zombie.
-        assert_eq!(unsafe { shim_selftest_reaped(pid) }, 1, "child {pid} not reaped");
+        assert_eq!(
+            unsafe { shim_selftest_reaped(pid) },
+            1,
+            "child {pid} not reaped"
+        );
     }
 
     /// The unmount budget still kills and reaps a wedged child with no cancel, and a child
@@ -626,7 +642,11 @@ mod tests {
             )
         };
         assert_eq!(rc, 1, "a wedged child is killed when the budget is spent");
-        assert_eq!(unsafe { shim_selftest_reaped(pid) }, 1, "child {pid} not reaped");
+        assert_eq!(
+            unsafe { shim_selftest_reaped(pid) },
+            1,
+            "child {pid} not reaped"
+        );
 
         let rc = unsafe {
             shim_selftest_run_and_reap(
@@ -638,7 +658,11 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "a child that exits is a normal exit");
-        assert_eq!(unsafe { shim_selftest_reaped(pid) }, 1, "child {pid} not reaped");
+        assert_eq!(
+            unsafe { shim_selftest_reaped(pid) },
+            1,
+            "child {pid} not reaped"
+        );
     }
 
     /// §2.9 M2: `SHIM_CANCELLED` → `Halted`. A cancelled open is `Halted` before any side
@@ -655,9 +679,20 @@ mod tests {
         halt.cancel();
         let t0 = Instant::now();
         let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &halt);
-        assert!(matches!(r, Err(Error::Halted)), "expected Halted, got {:?}", r.err());
-        assert!(t0.elapsed() <= WAKE_BOUND, "cancelled open took {:?}", t0.elapsed());
-        assert!(!OPEN.load(Ordering::Acquire), "a cancelled open left OPEN held");
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "expected Halted, got {:?}",
+            r.err()
+        );
+        assert!(
+            t0.elapsed() <= WAKE_BOUND,
+            "cancelled open took {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            !OPEN.load(Ordering::Acquire),
+            "a cancelled open left OPEN held"
+        );
     }
 
     /// §2.9 M1: "`timeout_ms` is passed through to the shim", reaching the task unchanged.
@@ -665,7 +700,10 @@ mod tests {
     #[test]
     fn shim_selftest_timeout_ms_is_passed_through() {
         let _globals = shim_globals();
-        assert!(!OPEN.swap(true, Ordering::Acquire), "OPEN held outside SHIM_GLOBALS");
+        assert!(
+            !OPEN.swap(true, Ordering::Acquire),
+            "OPEN held outside SHIM_GLOBALS"
+        );
         assert_eq!(unsafe { shim_selftest_install_fake_device() }, 0);
         let mut transport = MacScsiTransport {
             _bsd_name: "selftest".into(),
