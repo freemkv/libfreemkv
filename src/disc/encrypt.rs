@@ -108,7 +108,7 @@ pub(super) fn aacs_verdict(bus_encryption: bool, bus: &BusOutcome) -> Option<Err
     if let BusOutcome::Failed(e) = bus {
         return handshake_class_error(e).or(Some(Error::AacsBusKeyUnavailable));
     }
-    if !bus_encryption_removed(true, bus.source()) {
+    if !bus_encryption_removed(bus_encryption, bus.source()) {
         return Some(Error::AacsBusKeyUnavailable);
     }
     None
@@ -128,8 +128,8 @@ pub(super) fn handshake_class_error(e: &Error) -> Option<Error> {
 
 impl Disc {
     // Sticky refusal: a failed handshake on a bus-encrypted disc, or a live disc without
-    // its key file, admits no supplied key. With no AACS state the bus flag is unknown,
-    // so bus encryption is assumed.
+    // its key file (E7031; key sources then trace BUS_BLOCKED), admits no supplied key.
+    // With no AACS state the bus flag is unknown, so bus encryption is assumed.
     pub(crate) fn bus_blocked_error(&self) -> Option<Error> {
         if matches!(self.aacs_error, Some(Error::AacsKeyFileUnreadable)) {
             return Some(Error::AacsKeyFileUnreadable);
@@ -169,19 +169,37 @@ pub(super) struct AacsCapture {
     pub(super) mkb: Vec<u8>,
 }
 
-// Reads the AACS key files (plain READs, no AACS command). `Err` only for a Stop: a
-// missing or unreadable file is carried in the capture.
+/// Where a capture reads from, which decides what an unreadable `Unit_Key_RO.inf` does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CaptureFrom {
+    /// Image or folder: the key-file error is recorded as read (E7000/E6000).
+    Image,
+    /// Live drive: E7031, fatal unless `raw_copy` (then recorded, keys refused).
+    Live { raw_copy: bool },
+}
+
+// Reads the AACS key files (plain READs, no AACS command). `Err` for a Stop, and for a
+// live key-file failure without `raw_copy`, returned before any other read.
 pub(super) fn capture(
     reader: &mut dyn SectorSource,
     udf_fs: &udf::UdfFs,
-    live: bool,
+    from: CaptureFrom,
 ) -> Result<AacsCapture> {
     use crate::aacs;
-    let uk_ro = aacs::read_first(&aacs::role_paths(udf_fs, aacs::AacsRole::UnitKey), |p| {
+    let live = from != CaptureFrom::Image;
+    let mut uk_ro = aacs::read_first(&aacs::role_paths(udf_fs, aacs::AacsRole::UnitKey), |p| {
         udf_fs.read_file(reader, p)
     });
-    if matches!(uk_ro, Err(Error::Halted)) {
-        return Err(Error::Halted);
+    match (&uk_ro, from) {
+        (Err(Error::Halted), _) => return Err(Error::Halted),
+        (Err(e), CaptureFrom::Live { raw_copy }) => {
+            tracing::debug!(target: "freemkv::scan", phase = "aacs_capture", error_code = e.code(), raw_copy);
+            if !raw_copy {
+                return Err(Error::AacsKeyFileUnreadable);
+            }
+            uk_ro = Err(Error::AacsKeyFileUnreadable);
+        }
+        _ => {}
     }
     let cc_raw = match aacs::read_first(
         &aacs::role_paths(udf_fs, aacs::AacsRole::ContentCert),
@@ -727,14 +745,20 @@ mod tests {
     // Tests: capture + verdict (the keys-free state)
     // ---------------------------------------------------------------
 
+    fn from_for(bus: &BusOutcome) -> CaptureFrom {
+        match bus {
+            BusOutcome::FileOrIso => CaptureFrom::Image,
+            _ => CaptureFrom::Live { raw_copy: false },
+        }
+    }
+
     /// The keys-free state a scan keeps for `bus`, or the recorded error when there is none.
     fn vid_only(
         udf: &udf::UdfFs,
         reader: &mut dyn SectorSource,
         bus: &BusOutcome,
     ) -> Result<AacsState> {
-        let live = !matches!(bus, BusOutcome::FileOrIso);
-        let cap = capture(reader, udf, live)?;
+        let cap = capture(reader, udf, from_for(bus))?;
         let (state, err) = resolve_aacs(cap, bus);
         state.ok_or_else(|| err.unwrap_or(Error::AacsNoKeys))
     }
@@ -1066,13 +1090,11 @@ mod tests {
                 "UHD live drive must assume bus encryption"
             );
             let err = super::aacs_verdict(st.bus_encryption, &src);
-            assert!(
-                matches!(
-                    err,
-                    Some(Error::AacsBusKeyUnavailable | Error::AacsHostCertRejected)
-                ),
-                "{err:?}"
-            );
+            let want = match src {
+                BusOutcome::Failed(_) => crate::error::E_AACS_HOST_CERT_REJECTED,
+                _ => crate::error::E_AACS_BUS_KEY_UNAVAILABLE,
+            };
+            assert_eq!(err.map(|e| e.code()), Some(want));
         }
         let iso = vid_only(&udf, &mut uhd, &BusOutcome::FileOrIso).expect("ISO");
         assert!(super::aacs_verdict(iso.bus_encryption, &BusOutcome::FileOrIso).is_none());
@@ -1126,8 +1148,7 @@ mod tests {
 
     // Capture a synthetic AACS disc and `finish` it with the given bus outcome.
     fn finish_disc(disc: &mut MemDisc, udf: udf::UdfFs, bus: BusOutcome) -> Disc {
-        let live = !matches!(bus, BusOutcome::FileOrIso);
-        let cap = capture(disc, &udf, live).expect("capture");
+        let cap = capture(disc, &udf, from_for(&bus)).expect("capture");
         Disc::finish(disc, 10_000, udf, Some((cap, bus)), &ScanOptions::default()).expect("scan")
     }
 

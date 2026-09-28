@@ -667,6 +667,41 @@ fn halted_during_capture_propagates() {
     }
 }
 
+// A source whose reads covering `lba` fail with `Halted`, as a stopped drive's do.
+struct HaltAt {
+    mem: MemDisc,
+    lba: u32,
+}
+impl crate::sector::SectorSource for HaltAt {
+    fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], rec: bool) -> Result<usize> {
+        if (lba..lba + n as u32).contains(&self.lba) {
+            return Err(Error::Halted);
+        }
+        self.mem.read_sectors(lba, n, buf, rec)
+    }
+}
+
+// No later check may mask a Stop swallowed by one of capture's own reads.
+#[test]
+fn capture_propagates_a_stop_from_every_key_file_read() {
+    use super::encrypt::{CaptureFrom, capture};
+    for lba in [UK_LBA, CERT_LBA, MKB_LBA] {
+        for from in [
+            CaptureFrom::Image,
+            CaptureFrom::Live { raw_copy: true },
+            CaptureFrom::Live { raw_copy: false },
+        ] {
+            let mut src = HaltAt {
+                mem: bd_disc(Some(true)),
+                lba,
+            };
+            let udf = crate::udf::read_filesystem(&mut src).expect("udf");
+            let r = capture(&mut src, &udf, from);
+            assert!(matches!(r, Err(Error::Halted)), "lba {lba}");
+        }
+    }
+}
+
 #[test]
 fn no_unlocker_runs_cert_route_and_issues_ake() {
     let mut rig = Rig::new(bd_disc(Some(true)), |_| {});

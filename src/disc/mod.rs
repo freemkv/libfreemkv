@@ -1829,17 +1829,20 @@ impl Disc {
             buffered.prefetch_ranges(&ranges);
         }
 
-        let aacs = if !dvd && aacs_dir_present(&udf_fs) {
-            let mut cap = encrypt::capture(&mut buffered, &udf_fs, true)?;
-            if let Err(e) = &cap.uk_ro {
-                tracing::debug!(target: "freemkv::scan", phase = "aacs_capture", error_code = e.code(), raw_copy = opts.raw_copy);
-                if !opts.raw_copy {
-                    return Err(Error::AacsKeyFileUnreadable);
-                }
-                cap.uk_ro = Err(Error::AacsKeyFileUnreadable);
-            }
-            tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
-            let bus = encrypt::aacs_bus_step(buffered.inner_mut(), opts)?;
+        let aacs = if aacs_dir_present(&udf_fs) {
+            let from = encrypt::CaptureFrom::Live {
+                raw_copy: opts.raw_copy,
+            };
+            let cap = encrypt::capture(&mut buffered, &udf_fs, from)?;
+            // A DVD carrying /AACS gets no AACS handshake (CSS already ran).
+            let bus = if !dvd {
+                tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
+                encrypt::aacs_bus_step(buffered.inner_mut(), opts)?
+            } else if buffered.inner_mut().unlocker_name().is_some() {
+                encrypt::BusOutcome::FirmwareUnlocked
+            } else {
+                encrypt::BusOutcome::FileOrIso
+            };
             Some((cap, bus))
         } else {
             None
@@ -2231,7 +2234,7 @@ impl Disc {
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
         let aacs = if aacs_dir_present(&udf_fs) {
-            let cap = encrypt::capture(reader, &udf_fs, false)?;
+            let cap = encrypt::capture(reader, &udf_fs, encrypt::CaptureFrom::Image)?;
             Some((cap, encrypt::BusOutcome::FileOrIso))
         } else {
             None
@@ -9187,7 +9190,8 @@ mod tests {
         udf: &udf::UdfFs,
         rdk: Option<[u8; 16]>,
     ) -> Option<[u8; 16]> {
-        let cap = encrypt::capture(mem, udf, true).expect("capture");
+        let from = encrypt::CaptureFrom::Live { raw_copy: true };
+        let cap = encrypt::capture(mem, udf, from).expect("capture");
         let bus = encrypt::BusOutcome::Handshake(encrypt::HandshakeResult {
             volume_id: [0x11; 16],
             read_data_key: rdk,
@@ -9296,7 +9300,8 @@ mod tests {
             let (mem, _) = bus_fixture_with(Some(cert), wire.clone());
             let mut d = Drive::from_transport_for_test(Box::new(MemTransport(mem)));
             let (capacity, mut buffered, udf) = Disc::read_udf(&mut d).expect("udf");
-            let cap = encrypt::capture(&mut buffered, &udf, true).expect("capture");
+            let from = encrypt::CaptureFrom::Live { raw_copy: true };
+            let cap = encrypt::capture(&mut buffered, &udf, from).expect("capture");
             let bus = encrypt::BusOutcome::Handshake(handshake());
             Disc::live_finish(
                 buffered,
