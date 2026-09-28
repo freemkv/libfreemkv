@@ -565,6 +565,14 @@ impl<S: SectorSource> UnitAligned<S> {
     }
 }
 
+impl<S: SectorSource> UnitAligned<crate::sector::DecryptingSectorSource<S>> {
+    /// Damaged AACS units the decrypting reader blanked so far (see
+    /// [`DecryptingSectorSource::blanked_units`](crate::sector::DecryptingSectorSource::blanked_units)).
+    pub fn blanked_units(&self) -> u64 {
+        self.inner.blanked_units()
+    }
+}
+
 impl<S: SectorSource> SectorSource for UnitAligned<S> {
     fn capacity_sectors(&self) -> u32 {
         self.inner.capacity_sectors()

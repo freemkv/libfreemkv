@@ -183,6 +183,12 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         self.unit_base = None;
     }
 
+    /// Damaged AACS units this reader blanked (zero-filled) so far: flagged units no key can
+    /// open, read damage the rip carries on past.
+    pub fn blanked_units(&self) -> u64 {
+        0
+    }
+
     /// Borrow the inner source. Useful for tests and for adapters
     /// that want to introspect the underlying drive / file without
     /// unwrapping the decorator.
@@ -1015,18 +1021,32 @@ mod tests {
         );
     }
 
-    // A wrong explicit base (disc grid) cuts chunks across real units: their seed has
-    // no TS sync at byte 4, so the decrypt refuses instead of returning garbage.
+    // A wrong explicit base (disc grid) cuts chunks across real units: a flagged chunk's seed
+    // has no TS sync at byte 4, so no key opens it. Like any damaged unit it is blanked and
+    // counted, never E7013 (1.7.7 muxed through; "multi pass shouldn't error").
     #[test]
-    fn aacs_read_on_wrong_unit_grid_fails_loud() {
+    fn aacs_read_on_wrong_unit_grid_is_blanked_not_e7013() {
         let mut dec = misaligned_file_source();
         let mut buf = vec![0u8; 2 * crate::aacs::content::ALIGNED_UNIT_LEN];
         dec.set_unit_base(FILE_LBA + 1);
-        let r = dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false);
+        let mut raw = vec![0u8; buf.len()];
+        dec.inner_mut()
+            .read_sectors(FILE_LBA + 1, 6, &mut raw, false)
+            .unwrap();
+        let flagged: Vec<usize> = (0..2).filter(|&u| raw[u * 6144] & 0xC0 != 0).collect();
         assert!(
-            matches!(r, Err(crate::error::Error::DecryptFailed)),
-            "an off-grid read must be DecryptFailed, got Ok"
+            !flagged.is_empty(),
+            "the fixture cuts at least one flagged chunk"
         );
+        dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false)
+            .expect("an off-grid read is blanked, never E7013");
+        for &u in &flagged {
+            assert!(
+                buf[u * 6144..(u + 1) * 6144].iter().all(|&b| b == 0),
+                "unit {u} blanked"
+            );
+        }
+        assert_eq!(dec.blanked_units(), flagged.len() as u64);
 
         // The file's own grid decrypts both units byte-exact.
         dec.set_unit_base(FILE_LBA);
@@ -1092,21 +1112,22 @@ mod tests {
             "the damaged unit is a hole"
         );
         assert_eq!(&buf[2 * ul..], &clear[..]);
+        assert_eq!(dec.blanked_units(), 1);
     }
 
-    /// Once a read has shown the base is the file's grid, a later read of damaged units only
-    /// (no witness of its own) on that base is holes, not E7013. KS-2 [BD] §3.10.1: "Each MPEG
-    /// source packet consists of the TP_extra_header (4 bytes) and an MPEG Transport packet".
+    /// A cluster of damaged units is blanked and counted however it is read: alone, first,
+    /// with no intact unit around it. KS-2 [BD] §3.10.1: "Each MPEG source packet consists of
+    /// the TP_extra_header (4 bytes) and an MPEG Transport packet".
     #[test]
-    fn damaged_units_on_a_proven_grid_are_holes() {
+    fn a_cluster_of_damaged_units_is_blanked_and_counted() {
         assert!(
             crate::spec::keys::KS_2_ALIGNED_UNIT
                 .text
                 .contains("TP_extra_header (4 bytes)")
         );
-        let mut dec = damaged_file_source(4, &[2, 3]);
-        read_units(&mut dec, 0, 2).expect("an intact read proves the grid");
-        let buf = read_units(&mut dec, 2, 2).expect("damage on a proven grid is holes");
+        let mut dec = damaged_file_source(4, &[1, 2]);
+        let buf = read_units(&mut dec, 1, 2).expect("a damage cluster is blanked, never E7013");
+        assert_eq!(dec.blanked_units(), 2);
         assert!(buf.iter().all(|&b| b == 0), "both damaged units are holes");
     }
 
@@ -1137,5 +1158,10 @@ mod tests {
             "a lost seed is a hole"
         );
         assert_eq!(&buf[3 * ul..], &clear[..]);
+        assert_eq!(
+            dec.blanked_units(),
+            1,
+            "the lost-seed unit; the kept head is not blanked"
+        );
     }
 }

@@ -3766,6 +3766,7 @@ mod tests {
         let out = mux_damaged_iso(&path, title, &set, &format!("mkv://{}", out_path.display()))
             .expect("a damaged unit seed is read damage, never E7013");
         assert!(out.completed);
+        assert_eq!(out.lost_bytes, 6144, "the blanked unit is counted as loss");
         assert!(holds_plain_es(&out_path), "units around the hole decrypt");
     }
 
@@ -3788,5 +3789,150 @@ mod tests {
             .expect("an unaligned zero run is read damage, never E7013");
         assert!(out.completed);
         assert!(holds_plain_es(&out_path), "units around the hole decrypt");
+    }
+
+    // A random-access reader over an in-memory image (zeros past its end).
+    struct ImageReader(Vec<u8>);
+    impl crate::sector::SectorSource for ImageReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let (at, n) = (lba as usize * 2048, count as usize * 2048);
+            buf[..n].fill(0);
+            let have = self.0.len().saturating_sub(at).min(n);
+            buf[..have].copy_from_slice(&self.0[at..at + have]);
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            (self.0.len() / 2048) as u32
+        }
+        fn random_access(&self) -> bool {
+            true
+        }
+    }
+
+    // `damaged_uhd_image`'s title, re-cut into `extents`, muxed from the image (ISO) and from
+    // a live reader over the same bytes; `batch` sectors per read.
+    fn mux_both(
+        units: u32,
+        extents: &[(u32, u32)],
+        batch: u16,
+        damage: impl Fn(&mut [u8]),
+    ) -> [std::io::Result<MuxOutcome>; 2] {
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let key = [0x5A; 16];
+        let (_dir, path, mut title, set) = damaged_uhd_image(key, units, damage);
+        title.extents = extents
+            .iter()
+            .map(|&(start_lba, sector_count)| crate::disc::Extent {
+                start_lba,
+                sector_count,
+            })
+            .collect();
+        let opts = MuxOptions {
+            batch_sectors: batch,
+            ..keyed_opts()
+        };
+        let iso = mux_with_keys(
+            MuxSource::Iso {
+                path: &path,
+                title: title.clone(),
+                format: crate::disc::ContentFormat::BdTs,
+            },
+            Some(&set),
+            "null://",
+            &opts,
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        );
+        let live = mux_with_keys(
+            MuxSource::Live {
+                reader: Box::new(ImageReader(std::fs::read(&path).unwrap())),
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+            },
+            Some(&set),
+            "null://",
+            &opts,
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        );
+        [iso, live]
+    }
+
+    /// An extent that starts inside a cluster of damaged units (its first reads show no intact
+    /// unit) is holes, not E7013: the grid verdict waits for the extent's intact units. KS-4
+    /// [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed".
+    #[test]
+    fn an_extent_starting_inside_a_damage_cluster_muxes_through() {
+        let [iso, live] = mux_both(9, &[(0, 12), (12, 15)], 6, |im| {
+            (3..6).for_each(|u| {
+                crate::test_util::damage_unit_seed(&mut im[u * 6144..(u + 1) * 6144])
+            });
+        });
+        let (iso, live) = (
+            iso.expect("iso: damage is blanked"),
+            live.expect("live: blanked"),
+        );
+        assert!(iso.completed && live.completed);
+        assert_eq!(
+            (iso.lost_bytes, live.lost_bytes),
+            (3 * 6144, 3 * 6144),
+            "3 units counted"
+        );
+        assert!(
+            iso.errors >= 3 && live.errors >= 3,
+            "a damaged rip never looks clean"
+        );
+    }
+
+    /// Units read off their file's grid look like damage (a flagged seed without TS sync): as
+    /// in 1.7.7 the mux carries on, never E7013 — here blanked and counted as loss, on ISO and
+    /// live alike. The second extent starts 2 sectors off the grid.
+    #[test]
+    fn an_off_grid_extent_is_blanked_never_e7013_on_iso_and_live() {
+        let [iso, live] = mux_both(9, &[(0, 9), (11, 15)], 64, |_| {});
+        let (iso, live) = (
+            iso.expect("iso: never E7013"),
+            live.expect("live: never E7013"),
+        );
+        assert!(
+            iso.lost_bytes > 0,
+            "the flagged off-grid chunks are counted"
+        );
+        assert_eq!(
+            iso.lost_bytes, live.lost_bytes,
+            "ISO and live never deviate"
+        );
+    }
+
+    /// Dunkirk (AACS 2.0, bus encryption, one 55.5 GB clip): five unaligned zero runs of
+    /// 260, 611, 352, 192 and 546 sectors, laid out as on the real image, plus a unit on a run's
+    /// edge whose head read back as garbage. Every grid phase muxes through on ISO and live.
+    #[test]
+    fn a_dunkirk_damage_pattern_muxes_through_on_iso_and_live() {
+        const RUNS: [(u32, u32); 5] =
+            [(96, 260), (928, 611), (8899, 352), (9280, 192), (9633, 546)];
+        for phase in 0..3u32 {
+            let [iso, live] = mux_both(3400, &[(0, 10200)], 64, |im| {
+                for (at, n) in RUNS {
+                    let a = (at - phase) as usize * 2048;
+                    im[a..a + n as usize * 2048].fill(0);
+                }
+                let u = (928 - phase as usize + 611) / 3 + 1;
+                crate::test_util::damage_unit_seed(&mut im[u * 6144..(u + 1) * 6144]);
+            });
+            let (iso, live) = (iso.expect("iso"), live.expect("live"));
+            assert!(iso.completed && live.completed, "phase {phase}");
+            assert_eq!(
+                iso.lost_bytes, 6144,
+                "phase {phase}: the garbage head is counted"
+            );
+            assert_eq!(live.lost_bytes, iso.lost_bytes, "phase {phase}");
+        }
     }
 }

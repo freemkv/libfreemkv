@@ -1257,6 +1257,59 @@ fn on_arrival_read_damage_neither_proves_nor_refutes() {
     );
 }
 
+/// Sweep, patch and image→ISO read through the whole-disc reader, one call per block. A
+/// cluster of damaged units (KS-4: "The first 16 bytes of each Aligned Unit is used as the
+/// seed") is blanked and counted wherever it falls, never E7013: multipass must not error.
+#[test]
+fn whole_disc_reader_blanks_clustered_damage() {
+    let fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        2,
+        &[&[0, 1]],
+    );
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1, K2], &calls)]).unwrap();
+    let mut fx = fx;
+    (3..6).for_each(|u| damage_seed(&mut fx, 1, u));
+    let holes = vec![0u8; 3 * ALIGNED_UNIT_LEN];
+    let read = |w: &mut WholeDiscReader<Faulty>, u: u32, n: u32| {
+        let mut buf = vec![0u8; n as usize * ALIGNED_UNIT_LEN];
+        w.read_sectors(fx.unit(1, u), (n * 3) as u16, &mut buf, true)
+            .map(|_| masked(&buf))
+    };
+    // The cluster read first, then after an intact block: blanked and counted both ways.
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    assert_eq!(read(&mut w, 3, 3).unwrap(), holes, "a cluster read first");
+    assert_eq!(read(&mut w, 0, 3).unwrap(), fx.plain(fx.unit(1, 0), 3));
+    assert_eq!(w.blanked_units(), 3);
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    assert_eq!(read(&mut w, 0, 3).unwrap(), fx.plain(fx.unit(1, 0), 3));
+    assert_eq!(read(&mut w, 3, 3).unwrap(), holes, "a cluster read later");
+    assert_eq!(read(&mut w, 6, 4).unwrap(), fx.plain(fx.unit(1, 6), 4));
+    assert_eq!(w.blanked_units(), 3);
+}
+
+/// Extract (a decrypted folder) blanks a cluster of damaged units and reports their bytes as
+/// unreadable, never E7013 or E7032. KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned
+/// Unit is used as the seed" — no key opens a damaged one, so it is neither proof nor disproof.
+#[test]
+fn extract_tree_blanks_clustered_damage() {
+    let (fx, set, mut src) =
+        lazy_b_damaged(&[K1, K2], |fx| (3..6).for_each(|u| damage_seed(fx, 1, u)));
+    let dest = tempfile::tempdir().unwrap();
+    let opts = crate::disc::ExtractOptions {
+        keys: Some(&set),
+        ..Default::default()
+    };
+    let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
+    assert!(res.complete);
+    assert_eq!(res.bytes_unreadable, 3 * ALIGNED_UNIT_LEN as u64);
+    let got = std::fs::read(dest.path().join("BDMV/STREAM/00002.m2ts")).unwrap();
+    let mut want = fx.plain(fx.file(1).0, 10);
+    want[3 * ALIGNED_UNIT_LEN..6 * ALIGNED_UNIT_LEN].fill(0);
+    assert_eq!(masked(&got), want);
+}
+
 /// SG25 ⚑ — per spec; do not change without a spec citation — KS-1 [BD] §3.10.1:
 /// "encryption is applied to every Aligned Unit in the file"; KS-2. The final unit of a Lazy
 /// piece is decrypted (proven backward), never a read error.

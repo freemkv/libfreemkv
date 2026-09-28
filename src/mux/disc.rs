@@ -1972,7 +1972,11 @@ mod tests {
             false,
             None,
         )
-        .unwrap();
+        .unwrap()
+        // AACS decrypts only through a key map; without one every read is a decrypt refusal.
+        .with_key_map(std::sync::Arc::new(
+            crate::decrypt::AacsKeyMap::from_ranges(vec![(0, COUNT, 0)]),
+        ));
         stream.skip_errors = true;
         assert_eq!(
             stream.unit_align, ALIGN as u16,
