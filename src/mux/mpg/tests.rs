@@ -1066,6 +1066,76 @@ fn skipped_tracks_are_dropped_and_an_orphan_extension_is_reported() {
     assert!(p.pes.iter().all(|x| x.key.0 != 0xC0 && x.key.0 != 0xD0));
 }
 
+// J23: IFO coding mode 3 only declares the extension. One whose packets never arrive holds
+// nothing back (no interleave cap, no warning) and is not described; one first seen after
+// the origin window is left out and reported, as the map no longer can describe it.
+#[test]
+fn a_declared_only_extension_is_neither_waited_for_nor_described() {
+    let base = fixture(&Opts {
+        secs: 14,
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let fx = rebuild_aus(Fx {
+        frames: base
+            .frames
+            .iter()
+            .filter(|f| f.track != 2)
+            .cloned()
+            .collect(),
+        ..base
+    });
+    let r = run(&fx);
+    assert_eq!(
+        r.counters,
+        MpgCounters::default(),
+        "a clean disc counts nothing"
+    );
+    assert_replays(&r, &fx);
+    let m = &r.parsed.psms[0].1;
+    let info = usize::from(u16::from_be_bytes([m[8], m[9]]));
+    let es = &m[12 + info..m.len() - 4];
+    assert!(
+        !es.windows(2).any(|w| w == [0x04, 0xD0]),
+        "0xD0 is not mapped"
+    );
+    assert_eq!(
+        &es[4..6],
+        &[0x03, 0xC0],
+        "a base with no extension is 11172 audio"
+    );
+    let sh = &r.parsed.system_headers[0].1;
+    assert!(sh[12..].chunks(3).all(|e| e[0] != 0xD0), "no 0xD0 bound");
+
+    // First seen after the origin window: left out, and reported once its packets arrive.
+    let late = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let frames: Vec<PesFrame> = late
+        .frames
+        .iter()
+        .filter(|f| f.track != 2 || f.pts > VIDEO_START_NS + 3_000 * MS)
+        .cloned()
+        .collect();
+    let mut sink = MpgSink::create(Vec::new(), &late.title).unwrap();
+    for f in &frames {
+        sink.write(f).unwrap();
+    }
+    sink.finish().unwrap();
+    assert_eq!(sink.undelivered_streams(), vec![2]);
+    let out = sink.mux.take().unwrap().into_writer();
+    assert!(
+        replay::parse(&out)
+            .unwrap()
+            .pes
+            .iter()
+            .all(|x| x.key.0 != 0xD0)
+    );
+}
+
 // The replayer is not vacuous: tampered output fails it (design §7 "never more").
 #[test]
 fn the_replayer_rejects_tampered_streams() {
