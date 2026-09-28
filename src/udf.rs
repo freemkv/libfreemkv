@@ -2103,6 +2103,45 @@ mod tests {
         assert_eq!(extents, vec![(10, 4096), (20, 2048)]);
     }
 
+    /// per spec; do not change without a spec citation — KS-20, KS-21 ECMA-167 4/14.14.1.1:
+    /// "The 30 least significant bits … the length"; "1 Extent not recorded but allocated".
+    #[test]
+    fn udf_extent_type_bits() {
+        use crate::spec::keys::{KS_20_UDF_EXTENT_LENGTH, KS_21_UDF_EXTENT_TYPE};
+        assert!(
+            KS_20_UDF_EXTENT_LENGTH
+                .text
+                .starts_with("The 30 least significant bits")
+        );
+        assert!(
+            KS_20_UDF_EXTENT_LENGTH
+                .text
+                .contains("2 most significant bits")
+        );
+        let t = KS_21_UDF_EXTENT_TYPE.text;
+        assert!(t.starts_with("0 Extent recorded and allocated / 1 Extent not recorded"));
+        assert!(t.ends_with("3 The extent is the next extent of allocation descriptors"));
+        let big = 0x3FFF_F800; // type 0 with the top length bits set: length, not type
+        let icb = build_efe(
+            big as u64 + 2048 + 4096,
+            &[(0, big, 10), (1, 2048, 20), (3, 2048, 50)],
+        );
+        let mut reader = MapReader::new();
+        reader.put(105, icb);
+        reader.put(150, build_cont_block(&[(0, 4096, 30)]));
+        let fs = fs_with(0, 100, file_entry("T", 5, big as u64 + 2048 + 4096));
+        let got = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        let want = [(10, big, true), (20, 2048, false), (30, 4096, true)];
+        let want: Vec<IcbExtent> = want
+            .iter()
+            .map(|&(lba, len, recorded)| IcbExtent { lba, len, recorded })
+            .collect();
+        assert_eq!(
+            got, want,
+            "type 0 read, type 1 kept unrecorded, type 3 chained"
+        );
+    }
+
     #[test]
     fn icb_extents_continuation_skips_aed_header_not_read_as_extent() {
         // Regression (Blu-ray 3D): a continuation block opens with a 24-byte AED whose tag holds
