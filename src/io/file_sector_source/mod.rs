@@ -172,7 +172,8 @@ impl SectorSource for FileSectorSource {
             .map_err(|e| Error::IoError { source: e })?;
         // A padded source reads what the file holds and zero-fills the rest of the sector.
         let real = match self.padded_len {
-            Some(len) => (len.saturating_sub(offset) as usize).min(bytes),
+            // Clamp in u64 first: on a 32-bit target `as usize` would truncate the distance.
+            Some(len) => len.saturating_sub(offset).min(bytes as u64) as usize,
             None => bytes,
         };
         if let Err(e) = self.file.read_exact(&mut out[..real]) {
