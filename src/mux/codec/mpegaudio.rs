@@ -1,6 +1,6 @@
 //! MPEG audio framing and validation.
 
-use super::audio_frames::{AudioFrames, Header};
+use super::audio_frames::{AudioFrames, Header, Sync};
 #[cfg(test)]
 use super::pts_to_ns;
 use super::{CodecParser, Frame, PesPacket};
@@ -176,7 +176,13 @@ impl Default for MpegAudioParser {
 impl MpegAudioParser {
     pub fn new() -> Self {
         Self {
-            frames: AudioFrames::new("mpegaudio"),
+            frames: AudioFrames::new(
+                "mpegaudio",
+                Sync {
+                    mask: 0xe0,
+                    frame_len: |d| frame_header(d, &mut None, false).map(|h| h.bytes),
+                },
+            ),
             free_size: None,
         }
     }
@@ -508,6 +514,18 @@ mod tests {
         f.extend(p.flush());
         assert_eq!(f.len(), 2);
         assert!(f.iter().all(|fr| fr.data == free_frame()));
+    }
+
+    // L042: a first PES that starts mid-frame frames from the first chained header.
+    #[test]
+    fn a_first_pes_starting_mid_frame_frames_from_the_first_header() {
+        let mut data = vec![0x11; 100];
+        data.extend_from_slice(&mp3_frame().repeat(2));
+        let mut p = MpegAudioParser::new();
+        let f = p.parse(&make_pes(data, Some(90_000)));
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|fr| fr.data == mp3_frame()));
+        assert_eq!(f[0].pts_ns, pts_to_ns(90_000));
     }
 
     #[test]

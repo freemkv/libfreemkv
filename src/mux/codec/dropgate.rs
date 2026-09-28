@@ -56,6 +56,11 @@ impl DropTally {
         self.dropped_dur_ns
     }
 
+    #[cfg(test)]
+    pub(crate) fn verified_dropped(&self) -> u64 {
+        self.verified_dropped
+    }
+
     /// Record an emitted (decodable) access unit.
     pub(crate) fn record_kept(&mut self) {
         self.kept += 1;
