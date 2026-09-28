@@ -341,7 +341,14 @@ impl<W: Write> Mux<W> {
             room = u64::MAX;
         }
         let room = usize::try_from(room.saturating_sub(hdr as u64)).unwrap_or(usize::MAX);
-        let whole = s.spec.payload == Payload::WholeAu;
+        // Audio AUs go whole into one PES when a pack can hold them: PS readers time a
+        // frame by the PES its first byte is in, some only once it completes there (the
+        // extension additionally by MPG4-7).
+        let whole = match s.spec.payload {
+            Payload::WholeAu | Payload::Frames { .. } => true,
+            Payload::Plain => (0xC0..=0xDF).contains(&s.spec.stream_id),
+            _ => false,
+        };
         // Never more than the bytes queued: the header states the payload length.
         let queued = s.queue.iter().map(|q| q.au.data.len()).sum::<usize>() - head.sent;
         let room = room.min(queued);
@@ -361,10 +368,12 @@ impl<W: Write> Mux<W> {
                 let until_next = Self::first_byte(s, k + 1).unwrap_or(usize::MAX);
                 let mut len = cap.min(until_next).min(room);
                 if whole && k == 0 && head.sent == 0 {
-                    // MPG4-7: one extension frame, one whole PES (when a pack can hold it).
+                    // Wait for a fresh pack when one could hold the whole AU; a larger AU
+                    // (BD AC-3 at 640 kbit/s) spans PES.
+                    let fresh = pack::PACK_BYTES - pack::PACK_HEADER_BYTES - (9 + pstd + ts + hdr);
                     if q.au.data.len() <= cap && q.au.data.len() <= room {
                         len = q.au.data.len();
-                    } else if q.au.data.len() <= super::MAX_WHOLE_AU {
+                    } else if q.au.data.len() <= fresh {
                         len = 0;
                     }
                 }
@@ -572,10 +581,6 @@ impl<W: Write> Mux<W> {
     fn wake_time(&self, si: usize, t: u64) -> Option<u64> {
         let s = &self.streams[si];
         let head = s.queue.front()?;
-        let mut w = u64::MAX;
-        if let Some((k, _)) = Self::next_commencement(s) {
-            w = w.min(s.queue[k].dec27.saturating_sub(LEAD27));
-        }
         let removal = self
             .entries
             .iter()
@@ -584,14 +589,14 @@ impl<W: Write> Mux<W> {
             })
             .map(|e| e.dec27)
             .min();
-        if let Some(r) = removal {
-            w = w.min(r);
-        }
-        if head.sent > 0 {
-            // A tail blocked by room waits for a removal only.
-            w = removal.unwrap_or(w);
-        }
-        (w != u64::MAX).then_some(w.max(t + 1))
+        // Not yet within the 0.95 s lead: wait for it; else (a tail, or an AU waiting for
+        // room) only a removal can unblock it.
+        let lead = Self::next_commencement(s).map(|(k, _)| s.queue[k].dec27.saturating_sub(LEAD27));
+        let w = match lead {
+            Some(l) if head.sent == 0 && l > t => Some(l),
+            _ => removal,
+        };
+        w.map(|w| w.max(t + 1))
     }
 
     /// Write every pack the lookahead allows; at `eof`, everything.
@@ -740,5 +745,42 @@ mod tests {
         m.streams[0].queue[0].sent = 90;
         let p = m.plan_pes(0, 1_000, 0).unwrap();
         assert_eq!((p.len, p.start), (10, None), "the tail goes alone");
+    }
+
+    // An audio frame that fits one PES goes whole: PS readers time a frame by the PES its
+    // first byte is in, and some (our Ac3Parser) only when it completes there.
+    #[test]
+    fn an_audio_frame_that_fits_goes_whole() {
+        let spec = StreamSpec {
+            stream_id: 0xBD,
+            payload: Payload::Frames { sub_id: 0x80 },
+            buffer: 0,
+            sparse: false,
+            av: true,
+        };
+        let buf = BufferSpec {
+            stream_id: 0xBD,
+            scale_1024: true,
+            size: 8191,
+        };
+        let mut m = Mux::new(Vec::new(), vec![spec], vec![buf], Vec::new(), 25_200);
+        m.push(0, au(9_000, 1_792, 0));
+        assert!(
+            m.plan_pes(0, 500, 0).is_none(),
+            "no 480-byte start: wait for a pack"
+        );
+        assert_eq!(m.plan_pes(0, 2_034, 0).map(|p| p.len), Some(1_792));
+        let mut big = Mux::new(
+            Vec::new(),
+            vec![m.streams[0].spec.clone()],
+            vec![buf],
+            Vec::new(),
+            25_200,
+        );
+        big.push(0, au(9_000, 2_560, 0));
+        assert!(
+            big.plan_pes(0, 2_034, 0).is_some_and(|p| p.len < 2_560),
+            "a frame no PES holds spans"
+        );
     }
 }

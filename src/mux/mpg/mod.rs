@@ -27,8 +27,6 @@ use crate::pes::{PesFrame, Stream};
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
-/// Largest AU one pack's PES can hold whole (the extension's one-frame-one-PES rule).
-pub(crate) const MAX_WHOLE_AU: usize = pack::PACK_BYTES - pack::PACK_HEADER_BYTES - 9 - 3 - 5;
 /// Design §2.3 "every output tick is `input tick − lowest + 135 000` (1.5 s)".
 const ORIGIN_TICKS: i64 = 135_000;
 /// Design §2.3: "The sink queues ≥ 1 s of IR before its first pack".
