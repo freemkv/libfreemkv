@@ -177,6 +177,8 @@ pub trait ResolveCtx {
 pub struct DiscInputsCtx<'a> {
     inner: &'a DiscInputs,
     enc_keys: Vec<[u8; 16]>,
+    halt: Option<&'a crate::halt::Halt>,
+    progress: Option<&'a crate::halt::Progress>,
 }
 
 impl<'a> DiscInputsCtx<'a> {
@@ -200,6 +202,8 @@ impl<'a> DiscInputsCtx<'a> {
         Self {
             inner: inputs,
             enc_keys,
+            halt: None,
+            progress: None,
         }
     }
 
@@ -207,10 +211,14 @@ impl<'a> DiscInputsCtx<'a> {
     /// come back from [`ResolveCtx::halt`] and [`ResolveCtx::progress`].
     pub(crate) fn with_stop(
         self,
-        _halt: Option<&'a crate::halt::Halt>,
-        _progress: Option<&'a crate::halt::Progress>,
+        halt: Option<&'a crate::halt::Halt>,
+        progress: Option<&'a crate::halt::Progress>,
     ) -> Self {
-        self
+        Self {
+            halt,
+            progress,
+            ..self
+        }
     }
 }
 
@@ -239,6 +247,12 @@ impl ResolveCtx for DiscInputsCtx<'_> {
     }
     fn unit_key_ro(&self) -> &[u8] {
         &self.inner.unit_key_ro
+    }
+    fn halt(&self) -> Option<&crate::halt::Halt> {
+        self.halt
+    }
+    fn progress(&self) -> Option<&crate::halt::Progress> {
+        self.progress
     }
 }
 

@@ -327,8 +327,8 @@ impl ResolvedKeySet {
         opts: ResolveKeysOptions,
         progress: &crate::halt::Progress,
     ) -> Result<KeyResolution> {
-        let _ = progress;
-        Self::resolve(disc, reader, scope, sources, opts)
+        let clock = resolve::RealClock::new();
+        resolve::resolve_observed(disc, reader, scope, sources, opts, &clock, Some(progress))
     }
 
     /// A set holding no keys: for a raw copy, or a disc with no AACS.

@@ -181,6 +181,9 @@ impl Run<'_> {
             attempted = true;
             let src = &self.sources[i];
             let who = src.label().to_string();
+            // Stop §2.1 item 2 (ST4-2): a source call (a keydb parse, a key-service call)
+            // moves no CDB, so it is busy for the idle-only T29 probe.
+            let busy = self.progress.map(Progress::busy);
             let answer = if forensic {
                 src.get_fmts_indexes(&ctx).map(|k| (k, None))
             } else {
@@ -189,6 +192,7 @@ impl Run<'_> {
                     (r.keys, Some(info))
                 })
             };
+            drop(busy);
             match answer {
                 Ok((keys, info)) => {
                     let (matched, entry, store, miss) =
@@ -558,6 +562,11 @@ pub(crate) fn resolve_observed(
         && (run.km_needs_vid || vid_consumer)
     {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // The final check (Stop §6 ST-L3): a Stop during the last source call ends `Halted`,
+    // never a refusal or a set.
+    if let Some(h) = halt {
+        h.check()?;
     }
     let mut inner = result?;
     inner.disc_hash = aacs.disc_hash.clone();
