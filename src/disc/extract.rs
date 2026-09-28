@@ -42,6 +42,11 @@ pub struct ExtractOptions<'a> {
     /// the in-flight file is left as `.partial` — never a half-written file
     /// that looks complete. `None` disables cancellation.
     pub halt: Option<crate::halt::Halt>,
+    /// The rip's up-front key set (KU §3.1), scope `WholeDisc`. For an AACS disc every file
+    /// is read through the set's reader: proven files by its map, the rest proven on
+    /// arrival, and a readable unit no held key opens stops the run (E7032). `None` keeps
+    /// the legacy disc-banked keys (until KU-X2).
+    pub keys: Option<&'a crate::keys::ResolvedKeySet>,
 }
 
 impl ExtractOptions<'_> {

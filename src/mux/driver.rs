@@ -482,6 +482,79 @@ pub fn mux_stream(
     )
 }
 
+/// Where [`mux_with_keys`] reads its PES frames from (KU §3.1). The same sources as
+/// [`MuxInput`] without key fields: keys come only from the rip's
+/// [`ResolvedKeySet`](crate::keys::ResolvedKeySet).
+pub enum MuxSource<'a> {
+    /// Live single-pass mux off an opened [`DiscSession`] (its reader staged).
+    Session {
+        session: &'a mut DiscSession,
+        /// Index into `session.disc().titles`.
+        title_index: usize,
+    },
+    /// An image file and a title the caller ALREADY scanned (the drive scan, J14): the
+    /// image is never rescanned, so a sweep's unreadable UDF/MPLS/AACS sectors do not
+    /// matter. The set must cover the title and be for a sector-exact image of its disc.
+    Iso {
+        path: &'a Path,
+        title: DiscTitle,
+        format: crate::disc::ContentFormat,
+    },
+    /// Live single-pass mux off a raw disc reader (the inline `DiscStream`).
+    Live {
+        reader: Box<dyn SectorSource>,
+        title: DiscTitle,
+        format: crate::disc::ContentFormat,
+    },
+    /// Any URL-addressed source; the only variant that scans. `keys` goes into
+    /// [`InputOptions::keys`].
+    Url { url: &'a str, opts: InputOptions },
+}
+/// [`mux_stream`] with the rip's up-front key set (KU §3.1). RED STUB: the set is ignored.
+pub fn mux_with_keys(
+    source: MuxSource,
+    keys: Option<&crate::keys::ResolvedKeySet>,
+    dest_url: &str,
+    opts: &MuxOptions,
+    halt: &Halt,
+    events: std::sync::Arc<dyn MuxEvents>,
+) -> std::io::Result<MuxOutcome> {
+    let _ = keys;
+    let input = match source {
+        MuxSource::Url { url, opts } => MuxInput::Url { url, opts },
+        MuxSource::Session {
+            session,
+            title_index,
+        } => MuxInput::Session {
+            session,
+            title_index,
+        },
+        MuxSource::Iso {
+            path,
+            title,
+            format,
+        } => MuxInput::Iso {
+            path,
+            title,
+            format,
+            keys: DecryptKeys::None,
+            key_fetch: None,
+        },
+        MuxSource::Live {
+            reader,
+            title,
+            format,
+        } => MuxInput::Live {
+            reader,
+            title,
+            format,
+            keys: DecryptKeys::None,
+            key_map: None,
+        },
+    };
+    mux_stream(input, dest_url, opts, halt, events)
+}
+
 // Decrypt keys for the live `Session` mux of `disc`. A DVD is handed `DecryptKeys::None` so
 // `DiscStream::new` cracks the CORRECT per-title CSS key rather than the whole-disc
 // (largest-title) VTS key.
@@ -3158,5 +3231,143 @@ mod tests {
         let calls = finish_flushing(20, Duration::from_millis(5), Duration::from_millis(600));
         assert!(!calls.is_empty() && calls.len() <= 3, "{calls:?}");
         assert_eq!(calls.last(), Some(&(20_000, 20_000)));
+    }
+
+    // ── mux_with_keys (KU §3.1): keys come only from the rip's set ─────────────
+
+    fn keyed_opts() -> MuxOptions {
+        MuxOptions {
+            skip_errors: false,
+            batch_sectors: 3,
+            raw: false,
+            send_deadline: Some(Duration::from_secs(60)),
+            selection: Default::default(),
+        }
+    }
+
+    // One encrypted audio unit at LBA 0..3 under `key`, its title, and a set keying it.
+    fn keyed_live(key: [u8; 16]) -> (Box<AacsUnitReader>, DiscTitle, crate::keys::ResolvedKeySet) {
+        let reader = Box::new(AacsUnitReader {
+            unit: encrypted_audio_unit(&key),
+            capacity: 16,
+        });
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+        let mut disc = aacs_session_disc(title.clone(), [0u8; 16]);
+        disc.capacity_sectors = 16;
+        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
+        (reader, title, set)
+    }
+
+    // The plaintext audio ES inside `encrypted_audio_unit`, and a muxed MKV holding it.
+    const PLAIN_ES: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
+    fn holds_plain_es(path: &std::path::Path) -> bool {
+        std::fs::read(path)
+            .unwrap()
+            .windows(PLAIN_ES.len())
+            .any(|w| w == PLAIN_ES)
+    }
+
+    /// `MuxSource::Live` decrypts through the set's reader: no key banked on a disc, no
+    /// resolution in the driver.
+    #[test]
+    fn mux_with_keys_live_decrypts_through_the_set() {
+        let (reader, title, set) = keyed_live([0x5A; 16]);
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("live.mkv");
+        let out = mux_with_keys(
+            MuxSource::Live {
+                reader,
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+            },
+            Some(&set),
+            &format!("mkv://{}", out_path.display()),
+            &keyed_opts(),
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        )
+        .expect("the set's key opens the unit");
+        assert!(out.completed);
+        assert!(
+            holds_plain_es(&out_path),
+            "the muxed audio is the plaintext"
+        );
+    }
+
+    /// `MuxSource::Session` uses the set, not the disc's banked keys (a wrong key here).
+    #[test]
+    fn mux_with_keys_session_uses_the_set_not_banked_keys() {
+        let key = [0x5A; 16];
+        let (reader, title, _) = keyed_live(key);
+        let mut disc = aacs_session_disc(title, [0x99; 16]);
+        disc.capacity_sectors = 16;
+        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
+        let out = mux_with_keys(
+            MuxSource::Session {
+                session: &mut session,
+                title_index: 0,
+            },
+            Some(&set),
+            "null://",
+            &keyed_opts(),
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        )
+        .expect("the set's key opens the unit");
+        assert!(out.completed && out.bytes_written > 0);
+    }
+
+    /// J14: `MuxSource::Iso` muxes the caller's already-scanned title out of an image with
+    /// no filesystem at all; opening the same image by URL (which scans) fails.
+    #[test]
+    fn mux_with_keys_iso_muxes_a_scanned_title_without_rescanning() {
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let key = [0x5A; 16];
+        let (_, title, set) = keyed_live(key);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.iso");
+        let mut image = encrypted_audio_unit(&key);
+        image.resize(16 * 2048, 0);
+        std::fs::write(&path, &image).unwrap();
+        let out_path = dir.path().join("iso.mkv");
+        let out = mux_with_keys(
+            MuxSource::Iso {
+                path: &path,
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+            },
+            Some(&set),
+            &format!("mkv://{}", out_path.display()),
+            &keyed_opts(),
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        )
+        .expect("no rescan: the scanned title is muxed as given");
+        assert!(out.completed);
+        assert!(
+            holds_plain_es(&out_path),
+            "the muxed audio is the plaintext"
+        );
+        let url = format!("iso://{}", path.display());
+        let rescanned = mux_with_keys(
+            MuxSource::Url {
+                url: &url,
+                opts: InputOptions::default(),
+            },
+            Some(&set),
+            "null://",
+            &keyed_opts(),
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        );
+        assert!(
+            rescanned.is_err(),
+            "a URL source scans the image, which has no filesystem"
+        );
     }
 }

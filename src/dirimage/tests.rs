@@ -541,7 +541,7 @@ fn scan_image_enumerates_a_bdmv_folder() {
 
 /// A one-PlayItem MPLS long enough that `parse_playlist` keeps it (it drops
 /// anything under 30 s as a menu stub).
-fn one_item_mpls(clip_id: &[u8; 5]) -> Vec<u8> {
+pub(crate) fn one_item_mpls(clip_id: &[u8; 5]) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"MPLS0200");
     buf.extend_from_slice(&40u32.to_be_bytes()); // playlist_start
@@ -582,7 +582,7 @@ fn one_item_mpls(clip_id: &[u8; 5]) -> Vec<u8> {
 
 /// A CLPI with only the fields `clpi::parse` needs: magic, zeroed section
 /// starts, and the source packet count at 56.
-fn minimal_clpi(source_packets: u32) -> Vec<u8> {
+pub(crate) fn minimal_clpi(source_packets: u32) -> Vec<u8> {
     let mut d = vec![0u8; 60];
     d[0..4].copy_from_slice(b"HDMV");
     d[4..8].copy_from_slice(b"0200");

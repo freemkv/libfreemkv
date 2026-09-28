@@ -337,6 +337,10 @@ pub struct InputOptions {
     /// after the title-index bounds check. Default keeps every stream (video is
     /// always kept). See [`crate::StreamSelection`].
     pub selection: crate::StreamSelection,
+    /// The rip's up-front key set (KU §3.1). For an AACS image it replaces `unit_keys` and
+    /// `key_fetch`: the title is read through the set's reader, with no lookup here.
+    /// `None` keeps the legacy disc-banked keys (until KU-X2).
+    pub keys: Option<crate::keys::ResolvedKeySet>,
 }
 
 // `KeyFetchFactory` holds a trait object that is not `Debug`; hand-roll the
@@ -350,6 +354,7 @@ impl std::fmt::Debug for InputOptions {
             .field("raw", &self.raw)
             .field("key_fetch", &self.key_fetch.is_some())
             .field("selection", &self.selection)
+            .field("keys", &self.keys.is_some())
             .finish()
     }
 }

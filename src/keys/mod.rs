@@ -515,6 +515,31 @@ impl ResolvedKeySet {
         Ok(dec)
     }
 
+    // A set keying `ranges` (`[start, end)`) with `key` as proven pieces: the mux tests'
+    // stand-in for a set `resolve` built over a disc they do not lay out.
+    #[cfg(test)]
+    pub(crate) fn keyed_for_test(disc: &Disc, key: [u8; 16], ranges: &[(u32, u32)]) -> Self {
+        let mut i = Inner::empty();
+        i.aacs = true;
+        i.disc_hash = disc
+            .aacs
+            .as_ref()
+            .map(|a| a.disc_hash.clone())
+            .unwrap_or_default();
+        i.capacity = disc.capacity_sectors;
+        i.format = disc.format;
+        i.content_format = disc.content_format;
+        i.scope = KeyScope::WholeDisc;
+        i.pool = vec![key];
+        i.proven = vec![0];
+        i.keyed = ranges.len();
+        i.spans = ranges.iter().map(|&(s, e)| (s, e - s, s as u64)).collect();
+        i.map = Arc::new(AacsKeyMap::from_ranges(
+            ranges.iter().map(|&(s, e)| (s, e, 0)).collect(),
+        ));
+        ResolvedKeySet(Arc::new(i))
+    }
+
     /// The decrypting reader for title `idx` of `disc` over the raw, random-access `inner`:
     /// keyed pieces through the set's map, the rest proven on arrival (a readable unit no
     /// held key opens stops with E7022). E7013 if the set is not for `disc`, does not cover

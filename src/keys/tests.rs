@@ -1352,6 +1352,179 @@ fn on_arrival_proof_skips_forensic_segment_units() {
     }
 }
 
+// ── §3.1 surfaces: extract, input, mux, session ─────────────────────────────
+
+/// LK11 (K-2). KS-1 [BD] §3.10.1: "encryption is applied to every Aligned Unit in the
+/// file"; KS-10. A decrypted folder never keys a file with a key that does not open it:
+/// `resolve(WholeDisc)` refuses up front (E7032), and a file left Lazy whose readable unit
+/// no held key opens stops the extract (E7032), never written.
+#[test]
+fn extract_tree_refuses_a_file_no_key_opens() {
+    let fx = two_units();
+    let calls = Calls::default();
+    assert_eq!(
+        code(resolve(
+            &fx,
+            KeyScope::WholeDisc,
+            &[Spec::keydb(&[K1], &calls)]
+        )),
+        E7032
+    );
+
+    let (fx, set, mut src) = lazy_b(&[K1]);
+    let dest = tempfile::tempdir().unwrap();
+    let opts = crate::disc::ExtractOptions {
+        keys: Some(&set),
+        ..Default::default()
+    };
+    let r = fx.disc.extract_tree(&mut src, dest.path(), &opts);
+    assert_eq!(code(r), E7032);
+    assert!(
+        !dest.path().join("BDMV/STREAM/00002.m2ts").exists(),
+        "B is never written"
+    );
+
+    let (fx, set, mut src) = lazy_b(&[K1, K2]);
+    let dest = tempfile::tempdir().unwrap();
+    let opts = crate::disc::ExtractOptions {
+        keys: Some(&set),
+        ..Default::default()
+    };
+    let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
+    assert!(res.complete);
+    for (i, name) in [(0, "00001"), (1, "00002")] {
+        let got = std::fs::read(dest.path().join(format!("BDMV/STREAM/{name}.m2ts"))).unwrap();
+        assert_eq!(masked(&got), fx.plain(fx.file(i).0, 10), "{name}");
+    }
+}
+
+/// LK7. `resolve` retains no source: after it, the factory's `Arc` count is 1, and it is
+/// unchanged, with no call made, across readers, three passes with on-arrival proofs and a
+/// mux.
+#[test]
+fn resolve_retains_no_source_and_nothing_asks_after() {
+    let _serial = crate::sector::prefetched::holder_test_lock();
+    let fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        2,
+        &[&[0, 1]],
+    );
+    let (b, n) = fx.file(1);
+    let src = fx.source();
+    src.kill(b, b + n);
+    let calls = Calls::default();
+    let f = factory(&[Spec::keydb(&[K1, K2], &calls)]);
+    let set = ResolvedKeySet::resolve(
+        &fx.disc,
+        &mut src.clone(),
+        KeyScope::WholeDisc,
+        &f,
+        ResolveKeysOptions::default(),
+    )
+    .unwrap()
+    .keys;
+    assert_eq!(Arc::strong_count(&f), 1);
+    let asked = calls.len();
+    src.heal();
+    for _ in 0..3 {
+        let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
+        assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
+        let mut w = set.whole_disc_reader(&fx.disc, src.clone(), None).unwrap();
+        let mut buf = vec![0u8; 30 * 2048];
+        w.read_sectors(b, 30, &mut buf, true).unwrap();
+    }
+    let _ = crate::mux::mux_with_keys(
+        crate::mux::MuxSource::Live {
+            reader: Box::new(src.clone()),
+            title: fx.disc.titles[0].clone(),
+            format: ContentFormat::BdTs,
+        },
+        Some(&set),
+        "null://",
+        &crate::mux::MuxOptions {
+            batch_sectors: 30,
+            ..Default::default()
+        },
+        &Halt::new(),
+        Arc::new(crate::mux::driver::NoopEvents),
+    );
+    assert_eq!(Arc::strong_count(&f), 1);
+    assert_eq!(calls.len(), asked, "nothing asks after resolve");
+}
+
+// A scannable encrypted BD image: one playlist over one K1 clip of 10 units.
+fn scannable_image() -> (EncryptedBdImage, Disc) {
+    use crate::dirimage::tests::{minimal_clpi, one_item_mpls};
+    let uk_ro = unit_key_ro(AacsVersion::V10, &[[0xEE; 16]], &[1]);
+    let files = [
+        BdFile::new("BDMV/index.bdmv", 1, None),
+        BdFile::new("BDMV/PLAYLIST/00000.mpls", 1, None),
+        BdFile::new("BDMV/CLIPINF/00000.clpi", 1, None),
+        BdFile::new("BDMV/STREAM/00000.m2ts", 30, Some(K1)),
+    ];
+    let mut img = encrypted_bd_image(&files, &uk_ro);
+    for (i, bytes) in [(1, one_item_mpls(b"00000")), (2, minimal_clpi(320))] {
+        let at = img.files[i].0 as usize * 2048;
+        img.image[at..at + bytes.len()].copy_from_slice(&bytes);
+    }
+    let mut src = MemSource::new(img.image.clone());
+    let cap = src.capacity_sectors();
+    let disc = Disc::scan_image(&mut src, cap, &crate::disc::ScanOptions::default()).unwrap();
+    assert_eq!(disc.titles.len(), 1, "the fixture scans to one title");
+    (img, disc)
+}
+
+/// `InputOptions::keys` (KU §3.1, §3.5): an `iso://` AACS source opens through the rip's set,
+/// gated by `check_decryptable`, where the legacy path (no banked key) refuses E7022.
+#[test]
+fn iso_input_reads_through_the_key_set() {
+    let _serial = crate::sector::prefetched::holder_test_lock();
+    let (img, disc) = scannable_image();
+    let calls = Calls::default();
+    let f = factory(&[Spec::keydb(&[K1], &calls)]);
+    let set = ResolvedKeySet::resolve(
+        &disc,
+        &mut MemSource::new(img.image.clone()),
+        KeyScope::Titles(vec![0]),
+        &f,
+        ResolveKeysOptions::default(),
+    )
+    .unwrap()
+    .keys;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("disc.iso");
+    std::fs::write(&path, &img.image).unwrap();
+    let url = format!("iso://{}", path.display());
+    let legacy = crate::input(&url, &crate::InputOptions::default());
+    assert_eq!(crate::error_code(&legacy.err().unwrap()), Some(E7022));
+    let opts = crate::InputOptions {
+        keys: Some(set),
+        ..Default::default()
+    };
+    let stream = crate::input(&url, &opts).expect("the set keys the title");
+    assert_eq!(stream.info().extents, disc.titles[0].extents);
+}
+
+/// `DiscSession::resolve_key_set` resolves through the session's staged reader and keeps
+/// nothing: the set is the caller's.
+#[test]
+fn session_resolves_a_key_set_through_its_reader() {
+    let fx = two_units();
+    let calls = Calls::default();
+    let f = factory(&[Spec::keydb(&[K1, K2], &calls)]);
+    let mut session = crate::session::DiscSession::from_parts_for_test(
+        Some(two_units().disc),
+        Some(Box::new(fx.source())),
+        None,
+    );
+    let r = session
+        .resolve_key_set(KeyScope::WholeDisc, &f, ResolveKeysOptions::default())
+        .unwrap();
+    assert_eq!(r.keys.status().keyed, 2);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(Arc::strong_count(&f), 1);
+}
+
 /// KU §2.5: a title scope — even every title (`-t all`) — covers only the files its titles
 /// play. A file no title plays is a whole-disc concern (E7032 there), never a title refusal.
 #[test]
