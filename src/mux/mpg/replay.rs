@@ -350,8 +350,15 @@ pub(super) fn replay(p: &Parsed, aus: &Aus) -> Result<Found, String> {
                 ));
             }
             // The AU's first byte (a sequence header ahead of the picture) shares that PES, as
-            // a DVD encoder writes it and PS readers expect.
-            if locate(j).0 != cpi {
+            // a DVD encoder writes it and PS readers expect; unless no PES of a fresh pack
+            // reaches the commencement byte from the first (B1).
+            let fresh = pack::PACK_BYTES
+                - pack::PACK_HEADER_BYTES
+                - 9
+                - if x.pstd.is_some() { 3 } else { 0 }
+                - if x.dts.is_some() { 10 } else { 5 }
+                - x.sub_hdr.len();
+            if locate(j).0 != cpi && mark < fresh {
                 return Err(format!(
                     "{key:?} AU {a}: first byte in PES {} but PTS in PES {cpi}",
                     locate(j).0

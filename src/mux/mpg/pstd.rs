@@ -157,6 +157,8 @@ pub(crate) struct Mux<W: Write> {
     next_id: u64,
     queued_bytes: usize,
     counters: PstdCounters,
+    /// EOF with nothing schedulable: the lead and whole-frame waits are lifted (B1).
+    forcing: bool,
 }
 
 // What one PES will carry.
@@ -201,6 +203,7 @@ impl<W: Write> Mux<W> {
             next_id: 0,
             queued_bytes: 0,
             counters: PstdCounters::default(),
+            forcing: false,
         }
     }
 
@@ -357,8 +360,16 @@ impl<W: Write> Mux<W> {
             let ts = if q.au.dts.is_some() { 10 } else { 5 };
             // A PES that carries a PTS starts at its AU's first byte, as a DVD encoder
             // writes it: PS readers give a PES's PTS to the AU holding its first byte.
-            let at_au = k == 0 && head.sent == 0;
-            let lead_ok = q.dec27.saturating_sub(t) <= LEAD27;
+            let at_au = k == 0 && head.sent <= head.au.mark;
+            let lead_ok = self.forcing || q.dec27.saturating_sub(t) <= LEAD27;
+            let fresh = pack::PACK_BYTES - pack::PACK_HEADER_BYTES - (9 + pstd + ts + hdr);
+            if at_au && lead_ok && dist >= fresh {
+                // B1: no PES reaches the commencement byte (MS-15), so the bytes before it
+                // go first without a PTS; the PES holding it carries the PTS.
+                let cap = avail.checked_sub(9 + pstd + hdr)?;
+                let len = cap.min(dist).min(room);
+                return (len > 0).then_some(PesPlan { len, start: None });
+            }
             if let Some(cap) = avail.checked_sub(9 + pstd + ts + hdr)
                 && at_au
                 && lead_ok
@@ -370,10 +381,9 @@ impl<W: Write> Mux<W> {
                 if whole && k == 0 && head.sent == 0 {
                     // Wait for a fresh pack when one could hold the whole AU; a larger AU
                     // (BD AC-3 at 640 kbit/s) spans PES.
-                    let fresh = pack::PACK_BYTES - pack::PACK_HEADER_BYTES - (9 + pstd + ts + hdr);
                     if q.au.data.len() <= cap && q.au.data.len() <= room {
                         len = q.au.data.len();
-                    } else if q.au.data.len() <= fresh {
+                    } else if q.au.data.len() <= fresh && !self.forcing {
                         len = 0;
                     }
                 }
@@ -593,7 +603,7 @@ impl<W: Write> Mux<W> {
         // room) only a removal can unblock it.
         let lead = Self::next_commencement(s).map(|(k, _)| s.queue[k].dec27.saturating_sub(LEAD27));
         let w = match lead {
-            Some(l) if head.sent == 0 && l > t => Some(l),
+            Some(l) if head.sent <= head.au.mark && l > t => Some(l),
             _ => removal,
         };
         w.map(|w| w.max(t + 1))
@@ -632,8 +642,24 @@ impl<W: Write> Mux<W> {
                 .filter_map(|si| self.wake_time(si, t))
                 .min();
             let Some(next) = next else {
-                // Only unsendable data would remain; stop rather than spin.
-                return Ok(());
+                if !eof {
+                    return Ok(());
+                }
+                // B1: at EOF nothing is left behind. Lift the waits and drop empty AUs once;
+                // what still cannot go is an error, never a silent Ok.
+                if self.forcing {
+                    let left: usize = self.streams.iter().map(|s| s.queue.len()).sum();
+                    return Err(io::Error::other(format!(
+                        "mpg: {left} access unit(s) could not be packetized"
+                    )));
+                }
+                self.forcing = true;
+                for s in &mut self.streams {
+                    while s.queue.front().is_some_and(|q| q.au.data.is_empty()) {
+                        s.queue.pop_front();
+                    }
+                }
+                continue;
             };
             match self.last_scr {
                 Some(last) if next > last + MAX_SCR_GAP27 => {

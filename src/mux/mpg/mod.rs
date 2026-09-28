@@ -587,6 +587,10 @@ impl<W: Write + Send> Stream for MpgSink<W> {
             self.excluded.drop_frame(frame.track);
             return Ok(());
         };
+        // B1: an empty frame (a Matroska empty Block) carries no access unit.
+        if frame.data.is_empty() {
+            return Ok(());
+        }
         let is_video = out == self.video_out;
         // Drop video before the first keyframe: nothing decodes without it (tsmux's guard).
         if is_video && !frame.keyframe && !self.armed {
