@@ -7,6 +7,7 @@
 //! channel + consumer thread. `byte_prefetcher` is the read-ahead
 //! producer feeding the mux pipeline for `io::Read`-backed sources.
 
+pub mod artifact_lock;
 pub(crate) mod bounded;
 pub mod byte_prefetcher;
 pub mod file_sector_source;
@@ -22,6 +23,7 @@ pub(crate) mod platform_macos;
 
 pub mod pipeline;
 
+pub use artifact_lock::ArtifactLock;
 pub use flush::{FlushProgress, durable_sync_file};
 pub use writeback_file::WritebackFile;
 

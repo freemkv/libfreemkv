@@ -112,6 +112,55 @@ pub const SS_7_AGID_INVALIDATE: SpecQuote = SpecQuote {
            >> 6;",
 };
 
+const FLOCK_URL: &str = "https://man7.org/linux/man-pages/man2/flock.2.html";
+
+pub const SS_8_FLOCK_NFS: SpecQuote = SpecQuote {
+    id: "SS-8",
+    kind: QuoteKind::Normative,
+    source: "Linux man-pages, flock(2)",
+    section: "DESCRIPTION; ERRORS; HISTORY, NFS details",
+    locator: "man7.org flock(2)",
+    url: FLOCK_URL,
+    text: "Only one process may hold an exclusive lock for a given file at a given time. … To \
+           make a nonblocking request, include LOCK_NB (by ORing) with any of the above \
+           operations. … Locks created by flock() are associated with an open file \
+           description (see open(2)). This means that duplicate file descriptors (created by, \
+           for example, fork(2) or dup(2)) refer to the same lock … If a process uses open(2) \
+           (or similar) to obtain more than one file descriptor for the same file, these file \
+           descriptors are treated independently by flock(). … EWOULDBLOCK The file is locked \
+           and the LOCK_NB flag was selected. … NFS clients support flock() locks by emulating \
+           them as fcntl(2) byte-range locks on the entire file. … in order to place an \
+           exclusive lock, the file must be opened for writing.",
+};
+
+pub const SS_9_FILE_IDENTITY: SpecQuote = SpecQuote {
+    id: "SS-9",
+    kind: QuoteKind::Normative,
+    source: "The Open Group Base Specifications Issue 8 (IEEE Std 1003.1-2024), XBD",
+    section: "<sys/stat.h> DESCRIPTION",
+    locator: "pubs.opengroup.org basedefs/sys_stat.h.html",
+    url: "https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_stat.h.html",
+    text: "A file identity is uniquely determined by the combination of st_dev and st_ino. At \
+           any given time in a system, distinct files shall have distinct file identities",
+};
+
+pub const SS_10_WINDOWS_LOCK_AND_ID: SpecQuote = SpecQuote {
+    id: "SS-10",
+    kind: QuoteKind::Normative,
+    source: "Microsoft Learn, Win32 API (fileapi.h): LockFileEx, CreateFileW, \
+             BY_HANDLE_FILE_INFORMATION",
+    section: "LockFileEx dwFlags; CreateFileW dwShareMode; BY_HANDLE_FILE_INFORMATION Members",
+    locator: "learn.microsoft.com nf-fileapi-lockfileex, nf-fileapi-createfilew, \
+              ns-fileapi-by_handle_file_information",
+    url: "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex",
+    text: "LOCKFILE_EXCLUSIVE_LOCK 0x00000002 The function requests an exclusive lock. … \
+           LOCKFILE_FAIL_IMMEDIATELY 0x00000001 The function returns immediately if it is \
+           unable to acquire the requested lock. … FILE_SHARE_DELETE 0x00000004 Enables \
+           subsequent open operations on a file or device to request delete access. … The \
+           identifier (low and high parts) and the volume serial number uniquely identify a \
+           file on a single computer.",
+};
+
 const RUST_STD: &str = "The Rust Standard Library, core::sync::atomic (Rust 1.98.1)";
 const ORDERING_URL: &str = "https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html";
 
@@ -192,6 +241,9 @@ pub const ALL: &[&SpecQuote] = &[
     &SS_5_PREVENT_ALLOW,
     &SS_6_START_STOP_LOEJ,
     &SS_7_AGID_INVALIDATE,
+    &SS_8_FLOCK_NFS,
+    &SS_9_FILE_IDENTITY,
+    &SS_10_WINDOWS_LOCK_AND_ID,
     &SS_12_FSYNC_FDATASYNC,
     &SS_13_SYNC_FILE_RANGE,
     &SS_14_F_FULLFSYNC,
