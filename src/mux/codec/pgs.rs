@@ -193,7 +193,7 @@ pub struct PgsParser {
     /// opening packet's, never the closing packet's. Same rule the other
     /// buffering parsers get from `PesBuf::front`.
     pending: Option<(super::pesbuf::PesFacts, Vec<u8>)>,
-    /// How many bytes of `pending`'s data [`complete_clear_pts`] has already
+    /// How many bytes of `pending`'s data [`Self::complete_clear_pts`] has already
     /// walked and confirmed are complete segments (no END found among them).
     /// Lets a pending clear set that accumulates many small appended PES
     /// resume the segment walk where it left off instead of re-walking from
