@@ -452,23 +452,21 @@ fn plan_tree(
     dirs: &mut Vec<PathBuf>,
     seen_hosts: &mut std::collections::HashMap<String, String>,
 ) -> Result<()> {
+    // Same discovery the AACS capture reads use, so the two can't drift.
+    let hddvd_aacs_dir = is_root
+        .then(|| crate::aacs::find_hddvd_aacs_dir(fs))
+        .flatten();
     for entry in &dir.entries {
         if entry.name.is_empty() {
             // The "parent" FID (".") has an empty name — skip.
             continue;
         }
         // Strip AACS / CERTIFICATE at the top level only (a deeper dir of the
-        // same name is content). HD DVD's `X!` dir is detected like capture
-        // does: by its `MKBROM.AACS` member (aacs::find_hddvd_aacs_dir).
+        // same name is content).
         if is_root
             && (entry.name.eq_ignore_ascii_case("AACS")
                 || entry.name.eq_ignore_ascii_case("CERTIFICATE")
-                || (entry.is_dir
-                    && entry.name.ends_with('!')
-                    && entry
-                        .entries
-                        .iter()
-                        .any(|c| !c.is_dir && c.name.eq_ignore_ascii_case("MKBROM.AACS"))))
+                || hddvd_aacs_dir.is_some_and(|d| std::ptr::eq(d, entry)))
         {
             continue;
         }
