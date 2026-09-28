@@ -2,15 +2,16 @@
 //!
 //! CSS uses a weak 40-bit LFSR stream cipher (broken since 1999).
 //!
-//! The title key is recovered keylessly: [`crack_key`] recovers it directly
-//! from the scrambled data (see the [`keyless`] module),
-//! needing no player keys, disc-key recovery, or external key file.
-//! Sectors are then decrypted with [`descramble_sector`].
+//! The title key is recovered keylessly: [`crack_key_outcome`] recovers it
+//! directly from the scrambled data (see the [`keyless`] module), needing no
+//! player keys, disc-key recovery, or external key file. Sectors are then
+//! decrypted with [`descramble_sector`].
 //!
 //! Usage:
 //! ```rust,ignore
-//! if let Some(state) = css::crack_key(reader, extents, batch) {
-//!     css::descramble_sector(&state, &mut sector);
+//! match css::crack_key_outcome(reader, extents, batch, None) {
+//!     CrackOutcome::Cracked(state) => css::descramble_sector(&state, &mut sector),
+//!     _ => { /* unencrypted, uncrackable, unreadable, or halted */ }
 //! }
 //! ```
 
@@ -68,6 +69,12 @@ impl std::fmt::Debug for CssState {
 ///
 /// This convenience form runs to completion (no cancellation); callers needing a cancel token,
 /// or the three-way [`CrackOutcome`], use [`crack_key_outcome`].
+#[deprecated(
+    since = "1.8.0",
+    note = "collapses Halted/Unreadable to None, hiding a cancellation or a read \
+            error as a plain crack failure; use crack_key_outcome and match on \
+            CrackOutcome instead"
+)]
 pub fn crack_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
@@ -426,6 +433,7 @@ pub fn is_scrambled_pack(sector: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // this module exercises crack_key itself, deliberately
 mod tests {
     use super::*;
     use crate::error::{Error, Result};
