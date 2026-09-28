@@ -64,11 +64,11 @@ pub const DVD_VIDEO_PID: u16 = 0xE0;
 /// DTS / LPCM / HD-DVD E-AC-3 ranges.
 ///
 /// The PID is `0xBD00 | sub_stream_id`, unique per sub-stream id (AC-3 / DTS `0x80..=0x8F`,
-/// LPCM `0xA0..=0xA7`, HD-DVD E-AC-3 `0xC0..=0xC7`) — the single source of truth shared with
+/// LPCM `0xA0..=0xA7`, E-AC-3 `0xC0..=0xCF` (G17)) — the single source of truth shared with
 /// `Disc::scan_dvd_titles` (`src/disc/dvd.rs`).
 pub fn dvd_audio_pid(sub_stream_id: u8) -> Option<u16> {
     match sub_stream_id {
-        0x80..=0x8F | 0xA0..=0xA7 | 0xC0..=0xC7 => Some(0xBD00 | sub_stream_id as u16),
+        0x80..=0x8F | 0xA0..=0xA7 | 0xC0..=0xCF => Some(0xBD00 | sub_stream_id as u16),
         _ => None,
     }
 }
@@ -744,10 +744,9 @@ fn finish_packet(
         let sub_id = payload[0];
         let skip = match sub_id {
             0x80..=0x8F => 4, // AC3/DTS: sub_id + frame_count + access_unit_ptr(2)
-            // HD-DVD E-AC-3: 4-byte sub-header like DVD AC-3 (sub_id + num_frames(1) +
-            // first_access_unit_pointer(2)), verified on a real HD-DVD EVO. Strip exactly 4
-            // bytes/packet for a clean ES; a shorter skip splices sub-header into a frame.
-            0xC0..=0xC7 => 4,
+            // E-AC-3 (G17: 0xC0..=0xCF): a 4-byte sub-header like DVD AC-3, verified on a
+            // real HD-DVD EVO; a shorter skip splices sub-header into a frame.
+            0xC0..=0xCF => 4,
             // LPCM: sub_id + frames + ptr(2); the 3-byte audio header (quant/rate/channels)
             // is left for `LpcmParser`, which needs it to unpack 20/24-bit samples.
             0xA0..=0xA7 => 4,

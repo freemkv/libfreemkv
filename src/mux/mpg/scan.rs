@@ -430,7 +430,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                         let (ch, rate) = probe_lpcm(es);
                         audio(pid, Codec::Lpcm, ch, rate, lang, String::new())
                     }
-                    0xC0..=0xC7 => audio(
+                    0xC0..=0xCF => audio(
                         pid,
                         Codec::Ac3Plus,
                         AudioChannels::Unknown,
