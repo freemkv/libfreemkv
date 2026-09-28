@@ -39,12 +39,45 @@ pub(super) struct Parsed {
     pub end_code: bool,
 }
 
-fn ts(b: &[u8]) -> u64 {
-    (u64::from(b[0] >> 1) & 7) << 30
+// A 33-bit PTS/DTS field with its 4-bit prefix and three marker bits (MS-10).
+fn ts(b: &[u8], prefix: u8) -> Result<u64, String> {
+    if b[0] >> 4 != prefix || b[0] & 1 == 0 || b[2] & 1 == 0 || b[4] & 1 == 0 {
+        return Err(format!("timestamp prefix or marker bits: {:02x?}", &b[..5]));
+    }
+    Ok((u64::from(b[0] >> 1) & 7) << 30
         | u64::from(b[1]) << 22
         | u64::from(b[2] >> 1) << 15
         | u64::from(b[3]) << 7
-        | u64::from(b[4] >> 1)
+        | u64::from(b[4] >> 1))
+}
+
+/// CRC_32 of Annex A (MSB first, polynomial 0x04C11DB7, register preset to ones, no final
+/// XOR), bit by bit: independent of the sink's table so a shared bug cannot hide.
+pub(super) fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in data {
+        c ^= u32::from(b) << 24;
+        for _ in 0..8 {
+            c = if c & 0x8000_0000 != 0 {
+                (c << 1) ^ 0x04C1_1DB7
+            } else {
+                c << 1
+            };
+        }
+    }
+    c
+}
+
+/// The offset of the first `picture_start_code` (`00 00 01 00`) in a video AU, 0 if none.
+pub(super) fn picture_start(es: &[u8]) -> usize {
+    let mut i = 0;
+    while i + 4 <= es.len() {
+        if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 && es[i + 3] == 0 {
+            return i;
+        }
+        i += 1;
+    }
+    0
 }
 
 /// Parse `data` as 2048-byte packs (MS-1: every PES lies inside its pack).
@@ -64,6 +97,16 @@ pub(super) fn parse(data: &[u8]) -> Result<Parsed, String> {
             .ok_or("a short pack")?;
         if pk[..4] != [0, 0, 1, 0xBA] || pk[4] >> 6 != 1 {
             return Err(format!("no MPEG-2 pack header at {off}"));
+        }
+        // MS-2: marker bits around the SCR and after program_mux_rate; reserved '11111'.
+        if pk[4] & 0x04 == 0
+            || pk[6] & 0x04 == 0
+            || pk[8] & 0x04 == 0
+            || pk[9] & 0x01 == 0
+            || pk[12] & 0x03 != 0x03
+            || pk[13] & 0xF8 != 0xF8
+        {
+            return Err(format!("pack header marker bits at {off} (MS-2)"));
         }
         let b = |i: usize| u64::from(pk[i]);
         let base = ((b(4) >> 3) & 7) << 30
@@ -101,24 +144,53 @@ pub(super) fn parse(data: &[u8]) -> Result<Parsed, String> {
                 0xBC => p.psms.push((pi, pk[i..end].to_vec())),
                 0xBE => {}
                 sid => {
+                    let at = off + i;
                     let hdl = usize::from(h[8]);
                     let flags = h[7];
+                    // MS-10: '10', and PTS_DTS_flags '01' is forbidden; the sink writes no
+                    // ESCR, ES_rate, trick mode, copy info or CRC.
+                    if h[6] >> 6 != 0b10 || flags & 0xC0 == 0x40 || flags & 0x3E != 0 {
+                        return Err(format!(
+                            "PES header flags at {at}: {:02x} {flags:02x}",
+                            h[6]
+                        ));
+                    }
                     let mut q = 9;
                     let (mut pts, mut dts) = (None, None);
                     if flags & 0x80 != 0 {
-                        pts = Some(ts(&h[q..]));
+                        let prefix = if flags & 0x40 != 0 { 0b0011 } else { 0b0010 };
+                        pts = Some(ts(&h[q..], prefix)?);
                         q += 5;
                     }
                     if flags & 0xC0 == 0xC0 {
-                        dts = Some(ts(&h[q..]));
+                        dts = Some(ts(&h[q..], 0b0001)?);
                         q += 5;
                     }
                     let mut pstd = None;
-                    if flags & 0x01 != 0 && h[q] & 0x10 != 0 {
-                        pstd = Some((
-                            h[q + 1] & 0x20 != 0,
-                            u16::from(h[q + 1] & 0x1F) << 8 | u16::from(h[q + 2]),
-                        ));
+                    if flags & 0x01 != 0 {
+                        // MS-11: only the P-STD flag, reserved '111', no extension 2.
+                        if h[q] & 0xEF != 0x0E {
+                            return Err(format!("PES_extension flags at {at}: {:02x}", h[q]));
+                        }
+                        if h[q] & 0x10 != 0 {
+                            if h[q + 1] >> 6 != 0b01 {
+                                return Err(format!("P-STD '01' at {at}"));
+                            }
+                            pstd = Some((
+                                h[q + 1] & 0x20 != 0,
+                                u16::from(h[q + 1] & 0x1F) << 8 | u16::from(h[q + 2]),
+                            ));
+                            q += 2;
+                        }
+                        q += 1;
+                    }
+                    // MS-13: PES_header_data_length covers the fields and at most 32
+                    // stuffing bytes of 0xFF.
+                    let stuffing = (9 + hdl)
+                        .checked_sub(q)
+                        .ok_or(format!("PES_header_data_length {hdl} short at {at}"))?;
+                    if stuffing > 32 || h[q..9 + hdl].iter().any(|&b| b != 0xFF) {
+                        return Err(format!("PES header stuffing at {at}: {stuffing} bytes"));
                     }
                     let data_off = off + i + 9 + hdl;
                     let payload = &pk[i + 9 + hdl..end];
@@ -203,7 +275,7 @@ pub(super) fn replay(p: &Parsed, aus: &Aus) -> Result<Found, String> {
     let [(0, psm)] = &p.psms[..] else {
         return Err("the program stream map is not (only) in the first pack".into());
     };
-    if pack::crc32(psm) != 0 || psm.len() - 6 > pack::MAX_PSM_LENGTH {
+    if crc32(psm) != 0 || psm.len() - 6 > pack::MAX_PSM_LENGTH {
         return Err("PSM CRC_32 or length".into());
     }
     if !p.end_code {
@@ -230,6 +302,9 @@ pub(super) fn replay(p: &Parsed, aus: &Aus) -> Result<Found, String> {
     let keys: std::collections::BTreeSet<Key> = p.pes.iter().map(|x| x.key).collect();
     // Buffer events: (time, buffer stream_id, +bytes / −bytes).
     let mut events: Vec<(i128, u8, i64, i128)> = Vec::new();
+    // Design §2.4 (MPG3-7): an AU larger than its buffer can never fit; it is late by
+    // definition and overflows Bn while resident, `(stream_id, first byte, decode)`.
+    let mut oversize: Vec<(u8, i128, i128)> = Vec::new();
     for key in &keys {
         let pes: Vec<&Pes> = p.pes.iter().filter(|x| x.key == *key).collect();
         let bound = bounds
@@ -376,7 +451,12 @@ pub(super) fn replay(p: &Parsed, aus: &Aus) -> Result<Found, String> {
                     (dec - t_first) as f64 / 27e6
                 ));
             }
-            if t_last > dec {
+            let bs = i64::from(bound.1) * if bound.0 { 1024 } else { 128 };
+            let big = (size + x.sub_hdr.len()) as i64 > bs;
+            if big {
+                oversize.push((key.0, t_first, dec));
+            }
+            if t_last > dec || big {
                 found.late_aus += 1;
             }
             events.push((dec, key.0, -(size as i64) - au_of_pes_hdr[a], 0));
@@ -397,12 +477,15 @@ pub(super) fn replay(p: &Parsed, aus: &Aus) -> Result<Found, String> {
     // MS-16: 0 ≤ Fn(t) ≤ BSn, one buffer per stream_id (0xBD shared).
     events.sort_by_key(|e| (e.0, e.2 > 0));
     let mut fill: BTreeMap<u8, i64> = BTreeMap::new();
-    for (_, sid, delta, _) in &events {
+    for (t, sid, delta, _) in &events {
         let f = fill.entry(*sid).or_default();
         *f += delta;
         let (scale, size) = bounds[sid];
         let bs = i64::from(size) * if scale { 1024 } else { 128 };
-        if *f > bs {
+        let excused = oversize
+            .iter()
+            .any(|(s, from, to)| s == sid && from <= t && t <= to);
+        if *f > bs && !excused {
             return Err(format!("B({sid:#04x}) overflows: {f} > {bs} (MS-16)"));
         }
     }

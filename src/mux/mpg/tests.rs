@@ -317,17 +317,13 @@ fn es_of(p: &Parsed, key: Key) -> Vec<u8> {
         .collect()
 }
 
-// The replay finds exactly what the sink counted, never more (design §7).
+// The replay finds exactly what the sink counted (design §7).
 fn assert_replays(r: &Run, fx: &Fx) {
     let found = replay::replay(&r.parsed, &fx.aus).unwrap_or_else(|e| panic!("replay: {e}"));
-    assert!(
-        found.late_aus <= r.counters.pstd.late_aus,
-        "{found:?} vs {:?}",
-        r.counters
-    );
-    assert!(
-        found.pts_gaps <= r.counters.pstd.pts_gaps,
-        "{found:?} vs {:?}",
+    assert_eq!(
+        (found.late_aus, found.pts_gaps),
+        (r.counters.pstd.late_aus, r.counters.pstd.pts_gaps),
+        "replayed {found:?} vs counted {:?}",
         r.counters
     );
 }
@@ -373,7 +369,7 @@ fn a_picture_start_past_one_pack_is_written() {
         ..Opts::default()
     });
     for f in fx.frames.iter_mut().filter(|f| f.track == 0 && f.keyframe) {
-        let at = picture_start(&f.data);
+        let at = replay::picture_start(&f.data);
         let mut user = vec![0, 0, 1, 0xB2];
         user.resize(3_000, 0x5A);
         f.data.splice(at..at, user);
@@ -427,7 +423,21 @@ fn a_dvd_like_title_replays_clean_with_nothing_counted() {
         MpgCounters::default(),
         "a clean title counts nothing"
     );
-    assert!(r.out.len().is_multiple_of(pack::PACK_BYTES) || r.out.ends_with(&pack::PROGRAM_END));
+}
+
+// Design §2.4 (MPG3-7): an AU larger than its buffer takes the late path rather than
+// deadlocking; it is counted in pstd_late_aus, and the replay allows exactly that count.
+#[test]
+fn an_au_larger_than_its_buffer_is_counted_late() {
+    let fx = fixture(&Opts {
+        i_size: 300_000,
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let r = run(&fx);
+    assert_replays(&r, &fx);
+    assert!(r.counters.pstd.late_aus >= 15, "{:?}", r.counters);
 }
 
 // J16/§2.3: ES bytes kept, PTS exact modulo one integer-tick origin.
@@ -686,7 +696,7 @@ fn rebuild_aus(mut fx: Fx) -> Fx {
             .or_default()
             .push((f.pts, f.data.clone()));
         let key = match f.track {
-            0 => Some(((0xE0, None), picture_start(&f.data))),
+            0 => Some(((0xE0, None), replay::picture_start(&f.data))),
             1 => Some(((0xC0, None), 0)),
             2 => Some(((0xD0, None), 0)),
             3 => Some(((0xBD, Some(0x80)), 0)),
@@ -850,7 +860,7 @@ fn a_sequence_header_from_codec_private_is_restored() {
     let seq = seq_header(720, 576, 3, 112, false);
     fx.title.codec_privates[0] = Some(seq.clone());
     for f in fx.frames.iter_mut().filter(|f| f.track == 0 && f.keyframe) {
-        let at = picture_start(&f.data);
+        let at = replay::picture_start(&f.data);
         f.data.drain(..at);
     }
     let r = run(&fx);
@@ -963,7 +973,6 @@ fn mpeg1_video_is_stream_type_1() {
     let m = &r.parsed.psms[0].1;
     let info = usize::from(u16::from_be_bytes([m[8], m[9]]));
     assert_eq!(&m[12 + info..14 + info], &[0x01, 0xE0]);
-    assert!(r.parsed.packs.iter().all(|_| true));
 }
 
 // G8: the LPCM quantization is sticky and never mixes inside one PES (the PES header states
@@ -1090,4 +1099,18 @@ fn the_replayer_rejects_tampered_streams() {
     let x = p.pes.iter_mut().find(|x| x.dts.is_some()).unwrap();
     x.dts = x.pts;
     assert!(replay::replay(&p, &fx.aus).unwrap_err().contains("DTS"));
+    // MS-2: a pack header marker bit cleared.
+    let mut out = r.out.clone();
+    out[pack::PACK_BYTES + 4] &= !0x04;
+    assert!(replay::parse(&out).unwrap_err().contains("marker"));
+    // MS-10: a PTS marker bit cleared in the first video PES.
+    let first = replay::parse(&r.out).unwrap();
+    let v = first.pes.iter().find(|x| x.key.0 == 0xE0).unwrap();
+    let at = r.out[..v.data_off]
+        .windows(4)
+        .rposition(|w| w == [0, 0, 1, 0xE0])
+        .unwrap();
+    let mut out = r.out.clone();
+    out[at + 9 + 4] &= !0x01;
+    assert!(replay::parse(&out).unwrap_err().contains("marker"));
 }
