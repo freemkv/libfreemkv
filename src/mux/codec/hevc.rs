@@ -704,6 +704,8 @@ impl CodecParser for HevcParser {
             bit_depth_chroma_minus8: 0,
             max_sub_layers_minus1: 0,
             temporal_id_nesting_flag: 0,
+            max_num_reorder_pics: None,
+            picture_period_ticks: None,
         });
         // chromaFormat (6 reserved bits set + 2-bit chroma_format_idc)
         record.push(0xFC | (chroma.chroma_format_idc & 0x03));
@@ -759,6 +761,25 @@ struct SpsChroma {
     max_sub_layers_minus1: u8,
     /// sps_temporal_id_nesting_flag (u1) for hvcC temporalIdNested.
     temporal_id_nesting_flag: u8,
+    /// `sps_max_num_reorder_pics[sps_max_sub_layers_minus1]` (H.265 §7.3.2.2), the
+    /// reorder depth R the sink-side DTS deriver needs. `None` when the SPS is cut
+    /// short before the ordering-info loop.
+    max_num_reorder_pics: Option<u32>,
+    /// VUI `num_units_in_tick ÷ time_scale` (one picture period) in 90 kHz ticks, when
+    /// `vui_timing_info_present_flag` is set.
+    picture_period_ticks: Option<i64>,
+}
+
+/// Reorder depth R of an HEVC SPS NAL (2-byte header included):
+/// `sps_max_num_reorder_pics[sps_max_sub_layers_minus1]` (H.265 §7.3.2.2 \[I\]).
+pub(crate) fn parse_sps_reorder(sps: &[u8]) -> Option<u32> {
+    parse_sps_chroma(sps)?.max_num_reorder_pics
+}
+
+/// Reorder depth R and the VUI picture period (90 kHz ticks) of an HEVC SPS NAL.
+pub(crate) fn parse_sps_dts(sps: &[u8]) -> Option<(u32, Option<i64>)> {
+    let c = parse_sps_chroma(sps)?;
+    Some((c.max_num_reorder_pics?, c.picture_period_ticks))
 }
 
 // Per-thread count of `strip_emulation_prevention` calls: the function
@@ -912,6 +933,15 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
     // bit_depth_luma_minus8 ue(v), bit_depth_chroma_minus8 ue(v)
     let bit_depth_luma_minus8 = r.read_ue()? as u8;
     let bit_depth_chroma_minus8 = r.read_ue()? as u8;
+    // The ordering-info tail is optional to the hvcC caller: a cut-short SPS keeps
+    // its chroma fields and only loses R.
+    let (max_num_reorder_pics, picture_period_ticks) =
+        match parse_sps_ordering_tail(&mut r, max_sub_layers_minus1) {
+            Some((reorder, poc_lsb_bits)) => {
+                (Some(reorder), parse_sps_vui_timing(&mut r, poc_lsb_bits))
+            }
+            None => (None, None),
+        };
 
     Some(SpsChroma {
         chroma_format_idc,
@@ -919,7 +949,163 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
         bit_depth_chroma_minus8,
         max_sub_layers_minus1: max_sub_layers_minus1 as u8,
         temporal_id_nesting_flag: temporal_id_nesting_flag as u8,
+        max_num_reorder_pics,
+        picture_period_ticks,
     })
+}
+
+// H.265 §7.3.2.2 after bit_depth_chroma_minus8: log2_max_pic_order_cnt_lsb_minus4, then
+// the sub-layer ordering loop (i = present ? 0 : max). Returns the reorder value at
+// i = max and log2_max_pic_order_cnt_lsb.
+fn parse_sps_ordering_tail(r: &mut BitReader, max_sub_layers_minus1: u32) -> Option<(u32, u32)> {
+    // log2_max_pic_order_cnt_lsb_minus4 ue(v), 0..=12
+    let poc_lsb_bits = r.read_ue()?.checked_add(4).filter(|&b| b <= 16)?;
+    // sps_sub_layer_ordering_info_present_flag u(1)
+    let first = if r.read_bit()? == 1 {
+        0
+    } else {
+        max_sub_layers_minus1
+    };
+    let mut reorder = 0;
+    for _ in first..=max_sub_layers_minus1 {
+        // sps_max_dec_pic_buffering_minus1, sps_max_num_reorder_pics,
+        // sps_max_latency_increase_plus1: all ue(v).
+        r.read_ue()?;
+        reorder = r.read_ue()?;
+        r.read_ue()?;
+    }
+    Some((reorder, poc_lsb_bits))
+}
+
+// se(v) over the shared bit reader (H.265 §9.2): code_num k → (−1)^(k+1)·Ceil(k÷2).
+fn read_se(r: &mut BitReader) -> Option<i64> {
+    let k = r.read_ue()? as i64;
+    Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
+}
+
+// H.265 §7.3.2.2 from log2_min_luma_coding_block_size_minus3 to the VUI's
+// vui_timing_info (E.2.1), walking scaling_list_data, PCM, st_ref_pic_set and the
+// long-term set. Returns num_units_in_tick ÷ time_scale in 90 kHz ticks (rounded).
+fn parse_sps_vui_timing(r: &mut BitReader, poc_lsb_bits: u32) -> Option<i64> {
+    // log2_min_luma_coding_block_size_minus3 … max_transform_hierarchy_depth_intra: 6 ue(v)
+    for _ in 0..6 {
+        r.read_ue()?;
+    }
+    // scaling_list_enabled_flag, then sps_scaling_list_data_present_flag
+    if r.read_bit()? == 1 && r.read_bit()? == 1 {
+        skip_scaling_list_data(r)?;
+    }
+    r.skip_bits(2)?; // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+    if r.read_bit()? == 1 {
+        // pcm_enabled_flag: two u(4) bit depths, two ue(v) sizes, loop-filter flag.
+        r.skip_bits(8)?;
+        r.read_ue()?;
+        r.read_ue()?;
+        r.skip_bits(1)?;
+    }
+    let num_sets = r.read_ue()?; // num_short_term_ref_pic_sets, 0..=64
+    if num_sets > 64 {
+        return None;
+    }
+    let mut num_delta_pocs: Vec<u32> = Vec::with_capacity(num_sets as usize);
+    for idx in 0..num_sets as usize {
+        let n = skip_st_ref_pic_set(r, idx, &num_delta_pocs)?;
+        num_delta_pocs.push(n);
+    }
+    if r.read_bit()? == 1 {
+        // long_term_ref_pics_present_flag: lt_ref_pic_poc_lsb_sps u(v) + used flag each.
+        let n = r.read_ue()?;
+        if n > 32 {
+            return None;
+        }
+        for _ in 0..n {
+            r.skip_bits(poc_lsb_bits + 1)?;
+        }
+    }
+    r.skip_bits(2)?; // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+    if r.read_bit()? == 0 {
+        return None; // vui_parameters_present_flag
+    }
+    if r.read_bit()? == 1 && r.read_bits(8)? == 255 {
+        r.skip_bits(32)?; // aspect_ratio_idc = Extended_SAR: sar_width, sar_height
+    }
+    if r.read_bit()? == 1 {
+        r.skip_bits(1)?; // overscan_appropriate_flag
+    }
+    if r.read_bit()? == 1 {
+        // video_format u(3), video_full_range_flag u(1), colour_description_present_flag
+        r.skip_bits(4)?;
+        if r.read_bit()? == 1 {
+            r.skip_bits(24)?;
+        }
+    }
+    if r.read_bit()? == 1 {
+        r.read_ue()?; // chroma_sample_loc_type_top_field
+        r.read_ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    // neutral_chroma_indication_flag, field_seq_flag, frame_field_info_present_flag
+    r.skip_bits(3)?;
+    if r.read_bit()? == 1 {
+        for _ in 0..4 {
+            r.read_ue()?; // default display window offsets
+        }
+    }
+    if r.read_bit()? == 0 {
+        return None; // vui_timing_info_present_flag
+    }
+    let num_units_in_tick = r.read_bits(32)? as i64;
+    let time_scale = r.read_bits(32)? as i64;
+    (num_units_in_tick > 0 && time_scale > 0)
+        .then(|| (num_units_in_tick * 90_000 + time_scale / 2) / time_scale)
+}
+
+// scaling_list_data() (H.265 §7.3.4): only its length matters here.
+fn skip_scaling_list_data(r: &mut BitReader) -> Option<()> {
+    for size_id in 0..4u32 {
+        let step = if size_id == 3 { 3 } else { 1 };
+        for _ in (0..6).step_by(step) {
+            if r.read_bit()? == 0 {
+                r.read_ue()?; // scaling_list_pred_matrix_id_delta
+            } else {
+                let coefs = 64.min(1u32 << (4 + (size_id << 1)));
+                if size_id > 1 {
+                    read_se(r)?; // scaling_list_dc_coef_minus8
+                }
+                for _ in 0..coefs {
+                    read_se(r)?; // scaling_list_delta_coef
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+// st_ref_pic_set(idx) in the SPS (H.265 §7.3.7): returns its NumDeltaPocs. An
+// inter-predicted set references set idx − 1 (delta_idx_minus1 is slice-header only).
+fn skip_st_ref_pic_set(r: &mut BitReader, idx: usize, num_delta_pocs: &[u32]) -> Option<u32> {
+    if idx != 0 && r.read_bit()? == 1 {
+        r.skip_bits(1)?; // delta_rps_sign
+        r.read_ue()?; // abs_delta_rps_minus1
+        let mut n = 0;
+        for _ in 0..=num_delta_pocs[idx - 1] {
+            // used_by_curr_pic_flag; use_delta_flag only when not used (inferred 1).
+            let used = r.read_bit()? == 1;
+            if used || r.read_bit()? == 1 {
+                n += 1;
+            }
+        }
+        return Some(n);
+    }
+    let negative = r.read_ue()?;
+    let positive = r.read_ue()?;
+    if negative > 16 || positive > 16 {
+        return None;
+    }
+    for _ in 0..negative + positive {
+        r.read_ue()?; // delta_poc_s{0,1}_minus1
+        r.skip_bits(1)?; // used_by_curr_pic_s{0,1}_flag
+    }
+    Some(negative + positive)
 }
 
 /// Consume a profile_tier_level(profilePresentFlag=1, maxNumSubLayersMinus1)

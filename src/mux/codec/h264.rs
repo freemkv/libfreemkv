@@ -509,6 +509,316 @@ impl<'a> SpsReader<'a> {
     }
 }
 
+impl SpsReader<'_> {
+    /// Read one signed Exp-Golomb integer se(v) (H.264 §9.1.1: code_num k maps to
+    /// `(−1)^(k+1)·Ceil(k÷2)`). `None` on end-of-data or a malformed code.
+    fn read_se(&mut self) -> Option<i64> {
+        let k = self.read_ue()? as i64;
+        Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
+    }
+}
+
+/// SPS fields the sink-side DTS deriver ([`crate::mux::decode_ts`]) needs: the
+/// reorder depth R, the slice-header layout, and the VUI field period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpsDtsInfo {
+    /// Reorder depth R, per the design's §2.3 fallback chain (see [`parse_sps_dts_info`]).
+    pub reorder: u32,
+    /// `log2_max_frame_num_minus4 + 4`: the `frame_num` width in a slice header.
+    pub log2_max_frame_num: u32,
+    /// `frame_mbs_only_flag`: when 0, slice headers carry `field_pic_flag`.
+    pub frame_mbs_only: bool,
+    /// `separate_colour_plane_flag`: when 1, slice headers carry `colour_plane_id`.
+    pub separate_colour_plane: bool,
+    /// The nominal frame period, two VUI clock ticks (`2·num_units_in_tick ÷
+    /// time_scale`), in 90 kHz ticks when `timing_info_present_flag` is set.
+    pub frame_period_ticks: Option<i64>,
+}
+
+// Profiles whose SPS carries chroma_format_idc, bit depths and scaling lists (H.264 §7.3.2.1.1).
+const SPS_CHROMA_PROFILES: [u32; 13] =
+    [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+
+// Intra profiles when constraint_set3_flag = 1: no reordering (design §2.3 step 2, H.264 E.2.1 [I]).
+const INTRA_PROFILES: [u32; 6] = [44, 86, 100, 110, 122, 244];
+
+// Upper bound of H.264 MaxDpbFrames, and the inference for an unknown level (design §2.3).
+const MAX_DPB_FRAMES: u32 = 16;
+
+/// Parse the DTS-relevant fields of an H.264 SPS NAL (1-byte header included):
+/// emulation prevention removed, then SPS → VUI → `hrd_parameters` (NAL and VCL)
+/// → `bitstream_restriction` (H.264 §7.3.2.1.1, E.1.1, E.1.2 \[I\]). R is, in order:
+/// `max_num_reorder_frames`; 0 for the intra profiles with `constraint_set3_flag`;
+/// 0 for `pic_order_cnt_type = 2`; else MaxDpbFrames inferred from the level
+/// (E.2.1 \[I\]). `None` when the SPS is cut short before the VUI flag.
+pub(crate) fn parse_sps_dts_info(sps_nal: &[u8]) -> Option<SpsDtsInfo> {
+    let raw = sps_nal.get(1..)?;
+    let rbsp = unescape_ebsp(raw, raw.len());
+    let mut r = SpsReader::new(&rbsp);
+    let profile_idc = r.read_bits(8)?;
+    let constraint_flags = r.read_bits(8)?;
+    let level_idc = r.read_bits(8)?;
+    // constraint_set3_flag is the 4th flag bit (constraint_set0 is the MSB).
+    let constraint_set3 = constraint_flags & 0x10 != 0;
+    r.read_ue()?; // seq_parameter_set_id
+    let mut separate_colour_plane = false;
+    if SPS_CHROMA_PROFILES.contains(&profile_idc) {
+        let chroma_format_idc = r.read_ue()?;
+        if chroma_format_idc == 3 {
+            separate_colour_plane = r.read_bit()? == 1;
+        }
+        r.read_ue()?; // bit_depth_luma_minus8
+        r.read_ue()?; // bit_depth_chroma_minus8
+        r.read_bit()?; // qpprime_y_zero_transform_bypass_flag
+        if r.read_bit()? == 1 {
+            // seq_scaling_matrix_present_flag: 8 lists, or 12 for 4:4:4.
+            let lists = if chroma_format_idc != 3 { 8 } else { 12 };
+            for i in 0..lists {
+                if r.read_bit()? == 1 {
+                    skip_scaling_list(&mut r, if i < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+    let log2_max_frame_num = r.read_ue()?.saturating_add(4);
+    if log2_max_frame_num > 16 {
+        return None; // log2_max_frame_num_minus4 is 0..=12
+    }
+    let pic_order_cnt_type = r.read_ue()?;
+    match pic_order_cnt_type {
+        0 => {
+            r.read_ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        }
+        1 => {
+            r.read_bit()?; // delta_pic_order_always_zero_flag
+            r.read_se()?; // offset_for_non_ref_pic
+            r.read_se()?; // offset_for_top_to_bottom_field
+            let cycle = r.read_ue()?; // num_ref_frames_in_pic_order_cnt_cycle, 0..=255
+            if cycle > 255 {
+                return None;
+            }
+            for _ in 0..cycle {
+                r.read_se()?; // offset_for_ref_frame[i]
+            }
+        }
+        _ => {}
+    }
+    r.read_ue()?; // max_num_ref_frames
+    r.read_bit()?; // gaps_in_frame_num_value_allowed_flag
+    let width_mbs = r.read_ue()?.saturating_add(1);
+    let height_map_units = r.read_ue()?.saturating_add(1);
+    let frame_mbs_only = r.read_bit()? == 1;
+    if !frame_mbs_only {
+        r.read_bit()?; // mb_adaptive_frame_field_flag
+    }
+    r.read_bit()?; // direct_8x8_inference_flag
+    if r.read_bit()? == 1 {
+        // frame_cropping_flag: four ue(v) offsets.
+        for _ in 0..4 {
+            r.read_ue()?;
+        }
+    }
+    let vui_present = r.read_bit()? == 1;
+    // A cut-short VUI keeps what it reached; a missing reorder count falls back
+    // to the level inference, which is never below max_num_reorder_frames.
+    let mut vui = Vui::default();
+    if vui_present {
+        let _ = parse_vui(&mut r, &mut vui);
+    }
+    let frame_height_mbs = (2 - frame_mbs_only as u32).saturating_mul(height_map_units);
+    let reorder = if let Some(n) = vui.max_num_reorder_frames {
+        n
+    } else if constraint_set3 && INTRA_PROFILES.contains(&profile_idc) {
+        0
+    } else if pic_order_cnt_type == 2 {
+        // POC type 2: output order is decode order.
+        0
+    } else {
+        max_dpb_frames(
+            profile_idc,
+            constraint_set3,
+            level_idc,
+            width_mbs,
+            frame_height_mbs,
+        )
+    };
+    Some(SpsDtsInfo {
+        reorder,
+        log2_max_frame_num,
+        frame_mbs_only,
+        separate_colour_plane,
+        frame_period_ticks: vui.frame_period_ticks,
+    })
+}
+
+/// VUI values [`parse_sps_dts_info`] keeps.
+#[derive(Default)]
+struct Vui {
+    frame_period_ticks: Option<i64>,
+    max_num_reorder_frames: Option<u32>,
+}
+
+// scaling_list(sizeOfScalingList) (H.264 §7.3.2.1.1.1): only delta_scale se(v) is coded.
+fn skip_scaling_list(r: &mut SpsReader, size: usize) -> Option<()> {
+    let mut last_scale: i64 = 8;
+    let mut next_scale: i64 = 8;
+    for _ in 0..size {
+        if next_scale != 0 {
+            let delta_scale = r.read_se()?;
+            next_scale = (last_scale + delta_scale + 256).rem_euclid(256);
+        }
+        if next_scale != 0 {
+            last_scale = next_scale;
+        }
+    }
+    Some(())
+}
+
+// vui_parameters() (H.264 E.1.1 [I]), filling `out` as fields are reached.
+fn parse_vui(r: &mut SpsReader, out: &mut Vui) -> Option<()> {
+    if r.read_bit()? == 1 {
+        // aspect_ratio_info_present_flag: aspect_ratio_idc u(8); 255 = Extended_SAR.
+        if r.read_bits(8)? == 255 {
+            r.read_bits(16)?; // sar_width
+            r.read_bits(16)?; // sar_height
+        }
+    }
+    if r.read_bit()? == 1 {
+        r.read_bit()?; // overscan_info_present_flag → overscan_appropriate_flag
+    }
+    if r.read_bit()? == 1 {
+        // video_signal_type_present_flag: video_format u(3), video_full_range_flag u(1).
+        r.read_bits(4)?;
+        if r.read_bit()? == 1 {
+            r.read_bits(24)?; // colour_primaries, transfer_characteristics, matrix_coefficients
+        }
+    }
+    if r.read_bit()? == 1 {
+        r.read_ue()?; // chroma_sample_loc_type_top_field
+        r.read_ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    if r.read_bit()? == 1 {
+        // timing_info_present_flag
+        let num_units_in_tick = r.read_bits(32)? as i64;
+        let time_scale = r.read_bits(32)? as i64;
+        r.read_bit()?; // fixed_frame_rate_flag
+        if num_units_in_tick > 0 && time_scale > 0 {
+            out.frame_period_ticks =
+                Some((2 * num_units_in_tick * 90_000 + time_scale / 2) / time_scale);
+        }
+    }
+    let nal_hrd = r.read_bit()? == 1;
+    if nal_hrd {
+        skip_hrd_parameters(r)?;
+    }
+    let vcl_hrd = r.read_bit()? == 1;
+    if vcl_hrd {
+        skip_hrd_parameters(r)?;
+    }
+    if nal_hrd || vcl_hrd {
+        r.read_bit()?; // low_delay_hrd_flag
+    }
+    r.read_bit()?; // pic_struct_present_flag
+    if r.read_bit()? == 1 {
+        // bitstream_restriction_flag
+        r.read_bit()?; // motion_vectors_over_pic_boundaries_flag
+        r.read_ue()?; // max_bytes_per_pic_denom
+        r.read_ue()?; // max_bits_per_mb_denom
+        r.read_ue()?; // log2_max_mv_length_horizontal
+        r.read_ue()?; // log2_max_mv_length_vertical
+        let max_num_reorder_frames = r.read_ue()?;
+        r.read_ue()?; // max_dec_frame_buffering
+        out.max_num_reorder_frames = Some(max_num_reorder_frames);
+    }
+    Some(())
+}
+
+// hrd_parameters() (H.264 E.1.2 [I]), skipped field by field.
+fn skip_hrd_parameters(r: &mut SpsReader) -> Option<()> {
+    let cpb_cnt_minus1 = r.read_ue()?;
+    if cpb_cnt_minus1 > 31 {
+        return None; // cpb_cnt_minus1 is 0..=31
+    }
+    r.read_bits(8)?; // bit_rate_scale u(4), cpb_size_scale u(4)
+    for _ in 0..=cpb_cnt_minus1 {
+        r.read_ue()?; // bit_rate_value_minus1
+        r.read_ue()?; // cpb_size_value_minus1
+        r.read_bit()?; // cbr_flag
+    }
+    // initial_cpb_removal_delay_length_minus1, cpb_removal_delay_length_minus1,
+    // dpb_output_delay_length_minus1, time_offset_length: u(5) each.
+    r.read_bits(20)?;
+    Some(())
+}
+
+// MaxDpbFrames = Min(MaxDpbMbs / (PicWidthInMbs · FrameHeightInMbs), 16) (H.264 A.3.1,
+// Table A-1 [I]). Level 1b is level_idc 11 + constraint_set3 on Baseline/Main/Extended,
+// or level_idc 9. An unknown level infers 16.
+fn max_dpb_frames(profile_idc: u32, set3: bool, level_idc: u32, w_mbs: u32, h_mbs: u32) -> u32 {
+    let level_1b =
+        level_idc == 9 || (level_idc == 11 && set3 && matches!(profile_idc, 66 | 77 | 88));
+    let max_dpb_mbs: u32 = match level_idc {
+        _ if level_1b => 396,
+        10 => 396,
+        11 => 900,
+        12 | 13 | 20 => 2376,
+        21 => 4752,
+        22 | 30 => 8100,
+        31 => 18000,
+        32 => 20480,
+        40 | 41 => 32768,
+        42 => 34816,
+        50 => 110400,
+        51 | 52 => 184320,
+        60..=62 => 696320,
+        _ => return MAX_DPB_FRAMES,
+    };
+    let frame_mbs = w_mbs.saturating_mul(h_mbs);
+    if frame_mbs == 0 {
+        return MAX_DPB_FRAMES;
+    }
+    (max_dpb_mbs / frame_mbs).min(MAX_DPB_FRAMES)
+}
+
+/// First-slice-header fields that decide field pairing (H.264 §7.3.3 \[I\]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SliceFieldInfo {
+    /// `first_mb_in_slice`: 0 starts a new picture.
+    pub first_mb: u32,
+    /// `frame_num`, `log2_max_frame_num` bits wide.
+    pub frame_num: u32,
+    /// `Some(bottom_field_flag)` for a field picture, `None` for a frame.
+    pub field: Option<bool>,
+}
+
+/// Read `first_mb_in_slice`, `frame_num` and `field_pic_flag`/`bottom_field_flag`
+/// from a coded slice NAL (1-byte header included), after emulation prevention is
+/// removed. `sps` supplies the header layout; `None` when the header is cut short.
+pub(crate) fn parse_slice_field_info(nal: &[u8], sps: &SpsDtsInfo) -> Option<SliceFieldInfo> {
+    // Everything read here fits well inside 32 RBSP octets.
+    const HEADER_OCTETS: usize = 32;
+    let raw = nal.get(1..)?;
+    let hdr = unescape_ebsp(raw, HEADER_OCTETS);
+    let mut r = SpsReader::new(&hdr);
+    let first_mb = r.read_ue()?;
+    r.read_ue()?; // slice_type
+    r.read_ue()?; // pic_parameter_set_id
+    if sps.separate_colour_plane {
+        r.read_bits(2)?; // colour_plane_id
+    }
+    let frame_num = r.read_bits(sps.log2_max_frame_num as u8)?;
+    let field = if !sps.frame_mbs_only && r.read_bit()? == 1 {
+        Some(r.read_bit()? == 1) // bottom_field_flag
+    } else {
+        None
+    };
+    Some(SliceFieldInfo {
+        first_mb,
+        frame_num,
+        field,
+    })
+}
+
 /// Iterator over NAL units in Annex B byte stream.
 /// Finds start codes (00 00 01 or 00 00 00 01) and yields the data between them.
 struct NalIterator<'a> {

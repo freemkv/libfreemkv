@@ -92,6 +92,18 @@ impl M2tsStream {
                 muxer.set_video_codec(i, v.codec)?;
             }
         }
+        // The MVC dependent view copies the base view's DTS per AU (design §2.3).
+        let base = out
+            .streams
+            .iter()
+            .position(|s| matches!(s, DiscStream::Video(v) if !v.is_mvc_dependent()));
+        for (i, s) in out.streams.iter().enumerate() {
+            if let (DiscStream::Video(v), Some(base)) = (s, base)
+                && v.is_mvc_dependent()
+            {
+                muxer.set_mvc_base(i, base)?;
+            }
+        }
         for (i, cp) in out.codec_privates.iter().enumerate() {
             if let Some(data) = cp {
                 muxer.set_codec_private(i, data.clone())?;
@@ -620,5 +632,156 @@ mod tests {
         let meta = super::meta::read_header(&mut cursor).unwrap().unwrap();
         let back = meta.to_title();
         assert_eq!(back.codec_privates[1], Some(b"BDLP\x31".to_vec()));
+    }
+
+    /// (PTS, DTS) of every PES start on `pid` in `ts` (BD-TS after the FMKV header).
+    fn pes_times(ts: &[u8], pid: u16) -> Vec<(u64, Option<u64>)> {
+        let t33 = |b: &[u8]| {
+            ((((b[0] >> 1) & 0x07) as u64) << 30)
+                | ((b[1] as u64) << 22)
+                | (((b[2] >> 1) as u64) << 15)
+                | ((b[3] as u64) << 7)
+                | ((b[4] >> 1) as u64)
+        };
+        ts.as_chunks::<192>()
+            .0
+            .iter()
+            .filter(|p| (((p[5] & 0x1F) as u16) << 8 | p[6] as u16) == pid && p[5] & 0x40 != 0)
+            .map(|p| {
+                let h = &p[4..];
+                let body = if (h[3] >> 4) & 0b10 != 0 {
+                    &h[5 + h[4] as usize..]
+                } else {
+                    &h[4..]
+                };
+                let dts = (body[7] >> 6 == 0b11).then(|| t33(&body[14..19]));
+                (t33(&body[9..14]), dts)
+            })
+            .collect()
+    }
+
+    fn frame(track: usize, pts: i64, keyframe: bool, data: Vec<u8>) -> PesFrame {
+        PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track,
+            pts,
+            keyframe,
+            data,
+            duration_ns: None,
+        }
+    }
+
+    // Design §7 (MPG3-3): field pairs detected from the ES bytes across a network:// hop,
+    // where `PesFrame::coding` does not survive.
+    #[test]
+    fn mpeg2_field_pairs_get_dts_from_es_bytes_after_a_network_hop() {
+        use crate::mux::decode_ts::test_es as es;
+        let mut title = make_title();
+        if let DiscStream::Video(v) = &mut title.streams[0] {
+            v.codec = Codec::Mpeg2;
+        }
+        title.codec_privates = vec![None];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        // Decode I0t I0b P3t P3b B1t B1b, PTS in 25 Hz field periods (20 ms).
+        let fields = [
+            (0, 1, 1),
+            (1, 1, 2),
+            (6, 2, 1),
+            (7, 2, 2),
+            (2, 3, 1),
+            (3, 3, 2),
+        ];
+        for (i, &(f, coding, structure)) in fields.iter().enumerate() {
+            let mut data = if i == 0 {
+                es::mpeg2_seq(3, false)
+            } else {
+                Vec::new()
+            };
+            data.extend(es::mpeg2_pic(coding, structure));
+            let sent = frame(0, 1_000_000_000 + f * 20_000_000, coding == 1, data);
+            let mut wire = Vec::new();
+            sent.serialize(&mut wire).unwrap();
+            let got = PesFrame::deserialize(&mut &wire[..]).unwrap().unwrap();
+            assert!(got.coding.is_none(), "the hop drops PesFrame::coding");
+            stream.write(&got).unwrap();
+        }
+        stream.finish().unwrap();
+        drop(stream);
+        let buf = shared.lock().unwrap().clone();
+        let (_, ts) = ts_after_header(&buf);
+        let t = pes_times(&ts, VIDEO_PID);
+        let has: Vec<bool> = t.iter().map(|(_, d)| d.is_some()).collect();
+        assert_eq!(
+            has,
+            [true, true, true, true, false, false],
+            "I/P fields carry DTS, B fields do not"
+        );
+        assert_eq!(
+            t[1].1.unwrap() - t[0].1.unwrap(),
+            1_800,
+            "2nd field: DTS_1st + ΔPTS"
+        );
+        assert_eq!(t[2].1, Some(t[0].0), "P3 decodes when I0 is presented");
+    }
+
+    // Design §2.3: the MVC dependent view copies its base AU's DTS.
+    fn mvc_dependent_dts(dependent_first: bool) {
+        use crate::mux::decode_ts::test_es as es;
+        let sps = es::sps_with_reorder(2);
+        let mut title = make_title();
+        let DiscStream::Video(base) = title.streams[0].clone() else {
+            unreachable!()
+        };
+        title.streams[0] = DiscStream::Video(VideoStream {
+            codec: Codec::H264,
+            ..base.clone()
+        });
+        title.streams.push(DiscStream::Video(VideoStream {
+            pid: VIDEO_PID + 1,
+            codec: Codec::H264,
+            secondary: true,
+            label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+            ..base
+        }));
+        title.codec_privates = vec![Some(es::avcc(&sps.nal())), None];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        for (i, d) in [0i64, 4, 2, 1, 3, 8].into_iter().enumerate() {
+            let pts = 1_000_000_000 + d * 41_666_667;
+            let base_au = es::length_prefixed(&[es::h264_slice(&sps, i == 0, 0, i as u32, None)]);
+            let dep_au = es::length_prefixed(&[vec![0x14, 0x80, i as u8], vec![0x74, 0x11]]);
+            let (b, dep) = (
+                frame(0, pts, i == 0, base_au),
+                frame(1, pts, i == 0, dep_au),
+            );
+            for f in if dependent_first { [dep, b] } else { [b, dep] } {
+                stream.write(&f).unwrap();
+            }
+        }
+        stream.finish().unwrap();
+        drop(stream);
+        let buf = shared.lock().unwrap().clone();
+        let (_, ts) = ts_after_header(&buf);
+        let (base_t, dep_t) = (pes_times(&ts, VIDEO_PID), pes_times(&ts, VIDEO_PID + 1));
+        assert_eq!(base_t.len(), 6);
+        assert!(base_t.iter().filter(|(_, d)| d.is_some()).count() >= 4);
+        assert_eq!(
+            dep_t, base_t,
+            "each dependent AU carries its base AU's PTS and DTS (dependent first: {dependent_first})"
+        );
+    }
+
+    #[test]
+    fn mvc_dependent_view_matches_the_base_dts() {
+        mvc_dependent_dts(false);
+    }
+
+    // SSIF reads deliver each dependent block before its base block.
+    #[test]
+    fn mvc_dependent_view_arriving_first_still_matches_the_base_dts() {
+        mvc_dependent_dts(true);
     }
 }
