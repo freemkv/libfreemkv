@@ -2042,11 +2042,15 @@ fn build_ps_pipeline(
             Err(e) => return Err(e),
         }
     }
-    let head_src = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
-    let mut head_reader = crate::sector::DecryptingSectorSource::new(
-        Box::new(head_src) as Box<dyn SectorSource>,
-        keys.clone(),
-    );
+    let title_key = match keys {
+        crate::decrypt::DecryptKeys::Css { title_key } => Some(title_key),
+        _ => None,
+    };
+    let mut head_reader = PsFileCss {
+        inner: crate::io::file_sector_source::FileSectorSource::open_padded(path)?,
+        title_key,
+        refuse: false,
+    };
     let n = capacity.min(HEAD_SECTORS);
     let mut head = vec![0u8; n as usize * 2048];
     let mut at = 0u32;
@@ -2081,25 +2085,77 @@ fn build_ps_pipeline(
     opts.selection
         .apply(&mut title)
         .map_err(|e| -> io::Error { e.into() })?;
-    let keys = if opts.raw {
-        crate::decrypt::DecryptKeys::None
-    } else {
-        keys
+    // CSS is PsFileCss's (m1/m2): descrambled where each pack's own stuffing puts its
+    // flags, and a scrambled pack with no key refused rather than muxed as ciphertext.
+    let reader = PsFileCss {
+        inner: reader,
+        title_key: title_key.filter(|_| !opts.raw),
+        refuse: !opts.raw,
     };
     build_iso_pipeline(
         reader,
         title,
-        keys,
+        crate::decrypt::DecryptKeys::None,
         PS_MUX_BATCH_SECTORS,
         ContentFormat::MpegPs,
-        // The keys are resolved above: `true` skips build_iso_pipeline's own crack, which a
-        // clear file's `None` would otherwise re-run (D3). Descrambling follows `keys`.
+        // `true` skips build_iso_pipeline's own crack: the verdict above is final (D3).
         true,
         halt.cloned(),
         None,
         None,
     )
     .map(|p| p.with_video_stream_id(scan.video_id))
+}
+
+/// An `mpg://` file's CSS layer (design §4 step 2, m1/m2): with the title key, each scrambled
+/// pack is descrambled where its own pack stuffing puts the PES flags; without one, a
+/// scrambled pack is `CssKeyMissing` (E7023) unless `refuse` is off (`--raw`).
+struct PsFileCss<S> {
+    inner: S,
+    title_key: Option<[u8; 5]>,
+    refuse: bool,
+}
+
+impl<S: SectorSource> SectorSource for PsFileCss<S> {
+    fn capacity_sectors(&self) -> u32 {
+        self.inner.capacity_sectors()
+    }
+
+    fn set_speed(&mut self, kbs: u16) {
+        self.inner.set_speed(kbs);
+    }
+
+    fn set_unit_base(&mut self, lba: u32) {
+        self.inner.set_unit_base(lba);
+    }
+
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.inner.unmapped_stream_files()
+    }
+
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> crate::error::Result<usize> {
+        let n = self.inner.read_sectors(lba, count, buf, recovery)?;
+        let len = n.min(buf.len());
+        let got = &mut buf[..len];
+        match &mut self.title_key {
+            Some(key) => crate::css::descramble_ps_region(got, key),
+            None if self.refuse && got.chunks(2048).any(crate::css::is_scrambled_ps_pack) => {
+                return Err(crate::error::Error::CssKeyMissing);
+            }
+            None => {}
+        }
+        Ok(n)
+    }
 }
 
 // Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head

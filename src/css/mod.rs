@@ -176,10 +176,37 @@ pub(crate) fn resolve_dvd_title_key(
     Ok(())
 }
 
-/// [`is_scrambled_pack`], and an unstuffed pack: the strict test the `mpg://` file crack scan
-/// uses, where a foreign stuffed pack's 0x14 is PES header, not scrambling bits (D3).
-pub(crate) fn is_scrambled_unstuffed_pack(sector: &[u8]) -> bool {
-    is_scrambled_pack(sector) && sector[0x0D] & 0x07 == 0
+/// Where a 13818-1 pack's first PES flags byte sits: `0x0E + pack_stuffing_length + 6`
+/// (0x14 unstuffed), `Some` only when that PES is scrambled (m1). The `mpg://` file's test.
+pub(crate) fn ps_scrambled_at(sector: &[u8]) -> Option<usize> {
+    use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
+    if sector.len() < 2048 || sector[..4] != PACK_START || sector[4] >> 6 != 0b01 {
+        return None;
+    }
+    let at = 0x14 + usize::from(sector[0x0D] & 0x07);
+    let sid = sector[at - 3];
+    (!matches!(sid, SYSTEM_HEADER | PADDING_STREAM | PRIVATE_STREAM_2)
+        && (sector[at] >> 4) & 0x03 != 0)
+        .then_some(at)
+}
+
+/// [`ps_scrambled_at`] as a test.
+pub(crate) fn is_scrambled_ps_pack(sector: &[u8]) -> bool {
+    ps_scrambled_at(sector).is_some()
+}
+
+// Run `f` on `sector` with its flags byte `at` presented at 0x14, where the LFSR and the
+// keyless crack read it; both bytes are put back after (a stuffed pack, m1/m2).
+fn with_flags_at_0x14<T>(sector: &mut [u8], at: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
+    if at == 0x14 {
+        return f(sector);
+    }
+    let b14 = sector[0x14];
+    sector[0x14] = sector[at];
+    let out = f(sector);
+    sector[at] = sector[0x14];
+    sector[0x14] = b14;
+    out
 }
 
 /// The `mpg://` file's crack (design §4 step 2.1, D3): raw = false, over the strict
@@ -190,13 +217,7 @@ pub(crate) fn resolve_ps_file_title_key(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> std::io::Result<crate::decrypt::DecryptKeys> {
-    match crack_key_scan_with(
-        reader,
-        extents,
-        batch_sectors,
-        halt,
-        is_scrambled_unstuffed_pack,
-    ) {
+    match crack_key_scan_with(reader, extents, batch_sectors, halt, is_scrambled_ps_pack) {
         CrackOutcome::Cracked(state) => Ok(crate::decrypt::DecryptKeys::Css {
             title_key: state.title_key,
         }),
@@ -225,7 +246,7 @@ fn crack_key_scan(
     crack_key_scan_with(reader, extents, batch_sectors, halt, is_scrambled_pack)
 }
 
-// The crack scan with its scramble test (`is_scrambled_unstuffed_pack` for mpg:// files).
+// The crack scan with its scramble test (`is_scrambled_ps_pack` for mpg:// files).
 fn crack_key_scan_with(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
@@ -318,7 +339,17 @@ fn crack_key_scan_with(
                         // or an unencrypted title falsely reports E7023.
                         if scrambled(sect) {
                             saw_scrambled = true;
-                            if let Some(key) = keyless::crack_title_key(sect) {
+                            // A stuffed mpg:// pack's flags sit past 0x14 (m1).
+                            let key = match ps_scrambled_at(sect).filter(|&at| at != 0x14) {
+                                Some(at) => {
+                                    let mut copy = sect.to_vec();
+                                    with_flags_at_0x14(&mut copy, at, |c| {
+                                        keyless::crack_title_key(c)
+                                    })
+                                }
+                                None => keyless::crack_title_key(sect),
+                            };
+                            if let Some(key) = key {
                                 return CrackOutcome::Cracked(CssState {
                                     title_key: key,
                                     crack_span,
@@ -391,17 +422,42 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 const RECRACK_RETRY_EVERY: u32 = 16;
 
 pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
+    // `is_scrambled_pack`, NOT the looser `is_scrambled`: this sees arbitrary
+    // regions (IFO/UDF/ISO 9660) where raw byte 0x14 isn't a reliable flag.
+    // Measured: an IFO misread this way was destroyed, dropping titles 38→10.
+    descramble_region_with(buf, title_key, |c| is_scrambled_pack(c).then_some(0x14))
+}
+
+/// [`descramble_region`] for an `mpg://` file: each pack is judged, and its flags cleared,
+/// where its own pack stuffing puts them ([`ps_scrambled_at`], m2).
+pub(crate) fn descramble_ps_region(buf: &mut [u8], title_key: &mut [u8; 5]) {
+    let _ = descramble_region_with(buf, title_key, ps_scrambled_at);
+}
+
+// `scrambled_at(chunk)`: the offset of a scrambled pack's flags byte, else `None`.
+fn descramble_region_with(
+    buf: &mut [u8],
+    title_key: &mut [u8; 5],
+    scrambled_at: fn(&[u8]) -> Option<usize>,
+) -> crate::error::Result<usize> {
     // Consecutive crib mismatches since the last re-crack attempt (0 = none
     // pending). Reset by a validated cache hit; a fresh run always attempts
     // on its first mismatch, then at most once every RECRACK_RETRY_EVERY.
     let mut mismatches_since_attempt: u32 = 0;
     for chunk in buf.chunks_mut(2048) {
-        // `is_scrambled_pack`, NOT the looser `is_scrambled`: this sees arbitrary
-        // regions (IFO/UDF/ISO 9660) where raw byte 0x14 isn't a reliable flag.
-        // Measured: an IFO misread this way was destroyed, dropping titles 38→10.
-        if chunk.len() < 2048 || !is_scrambled_pack(chunk) {
+        let Some(at) = (chunk.len() >= 2048).then(|| scrambled_at(chunk)).flatten() else {
             continue;
-        }
+        };
+        with_flags_at_0x14(chunk, at, |chunk| {
+            descramble_one(chunk, title_key, &mut mismatches_since_attempt)
+        });
+    }
+    Ok(0)
+}
+
+// One scrambled pack (flags at 0x14), validated against its crib and re-cracked on a miss.
+fn descramble_one(chunk: &mut [u8], title_key: &mut [u8; 5], mismatches_since_attempt: &mut u32) {
+    {
         let crib = keyless::attack_crib(chunk);
         // Snapshot the ciphertext (chunk is exactly 2048 here) only when there is
         // a crib to validate against, so the common cache-hit path costs no
@@ -411,16 +467,16 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
             original.copy_from_slice(chunk);
         }
         lfsr::descramble_sector(title_key, chunk);
-        let Some(crib) = crib else { continue };
+        let Some(crib) = crib else { return };
         if chunk[0x80..0x80 + 10] == crib[..] {
-            mismatches_since_attempt = 0; // validated: cached key still matches
-            continue;
+            *mismatches_since_attempt = 0; // validated: cached key still matches
+            return;
         }
-        mismatches_since_attempt += 1;
-        if mismatches_since_attempt % RECRACK_RETRY_EVERY != 1 {
+        *mismatches_since_attempt += 1;
+        if *mismatches_since_attempt % RECRACK_RETRY_EVERY != 1 {
             // Within a suppressed run, not yet due for its periodic retry —
             // keep the cached key (already applied above).
-            continue;
+            return;
         }
         // Due for an attempt: either the first mismatch of a run, or a
         // periodic retry into an ongoing one. Restore the ciphertext and
@@ -432,7 +488,7 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
             Some(fresh) => {
                 *title_key = fresh;
                 lfsr::descramble_sector(title_key, chunk);
-                mismatches_since_attempt = 0;
+                *mismatches_since_attempt = 0;
             }
             None => {
                 // Re-crack found nothing; descramble with the CACHED key
@@ -442,7 +498,6 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
             }
         }
     }
-    Ok(0)
 }
 
 /// Whether bits 4-5 of the sub-header byte 0x14 are set. NOTHING MORE.
@@ -731,10 +786,7 @@ mod tests {
             s[at..at + 4].copy_from_slice(&[0, 0, 1, 0xE0]);
             s[at + 4..at + 6].copy_from_slice(&0x07EBu16.to_be_bytes());
             s[at + 6] = 0x81;
-            assert!(
-                !is_scrambled_unstuffed_pack(&s),
-                "pack_stuffing_length {stuffing}"
-            );
+            assert!(!is_scrambled_ps_pack(&s), "pack_stuffing_length {stuffing}");
         }
     }
 
