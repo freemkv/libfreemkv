@@ -388,9 +388,9 @@ impl KeySource for Fake {
         ctx: &dyn ResolveCtx,
     ) -> Result<crate::keysource::UnitKeyResolution> {
         let keys = self.get_unit_keys(ctx)?;
-        let (matched, miss_path) = match (self.spec.no_vid, keys.is_empty()) {
-            (true, true) => (true, vec![crate::aacs::trace::KeyNode::NoVid]),
-            _ => (false, Vec::new()),
+        let (matched, miss_path) = match self.spec.no_vid {
+            true => (true, vec![crate::aacs::trace::KeyNode::NoVid]),
+            false => (false, Vec::new()),
         };
         Ok(crate::keysource::UnitKeyResolution {
             keys,
@@ -2029,6 +2029,91 @@ fn a_matched_miss_keeps_its_reason_in_the_trace() {
         "{:?}",
         r.trace.keys
     );
+    let outcome = r.trace.keys[0].outcome;
+    assert_eq!(
+        outcome,
+        crate::aacs::trace::KeyOutcome::MissingVid,
+        "not a bare no-key"
+    );
+}
+
+/// J23: a keydb entry with partial stored unit keys plus a Km but no VID still reports the
+/// Km path (`NoVid`), so the VID would help the unit keys it lacks.
+#[test]
+fn partial_stored_keys_with_a_km_still_say_the_vid_would_help() {
+    let calls = Calls::default();
+    let partial = Spec {
+        no_vid: true,
+        ..Spec::keydb(&[K1], &calls)
+    };
+    let (r, help) = vid_help(true, &[partial]);
+    assert_eq!((code(r), help), (E7022, true));
+}
+
+/// Review B-1: an unreachable key service is never coded Missing. With the online source
+/// down, the largest title's piece is asked first and records the failure; a smaller
+/// title's piece earlier on the disc is then skipped (the source is dead). The refusal is
+/// the source failure (E7028), never E7022, which the engine could turn into E7034.
+#[test]
+fn an_unreachable_service_is_never_coded_missing() {
+    let mut fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 20, Some(K2))],
+        2,
+        &[&[0], &[1]],
+    );
+    fx.disc.aacs.as_mut().unwrap().volume_id = [0u8; 16];
+    let calls = Calls::default();
+    let mut down = Spec::online(&[K1, K2], &calls);
+    down.fails = Some(|| Error::KeyServiceUnavailable);
+    down.uses_vid = true;
+    let r = resolve_with(
+        &fx,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0, 1]),
+        &[down],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    );
+    assert_eq!(code(r), E7028);
+    assert_eq!(
+        calls.of("online").len(),
+        1,
+        "the dead source is not asked again"
+    );
+}
+
+/// Review minor 1: a Stop during the backoff after a transport failure still leaves the
+/// request in the trace (a request went out), so a caller counting requests sees it.
+#[test]
+fn a_stop_during_backoff_keeps_the_asked_step() {
+    let fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
+    let calls = Calls::default();
+    let halt = Halt::new();
+    let clock = Arc::new(FakeClock {
+        cancel_at: Some((Duration::from_secs(2), halt.clone())),
+        ..Default::default()
+    });
+    let mut dead = Spec::online(&[K1], &calls);
+    dead.clock = Some(clock.clone());
+    dead.down_until = Some(Duration::MAX);
+    let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
+    let opts = ResolveKeysOptions {
+        halt: Some(&halt),
+        trace: Some(&out),
+        ..Default::default()
+    };
+    let r = resolve_with(
+        &fx,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0]),
+        &[dead],
+        opts,
+        &*clock,
+    );
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    let t = out.lock().unwrap().clone();
+    assert_eq!(t.keys.len(), 1, "the request that went out: {t:?}");
+    assert_eq!(t.keys[0].who, "online");
 }
 
 // ── KU-E1: the trace on Ok and Err; `is_aacs` ──────────────────────────────
