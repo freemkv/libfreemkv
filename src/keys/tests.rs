@@ -1674,3 +1674,69 @@ fn unopenable_unit_stops_before_any_side_read() {
     assert_eq!(code(read(&mut r, &fx, 1, 4, 1)), E7022);
     assert_eq!(log.reads(), [(fx.unit(1, 4), 3)], "only the requested read");
 }
+
+/// KU §2.3 step 10 under invariant 2, "never guessed" (J22, review r2 M1). KS-14 [BD]
+/// §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number of CPS Units on the disc".
+/// With one declared unit, a Lazy piece is keyed by the proven key only if that key opens
+/// every `Enc` probe of it: (a) probes no held key opens, (b) probes opened by two keys.
+#[test]
+fn single_unit_rule_keys_only_pieces_the_proven_key_opens() {
+    // (a) B's three units are under K2, which no source holds.
+    let fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 3, Some(K2))],
+        1,
+        &[&[0, 1]],
+    );
+    let calls = Calls::default();
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1], &calls)],
+    )
+    .unwrap();
+    let (b, n) = fx.file(1);
+    assert_eq!(
+        (set.status().keyed, set.lazy()),
+        (1, &[(b, b + n)][..]),
+        "(a)"
+    );
+    let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 0, 3)),
+        E7022,
+        "(a) never K1 over K2's ciphertext"
+    );
+
+    // (b) B's only readable probes: unit 0 opens under K1, unit 5 under K2.
+    let mut fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        1,
+        &[&[0, 1]],
+    );
+    fx.reencrypt(1, 0, &K1);
+    let (b, n) = fx.file(1);
+    let src = fx.source();
+    src.kill(fx.unit(1, 1), fx.unit(1, 5));
+    src.kill(fx.unit(1, 6), b + n);
+    let set = resolve_with(
+        &fx,
+        &mut src.clone(),
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1, K2], &calls)],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        (set.status().keyed, set.lazy()),
+        (1, &[(b, b + n)][..]),
+        "(b)"
+    );
+    src.heal();
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 0, 10)),
+        E7022,
+        "(b) two keys: a conflict"
+    );
+}
