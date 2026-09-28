@@ -171,6 +171,7 @@ fn two_gop_image() -> Vec<u8> {
 
 /// Drive the real highway and write every frame into the `fvi://` sink.
 fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
+    let _drive = crate::sector::prefetched::holder_test_lock();
     let mut input = build_iso_pipeline(
         MemSource { data: image },
         title.clone(),

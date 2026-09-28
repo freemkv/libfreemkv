@@ -538,7 +538,8 @@ pub fn live_drive_holders() -> usize {
 }
 
 // Every test that spawns a Drive holder or reads the process-wide count holds this.
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
+#[cfg_attr(loom, allow(dead_code))]
 pub(crate) static DRIVE_HOLDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A thread that holds the Drive (§2.5): the op joins it before returning. In debug
