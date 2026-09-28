@@ -151,20 +151,21 @@ impl BytePrefetcher {
     /// caller (typically [`crate::mux::demux_thread::DemuxThread`])
     /// drains `rx`, runs the demuxer in place on each filled buffer,
     /// and recycles back through `recycle_tx`.
-    pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
-        // MOVE the fields out, never clone: the pre-1.0.0 impl cloned + `mem::forget`-ed
-        // `self`, leaking endpoints that defeated disconnection shutdown (producer join
-        // hung forever). `ManuallyDrop` + `ptr::read` moves fields out cleanly instead.
-        let me = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `me` is `ManuallyDrop`, so none of these fields are dropped by `me`.
-        // Each `ptr::read` is one bitwise move, read exactly once — no double-frees.
-        let producer = unsafe { std::ptr::read(&me.producer) };
-        // SAFETY: `rx` and `recycle_tx` are always `Some` here —
-        // `into_channels` is the only way to consume a live
-        // `BytePrefetcher`; `Drop::drop` is suppressed by `ManuallyDrop`.
-        let rx = unsafe { std::ptr::read(&me.rx) }.expect("rx always Some before drop");
-        let recycle =
-            unsafe { std::ptr::read(&me.recycle_tx) }.expect("recycle_tx always Some before drop");
+    pub fn into_channels(mut self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
+        // Same `Option::take` pattern `Drop for BytePrefetcher` uses below (no `unsafe`,
+        // no double-drop). `rx`/`recycle_tx` are always `Some` here, but fall back to a
+        // disconnected stand-in instead of an `.expect()` panic if that ever changes.
+        let producer = self.producer.take();
+        let rx = self.rx.take().unwrap_or_else(|| {
+            let (_dead_tx, dead_rx) = bounded::<Batch>(0);
+            dead_rx
+        });
+        let recycle = self.recycle_tx.take().unwrap_or_else(|| {
+            let (dead_tx, _dead_rx) = bounded::<Vec<u8>>(0);
+            dead_tx
+        });
+        // `self` drops here: `rx`/`recycle_tx` are `None` and `producer` is `None`, so
+        // `Drop for BytePrefetcher` is a no-op.
         (rx, recycle, PrefetchShell { producer })
     }
 }
@@ -246,6 +247,37 @@ mod tests {
             drop(recycle_tx);
             // Joining the producer must not hang.
             drop(shell);
+        });
+    }
+
+    // L106 (safe `Option::take` rewrite, no `unsafe`): `shell` drop must join within the
+    // bound below (a leaked handle hangs it). No-double-drop is structural: an explicit
+    // second `Drop::drop` call is a compile error (E0040), so it can't be attempted.
+    #[test]
+    fn into_channels_then_drop_leaks_nothing() {
+        within(10, || {
+            let pf = BytePrefetcher::new(EndlessReader, 4096, None).expect("spawn");
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell); // joins: a leaked/duplicated handle would hang this within(10, ..).
+        });
+    }
+
+    // Channels handed back by `into_channels` must still carry real bytes end-to-end — the
+    // safe rewrite must not have swapped in the dead/disconnected fallback channels (the
+    // `unwrap_or_else` branch that replaced the removed `.expect()`s) by mistake.
+    #[test]
+    fn into_channels_channels_still_deliver_bytes() {
+        within(10, || {
+            let src = vec![7u8; 10_000];
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 4096, None).expect("spawn");
+            let (out, err) = drain_to_vec(pf);
+            assert!(err.is_none(), "no read error expected: {err:?}");
+            assert_eq!(
+                out, src,
+                "all bytes delivered, byte-identical, after into_channels"
+            );
         });
     }
 

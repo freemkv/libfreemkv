@@ -274,20 +274,18 @@ impl PrefetchedSectorSource {
     /// and pushes drained ones back through `recycle_tx`. Returns `(forward_rx, recycle_tx,
     /// shell)`; the shell holds the producer's `JoinHandle` (drop it to join) plus
     /// `total_sectors`.
-    pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
-        // MOVE the fields out, never clone: pre-1.0.0 code cloned + `forget`-ed
-        // `self`, leaking endpoints that defeated disconnection shutdown and
-        // hung `PrefetchShell::drop`'s `join()`. `ManuallyDrop` avoids that.
-        let me = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `me` is `ManuallyDrop` so it drops none of these fields;
-        // each `ptr::read` moves exactly one field out exactly once, so
-        // there are no double-frees and no aliasing.
-        let producer = unsafe { std::ptr::read(&me.producer) };
-        let rx = unsafe { std::ptr::read(&me.rx) };
-        let recycle = unsafe { std::ptr::read(&me.recycle_tx) };
-        // SAFETY: as above; these two are moved out only to be dropped (no leak).
-        drop(unsafe { std::ptr::read(&me.unmapped) });
-        drop(unsafe { std::ptr::read(&me.halt) });
+    pub fn into_channels(mut self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
+        // Same dead-channel swap `Drop for PrefetchedSectorSource` uses below: leaves `self`
+        // holding only harmless placeholders, so no `unsafe`/`ManuallyDrop`/`ptr::read`, and
+        // no double-drop (real endpoints already moved out via `mem::replace`/`Option::take`).
+        let (dead_tx, dead_rx) = bounded::<Batch>(0);
+        drop(dead_tx);
+        let rx = std::mem::replace(&mut self.rx, dead_rx);
+        let (dead_send, dead_recv) = bounded::<Vec<u8>>(0);
+        drop(dead_recv);
+        let recycle = std::mem::replace(&mut self.recycle_tx, dead_send);
+        let producer = self.producer.take();
+        // `self` drops here: dead endpoints no-op, `producer` is `None` (no join).
         (rx, recycle, PrefetchShell { producer })
     }
 }
@@ -595,6 +593,64 @@ mod tests {
             drop(recycle_tx);
             // Joining the producer must not hang.
             drop(shell);
+        });
+    }
+
+    // L106 (safe dead-channel/`Option::take` rewrite, no `unsafe`): dropping `shell` must
+    // release the producer's Drive-holder slot within the settle bound below — a leaked
+    // thread would never let the count return to `before`.
+    #[test]
+    fn into_channels_then_drop_leaks_no_drive_holder() {
+        let _serial = serial();
+        let before = crate::halt::live_drive_holders();
+        within(10, || {
+            let src = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, None)
+                .expect("spawn");
+            let (rx, recycle_tx, shell) = src.into_channels();
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell); // joins: producer thread ends, its holder guard drops.
+        });
+        assert!(
+            holders_settle_to(before, Duration::from_secs(2)),
+            "into_channels + drop must release the producer's drive-holder slot exactly once"
+        );
+    }
+
+    // No-double-drop is structural now (E0040 bars an explicit second `Drop::drop`). This
+    // checks channels handed back by `into_channels` still carry real batches end-to-end —
+    // the safe rewrite must not have swapped in the dead placeholder channels by mistake.
+    #[test]
+    fn into_channels_channels_still_deliver_batches() {
+        let _serial = serial();
+        with_watchdog(Duration::from_secs(10), || {
+            let start = 40u32;
+            let count = 9u32; // three units
+            let extents = vec![Extent {
+                start_lba: start,
+                sector_count: count,
+            }];
+            let src = PatternSource { capacity: 1000 };
+            let pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            let mut got = Vec::new();
+            while let Ok(batch) = rx.recv() {
+                let buf = batch.expect("no read error expected");
+                got.extend_from_slice(&buf);
+                let _ = recycle_tx.send(buf);
+            }
+            drop(recycle_tx);
+            drop(shell);
+            assert_eq!(got.len(), (count as usize) * 2048, "all sectors delivered");
+            for i in 0..count {
+                let tag = ((start + i) & 0xff) as u8;
+                let off = i as usize * 2048;
+                assert!(
+                    got[off..off + 2048].iter().all(|b| *b == tag),
+                    "sector {i} (lba {}) content mismatch after into_channels",
+                    start + i
+                );
+            }
         });
     }
 
