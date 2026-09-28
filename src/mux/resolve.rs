@@ -4411,6 +4411,61 @@ mod tests {
         );
     }
 
+    /// LK14 (K-5), per evidence (no public FMTS spec) — KS-25, KS-26: an index whose every
+    /// phase probe faulted is decrypted unit by unit, each kept only if it verifies; per spec
+    /// KS-3 [BD] §3.10.1 "A new CBC cipher chain is started for each Aligned Unit".
+    #[test]
+    fn fmts_verify_phase_drops_wrong_half() {
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, is_clean};
+        use crate::spec::keys::{
+            KS_3_CBC_PER_UNIT, KS_25_AACS2_EVIDENCE, KS_26_FMTS_ANCHOR_EVIDENCE,
+        };
+        assert!(
+            KS_3_CBC_PER_UNIT
+                .text
+                .contains("new CBC cipher chain is started for each")
+        );
+        assert_eq!(KS_25_AACS2_EVIDENCE.kind, crate::spec::QuoteKind::Evidence);
+        assert_eq!(
+            KS_26_FMTS_ANCHOR_EVIDENCE.kind,
+            crate::spec::QuoteKind::Evidence
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        // Every read of the index-2 segment (LBAs 10600..10840) faults: its phase is unknown.
+        let mut reader = FmtsDisc::new();
+        reader.fault_span = Some((10_600, 10_840));
+        let mut keys = fmts_keys();
+        let map = super::resolve_mux_key_map(
+            &mut reader,
+            &fmts_title(FMTS_CONTENT_SECTORS),
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+        )
+        .expect("a read-faulted phase probe never aborts the rip");
+        // Later the segment reads: unit 0 is index 2's half, unit 1 the other variant's.
+        let mut buf = vec![0u8; 2 * ALIGNED_UNIT_LEN];
+        FmtsDisc::new()
+            .read_sectors(10_600, 6, &mut buf, false)
+            .unwrap();
+        let other_half = buf[ALIGNED_UNIT_LEN..].to_vec();
+        crate::decrypt::decrypt_sectors_mapped(&mut buf, &keys, 10_600, &map)
+            .expect("a unit that fails the verify is left as ciphertext, not an error");
+        let (ours, theirs) = buf.split_at(ALIGNED_UNIT_LEN);
+        assert!(is_clean(ours, ContentFormat::BdTs), "our half decrypts");
+        assert!(
+            !aacs_unit_encrypted(ours, ContentFormat::BdTs),
+            "and reads clear"
+        );
+        assert!(theirs == other_half, "the wrong half is left as ciphertext");
+        assert!(
+            aacs_unit_encrypted(theirs, ContentFormat::BdTs),
+            "still flagged"
+        );
+    }
+
     // The UDF walk deciding FMTS-or-not must be attempted ONCE per disc, not once per playlist.
     #[test]
     fn non_fmts_disc_walks_the_filesystem_once_for_every_title() {
