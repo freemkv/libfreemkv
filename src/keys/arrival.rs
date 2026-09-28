@@ -13,7 +13,8 @@
 
 use super::{Proof, ProofCache, ResolvedKeySet, StopKind};
 use crate::aacs::content::{
-    ALIGNED_UNIT_LEN, aacs_unit_encrypted, clear_copy_permission_indicator, decrypt_unit, is_clean,
+    ALIGNED_UNIT_LEN, aacs_unit_encrypted, aacs_unit_on_grid, clear_copy_permission_indicator,
+    decrypt_unit, is_clean,
 };
 use crate::disc::ContentFormat;
 use crate::error::{Error, Result};
@@ -80,12 +81,20 @@ impl Arrival {
         is_clean(&u, self.format)
     }
 
-    // A non-segment encrypted unit of piece `piece` (a partner candidate).
+    /// Is `lba` in a piece this proof covers?
+    pub(crate) fn covers(&self, lba: u32) -> bool {
+        self.span_at(lba).is_some()
+    }
+
+    // A readable, non-segment encrypted unit of piece `piece` (a partner candidate).
     fn is_partner(&self, lba: u32, unit: &[u8], piece: usize) -> bool {
+        // KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed" —
+        // a unit whose seed is damaged (no TS sync) opens under no key: damage, not a partner.
         unit.len() == ALIGNED_UNIT_LEN
             && self.span_at(lba).is_some_and(|s| s.3 == piece)
             && !self.in_segment(lba)
             && aacs_unit_encrypted(unit, self.format)
+            && aacs_unit_on_grid(unit, self.format)
     }
 
     fn stop(&self, lba: u32, why: &'static str) -> Error {

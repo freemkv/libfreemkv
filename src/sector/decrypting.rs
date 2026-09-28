@@ -98,6 +98,9 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// The key set's on-arrival proof for pieces `resolve` could not prove up front
     /// (KU §2.4). `None` for every reader not built by a `ResolvedKeySet`.
     arrival: Option<Box<crate::keys::Arrival>>,
+    /// The unit base a read has proven to be the file's grid (intact units in majority), so
+    /// damaged units read later on it are holes, not a grid failure.
+    grid_proven: Option<u32>,
 }
 
 /// Does the sector span `[lba, lba+count)` intersect any encrypted-content range?
@@ -121,6 +124,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             content_ranges: None,
             key_map: None,
             arrival: None,
+            grid_proven: None,
         }
     }
 
@@ -268,6 +272,10 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
 
+        // Read damage before any key sees the units: a damaged seed is a hole, never a key
+        // verdict (E7013 here, E7022 on arrival). "We rip bad discs."
+        self.hole_damage(lba, &mut buf[..n], content_ref)?;
+
         // KU §2.4: units of a piece left unproven are proven now, from the held keys only.
         if let (Some(arrival), DecryptKeys::Aacs { unit_keys, .. }) =
             (self.arrival.as_deref(), &self.keys)
@@ -302,6 +310,32 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
 
     fn set_unit_base(&mut self, lba: u32) {
         self.unit_base = Some(lba);
+    }
+}
+
+impl<S: SectorSource> DecryptingSectorSource<S> {
+    // Hole the damaged AACS units of a read at `lba` (see `decrypt::hole_damaged_units`):
+    // judged are content units the map keys or the on-arrival proof covers.
+    fn hole_damage(
+        &mut self,
+        lba: u32,
+        buf: &mut [u8],
+        content: Option<&[(u32, u32)]>,
+    ) -> Result<()> {
+        let DecryptKeys::Aacs { format, .. } = self.keys else {
+            return Ok(());
+        };
+        let (map, arrival) = (self.key_map.as_deref(), self.arrival.as_deref());
+        let covered = |at: u32| {
+            content.is_none_or(|r| crate::decrypt::span_in_content_ranges(at, 1, r))
+                && (map.is_some_and(|m| m.entry_for(at).is_some())
+                    || arrival.is_some_and(|a| a.covers(at)))
+        };
+        let proven = self.unit_base.is_some() && self.grid_proven == self.unit_base;
+        if crate::decrypt::hole_damaged_units(buf, lba, format, proven, &covered)? {
+            self.grid_proven = self.unit_base;
+        }
+        Ok(())
     }
 }
 
