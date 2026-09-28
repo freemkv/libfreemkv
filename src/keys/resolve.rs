@@ -499,6 +499,9 @@ pub(crate) fn resolve(
     // Every source is dropped here: nothing can ask after `resolve` (LK7).
     let trace = std::mem::take(&mut run.trace);
     drop(run.sources);
+    if let Some(out) = opts.trace {
+        *out.lock().unwrap_or_else(|e| e.into_inner()) = trace.clone();
+    }
     // KU J23: the VID would help only through a Km path or a source that consumes it.
     if let Some(flag) = opts.vid_would_help
         && vid.is_none()

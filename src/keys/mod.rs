@@ -56,6 +56,9 @@ pub struct ResolveKeysOptions<'a> {
     /// reported a Media Key it could not finish without the VID (`KeyNode::NoVid`), or a
     /// configured source [`uses_vid`](crate::KeySource::uses_vid). Never cleared.
     pub vid_would_help: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Filled with the per-source walk on `Ok` and on `Err` alike, so a refusal still says
+    /// which source answered what. It holds labels, node enums and counts, never key bytes.
+    pub trace: Option<&'a Mutex<ResolutionTrace>>,
 }
 
 /// The outcome of [`ResolvedKeySet::resolve`]: the set, plus the per-source walk.
@@ -318,8 +321,9 @@ impl ResolvedKeySet {
         ResolvedKeySet(Arc::new(Inner::empty()))
     }
 
-    // Whether this set keys AACS content at all.
-    pub(crate) fn is_aacs(&self) -> bool {
+    /// Whether this set keys AACS content: `false` for [`none`](Self::none), which a caller
+    /// must not take as covering an AACS disc's titles ([`covers`](Self::covers) has no disc).
+    pub fn is_aacs(&self) -> bool {
         self.0.aacs
     }
 
