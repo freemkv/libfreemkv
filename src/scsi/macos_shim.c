@@ -896,14 +896,14 @@ int shim_list_drives(ShimDriveInfo *out, int max_entries) {
 // Entry points for macos.rs's `shim_selftest_*` tests. They drive the same static
 // helpers shim_open_exclusive uses, so no drive is needed (qa release-tests, D6).
 
-int shim_selftest_wait_slice_ms(void) { return SHIM_WAIT_SLICE_MS; }
+__attribute__((visibility("hidden"))) int shim_selftest_wait_slice_ms(void) { return SHIM_WAIT_SLICE_MS; }
 
-int shim_selftest_sleep(unsigned int ms, const volatile uint8_t *cancel) {
+__attribute__((visibility("hidden"))) int shim_selftest_sleep(unsigned int ms, const volatile uint8_t *cancel) {
     return sliced_sleep(ms, cancel);
 }
 
 // A fresh semaphore, signalled up front when `signalled` is set, waited on like the DA claim.
-int shim_selftest_sem_wait(unsigned int ms, int signalled, const volatile uint8_t *cancel) {
+__attribute__((visibility("hidden"))) int shim_selftest_sem_wait(unsigned int ms, int signalled, const volatile uint8_t *cancel) {
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     if (!sem) return -1;
     if (signalled) dispatch_semaphore_signal(sem);
@@ -912,7 +912,7 @@ int shim_selftest_sem_wait(unsigned int ms, int signalled, const volatile uint8_
     return rc;
 }
 
-int shim_selftest_run_and_reap(const char *path, const char *arg, unsigned int budget_ms,
+__attribute__((visibility("hidden"))) int shim_selftest_run_and_reap(const char *path, const char *arg, unsigned int budget_ms,
                                const volatile uint8_t *cancel, int *pid_out) {
     char *const argv[] = { (char *)path, (char *)arg, NULL };
     pid_t pid = 0;
@@ -923,7 +923,7 @@ int shim_selftest_run_and_reap(const char *path, const char *arg, unsigned int b
 
 // 1 once `pid` is reaped. wait(2) ECHILD: "The process specified by pid does not exist or
 // is not a child of the calling process". A zombie is reaped here and reported as 0.
-int shim_selftest_reaped(int pid) {
+__attribute__((visibility("hidden"))) int shim_selftest_reaped(int pid) {
     int status;
     errno = 0;
     return waitpid((pid_t)pid, &status, WNOHANG) < 0 && errno == ECHILD;
@@ -968,7 +968,7 @@ static SCSITaskDeviceInterface g_selftest_device_vt = {
 static SCSITaskDeviceInterface *g_selftest_device = &g_selftest_device_vt;
 
 // Install the fake as the open handle; shim_close tears it down. -1 if a handle is open.
-int shim_selftest_install_fake_device(void) {
+__attribute__((visibility("hidden"))) int shim_selftest_install_fake_device(void) {
     pthread_mutex_lock(&g_handle_lock);
     if (g_handle.scsi) { pthread_mutex_unlock(&g_handle_lock); return -1; }
     g_handle.scsi = &g_selftest_device;
@@ -978,4 +978,4 @@ int shim_selftest_install_fake_device(void) {
     return 0;
 }
 
-unsigned int shim_selftest_last_timeout_ms(void) { return g_selftest_timeout_ms; }
+__attribute__((visibility("hidden"))) unsigned int shim_selftest_last_timeout_ms(void) { return g_selftest_timeout_ms; }

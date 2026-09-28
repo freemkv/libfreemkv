@@ -20,6 +20,10 @@ const K_SENSE_DATA_SIZE: usize = 32;
 /// shim so a pathological >255-byte slice can't wrap a `u8`.
 const K_MAX_CDB_SIZE: usize = 16;
 
+// The timeout a caller's `timeout_ms == 0` gets: Linux SG_IO's default, include/linux/blkdev.h
+// "#define BLK_DEFAULT_SG_TIMEOUT (60 * HZ)". On macOS 0 would mean "Wait Forever".
+const ZERO_TIMEOUT_MS: u32 = 60_000;
+
 // The C shim uses a single global IOKit handle, so only one MacScsiTransport may exist at a
 // time — a second open() would race the shared handle with the first drop().
 static OPEN: AtomicBool = AtomicBool::new(false);
@@ -196,7 +200,12 @@ impl ScsiTransport for MacScsiTransport {
                 K_SENSE_DATA_SIZE as u32,
                 &mut task_status,
                 &mut transfer_count,
-                timeout_ms,
+                // SCSITaskLib.h SetTimeoutDuration: "A value of zero is equivalent to "Wait Forever"".
+                if timeout_ms == 0 {
+                    ZERO_TIMEOUT_MS
+                } else {
+                    timeout_ms
+                },
             )
         };
 
@@ -695,6 +704,42 @@ mod tests {
         );
     }
 
+    /// §2.9 M2 end to end: shim_open_exclusive hands its token to its own waits. The unmount of
+    /// a missing disk ends at once, so the cancel lands in the 500 ms settle (or the unmount).
+    #[test]
+    fn shim_selftest_cancel_mid_open_is_halted() {
+        let _globals = shim_globals();
+        let (r, wake) = {
+            let halt = Halt::new();
+            let canceller = {
+                let halt = halt.clone();
+                thread::spawn(move || {
+                    thread::sleep(CANCEL_AFTER);
+                    let at = Instant::now();
+                    halt.cancel();
+                    at
+                })
+            };
+            let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &halt);
+            let returned = Instant::now();
+            let cancelled_at = canceller.join().expect("canceller thread");
+            (r, returned.saturating_duration_since(cancelled_at))
+        };
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "expected Halted, got {:?}",
+            r.err()
+        );
+        assert!(
+            wake <= WAKE_BOUND,
+            "open returned {wake:?} after the cancel"
+        );
+        assert!(
+            !OPEN.load(Ordering::Acquire),
+            "a cancelled open left OPEN held"
+        );
+    }
+
     /// §2.9 M1: "`timeout_ms` is passed through to the shim", reaching the task unchanged.
     /// Apple SCSITaskLib.h SetTimeoutDuration: "The timeout duration is counted in milliseconds."
     #[test]
@@ -714,6 +759,11 @@ mod tests {
             assert!(r.is_ok(), "fake task failed: {:?}", r.err());
             assert_eq!(unsafe { shim_selftest_last_timeout_ms() }, timeout_ms);
         }
+        // SCSITaskLib.h SetTimeoutDuration: "A value of zero is equivalent to "Wait Forever"",
+        // so 0 must never reach the task; it becomes Linux SG_IO's 60 s default.
+        let r = transport.execute(&[0u8; 6], DataDirection::None, &mut [], 0);
+        assert!(r.is_ok(), "fake task failed: {:?}", r.err());
+        assert_eq!(unsafe { shim_selftest_last_timeout_ms() }, 60_000);
         drop(transport);
         assert!(!OPEN.load(Ordering::Acquire), "drop released OPEN");
     }
