@@ -552,3 +552,24 @@ fn unit_block_end_pulls_back_to_the_straddling_units_head() {
     assert_eq!(r.unit_block_end(103, 104), 104);
     assert_eq!(r.unit_block_end(0, 50), 50);
 }
+
+/// An AACS disc with titles but no stream folder names the missing folder (E6003),
+/// not a key failure: no key refresh can fix a tree with no content files.
+#[test]
+fn titles_without_a_stream_folder_name_the_missing_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("BDMV")).unwrap();
+    std::fs::write(dir.path().join("BDMV/index.bdmv"), b"INDX0200").unwrap();
+    let img = crate::DirImage::open(dir.path()).unwrap();
+    let mut d = aacs_disc(1);
+    let mut title = crate::DiscTitle::empty();
+    title.extents = vec![crate::Extent {
+        start_lba: 300,
+        sector_count: 30,
+    }];
+    d.titles = vec![title];
+    match whole_disc_reader(&d, img, true, None, None) {
+        Err(Error::UdfNotFound { path }) => assert_eq!(path, "/BDMV/STREAM"),
+        other => panic!("expected UdfNotFound, got {:?}", other.err()),
+    }
+}

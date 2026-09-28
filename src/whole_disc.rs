@@ -24,11 +24,12 @@ const PROOFS: u8 = 2;
 /// The decrypting reader a whole-disc copy reads through.
 pub type WholeDiscReader<S> = UnitAligned<DecryptingSectorSource<S>>;
 
-/// Build the whole-disc reader over `reader`. `decrypt` installs the disc's keys; for AACS
-/// every content file is keyed first (see the module doc), so a refusal comes before the
-/// caller creates any output. `fetch` goes to [`crate::mux::resolve_mux_key_map`], which
-/// asks it only when the pool holds several base keys and none opens a file's samples; a
-/// one-key pool is used as is. `false` (raw copy), CSS and clear discs pass through.
+/// Build the whole-disc reader over `reader`. For AACS every content file is keyed here, so
+/// a refusal (or a stop during keying) comes before the caller creates any output; the one
+/// exception is a file with no provable key on a multi-key disc, which stops the pass with
+/// E7032 at its first encrypted unit. `fetch` goes to [`crate::mux::resolve_mux_key_map`],
+/// which asks it only when the pool holds several base keys and none opens a file's
+/// samples. CSS is descrambled; `decrypt == false` (raw copy) and clear discs pass through.
 pub fn whole_disc_reader<S: SectorSource>(
     disc: &crate::Disc,
     mut reader: S,
@@ -52,7 +53,11 @@ pub fn whole_disc_reader<S: SectorSource>(
         let files = content_files(r)?;
         if files.is_empty() && !content.is_empty() {
             tracing::warn!(target: "freemkv::scan", "titles but no AACS content files");
-            return Err(Error::DecryptFailed);
+            let path = match disc.format {
+                crate::DiscFormat::HdDvd => "/HVDVD_TS",
+                _ => "/BDMV/STREAM",
+            };
+            return Err(Error::UdfNotFound { path: path.into() });
         }
         spans = unit_spans(&files, &content);
         let rule = KeyRule {
@@ -66,6 +71,10 @@ pub fn whole_disc_reader<S: SectorSource>(
         unproven = keyed.unproven;
         content.extend(files.iter().flatten());
         content = merge_ranges(content);
+        // A stop that landed during the last key lookup still ends before any output.
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(Error::Halted);
+        }
     }
     let mut dec = DecryptingSectorSource::new(reader, keys);
     if let Some(map) = key_map {
