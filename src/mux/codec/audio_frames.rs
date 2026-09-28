@@ -58,6 +58,9 @@ struct Placed {
     exact: bool,
 }
 
+/// Frames ADTS or MPEG audio. One verified fault per run (I1) keeps the poison verdict out of
+/// reach while any frame decodes: a damaged track keeps its genuine frames, and every lost AU
+/// is still counted. Per project principle; do not change without a user decision.
 pub(super) struct AudioFrames {
     buf: PesBuf,
     sync: Sync,
@@ -398,13 +401,27 @@ impl AudioFrames {
                 .flatten()
         });
         let d = self.last_frame.map_or(d_lock, |l| l.1 as i64).max(1);
-        // An estimate adds clock slots only with a clock before the run or a mid-run PTS; only
-        // then must it wait. TS/PS carry a PTS at least every 0.7 s, far inside MAX_HOLD; past
-        // it (non-conformant) the lock takes the fewest slots possible, which cannot overshoot.
+        // Only an estimate that adds slots (a prior clock or mid-run PTS) waits. 13818-1 §2.7.4
+        // (recollection, not quoted) puts a PTS at least every 0.7 s: inside MAX_HOLD below ~750
+        // kbit/s; past MAX_HOLD the lock takes the fewest slots, which cannot overshoot (I3).
         let adds_slots = r.advance || r.mid.is_some();
         let exact = match (fresh, next) {
             (Some(p), _) => Some(p),
-            (None, Some((q, end))) => Some(q - self.frames_before(data, end) * d_lock),
+            (None, Some((q, end))) => match self.frames_before(data, end) {
+                Ok(k) => Some(q - k * d_lock),
+                // The walk left the chain (another corruption before q): q measures nothing
+                // about this lock. Estimate it, below q by the walked frames, a lost AU and the
+                // next chain that reaches q, whose lock is then placed exactly (I3, I4).
+                Err((k, at)) => {
+                    let room = k + 1 + self.next_chain(data, at, end);
+                    let stamp = self.estimate(r, d).min(q - room * d_lock);
+                    return Some(Placed {
+                        stamp: r.start.map_or(stamp, |s| stamp.max(s)),
+                        lost: self.lost_by_bytes(r) as u64,
+                        exact: false,
+                    });
+                }
+            },
             (None, None) if eos || !adds_slots => None,
             (None, None) if data.len() > MAX_HOLD => {
                 let stamp = r.mid.map_or(r.start.unwrap_or(self.next_pts) + d, |m| m.0);
@@ -447,33 +464,45 @@ impl AudioFrames {
                 },
             });
         }
-        // EOS or gap. Limit (I5): with a mid-run PTS, the bytes after it (sized by the run's own
-        // AUs) decide between a corrupt AU and a carried fragment; off by one slot only when that
-        // stretch strays over half the run's AU size, and only for a run cut by EOS or a gap.
-        let stamp = match (r.mid, r.start) {
-            (Some((p, s0)), Some(start)) => p + self.after_mid(r, p, s0, start, d).1 * d,
-            (Some((p, s0)), None) => p + self.by_bytes(r.skipped - s0) * d,
-            (None, Some(start)) if r.advance => start + self.by_bytes(r.skipped).max(1) * d,
-            (None, start) => start.unwrap_or(self.next_pts),
-        };
         Some(Placed {
-            stamp,
+            stamp: self.estimate(r, d),
             lost: self.lost_by_bytes(r) as u64,
             exact: false,
         })
     }
 
-    // Frames starting in `data[..end]`: walked by header, the rest estimated by bytes.
-    fn frames_before(&self, data: &[u8], end: usize) -> i64 {
+    // Byte-estimated stamp for a lock no timestamp places. Limit (I5): with a mid-run PTS, the
+    // bytes after it (sized by the run's own AUs) decide between a corrupt AU and a carried
+    // fragment; off by one slot only when that stretch strays over half the run's AU size.
+    fn estimate(&self, r: &Resync, d: i64) -> i64 {
+        match (r.mid, r.start) {
+            (Some((p, s0)), Some(start)) => p + self.after_mid(r, p, s0, start, d).1 * d,
+            (Some((p, s0)), None) => p + self.by_bytes(r.skipped - s0) * d,
+            (None, Some(start)) if r.advance => start + self.by_bytes(r.skipped).max(1) * d,
+            (None, start) => start.unwrap_or(self.next_pts),
+        }
+    }
+
+    // Frames starting in `data[..end]`, walked by header; Err((walked, offset)) if the chain
+    // breaks first.
+    fn frames_before(&self, data: &[u8], end: usize) -> Result<i64, (i64, usize)> {
         let (mut pos, mut k) = (0, 0);
         while pos < end {
             let Some(n) = data.get(pos..).and_then(self.sync.frame_len) else {
-                return k + self.by_bytes(end - pos);
+                return Err((k, pos));
             };
             pos += n;
             k += 1;
         }
-        k
+        Ok(k)
+    }
+
+    // Frames of the first header chain after `from` that walks unbroken to `end` (0 if none).
+    fn next_chain(&self, data: &[u8], from: usize, end: usize) -> i64 {
+        (from + 1..end)
+            .filter(|&i| data[i] == 0xff)
+            .find_map(|i| self.frames_before(&data[i..], end - i).ok())
+            .unwrap_or(0)
     }
 
     // The lock is placed: count the run (the first lost AU was the verified fault), and stamp.

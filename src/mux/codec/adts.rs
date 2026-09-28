@@ -1660,6 +1660,134 @@ mod tests {
         );
     }
 
+    // A lock whose header walk to the next PTS leaves the chain (a second corruption with tiny
+    // VBR/silence frames after it) is not placed from that PTS: the byte estimate is no
+    // measurement. The second run's lock, which does reach the PTS, is placed exactly.
+    #[test]
+    fn a_walk_that_leaves_the_chain_does_not_place_the_lock() {
+        let mut seed = 211;
+        let mut c2 = frame48(&mut seed, 10);
+        corrupt(&mut c2);
+        let pes1 = [
+            frame48(&mut seed, 393),
+            frame48(&mut seed, 393),
+            bad48(&mut seed, 393),
+            frame48(&mut seed, 393),
+            c2,
+            frame48(&mut seed, 3),
+            frame48(&mut seed, 3),
+        ];
+        let mut p = AdtsParser::new();
+        let mut f = p.parse(&make_pes(pes1.concat(), Some(0)));
+        f.extend(p.parse(&make_pes(frame48(&mut seed, 393), Some(7 * SLOT48))));
+        let p7 = pts_to_ns(7 * SLOT48);
+        let want = [0, D48, 3 * D48, p7 - 2 * D48, p7 - D48, p7];
+        assert_eq!(pts(&f), want, "F0 F1 F3 F5 F6 F7");
+        assert_eq!(p.dropped_frames(), 2);
+        assert_eq!(p.frames.verified_dropped(), 2, "two runs");
+    }
+
+    // The same walk break with a run far larger than the stream's frames: the byte estimate
+    // overshoots, so the lock is capped below q by the walked frames, a lost AU and the next
+    // chain's frames that reach q; nothing repeats or goes backwards (I3).
+    #[test]
+    fn a_walk_break_leaves_room_for_the_next_chain() {
+        let mut seed = 227;
+        let mut c2 = frame48(&mut seed, 10);
+        corrupt(&mut c2);
+        let pes1 = [
+            frame48(&mut seed, 10),
+            frame48(&mut seed, 10),
+            bad48(&mut seed, 400),
+            frame48(&mut seed, 10),
+            c2,
+            frame48(&mut seed, 10),
+            frame48(&mut seed, 10),
+        ];
+        let mut p = AdtsParser::new();
+        let mut f = p.parse(&make_pes(pes1.concat(), Some(0)));
+        f.extend(p.parse(&make_pes(frame48(&mut seed, 10), Some(7 * SLOT48))));
+        let got = pts(&f);
+        assert!(
+            got.windows(2).all(|w| w[0] < w[1]),
+            "strictly increasing: {got:?}"
+        );
+        let p7 = pts_to_ns(7 * SLOT48);
+        assert_eq!(
+            got[3..],
+            [p7 - 2 * D48, p7 - D48, p7],
+            "F5 F6 F7 placed exactly"
+        );
+        assert!(got[2] <= p7 - 4 * D48, "F3 leaves room for C2, F5, F6");
+    }
+
+    // A walk break with no later chain before q (the corruption runs up to the next PES): the
+    // lock needs room only for itself and one lost AU.
+    #[test]
+    fn a_walk_break_with_no_next_chain_reserves_one_lost_au() {
+        let mut seed = 233;
+        let pes1 = [
+            frame48(&mut seed, 400),
+            frame48(&mut seed, 400),
+            bad48(&mut seed, 400),
+            frame48(&mut seed, 400),
+            bad48(&mut seed, 400),
+        ];
+        let mut p = AdtsParser::new();
+        let mut f = p.parse(&make_pes(pes1.concat(), Some(0)));
+        f.extend(p.parse(&make_pes(frame48(&mut seed, 400), Some(5 * SLOT48))));
+        f.extend(p.flush()); // run 2's lock has no successor until EOS
+        assert_eq!(pts(&f), [0, D48, 3 * D48, pts_to_ns(5 * SLOT48)]);
+    }
+
+    // With timestamps too close to hold the walked frames, the capped lock still never goes
+    // behind the run's start (I3).
+    #[test]
+    fn a_capped_lock_never_goes_behind_the_run_start() {
+        let mut seed = 229;
+        let mut c2 = frame48(&mut seed, 10);
+        corrupt(&mut c2);
+        let pes1 = [
+            frame48(&mut seed, 100),
+            frame48(&mut seed, 100),
+            bad48(&mut seed, 100),
+            frame48(&mut seed, 100),
+            c2,
+            frame48(&mut seed, 3),
+            frame48(&mut seed, 3),
+        ];
+        let mut p = AdtsParser::new();
+        let mut f = p.parse(&make_pes(pes1.concat(), Some(0)));
+        f.extend(p.parse(&make_pes(frame48(&mut seed, 100), Some(3 * SLOT48))));
+        assert!(
+            f[2].pts_ns >= 2 * D48,
+            "F3 at or after the run's first lost slot"
+        );
+        assert!(f[2].pts_ns > f[1].pts_ns);
+    }
+
+    // Per project principle ("rip bad discs"; do not change without a user decision): a track
+    // 90% lost in bursts is kept, never poisoned, and every lost AU is counted. One verified
+    // fault per burst (I1) cannot outnumber the good frames between bursts.
+    #[test]
+    fn a_ninety_percent_lost_track_keeps_its_good_frames() {
+        let mut seed = 223;
+        let mut p = AdtsParser::new();
+        let mut f = Vec::new();
+        for g in 0..30 {
+            let group: Vec<u8> = [frame48(&mut seed, 100)]
+                .into_iter()
+                .chain((0..9).map(|_| bad48(&mut seed, 100)))
+                .flatten()
+                .collect();
+            f.extend(p.parse(&make_pes(group, Some(g * 10 * SLOT48))));
+        }
+        f.extend(p.flush());
+        assert_eq!(f.len(), 30, "every genuine frame is emitted");
+        assert_eq!(p.dropped_frames(), 270, "every lost AU is counted");
+        assert_eq!(p.frames.verified_dropped(), 30, "one fault per burst");
+    }
+
     // [dropgate] Once poisoned, "the caller should drop every remaining AU": frames after the
     // poisoning drop in the same PES are not emitted, and each framed AU is counted. With no
     // frame measured, each PES timestamp ends a run, so 200 corrupt PES are 200 faults (I1).

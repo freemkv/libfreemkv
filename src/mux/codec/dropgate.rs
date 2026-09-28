@@ -5,6 +5,12 @@
 //! Responsibilities: count kept/dropped AUs and dropped duration; log every
 //! drop (per-drop trace plus a once-per-track `warn` aggregate); and latch a
 //! poison flag once a track is judged mostly undecodable so the rest drops too.
+//!
+//! ADTS and MPEG audio (`audio_frames`) count one verified fault per corruption event, so
+//! verified faults cannot outnumber kept frames plus runs ended by a gap or before any frame
+//! was measured: the verdict fires only for a track with nothing decodable. Per project
+//! principle ("rip bad discs": keep a damaged track's genuine frames); do not change without
+//! a user decision.
 
 /// Minimum access units observed before the whole-track drop verdict can fire.
 /// Below this, a short damaged burst can't poison an otherwise-good track.
