@@ -201,6 +201,12 @@ impl MpegAudioParser {
                     mask: 0xe0,
                     frame_len: |d| frame_header(d, &mut None, false).map(|h| h.bytes),
                     fixed: mpa_stream_key,
+                    frame_ns: |d| {
+                        let h = frame_header(d, &mut None, false)?;
+                        Some(u64::from(h.samples) * 1_000_000_000 / u64::from(h.rate))
+                    },
+                    // Smallest fixed-rate frame: ID '0' Layer III, 8 kbit/s at 24 kHz, 24 bytes.
+                    min_frame: 24,
                 },
             ),
             free_size: None,

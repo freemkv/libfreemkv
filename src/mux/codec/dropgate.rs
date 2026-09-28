@@ -61,6 +61,11 @@ impl DropTally {
         self.verified_dropped
     }
 
+    /// Add measured lost time (from timestamps) for AUs already counted as dropped.
+    pub(crate) fn add_dropped_duration(&mut self, ns: u64) {
+        self.dropped_dur_ns += ns;
+    }
+
     /// Record an emitted (decodable) access unit.
     pub(crate) fn record_kept(&mut self) {
         self.kept += 1;

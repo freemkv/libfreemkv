@@ -1,8 +1,23 @@
 //! Bounded framing and timestamp accounting shared by ADTS and MPEG audio.
+//!
+//! A resync run is the bytes from a failed header to the next locked frame, EOS or a gap.
+//! Every run rule keeps these invariants:
+//! - I1: one run (corruption event) is exactly one verified fault; its other lost AUs are
+//!   collateral, so they never feed the poison gate.
+//! - I2: a run never counts more lost AUs than its bytes can hold (bytes / smallest legal
+//!   frame + 1); a timestamp jump beyond that is an unflagged discontinuity.
+//! - I3: emitted PTS never repeat or go backwards: after a run, output waits for the next
+//!   timestamp; only EOS or a gap (nothing later to contradict it) uses a byte estimate.
+//! - I4: consistent timestamps are authoritative: they place the lock and count the run.
+//! - I5: where bytes must decide, the rule with the smaller worst-case error wins, and its
+//!   limit is documented where the rule lives.
 
 use super::dropgate::DropTally;
 use super::pesbuf::{PesBuf, PesFacts};
 use super::{Frame, PesPacket};
+
+// Most bytes held after a lock while waiting for the next timestamp (see place_lock).
+const MAX_HOLD: usize = 64 * 1024;
 
 pub(super) struct Header {
     pub bytes: usize,
@@ -21,14 +36,26 @@ pub(super) struct Sync {
     pub frame_len: fn(&[u8]) -> Option<usize>,
     /// Key of the header fields that stay the same for a stream (first four bytes given).
     pub fixed: fn(&[u8]) -> u32,
+    /// Pure duration in ns of a valid frame at the slice head.
+    pub frame_ns: fn(&[u8]) -> Option<u64>,
+    /// Smallest legal frame in bytes: the I2 bound on the AUs a run's bytes can hold.
+    pub min_frame: usize,
 }
 
-// A resync run after a verified drop: bytes skipped since, the clock slot of its first lost
-// AU (if a clock is known), and whether a byte estimate may advance the clock (not after a gap).
+// A run: bytes skipped, the slot of its first lost AU (None: no clock), whether a clock ran
+// before it (not after a gap), and the latest PES timestamp met inside it with `skipped` there.
 struct Resync {
     skipped: usize,
     start: Option<i64>,
     advance: bool,
+    mid: Option<(i64, usize)>,
+}
+
+// Where a locked frame goes after a run, and how many AUs the run lost (exact: timestamps).
+struct Placed {
+    stamp: i64,
+    lost: u64,
+    exact: bool,
 }
 
 pub(super) struct AudioFrames {
@@ -45,10 +72,7 @@ pub(super) struct AudioFrames {
     // A frame was just emitted, so a header is due next: a failure here is a lost AU.
     header_due: bool,
     resync: Option<Resync>,
-    // A verified drop was counted in this PES; later false syncs in it are the same fault.
-    drop_counted: bool,
-    // Buffer offset of the newest PES's first byte, while it is being framed.
-    pes_start: Option<usize>,
+    jump_warned: bool,
     tally: DropTally,
 }
 
@@ -65,8 +89,7 @@ impl AudioFrames {
             last_head: [0; 4],
             header_due: false,
             resync: None,
-            drop_counted: false,
-            pes_start: None,
+            jump_warned: false,
             tally: DropTally::new(codec),
         }
     }
@@ -96,7 +119,7 @@ impl AudioFrames {
             // Bytes cleared at a gap are a fragment of an AU cut by the loss, not counted as one;
             // an open run is settled from its skipped bytes.
             self.buf.clear();
-            self.settle_run(None);
+            self.settle_run();
             self.anchor = None;
             self.header_due = false;
         }
@@ -136,12 +159,8 @@ impl AudioFrames {
             );
             return Vec::new();
         }
-        self.pes_start = Some(self.buf.len());
         self.buf.push_with(data, facts);
-        self.drop_counted = false;
-        let frames = self.frame_buffered(min_header, false, header);
-        self.pes_start = None;
-        frames
+        self.frame_buffered(min_header, false, header)
     }
 
     // Offset of the first sync whose frame is chained to the next one or ends the packet.
@@ -165,7 +184,8 @@ impl AudioFrames {
     }
 
     // Frames every complete unit at the buffer front; a header callback asks to wait by
-    // returning `bytes` beyond what is buffered. While resyncing, a header must chain.
+    // returning `bytes` beyond what is buffered. While resyncing, a header must chain, and the
+    // lock waits until it can be placed (I3).
     fn frame_buffered(
         &mut self,
         min_header: usize,
@@ -180,8 +200,15 @@ impl AudioFrames {
             let Some(chained) = self.chains(data, min_header, eos) else {
                 break;
             };
+            let mut placed = None;
+            if chained && self.resync.is_some() && (self.sync.frame_len)(data).is_some() {
+                let Some(p) = self.place_lock(consumed, eos) else {
+                    break;
+                };
+                placed = Some(p);
+            }
             let Some(h) = header(data).filter(|_| chained) else {
-                self.skip_byte(consumed, sync, min_header);
+                self.skip_byte(consumed, sync);
                 consumed += 1;
                 continue;
             };
@@ -190,9 +217,11 @@ impl AudioFrames {
             }
             let head = [data[0], data[1], data[2], data[3]];
             let data = data[h.skip..h.bytes].to_vec();
-            self.end_resync(consumed);
+            let facts = match placed {
+                Some(p) => self.end_run(consumed, p),
+                None => self.anchor_at(consumed),
+            };
             self.last_head = head;
-            let facts = self.anchor_at(consumed);
             let duration = u64::from(h.samples) * 1_000_000_000 / u64::from(h.rate);
             if self.tally.is_poisoned() {
                 self.tally
@@ -245,86 +274,236 @@ impl AudioFrames {
             && (self.sync.fixed)(data) == (self.sync.fixed)(&self.last_head)
     }
 
-    // A byte no frame starts at. Where a header was due, or at the first sync-shaped byte of a
-    // PES, a verified drop opens a run. [13818-1 §2.4.3.7] a PES's PTS belongs to the first AU
-    // starting in it, so a new PTS there restarts an open run; the old one is settled first.
-    fn skip_byte(&mut self, consumed: usize, sync: bool, min_header: usize) {
+    // A byte no frame starts at. Where a header was due, or at a sync-shaped byte outside a
+    // run, a verified drop opens a run (I1). Inside one, a new PES timestamp is recorded if the
+    // bytes so far can hold the AUs it implies, else the run ends as a discontinuity (I2).
+    fn skip_byte(&mut self, consumed: usize, sync: bool) {
         let due = std::mem::take(&mut self.header_due);
-        let running = self.resync.is_some();
-        // An open run continues through bytes of a PES already scanned.
-        let new_pes = self.pes_start.is_none_or(|s| consumed >= s);
-        if (sync || due) && !self.drop_counted && (!running || new_pes) {
-            self.drop_counted = true;
+        if let Some(r) = &self.resync
+            && let Some(p) = self.buf.facts_at(consumed).presentation_ns()
+            && self.anchor != Some(p)
+            && r.mid.map(|m| m.0) != Some(p)
+        {
+            let skipped = r.skipped;
+            if self.holds(r, p) {
+                self.resync.as_mut().unwrap().mid = Some((p, skipped));
+            } else {
+                if self.last_frame.is_some() {
+                    self.warn_jump(p);
+                }
+                self.settle_run();
+                self.anchor = None;
+            }
+        }
+        if self.resync.is_none() && (sync || due) {
             let before = self.anchor;
             self.anchor_at(consumed);
-            if !running || self.anchor != before {
-                self.settle_run(self.anchor.filter(|_| running));
-                if self.tally.is_poisoned() {
-                    self.tally.record_collateral_drop(
-                        self.next_pts,
-                        0,
-                        min_header,
-                        "track-poisoned",
-                    );
-                } else {
-                    self.tally
-                        .record_drop(self.next_pts, 0, min_header, "header");
-                }
-                // Mirror limit: after a gap there is no clock (advance false), so a PES that
-                // starts with a fragment and then a corrupt AU stamps its next good frame early.
-                self.resync = Some(Resync {
-                    skipped: 0,
-                    start: self.anchor.map(|_| self.next_pts),
-                    advance: before.is_some(),
-                });
+            if self.tally.is_poisoned() {
+                self.tally
+                    .record_collateral_drop(self.next_pts, 0, 1, "track-poisoned");
+            } else {
+                self.tally.record_drop(self.next_pts, 0, 1, "header");
             }
+            self.resync = Some(Resync {
+                skipped: 0,
+                start: self.anchor.map(|_| self.next_pts),
+                advance: before.is_some(),
+                mid: None,
+            });
         }
         if let Some(r) = &mut self.resync {
             r.skipped += 1;
         }
     }
 
-    // A frame locks at `consumed`. A fresh PTS there ends the run exactly; otherwise the byte
-    // estimate advances the clock, never past a timestamp already buffered after the lock.
-    fn end_resync(&mut self, consumed: usize) {
-        self.drop_counted = false;
-        let fresh = self.buf.facts_at(consumed).presentation_ns();
-        let lost_ns = self.settle_run(fresh.filter(|&p| self.anchor != Some(p)));
-        if lost_ns == 0 {
-            return;
-        }
-        self.next_pts = self.next_pts.saturating_add(lost_ns);
-        let next = self
-            .buf
-            .marks_snapshot()
-            .into_iter()
-            .find_map(|(at, f)| (at > consumed).then_some(f.presentation_ns()).flatten());
-        if let (Some(q), Some((_, d))) = (next, self.last_frame) {
-            self.next_pts = self.next_pts.min(q.saturating_sub(d as i64));
+    // I2: can the run's bytes hold the AUs from its start to timestamp `p`? Without a measured
+    // frame (none kept yet) nothing can be checked, so a new timestamp ends the run instead.
+    fn holds(&self, r: &Resync, p: i64) -> bool {
+        let (Some(start), Some((_, d))) = (r.start, self.last_frame) else {
+            return false;
+        };
+        let n = (p.saturating_sub(start) + d as i64 / 2).div_euclid(d.max(1) as i64);
+        p >= start && n <= self.cap(r.skipped)
+    }
+
+    fn cap(&self, skipped: usize) -> i64 {
+        (skipped / self.sync.min_frame.max(1) + 1) as i64
+    }
+
+    fn warn_jump(&mut self, p: i64) {
+        if !std::mem::replace(&mut self.jump_warned, true) {
+            tracing::warn!(target: "mux", pts_ns = p, "audio timestamp jump beyond the lost bytes; treated as a discontinuity");
         }
     }
 
-    // Close any open run and count its lost AUs (the first was the verified drop, the rest are
-    // collateral): exactly from timestamps when it ends at `end` with a known start, else skipped
-    // bytes over the mean kept frame size (at least one). Returns the clock advance to apply.
-    fn settle_run(&mut self, end: Option<i64>) -> i64 {
-        let (Some(r), Some((_, duration))) = (self.resync.take(), self.last_frame) else {
-            return 0;
+    // Mean kept frame size for the stream key (the minimum legal size before any frame).
+    fn yardstick(&self) -> usize {
+        ((self.sizes.1 / self.sizes.2.max(1)) as usize).max(self.sync.min_frame.max(1))
+    }
+
+    fn by_bytes(&self, bytes: usize) -> i64 {
+        Self::div_round(bytes, self.yardstick())
+    }
+
+    fn div_round(bytes: usize, y: usize) -> i64 {
+        let y = y.max(1);
+        ((bytes + y / 2) / y) as i64
+    }
+
+    // AUs between a recorded mid-run PTS and `skipped`, sized by the run's own AUs where the
+    // PTS measured them (its bytes before `p` over the AUs `p` implies), else by the mean.
+    fn after_mid(&self, r: &Resync, p: i64, s0: usize, start: i64, d: i64) -> (i64, i64) {
+        let n = (p - start + d / 2).div_euclid(d);
+        // VBR spans about 10x, so an implied size below a tenth of the mean is not believed.
+        let floor = self.yardstick() / 10;
+        let y = if n > 0 {
+            (s0 / n as usize).max(floor)
+        } else {
+            self.yardstick()
         };
-        let d = duration.max(1) as i64;
-        let lost = match (end, r.start) {
-            (Some(end), Some(start)) => (end.saturating_sub(start) + d / 2).div_euclid(d).max(0),
-            _ => {
-                let mean = (self.sizes.1 / self.sizes.2.max(1)).max(1) as usize;
-                ((r.skipped + mean / 2) / mean).max(1) as i64
-            }
-        };
-        for _ in 1..lost {
-            self.tally
-                .record_collateral_drop(self.next_pts, 0, 0, "resync-lost");
+        (n, Self::div_round(r.skipped - s0, y))
+    }
+
+    // AUs the run lost by its bytes: exact up to a recorded mid-run PTS, estimated after it.
+    // At least one (the verified fault) and at most what the bytes hold (I2).
+    fn lost_by_bytes(&self, r: &Resync) -> i64 {
+        if self.sizes.2 == 0 {
+            return 1; // no kept frame to measure by: only the verified fault is known
         }
-        // A byte estimate needs a running clock (a fresh PTS re-anchors the clock anyway).
-        if r.advance { lost.saturating_mul(d) } else { 0 }
+        let n = match (r.mid, r.start, self.last_frame) {
+            (Some((p, s0)), Some(start), Some((_, d))) => {
+                let (before, after) = self.after_mid(r, p, s0, start, d.max(1) as i64);
+                before + after
+            }
+            _ => self.by_bytes(r.skipped),
+        };
+        n.clamp(1, self.cap(r.skipped))
+    }
+
+    // Place the frame locking at `consumed` after a run, or `None` to wait. A PES starting
+    // here names it by its PTS; otherwise the next buffered PTS `q` fixes it at q - k frames,
+    // k counted by walking headers (I4). With neither, only EOS or a gap may estimate (I3).
+    fn place_lock(&self, consumed: usize, eos: bool) -> Option<Placed> {
+        let r = self.resync.as_ref()?;
+        let data = &self.buf.as_slice()[consumed..];
+        let d_lock = (self.sync.frame_ns)(data).unwrap_or(0) as i64;
+        let fresh = self
+            .buf
+            .facts_at(consumed)
+            .presentation_ns()
+            .filter(|&p| self.anchor != Some(p) && r.mid.map(|m| m.0) != Some(p));
+        let next = self.buf.marks_snapshot().into_iter().find_map(|(at, f)| {
+            (at > consumed)
+                .then(|| f.presentation_ns().map(|q| (q, at - consumed)))
+                .flatten()
+        });
+        let d = self.last_frame.map_or(d_lock, |l| l.1 as i64).max(1);
+        // An estimate adds clock slots only with a clock before the run or a mid-run PTS; only
+        // then must it wait. TS/PS carry a PTS at least every 0.7 s, far inside MAX_HOLD; past
+        // it (non-conformant) the lock takes the fewest slots possible, which cannot overshoot.
+        let adds_slots = r.advance || r.mid.is_some();
+        let exact = match (fresh, next) {
+            (Some(p), _) => Some(p),
+            (None, Some((q, end))) => Some(q - self.frames_before(data, end) * d_lock),
+            (None, None) if eos || !adds_slots => None,
+            (None, None) if data.len() > MAX_HOLD => {
+                let stamp = r.mid.map_or(r.start.unwrap_or(self.next_pts) + d, |m| m.0);
+                return Some(Placed {
+                    stamp,
+                    lost: self.lost_by_bytes(r) as u64,
+                    exact: false,
+                });
+            }
+            (None, None) => return None,
+        };
+        if let Some(stamp) = exact {
+            return Some(match r.start {
+                Some(start) if stamp >= start => {
+                    let n = (stamp - start + d / 2).div_euclid(d);
+                    if n <= self.cap(r.skipped) {
+                        Placed {
+                            stamp,
+                            lost: n as u64,
+                            exact: true,
+                        }
+                    } else {
+                        Placed {
+                            stamp,
+                            lost: self.lost_by_bytes(r) as u64,
+                            exact: false,
+                        }
+                    }
+                }
+                // No clock before the run, or a timestamp behind it: I3 keeps the clock.
+                Some(start) => Placed {
+                    stamp: start,
+                    lost: self.lost_by_bytes(r) as u64,
+                    exact: false,
+                },
+                None => Placed {
+                    stamp,
+                    lost: self.lost_by_bytes(r) as u64,
+                    exact: false,
+                },
+            });
+        }
+        // EOS or gap. Limit (I5): with a mid-run PTS, the bytes after it (sized by the run's own
+        // AUs) decide between a corrupt AU and a carried fragment; off by one slot only when that
+        // stretch strays over half the run's AU size, and only for a run cut by EOS or a gap.
+        let stamp = match (r.mid, r.start) {
+            (Some((p, s0)), Some(start)) => p + self.after_mid(r, p, s0, start, d).1 * d,
+            (Some((p, s0)), None) => p + self.by_bytes(r.skipped - s0) * d,
+            (None, Some(start)) if r.advance => start + self.by_bytes(r.skipped).max(1) * d,
+            (None, start) => start.unwrap_or(self.next_pts),
+        };
+        Some(Placed {
+            stamp,
+            lost: self.lost_by_bytes(r) as u64,
+            exact: false,
+        })
+    }
+
+    // Frames starting in `data[..end]`: walked by header, the rest estimated by bytes.
+    fn frames_before(&self, data: &[u8], end: usize) -> i64 {
+        let (mut pos, mut k) = (0, 0);
+        while pos < end {
+            let Some(n) = data.get(pos..).and_then(self.sync.frame_len) else {
+                return k + self.by_bytes(end - pos);
+            };
+            pos += n;
+            k += 1;
+        }
+        k
+    }
+
+    // The lock is placed: count the run (the first lost AU was the verified fault), and stamp.
+    fn end_run(&mut self, consumed: usize, p: Placed) -> PesFacts {
+        self.resync = None;
+        let d = self.last_frame.map_or(0, |l| l.1);
+        let dur = if p.exact { d } else { 0 };
+        if p.exact && p.lost > 0 {
+            self.tally.add_dropped_duration(d);
+        }
+        for _ in 1..p.lost {
+            self.tally
+                .record_collateral_drop(p.stamp, dur as i64, 0, "resync-lost");
+        }
+        let facts = self.buf.facts_at(consumed);
+        if let Some(pts) = facts.presentation_ns() {
+            self.anchor = Some(pts);
+        }
+        self.next_pts = p.stamp;
+        facts
+    }
+
+    // Close a run no frame ended (EOS, a gap, a timestamp jump): count it by its bytes.
+    fn settle_run(&mut self) {
+        if let Some(r) = self.resync.take() {
+            for _ in 1..self.lost_by_bytes(&r) {
+                self.tally
+                    .record_collateral_drop(self.next_pts, 0, 0, "resync-lost");
+            }
+        }
     }
 
     // Running mean of kept frame sizes, restarted when the stream key changes.
@@ -365,7 +544,7 @@ impl AudioFrames {
         } else {
             Vec::new()
         };
-        self.settle_run(None);
+        self.settle_run();
         self.buf.clear();
         self.tally.log_summary();
         frames
@@ -385,6 +564,8 @@ mod tests {
                 mask: 0xf0,
                 frame_len: |_| None,
                 fixed: |_| 0,
+                frame_ns: |_| None,
+                min_frame: 7,
             },
         );
         while !af.tally.is_poisoned() {
