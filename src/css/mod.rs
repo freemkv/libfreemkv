@@ -790,6 +790,37 @@ mod tests {
         }
     }
 
+    // A pack of `lead` (a packet with no PES header) then one video PES whose flags byte is
+    // `flags`: the offset of that byte, and the pack.
+    fn pack_after(lead: &[u8], flags: u8) -> (usize, Vec<u8>) {
+        let mut s = vec![0u8; 2048];
+        s[..14].copy_from_slice(&[0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8]);
+        s[14..14 + lead.len()].copy_from_slice(lead);
+        let pes = 14 + lead.len();
+        s[pes..pes + 4].copy_from_slice(&[0, 0, 1, 0xE0]);
+        let len = (2048 - pes - 6) as u16;
+        s[pes + 4..pes + 6].copy_from_slice(&len.to_be_bytes());
+        s[pes + 6] = flags;
+        (pes + 6, s)
+    }
+
+    // B-1: a pack that begins with a program stream map (no PES header, MS-31) is judged by
+    // the PES after it: clear stays clear, scrambled is found at its own flags byte.
+    #[test]
+    fn a_map_first_pack_is_judged_by_the_pes_after_it() {
+        // A PSM whose byte at 0x14 (current_next_indicator, version) reads as "scrambled".
+        let psm = [0, 0, 1, 0xBC, 0, 10, 0xE0, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
+        let (_, clear) = pack_after(&psm, 0x81);
+        assert_eq!(ps_scrambled_at(&clear), None, "clear");
+        let (at, scrambled) = pack_after(&psm, 0x91);
+        assert_eq!(ps_scrambled_at(&scrambled), Some(at), "scrambled");
+        // Every stream_id with no PES header (MS-31), and the system header, is walked past.
+        for id in [0xBB, 0xBC, 0xBE, 0xBF, 0xF0, 0xF1, 0xF2, 0xF8, 0xFF] {
+            let lead = [0, 0, 1, id, 0, 4, 0xB0, 0xB0, 0xB0, 0xB0];
+            assert_eq!(ps_scrambled_at(&pack_after(&lead, 0x81).1), None, "{id:#x}");
+        }
+    }
+
     // D3: on the disc/ISO path a scrambled 13818-1 pack is detected and descrambled whatever
     // its pack_stuffing_length (libdvdcss reads 0x14 regardless); only mpg:// files are strict.
     #[test]

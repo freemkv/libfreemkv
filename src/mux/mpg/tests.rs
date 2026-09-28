@@ -1722,6 +1722,26 @@ fn read_video(file: &[u8], tag: &str) -> Result<Vec<u8>, Option<u16>> {
     .map_err(|e| crate::error::error_code(&e))
 }
 
+// B-1: a clear file whose first pack begins with a program stream map (byte 0x14 holds the
+// map's version byte) opens, and reads back unchanged.
+#[test]
+fn a_clear_file_opening_with_a_map_opens() {
+    let (body, es) = clear_ps(false, 0);
+    let e = [pack::PsmEntry {
+        stream_type: 0x02,
+        stream_id: 0xE0,
+        descriptors: vec![],
+    }];
+    let map = pack::psm(&[], &e).unwrap();
+    let mut first = pack::pack_header(0, 25_200, 0);
+    first.extend_from_slice(&map);
+    first.extend(pack::padding_pes(pack::PACK_BYTES - first.len()));
+    assert!(first[0x14] & 0x30 != 0, "fixture: 0x14 reads as scrambled");
+    let file = [first, body].concat();
+    let video = read_video(&file, "map-first").map(|v| v.len());
+    assert_eq!(video, Ok(es.len()));
+}
+
 // m1: an MPEG-2 file whose scrambled packs are all stuffed is judged by the flags where its
 // stuffing puts them: descrambled, or refused with E7023, never muxed as ciphertext.
 #[test]
