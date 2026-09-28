@@ -98,9 +98,21 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// The key set's on-arrival proof for pieces `resolve` could not prove up front
     /// (KU §2.4). `None` for every reader not built by a `ResolvedKeySet`.
     arrival: Option<Box<crate::keys::Arrival>>,
-    /// The unit base a read has proven to be the file's grid (intact units in majority), so
-    /// damaged units read later on it are holes, not a grid failure.
-    grid_proven: Option<u32>,
+    /// Damaged AACS units blanked so far (see [`blanked_units`](Self::blanked_units)).
+    blanked: BlankTally,
+}
+
+// The blanked-unit count, shared with the stream that reports it as loss; logged once when
+// the reader is dropped, so a damaged rip never reads as clean.
+struct BlankTally(Arc<std::sync::atomic::AtomicU64>);
+
+impl Drop for BlankTally {
+    fn drop(&mut self) {
+        let n = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            tracing::warn!(target: "freemkv::decrypt", units = n, "{n} damaged AACS units blanked");
+        }
+    }
 }
 
 /// Does the sector span `[lba, lba+count)` intersect any encrypted-content range?
@@ -124,7 +136,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             content_ranges: None,
             key_map: None,
             arrival: None,
-            grid_proven: None,
+            blanked: BlankTally(Arc::default()),
         }
     }
 
@@ -186,7 +198,12 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// Damaged AACS units this reader blanked (zero-filled) so far: flagged units no key can
     /// open, read damage the rip carries on past.
     pub fn blanked_units(&self) -> u64 {
-        0
+        self.blanked.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The shared blanked-unit counter, for a stream that reports it after this reader moves.
+    pub(crate) fn blanked_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.blanked.0.clone()
     }
 
     /// Borrow the inner source. Useful for tests and for adapters
@@ -278,9 +295,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
 
-        // Read damage before any key sees the units: a damaged seed is a hole, never a key
-        // verdict (E7013 here, E7022 on arrival). "We rip bad discs."
-        self.hole_damage(lba, &mut buf[..n], content_ref)?;
+        // Read damage before any key sees the units: a damaged unit is blanked and counted,
+        // never a key verdict (E7013 here, E7022 on arrival). "We rip bad discs."
+        self.blank_damage(lba, &mut buf[..n], content_ref);
 
         // KU §2.4: units of a piece left unproven are proven now, from the held keys only.
         if let (Some(arrival), DecryptKeys::Aacs { unit_keys, .. }) =
@@ -320,16 +337,11 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
-    // Hole the damaged AACS units of a read at `lba` (see `decrypt::hole_damaged_units`):
-    // judged are content units the map keys or the on-arrival proof covers.
-    fn hole_damage(
-        &mut self,
-        lba: u32,
-        buf: &mut [u8],
-        content: Option<&[(u32, u32)]>,
-    ) -> Result<()> {
+    // Blank and count the damaged AACS units of a read at `lba` (see
+    // `decrypt::blank_damaged_units`): judged are content units the map keys or arrival covers.
+    fn blank_damage(&mut self, lba: u32, buf: &mut [u8], content: Option<&[(u32, u32)]>) {
         let DecryptKeys::Aacs { format, .. } = self.keys else {
-            return Ok(());
+            return;
         };
         let (map, arrival) = (self.key_map.as_deref(), self.arrival.as_deref());
         let covered = |at: u32| {
@@ -337,11 +349,10 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                 && (map.is_some_and(|m| m.entry_for(at).is_some())
                     || arrival.is_some_and(|a| a.covers(at)))
         };
-        let proven = self.unit_base.is_some() && self.grid_proven == self.unit_base;
-        if crate::decrypt::hole_damaged_units(buf, lba, format, proven, &covered)? {
-            self.grid_proven = self.unit_base;
-        }
-        Ok(())
+        let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered);
+        self.blanked
+            .0
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

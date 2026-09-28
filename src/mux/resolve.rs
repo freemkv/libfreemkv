@@ -1964,6 +1964,7 @@ fn iso_pipeline_tail(
     }
     crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
     decrypting.clear_unit_base();
+    let blanked = decrypting.blanked_counter();
 
     let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
         decrypting,
@@ -1988,7 +1989,8 @@ fn iso_pipeline_tail(
     .map_err(|e| -> io::Error { e.into() })?;
     Ok(
         PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
-            .with_halt(halt),
+            .with_halt(halt)
+            .with_blanked(blanked),
     )
 }
 

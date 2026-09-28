@@ -1302,7 +1302,14 @@ fn extract_tree_blanks_clustered_damage() {
         ..Default::default()
     };
     let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
-    assert!(res.complete);
+    assert!(
+        !res.halted && res.files.iter().all(|f| f.complete),
+        "every file is written"
+    );
+    assert!(
+        !res.complete,
+        "a folder with blanked units is not reported clean"
+    );
     assert_eq!(res.bytes_unreadable, 3 * ALIGNED_UNIT_LEN as u64);
     let got = std::fs::read(dest.path().join("BDMV/STREAM/00002.m2ts")).unwrap();
     let mut want = fx.plain(fx.file(1).0, 10);

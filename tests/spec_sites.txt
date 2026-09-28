@@ -8,10 +8,10 @@ src/decrypt.rs	apply_aacs_map	KS-3
 src/decrypt.rs	apply_aacs_map	KS-5
 src/decrypt.rs	apply_aacs_map	KS-25
 src/decrypt.rs	apply_aacs_map	KS-26
-src/decrypt.rs	hole_damaged_units	KS-2
-src/decrypt.rs	hole_damaged_units	KS-3
-src/decrypt.rs	hole_damaged_units	KS-4
-src/decrypt.rs	hole_damaged_units	KS-22
+src/decrypt.rs	blank_damaged_units	KS-2
+src/decrypt.rs	blank_damaged_units	KS-3
+src/decrypt.rs	blank_damaged_units	KS-4
+src/decrypt.rs	blank_damaged_units	KS-22
 src/mux/resolve.rs	probe_fmts_index_keys	KS-25
 src/mux/resolve.rs	probe_fmts_index_keys	KS-26
 src/disc/mod.rs	declared_cps_units	KS-14

@@ -710,6 +710,7 @@ fn extract_one_file<S: SectorSource>(
             let batch = whole_unit_batch(sectors - sector_off);
             let want = batch as usize * SECTOR_BYTES;
             let start = abs_lba.checked_add(sector_off);
+            let blanked_before = dec.blanked_units();
             let read_ok = match start.filter(|l| l.checked_add(batch - 1).is_some()) {
                 // Crafted extent past u32::MAX: no such sector — a hole, not a wrapped read.
                 None => false,
@@ -726,7 +727,13 @@ fn extract_one_file<S: SectorSource>(
             let usable = chunk_bytes.min(remaining) as usize;
             if read_ok {
                 write_all(&mut writer, &buf[..usable], &partial_path)?;
-                fr.bytes_good = fr.bytes_good.saturating_add(usable as u64);
+                // Damaged AACS units the reader blanked are unreadable, not good bytes.
+                let unit = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
+                let blanked = (dec.blanked_units() - blanked_before) * unit;
+                let blanked = blanked.min(usable as u64);
+                fr.bytes_good = fr.bytes_good.saturating_add(usable as u64 - blanked);
+                fr.bytes_unreadable = fr.bytes_unreadable.saturating_add(blanked);
+                *done_unreadable = done_unreadable.saturating_add(blanked);
             } else {
                 // Bad sector(s): zero-fill this byte range, record the hole,
                 // keep going (no abort, no sweep-skip).

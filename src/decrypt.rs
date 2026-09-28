@@ -455,10 +455,10 @@ fn apply_aacs_map(
             }
             return;
         };
-        // Off-grid guard: a real unit's clear seed carries its sync byte, so a flagged
-        // chunk without it was cut across two units (wrong unit base) — fail loud.
+        // A flagged unit whose seed lacks its sync (damage, or a read cut off its grid) opens
+        // under no key: blanked, never refused (`blank_damaged_units`, which readers run first).
         if !aacs::content::aacs_unit_on_grid(chunk, format) {
-            verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            chunk.fill(0);
             return;
         }
         // PHASE GATE (FMTS forensic segment): the segment interleaves two variants
@@ -526,81 +526,60 @@ fn apply_aacs_map(
     Ok(())
 }
 
-/// Intact flagged units that prove a read sits on its file's unit grid, at least and in
-/// majority over damaged ones: a read cut off the grid shows sync on ~1 in 256 units.
-const GRID_WITNESS_UNITS: usize = 2;
-
-/// Turn the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid) into
-/// holes (zeros, like a sweep's unread sector), never a key verdict. Damaged: flagged (CPI) with
-/// no TS sync in the seed, or a zero-filled first sector over a non-TS rest; no key opens
-/// either. Only units `covered` (keyed or proven on arrival) are judged. Two or more flagged
-/// units without sync and no grid witness, here or earlier on this base (`grid_proven`), cannot
-/// be told from a read cut off its grid: that stays E7013. Returns whether this read proved it.
-pub(crate) fn hole_damaged_units(
+/// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
+/// zero-fill them, like a sweep's unread sector, and return how many. Damaged: flagged (CPI)
+/// with no TS sync in the seed, or a zero-filled first sector over a non-TS rest. No key opens
+/// either, so it is read damage, never a key verdict and never E7013, whether the unit is
+/// alone, in a cluster, or a read cut off its grid (1.7.7 muxed through all three). Only units
+/// `covered` (keyed or proven on arrival) are judged. A garbage seed that keeps 0x47 at byte 4
+/// (~1 in 256) is not caught here: it decrypts as garbage, or on arrival reads as unopened.
+pub(crate) fn blank_damaged_units(
     buf: &mut [u8],
     base_lba: u32,
     format: crate::disc::ContentFormat,
-    grid_proven: bool,
     covered: &dyn Fn(u32) -> bool,
-) -> Result<bool, crate::error::Error> {
+) -> usize {
     if format != crate::disc::ContentFormat::BdTs {
-        return Ok(false);
+        return 0;
     }
     let unit_len = aacs::content::ALIGNED_UNIT_LEN;
-    let mut synced = 0usize;
-    let (mut damaged, mut zero_headed) = (Vec::new(), Vec::new());
+    let mut damaged = Vec::new();
     for (i, unit) in buf.chunks_exact(unit_len).enumerate() {
         let lba = base_lba.saturating_add(i as u32 * aacs::content::ALIGNED_UNIT_SECTORS);
         if !covered(lba) {
             continue;
         }
-        if !aacs::content::aacs_unit_seed_encrypted(unit, format) {
+        let lost = if aacs::content::aacs_unit_seed_encrypted(unit, format) {
+            // KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed";
+            // KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport
+            // packet", so an intact seed carries the TS sync at byte 4 (KS-22 corroborates).
+            !aacs::content::aacs_unit_on_grid(unit, format)
+        } else {
             // A zero-filled head took the seed (KS-4); a non-zero rest that is not TS is
             // ciphertext no key opens. A trailing zero run keeps its head and decrypts.
             let (head, rest) = unit.split_at(crate::consts::SECTOR_BYTES);
-            if head.iter().all(|&b| b == 0)
+            head.iter().all(|&b| b == 0)
                 && rest.iter().any(|&b| b != 0)
                 && !aacs::content::is_clean(unit, format)
-            {
-                zero_headed.push(i);
-            }
-            continue;
-        }
-        // KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed";
-        // KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport
-        // packet", so an intact seed carries the TS sync at byte 4 (KS-22 corroborates).
-        if aacs::content::aacs_unit_on_grid(unit, format) {
-            synced += 1;
-        } else {
+        };
+        if lost {
             damaged.push(i);
         }
     }
-    let proven_here = synced >= GRID_WITNESS_UNITS && synced > damaged.len();
-    if damaged.len() >= GRID_WITNESS_UNITS && !(grid_proven || proven_here) {
-        tracing::error!(
-            target: "freemkv::decrypt",
-            lba = base_lba,
-            damaged = damaged.len(),
-            code = crate::error::E_DECRYPT_FAILED,
-            "flagged units lack the TS sync and nothing proves the unit grid: read cut off its grid"
-        );
-        return Err(crate::error::Error::DecryptFailed);
-    }
     // KS-3 [BD] §3.10.1: "A new CBC cipher chain is started for each Aligned Unit", so the
     // loss is this unit alone.
-    damaged.extend(zero_headed);
     for &i in &damaged {
         buf[i * unit_len..(i + 1) * unit_len].fill(0);
     }
-    if let Some(&first) = damaged.iter().min() {
+    if let Some(&first) = damaged.first() {
         tracing::warn!(
             target: "freemkv::decrypt",
             lba = base_lba.saturating_add(first as u32 * aacs::content::ALIGNED_UNIT_SECTORS),
             units = damaged.len(),
-            "unit seed damaged (no key can open it): read damage, left as a hole"
+            "damaged AACS unit (no key can open it): blanked, the rip carries on"
         );
     }
-    Ok(proven_here)
+    damaged.len()
 }
 
 /// Decrypt a buffer of sectors in-place — the CSS / clear path only.

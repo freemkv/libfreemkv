@@ -1068,6 +1068,7 @@ impl crate::pes::Stream for DiscStream {
         // here rather than at each of three `admit` call sites (one place can't
         // drift); `dropped_total` catches gaps that RESOLVE, which most do.
         self.errors
+            + self.reader.blanked_units()
             + self
                 .resync
                 .iter()
@@ -1076,10 +1077,10 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn lost_bytes(&self) -> u64 {
-        // Read-error zero-fill loss only — the abort gate needs real missing
-        // content. No decrypt-loss term: undecryptable units pass through as
-        // broken TS (the muxer's concern), indistinguishable from bad authoring.
-        self.lost_bytes
+        // Read-error zero-fill plus the damaged AACS units the reader blanked (one whole
+        // aligned unit each): both are real missing content.
+        let unit = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
+        self.lost_bytes + self.reader.blanked_units() * unit
     }
 }
 

@@ -3928,9 +3928,16 @@ mod tests {
             });
             let (iso, live) = (iso.expect("iso"), live.expect("live"));
             assert!(iso.completed && live.completed, "phase {phase}");
+            // Blanked: the garbage head, and each run end that zero-filled a unit's head sector
+            // but not its tail (a lost seed over ciphertext). A run start keeps its head.
+            let lost_seeds = RUNS
+                .iter()
+                .filter(|&&(at, n)| (at - phase + n) % 3 != 0)
+                .count();
+            let want = (1 + lost_seeds as u64) * 6144;
             assert_eq!(
-                iso.lost_bytes, 6144,
-                "phase {phase}: the garbage head is counted"
+                iso.lost_bytes, want,
+                "phase {phase}: blanked units are counted"
             );
             assert_eq!(live.lost_bytes, iso.lost_bytes, "phase {phase}");
         }
