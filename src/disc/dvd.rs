@@ -245,7 +245,7 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
         .zip(t.ast_ctl)
         .any(|(_, c)| ifo::audio_stream_number(c).is_some());
     if !any_present && !declared.is_empty() {
-        let outcome = "positional sub-stream ids";
+        let outcome = "positional routing (codec base | position)";
         crate::diag::dvd_ctl_none_present("ast", ts.vts_number, title, declared.len(), outcome);
     }
     let mut kept: Vec<(u16, &str)> = Vec::new();
@@ -652,8 +652,8 @@ mod tests {
             vec![(0xBD80, "eng".to_string()), (0xBD89, "fra".to_string())]
         );
         assert!(
-            diag.iter()
-                .any(|m| m.contains("tag=dvd.astctl") && m.contains("declared=2 present=0")),
+            diag.iter().any(|m| m.contains("tag=dvd.astctl")
+                && m.contains("declared=2 present=0 -> positional routing")),
             "{diag:?}"
         );
     }
