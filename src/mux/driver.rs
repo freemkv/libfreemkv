@@ -698,9 +698,15 @@ fn drive_mux(
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
-    // A sink may refuse a stream at open (m2ts: LPCM BD LPCM can't carry); the
-    // opened title lists only what will be written.
-    let refused = output_stream.undelivered_streams();
+    // A sink may refuse a stream at open (m2ts: LPCM BD LPCM can't carry), and a sink with no
+    // mapping never writes an MPEG-2 extension track (reported lost only once its packets
+    // arrive); the opened title lists only what will be written.
+    let mut refused = output_stream.undelivered_streams();
+    if drops_mp2_extensions(dest_url) {
+        refused.extend((out_title.streams.iter().enumerate()).filter_map(|(i, s)| {
+            matches!(s, crate::disc::Stream::Audio(a) if a.is_mp2_extension()).then_some(i)
+        }));
+    }
     if refused.is_empty() {
         events.on_output_opened(&out_title);
     } else {
@@ -891,6 +897,19 @@ fn collect_late_configs(stream: &dyn Stream, pending: &mut Vec<usize>, out: &Lat
         }
         None => true,
     });
+}
+
+// Sinks that never write a DVD MPEG-2 multichannel extension track (no mapping for 13818-3
+// `ext_frame`s); the FMKV wire (network://, stdio://) carries it.
+fn drops_mp2_extensions(dest_url: &str) -> bool {
+    matches!(
+        parse_url(dest_url),
+        StreamUrl::Mkv { .. }
+            | StreamUrl::Mp4 { .. }
+            | StreamUrl::M2ts { .. }
+            | StreamUrl::Demux { .. }
+            | StreamUrl::Audio { .. }
+    )
 }
 
 // What the write consumer hands back once the container is finalised.
@@ -2613,6 +2632,40 @@ mod tests {
         assert_eq!(out.undelivered_streams, vec![1]);
         let opened = spy.0.lock().unwrap().clone().unwrap();
         assert_eq!(opened.streams.len(), 1, "only the carried track is listed");
+    }
+
+    /// A declared MPEG-2 extension track that a sink can never write is not in the opened title
+    /// (CLI and GUI list the same streams), and with no `0xD0|n` packet nothing is reported lost.
+    #[test]
+    fn mkv_opened_title_omits_a_declared_mp2_extension_without_warning() {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("mkv://{}", dir.path().join("o.mkv").display());
+        let mut src = LpcmSource::new(AudioChannels::Stereo, SampleRate::S48, None);
+        src.info.streams.push(Stream::Audio(AudioStream {
+            pid: 0x00D0,
+            codec: Codec::Mp2,
+            channels: AudioChannels::Unknown,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: crate::disc::MP2_EXTENSION_LABEL.into(),
+        }));
+        let spy = TitleSpy::default();
+        let (out, ev) = crate::testlog::capture(|| run(src, &url, &spy));
+        let opened = spy.0.lock().unwrap().clone().unwrap();
+        assert!(
+            !opened
+                .streams
+                .iter()
+                .any(|s| matches!(s, Stream::Audio(a) if a.is_mp2_extension())),
+            "{:?}",
+            opened.streams
+        );
+        assert_eq!(opened.streams.len(), 1);
+        assert!(out.undelivered_streams.is_empty());
+        assert_eq!(mp2_extension_warnings(&ev), 0);
     }
 
     // The sink lives in the consumer thread and is destroyed with it, so an
