@@ -1560,3 +1560,75 @@ fn fmts_segment_without_its_index_key_refuses() {
     );
     assert_eq!(code(r), E7026);
 }
+
+// Counts full-recovery (ECC) reads through to the source.
+#[derive(Clone)]
+struct RecoveryCount(Faulty, Arc<Mutex<u32>>);
+
+impl SectorSource for RecoveryCount {
+    fn capacity_sectors(&self) -> u32 {
+        self.0.capacity_sectors()
+    }
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+        if r {
+            *self.1.lock().unwrap() += 1;
+        }
+        self.0.read_sectors(lba, count, buf, r)
+    }
+}
+
+/// KU §2.4, §6 (review item 2): the on-arrival loud stop on the live inline reader is E7022
+/// at once, in both skip modes: never shrunk and retried, never an ECC recovery read,
+/// never zero-filled as a bad sector.
+#[test]
+fn live_stream_stops_on_an_unkeyed_piece_without_recovery() {
+    use crate::pes::Stream;
+    for skip in [true, false] {
+        let (fx, set, src) = lazy_b(&[K1]);
+        let recovery = Arc::new(Mutex::new(0u32));
+        let reader = RecoveryCount(src, recovery.clone());
+        let mut stream = crate::mux::DiscStream::new(
+            Box::new(reader),
+            fx.disc.titles[0].clone(),
+            set.decrypt_keys(),
+            30,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap()
+        .with_key_map(set.key_map())
+        .with_arrival(set.arrival(set.title_stop()).expect("B is Lazy"));
+        stream.skip_errors = skip;
+        let got = loop {
+            match stream.read() {
+                Ok(Some(_)) => continue,
+                other => break other,
+            }
+        };
+        let err = got.expect_err("an unkeyed readable unit stops the mux");
+        assert_eq!(crate::error_code(&err), Some(E7022), "skip={skip}: {err}");
+        assert_eq!(
+            *recovery.lock().unwrap(),
+            0,
+            "skip={skip}: no ECC recovery read"
+        );
+        assert_eq!(
+            (stream.errors(), stream.lost_bytes()),
+            (0, 0),
+            "skip={skip}"
+        );
+    }
+}
+
+/// Review item 1 (guard): the status counts keyed pieces and proven keys from the pieces
+/// themselves, so a whole-disc resolve over a disc with no scanned titles (FK9's fixture)
+/// still reports its keyed stream file: (keyed, proven) = (1, 1).
+#[test]
+fn whole_disc_status_counts_keyed_files_without_titles() {
+    let fx = fixture(&[stream(1, 10, Some(K1))], 1, &[]);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let s = set.status();
+    assert_eq!((s.keyed, s.proven, s.lazy), (1, 1, 0), "{s:?}");
+}
