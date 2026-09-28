@@ -11,6 +11,14 @@ use super::meta;
 use crate::disc::{DiscTitle, Stream as DiscStream};
 use std::io::{self, Write};
 
+/// The BD LPCM header an `m2ts://` sink re-packs an LPCM track with, or `None` when BD
+/// LPCM cannot carry its layout/rate and `create` leaves the track out. Shared with the
+/// pre-mux plan ([`super::fit::fit_report`]) so the two cannot disagree.
+pub(crate) fn lpcm_bd_header(a: &crate::disc::AudioStream, cp: Option<&[u8]>) -> Option<[u8; 2]> {
+    let src = cp.and_then(super::codec::lpcm::layout_byte);
+    super::codec::lpcm::bd_header(a.channels.count(), a.sample_rate.hz() as u32, src)
+}
+
 /// BD transport stream write sink with embedded FMKV metadata
 /// header.
 pub struct M2tsStream {
@@ -43,12 +51,7 @@ impl M2tsStream {
             }
             let lpcm = match s {
                 DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => {
-                    let src = cp.as_deref().and_then(super::codec::lpcm::layout_byte);
-                    let h = super::codec::lpcm::bd_header(
-                        a.channels.count(),
-                        a.sample_rate.hz() as u32,
-                        src,
-                    );
+                    let h = lpcm_bd_header(a, cp.as_deref());
                     if h.is_none() {
                         tracing::warn!(
                             target: "mux",

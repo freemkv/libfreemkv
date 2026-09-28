@@ -228,6 +228,8 @@ pub use mux::StdioStream;
 #[cfg(feature = "rip")]
 pub use mux::WriteSeek;
 #[cfg(feature = "rip")]
+pub use mux::{FitReport, SkipReason, fit_report};
+#[cfg(feature = "rip")]
 pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 #[cfg(feature = "rip")]
 pub use mux::{Medium, SourceInfo};

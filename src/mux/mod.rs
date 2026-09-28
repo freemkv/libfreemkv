@@ -53,6 +53,7 @@ pub(crate) mod meta_sink;
 // ── Sequential-sink muxers ── write-only PES → `SequentialSink`. `pub(crate)`+
 // `allow(dead_code)`: `fmp4` is a STUB (pub would lock a half-built type into
 // v1.0); `m2ts_mux`/`hevc` are sink-split scaffolding (production: `tsmux`/`mkv`).
+pub(crate) mod fit;
 #[allow(dead_code)]
 pub(crate) mod fmp4;
 #[allow(dead_code)]
@@ -85,6 +86,7 @@ pub use disc::DiscStream;
 pub use driver::{
     MuxEvents, MuxInput, MuxOptions, MuxOutcome, MuxSource, mux_stream, mux_with_keys,
 };
+pub use fit::{FitReport, SkipReason, fit_report};
 pub use m2ts::M2tsStream;
 pub use mkvstream::{
     MkvProbe, MkvProbeTrack, MkvStream, MkvTrackKind, parse_freemkv_version, probe_mkv,
