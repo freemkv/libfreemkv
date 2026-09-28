@@ -1122,11 +1122,32 @@ mod tests {
         t
     }
 
+    fn ext_frame() -> PesFrame {
+        PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 1,
+            pts: 0,
+            keyframe: true,
+            // 13818-3 2nd ed. §2.5.2.10: "ext_syncword - A 12 bit string '0111 1111 1111'".
+            data: vec![0x7F, 0xF0, 0x00],
+            duration_ns: None,
+        }
+    }
+
+    fn mp2_extension_warnings(ev: &[crate::testlog::CapturedEvent]) -> usize {
+        (ev.iter())
+            .filter(|e| e.level == tracing::Level::WARN)
+            .filter(|e| e.message().contains("MPEG-2 multichannel extension"))
+            .count()
+    }
+
     /// Guard (mpg design §7): every sink but mpg/network/stdio lists an MPEG-2 multichannel
-    /// extension track as excluded, so the lost surround is never silent. Matroska, MP4 and
-    /// BD-TS define no mapping for 13818-3 extension frames.
+    /// extension track as excluded once its packets arrive, so lost surround is never silent;
+    /// IFO coding mode 3 alone (no `0xD0|n` packet) gives no warning and no note.
     #[test]
-    fn every_sink_that_cannot_store_an_mp2_extension_reports_it() {
+    fn every_sink_that_cannot_store_an_mp2_extension_reports_it_once_seen() {
         let title = mp2_ext_title();
         let dir = tempfile::tempdir().expect("tempdir");
         let d = dir.path().display();
@@ -1136,13 +1157,27 @@ mod tests {
             format!("demux://{d}/demux"),
             format!("audio://{d}/audio"),
         ] {
-            let sink = crate::mux::resolve::output(&url, &title, None).expect("sink opens");
+            let (mut sink, ev) = crate::testlog::capture(|| {
+                crate::mux::resolve::output(&url, &title, None).expect("sink opens")
+            });
+            assert_eq!(mp2_extension_warnings(&ev), 0, "{url}: declared only");
+            assert!(
+                sink.undelivered_streams().is_empty(),
+                "{url}: declared only"
+            );
+            let ((), ev) = crate::testlog::capture(|| {
+                sink.write(&ext_frame()).unwrap();
+                sink.write(&ext_frame()).unwrap();
+            });
+            assert_eq!(mp2_extension_warnings(&ev), 1, "{url}: warned once");
             assert_eq!(sink.undelivered_streams(), vec![1], "{url}");
         }
+        // mp4's pre-mux plan never lists it; the sink does once packets arrive (mp4 tests).
         let fit = crate::mux::mp4::fit_report(&title);
         assert!(
+            !fit.skipped.iter().any(|&(i, _)| i == 1),
+            "{:?}",
             fit.skipped
-                .contains(&(1, crate::mux::mp4::Mp4SkipReason::Mp2Extension))
         );
         // The FMKV wire (network://, stdio://) keeps it: the label round-trips.
         let wire = crate::mux::meta::M2tsMeta::from_title(&title).to_title();

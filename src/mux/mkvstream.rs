@@ -412,9 +412,9 @@ pub struct MkvStream {
     /// `title.streams` index → muxer track index when a track is left out without an MVC fold
     /// (`None` = not written); `None` when every stream maps to its own index.
     remap: Option<Vec<Option<usize>>>,
-    /// `title.streams` indices Matroska cannot store: DVD MPEG-2 multichannel extension tracks
-    /// (no registered codec or BlockAddIDType carries 13818-3 `ext_frame`s).
-    excluded: Vec<usize>,
+    /// DVD MPEG-2 multichannel extension tracks Matroska cannot store (no registered codec or
+    /// BlockAddIDType carries 13818-3 `ext_frame`s); reported once their packets arrive.
+    excluded: super::ps::UnstoredExtensions,
 }
 
 // Base frames held awaiting their PTS-matching dependent AU before the oldest
@@ -647,23 +647,13 @@ impl MkvStream {
         // `title.streams` index → muxer track index (`None` = the dependent view,
         // which has no track). Streams after the dependent shift down by one.
         let mut stream_to_track: Vec<Option<usize>> = Vec::with_capacity(title.streams.len());
-        let mut excluded = Vec::new();
+        let excluded = super::ps::UnstoredExtensions::new(title, "Matroska");
         for (idx, s) in title.streams.iter().enumerate() {
             if Some(idx) == skip_stream_idx {
                 stream_to_track.push(None);
                 continue;
             }
-            if let crate::disc::Stream::Audio(a) = s
-                && a.is_mp2_extension()
-            {
-                tracing::warn!(
-                    target: "mux",
-                    track = idx,
-                    "MPEG-2 multichannel extension {:#04x} has no Matroska mapping; left out (the stereo \
-                     base is kept; an ISO copy keeps the surround)",
-                    a.pid,
-                );
-                excluded.push(idx);
+            if excluded.contains(idx) {
                 stream_to_track.push(None);
                 continue;
             }
@@ -906,7 +896,7 @@ impl MkvStream {
             disc_title,
             mvc: None,
             remap: None,
-            excluded: Vec::new(),
+            excluded: Default::default(),
             mode: Mode::Read(Box::new(ReadState {
                 reader: Box::new(reader),
                 cluster_ts_ticks: 0,
@@ -1295,6 +1285,9 @@ impl crate::pes::Stream for MkvStream {
         if matches!(self.mode, Mode::Read(_)) {
             return Err(crate::error::Error::StreamReadOnly.into());
         }
+        if self.excluded.drop_frame(frame.track) {
+            return Ok(());
+        }
         // Non-3D fast path: emit the frame directly, no clone, no buffering.
         let Some(mvc) = self.mvc.as_mut() else {
             return match self.remap.as_ref().map(|r| r.get(frame.track).copied()) {
@@ -1369,8 +1362,8 @@ impl crate::pes::Stream for MkvStream {
     }
 
     fn undelivered_streams(&self) -> Vec<usize> {
-        // Known from create: tracks Matroska has no mapping for are never written.
-        self.excluded.clone()
+        // Tracks Matroska has no mapping for, once their packets arrived.
+        self.excluded.seen()
     }
 
     fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
@@ -4420,8 +4413,8 @@ mod tests {
     }
 
     /// An MPEG-2 multichannel extension track (DVD `0xD0|n`) has no Matroska mapping: it is
-    /// reported as excluded, its frames and timing are ignored, and the tracks after it keep
-    /// their frames.
+    /// reported as excluded once its packets arrive, its frames and timing are ignored, and the
+    /// tracks after it keep their frames.
     #[test]
     fn mp2_extension_track_is_left_out_and_later_tracks_still_mux() {
         let out = SharedOut::new();
@@ -4444,7 +4437,8 @@ mod tests {
         title.streams.push(mp2(0x00C0, ""));
         title.codec_privates.extend([None, None]);
         let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
-        assert_eq!(s.undelivered_streams(), vec![1]);
+        // Declared only (IFO coding mode 3): nothing lost yet, nothing reported.
+        assert!(s.undelivered_streams().is_empty());
         s.set_track_timing(1, Default::default()).unwrap();
         let frame = |track, data: Vec<u8>, keyframe| crate::pes::PesFrame {
             discard_padding_ns: 0,
@@ -4459,6 +4453,11 @@ mod tests {
         s.write(&frame(0, vec![0xA1; 48], true)).unwrap();
         s.write(&frame(1, vec![0x7F, 0xF0, 0x01], true)).unwrap();
         s.write(&frame(2, vec![0xB2; 16], true)).unwrap();
+        assert_eq!(
+            s.undelivered_streams(),
+            vec![1],
+            "reported once its packets arrived"
+        );
         s.finish().unwrap();
         let mut back = MkvStream::open(Cursor::new(out.bytes())).unwrap();
         assert_eq!(back.info().streams.len(), 2, "video + MP2 base only");

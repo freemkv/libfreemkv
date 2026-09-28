@@ -1,0 +1,20 @@
+Real-encoder MPEG-1 Layer II fixtures for mp2_channels_tests.rs
+(ffmpeg_encoded_frames_walk_to_the_end_of_every_frame).
+
+Content: a synthetic 440 Hz sine tone from FFmpeg's lavfi `sine` source, 0.1 s.
+No recorded or copyrighted material. Generated for this repository and covered
+by its licence (MIT, see /LICENSE).
+
+Encoder: FFmpeg 9.0.2 native `mp2` encoder (-c:a mp2), raw Layer II output.
+Name: <st|mo>_<kHz>_<kbit/s>_<Table 3-B.2 a|b|c|d the frames select>.mp2
+
+Commands (reproduce byte for byte with FFmpeg 9.0.2):
+
+  sine() { echo "sine=frequency=440:sample_rate=$1:duration=0.1"; }
+  ffmpeg -f lavfi -i "$(sine 48000)" -ar 48000 -ac 2 -c:a mp2 -b:a 256k -f mp2 st_48_256_a.mp2
+  ffmpeg -f lavfi -i "$(sine 48000)" -ar 48000 -ac 2 -c:a mp2 -b:a 384k -f mp2 st_48_384_a.mp2
+  ffmpeg -f lavfi -i "$(sine 48000)" -ar 48000 -ac 1 -c:a mp2 -b:a 96k  -f mp2 mo_48_96_a.mp2
+  ffmpeg -f lavfi -i "$(sine 44100)" -ar 44100 -ac 2 -c:a mp2 -b:a 192k -f mp2 st_441_192_b.mp2
+  ffmpeg -f lavfi -i "$(sine 48000)" -ar 48000 -ac 2 -c:a mp2 -b:a 64k  -f mp2 st_48_64_c.mp2
+  ffmpeg -f lavfi -i "$(sine 32000)" -ar 32000 -ac 2 -c:a mp2 -b:a 64k  -f mp2 st_32_64_d.mp2
+  ffmpeg -f lavfi -i "$(sine 32000)" -ar 32000 -ac 1 -c:a mp2 -b:a 32k  -f mp2 mo_32_32_d.mp2

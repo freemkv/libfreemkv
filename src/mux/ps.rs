@@ -110,6 +110,64 @@ pub(crate) fn warn_undeclared_extensions(packets: &[u64; 8]) {
     }
 }
 
+/// The DVD MPEG-2 multichannel extension tracks of a title that a sink cannot store. IFO
+/// coding mode 3 only declares them; the loss is reported (warned once, then listed by
+/// `undelivered_streams`) only for a track whose `0xD0|n` packets actually arrived.
+#[derive(Debug, Default)]
+pub(crate) struct UnstoredExtensions {
+    /// (`title.streams` index, PID, frames seen).
+    tracks: Vec<(usize, u16, bool)>,
+    container: &'static str,
+}
+
+impl UnstoredExtensions {
+    /// Every extension track of `title`, for a sink writing `container`.
+    pub(crate) fn new(title: &crate::disc::DiscTitle, container: &'static str) -> Self {
+        let tracks = (title.streams.iter().enumerate())
+            .filter_map(|(i, s)| match s {
+                crate::disc::Stream::Audio(a) if a.is_mp2_extension() => Some((i, a.pid, false)),
+                _ => None,
+            })
+            .collect();
+        Self { tracks, container }
+    }
+
+    /// Whether `track` is an extension track (never written).
+    pub(crate) fn contains(&self, track: usize) -> bool {
+        self.tracks.iter().any(|&(i, _, _)| i == track)
+    }
+
+    /// Whether the title has no extension track at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tracks.is_empty()
+    }
+
+    /// Notes a frame for `track`; `true` when it is an extension track the sink must drop.
+    /// The first frame of each one warns.
+    pub(crate) fn drop_frame(&mut self, track: usize) -> bool {
+        let Some(t) = self.tracks.iter_mut().find(|t| t.0 == track) else {
+            return false;
+        };
+        if !t.2 {
+            t.2 = true;
+            tracing::warn!(
+                target: "mux",
+                track,
+                "MPEG-2 multichannel extension {:#04x} has no {} mapping; left out (the stereo \
+                 base is kept; an ISO copy keeps the surround)",
+                t.1,
+                self.container,
+            );
+        }
+        true
+    }
+
+    /// Extension tracks whose packets arrived and were left out.
+    pub(crate) fn seen(&self) -> Vec<usize> {
+        (self.tracks.iter()).filter(|t| t.2).map(|t| t.0).collect()
+    }
+}
+
 /// Canonical PID for a VobSub subtitle stream identified by its on-wire
 /// sub-stream id (`0x20..=0x3F`). The PID is the sub-id itself (identity),
 /// which never overlaps the `0xBD..` audio PID space.

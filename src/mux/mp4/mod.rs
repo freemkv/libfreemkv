@@ -156,7 +156,8 @@ pub enum Mp4SkipReason {
     UnmappableVideo,
     /// A DVD MPEG-2 multichannel extension track
     /// ([`AudioStream::is_mp2_extension`](crate::disc::AudioStream::is_mp2_extension)): MP4
-    /// has no mapping for ISO/IEC 13818-3 extension frames.
+    /// has no mapping for ISO/IEC 13818-3 extension frames. A *post-mux* reason: reported
+    /// only once the track's packets arrived.
     Mp2Extension,
     /// Planned as carried, but the stream delivered no sample at all, so
     /// `finish()` dropped the track rather than write an empty `trak`.
@@ -190,7 +191,8 @@ pub struct Mp4FitReport {
 /// Compute the fit plan without opening a file. Video: the first primary
 /// HEVC/H.264 track. Audio: every track `audio::audio_fits` carries — the Dolby
 /// family (AC-3 / E-AC-3) and DTS (core / DTS-HD HRA / DTS-HD MA). Everything
-/// else is skipped with a reason.
+/// else is skipped with a reason, except a DVD MPEG-2 multichannel extension track, which
+/// only [`Mp4Sink::final_report`] lists, and only once its packets arrived.
 pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
     let mut included = Vec::new();
     let mut skipped = Vec::new();
@@ -211,9 +213,9 @@ pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
                     skipped.push((i, Mp4SkipReason::UnmappableVideo));
                 }
             }
-            DiscStream::Audio(a) if a.is_mp2_extension() => {
-                skipped.push((i, Mp4SkipReason::Mp2Extension));
-            }
+            // Not planned either way: IFO coding mode 3 only declares it. The sink reports it
+            // (Mp2Extension, post-mux) once its packets actually arrive.
+            DiscStream::Audio(a) if a.is_mp2_extension() => {}
             DiscStream::Audio(a) => {
                 if audio::audio_fits(a.codec) {
                     included.push(i);
@@ -263,9 +265,11 @@ pub struct Mp4Sink<W: Write + Seek> {
     /// The create-time (pre-mux) plan, kept so [`Self::final_report`] can hand
     /// back a report that matches the FILE rather than the prediction.
     plan: Mp4FitReport,
-    /// Streams the plan promised that `finish()` actually dropped, with why.
-    /// Empty until `finish()` runs.
+    /// Streams the plan promised that `finish()` actually dropped, with why, plus MPEG-2
+    /// extension tracks whose packets arrived (the plan never lists those).
     dropped: Vec<(usize, Mp4SkipReason)>,
+    /// MPEG-2 multichannel extension tracks (no MP4 mapping), reported once packets arrive.
+    excluded: super::ps::UnstoredExtensions,
 }
 
 impl<W: Write + Seek> Mp4Sink<W> {
@@ -370,6 +374,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
             reserve,
             finished: false,
             plan: report,
+            excluded: super::ps::UnstoredExtensions::new(title, "MP4"),
             dropped: Vec::new(),
         })
     }
@@ -378,7 +383,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
     /// [`fit_report`] plan. Before `finish()` it equals that plan; after
     /// `finish()` every track the writer had to drop has moved from `included`
     /// into `skipped` with a post-mux reason ([`Mp4SkipReason::NoSamples`],
-    /// [`Mp4SkipReason::UndescribableAudio`]).
+    /// [`Mp4SkipReason::UndescribableAudio`], [`Mp4SkipReason::Mp2Extension`]).
     ///
     /// Call this after `finish()`, not the pre-mux plan, before reporting what was written: the
     /// plan is only a prediction and can still list a stream `finish()` had to drop.
@@ -427,6 +432,13 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
+        if self.excluded.drop_frame(frame.track) {
+            if !self.dropped.iter().any(|&(i, _)| i == frame.track) {
+                self.dropped
+                    .push((frame.track, Mp4SkipReason::Mp2Extension));
+            }
+            return Ok(());
+        }
         let Some(slot) = self.route.get(frame.track).copied().flatten() else {
             return Ok(()); // excluded track (or out of range)
         };
@@ -1222,6 +1234,39 @@ mod tests {
             pos += size;
         }
         None
+    }
+
+    /// An MPEG-2 multichannel extension track (IFO coding mode 3) is reported only once its
+    /// `0xD0|n` packets arrive; declared alone it is in neither the plan nor the report.
+    #[test]
+    fn mp2_extension_is_reported_only_once_its_packets_arrive() {
+        let ext = || {
+            let mut a = audio(Codec::Mp2, "eng");
+            if let DiscStream::Audio(x) = &mut a {
+                x.pid = 0x00D0;
+                x.label = crate::disc::MP2_EXTENSION_LABEL.into();
+            }
+            a
+        };
+        let t = title(
+            vec![hevc_video(), ext()],
+            vec![Some(vec![1, 2, 3, 4]), None],
+        );
+        assert!(fit_report(&t).skipped.is_empty(), "declared only: no note");
+        let mut quiet = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        quiet.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+        quiet.finish().unwrap();
+        assert!(quiet.undelivered_streams().is_empty());
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+        s.write(&frame(1, 0, true, vec![0x7F, 0xF0, 0x00])).unwrap();
+        s.write(&frame(1, 0, true, vec![0x7F, 0xF0, 0x00])).unwrap();
+        s.finish().unwrap();
+        assert_eq!(s.undelivered_streams(), vec![1]);
+        assert_eq!(
+            s.final_report().skipped,
+            vec![(1, Mp4SkipReason::Mp2Extension)]
+        );
     }
 
     // An audio track whose frames never yield a parseable sample entry must be dropped from

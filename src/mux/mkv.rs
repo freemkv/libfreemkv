@@ -6167,6 +6167,11 @@ mod tests {
 
     use super::super::codec::mp2_channels::tests::{MC_3_2_LFE, Mc, STEREO_256, Spec};
 
+    // 13818-3 §2.5.3.1 CRC-gated, committed after RUN_FRAMES matching frames in a row.
+    fn run(f: Vec<u8>) -> Vec<Vec<u8>> {
+        vec![f; super::super::codec::mp2_channels::RUN_FRAMES as usize]
+    }
+
     fn mc_frame(mc: Mc) -> Vec<u8> {
         mp2(Spec {
             mc: Some(mc),
@@ -6222,7 +6227,7 @@ mod tests {
     #[test]
     fn mp2_ext_0_3_2_lfe_keeps_all_six() {
         // 13818-3 §2.5.2.13: "'0' no extension stream present"; "'10' stereo surround", lfe '1'.
-        assert_eq!(mp2_channels_written(6, &[mc_frame(MC_3_2_LFE)]).0, 6);
+        assert_eq!(mp2_channels_written(6, &run(mc_frame(MC_3_2_LFE))).0, 6);
     }
 
     #[test]
@@ -6234,7 +6239,7 @@ mod tests {
             ..MC_3_2_LFE
         };
         // 13818-3 §2.5.2.13: "'01' centre channel present", "'00' no surround".
-        assert_eq!(mp2_channels_written(6, &[mc_frame(m)]).0, 3);
+        assert_eq!(mp2_channels_written(6, &run(mc_frame(m))).0, 3);
     }
 
     /// This is per spec; do not change without a spec citation proving otherwise.
@@ -6265,7 +6270,7 @@ mod tests {
     /// started." This is per spec; do not change without a spec citation proving otherwise.
     #[test]
     fn mp2_ifo_2_over_verified_5_1_writes_6() {
-        assert_eq!(mp2_channels_written(2, &[mc_frame(MC_3_2_LFE)]).0, 6);
+        assert_eq!(mp2_channels_written(2, &run(mc_frame(MC_3_2_LFE))).0, 6);
     }
 
     #[test]
@@ -6280,7 +6285,10 @@ mod tests {
         let good = mc_frame(MC_3_2_LFE);
         let zeros = vec![0u8; good.len()];
         // 11172-3 §2.4.2.3: no "syncword - the bit string '1111 1111 1111'." in the first.
-        assert_eq!(mp2_channels_written(6, &[zeros, good.clone(), good]).0, 6);
+        assert_eq!(
+            mp2_channels_written(6, &[zeros, good.clone(), good.clone(), good]).0,
+            6
+        );
     }
 
     #[test]

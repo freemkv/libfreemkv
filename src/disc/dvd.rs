@@ -717,7 +717,10 @@ mod tests {
         let mut out = std::io::Cursor::new(Vec::new());
         let mut m = MkvMuxer::new(&mut out, &tracks, None, 0.0, &[]).unwrap();
         m.write_frame(0, 0, true, &[1, 2], None, None).unwrap();
-        m.write_frame(1, 0, false, frame, None, None).unwrap();
+        // A count above nch commits after RUN_FRAMES CRC-valid frames in a row.
+        for _ in 0..crate::mux::codec::mp2_channels::RUN_FRAMES {
+            m.write_frame(1, 0, false, frame, None, None).unwrap();
+        }
         m.finish().unwrap();
         let d = out.into_inner();
         let at = d
@@ -784,7 +787,7 @@ mod tests {
             ..STEREO_256
         })
         .0;
-        // 13818-3 §2.5.2.8: "'0' no extension stream present" with 3/2 + LFE.
+        // 13818-3 §2.5.2.13: "'0' no extension stream present" with 3/2 + LFE.
         assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 6);
     }
 

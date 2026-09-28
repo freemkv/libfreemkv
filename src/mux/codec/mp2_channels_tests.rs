@@ -384,6 +384,11 @@ fn multichannel(f: &[u8]) -> Option<McHeader> {
     }
 }
 
+// A full run of one frame: RUN_FRAMES copies (a count above nch needs that many in a row).
+fn run(f: Vec<u8>) -> Vec<Vec<u8>> {
+    vec![f; RUN_FRAMES as usize]
+}
+
 fn settle(frames: &[Vec<u8>]) -> (Option<u8>, bool) {
     let mut t = ChannelTracker::default();
     for f in frames {
@@ -834,7 +839,7 @@ fn every_mc_configuration_counts_its_main_programme() {
             let f = frame(with_mc(STEREO_256, mc(centre, surround, lfe)));
             // §2.5.2.13: "'0' no extension stream present" - all of it is in this track.
             assert_eq!(
-                settle(&[f]),
+                settle(&run(f)),
                 (Some(main + u8::from(lfe)), false),
                 "{name} lfe {lfe}"
             );
@@ -858,7 +863,7 @@ fn second_stereo_programme_is_not_counted_as_surround() {
 fn ext_zero_3_2_lfe_is_six_not_two() {
     // §2.5.2.13: "'0' no extension stream present"; centre '01', surround '10', lfe '1'.
     assert_eq!(
-        settle(&[frame(with_mc(STEREO_256, MC_3_2_LFE))]),
+        settle(&run(frame(with_mc(STEREO_256, MC_3_2_LFE)))),
         (Some(6), false)
     );
 }
@@ -1129,7 +1134,7 @@ fn joint_stereo_bound_is_capped_at_sblimit() {
     }; // 64 kbit/s
     let f = frame(with_mc(s, mc(0b01, 0b00, false)));
     // Verifying the 3/0 mc_header ("'01' centre channel present") needs a full base walk.
-    assert_eq!(settle(&[f]), (Some(3), false));
+    assert_eq!(settle(&run(f)), (Some(3), false));
 }
 
 // ── fallbacks and the bounded look (Opus defect 1) ─────────────────────────
@@ -1244,7 +1249,12 @@ fn a_failed_first_frame_does_not_lock_in_the_base_count() {
     let good = frame(with_mc(STEREO_256, MC_3_2_LFE));
     // A zero-filled frame has no "syncword - the bit string '1111 1111 1111'".
     assert_eq!(
-        settle(&[vec![0; good.len()], good.clone(), good.clone()]),
+        settle(&[
+            vec![0; good.len()],
+            good.clone(),
+            good.clone(),
+            good.clone()
+        ]),
         (Some(6), false)
     );
     let damaged = frame(Spec {
@@ -1253,12 +1263,124 @@ fn a_failed_first_frame_does_not_lock_in_the_base_count() {
         ..with_mc(STEREO_256, MC_3_2_LFE)
     });
     // §2.4.3.1: a CRC mismatch means "a transmission error has occured".
-    assert_eq!(settle(&[damaged, good.clone()]), (Some(6), false));
+    assert_eq!(
+        settle(&[&[damaged][..], &run(good.clone())].concat()),
+        (Some(6), false)
+    );
     let bad_mc = frame(Spec {
         bad_mc_crc: true,
         ..with_mc(STEREO_256, MC_3_2_LFE)
     });
-    assert_eq!(settle(&[bad_mc.clone(), bad_mc, good]), (Some(6), false));
+    assert_eq!(
+        settle(&[&[bad_mc.clone(), bad_mc][..], &run(good)].concat()),
+        (Some(6), false)
+    );
+}
+
+// ── Scenario A: a forged-valid mc_crc_check (review round 3) ────────────────
+
+fn bad_mc() -> Vec<u8> {
+    frame(Spec {
+        bad_mc_crc: true,
+        ..with_mc(STEREO_256, MC_3_2_LFE)
+    })
+}
+
+/// One frame whose ancillary bits happen to pass mc_crc_check (1 in 2^16) between plain
+/// stereo frames is not multichannel: more than `nch` needs RUN_FRAMES in a row. Per the
+/// run rule; do not change without a spec citation proving otherwise.
+#[test]
+fn a_single_forged_valid_frame_between_stereo_frames_stays_at_nch() {
+    let forged = frame(with_mc(STEREO_256, MC_3_2_LFE));
+    let stereo = bad_mc(); // "mandatory CRC-check" fails: plain MPEG-1 ancillary data
+    let mut frames = vec![stereo.clone(); 5];
+    frames.insert(2, forged);
+    assert_eq!(settle(&frames), (Some(2), false));
+}
+
+/// Real ext '0' 5.1 (§2.5.2.13 "'0' no extension stream present") commits on the third
+/// consecutive CRC-valid frame with the same mc_header, not before.
+#[test]
+fn real_ext_zero_5_1_commits_after_three_frames() {
+    let good = frame(with_mc(STEREO_256, MC_3_2_LFE));
+    let mut t = ChannelTracker::default();
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), Some(6));
+}
+
+/// A failed mc_crc_check in the middle of a run resets it; a damaged or header-less frame is
+/// skipped and does not.
+#[test]
+fn an_mc_crc_failure_mid_run_resets_it_and_damage_does_not() {
+    let good = frame(with_mc(STEREO_256, MC_3_2_LFE));
+    let mut t = ChannelTracker::default();
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&bad_mc()), None, "reset");
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), Some(6));
+    let damaged = frame(Spec {
+        bad_frame_crc: true,
+        protection_bit: 0,
+        ..with_mc(STEREO_256, MC_3_2_LFE)
+    });
+    let mut t = ChannelTracker::default();
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&damaged), None, "skipped");
+    assert_eq!(t.observe(&[0u8; 16]), None, "skipped");
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), Some(6));
+}
+
+/// A different verified mc_header restarts the run instead of extending it.
+#[test]
+fn a_changed_mc_header_restarts_the_run() {
+    let a = frame(with_mc(STEREO_256, MC_3_2_LFE));
+    let b = frame(with_mc(STEREO_256, mc(0b01, 0b00, false)));
+    assert_eq!(
+        settle(&[a.clone(), a.clone(), b.clone(), b.clone(), b]),
+        (Some(3), false)
+    );
+}
+
+/// A verified count equal to `nch` (ext '1': the rest "is not in the track") commits on one
+/// frame, as does a 2/0 + second stereo programme.
+#[test]
+fn a_verified_count_equal_to_nch_commits_on_one_frame() {
+    let ext = frame(with_mc(
+        STEREO_256,
+        Mc {
+            ext: true,
+            ..MC_3_2_LFE
+        },
+    ));
+    let mut t = ChannelTracker::default();
+    assert_eq!((t.observe(&ext), t.extension_signalled()), (Some(2), true));
+    let second = frame(with_mc(STEREO_256, mc(0b00, 0b11, false)));
+    assert_eq!(ChannelTracker::default().observe(&second), Some(2));
+}
+
+/// A run under way at MAX_FRAMES is followed to its end: it commits if it completes.
+#[test]
+fn a_run_under_way_at_the_bound_is_followed_to_its_end() {
+    let good = frame(with_mc(STEREO_256, MC_3_2_LFE));
+    let mut t = ChannelTracker::default();
+    for i in 1..MAX_FRAMES {
+        assert_eq!(t.observe(&bad_mc()), None, "frame {i}");
+    }
+    assert_eq!(t.observe(&good), None, "frame MAX_FRAMES starts a run");
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), Some(6));
+    // A run that breaks past the bound settles on the base count at once.
+    let mut t = ChannelTracker::default();
+    for _ in 1..MAX_FRAMES {
+        t.observe(&bad_mc());
+    }
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&bad_mc()), Some(2));
+    assert_eq!(t.observe(&good), None, "settled");
 }
 
 /// The look is bounded: base count after MAX_FRAMES clean MPEG-1 frames, and nothing

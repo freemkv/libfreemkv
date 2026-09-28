@@ -690,8 +690,8 @@ pub struct DemuxSink {
     /// placed", a filtered-out track's clip-join drops would measure against a
     /// count that never included them, wrongly tripping `SeamPlanDroppedMost`/`SinkWroteNothing`.
     frames_mapped: u64,
-    /// `title.streams` indices with no ES file form (MPEG-2 multichannel extension tracks).
-    excluded: Vec<usize>,
+    /// MPEG-2 multichannel extension tracks (no ES file form), reported once packets arrive.
+    excluded: super::ps::UnstoredExtensions,
 }
 
 impl DemuxSink {
@@ -701,7 +701,7 @@ impl DemuxSink {
         let mut tracks: Vec<Option<TrackOut>> = Vec::with_capacity(title.streams.len());
         let mut ref_video_track = None;
         let mut video_tracks: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut excluded = Vec::new();
+        let excluded = super::ps::UnstoredExtensions::new(title, "elementary-stream file");
 
         for (idx, stream) in title.streams.iter().enumerate() {
             let selected = opts
@@ -738,17 +738,7 @@ impl DemuxSink {
                 continue;
             }
             // A 13818-3 extension stream is not a decodable ES on its own: left out, reported.
-            if let DiscStream::Audio(a) = stream
-                && a.is_mp2_extension()
-            {
-                tracing::warn!(
-                    target: "mux",
-                    track = idx,
-                    "MPEG-2 multichannel extension {:#04x} has no elementary-stream file form; left out (the stereo \
-                     base is kept; an ISO copy keeps the surround)",
-                    a.pid,
-                );
-                excluded.push(idx);
+            if excluded.contains(idx) {
                 tracks.push(None);
                 continue;
             }
@@ -898,7 +888,7 @@ impl DemuxSink {
 
 impl Stream for DemuxSink {
     fn undelivered_streams(&self) -> Vec<usize> {
-        self.excluded.clone()
+        self.excluded.seen()
     }
 
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
@@ -907,6 +897,9 @@ impl Stream for DemuxSink {
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
+        if self.excluded.drop_frame(frame.track) {
+            return Ok(());
+        }
         // Use the dynamically-resolved video reference, not literal stream index 0:
         // an M2TS/PMT title can list audio before video, so a non-video epoch
         // driver would ratchet the frontier on sparse/lagging PTS.

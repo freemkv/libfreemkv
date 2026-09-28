@@ -3,12 +3,15 @@
 //! - ISO/IEC 11172-3 (CD text): §2.4.2.3 header, §2.4.1.6 Layer II `audio_data()`, §2.4.2.6,
 //!   §2.4.3.1 CRC, §2.4.3.3 nbal/sblimit, 3-Annex B Tables 3-B.2a-d and 3-B.4. Annex B is not in
 //!   the public text: table data is the ISO reference software's (dist10 `tables/alloc_0..3`).
+//!   Real-encoder test frames are FFmpeg 9.0.2 output of a synthetic sine
+//!   (`testdata/ffmpeg_mp2/PROVENANCE` holds the commands).
 //! - ISO/IEC 13818-3 second edition (WG11 N1519, 1997): §2.5.1.3 `base_frame()`, §2.5.1.13-15
 //!   and §2.5.1.17 syntax, §2.5.2.13/15/17 semantics, §2.5.3.1 CRC-gated multichannel detection.
 //!
-//! Multichannel data is trusted only when its mandatory `mc_crc_check` verifies (§2.5.3.1), and
-//! the base frame's own CRC when present. Only base frames (PES `0xC0|n`) are muxed: with
-//! `ext_bit_stream_present` set the track holds just the MPEG-1 channels.
+//! Multichannel data is trusted only when its mandatory `mc_crc_check` verifies (§2.5.3.1) in
+//! [`RUN_FRAMES`] frames in a row, and the base frame's own CRC when present. Only base frames
+//! (PES `0xC0|n`) are muxed: with `ext_bit_stream_present` set the track holds just the MPEG-1
+//! channels.
 
 /// 11172-3 §2.4.2.3: "The first 32 bits (four bytes) are header information".
 const HEADER_BITS: usize = 32;
@@ -702,8 +705,17 @@ pub(crate) fn main_programme_channels(nch: u8, mc: &McHeader) -> u8 {
     nch + centre + surround + u8::from(mc.lfe)
 }
 
-/// Settles a track's channel count from its stored frames: the first verified multichannel
-/// frame decides; failing that, the base count once [`MAX_FRAMES`] frames (or the track) end.
+/// Consecutive CRC-valid frames with one identical `mc_header` needed before a count above
+/// `nch` is committed. 13818-3 2nd ed. §2.5.3.1: "If the mandatory CRC-check yields a valid
+/// result, then multichannel decoding will be started." A 16-bit CRC over plain MPEG-1
+/// ancillary data still matches 1 time in 2^16, so (freemkv policy) three matches in a row:
+/// ~2^-48 per run start, ~2^-43 over the [`MAX_FRAMES`] look. A count equal to `nch`
+/// over-claims nothing and commits on one frame.
+pub(crate) const RUN_FRAMES: u32 = 3;
+
+/// Settles a track's channel count from its stored frames: a verified count above `nch`
+/// after [`RUN_FRAMES`] matching frames in a row, one equal to `nch` at once; failing that,
+/// the base count once [`MAX_FRAMES`] frames (and any run under way) or the track end.
 #[derive(Debug, Default)]
 pub(crate) struct ChannelTracker {
     frames: u32,
@@ -711,11 +723,14 @@ pub(crate) struct ChannelTracker {
     settled: bool,
     extension: bool,
     last: Option<Fallback>,
+    /// The verified `mc_header` of the current run and how many frames in a row carried it.
+    run: Option<(McHeader, u32)>,
 }
 
 impl ChannelTracker {
     /// Feeds one stored frame; `Some(channels)` the one time a count is settled. After
-    /// [`MAX_FRAMES`] frames it stops looking, settling on the base count if any frame had one.
+    /// [`MAX_FRAMES`] frames it stops looking once no run is under way, settling on the base
+    /// count if any frame had one.
     pub(crate) fn observe(&mut self, frame: &[u8]) -> Option<u8> {
         if self.settled {
             return None;
@@ -723,24 +738,35 @@ impl ChannelTracker {
         self.frames += 1;
         match inspect(frame) {
             Frame::Multichannel { nch, mc } => {
-                self.settled = true;
-                self.extension = mc.ext_bit_stream_present;
+                self.base = Some(nch);
                 // §2.5.2.13: "'1' extension bit stream present" - the rest is not in the track.
-                return Some(if mc.ext_bit_stream_present {
+                let count = if mc.ext_bit_stream_present {
                     nch
                 } else {
                     main_programme_channels(nch, &mc)
-                });
+                };
+                let len = match self.run {
+                    Some((prev, n)) if prev == mc => n + 1,
+                    _ => 1,
+                };
+                self.run = Some((mc, len));
+                if count <= nch || len >= RUN_FRAMES {
+                    self.settled = true;
+                    self.extension = mc.ext_bit_stream_present;
+                    return Some(count);
+                }
             }
+            // A clean frame without a verified mc_header (§2.5.3.1) breaks the run.
             Frame::Base { nch, why } => {
                 self.base = Some(nch);
                 self.last = Some(why);
+                self.run = None;
             }
-            // A failed frame CRC covers the header too, so its nch is not trusted either.
+            // Skipped: a failed frame CRC covers the header too, so its nch is not trusted.
             Frame::Damaged { why, .. } => self.last = Some(why),
             Frame::NoHeader => {}
         }
-        if self.frames >= MAX_FRAMES {
+        if self.frames >= MAX_FRAMES && self.run.is_none() {
             self.settled = true;
             return self.base;
         }
