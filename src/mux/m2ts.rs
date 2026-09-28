@@ -32,6 +32,21 @@ impl M2tsStream {
         let mut route = Vec::with_capacity(title.streams.len());
         for (i, s) in title.streams.iter().enumerate() {
             let mut cp = title.codec_privates.get(i).cloned().flatten();
+            // No descriptor binds a 13818-3 extension PID to its base, so a player could not
+            // re-pair it: left out, and reported like refused LPCM.
+            if let DiscStream::Audio(a) = s
+                && a.is_mp2_extension()
+            {
+                tracing::warn!(
+                    target: "mux",
+                    track = i,
+                    "MPEG-2 multichannel extension {:#04x} has no M2TS mapping; left out (the stereo \
+                     base is kept; an ISO copy keeps the surround)",
+                    a.pid,
+                );
+                route.push(None);
+                continue;
+            }
             let lpcm = match s {
                 DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => {
                     let src = cp.as_deref().and_then(super::codec::lpcm::layout_byte);
@@ -140,7 +155,8 @@ impl crate::pes::Stream for M2tsStream {
     }
 
     fn undelivered_streams(&self) -> Vec<usize> {
-        // Known from create: LPCM BD LPCM can't carry is never written.
+        // Known from create: LPCM BD LPCM can't carry, and MPEG-2 extension tracks, are never
+        // written.
         (0..self.route.len())
             .filter(|&i| self.route[i].is_none())
             .collect()

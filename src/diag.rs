@@ -178,12 +178,13 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
     for (i, a) in ts.audio_streams.iter().enumerate() {
         tracing::debug!(
             target: DIAG,
-            "tag=dvd.aattr vts={} idx={i} codec={:?} ch={} sr={}Hz lang={:?}",
+            "tag=dvd.aattr vts={} idx={i} codec={:?} ch={} sr={}Hz lang={:?} mpeg_ext={}",
             ts.vts_number,
             a.codec,
             a.channels,
             a.sample_rate,
             a.language,
+            a.mpeg_ext,
         );
     }
     for (i, s) in ts.subtitle_streams.iter().enumerate() {

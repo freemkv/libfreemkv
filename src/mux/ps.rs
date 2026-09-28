@@ -80,6 +80,36 @@ pub fn dvd_mpeg_audio_pid(stream_id: u8) -> Option<u16> {
     }
 }
 
+/// Canonical PID for a DVD MPEG-2 audio extension bit stream (PES `0xD0|n`): the stream id,
+/// paired with its base `0xC0|n` (the same `n`). Inference, not spec: US5987417 gives MPEG audio
+/// packets "stream id ... 1100 0***b or 1101 0***b"; which one carries the extension is ours.
+pub fn dvd_mpeg_audio_extension_pid(stream_id: u8) -> Option<u16> {
+    match stream_id {
+        0xD0..=0xD7 => Some(stream_id as u16),
+        _ => None,
+    }
+}
+
+/// The base MPEG audio PID (`0xC0|n`) an extension PID (`0xD0|n`) belongs to.
+pub fn dvd_mpeg_audio_extension_base(ext_pid: u16) -> Option<u16> {
+    let id = u8::try_from(ext_pid).ok()?;
+    dvd_mpeg_audio_extension_pid(id).map(|_| ext_pid & !0x0010)
+}
+
+/// Reports, once at end of stream, MPEG-2 audio extension packets (`0xD0|n`, index `n`) that
+/// had no declared extension track (the IFO did not say coding mode 3) and were left out.
+pub(crate) fn warn_undeclared_extensions(packets: &[u64; 8]) {
+    for (n, &count) in packets.iter().enumerate().filter(|(_, c)| **c > 0) {
+        tracing::warn!(
+            target: "mux",
+            "tag=mp2.extension stream_id={:#04x} packets={count}: MPEG-2 audio extension \
+             packets with no declared extension track (IFO coding mode 3) were left out; an \
+             ISO or raw copy keeps them",
+            0xD0 | n,
+        );
+    }
+}
+
 /// Canonical PID for a VobSub subtitle stream identified by its on-wire
 /// sub-stream id (`0x20..=0x3F`). The PID is the sub-id itself (identity),
 /// which never overlaps the `0xBD..` audio PID space.
@@ -115,7 +145,8 @@ impl PsPacket {
     pub fn dvd_pid(&self) -> Option<u16> {
         match self.stream_id {
             crate::consts::pes_stream_id::VIDEO..=0xEF => Some(DVD_VIDEO_PID),
-            0xC0..=0xDF => dvd_mpeg_audio_pid(self.stream_id),
+            0xC0..=0xDF => dvd_mpeg_audio_pid(self.stream_id)
+                .or_else(|| dvd_mpeg_audio_extension_pid(self.stream_id)),
             PRIVATE_STREAM_1 => {
                 let sub = self.sub_stream_id?;
                 dvd_audio_pid(sub).or_else(|| dvd_subtitle_pid(sub))
@@ -1073,6 +1104,24 @@ mod tests {
         assert_eq!(parsed.data, es);
     }
 
+    /// Inference (US5987417 "1100 0***b or 1101 0***b"): extension `0xD0|n` routes to PID
+    /// `0x00D0|n` and pairs with base `0xC0|n`.
+    #[test]
+    fn extension_packets_route_and_pair_by_stream_number() {
+        for n in 0..8u8 {
+            assert_eq!(mk(0xD0 | n, None).dvd_pid(), Some(0x00D0 | u16::from(n)));
+            assert_eq!(
+                dvd_mpeg_audio_extension_base(0x00D0 | u16::from(n)),
+                Some(0x00C0 | u16::from(n))
+            );
+        }
+        assert_eq!(mk(0xD8, None).dvd_pid(), None);
+        assert_eq!(mk(0xCF, None).dvd_pid(), None);
+        assert_eq!(dvd_mpeg_audio_extension_base(0x00C1), None);
+        assert_eq!(dvd_mpeg_audio_extension_base(0x00D8), None);
+        assert_eq!(dvd_mpeg_audio_extension_base(0xBDD0), None);
+    }
+
     #[test]
     fn dvd_pid_matches_scanner_assignment() {
         // Video → 0xE0 (matches dvd.rs VideoStream pid).
@@ -1089,7 +1138,7 @@ mod tests {
         assert_eq!(mk(0xC0, None).dvd_pid(), Some(0xC0));
         assert_eq!(mk(0xC7, None).dvd_pid(), Some(0xC7));
         assert_eq!(mk(0xC8, None).dvd_pid(), None);
-        assert_eq!(mk(0xD0, None).dvd_pid(), None); // MPEG-2 extension, not a track
+        assert_eq!(mk(0xD8, None).dvd_pid(), None); // past DVD's 8 audio streams
         // Unmappable: private stream 2, bogus sub-id.
         assert_eq!(mk(0xBF, None).dvd_pid(), None);
         assert_eq!(mk(0xBD, Some(0x10)).dvd_pid(), None);

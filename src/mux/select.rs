@@ -39,7 +39,8 @@ impl StreamSelection {
 
     /// Prune `title.streams` in place: keep every [`Stream::Video`]
     /// unconditionally; keep an [`Stream::Audio`]/[`Stream::Subtitle`] iff its
-    /// PID passes the corresponding [`PidFilter`]; drop the rest. Declared
+    /// PID passes the corresponding [`PidFilter`]; drop the rest. A DVD MPEG-2
+    /// multichannel extension track follows its base's PID instead of its own. Declared
     /// order is preserved. The parallel `codec_privates` vec is pruned in
     /// lockstep, by index, when populated.
     ///
@@ -115,6 +116,11 @@ impl StreamSelection {
     fn keeps(&self, stream: &Stream) -> bool {
         match stream {
             Stream::Video(_) => true,
+            // 13818-3 2nd ed. §2.5.2.13: the extension "contains a remainder of the
+            // multichannel and multilingual audio information", so it follows its base 0xC0|n.
+            Stream::Audio(a) if a.is_mp2_extension() => {
+                filter_keeps(&self.audio, 0x00C0 | (a.pid & 0x07))
+            }
             Stream::Audio(a) => filter_keeps(&self.audio, a.pid),
             Stream::Subtitle(s) => filter_keeps(&self.subtitle, s.pid),
         }
@@ -373,5 +379,51 @@ mod tests {
             sel.apply(&mut t).is_ok(),
             "correctly-classed PIDs must apply"
         );
+    }
+
+    // DVD title: video, MP2 base 0xC0 + its extension 0xD0, MP2 0xC1.
+    fn mp2_ext_title() -> DiscTitle {
+        let mp2 = |pid: u16, label: &str| {
+            Stream::Audio(AudioStream {
+                pid,
+                codec: Codec::Mp2,
+                channels: AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: label.into(),
+            })
+        };
+        let mut t = DiscTitle::empty();
+        t.streams = vec![
+            video(0x00E0),
+            mp2(0x00C0, ""),
+            mp2(0x00D0, crate::disc::MP2_EXTENSION_LABEL),
+            mp2(0x00C1, ""),
+        ];
+        t
+    }
+
+    /// An MPEG-2 extension track (`0xD0|n`) is kept iff its base (`0xC0|n`) is, whatever the
+    /// filter lists: it holds "a remainder of the multichannel ... information" (13818-3 2nd ed.
+    /// §2.5.2.13), meaningless alone. Per spec; do not change without a spec citation otherwise.
+    #[test]
+    fn an_mp2_extension_follows_its_base_whatever_the_filter_lists() {
+        let keep = |audio: Vec<u16>| {
+            let mut t = mp2_ext_title();
+            StreamSelection {
+                audio: PidFilter::Only(audio),
+                subtitle: PidFilter::All,
+            }
+            .apply(&mut t)
+            .unwrap();
+            pids(&t)
+        };
+        assert_eq!(keep(vec![0x00C0]), vec![0x00E0, 0x00C0, 0x00D0]);
+        assert_eq!(keep(vec![0x00C1]), vec![0x00E0, 0x00C1]);
+        // Listing the extension alone keeps nothing it depends on, so it goes too.
+        assert_eq!(keep(vec![0x00D0]), vec![0x00E0]);
+        assert_eq!(keep(vec![0x00D0, 0x00C1]), vec![0x00E0, 0x00C1]);
     }
 }

@@ -409,6 +409,12 @@ pub struct MkvStream {
     /// base video track as per-frame `BlockAdditional`, paired by PTS, so the
     /// output is a single MVC track instead of two independent H.264 tracks.
     mvc: Option<MvcMerge>,
+    /// `title.streams` index → muxer track index when a track is left out without an MVC fold
+    /// (`None` = not written); `None` when every stream maps to its own index.
+    remap: Option<Vec<Option<usize>>>,
+    /// `title.streams` indices Matroska cannot store: DVD MPEG-2 multichannel extension tracks
+    /// (no registered codec or BlockAddIDType carries 13818-3 `ext_frame`s).
+    excluded: Vec<usize>,
 }
 
 // Base frames held awaiting their PTS-matching dependent AU before the oldest
@@ -641,8 +647,23 @@ impl MkvStream {
         // `title.streams` index → muxer track index (`None` = the dependent view,
         // which has no track). Streams after the dependent shift down by one.
         let mut stream_to_track: Vec<Option<usize>> = Vec::with_capacity(title.streams.len());
+        let mut excluded = Vec::new();
         for (idx, s) in title.streams.iter().enumerate() {
             if Some(idx) == skip_stream_idx {
+                stream_to_track.push(None);
+                continue;
+            }
+            if let crate::disc::Stream::Audio(a) = s
+                && a.is_mp2_extension()
+            {
+                tracing::warn!(
+                    target: "mux",
+                    track = idx,
+                    "MPEG-2 multichannel extension {:#04x} has no Matroska mapping; left out (the stereo \
+                     base is kept; an ISO copy keeps the surround)",
+                    a.pid,
+                );
+                excluded.push(idx);
                 stream_to_track.push(None);
                 continue;
             }
@@ -669,6 +690,7 @@ impl MkvStream {
         // Assemble the MVC merge only when active — i.e. a dependent AND a
         // distinct base video both exist (established above). `base_stream_idx`
         // then always has a built track, so its remap is `Some` (no panic path).
+        let remap = (!mvc_active && !excluded.is_empty()).then(|| stream_to_track.clone());
         let mvc = match (mvc_active, dep_stream_idx, base_stream_idx) {
             (true, Some(dep_stream_idx), Some(base_stream_idx)) => stream_to_track
                 .get(base_stream_idx)
@@ -695,6 +717,8 @@ impl MkvStream {
         Ok(Self {
             disc_title: title.clone(),
             mvc,
+            remap,
+            excluded,
             mode: Mode::Write(WriteMode::Pending(Box::new(PendingMux {
                 timings: vec![crate::pes::TrackTiming::default(); tracks.len()],
                 writer,
@@ -881,6 +905,8 @@ impl MkvStream {
         let mut stream = Self {
             disc_title,
             mvc: None,
+            remap: None,
+            excluded: Vec::new(),
             mode: Mode::Read(Box::new(ReadState {
                 reader: Box::new(reader),
                 cluster_ts_ticks: 0,
@@ -1271,7 +1297,12 @@ impl crate::pes::Stream for MkvStream {
         }
         // Non-3D fast path: emit the frame directly, no clone, no buffering.
         let Some(mvc) = self.mvc.as_mut() else {
-            return self.emit(frame.track, frame, None);
+            return match self.remap.as_ref().map(|r| r.get(frame.track).copied()) {
+                // Left out at create (already warned): nothing to write.
+                Some(Some(None)) => Ok(()),
+                Some(Some(Some(t))) => self.emit(t, frame, None),
+                _ => self.emit(frame.track, frame, None),
+            };
         };
         // 3D, but not a base/dependent video frame: remap and emit without a clone.
         if let Some(mapped) = mvc.passthrough_track(frame.track) {
@@ -1337,6 +1368,11 @@ impl crate::pes::Stream for MkvStream {
         &self.disc_title
     }
 
+    fn undelivered_streams(&self) -> Vec<usize> {
+        // Known from create: tracks Matroska has no mapping for are never written.
+        self.excluded.clone()
+    }
+
     fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
         match &self.mode {
             Mode::Read(rs) => rs.tracks.timings.get(track).copied().unwrap_or_default(),
@@ -1362,9 +1398,14 @@ impl crate::pes::Stream for MkvStream {
             }
             .into()
         };
-        let mapped = match &self.mvc {
-            Some(m) => match m.stream_to_track.get(track) {
-                // The dependent view folds into the base track: nothing to set.
+        let map = self
+            .mvc
+            .as_ref()
+            .map(|m| &m.stream_to_track)
+            .or(self.remap.as_ref());
+        let mapped = match map {
+            Some(m) => match m.get(track) {
+                // Folded into the base (MVC) or left out: nothing to set.
                 Some(None) => return Ok(()),
                 Some(Some(t)) => *t,
                 None => return Err(range()),
@@ -1376,8 +1417,13 @@ impl crate::pes::Stream for MkvStream {
     }
 
     fn set_codec_private(&mut self, track: usize, data: &[u8]) -> io::Result<bool> {
-        let track = match &self.mvc {
-            Some(m) => match m.stream_to_track.get(track).copied().flatten() {
+        let map = self
+            .mvc
+            .as_ref()
+            .map(|m| &m.stream_to_track)
+            .or(self.remap.as_ref());
+        let track = match map {
+            Some(m) => match m.get(track).copied().flatten() {
                 Some(t) => t,
                 None => return Ok(false),
             },
@@ -4371,6 +4417,56 @@ mod tests {
         // A minimal avcC so the written TrackEntry carries a CodecPrivate.
         t.codec_privates = vec![Some(vec![0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1])];
         t
+    }
+
+    /// An MPEG-2 multichannel extension track (DVD `0xD0|n`) has no Matroska mapping: it is
+    /// reported as excluded, its frames and timing are ignored, and the tracks after it keep
+    /// their frames.
+    #[test]
+    fn mp2_extension_track_is_left_out_and_later_tracks_still_mux() {
+        let out = SharedOut::new();
+        let mut title = h264_title();
+        let mp2 = |pid, label: &str| {
+            crate::disc::Stream::Audio(crate::disc::AudioStream {
+                pid,
+                codec: crate::disc::Codec::Mp2,
+                channels: crate::disc::AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: crate::disc::SampleRate::S48,
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: label.into(),
+            })
+        };
+        title
+            .streams
+            .push(mp2(0x00D0, crate::disc::MP2_EXTENSION_LABEL));
+        title.streams.push(mp2(0x00C0, ""));
+        title.codec_privates.extend([None, None]);
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        assert_eq!(s.undelivered_streams(), vec![1]);
+        s.set_track_timing(1, Default::default()).unwrap();
+        let frame = |track, data: Vec<u8>, keyframe| crate::pes::PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track,
+            pts: 0,
+            keyframe,
+            data,
+            duration_ns: None,
+        };
+        s.write(&frame(0, vec![0xA1; 48], true)).unwrap();
+        s.write(&frame(1, vec![0x7F, 0xF0, 0x01], true)).unwrap();
+        s.write(&frame(2, vec![0xB2; 16], true)).unwrap();
+        s.finish().unwrap();
+        let mut back = MkvStream::open(Cursor::new(out.bytes())).unwrap();
+        assert_eq!(back.info().streams.len(), 2, "video + MP2 base only");
+        let mut got = Vec::new();
+        while let Some(f) = back.read().unwrap() {
+            got.push((f.track, f.data));
+        }
+        assert_eq!(got, vec![(0, vec![0xA1; 48]), (1, vec![0xB2; 16])]);
     }
 
     // `finish()` turns a stream of frames into a FILE (activates + finalizes the muxer); proven

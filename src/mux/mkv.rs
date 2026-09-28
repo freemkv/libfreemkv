@@ -667,12 +667,13 @@ struct ChannelFixup {
     source: ChannelSource,
 }
 
-#[derive(Clone, Copy)]
 enum ChannelSource {
     /// AC-3 BSI `acmod` + `lfeon`.
     Ac3,
-    /// MPEG audio header `mode`, plus the 13818-3 `mc_header` when multichannel is declared.
-    MpegLayerII,
+    /// MPEG audio header `mode`, plus a CRC-verified 13818-3 `mc_header` (§2.5.3.1).
+    // Not gated on IFO coding mode 3: mode 2 is "MPEG-1 or MPEG-2 without extension bit stream"
+    // (EP0867877A2), i.e. ext '0' multichannel; §2.5.3.1's mandatory CRC-check is the gate.
+    MpegLayerII(super::codec::mp2_channels::ChannelTracker),
 }
 
 /// Deferred PGS forced-subtitle detection state for one PGS subtitle track.
@@ -1164,7 +1165,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     writer.write_all(&[track.channels])?;
                     let source = match track.codec_id {
                         ebml::CODEC_AC3 => Some(ChannelSource::Ac3),
-                        ebml::CODEC_MP2 => Some(ChannelSource::MpegLayerII),
+                        ebml::CODEC_MP2 => Some(ChannelSource::MpegLayerII(Default::default())),
                         _ => None,
                     };
                     if let Some(source) = source {
@@ -1662,41 +1663,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if let Some(fixup) = self.channel_fixups.get_mut(&track_idx)
             && !fixup.corrected
         {
-            let actual = match fixup.source {
+            let actual = match &mut fixup.source {
                 ChannelSource::Ac3 => super::codec::ac3::acmod_channels(data).filter(|&c| c > 0),
-                ChannelSource::MpegLayerII => {
-                    // More than an MPEG-1 base's 2 is only declared for a 13818-3 multichannel
-                    // program, the one case whose frames carry an `mc_header` to read.
-                    let declared_mc = fixup.claimed > 2;
-                    super::codec::mp2_channels::stored_channels(data, declared_mc).map(|s| {
-                        if let Some(why) = s.fallback {
-                            tracing::debug!(
-                                target: "freemkv::diag",
-                                "tag=mp2.channels track={track_idx} declared={} fallback={why:?} -> base {}",
-                                fixup.claimed,
-                                s.channels,
-                            );
-                        }
-                        s.channels
-                    })
-                }
+                // A frame that proves nothing leaves the IFO value in place; the tracker settles
+                // on the first verified frame or after its bounded look (never on a failure).
+                ChannelSource::MpegLayerII(t) => t.observe(data),
             };
             // None: frame too short or no valid header; keep the IFO value, retry next frame.
             if let Some(actual) = actual {
-                if actual != fixup.claimed {
-                    tracing::warn!(
-                        target: "mux",
-                        "audio track {track_idx}: IFO claimed {} channels but the stored bitstream carries {}; trusting the bitstream",
-                        fixup.claimed,
-                        actual,
-                    );
-                    let here = self.writer.stream_position()?;
-                    self.writer
-                        .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
-                    self.writer.write_all(&[actual])?;
-                    self.writer.seek(std::io::SeekFrom::Start(here))?;
-                }
                 fixup.corrected = true;
+                let (offset, claimed) = (fixup.value_offset, fixup.claimed);
+                self.patch_channels(track_idx, offset, claimed, actual)?;
             }
         }
 
@@ -1731,7 +1708,56 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// (see `cluster_driver`). The caller must deliver a keyframe on that track
     /// before/alongside other-track data, or every `write_frame` is silently dropped; `finish`
     /// then returns `Error::MkvInvalid` rather than emit a structurally valid but empty MKV.
+    // Rewrites a track's 1-byte Channels value in place when the bitstream disagrees.
+    fn patch_channels(
+        &mut self,
+        track: usize,
+        offset: u64,
+        claimed: u8,
+        actual: u8,
+    ) -> io::Result<()> {
+        if let Some(ChannelFixup {
+            source: ChannelSource::MpegLayerII(t),
+            ..
+        }) = self.channel_fixups.get(&track)
+        {
+            let (frames, last) = t.evidence();
+            let ext = t.extension_signalled();
+            tracing::debug!(
+                target: "freemkv::diag",
+                "tag=mp2.channels track={track} declared={claimed} stored={actual} frames={frames} extension_signalled={ext} last_fallback={last:?}",
+            );
+        }
+        if actual == claimed {
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "mux",
+            "audio track {track}: IFO claimed {claimed} channels but the stored bitstream carries {actual}; trusting the bitstream",
+        );
+        let here = self.writer.stream_position()?;
+        self.writer.seek(std::io::SeekFrom::Start(offset))?;
+        self.writer.write_all(&[actual])?;
+        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        Ok(())
+    }
+
     pub fn finish(mut self) -> io::Result<()> {
+        // An MP2 track shorter than the tracker's look settles on its base count now.
+        let pending: Vec<(usize, u64, u8, u8)> = self
+            .channel_fixups
+            .iter_mut()
+            .filter(|(_, f)| !f.corrected)
+            .filter_map(|(&i, f)| match &mut f.source {
+                ChannelSource::MpegLayerII(t) => {
+                    t.finish().map(|n| (i, f.value_offset, f.claimed, n))
+                }
+                ChannelSource::Ac3 => None,
+            })
+            .collect();
+        for (track, offset, claimed, actual) in pending {
+            self.patch_channels(track, offset, claimed, actual)?;
+        }
         // Order matters: a title the seam plan dropped ENTIRELY also has zero frames,
         // and `MkvInvalid` is classified as a skippable empty nav/menu stub — so that
         // case must be decided FIRST, or a real feature silently drops at exit 0.
@@ -6141,28 +6167,38 @@ mod tests {
 
     use super::super::codec::mp2_channels::tests::{MC_3_2_LFE, Mc, STEREO_256, Spec};
 
+    fn mc_frame(mc: Mc) -> Vec<u8> {
+        mp2(Spec {
+            mc: Some(mc),
+            ..STEREO_256
+        })
+    }
+
+    // 192 kbit/s: 11172-3 §2.4.2.3 Table 3-B.2 allows single_channel only up to 192.
+    const MONO_192: Spec = Spec {
+        mode: 0b11,
+        bitrate_index: 0b1010,
+        ..STEREO_256
+    };
+
     #[test]
     fn mp2_ifo_6_with_extension_stream_writes_the_stereo_base() {
-        let f = mp2(Spec {
-            mc: Some(Mc {
-                ext: true,
-                ..MC_3_2_LFE
-            }),
-            ..STEREO_256
+        let f = mc_frame(Mc {
+            ext: true,
+            ..MC_3_2_LFE
         });
-        // 13818-3 §2.5.2.8: "'1' extension bit stream present" - not in the muxed 0xC0 track.
+        // 13818-3 §2.5.2.13: "'1' extension bit stream present" - not in the muxed 0xC0 track.
         assert_eq!(mp2_channels_written(6, &[f]).0, 2);
     }
 
     #[test]
     fn mp2_ifo_6_mono_base_writes_1() {
         let s = Spec {
-            mode: 0b11,
             mc: Some(Mc {
                 ext: true,
                 ..MC_3_2_LFE
             }),
-            ..STEREO_256
+            ..MONO_192
         };
         // 11172-3 §2.4.2.3 mode "'11' single_channel"; 13818-3 "nch ... equal to 1".
         assert_eq!(mp2_channels_written(6, &[mp2(s)]).0, 1);
@@ -6185,34 +6221,20 @@ mod tests {
     /// This is per spec; do not change without a spec citation proving otherwise.
     #[test]
     fn mp2_ext_0_3_2_lfe_keeps_all_six() {
-        let f = mp2(Spec {
-            mc: Some(MC_3_2_LFE),
-            ..STEREO_256
-        });
-        // 13818-3 §2.5.2.8: "'0' no extension stream present"; "'10' stereo surround", lfe "'1'".
-        assert_eq!(mp2_channels_written(6, &[f]).0, 6);
+        // 13818-3 §2.5.2.13: "'0' no extension stream present"; "'10' stereo surround", lfe '1'.
+        assert_eq!(mp2_channels_written(6, &[mc_frame(MC_3_2_LFE)]).0, 6);
     }
 
     #[test]
     fn mp2_ext_0_3_0_writes_3() {
-        let mc = Mc {
-            ext: false,
+        let m = Mc {
             centre: 0b01,
             surround: 0b00,
             lfe: false,
+            ..MC_3_2_LFE
         };
-        // 13818-3 §2.5.2.8: "'01' centre channel present", "'00' no surround".
-        assert_eq!(
-            mp2_channels_written(
-                6,
-                &[mp2(Spec {
-                    mc: Some(mc),
-                    ..STEREO_256
-                })]
-            )
-            .0,
-            3
-        );
+        // 13818-3 §2.5.2.13: "'01' centre channel present", "'00' no surround".
+        assert_eq!(mp2_channels_written(6, &[mc_frame(m)]).0, 3);
     }
 
     /// This is per spec; do not change without a spec citation proving otherwise.
@@ -6220,50 +6242,59 @@ mod tests {
     fn mp2_matching_ifo_is_unchanged() {
         // 11172-3 §2.4.2.3 mode "'00' stereo" = the declared 2; nothing to correct.
         assert_eq!(mp2_channels_written(2, &[mp2(STEREO_256)]).0, 2);
-        let mono = Spec {
-            mode: 0b11,
-            ..STEREO_256
-        };
         // "'11' single_channel" = the declared 1.
-        assert_eq!(mp2_channels_written(1, &[mp2(mono)]).0, 1);
+        assert_eq!(mp2_channels_written(1, &[mp2(MONO_192)]).0, 1);
     }
 
-    /// A declared stereo MPEG-1 stream's ancillary bits are never read as an `mc_header`.
-    /// This is per spec; do not change without a spec citation proving otherwise.
+    /// Review scenario 1: coding mode 2 ("MPEG-1 or MPEG-2 without extension bit stream",
+    /// EP0867877A2) with a bogus 6 nibble. Ancillary bits never become channels without a
+    /// valid mc_crc_check (13818-3 §2.5.3.1). This is per spec; do not change without a spec
+    /// citation proving otherwise.
     #[test]
-    fn mp2_declared_stereo_ignores_mc_looking_ancillary_data() {
-        let f = mp2(Spec {
+    fn mp2_bogus_ifo_6_on_mpeg1_writes_the_header_count() {
+        let lookalike = mp2(Spec {
+            bad_mc_crc: true,
             mc: Some(MC_3_2_LFE),
             ..STEREO_256
         });
-        // 11172-3 §2.4.2.2: "ancillary_data - part of the bitstream that may be used for
-        // ancillary data" - not channels; nch is 2.
-        assert_eq!(mp2_channels_written(2, &[f]).0, 2);
+        assert_eq!(mp2_channels_written(6, &[lookalike]).0, 2);
+    }
+
+    /// Review scenario 2: a nibble of 2 over a verified 5.1 base (ext '0') is 6: §2.5.3.1
+    /// "If the mandatory CRC-check yields a valid result, then multichannel decoding will be
+    /// started." This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn mp2_ifo_2_over_verified_5_1_writes_6() {
+        assert_eq!(mp2_channels_written(2, &[mc_frame(MC_3_2_LFE)]).0, 6);
     }
 
     #[test]
     fn mp2_plain_mpeg1_declared_2_but_mono_writes_1() {
-        let mono = Spec {
-            mode: 0b11,
-            ..STEREO_256
-        };
         // 13818-3 symbols: "nch ... equal to 1 for single_channel mode".
-        assert_eq!(mp2_channels_written(2, &[mp2(mono)]).0, 1);
+        assert_eq!(mp2_channels_written(2, &[mp2(MONO_192)]).0, 1);
+    }
+
+    /// Opus defect 1: a zero-filled first frame, then good 5.1 ext '0' frames, gives 6.
+    #[test]
+    fn mp2_zero_filled_first_frame_does_not_lock_in_a_count() {
+        let good = mc_frame(MC_3_2_LFE);
+        let zeros = vec![0u8; good.len()];
+        // 11172-3 §2.4.2.3: no "syncword - the bit string '1111 1111 1111'." in the first.
+        assert_eq!(mp2_channels_written(6, &[zeros, good.clone(), good]).0, 6);
     }
 
     #[test]
-    fn mp2_malformed_mc_falls_back_to_the_header_count_and_says_why() {
-        let mut f = mp2(Spec {
-            mc: Some(MC_3_2_LFE),
-            ..STEREO_256
-        });
-        f.truncate(20); // ends inside the Layer II allocation (11172-3 §2.4.1.6)
-        let (ch, diag) = mp2_channels_written(6, &[f]);
-        // 13818-3 §0.2.3.1: the base is "the basic stereo information".
+    fn mp2_damaged_frames_keep_the_ifo_value_until_one_proves_otherwise() {
+        let mut cut = mc_frame(MC_3_2_LFE);
+        cut.truncate(20); // ends inside the Layer II allocation (11172-3 §2.4.1.6)
+        // Nothing verifiable: the declared value stands.
+        assert_eq!(mp2_channels_written(6, std::slice::from_ref(&cut)).0, 6);
+        let (ch, diag) = mp2_channels_written(6, &[cut, mp2(STEREO_256)]);
+        // A clean MPEG-1 frame: "nch ... 2 in other modes", once the track ends.
         assert_eq!(ch, 2);
         assert!(
             diag.iter()
-                .any(|m| m.contains("tag=mp2.channels") && m.contains("Truncated(\"allocation\")")),
+                .any(|m| m.contains("tag=mp2.channels") && m.contains("stored=2")),
             "{diag:?}"
         );
     }
@@ -6272,12 +6303,9 @@ mod tests {
     fn mp2_no_header_keeps_the_declared_count_until_a_frame_parses() {
         // 11172-3 §2.4.2.3: "syncword - the bit string '1111 1111 1111'." - absent here.
         assert_eq!(mp2_channels_written(6, &[vec![0u8; 8]]).0, 6);
-        let later = mp2(Spec {
-            mc: Some(Mc {
-                ext: true,
-                ..MC_3_2_LFE
-            }),
-            ..STEREO_256
+        let later = mc_frame(Mc {
+            ext: true,
+            ..MC_3_2_LFE
         });
         assert_eq!(mp2_channels_written(6, &[vec![0u8; 8], later]).0, 2);
     }

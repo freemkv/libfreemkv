@@ -769,6 +769,9 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
             crate::disc::Stream::Video(v) if v.is_mvc_dependent() => {
                 super::codec::parser_for_mvc_dependent(codec, is_dvd_ps)
             }
+            crate::disc::Stream::Audio(a) if a.is_mp2_extension() => {
+                super::codec::parser_for_mp2_extension()
+            }
             _ => super::codec::parser_for_codec(codec, None, is_dvd_ps),
         };
         parsers.push((pid, parser));

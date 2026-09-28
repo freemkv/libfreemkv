@@ -200,6 +200,9 @@ pub struct DvdAudioAttr {
     pub channels: u8,
     pub sample_rate: u32,
     pub language: String,
+    /// Coding mode 3: mpucoder IFO "3 Mpeg-2ext"; EP0867877A2 "011b MPEG-2 with extension
+    /// bitstream" (mode 2 is "MPEG-1 or MPEG-2 without extension bit stream").
+    pub mpeg_ext: bool,
 }
 
 /// The on-wire VobSub sub-stream id (0x20..=0x3F) of one PGC_SPST_CTL entry, or `None` when
@@ -689,6 +692,7 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
         channels,
         sample_rate,
         language,
+        mpeg_ext: coding_mode == 3,
     })
 }
 
@@ -1219,6 +1223,7 @@ mod tests {
             channels: 6,
             sample_rate: 48000,
             language: "en".to_string(),
+            mpeg_ext: false,
         };
         assert_eq!(audio.channels, 6);
 
@@ -1471,6 +1476,19 @@ mod tests {
         assert_eq!(audio_pid(Codec::Mp2, 0), Some(0x00C0));
         assert_eq!(audio_pid(Codec::Mp2, 7), Some(0x00C7));
         assert_eq!(audio_pid(Codec::Unknown(1), 0), None);
+    }
+
+    /// mpucoder IFO coding mode "2 Mpeg-1, 3 Mpeg-2ext"; EP0867877A2 "010b MPEG-1 or MPEG-2
+    /// without extension bit stream", "011b MPEG-2 with extension bitstream".
+    #[test]
+    fn coding_mode_3_is_mpeg2_with_extension_and_mode_2_is_not() {
+        let attr = |b0: u8| parse_audio_attr(&[b0, 0x05, b'e', b'n', 0, 0, 0, 0], 0).unwrap();
+        assert_eq!((attr(0x60).codec, attr(0x60).mpeg_ext), (Codec::Mp2, true));
+        assert_eq!((attr(0x40).codec, attr(0x40).mpeg_ext), (Codec::Mp2, false));
+        assert!(
+            !attr(0x00).mpeg_ext,
+            "AC-3 (mode 0) carries no MPEG extension"
+        );
     }
 
     #[test]

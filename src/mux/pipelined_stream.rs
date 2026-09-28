@@ -44,6 +44,9 @@ pub struct PipelinedPesStream {
     /// are expected on every disc; instead of a per-packet WARN they're tallied
     /// and summarised once at EOF.
     dropped_nav_packets: u64,
+    /// Packets of MPEG-2 audio extension streams (`0xD0|n`) with no declared extension track,
+    /// reported once at EOF (see `ps::warn_undeclared_extensions`).
+    mpeg_extension_packets: [u64; 8],
     /// Per-track (by stream index) B1 drop-to-keyframe gate. After a TS gap on a
     /// video track, drop inter-coded frames until the next IRAP so the muxed
     /// stream stays decode-clean across an upstream concealed loss (P3/B1).
@@ -107,6 +110,7 @@ impl PipelinedPesStream {
             eof: false,
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             dropped_nav_packets: 0,
+            mpeg_extension_packets: [0; 8],
             resync,
             is_video,
             au_asm,
@@ -217,6 +221,11 @@ impl PipelinedPesStream {
             };
             let Some((_, track)) = self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
             else {
+                if let Some(base) = super::ps::dvd_mpeg_audio_extension_base(pid) {
+                    // Counted and reported once at EOF: no extension track was declared.
+                    self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
+                    continue;
+                }
                 tracing::warn!(
                     target: "mux",
                     "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
@@ -296,6 +305,7 @@ impl PipelinedPesStream {
                             self.dropped_nav_packets
                         );
                     }
+                    super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
                     // Drain any AU a parser buffered past the last PES (DTS-HD tail, MPEG-2
                     // final GOP), routing through the SAME B1 gate — flush frames carry their
                     // own `discontinuity`, so a trailing dangling-ref frame must not bypass it.
@@ -758,6 +768,85 @@ mod tests {
             stream.read().unwrap().is_none(),
             "flush frames for an unmapped PID are skipped"
         );
+    }
+
+    fn ext_packet(stream_id: u8, data: Vec<u8>) -> PsPacket {
+        PsPacket {
+            source: None,
+            stream_id,
+            sub_stream_id: None,
+            pts: Some(90_000),
+            dts: None,
+            data,
+        }
+    }
+
+    /// Extension packets (`0xD0|n`) with no declared extension track are counted and
+    /// reported once at EOF (tag=mp2.extension), not WARNed per packet.
+    #[test]
+    fn undeclared_extension_packets_are_reported_once_at_eof() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+        let batch = vec![
+            ext_packet(0xD1, vec![0x7F, 0xF0]),
+            ext_packet(0xD1, vec![0x7F, 0xF0]),
+            ext_packet(0xD5, vec![0x7F, 0xF0]),
+        ];
+        tx.send(DemuxBatch::Ps(batch)).unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let (frame, ev) = crate::testlog::capture(|| stream.read().unwrap());
+        assert!(frame.is_none());
+        let msgs: Vec<&str> = ev
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .map(|e| e.message())
+            .collect();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(
+            msgs[0].contains("tag=mp2.extension stream_id=0xd1 packets=2"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs[1].contains("tag=mp2.extension stream_id=0xd5 packets=1"),
+            "{msgs:?}"
+        );
+    }
+
+    /// A declared extension track (IFO coding mode 3) routes `0xD0|n` to its own track, each
+    /// PES whole: 13818-3 `ext_frame`s are not Layer II frames (2nd ed. §2.5.2.10 "ext_syncword -
+    /// A 12 bit string '0111 1111 1111'").
+    #[test]
+    fn declared_extension_track_carries_each_pes_whole() {
+        let mut title = DiscTitle::empty();
+        let ext = crate::disc::AudioStream {
+            pid: 0x00D1,
+            codec: Codec::Mp2,
+            channels: crate::disc::AudioChannels::Unknown,
+            language: "eng".into(),
+            sample_rate: crate::disc::SampleRate::S48,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: crate::disc::MP2_EXTENSION_LABEL.into(),
+        };
+        title.streams.push(crate::disc::Stream::Audio(ext));
+        // The canonical builder both read paths use picks the parser.
+        let (parsers, pid_to_track, _, _) =
+            super::super::resolve::build_demux_state(&title, crate::disc::ContentFormat::MpegPs);
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+        // Bytes that look like a Layer II header (0xFFF sync, 256 kbit/s, 48 kHz) must neither
+        // split an ext PES nor be held back as the start of a longer frame.
+        let first = vec![0x7F, 0xF0, 0x12, 0xFF, 0xFD, 0xC4, 0x00, 0x34, 0x56];
+        let second = vec![0xFF, 0xFD, 0xC4, 0x00, 0x7F, 0xF0, 0x12];
+        tx.send(DemuxBatch::Ps(vec![
+            ext_packet(0xD1, first.clone()),
+            ext_packet(0xD1, second.clone()),
+        ]))
+        .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let mut got = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            got.push((f.track, f.data));
+        }
+        assert_eq!(got, vec![(0, first), (0, second)]);
     }
 
     // consume_ps routes by the REAL DVD PID (via PsPacket::dvd_pid), e.g.

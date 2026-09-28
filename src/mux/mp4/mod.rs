@@ -154,6 +154,10 @@ pub enum Mp4SkipReason {
     /// A primary video track whose codec this MP4 writer can't carry
     /// (only HEVC/H.264 are supported — e.g. VC-1, MPEG-2, AV1).
     UnmappableVideo,
+    /// A DVD MPEG-2 multichannel extension track
+    /// ([`AudioStream::is_mp2_extension`](crate::disc::AudioStream::is_mp2_extension)): MP4
+    /// has no mapping for ISO/IEC 13818-3 extension frames.
+    Mp2Extension,
     /// Planned as carried, but the stream delivered no sample at all, so
     /// `finish()` dropped the track rather than write an empty `trak`.
     /// A *post-mux* reason: [`fit_report`] cannot predict it, only
@@ -206,6 +210,9 @@ pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
                     // First primary video, but an unsupported codec (VC-1/MPEG-2/AV1).
                     skipped.push((i, Mp4SkipReason::UnmappableVideo));
                 }
+            }
+            DiscStream::Audio(a) if a.is_mp2_extension() => {
+                skipped.push((i, Mp4SkipReason::Mp2Extension));
             }
             DiscStream::Audio(a) => {
                 if audio::audio_fits(a.codec) {

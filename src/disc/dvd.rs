@@ -280,6 +280,24 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
             purpose: crate::disc::LabelPurpose::Normal,
             label: String::new(),
         }));
+        // Coding mode 3, "MPEG-2 with extension bitstream" (EP0867877A2): its extension stream
+        // `0xD0|n` becomes a dependent track right after the base (pairing inferred, see
+        // ps::dvd_mpeg_audio_extension_pid).
+        if a.mpeg_ext && a.codec == Codec::Mp2 {
+            let Some(ext_pid) = crate::mux::ps::dvd_mpeg_audio_extension_pid(0xD0 | n) else {
+                continue;
+            };
+            out.push(Stream::Audio(AudioStream {
+                pid: ext_pid,
+                codec: Codec::Mp2,
+                channels: AudioChannels::Unknown,
+                language: a.language.clone(),
+                sample_rate: SampleRate::from_hz(a.sample_rate),
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: crate::disc::MP2_EXTENSION_LABEL.to_string(),
+            }));
+        }
     }
     out
 }
@@ -768,6 +786,48 @@ mod tests {
         .0;
         // 13818-3 §2.5.2.8: "'0' no extension stream present" with 3/2 + LFE.
         assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 6);
+    }
+
+    // (pid, language, is_mp2_extension) of every audio track of a one-title disc.
+    fn scanned_audio(vts: Vec<u8>) -> Vec<(u16, String, bool)> {
+        scan_title(vts)
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some((a.pid, a.language.clone(), a.is_mp2_extension())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const MP2_EXT_51: (u8, u8) = (0x60, 0x05); // coding mode 3, 6 channels declared
+
+    /// IFO coding mode 3 ("3 Mpeg-2ext"; EP0867877A2 "011b MPEG-2 with extension bitstream")
+    /// declares the extension stream `0xD0|n` right after its base `0xC0|n`, n from AST_CTL.
+    /// This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn mode_3_mp2_declares_its_extension_track_after_the_base() {
+        let audio = [aud(MP2_EXT_51, b"en"), aud(MP2_2CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x8300, 0x8100]);
+        assert_eq!(
+            scanned_audio(vts),
+            vec![
+                (0x00C3, "eng".to_string(), false),
+                (0x00D3, "eng".to_string(), true),
+                // "010b MPEG-1 or MPEG-2 without extension bit stream": no extension track.
+                (0x00C1, "fra".to_string(), false),
+            ]
+        );
+    }
+
+    /// A stream AST_CTL marks absent declares neither its base nor its extension.
+    #[test]
+    fn absent_mode_3_stream_declares_no_extension_either() {
+        let audio = [aud(MP2_EXT_51, b"en"), aud(MP2_2CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x0000, 0x8000]);
+        assert_eq!(scanned_audio(vts), vec![(0x00C0, "fra".to_string(), false)]);
     }
 
     /// An unknown coding mode has no route: a unique placeholder PID 0xBD00 + i, never
