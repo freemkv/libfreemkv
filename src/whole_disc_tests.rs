@@ -717,3 +717,52 @@ fn unit_aligned_forwards_unmapped_stream_files() {
     use crate::sector::bus_removal::test_support::{Reports, assert_forwards, m2ts1};
     assert_forwards(UnitAligned::new(Reports(vec![m2ts1()]), Vec::new()));
 }
+
+/// LK21 (K-13), per spec — KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not
+/// encrypted"; corroborated by KS-22 (libaacs clears it per source packet). A decrypted
+/// image says so in every packet, so re-scanning it finds only clear pieces and asks nothing.
+#[test]
+fn decrypt_clears_cpi_on_every_source_packet() {
+    use crate::spec::keys::{KS_5_CPI, KS_22_LIBAACS_VERIFY_TS};
+    assert!(KS_5_CPI.text.contains("00₂ if the data is not encrypted"));
+    assert!(KS_22_LIBAACS_VERIFY_TS.text.contains("buf[i] &= ~0xc0;"));
+    let specs = [(300, 30, K0, ALL), (600, 30, K1, ALL)];
+    let files = one_file_each(&specs);
+    let mut keys = pool(&[K0, K1]);
+    let planned = plan(&mut img(1200, &specs), &mut keys, &files, &rule(None)).unwrap();
+    let bytes = write_through(img(1200, &specs), keys, &files, planned).unwrap();
+    for &(start, n, _, _) in &specs {
+        for lba in (start..start + n).step_by(3) {
+            let o = lba as usize * SECTOR;
+            for i in (0..6144).step_by(192) {
+                assert_eq!(bytes[o + i] & 0xC0, 0, "LBA {lba}, packet byte {i}: CPI");
+            }
+        }
+    }
+    // Re-scan the decrypted image: every piece reads Clear, and no source is asked.
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = asked.clone();
+    let fetch = KeyFetch::unit_only(std::sync::Arc::new(move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }));
+    let rescan_rule = KeyRule {
+        format: crate::ContentFormat::BdTs,
+        single: None,
+        fetch: Some(&fetch),
+        halt: None,
+    };
+    let mut decrypted = Img {
+        plain: bytes.clone(),
+        data: bytes,
+        probe_fail: None,
+        reads: Vec::new(),
+    };
+    let replanned = plan(&mut decrypted, &mut pool(&[K0, K1]), &files, &rescan_rule);
+    assert!(replanned.is_ok(), "{:?}", replanned.err());
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "requests"
+    );
+}

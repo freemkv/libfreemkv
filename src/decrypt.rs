@@ -1868,7 +1868,7 @@ mod spec_guards {
     use super::*;
     use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
     use crate::disc::ContentFormat;
-    use crate::spec::keys::KS_5_CPI;
+    use crate::spec::keys::{KS_5_CPI, KS_6_TP_EXTRA_HEADER, KS_22_LIBAACS_VERIFY_TS};
 
     const OURS: [u8; 16] = [0xA1; 16];
     const ALT: [u8; 16] = [0xB2; 16];
@@ -1936,5 +1936,70 @@ mod spec_guards {
         );
         assert_eq!(orphan, before, "the orphan keeps every byte, CPI included");
         assert_eq!(orphan[0] & 0xC0, 0xC0);
+    }
+
+    // The plaintext a decrypt must produce, with byte 0 of every 192-byte source packet
+    // masked to its 6 Arrival_time_stamp bits (KS-6): CPI cleared, the rest untouched.
+    fn cpi_cleared(mut plain: Vec<u8>) -> Vec<u8> {
+        for p in plain.chunks_mut(192) {
+            p[0] &= 0x3F;
+        }
+        plain
+    }
+
+    /// per spec; do not change without a spec citation — KS-5 [BD] §3.10.2: "shall be set
+    /// to 11₂ if the data is encrypted, or … 00₂ if the data is not encrypted"; KS-6 (CPI is
+    /// the top 2 bits of TP_extra_header); corroborated by KS-22 libaacs `buf[i] &= ~0xc0`.
+    #[test]
+    fn every_decrypted_unit_clears_cpi_in_all_32_packets() {
+        assert!(KS_5_CPI.text.contains("00₂ if the data is not encrypted"));
+        assert!(
+            KS_6_TP_EXTRA_HEADER
+                .text
+                .contains("Copy_permission_indicator 2 uimsbf Arrival_time_stamp 30 uimsbf")
+        );
+        assert!(KS_22_LIBAACS_VERIFY_TS.text.contains("buf[i] &= ~0xc0;"));
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, OURS)],
+            format: ContentFormat::BdTs,
+        };
+        let check = |label: &str, got: &[u8], plain: Vec<u8>| {
+            assert!(
+                cpi(got).iter().all(|&c| c == 0),
+                "{label}: CPI of all 32 packets"
+            );
+            assert_eq!(
+                got,
+                &cpi_cleared(plain)[..],
+                "{label}: ATS and payload untouched"
+            );
+        };
+
+        // A map-keyed unit (`Phase::All`, the base Unit Key).
+        let mut unit = encrypted(&OURS, 7);
+        let mut plain = unit.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        let map = AacsKeyMap::from_ranges(vec![(0, 3, 0)]);
+        decrypt_sectors_mapped(&mut unit, &keys, 0, &map).expect("map-keyed unit decrypts");
+        check("map-keyed", &unit, plain);
+
+        // A DAMAGED map-keyed unit: media garbage, still decrypted, so no longer ciphertext.
+        let mut damaged: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+            .map(|i| (i as u8).wrapping_mul(37) ^ 0x5A)
+            .collect();
+        damaged[0] |= 0xC0;
+        damaged[4] = 0x47; // the clear seed's sync: read on the unit grid
+        let mut plain = damaged.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        decrypt_sectors_mapped(&mut damaged, &keys, 0, &map).expect("no verify on Phase::All");
+        check("damaged map-keyed", &damaged, plain);
+
+        // Our half of a forensic segment (`Phase::Even`, unit 0 of the range).
+        let mut ours = encrypted(&OURS, 9);
+        let mut plain = ours.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Even)]);
+        decrypt_sectors_mapped(&mut ours, &keys, 0, &map).expect("our phase decrypts");
+        check("our forensic phase", &ours, plain);
     }
 }
