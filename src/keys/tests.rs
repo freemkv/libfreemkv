@@ -1632,3 +1632,33 @@ fn whole_disc_status_counts_keyed_files_without_titles() {
     let s = set.status();
     assert_eq!((s.keyed, s.proven, s.lazy), (1, 1, 0), "{s:?}");
 }
+
+/// KU §2.3 step 10 (review item 4). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits)
+/// indicates the number of CPS Units on the disc". The n_decl == 1 rule keys only Lazy
+/// pieces no other held key opened: a piece whose one readable probe another key opened
+/// stays Lazy with that candidate, never keyed with the proven key over it.
+#[test]
+fn single_unit_rule_never_overrides_a_piece_another_key_opened() {
+    let fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        1,
+        &[&[0, 1]],
+    );
+    let (b, n) = fx.file(1);
+    let src = fx.source();
+    src.kill(b + 3, b + n); // only B's first unit reads, and K2 opens it
+    let calls = Calls::default();
+    let set = resolve_with(
+        &fx,
+        &mut src.clone(),
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1, K2], &calls)],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    )
+    .unwrap();
+    assert_eq!(set.lazy(), &[(b, b + n)], "B stays Lazy (candidate K2)");
+    src.heal();
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
+}
