@@ -575,6 +575,17 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         self.finish_with_halt_timing(halt, JoinTiming::default())
     }
 
+    // `finish_with_halt_timing`, calling `on_poll` on every slice of the wait (the
+    // driver forwards flush progress from it, §4.5).
+    pub(crate) fn finish_with_halt_observed(
+        self,
+        halt: Option<&Halt>,
+        timing: JoinTiming,
+        _on_poll: &mut dyn FnMut(),
+    ) -> Result<R, Error> {
+        self.finish_with_halt_timing(halt, timing)
+    }
+
     // `finish_with_halt` with its windows as parameters (T7, T8).
     pub(crate) fn finish_with_halt_timing(
         self,

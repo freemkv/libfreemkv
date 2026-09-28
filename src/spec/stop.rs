@@ -116,6 +116,62 @@ pub const SS_7_AGID_INVALIDATE: SpecQuote = SpecQuote {
 const RUST_STD: &str = "The Rust Standard Library, core::sync::atomic (Rust 1.98.1)";
 const ORDERING_URL: &str = "https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html";
 
+const POSIX: &str = "The Open Group Base Specifications Issue 8 (IEEE Std 1003.1-2024), XSH";
+const FSYNC_URL: &str = "https://pubs.opengroup.org/onlinepubs/9799919799/functions/fsync.html";
+
+pub const SS_12_FSYNC_FDATASYNC: SpecQuote = SpecQuote {
+    id: "SS-12",
+    kind: QuoteKind::Normative,
+    source: POSIX,
+    section: "fsync() DESCRIPTION; fdatasync() DESCRIPTION",
+    locator: "pubs.opengroup.org functions/fsync.html and functions/fdatasync.html",
+    url: FSYNC_URL,
+    text: "The fsync() function shall request that all data for the open file descriptor named \
+           by fildes is to be transferred to the storage device associated with the file \
+           described by fildes. … The fsync() function shall not return until the system has \
+           completed that action or until an error is detected. … The fdatasync() function \
+           shall force all currently queued I/O operations associated with the file indicated \
+           by file descriptor fildes to the synchronized I/O completion state.",
+};
+
+pub const SS_13_SYNC_FILE_RANGE: SpecQuote = SpecQuote {
+    id: "SS-13",
+    kind: QuoteKind::Normative,
+    source: "Linux man-pages, sync_file_range(2)",
+    section: "DESCRIPTION, Warning and Some details",
+    locator: "man7.org sync_file_range(2)",
+    url: "https://man7.org/linux/man-pages/man2/sync_file_range.2.html",
+    text: "None of these operations writes out the file's metadata. … This system call does \
+           not flush disk write caches and thus does not provide any data integrity on systems \
+           with volatile disk write caches. … SYNC_FILE_RANGE_WAIT_BEFORE | \
+           SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER This is a write-for-data-integrity \
+           operation that will ensure that all pages in the specified range which were dirty \
+           when sync_file_range() was called are committed to disk.",
+};
+
+pub const SS_14_F_FULLFSYNC: SpecQuote = SpecQuote {
+    id: "SS-14",
+    kind: QuoteKind::Normative,
+    source: "Apple xnu, fcntl(2) manual page (bsd/man/man2/fcntl.2)",
+    section: "DESCRIPTION, F_FULLFSYNC",
+    locator: "xnu bsd/man/man2/fcntl.2 (apple-oss-distributions, main); man 2 fcntl on macOS",
+    url: "https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/fcntl.2",
+    text: "Does the same thing as fsync(2) then asks the drive to flush all buffered data to \
+           the permanent storage device (arg is ignored). … This is currently implemented on \
+           HFS, MS-DOS (FAT), Universal Disk Format (UDF) and APFS file systems.",
+};
+
+pub const SS_15_FLUSH_FILE_BUFFERS: SpecQuote = SpecQuote {
+    id: "SS-15",
+    kind: QuoteKind::Normative,
+    source: "Microsoft Learn, Win32 API: FlushFileBuffers function (fileapi.h)",
+    section: "Remarks",
+    locator: "learn.microsoft.com nf-fileapi-flushfilebuffers",
+    url: "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers",
+    text: "The FlushFileBuffers function writes all the buffered information for a specified \
+           file to the device or pipe.",
+};
+
 pub const SS_23_RELEASE_ACQUIRE: SpecQuote = SpecQuote {
     id: "SS-23",
     kind: QuoteKind::Normative,
@@ -137,5 +193,9 @@ pub const ALL: &[&SpecQuote] = &[
     &SS_5_PREVENT_ALLOW,
     &SS_6_START_STOP_LOEJ,
     &SS_7_AGID_INVALIDATE,
+    &SS_12_FSYNC_FDATASYNC,
+    &SS_13_SYNC_FILE_RANGE,
+    &SS_14_F_FULLFSYNC,
+    &SS_15_FLUSH_FILE_BUFFERS,
     &SS_23_RELEASE_ACQUIRE,
 ];

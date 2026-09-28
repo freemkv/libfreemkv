@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const ADAPTIVE_WINDOW: usize = 16;
-const CHUNK_BYTES_MIN: u64 = 4 * 1024 * 1024;
+use super::CHUNK_BYTES_MIN;
 const CHUNK_BYTES_MAX: u64 = 256 * 1024 * 1024;
 const ADAPTIVE_GROW_MS: u64 = 200;
 const ADAPTIVE_SHRINK_MS: u64 = 20;

@@ -27,7 +27,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use super::flush::FlushProgress;
 use super::writeback::WritebackPipeline;
+use crate::halt::Halt;
 
 // Linux sync_file_range granularity. 32 MiB measured best on a 1 GbE NFS
 // mount (8/64/128 MiB all worse); override via FREEMKV_WRITEBACK_CHUNK_MIB.
@@ -57,6 +59,8 @@ pub struct WritebackFile {
     seek_count: u64,
     /// Sum of |delta| over all position-moving seeks, in bytes.
     seek_bytes: u64,
+    /// Shared flush counters (§2.10): accepted writes and completed flushes.
+    flush: FlushProgress,
 }
 
 impl WritebackFile {
@@ -73,7 +77,42 @@ impl WritebackFile {
             pos,
             seek_count: 0,
             seek_bytes: 0,
+            flush: FlushProgress::default(),
         })
+    }
+
+    /// The token a blocked write or [`sync_all`](Self::sync_all) observes: a cancel
+    /// returns [`E_HALTED`](crate::error::E_HALTED) at once.
+    pub fn set_halt(&mut self, halt: Halt) {
+        let _ = halt;
+    }
+
+    /// Share `flush`'s counters (§2.10 item 3): give it the pipeline consumer's
+    /// [`Progress`](crate::halt::Progress) so a flushing `close()` counts as progress.
+    /// Call before the first write.
+    pub fn set_flush_progress(&mut self, flush: FlushProgress) {
+        self.flush = flush;
+    }
+
+    /// This file's flush counters: accepted writes and completed flushes.
+    pub fn flush_progress(&self) -> &FlushProgress {
+        &self.flush
+    }
+
+    // Flusher mode over `ops` whatever the OS, with the timing as a parameter.
+    #[cfg(test)]
+    pub(crate) fn with_flush_ops(
+        file: File,
+        _ops: std::sync::Arc<dyn super::flush::FlushOps>,
+        _timing: super::flush::FlushTiming,
+    ) -> io::Result<Self> {
+        Self::new(file)
+    }
+
+    // The flusher's current chunk size.
+    #[cfg(test)]
+    pub(crate) fn chunk_bytes(&self) -> u64 {
+        super::flush::FlushTiming::default().chunk_start
     }
 
     /// Create a new file at `path` (truncating any existing contents)

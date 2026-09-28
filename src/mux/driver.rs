@@ -16,6 +16,7 @@ use crate::disc::DiscTitle;
 use crate::error::Error;
 use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::halt::Halt;
+use crate::io::FlushProgress;
 use crate::io::pipeline::{Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH};
 use crate::pes::{CountingStream, PesFrame, Stream};
 use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
@@ -176,6 +177,10 @@ pub trait MuxEvents: Send + Sync + 'static {
     fn on_batch_size_changed(&self, _batch: u16, _reason: BatchSizeReason) {}
     /// A read error occurred at `lba`.
     fn on_read_error(&self, _lba: u32) {}
+    /// While the output is being flushed at the end (the driver waiting on a closing
+    /// consumer): more bytes became durable. One call per increase, at most 4 per second,
+    /// none while nothing moves, so silence means a stalled flush (stop design §4.5).
+    fn on_flush_progress(&self, _bytes_durable: u64, _bytes_total: u64) {}
 }
 
 /// A [`MuxEvents`] that ignores everything — test-only (production callers
@@ -529,13 +534,16 @@ fn finish_pumped<I: Send + 'static, R: Send + 'static>(
     pipe: Pipeline<I, R>,
     halt: &Halt,
     send_timed_out: bool,
+    _flush: &FlushProgress,
+    _events: &dyn MuxEvents,
 ) -> Result<R, Error> {
     if send_timed_out {
         let wedged = Halt::new();
         wedged.cancel();
         return pipe.finish_with_halt(Some(&wedged));
     }
-    pipe.finish_with_halt(Some(halt))
+    let timing = crate::io::pipeline::JoinTiming::default();
+    pipe.finish_with_halt_observed(Some(halt), timing, &mut || {})
 }
 
 // Whether a finished mux counts as COMPLETED: interrupted, finalize_failed, or halt_cancelled
@@ -825,14 +833,19 @@ fn drive_mux(
     // ── Finish ── Drop the producer, join the consumer; `close()` finalises
     // the container. On halt/wedge this returns an error variant, translated
     // to `completed = false` rather than a hard failure.
-    let (bytes_written, undelivered_streams, finalize_failed) =
-        match finish_pumped(pipe, halt, send_timed_out) {
-            Ok(c) => (c.bytes, c.undelivered, false),
-            Err(Error::Halted | Error::PipelineJoinTimeout) => {
-                (bytes.load(Ordering::Relaxed), Vec::new(), true)
-            }
-            Err(e) => return Err(e.into()),
-        };
+    let (bytes_written, undelivered_streams, finalize_failed) = match finish_pumped(
+        pipe,
+        halt,
+        send_timed_out,
+        &FlushProgress::default(),
+        events,
+    ) {
+        Ok(c) => (c.bytes, c.undelivered, false),
+        Err(Error::Halted | Error::PipelineJoinTimeout) => {
+            (bytes.load(Ordering::Relaxed), Vec::new(), true)
+        }
+        Err(e) => return Err(e.into()),
+    };
     if !undelivered_streams.is_empty() {
         tracing::warn!(
             target: "mux",
@@ -2949,7 +2962,8 @@ mod tests {
         assert!(timed_out, "the stuck consumer trips the send deadline");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(finish_pumped(pipe, &halt, true).is_err());
+            let flush = FlushProgress::default();
+            let _ = tx.send(finish_pumped(pipe, &halt, true, &flush, &NoopEvents).is_err());
         });
         let failed = rx
             .recv_timeout(Duration::from_secs(30))
@@ -3028,5 +3042,75 @@ mod tests {
         assert!(out.completed);
         let back = MkvStream::open(std::fs::File::open(&dst).unwrap()).unwrap();
         assert_eq!(back.track_timing(0), timing);
+    }
+
+    // Records every `on_flush_progress` call.
+    #[derive(Default)]
+    struct FlushSpy(std::sync::Mutex<Vec<(u64, u64)>>);
+
+    impl MuxEvents for FlushSpy {
+        fn on_flush_progress(&self, durable: u64, total: u64) {
+            self.0.lock().unwrap().push((durable, total));
+        }
+    }
+
+    // `close()` makes `steps` bytes durable, `gap` apart, then idles `tail`.
+    struct FlushingClose {
+        flush: FlushProgress,
+        steps: u64,
+        gap: Duration,
+        tail: Duration,
+    }
+
+    impl Sink<u64> for FlushingClose {
+        type Output = ();
+        fn apply(&mut self, _: u64) -> Result<Flow, Error> {
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> Result<(), Error> {
+            self.flush.note_total(self.steps * 1000);
+            for _ in 0..self.steps {
+                std::thread::sleep(self.gap);
+                self.flush.add_durable(1000);
+            }
+            std::thread::sleep(self.tail);
+            Ok(())
+        }
+    }
+
+    fn finish_flushing(steps: u64, gap: Duration, tail: Duration) -> Vec<(u64, u64)> {
+        let flush = FlushProgress::new(crate::halt::Progress::new());
+        let sink = FlushingClose {
+            flush: flush.clone(),
+            steps,
+            gap,
+            tail,
+        };
+        let progress = flush.progress().clone();
+        let pipe = Pipeline::spawn_named_with_progress("t-flush", 4, sink, progress).unwrap();
+        let spy = FlushSpy::default();
+        finish_pumped(pipe, &Halt::new(), false, &flush, &spy).unwrap();
+        spy.0.into_inner().unwrap()
+    }
+
+    /// LP20 (§4.5): while the driver waits on a closing consumer, each increase of the
+    /// flusher's bytes produces one `on_flush_progress`, and none while it is static.
+    #[test]
+    fn finish_with_halt_forwards_flush_progress() {
+        let calls = finish_flushing(4, Duration::from_millis(300), Duration::from_millis(600));
+        let want: Vec<(u64, u64)> = (1..=4).map(|i| (i * 1000, 4000)).collect();
+        assert_eq!(
+            calls, want,
+            "one call per increase, none during the idle tail"
+        );
+    }
+
+    /// LP20, the rate limit: a burst of increases is forwarded at most 4 times a second,
+    /// and the last value still arrives.
+    #[test]
+    fn flush_progress_is_rate_limited_to_4hz() {
+        let calls = finish_flushing(20, Duration::from_millis(5), Duration::from_millis(600));
+        assert!(!calls.is_empty() && calls.len() <= 3, "{calls:?}");
+        assert_eq!(calls.last(), Some(&(20_000, 20_000)));
     }
 }
