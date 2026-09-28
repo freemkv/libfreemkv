@@ -791,6 +791,23 @@ mod tests {
         );
     }
 
+    // D1: a tail that ends short of the picture start never crosses it without a PTS: with
+    // 494 bytes left and the mark 484 away, the commencing PES cannot fit (cap 480) and the
+    // tail stops at the mark.
+    #[test]
+    fn a_tail_never_crosses_the_picture_start() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 5_000, 3_000));
+        m.streams[0].first_pes_done = true;
+        m.streams[0].queue[0].sent = 3_000 - 484;
+        let p = m.plan_pes(0, 494, 0);
+        assert!(
+            p.as_ref().is_none_or(|p| p.start.is_none() && p.len <= 484),
+            "{:?}",
+            p.map(|p| (p.len, p.start))
+        );
+    }
+
     // An AU's first byte and its commencement byte share one PES: a PES ends before the next
     // AU's first byte, never between its sequence header and its picture start code (MS-15).
     #[test]
