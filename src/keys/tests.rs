@@ -1310,6 +1310,17 @@ fn on_arrival_a_garbled_head_keeping_sync_is_blanked_never_e7022() {
     );
 }
 
+/// KU §2.4 step 1: a unit that opens, whose only partners in the read are damaged (garbled
+/// heads that kept their sync), looks further in side reads before any verdict: never E7022.
+#[test]
+fn on_arrival_damaged_batch_partners_fall_back_to_side_reads() {
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| garble_keeping_sync(fx, 1, 1));
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    let got = read(&mut r, &fx, 1, 0, 2).expect("a side read finds an intact partner");
+    assert_eq!(&got[..ALIGNED_UNIT_LEN], &fx.plain(fx.unit(1, 0), 1)[..]);
+    assert_eq!(set.proof_cache().get(fx.file(1).0), Some(Proof::Proven(1)));
+}
+
 /// Sweep, patch and image→ISO read through the whole-disc reader, one call per block. A
 /// cluster of damaged units (KS-4: "The first 16 bytes of each Aligned Unit is used as the
 /// seed") is blanked and counted wherever it falls, never E7013: multipass must not error.

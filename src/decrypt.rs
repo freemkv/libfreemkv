@@ -1841,6 +1841,34 @@ mod tests {
         ));
     }
 
+    /// The wrong-key verdict is per key: a read spanning a good FMTS range and a wrong-keyed
+    /// one stops, even though the good range's units verify.
+    #[test]
+    fn mapped_phase_wrong_key_stops_beside_a_good_range() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let good = [0xAAu8; 16];
+        let mut buf = vec![0u8; 8 * ul];
+        for i in 0..8 {
+            let mut u = clear_ts_unit();
+            aacs_encrypt_unit_for_test(&mut u, &good);
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, good), (1, [0xCCu8; 16])],
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges_phased(vec![
+            (0, 4 * usz, 0, Phase::Even),
+            (4 * usz, 8 * usz, 1, Phase::Even),
+        ]);
+        assert!(matches!(
+            decrypt_sectors_mapped(&mut buf, &keys, 0, &map),
+            Err(crate::error::Error::DecryptFailed)
+        ));
+    }
+
     /// Phase::All (multi-CPS / base) decrypts EVERY unit and never runs the verify
     /// — the common-disc path is byte-for-byte unchanged.
     #[test]
