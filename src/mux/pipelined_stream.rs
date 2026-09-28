@@ -148,7 +148,11 @@ impl PipelinedPesStream {
                 Ok(true)
             }
             Ok(DemuxBatch::Err(e)) => Err(e),
-            // Explicit clean-completion sentinel from the demux worker.
+            // Explicit clean-completion sentinel from the demux worker; a Stop that
+            // raced it is still `Halted`, never a truncated clean end (LP11).
+            Ok(DemuxBatch::Eof) if self.halt.is_cancelled() => {
+                Err(crate::error::Error::Halted.into())
+            }
             Ok(DemuxBatch::Eof) => Ok(false),
             // Channel disconnected WITHOUT an `Eof`/`Err` sentinel — the worker
             // panicked or was dropped mid-stream. Surface as an error so a parser/demux
@@ -557,6 +561,46 @@ mod tests {
         let err = r.expect_err("a stop is not a frame or EOF");
         assert!(crate::error::is_halt(&err), "{err}");
         drop(tx);
+    }
+
+    /// LP11 on the highway: a Stop mid-stream through a real demux worker yields
+    /// `Err(Halted)`, never `Ok(None)` (a truncated container finalised as complete),
+    /// and an `Eof` that raced the Stop is `Halted` too.
+    #[test]
+    fn highway_stop_mid_stream_is_halted_never_eof() {
+        let halt = crate::halt::Halt::new();
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+        let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(8);
+        let (dt, rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), Some(halt.clone()), None, None)
+                .expect("spawn");
+        let mut stream = PipelinedPesStream::new(dt, rx, DiscTitle::empty(), vec![], vec![])
+            .with_halt(Some(halt.clone()));
+        pf_tx.send(Ok(vec![0u8; 188])).unwrap();
+        halt.cancel();
+        // The halted prefetcher closes its channel.
+        drop(pf_tx);
+        let mut outcome = None;
+        for _ in 0..16 {
+            match stream.read() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("a Stop must never read as a clean end of stream"),
+                Err(e) => {
+                    outcome = Some(e);
+                    break;
+                }
+            }
+        }
+        let e = outcome.expect("the Stop surfaced");
+        assert!(crate::error::is_halt(&e), "{e}");
+
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        let halt = crate::halt::Halt::new();
+        stream = stream.with_halt(Some(halt.clone()));
+        halt.cancel();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let e = stream.read().expect_err("an Eof after a Stop is not clean");
+        assert!(crate::error::is_halt(&e), "{e}");
     }
 
     // CLEAN EOF: explicit Eof sentinel → consumer returns Ok(None) and stays
