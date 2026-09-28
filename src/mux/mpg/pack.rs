@@ -7,7 +7,6 @@ pub(crate) const PACK_BYTES: usize = 2048;
 /// Pack header without stuffing (MS-2: 32 + 2 + 3 + 1 + 15 + 1 + 15 + 1 + 9 + 1 + 22 + 1 + 1
 /// + 5 + 3 bits).
 pub(crate) const PACK_HEADER_BYTES: usize = 14;
-#[cfg(test)]
 /// Offset in a pack of the byte holding the last bit of `system_clock_reference_base`
 /// (MS-4: the byte whose arrival time the SCR encodes).
 pub(crate) const SCR_BASE_LAST_BYTE: usize = 8;

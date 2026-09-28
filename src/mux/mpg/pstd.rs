@@ -412,8 +412,11 @@ impl<W: Write> Mux<W> {
         None
     }
 
-    // Build one PES of stream `si` from `plan`; update queue, buffer model and counters.
-    fn emit_pes(&mut self, si: usize, plan: PesPlan, arrival_end: u64) -> Vec<u8> {
+    // Build one PES of stream `si` from `plan`; update queue and buffer model. Each AU it
+    // completes is returned as `(decoding time, offset of its last byte, oversize)`.
+    fn emit_pes(&mut self, si: usize, plan: PesPlan) -> (Vec<u8>, Vec<(u64, usize, bool)>) {
+        let buffer_bytes = self.buffers[self.streams[si].spec.buffer].bytes();
+        let mut done_aus = Vec::new();
         let s = &self.streams[si];
         let mut fields = PesFields::default();
         if let Some((k, _)) = plan.start {
@@ -488,16 +491,15 @@ impl<W: Write> Mux<W> {
                 }),
             }
             if done {
-                // MS-16: complete "at the decoding time"; later is counted, not refused.
-                if arrival_end > dec27 {
-                    self.counters.late_aus += 1;
-                }
+                // Design §2.4 (MPG3-7): the AU plan_pes let past a buffer it cannot fit.
+                let oversize = (q.au.data.len() + hdr_len) as u64 > buffer_bytes;
+                done_aus.push((dec27, out.len() - 1, oversize));
                 self.queued_bytes -= q.au.data.len();
                 s.queue.pop_front();
             }
         }
         self.streams[si].first_pes_done = true;
-        out
+        (out, done_aus)
     }
 
     // Design §2.4 step 5: the lowest rate, rounded up to 50 B/s units, that delivers every
@@ -531,13 +533,14 @@ impl<W: Write> Mux<W> {
     fn write_pack(&mut self, t: u64, padding_only: bool) -> io::Result<bool> {
         self.remove_decoded(t);
         let rate = if padding_only { self.r0 } else { self.rate(t) };
-        let arrival_end = t + dur27(pack::PACK_BYTES as u64, rate);
         let prefix = self.first.take();
         let mut avail =
             pack::PACK_BYTES - pack::PACK_HEADER_BYTES - prefix.as_ref().map_or(0, Vec::len);
         let mut body: Vec<u8> = prefix.clone().unwrap_or_default();
         let mut any = false;
         let mut last_pes = None;
+        // AUs completed in this pack: (decoding time, offset in `body`, oversize, PES start).
+        let mut done_aus: Vec<(u64, usize, bool, usize)> = Vec::new();
         while !padding_only && avail >= 10 {
             let mut best: Option<(u64, usize, PesPlan)> = None;
             for si in 0..self.streams.len() {
@@ -552,9 +555,11 @@ impl<W: Write> Mux<W> {
                 }
             }
             let Some((_, si, plan)) = best else { break };
-            let pes = self.emit_pes(si, plan, arrival_end);
+            let (pes, done) = self.emit_pes(si, plan);
             avail -= pes.len();
-            last_pes = Some(body.len());
+            let at = body.len();
+            done_aus.extend(done.into_iter().map(|(d, o, big)| (d, at + o, big, at)));
+            last_pes = Some(at);
             body.extend_from_slice(&pes);
             any = true;
         }
@@ -564,6 +569,7 @@ impl<W: Write> Mux<W> {
         // Design §2.3 pack fill: a padding PES for ≥ 6 bytes; 1-5 bytes become PES-header
         // stuffing on the last PES (MS-13 "No more than 32"), keeping the pack header
         // unstuffed like a DVD VOB pack; pack stuffing (MS-3 ≤ 7) only with no PES at all.
+        let mut stuffed = None;
         let stuffing = match (avail, last_pes) {
             (0, _) => 0,
             (a, _) if a >= pack::MIN_PADDING_PES => {
@@ -572,10 +578,25 @@ impl<W: Write> Mux<W> {
             }
             (a, Some(at)) => {
                 pack::stuff_pes_header(&mut body, at, a);
+                stuffed = Some((at, a));
                 0
             }
             (a, None) => a,
         };
+        // MS-16: complete "at the decoding time"; later is counted, not refused. A byte's
+        // arrival follows MS-4 eq. 2-21 from this pack's SCR and rate.
+        for (dec27, off, oversize, pes_at) in done_aus {
+            let shift = stuffed
+                .filter(|(at, _)| *at == pes_at)
+                .map_or(0, |(_, n)| n);
+            let pos = pack::PACK_HEADER_BYTES + stuffing + off + shift;
+            let arrival = t
+                + ((pos - pack::SCR_BASE_LAST_BYTE) as u128 * TICKS_PER_BYTE_UNIT
+                    / u128::from(rate)) as u64;
+            if arrival > dec27 || oversize {
+                self.counters.late_aus += 1;
+            }
+        }
         let mut p = pack::pack_header(t, rate, stuffing);
         p.extend_from_slice(&body);
         debug_assert_eq!(p.len(), pack::PACK_BYTES);
