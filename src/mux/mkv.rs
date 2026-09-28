@@ -4442,6 +4442,50 @@ mod tests {
     }
 
     #[test]
+    fn probe_round_trips_the_writer_header() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));
+        let p = crate::mux::probe_mkv(Cursor::new(&data)).unwrap();
+        assert_eq!(p.muxing_app.as_deref(), Some(crate::MUX_APP));
+        assert_eq!(p.writing_app.as_deref(), Some(crate::MUX_APP));
+        let want: Vec<u32> = env!("FREEMKV_VERSION")
+            .split(['.', '-'])
+            .take(3)
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let (a, b, c) = crate::mux::parse_freemkv_version(crate::MUX_APP).unwrap();
+        assert_eq!(vec![a, b, c], want);
+        assert_eq!(p.timestamp_scale, TIMESTAMP_SCALE_NS as u64);
+        assert!((p.duration_secs.unwrap() - 10.0).abs() < 0.1, "{p:?}");
+        let ids: Vec<&str> = p.tracks.iter().map(|t| t.codec_id.as_str()).collect();
+        assert_eq!(ids, [ebml::CODEC_H264, ebml::CODEC_AC3]);
+        assert_eq!(p.tracks[1].language, "eng");
+        assert_eq!(p.last_cue_secs, None);
+
+        let p = crate::mux::probe_mkv_with_cues(Cursor::new(&data)).unwrap();
+        let cue = p.last_cue_secs.expect("writer emits Cues");
+        assert!((8.0..=10.0).contains(&cue), "last cue {cue}");
+    }
+
+    #[test]
+    fn declared_duration_is_kept_not_measured() {
+        // A title that declares its runtime keeps that value in the header even
+        // when fewer seconds were muxed; only the Cues reflect the real timeline.
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let tracks = [make_video_track()];
+        let mut muxer =
+            MkvMuxer::new(SharedWriter(shared.clone()), &tracks, None, 100.0, &[]).unwrap();
+        for (t, pts, kf, d) in frames_for(5.0, 1.0) {
+            muxer.write_frame(t, pts, kf, &d, None, None).unwrap();
+        }
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+        let p = crate::mux::probe_mkv_with_cues(Cursor::new(&data)).unwrap();
+        assert!((p.duration_secs.unwrap() - 100.0).abs() < 1e-6, "{p:?}");
+        assert!(p.last_cue_secs.unwrap() < 5.0, "{p:?}");
+    }
+
+    #[test]
     fn seekhead_points_to_real_elements() {
         let tracks = [make_video_track(), make_audio_track()];
         let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));

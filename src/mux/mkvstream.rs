@@ -6,10 +6,221 @@
 use super::mkv::{MkvMuxer, MkvTrack};
 use super::{WriteSeek, ebml};
 
-/// (title, codec_privates, ts_scale_ns, track_table) — `ts_scale_ns` is the
-/// TimestampScale in nanoseconds per tick, threaded into the frame read path;
-/// `track_table` maps Matroska TrackNumbers onto `DiscTitle::streams` indices.
-type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>, i64, TrackTable)>;
+// Parsed Info + Tracks. `ts_scale_ns` feeds the frame read path; `tracks` maps Matroska
+// TrackNumbers onto `DiscTitle::streams` indices; `probe` is the public header view.
+struct MkvHeader {
+    title: crate::disc::DiscTitle,
+    codec_privates: Vec<(u16, Vec<u8>)>,
+    ts_scale_ns: i64,
+    tracks: TrackTable,
+    probe: MkvProbe,
+}
+
+/// What a Matroska file declares about itself, read by [`probe_mkv`] from the
+/// Info and Tracks elements alone (no cluster is read).
+///
+/// `muxing_app` / `writing_app` name the program that wrote the file; for
+/// freemkv output they carry its version (see [`parse_freemkv_version`]).
+/// `duration_secs` is the Segment's declared Duration (absent when the file
+/// has none). `last_cue_secs` is only filled by [`probe_mkv_with_cues`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MkvProbe {
+    pub muxing_app: Option<String>,
+    pub writing_app: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub title: Option<String>,
+    pub tracks: Vec<MkvProbeTrack>,
+    /// TimestampScale in nanoseconds per tick (Matroska default 1 000 000).
+    pub timestamp_scale: u64,
+    /// Timestamp of the last Cues entry, i.e. the start of the last indexed
+    /// cluster — a lower bound on the muxed runtime.
+    pub last_cue_secs: Option<f64>,
+}
+
+/// One TrackEntry as declared in the Tracks element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MkvProbeTrack {
+    pub number: u16,
+    pub kind: MkvTrackKind,
+    pub codec_id: String,
+    pub language: String,
+}
+
+/// Matroska TrackType.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MkvTrackKind {
+    Video,
+    Audio,
+    Subtitle,
+    Other(u64),
+}
+
+impl MkvTrackKind {
+    fn from_track_type(t: u64) -> Self {
+        match t {
+            1 => Self::Video,
+            2 => Self::Audio,
+            17 => Self::Subtitle,
+            n => Self::Other(n),
+        }
+    }
+}
+
+/// Read the EBML header, Segment Info and Tracks of a Matroska file and stop:
+/// no cluster is touched, so this is cheap enough to run over a whole library.
+pub fn probe_mkv(mut r: impl Read) -> io::Result<MkvProbe> {
+    Ok(parse_mkv_header(&mut r)?.probe)
+}
+
+/// [`probe_mkv`] plus `last_cue_secs`: follows the SeekHead to the Cues element
+/// (seeking over clusters, never reading one). `last_cue_secs` stays `None`
+/// when the file has no Cues.
+pub fn probe_mkv_with_cues(mut r: impl Read + io::Seek) -> io::Result<MkvProbe> {
+    r.seek(io::SeekFrom::Start(0))?;
+    let mut probe = parse_mkv_header(&mut r)?.probe;
+    r.seek(io::SeekFrom::Start(0))?;
+    let last_cue_ticks = last_cue_ticks(&mut r)?;
+    probe.last_cue_secs =
+        last_cue_ticks.map(|t| t as f64 * probe.timestamp_scale as f64 / 1_000_000_000.0);
+    Ok(probe)
+}
+
+/// The `(major, minor, patch)` of a freemkv muxing-app string such as
+/// `"freemkv 1.7.7 (gc8e67f1)"`. `None` for other writers and for the bare
+/// `"freemkv"` older builds wrote. A pre-release suffix on the patch
+/// (`"1.8.0-rc.1"`) is ignored.
+pub fn parse_freemkv_version(app: &str) -> Option<(u32, u32, u32)> {
+    let ver = app
+        .trim()
+        .strip_prefix("freemkv ")?
+        .split_whitespace()
+        .next()?;
+    let mut parts = ver.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?;
+    let digits = patch
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(patch.len());
+    Some((major, minor, patch[..digits].parse().ok()?))
+}
+
+// Walk the Segment's top-level elements (seeking, never reading a cluster) to the
+// Cues — directly or via a SeekHead entry — and return the largest CueTime.
+fn last_cue_ticks(r: &mut (impl Read + io::Seek)) -> io::Result<Option<u64>> {
+    let (id, size, _) = ebml::read_element_header(r)?;
+    if id != ebml::EBML || size == u64::MAX {
+        return Err(crate::error::Error::MkvSourceInvalid.into());
+    }
+    skip_bytes(r, size)?;
+    let (id, seg_size, _) = ebml::read_element_header(r)?;
+    if id != ebml::SEGMENT {
+        return Err(crate::error::Error::MkvSourceInvalid.into());
+    }
+    let seg_start = r.stream_position()?;
+    let seg_end = seg_start.saturating_add(seg_size);
+    let mut cues_pos: Option<u64> = None;
+    let mut pos = seg_start;
+    while pos < seg_end {
+        let (id, size, hlen) = match ebml::read_element_header(r) {
+            Ok(h) => h,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        };
+        if size == u64::MAX {
+            break;
+        }
+        match id {
+            ebml::CUES => return read_last_cue(r, size).map(Some),
+            ebml::SEEK_HEAD if cues_pos.is_none() => {
+                cues_pos = seekhead_target(r, size, ebml::CUES)?;
+            }
+            ebml::CLUSTER => break,
+            _ => {
+                r.seek(io::SeekFrom::Current(i64::try_from(size).map_err(
+                    |_| io::Error::from(crate::error::Error::MkvSourceInvalid),
+                )?))?;
+            }
+        }
+        pos = pos.saturating_add(hlen as u64).saturating_add(size);
+        r.seek(io::SeekFrom::Start(pos))?;
+    }
+    let Some(rel) = cues_pos else {
+        return Ok(None);
+    };
+    r.seek(io::SeekFrom::Start(seg_start.saturating_add(rel)))?;
+    let (id, size, _) = ebml::read_element_header(r)?;
+    if id != ebml::CUES || size == u64::MAX {
+        return Err(crate::error::Error::MkvSourceInvalid.into());
+    }
+    read_last_cue(r, size).map(Some)
+}
+
+// SeekPosition (relative to the Segment body) of `target` in a SeekHead body.
+fn seekhead_target(r: &mut impl Read, size: u64, target: u32) -> io::Result<Option<u64>> {
+    let mut found = None;
+    for_each_child(r, size, |r, cid, cs| {
+        if cid != ebml::SEEK {
+            return skip_bytes(r, cs);
+        }
+        let (mut id, mut at) = (None, None);
+        for_each_child(r, cs, |r, sid, ss| match sid {
+            ebml::SEEK_ID => {
+                let b = ebml::read_binary_val(r, checked_size(ss, 4)?)?;
+                id = Some(b.iter().fold(0u32, |acc, &x| (acc << 8) | x as u32));
+                Ok(())
+            }
+            ebml::SEEK_POSITION => {
+                at = Some(read_uint_bounded(r, ss)?);
+                Ok(())
+            }
+            _ => skip_bytes(r, ss),
+        })?;
+        if id == Some(target) && found.is_none() {
+            found = at;
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+// Largest CueTime (in TimestampScale ticks) over the CuePoints of a Cues body.
+fn read_last_cue(r: &mut impl Read, size: u64) -> io::Result<u64> {
+    let mut last = 0u64;
+    for_each_child(r, size, |r, cid, cs| {
+        if cid != ebml::CUE_POINT {
+            return skip_bytes(r, cs);
+        }
+        for_each_child(r, cs, |r, pid, ps| {
+            if pid == ebml::CUE_TIME {
+                last = last.max(read_uint_bounded(r, ps)?);
+                Ok(())
+            } else {
+                skip_bytes(r, ps)
+            }
+        })
+    })?;
+    Ok(last)
+}
+
+// Visit each child of a sized master body, rejecting unknown-size or overrunning children.
+fn for_each_child<R: Read>(
+    r: &mut R,
+    size: u64,
+    mut f: impl FnMut(&mut R, u32, u64) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut remaining = size;
+    while remaining > 0 {
+        let (cid, cs, hlen) = ebml::read_element_header(r)?;
+        let consumed = (hlen as u64).saturating_add(cs);
+        if cs == u64::MAX || consumed > remaining {
+            return Err(crate::error::Error::MkvSourceInvalid.into());
+        }
+        remaining -= consumed;
+        f(r, cid, cs)?;
+    }
+    Ok(())
+}
 
 // Skip `n` bytes on a forward-only reader (no Seek required). A short skip is a TRUNCATED
 // element, reported as `MkvSourceInvalid` (not a silent `Ok`).
@@ -660,7 +871,13 @@ impl MkvStream {
 
     /// Open an MKV file for reading → PES frames.
     pub fn open(mut reader: impl Read + Send + 'static) -> io::Result<Self> {
-        let (disc_title, codec_privates, ts_scale_ns, tracks) = parse_mkv_header(&mut reader)?;
+        let MkvHeader {
+            title: disc_title,
+            codec_privates,
+            ts_scale_ns,
+            tracks,
+            probe: _,
+        } = parse_mkv_header(&mut reader)?;
         let mut stream = Self {
             disc_title,
             mvc: None,
@@ -1220,13 +1437,14 @@ impl crate::pes::Stream for MkvStream {
 
 // ── MKV header parsing (read side) ────────────────────────────
 
-/// Returns (DiscTitle, codec_privates: Vec<(track_number, codec_private_bytes)>)
-fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
+// Reads the EBML header, then the Segment's Info + Tracks, stopping at the first Cluster.
+fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
     let mut title = String::new();
     // EBML `DURATION` is a float expressed in TimestampScale ticks, not
-    // milliseconds (Matroska spec). Named accordingly; converted to
-    // seconds below as ticks * ts_scale_ns / 1e9.
-    let mut duration_ticks = 0.0f64;
+    // milliseconds (Matroska spec). Converted to seconds as ticks * ts_scale_ns / 1e9.
+    let mut duration_ticks: Option<f64> = None;
+    let (mut muxing_app, mut writing_app, mut title_seen) = (None, None, false);
+    let mut probe_tracks: Vec<MkvProbeTrack> = Vec::new();
     let mut ts_scale: u64 = 1_000_000;
     let mut streams: Vec<crate::disc::Stream> = Vec::new();
     let mut codec_privates: Vec<(u16, Vec<u8>)> = Vec::new();
@@ -1285,8 +1503,13 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                     remaining -= consumed;
                     match cid {
                         ebml::TIMESTAMP_SCALE => ts_scale = read_uint_bounded(r, cs)?,
-                        ebml::DURATION => duration_ticks = read_float_bounded(r, cs)?,
-                        ebml::TITLE => title = read_string_bounded(r, cs)?,
+                        ebml::DURATION => duration_ticks = Some(read_float_bounded(r, cs)?),
+                        ebml::TITLE => {
+                            title = read_string_bounded(r, cs)?;
+                            title_seen = true;
+                        }
+                        ebml::MUXING_APP => muxing_app = Some(read_string_bounded(r, cs)?),
+                        ebml::WRITING_APP => writing_app = Some(read_string_bounded(r, cs)?),
                         _ => {
                             skip_bytes(r, cs)?;
                         }
@@ -1312,8 +1535,9 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                     }
                     remaining -= consumed;
                     if cid == ebml::TRACK_ENTRY {
-                        let (stream, tnum, cp, default_dur, timing, pcm, infer) =
+                        let (stream, tnum, cp, default_dur, timing, pcm, infer, pt) =
                             parse_track(r, cs)?;
+                        probe_tracks.push(pt);
                         if let Some(s) = stream {
                             // Record the TrackNumber alongside the stream it maps
                             // to, in the SAME order, so block routing never has to
@@ -1338,9 +1562,19 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
         }
     }
 
+    let duration_secs = duration_ticks.map(|t| t * (ts_scale as f64) / 1_000_000_000.0);
+    let probe = MkvProbe {
+        muxing_app,
+        writing_app,
+        duration_secs,
+        title: title_seen.then(|| title.clone()),
+        tracks: probe_tracks,
+        timestamp_scale: ts_scale,
+        last_cue_secs: None,
+    };
     let disc_title = DiscTitle {
         playlist: title,
-        duration_secs: duration_ticks * (ts_scale as f64) / 1_000_000_000.0,
+        duration_secs: duration_secs.unwrap_or(0.0),
         streams,
         ..DiscTitle::empty()
     };
@@ -1351,7 +1585,13 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
     } else {
         ts_scale as i64
     };
-    Ok((disc_title, codec_privates, ts_scale_ns, tracks))
+    Ok(MkvHeader {
+        title: disc_title,
+        codec_privates,
+        ts_scale_ns,
+        tracks,
+        probe,
+    })
 }
 
 /// Largest valid 13-bit MPEG-TS PID.
@@ -1388,6 +1628,7 @@ type ParsedTrack = (
     crate::pes::TrackTiming,
     Option<PcmIn>,
     Option<PcmInfer>,
+    MkvProbeTrack,
 );
 
 // A PCM track that declares no BitDepth: the depth is inferred from the first
@@ -1690,6 +1931,12 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     // reject anything landing outside the valid PID space.
     let ts_pid = ts_pid_for_track(tnum)?;
 
+    let probe = MkvProbeTrack {
+        number: tnum,
+        kind: MkvTrackKind::from_track_type(ttype),
+        codec_id,
+        language: lang.clone(),
+    };
     let stream = match ttype {
         1 => {
             let is_secondary = name.contains("Dolby Vision EL") || name.contains("DV EL");
@@ -1728,7 +1975,16 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         })),
         _ => None,
     };
-    Ok((stream, tnum, codec_priv, default_dur, timing, pcm, infer))
+    Ok((
+        stream,
+        tnum,
+        codec_priv,
+        default_dur,
+        timing,
+        pcm,
+        infer,
+        probe,
+    ))
 }
 
 // Read-side map from Matroska TrackNumber to the index of the corresponding entry in
@@ -5890,5 +6146,152 @@ mod tests {
                 None => assert_eq!(codec, Codec::Unknown(0), "{cid} {depth:?}"),
             }
         }
+    }
+
+    // ── probe_mkv ─────────────────────────────────────────────
+
+    fn master(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, id).unwrap();
+        ebml::write_size(&mut out, body.len() as u64).unwrap();
+        out.extend_from_slice(body);
+        out
+    }
+
+    // Info + Tracks (HEVC video, French TrueHD audio) as Segment children.
+    fn info_and_tracks(info: &[u8]) -> Vec<u8> {
+        let mut video = Vec::new();
+        ebml::write_uint(&mut video, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut video, ebml::TRACK_TYPE, 1).unwrap();
+        ebml::write_string(&mut video, ebml::CODEC_ID, ebml::CODEC_HEVC).unwrap();
+        let mut audio = Vec::new();
+        ebml::write_uint(&mut audio, ebml::TRACK_NUMBER, 2).unwrap();
+        ebml::write_uint(&mut audio, ebml::TRACK_TYPE, 2).unwrap();
+        ebml::write_string(&mut audio, ebml::CODEC_ID, ebml::CODEC_TRUEHD).unwrap();
+        ebml::write_string(&mut audio, ebml::LANGUAGE, "fre").unwrap();
+        let mut tracks = master(ebml::TRACK_ENTRY, &video);
+        tracks.extend(master(ebml::TRACK_ENTRY, &audio));
+        let mut out = master(ebml::INFO, info);
+        out.extend(master(ebml::TRACKS, &tracks));
+        out
+    }
+
+    fn segment(children: &[&[u8]]) -> Vec<u8> {
+        let mut out = master(ebml::EBML, &[]);
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        for c in children {
+            out.extend_from_slice(c);
+        }
+        out
+    }
+
+    fn probe_fixture(info: &[u8], after_tracks: &[u8]) -> Vec<u8> {
+        segment(&[&info_and_tracks(info), after_tracks])
+    }
+
+    #[test]
+    fn probe_reads_apps_duration_title_and_tracks() {
+        let mut info = Vec::new();
+        ebml::write_uint(&mut info, ebml::TIMESTAMP_SCALE, 100_000).unwrap();
+        ebml::write_float(&mut info, ebml::DURATION, 72_000.0).unwrap();
+        ebml::write_string(&mut info, ebml::MUXING_APP, "freemkv 1.7.7 (gc8e67f1)").unwrap();
+        ebml::write_string(&mut info, ebml::WRITING_APP, "other 2.0").unwrap();
+        ebml::write_string(&mut info, ebml::TITLE, "Feature").unwrap();
+        // A cluster whose block claims more bytes than exist: never read by the probe.
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, 4096).unwrap();
+
+        let p = probe_mkv(Cursor::new(probe_fixture(&info, &cluster))).unwrap();
+        assert_eq!(p.muxing_app.as_deref(), Some("freemkv 1.7.7 (gc8e67f1)"));
+        assert_eq!(p.writing_app.as_deref(), Some("other 2.0"));
+        assert_eq!(p.title.as_deref(), Some("Feature"));
+        assert_eq!(p.timestamp_scale, 100_000);
+        assert!((p.duration_secs.unwrap() - 7.2).abs() < 1e-9);
+        assert_eq!(p.last_cue_secs, None);
+        assert_eq!(p.tracks.len(), 2);
+        assert_eq!(p.tracks[0].kind, MkvTrackKind::Video);
+        assert_eq!(p.tracks[0].codec_id, ebml::CODEC_HEVC);
+        assert_eq!(p.tracks[0].language, "und");
+        assert_eq!(p.tracks[1].number, 2);
+        assert_eq!(p.tracks[1].kind, MkvTrackKind::Audio);
+        assert_eq!(p.tracks[1].codec_id, ebml::CODEC_TRUEHD);
+        assert_eq!(p.tracks[1].language, "fre");
+    }
+
+    #[test]
+    fn probe_leaves_absent_fields_none() {
+        let p = probe_mkv(Cursor::new(probe_fixture(&[], &[]))).unwrap();
+        assert_eq!(p.muxing_app, None);
+        assert_eq!(p.writing_app, None);
+        assert_eq!(p.duration_secs, None);
+        assert_eq!(p.title, None);
+        assert_eq!(p.timestamp_scale, 1_000_000);
+        assert_eq!(p.tracks.len(), 2);
+    }
+
+    #[test]
+    fn probe_rejects_non_matroska() {
+        let e = probe_mkv(Cursor::new(vec![0x47u8; 188])).unwrap_err();
+        assert!(is_mkv_source_invalid(&e));
+    }
+
+    #[test]
+    fn probe_with_cues_follows_the_seekhead() {
+        // SeekHead → Cues placed after the (skipped) cluster; the largest CueTime wins.
+        let cue = |t: u64| {
+            let mut b = Vec::new();
+            ebml::write_uint(&mut b, ebml::CUE_TIME, t).unwrap();
+            master(ebml::CUE_POINT, &b)
+        };
+        let mut cues_body = cue(0);
+        cues_body.extend(cue(9_000));
+        cues_body.extend(cue(4_000));
+        let cues = master(ebml::CUES, &cues_body);
+        let cluster = master(ebml::CLUSTER, &[0u8; 64]);
+
+        let seekhead = |pos: u64| {
+            let mut seek = Vec::new();
+            ebml::write_binary(&mut seek, ebml::SEEK_ID, &ebml::CUES.to_be_bytes()).unwrap();
+            ebml::write_id(&mut seek, ebml::SEEK_POSITION).unwrap();
+            ebml::write_size(&mut seek, 8).unwrap();
+            seek.extend_from_slice(&pos.to_be_bytes());
+            master(ebml::SEEK_HEAD, &master(ebml::SEEK, &seek))
+        };
+        let it = info_and_tracks(&[]);
+        // Fixed-width SeekPosition: the SeekHead's length does not depend on the value.
+        let cues_rel = (seekhead(0).len() + it.len() + cluster.len()) as u64;
+        let out = segment(&[&seekhead(cues_rel), &it, &cluster, &cues]);
+
+        let p = probe_mkv_with_cues(Cursor::new(out)).unwrap();
+        assert_eq!(p.tracks.len(), 2);
+        assert!((p.last_cue_secs.unwrap() - 9.0).abs() < 1e-9);
+        // No Cues at all: still a probe, just no cue runtime.
+        let p = probe_mkv_with_cues(Cursor::new(probe_fixture(&[], &cluster))).unwrap();
+        assert_eq!(p.last_cue_secs, None);
+    }
+
+    #[test]
+    fn parse_freemkv_version_accepts_freemkv_stamps_only() {
+        assert_eq!(
+            parse_freemkv_version("freemkv 1.7.7 (gc8e67f1)"),
+            Some((1, 7, 7))
+        );
+        assert_eq!(parse_freemkv_version("freemkv 1.10.0"), Some((1, 10, 0)));
+        assert_eq!(
+            parse_freemkv_version("freemkv 1.8.0-rc.1 (gabc1234)"),
+            Some((1, 8, 0))
+        );
+        assert_eq!(parse_freemkv_version("freemkv"), None);
+        assert_eq!(parse_freemkv_version("freemkv 1.7"), None);
+        assert_eq!(parse_freemkv_version("freemkv x.7.7"), None);
+        assert_eq!(
+            parse_freemkv_version("libebml v1.4.4 + libmatroska v1.7.1"),
+            None
+        );
+        assert_eq!(parse_freemkv_version("mkvmerge v80.0 ('x') 64-bit"), None);
     }
 }

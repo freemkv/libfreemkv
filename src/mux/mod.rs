@@ -83,7 +83,10 @@ pub(crate) mod videomap;
 pub use disc::DiscStream;
 pub use driver::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, mux_stream};
 pub use m2ts::M2tsStream;
-pub use mkvstream::MkvStream;
+pub use mkvstream::{
+    MkvProbe, MkvProbeTrack, MkvStream, MkvTrackKind, parse_freemkv_version, probe_mkv,
+    probe_mkv_with_cues,
+};
 pub use videomap::{Medium, SourceInfo};
 // `Mp4Sink` is public so a caller driving the sink can ask `final_report()` what
 // the finished file contains — the pre-mux `mp4_fit_report` is only a prediction,

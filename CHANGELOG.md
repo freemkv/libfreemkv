@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `probe_mkv` reads a Matroska file's Info and Tracks (muxing/writing app, declared duration, title, timestamp scale, per-track kind/codec/language) without reading a cluster; `probe_mkv_with_cues` also reports the last Cues timestamp. `parse_freemkv_version` extracts the version from freemkv's muxing-app stamp.
+
 ### Changed
 
 - `sector::KeyFetchFn`, `KeyFetch::unit_keys` and `KeyFetch::fmts_indexes` return `Result`: a key-source failure or an all-rejected reply is an `Err`, not an empty key set.
