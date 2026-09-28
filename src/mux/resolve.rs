@@ -1028,7 +1028,7 @@ fn resolve_fmts_key_map(
             let probed =
                 probe_fmts_index_keys(reader, &clip_extents, &segments, fetch, format, halt)?;
             // Only memoise a run whose every index reached a DEFINITE phase —
-            // a read-faulted index defaulting to `Phase::All` is a transient
+            // a read-faulted index falling back to `Phase::Verify` is a transient
             // fault, not a property of these extents; caching it would spread.
             if probed.all_phases_definite {
                 memo.insert(ek, (probed.keys.clone(), probed.phases.clone()));
@@ -1077,10 +1077,11 @@ fn resolve_fmts_key_map(
             unresolved += 1;
             continue;
         };
+        // No resolved phase → `Verify` (KU design §5.3, K-5), never an unverified `All`.
         let phase = phase_of_index
             .get(&seg.index)
             .copied()
-            .unwrap_or(crate::decrypt::Phase::All);
+            .unwrap_or(crate::decrypt::Phase::Verify);
         let start_byte = seg.start_spn as u64 * 192;
         let end_byte = (seg.end_spn as u64 + 1) * 192;
         // Clip bytes → LBAs through the FORENSIC CLIP's extents, never the
@@ -1144,7 +1145,7 @@ fn resolve_fmts_key_map(
 struct FmtsIndexKeys {
     keys: Vec<[u8; 16]>,
     phases: std::collections::HashMap<u16, crate::decrypt::Phase>,
-    /// Every index reached a DEFINITE phase — no index fell back to `Phase::All`
+    /// Every index reached a DEFINITE phase — no index fell back to `Phase::Verify`
     /// after [`IndexProbe::ReadFault`]. Only such a run is safe to memoise; see
     /// [`resolve_mux_key_map_cached`].
     all_phases_definite: bool,
@@ -1271,10 +1272,10 @@ fn probe_fmts_index_keys(
                 return Err(crate::error::Error::FmtsKeyMissing.into());
             }
             IndexProbe::ReadFault => {
-                // EVERY probe read faulted (transient drive fault). Zero
-                // evidence ⇒ not a wrong key. Leave phase unresolved so the
-                // range-builder defaults to `Phase::All`. Degraded, never abort.
-                tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: index phase probe read-faulted on every segment — defaulting Phase::All (recoverable read fault, not a wrong key)");
+                // EVERY probe read faulted (zero evidence ⇒ not a wrong key; never
+                // abort). KU design §5.3 (evidence KS-25/KS-26): `Phase::Verify`.
+                tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: index phase probe read-faulted on every segment — Phase::Verify: each unit kept only if it verifies (recoverable read fault, not a wrong key)");
+                phase_of_index.insert(tag, crate::decrypt::Phase::Verify);
                 all_phases_definite = false;
             }
         }
@@ -4352,8 +4353,7 @@ mod tests {
         );
     }
 
-    // A read-faulted phase (defaulted to Phase::All) must NOT be memoised; the next title
-    // re-probes.
+    // A read-faulted phase (Phase::Verify) must NOT be memoised; the next title re-probes.
     #[test]
     fn fmts_read_faulted_phase_is_not_memoised() {
         use std::sync::atomic::Ordering;
@@ -4380,8 +4380,8 @@ mod tests {
         .expect("a read fault must NOT abort a rip whose index keys are good");
         assert_eq!(
             first.entry_for(10_600).map(|(_, p, _)| p),
-            Some(crate::decrypt::Phase::All),
-            "the read-faulted index defaults to Phase::All"
+            Some(crate::decrypt::Phase::Verify),
+            "the read-faulted index falls back to Phase::Verify (K-5)"
         );
         assert_eq!(
             first.entry_for(10_300).map(|(_, p, _)| p),

@@ -141,19 +141,27 @@ impl DecryptKeys {
 /// half (parity of the unit's index within the segment) and the ALTERNATE half is
 /// left untouched (ciphertext) for the muxer to drop. Every non-forensic range —
 /// the base Unit Key, a multi-CPS unit — is `All` (decrypt every unit), so the
-/// common disc is byte-for-byte unchanged.
+/// common disc is byte-for-byte unchanged. `Verify` is a forensic index whose every
+/// phase probe faulted (KU design §5.3): each unit is kept only if it verifies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     All,
     Even,
     Odd,
+    /// Phase unknown: decrypt each unit, keep it (CPI cleared) only if [`is_clean`]
+    /// passes, else restore its ciphertext for the muxer to drop. No public spec for
+    /// FMTS (KS-25, KS-26); per unit because each unit is its own CBC chain (KS-3).
+    ///
+    /// [`is_clean`]: crate::aacs::content::is_clean
+    Verify,
 }
 
 // Does this unit belong to the phase we hold the key for? `Phase::All` means the whole range is
 // ours; a wrong index gets the wrong half.
 fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: Phase) -> bool {
     let want_odd = match phase {
-        Phase::All => return true,
+        // `Verify` tries every unit; the per-unit verify decides what is ours.
+        Phase::All | Phase::Verify => return true,
         Phase::Even => false,
         Phase::Odd => true,
     };
@@ -301,7 +309,8 @@ impl AacsKeyMap {
                 // A unit in NO range is pass-through content (base/default) — read
                 // it. Only an alternate-phase forensic unit is dropped from the plan.
                 let keep = match self.entry_for(lba) {
-                    None | Some((_, Phase::All, _)) => true,
+                    // A `Verify` range reads both halves: which one is ours is unknown.
+                    None | Some((_, Phase::All | Phase::Verify, _)) => true,
                     Some((_, phase, range_start)) => {
                         let unit_ix = (lba - range_start) / us;
                         let is_odd = unit_ix % 2 == 1;
@@ -383,8 +392,8 @@ pub(crate) fn span_in_content_ranges(lba: u32, count: u32, ranges: &[(u32, u32)]
     }
 }
 
-// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key trial, no
-// `is_clean` verdict; the refusal decision belongs to `decrypt_span`.
+// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key trial; the one
+// `is_clean` verdict is `Phase::Verify`'s keep-or-restore. Refusal belongs to `decrypt_span`.
 fn apply_aacs_map(
     buf: &mut [u8],
     keys: &DecryptKeys,
@@ -468,6 +477,19 @@ fn apply_aacs_map(
         // removed by the drive's single de-bus point before this buffer arrived —
         // this path only applies the CPS unit key.
         let key = &unit_keys[key_idx].1;
+        if phase == Phase::Verify {
+            // KU design §5.3 (no public FMTS spec, KS-25/KS-26): keep a unit only if it
+            // verifies; KS-3 [BD] §3.10.1 "A new CBC cipher chain is started for each Aligned Unit".
+            let mut ciphertext = [0u8; aacs::content::ALIGNED_UNIT_LEN];
+            ciphertext.copy_from_slice(chunk);
+            aacs::content::decrypt_unit(chunk, key);
+            if aacs::content::is_clean(chunk, format) {
+                aacs::content::clear_copy_permission_indicator(chunk, format);
+            } else {
+                chunk.copy_from_slice(&ciphertext); // flagged ciphertext: the muxer drops it
+            }
+            return;
+        }
         aacs::content::decrypt_unit(chunk, key);
         // Correct-phase forensic verify (silent unless the map is wrong).
         if matches!(phase, Phase::Even | Phase::Odd) && !aacs::content::is_clean(chunk, format) {
@@ -1898,8 +1920,8 @@ mod spec_guards {
 
     /// per spec; do not change without a spec citation — KS-5 [BD] §3.10.2: "shall be set
     /// to 11₂ if the data is encrypted": a unit left as ciphertext keeps its CPI bits.
-    /// Covers the alternate FMTS phase and an orphan; the failed `Phase::Verify` leg is
-    /// added with `Phase::Verify` (KU-L1).
+    /// Covers the alternate FMTS phase, an orphan, and a `Phase::Verify` unit that fails
+    /// `is_clean` and is restored.
     #[test]
     fn ciphertext_units_keep_cpi() {
         assert!(
@@ -1942,6 +1964,17 @@ mod spec_guards {
         );
         assert_eq!(orphan, before, "the orphan keeps every byte, CPI included");
         assert_eq!(orphan[0] & 0xC0, 0xC0);
+        // A `Verify` unit our key does not open: restored, every byte and CPI kept.
+        let mut failed = encrypted(&ALT, 4);
+        let before = failed.clone();
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Verify)]);
+        decrypt_sectors_mapped(&mut failed, &keys, 0, &map).expect("a failed verify is no error");
+        assert_eq!(
+            failed, before,
+            "the failed Verify unit is restored as ciphertext"
+        );
+        assert_eq!(cpi(&failed), cpi(&before), "CPI of all 32 packets");
+        assert_eq!(failed[0] & 0xC0, 0xC0, "packet 0's clear CPI still 11₂");
     }
 
     /// per spec; do not change without a spec citation — KS-5 [BD] §3.10.2: "shall be set
@@ -1996,5 +2029,14 @@ mod spec_guards {
         let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Even)]);
         decrypt_sectors_mapped(&mut ours, &keys, 0, &map).expect("our phase decrypts");
         check("our forensic phase", &ours, plain);
+
+        // A kept `Phase::Verify` unit (it verified under our key). The on-arrival leg
+        // joins with the on-arrival proof (KU-L2).
+        let mut kept = encrypted(&OURS, 11);
+        let mut plain = kept.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Verify)]);
+        decrypt_sectors_mapped(&mut kept, &keys, 0, &map).expect("a verified unit decrypts");
+        check("kept Verify", &kept, plain);
     }
 }
