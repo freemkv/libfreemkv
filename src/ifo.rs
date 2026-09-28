@@ -51,6 +51,9 @@ pub struct DvdTitle {
     pub chapter_times: Vec<f64>,
     /// Subtitle palette from PGC: 16 entries of [padding, Y, Cr, Cb].
     pub palette: Option<Vec<[u8; 4]>>,
+    /// PGC_SPST_CTL (PGC+0x1C): per logical subpicture stream, its presence bit
+    /// and physical sub-stream ids for 4:3 / wide / letterbox / pan-scan.
+    pub spst_ctl: [u32; 32],
     /// This title's 1-based `vts_title_num` (TTN within its VTS). Carried so nav
     /// resolution joins on the REAL title number rather than the position in the
     /// titles vec, which desyncs when a sibling PGC is dropped as unparseable.
@@ -202,6 +205,20 @@ pub struct DvdAudioAttr {
     /// This is the single routing key shared with the muxer's `dvd_pid()`
     /// so the two never disagree on a mixed-codec title.
     pub sub_stream_id: Option<u8>,
+}
+
+/// The on-wire VobSub sub-stream id (0x20..=0x3F) of one PGC_SPST_CTL entry, or `None` when
+/// the stream is absent from the PGC. 16:9 takes the wide id (the rip keeps the anamorphic
+/// frame); 4:3 takes the 4:3 id. Letterbox/pan-scan variants are display-side downscales.
+pub(crate) fn subpicture_stream_id(ctl: u32, aspect: DvdAspect) -> Option<u8> {
+    if ctl & 0x8000_0000 == 0 {
+        return None;
+    }
+    let shift = match aspect {
+        DvdAspect::R4x3 => 24,
+        DvdAspect::R16x9 => 16,
+    };
+    Some(0x20 | ((ctl >> shift) & 0x1F) as u8)
 }
 
 /// DVD subtitle stream attributes.
@@ -935,6 +952,12 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         times
     };
 
+    // PGC_SPST_CTL at PGC+0x1C: 32 x u32 BE; inside the 0xEA bound checked above.
+    let mut spst_ctl = [0u32; 32];
+    for (i, c) in spst_ctl.iter_mut().enumerate() {
+        *c = be_u32(data, pgc_offset + 0x1C + i * 4)?;
+    }
+
     // Subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cr, Cb].
     // Chroma order is Cr (byte 2) BEFORE Cb (byte 3) per the DVD-Video PGC CLUT format;
     // `mux::codec::dvdsub::ycbcr_to_rgb` must read it the same way.
@@ -960,6 +983,7 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         cells,
         chapter_times,
         palette,
+        spst_ctl,
         // Set by the caller (parse_pgcit) which knows the TT_SRPT title number.
         vts_title_num: 0,
     })
@@ -1162,6 +1186,7 @@ mod tests {
             cells: vec![cell.clone()],
             chapter_times: Vec::new(),
             palette: None,
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(title.chapters, 5);
@@ -1200,6 +1225,31 @@ mod tests {
             title_sets: vec![ts],
         };
         assert_eq!(info.title_sets.len(), 1);
+    }
+
+    // SPST_CTL entry: bit31 present; bytes 0-3 low 5 bits = 4:3/wide/letterbox/pan-scan ids.
+    #[test]
+    fn subpicture_stream_id_selects_by_aspect_and_presence() {
+        let ctl = 0x9FE1_0203; // reserved bits set in bytes 0-1 must be masked off
+        assert_eq!(subpicture_stream_id(ctl, DvdAspect::R4x3), Some(0x3F));
+        assert_eq!(subpicture_stream_id(ctl, DvdAspect::R16x9), Some(0x21));
+        assert_eq!(subpicture_stream_id(0x0001_0203, DvdAspect::R16x9), None);
+        assert_eq!(
+            subpicture_stream_id(0x8000_0000, DvdAspect::R4x3),
+            Some(0x20)
+        );
+    }
+
+    #[test]
+    fn pgc_parses_spst_ctl_at_0x1c() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x1B] = 0xFF; // last byte of PGC_AST_CTL; must not bleed in
+        pgc[0x1C..0x20].copy_from_slice(&0x8003_0405u32.to_be_bytes());
+        pgc[0x98..0x9C].copy_from_slice(&0x8000_1F00u32.to_be_bytes());
+        let t = parse_pgc(&pgc, 0, 1).unwrap();
+        assert_eq!(t.spst_ctl[0], 0x8003_0405);
+        assert_eq!(t.spst_ctl[31], 0x8000_1F00);
+        assert!(t.spst_ctl[1..31].iter().all(|&c| c == 0));
     }
 
     #[test]
@@ -1996,6 +2046,7 @@ mod tests {
             ],
             chapter_times: vec![0.0, 100.0, 200.0],
             palette: None,
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);
@@ -2018,6 +2069,7 @@ mod tests {
             ],
             chapter_times: vec![0.0, 50.0],
             palette: None,
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 2);
@@ -2036,6 +2088,7 @@ mod tests {
             cells: vec![cell(0, 9, 0b1001_0000), cell(10, 19, 0b1101_0000)],
             chapter_times: vec![0.0],
             palette: None,
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);
@@ -2051,6 +2104,7 @@ mod tests {
             cells: vec![],
             chapter_times: vec![],
             palette: None,
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);

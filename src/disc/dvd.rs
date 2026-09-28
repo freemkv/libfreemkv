@@ -175,27 +175,48 @@ impl Disc {
                     .as_ref()
                     .map(|pal| crate::mux::codec::dvdsub::format_palette(pal, vid_w, vid_h));
 
-                // Map DvdSubtitleAttr to Stream::Subtitle
-                let subtitle_streams: Vec<Stream> = ts
-                    .subtitle_streams
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        // VobSub sub-stream ids run 0x20..=0x3F; PID = sub-id
-                        // (identity), shared with the demuxer via
-                        // `dvd_subtitle_pid`.
-                        let sub_id = 0x20u8.saturating_add(i.min(0x1F) as u8);
-                        let pid = crate::mux::ps::dvd_subtitle_pid(sub_id).unwrap_or(sub_id as u16);
-                        Stream::Subtitle(SubtitleStream {
-                            pid,
-                            codec: Codec::DvdSub,
-                            language: s.language.clone(),
-                            forced: false,
-                            qualifier: crate::disc::LabelQualifier::None,
-                            codec_data: codec_data.clone(),
-                        })
-                    })
-                    .collect();
+                // Logical stream i routes to the physical id this PGC's SPST_CTL names (not
+                // 0x20+i: anamorphic discs interleave wide/letterbox/pan-scan variants).
+                // Absent streams get no track; a repeated physical id keeps the first.
+                let mut subtitle_streams: Vec<Stream> = Vec::new();
+                let mut kept_langs: [Option<&str>; 32] = [None; 32];
+                for (s, ctl) in ts.subtitle_streams.iter().zip(dvd_title.spst_ctl) {
+                    let Some(sub_id) = crate::ifo::subpicture_stream_id(ctl, ts.video.aspect)
+                    else {
+                        continue;
+                    };
+                    let slot = &mut kept_langs[(sub_id & 0x1F) as usize];
+                    if let Some(kept) = slot {
+                        crate::diag::dvd_ctl_duplicate(
+                            "spst",
+                            ts.vts_number,
+                            title_number,
+                            sub_id,
+                            kept,
+                            &s.language,
+                        );
+                        continue;
+                    }
+                    *slot = Some(&s.language);
+                    let pid = crate::mux::ps::dvd_subtitle_pid(sub_id).unwrap_or(sub_id as u16);
+                    subtitle_streams.push(Stream::Subtitle(SubtitleStream {
+                        pid,
+                        codec: Codec::DvdSub,
+                        language: s.language.clone(),
+                        forced: false,
+                        qualifier: crate::disc::LabelQualifier::None,
+                        codec_data: codec_data.clone(),
+                    }));
+                }
+                if subtitle_streams.is_empty() && !ts.subtitle_streams.is_empty() {
+                    crate::diag::dvd_ctl_none_present(
+                        "spst",
+                        ts.vts_number,
+                        title_number,
+                        ts.subtitle_streams.len(),
+                        "no subtitle tracks",
+                    );
+                }
 
                 let mut streams = vec![video_stream.clone()];
                 streams.extend(audio_streams.iter().cloned());
@@ -492,7 +513,119 @@ mod tests {
         if palette_nonzero {
             d[pgc + 0xA4 + 1] = 0x40; // Y of color 0
         }
+        // SPST_CTL: every declared subpicture present, all four ids = its ordinal.
+        let ordinal: Vec<u32> = (0..subs.len() as u32)
+            .map(|i| 0x8000_0000 | (i << 24) | (i << 16) | (i << 8) | i)
+            .collect();
+        set_spst(&mut d, &ordinal);
         d
+    }
+
+    // Overwrites build_vts's PGC_SPST_CTL (PGC+0x1C, 32 x u32 BE).
+    fn set_spst(vts: &mut [u8], ctl: &[u32]) {
+        let at = 2 * 2048 + 0x100 + 0x1C;
+        for (i, c) in ctl.iter().enumerate() {
+            vts[at + i * 4..at + i * 4 + 4].copy_from_slice(&c.to_be_bytes());
+        }
+    }
+
+    // Scans a one-VTS disc and returns its first title's (pid, language) subtitles.
+    fn scan_subs(vts: Vec<u8>) -> Vec<(u16, String)> {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0;
+        t[0].streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Subtitle(s) => Some((s.pid, s.language.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const NTSC_16X9: u8 = 0x0C;
+
+    /// L084: an anamorphic title carries wide/letterbox/pan-scan variants per
+    /// language, so the wide sub-stream id comes from SPST_CTL, not the ordinal.
+    #[test]
+    fn scan_dvd_titles_anamorphic_subtitles_use_spst_wide_id() {
+        let mut vts = build_vts(0, NTSC_16X9, &[], &[*b"en", *b"fr"], &[(0, 9)], true);
+        // byte0 = present|4:3, byte1 = wide, byte2 = letterbox, byte3 = pan-scan.
+        set_spst(&mut vts, &[0x8000_0102, 0x8003_0405]);
+        assert_eq!(
+            scan_subs(vts),
+            vec![(0x20, "eng".to_string()), (0x23, "fra".to_string())],
+            "French must route to its wide sub-stream 0x23, not ordinal 0x21"
+        );
+    }
+
+    /// A 4:3 title uses SPST_CTL's 4:3 field (byte 0 bits 4-0).
+    #[test]
+    fn scan_dvd_titles_4x3_subtitles_use_spst_4x3_id() {
+        let mut vts = build_vts(0, 0x00, &[], &[*b"en", *b"de"], &[(0, 9)], true);
+        set_spst(&mut vts, &[0x8500_0000, 0x8200_0000]);
+        assert_eq!(
+            scan_subs(vts),
+            vec![(0x25, "eng".to_string()), (0x22, "deu".to_string())]
+        );
+    }
+
+    /// A subpicture stream SPST_CTL marks absent from this PGC gets no track,
+    /// and two logical streams naming the same physical id keep only the first.
+    #[test]
+    fn scan_dvd_titles_skips_absent_and_duplicate_subpictures() {
+        let subs = [*b"en", *b"es", *b"it"];
+        let mut vts = build_vts(0, NTSC_16X9, &[], &subs, &[(0, 9)], true);
+        set_spst(&mut vts, &[0x0000_0000, 0x8001_0100, 0x8001_0100]);
+        let (subs, ev) = crate::testlog::capture(|| scan_subs(vts));
+        assert_eq!(subs, vec![(0x21, "spa".to_string())]);
+        assert!(
+            diag_lines(&ev).iter().any(|m| m.contains("tag=dvd.spstctl")
+                && m.contains("sub_id=0x21 kept=\"spa\" dropped=\"ita\"")),
+            "{:?}",
+            diag_lines(&ev)
+        );
+    }
+
+    fn diag_lines(ev: &[crate::testlog::CapturedEvent]) -> Vec<String> {
+        ev.iter()
+            .filter(|e| e.target == "freemkv::diag")
+            .map(|e| e.message().to_string())
+            .collect()
+    }
+
+    /// Every declared subpicture absent from the PGC: no tracks, and a diag line says so.
+    #[test]
+    fn scan_dvd_titles_all_subpictures_absent_is_traced() {
+        let mut vts = build_vts(0, NTSC_16X9, &[], &[*b"en", *b"fr"], &[(0, 9)], true);
+        set_spst(&mut vts, &[0, 0]);
+        let (subs, ev) = crate::testlog::capture(|| scan_subs(vts));
+        assert!(subs.is_empty());
+        assert!(
+            diag_lines(&ev)
+                .iter()
+                .any(|m| m.contains("tag=dvd.spstctl") && m.contains("declared=2 present=0")),
+            "{:?}",
+            diag_lines(&ev)
+        );
     }
 
     // Tests. HaltingReader fails every read at/above halt_at with Error::Halted, mimicking a

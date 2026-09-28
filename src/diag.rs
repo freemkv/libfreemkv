@@ -197,6 +197,23 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
     }
 }
 
+/// A title whose PGC control table (`ast`/`spst`) marks none of its `declared` streams present,
+/// so a disc that loses every audio or subtitle track to sloppy authoring is traceable.
+pub fn dvd_ctl_none_present(kind: &str, vts: u8, title: u16, declared: usize, outcome: &str) {
+    tracing::debug!(
+        target: DIAG,
+        "tag=dvd.{kind}ctl vts={vts} title={title} declared={declared} present=0 -> {outcome}",
+    );
+}
+
+/// A logical stream dropped because an earlier one already routes to the same physical id.
+pub fn dvd_ctl_duplicate(kind: &str, vts: u8, title: u16, sub_id: u8, kept: &str, dropped: &str) {
+    tracing::debug!(
+        target: DIAG,
+        "tag=dvd.{kind}ctl vts={vts} title={title} sub_id=0x{sub_id:02X} kept={kept:?} dropped={dropped:?} (duplicate physical id)",
+    );
+}
+
 /// Emit the ACTUAL per-physical-sub-stream AC-3 channel counts read off the VOB during the
 /// mux-time sub-stream probe. This is the ground truth the IFO nibble is compared against: each
 /// row is `sub_id=0x8x channels=N` for a physical `private_stream_1` AC-3 sub-stream whose
