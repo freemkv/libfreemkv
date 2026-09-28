@@ -75,6 +75,8 @@ pub(crate) struct WritebackPipeline {
     wait_op: WaitOp,
     /// T11's bound on one `WAIT_AFTER` ([`WAIT_AFTER_TIMEOUT`]); a seam for tests.
     wait_timeout: Duration,
+    /// Each completed `WAIT_AFTER` is flush progress (§2.10 Linux local row).
+    flush: crate::io::flush::FlushProgress,
 }
 
 /// `(fd, off, len) -> 0 or errno`.
@@ -139,7 +141,18 @@ impl WritebackPipeline {
             wb_errno: None,
             wait_op: sys_wait_after,
             wait_timeout: WAIT_AFTER_TIMEOUT,
+            flush: crate::io::flush::FlushProgress::default(),
         }
+    }
+
+    pub(crate) fn set_flush_progress(&mut self, flush: crate::io::flush::FlushProgress) {
+        self.flush = flush;
+    }
+
+    /// NFS or degraded (`skip_wait`) on a waitable fd: nothing bounds the dirty pages, so
+    /// the §2.10 flusher runs.
+    pub(crate) fn needs_flusher(&self) -> bool {
+        self.waitable && self.skip_wait()
     }
 
     /// The latched writeback error, if any `WAIT_AFTER` failed.
@@ -223,6 +236,7 @@ impl WritebackPipeline {
                 match self.wait_after(prev_off, prev_len) {
                     WaitOutcome::Done(ms) => {
                         wait_ms = ms;
+                        self.flush.add_durable(prev_len);
                         let t_fadv = Instant::now();
                         unsafe {
                             libc::posix_fadvise(
@@ -382,14 +396,18 @@ impl WritebackPipeline {
             return;
         }
         match self.wait_after(prev_off, prev_len) {
-            WaitOutcome::Done(_ms) => unsafe {
-                libc::posix_fadvise(
-                    self.fd,
-                    prev_off as i64,
-                    prev_len as i64,
-                    libc::POSIX_FADV_DONTNEED,
-                );
-            },
+            WaitOutcome::Done(_ms) => {
+                self.flush.add_durable(prev_len);
+                // SAFETY: a valid fd; an advisory call.
+                unsafe {
+                    libc::posix_fadvise(
+                        self.fd,
+                        prev_off as i64,
+                        prev_len as i64,
+                        libc::POSIX_FADV_DONTNEED,
+                    );
+                }
+            }
             WaitOutcome::Failed(errno) => self.latch_error(errno, prev_off, prev_len),
             WaitOutcome::TimedOut => {
                 self.degraded.store(true, Ordering::Relaxed);

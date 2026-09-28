@@ -621,6 +621,38 @@ pub fn output(
     title: &crate::disc::DiscTitle,
     source: Option<&super::videomap::SourceInfo>,
 ) -> io::Result<Box<dyn crate::pes::Stream>> {
+    output_with(url, title, source, None)
+}
+
+/// What a file output shares with the mux (§2.10): the flush counters (the consumer's
+/// progress) and the op's stop token for its flush backpressure.
+pub(crate) struct OutputFlush<'a> {
+    pub(crate) progress: &'a crate::io::FlushProgress,
+    pub(crate) halt: &'a crate::halt::Halt,
+}
+
+// A file output's bounded-cache writer, sharing `flush` when given.
+fn writeback_file(
+    path: &Path,
+    size_hint: u64,
+    flush: Option<&OutputFlush>,
+) -> io::Result<crate::io::WritebackFile> {
+    let mut w = crate::io::WritebackFile::create_with_size_hint(path, size_hint)?;
+    if let Some(f) = flush {
+        w.set_flush_progress(f.progress.clone());
+        w.set_halt(f.halt.clone());
+    }
+    Ok(w)
+}
+
+// [`output`], with the file outputs sharing `flush` (the mux driver's path).
+pub(crate) fn output_with(
+    url: &str,
+    title: &crate::disc::DiscTitle,
+    source: Option<&super::videomap::SourceInfo>,
+    flush: Option<OutputFlush>,
+) -> io::Result<Box<dyn crate::pes::Stream>> {
+    let flush = flush.as_ref();
     let parsed = parse_url(url);
     match parsed {
         StreamUrl::Mkv { ref path } => {
@@ -631,7 +663,7 @@ pub fn output(
             let writer: Box<dyn super::WriteSeek + Send> =
                 Box::new(std::io::BufWriter::with_capacity(
                     IO_BUF_SIZE,
-                    crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
+                    writeback_file(path, title.size_bytes, flush)?,
                 ));
             Ok(Box::new(MkvStream::create(writer, title, Some(path))?))
         }
@@ -642,7 +674,7 @@ pub fn output(
             // seek WritebackFile handles. BufWriter coalesces moov writes.
             let writer = std::io::BufWriter::with_capacity(
                 IO_BUF_SIZE,
-                crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
+                writeback_file(path, title.size_bytes, flush)?,
             );
             Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
         }
@@ -650,7 +682,7 @@ pub fn output(
             validate_file_path(path, "m2ts")?;
             let writer = std::io::BufWriter::with_capacity(
                 IO_BUF_SIZE,
-                crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
+                writeback_file(path, title.size_bytes, flush)?,
             );
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }

@@ -96,11 +96,22 @@ fn finish_with_grace<R: Send + 'static>(
     progress: &Progress,
     grace: Duration,
     leak_err: Error,
+    on_poll: &mut dyn FnMut(),
 ) -> Result<R, Error> {
-    let mut handle = match join_within(handle, grace, None) {
-        Joined::Done(r) => return join_result(r),
-        Joined::Halted(h) | Joined::Pending(h) => h,
-    };
+    // `None` = a grace past `Instant`'s range: wait unbounded.
+    let end = Instant::now().checked_add(grace);
+    let mut handle = handle;
+    loop {
+        let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
+        handle = match join_within(handle, left.min(WAIT_SLICE), None) {
+            Joined::Done(r) => return join_result(r),
+            Joined::Halted(h) | Joined::Pending(h) => h,
+        };
+        on_poll();
+        if end.is_some_and(|e| Instant::now() >= e) {
+            break;
+        }
+    }
     // CLAIM abandonment before dropping the handle so the leaked consumer skips further
     // `apply`/`close()`. Compare-exchange, not a store: a consumer already CLOSING wins.
     if state
@@ -135,6 +146,7 @@ fn finish_with_grace<R: Send + 'static>(
             Joined::Done(r) => return join_result(r),
             Joined::Halted(h) | Joined::Pending(h) => h,
         };
+        on_poll();
         if timer.poll(progress) == Stall::Expired {
             // A close with no progress for a whole window: leak and report the wedge.
             drop(handle);
@@ -581,16 +593,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         self,
         halt: Option<&Halt>,
         timing: JoinTiming,
-        _on_poll: &mut dyn FnMut(),
-    ) -> Result<R, Error> {
-        self.finish_with_halt_timing(halt, timing)
-    }
-
-    // `finish_with_halt` with its windows as parameters (T7, T8).
-    pub(crate) fn finish_with_halt_timing(
-        self,
-        halt: Option<&Halt>,
-        timing: JoinTiming,
+        on_poll: &mut dyn FnMut(),
     ) -> Result<R, Error> {
         let Pipeline {
             tx,
@@ -607,15 +610,26 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             handle = match join_within(handle, WAIT_SLICE, halt) {
                 Joined::Done(r) => return join_result(r),
                 Joined::Halted(h) => {
-                    return finish_with_grace(h, &state, &progress, timing.grace, Error::Halted);
+                    let (g, e) = (timing.grace, Error::Halted);
+                    return finish_with_grace(h, &state, &progress, g, e, on_poll);
                 }
                 Joined::Pending(h) => h,
             };
+            on_poll();
             if timer.poll(&progress) == Stall::Expired {
-                let err = Error::PipelineJoinTimeout;
-                return finish_with_grace(handle, &state, &progress, timing.grace, err);
+                let (g, e) = (timing.grace, Error::PipelineJoinTimeout);
+                return finish_with_grace(handle, &state, &progress, g, e, on_poll);
             }
         }
+    }
+
+    // `finish_with_halt` with its windows as parameters (T7, T8).
+    pub(crate) fn finish_with_halt_timing(
+        self,
+        halt: Option<&Halt>,
+        timing: JoinTiming,
+    ) -> Result<R, Error> {
+        self.finish_with_halt_observed(halt, timing, &mut || {})
     }
 }
 
@@ -638,6 +652,7 @@ mod tests {
                 &Progress::new(),
                 Duration::MAX,
                 Error::Halted,
+                &mut || {},
             )
         }));
         assert!(matches!(r.expect("must not panic"), Ok(3)));
@@ -1633,7 +1648,14 @@ mod tests {
         });
 
         let grace = Duration::from_secs(1);
-        let res = finish_with_grace(handle, &state, &Progress::new(), grace, Error::Halted);
+        let res = finish_with_grace(
+            handle,
+            &state,
+            &Progress::new(),
+            grace,
+            Error::Halted,
+            &mut || {},
+        );
         assert!(
             matches!(res, Ok(42)),
             "a finalise already in flight must be waited for, not abandoned: {res:?}"

@@ -619,3 +619,19 @@ fn flushfilebuffers_ok() {
     // std's `File::sync_all` is `FlushFileBuffers` on Windows.
     f.sync_all().unwrap();
 }
+
+/// Every failed flush wait is an error, never `Ok`, and the three causes stay apart:
+/// E9056 (stall), `is_halt` (a Stop) and E9057 (worker lost). Moved from the per-OS
+/// `durable_sync` mapping tests.
+#[test]
+fn every_wait_failure_is_a_distinct_error() {
+    use crate::error::{E_SYNC_WORKER_LOST, error_code};
+    use crate::io::bounded::BoundedError;
+    let timeout = wait_failure(BoundedError::Timeout, "t");
+    assert!(is_sync_timeout(&timeout), "{timeout}");
+    assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+    let halted = wait_failure(BoundedError::Halted, "t");
+    assert!(crate::error::is_halt(&halted), "{halted}");
+    let lost = wait_failure(BoundedError::WorkerLost, "t");
+    assert_eq!(error_code(&lost), Some(E_SYNC_WORKER_LOST));
+}
