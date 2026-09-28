@@ -1,16 +1,11 @@
 //! Proof on first read (KU §2.4): the decrypting readers prove a held key on a piece that
 //! `resolve` could not prove up front, the first time one of its encrypted units is read.
 //!
-//! - A partner is another readable, non-segment `Enc` unit of the same piece: first from the
-//!   current batch, then from at most one backward and one forward side read (`recovery =
-//!   false`, never retried, straight to the random-access inner source). A failed side read
-//!   only means "no partner there": it is swallowed, never classified, never surfaced.
-//! - A held key that opens the unit and a partner is `Proven`. With no readable partner, a
-//!   key that opens the unit is `Provisional`; the piece's next readable `Enc` unit confirms
-//!   it or stops the rip (a key conflict).
-//! - A readable unit is never reported as a read error or withheld. One no held key opens is
-//!   a loud stop (E7022 / E7032), unless a held key opens a partner in its batch: then it is
-//!   damage, blanked and counted. FMTS segment units are never part of this proof.
+//! A partner is another readable non-segment `Enc` unit of the piece, from the batch, else one
+//! backward and one forward side read (`recovery = false`, never retried, failures swallowed).
+//! A held key opening the unit and a partner is `Proven`; with no partner, `Provisional` until
+//! the next readable unit confirms it or stops (key conflict). A unit no held key opens stops
+//! E7022 / E7032, unless a held key opens a batch partner: then it is damage, blanked.
 
 use super::{Proof, ProofCache, ResolvedKeySet, StopKind};
 use crate::aacs::content::{
@@ -252,25 +247,30 @@ impl Arrival {
             }
             return Err(self.stop(at, "no held key opens the unit"));
         }
-        // Step 1: partners already in the batch, both ways; then the side reads.
-        let mut partners = self.batch_partners(lba, buf, u, span.3);
-        if partners.is_empty() {
-            partners = self.side_partners(inner, at, span);
+        // Step 1: partners already in the batch, both ways; then the side reads, also when
+        // no batch partner opens (they may be damaged heads that kept their sync).
+        let find = |partners: &[Vec<u8>]| {
+            let opens = |s: usize| partners.iter().any(|p| self.opens(p, &unit_keys[s].1));
+            openers.iter().copied().find(|&s| opens(s))
+        };
+        let batch = self.batch_partners(lba, buf, u, span.3);
+        let (mut proven, mut any_partner) = (find(&batch), !batch.is_empty());
+        if proven.is_none() {
+            let side = self.side_partners(inner, at, span);
+            any_partner |= !side.is_empty();
+            proven = find(&side);
         }
         let id = self.pieces[span.3].0;
-        if partners.is_empty() {
-            // No readable partner: provisional one-unit proof, false-accept ≈ pool × 1e-5.
-            tracing::debug!(target: "freemkv::keys", lba = at, "provisional one-unit proof");
-            self.cache.set(id, Proof::Provisional(openers[0]));
-            return Ok(Some(openers[0]));
-        }
-        match openers
-            .into_iter()
-            .find(|&s| partners.iter().any(|p| self.opens(p, &unit_keys[s].1)))
-        {
+        match proven {
             Some(s) => {
                 self.cache.set(id, Proof::Proven(s));
                 Ok(Some(s))
+            }
+            None if !any_partner => {
+                // No readable partner: provisional one-unit proof, false-accept ≈ pool × 1e-5.
+                tracing::debug!(target: "freemkv::keys", lba = at, "provisional one-unit proof");
+                self.cache.set(id, Proof::Provisional(openers[0]));
+                Ok(Some(openers[0]))
             }
             None => Err(self.stop(at, "no held key opens the unit and a partner")),
         }

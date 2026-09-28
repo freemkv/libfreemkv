@@ -424,7 +424,8 @@ fn apply_aacs_map(
     // Cheap safety net: a correct map decrypts CORRECT-PHASE forensic units to clean TS, so
     // a map bug surfaces as loud DecryptFailed, not silent corruption (verdict at the end).
     let verify_failed = std::sync::atomic::AtomicBool::new(false);
-    let (failed, verified) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    // Per mapped key: (failed, verified) FMTS units of this read.
+    let tally: Vec<[AtomicUsize; 2]> = unit_keys.iter().map(|_| Default::default()).collect();
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
@@ -494,12 +495,12 @@ fn apply_aacs_map(
         aacs::content::decrypt_unit(chunk, key);
         // Correct-phase forensic verify: a failing unit is blanked; the read is judged below.
         if matches!(phase, Phase::Even | Phase::Odd) {
-            if !aacs::content::is_clean(chunk, format) {
+            let clean = aacs::content::is_clean(chunk, format);
+            tally[key_idx][clean as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !clean {
                 chunk.fill(0);
-                failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
-            verified.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted": a unit
         // we decrypted (damaged or not) is no longer ciphertext (KU design §5.4, K-13).
@@ -529,10 +530,16 @@ fn apply_aacs_map(
     if verify_failed.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(crate::error::Error::DecryptFailed);
     }
-    // A wrong key fails every unit it keys (and resolve's phase probe catches it first);
-    // damage fails one. Two or more failures with none verifying: a wrong map, E7013.
-    let (failed, verified) = (failed.into_inner(), verified.into_inner());
-    if failed >= WRONG_KEY_FAILURES && verified == 0 {
+    // A wrong key fails every unit it keys (resolve's phase probe catches it first); damage
+    // fails one. Two or more failures, none verifying, under one key or the read: E7013.
+    let tally: Vec<[usize; 2]> = tally
+        .into_iter()
+        .map(|t| t.map(|n| n.into_inner()))
+        .collect();
+    let read = tally.iter().fold([0, 0], |a, t| [a[0] + t[0], a[1] + t[1]]);
+    let wrong = |t: &[usize; 2]| t[0] >= WRONG_KEY_FAILURES && t[1] == 0;
+    let failed = read[0];
+    if wrong(&read) || tally.iter().any(wrong) {
         tracing::error!(
             target: "freemkv::decrypt",
             lba = base_lba,
@@ -553,8 +560,8 @@ fn apply_aacs_map(
     Ok(failed)
 }
 
-/// FMTS units of one read that must fail their verify, none verifying, before the read is a
-/// wrong key rather than damage: a wrong key fails every unit it keys, damage fails one.
+/// FMTS units of one read that must fail their verify, none verifying, under one key or
+/// across the read, before it is a wrong key rather than damage: a wrong key fails them all.
 const WRONG_KEY_FAILURES: usize = 2;
 
 /// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
