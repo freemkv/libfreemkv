@@ -31,6 +31,7 @@ pub mod lpcm;
 /// MPEG-2 Video elementary-stream parser.
 pub mod mpeg2;
 
+pub(crate) mod mp2_channels;
 pub mod mpegaudio;
 /// HDMV PGS (Presentation Graphics Stream) subtitle parser.
 pub mod pgs;
@@ -371,6 +372,7 @@ mod provenance_guard {
         "coding",
         "crc",
         "dropgate",
+        "mp2_channels",
         "pesbuf",
         "reorder",
         "startcode",

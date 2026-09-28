@@ -675,6 +675,101 @@ mod tests {
         assert_eq!(scan_audio(vts).0, vec![(0x00C3, "fra".to_string())]);
     }
 
+    // Scans a one-title disc whose IFO declares one MP2 stream (b0, b1), muxes `frame` as its
+    // first audio frame, and returns the MKV Tracks/Audio/Channels value.
+    fn scanned_mp2_mkv_channels(b0: u8, b1: u8, frame: &[u8]) -> u8 {
+        use crate::mux::mkv::{MkvMuxer, MkvTrack};
+        let t = &scan_title(build_vts(
+            0,
+            0x00,
+            &[aud((b0, b1), b"en")],
+            &[],
+            &[(0, 9)],
+            false,
+        ));
+        let tracks: Vec<MkvTrack> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Video(v) => Some(MkvTrack::video(v)),
+                Stream::Audio(a) => Some(MkvTrack::audio(a)),
+                _ => None,
+            })
+            .collect();
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut m = MkvMuxer::new(&mut out, &tracks, None, 0.0, &[]).unwrap();
+        m.write_frame(0, 0, true, &[1, 2], None, None).unwrap();
+        m.write_frame(1, 0, false, frame, None, None).unwrap();
+        m.finish().unwrap();
+        let d = out.into_inner();
+        let at = d
+            .windows(4)
+            .position(|w| w == [0x16, 0x54, 0xAE, 0x6B])
+            .expect("Tracks");
+        let ch = at
+            + d[at..]
+                .windows(2)
+                .position(|w| w == [0x9F, 0x81])
+                .expect("Channels");
+        d[ch + 2]
+    }
+
+    fn scan_title(vts: Vec<u8>) -> DiscTitle {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0
+            .remove(0)
+    }
+
+    /// Scan to MKV: IFO coding mode 3 declares 6 channels ("channels-1" = 5); the stored 0xC0
+    /// base has an extension stream, so the track holds the stereo base only.
+    #[test]
+    fn scan_to_mkv_mp2_mode3_with_extension_stream_is_stereo() {
+        use crate::mux::codec::mp2_channels::tests::{MC_3_2_LFE, Mc, STEREO_256, Spec, write};
+        let f = write(Spec {
+            mc: Some(Mc {
+                ext: true,
+                ..MC_3_2_LFE
+            }),
+            ..STEREO_256
+        })
+        .0;
+        // mpucoder IFO: coding mode "3 Mpeg-2ext", byte 1 bits 2-0 "channels-1".
+        assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 2);
+    }
+
+    /// Scan to MKV with the multichannel data stored in the base frame.
+    /// This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn scan_to_mkv_mp2_mode3_without_extension_stream_keeps_5_1() {
+        use crate::mux::codec::mp2_channels::tests::{MC_3_2_LFE, STEREO_256, Spec, write};
+        let f = write(Spec {
+            mc: Some(MC_3_2_LFE),
+            ..STEREO_256
+        })
+        .0;
+        // 13818-3 §2.5.2.8: "'0' no extension stream present" with 3/2 + LFE.
+        assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 6);
+    }
+
     /// An unknown coding mode has no route: a unique placeholder PID 0xBD00 + i, never
     /// colliding with a sibling.
     #[test]
