@@ -97,6 +97,16 @@ pub fn pts_to_ns(pts: i64) -> i64 {
     (pts * 100_000 + 4) / 9
 }
 
+/// Convert nanoseconds to 90 kHz ticks, rounding to nearest (half up, also below 0):
+/// the one ns → tick helper of the mux sinks (design §2.3, J16/J20). It inverts
+/// [`pts_to_ns`] exactly, and does not saturate: only `ticks − origin` does.
+pub(crate) fn ns_to_ticks(ns: i64) -> i64 {
+    // |ns − p·100 000/9| ≤ 0.5 for a pts_to_ns value, a tick error ≤ 4.5·10⁻⁵ < 0.5.
+    ns.saturating_mul(9)
+        .saturating_add(50_000)
+        .div_euclid(100_000)
+}
+
 /// Trait for codec-specific elementary stream parsers.
 pub trait CodecParser: Send {
     /// Parse a PES packet into zero or more frames.
@@ -248,6 +258,45 @@ pub fn parser_for_mvc_dependent(codec: Codec, is_dvd_ps: bool) -> Box<dyn CodecP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Per design J16/J20 (MPG3-5, MPG4-2); do not change without a spec citation proving
+    // otherwise. Every 90 kHz tick survives pts_to_ns → ns_to_ticks exactly, including
+    // every residue mod 9 (100 000 ≡ 1 mod 9) and negative ticks.
+    #[test]
+    fn disc_ticks_round_trip_through_ns_exactly() {
+        let sweep = (-200_000i64..200_000)
+            .chain((0..9).map(|r| (1i64 << 33) - 9 + r))
+            .chain((0..9).map(|r| -(1i64 << 33) + r))
+            .chain([i64::from(u32::MAX), 95_443_717_i64 * 9 + 4]);
+        for p in sweep {
+            assert_eq!(
+                ns_to_ticks(pts_to_ns(p)),
+                p,
+                "tick {p} (residue {})",
+                p.rem_euclid(9)
+            );
+        }
+    }
+
+    // Round half up on the signed line: no saturation inside the helper (MPG4-2), so a
+    // negative absolute PTS keeps its distance from the origin.
+    #[test]
+    fn ns_to_ticks_rounds_to_nearest_signed() {
+        assert_eq!(ns_to_ticks(0), 0);
+        assert_eq!(ns_to_ticks(5_555), 0, "0.49995 tick");
+        assert_eq!(ns_to_ticks(5_556), 1, "0.50004 tick");
+        assert_eq!(ns_to_ticks(-5_555), 0, "−0.49995 tick");
+        assert_eq!(ns_to_ticks(-5_556), -1, "−0.50004 tick");
+        assert_eq!(ns_to_ticks(-40_000_000), -3_600);
+        assert_eq!(ns_to_ticks(-80_000_000), -7_200);
+        assert_eq!(
+            ns_to_ticks(i64::MIN),
+            i64::MIN
+                .saturating_mul(9)
+                .saturating_add(50_000)
+                .div_euclid(100_000)
+        );
+    }
 
     fn pes(pts: Option<i64>, data: Vec<u8>) -> PesPacket {
         PesPacket {

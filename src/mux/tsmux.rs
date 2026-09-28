@@ -4,6 +4,7 @@
 //! packets. Each frame is wrapped in a PES header, split into TS packets,
 //! and prepended with the 4-byte TP_extra_header.
 
+use super::codec::ns_to_ticks;
 use super::decode_ts::{DtsCounters, DtsDeriver};
 use super::hevc::{
     append_length_prefixed_as_annex_b_sized, avcc_to_annex_b, hvcc_to_annex_b, nal_length_size,
@@ -32,6 +33,8 @@ fn is_video_pid(pid: u16) -> bool {
 // Headroom below the first frame's PTS for frames presented before it but emitted
 // after it. ISO/IEC 13818-1 §2.4.2.6 caps T-STD buffer delay at 1 s.
 pub(crate) const ORIGIN_HEADROOM_NS: i64 = 1_000_000_000;
+// The same headroom in 90 kHz ticks: 1 s is exactly 90 000 ticks.
+const ORIGIN_HEADROOM_TICKS: i64 = 90_000;
 
 // Start-up hold cap (design §2.3): "1 s of IR timeline or 64 MiB", then release in
 // arrival order and count `dts_hold_overflow`.
@@ -62,11 +65,11 @@ pub struct TsMuxer<W: Write> {
     /// sets); MPEG-2/VC-1 are already start-code ES and must NOT be converted. Defaults to
     /// [`Codec::Hevc`]; ignored for non-video tracks.
     video_codec: Vec<Codec>,
-    /// Global PTS origin (nanoseconds), seeded by the FIRST frame of any kind
-    /// (video or audio) so a single fixed origin rebases every frame and the
-    /// audio/video offset is preserved. It lies [`ORIGIN_HEADROOM_NS`] before
-    /// the seeding frame; only a frame earlier than that saturates to 0.
-    base_pts_ns: Option<i64>,
+    /// Global PTS origin in integer 90 kHz ticks, seeded by the FIRST frame of any
+    /// kind (video or audio) so a single fixed origin rebases every frame and the
+    /// audio/video offset is preserved. It lies [`ORIGIN_HEADROOM_NS`] (90 000 ticks)
+    /// before the seeding frame's tick; only a frame earlier than that saturates to 0.
+    origin_ticks: Option<i64>,
     /// Count of PES frames actually emitted (a frame dropped as non-key
     /// before the first keyframe does NOT count). `finish()` returns
     /// [`Error::MuxEmpty`](crate::error::Error::MuxEmpty) when this is zero,
@@ -109,7 +112,7 @@ impl<W: Write> TsMuxer<W> {
             codec_privates: vec![None; n],
             params_written: vec![false; n],
             video_codec: vec![Codec::Hevc; n],
-            base_pts_ns: None,
+            origin_ticks: None,
             frame_count: 0,
             annex_b: Vec::new(),
             arrival_armed: vec![false; n],
@@ -214,13 +217,14 @@ impl<W: Write> TsMuxer<W> {
             self.arrival_armed[track] = true;
         }
 
-        // One origin for every track, seeded by the FIRST frame of any kind and set
-        // ORIGIN_HEADROOM_NS below it, so a frame emitted later but presented
+        // One integer-tick origin for every track (J16), seeded by the FIRST frame of any
+        // kind and set 90 000 ticks below its tick, so a frame emitted later but presented
         // earlier (video behind its GOP) keeps its offset.
-        let base = *self
-            .base_pts_ns
-            .get_or_insert(pts_ns.saturating_sub(ORIGIN_HEADROOM_NS));
-        let pts_90k = pts_ns_to_90k(pts_ns.saturating_sub(base));
+        let ticks = ns_to_ticks(pts_ns);
+        let origin = *self
+            .origin_ticks
+            .get_or_insert(ticks.saturating_sub(ORIGIN_HEADROOM_TICKS));
+        let pts_90k = ticks.saturating_sub(origin).max(0) as u64;
 
         // The deriver sees exactly the PTS the header carries (design §2.3 rule 3);
         // dropped frames never reach it (rule 2).
@@ -561,16 +565,6 @@ enum PesTimes {
     None,
     /// PTS, plus a DTS only where it differs from the PTS (h222:6425-6429).
     Pts { pts: u64, dts: Option<u64> },
-}
-
-/// S0a tick conversion: `floor(ns · 9 / 100 000)` of an origin-relative time, saturated
-/// at 0 below the origin.
-fn pts_ns_to_90k(rel_ns: i64) -> u64 {
-    if rel_ns >= 0 {
-        (rel_ns as u64).saturating_mul(9) / 100_000
-    } else {
-        0
-    }
 }
 
 // A 33-bit timestamp with its 4-bit prefix and marker bits (h222 Table 2-17).
@@ -1716,7 +1710,8 @@ mod tests {
         sink
     }
 
-    // Recorded with `print_goldens` against the pre-S0a writer (origin/dev bbcce1d).
+    // Digests of the pre-S0a writer's output (origin/dev bbcce1d); S0b's PTS delta is
+    // undone before comparing (`as_s0a`, `s0a_tick`).
     const GOLDEN_A: u64 = 0xe76c_c4fa_bd69_9166;
     const GOLDEN_B_AUDIO: u64 = 0x2f58_2a68_48d5_835c;
     const GOLDEN_B_PES_ORDER: u64 = 0x01d8_5336_c980_c698;
@@ -1778,21 +1773,86 @@ both the PTS fields and DTS fields shall be present in the PES packet header.";
 
     // Per spec (§2.7.5); do not change without a spec citation proving otherwise.
     #[test]
-    fn golden_non_reordered_h264_output_is_byte_identical_to_pre_s0a() {
+    fn golden_non_reordered_h264_output_is_pre_s0a_plus_the_s0b_tick_delta() {
+        let decode: Vec<i64> = (0..12).collect();
+        let (s0a, moved) = as_s0a(&golden_a(), &decode, 13, AUDIO_TICK0);
         assert_eq!(
-            fnv(&golden_a()),
+            fnv(&s0a),
             GOLDEN_A,
-            "R = 0: every PES has DTS = PTS, so PTS only"
+            "R = 0: PTS only, byte-identical up to the S0b delta"
+        );
+        // Seed residue 0: exactly the video ticks with p mod 9 ∈ {1..4} moved (J16).
+        assert_eq!(
+            moved, 7,
+            "7 of 12 video PTS move +1 tick; audio (residue 0) none"
         );
     }
 
     #[test]
-    fn golden_sps_less_fake_hevc_output_is_byte_identical_to_pre_s0a() {
+    fn golden_sps_less_fake_hevc_output_is_pre_s0a_plus_the_s0b_tick_delta() {
+        let (s0a, moved) = as_s0a(&golden_c(), &[0, 3, 1, 2, 6, 4, 5], 7, VIDEO_TICK0);
         assert_eq!(
-            fnv(&golden_c()),
+            fnv(&s0a),
             GOLDEN_C,
             "no parameter set: R = 0, no hold (MPG4-4)"
         );
+        // Seed residue 1: a tick moves iff its residue is 2..4 (displays 1..3).
+        assert_eq!(
+            moved, 3,
+            "3 of 7 video PTS move +1 tick; audio (residue 0) none"
+        );
+    }
+
+    /// The tick S0a wrote for source tick `p` (its ns-domain origin, then floor), with
+    /// the origin seeded by source tick `seed`.
+    fn s0a_tick(p: i64, seed: i64) -> u64 {
+        let base = pts_to_ns(seed) - ORIGIN_HEADROOM_NS;
+        (pts_to_ns(p) - base) as u64 * 9 / 100_000
+    }
+
+    /// Overwrite a PES header's PTS, keeping its prefix nibble.
+    fn set_pts(pes: &mut [u8], pts: u64) {
+        let mut v = Vec::new();
+        push_timestamp(&mut v, pes[9] >> 4, pts);
+        pes[9..14].copy_from_slice(&v);
+    }
+
+    /// Undo the S0b delta on a PTS-only output: every PES PTS rewritten to the value S0a
+    /// wrote. `video_display` gives each video PES's display index; audio frame j has
+    /// source tick `AUDIO_TICK0 + j·AUDIO_STEP`; `seed` is the origin-seeding tick.
+    /// Returns the bytes and the count of moved PTS.
+    fn as_s0a(buf: &[u8], video_display: &[i64], audio: i64, seed: i64) -> (Vec<u8>, usize) {
+        let mut out = buf.to_vec();
+        let (mut v, mut a, mut moved) = (0, 0, 0);
+        for pkt in out.chunks_mut(BD_SOURCE_PACKET_BYTES) {
+            if pkt[5] & 0x40 == 0 {
+                continue;
+            }
+            let pid = (((pkt[5] & 0x1F) as u16) << 8) | pkt[6] as u16;
+            let src = if pid == VIDEO_PID {
+                v += 1;
+                VIDEO_TICK0 + video_display[v - 1] * VIDEO_STEP
+            } else {
+                a += 1;
+                AUDIO_TICK0 + (a - 1) * AUDIO_STEP
+            };
+            let at = 8 + if pkt[7] & 0x20 != 0 {
+                1 + pkt[8] as usize
+            } else {
+                0
+            };
+            let pes = &mut pkt[at..];
+            assert_eq!(pes[7] >> 6, 0b10, "PTS only");
+            assert_eq!(
+                ts33(&pes[9..14]),
+                (src - seed + 90_000) as u64,
+                "source tick"
+            );
+            moved += (ts33(&pes[9..14]) != s0a_tick(src, seed)) as usize;
+            set_pts(pes, s0a_tick(src, seed));
+        }
+        assert_eq!((v, a), (video_display.len(), audio));
+        (out, moved)
     }
 
     // Per spec (§2.7.5); do not change without a spec citation proving otherwise.
@@ -1827,10 +1887,19 @@ both the PTS fields and DTS fields shall be present in the PES packet header.";
                 }
                 None => pes.clone(),
             };
+            // S0b (J16): the PTS is the source tick; S0a wrote its floor.
+            let mut pre = pre;
+            let src = VIDEO_TICK0 + GOLDEN_B_DISPLAY[i] * VIDEO_STEP;
+            assert_eq!(
+                pts,
+                (src - AUDIO_TICK0 + 90_000) as u64,
+                "PES {i}: source tick"
+            );
+            set_pts(&mut pre, s0a_tick(src, AUDIO_TICK0));
             assert_eq!(
                 fnv(&pre),
                 want,
-                "PES {i} identical to pre-S0a apart from its DTS"
+                "PES {i} identical to pre-S0a apart from DTS and delta"
             );
             assert!(
                 *n == n0 || *n == n0 + 1,
@@ -1857,6 +1926,9 @@ both the PTS fields and DTS fields shall be present in the PES packet header.";
         assert!(ccs.windows(2).all(|w| w[1] == (w[0] + 1) & 0x0F));
     }
     const EXPECTED_VIDEO_CC_SHIFT: usize = 1;
+    // Golden B's video PES in output (decode) order, as display indices.
+    const GOLDEN_B_DISPLAY: [i64; 18] =
+        [0, 4, 2, 1, 3, 8, 6, 5, 7, 9, 13, 11, 10, 12, 17, 15, 14, 16];
 
     fn mpeg2_es(first: bool, coding: u8, structure: u8, low_delay: bool) -> Vec<u8> {
         let mut v = if first {
@@ -2058,22 +2130,54 @@ both the PTS fields and DTS fields shall be present in the PES packet header.";
         );
     }
 
+    // Per design J16 (S0b); do not change without a spec citation proving otherwise.
+    // Every written PTS/DTS is the source's own 90 kHz tick minus the integer-tick
+    // origin (the seed's tick − 90 000), for every residue mod 9.
     #[test]
-    #[ignore = "prints the golden digests"]
-    fn print_goldens() {
-        let a = golden_a();
-        println!("GOLDEN_A = {:#018x}", fnv(&a));
-        let b = golden_b();
-        println!("GOLDEN_B_AUDIO = {:#018x}", fnv(&pid_bytes(&b, AUDIO_PID)));
-        let v: Vec<_> = pes_by_pid(&parse_bd_ts(&b), VIDEO_PID)
+    fn m2ts_pts_equals_the_source_tick_after_s0b() {
+        let decode: Vec<_> = (0..18).map(|d| (d, d % 9 == 0)).collect();
+        let sps = es::sps_with_reorder(0);
+        let frames = golden_frames(&sps, &decode, false);
+        let buf = mux_golden(&sps, &frames);
+        let packets = parse_bd_ts(&buf);
+        let video: Vec<u64> = pes_by_pid(&packets, VIDEO_PID)
             .iter()
-            .map(|(pes, n)| format!("({:#018x}, {n})", fnv(pes)))
+            .map(|(p, _)| pes_times(p).0)
             .collect();
-        println!("GOLDEN_B_VIDEO = [{}]", v.join(", "));
-        println!("GOLDEN_C = {:#018x}", fnv(&golden_c()));
-        println!(
-            "GOLDEN_B_PES_ORDER = {:#018x}",
-            fnv(&pes_order(&parse_bd_ts(&b)))
+        let want: Vec<u64> = (0..18)
+            .map(|d| (VIDEO_TICK0 + d * VIDEO_STEP - AUDIO_TICK0 + 90_000) as u64)
+            .collect();
+        assert_eq!(video, want, "PTS now equals the source tick");
+        let audio = all_pts_90k(&packets, AUDIO_PID);
+        assert!(
+            audio
+                .iter()
+                .enumerate()
+                .all(|(j, &p)| p == 90_000 + j as u64 * AUDIO_STEP as u64)
+        );
+    }
+
+    // Design §2.3 (MPG4-2): a negative absolute IR PTS pair keeps its offset.
+    #[test]
+    fn negative_pts_audio_video_pair_keeps_its_offset() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.write_frame(0, -40_000_000, true, &fake_hevc_nal(19, 50))
+                .unwrap();
+            mux.write_frame(1, -80_000_000, false, &[0x0B, 0x77, 0, 0])
+                .unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let (v, a) = (
+            first_pts_90k(&packets, VIDEO_PID),
+            first_pts_90k(&packets, AUDIO_PID),
+        );
+        assert_eq!(
+            (v, a),
+            (H, H - 3_600),
+            "−40 ms video, −80 ms audio: 40 ms apart"
         );
     }
 

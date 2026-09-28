@@ -311,14 +311,13 @@ const PGS_SEG_HEADER_LEN: usize = 3;
 /// Byte offset of `width`/`height` within a PCS segment (after type+size).
 const PCS_WIDTH_OFFSET: usize = PGS_SEG_HEADER_LEN; // 3
 
-/// 90 kHz ticks from nanoseconds (saturating into u32 for the `.sup` header).
+/// 90 kHz ticks from nanoseconds via the shared round-to-nearest helper (design J16),
+/// clamped to `0..=u32::MAX` for the `.sup` header (≤ 0 ns writes 0).
 fn ns_to_90k(pts_ns: i64) -> u32 {
     if pts_ns <= 0 {
         return 0;
     }
-    // 90_000 / 1e9 = 9 / 100_000
-    let ticks = (pts_ns as i128 * 9) / 100_000;
-    ticks.clamp(0, u32::MAX as i128) as u32
+    crate::mux::codec::ns_to_ticks(pts_ns).clamp(0, u32::MAX as i64) as u32
 }
 
 impl PgsSupWriter {
@@ -1630,6 +1629,24 @@ mod tests {
         // 1 second = 90000 ticks.
         assert_eq!(ns_to_90k(1_000_000_000), 90_000);
         assert_eq!(ns_to_90k(-5), 0);
+    }
+
+    // Per design J16 (S0b); do not change without a spec citation proving otherwise.
+    // The `.sup` header carries the disc's own tick for every residue mod 9, keeps the
+    // ≤ 0 → 0 clamp and saturates at u32::MAX.
+    #[test]
+    fn sup_ticks_round_trip_disc_ticks_exactly() {
+        use crate::mux::codec::pts_to_ns;
+        for p in (1..20_000i64).chain([u32::MAX as i64 - 9, u32::MAX as i64]) {
+            assert_eq!(
+                ns_to_90k(pts_to_ns(p)) as i64,
+                p,
+                "tick {p} (residue {})",
+                p % 9
+            );
+        }
+        assert_eq!(ns_to_90k(pts_to_ns(-4)), 0, "≤ 0 clamps to 0");
+        assert_eq!(ns_to_90k(i64::MAX), u32::MAX, "saturates at u32::MAX");
     }
 
     // ── VobSub .idx ──────────────────────────────────────────────────────────
