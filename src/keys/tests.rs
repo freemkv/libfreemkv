@@ -2030,3 +2030,97 @@ fn a_matched_miss_keeps_its_reason_in_the_trace() {
         r.trace.keys
     );
 }
+
+// ── KU-E1: the trace on Ok and Err; `is_aacs` ──────────────────────────────
+
+/// The per-source walk ("keydb > matched disc > online > …") answers "why no key", so
+/// `resolve` hands it back through `ResolveKeysOptions::trace` on a refusal too.
+#[test]
+fn resolve_returns_the_trace_on_ok_and_on_err() {
+    let fx = two_units();
+    let calls = Calls::default();
+    let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
+    let opts = ResolveKeysOptions {
+        trace: Some(&out),
+        ..Default::default()
+    };
+    let r = resolve_with(
+        &fx,
+        &mut fx.source(),
+        KeyScope::Titles(vec![1]),
+        &[Spec::keydb(&[K1], &calls)],
+        opts,
+        &FakeClock::default(),
+    );
+    assert_eq!(code(r), E7022);
+    let t = out.lock().unwrap().clone();
+    assert_eq!(t.keys.len(), 1, "{t:?}");
+    assert_eq!(t.keys[0].who, "keydb");
+
+    let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
+    let opts = ResolveKeysOptions {
+        trace: Some(&out),
+        ..Default::default()
+    };
+    let f = factory(&[Spec::keydb(&[K1], &calls)]);
+    let ok = ResolvedKeySet::resolve(
+        &fx.disc,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0]),
+        &f,
+        opts,
+    )
+    .unwrap();
+    assert_eq!(*out.lock().unwrap(), ok.trace);
+}
+
+/// The trace is redacted by construction: source labels, node and outcome enums, booleans
+/// and counts. No key, VID or MKB byte reaches it, in any rendering (KU §2.1 memory only).
+#[test]
+fn the_resolution_trace_holds_no_key_vid_or_mkb_bytes() {
+    let mut fx = two_units();
+    let mkb = vec![0x9Du8; 64];
+    fx.disc.aacs.as_mut().unwrap().mkb = mkb.clone();
+    let calls = Calls::default();
+    let km_no_vid = Spec {
+        no_vid: true,
+        ..Spec::keydb(&[], &calls)
+    };
+    let f = factory(&[
+        km_no_vid,
+        Spec::keydb(&[K1, K2], &calls),
+        Spec::online(&[K1, K2], &calls),
+    ]);
+    let r = ResolvedKeySet::resolve(
+        &fx.disc,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0, 1]),
+        &f,
+        ResolveKeysOptions::default(),
+    )
+    .unwrap();
+    let text = format!("{:?} {:#?}", r.trace, r.trace);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    for secret in [&K1[..], &K2[..], &VID[..], &mkb[..8]] {
+        assert!(!text.contains(&hex(secret)), "hex bytes in {text}");
+        assert!(
+            !text.contains(&format!("{secret:?}")[1..20]),
+            "byte list in {text}"
+        );
+    }
+}
+
+/// `is_aacs`: whether a set keys AACS content. `none()` does not, so a caller can tell it
+/// apart from a resolved set, which `covers` alone (no disc) cannot (KU-E1).
+#[test]
+fn is_aacs_tells_none_from_a_resolved_set() {
+    let fx = two_units();
+    assert!(!ResolvedKeySet::none().is_aacs());
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1], &Calls::default())],
+    )
+    .unwrap();
+    assert!(set.is_aacs());
+}
