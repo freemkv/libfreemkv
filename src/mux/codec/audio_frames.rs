@@ -17,6 +17,8 @@ pub(super) struct Sync {
     pub mask: u8,
     /// Pure size of a valid frame at the slice head (None if none), to find framing mid-stream.
     pub frame_len: fn(&[u8]) -> Option<usize>,
+    /// Mask over the first four header bytes selecting the fields fixed for a stream.
+    pub fixed: [u8; 4],
 }
 
 // A resync run after a verified drop: bytes skipped since, and whether they cost clock slots
@@ -34,9 +36,14 @@ pub(super) struct AudioFrames {
     next_pts: i64,
     // Size and duration of the last emitted frame: the yardstick for frames lost in a resync.
     last_frame: Option<(usize, u64)>,
+    last_head: [u8; 4],
+    // A frame was just emitted, so a header is due next: a failure here is a lost AU.
+    header_due: bool,
     resync: Option<Resync>,
     // A verified drop was counted in this PES; later false syncs in it are the same fault.
     drop_counted: bool,
+    // Buffer offset of the newest PES's first byte, while it is being framed.
+    pes_start: Option<usize>,
     tally: DropTally,
 }
 
@@ -49,8 +56,11 @@ impl AudioFrames {
             anchor: None,
             next_pts: 0,
             last_frame: None,
+            last_head: [0; 4],
+            header_due: false,
             resync: None,
             drop_counted: false,
+            pes_start: None,
             tally: DropTally::new(codec),
         }
     }
@@ -60,6 +70,10 @@ impl AudioFrames {
     }
     pub fn dropped_duration_ns(&self) -> u64 {
         self.tally.dropped_duration_ns()
+    }
+    #[cfg(test)]
+    pub fn verified_dropped(&self) -> u64 {
+        self.tally.verified_dropped()
     }
 
     pub fn parse(
@@ -76,6 +90,7 @@ impl AudioFrames {
             self.buf.clear();
             self.anchor = None;
             self.resync = None;
+            self.header_due = false;
         }
         if self.tally.is_poisoned() {
             self.tally.record_collateral_drop(
@@ -122,9 +137,12 @@ impl AudioFrames {
             );
             return Vec::new();
         }
+        self.pes_start = Some(self.buf.len());
         self.buf.push_with(data, facts);
         self.drop_counted = false;
-        self.frame_buffered(min_header, false, header)
+        let frames = self.frame_buffered(min_header, false, header);
+        self.pes_start = None;
+        frames
     }
 
     // Offset of the first sync whose frame is chained to the next one or ends the packet.
@@ -164,14 +182,17 @@ impl AudioFrames {
                 break;
             };
             let Some(h) = header(data).filter(|_| chained) else {
-                self.skip_byte(consumed, sync, min_header);
+                let valid = (self.sync.frame_len)(data).is_some();
+                self.skip_byte(consumed, sync, valid, min_header);
                 consumed += 1;
                 continue;
             };
             if data.len() < h.bytes {
                 break;
             }
+            let head = [data[0], data[1], data[2], data[3]];
             let data = data[h.skip..h.bytes].to_vec();
+            self.last_head = head;
             self.end_resync();
             let facts = self.anchor_at(consumed);
             let duration = u64::from(h.samples) * 1_000_000_000 / u64::from(h.rate);
@@ -186,6 +207,7 @@ impl AudioFrames {
             });
             self.next_pts = self.next_pts.saturating_add(duration as i64);
             self.last_frame = Some((h.bytes, duration));
+            self.header_due = true;
             self.tally.record_kept();
             consumed += h.bytes;
         }
@@ -193,9 +215,9 @@ impl AudioFrames {
         frames
     }
 
-    // Outside a resync every header stands. Inside one, a frame counts only if another valid
-    // header follows it (or, at EOS, it ends the data); `None` waits for more bytes. Checked
-    // with the pure `frame_len` so a rejected candidate never reaches the parser's header.
+    // Outside a resync every header stands. Inside one, a frame counts if a valid header
+    // follows it, or if it matches the last good frame's fixed header and ends at a sync-shaped
+    // (corrupt) header or at EOS. `None` waits for more bytes. Pure: no parser state is touched.
     fn chains(&self, data: &[u8], min_header: usize, eos: bool) -> Option<bool> {
         if self.resync.is_none() {
             return Some(true);
@@ -203,25 +225,37 @@ impl AudioFrames {
         let Some(n) = (self.sync.frame_len)(data) else {
             return Some(false);
         };
-        match data.get(n..) {
-            None if eos => Some(true),
-            Some([]) if eos => Some(true),
-            Some(next) if next.len() < min_header && !eos => None,
-            Some(next) => Some((self.sync.frame_len)(next).is_some()),
-            None => None,
+        let Some(next) = data.get(n..) else {
+            return eos.then_some(true);
+        };
+        if next.len() < min_header {
+            return eos.then(|| next.is_empty() || self.matches_last(data));
         }
+        let sync_next = next[0] == 0xff && next[1] & self.sync.mask == self.sync.mask;
+        Some((self.sync.frame_len)(next).is_some() || (sync_next && self.matches_last(data)))
     }
 
-    // A byte no frame starts at. The first sync-looking one in a PES is a verified drop that
-    // opens (or, under a new timestamp, restarts) the resync run the skipped bytes count toward.
-    fn skip_byte(&mut self, consumed: usize, sync: bool, min_header: usize) {
-        if sync && !self.drop_counted {
+    fn matches_last(&self, data: &[u8]) -> bool {
+        self.last_frame.is_some()
+            && data.len() >= 4
+            && (0..4).all(|i| (data[i] ^ self.last_head[i]) & self.sync.fixed[i] == 0)
+    }
+
+    // A byte no frame starts at. The first sync-looking one in a PES, or any where a header was
+    // due, is a verified drop that opens the resync run the skipped bytes count toward. A run
+    // restarts under a new timestamp only at a valid (if unchained) header or a PES's first byte.
+    fn skip_byte(&mut self, consumed: usize, sync: bool, valid: bool, min_header: usize) {
+        let due = std::mem::take(&mut self.header_due);
+        if (sync || due) && !self.drop_counted {
             self.drop_counted = true;
             let before = self.anchor;
-            self.anchor_at(consumed);
+            let open = self.resync.is_none() || valid || self.pes_start == Some(consumed);
+            if open {
+                self.anchor_at(consumed);
+            }
             self.tally
                 .record_drop(self.next_pts, 0, min_header, "header");
-            if self.resync.is_none() || self.anchor != before {
+            if open && (self.resync.is_none() || self.anchor != before) {
                 let advance = before.is_some();
                 self.resync = Some(Resync {
                     skipped: 0,
@@ -242,6 +276,11 @@ impl AudioFrames {
             && r.advance
         {
             let lost = ((r.skipped + bytes / 2) / bytes).max(1) as u64;
+            // The first lost AU was the verified drop; the rest went with it (collateral).
+            for _ in 1..lost {
+                self.tally
+                    .record_collateral_drop(self.next_pts, 0, 0, "resync-lost");
+            }
             self.next_pts = self
                 .next_pts
                 .saturating_add(lost.saturating_mul(duration) as i64);
@@ -294,6 +333,7 @@ mod tests {
             Sync {
                 mask: 0xf0,
                 frame_len: |_| None,
+                fixed: [0; 4],
             },
         );
         while !af.tally.is_poisoned() {

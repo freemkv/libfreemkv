@@ -82,6 +82,8 @@ impl AdtsParser {
                 Sync {
                     mask: 0xf0,
                     frame_len: adts_frame_len,
+                    // ID, layer, profile, sampling_frequency_index, channel_configuration.
+                    fixed: [0, 0x0E, 0xFD, 0xC0],
                 },
             ),
             config: None,
@@ -462,7 +464,11 @@ mod tests {
             })
             .sum();
         assert_eq!(kept, 300, "the good track survives");
-        assert_eq!(p.dropped_frames(), 0, "0xFFE is not an ADTS sync");
+        assert_eq!(
+            p.frames.verified_dropped(),
+            1,
+            "one garbage run where a header was due"
+        );
     }
 
     // L043: one resync run through a PES is one verified drop, not one per sync-looking byte.
@@ -481,7 +487,16 @@ mod tests {
             })
             .sum();
         assert_eq!(kept, 300, "the good track survives");
-        assert_eq!(p.dropped_frames(), 1);
+        assert_eq!(
+            p.frames.verified_dropped(),
+            1,
+            "one fault, one verified drop"
+        );
+        assert_eq!(
+            p.dropped_frames(),
+            20,
+            "4200 lost bytes are 20 frames of audio"
+        );
     }
 
     // L042: a first PES starting mid-frame loses the fragment, not the frames after it.
@@ -539,15 +554,24 @@ mod tests {
     #[test]
     fn two_corrupt_frames_in_one_pes_are_two_drops() {
         let mut seed = 13;
-        let mut frames: Vec<Vec<u8>> = (0..6).map(|_| noisy_frame(&mut seed, 200)).collect();
-        for i in [1, 4] {
+        let mut frames: Vec<Vec<u8>> = (0..5).map(|_| noisy_frame(&mut seed, 200)).collect();
+        for i in [1, 3] {
             frames[i][2] = (frames[i][2] & 0xC3) | (13 << 2);
         }
         let mut p = AdtsParser::new();
         let mut f = p.parse(&make_pes(frames.concat(), Some(0)));
         f.extend(p.flush());
         let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
-        assert_eq!(pts, [0, 2, 3, 5].map(|i| i * AAC_FRAME_NS));
+        assert_eq!(
+            pts,
+            [0, 2, 4].map(|i| i * AAC_FRAME_NS),
+            "the good frame between is kept"
+        );
+        assert!(
+            f.iter()
+                .zip([0, 2, 4])
+                .all(|(f, i)| f.data == frames[i][7..])
+        );
         assert_eq!(p.dropped_frames(), 2);
     }
 
@@ -605,6 +629,24 @@ mod tests {
         assert_eq!(pts, [10_000_000_000, 10_000_000_000 + AAC_FRAME_NS]);
     }
 
+    // After a gap the PES may start mid-frame: that fragment is not a due header, so no drop.
+    #[test]
+    fn a_fragment_after_a_gap_is_not_a_drop() {
+        let mut seed = 83;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
+        let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes(
+                [&noise(&mut seed, 40)[..], &g1, &g2].concat(),
+                Some(900_000),
+            )
+        };
+        assert_eq!(p.parse(&gap).len(), 2);
+        assert_eq!(p.dropped_frames(), 0);
+    }
+
     // A gap ends an open resync run: the next PES's lone frame needs no successor.
     #[test]
     fn a_discontinuity_ends_a_resync_run() {
@@ -636,6 +678,98 @@ mod tests {
         let f = p.parse(&make_pes(frames.concat(), Some(0)));
         let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
         assert_eq!(pts, [0, 3, 4].map(|i| i * AAC_FRAME_NS));
+        assert_eq!(p.dropped_frames(), 2, "both lost frames are reported");
+        assert_eq!(p.frames.verified_dropped(), 1);
+    }
+
+    // While resyncing, a frame ending at a sync-shaped (corrupt) header is kept only if its own
+    // fixed header matches the last good frame's; a stray header that differs is payload.
+    #[test]
+    fn a_mismatched_header_ending_at_a_sync_is_not_kept() {
+        let mut seed = 67;
+        let frames: Vec<Vec<u8>> = (0..4).map(|_| noisy_frame(&mut seed, 300)).collect();
+        let mut bad = frames[1].clone();
+        corrupt(&mut bad);
+        let mut fake = adts_frame(13);
+        fake[2] |= 0x01; // channel configuration 4..7: differs from the stream's stereo
+        fake[7..].copy_from_slice(&noise(&mut seed, 13));
+        bad[50..70].copy_from_slice(&fake);
+        bad[70..72].copy_from_slice(&[0xFF, 0xF3]);
+        let data = [&frames[0][..], &bad, &frames[2], &frames[3]].concat();
+        let f = AdtsParser::new().parse(&make_pes(data, Some(0)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [0, 2, 3].map(|i| i * AAC_FRAME_NS));
+    }
+
+    // At EOS a good frame after a drop is kept even when a truncated header trails it.
+    #[test]
+    fn a_resync_frame_before_a_short_tail_is_kept_at_eos() {
+        let mut seed = 71;
+        let (g0, g2) = (noisy_frame(&mut seed, 200), noisy_frame(&mut seed, 200));
+        let mut bad = noisy_frame(&mut seed, 200);
+        corrupt(&mut bad);
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(g0.clone(), Some(0)));
+        assert!(
+            p.parse(&make_pes([&bad[..], &g2, &g0[..3]].concat(), None))
+                .is_empty()
+        );
+        let f = p.flush();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, g2[7..]);
+    }
+
+    // Mid-run, a sync-shaped byte that is no valid header does not re-anchor the run: the next
+    // PES's PTS still names its first whole frame.
+    #[test]
+    fn a_run_restarts_only_on_a_valid_header() {
+        let mut seed = 73;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
+        let mut bad = noisy_frame(&mut seed, 300);
+        corrupt(&mut bad);
+        p.parse(&make_pes(bad, None));
+        let mut tail = noise(&mut seed, 30);
+        tail[10..12].copy_from_slice(&[0xFF, 0xF3]); // sync-shaped, invalid layer
+        let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
+        let f = p.parse(&make_pes([&tail[..], &g1, &g2].concat(), Some(90_000)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [0, 1].map(|i| 1_000_000_000 + i * AAC_FRAME_NS));
+    }
+
+    // Mid-run, a valid (if unchained) header in a new PES does restart the run there.
+    #[test]
+    fn a_run_restarts_at_a_valid_unchained_header() {
+        let mut seed = 89;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
+        let mut bad = noisy_frame(&mut seed, 300);
+        corrupt(&mut bad);
+        p.parse(&make_pes(bad, None));
+        let cut = noisy_frame(&mut seed, 300)[..157].to_vec(); // its length runs past the cut
+        let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
+        let data = [&noise(&mut seed, 30)[..], &cut, &g1, &g2].concat();
+        let f = p.parse(&make_pes(data, Some(90_000)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [1, 2].map(|i| 1_000_000_000 + i * AAC_FRAME_NS));
+    }
+
+    // A frame whose sync is lost where a header was due opens a resync run: a false header in
+    // its payload is not emitted, and the loss is counted.
+    #[test]
+    fn a_lost_sync_where_a_header_was_due_opens_a_run() {
+        let mut seed = 79;
+        let frames: Vec<Vec<u8>> = (0..4).map(|_| noisy_frame(&mut seed, 300)).collect();
+        let mut bad = frames[1].clone();
+        bad[..2].copy_from_slice(&[0x00, 0x00]);
+        let mut fake = adts_frame(6);
+        fake[7..].copy_from_slice(&noise(&mut seed, 6));
+        bad[50..63].copy_from_slice(&fake);
+        let data = [&frames[0][..], &bad, &frames[2], &frames[3]].concat();
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(data, Some(0)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [0, 2, 3].map(|i| i * AAC_FRAME_NS), "no junk AU");
         assert_eq!(p.dropped_frames(), 1);
     }
 
@@ -721,6 +855,7 @@ mod tests {
         let mut fake = adts_frame(13);
         fake[7..].copy_from_slice(&noise(&mut seed, 13));
         bad[50..70].copy_from_slice(&fake);
+        bad[70..72].copy_from_slice(&[0xFF, 0x12]); // 0xFF, but no sync after it
         let mut p = AdtsParser::new();
         let f = p.parse(&make_pes(
             [&frames[0][..], &bad, &frames[2], &frames[3]].concat(),

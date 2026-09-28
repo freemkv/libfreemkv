@@ -181,6 +181,8 @@ impl MpegAudioParser {
                 Sync {
                     mask: 0xe0,
                     frame_len: |d| frame_header(d, &mut None, false).map(|h| h.bytes),
+                    // Version, layer, sampling rate, channel mode.
+                    fixed: [0, 0x1E, 0x0C, 0xC0],
                 },
             ),
             free_size: None,
@@ -543,6 +545,25 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].data, free_frame());
         assert_eq!(p.dropped_frames(), 1);
+    }
+
+    // A good frame between two corrupt ones is kept: it ends at a sync-shaped header and
+    // matches the stream's fixed header. A stray header with another channel mode is not.
+    #[test]
+    fn good_then_corrupt_frames_keep_the_good_one() {
+        let mut bad = mp3_frame();
+        bad[2] = 0x9C; // reserved sample rate
+        let mut fake = vec![0xFF, 0xFB, 0x10, 0xC0]; // 32 kbit/s (104 bytes), mono
+        fake.resize(104, 0x11);
+        bad[40..144].copy_from_slice(&fake);
+        bad[144..146].copy_from_slice(&[0xFF, 0xE0]);
+        let data = [mp3_frame(), bad.clone(), mp3_frame(), bad, mp3_frame()].concat();
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(data, Some(0)));
+        f.extend(p.flush());
+        assert_eq!(f.len(), 3);
+        assert!(f.iter().all(|fr| fr.data == mp3_frame()));
+        assert_eq!(p.dropped_frames(), 2);
     }
 
     #[test]
