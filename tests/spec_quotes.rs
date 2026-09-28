@@ -208,10 +208,20 @@ fn spec_governed_sites_cite_the_spec() {
         assert!(ids.contains(id), "{file} {name}: {id} is not a spec quote");
         let src = std::fs::read_to_string(root.join(file)).expect(file);
         let body = fn_body(&src, name).unwrap_or_else(|e| panic!("{file}: {e}"));
-        assert!(body.contains(id), "{file} fn {name} does not cite {id}");
+        assert!(cites(body, id), "{file} fn {name} does not cite {id}");
         rows += 1;
     }
     assert!(rows > 0, "no spec-governed sites listed");
+}
+
+// Does `body` name `id` as a whole ID? `KS-2` must not match inside `KS-22` or `XKS-2`.
+fn cites(body: &str, id: &str) -> bool {
+    body.match_indices(id).any(|(at, _)| {
+        let before = body[..at].chars().next_back();
+        let after = body[at + id.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_ascii_digit())
+    })
 }
 
 /// The site checker itself: a cited ID passes; a missing ID, a missing fn, a braced
@@ -225,4 +235,10 @@ fn spec_site_check_finds_the_body() {
     assert!(!fn_body(src, "b2").unwrap().contains("KS-2"));
     assert!(fn_body(src, "c").is_err());
     assert!(fn_body("fn d() {}\nfn d() {}", "d").is_err());
+    // Word boundaries: `KS-2` is not cited by `KS-22`, and is by `KS-2,` / `(KS-2)`.
+    assert!(!cites("fn e() { // KS-22 only }", "KS-2"));
+    assert!(!cites("fn e() { // XKS-2 }", "KS-2"));
+    assert!(cites("fn e() { // KS-22, KS-2, KS-3 }", "KS-2"));
+    assert!(cites("fn e() { // (KS-2) }", "KS-2"));
+    assert!(cites(fn_body(src, "b").unwrap(), "KS-2"));
 }

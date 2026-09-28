@@ -1649,9 +1649,9 @@ mod spec_guards {
         assert!(changed, "every block of the final 6128 bytes is decrypted");
     }
 
-    /// per spec; do not change without a spec citation — KS-3 [BD] §3.10.1: "A new CBC
-    /// cipher chain is started for each Aligned Unit": the mapped decrypt of a multi-unit
-    /// buffer, in either order, never chains one unit's ciphertext into the next.
+    /// per spec; do not change without a spec citation proving otherwise — KS-3 [BD]
+    /// §3.10.1: "A new CBC cipher chain is started for each Aligned Unit": the mapped decrypt
+    /// of a multi-unit buffer, in either order, never chains one unit into the next.
     #[test]
     fn cbc_chain_restarts_every_unit() {
         use crate::decrypt::{AacsKeyMap, DecryptKeys, Phase, decrypt_sectors_mapped};
