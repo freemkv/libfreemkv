@@ -776,7 +776,8 @@ fn apply_single_unit_rule(run: &Run, ps: &mut [Piece], n_decl: Option<usize>) ->
         _ => None,
     }) {
         for p in ps.iter_mut() {
-            if matches!(p.verdict, Verdict::Lazy(_)) {
+            // Only a piece no other held key opened; a different candidate stays Lazy.
+            if matches!(p.verdict, Verdict::Lazy(None)) || p.verdict == Verdict::Lazy(Some(slot)) {
                 p.verdict = Verdict::Keyed(slot);
             }
         }
