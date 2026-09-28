@@ -49,8 +49,11 @@ impl Drop for PrefetchShell {
 
 /// Spawned byte prefetcher. Drop joins the producer thread.
 pub struct BytePrefetcher {
-    rx: Option<Receiver<Batch>>,
-    recycle_tx: Option<Sender<Vec<u8>>>,
+    // Non-`Option`: `into_channels`/`Drop` swap in a disconnected stand-in (dead-channel
+    // `mem::replace`, as `sector::PrefetchedSectorSource` does), so a missing `rx` can
+    // never read as a silent, truncating clean EOF.
+    rx: Receiver<Batch>,
+    recycle_tx: Sender<Vec<u8>>,
     producer: Option<JoinHandle<()>>,
 }
 
@@ -99,16 +102,10 @@ impl BytePrefetcher {
                         else {
                             return;
                         };
-                        // Regrow to chunk_bytes: a prior short read truncated len to
-                        // n < chunk_bytes. No realloc — capacity was fixed at
-                        // construction and never shrinks.
-                        if buf.len() < chunk_bytes {
-                            buf.resize(chunk_bytes, 0);
-                        } else {
-                            // SAFETY: capacity is at least chunk_bytes
-                            // after construction.
-                            unsafe { buf.set_len(chunk_bytes) };
-                        }
+                        // Regrow to chunk_bytes (a short read may have truncated len): sound
+                        // resize, was `unsafe set_len` guarded only by capacity (GHSA-j8ww-f5fg-9pmh
+                        // in `sector::prefetched`). No realloc; a no-op if len is already there.
+                        buf.resize(chunk_bytes, 0);
                         // Read up to one full chunk. Short reads are
                         // valid and common — pipe `truncate` so the
                         // consumer sees only the bytes that arrived.
@@ -141,8 +138,8 @@ impl BytePrefetcher {
             })?;
 
         Ok(Self {
-            rx: Some(rx),
-            recycle_tx: Some(recycle_tx),
+            rx,
+            recycle_tx,
             producer: Some(producer),
         })
     }
@@ -152,20 +149,17 @@ impl BytePrefetcher {
     /// drains `rx`, runs the demuxer in place on each filled buffer,
     /// and recycles back through `recycle_tx`.
     pub fn into_channels(mut self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
-        // Same `Option::take` pattern `Drop for BytePrefetcher` uses below (no `unsafe`,
-        // no double-drop). `rx`/`recycle_tx` are always `Some` here, but fall back to a
-        // disconnected stand-in instead of an `.expect()` panic if that ever changes.
+        // Same dead-channel swap as `Drop for BytePrefetcher` below: `self` is left
+        // holding only disconnected placeholders — no `unsafe`, no double-drop, and (being
+        // non-`Option`) no fallback branch that could hand back a dead `rx`.
+        let (dead_tx, dead_rx) = bounded::<Batch>(0);
+        drop(dead_tx);
+        let rx = std::mem::replace(&mut self.rx, dead_rx);
+        let (dead_send, dead_recv) = bounded::<Vec<u8>>(0);
+        drop(dead_recv);
+        let recycle = std::mem::replace(&mut self.recycle_tx, dead_send);
         let producer = self.producer.take();
-        let rx = self.rx.take().unwrap_or_else(|| {
-            let (_dead_tx, dead_rx) = bounded::<Batch>(0);
-            dead_rx
-        });
-        let recycle = self.recycle_tx.take().unwrap_or_else(|| {
-            let (dead_tx, _dead_rx) = bounded::<Vec<u8>>(0);
-            dead_tx
-        });
-        // `self` drops here: `rx`/`recycle_tx` are `None` and `producer` is `None`, so
-        // `Drop for BytePrefetcher` is a no-op.
+        // `self` drops here: dead endpoints no-op, `producer` is `None` (no join).
         (rx, recycle, PrefetchShell { producer })
     }
 }
@@ -175,8 +169,12 @@ impl Drop for BytePrefetcher {
         // Drop channel endpoints BEFORE joining so the producer observes Disconnected
         // (send/recv) and exits promptly. Otherwise a non-EOF source fills the forward
         // channel and spins in send_timeout forever since rx is never drained.
-        drop(self.rx.take());
-        drop(self.recycle_tx.take());
+        let (dead_tx, dead_rx) = bounded::<Batch>(0);
+        drop(dead_tx);
+        drop(std::mem::replace(&mut self.rx, dead_rx));
+        let (dead_send, dead_recv) = bounded::<Vec<u8>>(0);
+        drop(dead_recv);
+        drop(std::mem::replace(&mut self.recycle_tx, dead_send));
         if let Some(h) = self.producer.take() {
             let _ = h.join();
         }
@@ -265,8 +263,7 @@ mod tests {
     }
 
     // Channels handed back by `into_channels` must still carry real bytes end-to-end — the
-    // safe rewrite must not have swapped in the dead/disconnected fallback channels (the
-    // `unwrap_or_else` branch that replaced the removed `.expect()`s) by mistake.
+    // safe rewrite must not have handed back the dead placeholder channels by mistake.
     #[test]
     fn into_channels_channels_still_deliver_bytes() {
         within(10, || {
@@ -428,6 +425,22 @@ mod tests {
                 err.is_some(),
                 "a mid-stream producer PANIC must surface as an Err batch, \
                  not a clean EOF (which would silently truncate the mux)"
+            );
+        });
+    }
+
+    // Exercises the regrow-fill's now-plain `resize` when len is already chunk_bytes (was
+    // `unsafe set_len`): three full 8-byte chunks back to back, no short read in between.
+    #[test]
+    fn full_chunks_back_to_back_exercise_the_no_shrink_resize_path() {
+        within(10, || {
+            let src = vec![0x5Cu8; 24]; // 3 whole 8-byte chunks, source ends exactly on a chunk
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none());
+            assert_eq!(
+                got, src,
+                "back-to-back full-size chunks must round-trip exactly"
             );
         });
     }
