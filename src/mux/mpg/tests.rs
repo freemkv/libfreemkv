@@ -1005,6 +1005,35 @@ fn an_lpcm_depth_rise_never_splits_a_pes() {
     assert!(bits.windows(2).all(|w| w[0] <= w[1]), "never back down");
 }
 
+// G8 / §2.3: a 20/24-bit LPCM AU cut on a frame takes that frame's PTS less the carried
+// samples' duration, so the output follows the source clock, not a running sample count.
+#[test]
+fn lpcm_pts_reanchor_on_every_frame() {
+    let fx = fixture(&Opts {
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let mut sink = MpgSink::create(Vec::new(), &fx.title).unwrap();
+    let out = sink.route[6].unwrap();
+    // 477 sample frames stamped every 10 ms (480 frames): a source clock ahead of its samples.
+    let data: Vec<u8> = (0..477 * 6).map(|i| (i as u8) | 1).collect();
+    let mut checked = 0;
+    for k in 0..400i64 {
+        let rel = k * 900;
+        let carried = (sink.lpcm[out].carry.len() / 6) as i64;
+        for au in sink.lpcm_aus(out, rel, &data, false) {
+            let want = rel - (carried * 90_000 + 24_000) / 48_000;
+            assert!(
+                (au.pts - want).abs() <= 1,
+                "frame {k}: {} vs {want}",
+                au.pts
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 400);
+}
+
 // Design §2.4 step 1 (MPG2-6c): a Matroska source whose audio lags its video in the
 // interleave by 3 s is held until the audio catches up; nothing is late.
 #[test]
