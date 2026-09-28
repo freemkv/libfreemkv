@@ -772,3 +772,27 @@ fn decrypt_clears_cpi_on_every_source_packet() {
         "requests"
     );
 }
+
+/// K-8: the declared count is read through `parse_title_keys`, so an HD DVD title-key
+/// file counts too. Per spec KS-14 ("Num_of_CPS_Unit … the number of CPS Units on the
+/// disc") for BD; HD DVD has no public book, per evidence KS-27.
+#[test]
+fn single_cps_reads_hd_dvd_title_keys_too() {
+    use crate::spec::keys::{KS_14_UNIT_KEY_BLOCK, KS_27_HDDVD_EVIDENCE};
+    assert!(
+        KS_14_UNIT_KEY_BLOCK
+            .text
+            .contains("indicates the number of CPS Units")
+    );
+    assert_eq!(KS_27_HDDVD_EVIDENCE.kind, crate::spec::QuoteKind::Evidence);
+    // A VTKF with one available Title Key Entry (AV_FLG set in slot 0).
+    let mut vtkf = vec![0u8; 2480];
+    vtkf[..12].copy_from_slice(crate::aacs::inf::VTKF_MAGIC);
+    vtkf[0x80] = 0x80;
+    let mut disc = aacs_disc(1);
+    disc.format = crate::DiscFormat::HdDvd;
+    disc.content_format = crate::ContentFormat::MpegPs;
+    disc.aacs.as_mut().unwrap().uk_ro = vtkf;
+    let empty = AacsKeyMap::from_ranges(Vec::new());
+    assert_eq!(single_cps_key_slot(&disc, &pool(&[K0]), &empty), Some(0));
+}
