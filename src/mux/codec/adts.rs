@@ -1,12 +1,16 @@
 //! AAC ADTS framing and validation.
+//!
+//! Spec text is quoted from ISO/IEC 13818-7:2004 (MPEG-2 AAC, ADTS in §6.2 and §8.1) and
+//! ISO/IEC 11172-3 (the public CD text of §2.4.2.3, which 13818-7 refers to). MPEG-4 ADTS
+//! (ID '0', 7350 Hz at index 0xc) follows ISO/IEC 14496-3, which is not quoted here.
 
 use super::audio_frames::{AudioFrames, Header, Sync};
 #[cfg(test)]
 use super::pts_to_ns;
 use super::{CodecParser, Frame, PesPacket};
 
-/// ADTS `sampling_frequency_index` table (ISO/IEC 14496-3) — 13 valid entries;
-/// indices 13/14/15 are 0 (reserved) and constitute a hard reject.
+/// [13818-7 §8.1.1.2 Table 35] `sampling_frequency_index` 0x0-0xb in Hz, "0xc reserved" to
+/// "0xf reserved"; 0xc is 7350 Hz for MPEG-4 (14496-3). Zero marks a reserved index.
 const ADTS_SAMPLE_RATE_VALID: [u32; 16] = [
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, 0, 0,
     0,
@@ -16,10 +20,9 @@ const ADTS_SAMPLE_RATE_VALID: [u32; 16] = [
 enum AdtsVerdict {
     /// No 12-bit ADTS sync at the head — not an ADTS frame we can validate.
     NoSync,
-    /// Sync present and the three structural fields are legal.
+    /// Sync present and the structural fields are legal.
     Valid,
-    /// Sync present but a reserved sample-rate index or a sub-header
-    /// frame-length — structurally invalid per the ADTS spec.
+    /// Sync present but a field is reserved or the frame length is shorter than its headers.
     Invalid,
 }
 
@@ -28,25 +31,24 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
     if data.len() < 7 {
         return AdtsVerdict::NoSync;
     }
-    // 12-bit syncword 0xFFF: byte0 == 0xFF and top nibble of byte1 == 0xF.
+    // [13818-7 §8.1.1.2] syncword: "The bit string '1111 1111 1111'."
     if data[0] != 0xFF || (data[1] & 0xF0) != 0xF0 {
         return AdtsVerdict::NoSync;
     }
-    // layer is always 00; profile 3 is reserved when ID = 1 (MPEG-2 AAC).
-    if data[1] & 0x06 != 0 || (data[1] & 0x08 != 0 && data[2] >> 6 == 3) {
+    // [§8.1.1.2] layer: "Set to '00'." ID: "MPEG identifier, set to '1'" (MPEG-2), where
+    // [§7.1 Table 31] profile "3 (reserved)" and [Table 35] "0xc reserved".
+    let mpeg2 = data[1] & 0x08 != 0;
+    let sr_index = usize::from((data[2] >> 2) & 0x0F);
+    if data[1] & 0x06 != 0 || (mpeg2 && (data[2] >> 6 == 3 || sr_index == 0xc)) {
         return AdtsVerdict::Invalid;
     }
-    // sampling_frequency_index: byte2 bits 5..2.
-    let sr_index = ((data[2] >> 2) & 0x0F) as usize;
     if ADTS_SAMPLE_RATE_VALID[sr_index] == 0 {
         return AdtsVerdict::Invalid;
     }
-    // aac_frame_length: 13 bits = byte3[1:0] | byte4 | byte5[7:5].
+    // [§8.1.1.2] frame_length: "Length of the frame including headers and error_check in
+    // bytes", so at least 7, or 9 with the CRC ("protection_absent" '0').
     let frame_length =
         ((u32::from(data[3]) & 0x03) << 11) | (u32::from(data[4]) << 3) | (u32::from(data[5]) >> 5);
-    // Floor depends on protection_absent: CRC-present (byte1 bit0 clear) adds a
-    // 16-bit crc_check after the 7-byte header, so the min is 9, not a flat 7 —
-    // else a CRC frame declaring length 7-8 wrongly passed as Valid.
     let header_bytes = if data[1] & 0x01 == 0 { 9 } else { 7 };
     if frame_length < header_bytes {
         return AdtsVerdict::Invalid;
@@ -59,6 +61,12 @@ fn adts_frame_len(data: &[u8]) -> Option<usize> {
     matches!(adts_verdict(data), AdtsVerdict::Valid).then(|| {
         (usize::from(data[3] & 3) << 11) | (usize::from(data[4]) << 3) | usize::from(data[5] >> 5)
     })
+}
+
+// [13818-7 §8.1.1.1 adts_fixed_header()] "The information in this header does not change from
+// frame to frame." Keyed: ID, layer, profile, sampling_frequency_index, channel_configuration.
+fn adts_fixed_key(d: &[u8]) -> u32 {
+    u32::from_be_bytes([d[0], d[1], d[2], d[3]]) & 0x000E_FDC0
 }
 
 pub struct AdtsParser {
@@ -82,8 +90,7 @@ impl AdtsParser {
                 Sync {
                     mask: 0xf0,
                     frame_len: adts_frame_len,
-                    // ID, layer, profile, sampling_frequency_index, channel_configuration.
-                    fixed: [0, 0x0E, 0xFD, 0xC0],
+                    fixed: adts_fixed_key,
                 },
             ),
             config: None,
@@ -129,6 +136,8 @@ fn adts_header(
         }
         Some(_) => {}
     }
+    // [§8.1.1.2] "Number of raw_data_block()'s ... is equal to number_of_raw_data_blocks_in_frame
+    // + 1", and [§8.2.1.1] each holds "audio data for a time period of 1024 samples".
     Some(Header {
         bytes: adts_frame_len(data)?,
         skip: if data[1] & 1 == 0 { 9 } else { 7 },
@@ -647,6 +656,37 @@ mod tests {
         assert_eq!(p.dropped_frames(), 0);
     }
 
+    // A run still open at EOS reports its lost slots too, not just the first.
+    #[test]
+    fn a_run_open_at_eos_reports_every_lost_slot() {
+        let mut bad = adts_frame(0);
+        corrupt(&mut bad);
+        let mut seed = 97;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(0)));
+        p.parse(&make_pes(bad.repeat(600), None));
+        assert!(p.flush().is_empty());
+        assert_eq!(p.dropped_frames(), 20, "4194 scanned bytes are 20 frames");
+        assert_eq!(p.frames.verified_dropped(), 1);
+    }
+
+    // So does a run that a discontinuity cuts short.
+    #[test]
+    fn a_run_cut_by_a_gap_reports_every_lost_slot() {
+        let mut bad = adts_frame(0);
+        corrupt(&mut bad);
+        let mut seed = 101;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(0)));
+        p.parse(&make_pes(bad.repeat(600), None));
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes(noisy_frame(&mut seed, 200), Some(900_000))
+        };
+        assert_eq!(p.parse(&gap).len(), 1);
+        assert_eq!(p.dropped_frames(), 20);
+    }
+
     // A gap ends an open resync run: the next PES's lone frame needs no successor.
     #[test]
     fn a_discontinuity_ends_a_resync_run() {
@@ -894,6 +934,265 @@ mod tests {
         let f = p.flush();
         assert_eq!(f.len(), 1, "EOS: a frame ending the data is accepted");
         assert_eq!(f[0].data, fr[1][7..]);
+    }
+
+    // ADTS header fields, laid out per [13818-7 §6.2.1 Table 8] adts_fixed_header() and
+    // [§6.2.2 Table 9] adts_variable_header(); `len` bytes long, zero payload.
+    struct Adts {
+        id: u8,
+        layer: u8,
+        protection_absent: u8,
+        profile: u8,
+        sfi: u8,
+        channels: u8,
+        len: usize,
+        fullness: u16,
+        blocks: u8,
+    }
+
+    const LC_44K_STEREO: Adts = Adts {
+        id: 1,
+        layer: 0,
+        protection_absent: 1,
+        profile: 1,
+        sfi: 4,
+        channels: 2,
+        len: 64,
+        fullness: 0x7FF,
+        blocks: 0,
+    };
+
+    impl Adts {
+        fn bytes(&self) -> Vec<u8> {
+            let mut f = vec![0u8; self.len.max(7)];
+            f[0] = 0xFF;
+            f[1] = 0xF0 | self.id << 3 | self.layer << 1 | self.protection_absent;
+            f[2] = self.profile << 6 | self.sfi << 2 | self.channels >> 2;
+            f[3] = (self.channels & 3) << 6 | (self.len >> 11) as u8;
+            f[4] = (self.len >> 3) as u8;
+            f[5] = ((self.len & 7) as u8) << 5 | (self.fullness >> 6) as u8;
+            f[6] = ((self.fullness & 0x3F) as u8) << 2 | self.blocks;
+            f
+        }
+        fn verdict(&self) -> AdtsVerdict {
+            adts_verdict(&self.bytes())
+        }
+        fn header(&self) -> Option<Header> {
+            adts_header(&self.bytes(), &mut None, &mut 0, 0)
+        }
+    }
+
+    // [13818-7 §8.1.1.2] syncword: "The bit string '1111 1111 1111'."
+    #[test]
+    fn spec_syncword_is_twelve_ones() {
+        let f = LC_44K_STEREO.bytes();
+        assert!(matches!(adts_verdict(&f), AdtsVerdict::Valid));
+        for bit in 0..4 {
+            let mut g = f.clone();
+            g[1] &= !(0x80 >> bit);
+            assert!(
+                matches!(adts_verdict(&g), AdtsVerdict::NoSync),
+                "sync bit {bit}"
+            );
+        }
+    }
+
+    // [13818-7 §8.1.1.2] layer: "Indicates which layer is used. Set to '00'."
+    #[test]
+    fn spec_layer_is_00() {
+        for layer in 1..4 {
+            let a = Adts {
+                layer,
+                ..LC_44K_STEREO
+            };
+            assert!(matches!(a.verdict(), AdtsVerdict::Invalid), "layer {layer}");
+        }
+    }
+
+    // [13818-7 §7.1 Table 31] profile: "0 Main profile", "1 Low Complexity profile (LC)",
+    // "2 Scalable Sampling Rate profile (SSR)", "3 (reserved)".
+    #[test]
+    fn spec_mpeg2_profile_3_is_reserved() {
+        for profile in 0..3 {
+            let a = Adts {
+                profile,
+                ..LC_44K_STEREO
+            };
+            assert!(
+                matches!(a.verdict(), AdtsVerdict::Valid),
+                "profile {profile}"
+            );
+        }
+        let a = Adts {
+            profile: 3,
+            ..LC_44K_STEREO
+        };
+        assert!(matches!(a.verdict(), AdtsVerdict::Invalid));
+    }
+
+    // [13818-7 §8.1.1.2 Table 35] sampling_frequency_index 0x0..0xb: 96000 88200 64000 48000
+    // 44100 32000 24000 22050 16000 12000 11025 8000 Hz; "0xc reserved" to "0xf reserved".
+    #[test]
+    fn spec_sampling_frequency_index_table() {
+        let hz = [
+            96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000,
+        ];
+        for (sfi, want) in hz.into_iter().enumerate() {
+            let a = Adts {
+                sfi: sfi as u8,
+                ..LC_44K_STEREO
+            };
+            assert_eq!(a.header().map(|h| h.rate), Some(want), "index {sfi:#x}");
+        }
+        for sfi in 0xc..=0xf {
+            let a = Adts {
+                sfi,
+                ..LC_44K_STEREO
+            };
+            assert!(
+                matches!(a.verdict(), AdtsVerdict::Invalid),
+                "index {sfi:#x}"
+            );
+        }
+    }
+
+    // [13818-7 §8.1.1.2] protection_absent: "Indicates whether error_check() data is present or
+    // not." [11172-3 §2.4.2.3] protection_bit: "'0' if redundancy has been added".
+    #[test]
+    fn spec_protection_absent_selects_the_crc() {
+        for (absent, header) in [(1, 7), (0, 9)] {
+            let a = Adts {
+                protection_absent: absent,
+                ..LC_44K_STEREO
+            };
+            let h = a.header().unwrap();
+            assert_eq!(
+                (h.skip, h.bytes),
+                (header, 64),
+                "protection_absent {absent}"
+            );
+        }
+    }
+
+    // [13818-7 §8.1.1.2] frame_length: "Length of the frame including headers and error_check
+    // in bytes". So it can never be shorter than those headers.
+    #[test]
+    fn spec_frame_length_includes_headers_and_error_check() {
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(LC_44K_STEREO.bytes(), Some(0)));
+        assert_eq!(f[0].data.len(), 64 - 7, "payload = frame_length - header");
+        for (absent, floor) in [(1, 7), (0, 9)] {
+            let short = Adts {
+                protection_absent: absent,
+                len: floor - 1,
+                ..LC_44K_STEREO
+            };
+            assert!(matches!(adts_verdict(&short.bytes()), AdtsVerdict::Invalid));
+            let ok = Adts {
+                protection_absent: absent,
+                len: floor,
+                ..LC_44K_STEREO
+            };
+            assert!(matches!(ok.verdict(), AdtsVerdict::Valid));
+        }
+    }
+
+    // [13818-7 §8.1.1.2] "Number of raw_data_block()'s that are multiplexed in the adts_frame()
+    // is equal to number_of_raw_data_blocks_in_frame + 1." [§8.2.1.1] raw_data_block(): "block
+    // of raw data that contains audio data for a time period of 1024 samples".
+    #[test]
+    fn spec_each_raw_data_block_is_1024_samples() {
+        for blocks in 0..4u8 {
+            let a = Adts {
+                blocks,
+                ..LC_44K_STEREO
+            };
+            assert_eq!(a.header().unwrap().samples, 1024 * (u32::from(blocks) + 1));
+        }
+    }
+
+    // [13818-7 §8.1.1.2] channel_configuration: "If channel_configuration equals 0, the channel
+    // configuration is not specified in the header" (a PCE carries it): legal, not rejected.
+    #[test]
+    fn spec_channel_configuration_0_is_legal() {
+        for channels in 0..8 {
+            let a = Adts {
+                channels,
+                ..LC_44K_STEREO
+            };
+            assert!(
+                matches!(a.verdict(), AdtsVerdict::Valid),
+                "config {channels}"
+            );
+        }
+    }
+
+    // [13818-7 §8.1.1.2] adts_buffer_fullness: "A value of hexadecimal 7FF signals that the
+    // bitstream is a variable rate bitstream." Any fullness is legal.
+    #[test]
+    fn spec_buffer_fullness_is_not_validated() {
+        for fullness in [0, 0x123, 0x7FF] {
+            let a = Adts {
+                fullness,
+                ..LC_44K_STEREO
+            };
+            assert!(
+                matches!(a.verdict(), AdtsVerdict::Valid),
+                "fullness {fullness:#x}"
+            );
+        }
+    }
+
+    // [13818-7 §8.1.1.1] adts_fixed_header(): "The information in this header does not change
+    // from frame to frame." The resync key covers it and ignores the variable header.
+    #[test]
+    fn spec_fixed_key_is_the_fixed_header() {
+        let key = |a: Adts| adts_fixed_key(&a.bytes());
+        let base = key(LC_44K_STEREO);
+        assert_eq!(
+            base,
+            key(Adts {
+                len: 300,
+                fullness: 0,
+                blocks: 3,
+                ..LC_44K_STEREO
+            })
+        );
+        assert_ne!(
+            base,
+            key(Adts {
+                id: 0,
+                ..LC_44K_STEREO
+            })
+        );
+        assert_ne!(
+            base,
+            key(Adts {
+                profile: 0,
+                ..LC_44K_STEREO
+            })
+        );
+        assert_ne!(
+            base,
+            key(Adts {
+                sfi: 3,
+                ..LC_44K_STEREO
+            })
+        );
+        assert_ne!(
+            base,
+            key(Adts {
+                channels: 6,
+                ..LC_44K_STEREO
+            })
+        );
+        assert_ne!(
+            base,
+            key(Adts {
+                channels: 3,
+                ..LC_44K_STEREO
+            })
+        );
     }
 
     // L056: random payloads (false syncs and all) are never scanned while framing is locked.

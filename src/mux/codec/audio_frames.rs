@@ -13,12 +13,14 @@ pub(super) struct Header {
 
 /// How a codec's syncframes are recognised without parser side effects.
 pub(super) struct Sync {
-    /// Mask over the byte after 0xFF: 0xF0 for ADTS's 12-bit sync, 0xE0 for MPEG's 11-bit.
+    /// Mask over the byte after 0xFF. Both syncwords are "The bit string '1111 1111 1111'."
+    /// ([13818-7 §8.1.1.2], [11172-3 §2.4.2.3]): 0xF0 for ADTS; 0xE0 for MPEG audio, whose
+    /// twelfth bit MPEG 2.5 (not ISO) reuses.
     pub mask: u8,
     /// Pure size of a valid frame at the slice head (None if none), to find framing mid-stream.
     pub frame_len: fn(&[u8]) -> Option<usize>,
-    /// Mask over the first four header bytes selecting the fields fixed for a stream.
-    pub fixed: [u8; 4],
+    /// Key of the header fields that stay the same for a stream (first four bytes given).
+    pub fixed: fn(&[u8]) -> u32,
 }
 
 // A resync run after a verified drop: bytes skipped since, and whether they cost clock slots
@@ -88,8 +90,8 @@ impl AudioFrames {
         let facts = PesFacts::of(pes);
         if pes.discontinuity {
             self.buf.clear();
+            self.settle_run();
             self.anchor = None;
-            self.resync = None;
             self.header_due = false;
         }
         if self.tally.is_poisoned() {
@@ -238,7 +240,7 @@ impl AudioFrames {
     fn matches_last(&self, data: &[u8]) -> bool {
         self.last_frame.is_some()
             && data.len() >= 4
-            && (0..4).all(|i| (data[i] ^ self.last_head[i]) & self.sync.fixed[i] == 0)
+            && (self.sync.fixed)(data) == (self.sync.fixed)(&self.last_head)
     }
 
     // A byte no frame starts at. The first sync-looking one in a PES, or any where a header was
@@ -249,6 +251,8 @@ impl AudioFrames {
         if (sync || due) && !self.drop_counted {
             self.drop_counted = true;
             let before = self.anchor;
+            // Known limit: a PES that starts mid-frame on a sync-shaped byte restarts the run
+            // there, so its first whole frame is stamped one slot late (rare; bounded to 1 slot).
             let open = self.resync.is_none() || valid || self.pes_start == Some(consumed);
             if open {
                 self.anchor_at(consumed);
@@ -268,23 +272,28 @@ impl AudioFrames {
         }
     }
 
-    // A frame was found: the lost AUs (skipped bytes over the last frame's size, at least one)
-    // keep their slots on the clock; their reported duration stays unmeasured.
+    // A frame was found: the lost AUs keep their slots on the clock.
     fn end_resync(&mut self) {
         self.drop_counted = false;
-        if let (Some(r), Some((bytes, duration))) = (self.resync.take(), self.last_frame)
-            && r.advance
-        {
-            let lost = ((r.skipped + bytes / 2) / bytes).max(1) as u64;
-            // The first lost AU was the verified drop; the rest went with it (collateral).
-            for _ in 1..lost {
-                self.tally
-                    .record_collateral_drop(self.next_pts, 0, 0, "resync-lost");
-            }
-            self.next_pts = self
-                .next_pts
-                .saturating_add(lost.saturating_mul(duration) as i64);
+        let lost_ns = self.settle_run();
+        self.next_pts = self.next_pts.saturating_add(lost_ns);
+    }
+
+    // Close any open run: its lost AUs are skipped bytes over the last frame's size (at least
+    // one; the first was the verified drop, the rest collateral). Returns their clock length.
+    fn settle_run(&mut self) -> i64 {
+        let (Some(r), Some((bytes, duration))) = (self.resync.take(), self.last_frame) else {
+            return 0;
+        };
+        if !r.advance {
+            return 0;
         }
+        let lost = ((r.skipped + bytes / 2) / bytes).max(1) as u64;
+        for _ in 1..lost {
+            self.tally
+                .record_collateral_drop(self.next_pts, 0, 0, "resync-lost");
+        }
+        lost.saturating_mul(duration) as i64
     }
 
     pub fn flush(&mut self) -> Vec<Frame> {
@@ -315,6 +324,7 @@ impl AudioFrames {
         } else {
             Vec::new()
         };
+        self.settle_run();
         self.buf.clear();
         self.tally.log_summary();
         frames
@@ -333,7 +343,7 @@ mod tests {
             Sync {
                 mask: 0xf0,
                 frame_len: |_| None,
-                fixed: [0; 4],
+                fixed: |_| 0,
             },
         );
         while !af.tally.is_poisoned() {
