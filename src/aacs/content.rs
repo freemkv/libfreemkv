@@ -1623,16 +1623,28 @@ mod spec_guards {
         assert!(changed, "every block of the final 6128 bytes is decrypted");
     }
 
-    /// per spec; do not change without a spec citation — KS-3 [BD] §3.10.1:
-    /// "A new CBC cipher chain is started for each Aligned Unit".
+    /// per spec; do not change without a spec citation — KS-3 [BD] §3.10.1: "A new CBC
+    /// cipher chain is started for each Aligned Unit": the mapped decrypt of a multi-unit
+    /// buffer, in either order, never chains one unit's ciphertext into the next.
     #[test]
     fn cbc_chain_restarts_every_unit() {
+        use crate::decrypt::{AacsKeyMap, DecryptKeys, Phase, decrypt_sectors_mapped};
         assert!(
             KS_3_CBC_PER_UNIT
                 .text
                 .contains("new CBC cipher chain is started for each")
         );
-        let plain: Vec<Vec<u8>> = (0..2).map(|i| unit(40 + i)).collect();
+        // Encrypted TS units (sync at +4, CPI 11₂ per packet) so the mapped path decrypts.
+        let plain: Vec<Vec<u8>> = (0..2)
+            .map(|i| {
+                let mut u = unit(40 + i);
+                for p in u.chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES) {
+                    p[0] |= 0xC0;
+                    p[4] = TS_SYNC;
+                }
+                u
+            })
+            .collect();
         let enc: Vec<Vec<u8>> = plain
             .iter()
             .map(|p| {
@@ -1641,14 +1653,18 @@ mod spec_guards {
                 u
             })
             .collect();
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, KCU)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map =
+            AacsKeyMap::from_ranges_phased(vec![(0, 2 * ALIGNED_UNIT_SECTORS, 0, Phase::All)]);
         for order in [[0, 1], [1, 0]] {
             let mut buf: Vec<u8> = order.iter().flat_map(|&i| enc[i].clone()).collect();
-            for u in buf.chunks_mut(ALIGNED_UNIT_LEN) {
-                decrypt_unit(u, &KCU);
-            }
+            decrypt_sectors_mapped(&mut buf, &keys, 0, &map).expect("both units keyed");
             let want: Vec<u8> = order.iter().flat_map(|&i| plain[i].clone()).collect();
-            assert_eq!(
-                buf, want,
+            assert!(
+                buf == want,
                 "order {order:?}: each unit decrypts on its own chain"
             );
         }
