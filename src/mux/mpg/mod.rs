@@ -377,8 +377,10 @@ impl<W: Write + Send> MpgSink<W> {
         };
         let st = &mut self.lpcm[out];
         let frame = channels * 3;
-        if st.carry.is_empty() {
-            st.carry_pts = rel;
+        if !data.is_empty() {
+            // Re-anchor on every frame: the carried samples end where this frame starts.
+            let carried = (st.carry.len() / frame) as i64;
+            st.carry_pts = rel - (carried * 90_000 + i64::from(rate / 2)) / i64::from(rate);
         }
         st.carry.extend_from_slice(data);
         st.bits = st
