@@ -117,6 +117,11 @@ pub const E_KEY_SERVICE_RATE_LIMITED: u16 = 7030;
 /// The key file is required, so the live scan stops. NOT [`E_AACS_NO_KEYS`]:
 /// no key lookup was reached, and the fix is the disc, not a key database.
 pub const E_AACS_KEY_FILE_UNREADABLE: u16 = 7031;
+/// A key source offered host cert(s), but every one failed a local check
+/// before any drive round-trip (keydb data problem). NOT
+/// [`E_AACS_NO_HOST_CERT`] (no cert offered at all) or
+/// [`E_AACS_HOST_CERT_REJECTED`] (the drive itself rejected a cert).
+pub const E_AACS_NO_USABLE_HOST_CERT: u16 = 7032;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -588,6 +593,13 @@ pub enum Error {
     AacsNoHostCert {
         path: String,
     },
+    /// A key source offered host cert(s) for the drive's handshake, but every
+    /// one failed a LOCAL check (stored private key vs cert public key)
+    /// before any drive round-trip — a keydb data problem, not a drive
+    /// rejection. Distinct from [`Error::AacsNoHostCert`] (no cert offered at
+    /// all) and [`Error::AacsHostCertRejected`] (the drive rejected a cert
+    /// it actually saw).
+    AacsNoUsableHostCert,
     /// A bus-encrypted disc (AACS 2.0 / UHD, Content Certificate bus-encryption bit set) was
     /// scanned on a live drive, the Volume ID was obtained, but no `read_data_key` (bus key)
     /// was produced — so the on-disc bytes are still bus-encrypted and would decrypt to
@@ -929,6 +941,7 @@ impl Error {
             Error::KeyServiceUnauthorized => E_KEY_SERVICE_UNAUTHORIZED,
             Error::KeyServiceRateLimited => E_KEY_SERVICE_RATE_LIMITED,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
+            Error::AacsNoUsableHostCert => E_AACS_NO_USABLE_HOST_CERT,
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
             Error::AacsKeyFileUnreadable => E_AACS_KEY_FILE_UNREADABLE,
             Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
@@ -1593,6 +1606,7 @@ mod tests {
             Error::StreamClosed.code(),
             Error::StreamHeaderWritten.code(),
             Error::AacsKeyFileUnreadable.code(),
+            Error::AacsNoUsableHostCert.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1677,6 +1691,7 @@ mod tests {
             (Error::KeyServiceUnauthorized, E_KEY_SERVICE_UNAUTHORIZED),
             (Error::KeyServiceRateLimited, E_KEY_SERVICE_RATE_LIMITED),
             (Error::AacsKeyFileUnreadable, E_AACS_KEY_FILE_UNREADABLE),
+            (Error::AacsNoUsableHostCert, E_AACS_NO_USABLE_HOST_CERT),
         ];
         for (e, want_code) in cases {
             let s = e.to_string();
@@ -2092,6 +2107,7 @@ mod tests {
             (Error::DecryptFailed, E_DECRYPT_FAILED),
             (Error::CssAuthFailed, E_CSS_AUTH_FAILED),
             (Error::AacsHostCertRejected, E_AACS_HOST_CERT_REJECTED),
+            (Error::AacsNoUsableHostCert, E_AACS_NO_USABLE_HOST_CERT),
             (Error::AacsRawReadUnsupported, E_AACS_RAW_READ_UNSUPPORTED),
             (Error::AacsVidUnavailable, E_AACS_VID_UNAVAILABLE),
             (Error::AacsMkUnavailable, E_AACS_MK_UNAVAILABLE),

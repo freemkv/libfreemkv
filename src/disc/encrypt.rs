@@ -119,6 +119,7 @@ pub(super) fn aacs_verdict(bus_encryption: bool, bus: &BusOutcome) -> Option<Err
 pub(super) fn handshake_class_error(e: &Error) -> Option<Error> {
     match e {
         Error::AacsNoHostCert { path } => Some(Error::AacsNoHostCert { path: path.clone() }),
+        Error::AacsNoUsableHostCert => Some(Error::AacsNoUsableHostCert),
         Error::AacsHostCertRejected => Some(Error::AacsHostCertRejected),
         Error::AacsVidUnavailable => Some(Error::AacsVidUnavailable),
         Error::AacsBusKeyUnavailable => Some(Error::AacsBusKeyUnavailable),
@@ -419,11 +420,12 @@ impl AacsCertUnlocker<'_> {
 // Maps a recorded cert-route failure to the handshake-class Error the scan records.
 fn unlock_error_to_error(e: CertUnlockFailure) -> Error {
     match e {
-        CertUnlockFailure::NoHostCert | CertUnlockFailure::NoUsableHostCert => {
-            Error::AacsNoHostCert {
-                path: "<no host cert>".into(),
-            }
-        }
+        CertUnlockFailure::NoHostCert => Error::AacsNoHostCert {
+            path: "<no host cert>".into(),
+        },
+        // Certs were offered but none survived the LOCAL keydb check (dead
+        // pairing) — never reached the drive, so this is not a rejection.
+        CertUnlockFailure::NoUsableHostCert => Error::AacsNoUsableHostCert,
         CertUnlockFailure::VidUnavailable => Error::AacsVidUnavailable,
         CertUnlockFailure::Rejected => Error::AacsHostCertRejected,
     }
@@ -1557,14 +1559,16 @@ mod tests {
             CertFail::Other(f) => f,
             CertFail::Transport => panic!("only Transport is a dead bus"),
         };
-        match unlock_error_to_error(recorded(U::NoUsableHostCert)) {
+        // All-broken cert list (never reached the drive) is its own error —
+        // distinct from truly having no cert to offer at all.
+        assert!(matches!(
+            unlock_error_to_error(recorded(U::NoUsableHostCert)),
+            Error::AacsNoUsableHostCert
+        ));
+        match unlock_error_to_error(CertUnlockFailure::NoHostCert) {
             Error::AacsNoHostCert { path } => assert_eq!(path, "<no host cert>"),
             other => panic!("expected AacsNoHostCert, got {other:?}"),
         }
-        assert!(matches!(
-            unlock_error_to_error(CertUnlockFailure::NoHostCert),
-            Error::AacsNoHostCert { .. }
-        ));
         assert!(matches!(
             unlock_error_to_error(recorded(U::VidUnavailable)),
             Error::AacsVidUnavailable
