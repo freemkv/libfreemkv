@@ -2209,3 +2209,45 @@ fn is_aacs_tells_none_from_a_resolved_set() {
     .unwrap();
     assert!(set.is_aacs());
 }
+
+/// Review minor 1, the other wake-up: a retry wait that ends on a Stop without reporting it
+/// (the halt is then seen at the next attempt's check) still leaves the request's step.
+#[test]
+fn a_stop_seen_before_the_retry_keeps_the_asked_step() {
+    struct WakeOnStop(Halt);
+    impl Clock for WakeOnStop {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn sleep(&self, _d: Duration, _halt: Option<&Halt>) -> Result<()> {
+            self.0.cancel();
+            Ok(())
+        }
+    }
+    let fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
+    let calls = Calls::default();
+    let halt = Halt::new();
+    let mut dead = Spec::online(&[K1], &calls);
+    dead.down_until = Some(Duration::MAX);
+    let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
+    let opts = ResolveKeysOptions {
+        halt: Some(&halt),
+        trace: Some(&out),
+        ..Default::default()
+    };
+    let clock = WakeOnStop(halt.clone());
+    let r = resolve_with(
+        &fx,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0]),
+        &[dead],
+        opts,
+        &clock,
+    );
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    assert_eq!(
+        out.lock().unwrap().keys.len(),
+        1,
+        "the request that went out"
+    );
+}
