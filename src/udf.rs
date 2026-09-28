@@ -389,6 +389,53 @@ impl UdfFs {
         Ok(merged)
     }
 
+    /// Every sector a scan of this filesystem reads that is NOT Clip AV stream data:
+    /// the volume structures before the partition, the Metadata File, every directory
+    /// and File Entry (stream files' included), and every file's data outside
+    /// `/BDMV/STREAM` (any size).
+    ///
+    /// AACS BD Pre-recorded Book 0.953 §3.7: "the BEF shall be set to 0b for the sectors
+    /// that do not correspond to Clip AV stream files under \BDMV\STREAM directory." None
+    /// of these is bus-encrypted. A file whose File Entry cannot be read is left out.
+    pub(crate) fn non_stream_ranges(
+        &self,
+        reader: &mut dyn SectorSource,
+    ) -> Result<Vec<(u32, u32)>> {
+        let mut ranges = vec![(0, self.partition_start)];
+        ranges.push((self.meta.start(), self.metadata_sectors.max(1)));
+        ranges.extend(self.meta.0.iter().copied().filter(|&(_, n)| n > 0));
+        let stream = self.find_dir("/BDMV/STREAM").map(|d| d as *const DirEntry);
+        // (directory, inside /BDMV/STREAM): there only the File Entries are staged.
+        let mut stack = vec![(&self.root, false)];
+        let mut entries: Vec<(&DirEntry, bool)> = vec![(&self.root, false)];
+        while let Some((dir, in_stream)) = stack.pop() {
+            for e in &dir.entries {
+                let in_stream = in_stream || stream == Some(e as *const DirEntry);
+                if e.is_dir {
+                    stack.push((e, in_stream));
+                }
+                entries.push((e, in_stream));
+            }
+        }
+        for (e, in_stream) in entries {
+            ranges.push((self.meta_to_abs(e.meta_lba)?, 1));
+            if !e.is_dir && in_stream {
+                continue;
+            }
+            match self.extents_abs_at(reader, e.meta_lba) {
+                Ok(exts) => ranges.extend(
+                    exts.iter()
+                        .filter(|x| x.recorded && x.len > 0)
+                        .map(|x| (x.lba, (x.len as u64).div_ceil(2048) as u32)),
+                ),
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(_) => {} // embedded data, or unreadable: nothing to stage
+            }
+        }
+        ranges.sort_by_key(|r| r.0);
+        Ok(merge_ranges(&ranges))
+    }
+
     fn collect_file_ranges(
         &self,
         reader: &mut dyn SectorSource,

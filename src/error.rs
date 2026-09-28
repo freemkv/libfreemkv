@@ -66,6 +66,10 @@ pub const E_IMAGE_ENDS_BEFORE_READ: u16 = 6020;
 /// file's File Entry could not be read, so its sectors cannot be located to de-bus
 /// (AACS BD Pre-recorded Book 0.953 §3.7). MKV and `dir://` still proceed.
 pub const E_BUS_STREAM_UNMAPPED: u16 = 6021;
+/// An image staged for an MKV rip (its mapfile records a scope) was offered as a
+/// whole-disc image (`iso://` copy, `dir://` extract): only the chosen titles, nav
+/// and UDF were ever read, so the rest of it is not disc data.
+pub const E_IMAGE_SCOPED: u16 = 6022;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -521,6 +525,10 @@ pub enum Error {
     BusStreamUnmapped {
         files: String,
     },
+    /// `path` is an image staged for an MKV rip, not a whole-disc image.
+    ImageScoped {
+        path: String,
+    },
 
     // AACS (7xxx)
     AacsNoKeys,
@@ -951,6 +959,7 @@ impl Error {
             Error::ImageTruncated { .. } => E_IMAGE_TRUNCATED,
             Error::ImageEndsBeforeRead { .. } => E_IMAGE_ENDS_BEFORE_READ,
             Error::BusStreamUnmapped { .. } => E_BUS_STREAM_UNMAPPED,
+            Error::ImageScoped { .. } => E_IMAGE_SCOPED,
             Error::AacsNoKeys => E_AACS_NO_KEYS,
             Error::AacsCertShort => E_AACS_CERT_SHORT,
             Error::AacsAgidAlloc => E_AACS_AGID_ALLOC,
@@ -1225,6 +1234,7 @@ impl std::fmt::Display for Error {
             // "artifact_lock"), not translatable prose.
             Error::TimedOut { op } => write!(f, "E{}: {op}", self.code()),
             Error::BusStreamUnmapped { files } => write!(f, "E{}: {files}", self.code()),
+            Error::ImageScoped { path } => write!(f, "E{}: {path}", self.code()),
             _ => write!(f, "E{}", self.code()),
         }
     }
@@ -1672,6 +1682,7 @@ mod tests {
             }
             .code(),
             Error::BusStreamUnmapped { files: "x".into() }.code(),
+            Error::ImageScoped { path: "x".into() }.code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
@@ -1751,6 +1762,12 @@ mod tests {
                     files: "/BDMV/STREAM/00002.m2ts".into(),
                 },
                 E_BUS_STREAM_UNMAPPED,
+            ),
+            (
+                Error::ImageScoped {
+                    path: "/rips/DISC.iso".into(),
+                },
+                E_IMAGE_SCOPED,
             ),
         ];
         for (e, want_code) in cases {
@@ -2063,6 +2080,7 @@ mod tests {
         assert!((6000..7000).contains(&E_IMAGE_TRUNCATED));
         assert!((6000..7000).contains(&E_IMAGE_ENDS_BEFORE_READ));
         assert!((6000..7000).contains(&E_BUS_STREAM_UNMAPPED));
+        assert!((6000..7000).contains(&E_IMAGE_SCOPED));
         // AACS (7xxx)
         assert!((7000..8000).contains(&E_AACS_NO_KEYS));
         assert!((7000..8000).contains(&E_NO_DISC_KEY));

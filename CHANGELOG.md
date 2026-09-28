@@ -36,6 +36,7 @@
 - `DiscPresence` (`Present` / `Absent` / `Settling`) and `disc_presence(path)`: the tri-state answer `drive_has_disc` collapses (`Settling` counts as a disc).
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
 - `Error::AacsKeyFileUnreadable` (E7031).
+- `Disc::mkv_staging_ranges(reader, titles)`: the sectors an image staged for an MKV rip needs (UDF structures, every File Entry and directory, every file outside `/BDMV/STREAM`, and those titles' extents). None of it is bus-encrypted (AACS BD Pre-recorded 0.953 §3.7), so it stages a disc with an unlocatable stream file. `Error::ImageScoped` (E6022): such an image offered as a whole-disc source.
 - `Error::BusStreamUnmapped` (E6021), `sector::bus_removal::UnmappedStreamFile`, `BusMap::unmapped`, `SectorSource::unmapped_stream_files` (forwarded by every in-crate wrapper, including `DecryptingSectorSource`, `whole_disc::UnitAligned` and `PrefetchedSectorSource`) and `sector::bus_removal::ensure_image_debussable(reader)`, which `iso://`/sweep/patch callers run before writing an image.
 - `DecryptingSectorSource::clear_unit_base()`: drop the unit base so AACS content reads fail loud until the next `set_unit_base`.
 - `Error::WholeDiscKeyMissing` (E7032): a decrypted whole-disc image would keep encrypted pieces because a stream file no title plays has no held key. The fix is an MKV rip or a raw copy.

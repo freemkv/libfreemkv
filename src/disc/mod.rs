@@ -2076,6 +2076,34 @@ impl Disc {
         Ok(crate::sector::bus_removal::BusMap::new(scan.files, &[]).covered_ranges())
     }
 
+    /// The sectors a staged image for an MKV rip of `titles` (indices into
+    /// [`Self::titles`]) needs: everything outside `/BDMV/STREAM` (UDF structures,
+    /// nav, AACS files) plus those titles' extents, sorted and merged. Reads the UDF
+    /// tree from `reader`.
+    ///
+    /// None of it is bus-encrypted once read through a scanned drive: nav and UDF carry
+    /// BEF=0 (AACS BD Pre-recorded 0.953 §3.7), and every title extent is in the bus
+    /// map. So the image holds no bus-encrypted byte even when a stream file is unmapped.
+    /// Per spec; do not change without a spec citation proving otherwise.
+    pub fn mkv_staging_ranges(
+        &self,
+        reader: &mut dyn SectorSource,
+        titles: &[usize],
+    ) -> Result<Vec<(u32, u32)>> {
+        let udf_fs = udf::read_filesystem(reader)?;
+        let mut ranges = udf_fs.non_stream_ranges(reader)?;
+        for &i in titles {
+            let t = self.titles.get(i).ok_or(Error::DiscTitleRange {
+                index: i,
+                count: self.titles.len(),
+            })?;
+            ranges.extend(t.extents.iter().map(|e| (e.start_lba, e.sector_count)));
+        }
+        ranges.retain(|&(_, n)| n > 0);
+        ranges.sort_by_key(|r| r.0);
+        Ok(crate::udf::merge_ranges(&ranges))
+    }
+
     // The stream files a live scan's bus map needs. `debus` = the cert route installs a
     // host-key de-bus stage; otherwise the map de-busses nothing, so skip the tree walk.
     fn bus_stream_files(
@@ -9804,6 +9832,75 @@ mod tests {
         let mut inner = MemReports(mem, vec![m2ts1()]);
         let ra = FileReadAhead::new(&mut inner, &udf, 40).expect("icb 40 is 00001.m2ts");
         assert_eq!(unmapped_paths(&ra), ["/BDMV/STREAM/00001.m2ts"]);
+    }
+
+    fn covers(ranges: &[(u32, u32)], lba: u32) -> bool {
+        ranges.iter().any(|&(s, n)| lba >= s && lba - s < n)
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOT_STREAM`]: the MKV staging scope is nav + UDF + the chosen
+    /// titles' extents; no other stream file's data is read.
+    #[test]
+    fn mkv_staging_ranges_are_non_stream_sectors_plus_the_chosen_titles() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, _) = bus_fixture(0x80);
+        let mut disc = make_test_disc(10_000, "UHD");
+        let mut t = DiscTitle::empty();
+        t.extents = vec![ext(PART_START + 2_000, 6)];
+        disc.titles = vec![DiscTitle::empty(), t];
+        let r = disc.mkv_staging_ranges(&mut mem, &[1]).expect("scope");
+        for lba in [0, 256, PART_START - 1, PART_START] {
+            assert!(
+                covers(&r, lba),
+                "volume structures {lba}: {SPEC_BD_3_7_NOT_STREAM}"
+            );
+        }
+        for icb in [10, 20, 22, 30, 32, 40, 41, 42, 43, 44] {
+            assert!(covers(&r, PART_START + icb), "File Entry {icb}");
+        }
+        for lba in [500, 600] {
+            assert!(covers(&r, PART_START + lba), "nav/AACS data {lba}");
+        }
+        for lba in 2_000..2_006 {
+            assert!(
+                covers(&r, PART_START + lba),
+                "chosen title {lba}: {SPEC_BD_3_7_BEF}"
+            );
+        }
+        for lba in (1_000..1_003).chain(3_000..3_003) {
+            assert!(!covers(&r, PART_START + lba), "unchosen stream data {lba}");
+        }
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: an unlocatable stream file never enters the staging scope,
+    /// so a staged image holds none of its (bus-encrypted) data.
+    #[test]
+    fn mkv_staging_ranges_leave_out_an_unmapped_stream_file() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, _) = bus_fixture(0x80);
+        break_m2ts1_ads(&mut mem);
+        let mut disc = make_test_disc(10_000, "UHD");
+        let mut t = DiscTitle::empty();
+        t.extents = vec![ext(PART_START + 2_000, 6)];
+        disc.titles = vec![t];
+        let r = disc.mkv_staging_ranges(&mut mem, &[0]).expect("scope");
+        assert!(covers(&r, PART_START + 40), "its File Entry is metadata");
+        for lba in 1_000..1_003 {
+            assert!(!covers(&r, PART_START + lba), "{SPEC_BD_3_7_NOTE}");
+        }
+    }
+
+    #[test]
+    fn mkv_staging_ranges_reject_an_unknown_title() {
+        let (mut mem, _) = bus_fixture(0x80);
+        let disc = make_test_disc(10_000, "UHD");
+        let err = disc.mkv_staging_ranges(&mut mem, &[3]).unwrap_err();
+        assert!(
+            matches!(err, Error::DiscTitleRange { index: 3, count: 0 }),
+            "{err:?}"
+        );
     }
 
     // A Stop during the stream-file walk surfaces as Halted, never as a recorded bad file.
