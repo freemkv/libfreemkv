@@ -2627,3 +2627,78 @@ fn whole_disc_reader_refuses_titles_without_a_stream_folder() {
         other => panic!("expected E6003, got {:?}", other.err()),
     }
 }
+
+/// KU §2.1 (6) "Refuse first": a whole-disc sweep reads every unit, so a Lazy piece
+/// holding a readable encrypted probe no held key opens is refused E7032 by the reader,
+/// before any output (engine `a_multi_cps_sweep_refuses_a_first_unit_no_key_opens_*`).
+#[test]
+fn whole_disc_reader_refuses_a_lazy_piece_no_held_key_opens() {
+    let mut fx = fixture(&[stream(1, 10, Some(K1)), stream(2, 10, None)], 2, &[&[0]]);
+    let at = fx.unit(1, 0) as usize * 2048;
+    // An intact unit: TS sync at byte 4 of each packet, so its seed is not damage (KS-4).
+    fx.img.plain[at..at + ALIGNED_UNIT_LEN]
+        .chunks_mut(192)
+        .for_each(|p| p[4] = 0x47);
+    fx.reencrypt(1, 0, &WRONG);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let (b, n) = fx.file(1);
+    assert_eq!(
+        set.lazy(),
+        &[(b, b + n)],
+        "one unopened unit: Lazy (step 9.2)"
+    );
+    assert_eq!(
+        code(
+            set.whole_disc_reader(&fx.disc, fx.source(), None)
+                .map(|_| ())
+        ),
+        E7032
+    );
+    // A title rip that never reads B is unaffected.
+    assert!(set.title_reader(&fx.disc, 0, fx.source()).is_ok());
+}
+
+/// E7013 option A with the E7032 refusal above: a probe whose seed is damaged (no TS sync,
+/// KS-4 [BD] §3.10.1 "The first 16 bytes of each Aligned Unit is used as the seed") opens
+/// under no key and is blanked on read, never a stop, so it refuses no sweep up front.
+#[test]
+fn whole_disc_reader_does_not_refuse_a_damaged_probe() {
+    let mut fx = fixture(&[stream(1, 10, Some(K1)), stream(2, 10, None)], 2, &[&[0]]);
+    let at = fx.unit(1, 0) as usize * 2048;
+    // A damaged seed: no TS sync at byte 4.
+    fx.img.plain[at..at + ALIGNED_UNIT_LEN]
+        .chunks_mut(192)
+        .for_each(|p| p[4] = 0);
+    fx.reencrypt(1, 0, &WRONG);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let r = set
+        .whole_disc_reader(&fx.disc, fx.source(), None)
+        .map(|_| ());
+    assert!(r.is_ok(), "{:?} lazy={:?}", r.err(), set.lazy());
+}
+
+/// With cb76dcc's damage rule (KU §2.4): a unit no held key opens while a held key opens a
+/// partner in its batch is blanked, not a stop. So a Lazy piece with a probe a held key
+/// opens is left to the on-arrival proof, never refused up front.
+#[test]
+fn whole_disc_reader_leaves_a_piece_with_an_opened_probe_to_arrival() {
+    let mut fx = fixture(&[stream(1, 10, Some(K1)), stream(2, 10, None)], 2, &[&[0]]);
+    for (u, key) in [(0, WRONG), (1, K1)] {
+        let at = fx.unit(1, u) as usize * 2048;
+        fx.img.plain[at..at + ALIGNED_UNIT_LEN]
+            .chunks_mut(192)
+            .for_each(|p| p[4] = 0x47);
+        fx.reencrypt(1, u, &key);
+    }
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let (b, n) = fx.file(1);
+    assert_eq!(
+        set.lazy(),
+        &[(b, b + n)],
+        "one opened, one unopened probe: Lazy"
+    );
+    assert!(set.whole_disc_reader(&fx.disc, fx.source(), None).is_ok());
+}
