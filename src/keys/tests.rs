@@ -1159,6 +1159,104 @@ fn on_arrival_proof() {
     );
 }
 
+// File B (K2) Lazy as in `lazy_b`, its image first damaged by `damage`.
+fn lazy_b_damaged(pool: &[[u8; 16]], damage: impl Fn(&mut Fx)) -> (Fx, ResolvedKeySet, Faulty) {
+    let mut fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        2,
+        &[&[0, 1]],
+    );
+    damage(&mut fx);
+    let (b, n) = fx.file(1);
+    let src = fx.source();
+    src.kill(b, b + n);
+    let calls = Calls::default();
+    let set = resolve_with(
+        &fx,
+        &mut src.clone(),
+        KeyScope::WholeDisc,
+        &[Spec::keydb(pool, &calls)],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    )
+    .unwrap();
+    src.heal();
+    (fx, set, src)
+}
+
+// Unit `u` of file `i`: its first sector read back as garbage (seed damaged), or zero-filled.
+fn damage_seed(fx: &mut Fx, i: usize, u: u32) {
+    let at = fx.unit(i, u) as usize * 2048;
+    crate::test_util::damage_unit_seed(&mut fx.img.image[at..at + ALIGNED_UNIT_LEN]);
+}
+fn zero_unit(fx: &mut Fx, i: usize, u: u32) {
+    let at = fx.unit(i, u) as usize * 2048;
+    fx.img.image[at..at + ALIGNED_UNIT_LEN].fill(0);
+}
+
+/// ⚑ per spec; do not change without a spec citation. KU §2.4 proves a key on READABLE units:
+/// a zero unit (KS-5: CPI "00₂ if the data is not encrypted") or a damaged seed (KS-4: "The
+/// first 16 bytes of each Aligned Unit is used as the seed") is a hole, never proof or disproof.
+#[test]
+fn on_arrival_read_damage_neither_proves_nor_refutes() {
+    assert!(
+        crate::spec::keys::KS_4_SEED
+            .text
+            .contains("used as the seed")
+    );
+    assert!(
+        crate::spec::keys::KS_5_CPI
+            .text
+            .contains("00₂ if the data is not encrypted")
+    );
+    let edge = |fx: &mut Fx| {
+        damage_seed(fx, 1, 0);
+        zero_unit(fx, 1, 1);
+    };
+    let holes = vec![0u8; 2 * ALIGNED_UNIT_LEN];
+    // (a) damage alone proves nothing and reads as holes; the first intact unit proves K2.
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], edge);
+    let b = fx.file(1).0;
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(read(&mut r, &fx, 1, 0, 2).unwrap(), holes);
+    assert_eq!(set.proof_cache().get(b), None, "a hole is not proof");
+    assert_eq!(
+        read(&mut r, &fx, 1, 2, 2).unwrap(),
+        fx.plain(fx.unit(1, 2), 2)
+    );
+    assert_eq!(set.proof_cache().get(b), Some(Proof::Proven(1)));
+
+    // (b) no held key opens B: the damage is still holes, the first intact unit stops E7022.
+    let (fx, set, src) = lazy_b_damaged(&[K1], edge);
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        read(&mut r, &fx, 1, 0, 2).unwrap(),
+        holes,
+        "a hole is not disproof"
+    );
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 2, 1)),
+        E7022,
+        "a wrong key still stops"
+    );
+
+    // (c) damaged neighbours are not partners: the one intact unit is a provisional proof.
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| {
+        (0..10)
+            .filter(|&u| u != 5)
+            .for_each(|u| damage_seed(fx, 1, u));
+    });
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        read(&mut r, &fx, 1, 5, 1).unwrap(),
+        fx.plain(fx.unit(1, 5), 1)
+    );
+    assert_eq!(
+        set.proof_cache().get(fx.file(1).0),
+        Some(Proof::Provisional(1))
+    );
+}
+
 /// SG25 ⚑ — per spec; do not change without a spec citation — KS-1 [BD] §3.10.1:
 /// "encryption is applied to every Aligned Unit in the file"; KS-2. The final unit of a Lazy
 /// piece is decrypted (proven backward), never a read error.

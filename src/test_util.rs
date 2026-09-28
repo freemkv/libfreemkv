@@ -8,6 +8,7 @@
 //!   per aligned unit on each file's own grid (KS-1, KS-2, KS-3).
 //! - [`CountingSource`]: a [`SectorSource`] wrapper that logs every read.
 //! - [`decrypt_unit`]: the aligned-unit decrypt, for tests that check ciphertext.
+//! - [`damage_unit_seed`]: an aligned unit whose first sector read back as garbage.
 //! - [`FakeTransport`]: a scripted drive with a state model for Stop tests (stop §5.0).
 
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
@@ -378,6 +379,17 @@ impl<S: SectorSource> SectorSource for CountingSource<S> {
 /// test-side door to the unit decrypt, so no consumer test needs the internal one.
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     crate::aacs::content::decrypt_unit(unit, unit_key)
+}
+
+/// Overwrite the first sector of an aligned unit with garbage that keeps the encrypted flag
+/// (CPI 11₂, KS-5) but not the seed's TS sync at byte 4 (KS-2, KS-4): read damage that no
+/// key opens, as a drive returning the wrong bytes leaves it.
+pub fn damage_unit_seed(unit: &mut [u8]) {
+    for (i, b) in unit[..SECTOR_BYTES].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37) ^ 0xA5;
+    }
+    unit[0] |= 0xC0;
+    unit[4] = 0x00;
 }
 
 #[path = "test_util_fake.rs"]

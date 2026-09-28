@@ -1002,4 +1002,106 @@ mod tests {
         want.extend(clear_aacs_unit());
         assert_eq!(buf, crate::aacs::content::cpi_cleared(want));
     }
+
+    // A file at FILE_LBA of `units` units under one key; `damaged` units have a garbage seed.
+    fn damaged_file_source(units: u32, damaged: &[u32]) -> DecryptingSectorSource<MisalignedFile> {
+        let key = [0x5Au8; 16];
+        let mut data = Vec::new();
+        for u in 0..units {
+            let mut unit = encrypt_aacs_unit(&key);
+            if damaged.contains(&u) {
+                crate::test_util::damage_unit_seed(&mut unit);
+            }
+            data.extend(unit);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let end = FILE_LBA + units * 3;
+        let map = Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+            FILE_LBA, end, 0,
+        )]));
+        let mut dec = DecryptingSectorSource::new(MisalignedFile(data), keys).with_key_map(map);
+        dec.set_unit_base(FILE_LBA);
+        dec
+    }
+
+    // Read `units` units from unit `from` of the damaged file.
+    fn read_units(
+        dec: &mut DecryptingSectorSource<MisalignedFile>,
+        from: u32,
+        units: u32,
+    ) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; units as usize * crate::aacs::content::ALIGNED_UNIT_LEN];
+        dec.read_sectors(FILE_LBA + from * 3, (units * 3) as u16, &mut buf, false)?;
+        Ok(buf)
+    }
+
+    /// A lone unit whose seed is damaged, among units that decrypt on the grid, is a hole
+    /// (zeros), never E7013. KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is
+    /// used as the seed for calculating the Block Key." — no key opens a damaged seed.
+    #[test]
+    fn a_damaged_unit_seed_on_the_grid_is_a_hole() {
+        assert!(
+            crate::spec::keys::KS_4_SEED
+                .text
+                .contains("used as the seed")
+        );
+        let mut dec = damaged_file_source(3, &[1]);
+        let buf = read_units(&mut dec, 0, 3).expect("read damage is not a key failure");
+        let clear = crate::aacs::content::cpi_cleared(clear_aacs_unit());
+        let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+        assert_eq!(&buf[..ul], &clear[..]);
+        assert!(
+            buf[ul..2 * ul].iter().all(|&b| b == 0),
+            "the damaged unit is a hole"
+        );
+        assert_eq!(&buf[2 * ul..], &clear[..]);
+    }
+
+    /// Once a read has shown the base is the file's grid, a later read of damaged units only
+    /// (no witness of its own) on that base is holes, not E7013. KS-2 [BD] §3.10.1: "Each MPEG
+    /// source packet consists of the TP_extra_header (4 bytes) and an MPEG Transport packet".
+    #[test]
+    fn damaged_units_on_a_proven_grid_are_holes() {
+        assert!(
+            crate::spec::keys::KS_2_ALIGNED_UNIT
+                .text
+                .contains("TP_extra_header (4 bytes)")
+        );
+        let mut dec = damaged_file_source(4, &[2, 3]);
+        read_units(&mut dec, 0, 2).expect("an intact read proves the grid");
+        let buf = read_units(&mut dec, 2, 2).expect("damage on a proven grid is holes");
+        assert!(buf.iter().all(|&b| b == 0), "both damaged units are holes");
+    }
+
+    /// A sweep's zero run need not be unit-aligned. A unit whose tail sectors are zero keeps
+    /// its seed: its head sector decrypts and the zeros stay zeros. A unit whose head sector is
+    /// zero lost its seed (KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used
+    /// as the seed"), so its ciphertext rest is a hole too — never E7013, never ciphertext out.
+    #[test]
+    fn partial_zero_units_at_both_edges_of_a_run_are_holes() {
+        let mut dec = damaged_file_source(4, &[]);
+        dec.inner_mut().0[4 * 2048..7 * 2048].fill(0); // unit 1 sectors 1-2, unit 2 sector 0
+        let buf = read_units(&mut dec, 0, 4).expect("a partial zero run is read damage");
+        let clear = crate::aacs::content::cpi_cleared(clear_aacs_unit());
+        let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+        assert_eq!(&buf[..ul], &clear[..]);
+        // Packets 0-9 lie wholly in unit 1's intact head sector (10 × 192 = 1920 bytes).
+        assert_eq!(
+            &buf[ul..ul + 1920],
+            &clear[..1920],
+            "the kept head decrypts"
+        );
+        assert!(
+            buf[ul + 2112..2 * ul].iter().all(|&b| b == 0),
+            "its zero tail stays zero"
+        );
+        assert!(
+            buf[2 * ul..3 * ul].iter().all(|&b| b == 0),
+            "a lost seed is a hole"
+        );
+        assert_eq!(&buf[3 * ul..], &clear[..]);
+    }
 }

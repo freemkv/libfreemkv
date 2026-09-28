@@ -3670,4 +3670,123 @@ mod tests {
             );
         }
     }
+
+    // A staged UHD image (AACS 2.0, bus encryption on) of `units` encrypted audio units under
+    // `key`, damaged by `damage`, its title over all of them, and a set keying the title.
+    fn damaged_uhd_image(
+        key: [u8; 16],
+        units: u32,
+        damage: impl Fn(&mut [u8]),
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        DiscTitle,
+        crate::keys::ResolvedKeySet,
+    ) {
+        let (_, mut title, _) = keyed_live(key);
+        let sectors = units * 3;
+        title.extents = vec![crate::disc::Extent {
+            start_lba: 0,
+            sector_count: sectors,
+        }];
+        let mut disc = aacs_session_disc(title.clone(), [0u8; 16]);
+        disc.aacs.as_mut().unwrap().bus_encryption = true;
+        disc.capacity_sectors = sectors + 16;
+        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, sectors)]);
+        let mut image = encrypted_audio_unit(&key).repeat(units as usize);
+        damage(&mut image);
+        image.resize((sectors + 16) as usize * 2048, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.iso");
+        std::fs::write(&path, &image).unwrap();
+        (dir, path, title, set)
+    }
+
+    fn mux_damaged_iso(
+        path: &std::path::Path,
+        title: DiscTitle,
+        set: &crate::keys::ResolvedKeySet,
+        dest: &str,
+    ) -> std::io::Result<MuxOutcome> {
+        mux_with_keys(
+            MuxSource::Iso {
+                path,
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+            },
+            Some(set),
+            dest,
+            &MuxOptions {
+                batch_sectors: 64,
+                ..keyed_opts()
+            },
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        )
+    }
+
+    /// "We rip bad discs": a sweep hole (whole zero units) mid-title muxes through, as before
+    /// KU. KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted" — a zero
+    /// unit is not flagged, so no key is applied to it and none is judged by it.
+    #[test]
+    fn iso_mux_through_a_zero_filled_run_mid_title() {
+        assert!(
+            crate::spec::keys::KS_5_CPI
+                .text
+                .contains("00₂ if the data is not encrypted")
+        );
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let key = [0x5A; 16];
+        let (dir, path, title, set) =
+            damaged_uhd_image(key, 9, |im| im[3 * 6144..6 * 6144].fill(0));
+        let out_path = dir.path().join("hole.mkv");
+        let out = mux_damaged_iso(&path, title, &set, &format!("mkv://{}", out_path.display()))
+            .expect("a zero-filled run is read damage, never E7013");
+        assert!(out.completed);
+        assert!(holds_plain_es(&out_path), "units around the hole decrypt");
+    }
+
+    /// Regression (b4d322e): a unit on the edge of a sweep hole whose first sector read back as
+    /// garbage (CPI 11₂, no TS sync) is read damage — a hole — not E7013. KS-4 [BD] §3.10.1:
+    /// "The first 16 bytes of each Aligned Unit is used as the seed for calculating the Block Key."
+    #[test]
+    fn iso_mux_through_a_damaged_unit_seed_is_a_hole_not_e7013() {
+        assert!(
+            crate::spec::keys::KS_4_SEED
+                .text
+                .contains("used as the seed")
+        );
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let key = [0x5A; 16];
+        let (dir, path, title, set) = damaged_uhd_image(key, 9, |im| {
+            im[3 * 6144..5 * 6144].fill(0);
+            crate::test_util::damage_unit_seed(&mut im[5 * 6144..6 * 6144]);
+        });
+        let out_path = dir.path().join("hole.mkv");
+        let out = mux_damaged_iso(&path, title, &set, &format!("mkv://{}", out_path.display()))
+            .expect("a damaged unit seed is read damage, never E7013");
+        assert!(out.completed);
+        assert!(holds_plain_es(&out_path), "units around the hole decrypt");
+    }
+
+    /// The real sweep holes are not unit-aligned (Dunkirk: runs of 260, 611, 352 sectors): a
+    /// run that starts in one unit's tail and ends in another's head muxes through as holes.
+    /// KS-3 [BD] §3.10.1: "A new CBC cipher chain is started for each Aligned Unit".
+    #[test]
+    fn iso_mux_through_a_zero_run_cutting_units_at_both_edges() {
+        assert!(
+            crate::spec::keys::KS_3_CBC_PER_UNIT
+                .text
+                .contains("new CBC cipher chain")
+        );
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let key = [0x5A; 16];
+        let (dir, path, title, set) =
+            damaged_uhd_image(key, 9, |im| im[7 * 2048..16 * 2048].fill(0));
+        let out_path = dir.path().join("hole.mkv");
+        let out = mux_damaged_iso(&path, title, &set, &format!("mkv://{}", out_path.display()))
+            .expect("an unaligned zero run is read damage, never E7013");
+        assert!(out.completed);
+        assert!(holds_plain_es(&out_path), "units around the hole decrypt");
+    }
 }
