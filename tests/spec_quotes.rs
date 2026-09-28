@@ -128,3 +128,22 @@ fn fragment_check_rejects_drift() {
     assert!(fragments_in_order("delta … alpha", passage).is_err());
     assert!(fragments_in_order("alpha  beta", passage).is_err());
 }
+
+/// Registry == source for the libaacs rows (KS-22…KS-24), whitespace-collapsed. Needs a
+/// libaacs checkout at `55be92be`: `LIBAACS_AACS_C=…/src/libaacs/aacs.c cargo test
+/// --test spec_quotes -- --ignored`. Ignored in CI, which has no libaacs checkout.
+#[test]
+#[ignore = "needs LIBAACS_AACS_C pointing at libaacs src/libaacs/aacs.c @55be92be"]
+fn libaacs_quotes_match_source() {
+    let path = std::env::var("LIBAACS_AACS_C").expect("set LIBAACS_AACS_C");
+    let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let src = collapse(&std::fs::read_to_string(path).expect("read aacs.c"));
+    let reg = registry();
+    for id in ["KS-22", "KS-23", "KS-24"] {
+        let passage = collapse(reg[id]);
+        assert!(
+            src.contains(&passage),
+            "{id}: registry passage not in aacs.c: {passage}"
+        );
+    }
+}
