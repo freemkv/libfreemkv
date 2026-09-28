@@ -282,6 +282,10 @@ struct Spec {
     // Answered with this failure (e.g. a 5xx): not transport class.
     fails: Option<fn() -> Error>,
     cancel: Option<Halt>,
+    // A keydb that matched the disc and holds a Media Key but got no VID (J23).
+    no_vid: bool,
+    // A source that derives keys from the VID it is sent (J23).
+    uses_vid: bool,
 }
 
 impl Spec {
@@ -297,6 +301,8 @@ impl Spec {
             down_until: None,
             fails: None,
             cancel: None,
+            no_vid: false,
+            uses_vid: false,
         }
     }
     fn online(keys: &[[u8; 16]], calls: &Calls) -> Self {
@@ -377,11 +383,30 @@ impl KeySource for Fake {
             .map(|(i, k)| UnitKey::new(i as u32, *k))
             .collect())
     }
+    fn resolve_unit_keys(
+        &self,
+        ctx: &dyn ResolveCtx,
+    ) -> Result<crate::keysource::UnitKeyResolution> {
+        let keys = self.get_unit_keys(ctx)?;
+        let (matched, miss_path) = match (self.spec.no_vid, keys.is_empty()) {
+            (true, true) => (true, vec![crate::aacs::trace::KeyNode::NoVid]),
+            _ => (false, Vec::new()),
+        };
+        Ok(crate::keysource::UnitKeyResolution {
+            keys,
+            matched,
+            miss_path,
+            ..Default::default()
+        })
+    }
     fn label(&self) -> &'static str {
         self.spec.who
     }
     fn answer_depends_on_samples(&self) -> bool {
         self.spec.dependent
+    }
+    fn uses_vid(&self) -> bool {
+        self.spec.uses_vid
     }
     fn last_failure_was_transport(&self) -> bool {
         self.transport.get()
@@ -1917,4 +1942,91 @@ fn single_unit_rule_needs_two_probes_unless_one_unit_long() {
     let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
     assert_eq!(set.proof_cache().get(b), Some(Proof::Proven(0)));
+}
+
+// ── J23: would the disc's VID help? ────────────────────────────────────────
+
+// Resolve `Titles([1])` of `two_units` (K2 held by no source) with the disc's VID zeroed or
+// not; returns the refusal and the `vid_would_help` flag.
+fn vid_help(zero_vid: bool, specs: &[Spec]) -> (Result<ResolvedKeySet>, bool) {
+    let mut fx = two_units();
+    if zero_vid {
+        fx.disc.aacs.as_mut().unwrap().volume_id = [0u8; 16];
+    }
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let opts = ResolveKeysOptions {
+        vid_would_help: Some(&flag),
+        ..Default::default()
+    };
+    let r = resolve_with(
+        &fx,
+        &mut fx.source(),
+        KeyScope::Titles(vec![1]),
+        specs,
+        opts,
+        &FakeClock::default(),
+    );
+    (r, flag.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// J23 (amends J11): KS-16 "Kvu = AES-G(Km, IDv)". A VID helps only when a Km is obtainable
+/// (a keydb reports "matched, Media Key, no VID": `KeyNode::NoVid`) or a configured source
+/// consumes the VID (`uses_vid`). Neither → the flag stays clear.
+#[test]
+fn vid_would_help_only_with_a_km_path_or_a_vid_consuming_source() {
+    let calls = Calls::default();
+    let plain = Spec::keydb(&[K1], &calls);
+    let km = Spec {
+        no_vid: true,
+        ..Spec::keydb(&[K1], &calls)
+    };
+    let online = Spec {
+        uses_vid: true,
+        ..Spec::online(&[K1], &calls)
+    };
+    let (r, help) = vid_help(true, &[plain.clone()]);
+    assert_eq!(
+        (code(r), help),
+        (E7022, false),
+        "no Km path, no VID consumer"
+    );
+    let (r, help) = vid_help(true, &[km.clone()]);
+    assert_eq!((code(r), help), (E7022, true), "a Km path");
+    let (r, help) = vid_help(true, &[plain, online.clone()]);
+    assert_eq!(
+        (code(r), help),
+        (E7022, true),
+        "an online source configured"
+    );
+    let (_, help) = vid_help(false, &[km, online]);
+    assert!(!help, "the VID was in hand: it did not help");
+}
+
+/// J23: `resolve` keeps a source's `miss_path` in the trace instead of flattening a matched
+/// miss to `NoDerivableKey`, so "matched disc > no VID" reaches the front end.
+#[test]
+fn a_matched_miss_keeps_its_reason_in_the_trace() {
+    use crate::aacs::trace::KeyNode;
+    let fx = two_units();
+    let calls = Calls::default();
+    let km_no_vid = Spec {
+        no_vid: true,
+        ..Spec::keydb(&[], &calls)
+    };
+    let f = factory(&[km_no_vid, Spec::keydb(&[K1], &calls)]);
+    let opts = ResolveKeysOptions::default();
+    let r = ResolvedKeySet::resolve(
+        &fx.disc,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0]),
+        &f,
+        opts,
+    )
+    .unwrap();
+    assert_eq!(
+        r.trace.keys[0].path,
+        [KeyNode::MatchedDisc, KeyNode::NoVid],
+        "{:?}",
+        r.trace.keys
+    );
 }
