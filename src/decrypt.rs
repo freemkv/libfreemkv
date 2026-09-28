@@ -446,6 +446,12 @@ fn apply_aacs_map(
             }
             return;
         };
+        // Off-grid guard: a real unit's clear seed carries its sync byte, so a flagged
+        // chunk without it was cut across two units (wrong unit base) — fail loud.
+        if !aacs::content::aacs_unit_on_grid(chunk, format) {
+            verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         // PHASE GATE (FMTS forensic segment): the segment interleaves two variants
         // at the unit level. Decrypt ONLY our parity; leave the alternate half as
         // ciphertext (the muxer drops untouched ciphertext cleanly — no garble).

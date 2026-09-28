@@ -87,6 +87,16 @@ pub fn aacs_unit_seed_encrypted(unit: &[u8], format: crate::disc::ContentFormat)
     }
 }
 
+/// Was `unit` cut on its file's unit grid? An encrypted BD-TS unit's clear seed
+/// always starts a source packet, so its TS sync (0x47) sits at byte 4; a chunk
+/// read off the grid starts mid-unit on ciphertext. Clear units, and `MpegPs`
+/// (seed layout unverified), always pass.
+pub(crate) fn aacs_unit_on_grid(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
+    format != crate::disc::ContentFormat::BdTs
+        || !aacs_unit_seed_encrypted(unit, format)
+        || unit.get(4) == Some(&TS_SYNC)
+}
+
 /// True when an aligned unit is flagged encrypted AND still looks scrambled
 /// (structure not yet restored) — genuine encrypted content NOT yet decrypted.
 ///

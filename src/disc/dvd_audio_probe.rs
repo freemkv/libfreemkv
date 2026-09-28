@@ -212,6 +212,7 @@ pub fn probe_and_remap<S: SectorSource + ?Sized>(
     let mut buf = vec![0u8; count as usize * 2048];
     // `recovery=false`: a single best-effort attempt — the probe must never
     // stall the mux or hammer a marginal drive. On any error, bail to ordinal.
+    reader.set_unit_base(ext.start_lba); // HD DVD AACS: anchor at the title head
     let n = match reader.read_sectors(ext.start_lba, count, &mut buf, false) {
         Ok(n) => n,
         Err(_) => return,

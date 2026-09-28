@@ -1774,7 +1774,7 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         }
     }
     crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
-    decrypting.set_unit_base(0);
+    decrypting.clear_unit_base();
 
     let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
         decrypting,

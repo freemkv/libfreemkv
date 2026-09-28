@@ -76,11 +76,11 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// extent `start_lba` that AACS aligned units are anchored at. The unit-
     /// alignment gate measures `lba` relative to THIS, not absolute disc LBA 0,
     /// so a clip whose `start_lba` is not 3-aligned still gates correctly. Set
-    /// per-extent by the mux read paths via [`set_unit_base`]; defaults to 0
-    /// (absolute alignment) for callers that read from a 3-aligned base.
+    /// per-extent via [`set_unit_base`]. `None` (the default): there is no implicit
+    /// disc-LBA-0 grid, so an AACS content read fails loud until a base is set.
     ///
     /// [`set_unit_base`]: Self::set_unit_base
-    unit_base: u32,
+    unit_base: Option<u32>,
     /// Encrypted-content map: every stream file's sorted/merged `(start_lba,
     /// sector_count)` (e.g. [`Disc::stream_content_ranges`](crate::Disc::stream_content_ranges)).
     /// When `Some`, a unit outside these ranges is clear and passed through
@@ -113,7 +113,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         Self {
             inner,
             keys,
-            unit_base: 0,
+            unit_base: None,
             content_ranges: None,
             key_map: None,
         }
@@ -154,6 +154,12 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// [`new`]: Self::new
     pub fn set_keys(&mut self, keys: DecryptKeys) {
         self.keys = keys;
+    }
+
+    /// Drop the unit base: AACS content reads fail loud until
+    /// [`set_unit_base`](SectorSource::set_unit_base) anchors the next one.
+    pub fn clear_unit_base(&mut self) {
+        self.unit_base = None;
     }
 
     /// Borrow the inner source. Useful for tests and for adapters
@@ -223,12 +229,14 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         let content = self.content_ranges.clone();
         let content_ref = content.as_deref();
 
-        // Defense-in-depth: AACS units are 3-sector aligned; misalignment silently mis-
-        // decrypts, so reject loud (DecryptFailed) before reading — gated vs `unit_base`
-        // (not raw `lba % 3`), only when the span TOUCHES content (else UDF/nav passes through).
+        // AACS units are 3-sector aligned on each file's grid; a content read with no
+        // base, or off it, silently mis-decrypts, so reject loud before reading. Only
+        // spans that TOUCH content are gated (UDF/nav passes through).
         if matches!(self.keys, DecryptKeys::Aacs { .. })
             && span_touches_content(content_ref, lba, count)
-            && !crate::aacs::content::is_unit_aligned(lba, self.unit_base)
+            && !self
+                .unit_base
+                .is_some_and(|b| crate::aacs::content::is_unit_aligned(lba, b))
         {
             return Err(crate::error::Error::DecryptFailed);
         }
@@ -262,7 +270,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
     }
 
     fn set_unit_base(&mut self, lba: u32) {
-        self.unit_base = lba;
+        self.unit_base = Some(lba);
     }
 }
 
@@ -741,6 +749,7 @@ mod tests {
             0,
         )]));
         let mut dec = DecryptingSectorSource::new(src, keys).with_key_map(map);
+        dec.set_unit_base(0);
         let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let n = dec.read_sectors(0, 3, &mut buf, false).unwrap();
         assert_eq!(n, crate::aacs::content::ALIGNED_UNIT_LEN);
@@ -767,6 +776,7 @@ mod tests {
             format: crate::disc::ContentFormat::BdTs,
         };
         let mut dec = DecryptingSectorSource::new(src, keys); // no with_key_map
+        dec.set_unit_base(0);
         let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let err = dec
             .read_sectors(0, 3, &mut buf, false)
@@ -860,6 +870,7 @@ mod tests {
         )]));
         let mut dec =
             DecryptingSectorSource::new(CountingSource(reads.clone()), keys).with_key_map(map);
+        dec.set_unit_base(0);
         let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let err = dec
             .read_sectors(1, 3, &mut buf, false)
@@ -878,5 +889,76 @@ mod tests {
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(dec.read_sectors(3, 3, &mut buf, false).is_err());
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // A file whose first sector is LBA 1001 (1001 % 3 == 2): two encrypted units on
+    // its own grid (1001, 1004), zeroes elsewhere.
+    struct MisalignedFile(Vec<u8>);
+    const FILE_LBA: u32 = 1001;
+    impl SectorSource for MisalignedFile {
+        fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+            for i in 0..c as usize {
+                let rel = (lba as usize + i).wrapping_sub(FILE_LBA as usize) * 2048;
+                let dst = &mut b[i * 2048..(i + 1) * 2048];
+                match self.0.get(rel..rel + 2048) {
+                    Some(src) => dst.copy_from_slice(src),
+                    None => dst.fill(0),
+                }
+            }
+            Ok(c as usize * 2048)
+        }
+    }
+
+    fn misaligned_file_source() -> DecryptingSectorSource<MisalignedFile> {
+        let key = [0x5Au8; 16];
+        let mut data = encrypt_aacs_unit(&key);
+        data.extend(encrypt_aacs_unit(&key));
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let map = Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+            FILE_LBA,
+            FILE_LBA + 6,
+            0,
+        )]));
+        DecryptingSectorSource::new(MisalignedFile(data), keys)
+            .with_key_map(map)
+            .with_content_ranges(Arc::from(vec![(FILE_LBA, 6u32)]))
+    }
+
+    // No default grid: an AACS content read before any `set_unit_base` fails loud,
+    // never decrypts on the disc-LBA-0 grid (1002 % 3 == 0 once passed the gate).
+    #[test]
+    fn aacs_content_read_without_unit_base_fails_loud() {
+        let mut dec = misaligned_file_source();
+        let mut buf = vec![0u8; 2 * crate::aacs::content::ALIGNED_UNIT_LEN];
+        let r = dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false);
+        assert!(
+            matches!(r, Err(crate::error::Error::DecryptFailed)),
+            "no unit base must be DecryptFailed, got {r:?}"
+        );
+    }
+
+    // A wrong explicit base (disc grid) cuts chunks across real units: their seed has
+    // no TS sync at byte 4, so the decrypt refuses instead of returning garbage.
+    #[test]
+    fn aacs_read_on_wrong_unit_grid_fails_loud() {
+        let mut dec = misaligned_file_source();
+        let mut buf = vec![0u8; 2 * crate::aacs::content::ALIGNED_UNIT_LEN];
+        dec.set_unit_base(FILE_LBA + 1);
+        let r = dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false);
+        assert!(
+            matches!(r, Err(crate::error::Error::DecryptFailed)),
+            "an off-grid read must be DecryptFailed, got Ok"
+        );
+
+        // The file's own grid decrypts both units byte-exact.
+        dec.set_unit_base(FILE_LBA);
+        dec.read_sectors(FILE_LBA, 6, &mut buf, false)
+            .expect("file-grid read decrypts");
+        let mut want = clear_aacs_unit();
+        want.extend(clear_aacs_unit());
+        assert_eq!(buf, want);
     }
 }

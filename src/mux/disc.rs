@@ -269,7 +269,7 @@ impl DiscStream {
         // `reader` is already wrapped above (DecryptKeys::None makes it a
         // pass-through). Reset the unit base the probe read advanced so the
         // first fill_extents read starts cleanly.
-        reader.set_unit_base(0);
+        reader.clear_unit_base();
 
         // B1 resync gates: one per stream, video flagged so the gate only
         // drop-to-keyframes video (audio/subtitle always admit). Computed before
