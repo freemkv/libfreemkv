@@ -599,12 +599,13 @@ mod tests {
         (c.0, c.1, *lang)
     }
 
-    /// L084b: the physical audio stream number comes from PGC_AST_CTL bits 10-8, not the
-    /// logical position (the one-5.1-stream-on-0x81 case the channel probe papered over).
+    /// L084b: the physical audio stream number comes from PGC_AST_CTL, not the logical
+    /// position. This is per spec; do not change without a spec citation proving otherwise.
     #[test]
     fn scan_dvd_titles_audio_uses_ast_ctl_stream_number() {
         let mut vts = build_vts(0, 0x00, &[aud(AC3_6CH, b"en")], &[], &[(0, 9)], false);
         set_ast(&mut vts, &[0x8100]);
+        // vm_get_audio_stream: "streamN = (...audio_control[audioN] >> 8) & 0x07;" = 1 -> 0x81.
         assert_eq!(scan_audio(vts).0, vec![(0xBD81, "eng".to_string())]);
     }
 
@@ -614,13 +615,15 @@ mod tests {
         let audio = [aud(DTS_6CH, b"en"), aud(AC3_6CH, b"fr")];
         let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
         set_ast(&mut vts, &[0xFA00, 0x8300]);
+        // "& 0x07" drops bits 14-11: DTS 2 -> VLC "0x88 -> 0x8f"; AC-3 3 -> "0x80 -> 0x87".
         assert_eq!(
             scan_audio(vts).0,
             vec![(0xBD8A, "eng".to_string()), (0xBD83, "fra".to_string())]
         );
     }
 
-    /// A stream AST_CTL marks absent gets no track; a repeated physical id keeps the first.
+    /// A stream AST_CTL marks absent gets no track (spec); a repeated physical id keeps the
+    /// first (freemkv policy, not a spec rule: two tracks cannot share one PID).
     #[test]
     fn scan_dvd_titles_audio_skips_absent_and_duplicate() {
         let audio = [
@@ -631,6 +634,7 @@ mod tests {
         let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
         set_ast(&mut vts, &[0x0000, 0x8200, 0x8200]);
         let (tracks, diag) = scan_audio(vts);
+        // mpucoder PGC_AST_CTL: "1 = stream available" is clear for entry 0.
         assert_eq!(tracks, vec![(0xBD82, "fra".to_string())]);
         assert!(
             diag.iter().any(|m| m.contains("tag=dvd.astctl")
@@ -640,7 +644,8 @@ mod tests {
     }
 
     /// No AST_CTL entry present at all: keep every declared stream on its positional id
-    /// (the pre-AST_CTL mapping) rather than rip silently, and trace it.
+    /// rather than rip silently, and trace it. freemkv policy, not a spec rule: libdvdnav's
+    /// vm_get_audio_stream returns "streamN = -1" (no stream) here.
     #[test]
     fn scan_dvd_titles_audio_all_absent_falls_back_to_position() {
         let audio = [aud(AC3_6CH, b"en"), aud(DTS_6CH, b"fr")];
@@ -658,13 +663,15 @@ mod tests {
         );
     }
 
-    /// MPEG audio rides its own PES id 0xC0|n (HandBrake/VLC), with n from AST_CTL like
-    /// every other codec; the PID is that stream id.
+    /// MPEG audio rides its own PES id 0xC0|n, with n from AST_CTL like every other codec.
+    /// This is per spec; do not change without a spec citation proving otherwise.
     #[test]
     fn scan_dvd_titles_mp2_audio_routes_by_ast_to_pes_id() {
         let audio = [aud(MP2_2CH, b"en"), aud(MP2_2CH, b"fr")];
         let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
         set_ast(&mut vts, &[0x0000, 0x8300]);
+        // mpucoder PGC_AST_CTL: "Stream number (MPEG audio) or Substream number (all others)";
+        // PES: "0xC0 - 0xDF MPEG-1 or MPEG-2 audio stream number x xxxx".
         assert_eq!(scan_audio(vts).0, vec![(0x00C3, "fra".to_string())]);
     }
 
@@ -735,13 +742,16 @@ mod tests {
 
     const NTSC_16X9: u8 = 0x0C;
 
-    /// L084: an anamorphic title carries wide/letterbox/pan-scan variants per
-    /// language, so the wide sub-stream id comes from SPST_CTL, not the ordinal.
+    /// L084: an anamorphic title carries wide/letterbox/pan-scan variants per language, so the
+    /// wide sub-stream id comes from SPST_CTL, not the ordinal. This is per spec; do not
+    /// change without a spec citation proving otherwise.
     #[test]
     fn scan_dvd_titles_anamorphic_subtitles_use_spst_wide_id() {
         let mut vts = build_vts(0, NTSC_16X9, &[], &[*b"en", *b"fr"], &[(0, 9)], true);
-        // byte0 = present|4:3, byte1 = wide, byte2 = letterbox, byte3 = pan-scan.
+        // mpucoder PGC_SPST_CTL bytes: "Stream number for 4:3", "for wide", "for letterbox",
+        // "for pan&scan".
         set_spst(&mut vts, &[0x8000_0102, 0x8003_0405]);
+        // vm_get_subp_stream "mode == 0 - widescreen": "subp_control[subpN] >> 16) & 0x1f".
         assert_eq!(
             scan_subs(vts),
             vec![(0x20, "eng".to_string()), (0x23, "fra".to_string())],
@@ -754,20 +764,22 @@ mod tests {
     fn scan_dvd_titles_4x3_subtitles_use_spst_4x3_id() {
         let mut vts = build_vts(0, 0x00, &[], &[*b"en", *b"de"], &[(0, 9)], true);
         set_spst(&mut vts, &[0x8500_0000, 0x8200_0000]);
+        // vm_get_subp_stream "if(source_aspect == 0) /* 4:3 */": "subp_control[subpN] >> 24".
         assert_eq!(
             scan_subs(vts),
             vec![(0x25, "eng".to_string()), (0x22, "deu".to_string())]
         );
     }
 
-    /// A subpicture stream SPST_CTL marks absent from this PGC gets no track,
-    /// and two logical streams naming the same physical id keep only the first.
+    /// A subpicture stream SPST_CTL marks absent gets no track (spec); two logical streams on
+    /// one physical id keep the first (freemkv policy, not a spec rule).
     #[test]
     fn scan_dvd_titles_skips_absent_and_duplicate_subpictures() {
         let subs = [*b"en", *b"es", *b"it"];
         let mut vts = build_vts(0, NTSC_16X9, &[], &subs, &[(0, 9)], true);
         set_spst(&mut vts, &[0x0000_0000, 0x8001_0100, 0x8001_0100]);
         let (subs, ev) = crate::testlog::capture(|| scan_subs(vts));
+        // ifo_print: "subp_control[i] & 0x80000000) { /* The 'is present' bit */" is clear.
         assert_eq!(subs, vec![(0x21, "spa".to_string())]);
         assert!(
             diag_lines(&ev).iter().any(|m| m.contains("tag=dvd.spstctl")

@@ -206,13 +206,16 @@ pub struct DvdAudioAttr {
 /// the stream is absent from the PGC. 16:9 takes the wide id (the rip keeps the anamorphic
 /// frame); 4:3 takes the 4:3 id. Letterbox/pan-scan variants are display-side downscales.
 pub(crate) fn subpicture_stream_id(ctl: u32, aspect: DvdAspect) -> Option<u8> {
+    // libdvdnav vm_get_subp_stream: "if((vm->state).pgc->subp_control[subpN] & (1u<<31))";
+    // mpucoder PGC_SPST_CTL byte 0: "1 = stream available".
     if ctl & 0x8000_0000 == 0 {
         return None;
     }
     let shift = match aspect {
-        DvdAspect::R4x3 => 24,
-        DvdAspect::R16x9 => 16,
+        DvdAspect::R4x3 => 24, // vm_get_subp_stream "/* 4:3 */": "subp_control[subpN] >> 24) & 0x1f"
+        DvdAspect::R16x9 => 16, // "mode == 0 - widescreen": "subp_control[subpN] >> 16) & 0x1f"
     };
+    // VLC ps.h: "( i_id&0xe0 ) == 0x20 ) /* 0x20 -> 0x3f */" is the subpicture sub-stream.
     Some(0x20 | ((ctl >> shift) & 0x1F) as u8)
 }
 
@@ -693,9 +696,9 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
 /// AC-3 `0x80|n`, DTS `0x88|n`, LPCM `0xA0|n`; `None` for MPEG audio (its own PES id).
 pub(crate) fn audio_sub_stream_id(codec: Codec, n: u8) -> Option<u8> {
     match codec {
-        Codec::Ac3 => Some(0x80 | n),
-        Codec::Dts => Some(0x88 | n),
-        Codec::Lpcm => Some(0xA0 | n),
+        Codec::Ac3 => Some(0x80 | n), // VLC ps.h: "( i_id&0xf8 ) == 0x80 || /* 0x80 -> 0x87 */"
+        Codec::Dts => Some(0x88 | n), // VLC ps.h: "( i_id&0xf8 ) == 0x88 || /* 0x88 -> 0x8f"
+        Codec::Lpcm => Some(0xA0 | n), // mpucoder LPCM: "1010 0***b *** = Audio stream number"
         _ => None,
     }
 }
@@ -704,6 +707,7 @@ pub(crate) fn audio_sub_stream_id(codec: Codec, n: u8) -> Option<u8> {
 /// `dvd_pid()`: `0xBD00 | sub-id` on `private_stream_1`, or MPEG audio's own PES id `0xC0|n`.
 pub(crate) fn audio_pid(codec: Codec, n: u8) -> Option<u16> {
     match codec {
+        // mpucoder PES: "0xC0 - 0xDF MPEG-1 or MPEG-2 audio stream number x xxxx".
         Codec::Mp2 => crate::mux::ps::dvd_mpeg_audio_pid(0xC0 | n),
         _ => audio_sub_stream_id(codec, n).and_then(crate::mux::ps::dvd_audio_pid),
     }
@@ -712,6 +716,8 @@ pub(crate) fn audio_pid(codec: Codec, n: u8) -> Option<u16> {
 /// The physical stream number (0..=7) of one PGC_AST_CTL entry, or `None` when the
 /// stream is absent from the PGC. Bits 14-11 are reserved (libdvdnav masks `& 0x07`).
 pub(crate) fn audio_stream_number(ctl: u16) -> Option<u8> {
+    // libdvdnav vm_get_audio_stream: "if((vm->state).pgc->audio_control[audioN] & (1<<15))"
+    // then "streamN = ((vm->state).pgc->audio_control[audioN] >> 8) & 0x07;".
     (ctl & 0x8000 != 0).then_some(((ctl >> 8) & 0x07) as u8)
 }
 
@@ -952,8 +958,8 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         times
     };
 
-    // PGC_AST_CTL at PGC+0x0C (8 x u16 BE), PGC_SPST_CTL at PGC+0x1C (32 x u32 BE);
-    // both inside the 0xEA bound checked above.
+    // mpucoder PGC: "000C PGC_AST_CTL 8*2", "001C PGC_SPST_CTL 32*4" (libdvdread pgc_t:
+    // "uint16_t audio_control[8];", "uint32_t subp_control[32];"); inside the 0xEA bound.
     let mut ast_ctl = [0u16; 8];
     for (i, c) in ast_ctl.iter_mut().enumerate() {
         *c = be_u16(data, pgc_offset + 0x0C + i * 2)?;
@@ -1233,12 +1239,17 @@ mod tests {
         assert_eq!(info.title_sets.len(), 1);
     }
 
-    // SPST_CTL entry: bit31 present; bytes 0-3 low 5 bits = 4:3/wide/letterbox/pan-scan ids.
+    /// mpucoder PGC_SPST_CTL: "Stream number for 4:3", "for wide", "for letterbox", "for
+    /// pan&scan" in bytes 0-3. This is per spec; do not change without a spec citation proving
+    /// otherwise.
     #[test]
     fn subpicture_stream_id_selects_by_aspect_and_presence() {
         let ctl = 0x9FE1_0203; // reserved bits set in bytes 0-1 must be masked off
+        // vm_get_subp_stream "/* 4:3 */": ">> 24) & 0x1f".
         assert_eq!(subpicture_stream_id(ctl, DvdAspect::R4x3), Some(0x3F));
+        // "mode == 0 - widescreen": ">> 16) & 0x1f".
         assert_eq!(subpicture_stream_id(ctl, DvdAspect::R16x9), Some(0x21));
+        // ifo_print: "if(pgc->subp_control[i] & 0x80000000) { /* The 'is present' bit */".
         assert_eq!(subpicture_stream_id(0x0001_0203, DvdAspect::R16x9), None);
         assert_eq!(
             subpicture_stream_id(0x8000_0000, DvdAspect::R4x3),
@@ -1246,19 +1257,24 @@ mod tests {
         );
     }
 
-    // AST_CTL entry: bit15 present; bits 10-8 physical stream number; bits 14-11 reserved.
+    /// This is per spec; do not change without a spec citation proving otherwise.
     #[test]
     fn audio_stream_number_reads_present_bit_and_low_three_bits() {
+        // vm_get_audio_stream: "streamN = ((vm->state).pgc->audio_control[audioN] >> 8) & 0x07;"
         assert_eq!(audio_stream_number(0x8000), Some(0));
         assert_eq!(audio_stream_number(0xFFFF), Some(7));
         assert_eq!(audio_stream_number(0x8A00), Some(2));
+        // ifo_print: "if(pgc->audio_control[i] & 0x8000) { /* The 'is present' bit */".
         assert_eq!(audio_stream_number(0x7FFF), None);
+        // VLC ps.h "0x80 -> 0x87" (AC-3), "0x88 -> 0x8f" (DTS); mpucoder LPCM "1010 0***b".
         assert_eq!(audio_sub_stream_id(Codec::Ac3, 3), Some(0x83));
         assert_eq!(audio_sub_stream_id(Codec::Dts, 3), Some(0x8B));
         assert_eq!(audio_sub_stream_id(Codec::Lpcm, 3), Some(0xA3));
+        // mpucoder PES: MPEG audio is "0xC0 - 0xDF", not a private stream 1 sub-stream.
         assert_eq!(audio_sub_stream_id(Codec::Mp2, 3), None);
     }
 
+    // mpucoder PGC: "000C PGC_AST_CTL 8*2 Audio Stream Control".
     #[test]
     fn pgc_parses_ast_ctl_at_0x0c() {
         let mut pgc = vec![0u8; 0xEA];
@@ -1270,6 +1286,7 @@ mod tests {
         assert_eq!(t.ast_ctl, [0x8100, 0, 0, 0, 0, 0, 0, 0x8700]);
     }
 
+    // mpucoder PGC: "001C PGC_SPST_CTL 32*4 Subpicture Stream Control".
     #[test]
     fn pgc_parses_spst_ctl_at_0x1c() {
         let mut pgc = vec![0u8; 0xEA];
