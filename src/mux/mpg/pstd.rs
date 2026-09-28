@@ -682,6 +682,14 @@ impl<W: Write> Mux<W> {
                     )));
                 }
                 self.forcing = true;
+                self.counters.forced_eof += 1;
+                let left: usize = self.streams.iter().map(|s| s.queue.len()).sum();
+                tracing::warn!(
+                    target: "mux",
+                    access_units = left,
+                    "mpg: end of input with access units no pack could take; the 0.95 s lead \
+                     and whole-frame waits are lifted to write them"
+                );
                 for s in &mut self.streams {
                     while s.queue.front().is_some_and(|q| q.au.data.is_empty()) {
                         s.queue.pop_front();
