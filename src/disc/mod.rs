@@ -1830,11 +1830,15 @@ impl Disc {
         }
 
         let aacs = if aacs_dir_present(&udf_fs) {
-            let from = encrypt::CaptureFrom::Live {
-                raw_copy: opts.raw_copy,
+            // A DVD with /AACS gets no handshake, so its key file keeps the image rule.
+            let from = if dvd {
+                encrypt::CaptureFrom::Image
+            } else {
+                encrypt::CaptureFrom::Live {
+                    raw_copy: opts.raw_copy,
+                }
             };
             let cap = encrypt::capture(&mut buffered, &udf_fs, from)?;
-            // A DVD carrying /AACS gets no AACS handshake (CSS already ran).
             let bus = if !dvd {
                 tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
                 encrypt::aacs_bus_step(buffered.inner_mut(), opts)?
