@@ -776,14 +776,14 @@ fn apply_single_unit_rule(run: &Run, ps: &mut [Piece], n_decl: Option<usize>) ->
         _ => None,
     }) {
         for p in ps.iter_mut() {
-            // J22 (invariant 2, "never guessed"): keyed only if Enc probes were read and the
-            // proven key opens them all; with none read, Lazy with that key as candidate.
+            // J22 ("never guessed"; J21 parity): keyed only on step 9's evidence, the key
+            // opening every Enc probe, two or more (or one of a one-unit piece); else Lazy.
+            let opens_all = !p.enc.is_empty() && p.enc.iter().all(|u| run.opens(u, slot));
+            let enough = p.enc.len() >= 2 || p.units == 1;
             match p.verdict {
-                Verdict::Lazy(None) if p.enc.is_empty() => p.verdict = Verdict::Lazy(Some(slot)),
-                Verdict::Lazy(_)
-                    if !p.enc.is_empty() && p.enc.iter().all(|u| run.opens(u, slot)) =>
-                {
-                    p.verdict = Verdict::Keyed(slot);
+                Verdict::Lazy(_) if opens_all && enough => p.verdict = Verdict::Keyed(slot),
+                Verdict::Lazy(_) if opens_all || p.enc.is_empty() => {
+                    p.verdict = Verdict::Lazy(Some(slot));
                 }
                 _ => {}
             }
