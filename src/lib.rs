@@ -118,6 +118,9 @@ pub mod progress;
 pub mod sector;
 #[cfg(feature = "rip")]
 pub mod session;
+/// Test fixtures (feature `test-util`); see the module doc.
+#[cfg(all(feature = "rip", any(test, feature = "test-util")))]
+pub mod test_util;
 #[cfg(all(test, feature = "rip"))]
 pub(crate) mod testlog;
 #[cfg(feature = "rip")]
