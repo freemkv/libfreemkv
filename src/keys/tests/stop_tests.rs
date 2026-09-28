@@ -137,3 +137,36 @@ fn resolve_without_stop_hands_out_no_token_or_progress() {
         "{seen:?}"
     );
 }
+
+/// Review minor 1 (§2.2 alias rule, as `Drive::alias`): under `open_with` the session's
+/// op token wins over a different caller token, so a Stop on the session token reaches
+/// a key call in flight and the resolve ends `Halted`.
+#[test]
+fn session_token_wins_over_the_callers_in_resolve() {
+    let fx = two_units();
+    let reader = fx.source();
+    let (session_tok, caller_tok) = (Halt::new(), Halt::new());
+    let (f, seen) = spies(&session_tok, true);
+    let mut s = crate::session::DiscSession::from_parts_for_test(
+        Some(fx.disc),
+        Some(Box::new(reader)),
+        None,
+    );
+    s.set_halt_for_test(&session_tok);
+    let opts = ResolveKeysOptions {
+        halt: Some(&caller_tok),
+        ..Default::default()
+    };
+    let r = s.resolve_key_set(KeyScope::Titles(vec![0]), &f, opts);
+    assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().all(|s| s.halt_is_op == Some(true)),
+        "every source sees the session token: {seen:?}"
+    );
+    assert!(
+        seen[1].cancelled,
+        "the call in flight sees the Stop: {seen:?}"
+    );
+    assert!(!caller_tok.is_cancelled());
+}

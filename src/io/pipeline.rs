@@ -482,8 +482,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     }
 
     /// Give the consumer the op's token (stop design §2.5): a consumer that reaches
-    /// `close()` after it is cancelled runs [`Sink::close_stopped`] instead, and the
-    /// pipeline returns `Halted`. The first token set wins;
+    /// `close()` after it is cancelled runs [`Sink::close_stopped`] instead and returns
+    /// that close's own result; only a close leaked after its grace gives `Halted`. The
+    /// first token set wins;
     /// [`finish_with_halt`](Self::finish_with_halt) sets its `halt` if none was.
     pub fn set_op_token(&self, halt: &Halt) {
         let _ = self.op.set(halt.clone());

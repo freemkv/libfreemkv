@@ -234,3 +234,57 @@ fn windows_file_id_identifies_file() {
         "a second handle conflicts"
     );
 }
+
+/// Review minor 4 (§2.5, T10): an identity mismatch that never clears is a wait, not a
+/// spin — it ends `TimedOut { op: "artifact_lock" }` (E9073) after the window, having
+/// re-checked about once per `WAIT_SLICE`.
+#[test]
+fn persistent_identity_mismatch_times_out_not_spins() {
+    let (_dir, out) = artifact();
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let ids = |_: &File, _: &Path| {
+        checks.fetch_add(1, Ordering::SeqCst);
+        (Ok((1, 1)), Ok((1, 2)))
+    };
+    let t = Instant::now();
+    let r = ArtifactLock::acquire_ids(&out, &[], &Halt::new(), WINDOW, &ids);
+    let took = t.elapsed();
+    assert!(
+        matches!(
+            r,
+            Err(Error::TimedOut {
+                op: "artifact_lock"
+            })
+        ),
+        "{r:?}"
+    );
+    assert!(took >= WINDOW && took <= WINDOW + SLACK, "{took:?}");
+    let n = checks.load(Ordering::SeqCst);
+    let per_slice = (WINDOW.as_millis() / WAIT_SLICE.as_millis()) as usize;
+    assert!(
+        n <= per_slice * 2 + 2,
+        "{n} re-checks in one window: a spin"
+    );
+}
+
+/// Review minor 3 (§2.5): "`ESTALE` from `fstat`/`stat` … is treated as 'retry'" — on
+/// the open file's own id too; the next attempt then takes the lock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn estale_from_fstat_retries() {
+    let (_dir, out) = artifact();
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let ids = |f: &File, p: &Path| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            (
+                Err(io::Error::from_raw_os_error(libc::ESTALE)),
+                os::path_id(p),
+            )
+        } else {
+            (os::file_id(f), os::path_id(p))
+        }
+    };
+    let lock = ArtifactLock::acquire_ids(&out, &[], &Halt::new(), WINDOW, &ids);
+    assert!(lock.is_ok(), "{lock:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry, then held");
+}

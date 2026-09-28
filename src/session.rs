@@ -218,6 +218,12 @@ impl DiscSession {
         Self::bring_up(drive, spec, Some(halt.clone()))
     }
 
+    // Test-only: give a `from_parts_for_test` session the op token `open_with` would.
+    #[cfg(test)]
+    pub(crate) fn set_halt_for_test(&mut self, halt: &Halt) {
+        self.halt = Some(halt.clone());
+    }
+
     // `wait_ready` → `init` → `probe_disc`, advisory. Under an op token (`open_with`) a
     // Stop is the one failure that is not advisory.
     pub(crate) fn bring_up(
@@ -402,7 +408,20 @@ impl DiscSession {
             h.check()?;
         }
         let mut opts = opts;
-        opts.halt = opts.halt.or(op.as_ref());
+        if let Some(h) = &op {
+            // As `Drive::alias` (§2.2): the session's op token wins over the caller's.
+            if opts
+                .halt
+                .is_some_and(|c| !Arc::ptr_eq(c.as_arc(), h.as_arc()))
+            {
+                tracing::warn!(
+                    target: "freemkv::session",
+                    phase = "halt_alias",
+                    "ResolveKeysOptions.halt differs from the session's op token; the session token wins"
+                );
+            }
+            opts.halt = Some(h);
+        }
         let Some(disc) = self.disc.as_ref() else {
             return Err(Error::DeviceNotReady {
                 path: self.device.clone(),

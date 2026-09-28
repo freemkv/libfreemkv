@@ -65,6 +65,20 @@ impl ArtifactLock {
         halt: &Halt,
         window: Duration,
     ) -> Result<ArtifactLock> {
+        Self::acquire_ids(final_path, watch, halt, window, &|f, p| {
+            (os::file_id(f), os::path_id(p))
+        })
+    }
+
+    // `acquire_within` with the identity check as a parameter (tests inject ESTALE and
+    // a lasting mismatch): `ids` is (the open file's id, the path's id).
+    fn acquire_ids(
+        final_path: &Path,
+        watch: &[&Path],
+        halt: &Halt,
+        window: Duration,
+        ids: &Ids<'_>,
+    ) -> Result<ArtifactLock> {
         let path = lock_path(final_path);
         let mut wait = LockWait::new(final_path, watch, window);
         loop {
@@ -85,13 +99,17 @@ impl ArtifactLock {
             }
             // SS-9 XBD <sys/stat.h>: "A file identity is uniquely determined by the combination
             // of st_dev and st_ino." SS-10: "the identifier … and the volume serial number".
-            match (os::file_id(&file), os::path_id(&path)) {
+            let retry = match ids(&file, &path) {
                 (Ok(held), Ok(named)) if held == named => return Ok(ArtifactLock { file, path }),
-                // The holder deleted it while we waited: we hold an unlinked file. Retry.
-                (Ok(_), Ok(_)) => {}
-                (_, Err(e)) if os::id_retryable(&e) => {}
+                // The holder deleted it while we waited: we hold an unlinked file.
+                (Ok(_), Ok(_)) => io::Error::other("the sidecar was replaced"),
+                // §2.5: ENOENT/ESTALE from `fstat` or `stat` (another client deleted it).
+                (Err(e), _) | (_, Err(e)) if os::id_retryable(&e) => e,
                 (Err(e), _) | (_, Err(e)) => return Err(Error::IoError { source: e }),
-            }
+            };
+            // A retry is a wait like any other: halt-aware, and under T10 (never a spin).
+            drop(file);
+            wait.slice(halt, &retry)?;
         }
     }
 
@@ -117,6 +135,9 @@ impl ArtifactLock {
         removed
     }
 }
+
+// (the open file's identity, the path's identity).
+type Ids<'a> = dyn Fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64, u64)>) + 'a;
 
 // The T10 wait between lock attempts: halt-aware, failing only after `window` with no
 // change in any watched file.

@@ -27,9 +27,9 @@ src/drive/mod.rs	eject	SS-6
 src/drive/mod.rs	finish_eject	SS-6
 src/drive/mod.rs	start_unit	SS-6
 src/drive/mod.rs	note_ledger	SS-7
-src/io/artifact_lock.rs	acquire_within	SS-8
-src/io/artifact_lock.rs	acquire_within	SS-9
-src/io/artifact_lock.rs	acquire_within	SS-10
+src/io/artifact_lock.rs	acquire_ids	SS-8
+src/io/artifact_lock.rs	acquire_ids	SS-9
+src/io/artifact_lock.rs	acquire_ids	SS-10
 src/keys/resolve.rs	resolve_observed	KS-14
 src/keys/resolve.rs	borrow_samples	KS-10
 src/keys/resolve.rs	apply_single_unit_rule	KS-14
