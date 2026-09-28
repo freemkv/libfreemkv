@@ -404,6 +404,11 @@ impl<W: Write> Mux<W> {
             if let Some(next) = Self::first_byte(s, 1) {
                 len = len.min(next);
             }
+            // D1: bytes before the commencement byte go without a PTS; the mark itself
+            // must start the PES that carries it (MS-15).
+            if head.sent <= head.au.mark {
+                len = len.min(head.au.mark - head.sent);
+            }
             len = round_down(len, unit(head).max(1));
             if len > 0 {
                 return Some(PesPlan { len, start: None });
