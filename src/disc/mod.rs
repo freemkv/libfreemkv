@@ -16,13 +16,13 @@ mod extract;
 mod hddvd;
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
+#[cfg(test)]
+mod scan_order_tests;
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 use crate::udf;
-
-use encrypt::HandshakeResult;
 
 // Re-export label classification enums alongside AudioStream / SubtitleStream
 // so the public surface keeps the structured metadata together. Callers map
@@ -1640,6 +1640,11 @@ pub struct ScanOptions {
     /// scanned title (e.g. `freemkv info`) opt in. The rip path leaves it off:
     /// the muxer detects forced during muxing without a second read.
     pub probe_forced_subtitles: bool,
+    /// The caller copies sectors raw and never decrypts or accepts keys (a raw
+    /// disc→ISO copy). A live AACS disc whose `Unit_Key_RO.inf` is unreadable then
+    /// still scans, with [`Error::AacsKeyFileUnreadable`] recorded and every key refused;
+    /// otherwise `Disc::scan` returns that error.
+    pub raw_copy: bool,
 }
 
 /// Quick disc identification — name, format, capacity. No title/stream parsing.
@@ -1698,7 +1703,9 @@ impl Disc {
 
     /// Read UDF filesystem and set up buffered reader with metadata prefetched.
     /// Shared setup for both identify() and scan().
-    fn read_udf(session: &mut Drive) -> Result<(u32, udf::BufferedSectorReader<'_>, udf::UdfFs)> {
+    fn read_udf(
+        session: &mut Drive,
+    ) -> Result<(u32, udf::BufferedSectorReader<'_, Drive>, udf::UdfFs)> {
         // READ CAPACITY is the sole authoritative whole-disc size (the UDF partition
         // is a subset — 288 sectors short on a real BD, truncating the backup anchor).
         // Its sporadic failures are ridden out by `read_capacity_retrying` (0 on hard fail).
@@ -1708,7 +1715,7 @@ impl Disc {
     }
 
     // UDF filesystem + metadata-prefetched reader, without the READ CAPACITY step.
-    fn open_udf(session: &mut Drive) -> Result<(udf::BufferedSectorReader<'_>, udf::UdfFs)> {
+    fn open_udf(session: &mut Drive) -> Result<(udf::BufferedSectorReader<'_, Drive>, udf::UdfFs)> {
         let batch = detect_max_batch_sectors(session.device_path());
         let mut buffered = udf::BufferedSectorReader::new(session, batch);
         let udf_fs = udf::read_filesystem(&mut buffered)?;
@@ -1796,136 +1803,110 @@ impl Disc {
         })
     }
 
-    /// Scan a disc — parse filesystem, playlists, streams, and set up AACS
-    /// decryption. This is the main entry point; after `scan()` the Disc is
-    /// ready (titles populated with streams, AACS inputs captured, content
-    /// readable and decryptable transparently). One pipeline, one order:
-    /// (1) read capacity + UDF filesystem, (2) AACS handshake + key
-    /// resolution, (3) parse playlists + streams, (4) apply labels. The
-    /// session must be open and unlocked (`Drive::open` handles this). All
-    /// disc reads use standard READ(10) via UDF — no vendor SCSI commands.
+    /// Scan a disc — parse filesystem, playlists, streams, and capture AACS
+    /// inputs. The main entry point; the session must be open. One order, the
+    /// standard one: (1) DVD only: CSS bus-auth, (2) read capacity + UDF, (3) read
+    /// the AACS files (`Unit_Key_RO.inf`, content cert, MKB) with plain READs,
+    /// (4) the AACS handshake when the disc has AACS, (5) titles + labels.
+    ///
+    /// A live AACS disc whose `Unit_Key_RO.inf` cannot be read fails with
+    /// [`Error::AacsKeyFileUnreadable`] before any AACS command (see
+    /// [`ScanOptions::raw_copy`]). A dead bus during a handshake aborts the scan.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
-        // AACS handshake (Blu-ray/UHD) acquires the Volume ID via cert-based
-        // mutual-auth; drive unlock runs separately behind the `Unlocker` seam.
-        // DVD uses CSS, so skip AACS entirely — no OEM-VID/cert SCSI before bus-auth.
-        let (handshake, handshake_error) = if session.disc_is_dvd() {
-            (None, None)
-        } else {
-            tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
-            Self::do_handshake(session, opts)
-        };
-        tracing::info!(target: "freemkv::scan", handshake = handshake.is_some(), "phase: handshake done");
-        Self::scan_after_handshake(session, handshake, handshake_error, opts)
-    }
-
-    // Everything in `scan` after the AACS handshake; split out so the bus wiring is
-    // testable against a mock transport with a synthetic handshake.
-    fn scan_after_handshake(
-        session: &mut Drive,
-        handshake: Option<encrypt::HandshakeResult>,
-        handshake_error: Option<Error>,
-        opts: &ScanOptions,
-    ) -> Result<Self> {
-        let firmware_unlocked = session.unlocker_name().is_some();
-        // Request max read speed — removes riplock on DVD
-        // (BD/UHD speed is set by drive unlock/init, but DVD needs explicit SET CD SPEED)
+        let dvd = session.disc_is_dvd();
+        // Max read speed; removes riplock on DVD.
         session.set_speed(0xFFFF);
-
-        // CSS bus-auth unlock — run BEFORE any scrambled-sector read, else the UDF
-        // metadata prefetch below hits scrambled VOB extents (sense 05/6F/03).
-        // Title keys are cracked later via `css::resolve_dvd_title_key` instead.
-        if session.disc_is_dvd() {
-            tracing::info!(target: "freemkv::scan", "phase: CSS — bus-auth unlock (pre-scan)");
-            let drive_id = session.drive_id.clone();
-            let (_, css_unlock_res) = crate::unlock_bridge::run_bus(
-                session.scsi_mut(),
-                &drive_id,
-                freemkv_unlock::DiscKind::Css,
-                &[],
-            );
-            match css_unlock_res {
-                Ok(Some(_)) => {}
-                Ok(None) => tracing::warn!(
-                    target: "freemkv::scan",
-                    "CSS bus-auth unlock declined; scrambled sectors may be unavailable"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "freemkv::scan",
-                    outcome = ?e,
-                    "CSS bus-auth unlock did not apply; scrambled sectors may be unavailable"
-                ),
-            }
+        // CSS bus-auth before any read, else the UDF prefetch hits scrambled VOB extents.
+        if dvd {
+            Self::css_bus_step(session)?;
         }
 
-        // Read UDF filesystem with buffered sector reader
         tracing::info!(target: "freemkv::scan", "phase: reading UDF filesystem");
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
         tracing::info!(target: "freemkv::scan", capacity, "phase: UDF read");
-
-        // Pre-read all small file sectors (AACS, MPLS, CLPI, META, *.bdmv).
-        // Without this, each read_file() triggers individual SCSI commands at 500ms each.
+        // Pre-read small files (AACS, MPLS, CLPI, META, *.bdmv): one command each otherwise.
         if let Ok(ranges) = udf_fs.metadata_sector_ranges(&mut buffered) {
             buffered.prefetch_ranges(&ranges);
         }
 
-        // The AACS bus stage is decided ONCE from the handshake result, captured
-        // before `handshake` is moved into `scan_with` (see `BusStage`).
-        let bus_key = Self::bus_key_for_disc(
-            &mut buffered,
-            &udf_fs,
-            handshake.as_ref().and_then(|h| h.read_data_key),
-        );
+        let aacs = if !dvd && aacs_dir_present(&udf_fs) {
+            let mut cap = encrypt::capture(&mut buffered, &udf_fs, true)?;
+            if let Err(e) = &cap.uk_ro {
+                tracing::debug!(target: "freemkv::scan", phase = "aacs_capture", error_code = e.code(), raw_copy = opts.raw_copy);
+                if !opts.raw_copy {
+                    return Err(Error::AacsKeyFileUnreadable);
+                }
+                cap.uk_ro = Err(Error::AacsKeyFileUnreadable);
+            }
+            tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
+            let bus = encrypt::aacs_bus_step(buffered.inner_mut(), opts)?;
+            Some((cap, bus))
+        } else {
+            None
+        };
+        Self::live_finish(buffered, capacity, udf_fs, aacs, opts)
+    }
+
+    // `finish` over the live reader, then the drive's bus wiring from the bus outcome.
+    fn live_finish(
+        mut buffered: udf::BufferedSectorReader<'_, Drive>,
+        capacity: u32,
+        udf_fs: udf::UdfFs,
+        aacs: Option<(encrypt::AacsCapture, encrypt::BusOutcome)>,
+        opts: &ScanOptions,
+    ) -> Result<Self> {
+        let bus_key = aacs.as_ref().and_then(|(c, b)| encrypt::bus_key(c, b));
         let stream_files = match bus_key {
             Some(_) => Self::stream_file_extents(&mut buffered, &udf_fs),
             None => Vec::new(),
         };
 
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
-        let disc = Self::scan_with(
-            &mut buffered,
-            capacity,
-            handshake,
-            handshake_error,
-            firmware_unlocked,
-            opts,
-            udf_fs,
-        )?;
+        let disc = Self::finish(&mut buffered, capacity, udf_fs, aacs, opts)?;
         tracing::info!(target: "freemkv::scan", titles = disc.titles.len(), format = ?disc.content_format, "phase: titles parsed");
 
-        // Wire the SINGLE de-bus point onto the drive from the handshake result,
-        // BEFORE the caller samples keys or muxes (the earlier UDF/metadata reads
-        // ran under default Passthrough).
+        // The SINGLE de-bus point, wired before the caller samples keys or muxes (the
+        // metadata reads above ran under Passthrough).
+        let session = buffered.into_inner();
         Self::wire_bus_removal(session, bus_key, bus_map(stream_files, &disc.titles));
 
-        // No CSS key recovery at scan time: DVD CSS keys are per-title and are
-        // re-cracked keylessly at read/decrypt time (`disc.css` stays unset),
-        // so log the format rather than a key state that is always `None`.
+        // No CSS key recovery at scan time: DVD CSS keys are re-cracked keylessly at read time.
         tracing::info!(target: "freemkv::scan", format = ?disc.format, titles = disc.titles.len(), "phase: scan complete");
         Ok(disc)
     }
 
-    // Drops the Read Data Key when the content cert's BEE flag is clear (AACS spec;
-    // libaacs gates on `bee && bec`). An unreadable cert keeps the key. HD DVD
-    // CONTENT_CERT.AACS BEE semantics are unverified; the same rule applies.
-    pub(crate) fn bus_key_for_disc(
-        reader: &mut dyn SectorSource,
-        udf_fs: &udf::UdfFs,
-        read_data_key: Option<[u8; 16]>,
-    ) -> Option<[u8; 16]> {
-        read_data_key?;
-        let bee = crate::aacs::read_first(
-            &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
-            |p| udf_fs.read_file(reader, p),
-        )
-        .ok()
-        .as_deref()
-        .and_then(crate::aacs::inf::parse_content_cert)
-        .map(|c| c.bus_encryption);
-        if bee == Some(false) {
-            tracing::info!(target: "freemkv::scan", "content cert BEE=0: bus removal off");
-            return None;
+    // CSS bus-auth for a live DVD. A dead bus aborts like `Drive::init`; a Stop is `Halted`.
+    fn css_bus_step(session: &mut Drive) -> Result<()> {
+        tracing::info!(target: "freemkv::scan", "phase: CSS — bus-auth unlock (pre-scan)");
+        if session.is_halted() {
+            return Err(Error::Halted);
         }
-        read_data_key
+        let drive_id = session.drive_id.clone();
+        let (_, res) = crate::unlock_bridge::run_bus(
+            session.scsi_mut(),
+            &drive_id,
+            freemkv_unlock::DiscKind::Css,
+            &[],
+        );
+        if session.is_halted() {
+            return Err(Error::Halted);
+        }
+        match res {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::warn!(
+                target: "freemkv::scan",
+                "CSS bus-auth unlock declined; scrambled sectors may be unavailable"
+            ),
+            Err(freemkv_unlock::UnlockError::Transport) => {
+                return Err(crate::unlock_bridge::unlock_transport_error());
+            }
+            Err(e) => tracing::warn!(
+                target: "freemkv::scan",
+                outcome = ?e,
+                "CSS bus-auth unlock did not apply; scrambled sectors may be unavailable"
+            ),
+        }
+        Ok(())
     }
 
     /// The AACS stream files' sectors (every file under `/BDMV/STREAM`: m2ts,
@@ -2014,7 +1995,7 @@ impl Disc {
         opts: &ScanOptions,
     ) -> Result<Self> {
         let udf_fs = udf::read_filesystem(reader)?;
-        let mut disc = Self::scan_with(reader, capacity, None, None, false, opts, udf_fs)?;
+        let mut disc = Self::scan_fs(reader, capacity, opts, udf_fs)?;
 
         // CSS for a raw (still-scrambled) DVD image: recover the title key via
         // known-plaintext crack (no SCSI auth needed). Gated on `DiscFormat::Dvd`,
@@ -2241,50 +2222,40 @@ impl Disc {
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
-    // Core scan pipeline — works with any SectorSource. `handshake_error` is
-    // plumbed so failures are preserved as `disc.aacs_error`, unless key
-    // resolution still succeeds (built-in keys + disc-hash hit).
-    fn scan_with(
+    // Image scan body (no SCSI): capture the AACS files, then `finish`. A missing
+    // `Unit_Key_RO.inf` is recorded, not fatal (decrypted folders, deferred mux).
+    fn scan_fs(
         reader: &mut dyn SectorSource,
         capacity: u32,
-        handshake: Option<HandshakeResult>,
-        handshake_error: Option<Error>,
-        firmware_unlocked: bool,
         opts: &ScanOptions,
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
+        let aacs = if aacs_dir_present(&udf_fs) {
+            let cap = encrypt::capture(reader, &udf_fs, false)?;
+            Some((cap, encrypt::BusOutcome::FileOrIso))
+        } else {
+            None
+        };
+        Self::finish(reader, capacity, udf_fs, aacs, opts)
+    }
+
+    // Everything after the AACS bus step, for live and image scans alike: the AACS
+    // verdict, titles, labels, format. `aacs` is `None` for a disc with no AACS dir.
+    fn finish(
+        reader: &mut dyn SectorSource,
+        capacity: u32,
+        udf_fs: udf::UdfFs,
+        aacs: Option<(encrypt::AacsCapture, encrypt::BusOutcome)>,
+        opts: &ScanOptions,
+    ) -> Result<Self> {
         let scan_with_t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
-        // 2. Resolve encryption (AACS, CSS, or none)
-        let encrypted = aacs_dir_present(&udf_fs);
-
-        let (aacs, aacs_error) = if !encrypted {
-            (None, None)
-        } else {
-            // Lookup-free: capture the disc's AACS inputs (MKB, VID, Unit_Key_RO.inf)
-            // but resolve no key — the caller resolves one and applies it via
-            // `Disc::decrypt_with`; until then the disc reports "encrypted, no keys".
-            let source = encrypt::BusSource::classify(
-                handshake.as_ref(),
-                handshake_error.is_some(),
-                firmware_unlocked,
-            );
-            match Self::resolve_vid_only(&udf_fs, reader, source) {
-                Ok(state) => {
-                    let err =
-                        encrypt::aacs_scan_error(state.bus_encryption, source, handshake_error);
-                    (Some(state), err)
-                }
-                // The capture error is surfaced, except that a handshake-class failure
-                // is kept: it is what makes `bus_blocked_error` refuse keys fail-safe.
-                Err(e) => match handshake_error {
-                    Some(h) if encrypt::handshake_class_error(&h).is_some() => {
-                        tracing::warn!(target: "freemkv::scan", capture_error = e.code(), handshake_error = h.code(), "AACS inputs unreadable after a failed handshake");
-                        (None, Some(h))
-                    }
-                    _ => (None, Some(e)),
-                },
-            }
+        let encrypted = aacs.is_some();
+        // Lookup-free: the state carries the disc's AACS inputs but no key; the caller
+        // resolves one and applies it via `Disc::decrypt_with`.
+        let (aacs, aacs_error) = match aacs {
+            Some((cap, bus)) => encrypt::resolve_aacs(cap, &bus),
+            None => (None, None),
         };
 
         // 3. Titles + container — dispatched by on-disc tree (HD-DVD/DVD peers,
@@ -4069,7 +4040,7 @@ mod tests {
             inner: &mut disc,
             clip_reads: 0,
         };
-        let res = Disc::scan_with(&mut reader, 3_997_952, None, None, false, &opts, udf);
+        let res = Disc::scan_fs(&mut reader, 3_997_952, &opts, udf);
         let clip_reads = reader.clip_reads;
 
         assert!(
@@ -4111,16 +4082,7 @@ mod tests {
         // Sanity: the same disc scans clean when nothing is cancelled, so a
         // pass below cannot be some unrelated failure wearing Halted.
         assert!(
-            Disc::scan_with(
-                &mut disc,
-                500_000,
-                None,
-                None,
-                false,
-                &ScanOptions::default(),
-                udf
-            )
-            .is_ok(),
+            Disc::scan_fs(&mut disc, 500_000, &ScanOptions::default(), udf).is_ok(),
             "fixture must scan successfully when not cancelled"
         );
 
@@ -4131,7 +4093,7 @@ mod tests {
             halt: Some(halt),
             ..Default::default()
         };
-        let res = Disc::scan_with(&mut disc, 500_000, None, None, false, &opts, udf);
+        let res = Disc::scan_fs(&mut disc, 500_000, &opts, udf);
         assert!(
             matches!(res, Err(Error::Halted)),
             "a cancelled BD scan must say so; returning a title list built \
@@ -4168,16 +4130,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         assert!(
-            Disc::scan_with(
-                &mut disc,
-                500_000,
-                None,
-                None,
-                false,
-                &ScanOptions::default(),
-                udf
-            )
-            .is_ok(),
+            Disc::scan_fs(&mut disc, 500_000, &ScanOptions::default(), udf).is_ok(),
             "fixture must scan successfully when not cancelled"
         );
 
@@ -4188,7 +4141,7 @@ mod tests {
             halt: Some(halt),
             ..Default::default()
         };
-        let res = Disc::scan_with(&mut disc, 500_000, None, None, false, &opts, udf);
+        let res = Disc::scan_fs(&mut disc, 500_000, &opts, udf);
         assert!(
             matches!(res, Err(Error::Halted)),
             "a cancelled DVD scan must say so, not hand back whatever it had \
@@ -4227,15 +4180,7 @@ mod tests {
 
         let (mut disc, udf) = hddvd_two_clip_disc(3_000_000, 5_000_000);
         let mut reader = HaltingReader { inner: &mut disc };
-        let res = Disc::scan_with(
-            &mut reader,
-            3_997_952,
-            None,
-            None,
-            false,
-            &ScanOptions::default(),
-            udf,
-        );
+        let res = Disc::scan_fs(&mut reader, 3_997_952, &ScanOptions::default(), udf);
         assert!(
             matches!(res, Err(Error::Halted)),
             "reads cancelled by the drive's own halt flag must surface as a \
@@ -4255,16 +4200,8 @@ mod tests {
     fn scan_with_capacity_bytes_uses_multiplication_not_addition() {
         const CAPACITY_SECTORS: u32 = 3_997_952; // *2048 = 8_187_805_696; +2048 = 4_000_000
         let (mut disc, udf) = hddvd_two_clip_disc(3_000_000, 5_000_000);
-        let scanned = Disc::scan_with(
-            &mut disc,
-            CAPACITY_SECTORS,
-            None,
-            None,
-            false,
-            &ScanOptions::default(),
-            udf,
-        )
-        .expect("scan_with must succeed on this synthetic HD-DVD image");
+        let scanned = Disc::scan_fs(&mut disc, CAPACITY_SECTORS, &ScanOptions::default(), udf)
+            .expect("scan_with must succeed on this synthetic HD-DVD image");
         assert_eq!(
             scanned.titles.first().map(|t| t.playlist.as_str()),
             Some("OTHER.EVO"),
@@ -4283,16 +4220,8 @@ mod tests {
     fn scan_with_capacity_bytes_uses_multiplication_not_division() {
         const CAPACITY_SECTORS: u32 = 204_800_000; // *2048 = huge; /2048 = 100_000
         let (mut disc, udf) = hddvd_two_clip_disc(1_000, 5_000_000);
-        let scanned = Disc::scan_with(
-            &mut disc,
-            CAPACITY_SECTORS,
-            None,
-            None,
-            false,
-            &ScanOptions::default(),
-            udf,
-        )
-        .expect("scan_with must succeed on this synthetic HD-DVD image");
+        let scanned = Disc::scan_fs(&mut disc, CAPACITY_SECTORS, &ScanOptions::default(), udf)
+            .expect("scan_with must succeed on this synthetic HD-DVD image");
         assert_eq!(
             scanned.titles.first().map(|t| t.playlist.as_str()),
             Some("OTHER.EVO"),
@@ -9252,6 +9181,22 @@ mod tests {
         );
     }
 
+    // The de-bus key a live scan picks for `rdk` over this disc's captured content cert.
+    fn bus_key_for_disc(
+        mem: &mut crate::udf::fixture::MemDisc,
+        udf: &udf::UdfFs,
+        rdk: Option<[u8; 16]>,
+    ) -> Option<[u8; 16]> {
+        let cap = encrypt::capture(mem, udf, true).expect("capture");
+        let bus = encrypt::BusOutcome::Handshake(encrypt::HandshakeResult {
+            volume_id: [0x11; 16],
+            read_data_key: rdk,
+            read_data_key_err: None,
+            drive_unlocked: false,
+        });
+        encrypt::bus_key(&cap, &bus)
+    }
+
     // libaacs gates bus decrypt on the content cert BEE flag (`bee && bec`): a
     // BEE=0 disc must not be de-bussed even when the drive served a Read Data Key.
     #[test]
@@ -9259,13 +9204,13 @@ mod tests {
         let rdk = Some([0x5Au8; 16]);
         let (mut mem, udf) = bus_fixture(0x00);
         assert_eq!(
-            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            bus_key_for_disc(&mut mem, &udf, rdk),
             None,
             "BEE=0 content cert must force Passthrough"
         );
         let (mut mem, udf) = bus_fixture(0x80);
         assert_eq!(
-            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
+            bus_key_for_disc(&mut mem, &udf, rdk),
             rdk,
             "BEE=1 keeps the cert-route Read Data Key"
         );
@@ -9277,23 +9222,15 @@ mod tests {
     fn bus_key_kept_when_content_cert_absent_or_unparseable() {
         let rdk = Some([0x5Au8; 16]);
         let (mut mem, udf) = bus_fixture_with(None, Vec::new());
-        assert_eq!(Disc::bus_key_for_disc(&mut mem, &udf, rdk), rdk, "no cert");
+        assert_eq!(bus_key_for_disc(&mut mem, &udf, rdk), rdk, "no cert");
         let (mut mem, udf) = bus_fixture_with(Some(vec![0x10, 0x00, 0x00]), Vec::new());
-        assert_eq!(
-            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
-            rdk,
-            "short cert"
-        );
+        assert_eq!(bus_key_for_disc(&mut mem, &udf, rdk), rdk, "short cert");
         let mut odd = vec![0u8; 32];
         odd[0] = 0x55;
         let (mut mem, udf) = bus_fixture_with(Some(odd), Vec::new());
+        assert_eq!(bus_key_for_disc(&mut mem, &udf, rdk), rdk, "unknown type");
         assert_eq!(
-            Disc::bus_key_for_disc(&mut mem, &udf, rdk),
-            rdk,
-            "unknown type"
-        );
-        assert_eq!(
-            Disc::bus_key_for_disc(&mut mem, &udf, None),
+            bus_key_for_disc(&mut mem, &udf, None),
             None,
             "no key stays none"
         );
@@ -9345,13 +9282,11 @@ mod tests {
         let mut wire = clear.clone();
         crate::aacs::content::encrypt_bus(&mut wire[..3 * 2048], &rdk);
         crate::aacs::content::encrypt_bus(&mut wire[3 * 2048..], &rdk);
-        let handshake = || {
-            Some(encrypt::HandshakeResult {
-                volume_id: [0x11; 16],
-                read_data_key: Some(rdk),
-                read_data_key_err: None,
-                drive_unlocked: false,
-            })
+        let handshake = || encrypt::HandshakeResult {
+            volume_id: [0x11; 16],
+            read_data_key: Some(rdk),
+            read_data_key_err: None,
+            drive_unlocked: false,
         };
         let lba = PART_START + 2_000;
         for (bee, want) in [(0x80u8, &clear), (0x00u8, &wire)] {
@@ -9360,8 +9295,17 @@ mod tests {
             cert[1] = bee;
             let (mem, _) = bus_fixture_with(Some(cert), wire.clone());
             let mut d = Drive::from_transport_for_test(Box::new(MemTransport(mem)));
-            Disc::scan_after_handshake(&mut d, handshake(), None, &ScanOptions::default())
-                .expect("scan");
+            let (capacity, mut buffered, udf) = Disc::read_udf(&mut d).expect("udf");
+            let cap = encrypt::capture(&mut buffered, &udf, true).expect("capture");
+            let bus = encrypt::BusOutcome::Handshake(handshake());
+            Disc::live_finish(
+                buffered,
+                capacity,
+                udf,
+                Some((cap, bus)),
+                &ScanOptions::default(),
+            )
+            .expect("scan");
             let mut got = vec![0u8; 6 * 2048];
             d.read_sectors(lba, 6, &mut got, false).unwrap();
             assert_eq!(&got, want, "BEE byte {bee:#04x}: non-title m2ts bus state");

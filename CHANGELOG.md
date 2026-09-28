@@ -16,6 +16,9 @@
 - `Error::ImageTruncated` displays as `E<code>: have/want`.
 - `json://` audio `sample_rate` is now a number in Hz (`null` when unknown) instead of a display string such as `"48kHz"`; a new `sample_rates` array lists every rate a stream carries (e.g. `[48000, 96000]` for a 48/96 kHz combo).
 - `network://` / `stdio://` FMKV headers use version 2 when a track carries decoder timing (Opus CodecDelay/SeekPreRoll), adding per-frame DiscardPadding; streams without timing stay version 1.
+- `Disc::scan` follows the standard AACS order: UDF, then `Unit_Key_RO.inf`, the content certificate and the MKB with plain reads, then the handshake, and only on a disc with an AACS directory. It no longer reads the MKB from the drive, and passes `None` to `KeySource::host_certs`.
+- `Disc::scan` fails with `Error::AacsKeyFileUnreadable` (E7031) when a live AACS disc's `Unit_Key_RO.inf` is missing or unreadable, before any AACS command. Image and folder scans still record the error and continue.
+- A transport fault during the AACS or CSS handshake makes `Disc::scan` fail with the same error `Drive::init` returns; a Stop during the handshake returns `Error::Halted`.
 
 ### Removed
 
@@ -26,6 +29,8 @@
 - `AudioChannels` gains 3.0, 3.1, 4.1, 6.0 and 7.0.
 - `DiscPresence` (`Present` / `Absent` / `Settling`) and `disc_presence(path)`: the tri-state answer `drive_has_disc` collapses (`Settling` counts as a disc).
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
+- `Error::AacsKeyFileUnreadable` (E7031).
+- `ScanOptions::raw_copy`: a raw disc→ISO copy scans on past an unreadable `Unit_Key_RO.inf`, with E7031 recorded and every key refused.
 
 ### Fixed
 

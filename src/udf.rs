@@ -1575,8 +1575,8 @@ pub(crate) fn parse_dstring_for_test(data: &[u8]) -> String {
 
 // Buffered sector reader — coalesces single-sector reads into `batch`-sized SCSI commands,
 // since per-command latency dominates on USB drives.
-pub(crate) struct BufferedSectorReader<'a> {
-    inner: &'a mut dyn SectorSource,
+pub(crate) struct BufferedSectorReader<'a, S: SectorSource + ?Sized = dyn SectorSource> {
+    inner: &'a mut S,
     cache_start: u32,
     cache: Vec<u8>,
     cache_sectors: u32,
@@ -1585,8 +1585,8 @@ pub(crate) struct BufferedSectorReader<'a> {
     prefetched: std::collections::HashMap<u32, Vec<u8>>,
 }
 
-impl<'a> BufferedSectorReader<'a> {
-    pub(crate) fn new(inner: &'a mut dyn SectorSource, batch: u16) -> Self {
+impl<'a, S: SectorSource + ?Sized> BufferedSectorReader<'a, S> {
+    pub(crate) fn new(inner: &'a mut S, batch: u16) -> Self {
         Self {
             inner,
             cache_start: u32::MAX,
@@ -1596,9 +1596,20 @@ impl<'a> BufferedSectorReader<'a> {
             prefetched: std::collections::HashMap::new(),
         }
     }
+
+    // The wrapped source, so a live scan can run the handshake on the drive
+    // without dropping the prefetched metadata cache.
+    pub(crate) fn inner_mut(&mut self) -> &mut S {
+        self.inner
+    }
+
+    // Ends the buffering and hands the source back (the live scan's bus wiring).
+    pub(crate) fn into_inner(self) -> &'a mut S {
+        self.inner
+    }
 }
 
-impl BufferedSectorReader<'_> {
+impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
     /// Pre-read a contiguous range of sectors into the sliding cache.
     /// Used to bulk-load the UDF metadata partition so subsequent reads are instant.
     pub(crate) fn prefetch(&mut self, start_lba: u32, count: u32) {
@@ -1680,7 +1691,7 @@ impl BufferedSectorReader<'_> {
     }
 }
 
-impl SectorSource for BufferedSectorReader<'_> {
+impl<S: SectorSource + ?Sized> SectorSource for BufferedSectorReader<'_, S> {
     fn read_sectors(
         &mut self,
         lba: u32,

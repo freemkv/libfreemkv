@@ -75,6 +75,16 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
     }
 }
 
+// The one Error for an unlocker's `Transport` (dead bus): `Drive::init` and both
+// scan bus steps (AACS, CSS) abort with it.
+pub(crate) fn unlock_transport_error() -> crate::error::Error {
+    crate::error::Error::ScsiError {
+        opcode: 0,
+        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+        sense: None,
+    }
+}
+
 /// Map libfreemkv's host certs (keysource-collected) to the unlock contract's.
 pub(crate) fn map_host_certs(certs: &[crate::aacs::types::HostCert]) -> Vec<fu::HostCert> {
     certs

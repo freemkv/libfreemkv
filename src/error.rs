@@ -113,6 +113,10 @@ pub const E_KEY_SERVICE_UNAUTHORIZED: u16 = 7029;
 /// The operator action is to back off and retry more slowly; the disc's key may
 /// well exist.
 pub const E_KEY_SERVICE_RATE_LIMITED: u16 = 7030;
+/// A live AACS disc's `Unit_Key_RO.inf` (both copies) is missing or unreadable.
+/// The key file is required, so the live scan stops. NOT [`E_AACS_NO_KEYS`]:
+/// no key lookup was reached, and the fix is the disc, not a key database.
+pub const E_AACS_KEY_FILE_UNREADABLE: u16 = 7031;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -592,6 +596,9 @@ pub enum Error {
     /// of silently producing a corrupt rip. NOT raised for AACS 1.0 BD or file-backed (ISO)
     /// scans, where no bus-key handshake runs.
     AacsBusKeyUnavailable,
+    /// A live AACS disc's `Unit_Key_RO.inf` is missing or unreadable (both copies).
+    /// `Disc::scan` returns it; a `raw_copy` scan records it and refuses every key.
+    AacsKeyFileUnreadable,
 
     /// AACS 2.1 (FMTS) disc carries forensic variant segments, but no segment
     /// (variant) key is available to open them. Raised UPFRONT — before the mux —
@@ -923,6 +930,7 @@ impl Error {
             Error::KeyServiceRateLimited => E_KEY_SERVICE_RATE_LIMITED,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
+            Error::AacsKeyFileUnreadable => E_AACS_KEY_FILE_UNREADABLE,
             Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
@@ -1584,6 +1592,7 @@ mod tests {
             Error::SinkWroteNothing.code(),
             Error::StreamClosed.code(),
             Error::StreamHeaderWritten.code(),
+            Error::AacsKeyFileUnreadable.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1667,6 +1676,7 @@ mod tests {
             (Error::KeyServiceUnavailable, E_KEY_SERVICE_UNAVAILABLE),
             (Error::KeyServiceUnauthorized, E_KEY_SERVICE_UNAUTHORIZED),
             (Error::KeyServiceRateLimited, E_KEY_SERVICE_RATE_LIMITED),
+            (Error::AacsKeyFileUnreadable, E_AACS_KEY_FILE_UNREADABLE),
         ];
         for (e, want_code) in cases {
             let s = e.to_string();
@@ -1980,6 +1990,7 @@ mod tests {
         // AACS (7xxx)
         assert!((7000..8000).contains(&E_AACS_NO_KEYS));
         assert!((7000..8000).contains(&E_NO_DISC_KEY));
+        assert!((7000..8000).contains(&E_AACS_KEY_FILE_UNREADABLE));
         // Keydb (8xxx)
         assert!((8000..9000).contains(&E_KEYDB_CONNECT));
         assert!((8000..9000).contains(&E_KEYDB_TOO_MANY_REDIRECTS));
