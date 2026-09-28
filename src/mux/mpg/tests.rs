@@ -332,6 +332,35 @@ fn assert_replays(r: &Run, fx: &Fx) {
     );
 }
 
+// Design §2.3 pack fill: 1-5 spare bytes go as PES-header stuffing on the last PES (MS-13
+// "No more than 32 stuffing bytes"), never pack stuffing: a stuffed pack header moves byte
+// 0x14 off the first PES's flags, where CSS scrambling detection reads a VOB pack.
+#[test]
+fn no_pack_header_carries_stuffing() {
+    for o in [
+        Opts::default(),
+        Opts {
+            spu_tracks: 12,
+            ..Opts::default()
+        },
+        Opts {
+            i_size: 180_000,
+            ..Opts::default()
+        },
+    ] {
+        let fx = fixture(&o);
+        let r = run(&fx);
+        assert_replays(&r, &fx);
+        for pk in r.out.as_chunks::<{ pack::PACK_BYTES }>().0 {
+            assert_eq!(pk[13] & 7, 0, "pack_stuffing_length");
+            assert!(
+                !crate::css::is_scrambled_pack(pk),
+                "a clear pack reads as scrambled"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_dvd_like_title_replays_clean_with_nothing_counted() {
     let fx = fixture(&Opts::default());

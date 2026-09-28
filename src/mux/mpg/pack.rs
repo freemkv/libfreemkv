@@ -290,6 +290,18 @@ pub(crate) fn pes_header(stream_id: u8, fields: &PesFields, payload_len: usize) 
     h
 }
 
+/// Grow the PES header at `body[at..]` by `n` stuffing bytes (MS-10: the stuffing loop after
+/// the optional fields; MS-13: at most 32 per header), fixing both length fields.
+pub(crate) fn stuff_pes_header(body: &mut Vec<u8>, at: usize, n: usize) {
+    debug_assert!(n <= 32);
+    let hdl = usize::from(body[at + 8]);
+    let len = usize::from(u16::from_be_bytes([body[at + 4], body[at + 5]])) + n;
+    body[at + 4..at + 6].copy_from_slice(&(len as u16).to_be_bytes());
+    body[at + 8] = (hdl + n) as u8;
+    let end = at + 9 + hdl;
+    body.splice(end..end, std::iter::repeat_n(0xFF, n));
+}
+
 /// A padding PES (MS-11 "padding_byte") that is exactly `total` bytes long.
 pub(crate) fn padding_pes(total: usize) -> Vec<u8> {
     debug_assert!(total >= MIN_PADDING_PES);

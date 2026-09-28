@@ -501,6 +501,7 @@ impl<W: Write> Mux<W> {
             pack::PACK_BYTES - pack::PACK_HEADER_BYTES - prefix.as_ref().map_or(0, Vec::len);
         let mut body: Vec<u8> = prefix.clone().unwrap_or_default();
         let mut any = false;
+        let mut last_pes = None;
         while !padding_only && avail >= 10 {
             let mut best: Option<(u64, usize, PesPlan)> = None;
             for si in 0..self.streams.len() {
@@ -517,18 +518,27 @@ impl<W: Write> Mux<W> {
             let Some((_, si, plan)) = best else { break };
             let pes = self.emit_pes(si, plan, arrival_end);
             avail -= pes.len();
+            last_pes = Some(body.len());
             body.extend_from_slice(&pes);
             any = true;
         }
         if !any && prefix.is_none() && !padding_only {
             return Ok(false);
         }
-        // Design §2.3 pack fill: padding PES for ≥ 6 bytes, else pack stuffing (MS-3 ≤ 7).
-        let stuffing = if avail >= pack::MIN_PADDING_PES {
-            body.extend_from_slice(&pack::padding_pes(avail));
-            0
-        } else {
-            avail
+        // Design §2.3 pack fill: a padding PES for ≥ 6 bytes; 1-5 bytes become PES-header
+        // stuffing on the last PES (MS-13 "No more than 32"), keeping the pack header
+        // unstuffed like a DVD VOB pack; pack stuffing (MS-3 ≤ 7) only with no PES at all.
+        let stuffing = match (avail, last_pes) {
+            (0, _) => 0,
+            (a, _) if a >= pack::MIN_PADDING_PES => {
+                body.extend_from_slice(&pack::padding_pes(a));
+                0
+            }
+            (a, Some(at)) => {
+                pack::stuff_pes_header(&mut body, at, a);
+                0
+            }
+            (a, None) => a,
         };
         let mut p = pack::pack_header(t, rate, stuffing);
         p.extend_from_slice(&body);
