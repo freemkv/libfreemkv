@@ -13,8 +13,6 @@
 //! The wait is halt-aware and stall-based: it fails `TimedOut { op: "artifact_lock" }`
 //! (E9073) only after 30 s in which neither the `.partial` nor a watched file changed.
 
-#![allow(dead_code)]
-
 use crate::error::{Error, Result};
 use crate::halt::{Halt, Progress, Stall, StallTimer, WAIT_SLICE};
 use std::fs::File;
@@ -67,13 +65,34 @@ impl ArtifactLock {
         halt: &Halt,
         window: Duration,
     ) -> Result<ArtifactLock> {
-        // Old behaviour: no lock is waited for or checked (red stub). The acquire will be
-        // SS-8 (flock), SS-9 (st_dev, st_ino) and SS-10 (LockFileEx, file ID).
         let path = lock_path(final_path);
-        let _ = (watch, halt, window);
-        let file = os::open_rw(&path).map_err(|source| Error::IoError { source })?;
-        let _ = os::try_lock_exclusive(&file);
-        Ok(ArtifactLock { file, path })
+        let mut wait = LockWait::new(final_path, watch, window);
+        loop {
+            halt.check()?;
+            let file = match os::open_rw(&path) {
+                Ok(f) => f,
+                // Windows: a delete-pending sidecar refuses the open; the holder is leaving.
+                Err(e) if os::open_retryable(&e) => {
+                    wait.slice(halt, &e)?;
+                    continue;
+                }
+                Err(e) => return Err(Error::IoError { source: e }),
+            };
+            // SS-8 flock(2): "Only one process may hold an exclusive lock for a given file at
+            // a given time." SS-10 LockFileEx: LOCKFILE_EXCLUSIVE_LOCK, FAIL_IMMEDIATELY.
+            while !os::try_lock_exclusive(&file).map_err(|source| Error::IoError { source })? {
+                wait.slice(halt, &io::Error::from(io::ErrorKind::WouldBlock))?;
+            }
+            // SS-9 XBD <sys/stat.h>: "A file identity is uniquely determined by the combination
+            // of st_dev and st_ino." SS-10: "the identifier … and the volume serial number".
+            match (os::file_id(&file), os::path_id(&path)) {
+                (Ok(held), Ok(named)) if held == named => return Ok(ArtifactLock { file, path }),
+                // The holder deleted it while we waited: we hold an unlinked file. Retry.
+                (Ok(_), Ok(_)) => {}
+                (_, Err(e)) if os::id_retryable(&e) => {}
+                (Err(e), _) | (_, Err(e)) => return Err(Error::IoError { source: e }),
+            }
+        }
     }
 
     /// The sidecar's path.
@@ -87,8 +106,15 @@ impl ArtifactLock {
     ///
     /// [`Error::IoError`] if the file exists but cannot be removed.
     pub fn delete(self) -> Result<()> {
-        drop(self);
-        Ok(())
+        let ArtifactLock { file, path } = self;
+        let removed = match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(Error::IoError { source }),
+        };
+        // Released only now: nobody can lock the path between the check and the unlink.
+        drop(file);
+        removed
     }
 }
 
