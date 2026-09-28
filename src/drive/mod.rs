@@ -230,7 +230,10 @@ impl Drive {
     fn open_slot(device: &Path, slot: Slot) -> Result<Self> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "open", device = %device.display(), "begin");
-        let transport = crate::scsi::open(device)?;
+        let transport = match slot.token() {
+            Some(halt) => crate::scsi::open_with(device, halt)?,
+            None => crate::scsi::open(device)?,
+        };
         let mut drive = Self::bare(transport, device.to_string_lossy().to_string(), slot);
         drive.drive_id = DriveId::identify(&mut |cdb, dir, buf, t| drive.exec(cdb, dir, buf, t))?;
         tracing::info!(

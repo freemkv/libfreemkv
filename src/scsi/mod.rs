@@ -477,6 +477,15 @@ pub trait ScsiTransport: Send {
 /// Open a SCSI transport for the given device path.
 /// Selects the right backend for the current platform.
 pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
+    open_with(device, &crate::halt::Halt::new())
+}
+
+// `open` whose waits observe `halt`: the macOS shim's open waits are sliced and cancellable
+// (stop design §2.9 M2); SG_IO and SPTI opens do not wait.
+pub(crate) fn open_with(device: &Path, halt: &crate::halt::Halt) -> Result<Box<dyn ScsiTransport>> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = halt;
+
     #[cfg(target_os = "linux")]
     {
         Ok(Box::new(linux::SgIoTransport::open(device)?))
@@ -484,7 +493,7 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
 
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(macos::MacScsiTransport::open(device)?))
+        Ok(Box::new(macos::MacScsiTransport::open(device, halt)?))
     }
 
     #[cfg(target_os = "windows")]
