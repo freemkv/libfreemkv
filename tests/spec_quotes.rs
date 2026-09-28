@@ -13,11 +13,19 @@ const ELISION: &str = " … ";
 // malformed line or a duplicate ID.
 fn registry() -> HashMap<&'static str, &'static str> {
     let mut out = HashMap::new();
-    for line in REGISTRY.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
-        let (id, rest) = line.split_once('\t').expect("registry line is `<id>\\t<passage>`");
+    for line in REGISTRY
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (id, rest) = line
+            .split_once('\t')
+            .expect("registry line is `<id>\\t<passage>`");
         let passage = rest.split("\t// ").next().unwrap_or(rest);
         assert!(!passage.trim().is_empty(), "{id}: empty registry passage");
-        assert!(out.insert(id, passage).is_none(), "{id}: two registry lines");
+        assert!(
+            out.insert(id, passage).is_none(),
+            "{id}: two registry lines"
+        );
     }
     out
 }
@@ -65,7 +73,10 @@ fn spec_quotes_match_registry() {
         }
     }
     let orphans: Vec<_> = reg.keys().filter(|id| !seen.contains(*id)).collect();
-    assert!(orphans.is_empty(), "registry lines with no const: {orphans:?}");
+    assert!(
+        orphans.is_empty(),
+        "registry lines with no const: {orphans:?}"
+    );
     assert!(n > 0, "spec::ALL is empty");
 }
 
@@ -92,7 +103,11 @@ fn const_names_agree_with_ids() {
             consts += 1;
         }
     }
-    assert_eq!(consts, spec::quotes().count(), "a quote const missing from spec::ALL");
+    assert_eq!(
+        consts,
+        spec::quotes().count(),
+        "a quote const missing from spec::ALL"
+    );
 }
 
 /// `KS-1`…`KS-29` exist, in order, with no gap (KU design §3.6.1 rule 4).
