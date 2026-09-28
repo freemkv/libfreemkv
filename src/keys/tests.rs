@@ -1862,3 +1862,19 @@ fn keyless_set_keeps_adjacent_clips_on_their_own_grids() {
     let anchors: Vec<u64> = set.0.arrival.iter().map(|p| p.spans[0].2).collect();
     assert_eq!(anchors, [100, 131]);
 }
+
+/// Review r3: a keyless set for a Session carries the disc's identity, so it fits that disc
+/// through `is_for` like any set (no bypass) and no other; a bare `keyless_for` (Iso/Live,
+/// never checked against a disc) carries none.
+#[test]
+fn keyless_session_set_is_bound_to_its_disc() {
+    let fx = two_units();
+    let set = ResolvedKeySet::keyless_for_disc(&fx.disc, 0).expect("title 0");
+    assert!(set.is_for(&fx.disc));
+    let mut other = two_units();
+    other.disc.aacs.as_mut().unwrap().disc_hash = "0xffff".into();
+    assert!(!set.is_for(&other.disc));
+    assert!(ResolvedKeySet::keyless_for_disc(&fx.disc, 9).is_none());
+    let bare = ResolvedKeySet::keyless_for(&fx.disc.titles[0], ContentFormat::BdTs);
+    assert!(!bare.is_for(&fx.disc), "no identity, no bypass");
+}

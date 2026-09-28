@@ -551,9 +551,7 @@ pub fn mux_with_keys(
                     }
                     .into());
                 }
-                d.titles
-                    .get(*title_index)
-                    .map(|t| crate::keys::ResolvedKeySet::keyless_for(t, d.content_format))
+                crate::keys::ResolvedKeySet::keyless_for_disc(d, *title_index)
             }
             _ => None,
         },

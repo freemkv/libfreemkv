@@ -184,8 +184,6 @@ pub(crate) struct ArrivalPiece {
 // Everything a set holds. Key bytes and the VID never leave the crate.
 pub(crate) struct Inner {
     pub(crate) aacs: bool,
-    // A set holding no key, built for one title when a mux was given none (`keyless_for`).
-    pub(crate) keyless: bool,
     pub(crate) disc_hash: String,
     pub(crate) capacity: u32,
     pub(crate) format: DiscFormat,
@@ -217,7 +215,6 @@ impl Inner {
     fn empty() -> Self {
         Inner {
             aacs: false,
-            keyless: false,
             disc_hash: String::new(),
             capacity: 0,
             format: DiscFormat::BluRay,
@@ -327,7 +324,7 @@ impl ResolvedKeySet {
     /// and fits any disc.
     pub fn is_for(&self, disc: &Disc) -> bool {
         let i = &self.0;
-        if !i.aacs || i.keyless {
+        if !i.aacs {
             return true;
         }
         let Some(aacs) = disc.aacs.as_ref() else {
@@ -562,7 +559,6 @@ impl ResolvedKeySet {
     pub(crate) fn keyless_for(title: &crate::disc::DiscTitle, format: ContentFormat) -> Self {
         let mut i = Inner::empty();
         i.aacs = true;
-        i.keyless = true;
         i.content_format = format;
         i.scope = KeyScope::WholeDisc;
         // Arrival spans must be disjoint: overlapping extents (a clip played twice, or one
@@ -591,6 +587,22 @@ impl ResolvedKeySet {
             });
         }
         ResolvedKeySet(Arc::new(i))
+    }
+
+    // `keyless_for` title `idx` of `disc`, carrying the disc's identity: its E7022 names the
+    // disc, and it passes `is_for` on that disc (a Session mux given no set, over no key).
+    pub(crate) fn keyless_for_disc(disc: &Disc, idx: usize) -> Option<Self> {
+        let title = disc.titles.get(idx)?;
+        let mut set = Self::keyless_for(title, disc.content_format);
+        let i = Arc::get_mut(&mut set.0).expect("a fresh set has one owner");
+        i.disc_hash = disc
+            .aacs
+            .as_ref()
+            .map(|a| a.disc_hash.clone())
+            .unwrap_or_default();
+        i.format = disc.format;
+        i.capacity = disc.capacity_sectors;
+        Some(set)
     }
 
     // A set keying `ranges` (`[start, end)`) with `key` as proven pieces: the mux tests'
