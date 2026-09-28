@@ -759,7 +759,9 @@ fn sync_file_range_wait_after_completes_written_range() {
     assert_eq!(unsafe { libc::fstatfs(f.as_raw_fd(), &mut st) }, 0);
     const TMPFS: i64 = 0x0102_1994;
     const OVERLAY: i64 = 0x794c_7630;
-    if [TMPFS, OVERLAY].contains(&(st.f_type as i64)) {
+    #[allow(clippy::unnecessary_cast)] // f_type is i64 on some targets, not all
+    let f_type = st.f_type as i64;
+    if [TMPFS, OVERLAY].contains(&f_type) {
         eprintln!("SKIP sync_file_range: tmpdir is tmpfs/overlay");
         return;
     }
