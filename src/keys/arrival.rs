@@ -162,7 +162,16 @@ impl Arrival {
     ) -> Result<usize> {
         let at = lba.saturating_add(u as u32 * UNIT as u32);
         let unit = &buf[u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN];
-        // Step 1: partners already in the batch, both ways.
+        // The held keys that open U, the candidate first. None: stop now, no side read.
+        let openers: Vec<usize> = candidate
+            .into_iter()
+            .chain((0..self.base).filter(|&s| Some(s) != candidate))
+            .filter(|&s| self.opens(unit, &unit_keys[s].1))
+            .collect();
+        if openers.is_empty() {
+            return Err(self.stop(at, "no held key opens the unit"));
+        }
+        // Step 1: partners already in the batch, both ways; then the side reads.
         let mut partners: Vec<Vec<u8>> = buf
             .chunks(ALIGNED_UNIT_LEN)
             .enumerate()
@@ -175,35 +184,22 @@ impl Arrival {
             partners = self.side_partners(inner, at, span);
         }
         let id = self.pieces[span.3].0;
-        let order = candidate
-            .into_iter()
-            .chain((0..self.base).filter(|&s| Some(s) != candidate));
-        let mut opened_unit = false;
-        for s in order {
-            let key = &unit_keys[s].1;
-            if !self.opens(unit, key) {
-                continue;
-            }
-            opened_unit = true;
-            if partners.is_empty() {
-                // No readable partner: provisional one-unit proof, false-accept ≈ pool × 1e-5.
-                tracing::debug!(target: "freemkv::keys", lba = at, "provisional one-unit proof");
-                self.cache.set(id, Proof::Provisional(s));
-                return Ok(s);
-            }
-            if partners.iter().any(|p| self.opens(p, key)) {
-                self.cache.set(id, Proof::Proven(s));
-                return Ok(s);
-            }
+        if partners.is_empty() {
+            // No readable partner: provisional one-unit proof, false-accept ≈ pool × 1e-5.
+            tracing::debug!(target: "freemkv::keys", lba = at, "provisional one-unit proof");
+            self.cache.set(id, Proof::Provisional(openers[0]));
+            return Ok(openers[0]);
         }
-        Err(self.stop(
-            at,
-            if opened_unit {
-                "no held key opens the unit and a partner"
-            } else {
-                "no held key opens the unit"
-            },
-        ))
+        match openers
+            .into_iter()
+            .find(|&s| partners.iter().any(|p| self.opens(p, &unit_keys[s].1)))
+        {
+            Some(s) => {
+                self.cache.set(id, Proof::Proven(s));
+                Ok(s)
+            }
+            None => Err(self.stop(at, "no held key opens the unit and a partner")),
+        }
     }
 
     // Step 1.2: at most one backward and one forward side read inside U's span, each up to
