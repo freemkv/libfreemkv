@@ -68,6 +68,9 @@ pub struct FitReport {
 /// in neither: whether it is lost is known only once its packets arrive (J23).
 /// Destinations that carry everything (`mkv://`, the FMKV wire, …) skip nothing.
 pub fn fit_report(dest: &StreamUrl, title: &DiscTitle) -> FitReport {
+    if let StreamUrl::Mpg { .. } = dest {
+        return super::mpg::plan(title).report;
+    }
     if let StreamUrl::Mp4 { .. } = dest {
         let r = super::mp4::fit_report(title);
         return FitReport {

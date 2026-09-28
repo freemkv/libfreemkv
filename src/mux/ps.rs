@@ -162,6 +162,11 @@ impl UnstoredExtensions {
         true
     }
 
+    /// Keep only the extension tracks `unstored` says this sink does not write.
+    pub(crate) fn retain(&mut self, unstored: impl Fn(usize) -> bool) {
+        self.tracks.retain(|t| unstored(t.0));
+    }
+
     /// Extension tracks whose packets arrived and were left out.
     pub(crate) fn seen(&self) -> Vec<usize> {
         (self.tracks.iter()).filter(|t| t.2).map(|t| t.0).collect()

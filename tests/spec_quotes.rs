@@ -6,7 +6,7 @@ use libfreemkv::spec::{self, SpecQuote};
 use std::collections::{HashMap, HashSet};
 
 const REGISTRY: &str = include_str!("spec_quotes.txt");
-const PREFIXES: &[&str] = &["KS-", "SS-"];
+const PREFIXES: &[&str] = &["KS-", "SS-", "MS-"];
 const ELISION: &str = " … ";
 
 // `<id>\t<passage>[\t// comment]` per line; `#` lines are the header. Panics on a

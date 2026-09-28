@@ -63,6 +63,7 @@ pub(crate) mod m2ts_mux;
 pub(crate) mod mkv;
 pub(crate) mod mkvstream;
 pub(crate) mod mp4;
+pub(crate) mod mpg;
 pub(crate) mod network;
 pub(crate) mod null;
 pub(crate) mod ps;
@@ -97,6 +98,7 @@ pub use videomap::{Medium, SourceInfo};
 // the finished file contains — the pre-mux `mp4_fit_report` is only a prediction,
 // and two of its inclusions can still be dropped at `finish()`.
 pub use mp4::{Mp4FitReport, Mp4Sink, Mp4SkipReason, fit_report as mp4_fit_report};
+pub use mpg::MpgSink;
 pub use network::NetworkStream;
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;

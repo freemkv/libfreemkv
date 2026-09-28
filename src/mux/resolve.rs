@@ -35,6 +35,9 @@ pub enum StreamUrl {
     /// a single self-contained `.mp4` (ftyp+mdat+moov). Compatibility export —
     /// carries only MP4-mappable codecs; see `mux::mp4`.
     Mp4 { path: PathBuf },
+    /// MPEG-2 program stream (`mpg://`, ISO/IEC 13818-1): the DVD-core carriage of
+    /// `mux::mpg`; tracks it cannot carry are excluded with a reason.
+    Mpg { path: PathBuf },
     /// Network stream (host:port).
     Network { addr: String },
     /// Standard I/O (stdin/stdout).
@@ -94,6 +97,7 @@ impl StreamUrl {
             StreamUrl::M2ts { .. } => "m2ts",
             StreamUrl::Mkv { .. } => "mkv",
             StreamUrl::Mp4 { .. } => "mp4",
+            StreamUrl::Mpg { .. } => "mpg",
             StreamUrl::Network { .. } => "network",
             StreamUrl::Stdio => "stdio",
             StreamUrl::Iso { .. } => "iso",
@@ -118,6 +122,7 @@ impl StreamUrl {
             StreamUrl::M2ts { path }
             | StreamUrl::Mkv { path }
             | StreamUrl::Mp4 { path }
+            | StreamUrl::Mpg { path }
             | StreamUrl::Iso { path }
             | StreamUrl::Dir { path }
             | StreamUrl::Demux { dir: path }
@@ -180,6 +185,11 @@ pub fn parse_url(url: &str) -> StreamUrl {
     }
     if let Some(rest) = url.strip_prefix("mp4://") {
         return StreamUrl::Mp4 {
+            path: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("mpg://") {
+        return StreamUrl::Mpg {
             path: PathBuf::from(rest),
         };
     }
@@ -439,6 +449,8 @@ pub(crate) fn input_with_halt(
         // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
         // `mp4://` flows to every sink (mkv://, audio://, json://, …).
         StreamUrl::Mp4 { ref path } => Ok(Box::new(super::mp4::Mp4Reader::open(path)?)),
+        // The `mpg://` source (program stream demux) lands with L3.
+        StreamUrl::Mpg { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
         | StreamUrl::Video { .. }
@@ -729,6 +741,15 @@ pub(crate) fn output_with(
                 writeback_file(path, title.size_bytes, flush)?,
             );
             Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
+        }
+        StreamUrl::Mpg { ref path } => {
+            validate_file_path(path, "mpg")?;
+            // Streaming pack writer, no seeks: the bounded-cache writeback as for mkv://.
+            let writer = std::io::BufWriter::with_capacity(
+                IO_BUF_SIZE,
+                writeback_file(path, title.size_bytes, flush)?,
+            );
+            Ok(Box::new(super::mpg::MpgSink::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
