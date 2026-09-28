@@ -32,6 +32,10 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
     if data[0] != 0xFF || (data[1] & 0xF0) != 0xF0 {
         return AdtsVerdict::NoSync;
     }
+    // layer is always 00; profile 3 is reserved when ID = 1 (MPEG-2 AAC).
+    if data[1] & 0x06 != 0 || (data[1] & 0x08 != 0 && data[2] >> 6 == 3) {
+        return AdtsVerdict::Invalid;
+    }
     // sampling_frequency_index: byte2 bits 5..2.
     let sr_index = ((data[2] >> 2) & 0x0F) as usize;
     if ADTS_SAMPLE_RATE_VALID[sr_index] == 0 {
@@ -61,6 +65,7 @@ pub struct AdtsParser {
     frames: AudioFrames,
     config: Option<Vec<u8>>,
     config_changes: u64,
+    pid: u16,
 }
 
 impl Default for AdtsParser {
@@ -81,6 +86,7 @@ impl AdtsParser {
             ),
             config: None,
             config_changes: 0,
+            pid: 0,
         }
     }
     pub fn dropped_frames(&self) -> u64 {
@@ -91,46 +97,67 @@ impl AdtsParser {
     }
 }
 
+// Validate and size the ADTS frame at the slice head, recording its AudioSpecificConfig.
+fn adts_header(
+    data: &[u8],
+    config: &mut Option<Vec<u8>>,
+    changes: &mut u64,
+    pid: u16,
+) -> Option<Header> {
+    if !matches!(adts_verdict(data), AdtsVerdict::Valid) {
+        return None;
+    }
+    let rate_index = (data[2] >> 2) & 15;
+    let object_type = (data[2] >> 6) + 1;
+    let channels = ((data[2] & 1) << 2) | (data[3] >> 6);
+    // The ASC replaces the ADTS header (payload carries no header/CRC).
+    // CodecPrivate is fixed per track: a later config change keeps the
+    // first ASC and is counted.
+    let asc = [
+        (object_type << 3) | (rate_index >> 1),
+        (rate_index << 7) | (channels << 3),
+    ];
+    match config {
+        None => *config = Some(asc.to_vec()),
+        Some(first) if first[..] != asc => {
+            if *changes == 0 {
+                tracing::warn!(target: "mux", pid, "AAC config changed mid-stream; keeping the first");
+            }
+            *changes += 1;
+        }
+        Some(_) => {}
+    }
+    Some(Header {
+        bytes: adts_frame_len(data)?,
+        skip: if data[1] & 1 == 0 { 9 } else { 7 },
+        samples: 1024 * (u32::from(data[6] & 3) + 1),
+        rate: ADTS_SAMPLE_RATE_VALID[usize::from(rate_index)],
+    })
+}
+
 impl CodecParser for AdtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        let config = &mut self.config;
-        let changes = &mut self.config_changes;
+        let (config, changes) = (&mut self.config, &mut self.config_changes);
         let pid = pes.pid;
-        self.frames.parse(pes, 7, |data| {
-            if !matches!(adts_verdict(data), AdtsVerdict::Valid) {
-                return None;
-            }
-            let rate_index = (data[2] >> 2) & 15;
-            let object_type = (data[2] >> 6) + 1;
-            let channels = ((data[2] & 1) << 2) | (data[3] >> 6);
-            // The ASC replaces the ADTS header (payload carries no header/CRC).
-            // CodecPrivate is fixed per track: a later config change keeps the
-            // first ASC and is counted.
-            let asc = [
-                (object_type << 3) | (rate_index >> 1),
-                (rate_index << 7) | (channels << 3),
-            ];
-            match config {
-                None => *config = Some(asc.to_vec()),
-                Some(first) if first[..] != asc => {
-                    if *changes == 0 {
-                        tracing::warn!(target: "mux", pid, "AAC config changed mid-stream; keeping the first");
-                    }
-                    *changes += 1;
-                }
-                Some(_) => {}
-            }
-            Some(Header {
-                bytes: adts_frame_len(data)?,
-                skip: if data[1] & 1 == 0 { 9 } else { 7 },
-                samples: 1024 * (u32::from(data[6] & 3) + 1),
-                rate: ADTS_SAMPLE_RATE_VALID[usize::from(rate_index)],
-            })
-        })
+        let mut out = Vec::new();
+        if pes.discontinuity {
+            // A frame still awaiting its successor is emitted before the gap clears it.
+            out = self
+                .frames
+                .drain_before_gap(7, |d| adts_header(d, config, changes, pid));
+        }
+        out.extend(
+            self.frames
+                .parse(pes, 7, |d| adts_header(d, config, changes, pid)),
+        );
+        self.pid = pid;
+        out
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        self.frames.flush()
+        let (config, changes, pid) = (&mut self.config, &mut self.config_changes, self.pid);
+        self.frames
+            .flush_with(7, |d| adts_header(d, config, changes, pid))
     }
     fn codec_private(&self) -> Option<Vec<u8>> {
         self.config.clone()
@@ -297,7 +324,9 @@ mod tests {
         let mut bad = adts_frame(400);
         bad[2] = (bad[2] & 0xC3) | (14 << 2); // reserved sr_index
         assert!(p.parse(&make_pes(bad, Some(90000))).is_empty());
-        let f = p.parse(&make_pes(adts_frame(400), Some(96000)));
+        // The first frame after a drop waits for a successor to confirm it, here EOS.
+        let mut f = p.parse(&make_pes(adts_frame(400), Some(96000)));
+        f.extend(p.flush());
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].pts_ns,
@@ -510,14 +539,15 @@ mod tests {
     #[test]
     fn two_corrupt_frames_in_one_pes_are_two_drops() {
         let mut seed = 13;
-        let mut frames: Vec<Vec<u8>> = (0..5).map(|_| noisy_frame(&mut seed, 200)).collect();
-        for i in [1, 3] {
+        let mut frames: Vec<Vec<u8>> = (0..6).map(|_| noisy_frame(&mut seed, 200)).collect();
+        for i in [1, 4] {
             frames[i][2] = (frames[i][2] & 0xC3) | (13 << 2);
         }
         let mut p = AdtsParser::new();
-        let f = p.parse(&make_pes(frames.concat(), Some(0)));
+        let mut f = p.parse(&make_pes(frames.concat(), Some(0)));
+        f.extend(p.flush());
         let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
-        assert_eq!(pts, [0, 2, 4].map(|i| i * AAC_FRAME_NS));
+        assert_eq!(pts, [0, 2, 3, 5].map(|i| i * AAC_FRAME_NS));
         assert_eq!(p.dropped_frames(), 2);
     }
 
@@ -530,7 +560,8 @@ mod tests {
         let mut bad = noisy_frame(&mut seed, 300);
         bad[2] = (bad[2] & 0xC3) | (13 << 2);
         let good = noisy_frame(&mut seed, 300);
-        let f = p.parse(&make_pes([&bad[..], &good].concat(), Some(90_000)));
+        let mut f = p.parse(&make_pes([&bad[..], &good].concat(), Some(90_000)));
+        f.extend(p.flush());
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].pts_ns, 1_000_000_000 + AAC_FRAME_NS);
     }
@@ -549,6 +580,185 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].data, data);
         assert_eq!(p.codec_private(), None);
+    }
+
+    fn corrupt(f: &mut [u8]) {
+        f[2] = (f[2] & 0xC3) | (13 << 2);
+    }
+
+    // After a gap the leading bytes are a fragment, not a lost AU: a false sync in them must
+    // not push the PES's first real frame a slot late.
+    #[test]
+    fn a_false_sync_after_a_discontinuity_does_not_delay_the_next_frame() {
+        let mut seed = 31;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
+        let mut frag = noise(&mut seed, 50);
+        frag[10..17].copy_from_slice(&adts_frame(0)[..7]);
+        corrupt(&mut frag[10..]);
+        let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes([&frag[..], &g1, &g2].concat(), Some(900_000))
+        };
+        let pts: Vec<i64> = p.parse(&gap).iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [10_000_000_000, 10_000_000_000 + AAC_FRAME_NS]);
+    }
+
+    // A gap ends an open resync run: the next PES's lone frame needs no successor.
+    #[test]
+    fn a_discontinuity_ends_a_resync_run() {
+        let mut seed = 61;
+        let mut bad = noisy_frame(&mut seed, 200);
+        corrupt(&mut bad);
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(0)));
+        p.parse(&make_pes(bad, None));
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes(noisy_frame(&mut seed, 200), Some(900_000))
+        };
+        let f = p.parse(&gap);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 10_000_000_000);
+    }
+
+    // A resync run spanning two lost frames advances the clock two slots (skipped bytes over
+    // the last frame's size).
+    #[test]
+    fn a_resync_run_over_two_frames_advances_two_slots() {
+        let mut seed = 37;
+        let mut frames: Vec<Vec<u8>> = (0..5).map(|_| noisy_frame(&mut seed, 250)).collect();
+        corrupt(&mut frames[1]);
+        frames[2] = noisy_frame(&mut seed, 240); // shorter: 504 skipped bytes round to 2 frames
+        frames[2][..2].copy_from_slice(&[0x12, 0x34]); // header lost: no sync at all
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(frames.concat(), Some(0)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [0, 3, 4].map(|i| i * AAC_FRAME_NS));
+        assert_eq!(p.dropped_frames(), 1);
+    }
+
+    // A verified drop costs at least one slot, however few bytes the run skipped.
+    #[test]
+    fn a_short_lost_frame_still_costs_a_slot() {
+        let mut seed = 47;
+        let (g0, g2, g3) = (
+            noisy_frame(&mut seed, 300),
+            noisy_frame(&mut seed, 300),
+            noisy_frame(&mut seed, 300),
+        );
+        let mut bad = noisy_frame(&mut seed, 60);
+        corrupt(&mut bad);
+        let f = AdtsParser::new().parse(&make_pes([&g0[..], &bad, &g2, &g3].concat(), Some(0)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [0, 2, 3].map(|i| i * AAC_FRAME_NS));
+    }
+
+    // A new PES timestamp met mid-run names the AU lost there, so skipped bytes restart.
+    #[test]
+    fn a_resync_run_restarts_under_a_new_timestamp() {
+        let mut seed = 53;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
+        let mut bad = noisy_frame(&mut seed, 300);
+        corrupt(&mut bad);
+        p.parse(&make_pes(bad.clone(), None));
+        let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
+        let f = p.parse(&make_pes([&bad[..], &g1, &g2].concat(), Some(90_000)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [1, 2].map(|i| 1_000_000_000 + i * AAC_FRAME_NS));
+    }
+
+    // A frame awaiting its successor is emitted before a discontinuity clears the buffer.
+    #[test]
+    fn a_pending_resync_frame_survives_a_discontinuity() {
+        let mut seed = 59;
+        let (g0, g1, g2) = (
+            noisy_frame(&mut seed, 200),
+            noisy_frame(&mut seed, 200),
+            noisy_frame(&mut seed, 200),
+        );
+        let mut bad = noisy_frame(&mut seed, 200);
+        corrupt(&mut bad);
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(g0, Some(0)));
+        assert!(
+            p.parse(&make_pes([&bad[..], &g1].concat(), None))
+                .is_empty()
+        );
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes(g2.clone(), Some(900_000))
+        };
+        let f = p.parse(&gap);
+        assert_eq!(f.len(), 2);
+        assert_eq!((&f[0].data[..], &f[1].data[..]), (&g1[7..], &g2[7..]));
+    }
+
+    #[test]
+    fn a_nonzero_layer_or_mpeg2_profile_3_is_invalid() {
+        let mut layer = adts_frame(16);
+        layer[1] = 0xF3; // layer 01
+        assert!(matches!(adts_verdict(&layer), AdtsVerdict::Invalid));
+        let mut mpeg2 = adts_frame(16);
+        mpeg2[1] = 0xF9; // ID = 1 (MPEG-2)
+        assert!(matches!(adts_verdict(&mpeg2), AdtsVerdict::Valid));
+        mpeg2[2] |= 0xC0; // profile 3: reserved in MPEG-2 AAC
+        assert!(matches!(adts_verdict(&mpeg2), AdtsVerdict::Invalid));
+        let mut mpeg4 = adts_frame(16);
+        mpeg4[2] |= 0xC0; // profile 3 (LTP) is legal for MPEG-4
+        assert!(matches!(adts_verdict(&mpeg4), AdtsVerdict::Valid));
+    }
+
+    // While resyncing, a valid-looking header that does not chain to another is payload.
+    #[test]
+    fn an_unchained_header_inside_a_resync_run_is_not_emitted() {
+        let mut seed = 41;
+        let frames: Vec<Vec<u8>> = (0..4).map(|_| noisy_frame(&mut seed, 300)).collect();
+        let mut bad = frames[1].clone();
+        corrupt(&mut bad);
+        let mut fake = adts_frame(13);
+        fake[7..].copy_from_slice(&noise(&mut seed, 13));
+        bad[50..70].copy_from_slice(&fake);
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(
+            [&frames[0][..], &bad, &frames[2], &frames[3]].concat(),
+            Some(0),
+        ));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [0, 2, 3].map(|i| i * AAC_FRAME_NS), "no junk AU");
+        assert!(
+            f.iter()
+                .zip([0, 2, 3])
+                .all(|(f, i)| f.data == frames[i][7..])
+        );
+        assert_eq!(p.dropped_frames(), 1);
+    }
+
+    // The first header after a resync waits for its successor, or for EOS if it ends the data.
+    #[test]
+    fn a_resync_header_waits_for_its_successor_or_eos() {
+        let mut seed = 43;
+        let fr: Vec<Vec<u8>> = (0..3).map(|_| noisy_frame(&mut seed, 200)).collect();
+        let mut bad = noisy_frame(&mut seed, 200);
+        corrupt(&mut bad);
+        let lost = [&bad[..], &fr[1]].concat();
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(fr[0].clone(), Some(0)));
+        assert!(
+            p.parse(&make_pes(lost.clone(), None)).is_empty(),
+            "unconfirmed yet"
+        );
+        let f = p.parse(&make_pes(fr[2].clone(), None));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [2, 3].map(|i| i * AAC_FRAME_NS));
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(fr[0].clone(), Some(0)));
+        assert!(p.parse(&make_pes(lost, None)).is_empty());
+        let f = p.flush();
+        assert_eq!(f.len(), 1, "EOS: a frame ending the data is accepted");
+        assert_eq!(f[0].data, fr[1][7..]);
     }
 
     // L056: random payloads (false syncs and all) are never scanned while framing is locked.

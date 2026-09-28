@@ -528,6 +528,23 @@ mod tests {
         assert_eq!(f[0].pts_ns, pts_to_ns(90_000));
     }
 
+    // After a drop, a free-format frame at EOS has no successor to chain to; EOS emits it.
+    #[test]
+    fn a_free_format_frame_after_a_drop_is_emitted_at_eos() {
+        let mut bad = mp3_frame();
+        bad[2] = 0x9C; // reserved sample rate
+        let mut p = MpegAudioParser::new();
+        assert_eq!(p.parse(&make_pes(mp3_frame(), Some(0))).len(), 1);
+        assert!(
+            p.parse(&make_pes([bad, free_frame()].concat(), None))
+                .is_empty()
+        );
+        let f = p.flush();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, free_frame());
+        assert_eq!(p.dropped_frames(), 1);
+    }
+
     #[test]
     fn non_sync_packet_passes_through() {
         // No 11-bit sync → not a validatable frame → keep (conservative).
@@ -543,7 +560,9 @@ mod tests {
         let mut bad = mp3_frame();
         bad[2] = 0x9C; // reserved sample rate
         assert!(p.parse(&make_pes(bad, Some(90000))).is_empty());
-        let f = p.parse(&make_pes(mp3_frame(), Some(96000)));
+        // The first frame after a drop waits for a successor to confirm it, here EOS.
+        let mut f = p.parse(&make_pes(mp3_frame(), Some(96000)));
+        f.extend(p.flush());
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].pts_ns,
