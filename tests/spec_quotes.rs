@@ -147,3 +147,82 @@ fn libaacs_quotes_match_source() {
         );
     }
 }
+
+const SITES: &str = include_str!("spec_sites.txt");
+
+// The body of the one `fn <name>` in `src`, braces matched outside `//` comments and
+// string/char literals. Err when the fn is missing or defined twice.
+fn fn_body<'a>(src: &'a str, name: &str) -> Result<&'a str, String> {
+    let starts: Vec<usize> = [format!("fn {name}("), format!("fn {name}<")]
+        .iter()
+        .flat_map(|pat| src.match_indices(pat.as_str()).map(|(i, _)| i))
+        .collect();
+    let [start] = starts[..] else {
+        return Err(format!("fn {name}: {} definitions", starts.len()));
+    };
+    let bytes = src.as_bytes();
+    let (mut i, mut depth, mut open) = (start, 0usize, None);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += src[i..].find('\n').unwrap_or(src.len() - i);
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'\'' if bytes.get(i + 2) == Some(&b'\'') => i += 2,
+            b'{' => {
+                open.get_or_insert(i);
+                depth += 1;
+            }
+            b'}' if open.is_some() => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(&src[open.unwrap()..=i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Err(format!("fn {name}: unbalanced body"))
+}
+
+/// KU design §3.6.1 rule 11: every listed spec-governed site names its quote ID.
+#[test]
+fn spec_governed_sites_cite_the_spec() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ids: HashSet<&str> = spec::quotes().map(|q| q.id).collect();
+    let mut rows = 0;
+    for line in SITES
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let [file, name, id] = cols[..] else {
+            panic!("site row is `<file>\\t<fn>\\t<id>`: {line:?}");
+        };
+        assert!(ids.contains(id), "{file} {name}: {id} is not a spec quote");
+        let src = std::fs::read_to_string(root.join(file)).expect(file);
+        let body = fn_body(&src, name).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(body.contains(id), "{file} fn {name} does not cite {id}");
+        rows += 1;
+    }
+    assert!(rows > 0, "no spec-governed sites listed");
+}
+
+/// The site checker itself: a cited ID passes; a missing ID, a missing fn, a braced
+/// comment or string, and a twice-defined fn are all caught.
+#[test]
+fn spec_site_check_finds_the_body() {
+    let src = "fn a() { // KS-1 { unbalanced in a comment\n    let s = \"}\"; let c = '{'; }\n\
+               fn b() { if x { KS-2 } }\nfn b2() {}\n";
+    assert!(fn_body(src, "a").unwrap().contains("KS-1"));
+    assert!(fn_body(src, "b").unwrap().contains("KS-2"));
+    assert!(!fn_body(src, "b2").unwrap().contains("KS-2"));
+    assert!(fn_body(src, "c").is_err());
+    assert!(fn_body("fn d() {}\nfn d() {}", "d").is_err());
+}
