@@ -408,12 +408,14 @@ fn pending_clear_memory_is_bounded_and_next_pcs_resynchronizes() {
 }
 
 #[test]
-fn duration_fallback_does_not_move_the_original_clear_timestamp() {
+fn duration_cap_does_not_move_the_original_clear_timestamp() {
+    // A 40s span (> the 30s cap) clamps to the cap, not the 5s fallback
+    // (L053); the clear's own timestamp is untouched either way.
     let mut parser = PgsParser::new();
     parser.parse(&packet(display(true, 0), Some(90_000)));
     let frames = parser.parse(&packet(clear(1), Some(41 * 90_000)));
     assert_eq!(frames.len(), 2);
-    assert_eq!(frames[0].duration_ns, Some(DEFAULT_PGS_DURATION_NS));
+    assert_eq!(frames[0].duration_ns, Some(MAX_PGS_DURATION_NS));
     assert_eq!(frames[1].pts_ns, 41_000_000_000);
     assert_eq!(frames[1].data, clear(1));
 }

@@ -193,6 +193,14 @@ pub struct PgsParser {
     /// opening packet's, never the closing packet's. Same rule the other
     /// buffering parsers get from `PesBuf::front`.
     pending: Option<(super::pesbuf::PesFacts, Vec<u8>)>,
+    /// How many bytes of `pending`'s data [`complete_clear_pts`] has already
+    /// walked and confirmed are complete segments (no END found among them).
+    /// Lets a pending clear set that accumulates many small appended PES
+    /// resume the segment walk where it left off instead of re-walking from
+    /// byte 0 on every PES — that rescan is O(n^2) in the number of appends
+    /// (L026). Always 0 when `pending` doesn't hold a clear set; reset
+    /// whenever `pending` is assigned a fresh set.
+    clear_scan_offset: usize,
 }
 
 impl Default for PgsParser {
@@ -204,52 +212,62 @@ impl Default for PgsParser {
 impl PgsParser {
     /// Create a fresh PGS parser with no pending display set.
     pub fn new() -> Self {
-        Self { pending: None }
+        Self {
+            pending: None,
+            clear_scan_offset: 0,
+        }
     }
 
     fn is_clear(data: &[u8]) -> bool {
         data.first() == Some(&SEGMENT_PCS) && data.get(PCS_NUM_OBJECTS_OFFSET) == Some(&0)
     }
 
-    // Clear sets must include END: it is what makes a decoder apply the empty
-    // composition. Walk segment lengths, never search bitmap/palette bytes for
-    // 0x80. END can arrive in a later PES without its own timestamp.
-    fn complete_clear_pts(&self) -> Option<i64> {
+    // Walk segment lengths for END (never search bitmap bytes for 0x80).
+    // Resumes from `clear_scan_offset` rather than rescanning `data` from 0
+    // every call, which is O(n^2) over many small appends (L026).
+    fn complete_clear_pts(&mut self) -> Option<i64> {
         let (facts, data) = self.pending.as_ref()?;
         if !Self::is_clear(data) {
             return None;
         }
-        let mut rest = data.as_slice();
-        while rest.len() >= 3 {
+        let presentation_ns = facts.presentation_ns();
+        let mut offset = self.clear_scan_offset.min(data.len());
+        let mut found_end = false;
+        while data.len() - offset >= 3 {
+            let rest = &data[offset..];
             let size = 3 + usize::from(u16::from_be_bytes([rest[1], rest[2]]));
             if size > rest.len() {
-                return None;
+                break; // incomplete trailing segment; wait for more bytes
             }
             if rest[0] == SEGMENT_END && size == 3 && rest.len() == 3 {
-                return facts.presentation_ns();
+                offset += size;
+                found_end = true;
+                break;
             }
-            rest = &rest[size..];
+            offset += size;
         }
-        None
+        self.clear_scan_offset = offset;
+        if found_end { presentation_ns } else { None }
     }
 
     // One emission path for clear, replacement, malformed input and EOF.
     // Missing end times use the existing fallback only for visible sets.
     fn emit_pending(&mut self, end_pts_ns: Option<i64>) -> Option<Frame> {
         let (facts, data) = self.pending.take()?;
+        self.clear_scan_offset = 0;
         let start_pts = facts.presentation_ns().unwrap_or(0);
         let computed = end_pts_ns
             .map(|end| end.saturating_sub(start_pts).max(0) as u64)
             .unwrap_or(DEFAULT_PGS_DURATION_NS);
-        // Trust the real computed span, but clamp a pathologically large one (a
-        // missing intermediate PCS makes one set look like it lingered for
-        // minutes) back to the fallback dwell rather than emit an absurd cue.
+        // Clamp a pathologically large computed span to the cap itself, not
+        // the much shorter 5s DEFAULT dwell (L053): the fallback made a long
+        // sign or caption vanish early in players that honour BlockDuration.
         let duration = if Self::is_clear(&data) {
             // A clear is an instantaneous state change, not a visible cue.
             // The MKV writer rounds this up to its minimum duration tick.
             0
         } else if computed > MAX_PGS_DURATION_NS {
-            DEFAULT_PGS_DURATION_NS
+            MAX_PGS_DURATION_NS
         } else {
             computed
         };
@@ -703,10 +721,9 @@ mod tests {
     }
 
     #[test]
-    fn pathologically_large_computed_duration_clamps_to_fallback() {
-        // A missing intermediate clear PCS makes a set appear to linger until a much
-        // later one; a computed span past MAX_PGS_DURATION_NS is untrusted and falls
-        // back to the dwell instead of an absurd multi-minute cue (90000 ticks = 1s).
+    fn pathologically_large_computed_duration_clamps_to_cap() {
+        // A span past MAX_PGS_DURATION_NS is untrusted, but clamps to the
+        // 30s cap itself (L053), not the unrelated 5s fallback dwell.
         let display_pts = 90_000_i64; // 1 s
         // 40 s later in 90 kHz ticks (> 30 s cap).
         let clear_pts = display_pts + 40 * 90_000;
@@ -716,8 +733,8 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].duration_ns,
-            Some(DEFAULT_PGS_DURATION_NS),
-            "a >30s computed span is clamped to the fallback dwell"
+            Some(MAX_PGS_DURATION_NS),
+            "a >30s computed span is clamped to the 30s cap, not the 5s fallback"
         );
     }
 
@@ -930,6 +947,38 @@ mod tests {
             frames[0].source.map(|s| s.byte),
             Some(7_777),
             "emitted straight from this packet, so it carries this packet's offset"
+        );
+    }
+
+    #[test]
+    fn complete_clear_pts_scan_cost_is_linear_in_appends_not_quadratic() {
+        use std::time::Instant;
+
+        fn run(appends: usize) -> std::time::Duration {
+            let mut parser = PgsParser::new();
+            // Open a pending clear set that never resolves (no END arrives).
+            let _ = parser.parse(&make_pes(pcs_bytes(0), Some(0)));
+            let seg = vec![0x17u8, 0x00, 0x02, 0xAA, 0xBB]; // 5-byte non-PCS segment
+            let start = Instant::now();
+            for _ in 0..appends {
+                let _ = parser.parse(&make_pes(seg.clone(), None));
+            }
+            start.elapsed()
+        }
+
+        let _ = run(50); // warm-up
+
+        let base = 4_000usize;
+        let t1 = run(base);
+        let t2 = run(base * 4);
+
+        // Linear: ~4x work for 4x appends. Pre-fix rescan-from-0 (L026): ~16x.
+        // Slack for measurement noise, while still rejecting quadratic growth.
+        let ratio = t2.as_secs_f64() / t1.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 8.0,
+            "scan cost grew {ratio:.1}x for 4x the appends (t1={t1:?}, t2={t2:?}); \
+             expected ~4x for a linear scan"
         );
     }
 }
