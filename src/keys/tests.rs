@@ -2606,3 +2606,24 @@ fn declared_cps_units_reads_hd_dvd_title_keys_too() {
     fx.disc.aacs.as_mut().unwrap().uk_ro = vtkf;
     assert_eq!(fx.disc.declared_cps_units(), Some(1));
 }
+
+/// The whole-disc reader's E6003 (kept from the pre-KU-X2 reader, engine
+/// `an_empty_stream_map_with_titles_fails_loud`): an AACS disc whose titles have content
+/// but whose image has no stream folder names the missing folder before any output.
+#[test]
+fn whole_disc_reader_refuses_titles_without_a_stream_folder() {
+    let uk_ro = unit_key_ro(AacsVersion::V10, &[[0xEE; 16]], &[1]);
+    let files = [
+        BdFile::new("BDMV/index.bdmv", 1, None),
+        BdFile::new("BDMV/AUXDATA/00000.bin", 30, None),
+    ];
+    let img = encrypted_bd_image(&files, &uk_ro);
+    let disc = disc_over(&img, &uk_ro, &[&[1]], DiscFormat::BluRay);
+    let fx = Fx { img, disc };
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    match set.whole_disc_reader(&fx.disc, fx.source(), None) {
+        Err(Error::UdfNotFound { path }) => assert_eq!(path, "/BDMV/STREAM"),
+        other => panic!("expected E6003, got {:?}", other.err()),
+    }
+}
