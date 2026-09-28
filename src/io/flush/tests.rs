@@ -248,6 +248,35 @@ fn nfs_mountstats_signal_rearms() {
     assert!(t.elapsed() >= W * 2, "the blocked flush was waited for");
 }
 
+/// Design review item 3: once a Stop is pending, a close on NFS counts only this file's
+/// own chunk completions; other writers' `mountstats` counters no longer re-arm the wait,
+/// so a blocked close fails E9056 at the window instead of running on unbounded.
+#[test]
+fn stop_pending_close_ignores_mountstats() {
+    let gate = Gate::closed();
+    let ops = Arc::new(FakeFlushOps {
+        chunk_gate: gate.clone(),
+        sample_from: Some(Instant::now()),
+        ..FakeFlushOps::default()
+    });
+    let (_d, mut w, _) = fake_file(&ops, timing(W));
+    let halt = Halt::new();
+    w.set_halt(halt.clone());
+    w.write_all(&[3u8; K as usize]).unwrap();
+    halt.cancel();
+    let g = gate.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(W * 6);
+        g.release();
+    });
+    let t = Instant::now();
+    let e = w
+        .flush()
+        .expect_err("no own progress for a window after the Stop");
+    assert!(is_sync_timeout(&e), "{e}");
+    assert!(t.elapsed() <= W + SLACK / 4, "bounded: {:?}", t.elapsed());
+}
+
 /// LP13e (§2.10 item 2): the writer blocks once written − flushed exceeds 2 × C, and
 /// resumes when a chunk flush completes.
 #[test]

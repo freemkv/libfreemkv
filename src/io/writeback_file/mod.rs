@@ -270,10 +270,11 @@ impl WritebackFile {
         }
     }
 
-    // Everything written handed to the flusher and made durable, if one runs.
-    fn drain(&self, halt: Option<&Halt>) -> io::Result<()> {
+    // Everything written handed to the flusher and made durable, if one runs. After a Stop
+    // only this file's chunk completions are progress (a close on NFS stays bounded).
+    fn drain(&self, abort: Option<&Halt>) -> io::Result<()> {
         match &self.flusher {
-            Some(f) => f.drain(self.written, halt),
+            Some(f) => f.drain(self.written, abort, self.halt.as_ref()),
             None => Ok(()),
         }
     }

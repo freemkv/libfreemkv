@@ -112,13 +112,20 @@ impl Flusher {
 
     /// Backpressure before a write: wait while more than `2 × C` is unflushed.
     pub(super) fn wait_room(&self, written: u64, halt: Option<&Halt>) -> io::Result<()> {
-        self.wait(halt, |st| {
+        self.wait(halt, halt, |st| {
             written.saturating_sub(st.flushed) <= 2 * st.chunk
         })
     }
 
-    /// Hand over everything written and wait until it is durable.
-    pub(super) fn drain(&self, written: u64, halt: Option<&Halt>) -> io::Result<()> {
+    /// Hand over everything written and wait until it is durable. `abort` ends the wait
+    /// at once; `stop` (a Stop pending without aborting, e.g. a container's close) only
+    /// narrows progress to this file's own chunk completions.
+    pub(super) fn drain(
+        &self,
+        written: u64,
+        abort: Option<&Halt>,
+        stop: Option<&Halt>,
+    ) -> io::Result<()> {
         {
             let mut st = self.lock();
             if written > st.requested {
@@ -126,12 +133,18 @@ impl Flusher {
                 self.shared.cv.notify_all();
             }
         }
-        self.wait(halt, |st| st.flushed >= written)
+        self.wait(abort, stop, |st| st.flushed >= written)
     }
 
-    // Wait for `done`, halt-aware, under the stall timer on the shared progress; a
-    // sampled counter (NFS) moving counts. Expiry latches `SyncTimeout` (sticky).
-    fn wait(&self, halt: Option<&Halt>, done: impl Fn(&State) -> bool) -> io::Result<()> {
+    // Wait for `done` under the stall timer on the shared progress; `abort` ends it. A
+    // sampled counter (NFS) counts only while no Stop is pending: other writers on the
+    // mount move it too. Expiry latches `SyncTimeout` (sticky).
+    fn wait(
+        &self,
+        abort: Option<&Halt>,
+        stop: Option<&Halt>,
+        done: impl Fn(&State) -> bool,
+    ) -> io::Result<()> {
         let progress = self.lock().flush.progress().clone();
         let mut timer = StallTimer::new(self.timing.stall, &progress);
         let mut sampler = Sampler::new(self.timing.sample_every, self.timing.stall);
@@ -149,11 +162,12 @@ impl Flusher {
                 .wait_timeout(st, WAIT_SLICE)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
-            if let Some(h) = halt {
+            if let Some(h) = abort {
                 h.check().map_err(io::Error::from)?;
             }
             drop(st);
-            if sampler.tick(&*self.ops).is_some() {
+            let stopping = stop.is_some_and(Halt::is_cancelled);
+            if sampler.tick(&*self.ops).is_some() && !stopping {
                 progress.bump();
             }
             let stalled = timer.poll(&progress) == Stall::Expired;
