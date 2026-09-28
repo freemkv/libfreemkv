@@ -121,7 +121,7 @@ pub const E_AACS_KEY_FILE_UNREADABLE: u16 = 7031;
 /// before any drive round-trip (keydb data problem). NOT
 /// [`E_AACS_NO_HOST_CERT`] (no cert offered at all) or
 /// [`E_AACS_HOST_CERT_REJECTED`] (the drive itself rejected a cert).
-pub const E_AACS_NO_USABLE_HOST_CERT: u16 = 7032;
+pub const E_AACS_NO_USABLE_HOST_CERT: u16 = 7033;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
