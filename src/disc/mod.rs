@@ -3186,10 +3186,10 @@ impl Disc {
                     "AACS" => {
                         self.aacs.as_ref().is_some_and(|a| a.volume_id != [0u8; 16])
                             && !fw_removed_bus
-                            && !self
+                            && self
                                 .aacs_error
                                 .as_ref()
-                                .is_some_and(|e| encrypt::handshake_class_error(e).is_some())
+                                .is_none_or(|e| encrypt::handshake_class_error(e).is_none())
                     }
                     // DVD read-unlock (CSS bus-auth) runs for EVERY DVD during scan
                     // and isn't tracked separately, so this reports the MEDIUM

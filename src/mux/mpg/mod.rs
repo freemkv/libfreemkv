@@ -442,7 +442,7 @@ impl<W: Write + Send> MpgSink<W> {
             return Ok(());
         }
         let spanned = self.span.is_some_and(|(lo, hi)| hi - lo >= WINDOW_TICKS);
-        if !eof && !(spanned && !self.deriver.pending()) {
+        if !eof && (!spanned || self.deriver.pending()) {
             return Ok(());
         }
         // Design §2.3 (MPG3-8): the lowest first DTS/PTS over ALL tracks maps to 1.5 s.
