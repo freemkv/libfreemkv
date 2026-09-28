@@ -1010,6 +1010,89 @@ mod tests {
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
     }
 
+    // Design §2.3 "Reader side (L3)" (MPG2-7): one AUD per field splits a PAFF field pair
+    // into two AUs, the second with no PES PTS; it is merged back into its first field, so
+    // the IR frame is the field pair and never a PTS-0 frame.
+    #[test]
+    fn a_pts_less_second_field_merges_into_its_first() {
+        use crate::mux::decode_ts::test_es::{H264Sps, h264_slice};
+        let sps = H264Sps {
+            frame_mbs_only: false,
+            ..H264Sps::default()
+        };
+        let mut title = DiscTitle::empty();
+        title.streams.push(crate::disc::Stream::Video(VideoStream {
+            pid: crate::mux::ps::DVD_VIDEO_PID,
+            codec: Codec::H264,
+            resolution: Resolution::R1080i,
+            frame_rate: FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            crate::mux::ps::DVD_VIDEO_PID,
+            Box::new(CountingParser {
+                per_pes: 1,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let (mut stream, tx) = make_stream(
+            title,
+            parsers,
+            vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)],
+        );
+        let annexb = |nals: Vec<Vec<u8>>| {
+            let mut v = vec![0, 0, 1, 0x09, 0xF0];
+            for n in nals {
+                v.extend_from_slice(&[0, 0, 1]);
+                v.extend(n);
+            }
+            v
+        };
+        let au = [
+            annexb(vec![sps.nal(), h264_slice(&sps, true, 0, 0, Some(false))]),
+            annexb(vec![h264_slice(&sps, true, 0, 0, Some(true))]),
+            annexb(vec![h264_slice(&sps, false, 0, 1, Some(false))]),
+            annexb(vec![h264_slice(&sps, false, 0, 1, Some(true))]),
+            // A frame picture with no PES PTS is its own AU, never merged.
+            annexb(vec![h264_slice(&sps, false, 0, 2, None)]),
+        ];
+        let frag = |pts, data: &[u8]| PsPacket {
+            source: None,
+            stream_id: 0xE0,
+            sub_stream_id: None,
+            pts,
+            dts: None,
+            data: data.to_vec(),
+        };
+        tx.send(DemuxBatch::Ps(vec![
+            frag(Some(9_000), &au[0]),
+            frag(None, &au[1]),
+            frag(Some(12_003), &au[2]),
+            frag(None, &au[3]),
+            frag(None, &au[4]),
+        ]))
+        .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let mut out = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            out.push(f.data);
+        }
+        assert_eq!(
+            out,
+            vec![
+                [au[0].clone(), au[1].clone()].concat(),
+                [au[2].clone(), au[3].clone()].concat(),
+                au[4].clone()
+            ]
+        );
+    }
+
     // Single-video-stream title on `codec` + CountingParser; feeds three 0xE0
     // PS fragments forming TWO AUD-delimited AUs (only AU-start has a PTS).
     // Returns every emitted frame.
