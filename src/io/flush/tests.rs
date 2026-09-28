@@ -6,7 +6,7 @@ use super::*;
 use crate::io::WritebackFile;
 use std::io::Write;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::time::Instant;
 
 const W: Duration = Duration::from_millis(200);
@@ -41,6 +41,11 @@ type PieceDelay = Box<dyn Fn(usize) -> Duration + Send + Sync>;
 /// counts its calls, and `sample` rises with wall time when enabled.
 struct FakeFlushOps {
     chunk_sleep: Duration,
+    // Extra chunk sleep by call index (LP13f), and a device writing out at this many
+    // bytes per second of wall time (the throttled-device pair).
+    chunk_delay: Option<PieceDelay>,
+    rate: Option<u64>,
+    flushed_len: AtomicU64,
     chunk_gate: Gate,
     finish_sleep: Duration,
     finish_gate: Gate,
@@ -55,6 +60,9 @@ impl Default for FakeFlushOps {
     fn default() -> Self {
         Self {
             chunk_sleep: Duration::ZERO,
+            chunk_delay: None,
+            rate: None,
+            flushed_len: AtomicU64::new(0),
             chunk_gate: Gate::open(),
             finish_sleep: Duration::ZERO,
             finish_gate: Gate::open(),
@@ -68,9 +76,19 @@ impl Default for FakeFlushOps {
 }
 
 impl FlushOps for FakeFlushOps {
-    fn chunk(&self, _file: &File) -> io::Result<()> {
+    fn chunk(&self, file: &File) -> io::Result<()> {
         self.chunk_gate.pass();
         std::thread::sleep(self.chunk_sleep);
+        let i = self.chunks.load(Ordering::SeqCst);
+        if let Some(d) = &self.chunk_delay {
+            std::thread::sleep(d(i));
+        }
+        if let Some(rate) = self.rate {
+            // The dirty bytes since the last chunk, written out at `rate`.
+            let len = file.metadata()?.len();
+            let dirty = len.saturating_sub(self.flushed_len.swap(len, Ordering::SeqCst));
+            std::thread::sleep(Duration::from_secs_f64(dirty as f64 / rate as f64));
+        }
         self.chunks.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -99,8 +117,8 @@ fn timing(stall: Duration) -> FlushTiming {
     FlushTiming {
         stall,
         slow_chunk: Duration::from_secs(10),
-        chunk_start: K,
-        chunk_min: K / 4,
+        chunk_min: K,
+        chunk_max: K,
         sample_every: W / 4,
     }
 }
@@ -266,27 +284,181 @@ fn writer_backpressure_at_two_chunks() {
     writer.join().unwrap().sync_all().unwrap();
 }
 
-/// LP13f (§2.10 item 1): a chunk flush slower than the slow bound (15 s, scaled) halves
-/// C, down to the floor and never below it.
+/// LP13f (§2.10 item 1, as revised): C starts at the floor, doubles after fast chunk
+/// flushes up to the cap, and halves after one slower than the slow bound (15 s, scaled),
+/// never below the floor.
 #[test]
 fn chunk_halves_on_slow_flush() {
     let ops = Arc::new(FakeFlushOps {
-        chunk_sleep: Duration::from_millis(40),
+        chunk_delay: Some(Box::new(|i| {
+            if i >= 2 {
+                Duration::from_millis(40)
+            } else {
+                Duration::ZERO
+            }
+        })),
         ..FakeFlushOps::default()
     });
     let t = FlushTiming {
         slow_chunk: Duration::from_millis(20),
-        chunk_start: 4 * K,
         chunk_min: K,
+        chunk_max: 4 * K,
         ..timing(Duration::from_secs(30))
     };
     let (_d, mut w, _) = fake_file(&ops, t);
-    assert_eq!(w.chunk_bytes(), 4 * K);
-    for _ in 0..24 {
+    assert_eq!(w.chunk_bytes(), K, "starts at the floor");
+    let mut peak = K;
+    for _ in 0..40 {
         w.write_all(&[5u8; K as usize]).unwrap();
+        peak = peak.max(w.chunk_bytes());
     }
     w.sync_all().unwrap();
-    assert_eq!(w.chunk_bytes(), K, "halved to the floor, not below");
+    assert_eq!(peak, 4 * K, "fast flushes grew C to the cap, not past it");
+    assert_eq!(
+        w.chunk_bytes(),
+        K,
+        "slow flushes halved it to the floor, not below"
+    );
+}
+
+// ── The slow-device pair (design review: C starts at the floor) ──
+
+/// A virtual-clock model of the flusher (§2.10 items 1–3) at production sizes: a writer
+/// at `writer_bps` in 64 KiB writes, a device at `device_bps` until `dies_at`, `next_size`
+/// for C. Returns the longest time with no progress (an accepted write or a completed chunk).
+fn simulate(total: u64, writer_bps: f64, device_bps: f64, dies_at: f64) -> f64 {
+    let t = FlushTiming::default();
+    let (mut clock, mut last_progress, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut written, mut requested, mut flushed, mut chunk) = (0u64, 0u64, 0u64, t.chunk_min);
+    let mut busy: Option<(f64, u64, f64)> = None; // (done_at, target, started)
+    let write = 64 * K;
+    let mut next_write = 0.0f64;
+    loop {
+        let draining = written >= total;
+        if draining && requested < written {
+            requested = written;
+        }
+        if busy.is_none() && requested > flushed {
+            let secs = (requested - flushed) as f64 / device_bps;
+            let done = if clock + secs > dies_at {
+                f64::INFINITY
+            } else {
+                clock + secs
+            };
+            busy = Some((done, requested, clock));
+        }
+        if draining && flushed >= written {
+            return worst;
+        }
+        let room = written.saturating_sub(flushed) <= 2 * chunk;
+        let wake_w = if !draining && room {
+            next_write
+        } else {
+            f64::INFINITY
+        };
+        let wake_f = busy.map_or(f64::INFINITY, |b| b.0);
+        let now = wake_w.min(wake_f);
+        if now.is_infinite() {
+            return f64::INFINITY; // the device died: nothing ever moves again
+        }
+        clock = now;
+        if wake_f <= wake_w {
+            let (_, target, started) = busy.take().unwrap();
+            flushed = target;
+            let took = Duration::from_secs_f64(clock - started);
+            chunk = next_size(chunk, took, t.slow_chunk, t.chunk_min, t.chunk_max);
+        } else {
+            written += write;
+            next_write = clock + write as f64 / writer_bps;
+            if written - requested >= chunk {
+                requested = written;
+            }
+        }
+        worst = worst.max(clock - last_progress);
+        last_progress = clock;
+    }
+}
+
+/// Design review item 1 (fake clock, production sizes): a writer and a device both at
+/// ~100 KiB/s over 512 MiB never go a whole 60 s without progress, so no false
+/// `SyncTimeout`; with the old 64 MiB first chunk the same run went minutes without one.
+/// A device that dies mid-run still leaves only silence, which T12 times out.
+#[test]
+fn slow_device_keeps_progressing_on_a_fake_clock() {
+    let bps = 100.0 * 1024.0;
+    let worst = simulate(512 * K * K, bps, bps, f64::INFINITY);
+    assert!(
+        worst < FLUSH_STALL.as_secs_f64(),
+        "longest silence {worst:.1} s"
+    );
+    // The old sizing: one 64 MiB chunk at 100 KiB/s is ~655 s of silence.
+    assert!(64.0 * 1024.0 * 1024.0 / bps > FLUSH_STALL.as_secs_f64());
+    let dead = simulate(512 * K * K, bps, bps, 300.0);
+    assert!(
+        dead >= FLUSH_STALL.as_secs_f64(),
+        "a dead device is silence: {dead}"
+    );
+}
+
+/// Design review item 1 (scaled wall clock): a writer and a device both throttled so a
+/// floor chunk takes a quarter window, and a cap chunk four windows. Starting at the floor
+/// the flush keeps progressing to `Ok`; the same device stalled mid-run still fails E9056
+/// within the window.
+#[test]
+fn throttled_writer_never_latches_sync_timeout() {
+    let floor = 16 * K;
+    let rate = floor * 1000 / (W.as_millis() as u64 / 4); // bytes per second
+    let t = FlushTiming {
+        slow_chunk: W / 2,
+        chunk_min: floor,
+        chunk_max: 16 * floor,
+        ..timing(W)
+    };
+    let ops = Arc::new(FakeFlushOps {
+        rate: Some(rate),
+        ..FakeFlushOps::default()
+    });
+    let (_d, mut w, _) = fake_file(&ops, t);
+    for _ in 0..24 {
+        w.write_all(&[8u8; 16 * K as usize])
+            .expect("a slow but healthy device never latches SyncTimeout");
+        std::thread::sleep(W / 4);
+    }
+    w.sync_all().expect("and its final flush completes");
+    assert!(ops.chunks.load(Ordering::SeqCst) >= 4);
+
+    let gate = Gate::open();
+    let n = Arc::new(AtomicUsize::new(0));
+    let (g2, n2) = (gate.clone(), n.clone());
+    let ops = Arc::new(FakeFlushOps {
+        rate: Some(rate),
+        chunk_delay: Some(Box::new(move |i| {
+            n2.store(i, Ordering::SeqCst);
+            if i == 2 {
+                g2.0.store(false, Ordering::SeqCst);
+            }
+            Duration::ZERO
+        })),
+        chunk_gate: gate.clone(),
+        ..FakeFlushOps::default()
+    });
+    let (_d, mut w, _) = fake_file(&ops, t);
+    let t0 = Instant::now();
+    let r = (|| {
+        for _ in 0..24 {
+            w.write_all(&[8u8; 16 * K as usize])?;
+            std::thread::sleep(W / 4);
+        }
+        w.sync_all()
+    })();
+    let e = r.expect_err("a stalled device still times out");
+    assert!(is_sync_timeout(&e), "{e}");
+    assert!(
+        n.load(Ordering::SeqCst) >= 2,
+        "it progressed before the stall"
+    );
+    assert!(t0.elapsed() < W * 24, "{:?}", t0.elapsed());
+    gate.release();
 }
 
 /// LP13g (§2.10 item 4): a flusher stalled a whole window while writing latches
@@ -328,20 +500,20 @@ fn durable_timing(stall: Duration) -> DurableTiming {
     DurableTiming {
         stall,
         piece_target: Duration::from_millis(20),
-        window_start: 16 * K,
         window_min: 4 * K,
+        window_max: 16 * K,
         sample_every: W / 4,
     }
 }
 
 /// LP19 (§4.5), Linux-local shape: every window's completion reports `bytes_done`; the
-/// window halves when a piece takes over the target (2 s, scaled), floors at the minimum
-/// (1 MiB, scaled) and grows back when pieces are fast; the final flush follows.
+/// window starts at the floor (1 MiB, scaled), doubles after fast pieces to the cap and
+/// halves after one over the target (2 s, scaled); the final flush follows.
 #[test]
 fn durable_sync_file_reports_piece_completions() {
     let ops = Arc::new(FakeFlushOps {
         pieces: Some(Box::new(|i| {
-            if i < 3 {
+            if i == 2 || i == 3 {
                 Duration::from_millis(40)
             } else {
                 Duration::ZERO
@@ -355,7 +527,7 @@ fn durable_sync_file_reports_piece_completions() {
     let t = durable_timing(Duration::from_secs(30));
     durable_sync_file_with(&f, None, |d, n| seen.push((d, n)), dyn_ops, t).unwrap();
     let lens: Vec<u64> = ops.ranges.lock().unwrap().iter().map(|r| r.1).collect();
-    assert_eq!(lens, [16 * K, 8 * K, 4 * K, 4 * K, 8 * K, 16 * K, 8 * K]);
+    assert_eq!(lens, [4 * K, 8 * K, 16 * K, 8 * K, 4 * K, 8 * K, 16 * K]);
     assert_eq!(
         ops.finishes.load(Ordering::SeqCst),
         1,

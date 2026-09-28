@@ -94,10 +94,11 @@ pub(crate) trait FlushOps: Send + Sync + 'static {
 pub(crate) struct FlushTiming {
     /// T12: no progress for this long is `SyncTimeout`.
     pub(crate) stall: Duration,
-    /// A chunk flush slower than this halves the chunk.
+    /// A chunk flush slower than this halves the chunk; one under a quarter of it doubles it.
     pub(crate) slow_chunk: Duration,
-    pub(crate) chunk_start: u64,
+    /// The first chunk and the floor: small, so a slow device completes one inside `stall`.
     pub(crate) chunk_min: u64,
+    pub(crate) chunk_max: u64,
     /// How often a blocked wait samples [`FlushOps::sample`].
     pub(crate) sample_every: Duration,
 }
@@ -107,8 +108,8 @@ impl Default for FlushTiming {
         Self {
             stall: FLUSH_STALL,
             slow_chunk: Duration::from_secs(15),
-            chunk_start: 64 * 1024 * 1024,
             chunk_min: super::writeback::CHUNK_BYTES_MIN,
+            chunk_max: 64 * 1024 * 1024,
             sample_every: Duration::from_secs(1),
         }
     }
@@ -120,8 +121,9 @@ pub(crate) struct DurableTiming {
     pub(crate) stall: Duration,
     /// A piece slower than this halves the window; one under a quarter of it doubles it.
     pub(crate) piece_target: Duration,
-    pub(crate) window_start: u64,
+    /// The first window and the floor.
     pub(crate) window_min: u64,
+    pub(crate) window_max: u64,
     pub(crate) sample_every: Duration,
 }
 
@@ -130,8 +132,8 @@ impl Default for DurableTiming {
         Self {
             stall: FLUSH_STALL,
             piece_target: Duration::from_secs(2),
-            window_start: 64 * 1024 * 1024,
             window_min: 1024 * 1024,
+            window_max: 64 * 1024 * 1024,
             sample_every: Duration::from_secs(1),
         }
     }
@@ -141,8 +143,8 @@ impl Default for DurableTiming {
 /// that completes (stop design §4.5).
 ///
 /// Pieces are sized to finish in about 2 s: Linux local storage syncs consecutive windows
-/// (starting at 64 MiB, halving when a piece takes over 2 s, floor 1 MiB, growing back when
-/// fast) and then the file; Linux NFS runs one flush while the mount's `mountstats` write
+/// (starting at the 1 MiB floor, doubling after a fast piece up to 64 MiB, halving after one
+/// over 2 s) and then the file; Linux NFS runs one flush while the mount's `mountstats` write
 /// counters report bytes; macOS (`F_FULLFSYNC`) and Windows (`FlushFileBuffers`) report the
 /// one call's completion. Fails with `SyncTimeout` (E9056) only after 60 s with no
 /// progress; a cancelled `halt` returns `Halted` at once, leaking the worker.
@@ -175,7 +177,7 @@ pub(crate) fn durable_sync_file_with(
     let mut timer = StallTimer::new(timing.stall, &progress);
     let mut sampler = Sampler::new(timing.sample_every, timing.stall);
     let mut done = 0u64;
-    let mut window = timing.window_start.max(1);
+    let mut window = timing.window_min.max(1);
     // Linux local: consecutive windows, each completion is progress (§4.5).
     while done < len {
         let piece = window.min(len - done);
@@ -193,13 +195,13 @@ pub(crate) fn durable_sync_file_with(
         progress.bump();
         on_progress(done, len);
         let took = started.elapsed();
-        window = if took > timing.piece_target {
-            (window / 2).max(timing.window_min)
-        } else if took < timing.piece_target / 4 {
-            (window * 2).min(timing.window_start)
-        } else {
-            window
-        };
+        window = next_size(
+            window,
+            took,
+            timing.piece_target,
+            timing.window_min,
+            timing.window_max,
+        );
     }
     // The final flush; while it is blocked, a sampled counter (NFS) is progress too.
     let reported = done;
@@ -222,6 +224,19 @@ pub(crate) fn durable_sync_file_with(
         on_progress(len, len);
     }
     Ok(())
+}
+
+/// The adaptive piece size (§2.10 item 1, §4.5): start at the floor so the first piece of
+/// a slow device completes inside the stall window; halve (to `min`) after a piece slower
+/// than `slow`, double (to `max`) after one under a quarter of it.
+pub(crate) fn next_size(size: u64, took: Duration, slow: Duration, min: u64, max: u64) -> u64 {
+    if took > slow {
+        (size / 2).max(min)
+    } else if took < slow / 4 {
+        size.saturating_mul(2).min(max.max(min))
+    } else {
+        size
+    }
 }
 
 // Samples `FlushOps::sample` every `every` from a blocked wait: the counter's increase since

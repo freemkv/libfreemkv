@@ -66,7 +66,7 @@ impl Flusher {
             state: Mutex::new(State {
                 requested: base,
                 flushed: base,
-                chunk: timing.chunk_start.max(timing.chunk_min),
+                chunk: timing.chunk_min,
                 error: None,
                 stop: false,
                 flush,
@@ -200,8 +200,15 @@ fn run(file: File, ops: &dyn FlushOps, shared: &Shared, timing: FlushTiming) {
                 let newly = target.saturating_sub(st.flushed);
                 st.flushed = st.flushed.max(target);
                 st.flush.add_durable(newly);
-                if took > timing.slow_chunk && st.chunk > timing.chunk_min {
-                    st.chunk = (st.chunk / 2).max(timing.chunk_min);
+                let before = st.chunk;
+                st.chunk = crate::io::flush::next_size(
+                    before,
+                    took,
+                    timing.slow_chunk,
+                    timing.chunk_min,
+                    timing.chunk_max,
+                );
+                if st.chunk < before {
                     tracing::info!(
                         target: "freemkv::io",
                         chunk = st.chunk,

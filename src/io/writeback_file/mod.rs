@@ -155,7 +155,7 @@ impl WritebackFile {
     pub(crate) fn chunk_bytes(&self) -> u64 {
         self.flusher
             .as_ref()
-            .map_or(self.timing.chunk_start, Flusher::chunk)
+            .map_or(self.timing.chunk_min, Flusher::chunk)
     }
 
     // Start the flusher once this file needs one (Linux: only NFS or a degraded pipeline).
