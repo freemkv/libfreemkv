@@ -25,9 +25,10 @@ const PROOFS: u8 = 2;
 pub type WholeDiscReader<S> = UnitAligned<DecryptingSectorSource<S>>;
 
 /// Build the whole-disc reader over `reader`. `decrypt` installs the disc's keys; for AACS
-/// every content file is keyed first (see the module doc), with `fetch` asked for a key no
-/// held one provides, so a refusal comes before the caller creates any output. `false`
-/// (raw copy), CSS and clear discs pass straight through.
+/// every content file is keyed first (see the module doc), so a refusal comes before the
+/// caller creates any output. `fetch` goes to [`crate::mux::resolve_mux_key_map`], which
+/// asks it only when the pool holds several base keys and none opens a file's samples; a
+/// one-key pool is used as is. `false` (raw copy), CSS and clear discs pass through.
 pub fn whole_disc_reader<S: SectorSource>(
     disc: &crate::Disc,
     mut reader: S,
