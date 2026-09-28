@@ -34,6 +34,7 @@ fn hex20(s: &str) -> [u8; 20] {
 type Log = Arc<Mutex<Vec<Vec<u8>>>>;
 type Pred = fn(&[u8]) -> bool;
 type ReadFail = Box<dyn Fn(u32, u16, &[Vec<u8>]) -> Option<Error> + Send>;
+type HaltOn = Box<dyn Fn(&[u8]) -> bool + Send>;
 
 fn is_aacs_cdb(c: &[u8]) -> bool {
     matches!(c[0], 0xA3 | 0xA4 | 0xAD)
@@ -84,7 +85,7 @@ struct AkeMemTransport {
     profile: u16,
     fail_read: Option<ReadFail>,
     fault_on: Option<Pred>,
-    halt_on: Option<Box<dyn Fn(&[u8]) -> bool + Send>>,
+    halt_on: Option<HaltOn>,
     halt: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     mkb_pack: Option<Vec<u8>>,
 }
@@ -643,7 +644,7 @@ fn pre_ake_read_refusal_is_a_plain_scan_error() {
         }));
     });
     let r = Disc::scan(&mut rig.drive, &with_hc());
-    let e = r.err().expect("scan must fail");
+    let Err(e) = r else { panic!("scan must fail") };
     let s = e.scsi_sense().copied();
     assert!(
         s.is_some_and(|s| s.sense_key == 5 && s.asc == 0x21),
