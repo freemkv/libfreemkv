@@ -1257,6 +1257,59 @@ fn on_arrival_read_damage_neither_proves_nor_refutes() {
     );
 }
 
+// Unit `u` of file `i`: a garbage head that keeps both the CPI flag and the TS sync at byte 4
+// (~1 in 341 damaged heads), so the seed test cannot tell it from an intact unit.
+fn garble_keeping_sync(fx: &mut Fx, i: usize, u: u32) {
+    damage_seed(fx, i, u);
+    let at = fx.unit(i, u) as usize * 2048;
+    fx.img.image[at + 4] = 0x47;
+}
+
+/// KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed". A unit
+/// no held key opens while a held key opens its partners is damage: blanked and counted,
+/// never E7022, whether it would prove the key (a) or confirm a provisional one (b). (c) A
+/// wrong key opens no unit at all and still stops E7022. Partners come from the batch only.
+#[test]
+fn on_arrival_a_garbled_head_keeping_sync_is_blanked_never_e7022() {
+    // (a) the unit that would prove the key.
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| garble_keeping_sync(fx, 1, 0));
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    let mut want = fx.plain(fx.unit(1, 0), 4);
+    want[..ALIGNED_UNIT_LEN].fill(0);
+    assert_eq!(read(&mut r, &fx, 1, 0, 4).expect("damage, not E7022"), want);
+    assert_eq!(r.blanked_units(), 1);
+    assert_eq!(set.proof_cache().get(fx.file(1).0), Some(Proof::Proven(1)));
+
+    // (b) the unit that would confirm a provisional key (dead neighbours made it provisional).
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| garble_keeping_sync(fx, 1, 7));
+    let (b, n) = fx.file(1);
+    src.kill(b, fx.unit(1, 5));
+    src.kill(fx.unit(1, 6), b + n);
+    let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
+    read(&mut r, &fx, 1, 5, 1).expect("provisional under K2");
+    assert_eq!(set.proof_cache().get(b), Some(Proof::Provisional(1)));
+    src.heal();
+    let mut want = fx.plain(fx.unit(1, 7), 3);
+    want[..ALIGNED_UNIT_LEN].fill(0);
+    let got = read(&mut r, &fx, 1, 7, 3).expect("damage does not contradict a key");
+    assert_eq!(got, want);
+    assert_eq!(r.blanked_units(), 1);
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Proven(1)),
+        "unit 8 confirms"
+    );
+
+    // (c) no held key opens B: the garbled unit and its partners alike, so E7022.
+    let (fx, set, src) = lazy_b_damaged(&[K1], |fx| garble_keeping_sync(fx, 1, 0));
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 0, 4)),
+        E7022,
+        "a wrong key still stops"
+    );
+}
+
 /// Sweep, patch and image→ISO read through the whole-disc reader, one call per block. A
 /// cluster of damaged units (KS-4: "The first 16 bytes of each Aligned Unit is used as the
 /// seed") is blanked and counted wherever it falls, never E7013: multipass must not error.

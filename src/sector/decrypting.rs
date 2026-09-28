@@ -1175,4 +1175,72 @@ mod tests {
             "the lost-seed unit; the kept head is not blanked"
         );
     }
+
+    // An FMTS Even-phase segment of `units` units under `key`, the map pointing at `map_key`;
+    // units in `garbled` read back with a garbage head that kept the CPI flag and TS sync.
+    fn fmts_file_source(
+        units: u32,
+        garbled: &[u32],
+        key: [u8; 16],
+        map_key: [u8; 16],
+    ) -> DecryptingSectorSource<MisalignedFile> {
+        let mut data = Vec::new();
+        for u in 0..units {
+            let mut unit = encrypt_aacs_unit(&key);
+            if garbled.contains(&u) {
+                crate::test_util::damage_unit_seed(&mut unit);
+                unit[4] = 0x47;
+            }
+            data.extend(unit);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, map_key)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let end = FILE_LBA + units * 3;
+        let map = crate::decrypt::AacsKeyMap::from_ranges_phased(vec![(
+            FILE_LBA,
+            end,
+            0,
+            crate::decrypt::Phase::Even,
+        )]);
+        let mut dec =
+            DecryptingSectorSource::new(MisalignedFile(data), keys).with_key_map(Arc::new(map));
+        dec.set_unit_base(FILE_LBA);
+        dec
+    }
+
+    /// A lone FMTS unit that fails the correct-phase verify (a garbled head that kept its
+    /// sync) is damage: blanked and counted, never E7013, read with its segment or alone.
+    /// KS-3 [BD] §3.10.1: "A new CBC cipher chain is started for each Aligned Unit".
+    #[test]
+    fn a_lone_fmts_verify_failure_is_blanked_never_e7013() {
+        let key = [0x5Au8; 16];
+        let mut dec = fmts_file_source(4, &[2], key, key);
+        let buf = read_units(&mut dec, 0, 4).expect("damage, not E7013");
+        let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+        let fmt = crate::disc::ContentFormat::BdTs;
+        assert!(
+            crate::aacs::content::is_clean(&buf[..ul], fmt),
+            "unit 0 decrypts"
+        );
+        assert!(
+            buf[2 * ul..3 * ul].iter().all(|&b| b == 0),
+            "unit 2 blanked"
+        );
+        assert_eq!(dec.blanked_units(), 1);
+        let alone = read_units(&mut dec, 2, 1).expect("alone, still damage");
+        assert!(alone.iter().all(|&b| b == 0));
+        assert_eq!(dec.blanked_units(), 2);
+    }
+
+    /// A wrong FMTS key fails every unit it keys: that stops E7013, never a blank.
+    #[test]
+    fn a_wrong_fmts_key_still_stops_e7013() {
+        let mut dec = fmts_file_source(4, &[], [0x5Au8; 16], [0xCCu8; 16]);
+        assert!(matches!(
+            read_units(&mut dec, 0, 4),
+            Err(crate::error::Error::DecryptFailed)
+        ));
+    }
 }

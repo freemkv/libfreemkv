@@ -1785,22 +1785,25 @@ mod tests {
         );
     }
 
-    /// The correct-phase safety `is_clean` fires loud: an even unit whose mapped
-    /// key is wrong does NOT come clean → `DecryptFailed` (not silent corruption).
+    /// The correct-phase safety `is_clean` fires loud: even units whose mapped key is
+    /// wrong do NOT come clean → `DecryptFailed` (not silent corruption). A wrong key
+    /// fails every unit it keys (here both even ones); a lone failure is damage.
     #[test]
     fn mapped_phase_verify_fails_loud_on_wrong_key() {
         use crate::disc::ContentFormat;
         let ul = aacs::content::ALIGNED_UNIT_LEN;
         let usz = (ul / 2048) as u32;
-        let mut buf = vec![0u8; 2 * ul];
-        let mut u0 = clear_ts_unit();
-        aacs_encrypt_unit_for_test(&mut u0, &[0xAAu8; 16]); // encrypted under A
-        buf[..ul].copy_from_slice(&u0);
+        let mut buf = vec![0u8; 4 * ul];
+        for i in 0..4 {
+            let mut u = clear_ts_unit();
+            aacs_encrypt_unit_for_test(&mut u, &[0xAAu8; 16]); // encrypted under A
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xCCu8; 16])], // map slot points at the WRONG key
             format: ContentFormat::BdTs,
         };
-        let map = AacsKeyMap::from_ranges_phased(vec![(0, 2 * usz, 0, Phase::Even)]);
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 4 * usz, 0, Phase::Even)]);
         assert!(matches!(
             decrypt_sectors_mapped(&mut buf, &keys, 0, &map),
             Err(crate::error::Error::DecryptFailed)
