@@ -2011,6 +2011,7 @@ fn build_ps_pipeline(
         start_lba: 0,
         sector_count: capacity,
     };
+    // The crack's verdict (`None` = clear) is final: the pipeline never scans again (D3).
     let mut keys = crate::decrypt::DecryptKeys::None;
     // B2: CSS scrambles DVD-Video's 13818-1 packs only; an 11172-1 system stream (the
     // first pack's '0010') cannot be CSS, so it is never cracked.
@@ -2026,17 +2027,14 @@ fn build_ps_pipeline(
     if mpeg2 {
         // Design §4 step 2.1: "css::resolve_dvd_title_key(… raw = false, halt)". Even a
         // raw read cracks, so the head scan sees the streams; the mux itself stays raw.
-        let cracked = crate::css::resolve_dvd_title_key(
+        let cracked = crate::css::resolve_ps_file_title_key(
             &mut reader,
             &[extent],
-            &mut keys,
             PS_MUX_BATCH_SECTORS,
-            ContentFormat::MpegPs,
-            false,
             halt,
         );
         match cracked {
-            Ok(()) => {}
+            Ok(k) => keys = k,
             // `--raw` never hard-fails on scrambled-uncrackable: scan the ciphertext.
             Err(e)
                 if opts.raw
@@ -2094,7 +2092,9 @@ fn build_ps_pipeline(
         keys,
         PS_MUX_BATCH_SECTORS,
         ContentFormat::MpegPs,
-        opts.raw,
+        // The keys are resolved above: `true` skips build_iso_pipeline's own crack, which a
+        // clear file's `None` would otherwise re-run (D3). Descrambling follows `keys`.
+        true,
         halt.cloned(),
         None,
         None,

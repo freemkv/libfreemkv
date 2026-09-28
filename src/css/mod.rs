@@ -176,6 +176,37 @@ pub(crate) fn resolve_dvd_title_key(
     Ok(())
 }
 
+/// [`is_scrambled_pack`], and an unstuffed pack: the strict test the `mpg://` file crack scan
+/// uses, where a foreign stuffed pack's 0x14 is PES header, not scrambling bits (D3).
+pub(crate) fn is_scrambled_unstuffed_pack(sector: &[u8]) -> bool {
+    is_scrambled_pack(sector) && sector[0x0D] & 0x07 == 0
+}
+
+/// The `mpg://` file's crack (design §4 step 2.1, D3): raw = false, over the strict
+/// unstuffed-pack test; the resolved keys, `DecryptKeys::None` when the file is clear.
+pub(crate) fn resolve_ps_file_title_key(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    batch_sectors: u16,
+    halt: Option<&crate::halt::Halt>,
+) -> std::io::Result<crate::decrypt::DecryptKeys> {
+    match crack_key_scan_with(
+        reader,
+        extents,
+        batch_sectors,
+        halt,
+        is_scrambled_unstuffed_pack,
+    ) {
+        CrackOutcome::Cracked(state) => Ok(crate::decrypt::DecryptKeys::Css {
+            title_key: state.title_key,
+        }),
+        CrackOutcome::Unencrypted => Ok(crate::decrypt::DecryptKeys::None),
+        CrackOutcome::ScrambledUncracked => Err(crate::error::Error::CssKeyMissing.into()),
+        CrackOutcome::Unreadable(e) => Err(e.into()),
+        CrackOutcome::Halted => Err(crate::error::Error::Halted.into()),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Crack scans run on this thread (test-only: the mpg:// path must scan once).
@@ -190,6 +221,17 @@ fn crack_key_scan(
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
+) -> CrackOutcome {
+    crack_key_scan_with(reader, extents, batch_sectors, halt, is_scrambled_pack)
+}
+
+// The crack scan with its scramble test (`is_scrambled_unstuffed_pack` for mpg:// files).
+fn crack_key_scan_with(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    batch_sectors: u16,
+    halt: Option<&crate::halt::Halt>,
+    scrambled: fn(&[u8]) -> bool,
 ) -> CrackOutcome {
     #[cfg(test)]
     CRACK_SCANS.with(|n| n.set(n.get() + 1));
@@ -274,7 +316,7 @@ fn crack_key_scan(
                         // HARDENED pack-gated check: a clear stub sector with
                         // stray bits at 0x14 must NOT count as scramble evidence,
                         // or an unencrypted title falsely reports E7023.
-                        if is_scrambled_pack(sect) {
+                        if scrambled(sect) {
                             saw_scrambled = true;
                             if let Some(key) = keyless::crack_title_key(sect) {
                                 return CrackOutcome::Cracked(CssState {
@@ -427,16 +469,14 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// Requires BOTH the MPEG-PS pack-start code AND the 0x14 scramble bits
 /// ([`has_scramble_flag_bits`] alone is not enough), and excludes structural/nav `stream_id`s
 /// at 0x11 (`0xBB`/`0xBE`/`0xBF`) that CSS never scrambles so a decrypted HD-DVD's RDI nav
-/// packs can't falsely trip it. 0x11/0x14 hold the `stream_id`/PES flags only in an unstuffed
-/// 13818-1 pack (every DVD-Video VOB pack), so an 11172-1 or stuffed pack never counts.
+/// packs can't falsely trip it. An 11172-1 pack cannot be CSS; pack stuffing is not checked
+/// here (libdvdcss reads 0x14 regardless), only by the `mpg://` file scan.
 pub fn is_scrambled_pack(sector: &[u8]) -> bool {
     use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
-    // B2: only an unstuffed 13818-1 pack ('01', pack_stuffing_length 0) has the first
-    // PES's stream_id at 0x11 and its flags at 0x14; an 11172-1 pack cannot be CSS.
+    // B2: a 13818-1 pack ('01'); an 11172-1 pack's 0x11/0x14 are a packet length and PTS.
     sector.len() >= 2048
         && sector[0x00..0x04] == PACK_START
         && sector[0x04] >> 6 == 0b01
-        && sector[0x0D] & 0x07 == 0
         && !matches!(
             sector[0x11],
             SYSTEM_HEADER | PADDING_STREAM | PRIVATE_STREAM_2
@@ -691,7 +731,10 @@ mod tests {
             s[at..at + 4].copy_from_slice(&[0, 0, 1, 0xE0]);
             s[at + 4..at + 6].copy_from_slice(&0x07EBu16.to_be_bytes());
             s[at + 6] = 0x81;
-            assert!(!is_scrambled_pack(&s), "pack_stuffing_length {stuffing}");
+            assert!(
+                !is_scrambled_unstuffed_pack(&s),
+                "pack_stuffing_length {stuffing}"
+            );
         }
     }
 
