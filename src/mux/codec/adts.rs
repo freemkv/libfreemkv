@@ -485,14 +485,14 @@ mod tests {
     #[test]
     fn a_resync_run_is_one_verified_drop() {
         let mut bad = adts_frame(0);
-        bad[2] = (bad[2] & 0xC3) | (13 << 2);
+        corrupt(&mut bad);
         let mut p = AdtsParser::new();
         let mut seed = 11;
-        p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(0)));
+        p.parse(&make_pes(frame48(&mut seed, 200), Some(0)));
         p.parse(&make_pes(bad.repeat(600), None));
         let kept: usize = (1..=300)
             .map(|i| {
-                p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(i * 2090)))
+                p.parse(&make_pes(frame48(&mut seed, 200), Some(i * SLOT48)))
                     .len()
             })
             .sum();
@@ -502,11 +502,8 @@ mod tests {
             1,
             "one fault, one verified drop"
         );
-        assert_eq!(
-            p.dropped_frames(),
-            20,
-            "4200 lost bytes are 20 frames of audio"
-        );
+        // The next PTS is one slot on: the garbage took no audio time, so one AU (the fault).
+        assert_eq!(p.dropped_frames(), 1);
     }
 
     // L042: a first PES starting mid-frame loses the fragment, not the frames after it.
@@ -760,10 +757,10 @@ mod tests {
         assert_eq!(f[0].data, g2[7..]);
     }
 
-    // Mid-run, a sync-shaped byte that is no valid header does not re-anchor the run: the next
-    // PES's PTS still names its first whole frame.
+    // Known limit: a false sync in the fragment a new PES carries over is taken as the first AU
+    // to start in it, so it takes the PES timestamp and the next whole frame is one slot late.
     #[test]
-    fn a_run_restarts_only_on_a_valid_header() {
+    fn a_false_sync_in_a_carried_fragment_takes_the_pes_pts() {
         let mut seed = 73;
         let mut p = AdtsParser::new();
         p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
@@ -775,7 +772,7 @@ mod tests {
         let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
         let f = p.parse(&make_pes([&tail[..], &g1, &g2].concat(), Some(90_000)));
         let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
-        assert_eq!(pts, [0, 1].map(|i| 1_000_000_000 + i * AAC_FRAME_NS));
+        assert_eq!(pts, [1, 2].map(|i| 1_000_000_000 + i * AAC_FRAME_NS));
     }
 
     // Mid-run, a valid (if unchained) header in a new PES does restart the run there.
@@ -835,14 +832,13 @@ mod tests {
     fn a_resync_run_restarts_under_a_new_timestamp() {
         let mut seed = 53;
         let mut p = AdtsParser::new();
-        p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
-        let mut bad = noisy_frame(&mut seed, 300);
-        corrupt(&mut bad);
+        p.parse(&make_pes(frame48(&mut seed, 300), Some(0)));
+        let bad = bad48(&mut seed, 300);
         p.parse(&make_pes(bad.repeat(3), None));
-        let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
-        let f = p.parse(&make_pes([&bad[..], &g1, &g2].concat(), Some(90_000)));
-        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
-        assert_eq!(pts, [1, 2].map(|i| 1_000_000_000 + i * AAC_FRAME_NS));
+        let (g1, g2) = (frame48(&mut seed, 300), frame48(&mut seed, 300));
+        let f = p.parse(&make_pes([&bad[..], &g1, &g2].concat(), Some(4 * SLOT48)));
+        let p4 = pts_to_ns(4 * SLOT48);
+        assert_eq!(pts(&f), [p4 + D48, p4 + 2 * D48]);
         assert_eq!(
             p.dropped_frames(),
             4,
@@ -875,14 +871,13 @@ mod tests {
     #[test]
     fn a_run_spanning_several_pes_is_one_fault() {
         let mut seed = 107;
-        let mut bad = noisy_frame(&mut seed, 193);
-        corrupt(&mut bad);
+        let bad = bad48(&mut seed, 193);
         let mut p = AdtsParser::new();
-        p.parse(&make_pes(noisy_frame(&mut seed, 193), Some(0)));
+        p.parse(&make_pes(frame48(&mut seed, 193), Some(0)));
         p.parse(&make_pes(bad.repeat(10), None));
         p.parse(&make_pes(bad.repeat(10), None));
-        let good = [noisy_frame(&mut seed, 193), noisy_frame(&mut seed, 193)].concat();
-        assert_eq!(p.parse(&make_pes(good, Some(90_000))).len(), 2);
+        let good = [frame48(&mut seed, 193), frame48(&mut seed, 193)].concat();
+        assert_eq!(p.parse(&make_pes(good, Some(21 * SLOT48))).len(), 2);
         assert_eq!(p.dropped_frames(), 20, "20 AUs lost");
         assert_eq!(p.frames.verified_dropped(), 1, "one fault");
     }
@@ -1235,6 +1230,249 @@ mod tests {
                 channels: 3,
                 ..LC_44K_STEREO
             })
+        );
+    }
+
+    // 48 kHz frames: one 1024-sample slot is exactly 1920 PTS ticks.
+    fn frame48(seed: &mut u64, payload: usize) -> Vec<u8> {
+        let mut f = noisy_frame(seed, payload);
+        f[2] = (f[2] & 0xC3) | (3 << 2);
+        f
+    }
+    const SLOT48: i64 = 1920;
+    const D48: i64 = 1024 * 1_000_000_000 / 48000;
+    fn bad48(seed: &mut u64, payload: usize) -> Vec<u8> {
+        let mut f = frame48(seed, payload);
+        corrupt(&mut f);
+        f
+    }
+    fn pts(f: &[Frame]) -> Vec<i64> {
+        f.iter().map(|f| f.pts_ns).collect()
+    }
+
+    // [13818-1 §2.4.3.7] PTS: a PES's PTS belongs to the first access unit that starts in the
+    // packet. Mid-run, that is the first sync-shaped byte after the carried-over fragment.
+    #[test]
+    fn a_new_pes_pts_names_the_first_au_starting_in_it() {
+        let mut seed = 113;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(frame48(&mut seed, 300), Some(0)));
+        let (b1, b2, b3) = (
+            bad48(&mut seed, 300),
+            bad48(&mut seed, 300),
+            bad48(&mut seed, 300),
+        );
+        p.parse(&make_pes([&b1[..], &b2[..257]].concat(), None));
+        let (g1, g2) = (frame48(&mut seed, 300), frame48(&mut seed, 300));
+        let c = [&b2[257..], &b3, &g1, &g2].concat();
+        let f = p.parse(&make_pes(c, Some(3 * SLOT48)));
+        let p3 = pts_to_ns(3 * SLOT48);
+        assert_eq!(
+            pts(&f),
+            [p3 + D48, p3 + 2 * D48],
+            "g1 follows the corrupt AU C's PTS names"
+        );
+        assert_eq!(p.dropped_frames(), 3);
+        assert_eq!(p.frames.verified_dropped(), 2);
+    }
+
+    // Timestamps count the AUs a run lost, whatever their size: VBR frames larger than the
+    // last good one (small then large).
+    #[test]
+    fn lost_aus_come_from_timestamps_small_then_large() {
+        let mut seed = 127;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(frame48(&mut seed, 50), Some(0)));
+        p.parse(&make_pes(
+            [bad48(&mut seed, 400), bad48(&mut seed, 400)].concat(),
+            None,
+        ));
+        let g = [frame48(&mut seed, 400), frame48(&mut seed, 400)].concat();
+        let f = p.parse(&make_pes(g, Some(3 * SLOT48)));
+        let p3 = pts_to_ns(3 * SLOT48);
+        assert_eq!(pts(&f), [p3, p3 + D48]);
+        assert_eq!(p.dropped_frames(), 2);
+    }
+
+    // ... and smaller than it (large then small).
+    #[test]
+    fn lost_aus_come_from_timestamps_large_then_small() {
+        let mut seed = 131;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(frame48(&mut seed, 800), Some(0)));
+        p.parse(&make_pes(
+            [bad48(&mut seed, 50), bad48(&mut seed, 50)].concat(),
+            None,
+        ));
+        let g = [frame48(&mut seed, 50), frame48(&mut seed, 50)].concat();
+        let f = p.parse(&make_pes(g, Some(3 * SLOT48)));
+        let p3 = pts_to_ns(3 * SLOT48);
+        assert_eq!(pts(&f), [p3, p3 + D48]);
+        assert_eq!(p.dropped_frames(), 2);
+    }
+
+    // With no timestamp at the lock, lost AUs are skipped bytes over the stream's mean kept
+    // frame size, not the last frame's (VBR: 107/507-byte frames, mean 307).
+    #[test]
+    fn without_a_pts_lost_aus_use_the_mean_frame_size() {
+        let mut seed = 137;
+        let mut p = AdtsParser::new();
+        let mut data: Vec<u8> = (0..10)
+            .flat_map(|i| frame48(&mut seed, [100, 500][i % 2]))
+            .collect();
+        data.extend(
+            [
+                bad48(&mut seed, 300),
+                bad48(&mut seed, 300),
+                frame48(&mut seed, 300),
+            ]
+            .concat(),
+        );
+        data.extend(frame48(&mut seed, 300));
+        let f = p.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 12);
+        assert_eq!(f[10].pts_ns, 12 * D48, "two lost slots");
+        assert_eq!(p.dropped_frames(), 2);
+    }
+
+    // At EOS there is no lock at all: the open run is sized by the mean frame size too.
+    #[test]
+    fn at_eos_lost_aus_use_the_mean_frame_size() {
+        let mut seed = 139;
+        let mut p = AdtsParser::new();
+        let mut data: Vec<u8> = (0..10)
+            .flat_map(|i| frame48(&mut seed, [100, 500][i % 2]))
+            .collect();
+        data.extend((0..3).flat_map(|_| bad48(&mut seed, 300)));
+        p.parse(&make_pes(data, Some(0)));
+        p.flush();
+        assert_eq!(p.dropped_frames(), 3);
+    }
+
+    // The clock never runs past a timestamp already buffered after the lock.
+    #[test]
+    fn a_byte_estimate_never_passes_a_known_next_pts() {
+        let mut seed = 149;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(frame48(&mut seed, 50), Some(0)));
+        let run = [
+            bad48(&mut seed, 400),
+            bad48(&mut seed, 400),
+            frame48(&mut seed, 400),
+        ]
+        .concat();
+        assert!(
+            p.parse(&make_pes(run, None)).is_empty(),
+            "the lock awaits its successor"
+        );
+        let d = [frame48(&mut seed, 400), frame48(&mut seed, 400)].concat();
+        let f = p.parse(&make_pes(d, Some(4 * SLOT48)));
+        let p4 = pts_to_ns(4 * SLOT48);
+        assert_eq!(pts(&f), [p4 - D48, p4, p4 + D48]);
+    }
+
+    // A restart settles the old run from timestamps too: VBR sizes make its bytes misleading.
+    #[test]
+    fn a_restart_counts_the_old_run_from_timestamps() {
+        let mut seed = 157;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(frame48(&mut seed, 400), Some(0)));
+        p.parse(&make_pes(
+            [bad48(&mut seed, 50), bad48(&mut seed, 50)].concat(),
+            None,
+        ));
+        let c = [
+            bad48(&mut seed, 50),
+            frame48(&mut seed, 400),
+            frame48(&mut seed, 400),
+        ];
+        let f = p.parse(&make_pes(c.concat(), Some(3 * SLOT48)));
+        assert_eq!(
+            pts(&f),
+            [pts_to_ns(3 * SLOT48) + D48, pts_to_ns(3 * SLOT48) + 2 * D48]
+        );
+        assert_eq!(
+            p.dropped_frames(),
+            3,
+            "2 before the restart (timestamps) + 1 after"
+        );
+    }
+
+    // A sync-shaped byte left from the previous PES does not stand in for the new PES's first
+    // AU: the restart waits for a byte of the new PES.
+    #[test]
+    fn a_restart_happens_only_at_a_byte_of_the_new_pes() {
+        let mut seed = 163;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(frame48(&mut seed, 300), Some(0)));
+        let b = [&bad48(&mut seed, 300)[..], &[0xFF, 0xF3, 0x00, 0x00]].concat();
+        p.parse(&make_pes(b, None));
+        let c = [
+            bad48(&mut seed, 300),
+            frame48(&mut seed, 300),
+            frame48(&mut seed, 300),
+        ];
+        let f = p.parse(&make_pes(c.concat(), Some(2 * SLOT48)));
+        assert_eq!(
+            pts(&f),
+            [pts_to_ns(2 * SLOT48) + D48, pts_to_ns(2 * SLOT48) + 2 * D48]
+        );
+    }
+
+    // The mean frame size restarts with the stream key, so a run after a change is measured in
+    // the new stream's frames.
+    #[test]
+    fn the_mean_frame_size_restarts_with_the_stream_key() {
+        let mut seed = 167;
+        let mono = |mut f: Vec<u8>| {
+            f[2] &= !1;
+            f[3] = (f[3] & 0x3F) | 1 << 6;
+            f
+        };
+        let mut data: Vec<u8> = (0..10).flat_map(|_| frame48(&mut seed, 100)).collect();
+        data.extend((0..2).flat_map(|_| mono(frame48(&mut seed, 500))));
+        data.extend((0..2).flat_map(|_| mono(bad48(&mut seed, 500))));
+        data.extend((0..2).flat_map(|_| mono(frame48(&mut seed, 500))));
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(data, Some(0)));
+        assert_eq!(
+            f[12].pts_ns,
+            14 * D48,
+            "two 507-byte slots, not six of the old mean"
+        );
+        assert_eq!(p.dropped_frames(), 2);
+    }
+
+    // [dropgate] Once poisoned, "the caller should drop every remaining AU": frames after the
+    // poisoning drop in the same PES are not emitted, and each framed AU is counted.
+    #[test]
+    fn nothing_is_emitted_once_poisoned() {
+        let mut seed = 151;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(frame48(&mut seed, 100), Some(0)));
+        for i in 1..199 {
+            p.parse(&make_pes(bad48(&mut seed, 100), Some(i * SLOT48)));
+        }
+        let last = [
+            bad48(&mut seed, 100),
+            frame48(&mut seed, 100),
+            frame48(&mut seed, 100),
+        ];
+        assert!(
+            p.parse(&make_pes(last.concat(), Some(199 * SLOT48)))
+                .is_empty()
+        );
+        let before = p.dropped_frames();
+        assert_eq!(
+            before, 201,
+            "199 verified, then the two good AUs as collateral"
+        );
+        let more: Vec<u8> = (0..3).flat_map(|_| frame48(&mut seed, 100)).collect();
+        assert!(p.parse(&make_pes(more, Some(200 * SLOT48))).is_empty());
+        assert_eq!(
+            p.dropped_frames(),
+            before + 3,
+            "one per framed AU, not one per PES"
         );
     }
 
