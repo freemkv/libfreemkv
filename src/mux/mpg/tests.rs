@@ -946,6 +946,8 @@ fn a_slideshow_is_counted_not_refused() {
     let r = run(&fx);
     assert_replays(&r, &fx);
     assert!(r.counters.pstd.pts_gaps >= 1, "{:?}", r.counters);
+    // Design §2.3 "Cap: 1 s of IR timeline or 64 MiB": 5 s of audio behind the held I.
+    assert_eq!(r.counters.dts.hold_overflow, 1, "{:?}", r.counters);
     let dts: Vec<Option<u64>> = r
         .parsed
         .pes
