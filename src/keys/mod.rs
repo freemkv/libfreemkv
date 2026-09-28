@@ -352,7 +352,9 @@ impl ResolvedKeySet {
         }
     }
 
-    /// Whether the set keys everything `scope` decrypts.
+    /// Whether the set was resolved over `scope`: structural coverage only. It says nothing
+    /// about whether an AACS title is keyed: a set with no AACS key ([`none`](Self::none))
+    /// covers every scope. Use the engine's disc-aware check, or [`is_aacs`](Self::is_aacs).
     pub fn covers(&self, scope: &KeyScope) -> bool {
         if !self.0.aacs {
             return true;

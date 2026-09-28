@@ -184,15 +184,19 @@ impl Run<'_> {
                     self.km_needs_vid |= miss.contains(&KeyNode::NoVid);
                     let (path, outcome) = match (keys.is_empty(), matched) {
                         (false, _) => (vec![KeyNode::FoundUnitKeys], KeyOutcome::Resolved),
-                        // The source's own reason (e.g. `NoVid`), else a bare no-key.
+                        // The source's own reason (e.g. `NoVid`: `MissingVid`), else a bare no-key.
                         (true, true) => {
+                            let outcome = if miss.contains(&KeyNode::NoVid) {
+                                KeyOutcome::MissingVid
+                            } else {
+                                KeyOutcome::NoKey
+                            };
                             let why = if miss.is_empty() {
                                 vec![KeyNode::NoDerivableKey]
                             } else {
                                 miss
                             };
-                            let path = [vec![KeyNode::MatchedDisc], why].concat();
-                            (path, KeyOutcome::NoKey)
+                            ([vec![KeyNode::MatchedDisc], why].concat(), outcome)
                         }
                         (true, false) => (vec![KeyNode::NoEntry], KeyOutcome::NoKey),
                     };
@@ -219,8 +223,18 @@ impl Run<'_> {
                             waited_secs = waited.as_secs(),
                             "key source gave no answer; retrying"
                         );
-                        self.clock
-                            .sleep(wait.min(NO_ANSWER_WINDOW - waited), self.halt)?;
+                        let pause = wait.min(NO_ANSWER_WINDOW - waited);
+                        if let Err(stop) = self.clock.sleep(pause, self.halt) {
+                            // A request went out (unanswered): the trace keeps it (minor 1).
+                            self.trace.keys.push(KeyStep {
+                                who,
+                                path: Vec::new(),
+                                outcome: KeyOutcome::NoKey,
+                                matched_entry: None,
+                                store_entries: None,
+                            });
+                            return Err(stop);
+                        }
                         wait = (wait * 2).min(RETRY_CAP);
                         continue;
                     }
@@ -651,6 +665,9 @@ fn resolve_bd(
     for p in &mut ps {
         probe(reader, p, &segments, format, run.halt)?;
     }
+    // The first source failure of this run: a Missing piece whose sources were dead or
+    // failing is that failure, never E7022 (review B-1; E7034 must not stand for an outage).
+    let mut source_failure: Option<Error> = None;
     // Step 8: sample-independent sources, once, with the main title's samples.
     let needs_keys = ps
         .iter()
@@ -674,9 +691,15 @@ fn resolve_bd(
             if run.sources[i].answer_depends_on_samples() {
                 continue;
             }
-            if let Asked::Keys(k) = run.ask(i, &samples, false)? {
-                let who = run.sources[i].label();
-                run.add_keys(&k, who);
+            match run.ask(i, &samples, false)? {
+                Asked::Keys(k) => {
+                    let who = run.sources[i].label();
+                    run.add_keys(&k, who);
+                }
+                Asked::Failed(e) => {
+                    source_failure.get_or_insert(e);
+                }
+                Asked::Empty | Asked::Skipped => {}
             }
         }
     }
@@ -738,18 +761,21 @@ fn resolve_bd(
         }
     }
     apply_single_unit_rule(run, &mut ps, n_decl)?;
-    if let Some(i) = ps.iter().position(|p| p.verdict == Verdict::Missing) {
+    let missing = |p: &Piece| p.verdict == Verdict::Missing;
+    let failed = ps.iter().position(|p| missing(p) && p.failure.is_some());
+    if let Some(i) = failed.or_else(|| ps.iter().position(missing)) {
         let lba = ps[i].id();
         let err = ps[i]
             .failure
             .take()
+            .or(source_failure.take())
             .unwrap_or_else(|| missing_error(scope, disc));
         tracing::error!(target: "freemkv::keys", lba, code = err.code(), "a stream file in scope has no key; refusing before any output");
         return Err(err);
     }
     // KU §2.7: an empty pool on an encrypted scope is today's keyless case.
     if run.pool.is_empty() && ps.iter().any(|p| matches!(p.verdict, Verdict::Lazy(_))) {
-        return Err(missing_error(scope, disc));
+        return Err(source_failure.unwrap_or_else(|| missing_error(scope, disc)));
     }
     let mut inner = aacs_inner(run);
     // Step 6 (continued): forensic keys, reused from the seed or anchored once.

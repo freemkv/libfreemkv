@@ -236,7 +236,8 @@ pub struct UnitKeyResolution {
     /// When `matched` and `keys` is empty: the derivation nodes walked AFTER the
     /// implicit `MatchedDisc` node — e.g. `[NoVid]` (had a Media Key, no VID) or
     /// `[NoDerivableKey]` (no material at all). Empty ⇒ the caller supplies a
-    /// bare `NoDerivableKey`. Ignored unless `matched` and `keys` is empty.
+    /// bare `NoDerivableKey`. Rendered only when `matched` and `keys` is empty; a `NoVid`
+    /// beside partial keys still tells `resolve` the VID would help (KU J23).
     pub miss_path: Vec<crate::aacs::trace::KeyNode>,
     /// When `matched`: a booleans-and-lengths shape of the matched entry (no key
     /// material), for the application to log. `None` for a miss or a source kind
