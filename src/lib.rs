@@ -57,6 +57,8 @@ pub(crate) const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), en
 // Transport-only surface (`--features scsi`, `default-features = false`): `error`
 // = SCSI error variants, `scsi` = passthrough. Rip tree (heavy deps) gated below.
 pub mod error;
+// `halt` is std-only; ungated so the `loom` job (`--features scsi`) can model it.
+pub mod halt;
 pub mod scsi;
 pub mod spec;
 
@@ -87,8 +89,6 @@ pub mod drive;
 pub(crate) mod dvdnav;
 #[cfg(feature = "rip")]
 pub mod event;
-#[cfg(feature = "rip")]
-pub mod halt;
 #[cfg(all(test, feature = "rip"))]
 mod harness;
 #[cfg(feature = "rip")]

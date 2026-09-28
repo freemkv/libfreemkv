@@ -18,6 +18,11 @@ impl WritebackPipeline {
     pub(crate) fn note_progress(&mut self, _pos: u64) {}
     pub(crate) fn handle_seek(&mut self, _new_pos: u64) {}
     pub(crate) fn finalize(&mut self) {}
+    pub(crate) fn set_flush_progress(&mut self, _flush: crate::io::flush::FlushProgress) {}
+    // No bounded writeback here: the §2.10 flusher always runs.
+    pub(crate) fn needs_flusher(&self) -> bool {
+        true
+    }
     pub(crate) fn error(&self) -> Option<std::io::Error> {
         self.wb_errno.map(std::io::Error::from_raw_os_error)
     }

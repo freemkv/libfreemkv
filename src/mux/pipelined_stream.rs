@@ -64,6 +64,8 @@ pub struct PipelinedPesStream {
     au_asm: Vec<super::au_assembly::AuAssembler>,
     /// Bounds the header pump's wait for in-band codec configs (AAC).
     header_gate: super::header_gate::HeaderGate,
+    /// The op's stop token; a never-cancelled stand-in when there is none.
+    halt: crate::halt::Halt,
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
@@ -115,13 +117,28 @@ impl PipelinedPesStream {
             is_video,
             au_asm,
             header_gate: super::header_gate::HeaderGate::default(),
+            halt: crate::halt::Halt::new(),
         }
+    }
+
+    // The op's stop token: a cancel ends a blocked `read` with `Halted` (LP11).
+    pub(crate) fn with_halt(mut self, halt: Option<crate::halt::Halt>) -> Self {
+        self.halt = halt.unwrap_or_default();
+        self
     }
 
     // Pull one batch, parse it, enqueue frames on pending_frames. Ok(true) =
     // success, Ok(false) = clean EOF, Err = demuxer error.
     fn pump_one_batch(&mut self) -> io::Result<bool> {
-        match self.demux_rx.recv() {
+        let batch = match self
+            .halt
+            .recv_timeout(&self.demux_rx, std::time::Duration::MAX)
+        {
+            Ok(crate::halt::Recv::Item(b)) => Ok(b),
+            Ok(_) => Err(()),
+            Err(halted) => return Err(halted.into()),
+        };
+        match batch {
             Ok(DemuxBatch::Ts(packets)) => {
                 self.consume_ts(packets);
                 Ok(true)
@@ -131,7 +148,11 @@ impl PipelinedPesStream {
                 Ok(true)
             }
             Ok(DemuxBatch::Err(e)) => Err(e),
-            // Explicit clean-completion sentinel from the demux worker.
+            // Explicit clean-completion sentinel from the demux worker; a Stop that
+            // raced it is still `Halted`, never a truncated clean end (LP11).
+            Ok(DemuxBatch::Eof) if self.halt.is_cancelled() => {
+                Err(crate::error::Error::Halted.into())
+            }
             Ok(DemuxBatch::Eof) => Ok(false),
             // Channel disconnected WITHOUT an `Eof`/`Err` sentinel — the worker
             // panicked or was dropped mid-stream. Surface as an error so a parser/demux
@@ -519,6 +540,67 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    /// LP11: a reader blocked on the demux channel returns `Halted` once the op's
+    /// token is cancelled, with the demux worker still alive (no batch, no EOF).
+    #[test]
+    fn pipelined_stream_cancel_unblocks_reader() {
+        let (stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        let halt = crate::halt::Halt::new();
+        let mut stream = stream.with_halt(Some(halt.clone()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(stream.read().map(|f| f.is_some()));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        halt.cancel();
+        let r = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a cancel must unblock the reader within a slice");
+        let err = r.expect_err("a stop is not a frame or EOF");
+        assert!(crate::error::is_halt(&err), "{err}");
+        drop(tx);
+    }
+
+    /// LP11 on the highway: a Stop mid-stream through a real demux worker yields
+    /// `Err(Halted)`, never `Ok(None)` (a truncated container finalised as complete),
+    /// and an `Eof` that raced the Stop is `Halted` too.
+    #[test]
+    fn highway_stop_mid_stream_is_halted_never_eof() {
+        let halt = crate::halt::Halt::new();
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+        let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(8);
+        let (dt, rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), Some(halt.clone()), None, None)
+                .expect("spawn");
+        let mut stream = PipelinedPesStream::new(dt, rx, DiscTitle::empty(), vec![], vec![])
+            .with_halt(Some(halt.clone()));
+        pf_tx.send(Ok(vec![0u8; 188])).unwrap();
+        halt.cancel();
+        // The halted prefetcher closes its channel.
+        drop(pf_tx);
+        let mut outcome = None;
+        for _ in 0..16 {
+            match stream.read() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("a Stop must never read as a clean end of stream"),
+                Err(e) => {
+                    outcome = Some(e);
+                    break;
+                }
+            }
+        }
+        let e = outcome.expect("the Stop surfaced");
+        assert!(crate::error::is_halt(&e), "{e}");
+
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        let halt = crate::halt::Halt::new();
+        stream = stream.with_halt(Some(halt.clone()));
+        halt.cancel();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let e = stream.read().expect_err("an Eof after a Stop is not clean");
+        assert!(crate::error::is_halt(&e), "{e}");
     }
 
     // CLEAN EOF: explicit Eof sentinel → consumer returns Ok(None) and stays

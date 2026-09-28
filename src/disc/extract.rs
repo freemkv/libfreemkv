@@ -1885,6 +1885,8 @@ mod tests {
         // Expected plaintext after a correct per-extent decrypt.
         let mut expect = clear_aacs_unit(0xA1);
         expect.extend_from_slice(&clear_aacs_unit(0xB2));
+        // KS-5: a decrypted unit's CPI reads 00₂ (KU design §5.4).
+        let expect = crate::aacs::content::cpi_cleared(expect);
 
         // Lay the disc by hand: root dir with one BDMV/STREAM/00001.m2ts whose
         // ICB carries two Short ADs.

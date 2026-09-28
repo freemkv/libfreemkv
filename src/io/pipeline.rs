@@ -13,18 +13,32 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Sender, TrySendError, bounded};
 
 use crate::error::Error;
-use crate::halt::Halt;
+use crate::halt::join_within;
+use crate::halt::{Halt, Halted, Joined, Progress, SendOutcome, Stall, StallTimer, WAIT_SLICE};
 
-// Deadline for finish_with_halt's polling join.
+/// `finish_with_halt`'s join window (T7): this long with no consumer progress is
+/// `PipelineJoinTimeout`. A stall window, not a total (HR1).
 pub const JOIN_TIMEOUT_SECS: u64 = 600;
 
-// Grace period after a halt/timeout fires in finish_with_halt, to let a "nearly done" consumer
-// join cleanly.
+// Grace after a halt or a join stall (T8, D2): a RUNNING consumer gets this long, then a
+// CLOSING one waits in windows of it that re-arm on each progress bump.
 const FINISH_GRACE_SECS: u64 = 5;
 
-// Halt-check cadence for the send loop; aliases crate::halt::POLL_INTERVAL.
-use crate::halt::POLL_INTERVAL;
-const SEND_HALT_CHECK_INTERVAL: Duration = POLL_INTERVAL;
+// The join's stall window (T7) and grace (T8): a parameter so tests run in ms.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JoinTiming {
+    pub(crate) join_window: Duration,
+    pub(crate) grace: Duration,
+}
+
+impl Default for JoinTiming {
+    fn default() -> Self {
+        Self {
+            join_window: Duration::from_secs(JOIN_TIMEOUT_SECS),
+            grace: Duration::from_secs(FINISH_GRACE_SECS),
+        }
+    }
+}
 
 // Cached FREEMKV_DEBUG=1 lookup — called per item on the mux hot loop,
 // so the env lock is paid once, not per call.
@@ -69,28 +83,37 @@ mod state {
     pub const CLOSING: u8 = 2;
 }
 
-// Spin-polls handle.is_finished() for `grace` before accepting the thread leak, so a "nearly
-// done" consumer still joins cleanly.
+fn join_result<R>(r: thread::Result<Result<R, Error>>) -> Result<R, Error> {
+    r.unwrap_or_else(|payload| Err(consumer_panicked(payload)))
+}
+
+// The grace (T8, D2): wait `grace` for the consumer; then abandon a RUNNING one, but wait
+// for a CLOSING one while its `progress` moves, `grace` re-arming on each bump (a committed
+// close is never abandoned for being slow). Only a CLOSING stall leaks it.
 fn finish_with_grace<R: Send + 'static>(
     handle: thread::JoinHandle<Result<R, Error>>,
     state: &Arc<AtomicU8>,
+    progress: &Progress,
     grace: Duration,
     leak_err: Error,
+    on_poll: &mut dyn FnMut(),
 ) -> Result<R, Error> {
     // `None` = a grace past `Instant`'s range: wait unbounded.
-    let deadline = Instant::now().checked_add(grace);
-    while deadline.is_none_or(|d| Instant::now() < d) {
-        if handle.is_finished() {
-            return match handle.join() {
-                Ok(result) => result,
-                Err(payload) => Err(consumer_panicked(payload)),
-            };
+    let end = Instant::now().checked_add(grace);
+    let mut handle = handle;
+    loop {
+        let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
+        handle = match join_within(handle, left.min(WAIT_SLICE), None) {
+            Joined::Done(r) => return join_result(r),
+            Joined::Halted(h) | Joined::Pending(h) => h,
+        };
+        on_poll();
+        if end.is_some_and(|e| Instant::now() >= e) {
+            break;
         }
-        thread::sleep(POLL_INTERVAL);
     }
-    // Grace expired. CLAIM abandonment before dropping the handle so the leaked consumer
-    // skips further `apply`/`close()` once its wedged syscall returns. Compare-exchange,
-    // not a store: if it already committed to `close()`, wait for its result instead.
+    // CLAIM abandonment before dropping the handle so the leaked consumer skips further
+    // `apply`/`close()`. Compare-exchange, not a store: a consumer already CLOSING wins.
     if state
         .compare_exchange(
             state::RUNNING,
@@ -98,42 +121,38 @@ fn finish_with_grace<R: Send + 'static>(
             Ordering::AcqRel,
             Ordering::Acquire,
         )
-        .is_err()
+        .is_ok()
     {
         tracing::warn!(
             target: "freemkv::pipeline",
-            phase = "finish_with_halt_close_in_flight",
-            "pipeline consumer had already committed to finalising the output; \
-             waiting for it rather than reporting an unfinalised output"
+            phase = "finish_with_halt_grace_expired",
+            "pipeline consumer did not finish within {}s grace period; abandoning thread \
+             (output will not be finalised)",
+            grace.as_secs()
         );
-        let close_deadline = Instant::now().checked_add(grace);
-        while close_deadline.is_none_or(|d| Instant::now() < d) {
-            if handle.is_finished() {
-                return match handle.join() {
-                    Ok(result) => result,
-                    Err(payload) => Err(consumer_panicked(payload)),
-                };
-            }
-            thread::sleep(POLL_INTERVAL);
-        }
-        // Still finalising after a second grace window: leak and report the wedge.
-        // The output may end up finalised by the leaked thread — but that is now a
-        // wedged-`close()` case, not the check-then-finalise race.
+        // Dropping the handle detaches the thread until its kernel call returns.
         drop(handle);
         return Err(leak_err);
     }
     tracing::warn!(
         target: "freemkv::pipeline",
-        phase = "finish_with_halt_grace_expired",
-        "pipeline consumer did not finish within {}s grace period; abandoning thread \
-         (output will not be finalised)",
-        FINISH_GRACE_SECS
+        phase = "finish_with_halt_close_in_flight",
+        "pipeline consumer had already committed to finalising the output; \
+         waiting for it while it makes progress"
     );
-    // Dropping `handle` without joining detaches the thread; the consumer keeps
-    // running until its kernel call returns or the process exits. This is the
-    // intentional "leak" from `finish_with_halt`'s contract, bounded by `abandoned`.
-    drop(handle);
-    Err(leak_err)
+    let mut timer = StallTimer::new(grace, progress);
+    loop {
+        handle = match join_within(handle, WAIT_SLICE, None) {
+            Joined::Done(r) => return join_result(r),
+            Joined::Halted(h) | Joined::Pending(h) => h,
+        };
+        on_poll();
+        if timer.poll(progress) == Stall::Expired {
+            // A close with no progress for a whole window: leak and report the wedge.
+            drop(handle);
+            return Err(leak_err);
+        }
+    }
 }
 
 /// Default channel depth for callers without a specific reason to
@@ -209,6 +228,8 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     /// this; [`Pipeline::consumer_failed`] exposes it to plain
     /// [`Pipeline::send`] users.
     failed: Arc<AtomicBool>,
+    /// The consumer's forward progress (T7): shared with the sink's output.
+    progress: Progress,
 }
 
 impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
@@ -229,11 +250,24 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         depth: usize,
         sink: S,
     ) -> Result<Self, Error> {
+        Self::spawn_named_with_progress(name, depth, sink, Progress::new())
+    }
+
+    /// Like [`Pipeline::spawn_named`], with the consumer's [`Progress`] supplied, so the
+    /// sink's output (a [`WritebackFile`](crate::io::WritebackFile) given the same counter)
+    /// shares it (stop design §2.10 item 3).
+    pub fn spawn_named_with_progress<S: Sink<I, Output = R>>(
+        name: &str,
+        depth: usize,
+        sink: S,
+        progress: Progress,
+    ) -> Result<Self, Error> {
         let (tx, rx) = bounded::<I>(depth);
         let state = Arc::new(AtomicU8::new(state::RUNNING));
         let state_consumer = state.clone();
         let failed = Arc::new(AtomicBool::new(false));
         let failed_consumer = failed.clone();
+        let progress_consumer = progress.clone();
         let handle = thread::Builder::new()
             .name(name.into())
             .spawn(move || -> Result<R, Error> {
@@ -274,7 +308,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     // path.
                     let apply_start = debug.then(Instant::now);
 
-                    match sink.apply(item) {
+                    let applied = sink.apply(item);
+                    progress_consumer.bump();
+                    match applied {
                         Ok(Flow::Continue) => {}
                         Ok(Flow::Stop) => {
                             stopped = true;
@@ -369,7 +405,10 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                         {
                             return Err(Error::Halted);
                         }
-                        sink.close()
+                        progress_consumer.bump();
+                        let closed = sink.close();
+                        progress_consumer.bump();
+                        closed
                     }
                 }
             })
@@ -380,7 +419,14 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             handle,
             state,
             failed,
+            progress,
         })
+    }
+
+    /// The consumer's forward-progress counter: bumped per item applied and at
+    /// `close()` entry and exit; [`finish_with_halt`](Self::finish_with_halt) waits on it.
+    pub fn progress(&self) -> &Progress {
+        &self.progress
     }
 
     /// Whether the consumer's `apply` has already failed fatally.
@@ -461,75 +507,49 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         self.tx.try_send(item)
     }
 
-    /// Halt-aware bounded variant of [`Pipeline::send`]. Uses
-    /// [`crossbeam_channel::Sender::send_timeout`] so the producer
-    /// BLOCKS on consumer drain rather than polling, in slices of
-    /// [`SEND_HALT_CHECK_INTERVAL`].
+    /// Halt-aware bounded variant of [`Pipeline::send`]: blocks on consumer drain via
+    /// [`Halt::send_timeout`], observing a cancel or a failed consumer within one
+    /// [`WAIT_SLICE`].
     ///
     /// Returns `Ok(())` once the item lands in the channel, or `Err(item)` if the consumer
-    /// disconnected, the halt fired, or the deadline elapsed. NOT a `foo_with_X` variant of
-    /// [`Pipeline::send`] despite the name.
+    /// disconnected or failed, the halt fired, or the deadline elapsed. NOT a `foo_with_X`
+    /// variant of [`Pipeline::send`] despite the name.
     pub fn send_with_halt(&self, item: I, halt: &Halt, deadline: Duration) -> Result<(), I> {
-        use crossbeam_channel::SendTimeoutError;
         // `None` = a deadline past `Instant`'s range (e.g. `Duration::MAX`): unbounded.
         let end = Instant::now().checked_add(deadline);
         let mut pending = item;
         loop {
-            // The consumer's `apply` failed fatally: hand the item back now, since
-            // otherwise sends keep succeeding and the producer reads a whole UHD
-            // title before learning at `finish()` the write died on frame one.
+            // The consumer's `apply` failed fatally: hand the item back now, or the
+            // producer reads a whole title before `finish()` reports frame one's failure.
             if self.consumer_failed() {
-                if debug_enabled() {
-                    tracing::debug!(
-                        "Pipeline send_with_halt: consumer apply failed, returning item={}",
-                        std::any::type_name::<I>()
-                    );
-                }
-                return Err(pending);
+                return Err(self.refused(pending, "consumer apply failed"));
             }
-            // Pre-check the cheap exit conditions before parking.
-            if halt.is_cancelled() {
-                if debug_enabled() {
-                    tracing::debug!(
-                        "Pipeline send_with_halt: halt observed, returning item={}",
-                        std::any::type_name::<I>()
-                    );
-                }
-                return Err(pending);
-            }
-            let now = Instant::now();
-            if end.is_some_and(|end| now >= end) {
-                if debug_enabled() {
-                    tracing::debug!(
-                        "Pipeline send_with_halt: deadline elapsed, returning item={}",
-                        std::any::type_name::<I>()
-                    );
-                }
-                return Err(pending);
-            }
-            // Wait for space-available or halt-check tick, whichever is sooner.
-            // send_timeout is kernel-wakeup based: recv on a saturated channel
-            // signals this thread the moment a slot opens up.
-            let slice = end.map_or(SEND_HALT_CHECK_INTERVAL, |end| {
-                SEND_HALT_CHECK_INTERVAL.min(end.saturating_duration_since(now))
+            let slice = end.map_or(WAIT_SLICE, |end| {
+                end.saturating_duration_since(Instant::now())
+                    .min(WAIT_SLICE)
             });
-            match self.tx.send_timeout(pending, slice) {
-                Ok(()) => return Ok(()),
-                Err(SendTimeoutError::Timeout(returned)) => {
-                    pending = returned;
-                    // loop: re-check halt + deadline, then park again
+            match halt.send_timeout(&self.tx, pending, slice) {
+                Ok(SendOutcome::Sent) => return Ok(()),
+                Ok(SendOutcome::TimedOut(back)) if end.is_some_and(|e| Instant::now() >= e) => {
+                    return Err(self.refused(back, "deadline elapsed"));
                 }
-                Err(SendTimeoutError::Disconnected(returned)) => {
-                    if debug_enabled() {
-                        tracing::debug!(
-                            "Pipeline send_with_halt: consumer disconnected, item={}",
-                            std::any::type_name::<I>()
-                        );
-                    }
-                    return Err(returned);
+                Ok(SendOutcome::TimedOut(back)) => pending = back,
+                Ok(SendOutcome::Disconnected(back)) => {
+                    return Err(self.refused(back, "consumer disconnected"));
                 }
+                Err(Halted(back)) => return Err(self.refused(back, "halt observed")),
             }
         }
+    }
+
+    fn refused(&self, item: I, why: &str) -> I {
+        if debug_enabled() {
+            tracing::debug!(
+                "Pipeline send_with_halt: {why}, returning item={}",
+                std::any::type_name::<I>()
+            );
+        }
+        item
     }
 
     /// Drop the producer-side channel and wait for the consumer
@@ -544,6 +564,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             handle,
             state: _,
             failed: _,
+            progress: _,
         } = self;
         // Explicit drop, although the destructure already drops `tx`
         // at end-of-scope. Being explicit keeps the intent obvious.
@@ -554,53 +575,66 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         }
     }
 
-    /// Halt-aware, deadline-bounded variant of [`Pipeline::finish`].
-    /// Drops the producer-side channel, then polls
-    /// `JoinHandle::is_finished()`, checking the optional [`Halt`]
-    /// token and the [`JOIN_TIMEOUT_SECS`] deadline between slices.
+    /// Halt-aware, stall-bounded variant of [`Pipeline::finish`]. Drops the producer-side
+    /// channel, then waits for the consumer, checking the optional [`Halt`] every
+    /// [`WAIT_SLICE`]. It fails only after [`JOIN_TIMEOUT_SECS`] with no consumer progress
+    /// (see [`Pipeline::progress`]), never on total time.
     ///
     /// Returns `Ok(R)` on a clean exit, or one of [`Error::Halted`],
     /// [`Error::PipelineJoinTimeout`], [`Error::PipelineConsumerPanicked`] for the wedge cases
-    /// (leaks the consumer after a grace spin). NOT a `foo_with_X` variant of
-    /// [`Pipeline::finish`].
+    /// (leaks the consumer after the grace). NOT a `foo_with_X` variant of [`Pipeline::finish`].
     pub fn finish_with_halt(self, halt: Option<&Halt>) -> Result<R, Error> {
+        self.finish_with_halt_timing(halt, JoinTiming::default())
+    }
+
+    // `finish_with_halt_timing`, calling `on_poll` on every slice of the wait (the
+    // driver forwards flush progress from it, §4.5).
+    pub(crate) fn finish_with_halt_observed(
+        self,
+        halt: Option<&Halt>,
+        timing: JoinTiming,
+        on_poll: &mut dyn FnMut(),
+    ) -> Result<R, Error> {
         let Pipeline {
             tx,
             handle,
             state,
             failed: _,
+            progress,
         } = self;
         drop(tx);
-        let deadline = Instant::now() + Duration::from_secs(JOIN_TIMEOUT_SECS);
+        // T7: a stall window over the consumer's progress, not a total from here.
+        let mut timer = StallTimer::new(timing.join_window, &progress);
+        let mut handle = handle;
         loop {
-            if handle.is_finished() {
-                return match handle.join() {
-                    Ok(result) => result,
-                    Err(payload) => Err(consumer_panicked(payload)),
-                };
+            handle = match join_within(handle, WAIT_SLICE, halt) {
+                Joined::Done(r) => return join_result(r),
+                Joined::Halted(h) => {
+                    let (g, e) = (timing.grace, Error::Halted);
+                    return finish_with_grace(h, &state, &progress, g, e, on_poll);
+                }
+                Joined::Pending(h) => h,
+            };
+            on_poll();
+            if timer.poll(&progress) == Stall::Expired {
+                let (g, e) = (timing.grace, Error::PipelineJoinTimeout);
+                return finish_with_grace(handle, &state, &progress, g, e, on_poll);
             }
-            if let Some(h) = halt
-                && h.is_cancelled()
-            {
-                return finish_with_grace(
-                    handle,
-                    &state,
-                    Duration::from_secs(FINISH_GRACE_SECS),
-                    Error::Halted,
-                );
-            }
-            if Instant::now() >= deadline {
-                return finish_with_grace(
-                    handle,
-                    &state,
-                    Duration::from_secs(FINISH_GRACE_SECS),
-                    Error::PipelineJoinTimeout,
-                );
-            }
-            thread::sleep(POLL_INTERVAL);
         }
     }
+
+    // `finish_with_halt` with its windows as parameters (T7, T8).
+    pub(crate) fn finish_with_halt_timing(
+        self,
+        halt: Option<&Halt>,
+        timing: JoinTiming,
+    ) -> Result<R, Error> {
+        self.finish_with_halt_observed(halt, timing, &mut || {})
+    }
 }
+
+#[cfg(test)]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {
@@ -612,7 +646,14 @@ mod tests {
         let handle = thread::spawn(|| Ok::<u32, Error>(3));
         let state = Arc::new(AtomicU8::new(state::RUNNING));
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            finish_with_grace(handle, &state, Duration::MAX, Error::Halted)
+            finish_with_grace(
+                handle,
+                &state,
+                &Progress::new(),
+                Duration::MAX,
+                Error::Halted,
+                &mut || {},
+            )
         }));
         assert!(matches!(r.expect("must not panic"), Ok(3)));
     }
@@ -1607,7 +1648,14 @@ mod tests {
         });
 
         let grace = Duration::from_secs(1);
-        let res = finish_with_grace(handle, &state, grace, Error::Halted);
+        let res = finish_with_grace(
+            handle,
+            &state,
+            &Progress::new(),
+            grace,
+            Error::Halted,
+            &mut || {},
+        );
         assert!(
             matches!(res, Ok(42)),
             "a finalise already in flight must be waited for, not abandoned: {res:?}"

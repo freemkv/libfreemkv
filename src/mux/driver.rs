@@ -16,13 +16,14 @@ use crate::disc::DiscTitle;
 use crate::error::Error;
 use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::halt::Halt;
+use crate::io::FlushProgress;
 use crate::io::pipeline::{Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH};
 use crate::pes::{CountingStream, PesFrame, Stream};
 use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
 use crate::session::DiscSession;
 
 use super::resolve::{
-    InputOptions, StreamUrl, build_iso_pipeline, input_with_halt, output, parse_url,
+    InputOptions, StreamUrl, build_iso_pipeline, input_with_halt, output, output_with, parse_url,
     resolve_mux_key_map,
 };
 use super::videomap::{Medium, SourceInfo};
@@ -176,6 +177,10 @@ pub trait MuxEvents: Send + Sync + 'static {
     fn on_batch_size_changed(&self, _batch: u16, _reason: BatchSizeReason) {}
     /// A read error occurred at `lba`.
     fn on_read_error(&self, _lba: u32) {}
+    /// While the output is being flushed at the end (the driver waiting on a closing
+    /// consumer): more bytes became durable. One call per increase, at most 4 per second,
+    /// none while nothing moves, so silence means a stalled flush (stop design §4.5).
+    fn on_flush_progress(&self, _bytes_durable: u64, _bytes_total: u64) {}
 }
 
 /// A [`MuxEvents`] that ignores everything — test-only (production callers
@@ -525,17 +530,59 @@ fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::Eve
 
 // Join the write consumer after the pump. A send that hit its deadline means the
 // consumer is wedged, so the join gets only the short grace, not JOIN_TIMEOUT.
+// While it waits, each increase of the output's durable bytes is forwarded (§4.5, LP20).
 fn finish_pumped<I: Send + 'static, R: Send + 'static>(
     pipe: Pipeline<I, R>,
     halt: &Halt,
     send_timed_out: bool,
+    flush: &FlushProgress,
+    events: &dyn MuxEvents,
 ) -> Result<R, Error> {
-    if send_timed_out {
-        let wedged = Halt::new();
+    let mut fwd = FlushForwarder {
+        flush,
+        events,
+        last: flush.bytes_durable(),
+        last_call: None,
+    };
+    let timing = crate::io::pipeline::JoinTiming::default();
+    let wedged = Halt::new();
+    let halt = if send_timed_out {
         wedged.cancel();
-        return pipe.finish_with_halt(Some(&wedged));
+        &wedged
+    } else {
+        halt
+    };
+    let joined = pipe.finish_with_halt_observed(Some(halt), timing, &mut || fwd.poll(false));
+    fwd.poll(true);
+    joined
+}
+
+// At most one `on_flush_progress` per this long (4 Hz, §4.5).
+const FLUSH_PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+// Forwards increases of the output's durable bytes to `MuxEvents::on_flush_progress`:
+// one call per increase, rate-limited, none while nothing moves.
+struct FlushForwarder<'a> {
+    flush: &'a FlushProgress,
+    events: &'a dyn MuxEvents,
+    last: u64,
+    last_call: Option<std::time::Instant>,
+}
+
+impl FlushForwarder<'_> {
+    // `last_word`: the wait is over, so a pending increase goes out now.
+    fn poll(&mut self, last_word: bool) {
+        let done = self.flush.bytes_durable();
+        let due = self
+            .last_call
+            .is_none_or(|t| t.elapsed() >= FLUSH_PROGRESS_EVERY);
+        if done > self.last && (due || last_word) {
+            self.events
+                .on_flush_progress(done, self.flush.bytes_total());
+            self.last = done;
+            self.last_call = Some(std::time::Instant::now());
+        }
     }
-    pipe.finish_with_halt(Some(halt))
 }
 
 // Whether a finished mux counts as COMPLETED: interrupted, finalize_failed, or halt_cancelled
@@ -694,7 +741,13 @@ fn drive_mux(
     let num_streams = info.streams.len();
 
     // ── Open the sink, wrap in a byte counter, hand it to the write pipeline ──
-    let mut output_stream = output(dest_url, &out_title, source)?;
+    // The output file's flush counters share the consumer's progress (§2.10 item 3).
+    let flush = FlushProgress::new(crate::halt::Progress::new());
+    let out_flush = super::resolve::OutputFlush {
+        progress: &flush,
+        halt,
+    };
+    let mut output_stream = output_with(dest_url, &out_title, source, Some(out_flush))?;
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
@@ -733,12 +786,18 @@ fn drive_mux(
         bytes: bytes.clone(),
         late_configs: late_configs.clone(),
     };
-    let pipe = Pipeline::spawn_named("freemkv-mux-consumer", WRITE_PIPELINE_DEPTH, sink)
-        .map_err(std::io::Error::from)?;
+    let consumer_progress = flush.progress().clone();
+    let pipe = Pipeline::spawn_named_with_progress(
+        "freemkv-mux-consumer",
+        WRITE_PIPELINE_DEPTH,
+        sink,
+        consumer_progress,
+    )
+    .map_err(std::io::Error::from)?;
 
     // ── Frame pump ── Per-frame send deadline is a hard bound (autorip) or
     // effectively unbounded (CLI). Either way `send_with_halt` re-checks halt
-    // every `POLL_INTERVAL`, so Ctrl-C / `/api/stop` stays responsive.
+    // every `WAIT_SLICE`, so Ctrl-C / `/api/stop` stays responsive.
     let deadline = send_deadline;
     let mut interrupted = false;
     // A send refused with no halt and a healthy consumer ran out its deadline.
@@ -826,7 +885,7 @@ fn drive_mux(
     // the container. On halt/wedge this returns an error variant, translated
     // to `completed = false` rather than a hard failure.
     let (bytes_written, undelivered_streams, finalize_failed) =
-        match finish_pumped(pipe, halt, send_timed_out) {
+        match finish_pumped(pipe, halt, send_timed_out, &flush, events) {
             Ok(c) => (c.bytes, c.undelivered, false),
             Err(Error::Halted | Error::PipelineJoinTimeout) => {
                 (bytes.load(Ordering::Relaxed), Vec::new(), true)
@@ -1629,6 +1688,8 @@ mod tests {
     // Mutation: dropping `reader_event_fn` leaves `saw_read_total` false.
     #[test]
     fn mux_stream_iso_forwards_reader_progress_through_arc() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
         let pkt = bdts_data_packet(0x1100, true, &audio_pes(&es));
         let mut data = vec![0u8; 3 * 2048]; // 3 sectors = one AACS unit = 6144 bytes
@@ -2947,7 +3008,8 @@ mod tests {
         assert!(timed_out, "the stuck consumer trips the send deadline");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(finish_pumped(pipe, &halt, true).is_err());
+            let flush = FlushProgress::default();
+            let _ = tx.send(finish_pumped(pipe, &halt, true, &flush, &NoopEvents).is_err());
         });
         let failed = rx
             .recv_timeout(Duration::from_secs(30))
@@ -3026,5 +3088,75 @@ mod tests {
         assert!(out.completed);
         let back = MkvStream::open(std::fs::File::open(&dst).unwrap()).unwrap();
         assert_eq!(back.track_timing(0), timing);
+    }
+
+    // Records every `on_flush_progress` call.
+    #[derive(Default)]
+    struct FlushSpy(std::sync::Mutex<Vec<(u64, u64)>>);
+
+    impl MuxEvents for FlushSpy {
+        fn on_flush_progress(&self, durable: u64, total: u64) {
+            self.0.lock().unwrap().push((durable, total));
+        }
+    }
+
+    // `close()` makes `steps` bytes durable, `gap` apart, then idles `tail`.
+    struct FlushingClose {
+        flush: FlushProgress,
+        steps: u64,
+        gap: Duration,
+        tail: Duration,
+    }
+
+    impl Sink<u64> for FlushingClose {
+        type Output = ();
+        fn apply(&mut self, _: u64) -> Result<Flow, Error> {
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> Result<(), Error> {
+            self.flush.note_total(self.steps * 1000);
+            for _ in 0..self.steps {
+                std::thread::sleep(self.gap);
+                self.flush.add_durable(1000);
+            }
+            std::thread::sleep(self.tail);
+            Ok(())
+        }
+    }
+
+    fn finish_flushing(steps: u64, gap: Duration, tail: Duration) -> Vec<(u64, u64)> {
+        let flush = FlushProgress::new(crate::halt::Progress::new());
+        let sink = FlushingClose {
+            flush: flush.clone(),
+            steps,
+            gap,
+            tail,
+        };
+        let progress = flush.progress().clone();
+        let pipe = Pipeline::spawn_named_with_progress("t-flush", 4, sink, progress).unwrap();
+        let spy = FlushSpy::default();
+        finish_pumped(pipe, &Halt::new(), false, &flush, &spy).unwrap();
+        spy.0.into_inner().unwrap()
+    }
+
+    /// LP20 (§4.5): while the driver waits on a closing consumer, each increase of the
+    /// flusher's bytes produces one `on_flush_progress`, and none while it is static.
+    #[test]
+    fn finish_with_halt_forwards_flush_progress() {
+        let calls = finish_flushing(4, Duration::from_millis(300), Duration::from_millis(600));
+        let want: Vec<(u64, u64)> = (1..=4).map(|i| (i * 1000, 4000)).collect();
+        assert_eq!(
+            calls, want,
+            "one call per increase, none during the idle tail"
+        );
+    }
+
+    /// LP20, the rate limit: a burst of increases is forwarded at most 4 times a second,
+    /// and the last value still arrives.
+    #[test]
+    fn flush_progress_is_rate_limited_to_4hz() {
+        let calls = finish_flushing(20, Duration::from_millis(5), Duration::from_millis(600));
+        assert!(!calls.is_empty() && calls.len() <= 3, "{calls:?}");
+        assert_eq!(calls.last(), Some(&(20_000, 20_000)));
     }
 }

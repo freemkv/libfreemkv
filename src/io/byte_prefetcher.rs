@@ -4,10 +4,11 @@
 //! producer re-fills in place, for zero allocations and zero cross-thread frees in the hot
 //! loop. Works for any stream whose source is an `io::Read`, not just a `SectorSource`.
 
-use crate::halt::{Halt, POLL_INTERVAL};
-use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
+use crate::halt::{Halt, Recv, SendOutcome};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::io::Read;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Items flowing through the forward channel.
 pub type Batch = std::io::Result<Vec<u8>>;
@@ -32,8 +33,8 @@ pub const DEFAULT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Drop blocks until the producer exits. For a prompt exit, drop the
 /// forward receiver and recycle sender first (channel disconnection)
-/// or cancel the [`Halt`] passed to [`BytePrefetcher::new`], polled
-/// at [`POLL_INTERVAL`] granularity even while parked on a channel op.
+/// or cancel the [`Halt`] passed to [`BytePrefetcher::new`], observed
+/// within one [`WAIT_SLICE`](crate::halt::WAIT_SLICE) even while parked on a channel op.
 pub struct PrefetchShell {
     producer: Option<JoinHandle<()>>,
 }
@@ -48,8 +49,11 @@ impl Drop for PrefetchShell {
 
 /// Spawned byte prefetcher. Drop joins the producer thread.
 pub struct BytePrefetcher {
-    rx: Option<Receiver<Batch>>,
-    recycle_tx: Option<Sender<Vec<u8>>>,
+    // Non-`Option`: `into_channels`/`Drop` swap in a disconnected stand-in (dead-channel
+    // `mem::replace`, as `sector::PrefetchedSectorSource` does), so a missing `rx` can
+    // never read as a silent, truncating clean EOF.
+    rx: Receiver<Batch>,
+    recycle_tx: Sender<Vec<u8>>,
     producer: Option<JoinHandle<()>>,
 }
 
@@ -76,6 +80,8 @@ impl BytePrefetcher {
             let _ = recycle_tx.send(vec![0u8; chunk_bytes]);
         }
 
+        // A never-cancelled stand-in keeps one halt-aware code path without a token.
+        let wait = halt.unwrap_or_default();
         let producer = std::thread::Builder::new()
             .name("freemkv-byte-prefetch".into())
             .spawn(move || {
@@ -83,41 +89,23 @@ impl BytePrefetcher {
                 // but a panic sends an error sentinel first so demux gets a typed error
                 // instead of finalizing a truncated mux as success.
                 let body = std::panic::AssertUnwindSafe(|| {
-                    let cancelled = || halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false);
                     // Liveness heartbeat: a stalled consumer or wedged reader shows up
                     // as the beat going silent. Total is unknown, so `pos` is cumulative.
                     let mut hb = crate::progress::Heartbeat::new("byte_prefetch");
                     let mut produced_bytes: u64 = 0;
                     loop {
                         hb.tick(produced_bytes, 0);
-                        if cancelled() {
+                        // Halt-aware: a cancel does not disconnect the channel, so a
+                        // plain recv() would never re-reach the check. Disconnected =
+                        // the consumer dropped both channels.
+                        let Ok(Recv::Item(mut buf)) = wait.recv_timeout(&recycle_rx, Duration::MAX)
+                        else {
                             return;
-                        }
-                        // Re-poll halt every POLL_INTERVAL: a pure-AtomicBool Halt does
-                        // not disconnect the channel, so a blocking recv() would never
-                        // re-reach the cancel check.
-                        let mut buf = loop {
-                            match recycle_rx.recv_timeout(POLL_INTERVAL) {
-                                Ok(b) => break b,
-                                Err(RecvTimeoutError::Timeout) => {
-                                    if cancelled() {
-                                        return;
-                                    }
-                                }
-                                // Consumer dropped both channels.
-                                Err(RecvTimeoutError::Disconnected) => return,
-                            }
                         };
-                        // Regrow to chunk_bytes: a prior short read truncated len to
-                        // n < chunk_bytes. No realloc — capacity was fixed at
-                        // construction and never shrinks.
-                        if buf.len() < chunk_bytes {
-                            buf.resize(chunk_bytes, 0);
-                        } else {
-                            // SAFETY: capacity is at least chunk_bytes
-                            // after construction.
-                            unsafe { buf.set_len(chunk_bytes) };
-                        }
+                        // Regrow to chunk_bytes (a short read may have truncated len): sound
+                        // resize, was `unsafe set_len` guarded only by capacity (GHSA-j8ww-f5fg-9pmh
+                        // in `sector::prefetched`). No realloc; a no-op if len is already there.
+                        buf.resize(chunk_bytes, 0);
                         // Read up to one full chunk. Short reads are
                         // valid and common — pipe `truncate` so the
                         // consumer sees only the bytes that arrived.
@@ -125,7 +113,7 @@ impl BytePrefetcher {
                             Ok(0) => return, // EOF — drop tx, consumer sees RecvError
                             Ok(n) => n,
                             Err(e) => {
-                                let _ = tx.send(Err(e));
+                                let _ = wait.send_timeout(&tx, Err(e), Duration::MAX);
                                 return;
                             }
                         };
@@ -134,19 +122,9 @@ impl BytePrefetcher {
                         // Hand off the filled buffer, re-polling halt on
                         // each timeout slice so a cancel can interrupt a
                         // producer parked on a saturated forward channel.
-                        let mut pending = Ok(buf);
-                        loop {
-                            match tx.send_timeout(pending, POLL_INTERVAL) {
-                                Ok(()) => break,
-                                Err(SendTimeoutError::Timeout(returned)) => {
-                                    if cancelled() {
-                                        return;
-                                    }
-                                    pending = returned;
-                                }
-                                // Consumer dropped.
-                                Err(SendTimeoutError::Disconnected(_)) => return,
-                            }
+                        let sent = wait.send_timeout(&tx, Ok(buf), Duration::MAX);
+                        if !matches!(sent, Ok(SendOutcome::Sent)) {
+                            return; // consumer dropped, or stopped
                         }
                     }
                 });
@@ -154,13 +132,14 @@ impl BytePrefetcher {
                     // Producer panicked mid-stream — surface a typed terminal
                     // error so the demux thread does NOT read the dropped channel
                     // as a clean EOF and truncate output.
-                    let _ = tx.send(Err(crate::error::Error::DemuxThreadPanicked.into()));
+                    let e = crate::error::Error::DemuxThreadPanicked.into();
+                    let _ = wait.send_timeout(&tx, Err(e), Duration::MAX);
                 }
             })?;
 
         Ok(Self {
-            rx: Some(rx),
-            recycle_tx: Some(recycle_tx),
+            rx,
+            recycle_tx,
             producer: Some(producer),
         })
     }
@@ -169,20 +148,18 @@ impl BytePrefetcher {
     /// caller (typically [`crate::mux::demux_thread::DemuxThread`])
     /// drains `rx`, runs the demuxer in place on each filled buffer,
     /// and recycles back through `recycle_tx`.
-    pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
-        // MOVE the fields out, never clone: the pre-1.0.0 impl cloned + `mem::forget`-ed
-        // `self`, leaking endpoints that defeated disconnection shutdown (producer join
-        // hung forever). `ManuallyDrop` + `ptr::read` moves fields out cleanly instead.
-        let me = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `me` is `ManuallyDrop`, so none of these fields are dropped by `me`.
-        // Each `ptr::read` is one bitwise move, read exactly once — no double-frees.
-        let producer = unsafe { std::ptr::read(&me.producer) };
-        // SAFETY: `rx` and `recycle_tx` are always `Some` here —
-        // `into_channels` is the only way to consume a live
-        // `BytePrefetcher`; `Drop::drop` is suppressed by `ManuallyDrop`.
-        let rx = unsafe { std::ptr::read(&me.rx) }.expect("rx always Some before drop");
-        let recycle =
-            unsafe { std::ptr::read(&me.recycle_tx) }.expect("recycle_tx always Some before drop");
+    pub fn into_channels(mut self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
+        // Same dead-channel swap as `Drop for BytePrefetcher` below: `self` is left
+        // holding only disconnected placeholders — no `unsafe`, no double-drop, and (being
+        // non-`Option`) no fallback branch that could hand back a dead `rx`.
+        let (dead_tx, dead_rx) = bounded::<Batch>(0);
+        drop(dead_tx);
+        let rx = std::mem::replace(&mut self.rx, dead_rx);
+        let (dead_send, dead_recv) = bounded::<Vec<u8>>(0);
+        drop(dead_recv);
+        let recycle = std::mem::replace(&mut self.recycle_tx, dead_send);
+        let producer = self.producer.take();
+        // `self` drops here: dead endpoints no-op, `producer` is `None` (no join).
         (rx, recycle, PrefetchShell { producer })
     }
 }
@@ -192,8 +169,12 @@ impl Drop for BytePrefetcher {
         // Drop channel endpoints BEFORE joining so the producer observes Disconnected
         // (send/recv) and exits promptly. Otherwise a non-EOF source fills the forward
         // channel and spins in send_timeout forever since rx is never drained.
-        drop(self.rx.take());
-        drop(self.recycle_tx.take());
+        let (dead_tx, dead_rx) = bounded::<Batch>(0);
+        drop(dead_tx);
+        drop(std::mem::replace(&mut self.rx, dead_rx));
+        let (dead_send, dead_recv) = bounded::<Vec<u8>>(0);
+        drop(dead_recv);
+        drop(std::mem::replace(&mut self.recycle_tx, dead_send));
         if let Some(h) = self.producer.take() {
             let _ = h.join();
         }
@@ -264,6 +245,36 @@ mod tests {
             drop(recycle_tx);
             // Joining the producer must not hang.
             drop(shell);
+        });
+    }
+
+    // L106 (safe `Option::take` rewrite, no `unsafe`): `shell` drop must join within the
+    // bound below (a leaked handle hangs it). No-double-drop is structural: an explicit
+    // second `Drop::drop` call is a compile error (E0040), so it can't be attempted.
+    #[test]
+    fn into_channels_then_drop_leaks_nothing() {
+        within(10, || {
+            let pf = BytePrefetcher::new(EndlessReader, 4096, None).expect("spawn");
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell); // joins: a leaked/duplicated handle would hang this within(10, ..).
+        });
+    }
+
+    // Channels handed back by `into_channels` must still carry real bytes end-to-end — the
+    // safe rewrite must not have handed back the dead placeholder channels by mistake.
+    #[test]
+    fn into_channels_channels_still_deliver_bytes() {
+        within(10, || {
+            let src = vec![7u8; 10_000];
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 4096, None).expect("spawn");
+            let (out, err) = drain_to_vec(pf);
+            assert!(err.is_none(), "no read error expected: {err:?}");
+            assert_eq!(
+                out, src,
+                "all bytes delivered, byte-identical, after into_channels"
+            );
         });
     }
 
@@ -418,6 +429,22 @@ mod tests {
         });
     }
 
+    // Exercises the regrow-fill's now-plain `resize` when len is already chunk_bytes (was
+    // `unsafe set_len`): three full 8-byte chunks back to back, no short read in between.
+    #[test]
+    fn full_chunks_back_to_back_exercise_the_no_shrink_resize_path() {
+        within(10, || {
+            let src = vec![0x5Cu8; 24]; // 3 whole 8-byte chunks, source ends exactly on a chunk
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none());
+            assert_eq!(
+                got, src,
+                "back-to-back full-size chunks must round-trip exactly"
+            );
+        });
+    }
+
     // Recycle-buffer reuse must not leak stale bytes between chunks of different lengths;
     // source 8×0xAA + 3×0xBB, chunk_bytes=8.
     #[test]
@@ -482,5 +509,25 @@ mod tests {
             // Drop without consuming — the old Drop deadlocked here.
             drop(pf);
         });
+    }
+
+    /// LP9 (×2, §2.1 "Unbounded Drop joins stay plain joins"): after a cancel, dropping
+    /// the prefetcher, or its shell with both channel ends still held, returns within
+    /// 1 s. Guard.
+    #[test]
+    fn byte_prefetcher_drop_after_cancel_returns() {
+        let halt = Halt::new();
+        let pf = BytePrefetcher::new(EndlessReader, 4096, Some(halt.clone())).expect("spawn");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        halt.cancel();
+        within(1, move || drop(pf));
+
+        let halt = Halt::new();
+        let pf = BytePrefetcher::new(EndlessReader, 4096, Some(halt.clone())).expect("spawn");
+        let (rx, recycle_tx, shell) = pf.into_channels();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        halt.cancel();
+        within(1, move || drop(shell));
+        drop((rx, recycle_tx));
     }
 }

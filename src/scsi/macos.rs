@@ -9,6 +9,7 @@
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
+use crate::halt::Halt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,6 +19,10 @@ const K_SENSE_DATA_SIZE: usize = 32;
 /// the clamp Linux applies. Used to bound the `cdb_len` passed to the
 /// shim so a pathological >255-byte slice can't wrap a `u8`.
 const K_MAX_CDB_SIZE: usize = 16;
+
+// The timeout a caller's `timeout_ms == 0` gets: Linux SG_IO's default, include/linux/blkdev.h
+// "#define BLK_DEFAULT_SG_TIMEOUT (60 * HZ)". On macOS 0 would mean "Wait Forever".
+const ZERO_TIMEOUT_MS: u32 = 60_000;
 
 // The C shim uses a single global IOKit handle, so only one MacScsiTransport may exist at a
 // time — a second open() would race the shared handle with the first drop().
@@ -32,8 +37,11 @@ struct ShimDriveInfo {
     firmware: [u8; 16],
 }
 
+// shim_open_exclusive's result when the cancel byte was set (`SHIM_CANCELLED` in the shim).
+const SHIM_CANCELLED: i32 = -6;
+
 unsafe extern "C" {
-    fn shim_open_exclusive(bsd_name: *const u8) -> i32;
+    fn shim_open_exclusive(bsd_name: *const u8, cancel: *const u8) -> i32;
     fn shim_close();
     fn shim_execute(
         cdb: *const u8,
@@ -45,6 +53,7 @@ unsafe extern "C" {
         sense_len: u32,
         task_status_out: *mut u8,
         transfer_count: *mut u64,
+        timeout_ms: u32,
     ) -> i32;
     fn shim_list_drives(out: *mut ShimDriveInfo, max_entries: i32) -> i32;
     fn shim_media_present(bsd_name: *const u8) -> i32;
@@ -63,6 +72,11 @@ fn bsd_name_of(device: &Path) -> Result<&str> {
         .unwrap_or(dev_str))
 }
 
+// The token's flag as the shim's `const volatile uint8_t *` cancel byte; valid while `halt` is.
+fn cancel_byte(halt: &Halt) -> *const u8 {
+    halt.as_arc().as_ptr().cast_const().cast()
+}
+
 fn device_path_for_selector(selector: &str) -> String {
     if selector.starts_with("ioreg:") {
         selector.to_string()
@@ -75,6 +89,8 @@ fn device_path_for_selector(selector: &str) -> String {
 // variant, pulled out standalone so the mapping can be unit-tested.
 fn map_shim_open_error(rc: i32, path: String) -> Error {
     match rc {
+        // The caller's token was cancelled during an open wait (§2.9 M2).
+        SHIM_CANCELLED => Error::Halted,
         // -2/-3/-4: IOCreatePlugInInterfaceForService /
         // QueryInterface MMCDeviceInterface /
         // GetSCSITaskDeviceInterface failed.
@@ -89,12 +105,16 @@ fn map_shim_open_error(rc: i32, path: String) -> Error {
 
 pub struct MacScsiTransport {
     _bsd_name: String,
+    /// The last command's sense-key specific progress indication (§2.11).
+    last_progress: Option<u16>,
 }
 
 unsafe impl Send for MacScsiTransport {}
 
 impl MacScsiTransport {
-    pub fn open(device: &Path) -> Result<Self> {
+    /// Open `device`; every wait inside the shim's open ends within a slice of `halt`
+    /// being cancelled, and a cancelled open is [`Error::Halted`] (stop design §2.9 M2).
+    pub fn open(device: &Path, halt: &Halt) -> Result<Self> {
         let bsd_name = bsd_name_of(device)?;
 
         // Enforce single-instance: the shim's global handle can't back two
@@ -109,7 +129,7 @@ impl MacScsiTransport {
         let mut bsd_c = bsd_name.as_bytes().to_vec();
         bsd_c.push(0);
 
-        let rc = unsafe { shim_open_exclusive(bsd_c.as_ptr()) };
+        let rc = unsafe { shim_open_exclusive(bsd_c.as_ptr(), cancel_byte(halt)) };
         if rc != 0 {
             // Release the single-instance lock taken by the OPEN.swap above;
             // a failed open must not leave it held or every later open wedges.
@@ -119,6 +139,7 @@ impl MacScsiTransport {
 
         Ok(MacScsiTransport {
             _bsd_name: bsd_name.to_string(),
+            last_progress: None,
         })
     }
 }
@@ -131,16 +152,18 @@ impl Drop for MacScsiTransport {
 }
 
 impl ScsiTransport for MacScsiTransport {
+    fn last_sense_progress(&self) -> Option<u16> {
+        self.last_progress
+    }
+
     fn execute(
         &mut self,
         cdb: &[u8],
         direction: DataDirection,
         data: &mut [u8],
-        // NOTE: timeout_ms is ignored on macOS — the C shim hardcodes a
-        // fixed 30s `SetTimeoutDuration`, tracked separately since macOS
-        // is dev/test-only per project rules.
-        _timeout_ms: u32,
+        timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        self.last_progress = None;
         // Match the Linux guard: a >=4 GiB buffer would wrap when cast to
         // u32 for the shim, producing a short transfer reported as success
         // with the wrong byte count.
@@ -177,6 +200,12 @@ impl ScsiTransport for MacScsiTransport {
                 K_SENSE_DATA_SIZE as u32,
                 &mut task_status,
                 &mut transfer_count,
+                // SCSITaskLib.h SetTimeoutDuration: "A value of zero is equivalent to "Wait Forever"".
+                if timeout_ms == 0 {
+                    ZERO_TIMEOUT_MS
+                } else {
+                    timeout_ms
+                },
             )
         };
 
@@ -199,6 +228,7 @@ impl ScsiTransport for MacScsiTransport {
 
         if task_status != 0 {
             let parsed = super::parse_sense(&sense, K_SENSE_DATA_SIZE as u8);
+            self.last_progress = super::parse_sense_progress(&sense, K_SENSE_DATA_SIZE as u8);
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),
                 status: task_status,
@@ -275,12 +305,25 @@ pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
 #[cfg(test)]
 mod tests {
     use super::{
-        K_MAX_CDB_SIZE, OPEN, ShimDriveInfo, bsd_name_of, cstr_to_str, device_path_for_selector,
-        disc_presence, drive_info_from_shim, map_shim_open_error,
+        K_MAX_CDB_SIZE, MacScsiTransport, OPEN, SHIM_CANCELLED, ShimDriveInfo, bsd_name_of,
+        cancel_byte, cstr_to_str, device_path_for_selector, disc_presence, drive_info_from_shim,
+        map_shim_open_error,
     };
     use crate::error::Error;
+    use crate::halt::{Halt, WAIT_SLICE};
+    use crate::scsi::{DataDirection, ScsiTransport};
     use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    // Serializes the tests that read or take the process-global OPEN bit and shim handle.
+    static SHIM_GLOBALS: Mutex<()> = Mutex::new(());
+
+    fn shim_globals() -> std::sync::MutexGuard<'static, ()> {
+        SHIM_GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn bsd_name_strips_dev_and_raw_dev_prefixes() {
@@ -382,6 +425,7 @@ mod tests {
     #[test]
     fn presence_probe_does_not_open_a_transport() {
         let path = Path::new("/dev/freemkv-no-such-device");
+        let _globals = shim_globals();
         // Snapshot rather than assume `false`: OPEN is a process-global bit any
         // concurrent test's live transport can hold, so compare the delta — it
         // scopes the check to this call, can't flake, still catches a held lock.
@@ -427,7 +471,7 @@ mod tests {
             }
             other => panic!("expected DeviceLocked, got {other:?}"),
         }
-        for rc in [-1, -6, i32::MIN] {
+        for rc in [-1, -7, i32::MIN] {
             match map_shim_open_error(rc, "disk4".into()) {
                 Error::DeviceNotFound { path } => assert_eq!(path, "disk4"),
                 other => panic!("rc={rc}: expected DeviceNotFound, got {other:?}"),
@@ -461,5 +505,266 @@ mod tests {
             Some(K_MAX_CDB_SIZE as u8),
             "CDB of exactly K_MAX_CDB_SIZE should not trigger guard"
         );
+    }
+
+    // ── shim_selftest (stop design §5.1 LM1; qa release-tests on macOS, D6) ──
+
+    unsafe extern "C" {
+        fn shim_selftest_wait_slice_ms() -> i32;
+        fn shim_selftest_sleep(ms: u32, cancel: *const u8) -> i32;
+        fn shim_selftest_sem_wait(ms: u32, signalled: i32, cancel: *const u8) -> i32;
+        fn shim_selftest_run_and_reap(
+            path: *const u8,
+            arg: *const u8,
+            budget_ms: u32,
+            cancel: *const u8,
+            pid_out: *mut i32,
+        ) -> i32;
+        fn shim_selftest_reaped(pid: i32) -> i32;
+        fn shim_selftest_install_fake_device() -> i32;
+        fn shim_selftest_last_timeout_ms() -> u32;
+    }
+
+    /// A wait that is never cancelled would run this long; every cancelled wait must end far sooner.
+    const LONG_MS: u32 = 10_000;
+    /// Cancel lands this long after the wait starts.
+    const CANCEL_AFTER: Duration = Duration::from_millis(50);
+    /// A cancelled wait returns within this of the cancel: a few 20 ms slices, CI-robust (§3.2).
+    const WAKE_BOUND: Duration = Duration::from_millis(150);
+
+    // Run `wait` against a token cancelled CANCEL_AFTER in; returns its result and the time
+    // from the cancel to its return.
+    fn cancel_during(wait: impl FnOnce(*const u8) -> i32) -> (i32, Duration) {
+        let halt = Halt::new();
+        let canceller = {
+            let halt = halt.clone();
+            thread::spawn(move || {
+                thread::sleep(CANCEL_AFTER);
+                let at = Instant::now();
+                halt.cancel();
+                at
+            })
+        };
+        let rc = wait(cancel_byte(&halt));
+        let returned = Instant::now();
+        let cancelled_at = canceller.join().expect("canceller thread");
+        (rc, returned.saturating_duration_since(cancelled_at))
+    }
+
+    /// Per design §2.9 M2 ("every wait is sliced at ≤ 20 ms") and §2.1 `WAIT_SLICE`: the shim's
+    /// slice is the library's. Guard; do not change without a design citation.
+    #[test]
+    fn shim_selftest_wait_slice_is_the_library_wait_slice() {
+        let slice = unsafe { shim_selftest_wait_slice_ms() };
+        assert!(slice <= 20, "shim slice {slice} ms exceeds the 20 ms bound");
+        assert_eq!(Duration::from_millis(slice as u64), WAIT_SLICE);
+    }
+
+    /// §2.9 M2: the settle and ObtainExclusiveAccess retry sleeps end within a slice of a cancel.
+    #[test]
+    fn shim_selftest_cancel_ends_the_settle_sleep() {
+        let (rc, wake) = cancel_during(|c| unsafe { shim_selftest_sleep(LONG_MS, c) });
+        assert_eq!(rc, SHIM_CANCELLED);
+        assert!(
+            wake <= WAKE_BOUND,
+            "settle sleep woke {wake:?} after the cancel"
+        );
+
+        let halt = Halt::new();
+        halt.cancel();
+        let t0 = Instant::now();
+        let rc = unsafe { shim_selftest_sleep(LONG_MS, cancel_byte(&halt)) };
+        assert_eq!(
+            rc, SHIM_CANCELLED,
+            "a token cancelled before the wait ends it at once"
+        );
+        assert!(t0.elapsed() <= WAKE_BOUND);
+
+        let t0 = Instant::now();
+        let rc = unsafe { shim_selftest_sleep(60, cancel_byte(&Halt::new())) };
+        assert_eq!(rc, 0, "an uncancelled sleep runs out normally");
+        assert!(t0.elapsed() >= Duration::from_millis(60));
+    }
+
+    /// §2.9 M2: the DiskArbitration claim wait (5 s) is sliced and ends on a cancel.
+    /// Apple dispatch/semaphore.h: "Returns zero on success, or non-zero if the timeout occurred."
+    #[test]
+    fn shim_selftest_cancel_ends_the_da_claim_wait() {
+        let (rc, wake) = cancel_during(|c| unsafe { shim_selftest_sem_wait(LONG_MS, 0, c) });
+        assert_eq!(rc, SHIM_CANCELLED);
+        assert!(
+            wake <= WAKE_BOUND,
+            "DA claim wait woke {wake:?} after the cancel"
+        );
+
+        let never = Halt::new();
+        let rc = unsafe { shim_selftest_sem_wait(60, 0, cancel_byte(&never)) };
+        assert_eq!(rc, 1, "an unsignalled, uncancelled wait times out");
+        let t0 = Instant::now();
+        let rc = unsafe { shim_selftest_sem_wait(LONG_MS, 1, cancel_byte(&never)) };
+        assert_eq!(rc, 0, "a signalled claim is taken");
+        assert!(t0.elapsed() <= WAKE_BOUND);
+    }
+
+    /// §2.9 M2: "On cancel, diskutil is killed and reaped". The child is `sleep` standing in for
+    /// a wedged `diskutil unmountDisk`, run through the same spawn-and-reap path.
+    #[test]
+    fn shim_selftest_cancel_kills_and_reaps_the_unmount() {
+        let mut pid = 0;
+        let (rc, wake) = cancel_during(|c| unsafe {
+            shim_selftest_run_and_reap(
+                c"/bin/sleep".as_ptr().cast(),
+                c"30".as_ptr().cast(),
+                LONG_MS,
+                c,
+                &mut pid,
+            )
+        });
+        assert_eq!(rc, SHIM_CANCELLED);
+        assert!(
+            wake <= WAKE_BOUND,
+            "unmount wait woke {wake:?} after the cancel"
+        );
+        assert!(pid > 0, "the child was spawned");
+        // wait(2) ECHILD: "The process specified by pid does not exist or is not a child of
+        // the calling process" — the shim reaped it, leaving no zombie.
+        assert_eq!(
+            unsafe { shim_selftest_reaped(pid) },
+            1,
+            "child {pid} not reaped"
+        );
+    }
+
+    /// The unmount budget still kills and reaps a wedged child with no cancel, and a child
+    /// that exits on its own is reaped as a normal exit.
+    #[test]
+    fn shim_selftest_unmount_budget_and_normal_exit_reap() {
+        let never = Halt::new();
+        let mut pid = 0;
+        let rc = unsafe {
+            shim_selftest_run_and_reap(
+                c"/bin/sleep".as_ptr().cast(),
+                c"30".as_ptr().cast(),
+                60,
+                cancel_byte(&never),
+                &mut pid,
+            )
+        };
+        assert_eq!(rc, 1, "a wedged child is killed when the budget is spent");
+        assert_eq!(
+            unsafe { shim_selftest_reaped(pid) },
+            1,
+            "child {pid} not reaped"
+        );
+
+        let rc = unsafe {
+            shim_selftest_run_and_reap(
+                c"/bin/sleep".as_ptr().cast(),
+                c"0".as_ptr().cast(),
+                LONG_MS,
+                cancel_byte(&never),
+                &mut pid,
+            )
+        };
+        assert_eq!(rc, 0, "a child that exits is a normal exit");
+        assert_eq!(
+            unsafe { shim_selftest_reaped(pid) },
+            1,
+            "child {pid} not reaped"
+        );
+    }
+
+    /// §2.9 M2: `SHIM_CANCELLED` → `Halted`. A cancelled open is `Halted` before any side
+    /// effect, and the single-instance lock is released.
+    #[test]
+    fn shim_selftest_cancelled_open_is_halted() {
+        assert!(matches!(
+            map_shim_open_error(SHIM_CANCELLED, "disk4".into()),
+            Error::Halted
+        ));
+
+        let _globals = shim_globals();
+        let halt = Halt::new();
+        halt.cancel();
+        let t0 = Instant::now();
+        let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &halt);
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "expected Halted, got {:?}",
+            r.err()
+        );
+        assert!(
+            t0.elapsed() <= WAKE_BOUND,
+            "cancelled open took {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            !OPEN.load(Ordering::Acquire),
+            "a cancelled open left OPEN held"
+        );
+    }
+
+    /// §2.9 M2 end to end: shim_open_exclusive hands its token to its own waits. The unmount of
+    /// a missing disk ends at once, so the cancel lands in the 500 ms settle (or the unmount).
+    #[test]
+    fn shim_selftest_cancel_mid_open_is_halted() {
+        let _globals = shim_globals();
+        let (r, wake) = {
+            let halt = Halt::new();
+            let canceller = {
+                let halt = halt.clone();
+                thread::spawn(move || {
+                    thread::sleep(CANCEL_AFTER);
+                    let at = Instant::now();
+                    halt.cancel();
+                    at
+                })
+            };
+            let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &halt);
+            let returned = Instant::now();
+            let cancelled_at = canceller.join().expect("canceller thread");
+            (r, returned.saturating_duration_since(cancelled_at))
+        };
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "expected Halted, got {:?}",
+            r.err()
+        );
+        assert!(
+            wake <= WAKE_BOUND,
+            "open returned {wake:?} after the cancel"
+        );
+        assert!(
+            !OPEN.load(Ordering::Acquire),
+            "a cancelled open left OPEN held"
+        );
+    }
+
+    /// §2.9 M1: "`timeout_ms` is passed through to the shim", reaching the task unchanged.
+    /// Apple SCSITaskLib.h SetTimeoutDuration: "The timeout duration is counted in milliseconds."
+    #[test]
+    fn shim_selftest_timeout_ms_is_passed_through() {
+        let _globals = shim_globals();
+        assert!(
+            !OPEN.swap(true, Ordering::Acquire),
+            "OPEN held outside SHIM_GLOBALS"
+        );
+        assert_eq!(unsafe { shim_selftest_install_fake_device() }, 0);
+        let mut transport = MacScsiTransport {
+            _bsd_name: "selftest".into(),
+            last_progress: None,
+        };
+        for timeout_ms in [1, 5_000, 10_000, 12_345, 60_000] {
+            let r = transport.execute(&[0u8; 6], DataDirection::None, &mut [], timeout_ms);
+            assert!(r.is_ok(), "fake task failed: {:?}", r.err());
+            assert_eq!(unsafe { shim_selftest_last_timeout_ms() }, timeout_ms);
+        }
+        // SCSITaskLib.h SetTimeoutDuration: "A value of zero is equivalent to "Wait Forever"",
+        // so 0 must never reach the task; it becomes Linux SG_IO's 60 s default.
+        let r = transport.execute(&[0u8; 6], DataDirection::None, &mut [], 0);
+        assert!(r.is_ok(), "fake task failed: {:?}", r.err());
+        assert_eq!(unsafe { shim_selftest_last_timeout_ms() }, 60_000);
+        drop(transport);
+        assert!(!OPEN.load(Ordering::Acquire), "drop released OPEN");
     }
 }

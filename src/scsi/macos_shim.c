@@ -19,6 +19,101 @@
 
 extern char **environ;
 
+// ── Cancellation (stop design §2.9 M2) ─────────────────────────────────────
+
+// shim_open_exclusive's result when the caller's cancel byte is set; Rust maps it to Halted.
+#define SHIM_CANCELLED (-6)
+// The longest a shim wait sleeps between cancel-byte checks (§2.9: "sliced at ≤ 20 ms").
+#define SHIM_WAIT_SLICE_MS 20
+// diskutil unmount budget; a wedged unmount is killed so open() still returns (§2.9).
+#define SHIM_DISKUTIL_BUDGET_MS 20000
+// Settle time after the unmount, and between ObtainExclusiveAccess retries.
+#define SHIM_SETTLE_MS 500
+// DiskArbitration claim wait, so a wedged DA can't hang open().
+#define SHIM_DA_CLAIM_MS 5000
+
+void shim_close(void);
+
+// The cancel byte is the Rust Halt's AtomicBool; the Acquire load pairs with its Release (SS-23).
+static int shim_cancelled(const volatile uint8_t *cancel) {
+    return cancel && __atomic_load_n(cancel, __ATOMIC_ACQUIRE) != 0;
+}
+
+static uint64_t shim_now_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+// The next wait until `end_ns`: at most one slice, in nanoseconds.
+static uint64_t shim_slice_ns(uint64_t now_ns, uint64_t end_ns) {
+    uint64_t left = end_ns - now_ns;
+    uint64_t slice = (uint64_t)SHIM_WAIT_SLICE_MS * NSEC_PER_MSEC;
+    return left < slice ? left : slice;
+}
+
+// Sleep `ms`. 0 once slept out, SHIM_CANCELLED on cancel.
+static int sliced_sleep(uint32_t ms, const volatile uint8_t *cancel) {
+    uint64_t end = shim_now_ns() + (uint64_t)ms * NSEC_PER_MSEC;
+    for (;;) {
+        if (shim_cancelled(cancel)) return SHIM_CANCELLED;
+        uint64_t now = shim_now_ns();
+        if (now >= end) return 0;
+        usleep((useconds_t)((shim_slice_ns(now, end) + NSEC_PER_USEC - 1) / NSEC_PER_USEC));
+    }
+}
+
+// Wait up to `ms` for `sem`. 0 signalled, 1 timed out, SHIM_CANCELLED on cancel.
+static int sliced_sem_wait(dispatch_semaphore_t sem, uint32_t ms, const volatile uint8_t *cancel) {
+    uint64_t end = shim_now_ns() + (uint64_t)ms * NSEC_PER_MSEC;
+    for (;;) {
+        if (shim_cancelled(cancel)) return SHIM_CANCELLED;
+        uint64_t now = shim_now_ns();
+        if (now >= end) return 1;
+        int64_t slice = (int64_t)shim_slice_ns(now, end);
+        // Apple dispatch/semaphore.h: "Returns zero on success, or non-zero if the timeout occurred."
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, slice)) == 0) {
+            return 0;
+        }
+    }
+}
+
+// Run `path argv` (no shell; stdout/stderr to /dev/null) and wait for it, killing it on
+// budget or cancel. 0 exited, 1 budget spent, SHIM_CANCELLED, -1 spawn failed.
+static int run_and_reap(const char *path, char *const argv[], uint32_t budget_ms,
+                        const volatile uint8_t *cancel, pid_t *pid_out) {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    pid_t pid;
+    int spawned = posix_spawn(&pid, path, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (spawned != 0) return -1;
+    if (pid_out) *pid_out = pid;
+    uint64_t end = shim_now_ns() + (uint64_t)budget_ms * NSEC_PER_MSEC;
+    int status;
+    int outcome;
+    for (;;) {
+        // wait(2): "The WNOHANG option is used to indicate that the call should not block if
+        // there are no processes that wish to report status." r < 0 (ECHILD): already gone.
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r < 0 && errno == EINTR) continue;
+        if (r == pid || r < 0) return 0;
+        if (shim_cancelled(cancel)) { outcome = SHIM_CANCELLED; break; }
+        uint64_t now = shim_now_ns();
+        if (now >= end) { outcome = 1; break; }
+        usleep((useconds_t)((shim_slice_ns(now, end) + NSEC_PER_USEC - 1) / NSEC_PER_USEC));
+    }
+    // signal(3): "Except for the SIGKILL and SIGSTOP signals, the signal() function allows for
+    // a signal to be caught" — so the reap converges; still bounded (1 s) and sliced.
+    kill(pid, SIGKILL);
+    for (int i = 0; i < 1000 / SHIM_WAIT_SLICE_MS; i++) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || (r < 0 && errno != EINTR)) break;
+        usleep(SHIM_WAIT_SLICE_MS * 1000);
+    }
+    return outcome;
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 typedef struct {
@@ -357,7 +452,7 @@ static void da_claim_done(DADiskRef disk, DADissenterRef dissenter, void *ctx) {
 // Best-effort: claim the disk and register the mount-approval dissenter.
 // Returns 1 if claimed. The caller proceeds either way — ObtainExclusiveAccess
 // remains the hard gate; the claim is what keeps DA from remounting after it.
-static int da_hold(const char *bsd_name) {
+static int da_hold(const char *bsd_name, const volatile uint8_t *cancel) {
     // Hold the lock only for the g_da_bsd / g_handle field mutations below; it
     // is dropped before the bounded 5 s wait so legit claim waits aren't
     // serialized behind it (and re-taken just to publish g_handle.da_claimed).
@@ -390,8 +485,8 @@ static int da_hold(const char *bsd_name) {
     // callback may still fire: keep our ref in da_pending for da_release,
     // which reaps it (and unclaims a late success) once callbacks are stopped.
     int claimed = 0;
-    int timed_out = dispatch_semaphore_wait(r->sem,
-        dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0;
+    int waited = sliced_sem_wait(r->sem, SHIM_DA_CLAIM_MS, cancel);
+    int timed_out = waited != 0;
     if (!timed_out) {
         claimed = r->ok;
         da_claim_result_release(r);
@@ -404,7 +499,7 @@ static int da_hold(const char *bsd_name) {
         g_handle.da_pending = r;
     }
     pthread_mutex_unlock(&g_handle_lock);
-    return claimed;
+    return waited == SHIM_CANCELLED ? SHIM_CANCELLED : claimed;
 }
 
 static void da_noop(void *ctx) { (void)ctx; }
@@ -447,7 +542,7 @@ static void da_release(void) {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-int shim_open_exclusive(const char *selector) {
+int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     kern_return_t kr;
     HRESULT hr;
     SInt32 score = 0;
@@ -456,6 +551,12 @@ int shim_open_exclusive(const char *selector) {
     // check-then-act TOCTOU, and a concurrent shim_close must not tear down scsi/
     // mmc/plugin mid-setup. Released before the self-locking da_hold (5 s wait).
     pthread_mutex_lock(&g_handle_lock);
+
+    // A Stop before the open does nothing at all: no unmount is started.
+    if (shim_cancelled(cancel)) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return SHIM_CANCELLED;
+    }
 
     if (g_handle.exclusive && g_handle.scsi) {
         pthread_mutex_unlock(&g_handle_lock);
@@ -484,62 +585,22 @@ int shim_open_exclusive(const char *selector) {
         strlcpy(bsd_name, selector, sizeof(bsd_name));
     }
 
-    // Unmount via diskutil, invoked directly with posix_spawn (no shell) so
-    // the BSD device name can never be interpreted as shell syntax. A shell
-    // wrapper here (system()/sh -c) was a command-injection vector for an
-    // attacker-controlled device argument. Passing bsd_name as a discrete
-    // argv element also sidesteps the old buffer-truncation concern entirely.
-    // stdout/stderr go to /dev/null to keep diskutil chatter out of the
-    // caller's streams.
+    // Unmount via diskutil, invoked directly with posix_spawn (no shell) so the
+    // BSD device name is a discrete argv element and never shell syntax. A killed
+    // unmount is fine: ObtainExclusiveAccess below is the real gate (-5).
     if (bsd_name[0]) {
-        posix_spawn_file_actions_t fa;
-        posix_spawn_file_actions_init(&fa);
-        posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-        posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
         char *const argv[] = {
             "diskutil", "unmountDisk", "force", bsd_name, NULL
         };
-        pid_t pid;
-        if (posix_spawn(&pid, "/usr/sbin/diskutil", &fa, NULL, argv, environ) == 0) {
-            // BOUNDED wait. A plain blocking waitpid() here hung the public
-            // scsi::open() forever whenever the unmount wedged — diskutil
-            // blocks indefinitely on a volume whose filesystem is stuck (a
-            // hung network mount, a fs process not answering the unmount
-            // notification), and there is no signal, timeout or cancellation
-            // reaching this frame. Poll with WNOHANG to a deadline, then
-            // SIGKILL and reap so no zombie is left behind.
-            //
-            // Continuing after a killed unmount is deliberate:
-            // ObtainExclusiveAccess below is the real gate, and it reports the
-            // still-mounted disc through the shim's -5 sentinel (mapped to
-            // Error::DeviceLocked) — a typed error the caller can act on,
-            // instead of a process that never returns.
-            const int poll_us = 50000;      // 50 ms
-            const int max_polls = 400;      // 400 x 50 ms = 20 s
-            int status;
-            int reaped = 0;
-            for (int i = 0; i <= max_polls; i++) {
-                pid_t r = waitpid(pid, &status, WNOHANG);
-                if (r == pid) { reaped = 1; break; }
-                // r < 0 means the child is already gone (ECHILD) — nothing to
-                // wait for, and looping would spin to the deadline.
-                if (r < 0) { reaped = 1; break; }
-                if (i == max_polls) break;
-                usleep(poll_us);
-            }
-            if (!reaped) {
-                kill(pid, SIGKILL);
-                // SIGKILL is uncatchable, so this reap converges; still poll
-                // rather than block, so the shim has no unbounded wait at all.
-                for (int i = 0; i < 100; i++) {
-                    if (waitpid(pid, &status, WNOHANG) != 0) break;
-                    usleep(10000); // 10 ms x 100 = 1 s
-                }
-            }
+        // On cancel run_and_reap has killed and reaped diskutil (§2.9 M2).
+        if (run_and_reap("/usr/sbin/diskutil", argv, SHIM_DISKUTIL_BUDGET_MS, cancel, NULL)
+                == SHIM_CANCELLED
+            || sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) {
+            if (svc) IOObjectRelease(svc);
+            pthread_mutex_unlock(&g_handle_lock);
+            return SHIM_CANCELLED;
         }
-        posix_spawn_file_actions_destroy(&fa);
     }
-    if (bsd_name[0]) usleep(500000);
 
     // Check the return before using the port. On failure IOMainPort leaves `mp`
     // untouched, so every IOKit call below would run against an uninitialised
@@ -615,10 +676,11 @@ int shim_open_exclusive(const char *selector) {
         return -4;
     }
 
+    int cancelled = 0;
     for (int retry = 0; retry < 10; retry++) {
         kr = (*g_handle.scsi)->ObtainExclusiveAccess(g_handle.scsi);
         if (kr == kIOReturnSuccess) break;
-        usleep(500000);
+        if (sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) { cancelled = 1; break; }
     }
     if (kr != kIOReturnSuccess) {
         (*g_handle.scsi)->Release(g_handle.scsi);
@@ -628,7 +690,7 @@ int shim_open_exclusive(const char *selector) {
         g_handle.mmc = NULL;
         g_handle.plugin = NULL;
         pthread_mutex_unlock(&g_handle_lock);
-        return -5;
+        return cancelled ? SHIM_CANCELLED : -5;
     }
 
     g_handle.exclusive = 1;
@@ -648,7 +710,11 @@ int shim_open_exclusive(const char *selector) {
     // allocations fails it returns early (0 → no claim). The lock is deliberately
     // NOT held across da_hold's ~5 s self-locking claim wait, which would
     // serialize every open behind it.
-    if (bsd_name[0]) da_hold(bsd_name);
+    // A cancel during the claim wait undoes the whole open; da_release reaps the pending claim.
+    if (bsd_name[0] && da_hold(bsd_name, cancel) == SHIM_CANCELLED) {
+        shim_close();
+        return SHIM_CANCELLED;
+    }
 
     return 0;
 }
@@ -678,7 +744,8 @@ void shim_close(void) {
 int shim_execute(const unsigned char *cdb, unsigned char cdb_len,
                  void *buf, unsigned int buf_len, int data_in,
                  unsigned char *sense_out, unsigned int sense_len,
-                 unsigned char *task_status_out, unsigned long long *transfer_count) {
+                 unsigned char *task_status_out, unsigned long long *transfer_count,
+                 unsigned int timeout_ms) {
     if (!g_handle.scsi) return -1;
 
     SCSITaskInterface **task = (*g_handle.scsi)->CreateSCSITask(g_handle.scsi);
@@ -702,7 +769,9 @@ int shim_execute(const unsigned char *cdb, unsigned char cdb_len,
             kSCSIDataTransfer_NoDataTransfer);
     }
 
-    (*task)->SetTimeoutDuration(task, 30000);
+    // §2.9 M1: the caller's timeout_ms, not a fixed 30 s. SCSITaskLib.h SetTimeoutDuration:
+    // "The timeout duration is counted in milliseconds."
+    (*task)->SetTimeoutDuration(task, timeout_ms);
 
     SCSI_Sense_Data sense;
     memset(&sense, 0, sizeof(sense));
@@ -821,3 +890,92 @@ int shim_list_drives(ShimDriveInfo *out, int max_entries) {
     IOObjectRelease(iter);
     return count;
 }
+
+// ── shim_selftest hooks (stop design §5.1 LM1) ────────────────────────────
+//
+// Entry points for macos.rs's `shim_selftest_*` tests. They drive the same static
+// helpers shim_open_exclusive uses, so no drive is needed (qa release-tests, D6).
+
+__attribute__((visibility("hidden"))) int shim_selftest_wait_slice_ms(void) { return SHIM_WAIT_SLICE_MS; }
+
+__attribute__((visibility("hidden"))) int shim_selftest_sleep(unsigned int ms, const volatile uint8_t *cancel) {
+    return sliced_sleep(ms, cancel);
+}
+
+// A fresh semaphore, signalled up front when `signalled` is set, waited on like the DA claim.
+__attribute__((visibility("hidden"))) int shim_selftest_sem_wait(unsigned int ms, int signalled, const volatile uint8_t *cancel) {
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    if (!sem) return -1;
+    if (signalled) dispatch_semaphore_signal(sem);
+    int rc = sliced_sem_wait(sem, ms, cancel);
+    dispatch_release(sem);
+    return rc;
+}
+
+__attribute__((visibility("hidden"))) int shim_selftest_run_and_reap(const char *path, const char *arg, unsigned int budget_ms,
+                               const volatile uint8_t *cancel, int *pid_out) {
+    char *const argv[] = { (char *)path, (char *)arg, NULL };
+    pid_t pid = 0;
+    int rc = run_and_reap(path, argv, budget_ms, cancel, &pid);
+    if (pid_out) *pid_out = (int)pid;
+    return rc;
+}
+
+// 1 once `pid` is reaped. wait(2) ECHILD: "The process specified by pid does not exist or
+// is not a child of the calling process". A zombie is reaped here and reported as 0.
+__attribute__((visibility("hidden"))) int shim_selftest_reaped(int pid) {
+    int status;
+    errno = 0;
+    return waitpid((pid_t)pid, &status, WNOHANG) < 0 && errno == ECHILD;
+}
+
+// A fake SCSITaskDeviceInterface that records the timeout shim_execute sets on its task.
+static volatile UInt32 g_selftest_timeout_ms;
+
+static ULONG selftest_release(void *self) { (void)self; return 0; }
+static IOReturn selftest_release_exclusive(void *self) { (void)self; return kIOReturnSuccess; }
+static IOReturn selftest_set_cdb(void *task, UInt8 *cdb, UInt8 size) {
+    (void)task; (void)cdb; (void)size; return kIOReturnSuccess;
+}
+static IOReturn selftest_set_sg(void *task, SCSITaskSGElement *sg, UInt8 entries,
+                                UInt64 count, UInt8 direction) {
+    (void)task; (void)sg; (void)entries; (void)count; (void)direction; return kIOReturnSuccess;
+}
+static IOReturn selftest_set_timeout(void *task, UInt32 ms) {
+    (void)task; g_selftest_timeout_ms = ms; return kIOReturnSuccess;
+}
+static IOReturn selftest_execute(void *task, SCSI_Sense_Data *sense, SCSITaskStatus *status,
+                                 UInt64 *count) {
+    (void)task; (void)sense; *status = kSCSITaskStatus_GOOD; *count = 0; return kIOReturnSuccess;
+}
+
+static SCSITaskInterface g_selftest_task_vt = {
+    .Release = selftest_release,
+    .SetCommandDescriptorBlock = selftest_set_cdb,
+    .SetScatterGatherEntries = selftest_set_sg,
+    .SetTimeoutDuration = selftest_set_timeout,
+    .ExecuteTaskSync = selftest_execute,
+};
+static SCSITaskInterface *g_selftest_task = &g_selftest_task_vt;
+
+static SCSITaskInterface **selftest_create_task(void *self) { (void)self; return &g_selftest_task; }
+
+static SCSITaskDeviceInterface g_selftest_device_vt = {
+    .Release = selftest_release,
+    .ReleaseExclusiveAccess = selftest_release_exclusive,
+    .CreateSCSITask = selftest_create_task,
+};
+static SCSITaskDeviceInterface *g_selftest_device = &g_selftest_device_vt;
+
+// Install the fake as the open handle; shim_close tears it down. -1 if a handle is open.
+__attribute__((visibility("hidden"))) int shim_selftest_install_fake_device(void) {
+    pthread_mutex_lock(&g_handle_lock);
+    if (g_handle.scsi) { pthread_mutex_unlock(&g_handle_lock); return -1; }
+    g_handle.scsi = &g_selftest_device;
+    g_handle.exclusive = 1;
+    g_selftest_timeout_ms = 0;
+    pthread_mutex_unlock(&g_handle_lock);
+    return 0;
+}
+
+__attribute__((visibility("hidden"))) unsigned int shim_selftest_last_timeout_ms(void) { return g_selftest_timeout_ms; }

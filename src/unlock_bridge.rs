@@ -23,8 +23,75 @@ pub(crate) fn unlocker_name(drive_id: &crate::identity::DriveId) -> Option<&'sta
     fu::unlocker_name(&to_fu_drive_id(drive_id))
 }
 
-/// Adapt libfreemkv's `ScsiTransport` to the unlock crate's transport contract.
-struct ScsiAdapter<'a>(&'a mut dyn crate::scsi::ScsiTransport);
+/// The unlock crate's transport over a [`Drive`](crate::drive::Drive) (stop design
+/// §2.3): every CDB goes through the Drive's token, so after a Stop the unlocker sees
+/// a dead bus (status 0xFF, no sense) and aborts through its transport-fault path.
+pub(crate) struct ScsiAdapter<'a> {
+    drive: &'a mut crate::drive::Drive,
+    /// Open critical spans: while > 0 CDBs run even after a cancel (§2.4 row 4).
+    critical: u32,
+}
+
+impl<'a> ScsiAdapter<'a> {
+    pub(crate) fn new(drive: &'a mut crate::drive::Drive) -> Self {
+        ScsiAdapter { drive, critical: 0 }
+    }
+}
+
+// A Stop refusal: the dead-bus shape every unlocker already aborts on.
+fn refused() -> fu::scsi::ScsiError {
+    fu::scsi::ScsiError {
+        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+        sense: None,
+    }
+}
+
+fn to_lib_dir(dir: fu::scsi::DataDirection) -> crate::scsi::DataDirection {
+    match dir {
+        fu::scsi::DataDirection::None => crate::scsi::DataDirection::None,
+        fu::scsi::DataDirection::FromDevice => crate::scsi::DataDirection::FromDevice,
+        fu::scsi::DataDirection::ToDevice => crate::scsi::DataDirection::ToDevice,
+    }
+}
+
+// libfreemkv's result → the unlock crate's. `Halted` is a refusal (0xFF).
+fn to_fu_result(
+    r: crate::error::Result<crate::scsi::ScsiResult>,
+) -> fu::scsi::Result<fu::scsi::ScsiResult> {
+    match r {
+        Ok(r) => Ok(fu::scsi::ScsiResult {
+            status: r.status,
+            bytes_transferred: r.bytes_transferred,
+            sense: r.sense,
+        }),
+        Err(crate::error::Error::Halted) => Err(refused()),
+        // Transport Err covers both real faults and a normal CHECK CONDITION
+        // status; preserve status+sense so AACS's wedge guard and diagnosis can
+        // tell a cert rejection from a dead bus (sense_key@2, asc@12, ascq@13).
+        Err(e) => {
+            // ScsiError/DiscRead carry real status+sense via extract_scsi_context;
+            // any other variant is a non-SCSI transport/IO fault (dead bus, not a
+            // drive rejection) — surface transport-failure status so unlock bails.
+            let (status, sense) = match &e {
+                crate::error::Error::ScsiError { .. } | crate::error::Error::DiscRead { .. } => {
+                    crate::drive::extract_scsi_context(&e)
+                }
+                _ => (crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE, None),
+            };
+            let sense_buf = sense.map(|s| {
+                let mut b = [0u8; 32];
+                b[2] = s.sense_key & 0x0F;
+                b[12] = s.asc;
+                b[13] = s.ascq;
+                b
+            });
+            Err(fu::scsi::ScsiError {
+                status,
+                sense: sense_buf,
+            })
+        }
+    }
+}
 
 impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
     fn execute(
@@ -34,44 +101,46 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> fu::scsi::Result<fu::scsi::ScsiResult> {
-        let d = match dir {
-            fu::scsi::DataDirection::None => crate::scsi::DataDirection::None,
-            fu::scsi::DataDirection::FromDevice => crate::scsi::DataDirection::FromDevice,
-            fu::scsi::DataDirection::ToDevice => crate::scsi::DataDirection::ToDevice,
-        };
-        match self.0.execute(cdb, d, data, timeout_ms) {
-            Ok(r) => Ok(fu::scsi::ScsiResult {
-                status: r.status,
-                bytes_transferred: r.bytes_transferred,
-                sense: r.sense,
-            }),
-            // Transport Err covers both real faults and a normal CHECK CONDITION
-            // status; preserve status+sense so AACS's wedge guard and diagnosis can
-            // tell a cert rejection from a dead bus (sense_key@2, asc@12, ascq@13).
-            Err(e) => {
-                // ScsiError/DiscRead carry real status+sense via extract_scsi_context;
-                // any other variant is a non-SCSI transport/IO fault (dead bus, not a
-                // drive rejection) — surface transport-failure status so unlock bails.
-                let (status, sense) = match &e {
-                    crate::error::Error::ScsiError { .. }
-                    | crate::error::Error::DiscRead { .. } => {
-                        crate::drive::extract_scsi_context(&e)
-                    }
-                    _ => (crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE, None),
-                };
-                let sense_buf = sense.map(|s| {
-                    let mut b = [0u8; 32];
-                    b[2] = s.sense_key & 0x0F;
-                    b[12] = s.asc;
-                    b[13] = s.ascq;
-                    b
-                });
-                Err(fu::scsi::ScsiError {
-                    status,
-                    sense: sense_buf,
-                })
-            }
+        let d = to_lib_dir(dir);
+        to_fu_result(if self.critical > 0 {
+            self.drive.exec_uncancellable(cdb, d, data, timeout_ms)
+        } else {
+            self.drive.exec(cdb, d, data, timeout_ms)
+        })
+    }
+
+    fn pause(&mut self, d: std::time::Duration) -> fu::scsi::Result<()> {
+        self.drive.pause(d).map_err(|_| refused())
+    }
+
+    fn begin_critical(&mut self) -> fu::scsi::Result<()> {
+        if self.drive.is_halted() {
+            return Err(refused());
         }
+        self.critical += 1;
+        Ok(())
+    }
+
+    fn end_critical(&mut self) {
+        self.critical = self.critical.saturating_sub(1);
+    }
+
+    fn execute_cleanup(
+        &mut self,
+        cdb: &[u8],
+        dir: fu::scsi::DataDirection,
+        data: &mut [u8],
+        timeout_ms: u32,
+    ) -> fu::scsi::Result<fu::scsi::ScsiResult> {
+        let ctx = if self.critical > 0 {
+            crate::drive::CleanupCtx::Critical
+        } else {
+            crate::drive::CleanupCtx::Plain
+        };
+        to_fu_result(
+            self.drive
+                .exec_cleanup(cdb, to_lib_dir(dir), data, timeout_ms, ctx),
+        )
     }
 }
 
@@ -111,13 +180,13 @@ type Dispatch = (
 /// unlocker is an unlocker, so this loop knows nothing about any of them.
 fn run(
     unlockers: Vec<Box<dyn fu::Unlocker>>,
-    scsi: &mut dyn crate::scsi::ScsiTransport,
+    drive: &mut crate::drive::Drive,
     drive_id: &crate::identity::DriveId,
     kind: fu::DiscKind,
 ) -> Dispatch {
     let id = to_fu_drive_id(drive_id);
     let ctx = fu::UnlockCtx::new(&id, kind);
-    let mut adapter = ScsiAdapter(scsi);
+    let mut adapter = ScsiAdapter::new(drive);
     for u in &unlockers {
         match u.unlock(&mut adapter, &ctx) {
             Ok(None) => continue, // not this one's drive
@@ -133,10 +202,10 @@ fn run(
 /// no certs. Each removes bus encryption at the drive and reads the OEM Volume
 /// ID best-effort.
 pub(crate) fn run_features(
-    scsi: &mut dyn crate::scsi::ScsiTransport,
+    drive: &mut crate::drive::Drive,
     drive_id: &crate::identity::DriveId,
 ) -> Dispatch {
-    run(firmware_unlockers(), scsi, drive_id, fu::DiscKind::Unknown)
+    run(firmware_unlockers(), drive, drive_id, fu::DiscKind::Unknown)
 }
 
 /// The FIRMWARE/drive unlockers, in dispatch order. These key off the DRIVE and
@@ -180,12 +249,12 @@ pub(crate) fn is_drive_unlocker(name: &str) -> bool {
 /// construction, the one place certs enter) and the CSS/DVD route. `kind`
 /// selects which self-applies; the other declines.
 pub(crate) fn run_bus(
-    scsi: &mut dyn crate::scsi::ScsiTransport,
+    drive: &mut crate::drive::Drive,
     drive_id: &crate::identity::DriveId,
     kind: fu::DiscKind,
     host_certs: &[fu::HostCert],
 ) -> Dispatch {
-    run(disc_unlockers(host_certs.to_vec()), scsi, drive_id, kind)
+    run(disc_unlockers(host_certs.to_vec()), drive, drive_id, kind)
 }
 
 // The unlocker names, in dispatch order, for the user-facing unlocker matrix.
@@ -219,9 +288,9 @@ mod tests {
         }
     }
 
-    fn adapt(e: impl FnMut() -> crate::error::Error + Send) -> fu::scsi::ScsiError {
-        let mut t = ErrTransport(e);
-        let mut adapter = ScsiAdapter(&mut t);
+    fn adapt(e: impl FnMut() -> crate::error::Error + Send + 'static) -> fu::scsi::ScsiError {
+        let mut d = crate::drive::Drive::from_transport_for_test(Box::new(ErrTransport(e)));
+        let mut adapter = ScsiAdapter::new(&mut d);
         let mut buf = [0u8; 0];
         adapter
             .execute(&[0u8; 12], fu::scsi::DataDirection::None, &mut buf, 1_000)
@@ -315,5 +384,47 @@ mod tests {
         });
         assert_eq!(err.status, 0xFF);
         assert!(err.sense.is_none());
+    }
+
+    /// LD14: `begin_critical` after a cancel is refused (0xFF); a CDB inside a
+    /// critical section entered before the cancel still runs; `pause` is refused on a
+    /// cancel; the clean-up path admits the ALLOW for a tray this Drive locked.
+    #[test]
+    fn adapter_critical_and_pause() {
+        use crate::test_util::FakeTransport;
+        let tur = [0u8; 6];
+        let h = crate::halt::Halt::new();
+        let (t, fake) = FakeTransport::new();
+        let t = t.watch(&h).allow_after_cancel(|c| c[0] == 0x00);
+        let mut d = crate::drive::Drive::from_transport_with(Box::new(t), &h);
+        d.lock_tray();
+        let mut a = ScsiAdapter::new(&mut d);
+        a.begin_critical().expect("not cancelled yet");
+        h.cancel();
+        let mut buf = [0u8; 0];
+        assert!(
+            a.execute(&tur, fu::scsi::DataDirection::None, &mut buf, 5_000)
+                .is_ok()
+        );
+        a.end_critical();
+        let e = a
+            .execute(&tur, fu::scsi::DataDirection::None, &mut buf, 5_000)
+            .expect_err("refused outside the span");
+        assert_eq!((e.status, e.sense), (0xFF, None));
+        let e = a.begin_critical().expect_err("no span after the cancel");
+        assert_eq!(e.status, 0xFF);
+        let t0 = std::time::Instant::now();
+        let e = a
+            .pause(std::time::Duration::from_secs(10))
+            .expect_err("pause refused");
+        assert_eq!(e.status, 0xFF);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+        let allow = [0x1E, 0, 0, 0, 0, 0];
+        assert!(
+            a.execute_cleanup(&allow, fu::scsi::DataDirection::None, &mut buf, 5_000)
+                .is_ok()
+        );
+        assert_eq!(fake.count(|c| c[0] == 0x00), 1, "one TUR, inside the span");
+        assert_eq!(fake.count(|c| c == allow), 1, "one ALLOW");
     }
 }

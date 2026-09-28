@@ -312,12 +312,20 @@ fn variant_uv_slots(records: &[MkbRecord]) -> Option<Vec<(u32, usize)>> {
 /// per-slot body stays a lean `(Kp, uv, slot)` call.
 struct VariantMkb<'a> {
     records: &'a [MkbRecord],
-    nonce: [u8; 16],
     vkd_table: &'a [u8],
     /// Per-slot C table from `0x0c` (16 bytes/slot), same index
     /// [`walk_processing_key`] uses. NOT `0x2d` (VARIANTS + Nonce).
     cvalues: &'a [u8],
     mk_dv: [u8; 16],
+    /// `Kvn = AES-G(Kp, Nonce) & 0xFFFF` (`[C]` §2.1.3 / this module's chain doc). Depends only
+    /// on `Kp` and the MKB's Nonce — both loop-invariant across every slot a given `Kp` is tried
+    /// against (L103) — so [`derive_media_key_variant`] computes it ONCE, not per slot.
+    ///
+    /// The closest published precedent for this `Kvn` shape is `[C]` §3.2.5.2.2 "Variant
+    /// Number Record" (Table 3-12), PDF p.29: "Kvn = [AES-G(Kp, Nonce)]lsb_10" (10-bit, for a
+    /// content-variation number, record type `0x0D`). This module's `0x2d`/`0x2f` chain is a
+    /// distinct, reverse-engineered AACS 2.1 scheme — same `AES-G(Kp, Nonce)` shape, 16-bit.
+    kvn: u16,
 }
 
 /// Derive+verify the Media Key for ONE known `(Kp, uv, slot)`. VID-free —
@@ -364,14 +372,12 @@ fn variant_km_for_slot(
         kpnew[i] = kmp[i] ^ KEY_CORRECTION_DATA[i];
     }
 
-    // Step: Kvn = AES-G(Kp, Nonce) & 0xFFFF  (low 16 bits, BE).
-    let kvn_block = aes_g(kp, &m.nonce);
-    let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
-
-    // Step: VKD_idx = Kvn XOR VARIANTS[uv];  VKD = vkd_table[VKD_idx].
+    // Step: VKD_idx = Kvn XOR VARIANTS[uv];  VKD = vkd_table[VKD_idx]. Kvn = AES-G(Kp, Nonce) &
+    // 0xFFFF is loop-invariant for this Kp (L103): hoisted into `m.kvn` by the caller instead
+    // of being recomputed for each of the ~46k slots this function is tried against.
     let v_for_uv = variants_for_uv(m.records, slot_index)
         .ok_or(MediaKeyVariantError::VariantsTableUnavailable)?;
-    let vkd_idx = kvn ^ v_for_uv;
+    let vkd_idx = m.kvn ^ v_for_uv;
     let off = (vkd_idx as usize) * 16;
     if off + 16 > m.vkd_table.len() {
         return Err(MediaKeyVariantError::VkdIndexOutOfRange);
@@ -419,12 +425,17 @@ pub fn derive_media_key_variant(
         .ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let slots = variant_uv_slots(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    // Kvn = AES-G(Kp, Nonce) & 0xFFFF depends only on `pk` and the MKB's Nonce — neither
+    // varies per slot — so compute it ONCE here rather than once per slot in
+    // `variant_km_for_slot` (L103: was tens of ms/disc across ~46k slots).
+    let kvn_block = aes_g(pk, &nonce);
+    let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
     let m = VariantMkb {
         records: mkb_records,
-        nonce,
         vkd_table,
         cvalues,
         mk_dv,
+        kvn,
     };
 
     // Try `pk` against each slot; return the first verified Km. If none verify,
@@ -1181,6 +1192,182 @@ mod tests {
             c_block,
             uv: UV,
         }
+    }
+
+    // ── L103: Kvn hoist — equivalence, call-count, and spec quote ─────────────────────
+
+    /// Test-only ORACLE: `variant_km_for_slot` as it read before L103 — recomputes `Kvn =
+    /// AES-G(Kp, Nonce) & 0xFFFF` on every call instead of once per
+    /// [`derive_media_key_variant`] call. Takes `nonce` explicitly since the production
+    /// `VariantMkb` no longer carries it (only `kvn` does). Byte-identical body to
+    /// `variant_km_for_slot` otherwise; used only to prove the hoist agrees with it.
+    fn variant_km_for_slot_oracle(
+        m: &VariantMkb<'_>,
+        nonce: &[u8; 16],
+        kp: &[u8; 16],
+        uv: u32,
+        slot_index: usize,
+    ) -> Result<[u8; 16], MediaKeyVariantError> {
+        let cv_off = slot_index
+            .checked_mul(16)
+            .ok_or(MediaKeyVariantError::MkbIncomplete)?;
+        let c_slice = m
+            .cvalues
+            .get(cv_off..cv_off + 16)
+            .ok_or(MediaKeyVariantError::MkbIncomplete)?;
+        let mut c_block = [0u8; 16];
+        c_block.copy_from_slice(c_slice);
+
+        let mut kmp = aes_ecb_decrypt(kp, &c_block);
+        let uv_bytes = uv.to_be_bytes();
+        for i in 0..4 {
+            kmp[12 + i] ^= uv_bytes[i];
+        }
+        if kmp[15] & 0b0000_0010 != 0 {
+            return Err(MediaKeyVariantError::SoftCorrectionRequired);
+        }
+        if kmp[15] & 0b0000_0100 != 0 {
+            return Err(MediaKeyVariantError::OnlineChallengeRequired);
+        }
+        let mut kpnew = [0u8; 16];
+        for i in 0..16 {
+            kpnew[i] = kmp[i] ^ KEY_CORRECTION_DATA[i];
+        }
+
+        // The pre-L103 line: recomputed on EVERY call, unlike the hoisted `m.kvn`.
+        let kvn_block = aes_g(kp, nonce);
+        let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
+
+        let v_for_uv = variants_for_uv(m.records, slot_index)
+            .ok_or(MediaKeyVariantError::VariantsTableUnavailable)?;
+        let vkd_idx = kvn ^ v_for_uv;
+        let off = (vkd_idx as usize) * 16;
+        if off + 16 > m.vkd_table.len() {
+            return Err(MediaKeyVariantError::VkdIndexOutOfRange);
+        }
+        let mut vkd = [0u8; 16];
+        vkd.copy_from_slice(&m.vkd_table[off..off + 16]);
+
+        let mut km = aes_ecb_decrypt(&kpnew, &vkd);
+        for i in 0..4 {
+            km[12 + i] ^= uv_bytes[i];
+        }
+        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        if aes_ecb_decrypt(&km, &m.mk_dv)[..8] != VERIFY_MAGIC {
+            return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
+        }
+        Ok(km)
+    }
+
+    /// Build the `VariantMkb` + `nonce` the equivalence tests below drive both
+    /// `variant_km_for_slot` and its oracle through, from a planted fixture's records.
+    fn variant_mkb_from_records<'a>(
+        records: &'a [MkbRecord],
+        kp: &[u8; 16],
+    ) -> ([u8; 16], VariantMkb<'a>) {
+        let nonce = variant_nonce(records).expect("0x2d present");
+        let vkd_table = variant_key_data(records).expect("0x2f present");
+        let cvalues = mkb_find_body(records, REC_MEDIA_KEY_VARIANT_DATA)
+            .or_else(|| mkb_find_body(records, REC_MEDIA_KEY_DATA))
+            .expect("cvalues present");
+        let mk_dv = mkb_find_mk_dv(records).expect("0x86 present");
+        let kvn_block = aes_g(kp, &nonce);
+        let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
+        (
+            nonce,
+            VariantMkb {
+                records,
+                vkd_table,
+                cvalues,
+                mk_dv,
+                kvn,
+            },
+        )
+    }
+
+    /// L103 equivalence: the hoisted-`kvn` `variant_km_for_slot` must return byte-identical
+    /// results to the pre-hoist oracle — the covering slot (single-slot fixture), a
+    /// one-bit-away Kp, and the two-slot fixture's decoy AND real slot.
+    #[test]
+    fn variant_km_for_slot_matches_the_pre_hoist_oracle() {
+        let p = plant_variant_mkb();
+        let (nonce, m) = variant_mkb_from_records(&p.records, &p.kp);
+        assert_eq!(
+            variant_km_for_slot(&m, &p.kp, p.uv, 0),
+            variant_km_for_slot_oracle(&m, &nonce, &p.kp, p.uv, 0),
+        );
+        assert_eq!(variant_km_for_slot(&m, &p.kp, p.uv, 0), Ok(p.km));
+
+        let mut stranger = p.kp;
+        stranger[0] ^= 0x01;
+        assert_eq!(
+            variant_km_for_slot(&m, &stranger, p.uv, 0),
+            variant_km_for_slot_oracle(&m, &nonce, &stranger, p.uv, 0),
+        );
+
+        let w = plant_walk_variant_mkb();
+        let kp = aesg3(&w.dk.key, 1);
+        let (wnonce, wm) = variant_mkb_from_records(&w.records, &kp);
+        // Decoy slot 0 (must fail identically both ways).
+        assert_eq!(
+            variant_km_for_slot(&wm, &kp, 0x0800, 0),
+            variant_km_for_slot_oracle(&wm, &wnonce, &kp, 0x0800, 0),
+        );
+        // Real slot 1 (must succeed identically both ways).
+        assert_eq!(
+            variant_km_for_slot(&wm, &kp, 0x0400, 1),
+            variant_km_for_slot_oracle(&wm, &wnonce, &kp, 0x0400, 1),
+        );
+        assert_eq!(variant_km_for_slot(&wm, &kp, 0x0400, 1), Ok(w.km));
+    }
+
+    /// L103 "red first" observable: `AES_G_CALLS` (crypto.rs, test-only) counts calls to
+    /// `aes_g`. Before this fix, `derive_media_key_variant` on a 2-slot MKB (decoy then the
+    /// covering slot) called `aes_g` once PER SLOT tried — 2 here — because `Kvn` was
+    /// recomputed inside `variant_km_for_slot`. After the hoist it is computed once, before
+    /// the slot loop, regardless of how many slots are tried.
+    #[test]
+    fn derive_media_key_variant_computes_kvn_once_per_call_not_per_slot() {
+        use crate::aacs::crypto::AES_G_CALLS;
+        let w = plant_walk_variant_mkb();
+        let kp = aesg3(&w.dk.key, 1);
+        AES_G_CALLS.with(|c| c.set(0));
+        let got = derive_media_key_variant(&w.records, &kp);
+        assert_eq!(
+            got,
+            Ok(w.km),
+            "sanity: the covering kp still derives the planted Media Key"
+        );
+        assert_eq!(
+            AES_G_CALLS.with(|c| c.get()),
+            1,
+            "aes_g(kp, nonce) must run once per derive_media_key_variant call, not once per \
+             slot tried (this MKB tries 2: the decoy, then the covering slot)"
+        );
+    }
+
+    /// Verbatim from `[C]` (AACS Introduction and Common Cryptographic Elements, Final Rev
+    /// 0.953) §2.1.3 "AES-based One-way Function (AES-G)", PDF p.8 — the SAME relation
+    /// `KS_17_AES_G` registers for `crypto::aes_g`. Per spec; do not change without a
+    /// citation proving otherwise.
+    #[test]
+    fn kvn_uses_the_registered_c_dot_2_1_3_aes_g_relation() {
+        use crate::spec::keys::KS_17_AES_G;
+        assert!(
+            KS_17_AES_G
+                .text
+                .contains("AES-G(x1, x2) = AES-128D(x1, x2)"),
+            "KS-17 must still state the AES-G relation this module's Kvn step relies on"
+        );
+        // The relation itself, applied directly: Kvn's hoisted `aes_g(kp, nonce)` must equal
+        // AES-128D(kp, nonce) XOR nonce — not a constant, not `aes_ecb_decrypt` alone.
+        let kp = [0x5Bu8; 16];
+        let nonce = [0x7Eu8; 16];
+        let mut expected = aes_ecb_decrypt(&kp, &nonce);
+        for i in 0..16 {
+            expected[i] ^= nonce[i];
+        }
+        assert_eq!(aes_g(&kp, &nonce), expected);
     }
 
     /// Sanity-check the fixture before anything is asserted through it: an MKB

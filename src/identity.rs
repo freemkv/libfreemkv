@@ -53,13 +53,23 @@ pub struct DriveId {
 /// shorter cannot populate the identity fields this type promises.
 const INQUIRY_STANDARD_LEN: usize = 36;
 
+/// Issues one CDB: a raw transport, or `Drive::exec`.
+pub(crate) type Exec<'a> =
+    dyn FnMut(&[u8], DataDirection, &mut [u8], u32) -> Result<crate::scsi::ScsiResult> + 'a;
+
 impl DriveId {
     /// Probe a real drive via SCSI and build its identity.
     pub fn from_drive(transport: &mut dyn ScsiTransport) -> Result<Self> {
+        Self::identify(&mut |cdb, dir, buf, t| transport.execute(cdb, dir, buf, t))
+    }
+
+    /// [`from_drive`](Self::from_drive) over any CDB issuer: `Drive::open` passes
+    /// `Drive::exec`, so identification is refused once the op token is cancelled.
+    pub(crate) fn identify(exec: &mut Exec<'_>) -> Result<Self> {
         // INQUIRY — SPC-4 §6.4
         let mut inquiry = vec![0u8; 96];
         let cdb_inq = [0x12, 0x00, 0x00, 0x00, 0x60, 0x00];
-        let inq = transport.execute(&cdb_inq, DataDirection::FromDevice, &mut inquiry, 5000)?;
+        let inq = exec(&cdb_inq, DataDirection::FromDevice, &mut inquiry, 5000)?;
         // `bytes_transferred` is device-reported and untrusted. Unchecked, a
         // GOOD status with a short/empty data phase decoded to blank identity +
         // byte0 0x00 — which reads as DIRECT ACCESS, so the drive vanishes silently.
@@ -75,13 +85,14 @@ impl DriveId {
         let mut gc = vec![0u8; 256];
         let cdb_gc = [0x46, 0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
         let (firmware_date, raw_gc_010c) =
-            match transport.execute(&cdb_gc, DataDirection::FromDevice, &mut gc, 5000) {
+            match exec(&cdb_gc, DataDirection::FromDevice, &mut gc, 5000) {
                 Ok(r) => {
                     let date = gc_feature_descriptor(&gc, r.bytes_transferred, 0x010C)
                         .map(|d| gc_text(&d[4..d.len().min(16)]))
                         .unwrap_or_default();
                     (date, gc[..gc_reply_len(&gc, r.bytes_transferred)].to_vec())
                 }
+                Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
                 Err(_) => (String::new(), Vec::new()),
             };
 
@@ -90,13 +101,14 @@ impl DriveId {
         // bytes deliberately yields an empty serial rather than failing.
         let mut gc_serial = vec![0u8; 256];
         let cdb_serial = [0x46, 0x02, 0x01, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
-        let serial_number =
-            match transport.execute(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000) {
-                Ok(r) => gc_feature_descriptor(&gc_serial, r.bytes_transferred, 0x0108)
-                    .map(|d| gc_text(&d[4..]))
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
-            };
+        let serial_number = match exec(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000)
+        {
+            Ok(r) => gc_feature_descriptor(&gc_serial, r.bytes_transferred, 0x0108)
+                .map(|d| gc_text(&d[4..]))
+                .unwrap_or_default(),
+            Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
+            Err(_) => String::new(),
+        };
 
         Ok(DriveId {
             vendor_id: ascii_field(&inquiry, 8, 16),

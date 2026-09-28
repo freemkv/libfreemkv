@@ -147,6 +147,8 @@ pub struct SptiTransport {
     alignment_mask: usize,
     /// Reused aligned scratch for misaligned buffers; grows to the largest transfer seen.
     bounce: Vec<u8>,
+    /// The last command's sense-key specific progress indication (§2.11).
+    last_progress: Option<u16>,
 }
 
 // SptiTransport's fields are an isize HANDLE plus owned data: Send+Sync auto-derive;
@@ -211,6 +213,7 @@ impl SptiTransport {
             max_transfer,
             alignment_mask: super::sanitize_alignment_mask(alignment_mask),
             bounce: Vec::new(),
+            last_progress: None,
         })
     }
 }
@@ -334,6 +337,10 @@ impl ScsiTransport for SptiTransport {
         self.max_transfer
     }
 
+    fn last_sense_progress(&self) -> Option<u16> {
+        self.last_progress
+    }
+
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -341,6 +348,7 @@ impl ScsiTransport for SptiTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        self.last_progress = None;
         // Zero the data buffer for reads to prevent returning uninitialized data
         // if the driver doesn't fully update DataTransferLength.
         if direction == DataDirection::FromDevice {
@@ -453,6 +461,7 @@ impl ScsiTransport for SptiTransport {
             // SenseInfoLength; pass the full K_SENSE_SIZE and let
             // parse_sense key off byte 0's response code (fixed vs descriptor).
             let parsed = super::parse_sense(&sptwb.sense, K_SENSE_SIZE as u8);
+            self.last_progress = super::parse_sense_progress(&sptwb.sense, K_SENSE_SIZE as u8);
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),
                 status: sptwb.spt.ScsiStatus,

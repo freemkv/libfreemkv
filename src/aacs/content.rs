@@ -87,6 +87,31 @@ pub fn aacs_unit_seed_encrypted(unit: &[u8], format: crate::disc::ContentFormat)
     }
 }
 
+/// Clear the Copy_permission_indicator of every source packet of a unit freemkv has
+/// DECRYPTED, so the flag is true of the bytes written (KU design §5.4, K-13). `BdTs`
+/// only; HD DVD (`MpegPs`) is excluded (§2.6). Never called on a unit left as ciphertext.
+pub(crate) fn clear_copy_permission_indicator(unit: &mut [u8], format: crate::disc::ContentFormat) {
+    if format != crate::disc::ContentFormat::BdTs || unit.len() < ALIGNED_UNIT_LEN {
+        return;
+    }
+    // KS-5 [BD] §3.10.2: "shall be set to 11₂ if the data is encrypted, or … 00₂ if the data
+    // is not encrypted"; KS-6: CPI is the top 2 of TP_extra_header's 32 bits (ATS kept).
+    // KS-22 libaacs `_verify_ts` (corroboration): "buf[i] &= ~0xc0;" per 192-byte packet.
+    for packet in unit[..ALIGNED_UNIT_LEN].chunks_mut(BD_SOURCE_PACKET_BYTES) {
+        packet[0] &= 0x3F;
+    }
+}
+
+/// Test helper: `plain` as a decrypt writes it, CPI cleared in every source packet (KS-5;
+/// KU design §5.4). For a buffer of whole decrypted units only.
+#[cfg(test)]
+pub(crate) fn cpi_cleared(mut plain: Vec<u8>) -> Vec<u8> {
+    for packet in plain.chunks_mut(BD_SOURCE_PACKET_BYTES) {
+        packet[0] &= 0x3F;
+    }
+    plain
+}
+
 /// Was `unit` cut on its file's unit grid? An encrypted BD-TS unit's clear seed
 /// always starts a source packet, so its TS sync (0x47) sits at byte 4; a chunk
 /// read off the grid starts mid-unit on ciphertext. Clear units, and `MpegPs`
@@ -103,10 +128,11 @@ pub(crate) fn aacs_unit_on_grid(unit: &[u8], format: crate::disc::ContentFormat)
 /// True when an aligned unit is flagged encrypted AND still looks scrambled
 /// (structure not yet restored) — genuine encrypted content NOT yet decrypted.
 ///
-/// Composes [`aacs_unit_encrypted`] (the authoritative flag, which decryption never rewrites)
-/// with an IDEMPOTENT "structure restored?" check, so callers that may run twice over the same
-/// buffer (re-decrypt, sampling, diagnosis) get a stable answer. Only meaningful at the
-/// clip-FILE-anchored boundary.
+/// Composes [`aacs_unit_encrypted`] (the authoritative flag) with an IDEMPOTENT "structure
+/// restored?" check, so callers that may run twice over the same buffer (re-decrypt, sampling,
+/// diagnosis) get a stable answer. A unit freemkv decrypted has its flag CLEARED (KS-5 `[BD]`
+/// §3.10.2: "00₂ if the data is not encrypted"; KU design §5.4), so it reads clear here; a
+/// unit left as ciphertext keeps it. Only meaningful at the clip-FILE-anchored boundary.
 pub fn aacs_unit_needs_decrypt(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     // "Still needs key" = flagged encrypted AND not structurally clean per the
     // ONE definition, [`is_clean`]'s min(E,4) proof floor. Never a second threshold:
@@ -1623,9 +1649,9 @@ mod spec_guards {
         assert!(changed, "every block of the final 6128 bytes is decrypted");
     }
 
-    /// per spec; do not change without a spec citation — KS-3 [BD] §3.10.1: "A new CBC
-    /// cipher chain is started for each Aligned Unit": the mapped decrypt of a multi-unit
-    /// buffer, in either order, never chains one unit's ciphertext into the next.
+    /// per spec; do not change without a spec citation proving otherwise — KS-3 [BD]
+    /// §3.10.1: "A new CBC cipher chain is started for each Aligned Unit": the mapped decrypt
+    /// of a multi-unit buffer, in either order, never chains one unit into the next.
     #[test]
     fn cbc_chain_restarts_every_unit() {
         use crate::decrypt::{AacsKeyMap, DecryptKeys, Phase, decrypt_sectors_mapped};
@@ -1662,7 +1688,11 @@ mod spec_guards {
         for order in [[0, 1], [1, 0]] {
             let mut buf: Vec<u8> = order.iter().flat_map(|&i| enc[i].clone()).collect();
             decrypt_sectors_mapped(&mut buf, &keys, 0, &map).expect("both units keyed");
-            let want: Vec<u8> = order.iter().flat_map(|&i| plain[i].clone()).collect();
+            // KS-5: a decrypted unit's CPI reads 00₂ (KU design §5.4); the chain rule is KS-3.
+            let want: Vec<u8> = order
+                .iter()
+                .flat_map(|&i| super::cpi_cleared(plain[i].clone()))
+                .collect();
             assert!(
                 buf == want,
                 "order {order:?}: each unit decrypts on its own chain"

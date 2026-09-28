@@ -24,12 +24,16 @@ pub enum DemuxBatch {
     /// Underlying reader returned an error. Terminal.
     Err(std::io::Error),
     /// Explicit clean-completion sentinel. The worker sends this as its
-    /// LAST message on every non-error exit (input exhausted, or halt
-    /// cancelled) so the consumer can distinguish a normal end-of-stream
+    /// LAST message when the input is exhausted and no Stop is pending (a Stop
+    /// is `Err(Halted)`, never EOF) so the consumer can distinguish a normal end-of-stream
     /// from a bare channel disconnection. A worker that panics mid-stream
     /// drops `tx` without sending this, so the consumer sees `RecvError`
     /// and reports the panic rather than silently truncating output.
     Eof,
+}
+
+fn halted(halt: Option<&Halt>) -> bool {
+    halt.is_some_and(Halt::is_cancelled)
 }
 
 /// Spawned demux thread. Drop joins.
@@ -85,11 +89,10 @@ impl DemuxThread {
                 let mut fed_bytes: u64 = 0;
                 loop {
                     hb.tick(fed_bytes, 0);
-                    if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                        // Caller-initiated stop is a clean termination —
-                        // send the Eof sentinel so the consumer doesn't
-                        // mistake it for a worker panic.
-                        let _ = tx.send(DemuxBatch::Eof);
+                    // A Stop is `Halted`, never a clean EOF (LP11): a truncated
+                    // title must not finalise as a complete container.
+                    if halted(halt.as_ref()) {
+                        let _ = tx.send(DemuxBatch::Err(crate::error::Error::Halted.into()));
                         return;
                     }
                     let t0 = if prof {
@@ -187,8 +190,14 @@ impl DemuxThread {
                     }
                 }
                 // Clean EOF sentinel. A panic during `feed`/`flush` skips this and
-                // drops `tx`, which the consumer reads as an error, not clean EOF.
-                let _ = tx.send(DemuxBatch::Eof);
+                // drops `tx`, which the consumer reads as an error, not clean EOF. A
+                // halted prefetcher closes its channel too: that close is a Stop.
+                let last = if halted(halt.as_ref()) {
+                    DemuxBatch::Err(crate::error::Error::Halted.into())
+                } else {
+                    DemuxBatch::Eof
+                };
+                let _ = tx.send(last);
             });
 
         let handle = match spawn_result {
@@ -341,26 +350,42 @@ mod tests {
         assert!(pes_idx.unwrap() < eof_idx.unwrap(), "tail before Eof");
     }
 
+    /// LP11 / L096 on the highway: a Stop is `Err(Halted)`, never the clean `Eof`
+    /// sentinel, whether the worker sees the cancel itself or the halted prefetcher
+    /// closes its channel first.
     #[test]
-    fn halt_cancellation_sends_eof_not_panic() {
-        // A caller-initiated halt is a CLEAN termination — the worker must
-        // send Eof (not just drop tx), so the consumer doesn't mistake the
-        // stop for a worker panic.
-        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
-        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
-        let halt = Halt::new();
-        halt.cancel(); // already cancelled before the loop runs
-        let ts = super::super::ts::TsDemuxer::new(&[0x1011]);
-        let (_dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt), Some(ts), None).unwrap();
-        // Keep pf_tx alive so the ONLY exit is the halt path, not producer
-        // disconnect.
-        let batches = collect_batches(&rx, Duration::from_secs(5));
-        drop(pf_tx);
-        assert!(
-            matches!(batches.last(), Some(DemuxBatch::Eof)),
-            "halt cancellation must yield a clean Eof sentinel"
-        );
+    fn halt_cancellation_sends_halted_not_eof() {
+        let batches = |close_first: bool| {
+            let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+            let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+            let halt = Halt::new();
+            let ts = super::super::ts::TsDemuxer::new(&[0x1011]);
+            let (dt, rx) =
+                DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt.clone()), Some(ts), None)
+                    .unwrap();
+            halt.cancel();
+            if close_first {
+                drop(pf_tx);
+                let b = collect_batches(&rx, Duration::from_secs(5));
+                drop(rx);
+                drop(dt);
+                b
+            } else {
+                let b = collect_batches(&rx, Duration::from_secs(5));
+                drop(pf_tx);
+                drop(rx);
+                drop(dt);
+                b
+            }
+        };
+        for close_first in [false, true] {
+            let b = batches(close_first);
+            assert!(
+                matches!(b.last(), Some(DemuxBatch::Err(e)) if crate::error::is_halt(e)),
+                "close_first={close_first}: a Stop is Halted"
+            );
+            assert!(!b.iter().any(|x| matches!(x, DemuxBatch::Eof)), "no Eof");
+        }
     }
 
     #[test]
@@ -620,5 +645,40 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("drop must not deadlock on the blocked demux worker");
+    }
+
+    /// LP10 (§2.1 "Unbounded Drop joins"): a worker blocked on its full output
+    /// channel, then a cancel: dropping the stream returns within 1 s. Guard.
+    #[test]
+    fn demux_drop_with_blocked_worker_after_cancel() {
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(16);
+        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(16);
+        let pid = 0x1011;
+        let ts = super::super::ts::TsDemuxer::new(&[pid]);
+        let halt = Halt::new();
+        let (dt, rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt.clone()), Some(ts), None)
+                .unwrap();
+        for i in 0..8u8 {
+            pf_tx.send(Ok(bdts_pes_packet(pid, &[i]))).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        halt.cancel();
+        let stream = super::super::pipelined_stream::PipelinedPesStream::new(
+            dt,
+            rx,
+            crate::disc::DiscTitle::empty(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(stream);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drop after a cancel must return within 1 s");
+        drop(pf_tx);
     }
 }

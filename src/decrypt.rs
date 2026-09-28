@@ -141,19 +141,27 @@ impl DecryptKeys {
 /// half (parity of the unit's index within the segment) and the ALTERNATE half is
 /// left untouched (ciphertext) for the muxer to drop. Every non-forensic range —
 /// the base Unit Key, a multi-CPS unit — is `All` (decrypt every unit), so the
-/// common disc is byte-for-byte unchanged.
+/// common disc is byte-for-byte unchanged. `Verify` is a forensic index whose every
+/// phase probe faulted (KU design §5.3): each unit is kept only if it verifies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     All,
     Even,
     Odd,
+    /// Phase unknown: decrypt each unit, keep it (CPI cleared) only if [`is_clean`]
+    /// passes, else restore its ciphertext for the muxer to drop. No public spec for
+    /// FMTS (KS-25, KS-26); per unit because each unit is its own CBC chain (KS-3).
+    ///
+    /// [`is_clean`]: crate::aacs::content::is_clean
+    Verify,
 }
 
 // Does this unit belong to the phase we hold the key for? `Phase::All` means the whole range is
 // ours; a wrong index gets the wrong half.
 fn unit_is_our_phase(unit_lba: u32, range_start: u32, unit_sectors: u32, phase: Phase) -> bool {
     let want_odd = match phase {
-        Phase::All => return true,
+        // `Verify` tries every unit; the per-unit verify decides what is ours.
+        Phase::All | Phase::Verify => return true,
         Phase::Even => false,
         Phase::Odd => true,
     };
@@ -301,7 +309,8 @@ impl AacsKeyMap {
                 // A unit in NO range is pass-through content (base/default) — read
                 // it. Only an alternate-phase forensic unit is dropped from the plan.
                 let keep = match self.entry_for(lba) {
-                    None | Some((_, Phase::All, _)) => true,
+                    // A `Verify` range reads both halves: which one is ours is unknown.
+                    None | Some((_, Phase::All | Phase::Verify, _)) => true,
                     Some((_, phase, range_start)) => {
                         let unit_ix = (lba - range_start) / us;
                         let is_odd = unit_ix % 2 == 1;
@@ -383,8 +392,8 @@ pub(crate) fn span_in_content_ranges(lba: u32, count: u32, ranges: &[(u32, u32)]
     }
 }
 
-// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key trial, no
-// `is_clean` verdict; the refusal decision belongs to `decrypt_span`.
+// AACS scheme step: apply `map`'s per-unit keys to `buf`, in-place — no key trial; the one
+// `is_clean` verdict is `Phase::Verify`'s keep-or-restore. Refusal belongs to `decrypt_span`.
 fn apply_aacs_map(
     buf: &mut [u8],
     keys: &DecryptKeys,
@@ -468,11 +477,27 @@ fn apply_aacs_map(
         // removed by the drive's single de-bus point before this buffer arrived —
         // this path only applies the CPS unit key.
         let key = &unit_keys[key_idx].1;
+        if phase == Phase::Verify {
+            // KU design §5.3 (no public FMTS spec, KS-25/KS-26): keep a unit only if it
+            // verifies; KS-3 [BD] §3.10.1 "A new CBC cipher chain is started for each Aligned Unit".
+            let mut ciphertext = [0u8; aacs::content::ALIGNED_UNIT_LEN];
+            ciphertext.copy_from_slice(chunk);
+            aacs::content::decrypt_unit(chunk, key);
+            if aacs::content::is_clean(chunk, format) {
+                aacs::content::clear_copy_permission_indicator(chunk, format);
+            } else {
+                chunk.copy_from_slice(&ciphertext); // flagged ciphertext: the muxer drops it
+            }
+            return;
+        }
         aacs::content::decrypt_unit(chunk, key);
         // Correct-phase forensic verify (silent unless the map is wrong).
         if matches!(phase, Phase::Even | Phase::Odd) && !aacs::content::is_clean(chunk, format) {
             verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted": a unit
+        // we decrypted (damaged or not) is no longer ciphertext (KU design §5.4, K-13).
+        aacs::content::clear_copy_permission_indicator(chunk, format);
     };
 
     let nthreads = decrypt_threads();
@@ -1177,7 +1202,8 @@ mod tests {
         decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
             .expect("unit-key decrypt over de-bussed content must succeed");
         assert_eq!(
-            buf, clear,
+            buf,
+            aacs::content::cpi_cleared(clear),
             "bus removal (at read) then unit-key decrypt must recover the plaintext exactly"
         );
     }
@@ -1601,7 +1627,8 @@ mod tests {
         decrypt_sectors_mapped_in_content(&mut inside, &keys, 0, &map, Some(&[(0, 3)]))
             .expect("an in-content unit decrypts");
         assert_eq!(
-            inside, clear,
+            inside,
+            aacs::content::cpi_cleared(clear),
             "unit inside content ranges must decrypt to plaintext"
         );
     }
@@ -1644,7 +1671,7 @@ mod tests {
         for i in 0..n {
             assert_eq!(
                 &buf[i * ul..(i + 1) * ul],
-                clear_of(i).as_slice(),
+                aacs::content::cpi_cleared(clear_of(i)).as_slice(),
                 "unit {i} must recover to its own plaintext on the parallel path"
             );
         }
@@ -1857,9 +1884,10 @@ mod tests {
         // Units at LBA 300, 303, 306: content is 300..303 and 306..309.
         decrypt_sectors_mapped_in_content(&mut buf, &keys, 300, &map, Some(&[(300, 3), (306, 3)]))
             .expect("mixed buffer decrypts");
-        assert_eq!(&buf[..ul], clear.as_slice(), "unit 0 is content");
+        let plain = aacs::content::cpi_cleared(clear);
+        assert_eq!(&buf[..ul], plain.as_slice(), "unit 0 is content");
         assert_eq!(&buf[ul..2 * ul], enc.as_slice(), "unit 1 sits in the gap");
-        assert_eq!(&buf[2 * ul..], clear.as_slice(), "unit 2 is content");
+        assert_eq!(&buf[2 * ul..], plain.as_slice(), "unit 2 is content");
     }
 }
 
@@ -1868,7 +1896,7 @@ mod spec_guards {
     use super::*;
     use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
     use crate::disc::ContentFormat;
-    use crate::spec::keys::KS_5_CPI;
+    use crate::spec::keys::{KS_5_CPI, KS_6_TP_EXTRA_HEADER, KS_22_LIBAACS_VERIFY_TS};
 
     const OURS: [u8; 16] = [0xA1; 16];
     const ALT: [u8; 16] = [0xB2; 16];
@@ -1892,8 +1920,8 @@ mod spec_guards {
 
     /// per spec; do not change without a spec citation — KS-5 [BD] §3.10.2: "shall be set
     /// to 11₂ if the data is encrypted": a unit left as ciphertext keeps its CPI bits.
-    /// Covers the alternate FMTS phase and an orphan; the failed `Phase::Verify` leg is
-    /// added with `Phase::Verify` (KU-L1).
+    /// Covers the alternate FMTS phase, an orphan, and a `Phase::Verify` unit that fails
+    /// `is_clean` and is restored.
     #[test]
     fn ciphertext_units_keep_cpi() {
         assert!(
@@ -1936,5 +1964,79 @@ mod spec_guards {
         );
         assert_eq!(orphan, before, "the orphan keeps every byte, CPI included");
         assert_eq!(orphan[0] & 0xC0, 0xC0);
+        // A `Verify` unit our key does not open: restored, every byte and CPI kept.
+        let mut failed = encrypted(&ALT, 4);
+        let before = failed.clone();
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Verify)]);
+        decrypt_sectors_mapped(&mut failed, &keys, 0, &map).expect("a failed verify is no error");
+        assert_eq!(
+            failed, before,
+            "the failed Verify unit is restored as ciphertext"
+        );
+        assert_eq!(cpi(&failed), cpi(&before), "CPI of all 32 packets");
+        assert_eq!(failed[0] & 0xC0, 0xC0, "packet 0's clear CPI still 11₂");
+    }
+
+    /// per spec; do not change without a spec citation — KS-5 [BD] §3.10.2: "shall be set
+    /// to 11₂ if the data is encrypted, or … 00₂ if the data is not encrypted"; KS-6 (CPI is
+    /// the top 2 bits of TP_extra_header); corroborated by KS-22 libaacs `buf[i] &= ~0xc0`.
+    #[test]
+    fn every_decrypted_unit_clears_cpi_in_all_32_packets() {
+        assert!(KS_5_CPI.text.contains("00₂ if the data is not encrypted"));
+        assert!(
+            KS_6_TP_EXTRA_HEADER
+                .text
+                .contains("Copy_permission_indicator 2 uimsbf Arrival_time_stamp 30 uimsbf")
+        );
+        assert!(KS_22_LIBAACS_VERIFY_TS.text.contains("buf[i] &= ~0xc0;"));
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, OURS)],
+            format: ContentFormat::BdTs,
+        };
+        let check = |label: &str, got: &[u8], plain: Vec<u8>| {
+            assert!(
+                cpi(got).iter().all(|&c| c == 0),
+                "{label}: CPI of all 32 packets"
+            );
+            // Byte 0 of each packet keeps its 6 Arrival_time_stamp bits (KS-6).
+            let want = crate::aacs::content::cpi_cleared(plain);
+            assert_eq!(got, &want[..], "{label}: ATS and payload untouched");
+        };
+
+        // A map-keyed unit (`Phase::All`, the base Unit Key).
+        let mut unit = encrypted(&OURS, 7);
+        let mut plain = unit.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        let map = AacsKeyMap::from_ranges(vec![(0, 3, 0)]);
+        decrypt_sectors_mapped(&mut unit, &keys, 0, &map).expect("map-keyed unit decrypts");
+        check("map-keyed", &unit, plain);
+
+        // A DAMAGED map-keyed unit: media garbage, still decrypted, so no longer ciphertext.
+        let mut damaged: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+            .map(|i| (i as u8).wrapping_mul(37) ^ 0x5A)
+            .collect();
+        damaged[0] |= 0xC0;
+        damaged[4] = 0x47; // the clear seed's sync: read on the unit grid
+        let mut plain = damaged.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        decrypt_sectors_mapped(&mut damaged, &keys, 0, &map).expect("no verify on Phase::All");
+        check("damaged map-keyed", &damaged, plain);
+
+        // Our half of a forensic segment (`Phase::Even`, unit 0 of the range).
+        let mut ours = encrypted(&OURS, 9);
+        let mut plain = ours.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Even)]);
+        decrypt_sectors_mapped(&mut ours, &keys, 0, &map).expect("our phase decrypts");
+        check("our forensic phase", &ours, plain);
+
+        // A kept `Phase::Verify` unit (it verified under our key). The on-arrival leg
+        // joins with the on-arrival proof (KU-L2).
+        let mut kept = encrypted(&OURS, 11);
+        let mut plain = kept.clone();
+        crate::aacs::content::decrypt_unit(&mut plain, &OURS);
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Verify)]);
+        decrypt_sectors_mapped(&mut kept, &keys, 0, &map).expect("a verified unit decrypts");
+        check("kept Verify", &kept, plain);
     }
 }

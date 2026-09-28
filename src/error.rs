@@ -300,6 +300,9 @@ pub const E_EMPTY_IMAGE: u16 = 9060;
 /// "artifact_lock", "verify"). "An expired `StallTimer` produces
 /// `Error::TimedOut { op }`" (stop-design-v5 §2.1).
 pub const E_TIMED_OUT: u16 = 9073;
+/// `mpg://` output but the title has no video track a program stream can carry
+/// (MPEG-1/2, H.264, HEVC or VC-1). The `mpg://` twin of [`E_MP4_NO_VIDEO_TRACK`].
+pub const E_MPG_NO_VIDEO_TRACK: u16 = 9074;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -913,6 +916,9 @@ pub enum Error {
     TimedOut {
         op: &'static str,
     },
+    /// `mpg://` target title has no video track a program stream can carry. See
+    /// [`E_MPG_NO_VIDEO_TRACK`]. Declared ahead of the `mpg://` sink that raises it.
+    MpgNoVideoTrack,
 }
 
 impl Error {
@@ -1053,6 +1059,7 @@ impl Error {
             Error::StreamClosed => E_STREAM_CLOSED,
             Error::StreamHeaderWritten => E_STREAM_HEADER_WRITTEN,
             Error::TimedOut { .. } => E_TIMED_OUT,
+            Error::MpgNoVideoTrack => E_MPG_NO_VIDEO_TRACK,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
@@ -1330,6 +1337,7 @@ impl From<Error> for std::io::Error {
             // (E_MP4_INVALID), or a source whose tracks the mux can't use — no
             // video track / missing codec-private config. All are invalid data.
             E_MP4_NO_VIDEO_TRACK
+            | E_MPG_NO_VIDEO_TRACK
             | E_MP4_INVALID
             | E_MP4_MISSING_CODEC_PRIVATE
             | E_MP4_UNKNOWN_RESOLUTION => std::io::ErrorKind::InvalidData,
@@ -1667,6 +1675,7 @@ mod tests {
             Error::WholeDiscKeyMissing.code(),
             Error::AacsVidNeedsDisc.code(),
             Error::TimedOut { op: "verify" }.code(),
+            Error::MpgNoVideoTrack.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1757,6 +1766,7 @@ mod tests {
             (Error::WholeDiscKeyMissing, E_WHOLE_DISC_KEY_MISSING),
             (Error::AacsVidNeedsDisc, E_AACS_VID_NEEDS_DISC),
             (Error::TimedOut { op: "verify" }, E_TIMED_OUT),
+            (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
             (
                 Error::BusStreamUnmapped {
                     files: "/BDMV/STREAM/00002.m2ts".into(),
@@ -2127,6 +2137,7 @@ mod tests {
             (Error::StreamClosed, E_STREAM_CLOSED),
             (Error::StreamHeaderWritten, E_STREAM_HEADER_WRITTEN),
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
+            (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
             (Error::Mp4UnknownResolution, E_MP4_UNKNOWN_RESOLUTION),
@@ -2222,6 +2233,25 @@ mod tests {
         assert_eq!(io.kind(), ErrorKind::TimedOut);
         // The declared-constants table (parsed from source) carries the code.
         assert!(declared_error_codes().contains(&("E_TIMED_OUT", E_TIMED_OUT)));
+    }
+
+    /// MPG-L0: E9074's code, Display and `ErrorKind` (the E9048 bucket). "No carriable
+    /// video → `MpgNoVideoTrack` (E9074), as `mp4://` does with E9048" (mpg design v5 §0).
+    /// Declared only; `mpg://` (L2) raises it. Per spec; do not change without a design citation.
+    #[test]
+    fn mpg_no_video_track_code_display_kind() {
+        use std::io::ErrorKind;
+        let e = Error::MpgNoVideoTrack;
+        assert_eq!(e.code(), 9074);
+        assert_eq!(e.code(), E_MPG_NO_VIDEO_TRACK);
+        assert_eq!(e.to_string(), "E9074");
+        let io: std::io::Error = e.into();
+        assert_eq!(io.kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            io.kind(),
+            std::io::Error::from(Error::Mp4NoVideoTrack).kind()
+        );
+        assert!(declared_error_codes().contains(&("E_MPG_NO_VIDEO_TRACK", E_MPG_NO_VIDEO_TRACK)));
     }
 
     /// LT8 companion (KU v3.4 J11): E7034's code, Display and its `ErrorKind`

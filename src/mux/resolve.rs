@@ -621,6 +621,38 @@ pub fn output(
     title: &crate::disc::DiscTitle,
     source: Option<&super::videomap::SourceInfo>,
 ) -> io::Result<Box<dyn crate::pes::Stream>> {
+    output_with(url, title, source, None)
+}
+
+/// What a file output shares with the mux (§2.10): the flush counters (the consumer's
+/// progress) and the op's stop token for its flush backpressure.
+pub(crate) struct OutputFlush<'a> {
+    pub(crate) progress: &'a crate::io::FlushProgress,
+    pub(crate) halt: &'a crate::halt::Halt,
+}
+
+// A file output's bounded-cache writer, sharing `flush` when given.
+fn writeback_file(
+    path: &Path,
+    size_hint: u64,
+    flush: Option<&OutputFlush>,
+) -> io::Result<crate::io::WritebackFile> {
+    let mut w = crate::io::WritebackFile::create_with_size_hint(path, size_hint)?;
+    if let Some(f) = flush {
+        w.set_flush_progress(f.progress.clone());
+        w.set_halt(f.halt.clone());
+    }
+    Ok(w)
+}
+
+// [`output`], with the file outputs sharing `flush` (the mux driver's path).
+pub(crate) fn output_with(
+    url: &str,
+    title: &crate::disc::DiscTitle,
+    source: Option<&super::videomap::SourceInfo>,
+    flush: Option<OutputFlush>,
+) -> io::Result<Box<dyn crate::pes::Stream>> {
+    let flush = flush.as_ref();
     let parsed = parse_url(url);
     match parsed {
         StreamUrl::Mkv { ref path } => {
@@ -631,7 +663,7 @@ pub fn output(
             let writer: Box<dyn super::WriteSeek + Send> =
                 Box::new(std::io::BufWriter::with_capacity(
                     IO_BUF_SIZE,
-                    crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
+                    writeback_file(path, title.size_bytes, flush)?,
                 ));
             Ok(Box::new(MkvStream::create(writer, title, Some(path))?))
         }
@@ -642,7 +674,7 @@ pub fn output(
             // seek WritebackFile handles. BufWriter coalesces moov writes.
             let writer = std::io::BufWriter::with_capacity(
                 IO_BUF_SIZE,
-                crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
+                writeback_file(path, title.size_bytes, flush)?,
             );
             Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
         }
@@ -650,7 +682,7 @@ pub fn output(
             validate_file_path(path, "m2ts")?;
             let writer = std::io::BufWriter::with_capacity(
                 IO_BUF_SIZE,
-                crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
+                writeback_file(path, title.size_bytes, flush)?,
             );
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }
@@ -1028,7 +1060,7 @@ fn resolve_fmts_key_map(
             let probed =
                 probe_fmts_index_keys(reader, &clip_extents, &segments, fetch, format, halt)?;
             // Only memoise a run whose every index reached a DEFINITE phase —
-            // a read-faulted index defaulting to `Phase::All` is a transient
+            // a read-faulted index falling back to `Phase::Verify` is a transient
             // fault, not a property of these extents; caching it would spread.
             if probed.all_phases_definite {
                 memo.insert(ek, (probed.keys.clone(), probed.phases.clone()));
@@ -1077,10 +1109,11 @@ fn resolve_fmts_key_map(
             unresolved += 1;
             continue;
         };
+        // No resolved phase → `Verify` (KU design §5.3, K-5), never an unverified `All`.
         let phase = phase_of_index
             .get(&seg.index)
             .copied()
-            .unwrap_or(crate::decrypt::Phase::All);
+            .unwrap_or(crate::decrypt::Phase::Verify);
         let start_byte = seg.start_spn as u64 * 192;
         let end_byte = (seg.end_spn as u64 + 1) * 192;
         // Clip bytes → LBAs through the FORENSIC CLIP's extents, never the
@@ -1144,7 +1177,7 @@ fn resolve_fmts_key_map(
 struct FmtsIndexKeys {
     keys: Vec<[u8; 16]>,
     phases: std::collections::HashMap<u16, crate::decrypt::Phase>,
-    /// Every index reached a DEFINITE phase — no index fell back to `Phase::All`
+    /// Every index reached a DEFINITE phase — no index fell back to `Phase::Verify`
     /// after [`IndexProbe::ReadFault`]. Only such a run is safe to memoise; see
     /// [`resolve_mux_key_map_cached`].
     all_phases_definite: bool,
@@ -1271,10 +1304,10 @@ fn probe_fmts_index_keys(
                 return Err(crate::error::Error::FmtsKeyMissing.into());
             }
             IndexProbe::ReadFault => {
-                // EVERY probe read faulted (transient drive fault). Zero
-                // evidence ⇒ not a wrong key. Leave phase unresolved so the
-                // range-builder defaults to `Phase::All`. Degraded, never abort.
-                tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: index phase probe read-faulted on every segment — defaulting Phase::All (recoverable read fault, not a wrong key)");
+                // EVERY probe read faulted (zero evidence ⇒ not a wrong key; never
+                // abort). KU design §5.3 (evidence KS-25/KS-26): `Phase::Verify`.
+                tracing::warn!(target: "freemkv::keysource", index = tag, "fmts: index phase probe read-faulted on every segment — Phase::Verify: each unit kept only if it verifies (recoverable read fault, not a wrong key)");
+                phase_of_index.insert(tag, crate::decrypt::Phase::Verify);
                 all_phases_definite = false;
             }
         }
@@ -1791,16 +1824,19 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     let (rx, recycle_tx, shell) = prefetched.into_channels();
 
     let (parsers, pid_to_track, ts, ps) = build_demux_state(&title, format);
-    let (demux_thread, demux_rx) =
-        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, halt, ts, ps)
-            .map_err(|e| -> io::Error { e.into() })?;
-    Ok(PipelinedPesStream::new(
-        demux_thread,
-        demux_rx,
-        title,
-        parsers,
-        pid_to_track,
-    ))
+    let (demux_thread, demux_rx) = super::demux_thread::DemuxThread::spawn_zero_copy(
+        rx,
+        recycle_tx,
+        shell,
+        halt.clone(),
+        ts,
+        ps,
+    )
+    .map_err(|e| -> io::Error { e.into() })?;
+    Ok(
+        PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
+            .with_halt(halt),
+    )
 }
 
 // Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head
@@ -2478,6 +2514,8 @@ mod tests {
     // Empty extents -> clean immediate EOF, no panic/hang.
     #[test]
     fn build_iso_pipeline_empty_extents_clean_eof() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let title = aac_audio_title(0x1100); // extents empty by default
         let mut stream = build_iso_pipeline(
             MemSource { data: Vec::new() },
@@ -2504,6 +2542,8 @@ mod tests {
     // then clean EOF.
     #[test]
     fn build_iso_pipeline_delivers_one_frame_then_eof() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
         let pes = audio_pes(&es);
         let pkt = bdts_data_packet(0x1100, true, &pes);
@@ -2568,6 +2608,8 @@ mod tests {
     // a frame from the excluded PID.
     #[test]
     fn build_iso_pipeline_pruned_title_drops_unselected_pid_frames() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
         use crate::mux::select::{PidFilter, StreamSelection};
 
@@ -2648,6 +2690,8 @@ mod tests {
     /// would spin the producer forever). Surfaced as an io error, not a hang.
     #[test]
     fn build_iso_pipeline_zero_batch_rejected() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let title = aac_audio_title(0x1100);
         let res = build_iso_pipeline(
             MemSource { data: Vec::new() },
@@ -2667,6 +2711,8 @@ mod tests {
     // scrambled-uncrackable must HARD-FAIL, never mux garbage.
     #[test]
     fn build_iso_pipeline_dvd_none_keys_scrambled_hard_fails() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         // One CSS-scrambled, crib-less (uncrackable) MPEG-PS sector.
         let key = [0x11u8, 0x22, 0x33, 0x44, 0x55];
         let mut sec = vec![0u8; 2048];
@@ -4352,8 +4398,7 @@ mod tests {
         );
     }
 
-    // A read-faulted phase (defaulted to Phase::All) must NOT be memoised; the next title
-    // re-probes.
+    // A read-faulted phase (Phase::Verify) must NOT be memoised; the next title re-probes.
     #[test]
     fn fmts_read_faulted_phase_is_not_memoised() {
         use std::sync::atomic::Ordering;
@@ -4380,8 +4425,8 @@ mod tests {
         .expect("a read fault must NOT abort a rip whose index keys are good");
         assert_eq!(
             first.entry_for(10_600).map(|(_, p, _)| p),
-            Some(crate::decrypt::Phase::All),
-            "the read-faulted index defaults to Phase::All"
+            Some(crate::decrypt::Phase::Verify),
+            "the read-faulted index falls back to Phase::Verify (K-5)"
         );
         assert_eq!(
             first.entry_for(10_300).map(|(_, p, _)| p),
@@ -4408,6 +4453,61 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "and re-anchors rather than inheriting a degraded answer"
+        );
+    }
+
+    /// LK14 (K-5), per evidence (no public FMTS spec) — KS-25, KS-26: an index whose every
+    /// phase probe faulted is decrypted unit by unit, each kept only if it verifies; per spec
+    /// KS-3 [BD] §3.10.1 "A new CBC cipher chain is started for each Aligned Unit".
+    #[test]
+    fn fmts_verify_phase_drops_wrong_half() {
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, is_clean};
+        use crate::spec::keys::{
+            KS_3_CBC_PER_UNIT, KS_25_AACS2_EVIDENCE, KS_26_FMTS_ANCHOR_EVIDENCE,
+        };
+        assert!(
+            KS_3_CBC_PER_UNIT
+                .text
+                .contains("new CBC cipher chain is started for each")
+        );
+        assert_eq!(KS_25_AACS2_EVIDENCE.kind, crate::spec::QuoteKind::Evidence);
+        assert_eq!(
+            KS_26_FMTS_ANCHOR_EVIDENCE.kind,
+            crate::spec::QuoteKind::Evidence
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = counting_fmts_fetch(calls);
+        // Every read of the index-2 segment (LBAs 10600..10840) faults: its phase is unknown.
+        let mut reader = FmtsDisc::new();
+        reader.fault_span = Some((10_600, 10_840));
+        let mut keys = fmts_keys();
+        let map = super::resolve_mux_key_map(
+            &mut reader,
+            &fmts_title(FMTS_CONTENT_SECTORS),
+            &mut keys,
+            Some(&fetch),
+            ContentFormat::BdTs,
+            None,
+        )
+        .expect("a read-faulted phase probe never aborts the rip");
+        // Later the segment reads: unit 0 is index 2's half, unit 1 the other variant's.
+        let mut buf = vec![0u8; 2 * ALIGNED_UNIT_LEN];
+        FmtsDisc::new()
+            .read_sectors(10_600, 6, &mut buf, false)
+            .unwrap();
+        let other_half = buf[ALIGNED_UNIT_LEN..].to_vec();
+        crate::decrypt::decrypt_sectors_mapped(&mut buf, &keys, 10_600, &map)
+            .expect("a unit that fails the verify is left as ciphertext, not an error");
+        let (ours, theirs) = buf.split_at(ALIGNED_UNIT_LEN);
+        assert!(is_clean(ours, ContentFormat::BdTs), "our half decrypts");
+        assert!(
+            !aacs_unit_encrypted(ours, ContentFormat::BdTs),
+            "and reads clear"
+        );
+        assert!(theirs == other_half, "the wrong half is left as ciphertext");
+        assert!(
+            aacs_unit_encrypted(theirs, ContentFormat::BdTs),
+            "still flagged"
         );
     }
 

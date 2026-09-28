@@ -5,6 +5,7 @@
 //! Platform-specific preallocation/durable-flush primitives live in per-OS sibling modules,
 //! dispatched via the cfg-gated `mod` decls below.
 
+mod flusher;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -26,8 +27,12 @@ use windows as platform;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
+use super::flush::{DurableTiming, FlushOps, FlushProgress, FlushTiming};
 use super::writeback::WritebackPipeline;
+use crate::halt::Halt;
+use flusher::Flusher;
 
 // Linux sync_file_range granularity. 32 MiB measured best on a 1 GbE NFS
 // mount (8/64/128 MiB all worse); override via FREEMKV_WRITEBACK_CHUNK_MIB.
@@ -57,6 +62,19 @@ pub struct WritebackFile {
     seek_count: u64,
     /// Sum of |delta| over all position-moving seeks, in bytes.
     seek_bytes: u64,
+    /// Shared flush counters (§2.10): accepted writes and completed flushes.
+    flush: FlushProgress,
+    /// Bytes accepted so far (any position): what the flusher must make durable.
+    written: u64,
+    /// The in-write flusher (§2.10): started at the first write where the OS page cache
+    /// has no bounded writeback of its own (Linux NFS/degraded, macOS, Windows).
+    flusher: Option<Flusher>,
+    /// Whether a flusher applies at all (a regular file); tests force it.
+    flushable: bool,
+    force_flusher: bool,
+    ops: Arc<dyn FlushOps>,
+    timing: FlushTiming,
+    halt: Option<Halt>,
 }
 
 impl WritebackFile {
@@ -64,16 +82,119 @@ impl WritebackFile {
     /// once so the pipeline starts tracking from wherever the file
     /// already is (typically 0 for fresh files; non-zero for resumed
     /// or appended files).
-    pub fn new(mut file: File) -> io::Result<Self> {
+    pub fn new(file: File) -> io::Result<Self> {
+        let ops = super::flush::os_ops(&file);
+        Self::with_ops(file, ops, FlushTiming::default(), false)
+    }
+
+    fn with_ops(
+        mut file: File,
+        ops: Arc<dyn FlushOps>,
+        timing: FlushTiming,
+        force_flusher: bool,
+    ) -> io::Result<Self> {
         let pos = file.stream_position()?;
-        let pipeline = WritebackPipeline::new(&file, pos, writeback_chunk_bytes());
+        let mut pipeline = WritebackPipeline::new(&file, pos, writeback_chunk_bytes());
+        let flush = FlushProgress::default();
+        pipeline.set_flush_progress(flush.clone());
+        flush.note_total(pos);
+        let flushable = file.metadata().is_ok_and(|m| m.is_file());
         Ok(Self {
             file,
             pipeline,
             pos,
             seek_count: 0,
             seek_bytes: 0,
+            flush,
+            written: 0,
+            flusher: None,
+            flushable,
+            force_flusher,
+            ops,
+            timing,
+            halt: None,
         })
+    }
+
+    /// The token a write blocked on flush backpressure, or [`sync_all`](Self::sync_all),
+    /// observes: a cancel returns [`E_HALTED`](crate::error::E_HALTED) at once. `flush`
+    /// (a container's `close()`) is not interrupted: a committed close completes.
+    pub fn set_halt(&mut self, halt: Halt) {
+        self.halt = Some(halt);
+    }
+
+    /// Share `flush`'s counters (§2.10 item 3): give it the pipeline consumer's
+    /// [`Progress`](crate::halt::Progress) so a flushing `close()` counts as progress.
+    /// Call before the first write.
+    pub fn set_flush_progress(&mut self, flush: FlushProgress) {
+        flush.note_total(self.flush.bytes_total());
+        self.pipeline.set_flush_progress(flush.clone());
+        if let Some(f) = &self.flusher {
+            f.set_flush_progress(flush.clone());
+        }
+        self.flush = flush;
+    }
+
+    /// This file's flush counters: accepted writes and completed flushes.
+    pub fn flush_progress(&self) -> &FlushProgress {
+        &self.flush
+    }
+
+    // Flusher mode over `ops` whatever the OS, with the timing as a parameter.
+    #[cfg(test)]
+    pub(crate) fn with_flush_ops(
+        file: File,
+        ops: Arc<dyn FlushOps>,
+        timing: FlushTiming,
+    ) -> io::Result<Self> {
+        Self::with_ops(file, ops, timing, true)
+    }
+
+    // The flusher's current chunk size.
+    #[cfg(test)]
+    pub(crate) fn chunk_bytes(&self) -> u64 {
+        self.flusher
+            .as_ref()
+            .map_or(self.timing.chunk_min, Flusher::chunk)
+    }
+
+    // Start the flusher once this file needs one (Linux: only NFS or a degraded pipeline).
+    fn ensure_flusher(&mut self) {
+        let wanted = self.force_flusher || (self.flushable && self.pipeline.needs_flusher());
+        if self.flusher.is_some() || !wanted {
+            return;
+        }
+        let (ops, flush) = (self.ops.clone(), self.flush.clone());
+        match Flusher::spawn(&self.file, ops, self.timing, flush, self.written) {
+            Ok(f) => self.flusher = Some(f),
+            Err(e) => tracing::warn!(
+                target: "freemkv::io",
+                error = %e,
+                "WritebackFile flusher did not start; flushing at sync_all only"
+            ),
+        }
+    }
+
+    // Before a write: a latched error, then the flusher's backpressure (halt-aware).
+    fn before_write(&mut self) -> io::Result<()> {
+        self.check_writeback()?;
+        self.ensure_flusher();
+        match &self.flusher {
+            Some(f) => f.wait_room(self.written, self.halt.as_ref()),
+            None => Ok(()),
+        }
+    }
+
+    // After `n` bytes were accepted: progress ("writing"), and a chunk for the flusher.
+    fn after_write(&mut self, n: usize) {
+        self.pos += n as u64;
+        self.written += n as u64;
+        self.pipeline.note_progress(self.pos);
+        self.flush.note_total(self.pos);
+        self.flush.progress().bump();
+        if let Some(f) = &self.flusher {
+            f.note_written(self.written);
+        }
     }
 
     /// Create a new file at `path` (truncating any existing contents)
@@ -109,12 +230,13 @@ impl WritebackFile {
         Self::new(file)
     }
 
-    /// Drain in-flight writeback then issue a full fsync, in place of `File::sync_all`. Bounded
-    /// by [`crate::io::bounded::bounded_syscall`] on Linux/macOS (60 s), so a wedged NFS server
-    /// cannot trap the caller indefinitely; `Ok(())` is a durability barrier. Failure is
-    /// [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT), [`E_HALTED`](crate::error::E_HALTED),
-    /// or [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST), or the OS error of a failed
-    /// chunk writeback (sticky: later writes fail with it too).
+    /// Drain in-flight writeback, flush the rest, then the final flush
+    /// ([`durable_sync_file`](crate::io::durable_sync_file)), in place of `File::sync_all`.
+    /// It waits while the flush makes progress and fails with
+    /// [`E_SYNC_TIMEOUT`](crate::error::E_SYNC_TIMEOUT) only after 60 s without any (§2.10);
+    /// a cancelled [`set_halt`](Self::set_halt) token is [`E_HALTED`](crate::error::E_HALTED)
+    /// at once. Also [`E_SYNC_WORKER_LOST`](crate::error::E_SYNC_WORKER_LOST), or the OS error
+    /// of a failed chunk writeback (sticky: later writes fail with it too).
     pub fn sync_all(&mut self) -> io::Result<()> {
         if self.seek_count > 0 {
             tracing::debug!(
@@ -125,7 +247,21 @@ impl WritebackFile {
             );
         }
         self.pipeline.finalize();
-        let synced = platform::durable_sync(&self.file);
+        let synced = self.drain(self.halt.clone().as_ref()).and_then(|()| {
+            let timing = DurableTiming {
+                stall: self.timing.stall,
+                sample_every: self.timing.sample_every,
+                ..DurableTiming::default()
+            };
+            let flush = &self.flush;
+            super::flush::durable_sync_file_with(
+                &self.file,
+                self.halt.as_ref(),
+                |done, _| flush.durable_at_least(done),
+                self.ops.clone(),
+                timing,
+            )
+        });
         // A latched writeback error outranks fsync's verdict: the failed
         // WAIT_AFTER consumed it, so fsync can return 0 over lost data.
         match self.pipeline.error() {
@@ -134,34 +270,49 @@ impl WritebackFile {
         }
     }
 
+    // Everything written handed to the flusher and made durable, if one runs. After a Stop
+    // only this file's chunk completions are progress (a close on NFS stays bounded).
+    fn drain(&self, abort: Option<&Halt>) -> io::Result<()> {
+        match &self.flusher {
+            Some(f) => f.drain(self.written, abort, self.halt.as_ref()),
+            None => Ok(()),
+        }
+    }
+
     fn check_writeback(&self) -> io::Result<()> {
-        self.pipeline.error().map_or(Ok(()), Err)
+        if let Some(e) = self.pipeline.error() {
+            return Err(e);
+        }
+        self.flusher
+            .as_ref()
+            .and_then(Flusher::error)
+            .map_or(Ok(()), Err)
     }
 }
 
 impl Write for WritebackFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.check_writeback()?;
+        self.before_write()?;
         let n = self.file.write(buf)?;
-        self.pos += n as u64;
-        self.pipeline.note_progress(self.pos);
+        self.after_write(n);
         Ok(n)
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.check_writeback()?;
+        self.before_write()?;
         self.file.write_all(buf)?;
-        self.pos += buf.len() as u64;
-        self.pipeline.note_progress(self.pos);
+        self.after_write(buf.len());
         Ok(())
     }
 
-    // Drains the in-flight chunk so its writeback verdict is known: sinks finished
-    // by `flush` alone (m2ts behind a BufWriter) must still see a latched error.
+    // Drains the in-flight chunk and the flusher so their verdict is known: sinks finished
+    // by `flush` alone (m2ts behind a BufWriter) must still see a latched error. Stall-bounded
+    // but not halt-aware: this is a container's close, which a Stop does not abandon (§2.5).
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()?;
         self.pipeline.finalize();
-        self.check_writeback()
+        let drained = self.drain(None);
+        self.check_writeback().and(drained)
     }
 }
 

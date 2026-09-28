@@ -1,0 +1,28 @@
+# Spec-governed code sites (KU design §3.6.1 rule 11): `<file>\t<fn>\t<id>`, one row per
+# (site, quote). `spec_governed_sites_cite_the_spec` checks that the body of `fn <fn>` in
+# `<file>` names `<id>`. KU rows are KS-n; Stop adds its SS-n rows here.
+src/aacs/content.rs	clear_copy_permission_indicator	KS-5
+src/aacs/content.rs	clear_copy_permission_indicator	KS-6
+src/aacs/content.rs	clear_copy_permission_indicator	KS-22
+src/decrypt.rs	apply_aacs_map	KS-3
+src/decrypt.rs	apply_aacs_map	KS-5
+src/decrypt.rs	apply_aacs_map	KS-25
+src/decrypt.rs	apply_aacs_map	KS-26
+src/mux/resolve.rs	probe_fmts_index_keys	KS-25
+src/mux/resolve.rs	probe_fmts_index_keys	KS-26
+src/disc/mod.rs	declared_cps_units	KS-14
+src/whole_disc.rs	single_cps_key_slot	KS-14
+src/whole_disc.rs	single_cps_key_slot	KS-27
+src/sector/bus_removal.rs	debus_read	KS-18
+src/scsi/mod.rs	parse_sense_progress	SS-1
+src/scsi/mod.rs	parse_sense_progress	SS-2
+src/drive/mod.rs	wait_ready_with	SS-1
+src/drive/mod.rs	wait_ready_with	SS-3
+src/drive/mod.rs	wait_ready_with	SS-4
+src/drive/allow.rs	is_allow	SS-5
+src/drive/mod.rs	lock_tray	SS-5
+src/drive/mod.rs	unlock_tray	SS-5
+src/drive/allow.rs	is_eject	SS-6
+src/drive/mod.rs	eject	SS-6
+src/drive/mod.rs	start_unit	SS-6
+src/drive/mod.rs	note_ledger	SS-7

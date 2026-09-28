@@ -28,6 +28,10 @@ pub(crate) mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
 
+pub(crate) mod allow;
+#[cfg(test)]
+mod stop_tests;
+
 // Pick the platform module ONCE, here, so the cross-platform entry points below
 // dispatch through `platform::…` with no per-function `#[cfg]` in their bodies.
 #[cfg(target_os = "linux")]
@@ -39,12 +43,15 @@ pub(crate) use windows as platform;
 
 use crate::error::{Error, Result};
 use crate::event::Event;
+use crate::halt::{Halt, Progress};
 use crate::identity::DriveId;
 use crate::scsi::ScsiTransport;
 use crate::sector::SectorSource;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+pub(crate) use allow::CleanupCtx;
 
 /// Physical state of the drive tray and disc.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,8 +121,12 @@ pub struct Drive {
     matched_name_cache: std::sync::OnceLock<String>,
     pub drive_id: DriveId,
     device_path: String,
-    /// Halt flag — when set, Drive::read() bails at the next check point.
-    halt: Arc<AtomicBool>,
+    /// The op token every CDB is checked against (§2.2).
+    slot: Slot,
+    /// Bumped on every `exec` completion, busy while one is in flight (T29 feed).
+    progress: Option<Progress>,
+    /// AGIDs allocated through this Drive and not yet invalidated (§2.2 ledger).
+    agids: u8,
     /// Event handler — fires for read errors and library-level state changes.
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
     /// The SINGLE AACS bus-encryption removal point. Decided ONCE from the
@@ -142,41 +153,134 @@ pub struct Drive {
     block_dev_fd: Option<std::os::unix::io::RawFd>,
 }
 
+/// Which token a Drive checks every CDB against (stop design §2.2).
+#[derive(Debug)]
+enum Slot {
+    /// `own`: the Drive made the token itself ([`Drive::open`]); `false`: the caller's
+    /// op token ([`Drive::open_with`], [`Drive::attach`]).
+    Attached { token: Halt, own: bool },
+    /// No token: `exec` panics in debug, and in release warns once and runs
+    /// uncancellably.
+    Detached,
+}
+
+impl Slot {
+    fn own() -> Self {
+        Slot::Attached {
+            token: Halt::new(),
+            own: true,
+        }
+    }
+
+    fn foreign(halt: &Halt) -> Self {
+        Slot::Attached {
+            token: halt.clone(),
+            own: false,
+        }
+    }
+
+    fn token(&self) -> Option<&Halt> {
+        match self {
+            Slot::Attached { token, .. } => Some(token),
+            Slot::Detached => None,
+        }
+    }
+}
+
+/// While alive, the Drive checks a `ScanOptions.halt` alias; dropping it (on every
+/// exit, unwind included) restores the slot it replaced (§2.2).
+pub(crate) struct AliasGuard<'a> {
+    drive: &'a mut Drive,
+    saved: Option<Slot>,
+}
+
+impl std::ops::Deref for AliasGuard<'_> {
+    type Target = Drive;
+    fn deref(&self) -> &Drive {
+        self.drive
+    }
+}
+
+impl std::ops::DerefMut for AliasGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Drive {
+        self.drive
+    }
+}
+
+impl Drop for AliasGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.saved.take() {
+            self.drive.slot = slot;
+        }
+    }
+}
+
 impl Drive {
+    /// Open the drive with its own token, cancelled by [`halt`](Self::halt).
     pub fn open(device: &Path) -> Result<Self> {
+        Self::open_slot(device, Slot::own())
+    }
+
+    /// Open the drive checking the caller's op token: identification and every later
+    /// CDB are refused once `halt` is cancelled.
+    pub fn open_with(device: &Path, halt: &Halt) -> Result<Self> {
+        Self::open_slot(device, Slot::foreign(halt))
+    }
+
+    fn open_slot(device: &Path, slot: Slot) -> Result<Self> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "open", device = %device.display(), "begin");
-        let mut transport = crate::scsi::open(device)?;
-        let drive_id = DriveId::from_drive(transport.as_mut())?;
+        let transport = match slot.token() {
+            Some(halt) => crate::scsi::open_with(device, halt)?,
+            None => crate::scsi::open(device)?,
+        };
+        let mut drive = Self::bare(transport, device.to_string_lossy().to_string(), slot);
+        drive.drive_id = DriveId::identify(&mut |cdb, dir, buf, t| drive.exec(cdb, dir, buf, t))?;
         tracing::info!(
             target: "freemkv::drive",
             phase = "open",
             device = %device.display(),
-            vendor = %drive_id.vendor_id.trim(),
-            product = %drive_id.product_id.trim(),
+            vendor = %drive.drive_id.vendor_id.trim(),
+            product = %drive.drive_id.product_id.trim(),
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "end"
         );
-
         #[cfg(target_os = "linux")]
-        let block_dev_fd = open_block_device_for_sg(device);
+        {
+            drive.block_dev_fd = open_block_device_for_sg(device);
+        }
+        Ok(drive)
+    }
 
-        Ok(Drive {
-            scsi: transport,
+    // A Drive over `scsi` with a blank identity (filled in by the caller).
+    fn bare(scsi: Box<dyn ScsiTransport>, device_path: String, slot: Slot) -> Self {
+        Drive {
+            scsi,
             unlocker_name: None,
             oem_vid: None,
             init_ran: false,
             tray_locked: false,
             matched_name_cache: std::sync::OnceLock::new(),
-            drive_id,
-            device_path: device.to_string_lossy().to_string(),
-            halt: Arc::new(AtomicBool::new(false)),
+            drive_id: DriveId {
+                vendor_id: String::new(),
+                product_id: String::new(),
+                product_revision: String::new(),
+                vendor_specific: String::new(),
+                firmware_date: String::new(),
+                serial_number: String::new(),
+                raw_inquiry: Vec::new(),
+                raw_gc_010c: Vec::new(),
+            },
+            device_path,
+            slot,
+            progress: None,
+            agids: 0,
             event_fn: None,
             bus_stage: crate::sector::bus_removal::BusStage::Passthrough,
             bus_gate: None,
             #[cfg(target_os = "linux")]
-            block_dev_fd,
-        })
+            block_dev_fd: None,
+        }
     }
 
     /// Set the SINGLE AACS bus-removal stage for this drive, decided once from
@@ -227,31 +331,21 @@ impl Drive {
     // command-builder/response-parser logic can be exercised against a mock.
     #[cfg(test)]
     pub(crate) fn from_transport_for_test(scsi: Box<dyn ScsiTransport>) -> Self {
-        Drive {
-            scsi,
-            unlocker_name: None,
-            oem_vid: None,
-            init_ran: false,
-            tray_locked: false,
-            matched_name_cache: std::sync::OnceLock::new(),
-            drive_id: DriveId {
-                vendor_id: String::new(),
-                product_id: String::new(),
-                product_revision: String::new(),
-                vendor_specific: String::new(),
-                firmware_date: String::new(),
-                serial_number: String::new(),
-                raw_inquiry: Vec::new(),
-                raw_gc_010c: Vec::new(),
-            },
-            device_path: "test".to_string(),
-            halt: Arc::new(AtomicBool::new(false)),
-            event_fn: None,
-            bus_stage: crate::sector::bus_removal::BusStage::Passthrough,
-            bus_gate: None,
-            #[cfg(target_os = "linux")]
-            block_dev_fd: None,
-        }
+        Self::bare(scsi, "test".to_string(), Slot::own())
+    }
+
+    /// Test fixture (feature `test-util`): a Drive over any transport (e.g.
+    /// [`crate::test_util::FakeTransport`]) with its own token and a blank identity.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn from_transport(scsi: Box<dyn ScsiTransport>) -> Self {
+        Self::bare(scsi, "test".to_string(), Slot::own())
+    }
+
+    /// Test fixture (feature `test-util`): [`from_transport`](Self::from_transport)
+    /// checking the caller's op token, as [`open_with`](Self::open_with) does.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn from_transport_with(scsi: Box<dyn ScsiTransport>, halt: &Halt) -> Self {
+        Self::bare(scsi, "test".to_string(), Slot::foreign(halt))
     }
 
     /// Test-only: mark the drive as claimed by a named firmware unlocker at
@@ -269,19 +363,21 @@ impl Drive {
         self.oem_vid = Some(vid);
     }
 
-    /// Get a clone of the halt flag. Set to true to interrupt Drive::read().
-    pub fn halt_flag(&self) -> Arc<AtomicBool> {
-        self.halt.clone()
+    /// The attached token as a raw flag (a view over the same bit, so setting it
+    /// is a Stop). A detached Drive hands out a fresh, never-read flag.
+    pub fn halt_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        match self.slot.token() {
+            Some(t) => t.as_arc().clone(),
+            None => Arc::default(),
+        }
     }
 
-    /// Halt the drive — Drive::read() will bail at the next check point.
+    /// Cancel the attached token: the next CDB is refused, and a READ in flight is
+    /// discarded when it completes.
     pub fn halt(&self) {
-        self.halt.store(true, Ordering::Relaxed);
-    }
-
-    /// Clear the halt flag for the next operation.
-    pub fn clear_halt(&self) {
-        self.halt.store(false, Ordering::Relaxed);
+        if let Some(t) = self.slot.token() {
+            t.cancel();
+        }
     }
 
     /// Set an event handler for read recovery events.
@@ -289,27 +385,180 @@ impl Drive {
         self.event_fn = Some(Box::new(f));
     }
 
-    pub(crate) fn is_halted(&self) -> bool {
-        self.halt.load(Ordering::Relaxed)
+    /// The token every CDB is checked against, or `None` once [`detach`](Self::detach)ed.
+    pub fn token(&self) -> Option<&Halt> {
+        self.slot.token()
     }
 
-    // Halt-aware SCSI execute: returns `Err(Halted)` if the flag is set before
-    // dispatch or by completion. Keeps Drive::read free of explicit halt checks.
-    pub(crate) fn checked_exec(
+    /// Check the caller's op token from now on (it replaces the Drive's own).
+    pub fn attach(&mut self, halt: &Halt) {
+        self.slot = Slot::foreign(halt);
+    }
+
+    /// Stop checking any token, handing back the one that was attached. Until the
+    /// next [`attach`](Self::attach), `exec` panics in debug builds and in release
+    /// warns once and runs uncancellably.
+    pub fn detach(&mut self) -> Option<Halt> {
+        match std::mem::replace(&mut self.slot, Slot::Detached) {
+            Slot::Attached { token, .. } => Some(token),
+            Slot::Detached => None,
+        }
+    }
+
+    /// Report forward progress to `p`: bumped on every CDB completion, and
+    /// [`busy`](Progress::busy) while a CDB (or a scan bus step) is in flight.
+    pub fn attach_progress(&mut self, p: &Progress) {
+        self.progress = Some(p.clone());
+    }
+
+    pub(crate) fn progress(&self) -> Option<&Progress> {
+        self.progress.as_ref()
+    }
+
+    /// The `ScanOptions.halt` alias rule (§2.2): over the Drive's own token (or none),
+    /// check `alias` until the guard drops, then restore; over a caller's attached
+    /// token, that token wins and a different alias is logged.
+    pub(crate) fn alias(&mut self, alias: Option<&Halt>) -> AliasGuard<'_> {
+        let saved = match (alias, &self.slot) {
+            (None, _) => None,
+            (Some(a), Slot::Attached { token, own: false }) => {
+                if !Arc::ptr_eq(a.as_arc(), token.as_arc()) {
+                    tracing::warn!(
+                        target: "freemkv::drive",
+                        phase = "halt_alias",
+                        "ScanOptions.halt differs from the op token attached to this drive; the attached token wins"
+                    );
+                }
+                None
+            }
+            (Some(a), _) => Some(std::mem::replace(&mut self.slot, Slot::foreign(a))),
+        };
+        AliasGuard { drive: self, saved }
+    }
+
+    pub(crate) fn is_halted(&self) -> bool {
+        self.slot.token().is_some_and(Halt::is_cancelled)
+    }
+
+    /// `Err(Halted)` once the attached token is cancelled.
+    pub(crate) fn check_token(&self) -> Result<()> {
+        self.slot.token().map_or(Ok(()), Halt::check)
+    }
+
+    /// Wait `d` on the attached token: `Err(Halted)` within one slice of a Stop.
+    pub(crate) fn pause(&self, d: Duration) -> Result<()> {
+        match self.slot.token() {
+            Some(t) => t.wait(d),
+            None => Halt::new().wait(d),
+        }
+    }
+
+    /// The §2.2 ledger: what a post-cancel clean-up CDB may release.
+    pub(crate) fn ledger(&self) -> allow::Ledger {
+        allow::Ledger {
+            tray_locked: self.tray_locked,
+            agids: self.agids,
+        }
+    }
+
+    // A Detached exec: a bug in debug; in release, one warning, then uncancellable.
+    fn on_detached_exec(&self) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        debug_assert!(false, "Drive::exec on a detached drive");
+        WARNED.call_once(|| {
+            tracing::warn!(target: "freemkv::drive", phase = "exec", "CDB on a detached drive runs uncancellably");
+        });
+    }
+
+    /// Every CDB this Drive issues goes through here (§2.2): the token is checked
+    /// before dispatch (a cancelled op issues nothing), and a READ-class CDB is
+    /// checked again on completion so its buffer is never returned as good.
+    pub(crate) fn exec(
         &mut self,
         cdb: &[u8],
         dir: crate::scsi::DataDirection,
         buf: &mut [u8],
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
-        if self.is_halted() {
+        crate::halt::diag::assert_may_block("Drive::exec", Duration::MAX);
+        match self.slot.token() {
+            None => self.on_detached_exec(),
+            Some(t) => t.check()?,
+        }
+        let r = self.dispatch(cdb, dir, buf, timeout_ms);
+        if is_read_class(cdb) {
+            self.check_token()?;
+        }
+        r
+    }
+
+    /// A CDB inside a critical section entered before any cancel (§2.4 row 4): not
+    /// checked against the token.
+    pub(crate) fn exec_uncancellable(
+        &mut self,
+        cdb: &[u8],
+        dir: crate::scsi::DataDirection,
+        buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<crate::scsi::ScsiResult> {
+        crate::halt::diag::assert_may_block("Drive::exec", Duration::MAX);
+        self.dispatch(cdb, dir, buf, timeout_ms)
+    }
+
+    /// A clean-up CDB (§2.4): runs as usual until a cancel, then only if the
+    /// allow-list admits it from `ctx` with this Drive's ledger; refused with
+    /// `Halted` (and not sent) otherwise.
+    pub(crate) fn exec_cleanup(
+        &mut self,
+        cdb: &[u8],
+        dir: crate::scsi::DataDirection,
+        buf: &mut [u8],
+        timeout_ms: u32,
+        ctx: CleanupCtx,
+    ) -> Result<crate::scsi::ScsiResult> {
+        crate::halt::diag::assert_may_block("Drive::exec", Duration::MAX);
+        if self.is_halted() && !allow::allowed_after_cancel(cdb, self.ledger(), ctx) {
             return Err(Error::Halted);
         }
-        let r = self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms)?;
-        if self.is_halted() {
-            return Err(Error::Halted);
+        self.dispatch(cdb, dir, buf, timeout_ms)
+    }
+
+    // The one call into the transport: progress is busy while the CDB is in flight
+    // and bumped on its completion, and the AGID ledger follows REPORT KEY.
+    fn dispatch(
+        &mut self,
+        cdb: &[u8],
+        dir: crate::scsi::DataDirection,
+        buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<crate::scsi::ScsiResult> {
+        let busy = self.progress.as_ref().map(Progress::busy);
+        let r = self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms);
+        drop(busy);
+        if let Some(p) = &self.progress {
+            p.bump();
         }
-        Ok(r)
+        self.note_ledger(cdb, buf, r.is_ok());
+        r
+    }
+
+    // §2.2 ledger: an ALLOW that reached the drive ends this Drive's claim on the tray
+    // (so it is sent once); a successful REPORT KEY key format 0 allocates the AGID in
+    // response byte 7 bits 7-6; key format 3Fh invalidates the AGID in byte 10 bits 7-6.
+    fn note_ledger(&mut self, cdb: &[u8], resp: &[u8], ok: bool) {
+        if cdb.first() == Some(&allow::PREVENT_ALLOW) && cdb.get(4).is_some_and(|b| b & 1 == 0) {
+            self.tray_locked = false;
+        }
+        // SS-7 (evidence, not spec) libaacs mmc.c: "*agid = (buf[7] & 0xff) >> 6;" on
+        // allocation, and "cmd[10] = (agid << 6) | (format & 0x3f);" names the AGID.
+        if cdb.first() != Some(&allow::REPORT_KEY) || cdb.len() < 11 {
+            return;
+        }
+        if let Some(agid) = allow::invalidated_agid(cdb) {
+            self.agids &= !(1 << agid);
+        } else if cdb[10] & 0x3F == 0 && ok && resp.len() > 7 {
+            self.agids |= 1 << (resp[7] >> 6);
+        }
     }
 
     /// Close the drive cleanly. Unlocks the tray and closes the fd.
@@ -341,76 +590,102 @@ impl Drive {
         self.unlocker_name.as_deref()
     }
 
-    /// Access the SCSI transport for direct commands (used by CSS/AACS auth).
-    pub fn scsi_mut(&mut self) -> &mut dyn ScsiTransport {
-        self.scsi.as_mut()
-    }
-
     // The OEM Volume ID a matching unlocker returned at Drive::init, if any.
     // AACS uses it to skip the cert handshake. None if no unlocker matched.
     pub(crate) fn oem_vid(&self) -> Option<[u8; 16]> {
         self.oem_vid
     }
 
+    /// Wait for the drive to become ready: TEST UNIT READY every 500 ms until it
+    /// answers GOOD. Fails with `DeviceNotReady` only after 60 s without progress
+    /// (§2.11): an answer not yet seen in this wait, or a rising progress indicator.
+    /// A Stop interrupts between polls; a dead bus fails after 5 s of failures.
     pub fn wait_ready(&mut self) -> Result<()> {
+        self.wait_ready_with(WaitReadyTiming::PRODUCTION)
+    }
+
+    pub(crate) fn wait_ready_with(&mut self, timing: WaitReadyTiming) -> Result<()> {
+        // SS-4 TEST UNIT READY: "provides a means to check if the logical unit is ready".
         let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "wait_ready", "begin");
-
-        // The poll can take up to 30s (60 × 500ms). Heartbeat it so a slow
-        // spin-up is visible as steady beats rather than a silent stall.
         let mut hb = crate::progress::Heartbeat::new("wait_ready");
+        // T6: the answers seen so far and the highest progress indicator; either
+        // growing re-arms the no-progress window.
+        let moved = Progress::new();
+        let mut stall = crate::halt::StallTimer::new(timing.window, &moved);
+        let mut seen: Vec<Option<(u8, u8, u8)>> = Vec::new();
+        let mut best: Option<u16> = None;
         // (when the first failure of the current run completed, failures in it)
         let mut failing: Option<(std::time::Instant, u32)> = None;
         let mut start_sent = false;
         // Consecutive 3Ah answers, and whether 04/01 (a disc being identified) was seen.
         let (mut empty_run, mut becoming_ready_seen) = (0u32, false);
-        for attempt in 0..60u64 {
-            hb.tick(attempt, 60);
+        let mut attempt = 0u64;
+        loop {
+            attempt += 1;
+            hb.tick(t0.elapsed().as_secs(), timing.window.as_secs());
             let mut buf = [0u8; 0];
-            // `checked_exec`, not bare `execute`: this poll (60 x 500 ms = ~30 s) must
-            // see `self.halt`, or a Stop during cold spin-up is ignored for half a
-            // minute. A TUR that FAILS is just not-ready-yet and keeps the loop going.
-            match self.checked_exec(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000) {
+            match self.exec(
+                &tur,
+                crate::scsi::DataDirection::None,
+                &mut buf,
+                crate::scsi::TUR_TIMEOUT_MS,
+            ) {
                 Ok(_) => {
                     tracing::info!(
                         target: "freemkv::drive",
                         phase = "wait_ready",
-                        attempts = attempt + 1,
+                        attempts = attempt,
                         elapsed_ms = t0.elapsed().as_millis() as u64,
                         "end"
                     );
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                // Transport failures (DID_TIME_OUT/DID_RESET, fd<0 DeviceNotFound) may be
-                // a hiccup; a run of 2+ lasting the budget past the first one's
-                // completion is a dead bus, surfaced rather than polled for 30 s.
+                // T5: transport failures (DID_TIME_OUT/DID_RESET, fd<0 DeviceNotFound) may be
+                // a hiccup; a run of 2+ lasting the budget past the first one's completion
+                // is a dead bus. Any drive answer ends the run.
                 Err(e) if e.is_scsi_transport_failure() => {
                     empty_run = 0;
                     let (since, n) = failing.get_or_insert((std::time::Instant::now(), 0));
                     *n += 1;
-                    if *n >= 2 && since.elapsed() >= WAIT_READY_DEAD_BUS_BUDGET {
+                    if *n >= 2 && since.elapsed() >= timing.dead_bus {
                         return Err(e);
                     }
                 }
                 Err(e) => {
                     failing = None;
                     let sense = e.scsi_sense().map(|s| (s.sense_key, s.asc, s.ascq));
+                    // §2.11: a new answer in this wait is progress; the same one, or two
+                    // known ones alternating, is not.
+                    if !seen.contains(&sense) {
+                        seen.push(sense);
+                        moved.bump();
+                    }
+                    // SS-1: "The PROGRESS INDICATION field is a percent complete indication";
+                    // a value above the best seen so far is progress.
+                    if let Some(p) = self.scsi.last_sense_progress()
+                        && best.is_none_or(|b| p > b)
+                    {
+                        best = Some(p);
+                        moved.bump();
+                    }
                     let empty = matches!(sense, Some((crate::scsi::SENSE_KEY_NOT_READY, 0x3A, _)));
                     empty_run = if empty { empty_run + 1 } else { 0 };
                     becoming_ready_seen |=
                         sense == Some((crate::scsi::SENSE_KEY_NOT_READY, 0x04, 0x01));
-                    // An empty drive that never said 04/01 will not become ready.
+                    // SS-3 MMC-6 Table F.3 "2 3A 00 MEDIUM NOT PRESENT": an empty drive that
+                    // never said 04/01 will not become ready.
                     if !becoming_ready_seen && empty_run >= WAIT_READY_MAX_EMPTY_POLLS {
                         return Err(e);
                     }
                     match sense {
-                        // Incompatible / unreadable medium (MMC-6 Table F.3) never
-                        // becomes ready: surface its sense now, not after 30 s.
+                        // SS-3 "2 30 00 INCOMPATIBLE MEDIUM INSTALLED": never becomes
+                        // ready, so surface its sense now.
                         Some((crate::scsi::SENSE_KEY_NOT_READY, 0x30, _)) => return Err(e),
-                        // 04/02, initializing command required: nothing else spins the
-                        // unit up, so send START UNIT once, then keep polling.
+                        // SS-3 "2 04 02 LOGICAL UNIT NOT READY, INITIALIZING CMD. REQUIRED":
+                        // nothing else spins the unit up, so START UNIT once.
                         Some((crate::scsi::SENSE_KEY_NOT_READY, 0x04, 0x02)) if !start_sent => {
                             start_sent = true;
                             self.start_unit()?;
@@ -419,15 +694,17 @@ impl Drive {
                     }
                 }
             }
-            // Halt-aware backoff: the flag can also flip DURING the 500 ms
-            // gap, which is where most of the 30 s is actually spent.
-            sleep_until_halted(&self.halt, std::time::Duration::from_millis(500))?;
+            if stall.poll(&moved) == crate::halt::Stall::Expired {
+                break;
+            }
+            self.pause(timing.poll)?;
         }
         tracing::warn!(
             target: "freemkv::drive",
             phase = "wait_ready",
             elapsed_ms = t0.elapsed().as_millis() as u64,
-            "device never became ready"
+            window_ms = timing.window.as_millis() as u64,
+            "device never became ready: no progress for the whole window"
         );
         Err(Error::DeviceNotReady {
             path: self.device_path.clone(),
@@ -451,7 +728,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        let reply = self.scsi.as_mut().execute(
+        let reply = self.exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
@@ -511,12 +788,7 @@ impl Drive {
                 // Fallback: try TUR
                 let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
                 let mut empty = [0u8; 0];
-                match self.scsi.as_mut().execute(
-                    &tur,
-                    crate::scsi::DataDirection::None,
-                    &mut empty,
-                    5_000,
-                ) {
+                match self.exec(&tur, crate::scsi::DataDirection::None, &mut empty, 5_000) {
                     Ok(_) => DriveStatus::DiscPresent,
                     Err(ref e)
                         if e.scsi_sense()
@@ -567,9 +839,7 @@ impl Drive {
         ];
         let mut buf = [0u8; 8];
         let r = self
-            .scsi
-            .as_mut()
-            .execute(
+            .exec(
                 &cdb,
                 crate::scsi::DataDirection::FromDevice,
                 &mut buf,
@@ -604,8 +874,11 @@ impl Drive {
         // disc-independent; AACS/CSS handshakes run LATER, gated on disc kind. A
         // transport fault aborts init (v1.1.0 invariant); other errors fall through.
         self.init_ran = true;
-        let (matched, unlock_res) =
-            crate::unlock_bridge::run_features(self.scsi.as_mut(), &self.drive_id);
+        let drive_id = self.drive_id.clone();
+        let (matched, unlock_res) = crate::unlock_bridge::run_features(self, &drive_id);
+        // §2.3 reclassification: a Stop is `Halted` before any other result mapping, so
+        // the refused CDBs it caused never read as a dead bus.
+        self.check_token()?;
         let r: Result<()> = match unlock_res {
             Ok(Some(unlocked)) => {
                 // Record which firmware unlocker ran, not the id-only lookup.
@@ -684,9 +957,7 @@ impl Drive {
         ];
         let mut buf = vec![0u8; 256];
         let r = self
-            .scsi
-            .as_mut()
-            .execute(
+            .exec(
                 &cdb,
                 crate::scsi::DataDirection::FromDevice,
                 &mut buf,
@@ -715,9 +986,7 @@ impl Drive {
         ];
         let mut buf = vec![0u8; 8];
         let r = self
-            .scsi
-            .as_mut()
-            .execute(
+            .exec(
                 &cdb,
                 crate::scsi::DataDirection::FromDevice,
                 &mut buf,
@@ -748,9 +1017,7 @@ impl Drive {
         ];
         let mut buf = vec![0u8; 252];
         let r = self
-            .scsi
-            .as_mut()
-            .execute(
+            .exec(
                 &cdb,
                 crate::scsi::DataDirection::FromDevice,
                 &mut buf,
@@ -798,7 +1065,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = payload;
-        match self.checked_exec(&cdb, crate::scsi::DataDirection::ToDevice, &mut buf, 5_000) {
+        match self.exec(&cdb, crate::scsi::DataDirection::ToDevice, &mut buf, 5_000) {
             Ok(_) => {
                 tracing::info!(target: "freemkv::drive", phase = "error_recovery", "recovered-error reporting enabled (PER=1) — marginal reads will surface instead of committing silently");
                 true
@@ -815,9 +1082,7 @@ impl Drive {
         let cdb = crate::scsi::build_read_buffer(mode, buffer_id, 0, length as u32);
         let mut buf = vec![0u8; length as usize];
         let r = self
-            .scsi
-            .as_mut()
-            .execute(
+            .exec(
                 &cdb,
                 crate::scsi::DataDirection::FromDevice,
                 &mut buf,
@@ -971,7 +1236,7 @@ impl Drive {
             0x00,
         ];
 
-        match self.checked_exec(
+        match self.exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             buf,
@@ -1074,7 +1339,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        let result = self.scsi.as_mut().execute(
+        let result = self.exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
@@ -1095,8 +1360,10 @@ impl Drive {
         }
     }
 
-    /// Lock the tray so the disc cannot be ejected during a rip.
+    /// Lock the tray so the disc cannot be ejected during a rip. After a Stop it
+    /// sends nothing and leaves the tray unlocked.
     pub fn lock_tray(&mut self) {
+        // SS-5 MMC-6 Table 329: Persistent 0, Prevent 1 = "Prevent State shall be set (Locked)".
         let prevent = [
             SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL,
             0x00,
@@ -1106,18 +1373,24 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
+        // Pre-check: a stopped op must not lock a tray it will never unlock.
+        if self.is_halted() {
+            return;
+        }
         self.tray_locked = true;
-        if let Err(e) =
-            self.scsi
-                .as_mut()
-                .execute(&prevent, crate::scsi::DataDirection::None, &mut buf, 5_000)
-        {
-            tracing::warn!(target: "freemkv::drive", error = %e, "PREVENT MEDIUM REMOVAL failed");
+        match self.exec(&prevent, crate::scsi::DataDirection::None, &mut buf, 5_000) {
+            Err(Error::Halted) => self.tray_locked = false,
+            Err(e) => {
+                tracing::warn!(target: "freemkv::drive", error = %e, "PREVENT MEDIUM REMOVAL failed")
+            }
+            Ok(_) => {}
         }
     }
 
-    /// Unlock the tray so the user can manually eject the disc.
+    /// Unlock the tray so the user can manually eject the disc. A clean-up CDB: after
+    /// a Stop it is still sent if this Drive locked the tray (§2.4).
     pub fn unlock_tray(&mut self) {
+        // SS-5 MMC-6 Table 329: Persistent 0, Prevent 0 = "Prevent State shall be cleared (Unlocked)".
         let allow = [
             SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL,
             0x00,
@@ -1127,30 +1400,36 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
+        // Checked against the ledger as it stands, then cleared: exactly one ALLOW.
+        let r = self.exec_cleanup(
+            &allow,
+            crate::scsi::DataDirection::None,
+            &mut buf,
+            5_000,
+            CleanupCtx::Plain,
+        );
         self.tray_locked = false;
         // Best-effort (the tray-unlock is advisory), but a failure is worth a warn!
         // rather than a silent `let _`: a stuck PREVENT lock is a real symptom the
         // operator otherwise never sees until the tray won't open.
-        if let Err(e) =
-            self.scsi
-                .as_mut()
-                .execute(&allow, crate::scsi::DataDirection::None, &mut buf, 5_000)
-        {
-            tracing::warn!(
+        match r {
+            Ok(_) | Err(Error::Halted) => {}
+            Err(e) => tracing::warn!(
                 target: "freemkv::drive",
                 phase = "unlock_tray",
                 error_code = e.code(),
                 "Failed to clear the medium-removal PREVENT lock; the tray may stay locked until the drive is power-cycled."
-            );
+            ),
         }
     }
 
     /// Eject the disc tray. Unlocks first, then ejects.
     pub fn eject(&mut self) -> Result<()> {
         self.unlock_tray();
+        // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted".
         let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
         let mut buf = [0u8; 0];
-        self.scsi.as_mut().execute(
+        self.exec(
             &eject_cdb,
             crate::scsi::DataDirection::None,
             &mut buf,
@@ -1162,9 +1441,10 @@ impl Drive {
     // START STOP UNIT with START=1, LoEj=0 (never ejects). Only Halted propagates;
     // a rejected START just leaves wait_ready polling.
     fn start_unit(&mut self) -> Result<()> {
+        // SS-6 MMC-6 Table 633: LoEj 0, Start 1 = "Start the disc and make ready for access".
         let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0];
         let mut buf = [0u8; 0];
-        match self.checked_exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000) {
+        match self.exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000) {
             Err(Error::Halted) => Err(Error::Halted),
             Err(e) => {
                 tracing::warn!(target: "freemkv::drive", phase = "wait_ready", error_code = e.code(), "START UNIT rejected");
@@ -1186,19 +1466,13 @@ impl Drive {
         let stop = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x00, 0]; // START=0, LOEJ=0 → spin down
         let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0]; // START=1, LOEJ=0 → spin up
         let mut buf = [0u8; 0];
-        // `checked_exec` + `sleep_until_halted`, not blind `thread::sleep`: this ~15 s
-        // wait runs from the recovery path, exactly when Stop is likely pressed. A
-        // half-finished spin cycle is fine — the next command spins the drive back up.
-        self.checked_exec(&stop, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
-        sleep_until_halted(
-            &self.halt,
-            std::time::Duration::from_secs(SPIN_DOWN_IDLE_SECS),
-        )?;
-        self.checked_exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
-        sleep_until_halted(
-            &self.halt,
-            std::time::Duration::from_secs(SPIN_UP_SETTLE_SECS),
-        )?;
+        // `exec` + `pause`, not blind `thread::sleep`: this ~15 s wait runs from the
+        // recovery path, exactly when Stop is likely pressed. A half-finished spin
+        // cycle is fine — the next command spins the drive back up.
+        self.exec(&stop, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        self.pause(Duration::from_secs(SPIN_DOWN_IDLE_SECS))?;
+        self.exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        self.pause(Duration::from_secs(SPIN_UP_SETTLE_SECS))?;
         Ok(())
     }
 
@@ -1209,7 +1483,7 @@ impl Drive {
         buf: &mut [u8],
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
-        self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
+        self.exec(cdb, direction, buf, timeout_ms)
     }
 }
 
@@ -1429,24 +1703,35 @@ const WAIT_READY_MAX_EMPTY_POLLS: u32 = 10;
 
 // How long an unbroken run of transport-class TUR failures may last, from the
 // first one's completion, before wait_ready calls the bus dead.
-const WAIT_READY_DEAD_BUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const WAIT_READY_DEAD_BUS_BUDGET: Duration = Duration::from_secs(5);
 
-// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping true, returning
-// Error::Halted. Used by wait_ready's poll backoff and spin_cycle's spin-down/settle pauses.
-pub(crate) fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
-    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
-    let deadline = std::time::Instant::now() + total;
-    loop {
-        if halt.load(Ordering::Relaxed) {
-            return Err(Error::Halted);
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return Ok(());
-        }
-        let remaining = deadline - now;
-        std::thread::sleep(remaining.min(SLICE));
-    }
+/// `wait_ready`'s durations (§2.11, T3/T5/T6), parameters so tests run in ms.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WaitReadyTiming {
+    /// The wait between two TEST UNIT READYs.
+    pub poll: Duration,
+    /// T6: give up after this long with no progress.
+    pub window: Duration,
+    /// T5: an unbroken run of transport failures this long is a dead bus.
+    pub dead_bus: Duration,
+}
+
+impl WaitReadyTiming {
+    /// 500 ms polls, 60 s without progress (user: "60s"), the 5 s dead-bus budget.
+    pub(crate) const PRODUCTION: Self = Self {
+        poll: Duration::from_millis(500),
+        window: Duration::from_secs(60),
+        dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+    };
+}
+
+// READ-class opcodes: their data is checked against the token again on completion
+// (§2.2), so a READ that finishes after a Stop is discarded, never returned as good.
+fn is_read_class(cdb: &[u8]) -> bool {
+    matches!(
+        cdb.first(),
+        Some(&(crate::scsi::SCSI_READ_10 | 0xA8 | 0x88 | 0xBE | 0xB9))
+    )
 }
 
 /// Structured outcome of [`resolve_device`] — a machine-readable signal
@@ -1475,50 +1760,63 @@ mod halt_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    struct Idle;
+    impl ScsiTransport for Idle {
+        fn execute(
+            &mut self,
+            _: &[u8],
+            _: crate::scsi::DataDirection,
+            _: &mut [u8],
+            _: u32,
+        ) -> Result<crate::scsi::ScsiResult> {
+            unreachable!("pause issues no CDB")
+        }
+    }
+
+    fn idle() -> Drive {
+        Drive::from_transport_for_test(Box::new(Idle))
+    }
+
+    // `Drive::pause` (was `sleep_until_halted`) is `Halt::wait` on the attached token.
     #[test]
-    fn sleep_until_halted_completes_when_not_halted() {
-        let flag = AtomicBool::new(false);
+    fn pause_completes_when_not_halted() {
         let t0 = Instant::now();
-        let r = sleep_until_halted(&flag, Duration::from_millis(150));
-        assert!(r.is_ok());
+        assert!(idle().pause(Duration::from_millis(150)).is_ok());
         assert!(t0.elapsed() >= Duration::from_millis(140));
     }
 
     #[test]
-    fn sleep_until_halted_returns_immediately_if_preflagged() {
-        let flag = AtomicBool::new(true);
+    fn pause_returns_immediately_if_prehalted() {
+        let d = idle();
+        d.halt();
         let t0 = Instant::now();
-        let r = sleep_until_halted(&flag, Duration::from_secs(10));
-        assert!(matches!(r, Err(Error::Halted)));
-        // Must wake within one slice (100 ms) — the whole point of the
-        // primitive is that a 30 s sleep doesn't block Stop.
+        assert!(matches!(
+            d.pause(Duration::from_secs(10)),
+            Err(Error::Halted)
+        ));
         assert!(t0.elapsed() < Duration::from_millis(200));
     }
 
     #[test]
-    fn sleep_until_halted_wakes_mid_sleep() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let f2 = flag.clone();
+    fn pause_wakes_mid_sleep() {
+        let d = idle();
+        let flag = d.halt_flag();
         let t0 = Instant::now();
-        std::thread::spawn(move || {
+        let stopper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            f2.store(true, Ordering::Relaxed);
+            flag.store(true, std::sync::atomic::Ordering::Release);
         });
-        let r = sleep_until_halted(&flag, Duration::from_secs(10));
+        let r = d.pause(Duration::from_secs(10));
+        stopper.join().unwrap();
         assert!(matches!(r, Err(Error::Halted)));
         let waited = t0.elapsed();
-        // The sleep must end because the flag flipped, not the 10 s timeout; the lower
-        // bound rules out returning early otherwise. Upper bound was 350 ms but that
-        // measures the scheduler: a loaded CI runner hit 377 ms and failed for no reason.
         assert!(waited < Duration::from_secs(2), "waited {waited:?}");
         assert!(waited >= Duration::from_millis(140), "waited {waited:?}");
     }
 
     #[test]
-    fn sleep_until_halted_zero_duration_is_noop_when_not_halted() {
-        let flag = AtomicBool::new(false);
-        let r = sleep_until_halted(&flag, Duration::ZERO);
-        assert!(r.is_ok());
+    fn pause_zero_duration_is_noop_when_not_halted() {
+        assert!(idle().pause(Duration::ZERO).is_ok());
     }
 
     #[test]
@@ -1560,6 +1858,7 @@ mod halt_tests {
 mod command_tests {
     use super::*;
     use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // Minimal MODE SENSE(10) reply carrying the Error Recovery page (0x01)
     // with the given flags/retry, no block descriptors. `ps` sets the page's
@@ -2365,16 +2664,16 @@ mod command_tests {
     }
 
     #[test]
-    fn clear_halt_reenables_reads() {
-        // halt() then clear_halt() must allow reads again — the flag is
-        // not sticky.
+    fn a_fresh_token_reenables_reads_after_a_stop() {
+        // A cancel is one-way (`clear_halt` is gone, §2.2): the next op attaches a
+        // fresh token, and reads work again under it.
         let RecordingHarness {
             drive: mut d,
             cdb: _cdb,
             timeouts: _to,
         } = recording(TransportOutcome::Ok(2048));
         d.halt();
-        d.clear_halt();
+        d.attach(&Halt::new());
         let mut buf = vec![0u8; 2048];
         assert!(d.read(0, 1, &mut buf, false).is_ok());
     }
@@ -3001,7 +3300,12 @@ mod command_tests {
             }
         }
         let mut d = Drive::from_transport_for_test(Box::new(NeverReady));
-        let r = d.wait_ready();
+        // T6 scaled: 60 s → 300 ms, polls 500 ms → 10 ms.
+        let r = d.wait_ready_with(WaitReadyTiming {
+            poll: std::time::Duration::from_millis(10),
+            window: std::time::Duration::from_millis(300),
+            dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+        });
         assert!(
             matches!(r, Err(Error::DeviceNotReady { .. })),
             "a drive that never answers TUR successfully must be DeviceNotReady, got {r:?}"

@@ -51,6 +51,10 @@ pub(crate) fn try_pk_against_tables(
         .count();
 
     for pk in processing_keys {
+        // `pk` is loop-invariant across every (uv, cvalue) candidate below (up to ~46k on a
+        // UHD MKB): build its AES-128 schedule once (L104) and reuse it via
+        // `validate_processing_key_with_cipher`, byte-identical to `validate_processing_key`.
+        let cipher = new_cipher_for(pk);
         for i in 0..num_uvs {
             if (i + 1) * 16 > cvalues.len() {
                 continue;
@@ -61,10 +65,42 @@ pub(crate) fn try_pk_against_tables(
             }
             let uv = &uvs[record_start + 1..record_start + 5];
             let cv = &cvalues[i * 16..(i + 1) * 16];
-            if let Some(mk) = validate_processing_key(pk, cv, uv, mk_dv) {
+            if let Some(mk) = validate_processing_key_with_cipher(&cipher, cv, uv, mk_dv) {
                 return Some(mk);
             }
         }
+    }
+    None
+}
+
+// Same relation as [`validate_processing_key`], but driven by a caller-supplied AES-128 key
+// schedule for `pk` instead of building one internally — the cvalue-loop fast path
+// ([`try_pk_against_tables`]) shares one schedule across every candidate for a given pk (L104).
+fn validate_processing_key_with_cipher(
+    cipher: &aes::Aes128,
+    cvalue: &[u8],
+    uv: &[u8],
+    mk_dv: &[u8; 16],
+) -> Option<[u8; 16]> {
+    if cvalue.len() < 16 || uv.len() < 4 {
+        return None;
+    }
+
+    // Step 1: mk = AES-128D(pk, cvalue), via the shared schedule.
+    let mut cv = [0u8; 16];
+    cv.copy_from_slice(&cvalue[..16]);
+    let mut mk = aes_ecb_decrypt_with_cipher(cipher, &cv);
+
+    // Step 2: XOR uv into the last 4 bytes of mk (mk[12..16]).
+    for a in 0..4 {
+        mk[12 + a] ^= uv[a];
+    }
+
+    // Step 3 + 4: dec_vd = AES-128D(mk, mk_dv); verify magic.
+    let dec_vd = aes_ecb_decrypt(&mk, mk_dv);
+    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+    if dec_vd[..8] == VERIFY_MAGIC {
+        return Some(mk);
     }
     None
 }
@@ -1560,6 +1596,162 @@ mod position_recovery_tests {
         assert!(
             try_pk_against_tables(&[_pk], &ok_uvs, &ok_cvalues, &mk_dv).is_some(),
             "sanity: the same PK/cvalue pair does resolve when present"
+        );
+    }
+
+    // ── L104: cvalue-loop cipher hoist — equivalence, call-count, and spec quote ──────
+
+    /// Test-only ORACLE: `try_pk_against_tables` as it read before L104 — rebuilds an
+    /// AES-128 schedule for `pk` on every candidate via `validate_processing_key`
+    /// (UNCHANGED by L104; still builds its own schedule per call, since `dk_walk` and
+    /// `recover_dk_position` keep calling it that way). Used only to prove the hoisted
+    /// loop agrees with it, never as production code.
+    fn try_pk_against_tables_oracle(
+        processing_keys: &[[u8; 16]],
+        uvs: &[u8],
+        cvalues: &[u8],
+        mk_dv: &[u8; 16],
+    ) -> Option<[u8; 16]> {
+        let num_uvs = uvs
+            .chunks(5)
+            .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
+            .count();
+        for pk in processing_keys {
+            for i in 0..num_uvs {
+                if (i + 1) * 16 > cvalues.len() {
+                    continue;
+                }
+                let record_start = i * 5;
+                if record_start + 5 > uvs.len() {
+                    continue;
+                }
+                let uv = &uvs[record_start + 1..record_start + 5];
+                let cv = &cvalues[i * 16..(i + 1) * 16];
+                if let Some(mk) = validate_processing_key(pk, cv, uv, mk_dv) {
+                    return Some(mk);
+                }
+            }
+        }
+        None
+    }
+
+    /// L104 equivalence: the hoisted-cipher loop must return byte-identical results to the
+    /// pre-hoist oracle — a matching PK behind decoys, a one-bit-away PK, two PKs tried in
+    /// order, and an empty table.
+    #[test]
+    fn try_pk_against_tables_matches_the_pre_hoist_oracle() {
+        let (_dkey, mk, pk, cv, mk_dv) = four_level_parts();
+        let slots = [
+            (U_MASK_SHIFT, 0x0000_1100u32),
+            (U_MASK_SHIFT, 0x0000_2200u32),
+            (U_MASK_SHIFT, UV_SLOT4),
+        ];
+        let mut cvalues = vec![0x44u8; 16];
+        cvalues.extend_from_slice(&[0x55u8; 16]);
+        cvalues.extend_from_slice(&cv);
+        let mkb = build_mkb(&slots, &cvalues, &mk_dv);
+        let uvs = mkb_find_subdiff_records(&mkb).expect("subdiff");
+
+        assert_eq!(
+            try_pk_against_tables(&[pk], &uvs, &cvalues, &mk_dv),
+            try_pk_against_tables_oracle(&[pk], &uvs, &cvalues, &mk_dv),
+        );
+        assert_eq!(
+            try_pk_against_tables(&[pk], &uvs, &cvalues, &mk_dv),
+            Some(mk)
+        );
+
+        let mut stranger = pk;
+        stranger[0] ^= 0x01;
+        assert_eq!(
+            try_pk_against_tables(&[stranger], &uvs, &cvalues, &mk_dv),
+            try_pk_against_tables_oracle(&[stranger], &uvs, &cvalues, &mk_dv),
+        );
+        assert_eq!(
+            try_pk_against_tables(&[stranger], &uvs, &cvalues, &mk_dv),
+            None
+        );
+
+        assert_eq!(
+            try_pk_against_tables(&[stranger, pk], &uvs, &cvalues, &mk_dv),
+            try_pk_against_tables_oracle(&[stranger, pk], &uvs, &cvalues, &mk_dv),
+        );
+
+        assert_eq!(
+            try_pk_against_tables(&[pk], &[], &[], &mk_dv),
+            try_pk_against_tables_oracle(&[pk], &[], &[], &mk_dv),
+        );
+    }
+
+    /// L104 "red first" observable: `KEY_EXPANSIONS` (crypto.rs, test-only) counts AES-128
+    /// key schedules built through `new_cipher`/`new_cipher_for`. Before this fix the count
+    /// would read 0 here — `validate_processing_key`'s internal `Aes128::new` was never
+    /// routed through the counted constructor — so this exact assertion (`== pks tried`,
+    /// not 0 and not `pks × candidates`) only holds once the loop shares one schedule per
+    /// `pk` across every `(uv, cvalue)` candidate instead of rebuilding it per candidate.
+    #[test]
+    fn try_pk_against_tables_builds_one_key_schedule_per_pk_not_per_candidate() {
+        let (_dkey, mk, pk, cv, mk_dv) = four_level_parts();
+        // Five decoy slots plus the keyed one: several candidates per PK, so a
+        // per-candidate rebuild (6) would disagree with a per-pk one (1).
+        let mut slots: Vec<(u8, u32)> = (0..5u32)
+            .map(|i| (U_MASK_SHIFT, 0x0000_1100u32 + (i << 8)))
+            .collect();
+        slots.push((U_MASK_SHIFT, UV_SLOT4));
+        let mut cvalues = Vec::new();
+        for i in 0..5u8 {
+            cvalues.extend_from_slice(&[i; 16]);
+        }
+        cvalues.extend_from_slice(&cv);
+        let mkb = build_mkb(&slots, &cvalues, &mk_dv);
+        let uvs = mkb_find_subdiff_records(&mkb).expect("subdiff");
+
+        let stranger = [0xFFu8; 16]; // matches nothing: forces a full 6-candidate sweep
+        KEY_EXPANSIONS.with(|c| c.set(0));
+        let got = try_pk_against_tables(&[stranger, pk], &uvs, &cvalues, &mk_dv);
+        assert_eq!(got, Some(mk), "sanity: the real pk still resolves");
+        assert_eq!(
+            KEY_EXPANSIONS.with(|c| c.get()),
+            2,
+            "one AES-128 schedule per pk tried (2), not one per (pk, candidate) pair (up to 12)"
+        );
+    }
+
+    /// Verbatim from `[C]` (AACS Introduction and Common Cryptographic Elements, Final Rev
+    /// 0.953) §3.2.4 "Calculation of Media Key", PDF p.14. Per spec; do not change this
+    /// relation without a spec citation proving otherwise.
+    const SPEC_MEDIA_KEY_FROM_CVALUE: &str = "Using that Processing Key K and the appropriate \
+        16 bytes of encrypted key data C, the device calculates the 128-bit Media Key Km as \
+        follows: Km = AES-128D(K, C) \u{2295} (00000000000000000000000016 || uv)";
+
+    /// The hoisted cvalue loop must still satisfy the `[C]` §3.2.4 relation above, checked by
+    /// building the expected Km directly from the spec formula (inverted to plant `C`),
+    /// independent of any production code path.
+    #[test]
+    fn try_pk_against_tables_matches_the_c_dot_3_2_4_media_key_relation() {
+        let pk = [0x2Bu8; 16];
+        const UV: u32 = 0x0000_0007;
+        let mk: [u8; 16] = [
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        // Invert the spec relation: C = AES-128E(K, Km ⊕ (0^96 || uv)).
+        let mut pre = mk;
+        for (b, u) in pre[12..16].iter_mut().zip(UV.to_be_bytes()) {
+            *b ^= u;
+        }
+        let cv = aes_ecb_encrypt(&pk, &pre);
+        let mut vd = [0x22u8; 16];
+        vd[..8].copy_from_slice(&VERIFY_MAGIC);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        let mut uvs = vec![0u8];
+        uvs.extend_from_slice(&UV.to_be_bytes());
+
+        assert_eq!(
+            try_pk_against_tables(&[pk], &uvs, &cv, &mk_dv),
+            Some(mk),
+            "{SPEC_MEDIA_KEY_FROM_CVALUE}"
         );
     }
 

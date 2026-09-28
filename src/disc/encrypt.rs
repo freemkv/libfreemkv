@@ -387,12 +387,12 @@ impl AacsCertUnlocker<'_> {
             return Err(CertFail::Other(CertUnlockFailure::NoHostCert));
         }
 
-        // Borrow checker can't split `session` across `scsi_mut()` + `&drive_id`.
+        // `run_bus` borrows the whole Drive, so hand it a copy of the identity.
         let drive_id = session.drive_id.clone();
         let fu_certs = crate::unlock_bridge::map_host_certs(&host_certs);
         // `matched` is only ever "AACS"/"DVD"/"" on this disc-keyed route, never a drive unlock.
         let (_matched, unlock_res) = crate::unlock_bridge::run_bus(
-            session.scsi_mut(),
+            session,
             &drive_id,
             freemkv_unlock::DiscKind::Aacs,
             &fu_certs,
@@ -444,17 +444,28 @@ fn cert_unlock_outcome(e: CertUnlockFailure) -> crate::aacs::trace::UnlockOutcom
     }
 }
 
+// The scan's one bus step (§2.3), shared by AACS and CSS: the op token is checked before
+// and after, ahead of any result mapping; the Drive's `Progress` is busy throughout, as
+// it spans the first keydb parse in `host_certs` (ST4-2).
+pub(super) fn bus_step_guard<T>(
+    session: &mut crate::drive::Drive,
+    step: impl FnOnce(&mut crate::drive::Drive) -> T,
+) -> Result<T> {
+    let _busy = session.progress().map(crate::halt::Progress::busy);
+    session.check_token()?;
+    let r = step(session);
+    session.check_token()?;
+    Ok(r)
+}
+
 // The AACS bus step of a live scan, run after the AACS files are captured. A dead bus
 // aborts like `Drive::init`, and a Stop during the AKE is `Halted`.
 pub(super) fn aacs_bus_step(
     session: &mut crate::drive::Drive,
     opts: &ScanOptions,
 ) -> Result<BusOutcome> {
-    if session.is_halted() {
-        return Err(Error::Halted);
-    }
     let t0 = std::time::Instant::now();
-    let r = Disc::do_handshake_cert(session, opts);
+    let r = bus_step_guard(session, |s| Disc::do_handshake_cert(s, opts))?;
     tracing::info!(
         target: "freemkv::scan",
         phase = "do_handshake",
@@ -462,9 +473,6 @@ pub(super) fn aacs_bus_step(
         elapsed_ms = t0.elapsed().as_millis() as u64,
         "end"
     );
-    if session.is_halted() {
-        return Err(Error::Halted);
-    }
     match r {
         Ok(CertRoute::Handshake(h)) => Ok(BusOutcome::Handshake(h)),
         Ok(CertRoute::FirmwareUnlocked) => Ok(BusOutcome::FirmwareUnlocked),
@@ -1151,7 +1159,15 @@ mod tests {
     // Capture a synthetic AACS disc and `finish` it with the given bus outcome.
     fn finish_disc(disc: &mut MemDisc, udf: udf::UdfFs, bus: BusOutcome) -> Disc {
         let cap = capture(disc, &udf, from_for(&bus)).expect("capture");
-        Disc::finish(disc, 10_000, udf, Some((cap, bus)), &ScanOptions::default()).expect("scan")
+        Disc::finish(
+            disc,
+            10_000,
+            udf,
+            Some((cap, bus)),
+            &ScanOptions::default(),
+            None,
+        )
+        .expect("scan")
     }
 
     // Scan a synthetic AACS disc with the given handshake outcome.

@@ -771,7 +771,7 @@ mod tests {
         // corruption anywhere in the other 6112 bytes pass undetected.
         assert_eq!(
             buf,
-            clear_aacs_unit(),
+            crate::aacs::content::cpi_cleared(clear_aacs_unit()),
             "the decrypted unit must equal the known plaintext byte-for-byte"
         );
     }
@@ -972,6 +972,6 @@ mod tests {
             .expect("file-grid read decrypts");
         let mut want = clear_aacs_unit();
         want.extend(clear_aacs_unit());
-        assert_eq!(buf, want);
+        assert_eq!(buf, crate::aacs::content::cpi_cleared(want));
     }
 }

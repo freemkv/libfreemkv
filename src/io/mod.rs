@@ -10,6 +10,7 @@
 pub(crate) mod bounded;
 pub mod byte_prefetcher;
 pub mod file_sector_source;
+mod flush;
 pub mod fsync;
 pub mod image_writer;
 pub mod sink;
@@ -21,6 +22,7 @@ pub(crate) mod platform_macos;
 
 pub mod pipeline;
 
+pub use flush::{FlushProgress, durable_sync_file};
 pub use writeback_file::WritebackFile;
 
 pub use pipeline::{

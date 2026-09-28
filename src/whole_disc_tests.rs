@@ -146,13 +146,19 @@ fn write_through(
     std::fs::read(&dest).map_err(|e| Error::IoError { source: e })
 }
 
-fn assert_plain(img_plain: &[u8], bytes: &[u8]) {
+// `bytes` equals the image's plaintext, where each decrypted unit (`specs`) reads with
+// CPI 00₂ in every source packet (KS-5; KU design §5.4) and every other sector is verbatim.
+fn assert_plain(img_plain: &[u8], bytes: &[u8], specs: &[FileSpec]) {
     assert_eq!(bytes.len(), img_plain.len());
-    for (lba, (got, want)) in bytes
-        .chunks(SECTOR)
-        .zip(img_plain.chunks(SECTOR))
-        .enumerate()
-    {
+    let mut want = img_plain.to_vec();
+    for (start, n, _, enc) in specs {
+        for u in enc.iter().filter(|&&u| u < n / 3) {
+            let o = (start + u * 3) as usize * SECTOR;
+            let unit = crate::aacs::content::cpi_cleared(want[o..o + 6144].to_vec());
+            want[o..o + 6144].copy_from_slice(&unit);
+        }
+    }
+    for (lba, (got, want)) in bytes.chunks(SECTOR).zip(want.chunks(SECTOR)).enumerate() {
         assert!(got == want, "sector {lba} not decrypted as expected");
     }
 }
@@ -168,7 +174,7 @@ fn every_unplayed_file_is_keyed_and_the_image_decrypts_across_batches() {
     assert!(planned.unproven.is_empty());
     let want = src.plain.clone();
     let bytes = write_through(img(2200, &specs), keys, &files, planned).unwrap();
-    assert_plain(&want, &bytes);
+    assert_plain(&want, &bytes, &specs);
 }
 
 /// Back-to-back unplayed files in different CPS units each get their own key.
@@ -181,7 +187,7 @@ fn adjacent_files_in_different_cps_units_each_get_their_own_key() {
     assert_eq!(planned.map.entry_for(600).map(|e| e.0), Some(1));
     assert_eq!(planned.map.entry_for(630).map(|e| e.0), Some(2));
     let bytes = write_through(img(1200, &specs), keys, &files, planned).unwrap();
-    assert_plain(&img(1200, &specs).plain, &bytes);
+    assert_plain(&img(1200, &specs).plain, &bytes, &specs);
 }
 
 /// Ciphertext no held key opens refuses the plan: multi-CPS pool, and a single key.
@@ -716,4 +722,77 @@ mod spec_guards {
 fn unit_aligned_forwards_unmapped_stream_files() {
     use crate::sector::bus_removal::test_support::{Reports, assert_forwards, m2ts1};
     assert_forwards(UnitAligned::new(Reports(vec![m2ts1()]), Vec::new()));
+}
+
+/// LK21 (K-13), per spec — KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not
+/// encrypted"; corroborated by KS-22 (libaacs clears it per source packet). A decrypted
+/// image says so in every packet, so re-scanning it finds only clear pieces and asks nothing.
+#[test]
+fn decrypt_clears_cpi_on_every_source_packet() {
+    use crate::spec::keys::{KS_5_CPI, KS_22_LIBAACS_VERIFY_TS};
+    assert!(KS_5_CPI.text.contains("00₂ if the data is not encrypted"));
+    assert!(KS_22_LIBAACS_VERIFY_TS.text.contains("buf[i] &= ~0xc0;"));
+    let specs = [(300, 30, K0, ALL), (600, 30, K1, ALL)];
+    let files = one_file_each(&specs);
+    let mut keys = pool(&[K0, K1]);
+    let planned = plan(&mut img(1200, &specs), &mut keys, &files, &rule(None)).unwrap();
+    let bytes = write_through(img(1200, &specs), keys, &files, planned).unwrap();
+    for &(start, n, _, _) in &specs {
+        for lba in (start..start + n).step_by(3) {
+            let o = lba as usize * SECTOR;
+            for i in (0..6144).step_by(192) {
+                assert_eq!(bytes[o + i] & 0xC0, 0, "LBA {lba}, packet byte {i}: CPI");
+            }
+        }
+    }
+    // Re-scan the decrypted image: every piece reads Clear, and no source is asked.
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = asked.clone();
+    let fetch = KeyFetch::unit_only(std::sync::Arc::new(move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }));
+    let rescan_rule = KeyRule {
+        format: crate::ContentFormat::BdTs,
+        single: None,
+        fetch: Some(&fetch),
+        halt: None,
+    };
+    let mut decrypted = Img {
+        plain: bytes.clone(),
+        data: bytes,
+        probe_fail: None,
+        reads: Vec::new(),
+    };
+    let replanned = plan(&mut decrypted, &mut pool(&[K0, K1]), &files, &rescan_rule);
+    assert!(replanned.is_ok(), "{:?}", replanned.err());
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "requests"
+    );
+}
+
+/// K-8: the declared count is read through `parse_title_keys`, so an HD DVD title-key
+/// file counts too. Per spec KS-14 ("Num_of_CPS_Unit … the number of CPS Units on the
+/// disc") for BD; HD DVD has no public book, per evidence KS-27.
+#[test]
+fn single_cps_reads_hd_dvd_title_keys_too() {
+    use crate::spec::keys::{KS_14_UNIT_KEY_BLOCK, KS_27_HDDVD_EVIDENCE};
+    assert!(
+        KS_14_UNIT_KEY_BLOCK
+            .text
+            .contains("indicates the number of CPS Units")
+    );
+    assert_eq!(KS_27_HDDVD_EVIDENCE.kind, crate::spec::QuoteKind::Evidence);
+    // A VTKF with one available Title Key Entry (AV_FLG set in slot 0).
+    let mut vtkf = vec![0u8; 2480];
+    vtkf[..12].copy_from_slice(crate::aacs::inf::VTKF_MAGIC);
+    vtkf[0x80] = 0x80;
+    let mut disc = aacs_disc(1);
+    disc.format = crate::DiscFormat::HdDvd;
+    disc.content_format = crate::ContentFormat::MpegPs;
+    disc.aacs.as_mut().unwrap().uk_ro = vtkf;
+    let empty = AacsKeyMap::from_ranges(Vec::new());
+    assert_eq!(single_cps_key_slot(&disc, &pool(&[K0]), &empty), Some(0));
 }

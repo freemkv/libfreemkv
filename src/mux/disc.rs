@@ -1814,6 +1814,8 @@ mod tests {
     // crossing the prefetch channel, not become a fabricated transport failure.
     #[test]
     fn bad_sector_keeps_its_identity_across_the_prefetch_channel() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         const COUNT: u32 = 9;
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let reader = RecordingReader {
@@ -1858,6 +1860,8 @@ mod tests {
     // exhaustion after that must NOT look like a completed pass.
     #[test]
     fn dead_prefetch_producer_does_not_silently_zero_fill_the_title() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         const COUNT: u32 = 30;
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let reader = RecordingReader {

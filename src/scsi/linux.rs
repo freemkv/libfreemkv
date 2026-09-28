@@ -92,6 +92,8 @@ pub struct SgIoTransport {
     /// that publishes after that point sees it and closes its own fd, since
     /// nothing will ever drain the slot again.
     dead: Arc<AtomicBool>,
+    /// The last command's sense-key specific progress indication (§2.11).
+    last_progress: Option<u16>,
 }
 
 impl SgIoTransport {
@@ -115,6 +117,7 @@ impl SgIoTransport {
             prevent_held: false,
             allow_transport_failed: false,
             dead: Arc::new(AtomicBool::new(false)),
+            last_progress: None,
         })
     }
 
@@ -286,6 +289,10 @@ impl Drop for SgIoTransport {
 
 impl ScsiTransport for SgIoTransport {
     // Execute via one synchronous SG_IO ioctl; errors map to IoError/ScsiError.
+    fn last_sense_progress(&self) -> Option<u16> {
+        self.last_progress
+    }
+
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -297,6 +304,7 @@ impl ScsiTransport for SgIoTransport {
         // pub, so an external caller could pass an empty or over-length
         // CDB. Shared helper keeps the check identical across platforms.
         let cmd_len = super::checked_cdb_len(cdb, K_MAX_CDB_SIZE)?;
+        self.last_progress = None;
         let exec_t0 = std::time::Instant::now();
         let opcode = cdb[0];
         // Held from the moment a PREVENT is attempted: its outcome may be unknown.
@@ -471,6 +479,7 @@ impl ScsiTransport for SgIoTransport {
         // `ScsiSense::is_medium_error()` etc.
         if hdr.status != 0 {
             let parsed = super::parse_sense(&sense, hdr.sb_len_wr);
+            self.last_progress = super::parse_sense_progress(&sense, hdr.sb_len_wr);
             tracing::trace!(
                 target: "freemkv::scsi",
                 phase = "scsi_err",

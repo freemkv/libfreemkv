@@ -9,10 +9,10 @@
 
 use crate::error::Result;
 use crate::event::{Event, EventKind};
-use crate::halt::{Halt, POLL_INTERVAL};
+use crate::halt::{DriveHolder, Halt, Recv, SendOutcome};
 use crate::sector::SectorSource;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
-use std::thread::JoinHandle;
+use crossbeam_channel::{Receiver, Sender, bounded};
+use std::time::Duration;
 
 /// Producer-thread event callback. Fires `BytesRead` after every
 /// successful batch read so the consumer side can update a UI
@@ -43,8 +43,8 @@ pub struct PrefetchedSectorSource {
     /// cross-thread alloc/free was the dominant cost in the demux
     /// thread before this).
     recycle_tx: Sender<Vec<u8>>,
-    /// Joined on drop so producer cleanup runs deterministically.
-    producer: Option<JoinHandle<()>>,
+    /// The producer, a Drive holder (§2.5): joined on drop.
+    producer: Option<DriveHolder<()>>,
     /// Total sector count across all extents, computed once at
     /// construction (the sum of each extent's `sector_count`) and
     /// returned by [`capacity_sectors`]. Never updated by reads.
@@ -59,6 +59,17 @@ pub struct PrefetchedSectorSource {
     producer_failed: bool,
     /// The reader's unmapped stream files, snapshotted before it moved to the producer.
     unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
+    /// The op's token: once cancelled, the closed channel is a stop, not EOF (L096).
+    halt: Option<Halt>,
+}
+
+// Hand `item` to the consumer, waiting on a full channel; `false` once the consumer is
+// gone or `halt` is cancelled (observed within a slice), so the producer returns.
+fn send_or_stop(halt: &Halt, tx: &Sender<Batch>, item: Batch) -> bool {
+    matches!(
+        halt.send_timeout(tx, item, Duration::MAX),
+        Ok(SendOutcome::Sent)
+    )
 }
 
 impl PrefetchedSectorSource {
@@ -126,6 +137,8 @@ impl PrefetchedSectorSource {
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
         let batch_bytes = batch_sectors as usize * 2048;
+        // A never-cancelled stand-in keeps one halt-aware code path without a token.
+        let wait = halt.clone().unwrap_or_default();
 
         // Seed the recycle pool so the producer has a buffer on the first
         // iteration; otherwise the first recycle_rx.recv() blocks forever.
@@ -133,122 +146,118 @@ impl PrefetchedSectorSource {
             let _ = recycle_tx.send(vec![0u8; batch_bytes]);
         }
 
-        let producer = std::thread::Builder::new()
-            .name("freemkv-prefetch".into())
-            .spawn(move || {
-                // catch_unwind so a panic (decrypt source, read path, event_fn) isn't
-                // mistaken for clean EOF: a dropped `tx` alone would finalize a
-                // TRUNCATED mux as success. Locals are thread-local, so this is sound.
-                let body = std::panic::AssertUnwindSafe(|| {
-                    let mut ext_idx = 0usize;
-                    let mut offset: u32 = 0;
-                    let mut bytes_read_total: u64 = 0;
-                    while ext_idx < extents.len() {
-                        if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                            return;
-                        }
-                        let extent = &extents[ext_idx];
-                        // AACS aligned units anchor at THIS extent's start LBA, so gate
-                        // relative to it, not absolute disc LBA 0. No-op for
-                        // non-decrypting / CSS / None sources.
-                        reader.set_unit_base(extent.start_lba);
-                        let remaining = extent.sector_count.saturating_sub(offset);
-                        if remaining == 0 {
-                            ext_idx += 1;
-                            offset = 0;
-                            continue;
-                        }
-                        // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt processes only
-                        // full units, so a tail below one unit can't decrypt — error, don't emit
-                        // encrypted bytes. (`remaining > 0` above, so `< align` IS the short tail; `!is_multiple_of` was redundant.)
-                        if remaining < unit_align as u32 {
-                            let _ = tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
-                            return;
-                        }
-                        let mut sectors = remaining.min(batch_sectors as u32) as u16;
-                        // Trim to a whole number of units. A trim to 0 here means the
-                        // batch window landed on a sub-unit boundary (not the
-                        // trailing-tail case, rejected above); clamp to one unit.
-                        if sectors >= unit_align {
-                            sectors -= sectors % unit_align;
-                        } else {
-                            sectors = unit_align;
-                        }
-                        let bytes = sectors as usize * 2048;
-                        // Re-poll halt every POLL_INTERVAL: a pure-AtomicBool Halt
-                        // doesn't disconnect the channel, so a blocking recv() would
-                        // never re-reach the cancel check. Mirrors BytePrefetcher.
-                        let mut buf = loop {
-                            match recycle_rx.recv_timeout(POLL_INTERVAL) {
-                                Ok(b) => break b,
-                                Err(RecvTimeoutError::Timeout) => {
-                                    if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                                        return;
-                                    }
-                                }
-                                // Consumer dropped both channels.
-                                Err(RecvTimeoutError::Disconnected) => return,
-                            }
-                        };
-                        // Sound resize (was `unsafe set_len` guarded only by capacity):
-                        // public `into_channels` lets a caller recycle a cap-only Vec, so
-                        // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
-                        buf.resize(bytes, 0);
-                        // `start_lba + offset` derives from untrusted extent
-                        // data — saturate rather than wrap/panic on a
-                        // hostile start_lba near u32::MAX.
-                        let lba = extent.start_lba.saturating_add(offset);
-                        match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
-                            Ok(n) => {
-                                // A short read must not desync the stream: advance by
-                                // sectors actually read, and reject a non-whole-sector
-                                // count (belt-and-braces; FileSectorSource read_exact's).
-                                if n % 2048 != 0 {
-                                    let _ = tx.send(Err(
-                                        crate::error::Error::ExtentNotUnitAligned.into()
-                                    ));
-                                    return;
-                                }
-                                let sectors_read = (n / 2048) as u32;
-                                // A zero-byte read isn't EOF (extents still have
-                                // `remaining`) and would spin forever; send a terminal
-                                // sentinel instead of a clean EOF that reports success.
-                                if sectors_read == 0 {
-                                    let _ =
-                                        tx.send(Err(crate::error::Error::SourceTerminated.into()));
-                                    return;
-                                }
-                                buf.truncate(n);
-                                bytes_read_total = bytes_read_total.saturating_add(n as u64);
-                                if let Some(ref f) = event_fn {
-                                    f(Event {
-                                        kind: EventKind::BytesRead {
-                                            bytes: bytes_read_total,
-                                            total: bytes_total_extents,
-                                        },
-                                    });
-                                }
-                                if tx.send(Ok(buf)).is_err() {
-                                    return; // consumer dropped
-                                }
-                                offset = offset.saturating_add(sectors_read);
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(e.into()));
+        #[cfg(test)]
+        assert!(
+            crate::halt::DRIVE_HOLDER_TEST_LOCK.try_lock().is_err(),
+            "a test that spawns a prefetcher (a Drive holder) must hold DRIVE_HOLDER_TEST_LOCK"
+        );
+        let producer = crate::halt::spawn_drive_holder("prefetch", move || {
+            // catch_unwind so a panic (decrypt source, read path, event_fn) isn't
+            // mistaken for clean EOF: a dropped `tx` alone would finalize a
+            // TRUNCATED mux as success. Locals are thread-local, so this is sound.
+            let body = std::panic::AssertUnwindSafe(|| {
+                let mut ext_idx = 0usize;
+                let mut offset: u32 = 0;
+                let mut bytes_read_total: u64 = 0;
+                while ext_idx < extents.len() {
+                    if wait.is_cancelled() {
+                        return;
+                    }
+                    let extent = &extents[ext_idx];
+                    // AACS aligned units anchor at THIS extent's start LBA, so gate
+                    // relative to it, not absolute disc LBA 0. No-op for
+                    // non-decrypting / CSS / None sources.
+                    reader.set_unit_base(extent.start_lba);
+                    let remaining = extent.sector_count.saturating_sub(offset);
+                    if remaining == 0 {
+                        ext_idx += 1;
+                        offset = 0;
+                        continue;
+                    }
+                    // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt processes only
+                    // full units, so a tail below one unit can't decrypt — error, don't emit
+                    // encrypted bytes. (`remaining > 0` above, so `< align` IS the short tail; `!is_multiple_of` was redundant.)
+                    if remaining < unit_align as u32 {
+                        let e = crate::error::Error::ExtentNotUnitAligned.into();
+                        send_or_stop(&wait, &tx, Err(e));
+                        return;
+                    }
+                    let mut sectors = remaining.min(batch_sectors as u32) as u16;
+                    // Trim to a whole number of units. A trim to 0 here means the
+                    // batch window landed on a sub-unit boundary (not the
+                    // trailing-tail case, rejected above); clamp to one unit.
+                    if sectors >= unit_align {
+                        sectors -= sectors % unit_align;
+                    } else {
+                        sectors = unit_align;
+                    }
+                    let bytes = sectors as usize * 2048;
+                    // Halt-aware: a cancel does not disconnect the channel, so a
+                    // plain recv() would never re-reach the check. Disconnected =
+                    // the consumer dropped both channels.
+                    let Ok(Recv::Item(mut buf)) = wait.recv_timeout(&recycle_rx, Duration::MAX)
+                    else {
+                        return;
+                    };
+                    // Sound resize (was `unsafe set_len` guarded only by capacity):
+                    // public `into_channels` lets a caller recycle a cap-only Vec, so
+                    // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
+                    buf.resize(bytes, 0);
+                    // `start_lba + offset` derives from untrusted extent
+                    // data — saturate rather than wrap/panic on a
+                    // hostile start_lba near u32::MAX.
+                    let lba = extent.start_lba.saturating_add(offset);
+                    match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
+                        Ok(n) => {
+                            // A short read must not desync the stream: advance by
+                            // sectors actually read, and reject a non-whole-sector
+                            // count (belt-and-braces; FileSectorSource read_exact's).
+                            if n % 2048 != 0 {
+                                let e = crate::error::Error::ExtentNotUnitAligned.into();
+                                send_or_stop(&wait, &tx, Err(e));
                                 return;
                             }
+                            let sectors_read = (n / 2048) as u32;
+                            // A zero-byte read isn't EOF (extents still have
+                            // `remaining`) and would spin forever; send a terminal
+                            // sentinel instead of a clean EOF that reports success.
+                            if sectors_read == 0 {
+                                let e = crate::error::Error::SourceTerminated.into();
+                                send_or_stop(&wait, &tx, Err(e));
+                                return;
+                            }
+                            buf.truncate(n);
+                            bytes_read_total = bytes_read_total.saturating_add(n as u64);
+                            if let Some(ref f) = event_fn {
+                                f(Event {
+                                    kind: EventKind::BytesRead {
+                                        bytes: bytes_read_total,
+                                        total: bytes_total_extents,
+                                    },
+                                });
+                            }
+                            if !send_or_stop(&wait, &tx, Ok(buf)) {
+                                return; // consumer dropped, or stopped
+                            }
+                            offset = offset.saturating_add(sectors_read);
+                        }
+                        Err(e) => {
+                            send_or_stop(&wait, &tx, Err(e.into()));
+                            return;
                         }
                     }
-                    // Drop tx implicitly — consumer sees RecvError → EOF.
-                });
-                if std::panic::catch_unwind(body).is_err() {
-                    // Panicked mid-stream — surface a typed error so the demux
-                    // doesn't read the dropped channel as clean EOF and truncate.
-                    // Ignore send failure: consumer already gone, nothing to report.
-                    let _ = tx.send(Err(crate::error::Error::DemuxThreadPanicked.into()));
                 }
-            })
-            .map_err(|e| crate::error::Error::IoError { source: e })?;
+                // Drop tx implicitly — consumer sees RecvError → EOF.
+            });
+            if std::panic::catch_unwind(body).is_err() {
+                // Panicked mid-stream — surface a typed error so the demux
+                // doesn't read the dropped channel as clean EOF and truncate.
+                // Ignore send failure: consumer already gone, nothing to report.
+                let e = crate::error::Error::DemuxThreadPanicked.into();
+                send_or_stop(&wait, &tx, Err(e));
+            }
+        })
+        .map_err(|e| crate::error::Error::IoError { source: e })?;
 
         Ok(Self {
             rx,
@@ -257,6 +266,7 @@ impl PrefetchedSectorSource {
             total_sectors,
             producer_failed: false,
             unmapped,
+            halt,
         })
     }
 
@@ -264,17 +274,18 @@ impl PrefetchedSectorSource {
     /// and pushes drained ones back through `recycle_tx`. Returns `(forward_rx, recycle_tx,
     /// shell)`; the shell holds the producer's `JoinHandle` (drop it to join) plus
     /// `total_sectors`.
-    pub fn into_channels(self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
-        // MOVE the fields out, never clone: pre-1.0.0 code cloned + `forget`-ed
-        // `self`, leaking endpoints that defeated disconnection shutdown and
-        // hung `PrefetchShell::drop`'s `join()`. `ManuallyDrop` avoids that.
-        let me = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `me` is `ManuallyDrop` so it drops none of these fields;
-        // each `ptr::read` moves exactly one field out exactly once, so
-        // there are no double-frees and no aliasing.
-        let producer = unsafe { std::ptr::read(&me.producer) };
-        let rx = unsafe { std::ptr::read(&me.rx) };
-        let recycle = unsafe { std::ptr::read(&me.recycle_tx) };
+    pub fn into_channels(mut self) -> (Receiver<Batch>, Sender<Vec<u8>>, PrefetchShell) {
+        // Same dead-channel swap `Drop for PrefetchedSectorSource` uses below: leaves `self`
+        // holding only harmless placeholders, so no `unsafe`/`ManuallyDrop`/`ptr::read`, and
+        // no double-drop (real endpoints already moved out via `mem::replace`/`Option::take`).
+        let (dead_tx, dead_rx) = bounded::<Batch>(0);
+        drop(dead_tx);
+        let rx = std::mem::replace(&mut self.rx, dead_rx);
+        let (dead_send, dead_recv) = bounded::<Vec<u8>>(0);
+        drop(dead_recv);
+        let recycle = std::mem::replace(&mut self.recycle_tx, dead_send);
+        let producer = self.producer.take();
+        // `self` drops here: dead endpoints no-op, `producer` is `None` (no join).
         (rx, recycle, PrefetchShell { producer })
     }
 }
@@ -283,7 +294,15 @@ impl PrefetchedSectorSource {
 /// producer thread join handle so dropping the shell joins the
 /// producer, even though the channels have been peeled off.
 pub struct PrefetchShell {
-    producer: Option<JoinHandle<()>>,
+    producer: Option<DriveHolder<()>>,
+}
+
+// Every test that spawns a producer holds this (the halt module's Drive-holder test lock).
+#[cfg(test)]
+pub(crate) fn holder_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::halt::DRIVE_HOLDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 impl Drop for PrefetchShell {
@@ -365,9 +384,13 @@ impl SectorSource for PrefetchedSectorSource {
                 self.producer_failed = true;
                 Err(crate::error::Error::from(e))
             }
-            // Channel closed. Clean EOF only if the producer never signalled a
-            // failure — else `Ok(0)` would let fill_extents mistake a dead
-            // source for a short read and zero-fill the rest as "complete".
+            // Channel closed. A stop first (L096, LP17): a halted producer returns
+            // silently, and `Ok(0)` would read as a short, complete source.
+            Err(_) if self.halt.as_ref().is_some_and(Halt::is_cancelled) => {
+                Err(crate::error::Error::Halted)
+            }
+            // Clean EOF only if the producer never signalled a failure — else `Ok(0)`
+            // lets fill_extents zero-fill a dead source's rest as "complete".
             Err(_) if self.producer_failed => Err(crate::error::Error::SourceTerminated),
             Err(_) => Ok(0),
         }
@@ -521,6 +544,7 @@ mod tests {
     // at construction and still forwarded afterwards.
     #[test]
     fn prefetched_source_forwards_unmapped_stream_files() {
+        let _serial = serial();
         use crate::sector::bus_removal::test_support::{Reports, m2ts1, unmapped_paths};
         let ext = vec![crate::disc::Extent {
             start_lba: 0,
@@ -534,6 +558,7 @@ mod tests {
     // must join the producer cleanly.
     #[test]
     fn drop_undrained_source_joins_cleanly() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![Extent {
                 start_lba: 0,
@@ -557,6 +582,7 @@ mod tests {
     // disconnection so `PrefetchShell` drop (join) returns promptly.
     #[test]
     fn into_channels_drop_releases_producer() {
+        let _serial = serial();
         within(10, || {
             let src = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, None)
                 .expect("spawn");
@@ -570,11 +596,70 @@ mod tests {
         });
     }
 
+    // L106 (safe dead-channel/`Option::take` rewrite, no `unsafe`): dropping `shell` must
+    // release the producer's Drive-holder slot within the settle bound below — a leaked
+    // thread would never let the count return to `before`.
+    #[test]
+    fn into_channels_then_drop_leaks_no_drive_holder() {
+        let _serial = serial();
+        let before = crate::halt::live_drive_holders();
+        within(10, || {
+            let src = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, None)
+                .expect("spawn");
+            let (rx, recycle_tx, shell) = src.into_channels();
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell); // joins: producer thread ends, its holder guard drops.
+        });
+        assert!(
+            holders_settle_to(before, Duration::from_secs(2)),
+            "into_channels + drop must release the producer's drive-holder slot exactly once"
+        );
+    }
+
+    // No-double-drop is structural now (E0040 bars an explicit second `Drop::drop`). This
+    // checks channels handed back by `into_channels` still carry real batches end-to-end —
+    // the safe rewrite must not have swapped in the dead placeholder channels by mistake.
+    #[test]
+    fn into_channels_channels_still_deliver_batches() {
+        let _serial = serial();
+        with_watchdog(Duration::from_secs(10), || {
+            let start = 40u32;
+            let count = 9u32; // three units
+            let extents = vec![Extent {
+                start_lba: start,
+                sector_count: count,
+            }];
+            let src = PatternSource { capacity: 1000 };
+            let pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            let mut got = Vec::new();
+            while let Ok(batch) = rx.recv() {
+                let buf = batch.expect("no read error expected");
+                got.extend_from_slice(&buf);
+                let _ = recycle_tx.send(buf);
+            }
+            drop(recycle_tx);
+            drop(shell);
+            assert_eq!(got.len(), (count as usize) * 2048, "all sectors delivered");
+            for i in 0..count {
+                let tag = ((start + i) & 0xff) as u8;
+                let off = i as usize * 2048;
+                assert!(
+                    got[off..off + 2048].iter().all(|b| *b == tag),
+                    "sector {i} (lba {}) content mismatch after into_channels",
+                    start + i
+                );
+            }
+        });
+    }
+
     // Same property via the halt path: cancel the token, then the producer
     // must exit and the shell join must complete (drain on a background
     // thread so blocked sends make progress toward the halt check).
     #[test]
     fn halt_releases_producer() {
+        let _serial = serial();
         within(10, || {
             let halt = Halt::new();
             let src =
@@ -597,10 +682,127 @@ mod tests {
         });
     }
 
+    // Every test that spawns the producer (a Drive holder, §2.5) serialises on
+    // this, so a holder-count assertion never sees another test's producer.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        super::holder_test_lock()
+    }
+
+    // Wait (bounded) for the live Drive-holder count to reach `n`.
+    fn holders_settle_to(n: usize, bound: Duration) -> bool {
+        let t = std::time::Instant::now();
+        while crate::halt::live_drive_holders() != n {
+            if t.elapsed() > bound {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
+    /// LP7 (§2.5 "Drive-holding threads"): the producer is a Drive holder; a cancel
+    /// while it is blocked on a full channel ends it within a slice (holders back
+    /// to 0) even though the consumer keeps the channel open, and drop joins it.
+    #[test]
+    fn sector_prefetcher_stop_with_producer_blocked() {
+        let _serial = serial();
+        let before = crate::halt::live_drive_holders();
+        let halt = Halt::new();
+        let pf =
+            PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
+                .expect("spawn");
+        assert_eq!(
+            crate::halt::live_drive_holders(),
+            before + 1,
+            "the producer runs as a Drive holder"
+        );
+        // Undrained: the forward channel fills and the producer blocks sending.
+        std::thread::sleep(Duration::from_millis(100));
+        halt.cancel();
+        let ended = holders_settle_to(before, Duration::from_secs(1));
+        within(10, move || drop(pf));
+        assert!(
+            ended,
+            "a cancel must end the blocked producer within a slice"
+        );
+        assert_eq!(
+            crate::halt::live_drive_holders(),
+            before,
+            "joined before return"
+        );
+    }
+
+    /// LP8 (both Drop sites): after a cancel, dropping the source, or the shell with
+    /// the channels still held, returns within 1 s. Guard for the direct drop.
+    #[test]
+    fn sector_prefetcher_drop_after_cancel_returns() {
+        let _serial = serial();
+        let halt = Halt::new();
+        let pf =
+            PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
+                .expect("spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        halt.cancel();
+        within(1, move || drop(pf));
+
+        let halt = Halt::new();
+        let pf =
+            PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
+                .expect("spawn");
+        let (rx, recycle_tx, shell) = pf.into_channels();
+        std::thread::sleep(Duration::from_millis(50));
+        halt.cancel();
+        within(1, move || drop(shell));
+        drop((rx, recycle_tx));
+    }
+
+    /// LP17 (L096, §2.5 "Halt is not EOF"): once the halt is cancelled, the closed
+    /// channel is `Err(Halted)`, never the clean-EOF `Ok(0)`; queued batches still
+    /// drain first. The un-halted close stays `Ok(0)` (below).
+    #[test]
+    fn prefetcher_halt_is_not_eof() {
+        let _serial = serial();
+        with_watchdog(Duration::from_secs(10), || {
+            let halt = Halt::new();
+            let mut pf =
+                PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
+                    .expect("spawn");
+            let mut buf = vec![0u8; 3 * 2048];
+            assert_eq!(pf.read_sectors(0, 3, &mut buf, false).unwrap(), 3 * 2048);
+            halt.cancel();
+            let end = loop {
+                match pf.read_sectors(0, 3, &mut buf, false) {
+                    Ok(n) if n > 0 => continue,
+                    other => break other,
+                }
+            };
+            let err = end.expect_err("a stop mid-title must not read as a short, complete source");
+            assert!(matches!(err, crate::error::Error::Halted), "{err:?}");
+        });
+    }
+
+    /// LP17, the other half: a producer that finishes un-halted still ends in `Ok(0)`.
+    #[test]
+    fn prefetcher_unhalted_close_is_eof() {
+        let _serial = serial();
+        with_watchdog(Duration::from_secs(10), || {
+            let ext = vec![Extent {
+                start_lba: 0,
+                sector_count: 6,
+            }];
+            let halt = Halt::new();
+            let mut pf =
+                PrefetchedSectorSource::new(EndlessZeroSource, ext, 3, Some(halt)).expect("spawn");
+            let (_, last) = drain_direct(&mut pf, 3, 8);
+            assert_eq!(last.unwrap(), 0);
+        });
+    }
+
     /// `batch_sectors == 0` is rejected rather than spawning a thread
     /// that spins forever emitting empty batches.
     #[test]
     fn zero_batch_rejected() {
+        let _serial = serial();
         let err = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 0, None);
         assert!(err.is_err(), "zero batch_sectors must be rejected");
     }
@@ -609,6 +811,7 @@ mod tests {
     // divide-by-zero panic (`remaining % 0`) misreported as DemuxThreadPanicked.
     #[test]
     fn zero_unit_align_rejected() {
+        let _serial = serial();
         let res = PrefetchedSectorSource::new_with_events(
             EndlessZeroSource,
             big_extent(),
@@ -628,6 +831,7 @@ mod tests {
     // dropped instead of recycled, so the 4th call deadlocked.
     #[test]
     fn direct_reads_past_pool_depth_do_not_deadlock() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // 24 sectors = 8 aligned units; batch of 3 sectors gives 8
             // sequential batches, well past the 3-buffer pool depth.
@@ -656,6 +860,7 @@ mod tests {
     // bar + stall watchdog depend on.
     #[test]
     fn event_fn_fires_bytes_read_per_batch() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // 24 sectors = 8 aligned units; batch of 3 gives 8 batches.
             let extents = vec![Extent {
@@ -721,6 +926,7 @@ mod tests {
     // full units, then surfaces a typed error on the tail.
     #[test]
     fn non_multiple_of_three_extent_errors_on_tail() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // 8 sectors = 2 full units (6 sectors) + 2 leftover.
             let extents = vec![Extent {
@@ -754,6 +960,7 @@ mod tests {
     // verify every sector of the extent is delivered.
     #[test]
     fn short_read_does_not_desync_stream() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // 9 sectors = 3 full units. batch of 9 means the first
             // request is for 9 sectors; ShortFirstSource hands back
@@ -889,6 +1096,7 @@ mod tests {
     /// `total_sectors` — "the sum of each extent's sector_count".
     #[test]
     fn capacity_sectors_sums_all_extents() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![
                 Extent {
@@ -923,6 +1131,7 @@ mod tests {
     // summed sector_count exceeds u32.
     #[test]
     fn capacity_sectors_clamps_on_overflow() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![
                 Extent {
@@ -959,6 +1168,7 @@ mod tests {
     // reorder/merge them.
     #[test]
     fn producer_walks_extents_in_order_at_correct_lbas() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let extents = vec![
@@ -995,6 +1205,7 @@ mod tests {
     // that decrypt would leave partially encrypted. batch=5 -> trimmed to 3.
     #[test]
     fn batch_trimmed_to_whole_units() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let calls = Arc::new(Mutex::new(Vec::new()));
             // 9 sectors total = three 3-sector units.
@@ -1030,6 +1241,7 @@ mod tests {
     // aligned batch); the trailing-tail guard only fires on sub-unit leftovers.
     #[test]
     fn unit_aligned_extent_delivers_all_and_eofs() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // 12 sectors = exactly four 3-sector units.
             let extents = vec![Extent {
@@ -1052,6 +1264,7 @@ mod tests {
     // with its ErrorKind surviving the channel round-trip (typed, not blanket-wrapped).
     #[test]
     fn reader_error_propagates_with_kind() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![Extent {
                 start_lba: 0,
@@ -1091,6 +1304,7 @@ mod tests {
 
     #[test]
     fn inner_source_quitting_early_is_not_reported_as_end_of_stream() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![Extent {
                 start_lba: 0,
@@ -1128,6 +1342,7 @@ mod tests {
     // a sector and hand decrypt a partial unit.
     #[test]
     fn non_sector_multiple_read_rejected() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![Extent {
                 start_lba: 0,
@@ -1152,6 +1367,7 @@ mod tests {
     // `buf.len()` (would desync the stream).
     #[test]
     fn direct_read_too_small_buffer_errors() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![Extent {
                 start_lba: 0,
@@ -1175,6 +1391,7 @@ mod tests {
     // by the 4th call.
     #[test]
     fn too_small_buffer_repeated_does_not_deadlock_pool() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // Extent with enough sectors that the producer never reaches
             // EOF during the test — we need it to keep producing batches.
@@ -1207,6 +1424,7 @@ mod tests {
     // in the offset bookkeeping.
     #[test]
     fn delivered_bytes_match_source_exactly() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let start = 40u32;
             let count = 9u32; // three units
@@ -1237,6 +1455,7 @@ mod tests {
     // so `tx` drops and the consumer sees RecvError -> Ok(0).
     #[test]
     fn empty_extents_eof_immediately() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let pf =
                 PrefetchedSectorSource::new(EndlessZeroSource, Vec::new(), 3, None).expect("spawn");
@@ -1253,6 +1472,7 @@ mod tests {
     // batch and without stalling.
     #[test]
     fn zero_length_extent_is_skipped() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let extents = vec![
@@ -1293,6 +1513,7 @@ mod tests {
     // trim-within-batch path, distinct control flow from the 8-sector case.
     #[test]
     fn four_sector_extent_errors_on_one_sector_tail() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![Extent {
                 start_lba: 0,
@@ -1316,6 +1537,7 @@ mod tests {
     // pool-depth regression that also crosses extent boundaries.
     #[test]
     fn many_extents_drain_without_deadlock() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(15), || {
             // 10 extents of 3 sectors each = 30 sectors total, well past
             // the 3-buffer pool, and 10 extent transitions.
@@ -1378,6 +1600,7 @@ mod tests {
     // wedged-USB-bridge arm).
     #[test]
     fn bad_sector_across_channel_is_not_a_transport_failure() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let sense = crate::scsi::ScsiSense {
                 sense_key: 0x03,
@@ -1408,6 +1631,7 @@ mod tests {
     // sweep keeps aborting instead of zero-filling against a dead bus.
     #[test]
     fn transport_failure_across_channel_still_classifies() {
+        let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let err = read_one_err(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE, None);
             assert!(

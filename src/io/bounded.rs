@@ -1,20 +1,17 @@
-//! Bounded-syscall primitive: run a (potentially-blocking) operation
-//! on a worker thread, with a hard wall-clock deadline and an optional
-//! cooperative [`Halt`] poll. The calling thread is never trapped
-//! inside a kernel call.
+//! Bounded-syscall primitive: run a (potentially-blocking) operation on a worker thread
+//! while the caller waits halt-aware, bounded by a deadline (`bounded_syscall`, one
+//! call's "no answer" bound) or by a stall window over a [`Progress`]
+//! ([`bounded_syscall_stall`], HR1). The calling thread is never trapped in a kernel call.
 //!
-//! Escape hatch for syscalls that trap a thread inside the kernel (`sync_file_range`, `fsync`,
-//! NFS writes) where a cooperative [`Halt`] can't interrupt. The worker thread is leaked on
-//! timeout or halt.
+//! Escape hatch for syscalls a cooperative [`Halt`] can't interrupt (`sync_file_range`,
+//! `fsync`, `FlushFileBuffers`, NFS writes). The worker thread is leaked on timeout or halt.
 
-// Only the Linux/macOS writeback paths call this; Windows has no bounded syscall yet.
-#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(any(target_os = "linux", test))]
+use std::time::Duration;
 
-use crate::halt::{Halt, POLL_INTERVAL};
+use crate::halt::{Halt, Progress, Recv, Stall, StallTimer, WAIT_SLICE};
 
 /// Failure outcome from a bounded syscall wrapper.
 #[derive(Debug)]
@@ -24,8 +21,8 @@ pub(crate) enum BoundedError {
     /// a degraded code path rather than waiting on the syscall to
     /// return.
     Halted,
-    /// The deadline elapsed before the syscall returned. Same leak
-    /// semantics as `Halted`.
+    /// The deadline (or stall window) elapsed before the syscall returned.
+    /// Same leak semantics as `Halted`.
     Timeout,
     /// The worker thread panicked, the OS rejected the thread spawn,
     /// or its sender disconnected before sending a result. Treat as a
@@ -36,8 +33,30 @@ pub(crate) enum BoundedError {
     WorkerLost,
 }
 
+// Start `op` on a worker; `None` if the caller already requested halt (don't spawn and
+// leak a worker that would run `op` in the background).
+fn start<F, R>(halt: Option<&Halt>, op: F) -> Option<Receiver<R>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    if halt.is_some_and(Halt::is_cancelled) {
+        return None;
+    }
+    // Rendezvous channel: worker sends one value then exits. On timeout/halt
+    // the receiver is dropped, so the worker's send returns Err (ignored).
+    let (tx, rx) = sync_channel::<R>(0);
+    let _ = thread::Builder::new()
+        .name("freemkv-bounded-syscall".into())
+        .spawn(move || {
+            let _ = tx.send(op());
+        });
+    Some(rx)
+}
+
 // Runs `op` on a worker thread with a deadline + optional [`Halt`] poll; returns Ok, or Err on
 // Halted/Timeout/WorkerLost (worker leaked).
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn bounded_syscall<F, R>(
     halt: Option<&Halt>,
     timeout: Duration,
@@ -47,49 +66,45 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    // If the caller already requested halt, don't spawn (and leak) a
-    // worker that would run `op` to completion in the background.
-    if halt.is_some_and(|h| h.is_cancelled()) {
-        return Err(BoundedError::Halted);
+    let rx = start(halt, op).ok_or(BoundedError::Halted)?;
+    // Halt-aware in WAIT_SLICE slices; a `timeout` past `Instant`'s range is unbounded.
+    let never = Halt::new();
+    match halt.unwrap_or(&never).recv_timeout(&rx, timeout) {
+        Ok(Recv::Item(v)) => Ok(v),
+        Ok(Recv::TimedOut) => Err(BoundedError::Timeout),
+        // Worker spawn failed, or it panicked before sending: "no syscall ran".
+        Ok(Recv::Disconnected) => Err(BoundedError::WorkerLost),
+        Err(_) => Err(BoundedError::Halted),
     }
+}
 
-    // Rendezvous channel: worker sends one value then exits. On timeout/halt
-    // the receiver is dropped, so the worker's send returns Err (ignored).
-    let (tx, rx) = sync_channel::<R>(0);
-    let _ = thread::Builder::new()
-        .name("freemkv-bounded-syscall".into())
-        .spawn(move || {
-            // Ignore send error: if we time out/halt before the worker finishes,
-            // the receiver is dropped and `tx.send` returns Err — nothing more to do.
-            let _ = tx.send(op());
-        });
-
-    // `None` = a timeout past `Instant`'s range: unbounded.
-    let deadline = Instant::now().checked_add(timeout);
+// Runs `op` on a worker thread; the caller waits halt-aware, calling `tick` every slice
+// (a sampler may bump `progress`), and gives up with `Timeout` only once `timer` expires
+// on `progress` (HR1: no progress for its window, never elapsed time).
+pub(crate) fn bounded_syscall_stall<F, R>(
+    halt: Option<&Halt>,
+    progress: &Progress,
+    timer: &mut StallTimer,
+    tick: &mut dyn FnMut(),
+    op: F,
+) -> Result<R, BoundedError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let rx = start(halt, op).ok_or(BoundedError::Halted)?;
+    let never = Halt::new();
+    let halt = halt.unwrap_or(&never);
     loop {
-        let now = Instant::now();
-        let slice = deadline.map_or(POLL_INTERVAL, |d| {
-            d.saturating_duration_since(now).min(POLL_INTERVAL)
-        });
-        match rx.recv_timeout(slice) {
-            Ok(v) => return Ok(v),
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(h) = halt
-                    && h.is_cancelled()
-                {
-                    return Err(BoundedError::Halted);
-                }
-                if deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(BoundedError::Timeout);
-                }
-                // Otherwise: another slice.
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Worker thread spawn failed, or it panicked before
-                // sending. Caller treats this as "no syscall ran" —
-                // typically a no-op + log.
-                return Err(BoundedError::WorkerLost);
-            }
+        match halt.recv_timeout(&rx, WAIT_SLICE) {
+            Ok(Recv::Item(v)) => return Ok(v),
+            Ok(Recv::Disconnected) => return Err(BoundedError::WorkerLost),
+            Err(_) => return Err(BoundedError::Halted),
+            Ok(Recv::TimedOut) => {}
+        }
+        tick();
+        if timer.poll(progress) == Stall::Expired {
+            return Err(BoundedError::Timeout);
         }
     }
 }
@@ -99,6 +114,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     // `Duration::MAX` overflowed `Instant + Duration` and panicked; it means unbounded.
     #[test]
@@ -227,6 +243,68 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(1500),
             "timeout did not return near deadline: {elapsed:?} (op should be leaked, not awaited)"
+        );
+    }
+
+    /// LP12: a halted wait returns at once and leaks the worker, and the worker's
+    /// rendezvous send to the dropped receiver does not wedge it: it ends once the
+    /// op returns. Guard.
+    #[test]
+    fn bounded_syscall_halt_leaks_worker_without_blocking() {
+        let halt = Halt::new();
+        let h2 = halt.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            h2.cancel();
+        });
+        let alive = Arc::new(());
+        let held = alive.clone();
+        let t = Instant::now();
+        let r = bounded_syscall(Some(&halt), Duration::from_secs(10), move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(held);
+            1u8
+        });
+        assert!(matches!(r, Err(BoundedError::Halted)));
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        let t = Instant::now();
+        while Arc::strong_count(&alive) > 1 {
+            assert!(
+                t.elapsed() < Duration::from_secs(2),
+                "the leaked worker wedged"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// HR1 for one blocked call: a worker blocked past the window while `tick` bumps the
+    /// progress is waited for; the same call with no progress times out at the window.
+    #[test]
+    fn stall_bound_rearms_on_progress_and_expires_without() {
+        let w = Duration::from_millis(100);
+        let p = Progress::new();
+        let mut timer = StallTimer::new(w, &p);
+        let bump = p.clone();
+        let r = bounded_syscall_stall(None, &p, &mut timer, &mut || bump.bump(), || {
+            thread::sleep(Duration::from_millis(400));
+            3u8
+        });
+        assert!(matches!(r, Ok(3)));
+        let mut timer = StallTimer::new(w, &p);
+        let t = Instant::now();
+        let r = bounded_syscall_stall(None, &p, &mut timer, &mut || {}, || {
+            thread::sleep(Duration::from_secs(2));
+            0u8
+        });
+        assert!(matches!(r, Err(BoundedError::Timeout)));
+        assert!(
+            t.elapsed() < Duration::from_millis(1100),
+            "{:?}",
+            t.elapsed()
         );
     }
 }

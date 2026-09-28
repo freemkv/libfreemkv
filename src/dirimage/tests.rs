@@ -667,6 +667,8 @@ fn an_aacs_folder_with_scrambled_content_is_rejected() {
 /// not a bare is_ok(), so it cannot go vacuous.
 #[test]
 fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
+    // Spawns the prefetch producer, a Drive holder.
+    let _serial = crate::sector::prefetched::holder_test_lock();
     // `s` MUST outlive `stream`: the pipeline's producer thread is still
     // reading the folder until the stream is dropped, and `Scratch::drop`
     // removes the directory out from under it.

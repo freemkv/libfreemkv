@@ -96,7 +96,7 @@ jobs:
       - run: cargo test --tests
         working-directory: libfreemkv
 
-  # The memory orderings in `scsi::fd_handoff` compile to the same instructions
+  # The memory orderings in `scsi::fd_handoff` (and `halt`) compile to the same instructions
   # on x86_64, so the WRONG ones pass every run; loom enumerates the executions
   # the C++20 model permits and is the only regression coverage that code has.
   # Its own job because RUSTFLAGS is part of the rust-cache key. Takes the sibling
@@ -122,6 +122,9 @@ jobs:
         with:
           workspaces: libfreemkv
       - run: cargo test --lib --no-default-features --features scsi fd_handoff
+        working-directory: libfreemkv
+      # LT3: `Halt`'s cancel Release / observe Acquire pair (stop design §2.1, SS-23).
+      - run: cargo test --lib --no-default-features --features scsi loom_halt
         working-directory: libfreemkv
       # `lint` runs clippy without --cfg loom, so this is the only place the
       # model code is linted at all.
