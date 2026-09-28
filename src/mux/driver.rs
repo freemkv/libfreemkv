@@ -510,7 +510,13 @@ pub enum MuxSource<'a> {
     /// [`InputOptions::keys`].
     Url { url: &'a str, opts: InputOptions },
 }
-/// [`mux_stream`] with the rip's up-front key set (KU §3.1). RED STUB: the set is ignored.
+
+/// [`mux_stream`] with the rip's up-front key set (KU §3.1): every AACS read goes through
+/// the set's readers (its map, and the on-arrival proof for pieces it left unproven), with
+/// no key lookup. `keys == None`, a non-AACS set, or `opts.raw`: no AACS decryption (CSS
+/// and clear discs as before; a `Session` keeps the legacy disc-banked keys until KU-X2).
+/// E7013 when the set is not for the disc or does not cover the title; E7026 when the title
+/// needs forensic keys that are Pending. `events` stays last, as in `mux_stream` (J17).
 pub fn mux_with_keys(
     source: MuxSource,
     keys: Option<&crate::keys::ResolvedKeySet>,
@@ -519,40 +525,195 @@ pub fn mux_with_keys(
     halt: &Halt,
     events: std::sync::Arc<dyn MuxEvents>,
 ) -> std::io::Result<MuxOutcome> {
-    let _ = keys;
-    let input = match source {
-        MuxSource::Url { url, opts } => MuxInput::Url { url, opts },
-        MuxSource::Session {
-            session,
-            title_index,
-        } => MuxInput::Session {
+    let set = keys.filter(|s| s.is_aacs() && !opts.raw);
+    let input = match (source, set) {
+        (MuxSource::Url { url, opts: mut o }, _) => {
+            if let Some(k) = keys {
+                o.keys = Some(k.clone());
+            }
+            MuxInput::Url { url, opts: o }
+        }
+        (
+            MuxSource::Session {
+                session,
+                title_index,
+            },
+            None,
+        ) => MuxInput::Session {
             session,
             title_index,
         },
-        MuxSource::Iso {
-            path,
-            title,
-            format,
-        } => MuxInput::Iso {
+        (
+            MuxSource::Iso {
+                path,
+                title,
+                format,
+            },
+            None,
+        ) => MuxInput::Iso {
             path,
             title,
             format,
             keys: DecryptKeys::None,
             key_fetch: None,
         },
-        MuxSource::Live {
-            reader,
-            title,
-            format,
-        } => MuxInput::Live {
+        (
+            MuxSource::Live {
+                reader,
+                title,
+                format,
+            },
+            None,
+        ) => MuxInput::Live {
             reader,
             title,
             format,
             keys: DecryptKeys::None,
             key_map: None,
         },
+        (src, Some(set)) => return mux_keyed(src, set, dest_url, opts, halt, events),
     };
     mux_stream(input, dest_url, opts, halt, events)
+}
+
+// The keyed arms of `mux_with_keys`: the set's readers, never a resolve.
+fn mux_keyed(
+    source: MuxSource,
+    set: &crate::keys::ResolvedKeySet,
+    dest_url: &str,
+    opts: &MuxOptions,
+    halt: &Halt,
+    events: std::sync::Arc<dyn MuxEvents>,
+) -> std::io::Result<MuxOutcome> {
+    let (stream, playlist, source): (Box<dyn Stream>, Option<String>, SourceInfo) = match source {
+        MuxSource::Iso { path, title, .. } => {
+            let mut title = title;
+            opts.selection
+                .apply(&mut title)
+                .map_err(std::io::Error::from)?;
+            let source = SourceInfo {
+                medium: Medium::Iso,
+                path: format!("iso://{}", path.display()),
+                playlist: title.playlist.clone(),
+                ..SourceInfo::default()
+            };
+            let reader = FileSectorSource::open(path)?;
+            let stream = super::resolve::build_iso_pipeline_keyed(
+                reader,
+                title,
+                set,
+                opts.batch_sectors,
+                Some(halt.clone()),
+                Some(reader_event_fn(events.clone())),
+            )?;
+            (Box::new(stream), None, source)
+        }
+        MuxSource::Session {
+            session,
+            title_index,
+        } => {
+            let (title, format, playlist, source) = {
+                let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
+                    path: session.device_path().to_string(),
+                })?;
+                let scope = crate::keys::KeyScope::Titles(vec![title_index]);
+                if !set.is_for(disc) || !set.covers(&scope) {
+                    tracing::error!(target: "freemkv::keys", "key set is not for this session's title");
+                    debug_assert!(false, "key set is not for this session's title");
+                    return Err(Error::DecryptFailed.into());
+                }
+                let title = disc
+                    .titles
+                    .get(title_index)
+                    .cloned()
+                    .ok_or(Error::MuxTrackRange {
+                        track: title_index,
+                        tracks: disc.titles.len(),
+                    })?;
+                let source = SourceInfo {
+                    medium: Medium::Disc,
+                    path: format!("disc://{}", session.device_path()),
+                    title: title_index,
+                    playlist: title.playlist.clone(),
+                    volume_id: disc.volume_id.clone(),
+                };
+                let playlist = disc
+                    .meta_title
+                    .clone()
+                    .unwrap_or_else(|| disc.volume_id.clone());
+                (title, disc.content_format, playlist, source)
+            };
+            let reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
+                path: session.device_path().to_string(),
+            })?;
+            let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
+            (stream, Some(playlist), source)
+        }
+        MuxSource::Live {
+            reader,
+            title,
+            format,
+        } => {
+            let source = SourceInfo {
+                medium: Medium::Disc,
+                playlist: title.playlist.clone(),
+                ..SourceInfo::default()
+            };
+            let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
+            (stream, None, source)
+        }
+        MuxSource::Url { .. } => unreachable!("mux_with_keys routes Url to mux_stream"),
+    };
+    let mut source = source;
+    if let Some(name) = playlist.as_deref() {
+        source.playlist = name.to_string();
+    }
+    drive_mux(
+        stream,
+        dest_url,
+        halt,
+        events.as_ref(),
+        playlist.as_deref(),
+        effective_send_deadline(opts.send_deadline),
+        Some(&source),
+    )
+}
+
+// The inline live-drive `DiscStream` over the set: its keys, map and on-arrival proof.
+fn live_keyed(
+    reader: Box<dyn SectorSource>,
+    mut title: DiscTitle,
+    format: crate::disc::ContentFormat,
+    set: &crate::keys::ResolvedKeySet,
+    opts: &MuxOptions,
+    halt: &Halt,
+    events: &std::sync::Arc<dyn MuxEvents>,
+) -> std::io::Result<Box<dyn Stream>> {
+    opts.selection
+        .apply(&mut title)
+        .map_err(std::io::Error::from)?;
+    let ranges: Vec<(u32, u32)> = title
+        .extents
+        .iter()
+        .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
+        .collect();
+    set.gate(reader.random_access(), Some(&ranges), false)?;
+    let mut stream = crate::mux::DiscStream::new(
+        reader,
+        title,
+        set.decrypt_keys(),
+        opts.batch_sectors,
+        format,
+        false,
+        Some(halt.clone()),
+    )?
+    .with_key_map(set.key_map());
+    if let Some(a) = set.arrival(set.title_stop()) {
+        stream = stream.with_arrival(a);
+    }
+    stream.skip_errors = opts.skip_errors;
+    stream.on_event(reader_event_fn(events.clone()));
+    Ok(Box::new(stream))
 }
 
 // Decrypt keys for the live `Session` mux of `disc`. A DVD is handed `DecryptKeys::None` so

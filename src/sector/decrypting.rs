@@ -131,6 +131,11 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         self
     }
 
+    /// `&mut` counterpart of [`with_arrival`](Self::with_arrival).
+    pub(crate) fn set_arrival(&mut self, arrival: crate::keys::Arrival) {
+        self.arrival = Some(Box::new(arrival));
+    }
+
     /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap): the caller
     /// resolved one key per CPS unit / segment up front, so every aligned unit is
     /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check.

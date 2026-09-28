@@ -478,6 +478,9 @@ where
         crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)
             .map_err(|e| -> io::Error { e.into() })?;
     }
+    if let Some(set) = opts.keys.as_ref().filter(|s| s.is_aacs() && !opts.raw) {
+        return keyed_image_input(reader, disc, opts, set, reopen);
+    }
     // Apply the caller-resolved keys (lookup-free); decrypt_keys() then
     // yields them for the stream below. Propagate a failed application
     // rather than silently muxing an undecryptable stream.
@@ -612,6 +615,50 @@ where
         fetch,
     )?;
     Ok(stream)
+}
+
+// `image_input` over the rip's key set (KU §3.1, §3.5): the gate is `check_decryptable`,
+// and the TrueHD probe and the mux read through the set's reader. No lookup, no banking.
+fn keyed_image_input<S, F>(
+    reader: S,
+    mut disc: crate::disc::Disc,
+    opts: &InputOptions,
+    set: &crate::keys::ResolvedKeySet,
+    reopen: F,
+) -> io::Result<PipelinedPesStream>
+where
+    S: SectorSource + Send + 'static,
+    F: FnOnce() -> io::Result<S>,
+{
+    if disc.titles.is_empty() {
+        return Err(crate::error::Error::NoStreams.into());
+    }
+    let idx = opts.title_index.unwrap_or(0);
+    if idx >= disc.titles.len() {
+        return Err(crate::error::Error::DiscTitleRange {
+            index: idx,
+            count: disc.titles.len(),
+        }
+        .into());
+    }
+    let scope = crate::keys::KeyScope::Titles(vec![idx]);
+    crate::keys::check_decryptable(&disc, false, Some(set), &scope)
+        .map_err(|e| -> io::Error { e.into() })?;
+    opts.selection
+        .apply(&mut disc.titles[idx])
+        .map_err(|e| -> io::Error { e.into() })?;
+    match reopen() {
+        Ok(probe) => match set.title_reader(&disc, idx, probe) {
+            Ok(mut dec) => crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]),
+            Err(e) => tracing::debug!(target: "mux", error = %e, "TrueHD probe reader refused"),
+        },
+        Err(e) => {
+            tracing::debug!(target: "mux", error = %e, "TrueHD channel-correction probe re-open failed")
+        }
+    }
+    const ISO_MUX_BATCH_SECTORS: u16 = 8192;
+    let title = disc.titles[idx].clone();
+    build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, None, None)
 }
 
 /// Open a PES output stream (consumes PES frames).
@@ -1790,15 +1837,93 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         Some(map) => map.read_plan(&extents, unit_align as u32),
         None => extents,
     };
-    // The plan and clip feed spans must describe the SAME bytes: if the plan
-    // drops alternate-phase units, frames drift out of place near a join —
-    // undetectable by the tile check. Fall back to timestamps if mismatched.
-    let feed_matches_spans = extents == full_extents;
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     if let Some(map) = key_map {
         decrypting = decrypting.with_key_map(map);
     }
+    let plan = IsoPlan {
+        extents,
+        full_extents,
+        batch_sectors,
+        unit_align,
+        format,
+    };
+    iso_pipeline_tail(decrypting, plan, title, halt, event_fn)
+}
+
+// The read plan of an ISO title mux: the extents read (FMTS alternate phase dropped), the
+// title's full extents, and the read geometry.
+struct IsoPlan {
+    extents: Vec<crate::disc::Extent>,
+    full_extents: Vec<crate::disc::Extent>,
+    batch_sectors: u16,
+    unit_align: u16,
+    format: ContentFormat,
+}
+
+/// The ISO title mux over a [`ResolvedKeySet`](crate::keys::ResolvedKeySet) (KU §3.1): the
+/// set's decrypting reader (its map and on-arrival proof) under the prefetcher, with no
+/// resolution here. `title` is an already-scanned title; E7013 if the set does not cover
+/// its extents or the image is not a sector-exact copy of the set's disc.
+pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
+    reader: S,
+    title: DiscTitle,
+    set: &crate::keys::ResolvedKeySet,
+    batch_sectors: u16,
+    halt: Option<crate::halt::Halt>,
+    event_fn: Option<crate::sector::prefetched::EventFn>,
+) -> io::Result<PipelinedPesStream> {
+    let cap = reader.capacity_sectors();
+    if (cap != 0 && set.capacity() != 0 && cap != set.capacity())
+        || !set.covers_extents(&title.extents)
+    {
+        tracing::error!(target: "freemkv::keys", "key set does not cover this image title");
+        debug_assert!(false, "key set does not cover this image title");
+        return Err(crate::error::Error::DecryptFailed.into());
+    }
+    let full_extents = title.extents.clone();
+    let ranges: Vec<(u32, u32)> = full_extents
+        .iter()
+        .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
+        .collect();
+    let decrypting = set
+        .decrypting(
+            Box::new(reader) as Box<dyn SectorSource>,
+            Some(&ranges),
+            set.title_stop(),
+            false,
+        )
+        .map_err(io::Error::from)?;
+    let plan = IsoPlan {
+        extents: set.key_map().read_plan(&full_extents, 3),
+        full_extents,
+        batch_sectors,
+        unit_align: 3,
+        format: set.content_format(),
+    };
+    iso_pipeline_tail(decrypting, plan, title, halt, event_fn)
+}
+
+// The shared tail of the ISO title mux: decrypting reader → prefetcher → demux → parse.
+fn iso_pipeline_tail(
+    mut decrypting: crate::sector::DecryptingSectorSource<Box<dyn SectorSource>>,
+    plan: IsoPlan,
+    title: DiscTitle,
+    halt: Option<crate::halt::Halt>,
+    event_fn: Option<crate::sector::prefetched::EventFn>,
+) -> io::Result<PipelinedPesStream> {
+    let IsoPlan {
+        extents,
+        full_extents,
+        batch_sectors,
+        unit_align,
+        format,
+    } = plan;
+    // The plan and clip feed spans must describe the SAME bytes: if the plan
+    // drops alternate-phase units, frames drift out of place near a join —
+    // undetectable by the tile check. Fall back to timestamps if mismatched.
+    let feed_matches_spans = extents == full_extents;
     // The mux does not tally decrypt-quality misses (`lost_bytes()` is read-loss
     // only); a missing key is an up-front resolve failure. Wrong-substream fix
     // below: re-route declared AC-3 audio onto correct `0x8x` sub-streams.

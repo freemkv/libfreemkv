@@ -441,6 +441,29 @@ impl ResolvedKeySet {
         self.0.map.clone()
     }
 
+    // Whether every sector of `extents` lies in a piece this set resolved.
+    pub(crate) fn covers_extents(&self, extents: &[crate::disc::Extent]) -> bool {
+        let mut spans: Vec<(u64, u64)> = self
+            .0
+            .spans
+            .iter()
+            .map(|&(s, n, _)| (s as u64, s as u64 + n as u64))
+            .collect();
+        spans.sort_unstable();
+        extents.iter().all(|e| {
+            let (mut at, end) = (
+                e.start_lba as u64,
+                e.start_lba as u64 + e.sector_count as u64,
+            );
+            for &(s, t) in &spans {
+                if s <= at && at < t {
+                    at = t;
+                }
+            }
+            at >= end
+        })
+    }
+
     // The E7013 caller-bug refusal (KU §6): a set used on the wrong disc, outside its scope,
     // or over a source that cannot seek.
     fn caller_bug(what: &'static str) -> Error {
@@ -485,6 +508,21 @@ impl ResolvedKeySet {
     // The on-arrival proof for this set's readers, if any piece needs one (KU §2.4).
     pub(crate) fn arrival(&self, stop: StopKind) -> Option<Arrival> {
         (!self.0.arrival.is_empty() && !self.0.best_effort).then(|| Arrival::new(self, stop))
+    }
+
+    // The E7022 stop for a title read of this set's disc.
+    pub(crate) fn title_stop(&self) -> StopKind {
+        StopKind::Title {
+            disc_hash: crate::hex::strip_hex_prefix(&self.0.disc_hash).to_string(),
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> u32 {
+        self.0.capacity
+    }
+
+    pub(crate) fn content_format(&self) -> ContentFormat {
+        self.0.content_format
     }
 
     // The decrypting view over `inner` for content touching `extents` (`None`: the whole

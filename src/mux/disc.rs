@@ -358,6 +358,13 @@ impl DiscStream {
         self
     }
 
+    /// Install a [`ResolvedKeySet`](crate::keys::ResolvedKeySet)'s on-arrival proof on the
+    /// inline reader (KU §2.4): a piece the set left unproven is proven when first read.
+    pub(crate) fn with_arrival(mut self, arrival: crate::keys::Arrival) -> Self {
+        self.reader.set_arrival(arrival);
+        self
+    }
+
     fn is_halted(&self) -> bool {
         self.halt
             .as_ref()
