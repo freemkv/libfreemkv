@@ -77,7 +77,8 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// alignment gate measures `lba` relative to THIS, not absolute disc LBA 0,
     /// so a clip whose `start_lba` is not 3-aligned still gates correctly. Set
     /// per-extent via [`set_unit_base`]. `None` (the default): there is no implicit
-    /// disc-LBA-0 grid, so an AACS content read fails loud until a base is set.
+    /// disc-LBA-0 grid, so an AACS content read fails loud until a base is set —
+    /// callers of [`new`](Self::new) must anchor before reading AACS content.
     ///
     /// [`set_unit_base`]: Self::set_unit_base
     unit_base: Option<u32>,

@@ -2587,6 +2587,7 @@ mod tests {
             // are installed, a read not starting on a 6144-byte unit boundary
             // hard-fails (it would mis-decrypt every following unit).
             let mut buf = vec![0u8; 2048];
+            s.reader.set_unit_base(0); // anchored: witnesses the keys, not the no-base gate
             let before = s.reader.read_sectors(1, 1, &mut buf, false);
             assert!(
                 matches!(before, Err(crate::error::Error::DecryptFailed)),

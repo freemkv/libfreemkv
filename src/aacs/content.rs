@@ -90,7 +90,10 @@ pub fn aacs_unit_seed_encrypted(unit: &[u8], format: crate::disc::ContentFormat)
 /// Was `unit` cut on its file's unit grid? An encrypted BD-TS unit's clear seed
 /// always starts a source packet, so its TS sync (0x47) sits at byte 4; a chunk
 /// read off the grid starts mid-unit on ciphertext. Clear units, and `MpegPs`
-/// (seed layout unverified), always pass.
+/// (seed layout unverified), always pass. A wrong-grid chunk with CPI=0 also
+/// passes (~1 in 4 per unit), so single-unit reads can slip; multi-unit reads are
+/// caught almost surely. An on-grid unit whose seed is corrupt (media or read
+/// damage in bytes 0..5) fails the whole read as DecryptFailed.
 pub(crate) fn aacs_unit_on_grid(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     format != crate::disc::ContentFormat::BdTs
         || !aacs_unit_seed_encrypted(unit, format)

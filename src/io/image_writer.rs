@@ -199,6 +199,7 @@ mod tests {
         let mut dec = crate::sector::DecryptingSectorSource::new(src, keys)
             .with_key_map(Arc::new(AacsKeyMap::from_ranges(vec![(3000, 3030, 0)])))
             .with_content_ranges(Arc::from(vec![(3000u32, 30u32)]));
+        dec.set_unit_base(0); // file grid (3000 % 3 == 0): fails loud past the no-base gate
         let dest = tmp("aacs-batch");
         let r = write_image(&mut dec, &dest, 3100, &Halt::new(), |_| {});
         let _ = std::fs::remove_file(&dest);
