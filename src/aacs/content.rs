@@ -130,7 +130,7 @@ pub(crate) fn aacs_unit_on_grid(unit: &[u8], format: crate::disc::ContentFormat)
 ///
 /// Composes [`aacs_unit_encrypted`] (the authoritative flag) with an IDEMPOTENT "structure
 /// restored?" check, so callers that may run twice over the same buffer (re-decrypt, sampling,
-/// diagnosis) get a stable answer. A unit freemkv decrypted has its flag CLEARED (KS-5 [BD]
+/// diagnosis) get a stable answer. A unit freemkv decrypted has its flag CLEARED (KS-5 `[BD]`
 /// §3.10.2: "00₂ if the data is not encrypted"; KU design §5.4), so it reads clear here; a
 /// unit left as ciphertext keeps it. Only meaningful at the clip-FILE-anchored boundary.
 pub fn aacs_unit_needs_decrypt(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
