@@ -58,6 +58,8 @@ pub(crate) const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), en
 // = SCSI error variants, `scsi` = passthrough. Rip tree (heavy deps) gated below.
 pub mod error;
 pub mod scsi;
+/// Verbatim spec quotes (text only) that govern behaviour; see [`spec::SpecQuote`].
+pub mod spec;
 
 // ─── Ripping tree (feature = "rip") ─────────────────────────────────────────
 // Drive lifecycle, disc/UDF/MPLS/CLPI parsing, AACS/CSS decrypt, PES/mux, keydb,
