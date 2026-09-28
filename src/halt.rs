@@ -377,7 +377,7 @@ impl Progress {
     }
 
     /// Whether a [`BusyGuard`] is live (crate tests of busy spans).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rip"))]
     pub(crate) fn is_busy(&self) -> bool {
         self.busy_state().0
     }
