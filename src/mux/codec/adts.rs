@@ -63,8 +63,9 @@ fn adts_frame_len(data: &[u8]) -> Option<usize> {
     })
 }
 
-// [13818-7 §8.1.1.1 adts_fixed_header()] "The information in this header does not change from
-// frame to frame." Keyed: ID, layer, profile, sampling_frequency_index, channel_configuration.
+// [13818-7 §8.1.1.1] adts_fixed_header(): "does not change from frame to frame." Keyed on its
+// ID, layer, profile, sampling_frequency_index, channel_configuration; protection_absent,
+// private_bit, original_copy and home are left out (no effect on decoding the payload).
 fn adts_fixed_key(d: &[u8]) -> u32 {
     u32::from_be_bytes([d[0], d[1], d[2], d[3]]) & 0x000E_FDC0
 }
@@ -837,11 +838,53 @@ mod tests {
         p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
         let mut bad = noisy_frame(&mut seed, 300);
         corrupt(&mut bad);
-        p.parse(&make_pes(bad.clone(), None));
+        p.parse(&make_pes(bad.repeat(3), None));
         let (g1, g2) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 300));
         let f = p.parse(&make_pes([&bad[..], &g1, &g2].concat(), Some(90_000)));
         let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
         assert_eq!(pts, [1, 2].map(|i| 1_000_000_000 + i * AAC_FRAME_NS));
+        assert_eq!(
+            p.dropped_frames(),
+            4,
+            "the old run's 3 lost AUs are settled, not discarded"
+        );
+        assert_eq!(p.frames.verified_dropped(), 2, "two faults");
+    }
+
+    // After a gap, a garbage run still reports every lost AU; with no clock before it, the first
+    // locked frame takes the PES timestamp.
+    #[test]
+    fn a_garbage_run_after_a_gap_reports_every_lost_slot() {
+        let mut seed = 109;
+        let mut bad = noisy_frame(&mut seed, 193);
+        corrupt(&mut bad);
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 193), Some(0)));
+        let (g1, g2) = (noisy_frame(&mut seed, 193), noisy_frame(&mut seed, 193));
+        let gap = PesPacket {
+            discontinuity: true,
+            ..make_pes([&bad.repeat(5)[..], &g1, &g2].concat(), Some(900_000))
+        };
+        let pts: Vec<i64> = p.parse(&gap).iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [10_000_000_000, 10_000_000_000 + AAC_FRAME_NS]);
+        assert_eq!(p.dropped_frames(), 5);
+        assert_eq!(p.frames.verified_dropped(), 1);
+    }
+
+    // One run spanning PES without a PTS is one fault: later PES starts are not new drops.
+    #[test]
+    fn a_run_spanning_several_pes_is_one_fault() {
+        let mut seed = 107;
+        let mut bad = noisy_frame(&mut seed, 193);
+        corrupt(&mut bad);
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 193), Some(0)));
+        p.parse(&make_pes(bad.repeat(10), None));
+        p.parse(&make_pes(bad.repeat(10), None));
+        let good = [noisy_frame(&mut seed, 193), noisy_frame(&mut seed, 193)].concat();
+        assert_eq!(p.parse(&make_pes(good, Some(90_000))).len(), 2);
+        assert_eq!(p.dropped_frames(), 20, "20 AUs lost");
+        assert_eq!(p.frames.verified_dropped(), 1, "one fault");
     }
 
     // A frame awaiting its successor is emitted before a discontinuity clears the buffer.

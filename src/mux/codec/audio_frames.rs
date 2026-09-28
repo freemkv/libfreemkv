@@ -250,16 +250,22 @@ impl AudioFrames {
         let due = std::mem::take(&mut self.header_due);
         if (sync || due) && !self.drop_counted {
             self.drop_counted = true;
-            let before = self.anchor;
+            let running = self.resync.is_some();
             // Known limit: a PES that starts mid-frame on a sync-shaped byte restarts the run
             // there, so its first whole frame is stamped one slot late (rare; bounded to 1 slot).
-            let open = self.resync.is_none() || valid || self.pes_start == Some(consumed);
-            if open {
+            let restartable = !running || valid || self.pes_start == Some(consumed);
+            let before = self.anchor;
+            if restartable {
                 self.anchor_at(consumed);
             }
-            self.tally
-                .record_drop(self.next_pts, 0, min_header, "header");
-            if open && (self.resync.is_none() || self.anchor != before) {
+            // A run already open continues unless a new PES timestamp names a new lost AU here;
+            // then the old run is settled (its lost AUs counted, its clock span superseded).
+            if !running || self.anchor != before {
+                self.settle_run();
+                self.tally
+                    .record_drop(self.next_pts, 0, min_header, "header");
+                // Mirror limit: after a gap there is no clock (advance false), so a PES that
+                // starts with a fragment and then a corrupt AU stamps its next good frame early.
                 let advance = before.is_some();
                 self.resync = Some(Resync {
                     skipped: 0,
@@ -285,15 +291,17 @@ impl AudioFrames {
         let (Some(r), Some((bytes, duration))) = (self.resync.take(), self.last_frame) else {
             return 0;
         };
-        if !r.advance {
-            return 0;
-        }
         let lost = ((r.skipped + bytes / 2) / bytes).max(1) as u64;
         for _ in 1..lost {
             self.tally
                 .record_collateral_drop(self.next_pts, 0, 0, "resync-lost");
         }
-        lost.saturating_mul(duration) as i64
+        // With no clock before the run (after a gap) the next frame's own PTS places it.
+        if r.advance {
+            lost.saturating_mul(duration) as i64
+        } else {
+            0
+        }
     }
 
     pub fn flush(&mut self) -> Vec<Frame> {

@@ -176,12 +176,10 @@ fn frame_header(data: &[u8], free_size: &mut Option<usize>, eos: bool) -> Option
     })
 }
 
-// Header fields a stream keeps: version, layer, sampling_frequency, and the mode with stereo
-// and joint_stereo alike. [11172-3 §2.4.2.3] only says "To change the layer, a reset of the
-// decoder is required" (likewise the sampling rate); mode may change per frame.
+// Header fields a stream keeps: [11172-3 §2.4.2.3] "To change the layer, a reset of the decoder
+// is required." and likewise the sampling rate (and so ID). Mode and bitrate may change.
 fn mpa_stream_key(d: &[u8]) -> u32 {
-    let mode = d[3] >> 6; // '00' stereo, '01' joint_stereo, '10' dual_channel, '11' single_channel
-    u32::from(d[1] & 0x1E) << 16 | u32::from(d[2] & 0x0C) << 8 | u32::from(mode.max(1))
+    u32::from(d[1] & 0x1E) << 8 | u32::from(d[2] & 0x0C)
 }
 
 pub struct MpegAudioParser {
@@ -568,15 +566,15 @@ mod tests {
     }
 
     // A good frame between two corrupt ones is kept: it ends at a sync-shaped header and
-    // matches the stream's fixed header. A stray header with another channel mode is not.
+    // matches the stream's key. A stray header with another sampling rate is not.
     #[test]
     fn good_then_corrupt_frames_keep_the_good_one() {
         let mut bad = mp3_frame();
         bad[2] = 0x9C; // reserved sample rate
-        let mut fake = vec![0xFF, 0xFB, 0x10, 0xC0]; // 32 kbit/s (104 bytes), mono
-        fake.resize(104, 0x11);
-        bad[40..144].copy_from_slice(&fake);
-        bad[144..146].copy_from_slice(&[0xFF, 0xE0]);
+        let mut fake = vec![0xFF, 0xFB, 0x14, 0x00]; // 32 kbit/s at 48 kHz (96 bytes)
+        fake.resize(96, 0x11);
+        bad[40..136].copy_from_slice(&fake);
+        bad[136..138].copy_from_slice(&[0xFF, 0xE0]);
         let data = [mp3_frame(), bad.clone(), mp3_frame(), bad, mp3_frame()].concat();
         let mut p = MpegAudioParser::new();
         let mut f = p.parse(&make_pes(data, Some(0)));
@@ -602,26 +600,32 @@ mod tests {
         assert_eq!(f[1].data, joint);
     }
 
-    // [11172-3 §2.4.2.3] "'10' dual_channel / '11' single_channel": two programs and one are
-    // different streams, so a single_channel header inside a dual_channel stream is payload.
+    // [11172-3 §2.4.2.3] "To change the layer, a reset of the decoder is required." and "A reset
+    // of the decoder is required to change the sampling rate." Mode may change (e.g. stereo to
+    // single_channel at a programme boundary), so after a drop such a frame is kept.
     #[test]
-    fn a_single_channel_header_in_a_dual_channel_stream_is_not_kept() {
-        let dual = |mut f: Vec<u8>| {
-            f[3] = 0x80;
+    fn a_mode_change_is_kept_after_a_drop() {
+        let with_mode = |mode: u8| {
+            let mut f = mp3_frame();
+            f[3] = mode << 6;
             f
         };
-        let mut bad = dual(mp3_frame());
-        bad[2] = 0x9C;
-        let mut fake = vec![0xFF, 0xFB, 0x10, 0xC0]; // 32 kbit/s (104 bytes), single_channel
-        fake.resize(104, 0x11);
-        bad[40..144].copy_from_slice(&fake);
-        bad[144..146].copy_from_slice(&[0xFF, 0xE0]);
-        let data = [dual(mp3_frame()), bad, dual(mp3_frame()), dual(mp3_frame())].concat();
-        let mut p = MpegAudioParser::new();
-        let mut f = p.parse(&make_pes(data, Some(0)));
-        f.extend(p.flush());
-        assert_eq!(f.len(), 3);
-        assert!(f.iter().all(|fr| fr.data == dual(mp3_frame())));
+        let mut bad = mp3_frame();
+        bad[2] = 0x9C; // reserved sample rate
+        for (from, to) in [(0, 3), (1, 2)] {
+            let data = [
+                with_mode(from),
+                bad.clone(),
+                with_mode(to),
+                bad.clone(),
+                with_mode(to),
+            ];
+            let mut p = MpegAudioParser::new();
+            let mut f = p.parse(&make_pes(data.concat(), Some(0)));
+            f.extend(p.flush());
+            assert_eq!(f.len(), 3, "mode {from} to {to}");
+            assert_eq!(f[1].data, with_mode(to), "mode {from} to {to}");
+        }
     }
 
     // A 4-byte header: version 3 = ID '1' (11172-3), 2 = ID '0' (13818-3); layer 3/2/1 = I/II/III.
@@ -764,7 +768,7 @@ mod tests {
 
     // [11172-3 §2.4.2.3] "To change the layer, a reset of the decoder is required." and "A reset
     // of the decoder is required to change the sampling rate."; "Layer III supports variable
-    // bitrate by switching the bit_rate_index". Mode: stereo and joint_stereo alike.
+    // bitrate by switching the bit_rate_index". Nothing restricts the mode, so it is not keyed.
     #[test]
     fn spec_stream_key() {
         let key = |f: Vec<u8>| mpa_stream_key(&f);
@@ -774,17 +778,13 @@ mod tests {
             key(mpa(3, 1, 11, 0, 1, 0)),
             "bitrate and padding vary"
         );
-        assert_eq!(
-            base,
-            key(mpa(3, 1, 9, 0, 0, 1)),
-            "'01' joint_stereo ~ '00' stereo"
-        );
-        assert_ne!(base, key(mpa(3, 1, 9, 0, 0, 2)), "'10' dual_channel");
-        assert_ne!(
-            key(mpa(3, 1, 9, 0, 0, 2)),
-            key(mpa(3, 1, 9, 0, 0, 3)),
-            "vs single_channel"
-        );
+        for mode in 1..4 {
+            assert_eq!(
+                base,
+                key(mpa(3, 1, 9, 0, 0, mode)),
+                "mode {mode} may change"
+            );
+        }
         assert_ne!(base, key(mpa(3, 2, 9, 0, 0, 0)), "layer");
         assert_ne!(base, key(mpa(3, 1, 9, 1, 0, 0)), "sampling_frequency");
         assert_ne!(base, key(mpa(2, 1, 9, 0, 0, 0)), "ID");
