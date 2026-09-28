@@ -146,13 +146,16 @@ fn recv_send_timeout_without_cancel() {
     let h = Halt::new();
     let (tx, rx) = mpsc::channel::<u32>();
     tx.send(5).unwrap();
-    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Some(5));
+    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Recv::Item(5));
     let t = Instant::now();
-    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), None);
+    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Recv::TimedOut);
     assert!(t.elapsed() >= WINDOW && t.elapsed() < WINDOW + SLACK);
     drop(tx);
     let t = Instant::now();
-    assert_eq!(h.recv_timeout(&rx, Duration::from_secs(10)).unwrap(), None);
+    assert_eq!(
+        h.recv_timeout(&rx, Duration::from_secs(10)).unwrap(),
+        Recv::Disconnected
+    );
     assert!(t.elapsed() < SLACK, "a gone sender ends the wait at once");
 
     let (stx, srx) = mpsc::sync_channel::<u32>(1);
@@ -177,10 +180,71 @@ fn crossbeam_channels_are_timed() {
     let (tx, rx) = crossbeam_channel::bounded::<u32>(1);
     assert_eq!(h.send_timeout(&tx, 1, WINDOW), Ok(()));
     assert_eq!(h.send_timeout(&tx, 2, WINDOW), Err(2));
-    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Some(1));
-    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), None);
+    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Recv::Item(1));
+    assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Recv::TimedOut);
+    assert_eq!(h.send_timeout(&tx, 3, Duration::ZERO), Ok(()));
+    assert_eq!(h.send_timeout(&tx, 4, Duration::ZERO), Err(4));
+    assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::Item(3));
+    assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::TimedOut);
     drop(tx);
-    assert_eq!(h.recv_timeout(&rx, Duration::from_secs(10)).unwrap(), None);
+    assert_eq!(
+        h.recv_timeout(&rx, Duration::MAX).unwrap(),
+        Recv::Disconnected
+    );
+}
+
+/// A zero budget still makes one non-blocking attempt: a queued item is taken and
+/// a send into room succeeds; a full or empty channel reports at once.
+#[test]
+fn zero_budget_makes_one_attempt() {
+    let h = Halt::new();
+    let (tx, rx) = mpsc::sync_channel::<u32>(1);
+    let t = Instant::now();
+    assert_eq!(h.send_timeout(&tx, 1, Duration::ZERO), Ok(()));
+    assert_eq!(h.send_timeout(&tx, 2, Duration::ZERO), Err(2));
+    assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::Item(1));
+    assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::TimedOut);
+    assert!(t.elapsed() < SLACK);
+}
+
+/// A disconnected channel with an unbounded wait returns `Disconnected` at once, and
+/// every repeat does too, so a caller looping on it exits instead of spinning.
+#[test]
+fn disconnected_unbounded_recv_returns_at_once() {
+    let h = Halt::new();
+    let (tx, rx) = mpsc::channel::<u32>();
+    let worker = std::thread::spawn(move || {
+        let _tx = tx;
+        panic!("worker died");
+    });
+    assert!(worker.join().is_err());
+    let t = Instant::now();
+    assert_eq!(
+        h.recv_timeout(&rx, Duration::MAX).unwrap(),
+        Recv::Disconnected
+    );
+    assert_eq!(h.recv_timeout(&rx, WAIT_SLICE).unwrap(), Recv::Disconnected);
+    assert!(t.elapsed() < SLACK, "{:?}", t.elapsed());
+}
+
+/// The `SyncSender` poll backs off to one attempt per `WAIT_SLICE`: blocked for 10
+/// slices it makes ~15 attempts (1, 2, 4, 8, 16 ms, then 20 ms), not ~200 at 1 ms.
+#[test]
+fn sync_sender_poll_backs_off_to_a_slice() {
+    let mut attempts = 0;
+    let t = Instant::now();
+    let r = backoff_poll(1u32, WAIT_SLICE * 10, |v| {
+        attempts += 1;
+        Err(SendFail::Timeout(v))
+    });
+    assert!(matches!(r, Err(SendFail::Timeout(1))));
+    assert!(t.elapsed() >= WAIT_SLICE * 10);
+    assert!((5..=25).contains(&attempts), "{attempts} attempts");
+    let (tx, _rx) = mpsc::sync_channel::<u32>(0);
+    assert!(matches!(
+        tx.send_slice(2, WAIT_SLICE),
+        Err(SendFail::Timeout(2))
+    ));
 }
 
 // A thread blocked until the returned sender sends or drops.
@@ -355,8 +419,25 @@ fn idle_only_is_constructed_only_at_the_t29_site() {
     assert!(hits.is_empty(), "idle_only outside halt: {hits:?}");
 }
 
+// Serialise on the holder count; a poisoned lock (a failed sibling test) still serialises.
+fn holder_lock() -> std::sync::MutexGuard<'static, ()> {
+    DRIVE_HOLDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+// Wait (bounded) for detached holders to finish, so the next test sees `before`.
+fn settle_holders(before: usize) {
+    let t = Instant::now();
+    while live_drive_holders() != before {
+        assert!(t.elapsed() < SLACK * 4, "holders never settled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn drive_holder_joins_and_counts() {
+    let _serial = holder_lock();
     let (tx, rx) = mpsc::channel::<()>();
     let before = live_drive_holders();
     let holder = spawn_drive_holder("test-holder", move || {
@@ -365,20 +446,28 @@ fn drive_holder_joins_and_counts() {
     })
     .unwrap();
     assert_eq!(holder.role(), "test-holder");
-    assert!(live_drive_holders() > before);
+    assert_eq!(live_drive_holders(), before + 1);
     assert!(!holder.is_finished());
     drop(tx);
     let name = holder.join().unwrap();
     assert_eq!(name.as_deref(), Some("freemkv-test-holder"));
+    assert_eq!(
+        live_drive_holders(),
+        before,
+        "the count drops before join returns"
+    );
 }
 
 /// §2.1: a Drive holder dropped unjoined panics in debug builds.
 #[cfg(debug_assertions)]
 #[test]
 fn drive_holder_dropped_unjoined_panics_in_debug() {
+    let _serial = holder_lock();
+    let before = live_drive_holders();
     let holder = spawn_drive_holder("leaky", || 1u8).unwrap();
     let r = catch(move || drop(holder));
     assert!(r.is_err());
+    settle_holders(before);
 }
 
 /// LT6: a debug panic for each forbidden call (exec, sleep, join) under the scope;
@@ -386,6 +475,8 @@ fn drive_holder_dropped_unjoined_panics_in_debug() {
 #[cfg(debug_assertions)]
 #[test]
 fn no_blocking_scope_trips_on_exec_sleep_join() {
+    let _serial = holder_lock();
+    let before = live_drive_holders();
     let h = Halt::new();
     let (running, release) = parked_thread();
     let finished = std::thread::spawn(|| 1u8);
@@ -415,6 +506,7 @@ fn no_blocking_scope_trips_on_exec_sleep_join() {
     #[cfg(feature = "rip")]
     assert!(catch(scoped_exec_outside).unwrap());
     drop((release, hold));
+    settle_holders(before);
 }
 
 #[cfg(all(debug_assertions, feature = "rip"))]

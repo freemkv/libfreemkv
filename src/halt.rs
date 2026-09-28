@@ -121,20 +121,18 @@ impl Halt {
 
     /// Receive from `rx` for up to `d`, checking the token every [`WAIT_SLICE`].
     ///
-    /// `Ok(Some(item))` on receipt; `Ok(None)` when `d` passes, or at once when the
-    /// sending side is gone (nothing can arrive); `Err(Error::Halted)` on cancel,
-    /// which is checked before each slice.
-    pub fn recv_timeout<C: TimedRecv>(&self, rx: &C, d: Duration) -> Result<Option<C::Item>> {
+    /// `Recv::Item` on receipt; `Recv::TimedOut` once `d` passes; `Recv::Disconnected`
+    /// at once when the sending side is gone, so a caller looping on it cannot spin;
+    /// `Err(Error::Halted)` on cancel, checked before each slice. At least one
+    /// attempt is always made, so a zero `d` still takes a queued item.
+    pub fn recv_timeout<C: TimedRecv>(&self, rx: &C, d: Duration) -> Result<Recv<C::Item>> {
         let end = Instant::now().checked_add(d);
         loop {
             self.check()?;
-            let Some(slice) = remaining(end) else {
-                return Ok(None);
-            };
+            let slice = remaining(end).unwrap_or(Duration::ZERO);
             match rx.recv_slice(slice) {
-                Recv::Item(v) => return Ok(Some(v)),
-                Recv::Disconnected => return Ok(None),
-                Recv::Timeout => {}
+                Recv::TimedOut if remaining(end).is_some() => {}
+                r => return Ok(r),
             }
         }
     }
@@ -144,6 +142,7 @@ impl Halt {
     /// `Ok(())` once sent. On a cancel, `d` passing, or the receiver gone, the item
     /// comes back as `Err(v)`; the caller tells a stop apart with
     /// [`is_cancelled`](Self::is_cancelled), as with `Pipeline::send_with_halt`.
+    /// At least one attempt is always made, so a zero `d` still sends into room.
     pub fn send_timeout<C: TimedSend>(
         &self,
         tx: &C,
@@ -156,13 +155,11 @@ impl Halt {
             if self.is_cancelled() {
                 return Err(pending);
             }
-            let Some(slice) = remaining(end) else {
-                return Err(pending);
-            };
+            let slice = remaining(end).unwrap_or(Duration::ZERO);
             match tx.send_slice(pending, slice) {
                 Ok(()) => return Ok(()),
-                Err(SendFail::Timeout(back)) => pending = back,
-                Err(SendFail::Disconnected(back)) => return Err(back),
+                Err(SendFail::Timeout(back)) if remaining(end).is_some() => pending = back,
+                Err(SendFail::Timeout(back) | SendFail::Disconnected(back)) => return Err(back),
             }
         }
     }
@@ -185,11 +182,13 @@ fn remaining(end: Option<Instant>) -> Option<Duration> {
     }
 }
 
-/// One bounded receive attempt, as [`TimedRecv::recv_slice`] reports it.
-#[derive(Debug)]
+/// How a receive ended ([`Halt::recv_timeout`], [`TimedRecv::recv_slice`]).
+#[derive(Debug, PartialEq, Eq)]
 pub enum Recv<T> {
     Item(T),
-    Timeout,
+    /// Nothing arrived within the budget.
+    TimedOut,
+    /// Every sender is gone: nothing can ever arrive.
     Disconnected,
 }
 
@@ -203,14 +202,14 @@ pub enum SendFail<T> {
 /// A channel receiver [`Halt::recv_timeout`] can wait on in slices.
 pub trait TimedRecv {
     type Item;
-    /// Block for at most `d` waiting for one item.
+    /// Block for at most `d` waiting for one item; a zero `d` is one non-blocking try.
     fn recv_slice(&self, d: Duration) -> Recv<Self::Item>;
 }
 
 /// A channel sender [`Halt::send_timeout`] can wait on in slices.
 pub trait TimedSend {
     type Item;
-    /// Block for at most `d` waiting for room for `v`.
+    /// Block for at most `d` waiting for room for `v`; a zero `d` is one non-blocking try.
     fn send_slice(
         &self,
         v: Self::Item,
@@ -221,34 +220,57 @@ pub trait TimedSend {
 impl<T> TimedRecv for std::sync::mpsc::Receiver<T> {
     type Item = T;
     fn recv_slice(&self, d: Duration) -> Recv<T> {
-        use std::sync::mpsc::RecvTimeoutError;
+        use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+        if d.is_zero() {
+            return match self.try_recv() {
+                Ok(v) => Recv::Item(v),
+                Err(TryRecvError::Empty) => Recv::TimedOut,
+                Err(TryRecvError::Disconnected) => Recv::Disconnected,
+            };
+        }
         match self.recv_timeout(d) {
             Ok(v) => Recv::Item(v),
-            Err(RecvTimeoutError::Timeout) => Recv::Timeout,
+            Err(RecvTimeoutError::Timeout) => Recv::TimedOut,
             Err(RecvTimeoutError::Disconnected) => Recv::Disconnected,
         }
     }
 }
 
-// std's `SyncSender` has no timed send: poll `try_send`, sleeping at most `d`.
+// std's `SyncSender` has no timed send: poll `try_send` via `backoff_poll`.
 impl<T> TimedSend for std::sync::mpsc::SyncSender<T> {
     type Item = T;
     fn send_slice(&self, v: T, d: Duration) -> std::result::Result<(), SendFail<T>> {
         use std::sync::mpsc::TrySendError;
-        let end = Instant::now() + d;
-        let mut pending = v;
-        loop {
-            match self.try_send(pending) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Disconnected(back)) => return Err(SendFail::Disconnected(back)),
-                Err(TrySendError::Full(back)) => pending = back,
-            }
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(SendFail::Timeout(pending));
-            }
-            thread::sleep(left.min(Duration::from_millis(1)));
+        backoff_poll(v, d, |v| match self.try_send(v) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(back)) => Err(SendFail::Timeout(back)),
+            Err(TrySendError::Disconnected(back)) => Err(SendFail::Disconnected(back)),
+        })
+    }
+}
+
+// Retry `attempt` until it stops reporting `Timeout` or `d` passes, sleeping 1 ms and
+// doubling up to WAIT_SLICE: a long-full channel costs ~50 wakeups/s, and freed room is
+// seen within one backoff step. The first attempt is immediate.
+fn backoff_poll<T>(
+    v: T,
+    d: Duration,
+    mut attempt: impl FnMut(T) -> std::result::Result<(), SendFail<T>>,
+) -> std::result::Result<(), SendFail<T>> {
+    let end = Instant::now() + d;
+    let mut pending = v;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match attempt(pending) {
+            Err(SendFail::Timeout(back)) => pending = back,
+            done => return done,
         }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(SendFail::Timeout(pending));
+        }
+        thread::sleep(left.min(backoff));
+        backoff = (backoff * 2).min(WAIT_SLICE);
     }
 }
 
@@ -256,10 +278,17 @@ impl<T> TimedSend for std::sync::mpsc::SyncSender<T> {
 impl<T> TimedRecv for crossbeam_channel::Receiver<T> {
     type Item = T;
     fn recv_slice(&self, d: Duration) -> Recv<T> {
-        use crossbeam_channel::RecvTimeoutError;
+        use crossbeam_channel::{RecvTimeoutError, TryRecvError};
+        if d.is_zero() {
+            return match self.try_recv() {
+                Ok(v) => Recv::Item(v),
+                Err(TryRecvError::Empty) => Recv::TimedOut,
+                Err(TryRecvError::Disconnected) => Recv::Disconnected,
+            };
+        }
         match self.recv_timeout(d) {
             Ok(v) => Recv::Item(v),
-            Err(RecvTimeoutError::Timeout) => Recv::Timeout,
+            Err(RecvTimeoutError::Timeout) => Recv::TimedOut,
             Err(RecvTimeoutError::Disconnected) => Recv::Disconnected,
         }
     }
@@ -269,7 +298,14 @@ impl<T> TimedRecv for crossbeam_channel::Receiver<T> {
 impl<T> TimedSend for crossbeam_channel::Sender<T> {
     type Item = T;
     fn send_slice(&self, v: T, d: Duration) -> std::result::Result<(), SendFail<T>> {
-        use crossbeam_channel::SendTimeoutError;
+        use crossbeam_channel::{SendTimeoutError, TrySendError};
+        if d.is_zero() {
+            return match self.try_send(v) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(back)) => Err(SendFail::Timeout(back)),
+                Err(TrySendError::Disconnected(back)) => Err(SendFail::Disconnected(back)),
+            };
+        }
         match self.send_timeout(v, d) {
             Ok(()) => Ok(()),
             Err(SendTimeoutError::Timeout(back)) => Err(SendFail::Timeout(back)),
@@ -471,6 +507,10 @@ static LIVE_DRIVE_HOLDERS: AtomicUsize = AtomicUsize::new(0);
 pub fn live_drive_holders() -> usize {
     LIVE_DRIVE_HOLDERS.load(Ordering::SeqCst)
 }
+
+// Every test that spawns a Drive holder or reads the process-wide count holds this.
+#[cfg(all(test, not(loom)))]
+pub(crate) static DRIVE_HOLDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A thread that holds the Drive (§2.5): the op joins it before returning. In debug
 /// builds, dropping it unjoined panics.
