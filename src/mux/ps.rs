@@ -162,6 +162,13 @@ impl UnstoredExtensions {
         true
     }
 
+    /// Add extension track `track` (PID `pid`) as one this sink does not write.
+    pub(crate) fn add(&mut self, track: usize, pid: u16) {
+        if !self.contains(track) {
+            self.tracks.push((track, pid, false));
+        }
+    }
+
     /// Keep only the extension tracks `unstored` says this sink does not write.
     pub(crate) fn retain(&mut self, unstored: impl Fn(usize) -> bool) {
         self.tracks.retain(|t| unstored(t.0));

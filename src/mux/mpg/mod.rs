@@ -448,6 +448,26 @@ impl<W: Write + Send> MpgSink<W> {
 
     // The system header and program stream map of the first pack (MS-21 §2.7.8).
     fn first_pack_prefix(&mut self) -> Vec<u8> {
+        // J23: an extension with no packets in the origin window is not described; its
+        // packets, should they come later, are left out and reported like an orphan's.
+        let unseen: Vec<usize> = (0..self.outs.len())
+            .filter(|&o| matches!(self.outs[o].kind, OutKind::Extension { .. }))
+            .filter(|&o| self.window.iter().all(|(w, _)| *w != o))
+            .collect();
+        for &o in &unseen {
+            let track = self.outs[o].track;
+            self.route[track] = None;
+            if let DiscStream::Audio(a) = &self.title.streams[track] {
+                self.excluded.add(track, a.pid);
+            }
+        }
+        let unseen_buffers: Vec<usize> = unseen.iter().map(|&o| self.outs[o].spec.buffer).collect();
+        let ext_of = |base: usize| {
+            (0..self.outs.len()).any(|o| {
+                matches!(self.outs[o].kind, OutKind::Extension { base_out } if base_out == base)
+                    && !unseen.contains(&o)
+            })
+        };
         let first_au = |out: usize| self.window.iter().find(|(o, _)| *o == out).map(|(_, a)| a);
         // MS-7/MS-13: the video bound from vbv_buffer_size + 8 KiB (design §2.4 table).
         let video_track = self.outs[self.video_out].track;
@@ -477,6 +497,7 @@ impl<W: Write + Send> MpgSink<W> {
                     descriptors: Vec::new(),
                 }),
                 OutKind::MpegAudio { has_ext } => {
+                    let has_ext = has_ext && ext_of(oi);
                     audio_bound += 1;
                     // MS-22: 0x03 11172 Audio (ID bit 1), 0x04 13818-3 Audio (LSF, or a base
                     // whose multichannel extension is carried).
@@ -504,6 +525,7 @@ impl<W: Write + Send> MpgSink<W> {
                         descriptors: d,
                     });
                 }
+                OutKind::Extension { .. } if unseen.contains(&oi) => {}
                 OutKind::Extension { .. } => {
                     audio_bound += 1;
                     let n = o.spec.stream_id & 0x07;
@@ -553,10 +575,9 @@ impl<W: Write + Send> MpgSink<W> {
                 descriptors: Vec::new(),
             });
         }
-        let bounds: Vec<Bound> = self
-            .buffers
-            .iter()
-            .map(|b| Bound {
+        let bounds: Vec<Bound> = (self.buffers.iter().enumerate())
+            .filter(|(i, _)| !unseen_buffers.contains(i))
+            .map(|(_, b)| Bound {
                 stream_id: b.stream_id,
                 scale_1024: b.scale_1024,
                 size: b.size,

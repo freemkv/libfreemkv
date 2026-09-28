@@ -183,9 +183,9 @@ impl<W: Write> Mux<W> {
                 .into_iter()
                 .map(|spec| Stream {
                     // Every carried track holds the lookahead from the start, so one that
-                    // lags in the source interleave is waited for (design §2.4 step 1); a
-                    // track that never delivers is released by the interleave cap.
-                    active: !spec.sparse,
+                    // lags in the source interleave is waited for (design §2.4 step 1); the
+                    // extension, which IFO coding mode 3 may only declare, from its first AU.
+                    active: !spec.sparse && spec.payload != Payload::WholeAu,
                     spec,
                     queue: VecDeque::new(),
                     first_pes_done: false,
