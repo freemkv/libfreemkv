@@ -1662,3 +1662,15 @@ fn single_unit_rule_never_overrides_a_piece_another_key_opened() {
     let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
 }
+
+/// KU §2.4 (review item 5): the held keys are tried on U before any side read. A readable
+/// unit no held key opens stops at once, with no side read of a (possibly damaged) area.
+#[test]
+fn unopenable_unit_stops_before_any_side_read() {
+    let (fx, set, src) = lazy_b(&[K1]);
+    let counted = CountingSource::new(src);
+    let log = counted.log();
+    let mut r = set.title_reader(&fx.disc, 0, counted).unwrap();
+    assert_eq!(code(read(&mut r, &fx, 1, 4, 1)), E7022);
+    assert_eq!(log.reads(), [(fx.unit(1, 4), 3)], "only the requested read");
+}
