@@ -806,6 +806,16 @@ fn resolve_bd(
     }
     let mut inner = aacs_inner(run);
     inner.no_stream_files = files.is_empty();
+    // Refused up front only if no probe of the piece opens: arrival blanks a unit whose batch
+    // partner opens (damage), and a damaged seed opens under no key (E7013 option A).
+    inner.lazy_unopened = ps.iter().any(|p| {
+        let opened = |u: &Vec<u8>| (0..run.pool.len()).any(|s| run.opens(u, s));
+        matches!(p.verdict, Verdict::Lazy(_))
+            && !p.enc.iter().any(opened)
+            && p.enc
+                .iter()
+                .any(|u| crate::aacs::content::aacs_unit_on_grid(u, format))
+    });
     // Step 6 (continued): forensic keys, reused from the seed or anchored once.
     let forensic = match &layout {
         None => None,
