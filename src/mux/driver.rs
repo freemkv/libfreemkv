@@ -349,8 +349,8 @@ pub fn mux_stream(
                     )
                 };
                 // Prune to selected streams before `DiscStream::new` builds demux
-                // tables (and before inline probe_and_remap). Only touches the
-                // stream list; ciphertext sampling in resolve_inline_base_map unaffected.
+                // tables. Only touches the stream list; ciphertext sampling in
+                // resolve_inline_base_map unaffected.
                 opts.selection
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
