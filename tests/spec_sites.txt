@@ -14,3 +14,15 @@ src/disc/mod.rs	declared_cps_units	KS-14
 src/whole_disc.rs	single_cps_key_slot	KS-14
 src/whole_disc.rs	single_cps_key_slot	KS-27
 src/sector/bus_removal.rs	debus_read	KS-18
+src/scsi/mod.rs	parse_sense_progress	SS-1
+src/scsi/mod.rs	parse_sense_progress	SS-2
+src/drive/mod.rs	wait_ready_with	SS-1
+src/drive/mod.rs	wait_ready_with	SS-3
+src/drive/mod.rs	wait_ready_with	SS-4
+src/drive/allow.rs	is_allow	SS-5
+src/drive/mod.rs	lock_tray	SS-5
+src/drive/mod.rs	unlock_tray	SS-5
+src/drive/allow.rs	is_eject	SS-6
+src/drive/mod.rs	eject	SS-6
+src/drive/mod.rs	start_unit	SS-6
+src/drive/mod.rs	note_ledger	SS-7
