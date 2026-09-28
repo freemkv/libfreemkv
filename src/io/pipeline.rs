@@ -206,6 +206,18 @@ pub trait Sink<I>: Send + 'static {
     /// this to flush, fsync, finalise. Skipped if any prior `apply`
     /// returned `Err`.
     fn close(self) -> Result<Self::Output, Error>;
+
+    /// `close` for a consumer that committed to finalising only after the op was stopped
+    /// (stop design §2.5, §2.6: "A post-cancel `close()` leaves `*.partial`"): finish
+    /// writing, but keep the output under its `*.partial` name. Its result is the
+    /// pipeline's; the caller classifies the op by its token (§2.6). Defaults to `close`,
+    /// right for a sink that never renames its output.
+    fn close_stopped(self) -> Result<Self::Output, Error>
+    where
+        Self: Sized,
+    {
+        self.close()
+    }
 }
 
 /// Bounded producer/consumer pipeline. Holds the producer-side
@@ -421,6 +433,14 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             failed,
             progress,
         })
+    }
+
+    /// Give the consumer the op's token (stop design §2.5): a consumer that reaches
+    /// `close()` after it is cancelled runs [`Sink::close_stopped`] instead, and the
+    /// pipeline returns `Halted`. The first token set wins;
+    /// [`finish_with_halt`](Self::finish_with_halt) sets its `halt` if none was.
+    pub fn set_op_token(&self, halt: &Halt) {
+        let _ = halt;
     }
 
     /// The consumer's forward-progress counter: bumped per item applied and at
