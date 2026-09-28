@@ -565,14 +565,27 @@ impl ResolvedKeySet {
         i.keyless = true;
         i.content_format = format;
         i.scope = KeyScope::WholeDisc;
-        for e in title.extents.iter().filter(|e| e.sector_count > 0) {
-            let span = (e.start_lba, e.sector_count, e.start_lba as u64);
-            if i.spans.contains(&span) {
-                continue; // a playlist may play a clip twice
+        // Arrival spans must be disjoint: overlapping extents (a clip played twice, or one
+        // inside another) merge into one span. Adjacent clips keep their own unit grids.
+        let mut ranges: Vec<(u32, u32)> = title
+            .extents
+            .iter()
+            .filter(|e| e.sector_count > 0)
+            .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
+            .collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (s, e) in ranges {
+            match merged.last_mut() {
+                Some(last) if s < last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
             }
+        }
+        for (s, e) in merged {
+            let span = (s, e - s, s as u64);
             i.spans.push(span);
             i.arrival.push(ArrivalPiece {
-                id: e.start_lba,
+                id: s,
                 spans: vec![span],
                 candidate: None,
             });
