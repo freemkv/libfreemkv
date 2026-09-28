@@ -78,7 +78,6 @@ struct Piece {
     enc: Vec<Vec<u8>>,
     faults: usize,
     verdict: Verdict,
-    failure: Option<Error>,
 }
 
 impl Piece {
@@ -108,7 +107,8 @@ impl Piece {
 enum Asked {
     Keys(Vec<[u8; 16]>),
     Empty,
-    Failed(Error),
+    /// The source failed; the error is the run's `first_failure` if it came first.
+    Failed,
     Skipped,
 }
 
@@ -126,6 +126,9 @@ struct Run<'a> {
     trace: ResolutionTrace,
     // A source matched the disc and held a Media Key but had no VID (KU J23).
     km_needs_vid: bool,
+    // The run's first source failure: a Missing refusal is this failure when there was one,
+    // whichever piece's request failed (review B-1, KU-E1b); never E7022, so never E7034.
+    first_failure: Option<Error>,
 }
 
 impl Run<'_> {
@@ -220,7 +223,11 @@ impl Run<'_> {
                         Asked::Keys(keys.into_iter().map(|u| u.key).collect())
                     });
                 }
-                Err(Error::Halted) => return Err(Error::Halted),
+                Err(Error::Halted) => {
+                    // A source stopped mid-request: the request went out (minor 1).
+                    self.unanswered(i);
+                    return Err(Error::Halted);
+                }
                 Err(e) => {
                     let waited = self.clock.now().saturating_sub(start);
                     if src.last_failure_was_transport() && waited < NO_ANSWER_WINDOW {
@@ -246,7 +253,8 @@ impl Run<'_> {
                         matched_entry: None,
                         store_entries: None,
                     });
-                    return Ok(Asked::Failed(e));
+                    self.first_failure.get_or_insert(e);
+                    return Ok(Asked::Failed);
                 }
             }
         }
@@ -354,7 +362,6 @@ fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) ->
             enc: Vec::new(),
             faults: 0,
             verdict: Verdict::Ask,
-            failure: None,
         });
     };
     for file in files {
@@ -513,6 +520,7 @@ pub(crate) fn resolve(
         requests: 0,
         trace: ResolutionTrace::new(),
         km_needs_vid: false,
+        first_failure: None,
     };
     if let Some(s) = seed {
         run.add_keys(&s.0.pool, "seed");
@@ -589,21 +597,15 @@ fn resolve_hddvd(
     let ps = pieces(disc, &files, sel, *scope == KeyScope::WholeDisc);
     if run.pool.is_empty() {
         let samples = disc.content_samples(reader, MIN_SAMPLE_UNITS);
-        let mut failure = None;
         for i in 0..run.sources.len() {
-            match run.ask(i, &samples, false)? {
-                Asked::Keys(k) => {
-                    let who = run.sources[i].label();
-                    run.add_keys(&k[..1], who);
-                    break;
-                }
-                Asked::Failed(e) => {
-                    failure.get_or_insert(e);
-                }
-                _ => {}
+            if let Asked::Keys(k) = run.ask(i, &samples, false)? {
+                let who = run.sources[i].label();
+                run.add_keys(&k[..1], who);
+                break;
             }
         }
         if run.pool.is_empty() {
+            let failure = run.first_failure.take();
             return Err(failure.unwrap_or_else(|| missing_error(scope, disc)));
         }
     }
@@ -677,9 +679,6 @@ fn resolve_bd(
     for p in &mut ps {
         probe(reader, p, &segments, format, run.halt)?;
     }
-    // The first source failure of this run: a Missing piece whose sources were dead or
-    // failing is that failure, never E7022 (review B-1; E7034 must not stand for an outage).
-    let mut source_failure: Option<Error> = None;
     // Step 8: sample-independent sources, once, with the main title's samples.
     let needs_keys = ps
         .iter()
@@ -703,15 +702,9 @@ fn resolve_bd(
             if run.sources[i].answer_depends_on_samples() {
                 continue;
             }
-            match run.ask(i, &samples, false)? {
-                Asked::Keys(k) => {
-                    let who = run.sources[i].label();
-                    run.add_keys(&k, who);
-                }
-                Asked::Failed(e) => {
-                    source_failure.get_or_insert(e);
-                }
-                Asked::Empty | Asked::Skipped => {}
+            if let Asked::Keys(k) = run.ask(i, &samples, false)? {
+                let who = run.sources[i].label();
+                run.add_keys(&k, who);
             }
         }
     }
@@ -746,20 +739,13 @@ fn resolve_bd(
             continue;
         }
         budget -= 1;
-        let mut failure = None;
         for s in dependent {
-            match run.ask(s, &samples, false)? {
-                Asked::Keys(k) => {
-                    let who = run.sources[s].label();
-                    run.add_keys(&k, who);
-                    if run.judge(&ps[i]) != Verdict::Ask {
-                        break;
-                    }
+            if let Asked::Keys(k) = run.ask(s, &samples, false)? {
+                let who = run.sources[s].label();
+                run.add_keys(&k, who);
+                if run.judge(&ps[i]) != Verdict::Ask {
+                    break;
                 }
-                Asked::Failed(e) => {
-                    failure.get_or_insert(e);
-                }
-                Asked::Empty | Asked::Skipped => {}
             }
         }
         // Proven on this piece's own units: ≥ 2 → Keyed; an unopened unit → Missing. A piece
@@ -768,26 +754,19 @@ fn resolve_bd(
             Verdict::Ask => Verdict::Missing,
             v => v,
         };
-        if ps[i].verdict == Verdict::Missing {
-            ps[i].failure = failure;
-        }
     }
     apply_single_unit_rule(run, &mut ps, n_decl)?;
-    let missing = |p: &Piece| p.verdict == Verdict::Missing;
-    let failed = ps.iter().position(|p| missing(p) && p.failure.is_some());
-    if let Some(i) = failed.or_else(|| ps.iter().position(missing)) {
+    if let Some(i) = ps.iter().position(|p| p.verdict == Verdict::Missing) {
         let lba = ps[i].id();
-        let err = ps[i]
-            .failure
-            .take()
-            .or(source_failure.take())
-            .unwrap_or_else(|| missing_error(scope, disc));
+        let failure = run.first_failure.take();
+        let err = failure.unwrap_or_else(|| missing_error(scope, disc));
         tracing::error!(target: "freemkv::keys", lba, code = err.code(), "a stream file in scope has no key; refusing before any output");
         return Err(err);
     }
     // KU §2.7: an empty pool on an encrypted scope is today's keyless case.
     if run.pool.is_empty() && ps.iter().any(|p| matches!(p.verdict, Verdict::Lazy(_))) {
-        return Err(source_failure.unwrap_or_else(|| missing_error(scope, disc)));
+        let failure = run.first_failure.take();
+        return Err(failure.unwrap_or_else(|| missing_error(scope, disc)));
     }
     let mut inner = aacs_inner(run);
     // Step 6 (continued): forensic keys, reused from the seed or anchored once.
@@ -891,21 +870,14 @@ fn resolve_forensic(
         ));
     }
     let halt = run.halt;
+    // A failed request is kept as the run's first failure, not returned per batch.
     let mut ask = |batch: &[Vec<u8>]| -> Result<Option<Vec<[u8; 16]>>> {
-        let mut failure = None;
         for i in 0..run.sources.len() {
-            match run.ask(i, batch, true)? {
-                Asked::Keys(k) => return Ok(Some(k)),
-                Asked::Failed(e) => {
-                    failure.get_or_insert(e);
-                }
-                _ => {}
+            if let Asked::Keys(k) = run.ask(i, batch, true)? {
+                return Ok(Some(k));
             }
         }
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(None),
-        }
+        Ok(None)
     };
     let keys = match super::fmts::anchor(reader, layout, halt, &mut ask)? {
         super::fmts::Anchor::Keys(k) => k,
@@ -914,6 +886,7 @@ fn resolve_forensic(
             return Ok(Forensic::Pending);
         }
         super::fmts::Anchor::Missing(failure) => {
+            let failure = failure.or(run.first_failure.take());
             return Err(failure.unwrap_or(Error::FmtsKeyMissing));
         }
     };
