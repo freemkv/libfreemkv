@@ -1693,7 +1693,20 @@ mod tests {
         assert_eq!(dvd_audio_pid(0xC7), Some(0xBDC7));
         // Just outside the range.
         assert_eq!(dvd_audio_pid(0xBF), None);
-        assert_eq!(dvd_audio_pid(0xC8), None);
+        // G17: the whole E-AC-3 sub-id range 0xC0..=0xCF (mpg:// allocates 0xC8..).
+        assert_eq!(dvd_audio_pid(0xC8), Some(0xBDC8));
+        assert_eq!(dvd_audio_pid(0xCF), Some(0xBDCF));
+        assert_eq!(dvd_audio_pid(0xD0), None);
+        assert_eq!(mk(0xBD, Some(0xCA)).dvd_pid(), Some(0xBDCA));
+        // …and its 4-byte sub-header is stripped like 0xC0's.
+        let pes = [
+            0, 0, 1, 0xBD, 0, 14, 0x81, 0x80, 5, 0x21, 0, 1, 0, 1, 0xCA, 1, 0, 1, 0x0B, 0x77,
+        ];
+        let mut d = PsDemuxer::new();
+        let mut ps = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
+        ps.extend_from_slice(&pes);
+        let got: Vec<_> = d.feed(&ps).into_iter().chain(d.flush()).collect();
+        assert_eq!(got[0].data, vec![0x0B, 0x77], "sub-header stripped");
         // Four DD+ tracks (as seen on a real disc) get four distinct PIDs.
         let pids: Vec<u16> = (0xC0u8..=0xC3).map(|s| dvd_audio_pid(s).unwrap()).collect();
         assert_eq!(pids, vec![0xBDC0, 0xBDC1, 0xBDC2, 0xBDC3]);
