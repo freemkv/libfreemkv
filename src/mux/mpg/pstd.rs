@@ -140,6 +140,8 @@ pub(crate) struct PstdCounters {
     pub interleave_cap: u64,
     /// Padding-only packs written to keep SCR spacing ≤ 0.7 s.
     pub padding_packs: u64,
+    /// EOF passes that lifted the lead and whole-frame waits to drain what was stuck.
+    pub forced_eof: u64,
 }
 
 /// The pack writer.
@@ -766,6 +768,20 @@ mod tests {
             data: vec![0x55; len],
             lpcm_bits: 0,
         }
+    }
+
+    // Nit (r2): the forced EOF pass that lifts the 0.95 s lead is counted, not silent.
+    #[test]
+    fn a_forced_eof_drain_is_counted() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 0, 0));
+        m.push(0, au(12_600, 100, 0));
+        m.finish().unwrap();
+        assert_eq!(m.counters().forced_eof, 1);
+        let mut clean = video_mux();
+        clean.push(0, au(9_000, 100, 0));
+        clean.finish().unwrap();
+        assert_eq!(clean.counters().forced_eof, 0);
     }
 
     // B1: at EOF nothing is left behind. A zero-length AU used to wedge its stream and
