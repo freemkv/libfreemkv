@@ -419,12 +419,16 @@ pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 /// Requires BOTH the MPEG-PS pack-start code AND the 0x14 scramble bits
 /// ([`has_scramble_flag_bits`] alone is not enough), and excludes structural/nav `stream_id`s
 /// at 0x11 (`0xBB`/`0xBE`/`0xBF`) that CSS never scrambles so a decrypted HD-DVD's RDI nav
-/// packs can't falsely trip it. 0x11 holds the `stream_id` only for zero-stuffing headers
-/// (always true for DVD-Video VOB packs); a stuffed pack reads 0xFF there, harmless.
+/// packs can't falsely trip it. 0x11/0x14 hold the `stream_id`/PES flags only in an unstuffed
+/// 13818-1 pack (every DVD-Video VOB pack), so an 11172-1 or stuffed pack never counts.
 pub fn is_scrambled_pack(sector: &[u8]) -> bool {
     use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
+    // B2: only an unstuffed 13818-1 pack ('01', pack_stuffing_length 0) has the first
+    // PES's stream_id at 0x11 and its flags at 0x14; an 11172-1 pack cannot be CSS.
     sector.len() >= 2048
         && sector[0x00..0x04] == PACK_START
+        && sector[0x04] >> 6 == 0b01
+        && sector[0x0D] & 0x07 == 0
         && !matches!(
             sector[0x11],
             SYSTEM_HEADER | PADDING_STREAM | PRIVATE_STREAM_2
@@ -494,6 +498,7 @@ mod tests {
     fn false_positive_scrambled_pack() -> [u8; 2048] {
         let mut sector = [0u8; 2048];
         sector[0x00..0x04].copy_from_slice(&PACK_START);
+        sector[4] = 0x44; // '01': a 13818-1 pack
         sector[0x11] = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
         sector[0x14] = 0x30;
         for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
@@ -706,6 +711,7 @@ mod tests {
         );
         // The real signature flips it to a scrambled pack.
         s[0x00..0x04].copy_from_slice(&PACK_START);
+        s[4] = 0x44; // '01': a 13818-1 pack
         assert!(
             is_scrambled_pack(&s),
             "valid pack-start + 0x14 bits → scrambled pack"
@@ -722,6 +728,7 @@ mod tests {
         // A pack-start pack with 0x14 scramble bits set, varying only 0x11.
         let mut s = vec![0u8; 2048];
         s[0x00..0x04].copy_from_slice(&PACK_START);
+        s[4] = 0x44; // '01': a 13818-1 pack
         s[0x14] = 0x30;
         for excluded in [SYSTEM_HEADER, PADDING_STREAM, PRIVATE_STREAM_2] {
             s[0x11] = excluded;
@@ -789,6 +796,7 @@ mod tests {
         const SEED_OFFSET: usize = 0x54;
         let mut plaintext = vec![0u8; 2048];
         plaintext[0x00..0x04].copy_from_slice(&PACK_START); // valid DVD pack header
+        plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
         let pat: Vec<u8> = (0..period)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
@@ -851,6 +859,7 @@ mod tests {
                         // before trusting 0x14; `stream_id` defaults to 0x00
                         // (scramblable) vs. an RDI nav pack's excluded 0xBF.
                         buf[base..base + 4].copy_from_slice(&PACK_START);
+                        buf[base + 4] = 0x44; // '01': a 13818-1 pack
                         buf[base + 0x11] = self.stream_id;
                         buf[base + 0x14] = self.flag_byte;
                     }
@@ -1048,6 +1057,8 @@ mod tests {
             *b = (i as u8).wrapping_mul(29).wrapping_add(3);
         }
         pack[0x00..0x04].copy_from_slice(&PACK_START);
+        pack[4] = 0x44; // '01': a 13818-1 pack
+        pack[0x0D] = 0xF8; // pack_stuffing_length 0
         pack[0x14] = 0x30;
         assert!(is_scrambled_pack(&pack));
 

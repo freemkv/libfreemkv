@@ -33,6 +33,8 @@ fn css_decrypt_of_an_uncrackable_sector_still_descrambles() {
     // the pack start code as well as the flag bits, because byte 0x14 means
     // something else entirely in an IFO, UDF or ISO 9660 sector.
     sector[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+    sector[4] = 0x44; // '01': a 13818-1 pack
+    sector[0x0D] = 0xF8; // pack_stuffing_length 0
     sector[0x14] |= 0x30; // CSS scramble flag, bits 4-5
 
     let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];

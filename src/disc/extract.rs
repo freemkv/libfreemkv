@@ -1583,6 +1583,7 @@ mod tests {
         // Pack start code: a real scrambled sector is an MPEG-2 PS pack, and
         // the descrambler requires it before trusting byte 0x14.
         plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        plain[4] = 0x44; // '01': a 13818-1 pack
         plain[0x14] = 0x10; // scramble flag
         let pat: Vec<u8> = (0..8)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
@@ -2140,6 +2141,7 @@ mod tests {
             // signature (real scrambled sector = MPEG-2 PS pack) before cracking; without it
             // `resolve_vts_key` falls back to `base_keys` for both groups, masking the regression.
             plain[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
+            plain[4] = 0x44; // '01': a 13818-1 pack
             plain[0x14] = 0x10; // scramble flag
             let pat: Vec<u8> = (0..8)
                 .map(|k| (0xA0u8.wrapping_add(k as u8) ^ marker) ^ 0x5A)
@@ -2214,6 +2216,7 @@ mod tests {
             let seed = [0x11u8, 0x22, 0x33, 0x44, 0x01];
             let mut plain = vec![0u8; 2048];
             plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+            plain[4] = 0x44; // '01': a 13818-1 pack
             plain[0x14] = 0x10;
             let pat: Vec<u8> = (0..8)
                 .map(|k| (0xA0u8.wrapping_add(k as u8) ^ 0x01) ^ 0x5A)
@@ -2231,6 +2234,7 @@ mod tests {
         let uncrackable = {
             let mut sect = vec![0u8; 2048];
             sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+            sect[4] = 0x44; // '01': a 13818-1 pack
             sect[0x14] = 0x10;
             for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
                 // Non-repeating, so no run of any period survives to 0x80.
@@ -2927,6 +2931,7 @@ mod tests {
         // Uncrackable ciphertext over >1 crack batch (64), so the cancel lands mid-scan.
         let mut sect = vec![0u8; 2048];
         sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sect[4] = 0x44; // '01': a 13818-1 pack
         sect[0x14] = 0x10;
         for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);
@@ -3025,6 +3030,7 @@ mod tests {
         }
         let mut sect = vec![0u8; 2048];
         sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sect[4] = 0x44; // '01': a 13818-1 pack
         sect[0x14] = 0x10;
         for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);

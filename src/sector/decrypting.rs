@@ -660,6 +660,8 @@ mod tests {
         // Real scrambled DVD sectors are MPEG-2 PS packs; the scramble policy
         // requires the pack start code as well as the flag bits.
         template[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        template[4] = 0x44; // '01': a 13818-1 pack
+        template[0x0D] = 0xF8; // pack_stuffing_length 0
         template[0x14] = 0x30; // scramble bits (4-5) set → flags == 0x03
         let pristine = template;
 

@@ -2008,15 +2008,28 @@ fn build_ps_pipeline(path: &Path, opts: &InputOptions) -> io::Result<PipelinedPe
         sector_count: capacity,
     };
     let mut keys = crate::decrypt::DecryptKeys::None;
-    crate::css::resolve_dvd_title_key(
-        &mut reader,
-        &[extent],
-        &mut keys,
-        PS_MUX_BATCH_SECTORS,
-        ContentFormat::MpegPs,
-        opts.raw,
-        None,
-    )?;
+    // B2: CSS scrambles DVD-Video's 13818-1 packs only; an 11172-1 system stream (the
+    // first pack's '0010') cannot be CSS, so it is never cracked.
+    let probe = capacity.min(32);
+    let mut first = vec![0u8; probe as usize * 2048];
+    reader
+        .read_sectors(0, probe as u16, &mut first, false)
+        .map_err(|e| -> io::Error { e.into() })?;
+    let mpeg2 = first
+        .windows(5)
+        .find(|w| w[..4] == crate::css::PACK_START)
+        .is_some_and(|w| w[4] >> 6 == 0b01);
+    if mpeg2 {
+        crate::css::resolve_dvd_title_key(
+            &mut reader,
+            &[extent],
+            &mut keys,
+            PS_MUX_BATCH_SECTORS,
+            ContentFormat::MpegPs,
+            opts.raw,
+            None,
+        )?;
+    }
     let head_src = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
     let mut head_reader = crate::sector::DecryptingSectorSource::new(
         Box::new(head_src) as Box<dyn SectorSource>,
@@ -2954,6 +2967,8 @@ mod tests {
         for (i, b) in sec.iter_mut().enumerate().take(0x80).skip(4) {
             *b = (i as u8).wrapping_mul(7).wrapping_add(1); // non-repeating → no crib
         }
+        sec[4] = 0x44; // '01': a 13818-1 pack
+        sec[0x0D] = 0xF8; // pack_stuffing_length 0
         sec[0x14] = 0x10; // scramble flag
         for (i, b) in sec.iter_mut().enumerate().skip(0x80) {
             *b = (i as u8) ^ 0x3C;
