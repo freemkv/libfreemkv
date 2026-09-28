@@ -62,6 +62,8 @@ pub struct PipelinedPesStream {
     /// stream index. (TS titles are AU-complete already, so this is a passthrough
     /// there too — `consume_ts` does not use it.)
     au_asm: Vec<super::au_assembly::AuAssembler>,
+    /// Per-track PAFF second-field merge after the assembler (H.264 only, MPG2-7).
+    field_merge: Vec<Option<super::au_assembly::SecondFieldMerge>>,
     /// Bounds the header pump's wait for in-band codec configs (AAC).
     header_gate: super::header_gate::HeaderGate,
     /// The op's stop token; a never-cancelled stand-in when there is none.
@@ -106,6 +108,14 @@ impl PipelinedPesStream {
             .iter()
             .map(|s| super::au_assembly::AuAssembler::for_codec(stream_codec(s)))
             .collect();
+        let field_merge = title
+            .streams
+            .iter()
+            .map(|s| {
+                (stream_codec(s) == crate::disc::Codec::H264)
+                    .then(super::au_assembly::SecondFieldMerge::default)
+            })
+            .collect();
         Self {
             title,
             parsers,
@@ -120,6 +130,7 @@ impl PipelinedPesStream {
             resync,
             is_video,
             au_asm,
+            field_merge,
             header_gate: super::header_gate::HeaderGate::default(),
             halt: crate::halt::Halt::new(),
             video_stream_id: None,
@@ -311,6 +322,10 @@ impl PipelinedPesStream {
                     discontinuity: false,
                 }],
             };
+            let pkts = match self.field_merge.get_mut(track).and_then(Option::as_mut) {
+                Some(m) => pkts.into_iter().flat_map(|p| m.push(p)).collect(),
+                None => pkts,
+            };
             for pes in &pkts {
                 if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
                     for frame in parser.parse(pes) {
@@ -357,6 +372,7 @@ impl PipelinedPesStream {
                     let resync = &mut self.resync;
                     let is_video = &self.is_video;
                     let au_asm = &mut self.au_asm;
+                    let field_merge = &mut self.field_merge;
                     for (pid, parser) in self.parsers.iter_mut() {
                         let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                             continue;
@@ -366,16 +382,23 @@ impl PipelinedPesStream {
                         // the parser's own buffer (MPEG-2 final GOP, DTS-HD tail).
                         let mut frames = Vec::new();
                         let tail = au_asm.get_mut(track).map(|a| a.flush()).unwrap_or_default();
-                        for au in tail {
-                            let pes = PesPacket {
+                        let mut tail: Vec<PesPacket> = tail
+                            .into_iter()
+                            .map(|au| PesPacket {
                                 source: au.source,
                                 pid: *pid,
                                 pts: au.pts,
                                 dts: au.dts,
                                 data: au.data,
                                 discontinuity: au.discontinuity,
-                            };
-                            frames.extend(parser.parse(&pes));
+                            })
+                            .collect();
+                        if let Some(m) = field_merge.get_mut(track).and_then(Option::as_mut) {
+                            tail = tail.into_iter().flat_map(|p| m.push(p)).collect();
+                            tail.extend(m.flush());
+                        }
+                        for pes in &tail {
+                            frames.extend(parser.parse(pes));
                         }
                         frames.extend(parser.flush());
                         for frame in frames {
