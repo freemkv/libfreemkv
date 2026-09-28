@@ -339,7 +339,7 @@ pub(crate) fn decrypt_sectors_mapped(
     base_lba: u32,
     map: &AacsKeyMap,
 ) -> Result<(), crate::error::Error> {
-    decrypt_sectors_mapped_in_content(buf, keys, base_lba, map, None)
+    decrypt_sectors_mapped_in_content(buf, keys, base_lba, map, None).map(|_| ())
 }
 
 /// `decrypt_sectors_mapped` restricted to the disc's encrypted-content extents.
@@ -349,20 +349,21 @@ pub(crate) fn decrypt_sectors_mapped(
 /// verified, or counted as loss. `None` means "the caller only reads encrypted
 /// content", so every unit is treated as content (the legacy behaviour). This is
 /// how [`crate::sector::DecryptingSectorSource::with_content_ranges`] honours its contract.
+/// Returns how many damaged FMTS units (a lone failed verify) it blanked.
 pub(crate) fn decrypt_sectors_mapped_in_content(
     buf: &mut [u8],
     keys: &DecryptKeys,
     base_lba: u32,
     map: &AacsKeyMap,
     content: Option<&[(u32, u32)]>,
-) -> Result<(), crate::error::Error> {
+) -> Result<usize, crate::error::Error> {
     match keys {
         // The AACS arm only reads the keys: no per-batch deep clone.
         DecryptKeys::Aacs { .. } => apply_aacs_map(buf, keys, base_lba, map, content),
         // CSS re-cracks into its title key, so it needs its own mutable copy.
         _ => {
             let mut keys = keys.clone();
-            decrypt_span(buf, &mut keys, base_lba, Some(map), content).map(|_| ())
+            decrypt_span(buf, &mut keys, base_lba, Some(map), content).map(|_| 0)
         }
     }
 }
@@ -400,12 +401,12 @@ fn apply_aacs_map(
     base_lba: u32,
     map: &AacsKeyMap,
     content: Option<&[(u32, u32)]>,
-) -> Result<(), crate::error::Error> {
+) -> Result<usize, crate::error::Error> {
     let (unit_keys, format) = match keys {
         DecryptKeys::Aacs { unit_keys, format } => (unit_keys, *format),
         // Clear / CSS: the mapped path is AACS-only. Leave the buffer untouched;
         // CSS descrambles via `decrypt_sectors` and `None` is already clear.
-        _ => return Ok(()),
+        _ => return Ok(0),
     };
 
     let unit_len = aacs::content::ALIGNED_UNIT_LEN;
@@ -420,10 +421,10 @@ fn apply_aacs_map(
         }
     }
 
-    // Cheap safety net: a correct map always decrypts CORRECT-PHASE forensic
-    // units to clean TS, so this never fires happy-path — a map bug surfaces as
-    // loud DecryptFailed, not silent corruption. Only forensic ranges are verified.
+    // Cheap safety net: a correct map decrypts CORRECT-PHASE forensic units to clean TS, so
+    // a map bug surfaces as loud DecryptFailed, not silent corruption (verdict at the end).
     let verify_failed = std::sync::atomic::AtomicBool::new(false);
+    let (failed, verified) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
@@ -491,9 +492,14 @@ fn apply_aacs_map(
             return;
         }
         aacs::content::decrypt_unit(chunk, key);
-        // Correct-phase forensic verify (silent unless the map is wrong).
-        if matches!(phase, Phase::Even | Phase::Odd) && !aacs::content::is_clean(chunk, format) {
-            verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Correct-phase forensic verify: a failing unit is blanked; the read is judged below.
+        if matches!(phase, Phase::Even | Phase::Odd) {
+            if !aacs::content::is_clean(chunk, format) {
+                chunk.fill(0);
+                failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            verified.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted": a unit
         // we decrypted (damaged or not) is no longer ciphertext (KU design §5.4, K-13).
@@ -523,8 +529,33 @@ fn apply_aacs_map(
     if verify_failed.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(crate::error::Error::DecryptFailed);
     }
-    Ok(())
+    // A wrong key fails every unit it keys (and resolve's phase probe catches it first);
+    // damage fails one. Two or more failures with none verifying: a wrong map, E7013.
+    let (failed, verified) = (failed.into_inner(), verified.into_inner());
+    if failed >= WRONG_KEY_FAILURES && verified == 0 {
+        tracing::error!(
+            target: "freemkv::decrypt",
+            lba = base_lba,
+            failed,
+            code = crate::error::E_DECRYPT_FAILED,
+            "no FMTS unit of the read verifies under its mapped key: wrong key"
+        );
+        return Err(crate::error::Error::DecryptFailed);
+    }
+    if failed > 0 {
+        tracing::warn!(
+            target: "freemkv::decrypt",
+            lba = base_lba,
+            units = failed,
+            "damaged AACS unit (fails its FMTS verify): blanked, the rip carries on"
+        );
+    }
+    Ok(failed)
 }
+
+/// FMTS units of one read that must fail their verify, none verifying, before the read is a
+/// wrong key rather than damage: a wrong key fails every unit it keys, damage fails one.
+const WRONG_KEY_FAILURES: usize = 2;
 
 /// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
 /// zero-fill them, like a sweep's unread sector, and return how many. Damaged: flagged (CPI)

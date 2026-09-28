@@ -303,20 +303,22 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         if let (Some(arrival), DecryptKeys::Aacs { unit_keys, .. }) =
             (self.arrival.as_deref(), &self.keys)
         {
-            arrival.process(&mut self.inner, lba, &mut buf[..n], unit_keys)?;
+            let blanked = arrival.process(&mut self.inner, lba, &mut buf[..n], unit_keys)?;
+            self.count_blanked(blanked);
         }
 
         // Proactive map path (storm-free mux): keys were resolved per unit up front,
         // so decrypt with the mapped key and trust it (no per-unit `is_clean`). A
         // resolver gap fails loud; bad TS and units outside content extents pass through.
         if let Some(map) = self.key_map.clone() {
-            crate::decrypt::decrypt_sectors_mapped_in_content(
+            let blanked = crate::decrypt::decrypt_sectors_mapped_in_content(
                 &mut buf[..n],
                 &self.keys,
                 lba,
                 &map,
                 content_ref,
             )?;
+            self.count_blanked(blanked);
             return Ok(n);
         }
 
@@ -350,6 +352,10 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                     || arrival.is_some_and(|a| a.covers(at)))
         };
         let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered);
+        self.count_blanked(n);
+    }
+
+    fn count_blanked(&self, n: usize) {
         self.blanked
             .0
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);

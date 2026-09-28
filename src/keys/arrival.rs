@@ -9,7 +9,8 @@
 //!   key that opens the unit is `Provisional`; the piece's next readable `Enc` unit confirms
 //!   it or stops the rip (a key conflict).
 //! - A readable unit is never reported as a read error or withheld. One no held key opens is
-//!   a loud stop (E7022 / E7032). FMTS segment units are never part of this proof.
+//!   a loud stop (E7022 / E7032), unless a held key opens a partner in its batch: then it is
+//!   damage, blanked and counted. FMTS segment units are never part of this proof.
 
 use super::{Proof, ProofCache, ResolvedKeySet, StopKind};
 use crate::aacs::content::{
@@ -110,17 +111,19 @@ impl Arrival {
     }
 
     /// Prove and decrypt the lazy-piece units of `buf`, read at `lba` on the unit grid.
-    /// Keyed pieces are left to the key map; clear and segment units are untouched.
+    /// Keyed pieces are left to the key map; clear and segment units are untouched. Returns
+    /// how many damaged units it blanked (see [`is_damage`](Self::is_damage)).
     pub(crate) fn process(
         &self,
         inner: &mut dyn SectorSource,
         lba: u32,
         buf: &mut [u8],
         unit_keys: &[(u32, [u8; 16])],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if self.spans.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+        let mut blanked = 0;
         let n_units = buf.len() / ALIGNED_UNIT_LEN;
         for u in 0..n_units {
             let at = lba.saturating_add(u as u32 * UNIT as u32);
@@ -135,18 +138,82 @@ impl Arrival {
             let slot = match self.cache.get(id) {
                 Some(Proof::Proven(s)) => s,
                 Some(Proof::Provisional(s)) => {
-                    // KU §2.4: the next readable unit confirms a provisional key or stops.
-                    if !self.opens(&buf[range.clone()], &unit_keys[s].1) {
+                    // KU §2.4: the next readable unit confirms a provisional key or stops;
+                    // one no held key opens while the key opens a batch partner is damage.
+                    if self.opens(&buf[range.clone()], &unit_keys[s].1) {
+                        self.cache.set(id, Proof::Proven(s));
+                        s
+                    } else if self.is_damage(
+                        &buf[range.clone()],
+                        &self.batch_partners(lba, buf, u, span.3),
+                        candidate,
+                        &[s],
+                        unit_keys,
+                    ) {
+                        buf[range].fill(0);
+                        blanked += 1;
+                        continue;
+                    } else {
                         return Err(self.stop(at, "provisional key contradicted"));
                     }
-                    self.cache.set(id, Proof::Proven(s));
-                    s
                 }
-                None => self.prove(inner, lba, buf, u, span, candidate, unit_keys)?,
+                None => match self.prove(inner, lba, buf, u, span, candidate, unit_keys)? {
+                    Some(s) => s,
+                    None => {
+                        buf[range].fill(0);
+                        blanked += 1;
+                        continue;
+                    }
+                },
             };
             self.decrypt_proven(&mut buf[range], &unit_keys[slot].1);
         }
-        Ok(())
+        if blanked > 0 {
+            tracing::warn!(
+                target: "freemkv::keys",
+                lba,
+                units = blanked,
+                "damaged AACS unit (no held key opens it, one opens its partners): blanked"
+            );
+        }
+        Ok(blanked)
+    }
+
+    // The held keys, the piece's candidate first.
+    fn held(&self, candidate: Option<usize>) -> impl Iterator<Item = usize> {
+        let rest = (0..self.base).filter(move |&s| Some(s) != candidate);
+        candidate.into_iter().chain(rest)
+    }
+
+    /// Is `unit` damage rather than a key failure? KS-4 \[BD\] §3.10.1: "The first 16 bytes of
+    /// each Aligned Unit is used as the seed", and a garbled head can keep its CPI flag and TS
+    /// sync. A wrong key opens no unit of the piece; damage fails one. So: no held key opens
+    /// it and one of `witnesses` opens a batch partner (no side read: KU §2.4 stops an
+    /// unopenable unit before any). A blanked unit proves nothing itself.
+    fn is_damage(
+        &self,
+        unit: &[u8],
+        partners: &[Vec<u8>],
+        candidate: Option<usize>,
+        witnesses: &[usize],
+        unit_keys: &[(u32, [u8; 16])],
+    ) -> bool {
+        let opens = |u: &[u8], s: usize| self.opens(u, &unit_keys[s].1);
+        !self.held(candidate).any(|s| opens(unit, s))
+            && partners
+                .iter()
+                .any(|p| witnesses.iter().any(|&s| opens(p, s)))
+    }
+
+    // Unit `u`'s partners already in the batch, both ways (KU §2.4 step 1).
+    fn batch_partners(&self, lba: u32, buf: &[u8], u: usize, piece: usize) -> Vec<Vec<u8>> {
+        buf.chunks(ALIGNED_UNIT_LEN)
+            .enumerate()
+            .filter(|&(j, c)| {
+                j != u && self.is_partner(lba.saturating_add(j as u32 * UNIT as u32), c, piece)
+            })
+            .map(|(_, c)| c.to_vec())
+            .collect()
     }
 
     // Decrypt one unit with its proven key and mark it plaintext.
@@ -157,7 +224,8 @@ impl Arrival {
         clear_copy_permission_indicator(unit, self.format);
     }
 
-    // Find the held key for unit `u` of `buf` (KU §2.4 steps 1–2) and record it.
+    // Find the held key for unit `u` of `buf` (KU §2.4 steps 1–2) and record it. `None`:
+    // no held key opens U but one opens a partner, so U is damage (`is_damage`), not proof.
     #[allow(clippy::too_many_arguments)]
     fn prove(
         &self,
@@ -168,27 +236,24 @@ impl Arrival {
         span: (u32, u32, u64, usize),
         candidate: Option<usize>,
         unit_keys: &[(u32, [u8; 16])],
-    ) -> Result<usize> {
+    ) -> Result<Option<usize>> {
         let at = lba.saturating_add(u as u32 * UNIT as u32);
         let unit = &buf[u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN];
-        // The held keys that open U, the candidate first. None: stop now, no side read.
-        let openers: Vec<usize> = candidate
-            .into_iter()
-            .chain((0..self.base).filter(|&s| Some(s) != candidate))
+        // The held keys that open U, the candidate first. None: damage, or a wrong key.
+        let openers: Vec<usize> = self
+            .held(candidate)
             .filter(|&s| self.opens(unit, &unit_keys[s].1))
             .collect();
         if openers.is_empty() {
+            let held: Vec<usize> = self.held(candidate).collect();
+            let partners = self.batch_partners(lba, buf, u, span.3);
+            if self.is_damage(unit, &partners, candidate, &held, unit_keys) {
+                return Ok(None);
+            }
             return Err(self.stop(at, "no held key opens the unit"));
         }
         // Step 1: partners already in the batch, both ways; then the side reads.
-        let mut partners: Vec<Vec<u8>> = buf
-            .chunks(ALIGNED_UNIT_LEN)
-            .enumerate()
-            .filter(|&(j, c)| {
-                j != u && self.is_partner(lba.saturating_add(j as u32 * UNIT as u32), c, span.3)
-            })
-            .map(|(_, c)| c.to_vec())
-            .collect();
+        let mut partners = self.batch_partners(lba, buf, u, span.3);
         if partners.is_empty() {
             partners = self.side_partners(inner, at, span);
         }
@@ -197,7 +262,7 @@ impl Arrival {
             // No readable partner: provisional one-unit proof, false-accept ≈ pool × 1e-5.
             tracing::debug!(target: "freemkv::keys", lba = at, "provisional one-unit proof");
             self.cache.set(id, Proof::Provisional(openers[0]));
-            return Ok(openers[0]);
+            return Ok(Some(openers[0]));
         }
         match openers
             .into_iter()
@@ -205,7 +270,7 @@ impl Arrival {
         {
             Some(s) => {
                 self.cache.set(id, Proof::Proven(s));
-                Ok(s)
+                Ok(Some(s))
             }
             None => Err(self.stop(at, "no held key opens the unit and a partner")),
         }
