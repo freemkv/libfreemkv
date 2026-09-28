@@ -146,13 +146,19 @@ fn write_through(
     std::fs::read(&dest).map_err(|e| Error::IoError { source: e })
 }
 
-fn assert_plain(img_plain: &[u8], bytes: &[u8]) {
+// `bytes` equals the image's plaintext, where each decrypted unit (`specs`) reads with
+// CPI 00₂ in every source packet (KS-5; KU design §5.4) and every other sector is verbatim.
+fn assert_plain(img_plain: &[u8], bytes: &[u8], specs: &[FileSpec]) {
     assert_eq!(bytes.len(), img_plain.len());
-    for (lba, (got, want)) in bytes
-        .chunks(SECTOR)
-        .zip(img_plain.chunks(SECTOR))
-        .enumerate()
-    {
+    let mut want = img_plain.to_vec();
+    for (start, n, _, enc) in specs {
+        for u in enc.iter().filter(|&&u| u < n / 3) {
+            let o = (start + u * 3) as usize * SECTOR;
+            let unit = crate::aacs::content::cpi_cleared(want[o..o + 6144].to_vec());
+            want[o..o + 6144].copy_from_slice(&unit);
+        }
+    }
+    for (lba, (got, want)) in bytes.chunks(SECTOR).zip(want.chunks(SECTOR)).enumerate() {
         assert!(got == want, "sector {lba} not decrypted as expected");
     }
 }
@@ -168,7 +174,7 @@ fn every_unplayed_file_is_keyed_and_the_image_decrypts_across_batches() {
     assert!(planned.unproven.is_empty());
     let want = src.plain.clone();
     let bytes = write_through(img(2200, &specs), keys, &files, planned).unwrap();
-    assert_plain(&want, &bytes);
+    assert_plain(&want, &bytes, &specs);
 }
 
 /// Back-to-back unplayed files in different CPS units each get their own key.
@@ -181,7 +187,7 @@ fn adjacent_files_in_different_cps_units_each_get_their_own_key() {
     assert_eq!(planned.map.entry_for(600).map(|e| e.0), Some(1));
     assert_eq!(planned.map.entry_for(630).map(|e| e.0), Some(2));
     let bytes = write_through(img(1200, &specs), keys, &files, planned).unwrap();
-    assert_plain(&img(1200, &specs).plain, &bytes);
+    assert_plain(&img(1200, &specs).plain, &bytes, &specs);
 }
 
 /// Ciphertext no held key opens refuses the plan: multi-CPS pool, and a single key.

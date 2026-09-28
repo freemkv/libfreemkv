@@ -473,6 +473,9 @@ fn apply_aacs_map(
         if matches!(phase, Phase::Even | Phase::Odd) && !aacs::content::is_clean(chunk, format) {
             verify_failed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted": a unit
+        // we decrypted (damaged or not) is no longer ciphertext (KU design §5.4, K-13).
+        aacs::content::clear_copy_permission_indicator(chunk, format);
     };
 
     let nthreads = decrypt_threads();
@@ -1177,7 +1180,8 @@ mod tests {
         decrypt_sectors_mapped(&mut buf, &keys, 0, &map)
             .expect("unit-key decrypt over de-bussed content must succeed");
         assert_eq!(
-            buf, clear,
+            buf,
+            aacs::content::cpi_cleared(clear),
             "bus removal (at read) then unit-key decrypt must recover the plaintext exactly"
         );
     }
@@ -1601,7 +1605,8 @@ mod tests {
         decrypt_sectors_mapped_in_content(&mut inside, &keys, 0, &map, Some(&[(0, 3)]))
             .expect("an in-content unit decrypts");
         assert_eq!(
-            inside, clear,
+            inside,
+            aacs::content::cpi_cleared(clear),
             "unit inside content ranges must decrypt to plaintext"
         );
     }
@@ -1644,7 +1649,7 @@ mod tests {
         for i in 0..n {
             assert_eq!(
                 &buf[i * ul..(i + 1) * ul],
-                clear_of(i).as_slice(),
+                aacs::content::cpi_cleared(clear_of(i)).as_slice(),
                 "unit {i} must recover to its own plaintext on the parallel path"
             );
         }
@@ -1857,9 +1862,10 @@ mod tests {
         // Units at LBA 300, 303, 306: content is 300..303 and 306..309.
         decrypt_sectors_mapped_in_content(&mut buf, &keys, 300, &map, Some(&[(300, 3), (306, 3)]))
             .expect("mixed buffer decrypts");
-        assert_eq!(&buf[..ul], clear.as_slice(), "unit 0 is content");
+        let plain = aacs::content::cpi_cleared(clear);
+        assert_eq!(&buf[..ul], plain.as_slice(), "unit 0 is content");
         assert_eq!(&buf[ul..2 * ul], enc.as_slice(), "unit 1 sits in the gap");
-        assert_eq!(&buf[2 * ul..], clear.as_slice(), "unit 2 is content");
+        assert_eq!(&buf[2 * ul..], plain.as_slice(), "unit 2 is content");
     }
 }
 
@@ -1938,15 +1944,6 @@ mod spec_guards {
         assert_eq!(orphan[0] & 0xC0, 0xC0);
     }
 
-    // The plaintext a decrypt must produce, with byte 0 of every 192-byte source packet
-    // masked to its 6 Arrival_time_stamp bits (KS-6): CPI cleared, the rest untouched.
-    fn cpi_cleared(mut plain: Vec<u8>) -> Vec<u8> {
-        for p in plain.chunks_mut(192) {
-            p[0] &= 0x3F;
-        }
-        plain
-    }
-
     /// per spec; do not change without a spec citation — KS-5 [BD] §3.10.2: "shall be set
     /// to 11₂ if the data is encrypted, or … 00₂ if the data is not encrypted"; KS-6 (CPI is
     /// the top 2 bits of TP_extra_header); corroborated by KS-22 libaacs `buf[i] &= ~0xc0`.
@@ -1968,11 +1965,9 @@ mod spec_guards {
                 cpi(got).iter().all(|&c| c == 0),
                 "{label}: CPI of all 32 packets"
             );
-            assert_eq!(
-                got,
-                &cpi_cleared(plain)[..],
-                "{label}: ATS and payload untouched"
-            );
+            // Byte 0 of each packet keeps its 6 Arrival_time_stamp bits (KS-6).
+            let want = crate::aacs::content::cpi_cleared(plain);
+            assert_eq!(got, &want[..], "{label}: ATS and payload untouched");
         };
 
         // A map-keyed unit (`Phase::All`, the base Unit Key).
