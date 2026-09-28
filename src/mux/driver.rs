@@ -535,6 +535,28 @@ pub fn mux_with_keys(
         {
             Some(crate::keys::ResolvedKeySet::keyless_for(title, *format))
         }
+        // A Session over an AACS disc with no banked key: BD-TS as above; HD DVD is never
+        // probed (KU §2.6), so it refuses up front. Banked keys keep the legacy path (J20).
+        (
+            MuxSource::Session {
+                session,
+                title_index,
+            },
+            None,
+        ) if !opts.raw => match session.disc() {
+            Some(d) if d.aacs.is_some() && !d.decrypt_keys().is_encrypted() => {
+                if d.content_format != crate::disc::ContentFormat::BdTs {
+                    return Err(Error::NoDiscKey {
+                        disc_hash: d.aacs_disc_hash(),
+                    }
+                    .into());
+                }
+                d.titles
+                    .get(*title_index)
+                    .map(|t| crate::keys::ResolvedKeySet::keyless_for(t, d.content_format))
+            }
+            _ => None,
+        },
         _ => None,
     };
     let set = set.or(keyless.as_ref());

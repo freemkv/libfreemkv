@@ -184,6 +184,8 @@ pub(crate) struct ArrivalPiece {
 // Everything a set holds. Key bytes and the VID never leave the crate.
 pub(crate) struct Inner {
     pub(crate) aacs: bool,
+    // A set holding no key, built for one title when a mux was given none (`keyless_for`).
+    pub(crate) keyless: bool,
     pub(crate) disc_hash: String,
     pub(crate) capacity: u32,
     pub(crate) format: DiscFormat,
@@ -215,6 +217,7 @@ impl Inner {
     fn empty() -> Self {
         Inner {
             aacs: false,
+            keyless: false,
             disc_hash: String::new(),
             capacity: 0,
             format: DiscFormat::BluRay,
@@ -324,7 +327,7 @@ impl ResolvedKeySet {
     /// and fits any disc.
     pub fn is_for(&self, disc: &Disc) -> bool {
         let i = &self.0;
-        if !i.aacs {
+        if !i.aacs || i.keyless {
             return true;
         }
         let Some(aacs) = disc.aacs.as_ref() else {
@@ -559,6 +562,7 @@ impl ResolvedKeySet {
     pub(crate) fn keyless_for(title: &crate::disc::DiscTitle, format: ContentFormat) -> Self {
         let mut i = Inner::empty();
         i.aacs = true;
+        i.keyless = true;
         i.content_format = format;
         i.scope = KeyScope::WholeDisc;
         for e in title.extents.iter().filter(|e| e.sector_count > 0) {
