@@ -51,6 +51,9 @@ rip = [
     "dep:socket2",
     "dep:rustix",
 ]
+# `test-util`: `libfreemkv::test_util` fixtures for consumers' tests (dev-dependency
+# only; never in a release build). Implies the rip tree the fixtures build on.
+test-util = ["rip"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }

@@ -4,10 +4,13 @@
 //! packets. Each frame is wrapped in a PES header, split into TS packets,
 //! and prepended with the 4-byte TP_extra_header.
 
+use super::codec::ns_to_ticks;
+use super::decode_ts::{DtsCounters, DtsDeriver};
 use super::hevc::{
     append_length_prefixed_as_annex_b_sized, avcc_to_annex_b, hvcc_to_annex_b, nal_length_size,
 };
 use crate::disc::Codec;
+use std::collections::VecDeque;
 use std::io::{self, Write};
 
 const SYNC_BYTE: u8 = 0x47;
@@ -30,6 +33,21 @@ fn is_video_pid(pid: u16) -> bool {
 // Headroom below the first frame's PTS for frames presented before it but emitted
 // after it. ISO/IEC 13818-1 §2.4.2.6 caps T-STD buffer delay at 1 s.
 pub(crate) const ORIGIN_HEADROOM_NS: i64 = 1_000_000_000;
+// The same headroom in 90 kHz ticks: 1 s is exactly 90 000 ticks.
+const ORIGIN_HEADROOM_TICKS: i64 = 90_000;
+
+// Start-up hold cap (design §2.3): "1 s of IR timeline or 64 MiB", then release in
+// arrival order and count `dts_hold_overflow`.
+const HOLD_CAP_TICKS: u64 = 90_000;
+const HOLD_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+/// A frame held, in arrival order, while a video track's start-up window is open.
+struct Held {
+    track: usize,
+    pts_90k: u64,
+    keyframe: bool,
+    data: Vec<u8>,
+}
 
 /// BD-TS muxer: PES frames in, 192-byte BD-TS packets out.
 ///
@@ -47,11 +65,11 @@ pub struct TsMuxer<W: Write> {
     /// sets); MPEG-2/VC-1 are already start-code ES and must NOT be converted. Defaults to
     /// [`Codec::Hevc`]; ignored for non-video tracks.
     video_codec: Vec<Codec>,
-    /// Global PTS origin (nanoseconds), seeded by the FIRST frame of any kind
-    /// (video or audio) so a single fixed origin rebases every frame and the
-    /// audio/video offset is preserved. It lies [`ORIGIN_HEADROOM_NS`] before
-    /// the seeding frame; only a frame earlier than that saturates to 0.
-    base_pts_ns: Option<i64>,
+    /// Global PTS origin in integer 90 kHz ticks, seeded by the FIRST frame of any
+    /// kind (video or audio) so a single fixed origin rebases every frame and the
+    /// audio/video offset is preserved. It lies [`ORIGIN_HEADROOM_NS`] (90 000 ticks)
+    /// before the seeding frame's tick; only a frame earlier than that saturates to 0.
+    origin_ticks: Option<i64>,
     /// Count of PES frames actually emitted (a frame dropped as non-key
     /// before the first keyframe does NOT count). `finish()` returns
     /// [`Error::MuxEmpty`](crate::error::Error::MuxEmpty) when this is zero,
@@ -67,6 +85,21 @@ pub struct TsMuxer<W: Write> {
     /// the borrow of the converted bytes does not conflict with the `&mut self`
     /// the writer needs.
     annex_b: Vec<u8>,
+    /// Per-track arrival-time copy of `params_written` for the pre-keyframe drop guard,
+    /// which runs before the start-up hold (design §2.3 tick-domain rule 1).
+    arrival_armed: Vec<bool>,
+    /// Per video track: the online DTS deriver, built at its first frame.
+    dts: Vec<Option<DtsDeriver>>,
+    /// Per track: `Some(base)` for an MVC dependent view, whose deriver follows the base
+    /// view's R and frame period.
+    mvc_base: Vec<Option<usize>>,
+    /// Frames of every track held, in arrival order, while a start-up window is open.
+    hold: VecDeque<Held>,
+    hold_bytes: usize,
+    /// Lowest and highest PTS in the hold (its span against `HOLD_CAP_TICKS`).
+    hold_span: Option<(u64, u64)>,
+    /// Warn once at `finish` when a DTS anomaly was counted.
+    warned: bool,
 }
 
 impl<W: Write> TsMuxer<W> {
@@ -79,10 +112,34 @@ impl<W: Write> TsMuxer<W> {
             codec_privates: vec![None; n],
             params_written: vec![false; n],
             video_codec: vec![Codec::Hevc; n],
-            base_pts_ns: None,
+            origin_ticks: None,
             frame_count: 0,
             annex_b: Vec::new(),
+            arrival_armed: vec![false; n],
+            dts: (0..n).map(|_| None).collect(),
+            mvc_base: vec![None; n],
+            hold: VecDeque::new(),
+            hold_bytes: 0,
+            hold_span: None,
+            warned: false,
         }
+    }
+
+    /// Mark `track` as the MVC dependent view of `base` (design §2.3). Its own deriver
+    /// takes the base's R and frame period; the PTS sequences match, so the DTS match
+    /// whichever view arrives first (SSIF reads deliver the dependent first). Returns
+    /// [`Error::MuxTrackRange`](crate::error::Error::MuxTrackRange) for a bad index.
+    pub(crate) fn set_mvc_base(&mut self, track: usize, base: usize) -> io::Result<()> {
+        let tracks = self.pids.len();
+        if track >= tracks || base >= tracks {
+            return Err(crate::error::Error::MuxTrackRange {
+                track: track.max(base),
+                tracks,
+            }
+            .into());
+        }
+        self.mvc_base[track] = Some(base);
+        Ok(())
     }
 
     /// Set codec_private data for a track. Used to prepend VPS/SPS/PPS
@@ -148,22 +205,113 @@ impl<W: Write> TsMuxer<W> {
             }
             .into());
         }
-        let pid = self.pids[track];
-        let is_video = is_video_pid(pid);
+        let is_video = is_video_pid(self.pids[track]);
 
-        // Drop non-key video before any keyframe — decoder has no IDR or
-        // parameter sets to anchor on.
-        if is_video && !keyframe && !self.params_written[track] {
+        // Arrival rules (design §2.3 rule 1): the drop guard and the origin seed run here,
+        // before the hold, so a replay in arrival order reaches the same decisions.
+        // Drop non-key video before any keyframe — decoder has no IDR or parameter sets.
+        if is_video && !keyframe && !self.arrival_armed[track] {
             return Ok(());
         }
+        if is_video {
+            self.arrival_armed[track] = true;
+        }
 
-        // One origin for every track, seeded by the FIRST frame of any kind and set
-        // ORIGIN_HEADROOM_NS below it, so a frame emitted later but presented
+        // One integer-tick origin for every track (J16), seeded by the FIRST frame of any
+        // kind and set 90 000 ticks below its tick, so a frame emitted later but presented
         // earlier (video behind its GOP) keeps its offset.
-        let base = *self
-            .base_pts_ns
-            .get_or_insert(pts_ns.saturating_sub(ORIGIN_HEADROOM_NS));
-        let pts_ns = pts_ns.saturating_sub(base);
+        let ticks = ns_to_ticks(pts_ns);
+        let origin = *self
+            .origin_ticks
+            .get_or_insert(ticks.saturating_sub(ORIGIN_HEADROOM_TICKS));
+        let pts_90k = ticks.saturating_sub(origin).max(0) as u64;
+
+        // The deriver sees exactly the PTS the header carries (design §2.3 rule 3);
+        // dropped frames never reach it (rule 2).
+        if is_video {
+            self.push_dts(track, pts_90k as i64, data);
+        }
+
+        if self.hold.is_empty() && !self.dts_pending() {
+            return self.emit(track, pts_90k, keyframe, data);
+        }
+        self.hold_push(track, pts_90k, keyframe, data);
+        if self.dts_pending() && self.hold_over_cap() {
+            for d in self.dts.iter_mut().flatten() {
+                d.release_cap();
+            }
+        }
+        if self.dts_pending() {
+            return Ok(());
+        }
+        self.drain_hold()
+    }
+
+    fn deriver(&mut self, track: usize) -> &mut DtsDeriver {
+        let codec = self.video_codec[track];
+        let cp = self.codec_privates[track].as_deref();
+        self.dts[track].get_or_insert_with(|| DtsDeriver::for_codec(codec, cp))
+    }
+
+    // Push to `track`'s deriver. An MVC dependent's NAL units carry no SPS, so its deriver
+    // adopts the base view's parameters (from the base's codec_private if it has no frame yet).
+    fn push_dts(&mut self, track: usize, pts: i64, data: &[u8]) {
+        let Some(base) = self.mvc_base[track] else {
+            self.deriver(track).push(pts, data);
+            return;
+        };
+        let params = self.deriver(base).params();
+        let dep = self.dts[track].get_or_insert_with(DtsDeriver::follower);
+        dep.adopt(params);
+        dep.push(pts, data);
+    }
+
+    fn dts_pending(&self) -> bool {
+        self.dts.iter().flatten().any(DtsDeriver::pending)
+    }
+
+    fn hold_push(&mut self, track: usize, pts_90k: u64, keyframe: bool, data: &[u8]) {
+        self.hold_bytes += data.len();
+        let (lo, hi) = self.hold_span.unwrap_or((pts_90k, pts_90k));
+        self.hold_span = Some((lo.min(pts_90k), hi.max(pts_90k)));
+        self.hold.push_back(Held {
+            track,
+            pts_90k,
+            keyframe,
+            data: data.to_vec(),
+        });
+    }
+
+    fn hold_over_cap(&self) -> bool {
+        let span = self.hold_span.map_or(0, |(lo, hi)| hi - lo);
+        span > HOLD_CAP_TICKS || self.hold_bytes > HOLD_CAP_BYTES
+    }
+
+    // Replay the hold through the unchanged write path, in arrival order.
+    fn drain_hold(&mut self) -> io::Result<()> {
+        self.hold_bytes = 0;
+        self.hold_span = None;
+        while let Some(h) = self.hold.pop_front() {
+            self.emit(h.track, h.pts_90k, h.keyframe, &h.data)?;
+        }
+        Ok(())
+    }
+
+    // The DTS to write for `track`'s next frame: its deriver's decision.
+    fn next_dts(&mut self, track: usize) -> Option<u64> {
+        let d = self.dts[track].as_mut()?.pop();
+        debug_assert!(
+            d.is_some(),
+            "a frame is emitted only once its DTS is resolved"
+        );
+        d.flatten().map(|d| d as u64)
+    }
+
+    // Write one arrived, accepted frame (after the drop guard and origin seed).
+    fn emit(&mut self, track: usize, pts_90k: u64, keyframe: bool, data: &[u8]) -> io::Result<()> {
+        let pid = self.pids[track];
+        let is_video = is_video_pid(pid);
+        let dts_90k = if is_video { self.next_dts(track) } else { None };
 
         // NAL video (HEVC/H.264): convert length-prefixed NALUs to Annex B and prepend
         // codec_private params on the first keyframe only (arm `params_written` even if
@@ -215,29 +363,29 @@ impl<W: Write> TsMuxer<W> {
         // `&mut self` writes below are free of it.
         let es_data: &[u8] = if convert { &annex_b } else { data };
 
-        let pts_90k = if pts_ns >= 0 {
-            (pts_ns as u64).saturating_mul(9) / 100_000
-        } else {
-            0
-        };
-
         // 0xBD private_stream_1 needs a bounded length, so oversized audio/sub units
         // split into multiple PES packets; only the first carries the PTS (§2.4.3.7) —
         // repeating it made a demuxer read one display set as two same-timestamp blocks.
         let res = if is_video || es_data.len() <= MAX_BD_PES_PAYLOAD {
-            self.write_pes_chain(track, pid, Some(pts_90k), is_video, keyframe, es_data)
+            let times = PesTimes::Pts {
+                pts: pts_90k,
+                dts: dts_90k,
+            };
+            self.write_pes_chain(track, pid, times, is_video, keyframe, es_data)
         } else {
             let mut first_pes = true;
             let mut res = Ok(());
             for chunk in es_data.chunks(MAX_BD_PES_PAYLOAD) {
-                res = self.write_pes_chain(
-                    track,
-                    pid,
-                    first_pes.then_some(pts_90k),
-                    is_video,
-                    keyframe && first_pes,
-                    chunk,
-                );
+                let times = if first_pes {
+                    PesTimes::Pts {
+                        pts: pts_90k,
+                        dts: None,
+                    }
+                } else {
+                    PesTimes::None
+                };
+                res =
+                    self.write_pes_chain(track, pid, times, is_video, keyframe && first_pes, chunk);
                 if res.is_err() {
                     break;
                 }
@@ -261,12 +409,12 @@ impl<W: Write> TsMuxer<W> {
         &mut self,
         track: usize,
         pid: u16,
-        pts_90k: Option<u64>,
+        times: PesTimes,
         is_video: bool,
         keyframe: bool,
         es_data: &[u8],
     ) -> io::Result<()> {
-        let pes_header = build_pes_header(pid, pts_90k, es_data.len());
+        let pes_header = build_pes_header(pid, times, es_data.len());
 
         // Logical PES packet = header bytes followed by es_data. It is
         // indexed (and written) in place, without materializing the
@@ -368,6 +516,15 @@ impl<W: Write> TsMuxer<W> {
         Ok(())
     }
 
+    /// DTS anomalies counted so far, summed over the video tracks (design §2.3).
+    pub(crate) fn dts_counters(&self) -> DtsCounters {
+        let mut c = DtsCounters::default();
+        for d in self.dts.iter().flatten() {
+            c += d.counters();
+        }
+        c
+    }
+
     /// Flush the underlying writer. BD-TS needs no stream trailer, so this
     /// only drains buffering; the muxer remains usable afterwards.
     ///
@@ -378,6 +535,21 @@ impl<W: Write> TsMuxer<W> {
     /// header-only file reported as a successful rip. Mirrors the zero-frame
     /// guard in `MkvMuxer::finish`.
     pub fn finish(&mut self) -> io::Result<()> {
+        // EOF (design §2.3): resolve open start-up windows over the units that arrived and
+        // drain the hold BEFORE the MuxEmpty check, so a short input is written, not failed.
+        for d in self.dts.iter_mut().flatten() {
+            d.finish();
+        }
+        self.drain_hold()?;
+        let c = self.dts_counters();
+        if c != DtsCounters::default() && !self.warned {
+            self.warned = true;
+            tracing::warn!(
+                dts_order_violations = c.order_violations,
+                dts_hold_overflow = c.hold_overflow,
+                "bd-ts: video DTS needed correction (PTS-only or guarded AUs)"
+            );
+        }
         if self.frame_count == 0 {
             return Err(crate::error::Error::MuxEmpty.into());
         }
@@ -385,9 +557,28 @@ impl<W: Write> TsMuxer<W> {
     }
 }
 
-// Build a PES packet header for a BD stream. `pts_90k` is `None` for a CONTINUATION PES (rest
-// of an oversized private_stream_1 access unit) — only the first PES may carry a PTS.
-fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> {
+/// Timestamps of one PES header.
+#[derive(Clone, Copy)]
+enum PesTimes {
+    /// A continuation PES (rest of an oversized private_stream_1 access unit): only the
+    /// first PES of an access unit may carry a PTS.
+    None,
+    /// PTS, plus a DTS only where it differs from the PTS (h222:6425-6429).
+    Pts { pts: u64, dts: Option<u64> },
+}
+
+// A 33-bit timestamp with its 4-bit prefix and marker bits (h222 Table 2-17).
+fn push_timestamp(header: &mut Vec<u8>, prefix: u8, ts: u64) {
+    let ts = ts & 0x1_FFFF_FFFF;
+    header.push((prefix << 4) | 0x01 | (((ts >> 29) & 0x0E) as u8));
+    header.push(((ts >> 22) & 0xFF) as u8);
+    header.push(0x01 | (((ts >> 14) & 0xFE) as u8));
+    header.push(((ts >> 7) & 0xFF) as u8);
+    header.push(0x01 | (((ts << 1) & 0xFE) as u8));
+}
+
+// Build a PES packet header for a BD stream.
+fn build_pes_header(pid: u16, times: PesTimes, data_len: usize) -> Vec<u8> {
     use crate::consts::pes_stream_id;
     // Determine stream_id from PID range
     let stream_id: u8 = if is_video_pid(pid) {
@@ -395,10 +586,16 @@ fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> 
     } else {
         pes_stream_id::PRIVATE_STREAM_1 // audio, PGS subtitle, or default
     };
+    // PES_header_data_length: 5 PTS bytes, plus 5 DTS bytes when present.
+    let header_data_len: usize = match times {
+        PesTimes::None => 0,
+        PesTimes::Pts { dts: None, .. } => 5,
+        PesTimes::Pts { dts: Some(_), .. } => 10,
+    };
 
-    // 3 optional-header bytes + 5 PTS bytes (when present) + data.
-    let pes_data_len = data_len + if pts_90k.is_some() { 8 } else { 3 };
-    let mut header = Vec::with_capacity(14);
+    // 3 optional-header bytes + the timestamps + data.
+    let pes_data_len = data_len + 3 + header_data_len;
+    let mut header = Vec::with_capacity(19);
 
     // Start code: 00 00 01 stream_id
     header.push(0x00);
@@ -419,24 +616,24 @@ fn build_pes_header(pid: u16, pts_90k: Option<u64>, data_len: usize) -> Vec<u8> 
 
     // Flags: 10xx xxxx — MPEG-2
     header.push(0x80); // marker bits
-    let Some(pts_90k) = pts_90k else {
+    let PesTimes::Pts { pts, dts } = times else {
         // Continuation packet: PTS_DTS_flags = 00, no optional fields.
         header.push(0x00);
         header.push(0);
         return header;
     };
-    header.push(0x80); // PTS present
-
-    // PES header data length
-    header.push(5); // 5 bytes of PTS
-
-    // PTS (5 bytes, 33-bit timestamp with markers)
-    let pts = pts_90k & 0x1_FFFF_FFFF;
-    header.push(0x21 | (((pts >> 29) & 0x0E) as u8));
-    header.push(((pts >> 22) & 0xFF) as u8);
-    header.push(0x01 | (((pts >> 14) & 0xFE) as u8));
-    header.push(((pts >> 7) & 0xFF) as u8);
-    header.push(0x01 | (((pts << 1) & 0xFE) as u8));
+    // "When the PTS_DTS_flags field is set to '11', both the PTS fields and DTS fields
+    // shall be present" (h222:3237-3238); '10' = PTS only.
+    header.push(if dts.is_some() { 0xC0 } else { 0x80 });
+    header.push(header_data_len as u8);
+    match dts {
+        // '0011' + PTS, then '0001' + DTS (h222 Table 2-17).
+        Some(dts) => {
+            push_timestamp(&mut header, 0b0011, pts);
+            push_timestamp(&mut header, 0b0001, dts);
+        }
+        None => push_timestamp(&mut header, 0b0010, pts),
+    }
 
     header
 }
@@ -1377,5 +1574,619 @@ mod tests {
         let video = first_pts_90k(&packets, VIDEO_PID);
         let audio = first_pts_90k(&packets, AUDIO_PID);
         assert_eq!(audio - video, 4_500, "50 ms apart, video first");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // S0a goldens (design §7 "m2ts goldens", MPG3-1, MPG4-3)
+    // ════════════════════════════════════════════════════════════════════
+
+    use crate::mux::codec::pts_to_ns;
+    use crate::mux::decode_ts::test_es::{self as es, H264Sps};
+
+    /// FNV-1a 64: a stable digest for recorded golden output.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Every PES on `pid` in order, with the TS packets it took.
+    fn pes_by_pid(packets: &[TsPacket], pid: u16) -> Vec<(Vec<u8>, usize)> {
+        let mut out: Vec<(Vec<u8>, usize)> = Vec::new();
+        for p in packets.iter().filter(|p| p.pid == pid) {
+            if p.pusi || out.is_empty() {
+                out.push((Vec::new(), 0));
+            }
+            let last = out.last_mut().expect("pushed above");
+            last.0.extend_from_slice(&p.payload);
+            last.1 += 1;
+        }
+        out
+    }
+
+    /// Raw 192-byte packets of `pid`, concatenated.
+    fn pid_bytes(buf: &[u8], pid: u16) -> Vec<u8> {
+        buf.chunks(BD_SOURCE_PACKET_BYTES)
+            .filter(|c| ((((c[5] & 0x1F) as u16) << 8) | c[6] as u16) == pid)
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    // Tick sources (MPG4-3): the seeding audio has p ≡ 0 (mod 9); video steps by 3754 ≡ 1,
+    // so its residues cycle and B pictures land on p mod 9 ∈ {1..4} as well as 5..8.
+    const AUDIO_TICK0: i64 = 897_120;
+    const AUDIO_STEP: i64 = 2_880;
+    const VIDEO_TICK0: i64 = 900_001;
+    const VIDEO_STEP: i64 = 3_754;
+
+    /// (track, pts_ns, keyframe, data) in arrival order: an audio frame first, optionally a
+    /// non-key video frame (dropped at arrival), then video (decode order) + audio.
+    fn golden_frames(
+        sps: &H264Sps,
+        decode: &[(i64, bool)],
+        lead_non_key: bool,
+    ) -> Vec<(usize, i64, bool, Vec<u8>)> {
+        let audio = |j: i64| {
+            (
+                1,
+                pts_to_ns(AUDIO_TICK0 + j * AUDIO_STEP),
+                false,
+                vec![0x0B, 0x77, j as u8, 0x5A],
+            )
+        };
+        let mut out = vec![audio(0)];
+        if lead_non_key {
+            let p = es::length_prefixed(&[es::h264_slice(sps, false, 0, 7, None)]);
+            out.push((0, pts_to_ns(VIDEO_TICK0 + 40 * VIDEO_STEP), false, p));
+        }
+        for (i, &(d, idr)) in decode.iter().enumerate() {
+            let mut nals = Vec::new();
+            if idr {
+                nals.push(sps.nal()); // in-band SPS re-assert, as the H.264 parser emits
+            }
+            let mut slice = es::h264_slice(sps, idr, 0, i as u32 % 16, None);
+            slice.extend(std::iter::repeat_n(
+                0x5C,
+                300 + 37 * i + if i == 6 { 2 } else { 0 },
+            ));
+            nals.push(slice);
+            let pts = pts_to_ns(VIDEO_TICK0 + d * VIDEO_STEP);
+            out.push((0, pts, idr, es::length_prefixed(&nals)));
+            out.push(audio(i as i64 + 1));
+        }
+        out
+    }
+
+    fn mux_golden(sps: &H264Sps, frames: &[(usize, i64, bool, Vec<u8>)]) -> Vec<u8> {
+        let mut sink = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.set_video_codec(0, Codec::H264).unwrap();
+            mux.set_codec_private(0, es::avcc(&sps.nal())).unwrap();
+            for (t, pts, key, data) in frames {
+                mux.write_frame(*t, *pts, *key, data).unwrap();
+            }
+            mux.finish().unwrap();
+        }
+        sink
+    }
+
+    /// Golden A: audio + non-reordered H.264 (`max_num_reorder_frames = 0`).
+    fn golden_a() -> Vec<u8> {
+        let sps = es::sps_with_reorder(0);
+        let decode: Vec<_> = (0..12).map(|d| (d, d % 6 == 0)).collect();
+        mux_golden(&sps, &golden_frames(&sps, &decode, false))
+    }
+
+    /// Golden B: reordered H.264 B-pyramid (R = 2), two GOPs, audio first, the first
+    /// arriving video frame non-key.
+    fn golden_b() -> Vec<u8> {
+        let sps = es::sps_with_reorder(2);
+        let gop = [0, 4, 2, 1, 3, 8, 6, 5, 7];
+        let decode: Vec<_> = gop
+            .iter()
+            .map(|&d| (d, d == 0))
+            .chain(gop.iter().map(|&d| (9 + d, d == 0)))
+            .collect();
+        mux_golden(&sps, &golden_frames(&sps, &decode, true))
+    }
+
+    /// Golden C: SPS-less fake HEVC (no parameter set, so R = 0) with reordered PTS + audio.
+    fn golden_c() -> Vec<u8> {
+        let mut sink = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            for (i, d) in [0i64, 3, 1, 2, 6, 4, 5].into_iter().enumerate() {
+                let nal = fake_hevc_nal(if i == 0 { 19 } else { 1 }, 200 + i);
+                mux.write_frame(0, pts_to_ns(VIDEO_TICK0 + d * VIDEO_STEP), i == 0, &nal)
+                    .unwrap();
+                let a = pts_to_ns(AUDIO_TICK0 + i as i64 * AUDIO_STEP);
+                mux.write_frame(1, a, false, &[0x0B, 0x77, i as u8])
+                    .unwrap();
+            }
+            mux.finish().unwrap();
+        }
+        sink
+    }
+
+    // Digests of the pre-S0a writer's output (origin/dev bbcce1d); S0b's PTS delta is
+    // undone before comparing (`as_s0a`, `s0a_tick`).
+    const GOLDEN_A: u64 = 0xe76c_c4fa_bd69_9166;
+    const GOLDEN_B_AUDIO: u64 = 0x2f58_2a68_48d5_835c;
+    const GOLDEN_B_PES_ORDER: u64 = 0x01d8_5336_c980_c698;
+    const GOLDEN_C: u64 = 0xbce9_708f_32b8_f90b;
+    const GOLDEN_B_VIDEO: [(u64, usize); 18] = [
+        (0xce39_af4d_07da_4e8c, 3),
+        (0xdd2c_1dfe_972e_49c4, 2),
+        (0x0743_afab_5034_0970, 3),
+        (0x378d_5374_ca8e_1948, 3),
+        (0x3f4b_f881_2144_fa3d, 3),
+        (0x0875_ae46_1852_8cea, 3),
+        (0x96f2_8d3d_d738_397f, 3),
+        (0x21f1_01a2_c5bb_92d6, 4),
+        (0x34a8_aa4b_6083_01d4, 4),
+        (0x7214_a185_1443_8afc, 4),
+        (0x8313_dbb1_4f96_3e95, 4),
+        (0xa95a_516e_c7a1_c243, 4),
+        (0x72b0_649e_66e3_901d, 5),
+        (0xa15c_2a41_135c_2d58, 5),
+        (0x837a_e12e_74b7_ed33, 5),
+        (0xbdba_c585_9e07_aca2, 5),
+        (0x1df9_bc86_22fd_64fd, 5),
+        (0x806d_6835_3776_7346, 6),
+    ];
+
+    /// h222:6425-6429 (§2.7.5), verbatim.
+    const SPEC_DTS_IFF: &str = "A decoding_timestamp (DTS) shall appear in a PES packet header \
+if and only if the following two conditions are met: • a PTS is present in the PES packet \
+header; • the decoding time differs from the presentation time.";
+
+    /// h222:3236-3238 (§2.4.3.7), verbatim.
+    const SPEC_PTS_DTS_FLAGS: &str = "When the PTS_DTS_flags field is set to '10', the PTS \
+fields shall be present in the PES packet header. When the PTS_DTS_flags field is set to '11', \
+both the PTS fields and DTS fields shall be present in the PES packet header.";
+
+    fn ts33(b: &[u8]) -> u64 {
+        ((((b[0] >> 1) & 0x07) as u64) << 30)
+            | ((b[1] as u64) << 22)
+            | (((b[2] >> 1) as u64) << 15)
+            | ((b[3] as u64) << 7)
+            | ((b[4] >> 1) as u64)
+    }
+
+    /// (PTS, DTS) of a PES header; DTS `None` unless PTS_DTS_flags = '11'.
+    fn pes_times(pes: &[u8]) -> (u64, Option<u64>) {
+        let flags = pes[7] >> 6;
+        let pts = ts33(&pes[9..14]);
+        (pts, (flags == 0b11).then(|| ts33(&pes[14..19])))
+    }
+
+    /// The PES as the pre-S0a writer emitted it: DTS removed, flags '10', length 5.
+    fn strip_dts(pes: &[u8]) -> Vec<u8> {
+        let mut out = pes[..6].to_vec();
+        out.extend_from_slice(&[0x80, 0x80, 5, (pes[9] & 0x0F) | 0x20]);
+        out.extend_from_slice(&pes[10..14]);
+        out.extend_from_slice(&pes[19..]);
+        out
+    }
+
+    // Per spec (§2.7.5); do not change without a spec citation proving otherwise.
+    #[test]
+    fn golden_non_reordered_h264_output_is_pre_s0a_plus_the_s0b_tick_delta() {
+        let decode: Vec<i64> = (0..12).collect();
+        let (s0a, moved) = as_s0a(&golden_a(), &decode, 13, AUDIO_TICK0);
+        assert_eq!(
+            fnv(&s0a),
+            GOLDEN_A,
+            "R = 0: PTS only, byte-identical up to the S0b delta"
+        );
+        // Seed residue 0: exactly the video ticks with p mod 9 ∈ {1..4} moved (J16).
+        assert_eq!(
+            moved, 7,
+            "7 of 12 video PTS move +1 tick; audio (residue 0) none"
+        );
+    }
+
+    #[test]
+    fn golden_sps_less_fake_hevc_output_is_pre_s0a_plus_the_s0b_tick_delta() {
+        let (s0a, moved) = as_s0a(&golden_c(), &[0, 3, 1, 2, 6, 4, 5], 7, VIDEO_TICK0);
+        assert_eq!(
+            fnv(&s0a),
+            GOLDEN_C,
+            "no parameter set: R = 0, no hold (MPG4-4)"
+        );
+        // Seed residue 1: a tick moves iff its residue is 2..4 (displays 1..3).
+        assert_eq!(
+            moved, 3,
+            "3 of 7 video PTS move +1 tick; audio (residue 0) none"
+        );
+    }
+
+    /// The tick S0a wrote for source tick `p` (its ns-domain origin, then floor), with
+    /// the origin seeded by source tick `seed`.
+    fn s0a_tick(p: i64, seed: i64) -> u64 {
+        let base = pts_to_ns(seed) - ORIGIN_HEADROOM_NS;
+        (pts_to_ns(p) - base) as u64 * 9 / 100_000
+    }
+
+    /// Overwrite a PES header's PTS, keeping its prefix nibble.
+    fn set_pts(pes: &mut [u8], pts: u64) {
+        let mut v = Vec::new();
+        push_timestamp(&mut v, pes[9] >> 4, pts);
+        pes[9..14].copy_from_slice(&v);
+    }
+
+    /// Undo the S0b delta on a PTS-only output: every PES PTS rewritten to the value S0a
+    /// wrote. `video_display` gives each video PES's display index; audio frame j has
+    /// source tick `AUDIO_TICK0 + j·AUDIO_STEP`; `seed` is the origin-seeding tick.
+    /// Returns the bytes and the count of moved PTS.
+    fn as_s0a(buf: &[u8], video_display: &[i64], audio: i64, seed: i64) -> (Vec<u8>, usize) {
+        let mut out = buf.to_vec();
+        let (mut v, mut a, mut moved) = (0, 0, 0);
+        for pkt in out.chunks_mut(BD_SOURCE_PACKET_BYTES) {
+            if pkt[5] & 0x40 == 0 {
+                continue;
+            }
+            let pid = (((pkt[5] & 0x1F) as u16) << 8) | pkt[6] as u16;
+            let src = if pid == VIDEO_PID {
+                v += 1;
+                VIDEO_TICK0 + video_display[v - 1] * VIDEO_STEP
+            } else {
+                a += 1;
+                AUDIO_TICK0 + (a - 1) * AUDIO_STEP
+            };
+            let at = 8 + if pkt[7] & 0x20 != 0 {
+                1 + pkt[8] as usize
+            } else {
+                0
+            };
+            let pes = &mut pkt[at..];
+            assert_eq!(pes[7] >> 6, 0b10, "PTS only");
+            assert_eq!(
+                ts33(&pes[9..14]),
+                (src - seed + 90_000) as u64,
+                "source tick"
+            );
+            moved += (ts33(&pes[9..14]) != s0a_tick(src, seed)) as usize;
+            set_pts(pes, s0a_tick(src, seed));
+        }
+        assert_eq!((v, a), (video_display.len(), audio));
+        (out, moved)
+    }
+
+    // Per spec (§2.7.5); do not change without a spec citation proving otherwise.
+    #[test]
+    fn golden_reordered_h264_changes_only_the_dts_bearing_video_pes() {
+        let b = golden_b();
+        let packets = parse_bd_ts(&b);
+        assert_eq!(
+            fnv(&pid_bytes(&b, AUDIO_PID)),
+            GOLDEN_B_AUDIO,
+            "audio PID byte-identical: origin, drop decisions and CC unchanged"
+        );
+        assert_eq!(
+            fnv(&pes_order(&packets)),
+            GOLDEN_B_PES_ORDER,
+            "PES interleave unchanged"
+        );
+        let video = pes_by_pid(&packets, VIDEO_PID);
+        assert_eq!(
+            video.len(),
+            GOLDEN_B_VIDEO.len(),
+            "the non-key lead frame is still dropped"
+        );
+        let (mut with_dts, mut extra) = (Vec::new(), 0);
+        for (i, ((pes, n), (want, n0))) in video.iter().zip(GOLDEN_B_VIDEO).enumerate() {
+            let (pts, dts) = pes_times(pes);
+            let pre = match dts {
+                Some(dts) => {
+                    assert!(dts < pts, "{SPEC_DTS_IFF}: PES {i} DTS {dts} vs PTS {pts}");
+                    with_dts.push(i);
+                    strip_dts(pes)
+                }
+                None => pes.clone(),
+            };
+            // S0b (J16): the PTS is the source tick; S0a wrote its floor.
+            let mut pre = pre;
+            let src = VIDEO_TICK0 + GOLDEN_B_DISPLAY[i] * VIDEO_STEP;
+            assert_eq!(
+                pts,
+                (src - AUDIO_TICK0 + 90_000) as u64,
+                "PES {i}: source tick"
+            );
+            set_pts(&mut pre, s0a_tick(src, AUDIO_TICK0));
+            assert_eq!(
+                fnv(&pre),
+                want,
+                "PES {i} identical to pre-S0a apart from DTS and delta"
+            );
+            assert!(
+                *n == n0 || *n == n0 + 1,
+                "PES {i}: +5 header bytes add at most one packet"
+            );
+            extra += n - n0;
+        }
+        // b1, b5, b10, b14 are presented as decoded (DTS = PTS, h222:2010-2012): PTS only.
+        let pts_only = [3, 7, 12, 16];
+        assert_eq!(
+            with_dts,
+            (0..18)
+                .filter(|i| !pts_only.contains(i))
+                .collect::<Vec<_>>()
+        );
+        // The video PID's continuity_counter shifts by this many packets after the first
+        // DTS-bearing PES that grew (design §2.3 "What S0 changes" 2); CC stays contiguous.
+        assert_eq!(extra, EXPECTED_VIDEO_CC_SHIFT);
+        let ccs: Vec<u8> = packets
+            .iter()
+            .filter(|p| p.pid == VIDEO_PID)
+            .map(|p| p.cc)
+            .collect();
+        assert!(ccs.windows(2).all(|w| w[1] == (w[0] + 1) & 0x0F));
+    }
+    const EXPECTED_VIDEO_CC_SHIFT: usize = 1;
+    // Golden B's video PES in output (decode) order, as display indices.
+    const GOLDEN_B_DISPLAY: [i64; 18] =
+        [0, 4, 2, 1, 3, 8, 6, 5, 7, 9, 13, 11, 10, 12, 17, 15, 14, 16];
+
+    fn mpeg2_es(first: bool, coding: u8, structure: u8, low_delay: bool) -> Vec<u8> {
+        let mut v = if first {
+            es::mpeg2_seq(3, low_delay)
+        } else {
+            Vec::new()
+        };
+        v.extend(es::mpeg2_pic(coding, structure));
+        v
+    }
+
+    /// MPEG-2 frame pictures on `pid` (decode order, display index × 1/24 s from 1 s).
+    fn mux_mpeg2(pid: u16, order: &[(i64, u8)], low_delay: bool) -> Vec<(u64, Option<u64>)> {
+        let mut sink = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[pid]);
+            mux.set_video_codec(0, Codec::Mpeg2).unwrap();
+            for (i, &(d, t)) in order.iter().enumerate() {
+                let data = mpeg2_es(i == 0, t, 3, low_delay);
+                mux.write_frame(0, 1_000_000_000 + d * 41_666_667, t == 1, &data)
+                    .unwrap();
+            }
+            mux.finish().unwrap();
+        }
+        pes_by_pid(&parse_bd_ts(&sink), pid)
+            .iter()
+            .map(|(p, _)| pes_times(p))
+            .collect()
+    }
+
+    const IBBP: [(i64, u8); 7] = [(0, 1), (3, 2), (1, 3), (2, 3), (6, 2), (4, 3), (5, 3)];
+
+    // Per spec (§2.7.5, h222:3236-3238); do not change without a spec citation proving otherwise.
+    #[test]
+    fn mpeg2_ibbp_i_and_p_carry_dts_b_carry_pts_only() {
+        let t = mux_mpeg2(VIDEO_PID, &IBBP, false);
+        let flags: Vec<bool> = t.iter().map(|(_, d)| d.is_some()).collect();
+        assert_eq!(
+            flags,
+            [true, true, false, false, true, false, false],
+            "{SPEC_PTS_DTS_FLAGS}"
+        );
+        let written: Vec<u64> = t.iter().filter_map(|(_, d)| *d).collect();
+        assert!(
+            written.windows(2).all(|w| w[0] < w[1]),
+            "DTS strictly increase"
+        );
+        assert!(
+            t.iter().all(|(p, d)| d.is_none_or(|d| d < *p)),
+            "{SPEC_DTS_IFF}"
+        );
+        // P3 decodes when I0 is presented (h222:3290-3291).
+        assert_eq!(t[1].1, Some(t[0].0));
+    }
+
+    // Per spec (design §0 S0 scope, MPG4-8); do not change without a spec citation.
+    #[test]
+    fn dts_only_on_video_pids_0x1011_to_0x101f() {
+        for pid in [0x00E0, 0xFD55, 0x1100] {
+            let t = mux_mpeg2(pid, &IBBP, false);
+            assert!(
+                t.iter().all(|(_, d)| d.is_none()),
+                "PID {pid:#x} stays PTS-only (F6/F7)"
+            );
+        }
+        for pid in [0x1011, 0x101F] {
+            assert!(
+                mux_mpeg2(pid, &IBBP, false)
+                    .iter()
+                    .any(|(_, d)| d.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn low_delay_mpeg2_on_a_video_pid_stays_pts_only() {
+        let t = mux_mpeg2(VIDEO_PID, &[(0, 1), (1, 2), (2, 2)], true);
+        assert!(t.iter().all(|(_, d)| d.is_none()));
+    }
+
+    #[test]
+    fn short_input_with_at_most_r_units_is_written_not_mux_empty() {
+        let sps = es::sps_with_reorder(2);
+        let mut sink = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            mux.set_video_codec(0, Codec::H264).unwrap();
+            mux.set_codec_private(0, es::avcc(&sps.nal())).unwrap();
+            let f = |idr, n| es::length_prefixed(&[es::h264_slice(&sps, idr, 0, n, None)]);
+            mux.write_frame(0, 0, true, &f(true, 0)).unwrap();
+            mux.write_frame(0, 166_666_667, false, &f(false, 1))
+                .unwrap();
+            mux.finish()
+                .expect("held units are drained before the MuxEmpty check");
+        }
+        let t: Vec<_> = pes_by_pid(&parse_bd_ts(&sink), VIDEO_PID)
+            .iter()
+            .map(|(p, _)| pes_times(p))
+            .collect();
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            t[1].1,
+            Some(t[0].0),
+            "EOF start-up over 2 units: DTS_1 = S[0]"
+        );
+        assert!(t[0].1.is_some_and(|d| d < t[0].0));
+    }
+
+    #[test]
+    fn slideshow_hold_cap_release_counts_and_never_duplicates_a_dts() {
+        // MPEG-2 R = 1, I0 at 0 s, audio every 100 ms, P1 at 5 s (MPG4-1b).
+        let mut sink = Vec::new();
+        let counters;
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.set_video_codec(0, Codec::Mpeg2).unwrap();
+            mux.write_frame(0, 0, true, &mpeg2_es(true, 1, 3, false))
+                .unwrap();
+            for j in 0..50 {
+                mux.write_frame(1, j * 100_000_000, false, &[0x0B, 0x77, j as u8])
+                    .unwrap();
+            }
+            mux.write_frame(0, 5_000_000_000, false, &mpeg2_es(false, 2, 3, false))
+                .unwrap();
+            mux.finish().unwrap();
+            counters = mux.dts_counters();
+        }
+        let packets = parse_bd_ts(&sink);
+        let t: Vec<_> = pes_by_pid(&packets, VIDEO_PID)
+            .iter()
+            .map(|(p, _)| pes_times(p))
+            .collect();
+        assert_eq!(t[0].1, None, "one held unit: DTS = S[0] = PTS");
+        assert_eq!(t[1].1, Some(t[0].0 + 1), "DTS_last + 1, not a duplicate");
+        assert_eq!(counters.hold_overflow, 1, "dts_hold_overflow");
+        assert_eq!(counters.order_violations, 1, "dts_order_violations");
+        assert_eq!(
+            all_pts_90k(&packets, AUDIO_PID).len(),
+            50,
+            "every held audio frame written"
+        );
+    }
+
+    // A video-only slideshow (R = 1, I0 at 0 s, P1 at 5 s): the start-up T is the stated
+    // frame period, never the 5 s gap, so no DTS clamps below 0 and nothing is counted.
+    #[test]
+    fn video_only_slideshow_start_up_uses_the_frame_period_not_the_gap() {
+        let mut sink = Vec::new();
+        let counters;
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            mux.set_video_codec(0, Codec::Mpeg2).unwrap();
+            mux.write_frame(0, 0, true, &mpeg2_es(true, 1, 3, false))
+                .unwrap();
+            mux.write_frame(0, 5_000_000_000, false, &mpeg2_es(false, 2, 3, false))
+                .unwrap();
+            mux.finish().unwrap();
+            counters = mux.dts_counters();
+        }
+        let t: Vec<_> = pes_by_pid(&parse_bd_ts(&sink), VIDEO_PID)
+            .iter()
+            .map(|(p, _)| pes_times(p))
+            .collect();
+        assert_eq!(
+            counters,
+            DtsCounters::default(),
+            "no false dts_order_violations"
+        );
+        assert_eq!(
+            t[0].1,
+            Some(t[0].0 - 3_600),
+            "DTS_0 = PTS_0 − one 25 Hz frame"
+        );
+        assert_eq!(t[1].1, Some(t[0].0), "P1 decodes when I0 is presented");
+    }
+
+    #[test]
+    fn hold_cap_by_bytes_releases_in_arrival_order() {
+        let mut sink = Vec::new();
+        let counters;
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.set_video_codec(0, Codec::Mpeg2).unwrap();
+            mux.write_frame(0, 0, true, &mpeg2_es(true, 1, 3, false))
+                .unwrap();
+            let big = vec![0xA5u8; 64 * 1024 * 1024 + 1];
+            mux.write_frame(1, 10_000_000, false, &big).unwrap();
+            mux.write_frame(0, 41_666_667, false, &mpeg2_es(false, 2, 3, false))
+                .unwrap();
+            mux.finish().unwrap();
+            counters = mux.dts_counters();
+        }
+        assert_eq!(counters.hold_overflow, 1, "64 MiB held: released");
+        let order = pes_order(&parse_bd_ts(&sink));
+        assert_eq!(
+            &order[..4],
+            &[0x10, 0x11, 0x11, 0x00],
+            "video, then the big audio: arrival order"
+        );
+    }
+
+    // Per design J16 (S0b); do not change without a spec citation proving otherwise.
+    // Every written PTS/DTS is the source's own 90 kHz tick minus the integer-tick
+    // origin (the seed's tick − 90 000), for every residue mod 9.
+    #[test]
+    fn m2ts_pts_equals_the_source_tick_after_s0b() {
+        let decode: Vec<_> = (0..18).map(|d| (d, d % 9 == 0)).collect();
+        let sps = es::sps_with_reorder(0);
+        let frames = golden_frames(&sps, &decode, false);
+        let buf = mux_golden(&sps, &frames);
+        let packets = parse_bd_ts(&buf);
+        let video: Vec<u64> = pes_by_pid(&packets, VIDEO_PID)
+            .iter()
+            .map(|(p, _)| pes_times(p).0)
+            .collect();
+        let want: Vec<u64> = (0..18)
+            .map(|d| (VIDEO_TICK0 + d * VIDEO_STEP - AUDIO_TICK0 + 90_000) as u64)
+            .collect();
+        assert_eq!(video, want, "PTS now equals the source tick");
+        let audio = all_pts_90k(&packets, AUDIO_PID);
+        assert!(
+            audio
+                .iter()
+                .enumerate()
+                .all(|(j, &p)| p == 90_000 + j as u64 * AUDIO_STEP as u64)
+        );
+    }
+
+    // Design §2.3 (MPG4-2): a negative absolute IR PTS pair keeps its offset.
+    #[test]
+    fn negative_pts_audio_video_pair_keeps_its_offset() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.write_frame(0, -40_000_000, true, &fake_hevc_nal(19, 50))
+                .unwrap();
+            mux.write_frame(1, -80_000_000, false, &[0x0B, 0x77, 0, 0])
+                .unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let (v, a) = (
+            first_pts_90k(&packets, VIDEO_PID),
+            first_pts_90k(&packets, AUDIO_PID),
+        );
+        assert_eq!(
+            (v, a),
+            (H, H - 3_600),
+            "−40 ms video, −80 ms audio: 40 ms apart"
+        );
+    }
+
+    /// The PID of every PES start, in output order: the interleave of access units.
+    fn pes_order(packets: &[TsPacket]) -> Vec<u8> {
+        packets
+            .iter()
+            .filter(|p| p.pusi)
+            .flat_map(|p| p.pid.to_be_bytes())
+            .collect()
     }
 }

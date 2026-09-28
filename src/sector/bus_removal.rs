@@ -283,6 +283,9 @@ pub(crate) fn debus_read(
     lba: u32,
     head_byte0: &mut dyn FnMut(u32) -> Option<u8>,
 ) {
+    // KS-18 [BD] §3.7: BEF set for "the Aligned Unit with Copy_permission_indicator set to
+    // 11₂" when BEE is 1₂. This gate diverges (KU §7.0.4), backlog: BEE is not read, and
+    // unmapped or unknown-grid content is de-bussed by LBA range, whatever its CPI.
     match gate {
         Some(g) => g.debus(buf, read_data_key, lba, head_byte0),
         None => crate::aacs::content::decrypt_bus_sectors(buf, read_data_key),

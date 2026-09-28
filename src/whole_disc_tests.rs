@@ -573,3 +573,139 @@ fn titles_without_a_stream_folder_name_the_missing_folder() {
         other => panic!("expected UdfNotFound, got {:?}", other.err()),
     }
 }
+
+// Spec guards (keys-upfront-design §7.8) on the per-file unit grid.
+mod spec_guards {
+    use super::*;
+    use crate::spec::keys::{
+        KS_1_ENCRYPT_EVERY_UNIT, KS_7_UNIT_CONTIGUOUS, KS_8_EXTENTS_ASCENDING, KS_9_SSIF_ALIGNED,
+        KS_28_FILE_GRID_EVIDENCE,
+    };
+
+    /// per spec; do not change without a spec citation — KS-1 [BD] §3.10.1: "encryption is
+    /// applied to every Aligned Unit in the file" (per evidence KS-28: the grid is the file's).
+    #[test]
+    fn unit_grid_anchors_at_file_byte_0() {
+        assert!(
+            KS_1_ENCRYPT_EVERY_UNIT
+                .text
+                .ends_with("every Aligned Unit in the file.")
+        );
+        assert!(
+            KS_28_FILE_GRID_EVIDENCE
+                .text
+                .contains("32/32 sync on the file grid")
+        );
+        let mut one = vec![0u8; 2048];
+        for start in [100u32, 101] {
+            assert_ne!(start % 3, 0);
+            let spans = unit_spans(&[vec![(start, 30)]], &[]);
+            assert_eq!(
+                spans,
+                vec![(start, 30, start as u64)],
+                "anchored at the file"
+            );
+            let mut r = reader(spans);
+            for lba in start..start + 30 {
+                r.inner.reads.clear();
+                r.read_sectors(lba, 1, &mut one, false).unwrap();
+                let (head, n) = r.inner.reads[0];
+                assert_eq!(
+                    (head - start) % 3,
+                    0,
+                    "lba {lba}: head {head} on the file grid"
+                );
+                assert_ne!(head % 3, 0, "lba {lba}: never the disc-LBA grid");
+                assert!(head <= lba && lba < head + n as u32);
+            }
+        }
+    }
+
+    /// per spec (**Informative**); do not change without a spec citation — KS-7 [BD] Annex A:
+    /// "Each physical sector in an Aligned Unit shall be allocated contiguously" (KS-28).
+    #[test]
+    fn unit_never_straddles_an_extent_boundary() {
+        assert_eq!(
+            KS_7_UNIT_CONTIGUOUS.kind,
+            crate::spec::QuoteKind::Informative
+        );
+        assert!(KS_7_UNIT_CONTIGUOUS.text.contains("allocated contiguously"));
+        // A 4-sector first extent: unit 1 would span sectors 103 and 300..302.
+        let spans = unit_spans(&[vec![(100, 4), (300, 8)]], &[]);
+        let mut r = reader(spans);
+        let mut buf = vec![0u8; 3 * 2048];
+        assert_eq!(r.read_sectors(100, 3, &mut buf, false).unwrap(), 3 * 2048);
+        for lba in [300, 301] {
+            let got = r.read_sectors(lba, 1, &mut buf[..2048], false);
+            assert!(
+                matches!(got, Err(Error::DecryptFailed)),
+                "lba {lba}: {got:?}"
+            );
+        }
+        assert!(
+            r.read_sectors(302, 3, &mut buf, false).is_ok(),
+            "the next unit is whole"
+        );
+    }
+
+    /// per spec (**Informative**); do not change without a spec citation — KS-8 [BD] Annex A:
+    /// "All the extents of each Clip AV stream file shall be allocated with ascending order".
+    #[test]
+    fn extents_ascending_per_file_grid_carries_across() {
+        assert_eq!(
+            KS_8_EXTENTS_ASCENDING.kind,
+            crate::spec::QuoteKind::Informative
+        );
+        assert!(
+            KS_8_EXTENTS_ASCENDING
+                .text
+                .contains("ascending order in physical layer")
+        );
+        // The grid carries by file offset: 6 sectors → 200 is a head; 7 → 199 anchors.
+        let spans = unit_spans(&[vec![(100, 6), (200, 9)]], &[]);
+        assert_eq!(spans, vec![(100, 6, 100), (200, 9, 200)]);
+        let spans = unit_spans(&[vec![(100, 7), (200, 8)]], &[]);
+        assert_eq!(spans, vec![(100, 7, 100), (200, 8, 199)]);
+        let mut r = reader(spans);
+        let mut one = vec![0u8; 2048];
+        r.read_sectors(205, 1, &mut one, false).unwrap();
+        assert_eq!(
+            r.inner.reads,
+            vec![(205, 3)],
+            "heads at 202, 205: file offset 9, 12"
+        );
+    }
+
+    /// per spec; do not change without a spec citation — KS-9 [BD] §8.1.2: "The boundary of
+    /// these segments shall be always aligned to Aligned Unit boundary" (SSIF keeps the grid).
+    #[test]
+    fn ssif_segments_keep_the_unit_grid() {
+        assert!(
+            KS_9_SSIF_ALIGNED
+                .text
+                .contains("aligned to Aligned Unit boundary")
+        );
+        let specs = [(300, 30, K0, ALL), (600, 30, K1, ALL)];
+        let m2ts = one_file_each(&specs);
+        // The SSIF re-lists the second clip from sector 601: its own grid would be 601+3k.
+        let mut with_ssif = m2ts.clone();
+        with_ssif.push(vec![(601, 29)]);
+        assert_eq!(
+            unit_spans(&with_ssif, &[]),
+            unit_spans(&m2ts, &[]),
+            "not re-gridded"
+        );
+        let run = |files: &[Vec<(u32, u32)>]| {
+            let mut src = img(1200, &specs);
+            let planned = plan(&mut src, &mut pool(&[K0, K1]), files, &rule(None)).unwrap();
+            (planned.map.ranges().to_vec(), src.reads)
+        };
+        let (map, reads) = run(&m2ts);
+        assert_eq!(
+            run(&with_ssif),
+            (map.clone(), reads),
+            "not re-keyed, not re-probed"
+        );
+        assert!(map.iter().any(|&(s, _, slot, _)| s <= 600 && slot == 1));
+    }
+}

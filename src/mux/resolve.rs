@@ -3982,6 +3982,57 @@ mod tests {
         )
     }
 
+    /// per evidence (no public spec); do not change without evidence proving otherwise —
+    /// KS-26: "the decode server returns the whole set only for an index-1 anchor".
+    #[test]
+    fn fmts_anchor_is_index_1() {
+        use crate::spec::keys::KS_26_FMTS_ANCHOR_EVIDENCE as KS_26;
+        assert_eq!(KS_26.kind, crate::spec::QuoteKind::Evidence);
+        assert!(KS_26.text.contains("only for an index-1 anchor"));
+        // Per batch sent: (opens under the index-1 key, opens under the index-2 key).
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let opens = |batch: &[Vec<u8>], key: &[u8; 16]| {
+            let mut u = batch[0].clone();
+            crate::aacs::content::decrypt_unit(&mut u, key);
+            crate::aacs::content::is_clean(&u, ContentFormat::BdTs)
+        };
+        let fetch = crate::sector::KeyFetch::new(
+            std::sync::Arc::new(|_| Ok(Vec::new())),
+            std::sync::Arc::new(move |batch: &[Vec<u8>]| {
+                let hit = (
+                    opens(batch, &FMTS_INDEX_KEYS[0]),
+                    opens(batch, &FMTS_INDEX_KEYS[1]),
+                );
+                log.lock().unwrap().push(hit);
+                Ok(if hit.0 {
+                    FMTS_INDEX_KEYS.to_vec()
+                } else {
+                    Vec::new()
+                })
+            }),
+        );
+        let clip = [Extent {
+            start_lba: FMTS_CONTENT_LBA,
+            sector_count: FMTS_CONTENT_SECTORS,
+        }];
+        let mut segs = fmts_segments();
+        segs.reverse(); // the index-2 segment is listed (and readable) first
+        let mut disc = FmtsDisc::new();
+        super::probe_fmts_index_keys(&mut disc, &clip, &segs, &fetch, ContentFormat::BdTs, None)
+            .expect("anchors from the index-1 segment");
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent.first(),
+            Some(&(true, false)),
+            "the first batch is index 1's"
+        );
+        assert!(
+            sent.iter().all(|&(_, idx2)| !idx2),
+            "no index-2 batch is sent: {sent:?}"
+        );
+    }
+
     fn fmts_title(sectors: u32) -> DiscTitle {
         multi_cps_title(FMTS_CONTENT_LBA, sectors)
     }

@@ -30,6 +30,7 @@ pub mod select;
 pub(crate) mod au_assembly;
 #[allow(dead_code)]
 pub(crate) mod codec;
+pub(crate) mod decode_ts;
 pub(crate) mod demux_sink;
 #[allow(dead_code)]
 pub(crate) mod demux_thread;

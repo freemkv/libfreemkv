@@ -58,6 +58,7 @@ pub(crate) const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), en
 // = SCSI error variants, `scsi` = passthrough. Rip tree (heavy deps) gated below.
 pub mod error;
 pub mod scsi;
+pub mod spec;
 
 // ─── Ripping tree (feature = "rip") ─────────────────────────────────────────
 // Drive lifecycle, disc/UDF/MPLS/CLPI parsing, AACS/CSS decrypt, PES/mux, keydb,
@@ -116,6 +117,8 @@ pub mod progress;
 pub mod sector;
 #[cfg(feature = "rip")]
 pub mod session;
+#[cfg(all(feature = "rip", any(test, feature = "test-util")))]
+pub mod test_util;
 #[cfg(all(test, feature = "rip"))]
 pub(crate) mod testlog;
 #[cfg(feature = "rip")]
