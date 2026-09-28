@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 
 /// The longest a halt-aware wait sleeps between token checks (§2.1).
-pub const WAIT_SLICE: Duration = Duration::from_millis(250);
+pub const WAIT_SLICE: Duration = Duration::from_millis(20);
 
 /// Alias of [`WAIT_SLICE`], kept until ST-X1b removes it.
 pub const POLL_INTERVAL: Duration = WAIT_SLICE;
@@ -50,12 +50,12 @@ impl AtomicFlag for loom::sync::atomic::AtomicBool {
 // SS-23 Ordering::Release: "all previous writes become visible to all threads that perform
 // an Acquire (or stronger) load of this value" — cancel publishes everything before it.
 fn raise<F: AtomicFlag>(flag: &F) {
-    flag.store_flag(true, Ordering::Relaxed)
+    flag.store_flag(true, Ordering::Release)
 }
 
 // SS-23 Ordering::Acquire: "all subsequent loads will see data written before the store".
 fn observed<F: AtomicFlag>(flag: &F) -> bool {
-    flag.load_flag(Ordering::Relaxed)
+    flag.load_flag(Ordering::Acquire)
 }
 
 /// Clonable, infallible cooperative-cancellation token.
@@ -97,8 +97,11 @@ impl Halt {
 
     /// `Err(Error::Halted)` once cancelled, else `Ok(())`.
     pub fn check(&self) -> Result<()> {
-        let _ = Error::Halted;
-        Ok(())
+        if self.is_cancelled() {
+            Err(Error::Halted)
+        } else {
+            Ok(())
+        }
     }
 
     /// Sleep for `d` in [`WAIT_SLICE`] slices: `Ok(())` once `d` has passed,
@@ -108,9 +111,7 @@ impl Halt {
         diag::assert_may_block("Halt::wait (sleep)", d);
         let end = Instant::now().checked_add(d);
         loop {
-            if self.is_cancelled() {
-                return Err(Error::Halted);
-            }
+            self.check()?;
             let Some(left) = remaining(end) else {
                 return Ok(());
             };
@@ -126,9 +127,7 @@ impl Halt {
     pub fn recv_timeout<C: TimedRecv>(&self, rx: &C, d: Duration) -> Result<Option<C::Item>> {
         let end = Instant::now().checked_add(d);
         loop {
-            if self.is_cancelled() {
-                return Err(Error::Halted);
-            }
+            self.check()?;
             let Some(slice) = remaining(end) else {
                 return Ok(None);
             };
@@ -394,9 +393,6 @@ impl StallTimer {
 
     /// Sample `p`. Any movement re-arms the whole window.
     pub fn poll(&mut self, p: &Progress) -> Stall {
-        if self.window > Duration::ZERO {
-            return Stall::Progressing;
-        }
         let now = Instant::now();
         let count = p.get();
         if count != self.last {
@@ -535,7 +531,7 @@ impl<R> DriveHolder<R> {
 impl<R> Drop for DriveHolder<R> {
     fn drop(&mut self) {
         if self.handle.is_some() && !thread::panicking() {
-            if false {
+            if cfg!(debug_assertions) {
                 panic!("drive holder `{}` dropped unjoined", self.role);
             }
             #[cfg(feature = "scsi")]
@@ -591,7 +587,7 @@ pub mod diag {
 
     // Debug panic when `what` could block (`d > 0`) inside a scope.
     pub(crate) fn assert_may_block(what: &str, d: Duration) {
-        if false && !d.is_zero() && NoBlockingScope::active() {
+        if cfg!(debug_assertions) && !d.is_zero() && NoBlockingScope::active() {
             panic!("{what} under NoBlockingScope");
         }
     }
