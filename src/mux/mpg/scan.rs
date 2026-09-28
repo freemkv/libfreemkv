@@ -140,6 +140,26 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<(Codec, Resolution, Fr
     Some((codec, res, rate))
 }
 
+// Design §4 step 3 "MPEG audio | header + mc_header": Layer II frames from `at` go through
+// the M1 channel tracker (a CRC-verified 13818-3 mc_header run), else `None`.
+fn mc_channels(es: &[u8], at: usize) -> Option<AudioChannels> {
+    use crate::mux::codec::mp2_channels::{ChannelTracker, Header};
+    let mut t = ChannelTracker::default();
+    let mut pos = at;
+    while let Some(n) = es
+        .get(pos..)
+        .and_then(Header::parse)
+        .and_then(|h| h.frame_bytes())
+        .filter(|&n| n > 4 && pos + n <= es.len())
+    {
+        if let Some(c) = t.observe(&es[pos..pos + n]) {
+            return Some(AudioChannels::from_count(c));
+        }
+        pos += n;
+    }
+    t.finish().map(AudioChannels::from_count)
+}
+
 // 11172-3 / 13818-3 frame header: codec, channels, sample rate.
 fn probe_mpeg_audio(es: &[u8]) -> (Codec, AudioChannels, SampleRate) {
     let Some(at) = es
@@ -170,6 +190,10 @@ fn probe_mpeg_audio(es: &[u8]) -> (Codec, AudioChannels, SampleRate) {
             (ch, hz)
         }
         _ => (AudioChannels::Unknown, 0),
+    };
+    let channels = match codec {
+        Codec::Mp2 => mc_channels(es, at).unwrap_or(channels),
+        _ => channels,
     };
     (codec, channels, SampleRate::from_hz(hz))
 }
@@ -222,9 +246,30 @@ fn audio(
     })
 }
 
-/// Streams of the program stream in `head`, in map order (else id order), with the
-/// `pid`s the DVD demux routes (`PsPacket::dvd_pid`). `None` when `head` holds no pack.
+/// [`scan`]'s streams alone.
+#[cfg(test)]
 pub(crate) fn scan_streams(head: &[u8]) -> Option<Vec<Stream>> {
+    scan(head).map(|s| s.streams)
+}
+
+/// What the scan found: the streams, and the one video `stream_id` carried.
+pub(crate) struct Scan {
+    pub streams: Vec<Stream>,
+    /// Only this video `stream_id` is routed; others are left out (one video track).
+    pub video_id: Option<u8>,
+}
+
+// `(hierarchy_type, hierarchy_layer_index, hierarchy_embedded_layer_index)` (MS-23).
+fn hierarchy(desc: &[u8]) -> Option<(u8, u8, u8)> {
+    descriptors(desc)
+        .find(|(t, b)| *t == 4 && b.len() >= 4)
+        .map(|(_, b)| (b[0] & 0x0F, b[1] & 0x3F, b[2] & 0x3F))
+}
+
+/// Streams of the program stream in `head`, in map order (else id order), with the
+/// `pid`s the DVD demux routes (`PsPacket::dvd_pid`), and the chosen video `stream_id`.
+/// `None` when `head` holds no pack.
+pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
     if !head.windows(4).any(|w| w == [0, 0, 1, 0xBA]) {
         return None;
     }
@@ -232,15 +277,7 @@ pub(crate) fn scan_streams(head: &[u8]) -> Option<Vec<Stream>> {
     let mut seen: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
     let packets: Vec<PsPacket> = d.feed(head).into_iter().chain(d.flush()).collect();
     for p in packets.iter().filter(|p| p.dvd_pid().is_some()) {
-        let key = (
-            if (0xE0..=0xEF).contains(&p.stream_id) {
-                0xE0
-            } else {
-                p.stream_id
-            },
-            p.sub_stream_id,
-        );
-        let e = seen.entry(key).or_default();
+        let e = seen.entry((p.stream_id, p.sub_stream_id)).or_default();
         if e.len() < PROBE_BYTES {
             e.extend_from_slice(&p.data);
         }
@@ -288,6 +325,9 @@ pub(crate) fn scan_streams(head: &[u8]) -> Option<Vec<Stream>> {
     let empty = Vec::new();
     let mut streams: Vec<Stream> = Vec::new();
     let mut video_res = Resolution::Unknown;
+    let mut video_id = None;
+    // Extensions resolved against their base once every base is known: `(index, base id)`.
+    let mut exts: Vec<(usize, u8)> = Vec::new();
     for key in order {
         let es = seen.get(&key).unwrap_or(&empty);
         let (ty, desc) = map_type
@@ -299,7 +339,8 @@ pub(crate) fn scan_streams(head: &[u8]) -> Option<Vec<Stream>> {
             .unwrap_or_default();
         match key {
             (0xE0..=0xEF, _) => {
-                if streams.iter().any(|s| matches!(s, Stream::Video(_))) {
+                if video_id.is_some() {
+                    tracing::warn!(target: "mux", stream_id = key.0, "mpg: a second video stream; left out");
                     continue;
                 }
                 let Some((codec, res, rate)) = probe_video(es, ty) else {
@@ -307,6 +348,7 @@ pub(crate) fn scan_streams(head: &[u8]) -> Option<Vec<Stream>> {
                     continue;
                 };
                 video_res = res;
+                video_id = Some(key.0);
                 streams.push(Stream::Video(VideoStream {
                     pid: crate::mux::ps::DVD_VIDEO_PID,
                     codec,
@@ -325,32 +367,33 @@ pub(crate) fn scan_streams(head: &[u8]) -> Option<Vec<Stream>> {
                 }));
             }
             (id @ 0xD0..=0xD7, None) => {
-                // With a map, the hierarchy descriptor decides (type 5, MS-23); without one,
-                // the sync word: 13818-3 ext_syncword 0x7FF is an extension, 0xFFF audio.
-                let is_ext = match &map {
-                    Some(_) => descriptors(desc).any(|(t, b)| {
-                        t == 4
-                            && b.first()
-                                .is_some_and(|x| x & 0x0F == pack::HIERARCHY_EXTENSION)
-                    }),
-                    None => es.len() >= 2 && es[0] == 0x7F && es[1] & 0xF0 == 0xF0,
+                // With a map, the hierarchy descriptor decides (type 5, MS-23) and names the
+                // base by hierarchy_embedded_layer_index; without one, the first sync word:
+                // 13818-3 ext_syncword 0x7FF is an extension (base 0xC0|n), 0xFFF audio.
+                let base = match &map {
+                    Some(m) => hierarchy(desc)
+                        .filter(|h| h.0 == pack::HIERARCHY_EXTENSION)
+                        .map(|(_, _, embedded)| {
+                            m.entries
+                                .iter()
+                                .find(|(_, _, d)| hierarchy(d).is_some_and(|h| h.1 == embedded))
+                                .map(|e| e.1)
+                        }),
+                    None => es
+                        .windows(2)
+                        .find(|w| (w[0] == 0x7F || w[0] == 0xFF) && w[1] & 0xF0 == 0xF0)
+                        .filter(|w| w[0] == 0x7F)
+                        .map(|_| Some(0xC0 | (id & 7))),
                 };
-                if is_ext {
-                    let base = u16::from(0xC0 | (id & 7));
-                    let Some(Stream::Audio(b)) = streams
-                        .iter()
-                        .find(|s| matches!(s, Stream::Audio(a) if a.pid == base))
-                        .cloned()
-                    else {
-                        tracing::warn!(target: "mux", stream_id = id, "mpg: 13818-3 extension with no base stream; left out");
-                        continue;
-                    };
+                if let Some(base) = base {
+                    // Paired in a second pass, when every base is known.
+                    exts.push((streams.len(), base.unwrap_or(0)));
                     streams.push(audio(
                         u16::from(id),
                         Codec::Mp2,
-                        b.channels,
-                        b.sample_rate,
-                        b.language.clone(),
+                        AudioChannels::Unknown,
+                        SampleRate::Unknown,
+                        String::new(),
                         crate::disc::MP2_EXTENSION_LABEL.into(),
                     ));
                 } else {
@@ -413,5 +456,33 @@ pub(crate) fn scan_streams(head: &[u8]) -> Option<Vec<Stream>> {
             _ => {}
         }
     }
-    (!streams.is_empty()).then_some(streams)
+    // The IR pairs an extension 0xD0|n with base 0xC0|n (M1); a map pairing anything else,
+    // or a base not carried, leaves the extension out.
+    let mut drop = Vec::new();
+    for (i, base) in exts {
+        let Stream::Audio(ext) = &streams[i] else {
+            continue;
+        };
+        let id = ext.pid as u8;
+        let b = streams.iter().find_map(|s| match s {
+            Stream::Audio(a) if a.pid == u16::from(base) && !a.is_mp2_extension() => Some(a),
+            _ => None,
+        });
+        match b {
+            Some(b) if base == 0xC0 | (id & 7) => {
+                let (channels, rate, lang) = (b.channels, b.sample_rate, b.language.clone());
+                if let Stream::Audio(e) = &mut streams[i] {
+                    (e.channels, e.sample_rate, e.language) = (channels, rate, lang);
+                }
+            }
+            _ => {
+                tracing::warn!(target: "mux", stream_id = id, "mpg: 13818-3 extension with no base stream it can pair with; left out");
+                drop.push(i);
+            }
+        }
+    }
+    for i in drop.into_iter().rev() {
+        streams.remove(i);
+    }
+    (!streams.is_empty()).then_some(Scan { streams, video_id })
 }

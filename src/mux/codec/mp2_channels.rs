@@ -127,7 +127,7 @@ impl Header {
 
     // 11172-3 §2.4.3.1 (Layer II): "N = 144 * bitrate / sampling_frequency" slots of one byte,
     // plus one when the padding bit is set.
-    fn frame_bytes(&self) -> Option<usize> {
+    pub(crate) fn frame_bytes(&self) -> Option<usize> {
         let kbps = self.bitrate_kbps? as usize;
         Some(144_000 * kbps / self.sampling_hz as usize + usize::from(self.padding))
     }

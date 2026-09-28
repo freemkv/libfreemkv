@@ -66,6 +66,10 @@ pub struct PipelinedPesStream {
     header_gate: super::header_gate::HeaderGate,
     /// The op's stop token; a never-cancelled stand-in when there is none.
     halt: crate::halt::Halt,
+    /// `mpg://` input: the one video `stream_id` routed; other video ids are left out.
+    video_stream_id: Option<u8>,
+    /// Packets of a video `stream_id` other than `video_stream_id`, dropped.
+    other_video_packets: u64,
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
@@ -118,7 +122,15 @@ impl PipelinedPesStream {
             au_asm,
             header_gate: super::header_gate::HeaderGate::default(),
             halt: crate::halt::Halt::new(),
+            video_stream_id: None,
+            other_video_packets: 0,
         }
+    }
+
+    // `mpg://`: route only video `stream_id` `id` (design §4: one video track).
+    pub(crate) fn with_video_stream_id(mut self, id: Option<u8>) -> Self {
+        self.video_stream_id = id;
+        self
     }
 
     // The op's stop token: a cancel ends a blocked `read` with `Halted` (LP11).
@@ -221,6 +233,16 @@ impl PipelinedPesStream {
 
     fn consume_ps(&mut self, packets: Vec<super::ps::PsPacket>) {
         for ps in packets {
+            if let Some(id) = self.video_stream_id
+                && (0xE0..=0xEF).contains(&ps.stream_id)
+                && ps.stream_id != id
+            {
+                if self.other_video_packets == 0 {
+                    tracing::warn!(target: "mux", stream_id = ps.stream_id, "mpg: a second video stream is left out");
+                }
+                self.other_video_packets += 1;
+                continue;
+            }
             // Route by the REAL DVD PID (matching `scan_dvd_titles`) not a synthetic
             // track index. The old `(sub_id & 0x1F) + 1` heuristic collided subtitle
             // sub-id 0x20+j with audio track j+1, feeding VobSub PES into the AC-3 parser.

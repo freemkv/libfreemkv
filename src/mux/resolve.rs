@@ -2065,8 +2065,9 @@ fn build_ps_pipeline(
             .map_err(|e| -> io::Error { e.into() })?;
         at += u32::from(count);
     }
-    let streams = super::mpg::scan::scan_streams(&head)
+    let scan = super::mpg::scan::scan(&head)
         .ok_or_else(|| -> io::Error { crate::error::Error::NoStreams.into() })?;
+    let streams = scan.streams;
     let mut title = DiscTitle {
         playlist: path
             .file_name()
@@ -2098,6 +2099,7 @@ fn build_ps_pipeline(
         None,
         None,
     )
+    .map(|p| p.with_video_stream_id(scan.video_id))
 }
 
 // Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head
