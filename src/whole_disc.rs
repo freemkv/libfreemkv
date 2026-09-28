@@ -24,6 +24,16 @@ const PROOFS: u8 = 2;
 /// The decrypting reader a whole-disc copy reads through.
 pub type WholeDiscReader<S> = UnitAligned<DecryptingSectorSource<S>>;
 
+/// The whole-disc reader for a raw (`--raw`) copy. It never decrypts: AACS ciphertext and
+/// CSS-scrambled sectors pass through byte for byte. A decrypting copy reads through
+/// [`ResolvedKeySet::whole_disc_reader`](crate::keys::ResolvedKeySet::whole_disc_reader).
+pub fn raw_whole_disc_reader<S: SectorSource>(reader: S) -> WholeDiscReader<S> {
+    UnitAligned::new(
+        DecryptingSectorSource::new(reader, crate::decrypt::DecryptKeys::None),
+        Vec::new(),
+    )
+}
+
 /// Build the whole-disc reader over `reader`. For AACS every content file is keyed here, so
 /// a refusal (or a stop during keying) comes before the caller creates any output; the one
 /// exception is a file with no provable key on a multi-key disc, which stops the pass with
