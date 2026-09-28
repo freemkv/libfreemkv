@@ -302,6 +302,7 @@ impl Drive {
         buf: &mut [u8],
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
+        crate::halt::diag::assert_may_block("Drive::exec", std::time::Duration::MAX);
         if self.is_halted() {
             return Err(Error::Halted);
         }
