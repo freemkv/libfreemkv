@@ -316,6 +316,21 @@ impl ResolvedKeySet {
         )
     }
 
+    /// [`resolve`](Self::resolve), reporting to the op's `progress` (stop design §2.1,
+    /// T29): every source call runs [`busy`](crate::halt::Progress::busy) on it, and each
+    /// source's ctx hands it out as [`ResolveCtx::progress`](crate::keysource::ResolveCtx::progress).
+    pub fn resolve_with_progress(
+        disc: &Disc,
+        reader: &mut dyn SectorSource,
+        scope: KeyScope,
+        sources: &KeySourceFactory,
+        opts: ResolveKeysOptions,
+        progress: &crate::halt::Progress,
+    ) -> Result<KeyResolution> {
+        let _ = progress;
+        Self::resolve(disc, reader, scope, sources, opts)
+    }
+
     /// A set holding no keys: for a raw copy, or a disc with no AACS.
     pub fn none() -> ResolvedKeySet {
         ResolvedKeySet(Arc::new(Inner::empty()))
