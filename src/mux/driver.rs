@@ -1063,6 +1063,8 @@ fn drive_mux(
         consumer_progress,
     )
     .map_err(std::io::Error::from)?;
+    // The op's token, not the wedge token `finish_pumped` may pass (§2.5 `.partial` rule).
+    pipe.set_op_token(halt);
 
     // ── Frame pump ── Per-frame send deadline is a hard bound (autorip) or
     // effectively unbounded (CLI). Either way `send_with_halt` re-checks halt

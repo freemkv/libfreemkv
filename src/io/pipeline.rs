@@ -5,8 +5,8 @@
 //! The consumer's behaviour is supplied by a [`Sink`] implementation:
 //! `apply` is called once per item, `close` is called once at the end.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,9 @@ mod state {
     /// can no longer abandon it; it must wait for the result it is about to
     /// produce.
     pub const CLOSING: u8 = 2;
+    /// The consumer committed to finalising after the op token was cancelled: it runs
+    /// `Sink::close_stopped` (the output stays `*.partial`), and gets one grace (§2.5).
+    pub const CLOSING_STOPPED: u8 = 3;
 }
 
 fn join_result<R>(r: thread::Result<Result<R, Error>>) -> Result<R, Error> {
@@ -134,6 +137,11 @@ fn finish_with_grace<R: Send + 'static>(
         drop(handle);
         return Err(leak_err);
     }
+    if state.load(Ordering::Acquire) == state::CLOSING_STOPPED {
+        // T8 (D2): a close begun after the Stop gets one grace, then is leaked; it can
+        // only leave `*.partial` behind.
+        return grace_then_leak(handle, grace, leak_err, on_poll);
+    }
     tracing::warn!(
         target: "freemkv::pipeline",
         phase = "finish_with_halt_close_in_flight",
@@ -149,6 +157,29 @@ fn finish_with_grace<R: Send + 'static>(
         on_poll();
         if timer.poll(progress) == Stall::Expired {
             // A close with no progress for a whole window: leak and report the wedge.
+            drop(handle);
+            return Err(leak_err);
+        }
+    }
+}
+
+// Wait `grace` for the consumer, then leak it with `leak_err`.
+fn grace_then_leak<R: Send + 'static>(
+    handle: thread::JoinHandle<Result<R, Error>>,
+    grace: Duration,
+    leak_err: Error,
+    on_poll: &mut dyn FnMut(),
+) -> Result<R, Error> {
+    let end = Instant::now().checked_add(grace);
+    let mut handle = handle;
+    loop {
+        let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
+        handle = match join_within(handle, left.min(WAIT_SLICE), None) {
+            Joined::Done(r) => return join_result(r),
+            Joined::Halted(h) | Joined::Pending(h) => h,
+        };
+        on_poll();
+        if end.is_some_and(|e| Instant::now() >= e) {
             drop(handle);
             return Err(leak_err);
         }
@@ -242,6 +273,8 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     failed: Arc<AtomicBool>,
     /// The consumer's forward progress (T7): shared with the sink's output.
     progress: Progress,
+    /// The op's token, read by the consumer when it commits to `close()` (§2.5).
+    op: Arc<OnceLock<Halt>>,
 }
 
 impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
@@ -280,6 +313,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         let failed = Arc::new(AtomicBool::new(false));
         let failed_consumer = failed.clone();
         let progress_consumer = progress.clone();
+        let op: Arc<OnceLock<Halt>> = Arc::default();
+        let op_consumer = op.clone();
         let handle = thread::Builder::new()
             .name(name.into())
             .spawn(move || -> Result<R, Error> {
@@ -406,10 +441,16 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     // `abandoned`, letting `close()` finalise output already reported
                     // interrupted. Compare-exchange: loser skips `close()`, waits for winner.
                     None => {
+                        // §2.6: Done only if the commit comes before the cancel.
+                        let stopped = op_consumer.get().is_some_and(Halt::is_cancelled);
+                        let commit = match stopped {
+                            true => state::CLOSING_STOPPED,
+                            false => state::CLOSING,
+                        };
                         if state_consumer
                             .compare_exchange(
                                 state::RUNNING,
-                                state::CLOSING,
+                                commit,
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )
@@ -418,7 +459,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                             return Err(Error::Halted);
                         }
                         progress_consumer.bump();
-                        let closed = sink.close();
+                        // §2.5: after the cancel the output stays `*.partial`.
+                        let closed = match stopped {
+                            true => sink.close_stopped(),
+                            false => sink.close(),
+                        };
                         progress_consumer.bump();
                         closed
                     }
@@ -432,6 +477,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             state,
             failed,
             progress,
+            op,
         })
     }
 
@@ -440,7 +486,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// pipeline returns `Halted`. The first token set wins;
     /// [`finish_with_halt`](Self::finish_with_halt) sets its `halt` if none was.
     pub fn set_op_token(&self, halt: &Halt) {
-        let _ = halt;
+        let _ = self.op.set(halt.clone());
     }
 
     /// The consumer's forward-progress counter: bumped per item applied and at
@@ -585,6 +631,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             state: _,
             failed: _,
             progress: _,
+            op: _,
         } = self;
         // Explicit drop, although the destructure already drops `tx`
         // at end-of-scope. Being explicit keeps the intent obvious.
@@ -621,7 +668,12 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             state,
             failed: _,
             progress,
+            op,
         } = self;
+        // Before the consumer can commit to `close()`: it must see the op's token.
+        if let Some(h) = halt {
+            let _ = op.set(h.clone());
+        }
         drop(tx);
         // T7: a stall window over the consumer's progress, not a total from here.
         let mut timer = StallTimer::new(timing.join_window, &progress);
