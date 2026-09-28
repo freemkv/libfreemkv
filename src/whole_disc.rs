@@ -405,18 +405,12 @@ fn probe_units(units: u64) -> Vec<u64> {
 /// uses at most one key. Never the pool size: one held key on a two-unit disc is
 /// not single-CPS.
 fn single_cps_key_slot(disc: &crate::Disc, keys: &DecryptKeys, map: &AacsKeyMap) -> Option<usize> {
-    use crate::aacs::mkb::AacsVersion;
-    let aacs = disc.aacs.as_ref()?;
     if disc.format == crate::DiscFormat::Fmts || map.ranges().iter().any(|r| r.3 != Phase::All) {
         return None;
     }
-    let version = if aacs.version >= 2 {
-        AacsVersion::V20
-    } else {
-        AacsVersion::V10
-    };
-    let ukf = crate::aacs::inf::parse_unit_key_ro(&aacs.uk_ro, version)?;
-    if ukf.encrypted_keys.len() != 1 {
+    // KS-14 [BD] §3.9.3: "Num_of_CPS_Unit … indicates the number of CPS Units on the
+    // disc"; K-8: via `parse_title_keys`, so an HD DVD VTKF counts too (KS-27, evidence).
+    if disc.declared_cps_units()? != 1 {
         return None;
     }
     match (map.key_indices(), keys) {

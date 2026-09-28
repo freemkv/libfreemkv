@@ -3260,6 +3260,23 @@ impl Disc {
         merged_extents(self.titles.iter().flat_map(|t| &t.extents))
     }
 
+    /// `n_decl` (KU design §2.3 step 3): the CPS units the disc's title-key file
+    /// DECLARES, parsed by [`crate::aacs::inf::parse_title_keys`] (BD/UHD
+    /// `Unit_Key_RO.inf` or HD DVD VTKF). `None` when absent or unparseable (fails closed).
+    pub(crate) fn declared_cps_units(&self) -> Option<usize> {
+        use crate::aacs::mkb::AacsVersion;
+        let aacs = self.aacs.as_ref()?;
+        let version = if aacs.version >= 2 {
+            AacsVersion::V20
+        } else {
+            AacsVersion::V10
+        };
+        // KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number of CPS
+        // Units on the disc" — the declared count, never the number of keys held.
+        let ukf = crate::aacs::inf::parse_title_keys(&aacs.uk_ro, version)?;
+        Some(ukf.encrypted_keys.len())
+    }
+
     // The 40-hex AACS disc id (SHA1 of Unit_Key_RO.inf, no 0x prefix), or
     // empty when uncaptured. Names the disc in an Error::NoDiscKey.
     pub(crate) fn aacs_disc_hash(&self) -> String {
