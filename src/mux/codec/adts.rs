@@ -57,7 +57,7 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
 }
 
 // Frame length of a valid ADTS header, with no parser state touched.
-fn adts_frame_len(data: &[u8]) -> Option<usize> {
+pub(super) fn adts_frame_len(data: &[u8]) -> Option<usize> {
     matches!(adts_verdict(data), AdtsVerdict::Valid).then(|| {
         (usize::from(data[3] & 3) << 11) | (usize::from(data[4]) << 3) | usize::from(data[5] >> 5)
     })
@@ -109,8 +109,14 @@ impl AdtsParser {
             pid: 0,
         }
     }
+    /// Access units dropped as undecodable: a lower bound where no later timestamp measured a
+    /// corrupt run (at EOS or a gap), which counts the fewest AUs it allows.
     pub fn dropped_frames(&self) -> u64 {
         self.frames.dropped_frames()
+    }
+    #[cfg(test)]
+    pub(crate) fn verified_dropped(&self) -> u64 {
+        self.frames.verified_dropped()
     }
     pub fn dropped_duration_ns(&self) -> u64 {
         self.frames.dropped_duration_ns()
@@ -643,8 +649,9 @@ mod tests {
             discontinuity: true,
             ..make_pes([&frag[..], &g1, &g2].concat(), Some(900_000))
         };
-        let pts: Vec<i64> = p.parse(&gap).iter().map(|f| f.pts_ns).collect();
-        assert_eq!(pts, [10_000_000_000, 10_000_000_000 + AAC_FRAME_NS]);
+        let mut f = p.parse(&gap);
+        f.extend(p.flush()); // the lock waits for the next PTS, or EOS
+        assert_eq!(pts(&f), [10_000_000_000, 10_000_000_000 + AAC_FRAME_NS]);
     }
 
     // After a gap the PES may start mid-frame: that fragment is not a due header, so no drop.
@@ -692,7 +699,9 @@ mod tests {
             discontinuity: true,
             ..make_pes(noisy_frame(&mut seed, 200), Some(900_000))
         };
-        assert_eq!(p.parse(&gap).len(), 1);
+        let mut f = p.parse(&gap);
+        f.extend(p.flush()); // after a gap the first frame chains (the PES may start in a fragment): EOS confirms it
+        assert_eq!(f.len(), 1);
         assert_eq!(p.dropped_frames(), 20);
     }
 
@@ -709,7 +718,8 @@ mod tests {
             discontinuity: true,
             ..make_pes(noisy_frame(&mut seed, 200), Some(900_000))
         };
-        let f = p.parse(&gap);
+        let mut f = p.parse(&gap);
+        f.extend(p.flush()); // after a gap the first frame chains (the PES may start in a fragment): EOS confirms it
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].pts_ns, 10_000_000_000);
     }
@@ -950,7 +960,8 @@ mod tests {
             discontinuity: true,
             ..make_pes(g2.clone(), Some(900_000))
         };
-        let f = p.parse(&gap);
+        let mut f = p.parse(&gap);
+        f.extend(p.flush()); // after a gap the first frame chains (the PES may start in a fragment): EOS confirms it
         assert_eq!(f.len(), 2);
         assert_eq!((&f[0].data[..], &f[1].data[..]), (&g1[7..], &g2[7..]));
     }
@@ -1585,10 +1596,11 @@ mod tests {
         );
     }
 
-    // I2 mid-run: a PES timestamp its run's bytes cannot reach ends the run as a discontinuity;
-    // the next run opens at that PES's first byte, the AU its PTS names, so the lock follows it.
+    // I2 mid-run: a forward PES timestamp jump the run's bytes cannot hold is followed, not
+    // counted: the lock takes the jump PTS (the fewest slots, I5), and the lost count stays what
+    // the bytes allow, one run and one fault (I1).
     #[test]
-    fn a_mid_run_pts_jump_ends_the_run() {
+    fn a_mid_run_pts_jump_is_followed_but_not_counted() {
         let mut seed = 191;
         let mut p = AdtsParser::new();
         p.parse(&make_pes(frame48(&mut seed, 300), Some(0)));
@@ -1601,8 +1613,9 @@ mod tests {
         ];
         let mut f = p.parse(&make_pes(c.concat(), Some(far)));
         f.extend(p.flush());
-        assert_eq!(pts(&f), [pts_to_ns(far) + D48, pts_to_ns(far) + 2 * D48]);
-        assert_eq!(p.dropped_frames(), 2, "one AU each side of the jump");
+        assert_eq!(pts(&f), [pts_to_ns(far), pts_to_ns(far) + D48]);
+        assert_eq!(p.dropped_frames(), 2, "what 614 bytes hold, not a million");
+        assert_eq!(p.frames.verified_dropped(), 1);
     }
 
     // I3: a timestamp behind the run's start (unflagged, backwards) does not move the clock back.
@@ -1823,10 +1836,11 @@ mod tests {
         assert_eq!(p.dropped_frames(), 3);
     }
 
-    // With a break before the next PTS, the timestamps fix the run's and the break's lost AUs
-    // together and bytes split them: equal-size AUs give the true slots (3 lost, then 1).
+    // A lock with a break before the next PTS takes the fewest slots its run allows (slot 3):
+    // early, never late, as a byte split can err late and push later frames on (I3, I5). The
+    // chain reaching the PTS is exact.
     #[test]
-    fn a_split_by_bytes_places_the_lock_between_run_and_break() {
+    fn a_lock_before_a_break_takes_the_fewest_slots() {
         let mut seed = 263;
         let pes1 = vbr_stream(
             &[300, 300, -300, -300, -300, 300, -300, 300, 300],
@@ -1835,8 +1849,7 @@ mod tests {
         let mut p = AdtsParser::new();
         let mut f = p.parse(&make_pes(pes1, Some(0)));
         f.extend(p.parse(&make_pes(frame48(&mut seed, 300), Some(9 * SLOT48))));
-        assert_slots(&f, &[0, 1, 5, 7, 8, 9]);
-        assert_eq!(p.dropped_frames(), 4);
+        assert_slots(&f, &[0, 1, 3, 7, 8, 9]);
     }
 
     // A mid-run PTS names an AU at or before the lock, so the lock is never placed before it,
@@ -1880,6 +1893,24 @@ mod tests {
             pts_to_ns(7 * SLOT48),
             "the frame at the next PTS is exact"
         );
+    }
+
+    // A false header in corrupt payload whose frame_len runs past the data is no lock at EOS:
+    // scanning continues, so the good frames after it are kept, not cleared with it.
+    #[test]
+    fn a_false_header_running_past_eos_does_not_swallow_the_frames_after_it() {
+        let mut seed = 271;
+        let mut bad = bad48(&mut seed, 300);
+        let mut fake = adts_frame(0);
+        fake[3] = (fake[3] & 0xFC) | 0x01; // frame_length 2048 + 7: past everything buffered
+        bad[50..57].copy_from_slice(&fake);
+        let (g2, g3) = (frame48(&mut seed, 300), frame48(&mut seed, 300));
+        let mut p = AdtsParser::new();
+        let mut f = p.parse(&make_pes(frame48(&mut seed, 300), Some(0)));
+        f.extend(p.parse(&make_pes([&bad[..], &g2, &g3].concat(), None)));
+        f.extend(p.flush());
+        assert_eq!(f.len(), 3, "g0, g2 and g3");
+        assert_eq!((&f[1].data[..], &f[2].data[..]), (&g2[7..], &g3[7..]));
     }
 
     // I3 backstop: whatever the source timestamps do, a stream key never emits a PTS at or
@@ -2260,7 +2291,8 @@ mod tests {
         let mut fresh = make_pes(data.clone(), Some(180000));
         fresh.discontinuity = true;
         fresh.source = Some(crate::pes::SourcePos::at_byte(4096));
-        let frames = p.parse(&fresh);
+        let mut frames = p.parse(&fresh);
+        frames.extend(p.flush()); // after a gap the first frame chains (the PES may start in a fragment): EOS confirms it
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].pts_ns, 2_000_000_000);
         assert_eq!(frames[0].source, fresh.source);

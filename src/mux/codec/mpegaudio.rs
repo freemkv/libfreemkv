@@ -182,6 +182,11 @@ fn mpa_stream_key(d: &[u8]) -> u32 {
     u32::from(d[1] & 0x1E) << 8 | u32::from(d[2] & 0x0C)
 }
 
+// Size of a valid frame at the slice head, with no parser state touched.
+pub(super) fn mpa_frame_len(d: &[u8]) -> Option<usize> {
+    frame_header(d, &mut None, false).map(|h| h.bytes)
+}
+
 pub struct MpegAudioParser {
     frames: AudioFrames,
     // Free-format frame size (without padding), learned from the first sync spacing.
@@ -199,7 +204,7 @@ impl MpegAudioParser {
                 "mpegaudio",
                 Sync {
                     mask: 0xe0,
-                    frame_len: |d| frame_header(d, &mut None, false).map(|h| h.bytes),
+                    frame_len: mpa_frame_len,
                     fixed: mpa_stream_key,
                     frame_ns: |d| {
                         let h = frame_header(d, &mut None, false)?;
@@ -212,8 +217,14 @@ impl MpegAudioParser {
             free_size: None,
         }
     }
+    /// Access units dropped as undecodable: a lower bound where no later timestamp measured a
+    /// corrupt run (at EOS or a gap), which counts the fewest AUs it allows.
     pub fn dropped_frames(&self) -> u64 {
         self.frames.dropped_frames()
+    }
+    #[cfg(test)]
+    pub(crate) fn verified_dropped(&self) -> u64 {
+        self.frames.verified_dropped()
     }
     pub fn dropped_duration_ns(&self) -> u64 {
         self.frames.dropped_duration_ns()
@@ -554,21 +565,33 @@ mod tests {
         assert_eq!(f[0].pts_ns, pts_to_ns(90_000));
     }
 
-    // After a drop, a free-format frame at EOS has no successor to chain to; EOS emits it.
+    // Both sides of one rule: after a drop, a frame whose size cannot be settled by EOS is no
+    // lock. A lone real free-format frame there is lost (free format never occurs on DVD/BD),
+    // so a false free-format header in corrupt payload cannot swallow the good frames after it.
     #[test]
-    fn a_free_format_frame_after_a_drop_is_emitted_at_eos() {
+    fn a_free_format_size_unsettled_at_eos_is_no_lock() {
         let mut bad = mp3_frame();
         bad[2] = 0x9C; // reserved sample rate
         let mut p = MpegAudioParser::new();
         assert_eq!(p.parse(&make_pes(mp3_frame(), Some(0))).len(), 1);
+        p.parse(&make_pes([bad.clone(), free_frame()].concat(), None));
         assert!(
-            p.parse(&make_pes([bad, free_frame()].concat(), None))
-                .is_empty()
+            p.flush().is_empty(),
+            "limit: the lone free-format frame is not emitted"
         );
-        let f = p.flush();
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].data, free_frame());
-        assert_eq!(p.dropped_frames(), 1);
+
+        let mut fake_in_bad = bad;
+        fake_in_bad[40..44].copy_from_slice(&[0xFF, 0xFB, 0x00, 0x00]); // free format, no successor
+        let tail = [mp3_frame(), mp3_frame()].concat();
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(mp3_frame(), Some(0)));
+        f.extend(p.parse(&make_pes([&fake_in_bad[..], &tail].concat(), None)));
+        f.extend(p.flush());
+        assert_eq!(
+            f.len(),
+            3,
+            "both good frames after the false header are kept"
+        );
     }
 
     // A good frame between two corrupt ones is kept: it ends at a sync-shaped header and
