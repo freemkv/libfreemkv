@@ -19,6 +19,7 @@
 - `Disc::scan` follows the standard AACS order: UDF, then `Unit_Key_RO.inf`, the content certificate and the MKB with plain reads, then the handshake, and only on a disc with an AACS directory. It no longer reads the MKB from the drive, and passes `None` to `KeySource::host_certs`.
 - `Disc::scan` fails with `Error::AacsKeyFileUnreadable` (E7031) when a live AACS disc's `Unit_Key_RO.inf` is missing or unreadable, before any AACS command. Image and folder scans still record the error and continue.
 - A transport fault during the AACS or CSS handshake makes `Disc::scan` fail with the same error `Drive::init` returns; a Stop during the handshake returns `Error::Halted`.
+- `DecryptingSectorSource` has no default AACS unit base: an AACS content read before `set_unit_base` fails `DecryptFailed` (it used to decrypt on the disc-LBA-0 grid). A BD-TS unit flagged encrypted whose clear seed lacks the TS sync at byte 4 (read off its file's unit grid) also fails `DecryptFailed` instead of decrypting to garbage.
 
 ### Removed
 
@@ -30,6 +31,7 @@
 - `DiscPresence` (`Present` / `Absent` / `Settling`) and `disc_presence(path)`: the tri-state answer `drive_has_disc` collapses (`Settling` counts as a disc).
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
 - `Error::AacsKeyFileUnreadable` (E7031).
+- `DecryptingSectorSource::clear_unit_base()`: drop the unit base so AACS content reads fail loud until the next `set_unit_base`.
 - `ScanOptions::raw_copy`: a raw disc→ISO copy scans on past an unreadable `Unit_Key_RO.inf`, with E7031 recorded and every key refused.
 
 ### Fixed
