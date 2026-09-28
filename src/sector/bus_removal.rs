@@ -506,6 +506,10 @@ impl<S: SectorSource> SectorSource for BusRemovalSectorSource<S> {
             _ => self.inner.unmapped_stream_files(),
         }
     }
+
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
 }
 
 // Shared across every module's "wrappers forward `unmapped_stream_files`" test.

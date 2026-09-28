@@ -304,6 +304,21 @@ pub trait KeySource {
     fn label(&self) -> &'static str {
         "source"
     }
+
+    /// Whether this source's answer depends on the content samples it is sent. `true` (the
+    /// default): `ResolvedKeySet::resolve` asks it once per unopened piece, with that piece's
+    /// samples. `false` (a keydb keyed by disc hash): asked once per resolve (KU §2.3 step 8).
+    fn answer_depends_on_samples(&self) -> bool {
+        true
+    }
+
+    /// Whether this source's most recent failed request got NO answer at all (DNS, connect or
+    /// idle stall: transport class). Only then does `resolve` retry it, until 60 s pass with no
+    /// answer (KU §2.3 step 8, J13, J15). Default `false`: never retried, so a source that
+    /// answered (a 5xx, 401, 429) is never asked twice.
+    fn last_failure_was_transport(&self) -> bool {
+        false
+    }
 }
 
 /// Drive `sources` until one resolves Unit Keys that decrypt `disc`. Returns

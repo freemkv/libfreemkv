@@ -95,6 +95,9 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// (CSS self-descrambles in `decrypt_sectors`); an AACS source without a map
     /// is a bug and fails loud on the first unit (AACS decrypts only via the map).
     key_map: Option<Arc<crate::decrypt::AacsKeyMap>>,
+    /// The key set's on-arrival proof for pieces `resolve` could not prove up front
+    /// (KU §2.4). `None` for every reader not built by a `ResolvedKeySet`.
+    arrival: Option<Box<crate::keys::Arrival>>,
 }
 
 /// Does the sector span `[lba, lba+count)` intersect any encrypted-content range?
@@ -117,7 +120,15 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             unit_base: None,
             content_ranges: None,
             key_map: None,
+            arrival: None,
         }
+    }
+
+    /// Install the key set's on-arrival proof (KU §2.4): an encrypted unit of a piece
+    /// `resolve` left unproven is decrypted with a held key proven on it here.
+    pub(crate) fn with_arrival(mut self, arrival: crate::keys::Arrival) -> Self {
+        self.arrival = Some(Box::new(arrival));
+        self
     }
 
     /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap): the caller
@@ -206,6 +217,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.inner.unmapped_stream_files()
     }
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
 
     fn read_sectors(
         &mut self,
@@ -248,6 +262,13 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         let n = self
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
+
+        // KU §2.4: units of a piece left unproven are proven now, from the held keys only.
+        if let (Some(arrival), DecryptKeys::Aacs { unit_keys, .. }) =
+            (self.arrival.as_deref(), &self.keys)
+        {
+            arrival.process(&mut self.inner, lba, &mut buf[..n], unit_keys)?;
+        }
 
         // Proactive map path (storm-free mux): keys were resolved per unit up front,
         // so decrypt with the mapped key and trust it (no per-unit `is_clean`). A

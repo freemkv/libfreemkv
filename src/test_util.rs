@@ -366,6 +366,12 @@ impl<S: SectorSource> SectorSource for CountingSource<S> {
     fn set_unit_base(&mut self, lba: u32) {
         self.inner.set_unit_base(lba)
     }
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.inner.unmapped_stream_files()
+    }
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
 }
 
 /// Decrypt one 6144-byte aligned unit in place with a CPS unit key (KS-3, KS-4). The

@@ -396,6 +396,10 @@ impl SectorSource for Borrowed<'_> {
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.0.unmapped_stream_files()
     }
+
+    fn random_access(&self) -> bool {
+        self.0.random_access()
+    }
 }
 
 /// Whether `dir` lives on a case-INSENSITIVE filesystem (macOS APFS/HFS+ and

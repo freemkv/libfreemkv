@@ -823,7 +823,7 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
 
 // Tag for an FMTS forensic index key banked into the key pool (base + slot); separates disc
 // BASE CPS unit keys (< this) from forensic ones (>= this).
-const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
+pub(crate) const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
 
 // Pool slot of the disc's ONE base CPS Unit Key, or None for a genuine multi-CPS disc; excludes
 // forensic index keys.

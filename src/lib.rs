@@ -100,6 +100,8 @@ pub(crate) mod ifo;
 #[cfg(feature = "rip")]
 pub mod io;
 #[cfg(feature = "rip")]
+pub mod keys;
+#[cfg(feature = "rip")]
 pub mod keysource;
 #[cfg(feature = "rip")]
 pub mod labels;
