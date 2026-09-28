@@ -621,4 +621,39 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("drop must not deadlock on the blocked demux worker");
     }
+
+    /// LP10 (§2.1 "Unbounded Drop joins"): a worker blocked on its full output
+    /// channel, then a cancel: dropping the stream returns within 1 s. Guard.
+    #[test]
+    fn demux_drop_with_blocked_worker_after_cancel() {
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(16);
+        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(16);
+        let pid = 0x1011;
+        let ts = super::super::ts::TsDemuxer::new(&[pid]);
+        let halt = Halt::new();
+        let (dt, rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt.clone()), Some(ts), None)
+                .unwrap();
+        for i in 0..8u8 {
+            pf_tx.send(Ok(bdts_pes_packet(pid, &[i]))).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        halt.cancel();
+        let stream = super::super::pipelined_stream::PipelinedPesStream::new(
+            dt,
+            rx,
+            crate::disc::DiscTitle::empty(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(stream);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drop after a cancel must return within 1 s");
+        drop(pf_tx);
+    }
 }

@@ -118,6 +118,11 @@ impl PipelinedPesStream {
         }
     }
 
+    // The op's stop token: a cancel ends a blocked `read` with `Halted` (LP11).
+    pub(crate) fn with_halt(self, _halt: Option<crate::halt::Halt>) -> Self {
+        self
+    }
+
     // Pull one batch, parse it, enqueue frames on pending_frames. Ok(true) =
     // success, Ok(false) = clean EOF, Err = demuxer error.
     fn pump_one_batch(&mut self) -> io::Result<bool> {
@@ -519,6 +524,27 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    /// LP11: a reader blocked on the demux channel returns `Halted` once the op's
+    /// token is cancelled, with the demux worker still alive (no batch, no EOF).
+    #[test]
+    fn pipelined_stream_cancel_unblocks_reader() {
+        let (stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        let halt = crate::halt::Halt::new();
+        let mut stream = stream.with_halt(Some(halt.clone()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(stream.read().map(|f| f.is_some()));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        halt.cancel();
+        let r = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a cancel must unblock the reader within a slice");
+        let err = r.expect_err("a stop is not a frame or EOF");
+        assert!(crate::error::is_halt(&err), "{err}");
+        drop(tx);
     }
 
     // CLEAN EOF: explicit Eof sentinel → consumer returns Ok(None) and stays

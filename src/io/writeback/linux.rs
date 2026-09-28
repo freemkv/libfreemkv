@@ -73,6 +73,8 @@ pub(crate) struct WritebackPipeline {
     wb_errno: Option<i32>,
     /// The `WAIT_AFTER` syscall; a seam so tests can inject a writeback error.
     wait_op: WaitOp,
+    /// T11's bound on one `WAIT_AFTER` ([`WAIT_AFTER_TIMEOUT`]); a seam for tests.
+    wait_timeout: Duration,
 }
 
 /// `(fd, off, len) -> 0 or errno`.
@@ -136,6 +138,7 @@ impl WritebackPipeline {
             waitable,
             wb_errno: None,
             wait_op: sys_wait_after,
+            wait_timeout: WAIT_AFTER_TIMEOUT,
         }
     }
 
@@ -168,7 +171,8 @@ impl WritebackPipeline {
     }
 
     fn wait_after(&self, off: u64, len: u64) -> WaitOutcome {
-        wait_after_with_timeout(self.clone_for_worker(), self.fd, off, len, self.wait_op)
+        let worker = self.clone_for_worker();
+        wait_after_with_timeout(worker, self.fd, off, len, self.wait_op, self.wait_timeout)
     }
 
     /// True if we should bypass the WAIT_AFTER + DONTNEED finalisation
@@ -442,11 +446,12 @@ fn wait_after_with_timeout(
     off: u64,
     len: u64,
     op: WaitOp,
+    timeout: Duration,
 ) -> WaitOutcome {
     let started = Instant::now();
     // The owned clone keeps the file description alive until the worker drops it;
     // without one (try_clone failed) the raw fd carries the fd-reuse risk on timeout.
-    let result = crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || {
+    let result = crate::io::bounded::bounded_syscall(None, timeout, move || {
         let fd = worker_file
             .as_ref()
             .map(|f| f.as_raw_fd())
@@ -767,5 +772,27 @@ mod tests {
         );
         // The clone fd must be valid (non-negative on Unix).
         assert!(clone_fd >= 0, "clone fd must be non-negative");
+    }
+
+    fn slow_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        std::thread::sleep(Duration::from_millis(300));
+        0
+    }
+
+    /// LP15 / G6 (T11): a `WAIT_AFTER` that outlives its bound degrades the pipeline
+    /// (no more waits) and never fails a write, `finalize` or `error()`. Guard: per
+    /// the stop design §3.1 T11, do not change without a design change.
+    #[test]
+    fn wait_after_timeout_degrades_never_fails() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = slow_wait;
+        p.wait_timeout = Duration::from_millis(30);
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.note_progress(2 * CHUNK_BYTES_MIN);
+        assert!(p.skip_wait(), "a timed-out WAIT_AFTER degrades");
+        assert_eq!(p.chunk_bytes, CHUNK_BYTES_MIN);
+        p.note_progress(3 * CHUNK_BYTES_MIN);
+        p.finalize();
+        assert!(p.error().is_none(), "a timeout is never an error");
     }
 }

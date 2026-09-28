@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Sender, TrySendError, bounded};
 
 use crate::error::Error;
-use crate::halt::Halt;
+use crate::halt::{Halt, Progress};
 
 // Deadline for finish_with_halt's polling join.
 pub const JOIN_TIMEOUT_SECS: u64 = 600;
@@ -21,6 +21,22 @@ pub const JOIN_TIMEOUT_SECS: u64 = 600;
 // Grace period after a halt/timeout fires in finish_with_halt, to let a "nearly done" consumer
 // join cleanly.
 const FINISH_GRACE_SECS: u64 = 5;
+
+// The join's stall window (T7) and grace (T8): a parameter so tests run in ms.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JoinTiming {
+    pub(crate) join_window: Duration,
+    pub(crate) grace: Duration,
+}
+
+impl Default for JoinTiming {
+    fn default() -> Self {
+        Self {
+            join_window: Duration::from_secs(JOIN_TIMEOUT_SECS),
+            grace: Duration::from_secs(FINISH_GRACE_SECS),
+        }
+    }
+}
 
 // Halt-check cadence for the send loop; aliases crate::halt::POLL_INTERVAL.
 use crate::halt::POLL_INTERVAL;
@@ -209,6 +225,8 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     /// this; [`Pipeline::consumer_failed`] exposes it to plain
     /// [`Pipeline::send`] users.
     failed: Arc<AtomicBool>,
+    /// The consumer's forward progress (T7): shared with the sink's output.
+    progress: Progress,
 }
 
 impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
@@ -228,6 +246,18 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         name: &str,
         depth: usize,
         sink: S,
+    ) -> Result<Self, Error> {
+        Self::spawn_named_with_progress(name, depth, sink, Progress::new())
+    }
+
+    /// Like [`Pipeline::spawn_named`], with the consumer's [`Progress`] supplied, so the
+    /// sink's output (a [`WritebackFile`](crate::io::WritebackFile) given the same counter)
+    /// shares it (stop design §2.10 item 3).
+    pub fn spawn_named_with_progress<S: Sink<I, Output = R>>(
+        name: &str,
+        depth: usize,
+        sink: S,
+        progress: Progress,
     ) -> Result<Self, Error> {
         let (tx, rx) = bounded::<I>(depth);
         let state = Arc::new(AtomicU8::new(state::RUNNING));
@@ -380,7 +410,14 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             handle,
             state,
             failed,
+            progress,
         })
+    }
+
+    /// The consumer's forward-progress counter: bumped per item applied and at
+    /// `close()` entry and exit; [`finish_with_halt`](Self::finish_with_halt) waits on it.
+    pub fn progress(&self) -> &Progress {
+        &self.progress
     }
 
     /// Whether the consumer's `apply` has already failed fatally.
@@ -544,6 +581,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             handle,
             state: _,
             failed: _,
+            progress: _,
         } = self;
         // Explicit drop, although the destructure already drops `tx`
         // at end-of-scope. Being explicit keeps the intent obvious.
@@ -564,14 +602,24 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// (leaks the consumer after a grace spin). NOT a `foo_with_X` variant of
     /// [`Pipeline::finish`].
     pub fn finish_with_halt(self, halt: Option<&Halt>) -> Result<R, Error> {
+        self.finish_with_halt_timing(halt, JoinTiming::default())
+    }
+
+    // `finish_with_halt` with its windows as parameters.
+    pub(crate) fn finish_with_halt_timing(
+        self,
+        halt: Option<&Halt>,
+        timing: JoinTiming,
+    ) -> Result<R, Error> {
         let Pipeline {
             tx,
             handle,
             state,
             failed: _,
+            progress: _,
         } = self;
         drop(tx);
-        let deadline = Instant::now() + Duration::from_secs(JOIN_TIMEOUT_SECS);
+        let deadline = Instant::now() + timing.join_window;
         loop {
             if handle.is_finished() {
                 return match handle.join() {
@@ -582,25 +630,18 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             if let Some(h) = halt
                 && h.is_cancelled()
             {
-                return finish_with_grace(
-                    handle,
-                    &state,
-                    Duration::from_secs(FINISH_GRACE_SECS),
-                    Error::Halted,
-                );
+                return finish_with_grace(handle, &state, timing.grace, Error::Halted);
             }
             if Instant::now() >= deadline {
-                return finish_with_grace(
-                    handle,
-                    &state,
-                    Duration::from_secs(FINISH_GRACE_SECS),
-                    Error::PipelineJoinTimeout,
-                );
+                return finish_with_grace(handle, &state, timing.grace, Error::PipelineJoinTimeout);
             }
             thread::sleep(POLL_INTERVAL);
         }
     }
 }
+
+#[cfg(test)]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {

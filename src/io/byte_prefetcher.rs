@@ -483,4 +483,24 @@ mod tests {
             drop(pf);
         });
     }
+
+    /// LP9 (×2, §2.1 "Unbounded Drop joins stay plain joins"): after a cancel, dropping
+    /// the prefetcher, or its shell with both channel ends still held, returns within
+    /// 1 s. Guard.
+    #[test]
+    fn byte_prefetcher_drop_after_cancel_returns() {
+        let halt = Halt::new();
+        let pf = BytePrefetcher::new(EndlessReader, 4096, Some(halt.clone())).expect("spawn");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        halt.cancel();
+        within(1, move || drop(pf));
+
+        let halt = Halt::new();
+        let pf = BytePrefetcher::new(EndlessReader, 4096, Some(halt.clone())).expect("spawn");
+        let (rx, recycle_tx, shell) = pf.into_channels();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        halt.cancel();
+        within(1, move || drop(shell));
+        drop((rx, recycle_tx));
+    }
 }

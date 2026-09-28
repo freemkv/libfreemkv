@@ -229,4 +229,39 @@ mod tests {
             "timeout did not return near deadline: {elapsed:?} (op should be leaked, not awaited)"
         );
     }
+
+    /// LP12: a halted wait returns at once and leaks the worker, and the worker's
+    /// rendezvous send to the dropped receiver does not wedge it: it ends once the
+    /// op returns. Guard.
+    #[test]
+    fn bounded_syscall_halt_leaks_worker_without_blocking() {
+        let halt = Halt::new();
+        let h2 = halt.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            h2.cancel();
+        });
+        let alive = Arc::new(());
+        let held = alive.clone();
+        let t = Instant::now();
+        let r = bounded_syscall(Some(&halt), Duration::from_secs(10), move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(held);
+            1u8
+        });
+        assert!(matches!(r, Err(BoundedError::Halted)));
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        let t = Instant::now();
+        while Arc::strong_count(&alive) > 1 {
+            assert!(
+                t.elapsed() < Duration::from_secs(2),
+                "the leaked worker wedged"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 }

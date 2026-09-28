@@ -1792,16 +1792,19 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     let (rx, recycle_tx, shell) = prefetched.into_channels();
 
     let (parsers, pid_to_track, ts, ps) = build_demux_state(&title, format);
-    let (demux_thread, demux_rx) =
-        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, halt, ts, ps)
-            .map_err(|e| -> io::Error { e.into() })?;
-    Ok(PipelinedPesStream::new(
-        demux_thread,
-        demux_rx,
-        title,
-        parsers,
-        pid_to_track,
-    ))
+    let (demux_thread, demux_rx) = super::demux_thread::DemuxThread::spawn_zero_copy(
+        rx,
+        recycle_tx,
+        shell,
+        halt.clone(),
+        ts,
+        ps,
+    )
+    .map_err(|e| -> io::Error { e.into() })?;
+    Ok(
+        PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
+            .with_halt(halt),
+    )
 }
 
 // Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head
