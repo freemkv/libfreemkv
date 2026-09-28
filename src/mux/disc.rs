@@ -483,6 +483,13 @@ impl DiscStream {
             let res = self
                 .reader
                 .read_sectors(lba, sectors, &mut self.read_buf[..bytes], false);
+            // The key set's loud stop (KU §2.4, §6): a readable unit no held key opens is not
+            // bad media — never shrunk, recovered or skipped.
+            if let Err(e) = res.as_ref()
+                && is_key_stop(e)
+            {
+                return Err(res.unwrap_err().into());
+            }
 
             if let Ok(&got) = res.as_ref() {
                 // read_sectors returns bytes written into buf. All in-tree
@@ -540,6 +547,11 @@ impl DiscStream {
                 let rec = self
                     .reader
                     .read_sectors(lba, sectors, &mut self.read_buf[..bytes], true);
+                if let Err(e) = rec.as_ref()
+                    && is_key_stop(e)
+                {
+                    return Err(rec.unwrap_err().into());
+                }
                 if let Ok(&got) = rec.as_ref() {
                     debug_assert!(got <= bytes, "recovery read over-reported byte count");
                     if let Some(ev) = self.adaptive.on_success(sectors) {
@@ -619,6 +631,14 @@ impl DiscStream {
         }
         Ok(true)
     }
+}
+
+// The key set's on-arrival loud stop: E7022 (a title) or E7032 (an image or folder).
+fn is_key_stop(e: &crate::error::Error) -> bool {
+    matches!(
+        e,
+        crate::error::Error::NoDiscKey { .. } | crate::error::Error::WholeDiscKeyMissing
+    )
 }
 
 // Per-stage profiling state, populated only when FREEMKV_PROFILE is set.
