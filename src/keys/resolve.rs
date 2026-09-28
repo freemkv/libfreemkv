@@ -645,6 +645,7 @@ fn resolve_hddvd(
         }
     }
     let mut inner = aacs_inner(run);
+    inner.no_stream_files = files.is_empty();
     inner.best_effort = true;
     inner.origin = run.origin.first().copied();
     inner.proven = vec![0];
@@ -804,6 +805,7 @@ fn resolve_bd(
         return Err(failure.unwrap_or_else(|| missing_error(scope, disc)));
     }
     let mut inner = aacs_inner(run);
+    inner.no_stream_files = files.is_empty();
     // Step 6 (continued): forensic keys, reused from the seed or anchored once.
     let forensic = match &layout {
         None => None,

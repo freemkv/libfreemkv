@@ -235,6 +235,8 @@ pub(crate) struct Inner {
     pub(crate) fmts_phases: HashMap<u16, crate::decrypt::Phase>,
     pub(crate) map: Arc<AacsKeyMap>,
     pub(crate) spans: Vec<UnitSpan>,
+    // `resolve` found no stream file (no `/BDMV/STREAM` or `/HVDVD_TS`, or an empty one).
+    pub(crate) no_stream_files: bool,
     pub(crate) arrival: Vec<ArrivalPiece>,
     pub(crate) lazy: Vec<(u32, u32)>,
     pub(crate) proven: Vec<usize>,
@@ -265,6 +267,7 @@ impl Inner {
             fmts_phases: HashMap::new(),
             map: Arc::new(AacsKeyMap::from_ranges(Vec::new())),
             spans: Vec::new(),
+            no_stream_files: false,
             arrival: Vec::new(),
             lazy: Vec::new(),
             proven: Vec::new(),
@@ -752,6 +755,15 @@ impl ResolvedKeySet {
         }
         if !self.covers(&KeyScope::WholeDisc) {
             return Err(Self::caller_bug("whole disc outside the key set's scope"));
+        }
+        if self.0.no_stream_files && !content.is_empty() {
+            // Titles but no stream file: sweeping would key bare title extents (freemkv#55).
+            tracing::warn!(target: "freemkv::scan", "titles but no AACS content files");
+            let path = match disc.format {
+                DiscFormat::HdDvd => "/HVDVD_TS",
+                _ => "/BDMV/STREAM",
+            };
+            return Err(Error::UdfNotFound { path: path.into() });
         }
         let mut dec = self.decrypting(inner, None, StopKind::Image, false)?;
         content.extend(self.0.spans.iter().map(|&(s, n, _)| (s, n)));
