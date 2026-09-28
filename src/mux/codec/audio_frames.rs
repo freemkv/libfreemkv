@@ -1,11 +1,9 @@
 //! Bounded framing and timestamp accounting shared by ADTS and MPEG audio.
 //!
-//! A resync run is the bytes from a failed header to the next locked frame, EOS or a gap.
-//! Every run rule keeps these invariants:
+//! A resync run (a failed header to the next locked frame, EOS or a gap) keeps invariants:
 //! - I1: one run (corruption event) is exactly one verified fault; its other lost AUs are
 //!   collateral, so they never feed the poison gate.
-//! - I2: a run's lost AUs are the clock skip its placement takes, never more than its bytes
-//!   hold (bytes / smallest legal frame + 1); a jump beyond that is an unflagged discontinuity.
+//! - I2: lost AUs are the clock skip taken, capped by the bytes (/ smallest frame + 1).
 //! - I3: emitted PTS never repeat or go backwards within a stream key: a lock waits for the
 //!   next timestamp, and an emission backstop continues from the last frame if needed.
 //! - I4: consistent timestamps are authoritative: they place the lock and count the run.
@@ -14,6 +12,9 @@
 //!
 //! A lock after a run or a gap must chain to a valid header (in a new key, twice); two
 //! candidates ending at one byte are both refused; at EOS a frame that cannot complete is none.
+//! Limit, even on a clean stream: a flagged gap (a BD clip's discontinuity_indicator too), then
+//! a key change with one frame before EOS or the next gap, loses that frame (it cannot chain
+//! twice): at worst 1-2 AUs at the end of a title that changes format.
 
 use super::dropgate::DropTally;
 use super::pesbuf::{PesBuf, PesFacts};
