@@ -526,6 +526,18 @@ pub fn mux_with_keys(
     events: std::sync::Arc<dyn MuxEvents>,
 ) -> std::io::Result<MuxOutcome> {
     let set = keys.filter(|s| s.is_aacs() && !opts.raw);
+    // KU §3.1: "keys must be Some for AACS". A BD-TS Iso/Live mux with no AACS set reads
+    // through a keyless set: the first AACS-flagged unit is E7022, never muxed as content.
+    // MPEG-PS keeps the old path (a DVD cracks its own CSS key; `MuxSource` has no disc).
+    let keyless = match (&source, set) {
+        (MuxSource::Iso { title, format, .. } | MuxSource::Live { title, format, .. }, None)
+            if !opts.raw && *format == crate::disc::ContentFormat::BdTs =>
+        {
+            Some(crate::keys::ResolvedKeySet::keyless_for(title, *format))
+        }
+        _ => None,
+    };
+    let set = set.or(keyless.as_ref());
     let input = match (source, set) {
         (MuxSource::Url { url, opts: mut o }, _) => {
             if let Some(k) = keys {

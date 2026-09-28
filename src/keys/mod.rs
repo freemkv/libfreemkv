@@ -553,6 +553,29 @@ impl ResolvedKeySet {
         Ok(dec)
     }
 
+    // A set holding no key over `title` (KU §3.1: "keys must be Some for AACS"): every
+    // extent is left to the on-arrival proof, which has no key to try, so the first
+    // AACS-flagged unit stops with E7022 and clear units pass. For a mux given no AACS set.
+    pub(crate) fn keyless_for(title: &crate::disc::DiscTitle, format: ContentFormat) -> Self {
+        let mut i = Inner::empty();
+        i.aacs = true;
+        i.content_format = format;
+        i.scope = KeyScope::WholeDisc;
+        for e in title.extents.iter().filter(|e| e.sector_count > 0) {
+            let span = (e.start_lba, e.sector_count, e.start_lba as u64);
+            if i.spans.contains(&span) {
+                continue; // a playlist may play a clip twice
+            }
+            i.spans.push(span);
+            i.arrival.push(ArrivalPiece {
+                id: e.start_lba,
+                spans: vec![span],
+                candidate: None,
+            });
+        }
+        ResolvedKeySet(Arc::new(i))
+    }
+
     // A set keying `ranges` (`[start, end)`) with `key` as proven pieces: the mux tests'
     // stand-in for a set `resolve` built over a disc they do not lay out.
     #[cfg(test)]
