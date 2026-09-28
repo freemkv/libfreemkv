@@ -102,17 +102,22 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
         timeout_ms: u32,
     ) -> fu::scsi::Result<fu::scsi::ScsiResult> {
         let d = to_lib_dir(dir);
-        // RED stub: the raw transport, blind to the token.
-        to_fu_result(self.drive.exec_uncancellable(cdb, d, data, timeout_ms))
+        to_fu_result(if self.critical > 0 {
+            self.drive.exec_uncancellable(cdb, d, data, timeout_ms)
+        } else {
+            self.drive.exec(cdb, d, data, timeout_ms)
+        })
     }
 
     fn pause(&mut self, d: std::time::Duration) -> fu::scsi::Result<()> {
-        std::thread::sleep(d.min(std::time::Duration::from_millis(1))); // RED stub
-        Ok(())
+        self.drive.pause(d).map_err(|_| refused())
     }
 
     fn begin_critical(&mut self) -> fu::scsi::Result<()> {
-        self.critical += 1; // RED stub: never refused
+        if self.drive.is_halted() {
+            return Err(refused());
+        }
+        self.critical += 1;
         Ok(())
     }
 
@@ -132,10 +137,9 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
         } else {
             crate::drive::CleanupCtx::Plain
         };
-        let _ = ctx; // RED stub
         to_fu_result(
             self.drive
-                .exec_uncancellable(cdb, to_lib_dir(dir), data, timeout_ms),
+                .exec_cleanup(cdb, to_lib_dir(dir), data, timeout_ms, ctx),
         )
     }
 }

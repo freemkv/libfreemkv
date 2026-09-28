@@ -1959,7 +1959,10 @@ impl Disc {
     /// `opts.halt` is the scan's op token unless the drive has one attached (§2.2).
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         let mut session = session.alias(opts.halt.as_ref());
-        Self::scan_live(&mut session, opts) // RED stub: no final check
+        let disc = Self::scan_live(&mut session, opts)?;
+        // LS6: a Stop after the last CDB still ends the scan; no `Disc` is returned.
+        session.check_token()?;
+        Ok(disc)
     }
 
     fn scan_live(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {

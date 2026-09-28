@@ -382,9 +382,6 @@ pub(crate) fn parse_sense(sense: &[u8], sb_len_wr: u8) -> ScsiSense {
 pub(crate) fn parse_sense_progress(sense: &[u8], sb_len_wr: u8) -> Option<u16> {
     // SS-1 Table 18: "NO SENSE or NOT READY | Progress indication"; other sense keys
     // give the field another meaning.
-    if sb_len_wr < 255 {
-        return None; // RED stub: no progress parsed
-    }
     let n = (sb_len_wr as usize).min(sense.len());
     let sense = &sense[..n];
     let progress_key = |k: u8| matches!(k & 0x0F, SENSE_KEY_NO_SENSE | SENSE_KEY_NOT_READY);

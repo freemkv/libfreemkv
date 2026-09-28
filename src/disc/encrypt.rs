@@ -451,7 +451,7 @@ pub(super) fn bus_step_guard<T>(
     session: &mut crate::drive::Drive,
     step: impl FnOnce(&mut crate::drive::Drive) -> T,
 ) -> Result<T> {
-    // RED stub: no busy span.
+    let _busy = session.progress().map(crate::halt::Progress::busy);
     session.check_token()?;
     let r = step(session);
     session.check_token()?;

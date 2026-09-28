@@ -215,7 +215,6 @@ impl Drop for AliasGuard<'_> {
     }
 }
 
-#[allow(dead_code)] // RED stub: wired in the next commit
 impl Drive {
     /// Open the drive with its own token, cancelled by [`halt`](Self::halt).
     pub fn open(device: &Path) -> Result<Self> {
@@ -233,7 +232,7 @@ impl Drive {
         tracing::info!(target: "freemkv::drive", phase = "open", device = %device.display(), "begin");
         let transport = crate::scsi::open(device)?;
         let mut drive = Self::bare(transport, device.to_string_lossy().to_string(), slot);
-        drive.drive_id = DriveId::from_drive(drive.scsi.as_mut())?; // RED stub
+        drive.drive_id = DriveId::identify(&mut |cdb, dir, buf, t| drive.exec(cdb, dir, buf, t))?;
         tracing::info!(
             target: "freemkv::drive",
             phase = "open",
@@ -417,10 +416,7 @@ impl Drive {
     /// check `alias` until the guard drops, then restore; over a caller's attached
     /// token, that token wins and a different alias is logged.
     pub(crate) fn alias(&mut self, alias: Option<&Halt>) -> AliasGuard<'_> {
-        let _ = alias; // RED stub: the alias is ignored
-        let saved: Option<Slot> = None;
-        #[allow(unreachable_code, unused_variables)]
-        let _unused = || match (alias, &self.slot) {
+        let saved = match (alias, &self.slot) {
             (None, _) => None,
             (Some(a), Slot::Attached { token, own: false }) => {
                 if !Arc::ptr_eq(a.as_arc(), token.as_arc()) {
@@ -432,7 +428,7 @@ impl Drive {
                 }
                 None
             }
-            (Some(a), _) => Some(Slot::foreign(a)),
+            (Some(a), _) => Some(std::mem::replace(&mut self.slot, Slot::foreign(a))),
         };
         AliasGuard { drive: self, saved }
     }
@@ -486,10 +482,11 @@ impl Drive {
             None => self.on_detached_exec(),
             Some(t) => t.check()?,
         }
-        let r = self.dispatch(cdb, dir, buf, timeout_ms)?;
-        let _ = is_read_class;
-        self.check_token()?; // RED stub: old post-check on every CDB
-        Ok(r)
+        let r = self.dispatch(cdb, dir, buf, timeout_ms);
+        if is_read_class(cdb) {
+            self.check_token()?;
+        }
+        r
     }
 
     /// A CDB inside a critical section entered before any cancel (§2.4 row 4): not
@@ -532,9 +529,14 @@ impl Drive {
         buf: &mut [u8],
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
-        // RED stub: no progress, no ledger.
-        let _ = (&self.progress, &self.agids, Self::note_ledger);
-        self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms)
+        let busy = self.progress.as_ref().map(Progress::busy);
+        let r = self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms);
+        drop(busy);
+        if let Some(p) = &self.progress {
+            p.bump();
+        }
+        self.note_ledger(cdb, buf, r.is_ok());
+        r
     }
 
     // §2.2 ledger: an ALLOW that reached the drive ends this Drive's claim on the tray
@@ -607,12 +609,14 @@ impl Drive {
         let mut hb = crate::progress::Heartbeat::new("wait_ready");
         // T6: the answers seen so far and the highest progress indicator; either
         // growing re-arms the no-progress window.
-        // RED stub: the old 60-poll cap; no progress detection.
-        let _ = (Progress::new, crate::halt::StallTimer::new);
-        let mut polls = 0u32;
+        let moved = Progress::new();
+        let mut stall = crate::halt::StallTimer::new(timing.window, &moved);
+        let mut seen: Vec<Option<(u8, u8, u8)>> = Vec::new();
+        let mut best: Option<u16> = None;
         // (when the first failure of the current run completed, failures in it)
         let mut failing: Option<(std::time::Instant, u32)> = None;
         let mut start_sent = false;
+        // Consecutive 3Ah answers, and whether 04/01 (a disc being identified) was seen.
         let (mut empty_run, mut becoming_ready_seen) = (0u32, false);
         let mut attempt = 0u64;
         loop {
@@ -652,6 +656,18 @@ impl Drive {
                     let sense = e.scsi_sense().map(|s| (s.sense_key, s.asc, s.ascq));
                     // §2.11: a new answer in this wait is progress; the same one, or two
                     // known ones alternating, is not.
+                    if !seen.contains(&sense) {
+                        seen.push(sense);
+                        moved.bump();
+                    }
+                    // SS-1: "The PROGRESS INDICATION field is a percent complete indication";
+                    // a value above the best seen so far is progress.
+                    if let Some(p) = self.scsi.last_sense_progress()
+                        && best.is_none_or(|b| p > b)
+                    {
+                        best = Some(p);
+                        moved.bump();
+                    }
                     let empty = matches!(sense, Some((crate::scsi::SENSE_KEY_NOT_READY, 0x3A, _)));
                     empty_run = if empty { empty_run + 1 } else { 0 };
                     becoming_ready_seen |=
@@ -675,8 +691,7 @@ impl Drive {
                     }
                 }
             }
-            polls += 1;
-            if polls >= 60 {
+            if stall.poll(&moved) == crate::halt::Stall::Expired {
                 break;
             }
             self.pause(timing.poll)?;
@@ -710,7 +725,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        let reply = self.scsi.as_mut().execute(
+        let reply = self.exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
@@ -770,12 +785,7 @@ impl Drive {
                 // Fallback: try TUR
                 let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
                 let mut empty = [0u8; 0];
-                match self.scsi.as_mut().execute(
-                    &tur,
-                    crate::scsi::DataDirection::None,
-                    &mut empty,
-                    5_000,
-                ) {
+                match self.exec(&tur, crate::scsi::DataDirection::None, &mut empty, 5_000) {
                     Ok(_) => DriveStatus::DiscPresent,
                     Err(ref e)
                         if e.scsi_sense()
@@ -865,6 +875,7 @@ impl Drive {
         let (matched, unlock_res) = crate::unlock_bridge::run_features(self, &drive_id);
         // §2.3 reclassification: a Stop is `Halted` before any other result mapping, so
         // the refused CDBs it caused never read as a dead bus.
+        self.check_token()?;
         let r: Result<()> = match unlock_res {
             Ok(Some(unlocked)) => {
                 // Record which firmware unlocker ran, not the id-only lookup.
@@ -1325,7 +1336,7 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        let result = self.scsi.as_mut().execute(
+        let result = self.exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
@@ -1360,13 +1371,11 @@ impl Drive {
         ];
         let mut buf = [0u8; 0];
         // Pre-check: a stopped op must not lock a tray it will never unlock.
+        if self.is_halted() {
+            return;
+        }
         self.tray_locked = true;
-        match self.scsi.as_mut().execute(
-            &prevent,
-            crate::scsi::DataDirection::None,
-            &mut buf,
-            5_000,
-        ) {
+        match self.exec(&prevent, crate::scsi::DataDirection::None, &mut buf, 5_000) {
             Err(Error::Halted) => self.tray_locked = false,
             Err(e) => {
                 tracing::warn!(target: "freemkv::drive", error = %e, "PREVENT MEDIUM REMOVAL failed")
@@ -1389,10 +1398,13 @@ impl Drive {
         ];
         let mut buf = [0u8; 0];
         // Checked against the ledger as it stands, then cleared: exactly one ALLOW.
-        let r =
-            self.scsi
-                .as_mut()
-                .execute(&allow, crate::scsi::DataDirection::None, &mut buf, 5_000);
+        let r = self.exec_cleanup(
+            &allow,
+            crate::scsi::DataDirection::None,
+            &mut buf,
+            5_000,
+            CleanupCtx::Plain,
+        );
         self.tray_locked = false;
         // Best-effort (the tray-unlock is advisory), but a failure is worth a warn!
         // rather than a silent `let _`: a stuck PREVENT lock is a real symptom the
@@ -1415,7 +1427,7 @@ impl Drive {
         // if the START bit is set to zero".
         let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
         let mut buf = [0u8; 0];
-        self.scsi.as_mut().execute(
+        self.exec(
             &eject_cdb,
             crate::scsi::DataDirection::None,
             &mut buf,
@@ -1468,7 +1480,7 @@ impl Drive {
         buf: &mut [u8],
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
-        self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
+        self.exec(cdb, direction, buf, timeout_ms)
     }
 }
 

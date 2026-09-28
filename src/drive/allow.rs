@@ -2,7 +2,6 @@
 //! only these clean-up CDBs may still reach the drive. Shared by
 //! [`Drive::exec_cleanup`](super::Drive) and the test `FakeTransport`, so the two can
 //! never disagree about what is legal after a Stop.
-#![allow(dead_code)] // RED stub: wired into Drive in the next commit
 
 /// PREVENT ALLOW MEDIUM REMOVAL.
 pub(crate) const PREVENT_ALLOW: u8 = 0x1E;

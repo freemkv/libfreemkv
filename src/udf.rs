@@ -1691,7 +1691,9 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
         }
         self.cache_start = start_lba;
         self.cache_sectors = offset;
-        let _ = halted; // RED stub: swallowed
+        if halted {
+            return Err(crate::error::Error::Halted);
+        }
         Ok(())
     }
 
@@ -1723,7 +1725,8 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
                     .read_sectors(start + offset, batch, &mut tmp[..bytes], true)
                 {
                     Ok(_) => {}
-                    Err(_) => break, // RED stub: a Stop is swallowed
+                    Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
+                    Err(_) => break,
                 }
                 for i in 0..batch as u32 {
                     if cached >= MAX_PREFETCH_SECTORS {
