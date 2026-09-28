@@ -50,6 +50,13 @@ pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 /// AES-128-ECB decrypt a single 16-byte block. `[C]` §2.1.1 (`AES-128D`).
 pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(&(*key).into());
+    aes_ecb_decrypt_with_cipher(&cipher, data)
+}
+
+/// AES-128-ECB decrypt a single block under an already-expanded key schedule. Split out of
+/// [`aes_ecb_decrypt`] for a candidate-scan loop that reuses one Processing Key's schedule
+/// across many `(uv, cvalue)` pairs instead of rebuilding it per candidate (L104).
+pub(crate) fn aes_ecb_decrypt_with_cipher(cipher: &Aes128, data: &[u8; 16]) -> [u8; 16] {
     let mut block: Array<u8, _> = (*data).into();
     cipher.decrypt_block(&mut block);
     let mut out = [0u8; 16];
@@ -128,9 +135,19 @@ pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
     }
 }
 
+// Per-thread count of `aes_g` calls. Test-only: L103 hoists the slot-independent
+// `aes_g(kp, nonce)` out of the AACS 2.1 variant per-slot loop (~46k slots/disc), so a test
+// can assert it now runs once per variant MKB, not once per slot.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AES_G_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // AES-G(x1, x2) = AES-128D(x1, x2) XOR x2 (`[C]` §2.1.3, uses AES-128D). Used by the Media Key
 // Variant chain to derive Kvn and Kvu.
 pub(crate) fn aes_g(x1: &[u8; 16], x2: &[u8; 16]) -> [u8; 16] {
+    #[cfg(test)]
+    AES_G_CALLS.with(|c| c.set(c.get() + 1));
     let mut out = aes_ecb_decrypt(x1, x2);
     for i in 0..16 {
         out[i] ^= x2[i];
