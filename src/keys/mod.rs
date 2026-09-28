@@ -556,7 +556,7 @@ impl ResolvedKeySet {
         Ok(dec)
     }
 
-    // A set holding no key over `title` (KU §3.1: "keys must be Some for AACS"): every
+    // A set holding no key over `title` (KU §3.1: "`keys` must be `Some` for AACS"): every
     // extent is left to the on-arrival proof, which has no key to try, so the first
     // AACS-flagged unit stops with E7022 and clear units pass. For a mux given no AACS set.
     pub(crate) fn keyless_for(title: &crate::disc::DiscTitle, format: ContentFormat) -> Self {
