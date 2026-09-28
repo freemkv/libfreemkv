@@ -1410,6 +1410,68 @@ fn a_css_scrambled_vob_is_descrambled() {
     let _ = std::fs::remove_file(&path);
 }
 
+// A CSS-scrambled copy of the fixture's output: every whole-sector video pack scrambled.
+fn scrambled_vob(fx: &Fx) -> Vec<u8> {
+    let mut vob = run(fx).out;
+    let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+    for pk in vob.as_chunks_mut::<{ pack::PACK_BYTES }>().0 {
+        if pk[13] & 7 == 0 && pk[17] == 0xE0 && pk[0x14] & 0x30 == 0 {
+            pk[0x14] |= 0x10;
+            crate::css::lfsr::scramble_sector(&key, pk);
+        }
+    }
+    vob
+}
+
+// Design §4 step 2.1: "css::resolve_dvd_title_key(… raw = false, halt)". A stop reaches the
+// crack, and `--raw` still cracks so the head scan reads the streams (the mux stays raw).
+#[test]
+fn the_crack_honours_halt_and_runs_under_raw() {
+    let fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let path = temp_path("halt");
+    std::fs::write(&path, scrambled_vob(&fx)).unwrap();
+    // The sequence header past the first 0x80 bytes of its pack, where CSS scrambles.
+    let (lead, _) = clear_ps_with_lead(false, 0, 200);
+    let mut vob = lead;
+    let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+    for pk in vob.as_chunks_mut::<{ pack::PACK_BYTES }>().0 {
+        if pk[0x11] == 0xE0 {
+            pk[0x14] |= 0x10;
+            crate::css::lfsr::scramble_sector(&key, pk);
+        }
+    }
+    let lead_path = temp_path("lead");
+    std::fs::write(&lead_path, vob).unwrap();
+    let url = format!("mpg://{}", path.display());
+    let _g = crate::sector::prefetched::holder_test_lock();
+    let halt = crate::halt::Halt::new();
+    halt.cancel();
+    let e = crate::mux::resolve::input_with_halt(&url, &Default::default(), Some(&halt))
+        .err()
+        .expect("a stopped crack is Halted");
+    assert_eq!(crate::error::error_code(&e), Some(crate::error::E_HALTED));
+    let raw = crate::mux::resolve::InputOptions {
+        raw: true,
+        ..Default::default()
+    };
+    let lead_url = format!("mpg://{}", lead_path.display());
+    let input = crate::mux::resolve::input(&lead_url, &raw).expect("raw input");
+    assert!(
+        matches!(&input.info().streams[0], DiscStream::Video(v) if v.resolution == Resolution::R1080p),
+        "the head scan read the descrambled sequence header: {:?}",
+        input.info().streams.first()
+    );
+    drop(input);
+    let _ = (
+        std::fs::remove_file(&path),
+        std::fs::remove_file(&lead_path),
+    );
+}
+
 // Design §4 step 2 (J13): a truncated rip (size not a multiple of 2048) is read, its cut-off
 // final packet dropped by the demuxer.
 #[test]
@@ -1512,7 +1574,16 @@ fn an_mpeg1_system_stream_is_read_and_remuxed() {
 // packs whose packets carry the STD buffer field and a PTS (as FFmpeg writes them), or
 // 13818-1 packs with `stuffing` pack-stuffing bytes. Returns the file and the video ES.
 fn clear_ps(mpeg1: bool, stuffing: usize) -> (Vec<u8>, Vec<u8>) {
+    clear_ps_with_lead(mpeg1, stuffing, 0)
+}
+
+// `clear_ps` with `lead` bytes of user data ahead of the first sequence header.
+fn clear_ps_with_lead(mpeg1: bool, stuffing: usize, lead: usize) -> (Vec<u8>, Vec<u8>) {
     let mut es = Vec::new();
+    if lead > 0 {
+        es.extend_from_slice(&[0, 0, 1, 0xB2]);
+        es.resize(lead, 0x5A);
+    }
     let mut starts = Vec::new();
     for k in 0..30u64 {
         starts.push((es.len(), 45_000 + k * 3_600));
