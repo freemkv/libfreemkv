@@ -32,6 +32,7 @@
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
 - `Error::AacsKeyFileUnreadable` (E7031).
 - `DecryptingSectorSource::clear_unit_base()`: drop the unit base so AACS content reads fail loud until the next `set_unit_base`.
+- `Error::WholeDiscKeyMissing` (E7032): a decrypted whole-disc image would keep encrypted pieces because a stream file no title plays has no held key. The fix is an MKV rip or a raw copy.
 - `ScanOptions::raw_copy`: a raw disc→ISO copy scans on past an unreadable `Unit_Key_RO.inf`, with E7031 recorded and every key refused.
 
 ### Fixed
