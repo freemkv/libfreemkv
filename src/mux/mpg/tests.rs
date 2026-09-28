@@ -1678,6 +1678,101 @@ fn clear_mpeg1_and_stuffed_mpeg2_are_never_read_as_scrambled() {
     }
 }
 
+// Scramble every video pack of `ps` whose PES flags sit at 0x14 + its pack stuffing.
+fn scramble_video_packs(ps: &mut [u8]) -> usize {
+    let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+    let mut n = 0;
+    for pk in ps.as_chunks_mut::<{ pack::PACK_BYTES }>().0 {
+        let at = 0x14 + usize::from(pk[13] & 7);
+        if pk[at - 3] == 0xE0 {
+            // The test scrambler flags byte 0x14; a stuffed pack's flags are at `at`.
+            let b14 = pk[0x14];
+            pk[at] |= 0x10;
+            crate::css::lfsr::scramble_sector(&key, pk);
+            if at != 0x14 {
+                pk[0x14] = b14;
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+// Where two byte strings first differ (their lengths when one is a prefix), for a short
+// failure message.
+fn first_diff(a: &[u8], b: &[u8]) -> Option<(usize, usize, usize)> {
+    let at = a.iter().zip(b).position(|(x, y)| x != y);
+    (at.is_some() || a.len() != b.len())
+        .then(|| (at.unwrap_or(a.len().min(b.len())), a.len(), b.len()))
+}
+
+// The video ES a file reads back as, or its error code.
+fn read_video(file: &[u8], tag: &str) -> Result<Vec<u8>, Option<u16>> {
+    let path = temp_path(tag);
+    std::fs::write(&path, file).unwrap();
+    let got = read_all(&path);
+    let _ = std::fs::remove_file(&path);
+    got.map(|(_, frames)| {
+        frames
+            .iter()
+            .filter(|f| f.track == 0)
+            .flat_map(|f| f.data.iter().copied())
+            .collect()
+    })
+    .map_err(|e| crate::error::error_code(&e))
+}
+
+// m1: an MPEG-2 file whose scrambled packs are all stuffed is judged by the flags where its
+// stuffing puts them: descrambled, or refused with E7023, never muxed as ciphertext.
+#[test]
+fn stuffed_scrambled_packs_are_never_muxed_as_ciphertext() {
+    let (mut file, es) = clear_ps(false, 2);
+    assert!(scramble_video_packs(&mut file) > 10);
+    match read_video(&file, "stuffed-css") {
+        Ok(video) => assert_eq!(first_diff(&video, &es), None, "descrambled"),
+        Err(code) => assert_eq!(code, Some(crate::error::E_CSS_KEY_MISSING)),
+    }
+}
+
+// m1: scrambling first met past the crack's 50 000-sector budget is refused with E7023 when
+// it is read, never muxed as ciphertext.
+#[test]
+fn scrambling_past_the_crack_budget_is_refused() {
+    let (head, _) = clear_ps(false, 0);
+    let mut file = head[..head.len() - 4].to_vec();
+    let mut pad = pack::pack_header(0, 25_200, 0);
+    pad.extend(pack::padding_pes(pack::PACK_BYTES - pad.len()));
+    for _ in 0..50_000 {
+        file.extend_from_slice(&pad);
+    }
+    let (mut tail, _) = clear_ps(false, 0);
+    scramble_video_packs(&mut tail);
+    file.extend(tail);
+    let got = read_video(&file, "late-css").map(|v| v.len());
+    assert_eq!(got, Err(Some(crate::error::E_CSS_KEY_MISSING)));
+}
+
+// m2: in a CSS file, a clear stuffed pack whose byte 0x14 happens to hold set bits (here the
+// low byte of PES_packet_length) is read as clear, not "descrambled".
+#[test]
+fn a_clear_stuffed_pack_in_a_css_file_is_left_clear() {
+    let (mut first, es1) = clear_ps(false, 0);
+    scramble_video_packs(&mut first);
+    let (second, es2) = clear_ps(false, 1);
+    assert!(
+        second
+            .as_chunks::<{ pack::PACK_BYTES }>()
+            .0
+            .iter()
+            .any(|pk| pk[0x14] & 0x30 != 0),
+        "fixture: a clear stuffed pack reads as scrambled at 0x14"
+    );
+    let mut file = first[..first.len() - 4].to_vec();
+    file.extend(second);
+    let video = read_video(&file, "css-then-stuffed").expect("reads");
+    assert_eq!(first_diff(&video, &[es1, es2].concat()), None);
+}
+
 // D3: a clear file is crack-scanned once; the pipeline is handed that verdict ("clear")
 // rather than scanning again because its keys are None.
 #[test]
