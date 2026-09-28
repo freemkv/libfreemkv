@@ -767,15 +767,16 @@ mod tests {
     fn ps_routing_uses_dvd_pid_and_drops_unmappable() {
         let title = DiscTitle::empty();
         // PID for AC-3 sub-id 0x80 is 0xBD00 | 0x80 = 0xBD80.
-        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
-            0xBD80,
+        let counting = || -> Box<dyn CodecParser> {
             Box::new(CountingParser {
                 per_pes: 1,
                 flush_n: 0,
                 cp: None,
-            }),
-        )];
-        let pid_to_track = vec![(0xBD80u16, 1usize)];
+            })
+        };
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> =
+            vec![(0xBD80, counting()), (0x00C1, counting())];
+        let pid_to_track = vec![(0xBD80u16, 1usize), (0x00C1, 2)];
         let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
 
         let mappable = PsPacket {
@@ -786,21 +787,33 @@ mod tests {
             dts: None,
             data: vec![0x12, 0x34],
         };
-        // stream_id 0xC0 (MPEG audio) has no DVD PID mapping → dropped.
+        // stream_id 0xC8: MPEG audio past DVD's 8 streams has no DVD PID → dropped.
         let unmappable = PsPacket {
             source: None,
-            stream_id: 0xC0,
+            stream_id: 0xC8,
             sub_stream_id: None,
             pts: None,
             dts: None,
             data: vec![0xFF],
         };
-        tx.send(DemuxBatch::Ps(vec![mappable, unmappable])).unwrap();
+        // MPEG audio stream 1 (PES id 0xC1) routes to PID 0xC1, the scanner's MP2 PID.
+        let mp2 = PsPacket {
+            source: None,
+            stream_id: 0xC1,
+            sub_stream_id: None,
+            pts: Some(90_000),
+            dts: None,
+            data: vec![0x56],
+        };
+        tx.send(DemuxBatch::Ps(vec![mappable, unmappable, mp2]))
+            .unwrap();
         tx.send(DemuxBatch::Eof).unwrap();
 
         let f = stream.read().unwrap().expect("one routed PS frame");
         assert_eq!(f.track, 1, "routed by dvd_pid to track 1");
         assert_eq!(f.data, vec![0x12, 0x34]);
+        let f = stream.read().unwrap().expect("routed MP2 frame");
+        assert_eq!((f.track, f.data), (2, vec![0x56]));
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
     }
 

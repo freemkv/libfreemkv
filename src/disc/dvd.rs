@@ -166,7 +166,7 @@ impl Disc {
                             "spst",
                             ts.vts_number,
                             title_number,
-                            sub_id,
+                            sub_id.into(),
                             kept,
                             &s.language,
                         );
@@ -251,21 +251,22 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
     let mut kept: Vec<(u16, &str)> = Vec::new();
     let mut out = Vec::new();
     for (i, (a, ctl)) in declared.iter().zip(t.ast_ctl).enumerate() {
-        let sub_id = if any_present {
-            let Some(n) = ifo::audio_stream_number(ctl) else {
-                continue;
-            };
-            ifo::audio_sub_stream_id(a.codec, n)
+        let n = if any_present {
+            match ifo::audio_stream_number(ctl) {
+                Some(n) => n,
+                None => {
+                    crate::diag::dvd_audio_route(ts.vts_number, title, i, a, ctl, None);
+                    continue;
+                }
+            }
         } else {
-            a.sub_stream_id
+            i as u8
         };
-        // MPEG audio has no private_stream_1 sub-id: 0xBD00 + logical index.
-        let pid = sub_id
-            .and_then(crate::mux::ps::dvd_audio_pid)
-            .unwrap_or(0xBD00 + i as u16);
+        // No route (an unknown coding mode): a unique placeholder PID nothing feeds.
+        let pid = ifo::audio_pid(a.codec, n).unwrap_or(0xBD00 + i as u16);
+        crate::diag::dvd_audio_route(ts.vts_number, title, i, a, ctl, Some(pid));
         if let Some((_, first)) = kept.iter().find(|(p, _)| *p == pid) {
-            let sub = (pid & 0xFF) as u8;
-            crate::diag::dvd_ctl_duplicate("ast", ts.vts_number, title, sub, first, &a.language);
+            crate::diag::dvd_ctl_duplicate("ast", ts.vts_number, title, pid, first, &a.language);
             continue;
         }
         kept.push((pid, &a.language));
@@ -633,7 +634,7 @@ mod tests {
         assert_eq!(tracks, vec![(0xBD82, "fra".to_string())]);
         assert!(
             diag.iter().any(|m| m.contains("tag=dvd.astctl")
-                && m.contains("sub_id=0x82 kept=\"fra\" dropped=\"deu\"")),
+                && m.contains("id=0xBD82 kept=\"fra\" dropped=\"deu\"")),
             "{diag:?}"
         );
     }
@@ -657,14 +658,39 @@ mod tests {
         );
     }
 
-    /// MPEG audio has no private_stream_1 sub-id: AST_CTL still gates presence, and the
-    /// PID keeps its 0xBD00 + logical-index fallback.
+    /// MPEG audio rides its own PES id 0xC0|n (HandBrake/VLC), with n from AST_CTL like
+    /// every other codec; the PID is that stream id.
     #[test]
-    fn scan_dvd_titles_mp2_audio_honours_ast_presence() {
+    fn scan_dvd_titles_mp2_audio_routes_by_ast_to_pes_id() {
         let audio = [aud(MP2_2CH, b"en"), aud(MP2_2CH, b"fr")];
         let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
-        set_ast(&mut vts, &[0x0000, 0x8000]);
-        assert_eq!(scan_audio(vts).0, vec![(0xBD01, "fra".to_string())]);
+        set_ast(&mut vts, &[0x0000, 0x8300]);
+        assert_eq!(scan_audio(vts).0, vec![(0x00C3, "fra".to_string())]);
+    }
+
+    /// An unknown coding mode has no route: a unique placeholder PID 0xBD00 + i, never
+    /// colliding with a sibling.
+    #[test]
+    fn scan_dvd_titles_unknown_audio_codec_gets_distinct_placeholder() {
+        let unknown = (0x20u8, 0x01u8); // coding_mode 1: reserved
+        let audio = [aud(unknown, b"en"), aud(unknown, b"fr")];
+        let vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        let pids: Vec<u16> = scan_audio(vts).0.iter().map(|t| t.0).collect();
+        assert_eq!(pids, vec![0xBD00, 0xBD01]);
+    }
+
+    /// Per-title diag line with the ROUTED id, not the VTS-level positional one.
+    #[test]
+    fn scan_dvd_titles_logs_routed_audio_id_per_title() {
+        let mut vts = build_vts(0, 0x00, &[aud(AC3_6CH, b"en")], &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x8100]);
+        let diag = scan_audio(vts).1;
+        assert!(
+            diag.iter().any(|m| m.contains("tag=dvd.aroute")
+                && m.contains("title=1 idx=0")
+                && m.contains("ast=0x8100 pid=0xBD81")),
+            "{diag:?}"
+        );
     }
 
     // Overwrites build_vts's PGC_SPST_CTL (PGC+0x1C, 32 x u32 BE).
@@ -745,7 +771,7 @@ mod tests {
         assert_eq!(subs, vec![(0x21, "spa".to_string())]);
         assert!(
             diag_lines(&ev).iter().any(|m| m.contains("tag=dvd.spstctl")
-                && m.contains("sub_id=0x21 kept=\"spa\" dropped=\"ita\"")),
+                && m.contains("id=0x21 kept=\"spa\" dropped=\"ita\"")),
             "{:?}",
             diag_lines(&ev)
         );
@@ -1726,14 +1752,12 @@ mod tests {
         assert!((t.chapters[0].time_secs - 0.0).abs() < 0.01);
     }
 
-    // MP1/MP2 audio (no sub-stream id) falls back to PID 0xBD00 + i; two such streams must land
-    // on distinct 0xBD00/0xBD01, pinning the `+` not `-`/`*`.
+    // Positional MP2 routes to PES ids 0xC0|i (not the old never-fed 0xBD00 + i).
     #[test]
-    fn scan_dvd_titles_mp2_audio_pid_fallback_is_additive() {
+    fn scan_dvd_titles_mp2_audio_routes_to_pes_ids() {
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(1, 1, 1)]);
-        // coding_mode bits are b0>>5 & 0x7; mode 2 = MPEG-1 Layer II (Mp2),
-        // which `assign_audio_sub_stream_ids` leaves at `sub_stream_id: None`.
+        // coding_mode bits are b0>>5 & 0x7; mode 2 = MPEG-1 Layer II (Mp2).
         // b0 = 0b010_00000 = 0x40. b1 = 0 (mono, sample rate 48k).
         let audio = [(0x40u8, 0x00u8, [0u8, 0u8]), (0x40u8, 0x00u8, [0u8, 0u8])];
         let vts = build_vts(1000, 0x00, &audio, &[], &[(10, 109)], false);
@@ -1766,6 +1790,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(audio_pids, vec![0xBD00u16, 0xBD01u16]);
+        assert_eq!(audio_pids, vec![0x00C0u16, 0x00C1u16]);
     }
 }

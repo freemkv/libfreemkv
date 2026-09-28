@@ -200,15 +200,6 @@ pub struct DvdAudioAttr {
     pub channels: u8,
     pub sample_rate: u32,
     pub language: String,
-    /// The PES `private_stream_1` sub-stream id this audio stream carries
-    /// on the wire (AC-3: `0x80..=0x87`, DTS: `0x88..=0x8F`, LPCM:
-    /// `0xA0..=0xA7`) when it is physical stream = its position: the fallback for a PGC
-    /// whose AST_CTL marks nothing present (titles otherwise route by AST_CTL).
-    /// `None` for codecs carried as a regular MPEG-audio PES (MP1/MP2,
-    /// stream_id `0xC0..`) which don't use a private-stream-1 sub-id.
-    /// This is the single routing key shared with the muxer's `dvd_pid()`
-    /// so the two never disagree on a mixed-codec title.
-    pub sub_stream_id: Option<u8>,
 }
 
 /// The on-wire VobSub sub-stream id (0x20..=0x3F) of one PGC_SPST_CTL entry, or `None` when
@@ -574,8 +565,6 @@ fn parse_vts(
         }
         audio_streams.push(parse_audio_attr(&vts_data, aoff)?);
     }
-    // Positional fallback ids; each title re-routes by its own PGC AST_CTL.
-    assign_audio_sub_stream_ids(&mut audio_streams);
 
     // Subtitle streams: count at 0x254 (u16 BE), then 6 bytes each starting at 0x256
     let num_subs = if vts_data.len() >= 0x256 {
@@ -697,17 +686,7 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
         channels,
         sample_rate,
         language,
-        // Assigned by `assign_audio_sub_stream_ids` once all streams are known.
-        sub_stream_id: None,
     })
-}
-
-// Assigns each audio stream the sub-stream id of physical stream number = its position
-// (saturated at 7): the fallback when a PGC's AST_CTL marks nothing present.
-fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
-    for (i, s) in streams.iter_mut().enumerate() {
-        s.sub_stream_id = audio_sub_stream_id(s.codec, (i as u8).min(7));
-    }
 }
 
 /// The on-wire `private_stream_1` sub-stream id of physical audio stream `n` (0..=7):
@@ -718,6 +697,15 @@ pub(crate) fn audio_sub_stream_id(codec: Codec, n: u8) -> Option<u8> {
         Codec::Dts => Some(0x88 | n),
         Codec::Lpcm => Some(0xA0 | n),
         _ => None,
+    }
+}
+
+/// The routing PID of physical audio stream `n` (0..=7), shared with the demuxer's
+/// `dvd_pid()`: `0xBD00 | sub-id` on `private_stream_1`, or MPEG audio's own PES id `0xC0|n`.
+pub(crate) fn audio_pid(codec: Codec, n: u8) -> Option<u16> {
+    match codec {
+        Codec::Mp2 => crate::mux::ps::dvd_mpeg_audio_pid(0xC0 | n),
+        _ => audio_sub_stream_id(codec, n).and_then(crate::mux::ps::dvd_audio_pid),
     }
 }
 
@@ -1225,7 +1213,6 @@ mod tests {
             channels: 6,
             sample_rate: 48000,
             language: "en".to_string(),
-            sub_stream_id: Some(0x80),
         };
         assert_eq!(audio.channels, 6);
 
@@ -1442,84 +1429,31 @@ mod tests {
         assert_eq!(attr.language, "eng");
     }
 
+    // Positional fallback: codec base | position, the wire ids the demux routes on.
     #[test]
-    fn mixed_codec_sub_stream_ids_are_distinct() {
-        // A title mixing AC-3, DTS and LPCM: sub-id low nibble is the positional
-        // audio-stream number OR'd with the codec base (idx 1 DTS → 0x89, idx 3
-        // AC-3 → 0x83) — the real wire ids the demux routes on, all distinct.
-        let mut streams = vec![
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Dts,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Lpcm,
-                channels: 2,
-                sample_rate: 48000,
-                language: "fr".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 2,
-                sample_rate: 48000,
-                language: "es".into(),
-                sub_stream_id: None,
-            },
-        ];
-        assign_audio_sub_stream_ids(&mut streams);
-        assert_eq!(streams[0].sub_stream_id, Some(0x80)); // AC-3 @ pos 0
-        assert_eq!(streams[1].sub_stream_id, Some(0x89)); // DTS  @ pos 1
-        assert_eq!(streams[2].sub_stream_id, Some(0xA2)); // LPCM @ pos 2
-        assert_eq!(streams[3].sub_stream_id, Some(0x83)); // AC-3 @ pos 3
-        // All sub-ids unique.
-        let ids: Vec<u8> = streams.iter().filter_map(|s| s.sub_stream_id).collect();
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(ids.len(), sorted.len(), "sub-stream ids must be unique");
+    fn mixed_codec_positional_pids_are_distinct() {
+        let codecs = [Codec::Ac3, Codec::Dts, Codec::Lpcm, Codec::Ac3, Codec::Mp2];
+        let pids: Vec<Option<u16>> = (0u8..).zip(codecs).map(|(n, c)| audio_pid(c, n)).collect();
+        assert_eq!(
+            pids,
+            [0xBD80, 0xBD89, 0xBDA2, 0xBD83, 0x00C4].map(Some).to_vec()
+        );
     }
 
-    // Regression (The Punisher 2004): audio[0]=AC-3, audio[1]=DTS. DTS at position 1 must get
-    // wire sub-id 0x89 (0x88|1), not the old per-codec 0x88 (which broke demux routing and
-    // muxed it silent).
+    // Regression (The Punisher 2004): DTS at physical stream 1 is sub-id 0x89 (0x88|1), not
+    // the old per-codec 0x88, which broke demux routing and muxed it silent.
     #[test]
-    fn dts_after_ac3_uses_positional_substream_id() {
-        let mut streams = vec![
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Dts,
-                channels: 5,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-        ];
-        assign_audio_sub_stream_ids(&mut streams);
-        assert_eq!(streams[0].sub_stream_id, Some(0x80));
-        assert_eq!(
-            streams[1].sub_stream_id,
-            Some(0x89),
-            "DTS at audio position 1 routes to 0x89 on the wire, not 0x88"
-        );
-        // The routing key the muxer actually uses must resolve for 0x89.
-        assert_eq!(crate::mux::ps::dvd_audio_pid(0x89), Some(0xBD89));
+    fn dts_after_ac3_uses_physical_stream_number() {
+        assert_eq!(audio_pid(Codec::Dts, 1), Some(0xBD89));
+    }
+
+    // MPEG audio is its own PES id 0xC0|n, not a private_stream_1 sub-id; unknown codecs
+    // have no route.
+    #[test]
+    fn mp2_audio_routes_to_its_pes_stream_id() {
+        assert_eq!(audio_pid(Codec::Mp2, 0), Some(0x00C0));
+        assert_eq!(audio_pid(Codec::Mp2, 7), Some(0x00C7));
+        assert_eq!(audio_pid(Codec::Unknown(1), 0), None);
     }
 
     #[test]
@@ -1710,59 +1644,6 @@ mod tests {
         let zero = vec![0u8; 6];
         let attr2 = parse_subtitle_attr(&zero, 0).unwrap();
         assert_eq!(attr2.language, "und");
-    }
-
-    /// assign_audio_sub_stream_ids: MP1/MP2 and other non-private-stream-1
-    /// codecs must get `None` (regular MPEG-audio PES, not a sub-id).
-    /// Source maps only AC3/DTS/LPCM to Some(_).
-    #[test]
-    fn mp2_audio_gets_no_sub_stream_id() {
-        let mut streams = vec![
-            DvdAudioAttr {
-                codec: Codec::Mp2,
-                channels: 2,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-        ];
-        assign_audio_sub_stream_ids(&mut streams);
-        assert_eq!(streams[0].sub_stream_id, None); // MP2 → no sub-id
-        assert_eq!(streams[1].sub_stream_id, Some(0x81)); // AC3 @ pos 1
-    }
-
-    /// assign_audio_sub_stream_ids saturates the positional index at the
-    /// range ceiling (min(7)) so a malformed over-count never produces an
-    /// out-of-range sub-id. 9 AC-3 streams: the 9th still ≤ 0x87.
-    #[test]
-    fn audio_sub_stream_id_saturates_at_ceiling() {
-        let mut streams: Vec<DvdAudioAttr> = (0..9)
-            .map(|_| DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 2,
-                sample_rate: 48000,
-                language: String::new(),
-                sub_stream_id: None,
-            })
-            .collect();
-        assign_audio_sub_stream_ids(&mut streams);
-        for s in &streams {
-            let id = s.sub_stream_id.unwrap();
-            assert!(
-                (0x80..=0x87).contains(&id),
-                "AC-3 sub-id out of range: {id:#x}"
-            );
-        }
-        // 8th and 9th both saturate at 0x87.
-        assert_eq!(streams[7].sub_stream_id, Some(0x87));
-        assert_eq!(streams[8].sub_stream_id, Some(0x87));
     }
 
     /// parse_pgc requires `pgc_offset + 0xEA <= data.len()` (needs the cell

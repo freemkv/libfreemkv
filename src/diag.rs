@@ -178,13 +178,12 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
     for (i, a) in ts.audio_streams.iter().enumerate() {
         tracing::debug!(
             target: DIAG,
-            "tag=dvd.aattr vts={} idx={i} codec={:?} ch={} sr={}Hz lang={:?} sub_id={:?}",
+            "tag=dvd.aattr vts={} idx={i} codec={:?} ch={} sr={}Hz lang={:?}",
             ts.vts_number,
             a.codec,
             a.channels,
             a.sample_rate,
             a.language,
-            a.sub_stream_id.map(|x| format!("0x{x:02X}")),
         );
     }
     for (i, s) in ts.subtitle_streams.iter().enumerate() {
@@ -206,11 +205,31 @@ pub fn dvd_ctl_none_present(kind: &str, vts: u8, title: u16, declared: usize, ou
     );
 }
 
-/// A logical stream dropped because an earlier one already routes to the same physical id.
-pub fn dvd_ctl_duplicate(kind: &str, vts: u8, title: u16, sub_id: u8, kept: &str, dropped: &str) {
+/// A logical stream dropped because an earlier one already routes to the same physical id
+/// (`id`: the VobSub sub-id, or the audio routing PID).
+pub fn dvd_ctl_duplicate(kind: &str, vts: u8, title: u16, id: u16, kept: &str, dropped: &str) {
     tracing::debug!(
         target: DIAG,
-        "tag=dvd.{kind}ctl vts={vts} title={title} sub_id=0x{sub_id:02X} kept={kept:?} dropped={dropped:?} (duplicate physical id)",
+        "tag=dvd.{kind}ctl vts={vts} title={title} id=0x{id:02X} kept={kept:?} dropped={dropped:?} (duplicate physical id)",
+    );
+}
+
+/// Where one title routes a declared audio stream: its raw AST_CTL entry and the PID it
+/// muxes from, or `absent` when the PGC does not play it.
+pub fn dvd_audio_route(
+    vts: u8,
+    title: u16,
+    idx: usize,
+    a: &crate::ifo::DvdAudioAttr,
+    ctl: u16,
+    pid: Option<u16>,
+) {
+    let route = pid.map_or("absent".to_string(), |p| format!("pid=0x{p:04X}"));
+    tracing::debug!(
+        target: DIAG,
+        "tag=dvd.aroute vts={vts} title={title} idx={idx} codec={:?} lang={:?} ast=0x{ctl:04X} {route}",
+        a.codec,
+        a.language,
     );
 }
 

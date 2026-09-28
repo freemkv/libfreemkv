@@ -70,6 +70,16 @@ pub fn dvd_audio_pid(sub_stream_id: u8) -> Option<u16> {
     }
 }
 
+/// Canonical PID for a DVD MPEG-audio stream, keyed by its PES `stream_id` (`0xC0|n`, DVD's
+/// eight audio streams): the stream id itself, disjoint from `0xBD00..` (which already holds
+/// HD-DVD E-AC-3 sub-ids `0xC0..`), VobSub `0x20..` and video `0xE0`.
+pub fn dvd_mpeg_audio_pid(stream_id: u8) -> Option<u16> {
+    match stream_id {
+        0xC0..=0xC7 => Some(stream_id as u16),
+        _ => None,
+    }
+}
+
 /// Canonical PID for a VobSub subtitle stream identified by its on-wire
 /// sub-stream id (`0x20..=0x3F`). The PID is the sub-id itself (identity),
 /// which never overlaps the `0xBD..` audio PID space.
@@ -97,7 +107,7 @@ impl PsPacket {
     /// looked up in the title's `pid_to_track` map.
     ///
     /// Routes by the REAL on-wire `(stream_id, sub_stream_id)` via the
-    /// shared [`dvd_audio_pid`] / [`dvd_subtitle_pid`] tables the scanner
+    /// shared [`dvd_audio_pid`] / [`dvd_mpeg_audio_pid`] / [`dvd_subtitle_pid`] tables the scanner
     /// also uses.
     ///
     /// Returns `None` for combinations the DVD title scanner does not assign a PID to; the
@@ -105,6 +115,7 @@ impl PsPacket {
     pub fn dvd_pid(&self) -> Option<u16> {
         match self.stream_id {
             crate::consts::pes_stream_id::VIDEO..=0xEF => Some(DVD_VIDEO_PID),
+            0xC0..=0xDF => dvd_mpeg_audio_pid(self.stream_id),
             PRIVATE_STREAM_1 => {
                 let sub = self.sub_stream_id?;
                 dvd_audio_pid(sub).or_else(|| dvd_subtitle_pid(sub))
@@ -1074,8 +1085,12 @@ mod tests {
         // VobSub subtitle 0x20/0x21 → 0x20 / 0x21 (identity).
         assert_eq!(mk(0xBD, Some(0x20)).dvd_pid(), Some(0x20));
         assert_eq!(mk(0xBD, Some(0x21)).dvd_pid(), Some(0x21));
-        // Unmappable: MPEG audio, private stream 2, bogus sub-id.
-        assert_eq!(mk(0xC0, None).dvd_pid(), None);
+        // MPEG audio stream n (PES id 0xC0|n) → PID = its stream id, DVD's 8 streams only.
+        assert_eq!(mk(0xC0, None).dvd_pid(), Some(0xC0));
+        assert_eq!(mk(0xC7, None).dvd_pid(), Some(0xC7));
+        assert_eq!(mk(0xC8, None).dvd_pid(), None);
+        assert_eq!(mk(0xD0, None).dvd_pid(), None); // MPEG-2 extension, not a track
+        // Unmappable: private stream 2, bogus sub-id.
         assert_eq!(mk(0xBF, None).dvd_pid(), None);
         assert_eq!(mk(0xBD, Some(0x10)).dvd_pid(), None);
     }
@@ -1329,8 +1344,8 @@ mod tests {
     #[test]
     fn only_private_stream_2_is_navigation_and_never_a_routable_stream() {
         // Demux a program stream carrying, in order: a navigation pack, MPEG-2
-        // video, an AC-3 audio substream, and an MPEG audio stream (unmappable on
-        // DVD, but NOT navigation).
+        // video, an AC-3 audio substream, and an MPEG audio stream (a track, NOT
+        // navigation).
         let mut demuxer = PsDemuxer::new();
         let mut data = Vec::new();
         // private_stream_2: no PES extension, payload follows the 6-byte prefix.
@@ -1374,11 +1389,10 @@ mod tests {
                 );
             }
         }
-        // The MPEG-audio packet is equally unroutable on DVD, yet must NOT be
-        // absorbed into the nav tally — that is the distinction being drawn.
+        // The MPEG-audio packet is a real track: it routes, and is never navigation.
         let mpa = packets.iter().find(|p| p.stream_id == 0xC0).unwrap();
-        assert_eq!(mpa.dvd_pid(), None, "MPEG audio is unmappable on DVD");
-        assert!(!mpa.is_nav(), "...but it is a lost stream, not navigation");
+        assert_eq!(mpa.dvd_pid(), Some(0xC0), "MPEG audio routes by its PES id");
+        assert!(!mpa.is_nav());
     }
 
     #[test]
