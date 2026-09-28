@@ -279,6 +279,21 @@ impl<W: Write> Mux<W> {
         self.entries.retain(|e| !(e.complete && e.dec27 <= t));
     }
 
+    // Distance from the chunk start to the first byte of queue item `k` (k ≥ 1).
+    fn first_byte(s: &Stream, k: usize) -> Option<usize> {
+        let head = s.queue.front()?;
+        s.queue.get(k)?;
+        (k >= 1).then(|| {
+            head.au.data.len() - head.sent
+                + s.queue
+                    .iter()
+                    .skip(1)
+                    .take(k - 1)
+                    .map(|q| q.au.data.len())
+                    .sum::<usize>()
+        })
+    }
+
     // Distance from the chunk start to the commencement byte of queue item `k`.
     fn commencement(s: &Stream, k: usize) -> Option<usize> {
         let head = s.queue.front()?;
@@ -340,8 +355,9 @@ impl<W: Write> Mux<W> {
                 && lead_ok
                 && dist < cap
             {
-                // At most one AU commences per PES: stop before the next one.
-                let until_next = Self::commencement(s, k + 1).unwrap_or(usize::MAX);
+                // At most one AU commences per PES, and it begins in the PES that carries
+                // its PTS: stop before the next AU's first byte.
+                let until_next = Self::first_byte(s, k + 1).unwrap_or(usize::MAX);
                 let mut len = cap.min(until_next).min(room);
                 if whole && k == 0 && head.sent == 0 {
                     // MPG4-7: one extension frame, one whole PES (when a pack can hold it).
@@ -365,8 +381,8 @@ impl<W: Write> Mux<W> {
         if head.sent > 0 {
             let cap = avail.checked_sub(9 + pstd + hdr)?;
             let mut len = cap.min(head.au.data.len() - head.sent).min(room);
-            if let Some((_, dist)) = Self::next_commencement(s) {
-                len = len.min(dist);
+            if let Some(next) = Self::first_byte(s, 1) {
+                len = len.min(next);
             }
             len = round_down(len, unit(head).max(1));
             if len > 0 {
@@ -662,4 +678,53 @@ pub(super) fn lpcm_unit_for_test(channels: usize, bits: u8) -> usize {
 
 fn round_down(n: usize, unit: usize) -> usize {
     n - n % unit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn video_mux() -> Mux<Vec<u8>> {
+        let spec = StreamSpec {
+            stream_id: 0xE0,
+            payload: Payload::Plain,
+            buffer: 0,
+            sparse: false,
+            av: true,
+        };
+        let buf = BufferSpec {
+            stream_id: 0xE0,
+            scale_1024: true,
+            size: 232,
+        };
+        Mux::new(Vec::new(), vec![spec], vec![buf], Vec::new(), 25_200)
+    }
+
+    fn au(pts: u64, len: usize, mark: usize) -> Au {
+        Au {
+            pts,
+            dts: None,
+            mark,
+            data: vec![0x55; len],
+            lpcm_bits: 0,
+        }
+    }
+
+    // An AU's first byte and its commencement byte share one PES: a PES ends before the next
+    // AU's first byte, never between its sequence header and its picture start code (MS-15).
+    #[test]
+    fn a_pes_never_splits_an_au_from_its_picture_start() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 100, 0));
+        m.push(0, au(12_600, 1_000, 20));
+        let p = m.plan_pes(0, 200, 0).unwrap();
+        assert_eq!(p.start.map(|s| s.0), Some(0));
+        assert_eq!(
+            p.len, 100,
+            "stops at the next AU's first byte, not its picture start"
+        );
+        m.streams[0].queue[0].sent = 90;
+        let tail = m.plan_pes(0, 30, 0).unwrap();
+        assert_eq!((tail.len, tail.start.map(|s| s.0)), (10, None));
+    }
 }

@@ -349,6 +349,14 @@ pub(super) fn replay(p: &Parsed, aus: &Aus) -> Result<Found, String> {
                     pts_pes[a]
                 ));
             }
+            // The AU's first byte (a sequence header ahead of the picture) shares that PES, as
+            // a DVD encoder writes it and PS readers expect.
+            if locate(j).0 != cpi {
+                return Err(format!(
+                    "{key:?} AU {a}: first byte in PES {} but PTS in PES {cpi}",
+                    locate(j).0
+                ));
+            }
             let dec = i128::from(x.dts.or(x.pts).unwrap()) * 300;
             let (fpi, first_off) = locate(j);
             let (lpi, last_off) = locate(j + size - 1);
