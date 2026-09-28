@@ -14,6 +14,8 @@
 
 mod arrival;
 mod fmts;
+#[cfg(doctest)]
+mod public_api_cannot_decrypt_aacs;
 mod resolve;
 #[cfg(test)]
 mod tests;
