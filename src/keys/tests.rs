@@ -2251,3 +2251,70 @@ fn a_stop_seen_before_the_retry_keeps_the_asked_step() {
         "the request that went out"
     );
 }
+
+// ── KU-E1b: the run's first source failure ─────────────────────────────────
+
+/// Review KU-E1b item 4: with two sample-dependent sources, A fails (dead) on piece 1 and B
+/// keys it; piece 2 then skips A and B holds no key for it. The refusal is A's failure
+/// (E7028), never E7022 (which the engine could turn into E7034).
+#[test]
+fn a_dead_sources_failure_outlives_its_piece() {
+    let fx = two_units();
+    let calls = Calls::default();
+    let mut a = Spec::online(&[K1, K2], &calls);
+    a.who = "a";
+    a.fails = Some(|| Error::KeyServiceUnavailable);
+    let mut b = Spec::online(&[K1], &calls);
+    b.who = "b";
+    let r = resolve(&fx, KeyScope::Titles(vec![0, 1]), &[a, b]);
+    assert_eq!(code(r), E7028);
+    assert_eq!(calls.of("a").len(), 1, "a is dead after its failure");
+}
+
+/// Item 4, the FMTS anchor: a source that failed on the base content and went dead is
+/// skipped at the anchor; the anchor's "no key" is that failure (E7028), not E7026.
+#[test]
+fn a_dead_sources_failure_outlives_it_at_the_fmts_anchor() {
+    let fx = fmts_fixture();
+    let calls = Calls::default();
+    let mut a = Spec::online(&[K2], &calls);
+    a.who = "a";
+    a.fails = Some(|| Error::KeyServiceUnavailable);
+    let mut b = Spec::online(&[K2], &calls);
+    b.who = "b";
+    let r = resolve(
+        &fx,
+        KeyScope::Titles(vec![0, 1, 2]),
+        &[Spec::keydb(&[K1], &calls), a, b],
+    );
+    assert_eq!(code(r), E7028);
+}
+
+/// Item 5: a source that itself returns `Halted` (ST-K1b wires the rip's Stop into the
+/// query) still leaves the request's trace step.
+#[test]
+fn a_source_halted_mid_request_keeps_the_asked_step() {
+    let fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
+    let calls = Calls::default();
+    let mut stopped = Spec::online(&[K1], &calls);
+    stopped.fails = Some(|| Error::Halted);
+    let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
+    let opts = ResolveKeysOptions {
+        trace: Some(&out),
+        ..Default::default()
+    };
+    let r = resolve_with(
+        &fx,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0]),
+        &[stopped],
+        opts,
+        &FakeClock::default(),
+    );
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    assert_eq!(
+        out.lock().unwrap().keys.len(),
+        1,
+        "the request that went out"
+    );
+}
