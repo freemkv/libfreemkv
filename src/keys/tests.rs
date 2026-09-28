@@ -531,8 +531,9 @@ fn single_declared_unit_wrong_key_refuses_e7013() {
     assert_eq!(code(r), E7013);
 }
 
-/// LK4. KS-14: with one declared CPS unit, a key proven on one piece keys every Lazy piece
-/// (KU §2.3 step 10).
+/// LK4 (J22). KS-14: with one declared CPS unit, a key proven on one piece keys a Lazy
+/// piece only when it opens every read probe of it. A piece with no readable probe stays
+/// Lazy with that key as its candidate ("never guessed") and is proven on first read.
 #[test]
 fn single_declared_unit_keys_lazy_pieces() {
     let fx = fixture(
@@ -553,11 +554,20 @@ fn single_declared_unit_keys_lazy_pieces() {
         &FakeClock::default(),
     )
     .unwrap();
-    assert!(set.lazy().is_empty(), "B is keyed by the one proven key");
-    assert_eq!(set.status().keyed, 2);
+    assert_eq!(
+        set.lazy(),
+        &[(b, b + n)],
+        "no probe of B read: Lazy, never keyed blind"
+    );
+    assert_eq!(set.status().keyed, 1);
     src.heal();
     let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Proven(0)),
+        "K1 first, proven on read"
+    );
 }
 
 /// LK5 (K-1). KS-14, KS-10: the count of held keys never decides coverage. Two declared,
@@ -1798,4 +1808,38 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
         assert_eq!(crate::error_code(&err), Some(E7022), "skip={skip}: {err}");
         assert_eq!(*recovery.lock().unwrap(), 0, "skip={skip}");
     }
+}
+
+/// J22 (review r3). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number
+/// of CPS Units on the disc". A piece whose every probe faulted has no evidence: with one
+/// declared unit it stays Lazy (the proven key its candidate), so a readable unit under a
+/// key no source holds stops with E7022, never decrypted under the proven key.
+#[test]
+fn single_unit_rule_never_keys_a_piece_with_no_readable_probe() {
+    let fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 3, Some(K2))],
+        1,
+        &[&[0, 1]],
+    );
+    let (b, n) = fx.file(1);
+    let src = fx.source();
+    src.kill(b, b + n);
+    let calls = Calls::default();
+    let set = resolve_with(
+        &fx,
+        &mut src.clone(),
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1], &calls)],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    )
+    .unwrap();
+    assert_eq!((set.status().keyed, set.lazy()), (1, &[(b, b + n)][..]));
+    src.heal();
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 0, 3)),
+        E7022,
+        "never K1 over K2's ciphertext"
+    );
 }
