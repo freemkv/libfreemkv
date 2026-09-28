@@ -70,3 +70,6 @@ src/mux/mpg/mod.rs	first_pack_prefix	MS-13
 src/mux/mpg/mod.rs	first_pack_prefix	MS-22
 src/mux/mpg/mod.rs	first_pack_prefix	MS-23
 src/mux/codec/lpcm.rs	dvd_header	MS-30
+src/mux/mpg/scan.rs	parse_map	MS-8
+src/mux/mpg/scan.rs	parse_map	MS-9
+src/mux/mpg/scan.rs	scan_streams	MS-23

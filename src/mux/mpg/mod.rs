@@ -12,6 +12,7 @@ pub(crate) mod pack;
 mod pstd;
 #[cfg(test)]
 mod replay;
+pub(crate) mod scan;
 #[cfg(test)]
 mod tests;
 

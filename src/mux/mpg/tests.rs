@@ -42,8 +42,9 @@ fn seq_header(w: u16, h: u16, frc: u8, vbv: u16, low_delay: bool) -> Vec<u8> {
     v
 }
 
+// group_of_pictures_header: time code 0 (marker set), closed_gop 1 (no leading B pictures).
 fn gop_header() -> Vec<u8> {
-    vec![0, 0, 1, 0xB8, 0x00, 0x08, 0x00, 0x00]
+    vec![0, 0, 1, 0xB8, 0x00, 0x08, 0x00, 0x40]
 }
 
 #[derive(Clone)]
@@ -194,7 +195,11 @@ fn fixture(o: &Opts) -> Fx {
                 data.extend(gop_header());
             }
             let mark = data.len();
-            data.extend(test_es::mpeg2_pic(coding, 3));
+            let mut pic = test_es::mpeg2_pic(coding, 3);
+            // temporal_reference (10 bits): the picture's display index in its GOP (13818-2).
+            pic[4] = (d >> 2) as u8;
+            pic[5] = ((d as u8 & 3) << 6) | (coding << 3);
+            data.extend(pic);
             let size = match coding {
                 1 => o.i_size,
                 2 => 15_000,
@@ -219,7 +224,8 @@ fn fixture(o: &Opts) -> Fx {
     // MPEG-1 Layer II, 24 ms, and its 13818-3 extension frame with the same PTS (MS-20).
     let mut t = a0;
     while t < end {
-        let mut f = vec![0xFF, 0xFD, 0x94, 0x00];
+        // MPEG-1 Layer II, 256 kbit/s, 48 kHz, stereo, no CRC: 144·256000/48000 = 768 B.
+        let mut f = vec![0xFF, 0xFD, 0xC4, 0x00];
         f.resize(768, 0x33);
         add(&mut ev, t, 1, t, true, f, Some(((0xC0, None), 0)));
         let mut x = vec![0x7F, 0xF0, 0x12, 0x34];
@@ -230,16 +236,26 @@ fn fixture(o: &Opts) -> Fx {
     // AC-3 32 ms / 1792 B; DTS 512 samples / 2012 B.
     let mut k = 0i64;
     while a0 + k * 32 * MS < end {
-        let mut f = vec![0x0B, 0x77];
+        // A decodable AC-3 syncframe: 48 kHz, frmsizecod 30 (448 kbit/s, 1792 B), bsid 8, CRC.
+        let mut f = vec![0x0B, 0x77, 0, 0, 0x1E, 0x40];
         f.resize(1_792, 0x66);
+        let c = crate::mux::codec::crc::crc16_ansi(&f[2..1_790]);
+        f[1_790..].copy_from_slice(&c.to_be_bytes());
         let t = a0 + k * 32 * MS;
         add(&mut ev, t, 3, t, true, f, Some(((0xBD, Some(0x80)), 0)));
         k += 1;
     }
     let mut k = 0i64;
     while a0 + k * 512 * 1_000_000_000 / 48_000 < end {
-        let mut f = vec![0x7F, 0xFE, 0x80, 0x01];
-        f.resize(2_012, 0x77);
+        // A DTS core frame: normal, 512 samples (NBLKS 15), 48 kHz, FSIZE 2011.
+        let mut f = vec![0u8; 2_012];
+        f[..4].copy_from_slice(&[0x7F, 0xFE, 0x80, 0x01]);
+        let fsize = 2_011usize;
+        f[4] = 0x80 | (31 << 2);
+        f[5] = (15 << 2) | ((fsize >> 12) & 3) as u8;
+        f[6] = (fsize >> 4) as u8;
+        f[7] = ((fsize & 0x0F) << 4) as u8;
+        f[8] = 13 << 2;
         let t = a0 + k * 512 * 1_000_000_000 / 48_000;
         add(&mut ev, t, 4, t, true, f, Some(((0xBD, Some(0x88)), 0)));
         k += 1;
@@ -869,17 +885,10 @@ fn a_sequence_header_from_codec_private_is_restored() {
 }
 
 #[test]
-fn mpg_urls_parse_and_input_waits_for_l3() {
+fn mpg_urls_parse() {
     let u = crate::mux::resolve::parse_url("mpg:///out/x.mpg");
     assert_eq!(u.scheme(), "mpg");
     assert_eq!(u.path_str(), "/out/x.mpg");
-    let e = crate::mux::resolve::input("mpg:///out/x.mpg", &Default::default())
-        .err()
-        .unwrap();
-    assert_eq!(
-        crate::error::error_code(&e),
-        Some(crate::error::E_STREAM_WRITE_ONLY)
-    );
 }
 
 #[test]
@@ -1214,4 +1223,420 @@ fn the_replayer_rejects_tampered_streams() {
     let mut out = r.out.clone();
     out[at + 9 + 4] &= !0x01;
     assert!(replay::parse(&out).unwrap_err().contains("marker"));
+}
+
+// ── L3: `mpg://` as a source (design §4) ────────────────────────────────────────────
+
+fn temp_path(tag: &str) -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("fmkv-mpg-{tag}-{}-{n}.mpg", std::process::id()))
+}
+
+fn read_all(path: &std::path::Path) -> std::io::Result<(DiscTitle, Vec<PesFrame>)> {
+    // The sector pipeline spawns a prefetcher (a Drive holder).
+    let _g = crate::sector::prefetched::holder_test_lock();
+    let url = format!("mpg://{}", path.display());
+    let mut input = crate::mux::resolve::input(&url, &Default::default())?;
+    let mut frames = Vec::new();
+    while let Some(f) = input.read()? {
+        frames.push(f);
+    }
+    Ok((input.info().clone(), frames))
+}
+
+fn by_track(frames: &[PesFrame]) -> BTreeMap<usize, Vec<&PesFrame>> {
+    let mut m: BTreeMap<usize, Vec<&PesFrame>> = BTreeMap::new();
+    for f in frames {
+        m.entry(f.track).or_default().push(f);
+    }
+    m
+}
+
+fn tracks_match(
+    fx_frames: &BTreeMap<usize, Vec<(i64, Vec<u8>)>>,
+    got: &[PesFrame],
+    lpcm: &[usize],
+) {
+    let got = by_track(got);
+    let mut offset = None;
+    for (t, want) in fx_frames {
+        let g = got
+            .get(t)
+            .unwrap_or_else(|| panic!("track {t} read nothing"));
+        if lpcm.contains(t) {
+            let a: Vec<u8> = g.iter().flat_map(|f| f.data.iter().copied()).collect();
+            let b: Vec<u8> = want.iter().flat_map(|f| f.1.iter().copied()).collect();
+            assert_eq!(a, b, "LPCM track {t}");
+            continue;
+        }
+        let mut w: Vec<&(i64, Vec<u8>)> = want.iter().collect();
+        let mut g: Vec<&&PesFrame> = g.iter().collect();
+        w.sort_by_key(|f| f.0);
+        g.sort_by_key(|f| f.pts);
+        assert_eq!(g.len(), w.len(), "track {t} frame count");
+        for (a, b) in g.iter().zip(&w) {
+            assert_eq!(a.data, b.1, "track {t} frame bytes");
+            let d = ns_to_ticks(a.pts) - ns_to_ticks(b.0);
+            assert_eq!(
+                *offset.get_or_insert(d),
+                d,
+                "track {t}: one constant tick offset (J16)"
+            );
+        }
+    }
+}
+
+// Design §4 steps 2-3 and §7 round trips: our own program stream reads back, stream for
+// stream, with the metadata the map carries (ISO 639, the extension, FMKV languages,
+// forced flag and palette) and every frame's bytes and PTS (modulo one tick offset).
+#[test]
+fn an_mpg_file_reads_back_through_the_ps_pipeline() {
+    let fx = fixture(&Opts::default());
+    let r = run(&fx);
+    let path = temp_path("rt");
+    std::fs::write(&path, &r.out).unwrap();
+    let (title, frames) = read_all(&path).unwrap();
+    let kinds: Vec<(u16, Codec, String)> = title
+        .streams
+        .iter()
+        .map(|s| match s {
+            DiscStream::Video(v) => (v.pid, v.codec, String::new()),
+            DiscStream::Audio(a) => (a.pid, a.codec, a.language.clone()),
+            DiscStream::Subtitle(t) => (t.pid, t.codec, t.language.clone()),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (0xE0, Codec::Mpeg2, String::new()),
+            (0xC0, Codec::Mp2, "eng".into()),
+            (0xD0, Codec::Mp2, "eng".into()),
+            (0xBD80, Codec::Ac3, "fra".into()),
+            (0xBD88, Codec::Dts, "deu".into()),
+            (0xBDA0, Codec::Lpcm, "spa".into()),
+            (0xBDA1, Codec::Lpcm, "ita".into()),
+            (0x20, Codec::DvdSub, "eng".into()),
+        ]
+    );
+    assert!(matches!(&title.streams[2], DiscStream::Audio(a) if a.is_mp2_extension()));
+    let DiscStream::Subtitle(sub) = &title.streams[7] else {
+        panic!()
+    };
+    assert!(sub.forced);
+    assert!(
+        sub.codec_data
+            .as_deref()
+            .is_some_and(|c| idx_palette(c).is_some())
+    );
+    tracks_match(&fx.input, &frames, &[5, 6]);
+    let _ = std::fs::remove_file(&path);
+}
+
+// §7 round trip 1: "PS → IR → mpg → IR: per-track (pts − const, keyframe, data) exactly".
+#[test]
+fn ps_to_ir_to_mpg_to_ir_is_exact() {
+    let fx = fixture(&Opts::default());
+    let p1 = temp_path("a");
+    std::fs::write(&p1, run(&fx).out).unwrap();
+    let (t1, f1) = read_all(&p1).unwrap();
+    let mut sink = MpgSink::create(Vec::new(), &t1).unwrap();
+    for f in &f1 {
+        sink.write(f).unwrap();
+    }
+    sink.finish().unwrap();
+    let p2 = temp_path("b");
+    std::fs::write(&p2, sink.mux.take().unwrap().into_writer()).unwrap();
+    let (t2, f2) = read_all(&p2).unwrap();
+    assert_eq!(t1.streams.len(), t2.streams.len());
+    let (a, b) = (by_track(&f1), by_track(&f2));
+    let mut offset = None;
+    for (t, fa) in &a {
+        let fb = &b[t];
+        if matches!(&t1.streams[*t], DiscStream::Audio(x) if x.codec == Codec::Lpcm) {
+            // LPCM IR frames follow the PES they came in; the samples are what round-trips.
+            let cat = |f: &Vec<&PesFrame>| {
+                f.iter()
+                    .flat_map(|x| x.data.iter().copied())
+                    .collect::<Vec<u8>>()
+            };
+            assert_eq!(cat(fa), cat(fb), "LPCM track {t}");
+            continue;
+        }
+        assert_eq!(fa.len(), fb.len(), "track {t}");
+        for (x, y) in fa.iter().zip(fb) {
+            assert_eq!((x.keyframe, &x.data), (y.keyframe, &y.data), "track {t}");
+            let d = ns_to_ticks(y.pts) - ns_to_ticks(x.pts);
+            assert_eq!(*offset.get_or_insert(d), d);
+        }
+    }
+    let _ = (std::fs::remove_file(&p1), std::fs::remove_file(&p2));
+}
+
+// Design §4 step 2 (MPG-11, J3): a CSS-scrambled `.vob` is cracked keylessly and read.
+#[test]
+fn a_css_scrambled_vob_is_descrambled() {
+    let fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let clear = run(&fx).out;
+    let mut vob = clear.clone();
+    let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+    let mut scrambled = 0;
+    for pk in vob.as_chunks_mut::<{ pack::PACK_BYTES }>().0 {
+        // Only a whole-sector video pack with no stuffing, as a DVD encoder writes them.
+        if pk[13] & 7 == 0 && pk[17] == 0xE0 && pk[0x14] & 0x30 == 0 {
+            pk[0x14] |= 0x10;
+            crate::css::lfsr::scramble_sector(&key, pk);
+            scrambled += 1;
+        }
+    }
+    assert!(scrambled > 10);
+    let path = temp_path("css");
+    std::fs::write(&path, &vob).unwrap();
+    let (_, frames) = read_all(&path).unwrap();
+    let want: Vec<u8> = fx.input[&0]
+        .iter()
+        .flat_map(|f| f.1.iter().copied())
+        .collect();
+    let got: Vec<u8> = frames
+        .iter()
+        .filter(|f| f.track == 0)
+        .flat_map(|f| f.data.iter().copied())
+        .collect();
+    assert_eq!(got, want, "descrambled video is byte-identical");
+    let _ = std::fs::remove_file(&path);
+}
+
+// Design §4 step 2 (J13): a truncated rip (size not a multiple of 2048) is read, its cut-off
+// final packet dropped by the demuxer.
+#[test]
+fn a_truncated_file_is_read() {
+    let fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let mut out = run(&fx).out;
+    out.truncate(out.len() - 1_000);
+    let path = temp_path("cut");
+    std::fs::write(&path, &out).unwrap();
+    let (_, frames) = read_all(&path).unwrap();
+    assert!(frames.iter().filter(|f| f.track == 0).count() > 100);
+    let _ = std::fs::remove_file(&path);
+}
+
+// Design §4 (J6): an ISO/IEC 11172-1 system stream is read, not refused; its MPEG-1 video
+// goes out as stream_type 0x01 in an MPEG-2 program stream.
+#[test]
+fn an_mpeg1_system_stream_is_read_and_remuxed() {
+    fn pack1() -> Vec<u8> {
+        vec![
+            0, 0, 1, 0xBA, 0x21, 0x00, 0x01, 0x00, 0x01, 0x80, 0x1B, 0x83,
+        ]
+    }
+    fn packet(id: u8, pts: Option<u64>, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![0xFF];
+        match pts {
+            Some(t) => body.extend_from_slice(&[
+                0x21 | (((t >> 29) & 0x0E) as u8),
+                (t >> 22) as u8,
+                1 | (((t >> 14) & 0xFE) as u8),
+                (t >> 7) as u8,
+                1 | (((t << 1) & 0xFE) as u8),
+            ]),
+            None => body.push(0x0F),
+        }
+        body.extend_from_slice(payload);
+        let mut p = vec![0, 0, 1, id];
+        p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        p.extend(body);
+        p
+    }
+    let mut ps = Vec::new();
+    let mut video = Vec::new();
+    for k in 0..50u64 {
+        let mut pic = if k % 10 == 0 {
+            test_es::mpeg1_seq(3)
+        } else {
+            Vec::new()
+        };
+        pic.extend(test_es::mpeg2_pic(if k % 10 == 0 { 1 } else { 2 }, 3));
+        pic.resize(3_000, 0x55);
+        video.push(pic.clone());
+        let pts = 45_000 + k * 3_600;
+        for (i, chunk) in pic.chunks(2_000).enumerate() {
+            ps.extend(pack1());
+            ps.extend(packet(0xE0, (i == 0).then_some(pts), chunk));
+        }
+        let mut a = vec![0xFF, 0xFD, 0xC4, 0x00];
+        a.resize(768, 0x33);
+        ps.extend(pack1());
+        ps.extend(packet(0xC0, Some(pts), &a));
+    }
+    ps.extend_from_slice(&[0, 0, 1, 0xB9]);
+    let path = temp_path("vcd");
+    std::fs::write(&path, &ps).unwrap();
+    let (title, frames) = read_all(&path).unwrap();
+    assert!(matches!(&title.streams[0], DiscStream::Video(v) if v.codec == Codec::Mpeg1));
+    let got: Vec<&[u8]> = frames
+        .iter()
+        .filter(|f| f.track == 0)
+        .map(|f| &f.data[..])
+        .collect();
+    assert_eq!(
+        got.len(),
+        video.len(),
+        "one IR frame per picture (Mpeg2Parser)"
+    );
+    let mut sink = MpgSink::create(Vec::new(), &title).unwrap();
+    for f in &frames {
+        sink.write(f).unwrap();
+    }
+    sink.finish().unwrap();
+    let out = sink.mux.take().unwrap().into_writer();
+    let p = replay::parse(&out).unwrap();
+    let m = &p.psms[0].1;
+    let info = usize::from(u16::from_be_bytes([m[8], m[9]]));
+    assert_eq!(
+        &m[12 + info..14 + info],
+        &[0x01, 0xE0],
+        "MPEG-1 video is stream_type 0x01"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+// Design §4: "A file with no pack start code in its head is not a PS; it fails with E6009".
+#[test]
+fn a_file_with_no_pack_is_no_streams() {
+    let path = temp_path("junk");
+    std::fs::write(&path, vec![0x5Au8; 10_000]).unwrap();
+    let e = read_all(&path).unwrap_err();
+    assert_eq!(
+        crate::error::error_code(&e),
+        Some(crate::error::E_NO_STREAMS)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+// Design §4 step 3: without a map, 0xD0-0xD7 are classified by sync — `0x7FF` ext_syncword
+// is an extension, `0xFFF` an ordinary MPEG audio stream (a foreign PS with audio at 0xD2).
+#[test]
+fn without_a_map_d0_streams_are_classified_by_sync() {
+    let mut ps = Vec::new();
+    let pack2 = [0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
+    let pes = |id: u8, data: &[u8]| {
+        let mut p = vec![0, 0, 1, id, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1];
+        p.extend_from_slice(data);
+        let len = (p.len() - 6) as u16;
+        p[4..6].copy_from_slice(&len.to_be_bytes());
+        p
+    };
+    ps.extend_from_slice(&pack2);
+    let mut v = seq_header(720, 576, 3, 112, false);
+    v.extend(test_es::mpeg2_pic(1, 3));
+    ps.extend(pes(0xE0, &v));
+    ps.extend(pes(0xC0, &[0xFF, 0xFD, 0xC4, 0x00, 0, 0]));
+    ps.extend(pes(0xD0, &[0x7F, 0xF1, 0x23, 0x45]));
+    ps.extend(pes(0xD2, &[0xFF, 0xFD, 0xC4, 0xC0, 0, 0]));
+    let s = scan::scan_streams(&ps).unwrap();
+    let ids: Vec<(u16, bool)> = s
+        .iter()
+        .filter_map(|x| match x {
+            DiscStream::Audio(a) => Some((a.pid, a.is_mp2_extension())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![(0xC0, false), (0xD0, true), (0xD2, false)]);
+    assert!(matches!(&s[3], DiscStream::Audio(a) if a.channels == AudioChannels::Mono));
+}
+
+#[test]
+fn a_map_with_a_bad_crc_is_ignored() {
+    let e = [pack::PsmEntry {
+        stream_type: 0x02,
+        stream_id: 0xE0,
+        descriptors: vec![],
+    }];
+    let mut m = pack::psm(&[], &e).unwrap();
+    assert!(scan::parse_map(&m).is_some());
+    let n = m.len();
+    m[n - 1] ^= 1;
+    assert!(scan::parse_map(&m).is_none());
+}
+
+// §7 round trip (mpg → mkv): the driver remuxes an `mpg://` source to `mkv://`; the video
+// and AC-3 frames read back from the mkv equal those read from the mpg (modulo one tick
+// offset); the extension is the mkv sink's to exclude (M1, J23).
+#[test]
+fn an_mpg_source_remuxes_to_mkv() {
+    use crate::mux::driver::{MuxInput, MuxOptions, NoopEvents, mux_stream};
+    let fx = fixture(&Opts {
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let mpg = temp_path("src");
+    std::fs::write(&mpg, run(&fx).out).unwrap();
+    let (_, from_mpg) = read_all(&mpg).unwrap();
+    let mkv = std::env::temp_dir().join(format!("fmkv-mpg-out-{}.mkv", std::process::id()));
+    let url = format!("mpg://{}", mpg.display());
+    let opts = MuxOptions {
+        skip_errors: false,
+        batch_sectors: 8192,
+        raw: false,
+        send_deadline: Some(std::time::Duration::from_secs(60)),
+        selection: Default::default(),
+    };
+    let out = {
+        let _g = crate::sector::prefetched::holder_test_lock();
+        mux_stream(
+            MuxInput::Url {
+                url: &url,
+                opts: Default::default(),
+            },
+            &format!("mkv://{}", mkv.display()),
+            &opts,
+            &crate::halt::Halt::new(),
+            std::sync::Arc::new(NoopEvents),
+        )
+        .unwrap()
+    };
+    assert!(out.completed);
+    assert_eq!(
+        out.undelivered_streams,
+        vec![2],
+        "the extension, once seen (J23)"
+    );
+    let mut input =
+        crate::mux::resolve::input(&format!("mkv://{}", mkv.display()), &Default::default())
+            .unwrap();
+    let mut from_mkv = Vec::new();
+    while let Some(f) = input.read().unwrap() {
+        from_mkv.push(f);
+    }
+    let codec_of = |t: &DiscTitle, i: usize| match &t.streams[i] {
+        DiscStream::Video(v) => v.codec,
+        DiscStream::Audio(a) => a.codec,
+        DiscStream::Subtitle(s) => s.codec,
+    };
+    let mkv_title = input.info().clone();
+    let pick = |frames: &[PesFrame], title: &DiscTitle, c: Codec| -> Vec<(i64, Vec<u8>)> {
+        frames
+            .iter()
+            .filter(|f| codec_of(title, f.track) == c)
+            .map(|f| (ns_to_ticks(f.pts), f.data.clone()))
+            .collect()
+    };
+    let (_, mpg_title) = (0, read_all(&mpg).unwrap().0);
+    for c in [Codec::Mpeg2, Codec::Ac3] {
+        let (a, b) = (
+            pick(&from_mpg, &mpg_title, c),
+            pick(&from_mkv, &mkv_title, c),
+        );
+        assert_eq!(a.len(), b.len(), "{c:?}");
+        assert!(a.iter().zip(&b).all(|(x, y)| x.1 == y.1), "{c:?} bytes");
+    }
+    let _ = (std::fs::remove_file(&mpg), std::fs::remove_file(&mkv));
 }

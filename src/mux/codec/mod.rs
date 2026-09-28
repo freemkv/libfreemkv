@@ -200,7 +200,9 @@ pub fn parser_for_codec(
         // a display-order PTS per frame there; on BD/UHD (per-frame PTS) they don't.
         Codec::H264 => Box::new(h264::H264Parser::new().with_ps_reorder(is_dvd_ps)),
         Codec::Hevc => Box::new(hevc::HevcParser::new().with_ps_reorder(is_dvd_ps)),
-        Codec::Mpeg2 => Box::new(mpeg2::Mpeg2Parser::new()),
+        // 11172-2 is the 13818-2 syntax without extension start codes (mpg-output-design v5
+        // §4 step 1), so MPEG-1 video is framed per picture by the same parser.
+        Codec::Mpeg2 | Codec::Mpeg1 => Box::new(mpeg2::Mpeg2Parser::new()),
         Codec::Vc1 => Box::new(vc1::Vc1Parser::new().with_ps_reorder(is_dvd_ps)),
         Codec::Ac3 | Codec::Ac3Plus => Box::new(ac3::Ac3Parser::new()),
         Codec::Flac => Box::new(flac::FlacParser::new()),
@@ -212,10 +214,10 @@ pub fn parser_for_codec(
         Codec::Lpcm if is_dvd_ps => Box::new(lpcm::LpcmParser::new_dvd()),
         Codec::Lpcm => Box::new(lpcm::LpcmParser::new()),
         Codec::DvdSub => Box::new(dvdsub::DvdSubParser::new(codec_data)),
-        // Video codecs with no dedicated parser (Mpeg1/Av1 are real, just unparsed):
-        // multi-AU PES becomes one oversized block. Use non-keyframe passthrough,
-        // not all-keyframe (would explode Cues density); warn framing is approximate.
-        Codec::Mpeg1 | Codec::Av1 => {
+        // Video with no dedicated parser (AV1 is real, just unparsed): a multi-AU PES
+        // becomes one oversized block. Non-keyframe passthrough, not all-keyframe (that
+        // would explode Cues density); warn that framing is approximate.
+        Codec::Av1 => {
             tracing::warn!(
                 target: "mux",
                 "no dedicated parser for video codec {:?}; using non-keyframe passthrough (frame boundaries/keyframes not detected)",
@@ -258,6 +260,32 @@ pub fn parser_for_mvc_dependent(codec: Codec, is_dvd_ps: bool) -> Box<dyn CodecP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Design §4 step 1: "MPEG-1 video is `Codec::Mpeg1`, which is routed to `Mpeg2Parser`
+    // (the 11172-2 syntax is the 13818-2 syntax without extension start codes)"; the parser
+    // must accept a sequence header with no sequence_extension and frame each picture.
+    #[test]
+    fn mpeg1_video_is_framed_by_the_mpeg2_parser() {
+        use crate::mux::decode_ts::test_es::{mpeg1_seq, mpeg2_pic};
+        let mut es = mpeg1_seq(3);
+        es.extend(mpeg2_pic(1, 3));
+        es.extend(mpeg2_pic(2, 3));
+        es.extend(mpeg2_pic(3, 3));
+        let pes = crate::mux::ts::PesPacket {
+            source: None,
+            pid: 0xE0,
+            pts: Some(9_000),
+            dts: None,
+            data: es,
+            discontinuity: false,
+        };
+        let mut p = parser_for_codec(Codec::Mpeg1, None, true);
+        let mut frames = p.parse(&pes);
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 3, "one frame per picture, not one per PES");
+        assert!(frames[0].keyframe, "the I picture is a keyframe");
+        assert_eq!(p.codec_private(), Some(mpeg1_seq(3)));
+    }
 
     // Per design J16/J20 (MPG3-5, MPG4-2); do not change without a spec citation proving
     // otherwise. Every 90 kHz tick survives pts_to_ns → ns_to_ticks exactly, including
@@ -311,19 +339,18 @@ mod tests {
 
     #[test]
     fn unhandled_video_codecs_use_non_keyframe_passthrough() {
-        // Mpeg1/Av1 have no dedicated parser. They must NOT be marked
-        // all-keyframe (that would explode Cues density and mislead seeking);
-        // the non-keyframe passthrough is the safe fallback.
-        for codec in [Codec::Mpeg1, Codec::Av1] {
-            let mut parser = parser_for_codec(codec, None, false);
-            let frames = parser.parse(&pes(Some(9000), vec![0xDE, 0xAD, 0xBE, 0xEF]));
-            assert_eq!(frames.len(), 1, "{codec:?}");
-            assert!(
-                !frames[0].keyframe,
-                "{codec:?} must not be flagged keyframe by the fallback parser"
-            );
-            assert_eq!(frames[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        }
+        // Av1 has no dedicated parser. It must NOT be marked all-keyframe (that would
+        // explode Cues density and mislead seeking); the non-keyframe passthrough is the
+        // safe fallback. (MPEG-1 has the MPEG-2 parser: mpg-output-design v5 §4 step 1.)
+        let codec = Codec::Av1;
+        let mut parser = parser_for_codec(codec, None, false);
+        let frames = parser.parse(&pes(Some(9000), vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(frames.len(), 1, "{codec:?}");
+        assert!(
+            !frames[0].keyframe,
+            "{codec:?} must not be flagged keyframe by the fallback parser"
+        );
+        assert_eq!(frames[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     // codec_private() feeds MKV CodecPrivate (RFC 9559 §5.1.4.1.24): Some vs None are NOT

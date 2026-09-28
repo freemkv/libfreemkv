@@ -449,8 +449,10 @@ pub(crate) fn input_with_halt(
         // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
         // `mp4://` flows to every sink (mkv://, audio://, json://, …).
         StreamUrl::Mp4 { ref path } => Ok(Box::new(super::mp4::Mp4Reader::open(path)?)),
-        // The `mpg://` source (program stream demux) lands with L3.
-        StreamUrl::Mpg { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
+        StreamUrl::Mpg { ref path } => {
+            validate_file_path(path, "mpg")?;
+            Ok(Box::new(build_ps_pipeline(path, opts)?))
+        }
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
         | StreamUrl::Video { .. }
@@ -1987,6 +1989,87 @@ fn iso_pipeline_tail(
     Ok(
         PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
             .with_halt(halt),
+    )
+}
+
+// An `mpg://` source (design §4 step 2, J13): the sector path, one extent over the zero-padded
+// file. Crack first (a scrambled `.vob` descrambles, a clear one passes), scan the decrypted
+// head, then build the DVD pipeline with the RESOLVED keys, so its own crack is a no-op.
+fn build_ps_pipeline(path: &Path, opts: &InputOptions) -> io::Result<PipelinedPesStream> {
+    const PS_MUX_BATCH_SECTORS: u16 = 8192;
+    const HEAD_SECTORS: u32 = 2048; // 4 MiB
+    let mut reader = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
+    let capacity = reader.capacity_sectors();
+    if capacity == 0 {
+        return Err(crate::error::Error::NoStreams.into());
+    }
+    let extent = crate::disc::Extent {
+        start_lba: 0,
+        sector_count: capacity,
+    };
+    let mut keys = crate::decrypt::DecryptKeys::None;
+    crate::css::resolve_dvd_title_key(
+        &mut reader,
+        &[extent],
+        &mut keys,
+        PS_MUX_BATCH_SECTORS,
+        ContentFormat::MpegPs,
+        opts.raw,
+        None,
+    )?;
+    let head_src = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
+    let mut head_reader = crate::sector::DecryptingSectorSource::new(
+        Box::new(head_src) as Box<dyn SectorSource>,
+        keys.clone(),
+    );
+    let n = capacity.min(HEAD_SECTORS);
+    let mut head = vec![0u8; n as usize * 2048];
+    let mut at = 0u32;
+    while at < n {
+        let count = (n - at).min(u32::from(PS_MUX_BATCH_SECTORS)) as u16;
+        let off = at as usize * 2048;
+        head_reader
+            .read_sectors(
+                at,
+                count,
+                &mut head[off..off + count as usize * 2048],
+                false,
+            )
+            .map_err(|e| -> io::Error { e.into() })?;
+        at += u32::from(count);
+    }
+    let streams = super::mpg::scan::scan_streams(&head)
+        .ok_or_else(|| -> io::Error { crate::error::Error::NoStreams.into() })?;
+    let mut title = DiscTitle {
+        playlist: path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        codec_privates: vec![None; streams.len()],
+        streams,
+        extents: vec![extent],
+        content_format: ContentFormat::MpegPs,
+        ..DiscTitle::empty()
+    };
+    opts.selection
+        .apply(&mut title)
+        .map_err(|e| -> io::Error { e.into() })?;
+    let keys = if opts.raw {
+        crate::decrypt::DecryptKeys::None
+    } else {
+        keys
+    };
+    build_iso_pipeline(
+        reader,
+        title,
+        keys,
+        PS_MUX_BATCH_SECTORS,
+        ContentFormat::MpegPs,
+        opts.raw,
+        None,
+        None,
+        None,
     )
 }
 
