@@ -124,6 +124,8 @@ struct Run<'a> {
     origin: Vec<&'static str>,
     requests: u32,
     trace: ResolutionTrace,
+    // A source matched the disc and held a Media Key but had no VID (KU J23).
+    km_needs_vid: bool,
 }
 
 impl Run<'_> {
@@ -170,18 +172,28 @@ impl Run<'_> {
             let answer = if forensic {
                 src.get_fmts_indexes(&ctx).map(|k| (k, None))
             } else {
-                src.resolve_unit_keys(&ctx)
-                    .map(|r| (r.keys, Some((r.matched, r.matched_entry, r.store_entries))))
+                src.resolve_unit_keys(&ctx).map(|r| {
+                    let info = (r.matched, r.matched_entry, r.store_entries, r.miss_path);
+                    (r.keys, Some(info))
+                })
             };
             match answer {
                 Ok((keys, info)) => {
-                    let (matched, entry, store) = info.unwrap_or((false, None, None));
+                    let (matched, entry, store, miss) =
+                        info.unwrap_or((false, None, None, Vec::new()));
+                    self.km_needs_vid |= miss.contains(&KeyNode::NoVid);
                     let (path, outcome) = match (keys.is_empty(), matched) {
                         (false, _) => (vec![KeyNode::FoundUnitKeys], KeyOutcome::Resolved),
-                        (true, true) => (
-                            vec![KeyNode::MatchedDisc, KeyNode::NoDerivableKey],
-                            KeyOutcome::NoKey,
-                        ),
+                        // The source's own reason (e.g. `NoVid`), else a bare no-key.
+                        (true, true) => {
+                            let why = if miss.is_empty() {
+                                vec![KeyNode::NoDerivableKey]
+                            } else {
+                                miss
+                            };
+                            let path = [vec![KeyNode::MatchedDisc], why].concat();
+                            (path, KeyOutcome::NoKey)
+                        }
                         (true, false) => (vec![KeyNode::NoEntry], KeyOutcome::NoKey),
                     };
                     self.trace.keys.push(KeyStep {
@@ -462,6 +474,7 @@ pub(crate) fn resolve(
     inputs.volume_id = vid.unwrap_or([0u8; 16]);
     let built = sources();
     let n_src = built.len();
+    let vid_consumer = built.iter().any(|s| s.uses_vid());
     let mut run = Run {
         halt,
         clock,
@@ -473,6 +486,7 @@ pub(crate) fn resolve(
         origin: Vec::new(),
         requests: 0,
         trace: ResolutionTrace::new(),
+        km_needs_vid: false,
     };
     if let Some(s) = seed {
         run.add_keys(&s.0.pool, "seed");
@@ -485,6 +499,13 @@ pub(crate) fn resolve(
     // Every source is dropped here: nothing can ask after `resolve` (LK7).
     let trace = std::mem::take(&mut run.trace);
     drop(run.sources);
+    // KU J23: the VID would help only through a Km path or a source that consumes it.
+    if let Some(flag) = opts.vid_would_help
+        && vid.is_none()
+        && (run.km_needs_vid || vid_consumer)
+    {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let mut inner = result?;
     inner.disc_hash = aacs.disc_hash.clone();
     inner.capacity = disc.capacity_sectors;

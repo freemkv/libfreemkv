@@ -52,6 +52,10 @@ pub struct ResolveKeysOptions<'a> {
     pub seed: Option<&'a ResolvedKeySet>,
     /// An in-memory VID the caller re-read from the drive (KU §4.2). Never written.
     pub vid: Option<[u8; 16]>,
+    /// Set by `resolve` when no VID was in hand and one would help (KU J23): a source
+    /// reported a Media Key it could not finish without the VID (`KeyNode::NoVid`), or a
+    /// configured source [`uses_vid`](crate::KeySource::uses_vid). Never cleared.
+    pub vid_would_help: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// The outcome of [`ResolvedKeySet::resolve`]: the set, plus the per-source walk.

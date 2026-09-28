@@ -1978,19 +1978,19 @@ fn vid_would_help_only_with_a_km_path_or_a_vid_consuming_source() {
     let plain = Spec::keydb(&[K1], &calls);
     let km = Spec {
         no_vid: true,
-        ..Spec::keydb(&[K1], &calls)
+        ..Spec::keydb(&[], &calls)
     };
     let online = Spec {
         uses_vid: true,
         ..Spec::online(&[K1], &calls)
     };
-    let (r, help) = vid_help(true, &[plain.clone()]);
+    let (r, help) = vid_help(true, std::slice::from_ref(&plain));
     assert_eq!(
         (code(r), help),
         (E7022, false),
         "no Km path, no VID consumer"
     );
-    let (r, help) = vid_help(true, &[km.clone()]);
+    let (r, help) = vid_help(true, std::slice::from_ref(&km));
     assert_eq!((code(r), help), (E7022, true), "a Km path");
     let (r, help) = vid_help(true, &[plain, online.clone()]);
     assert_eq!(

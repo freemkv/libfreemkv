@@ -319,6 +319,13 @@ pub trait KeySource {
     fn last_failure_was_transport(&self) -> bool {
         false
     }
+
+    /// Whether this source derives keys from the disc's Volume ID it is sent (an online key
+    /// service: Kvu = AES-G(Km, IDv), KS-16), so a Missing piece might open with the VID in
+    /// hand (KU J23, E7034). Default `false`.
+    fn uses_vid(&self) -> bool {
+        false
+    }
 }
 
 /// Drive `sources` until one resolves Unit Keys that decrypt `disc`. Returns
