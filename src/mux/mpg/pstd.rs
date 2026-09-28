@@ -348,15 +348,16 @@ impl<W: Write> Mux<W> {
         if let Some((k, dist)) = Self::next_commencement(s) {
             let q = &s.queue[k];
             let ts = if q.au.dts.is_some() { 10 } else { 5 };
-            let depth_ok = k == 0 || q.au.lpcm_bits == head.au.lpcm_bits;
+            // A PES that carries a PTS starts at its AU's first byte, as a DVD encoder
+            // writes it: PS readers give a PES's PTS to the AU holding its first byte.
+            let at_au = k == 0 && head.sent == 0;
             let lead_ok = q.dec27.saturating_sub(t) <= LEAD27;
             if let Some(cap) = avail.checked_sub(9 + pstd + ts + hdr)
-                && depth_ok
+                && at_au
                 && lead_ok
                 && dist < cap
             {
-                // At most one AU commences per PES, and it begins in the PES that carries
-                // its PTS: stop before the next AU's first byte.
+                // At most one AU commences per PES: stop before the next AU's first byte.
                 let until_next = Self::first_byte(s, k + 1).unwrap_or(usize::MAX);
                 let mut len = cap.min(until_next).min(room);
                 if whole && k == 0 && head.sent == 0 {
@@ -726,5 +727,18 @@ mod tests {
         m.streams[0].queue[0].sent = 90;
         let tail = m.plan_pes(0, 30, 0).unwrap();
         assert_eq!((tail.len, tail.start.map(|s| s.0)), (10, None));
+    }
+
+    // A PES that carries a PTS begins at its AU's first byte, as a DVD encoder writes it: PS
+    // readers (our AuAssembler) give a PES's PTS to the AU holding its first byte, so a tail
+    // of the previous AU in front would take the PTS.
+    #[test]
+    fn a_pts_pes_begins_at_its_au() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 100, 0));
+        m.push(0, au(12_600, 1_000, 20));
+        m.streams[0].queue[0].sent = 90;
+        let p = m.plan_pes(0, 1_000, 0).unwrap();
+        assert_eq!((p.len, p.start), (10, None), "the tail goes alone");
     }
 }
