@@ -1723,6 +1723,149 @@ fn without_a_map_d0_streams_are_classified_by_sync() {
     assert!(matches!(&s[3], DiscStream::Audio(a) if a.channels == AudioChannels::Mono));
 }
 
+// A pack of one MPEG-2 PES per `(stream_id, payload)`, PTS 90 000, for scan tests.
+fn scan_pack(pes: &[(u8, Vec<u8>)], map: Option<&[u8]>) -> Vec<u8> {
+    let mut ps = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
+    if let Some(m) = map {
+        ps.extend_from_slice(m);
+    }
+    for (id, data) in pes {
+        let mut p = vec![0, 0, 1, *id, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1];
+        p.extend_from_slice(data);
+        let len = (p.len() - 6) as u16;
+        p[4..6].copy_from_slice(&len.to_be_bytes());
+        ps.extend(p);
+    }
+    ps
+}
+
+fn scan_video() -> Vec<u8> {
+    let mut v = seq_header(720, 576, 3, 112, false);
+    v.extend(test_es::mpeg2_pic(1, 3));
+    v
+}
+
+// Design §4 step 3: without a map, a `0xD0-0xD7` packet that starts mid-frame is classified
+// by the first sync word in its bytes, not by its first two bytes.
+#[test]
+fn sync_classification_finds_the_first_sync() {
+    let ps = scan_pack(
+        &[
+            (0xE0, scan_video()),
+            (0xC0, vec![0xFF, 0xFD, 0xC4, 0x00, 0, 0]),
+            (0xD0, vec![0x12, 0x34, 0x00, 0x7F, 0xF1, 0x23, 0x45]),
+        ],
+        None,
+    );
+    let s = scan::scan_streams(&ps).unwrap();
+    assert!(
+        matches!(&s[2], DiscStream::Audio(a) if a.is_mp2_extension()),
+        "{:?}",
+        s[2]
+    );
+}
+
+// MS-23 / design §4 step 3: the map pairs an extension with its base by
+// hierarchy_embedded_layer_index, wherever the base sits in the map.
+#[test]
+fn the_map_pairs_an_extension_by_its_embedded_layer_index() {
+    let e = [
+        pack::PsmEntry {
+            stream_type: 0x02,
+            stream_id: 0xE0,
+            descriptors: vec![],
+        },
+        pack::PsmEntry {
+            stream_type: 0x04,
+            stream_id: 0xD1,
+            descriptors: pack::hierarchy_descriptor(pack::HIERARCHY_EXTENSION, 3, 2).to_vec(),
+        },
+        pack::PsmEntry {
+            stream_type: 0x04,
+            stream_id: 0xC1,
+            descriptors: pack::hierarchy_descriptor(pack::HIERARCHY_BASE, 2, 0).to_vec(),
+        },
+    ];
+    let m = pack::psm(&[], &e).unwrap();
+    let ps = scan_pack(
+        &[
+            (0xE0, scan_video()),
+            (0xD1, vec![0x7F, 0xF1, 0x23, 0x45]),
+            (0xC1, vec![0xFF, 0xFD, 0xC4, 0x00, 0, 0]),
+        ],
+        Some(&m),
+    );
+    let s = scan::scan_streams(&ps).unwrap();
+    let audio: Vec<(u16, bool)> = s
+        .iter()
+        .filter_map(|x| match x {
+            DiscStream::Audio(a) => Some((a.pid, a.is_mp2_extension())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(audio, vec![(0xD1, true), (0xC1, false)]);
+}
+
+// Design §4 step 3 (MPEG audio: "header + mc_header"): a 13818-3 multichannel base reports
+// its main programme's channel count, not the 2 of its MPEG-1 header.
+#[test]
+fn mpeg_audio_channels_come_from_the_mc_header() {
+    use crate::mux::codec::mp2_channels::tests::{MC_3_2_LFE, STEREO_256, Spec, write};
+    let f = write(Spec {
+        mc: Some(MC_3_2_LFE),
+        ..STEREO_256
+    })
+    .0;
+    let ps = scan_pack(&[(0xE0, scan_video()), (0xC0, f.repeat(4))], None);
+    let s = scan::scan_streams(&ps).unwrap();
+    assert!(
+        matches!(&s[1], DiscStream::Audio(a) if a.channels == AudioChannels::Surround51),
+        "{:?}",
+        s[1]
+    );
+}
+
+// Design §4: one video stream is carried; a second video stream_id is not interleaved into it.
+#[test]
+fn only_the_chosen_video_stream_is_routed() {
+    let (a, es_a) = clear_ps(false, 0);
+    let (b, _) = clear_ps(false, 0);
+    let mut file = Vec::new();
+    let packs_a = a.as_chunks::<{ pack::PACK_BYTES }>().0;
+    let packs_b = b.as_chunks::<{ pack::PACK_BYTES }>().0;
+    for (pa, pb) in packs_a.iter().zip(packs_b) {
+        file.extend_from_slice(pa);
+        let mut pb = *pb;
+        if pb[0x11] == 0xE0 {
+            pb[0x11] = 0xE1;
+            for x in &mut pb[0x80..] {
+                *x ^= 0x0F;
+            }
+        }
+        file.extend_from_slice(&pb);
+    }
+    file.extend_from_slice(&[0, 0, 1, 0xB9]);
+    let path = temp_path("two-video");
+    std::fs::write(&path, &file).unwrap();
+    let got = read_all(&path);
+    let _ = std::fs::remove_file(&path);
+    let (title, frames) = got.unwrap();
+    assert_eq!(
+        title
+            .streams
+            .iter()
+            .filter(|s| matches!(s, DiscStream::Video(_)))
+            .count(),
+        1
+    );
+    let video: Vec<u8> = frames
+        .iter()
+        .filter(|f| f.track == 0)
+        .flat_map(|f| f.data.iter().copied())
+        .collect();
+    assert_eq!(video, es_a, "0xE0 only");
+}
+
 #[test]
 fn a_map_with_a_bad_crc_is_ignored() {
     let e = [pack::PsmEntry {
