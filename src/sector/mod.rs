@@ -82,6 +82,14 @@ pub trait SectorSource: Send {
     ///
     /// [`DecryptingSectorSource`]: crate::sector::DecryptingSectorSource
     fn set_unit_base(&mut self, _lba: u32) {}
+
+    /// Stream files this source's bus-removal stage could not locate, so their
+    /// sectors come through still bus-encrypted (see
+    /// [`bus_removal::ensure_image_debussable`]). Empty for every source without
+    /// a host-key bus stage; wrappers must forward it.
+    fn unmapped_stream_files(&self) -> &[bus_removal::UnmappedStreamFile] {
+        &[]
+    }
 }
 
 // Forwarding impls so `Box<dyn SectorSource>` and `&mut dyn SectorSource`
@@ -120,6 +128,10 @@ impl SectorSource for Box<dyn SectorSource> {
     fn set_unit_base(&mut self, lba: u32) {
         (**self).set_unit_base(lba)
     }
+
+    fn unmapped_stream_files(&self) -> &[bus_removal::UnmappedStreamFile] {
+        (**self).unmapped_stream_files()
+    }
 }
 
 impl SectorSource for &mut (dyn SectorSource + '_) {
@@ -154,6 +166,10 @@ impl SectorSource for &mut (dyn SectorSource + '_) {
 
     fn set_unit_base(&mut self, lba: u32) {
         (**self).set_unit_base(lba)
+    }
+
+    fn unmapped_stream_files(&self) -> &[bus_removal::UnmappedStreamFile] {
+        (**self).unmapped_stream_files()
     }
 }
 

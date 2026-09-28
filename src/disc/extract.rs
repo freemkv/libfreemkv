@@ -104,6 +104,9 @@ struct PlannedFile {
     /// ECMA-167 4/14.14.1.1 type-1 extent is allocated but not recorded: it
     /// occupies the file's byte space and its contents are zeros).
     extents: Vec<crate::udf::AbsExtent>,
+    /// A bus-encrypted stream file the reader's bus map could not locate: it
+    /// cannot be de-bussed, so it is never read or written, only counted lost.
+    unmapped: bool,
 }
 
 impl Disc {
@@ -132,6 +135,11 @@ impl Disc {
 
         // ── Phase 1: read the FS structure + all file extents (raw) ──────
         let fs = udf::read_filesystem(reader)?;
+        let unmapped: Vec<u32> = reader
+            .unmapped_stream_files()
+            .iter()
+            .map(|u| u.icb)
+            .collect();
         let mut planned: Vec<PlannedFile> = Vec::new();
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut seen_hosts: std::collections::HashMap<String, String> =
@@ -147,6 +155,7 @@ impl Disc {
             "",
             true,
             case_insensitive,
+            &unmapped,
             &mut planned,
             &mut dirs,
             &mut seen_hosts,
@@ -232,6 +241,20 @@ impl Disc {
             if opts.cancelled(true) {
                 result.halted = true;
                 break;
+            }
+            // §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV stream file"; this one
+            // cannot be located to de-bus, so it is lost whole rather than written still encrypted.
+            if pf.unmapped {
+                let (fr, halted) =
+                    unmapped_file(pf, total_bytes, &mut done_bytes, &mut done_unreadable, opts);
+                result.bytes_unreadable =
+                    result.bytes_unreadable.saturating_add(fr.bytes_unreadable);
+                result.files.push(fr);
+                if halted {
+                    result.halted = true;
+                    break;
+                }
+                continue;
             }
             // Resolve the key for this file. CSS title VOBs need a per-VTS key;
             // clear nav (.IFO/.BUP/menu VOB) descrambles as a no-op with any
@@ -370,6 +393,9 @@ impl SectorSource for Borrowed<'_> {
     fn set_unit_base(&mut self, lba: u32) {
         self.0.set_unit_base(lba)
     }
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.0.unmapped_stream_files()
+    }
 }
 
 /// Whether `dir` lives on a case-INSENSITIVE filesystem (macOS APFS/HFS+ and
@@ -448,6 +474,7 @@ fn plan_tree(
     disc_path: &str,
     is_root: bool,
     case_insensitive: bool,
+    unmapped: &[u32],
     files: &mut Vec<PlannedFile>,
     dirs: &mut Vec<PathBuf>,
     seen_hosts: &mut std::collections::HashMap<String, String>,
@@ -505,10 +532,20 @@ fn plan_tree(
                 &child_disc,
                 false,
                 case_insensitive,
+                unmapped,
                 files,
                 dirs,
                 seen_hosts,
             )?;
+        } else if unmapped.contains(&entry.meta_lba) {
+            files.push(PlannedFile {
+                host_rel: child_rel,
+                disc_name: entry.name.clone(),
+                size: entry.size,
+                inline: None,
+                extents: Vec::new(),
+                unmapped: true,
+            });
         } else {
             let inline = fs.inline_data_at(reader, entry.meta_lba)?;
             let extents = if inline.is_some() {
@@ -522,10 +559,36 @@ fn plan_tree(
                 size: entry.size,
                 inline,
                 extents,
+                unmapped: false,
             });
         }
     }
     Ok(())
+}
+
+// Accounts an unmapped stream file as lost whole: nothing is written for it on the host.
+fn unmapped_file(
+    pf: &PlannedFile,
+    total_bytes: u64,
+    done_bytes: &mut u64,
+    done_unreadable: &mut u64,
+    opts: &ExtractOptions,
+) -> (FileResult, bool) {
+    tracing::warn!(
+        target: "freemkv::extract",
+        file = %pf.host_rel.display(),
+        "bus-encrypted stream file cannot be located to de-bus; not extracted"
+    );
+    *done_bytes = done_bytes.saturating_add(pf.size);
+    *done_unreadable = done_unreadable.saturating_add(pf.size);
+    let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
+    let fr = FileResult {
+        path: pf.host_rel.clone(),
+        bytes_good: 0,
+        bytes_unreadable: pf.size,
+        complete: false,
+    };
+    (fr, opts.cancelled(cont))
 }
 
 // Extracts one file via `<host>.partial` (bad sectors -> zero holes), then renames.
@@ -2183,6 +2246,33 @@ mod tests {
         );
     }
 
+    // The decrypting decorator owns a `Borrowed`; it must not hide what the drive could not map.
+    #[test]
+    fn borrowed_forwards_unmapped_stream_files() {
+        struct Reports(Vec<crate::sector::bus_removal::UnmappedStreamFile>);
+        impl SectorSource for Reports {
+            fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+                Ok(0)
+            }
+            fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+                &self.0
+            }
+        }
+        fn paths<S: SectorSource>(s: &S) -> Vec<String> {
+            s.unmapped_stream_files()
+                .iter()
+                .map(|u| u.path.clone())
+                .collect()
+        }
+        let file = crate::sector::bus_removal::UnmappedStreamFile::new(
+            "/BDMV/STREAM/00001.m2ts".into(),
+            40,
+            &Error::UdfAdChainTooLong,
+        );
+        let mut r = Reports(vec![file]);
+        assert_eq!(paths(&Borrowed(&mut r)), ["/BDMV/STREAM/00001.m2ts"]);
+    }
+
     // `Borrowed` must forward every `SectorSource` method to the wrapped
     // `&mut dyn SectorSource` verbatim; calling on a concrete `Borrowed`
     // value exercises the forwarding body via static, not vtable, dispatch.
@@ -2420,6 +2510,90 @@ mod tests {
         );
     }
 
+    // A MemDisc whose (host-key) bus map could not locate the File Entry at ICB `0`.
+    struct UnmappedAt(MemDisc, Vec<crate::sector::bus_removal::UnmappedStreamFile>);
+    impl SectorSource for UnmappedAt {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            self.0.read_sectors(lba, n, buf, r)
+        }
+        fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+            &self.1
+        }
+    }
+
+    fn two_clip_disc_with_first_unmapped() -> UnmappedAt {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![
+                        file("00001.m2ts", 24, 5000, vec![0x11; 3 * 2048], true),
+                        file("00002.m2ts", 25, 6000, vec![0x22; 3 * 2048], true),
+                    ],
+                    subdirs: vec![],
+                }],
+            }],
+        };
+        let lost = crate::sector::bus_removal::UnmappedStreamFile::new(
+            "/BDMV/STREAM/00001.m2ts".into(),
+            24,
+            &Error::UdfAdChainTooLong,
+        );
+        UnmappedAt(build_disc(root), vec![lost])
+    }
+
+    // The lost file is matched by ICB: it is never read, the other clip extracts intact.
+    #[test]
+    fn unmapped_stream_file_is_counted_lost_by_icb_and_never_written() {
+        let mut disc = two_clip_disc_with_first_unmapped();
+        let out = TmpDir::new("unmapped_icb");
+        let res = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect("extract");
+        assert_eq!(
+            read_out(out.path(), "BDMV/STREAM/00002.m2ts"),
+            Some(vec![0x22; 3 * 2048])
+        );
+        assert!(read_out(out.path(), "BDMV/STREAM/00001.m2ts").is_none());
+        assert!(read_out(out.path(), "BDMV/STREAM/00001.m2ts.partial").is_none());
+        assert_eq!(res.bytes_unreadable, 3 * 2048);
+        assert_eq!(res.bytes_good, 3 * 2048);
+        assert!(!res.complete && !res.halted);
+    }
+
+    // A progress Stop reported on the lost file ends the run there, like any other file.
+    #[test]
+    fn progress_stop_on_an_unmapped_stream_file_halts_the_run() {
+        struct StopImmediately;
+        impl crate::progress::Progress for StopImmediately {
+            fn report(&self, _p: &crate::progress::PassProgress) -> bool {
+                false
+            }
+        }
+        let mut disc = two_clip_disc_with_first_unmapped();
+        let out = TmpDir::new("unmapped_stop");
+        let opts = ExtractOptions {
+            progress: Some(&StopImmediately),
+            ..Default::default()
+        };
+        let res = clear_disc()
+            .extract_tree(&mut disc, out.path(), &opts)
+            .expect("a progress halt is not an error");
+        assert!(res.halted);
+        assert_eq!(res.files.len(), 1, "the run stops after the lost file");
+        assert!(read_out(out.path(), "BDMV/STREAM/00002.m2ts").is_none());
+    }
+
     // `available_space` must return `Some` for an existing dir on a platform
     // that exposes it — the free-space pre-check silently no-ops on `None`,
     // so a `statvfs` SUCCESS must never be read as "unavailable".
@@ -2589,6 +2763,7 @@ mod tests {
                 "",
                 true,
                 ci,
+                &[],
                 &mut files,
                 &mut dirs,
                 &mut seen,
@@ -2681,6 +2856,7 @@ mod tests {
                 len,
                 recorded: true,
             }],
+            unmapped: false,
         };
         let out = TmpDir::new("lba_overflow");
         std::fs::create_dir_all(out.path()).unwrap();

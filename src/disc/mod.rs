@@ -572,12 +572,19 @@ fn merged_extents<'a>(extents: impl Iterator<Item = &'a Extent>) -> Vec<(u32, u3
     crate::udf::merge_ranges(&ranges)
 }
 
+// Per-file stream extents in file order; a `None` start is an unrecorded hole.
+type StreamFiles = Vec<Vec<(Option<u32>, u32)>>;
+
+// The /BDMV/STREAM walk: every locatable file's extents, plus the files that are not.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct StreamScan {
+    pub(crate) files: StreamFiles,
+    pub(crate) unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
+}
+
 // The whole-disc bus map: every stream file, plus title extents no stream file
 // covers as content of unknown unit alignment (always de-bussed).
-fn bus_map(
-    files: Vec<Vec<(Option<u32>, u32)>>,
-    titles: &[DiscTitle],
-) -> crate::sector::bus_removal::BusMap {
+fn bus_map(files: StreamFiles, titles: &[DiscTitle]) -> crate::sector::bus_removal::BusMap {
     let unknown: Vec<(u32, u32)> = titles
         .iter()
         .flat_map(|t| &t.extents)
@@ -1880,10 +1887,7 @@ impl Disc {
         opts: &ScanOptions,
     ) -> Result<Self> {
         let bus_key = aacs.as_ref().and_then(|(c, b)| encrypt::bus_key(c, b));
-        let stream_files = match bus_key {
-            Some(_) => Self::stream_file_extents(&mut buffered, &udf_fs),
-            None => Vec::new(),
-        };
+        let streams = Self::bus_stream_files(&mut buffered, &udf_fs, bus_key.is_some())?;
 
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
         let disc = Self::finish(&mut buffered, capacity, udf_fs, aacs, opts)?;
@@ -1892,7 +1896,8 @@ impl Disc {
         // The SINGLE de-bus point, wired before the caller samples keys or muxes (the
         // metadata reads above ran under Passthrough).
         let session = buffered.into_inner();
-        Self::wire_bus_removal(session, bus_key, bus_map(stream_files, &disc.titles));
+        let map = bus_map(streams.files, &disc.titles).with_unmapped(streams.unmapped);
+        Self::wire_bus_removal(session, bus_key, map);
 
         // No CSS key recovery at scan time: DVD CSS keys are re-cracked keylessly at read time.
         tracing::info!(target: "freemkv::scan", format = ?disc.format, titles = disc.titles.len(), "phase: scan complete");
@@ -1937,28 +1942,55 @@ impl Disc {
     /// SSIF, fmts) as sorted, merged `(start_lba, sector_count)` ranges — the
     /// whole-disc encrypted-content map, unlike the title-only
     /// [`Self::encrypted_content_ranges`]. Reads the UDF tree from `reader`.
+    ///
+    /// Fails closed with [`Error::BusStreamUnmapped`], naming them, when any stream
+    /// file's extents cannot be read: a map that silently omits one is not this map.
     pub fn stream_content_ranges(reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
         let udf_fs = udf::read_filesystem(reader)?;
-        let files = Self::stream_file_extents(reader, &udf_fs);
-        Ok(crate::sector::bus_removal::BusMap::new(files, &[]).covered_ranges())
+        let scan = Self::stream_file_extents(reader, &udf_fs)?;
+        crate::sector::bus_removal::unmapped_error(&scan.unmapped)?;
+        Ok(crate::sector::bus_removal::BusMap::new(scan.files, &[]).covered_ranges())
     }
 
-    // Extents, in file order, of every file under /BDMV/STREAM (the AACS Clip AV
-    // stream files); an unrecorded extent is a `None` hole that keeps file offsets.
+    // The stream files a live scan's bus map needs. `debus` = the cert route installs a
+    // host-key de-bus stage; otherwise the map de-busses nothing, so skip the tree walk.
+    fn bus_stream_files(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        debus: bool,
+    ) -> Result<StreamScan> {
+        if !debus {
+            return Ok(StreamScan::default());
+        }
+        Self::stream_file_extents(reader, udf_fs)
+    }
+
+    /// Extents, in file order, of every file under /BDMV/STREAM (the AACS Clip AV
+    /// stream files); an unrecorded extent is a `None` hole that keeps file offsets.
+    ///
+    /// A file whose extents cannot be read is recorded in `unmapped` (its sectors stay
+    /// bus-encrypted, so whole-disc images must refuse it) and the walk goes on; a Stop
+    /// returns [`Error::Halted`]. An embedded file (§3.10.1) holds no Aligned Unit: skipped.
+    /// Per spec; do not change without a spec citation proving otherwise.
     pub(crate) fn stream_file_extents(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
-    ) -> Vec<Vec<(Option<u32>, u32)>> {
-        let mut out = Vec::new();
-        let mut stack: Vec<&udf::DirEntry> = udf_fs.find_dir("/BDMV/STREAM").into_iter().collect();
-        while let Some(dir) = stack.pop() {
+    ) -> Result<StreamScan> {
+        let mut out = StreamScan::default();
+        let mut stack: Vec<(&udf::DirEntry, String)> = udf_fs
+            .find_dir("/BDMV/STREAM")
+            .map(|d| (d, "/BDMV/STREAM".to_string()))
+            .into_iter()
+            .collect();
+        while let Some((dir, dir_path)) = stack.pop() {
             for e in &dir.entries {
+                let path = format!("{dir_path}/{}", e.name);
                 if e.is_dir {
-                    stack.push(e);
+                    stack.push((e, path));
                     continue;
                 }
                 match udf_fs.extents_abs_at(reader, e.meta_lba) {
-                    Ok(exts) => out.push(
+                    Ok(exts) => out.files.push(
                         exts.iter()
                             .filter(|x| x.len > 0)
                             .map(|x| {
@@ -1967,16 +1999,32 @@ impl Disc {
                             })
                             .collect(),
                     ),
-                    Err(err) => tracing::warn!(
+                    // §3.10.1: "The total size of an Aligned Unit is 6144 bytes, which is
+                    // equal to the size of 3 logical sectors." Embedded data holds none.
+                    Err(Error::UdfEmbeddedData) => tracing::debug!(
                         target: "freemkv::scan",
-                        file = %e.name,
-                        code = err.code(),
-                        "stream file extents unreadable; excluded from bus removal"
+                        file = %path,
+                        "embedded stream file: no Aligned Unit to de-bus"
                     ),
+                    // An operator Stop, not a disc fault: end the walk, record nothing.
+                    Err(Error::Halted) => return Err(Error::Halted),
+                    // §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV stream file";
+                    // unlocated, this file cannot be, so image outputs must refuse it.
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "freemkv::scan",
+                            file = %path,
+                            code = err.code(),
+                            error = %err,
+                            "stream file's File Entry unreadable; its sectors cannot be de-bussed"
+                        );
+                        let lost = crate::sector::bus_removal::UnmappedStreamFile::new;
+                        out.unmapped.push(lost(path, e.meta_lba, &err));
+                    }
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Wire the SINGLE AACS bus-removal de-bus point onto `session` from a
@@ -9152,6 +9200,13 @@ mod tests {
     }
 
     // ── whole-disc bus-removal gate ───────────────────────────────────────
+    // Verbatim quotes, AACS Blu-ray Disc Pre-recorded Book, Final Rev 0.953 (subscript 1₂ as 1b).
+    const SPEC_BD_3_7_BEF: &str = "AACS BD Pre-recorded Book 0.953 §3.7: \"If the Bus Encryption \
+        Enabled (BEE) flag in the Content Certificate is set to 1b, the BEF shall be set to 1b for \
+        all the sectors that correspond to the Aligned Unit with Copy_permission_indicator set to \
+        11b of the Clip AV stream files under \\BDMV\\STREAM directory.\"";
+    const SPEC_BD_3_7_NOTE: &str = "AACS BD Pre-recorded Book 0.953 §3.7 (Note): \"PC Host \
+        shall decrypt bus-encrypted Clip AV stream file and hand it over to the application.\"";
     // BD tree: two m2ts (only one in a title), an SSIF, a clear index.bdmv, and
     // an AACS content cert whose byte 1 carries the BEE flag.
     fn bus_fixture(cert_byte1: u8) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
@@ -9223,9 +9278,9 @@ mod tests {
         let (mut mem, udf) = bus_fixture(0x80);
         let mut feature = DiscTitle::empty();
         feature.extents = vec![ext(PART_START + 1_000, 3)];
-        let stream = Disc::stream_file_extents(&mut mem, &udf);
+        let stream = Disc::stream_file_extents(&mut mem, &udf).unwrap();
         assert_eq!(
-            bus_map(stream, &[feature]).covered_ranges(),
+            bus_map(stream.files, &[feature]).covered_ranges(),
             vec![
                 (PART_START + 1_000, 3),
                 (PART_START + 2_000, 6),
@@ -9247,6 +9302,268 @@ mod tests {
                 (PART_START + 2_000, 6),
                 (PART_START + 3_000, 3)
             ]
+        );
+    }
+
+    // Zero 00002.m2ts's File Entry (tag 0) after the tree was read: its extents are unreadable.
+    fn corrupt_m2ts2_icb(mem: &mut crate::udf::fixture::MemDisc) {
+        mem.put_bytes(crate::udf::fixture::PART_START + 41, &[0u8; 2048]);
+    }
+
+    // A reader that fails one LBA with `err` and serves the rest from `inner`.
+    struct FailAt {
+        inner: crate::udf::fixture::MemDisc,
+        lba: u32,
+        err: fn() -> Error,
+    }
+
+    impl SectorSource for FailAt {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            if (lba..lba + n as u32).contains(&self.lba) {
+                return Err((self.err)());
+            }
+            self.inner.read_sectors(lba, n, buf, r)
+        }
+    }
+
+    const SPEC_BD_3_7_NOT_STREAM: &str = "AACS BD Pre-recorded Book 0.953 §3.7: \"the BEF \
+        shall be set to 0b for the sectors that do not correspond to Clip AV stream files under \
+        \\BDMV\\STREAM directory.\"";
+    const SPEC_BD_3_7_OTHERWISE: &str = "AACS BD Pre-recorded Book 0.953 §3.7: \"If the BEE \
+        flag in the Content Certificate is set to 1b, the BEF shall be set to 1b [...]. \
+        Otherwise, the BEF shall be set to 0b.\"";
+    const SPEC_BD_8_1_3: &str = "AACS BD Pre-recorded Book 0.953 §8.1.3: \"When the Clip AV \
+        stream files are bus-encrypted as defined in Secion 3.7 of this specification, the \
+        corresponding Stereoscopic Interleaved files are also bus-encrypted.\"";
+    const SPEC_BD_3_10_1: &str = "AACS BD Pre-recorded Book 0.953 §3.10.1: \"The total size \
+        of an Aligned Unit is 6144 bytes, which is equal to the size of 3 logical sectors.\"";
+
+    fn unmapped_paths(scan: &StreamScan) -> Vec<&str> {
+        scan.unmapped.iter().map(|u| u.path.as_str()).collect()
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: "PC Host shall decrypt bus-encrypted Clip AV stream file".
+    #[test]
+    fn stream_content_ranges_fails_closed_naming_the_unreadable_stream_file() {
+        let (mut mem, _) = bus_fixture(0x80);
+        corrupt_m2ts2_icb(&mut mem);
+        match Disc::stream_content_ranges(&mut mem) {
+            Err(e @ Error::BusStreamUnmapped { .. }) => assert_eq!(
+                e.to_string(),
+                format!(
+                    "E{}: /BDMV/STREAM/00002.m2ts",
+                    crate::error::E_BUS_STREAM_UNMAPPED
+                ),
+                "{SPEC_BD_3_7_NOTE}"
+            ),
+            other => {
+                panic!("{SPEC_BD_3_7_NOTE}: a dropped file would ship bus-encrypted: {other:?}")
+            }
+        }
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: an unlocated file is recorded (by path + cause), not dropped.
+    #[test]
+    fn stream_file_extents_records_the_unreadable_file_and_maps_the_rest() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, udf) = bus_fixture(0x80);
+        corrupt_m2ts2_icb(&mut mem);
+        let mut scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_NOTE);
+        assert_eq!(
+            unmapped_paths(&scan),
+            ["/BDMV/STREAM/00002.m2ts"],
+            "{SPEC_BD_3_7_NOTE}"
+        );
+        let u = &scan.unmapped[0];
+        assert_eq!(u.icb, 41);
+        let fe_read = Error::DiscRead {
+            sector: (PART_START + 41) as u64,
+            status: None,
+            sense: None,
+        };
+        assert_eq!(u.cause, fe_read.to_string(), "names which read failed");
+        scan.files.sort();
+        assert_eq!(
+            scan.files,
+            vec![
+                vec![(Some(PART_START + 1_000), 3)],
+                vec![(Some(PART_START + 3_000), 3)],
+            ],
+            "{SPEC_BD_3_7_BEF}: the other files stay mapped"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_BEF`]: every Clip AV stream file is in scope, whichever one fails.
+    #[test]
+    fn stream_file_extents_records_any_unreadable_stream_file() {
+        use crate::udf::fixture::PART_START;
+        for (icb, name) in [(40u32, "00001.m2ts"), (41, "00002.m2ts")] {
+            let (mut mem, udf) = bus_fixture(0x80);
+            mem.put_bytes(PART_START + icb, &[0u8; 2048]);
+            let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_BEF);
+            let want = format!("/BDMV/STREAM/{name}");
+            assert_eq!(unmapped_paths(&scan), [want.as_str()], "{SPEC_BD_3_7_BEF}");
+            assert_eq!(scan.files.len(), 2, "{SPEC_BD_3_7_BEF}");
+        }
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_8_1_3`]: an SSIF file is bus-encrypted too, so it is recorded as well.
+    #[test]
+    fn stream_file_extents_records_an_unreadable_ssif() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, udf) = bus_fixture(0x80);
+        mem.put_bytes(PART_START + 42, &[0u8; 2048]);
+        let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_8_1_3);
+        assert_eq!(
+            unmapped_paths(&scan),
+            ["/BDMV/STREAM/SSIF/00003.ssif"],
+            "{SPEC_BD_8_1_3}"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: a drive read fault on a File Entry is recorded with its cause.
+    #[test]
+    fn stream_file_extents_records_a_drive_read_fault() {
+        use crate::udf::fixture::PART_START;
+        let (mem, udf) = bus_fixture(0x80);
+        let mut r = FailAt {
+            inner: mem,
+            lba: PART_START + 40,
+            err: || Error::DiscRead {
+                sector: (PART_START + 40) as u64,
+                status: None,
+                sense: None,
+            },
+        };
+        let scan = Disc::stream_file_extents(&mut r, &udf).expect(SPEC_BD_3_7_NOTE);
+        assert_eq!(
+            unmapped_paths(&scan),
+            ["/BDMV/STREAM/00001.m2ts"],
+            "{SPEC_BD_3_7_NOTE}"
+        );
+        let fault = Error::DiscRead {
+            sector: (PART_START + 40) as u64,
+            status: None,
+            sense: None,
+        };
+        assert_eq!(scan.unmapped[0].cause, fault.to_string());
+    }
+
+    // A Stop during the stream-file walk surfaces as Halted, never as a recorded bad file.
+    #[test]
+    fn stream_file_extents_propagates_halted() {
+        use crate::udf::fixture::PART_START;
+        for lba in [PART_START + 40, PART_START + 41] {
+            let (mem, udf) = bus_fixture(0x80);
+            let mut r = FailAt {
+                inner: mem,
+                lba,
+                err: || Error::Halted,
+            };
+            let got = Disc::stream_file_extents(&mut r, &udf);
+            assert!(matches!(got, Err(Error::Halted)), "ICB {lba}: {got:?}");
+        }
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_10_1`]: an embedded (< 1 sector) file holds no Aligned Unit, so it is skipped.
+    #[test]
+    fn stream_file_extents_skips_an_embedded_stream_file() {
+        use crate::udf::fixture::{PART_START, build_file_icb};
+        let (mut mem, udf) = bus_fixture(0x80);
+        let mut icb = build_file_icb(100, 2_000, false);
+        icb[34] = 3; // ECMA-167 4/14.6.8 AD type 3 = embedded; l_ad stays nonzero
+        mem.put_bytes(PART_START + 41, &icb);
+        let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_10_1);
+        assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_10_1}");
+        let map = crate::sector::bus_removal::BusMap::new(scan.files, &[]);
+        assert_eq!(
+            map.covered_ranges(),
+            vec![(PART_START + 1_000, 3), (PART_START + 3_000, 3)],
+            "{SPEC_BD_3_10_1}"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOT_STREAM`]: nav files are never bus-encrypted, so their faults are not ours.
+    #[test]
+    fn stream_file_extents_ignores_unreadable_files_outside_bdmv_stream() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, udf) = bus_fixture(0x80);
+        mem.put_bytes(PART_START + 43, &[0u8; 2048]); // index.bdmv File Entry
+        let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_NOT_STREAM);
+        assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_7_NOT_STREAM}");
+        assert_eq!(scan.files.len(), 3, "{SPEC_BD_3_7_NOT_STREAM}");
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_BEF`]: every readable stream file (m2ts + SSIF) is mapped, in file order.
+    #[test]
+    fn stream_file_extents_maps_every_readable_stream_file() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, udf) = bus_fixture(0x80);
+        let mut scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_BEF);
+        assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_7_BEF}");
+        scan.files.sort();
+        assert_eq!(
+            scan.files,
+            vec![
+                vec![(Some(PART_START + 1_000), 3)],
+                vec![(Some(PART_START + 2_000), 6)],
+                vec![(Some(PART_START + 3_000), 3)],
+            ],
+            "{SPEC_BD_3_7_BEF}"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: the live scan's host-key walk records, not fails, a bad file.
+    #[test]
+    fn live_bus_map_records_an_unreadable_file_when_host_key_debus_is_on() {
+        let (mut mem, udf) = bus_fixture(0x80);
+        corrupt_m2ts2_icb(&mut mem);
+        let scan = Disc::bus_stream_files(&mut mem, &udf, true).expect(SPEC_BD_3_7_NOTE);
+        assert_eq!(
+            unmapped_paths(&scan),
+            ["/BDMV/STREAM/00002.m2ts"],
+            "{SPEC_BD_3_7_NOTE}"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_OTHERWISE`]: no host-key stage means nothing to de-bus, so no walk to fail.
+    #[test]
+    fn live_bus_map_needs_no_stream_files_without_host_key_debus() {
+        let (mut mem, udf) = bus_fixture(0x00);
+        corrupt_m2ts2_icb(&mut mem);
+        assert_eq!(
+            Disc::bus_stream_files(&mut mem, &udf, false).expect(SPEC_BD_3_7_OTHERWISE),
+            StreamScan::default(),
+            "{SPEC_BD_3_7_OTHERWISE}"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_BEF`]: with every file readable, the live map carries them all.
+    #[test]
+    fn live_bus_map_carries_every_stream_file_when_readable() {
+        use crate::udf::fixture::PART_START;
+        let (mut mem, udf) = bus_fixture(0x80);
+        let scan = Disc::bus_stream_files(&mut mem, &udf, true).expect(SPEC_BD_3_7_BEF);
+        assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_7_BEF}");
+        assert_eq!(
+            bus_map(scan.files, &[]).covered_ranges(),
+            vec![
+                (PART_START + 1_000, 3),
+                (PART_START + 2_000, 6),
+                (PART_START + 3_000, 3)
+            ],
+            "{SPEC_BD_3_7_BEF}"
         );
     }
 
@@ -9381,6 +9698,174 @@ mod tests {
             d.read_sectors(lba, 6, &mut got, false).unwrap();
             assert_eq!(&got, want, "BEE byte {bee:#04x}: non-title m2ts bus state");
         }
+    }
+
+    // 00001.m2ts's File Entry keeps its info_length but its l_ad overruns the ICB, so the tree
+    // lists it at full size while its extents are unreadable (ECMA-167 4/14.17 L_AD).
+    fn break_m2ts1_ads(mem: &mut crate::udf::fixture::MemDisc) {
+        use crate::udf::fixture::{PART_START, build_file_icb};
+        let mut icb = build_file_icb(3 * 2048, 1_000, true);
+        icb[212..216].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+        mem.put_bytes(PART_START + 40, &icb);
+    }
+
+    // A live cert-route scan over `mem` (BEE=1 cert, `m2ts2` = 00002.m2ts wire bytes).
+    fn live_bus_scan(
+        mem: crate::udf::fixture::MemDisc,
+        rdk: Option<[u8; 16]>,
+    ) -> Result<(Drive, Disc)> {
+        let mut d = Drive::from_transport_for_test(Box::new(MemTransport(mem)));
+        let (capacity, mut buffered, udf) = Disc::read_udf(&mut d)?;
+        let cap = encrypt::capture(
+            &mut buffered,
+            &udf,
+            encrypt::CaptureFrom::Live { raw_copy: true },
+        )?;
+        let bus = encrypt::BusOutcome::Handshake(encrypt::HandshakeResult {
+            volume_id: [0x11; 16],
+            read_data_key: rdk,
+            read_data_key_err: None,
+            drive_unlocked: false,
+        });
+        let disc = Disc::live_finish(
+            buffered,
+            capacity,
+            udf,
+            Some((cap, bus)),
+            &ScanOptions::default(),
+        )?;
+        Ok((d, disc))
+    }
+
+    // 00002.m2ts clear bytes (CPI set on both units) and their bus-encrypted wire form.
+    fn m2ts2_clear_and_wire(rdk: &[u8; 16]) -> (Vec<u8>, Vec<u8>) {
+        let mut clear: Vec<u8> = (0..6 * 2048).map(|i| (i * 7 % 253) as u8).collect();
+        clear[0] |= 0xC0;
+        clear[3 * 2048] |= 0xC0;
+        let mut wire = clear.clone();
+        crate::aacs::content::encrypt_bus(&mut wire[..3 * 2048], rdk);
+        crate::aacs::content::encrypt_bus(&mut wire[3 * 2048..], rdk);
+        (clear, wire)
+    }
+
+    fn bee_cert() -> Vec<u8> {
+        let mut cert = vec![0u8; 32];
+        cert[0] = 0x10;
+        cert[1] = 0x80;
+        cert
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: one unlocatable clip must not sink the scan; titles/MKV
+    /// still run and every locatable stream file is still de-bussed on read.
+    #[test]
+    fn live_scan_proceeds_with_an_unreadable_stream_file() {
+        use crate::sector::SectorSource;
+        use crate::udf::fixture::PART_START;
+        let rdk = [0x6Du8; 16];
+        let (clear, wire) = m2ts2_clear_and_wire(&rdk);
+        let (mut mem, _) = bus_fixture_with(Some(bee_cert()), wire);
+        break_m2ts1_ads(&mut mem);
+        let (mut d, _disc) = live_bus_scan(mem, Some(rdk)).expect(SPEC_BD_3_7_NOTE);
+        let unmapped: Vec<&str> = d
+            .unmapped_stream_files()
+            .iter()
+            .map(|u| u.path.as_str())
+            .collect();
+        assert_eq!(unmapped, ["/BDMV/STREAM/00001.m2ts"], "{SPEC_BD_3_7_NOTE}");
+        let mut got = vec![0u8; 6 * 2048];
+        d.read_sectors(PART_START + 2_000, 6, &mut got, false)
+            .unwrap();
+        assert_eq!(
+            got, clear,
+            "{SPEC_BD_3_7_BEF}: a locatable file is still de-bussed"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: an image would carry the unlocated file still bus-encrypted,
+    /// so iso:// / sweep refuse up front, naming it.
+    #[test]
+    fn image_read_refuses_a_live_scan_with_an_unmapped_stream_file() {
+        let rdk = [0x6Du8; 16];
+        let (_, wire) = m2ts2_clear_and_wire(&rdk);
+        let (mut mem, _) = bus_fixture_with(Some(bee_cert()), wire);
+        break_m2ts1_ads(&mut mem);
+        let (d, _) = live_bus_scan(mem, Some(rdk)).expect("scan");
+        let err =
+            crate::sector::bus_removal::ensure_image_debussable(&d).expect_err(SPEC_BD_3_7_NOTE);
+        assert_eq!(
+            err.code(),
+            crate::error::E_BUS_STREAM_UNMAPPED,
+            "{SPEC_BD_3_7_NOTE}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "E6021: /BDMV/STREAM/00001.m2ts",
+            "{SPEC_BD_3_7_NOTE}"
+        );
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_BEF`]: every stream file located, so the image path is open.
+    #[test]
+    fn image_read_allows_a_live_scan_that_located_every_stream_file() {
+        let rdk = [0x6Du8; 16];
+        let (_, wire) = m2ts2_clear_and_wire(&rdk);
+        let (mem, _) = bus_fixture_with(Some(bee_cert()), wire);
+        let (d, _) = live_bus_scan(mem, Some(rdk)).expect("scan");
+        assert!(d.unmapped_stream_files().is_empty(), "{SPEC_BD_3_7_BEF}");
+        crate::sector::bus_removal::ensure_image_debussable(&d).expect(SPEC_BD_3_7_BEF);
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_OTHERWISE`]: no host-key stage leaves nothing bus-encrypted to refuse.
+    #[test]
+    fn image_read_allows_an_unreadable_stream_file_without_host_key_debus() {
+        let rdk = [0x6Du8; 16];
+        let (_, wire) = m2ts2_clear_and_wire(&rdk);
+        let (mut mem, _) = bus_fixture_with(Some(bee_cert()), wire);
+        break_m2ts1_ads(&mut mem);
+        let (d, _) = live_bus_scan(mem, None).expect("scan");
+        crate::sector::bus_removal::ensure_image_debussable(&d).expect(SPEC_BD_3_7_OTHERWISE);
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise.
+    /// [`SPEC_BD_3_7_NOTE`]: dir:// extracts every other file (de-bussed) and counts the
+    /// unlocated one lost whole, never writing its bus-encrypted bytes.
+    #[test]
+    fn dir_extract_marks_the_unmapped_stream_file_lost_and_extracts_the_rest() {
+        let rdk = [0x6Du8; 16];
+        let (clear, wire) = m2ts2_clear_and_wire(&rdk);
+        let (mut mem, _) = bus_fixture_with(Some(bee_cert()), wire);
+        break_m2ts1_ads(&mut mem);
+        let (mut d, disc) = live_bus_scan(mem, Some(rdk)).expect("scan");
+        let dest = tempfile::tempdir().unwrap();
+        let res = disc
+            .extract_tree(&mut d, dest.path(), &ExtractOptions::default())
+            .expect(SPEC_BD_3_7_NOTE);
+        let stream = dest.path().join("BDMV/STREAM");
+        assert_eq!(
+            std::fs::read(stream.join("00002.m2ts")).unwrap(),
+            clear,
+            "{SPEC_BD_3_7_NOTE}"
+        );
+        assert!(stream.join("SSIF/00003.ssif").is_file());
+        assert!(dest.path().join("BDMV/index.bdmv").is_file());
+        assert!(!stream.join("00001.m2ts").exists(), "{SPEC_BD_3_7_NOTE}");
+        assert!(
+            !stream.join("00001.m2ts.partial").exists(),
+            "{SPEC_BD_3_7_NOTE}"
+        );
+        let lost: Vec<_> = res.files.iter().filter(|f| !f.complete).collect();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].path, std::path::Path::new("BDMV/STREAM/00001.m2ts"));
+        assert_eq!(
+            (lost[0].bytes_good, lost[0].bytes_unreadable),
+            (0, 3 * 2048)
+        );
+        assert_eq!(res.bytes_lost(), 3 * 2048, "existing damage accounting");
+        assert!(!res.complete && !res.halted);
     }
 
     // ── encrypted_content_ranges ──────────────────────────────────────────

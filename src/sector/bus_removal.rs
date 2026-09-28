@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::consts::SECTOR_BYTES;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::SectorSource;
 
@@ -42,6 +42,51 @@ struct Located {
     head_in_span: Option<u32>,
 }
 
+/// A Clip AV stream file whose File Entry extents could not be read, so a
+/// [`BusMap`] cannot locate its sectors and they pass through still bus-encrypted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmappedStreamFile {
+    /// Disc path, e.g. `/BDMV/STREAM/00002.m2ts`.
+    pub path: String,
+    /// Why the File Entry could not be read, as `E{code}: {detail}`.
+    pub cause: String,
+    /// The file's ICB (File Entry) LBA in the metadata partition.
+    pub(crate) icb: u32,
+}
+
+impl UnmappedStreamFile {
+    /// `path` (a disc path), its File Entry `icb` and the read failure that lost it.
+    pub fn new(path: String, icb: u32, cause: &Error) -> Self {
+        Self {
+            path,
+            cause: cause.to_string(),
+            icb,
+        }
+    }
+}
+
+/// Refuse a whole-disc image (`iso://`, sweep, patch) read through `reader`
+/// when its bus map could not locate a bus-encrypted stream file: those sectors
+/// would be written still bus-encrypted as if plaintext. Names every such file.
+///
+/// AACS BD Pre-recorded Book 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted
+/// Clip AV stream file and hand it over to the application." An unlocated file cannot be.
+/// Per spec; do not change without a spec citation proving otherwise.
+pub fn ensure_image_debussable(reader: &dyn SectorSource) -> Result<()> {
+    unmapped_error(reader.unmapped_stream_files())
+}
+
+/// `Err(`[`Error::BusStreamUnmapped`]`)` naming every file in `unmapped`, or `Ok` when empty.
+pub(crate) fn unmapped_error(unmapped: &[UnmappedStreamFile]) -> Result<()> {
+    if unmapped.is_empty() {
+        return Ok(());
+    }
+    let files: Vec<&str> = unmapped.iter().map(|u| u.path.as_str()).collect();
+    Err(Error::BusStreamUnmapped {
+        files: files.join(", "),
+    })
+}
+
 /// Whole-disc host-key de-bus map: each AACS stream file's extents in file
 /// order, so an LBA resolves to its aligned unit and that unit's first sector.
 #[derive(Debug, Default, Clone)]
@@ -50,6 +95,8 @@ pub struct BusMap {
     spans: Vec<Span>,
     /// Per-file extents in file order; `None` start = unrecorded (a hole).
     files: Vec<Vec<(Option<u32>, u32)>>,
+    /// Stream files the map could not locate (their sectors stay bus-encrypted).
+    unmapped: Vec<UnmappedStreamFile>,
 }
 
 impl BusMap {
@@ -102,7 +149,22 @@ impl BusMap {
         }
         spans.extend(gaps);
         spans = disjoint(spans);
-        Self { spans, files }
+        Self {
+            spans,
+            files,
+            unmapped: Vec::new(),
+        }
+    }
+
+    /// Record the stream files this map could not locate.
+    pub(crate) fn with_unmapped(mut self, unmapped: Vec<UnmappedStreamFile>) -> Self {
+        self.unmapped = unmapped;
+        self
+    }
+
+    /// Stream files this map could not locate: whole-disc images must refuse them.
+    pub fn unmapped(&self) -> &[UnmappedStreamFile] {
+        &self.unmapped
     }
 
     /// Each range as its own unit-aligned file.
@@ -198,6 +260,10 @@ impl BusGate {
             cpi: HashMap::new(),
             last: None,
         }
+    }
+
+    pub(crate) fn map(&self) -> &BusMap {
+        &self.map
     }
 
     /// De-bus the whole sectors of `buf` (first at `base_lba`) that lie in
@@ -429,12 +495,99 @@ impl<S: SectorSource> SectorSource for BusRemovalSectorSource<S> {
     fn set_speed(&mut self, kbs: u16) {
         self.inner.set_speed(kbs)
     }
+
+    fn unmapped_stream_files(&self) -> &[UnmappedStreamFile] {
+        match (&self.stage, &self.gate) {
+            (BusStage::AacsHostKey(_), Some(g)) => g.map().unmapped(),
+            _ => self.inner.unmapped_stream_files(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aacs::content::encrypt_bus;
+
+    // A source whose own bus stage reports `0` as unmapped.
+    struct Reports(Vec<UnmappedStreamFile>);
+    impl SectorSource for Reports {
+        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+            Ok(0)
+        }
+        fn unmapped_stream_files(&self) -> &[UnmappedStreamFile] {
+            &self.0
+        }
+    }
+
+    fn m2ts1() -> UnmappedStreamFile {
+        UnmappedStreamFile::new(
+            "/BDMV/STREAM/00001.m2ts".into(),
+            40,
+            &Error::UdfAdChainTooLong,
+        )
+    }
+
+    // Through a generic bound, so the forwarding impls (not the vtable) answer.
+    fn unmapped_paths<S: SectorSource>(s: &S) -> Vec<String> {
+        s.unmapped_stream_files()
+            .iter()
+            .map(|u| u.path.clone())
+            .collect()
+    }
+
+    // A wrapper that drops the list would reopen the image path to bus-encrypted bytes.
+    #[test]
+    fn unmapped_stream_files_forward_through_every_wrapper() {
+        let want = ["/BDMV/STREAM/00001.m2ts"];
+        let boxed: Box<dyn SectorSource> = Box::new(Reports(vec![m2ts1()]));
+        assert_eq!(unmapped_paths(&boxed), want, "Box<dyn>");
+        let mut r = Reports(vec![m2ts1()]);
+        let dyn_ref: &mut dyn SectorSource = &mut r;
+        assert_eq!(unmapped_paths(&dyn_ref), want, "&mut dyn");
+        let mut r = Reports(vec![m2ts1()]);
+        let buffered = crate::udf::BufferedSectorReader::new(&mut r, 1);
+        assert_eq!(unmapped_paths(&buffered), want, "BufferedSectorReader");
+        let pass = BusRemovalSectorSource::new(Reports(vec![m2ts1()]), BusStage::Passthrough);
+        assert_eq!(
+            unmapped_paths(&pass),
+            want,
+            "BusRemovalSectorSource defers to inner"
+        );
+    }
+
+    // A host-key adapter answers from its own map, which is what it failed to de-bus.
+    #[test]
+    fn bus_removal_source_reports_its_own_maps_unmapped_files() {
+        let map = BusMap::from_ranges(&[(300, 3)]).with_unmapped(vec![m2ts1()]);
+        let s = BusRemovalSectorSource::new(Reports(Vec::new()), BusStage::AacsHostKey([1; 16]))
+            .with_bus_map(Arc::new(map));
+        assert_eq!(unmapped_paths(&s), ["/BDMV/STREAM/00001.m2ts"]);
+    }
+
+    /// Per spec; do not change without a spec citation proving otherwise. AACS BD Pre-recorded
+    /// 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV stream file" — every
+    /// unlocated file is named, and none means the image may proceed.
+    #[test]
+    fn ensure_image_debussable_names_every_unmapped_file() {
+        assert!(ensure_image_debussable(&Reports(Vec::new())).is_ok());
+        let ssif = UnmappedStreamFile::new(
+            "/BDMV/STREAM/SSIF/00003.ssif".into(),
+            42,
+            &Error::UdfAdChainTooLong,
+        );
+        let err = ensure_image_debussable(&Reports(vec![m2ts1(), ssif])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "E6021: /BDMV/STREAM/00001.m2ts, /BDMV/STREAM/SSIF/00003.ssif"
+        );
+    }
+
+    #[test]
+    fn unmapped_stream_file_keeps_the_cause_display() {
+        assert_eq!(m2ts1().cause, Error::UdfAdChainTooLong.to_string());
+        assert_eq!(m2ts1().icb, 40);
+    }
 
     /// A source returning a fixed buffer for any read (starting at whatever the
     /// fixture built), reporting the full span.
