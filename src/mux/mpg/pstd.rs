@@ -716,6 +716,34 @@ mod tests {
         }
     }
 
+    // B1: at EOF nothing is left behind. A zero-length AU used to wedge its stream and
+    // every AU after it; `finish` returned Ok with them queued.
+    #[test]
+    fn eof_never_leaves_aus_behind() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 0, 0));
+        m.push(0, au(12_600, 100, 0));
+        m.finish().unwrap();
+        assert!(
+            m.streams.iter().all(|s| s.queue.is_empty()),
+            "AUs left queued"
+        );
+    }
+
+    // B1: a picture start code no PES of a fresh pack can reach (a long sequence header or
+    // user data ahead of it): the bytes before it go first, without a PTS.
+    #[test]
+    fn a_commencement_past_a_packs_reach_still_goes() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 5_000, 3_000));
+        m.push(0, au(12_600, 100, 0));
+        m.finish().unwrap();
+        assert!(
+            m.streams.iter().all(|s| s.queue.is_empty()),
+            "AUs left queued"
+        );
+    }
+
     // An AU's first byte and its commencement byte share one PES: a PES ends before the next
     // AU's first byte, never between its sequence header and its picture start code (MS-15).
     #[test]

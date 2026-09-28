@@ -332,6 +332,62 @@ fn assert_replays(r: &Run, fx: &Fx) {
     );
 }
 
+// B1: an empty frame (a Matroska empty Block) is no AU: it never wedges its stream, and
+// every frame after it is written.
+#[test]
+fn an_empty_frame_never_wedges_its_stream() {
+    let mut fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    // An empty AC-3 frame, and an empty video frame after the first keyframe.
+    for (track, key) in [(3, true), (0, false)] {
+        let at = fx
+            .frames
+            .iter()
+            .position(|f| f.track == track && f.keyframe == key)
+            .unwrap();
+        let mut e = fx.frames[at].clone();
+        e.data.clear();
+        fx.frames.insert(at + 1, e);
+    }
+    let r = run(&fx);
+    for (track, key) in [(0usize, (0xE0u8, None)), (3, (0xBD, Some(0x80u8)))] {
+        let want: Vec<u8> = fx.input[&track]
+            .iter()
+            .flat_map(|f| f.1.iter().copied())
+            .collect();
+        assert_eq!(es_of(&r.parsed, key).len(), want.len(), "{key:?} ES bytes");
+    }
+    assert_replays(&r, &fx);
+}
+
+// B1: user data ahead of the picture start code puts the commencement byte past any PES of
+// a fresh pack; the AU is still written, its PTS in the PES that holds the picture start.
+#[test]
+fn a_picture_start_past_one_pack_is_written() {
+    let mut fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    for f in fx.frames.iter_mut().filter(|f| f.track == 0 && f.keyframe) {
+        let at = picture_start(&f.data);
+        let mut user = vec![0, 0, 1, 0xB2];
+        user.resize(3_000, 0x5A);
+        f.data.splice(at..at, user);
+    }
+    let fx = rebuild_aus(fx);
+    let r = run(&fx);
+    let want: Vec<u8> = fx.input[&0]
+        .iter()
+        .flat_map(|f| f.1.iter().copied())
+        .collect();
+    assert_eq!(es_of(&r.parsed, (0xE0, None)), want, "video ES bytes");
+    assert_replays(&r, &fx);
+}
+
 // Design §2.3 pack fill: 1-5 spare bytes go as PES-header stuffing on the last PES (MS-13
 // "No more than 32 stuffing bytes"), never pack stuffing: a stuffed pack header moves byte
 // 0x14 off the first PES's flags, where CSS scrambling detection reads a VOB pack.
