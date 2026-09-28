@@ -3531,4 +3531,70 @@ mod tests {
             "a URL source scans the image, which has no filesystem"
         );
     }
+
+    /// KU §3.1 (review item 3): "`keys` must be `Some` for AACS". With no AACS set (none, or a
+    /// non-AACS set) and not raw, `Iso` and `Live` refuse E7022 at the first AACS-flagged
+    /// unit rather than muxing ciphertext; raw passes it through, and clear content muxes.
+    #[test]
+    fn mux_with_keys_without_an_aacs_set_refuses_aacs_content() {
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let key = [0x5A; 16];
+        let none = crate::keys::ResolvedKeySet::none();
+        let live = |keys: Option<&crate::keys::ResolvedKeySet>, raw: bool, unit: Vec<u8>| {
+            let (_, title, _) = keyed_live(key);
+            let reader = Box::new(AacsUnitReader { unit, capacity: 16 });
+            let opts = MuxOptions {
+                raw,
+                ..keyed_opts()
+            };
+            mux_with_keys(
+                MuxSource::Live {
+                    reader,
+                    title,
+                    format: crate::disc::ContentFormat::BdTs,
+                },
+                keys,
+                "null://",
+                &opts,
+                &Halt::new(),
+                Arc::new(NoopEvents),
+            )
+        };
+        let code = |r: std::io::Result<MuxOutcome>| r.err().and_then(|e| crate::error_code(&e));
+        let e7022 = Some(crate::error::E_NO_DISC_KEY);
+        assert_eq!(code(live(None, false, encrypted_audio_unit(&key))), e7022);
+        assert_eq!(
+            code(live(Some(&none), false, encrypted_audio_unit(&key))),
+            e7022
+        );
+        assert!(
+            live(None, true, encrypted_audio_unit(&key)).is_ok(),
+            "raw passes"
+        );
+        let mut clear = encrypted_audio_unit(&key);
+        crate::test_util::decrypt_unit(&mut clear, &key);
+        clear.chunks_mut(192).for_each(|p| p[0] &= 0x3F);
+        let out = live(None, false, clear).expect("clear content needs no key");
+        assert!(out.completed && out.bytes_written > 0);
+
+        let (_, title, _) = keyed_live(key);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.iso");
+        let mut image = encrypted_audio_unit(&key);
+        image.resize(16 * 2048, 0);
+        std::fs::write(&path, &image).unwrap();
+        let iso = mux_with_keys(
+            MuxSource::Iso {
+                path: &path,
+                title,
+                format: crate::disc::ContentFormat::BdTs,
+            },
+            None,
+            "null://",
+            &keyed_opts(),
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        );
+        assert_eq!(code(iso), e7022);
+    }
 }
