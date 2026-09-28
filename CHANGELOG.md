@@ -33,6 +33,7 @@
 - `Error::AacsKeyFileUnreadable` (E7031).
 - `DecryptingSectorSource::clear_unit_base()`: drop the unit base so AACS content reads fail loud until the next `set_unit_base`.
 - `Error::WholeDiscKeyMissing` (E7032): a decrypted whole-disc image would keep encrypted pieces because a stream file no title plays has no held key. The fix is an MKV rip or a raw copy.
+- `whole_disc::whole_disc_reader` / `WholeDiscReader`: the decrypting reader for a whole-disc or image → ISO copy, shared by every front end. It keys every stream file no title plays, not just the kept titles. Each is probed at its first unit and up to 32 across it, and a held base key must open two probed units before it keys the file. Ciphertext that no held key opens refuses with E7032 before any output. A file with no proven key stays unkeyed on a multi-key disc, and a copy that reaches an encrypted unit there stops with E7032. `UnitAligned::unit_block_end` tiles sweep blocks on each file's unit grid.
 - `ScanOptions::raw_copy`: a raw disc→ISO copy scans on past an unreadable `Unit_Key_RO.inf`, with E7031 recorded and every key refused.
 
 ### Fixed
