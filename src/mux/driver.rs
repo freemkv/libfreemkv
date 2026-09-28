@@ -738,7 +738,7 @@ fn drive_mux(
 
     // ── Frame pump ── Per-frame send deadline is a hard bound (autorip) or
     // effectively unbounded (CLI). Either way `send_with_halt` re-checks halt
-    // every `POLL_INTERVAL`, so Ctrl-C / `/api/stop` stays responsive.
+    // every `WAIT_SLICE`, so Ctrl-C / `/api/stop` stays responsive.
     let deadline = send_deadline;
     let mut interrupted = false;
     // A send refused with no halt and a healthy consumer ran out its deadline.
@@ -1629,6 +1629,8 @@ mod tests {
     // Mutation: dropping `reader_event_fn` leaves `saw_read_total` false.
     #[test]
     fn mux_stream_iso_forwards_reader_progress_through_arc() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
         let pkt = bdts_data_packet(0x1100, true, &audio_pes(&es));
         let mut data = vec![0u8; 3 * 2048]; // 3 sectors = one AACS unit = 6144 bytes

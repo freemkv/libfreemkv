@@ -2482,6 +2482,8 @@ mod tests {
     // Empty extents -> clean immediate EOF, no panic/hang.
     #[test]
     fn build_iso_pipeline_empty_extents_clean_eof() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let title = aac_audio_title(0x1100); // extents empty by default
         let mut stream = build_iso_pipeline(
             MemSource { data: Vec::new() },
@@ -2508,6 +2510,8 @@ mod tests {
     // then clean EOF.
     #[test]
     fn build_iso_pipeline_delivers_one_frame_then_eof() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
         let pes = audio_pes(&es);
         let pkt = bdts_data_packet(0x1100, true, &pes);
@@ -2572,6 +2576,8 @@ mod tests {
     // a frame from the excluded PID.
     #[test]
     fn build_iso_pipeline_pruned_title_drops_unselected_pid_frames() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
         use crate::mux::select::{PidFilter, StreamSelection};
 
@@ -2652,6 +2658,8 @@ mod tests {
     /// would spin the producer forever). Surfaced as an io error, not a hang.
     #[test]
     fn build_iso_pipeline_zero_batch_rejected() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let title = aac_audio_title(0x1100);
         let res = build_iso_pipeline(
             MemSource { data: Vec::new() },
@@ -2671,6 +2679,8 @@ mod tests {
     // scrambled-uncrackable must HARD-FAIL, never mux garbage.
     #[test]
     fn build_iso_pipeline_dvd_none_keys_scrambled_hard_fails() {
+        // Spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         // One CSS-scrambled, crib-less (uncrackable) MPEG-PS sector.
         let key = [0x11u8, 0x22, 0x33, 0x44, 0x55];
         let mut sec = vec![0u8; 2048];

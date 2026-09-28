@@ -10,11 +10,11 @@
 // Only the Linux/macOS writeback paths call this; Windows has no bounded syscall yet.
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::mpsc::sync_channel;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::halt::{Halt, POLL_INTERVAL};
+use crate::halt::{Halt, Recv};
 
 /// Failure outcome from a bounded syscall wrapper.
 #[derive(Debug)]
@@ -64,33 +64,14 @@ where
             let _ = tx.send(op());
         });
 
-    // `None` = a timeout past `Instant`'s range: unbounded.
-    let deadline = Instant::now().checked_add(timeout);
-    loop {
-        let now = Instant::now();
-        let slice = deadline.map_or(POLL_INTERVAL, |d| {
-            d.saturating_duration_since(now).min(POLL_INTERVAL)
-        });
-        match rx.recv_timeout(slice) {
-            Ok(v) => return Ok(v),
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(h) = halt
-                    && h.is_cancelled()
-                {
-                    return Err(BoundedError::Halted);
-                }
-                if deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(BoundedError::Timeout);
-                }
-                // Otherwise: another slice.
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Worker thread spawn failed, or it panicked before
-                // sending. Caller treats this as "no syscall ran" —
-                // typically a no-op + log.
-                return Err(BoundedError::WorkerLost);
-            }
-        }
+    // Halt-aware in WAIT_SLICE slices; a `timeout` past `Instant`'s range is unbounded.
+    let never = Halt::new();
+    match halt.unwrap_or(&never).recv_timeout(&rx, timeout) {
+        Ok(Recv::Item(v)) => Ok(v),
+        Ok(Recv::TimedOut) => Err(BoundedError::Timeout),
+        // Worker spawn failed, or it panicked before sending: "no syscall ran".
+        Ok(Recv::Disconnected) => Err(BoundedError::WorkerLost),
+        Err(_) => Err(BoundedError::Halted),
     }
 }
 
@@ -99,6 +80,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     // `Duration::MAX` overflowed `Instant + Duration` and panicked; it means unbounded.
     #[test]

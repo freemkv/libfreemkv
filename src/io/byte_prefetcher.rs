@@ -4,10 +4,11 @@
 //! producer re-fills in place, for zero allocations and zero cross-thread frees in the hot
 //! loop. Works for any stream whose source is an `io::Read`, not just a `SectorSource`.
 
-use crate::halt::{Halt, POLL_INTERVAL};
-use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
+use crate::halt::{Halt, Recv, SendOutcome};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::io::Read;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Items flowing through the forward channel.
 pub type Batch = std::io::Result<Vec<u8>>;
@@ -32,8 +33,8 @@ pub const DEFAULT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Drop blocks until the producer exits. For a prompt exit, drop the
 /// forward receiver and recycle sender first (channel disconnection)
-/// or cancel the [`Halt`] passed to [`BytePrefetcher::new`], polled
-/// at [`POLL_INTERVAL`] granularity even while parked on a channel op.
+/// or cancel the [`Halt`] passed to [`BytePrefetcher::new`], observed
+/// within one [`WAIT_SLICE`](crate::halt::WAIT_SLICE) even while parked on a channel op.
 pub struct PrefetchShell {
     producer: Option<JoinHandle<()>>,
 }
@@ -76,6 +77,8 @@ impl BytePrefetcher {
             let _ = recycle_tx.send(vec![0u8; chunk_bytes]);
         }
 
+        // A never-cancelled stand-in keeps one halt-aware code path without a token.
+        let wait = halt.unwrap_or_default();
         let producer = std::thread::Builder::new()
             .name("freemkv-byte-prefetch".into())
             .spawn(move || {
@@ -83,30 +86,18 @@ impl BytePrefetcher {
                 // but a panic sends an error sentinel first so demux gets a typed error
                 // instead of finalizing a truncated mux as success.
                 let body = std::panic::AssertUnwindSafe(|| {
-                    let cancelled = || halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false);
                     // Liveness heartbeat: a stalled consumer or wedged reader shows up
                     // as the beat going silent. Total is unknown, so `pos` is cumulative.
                     let mut hb = crate::progress::Heartbeat::new("byte_prefetch");
                     let mut produced_bytes: u64 = 0;
                     loop {
                         hb.tick(produced_bytes, 0);
-                        if cancelled() {
+                        // Halt-aware: a cancel does not disconnect the channel, so a
+                        // plain recv() would never re-reach the check. Disconnected =
+                        // the consumer dropped both channels.
+                        let Ok(Recv::Item(mut buf)) = wait.recv_timeout(&recycle_rx, Duration::MAX)
+                        else {
                             return;
-                        }
-                        // Re-poll halt every POLL_INTERVAL: a pure-AtomicBool Halt does
-                        // not disconnect the channel, so a blocking recv() would never
-                        // re-reach the cancel check.
-                        let mut buf = loop {
-                            match recycle_rx.recv_timeout(POLL_INTERVAL) {
-                                Ok(b) => break b,
-                                Err(RecvTimeoutError::Timeout) => {
-                                    if cancelled() {
-                                        return;
-                                    }
-                                }
-                                // Consumer dropped both channels.
-                                Err(RecvTimeoutError::Disconnected) => return,
-                            }
                         };
                         // Regrow to chunk_bytes: a prior short read truncated len to
                         // n < chunk_bytes. No realloc — capacity was fixed at
@@ -125,7 +116,7 @@ impl BytePrefetcher {
                             Ok(0) => return, // EOF — drop tx, consumer sees RecvError
                             Ok(n) => n,
                             Err(e) => {
-                                let _ = tx.send(Err(e));
+                                let _ = wait.send_timeout(&tx, Err(e), Duration::MAX);
                                 return;
                             }
                         };
@@ -134,19 +125,9 @@ impl BytePrefetcher {
                         // Hand off the filled buffer, re-polling halt on
                         // each timeout slice so a cancel can interrupt a
                         // producer parked on a saturated forward channel.
-                        let mut pending = Ok(buf);
-                        loop {
-                            match tx.send_timeout(pending, POLL_INTERVAL) {
-                                Ok(()) => break,
-                                Err(SendTimeoutError::Timeout(returned)) => {
-                                    if cancelled() {
-                                        return;
-                                    }
-                                    pending = returned;
-                                }
-                                // Consumer dropped.
-                                Err(SendTimeoutError::Disconnected(_)) => return,
-                            }
+                        let sent = wait.send_timeout(&tx, Ok(buf), Duration::MAX);
+                        if !matches!(sent, Ok(SendOutcome::Sent)) {
+                            return; // consumer dropped, or stopped
                         }
                     }
                 });
@@ -154,7 +135,8 @@ impl BytePrefetcher {
                     // Producer panicked mid-stream — surface a typed terminal
                     // error so the demux thread does NOT read the dropped channel
                     // as a clean EOF and truncate output.
-                    let _ = tx.send(Err(crate::error::Error::DemuxThreadPanicked.into()));
+                    let e = crate::error::Error::DemuxThreadPanicked.into();
+                    let _ = wait.send_timeout(&tx, Err(e), Duration::MAX);
                 }
             })?;
 

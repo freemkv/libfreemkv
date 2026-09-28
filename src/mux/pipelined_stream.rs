@@ -64,6 +64,8 @@ pub struct PipelinedPesStream {
     au_asm: Vec<super::au_assembly::AuAssembler>,
     /// Bounds the header pump's wait for in-band codec configs (AAC).
     header_gate: super::header_gate::HeaderGate,
+    /// The op's stop token; a never-cancelled stand-in when there is none.
+    halt: crate::halt::Halt,
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
@@ -115,18 +117,28 @@ impl PipelinedPesStream {
             is_video,
             au_asm,
             header_gate: super::header_gate::HeaderGate::default(),
+            halt: crate::halt::Halt::new(),
         }
     }
 
     // The op's stop token: a cancel ends a blocked `read` with `Halted` (LP11).
-    pub(crate) fn with_halt(self, _halt: Option<crate::halt::Halt>) -> Self {
+    pub(crate) fn with_halt(mut self, halt: Option<crate::halt::Halt>) -> Self {
+        self.halt = halt.unwrap_or_default();
         self
     }
 
     // Pull one batch, parse it, enqueue frames on pending_frames. Ok(true) =
     // success, Ok(false) = clean EOF, Err = demuxer error.
     fn pump_one_batch(&mut self) -> io::Result<bool> {
-        match self.demux_rx.recv() {
+        let batch = match self
+            .halt
+            .recv_timeout(&self.demux_rx, std::time::Duration::MAX)
+        {
+            Ok(crate::halt::Recv::Item(b)) => Ok(b),
+            Ok(_) => Err(()),
+            Err(halted) => return Err(halted.into()),
+        };
+        match batch {
             Ok(DemuxBatch::Ts(packets)) => {
                 self.consume_ts(packets);
                 Ok(true)

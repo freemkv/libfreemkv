@@ -9,10 +9,10 @@
 
 use crate::error::Result;
 use crate::event::{Event, EventKind};
-use crate::halt::{Halt, POLL_INTERVAL};
+use crate::halt::{DriveHolder, Halt, Recv, SendOutcome};
 use crate::sector::SectorSource;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
-use std::thread::JoinHandle;
+use crossbeam_channel::{Receiver, Sender, bounded};
+use std::time::Duration;
 
 /// Producer-thread event callback. Fires `BytesRead` after every
 /// successful batch read so the consumer side can update a UI
@@ -43,8 +43,8 @@ pub struct PrefetchedSectorSource {
     /// cross-thread alloc/free was the dominant cost in the demux
     /// thread before this).
     recycle_tx: Sender<Vec<u8>>,
-    /// Joined on drop so producer cleanup runs deterministically.
-    producer: Option<JoinHandle<()>>,
+    /// The producer, a Drive holder (§2.5): joined on drop.
+    producer: Option<DriveHolder<()>>,
     /// Total sector count across all extents, computed once at
     /// construction (the sum of each extent's `sector_count`) and
     /// returned by [`capacity_sectors`]. Never updated by reads.
@@ -59,6 +59,17 @@ pub struct PrefetchedSectorSource {
     producer_failed: bool,
     /// The reader's unmapped stream files, snapshotted before it moved to the producer.
     unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
+    /// The op's token: once cancelled, the closed channel is a stop, not EOF (L096).
+    halt: Option<Halt>,
+}
+
+// Hand `item` to the consumer, waiting on a full channel; `false` once the consumer is
+// gone or `halt` is cancelled (observed within a slice), so the producer returns.
+fn send_or_stop(halt: &Halt, tx: &Sender<Batch>, item: Batch) -> bool {
+    matches!(
+        halt.send_timeout(tx, item, Duration::MAX),
+        Ok(SendOutcome::Sent)
+    )
 }
 
 impl PrefetchedSectorSource {
@@ -126,6 +137,8 @@ impl PrefetchedSectorSource {
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
         let batch_bytes = batch_sectors as usize * 2048;
+        // A never-cancelled stand-in keeps one halt-aware code path without a token.
+        let wait = halt.clone().unwrap_or_default();
 
         // Seed the recycle pool so the producer has a buffer on the first
         // iteration; otherwise the first recycle_rx.recv() blocks forever.
@@ -133,122 +146,118 @@ impl PrefetchedSectorSource {
             let _ = recycle_tx.send(vec![0u8; batch_bytes]);
         }
 
-        let producer = std::thread::Builder::new()
-            .name("freemkv-prefetch".into())
-            .spawn(move || {
-                // catch_unwind so a panic (decrypt source, read path, event_fn) isn't
-                // mistaken for clean EOF: a dropped `tx` alone would finalize a
-                // TRUNCATED mux as success. Locals are thread-local, so this is sound.
-                let body = std::panic::AssertUnwindSafe(|| {
-                    let mut ext_idx = 0usize;
-                    let mut offset: u32 = 0;
-                    let mut bytes_read_total: u64 = 0;
-                    while ext_idx < extents.len() {
-                        if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                            return;
-                        }
-                        let extent = &extents[ext_idx];
-                        // AACS aligned units anchor at THIS extent's start LBA, so gate
-                        // relative to it, not absolute disc LBA 0. No-op for
-                        // non-decrypting / CSS / None sources.
-                        reader.set_unit_base(extent.start_lba);
-                        let remaining = extent.sector_count.saturating_sub(offset);
-                        if remaining == 0 {
-                            ext_idx += 1;
-                            offset = 0;
-                            continue;
-                        }
-                        // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt processes only
-                        // full units, so a tail below one unit can't decrypt — error, don't emit
-                        // encrypted bytes. (`remaining > 0` above, so `< align` IS the short tail; `!is_multiple_of` was redundant.)
-                        if remaining < unit_align as u32 {
-                            let _ = tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
-                            return;
-                        }
-                        let mut sectors = remaining.min(batch_sectors as u32) as u16;
-                        // Trim to a whole number of units. A trim to 0 here means the
-                        // batch window landed on a sub-unit boundary (not the
-                        // trailing-tail case, rejected above); clamp to one unit.
-                        if sectors >= unit_align {
-                            sectors -= sectors % unit_align;
-                        } else {
-                            sectors = unit_align;
-                        }
-                        let bytes = sectors as usize * 2048;
-                        // Re-poll halt every POLL_INTERVAL: a pure-AtomicBool Halt
-                        // doesn't disconnect the channel, so a blocking recv() would
-                        // never re-reach the cancel check. Mirrors BytePrefetcher.
-                        let mut buf = loop {
-                            match recycle_rx.recv_timeout(POLL_INTERVAL) {
-                                Ok(b) => break b,
-                                Err(RecvTimeoutError::Timeout) => {
-                                    if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                                        return;
-                                    }
-                                }
-                                // Consumer dropped both channels.
-                                Err(RecvTimeoutError::Disconnected) => return,
-                            }
-                        };
-                        // Sound resize (was `unsafe set_len` guarded only by capacity):
-                        // public `into_channels` lets a caller recycle a cap-only Vec, so
-                        // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
-                        buf.resize(bytes, 0);
-                        // `start_lba + offset` derives from untrusted extent
-                        // data — saturate rather than wrap/panic on a
-                        // hostile start_lba near u32::MAX.
-                        let lba = extent.start_lba.saturating_add(offset);
-                        match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
-                            Ok(n) => {
-                                // A short read must not desync the stream: advance by
-                                // sectors actually read, and reject a non-whole-sector
-                                // count (belt-and-braces; FileSectorSource read_exact's).
-                                if n % 2048 != 0 {
-                                    let _ = tx.send(Err(
-                                        crate::error::Error::ExtentNotUnitAligned.into()
-                                    ));
-                                    return;
-                                }
-                                let sectors_read = (n / 2048) as u32;
-                                // A zero-byte read isn't EOF (extents still have
-                                // `remaining`) and would spin forever; send a terminal
-                                // sentinel instead of a clean EOF that reports success.
-                                if sectors_read == 0 {
-                                    let _ =
-                                        tx.send(Err(crate::error::Error::SourceTerminated.into()));
-                                    return;
-                                }
-                                buf.truncate(n);
-                                bytes_read_total = bytes_read_total.saturating_add(n as u64);
-                                if let Some(ref f) = event_fn {
-                                    f(Event {
-                                        kind: EventKind::BytesRead {
-                                            bytes: bytes_read_total,
-                                            total: bytes_total_extents,
-                                        },
-                                    });
-                                }
-                                if tx.send(Ok(buf)).is_err() {
-                                    return; // consumer dropped
-                                }
-                                offset = offset.saturating_add(sectors_read);
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(e.into()));
+        #[cfg(test)]
+        assert!(
+            crate::halt::DRIVE_HOLDER_TEST_LOCK.try_lock().is_err(),
+            "a test that spawns a prefetcher (a Drive holder) must hold DRIVE_HOLDER_TEST_LOCK"
+        );
+        let producer = crate::halt::spawn_drive_holder("prefetch", move || {
+            // catch_unwind so a panic (decrypt source, read path, event_fn) isn't
+            // mistaken for clean EOF: a dropped `tx` alone would finalize a
+            // TRUNCATED mux as success. Locals are thread-local, so this is sound.
+            let body = std::panic::AssertUnwindSafe(|| {
+                let mut ext_idx = 0usize;
+                let mut offset: u32 = 0;
+                let mut bytes_read_total: u64 = 0;
+                while ext_idx < extents.len() {
+                    if wait.is_cancelled() {
+                        return;
+                    }
+                    let extent = &extents[ext_idx];
+                    // AACS aligned units anchor at THIS extent's start LBA, so gate
+                    // relative to it, not absolute disc LBA 0. No-op for
+                    // non-decrypting / CSS / None sources.
+                    reader.set_unit_base(extent.start_lba);
+                    let remaining = extent.sector_count.saturating_sub(offset);
+                    if remaining == 0 {
+                        ext_idx += 1;
+                        offset = 0;
+                        continue;
+                    }
+                    // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt processes only
+                    // full units, so a tail below one unit can't decrypt — error, don't emit
+                    // encrypted bytes. (`remaining > 0` above, so `< align` IS the short tail; `!is_multiple_of` was redundant.)
+                    if remaining < unit_align as u32 {
+                        let e = crate::error::Error::ExtentNotUnitAligned.into();
+                        send_or_stop(&wait, &tx, Err(e));
+                        return;
+                    }
+                    let mut sectors = remaining.min(batch_sectors as u32) as u16;
+                    // Trim to a whole number of units. A trim to 0 here means the
+                    // batch window landed on a sub-unit boundary (not the
+                    // trailing-tail case, rejected above); clamp to one unit.
+                    if sectors >= unit_align {
+                        sectors -= sectors % unit_align;
+                    } else {
+                        sectors = unit_align;
+                    }
+                    let bytes = sectors as usize * 2048;
+                    // Halt-aware: a cancel does not disconnect the channel, so a
+                    // plain recv() would never re-reach the check. Disconnected =
+                    // the consumer dropped both channels.
+                    let Ok(Recv::Item(mut buf)) = wait.recv_timeout(&recycle_rx, Duration::MAX)
+                    else {
+                        return;
+                    };
+                    // Sound resize (was `unsafe set_len` guarded only by capacity):
+                    // public `into_channels` lets a caller recycle a cap-only Vec, so
+                    // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
+                    buf.resize(bytes, 0);
+                    // `start_lba + offset` derives from untrusted extent
+                    // data — saturate rather than wrap/panic on a
+                    // hostile start_lba near u32::MAX.
+                    let lba = extent.start_lba.saturating_add(offset);
+                    match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
+                        Ok(n) => {
+                            // A short read must not desync the stream: advance by
+                            // sectors actually read, and reject a non-whole-sector
+                            // count (belt-and-braces; FileSectorSource read_exact's).
+                            if n % 2048 != 0 {
+                                let e = crate::error::Error::ExtentNotUnitAligned.into();
+                                send_or_stop(&wait, &tx, Err(e));
                                 return;
                             }
+                            let sectors_read = (n / 2048) as u32;
+                            // A zero-byte read isn't EOF (extents still have
+                            // `remaining`) and would spin forever; send a terminal
+                            // sentinel instead of a clean EOF that reports success.
+                            if sectors_read == 0 {
+                                let e = crate::error::Error::SourceTerminated.into();
+                                send_or_stop(&wait, &tx, Err(e));
+                                return;
+                            }
+                            buf.truncate(n);
+                            bytes_read_total = bytes_read_total.saturating_add(n as u64);
+                            if let Some(ref f) = event_fn {
+                                f(Event {
+                                    kind: EventKind::BytesRead {
+                                        bytes: bytes_read_total,
+                                        total: bytes_total_extents,
+                                    },
+                                });
+                            }
+                            if !send_or_stop(&wait, &tx, Ok(buf)) {
+                                return; // consumer dropped, or stopped
+                            }
+                            offset = offset.saturating_add(sectors_read);
+                        }
+                        Err(e) => {
+                            send_or_stop(&wait, &tx, Err(e.into()));
+                            return;
                         }
                     }
-                    // Drop tx implicitly — consumer sees RecvError → EOF.
-                });
-                if std::panic::catch_unwind(body).is_err() {
-                    // Panicked mid-stream — surface a typed error so the demux
-                    // doesn't read the dropped channel as clean EOF and truncate.
-                    // Ignore send failure: consumer already gone, nothing to report.
-                    let _ = tx.send(Err(crate::error::Error::DemuxThreadPanicked.into()));
                 }
-            })
-            .map_err(|e| crate::error::Error::IoError { source: e })?;
+                // Drop tx implicitly — consumer sees RecvError → EOF.
+            });
+            if std::panic::catch_unwind(body).is_err() {
+                // Panicked mid-stream — surface a typed error so the demux
+                // doesn't read the dropped channel as clean EOF and truncate.
+                // Ignore send failure: consumer already gone, nothing to report.
+                let e = crate::error::Error::DemuxThreadPanicked.into();
+                send_or_stop(&wait, &tx, Err(e));
+            }
+        })
+        .map_err(|e| crate::error::Error::IoError { source: e })?;
 
         Ok(Self {
             rx,
@@ -257,6 +266,7 @@ impl PrefetchedSectorSource {
             total_sectors,
             producer_failed: false,
             unmapped,
+            halt,
         })
     }
 
@@ -275,6 +285,9 @@ impl PrefetchedSectorSource {
         let producer = unsafe { std::ptr::read(&me.producer) };
         let rx = unsafe { std::ptr::read(&me.rx) };
         let recycle = unsafe { std::ptr::read(&me.recycle_tx) };
+        // SAFETY: as above; these two are moved out only to be dropped (no leak).
+        drop(unsafe { std::ptr::read(&me.unmapped) });
+        drop(unsafe { std::ptr::read(&me.halt) });
         (rx, recycle, PrefetchShell { producer })
     }
 }
@@ -283,7 +296,7 @@ impl PrefetchedSectorSource {
 /// producer thread join handle so dropping the shell joins the
 /// producer, even though the channels have been peeled off.
 pub struct PrefetchShell {
-    producer: Option<JoinHandle<()>>,
+    producer: Option<DriveHolder<()>>,
 }
 
 // Every test that spawns a producer holds this (the halt module's Drive-holder test lock).
@@ -373,9 +386,13 @@ impl SectorSource for PrefetchedSectorSource {
                 self.producer_failed = true;
                 Err(crate::error::Error::from(e))
             }
-            // Channel closed. Clean EOF only if the producer never signalled a
-            // failure — else `Ok(0)` would let fill_extents mistake a dead
-            // source for a short read and zero-fill the rest as "complete".
+            // Channel closed. A stop first (L096, LP17): a halted producer returns
+            // silently, and `Ok(0)` would read as a short, complete source.
+            Err(_) if self.halt.as_ref().is_some_and(Halt::is_cancelled) => {
+                Err(crate::error::Error::Halted)
+            }
+            // Clean EOF only if the producer never signalled a failure — else `Ok(0)`
+            // lets fill_extents zero-fill a dead source's rest as "complete".
             Err(_) if self.producer_failed => Err(crate::error::Error::SourceTerminated),
             Err(_) => Ok(0),
         }
