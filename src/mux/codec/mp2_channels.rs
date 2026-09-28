@@ -762,9 +762,13 @@ impl ChannelTracker {
                 self.last = Some(why);
                 self.run = None;
             }
-            // Skipped: a failed frame CRC covers the header too, so its nch is not trusted.
-            Frame::Damaged { why, .. } => self.last = Some(why),
-            Frame::NoHeader => {}
+            // A failed frame CRC covers the header too, so its nch is not trusted; like a
+            // header-less frame it breaks the run, which must be consecutive.
+            Frame::Damaged { why, .. } => {
+                self.last = Some(why);
+                self.run = None;
+            }
+            Frame::NoHeader => self.run = None,
         }
         if self.frames >= MAX_FRAMES && self.run.is_none() {
             self.settled = true;
