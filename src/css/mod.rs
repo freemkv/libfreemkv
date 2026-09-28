@@ -176,6 +176,12 @@ pub(crate) fn resolve_dvd_title_key(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Crack scans run on this thread (test-only: the mpg:// path must scan once).
+    pub(crate) static CRACK_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // The crack scan, returning the full CrackOutcome. Tracks `saw_scrambled` so
 // a scrambled-but-uncracked disc is distinguished from a genuinely
 // unencrypted one (crack_key's Option wrapper collapses both to None).
@@ -185,6 +191,8 @@ fn crack_key_scan(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> CrackOutcome {
+    #[cfg(test)]
+    CRACK_SCANS.with(|n| n.set(n.get() + 1));
     // Batch the reads: a live drive at 1 sector/read is glacial. `batch_sectors`
     // MUST be sized to the source — a drive rejects a READ(10) larger than its
     // per-command max, and `Drive::read` does not chunk an over-large batch.
@@ -685,6 +693,29 @@ mod tests {
             s[at + 6] = 0x81;
             assert!(!is_scrambled_pack(&s), "pack_stuffing_length {stuffing}");
         }
+    }
+
+    // D3: on the disc/ISO path a scrambled 13818-1 pack is detected and descrambled whatever
+    // its pack_stuffing_length (libdvdcss reads 0x14 regardless); only mpg:// files are strict.
+    #[test]
+    fn a_stuffed_scrambled_pack_is_still_descrambled_on_the_disc_path() {
+        let mut pack = vec![0u8; 2048];
+        for (i, b) in pack.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29).wrapping_add(3);
+        }
+        pack[0x00..0x04].copy_from_slice(&PACK_START);
+        pack[4] = 0x44; // '01': a 13818-1 pack
+        pack[0x0D] = 0xF8 | 1; // pack_stuffing_length 1
+        pack[0x14] = 0x30;
+        assert!(is_scrambled_pack(&pack), "stuffed but scrambled");
+        let before = pack.clone();
+        let mut key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        descramble_region(&mut pack, &mut key).expect("region descramble");
+        assert_ne!(
+            pack[0x80..],
+            before[0x80..],
+            "descrambled, not passed through"
+        );
     }
 
     // Fix 3 hardening: `is_scrambled_pack` requires BOTH the pack-start code

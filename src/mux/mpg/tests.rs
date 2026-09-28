@@ -1678,6 +1678,20 @@ fn clear_mpeg1_and_stuffed_mpeg2_are_never_read_as_scrambled() {
     }
 }
 
+// D3: a clear file is crack-scanned once; the pipeline is handed that verdict ("clear")
+// rather than scanning again because its keys are None.
+#[test]
+fn a_clear_file_is_crack_scanned_once() {
+    let (file, _) = clear_ps(false, 0);
+    let path = temp_path("once");
+    std::fs::write(&path, &file).unwrap();
+    crate::css::CRACK_SCANS.with(|n| n.set(0));
+    let got = read_all(&path);
+    let _ = std::fs::remove_file(&path);
+    got.unwrap();
+    assert_eq!(crate::css::CRACK_SCANS.with(|n| n.get()), 1);
+}
+
 // Design §4: "A file with no pack start code in its head is not a PS; it fails with E6009".
 #[test]
 fn a_file_with_no_pack_is_no_streams() {
