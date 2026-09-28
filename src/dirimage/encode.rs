@@ -221,8 +221,10 @@ fn primary_volume(volume_id: &str, lba: u32, seq: u32) -> Box<[u8; SECTOR]> {
     put_dstring(&mut s[24..56], volume_id);
     s[56..58].copy_from_slice(&1u16.to_le_bytes()); // volume sequence number
     s[58..60].copy_from_slice(&1u16.to_le_bytes()); // max volume sequence number
-    s[60..62].copy_from_slice(&2u16.to_le_bytes()); // interchange level
-    s[62..64].copy_from_slice(&2u16.to_le_bytes()); // max interchange level
+    // Level 3 (not 2): permits a file to span multiple extents, which a
+    // large VOB/M2TS on a hybrid video disc needs.
+    s[60..62].copy_from_slice(&3u16.to_le_bytes()); // interchange level
+    s[62..64].copy_from_slice(&3u16.to_le_bytes()); // max interchange level
     s[64..68].copy_from_slice(&1u32.to_le_bytes()); // character set list
     s[68..72].copy_from_slice(&1u32.to_le_bytes()); // max character set list
     // UDF 2.2.2.5: the first 8 characters of the volume set identifier must be
@@ -697,5 +699,21 @@ mod tests {
         put_dstring(&mut field, "FREEMKV");
         assert_eq!(field[31], 8, "compid byte + 7 characters");
         assert_eq!(crate::udf::parse_dstring_for_test(&field), "FREEMKV");
+    }
+
+    /// L089: the PVD's interchange level must be 3 (not 2) — the level that
+    /// permits a file to span multiple extents, needed for a large VOB/M2TS
+    /// on a hybrid video disc. `file_set` already writes 3 for the same reason.
+    #[test]
+    fn primary_volume_interchange_level_permits_multi_extent_files() {
+        let pvd = primary_volume("FREEMKV", 16, 0);
+        assert_eq!(
+            (
+                u16::from_le_bytes([pvd[60], pvd[61]]),
+                u16::from_le_bytes([pvd[62], pvd[63]]),
+            ),
+            (3, 3),
+            "PVD interchange level / max must be 3, permitting multi-extent files"
+        );
     }
 }

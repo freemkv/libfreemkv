@@ -11,21 +11,37 @@ pub(super) struct Header {
     pub rate: u32,
 }
 
+/// How a codec's syncframes are recognised without parser side effects.
+pub(super) struct Sync {
+    /// Mask over the byte after 0xFF: 0xF0 for ADTS's 12-bit sync, 0xE0 for MPEG's 11-bit.
+    pub mask: u8,
+    /// Pure size of a valid frame at the slice head (None if none), to find framing mid-stream.
+    pub frame_len: fn(&[u8]) -> Option<usize>,
+}
+
 pub(super) struct AudioFrames {
     buf: PesBuf,
+    sync: Sync,
     framed: bool,
     anchor: Option<i64>,
     next_pts: i64,
+    // Duration of the last emitted frame: the clock advance for a dropped one.
+    last_duration: Option<u64>,
+    // Scanning for sync after a verified drop; later false syncs in this PES are the same fault.
+    resyncing: bool,
     tally: DropTally,
 }
 
 impl AudioFrames {
-    pub fn new(codec: &'static str) -> Self {
+    pub fn new(codec: &'static str, sync: Sync) -> Self {
         Self {
             buf: PesBuf::with_capacity(8192),
+            sync,
             framed: false,
             anchor: None,
             next_pts: 0,
+            last_duration: None,
+            resyncing: false,
             tally: DropTally::new(codec),
         }
     }
@@ -52,7 +68,7 @@ impl AudioFrames {
             self.anchor = None;
         }
         if self.tally.is_poisoned() {
-            self.tally.record_drop(
+            self.tally.record_collateral_drop(
                 facts.presentation_ns().unwrap_or(self.next_pts),
                 0,
                 pes.data.len(),
@@ -62,7 +78,15 @@ impl AudioFrames {
         }
         // Preserve the existing raw-AAC/nonframed passthrough contract. Once
         // sync has been seen, later nonsync bytes are continuations, not units.
-        if !self.framed && self.buf.is_empty() && pes.data[0] != 0xff {
+        let mut data = &pes.data[..];
+        if !self.framed && self.buf.is_empty() && data[0] != 0xff {
+            // A stream joined mid-frame: drop the fragment before a confirmed header.
+            if let Some(at) = self.first_confirmed_header(data) {
+                tracing::debug!(target: "mux", bytes = at, "skipped a leading partial audio frame");
+                data = &data[at..];
+            }
+        }
+        if !self.framed && self.buf.is_empty() && data[0] != 0xff {
             self.tally.record_kept();
             let pts_ns = facts.presentation_ns().unwrap_or(self.next_pts);
             self.next_pts = pts_ns;
@@ -88,8 +112,29 @@ impl AudioFrames {
             );
             return Vec::new();
         }
-        self.buf.push(pes);
+        self.buf.push_with(data, facts);
+        self.resyncing = false;
         self.frame_buffered(min_header, header)
+    }
+
+    // Offset of the first sync whose frame is chained to the next one or ends the packet.
+    fn first_confirmed_header(&self, data: &[u8]) -> Option<usize> {
+        let sized_at = |i: usize| data.get(i..).and_then(self.sync.frame_len);
+        (1..data.len()).find(|&i| {
+            sized_at(i).is_some_and(|n| i + n == data.len() || sized_at(i + n).is_some())
+        })
+    }
+
+    // Stamp the unit at `consumed`: a new PES timestamp re-anchors the running clock.
+    fn anchor_at(&mut self, consumed: usize) -> PesFacts {
+        let facts = self.buf.facts_at(consumed);
+        if let Some(pts) = facts.presentation_ns()
+            && self.anchor != Some(pts)
+        {
+            self.anchor = Some(pts);
+            self.next_pts = pts;
+        }
+        facts
     }
 
     // Frames every complete unit at the buffer front; a header callback asks to wait by
@@ -104,9 +149,16 @@ impl AudioFrames {
         while self.buf.len() - consumed >= min_header {
             let data = &self.buf.as_slice()[consumed..];
             let Some(h) = header(data) else {
-                if data[0] == 0xff && data[1] & 0xe0 == 0xe0 {
+                let sync = data[0] == 0xff && data[1] & self.sync.mask == self.sync.mask;
+                if sync && !self.resyncing {
+                    // The lost AU still takes its slot on the clock (length from the last good
+                    // frame); its reported duration stays unmeasured.
+                    self.resyncing = true;
+                    self.anchor_at(consumed);
                     self.tally
                         .record_drop(self.next_pts, 0, min_header, "header");
+                    let lost = self.last_duration.unwrap_or(0);
+                    self.next_pts = self.next_pts.saturating_add(lost as i64);
                 }
                 consumed += 1;
                 continue;
@@ -114,24 +166,21 @@ impl AudioFrames {
             if data.len() < h.bytes {
                 break;
             }
-            let facts = self.buf.facts_at(consumed);
-            if let Some(pts) = facts.presentation_ns()
-                && self.anchor != Some(pts)
-            {
-                self.anchor = Some(pts);
-                self.next_pts = pts;
-            }
+            let data = data[h.skip..h.bytes].to_vec();
+            self.resyncing = false;
+            let facts = self.anchor_at(consumed);
             let duration = u64::from(h.samples) * 1_000_000_000 / u64::from(h.rate);
             frames.push(Frame {
                 pts_ns: self.next_pts,
                 keyframe: true,
-                data: data[h.skip..h.bytes].to_vec(),
+                data,
                 duration_ns: Some(duration),
                 source: facts.source,
                 discontinuity: facts.discontinuity,
                 coding: None,
             });
             self.next_pts = self.next_pts.saturating_add(duration as i64);
+            self.last_duration = Some(duration);
             self.tally.record_kept();
             consumed += h.bytes;
         }
@@ -170,5 +219,41 @@ impl AudioFrames {
         self.buf.clear();
         self.tally.log_summary();
         frames
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // L044: once poisoned, later drops are collateral; they must not add to the verified count.
+    #[test]
+    fn drops_after_poison_are_collateral() {
+        let mut af = AudioFrames::new(
+            "test",
+            Sync {
+                mask: 0xf0,
+                frame_len: |_| None,
+            },
+        );
+        while !af.tally.is_poisoned() {
+            af.tally.record_drop(0, 0, 1, "bad");
+        }
+        let verified = af.tally.verified_dropped();
+        let pes = PesPacket {
+            source: None,
+            pid: 0x1100,
+            pts: Some(0),
+            dts: None,
+            data: vec![0xFF; 16],
+            discontinuity: false,
+        };
+        assert!(af.parse(&pes, 7, |_| None).is_empty());
+        assert_eq!(
+            af.dropped_frames(),
+            verified + 1,
+            "the poisoned PES is counted"
+        );
+        assert_eq!(af.tally.verified_dropped(), verified);
     }
 }

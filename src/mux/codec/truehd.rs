@@ -65,6 +65,11 @@ pub struct TrueHdParser {
     /// sync re-initialises state. On corruption we set this and drop every AU
     /// until a major sync whose header CRC validates, which we then emit.
     resync_pending: bool,
+    /// Test-only: how many `PesBuf::drain` calls the zero-length-AU-header path
+    /// made. Pins a WORK bound (one drain per contiguous zero-word run, not one
+    /// per 4-byte word), which no frame-level assertion can observe.
+    #[cfg(test)]
+    zero_run_drains: u64,
 }
 
 impl Default for TrueHdParser {
@@ -82,6 +87,8 @@ impl TrueHdParser {
             tally: DropTally::new("truehd"),
             num_substreams: None,
             resync_pending: false,
+            #[cfg(test)]
+            zero_run_drains: 0,
         }
     }
 
@@ -353,10 +360,24 @@ impl CodecParser for TrueHdParser {
                 | self.acc.as_slice()[1] as usize)
                 & 0xFFF;
             if unit_words == 0 {
-                // A zero-length AU is malformed/padding. Drain the whole 4-byte
-                // header, not just the length word, or the timing bytes get
-                // misread as the next length word — a spurious parse next iteration.
-                self.acc.drain(4);
+                // Zero-length AU (malformed/padding). Draining 4 bytes per header
+                // is O(run_len^2) (PesBuf::drain shifts the tail each call), so
+                // scan the whole zero-header run first and drain it in one call.
+                let mut skip = 4;
+                while skip + 4 <= self.acc.len() {
+                    let w = (((self.acc.as_slice()[skip] as usize) << 8)
+                        | self.acc.as_slice()[skip + 1] as usize)
+                        & 0xFFF;
+                    if w != 0 {
+                        break;
+                    }
+                    skip += 4;
+                }
+                self.acc.drain(skip);
+                #[cfg(test)]
+                {
+                    self.zero_run_drains += 1;
+                }
                 continue;
             }
             // unit_words is masked to 12 bits, so unit_bytes <= 4095 * 2 = 8190;
@@ -1199,6 +1220,26 @@ mod tests {
             frames[0].pts_ns,
             pts_to_ns(180000),
             "cadence re-bases to the post-gap PTS across the cleared buffer"
+        );
+    }
+
+    // A long zero-header run must be drained in ~1 call, not one 4-byte
+    // drain per header (each drain shifts the tail — O(run_len^2) otherwise).
+    #[test]
+    fn a_long_zero_word_run_is_drained_once_not_per_word() {
+        const ZERO_WORDS: usize = 8192; // 32 KiB of zero headers
+        let mut parser = TrueHdParser::new();
+        let mut data = vec![0u8; ZERO_WORDS * 4];
+        // A real unit follows, so the run has a clean end to detect.
+        data.extend_from_slice(&make_truehd_unit(100));
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1, "the trailing real unit is still emitted");
+        assert_eq!(frames[0].data.len(), 100);
+        assert!(
+            parser.zero_run_drains <= 2,
+            "expected the whole zero run to be drained in ~1 call, got {} drains for {ZERO_WORDS} zero words",
+            parser.zero_run_drains
         );
     }
 

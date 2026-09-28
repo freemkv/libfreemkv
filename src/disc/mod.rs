@@ -291,6 +291,20 @@ pub struct AudioStream {
     pub label: String,
 }
 
+/// Label marking an [`AudioStream`] as a DVD MPEG-2 multichannel extension bit stream (PES
+/// `0xD0|n`): the ISO/IEC 13818-3 remainder of the surround that only means something next to
+/// its base MPEG audio track (`0xC0|n`). A marker like [`MVC_DEPENDENT_LABEL`], not display text.
+pub const MP2_EXTENSION_LABEL: &str = "MPEG-2 multichannel extension";
+
+impl AudioStream {
+    /// Whether this is a DVD MPEG-2 multichannel extension track ([`MP2_EXTENSION_LABEL`] on
+    /// PID `0xD0..=0xD7`), which a sink either writes next to its base or lists as excluded.
+    /// Its base is PID `0xC0 | (pid & 7)`.
+    pub fn is_mp2_extension(&self) -> bool {
+        self.label == MP2_EXTENSION_LABEL && matches!(self.pid, 0xD0..=0xD7)
+    }
+}
+
 /// A subtitle stream.
 #[derive(Debug, Clone)]
 pub struct SubtitleStream {
@@ -2411,6 +2425,7 @@ impl Disc {
         "richest-audio",
         "more-video",
         "more-subs",
+        "lowest-playlist-id",
     ];
 
     // Content-based forced-subtitle detection, restricted to `BdTs` titles — gates on STREAM
@@ -3593,6 +3608,38 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mp2_track(pid: u16, label: &str) -> AudioStream {
+        AudioStream {
+            pid,
+            codec: Codec::Mp2,
+            channels: AudioChannels::Unknown,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: label.into(),
+        }
+    }
+
+    /// The extension marker needs both the label and a DVD extension PID `0xD0|n` (US5987417
+    /// "1100 0***b or 1101 0***b"): a base or BD track that happens to carry the text is not one.
+    #[test]
+    fn mp2_extension_needs_the_label_and_an_extension_pid() {
+        for pid in 0xD0..=0xD7 {
+            assert!(
+                mp2_track(pid, MP2_EXTENSION_LABEL).is_mp2_extension(),
+                "{pid:#x}"
+            );
+            assert!(!mp2_track(pid, "").is_mp2_extension(), "{pid:#x}");
+        }
+        for pid in [0x00C0, 0x00C7, 0x00CF, 0x00D8, 0x1100, 0xBD80] {
+            assert!(
+                !mp2_track(pid, MP2_EXTENSION_LABEL).is_mp2_extension(),
+                "{pid:#x}"
+            );
+        }
+    }
 
     // ── image-time CSS crack: canonical extent ordering (finding 1) ─────────
 
@@ -5050,6 +5097,18 @@ mod tests {
         assert_eq!(
             ii[0].playlist_id, 800,
             "identical seamless siblings still pick the lowest id"
+        );
+    }
+
+    // L088: canonical_title_order's final tiebreak (playlist_id) is a real sort
+    // key, same as the other 6 — the const naming them must not omit it.
+    #[test]
+    fn canonical_title_order_keys_names_every_sort_key_including_the_tiebreak() {
+        assert_eq!(
+            Disc::CANONICAL_TITLE_ORDER_KEYS.last(),
+            Some(&"lowest-playlist-id"),
+            "the const must name the comparator's final tiebreak key, not leave \
+             callers to append it by hand"
         );
     }
 

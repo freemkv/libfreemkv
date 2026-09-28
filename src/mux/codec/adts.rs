@@ -1,6 +1,6 @@
 //! AAC ADTS framing and validation.
 
-use super::audio_frames::{AudioFrames, Header};
+use super::audio_frames::{AudioFrames, Header, Sync};
 #[cfg(test)]
 use super::pts_to_ns;
 use super::{CodecParser, Frame, PesPacket};
@@ -50,6 +50,13 @@ fn adts_verdict(data: &[u8]) -> AdtsVerdict {
     AdtsVerdict::Valid
 }
 
+// Frame length of a valid ADTS header, with no parser state touched.
+fn adts_frame_len(data: &[u8]) -> Option<usize> {
+    matches!(adts_verdict(data), AdtsVerdict::Valid).then(|| {
+        (usize::from(data[3] & 3) << 11) | (usize::from(data[4]) << 3) | usize::from(data[5] >> 5)
+    })
+}
+
 pub struct AdtsParser {
     frames: AudioFrames,
     config: Option<Vec<u8>>,
@@ -65,7 +72,13 @@ impl Default for AdtsParser {
 impl AdtsParser {
     pub fn new() -> Self {
         Self {
-            frames: AudioFrames::new("aac"),
+            frames: AudioFrames::new(
+                "aac",
+                Sync {
+                    mask: 0xf0,
+                    frame_len: adts_frame_len,
+                },
+            ),
             config: None,
             config_changes: 0,
         }
@@ -108,9 +121,7 @@ impl CodecParser for AdtsParser {
                 Some(_) => {}
             }
             Some(Header {
-                bytes: (usize::from(data[3] & 3) << 11)
-                    | (usize::from(data[4]) << 3)
-                    | usize::from(data[5] >> 5),
+                bytes: adts_frame_len(data)?,
                 skip: if data[1] & 1 == 0 { 9 } else { 7 },
                 samples: 1024 * (u32::from(data[6] & 3) + 1),
                 rate: ADTS_SAMPLE_RATE_VALID[usize::from(rate_index)],
@@ -382,6 +393,187 @@ mod tests {
         let mut p = AdtsParser::new();
         assert!(p.parse(&make_pes(data[..10].to_vec(), Some(0))).is_empty());
         assert!(p.flush().is_empty());
+    }
+
+    // Deterministic noise with no 0xFF, so a scan through it meets only the syncs a test plants.
+    fn noise(seed: &mut u64, n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed as u8).min(0xFE)
+            })
+            .collect()
+    }
+
+    fn noisy_frame(seed: &mut u64, payload: usize) -> Vec<u8> {
+        let mut f = adts_frame(payload);
+        f[7..].copy_from_slice(&noise(seed, payload));
+        f
+    }
+
+    const AAC_FRAME_NS: i64 = 1024 * 1_000_000_000 / 44100;
+
+    // L043: 0xFFE is MPEG-audio sync, not ADTS; garbage full of it must not poison a good track.
+    #[test]
+    fn eleven_bit_false_syncs_do_not_poison_a_good_track() {
+        let mut p = AdtsParser::new();
+        let mut seed = 7;
+        assert_eq!(
+            p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(0)))
+                .len(),
+            1
+        );
+        p.parse(&make_pes([0xFF, 0xE5].repeat(2048), None));
+        let kept: usize = (1..=300)
+            .map(|i| {
+                p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(i * 2090)))
+                    .len()
+            })
+            .sum();
+        assert_eq!(kept, 300, "the good track survives");
+        assert_eq!(p.dropped_frames(), 0, "0xFFE is not an ADTS sync");
+    }
+
+    // L043: one resync run through a PES is one verified drop, not one per sync-looking byte.
+    #[test]
+    fn a_resync_run_is_one_verified_drop() {
+        let mut bad = adts_frame(0);
+        bad[2] = (bad[2] & 0xC3) | (13 << 2);
+        let mut p = AdtsParser::new();
+        let mut seed = 11;
+        p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(0)));
+        p.parse(&make_pes(bad.repeat(600), None));
+        let kept: usize = (1..=300)
+            .map(|i| {
+                p.parse(&make_pes(noisy_frame(&mut seed, 200), Some(i * 2090)))
+                    .len()
+            })
+            .sum();
+        assert_eq!(kept, 300, "the good track survives");
+        assert_eq!(p.dropped_frames(), 1);
+    }
+
+    // L042: a first PES starting mid-frame loses the fragment, not the frames after it.
+    #[test]
+    fn a_first_pes_starting_mid_frame_frames_from_the_first_header() {
+        let mut seed = 3;
+        let (a, b) = (noisy_frame(&mut seed, 300), noisy_frame(&mut seed, 250));
+        let mut data = noise(&mut seed, 57);
+        data.extend_from_slice(&a);
+        data.extend_from_slice(&b);
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(data, Some(90_000)));
+        assert_eq!(f.len(), 2, "the leading fragment is not a frame");
+        assert_eq!((&f[0].data[..], &f[1].data[..]), (&a[7..], &b[7..]));
+        assert_eq!(
+            f[0].pts_ns, 1_000_000_000,
+            "the PTS is the first whole frame's"
+        );
+        assert_eq!(f[1].pts_ns, 1_000_000_000 + AAC_FRAME_NS);
+        assert_eq!(p.codec_private(), Some(vec![0x12, 0x10]));
+        // A lone whole frame is confirmed by ending exactly at the packet end.
+        let mut data = noise(&mut seed, 30);
+        data.extend_from_slice(&a);
+        let f = AdtsParser::new().parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, a[7..]);
+    }
+
+    // L052/L056: a corrupt header mid-PES, its noisy payload holding false syncs of both widths,
+    // is one drop; the later frames keep their slots on the sample clock.
+    #[test]
+    fn a_corrupt_frame_mid_pes_keeps_later_frames_on_the_clock() {
+        let mut seed = 5;
+        let frames: Vec<Vec<u8>> = (0..4).map(|_| noisy_frame(&mut seed, 300)).collect();
+        let mut bad = frames[1].clone();
+        bad[2] = (bad[2] & 0xC3) | (13 << 2);
+        bad[40..42].copy_from_slice(&[0xFF, 0xE3]);
+        let false_header = bad[..7].to_vec();
+        bad[90..97].copy_from_slice(&false_header);
+        let data = [&frames[0][..], &bad, &frames[2], &frames[3]].concat();
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(data, Some(90_000)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        let slots = [0, 2, 3].map(|i| 1_000_000_000 + i * AAC_FRAME_NS);
+        assert_eq!(pts, slots, "the lost frame keeps its slot");
+        assert!(
+            f.iter()
+                .zip([0, 2, 3])
+                .all(|(f, i)| f.data == frames[i][7..])
+        );
+        assert_eq!(p.dropped_frames(), 1);
+    }
+
+    // Each corrupt frame in a PES is its own drop once a good frame ends the previous resync.
+    #[test]
+    fn two_corrupt_frames_in_one_pes_are_two_drops() {
+        let mut seed = 13;
+        let mut frames: Vec<Vec<u8>> = (0..5).map(|_| noisy_frame(&mut seed, 200)).collect();
+        for i in [1, 3] {
+            frames[i][2] = (frames[i][2] & 0xC3) | (13 << 2);
+        }
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(frames.concat(), Some(0)));
+        let pts: Vec<i64> = f.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(pts, [0, 2, 4].map(|i| i * AAC_FRAME_NS));
+        assert_eq!(p.dropped_frames(), 2);
+    }
+
+    // L052: the PES PTS names its first AU; when that AU is corrupt the next is one frame later.
+    #[test]
+    fn a_corrupt_first_frame_keeps_the_pes_pts_for_itself() {
+        let mut seed = 9;
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(noisy_frame(&mut seed, 300), Some(0)));
+        let mut bad = noisy_frame(&mut seed, 300);
+        bad[2] = (bad[2] & 0xC3) | (13 << 2);
+        let good = noisy_frame(&mut seed, 300);
+        let f = p.parse(&make_pes([&bad[..], &good].concat(), Some(90_000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 1_000_000_000 + AAC_FRAME_NS);
+    }
+
+    // An unchained header in a first non-sync PES is not trusted: the raw passthrough stands
+    // and the probe leaves no AudioSpecificConfig behind.
+    #[test]
+    fn an_unconfirmed_header_in_a_first_pes_is_not_trusted() {
+        let mut seed = 21;
+        let mut data = noise(&mut seed, 40);
+        data.extend_from_slice(&adts_frame(0)[..7]);
+        data[44] = 0x40; // frame_length 512: neither chained nor ending the packet
+        data.extend_from_slice(&noise(&mut seed, 60));
+        let mut p = AdtsParser::new();
+        let f = p.parse(&make_pes(data.clone(), Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, data);
+        assert_eq!(p.codec_private(), None);
+    }
+
+    // L056: random payloads (false syncs and all) are never scanned while framing is locked.
+    #[test]
+    fn random_payload_frames_pass_through_locked_framing() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15;
+        let mut p = AdtsParser::new();
+        let mut want = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..64 {
+            let mut f = noisy_frame(&mut seed, 100 + i * 7);
+            f[20 + i..22 + i].copy_from_slice(&[0xFF, 0xF1]);
+            want.push(f[7..].to_vec());
+            data.extend_from_slice(&f);
+        }
+        let mut got = Vec::new();
+        for chunk in data.chunks(1000) {
+            got.extend(
+                p.parse(&make_pes(chunk.to_vec(), None))
+                    .into_iter()
+                    .map(|f| f.data),
+            );
+        }
+        assert_eq!(got, want);
+        assert_eq!(p.dropped_frames(), 0);
     }
 
     #[test]

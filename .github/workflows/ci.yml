@@ -188,7 +188,7 @@ jobs:
       - run: cargo build --tests
         working-directory: libfreemkv
 
-  # Did this change break anything downstream? libfreemkv sits below all five
+  # Did this change break anything downstream? libfreemkv sits below all four
   # dependents; a break here is worth strictly more than anywhere else. Runs
   # their suites (not just check) — a behavioural change keeps signatures but
   # fails a dependent's tests, which is the shape worth catching. This caught an
@@ -200,11 +200,11 @@ jobs:
         with: { path: libfreemkv }
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          checkout: freemkv-unlock freemkv-keysources freemkv-engine freemkv-i18n freemkv autorip bdemu
+          checkout: freemkv-unlock freemkv-keysources freemkv-engine freemkv-i18n freemkv bdemu
       - name: Point every dependent at THIS libfreemkv commit
         shell: bash
         run: |
-          for c in freemkv-keysources freemkv-engine freemkv autorip bdemu; do
+          for c in freemkv-keysources freemkv-engine freemkv bdemu; do
             mkdir -p "$c/.cargo"
             cat > "$c/.cargo/config.toml" <<'EOF'
           [patch.crates-io]
@@ -230,7 +230,6 @@ jobs:
             freemkv-keysources
             freemkv-engine
             freemkv
-            autorip
             bdemu
       - run: cargo test --tests
         working-directory: freemkv-keysources
@@ -240,8 +239,6 @@ jobs:
         working-directory: freemkv
       - run: cargo test --tests --features gui
         working-directory: freemkv
-      - run: cargo test --tests
-        working-directory: autorip
       - run: cargo test --tests
         working-directory: bdemu
 

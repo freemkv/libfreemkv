@@ -568,6 +568,8 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
 
         for stream in &mut title.streams {
             match stream {
+                // A dependent extension track holds no vendor slot and keeps its marker label.
+                Stream::Audio(a) if a.is_mp2_extension() => {}
                 Stream::Audio(a) => {
                     audio_idx += 1;
                     if let Some((label, _authoritative)) =
@@ -1930,6 +1932,35 @@ mod apply_tests {
             codec_hint: codec_hint.into(),
             variant: variant.into(),
         }
+    }
+
+    /// A DVD MPEG-2 extension track is not a listed stream: it takes no vendor slot and keeps
+    /// its marker label, so slot 2 names the next real audio track.
+    #[test]
+    fn apply_skips_mp2_extension_tracks() {
+        let mut ext = audio(0x00D0, Codec::Mp2, AudioChannels::Unknown, "eng");
+        if let Stream::Audio(a) = &mut ext {
+            a.label = crate::disc::MP2_EXTENSION_LABEL.into();
+        }
+        let mut titles = vec![title_with(vec![
+            video(),
+            audio(0x00C0, Codec::Mp2, AudioChannels::Stereo, "eng"),
+            ext,
+            audio(0x00C1, Codec::Mp2, AudioChannels::Stereo, "eng"),
+        ])];
+        let labels = vec![audio_label(2, "eng", "", "(Commentary mix)")];
+        apply_labels(&labels, &mut titles);
+        let labels_of: Vec<String> = titles[0]
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a.label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels_of[1], crate::disc::MP2_EXTENSION_LABEL);
+        assert!(labels_of[2].contains("Commentary mix"), "{labels_of:?}");
+        assert!(!labels_of[0].contains("Commentary mix"), "{labels_of:?}");
     }
 
     #[test]

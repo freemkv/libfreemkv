@@ -2,15 +2,16 @@
 //!
 //! CSS uses a weak 40-bit LFSR stream cipher (broken since 1999).
 //!
-//! The title key is recovered keylessly: [`crack_key`] recovers it directly
-//! from the scrambled data (see the [`keyless`] module),
-//! needing no player keys, disc-key recovery, or external key file.
-//! Sectors are then decrypted with [`descramble_sector`].
+//! The title key is recovered keylessly: [`crack_key_outcome`] recovers it
+//! directly from the scrambled data (see the [`keyless`] module), needing no
+//! player keys, disc-key recovery, or external key file. Sectors are then
+//! decrypted with [`descramble_sector`].
 //!
 //! Usage:
 //! ```rust,ignore
-//! if let Some(state) = css::crack_key(reader, extents, batch) {
-//!     css::descramble_sector(&state, &mut sector);
+//! match css::crack_key_outcome(reader, extents, batch, None) {
+//!     CrackOutcome::Cracked(state) => css::descramble_sector(&state, &mut sector),
+//!     _ => { /* unencrypted, uncrackable, unreadable, or halted */ }
 //! }
 //! ```
 
@@ -24,6 +25,13 @@ use crate::sector::SectorSource;
 // Consecutive CSS-locked reads before the crack scan early-bails, instead of grinding the full
 // 50_000-sector budget. Resets to 0 on any readable batch.
 const CSS_LOCKED_BAIL: u32 = 64;
+
+// Test-only: how many times descramble_region called the expensive re-crack.
+// Pins a WORK bound (at most one per contiguous false-positive run).
+#[cfg(test)]
+thread_local! {
+    static RECRACK_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// CSS decryption state for a DVD title.
 #[derive(Clone)]
@@ -61,6 +69,12 @@ impl std::fmt::Debug for CssState {
 ///
 /// This convenience form runs to completion (no cancellation); callers needing a cancel token,
 /// or the three-way [`CrackOutcome`], use [`crack_key_outcome`].
+#[deprecated(
+    since = "1.8.0",
+    note = "collapses Halted/Unreadable to None, hiding a cancellation or a read \
+            error as a plain crack failure; use crack_key_outcome and match on \
+            CrackOutcome instead"
+)]
 pub fn crack_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
@@ -322,7 +336,15 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 ///
 /// Never returns `Err` — `Result` only matches the decrypt seam this is
 /// dispatched from (see [`crate::decrypt::decrypt_sectors`]).
+// How many mismatches a failed re-crack's "false positive" verdict covers before the next retry —
+// bounded so a genuine key change right after a false-positive run is still picked up.
+const RECRACK_RETRY_EVERY: u32 = 16;
+
 pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
+    // Consecutive crib mismatches since the last re-crack attempt (0 = none
+    // pending). Reset by a validated cache hit; a fresh run always attempts
+    // on its first mismatch, then at most once every RECRACK_RETRY_EVERY.
+    let mut mismatches_since_attempt: u32 = 0;
     for chunk in buf.chunks_mut(2048) {
         // `is_scrambled_pack`, NOT the looser `is_scrambled`: this sees arbitrary
         // regions (IFO/UDF/ISO 9660) where raw byte 0x14 isn't a reliable flag.
@@ -339,23 +361,34 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
             original.copy_from_slice(chunk);
         }
         lfsr::descramble_sector(title_key, chunk);
-        if let Some(crib) = crib
-            && chunk[0x80..0x80 + 10] != crib[..]
-        {
-            // Cached key is stale for this region — restore the ciphertext and
-            // crack this sector's own key.
-            chunk.copy_from_slice(&original);
-            match keyless::crack_title_key(chunk) {
-                Some(fresh) => {
-                    *title_key = fresh;
-                    lfsr::descramble_sector(title_key, chunk);
-                }
-                None => {
-                    // Re-crack found nothing; descramble with the CACHED key
-                    // anyway — mismatch+failure signals a crib false positive,
-                    // not a stale key (`DecryptFailed` here made discs unrippable).
-                    lfsr::descramble_sector(title_key, chunk);
-                }
+        let Some(crib) = crib else { continue };
+        if chunk[0x80..0x80 + 10] == crib[..] {
+            mismatches_since_attempt = 0; // validated: cached key still matches
+            continue;
+        }
+        mismatches_since_attempt += 1;
+        if mismatches_since_attempt % RECRACK_RETRY_EVERY != 1 {
+            // Within a suppressed run, not yet due for its periodic retry —
+            // keep the cached key (already applied above).
+            continue;
+        }
+        // Due for an attempt: either the first mismatch of a run, or a
+        // periodic retry into an ongoing one. Restore the ciphertext and
+        // crack this sector's own key.
+        chunk.copy_from_slice(&original);
+        #[cfg(test)]
+        RECRACK_ATTEMPTS.with(|c| c.set(c.get() + 1));
+        match keyless::crack_title_key(chunk) {
+            Some(fresh) => {
+                *title_key = fresh;
+                lfsr::descramble_sector(title_key, chunk);
+                mismatches_since_attempt = 0;
+            }
+            None => {
+                // Re-crack found nothing; descramble with the CACHED key
+                // anyway — mismatch+failure signals a crib false positive,
+                // not a stale key (`DecryptFailed` here made discs unrippable).
+                lfsr::descramble_sector(title_key, chunk);
             }
         }
     }
@@ -400,6 +433,7 @@ pub fn is_scrambled_pack(sector: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // this module exercises crack_key itself, deliberately
 mod tests {
     use super::*;
     use crate::error::{Error, Result};
@@ -452,6 +486,107 @@ mod tests {
             key, key_before,
             "a failed re-crack must leave the cached key in place — it is still \
              the best evidence, and overwriting it would poison every later sector"
+        );
+    }
+
+    /// A crib-false-positive sector (see above), but a genuine `is_scrambled_pack`
+    /// so `descramble_region` actually enters the mismatch branch.
+    fn false_positive_scrambled_pack() -> [u8; 2048] {
+        let mut sector = [0u8; 2048];
+        sector[0x00..0x04].copy_from_slice(&PACK_START);
+        sector[0x11] = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
+        sector[0x14] = 0x30;
+        for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
+            *b = (i % 4) as u8;
+        }
+        for (i, b) in sector.iter_mut().enumerate().skip(0x80) {
+            *b = ((i * 37 + 11) % 251) as u8;
+        }
+        sector
+    }
+
+    // L101: a VOB region full of crib-false-positive sectors must pay for the
+    // expensive re-crack at most once every RECRACK_RETRY_EVERY sectors, not
+    // once per sector — each sector within a suppressed window re-uses the
+    // "still stale-looking, still no new key" verdict instead of re-running
+    // the keyless attack.
+    #[test]
+    fn a_run_of_crib_false_positives_recracks_at_a_bounded_rate() {
+        let sector = false_positive_scrambled_pack();
+        assert!(
+            is_scrambled_pack(&sector),
+            "fixture must gate into the loop"
+        );
+        assert!(keyless::attack_crib(&sector).is_some());
+        assert!(keyless::crack_title_key(&sector).is_none());
+
+        const RUN: usize = 50;
+        let mut buf = Vec::with_capacity(RUN * 2048);
+        for _ in 0..RUN {
+            buf.extend_from_slice(&sector);
+        }
+        RECRACK_ATTEMPTS.with(|c| c.set(0));
+        let mut key = [0xAAu8; 5];
+        descramble_region(&mut buf, &mut key).expect("false positives must not fail the rip");
+        let attempts = RECRACK_ATTEMPTS.with(|c| c.get());
+        // One attempt on the first mismatch, then one more every
+        // RECRACK_RETRY_EVERY sectors thereafter.
+        let expected = (RUN as u32 - 1) / RECRACK_RETRY_EVERY + 1;
+        assert_eq!(
+            attempts, expected as usize,
+            "expected {expected} re-crack attempts for {RUN} sectors of the same \
+             false-positive pattern (bounded retry), got {attempts}"
+        );
+    }
+
+    // A GENUINE key change right after a false-positive run must still be
+    // picked up before the call ends, not ridden out on the stale cached key.
+    #[test]
+    fn a_genuine_key_change_after_a_false_positive_run_is_still_picked_up() {
+        let fp_sector = false_positive_scrambled_pack();
+        const FALSE_POSITIVE_RUN: usize = 5;
+        assert!(
+            (FALSE_POSITIVE_RUN as u32) < RECRACK_RETRY_EVERY,
+            "the false-positive run must end well before a periodic retry fires on its own"
+        );
+
+        let new_key = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let seed = [0x00, 0xFF, 0x80, 0x7F, 0x01];
+        let real_sector = crackable_sector(&new_key, &seed, 5);
+        assert!(is_scrambled_pack(&real_sector));
+        assert!(keyless::attack_crib(&real_sector).is_some());
+        // Expected plaintext for the real sector, independent of descramble_region:
+        // descrambling with the key it was actually scrambled with.
+        let mut expected_plain = real_sector.clone();
+        lfsr::descramble_sector(&new_key, &mut expected_plain);
+
+        // Enough real sectors that a periodic retry must land inside this run,
+        // even though the run does not start on a retry boundary.
+        const REAL_RUN: usize = 20;
+        let mut buf = Vec::with_capacity((FALSE_POSITIVE_RUN + REAL_RUN) * 2048);
+        for _ in 0..FALSE_POSITIVE_RUN {
+            buf.extend_from_slice(&fp_sector);
+        }
+        for _ in 0..REAL_RUN {
+            buf.extend_from_slice(&real_sector);
+        }
+
+        // Cached key is neither the false-positive fixture's nor the real
+        // sector's — every sector mismatches until the real key is recovered.
+        let mut key = [0xAAu8; 5];
+        descramble_region(&mut buf, &mut key)
+            .expect("false positives and a later genuine key must not fail the rip");
+
+        assert_eq!(
+            key, new_key,
+            "the genuine key change after the false-positive run must be adopted \
+             within the same call, not ridden out on the stale cached key"
+        );
+        let last = &buf[buf.len() - 2048..];
+        assert_eq!(
+            last,
+            &expected_plain[..],
+            "once the new key is adopted, later real sectors must decrypt correctly"
         );
     }
 

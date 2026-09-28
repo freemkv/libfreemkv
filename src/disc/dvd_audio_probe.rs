@@ -1,11 +1,10 @@
-//! Physical AC-3 sub-stream probing for DVD audio routing.
+//! Physical AC-3 sub-stream channel probe for DVD bug logs.
 //!
-//! On some discs the physical `private_stream_1` sub-stream order does not match the IFO's
-//! declared audio stream order, so ordinal assignment (`ifo::assign_audio_sub_stream_ids`) can
-//! mux the wrong physical track (e.g. a 2.0 down-mix labelled 5.1). This module probes each
-//! physical AC-3 sub-stream's REAL channel count from the VOB and re-routes each declared
-//! stream to the matching sub-stream, falling back to ordinal mapping when the probe yields
-//! nothing.
+//! Reads the head of a title's feature and reports each physical `private_stream_1` AC-3
+//! sub-stream's REAL channel count under `--log-level 3`, so a log alone shows whether the
+//! IFO's declared layout matches the VOB. It no longer re-routes anything: the scanner routes
+//! audio by the PGC's AST_CTL, the map every player follows, and a channel-count heuristic
+//! layered on top could only move a stream off the track the disc actually plays.
 
 use crate::disc::Stream;
 use crate::mux::codec::ac3;
@@ -75,126 +74,24 @@ fn max_substream_channels(data: &[u8]) -> Option<u8> {
     best
 }
 
-/// Re-route the title's declared AC-3 audio streams onto the physical sub-stream ids whose REAL
-/// channel counts match, using a probed `sub_id -> channels` map. For each declared AC-3 audio
-/// stream (in IFO order), picks the physical `0x8x` sub-stream whose probed channel count
-/// equals the declared count, never reusing a claimed sub-stream, and writes its PID (`0xBD00 |
-/// sub_id`) back onto the `Stream::Audio`. Conservative: only reassigns when a better match
-/// exists or keeping the ordinal sub would share a PID. Sharing is left (and logged) only when
-/// there are more AC-3 streams than sub-streams. Returns the number of changed PIDs.
-pub fn remap_audio_pids(streams: &mut [Stream], probed: &BTreeMap<u8, u8>) -> usize {
-    if probed.is_empty() {
-        return 0;
-    }
-    let ac3: Vec<usize> = streams
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| matches!(s, Stream::Audio(a) if a.codec == crate::disc::Codec::Ac3))
-        .map(|(i, _)| i)
-        .collect();
-    let info = |s: &Stream| match s {
-        Stream::Audio(a) => (a.channels.count(), (a.pid & 0x00FF) as u8),
-        _ => (0, 0),
-    };
-    // Ordinal subs before any re-route: candidates for a displaced stream in pass 3.
-    let ordinal: Vec<u8> = ac3.iter().map(|&i| info(&streams[i]).1).collect();
-    let mut changed = 0usize;
-    // Each physical sub-stream is claimed at most once, so two declared streams
-    // never collide on one PID. Pass 1: streams already on a matching sub-stream stay.
-    let mut claimed: Vec<u8> = Vec::new();
-    let mut pending: Vec<usize> = Vec::new();
-    for &i in &ac3 {
-        let (declared, current) = info(&streams[i]);
-        if probed.get(&current) == Some(&declared) && !claimed.contains(&current) {
-            claimed.push(current);
-        } else {
-            pending.push(i);
-        }
-    }
-    // Pass 2: route the rest to an unclaimed sub-stream with the declared count.
-    let mut unmatched: Vec<usize> = Vec::new();
-    for i in pending {
-        let (declared, _) = info(&streams[i]);
-        let pick = probed
-            .iter()
-            .find(|(sub, ch)| **ch == declared && !claimed.contains(*sub))
-            .map(|(sub, _)| *sub);
-        match pick {
-            Some(sub) => {
-                claimed.push(sub);
-                changed += set_sub(&mut streams[i], sub);
-            }
-            None => unmatched.push(i),
-        }
-    }
-    // Pass 3: no physical match — keep the ordinal sub when still free, else take a
-    // free one rather than share a PID.
-    let mut displaced: Vec<usize> = Vec::new();
-    for i in unmatched {
-        let (_, current) = info(&streams[i]);
-        if claimed.contains(&current) {
-            displaced.push(i);
-        } else {
-            claimed.push(current);
-        }
-    }
-    for i in displaced {
-        // Prefer a sub-stream that physically carries data, then a vacated ordinal one.
-        let free = probed
-            .keys()
-            .copied()
-            .chain(ordinal.iter().copied())
-            .find(|sub| !claimed.contains(sub));
-        match free {
-            Some(sub) => {
-                claimed.push(sub);
-                changed += set_sub(&mut streams[i], sub);
-            }
-            None => tracing::warn!(
-                target: "freemkv::scan",
-                pid = 0xBD00 | u16::from(info(&streams[i]).1),
-                "dvd: no free AC-3 sub-stream; audio track shares a PID with another"
-            ),
-        }
-    }
-    changed
-}
-
-// Route an AC-3 stream to physical sub-stream `sub`; returns 1 when its PID changed.
-fn set_sub(s: &mut Stream, sub: u8) -> usize {
-    let Stream::Audio(a) = s else { return 0 };
-    let new_pid = 0xBD00 | sub as u16;
-    if new_pid == a.pid {
-        return 0;
-    }
-    tracing::debug!(
-        target: "freemkv::scan",
-        old_pid = a.pid,
-        new_pid,
-        declared_channels = a.channels.count(),
-        "dvd: re-routed AC-3 audio to physical sub-stream matching channel count"
-    );
-    a.pid = new_pid;
-    1
-}
-
-/// Probe the first feature extent of a DVD title through a (decrypted) sector
-/// source and re-route its AC-3 audio PIDs to the physically-correct
-/// sub-streams. A bounded, best-effort scan: any read error or empty probe
-/// leaves the ordinal assignment untouched.
+/// Probe the first feature extent of a DVD title through a (decrypted) sector source and
+/// log each physical AC-3 sub-stream's real channel count. Diagnostics only: reads nothing
+/// unless `freemkv::diag` is enabled, and never changes `title` (the name predates L084b).
 ///
-/// `reader` MUST yield PLAINTEXT VOB bytes (i.e. a `DecryptingSectorSource` on a
-/// CSS disc) — probing scrambled sectors yields no AC-3 syncs and is a safe
-/// no-op. Remaps `title`'s AC-3 streams in place; returns nothing.
+/// `reader` MUST yield PLAINTEXT VOB bytes (a `DecryptingSectorSource` on a CSS disc);
+/// scrambled sectors yield no AC-3 syncs and log `probed=0`.
 pub fn probe_and_remap<S: SectorSource + ?Sized>(
     reader: &mut S,
     title: &mut crate::disc::DiscTitle,
 ) {
+    if !tracing::enabled!(target: "freemkv::diag", tracing::Level::DEBUG) {
+        return;
+    }
     // Only DVD (MPEG-PS) titles carry private_stream_1 AC-3 sub-streams.
     if title.content_format != crate::disc::ContentFormat::MpegPs {
         return;
     }
-    // Nothing to disambiguate unless there is at least one AC-3 audio stream.
+    // Nothing to report unless there is at least one AC-3 audio stream.
     let has_ac3 = title
         .streams
         .iter()
@@ -211,7 +108,7 @@ pub fn probe_and_remap<S: SectorSource + ?Sized>(
     }
     let mut buf = vec![0u8; count as usize * 2048];
     // `recovery=false`: a single best-effort attempt — the probe must never
-    // stall the mux or hammer a marginal drive. On any error, bail to ordinal.
+    // stall the mux or hammer a marginal drive. On any error, log nothing.
     reader.set_unit_base(ext.start_lba); // HD DVD AACS: anchor at the title head
     let n = match reader.read_sectors(ext.start_lba, count, &mut buf, false) {
         Ok(n) => n,
@@ -220,7 +117,6 @@ pub fn probe_and_remap<S: SectorSource + ?Sized>(
     buf.truncate(n);
     let probed = probe_ac3_substream_channels(&buf);
     crate::diag::dump_dvd_substream_probe(title.playlist_id, &probed);
-    remap_audio_pids(&mut title.streams, &probed);
 }
 
 #[cfg(test)]
@@ -357,152 +253,6 @@ mod tests {
         );
     }
 
-    // Real-disc regression: IFO declares ONE 5.1 AC-3 stream ordinally mapped
-    // to 0x80, but physically 0x80 is the 2.0 down-mix and 5.1 lives at 0x81.
-    #[test]
-    fn remap_routes_declared_51_to_physical_51_substream() {
-        // Physical layout: 0x80 = 2.0, 0x81 = 5.1 (reversed vs ordinal).
-        let mut probed = BTreeMap::new();
-        probed.insert(0x80u8, 2u8);
-        probed.insert(0x81u8, 6u8);
-
-        // Declared: one 5.1 stream, ordinally assigned 0x80 (PID 0xBD80).
-        let mut streams = vec![ac3_stream(0xBD80, AudioChannels::Surround51)];
-        let changed = remap_audio_pids(&mut streams, &probed);
-        assert_eq!(changed, 1, "the one 5.1 stream must be re-routed");
-        let Stream::Audio(a) = &streams[0] else {
-            panic!("audio")
-        };
-        assert_eq!(
-            a.pid, 0xBD81,
-            "declared 5.1 must route to physical 0x81 (the real 5.1), not ordinal 0x80"
-        );
-    }
-
-    /// Conservative no-op: when the physical order already matches the IFO
-    /// order (0x80 = 5.1 as declared), remap changes nothing.
-    #[test]
-    fn remap_noop_when_physical_matches_ordinal() {
-        let mut probed = BTreeMap::new();
-        probed.insert(0x80u8, 6u8); // 0x80 really is the 5.1
-        let mut streams = vec![ac3_stream(0xBD80, AudioChannels::Surround51)];
-        let changed = remap_audio_pids(&mut streams, &probed);
-        assert_eq!(changed, 0, "matching physical order is a no-op");
-        let Stream::Audio(a) = &streams[0] else {
-            panic!()
-        };
-        assert_eq!(a.pid, 0xBD80);
-    }
-
-    /// Two declared streams (5.1 + 2.0) where the physical order is reversed:
-    /// 0x80=2.0, 0x81=5.1. The 5.1 declaration must claim 0x81 and the 2.0
-    /// declaration must claim 0x80 — no collision, both correct.
-    #[test]
-    fn remap_two_streams_no_collision() {
-        let mut probed = BTreeMap::new();
-        probed.insert(0x80u8, 2u8);
-        probed.insert(0x81u8, 6u8);
-        // Declared order: 5.1 first (ordinal 0x80), 2.0 second (ordinal 0x81).
-        let mut streams = vec![
-            ac3_stream(0xBD80, AudioChannels::Surround51),
-            ac3_stream(0xBD81, AudioChannels::Stereo),
-        ];
-        remap_audio_pids(&mut streams, &probed);
-        let pids: Vec<u16> = streams
-            .iter()
-            .filter_map(|s| match s {
-                Stream::Audio(a) => Some(a.pid),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            pids,
-            vec![0xBD81, 0xBD80],
-            "5.1→0x81, 2.0→0x80, no collision"
-        );
-    }
-
-    /// A stream already sitting on its matching sub-stream must not share it with
-    /// an earlier stream that was re-routed there: 0x80=5.1, 0x81=2.0, both
-    /// declared 2.0 must stay on distinct sub-streams.
-    #[test]
-    fn remap_keep_current_respects_claimed() {
-        let mut probed = BTreeMap::new();
-        probed.insert(0x80u8, 6u8);
-        probed.insert(0x81u8, 2u8);
-        let mut streams = vec![
-            ac3_stream(0xBD80, AudioChannels::Stereo),
-            ac3_stream(0xBD81, AudioChannels::Stereo),
-        ];
-        remap_audio_pids(&mut streams, &probed);
-        let pids: Vec<u16> = streams
-            .iter()
-            .filter_map(|s| match s {
-                Stream::Audio(a) => Some(a.pid),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(pids, vec![0xBD80, 0xBD81], "no two tracks on one PID");
-    }
-
-    /// A displaced stream (its ordinal sub taken by a re-route) prefers an unclaimed
-    /// sub-stream that physically exists over a vacated ordinal one with no data.
-    #[test]
-    fn remap_displaced_stream_prefers_a_probed_sub() {
-        let mut probed = BTreeMap::new();
-        probed.insert(0x80u8, 2u8);
-        probed.insert(0x81u8, 6u8);
-        let mut streams = vec![
-            ac3_stream(0xBD82, AudioChannels::Surround51),
-            ac3_stream(0xBD81, AudioChannels::Mono),
-        ];
-        remap_audio_pids(&mut streams, &probed);
-        let pids: Vec<u16> = streams
-            .iter()
-            .filter_map(|s| match s {
-                Stream::Audio(a) => Some(a.pid),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            pids,
-            vec![0xBD81, 0xBD80],
-            "displaced -> probed 0x80, not empty 0x82"
-        );
-    }
-
-    /// More AC-3 streams than sub-streams: nothing is free, so the extra stream keeps
-    /// its (shared) ordinal PID — logged, never re-routed onto a random sub.
-    #[test]
-    fn remap_exhausted_subs_leave_the_ordinal_pid() {
-        let mut probed = BTreeMap::new();
-        probed.insert(0x80u8, 2u8);
-        let mut streams = vec![
-            ac3_stream(0xBD80, AudioChannels::Stereo),
-            ac3_stream(0xBD80, AudioChannels::Stereo),
-        ];
-        assert_eq!(remap_audio_pids(&mut streams, &probed), 0);
-        assert!(
-            streams
-                .iter()
-                .all(|s| matches!(s, Stream::Audio(a) if a.pid == 0xBD80))
-        );
-    }
-
-    /// Empty probe (unreadable / scrambled VOB) is a no-op — the ordinal
-    /// assignment survives so behaviour never regresses below today's.
-    #[test]
-    fn remap_empty_probe_is_noop() {
-        let probed = BTreeMap::new();
-        let mut streams = vec![ac3_stream(0xBD80, AudioChannels::Surround51)];
-        let changed = remap_audio_pids(&mut streams, &probed);
-        assert_eq!(changed, 0);
-        let Stream::Audio(a) = &streams[0] else {
-            panic!()
-        };
-        assert_eq!(a.pid, 0xBD80, "no probe data → keep ordinal");
-    }
-
     // Mutation guard for `pos + rel` (not `pos - rel`, which could underflow `usize`) as the
     // sync's true absolute position.
     #[test]
@@ -550,27 +300,6 @@ mod tests {
         );
     }
 
-    // Mutation guard: current sub-stream must be read via `pid & 0x00FF`, not `|`/`^`.
-    #[test]
-    fn remap_reads_current_substream_via_and_not_or_or_xor() {
-        let mut probed = BTreeMap::new();
-        probed.insert(0x80u8, 6u8);
-        probed.insert(0x81u8, 6u8); // ambiguous: two physical 6ch sub-streams
-        let mut streams = vec![ac3_stream(0xBD81, AudioChannels::Surround51)];
-        let changed = remap_audio_pids(&mut streams, &probed);
-        assert_eq!(
-            changed, 0,
-            "already sitting on a matching physical sub-stream (0x81) must be left alone"
-        );
-        let Stream::Audio(a) = &streams[0] else {
-            panic!()
-        };
-        assert_eq!(
-            a.pid, 0xBD81,
-            "must not be bumped to the other matching sub-stream (0x80)"
-        );
-    }
-
     /// A `SectorSource` stub that hands back fixed bytes regardless of the
     /// requested LBA/count, for exercising `probe_and_remap`'s end-to-end
     /// wiring (format/AC-3/extent/count guards -> read -> probe -> remap).
@@ -592,19 +321,19 @@ mod tests {
         }
     }
 
-    // End-to-end `probe_and_remap`: real-disc-shaped MpegPs title, 0x80=2.0 down-mix /
-    // 0x81=real 5.1, must re-route to 0xBD81.
+    // L084b: the scanner routes by PGC_AST_CTL, which every player follows, so the probe must
+    // not move a stream off it, even when the IFO channel count disagrees with the VOB.
     #[test]
-    fn probe_and_remap_reroutes_swapped_substream_scenario_end_to_end() {
-        let mut bytes = ps_ac3(0x80, 2, false); // physical 0x80 = 2.0 down-mix
-        bytes.extend(ps_ac3(0x81, 7, true)); // physical 0x81 = 5.1 main mix
+    fn probe_never_overrides_the_ast_ctl_route() {
+        let mut bytes = ps_ac3(0x80, 7, true); // 5.1 this PGC does not play
+        bytes.extend(ps_ac3(0x81, 2, false)); // the AST_CTL-routed stream, really 2.0
         let mut title = DiscTitle {
             playlist: "00001.ifo".into(),
             playlist_id: 1,
             duration_secs: 60.0,
             size_bytes: bytes.len() as u64,
             clips: Vec::new(),
-            streams: vec![ac3_stream(0xBD80, AudioChannels::Surround51)],
+            streams: vec![ac3_stream(0xBD81, AudioChannels::Surround51)],
             chapters: Vec::new(),
             extents: vec![Extent {
                 start_lba: 0,
@@ -613,14 +342,17 @@ mod tests {
             content_format: ContentFormat::MpegPs,
             codec_privates: vec![None],
         };
-        let mut source = FixedSource { data: bytes };
-        probe_and_remap(&mut source, &mut title);
+        let ((), ev) = crate::testlog::capture(|| {
+            probe_and_remap(&mut FixedSource { data: bytes }, &mut title)
+        });
+        let probed: Vec<&str> = ev.iter().map(|e| e.message()).collect();
+        assert!(
+            probed.iter().any(|m| m.contains("sub_id=0x80 channels=6")),
+            "the probe still runs and reports the VOB's real layout: {probed:?}"
+        );
         let Stream::Audio(a) = &title.streams[0] else {
             panic!("audio")
         };
-        assert_eq!(
-            a.pid, 0xBD81,
-            "declared 5.1 stream must be re-routed to the physical 5.1 sub-stream 0x81"
-        );
+        assert_eq!(a.pid, 0xBD81);
     }
 }

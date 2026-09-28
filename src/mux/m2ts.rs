@@ -19,6 +19,8 @@ pub struct M2tsStream {
     /// Per input track: output track index (None = dropped at create) and, for LPCM,
     /// the BD LPCM header to re-pack parser PCM with.
     route: Vec<Option<(usize, Option<[u8; 2]>)>>,
+    /// MPEG-2 multichannel extension tracks: no descriptor carrier (tsmux writes no PMT).
+    excluded: super::ps::UnstoredExtensions,
 }
 
 impl M2tsStream {
@@ -30,8 +32,15 @@ impl M2tsStream {
         out.streams.clear();
         out.codec_privates.clear();
         let mut route = Vec::with_capacity(title.streams.len());
+        let excluded = super::ps::UnstoredExtensions::new(title, "M2TS");
         for (i, s) in title.streams.iter().enumerate() {
             let mut cp = title.codec_privates.get(i).cloned().flatten();
+            // No descriptor binds a 13818-3 extension PID to its base, so a player could not
+            // re-pair it: left out, and reported like refused LPCM.
+            if excluded.contains(i) {
+                route.push(None);
+                continue;
+            }
             let lpcm = match s {
                 DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => {
                     let src = cp.as_deref().and_then(super::codec::lpcm::layout_byte);
@@ -92,6 +101,7 @@ impl M2tsStream {
             disc_title: title.clone(),
             muxer,
             route,
+            excluded,
         })
     }
 }
@@ -105,6 +115,9 @@ impl crate::pes::Stream for M2tsStream {
     }
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        if self.excluded.drop_frame(frame.track) {
+            return Ok(());
+        }
         match self.route.get(frame.track).copied() {
             // Dropped at create (already warned): nothing to write.
             Some(None) => Ok(()),
@@ -140,10 +153,14 @@ impl crate::pes::Stream for M2tsStream {
     }
 
     fn undelivered_streams(&self) -> Vec<usize> {
-        // Known from create: LPCM BD LPCM can't carry is never written.
-        (0..self.route.len())
-            .filter(|&i| self.route[i].is_none())
-            .collect()
+        // LPCM BD LPCM can't carry (known from create), and MPEG-2 extension tracks whose
+        // packets arrived.
+        let mut out: Vec<usize> = (0..self.route.len())
+            .filter(|&i| self.route[i].is_none() && !self.excluded.contains(i))
+            .chain(self.excluded.seen())
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {

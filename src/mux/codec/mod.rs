@@ -31,6 +31,7 @@ pub mod lpcm;
 /// MPEG-2 Video elementary-stream parser.
 pub mod mpeg2;
 
+pub(crate) mod mp2_channels;
 pub mod mpegaudio;
 /// HDMV PGS (Presentation Graphics Stream) subtitle parser.
 pub mod pgs;
@@ -220,6 +221,14 @@ pub fn parser_for_codec(
     }
 }
 
+/// Parser for a DVD MPEG-2 multichannel extension track
+/// ([`crate::disc::AudioStream::is_mp2_extension`]): one frame per PES, whole. Its payload is
+/// ISO/IEC 13818-3 `ext_frame()`s ("ext_syncword - A 12 bit string '0111 1111 1111'",
+/// §2.5.2.10), not Layer II frames, so the Layer II parser would split it at false syncs.
+pub(crate) fn parser_for_mp2_extension() -> Box<dyn CodecParser> {
+    Box::new(PassthroughParser::new(true))
+}
+
 /// Build the codec parser for a Blu-ray 3D **MVC dependent (right-eye)** video
 /// stream. Same codec space as the base view (H.264), but in param-set
 /// passthrough mode so each emitted frame is a self-contained dependent access
@@ -371,6 +380,7 @@ mod provenance_guard {
         "coding",
         "crc",
         "dropgate",
+        "mp2_channels",
         "pesbuf",
         "reorder",
         "startcode",

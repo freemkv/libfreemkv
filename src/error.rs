@@ -126,6 +126,10 @@ pub const E_WHOLE_DISC_KEY_MISSING: u16 = 7032;
 /// [`E_AACS_NO_HOST_CERT`] (no cert offered at all) or
 /// [`E_AACS_HOST_CERT_REJECTED`] (the drive itself rejected a cert).
 pub const E_AACS_NO_USABLE_HOST_CERT: u16 = 7033;
+/// An image piece is Missing, no VID is in hand, and the sidecar mapfile
+/// carries a `vidfp`: the key is derivable only from the disc's Volume ID.
+/// "the server must tell the two apart by code" (keys-upfront-design J11).
+pub const E_AACS_VID_NEEDS_DISC: u16 = 7034;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -284,6 +288,10 @@ pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
 pub const E_DRIVE_INQUIRY_SHORT: u16 = 9058;
 pub const E_SHORT_IMAGE_READ: u16 = 9059;
 pub const E_EMPTY_IMAGE: u16 = 9060;
+/// A `StallTimer` expired: `op` names the stalled operation (e.g.
+/// "artifact_lock", "verify"). "An expired `StallTimer` produces
+/// `Error::TimedOut { op }`" (stop-design-v5 §2.1).
+pub const E_TIMED_OUT: u16 = 9073;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -619,6 +627,11 @@ pub enum Error {
     /// no title plays is encrypted and no held key opens it. See
     /// [`E_WHOLE_DISC_KEY_MISSING`]. Raised before the copy where it can be.
     WholeDiscKeyMissing,
+    /// An image piece is Missing, no VID is in hand (neither passed nor scanned),
+    /// and the sidecar mapfile has a `vidfp`: the key can only be derived from
+    /// the disc's Volume ID. See [`E_AACS_VID_NEEDS_DISC`]. Raised before any
+    /// output; the image and mapfile are left untouched.
+    AacsVidNeedsDisc,
 
     /// AACS 2.1 (FMTS) disc carries forensic variant segments, but no segment
     /// (variant) key is available to open them. Raised UPFRONT — before the mux —
@@ -876,6 +889,13 @@ pub enum Error {
     StreamClosed,
     /// See [`E_STREAM_HEADER_WRITTEN`].
     StreamHeaderWritten,
+    /// A `StallTimer` expired with no forward progress on `op`. See
+    /// [`E_TIMED_OUT`]. "An expired `StallTimer` produces `Error::TimedOut
+    /// { op }`" (stop-design-v5 §2.1); existing timeout codes that already
+    /// name their cause (`PipelineJoinTimeout`, `SyncTimeout`) keep them.
+    TimedOut {
+        op: &'static str,
+    },
 }
 
 impl Error {
@@ -953,6 +973,7 @@ impl Error {
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
             Error::AacsKeyFileUnreadable => E_AACS_KEY_FILE_UNREADABLE,
             Error::WholeDiscKeyMissing => E_WHOLE_DISC_KEY_MISSING,
+            Error::AacsVidNeedsDisc => E_AACS_VID_NEEDS_DISC,
             Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
@@ -1012,6 +1033,7 @@ impl Error {
             Error::SinkWroteNothing => E_SINK_WROTE_NOTHING,
             Error::StreamClosed => E_STREAM_CLOSED,
             Error::StreamHeaderWritten => E_STREAM_HEADER_WRITTEN,
+            Error::TimedOut { .. } => E_TIMED_OUT,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
@@ -1189,6 +1211,9 @@ impl std::fmt::Display for Error {
             Error::ImageEndsBeforeRead { lba, have, want } => {
                 write!(f, "E{}: {lba} {have}/{want}", self.code())
             }
+            // `op` is a stable, language-neutral identifier (e.g. "verify",
+            // "artifact_lock"), not translatable prose.
+            Error::TimedOut { op } => write!(f, "E{}: {op}", self.code()),
             _ => write!(f, "E{}", self.code()),
         }
     }
@@ -1320,6 +1345,8 @@ impl From<Error> for std::io::Error {
             // 9065: the folder changed underneath a running read. Not bad input
             // at plan time — a mid-flight mutation of the source.
             E_DIR_IMAGE_FILE_CHANGED => std::io::ErrorKind::InvalidData,
+            // 9073 TimedOut: a StallTimer expired with no forward progress.
+            E_TIMED_OUT => std::io::ErrorKind::TimedOut,
             _ => std::io::ErrorKind::Other,
         };
         // Carry the typed value itself as the payload, not its stringification.
@@ -1617,6 +1644,8 @@ mod tests {
             Error::AacsKeyFileUnreadable.code(),
             Error::AacsNoUsableHostCert.code(),
             Error::WholeDiscKeyMissing.code(),
+            Error::AacsVidNeedsDisc.code(),
+            Error::TimedOut { op: "verify" }.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1703,6 +1732,8 @@ mod tests {
             (Error::AacsKeyFileUnreadable, E_AACS_KEY_FILE_UNREADABLE),
             (Error::AacsNoUsableHostCert, E_AACS_NO_USABLE_HOST_CERT),
             (Error::WholeDiscKeyMissing, E_WHOLE_DISC_KEY_MISSING),
+            (Error::AacsVidNeedsDisc, E_AACS_VID_NEEDS_DISC),
+            (Error::TimedOut { op: "verify" }, E_TIMED_OUT),
         ];
         for (e, want_code) in cases {
             let s = e.to_string();
@@ -2120,6 +2151,7 @@ mod tests {
             (Error::CssAuthFailed, E_CSS_AUTH_FAILED),
             (Error::AacsHostCertRejected, E_AACS_HOST_CERT_REJECTED),
             (Error::AacsNoUsableHostCert, E_AACS_NO_USABLE_HOST_CERT),
+            (Error::AacsVidNeedsDisc, E_AACS_VID_NEEDS_DISC),
             (Error::AacsRawReadUnsupported, E_AACS_RAW_READ_UNSUPPORTED),
             (Error::AacsVidUnavailable, E_AACS_VID_UNAVAILABLE),
             (Error::AacsMkUnavailable, E_AACS_MK_UNAVAILABLE),
@@ -2136,6 +2168,36 @@ mod tests {
                 expected_code
             );
         }
+    }
+
+    /// LT8 (CC-L0): E9073's code, Display and `ErrorKind::TimedOut` round trip.
+    /// "declare `E_TIMED_OUT = 9073` ... with their `Error` variants, `code()`,
+    /// `Display`, `ErrorKind` and table rows" (stop-design-v5 §6 R7.2).
+    #[test]
+    fn timed_out_code_display_kind() {
+        use std::io::ErrorKind;
+        let e = Error::TimedOut {
+            op: "artifact_lock",
+        };
+        assert_eq!(e.code(), E_TIMED_OUT);
+        assert_eq!(e.to_string(), format!("E{E_TIMED_OUT}: artifact_lock"));
+        let io: std::io::Error = e.into();
+        assert_eq!(io.kind(), ErrorKind::TimedOut);
+        // The declared-constants table (parsed from source) carries the code.
+        assert!(declared_error_codes().contains(&("E_TIMED_OUT", E_TIMED_OUT)));
+    }
+
+    /// LT8 companion (KU v3.4 J11): E7034's code, Display and its `ErrorKind`
+    /// (7xxx maps to `PermissionDenied`, same bucket as the sibling AACS codes).
+    #[test]
+    fn aacs_vid_needs_disc_code_display_kind() {
+        use std::io::ErrorKind;
+        let e = Error::AacsVidNeedsDisc;
+        assert_eq!(e.code(), E_AACS_VID_NEEDS_DISC);
+        assert_eq!(e.to_string(), format!("E{E_AACS_VID_NEEDS_DISC}"));
+        let io: std::io::Error = e.into();
+        assert_eq!(io.kind(), ErrorKind::PermissionDenied);
+        assert!(declared_error_codes().contains(&("E_AACS_VID_NEEDS_DISC", E_AACS_VID_NEEDS_DISC)));
     }
 
     // is_scsi_transport_failure is true for the 0xFF sentinel and non-SCSI

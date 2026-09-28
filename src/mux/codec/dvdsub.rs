@@ -37,21 +37,30 @@ impl DvdSubParser {
     /// Emit `pending` as a Frame if it is complete (or `force` at EOF),
     /// returning it and clearing the buffer. Returns None if nothing to emit.
     fn take_if_complete(&mut self, force: bool) -> Option<Frame> {
-        let (_, size, buf) = self.pending.as_ref()?;
-        if force || buf.len() >= *size {
-            let (facts, _, data) = self.pending.take().unwrap();
-            let pts_ns = facts.presentation_ns().unwrap_or(0);
-            return Some(Frame {
-                discontinuity: false,
-                coding: None,
-                source: facts.source,
-                pts_ns,
-                keyframe: true,
-                data,
-                duration_ns: None,
-            });
+        let complete = match self.pending.as_ref() {
+            Some((_, size, buf)) => force || buf.len() >= *size,
+            None => false,
+        };
+        if !complete {
+            return None;
         }
-        None
+        // `complete` is only true when `self.pending` was `Some` above, but
+        // borrow through `?` rather than a prod `unwrap()` on a fact the
+        // compiler can't see across the two lines.
+        let (facts, _, data) = self.pending.take()?;
+        // Guaranteed Some: `pending` is only ever created from a PES with
+        // `pts.is_some()` (L054 dropped the no-PTS orphan path), so this
+        // never takes the fallback; kept as unwrap_or, never a prod unwrap.
+        let pts_ns = facts.presentation_ns().unwrap_or(0);
+        Some(Frame {
+            discontinuity: false,
+            coding: None,
+            source: facts.source,
+            pts_ns,
+            keyframe: true,
+            data,
+            duration_ns: None,
+        })
     }
 }
 
@@ -66,28 +75,38 @@ impl CodecParser for DvdSubParser {
         // PTS present == start of a new SPU (continuations carry none); a PTS
         // while `pending` is still open (lost continuation/corrupt SPU_size)
         // force-emits it truncated rather than swallowing all later SPUs.
-        if pes.pts.is_none() {
-            if self.pending.is_some() {
-                // Continuation: append, bounded by MAX_SPU_BYTES.
-                if let Some((_, _, buf)) = self.pending.as_mut() {
-                    let room = MAX_SPU_BYTES.saturating_sub(buf.len());
-                    let take = room.min(pes.data.len());
-                    buf.extend_from_slice(&pes.data[..take]);
+        let pts = match pes.pts {
+            None => {
+                if self.pending.is_some() {
+                    // Continuation: append, bounded by MAX_SPU_BYTES.
+                    if let Some((_, _, buf)) = self.pending.as_mut() {
+                        let room = MAX_SPU_BYTES.saturating_sub(buf.len());
+                        let take = room.min(pes.data.len());
+                        buf.extend_from_slice(&pes.data[..take]);
+                    }
+                    if let Some(frame) = self.take_if_complete(false) {
+                        out.push(frame);
+                    }
+                    return out;
                 }
-                if let Some(frame) = self.take_if_complete(false) {
-                    out.push(frame);
-                }
+                // Orphan continuation (no pending, no PTS): a fresh SPU at
+                // pts 0 would put a garbage bitmap at 00:00:00. PGS drops
+                // the same case, so drop here too (L054).
                 return out;
             }
-            // No pending and no PTS: nothing to attach this to. Pass it through
-            // as a lone frame (PTS unknown → 0) rather than drop it.
-        } else if let Some(frame) = self.take_if_complete(true) {
-            // New SPU starting while a previous one is still open → flush stale.
-            out.push(frame);
-        }
+            Some(pts) => {
+                if let Some(frame) = self.take_if_complete(true) {
+                    // New SPU starting while a previous one is still open →
+                    // flush stale.
+                    out.push(frame);
+                }
+                pts
+            }
+        };
 
         // Start of a new SPU. The first 2 bytes are the big-endian total size.
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        // `pts` is always real here — the no-PTS arm above always returns.
+        let pts_ns = pts_to_ns(pts);
         let declared = if pes.data.len() >= 2 {
             // SPU_size includes the 2-byte header, so a declared size < 2 is
             // always malformed; treat it like the too-short path (lone frame)
@@ -276,13 +295,14 @@ mod tests {
     }
 
     #[test]
-    fn no_pts_defaults_to_zero() {
+    fn no_pts_orphan_with_no_pending_is_dropped() {
+        // Orphan (no pending, no PTS), even when "complete" on arrival: has
+        // no real start time, so it's dropped, not emitted at pts 0 (L054).
         let mut parser = DvdSubParser::new(None);
-        // SPU_size = 2, single complete PES (the 2 size bytes themselves).
         let pes = make_pes(vec![0x00, 0x02], None);
         let frames = parser.parse(&pes);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].pts_ns, 0);
+        assert!(frames.is_empty(), "orphan no-PTS PES is dropped");
+        assert!(parser.pending.is_none());
     }
 
     #[test]
@@ -661,37 +681,24 @@ mod tests {
     }
 
     #[test]
-    fn no_pts_short_segment_without_pending_passes_through() {
-        // A no-PTS segment with NO pending SPU and too few bytes to carry an
-        // SPU_size (< 2) has nothing to attach to and can't start a unit → passed
-        // through as a lone frame at pts 0 (the documented fallback).
+    fn no_pts_short_segment_without_pending_is_dropped() {
+        // Too-short (< 2 bytes) orphan: dropped, not passed through at pts 0.
+        // Matches PGS's drop of the same case (L054).
         let mut parser = DvdSubParser::new(None);
         let f = parser.parse(&make_pes(vec![0xAA], None));
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].pts_ns, 0, "lone no-PTS segment falls back to pts 0");
-        assert_eq!(f[0].data, vec![0xAA]);
+        assert!(f.is_empty(), "orphan short no-PTS segment is dropped");
+        assert!(parser.pending.is_none());
     }
 
     #[test]
-    fn no_pts_sized_segment_without_pending_starts_new_spu() {
-        // No-PTS segment, no pending, valid SPU_size (>= 2), incomplete length:
-        // starts a fresh pending SPU (size field is authoritative for boundary
-        // even if the demuxer dropped the PTS). declared=16, 3 bytes → held.
+    fn no_pts_sized_segment_without_pending_is_dropped() {
+        // No-PTS segment, no pending, valid SPU_size (>= 2): still an orphan
+        // continuation with no start time — dropped, not turned into a fresh
+        // pending SPU at pts 0 (the bug: a garbage bitmap at 00:00:00.0).
         let mut parser = DvdSubParser::new(None);
         let f = parser.parse(&make_pes(vec![0x00, 0x10, 0xAA], None));
-        assert!(f.is_empty(), "incomplete sized segment held, not emitted");
-        assert!(parser.pending.is_some(), "started a new pending SPU");
-        assert_eq!(
-            parser
-                .pending
-                .as_ref()
-                .unwrap()
-                .0
-                .presentation_ns()
-                .unwrap_or(0),
-            0,
-            "pts 0 (no PTS)"
-        );
+        assert!(f.is_empty(), "orphan sized no-PTS segment is dropped");
+        assert!(parser.pending.is_none(), "no pending SPU is started");
     }
 
     #[test]

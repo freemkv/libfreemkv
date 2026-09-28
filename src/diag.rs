@@ -178,13 +178,13 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
     for (i, a) in ts.audio_streams.iter().enumerate() {
         tracing::debug!(
             target: DIAG,
-            "tag=dvd.aattr vts={} idx={i} codec={:?} ch={} sr={}Hz lang={:?} sub_id={:?}",
+            "tag=dvd.aattr vts={} idx={i} codec={:?} ch={} sr={}Hz lang={:?} mpeg_ext={}",
             ts.vts_number,
             a.codec,
             a.channels,
             a.sample_rate,
             a.language,
-            a.sub_stream_id.map(|x| format!("0x{x:02X}")),
+            a.mpeg_ext,
         );
     }
     for (i, s) in ts.subtitle_streams.iter().enumerate() {
@@ -195,6 +195,43 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
             s.language,
         );
     }
+}
+
+/// A title whose PGC control table (`ast`/`spst`) marks none of its `declared` streams present,
+/// so a disc that loses every audio or subtitle track to sloppy authoring is traceable.
+pub fn dvd_ctl_none_present(kind: &str, vts: u8, title: u16, declared: usize, outcome: &str) {
+    tracing::debug!(
+        target: DIAG,
+        "tag=dvd.{kind}ctl vts={vts} title={title} declared={declared} present=0 -> {outcome}",
+    );
+}
+
+/// A logical stream dropped because an earlier one already routes to the same physical id
+/// (`id`: the VobSub sub-id, or the audio routing PID).
+pub fn dvd_ctl_duplicate(kind: &str, vts: u8, title: u16, id: u16, kept: &str, dropped: &str) {
+    tracing::debug!(
+        target: DIAG,
+        "tag=dvd.{kind}ctl vts={vts} title={title} id=0x{id:02X} kept={kept:?} dropped={dropped:?} (duplicate physical id)",
+    );
+}
+
+/// Where one title routes a declared audio stream: its raw AST_CTL entry and the PID it
+/// muxes from, or `absent` when the PGC does not play it.
+pub fn dvd_audio_route(
+    vts: u8,
+    title: u16,
+    idx: usize,
+    a: &crate::ifo::DvdAudioAttr,
+    ctl: u16,
+    pid: Option<u16>,
+) {
+    let route = pid.map_or("absent".to_string(), |p| format!("pid=0x{p:04X}"));
+    tracing::debug!(
+        target: DIAG,
+        "tag=dvd.aroute vts={vts} title={title} idx={idx} codec={:?} lang={:?} ast=0x{ctl:04X} {route}",
+        a.codec,
+        a.language,
+    );
 }
 
 /// Emit the ACTUAL per-physical-sub-stream AC-3 channel counts read off the VOB during the
@@ -462,14 +499,12 @@ pub fn dump_disc(disc: &Disc) {
     }
 }
 
-// The `reason=` token on the main-feature decision row. DERIVED from the Disc key
-// lists, plus the comparator's final playlist-id tiebreak those lists omit.
+// The `reason=` token on the main-feature decision row. DERIVED from the Disc key lists.
 fn main_feature_reason() -> String {
     let keys: Vec<&str> = Disc::MAIN_FEATURE_ORDER_KEYS
         .iter()
         .chain(Disc::CANONICAL_TITLE_ORDER_KEYS.iter())
         .copied()
-        .chain(std::iter::once("lowest-playlist-id"))
         .collect();
     format!("main_feature_order({})", keys.join(", "))
 }

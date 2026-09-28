@@ -7,7 +7,7 @@
 //! (0x0F) in the PES, per the BD VC-1 convention (see `parse`).
 
 use super::coding::{CodingType, PictureInfo};
-use super::startcode::BitReader;
+use super::startcode::{BitReader, find_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const SC_SEQUENCE_HEADER: u8 = 0x0F;
@@ -176,61 +176,61 @@ impl CodecParser for Vc1Parser {
         let mut redefined_seq: Option<Vec<u8>> = None;
         let mut redefined_ep: Option<Vec<u8>> = None;
 
-        // Scan for start codes (00 00 01 XX)
+        // Scan for start codes (00 00 01 XX), reusing the shared SIMD-backed
+        // scanner rather than a hand-rolled byte-by-byte loop.
         let data = &pes.data;
         let mut i = 0;
-        while i + 3 < data.len() {
-            if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 {
-                let sc_type = data[i + 3];
-                match sc_type {
-                    SC_SEQUENCE_HEADER => {
-                        let end = find_next_sc(data, i + 4).unwrap_or(data.len());
-                        let sh = &data[i..end];
-                        // Try to parse resolution from advanced profile sequence header
-                        if self.seq_header.is_none()
-                            && let Some((w, h)) = parse_vc1_resolution(sh) {
-                                self.width = w;
-                                self.height = h;
-                            }
-                        // Collect into a scratch Vec so handle_header can
-                        // append; we discard the Vec and only keep the flag.
-                        let mut scratch = Vec::new();
-                        let changed = handle_header(
-                            &mut self.seq_header,
-                            &mut self.cur_seq_header,
-                            sh,
-                            &mut scratch,
-                        );
-                        if changed {
-                            redefined_seq = Some(scratch);
-                        }
-                        has_seq_header = true;
-                    }
-                    SC_ENTRY_POINT => {
-                        let end = find_next_sc(data, i + 4).unwrap_or(data.len());
-                        let mut scratch = Vec::new();
-                        let changed = handle_header(
-                            &mut self.entry_point,
-                            &mut self.cur_entry_point,
-                            &data[i..end],
-                            &mut scratch,
-                        );
-                        if changed {
-                            redefined_ep = Some(scratch);
-                        }
-                        has_entry_point = true;
-                    }
-                    SC_FRAME
-                        // Frame data starts at this start code
-                        if frame_start.is_none() => {
-                            frame_start = Some(i);
-                        }
-                    _ => {}
-                }
-                i += 4;
-            } else {
-                i += 1;
+        while let Some(pos) = find_start_code(data, i) {
+            if pos + 3 >= data.len() {
+                break; // start code with no following type byte — nothing to read
             }
+            let sc_type = data[pos + 3];
+            match sc_type {
+                SC_SEQUENCE_HEADER => {
+                    let end = find_start_code(data, pos + 4).unwrap_or(data.len());
+                    let sh = &data[pos..end];
+                    // Try to parse resolution from advanced profile sequence header
+                    if self.seq_header.is_none()
+                        && let Some((w, h)) = parse_vc1_resolution(sh) {
+                            self.width = w;
+                            self.height = h;
+                        }
+                    // Collect into a scratch Vec so handle_header can
+                    // append; we discard the Vec and only keep the flag.
+                    let mut scratch = Vec::new();
+                    let changed = handle_header(
+                        &mut self.seq_header,
+                        &mut self.cur_seq_header,
+                        sh,
+                        &mut scratch,
+                    );
+                    if changed {
+                        redefined_seq = Some(scratch);
+                    }
+                    has_seq_header = true;
+                }
+                SC_ENTRY_POINT => {
+                    let end = find_start_code(data, pos + 4).unwrap_or(data.len());
+                    let mut scratch = Vec::new();
+                    let changed = handle_header(
+                        &mut self.entry_point,
+                        &mut self.cur_entry_point,
+                        &data[pos..end],
+                        &mut scratch,
+                    );
+                    if changed {
+                        redefined_ep = Some(scratch);
+                    }
+                    has_entry_point = true;
+                }
+                SC_FRAME
+                    // Frame data starts at this start code
+                    if frame_start.is_none() => {
+                        frame_start = Some(pos);
+                    }
+                _ => {}
+            }
+            i = pos + 4;
         }
 
         // Keyframe = this PES contains a sequence header (I-frame indicator in BD)
@@ -412,11 +412,6 @@ fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
     } else {
         None
     }
-}
-
-fn find_next_sc(data: &[u8], from: usize) -> Option<usize> {
-    (from..data.len().saturating_sub(2))
-        .find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
 }
 
 #[cfg(test)]
@@ -793,20 +788,6 @@ mod tests {
         let _ = cp;
     }
 
-    // --- find_next_sc utility ---
-
-    #[test]
-    fn find_next_sc_basic() {
-        let data = [0xAA, 0x00, 0x00, 0x01, 0x0D, 0xBB];
-        assert_eq!(find_next_sc(&data, 0), Some(1));
-    }
-
-    #[test]
-    fn find_next_sc_none() {
-        let data = [0xAA, 0xBB, 0xCC];
-        assert_eq!(find_next_sc(&data, 0), None);
-    }
-
     // --- codec_private extra data contains seq header + entry point ---
 
     // --- parse_vc1_resolution: profile gating + bounds + de-escaping ---
@@ -950,6 +931,23 @@ mod tests {
     }
 
     #[test]
+    fn scan_finds_start_codes_past_a_long_zero_run_and_4_byte_form() {
+        // Pin the tricky shapes the shared scanner must still handle: a long
+        // zero run before the real start code, and a 4-byte `00 00 00 01`
+        // start code (reported at the inner triple).
+        let mut parser = Vc1Parser::new();
+        let mut data = vec![0u8; 64]; // long zero run
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, SC_FRAME, 0xAB]); // 4-byte SC
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            &f[0].data[0..5],
+            &[0x00, 0x00, 0x01, SC_FRAME, 0xAB],
+            "frame data starts at the inner 00 00 01 triple, not the outer zero"
+        );
+    }
+
+    #[test]
     fn entry_point_without_frame_or_seq_header_emits_no_frame() {
         // A PES with ONLY an entry point (no frame SC, no seq header) is a
         // parameter-set-only AU → no coded picture → no frame (has_entry_point
@@ -959,15 +957,6 @@ mod tests {
         let f = parser.parse(&make_pes(data, Some(0)));
         assert!(f.is_empty(), "entry-point-only PES emits no frame");
         assert!(parser.entry_point.is_some(), "but entry point captured");
-    }
-
-    #[test]
-    fn find_next_sc_respects_from_offset() {
-        // find_next_sc must begin at `from`: a start code before `from` is
-        // ignored. Code at offset 1 and 6; from=2 finds the second (offset 6).
-        let data = [0xAA, 0x00, 0x00, 0x01, 0x0D, 0xBB, 0x00, 0x00, 0x01, 0x0E];
-        assert_eq!(find_next_sc(&data, 0), Some(1));
-        assert_eq!(find_next_sc(&data, 2), Some(6));
     }
 
     #[test]

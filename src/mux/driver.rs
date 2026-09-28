@@ -276,8 +276,8 @@ pub fn mux_stream(
                 key_fetch,
             } => {
                 // Prune to selected audio/subtitle streams BEFORE the highway
-                // builds demux state (and before probe_and_remap rewrites DVD
-                // AC-3 PIDs). Video is always kept; no-op for default All/All.
+                // builds demux state (and before the DVD AC-3 channel probe).
+                // Video is always kept; no-op for default All/All.
                 let mut title = title;
                 opts.selection
                     .apply(&mut title)
@@ -349,8 +349,8 @@ pub fn mux_stream(
                     )
                 };
                 // Prune to selected streams before `DiscStream::new` builds demux
-                // tables (and before inline probe_and_remap). Only touches the
-                // stream list; ciphertext sampling in resolve_inline_base_map unaffected.
+                // tables. Only touches the stream list; ciphertext sampling in
+                // resolve_inline_base_map unaffected.
                 opts.selection
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
@@ -698,9 +698,15 @@ fn drive_mux(
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
-    // A sink may refuse a stream at open (m2ts: LPCM BD LPCM can't carry); the
-    // opened title lists only what will be written.
-    let refused = output_stream.undelivered_streams();
+    // A sink may refuse a stream at open (m2ts: LPCM BD LPCM can't carry), and a sink with no
+    // mapping never writes an MPEG-2 extension track (reported lost only once its packets
+    // arrive); the opened title lists only what will be written.
+    let mut refused = output_stream.undelivered_streams();
+    if drops_mp2_extensions(dest_url) {
+        refused.extend((out_title.streams.iter().enumerate()).filter_map(|(i, s)| {
+            matches!(s, crate::disc::Stream::Audio(a) if a.is_mp2_extension()).then_some(i)
+        }));
+    }
     if refused.is_empty() {
         events.on_output_opened(&out_title);
     } else {
@@ -821,7 +827,7 @@ fn drive_mux(
     // to `completed = false` rather than a hard failure.
     let (bytes_written, undelivered_streams, finalize_failed) =
         match finish_pumped(pipe, halt, send_timed_out) {
-            Ok((b, undelivered)) => (b, undelivered, false),
+            Ok(c) => (c.bytes, c.undelivered, false),
             Err(Error::Halted | Error::PipelineJoinTimeout) => {
                 (bytes.load(Ordering::Relaxed), Vec::new(), true)
             }
@@ -893,6 +899,25 @@ fn collect_late_configs(stream: &dyn Stream, pending: &mut Vec<usize>, out: &Lat
     });
 }
 
+// Sinks that never write a DVD MPEG-2 multichannel extension track (no mapping for 13818-3
+// `ext_frame`s); the FMKV wire (network://, stdio://) carries it.
+fn drops_mp2_extensions(dest_url: &str) -> bool {
+    matches!(
+        parse_url(dest_url),
+        StreamUrl::Mkv { .. }
+            | StreamUrl::Mp4 { .. }
+            | StreamUrl::M2ts { .. }
+            | StreamUrl::Demux { .. }
+            | StreamUrl::Audio { .. }
+    )
+}
+
+// What the write consumer hands back once the container is finalised.
+struct SinkClose {
+    bytes: u64,
+    undelivered: Vec<usize>,
+}
+
 // Write-side `Sink`: applies each frame to the counting output stream and
 // finalises the container on close. `close()` returns the payload-byte count
 // plus any undelivered streams (see `MuxOutcome::undelivered_streams`).
@@ -920,7 +945,7 @@ impl WriteSink {
 }
 
 impl Sink<PesFrame> for WriteSink {
-    type Output = (u64, Vec<usize>);
+    type Output = SinkClose;
 
     fn apply(&mut self, frame: PesFrame) -> Result<Flow, Error> {
         self.apply_late_configs()?;
@@ -930,14 +955,14 @@ impl Sink<PesFrame> for WriteSink {
         Ok(Flow::Continue)
     }
 
-    fn close(mut self) -> Result<(u64, Vec<usize>), Error> {
+    fn close(mut self) -> Result<SinkClose, Error> {
         self.apply_late_configs()?;
         self.output.finish().map_err(Error::from)?;
         // Sample AFTER finish(): the mp4 sink decides its drops there.
-        Ok((
-            self.output.bytes_written(),
-            self.output.undelivered_streams(),
-        ))
+        Ok(SinkClose {
+            bytes: self.output.bytes_written(),
+            undelivered: self.output.undelivered_streams(),
+        })
     }
 }
 
@@ -1091,6 +1116,91 @@ mod tests {
         fn on_output_opened(&self, _title: &DiscTitle) {
             self.opened.store(true, Ordering::SeqCst);
         }
+    }
+
+    fn mp2_ext_title() -> DiscTitle {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        let audio = |pid, label: &str| {
+            Stream::Audio(AudioStream {
+                pid,
+                codec: Codec::Mp2,
+                channels: AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: label.into(),
+            })
+        };
+        let mut t = DiscTitle::empty();
+        t.content_format = crate::disc::ContentFormat::MpegPs;
+        t.streams = vec![
+            audio(0x00C0, ""),
+            audio(0x00D0, crate::disc::MP2_EXTENSION_LABEL),
+        ];
+        t
+    }
+
+    fn ext_frame() -> PesFrame {
+        PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 1,
+            pts: 0,
+            keyframe: true,
+            // 13818-3 2nd ed. §2.5.2.10: "ext_syncword - A 12 bit string '0111 1111 1111'".
+            data: vec![0x7F, 0xF0, 0x00],
+            duration_ns: None,
+        }
+    }
+
+    fn mp2_extension_warnings(ev: &[crate::testlog::CapturedEvent]) -> usize {
+        (ev.iter())
+            .filter(|e| e.level == tracing::Level::WARN)
+            .filter(|e| e.message().contains("MPEG-2 multichannel extension"))
+            .count()
+    }
+
+    /// Guard (mpg design §7): every sink but mpg/network/stdio lists an MPEG-2 multichannel
+    /// extension track as excluded once its packets arrive, so lost surround is never silent;
+    /// IFO coding mode 3 alone (no `0xD0|n` packet) gives no warning and no note.
+    #[test]
+    fn every_sink_that_cannot_store_an_mp2_extension_reports_it_once_seen() {
+        let title = mp2_ext_title();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().display();
+        for url in [
+            format!("mkv://{d}/o.mkv"),
+            format!("m2ts://{d}/o.m2ts"),
+            format!("demux://{d}/demux"),
+            format!("audio://{d}/audio"),
+        ] {
+            let (mut sink, ev) = crate::testlog::capture(|| {
+                crate::mux::resolve::output(&url, &title, None).expect("sink opens")
+            });
+            assert_eq!(mp2_extension_warnings(&ev), 0, "{url}: declared only");
+            assert!(
+                sink.undelivered_streams().is_empty(),
+                "{url}: declared only"
+            );
+            let ((), ev) = crate::testlog::capture(|| {
+                sink.write(&ext_frame()).unwrap();
+                sink.write(&ext_frame()).unwrap();
+            });
+            assert_eq!(mp2_extension_warnings(&ev), 1, "{url}: warned once");
+            assert_eq!(sink.undelivered_streams(), vec![1], "{url}");
+        }
+        // mp4's pre-mux plan never lists it; the sink does once packets arrive (mp4 tests).
+        let fit = crate::mux::mp4::fit_report(&title);
+        assert!(
+            !fit.skipped.iter().any(|&(i, _)| i == 1),
+            "{:?}",
+            fit.skipped
+        );
+        // The FMKV wire (network://, stdio://) keeps it: the label round-trips.
+        let wire = crate::mux::meta::M2tsMeta::from_title(&title).to_title();
+        assert!(matches!(&wire.streams[1], crate::disc::Stream::Audio(a) if a.is_mp2_extension()));
     }
 
     fn tmp(name: &str) -> (tempfile::TempDir, String) {
@@ -2524,6 +2634,40 @@ mod tests {
         assert_eq!(opened.streams.len(), 1, "only the carried track is listed");
     }
 
+    /// A declared MPEG-2 extension track that a sink can never write is not in the opened title
+    /// (CLI and GUI list the same streams), and with no `0xD0|n` packet nothing is reported lost.
+    #[test]
+    fn mkv_opened_title_omits_a_declared_mp2_extension_without_warning() {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("mkv://{}", dir.path().join("o.mkv").display());
+        let mut src = LpcmSource::new(AudioChannels::Stereo, SampleRate::S48, None);
+        src.info.streams.push(Stream::Audio(AudioStream {
+            pid: 0x00D0,
+            codec: Codec::Mp2,
+            channels: AudioChannels::Unknown,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: crate::disc::MP2_EXTENSION_LABEL.into(),
+        }));
+        let spy = TitleSpy::default();
+        let (out, ev) = crate::testlog::capture(|| run(src, &url, &spy));
+        let opened = spy.0.lock().unwrap().clone().unwrap();
+        assert!(
+            !opened
+                .streams
+                .iter()
+                .any(|s| matches!(s, Stream::Audio(a) if a.is_mp2_extension())),
+            "{:?}",
+            opened.streams
+        );
+        assert_eq!(opened.streams.len(), 1);
+        assert!(out.undelivered_streams.is_empty());
+        assert_eq!(mp2_extension_warnings(&ev), 0);
+    }
+
     // The sink lives in the consumer thread and is destroyed with it, so an
     // undelivered stream is knowable ONLY at `close()`, which must carry it
     // out alongside the byte count or `MuxOutcome` can never report it.
@@ -2536,7 +2680,7 @@ mod tests {
             bytes: Arc::new(AtomicU64::new(0)),
             late_configs: LateConfigs::default(),
         };
-        let (bytes, undelivered) = sink.close().expect("close succeeds");
+        let SinkClose { bytes, undelivered } = sink.close().expect("close succeeds");
         assert_eq!(bytes, 0);
         assert_eq!(
             undelivered,

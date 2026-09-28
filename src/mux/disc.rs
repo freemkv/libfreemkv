@@ -156,6 +156,9 @@ pub struct DiscStream {
     /// are expected on every disc; tallied and summarised once at EOF instead of
     /// a per-packet WARN.
     dropped_nav_packets: u64,
+    /// Packets of MPEG-2 audio extension streams (`0xD0|n`) with no declared extension track,
+    /// reported once at EOF (see `ps::warn_undeclared_extensions`).
+    mpeg_extension_packets: [u64; 8],
 
     // Cumulative bytes successfully read from the source. Drives
     // EventKind::BytesRead emission and autorip's per-device progress.
@@ -247,9 +250,8 @@ impl DiscStream {
         // decrypts to broken TS is the muxer's concern, not loss to conceal.
         let mut reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
 
-        // Wrong-substream fix (Silence-of-the-Lambs): re-route the title's
-        // declared AC-3 audio onto the physically-correct `0x8x` sub-streams
-        // by probing real channel counts off the feature's head. No-op otherwise.
+        // Diagnostics only: logs each physical AC-3 sub-stream's real channel count
+        // at --log-level 3. Routing is the scanner's PGC AST_CTL map.
         crate::disc::dvd_audio_probe::probe_and_remap(&mut reader, &mut title);
 
         // Use the CANONICAL builder shared with the file-backed highway
@@ -301,6 +303,7 @@ impl DiscStream {
             event_fn: None,
             eof: false,
             dropped_nav_packets: 0,
+            mpeg_extension_packets: [0; 8],
             bytes_read_total: 0,
             bytes_total_extents,
             ts_demuxer,
@@ -756,6 +759,11 @@ impl DiscStream {
                         let Some((_, track)) =
                             self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
                         else {
+                            if let Some(base) = super::ps::dvd_mpeg_audio_extension_base(pid) {
+                                // Counted and reported once at EOF: no extension track was declared.
+                                self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
+                                continue;
+                            }
                             tracing::warn!(
                                 target: "mux",
                                 "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
@@ -784,6 +792,7 @@ impl DiscStream {
                         }
                     }
                 }
+                super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
                 // Drain any access unit a codec parser buffered past the last
                 // PES (DTS-HD's final core+extension unit, assembled across
                 // PES boundaries).
@@ -927,6 +936,11 @@ impl DiscStream {
                     let Some((_, track)) =
                         self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
                     else {
+                        if let Some(base) = super::ps::dvd_mpeg_audio_extension_base(pid) {
+                            // Counted and reported once at EOF: no extension track was declared.
+                            self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
+                            continue;
+                        }
                         tracing::warn!(
                             target: "mux",
                             "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
@@ -2804,6 +2818,40 @@ mod tests {
                 frame.source.is_some(),
                 "PS path must forward ps.source so demuxed frames carry provenance"
             );
+        }
+
+        /// A DVD read with no declared extension track reports `0xD0|n` packets once at EOF.
+        #[test]
+        fn ps_stream_reports_undeclared_extension_packets_once() {
+            use crate::pes::Stream;
+
+            let mut sector = ps_pack_header();
+            for _ in 0..3 {
+                // MPEG-2 PES header without PTS, then an ext_frame's "ext_syncword".
+                sector.extend_from_slice(&[0x00, 0x00, 0x01, 0xD2, 0x00, 0x05, 0x81, 0x00, 0x00]);
+                sector.extend_from_slice(&[0x7F, 0xF0]);
+            }
+            sector.extend_from_slice(&ps_video_pes(&ps_gop_es(), 0));
+            sector.resize(2048, 0xFF);
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(sector)),
+                mpeg2_video_title(1),
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap();
+            let ((), ev) = crate::testlog::capture(|| while s.read().unwrap().is_some() {});
+            let warns: Vec<&str> = ev
+                .iter()
+                .filter(|e| e.message().contains("tag=mp2.extension"))
+                .map(|e| e.message())
+                .collect();
+            // Reported once, with the count, after the whole read (not per packet).
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert!(warns[0].contains("stream_id=0xd2 packets=3"), "{warns:?}");
         }
 
         // fed_bytes accumulates ACROSS read buffers, not reset per read: with

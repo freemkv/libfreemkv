@@ -227,6 +227,10 @@ pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 #[cfg(feature = "rip")]
 pub use mux::{Medium, SourceInfo};
 #[cfg(feature = "rip")]
+pub use mux::{
+    MkvProbe, MkvProbeTrack, MkvTrackKind, parse_freemkv_version, probe_mkv, probe_mkv_with_cues,
+};
+#[cfg(feature = "rip")]
 pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
 
 // ─── Lower-level surfaces ───────────────────────────────────────────────────

@@ -193,6 +193,19 @@ pub struct PgsParser {
     /// opening packet's, never the closing packet's. Same rule the other
     /// buffering parsers get from `PesBuf::front`.
     pending: Option<(super::pesbuf::PesFacts, Vec<u8>)>,
+    /// How many bytes of `pending`'s data [`Self::complete_clear_pts`] has already
+    /// walked and confirmed are complete segments (no END found among them).
+    /// Lets a pending clear set that accumulates many small appended PES
+    /// resume the segment walk where it left off instead of re-walking from
+    /// byte 0 on every PES — that rescan is O(n^2) in the number of appends
+    /// (L026). Always 0 when `pending` doesn't hold a clear set; reset
+    /// whenever `pending` is assigned a fresh set.
+    clear_scan_offset: usize,
+    /// Test-only: total iterations of the `complete_clear_pts` walk loop,
+    /// proving the walk stays O(n) in the number of appends rather than
+    /// O(n^2) (L026).
+    #[cfg(test)]
+    scan_steps: u64,
 }
 
 impl Default for PgsParser {
@@ -204,52 +217,74 @@ impl Default for PgsParser {
 impl PgsParser {
     /// Create a fresh PGS parser with no pending display set.
     pub fn new() -> Self {
-        Self { pending: None }
+        Self {
+            pending: None,
+            clear_scan_offset: 0,
+            #[cfg(test)]
+            scan_steps: 0,
+        }
     }
 
     fn is_clear(data: &[u8]) -> bool {
         data.first() == Some(&SEGMENT_PCS) && data.get(PCS_NUM_OBJECTS_OFFSET) == Some(&0)
     }
 
-    // Clear sets must include END: it is what makes a decoder apply the empty
-    // composition. Walk segment lengths, never search bitmap/palette bytes for
-    // 0x80. END can arrive in a later PES without its own timestamp.
-    fn complete_clear_pts(&self) -> Option<i64> {
+    // Walk segment lengths for END (never search bitmap bytes for 0x80).
+    // Resumes from `clear_scan_offset` rather than rescanning `data` from 0
+    // every call, which is O(n^2) over many small appends (L026).
+    fn complete_clear_pts(&mut self) -> Option<i64> {
         let (facts, data) = self.pending.as_ref()?;
         if !Self::is_clear(data) {
             return None;
         }
-        let mut rest = data.as_slice();
-        while rest.len() >= 3 {
+        let presentation_ns = facts.presentation_ns();
+        let mut offset = self.clear_scan_offset.min(data.len());
+        let mut found_end = false;
+        #[cfg(test)]
+        let mut steps = 0u64;
+        while data.len() - offset >= 3 {
+            #[cfg(test)]
+            {
+                steps += 1;
+            }
+            let rest = &data[offset..];
             let size = 3 + usize::from(u16::from_be_bytes([rest[1], rest[2]]));
             if size > rest.len() {
-                return None;
+                break; // incomplete trailing segment; wait for more bytes
             }
             if rest[0] == SEGMENT_END && size == 3 && rest.len() == 3 {
-                return facts.presentation_ns();
+                offset += size;
+                found_end = true;
+                break;
             }
-            rest = &rest[size..];
+            offset += size;
         }
-        None
+        self.clear_scan_offset = offset;
+        #[cfg(test)]
+        {
+            self.scan_steps += steps;
+        }
+        if found_end { presentation_ns } else { None }
     }
 
     // One emission path for clear, replacement, malformed input and EOF.
     // Missing end times use the existing fallback only for visible sets.
     fn emit_pending(&mut self, end_pts_ns: Option<i64>) -> Option<Frame> {
         let (facts, data) = self.pending.take()?;
+        self.clear_scan_offset = 0;
         let start_pts = facts.presentation_ns().unwrap_or(0);
         let computed = end_pts_ns
             .map(|end| end.saturating_sub(start_pts).max(0) as u64)
             .unwrap_or(DEFAULT_PGS_DURATION_NS);
-        // Trust the real computed span, but clamp a pathologically large one (a
-        // missing intermediate PCS makes one set look like it lingered for
-        // minutes) back to the fallback dwell rather than emit an absurd cue.
+        // Clamp a pathologically large computed span to the cap itself, not
+        // the much shorter 5s DEFAULT dwell (L053): the fallback made a long
+        // sign or caption vanish early in players that honour BlockDuration.
         let duration = if Self::is_clear(&data) {
             // A clear is an instantaneous state change, not a visible cue.
             // The MKV writer rounds this up to its minimum duration tick.
             0
         } else if computed > MAX_PGS_DURATION_NS {
-            DEFAULT_PGS_DURATION_NS
+            MAX_PGS_DURATION_NS
         } else {
             computed
         };
@@ -703,10 +738,9 @@ mod tests {
     }
 
     #[test]
-    fn pathologically_large_computed_duration_clamps_to_fallback() {
-        // A missing intermediate clear PCS makes a set appear to linger until a much
-        // later one; a computed span past MAX_PGS_DURATION_NS is untrusted and falls
-        // back to the dwell instead of an absurd multi-minute cue (90000 ticks = 1s).
+    fn pathologically_large_computed_duration_clamps_to_cap() {
+        // A span past MAX_PGS_DURATION_NS is untrusted, but clamps to the
+        // 30s cap itself (L053), not the unrelated 5s fallback dwell.
         let display_pts = 90_000_i64; // 1 s
         // 40 s later in 90 kHz ticks (> 30 s cap).
         let clear_pts = display_pts + 40 * 90_000;
@@ -716,8 +750,8 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].duration_ns,
-            Some(DEFAULT_PGS_DURATION_NS),
-            "a >30s computed span is clamped to the fallback dwell"
+            Some(MAX_PGS_DURATION_NS),
+            "a >30s computed span is clamped to the 30s cap, not the 5s fallback"
         );
     }
 
@@ -930,6 +964,67 @@ mod tests {
             frames[0].source.map(|s| s.byte),
             Some(7_777),
             "emitted straight from this packet, so it carries this packet's offset"
+        );
+    }
+
+    #[test]
+    fn clear_scan_offset_tracks_confirmed_segments_across_appends() {
+        // Deterministic (no wall-clock): after each append, `clear_scan_offset`
+        // must sit at the buffer's confirmed end, proving the walk resumes
+        // rather than rescanning from byte 0 every call (L026).
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(0), Some(0)));
+        // The opening clear PCS is itself one complete (non-END) segment, so
+        // the very first call already confirms the whole 14-byte buffer.
+        assert_eq!(parser.clear_scan_offset, pcs_bytes(0).len());
+
+        let seg = vec![0x17u8, 0x00, 0x02, 0xAA, 0xBB]; // one complete 5-byte segment
+        for i in 1..=20u32 {
+            let _ = parser.parse(&make_pes(seg.clone(), None));
+            let data_len = parser.pending.as_ref().unwrap().1.len();
+            assert_eq!(
+                parser.clear_scan_offset, data_len,
+                "after {i} appends the confirmed offset should track to the buffer end"
+            );
+        }
+
+        // A segment split across two PES: the declared payload (7 bytes,
+        // size 10) arrives incomplete first. The confirmed offset must stay
+        // at THAT segment's start, not advance past it.
+        let before = parser.pending.as_ref().unwrap().1.len();
+        let split_head = vec![0x17u8, 0x00, 0x07, 0xAA, 0xAA]; // 5 of 10 bytes
+        let _ = parser.parse(&make_pes(split_head, None));
+        assert_eq!(
+            parser.clear_scan_offset, before,
+            "an incomplete trailing segment must not be confirmed"
+        );
+
+        // Completing it confirms the whole segment.
+        let _ = parser.parse(&make_pes(vec![0xBB; 5], None)); // remaining 5 of 10
+        let data_len = parser.pending.as_ref().unwrap().1.len();
+        assert_eq!(
+            parser.clear_scan_offset, data_len,
+            "completed split segment is now confirmed"
+        );
+    }
+
+    #[test]
+    fn complete_clear_pts_scan_steps_stay_linear_in_appends() {
+        // Deterministic (no wall-clock): N appends must cost O(N) walk
+        // iterations, not O(N^2) (L026). A 2x-per-append budget has slack yet
+        // still catches a quadratic regression, which blows it by orders of magnitude.
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(0), Some(0)));
+        let seg = vec![0x17u8, 0x00, 0x02, 0xAA, 0xBB];
+        let n: u64 = 5_000;
+        for _ in 0..n {
+            let _ = parser.parse(&make_pes(seg.clone(), None));
+        }
+        assert!(
+            parser.scan_steps <= 2 * n,
+            "scan_steps {} exceeded the O(n) budget 2*n={} for n={n} appends",
+            parser.scan_steps,
+            2 * n
         );
     }
 }

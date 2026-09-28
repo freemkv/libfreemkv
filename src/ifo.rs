@@ -51,6 +51,12 @@ pub struct DvdTitle {
     pub chapter_times: Vec<f64>,
     /// Subtitle palette from PGC: 16 entries of [padding, Y, Cr, Cb].
     pub palette: Option<Vec<[u8; 4]>>,
+    /// PGC_AST_CTL (PGC+0x0C): per logical audio stream, its presence bit (15) and
+    /// physical stream number (bits 10-8).
+    pub ast_ctl: [u16; 8],
+    /// PGC_SPST_CTL (PGC+0x1C): per logical subpicture stream, its presence bit
+    /// and physical sub-stream ids for 4:3 / wide / letterbox / pan-scan.
+    pub spst_ctl: [u32; 32],
     /// This title's 1-based `vts_title_num` (TTN within its VTS). Carried so nav
     /// resolution joins on the REAL title number rather than the position in the
     /// titles vec, which desyncs when a sibling PGC is dropped as unparseable.
@@ -194,14 +200,26 @@ pub struct DvdAudioAttr {
     pub channels: u8,
     pub sample_rate: u32,
     pub language: String,
-    /// The PES `private_stream_1` sub-stream id this audio stream carries
-    /// on the wire (AC-3: `0x80..=0x87`, DTS: `0x88..=0x8F`, LPCM:
-    /// `0xA0..=0xA7`), assigned by per-codec ordinal during the scan.
-    /// `None` for codecs carried as a regular MPEG-audio PES (MP1/MP2,
-    /// stream_id `0xC0..`) which don't use a private-stream-1 sub-id.
-    /// This is the single routing key shared with the muxer's `dvd_pid()`
-    /// so the two never disagree on a mixed-codec title.
-    pub sub_stream_id: Option<u8>,
+    /// Coding mode 3: mpucoder IFO "3 Mpeg-2ext"; EP0867877A2 "011b MPEG-2 with extension
+    /// bitstream" (mode 2 is "MPEG-1 or MPEG-2 without extension bit stream").
+    pub mpeg_ext: bool,
+}
+
+/// The on-wire VobSub sub-stream id (0x20..=0x3F) of one PGC_SPST_CTL entry, or `None` when
+/// the stream is absent from the PGC. 16:9 takes the wide id (the rip keeps the anamorphic
+/// frame); 4:3 takes the 4:3 id. Letterbox/pan-scan variants are display-side downscales.
+pub(crate) fn subpicture_stream_id(ctl: u32, aspect: DvdAspect) -> Option<u8> {
+    // libdvdnav vm_get_subp_stream: "if((vm->state).pgc->subp_control[subpN] & (1u<<31))";
+    // mpucoder PGC_SPST_CTL byte 0: "1 = stream available".
+    if ctl & 0x8000_0000 == 0 {
+        return None;
+    }
+    let shift = match aspect {
+        DvdAspect::R4x3 => 24, // vm_get_subp_stream "/* 4:3 */": "subp_control[subpN] >> 24) & 0x1f"
+        DvdAspect::R16x9 => 16, // "mode == 0 - widescreen": "subp_control[subpN] >> 16) & 0x1f"
+    };
+    // VLC ps.h: "( i_id&0xe0 ) == 0x20 ) /* 0x20 -> 0x3f */" is the subpicture sub-stream.
+    Some(0x20 | ((ctl >> shift) & 0x1F) as u8)
 }
 
 /// DVD subtitle stream attributes.
@@ -553,10 +571,6 @@ fn parse_vts(
         }
         audio_streams.push(parse_audio_attr(&vts_data, aoff)?);
     }
-    // Assign each stream its on-wire private_stream_1 id by per-codec ordinal
-    // (AC-3 0x80+, DTS 0x88+, LPCM 0xA0+), the DVD authoring convention the
-    // muxer routes on — the positional index would collide in mixed-codec titles.
-    assign_audio_sub_stream_ids(&mut audio_streams);
 
     // Subtitle streams: count at 0x254 (u16 BE), then 6 bytes each starting at 0x256
     let num_subs = if vts_data.len() >= 0x256 {
@@ -678,24 +692,37 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
         channels,
         sample_rate,
         language,
-        // Assigned by `assign_audio_sub_stream_ids` once all streams in the
-        // title set are known (the sub-id is a per-codec ordinal).
-        sub_stream_id: None,
+        mpeg_ext: coding_mode == 3,
     })
 }
 
-// Assigns the on-wire private_stream_1 sub-stream id (codec_base | position, saturated at 7) to
-// each audio stream: AC-3 0x80|i, DTS 0x88|i, LPCM 0xA0|i, else None.
-fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
-    for (i, s) in streams.iter_mut().enumerate() {
-        let n = (i as u8).min(7);
-        s.sub_stream_id = match s.codec {
-            Codec::Ac3 => Some(0x80 | n),
-            Codec::Dts => Some(0x88 | n),
-            Codec::Lpcm => Some(0xA0 | n),
-            _ => None,
-        };
+/// The on-wire `private_stream_1` sub-stream id of physical audio stream `n` (0..=7):
+/// AC-3 `0x80|n`, DTS `0x88|n`, LPCM `0xA0|n`; `None` for MPEG audio (its own PES id).
+pub(crate) fn audio_sub_stream_id(codec: Codec, n: u8) -> Option<u8> {
+    match codec {
+        Codec::Ac3 => Some(0x80 | n), // VLC ps.h: "( i_id&0xf8 ) == 0x80 || /* 0x80 -> 0x87 */"
+        Codec::Dts => Some(0x88 | n), // VLC ps.h: "( i_id&0xf8 ) == 0x88 || /* 0x88 -> 0x8f"
+        Codec::Lpcm => Some(0xA0 | n), // mpucoder LPCM: "1010 0***b *** = Audio stream number"
+        _ => None,
     }
+}
+
+/// The routing PID of physical audio stream `n` (0..=7), shared with the demuxer's
+/// `dvd_pid()`: `0xBD00 | sub-id` on `private_stream_1`, or MPEG audio's own PES id `0xC0|n`.
+pub(crate) fn audio_pid(codec: Codec, n: u8) -> Option<u16> {
+    match codec {
+        // mpucoder PES: "0xC0 - 0xDF MPEG-1 or MPEG-2 audio stream number x xxxx".
+        Codec::Mp2 => crate::mux::ps::dvd_mpeg_audio_pid(0xC0 | n),
+        _ => audio_sub_stream_id(codec, n).and_then(crate::mux::ps::dvd_audio_pid),
+    }
+}
+
+/// The physical stream number (0..=7) of one PGC_AST_CTL entry, or `None` when the
+/// stream is absent from the PGC. Bits 14-11 are reserved (libdvdnav masks `& 0x07`).
+pub(crate) fn audio_stream_number(ctl: u16) -> Option<u8> {
+    // libdvdnav vm_get_audio_stream: "if((vm->state).pgc->audio_control[audioN] & (1<<15))"
+    // then "streamN = ((vm->state).pgc->audio_control[audioN] >> 8) & 0x07;".
+    (ctl & 0x8000 != 0).then_some(((ctl >> 8) & 0x07) as u8)
 }
 
 /// Parse one subtitle stream attribute block (6 bytes at `offset`).
@@ -935,6 +962,17 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         times
     };
 
+    // mpucoder PGC: "000C PGC_AST_CTL 8*2", "001C PGC_SPST_CTL 32*4" (libdvdread pgc_t:
+    // "uint16_t audio_control[8];", "uint32_t subp_control[32];"); inside the 0xEA bound.
+    let mut ast_ctl = [0u16; 8];
+    for (i, c) in ast_ctl.iter_mut().enumerate() {
+        *c = be_u16(data, pgc_offset + 0x0C + i * 2)?;
+    }
+    let mut spst_ctl = [0u32; 32];
+    for (i, c) in spst_ctl.iter_mut().enumerate() {
+        *c = be_u32(data, pgc_offset + 0x1C + i * 4)?;
+    }
+
     // Subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cr, Cb].
     // Chroma order is Cr (byte 2) BEFORE Cb (byte 3) per the DVD-Video PGC CLUT format;
     // `mux::codec::dvdsub::ycbcr_to_rgb` must read it the same way.
@@ -960,6 +998,8 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         cells,
         chapter_times,
         palette,
+        ast_ctl,
+        spst_ctl,
         // Set by the caller (parse_pgcit) which knows the TT_SRPT title number.
         vts_title_num: 0,
     })
@@ -1162,6 +1202,8 @@ mod tests {
             cells: vec![cell.clone()],
             chapter_times: Vec::new(),
             palette: None,
+            ast_ctl: [0; 8],
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(title.chapters, 5);
@@ -1181,7 +1223,7 @@ mod tests {
             channels: 6,
             sample_rate: 48000,
             language: "en".to_string(),
-            sub_stream_id: Some(0x80),
+            mpeg_ext: false,
         };
         assert_eq!(audio.channels, 6);
 
@@ -1200,6 +1242,66 @@ mod tests {
             title_sets: vec![ts],
         };
         assert_eq!(info.title_sets.len(), 1);
+    }
+
+    /// mpucoder PGC_SPST_CTL: "Stream number for 4:3", "for wide", "for letterbox", "for
+    /// pan&scan" in bytes 0-3. This is per spec; do not change without a spec citation proving
+    /// otherwise.
+    #[test]
+    fn subpicture_stream_id_selects_by_aspect_and_presence() {
+        let ctl = 0x9FE1_0203; // reserved bits set in bytes 0-1 must be masked off
+        // vm_get_subp_stream "/* 4:3 */": ">> 24) & 0x1f".
+        assert_eq!(subpicture_stream_id(ctl, DvdAspect::R4x3), Some(0x3F));
+        // "mode == 0 - widescreen": ">> 16) & 0x1f".
+        assert_eq!(subpicture_stream_id(ctl, DvdAspect::R16x9), Some(0x21));
+        // ifo_print: "if(pgc->subp_control[i] & 0x80000000) { /* The 'is present' bit */".
+        assert_eq!(subpicture_stream_id(0x0001_0203, DvdAspect::R16x9), None);
+        assert_eq!(
+            subpicture_stream_id(0x8000_0000, DvdAspect::R4x3),
+            Some(0x20)
+        );
+    }
+
+    /// This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn audio_stream_number_reads_present_bit_and_low_three_bits() {
+        // vm_get_audio_stream: "streamN = ((vm->state).pgc->audio_control[audioN] >> 8) & 0x07;"
+        assert_eq!(audio_stream_number(0x8000), Some(0));
+        assert_eq!(audio_stream_number(0xFFFF), Some(7));
+        assert_eq!(audio_stream_number(0x8A00), Some(2));
+        // ifo_print: "if(pgc->audio_control[i] & 0x8000) { /* The 'is present' bit */".
+        assert_eq!(audio_stream_number(0x7FFF), None);
+        // VLC ps.h "0x80 -> 0x87" (AC-3), "0x88 -> 0x8f" (DTS); mpucoder LPCM "1010 0***b".
+        assert_eq!(audio_sub_stream_id(Codec::Ac3, 3), Some(0x83));
+        assert_eq!(audio_sub_stream_id(Codec::Dts, 3), Some(0x8B));
+        assert_eq!(audio_sub_stream_id(Codec::Lpcm, 3), Some(0xA3));
+        // mpucoder PES: MPEG audio is "0xC0 - 0xDF", not a private stream 1 sub-stream.
+        assert_eq!(audio_sub_stream_id(Codec::Mp2, 3), None);
+    }
+
+    // mpucoder PGC: "000C PGC_AST_CTL 8*2 Audio Stream Control".
+    #[test]
+    fn pgc_parses_ast_ctl_at_0x0c() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x0B] = 0xFF; // last byte of the PGC's prohibited-user-ops field
+        pgc[0x0C..0x0E].copy_from_slice(&0x8100u16.to_be_bytes());
+        pgc[0x1A..0x1C].copy_from_slice(&0x8700u16.to_be_bytes());
+        pgc[0x1C] = 0xFF; // first byte of SPST_CTL; must not bleed in
+        let t = parse_pgc(&pgc, 0, 1).unwrap();
+        assert_eq!(t.ast_ctl, [0x8100, 0, 0, 0, 0, 0, 0, 0x8700]);
+    }
+
+    // mpucoder PGC: "001C PGC_SPST_CTL 32*4 Subpicture Stream Control".
+    #[test]
+    fn pgc_parses_spst_ctl_at_0x1c() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x1B] = 0xFF; // last byte of PGC_AST_CTL; must not bleed in
+        pgc[0x1C..0x20].copy_from_slice(&0x8003_0405u32.to_be_bytes());
+        pgc[0x98..0x9C].copy_from_slice(&0x8000_1F00u32.to_be_bytes());
+        let t = parse_pgc(&pgc, 0, 1).unwrap();
+        assert_eq!(t.spst_ctl[0], 0x8003_0405);
+        assert_eq!(t.spst_ctl[31], 0x8000_1F00);
+        assert!(t.spst_ctl[1..31].iter().all(|&c| c == 0));
     }
 
     #[test]
@@ -1349,84 +1451,44 @@ mod tests {
         assert_eq!(attr.language, "eng");
     }
 
+    // Positional fallback: codec base | position, the wire ids the demux routes on.
     #[test]
-    fn mixed_codec_sub_stream_ids_are_distinct() {
-        // A title mixing AC-3, DTS and LPCM: sub-id low nibble is the positional
-        // audio-stream number OR'd with the codec base (idx 1 DTS → 0x89, idx 3
-        // AC-3 → 0x83) — the real wire ids the demux routes on, all distinct.
-        let mut streams = vec![
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Dts,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Lpcm,
-                channels: 2,
-                sample_rate: 48000,
-                language: "fr".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 2,
-                sample_rate: 48000,
-                language: "es".into(),
-                sub_stream_id: None,
-            },
-        ];
-        assign_audio_sub_stream_ids(&mut streams);
-        assert_eq!(streams[0].sub_stream_id, Some(0x80)); // AC-3 @ pos 0
-        assert_eq!(streams[1].sub_stream_id, Some(0x89)); // DTS  @ pos 1
-        assert_eq!(streams[2].sub_stream_id, Some(0xA2)); // LPCM @ pos 2
-        assert_eq!(streams[3].sub_stream_id, Some(0x83)); // AC-3 @ pos 3
-        // All sub-ids unique.
-        let ids: Vec<u8> = streams.iter().filter_map(|s| s.sub_stream_id).collect();
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(ids.len(), sorted.len(), "sub-stream ids must be unique");
+    fn mixed_codec_positional_pids_are_distinct() {
+        let codecs = [Codec::Ac3, Codec::Dts, Codec::Lpcm, Codec::Ac3, Codec::Mp2];
+        let pids: Vec<Option<u16>> = (0u8..).zip(codecs).map(|(n, c)| audio_pid(c, n)).collect();
+        assert_eq!(
+            pids,
+            [0xBD80, 0xBD89, 0xBDA2, 0xBD83, 0x00C4].map(Some).to_vec()
+        );
     }
 
-    // Regression (The Punisher 2004): audio[0]=AC-3, audio[1]=DTS. DTS at position 1 must get
-    // wire sub-id 0x89 (0x88|1), not the old per-codec 0x88 (which broke demux routing and
-    // muxed it silent).
+    // Regression (The Punisher 2004): DTS at physical stream 1 is sub-id 0x89 (0x88|1), not
+    // the old per-codec 0x88, which broke demux routing and muxed it silent.
     #[test]
-    fn dts_after_ac3_uses_positional_substream_id() {
-        let mut streams = vec![
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Dts,
-                channels: 5,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-        ];
-        assign_audio_sub_stream_ids(&mut streams);
-        assert_eq!(streams[0].sub_stream_id, Some(0x80));
-        assert_eq!(
-            streams[1].sub_stream_id,
-            Some(0x89),
-            "DTS at audio position 1 routes to 0x89 on the wire, not 0x88"
+    fn dts_after_ac3_uses_physical_stream_number() {
+        assert_eq!(audio_pid(Codec::Dts, 1), Some(0xBD89));
+    }
+
+    // MPEG audio is its own PES id 0xC0|n, not a private_stream_1 sub-id; unknown codecs
+    // have no route.
+    #[test]
+    fn mp2_audio_routes_to_its_pes_stream_id() {
+        assert_eq!(audio_pid(Codec::Mp2, 0), Some(0x00C0));
+        assert_eq!(audio_pid(Codec::Mp2, 7), Some(0x00C7));
+        assert_eq!(audio_pid(Codec::Unknown(1), 0), None);
+    }
+
+    /// mpucoder IFO coding mode "2 Mpeg-1, 3 Mpeg-2ext"; EP0867877A2 "010b MPEG-1 or MPEG-2
+    /// without extension bit stream", "011b MPEG-2 with extension bitstream".
+    #[test]
+    fn coding_mode_3_is_mpeg2_with_extension_and_mode_2_is_not() {
+        let attr = |b0: u8| parse_audio_attr(&[b0, 0x05, b'e', b'n', 0, 0, 0, 0], 0).unwrap();
+        assert_eq!((attr(0x60).codec, attr(0x60).mpeg_ext), (Codec::Mp2, true));
+        assert_eq!((attr(0x40).codec, attr(0x40).mpeg_ext), (Codec::Mp2, false));
+        assert!(
+            !attr(0x00).mpeg_ext,
+            "AC-3 (mode 0) carries no MPEG extension"
         );
-        // The routing key the muxer actually uses must resolve for 0x89.
-        assert_eq!(crate::mux::ps::dvd_audio_pid(0x89), Some(0xBD89));
     }
 
     #[test]
@@ -1617,59 +1679,6 @@ mod tests {
         let zero = vec![0u8; 6];
         let attr2 = parse_subtitle_attr(&zero, 0).unwrap();
         assert_eq!(attr2.language, "und");
-    }
-
-    /// assign_audio_sub_stream_ids: MP1/MP2 and other non-private-stream-1
-    /// codecs must get `None` (regular MPEG-audio PES, not a sub-id).
-    /// Source maps only AC3/DTS/LPCM to Some(_).
-    #[test]
-    fn mp2_audio_gets_no_sub_stream_id() {
-        let mut streams = vec![
-            DvdAudioAttr {
-                codec: Codec::Mp2,
-                channels: 2,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-            DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 6,
-                sample_rate: 48000,
-                language: "en".into(),
-                sub_stream_id: None,
-            },
-        ];
-        assign_audio_sub_stream_ids(&mut streams);
-        assert_eq!(streams[0].sub_stream_id, None); // MP2 → no sub-id
-        assert_eq!(streams[1].sub_stream_id, Some(0x81)); // AC3 @ pos 1
-    }
-
-    /// assign_audio_sub_stream_ids saturates the positional index at the
-    /// range ceiling (min(7)) so a malformed over-count never produces an
-    /// out-of-range sub-id. 9 AC-3 streams: the 9th still ≤ 0x87.
-    #[test]
-    fn audio_sub_stream_id_saturates_at_ceiling() {
-        let mut streams: Vec<DvdAudioAttr> = (0..9)
-            .map(|_| DvdAudioAttr {
-                codec: Codec::Ac3,
-                channels: 2,
-                sample_rate: 48000,
-                language: String::new(),
-                sub_stream_id: None,
-            })
-            .collect();
-        assign_audio_sub_stream_ids(&mut streams);
-        for s in &streams {
-            let id = s.sub_stream_id.unwrap();
-            assert!(
-                (0x80..=0x87).contains(&id),
-                "AC-3 sub-id out of range: {id:#x}"
-            );
-        }
-        // 8th and 9th both saturate at 0x87.
-        assert_eq!(streams[7].sub_stream_id, Some(0x87));
-        assert_eq!(streams[8].sub_stream_id, Some(0x87));
     }
 
     /// parse_pgc requires `pgc_offset + 0xEA <= data.len()` (needs the cell
@@ -1996,6 +2005,8 @@ mod tests {
             ],
             chapter_times: vec![0.0, 100.0, 200.0],
             palette: None,
+            ast_ctl: [0; 8],
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);
@@ -2018,6 +2029,8 @@ mod tests {
             ],
             chapter_times: vec![0.0, 50.0],
             palette: None,
+            ast_ctl: [0; 8],
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 2);
@@ -2036,6 +2049,8 @@ mod tests {
             cells: vec![cell(0, 9, 0b1001_0000), cell(10, 19, 0b1101_0000)],
             chapter_times: vec![0.0],
             palette: None,
+            ast_ctl: [0; 8],
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);
@@ -2051,6 +2066,8 @@ mod tests {
             cells: vec![],
             chapter_times: vec![],
             palette: None,
+            ast_ctl: [0; 8],
+            spst_ctl: [0; 32],
             vts_title_num: 0,
         };
         assert_eq!(t.feature_start_cell(), 0);

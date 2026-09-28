@@ -690,6 +690,8 @@ pub struct DemuxSink {
     /// placed", a filtered-out track's clip-join drops would measure against a
     /// count that never included them, wrongly tripping `SeamPlanDroppedMost`/`SinkWroteNothing`.
     frames_mapped: u64,
+    /// MPEG-2 multichannel extension tracks (no ES file form), reported once packets arrive.
+    excluded: super::ps::UnstoredExtensions,
 }
 
 impl DemuxSink {
@@ -699,6 +701,7 @@ impl DemuxSink {
         let mut tracks: Vec<Option<TrackOut>> = Vec::with_capacity(title.streams.len());
         let mut ref_video_track = None;
         let mut video_tracks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let excluded = super::ps::UnstoredExtensions::new(title, "elementary-stream file");
 
         for (idx, stream) in title.streams.iter().enumerate() {
             let selected = opts
@@ -731,6 +734,11 @@ impl DemuxSink {
             }
             // Kind filter: `audio://` / `sub://` keep only their class.
             if opts.kind_filter.is_some_and(|k| k != kind) {
+                tracks.push(None);
+                continue;
+            }
+            // A 13818-3 extension stream is not a decodable ES on its own: left out, reported.
+            if excluded.contains(idx) {
                 tracks.push(None);
                 continue;
             }
@@ -770,6 +778,7 @@ impl DemuxSink {
             timeline: TimelineContinuity::with_clips(&title.clips, title.content_format),
             finished: false,
             frames_mapped: 0,
+            excluded,
         })
     }
 
@@ -878,12 +887,19 @@ impl DemuxSink {
 }
 
 impl Stream for DemuxSink {
+    fn undelivered_streams(&self) -> Vec<usize> {
+        self.excluded.seen()
+    }
+
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
         // Write-only sink, per the Stream trait contract.
         Err(crate::error::Error::StreamWriteOnly.into())
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
+        if self.excluded.drop_frame(frame.track) {
+            return Ok(());
+        }
         // Use the dynamically-resolved video reference, not literal stream index 0:
         // an M2TS/PMT title can list audio before video, so a non-video epoch
         // driver would ratchet the frontier on sparse/lagging PTS.

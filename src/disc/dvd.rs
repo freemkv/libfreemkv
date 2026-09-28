@@ -73,31 +73,6 @@ impl Disc {
             });
             // TODO(spec): DefaultDuration/cadence deferred.
 
-            // PID derives from private_stream_1 sub-id via dvd_audio_pid;
-            // MP1/MP2 (no sub-id) fall back to 0xBD00+ordinal.
-            let audio_streams: Vec<Stream> = ts
-                .audio_streams
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    let codec = a.codec;
-                    let pid = a
-                        .sub_stream_id
-                        .and_then(crate::mux::ps::dvd_audio_pid)
-                        .unwrap_or(0xBD00 + i as u16);
-                    Stream::Audio(AudioStream {
-                        pid,
-                        codec,
-                        channels: AudioChannels::from_count(a.channels),
-                        language: a.language.clone(),
-                        sample_rate: SampleRate::from_hz(a.sample_rate),
-                        secondary: false,
-                        purpose: crate::disc::LabelPurpose::Normal,
-                        label: String::new(),
-                    })
-                })
-                .collect();
-
             for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
 
@@ -175,30 +150,51 @@ impl Disc {
                     .as_ref()
                     .map(|pal| crate::mux::codec::dvdsub::format_palette(pal, vid_w, vid_h));
 
-                // Map DvdSubtitleAttr to Stream::Subtitle
-                let subtitle_streams: Vec<Stream> = ts
-                    .subtitle_streams
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        // VobSub sub-stream ids run 0x20..=0x3F; PID = sub-id
-                        // (identity), shared with the demuxer via
-                        // `dvd_subtitle_pid`.
-                        let sub_id = 0x20u8.saturating_add(i.min(0x1F) as u8);
-                        let pid = crate::mux::ps::dvd_subtitle_pid(sub_id).unwrap_or(sub_id as u16);
-                        Stream::Subtitle(SubtitleStream {
-                            pid,
-                            codec: Codec::DvdSub,
-                            language: s.language.clone(),
-                            forced: false,
-                            qualifier: crate::disc::LabelQualifier::None,
-                            codec_data: codec_data.clone(),
-                        })
-                    })
-                    .collect();
+                // Logical stream i routes to the physical id this PGC's SPST_CTL names (not
+                // 0x20+i: anamorphic discs interleave wide/letterbox/pan-scan variants).
+                // Absent streams get no track; a repeated physical id keeps the first.
+                let mut subtitle_streams: Vec<Stream> = Vec::new();
+                let mut kept_langs: [Option<&str>; 32] = [None; 32];
+                for (s, ctl) in ts.subtitle_streams.iter().zip(dvd_title.spst_ctl) {
+                    let Some(sub_id) = crate::ifo::subpicture_stream_id(ctl, ts.video.aspect)
+                    else {
+                        continue;
+                    };
+                    let slot = &mut kept_langs[(sub_id & 0x1F) as usize];
+                    if let Some(kept) = slot {
+                        crate::diag::dvd_ctl_duplicate(
+                            "spst",
+                            ts.vts_number,
+                            title_number,
+                            sub_id.into(),
+                            kept,
+                            &s.language,
+                        );
+                        continue;
+                    }
+                    *slot = Some(&s.language);
+                    let pid = crate::mux::ps::dvd_subtitle_pid(sub_id).unwrap_or(sub_id as u16);
+                    subtitle_streams.push(Stream::Subtitle(SubtitleStream {
+                        pid,
+                        codec: Codec::DvdSub,
+                        language: s.language.clone(),
+                        forced: false,
+                        qualifier: crate::disc::LabelQualifier::None,
+                        codec_data: codec_data.clone(),
+                    }));
+                }
+                if subtitle_streams.is_empty() && !ts.subtitle_streams.is_empty() {
+                    crate::diag::dvd_ctl_none_present(
+                        "spst",
+                        ts.vts_number,
+                        title_number,
+                        ts.subtitle_streams.len(),
+                        "no subtitle tracks",
+                    );
+                }
 
                 let mut streams = vec![video_stream.clone()];
-                streams.extend(audio_streams.iter().cloned());
+                streams.extend(title_audio_streams(ts, dvd_title, title_number));
                 streams.extend(subtitle_streams);
 
                 // Chapter times are absolute from the PGC start. When leading cells are
@@ -237,6 +233,73 @@ impl Disc {
         }
         Ok((titles, nav_feature))
     }
+}
+
+// This title's audio tracks: logical stream i plays the physical stream its PGC_AST_CTL
+// names (libdvdnav semantics), absent streams get no track, a repeated physical id keeps
+// the first. A PGC marking nothing present keeps the positional ids rather than go silent.
+fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> Vec<Stream> {
+    let declared = &ts.audio_streams;
+    let any_present = declared
+        .iter()
+        .zip(t.ast_ctl)
+        .any(|(_, c)| ifo::audio_stream_number(c).is_some());
+    if !any_present && !declared.is_empty() {
+        let outcome = "positional routing (codec base | position)";
+        crate::diag::dvd_ctl_none_present("ast", ts.vts_number, title, declared.len(), outcome);
+    }
+    let mut kept: Vec<(u16, &str)> = Vec::new();
+    let mut out = Vec::new();
+    for (i, (a, ctl)) in declared.iter().zip(t.ast_ctl).enumerate() {
+        let n = if any_present {
+            match ifo::audio_stream_number(ctl) {
+                Some(n) => n,
+                None => {
+                    crate::diag::dvd_audio_route(ts.vts_number, title, i, a, ctl, None);
+                    continue;
+                }
+            }
+        } else {
+            i as u8
+        };
+        // No route (an unknown coding mode): a unique placeholder PID nothing feeds.
+        let pid = ifo::audio_pid(a.codec, n).unwrap_or(0xBD00 + i as u16);
+        crate::diag::dvd_audio_route(ts.vts_number, title, i, a, ctl, Some(pid));
+        if let Some((_, first)) = kept.iter().find(|(p, _)| *p == pid) {
+            crate::diag::dvd_ctl_duplicate("ast", ts.vts_number, title, pid, first, &a.language);
+            continue;
+        }
+        kept.push((pid, &a.language));
+        out.push(Stream::Audio(AudioStream {
+            pid,
+            codec: a.codec,
+            channels: AudioChannels::from_count(a.channels),
+            language: a.language.clone(),
+            sample_rate: SampleRate::from_hz(a.sample_rate),
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        // Coding mode 3, "MPEG-2 with extension bitstream" (EP0867877A2): its extension stream
+        // `0xD0|n` becomes a dependent track right after the base (pairing inferred, see
+        // ps::dvd_mpeg_audio_extension_pid).
+        if a.mpeg_ext && a.codec == Codec::Mp2 {
+            let Some(ext_pid) = crate::mux::ps::dvd_mpeg_audio_extension_pid(0xD0 | n) else {
+                continue;
+            };
+            out.push(Stream::Audio(AudioStream {
+                pid: ext_pid,
+                codec: Codec::Mp2,
+                channels: AudioChannels::Unknown,
+                language: a.language.clone(),
+                sample_rate: SampleRate::from_hz(a.sample_rate),
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: crate::disc::MP2_EXTENSION_LABEL.to_string(),
+            }));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -492,7 +555,419 @@ mod tests {
         if palette_nonzero {
             d[pgc + 0xA4 + 1] = 0x40; // Y of color 0
         }
+        // SPST_CTL: every declared subpicture present, all four ids = its ordinal.
+        let ordinal: Vec<u32> = (0..subs.len() as u32)
+            .map(|i| 0x8000_0000 | (i << 24) | (i << 16) | (i << 8) | i)
+            .collect();
+        set_spst(&mut d, &ordinal);
+        let ast: Vec<u16> = (0..audio.len() as u16).map(|i| 0x8000 | (i << 8)).collect();
+        set_ast(&mut d, &ast);
         d
+    }
+
+    // Overwrites build_vts's PGC_AST_CTL (PGC+0x0C, 8 x u16 BE).
+    fn set_ast(vts: &mut [u8], ctl: &[u16]) {
+        let at = 2 * 2048 + 0x100 + 0x0C;
+        for (i, c) in ctl.iter().enumerate() {
+            vts[at + i * 2..at + i * 2 + 2].copy_from_slice(&c.to_be_bytes());
+        }
+    }
+
+    // Scans a one-VTS disc and returns its first title's (pid, language) audio tracks.
+    fn scan_audio(vts: Vec<u8>) -> (Vec<(u16, String)>, Vec<String>) {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let (t, ev) = crate::testlog::capture(|| {
+            Disc::scan_dvd_titles(&mut disc, &udf, None)
+                .expect("scan")
+                .0
+        });
+        let audio = t[0]
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some((a.pid, a.language.clone())),
+                _ => None,
+            })
+            .collect();
+        (audio, diag_lines(&ev))
+    }
+
+    const AC3_6CH: (u8, u8) = (0x00, 0x05);
+    const DTS_6CH: (u8, u8) = (0xC0, 0x05);
+    const MP2_2CH: (u8, u8) = (0x40, 0x01);
+
+    fn aud(c: (u8, u8), lang: &[u8; 2]) -> (u8, u8, [u8; 2]) {
+        (c.0, c.1, *lang)
+    }
+
+    /// L084b: the physical audio stream number comes from PGC_AST_CTL, not the logical
+    /// position. This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn scan_dvd_titles_audio_uses_ast_ctl_stream_number() {
+        let mut vts = build_vts(0, 0x00, &[aud(AC3_6CH, b"en")], &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x8100]);
+        // vm_get_audio_stream: "streamN = (...audio_control[audioN] >> 8) & 0x07;" = 1 -> 0x81.
+        assert_eq!(scan_audio(vts).0, vec![(0xBD81, "eng".to_string())]);
+    }
+
+    /// Codec base + AST_CTL number per libdvdnav; reserved bits 14-11 are masked off.
+    #[test]
+    fn scan_dvd_titles_audio_ast_ctl_codec_base_and_mask() {
+        let audio = [aud(DTS_6CH, b"en"), aud(AC3_6CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0xFA00, 0x8300]);
+        // "& 0x07" drops bits 14-11: DTS 2 -> VLC "0x88 -> 0x8f"; AC-3 3 -> "0x80 -> 0x87".
+        assert_eq!(
+            scan_audio(vts).0,
+            vec![(0xBD8A, "eng".to_string()), (0xBD83, "fra".to_string())]
+        );
+    }
+
+    /// A stream AST_CTL marks absent gets no track (spec); a repeated physical id keeps the
+    /// first (freemkv policy, not a spec rule: two tracks cannot share one PID).
+    #[test]
+    fn scan_dvd_titles_audio_skips_absent_and_duplicate() {
+        let audio = [
+            aud(AC3_6CH, b"en"),
+            aud(AC3_6CH, b"fr"),
+            aud(AC3_6CH, b"de"),
+        ];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x0000, 0x8200, 0x8200]);
+        let (tracks, diag) = scan_audio(vts);
+        // mpucoder PGC_AST_CTL: "1 = stream available" is clear for entry 0.
+        assert_eq!(tracks, vec![(0xBD82, "fra".to_string())]);
+        assert!(
+            diag.iter().any(|m| m.contains("tag=dvd.astctl")
+                && m.contains("id=0xBD82 kept=\"fra\" dropped=\"deu\"")),
+            "{diag:?}"
+        );
+    }
+
+    /// No AST_CTL entry present at all: keep every declared stream on its positional id
+    /// rather than rip silently, and trace it. freemkv policy, not a spec rule: libdvdnav's
+    /// vm_get_audio_stream returns "streamN = -1" (no stream) here.
+    #[test]
+    fn scan_dvd_titles_audio_all_absent_falls_back_to_position() {
+        let audio = [aud(AC3_6CH, b"en"), aud(DTS_6CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0, 0]);
+        let (tracks, diag) = scan_audio(vts);
+        assert_eq!(
+            tracks,
+            vec![(0xBD80, "eng".to_string()), (0xBD89, "fra".to_string())]
+        );
+        assert!(
+            diag.iter().any(|m| m.contains("tag=dvd.astctl")
+                && m.contains("declared=2 present=0 -> positional routing")),
+            "{diag:?}"
+        );
+    }
+
+    /// MPEG audio rides its own PES id 0xC0|n, with n from AST_CTL like every other codec.
+    /// This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn scan_dvd_titles_mp2_audio_routes_by_ast_to_pes_id() {
+        let audio = [aud(MP2_2CH, b"en"), aud(MP2_2CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x0000, 0x8300]);
+        // mpucoder PGC_AST_CTL: "Stream number (MPEG audio) or Substream number (all others)";
+        // PES: "0xC0 - 0xDF MPEG-1 or MPEG-2 audio stream number x xxxx".
+        assert_eq!(scan_audio(vts).0, vec![(0x00C3, "fra".to_string())]);
+    }
+
+    // Scans a one-title disc whose IFO declares one MP2 stream (b0, b1), muxes `frame` as its
+    // first audio frame, and returns the MKV Tracks/Audio/Channels value.
+    fn scanned_mp2_mkv_channels(b0: u8, b1: u8, frame: &[u8]) -> u8 {
+        use crate::mux::mkv::{MkvMuxer, MkvTrack};
+        let t = &scan_title(build_vts(
+            0,
+            0x00,
+            &[aud((b0, b1), b"en")],
+            &[],
+            &[(0, 9)],
+            false,
+        ));
+        let tracks: Vec<MkvTrack> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Video(v) => Some(MkvTrack::video(v)),
+                Stream::Audio(a) => Some(MkvTrack::audio(a)),
+                _ => None,
+            })
+            .collect();
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut m = MkvMuxer::new(&mut out, &tracks, None, 0.0, &[]).unwrap();
+        m.write_frame(0, 0, true, &[1, 2], None, None).unwrap();
+        // A count above nch commits after RUN_FRAMES CRC-valid frames in a row.
+        for _ in 0..crate::mux::codec::mp2_channels::RUN_FRAMES {
+            m.write_frame(1, 0, false, frame, None, None).unwrap();
+        }
+        m.finish().unwrap();
+        let d = out.into_inner();
+        let at = d
+            .windows(4)
+            .position(|w| w == [0x16, 0x54, 0xAE, 0x6B])
+            .expect("Tracks");
+        let ch = at
+            + d[at..]
+                .windows(2)
+                .position(|w| w == [0x9F, 0x81])
+                .expect("Channels");
+        d[ch + 2]
+    }
+
+    fn scan_title(vts: Vec<u8>) -> DiscTitle {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0
+            .remove(0)
+    }
+
+    /// Scan to MKV: IFO coding mode 3 declares 6 channels ("channels-1" = 5); the stored 0xC0
+    /// base has an extension stream, so the track holds the stereo base only.
+    #[test]
+    fn scan_to_mkv_mp2_mode3_with_extension_stream_is_stereo() {
+        use crate::mux::codec::mp2_channels::tests::{MC_3_2_LFE, Mc, STEREO_256, Spec, write};
+        let f = write(Spec {
+            mc: Some(Mc {
+                ext: true,
+                ..MC_3_2_LFE
+            }),
+            ..STEREO_256
+        })
+        .0;
+        // mpucoder IFO: coding mode "3 Mpeg-2ext", byte 1 bits 2-0 "channels-1".
+        assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 2);
+    }
+
+    /// Scan to MKV with the multichannel data stored in the base frame.
+    /// This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn scan_to_mkv_mp2_mode3_without_extension_stream_keeps_5_1() {
+        use crate::mux::codec::mp2_channels::tests::{MC_3_2_LFE, STEREO_256, Spec, write};
+        let f = write(Spec {
+            mc: Some(MC_3_2_LFE),
+            ..STEREO_256
+        })
+        .0;
+        // 13818-3 §2.5.2.13: "'0' no extension stream present" with 3/2 + LFE.
+        assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 6);
+    }
+
+    // (pid, language, is_mp2_extension) of every audio track of a one-title disc.
+    fn scanned_audio(vts: Vec<u8>) -> Vec<(u16, String, bool)> {
+        scan_title(vts)
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some((a.pid, a.language.clone(), a.is_mp2_extension())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const MP2_EXT_51: (u8, u8) = (0x60, 0x05); // coding mode 3, 6 channels declared
+
+    /// IFO coding mode 3 ("3 Mpeg-2ext"; EP0867877A2 "011b MPEG-2 with extension bitstream")
+    /// declares the extension stream `0xD0|n` right after its base `0xC0|n`, n from AST_CTL.
+    /// This is per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn mode_3_mp2_declares_its_extension_track_after_the_base() {
+        let audio = [aud(MP2_EXT_51, b"en"), aud(MP2_2CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x8300, 0x8100]);
+        assert_eq!(
+            scanned_audio(vts),
+            vec![
+                (0x00C3, "eng".to_string(), false),
+                (0x00D3, "eng".to_string(), true),
+                // "010b MPEG-1 or MPEG-2 without extension bit stream": no extension track.
+                (0x00C1, "fra".to_string(), false),
+            ]
+        );
+    }
+
+    /// A stream AST_CTL marks absent declares neither its base nor its extension.
+    #[test]
+    fn absent_mode_3_stream_declares_no_extension_either() {
+        let audio = [aud(MP2_EXT_51, b"en"), aud(MP2_2CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x0000, 0x8000]);
+        assert_eq!(scanned_audio(vts), vec![(0x00C0, "fra".to_string(), false)]);
+    }
+
+    /// An unknown coding mode has no route: a unique placeholder PID 0xBD00 + i, never
+    /// colliding with a sibling.
+    #[test]
+    fn scan_dvd_titles_unknown_audio_codec_gets_distinct_placeholder() {
+        let unknown = (0x20u8, 0x01u8); // coding_mode 1: reserved
+        let audio = [aud(unknown, b"en"), aud(unknown, b"fr")];
+        let vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        let pids: Vec<u16> = scan_audio(vts).0.iter().map(|t| t.0).collect();
+        assert_eq!(pids, vec![0xBD00, 0xBD01]);
+    }
+
+    /// Per-title diag line with the ROUTED id, not the VTS-level positional one.
+    #[test]
+    fn scan_dvd_titles_logs_routed_audio_id_per_title() {
+        let mut vts = build_vts(0, 0x00, &[aud(AC3_6CH, b"en")], &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x8100]);
+        let diag = scan_audio(vts).1;
+        assert!(
+            diag.iter().any(|m| m.contains("tag=dvd.aroute")
+                && m.contains("title=1 idx=0")
+                && m.contains("ast=0x8100 pid=0xBD81")),
+            "{diag:?}"
+        );
+    }
+
+    // Overwrites build_vts's PGC_SPST_CTL (PGC+0x1C, 32 x u32 BE).
+    fn set_spst(vts: &mut [u8], ctl: &[u32]) {
+        let at = 2 * 2048 + 0x100 + 0x1C;
+        for (i, c) in ctl.iter().enumerate() {
+            vts[at + i * 4..at + i * 4 + 4].copy_from_slice(&c.to_be_bytes());
+        }
+    }
+
+    // Scans a one-VTS disc and returns its first title's (pid, language) subtitles.
+    fn scan_subs(vts: Vec<u8>) -> Vec<(u16, String)> {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0;
+        t[0].streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Subtitle(s) => Some((s.pid, s.language.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const NTSC_16X9: u8 = 0x0C;
+
+    /// L084: an anamorphic title carries wide/letterbox/pan-scan variants per language, so the
+    /// wide sub-stream id comes from SPST_CTL, not the ordinal. This is per spec; do not
+    /// change without a spec citation proving otherwise.
+    #[test]
+    fn scan_dvd_titles_anamorphic_subtitles_use_spst_wide_id() {
+        let mut vts = build_vts(0, NTSC_16X9, &[], &[*b"en", *b"fr"], &[(0, 9)], true);
+        // mpucoder PGC_SPST_CTL bytes: "Stream number for 4:3", "for wide", "for letterbox",
+        // "for pan&scan".
+        set_spst(&mut vts, &[0x8000_0102, 0x8003_0405]);
+        // vm_get_subp_stream "mode == 0 - widescreen": "subp_control[subpN] >> 16) & 0x1f".
+        assert_eq!(
+            scan_subs(vts),
+            vec![(0x20, "eng".to_string()), (0x23, "fra".to_string())],
+            "French must route to its wide sub-stream 0x23, not ordinal 0x21"
+        );
+    }
+
+    /// A 4:3 title uses SPST_CTL's 4:3 field (byte 0 bits 4-0).
+    #[test]
+    fn scan_dvd_titles_4x3_subtitles_use_spst_4x3_id() {
+        let mut vts = build_vts(0, 0x00, &[], &[*b"en", *b"de"], &[(0, 9)], true);
+        set_spst(&mut vts, &[0x8500_0000, 0x8200_0000]);
+        // vm_get_subp_stream "if(source_aspect == 0) /* 4:3 */": "subp_control[subpN] >> 24".
+        assert_eq!(
+            scan_subs(vts),
+            vec![(0x25, "eng".to_string()), (0x22, "deu".to_string())]
+        );
+    }
+
+    /// A subpicture stream SPST_CTL marks absent gets no track (spec); two logical streams on
+    /// one physical id keep the first (freemkv policy, not a spec rule).
+    #[test]
+    fn scan_dvd_titles_skips_absent_and_duplicate_subpictures() {
+        let subs = [*b"en", *b"es", *b"it"];
+        let mut vts = build_vts(0, NTSC_16X9, &[], &subs, &[(0, 9)], true);
+        set_spst(&mut vts, &[0x0000_0000, 0x8001_0100, 0x8001_0100]);
+        let (subs, ev) = crate::testlog::capture(|| scan_subs(vts));
+        // ifo_print: "subp_control[i] & 0x80000000) { /* The 'is present' bit */" is clear.
+        assert_eq!(subs, vec![(0x21, "spa".to_string())]);
+        assert!(
+            diag_lines(&ev).iter().any(|m| m.contains("tag=dvd.spstctl")
+                && m.contains("id=0x21 kept=\"spa\" dropped=\"ita\"")),
+            "{:?}",
+            diag_lines(&ev)
+        );
+    }
+
+    fn diag_lines(ev: &[crate::testlog::CapturedEvent]) -> Vec<String> {
+        ev.iter()
+            .filter(|e| e.target == "freemkv::diag")
+            .map(|e| e.message().to_string())
+            .collect()
+    }
+
+    /// Every declared subpicture absent from the PGC: no tracks, and a diag line says so.
+    #[test]
+    fn scan_dvd_titles_all_subpictures_absent_is_traced() {
+        let mut vts = build_vts(0, NTSC_16X9, &[], &[*b"en", *b"fr"], &[(0, 9)], true);
+        set_spst(&mut vts, &[0, 0]);
+        let (subs, ev) = crate::testlog::capture(|| scan_subs(vts));
+        assert!(subs.is_empty());
+        assert!(
+            diag_lines(&ev)
+                .iter()
+                .any(|m| m.contains("tag=dvd.spstctl") && m.contains("declared=2 present=0")),
+            "{:?}",
+            diag_lines(&ev)
+        );
     }
 
     // Tests. HaltingReader fails every read at/above halt_at with Error::Halted, mimicking a
@@ -1447,14 +1922,12 @@ mod tests {
         assert!((t.chapters[0].time_secs - 0.0).abs() < 0.01);
     }
 
-    // MP1/MP2 audio (no sub-stream id) falls back to PID 0xBD00 + i; two such streams must land
-    // on distinct 0xBD00/0xBD01, pinning the `+` not `-`/`*`.
+    // Positional MP2 routes to PES ids 0xC0|i (not the old never-fed 0xBD00 + i).
     #[test]
-    fn scan_dvd_titles_mp2_audio_pid_fallback_is_additive() {
+    fn scan_dvd_titles_mp2_audio_routes_to_pes_ids() {
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(1, 1, 1)]);
-        // coding_mode bits are b0>>5 & 0x7; mode 2 = MPEG-1 Layer II (Mp2),
-        // which `assign_audio_sub_stream_ids` leaves at `sub_stream_id: None`.
+        // coding_mode bits are b0>>5 & 0x7; mode 2 = MPEG-1 Layer II (Mp2).
         // b0 = 0b010_00000 = 0x40. b1 = 0 (mono, sample rate 48k).
         let audio = [(0x40u8, 0x00u8, [0u8, 0u8]), (0x40u8, 0x00u8, [0u8, 0u8])];
         let vts = build_vts(1000, 0x00, &audio, &[], &[(10, 109)], false);
@@ -1487,6 +1960,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(audio_pids, vec![0xBD00u16, 0xBD01u16]);
+        assert_eq!(audio_pids, vec![0x00C0u16, 0x00C1u16]);
     }
 }
