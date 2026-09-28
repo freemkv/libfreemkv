@@ -1740,3 +1740,62 @@ fn single_unit_rule_keys_only_pieces_the_proven_key_opens() {
         "(b) two keys: a conflict"
     );
 }
+
+/// KU §3.1 (review r2 M3): a keyless set over a title whose extents overlap (one inside
+/// another) still stops with E7022 at the first AACS unit past the inner extent, never a
+/// DecryptFailed handled as bad media, in both skip modes.
+#[test]
+fn keyless_set_over_overlapping_extents_stops_e7022() {
+    use crate::pes::Stream;
+    let fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
+    let a = fx.file(0).0;
+    let mut title = fx.disc.titles[0].clone();
+    title.extents = vec![
+        Extent {
+            start_lba: a,
+            sector_count: 30,
+        },
+        Extent {
+            start_lba: a + 3,
+            sector_count: 6,
+        },
+    ];
+    let set = ResolvedKeySet::keyless_for(&title, ContentFormat::BdTs);
+    for skip in [false, true] {
+        let recovery = Arc::new(Mutex::new(0u32));
+        let mut stream = crate::mux::DiscStream::new(
+            Box::new(RecoveryCount(fx.source(), recovery.clone())),
+            title.clone(),
+            set.decrypt_keys(),
+            3,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap()
+        .with_key_map(set.key_map())
+        .with_arrival(set.arrival(set.title_stop()).expect("every extent is lazy"));
+        stream.skip_errors = skip;
+        // Start past the inner extent: its first read is unit 4 of the outer one.
+        let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut r = set
+            .decrypting(fx.source(), None, set.title_stop(), false)
+            .unwrap();
+        r.set_unit_base(a);
+        let direct = r.read_sectors(a + 12, 3, &mut buf, false);
+        assert_eq!(
+            code(direct),
+            E7022,
+            "skip={skip}: the unit past the inner extent"
+        );
+        let got = loop {
+            match stream.read() {
+                Ok(Some(_)) => continue,
+                other => break other,
+            }
+        };
+        let err = got.expect_err("AACS content with no key stops the mux");
+        assert_eq!(crate::error_code(&err), Some(E7022), "skip={skip}: {err}");
+        assert_eq!(*recovery.lock().unwrap(), 0, "skip={skip}");
+    }
+}
