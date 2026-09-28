@@ -2411,6 +2411,7 @@ impl Disc {
         "richest-audio",
         "more-video",
         "more-subs",
+        "lowest-playlist-id",
     ];
 
     // Content-based forced-subtitle detection, restricted to `BdTs` titles — gates on STREAM
@@ -5050,6 +5051,18 @@ mod tests {
         assert_eq!(
             ii[0].playlist_id, 800,
             "identical seamless siblings still pick the lowest id"
+        );
+    }
+
+    // L088: canonical_title_order's final tiebreak (playlist_id) is a real sort
+    // key, same as the other 6 — the const naming them must not omit it.
+    #[test]
+    fn canonical_title_order_keys_names_every_sort_key_including_the_tiebreak() {
+        assert_eq!(
+            Disc::CANONICAL_TITLE_ORDER_KEYS.last(),
+            Some(&"lowest-playlist-id"),
+            "the const must name the comparator's final tiebreak key, not leave \
+             callers to append it by hand"
         );
     }
 

@@ -462,14 +462,12 @@ pub fn dump_disc(disc: &Disc) {
     }
 }
 
-// The `reason=` token on the main-feature decision row. DERIVED from the Disc key
-// lists, plus the comparator's final playlist-id tiebreak those lists omit.
+// The `reason=` token on the main-feature decision row. DERIVED from the Disc key lists.
 fn main_feature_reason() -> String {
     let keys: Vec<&str> = Disc::MAIN_FEATURE_ORDER_KEYS
         .iter()
         .chain(Disc::CANONICAL_TITLE_ORDER_KEYS.iter())
         .copied()
-        .chain(std::iter::once("lowest-playlist-id"))
         .collect();
     format!("main_feature_order({})", keys.join(", "))
 }
