@@ -14,7 +14,7 @@ const LIBAACS_MMC: &str = "libaacs (VideoLAN) @55be92be, src/libaacs/mmc.c";
 const LIBAACS_MMC_URL: &str =
     "https://code.videolan.org/videolan/libaacs/-/blob/55be92be/src/libaacs/mmc.c";
 
-// SS-1, SS-2, SS-4, SS-6: the Seagate manual reproduces the SPC text but is not SPC
+// SS-1, SS-2, SS-4: the Seagate manual reproduces the SPC text but is not SPC
 // itself, so these are Corroboration (J-5.5-6: the reviewer re-kinds per row).
 
 pub const SS_1_SENSE_PROGRESS: SpecQuote = SpecQuote {
@@ -89,15 +89,14 @@ pub const SS_5_PREVENT_ALLOW: SpecQuote = SpecQuote {
 
 pub const SS_6_START_STOP_LOEJ: SpecQuote = SpecQuote {
     id: "SS-6",
-    kind: QuoteKind::Corroboration,
-    source: SEAGATE,
-    section: "§3.49 START STOP UNIT command (SBC), LOEJ (load eject) bit, as reproduced in the \
-              Seagate manual",
-    locator: "PDF p.224",
-    url: SEAGATE_URL,
-    text: "If the load eject (LOEJ) bit is set to zero, then the logical unit shall take no \
-           action regarding loading or ejecting the medium. … If the LOEJ bit is set to one, \
-           then the logical unit shall unload the medium if the START bit is set to zero.",
+    kind: QuoteKind::Normative,
+    source: MMC6,
+    section: "§6.42.2.6 LoEj and Start, Table 633",
+    locator: "PDF p.623 (printed 575)",
+    url: MMC6_URL,
+    text: "When Power Conditions field is zero and FL is zero, the meanings of LoEj and Start \
+           are defined in Table 633. … 0 1 Start the disc and make ready for access 1 0 Eject \
+           the disc if permitted.",
 };
 
 pub const SS_7_AGID_INVALIDATE: SpecQuote = SpecQuote {

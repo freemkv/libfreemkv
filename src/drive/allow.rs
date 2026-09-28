@@ -50,8 +50,8 @@ fn is_allow(cdb: &[u8]) -> bool {
 
 /// Whether `cdb` is START STOP UNIT with LoEj=1 and Start=0 (an eject).
 fn is_eject(cdb: &[u8]) -> bool {
-    // SS-6 START STOP UNIT: "the logical unit shall unload the medium if the START bit
-    // is set to zero" with LOEJ set; byte 4 bit 1 is LoEj, bit 0 is Start.
+    // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted"; byte 4
+    // bit 1 is LoEj, bit 0 is Start.
     cdb.first() == Some(&START_STOP_UNIT) && cdb.get(4).is_some_and(|b| b & 0x03 == 0x02)
 }
 

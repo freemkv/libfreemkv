@@ -1423,8 +1423,7 @@ impl Drive {
     /// Eject the disc tray. Unlocks first, then ejects.
     pub fn eject(&mut self) -> Result<()> {
         self.unlock_tray();
-        // SS-6 START STOP UNIT: with LOEJ set, "the logical unit shall unload the medium
-        // if the START bit is set to zero".
+        // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted".
         let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
         let mut buf = [0u8; 0];
         self.exec(
@@ -1439,6 +1438,7 @@ impl Drive {
     // START STOP UNIT with START=1, LoEj=0 (never ejects). Only Halted propagates;
     // a rejected START just leaves wait_ready polling.
     fn start_unit(&mut self) -> Result<()> {
+        // SS-6 MMC-6 Table 633: LoEj 0, Start 1 = "Start the disc and make ready for access".
         let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0];
         let mut buf = [0u8; 0];
         match self.exec(&start, crate::scsi::DataDirection::None, &mut buf, 30_000) {
