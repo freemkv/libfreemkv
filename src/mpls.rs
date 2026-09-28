@@ -32,7 +32,6 @@ pub(crate) struct PlaylistMark {
     /// Which play item this mark belongs to. Carries the per-PlayItem
     /// timebase needed to place a mark in a multi-PlayItem playlist;
     /// the chapter builder does not consume it yet.
-    #[allow(dead_code)]
     pub play_item_ref: u16,
     /// Timestamp in 45kHz PTS ticks
     pub timestamp: u32,

@@ -209,10 +209,9 @@ pub const WRITE_THROUGH_DEPTH: usize = 1;
 ///
 /// `Stop` currently has no in-tree caller (sweep always processes its
 /// full work-list; the mux highway drains to EOF), but it's part of the
-/// fixed `Sink` contract, so `#[allow(dead_code)]` is intentional.
+/// fixed `Sink` contract.
 pub enum Flow {
     Continue,
-    #[allow(dead_code)]
     Stop,
 }
 

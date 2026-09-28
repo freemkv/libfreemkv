@@ -57,7 +57,6 @@ pub struct StreamId {
 
 /// A stream label extracted from disc config files.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct StreamLabel {
     /// Which elementary stream this label describes, when its source stated
     /// it outright.

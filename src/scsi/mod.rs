@@ -18,7 +18,6 @@ mod windows;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod fd_handoff;
 
-#[allow(unused_imports)]
 use crate::error::{Error, Result};
 use std::path::Path;
 

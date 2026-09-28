@@ -205,7 +205,6 @@ impl WritebackFile {
     /// Callers that know the target output size should prefer
     /// [`Self::create_with_size_hint`] so the kernel can pre-reserve
     /// extents.
-    #[allow(dead_code)]
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = File::create(path)?;
         Self::new(file)
