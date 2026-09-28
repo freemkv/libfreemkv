@@ -176,18 +176,34 @@ pub(crate) fn resolve_dvd_title_key(
     Ok(())
 }
 
-/// Where a 13818-1 pack's first PES flags byte sits: `0x0E + pack_stuffing_length + 6`
-/// (0x14 unstuffed), `Some` only when that PES is scrambled (m1). The `mpg://` file's test.
+/// Where a 13818-1 pack's first PES header flags byte sits, `Some` only when that PES is
+/// scrambled: the `mpg://` file's test (m1, B-1). Leading packets with no PES header (a
+/// system header, a map, padding) are walked by their length; only the first PES is judged.
 pub(crate) fn ps_scrambled_at(sector: &[u8]) -> Option<usize> {
-    use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
     if sector.len() < 2048 || sector[..4] != PACK_START || sector[4] >> 6 != 0b01 {
         return None;
     }
-    let at = 0x14 + usize::from(sector[0x0D] & 0x07);
-    let sid = sector[at - 3];
-    (!matches!(sid, SYSTEM_HEADER | PADDING_STREAM | PRIVATE_STREAM_2)
-        && (sector[at] >> 4) & 0x03 != 0)
-        .then_some(at)
+    let mut p = 0x0E + usize::from(sector[0x0D] & 0x07);
+    loop {
+        let h = sector.get(p..p + 7)?;
+        if h[..3] != [0, 0, 1] {
+            return None;
+        }
+        match h[3] {
+            // MS-31: "if (stream_id != program_stream_map && stream_id != padding_stream &&
+            // stream_id != private_stream_2 && stream_id != ECM && stream_id != EMM && …"
+            // (0xBB, the system header, is no PES packet at all).
+            0xBB | 0xBC | 0xBE | 0xBF | 0xF0 | 0xF1 | 0xF2 | 0xF8 | 0xFF => {
+                p += 6 + usize::from(u16::from_be_bytes([h[4], h[5]]));
+            }
+            0xBD..=0xFE => {
+                let at = p + 6;
+                // CSS leaves bytes before 0x80 clear; a header past them cannot be read.
+                return (at < 0x80 && h[6] >> 6 == 0b10 && (h[6] >> 4) & 0x03 != 0).then_some(at);
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// [`ps_scrambled_at`] as a test.
@@ -209,15 +225,15 @@ fn with_flags_at_0x14<T>(sector: &mut [u8], at: usize, f: impl FnOnce(&mut [u8])
     out
 }
 
-/// The `mpg://` file's crack (design §4 step 2.1, D3): raw = false, over the strict
-/// unstuffed-pack test; the resolved keys, `DecryptKeys::None` when the file is clear.
+/// The `mpg://` file's crack (design §4 step 2.1, D3): raw = false, judging each pack by
+/// [`ps_scrambled_at`]; the resolved keys, `DecryptKeys::None` when the file is clear.
 pub(crate) fn resolve_ps_file_title_key(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> std::io::Result<crate::decrypt::DecryptKeys> {
-    match crack_key_scan_with(reader, extents, batch_sectors, halt, is_scrambled_ps_pack) {
+    match crack_key_scan_with(reader, extents, batch_sectors, halt, ps_scrambled_at) {
         CrackOutcome::Cracked(state) => Ok(crate::decrypt::DecryptKeys::Css {
             title_key: state.title_key,
         }),
@@ -243,16 +259,19 @@ fn crack_key_scan(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> CrackOutcome {
-    crack_key_scan_with(reader, extents, batch_sectors, halt, is_scrambled_pack)
+    crack_key_scan_with(reader, extents, batch_sectors, halt, |s| {
+        is_scrambled_pack(s).then_some(0x14)
+    })
 }
 
-// The crack scan with its scramble test (`is_scrambled_ps_pack` for mpg:// files).
+// The crack scan with its test: `scrambled_at` gives a scrambled pack's flags offset (always
+// 0x14 on the disc path; `ps_scrambled_at` for mpg:// files).
 fn crack_key_scan_with(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
-    scrambled: fn(&[u8]) -> bool,
+    scrambled_at: fn(&[u8]) -> Option<usize>,
 ) -> CrackOutcome {
     #[cfg(test)]
     CRACK_SCANS.with(|n| n.set(n.get() + 1));
@@ -337,17 +356,14 @@ fn crack_key_scan_with(
                         // HARDENED pack-gated check: a clear stub sector with
                         // stray bits at 0x14 must NOT count as scramble evidence,
                         // or an unencrypted title falsely reports E7023.
-                        if scrambled(sect) {
+                        if let Some(at) = scrambled_at(sect) {
                             saw_scrambled = true;
-                            // A stuffed mpg:// pack's flags sit past 0x14 (m1).
-                            let key = match ps_scrambled_at(sect).filter(|&at| at != 0x14) {
-                                Some(at) => {
-                                    let mut copy = sect.to_vec();
-                                    with_flags_at_0x14(&mut copy, at, |c| {
-                                        keyless::crack_title_key(c)
-                                    })
-                                }
-                                None => keyless::crack_title_key(sect),
+                            // An mpg:// pack's flags may sit past 0x14 (m1); the disc's never do.
+                            let key = if at == 0x14 {
+                                keyless::crack_title_key(sect)
+                            } else {
+                                let mut copy = sect.to_vec();
+                                with_flags_at_0x14(&mut copy, at, |c| keyless::crack_title_key(c))
                             };
                             if let Some(key) = key {
                                 return CrackOutcome::Cracked(CssState {

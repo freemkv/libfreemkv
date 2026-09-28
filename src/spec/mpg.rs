@@ -311,6 +311,16 @@ pub const MS_30_PCM_DVD_HEADER: SpecQuote = SpecQuote {
     text: "stream->lpcm_header[0] = 0x0c; stream->lpcm_header[1] = (freq << 4) | (((st->codecpar->bits_per_coded_sample - 16) / 4) << 6) | st->codecpar->ch_layout.nb_channels - 1; stream->lpcm_header[2] = 0x80;",
 };
 
+pub const MS_31_PES_HEADER_STREAM_IDS: SpecQuote = SpecQuote {
+    id: "MS-31",
+    kind: QuoteKind::Normative,
+    source: H222,
+    section: "§2.4.3.6 Table 2-17 PES packet",
+    locator: "h222:2973-2982",
+    url: H222_URL,
+    text: "if (stream_id != program_stream_map && stream_id != padding_stream && stream_id != private_stream_2 && stream_id != ECM && stream_id != EMM && stream_id != program_stream_directory && stream_id != DSMCC_stream && stream_id != ITU-T Rec. H.222.1 type E stream) { '10' 2 bslbf PES_scrambling_control 2 bslbf",
+};
+
 /// Every `MS-n` quote, in ID order.
 pub const ALL: &[&SpecQuote] = &[
     &MS_1_PACK,
@@ -343,4 +353,5 @@ pub const ALL: &[&SpecQuote] = &[
     &MS_28_PRIVATE_DESCRIPTOR,
     &MS_29_PRIVATE_STREAM_1_HEADERS,
     &MS_30_PCM_DVD_HEADER,
+    &MS_31_PES_HEADER_STREAM_IDS,
 ];

@@ -73,3 +73,4 @@ src/mux/codec/lpcm.rs	dvd_header	MS-30
 src/mux/mpg/scan.rs	parse_map	MS-8
 src/mux/mpg/scan.rs	parse_map	MS-9
 src/mux/mpg/scan.rs	scan	MS-23
+src/css/mod.rs	ps_scrambled_at	MS-31
