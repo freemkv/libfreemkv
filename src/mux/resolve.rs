@@ -451,7 +451,7 @@ pub(crate) fn input_with_halt(
         StreamUrl::Mp4 { ref path } => Ok(Box::new(super::mp4::Mp4Reader::open(path)?)),
         StreamUrl::Mpg { ref path } => {
             validate_file_path(path, "mpg")?;
-            Ok(Box::new(build_ps_pipeline(path, opts)?))
+            Ok(Box::new(build_ps_pipeline(path, opts, halt)?))
         }
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
@@ -1995,7 +1995,11 @@ fn iso_pipeline_tail(
 // An `mpg://` source (design §4 step 2, J13): the sector path, one extent over the zero-padded
 // file. Crack first (a scrambled `.vob` descrambles, a clear one passes), scan the decrypted
 // head, then build the DVD pipeline with the RESOLVED keys, so its own crack is a no-op.
-fn build_ps_pipeline(path: &Path, opts: &InputOptions) -> io::Result<PipelinedPesStream> {
+fn build_ps_pipeline(
+    path: &Path,
+    opts: &InputOptions,
+    halt: Option<&crate::halt::Halt>,
+) -> io::Result<PipelinedPesStream> {
     const PS_MUX_BATCH_SECTORS: u16 = 8192;
     const HEAD_SECTORS: u32 = 2048; // 4 MiB
     let mut reader = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
@@ -2020,15 +2024,25 @@ fn build_ps_pipeline(path: &Path, opts: &InputOptions) -> io::Result<PipelinedPe
         .find(|w| w[..4] == crate::css::PACK_START)
         .is_some_and(|w| w[4] >> 6 == 0b01);
     if mpeg2 {
-        crate::css::resolve_dvd_title_key(
+        // Design §4 step 2.1: "css::resolve_dvd_title_key(… raw = false, halt)". Even a
+        // raw read cracks, so the head scan sees the streams; the mux itself stays raw.
+        let cracked = crate::css::resolve_dvd_title_key(
             &mut reader,
             &[extent],
             &mut keys,
             PS_MUX_BATCH_SECTORS,
             ContentFormat::MpegPs,
-            opts.raw,
-            None,
-        )?;
+            false,
+            halt,
+        );
+        match cracked {
+            Ok(()) => {}
+            // `--raw` never hard-fails on scrambled-uncrackable: scan the ciphertext.
+            Err(e)
+                if opts.raw
+                    && crate::error::error_code(&e) == Some(crate::error::E_CSS_KEY_MISSING) => {}
+            Err(e) => return Err(e),
+        }
     }
     let head_src = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
     let mut head_reader = crate::sector::DecryptingSectorSource::new(
@@ -2080,7 +2094,7 @@ fn build_ps_pipeline(path: &Path, opts: &InputOptions) -> io::Result<PipelinedPe
         PS_MUX_BATCH_SECTORS,
         ContentFormat::MpegPs,
         opts.raw,
-        None,
+        halt.cloned(),
         None,
         None,
     )
