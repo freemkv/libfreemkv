@@ -155,6 +155,17 @@ pub trait ResolveCtx {
     fn unit_key_ro(&self) -> &[u8] {
         &[]
     }
+    /// The op's Stop token (stop design §2.7): a source waits on it, never past a Stop.
+    /// `None` for a ctx built with no token. Defaulted so foreign impls compile unchanged.
+    fn halt(&self) -> Option<&crate::halt::Halt> {
+        None
+    }
+    /// The op's [`Progress`](crate::halt::Progress) (§2.7, T29): a source bumps it per
+    /// byte moved and holds [`busy`](crate::halt::Progress::busy) while a call is in
+    /// flight. `None` when nothing watches the op. Defaulted like [`Self::halt`].
+    fn progress(&self) -> Option<&crate::halt::Progress> {
+        None
+    }
 }
 
 /// [`ResolveCtx`] over a scan-time [`DiscInputs`].
@@ -166,6 +177,8 @@ pub trait ResolveCtx {
 pub struct DiscInputsCtx<'a> {
     inner: &'a DiscInputs,
     enc_keys: Vec<[u8; 16]>,
+    halt: Option<&'a crate::halt::Halt>,
+    progress: Option<&'a crate::halt::Progress>,
 }
 
 impl<'a> DiscInputsCtx<'a> {
@@ -189,6 +202,22 @@ impl<'a> DiscInputsCtx<'a> {
         Self {
             inner: inputs,
             enc_keys,
+            halt: None,
+            progress: None,
+        }
+    }
+
+    /// The ctx the `keys` module hands every source (§2.12): `halt` and `progress`
+    /// come back from [`ResolveCtx::halt`] and [`ResolveCtx::progress`].
+    pub(crate) fn with_stop(
+        self,
+        halt: Option<&'a crate::halt::Halt>,
+        progress: Option<&'a crate::halt::Progress>,
+    ) -> Self {
+        Self {
+            halt,
+            progress,
+            ..self
         }
     }
 }
@@ -218,6 +247,12 @@ impl ResolveCtx for DiscInputsCtx<'_> {
     }
     fn unit_key_ro(&self) -> &[u8] {
         &self.inner.unit_key_ro
+    }
+    fn halt(&self) -> Option<&crate::halt::Halt> {
+        self.halt
+    }
+    fn progress(&self) -> Option<&crate::halt::Progress> {
+        self.progress
     }
 }
 

@@ -322,3 +322,188 @@ fn consumer_bumps_progress_per_item_and_close() {
     pipe.finish().unwrap();
     assert!(progress.get() >= 5, "{}", progress.get());
 }
+
+// ── The ST-L3 `.partial` rule (§2.5, §2.6) ──
+
+// Writes each item to `<out>.partial`; `close` renames it to `<out>` (the final name),
+// `close_stopped` keeps it. Each close bumps `progress` per `step` for `steps` steps.
+struct PartialFile {
+    file: std::fs::File,
+    partial: std::path::PathBuf,
+    out: std::path::PathBuf,
+    progress: Progress,
+    step: Duration,
+    steps: u32,
+    done: Arc<AtomicBool>,
+}
+
+impl PartialFile {
+    fn slow_close(&mut self) {
+        use std::io::Write;
+        for _ in 0..self.steps {
+            thread::sleep(self.step);
+            self.progress.bump();
+        }
+        self.file.flush().unwrap();
+    }
+}
+
+impl Sink<u64> for PartialFile {
+    type Output = ();
+    fn apply(&mut self, v: u64) -> Result<Flow, Error> {
+        use std::io::Write;
+        self.file.write_all(&v.to_le_bytes()).unwrap();
+        Ok(Flow::Continue)
+    }
+    fn close(mut self) -> Result<(), Error> {
+        self.slow_close();
+        std::fs::rename(&self.partial, &self.out).unwrap();
+        self.done.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn close_stopped(mut self) -> Result<(), Error> {
+        self.slow_close();
+        self.done.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct PartialRun {
+    _dir: tempfile::TempDir,
+    partial: std::path::PathBuf,
+    out: std::path::PathBuf,
+    done: Arc<AtomicBool>,
+    pipe: Pipeline<u64, ()>,
+}
+
+// A pipeline over a `PartialFile` sink whose closes take `steps` × GRACE / 2.
+fn partial_run(steps: u32) -> PartialRun {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("Movie.mkv");
+    let partial = dir.path().join("Movie.mkv.partial");
+    let progress = Progress::new();
+    let done = Arc::new(AtomicBool::new(false));
+    let sink = PartialFile {
+        file: std::fs::File::create(&partial).unwrap(),
+        partial: partial.clone(),
+        out: out.clone(),
+        progress: progress.clone(),
+        step: GRACE / 2,
+        steps,
+        done: done.clone(),
+    };
+    let pipe = Pipeline::spawn_named_with_progress("t-partial", 4, sink, progress).unwrap();
+    for i in 0..4 {
+        pipe.send(i).unwrap();
+    }
+    PartialRun {
+        _dir: dir,
+        partial,
+        out,
+        done,
+        pipe,
+    }
+}
+
+/// LP3 (the ST-L3 rule, §2.5): "A consumer that entered CLOSING **after** the cancel
+/// keeps its output under `*.partial`". It runs `close_stopped`: it finishes writing and
+/// never renames (§2.6 "A post-cancel `close()` leaves `*.partial`").
+#[test]
+fn closing_after_cancel_keeps_partial() {
+    let run = partial_run(0);
+    let halt = Halt::new();
+    halt.cancel();
+    let r = run.pipe.finish_with_halt_timing(Some(&halt), timing());
+    assert!(r.is_ok(), "the stopped close's own result: {r:?}");
+    assert!(run.done.load(Ordering::SeqCst), "the stopped close ran");
+    assert!(!run.out.exists(), "never a final-named file after a Stop");
+    let kept = std::fs::metadata(&run.partial).expect("`.partial` kept");
+    assert_eq!(kept.len(), 32, "every applied item is in the `.partial`");
+}
+
+/// LP3 with T8 (D2: "5 s for a CLOSING one"): a post-cancel close gets one fixed grace,
+/// not the re-arming wait a pre-cancel close gets (LP2). The leaked consumer still
+/// cannot produce a final-named file.
+#[test]
+fn closing_after_cancel_gets_one_grace_and_never_renames() {
+    let run = partial_run(8);
+    let halt = Halt::new();
+    halt.cancel();
+    let t = Instant::now();
+    let r = run.pipe.finish_with_halt_timing(Some(&halt), timing());
+    let took = t.elapsed();
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    assert!(took <= GRACE * 2 + SLACK, "no re-arming wait: {took:?}");
+    let end = Instant::now();
+    while !run.done.load(Ordering::SeqCst) {
+        assert!(end.elapsed() < SLACK * 5, "the leaked close never ended");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!run.out.exists(), "the leaked consumer kept `*.partial`");
+    assert!(run.partial.exists());
+}
+
+/// LP3 guard (GUARD): the default `close_stopped` is `close`, so a sink that never
+/// renames (the engine's sweep keeps its summary after a Stop) returns its output
+/// unchanged. Per spec; do not change without a spec citation proving otherwise.
+#[test]
+fn closing_after_cancel_default_sink_keeps_its_output() {
+    let pipe = Pipeline::spawn(4, Sum(0)).unwrap();
+    pipe.send(7).unwrap();
+    let halt = Halt::new();
+    halt.cancel();
+    let r = pipe.finish_with_halt_timing(Some(&halt), timing());
+    assert!(matches!(r, Ok(7)), "{r:?}");
+}
+
+/// LP1 (the `*.partial` half, GUARD): a halted RUNNING consumer is abandoned after the
+/// grace and never runs `close()`, so its output stays `*.partial`.
+#[test]
+fn halted_running_consumer_output_stays_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let partial = dir.path().join("Movie.iso.partial");
+    let out = dir.path().join("Movie.iso");
+    struct Wedged {
+        inner: PartialFile,
+        release: Arc<AtomicBool>,
+        started: Arc<AtomicBool>,
+    }
+    impl Sink<u64> for Wedged {
+        type Output = ();
+        fn apply(&mut self, v: u64) -> Result<Flow, Error> {
+            self.started.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.inner.apply(v)
+        }
+        fn close(self) -> Result<(), Error> {
+            self.inner.close()
+        }
+    }
+    let (release, started) = (Arc::new(AtomicBool::new(false)), Arc::default());
+    let sink = Wedged {
+        inner: PartialFile {
+            file: std::fs::File::create(&partial).unwrap(),
+            partial: partial.clone(),
+            out: out.clone(),
+            progress: Progress::new(),
+            step: Duration::ZERO,
+            steps: 0,
+            done: Arc::default(),
+        },
+        release: release.clone(),
+        started: Arc::clone(&started),
+    };
+    let pipe = Pipeline::spawn(4, sink).unwrap();
+    pipe.send(1).unwrap();
+    wait_until(&started);
+    let halt = Halt::new();
+    halt.cancel();
+    let r = pipe.finish_with_halt_timing(Some(&halt), timing());
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    release.store(true, Ordering::SeqCst);
+    thread::sleep(GRACE);
+    assert!(!out.exists(), "an abandoned consumer never finalises");
+    assert!(partial.exists());
+}

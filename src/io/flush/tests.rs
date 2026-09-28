@@ -321,7 +321,7 @@ fn chunk_halves_on_slow_flush() {
     let ops = Arc::new(FakeFlushOps {
         chunk_delay: Some(Box::new(|i| {
             if i >= 2 {
-                Duration::from_millis(40)
+                Duration::from_millis(400)
             } else {
                 Duration::ZERO
             }
@@ -329,7 +329,7 @@ fn chunk_halves_on_slow_flush() {
         ..FakeFlushOps::default()
     });
     let t = FlushTiming {
-        slow_chunk: Duration::from_millis(20),
+        slow_chunk: Duration::from_millis(200),
         chunk_min: K,
         chunk_max: 4 * K,
         ..timing(Duration::from_secs(30))

@@ -2318,3 +2318,5 @@ fn a_source_halted_mid_request_keeps_the_asked_step() {
         "the request that went out"
     );
 }
+
+mod stop_tests;

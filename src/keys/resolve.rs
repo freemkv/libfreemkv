@@ -9,7 +9,7 @@ use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace};
 use crate::decrypt::{AacsKeyMap, Phase};
 use crate::disc::{ContentFormat, Disc, DiscFormat, Extent};
 use crate::error::{Error, Result};
-use crate::halt::Halt;
+use crate::halt::{Halt, Progress};
 use crate::keysource::{DiscInputs, DiscInputsCtx, KeySource, MIN_SAMPLE_UNITS};
 use crate::sector::SectorSource;
 use crate::session::KeySourceFactory;
@@ -115,6 +115,8 @@ enum Asked {
 // The state of one `resolve` run.
 struct Run<'a> {
     halt: Option<&'a Halt>,
+    // The op's progress: busy around each source call (stop design §2.1 item 2).
+    progress: Option<&'a Progress>,
     clock: &'a dyn Clock,
     format: ContentFormat,
     sources: Vec<Box<dyn KeySource>>,
@@ -165,7 +167,7 @@ impl Run<'_> {
         self.requests += 1;
         let mut inputs = self.inputs.clone();
         inputs.samples = samples.to_vec();
-        let ctx = DiscInputsCtx::new(&inputs);
+        let ctx = DiscInputsCtx::new(&inputs).with_stop(self.halt, self.progress);
         let start = self.clock.now();
         let mut wait = RETRY_FIRST;
         let mut attempted = false;
@@ -179,6 +181,9 @@ impl Run<'_> {
             attempted = true;
             let src = &self.sources[i];
             let who = src.label().to_string();
+            // Stop §2.1 item 2 (ST4-2): a source call (a keydb parse, a key-service call)
+            // moves no CDB, so it is busy for the idle-only T29 probe.
+            let busy = self.progress.map(Progress::busy);
             let answer = if forensic {
                 src.get_fmts_indexes(&ctx).map(|k| (k, None))
             } else {
@@ -187,6 +192,7 @@ impl Run<'_> {
                     (r.keys, Some(info))
                 })
             };
+            drop(busy);
             match answer {
                 Ok((keys, info)) => {
                     let (matched, entry, store, miss) =
@@ -463,6 +469,19 @@ pub(crate) fn resolve(
     opts: ResolveKeysOptions,
     clock: &dyn Clock,
 ) -> Result<KeyResolution> {
+    resolve_observed(disc, reader, scope, sources, opts, clock, None)
+}
+
+/// [`resolve`] reporting to the op's `progress` (stop design §2.1, T29).
+pub(crate) fn resolve_observed(
+    disc: &Disc,
+    reader: &mut dyn SectorSource,
+    scope: KeyScope,
+    sources: &KeySourceFactory,
+    opts: ResolveKeysOptions,
+    clock: &dyn Clock,
+    progress: Option<&Progress>,
+) -> Result<KeyResolution> {
     let halt = opts.halt;
     if let Some(h) = halt {
         h.check()?;
@@ -510,6 +529,7 @@ pub(crate) fn resolve(
     let vid_consumer = built.iter().any(|s| s.uses_vid());
     let mut run = Run {
         halt,
+        progress,
         clock,
         format: disc.content_format,
         sources: built,
@@ -542,6 +562,11 @@ pub(crate) fn resolve(
         && (run.km_needs_vid || vid_consumer)
     {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // The final check (Stop §6 ST-L3): a Stop during the last source call ends `Halted`,
+    // never a refusal or a set.
+    if let Some(h) = halt {
+        h.check()?;
     }
     let mut inner = result?;
     inner.disc_hash = aacs.disc_hash.clone();

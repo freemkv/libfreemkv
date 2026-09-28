@@ -609,18 +609,11 @@ impl FeRereads {
         }
     }
 
-    // Sleep `pause` in short slices; a Stop during it is `Halted`.
+    // A Stop during the pause is `Halted`; with no token nothing can cancel it.
     fn pause(&self) -> Result<()> {
-        let end = std::time::Instant::now() + self.pause;
-        loop {
-            if self.halt.as_ref().is_some_and(|h| h.is_cancelled()) {
-                return Err(Error::Halted);
-            }
-            let now = std::time::Instant::now();
-            if now >= end {
-                return Ok(());
-            }
-            std::thread::sleep((end - now).min(std::time::Duration::from_millis(50)));
+        match &self.halt {
+            Some(h) => h.wait(self.pause),
+            None => crate::halt::Halt::new().wait(self.pause),
         }
     }
 }
@@ -9792,6 +9785,32 @@ mod tests {
             "the pause ends on Stop"
         );
         assert_eq!(r.reads.len(), 1, "no re-read after the Stop");
+    }
+
+    // §5.8 "Use `Halt::wait` / `pause` instead" of `thread::sleep`: with or without a
+    // token the re-read pause is a `Halt::wait`, so a NoBlockingScope refuses it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_reread_pause_is_a_halt_wait() {
+        for halt in [Some(crate::halt::Halt::new()), None] {
+            let rereads = FeRereads::with_pause(halt, std::time::Duration::from_millis(1));
+            let _scope = crate::halt::diag::NoBlockingScope::enter();
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rereads.pause()));
+            let msg = match got {
+                Err(p) => p.downcast_ref::<String>().cloned().unwrap_or_default(),
+                Ok(r) => format!("returned {r:?}"),
+            };
+            assert_eq!(msg, "Halt::wait (sleep) under NoBlockingScope");
+        }
+    }
+
+    // No token: nothing can end the pause early, so it is waited out in full.
+    #[test]
+    fn the_reread_pause_without_a_token_is_waited_out() {
+        let pause = std::time::Duration::from_millis(60);
+        let t0 = std::time::Instant::now();
+        assert!(FeRereads::with_pause(None, pause).pause().is_ok());
+        assert!(t0.elapsed() >= pause, "{:?}", t0.elapsed());
     }
 
     #[test]

@@ -39,7 +39,6 @@ pub struct DvdTitleSet {
 
 /// A single title (from PGC + TT_SRPT chapter count).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DvdTitle {
     /// Number of chapters (PTTs)
     pub chapters: u16,
@@ -185,7 +184,6 @@ pub enum DvdAspect {
 
 /// DVD video stream attributes.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DvdVideoAttr {
     pub codec: Codec,
     pub resolution: Resolution,

@@ -141,8 +141,8 @@ pub use drive::{Drive, DriveStatus, extract_scsi_context, find_drive};
 // key material into `ScanOptions` (the library derives no certs; see `KeySpec`).
 #[cfg(feature = "rip")]
 pub use session::{
-    DeviceTarget, DiscSession, KeySourceFactory, KeySpec, ResolvedKeys, resolve_keys_for, scan_dir,
-    scan_iso,
+    DeviceTarget, DiscSession, Finish, KeySourceFactory, KeySpec, ResolvedKeys, resolve_keys_for,
+    scan_dir, scan_iso,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────

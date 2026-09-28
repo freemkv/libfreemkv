@@ -1018,3 +1018,78 @@ fn bus_step_guard_holds_busy_across_host_certs() {
     assert!(!seen.is_empty() && seen.iter().all(|b| *b), "{seen:?}");
     assert!(!p.is_busy(), "released after the step");
 }
+
+// ── Stop design §5.1 "Scan" LS7 and the session alias rule (ST-L3) ──
+
+// A `DiscSession` brought up over `t`: under `halt` as `open_with` does, else as `open`.
+fn session_over(
+    t: crate::test_util::FakeTransport,
+    halt: Option<&crate::halt::Halt>,
+) -> crate::session::DiscSession {
+    let drive = match halt {
+        Some(h) => Drive::from_transport_with(Box::new(t), h),
+        None => Drive::from_transport(Box::new(t)),
+    };
+    crate::session::DiscSession::bring_up(drive, Default::default(), halt.cloned())
+        .expect("brought up")
+}
+
+/// LS7 (the scan half; KU's LK18 covers the library half): a Stop during
+/// `scan_with` returns `Halted` and stores no `Disc`, and a key resolution on that
+/// session then returns `Halted` too and builds no set.
+#[test]
+fn cancelled_scan_then_resolve_returns_halted_and_builds_no_set() {
+    use crate::test_util::FakeTransport;
+    let h = crate::halt::Halt::new();
+    let (t, fake) = FakeTransport::new();
+    let t = t
+        .with_inner(Box::new(ake(bd_disc(None), 0x0040)))
+        .cancel_on(nth(1, is_read10), &h)
+        .watch(&h);
+    let mut s = session_over(t, Some(&h));
+    let r = s.scan_with(with_hc()).map(|d| d.titles.len());
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    assert!(s.disc().is_none(), "a stopped scan stores no Disc");
+    let sources: crate::session::KeySourceFactory = Arc::new(Vec::new);
+    let r = s.resolve_key_set(
+        crate::keys::KeyScope::WholeDisc,
+        &sources,
+        Default::default(),
+    );
+    assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
+    let reads = fake.count(is_read10);
+    assert_eq!(
+        reads,
+        1,
+        "nothing read after the Stop: {:02x?}",
+        fake.cdbs()
+    );
+}
+
+/// Guard (LD8/LD9 at the session layer, §2.2 alias rule): a session from `open` (own
+/// token) scans under the `ScanOptions.halt` alias and gets its own token back; a
+/// session from `open_with` keeps its attached token, which wins over the alias.
+#[test]
+fn session_scan_with_follows_the_alias_rule() {
+    use crate::test_util::FakeTransport;
+    let alias = crate::halt::Halt::new();
+    let (t, _) = FakeTransport::new();
+    let t = t
+        .with_inner(Box::new(ake(bd_disc(None), 0x0040)))
+        .cancel_on(nth(1, is_read10), &alias);
+    let mut own = session_over(t, None);
+    let r = own.scan_with(with_halt(&alias)).map(|d| d.titles.len());
+    assert!(matches!(r, Err(Error::Halted)), "the alias stops it: {r:?}");
+    let drive = own.into_drive().expect("drive");
+    let tok = drive.token().expect("own token restored");
+    assert!(!Arc::ptr_eq(tok.as_arc(), alias.as_arc()) && !tok.is_cancelled());
+
+    let (op, alias) = (crate::halt::Halt::new(), crate::halt::Halt::new());
+    let (t, _) = FakeTransport::new();
+    let t = t
+        .with_inner(Box::new(ake(bd_disc(None), 0x0040)))
+        .cancel_on(nth(1, is_read10), &alias);
+    let mut attached = session_over(t, Some(&op));
+    let d = attached.scan_with(with_halt(&alias));
+    assert!(d.is_ok(), "the attached op token wins over the alias");
+}

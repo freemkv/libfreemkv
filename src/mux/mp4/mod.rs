@@ -772,7 +772,6 @@ fn build_tkhd(track_id: u32, width: u32, height: u32, duration: u64, audio: bool
     fullbox(b"tkhd", 1, 0x07, &body)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_mdia(
     language: [u8; 2],
     timescale: u32,
