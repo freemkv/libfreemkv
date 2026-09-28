@@ -655,6 +655,33 @@ mod tests {
         );
     }
 
+    // B2: an 11172-1 pack (12 bytes, '0010') puts a packet's length and PTS at 0x11/0x14,
+    // and a stuffed 13818-1 pack header moves the PES there: neither is scramble evidence.
+    #[test]
+    fn is_scrambled_pack_only_reads_an_unstuffed_13818_pack() {
+        // FFmpeg's MPEG-1 packet: STD buffer '01' at 0x12, then '0010' + PTS at 0x14.
+        let mut s = vec![0u8; 2048];
+        s[..12].copy_from_slice(&[0, 0, 1, 0xBA, 0x21, 0, 1, 0, 1, 0x80, 0x1B, 0x83]);
+        s[12..16].copy_from_slice(&[0, 0, 1, 0xE0]);
+        s[16..18].copy_from_slice(&2030u16.to_be_bytes());
+        s[18..20].copy_from_slice(&[0x60, 46]);
+        s[20] = 0x21;
+        assert!(!is_scrambled_pack(&s), "an 11172-1 pack");
+        // A 13818-1 pack with pack_stuffing_length 3 (0x14 = stream_id) and 1 (0x14 =
+        // PES_packet_length low byte).
+        for stuffing in [3usize, 1] {
+            let mut s = vec![0xFFu8; 2048];
+            s[..4].copy_from_slice(&PACK_START);
+            s[4] = 0x44;
+            s[13] = 0xF8 | stuffing as u8;
+            let at = 14 + stuffing;
+            s[at..at + 4].copy_from_slice(&[0, 0, 1, 0xE0]);
+            s[at + 4..at + 6].copy_from_slice(&0x07EBu16.to_be_bytes());
+            s[at + 6] = 0x81;
+            assert!(!is_scrambled_pack(&s), "pack_stuffing_length {stuffing}");
+        }
+    }
+
     // Fix 3 hardening: `is_scrambled_pack` requires BOTH the pack-start code
     // AND the 0x14 bits, so a stub with stray 0x14 bits but no pack-start
     // isn't scramble evidence (else a clear title reports E7023).

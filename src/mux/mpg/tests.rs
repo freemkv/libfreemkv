@@ -1508,6 +1508,105 @@ fn an_mpeg1_system_stream_is_read_and_remuxed() {
     let _ = std::fs::remove_file(&path);
 }
 
+// A clear program stream of 2048-byte packs carrying `pics` as one video stream: 11172-1
+// packs whose packets carry the STD buffer field and a PTS (as FFmpeg writes them), or
+// 13818-1 packs with `stuffing` pack-stuffing bytes. Returns the file and the video ES.
+fn clear_ps(mpeg1: bool, stuffing: usize) -> (Vec<u8>, Vec<u8>) {
+    let mut es = Vec::new();
+    let mut starts = Vec::new();
+    for k in 0..30u64 {
+        starts.push((es.len(), 45_000 + k * 3_600));
+        if k == 0 {
+            es.extend(if mpeg1 {
+                test_es::mpeg1_seq(3)
+            } else {
+                test_es::mpeg2_seq(3, false)
+            });
+        }
+        es.extend(test_es::mpeg2_pic(if k == 0 { 1 } else { 2 }, 3));
+        es.resize(es.len() + 5_000, 0x55);
+    }
+    let ts = |prefix: u8, t: u64| {
+        [
+            (prefix << 4) | (((t >> 29) & 0x0E) as u8) | 1,
+            (t >> 22) as u8,
+            1 | (((t >> 14) & 0xFE) as u8),
+            (t >> 7) as u8,
+            1 | (((t << 1) & 0xFE) as u8),
+        ]
+    };
+    let mut out = Vec::new();
+    let mut at = 0;
+    let mut scr = 0u64;
+    while at < es.len() {
+        // The PTS of a picture whose first byte this packet will hold.
+        let pts = |room: usize| {
+            starts
+                .iter()
+                .find(|(o, _)| *o >= at && *o < at + room)
+                .map(|&(_, t)| t)
+        };
+        let mut pk = Vec::new();
+        if mpeg1 {
+            pk.extend_from_slice(&[0, 0, 1, 0xBA, 0x21, 0, 1, 0, 1, 0x80, 0x1B, 0x83]);
+            let head = 6 + 2 + 5;
+            let t = pts(2048 - 12 - head);
+            let room = 2048 - 12 - 6 - 2 - if t.is_some() { 5 } else { 1 };
+            let n = room.min(es.len() - at);
+            let mut body = vec![0x40 | 0x20, 46]; // STD buffer: scale 1, 46 KiB
+            match t {
+                Some(t) => body.extend_from_slice(&ts(0b0010, t)),
+                None => body.push(0x0F),
+            }
+            body.extend_from_slice(&es[at..at + n]);
+            pk.extend_from_slice(&[0, 0, 1, 0xE0]);
+            pk.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            pk.extend(body);
+            at += n;
+        } else {
+            pk.extend(pack::pack_header(scr, 25_200, stuffing));
+            let t = pts(2048 - pk.len() - 14);
+            let f = pack::PesFields {
+                pts: t,
+                ..Default::default()
+            };
+            let n = (2048 - pk.len() - pack::pes_header_len(&f)).min(es.len() - at);
+            pk.extend(pack::pes_header(0xE0, &f, n));
+            pk.extend_from_slice(&es[at..at + n]);
+            at += n;
+        }
+        if pk.len() < 2048 {
+            let pad = 2048 - pk.len();
+            pk.extend(pack::padding_pes(pad));
+        }
+        assert_eq!(pk.len(), 2048);
+        out.extend(pk);
+        scr += 27_000;
+    }
+    out.extend_from_slice(&[0, 0, 1, 0xB9]);
+    (out, es)
+}
+
+// B2: an 11172-1 stream cannot be CSS, and a stuffed 13818-1 pack header moves bytes 0x11
+// and 0x14 off the stream_id and PES flags: neither clear file is refused with E7023.
+#[test]
+fn clear_mpeg1_and_stuffed_mpeg2_are_never_read_as_scrambled() {
+    for (mpeg1, stuffing) in [(true, 0), (false, 1), (false, 3)] {
+        let (file, es) = clear_ps(mpeg1, stuffing);
+        let path = temp_path("clear");
+        std::fs::write(&path, &file).unwrap();
+        let got = read_all(&path);
+        let _ = std::fs::remove_file(&path);
+        let (_, frames) = got.unwrap_or_else(|e| panic!("mpeg1={mpeg1} stuffing={stuffing}: {e}"));
+        let video: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.track == 0)
+            .flat_map(|f| f.data.iter().copied())
+            .collect();
+        assert_eq!(video, es, "mpeg1={mpeg1} stuffing={stuffing}");
+    }
+}
+
 // Design §4: "A file with no pack start code in its head is not a PS; it fails with E6009".
 #[test]
 fn a_file_with_no_pack_is_no_streams() {
