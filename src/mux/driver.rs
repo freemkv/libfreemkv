@@ -3608,5 +3608,35 @@ mod tests {
             Arc::new(NoopEvents),
         );
         assert_eq!(code(iso), e7022);
+
+        // Session over an AACS disc with no banked key (review B1): BD-TS stops at the first
+        // AACS unit; HD DVD refuses up front (it is never probed, KU §2.6).
+        for format in [crate::DiscFormat::Uhd, crate::DiscFormat::HdDvd] {
+            let (_, title, _) = keyed_live(key);
+            let mut disc = aacs_session_disc(title, key);
+            disc.aacs.as_mut().unwrap().unit_keys.clear();
+            disc.capacity_sectors = 16;
+            disc.format = format;
+            if format == crate::DiscFormat::HdDvd {
+                disc.content_format = crate::ContentFormat::MpegPs;
+            }
+            let reader = Box::new(AacsUnitReader {
+                unit: encrypted_audio_unit(&key),
+                capacity: 16,
+            });
+            let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
+            let r = mux_with_keys(
+                MuxSource::Session {
+                    session: &mut session,
+                    title_index: 0,
+                },
+                None,
+                "null://",
+                &keyed_opts(),
+                &Halt::new(),
+                Arc::new(NoopEvents),
+            );
+            assert_eq!(code(r), e7022, "{format:?}");
+        }
     }
 }
