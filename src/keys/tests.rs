@@ -1843,3 +1843,22 @@ fn single_unit_rule_never_keys_a_piece_with_no_readable_probe() {
         "never K1 over K2's ciphertext"
     );
 }
+
+/// KS-1 [BD] §3.10.1: "encryption is applied to every Aligned Unit in the file" — each clip
+/// file keeps its own unit grid. `keyless_for` merges only overlapping extents; adjacent
+/// clips stay separate spans, each anchored at its own start.
+#[test]
+fn keyless_set_keeps_adjacent_clips_on_their_own_grids() {
+    let mut title = DiscTitle::empty();
+    title.extents = [(100, 31), (131, 30), (140, 6)]
+        .iter()
+        .map(|&(start_lba, sector_count)| Extent {
+            start_lba,
+            sector_count,
+        })
+        .collect();
+    let set = ResolvedKeySet::keyless_for(&title, ContentFormat::BdTs);
+    assert_eq!(set.0.spans, [(100, 31, 100), (131, 30, 131)]);
+    let anchors: Vec<u64> = set.0.arrival.iter().map(|p| p.spans[0].2).collect();
+    assert_eq!(anchors, [100, 131]);
+}

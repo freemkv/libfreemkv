@@ -3658,7 +3658,13 @@ mod tests {
                 &Halt::new(),
                 Arc::new(NoopEvents),
             );
-            assert_eq!(code(r), e7022, "{format:?}");
+            let err = r.expect_err("no key, no mux");
+            assert_eq!(crate::error_code(&err), e7022, "{format:?}");
+            let text = err.to_string().to_ascii_lowercase();
+            assert!(
+                text.contains("abc"),
+                "{format:?}: E7022 names the disc: {text}"
+            );
         }
     }
 }
