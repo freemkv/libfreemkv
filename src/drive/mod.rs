@@ -1438,6 +1438,19 @@ impl Drive {
         Ok(())
     }
 
+    /// `DiscSession::finish(Finish::Eject)` (§2.4 row 2): the ALLOW (after a Stop only
+    /// for a tray this Drive locked), then the eject. Both are clean-up CDBs, so a Stop
+    /// never refuses them; the eject is the one START STOP UNIT a Stop still admits.
+    pub(crate) fn finish_eject(&mut self) -> Result<()> {
+        self.unlock_tray();
+        // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted".
+        let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
+        let mut buf = [0u8; 0];
+        let dir = crate::scsi::DataDirection::None;
+        self.exec_cleanup(&eject_cdb, dir, &mut buf, 30_000, CleanupCtx::FinishEject)?;
+        Ok(())
+    }
+
     // START STOP UNIT with START=1, LoEj=0 (never ejects). Only Halted propagates;
     // a rejected START just leaves wait_ready polling.
     fn start_unit(&mut self) -> Result<()> {

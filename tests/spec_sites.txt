@@ -24,6 +24,7 @@ src/drive/mod.rs	lock_tray	SS-5
 src/drive/mod.rs	unlock_tray	SS-5
 src/drive/allow.rs	is_eject	SS-6
 src/drive/mod.rs	eject	SS-6
+src/drive/mod.rs	finish_eject	SS-6
 src/drive/mod.rs	start_unit	SS-6
 src/drive/mod.rs	note_ledger	SS-7
 src/keys/resolve.rs	resolve_observed	KS-14

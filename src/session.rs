@@ -161,6 +161,9 @@ pub struct DiscSession {
     /// The op token from [`Self::open_with`] (stop design §2.2): every CDB, the scan and
     /// the key resolution observe it. `None` for [`Self::open`].
     halt: Option<Halt>,
+    /// The op's progress from [`Self::attach_progress`] (T29): the drive's CDBs and each
+    /// key-source call report to it.
+    progress: Option<Progress>,
 }
 
 // Overlay the session's key material onto `opts` without clobbering what the
@@ -222,18 +225,28 @@ impl DiscSession {
         spec: KeySpec,
         halt: Option<Halt>,
     ) -> Result<DiscSession> {
-        let _ = &halt;
         // Advisory bring-up — non-fatal in every consumer today. Preserve that: log
         // and continue, never propagate (CLI discarded these, autorip warned) — the
         // advisory semantics are preserved identically; only the sink moved here.
-        if let Err(e) = drive.wait_ready() {
-            tracing::warn!(target: "freemkv::session", error = %e, "wait_ready advisory failed (continuing)");
+        type Step = fn(&mut Drive) -> Result<()>;
+        let steps: [(&str, Step); 3] = [
+            ("wait_ready", Drive::wait_ready),
+            ("init", Drive::init),
+            ("probe_disc", Drive::probe_disc),
+        ];
+        for (step, run) in steps {
+            match run(&mut drive) {
+                // Stop is always honoured: dropping `drive` closes the handle.
+                Err(Error::Halted) if halt.is_some() => return Err(Error::Halted),
+                Err(e) => {
+                    tracing::warn!(target: "freemkv::session", step, error = %e, "advisory bring-up step failed (continuing)")
+                }
+                Ok(()) => {}
+            }
         }
-        if let Err(e) = drive.init() {
-            tracing::warn!(target: "freemkv::session", error = %e, "init advisory failed (continuing)");
-        }
-        if let Err(e) = drive.probe_disc() {
-            tracing::warn!(target: "freemkv::session", error = %e, "probe_disc advisory failed (continuing)");
+        // The final check (§6 ST-L3): a Stop after the last CDB still ends the open.
+        if let Some(h) = &halt {
+            h.check()?;
         }
 
         let device = drive.device_path().to_string();
@@ -244,7 +257,8 @@ impl DiscSession {
             disc: None,
             reader: None,
             key_fetch: None,
-            halt: None,
+            halt,
+            progress: None,
         })
     }
 
@@ -256,7 +270,10 @@ impl DiscSession {
     /// Report the op's forward progress to `p` (T29): every drive CDB (as
     /// [`Drive::attach_progress`]) and every key-source call in [`Self::resolve_key_set`].
     pub fn attach_progress(&mut self, p: &Progress) {
-        let _ = p;
+        if let Some(drive) = self.drive.as_mut() {
+            drive.attach_progress(p);
+        }
+        self.progress = Some(p.clone());
     }
 
     /// Fast disc identification — name/format only, no playlist parse. Wraps
@@ -292,7 +309,18 @@ impl DiscSession {
     /// wins), and a Stop after the scan's last CDB still ends it `Halted`, storing no
     /// [`Disc`].
     pub fn scan_with(&mut self, opts: ScanOptions) -> Result<&Disc> {
-        self.scan(opts)
+        let opts = forward_key_material(&mut self.spec, opts);
+        let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
+            path: self.device.clone(),
+        })?;
+        // `Disc::scan` applies the alias rule and checks the drive's token last (LS6).
+        let disc = Disc::scan(drive, &opts)?;
+        // The session's own final check: a Stop on the op token stores no `Disc`.
+        if let Some(h) = &self.halt {
+            h.check()?;
+        }
+        self.disc = Some(disc);
+        Ok(self.disc.as_ref().expect("disc just stored"))
     }
 
     /// End the session on the handle it holds (stop design §2.5), never re-opening the
@@ -303,9 +331,24 @@ impl DiscSession {
     ///
     /// [`Error::DeviceNotReady`] for `Unlock`/`Eject` when the drive has left the session;
     /// the eject's own error.
-    pub fn finish(self, how: Finish) -> Result<()> {
-        let _ = how;
-        Ok(())
+    pub fn finish(mut self, how: Finish) -> Result<()> {
+        let Some(mut drive) = self.drive.take() else {
+            return match how {
+                Finish::Release => Ok(()),
+                Finish::Unlock | Finish::Eject => Err(Error::DeviceNotReady {
+                    path: self.device.clone(),
+                }),
+            };
+        };
+        match how {
+            // `Drive::drop` sends the ALLOW for a tray this Drive locked.
+            Finish::Release => Ok(()),
+            Finish::Unlock => {
+                drive.unlock_tray();
+                Ok(())
+            }
+            Finish::Eject => drive.finish_eject(),
+        }
     }
 
     /// Resolve and bank the scanned disc's base AACS unit keys from the
@@ -353,6 +396,13 @@ impl DiscSession {
         sources: &KeySourceFactory,
         opts: crate::keys::ResolveKeysOptions,
     ) -> Result<crate::keys::KeyResolution> {
+        // Under `open_with` the session's op token governs the resolve too (§2.12).
+        let (op, progress) = (self.halt.clone(), self.progress.clone());
+        if let Some(h) = &op {
+            h.check()?;
+        }
+        let mut opts = opts;
+        opts.halt = opts.halt.or(op.as_ref());
         let Some(disc) = self.disc.as_ref() else {
             return Err(Error::DeviceNotReady {
                 path: self.device.clone(),
@@ -367,7 +417,12 @@ impl DiscSession {
                 });
             }
         };
-        crate::keys::ResolvedKeySet::resolve(disc, reader, scope, sources, opts)
+        match &progress {
+            Some(p) => crate::keys::ResolvedKeySet::resolve_with_progress(
+                disc, reader, scope, sources, opts, p,
+            ),
+            None => crate::keys::ResolvedKeySet::resolve(disc, reader, scope, sources, opts),
+        }
     }
 
     /// The read-time AACS fetch closure retained by [`Self::resolve_keys`], for a
@@ -467,6 +522,7 @@ impl DiscSession {
             reader,
             key_fetch,
             halt: None,
+            progress: None,
         }
     }
 
@@ -484,6 +540,7 @@ impl DiscSession {
             reader: None,
             key_fetch: None,
             halt: None,
+            progress: None,
         }
     }
 }
