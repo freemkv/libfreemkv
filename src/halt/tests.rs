@@ -135,8 +135,11 @@ fn halt_recv_send_timeout_return_on_cancel() {
     let (r, took) = cancel_during(&h, WINDOW, move || {
         h2.send_timeout(&tx, "frame".to_string(), Duration::from_secs(10))
     });
-    assert_eq!(r, Err("frame".to_string()));
-    assert!(h.is_cancelled());
+    assert_eq!(r, Err(Halted("frame".to_string())));
+    assert!(
+        matches!(Error::from(Halted(())), Error::Halted),
+        "`?` gives Error::Halted"
+    );
     assert!(took <= Duration::from_secs(1));
 }
 
@@ -159,18 +162,24 @@ fn recv_send_timeout_without_cancel() {
     assert!(t.elapsed() < SLACK, "a gone sender ends the wait at once");
 
     let (stx, srx) = mpsc::sync_channel::<u32>(1);
-    assert_eq!(h.send_timeout(&stx, 1, WINDOW), Ok(()));
+    assert_eq!(h.send_timeout(&stx, 1, WINDOW), Ok(SendOutcome::Sent));
     let t = Instant::now();
-    assert_eq!(h.send_timeout(&stx, 2, WINDOW), Err(2));
+    assert_eq!(
+        h.send_timeout(&stx, 2, WINDOW),
+        Ok(SendOutcome::TimedOut(2))
+    );
     assert!(t.elapsed() >= WINDOW && t.elapsed() < WINDOW + SLACK);
     drop(srx);
-    assert_eq!(h.send_timeout(&stx, 3, Duration::from_secs(10)), Err(3));
+    assert_eq!(
+        h.send_timeout(&stx, 3, Duration::from_secs(10)),
+        Ok(SendOutcome::Disconnected(3))
+    );
 
     h.cancel();
     let (tx, rx) = mpsc::channel::<u32>();
     tx.send(9).unwrap();
     assert!(matches!(h.recv_timeout(&rx, WINDOW), Err(Error::Halted)));
-    assert_eq!(h.send_timeout(&stx, 4, WINDOW), Err(4));
+    assert_eq!(h.send_timeout(&stx, 4, WINDOW), Err(Halted(4)));
 }
 
 #[cfg(feature = "rip")]
@@ -178,12 +187,18 @@ fn recv_send_timeout_without_cancel() {
 fn crossbeam_channels_are_timed() {
     let h = Halt::new();
     let (tx, rx) = crossbeam_channel::bounded::<u32>(1);
-    assert_eq!(h.send_timeout(&tx, 1, WINDOW), Ok(()));
-    assert_eq!(h.send_timeout(&tx, 2, WINDOW), Err(2));
+    assert_eq!(h.send_timeout(&tx, 1, WINDOW), Ok(SendOutcome::Sent));
+    assert_eq!(h.send_timeout(&tx, 2, WINDOW), Ok(SendOutcome::TimedOut(2)));
     assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Recv::Item(1));
     assert_eq!(h.recv_timeout(&rx, WINDOW).unwrap(), Recv::TimedOut);
-    assert_eq!(h.send_timeout(&tx, 3, Duration::ZERO), Ok(()));
-    assert_eq!(h.send_timeout(&tx, 4, Duration::ZERO), Err(4));
+    assert_eq!(
+        h.send_timeout(&tx, 3, Duration::ZERO),
+        Ok(SendOutcome::Sent)
+    );
+    assert_eq!(
+        h.send_timeout(&tx, 4, Duration::ZERO),
+        Ok(SendOutcome::TimedOut(4))
+    );
     assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::Item(3));
     assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::TimedOut);
     drop(tx);
@@ -200,8 +215,14 @@ fn zero_budget_makes_one_attempt() {
     let h = Halt::new();
     let (tx, rx) = mpsc::sync_channel::<u32>(1);
     let t = Instant::now();
-    assert_eq!(h.send_timeout(&tx, 1, Duration::ZERO), Ok(()));
-    assert_eq!(h.send_timeout(&tx, 2, Duration::ZERO), Err(2));
+    assert_eq!(
+        h.send_timeout(&tx, 1, Duration::ZERO),
+        Ok(SendOutcome::Sent)
+    );
+    assert_eq!(
+        h.send_timeout(&tx, 2, Duration::ZERO),
+        Ok(SendOutcome::TimedOut(2))
+    );
     assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::Item(1));
     assert_eq!(h.recv_timeout(&rx, Duration::ZERO).unwrap(), Recv::TimedOut);
     assert!(t.elapsed() < SLACK);
@@ -224,6 +245,25 @@ fn disconnected_unbounded_recv_returns_at_once() {
         Recv::Disconnected
     );
     assert_eq!(h.recv_timeout(&rx, WAIT_SLICE).unwrap(), Recv::Disconnected);
+    assert!(t.elapsed() < SLACK, "{:?}", t.elapsed());
+}
+
+/// A gone receiver with an unbounded wait returns `Disconnected` at once (item back),
+/// and so does every repeat, so a caller looping on it exits instead of spinning.
+#[test]
+fn disconnected_unbounded_send_returns_at_once() {
+    let h = Halt::new();
+    let (tx, rx) = mpsc::sync_channel::<u32>(0);
+    let worker = std::thread::spawn(move || {
+        let _rx = rx;
+        panic!("consumer died");
+    });
+    assert!(worker.join().is_err());
+    let t = Instant::now();
+    let r = h.send_timeout(&tx, 7, Duration::MAX);
+    assert_eq!(r, Ok(SendOutcome::Disconnected(7)));
+    let r = h.send_timeout(&tx, 8, WAIT_SLICE);
+    assert_eq!(r, Ok(SendOutcome::Disconnected(8)));
     assert!(t.elapsed() < SLACK, "{:?}", t.elapsed());
 }
 
@@ -589,7 +629,7 @@ fn every_halt_aware_wait_wakes_within_a_slice() {
         let h2 = h.clone();
         let (r, took) = cancel_during(h, LT7_CANCEL_AFTER, move || h2.send_timeout(&tx, 1, BUDGET));
         drop(rx);
-        assert_eq!(r, Err(1));
+        assert_eq!(r, Err(Halted(1)));
         took
     });
     median_wake("join_within", |h| {

@@ -139,27 +139,29 @@ impl Halt {
 
     /// Send `v` on `tx` within `d`, checking the token every [`WAIT_SLICE`].
     ///
-    /// `Ok(())` once sent. On a cancel, `d` passing, or the receiver gone, the item
-    /// comes back as `Err(v)`; the caller tells a stop apart with
-    /// [`is_cancelled`](Self::is_cancelled), as with `Pipeline::send_with_halt`.
-    /// At least one attempt is always made, so a zero `d` still sends into room.
+    /// `SendOutcome::Sent`; `TimedOut(v)` once `d` passes; `Disconnected(v)` at once
+    /// when the receiver is gone, so a caller looping on it cannot spin;
+    /// `Err(Halted(v))` on cancel, checked before each slice (`?` turns it into
+    /// `Error::Halted`). The item always comes back. At least one attempt is always
+    /// made, so a zero `d` still sends into room.
     pub fn send_timeout<C: TimedSend>(
         &self,
         tx: &C,
         v: C::Item,
         d: Duration,
-    ) -> std::result::Result<(), C::Item> {
+    ) -> std::result::Result<SendOutcome<C::Item>, Halted<C::Item>> {
         let end = Instant::now().checked_add(d);
         let mut pending = v;
         loop {
             if self.is_cancelled() {
-                return Err(pending);
+                return Err(Halted(pending));
             }
             let slice = remaining(end).unwrap_or(Duration::ZERO);
             match tx.send_slice(pending, slice) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(SendOutcome::Sent),
                 Err(SendFail::Timeout(back)) if remaining(end).is_some() => pending = back,
-                Err(SendFail::Timeout(back) | SendFail::Disconnected(back)) => return Err(back),
+                Err(SendFail::Timeout(back)) => return Ok(SendOutcome::TimedOut(back)),
+                Err(SendFail::Disconnected(back)) => return Ok(SendOutcome::Disconnected(back)),
             }
         }
     }
@@ -192,7 +194,28 @@ pub enum Recv<T> {
     Disconnected,
 }
 
-/// A failed bounded send; the item always comes back.
+/// How [`Halt::send_timeout`] ended short of a stop; unsent items come back.
+/// (Not named `Send`: that would shadow the marker trait for glob importers.)
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendOutcome<T> {
+    Sent,
+    /// No room within the budget.
+    TimedOut(T),
+    /// The receiver is gone: the item can never be delivered.
+    Disconnected(T),
+}
+
+/// A send stopped by a cancel, carrying the unsent item back.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Halted<T>(pub T);
+
+impl<T> From<Halted<T>> for Error {
+    fn from(_: Halted<T>) -> Self {
+        Error::Halted
+    }
+}
+
+/// A failed bounded send attempt ([`TimedSend::send_slice`]); the item comes back.
 #[derive(Debug)]
 pub enum SendFail<T> {
     Timeout(T),
