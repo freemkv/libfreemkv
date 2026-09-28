@@ -165,8 +165,15 @@ impl Run<'_> {
         let ctx = DiscInputsCtx::new(&inputs);
         let start = self.clock.now();
         let mut wait = RETRY_FIRST;
+        let mut attempted = false;
         loop {
-            self.check_halt()?;
+            if let Err(stop) = self.check_halt() {
+                if attempted {
+                    self.unanswered(i);
+                }
+                return Err(stop);
+            }
+            attempted = true;
             let src = &self.sources[i];
             let who = src.label().to_string();
             let answer = if forensic {
@@ -225,14 +232,7 @@ impl Run<'_> {
                         );
                         let pause = wait.min(NO_ANSWER_WINDOW - waited);
                         if let Err(stop) = self.clock.sleep(pause, self.halt) {
-                            // A request went out (unanswered): the trace keeps it (minor 1).
-                            self.trace.keys.push(KeyStep {
-                                who,
-                                path: Vec::new(),
-                                outcome: KeyOutcome::NoKey,
-                                matched_entry: None,
-                                store_entries: None,
-                            });
+                            self.unanswered(i);
                             return Err(stop);
                         }
                         wait = (wait * 2).min(RETRY_CAP);
@@ -250,6 +250,18 @@ impl Run<'_> {
                 }
             }
         }
+    }
+
+    // A request to source `i` went out and a Stop ended its retries with no answer: the
+    // trace keeps it, so a caller counting requests sees one was made.
+    fn unanswered(&mut self, i: usize) {
+        self.trace.keys.push(KeyStep {
+            who: self.sources[i].label().to_string(),
+            path: Vec::new(),
+            outcome: KeyOutcome::NoKey,
+            matched_entry: None,
+            store_entries: None,
+        });
     }
 
     // KU §2.3 step 9, rules 1 and 3–5, against the current pool. `Ask` means rule 2 applies:
