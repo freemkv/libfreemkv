@@ -76,12 +76,16 @@ pub fn ensure_image_debussable(reader: &dyn SectorSource) -> Result<()> {
     unmapped_error(reader.unmapped_stream_files())
 }
 
-/// `Err(`[`Error::BusStreamUnmapped`]`)` naming every file in `unmapped`, or `Ok` when empty.
+/// `Err(`[`Error::BusStreamUnmapped`]`)` naming every file in `unmapped` as `path (cause)`,
+/// or `Ok` when empty.
 pub(crate) fn unmapped_error(unmapped: &[UnmappedStreamFile]) -> Result<()> {
     if unmapped.is_empty() {
         return Ok(());
     }
-    let files: Vec<&str> = unmapped.iter().map(|u| u.path.as_str()).collect();
+    let files: Vec<String> = unmapped
+        .iter()
+        .map(|u| format!("{} ({})", u.path, u.cause))
+        .collect();
     Err(Error::BusStreamUnmapped {
         files: files.join(", "),
     })
@@ -504,23 +508,29 @@ impl<S: SectorSource> SectorSource for BusRemovalSectorSource<S> {
     }
 }
 
+// Shared across every module's "wrappers forward `unmapped_stream_files`" test.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::aacs::content::encrypt_bus;
 
-    // A source whose own bus stage reports `0` as unmapped.
-    struct Reports(Vec<UnmappedStreamFile>);
+    /// A leaf source reporting a fixed unmapped list; reads return zeroed sectors.
+    pub(crate) struct Reports(pub Vec<UnmappedStreamFile>);
+
     impl SectorSource for Reports {
-        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
-            Ok(0)
+        fn capacity_sectors(&self) -> u32 {
+            1 << 20
+        }
+        fn read_sectors(&mut self, _: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            let n = count as usize * SECTOR_BYTES;
+            buf[..n].fill(0);
+            Ok(n)
         }
         fn unmapped_stream_files(&self) -> &[UnmappedStreamFile] {
             &self.0
         }
     }
 
-    fn m2ts1() -> UnmappedStreamFile {
+    pub(crate) fn m2ts1() -> UnmappedStreamFile {
         UnmappedStreamFile::new(
             "/BDMV/STREAM/00001.m2ts".into(),
             40,
@@ -528,13 +538,27 @@ mod tests {
         )
     }
 
-    // Through a generic bound, so the forwarding impls (not the vtable) answer.
-    fn unmapped_paths<S: SectorSource>(s: &S) -> Vec<String> {
+    /// Through a generic bound, so the forwarding impl (not the vtable) answers.
+    pub(crate) fn unmapped_paths<S: SectorSource + ?Sized>(s: &S) -> Vec<String> {
         s.unmapped_stream_files()
             .iter()
             .map(|u| u.path.clone())
             .collect()
     }
+
+    /// Every wrapper must relay its inner list, or an image built on it drops the
+    /// refusal. New SectorSource wrapper → assert it here.
+    pub(crate) fn assert_forwards<S: SectorSource>(over_reports: S) {
+        assert_eq!(unmapped_paths(&over_reports), ["/BDMV/STREAM/00001.m2ts"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aacs::content::encrypt_bus;
+
+    use super::test_support::{Reports, m2ts1, unmapped_paths};
 
     // A wrapper that drops the list would reopen the image path to bus-encrypted bytes.
     #[test]
@@ -579,7 +603,7 @@ mod tests {
         let err = ensure_image_debussable(&Reports(vec![m2ts1(), ssif])).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "E6021: /BDMV/STREAM/00001.m2ts, /BDMV/STREAM/SSIF/00003.ssif"
+            "E6021: /BDMV/STREAM/00001.m2ts (E6016), /BDMV/STREAM/SSIF/00003.ssif (E6016)"
         );
     }
 

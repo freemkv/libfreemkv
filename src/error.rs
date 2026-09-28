@@ -517,7 +517,7 @@ pub enum Error {
         want: u64,
     },
     /// A whole-disc image read would carry bus-encrypted stream-file sectors as if
-    /// plaintext: `files` (comma-separated disc paths) could not be located to de-bus.
+    /// plaintext: `files` (comma-separated `path (cause)`) could not be located to de-bus.
     BusStreamUnmapped {
         files: String,
     },

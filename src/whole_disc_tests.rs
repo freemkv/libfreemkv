@@ -709,3 +709,11 @@ mod spec_guards {
         assert!(map.iter().any(|&(s, _, slot, _)| s <= 600 && slot == 1));
     }
 }
+
+// UnitAligned wraps the decrypting reader for whole-disc/image copies; it must
+// relay the inner source's unmapped list (an image built on it would else drop it).
+#[test]
+fn unit_aligned_forwards_unmapped_stream_files() {
+    use crate::sector::bus_removal::test_support::{Reports, assert_forwards, m2ts1};
+    assert_forwards(UnitAligned::new(Reports(vec![m2ts1()]), Vec::new()));
+}

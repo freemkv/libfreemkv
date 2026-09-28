@@ -582,6 +582,129 @@ pub(crate) struct StreamScan {
     pub(crate) unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
 }
 
+// File Entry re-reads: at most this many per file, and per scan in all (a count, not a
+// timeout: a drive in its fast-fail state answers every read at once).
+const FE_REREADS_PER_FILE: u32 = 2;
+const FE_REREADS_PER_SCAN: u32 = 4;
+// The engine's FAIL_PAUSE_SECS: let the drive settle before each re-read.
+const FE_REREAD_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+// The re-read allowance and pause for one /BDMV/STREAM walk; `halt` ends a pause early.
+pub(crate) struct FeRereads {
+    left: u32,
+    pause: std::time::Duration,
+    halt: Option<crate::halt::Halt>,
+}
+
+impl FeRereads {
+    pub(crate) fn new(halt: Option<crate::halt::Halt>) -> Self {
+        Self::with_pause(halt, FE_REREAD_PAUSE)
+    }
+
+    fn with_pause(halt: Option<crate::halt::Halt>, pause: std::time::Duration) -> Self {
+        Self {
+            left: FE_REREADS_PER_SCAN,
+            pause,
+            halt,
+        }
+    }
+
+    // Sleep `pause` in short slices; a Stop during it is `Halted`.
+    fn pause(&self) -> Result<()> {
+        let end = std::time::Instant::now() + self.pause;
+        loop {
+            if self.halt.as_ref().is_some_and(|h| h.is_cancelled()) {
+                return Err(Error::Halted);
+            }
+            let now = std::time::Instant::now();
+            if now >= end {
+                return Ok(());
+            }
+            std::thread::sleep((end - now).min(std::time::Duration::from_millis(50)));
+        }
+    }
+}
+
+// Sends every read as a recovery read (FUA on re-reads, past the drive cache) and notes a
+// failed read and whether its sense is the wedge family, so a parse failure is not re-read.
+struct RecoveryReads<'a> {
+    inner: &'a mut dyn SectorSource,
+    fua: bool,
+    read_failed: bool,
+    wedged: bool,
+}
+
+impl<'a> RecoveryReads<'a> {
+    fn new(inner: &'a mut dyn SectorSource, fua: bool) -> Self {
+        Self {
+            inner,
+            fua,
+            read_failed: false,
+            wedged: false,
+        }
+    }
+}
+
+impl SectorSource for RecoveryReads<'_> {
+    fn capacity_sectors(&self) -> u32 {
+        self.inner.capacity_sectors()
+    }
+    fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], _r: bool) -> Result<usize> {
+        let got = self.inner.read_sectors_fua(lba, n, buf, true, self.fua);
+        if let Err(e) = &got
+            && !matches!(e, Error::Halted)
+        {
+            self.read_failed = true;
+            self.wedged |= e.scsi_sense().is_some_and(|s| {
+                crate::scsi::SenseFamily::from_sense_key(s.sense_key).is_wedge_family()
+            });
+        }
+        got
+    }
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.inner.unmapped_stream_files()
+    }
+}
+
+// A read fault a re-read may clear: not a dead transport, a gone source or an image's end.
+fn rereadable(e: &Error) -> bool {
+    !(e.is_scsi_transport_failure()
+        || e.is_source_terminated()
+        || matches!(e, Error::Halted | Error::ImageEndsBeforeRead { .. }))
+}
+
+// A File Entry's extents. A media read fault gets up to FE_REREADS_PER_FILE recovery+FUA
+// re-reads from the scan's budget, each after a Stop-aware pause; wedge-family sense
+// (HARDWARE ERROR / ILLEGAL REQUEST, the BU40N fast-fail state) gets none.
+fn file_entry_extents(
+    reader: &mut dyn SectorSource,
+    udf_fs: &udf::UdfFs,
+    icb: u32,
+    rereads: &mut FeRereads,
+) -> Result<Vec<udf::AbsExtent>> {
+    let mut first = RecoveryReads::new(reader, false);
+    let mut err = match udf_fs.extents_abs_at(&mut first, icb) {
+        Ok(exts) => return Ok(exts),
+        Err(e) if !first.read_failed || first.wedged || !rereadable(&e) => return Err(e),
+        Err(e) => e,
+    };
+    for _ in 0..FE_REREADS_PER_FILE {
+        if rereads.left == 0 {
+            break;
+        }
+        rereads.left -= 1;
+        tracing::info!(target: "freemkv::scan", icb, error = %err, "File Entry read failed; re-reading");
+        rereads.pause()?;
+        let mut again = RecoveryReads::new(reader, true);
+        match udf_fs.extents_abs_at(&mut again, icb) {
+            Ok(exts) => return Ok(exts),
+            Err(e) if !again.read_failed || again.wedged || !rereadable(&e) => return Err(e),
+            Err(e) => err = e,
+        }
+    }
+    Err(err)
+}
+
 // The whole-disc bus map: every stream file, plus title extents no stream file
 // covers as content of unknown unit alignment (always de-bussed).
 fn bus_map(files: StreamFiles, titles: &[DiscTitle]) -> crate::sector::bus_removal::BusMap {
@@ -1887,7 +2010,8 @@ impl Disc {
         opts: &ScanOptions,
     ) -> Result<Self> {
         let bus_key = aacs.as_ref().and_then(|(c, b)| encrypt::bus_key(c, b));
-        let streams = Self::bus_stream_files(&mut buffered, &udf_fs, bus_key.is_some())?;
+        let rereads = FeRereads::new(opts.halt.clone());
+        let streams = Self::bus_stream_files(&mut buffered, &udf_fs, bus_key.is_some(), rereads)?;
 
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
         let disc = Self::finish(&mut buffered, capacity, udf_fs, aacs, opts)?;
@@ -1947,7 +2071,7 @@ impl Disc {
     /// file's extents cannot be read: a map that silently omits one is not this map.
     pub fn stream_content_ranges(reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
         let udf_fs = udf::read_filesystem(reader)?;
-        let scan = Self::stream_file_extents(reader, &udf_fs)?;
+        let scan = Self::stream_file_extents(reader, &udf_fs, FeRereads::new(None))?;
         crate::sector::bus_removal::unmapped_error(&scan.unmapped)?;
         Ok(crate::sector::bus_removal::BusMap::new(scan.files, &[]).covered_ranges())
     }
@@ -1958,11 +2082,12 @@ impl Disc {
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         debus: bool,
+        rereads: FeRereads,
     ) -> Result<StreamScan> {
         if !debus {
             return Ok(StreamScan::default());
         }
-        Self::stream_file_extents(reader, udf_fs)
+        Self::stream_file_extents(reader, udf_fs, rereads)
     }
 
     /// Extents, in file order, of every file under /BDMV/STREAM (the AACS Clip AV
@@ -1975,6 +2100,7 @@ impl Disc {
     pub(crate) fn stream_file_extents(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
+        mut rereads: FeRereads,
     ) -> Result<StreamScan> {
         let mut out = StreamScan::default();
         let mut stack: Vec<(&udf::DirEntry, String)> = udf_fs
@@ -1989,7 +2115,7 @@ impl Disc {
                     stack.push((e, path));
                     continue;
                 }
-                match udf_fs.extents_abs_at(reader, e.meta_lba) {
+                match file_entry_extents(reader, udf_fs, e.meta_lba, &mut rereads) {
                     Ok(exts) => out.files.push(
                         exts.iter()
                             .filter(|x| x.len > 0)
@@ -2940,6 +3066,9 @@ impl<'a> FileReadAhead<'a> {
 }
 
 impl SectorSource for FileReadAhead<'_> {
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.inner.unmapped_stream_files()
+    }
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -9201,10 +9330,8 @@ mod tests {
 
     // ── whole-disc bus-removal gate ───────────────────────────────────────
     // Verbatim quotes, AACS Blu-ray Disc Pre-recorded Book, Final Rev 0.953 (subscript 1₂ as 1b).
-    const SPEC_BD_3_7_BEF: &str = "AACS BD Pre-recorded Book 0.953 §3.7: \"If the Bus Encryption \
-        Enabled (BEE) flag in the Content Certificate is set to 1b, the BEF shall be set to 1b for \
-        all the sectors that correspond to the Aligned Unit with Copy_permission_indicator set to \
-        11b of the Clip AV stream files under \\BDMV\\STREAM directory.\"";
+    // The registered quotes (`crate::spec`, checked against tests/spec_quotes.txt).
+    const SPEC_BD_3_7_BEF: &str = crate::spec::keys::KS_18_BUS_ENCRYPTION_FLAG.text;
     const SPEC_BD_3_7_NOTE: &str = "AACS BD Pre-recorded Book 0.953 §3.7 (Note): \"PC Host \
         shall decrypt bus-encrypted Clip AV stream file and hand it over to the application.\"";
     // BD tree: two m2ts (only one in a title), an SSIF, a clear index.bdmv, and
@@ -9278,7 +9405,7 @@ mod tests {
         let (mut mem, udf) = bus_fixture(0x80);
         let mut feature = DiscTitle::empty();
         feature.extents = vec![ext(PART_START + 1_000, 3)];
-        let stream = Disc::stream_file_extents(&mut mem, &udf).unwrap();
+        let stream = Disc::stream_file_extents(&mut mem, &udf, no_pause()).unwrap();
         assert_eq!(
             bus_map(stream.files, &[feature]).covered_ranges(),
             vec![
@@ -9335,8 +9462,7 @@ mod tests {
     const SPEC_BD_8_1_3: &str = "AACS BD Pre-recorded Book 0.953 §8.1.3: \"When the Clip AV \
         stream files are bus-encrypted as defined in Secion 3.7 of this specification, the \
         corresponding Stereoscopic Interleaved files are also bus-encrypted.\"";
-    const SPEC_BD_3_10_1: &str = "AACS BD Pre-recorded Book 0.953 §3.10.1: \"The total size \
-        of an Aligned Unit is 6144 bytes, which is equal to the size of 3 logical sectors.\"";
+    const SPEC_BD_3_10_1: &str = crate::spec::keys::KS_2_ALIGNED_UNIT.text;
 
     fn unmapped_paths(scan: &StreamScan) -> Vec<&str> {
         scan.unmapped.iter().map(|u| u.path.as_str()).collect()
@@ -9352,8 +9478,10 @@ mod tests {
             Err(e @ Error::BusStreamUnmapped { .. }) => assert_eq!(
                 e.to_string(),
                 format!(
-                    "E{}: /BDMV/STREAM/00002.m2ts",
-                    crate::error::E_BUS_STREAM_UNMAPPED
+                    "E{}: /BDMV/STREAM/00002.m2ts (E{}: {})",
+                    crate::error::E_BUS_STREAM_UNMAPPED,
+                    crate::error::E_DISC_READ,
+                    crate::udf::fixture::PART_START + 41
                 ),
                 "{SPEC_BD_3_7_NOTE}"
             ),
@@ -9370,7 +9498,8 @@ mod tests {
         use crate::udf::fixture::PART_START;
         let (mut mem, udf) = bus_fixture(0x80);
         corrupt_m2ts2_icb(&mut mem);
-        let mut scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_NOTE);
+        let mut scan =
+            Disc::stream_file_extents(&mut mem, &udf, no_pause()).expect(SPEC_BD_3_7_NOTE);
         assert_eq!(
             unmapped_paths(&scan),
             ["/BDMV/STREAM/00002.m2ts"],
@@ -9403,7 +9532,8 @@ mod tests {
         for (icb, name) in [(40u32, "00001.m2ts"), (41, "00002.m2ts")] {
             let (mut mem, udf) = bus_fixture(0x80);
             mem.put_bytes(PART_START + icb, &[0u8; 2048]);
-            let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_BEF);
+            let scan =
+                Disc::stream_file_extents(&mut mem, &udf, no_pause()).expect(SPEC_BD_3_7_BEF);
             let want = format!("/BDMV/STREAM/{name}");
             assert_eq!(unmapped_paths(&scan), [want.as_str()], "{SPEC_BD_3_7_BEF}");
             assert_eq!(scan.files.len(), 2, "{SPEC_BD_3_7_BEF}");
@@ -9417,7 +9547,7 @@ mod tests {
         use crate::udf::fixture::PART_START;
         let (mut mem, udf) = bus_fixture(0x80);
         mem.put_bytes(PART_START + 42, &[0u8; 2048]);
-        let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_8_1_3);
+        let scan = Disc::stream_file_extents(&mut mem, &udf, no_pause()).expect(SPEC_BD_8_1_3);
         assert_eq!(
             unmapped_paths(&scan),
             ["/BDMV/STREAM/SSIF/00003.ssif"],
@@ -9440,7 +9570,7 @@ mod tests {
                 sense: None,
             },
         };
-        let scan = Disc::stream_file_extents(&mut r, &udf).expect(SPEC_BD_3_7_NOTE);
+        let scan = Disc::stream_file_extents(&mut r, &udf, no_pause()).expect(SPEC_BD_3_7_NOTE);
         assert_eq!(
             unmapped_paths(&scan),
             ["/BDMV/STREAM/00001.m2ts"],
@@ -9454,6 +9584,228 @@ mod tests {
         assert_eq!(scan.unmapped[0].cause, fault.to_string());
     }
 
+    // Fails reads of each of `lbas` with `err` `left` times (u32::MAX = always), logging
+    // every read of them as `(lba, recovery, fua)`.
+    struct Flaky {
+        inner: crate::udf::fixture::MemDisc,
+        lbas: Vec<u32>,
+        left: u32,
+        err: fn() -> Error,
+        reads: Vec<(u32, bool, bool)>,
+    }
+
+    impl SectorSource for Flaky {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            self.read_sectors_fua(lba, n, buf, r, false)
+        }
+        fn read_sectors_fua(
+            &mut self,
+            lba: u32,
+            n: u16,
+            buf: &mut [u8],
+            r: bool,
+            fua: bool,
+        ) -> Result<usize> {
+            if let Some(&hit) = self
+                .lbas
+                .iter()
+                .find(|&&l| (lba..lba + n as u32).contains(&l))
+            {
+                self.reads.push((hit, r, fua));
+                if self.left > 0 {
+                    self.left = self.left.saturating_sub(u32::from(self.left != u32::MAX));
+                    return Err((self.err)());
+                }
+            }
+            self.inner.read_sectors(lba, n, buf, r)
+        }
+    }
+
+    fn sense_error(sense_key: u8) -> Error {
+        Error::DiscRead {
+            sector: 0,
+            status: Some(0x02),
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key,
+                asc: 0x11,
+                ascq: 0x00,
+            }),
+        }
+    }
+
+    fn medium_error() -> Error {
+        sense_error(0x03)
+    }
+
+    // Faults on the File Entries (ICB `icbs`) of the bus fixture's stream files.
+    fn flaky(icbs: &[u32], left: u32, err: fn() -> Error) -> (Flaky, udf::UdfFs) {
+        let (inner, udf) = bus_fixture(0x80);
+        let lbas = icbs
+            .iter()
+            .map(|i| crate::udf::fixture::PART_START + i)
+            .collect();
+        let reads = Vec::new();
+        (
+            Flaky {
+                inner,
+                lbas,
+                left,
+                err,
+                reads,
+            },
+            udf,
+        )
+    }
+
+    fn flaky_m2ts1(left: u32, err: fn() -> Error) -> (Flaky, udf::UdfFs) {
+        flaky(&[40], left, err)
+    }
+
+    // The scan's re-read allowance with no pause (the 5 s pause is exercised on its own).
+    fn no_pause() -> FeRereads {
+        FeRereads::with_pause(None, std::time::Duration::ZERO)
+    }
+
+    // A transient File Entry fault is recovered on re-read 1 (recovery + FUA), not recorded.
+    #[test]
+    fn a_transient_file_entry_fault_is_recovered_on_the_first_reread() {
+        let (mut r, udf) = flaky_m2ts1(1, medium_error);
+        let scan = Disc::stream_file_extents(&mut r, &udf, no_pause()).expect("scan");
+        assert!(
+            scan.unmapped.is_empty(),
+            "{SPEC_BD_3_7_BEF}: recovered file stays mapped"
+        );
+        assert_eq!(scan.files.len(), 3);
+        let icb = crate::udf::fixture::PART_START + 40;
+        assert_eq!(
+            r.reads,
+            [(icb, true, false), (icb, true, true)],
+            "read, then FUA re-read"
+        );
+    }
+
+    // A count, not a timeout: at most FE_REREADS_PER_FILE re-reads, then the file is recorded.
+    #[test]
+    fn a_persistent_file_entry_fault_gets_two_rereads_then_is_recorded() {
+        let (mut r, udf) = flaky_m2ts1(u32::MAX, medium_error);
+        let scan = Disc::stream_file_extents(&mut r, &udf, no_pause()).expect("scan");
+        assert_eq!(unmapped_paths(&scan), ["/BDMV/STREAM/00001.m2ts"]);
+        assert_eq!(r.reads.len(), 3, "the read, then 2 re-reads");
+        assert!(r.reads[1..].iter().all(|&(_, rec, fua)| rec && fua));
+    }
+
+    // HARDWARE ERROR / ILLEGAL REQUEST is the BU40N fast-fail (wedge) state: another read
+    // only digs it deeper, so the file is recorded with no re-read.
+    #[test]
+    fn wedge_family_sense_gets_no_reread() {
+        for err in [(|| sense_error(0x04)) as fn() -> Error, || {
+            sense_error(0x05)
+        }] {
+            let (mut r, udf) = flaky_m2ts1(u32::MAX, err);
+            let scan = Disc::stream_file_extents(&mut r, &udf, no_pause()).expect("scan");
+            assert_eq!(unmapped_paths(&scan), ["/BDMV/STREAM/00001.m2ts"]);
+            assert_eq!(r.reads.len(), 1, "{:?}", err());
+        }
+    }
+
+    // The re-read budget is per scan: three bad File Entries share FE_REREADS_PER_SCAN.
+    #[test]
+    fn the_reread_budget_is_per_scan_not_per_file() {
+        let (mut r, udf) = flaky(&[40, 41, 42], u32::MAX, medium_error);
+        let scan = Disc::stream_file_extents(&mut r, &udf, no_pause()).expect("scan");
+        assert_eq!(scan.unmapped.len(), 3);
+        let rereads = r.reads.iter().filter(|&&(_, _, fua)| fua).count();
+        assert_eq!(rereads, FE_REREADS_PER_SCAN as usize, "{:?}", r.reads);
+        assert_eq!(r.reads.len(), 3 + FE_REREADS_PER_SCAN as usize);
+    }
+
+    // A Stop during the pause before a re-read ends the walk as Halted, without the re-read.
+    #[test]
+    fn a_stop_during_the_reread_pause_is_halted() {
+        let (mut r, udf) = flaky_m2ts1(u32::MAX, medium_error);
+        let halt = crate::halt::Halt::new();
+        let stop = halt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            stop.cancel();
+        });
+        let pause = std::time::Duration::from_secs(30);
+        let t0 = std::time::Instant::now();
+        let got = Disc::stream_file_extents(&mut r, &udf, FeRereads::with_pause(Some(halt), pause));
+        t.join().unwrap();
+        assert!(matches!(got, Err(Error::Halted)), "{got:?}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "the pause ends on Stop"
+        );
+        assert_eq!(r.reads.len(), 1, "no re-read after the Stop");
+    }
+
+    #[test]
+    fn the_reread_policy_is_two_per_file_four_per_scan_after_5s() {
+        assert_eq!((FE_REREADS_PER_FILE, FE_REREADS_PER_SCAN), (2, 4));
+        assert_eq!(FE_REREAD_PAUSE, std::time::Duration::from_secs(5));
+        assert_eq!(FeRereads::new(None).pause, FE_REREAD_PAUSE);
+        assert_eq!(FeRereads::new(None).left, FE_REREADS_PER_SCAN);
+    }
+
+    // A dead transport is not a media fault: no re-read, recorded at once.
+    #[test]
+    fn a_transport_failure_is_not_reread() {
+        let transport = || Error::DiscRead {
+            sector: 0,
+            status: Some(0xFF),
+            sense: None,
+        };
+        let (mut r, udf) = flaky_m2ts1(u32::MAX, transport);
+        let scan = Disc::stream_file_extents(&mut r, &udf, no_pause()).expect("scan");
+        assert_eq!(unmapped_paths(&scan), ["/BDMV/STREAM/00001.m2ts"]);
+        assert_eq!(r.reads.len(), 1);
+    }
+
+    // A Stop during a read ends the walk as Halted, not a recorded file.
+    #[test]
+    fn a_stop_during_a_file_entry_read_is_halted() {
+        let (mut r, udf) = flaky_m2ts1(u32::MAX, || Error::Halted);
+        let got = Disc::stream_file_extents(&mut r, &udf, no_pause());
+        assert!(matches!(got, Err(Error::Halted)), "{got:?}");
+        assert_eq!(r.reads.len(), 1, "Halted stops at once, no re-read");
+    }
+
+    // A File Entry that reads but does not parse gets no re-read (the bytes will not change).
+    #[test]
+    fn a_file_entry_that_reads_but_does_not_parse_is_not_reread() {
+        let (mut r, udf) = flaky_m2ts1(0, medium_error);
+        break_m2ts1_ads(&mut r.inner);
+        let scan = Disc::stream_file_extents(&mut r, &udf, no_pause()).expect("scan");
+        assert_eq!(unmapped_paths(&scan), ["/BDMV/STREAM/00001.m2ts"]);
+        assert_eq!(r.reads.len(), 1);
+    }
+
+    // A leaf serving reads from a MemDisc while reporting a fixed unmapped list.
+    struct MemReports(
+        crate::udf::fixture::MemDisc,
+        Vec<crate::sector::bus_removal::UnmappedStreamFile>,
+    );
+    impl SectorSource for MemReports {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            self.0.read_sectors(lba, n, buf, r)
+        }
+        fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+            &self.1
+        }
+    }
+
+    // FileReadAhead wraps the raw reader during title parse; it must relay the list.
+    #[test]
+    fn file_read_ahead_forwards_unmapped_stream_files() {
+        use crate::sector::bus_removal::test_support::{m2ts1, unmapped_paths};
+        let (mem, udf) = bus_fixture(0x80);
+        let mut inner = MemReports(mem, vec![m2ts1()]);
+        let ra = FileReadAhead::new(&mut inner, &udf, 40).expect("icb 40 is 00001.m2ts");
+        assert_eq!(unmapped_paths(&ra), ["/BDMV/STREAM/00001.m2ts"]);
+    }
+
     // A Stop during the stream-file walk surfaces as Halted, never as a recorded bad file.
     #[test]
     fn stream_file_extents_propagates_halted() {
@@ -9465,7 +9817,7 @@ mod tests {
                 lba,
                 err: || Error::Halted,
             };
-            let got = Disc::stream_file_extents(&mut r, &udf);
+            let got = Disc::stream_file_extents(&mut r, &udf, no_pause());
             assert!(matches!(got, Err(Error::Halted)), "ICB {lba}: {got:?}");
         }
     }
@@ -9479,7 +9831,7 @@ mod tests {
         let mut icb = build_file_icb(100, 2_000, false);
         icb[34] = 3; // ECMA-167 4/14.6.8 AD type 3 = embedded; l_ad stays nonzero
         mem.put_bytes(PART_START + 41, &icb);
-        let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_10_1);
+        let scan = Disc::stream_file_extents(&mut mem, &udf, no_pause()).expect(SPEC_BD_3_10_1);
         assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_10_1}");
         let map = crate::sector::bus_removal::BusMap::new(scan.files, &[]);
         assert_eq!(
@@ -9496,7 +9848,8 @@ mod tests {
         use crate::udf::fixture::PART_START;
         let (mut mem, udf) = bus_fixture(0x80);
         mem.put_bytes(PART_START + 43, &[0u8; 2048]); // index.bdmv File Entry
-        let scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_NOT_STREAM);
+        let scan =
+            Disc::stream_file_extents(&mut mem, &udf, no_pause()).expect(SPEC_BD_3_7_NOT_STREAM);
         assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_7_NOT_STREAM}");
         assert_eq!(scan.files.len(), 3, "{SPEC_BD_3_7_NOT_STREAM}");
     }
@@ -9507,7 +9860,8 @@ mod tests {
     fn stream_file_extents_maps_every_readable_stream_file() {
         use crate::udf::fixture::PART_START;
         let (mut mem, udf) = bus_fixture(0x80);
-        let mut scan = Disc::stream_file_extents(&mut mem, &udf).expect(SPEC_BD_3_7_BEF);
+        let mut scan =
+            Disc::stream_file_extents(&mut mem, &udf, no_pause()).expect(SPEC_BD_3_7_BEF);
         assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_7_BEF}");
         scan.files.sort();
         assert_eq!(
@@ -9527,7 +9881,8 @@ mod tests {
     fn live_bus_map_records_an_unreadable_file_when_host_key_debus_is_on() {
         let (mut mem, udf) = bus_fixture(0x80);
         corrupt_m2ts2_icb(&mut mem);
-        let scan = Disc::bus_stream_files(&mut mem, &udf, true).expect(SPEC_BD_3_7_NOTE);
+        let scan =
+            Disc::bus_stream_files(&mut mem, &udf, true, no_pause()).expect(SPEC_BD_3_7_NOTE);
         assert_eq!(
             unmapped_paths(&scan),
             ["/BDMV/STREAM/00002.m2ts"],
@@ -9542,7 +9897,7 @@ mod tests {
         let (mut mem, udf) = bus_fixture(0x00);
         corrupt_m2ts2_icb(&mut mem);
         assert_eq!(
-            Disc::bus_stream_files(&mut mem, &udf, false).expect(SPEC_BD_3_7_OTHERWISE),
+            Disc::bus_stream_files(&mut mem, &udf, false, no_pause()).expect(SPEC_BD_3_7_OTHERWISE),
             StreamScan::default(),
             "{SPEC_BD_3_7_OTHERWISE}"
         );
@@ -9554,7 +9909,7 @@ mod tests {
     fn live_bus_map_carries_every_stream_file_when_readable() {
         use crate::udf::fixture::PART_START;
         let (mut mem, udf) = bus_fixture(0x80);
-        let scan = Disc::bus_stream_files(&mut mem, &udf, true).expect(SPEC_BD_3_7_BEF);
+        let scan = Disc::bus_stream_files(&mut mem, &udf, true, no_pause()).expect(SPEC_BD_3_7_BEF);
         assert!(scan.unmapped.is_empty(), "{SPEC_BD_3_7_BEF}");
         assert_eq!(
             bus_map(scan.files, &[]).covered_ranges(),
@@ -9799,11 +10154,11 @@ mod tests {
             crate::error::E_BUS_STREAM_UNMAPPED,
             "{SPEC_BD_3_7_NOTE}"
         );
-        assert_eq!(
-            err.to_string(),
-            "E6021: /BDMV/STREAM/00001.m2ts",
-            "{SPEC_BD_3_7_NOTE}"
+        let want = format!(
+            "E6021: /BDMV/STREAM/00001.m2ts (E6000: {})",
+            crate::udf::fixture::PART_START + 40
         );
+        assert_eq!(err.to_string(), want, "{SPEC_BD_3_7_NOTE}: path and cause");
     }
 
     /// Per spec; do not change without a spec citation proving otherwise.

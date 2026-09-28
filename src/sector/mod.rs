@@ -250,6 +250,122 @@ mod tests {
         s.set_unit_base(base);
     }
 
+    // Leaf sources with no bus stage: image bytes on file are already bus-clear.
+    const UNMAPPED_LEAVES: &[&str] = &["FileSectorSource", "DirImage"];
+
+    // Byte offset where `s`'s first inline `#[cfg(test)] mod x {` starts (tests follow).
+    fn test_module_start(s: &str) -> usize {
+        let mut from = 0;
+        while let Some(i) = s[from..].find("#[cfg(test)]") {
+            let at = from + i;
+            let rest = s[at + 12..]
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("#["))
+                .unwrap_or("");
+            let rest = rest.strip_prefix("pub(crate) ").unwrap_or(rest);
+            if rest.starts_with("mod ") && rest.ends_with('{') {
+                return at;
+            }
+            from = at + 12;
+        }
+        s.len()
+    }
+
+    // Every production `impl SectorSource for X`, with whether its body forwards the list.
+    fn production_impls(s: &str) -> Vec<(String, bool)> {
+        let s = &s[..test_module_start(s)];
+        let mut out = Vec::new();
+        for (at, _) in s.match_indices("SectorSource for ") {
+            let line_start = s[..at].rfind('\n').map_or(0, |i| i + 1);
+            if !s[line_start..at].trim_start().starts_with("impl") {
+                continue;
+            }
+            let open = at + s[at..].find('{').expect("impl body");
+            let name = s[at + 17..open].trim().to_string();
+            let (mut depth, mut end) = (0i32, open);
+            for (i, c) in s[open..].char_indices() {
+                depth += match c {
+                    '{' => 1,
+                    '}' => -1,
+                    _ => 0,
+                };
+                if depth == 0 {
+                    end = open + i;
+                    break;
+                }
+            }
+            out.push((name, s[open..end].contains("fn unmapped_stream_files")));
+        }
+        out
+    }
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                // Test code: `*tests*.rs` and the `test-util` fixtures (never in a release).
+                && !p.file_name().unwrap().to_string_lossy().contains("tests")
+                && p.file_name().is_some_and(|n| n != "test_util.rs")
+            {
+                out.push(p);
+            }
+        }
+    }
+
+    // A wrapper that keeps the trait default (`&[]`) silently drops the drive's unmapped
+    // stream files, reopening iso:// to bus-encrypted bytes. New source: forward, or list
+    // it in UNMAPPED_LEAVES with the reason.
+    #[test]
+    fn every_production_sector_source_forwards_unmapped_stream_files() {
+        let mut files = Vec::new();
+        rust_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut seen = Vec::new();
+        let mut missing = Vec::new();
+        for f in &files {
+            for (name, forwards) in production_impls(&std::fs::read_to_string(f).unwrap()) {
+                let base = name.split(['<', ' ']).next().unwrap_or("").to_string();
+                if !forwards && !UNMAPPED_LEAVES.contains(&base.as_str()) {
+                    missing.push(format!("{} ({})", name, f.display()));
+                }
+                seen.push(base);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "do not forward unmapped_stream_files: {missing:?}"
+        );
+        for must in [
+            "Drive",
+            "DecryptingSectorSource",
+            "UnitAligned",
+            "PrefetchedSectorSource",
+        ] {
+            assert!(
+                seen.iter().any(|n| n == must),
+                "scanner lost {must}: {seen:?}"
+            );
+        }
+    }
+
+    // The scanner itself: a non-forwarding impl is caught, a test-module impl is not.
+    #[test]
+    fn production_impl_scanner_flags_a_wrapper_without_forwarding() {
+        let src = "impl<S: SectorSource> SectorSource for Wrap<S> {\n    fn read_sectors() {}\n}\n\
+                   #[cfg(test)]\n#[allow(x)]\nmod tests {\n    impl SectorSource for Mock {}\n}\n";
+        assert_eq!(production_impls(src), [("Wrap<S>".to_string(), false)]);
+        let ok = "impl SectorSource for &mut (dyn SectorSource + '_) {\n fn unmapped_stream_files() {}\n}";
+        assert_eq!(
+            production_impls(ok),
+            [("&mut (dyn SectorSource + '_)".to_string(), true)]
+        );
+    }
+
     /// The default `capacity_sectors` is 0 (unknown). Grounding: trait
     /// default body `fn capacity_sectors(&self) -> u32 { 0 }`.
     #[test]

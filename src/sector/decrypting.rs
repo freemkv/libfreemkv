@@ -203,6 +203,10 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         self.inner.capacity_sectors()
     }
 
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.inner.unmapped_stream_files()
+    }
+
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -312,6 +316,14 @@ mod tests {
             Self::fill(lba, count, buf);
             Ok(count as usize * 2048)
         }
+    }
+
+    // A DecryptingSectorSource must relay its inner source's unmapped list.
+    #[test]
+    fn decrypting_source_forwards_unmapped_stream_files() {
+        use crate::sector::bus_removal::test_support::{Reports, m2ts1};
+        let w = DecryptingSectorSource::new(Reports(vec![m2ts1()]), DecryptKeys::None);
+        crate::sector::bus_removal::test_support::assert_forwards(w);
     }
 
     #[test]

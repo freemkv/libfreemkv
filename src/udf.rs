@@ -1746,6 +1746,21 @@ impl<S: SectorSource + ?Sized> SectorSource for BufferedSectorReader<'_, S> {
         }
     }
 
+    // A FUA read asks the medium, not a cache: bypass the prefetch and sliding caches.
+    fn read_sectors_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> std::result::Result<usize, crate::error::Error> {
+        if fua {
+            return self.inner.read_sectors_fua(lba, count, buf, recovery, true);
+        }
+        self.read_sectors(lba, count, buf, recovery)
+    }
+
     fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
         self.inner.unmapped_stream_files()
     }
