@@ -188,6 +188,20 @@ mod tests {
     /// A full recovery-thread cap means SG_IO calls are already stuck: Drop
     /// closes at once rather than block on an inline ALLOW. Only a failed spawn
     /// (checked by the caller) falls back to an inline ALLOW.
+    /// LD15 (GUARD + a new row): the transport's drop-ALLOW fires whenever PREVENT is
+    /// still held, including after the Drive's own ALLOW was answered with an error
+    /// (`prevent_held` stays set); only a dead-bus ALLOW or a full cap skips it.
+    #[test]
+    fn fd_handoff_drop_allow_after_failed_drive_allow() {
+        // The Drive's ALLOW got a CHECK CONDITION: PREVENT still held, bus alive.
+        assert_eq!(drop_unlock_fd(true, false, 5, None), Some(5));
+        assert_eq!(drop_unlock_plan(Some(5), true), DropUnlock::Detached(5));
+        // Cap full: skipped (the UI warns the tray may stay locked).
+        assert_eq!(drop_unlock_plan(Some(5), false), DropUnlock::Skip);
+        // The ALLOW died on the transport: never retried.
+        assert_eq!(drop_unlock_fd(true, true, 5, None), None);
+    }
+
     #[test]
     fn drop_unlock_plan_skips_when_the_thread_cap_is_full() {
         assert_eq!(drop_unlock_plan(None, true), DropUnlock::Skip);

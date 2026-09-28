@@ -89,6 +89,8 @@ fn map_shim_open_error(rc: i32, path: String) -> Error {
 
 pub struct MacScsiTransport {
     _bsd_name: String,
+    /// The last command's sense-key specific progress indication (§2.11).
+    last_progress: Option<u16>,
 }
 
 unsafe impl Send for MacScsiTransport {}
@@ -119,6 +121,7 @@ impl MacScsiTransport {
 
         Ok(MacScsiTransport {
             _bsd_name: bsd_name.to_string(),
+            last_progress: None,
         })
     }
 }
@@ -131,6 +134,10 @@ impl Drop for MacScsiTransport {
 }
 
 impl ScsiTransport for MacScsiTransport {
+    fn last_sense_progress(&self) -> Option<u16> {
+        self.last_progress
+    }
+
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -141,6 +148,7 @@ impl ScsiTransport for MacScsiTransport {
         // is dev/test-only per project rules.
         _timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        self.last_progress = None;
         // Match the Linux guard: a >=4 GiB buffer would wrap when cast to
         // u32 for the shim, producing a short transfer reported as success
         // with the wrong byte count.
@@ -199,6 +207,7 @@ impl ScsiTransport for MacScsiTransport {
 
         if task_status != 0 {
             let parsed = super::parse_sense(&sense, K_SENSE_DATA_SIZE as u8);
+            self.last_progress = super::parse_sense_progress(&sense, K_SENSE_DATA_SIZE as u8);
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),
                 status: task_status,

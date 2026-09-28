@@ -800,3 +800,221 @@ fn image_unreadable_uk_ro_is_recorded_not_fatal() {
     d.decrypt_with(Key::Unit(vec![(0, [0x11; 16])]), &[])
         .expect("a mapfile unit key is accepted on an image");
 }
+
+// ── Stop design §5.1 "Scan" (LS1–LS6), over `test_util::FakeTransport` ──
+
+fn ake(mem: MemDisc, profile: u16) -> AkeMemTransport {
+    AkeMemTransport {
+        mem,
+        log: Arc::default(),
+        profile,
+        fail_read: None,
+        fault_on: None,
+        halt_on: None,
+        halt: Arc::default(),
+        mkb_pack: Some(mkb_gen(70)),
+    }
+}
+
+fn with_halt(h: &crate::halt::Halt) -> ScanOptions {
+    ScanOptions {
+        halt: Some(h.clone()),
+        ..with_hc()
+    }
+}
+
+// The `n`th (1-based) CDB matching `p`.
+fn nth(n: usize, p: Pred) -> impl Fn(&[u8]) -> bool + Send + 'static {
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    move |c| p(c) && seen.fetch_add(1, Ordering::Relaxed) + 1 == n
+}
+
+/// LS1 (D5): a Stop during a recovery-timeout UDF metadata READ waits for that CDB,
+/// issues nothing after it, and ends the scan `Halted`.
+#[test]
+fn stop_during_udf_metadata_read_waits_for_inflight_cdb() {
+    use crate::test_util::{FakeMode, FakeTransport};
+    let h = crate::halt::Halt::new();
+    let (t, fake) = FakeTransport::new();
+    let t = t
+        .with_inner(Box::new(ake(bd_disc(Some(true)), 0x0040)))
+        .rule_n(nth(1, is_read10), FakeMode::Stall, 1)
+        .scale(100)
+        .watch(&h);
+    let mut drive = Drive::from_transport(Box::new(t));
+    let (f2, h2) = (fake.clone(), h.clone());
+    let stopper = std::thread::spawn(move || {
+        assert!(f2.wait_for(1, is_read10, std::time::Duration::from_secs(5)));
+        h2.cancel();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        f2.release();
+    });
+    let r = Disc::scan(&mut drive, &with_halt(&h));
+    stopper.join().unwrap();
+    assert!(
+        matches!(r, Err(Error::Halted)),
+        "{:?}",
+        r.map(|d| d.titles.len())
+    );
+    let log = fake.log();
+    let at = log.iter().position(|c| is_read10(&c.cdb)).unwrap();
+    assert_eq!(
+        log[at].timeout_ms,
+        crate::scsi::READ_RECOVERY_TIMEOUT_MS,
+        "D5: recovery READ"
+    );
+    assert_eq!(
+        at + 1,
+        log.len(),
+        "zero CDBs after the in-flight READ: {:02x?}",
+        fake.cdbs()
+    );
+}
+
+/// LS2 / G1 (GUARD, D5): a metadata READ slower than the fast 10 s timeout but inside
+/// the 60 s recovery one (30 s, scaled) still scans.
+#[test]
+fn scan_survives_metadata_read_slower_than_fast_timeout() {
+    use crate::test_util::{FakeMode, FakeTransport};
+    let (t, fake) = FakeTransport::new();
+    // Scale 1000: fast READ times out at 10 ms, recovery at 60 ms; this one takes 30.
+    let t = t.with_inner(Box::new(ake(bd_disc(None), 0x0040))).rule_n(
+        nth(1, is_read10),
+        FakeMode::Complete(std::time::Duration::from_millis(30)),
+        1,
+    );
+    let mut drive = Drive::from_transport(Box::new(t));
+    let d = Disc::scan(&mut drive, &with_hc()).expect("a slow recovery READ is not a failure");
+    assert!(!d.titles.is_empty());
+    assert!(fake.count(is_read10) > 1);
+}
+
+/// LS4: AACS and CSS bus steps both observe the op token (the `ScanOptions.halt`
+/// alias, not the drive's own) through `bus_step_guard`.
+#[test]
+fn bus_step_stop_and_transport_share_bus_step_guard() {
+    use crate::test_util::FakeTransport;
+    for (mem, profile, alloc) in [
+        (bd_disc(Some(true)), 0x0040, is_aacs_agid_alloc as Pred),
+        (dvd_disc(), 0x0010, is_css_agid_alloc as Pred),
+    ] {
+        let h = crate::halt::Halt::new();
+        let (t, fake) = FakeTransport::new();
+        let t = t
+            .with_inner(Box::new(ake(mem, profile)))
+            .cancel_on(nth(1, alloc), &h)
+            .watch(&h);
+        let mut drive = Drive::from_transport(Box::new(t));
+        let r = Disc::scan(&mut drive, &with_halt(&h));
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "{profile:#x}: {:?}",
+            r.map(|d| d.titles.len())
+        );
+        assert!(
+            !drive.is_halted(),
+            "the drive's own token was never cancelled"
+        );
+        // After the Stop only the §2.4 clean-up: the allocated AGID's one release.
+        let cdbs = fake.cdbs();
+        let at = cdbs.iter().position(|c| alloc(c)).unwrap();
+        let after = &cdbs[at + 1..];
+        let release = |c: &Vec<u8>| crate::drive::allow::invalidated_agid(c).is_some();
+        assert!(
+            after.len() <= 1 && after.iter().all(release),
+            "{profile:#x}: {after:02x?}"
+        );
+    }
+    let enc = include_str!("encrypt.rs");
+    let body = |src: &'static str, f: &str| {
+        let i = src.find(f).unwrap();
+        &src[i..i + src[i..]
+            .find("\n}\n")
+            .or_else(|| src[i..].find("\n    }\n"))
+            .unwrap()]
+    };
+    assert!(body(enc, "pub(super) fn aacs_bus_step(").contains("bus_step_guard("));
+    assert!(body(include_str!("mod.rs"), "fn css_bus_step(").contains("bus_step_guard("));
+}
+
+/// LS5: a Stop during the metadata prefetch ends `prefetch_ranges` with `Halted`; no
+/// READ follows, and no title parse reads on from the cache.
+#[test]
+fn stop_between_prefetch_ranges_and_title_parses() {
+    use crate::test_util::FakeTransport;
+    let mpls = PART_START + 700;
+    let h = crate::halt::Halt::new();
+    let (t, fake) = FakeTransport::new();
+    let t = t
+        .with_inner(Box::new(ake(bd_disc(None), 0x0040)))
+        .cancel_on(move |c| touches(c, &[mpls]), &h)
+        .watch(&h);
+    let mut drive = Drive::from_transport(Box::new(t));
+    let r = Disc::scan(&mut drive, &with_halt(&h));
+    assert!(
+        matches!(r, Err(Error::Halted)),
+        "{:?}",
+        r.map(|d| d.titles.len())
+    );
+    let cdbs = fake.cdbs();
+    let at = cdbs.iter().position(|c| touches(c, &[mpls])).unwrap();
+    assert_eq!(at + 1, cdbs.len(), "no READ after the Stop: {cdbs:02x?}");
+}
+
+/// LS6: a Stop after the scan's last CDB, before it returns, still ends it `Halted`
+/// with no `Disc`.
+#[test]
+fn scan_with_final_check() {
+    use crate::test_util::FakeTransport;
+    let (t, fake) = FakeTransport::new();
+    let mut drive =
+        Drive::from_transport(Box::new(t.with_inner(Box::new(ake(bd_disc(None), 0x0040)))));
+    Disc::scan(&mut drive, &with_hc()).expect("dry run scans");
+    let last = fake.log().len();
+    let h = crate::halt::Halt::new();
+    let (t, fake) = FakeTransport::new();
+    let t = t
+        .with_inner(Box::new(ake(bd_disc(None), 0x0040)))
+        .cancel_on(nth(last, |_| true), &h);
+    let mut drive = Drive::from_transport(Box::new(t));
+    let r = Disc::scan(&mut drive, &with_halt(&h));
+    assert!(
+        matches!(r, Err(Error::Halted)),
+        "{:?}",
+        r.map(|d| d.titles.len())
+    );
+    assert_eq!(fake.log().len(), last);
+}
+
+// A key source that records whether the drive's Progress was busy while it ran.
+struct BusyProbe(crate::halt::Progress, Arc<Mutex<Vec<bool>>>);
+impl crate::KeySource for BusyProbe {
+    fn get_unit_keys(
+        &self,
+        _ctx: &dyn crate::keysource::ResolveCtx,
+    ) -> Result<Vec<crate::aacs::types::UnitKey>> {
+        Ok(Vec::new())
+    }
+    fn host_certs(&self, _mkb: Option<u32>) -> Vec<crate::aacs::types::HostCert> {
+        self.1.lock().unwrap().push(self.0.is_busy());
+        vec![test_hc()]
+    }
+}
+
+/// ST4-2: `bus_step_guard` holds `busy()` on the Drive-attached `Progress` for the
+/// whole bus step, so the first keydb parse (in `host_certs`) is never idle time.
+#[test]
+fn bus_step_guard_holds_busy_across_host_certs() {
+    let p = crate::halt::Progress::new();
+    let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let mut rig = Rig::new(bd_disc(Some(true)), |_| {});
+    rig.drive.attach_progress(&p);
+    let opts = ScanOptions {
+        key_sources: vec![Box::new(BusyProbe(p.clone(), seen.clone()))],
+        ..Default::default()
+    };
+    let _ = Disc::scan(&mut rig.drive, &opts);
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.is_empty() && seen.iter().all(|b| *b), "{seen:?}");
+    assert!(!p.is_busy(), "released after the step");
+}

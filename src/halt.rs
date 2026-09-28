@@ -376,6 +376,12 @@ impl Progress {
         BusyGuard(self.clone())
     }
 
+    /// Whether a [`BusyGuard`] is live (crate tests of busy spans).
+    #[cfg(test)]
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy_state().0
+    }
+
     fn busy_state(&self) -> (bool, u64) {
         let epoch = self.0.busy_epoch.load(Ordering::Relaxed);
         (self.0.busy.load(Ordering::Relaxed) > 0, epoch)

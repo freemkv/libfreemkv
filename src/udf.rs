@@ -1659,7 +1659,9 @@ impl<'a, S: SectorSource + ?Sized> BufferedSectorReader<'a, S> {
 impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
     /// Pre-read a contiguous range of sectors into the sliding cache.
     /// Used to bulk-load the UDF metadata partition so subsequent reads are instant.
-    pub(crate) fn prefetch(&mut self, start_lba: u32, count: u32) {
+    /// A failed batch ends the prefetch (the reads fall back to the sliding window);
+    /// a Stop is returned, so the scan never reads on past it (§2.8).
+    pub(crate) fn prefetch(&mut self, start_lba: u32, count: u32) -> crate::error::Result<()> {
         // Cap to 8192 sectors (16 MiB) so a disc-controlled ad_len cannot
         // drive a multi-hundred-MiB allocation before any sectors are read.
         let count = count.min(8192);
@@ -1670,31 +1672,35 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
         let total = count as usize * 2048;
         self.cache.resize(total, 0);
         let mut offset = 0u32;
+        let mut halted = false;
         while offset < count {
             let batch = (count - offset).min(self.batch as u32) as u16;
             let buf_off = offset as usize * 2048;
-            if self
-                .inner
-                .read_sectors(
-                    start_lba + offset,
-                    batch,
-                    &mut self.cache[buf_off..buf_off + batch as usize * 2048],
-                    true,
-                )
-                .is_err()
-            {
-                break;
+            match self.inner.read_sectors(
+                start_lba + offset,
+                batch,
+                &mut self.cache[buf_off..buf_off + batch as usize * 2048],
+                true,
+            ) {
+                Ok(_) => offset += batch as u32,
+                Err(e) => {
+                    halted = matches!(e, crate::error::Error::Halted);
+                    break;
+                }
             }
-            offset += batch as u32;
         }
         self.cache_start = start_lba;
         self.cache_sectors = offset;
+        let _ = halted; // RED stub: swallowed
+        Ok(())
     }
 
     // Pre-read multiple sector ranges into the permanent per-sector HashMap cache (bulk-loads
     // AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS to bound RAM against
     // a crafted UDF.
-    pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) {
+    /// A Stop ends it with `Halted` between (or within) ranges; any other failed
+    /// batch skips the rest of that range, as before.
+    pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) -> crate::error::Result<()> {
         // 2048 bytes/sector → 512 Ki sectors ≈ 1 GiB of permanent cache.
         const MAX_PREFETCH_SECTORS: u64 = 512 * 1024;
         let mut tmp = vec![0u8; self.batch as usize * 2048];
@@ -1712,19 +1718,19 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
                 hb.tick(done, total);
                 let batch = (count - offset).min(self.batch as u32) as u16;
                 let bytes = batch as usize * 2048;
-                if self
+                match self
                     .inner
                     .read_sectors(start + offset, batch, &mut tmp[..bytes], true)
-                    .is_err()
                 {
-                    break;
+                    Ok(_) => {}
+                    Err(_) => break, // RED stub: a Stop is swallowed
                 }
                 for i in 0..batch as u32 {
                     if cached >= MAX_PREFETCH_SECTORS {
                         // Cache cap hit: stop seeding the permanent HashMap.
                         // Remaining LBAs are still served by the sliding-window
                         // read path below, just without the bulk pre-load.
-                        return;
+                        return Ok(());
                     }
                     let s = i as usize * 2048;
                     self.prefetched
@@ -1735,6 +1741,7 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
                 done += batch as u64;
             }
         }
+        Ok(())
     }
 }
 
@@ -3503,7 +3510,7 @@ mod tests {
         let mut inner = CountReader::new();
         {
             let mut br = BufferedSectorReader::new(&mut inner, 3);
-            br.prefetch(100, 8); // 8 sectors in batches of 3 → 3 commands
+            br.prefetch(100, 8).unwrap(); // 8 sectors in batches of 3 → 3 commands
             let mut buf = [0u8; 2048];
             for lba in [100u32, 103, 107] {
                 br.read_sectors(lba, 1, &mut buf, true)
@@ -3529,7 +3536,7 @@ mod tests {
         // would hand back bytes from beyond the loaded data.
         let mut inner = CountReader::new();
         let mut br = BufferedSectorReader::new(&mut inner, 8);
-        br.prefetch(100, 8);
+        br.prefetch(100, 8).unwrap();
         let mut buf = [0u8; 2048];
         br.read_sectors(108, 1, &mut buf, true)
             .expect("the sector past the window is read from the drive");
@@ -3544,7 +3551,7 @@ mod tests {
         let mut inner = CountReader::new();
         {
             let mut br = BufferedSectorReader::new(&mut inner, 2);
-            br.prefetch_ranges(&[(200, 5), (300, 2)]);
+            br.prefetch_ranges(&[(200, 5), (300, 2)]).unwrap();
             let mut buf = [0u8; 2048];
             for lba in [200u32, 202, 204, 300, 301] {
                 br.read_sectors(lba, 1, &mut buf, true)
@@ -3645,7 +3652,7 @@ mod tests {
         let mut inner = MapReader::new();
         let mut br = BufferedSectorReader::new(&mut inner, 32);
         // Pass a count that would allocate ~512 MiB if uncapped (262144 sectors).
-        br.prefetch(0, 262_144);
+        br.prefetch(0, 262_144).unwrap();
         // The cache must be no larger than the cap: 8192 sectors × 2048 bytes.
         assert!(
             br.cache.len() <= 8192 * 2048,
@@ -3662,7 +3669,7 @@ mod tests {
         let mut br = BufferedSectorReader::new(&mut inner, 60);
         // start + count = 0xFFFF_FFC0 + 200 > u32::MAX: the second batch
         // iteration evaluates 0xFFFF_FFC0 + 60.
-        br.prefetch(0xFFFF_FFC0, 200);
+        br.prefetch(0xFFFF_FFC0, 200).unwrap();
         // Nothing read (MapReader serves no sector here), but crucially the
         // walk must never form an LBA above u32::MAX.
         assert!(
@@ -3679,7 +3686,7 @@ mod tests {
     fn prefetch_ranges_near_u32_max_does_not_overflow() {
         let mut inner = MapReader::new();
         let mut br = BufferedSectorReader::new(&mut inner, 60);
-        br.prefetch_ranges(&[(0xFFFF_FFF0, 512)]);
+        br.prefetch_ranges(&[(0xFFFF_FFF0, 512)]).unwrap();
         // Every key the permanent cache holds must be a real LBA, i.e. inside
         // the declared range — never a wrapped low sector.
         for &lba in br.prefetched.keys() {

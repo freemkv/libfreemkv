@@ -5,6 +5,114 @@
 
 use super::{QuoteKind, SpecQuote};
 
+const SEAGATE: &str = "Seagate SCSI Commands Reference Manual, 100293068 Rev. J (October 2016)";
+const SEAGATE_URL: &str = "https://www.seagate.com/files/staticfiles/support/docs/manual/Interface%20manuals/100293068j.pdf";
+const MMC6: &str =
+    "T10/1836-D SCSI Multi-Media Commands - 6 (MMC-6), Revision 2g, 11 December 2009";
+const MMC6_URL: &str = "https://www.13thmonkey.org/documentation/SCSI/mmc6r02g.pdf";
+const LIBAACS_MMC: &str = "libaacs (VideoLAN) @55be92be, src/libaacs/mmc.c";
+const LIBAACS_MMC_URL: &str =
+    "https://code.videolan.org/videolan/libaacs/-/blob/55be92be/src/libaacs/mmc.c";
+
+// SS-1, SS-2, SS-4, SS-6: the Seagate manual reproduces the SPC text but is not SPC
+// itself, so these are Corroboration (J-5.5-6: the reviewer re-kinds per row).
+
+pub const SS_1_SENSE_PROGRESS: SpecQuote = SpecQuote {
+    id: "SS-1",
+    kind: QuoteKind::Corroboration,
+    source: SEAGATE,
+    section: "SPC §2.4.1.1.4.4 Progress indication sense key specific data (Table 18, Table 21); \
+              §2.4.1.2 Fixed format sense data (Table 27), as reproduced in the Seagate manual",
+    locator: "PDF p.51-52, p.56-57",
+    url: SEAGATE_URL,
+    text: "NO SENSE or NOT READY … Progress indication … If the sense key is NO SENSE or NOT \
+           READY, the SENSE KEY SPECIFIC field shall be as shown in table 21. … The PROGRESS \
+           INDICATION field is a percent complete indication in which the returned value is a \
+           numerator that has 65 536 (10000h) as its denominator. … A sense-key specific valid \
+           (SKSV) bit set to one indicates the SENSE KEY SPECIFIC field contains valid \
+           information as defined in this manual.",
+};
+
+pub const SS_2_DESCRIPTOR_SENSE: SpecQuote = SpecQuote {
+    id: "SS-2",
+    kind: QuoteKind::Corroboration,
+    source: SEAGATE,
+    section: "SPC §2.4.1.1.1 Descriptor format sense data (Table 12); §2.4.1.1.4.1 Sense key \
+              specific sense data descriptor (Table 17), as reproduced in the Seagate manual",
+    locator: "PDF p.47, p.50",
+    url: SEAGATE_URL,
+    text: "The descriptor format sense data for response codes 72h (current errors) and 73h \
+           (deferred errors) is defined in table 12. … The sense key specific sense data \
+           descriptor (see table 17) provides additional information about the exception \
+           condition.",
+};
+
+pub const SS_3_READINESS_ERRORS: SpecQuote = SpecQuote {
+    id: "SS-3",
+    kind: QuoteKind::Normative,
+    source: MMC6,
+    section: "Annex F §F.3.3 Readiness Errors, Table F.3",
+    locator: "PDF p.695 (printed 646-647)",
+    url: MMC6_URL,
+    text: "In the event that a command requires a level of readiness that does not currently \
+           exist, the Drive should be terminated with CHECK CONDITION status and sense bytes \
+           SK/ASC/ASCQ should be selected from those shown in Table F.3. … 2 04 01 LOGICAL UNIT \
+           IS IN PROCESS OF BECOMING READY 2 04 02 LOGICAL UNIT NOT READY, INITIALIZING CMD. \
+           REQUIRED … 2 30 00 INCOMPATIBLE MEDIUM INSTALLED … 2 3A 00 MEDIUM NOT PRESENT",
+};
+
+pub const SS_4_TEST_UNIT_READY: SpecQuote = SpecQuote {
+    id: "SS-4",
+    kind: QuoteKind::Corroboration,
+    source: SEAGATE,
+    section: "SPC §3.53 TEST UNIT READY command, as reproduced in the Seagate manual",
+    locator: "PDF p.230",
+    url: SEAGATE_URL,
+    text: "The TEST UNIT READY command (see table 202) provides a means to check if the logical \
+           unit is ready. … If the logical unit is unable to become operational or is in a \
+           state such that an application client action (e.g., START UNIT command) is required \
+           to make the logical unit ready, the command shall be terminated with CHECK CONDITION \
+           status, with the sense key set to NOT READY.",
+};
+
+pub const SS_5_PREVENT_ALLOW: SpecQuote = SpecQuote {
+    id: "SS-5",
+    kind: QuoteKind::Normative,
+    source: MMC6,
+    section: "§6.13.2 PREVENT ALLOW MEDIUM REMOVAL, The CDB and its Parameters, Table 329",
+    locator: "PDF p.396 (printed 348)",
+    url: MMC6_URL,
+    text: "The Persistent and Prevent bits are used to independently select values for these \
+           states. See Table 329. … 0 0 Prevent State shall be cleared (Unlocked) 0 1 Prevent \
+           State shall be set (Locked)",
+};
+
+pub const SS_6_START_STOP_LOEJ: SpecQuote = SpecQuote {
+    id: "SS-6",
+    kind: QuoteKind::Corroboration,
+    source: SEAGATE,
+    section: "§3.49 START STOP UNIT command (SBC), LOEJ (load eject) bit, as reproduced in the \
+              Seagate manual",
+    locator: "PDF p.224",
+    url: SEAGATE_URL,
+    text: "If the load eject (LOEJ) bit is set to zero, then the logical unit shall take no \
+           action regarding loading or ejecting the medium. … If the LOEJ bit is set to one, \
+           then the logical unit shall unload the medium if the START bit is set to zero.",
+};
+
+pub const SS_7_AGID_INVALIDATE: SpecQuote = SpecQuote {
+    id: "SS-7",
+    kind: QuoteKind::Evidence,
+    source: LIBAACS_MMC,
+    section: "_mmc_report_key, _mmc_invalidate_agid, _mmc_report_agid (no public MMC key-format \
+              table)",
+    locator: "mmc.c:114-135, 202-230 @55be92be",
+    url: LIBAACS_MMC_URL,
+    text: "cmd[10] = (agid << 6) | (format & 0x3f); … return _mmc_report_key(mmc, agid, 0, 0, \
+           MMC_REPORT_KEY_AACS_INVALIDATE_AGID, buf, sizeof(buf)); … *agid = (buf[7] & 0xff) \
+           >> 6;",
+};
+
 const RUST_STD: &str = "The Rust Standard Library, core::sync::atomic (Rust 1.98.1)";
 const ORDERING_URL: &str = "https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html";
 
@@ -21,4 +129,13 @@ pub const SS_23_RELEASE_ACQUIRE: SpecQuote = SpecQuote {
 };
 
 /// Every `SS-n` quote, in ID order.
-pub const ALL: &[&SpecQuote] = &[&SS_23_RELEASE_ACQUIRE];
+pub const ALL: &[&SpecQuote] = &[
+    &SS_1_SENSE_PROGRESS,
+    &SS_2_DESCRIPTOR_SENSE,
+    &SS_3_READINESS_ERRORS,
+    &SS_4_TEST_UNIT_READY,
+    &SS_5_PREVENT_ALLOW,
+    &SS_6_START_STOP_LOEJ,
+    &SS_7_AGID_INVALIDATE,
+    &SS_23_RELEASE_ACQUIRE,
+];

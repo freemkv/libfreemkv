@@ -1866,7 +1866,7 @@ impl Disc {
         let batch = detect_max_batch_sectors(session.device_path());
         let mut buffered = udf::BufferedSectorReader::new(session, batch);
         let udf_fs = udf::read_filesystem(&mut buffered)?;
-        buffered.prefetch(udf_fs.metadata_start(), udf_fs.metadata_sectors());
+        buffered.prefetch(udf_fs.metadata_start(), udf_fs.metadata_sectors())?;
         Ok((buffered, udf_fs))
     }
 
@@ -1897,9 +1897,7 @@ impl Disc {
     /// into [`Error::EmptyImage`] via `image_read_sectors`. A Stop ([`Error::Halted`],
     /// including one during a backoff sleep) is returned, never retried.
     fn read_capacity_retrying(session: &mut Drive) -> Result<u32> {
-        Self::read_capacity_retrying_with(session, |d, t| {
-            crate::drive::sleep_until_halted(&d.halt_flag(), t)
-        })
+        Self::read_capacity_retrying_with(session, |d, t| d.pause(t))
     }
 
     // `sleep` is the backoff wait (injectable for tests); it returns Halted on a Stop.
@@ -1951,15 +1949,20 @@ impl Disc {
     }
 
     /// Scan a disc — parse filesystem, playlists, streams, and capture AACS
-    /// inputs. The main entry point; the session must be open. One order, the
-    /// standard one: (1) DVD only: CSS bus-auth, (2) read capacity + UDF, (3) read
-    /// the AACS files (`Unit_Key_RO.inf`, content cert, MKB) with plain READs,
-    /// (4) the AACS handshake when the disc has AACS, (5) titles + labels.
+    /// inputs; the session must be open. Order: (1) DVD only: CSS bus-auth, (2) read
+    /// capacity + UDF, (3) the AACS files (`Unit_Key_RO.inf`, content cert, MKB) with
+    /// plain READs, (4) the AACS handshake if AACS, (5) titles + labels.
     ///
     /// A live AACS disc whose `Unit_Key_RO.inf` cannot be read fails with
     /// [`Error::AacsKeyFileUnreadable`] before any AACS command (see
     /// [`ScanOptions::raw_copy`]). A dead bus during a handshake aborts the scan.
+    /// `opts.halt` is the scan's op token unless the drive has one attached (§2.2).
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
+        let mut session = session.alias(opts.halt.as_ref());
+        Self::scan_live(&mut session, opts) // RED stub: no final check
+    }
+
+    fn scan_live(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         let dvd = session.disc_is_dvd();
         // Max read speed; removes riplock on DVD.
         session.set_speed(0xFFFF);
@@ -1973,7 +1976,7 @@ impl Disc {
         tracing::info!(target: "freemkv::scan", capacity, "phase: UDF read");
         // Pre-read small files (AACS, MPLS, CLPI, META, *.bdmv): one command each otherwise.
         if let Ok(ranges) = udf_fs.metadata_sector_ranges(&mut buffered) {
-            buffered.prefetch_ranges(&ranges);
+            buffered.prefetch_ranges(&ranges)?;
         }
 
         let aacs = if aacs_dir_present(&udf_fs) {
@@ -2010,11 +2013,13 @@ impl Disc {
         opts: &ScanOptions,
     ) -> Result<Self> {
         let bus_key = aacs.as_ref().and_then(|(c, b)| encrypt::bus_key(c, b));
-        let rereads = FeRereads::new(opts.halt.clone());
+        // The op token: the drive's attached token (the `opts.halt` alias or the caller's).
+        let op = buffered.inner_mut().token().cloned();
+        let rereads = FeRereads::new(op.clone());
         let streams = Self::bus_stream_files(&mut buffered, &udf_fs, bus_key.is_some(), rereads)?;
 
         tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
-        let disc = Self::finish(&mut buffered, capacity, udf_fs, aacs, opts)?;
+        let disc = Self::finish(&mut buffered, capacity, udf_fs, aacs, opts, op.as_ref())?;
         tracing::info!(target: "freemkv::scan", titles = disc.titles.len(), format = ?disc.content_format, "phase: titles parsed");
 
         // The SINGLE de-bus point, wired before the caller samples keys or muxes (the
@@ -2031,19 +2036,10 @@ impl Disc {
     // CSS bus-auth for a live DVD. A dead bus aborts like `Drive::init`; a Stop is `Halted`.
     fn css_bus_step(session: &mut Drive) -> Result<()> {
         tracing::info!(target: "freemkv::scan", "phase: CSS — bus-auth unlock (pre-scan)");
-        if session.is_halted() {
-            return Err(Error::Halted);
-        }
         let drive_id = session.drive_id.clone();
-        let (_, res) = crate::unlock_bridge::run_bus(
-            session.scsi_mut(),
-            &drive_id,
-            freemkv_unlock::DiscKind::Css,
-            &[],
-        );
-        if session.is_halted() {
-            return Err(Error::Halted);
-        }
+        let (_, res) = encrypt::bus_step_guard(session, |s| {
+            crate::unlock_bridge::run_bus(s, &drive_id, freemkv_unlock::DiscKind::Css, &[])
+        })?;
         match res {
             Ok(Some(_)) => {}
             Ok(None) => tracing::warn!(
@@ -2462,7 +2458,7 @@ impl Disc {
         } else {
             None
         };
-        Self::finish(reader, capacity, udf_fs, aacs, opts)
+        Self::finish(reader, capacity, udf_fs, aacs, opts, opts.halt.as_ref())
     }
 
     // Everything after the AACS bus step, for live and image scans alike: the AACS
@@ -2473,6 +2469,7 @@ impl Disc {
         udf_fs: udf::UdfFs,
         aacs: Option<(encrypt::AacsCapture, encrypt::BusOutcome)>,
         opts: &ScanOptions,
+        halt: Option<&crate::halt::Halt>,
     ) -> Result<Self> {
         let scan_with_t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
@@ -2490,16 +2487,16 @@ impl Disc {
         let mut dvd_nav_feature: Option<u16> = None;
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
             (
-                Self::scan_bluray_titles(reader, &udf_fs, opts.halt.as_ref())?,
+                Self::scan_bluray_titles(reader, &udf_fs, halt)?,
                 ContentFormat::BdTs,
             )
         } else if udf_fs.find_dir("/HVDVD_TS").is_some() {
             (
-                Self::scan_hddvd_titles(reader, &udf_fs, opts.halt.as_ref())?,
+                Self::scan_hddvd_titles(reader, &udf_fs, halt)?,
                 ContentFormat::MpegPs,
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
-            let (dvd_titles, nav) = Self::scan_dvd_titles(reader, &udf_fs, opts.halt.as_ref())?;
+            let (dvd_titles, nav) = Self::scan_dvd_titles(reader, &udf_fs, halt)?;
             dvd_nav_feature = nav;
             (dvd_titles, ContentFormat::MpegPs)
         } else {
@@ -2560,7 +2557,7 @@ impl Disc {
         // forced flags match the muxer's rip-time result (shared PGS classifier);
         // rip leaves it off since the muxer detects forced without a second read.
         if opts.probe_forced_subtitles {
-            Self::probe_forced_subtitles_for_bdts_titles(reader, &mut titles, opts.halt.as_ref());
+            Self::probe_forced_subtitles_for_bdts_titles(reader, &mut titles, halt);
         }
         crate::labels::fill_defaults(&mut titles);
 
@@ -2924,7 +2921,7 @@ impl Disc {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        let result = session.checked_exec(
+        let result = session.exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
@@ -6355,7 +6352,7 @@ mod tests {
         });
         let res = Disc::read_capacity_retrying_with(&mut drive, |d, t| {
             d.halt();
-            crate::drive::sleep_until_halted(&d.halt_flag(), t)
+            d.pause(t)
         });
         assert!(matches!(res, Err(Error::Halted)), "got {res:?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);

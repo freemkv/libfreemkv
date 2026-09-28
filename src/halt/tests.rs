@@ -575,14 +575,14 @@ fn test_drive() -> crate::drive::Drive {
 fn scoped_exec() {
     let mut d = test_drive();
     let tur = [0u8; 6];
-    let _ = d.checked_exec(&tur, crate::scsi::DataDirection::None, &mut [], 1000);
+    let _ = d.exec(&tur, crate::scsi::DataDirection::None, &mut [], 1000);
 }
 
 #[cfg(all(debug_assertions, feature = "rip"))]
 fn scoped_exec_outside() -> bool {
     let mut d = test_drive();
     let tur = [0u8; 6];
-    d.checked_exec(&tur, crate::scsi::DataDirection::None, &mut [], 1000)
+    d.exec(&tur, crate::scsi::DataDirection::None, &mut [], 1000)
         .is_ok()
 }
 

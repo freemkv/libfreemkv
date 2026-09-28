@@ -8,6 +8,7 @@
 //!   per aligned unit on each file's own grid (KS-1, KS-2, KS-3).
 //! - [`CountingSource`]: a [`SectorSource`] wrapper that logs every read.
 //! - [`decrypt_unit`]: the aligned-unit decrypt, for tests that check ciphertext.
+//! - [`FakeTransport`]: a scripted drive with a state model for Stop tests (stop §5.0).
 
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::aacs::mkb::AacsVersion;
@@ -372,6 +373,10 @@ impl<S: SectorSource> SectorSource for CountingSource<S> {
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     crate::aacs::content::decrypt_unit(unit, unit_key)
 }
+
+#[path = "test_util_fake.rs"]
+mod fake;
+pub use fake::{FakeCdb, FakeHandle, FakeMode, FakeTransport};
 
 #[cfg(test)]
 #[path = "test_util_tests.rs"]
