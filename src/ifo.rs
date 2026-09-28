@@ -51,6 +51,9 @@ pub struct DvdTitle {
     pub chapter_times: Vec<f64>,
     /// Subtitle palette from PGC: 16 entries of [padding, Y, Cr, Cb].
     pub palette: Option<Vec<[u8; 4]>>,
+    /// PGC_AST_CTL (PGC+0x0C): per logical audio stream, its presence bit (15) and
+    /// physical stream number (bits 10-8).
+    pub ast_ctl: [u16; 8],
     /// PGC_SPST_CTL (PGC+0x1C): per logical subpicture stream, its presence bit
     /// and physical sub-stream ids for 4:3 / wide / letterbox / pan-scan.
     pub spst_ctl: [u32; 32],
@@ -199,7 +202,8 @@ pub struct DvdAudioAttr {
     pub language: String,
     /// The PES `private_stream_1` sub-stream id this audio stream carries
     /// on the wire (AC-3: `0x80..=0x87`, DTS: `0x88..=0x8F`, LPCM:
-    /// `0xA0..=0xA7`), assigned by per-codec ordinal during the scan.
+    /// `0xA0..=0xA7`) when it is physical stream = its position: the fallback for a PGC
+    /// whose AST_CTL marks nothing present (titles otherwise route by AST_CTL).
     /// `None` for codecs carried as a regular MPEG-audio PES (MP1/MP2,
     /// stream_id `0xC0..`) which don't use a private-stream-1 sub-id.
     /// This is the single routing key shared with the muxer's `dvd_pid()`
@@ -570,9 +574,7 @@ fn parse_vts(
         }
         audio_streams.push(parse_audio_attr(&vts_data, aoff)?);
     }
-    // Assign each stream its on-wire private_stream_1 id by per-codec ordinal
-    // (AC-3 0x80+, DTS 0x88+, LPCM 0xA0+), the DVD authoring convention the
-    // muxer routes on — the positional index would collide in mixed-codec titles.
+    // Positional fallback ids; each title re-routes by its own PGC AST_CTL.
     assign_audio_sub_stream_ids(&mut audio_streams);
 
     // Subtitle streams: count at 0x254 (u16 BE), then 6 bytes each starting at 0x256
@@ -695,24 +697,34 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
         channels,
         sample_rate,
         language,
-        // Assigned by `assign_audio_sub_stream_ids` once all streams in the
-        // title set are known (the sub-id is a per-codec ordinal).
+        // Assigned by `assign_audio_sub_stream_ids` once all streams are known.
         sub_stream_id: None,
     })
 }
 
-// Assigns the on-wire private_stream_1 sub-stream id (codec_base | position, saturated at 7) to
-// each audio stream: AC-3 0x80|i, DTS 0x88|i, LPCM 0xA0|i, else None.
+// Assigns each audio stream the sub-stream id of physical stream number = its position
+// (saturated at 7): the fallback when a PGC's AST_CTL marks nothing present.
 fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
     for (i, s) in streams.iter_mut().enumerate() {
-        let n = (i as u8).min(7);
-        s.sub_stream_id = match s.codec {
-            Codec::Ac3 => Some(0x80 | n),
-            Codec::Dts => Some(0x88 | n),
-            Codec::Lpcm => Some(0xA0 | n),
-            _ => None,
-        };
+        s.sub_stream_id = audio_sub_stream_id(s.codec, (i as u8).min(7));
     }
+}
+
+/// The on-wire `private_stream_1` sub-stream id of physical audio stream `n` (0..=7):
+/// AC-3 `0x80|n`, DTS `0x88|n`, LPCM `0xA0|n`; `None` for MPEG audio (its own PES id).
+pub(crate) fn audio_sub_stream_id(codec: Codec, n: u8) -> Option<u8> {
+    match codec {
+        Codec::Ac3 => Some(0x80 | n),
+        Codec::Dts => Some(0x88 | n),
+        Codec::Lpcm => Some(0xA0 | n),
+        _ => None,
+    }
+}
+
+/// The physical stream number (0..=7) of one PGC_AST_CTL entry, or `None` when the
+/// stream is absent from the PGC. Bits 14-11 are reserved (libdvdnav masks `& 0x07`).
+pub(crate) fn audio_stream_number(ctl: u16) -> Option<u8> {
+    (ctl & 0x8000 != 0).then_some(((ctl >> 8) & 0x07) as u8)
 }
 
 /// Parse one subtitle stream attribute block (6 bytes at `offset`).
@@ -952,7 +964,12 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         times
     };
 
-    // PGC_SPST_CTL at PGC+0x1C: 32 x u32 BE; inside the 0xEA bound checked above.
+    // PGC_AST_CTL at PGC+0x0C (8 x u16 BE), PGC_SPST_CTL at PGC+0x1C (32 x u32 BE);
+    // both inside the 0xEA bound checked above.
+    let mut ast_ctl = [0u16; 8];
+    for (i, c) in ast_ctl.iter_mut().enumerate() {
+        *c = be_u16(data, pgc_offset + 0x0C + i * 2)?;
+    }
     let mut spst_ctl = [0u32; 32];
     for (i, c) in spst_ctl.iter_mut().enumerate() {
         *c = be_u32(data, pgc_offset + 0x1C + i * 4)?;
@@ -983,6 +1000,7 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         cells,
         chapter_times,
         palette,
+        ast_ctl,
         spst_ctl,
         // Set by the caller (parse_pgcit) which knows the TT_SRPT title number.
         vts_title_num: 0,
@@ -1186,6 +1204,7 @@ mod tests {
             cells: vec![cell.clone()],
             chapter_times: Vec::new(),
             palette: None,
+            ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
         };
@@ -1238,6 +1257,30 @@ mod tests {
             subpicture_stream_id(0x8000_0000, DvdAspect::R4x3),
             Some(0x20)
         );
+    }
+
+    // AST_CTL entry: bit15 present; bits 10-8 physical stream number; bits 14-11 reserved.
+    #[test]
+    fn audio_stream_number_reads_present_bit_and_low_three_bits() {
+        assert_eq!(audio_stream_number(0x8000), Some(0));
+        assert_eq!(audio_stream_number(0xFFFF), Some(7));
+        assert_eq!(audio_stream_number(0x8A00), Some(2));
+        assert_eq!(audio_stream_number(0x7FFF), None);
+        assert_eq!(audio_sub_stream_id(Codec::Ac3, 3), Some(0x83));
+        assert_eq!(audio_sub_stream_id(Codec::Dts, 3), Some(0x8B));
+        assert_eq!(audio_sub_stream_id(Codec::Lpcm, 3), Some(0xA3));
+        assert_eq!(audio_sub_stream_id(Codec::Mp2, 3), None);
+    }
+
+    #[test]
+    fn pgc_parses_ast_ctl_at_0x0c() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x0B] = 0xFF; // last byte of the PGC's prohibited-user-ops field
+        pgc[0x0C..0x0E].copy_from_slice(&0x8100u16.to_be_bytes());
+        pgc[0x1A..0x1C].copy_from_slice(&0x8700u16.to_be_bytes());
+        pgc[0x1C] = 0xFF; // first byte of SPST_CTL; must not bleed in
+        let t = parse_pgc(&pgc, 0, 1).unwrap();
+        assert_eq!(t.ast_ctl, [0x8100, 0, 0, 0, 0, 0, 0, 0x8700]);
     }
 
     #[test]
@@ -2046,6 +2089,7 @@ mod tests {
             ],
             chapter_times: vec![0.0, 100.0, 200.0],
             palette: None,
+            ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
         };
@@ -2069,6 +2113,7 @@ mod tests {
             ],
             chapter_times: vec![0.0, 50.0],
             palette: None,
+            ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
         };
@@ -2088,6 +2133,7 @@ mod tests {
             cells: vec![cell(0, 9, 0b1001_0000), cell(10, 19, 0b1101_0000)],
             chapter_times: vec![0.0],
             palette: None,
+            ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
         };
@@ -2104,6 +2150,7 @@ mod tests {
             cells: vec![],
             chapter_times: vec![],
             palette: None,
+            ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
         };

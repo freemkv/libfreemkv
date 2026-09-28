@@ -73,31 +73,6 @@ impl Disc {
             });
             // TODO(spec): DefaultDuration/cadence deferred.
 
-            // PID derives from private_stream_1 sub-id via dvd_audio_pid;
-            // MP1/MP2 (no sub-id) fall back to 0xBD00+ordinal.
-            let audio_streams: Vec<Stream> = ts
-                .audio_streams
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    let codec = a.codec;
-                    let pid = a
-                        .sub_stream_id
-                        .and_then(crate::mux::ps::dvd_audio_pid)
-                        .unwrap_or(0xBD00 + i as u16);
-                    Stream::Audio(AudioStream {
-                        pid,
-                        codec,
-                        channels: AudioChannels::from_count(a.channels),
-                        language: a.language.clone(),
-                        sample_rate: SampleRate::from_hz(a.sample_rate),
-                        secondary: false,
-                        purpose: crate::disc::LabelPurpose::Normal,
-                        label: String::new(),
-                    })
-                })
-                .collect();
-
             for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
 
@@ -219,7 +194,7 @@ impl Disc {
                 }
 
                 let mut streams = vec![video_stream.clone()];
-                streams.extend(audio_streams.iter().cloned());
+                streams.extend(title_audio_streams(ts, dvd_title, title_number));
                 streams.extend(subtitle_streams);
 
                 // Chapter times are absolute from the PGC start. When leading cells are
@@ -258,6 +233,54 @@ impl Disc {
         }
         Ok((titles, nav_feature))
     }
+}
+
+// This title's audio tracks: logical stream i plays the physical stream its PGC_AST_CTL
+// names (libdvdnav semantics), absent streams get no track, a repeated physical id keeps
+// the first. A PGC marking nothing present keeps the positional ids rather than go silent.
+fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> Vec<Stream> {
+    let declared = &ts.audio_streams;
+    let any_present = declared
+        .iter()
+        .zip(t.ast_ctl)
+        .any(|(_, c)| ifo::audio_stream_number(c).is_some());
+    if !any_present && !declared.is_empty() {
+        let outcome = "positional sub-stream ids";
+        crate::diag::dvd_ctl_none_present("ast", ts.vts_number, title, declared.len(), outcome);
+    }
+    let mut kept: Vec<(u16, &str)> = Vec::new();
+    let mut out = Vec::new();
+    for (i, (a, ctl)) in declared.iter().zip(t.ast_ctl).enumerate() {
+        let sub_id = if any_present {
+            let Some(n) = ifo::audio_stream_number(ctl) else {
+                continue;
+            };
+            ifo::audio_sub_stream_id(a.codec, n)
+        } else {
+            a.sub_stream_id
+        };
+        // MPEG audio has no private_stream_1 sub-id: 0xBD00 + logical index.
+        let pid = sub_id
+            .and_then(crate::mux::ps::dvd_audio_pid)
+            .unwrap_or(0xBD00 + i as u16);
+        if let Some((_, first)) = kept.iter().find(|(p, _)| *p == pid) {
+            let sub = (pid & 0xFF) as u8;
+            crate::diag::dvd_ctl_duplicate("ast", ts.vts_number, title, sub, first, &a.language);
+            continue;
+        }
+        kept.push((pid, &a.language));
+        out.push(Stream::Audio(AudioStream {
+            pid,
+            codec: a.codec,
+            channels: AudioChannels::from_count(a.channels),
+            language: a.language.clone(),
+            sample_rate: SampleRate::from_hz(a.sample_rate),
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        }));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -518,7 +541,130 @@ mod tests {
             .map(|i| 0x8000_0000 | (i << 24) | (i << 16) | (i << 8) | i)
             .collect();
         set_spst(&mut d, &ordinal);
+        let ast: Vec<u16> = (0..audio.len() as u16).map(|i| 0x8000 | (i << 8)).collect();
+        set_ast(&mut d, &ast);
         d
+    }
+
+    // Overwrites build_vts's PGC_AST_CTL (PGC+0x0C, 8 x u16 BE).
+    fn set_ast(vts: &mut [u8], ctl: &[u16]) {
+        let at = 2 * 2048 + 0x100 + 0x0C;
+        for (i, c) in ctl.iter().enumerate() {
+            vts[at + i * 2..at + i * 2 + 2].copy_from_slice(&c.to_be_bytes());
+        }
+    }
+
+    // Scans a one-VTS disc and returns its first title's (pid, language) audio tracks.
+    fn scan_audio(vts: Vec<u8>) -> (Vec<(u16, String)>, Vec<String>) {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let (t, ev) = crate::testlog::capture(|| {
+            Disc::scan_dvd_titles(&mut disc, &udf, None)
+                .expect("scan")
+                .0
+        });
+        let audio = t[0]
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some((a.pid, a.language.clone())),
+                _ => None,
+            })
+            .collect();
+        (audio, diag_lines(&ev))
+    }
+
+    const AC3_6CH: (u8, u8) = (0x00, 0x05);
+    const DTS_6CH: (u8, u8) = (0xC0, 0x05);
+    const MP2_2CH: (u8, u8) = (0x40, 0x01);
+
+    fn aud(c: (u8, u8), lang: &[u8; 2]) -> (u8, u8, [u8; 2]) {
+        (c.0, c.1, *lang)
+    }
+
+    /// L084b: the physical audio stream number comes from PGC_AST_CTL bits 10-8, not the
+    /// logical position (the one-5.1-stream-on-0x81 case the channel probe papered over).
+    #[test]
+    fn scan_dvd_titles_audio_uses_ast_ctl_stream_number() {
+        let mut vts = build_vts(0, 0x00, &[aud(AC3_6CH, b"en")], &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x8100]);
+        assert_eq!(scan_audio(vts).0, vec![(0xBD81, "eng".to_string())]);
+    }
+
+    /// Codec base + AST_CTL number per libdvdnav; reserved bits 14-11 are masked off.
+    #[test]
+    fn scan_dvd_titles_audio_ast_ctl_codec_base_and_mask() {
+        let audio = [aud(DTS_6CH, b"en"), aud(AC3_6CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0xFA00, 0x8300]);
+        assert_eq!(
+            scan_audio(vts).0,
+            vec![(0xBD8A, "eng".to_string()), (0xBD83, "fra".to_string())]
+        );
+    }
+
+    /// A stream AST_CTL marks absent gets no track; a repeated physical id keeps the first.
+    #[test]
+    fn scan_dvd_titles_audio_skips_absent_and_duplicate() {
+        let audio = [
+            aud(AC3_6CH, b"en"),
+            aud(AC3_6CH, b"fr"),
+            aud(AC3_6CH, b"de"),
+        ];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x0000, 0x8200, 0x8200]);
+        let (tracks, diag) = scan_audio(vts);
+        assert_eq!(tracks, vec![(0xBD82, "fra".to_string())]);
+        assert!(
+            diag.iter().any(|m| m.contains("tag=dvd.astctl")
+                && m.contains("sub_id=0x82 kept=\"fra\" dropped=\"deu\"")),
+            "{diag:?}"
+        );
+    }
+
+    /// No AST_CTL entry present at all: keep every declared stream on its positional id
+    /// (the pre-AST_CTL mapping) rather than rip silently, and trace it.
+    #[test]
+    fn scan_dvd_titles_audio_all_absent_falls_back_to_position() {
+        let audio = [aud(AC3_6CH, b"en"), aud(DTS_6CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0, 0]);
+        let (tracks, diag) = scan_audio(vts);
+        assert_eq!(
+            tracks,
+            vec![(0xBD80, "eng".to_string()), (0xBD89, "fra".to_string())]
+        );
+        assert!(
+            diag.iter()
+                .any(|m| m.contains("tag=dvd.astctl") && m.contains("declared=2 present=0")),
+            "{diag:?}"
+        );
+    }
+
+    /// MPEG audio has no private_stream_1 sub-id: AST_CTL still gates presence, and the
+    /// PID keeps its 0xBD00 + logical-index fallback.
+    #[test]
+    fn scan_dvd_titles_mp2_audio_honours_ast_presence() {
+        let audio = [aud(MP2_2CH, b"en"), aud(MP2_2CH, b"fr")];
+        let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+        set_ast(&mut vts, &[0x0000, 0x8000]);
+        assert_eq!(scan_audio(vts).0, vec![(0xBD01, "fra".to_string())]);
     }
 
     // Overwrites build_vts's PGC_SPST_CTL (PGC+0x1C, 32 x u32 BE).

@@ -276,8 +276,8 @@ pub fn mux_stream(
                 key_fetch,
             } => {
                 // Prune to selected audio/subtitle streams BEFORE the highway
-                // builds demux state (and before probe_and_remap rewrites DVD
-                // AC-3 PIDs). Video is always kept; no-op for default All/All.
+                // builds demux state (and before the DVD AC-3 channel probe).
+                // Video is always kept; no-op for default All/All.
                 let mut title = title;
                 opts.selection
                     .apply(&mut title)

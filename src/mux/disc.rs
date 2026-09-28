@@ -247,9 +247,8 @@ impl DiscStream {
         // decrypts to broken TS is the muxer's concern, not loss to conceal.
         let mut reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
 
-        // Wrong-substream fix (Silence-of-the-Lambs): re-route the title's
-        // declared AC-3 audio onto the physically-correct `0x8x` sub-streams
-        // by probing real channel counts off the feature's head. No-op otherwise.
+        // Diagnostics only: logs each physical AC-3 sub-stream's real channel count
+        // at --log-level 3. Routing is the scanner's PGC AST_CTL map.
         crate::disc::dvd_audio_probe::probe_and_remap(&mut reader, &mut title);
 
         // Use the CANONICAL builder shared with the file-backed highway
