@@ -24,7 +24,9 @@ thread_local! {
 }
 
 /// Build an AES-128 key schedule for a caller that will drive
-/// [`cbc_decrypt_blocks`] over several regions under one key.
+/// [`cbc_decrypt_blocks`] over several regions under one key. Also used by the
+/// `aacs::derive` cvalue-candidate ECB scan (L104), which shares one schedule
+/// per Processing Key across every candidate instead of building one per call.
 pub(crate) fn new_cipher_for(key: &[u8; 16]) -> Aes128 {
     new_cipher(key)
 }

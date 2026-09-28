@@ -320,6 +320,11 @@ struct VariantMkb<'a> {
     /// `Kvn = AES-G(Kp, Nonce) & 0xFFFF` (`[C]` §2.1.3 / this module's chain doc). Depends only
     /// on `Kp` and the MKB's Nonce — both loop-invariant across every slot a given `Kp` is tried
     /// against (L103) — so [`derive_media_key_variant`] computes it ONCE, not per slot.
+    ///
+    /// The closest published precedent for this `Kvn` shape is `[C]` §3.2.5.2.2 "Variant
+    /// Number Record" (Table 3-12), PDF p.29: "Kvn = [AES-G(Kp, Nonce)]lsb_10" (10-bit, for a
+    /// content-variation number, record type `0x0D`). This module's `0x2d`/`0x2f` chain is a
+    /// distinct, reverse-engineered AACS 2.1 scheme — same `AES-G(Kp, Nonce)` shape, 16-bit.
     kvn: u16,
 }
 
