@@ -57,6 +57,8 @@ pub struct PrefetchedSectorSource {
     /// not end-of-stream — and `read_sectors` must keep saying so instead
     /// of answering `Ok(0)` for the rest of the title.
     producer_failed: bool,
+    /// The reader's unmapped stream files, snapshotted before it moved to the producer.
+    unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
 }
 
 impl PrefetchedSectorSource {
@@ -120,6 +122,7 @@ impl PrefetchedSectorSource {
             .sum::<u64>()
             .min(u32::MAX as u64) as u32;
         let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
+        let unmapped = reader.unmapped_stream_files().to_vec();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
         let batch_bytes = batch_sectors as usize * 2048;
@@ -253,6 +256,7 @@ impl PrefetchedSectorSource {
             producer: Some(producer),
             total_sectors,
             producer_failed: false,
+            unmapped,
         })
     }
 
@@ -313,6 +317,10 @@ impl Drop for PrefetchedSectorSource {
 impl SectorSource for PrefetchedSectorSource {
     fn capacity_sectors(&self) -> u32 {
         self.total_sectors
+    }
+
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        &self.unmapped
     }
 
     fn read_sectors(
@@ -507,6 +515,19 @@ mod tests {
             }
             Err(_) => panic!("watchdog timeout — likely deadlock/hang in prefetch read path"),
         }
+    }
+
+    // The producer thread takes the reader by value, so the list is snapshotted
+    // at construction and still forwarded afterwards.
+    #[test]
+    fn prefetched_source_forwards_unmapped_stream_files() {
+        use crate::sector::bus_removal::test_support::{Reports, m2ts1, unmapped_paths};
+        let ext = vec![crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+        let s = PrefetchedSectorSource::new(Reports(vec![m2ts1()]), ext, 3, None).unwrap();
+        assert_eq!(unmapped_paths(&s), ["/BDMV/STREAM/00001.m2ts"]);
     }
 
     // Regression: dropping a `PrefetchedSectorSource` DIRECTLY, before extents are drained,

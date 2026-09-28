@@ -568,6 +568,10 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
         self.inner.capacity_sectors()
     }
 
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.inner.unmapped_stream_files()
+    }
+
     fn read_sectors(
         &mut self,
         lba: u32,

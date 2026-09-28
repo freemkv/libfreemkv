@@ -1297,6 +1297,14 @@ impl SectorSource for Drive {
     fn set_speed(&mut self, kbs: u16) {
         Drive::set_speed(self, kbs);
     }
+
+    // Only a host-key stage leaves sectors bus-encrypted; firmware de-busses at the drive.
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        match (&self.bus_stage, &self.bus_gate) {
+            (crate::sector::bus_removal::BusStage::AacsHostKey(_), Some(g)) => g.map().unmapped(),
+            _ => &[],
+        }
+    }
 }
 
 /// Find an optical drive on this system and open it, **preferring a drive
@@ -1922,6 +1930,30 @@ mod command_tests {
         assert_eq!(
             got, wire,
             "None must map to Passthrough — no host-side de-bus, bytes returned verbatim"
+        );
+    }
+
+    // Only a host-key stage leaves sectors bus-encrypted, so only it reports unmapped files.
+    #[test]
+    fn unmapped_stream_files_are_reported_only_under_a_host_key_stage() {
+        use crate::sector::SectorSource;
+        let file = crate::sector::bus_removal::UnmappedStreamFile::new(
+            "/BDMV/STREAM/00001.m2ts".into(),
+            40,
+            &crate::error::Error::UdfAdChainTooLong,
+        );
+        let map = || {
+            crate::sector::bus_removal::BusMap::from_ranges(&[(300, 3)])
+                .with_unmapped(vec![file.clone()])
+        };
+        let mut d = drive_with(Vec::new());
+        assert!(d.unmapped_stream_files().is_empty(), "no stage wired");
+        crate::disc::Disc::wire_bus_removal(&mut d, Some([0x6B; 16]), map());
+        assert_eq!(d.unmapped_stream_files(), std::slice::from_ref(&file));
+        crate::disc::Disc::wire_bus_removal(&mut d, None, map());
+        assert!(
+            d.unmapped_stream_files().is_empty(),
+            "firmware route de-busses at the drive"
         );
     }
 

@@ -1,4 +1,8 @@
 //! MPEG audio framing and validation.
+//!
+//! Spec text is quoted from ISO/IEC 11172-3 (the public CD text of §2.4) and ISO/IEC
+//! 13818-3:1994 (lower sampling frequencies, ID '0'). The version field value '00' ("MPEG
+//! 2.5") is a de facto extension that neither standard defines.
 
 use super::audio_frames::{AudioFrames, Header, Sync};
 #[cfg(test)]
@@ -24,12 +28,13 @@ fn mpa_verdict(data: &[u8]) -> MpaVerdict {
         return MpaVerdict::NoSync;
     }
     let h = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    // 11-bit sync (0x7FF at the top).
+    // [11172-3 §2.4.2.3] syncword: "the bit string '1111 1111 1111'." MPEG 2.5 (not ISO)
+    // reuses its last bit as a version bit, so only the first 11 are required here.
     if (h & 0xffe0_0000) != 0xffe0_0000 {
         return MpaVerdict::NoSync;
     }
-    // Reject per spec: version field 01, layer field 00, bitrate_index 15,
-    // sample-rate field 3.
+    // [11172-3 §2.4.2.3] Layer: "00" reserved; sampling_frequency: '11' reserved;
+    // [13818-3 §2.4.2.3] bitrate_index "'1111' forbidden"; version '01' is reserved.
     if (h & (3 << 19)) == (1 << 19)
         || (h & (3 << 17)) == 0
         || (h & (0xf << 12)) == (0xf << 12)
@@ -43,7 +48,8 @@ fn mpa_verdict(data: &[u8]) -> MpaVerdict {
     MpaVerdict::Valid
 }
 
-// ISO/IEC 11172-3 and 13818-3 header bitrate tables, in kbit/s.
+// [11172-3 §2.4.2.3] bit_rate_index tables (ID '1') and [13818-3 §2.4.2.3] "for ID=0", kbit/s;
+// index 0 is "'0000' free format".
 const MPEG1_L1: [u32; 15] = [
     0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
 ];
@@ -110,12 +116,17 @@ fn free_format_bytes(
     })
 }
 
+// [11172-3 §2.4.3.1] "N = 12 * bit_rate / sampling_frequency." (Layer I; [§2.1] "In Layer I a
+// slot equals four bytes") and "N = 144 * bit_rate / sampling_frequency." (Layers II/III, one
+// byte); [§2.4.2.3] padding_bit "'1'": "the frame contains an additional slot".
 fn frame_header(data: &[u8], free_size: &mut Option<usize>, eos: bool) -> Option<Header> {
     if !matches!(mpa_verdict(data), MpaVerdict::Valid) {
         return None;
     }
     let version = (data[1] >> 3) & 3;
     let layer = (data[1] >> 1) & 3;
+    // [11172-3 §2.4.2.3] sampling_frequency '00' 44.1, '01' 48, '10' 32 kHz; [13818-3] for
+    // ID '0': '00' 22,05, '01' 24, '10' 16 kHz.
     let rate = [44100, 48000, 32000][usize::from((data[2] >> 2) & 3)]
         >> match version {
             3 => 0,
@@ -131,6 +142,8 @@ fn frame_header(data: &[u8], free_size: &mut Option<usize>, eos: bool) -> Option
     };
     let bitrate = rates[usize::from(data[2] >> 4)] * 1000;
     let padding = u32::from((data[2] >> 1) & 1);
+    // [11172-3 §2.4.2.1] frame: "In Layer I it contains information for 384 samples and in Layer
+    // II for 1152 samples", "In Layer III ... 1152 samples"; 576 for ID '0' Layer III.
     let samples = match layer {
         3 => 384,
         1 if version != 3 => 576,
@@ -163,6 +176,17 @@ fn frame_header(data: &[u8], free_size: &mut Option<usize>, eos: bool) -> Option
     })
 }
 
+// Header fields a stream keeps: [11172-3 §2.4.2.3] "To change the layer, a reset of the decoder
+// is required." and likewise the sampling rate (and so ID). Mode and bitrate may change.
+fn mpa_stream_key(d: &[u8]) -> u32 {
+    u32::from(d[1] & 0x1E) << 8 | u32::from(d[2] & 0x0C)
+}
+
+// Size of a valid frame at the slice head, with no parser state touched.
+pub(super) fn mpa_frame_len(d: &[u8]) -> Option<usize> {
+    frame_header(d, &mut None, false).map(|h| h.bytes)
+}
+
 pub struct MpegAudioParser {
     frames: AudioFrames,
     // Free-format frame size (without padding), learned from the first sync spacing.
@@ -180,14 +204,27 @@ impl MpegAudioParser {
                 "mpegaudio",
                 Sync {
                     mask: 0xe0,
-                    frame_len: |d| frame_header(d, &mut None, false).map(|h| h.bytes),
+                    frame_len: mpa_frame_len,
+                    fixed: mpa_stream_key,
+                    frame_ns: |d| {
+                        let h = frame_header(d, &mut None, false)?;
+                        Some(u64::from(h.samples) * 1_000_000_000 / u64::from(h.rate))
+                    },
+                    // Smallest fixed-rate frame: ID '0' Layer III, 8 kbit/s at 24 kHz, 24 bytes.
+                    min_frame: 24,
                 },
             ),
             free_size: None,
         }
     }
+    /// Access units dropped as undecodable: a lower bound where no later timestamp measured a
+    /// corrupt run (at EOS or a gap), which counts the fewest AUs it allows.
     pub fn dropped_frames(&self) -> u64 {
         self.frames.dropped_frames()
+    }
+    #[cfg(test)]
+    pub(crate) fn verified_dropped(&self) -> u64 {
+        self.frames.verified_dropped()
     }
     pub fn dropped_duration_ns(&self) -> u64 {
         self.frames.dropped_duration_ns()
@@ -528,6 +565,260 @@ mod tests {
         assert_eq!(f[0].pts_ns, pts_to_ns(90_000));
     }
 
+    // Both sides of one rule: after a drop, a frame whose size cannot be settled by EOS is no
+    // lock. A lone real free-format frame there is lost (free format never occurs on DVD/BD),
+    // so a false free-format header in corrupt payload cannot swallow the good frames after it.
+    #[test]
+    fn a_free_format_size_unsettled_at_eos_is_no_lock() {
+        let mut bad = mp3_frame();
+        bad[2] = 0x9C; // reserved sample rate
+        let mut p = MpegAudioParser::new();
+        assert_eq!(p.parse(&make_pes(mp3_frame(), Some(0))).len(), 1);
+        p.parse(&make_pes([bad.clone(), free_frame()].concat(), None));
+        assert!(
+            p.flush().is_empty(),
+            "limit: the lone free-format frame is not emitted"
+        );
+
+        let mut fake_in_bad = bad;
+        fake_in_bad[40..44].copy_from_slice(&[0xFF, 0xFB, 0x00, 0x00]); // free format, no successor
+        let tail = [mp3_frame(), mp3_frame()].concat();
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(mp3_frame(), Some(0)));
+        f.extend(p.parse(&make_pes([&fake_in_bad[..], &tail].concat(), None)));
+        f.extend(p.flush());
+        assert_eq!(
+            f.len(),
+            3,
+            "both good frames after the false header are kept"
+        );
+    }
+
+    // A good frame between two corrupt ones is kept: it ends at a sync-shaped header and
+    // matches the stream's key. A stray header with another sampling rate is not.
+    #[test]
+    fn good_then_corrupt_frames_keep_the_good_one() {
+        let mut bad = mp3_frame();
+        bad[2] = 0x9C; // reserved sample rate
+        let mut fake = vec![0xFF, 0xFB, 0x14, 0x00]; // 32 kbit/s at 48 kHz (96 bytes)
+        fake.resize(96, 0x11);
+        bad[40..136].copy_from_slice(&fake);
+        bad[136..138].copy_from_slice(&[0xFF, 0xE0]);
+        let data = [mp3_frame(), bad.clone(), mp3_frame(), bad, mp3_frame()].concat();
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(data, Some(0)));
+        f.extend(p.flush());
+        assert_eq!(f.len(), 3);
+        assert!(f.iter().all(|fr| fr.data == mp3_frame()));
+        assert_eq!(p.dropped_frames(), 2);
+    }
+
+    // [11172-3 §2.4.2.3] "'00' stereo / '01' joint_stereo (intensity_stereo and/or ms_stereo)":
+    // a stereo stream may code any frame as joint_stereo, so after a drop that frame is kept.
+    #[test]
+    fn a_joint_stereo_frame_in_a_stereo_stream_is_kept_after_a_drop() {
+        let mut bad = mp3_frame();
+        bad[2] = 0x9C; // reserved sample rate
+        let mut joint = mp3_frame();
+        joint[3] = 0x40; // mode '01' joint_stereo
+        let data = [mp3_frame(), bad.clone(), joint.clone(), bad, mp3_frame()].concat();
+        let mut p = MpegAudioParser::new();
+        let mut f = p.parse(&make_pes(data, Some(0)));
+        f.extend(p.flush());
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[1].data, joint);
+    }
+
+    // [11172-3 §2.4.2.3] "To change the layer, a reset of the decoder is required." and "A reset
+    // of the decoder is required to change the sampling rate." Mode may change (e.g. stereo to
+    // single_channel at a programme boundary), so after a drop such a frame is kept.
+    #[test]
+    fn a_mode_change_is_kept_after_a_drop() {
+        let with_mode = |mode: u8| {
+            let mut f = mp3_frame();
+            f[3] = mode << 6;
+            f
+        };
+        let mut bad = mp3_frame();
+        bad[2] = 0x9C; // reserved sample rate
+        for (from, to) in [(0, 3), (1, 2)] {
+            let data = [
+                with_mode(from),
+                bad.clone(),
+                with_mode(to),
+                bad.clone(),
+                with_mode(to),
+            ];
+            let mut p = MpegAudioParser::new();
+            let mut f = p.parse(&make_pes(data.concat(), Some(0)));
+            f.extend(p.flush());
+            assert_eq!(f.len(), 3, "mode {from} to {to}");
+            assert_eq!(f[1].data, with_mode(to), "mode {from} to {to}");
+        }
+    }
+
+    // A 4-byte header: version 3 = ID '1' (11172-3), 2 = ID '0' (13818-3); layer 3/2/1 = I/II/III.
+    fn mpa(version: u8, layer: u8, bitrate_index: u8, sf: u8, padding: u8, mode: u8) -> Vec<u8> {
+        let mut f = vec![0xFF, 0xE1 | version << 3 | layer << 1];
+        f.extend([bitrate_index << 4 | sf << 2 | padding << 1, mode << 6]);
+        f
+    }
+    fn hdr(f: &[u8]) -> Option<Header> {
+        frame_header(f, &mut None, false)
+    }
+
+    // [11172-3 §2.4.2.3] syncword: "the bit string '1111 1111 1111'." (11 of them checked).
+    #[test]
+    fn spec_syncword() {
+        let f = mpa(3, 1, 9, 0, 0, 0);
+        assert!(matches!(mpa_verdict(&f), MpaVerdict::Valid));
+        for bit in 0..11 {
+            let mut g = f.clone();
+            g[bit / 8] &= !(0x80 >> (bit % 8));
+            assert!(
+                matches!(mpa_verdict(&g), MpaVerdict::NoSync),
+                "sync bit {bit}"
+            );
+        }
+    }
+
+    // [13818-3 §2.4.2.3] ID: "Equals '1' for ISO/IEC 11172-3, '0' for extension to lower
+    // sampling frequencies." Its sampling_frequency table: "'00' 22,05", "'01' 24", "'10' 16".
+    #[test]
+    fn spec_id_selects_the_sampling_frequency_table() {
+        for (sf, mpeg1, mpeg2) in [(0, 44100, 22050), (1, 48000, 24000), (2, 32000, 16000)] {
+            assert_eq!(hdr(&mpa(3, 2, 4, sf, 0, 0)).unwrap().rate, mpeg1);
+            assert_eq!(hdr(&mpa(2, 2, 4, sf, 0, 0)).unwrap().rate, mpeg2);
+        }
+    }
+
+    // [11172-3 §2.4.2.3] sampling_frequency: "'11' reserved"; [13818-3] likewise for ID '0'.
+    #[test]
+    fn spec_sampling_frequency_11_is_reserved() {
+        for version in [3, 2] {
+            assert!(matches!(
+                mpa_verdict(&mpa(version, 2, 4, 3, 0, 0)),
+                MpaVerdict::Invalid
+            ));
+        }
+    }
+
+    // [11172-3 §2.4.2.3] Layer: "11" Layer I, "10" Layer II, "01" Layer III, "00" reserved.
+    #[test]
+    fn spec_layer_table() {
+        let samples = |layer| hdr(&mpa(3, layer, 4, 0, 0, 0)).map(|h| h.samples);
+        assert_eq!(
+            [samples(3), samples(2), samples(1)],
+            [Some(384), Some(1152), Some(1152)]
+        );
+        assert!(matches!(
+            mpa_verdict(&mpa(3, 0, 4, 0, 0, 0)),
+            MpaVerdict::Invalid
+        ));
+    }
+
+    // [11172-3 §2.4.2.3] bit_rate_index rows (Layer I / II / III kbit/s): '0001' 32 32 32,
+    // '0010' 64 48 40, '1001' 288 160 128, '1110' 448 384 320.
+    #[test]
+    fn spec_mpeg1_bitrate_table() {
+        for (i, l1, l2, l3) in [
+            (1, 32, 32, 32),
+            (2, 64, 48, 40),
+            (9, 288, 160, 128),
+            (14, 448, 384, 320),
+        ] {
+            assert_eq!(
+                (MPEG1_L1[i], MPEG1_L2[i], MPEG1_L3[i]),
+                (l1, l2, l3),
+                "index {i}"
+            );
+        }
+    }
+
+    // [13818-3 §2.4.2.3] "for ID=0" (Layer I / Layer II, Layer III kbit/s): '0001' 32 8,
+    // '1001' 144 80, '1110' 256 160, '1111' forbidden forbidden.
+    #[test]
+    fn spec_mpeg2_bitrate_table() {
+        for (i, l1, l23) in [(1, 32, 8), (9, 144, 80), (14, 256, 160)] {
+            assert_eq!((MPEG2_L1[i], MPEG2_L23[i]), (l1, l23), "index {i}");
+        }
+        for layer in 1..4 {
+            assert!(matches!(
+                mpa_verdict(&mpa(2, layer, 15, 0, 0, 0)),
+                MpaVerdict::Invalid
+            ));
+            assert!(matches!(
+                mpa_verdict(&mpa(3, layer, 15, 0, 0, 0)),
+                MpaVerdict::Invalid
+            ));
+        }
+    }
+
+    // [11172-3 §2.4.2.3] bit_rate_index: "The all zero value indicates the 'free format'
+    // condition": legal, sized by the distance to the next syncword.
+    #[test]
+    fn spec_free_format_is_legal() {
+        assert!(matches!(
+            mpa_verdict(&mpa(3, 1, 0, 0, 0, 0)),
+            MpaVerdict::Valid
+        ));
+    }
+
+    // [11172-3 §2.4.3.1] "N = 12 * bit_rate / sampling_frequency." for Layer I, in slots of
+    // four bytes ([§2.1]); padding_bit '1': "the frame contains an additional slot".
+    #[test]
+    fn spec_layer1_frame_is_n_four_byte_slots() {
+        // 384 kbit/s at 48 kHz: N = 96 slots.
+        assert_eq!(hdr(&mpa(3, 3, 12, 1, 0, 0)).unwrap().bytes, 96 * 4);
+        assert_eq!(hdr(&mpa(3, 3, 12, 1, 1, 0)).unwrap().bytes, 97 * 4);
+    }
+
+    // [11172-3 §2.4.3.1] "N = 144 * bit_rate / sampling_frequency." (Layers II and III) "If this
+    // calculation does not give an integer number the result is truncated".
+    #[test]
+    fn spec_layer2_and_3_frames_are_n_byte_slots() {
+        assert_eq!(hdr(&mpa(3, 2, 10, 1, 0, 0)).unwrap().bytes, 576); // 192 kbit/s, 48 kHz
+        assert_eq!(hdr(&mpa(3, 2, 10, 1, 1, 0)).unwrap().bytes, 577);
+        assert_eq!(hdr(&mpa(3, 1, 9, 0, 0, 0)).unwrap().bytes, 417); // 128 kbit/s: 417.96
+        assert_eq!(hdr(&mpa(3, 1, 9, 0, 1, 0)).unwrap().bytes, 418);
+    }
+
+    // [11172-3 §2.4.2.3] protection_bit: "Equals '1' if no redundancy has been added, '0' if
+    // redundancy has been added." The crc_check stays inside the frame; the size is the same.
+    #[test]
+    fn spec_protection_bit_does_not_change_the_frame_size() {
+        let plain = mpa(3, 1, 9, 0, 0, 0);
+        let mut crc = plain.clone();
+        crc[1] &= !1;
+        assert!(matches!(mpa_verdict(&crc), MpaVerdict::Valid));
+        let (a, b) = (hdr(&crc).unwrap(), hdr(&plain).unwrap());
+        assert_eq!((a.bytes, a.skip), (b.bytes, b.skip));
+    }
+
+    // [11172-3 §2.4.2.3] "To change the layer, a reset of the decoder is required." and "A reset
+    // of the decoder is required to change the sampling rate."; "Layer III supports variable
+    // bitrate by switching the bit_rate_index". Nothing restricts the mode, so it is not keyed.
+    #[test]
+    fn spec_stream_key() {
+        let key = |f: Vec<u8>| mpa_stream_key(&f);
+        let base = key(mpa(3, 1, 9, 0, 0, 0));
+        assert_eq!(
+            base,
+            key(mpa(3, 1, 11, 0, 1, 0)),
+            "bitrate and padding vary"
+        );
+        for mode in 1..4 {
+            assert_eq!(
+                base,
+                key(mpa(3, 1, 9, 0, 0, mode)),
+                "mode {mode} may change"
+            );
+        }
+        assert_ne!(base, key(mpa(3, 2, 9, 0, 0, 0)), "layer");
+        assert_ne!(base, key(mpa(3, 1, 9, 1, 0, 0)), "sampling_frequency");
+        assert_ne!(base, key(mpa(2, 1, 9, 0, 0, 0)), "ID");
+    }
+
     #[test]
     fn non_sync_packet_passes_through() {
         // No 11-bit sync → not a validatable frame → keep (conservative).
@@ -543,7 +834,9 @@ mod tests {
         let mut bad = mp3_frame();
         bad[2] = 0x9C; // reserved sample rate
         assert!(p.parse(&make_pes(bad, Some(90000))).is_empty());
-        let f = p.parse(&make_pes(mp3_frame(), Some(96000)));
+        // The first frame after a drop waits for a successor to confirm it, here EOS.
+        let mut f = p.parse(&make_pes(mp3_frame(), Some(96000)));
+        f.extend(p.flush());
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].pts_ns,
