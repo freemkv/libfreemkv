@@ -48,6 +48,9 @@ impl DvdSubParser {
         // borrow through `?` rather than a prod `unwrap()` on a fact the
         // compiler can't see across the two lines.
         let (facts, _, data) = self.pending.take()?;
+        // Guaranteed Some: `pending` is only ever created from a PES with
+        // `pts.is_some()` (L054 dropped the no-PTS orphan path), so this
+        // never takes the fallback; kept as unwrap_or, never a prod unwrap.
         let pts_ns = facts.presentation_ns().unwrap_or(0);
         Some(Frame {
             discontinuity: false,
@@ -72,30 +75,38 @@ impl CodecParser for DvdSubParser {
         // PTS present == start of a new SPU (continuations carry none); a PTS
         // while `pending` is still open (lost continuation/corrupt SPU_size)
         // force-emits it truncated rather than swallowing all later SPUs.
-        if pes.pts.is_none() {
-            if self.pending.is_some() {
-                // Continuation: append, bounded by MAX_SPU_BYTES.
-                if let Some((_, _, buf)) = self.pending.as_mut() {
-                    let room = MAX_SPU_BYTES.saturating_sub(buf.len());
-                    let take = room.min(pes.data.len());
-                    buf.extend_from_slice(&pes.data[..take]);
+        let pts = match pes.pts {
+            None => {
+                if self.pending.is_some() {
+                    // Continuation: append, bounded by MAX_SPU_BYTES.
+                    if let Some((_, _, buf)) = self.pending.as_mut() {
+                        let room = MAX_SPU_BYTES.saturating_sub(buf.len());
+                        let take = room.min(pes.data.len());
+                        buf.extend_from_slice(&pes.data[..take]);
+                    }
+                    if let Some(frame) = self.take_if_complete(false) {
+                        out.push(frame);
+                    }
+                    return out;
                 }
-                if let Some(frame) = self.take_if_complete(false) {
-                    out.push(frame);
-                }
+                // Orphan continuation (no pending, no PTS): a fresh SPU at
+                // pts 0 would put a garbage bitmap at 00:00:00. PGS drops
+                // the same case, so drop here too (L054).
                 return out;
             }
-            // Orphan continuation (no pending, no PTS): a fresh SPU at pts 0
-            // would put a garbage bitmap at 00:00:00. PGS drops the same
-            // case, so drop here too (L054).
-            return out;
-        } else if let Some(frame) = self.take_if_complete(true) {
-            // New SPU starting while a previous one is still open → flush stale.
-            out.push(frame);
-        }
+            Some(pts) => {
+                if let Some(frame) = self.take_if_complete(true) {
+                    // New SPU starting while a previous one is still open →
+                    // flush stale.
+                    out.push(frame);
+                }
+                pts
+            }
+        };
 
         // Start of a new SPU. The first 2 bytes are the big-endian total size.
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        // `pts` is always real here — the no-PTS arm above always returns.
+        let pts_ns = pts_to_ns(pts);
         let declared = if pes.data.len() >= 2 {
             // SPU_size includes the 2-byte header, so a declared size < 2 is
             // always malformed; treat it like the too-short path (lone frame)

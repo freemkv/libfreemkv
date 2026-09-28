@@ -201,6 +201,11 @@ pub struct PgsParser {
     /// (L026). Always 0 when `pending` doesn't hold a clear set; reset
     /// whenever `pending` is assigned a fresh set.
     clear_scan_offset: usize,
+    /// Test-only: total iterations of the `complete_clear_pts` walk loop,
+    /// proving the walk stays O(n) in the number of appends rather than
+    /// O(n^2) (L026).
+    #[cfg(test)]
+    scan_steps: u64,
 }
 
 impl Default for PgsParser {
@@ -215,6 +220,8 @@ impl PgsParser {
         Self {
             pending: None,
             clear_scan_offset: 0,
+            #[cfg(test)]
+            scan_steps: 0,
         }
     }
 
@@ -233,7 +240,13 @@ impl PgsParser {
         let presentation_ns = facts.presentation_ns();
         let mut offset = self.clear_scan_offset.min(data.len());
         let mut found_end = false;
+        #[cfg(test)]
+        let mut steps = 0u64;
         while data.len() - offset >= 3 {
+            #[cfg(test)]
+            {
+                steps += 1;
+            }
             let rest = &data[offset..];
             let size = 3 + usize::from(u16::from_be_bytes([rest[1], rest[2]]));
             if size > rest.len() {
@@ -247,6 +260,10 @@ impl PgsParser {
             offset += size;
         }
         self.clear_scan_offset = offset;
+        #[cfg(test)]
+        {
+            self.scan_steps += steps;
+        }
         if found_end { presentation_ns } else { None }
     }
 
@@ -951,34 +968,63 @@ mod tests {
     }
 
     #[test]
-    fn complete_clear_pts_scan_cost_is_linear_in_appends_not_quadratic() {
-        use std::time::Instant;
+    fn clear_scan_offset_tracks_confirmed_segments_across_appends() {
+        // Deterministic (no wall-clock): after each append, `clear_scan_offset`
+        // must sit at the buffer's confirmed end, proving the walk resumes
+        // rather than rescanning from byte 0 every call (L026).
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(0), Some(0)));
+        // The opening clear PCS is itself one complete (non-END) segment, so
+        // the very first call already confirms the whole 14-byte buffer.
+        assert_eq!(parser.clear_scan_offset, pcs_bytes(0).len());
 
-        fn run(appends: usize) -> std::time::Duration {
-            let mut parser = PgsParser::new();
-            // Open a pending clear set that never resolves (no END arrives).
-            let _ = parser.parse(&make_pes(pcs_bytes(0), Some(0)));
-            let seg = vec![0x17u8, 0x00, 0x02, 0xAA, 0xBB]; // 5-byte non-PCS segment
-            let start = Instant::now();
-            for _ in 0..appends {
-                let _ = parser.parse(&make_pes(seg.clone(), None));
-            }
-            start.elapsed()
+        let seg = vec![0x17u8, 0x00, 0x02, 0xAA, 0xBB]; // one complete 5-byte segment
+        for i in 1..=20u32 {
+            let _ = parser.parse(&make_pes(seg.clone(), None));
+            let data_len = parser.pending.as_ref().unwrap().1.len();
+            assert_eq!(
+                parser.clear_scan_offset, data_len,
+                "after {i} appends the confirmed offset should track to the buffer end"
+            );
         }
 
-        let _ = run(50); // warm-up
+        // A segment split across two PES: the declared payload (7 bytes,
+        // size 10) arrives incomplete first. The confirmed offset must stay
+        // at THAT segment's start, not advance past it.
+        let before = parser.pending.as_ref().unwrap().1.len();
+        let split_head = vec![0x17u8, 0x00, 0x07, 0xAA, 0xAA]; // 5 of 10 bytes
+        let _ = parser.parse(&make_pes(split_head, None));
+        assert_eq!(
+            parser.clear_scan_offset, before,
+            "an incomplete trailing segment must not be confirmed"
+        );
 
-        let base = 4_000usize;
-        let t1 = run(base);
-        let t2 = run(base * 4);
+        // Completing it confirms the whole segment.
+        let _ = parser.parse(&make_pes(vec![0xBB; 5], None)); // remaining 5 of 10
+        let data_len = parser.pending.as_ref().unwrap().1.len();
+        assert_eq!(
+            parser.clear_scan_offset, data_len,
+            "completed split segment is now confirmed"
+        );
+    }
 
-        // Linear: ~4x work for 4x appends. Pre-fix rescan-from-0 (L026): ~16x.
-        // Slack for measurement noise, while still rejecting quadratic growth.
-        let ratio = t2.as_secs_f64() / t1.as_secs_f64().max(1e-9);
+    #[test]
+    fn complete_clear_pts_scan_steps_stay_linear_in_appends() {
+        // Deterministic (no wall-clock): N appends must cost O(N) walk
+        // iterations, not O(N^2) (L026). A 2x-per-append budget has slack yet
+        // still catches a quadratic regression, which blows it by orders of magnitude.
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(0), Some(0)));
+        let seg = vec![0x17u8, 0x00, 0x02, 0xAA, 0xBB];
+        let n: u64 = 5_000;
+        for _ in 0..n {
+            let _ = parser.parse(&make_pes(seg.clone(), None));
+        }
         assert!(
-            ratio < 8.0,
-            "scan cost grew {ratio:.1}x for 4x the appends (t1={t1:?}, t2={t2:?}); \
-             expected ~4x for a linear scan"
+            parser.scan_steps <= 2 * n,
+            "scan_steps {} exceeded the O(n) budget 2*n={} for n={n} appends",
+            parser.scan_steps,
+            2 * n
         );
     }
 }
