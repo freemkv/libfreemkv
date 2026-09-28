@@ -1878,3 +1878,43 @@ fn keyless_session_set_is_bound_to_its_disc() {
     let bare = ResolvedKeySet::keyless_for(&fx.disc.titles[0], ContentFormat::BdTs);
     assert!(!bare.is_for(&fx.disc), "no identity, no bypass");
 }
+
+/// J22 with J21 parity (review r4). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits)
+/// indicates the number of CPS Units on the disc". Step 10 keys on no less evidence than step
+/// 9: one opened probe of a piece longer than one unit is not proof, so the piece stays Lazy
+/// with the proven key as candidate; a one-unit piece's one opened probe keys it.
+#[test]
+fn single_unit_rule_needs_two_probes_unless_one_unit_long() {
+    let fx = fixture(
+        &[
+            stream(1, 10, Some(K1)),
+            stream(2, 10, Some(K1)),
+            stream(3, 1, Some(K1)),
+        ],
+        1,
+        &[&[0, 1, 2]],
+    );
+    let (b, n) = fx.file(1);
+    let src = fx.source();
+    src.kill(b + 3, b + n); // one of B's ten probes reads
+    let calls = Calls::default();
+    let set = resolve_with(
+        &fx,
+        &mut src.clone(),
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1], &calls)],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        set.lazy(),
+        &[(b, b + n)],
+        "one probe of ten: Lazy, not keyed"
+    );
+    assert_eq!(set.status().keyed, 2, "A and the one-unit C");
+    src.heal();
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
+    assert_eq!(set.proof_cache().get(b), Some(Proof::Proven(0)));
+}
