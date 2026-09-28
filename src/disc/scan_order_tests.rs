@@ -552,6 +552,47 @@ fn dvd_css_bus_auth_precedes_the_first_udf_read() {
     assert!(css < read);
 }
 
+// A DVD carrying /AACS gets no AACS handshake, so its missing key file is recorded.
+#[test]
+fn dvd_with_aacs_dir_records_missing_key_file_without_aacs_scsi() {
+    let mut mem = dvd_disc();
+    lay_dir(
+        &mut mem,
+        &DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "VIDEO_TS".into(),
+                    icb_lba: 20,
+                    dir_data_lba: 21,
+                    files: Vec::new(),
+                    subdirs: vec![],
+                },
+                DirSpec {
+                    name: "AACS".into(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![file_with("Content000.cer", 41, 610, cert(true), false)],
+                    subdirs: vec![],
+                },
+            ],
+        },
+    );
+    let mut rig = Rig::new(mem, |t| t.profile = 0x0010);
+    let d = Disc::scan(&mut rig.drive, &with_hc()).expect("scan");
+    assert!(d.aacs.is_none());
+    assert!(
+        matches!(d.aacs_error, Some(Error::AacsNoKeys)),
+        "{:?}",
+        d.aacs_error
+    );
+    let aacs_class = |c: &[u8]| c[0] == 0xAD || (matches!(c[0], 0xA3 | 0xA4) && c[7] == 0x02);
+    assert_eq!(rig.count(aacs_class), 0, "{:02x?}", rig.cdbs());
+}
+
 #[test]
 fn stop_during_ake_returns_halted() {
     let mut rig = Rig::new(bd_disc(Some(true)), |t| {
