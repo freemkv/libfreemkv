@@ -288,9 +288,9 @@ pub trait KeySource {
     }
 
     /// The AACS host certificate(s) this source can supply for the live-drive
-    /// SCSI mutual-auth handshake (the OEM/AACS baseline route). `mkb` is the
-    /// disc's MKB generation when known, so a source MAY return only certs whose
-    /// generation matches (the default ignores it). A host cert unlocks the
+    /// SCSI mutual-auth handshake (the OEM/AACS baseline route), best first.
+    /// libfreemkv passes `None` for `mkb`: the argument is reserved and will be
+    /// removed at the next breaking window. A host cert unlocks the
     /// authenticated bus so the drive reports the Volume ID and bus key; it is
     /// **perishable** (revocable on a drive's HRL), so it is served by a source,
     /// never compiled in. A source holding no cert returns the empty vec.

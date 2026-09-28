@@ -437,7 +437,8 @@ fn unique_probe_token() -> String {
 
 /// Recursively plan the host tree: collect directories to create and files to
 /// extract, sanitizing each component and detecting host-path collisions.
-/// Skips the top-level `AACS/` and `CERTIFICATE/` directories (§7).
+/// Skips the top-level `AACS/`, `CERTIFICATE/`, and HD DVD's discovered `X!`
+/// AACS directories (§7).
 #[allow(clippy::too_many_arguments)]
 fn plan_tree(
     reader: &mut dyn SectorSource,
@@ -451,16 +452,21 @@ fn plan_tree(
     dirs: &mut Vec<PathBuf>,
     seen_hosts: &mut std::collections::HashMap<String, String>,
 ) -> Result<()> {
+    // Same discovery the AACS capture reads use, so the two can't drift.
+    let hddvd_aacs_dir = is_root
+        .then(|| crate::aacs::find_hddvd_aacs_dir(fs))
+        .flatten();
     for entry in &dir.entries {
         if entry.name.is_empty() {
             // The "parent" FID (".") has an empty name — skip.
             continue;
         }
         // Strip AACS / CERTIFICATE at the top level only (a deeper dir of the
-        // same name, if it ever existed, is content).
+        // same name is content).
         if is_root
             && (entry.name.eq_ignore_ascii_case("AACS")
-                || entry.name.eq_ignore_ascii_case("CERTIFICATE"))
+                || entry.name.eq_ignore_ascii_case("CERTIFICATE")
+                || hddvd_aacs_dir.is_some_and(|d| std::ptr::eq(d, entry)))
         {
             continue;
         }
@@ -1394,6 +1400,46 @@ mod tests {
         assert!(!out.path().join("AACS").exists(), "AACS/ must be stripped");
         assert!(res.complete, "clean extraction is complete");
         assert_eq!(res.bytes_lost(), 0);
+    }
+
+    /// An HD DVD's `X!` AACS dir is stripped like BD's `AACS/`, so the decrypted
+    /// folder does not rescan as AACS-encrypted.
+    #[test]
+    fn hddvd_extract_strips_the_aacs_dir() {
+        let evo = vec![0x5Au8; 3 * 2048];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "HVDVD_TS".to_string(),
+                    icb_lba: 20,
+                    dir_data_lba: 21,
+                    files: vec![file("MAIN.EVO", 30, 5000, evo.clone(), false)],
+                    subdirs: vec![],
+                },
+                DirSpec {
+                    name: "AAC!".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![
+                        file("MKBROM.AACS", 32, 33, vec![1; 64], false),
+                        file("VTKF000.AACS", 34, 35, vec![2; 64], false),
+                    ],
+                    subdirs: vec![],
+                },
+            ],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("hddvd");
+        let mut d = clear_disc();
+        d.content_format = crate::disc::ContentFormat::MpegPs;
+        d.extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect("extract");
+        assert_eq!(read_out(out.path(), "HVDVD_TS/MAIN.EVO"), Some(evo));
+        assert!(!out.path().join("AAC!").exists(), "AAC!/ must be stripped");
     }
 
     /// VIDEO_TS extraction writes VOBs + IFO/BUP. Here the content is clear

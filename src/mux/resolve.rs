@@ -802,7 +802,7 @@ fn single_base_key_slot(unit_keys: &[(u32, [u8; 16])]) -> Option<usize> {
 /// The pool slots of the disc's BASE CPS Unit Keys, in pool order — i.e. every
 /// entry that is not a forensic index key banked by [`resolve_fmts_key_map`]
 /// ([`FMTS_POOL_TAG_BASE`]). One element per CPS unit whose key is held.
-fn base_key_slots(unit_keys: &[(u32, [u8; 16])]) -> Vec<usize> {
+pub(crate) fn base_key_slots(unit_keys: &[(u32, [u8; 16])]) -> Vec<usize> {
     unit_keys
         .iter()
         .enumerate()
@@ -1774,7 +1774,7 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         }
     }
     crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
-    decrypting.set_unit_base(0);
+    decrypting.clear_unit_base();
 
     let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
         decrypting,

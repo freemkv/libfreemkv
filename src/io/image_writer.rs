@@ -22,9 +22,10 @@ const BATCH_SECTORS: u32 = 2048;
 
 /// Write `total_sectors` sectors from `reader` to `dest`.
 ///
-/// Reads sequentially, writes in order; does no decryption itself (caller's call).
-/// `on_progress` runs after each batch with cumulative bytes and must not block; `halt` is
-/// checked once per batch, and on cancellation the partial file is kept. Returns bytes written.
+/// Reads 2048-sector batches from LBA 0 in order; decrypts nothing. Batches are not whole
+/// 3-sector AACS units: wrap an AACS decrypting source to read on the unit grid, or it fails
+/// the first misaligned batch ([`Error::DecryptFailed`]). `on_progress` gets cumulative bytes
+/// per batch (must not block); `halt` is checked per batch, keeping the partial file.
 ///
 /// # Errors
 ///
@@ -141,6 +142,69 @@ mod tests {
             }
             Ok(want)
         }
+    }
+
+    // `lba`s from `file` hold the same encrypted AACS unit, on the file's own grid.
+    struct AacsFileImage {
+        file: u32,
+        unit: Vec<u8>,
+    }
+
+    impl SectorSource for AacsFileImage {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> FmResult<usize> {
+            for i in 0..count as usize {
+                let sector = &mut buf[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES];
+                let s = lba + i as u32;
+                match s.checked_sub(self.file).filter(|&o| o < 30) {
+                    Some(o) => {
+                        let k = (o % 3) as usize * SECTOR_BYTES;
+                        sector.copy_from_slice(&self.unit[k..k + SECTOR_BYTES]);
+                    }
+                    None => sector.fill(0),
+                }
+            }
+            Ok(count as usize * SECTOR_BYTES)
+        }
+    }
+
+    fn clear_aacs_unit() -> Vec<u8> {
+        let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        for off in (4..unit.len()).step_by(192) {
+            unit[off] = 0x47;
+        }
+        unit[0] |= 0xC0;
+        unit
+    }
+
+    // Batches are not whole AACS units: an unwrapped AACS decrypting source fails
+    // loud at the first misaligned batch that touches content, never ships ciphertext.
+    #[test]
+    fn write_image_over_an_unwrapped_aacs_source_fails_loud_at_a_misaligned_batch() {
+        use crate::decrypt::{AacsKeyMap, DecryptKeys};
+        use std::sync::Arc;
+        let key = [0x5A; 16];
+        let mut unit = clear_aacs_unit();
+        assert!(crate::aacs::content::encrypt_unit(&mut unit, &key));
+        let src = AacsFileImage { file: 3000, unit };
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let mut dec = crate::sector::DecryptingSectorSource::new(src, keys)
+            .with_key_map(Arc::new(AacsKeyMap::from_ranges(vec![(3000, 3030, 0)])))
+            .with_content_ranges(Arc::from(vec![(3000u32, 30u32)]));
+        dec.set_unit_base(0); // file grid (3000 % 3 == 0): fails loud past the no-base gate
+        let dest = tmp("aacs-batch");
+        let r = write_image(&mut dec, &dest, 3100, &Halt::new(), |_| {});
+        let _ = std::fs::remove_file(&dest);
+        let e = r.expect_err("batch 2048 is off the unit grid and touches content");
+        assert_eq!(e.code(), Error::DecryptFailed.code());
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {

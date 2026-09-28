@@ -5,8 +5,8 @@
 
 /// Union the host certificates a scan can offer the drive: the explicit
 /// `DriveCredentials`, then each key source's `host_certs(mkb)`. Host certs are
-/// keysource-served, never compiled in. `mkb` lets a source pick a
-/// generation-appropriate cert (the default impl ignores it).
+/// keysource-served, never compiled in. The scan passes `None` for `mkb`: the
+/// argument is reserved and will be removed at the next breaking window.
 pub fn collect_host_certs(
     opts: &crate::disc::ScanOptions,
     mkb: Option<u32>,

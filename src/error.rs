@@ -113,6 +113,19 @@ pub const E_KEY_SERVICE_UNAUTHORIZED: u16 = 7029;
 /// The operator action is to back off and retry more slowly; the disc's key may
 /// well exist.
 pub const E_KEY_SERVICE_RATE_LIMITED: u16 = 7030;
+/// A live AACS disc's `Unit_Key_RO.inf` (both copies) is missing or unreadable.
+/// The key file is required, so the live scan stops. NOT [`E_AACS_NO_KEYS`]:
+/// no key lookup was reached, and the fix is the disc, not a key database.
+pub const E_AACS_KEY_FILE_UNREADABLE: u16 = 7031;
+/// A decrypted whole-disc image (disc/image -> ISO) cannot be made: a stream
+/// file no title plays is encrypted with a key none of the held keys opens.
+/// NOT [`E_DECRYPT_FAILED`]: the fix is an MKV rip or a raw copy, not a key.
+pub const E_WHOLE_DISC_KEY_MISSING: u16 = 7032;
+/// A key source offered host cert(s), but every one failed a local check
+/// before any drive round-trip (keydb data problem). NOT
+/// [`E_AACS_NO_HOST_CERT`] (no cert offered at all) or
+/// [`E_AACS_HOST_CERT_REJECTED`] (the drive itself rejected a cert).
+pub const E_AACS_NO_USABLE_HOST_CERT: u16 = 7033;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -584,6 +597,13 @@ pub enum Error {
     AacsNoHostCert {
         path: String,
     },
+    /// A key source offered host cert(s) for the drive's handshake, but every
+    /// one failed a LOCAL check (stored private key vs cert public key)
+    /// before any drive round-trip — a keydb data problem, not a drive
+    /// rejection. Distinct from [`Error::AacsNoHostCert`] (no cert offered at
+    /// all) and [`Error::AacsHostCertRejected`] (the drive rejected a cert
+    /// it actually saw).
+    AacsNoUsableHostCert,
     /// A bus-encrypted disc (AACS 2.0 / UHD, Content Certificate bus-encryption bit set) was
     /// scanned on a live drive, the Volume ID was obtained, but no `read_data_key` (bus key)
     /// was produced — so the on-disc bytes are still bus-encrypted and would decrypt to
@@ -592,6 +612,13 @@ pub enum Error {
     /// of silently producing a corrupt rip. NOT raised for AACS 1.0 BD or file-backed (ISO)
     /// scans, where no bus-key handshake runs.
     AacsBusKeyUnavailable,
+    /// A live AACS disc's `Unit_Key_RO.inf` is missing or unreadable (both copies).
+    /// `Disc::scan` returns it; a `raw_copy` scan records it and refuses every key.
+    AacsKeyFileUnreadable,
+    /// A decrypted whole-disc image would keep encrypted pieces: a stream file
+    /// no title plays is encrypted and no held key opens it. See
+    /// [`E_WHOLE_DISC_KEY_MISSING`]. Raised before the copy where it can be.
+    WholeDiscKeyMissing,
 
     /// AACS 2.1 (FMTS) disc carries forensic variant segments, but no segment
     /// (variant) key is available to open them. Raised UPFRONT — before the mux —
@@ -922,7 +949,10 @@ impl Error {
             Error::KeyServiceUnauthorized => E_KEY_SERVICE_UNAUTHORIZED,
             Error::KeyServiceRateLimited => E_KEY_SERVICE_RATE_LIMITED,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
+            Error::AacsNoUsableHostCert => E_AACS_NO_USABLE_HOST_CERT,
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
+            Error::AacsKeyFileUnreadable => E_AACS_KEY_FILE_UNREADABLE,
+            Error::WholeDiscKeyMissing => E_WHOLE_DISC_KEY_MISSING,
             Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
@@ -1584,6 +1614,9 @@ mod tests {
             Error::SinkWroteNothing.code(),
             Error::StreamClosed.code(),
             Error::StreamHeaderWritten.code(),
+            Error::AacsKeyFileUnreadable.code(),
+            Error::AacsNoUsableHostCert.code(),
+            Error::WholeDiscKeyMissing.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1667,6 +1700,9 @@ mod tests {
             (Error::KeyServiceUnavailable, E_KEY_SERVICE_UNAVAILABLE),
             (Error::KeyServiceUnauthorized, E_KEY_SERVICE_UNAUTHORIZED),
             (Error::KeyServiceRateLimited, E_KEY_SERVICE_RATE_LIMITED),
+            (Error::AacsKeyFileUnreadable, E_AACS_KEY_FILE_UNREADABLE),
+            (Error::AacsNoUsableHostCert, E_AACS_NO_USABLE_HOST_CERT),
+            (Error::WholeDiscKeyMissing, E_WHOLE_DISC_KEY_MISSING),
         ];
         for (e, want_code) in cases {
             let s = e.to_string();
@@ -1980,6 +2016,8 @@ mod tests {
         // AACS (7xxx)
         assert!((7000..8000).contains(&E_AACS_NO_KEYS));
         assert!((7000..8000).contains(&E_NO_DISC_KEY));
+        assert!((7000..8000).contains(&E_AACS_KEY_FILE_UNREADABLE));
+        assert!((7000..8000).contains(&E_WHOLE_DISC_KEY_MISSING));
         // Keydb (8xxx)
         assert!((8000..9000).contains(&E_KEYDB_CONNECT));
         assert!((8000..9000).contains(&E_KEYDB_TOO_MANY_REDIRECTS));
@@ -2081,6 +2119,7 @@ mod tests {
             (Error::DecryptFailed, E_DECRYPT_FAILED),
             (Error::CssAuthFailed, E_CSS_AUTH_FAILED),
             (Error::AacsHostCertRejected, E_AACS_HOST_CERT_REJECTED),
+            (Error::AacsNoUsableHostCert, E_AACS_NO_USABLE_HOST_CERT),
             (Error::AacsRawReadUnsupported, E_AACS_RAW_READ_UNSUPPORTED),
             (Error::AacsVidUnavailable, E_AACS_VID_UNAVAILABLE),
             (Error::AacsMkUnavailable, E_AACS_MK_UNAVAILABLE),

@@ -16,6 +16,10 @@
 - `Error::ImageTruncated` displays as `E<code>: have/want`.
 - `json://` audio `sample_rate` is now a number in Hz (`null` when unknown) instead of a display string such as `"48kHz"`; a new `sample_rates` array lists every rate a stream carries (e.g. `[48000, 96000]` for a 48/96 kHz combo).
 - `network://` / `stdio://` FMKV headers use version 2 when a track carries decoder timing (Opus CodecDelay/SeekPreRoll), adding per-frame DiscardPadding; streams without timing stay version 1.
+- `Disc::scan` follows the standard AACS order: UDF, then `Unit_Key_RO.inf`, the content certificate and the MKB with plain reads, then the handshake, and only on a disc with an AACS directory. It no longer reads the MKB from the drive, and passes `None` to `KeySource::host_certs`.
+- `Disc::scan` fails with `Error::AacsKeyFileUnreadable` (E7031) when a live AACS disc's `Unit_Key_RO.inf` is missing or unreadable, before any AACS command. Image and folder scans still record the error and continue.
+- A transport fault during the AACS or CSS handshake makes `Disc::scan` fail with the same error `Drive::init` returns; a Stop during the handshake returns `Error::Halted`.
+- `DecryptingSectorSource` has no default AACS unit base: an AACS content read before `set_unit_base` fails `DecryptFailed` (it used to decrypt on the disc-LBA-0 grid). A BD-TS unit flagged encrypted whose clear seed lacks the TS sync at byte 4 (read off its file's unit grid) also fails `DecryptFailed` instead of decrypting to garbage.
 
 ### Removed
 
@@ -26,9 +30,15 @@
 - `AudioChannels` gains 3.0, 3.1, 4.1, 6.0 and 7.0.
 - `DiscPresence` (`Present` / `Absent` / `Settling`) and `disc_presence(path)`: the tri-state answer `drive_has_disc` collapses (`Settling` counts as a disc).
 - `Disc::inputs_with_samples` fills `DiscInputs::samples` from the main feature.
+- `Error::AacsKeyFileUnreadable` (E7031).
+- `DecryptingSectorSource::clear_unit_base()`: drop the unit base so AACS content reads fail loud until the next `set_unit_base`.
+- `Error::WholeDiscKeyMissing` (E7032): a decrypted whole-disc image would keep encrypted pieces because a stream file no title plays has no held key. The fix is an MKV rip or a raw copy.
+- `whole_disc::whole_disc_reader` / `WholeDiscReader`: the decrypting reader for a whole-disc or image → ISO copy, shared by every front end. It keys every stream file no title plays, not just the kept titles. Each is probed at its first unit and up to 32 across it, and a held base key must open two probed units before it keys the file. Ciphertext that no held key opens refuses with E7032 before any output. A file with no proven key stays unkeyed on a multi-key disc, and a copy that reaches an encrypted unit there stops with E7032. `UnitAligned::unit_block_end` tiles sweep blocks on each file's unit grid. An AACS disc with titles but no stream folder fails with `Error::UdfNotFound` (E6003) naming the folder.
+- `ScanOptions::raw_copy`: a raw disc→ISO copy scans on past an unreadable `Unit_Key_RO.inf`, with E7031 recorded and every key refused.
 
 ### Fixed
 
+- HD DVD XPL timecodes at a 60fps timeBase run at 60000/1001; title, clip and chapter times were 0.1% short.
 - TrueHD channel labels keep the LFE split (3.0 was labelled "2.1", 7.0 "6.1"), and a 6-channel presentation counts its Lvh/Rvh pair as 2. An older network:// receiver parses the new layout strings as unknown and omits the MKV Channels element for those tracks; keep both ends on the same version.
 - `mp4://` DTS tracks write the stream's maximum rate in `ddts` and read back as 96 kHz where the source is 96 kHz.
 - `mkv://` PCM tracks without BitDepth: bounded read-ahead and a multi-block depth estimate.

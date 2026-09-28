@@ -122,6 +122,8 @@ pub(crate) mod testlog;
 pub(crate) mod udf;
 #[cfg(feature = "rip")]
 pub(crate) mod unlock_bridge;
+#[cfg(feature = "rip")]
+pub mod whole_disc;
 
 // ─── Drive lifecycle ────────────────────────────────────────────────────────
 // `Drive::open(path)` → `wait_ready()` → `init()` → `Disc::scan()`. `Drive` owns

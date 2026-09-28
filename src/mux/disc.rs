@@ -269,7 +269,7 @@ impl DiscStream {
         // `reader` is already wrapped above (DecryptKeys::None makes it a
         // pass-through). Reset the unit base the probe read advanced so the
         // first fill_extents read starts cleanly.
-        reader.set_unit_base(0);
+        reader.clear_unit_base();
 
         // B1 resync gates: one per stream, video flagged so the gate only
         // drop-to-keyframes video (audio/subtitle always admit). Computed before
@@ -2587,6 +2587,7 @@ mod tests {
             // are installed, a read not starting on a 6144-byte unit boundary
             // hard-fails (it would mis-decrypt every following unit).
             let mut buf = vec![0u8; 2048];
+            s.reader.set_unit_base(0); // anchored: witnesses the keys, not the no-base gate
             let before = s.reader.read_sectors(1, 1, &mut buf, false);
             assert!(
                 matches!(before, Err(crate::error::Error::DecryptFailed)),

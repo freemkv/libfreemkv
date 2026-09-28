@@ -297,25 +297,33 @@ struct XplTitle {
     chapters: Vec<f64>,
 }
 
-/// Parse an `HH:MM:SS:FF` (or `MM:SS:FF`) timecode at `tick_base` frames/sec into
-/// seconds. `None` on a malformed field.
-fn parse_timecode(s: &str, tick_base: u32) -> Option<f64> {
+/// Parse an `HH:MM:SS:FF` (or `MM:SS:FF`) title timecode, `FF` in `time_base`
+/// frames/sec (the `<TitleSet timeBase>`), into seconds. `None` on a malformed field.
+/// A 60fps timeBase is scaled by 1001/1000: measured, not from a spec (a real disc's
+/// second feature clip starts at 2951.604 s where 60 exact puts it at 2948.667 s).
+/// Other timeBases (24/30/50) are unverified on real media and taken at face value.
+fn parse_timecode(s: &str, time_base: u32) -> Option<f64> {
     let n: Vec<u32> = s
         .split(':')
         .map(|p| p.trim().parse::<u32>())
         .collect::<std::result::Result<Vec<u32>, _>>()
         .ok()?;
-    let tb = tick_base.max(1) as f64;
+    let tb = time_base.max(1) as f64;
     let (h, m, sec, f) = match n.as_slice() {
         [h, m, s, f] => (*h, *m, *s, *f),
         [m, s, f] => (0, *m, *s, *f),
         _ => return None,
     };
-    Some(h as f64 * 3600.0 + m as f64 * 60.0 + sec as f64 + f as f64 / tb)
+    let nominal = h as f64 * 3600.0 + m as f64 * 60.0 + sec as f64 + f as f64 / tb;
+    Some(if time_base == 60 {
+        nominal * 1.001
+    } else {
+        nominal
+    })
 }
 
-/// `tickBase="60fps"` → 60. Defaults to 60 when absent/unparseable.
-fn parse_tick_base(s: &str) -> u32 {
+/// `timeBase="60fps"` → 60. Defaults to 60 when unparseable.
+fn parse_frame_rate(s: &str) -> u32 {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().unwrap_or(60)
 }
@@ -455,12 +463,12 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
     };
     let local = |n: &roxmltree::Node, name: &str| n.tag_name().name() == name;
 
-    // tickBase lives on <TitleSet> (default 60fps).
-    let tick_base = doc
-        .descendants()
-        .find(|n| local(n, "TitleSet"))
-        .and_then(|n| n.attribute("tickBase"))
-        .map(parse_tick_base)
+    // Title timecodes count frames in <TitleSet timeBase>; tickBase is the markup
+    // clock and only a fallback when timeBase is absent (default 60fps).
+    let title_set = doc.descendants().find(|n| local(n, "TitleSet"));
+    let time_base = title_set
+        .and_then(|n| n.attribute("timeBase").or_else(|| n.attribute("tickBase")))
+        .map(parse_frame_rate)
         .unwrap_or(60);
 
     let mut titles = Vec::new();
@@ -480,7 +488,7 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .to_string();
         let duration_secs = tnode
             .attribute("titleDuration")
-            .and_then(|s| parse_timecode(s, tick_base))
+            .and_then(|s| parse_timecode(s, time_base))
             .unwrap_or(0.0);
 
         let mut clips = Vec::new();
@@ -499,11 +507,11 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             };
             let begin_secs = c
                 .attribute("titleTimeBegin")
-                .and_then(|s| parse_timecode(s, tick_base))
+                .and_then(|s| parse_timecode(s, time_base))
                 .unwrap_or(0.0);
             let end_secs = c
                 .attribute("titleTimeEnd")
-                .and_then(|s| parse_timecode(s, tick_base))
+                .and_then(|s| parse_timecode(s, time_base))
                 .unwrap_or(begin_secs);
             clips.push(XplClip {
                 evo,
@@ -522,7 +530,7 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .filter(|n| local(n, "Chapter"))
             .filter_map(|ch| {
                 ch.attribute("titleTimeBegin")
-                    .and_then(|s| parse_timecode(s, tick_base))
+                    .and_then(|s| parse_timecode(s, time_base))
             })
             .take(MAX_XPL_CHAPTERS_PER_TITLE)
             .collect();
@@ -1691,15 +1699,65 @@ mod tests {
 
     #[test]
     fn parse_timecode_hhmmssff_at_60fps() {
-        // 01:37:20:00 = 5840 s exactly.
-        assert!((parse_timecode("01:37:20:00", 60).unwrap() - 5840.0).abs() < 1e-6);
+        // 01:37:20:00 = 5840 nominal seconds, x1.001 at the NTSC tick rate.
+        assert!((parse_timecode("01:37:20:00", 60).unwrap() - 5840.0 * 1.001).abs() < 1e-6);
         // 00:48:29:50 = 48m29s + 50/60 frames.
-        let want = 48.0 * 60.0 + 29.0 + 50.0 / 60.0;
+        let want = (48.0 * 60.0 + 29.0 + 50.0 / 60.0) * 1.001;
         assert!((parse_timecode("00:48:29:50", 60).unwrap() - want).abs() < 1e-6);
         // MM:SS:FF short form (hours omitted).
-        assert!((parse_timecode("02:05:15", 60).unwrap() - (125.0 + 15.0 / 60.0)).abs() < 1e-6);
+        let want = (125.0 + 15.0 / 60.0) * 1.001;
+        assert!((parse_timecode("02:05:15", 60).unwrap() - want).abs() < 1e-6);
         assert_eq!(parse_timecode("garbage", 60), None);
         assert_eq!(parse_timecode("", 60), None);
+    }
+
+    // A real HD DVD (VPLST000.XPL, timeBase="60fps") against its own EVOs as measured
+    // by ffprobe: title time runs at 60000/1001, so 60 exact reads every title 0.1% short.
+    #[test]
+    fn xpl_60fps_timecodes_run_at_ntsc_rate() {
+        for (tc, evo_secs) in [
+            ("00:49:08:40", 2951.604), // PEVOB_2 (feature clip 2) video start
+            ("00:14:49:00", 889.888),  // hazards
+            ("00:04:42:00", 282.272),  // daisy
+            ("00:02:01:56", 122.064),  // intro
+        ] {
+            let got = parse_timecode(tc, 60).unwrap();
+            assert!(
+                (got - evo_secs).abs() < 0.1,
+                "{tc}: {got} vs EVO {evo_secs}"
+            );
+        }
+        // PAL tick base is exact.
+        assert!((parse_timecode("00:14:49:00", 50).unwrap() - 889.0).abs() < 1e-9);
+    }
+
+    // Timecode frames count in timeBase, not tickBase (the markup tick clock).
+    #[test]
+    fn xpl_timecodes_use_time_base_not_tick_base() {
+        let xpl = |attrs: &str| {
+            format!(
+                r#"<Playlist xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Playlist">
+  <TitleSet {attrs}>
+    <Title titleNumber="1" titleDuration="00:00:10:30">
+      <PrimaryAudioVideoClip titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:10:30" src="file:///dvddisc/HVDVD_TS/A.MAP"/>
+    </Title>
+  </TitleSet>
+</Playlist>"#
+            )
+        };
+        let dur = |attrs: &str| parse_xpl_titles(xpl(attrs).as_bytes())[0].duration_secs;
+        let ntsc60 = 10.5 * 1.001;
+        let d = dur(r#"timeBase="60fps" tickBase="24fps""#);
+        assert!(
+            (d - ntsc60).abs() < 1e-9,
+            "timeBase 60 wins over tickBase 24: {d}"
+        );
+        let d = dur(r#"tickBase="60fps""#);
+        assert!((d - ntsc60).abs() < 1e-9, "tickBase is the fallback: {d}");
+        let d = dur(r#"timeBase="50fps" tickBase="60fps""#);
+        assert!((d - 10.6).abs() < 1e-9, "50fps unadjusted: {d}");
+        let d = dur("");
+        assert!((d - ntsc60).abs() < 1e-9, "default 60fps: {d}");
     }
 
     #[test]
@@ -1727,7 +1785,7 @@ mod tests {
         assert_eq!(mm.number, 2);
         assert_eq!(mm.name, "Main Movie");
         assert!(
-            (mm.duration_secs - 5840.0).abs() < 1e-6,
+            (mm.duration_secs - 5840.0 * 1.001).abs() < 1e-6,
             "97:20 from titleDuration"
         );
         // The layer-break split is ONE title with TWO clips, contiguous timeline.
@@ -1743,7 +1801,7 @@ mod tests {
             "second clip carries a title-time offset"
         );
         assert_eq!(mm.chapters.len(), 2);
-        assert!((mm.chapters[1] - (3.0 * 60.0 + 40.0 + 30.0 / 60.0)).abs() < 1e-6);
+        assert!((mm.chapters[1] - (3.0 * 60.0 + 40.0 + 30.0 / 60.0) * 1.001).abs() < 1e-6);
 
         let del = &titles[1];
         assert_eq!(del.name, "Deleted Scenes - Veronica Past");
@@ -2005,7 +2063,7 @@ mod tests {
             .expect("MainMovie composed from the playlist");
         assert_eq!(mm.playlist_id, 2);
         assert!(
-            (mm.duration_secs - 5840.0).abs() < 1.0,
+            (mm.duration_secs - 5840.0 * 1.001).abs() < 1.0,
             "97:20 duration from titleDuration, not 0/unknown"
         );
         assert_eq!(

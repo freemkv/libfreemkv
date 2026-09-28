@@ -289,7 +289,7 @@ impl Drive {
         self.event_fn = Some(Box::new(f));
     }
 
-    fn is_halted(&self) -> bool {
+    pub(crate) fn is_halted(&self) -> bool {
         self.halt.load(Ordering::Relaxed)
     }
 
@@ -611,7 +611,7 @@ impl Drive {
                 // Record which firmware unlocker ran, not the id-only lookup.
                 self.unlocker_name = Some(matched.to_string());
                 // Stash the OEM Volume ID (best-effort: a transient miss leaves
-                // the drive unlocked with no VID). do_handshake reads `oem_vid()`.
+                // the drive unlocked with no VID). do_handshake_cert reads `oem_vid()`.
                 if let Some(vid) = unlocked.vid {
                     self.oem_vid = Some(vid);
                 }
@@ -620,11 +620,9 @@ impl Drive {
             // No firmware unlocker claimed the drive — a stock/cert-only drive;
             // the AACS cert route runs later at the handshake phase.
             Ok(None) => Ok(()),
-            Err(freemkv_unlock::UnlockError::Transport) => Err(Error::ScsiError {
-                opcode: 0,
-                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
-                sense: None,
-            }),
+            Err(freemkv_unlock::UnlockError::Transport) => {
+                Err(crate::unlock_bridge::unlock_transport_error())
+            }
             Err(_) => Ok(()),
         };
         // Raise to max read speed UNCONDITIONALLY whenever the bus is alive, for
