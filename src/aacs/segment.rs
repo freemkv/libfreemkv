@@ -149,7 +149,7 @@ pub fn clip_byte_to_lba(extents: &[crate::disc::Extent], clip_byte: u64) -> Opti
 /// segment are left for the map's default (the Unit Key). A segment straddling a UDF extent
 /// boundary is skipped rather than emitting a wrong span.
 ///
-/// Feeds [`AacsKeyMap::from_ranges`](crate::decrypt::AacsKeyMap::from_ranges)
+/// Feeds `AacsKeyMap::from_ranges`
 /// with the Unit-Key index as the default.
 pub fn fmts_key_ranges(
     segments: &[Segment],

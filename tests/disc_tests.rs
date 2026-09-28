@@ -546,21 +546,6 @@ fn batch_count_max_batch_sizes() {
 }
 
 #[test]
-fn scan_encrypted_resolves_no_keys() {
-    // A UDF image with an /AACS directory: the lookup-free scan detects
-    // encryption and captures inputs, but resolves NO key on its own — a
-    // caller applies one later via Disc::decrypt_with.
-    let mut reader = MockSectorReader::new();
-    build_udf_with_aacs_dir(&mut reader);
-
-    let disc = Disc::scan_image(&mut reader, 1000, &ScanOptions::default()).unwrap();
-
-    // No unit keys without an external key (the mock has no Unit_Key_RO.inf to
-    // capture, so the keyless state isn't even built) — either way, no keys.
-    assert!(matches!(disc.decrypt_keys(), libfreemkv::DecryptKeys::None));
-}
-
-#[test]
 fn aacs_dir_alone_marks_the_disc_encrypted_and_reports_the_capture_error() {
     // Detection is an OR over `/AACS` and `/BDMV/AACS`. This fixture carries
     // only `/AACS` (the standard retail layout); requiring BOTH would call it

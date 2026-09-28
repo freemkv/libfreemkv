@@ -38,8 +38,7 @@ fn aacs_state_defaults_and_every_setter() {
         (d.version, d.bus_encryption, d.mkb_version),
         (1, false, None)
     );
-    assert!(d.disc_hash.is_empty() && d.unit_keys.is_empty() && d.vuk.is_none());
-    assert_eq!(d.key_source, KeyOrigin::ExternalUk);
+    assert!(d.disc_hash.is_empty());
     assert_eq!(d.volume_id, [0u8; 16]);
     assert!(d.uk_ro.is_empty() && d.mkb.is_empty());
     let s = aacs_state()
@@ -47,9 +46,6 @@ fn aacs_state_defaults_and_every_setter() {
         .bus_encryption(true)
         .mkb_version(Some(77))
         .disc_hash("0xABC")
-        .key_source(KeyOrigin::KeyDb)
-        .vuk(Some([7; 16]))
-        .unit_keys(vec![(1, K1)])
         .volume_id([9; 16])
         .uk_ro(vec![1, 2])
         .mkb(vec![3])
@@ -59,9 +55,7 @@ fn aacs_state_defaults_and_every_setter() {
         (2, true, Some(77))
     );
     assert_eq!(s.disc_hash, "0xABC");
-    assert_eq!(s.key_source, KeyOrigin::KeyDb);
-    assert_eq!((s.vuk, s.volume_id), (Some([7; 16]), [9; 16]));
-    assert_eq!(s.unit_keys, vec![(1, K1)]);
+    assert_eq!(s.volume_id, [9; 16]);
     assert_eq!((s.uk_ro, s.mkb), (vec![1, 2], vec![3]));
 }
 
@@ -102,7 +96,7 @@ fn encrypted_bd_image_encrypts_every_unit_on_its_files_grid() {
                     assert!(aacs_unit_encrypted(&enc, ContentFormat::BdTs));
                     assert_ne!(enc, plain, "file {i} unit {u} is ciphertext");
                     let mut d = enc.clone();
-                    decrypt_unit(&mut d, &k);
+                    crate::test_util::decrypt_unit(&mut d, &k);
                     assert_eq!(d, plain, "file {i} unit {u} opens with its key");
                 }
                 None => assert_eq!(enc, plain, "a clear file stays clear"),
@@ -111,7 +105,7 @@ fn encrypted_bd_image_encrypts_every_unit_on_its_files_grid() {
     }
     // The other key does not open file 0.
     let mut d = unit(&fx.image, fx.files[0].0);
-    decrypt_unit(&mut d, &K2);
+    crate::test_util::decrypt_unit(&mut d, &K2);
     assert!(!is_clean(&d, ContentFormat::BdTs));
 }
 
@@ -159,6 +153,6 @@ fn decrypt_unit_inverts_encrypt_unit() {
     let plain = u.clone();
     assert!(encrypt_unit(&mut u, &K1));
     assert_ne!(u[16..], plain[16..]);
-    decrypt_unit(&mut u, &K1);
+    crate::test_util::decrypt_unit(&mut u, &K1);
     assert_eq!(u, plain);
 }

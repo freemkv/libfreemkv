@@ -120,7 +120,9 @@ pub enum DecryptKeys {
     /// here. The `format` is the disc's content container (BD/UHD/FMTS = Transport
     /// Stream, HD-DVD `.evo` = Program Stream); it travels with the keys because
     /// both are resolved once per disc, and the key SELECTOR (`is_clean`) needs it
-    /// to prove a key structurally against the right container.
+    /// to prove a key structurally against the right container. Only a
+    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet) builds one (KU §2.2).
+    #[non_exhaustive]
     Aacs {
         unit_keys: Vec<(u32, [u8; 16])>,
         format: crate::disc::ContentFormat,
@@ -195,7 +197,7 @@ impl AacsKeyMap {
     /// Build from `[start_lba, end_lba) → key_idx` ranges that decrypt EVERY unit
     /// (single- or multi-CPS): each range is [`Phase::All`]. An LBA in no range is
     /// passed through untouched.
-    pub fn from_ranges(ranges: Vec<(u32, u32, usize)>) -> Self {
+    pub(crate) fn from_ranges(ranges: Vec<(u32, u32, usize)>) -> Self {
         let phased = ranges
             .into_iter()
             .map(|(s, e, i)| (s, e, i, Phase::All))
@@ -206,7 +208,7 @@ impl AacsKeyMap {
     /// Build a PHASE-AWARE map (FMTS): each range carries which unit-parity its key
     /// opens ([`Phase::Even`]/[`Phase::Odd`] for a forensic segment, [`Phase::All`]
     /// for base/CPS). Ranges are sorted; an LBA in no range is passed through.
-    pub fn from_ranges_phased(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Self {
+    pub(crate) fn from_ranges_phased(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Self {
         ranges.sort_by_key(|&(start, _, _, _)| start);
         let mut key_indices: Vec<usize> = ranges.iter().map(|&(_, _, i, _)| i).collect();
         key_indices.sort_unstable();
@@ -251,7 +253,7 @@ impl AacsKeyMap {
 
     /// The distinct key indices this map selects — the CPS units / segments the
     /// title actually reaches. The resolver secures exactly these up front. Computed
-    /// once at construction (see [`from_ranges_phased`](Self::from_ranges_phased)).
+    /// once at construction (see `from_ranges_phased`).
     pub fn key_indices(&self) -> &[usize] {
         &self.key_indices
     }

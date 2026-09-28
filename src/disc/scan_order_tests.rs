@@ -399,7 +399,7 @@ fn live_unreadable_uk_ro_fails_scan_before_any_aacs_scsi() {
 }
 
 #[test]
-fn raw_copy_scan_records_unreadable_uk_ro_and_refuses_keys() {
+fn raw_copy_scan_records_unreadable_uk_ro() {
     let mut rig = Rig::new(bd_disc(Some(false)), |t| {
         t.fail_read = Some(Box::new(|lba, n, _| {
             (lba..lba + n as u32)
@@ -411,13 +411,9 @@ fn raw_copy_scan_records_unreadable_uk_ro_and_refuses_keys() {
         raw_copy: true,
         ..with_hc()
     };
-    let mut d = Disc::scan(&mut rig.drive, &opts).expect("raw copy scans on");
+    let d = Disc::scan(&mut rig.drive, &opts).expect("raw copy scans on");
     assert!(d.aacs.is_none() && !d.titles.is_empty());
     assert_eq!(d.aacs_error.as_ref().map(|e| e.code()), Some(KEY_FILE_CODE));
-    assert!(
-        d.decrypt_with(Key::Unit(vec![(0, [0x11; 16])]), &[])
-            .is_err()
-    );
 }
 
 #[test]
@@ -456,7 +452,7 @@ fn non_bus_failed_handshake_is_info_only() {
 fn bus_disc_failed_handshake_lists_titles_one_error_refuses_keys() {
     let mut rig = Rig::new(bd_disc(Some(true)), |_| {});
     let (r, ev) = crate::testlog::capture(|| Disc::scan(&mut rig.drive, &with_hc()));
-    let mut d = r.expect("scan");
+    let d = r.expect("scan");
     assert!(!d.titles.is_empty());
     assert!(
         matches!(d.aacs_error, Some(Error::AacsHostCertRejected)),
@@ -466,13 +462,10 @@ fn bus_disc_failed_handshake_lists_titles_one_error_refuses_keys() {
     let w = aacs_warns(&ev);
     assert_eq!(w.len(), 1, "{w:?}");
     assert_eq!(w[0].field("phase"), Some("aacs_verdict"));
-    assert!(
-        d.decrypt_with(Key::Unit(vec![(0, [0x11; 16])]), &[])
-            .is_err()
-    );
-    let inputs = d.inputs().expect("inputs");
-    let (ok, _) = crate::keysource::resolve_and_apply_traced(&[], &inputs, &mut d);
-    assert!(!ok);
+    assert!(matches!(
+        crate::keys::check_decryptable(&d, false, None, &crate::keys::KeyScope::WholeDisc),
+        Err(Error::AacsHostCertRejected)
+    ));
 }
 
 #[test]
@@ -702,7 +695,7 @@ fn hddvd_aacs_dir_is_captured_and_handshaked() {
         d.aacs_error
     );
     assert!(matches!(
-        d.ensure_decryptable(false),
+        crate::keys::check_decryptable(&d, false, None, &crate::keys::KeyScope::WholeDisc),
         Err(Error::NoDiscKey { .. })
     ));
     let cdbs = rig.cdbs();
@@ -790,15 +783,13 @@ fn image_unreadable_uk_ro_is_recorded_not_fatal() {
             subdirs: vec![],
         },
     );
-    let mut d = Disc::scan_image(&mut mem, 9_999, &ScanOptions::default()).expect("scan");
+    let d = Disc::scan_image(&mut mem, 9_999, &ScanOptions::default()).expect("scan");
     assert!(d.aacs.is_none());
     assert!(
         matches!(d.aacs_error, Some(Error::AacsNoKeys)),
         "{:?}",
         d.aacs_error
     );
-    d.decrypt_with(Key::Unit(vec![(0, [0x11; 16])]), &[])
-        .expect("a mapfile unit key is accepted on an image");
 }
 
 // ── Stop design §5.1 "Scan" (LS1–LS6), over `test_util::FakeTransport` ──

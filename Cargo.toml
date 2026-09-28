@@ -113,6 +113,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# The crate's own `test_util` for its integration tests (`tests/crypto_tests.rs` decrypts
+# through `test_util::decrypt_unit`; the unit decrypt is crate-private, KU §2.2).
+libfreemkv = { path = ".", features = ["test-util"] }
 
 # Permutation model checker for the `scsi::fd_handoff` atomics — the fd
 # hand-off between a Linux recovery thread and `SgIoTransport::drop`. A normal

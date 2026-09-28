@@ -116,7 +116,7 @@ pub(super) fn aacs_verdict(bus_encryption: bool, bus: &BusOutcome) -> Option<Err
 
 // A copy of `e` if it is a handshake-class failure (the drive's AACS route did not
 // work); `None` for every other error.
-pub(super) fn handshake_class_error(e: &Error) -> Option<Error> {
+pub(crate) fn handshake_class_error(e: &Error) -> Option<Error> {
     match e {
         Error::AacsNoHostCert { path } => Some(Error::AacsNoHostCert { path: path.clone() }),
         Error::AacsNoUsableHostCert => Some(Error::AacsNoUsableHostCert),
@@ -124,22 +124,6 @@ pub(super) fn handshake_class_error(e: &Error) -> Option<Error> {
         Error::AacsVidUnavailable => Some(Error::AacsVidUnavailable),
         Error::AacsBusKeyUnavailable => Some(Error::AacsBusKeyUnavailable),
         _ => None,
-    }
-}
-
-impl Disc {
-    // Sticky refusal: a failed handshake on a bus-encrypted disc, or a live disc without
-    // its key file (E7031; key sources then trace BUS_BLOCKED), admits no supplied key.
-    // With no AACS state the bus flag is unknown, so bus encryption is assumed.
-    pub(crate) fn bus_blocked_error(&self) -> Option<Error> {
-        if matches!(self.aacs_error, Some(Error::AacsKeyFileUnreadable)) {
-            return Some(Error::AacsKeyFileUnreadable);
-        }
-        let bus = self.aacs.as_ref().is_none_or(|a| a.bus_encryption);
-        if !bus {
-            return None;
-        }
-        self.aacs_error.as_ref().and_then(handshake_class_error)
     }
 }
 
@@ -261,9 +245,6 @@ pub(super) fn resolve_aacs(
                 bus_encryption: cap.bus_encryption,
                 mkb_version,
                 disc_hash: aacs::inf::disc_hash_hex(&dh),
-                key_source: KeyOrigin::ExternalUk,
-                vuk: None,
-                unit_keys: vec![],
                 volume_id: bus.handshake().map(|h| h.volume_id).unwrap_or([0u8; 16]),
                 uk_ro,
                 mkb: cap.mkb,
@@ -810,9 +791,6 @@ mod tests {
         let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
         assert_eq!(st.version, 1, "V10 cert → AACS version 1");
         assert!(!st.bus_encryption);
-        assert_eq!(st.key_source, KeyOrigin::ExternalUk);
-        assert!(st.unit_keys.is_empty(), "vid-only resolves no keys");
-        assert!(st.vuk.is_none());
     }
 
     /// A V20 content cert (type != 0x00) → version 2 (encrypt.rs Some(_) → 2).
@@ -1144,7 +1122,7 @@ mod tests {
         let a = scanned.aacs.as_ref().expect("AACS metadata kept");
         assert!(!a.disc_hash.is_empty(), "disc hash must survive");
         assert_eq!(a.version, 2);
-        assert!(a.bus_encryption && a.unit_keys.is_empty());
+        assert!(a.bus_encryption);
         assert!(matches!(
             scanned.decrypt_keys(),
             crate::decrypt::DecryptKeys::None
@@ -1192,23 +1170,6 @@ mod tests {
         })
     }
 
-    /// A bus-blocked disc stays blocked: an unvalidated key (no samples) must not
-    /// commit or clear the handshake error.
-    #[test]
-    fn bus_blocked_disc_rejects_supplied_keys() {
-        let mut d = scan_cert_disc(0x10, true, None, no_host_cert());
-        let err = d
-            .decrypt_with(Key::Unit(vec![(0, [0x11; 16])]), &[])
-            .expect_err("bus-blocked disc must refuse keys");
-        assert_eq!(err.code(), crate::error::E_AACS_NO_HOST_CERT);
-        assert!(d.inject_unit_keys(vec![(0, [0x11; 16])]).is_err());
-        assert!(matches!(
-            d.decrypt_keys(),
-            crate::decrypt::DecryptKeys::None
-        ));
-        assert!(matches!(d.aacs_error, Some(Error::AacsNoHostCert { .. })));
-    }
-
     /// The unlocker matrix must not credit the AACS route when its handshake failed.
     #[test]
     fn unlocker_matrix_aacs_requires_a_working_handshake() {
@@ -1234,65 +1195,8 @@ mod tests {
         let d = scan_cert_disc(0x00, false, None, no_host_cert());
         assert!(d.aacs.is_some());
         assert!(d.aacs_error.is_none(), "{:?}", d.aacs_error);
-        let e = d.ensure_decryptable(false).expect_err("no key");
+        let e = gate(&d).expect_err("no key");
         assert_eq!(e.code(), crate::error::E_NO_DISC_KEY);
-    }
-
-    /// The `aacs = None` fail-safe: bus state unknown, so a recorded handshake-class
-    /// error refuses supplied keys as for a bus-blocked disc.
-    #[test]
-    fn failed_handshake_without_aacs_state_refuses_keys() {
-        let (mut disc, udf) = disc_with_cert(0x10, true);
-        let mut d = finish_disc(&mut disc, udf, BusOutcome::FileOrIso);
-        d.aacs = None;
-        d.aacs_error = no_host_cert();
-        assert!(
-            d.decrypt_with(Key::Unit(vec![(1, [0x11; 16])]), &[])
-                .is_err()
-        );
-        assert!(d.inject_unit_keys(vec![(1, [0x11; 16])]).is_err());
-        assert!(matches!(d.aacs_error, Some(Error::AacsNoHostCert { .. })));
-    }
-
-    /// A live key-file failure recorded by a raw-copy scan refuses every key, even
-    /// with no AACS state to say the disc is bus-encrypted.
-    #[test]
-    fn unreadable_key_file_refuses_keys() {
-        let (mut disc, udf) = disc_with_cert(0x00, false);
-        let mut d = finish_disc(&mut disc, udf, BusOutcome::FileOrIso);
-        d.aacs = None;
-        d.aacs_error = Some(Error::AacsKeyFileUnreadable);
-        let e = d
-            .decrypt_with(Key::Unit(vec![(1, [0x11; 16])]), &[])
-            .expect_err("no key file, no key");
-        assert_eq!(e.code(), crate::error::E_AACS_KEY_FILE_UNREADABLE);
-        assert!(d.inject_unit_keys(vec![(1, [0x11; 16])]).is_err());
-    }
-
-    /// A bus-blocked disc does not query key sources at all.
-    #[test]
-    fn bus_blocked_disc_skips_key_sources() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
-        struct Counting;
-        impl crate::keysource::KeySource for Counting {
-            fn get_unit_keys(
-                &self,
-                _ctx: &dyn crate::keysource::ResolveCtx,
-            ) -> Result<Vec<crate::aacs::types::UnitKey>> {
-                CALLS.fetch_add(1, Ordering::Relaxed);
-                Ok(vec![crate::aacs::types::UnitKey::new(0, [0x11; 16])])
-            }
-        }
-        let mut d = scan_cert_disc(0x10, true, None, no_host_cert());
-        let inputs = d.inputs().expect("inputs");
-        let sources: Vec<Box<dyn crate::keysource::KeySource>> = vec![Box::new(Counting)];
-        let (ok, trace) = crate::keysource::resolve_and_apply_traced(&sources, &inputs, &mut d);
-        assert!(!ok);
-        assert_eq!(CALLS.load(Ordering::Relaxed), 0, "no source may be queried");
-        // One step names the block, so a UI can tell it from "no sources".
-        assert_eq!(trace.keys.len(), 1);
-        assert_eq!(trace.keys[0].who, crate::aacs::trace::BUS_BLOCKED);
     }
 
     /// A handshake with no bus key and no drive unlock keeps the metadata and
@@ -1305,14 +1209,19 @@ mod tests {
         assert!(matches!(d.aacs_error, Some(Error::AacsBusKeyUnavailable)));
     }
 
+    // The public decrypt gate with no key set.
+    fn gate(d: &Disc) -> Result<()> {
+        crate::keys::check_decryptable(d, false, None, &crate::keys::KeyScope::WholeDisc)
+    }
+
     /// The decrypt gate reports the handshake reason, not a generic NoDiscKey.
     #[test]
     fn decrypt_gate_passes_handshake_errors_through() {
         let d = scan_cert_disc(0x10, true, None, no_host_cert());
-        let e = d.ensure_decryptable(false).expect_err("no key");
+        let e = gate(&d).expect_err("no key");
         assert_eq!(e.code(), crate::error::E_AACS_NO_HOST_CERT);
         let d = scan_cert_disc(0x10, true, None, Some(Error::AacsHostCertRejected));
-        let e = d.ensure_decryptable(false).expect_err("no key");
+        let e = gate(&d).expect_err("no key");
         assert_eq!(e.code(), crate::error::E_AACS_HOST_CERT_REJECTED);
     }
 

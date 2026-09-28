@@ -559,7 +559,7 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     (
         "src/mux/resolve.rs",
         r#"allow(clippy::too_many_arguments)"#,
-        2,
+        1,
     ),
     (
         "src/platform/fs_type/linux.rs",

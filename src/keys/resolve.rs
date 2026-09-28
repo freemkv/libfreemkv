@@ -402,6 +402,16 @@ fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) ->
     out
 }
 
+// Each whole-disc piece's unit spans, for the unit-grid guards in `whole_disc_tests`.
+#[cfg(test)]
+pub(crate) fn whole_disc_pieces(disc: &Disc, files: &[Vec<(u32, u32)>]) -> Vec<Vec<UnitSpan>> {
+    let sel: Vec<usize> = (0..disc.titles.len()).collect();
+    pieces(disc, files, &sel, true)
+        .into_iter()
+        .map(|p| p.spans)
+        .collect()
+}
+
 fn in_segment(segments: &[(u32, u32)], lba: u32) -> bool {
     let i = segments.partition_point(|s| s.0 <= lba);
     i > 0 && lba < segments[i - 1].1

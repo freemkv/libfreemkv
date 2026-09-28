@@ -14,7 +14,7 @@
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::aacs::mkb::AacsVersion;
 use crate::consts::{BD_SOURCE_PACKET_BYTES, SECTOR_BYTES};
-use crate::disc::{AacsState, KeyOrigin};
+use crate::disc::AacsState;
 use crate::error::Result;
 use crate::sector::SectorSource;
 use std::sync::{Arc, Mutex};
@@ -65,8 +65,7 @@ pub fn unit_key_ro(
 
 /// Builds an [`AacsState`] for a test: start from [`aacs_state`], set what the test
 /// needs, then [`AacsStateBuilder::build`]. Defaults: AACS 1.0, no bus encryption,
-/// no MKB version, empty disc hash, [`KeyOrigin::ExternalUk`], no VUK, no unit keys,
-/// a zero Volume ID, and empty `uk_ro` / `mkb`.
+/// no MKB version, empty disc hash, a zero Volume ID, and empty `uk_ro` / `mkb`.
 #[must_use]
 pub struct AacsStateBuilder {
     state: AacsState,
@@ -80,9 +79,6 @@ pub fn aacs_state() -> AacsStateBuilder {
             bus_encryption: false,
             mkb_version: None,
             disc_hash: String::new(),
-            key_source: KeyOrigin::ExternalUk,
-            vuk: None,
-            unit_keys: Vec::new(),
             volume_id: [0u8; 16],
             uk_ro: Vec::new(),
             mkb: Vec::new(),
@@ -105,18 +101,6 @@ impl AacsStateBuilder {
     }
     pub fn disc_hash(mut self, hash: impl Into<String>) -> Self {
         self.state.disc_hash = hash.into();
-        self
-    }
-    pub fn key_source(mut self, origin: KeyOrigin) -> Self {
-        self.state.key_source = origin;
-        self
-    }
-    pub fn vuk(mut self, vuk: Option<[u8; 16]>) -> Self {
-        self.state.vuk = vuk;
-        self
-    }
-    pub fn unit_keys(mut self, keys: Vec<(u32, [u8; 16])>) -> Self {
-        self.state.unit_keys = keys;
         self
     }
     pub fn volume_id(mut self, vid: [u8; 16]) -> Self {

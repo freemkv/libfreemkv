@@ -152,7 +152,6 @@ pub(crate) fn phases(
     format: ContentFormat,
     halt: Option<&Halt>,
 ) -> Result<Option<HashMap<u16, Phase>>> {
-    use crate::mux::resolve::{IndexProbe, probe_index_phase};
     let mut out = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
         if halt.is_some_and(|h| h.is_cancelled()) {
@@ -180,4 +179,269 @@ pub(crate) fn phases(
         }
     }
     Ok(Some(out))
+}
+
+// Decide a forensic index's decrypt phase from clean-sample counts of its EVEN vs ODD aligned
+// units under that index's key. Extracted for unit-testing.
+fn resolve_tie_phase(
+    even_clean: usize,
+    odd_clean: usize,
+) -> std::io::Result<crate::decrypt::Phase> {
+    match even_clean.cmp(&odd_clean) {
+        std::cmp::Ordering::Greater => Ok(crate::decrypt::Phase::Even),
+        std::cmp::Ordering::Less => Ok(crate::decrypt::Phase::Odd),
+        std::cmp::Ordering::Equal if even_clean == 0 => {
+            Err(crate::error::Error::FmtsKeyMissing.into())
+        }
+        std::cmp::Ordering::Equal => Ok(crate::decrypt::Phase::Even),
+    }
+}
+
+// Outcome of probing ONE forensic index's decrypt phase; the load-bearing split is WrongKey vs
+// ReadFault — only the former is a real FmtsKeyMissing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IndexProbe {
+    /// A parity decrypted clean under this index's key (or a padding tie) → its phase.
+    Phase(crate::decrypt::Phase),
+    /// At least one unit was READ and decrypt-attempted, yet NEITHER parity came up
+    /// clean under this index's key on any same-index segment → genuine wrong key.
+    WrongKey,
+    /// EVERY probe read of every same-index segment faulted (`read` returned `None`
+    /// for all attempts) → zero decrypt evidence. A recoverable read fault, NOT a
+    /// wrong key: there is no data to conclude the key is bad.
+    ReadFault,
+}
+
+// Probe one forensic index's decrypt phase (EVEN vs ODD aligned units) under `key`, tolerating
+// read faults without masking a genuine wrong key.
+pub(crate) fn probe_index_phase(
+    segments: &[crate::aacs::segment::Segment],
+    tag: u16,
+    batch_units: usize,
+    max_segments: usize,
+    format: ContentFormat,
+    key: &[u8; 16],
+    mut read: impl FnMut(&crate::aacs::segment::Segment, usize) -> Option<Vec<u8>>,
+) -> IndexProbe {
+    use crate::aacs::content::{aacs_unit_encrypted, decrypt_unit, is_clean};
+    let mut any_read = false;
+    for seg in segments
+        .iter()
+        .filter(|s| s.index == tag)
+        .take(max_segments)
+    {
+        let (mut even, mut odd) = (0usize, 0usize);
+        let mut seg_read = false;
+        for p in 0..batch_units {
+            for (phase_off, counter) in [(0usize, &mut even), (1usize, &mut odd)] {
+                if let Some(mut c) = read(seg, p * 2 + phase_off) {
+                    seg_read = true;
+                    if aacs_unit_encrypted(&c, format) {
+                        decrypt_unit(&mut c, key);
+                        if is_clean(&c, format) {
+                            *counter += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if !seg_read {
+            continue; // every read of this segment faulted — try the next same-index one
+        }
+        any_read = true;
+        // A clean parity or padding tie (even == odd > 0) resolves the phase;
+        // even == odd == 0 is this segment's wrong-key signature, but a
+        // different same-index segment could still anchor, so keep trying.
+        if let Ok(phase) = resolve_tie_phase(even, odd) {
+            return IndexProbe::Phase(phase);
+        }
+    }
+    if any_read {
+        IndexProbe::WrongKey
+    } else {
+        IndexProbe::ReadFault
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use crate::disc::ContentFormat;
+
+    // BEHAVIOR 2 — phase-tie default: all four arms of the even/odd clean-count decision.
+    #[test]
+    fn resolve_tie_phase_covers_all_arms() {
+        use crate::decrypt::Phase;
+        // Non-tie: the clean half is the index's real variant.
+        assert_eq!(
+            super::resolve_tie_phase(5, 2).unwrap(),
+            Phase::Even,
+            "even majority → Even"
+        );
+        assert_eq!(
+            super::resolve_tie_phase(2, 5).unwrap(),
+            Phase::Odd,
+            "odd majority → Odd"
+        );
+        // Padding tie (both halves clean, > 0): parity immaterial → default Even.
+        assert_eq!(
+            super::resolve_tie_phase(3, 3).unwrap(),
+            Phase::Even,
+            "even == odd > 0 → default Even"
+        );
+        assert_eq!(super::resolve_tie_phase(1, 1).unwrap(), Phase::Even);
+        // Neither half clean (even == odd == 0): fail loud with FmtsKeyMissing.
+        let err = super::resolve_tie_phase(0, 0).unwrap_err();
+        let expected = std::io::Error::from(crate::error::Error::FmtsKeyMissing).to_string();
+        assert_eq!(
+            err.to_string(),
+            expected,
+            "even == odd == 0 → FmtsKeyMissing"
+        );
+    }
+
+    // ── Fix 1: FMTS phase-probe read-fault vs wrong-key distinction ─────────
+
+    // Build a 6144-byte aligned unit of CLEAN MPEG-TS then AACS-encrypt it under key.
+    fn encrypted_clean_unit(key: &[u8; 16]) -> Vec<u8> {
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut off = 0;
+        while off + 192 <= ALIGNED_UNIT_LEN {
+            u[off + 4] = 0x47; // TS sync at the BD-TS packet stride
+            for b in &mut u[off + 5..off + 192] {
+                *b = 0xAB; // non-zero payload so is_clean counts it as content
+            }
+            off += 192;
+        }
+        // Flag encrypted BEFORE encrypting: bytes 0..16 are the key seed.
+        u[0] |= 0xC0;
+        assert!(
+            crate::aacs::content::encrypt_unit(&mut u, key),
+            "a full-length unit must encrypt"
+        );
+        u
+    }
+
+    fn a_segment(index: u16) -> crate::aacs::segment::Segment {
+        crate::aacs::segment::Segment {
+            index,
+            start_spn: 0,
+            end_spn: 100,
+        }
+    }
+
+    // A probe whose EVERY read faults must classify as ReadFault, NOT WrongKey.
+    #[test]
+    fn probe_index_phase_all_faults_is_read_fault_not_wrong_key() {
+        let segs = vec![a_segment(1)];
+        let key = [0x11u8; 16];
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &key,
+            |_seg, _unit| None, // every read faults
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::ReadFault,
+            "all-faulted probe is a recoverable read fault, never a wrong key"
+        );
+    }
+
+    /// Reads SUCCEED but decrypt to NEITHER clean parity (ciphertext under a key we
+    /// do NOT hold) → [`IndexProbe::WrongKey`]. This is the genuine-missing-key path
+    /// the caller MUST keep as a hard `FmtsKeyMissing`.
+    #[test]
+    fn probe_index_phase_reads_succeed_but_no_clean_phase_is_wrong_key() {
+        let segs = vec![a_segment(1)];
+        let cipher = encrypted_clean_unit(&[0xAAu8; 16]); // encrypted under key A
+        let probe_key = [0xBBu8; 16]; // ... probed under the WRONG key B
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &probe_key,
+            |_seg, _unit| Some(cipher.clone()),
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::WrongKey,
+            "reads that decrypt to no clean parity under the probed key are a wrong key"
+        );
+    }
+
+    /// Reads succeed and the EVEN units decrypt clean under this index's key while
+    /// the ODD units are (unencrypted) padding → [`IndexProbe::Phase`]`(Even)`.
+    #[test]
+    fn probe_index_phase_resolves_clean_even_phase() {
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        use crate::decrypt::Phase;
+        let segs = vec![a_segment(1)];
+        let key = [0x33u8; 16];
+        let even_unit = encrypted_clean_unit(&key);
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &key,
+            // even unit index → clean ciphertext under `key`; odd → zero padding
+            // (aacs_unit_encrypted false → not counted).
+            |_seg, unit| {
+                if unit % 2 == 0 {
+                    Some(even_unit.clone())
+                } else {
+                    Some(vec![0u8; ALIGNED_UNIT_LEN])
+                }
+            },
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::Phase(Phase::Even),
+            "clean even units + padding odd → Even phase"
+        );
+    }
+
+    // Read-fault TOLERANCE: first same-index segment faults every read, second decrypts clean
+    // -> probe falls through.
+    #[test]
+    fn probe_index_phase_falls_through_faulting_segment_to_next() {
+        use crate::decrypt::Phase;
+        let mut faulting = a_segment(1);
+        faulting.start_spn = 1; // distinguish the two same-index segments
+        let good = a_segment(1);
+        let segs = vec![faulting, good];
+        let key = [0x44u8; 16];
+        let clean = encrypted_clean_unit(&key);
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &key,
+            // The faulting segment (start_spn == 1) reads None; the good one reads a
+            // clean even unit / padding odd.
+            |seg, unit| {
+                if seg.start_spn == 1 {
+                    None
+                } else if unit % 2 == 0 {
+                    Some(clean.clone())
+                } else {
+                    Some(vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN])
+                }
+            },
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::Phase(Phase::Even),
+            "a faulting first segment must not block resolving from the next same-index one"
+        );
+    }
 }

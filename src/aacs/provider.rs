@@ -110,9 +110,9 @@ impl Providers<'_> {
     }
 }
 
-// Bridges a single caller-supplied key's raw material into a KeyProvider, for
-// `Disc::decrypt_with`. Fills only its own level (DK/PK/MK/VUK) so the resolver runs the
-// matching path.
+// One key's raw material as a KeyProvider, for the resolver tests. Fills only its own
+// level (DK/PK/MK/VUK) so the resolver runs the matching path.
+#[cfg(test)]
 pub(crate) struct SuppliedKey {
     pub device_keys: Vec<DeviceKey>,
     pub processing_keys: Vec<[u8; 16]>,
@@ -120,6 +120,7 @@ pub(crate) struct SuppliedKey {
     pub disc_entry: Option<DiscEntry>,
 }
 
+#[cfg(test)]
 impl KeyProvider for SuppliedKey {
     fn device_keys(&self) -> Vec<DeviceKey> {
         self.device_keys.clone()
@@ -362,44 +363,5 @@ mod tests {
         assert!(p.media_keys().is_empty());
         assert!(p.lookup_disc_by_hash(&[0u8; 20]).is_none());
         assert!(p.lookup_disc_by_vid(&[0u8; 16]).is_none());
-    }
-
-    // ── SuppliedKey: each level exposes only its own material ──────────────
-
-    #[test]
-    fn supplied_key_exposes_only_populated_fields() {
-        // A SuppliedKey filled at the DK level exposes DKs and nothing else,
-        // so the resolver runs the matching (DK→…) path and no other.
-        let sk = SuppliedKey {
-            device_keys: vec![dk(0x33, 9)],
-            processing_keys: Vec::new(),
-            media_keys: Vec::new(),
-            disc_entry: None,
-        };
-        assert_eq!(sk.device_keys().len(), 1);
-        assert!(sk.processing_keys().is_empty());
-        assert!(sk.media_keys().is_empty());
-        assert!(sk.lookup_disc_by_hash(&[0u8; 20]).is_none());
-        assert!(sk.lookup_disc_by_vid(&[0u8; 16]).is_none());
-    }
-
-    #[test]
-    fn supplied_key_disc_entry_returned_for_any_hash_or_vid() {
-        // decrypt_with already knows the disc, so a present disc_entry is
-        // returned regardless of the hash/VID argument (the lookup args are
-        // irrelevant in this bridge).
-        let sk = SuppliedKey {
-            device_keys: Vec::new(),
-            processing_keys: Vec::new(),
-            media_keys: Vec::new(),
-            disc_entry: Some(entry("supplied", 0x44)),
-        };
-        // Two unrelated hashes both return the same entry.
-        let h1 = sk.lookup_disc_by_hash(&[0x01u8; 20]).unwrap();
-        let h2 = sk.lookup_disc_by_hash(&[0xFFu8; 20]).unwrap();
-        assert_eq!(h1.disc_hash, "supplied");
-        assert_eq!(h2.disc_hash, "supplied");
-        // And by VID likewise.
-        assert!(sk.lookup_disc_by_vid(&[0x00u8; 16]).is_some());
     }
 }

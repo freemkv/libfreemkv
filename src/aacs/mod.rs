@@ -131,7 +131,7 @@ where
 }
 
 // The module structure IS the public API — consumers import from the owning module
-// (e.g. `aacs::content::decrypt_unit`). A small set of flat re-exports below is kept
+// (e.g. `aacs::content::is_clean`). A small set of flat re-exports below is kept
 // for typed key primitives and content-decrypt entry points that downstream crates rely on.
 pub use content::ALIGNED_UNIT_LEN;
 pub use derive::derive_vuk;

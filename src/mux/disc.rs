@@ -338,24 +338,20 @@ impl DiscStream {
         self
     }
 
-    /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap) on the inline
-    /// live-drive path — the counterpart to what
-    /// [`build_iso_pipeline`](crate::mux::resolve::build_iso_pipeline) does for the
-    /// file-backed highway. The map is the title's read plan: it decides which unit
-    /// each LBA is and, for an FMTS forensic segment, which phase is ours.
-    ///
-    /// The extent walk is rewritten so only our-phase units are read off the
-    /// drive, and each unit decrypts with its mapped key. A non-forensic map
-    /// leaves the extents unchanged.
-    pub fn with_key_map(mut self, map: std::sync::Arc<crate::decrypt::AacsKeyMap>) -> Self {
+    // The extent walk becomes `map`'s read plan: an FMTS forensic segment keeps only our-phase
+    // units (a non-forensic map leaves the extents unchanged). The key map itself is
+    // installed by `keys::install_key_map`.
+    pub(crate) fn plan_reads(&mut self, map: &crate::decrypt::AacsKeyMap) {
         self.extents = map.read_plan(&self.extents, self.unit_align.max(1) as u32);
         self.bytes_total_extents = self
             .extents
             .iter()
             .map(|e| e.sector_count as u64 * 2048)
             .sum();
-        self.reader.set_key_map(map);
-        self
+    }
+
+    pub(crate) fn reader_mut(&mut self) -> &mut DecryptingSectorSource<Box<dyn SectorSource>> {
+        &mut self.reader
     }
 
     /// Install a [`ResolvedKeySet`](crate::keys::ResolvedKeySet)'s on-arrival proof on the
@@ -1475,12 +1471,12 @@ mod tests {
         );
     }
 
-    /// `with_key_map` on the inline live-drive path applies the same FMTS read plan
+    /// A key map on the inline live-drive path applies the same FMTS read plan
     /// the file-backed highway uses: within a forensic segment only our-phase units
     /// survive the extent walk, so the alternate device-group units are never read.
     #[test]
-    fn with_key_map_reads_only_our_phase_units() {
-        use crate::decrypt::{AacsKeyMap, DecryptKeys, Phase};
+    fn a_key_map_reads_only_our_phase_units() {
+        use crate::decrypt::{DecryptKeys, Phase};
         // AACS keys → unit_align = 3, so a unit is 3 sectors and the phase filter
         // engages. Key contents are irrelevant to the read plan.
         let aacs = DecryptKeys::Aacs {
@@ -1489,7 +1485,7 @@ mod tests {
         };
         // 100 units (300 sectors). A 10-unit Even forensic segment at LBA [30,60):
         // even units (30,36,42,48,54) are ours; odd (33,39,45,51,57) are dropped.
-        let map = AacsKeyMap::from_ranges_phased(vec![(30, 60, 1, Phase::Even)]);
+        let map = crate::keys::test_key_map(vec![(30, 60, 1, Phase::Even)]);
         let stream = DiscStream::new(
             Box::new(ZeroReader { capacity: 300 }),
             synthetic_title(300),
@@ -1499,8 +1495,8 @@ mod tests {
             false,
             None,
         )
-        .unwrap()
-        .with_key_map(std::sync::Arc::new(map));
+        .unwrap();
+        let stream = crate::keys::install_key_map(stream, map);
         let total: u32 = stream.extents.iter().map(|e| e.sector_count).sum();
         assert_eq!(
             total,
@@ -1964,7 +1960,7 @@ mod tests {
             unit_keys: vec![(0, [0u8; 16])],
             format: crate::disc::ContentFormat::BdTs,
         };
-        let mut stream = DiscStream::new(
+        let stream = DiscStream::new(
             Box::new(reader),
             title,
             keys,
@@ -1973,11 +1969,10 @@ mod tests {
             false,
             None,
         )
-        .unwrap()
+        .unwrap();
         // AACS decrypts only through a key map; without one every read is a decrypt refusal.
-        .with_key_map(std::sync::Arc::new(
-            crate::decrypt::AacsKeyMap::from_ranges(vec![(0, COUNT, 0)]),
-        ));
+        let map = crate::keys::test_key_map(vec![(0, COUNT, 0, crate::decrypt::Phase::All)]);
+        let mut stream = crate::keys::install_key_map(stream, map);
         stream.skip_errors = true;
         assert_eq!(
             stream.unit_align, ALIGN as u16,

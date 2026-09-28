@@ -186,7 +186,7 @@ mod tests {
     // loud at the first misaligned batch that touches content, never ships ciphertext.
     #[test]
     fn write_image_over_an_unwrapped_aacs_source_fails_loud_at_a_misaligned_batch() {
-        use crate::decrypt::{AacsKeyMap, DecryptKeys};
+        use crate::decrypt::{DecryptKeys, Phase};
         use std::sync::Arc;
         let key = [0x5A; 16];
         let mut unit = clear_aacs_unit();
@@ -196,8 +196,9 @@ mod tests {
             unit_keys: vec![(0, key)],
             format: crate::disc::ContentFormat::BdTs,
         };
-        let mut dec = crate::sector::DecryptingSectorSource::new(src, keys)
-            .with_key_map(Arc::new(AacsKeyMap::from_ranges(vec![(3000, 3030, 0)])))
+        let map = crate::keys::test_key_map(vec![(3000, 3030, 0, Phase::All)]);
+        let dec = crate::sector::DecryptingSectorSource::new(src, keys);
+        let mut dec = crate::keys::test_keyed_source(dec, map)
             .with_content_ranges(Arc::from(vec![(3000u32, 30u32)]));
         dec.set_unit_base(0); // file grid (3000 % 3 == 0): fails loud past the no-base gate
         let dest = tmp("aacs-batch");

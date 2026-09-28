@@ -2014,7 +2014,7 @@ fn a_map_with_a_bad_crc_is_ignored() {
 // offset); the extension is the mkv sink's to exclude (M1, J23).
 #[test]
 fn an_mpg_source_remuxes_to_mkv() {
-    use crate::mux::driver::{MuxInput, MuxOptions, NoopEvents, mux_stream};
+    use crate::mux::driver::{MuxOptions, MuxSource, NoopEvents, mux_with_keys};
     let fx = fixture(&Opts {
         spu_tracks: 0,
         ..Opts::default()
@@ -2033,11 +2033,12 @@ fn an_mpg_source_remuxes_to_mkv() {
     };
     let out = {
         let _g = crate::sector::prefetched::holder_test_lock();
-        mux_stream(
-            MuxInput::Url {
+        mux_with_keys(
+            MuxSource::Url {
                 url: &url,
                 opts: Default::default(),
             },
+            None,
             &format!("mkv://{}", mkv.display()),
             &opts,
             &crate::halt::Halt::new(),

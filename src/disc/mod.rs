@@ -12,6 +12,7 @@ mod bluray;
 mod dvd;
 pub(crate) mod dvd_audio_probe;
 mod encrypt;
+pub(crate) use encrypt::handshake_class_error;
 mod extract;
 mod hddvd;
 pub(crate) mod pgs_forced_probe;
@@ -813,31 +814,6 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
             };
         }
     }
-}
-
-// Merges per-title AACS key ranges into the sorted, disjoint set the whole-disc map needs.
-// Same-key overlaps are UNIONED (never drop coverage); a malformed different-key overlap is
-// dropped to stay disjoint.
-fn merge_content_key_ranges(
-    mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)>,
-) -> Vec<(u32, u32, usize, crate::decrypt::Phase)> {
-    ranges.sort_by_key(|&(s, _, _, _)| s);
-    let mut merged: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
-    for r in ranges {
-        match merged.last_mut() {
-            // Overlaps the previous kept range.
-            Some(last) if r.0 < last.1 => {
-                // Same key + phase → union (coverage-preserving); a genuine
-                // different-key overlap (malformed disc) is dropped to stay disjoint.
-                if r.2 == last.2 && r.3 == last.3 {
-                    last.1 = last.1.max(r.1);
-                }
-            }
-            // Disjoint or exactly adjacent → keep as its own range.
-            _ => merged.push(r),
-        }
-    }
-    merged
 }
 
 /// Calculate how many bytes of bad/unreadable data fall within a title's extents.
@@ -1665,14 +1641,6 @@ pub struct AacsState {
     pub mkb_version: Option<u32>,
     /// Disc hash (SHA1 of Unit_Key_RO.inf) -- hex string with 0x prefix
     pub disc_hash: String,
-    /// How keys were resolved
-    pub key_source: KeyOrigin,
-    /// Volume Unique Key (16 bytes). `None` when keys were resolved
-    /// via the [`KeyOrigin::KeyDbUnitKeys`] path — that source delivers
-    /// pre-decrypted unit keys without a VUK to derive them from.
-    pub vuk: Option<[u8; 16]>,
-    /// Decrypted unit keys (CPS unit number, key)
-    pub unit_keys: Vec<(u32, [u8; 16])>,
     /// Volume ID (16 bytes) -- from SCSI handshake
     pub volume_id: [u8; 16],
     /// Raw `Unit_Key_RO.inf` bytes (encrypted unit keys + CPS map). Stashed at
@@ -1694,9 +1662,6 @@ impl std::fmt::Debug for AacsState {
             .field("bus_encryption", &self.bus_encryption)
             .field("mkb_version", &self.mkb_version)
             .field("disc_hash", &self.disc_hash)
-            .field("key_source", &self.key_source)
-            .field("vuk", &self.vuk.map(|_| "<redacted>"))
-            .field("unit_keys_len", &self.unit_keys.len())
             .field("volume_id", &"<redacted>")
             .field("uk_ro_len", &self.uk_ro.len())
             .field("mkb_len", &self.mkb.len())
@@ -1748,7 +1713,7 @@ pub struct DriveCredentials {
 /// Options for disc scanning.
 ///
 /// libfreemkv is lookup-free — it resolves no keys. The caller resolves a key
-/// out-of-band (a key source) and applies it via [`Disc::decrypt_with`]. The
+/// out-of-band through [`ResolvedKeySet::resolve`](crate::keys::ResolvedKeySet::resolve). The
 /// only scan input is the optional drive credentials for the live-drive
 /// authenticated handshake.
 #[derive(Default)]
@@ -1769,7 +1734,7 @@ pub struct ScanOptions {
     /// certs into `credentials` may leave it empty too. The library still
     /// resolves NO keys from these at scan time; they are consulted only for
     /// their host certs here (key *resolution* stays out-of-band via
-    /// `Disc::decrypt_with`).
+    /// `ResolvedKeySet::resolve`).
     pub key_sources: Vec<Box<dyn crate::KeySource>>,
     /// Optional cooperative-cancellation token. When set, long scan-time
     /// loops (notably the CSS known-plaintext crack, which can scan up to
@@ -2320,8 +2285,8 @@ impl Disc {
 
     /// Read a disc's AACS key-input files from an ISO image: returns
     /// `(Unit_Key_RO.inf, MKB, aacs_major_version)`. For callers that resolve a
-    /// Unit Key out-of-band: obtain the key however you like, then apply it via
-    /// [`Disc::decrypt_with`]. libfreemkv never makes a network call.
+    /// Unit Key out-of-band: the key reaches a read only through
+    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet). libfreemkv never makes a network call.
     pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>, u8)> {
         // Preserve the underlying open error (E5000) instead of collapsing
         // ENOENT/EPERM into `Error::AacsNoKeys` (E7000): a missing ISO is an
@@ -2434,8 +2399,8 @@ impl Disc {
 
     /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. The
     /// out-of-band Unit Key path fetches the disc's key files from the drive,
-    /// resolves a key from them however it likes, then applies it via
-    /// [`Disc::decrypt_with`]. These files are plaintext UDF metadata — no
+    /// resolves a key from them however it likes, through
+    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet). These files are plaintext UDF metadata — no
     /// AACS handshake or keys are required to read them.
     pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>, u8)> {
         // No READ CAPACITY: the key files do not need the disc size.
@@ -2474,7 +2439,7 @@ impl Disc {
         tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
         let encrypted = aacs.is_some();
         // Lookup-free: the state carries the disc's AACS inputs but no key; the caller
-        // resolves one and applies it via `Disc::decrypt_with`.
+        // resolves one into a `ResolvedKeySet`.
         let (aacs, aacs_error) = match aacs {
             Some((cap, bus)) => encrypt::resolve_aacs(cap, &bus),
             None => (None, None),
@@ -2939,7 +2904,7 @@ impl Disc {
 /// hands it in here; libfreemkv derives any remaining AACS-chain steps from
 /// disc-read inputs (MKB / VID / `Unit_Key_RO.inf`). `#[non_exhaustive]`:
 /// AACS is a derivation chain (`DK →(MKB)→ MK →(VID)→ VK →(Unit_Key_RO)→
-/// UK`); each variant enters at one level, and [`Disc::decrypt_with`]
+/// UK`); each variant enters at one level, and the library
 /// derives down from it — new levels can be added without breaking callers.
 #[derive(Clone)]
 #[non_exhaustive]
@@ -2970,7 +2935,7 @@ pub enum Key {
     Unit(Vec<(u32, [u8; 16])>),
 }
 
-// Redacting `Debug`: `Key` is the key-transport type crossing `Disc::decrypt_with`;
+// Redacting `Debug`: `Key` is a key-transport type;
 // every variant carries raw key material. Print only variant name and count —
 // never bytes. Guarded by `aacs_state_and_key_debug_are_redacted`.
 impl std::fmt::Debug for Key {
@@ -2983,55 +2948,6 @@ impl std::fmt::Debug for Key {
             Key::Unit(v) => write!(f, "Key::Unit(<{} redacted>)", v.len()),
         }
     }
-}
-
-// True if `unit_keys` covers EVERY supplied scrambled content `sample` — validation gate for
-// Disc::decrypt_with. `false` if a set only covers some CPS units.
-fn aligned_unit_keys_validate(
-    unit_keys: &[(u32, [u8; 16])],
-    samples: &[Vec<u8>],
-    format: ContentFormat,
-) -> bool {
-    use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_unit, is_clean};
-    let scrambled: Vec<&[u8]> = samples
-        .iter()
-        .map(|s| s.as_slice())
-        .filter(|s| aacs_unit_needs_decrypt(s, format))
-        .collect();
-    if scrambled.is_empty() {
-        return true; // nothing to disprove against — accept
-    }
-    if unit_keys.is_empty() {
-        return false;
-    }
-    let mut probe = vec![0u8; ALIGNED_UNIT_LEN];
-    let total = (scrambled.len() as u64) * (unit_keys.len() as u64);
-    let mut tried = 0u64;
-    let mut hb = crate::progress::Heartbeat::new("scan_key_trial");
-    // Every scrambled sample must be covered by SOME unit key. A single sample
-    // that no key descrambles means the key set is incomplete (wrong key, or a
-    // CPS unit left uncovered) — reject so the wrong/partial set never commits.
-    for sample in scrambled {
-        let mut covered = false;
-        for (_, k) in unit_keys {
-            // Pure-CPU inner loop: only consult the clock every 256 trials.
-            hb.tick_cpu(tried, total);
-            tried += 1;
-            probe.copy_from_slice(&sample[..ALIGNED_UNIT_LEN]);
-            // Samples arrive ALREADY de-bussed (the drive's single de-bus point
-            // removed AACS 2.0 bus encryption at read time), so validation only
-            // applies the CPS unit key, then the structural proof.
-            decrypt_unit(&mut probe, k);
-            if is_clean(&probe, format) {
-                covered = true;
-                break;
-            }
-        }
-        if !covered {
-            return false;
-        }
-    }
-    true
 }
 
 // Read-ahead confined to one file's recorded extents: a single-sector read inside an
@@ -3192,20 +3108,11 @@ impl Disc {
         Ok(self.capacity_sectors)
     }
 
-    /// Get the resolved decryption keys for this disc.
-    /// Used by disc-to-ISO and other full-disc operations.
-    pub fn decrypt_keys(&self) -> crate::decrypt::DecryptKeys {
-        if let Some(ref aacs) = self.aacs {
-            // An AACS state with NO unit keys is "encrypted, no keys" (e.g. a
-            // VID-only state before a Unit Key is supplied); report None so callers
-            // treat it as missing keys, not a usable empty key set.
-            if aacs.unit_keys.is_empty() {
-                return crate::decrypt::DecryptKeys::None;
-            }
-            crate::decrypt::DecryptKeys::Aacs {
-                unit_keys: aacs.unit_keys.clone(),
-                format: self.content_format,
-            }
+    /// The disc's own decryption keys: CSS, or `None`. AACS keys come only from a
+    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet) (KU §2.2), so an AACS disc is `None`.
+    pub(crate) fn decrypt_keys(&self) -> crate::decrypt::DecryptKeys {
+        if self.aacs.is_some() {
+            crate::decrypt::DecryptKeys::None
         } else if let Some(ref css) = self.css {
             crate::decrypt::DecryptKeys::Css {
                 title_key: css.title_key,
@@ -3213,42 +3120,6 @@ impl Disc {
         } else {
             crate::decrypt::DecryptKeys::None
         }
-    }
-
-    /// Resolve a WHOLE-DISC AACS key map for a decrypting sweep (`disc:// → iso://`):
-    /// the union of every title's proactive key map ([`crate::mux::resolve_mux_key_map`]),
-    /// so a sequential read of the entire disc decrypts each content unit with its
-    /// mapped key and passes clear filesystem/nav sectors (in no range) through.
-    /// Fails loud (via the per-title resolve) if any content unit's key is missing.
-    /// `keys` is mutated as fetched keys are banked; the merged ranges are disjoint
-    /// (titles that share a clip resolve the same span — the duplicate is dropped).
-    pub fn resolve_content_key_map(
-        &self,
-        reader: &mut dyn SectorSource,
-        keys: &mut crate::decrypt::DecryptKeys,
-        fetch: Option<&crate::sector::KeyFetch>,
-        halt: Option<&crate::halt::Halt>,
-    ) -> Result<crate::decrypt::AacsKeyMap> {
-        let mut ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)> = Vec::new();
-        // ONE per-disc memo across every title, else every playlist re-derives the
-        // same facts: multi-CPS key-per-extent seeks, FMTS-detection seeks, and on
-        // FMTS a key-server round-trip storm. The FMTS memo makes the CPS memo reachable.
-        let mut cache = crate::mux::resolve::DiscKeyCache::new();
-        for title in &self.titles {
-            let map = crate::mux::resolve::resolve_mux_key_map_cached(
-                reader,
-                title,
-                keys,
-                fetch,
-                self.content_format,
-                halt,
-                &mut cache,
-            )?;
-            ranges.extend_from_slice(map.ranges());
-        }
-        Ok(crate::decrypt::AacsKeyMap::from_ranges_phased(
-            merge_content_key_ranges(ranges),
-        ))
     }
 
     /// The scanned titles' encrypted content as a sorted, merged, disjoint set
@@ -3272,7 +3143,8 @@ impl Disc {
             AacsVersion::V10
         };
         // KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number of CPS
-        // Units on the disc" — the declared count, never the number of keys held.
+        // Units on the disc" — the declared count, never the number of keys held. K-8: an
+        // HD DVD VTKF counts too, through `parse_title_keys` (KS-27, evidence).
         let ukf = crate::aacs::inf::parse_title_keys(&aacs.uk_ro, version)?;
         Some(ukf.encrypted_keys.len())
     }
@@ -3332,221 +3204,6 @@ impl Disc {
             .collect()
     }
 
-    /// The system-wide decrypt correctness gate. Returns `Ok(())` when safe to proceed with a
-    /// copy or mux, and a clear typed error when decryption is **needed but unavailable** — the
-    /// case that would otherwise write ciphertext or feed the demux undecryptable bytes and
-    /// exit 0. Every copy/mux entry point calls this after key resolution and before any
-    /// source-data processing, so the failure is pre-flight (no partial output). `raw == true`
-    /// always succeeds.
-    pub fn ensure_decryptable(&self, raw: bool) -> Result<()> {
-        self.ensure_decryptable_keys(raw, &self.decrypt_keys())
-    }
-
-    /// [`Self::ensure_decryptable`] against a caller-resolved key set, for
-    /// the per-title path. A multi-VTS CSS DVD resolves its key with
-    /// [`Self::decrypt_keys_for_title`] (which can return `None` when the
-    /// chosen title's VTS could not be re-cracked even though the disc-wide
-    /// `decrypt_keys()` is `Css{..}`); the gate must judge THAT key. "Is the
-    /// source encrypted?" is answered by scan-captured disc state
-    /// (`css_error`/`aacs`/`css`), never by the keys — so an unencrypted
-    /// disc never false-errors regardless of `keys`.
-    pub fn ensure_decryptable_keys(
-        &self,
-        raw: bool,
-        keys: &crate::decrypt::DecryptKeys,
-    ) -> Result<()> {
-        // --raw skips decryption entirely: never error, even on an encrypted
-        // disc with no key (the user asked for the encrypted image).
-        if raw {
-            return Ok(());
-        }
-        // Scrambled-but-uncracked CSS: `css` is None so the key check can't see
-        // it. `css_error` is a WHOLE-DISC verdict raised as `CssNoDiscKey`, never
-        // per-title `CssKeyMissing` (which would log "empty stub" per title and exit 0).
-        if self.css_error.is_some() {
-            return Err(Error::CssNoDiscKey);
-        }
-        // Decryption is needed iff the disc carries cipher state. A no-key
-        // verdict on a non-encrypted disc is impossible here (the disc has no
-        // AACS/CSS state), so a genuinely unencrypted disc never errors.
-        let needs_key = matches!(keys, crate::decrypt::DecryptKeys::None);
-        if needs_key {
-            if self.aacs.is_some() {
-                // E7017 vs E7022 split: with derivation material but no VID, report
-                // `AacsVidUnavailable`, not generic `NoDiscKey`. Likewise a key SOURCE
-                // failure surfaces as ITSELF, else operators hunt a VUK during an outage.
-                if let Some(e) = self
-                    .aacs_error
-                    .as_ref()
-                    .and_then(encrypt::handshake_class_error)
-                {
-                    return Err(e);
-                }
-                match self.aacs_error {
-                    Some(Error::KeyServiceUnavailable) => {
-                        return Err(Error::KeyServiceUnavailable);
-                    }
-                    Some(Error::KeyServiceUnauthorized) => {
-                        return Err(Error::KeyServiceUnauthorized);
-                    }
-                    Some(Error::KeyServiceRateLimited) => {
-                        return Err(Error::KeyServiceRateLimited);
-                    }
-                    _ => {}
-                }
-                return Err(Error::NoDiscKey {
-                    disc_hash: self.aacs_disc_hash(),
-                });
-            }
-            if self.css.is_some() {
-                return Err(Error::CssKeyMissing);
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve decryption keys for muxing a *specific* title. For a **DVD** the CSS title key
-    /// MUST be recovered before descrambling: either reuse the scan's cracked key if its span
-    /// covers this title's VTS, or crack it fresh from this title's own extents in natural
-    /// PLAYBACK ORDER (never largest-cell-first, the 1.5.1 bug). The crack path does NOT gate
-    /// on `self.css`, so a detection miss can never route the mux into raw passthrough of
-    /// scrambled sectors. Non-DVD schemes return [`Self::decrypt_keys`] unchanged.
-    /// `halt` cancels the crack. `Err` is a crack that reached no verdict: `Halted`,
-    /// or the read error when no sector could be read.
-    pub fn decrypt_keys_for_title(
-        &self,
-        idx: usize,
-        reader: &mut dyn SectorSource,
-        batch_sectors: u16,
-        halt: Option<&crate::halt::Halt>,
-    ) -> Result<(crate::decrypt::DecryptKeys, bool)> {
-        // Non-DVD (AACS / FMTS / genuinely unencrypted): disc-wide keys, unchanged.
-        if self.format != DiscFormat::Dvd {
-            return Ok((self.decrypt_keys(), false));
-        }
-        let title = match self.titles.get(idx) {
-            Some(t) if !t.extents.is_empty() => t,
-            // No extents to crack from: mark it clear (`true`). Returning `false`
-            // would let the gate's "None keys + not clear = scrambled-uncracked"
-            // rule wrongly hard-fail a genuinely-unencrypted extentless title.
-            _ => return Ok((self.decrypt_keys(), true)),
-        };
-        // Fast path: reuse the scan's cracked key if its span covers this title's
-        // VTS. `crack_span: None` (unknown provenance) is treated as covering.
-        if let Some(css) = self.css.as_ref() {
-            let covers = match css.crack_span {
-                None => true,
-                Some((cs, ce)) => title
-                    .extents
-                    .iter()
-                    .any(|e| e.start_lba < ce && cs < e.start_lba.saturating_add(e.sector_count)),
-            };
-            if covers {
-                return Ok((
-                    crate::decrypt::DecryptKeys::Css {
-                        title_key: css.title_key,
-                    },
-                    false,
-                ));
-            }
-        }
-        // Detection miss or different VTS: crack this title's own extents in a
-        // SINGLE scan, in playback order (never largest-cell-first — the 1.5.1
-        // garbage bug). One call, so a locked title isn't re-hammered (rule #2).
-        Ok(
-            match crate::css::crack_key_outcome(reader, &title.extents, batch_sectors, halt) {
-                crate::css::CrackOutcome::Cracked(state) => (
-                    crate::decrypt::DecryptKeys::Css {
-                        title_key: state.title_key,
-                    },
-                    false,
-                ),
-                // Scrambled but no key recoverable → hard failure.
-                crate::css::CrackOutcome::ScrambledUncracked => {
-                    (crate::decrypt::DecryptKeys::None, false)
-                }
-                // No scrambled sector anywhere in the whole title → genuinely clear.
-                crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
-                crate::css::CrackOutcome::Unreadable(e) => return Err(e),
-                crate::css::CrackOutcome::Halted => return Err(Error::Halted),
-            },
-        )
-    }
-
-    /// Per-title decrypt gate that honours the `title_is_clear` verdict from
-    /// [`Self::decrypt_keys_for_title`]. Identical to
-    /// [`Self::ensure_decryptable_keys`] EXCEPT it does not raise `E7023`
-    /// when the chosen title proved genuinely clear: a multi-VTS CSS disc
-    /// can carry an unencrypted stub title in its own VTS that needs no key,
-    /// even though disc-wide `css.is_some()` is true. A scrambled-but-
-    /// uncrackable title (`title_is_clear == false`, key `None`) still
-    /// hard-fails exactly as before.
-    pub fn ensure_title_decryptable(
-        &self,
-        raw: bool,
-        keys: &crate::decrypt::DecryptKeys,
-        title_is_clear: bool,
-    ) -> Result<()> {
-        if raw {
-            return Ok(());
-        }
-        // A title proven clear by its own re-crack needs no key even though the
-        // disc is CSS — pass it. Disc-wide `css_error` is deliberately NOT
-        // consulted here: it reflects the MAIN feature's crack, not this title.
-        if title_is_clear && !keys.is_encrypted() {
-            return Ok(());
-        }
-        // A DVD title cracked to no key and NOT clear is scrambled-but-uncrackable;
-        // hard-fail directly (the disc-wide gate can miss this). `CssKeyMissing`
-        // is right here: a sibling VTS may still crack, so the rip skips only this one.
-        if self.format == DiscFormat::Dvd && !title_is_clear && !keys.is_encrypted() {
-            return Err(Error::CssKeyMissing);
-        }
-        // A usable per-title key was resolved — pass WITHOUT the disc-wide gate:
-        // it hard-fails on `self.css_error` (the MAIN feature's crack), and a
-        // bonus title that cracked its own key must not be blocked by that.
-        if keys.is_encrypted() {
-            return Ok(());
-        }
-        self.ensure_decryptable_keys(raw, keys)
-    }
-
-    // Injects pre-resolved AACS unit keys into a scanned disc — the deferred-mux/resume path
-    // (keys from the mapfile's `# freemkv-uk:` header).
-    pub(crate) fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) -> Result<()> {
-        if let Some(e) = self.bus_blocked_error() {
-            return Err(e);
-        }
-        if let Some(aacs) = self.aacs.as_mut() {
-            aacs.unit_keys = keys;
-            aacs.key_source = KeyOrigin::ExternalUk;
-        } else if self.encrypted && self.css.is_none() {
-            // FMTS is AACS 2.1, a UHD-family (bus-encrypted) format — not BD.
-            let uhd_family = matches!(self.format, DiscFormat::Uhd | DiscFormat::Fmts);
-            self.aacs = Some(AacsState {
-                version: if uhd_family {
-                    crate::aacs::mkb::AACS_MAJOR_UHD
-                } else {
-                    crate::aacs::mkb::AACS_MAJOR_BD
-                },
-                bus_encryption: uhd_family,
-                mkb_version: None,
-                disc_hash: String::new(),
-                key_source: KeyOrigin::ExternalUk,
-                vuk: None,
-                unit_keys: keys,
-                volume_id: [0u8; 16],
-                uk_ro: Vec::new(),
-                mkb: Vec::new(),
-            });
-            // The prior resolution error (e.g. KeydbLoad) is now moot — we have
-            // the decryption key. Clear it so callers don't treat the disc as
-            // keyless on the stale error.
-            self.aacs_error = None;
-        }
-        Ok(())
-    }
-
     /// The public AACS inputs for this disc, for a [`crate::KeySource`] to look
     /// a key up. `None` when the disc carries no AACS state (unencrypted, CSS,
     /// or AACS inputs not captured at scan). Contains no secrets — just disc
@@ -3602,111 +3259,6 @@ impl Disc {
             .filter(|t| t.has_probable_video())
             .max_by_key(|t| t.size_bytes)
             .or_else(|| self.titles.iter().max_by_key(|t| t.size_bytes))
-    }
-
-    /// Apply a caller-resolved [`Key`] so [`Self::decrypt_keys`] yields usable
-    /// decryption state. **Lookup-free**: the caller does all resolution and
-    /// hands the key in here. For [`Key::Unit`] this is the deferred-mux /
-    /// resume path (see [`Self::inject_unit_keys`]). `samples` are encrypted
-    /// on-disc aligned units (6144 bytes each) for content validation, since
-    /// a wrong key can still *derive* a non-empty (garbage) unit-key set. A
-    /// rejected key (`Err(AacsKeyRejected)`) falls through to the caller's
-    /// next candidate. Pass `&[]` to skip validation (resume / mapfile cache).
-    pub fn decrypt_with(&mut self, key: Key, samples: &[Vec<u8>]) -> Result<()> {
-        if let Some(e) = self.bus_blocked_error() {
-            return Err(e);
-        }
-        // Samples arrive already de-bussed (drive's single bus-removal point), so
-        // validation needs no bus key. Resolve the key DOWN to candidate unit keys
-        // WITHOUT committing — a wrong higher key is rejected before it poisons state.
-        let (candidate_unit_keys, candidate_vuk) = if let Key::Unit(keys) = key {
-            // Terminal — the source / mapfile already holds the final UKs.
-            (keys, None)
-        } else {
-            // Every higher level derives DOWN via the version-dispatched resolver
-            // (single home for all AACS derivation), needing the AACS inputs
-            // (Unit_Key_RO.inf, MKB, VID) stashed on the disc at scan time.
-            let aacs = self.aacs.as_ref().ok_or(crate::error::Error::AacsNoKeys)?;
-            if aacs.uk_ro.is_empty() {
-                // Scan captured no Unit_Key_RO.inf — nothing to derive into.
-                return Err(crate::error::Error::AacsNoKeys);
-            }
-
-            // Map the supplied Key -> raw material. The source handed in material
-            // at exactly one level; choosing/applying it is the resolver's job.
-            let mut supplied = crate::aacs::provider::SuppliedKey {
-                device_keys: Vec::new(),
-                processing_keys: Vec::new(),
-                media_keys: Vec::new(),
-                disc_entry: None,
-            };
-            match key {
-                Key::Device(dks) => supplied.device_keys = dks,
-                Key::Processing(pks) => supplied.processing_keys = pks,
-                Key::Media(mks) => supplied.media_keys = mks,
-                Key::Volume(vuk) => {
-                    supplied.disc_entry = Some(crate::aacs::types::DiscEntry {
-                        disc_hash: aacs.disc_hash.clone(),
-                        title: String::new(),
-                        media_key: None,
-                        disc_id: None,
-                        vuk: Some(vuk),
-                        unit_keys: Vec::new(),
-                    });
-                }
-                Key::Unit(_) => unreachable!("Key::Unit handled above"),
-            }
-
-            // Snapshot inputs (releases the &self borrow before the &mut below).
-            let volume_id = aacs.volume_id;
-            let mkb = aacs.mkb.clone();
-            let uk_ro = aacs.uk_ro.clone();
-            let version_u8 = aacs.version;
-
-            let provider_refs: [&dyn crate::aacs::provider::KeyProvider; 1] = [&supplied];
-            let ctx = crate::aacs::resolve::ResolveContext {
-                unit_key_ro: &uk_ro,
-                content_cert: None,
-                volume_id: &volume_id,
-                providers: &provider_refs,
-                mkb: if mkb.is_empty() { None } else { Some(&mkb) },
-            };
-
-            // Version dispatch — V10 uses the classical 48-byte-stride resolver,
-            // V20/V21 the 64-byte stride. The reason-preserving wrapper lets the
-            // gate report E7017 vs E7022 instead of a flat AacsKeyRejected.
-            let resolved = crate::aacs::resolve::resolve_keys_with_reason(&ctx, version_u8)
-                .map_err(|_reason| crate::error::Error::AacsKeyRejected)?;
-
-            if resolved.unit_keys.is_empty() {
-                return Err(crate::error::Error::AacsKeyRejected);
-            }
-            (resolved.unit_keys, resolved.vuk)
-        };
-
-        // VALIDATE against real ciphertext. Conservative: reject only when a
-        // supplied sample is AACS-scrambled and NO candidate key can de-scramble
-        // it; with no samples the key is accepted as-is (sample-less paths unchanged).
-        if !aligned_unit_keys_validate(&candidate_unit_keys, samples, self.content_format) {
-            return Err(crate::error::Error::AacsKeyRejected);
-        }
-
-        // Commit — only now does the key touch disc state.
-        match self.aacs.as_mut() {
-            Some(a) => {
-                a.unit_keys = candidate_unit_keys;
-                if candidate_vuk.is_some() {
-                    a.vuk = candidate_vuk;
-                }
-                a.key_source = KeyOrigin::ExternalUk;
-            }
-            // A Unit key for an AACS disc whose scan built no state (keyless
-            // scan, no keydb): synthesize a minimal ExternalUk state.
-            None => self.inject_unit_keys(candidate_unit_keys)?,
-        }
-        // A prior scan-time resolution error (e.g. keyless scan) is now moot.
-        self.aacs_error = None;
-        Ok(())
     }
 }
 
@@ -4599,9 +4151,6 @@ mod tests {
             bus_encryption: true,
             mkb_version: Some(77),
             disc_hash: "0xAA".into(),
-            key_source: KeyOrigin::ExternalUk,
-            vuk: Some([0xD5; 16]),
-            unit_keys: vec![(1, [0xD5; 16])],
             volume_id: [0xD5; 16],
             uk_ro: vec![1, 2, 3],
             mkb: vec![4, 5, 6],
@@ -4667,76 +4216,6 @@ mod tests {
     fn merged_extents_dedups_shared_clip() {
         let v = [ext(100, 50), ext(100, 50)];
         assert_eq!(merged_extents(v.iter()), vec![(100, 50)]);
-    }
-
-    // ── merge_content_key_ranges (whole-disc AACS map assembly) ────────────────
-    use crate::decrypt::Phase;
-
-    /// Ranges from different titles are sorted by start LBA and kept disjoint.
-    #[test]
-    fn merge_key_ranges_sorts_and_keeps_disjoint() {
-        let v = vec![
-            (500u32, 600u32, 1usize, Phase::All),
-            (100, 200, 0, Phase::All),
-            (300, 400, 2, Phase::All),
-        ];
-        assert_eq!(
-            merge_content_key_ranges(v),
-            vec![
-                (100, 200, 0, Phase::All),
-                (300, 400, 2, Phase::All),
-                (500, 600, 1, Phase::All),
-            ]
-        );
-    }
-
-    /// A clip shared by two titles resolves the SAME span twice; the duplicate is
-    /// dropped so `entry_for` sees a disjoint set (one key for the span).
-    #[test]
-    fn merge_key_ranges_dedups_shared_clip_span() {
-        let v = vec![
-            (100u32, 300u32, 0usize, Phase::All),
-            (100, 300, 0, Phase::All),
-        ];
-        assert_eq!(merge_content_key_ranges(v), vec![(100, 300, 0, Phase::All)]);
-    }
-
-    /// A later range that partially overlaps a kept one carrying the SAME key is
-    /// UNIONED, not dropped — the tail (400..500) must stay covered, or those
-    /// encrypted LBAs would fall in no range and pass through as ciphertext.
-    #[test]
-    fn merge_key_ranges_unions_same_key_overlap() {
-        let v = vec![
-            (100u32, 400u32, 0usize, Phase::All),
-            (200, 500, 0, Phase::All),
-        ];
-        assert_eq!(merge_content_key_ranges(v), vec![(100, 500, 0, Phase::All)]);
-    }
-
-    /// A different-key partial overlap (malformed disc) is dropped rather than
-    /// unioned, so one unit key is never stretched over another key's LBAs; the set
-    /// stays disjoint for `entry_for`.
-    #[test]
-    fn merge_key_ranges_drops_conflicting_key_overlap() {
-        let v = vec![
-            (100u32, 400u32, 0usize, Phase::All),
-            (200, 500, 1, Phase::All),
-        ];
-        assert_eq!(merge_content_key_ranges(v), vec![(100, 400, 0, Phase::All)]);
-    }
-
-    /// Adjacent (touching) ranges are BOTH kept — `r.0 >= prev_end` holds when the
-    /// next starts exactly at the previous end, so no coverage is lost.
-    #[test]
-    fn merge_key_ranges_keeps_adjacent() {
-        let v = vec![
-            (100u32, 200u32, 0usize, Phase::All),
-            (200, 300, 1, Phase::All),
-        ];
-        assert_eq!(
-            merge_content_key_ranges(v),
-            vec![(100, 200, 0, Phase::All), (200, 300, 1, Phase::All)]
-        );
     }
 
     // A Windows-form path (\\.\CdRom0, \\.\D:) must never fall through to
@@ -6863,102 +6342,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inject_unit_keys_synthesizes_aacs_state_when_scan_built_none() {
-        // Regression (E8005 deferred-mux loop): a disc swept without a keydb scans to
-        // aacs=None + KeydbLoad error, but its persisted UK is recovered at remux, so
-        // injecting it must yield usable keys, not leave inject_unit_keys a no-op.
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        disc.aacs_error = Some(crate::error::Error::KeydbLoad {
-            path: "<no keydb in search paths>".into(),
-        });
-        assert!(
-            matches!(disc.decrypt_keys(), crate::decrypt::DecryptKeys::None),
-            "precondition: encrypted disc with no aacs state => no decrypt keys"
-        );
-
-        let uk = vec![(0u32, [0x11u8; 16])];
-        disc.inject_unit_keys(uk.clone()).expect("inject");
-
-        match disc.decrypt_keys() {
-            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
-                assert_eq!(unit_keys, uk, "injected UK must be the decrypt key");
-            }
-            _ => panic!("expected Aacs decrypt keys after injecting a UK"),
-        }
-        assert!(
-            disc.aacs_error.is_none(),
-            "stale KeydbLoad must be cleared once a UK is in hand"
-        );
-        assert_eq!(
-            disc.aacs.as_ref().unwrap().key_source,
-            KeyOrigin::ExternalUk
-        );
-    }
-
-    #[test]
-    fn inject_unit_keys_labels_fmts_as_uhd_family() {
-        // FMTS is AACS 2.1 — a UHD-family, bus-encrypted format. Injecting a UK on an
-        // FMTS disc must synthesize the UHD version + bus encryption, not mislabel it
-        // AACS 1.0 / bus-off, which would break FMTS decryption on the recovered-UK path.
-        let mut disc = make_test_disc(1000, "FMTS");
-        disc.format = DiscFormat::Fmts;
-        disc.encrypted = true;
-        disc.inject_unit_keys(vec![(0u32, [0x22u8; 16])])
-            .expect("inject");
-        let aacs = disc.aacs.as_ref().expect("aacs state synthesized");
-        assert_eq!(
-            aacs.version,
-            crate::aacs::mkb::AACS_MAJOR_UHD,
-            "FMTS is AACS 2.x (UHD major), not BD"
-        );
-        assert!(aacs.bus_encryption, "FMTS is bus-encrypted like UHD");
-    }
-
-    /// Build an AacsState carrying the given unit keys (other fields are inert
-    /// defaults — these tests only exercise the unit-key/decrypt-keys plumbing).
-    fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {
+    /// An AACS state with every capture field inert (no keys live on `AacsState`, KU §2.2).
+    fn aacs_empty() -> AacsState {
         AacsState {
             version: 2,
             bus_encryption: true,
             mkb_version: None,
             disc_hash: String::new(),
-            key_source: KeyOrigin::DeviceKey,
-            vuk: None,
-            unit_keys,
             volume_id: [0u8; 16],
             uk_ro: Vec::new(),
             mkb: Vec::new(),
         }
     }
 
-    // ensure_decryptable: the single gate every copy/mux entry point calls. Full truth
-    // table below — only "decryption needed AND unavailable AND not --raw" may error;
-    // every legit non-error case (raw / unencrypted / a resolved key) must proceed.
+    // The disc-wide decrypt gate with no key set (`keys::disc_gate`). Only "decryption
+    // needed AND unavailable AND not --raw" may error.
 
-    fn css_state() -> crate::css::CssState {
-        crate::css::CssState {
-            title_key: [0u8; 5],
-            crack_span: None,
-        }
+    fn gate(disc: &Disc, raw: bool) -> Result<()> {
+        crate::keys::disc_gate(disc, raw)
     }
 
-    /// AACS-encrypted disc, decryption requested, no unit key resolved → the
-    /// gate must fail with NoDiscKey (this is the headline bug: a pass-through
-    /// `DecryptingSectorSource` would otherwise write ciphertext at exit 0).
+    /// AACS disc with no key set → NoDiscKey (a pass-through reader would otherwise
+    /// write ciphertext at exit 0). An AACS disc's own keys are always `None`.
     #[test]
-    fn ensure_decryptable_aacs_no_key_errors() {
+    fn disc_gate_aacs_no_key_errors() {
         let mut disc = make_test_disc(1000, "UHD");
         disc.encrypted = true;
-        disc.aacs = Some(aacs_with(Vec::new())); // present but no unit keys → None
+        disc.aacs = Some(aacs_empty());
         assert!(matches!(
             disc.decrypt_keys(),
             crate::decrypt::DecryptKeys::None
         ));
-        let err = disc
-            .ensure_decryptable(false)
-            .expect_err("AACS disc, no key, !raw must error");
+        let err = gate(&disc, false).expect_err("AACS disc, no key, !raw must error");
         assert_eq!(
             err.code(),
             crate::error::Error::NoDiscKey {
@@ -6966,16 +6381,13 @@ mod tests {
             }
             .code()
         );
+        assert!(gate(&disc, true).is_ok(), "--raw must proceed");
     }
 
-    // E7017 vs E7022 split (rc.6 WS1): with derivation material but no VID,
-    // aacs_error is AacsVidUnavailable and the gate must surface E7017, not
-    // the generic E7022. With no key material at all, E7022 stands.
+    // E7017 vs E7022: with derivation material but no VID the scan records
+    // AacsVidUnavailable, and the gate surfaces E7017, not the generic E7022.
     #[test]
-    fn ensure_decryptable_aacs_vid_unavailable_vs_no_key() {
-        // Branch 1 — derivation material present, but no VID: E7017.
-        // The resolver classifies a device-keys-but-zero-VID context as
-        // `VidUnavailable`; that reason rides on `aacs_error`.
+    fn disc_gate_aacs_vid_unavailable_vs_no_key() {
         let supplied = crate::aacs::provider::SuppliedKey {
             device_keys: vec![crate::aacs::types::DeviceKey {
                 key: [0x11; 16],
@@ -6988,16 +6400,14 @@ mod tests {
             disc_entry: None,
         };
         let provider_refs: [&dyn crate::aacs::provider::KeyProvider; 1] = [&supplied];
-        // A minimal but parseable Unit_Key_RO.inf (uk_pos=32, zero unit keys)
-        // so resolution proceeds to the path-try logic and fails for lack of a
-        // VID — not because the .inf failed to parse.
+        // A parseable Unit_Key_RO.inf (uk_pos=32, zero unit keys), so resolution
+        // fails for lack of a VID, not because the .inf failed to parse.
         let mut uk_ro = vec![0u8; 40];
-        uk_ro[0..4].copy_from_slice(&32u32.to_be_bytes()); // uk_pos = 32
-        // num_unit_keys = 0 (BE16) at uk_pos -> parses to an empty key file.
+        uk_ro[0..4].copy_from_slice(&32u32.to_be_bytes());
         let ctx = crate::aacs::resolve::ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
-            volume_id: &[0u8; 16], // the "no VID" sentinel
+            volume_id: &[0u8; 16],
             providers: &provider_refs,
             mkb: None,
         };
@@ -7007,897 +6417,92 @@ mod tests {
             "device keys + zero VID must classify as VidUnavailable"
         );
 
-        let mut disc_e7017 = make_test_disc(1000, "UHD");
-        disc_e7017.encrypted = true;
-        disc_e7017.aacs = Some(aacs_with(Vec::new())); // present but no unit keys
-        disc_e7017.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
-        let err = disc_e7017
-            .ensure_decryptable(false)
-            .expect_err("AACS disc, material-but-no-VID, !raw must error");
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_empty());
+        disc.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
         assert_eq!(
-            err.code(),
+            gate(&disc, false).expect_err("must error").code(),
             crate::error::Error::AacsVidUnavailable.code(),
-            "material-but-no-VID must surface E7017 (AacsVidUnavailable), not E7022"
+            "material-but-no-VID must surface E7017, not E7022"
         );
-
-        // Branch 2 — no key material at all: classified NoMaterial, gate E7022.
-        let supplied_none = crate::aacs::provider::SuppliedKey {
-            device_keys: Vec::new(),
-            processing_keys: Vec::new(),
-            media_keys: Vec::new(),
-            disc_entry: None,
-        };
-        let provider_refs_none: [&dyn crate::aacs::provider::KeyProvider; 1] = [&supplied_none];
-        let ctx_none = crate::aacs::resolve::ResolveContext {
-            unit_key_ro: &uk_ro,
-            content_cert: None,
-            volume_id: &[0u8; 16],
-            providers: &provider_refs_none,
-            mkb: None,
-        };
+        disc.aacs_error = None;
         assert_eq!(
-            crate::aacs::resolve::resolve_keys_with_reason(&ctx_none, 2).err(),
-            Some(crate::aacs::resolve::ResolveFailure::NoMaterial),
-            "no key material must classify as NoMaterial"
-        );
-
-        let mut disc_e7022 = make_test_disc(1000, "UHD");
-        disc_e7022.encrypted = true;
-        disc_e7022.aacs = Some(aacs_with(Vec::new()));
-        disc_e7022.aacs_error = None; // no reason captured → generic no-key
-        let err = disc_e7022
-            .ensure_decryptable(false)
-            .expect_err("AACS disc, no material, !raw must error");
-        assert_eq!(
-            err.code(),
+            gate(&disc, false).expect_err("must error").code(),
             crate::error::Error::NoDiscKey {
                 disc_hash: String::new()
             }
             .code(),
-            "no-material must keep E7022 (NoDiscKey)"
+            "no reason captured keeps E7022"
         );
     }
 
-    // THE defect: a key SOURCE that could not answer must not be reported as "this disc has no
-    // key" (E7022 for both used to send an operator hunting for a VUK through seven hours of
-    // 502s).
+    // A key SOURCE that could not answer must not be reported as "this disc has no key"
+    // (E7022 for both once sent an operator hunting for a VUK through hours of 502s).
     #[test]
     fn key_source_failure_is_not_reported_as_a_missing_disc_key() {
-        use crate::keysource::{KeySource, ResolveCtx, resolve_and_apply_traced};
-
-        /// A source that fails the way a down / hostile key service fails.
-        struct FailingSource(fn() -> crate::error::Error);
-        impl KeySource for FailingSource {
-            fn get_unit_keys(
-                &self,
-                _ctx: &dyn ResolveCtx,
-            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
-            {
-                Err((self.0)())
-            }
-            fn label(&self) -> &'static str {
-                "online"
-            }
+        let miss_code = crate::error::Error::NoDiscKey {
+            disc_hash: String::new(),
         }
-        /// A source that ANSWERS and holds nothing — the genuine miss.
-        struct AnsweredNoEntry;
-        impl KeySource for AnsweredNoEntry {
-            fn get_unit_keys(
-                &self,
-                _ctx: &dyn ResolveCtx,
-            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
-            {
-                Ok(Vec::new())
-            }
-            fn label(&self) -> &'static str {
-                "online"
-            }
-        }
-
-        let inputs = crate::keysource::DiscInputs {
-            disc_hash: "0x422EB".into(),
-            volume_id: [0u8; 16],
-            version: crate::aacs::mkb::AACS_MAJOR_UHD,
-            mkb: Vec::new(),
-            unit_key_ro: Vec::new(),
-            samples: Vec::new(),
-            volume_label: None,
-        };
-        let encrypted_aacs_disc = || {
-            let mut d = make_test_disc(1000, "UHD");
-            d.encrypted = true;
-            d.aacs = Some(aacs_with(Vec::new())); // AACS state, no unit keys
-            d
-        };
-
-        // The genuine miss — the service answered, nothing for this disc.
-        let mut answered = encrypted_aacs_disc();
-        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(AnsweredNoEntry)];
-        let (ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut answered);
-        assert!(!ok);
-        assert_eq!(
-            trace.keys[0].path,
-            vec![crate::aacs::trace::KeyNode::NoEntry],
-            "a source that ANSWERED and holds nothing is the one true `NoEntry`"
-        );
-        assert!(
-            answered.aacs_error.is_none(),
-            "a genuine miss stamps no failure reason on the disc"
-        );
-        let miss_code = answered
-            .ensure_decryptable(false)
-            .expect_err("no key, !raw must error")
-            .code();
-        assert_eq!(
-            miss_code,
-            crate::error::Error::NoDiscKey {
-                disc_hash: String::new()
-            }
-            .code(),
-            "a genuine miss keeps E7022 — that wording is correct for it"
-        );
-
-        // Each way the service can FAIL to answer, and the code it must produce.
-        type MakeError = fn() -> crate::error::Error;
-        let failures: &[(MakeError, u16)] = &[
+        .code();
+        let failures = [
             (
-                || crate::error::Error::KeyServiceUnavailable,
+                crate::error::Error::KeyServiceUnavailable,
                 crate::error::E_KEY_SERVICE_UNAVAILABLE,
             ),
             (
-                || crate::error::Error::KeyServiceUnauthorized,
+                crate::error::Error::KeyServiceUnauthorized,
                 crate::error::E_KEY_SERVICE_UNAUTHORIZED,
             ),
             (
-                || crate::error::Error::KeyServiceRateLimited,
+                crate::error::Error::KeyServiceRateLimited,
                 crate::error::E_KEY_SERVICE_RATE_LIMITED,
             ),
         ];
-        for (make, want) in failures {
-            let mut down = encrypted_aacs_disc();
-            let sources: Vec<Box<dyn KeySource>> = vec![Box::new(FailingSource(*make))];
-            let (ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut down);
-            assert!(!ok);
-            assert!(
-                trace.keys[0].path.is_empty(),
-                "a source that could not ANSWER must not claim `no entry` in the trace"
-            );
-            assert_eq!(
-                down.aacs_error.as_ref().map(crate::error::Error::code),
-                Some(*want),
-                "the source's failure reason must reach the disc"
-            );
-            let code = down
-                .ensure_decryptable(false)
-                .expect_err("no key, !raw must error")
-                .code();
-            assert_eq!(code, *want, "the gate must surface the SOURCE's code");
-            assert_ne!(
-                code, miss_code,
-                "a source that could not answer must NOT render as \"this disc has no key\""
-            );
+        for (reason, want) in failures {
+            let mut down = make_test_disc(1000, "UHD");
+            down.encrypted = true;
+            down.aacs = Some(aacs_empty());
+            down.aacs_error = Some(reason);
+            let code = gate(&down, false).expect_err("no key must error").code();
+            assert_eq!(code, want, "the gate must surface the SOURCE's code");
+            assert_ne!(code, miss_code);
         }
     }
 
-    /// Issue #46: a source that MATCHED the disc but derived no key must render
-    /// distinctly from a true miss — `matched disc > no VID`, NOT `no entry` —
-    /// and carry the matched entry's shape for the app to log.
+    /// A genuinely unencrypted disc has `None` keys legitimately — the gate keys off
+    /// the scan-captured disc state, never the keys, so it must not false-error.
     #[test]
-    fn matched_but_underivable_disc_is_not_reported_as_no_entry() {
-        use crate::aacs::trace::{KeyNode, MatchedEntry};
-        use crate::keysource::{
-            KeySource, ResolveCtx, UnitKeyResolution, resolve_and_apply_traced,
-        };
-
-        /// Matched the disc, had a Media Key, but no VID on this path — the
-        /// classic issue-#46 case (a keydb hit that cannot finish).
-        struct MatchedNoVid;
-        impl KeySource for MatchedNoVid {
-            fn get_unit_keys(
-                &self,
-                _ctx: &dyn ResolveCtx,
-            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
-            {
-                Ok(Vec::new())
-            }
-            fn resolve_unit_keys(
-                &self,
-                _ctx: &dyn ResolveCtx,
-            ) -> std::result::Result<UnitKeyResolution, crate::error::Error> {
-                Ok(UnitKeyResolution {
-                    keys: Vec::new(),
-                    matched: true,
-                    miss_path: vec![KeyNode::NoVid],
-                    matched_entry: Some(MatchedEntry {
-                        has_media_key: true,
-                        enc_title_keys_len: 1,
-                        ..Default::default()
-                    }),
-                    store_entries: Some(3),
-                })
-            }
-            fn label(&self) -> &'static str {
-                "keydb"
-            }
-        }
-
-        let inputs = crate::keysource::DiscInputs {
-            disc_hash: "0xMATCH".into(),
-            volume_id: [0u8; 16],
-            version: crate::aacs::mkb::AACS_MAJOR_UHD,
-            mkb: Vec::new(),
-            unit_key_ro: Vec::new(),
-            samples: Vec::new(),
-            volume_label: None,
-        };
-        let mut disc = {
-            let mut d = make_test_disc(1000, "UHD");
-            d.encrypted = true;
-            d.aacs = Some(aacs_with(Vec::new()));
-            d
-        };
-        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(MatchedNoVid)];
-        let (ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut disc);
-        assert!(!ok);
-        assert_eq!(
-            trace.keys[0].path,
-            vec![KeyNode::MatchedDisc, KeyNode::NoVid],
-            "a matched-but-underivable disc must NOT collapse to `no entry`"
-        );
-        assert_eq!(
-            trace.keys[0].matched_entry.map(|m| m.has_media_key),
-            Some(true),
-            "the matched entry's shape must survive to the trace for logging"
-        );
-    }
-
-    /// Companion to the above: a matched entry with NO derivation material at all
-    /// gets the library's default `no derivable key` node (empty `miss_path`),
-    /// still distinct from a true miss.
-    #[test]
-    fn matched_with_no_material_renders_no_derivable_key() {
-        use crate::aacs::trace::KeyNode;
-        use crate::keysource::{
-            KeySource, ResolveCtx, UnitKeyResolution, resolve_and_apply_traced,
-        };
-
-        struct MatchedNoMaterial;
-        impl KeySource for MatchedNoMaterial {
-            fn get_unit_keys(
-                &self,
-                _ctx: &dyn ResolveCtx,
-            ) -> std::result::Result<Vec<crate::aacs::types::UnitKey>, crate::error::Error>
-            {
-                Ok(Vec::new())
-            }
-            fn resolve_unit_keys(
-                &self,
-                _ctx: &dyn ResolveCtx,
-            ) -> std::result::Result<UnitKeyResolution, crate::error::Error> {
-                Ok(UnitKeyResolution {
-                    matched: true,
-                    ..Default::default()
-                })
-            }
-        }
-
-        let inputs = crate::keysource::DiscInputs {
-            disc_hash: "0xMATCH".into(),
-            volume_id: [0u8; 16],
-            version: crate::aacs::mkb::AACS_MAJOR_UHD,
-            mkb: Vec::new(),
-            unit_key_ro: Vec::new(),
-            samples: Vec::new(),
-            volume_label: None,
-        };
-        let mut disc = {
-            let mut d = make_test_disc(1000, "UHD");
-            d.encrypted = true;
-            d.aacs = Some(aacs_with(Vec::new()));
-            d
-        };
-        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(MatchedNoMaterial)];
-        let (_ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut disc);
-        assert_eq!(
-            trace.keys[0].path,
-            vec![KeyNode::MatchedDisc, KeyNode::NoDerivableKey],
-        );
-    }
-
-    /// Same AACS-no-key disc under `--raw` (raw=true) must PROCEED — the user
-    /// asked for the encrypted image and needs no key.
-    #[test]
-    fn ensure_decryptable_aacs_no_key_raw_proceeds() {
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        disc.aacs = Some(aacs_with(Vec::new()));
-        assert!(disc.ensure_decryptable(true).is_ok(), "--raw must proceed");
-    }
-
-    /// AACS disc WITH a resolved unit key → proceed (decrypt_keys is Aacs).
-    #[test]
-    fn ensure_decryptable_aacs_with_key_proceeds() {
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        disc.aacs = Some(aacs_with(vec![(0, [0x11u8; 16])]));
-        assert!(disc.ensure_decryptable(false).is_ok());
-    }
-
-    /// A genuinely unencrypted disc has `None` keys legitimately — the gate must
-    /// NOT false-error. This is the "is the source encrypted?" guard: the answer
-    /// is the scan-captured disc state, not the keys.
-    #[test]
-    fn ensure_decryptable_unencrypted_proceeds() {
-        let disc = make_test_disc(1000, "BD"); // aacs/css/css_error all None
-        assert!(matches!(
-            disc.decrypt_keys(),
-            crate::decrypt::DecryptKeys::None
-        ));
-        assert!(
-            disc.ensure_decryptable(false).is_ok(),
-            "unencrypted disc with None keys must proceed, not false-error"
-        );
-    }
-
-    // CSS scrambled-but-uncracked: css is None but css_error is Some — the
-    // disc IS encrypted. Gate must fail with DISC-LEVEL CssNoDiscKey, not
-    // the per-title skippable CssKeyMissing.
-    #[test]
-    fn ensure_decryptable_css_error_errors() {
-        let mut disc = make_test_disc(1000, "DVD");
-        disc.encrypted = true;
-        disc.css_error = Some(crate::error::Error::CssKeyMissing);
-        let err = disc
-            .ensure_decryptable(false)
-            .expect_err("scrambled-but-uncracked CSS must error");
-        assert_eq!(err.code(), crate::error::Error::CssNoDiscKey.code());
-        // --raw is exempt.
-        assert!(disc.ensure_decryptable(true).is_ok());
-    }
-
-    // The two CSS no-key conditions must classify oppositely: disc-wide (css_error set) is
-    // disc_level_no_key and NOT skippable; per-title stays skippable and NOT disc-level.
-    #[test]
-    fn css_disc_wide_no_key_is_disc_level_while_per_title_stays_skippable() {
-        // Disc-wide: the scan saw scrambled sectors and recovered no key.
-        let mut disc = make_test_disc(1000, "DVD");
-        disc.encrypted = true;
-        disc.css_error = Some(crate::error::Error::CssKeyMissing);
-        let wide: std::io::Error = disc
-            .ensure_decryptable(false)
-            .expect_err("scrambled-but-uncracked CSS disc must error")
-            .into();
-        assert!(
-            crate::error::is_disc_level_no_key(&wide),
-            "a whole-disc CSS crack failure must classify as disc-level: {wide}"
-        );
-        assert!(
-            !crate::error::is_skippable_title_stub(&wide),
-            "a whole-disc CSS crack failure must NOT be a skippable title stub: {wide}"
-        );
-
-        // Per-title: this title's VTS could not be re-cracked; the rest of the
-        // disc may still rip.
-        let (stub_disc, _) = css_disc_with_clear_stub();
-        let per_title: std::io::Error = stub_disc
-            .ensure_title_decryptable(false, &crate::decrypt::DecryptKeys::None, false)
-            .expect_err("scrambled-uncracked title must error")
-            .into();
-        assert!(
-            crate::error::is_skippable_title_stub(&per_title),
-            "a per-title CSS re-crack failure must stay skippable: {per_title}"
-        );
-        assert!(
-            !crate::error::is_disc_level_no_key(&per_title),
-            "a per-title CSS re-crack failure must NOT stop the whole rip: {per_title}"
-        );
-    }
-
-    /// CSS-keyless-crack SUCCESS: `css` is Some with a title key → proceed.
-    #[test]
-    fn ensure_decryptable_css_with_key_proceeds() {
-        let mut disc = make_test_disc(1000, "DVD");
-        disc.encrypted = true;
-        disc.css = Some(css_state());
-        assert!(disc.ensure_decryptable(false).is_ok());
-    }
-
-    // Per-title gate: a multi-VTS CSS disc whose chosen title's VTS could not
-    // be re-cracked yields DecryptKeys::None even though disc-wide
-    // decrypt_keys() is Css{..}; must fail with CssKeyMissing.
-    #[test]
-    fn ensure_decryptable_keys_css_per_title_none_errors() {
-        let mut disc = make_test_disc(1000, "DVD");
-        disc.encrypted = true;
-        disc.css = Some(css_state());
-        let err = disc
-            .ensure_decryptable_keys(false, &crate::decrypt::DecryptKeys::None)
-            .expect_err("CSS disc, per-title key None, !raw must error");
-        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
-        // The same None key under --raw proceeds.
-        assert!(
-            disc.ensure_decryptable_keys(true, &crate::decrypt::DecryptKeys::None)
-                .is_ok()
-        );
-    }
-
-    /// `ensure_decryptable_keys` must never false-error an UNENCRYPTED disc no
-    /// matter the key argument (the verdict keys off disc state, not keys).
-    #[test]
-    fn ensure_decryptable_keys_unencrypted_never_errors() {
+    fn disc_gate_unencrypted_proceeds() {
         let disc = make_test_disc(1000, "BD");
-        assert!(
-            disc.ensure_decryptable_keys(false, &crate::decrypt::DecryptKeys::None)
-                .is_ok()
-        );
+        assert!(gate(&disc, false).is_ok());
     }
 
-    // ── Fix 2/3: a genuinely-clear extra title on a CSS disc never E7023s ──────
-
-    /// Reader that serves clear (unscrambled) sectors for one extent range and
-    /// CSS-locked errors elsewhere — enough to drive `decrypt_keys_for_title`'s
-    /// per-title re-crack to `Unencrypted` for a clear stub.
-    struct ClearStubReader {
-        clear_range: (u32, u32),
-    }
-    impl crate::sector::SectorSource for ClearStubReader {
-        fn read_sectors(
-            &mut self,
-            _lba: u32,
-            count: u16,
-            buf: &mut [u8],
-            _recovery: bool,
-        ) -> crate::error::Result<usize> {
-            let n = count as usize * 2048;
-            buf[..n].fill(0); // clear sectors: scramble flag never set
-            let _ = self.clear_range;
-            Ok(n)
-        }
-        fn capacity_sectors(&self) -> u32 {
-            self.clear_range.1
-        }
+    // CSS scrambled-but-uncracked (css None, css_error Some): the DISC-LEVEL
+    // CssNoDiscKey, never the per-title skippable CssKeyMissing.
+    #[test]
+    fn disc_gate_css_error_is_disc_level() {
+        let mut disc = make_test_disc(1000, "DVD");
+        disc.encrypted = true;
+        disc.css_error = Some(crate::error::Error::CssKeyMissing);
+        let err = gate(&disc, false).expect_err("scrambled-but-uncracked CSS must error");
+        assert_eq!(err.code(), crate::error::Error::CssNoDiscKey.code());
+        let wide: std::io::Error = err.into();
+        assert!(crate::error::is_disc_level_no_key(&wide));
+        assert!(!crate::error::is_skippable_title_stub(&wide));
+        assert!(gate(&disc, true).is_ok(), "--raw is exempt");
     }
 
-    /// Build a multi-VTS CSS disc: `css` cracked from the main feature's span
-    /// `[main_lba, main_end)`, plus a clear stub title living in a DISJOINT VTS.
-    fn css_disc_with_clear_stub() -> (Disc, usize) {
-        let mut disc = make_test_disc(100_000, "DVD");
-        disc.format = DiscFormat::Dvd; // make_test_disc defaults to Uhd
-        disc.content_format = ContentFormat::MpegPs;
+    /// CSS-keyless-crack SUCCESS: `css` holds a title key → proceed.
+    #[test]
+    fn disc_gate_css_with_key_proceeds() {
+        let mut disc = make_test_disc(1000, "DVD");
         disc.encrypted = true;
         disc.css = Some(crate::css::CssState {
-            title_key: [0u8; 5],
-            crack_span: Some((0, 1000)), // main feature VTS span
-        });
-        // Title 0: the main feature, overlaps the cracked span.
-        let mut feature = title_with_video(Codec::Mpeg2, Resolution::R480i);
-        feature.extents = vec![Extent {
-            start_lba: 0,
-            sector_count: 1000,
-        }];
-        // Title 1: a tiny CLEAR stub in its own VTS, disjoint from the span.
-        let mut stub = title_with_video(Codec::Mpeg2, Resolution::R480i);
-        stub.extents = vec![Extent {
-            start_lba: 50_000,
-            sector_count: 7, // a 7-sector menu stub
-        }];
-        disc.titles = vec![feature, stub];
-        (disc, 1) // stub is title index 1
-    }
-
-    // A genuinely-clear extra title (menu stub in its own VTS, disjoint from
-    // crack_span) on a CSS DVD must mux without a false E7023 — the crack
-    // returns Unencrypted, and the gate must PASS with no key.
-    #[test]
-    fn clear_stub_title_on_css_disc_is_not_a_key_failure() {
-        let (disc, stub_idx) = css_disc_with_clear_stub();
-        assert_eq!(
-            disc.format,
-            DiscFormat::Dvd,
-            "fixture must exercise the DVD path"
-        );
-        let mut reader = ClearStubReader {
-            clear_range: (0, 100_000),
-        };
-        let (keys, title_is_clear) = disc
-            .decrypt_keys_for_title(stub_idx, &mut reader, 8, None)
-            .expect("crack verdict");
-        assert!(
-            matches!(keys, crate::decrypt::DecryptKeys::None),
-            "a clear stub in a disjoint VTS cracks to no key"
-        );
-        assert!(title_is_clear, "the stub's own extents show no scrambling");
-        // The gate must PASS a clear title — NO false E7023.
-        assert!(
-            disc.ensure_title_decryptable(false, &keys, title_is_clear)
-                .is_ok(),
-            "a genuinely clear extra title must never raise E7023"
-        );
-    }
-
-    /// Counterpart guard: a scrambled-but-uncrackable title (`title_is_clear ==
-    /// false`, `None` keys) on a CSS disc must STILL hard-fail with CssKeyMissing.
-    /// Fix 2/3 must not weaken the genuine encrypted-but-uncrackable case.
-    #[test]
-    fn scrambled_uncracked_title_still_hard_fails() {
-        let (disc, _) = css_disc_with_clear_stub();
-        let err = disc
-            .ensure_title_decryptable(false, &crate::decrypt::DecryptKeys::None, false)
-            .expect_err("scrambled-uncracked title (title_is_clear=false) must error");
-        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
-        // --raw is exempt even for a scrambled-uncracked title.
-        assert!(
-            disc.ensure_title_decryptable(true, &crate::decrypt::DecryptKeys::None, false)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn decrypt_keys_none_when_aacs_present_but_unit_keys_empty() {
-        // VID-only state (resolved but no Unit Key yet) must read as None, not
-        // an empty-but-usable key set — callers treat it as "keys missing".
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        disc.aacs = Some(aacs_with(Vec::new()));
-        assert!(matches!(
-            disc.decrypt_keys(),
-            crate::decrypt::DecryptKeys::None
-        ));
-    }
-
-    #[test]
-    fn decrypt_with_replaces_existing_aacs_unit_keys_and_marks_external() {
-        // When scan DID build an AACS state, decrypt_with must overwrite its
-        // unit keys (not append) and mark the source ExternalUk.
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        disc.aacs = Some(aacs_with(vec![(0, [0x01; 16])]));
-        let new = vec![(0u32, [0x77u8; 16]), (1, [0x88; 16])];
-        disc.decrypt_with(Key::Unit(new.clone()), &[]).unwrap();
-        match disc.decrypt_keys() {
-            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
-                assert_eq!(unit_keys, new, "must replace, preserving every CPS unit");
-            }
-            _ => panic!("expected Aacs decrypt keys"),
-        }
-        assert_eq!(
-            disc.aacs.as_ref().unwrap().key_source,
-            KeyOrigin::ExternalUk
-        );
-    }
-
-    /// Build a minimal valid `Unit_Key_RO.inf` carrying the given encrypted
-    /// unit keys at the V20 (64-byte) stride. Header is inert (no titles); only
-    /// the key-storage area matters for `parse_unit_key_ro`.
-    fn uk_ro_v20(enc_keys: &[[u8; 16]]) -> Vec<u8> {
-        let uk_pos = 32usize;
-        let keys_start = uk_pos + 48;
-        let stride = 64usize;
-        let mut data = vec![0u8; keys_start + enc_keys.len().max(1) * stride];
-        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
-        data[uk_pos..uk_pos + 2].copy_from_slice(&(enc_keys.len() as u16).to_be_bytes());
-        for (i, k) in enc_keys.iter().enumerate() {
-            let off = keys_start + i * stride;
-            data[off..off + 16].copy_from_slice(k);
-        }
-        data
-    }
-
-    #[test]
-    fn decrypt_with_volume_derives_per_cps_unit_keys() {
-        // A Volume key (VUK) is NOT terminal — the lib must decrypt Unit_Key_RO.inf
-        // into ONE unit key per CPS unit. Oracle is the lib's own decrypt_unit_key,
-        // so this pins the derive-down wiring (Volume -> per-CPS Unit), not the cipher.
-        let vuk = [0x5au8; 16];
-        let enc0 = [0x12u8; 16];
-        let enc1 = [0x34u8; 16];
-        let exp0 = crate::aacs::derive::decrypt_unit_key(&vuk, &enc0);
-        let exp1 = crate::aacs::derive::decrypt_unit_key(&vuk, &enc1);
-
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        let mut a = aacs_with(Vec::new());
-        a.uk_ro = uk_ro_v20(&[enc0, enc1]);
-        disc.aacs = Some(a);
-
-        disc.decrypt_with(Key::Volume(vuk), &[]).unwrap();
-        match disc.decrypt_keys() {
-            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
-                assert_eq!(
-                    unit_keys,
-                    vec![(1u32, exp0), (2u32, exp1)],
-                    "VUK must decrypt EACH CPS unit's encrypted key (does not stop at VK)"
-                );
-            }
-            _ => panic!("expected Aacs decrypt keys after Volume-key derive-down"),
-        }
-        assert_eq!(
-            disc.aacs.as_ref().unwrap().key_source,
-            KeyOrigin::ExternalUk
-        );
-    }
-
-    #[test]
-    fn decrypt_with_higher_key_without_inputs_errors() {
-        // A non-Unit key needs the AACS inputs (Unit_Key_RO.inf) stashed at
-        // scan. Without them the lib cannot derive — surfaces AacsNoKeys, not a
-        // panic and not a silent keyless "success".
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        disc.aacs = Some(aacs_with(Vec::new())); // uk_ro empty
-        assert!(matches!(
-            disc.decrypt_with(Key::Volume([0x11u8; 16]), &[])
-                .unwrap_err(),
-            crate::error::Error::AacsNoKeys
-        ));
-
-        // No AACS state at all → same.
-        let mut disc2 = make_test_disc(1000, "UHD");
-        disc2.encrypted = true;
-        assert!(matches!(
-            disc2
-                .decrypt_with(Key::Media(vec![[0x22u8; 16]]), &[])
-                .unwrap_err(),
-            crate::error::Error::AacsNoKeys
-        ));
-    }
-
-    #[test]
-    fn decrypt_with_volume_yielding_no_units_is_rejected() {
-        // A key that produces zero unit keys (here: an empty key-storage area)
-        // is a rejection, not a silent empty success.
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        let mut a = aacs_with(Vec::new());
-        a.uk_ro = uk_ro_v20(&[]); // num_uk = 0
-        disc.aacs = Some(a);
-        assert!(matches!(
-            disc.decrypt_with(Key::Volume([0x11u8; 16]), &[])
-                .unwrap_err(),
-            crate::error::Error::AacsKeyRejected
-        ));
-    }
-
-    #[test]
-    fn decrypt_with_unit_key_yields_decrypt_keys() {
-        // The public lookup-free entry point: hand libfreemkv a Key::Unit and
-        // decrypt_keys() must return usable AACS state (same path as the
-        // deferred-mux resume — autorip resolves the UK and passes it in).
-        let mut disc = make_test_disc(1000, "UHD");
-        disc.encrypted = true;
-        let uk = vec![(0u32, [0x44u8; 16])];
-        disc.decrypt_with(Key::Unit(uk.clone()), &[]).unwrap();
-        match disc.decrypt_keys() {
-            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
-                assert_eq!(unit_keys, uk);
-            }
-            _ => panic!("expected Aacs decrypt keys after decrypt_with(Key::Unit)"),
-        }
-    }
-
-    #[test]
-    fn unit_key_validation_gates_on_real_ciphertext() {
-        use crate::aacs::content::ALIGNED_UNIT_LEN;
-
-        // No samples -> nothing to disprove against -> accept (sample-less paths
-        // like resume / mapfile must be unaffected).
-        assert!(super::aligned_unit_keys_validate(
-            &[(0, [0x11u8; 16])],
-            &[],
-            ContentFormat::BdTs
-        ));
-
-        // A clear unit (TS syncs intact) is not scrambled -> proves nothing ->
-        // accept even with an arbitrary key.
-        let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
-        let mut off = 4;
-        while off < ALIGNED_UNIT_LEN {
-            clear[off] = 0x47;
-            off += 192;
-        }
-        assert!(crate::aacs::content::is_clean(
-            &clear,
-            crate::disc::ContentFormat::BdTs
-        ));
-        assert!(super::aligned_unit_keys_validate(
-            &[(0, [0x11u8; 16])],
-            &[clear.clone()],
-            ContentFormat::BdTs
-        ));
-
-        // A genuinely scrambled unit the RIGHT key restores to clear TS.
-        let uk = [0x5au8; 16];
-        let enc = encrypt_unit_for_test(&clear, &uk);
-        assert!(
-            !crate::aacs::content::is_clean(&enc, crate::disc::ContentFormat::BdTs),
-            "encrypted unit must read scrambled"
-        );
-
-        // Right key -> de-scrambles -> accept (NO false reject of a good key).
-        assert!(super::aligned_unit_keys_validate(
-            &[(7, uk)],
-            std::slice::from_ref(&enc),
-            ContentFormat::BdTs
-        ));
-        // Wrong key -> cannot de-scramble a scrambled sample -> reject.
-        assert!(!super::aligned_unit_keys_validate(
-            &[(7, [0x00u8; 16])],
-            std::slice::from_ref(&enc),
-            ContentFormat::BdTs
-        ));
-        // Empty key set against a scrambled sample -> reject.
-        assert!(!super::aligned_unit_keys_validate(
-            &[],
-            &[enc],
-            ContentFormat::BdTs
-        ));
-    }
-
-    #[test]
-    fn unit_key_validation_rejects_partial_cps_unit_coverage() {
-        // Regression: on a 2-CPS-unit disc, a key set covering only CPS unit 0 used to
-        // pass validation (old gate accepted on the first sample any key decrypted),
-        // silently letting CPS-unit-1 sectors through raw. Must reject any coverage gap.
-        use crate::aacs::content::ALIGNED_UNIT_LEN;
-
-        let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
-        let mut off = 4;
-        while off < ALIGNED_UNIT_LEN {
-            clear[off] = 0x47;
-            off += 192;
-        }
-
-        let uk0 = [0x11u8; 16];
-        let uk1 = [0x22u8; 16];
-        let sample0 = encrypt_unit_for_test(&clear, &uk0); // CPS unit 0 body
-        let sample1 = encrypt_unit_for_test(&clear, &uk1); // CPS unit 1 body
-        assert!(!crate::aacs::content::is_clean(
-            &sample0,
-            crate::disc::ContentFormat::BdTs
-        ));
-        assert!(!crate::aacs::content::is_clean(
-            &sample1,
-            crate::disc::ContentFormat::BdTs
-        ));
-
-        let samples = vec![sample0.clone(), sample1.clone()];
-
-        // Partial key set (CPS unit 0 only) against samples from BOTH units ->
-        // reject. This is the bug fix: previously this returned true.
-        assert!(!super::aligned_unit_keys_validate(
-            &[(0, uk0)],
-            &samples,
-            ContentFormat::BdTs
-        ));
-
-        // Complete key set (both CPS units) -> accept.
-        assert!(super::aligned_unit_keys_validate(
-            &[(0, uk0), (1, uk1)],
-            &samples,
-            ContentFormat::BdTs
-        ));
-
-        // Order-independent: covering key present anywhere in the set is fine.
-        assert!(super::aligned_unit_keys_validate(
-            &[(1, uk1), (0, uk0)],
-            &samples,
-            ContentFormat::BdTs
-        ));
-    }
-
-    // Inverse of decrypt_unit for one 6144-byte unit: produce ciphertext that
-    // decrypt_unit(uk) restores to clear (ECB-derive the per-unit key, then
-    // AES-CBC encrypt with the fixed AACS IV).
-    fn encrypt_unit_for_test(clear: &[u8], uk: &[u8; 16]) -> Vec<u8> {
-        use crate::aacs::content::ALIGNED_UNIT_LEN;
-        use crate::aacs::crypto::AACS_IV;
-        use aes::Aes128;
-        use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
-        let mut unit = clear[..ALIGNED_UNIT_LEN].to_vec();
-        // Flag the unit encrypted (CPI bits on byte 0) before key derivation so
-        // the recovered plaintext header matches and `decrypt_unit`'s CPI gate
-        // attempts the decrypt.
-        unit[0] |= 0xC0;
-        let mut header = [0u8; 16];
-        header.copy_from_slice(&unit[..16]);
-        let cipher = Aes128::new(&(*uk).into());
-        let mut blk: Array<u8, _> = header.into();
-        cipher.encrypt_block(&mut blk);
-        let mut dk = [0u8; 16];
-        for i in 0..16 {
-            dk[i] = blk[i] ^ header[i];
-        }
-        let bc = Aes128::new(&dk.into());
-        let mut prev = AACS_IV;
-        let mut i = 16;
-        while i + 16 <= ALIGNED_UNIT_LEN {
-            let mut b = [0u8; 16];
-            for j in 0..16 {
-                b[j] = unit[i + j] ^ prev[j];
-            }
-            let mut g: Array<u8, _> = b.into();
-            bc.encrypt_block(&mut g);
-            for j in 0..16 {
-                unit[i + j] = g[j];
-            }
-            prev.copy_from_slice(&unit[i..i + 16]);
-            i += 16;
-        }
-        unit
-    }
-
-    #[test]
-    fn inject_unit_keys_is_noop_without_aacs_on_unencrypted_or_css() {
-        // Unencrypted disc: nothing to inject into, stays None.
-        let mut plain = make_test_disc(1000, "PLAIN");
-        plain
-            .inject_unit_keys(vec![(0, [0x22; 16])])
-            .expect("inject");
-        assert!(plain.aacs.is_none());
-        assert!(matches!(
-            plain.decrypt_keys(),
-            crate::decrypt::DecryptKeys::None
-        ));
-
-        // Encrypted CSS (DVD): an AACS UK must NOT synthesize an AACS state.
-        let mut dvd = make_test_disc(1000, "DVD");
-        dvd.format = DiscFormat::Dvd;
-        dvd.encrypted = true;
-        dvd.css = Some(crate::css::CssState {
             title_key: [0u8; 5],
             crack_span: None,
         });
-        dvd.inject_unit_keys(vec![(0, [0x33; 16])]).expect("inject");
-        assert!(dvd.aacs.is_none(), "CSS disc must not gain an AACS state");
-    }
-
-    /// Records the LBAs read; returns all-zero (unscrambled) sectors so any
-    /// re-crack attempt finds no key and falls back, while we observe WHETHER
-    /// the title's extents were read at all.
-    struct RecordingSource {
-        reads: std::cell::RefCell<Vec<u32>>,
-    }
-    impl SectorSource for RecordingSource {
-        fn read_sectors(
-            &mut self,
-            lba: u32,
-            count: u16,
-            buf: &mut [u8],
-            _recovery: bool,
-        ) -> Result<usize> {
-            self.reads.borrow_mut().push(lba);
-            let n = (count as usize * 2048).min(buf.len());
-            for b in buf[..n].iter_mut() {
-                *b = 0;
-            }
-            Ok(n)
-        }
-    }
-
-    fn css_disc_with_two_vts() -> Disc {
-        // Title 0 (cracked VTS) at LBA 100..200; title 1 (other VTS) at
-        // 5000..5100. The cracked key's span is title 0's extents.
-        let mut t0 = title_with_video(Codec::Mpeg2, Resolution::R480p);
-        t0.extents = vec![Extent {
-            start_lba: 100,
-            sector_count: 100,
-        }];
-        let mut t1 = title_with_video(Codec::Mpeg2, Resolution::R480p);
-        t1.playlist = "00801.mpls".into();
-        t1.extents = vec![Extent {
-            start_lba: 5000,
-            sector_count: 100,
-        }];
-        let mut disc = make_test_disc(6000, "DVD");
-        disc.format = DiscFormat::Dvd;
-        disc.content_format = ContentFormat::MpegPs;
-        disc.encrypted = true;
-        disc.titles = vec![t0, t1];
-        disc.css = Some(crate::css::CssState {
-            title_key: [0xAB; 5],
-            crack_span: Some((100, 200)),
-        });
-        disc
+        assert!(gate(&disc, false).is_ok());
     }
 
     /// Build a crackable scrambled CSS sector (a periodic run in the
@@ -7914,353 +6519,6 @@ mod tests {
         }
         crate::css::lfsr::scramble_sector(title_key, &mut sec);
         sec
-    }
-
-    /// A reader that serves crackable CSS sectors for LBAs in `scrambled`
-    /// (half-open), all-zero (clear) elsewhere — records every LBA read.
-    struct CssMapReader {
-        key: [u8; 5],
-        scrambled: (u32, u32),
-        reads: std::cell::RefCell<Vec<u32>>,
-    }
-    impl SectorSource for CssMapReader {
-        fn read_sectors(
-            &mut self,
-            lba: u32,
-            count: u16,
-            buf: &mut [u8],
-            _recovery: bool,
-        ) -> Result<usize> {
-            self.reads.borrow_mut().push(lba);
-            let n = (count as usize * 2048).min(buf.len());
-            for s in 0..(n / 2048) {
-                let this = lba + s as u32;
-                let dst = &mut buf[s * 2048..(s + 1) * 2048];
-                if this >= self.scrambled.0 && this < self.scrambled.1 {
-                    dst.copy_from_slice(&crackable_css_sector(&self.key));
-                } else {
-                    dst.fill(0);
-                }
-            }
-            Ok(n)
-        }
-    }
-
-    fn css_dvd_with_extents(extents: Vec<Extent>) -> Disc {
-        let mut disc = make_test_disc(200_000, "DVD");
-        disc.format = DiscFormat::Dvd;
-        disc.content_format = ContentFormat::MpegPs;
-        disc.encrypted = true;
-        let mut t = title_with_video(Codec::Mpeg2, Resolution::R480p);
-        t.extents = extents;
-        disc.titles = vec![t];
-        disc
-    }
-
-    // decrypt_keys_for_title cracks a scrambled DVD title's key from its OWN
-    // extents and hands the mux the validated key (an un-seeded mux would
-    // emit corrupt PES, since CSS leaves the pack/PES header clear).
-    #[test]
-    fn decrypt_keys_for_title_cracks_the_titles_key() {
-        let key = [0x11, 0x22, 0x33, 0x44, 0x55];
-        let disc = css_dvd_with_extents(vec![Extent {
-            start_lba: 100,
-            sector_count: 64,
-        }]);
-        let mut src = CssMapReader {
-            key,
-            scrambled: (100, 164),
-            reads: std::cell::RefCell::new(Vec::new()),
-        };
-        let (keys, title_is_clear) = disc
-            .decrypt_keys_for_title(0, &mut src, 16, None)
-            .expect("crack verdict");
-        assert!(!title_is_clear, "a scrambled title is not clear");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => {
-                assert_eq!(title_key, key, "must crack the title's own key")
-            }
-            _ => panic!("expected Css{{key}} for a scrambled DVD title"),
-        }
-    }
-
-    // REGRESSION (1.5.1 garbage bug): crack scans extents in PLAYBACK ORDER,
-    // never largest-cell-first — must crack from the smaller scrambled-early
-    // cell that plays first, not starve on a larger clear cell. See docs.
-    #[test]
-    fn decrypt_keys_for_title_scans_playback_order_not_largest_first() {
-        let key = [0xDE, 0xAD, 0xBE, 0xEF, 0x01];
-        let disc = css_dvd_with_extents(vec![
-            // Plays FIRST: small, scrambled from its start.
-            Extent {
-                start_lba: 100,
-                sector_count: 32,
-            },
-            // A CLEAR cell far larger than the crack budget (would starve a
-            // largest-first scan before it reached the scrambled cell above).
-            Extent {
-                start_lba: 10_000,
-                sector_count: 100_000,
-            },
-        ]);
-        let mut src = CssMapReader {
-            key,
-            scrambled: (100, 132),
-            reads: std::cell::RefCell::new(Vec::new()),
-        };
-        let (keys, _) = disc
-            .decrypt_keys_for_title(0, &mut src, 16, None)
-            .expect("crack verdict");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
-                title_key, key,
-                "must crack from the scrambled cell that plays first, not miss it behind the clear giant"
-            ),
-            _ => panic!("largest-first regression: the title was read as unencrypted"),
-        }
-        assert!(
-            src.reads.borrow().iter().all(|&l| l < 10_000),
-            "the key is found in the first (scrambled) cell — the clear giant must never be scanned: {:?}",
-            src.reads.borrow()
-        );
-    }
-
-    // A reader whose every read is CSS-locked (05/6F/03) — a genuinely
-    // encrypted DVD whose sectors can't be authenticated/cracked.
-    struct LockedReader;
-    impl SectorSource for LockedReader {
-        fn read_sectors(
-            &mut self,
-            lba: u32,
-            _count: u16,
-            _buf: &mut [u8],
-            _recovery: bool,
-        ) -> Result<usize> {
-            Err(Error::DiscRead {
-                sector: lba as u64,
-                status: Some(2),
-                sense: Some(crate::scsi::ScsiSense {
-                    sense_key: 0x05,
-                    asc: 0x6F,
-                    ascq: 0x03,
-                }),
-            })
-        }
-    }
-
-    // A Stop during the per-title crack ends it after the current batch.
-    #[test]
-    fn decrypt_keys_for_title_crack_honours_the_halt_token() {
-        struct StopOnRead(crate::halt::Halt, u32);
-        impl SectorSource for StopOnRead {
-            fn read_sectors(&mut self, _l: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
-                self.1 += 1;
-                self.0.cancel();
-                let n = c as usize * 2048;
-                b[..n].fill(0);
-                Ok(n)
-            }
-        }
-        let disc = css_dvd_with_extents(vec![Extent {
-            start_lba: 100,
-            sector_count: 64,
-        }]);
-        let halt = crate::halt::Halt::new();
-        let mut src = StopOnRead(halt.clone(), 0);
-        let got = disc.decrypt_keys_for_title(0, &mut src, 16, Some(&halt));
-        assert!(
-            matches!(got, Err(Error::Halted)),
-            "a stopped crack is no verdict"
-        );
-        assert_eq!(src.1, 1, "no read after the Stop");
-    }
-
-    // End-to-end: a scrambled-but-uncrackable DVD title with NO up-front
-    // detection drives decrypt_keys_for_title to (None, false), and the
-    // gate MUST hard-fail (CssKeyMissing), never pass it to the muxer.
-    #[test]
-    fn decrypt_keys_for_title_scrambled_uncracked_dvd_hard_fails_even_without_detection() {
-        let disc = css_dvd_with_extents(vec![Extent {
-            start_lba: 100,
-            sector_count: 8,
-        }]);
-        assert!(disc.css.is_none(), "fixture: no up-front detection");
-        let mut reader = LockedReader;
-        let (keys, title_is_clear) = disc
-            .decrypt_keys_for_title(0, &mut reader, 8, None)
-            .expect("crack verdict");
-        assert!(
-            matches!(keys, crate::decrypt::DecryptKeys::None) && !title_is_clear,
-            "a locked/uncrackable scrambled title resolves to (None, false)"
-        );
-        let err = disc
-            .ensure_title_decryptable(false, &keys, title_is_clear)
-            .expect_err("scrambled-uncracked DVD title must hard-fail without detection");
-        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
-    }
-
-    /// Fast path: when the scan already cracked a key whose `crack_span` COVERS
-    /// this title's VTS, `decrypt_keys_for_title` reuses it and never touches the
-    /// reader (no redundant crack, no second bus-auth on a live drive).
-    #[test]
-    fn decrypt_keys_for_title_reuses_covered_scan_key_without_reading() {
-        let disc = css_disc_with_two_vts(); // css=[0xAB;5], crack_span=(100,200)
-        let mut src = RecordingSource {
-            reads: std::cell::RefCell::new(Vec::new()),
-        };
-        // Title 0's extents (100..200) overlap the cracked span → reuse.
-        let (keys, clear) = disc
-            .decrypt_keys_for_title(0, &mut src, 16, None)
-            .expect("crack verdict");
-        assert!(!clear);
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => {
-                assert_eq!(title_key, [0xAB; 5], "reuse the scan's cracked key")
-            }
-            _ => panic!("expected the reused Css key"),
-        }
-        assert!(
-            src.reads.borrow().is_empty(),
-            "a covered title must NOT re-read/re-crack: {:?}",
-            src.reads.borrow()
-        );
-    }
-
-    /// A title in a DIFFERENT VTS (extents disjoint from `crack_span`) does NOT
-    /// reuse the scan key — it cracks its own key from its own extents.
-    #[test]
-    fn decrypt_keys_for_title_cracks_other_vts_on_no_overlap() {
-        let key = [0x77, 0x66, 0x55, 0x44, 0x33];
-        let disc = css_disc_with_two_vts(); // title 1 lives at 5000.., span=(100,200)
-        let mut src = CssMapReader {
-            key,
-            scrambled: (5000, 5100),
-            reads: std::cell::RefCell::new(Vec::new()),
-        };
-        let (keys, _) = disc
-            .decrypt_keys_for_title(1, &mut src, 16, None)
-            .expect("crack verdict");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
-                title_key, key,
-                "a disjoint-VTS title cracks its OWN key, not the reused scan key"
-            ),
-            _ => panic!("expected a freshly-cracked Css key for the other VTS"),
-        }
-        assert!(
-            src.reads.borrow().iter().all(|&l| l >= 5000),
-            "must crack from title 1's own extents (>=5000): {:?}",
-            src.reads.borrow()
-        );
-    }
-
-    // A title whose clear front matter (studio logo/rating card) plays FIRST
-    // still cracks: the single playback-order scan reads through the small
-    // clear prefix and reaches the scrambled body within budget.
-    #[test]
-    fn decrypt_keys_for_title_cracks_feature_after_clear_front_matter() {
-        let key = [0xCA, 0xFE, 0xBA, 0xBE, 0x02];
-        // css=None so the crack path runs. ~10 MB of clear front matter plays
-        // first (well under the crack budget), then the scrambled feature.
-        let disc = css_dvd_with_extents(vec![
-            Extent {
-                start_lba: 10_000,
-                sector_count: 5_000,
-            }, // clear front matter (~10 MB), plays first
-            Extent {
-                start_lba: 100,
-                sector_count: 2_000,
-            }, // scrambled feature body
-        ]);
-        let mut src = CssMapReader {
-            key,
-            scrambled: (100, 2_100),
-            reads: std::cell::RefCell::new(Vec::new()),
-        };
-        let (keys, _) = disc
-            .decrypt_keys_for_title(0, &mut src, 16, None)
-            .expect("crack verdict");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
-                title_key, key,
-                "must crack the scrambled feature after reading through clear front matter"
-            ),
-            _ => panic!("clear front matter wrongly starved the crack"),
-        }
-    }
-
-    // Scrambling beginning well INTO a cell must still be cracked: the scan
-    // reads through the clear prefix and reaches the scrambled body within
-    // budget — never a silent "clear" verdict muxing corrupt PES.
-    #[test]
-    fn decrypt_keys_for_title_cracks_scrambling_after_a_clear_prefix_in_one_cell() {
-        let key = [0x0D, 0xEE, 0x40, 0x00, 0x05];
-        // One cell: clear for the first 9000 sectors, then scrambled (well within
-        // the crack budget). css=None so the crack path runs.
-        let disc = css_dvd_with_extents(vec![Extent {
-            start_lba: 100,
-            sector_count: 20_000,
-        }]);
-        let mut src = CssMapReader {
-            key,
-            scrambled: (100 + 9_000, 100 + 20_000),
-            reads: std::cell::RefCell::new(Vec::new()),
-        };
-        let (keys, _) = disc
-            .decrypt_keys_for_title(0, &mut src, 16, None)
-            .expect("crack verdict");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
-                title_key, key,
-                "the scan must crack scrambling that starts past a clear prefix"
-            ),
-            _ => panic!("in-cell-deep scrambling was misread as clear (silent-garbage direction)"),
-        }
-    }
-
-    // A DVD title with EMPTY extents resolves to (decrypt_keys(), true) —
-    // clear, no key needed — and the gate must PASS it (returning false
-    // would wrongly hard-fail a genuinely-clear empty title).
-    #[test]
-    fn decrypt_keys_for_title_empty_extents_is_clear_not_hard_fail() {
-        let mut disc = css_dvd_with_extents(vec![Extent {
-            start_lba: 100,
-            sector_count: 8,
-        }]);
-        disc.titles
-            .push(title_with_video(Codec::Mpeg2, Resolution::R480p)); // idx 1: no extents
-        let mut reader = LockedReader;
-        let (keys, title_is_clear) = disc
-            .decrypt_keys_for_title(1, &mut reader, 8, None)
-            .expect("crack verdict");
-        assert!(
-            title_is_clear,
-            "an empty-extents title is clear (nothing to descramble)"
-        );
-        assert!(
-            disc.ensure_title_decryptable(false, &keys, title_is_clear)
-                .is_ok(),
-            "an empty-extents DVD title must not hard-fail"
-        );
-    }
-
-    // A bonus title that cracked its OWN valid key must NOT be blocked by
-    // disc-wide css_error from the MAIN feature's scan failure. (Regression
-    // for audit r5 css_error-over-valid-key.)
-    #[test]
-    fn ensure_title_decryptable_valid_key_ignores_disc_wide_css_error() {
-        let mut disc = css_dvd_with_extents(vec![Extent {
-            start_lba: 100,
-            sector_count: 8,
-        }]);
-        disc.css_error = Some(crate::error::Error::CssKeyMissing); // main feature failed
-        let keys = crate::decrypt::DecryptKeys::Css {
-            title_key: [0x42; 5], // this bonus title cracked its own key
-        };
-        assert!(
-            disc.ensure_title_decryptable(false, &keys, false).is_ok(),
-            "a title with its own valid CSS key must pass despite disc-wide css_error"
-        );
     }
 
     /// bytes_bad_in_title must overlap per-extent, not against a single
@@ -10405,99 +8663,15 @@ mod tests {
         );
         disc.aacs = Some(AacsState {
             disc_hash: format!("0x{SHA1}"),
-            ..aacs_with(Vec::new())
+            ..aacs_empty()
         });
         assert_eq!(disc.aacs_disc_hash(), SHA1);
         // Already bare (no prefix) passes through unchanged, never re-stripped.
         disc.aacs = Some(AacsState {
             disc_hash: SHA1.to_string(),
-            ..aacs_with(Vec::new())
+            ..aacs_empty()
         });
         assert_eq!(disc.aacs_disc_hash(), SHA1);
-    }
-
-    // ── decrypt_keys_for_title: CSS crack-span reuse is half-open ───────── crack_span uses
-    // STRICT `<` both sides, so a title that merely ABUTS the span must NOT reuse the key.
-    #[test]
-    fn decrypt_keys_for_title_css_span_reuse_is_half_open() {
-        const KEY: [u8; 5] = [0xA1, 0xB2, 0xC3, 0xD4, 0xE5];
-        let mut disc = make_test_disc(200_000, "DVD");
-        disc.format = DiscFormat::Dvd;
-        disc.content_format = ContentFormat::MpegPs;
-        disc.encrypted = true;
-        // Key cracked from sectors [250, 300).
-        disc.css = Some(crate::css::CssState {
-            title_key: KEY,
-            crack_span: Some((250, 300)),
-        });
-        let mk = |extents: &[(u32, u32)]| {
-            let mut t = title_with_video(Codec::Mpeg2, Resolution::R480p);
-            t.extents = extents
-                .iter()
-                .map(|&(start_lba, sector_count)| Extent {
-                    start_lba,
-                    sector_count,
-                })
-                .collect();
-            t
-        };
-        disc.titles = vec![
-            // 0: [200,250) — ends exactly where the span begins.
-            mk(&[(200, 50)]),
-            // 1: [300,350) — begins exactly where the span ends.
-            mk(&[(300, 50)]),
-            // 2: [260,270) — genuinely inside the span.
-            mk(&[(260, 10)]),
-            // 3: no extents at all.
-            mk(&[]),
-        ];
-        let mut clear = CssMapReader {
-            key: KEY,
-            scrambled: (0, 0),
-            reads: std::cell::RefCell::new(Vec::new()),
-        };
-
-        for idx in [0usize, 1] {
-            let (keys, title_is_clear) = disc
-                .decrypt_keys_for_title(idx, &mut clear, 16, None)
-                .expect("crack verdict");
-            assert!(
-                matches!(keys, crate::decrypt::DecryptKeys::None),
-                "title {idx} only ABUTS the crack span — it shares no sector with it, so the \
-                 per-VTS key must not be reused"
-            );
-            assert!(
-                title_is_clear,
-                "title {idx} re-cracks from its own (clear) extents and is reported unencrypted"
-            );
-        }
-
-        let (keys, title_is_clear) = disc
-            .decrypt_keys_for_title(2, &mut clear, 16, None)
-            .expect("crack verdict");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(
-                title_key, KEY,
-                "a title INSIDE the crack span reuses the scan's key"
-            ),
-            _ => panic!("expected the reused CSS key for an overlapping title"),
-        }
-        assert!(!title_is_clear);
-
-        // A title with NO extents has nothing to crack from: it short-circuits
-        // to the disc-wide keys and is marked clear, so the decrypt gate's
-        // "None keys + not clear" rule cannot hard-fail it.
-        let (keys, title_is_clear) = disc
-            .decrypt_keys_for_title(3, &mut clear, 16, None)
-            .expect("crack verdict");
-        match keys {
-            crate::decrypt::DecryptKeys::Css { title_key } => assert_eq!(title_key, KEY),
-            _ => panic!("an extent-less title must return the disc-wide keys"),
-        }
-        assert!(
-            title_is_clear,
-            "an extent-less title is clear — nothing scrambled to worry about"
-        );
     }
 
     // ── mapfile paths ─────────────────────────────────────────────────────

@@ -141,8 +141,7 @@ pub use drive::{Drive, DriveStatus, extract_scsi_context, find_drive};
 // key material into `ScanOptions` (the library derives no certs; see `KeySpec`).
 #[cfg(feature = "rip")]
 pub use session::{
-    DeviceTarget, DiscSession, Finish, KeySourceFactory, KeySpec, ResolvedKeys, resolve_keys_for,
-    scan_dir, scan_iso,
+    DeviceTarget, DiscSession, Finish, KeySourceFactory, KeySpec, scan_dir, scan_iso,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -186,9 +185,9 @@ pub use identity::DriveId;
 
 // ─── Unlock seam: drive/disc unlocking (firmware, AACS cert, CSS bus-auth) lives entirely in `freemkv-unlock`; consumed via `unlock_bridge`, exposes nothing. ───
 
-// ─── Decryption (AACS/CSS): `Disc::scan()` resolves keys onto `Disc`; `DiscStream::new(...)` consumes them directly; `decrypt_sectors()` is for raw sector buffers (ISO patching). ───
+// ─── Decryption (AACS/CSS): AACS keys come only from `keys::ResolvedKeySet` (KU §2.2); `decrypt_sectors()` is for raw sector buffers (ISO patching). ───
 #[cfg(feature = "rip")]
-pub use decrypt::{AacsKeyMap, DecryptKeys, decrypt_sectors, decrypt_threads, set_decrypt_threads};
+pub use decrypt::{decrypt_sectors, decrypt_threads, set_decrypt_threads};
 
 // ─── Disc structure ─────────────────────────────────────────────────────────
 // `Disc::scan()` fully populates `Disc`; `Disc::identify()` is a UDF-only fast path
@@ -203,7 +202,7 @@ pub use disc::{
     SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
 };
 #[cfg(feature = "rip")]
-pub use keysource::{DiscInputs, KeySource, read_encrypted_units, resolve_and_apply};
+pub use keysource::{DiscInputs, KeySource, read_encrypted_units};
 
 // ─── Streams ────────────────────────────────────────────────────────────────
 // All types implement `pes::Stream` (re-exported `PesStream` to avoid colliding
@@ -244,20 +243,14 @@ pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
 // `ScsiTransport` is the platform trait Drive uses, exposed for out-of-tree
 // backends. `DecryptingSectorSource` wraps any `SectorSource` to decrypt (AACS/CSS).
 #[cfg(feature = "rip")]
-pub use mux::build_iso_pipeline;
-#[cfg(feature = "rip")]
-pub use mux::resolve_mux_key_map;
-#[cfg(feature = "rip")]
 pub use mux::select::{PidFilter, StreamSelection};
 #[cfg(feature = "rip")]
-pub use mux::{MuxEvents, MuxInput, MuxOptions, MuxOutcome, MuxSource, mux_stream, mux_with_keys};
+pub use mux::{MuxEvents, MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
 pub use scsi::{
     DiscPresence, DriveInfo, ScsiSense, ScsiTransport, SenseFamily, disc_presence, drive_has_disc,
     list_drives,
 };
 #[cfg(feature = "rip")]
-pub use sector::{
-    DecryptingSectorSource, FileSectorSource, KeyFetch, PrefetchedSectorSource, SectorSource,
-};
+pub use sector::{DecryptingSectorSource, FileSectorSource, PrefetchedSectorSource, SectorSource};
 #[cfg(feature = "rip")]
 pub use udf::{UdfFs, read_filesystem};

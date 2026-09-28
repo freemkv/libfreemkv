@@ -109,7 +109,7 @@ impl Scan {
 
 /// Source `medium` for the header `source.medium` member. Describes the physical/logical input
 /// the index was built from — never the destination the index is written to. The driver derives
-/// it from the `MuxInput` arm; [`Medium::File`] is the default only for a caller that declares
+/// it from the `MuxSource` arm; [`Medium::File`] is the default only for a caller that declares
 /// no provenance at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Medium {

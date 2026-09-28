@@ -14,55 +14,6 @@ use std::sync::Arc;
 
 use super::SectorSource;
 
-/// A closure resolving keys from encrypted-content samples — the shape of both
-/// [`KeyFetch`] operations. `Ok(empty)` = no key; `Err` = the key source failed
-/// (reported as itself, not as a missing key).
-pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Result<Vec<[u8; 16]>> + Send + Sync>;
-
-/// Resolves keys from encrypted-content samples for [`DecryptingSectorSource`].
-///
-/// Two operations: [`unit_keys`](Self::unit_keys) resolves the base Unit
-/// Key(s) for a CPS unit from real encrypted samples; [`fmts_indexes`](Self::fmts_indexes)
-/// resolves the disc's AACS 2.1 forensic index key set from an index-1
-/// anchor batch. Both return additional keys to add to the pool and retry
-/// with; empty if the source can't help, `Err` if it failed. The library does no key lookup or
-/// network I/O itself — this is the caller's seam to its key source.
-#[derive(Clone)]
-pub struct KeyFetch {
-    unit: KeyFetchFn,
-    fmts: KeyFetchFn,
-}
-
-impl KeyFetch {
-    /// Build a resolver from its two operations: `unit` resolves base Unit Keys
-    /// from a CPS unit's samples; `fmts` resolves the forensic index set from an
-    /// index-1 anchor batch.
-    pub fn new(unit: KeyFetchFn, fmts: KeyFetchFn) -> Self {
-        Self { unit, fmts }
-    }
-
-    /// A resolver that serves ONLY base Unit Keys; [`fmts_indexes`](Self::fmts_indexes)
-    /// is always empty. For read paths that never resolve forensic keys — the
-    /// sweep/patch recovery decorator, which handles CPS units only.
-    pub fn unit_only(unit: KeyFetchFn) -> Self {
-        Self::new(unit, std::sync::Arc::new(|_| Ok(Vec::new())))
-    }
-
-    /// Resolve the base Unit Key(s) for a CPS unit from `samples` (real encrypted
-    /// units drawn from it). Normally one key; the caller adds whatever it returns
-    /// to the pool.
-    pub fn unit_keys(&self, samples: &[Vec<u8>]) -> Result<Vec<[u8; 16]>> {
-        (self.unit)(samples)
-    }
-
-    /// Resolve the disc's AACS 2.1 forensic index keys from an index-1 single-
-    /// phase `anchor` batch. The source returns the COMPLETE ordered set (index i
-    /// = element i); the caller trusts any non-empty result as all of them.
-    pub fn fmts_indexes(&self, anchor: &[Vec<u8>]) -> Result<Vec<[u8; 16]>> {
-        (self.fmts)(anchor)
-    }
-}
-
 /// Decorator: read from `inner`, then run the configured
 /// AACS / CSS decrypt over the bytes that landed in `buf`.
 ///
@@ -125,9 +76,9 @@ fn span_touches_content(content: Option<&[(u32, u32)]>, lba: u32, count: u16) ->
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
-    /// Wrap `inner` with the given keys. For an AACS source, install a key map
-    /// via [`with_key_map`](Self::with_key_map) before reading — AACS decrypts
-    /// only through the map and fails loud without one.
+    /// Wrap `inner` with the given keys. AACS decrypts only through a key map, which
+    /// only a [`ResolvedKeySet`](crate::keys::ResolvedKeySet) reader installs; an AACS
+    /// source built here fails loud on its first encrypted unit.
     pub fn new(inner: S, keys: DecryptKeys) -> Self {
         Self {
             inner,
@@ -156,7 +107,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// resolved one key per CPS unit / segment up front, so every aligned unit is
     /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check.
     /// AACS-only; a CSS / clear disc ignores it.
-    pub fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
+    pub(crate) fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
         self.key_map = Some(map);
         self
     }
@@ -165,7 +116,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// proactive map on an already-constructed source (the inline live-drive
     /// [`DiscStream`](crate::mux::DiscStream) builds the decorator first, then
     /// installs the map via its own `with_key_map`).
-    pub fn set_key_map(&mut self, map: Arc<crate::decrypt::AacsKeyMap>) {
+    pub(crate) fn set_key_map(&mut self, map: Arc<crate::decrypt::AacsKeyMap>) {
         self.key_map = Some(map);
     }
 

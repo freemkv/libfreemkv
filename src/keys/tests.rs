@@ -1732,7 +1732,7 @@ fn scannable_image() -> (EncryptedBdImage, Disc) {
 }
 
 /// `InputOptions::keys` (KU §3.1, §3.5): an `iso://` AACS source opens through the rip's set,
-/// gated by `check_decryptable`, where the legacy path (no banked key) refuses E7022.
+/// gated by `check_decryptable`; with no set it refuses E7022.
 #[test]
 fn iso_input_reads_through_the_key_set() {
     let _serial = crate::sector::prefetched::holder_test_lock();
@@ -1752,8 +1752,8 @@ fn iso_input_reads_through_the_key_set() {
     let path = dir.path().join("disc.iso");
     std::fs::write(&path, &img.image).unwrap();
     let url = format!("iso://{}", path.display());
-    let legacy = crate::input(&url, &crate::InputOptions::default());
-    assert_eq!(crate::error_code(&legacy.err().unwrap()), Some(E7022));
+    let keyless = crate::input(&url, &crate::InputOptions::default());
+    assert_eq!(crate::error_code(&keyless.err().unwrap()), Some(E7022));
     let opts = crate::InputOptions {
         keys: Some(set),
         ..Default::default()
@@ -1772,7 +1772,6 @@ fn session_resolves_a_key_set_through_its_reader() {
     let mut session = crate::session::DiscSession::from_parts_for_test(
         Some(two_units().disc),
         Some(Box::new(fx.source())),
-        None,
     );
     let r = session
         .resolve_key_set(KeyScope::WholeDisc, &f, ResolveKeysOptions::default())
@@ -1844,17 +1843,19 @@ fn live_stream_stops_on_an_unkeyed_piece_without_recovery() {
         let (fx, set, src) = lazy_b(&[K1]);
         let recovery = Arc::new(Mutex::new(0u32));
         let reader = RecoveryCount(src, recovery.clone());
-        let mut stream = crate::mux::DiscStream::new(
-            Box::new(reader),
-            fx.disc.titles[0].clone(),
-            set.decrypt_keys(),
-            30,
-            ContentFormat::BdTs,
-            false,
-            None,
+        let mut stream = super::install_key_map(
+            crate::mux::DiscStream::new(
+                Box::new(reader),
+                fx.disc.titles[0].clone(),
+                set.decrypt_keys(),
+                30,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap(),
+            set.key_map(),
         )
-        .unwrap()
-        .with_key_map(set.key_map())
         .with_arrival(set.arrival(set.title_stop()).expect("B is Lazy"));
         stream.skip_errors = skip;
         let got = loop {
@@ -2020,17 +2021,19 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
     let set = ResolvedKeySet::keyless_for(&title, ContentFormat::BdTs);
     for skip in [false, true] {
         let recovery = Arc::new(Mutex::new(0u32));
-        let mut stream = crate::mux::DiscStream::new(
-            Box::new(RecoveryCount(fx.source(), recovery.clone())),
-            title.clone(),
-            set.decrypt_keys(),
-            3,
-            ContentFormat::BdTs,
-            false,
-            None,
+        let mut stream = super::install_key_map(
+            crate::mux::DiscStream::new(
+                Box::new(RecoveryCount(fx.source(), recovery.clone())),
+                title.clone(),
+                set.decrypt_keys(),
+                3,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap(),
+            set.key_map(),
         )
-        .unwrap()
-        .with_key_map(set.key_map())
         .with_arrival(set.arrival(set.title_stop()).expect("every extent is lazy"));
         stream.skip_errors = skip;
         // Start past the inner extent: its first read is unit 4 of the outer one.
@@ -2542,3 +2545,64 @@ fn a_source_halted_mid_request_keeps_the_asked_step() {
 }
 
 mod stop_tests;
+
+/// LK21 (K-13), per spec — KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not
+/// encrypted"; corroborated by KS-22 (libaacs clears it per source packet). A decrypted
+/// image says so in every packet, so re-scanning it finds only clear pieces and asks nothing.
+#[test]
+fn decrypt_clears_cpi_on_every_source_packet() {
+    use crate::spec::keys::{KS_5_CPI, KS_22_LIBAACS_VERIFY_TS};
+    assert!(KS_5_CPI.text.contains("00₂ if the data is not encrypted"));
+    assert!(KS_22_LIBAACS_VERIFY_TS.text.contains("buf[i] &= ~0xc0;"));
+    let mut fx = two_units();
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1, K2], &calls)]).unwrap();
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.iso");
+    let cap = fx.disc.capacity_sectors;
+    crate::write_image(&mut w, &dest, cap, &Halt::new(), |_| {}).unwrap();
+    let bytes = std::fs::read(&dest).unwrap();
+    for i in 0..2 {
+        let (start, n) = fx.file(i);
+        for lba in (start..start + n).step_by(3) {
+            let o = lba as usize * 2048;
+            for p in (0..ALIGNED_UNIT_LEN).step_by(192) {
+                assert_eq!(bytes[o + p] & 0xC0, 0, "LBA {lba}, packet byte {p}: CPI");
+            }
+        }
+    }
+    // Re-scan the decrypted image: every piece reads Clear, and no source is asked.
+    fx.img.image = bytes;
+    let calls = Calls::default();
+    let specs = [
+        Spec::keydb(&[K1, K2], &calls),
+        Spec::online(&[K1, K2], &calls),
+    ];
+    let set = resolve(&fx, KeyScope::WholeDisc, &specs).unwrap();
+    assert_eq!((set.status().clear, set.status().lazy), (2, 0));
+    assert_eq!((calls.len(), set.source_requests()), (0, 0), "requests");
+}
+
+/// K-8: `n_decl` is read through `parse_title_keys`, so an HD DVD title-key file counts
+/// too. Per spec KS-14 ("Num_of_CPS_Unit … the number of CPS Units on the disc") for BD;
+/// HD DVD has no public book, per evidence KS-27.
+#[test]
+fn declared_cps_units_reads_hd_dvd_title_keys_too() {
+    use crate::spec::keys::{KS_14_UNIT_KEY_BLOCK, KS_27_HDDVD_EVIDENCE};
+    assert!(
+        KS_14_UNIT_KEY_BLOCK
+            .text
+            .contains("indicates the number of CPS Units")
+    );
+    assert_eq!(KS_27_HDDVD_EVIDENCE.kind, crate::spec::QuoteKind::Evidence);
+    // A VTKF with one available Title Key Entry (AV_FLG set in slot 0).
+    let mut vtkf = vec![0u8; 2480];
+    vtkf[..12].copy_from_slice(crate::aacs::inf::VTKF_MAGIC);
+    vtkf[0x80] = 0x80;
+    let mut fx = two_units();
+    fx.disc.format = DiscFormat::HdDvd;
+    fx.disc.content_format = ContentFormat::MpegPs;
+    fx.disc.aacs.as_mut().unwrap().uk_ro = vtkf;
+    assert_eq!(fx.disc.declared_cps_units(), Some(1));
+}

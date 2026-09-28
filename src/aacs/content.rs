@@ -235,7 +235,7 @@ fn is_clean_ps(unit: &[u8]) -> bool {
 /// Applies the key UNCONDITIONALLY: does NOT check the encrypted-flag, so the CALLER must gate
 /// on [`aacs_unit_encrypted`] first. Block Key = AES-128E(Kcu, seed) ⊕ seed, then AES-128-CBC
 /// decrypt bytes 16..6144 under the AACS IV.
-pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
+pub(crate) fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     if unit.len() < ALIGNED_UNIT_LEN {
         return;
     }
@@ -266,7 +266,7 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     }
 }
 
-/// Encrypt one AACS aligned unit (6144 bytes) IN PLACE — the exact inverse of [`decrypt_unit`].
+/// Encrypt one AACS aligned unit (6144 bytes) IN PLACE — the exact inverse of `decrypt_unit`.
 /// Caller must set the encrypted flag BEFORE calling and check the returned bool.
 #[must_use = "returns false when the slice is too short to encrypt, leaving \
               plaintext behind a flag that already says 'encrypted'"]
@@ -1579,7 +1579,7 @@ mod tests {
 }
 
 // Spec guards (keys-upfront-design §7.8) on the unit decrypt; here because
-// `decrypt_unit` leaves the public API (KU-X2). Vectors come from the `aes` crate.
+// `decrypt_unit` is crate-private (KU §2.2). Vectors come from the `aes` crate.
 #[cfg(test)]
 mod spec_guards {
     use super::*;

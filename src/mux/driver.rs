@@ -2,16 +2,15 @@
 //! pump → finish` pipeline the consumers (CLI `pipe`/`pipe_disc`, autorip
 //! `run_mux`) each used to hand-roll.
 //!
-//! `mux_stream` DRIVES the existing pipeline via the same
-//! [`build_iso_pipeline`](crate::mux::resolve::build_iso_pipeline) and a
-//! [`WRITE_PIPELINE_DEPTH`]-deep write [`Pipeline`]; it does not replace either.
+//! [`mux_with_keys`] DRIVES the existing pipeline via the same ISO pipeline builders
+//! and a [`WRITE_PIPELINE_DEPTH`]-deep write [`Pipeline`]; it does not replace either.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::decrypt::{AacsKeyMap, DecryptKeys};
+use crate::decrypt::DecryptKeys;
 use crate::disc::DiscTitle;
 use crate::error::Error;
 use crate::event::{BatchSizeReason, Event, EventKind};
@@ -19,12 +18,11 @@ use crate::halt::Halt;
 use crate::io::FlushProgress;
 use crate::io::pipeline::{Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH};
 use crate::pes::{CountingStream, PesFrame, Stream};
-use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
+use crate::sector::{FileSectorSource, SectorSource};
 use crate::session::DiscSession;
 
 use super::resolve::{
     InputOptions, StreamUrl, build_iso_pipeline, input_with_halt, output, output_with, parse_url,
-    resolve_mux_key_map,
 };
 use super::videomap::{Medium, SourceInfo};
 
@@ -59,73 +57,6 @@ fn effective_send_deadline(send_deadline: Option<Duration>) -> Duration {
 // `codec_private` never resolves fails fast instead of OOM-killing the process.
 pub(crate) const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
 
-/// Where [`mux_stream`] reads its PES frames from. The driver owns the
-/// construction of the underlying [`Stream`] so consumers stop hand-rolling
-/// `DiscStream::new` / `build_iso_pipeline` / `input()`.
-pub enum MuxInput<'a> {
-    /// Live single-pass mux off an opened [`DiscSession`]. The driver takes the
-    /// session's staged reader ([`DiscSession::take_reader`]); a missing reader
-    /// (never staged, or already consumed) is a clean error, never a panic.
-    Session {
-        /// The opened, scanned session (its keys resolved via
-        /// [`DiscSession::resolve_keys`]).
-        session: &'a mut DiscSession,
-        /// Index into `session.disc().titles` of the title to mux.
-        title_index: usize,
-    },
-    /// Multipass / remux from a staged ISO on disk. Keys/map/fetch are the
-    /// pre-resolved material the consumer already banked — the driver does no
-    /// internal re-resolution beyond what [`build_iso_pipeline`] performs.
-    Iso {
-        /// Path to the ISO image.
-        path: &'a Path,
-        /// The scanned title to mux out of the image.
-        title: DiscTitle,
-        /// Container format of the title (TS vs PS demuxer selection).
-        format: crate::disc::ContentFormat,
-        /// Decryption keys for the title (`DecryptKeys::None` for raw/clear).
-        keys: DecryptKeys,
-        /// Optional read-time key fetch closure (banked by `resolve_keys`).
-        key_fetch: Option<KeyFetch>,
-    },
-    /// Live single-pass mux off a raw disc [`SectorSource`] (autorip's
-    /// live-drive path). The driver wraps the reader in a
-    /// [`DiscStream`](crate::mux::DiscStream) — the **INLINE** stream, NOT the
-    /// prefetch highway — so the consumer's adaptive batch-retry in
-    /// `DiscStream::fill_extents` still fires on a bad sector (the highway would
-    /// bypass it). The live analogue of [`MuxInput::Iso`]: the consumer resolves
-    /// keys as its own app-layer policy and hands the already-banked material in;
-    /// the driver does no internal re-resolution.
-    Live {
-        /// The raw sector source (physical drive). Boxed `dyn` — the driver owns
-        /// it and moves it into `DiscStream::new` (whose reader param is exactly
-        /// `Box<dyn SectorSource>`), so no concrete drive type leaks in here.
-        reader: Box<dyn SectorSource>,
-        /// The scanned title to mux.
-        title: DiscTitle,
-        /// Container format (TS vs PS demux selection).
-        format: crate::disc::ContentFormat,
-        /// Decryption keys the consumer already banked (`DecryptKeys::None` for
-        /// raw/clear). The driver consumes them as-is — never re-resolves.
-        keys: DecryptKeys,
-        /// Optional pre-resolved forensic AACS key map, applied VERBATIM via
-        /// [`DiscStream::with_key_map`](crate::mux::DiscStream::with_key_map)
-        /// BEFORE any read. `None` for every non-FMTS disc. Single-pass FMTS
-        /// correctness depends on this reaching the inline reader: `with_key_map`
-        /// rewrites the extent walk to our-phase units only and installs the map
-        /// so each unit decrypts with its mapped key.
-        key_map: Option<Arc<AacsKeyMap>>,
-    },
-    /// Any URL-addressed source (`iso://`, `mkv://`, `m2ts://`, `network://`,
-    /// stdio) opened via [`input`](super::resolve::input).
-    Url {
-        /// The source URL.
-        url: &'a str,
-        /// Input options forwarded to [`input`](super::resolve::input).
-        opts: InputOptions,
-    },
-}
-
 /// Tuning / behaviour knobs for a mux run.
 ///
 /// `Default` = keep-everything, no-skip, decrypt, no send deadline — the
@@ -146,7 +77,7 @@ pub struct MuxOptions {
     /// routing all follow the pruned list. See [`crate::StreamSelection`].
     ///
     /// Applies to the `Iso`, `Session` and `Live` inputs. It does NOT apply to
-    /// [`MuxInput::Url`], which builds its demux inside `input()` — a Url-source
+    /// [`MuxSource::Url`], which builds its demux inside `input()` — a Url-source
     /// caller sets `InputOptions::selection` instead. Setting this field for a Url
     /// input has no effect.
     pub selection: crate::StreamSelection,
@@ -160,7 +91,7 @@ pub struct MuxOptions {
 /// autorip's stream event handler). Every method has a no-op default so a
 /// consumer overrides only what it renders.
 ///
-/// `Send + Sync + 'static` so [`mux_stream`] can clone the handle into the reader constructors'
+/// `Send + Sync + 'static` so [`mux_with_keys`] can clone the handle into the reader constructors'
 /// `'static` `EventFn`. Progress is split into read-side and write-side callbacks (CLI renders
 /// WRITE, autorip READ).
 pub trait MuxEvents: Send + Sync + 'static {
@@ -193,7 +124,7 @@ pub(crate) struct NoopEvents;
 #[cfg(test)]
 impl MuxEvents for NoopEvents {}
 
-/// The result of a [`mux_stream`] run.
+/// The result of a [`mux_with_keys`] run.
 #[derive(Debug, Clone)]
 pub struct MuxOutcome {
     /// The mux drained to a natural EOF, finalised cleanly, and produced real
@@ -221,16 +152,10 @@ pub struct MuxOutcome {
     pub undelivered_streams: Vec<usize>,
 }
 
-/// Run the decrypt + mux pipeline end-to-end: construct the source stream from
-/// `input`, open the `dest_url` sink, and pump PES frames through a write
-/// pipeline until EOF (or `halt`). Preserves the CLI's/autorip's semantics:
-/// - metadata sinks short-circuit BEFORE the header gate;
-/// - unresolved codec headers are refused with [`Error::MkvInvalid`];
-/// - a zero-output/zero-stream drain is refused with [`Error::NoStreams`];
-/// - a `halt` mid-run yields `completed = false`. `halt` is mandatory: the
-///   caller threads a real [`Halt`] for `/api/stop` / SIGINT.
-pub fn mux_stream(
-    input_src: MuxInput,
+// The mux of a source with no AACS key set (clear, CSS, `raw`, or a URL that scans):
+// construct the source stream, open the `dest_url` sink and pump it (`drive_mux`).
+fn mux_unkeyed(
+    input_src: MuxSource,
     dest_url: &str,
     opts: &MuxOptions,
     halt: &Halt,
@@ -244,7 +169,7 @@ pub fn mux_stream(
             // The Url path builds its demux INSIDE `input()`, pruned via
             // `InputOptions.selection`. `MuxOptions.selection` does NOT apply
             // here — that's the File/Session arms' field.
-            MuxInput::Url { url, opts: in_opts } => {
+            MuxSource::Url { url, opts: in_opts } => {
                 // Provenance: source URL verbatim, scheme's medium, and the title
                 // `input()` will open. `playlist` fills in below from the opened
                 // stream's scanned title — not known until the scan runs.
@@ -276,12 +201,10 @@ pub fn mux_stream(
                 };
                 (stream, None, source)
             }
-            MuxInput::Iso {
+            MuxSource::Iso {
                 path,
                 title,
                 format,
-                keys,
-                key_fetch,
             } => {
                 // Prune to selected audio/subtitle streams BEFORE the highway
                 // builds demux state (and before the DVD AC-3 channel probe).
@@ -291,7 +214,7 @@ pub fn mux_stream(
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
                 // Provenance: staged image as an `iso://` URL, plus playlist. Title
-                // INDEX is NOT reachable here — `MuxInput::Iso` carries an already-
+                // INDEX is NOT reachable here — `MuxSource::Iso` carries an already-
                 // scanned `DiscTitle` with no index, so it stays 0 rather than guessed.
                 let source = SourceInfo {
                     medium: Medium::Iso,
@@ -303,24 +226,23 @@ pub fn mux_stream(
                 let stream = build_iso_pipeline(
                     reader,
                     title,
-                    keys,
+                    DecryptKeys::None,
                     opts.batch_sectors,
                     format,
                     opts.raw,
                     Some(halt.clone()),
                     Some(reader_event_fn(events.clone())),
-                    key_fetch,
                 )?;
                 (Box::new(stream), None, source)
             }
-            MuxInput::Session {
+            MuxSource::Session {
                 session,
                 title_index,
             } => {
                 // Pull everything we need out of the disc as owned values so the
                 // immutable disc borrow is released before the mutable
                 // `take_reader` below.
-                let (mut title, format, mut keys, playlist, source) = {
+                let (mut title, format, keys, playlist, source) = {
                     let disc = session.disc().ok_or_else(|| Error::DeviceNotReady {
                         path: session.device_path().to_string(),
                     })?;
@@ -356,29 +278,15 @@ pub fn mux_stream(
                         source,
                     )
                 };
-                // Prune to selected streams before `DiscStream::new` builds demux
-                // tables. Only touches the stream list; ciphertext sampling in
-                // resolve_inline_base_map unaffected.
+                // Prune to selected streams before `DiscStream::new` builds demux tables.
                 opts.selection
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
                 // A missing staged reader ("already consumed" / never staged) is a
                 // clean error, not a panic (contract Q2).
-                let mut reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
+                let reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
                     path: session.device_path().to_string(),
                 })?;
-                // Resolve the AACS key map off the STAGED reader BEFORE it moves into
-                // `DiscStream::new` (borrow to sample, then move). Without this the
-                // AACS reader has no map and fails `DecryptFailed` on the first unit.
-                let base_map = resolve_inline_base_map(
-                    &mut *reader,
-                    &title,
-                    &mut keys,
-                    session.key_fetch(),
-                    format,
-                    opts.raw,
-                    Some(halt),
-                )?;
                 let mut stream = crate::mux::DiscStream::new(
                     reader,
                     title,
@@ -391,9 +299,6 @@ pub fn mux_stream(
                 if opts.raw {
                     stream.set_raw();
                 }
-                if let Some(map) = base_map {
-                    stream = stream.with_key_map(map);
-                }
                 stream.skip_errors = opts.skip_errors;
                 // Live path: the `DiscStream` emits the full reader-side vocabulary
                 // (`SectorSkipped` on skip-mode zero-fill, `BatchSizeChanged` on the
@@ -401,12 +306,10 @@ pub fn mux_stream(
                 stream.on_event(reader_event_fn(events.clone()));
                 (Box::new(stream), Some(playlist), source)
             }
-            MuxInput::Live {
-                mut reader,
+            MuxSource::Live {
+                reader,
                 title,
                 format,
-                mut keys,
-                key_map,
             } => {
                 // Prune to selected streams, exactly as the Iso/Session arms do —
                 // without this, selection was silently ignored on the live-drive
@@ -416,27 +319,12 @@ pub fn mux_stream(
                     .apply(&mut title)
                     .map_err(std::io::Error::from)?;
                 // Provenance: medium is certain, playlist is on hand. Device PATH
-                // and title INDEX are NOT reachable — `MuxInput::Live` hands an
+                // and title INDEX are NOT reachable — `MuxSource::Live` hands an
                 // opaque reader/title with neither, so both stay empty/0.
                 let source = SourceInfo {
                     medium: Medium::Disc,
                     playlist: title.playlist.clone(),
                     ..SourceInfo::default()
-                };
-                // Map installed BEFORE reads begin: a caller-supplied `key_map`
-                // (autorip's FMTS gate) is used VERBATIM; `None` on AACS resolves
-                // the base map here (else `DecryptFailed` on first unit); DVD/raw → None.
-                let base_map = match key_map {
-                    Some(map) => Some(map),
-                    None => resolve_inline_base_map(
-                        &mut *reader,
-                        &title,
-                        &mut keys,
-                        None,
-                        format,
-                        opts.raw,
-                        Some(halt),
-                    )?,
                 };
                 // INLINE `DiscStream`, same constructor as the `Session` arm, NOT
                 // `build_iso_pipeline` — the highway would bypass the adaptive
@@ -444,7 +332,7 @@ pub fn mux_stream(
                 let mut stream = crate::mux::DiscStream::new(
                     reader,
                     title,
-                    keys,
+                    DecryptKeys::None,
                     opts.batch_sectors,
                     format,
                     opts.raw,
@@ -452,12 +340,6 @@ pub fn mux_stream(
                 )?;
                 if opts.raw {
                     stream.set_raw();
-                }
-                // Apply the key map BEFORE reads begin: for FMTS it rewrites the
-                // extent walk to our-phase units and installs the mapped key; `None`
-                // leaves it unchanged. Dropping the map mis-decrypts the segment.
-                if let Some(map) = base_map {
-                    stream = stream.with_key_map(map);
                 }
                 stream.skip_errors = opts.skip_errors;
                 // Same reader-side event vocabulary as the `Session` arm
@@ -485,9 +367,8 @@ pub fn mux_stream(
     )
 }
 
-/// Where [`mux_with_keys`] reads its PES frames from (KU §3.1). The same sources as
-/// [`MuxInput`] without key fields: keys come only from the rip's
-/// [`ResolvedKeySet`](crate::keys::ResolvedKeySet).
+/// Where [`mux_with_keys`] reads its PES frames from (KU §3.1). No variant carries key
+/// material: keys come only from the rip's [`ResolvedKeySet`](crate::keys::ResolvedKeySet).
 pub enum MuxSource<'a> {
     /// Live single-pass mux off an opened [`DiscSession`] (its reader staged).
     Session {
@@ -514,12 +395,13 @@ pub enum MuxSource<'a> {
     Url { url: &'a str, opts: InputOptions },
 }
 
-/// [`mux_stream`] with the rip's up-front key set (KU §3.1): every AACS read goes through
-/// the set's readers (its map, and the on-arrival proof for pieces it left unproven), with
-/// no key lookup. `keys == None`, a non-AACS set, or `opts.raw`: no AACS decryption (CSS
-/// and clear discs as before; a `Session` keeps the legacy disc-banked keys until KU-X2).
-/// E7013 when the set is not for the disc or does not cover the title; E7026 when the title
-/// needs forensic keys that are Pending. `events` stays last, as in `mux_stream` (J17).
+/// Run the decrypt + mux pipeline end-to-end with the rip's up-front key set (KU §3.1):
+/// every AACS read goes through the set's readers (its map, and the on-arrival proof for
+/// pieces it left unproven), with no key lookup. `keys == None`, a non-AACS set, or
+/// `opts.raw`: no AACS decryption (CSS and clear discs decrypt as before). E7013 when the
+/// set is not for the disc or does not cover the title; E7026 when the title needs
+/// forensic keys that are Pending. Unresolved codec headers are [`Error::MkvInvalid`], a
+/// zero-output drain [`Error::NoStreams`]; a `halt` mid-run yields `completed = false`.
 pub fn mux_with_keys(
     source: MuxSource,
     keys: Option<&crate::keys::ResolvedKeySet>,
@@ -538,8 +420,8 @@ pub fn mux_with_keys(
         {
             Some(crate::keys::ResolvedKeySet::keyless_for(title, *format))
         }
-        // A Session over an AACS disc with no banked key: BD-TS as above; HD DVD is never
-        // probed (KU §2.6), so it refuses up front. Banked keys keep the legacy path (J20).
+        // A Session over an AACS disc with no set: BD-TS as above; HD DVD is never
+        // probed (KU §2.6), so it refuses up front.
         (
             MuxSource::Session {
                 session,
@@ -547,7 +429,7 @@ pub fn mux_with_keys(
             },
             None,
         ) if !opts.raw => match session.disc() {
-            Some(d) if d.aacs.is_some() && !d.decrypt_keys().is_encrypted() => {
+            Some(d) if d.aacs.is_some() => {
                 if d.content_format != crate::disc::ContentFormat::BdTs {
                     return Err(Error::NoDiscKey {
                         disc_hash: d.aacs_disc_hash(),
@@ -561,54 +443,22 @@ pub fn mux_with_keys(
         _ => None,
     };
     let set = set.or(keyless.as_ref());
-    let input = match (source, set) {
+    match (source, set) {
         (MuxSource::Url { url, opts: mut o }, _) => {
             if let Some(k) = keys {
                 o.keys = Some(k.clone());
             }
-            MuxInput::Url { url, opts: o }
+            mux_unkeyed(
+                MuxSource::Url { url, opts: o },
+                dest_url,
+                opts,
+                halt,
+                events,
+            )
         }
-        (
-            MuxSource::Session {
-                session,
-                title_index,
-            },
-            None,
-        ) => MuxInput::Session {
-            session,
-            title_index,
-        },
-        (
-            MuxSource::Iso {
-                path,
-                title,
-                format,
-            },
-            None,
-        ) => MuxInput::Iso {
-            path,
-            title,
-            format,
-            keys: DecryptKeys::None,
-            key_fetch: None,
-        },
-        (
-            MuxSource::Live {
-                reader,
-                title,
-                format,
-            },
-            None,
-        ) => MuxInput::Live {
-            reader,
-            title,
-            format,
-            keys: DecryptKeys::None,
-            key_map: None,
-        },
-        (src, Some(set)) => return mux_keyed(src, set, dest_url, opts, halt, events),
-    };
-    mux_stream(input, dest_url, opts, halt, events)
+        (src, None) => mux_unkeyed(src, dest_url, opts, halt, events),
+        (src, Some(set)) => mux_keyed(src, set, dest_url, opts, halt, events),
+    }
 }
 
 // The keyed arms of `mux_with_keys`: the set's readers, never a resolve.
@@ -697,7 +547,7 @@ fn mux_keyed(
             let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
             (stream, None, source)
         }
-        MuxSource::Url { .. } => unreachable!("mux_with_keys routes Url to mux_stream"),
+        MuxSource::Url { .. } => unreachable!("mux_with_keys routes Url to mux_unkeyed"),
     };
     let mut source = source;
     if let Some(name) = playlist.as_deref() {
@@ -733,7 +583,7 @@ fn live_keyed(
         .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
         .collect();
     set.gate(reader.random_access(), Some(&ranges), false)?;
-    let mut stream = crate::mux::DiscStream::new(
+    let stream = crate::mux::DiscStream::new(
         reader,
         title,
         set.decrypt_keys(),
@@ -741,8 +591,8 @@ fn live_keyed(
         format,
         false,
         Some(halt.clone()),
-    )?
-    .with_key_map(set.key_map());
+    )?;
+    let mut stream = crate::keys::install_key_map(stream, set.key_map());
     if let Some(a) = set.arrival(set.title_stop()) {
         stream = stream.with_arrival(a);
     }
@@ -760,28 +610,6 @@ fn session_mux_keys(disc: &crate::disc::Disc) -> DecryptKeys {
     } else {
         disc.decrypt_keys()
     }
-}
-
-// Resolve the base AACS key map for an INLINE live-drive mux (`Session`/ `Live`) before the
-// reader moves into `DiscStream::new`. AACS keys resolve to `Some(map)`; CSS/clear/`None`/`raw`
-// return `Ok(None)`.
-fn resolve_inline_base_map(
-    reader: &mut dyn SectorSource,
-    title: &DiscTitle,
-    keys: &mut DecryptKeys,
-    fetch: Option<&KeyFetch>,
-    format: crate::disc::ContentFormat,
-    raw: bool,
-    halt: Option<&crate::halt::Halt>,
-) -> std::io::Result<Option<Arc<AacsKeyMap>>> {
-    if raw || !matches!(keys, DecryptKeys::Aacs { .. }) {
-        return Ok(None);
-    }
-    // Thread the driver's cancel token into key resolution: the resolve chain
-    // samples ciphertext off the LIVE reader (FMTS can do hundreds of reads,
-    // each able to stall), so `/api/stop` must be honored here too.
-    let map = resolve_mux_key_map(reader, title, keys, fetch, format, halt)?;
-    Ok(Some(Arc::new(map)))
 }
 
 // Adapt reader events to mux progress callbacks with an owned, 'static closure.
@@ -1954,11 +1782,11 @@ mod tests {
         t
     }
 
-    // End-to-end through `mux_stream` on the ISO path: asserts reader-side
+    // End-to-end through `mux_unkeyed` on the ISO path: asserts reader-side
     // progress AND `on_output_opened` reach the `Arc<dyn MuxEvents>`.
     // Mutation: dropping `reader_event_fn` leaves `saw_read_total` false.
     #[test]
-    fn mux_stream_iso_forwards_reader_progress_through_arc() {
+    fn mux_iso_forwards_reader_progress_through_arc() {
         // Spawns the prefetch producer, a Drive holder.
         let _serial = crate::sector::prefetched::holder_test_lock();
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
@@ -1985,13 +1813,11 @@ mod tests {
             selection: Default::default(),
         };
         let halt = Halt::new();
-        let out = mux_stream(
-            MuxInput::Iso {
+        let out = mux_unkeyed(
+            MuxSource::Iso {
                 path: &iso_path,
                 title,
                 format: crate::disc::ContentFormat::BdTs,
-                keys: DecryptKeys::None,
-                key_fetch: None,
             },
             "null://",
             &opts,
@@ -2015,107 +1841,8 @@ mod tests {
         );
     }
 
-    // Recording `SectorSource` for the live-path tests: logs every read's
-    // `(lba, count)` and returns zeroed sectors, the observable proof of
-    // WHICH extent walk the inline `DiscStream` executed.
-    struct RecordingReader {
-        capacity: u32,
-        log: std::sync::Arc<std::sync::Mutex<Vec<(u32, u16)>>>,
-    }
-    impl crate::sector::SectorSource for RecordingReader {
-        fn read_sectors(
-            &mut self,
-            lba: u32,
-            count: u16,
-            buf: &mut [u8],
-            _recovery: bool,
-        ) -> crate::error::Result<usize> {
-            self.log.lock().unwrap().push((lba, count));
-            let bytes = count as usize * 2048;
-            buf[..bytes].fill(0);
-            Ok(bytes)
-        }
-        fn capacity_sectors(&self) -> u32 {
-            self.capacity
-        }
-    }
-
-    // `MuxInput::Live` builds the INLINE `DiscStream` and applies the forensic `key_map` before
-    // reading, so odd-phase forensic units are NEVER fetched.
-    #[test]
-    fn mux_input_live_uses_inline_discstream_and_applies_key_map() {
-        use crate::decrypt::{AacsKeyMap, Phase};
-        use crate::disc::Extent;
-
-        // 3 sectors == one AACS aligned unit. A 10-unit Even forensic segment at
-        // LBA [1030, 1060): kept even units start at 1030,1036,1042,1048,1054;
-        // the odd units 1033,1039,1045,1051,1057 must never be read.
-        let us = 3u32;
-        let map = std::sync::Arc::new(AacsKeyMap::from_ranges_phased(vec![(
-            1030,
-            1060,
-            5,
-            Phase::Even,
-        )]));
-
-        let mut title = aac_audio_title(0x1100);
-        title.extents = vec![Extent {
-            start_lba: 1000,
-            sector_count: 300,
-        }];
-
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u32, u16)>::new()));
-        let reader = Box::new(RecordingReader {
-            capacity: 4000,
-            log: log.clone(),
-        });
-
-        let opts = MuxOptions {
-            skip_errors: false,
-            // One unit per read so the recorded LBAs land on unit boundaries and
-            // an odd-phase unit can't hide inside a larger coalesced batch.
-            batch_sectors: us as u16,
-            raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
-            selection: Default::default(),
-        };
-        let halt = Halt::new();
-        // Drains to a NoStreams refusal (zeroed data resolves no headers); we
-        // only care about the reads it performed on the way there.
-        let _ = mux_stream(
-            MuxInput::Live {
-                reader,
-                title,
-                format: crate::disc::ContentFormat::BdTs,
-                keys: DecryptKeys::None,
-                key_map: Some(map),
-            },
-            "null://",
-            &opts,
-            &halt,
-            Arc::new(NoopEvents),
-        );
-
-        let reads = log.lock().unwrap();
-        let read_lbas: std::collections::HashSet<u32> = reads.iter().map(|&(lba, _)| lba).collect();
-        // The dropped odd-phase forensic units must never be fetched.
-        for odd in [1033u32, 1039, 1045, 1051, 1057] {
-            assert!(
-                !read_lbas.contains(&odd),
-                "alternate-phase forensic unit LBA {odd} was read — key_map not applied \
-                 (with_key_map dropped from the Live arm?)"
-            );
-        }
-        // Sanity: our-phase units on either side ARE read (the walk still ran).
-        assert!(
-            read_lbas.contains(&1030) && read_lbas.contains(&1054),
-            "our-phase forensic units must still be read (kept LBAs 1030/1054)"
-        );
-    }
-
     // A `SectorSource` serving ONE genuinely-AACS-encrypted aligned unit
-    // (6144 bytes) at LBA 0..3 and zeros elsewhere, so the UDF probe inside
-    // `resolve_mux_key_map` fails cleanly (single-CPS base map).
+    // (6144 bytes) at LBA 0..3 and zeros elsewhere, so a UDF probe fails cleanly.
     struct AacsUnitReader {
         unit: Vec<u8>, // 6144 bytes, encrypted
         capacity: u32,
@@ -2158,66 +1885,10 @@ mod tests {
         unit
     }
 
-    // END-TO-END decrypt on live `MuxInput::Live` with a plain AACS disc and NO caller key map:
-    // the `Live` arm must RESOLVE + INSTALL the base map itself.
-    #[test]
-    fn mux_input_live_aacs_without_caller_map_resolves_and_decrypts() {
-        use crate::disc::Extent;
-
-        let unit_key = [0x5Au8; 16];
-        let reader = Box::new(AacsUnitReader {
-            unit: encrypted_audio_unit(&unit_key),
-            capacity: 2048,
-        });
-        let mut title = aac_audio_title(0x1100);
-        title.extents = vec![Extent {
-            start_lba: 0,
-            sector_count: 3,
-        }];
-        let keys = DecryptKeys::Aacs {
-            unit_keys: vec![(0, unit_key)],
-            format: crate::disc::ContentFormat::BdTs,
-        };
-
-        let opts = MuxOptions {
-            skip_errors: false, // a DecryptFailed must PROPAGATE, not zero-fill
-            batch_sectors: 3,   // one aligned unit per read
-            raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
-            selection: Default::default(),
-        };
-        let halt = Halt::new();
-        let out = mux_stream(
-            MuxInput::Live {
-                reader,
-                title,
-                format: crate::disc::ContentFormat::BdTs,
-                keys,
-                key_map: None, // plain AACS disc: the driver must resolve the base map
-            },
-            "null://",
-            &opts,
-            &halt,
-            Arc::new(NoopEvents),
-        )
-        .expect(
-            "a plain AACS live mux must resolve+install its base key map and DECRYPT \
-             (no map → the content batch fails to decrypt and the mux aborts)",
-        );
-        assert!(
-            out.completed,
-            "the decrypted audio PES drained and finalised — proves the unit decrypted"
-        );
-        assert!(
-            out.bytes_written > 0,
-            "decrypted payload bytes reached the sink"
-        );
-    }
-
-    /// Build a synthetic single-CPS AACS `Disc` carrying `unit_key` and one
-    /// title whose sole extent is the encrypted unit at LBA 0..3 — the disc a
-    /// `MuxInput::Session` mux scans off a live drive, minus the hardware.
-    fn aacs_session_disc(title: DiscTitle, unit_key: [u8; 16]) -> crate::disc::Disc {
+    /// A synthetic AACS `Disc` with one title whose sole extent is the encrypted unit at
+    /// LBA 0..3 — the disc a `MuxSource::Session` mux scans off a live drive, minus the
+    /// hardware. It holds no key: AACS keys come only from a `ResolvedKeySet`.
+    fn aacs_session_disc(title: DiscTitle) -> crate::disc::Disc {
         crate::disc::Disc {
             volume_id: "TEST".into(),
             meta_title: None,
@@ -2232,9 +1903,6 @@ mod tests {
                 bus_encryption: false,
                 mkb_version: None,
                 disc_hash: "0xabc".into(),
-                key_source: crate::disc::KeyOrigin::KeyDb,
-                vuk: None,
-                unit_keys: vec![(0, unit_key)],
                 volume_id: [0u8; 16],
                 uk_ro: Vec::new(),
                 mkb: Vec::new(),
@@ -2247,77 +1915,22 @@ mod tests {
         }
     }
 
-    // END-TO-END decrypt on the live single-pass `MuxInput::Session` path (same take_reader →
-    // resolve_inline_base_map → DiscStream → with_key_map sequence as `Live`).
-    #[test]
-    fn mux_input_session_aacs_without_caller_map_resolves_and_decrypts() {
-        use crate::disc::Extent;
-        use crate::session::DiscSession;
-
-        let unit_key = [0x5Au8; 16];
-        let reader = Box::new(AacsUnitReader {
-            unit: encrypted_audio_unit(&unit_key),
-            capacity: 2048,
-        });
-        let mut title = aac_audio_title(0x1100);
-        title.extents = vec![Extent {
-            start_lba: 0,
-            sector_count: 3,
-        }];
-        let disc = aacs_session_disc(title, unit_key);
-        // No caller key_fetch: a single-CPS disc resolves its base map with the
-        // banked unit key alone (the FMTS/multi-CPS fetch path is not exercised).
-        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
-
-        let opts = MuxOptions {
-            skip_errors: false, // a DecryptFailed must PROPAGATE, not zero-fill
-            batch_sectors: 3,   // one aligned unit per read
-            raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
-            selection: Default::default(),
-        };
-        let halt = Halt::new();
-        let out = mux_stream(
-            MuxInput::Session {
-                session: &mut session,
-                title_index: 0,
-            },
-            "null://",
-            &opts,
-            &halt,
-            Arc::new(NoopEvents),
-        )
-        .expect(
-            "a plain AACS Session mux must resolve+install its base key map and DECRYPT \
-             (no map → the content batch fails to decrypt and the mux aborts)",
-        );
-        assert!(
-            out.completed,
-            "the decrypted audio PES drained and finalised — proves the unit decrypted"
-        );
-        assert!(
-            out.bytes_written > 0,
-            "decrypted payload bytes reached the sink"
-        );
-    }
-
-    // A `MuxInput::Session` with an unstaged reader (`take_reader()` →
+    // A `MuxSource::Session` with an unstaged reader (`take_reader()` →
     // `None`) must surface a clean typed error, NOT panic — guards
     // `ok_or_else(|| Error::DeviceNotReady …)` against `.unwrap()` regression.
     #[test]
-    fn mux_input_session_missing_reader_is_clean_error_not_panic() {
+    fn mux_session_missing_reader_is_clean_error_not_panic() {
         use crate::disc::Extent;
         use crate::session::DiscSession;
 
-        let unit_key = [0x5Au8; 16];
         let mut title = aac_audio_title(0x1100);
         title.extents = vec![Extent {
             start_lba: 0,
             sector_count: 3,
         }];
-        let disc = aacs_session_disc(title, unit_key);
+        let disc = aacs_session_disc(title);
         // reader: None — never staged.
-        let mut session = DiscSession::from_parts_for_test(Some(disc), None, None);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), None);
 
         let opts = MuxOptions {
             skip_errors: false,
@@ -2327,8 +1940,8 @@ mod tests {
             selection: Default::default(),
         };
         let halt = Halt::new();
-        let err = mux_stream(
-            MuxInput::Session {
+        let err = mux_unkeyed(
+            MuxSource::Session {
                 session: &mut session,
                 title_index: 0,
             },
@@ -2372,11 +1985,11 @@ mod tests {
         );
     }
 
-    // FIX 4: `MuxInput::Session` with a `title_index` past the disc's title
+    // FIX 4: `MuxSource::Session` with a `title_index` past the disc's title
     // count must surface a clean `Error::MuxTrackRange` (E9011), NOT panic
     // on the out-of-range `titles.get(idx)`.
     #[test]
-    fn mux_input_session_out_of_range_title_is_clean_error_not_panic() {
+    fn mux_session_out_of_range_title_is_clean_error_not_panic() {
         use crate::disc::Extent;
         use crate::session::DiscSession;
 
@@ -2390,9 +2003,9 @@ mod tests {
             start_lba: 0,
             sector_count: 3,
         }];
-        let disc = aacs_session_disc(title, unit_key);
+        let disc = aacs_session_disc(title);
         let num_titles = disc.titles.len();
-        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
 
         let opts = MuxOptions {
             skip_errors: false,
@@ -2402,8 +2015,8 @@ mod tests {
             selection: Default::default(),
         };
         let halt = Halt::new();
-        let err = mux_stream(
-            MuxInput::Session {
+        let err = mux_unkeyed(
+            MuxSource::Session {
                 session: &mut session,
                 title_index: num_titles + 5, // out of range
             },
@@ -2418,75 +2031,6 @@ mod tests {
             err.to_string().contains("E9011"),
             "expected MuxTrackRange (E9011), got: {err}"
         );
-    }
-
-    // The shared `resolve_inline_base_map` helper's gating: AACS yields
-    // `Some(map)`; CSS/clear/`None`/`raw` yield `None`. Guards Session/Live
-    // against mapping a DVD (suppresses the per-title CSS crack) or `--raw`.
-    #[test]
-    fn resolve_inline_base_map_gates_on_aacs_and_raw() {
-        use crate::disc::Extent;
-        let unit_key = [0x5Au8; 16];
-        let mut title = aac_audio_title(0x1100);
-        title.extents = vec![Extent {
-            start_lba: 0,
-            sector_count: 3,
-        }];
-        let mk_reader = || AacsUnitReader {
-            unit: encrypted_audio_unit(&unit_key),
-            capacity: 2048,
-        };
-
-        // AACS, not raw → a map is resolved and installed.
-        let mut r = mk_reader();
-        let mut keys = DecryptKeys::Aacs {
-            unit_keys: vec![(0, unit_key)],
-            format: crate::disc::ContentFormat::BdTs,
-        };
-        let map = resolve_inline_base_map(
-            &mut r,
-            &title,
-            &mut keys,
-            None,
-            crate::disc::ContentFormat::BdTs,
-            false,
-            None,
-        )
-        .expect("resolve must not error for a single-CPS AACS disc");
-        assert!(map.is_some(), "AACS non-raw must resolve a base map");
-
-        // AACS but raw → no map (ciphertext passthrough).
-        let mut r = mk_reader();
-        let mut keys_raw = DecryptKeys::Aacs {
-            unit_keys: vec![(0, unit_key)],
-            format: crate::disc::ContentFormat::BdTs,
-        };
-        let map_raw = resolve_inline_base_map(
-            &mut r,
-            &title,
-            &mut keys_raw,
-            None,
-            crate::disc::ContentFormat::BdTs,
-            true,
-            None,
-        )
-        .expect("raw resolve is a no-op");
-        assert!(map_raw.is_none(), "raw must NOT resolve a map");
-
-        // CSS / clear (DecryptKeys::None) → no map (CSS self-cracks per title).
-        let mut r = mk_reader();
-        let mut keys_none = DecryptKeys::None;
-        let map_none = resolve_inline_base_map(
-            &mut r,
-            &title,
-            &mut keys_none,
-            None,
-            crate::disc::ContentFormat::MpegPs,
-            false,
-            None,
-        )
-        .expect("clear/CSS resolve is a no-op");
-        assert!(map_none.is_none(), "CSS/clear must NOT resolve an AACS map");
     }
 
     // Video + a secondary AAC track whose first frame (and so its ASC) arrives at
@@ -3454,7 +2998,7 @@ mod tests {
             start_lba: 0,
             sector_count: 3,
         }];
-        let mut disc = aacs_session_disc(title.clone(), [0u8; 16]);
+        let mut disc = aacs_session_disc(title.clone());
         disc.capacity_sectors = 16;
         let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
         (reader, title, set)
@@ -3496,15 +3040,15 @@ mod tests {
         );
     }
 
-    /// `MuxSource::Session` uses the set, not the disc's banked keys (a wrong key here).
+    /// `MuxSource::Session` decrypts with the set: the disc holds no key.
     #[test]
-    fn mux_with_keys_session_uses_the_set_not_banked_keys() {
+    fn mux_with_keys_session_uses_the_set() {
         let key = [0x5A; 16];
         let (reader, title, _) = keyed_live(key);
-        let mut disc = aacs_session_disc(title, [0x99; 16]);
+        let mut disc = aacs_session_disc(title);
         disc.capacity_sectors = 16;
         let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
-        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
         let out = mux_with_keys(
             MuxSource::Session {
                 session: &mut session,
@@ -3634,12 +3178,11 @@ mod tests {
         );
         assert_eq!(code(iso), e7022);
 
-        // Session over an AACS disc with no banked key (review B1): BD-TS stops at the first
+        // Session over an AACS disc with no set (review B1): BD-TS stops at the first
         // AACS unit; HD DVD refuses up front (it is never probed, KU §2.6).
         for format in [crate::DiscFormat::Uhd, crate::DiscFormat::HdDvd] {
             let (_, title, _) = keyed_live(key);
-            let mut disc = aacs_session_disc(title, key);
-            disc.aacs.as_mut().unwrap().unit_keys.clear();
+            let mut disc = aacs_session_disc(title);
             disc.capacity_sectors = 16;
             disc.format = format;
             if format == crate::DiscFormat::HdDvd {
@@ -3649,7 +3192,7 @@ mod tests {
                 unit: encrypted_audio_unit(&key),
                 capacity: 16,
             });
-            let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader), None);
+            let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
             let r = mux_with_keys(
                 MuxSource::Session {
                     session: &mut session,
@@ -3689,7 +3232,7 @@ mod tests {
             start_lba: 0,
             sector_count: sectors,
         }];
-        let mut disc = aacs_session_disc(title.clone(), [0u8; 16]);
+        let mut disc = aacs_session_disc(title.clone());
         disc.aacs.as_mut().unwrap().bus_encryption = true;
         disc.capacity_sectors = sectors + 16;
         let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, sectors)]);

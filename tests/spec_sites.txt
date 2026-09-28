@@ -12,11 +12,8 @@ src/decrypt.rs	blank_damaged_units	KS-2
 src/decrypt.rs	blank_damaged_units	KS-3
 src/decrypt.rs	blank_damaged_units	KS-4
 src/decrypt.rs	blank_damaged_units	KS-22
-src/mux/resolve.rs	probe_fmts_index_keys	KS-25
-src/mux/resolve.rs	probe_fmts_index_keys	KS-26
 src/disc/mod.rs	declared_cps_units	KS-14
-src/whole_disc.rs	single_cps_key_slot	KS-14
-src/whole_disc.rs	single_cps_key_slot	KS-27
+src/disc/mod.rs	declared_cps_units	KS-27
 src/sector/bus_removal.rs	debus_read	KS-18
 src/scsi/mod.rs	parse_sense_progress	SS-1
 src/scsi/mod.rs	parse_sense_progress	SS-2

@@ -245,10 +245,6 @@ fn inserted_uhd_disc_reports_full_aacs2_state() {
         aacs.volume_id, [0u8; 16],
         "VID must be populated after a successful AACS 2.0 handshake"
     );
-    assert!(
-        !aacs.unit_keys.is_empty(),
-        "at least one CPS unit key expected for a scannable UHD disc"
-    );
 }
 
 /// Scan is idempotent: rescanning the same session yields the same disc

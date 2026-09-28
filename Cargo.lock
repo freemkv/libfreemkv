@@ -324,6 +324,7 @@ dependencies = [
  "crossbeam-channel",
  "freemkv-unlock",
  "libc",
+ "libfreemkv",
  "loom",
  "memchr",
  "rayon",
