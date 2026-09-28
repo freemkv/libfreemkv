@@ -32,6 +32,7 @@ const ORIGIN_TICKS: i64 = 135_000;
 /// Design §2.3: "The sink queues ≥ 1 s of IR before its first pack".
 const WINDOW_TICKS: i64 = 90_000;
 /// The start-up hold cap (design §2.3 "1 s of IR timeline or 64 MiB").
+const HOLD_CAP_TICKS: i64 = 90_000;
 const HOLD_CAP_BYTES: usize = 64 * 1024 * 1024;
 /// Arrival-domain bias: ticks are held as `tick − first tick + BIAS`, positive for any
 /// source that starts within ~13 h of its first frame, so the deriver never clamps.
@@ -412,16 +413,35 @@ impl<W: Write + Send> MpgSink<W> {
         vec![au]
     }
 
+    // Design §2.3 "Cap: 1 s of IR timeline or 64 MiB. Past the cap it releases in arrival
+    // order": the held video's window resolves over the units held, counted.
+    fn release_over_cap(&mut self) -> io::Result<()> {
+        let Some(&(oldest, ..)) = self.pending_video.front() else {
+            return Ok(());
+        };
+        if !self.deriver.pending() {
+            return Ok(());
+        }
+        let newest = self.span.map_or(oldest, |(_, hi)| hi);
+        let held: usize = self.pending_video.iter().map(|p| p.2.len()).sum::<usize>()
+            + if self.offset.is_none() {
+                self.window_bytes
+            } else {
+                0
+            };
+        if newest - oldest > HOLD_CAP_TICKS || held > HOLD_CAP_BYTES {
+            self.deriver.release_cap();
+            self.drain_video()?;
+        }
+        Ok(())
+    }
+
     fn maybe_set_origin(&mut self, eof: bool) -> io::Result<()> {
         if self.offset.is_some() {
             return Ok(());
         }
-        let pending: usize = self.pending_video.iter().map(|p| p.2.len()).sum();
         let spanned = self.span.is_some_and(|(lo, hi)| hi - lo >= WINDOW_TICKS);
-        if self.window_bytes + pending > HOLD_CAP_BYTES {
-            self.deriver.release_cap();
-            self.drain_video()?;
-        } else if !eof && !(spanned && !self.deriver.pending()) {
+        if !eof && !(spanned && !self.deriver.pending()) {
             return Ok(());
         }
         // Design §2.3 (MPG3-8): the lowest first DTS/PTS over ALL tracks maps to 1.5 s.
@@ -663,6 +683,7 @@ impl<W: Write + Send> Stream for MpgSink<W> {
             };
             self.accept(out, au)?;
         }
+        self.release_over_cap()?;
         self.maybe_set_origin(false)?;
         if let Some(m) = self.mux.as_mut() {
             m.pump(false)?;
