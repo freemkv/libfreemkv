@@ -1322,7 +1322,7 @@ fn probe_fmts_index_keys(
 
 // FMTS forensic feature clip's own extents — the byte space every `IndividualSegment.tbl` SPN
 // is relative to — or None if not exactly one such clip.
-fn forensic_clip_extents(
+pub(crate) fn forensic_clip_extents(
     udf: &crate::udf::UdfFs,
     reader: &mut dyn SectorSource,
 ) -> io::Result<Option<Vec<crate::disc::Extent>>> {
@@ -1373,7 +1373,7 @@ fn extents_overlap(a: &[crate::disc::Extent], b: &[crate::disc::Extent]) -> bool
 // Keep only forensic segments addressable within the FORENSIC CLIP's extents; stale/foreign
 // records past the clip's end are dropped. Extracted from resolve_fmts_key_map for direct
 // testing.
-fn filter_addressable_segments(
+pub(crate) fn filter_addressable_segments(
     segments: Vec<crate::aacs::segment::Segment>,
     extents: &[crate::disc::Extent],
 ) -> Vec<crate::aacs::segment::Segment> {
@@ -1401,7 +1401,7 @@ fn resolve_tie_phase(even_clean: usize, odd_clean: usize) -> io::Result<crate::d
 // Outcome of probing ONE forensic index's decrypt phase; the load-bearing split is WrongKey vs
 // ReadFault — only the former is a real FmtsKeyMissing.
 #[derive(Debug, PartialEq, Eq)]
-enum IndexProbe {
+pub(crate) enum IndexProbe {
     /// A parity decrypted clean under this index's key (or a padding tie) → its phase.
     Phase(crate::decrypt::Phase),
     /// At least one unit was READ and decrypt-attempted, yet NEITHER parity came up
@@ -1415,7 +1415,7 @@ enum IndexProbe {
 
 // Probe one forensic index's decrypt phase (EVEN vs ODD aligned units) under `key`, tolerating
 // read faults without masking a genuine wrong key.
-fn probe_index_phase(
+pub(crate) fn probe_index_phase(
     segments: &[crate::aacs::segment::Segment],
     tag: u16,
     batch_units: usize,
@@ -1466,7 +1466,7 @@ fn probe_index_phase(
 
 // Back-fill LBA gaps NOT covered by forensic segment ranges with the base Unit Key, so the map
 // is a COMPLETE positive list over the title's content extents.
-fn fill_base_key_gaps(
+pub(crate) fn fill_base_key_gaps(
     extents: &[crate::disc::Extent],
     forensic_ranges: &[(u32, u32, usize, crate::decrypt::Phase)],
     base_idx: usize,

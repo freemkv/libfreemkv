@@ -12,9 +12,8 @@
 //! neighbouring units both ways, then falling back to a provisional one-unit proof. A
 //! readable unit is never withheld; one that no held key opens is a loud stop.
 
-#![allow(dead_code)] // RED STUB (KU-L2): the next commit uses every item.
-
 mod arrival;
+mod fmts;
 mod resolve;
 #[cfg(test)]
 mod tests;
@@ -458,8 +457,20 @@ impl ResolvedKeySet {
         extents: Option<&[(u32, u32)]>,
         allow_pending: bool,
     ) -> Result<()> {
-        // RED STUB: no layering or forensic-Pending check yet.
-        let _ = (random_access, extents, allow_pending);
+        if !random_access {
+            // KU §2.4: side reads need random access; `Prefetched(Decrypting(..))`, never
+            // the other way round (SG27).
+            return Err(Self::caller_bug("decrypting reader over a prefetcher"));
+        }
+        if self.forensic_pending() && self.touches_clip(extents) && !allow_pending {
+            tracing::error!(
+                target: "freemkv::keys",
+                code = crate::error::E_FMTS_KEY_MISSING,
+                "forensic keys pending (every anchor unreadable): a decrypting single pass \
+                 cannot key the forensic segments; copy raw, then convert"
+            );
+            return Err(Error::FmtsKeyMissing);
+        }
         Ok(())
     }
 
