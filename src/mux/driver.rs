@@ -34,7 +34,10 @@ fn url_medium(parsed: &StreamUrl) -> Medium {
     match parsed {
         StreamUrl::Disc { .. } => Medium::Disc,
         StreamUrl::Iso { .. } => Medium::Iso,
-        StreamUrl::Mkv { .. } | StreamUrl::M2ts { .. } | StreamUrl::Mp4 { .. } => Medium::File,
+        StreamUrl::Mkv { .. }
+        | StreamUrl::M2ts { .. }
+        | StreamUrl::Mp4 { .. }
+        | StreamUrl::Mpg { .. } => Medium::File,
         StreamUrl::Network { .. } | StreamUrl::Stdio => Medium::Stream,
         _ => Medium::File,
     }

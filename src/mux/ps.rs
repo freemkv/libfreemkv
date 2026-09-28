@@ -19,6 +19,9 @@ const SYSTEM_HEADER_ID: u8 = crate::consts::pes_stream_id::SYSTEM_HEADER;
 /// Program end start code suffix.
 const PROGRAM_END_ID: u8 = 0xB9;
 
+/// program_stream_map start code suffix (MS-27 `1011 1100`).
+const PROGRAM_STREAM_MAP_ID: u8 = 0xBC;
+
 /// Private stream 1 (AC3, DTS, LPCM, subtitles).
 const PRIVATE_STREAM_1: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
 /// Private stream 2 (0xBF) — DVD navigation (PCI/DSI). Carries no muxable
@@ -61,11 +64,11 @@ pub const DVD_VIDEO_PID: u16 = 0xE0;
 /// DTS / LPCM / HD-DVD E-AC-3 ranges.
 ///
 /// The PID is `0xBD00 | sub_stream_id`, unique per sub-stream id (AC-3 / DTS `0x80..=0x8F`,
-/// LPCM `0xA0..=0xA7`, HD-DVD E-AC-3 `0xC0..=0xC7`) — the single source of truth shared with
+/// LPCM `0xA0..=0xA7`, E-AC-3 `0xC0..=0xCF` (G17)) — the single source of truth shared with
 /// `Disc::scan_dvd_titles` (`src/disc/dvd.rs`).
 pub fn dvd_audio_pid(sub_stream_id: u8) -> Option<u16> {
     match sub_stream_id {
-        0x80..=0x8F | 0xA0..=0xA7 | 0xC0..=0xC7 => Some(0xBD00 | sub_stream_id as u16),
+        0x80..=0x8F | 0xA0..=0xA7 | 0xC0..=0xCF => Some(0xBD00 | sub_stream_id as u16),
         _ => None,
     }
 }
@@ -162,6 +165,18 @@ impl UnstoredExtensions {
         true
     }
 
+    /// Add extension track `track` (PID `pid`) as one this sink does not write.
+    pub(crate) fn add(&mut self, track: usize, pid: u16) {
+        if !self.contains(track) {
+            self.tracks.push((track, pid, false));
+        }
+    }
+
+    /// Keep only the extension tracks `unstored` says this sink does not write.
+    pub(crate) fn retain(&mut self, unstored: impl Fn(usize) -> bool) {
+        self.tracks.retain(|t| unstored(t.0));
+    }
+
     /// Extension tracks whose packets arrived and were left out.
     pub(crate) fn seen(&self) -> Vec<usize> {
         (self.tracks.iter()).filter(|t| t.2).map(|t| t.0).collect()
@@ -254,6 +269,11 @@ pub struct PsDemuxer {
     /// packet-level assertion can observe.
     #[cfg(test)]
     boundary_bytes_scanned: u64,
+    /// The current pack is an ISO/IEC 11172-1 (MPEG-1) pack: its packets use the MPEG-1
+    /// header form (mpg-output-design v5 §4 step 1, chosen per pack, J6).
+    mpeg1: bool,
+    /// The first program stream map (0xBC) seen, for the `mpg://` stream scan.
+    psm: Option<Vec<u8>>,
 }
 
 impl Default for PsDemuxer {
@@ -272,7 +292,14 @@ impl PsDemuxer {
             pending_scan: None,
             #[cfg(test)]
             boundary_bytes_scanned: 0,
+            mpeg1: false,
+            psm: None,
         }
+    }
+
+    /// The first program stream map seen, start code included.
+    pub(crate) fn psm(&self) -> Option<&[u8]> {
+        self.psm.as_deref()
     }
 
     /// Feed raw MPEG-2 PS bytes, returning any completely parsed PES packets.
@@ -330,19 +357,43 @@ impl PsDemuxer {
                     pos = sc + 4;
                 }
                 PACK_HEADER_ID => {
-                    // Pack header: need at least 14 bytes for MPEG-2 pack.
-                    if sc + 14 > self.buffer.len() {
-                        break; // wait for more data
+                    if sc + 5 > self.buffer.len() {
+                        break; // wait for the marker byte
                     }
-                    // DVD-Video is always MPEG-2 PS, so every 0xBA is a 14-byte MPEG-2
-                    // pack: low 3 bits of byte 13 are pack_stuffing_length. (An MPEG-1
-                    // pack is 12 bytes with no stuffing field, but DVD never emits one.)
-                    let stuffing = (self.buffer[sc + 13] & 0x07) as usize;
-                    let pack_len = 14 + stuffing;
+                    // The byte after 0x000001BA picks the layout per pack (design §4 step 1):
+                    // '01' is an H.222.0 pack (MS-2), '0010' an 11172-1 pack of 12 bytes with
+                    // no stuffing field; anything else is a lost sync, resynced below.
+                    let marker = self.buffer[sc + 4];
+                    let pack_len = if marker >> 6 == 0b01 {
+                        if sc + 14 > self.buffer.len() {
+                            break; // wait for more data
+                        }
+                        14 + (self.buffer[sc + 13] & 0x07) as usize
+                    } else if marker >> 4 == 0b0010 {
+                        12
+                    } else {
+                        pos = sc + 4;
+                        continue;
+                    };
                     if sc + pack_len > self.buffer.len() {
                         break;
                     }
+                    self.mpeg1 = pack_len == 12;
                     pos = sc + pack_len;
+                }
+                PROGRAM_STREAM_MAP_ID => {
+                    // The map is length-prefixed (MS-8); kept once, never parsed as packets.
+                    if sc + 6 > self.buffer.len() {
+                        break;
+                    }
+                    let len = ((self.buffer[sc + 4] as usize) << 8) | self.buffer[sc + 5] as usize;
+                    if sc + 6 + len > self.buffer.len() {
+                        break;
+                    }
+                    if self.psm.is_none() {
+                        self.psm = Some(self.buffer[sc..sc + 6 + len].to_vec());
+                    }
+                    pos = sc + 6 + len;
                 }
                 SYSTEM_HEADER_ID => {
                     // System header: 00 00 01 BB [length:2] ...
@@ -368,7 +419,7 @@ impl PsDemuxer {
                     // Length 0 means unbounded (video): the packet runs to the next PS-LAYER
                     // boundary (pack / system header / program end / next PES), NOT the next
                     // raw start code — the video ES payload is full of 00 00 01 xx codes.
-                    let end = if pes_packet_len == 0 {
+                    let end = if pes_packet_len == 0 && !self.mpeg1 {
                         // Resume where the last call stopped searching for
                         // THIS PES's terminating unit; anything before that is
                         // already proved boundary-free.
@@ -413,7 +464,12 @@ impl PsDemuxer {
                         e
                     };
 
-                    if let Some(mut pkt) = parse_pes_packet(&self.buffer[sc..end]) {
+                    let parsed = if self.mpeg1 {
+                        parse_mpeg1_packet(&self.buffer[sc..end])
+                    } else {
+                        parse_pes_packet(&self.buffer[sc..end])
+                    };
+                    if let Some(mut pkt) = parsed {
                         if self.has_base {
                             pkt.source =
                                 Some(crate::pes::SourcePos::at_byte(self.buffer_base + sc as u64));
@@ -562,6 +618,44 @@ fn parse_stream_id_extension(data: &[u8], flags2: u8, header_end: usize) -> Opti
     (b & 0x80 == 0).then_some(b & 0x7F)
 }
 
+/// Parse an ISO/IEC 11172-1 packet (design §4 step 1, cited: 11172-1 §2.4.3.3, F4): up to 16
+/// `0xFF` stuffing bytes, an optional `'01'` STD buffer field, then `'0010'` + PTS, `'0011'` +
+/// PTS + `'0001'` + DTS, or `0000 1111`; the sub-stream handling is the MPEG-2 path's.
+fn parse_mpeg1_packet(data: &[u8]) -> Option<PsPacket> {
+    if data.len() < 7 || data[..3] != [0, 0, 1] {
+        return None;
+    }
+    let stream_id = data[3];
+    if stream_id == crate::consts::pes_stream_id::PADDING_STREAM {
+        return None;
+    }
+    if stream_id == PRIVATE_STREAM_2 {
+        return parse_pes_packet(data);
+    }
+    let mut q = 6;
+    while q < data.len() && q < 6 + 16 && data[q] == 0xFF {
+        q += 1;
+    }
+    if data.get(q).is_some_and(|b| b & 0xC0 == 0x40) {
+        q += 2;
+    }
+    let (mut pts, mut dts) = (None, None);
+    match data.get(q).map(|b| b >> 4)? {
+        0b0010 if data.len() >= q + 5 => {
+            pts = parse_pts(&data[q..q + 5]);
+            q += 5;
+        }
+        0b0011 if data.len() >= q + 10 => {
+            pts = parse_pts(&data[q..q + 5]);
+            dts = parse_pts(&data[q + 5..q + 10]);
+            q += 10;
+        }
+        _ if data[q] == 0x0F => q += 1,
+        _ => return None,
+    }
+    finish_packet(stream_id, pts, dts, data, q)
+}
+
 /// Parse a single PES packet from a byte slice that starts at the start code.
 fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
     // Minimum: 00 00 01 [id] [len:2] = 6 bytes
@@ -620,26 +714,39 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
         dts = parse_pts(&data[14..19]);
     }
 
+    let flags2 = data[7];
+    let mut pkt = finish_packet(stream_id, pts, dts, data, header_end)?;
+    if stream_id == EXTENDED_STREAM_ID {
+        pkt.sub_stream_id = parse_stream_id_extension(data, flags2, header_end);
+    }
+    Some(pkt)
+}
+
+// The payload after a (MPEG-1 or MPEG-2) packet header ending at `header_end`: the
+// private_stream_1 sub-stream header stripped, the ES kept.
+fn finish_packet(
+    stream_id: u8,
+    pts: Option<u64>,
+    dts: Option<u64>,
+    data: &[u8],
+    header_end: usize,
+) -> Option<PsPacket> {
     let payload = &data[header_end..];
 
     // For private stream 1, the first payload byte is the sub-stream ID,
     // followed by a sub-header whose length depends on the sub-stream type.
     let (sub_stream_id, es_data) = if stream_id == EXTENDED_STREAM_ID {
         // HD-DVD extended-stream-id: real stream id is the stream_id_extension inside
-        // the PES extension. No leading sub-header byte on the payload (unlike
-        // private_stream_1), so the ES is the payload verbatim.
-        (
-            parse_stream_id_extension(data, data[7], header_end),
-            payload.to_vec(),
-        )
+        // the PES extension (filled in by the MPEG-2 caller). No leading sub-header byte on
+        // the payload (unlike private_stream_1), so the ES is the payload verbatim.
+        (None, payload.to_vec())
     } else if stream_id == PRIVATE_STREAM_1 && !payload.is_empty() {
         let sub_id = payload[0];
         let skip = match sub_id {
             0x80..=0x8F => 4, // AC3/DTS: sub_id + frame_count + access_unit_ptr(2)
-            // HD-DVD E-AC-3: 4-byte sub-header like DVD AC-3 (sub_id + num_frames(1) +
-            // first_access_unit_pointer(2)), verified on a real HD-DVD EVO. Strip exactly 4
-            // bytes/packet for a clean ES; a shorter skip splices sub-header into a frame.
-            0xC0..=0xC7 => 4,
+            // E-AC-3 (G17: 0xC0..=0xCF): a 4-byte sub-header like DVD AC-3, verified on a
+            // real HD-DVD EVO; a shorter skip splices sub-header into a frame.
+            0xC0..=0xCF => 4,
             // LPCM: sub_id + frames + ptr(2); the 3-byte audio header (quant/rate/channels)
             // is left for `LpcmParser`, which needs it to unpack 20/24-bit samples.
             0xA0..=0xA7 => 4,
@@ -1585,7 +1692,20 @@ mod tests {
         assert_eq!(dvd_audio_pid(0xC7), Some(0xBDC7));
         // Just outside the range.
         assert_eq!(dvd_audio_pid(0xBF), None);
-        assert_eq!(dvd_audio_pid(0xC8), None);
+        // G17: the whole E-AC-3 sub-id range 0xC0..=0xCF (mpg:// allocates 0xC8..).
+        assert_eq!(dvd_audio_pid(0xC8), Some(0xBDC8));
+        assert_eq!(dvd_audio_pid(0xCF), Some(0xBDCF));
+        assert_eq!(dvd_audio_pid(0xD0), None);
+        assert_eq!(mk(0xBD, Some(0xCA)).dvd_pid(), Some(0xBDCA));
+        // …and its 4-byte sub-header is stripped like 0xC0's.
+        let pes = [
+            0, 0, 1, 0xBD, 0, 14, 0x81, 0x80, 5, 0x21, 0, 1, 0, 1, 0xCA, 1, 0, 1, 0x0B, 0x77,
+        ];
+        let mut d = PsDemuxer::new();
+        let mut ps = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
+        ps.extend_from_slice(&pes);
+        let got: Vec<_> = d.feed(&ps).into_iter().chain(d.flush()).collect();
+        assert_eq!(got[0].data, vec![0x0B, 0x77], "sub-header stripped");
         // Four DD+ tracks (as seen on a real disc) get four distinct PIDs.
         let pids: Vec<u16> = (0xC0u8..=0xC3).map(|s| dvd_audio_pid(s).unwrap()).collect();
         assert_eq!(pids, vec![0xBDC0, 0xBDC1, 0xBDC2, 0xBDC3]);
@@ -2022,5 +2142,102 @@ mod tests {
             demuxer.buffer.is_empty(),
             "the exact-fit PES must be fully consumed, leaving nothing buffered"
         );
+    }
+
+    // ── MPEG-1 system streams (ISO/IEC 11172-1; mpg-output-design v5 §4 step 1, J6) ──
+
+    // An 11172-1 pack header: '0010', SCR (3+15+15 bits with markers), mux_rate.
+    fn mpeg1_pack(scr: u64) -> Vec<u8> {
+        let mut p = vec![0, 0, 1, 0xBA];
+        p.push(0x21 | (((scr >> 30) & 7) << 1) as u8);
+        p.push((scr >> 22) as u8);
+        p.push(0x01 | (((scr >> 15) & 0x7F) << 1) as u8);
+        p.push((scr >> 7) as u8);
+        p.push(0x01 | ((scr & 0x7F) << 1) as u8);
+        p.extend_from_slice(&[0x80, 0x1B, 0x83]);
+        p
+    }
+
+    // An 11172-1 packet: stuffing, the STD buffer field, then one timestamp form.
+    fn mpeg1_packet(id: u8, ts: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![0xFF, 0xFF, 0x40 | 0x20, 0x2E];
+        body.extend_from_slice(ts);
+        body.extend_from_slice(payload);
+        let mut p = vec![0, 0, 1, id];
+        p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        p.extend(body);
+        p
+    }
+
+    fn ts5(prefix: u8, t: u64) -> [u8; 5] {
+        [
+            (prefix << 4) | 1 | (((t >> 29) & 0x0E) as u8),
+            (t >> 22) as u8,
+            1 | (((t >> 14) & 0xFE) as u8),
+            (t >> 7) as u8,
+            1 | (((t << 1) & 0xFE) as u8),
+        ]
+    }
+
+    // Design §4 step 1: "'0010' → ISO/IEC 11172-1 §2.4.3.2 pack header … 12 bytes, no stuffing
+    // field"; the PES form "'0010' + PTS", "'0011' + PTS + '0001' + DTS", "'0000 1111'".
+    #[test]
+    fn mpeg1_packs_and_packets_parse() {
+        let mut s = mpeg1_pack(90_000);
+        s.extend(mpeg1_packet(0xC0, &ts5(0b0010, 3_600), &[0xFF, 0xFD, 1, 2]));
+        s.extend(mpeg1_packet(
+            0xE0,
+            &[&ts5(0b0011, 7_200)[..], &ts5(0b0001, 3_600)[..]].concat(),
+            &[0, 0, 1, 0xB3, 9],
+        ));
+        s.extend(mpeg1_packet(0xC0, &[0x0F], &[7, 8]));
+        s.extend_from_slice(&[0, 0, 1, 0xB9]);
+        let mut d = PsDemuxer::new();
+        let got: Vec<PsPacket> = d.feed(&s).into_iter().chain(d.flush()).collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(
+            (got[0].stream_id, got[0].pts, got[0].data.clone()),
+            (0xC0, Some(3_600), vec![0xFF, 0xFD, 1, 2])
+        );
+        assert_eq!((got[1].pts, got[1].dts), (Some(7_200), Some(3_600)));
+        assert_eq!(got[1].data, vec![0, 0, 1, 0xB3, 9]);
+        assert_eq!((got[2].pts, got[2].data.clone()), (None, vec![7, 8]));
+    }
+
+    // Design §4 step 1: the layout is chosen "per pack … from the marker bits"; anything else
+    // is a lost sync, resynced on the next start code.
+    #[test]
+    fn pack_forms_switch_per_pack_and_a_bad_marker_resyncs() {
+        let mut s = mpeg1_pack(0);
+        s.extend(mpeg1_packet(0xC0, &ts5(0b0010, 100), &[1]));
+        // A garbage "pack" whose marker bits are neither '01' nor '0010'.
+        s.extend_from_slice(&[0, 0, 1, 0xBA, 0xC0, 0, 0, 0]);
+        // An MPEG-2 pack, then an MPEG-2 PES.
+        s.extend_from_slice(&[0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8]);
+        let mut p2 = vec![0, 0, 1, 0xC0, 0, 9, 0x80, 0x80, 5];
+        p2.extend_from_slice(&ts5(0b0010, 200));
+        p2.push(2);
+        s.extend(p2);
+        let mut d = PsDemuxer::new();
+        let got: Vec<PsPacket> = d.feed(&s).into_iter().chain(d.flush()).collect();
+        let v: Vec<(Option<u64>, Vec<u8>)> = got.iter().map(|p| (p.pts, p.data.clone())).collect();
+        assert_eq!(v, vec![(Some(100), vec![1]), (Some(200), vec![2])]);
+    }
+
+    // Design §4 step 3: the program stream map (0xBC) is kept for the scan, and skipped by its
+    // length so its bytes are never mistaken for packets.
+    #[test]
+    fn the_program_stream_map_is_kept_and_skipped() {
+        let mut psm = vec![0, 0, 1, 0xBC, 0, 10, 0xE0, 0xFF, 0, 0, 0, 0, 0, 0, 1, 0xC0];
+        let crc = [0u8; 0];
+        psm.extend_from_slice(&crc);
+        let mut s = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
+        s.extend_from_slice(&psm);
+        let mut d = PsDemuxer::new();
+        assert!(
+            d.feed(&s).is_empty(),
+            "the map's `00 00 01 C0` is not a packet"
+        );
+        assert_eq!(d.psm(), Some(&psm[..]));
     }
 }

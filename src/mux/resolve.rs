@@ -35,6 +35,9 @@ pub enum StreamUrl {
     /// a single self-contained `.mp4` (ftyp+mdat+moov). Compatibility export —
     /// carries only MP4-mappable codecs; see `mux::mp4`.
     Mp4 { path: PathBuf },
+    /// MPEG-2 program stream (`mpg://`, ISO/IEC 13818-1): the DVD-core carriage of
+    /// `mux::mpg`; tracks it cannot carry are excluded with a reason.
+    Mpg { path: PathBuf },
     /// Network stream (host:port).
     Network { addr: String },
     /// Standard I/O (stdin/stdout).
@@ -94,6 +97,7 @@ impl StreamUrl {
             StreamUrl::M2ts { .. } => "m2ts",
             StreamUrl::Mkv { .. } => "mkv",
             StreamUrl::Mp4 { .. } => "mp4",
+            StreamUrl::Mpg { .. } => "mpg",
             StreamUrl::Network { .. } => "network",
             StreamUrl::Stdio => "stdio",
             StreamUrl::Iso { .. } => "iso",
@@ -118,6 +122,7 @@ impl StreamUrl {
             StreamUrl::M2ts { path }
             | StreamUrl::Mkv { path }
             | StreamUrl::Mp4 { path }
+            | StreamUrl::Mpg { path }
             | StreamUrl::Iso { path }
             | StreamUrl::Dir { path }
             | StreamUrl::Demux { dir: path }
@@ -180,6 +185,11 @@ pub fn parse_url(url: &str) -> StreamUrl {
     }
     if let Some(rest) = url.strip_prefix("mp4://") {
         return StreamUrl::Mp4 {
+            path: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("mpg://") {
+        return StreamUrl::Mpg {
             path: PathBuf::from(rest),
         };
     }
@@ -439,6 +449,10 @@ pub(crate) fn input_with_halt(
         // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
         // `mp4://` flows to every sink (mkv://, audio://, json://, …).
         StreamUrl::Mp4 { ref path } => Ok(Box::new(super::mp4::Mp4Reader::open(path)?)),
+        StreamUrl::Mpg { ref path } => {
+            validate_file_path(path, "mpg")?;
+            Ok(Box::new(build_ps_pipeline(path, opts, halt)?))
+        }
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
         | StreamUrl::Video { .. }
@@ -729,6 +743,15 @@ pub(crate) fn output_with(
                 writeback_file(path, title.size_bytes, flush)?,
             );
             Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
+        }
+        StreamUrl::Mpg { ref path } => {
+            validate_file_path(path, "mpg")?;
+            // Streaming pack writer, no seeks: the bounded-cache writeback as for mkv://.
+            let writer = std::io::BufWriter::with_capacity(
+                IO_BUF_SIZE,
+                writeback_file(path, title.size_bytes, flush)?,
+            );
+            Ok(Box::new(super::mpg::MpgSink::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
@@ -1969,6 +1992,172 @@ fn iso_pipeline_tail(
     )
 }
 
+// An `mpg://` source (design §4 step 2, J13): the sector path, one extent over the zero-padded
+// file. Crack first (a scrambled `.vob` descrambles, a clear one passes), scan the decrypted
+// head, then build the DVD pipeline with the RESOLVED keys, so its own crack is a no-op.
+fn build_ps_pipeline(
+    path: &Path,
+    opts: &InputOptions,
+    halt: Option<&crate::halt::Halt>,
+) -> io::Result<PipelinedPesStream> {
+    const PS_MUX_BATCH_SECTORS: u16 = 8192;
+    const HEAD_SECTORS: u32 = 2048; // 4 MiB
+    let mut reader = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
+    let capacity = reader.capacity_sectors();
+    if capacity == 0 {
+        return Err(crate::error::Error::NoStreams.into());
+    }
+    let extent = crate::disc::Extent {
+        start_lba: 0,
+        sector_count: capacity,
+    };
+    // The crack's verdict (`None` = clear) is final: the pipeline never scans again (D3).
+    let mut keys = crate::decrypt::DecryptKeys::None;
+    // B2: CSS scrambles DVD-Video's 13818-1 packs only; an 11172-1 system stream (the
+    // first pack's '0010') cannot be CSS, so it is never cracked.
+    let probe = capacity.min(32);
+    let mut first = vec![0u8; probe as usize * 2048];
+    reader
+        .read_sectors(0, probe as u16, &mut first, false)
+        .map_err(|e| -> io::Error { e.into() })?;
+    let mpeg2 = first
+        .windows(5)
+        .find(|w| w[..4] == crate::css::PACK_START)
+        .is_some_and(|w| w[4] >> 6 == 0b01);
+    if mpeg2 {
+        // Design §4 step 2.1: "css::resolve_dvd_title_key(… raw = false, halt)". Even a
+        // raw read cracks, so the head scan sees the streams; the mux itself stays raw.
+        let cracked = crate::css::resolve_ps_file_title_key(
+            &mut reader,
+            &[extent],
+            PS_MUX_BATCH_SECTORS,
+            halt,
+        );
+        match cracked {
+            Ok(k) => keys = k,
+            // `--raw` never hard-fails on scrambled-uncrackable: scan the ciphertext.
+            Err(e)
+                if opts.raw
+                    && crate::error::error_code(&e) == Some(crate::error::E_CSS_KEY_MISSING) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let title_key = match keys {
+        crate::decrypt::DecryptKeys::Css { title_key } => Some(title_key),
+        _ => None,
+    };
+    let mut head_reader = PsFileCss {
+        inner: crate::io::file_sector_source::FileSectorSource::open_padded(path)?,
+        title_key,
+        refuse: false,
+    };
+    let n = capacity.min(HEAD_SECTORS);
+    let mut head = vec![0u8; n as usize * 2048];
+    let mut at = 0u32;
+    while at < n {
+        let count = (n - at).min(u32::from(PS_MUX_BATCH_SECTORS)) as u16;
+        let off = at as usize * 2048;
+        head_reader
+            .read_sectors(
+                at,
+                count,
+                &mut head[off..off + count as usize * 2048],
+                false,
+            )
+            .map_err(|e| -> io::Error { e.into() })?;
+        at += u32::from(count);
+    }
+    let scan = super::mpg::scan::scan(&head)
+        .ok_or_else(|| -> io::Error { crate::error::Error::NoStreams.into() })?;
+    let streams = scan.streams;
+    let mut title = DiscTitle {
+        playlist: path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        codec_privates: vec![None; streams.len()],
+        streams,
+        extents: vec![extent],
+        content_format: ContentFormat::MpegPs,
+        ..DiscTitle::empty()
+    };
+    opts.selection
+        .apply(&mut title)
+        .map_err(|e| -> io::Error { e.into() })?;
+    // CSS is PsFileCss's (m1/m2): descrambled where each pack's own stuffing puts its
+    // flags, and a scrambled pack with no key refused rather than muxed as ciphertext.
+    let reader = PsFileCss {
+        inner: reader,
+        title_key: title_key.filter(|_| !opts.raw),
+        refuse: !opts.raw,
+    };
+    build_iso_pipeline(
+        reader,
+        title,
+        crate::decrypt::DecryptKeys::None,
+        PS_MUX_BATCH_SECTORS,
+        ContentFormat::MpegPs,
+        // `true` skips build_iso_pipeline's own crack: the verdict above is final (D3).
+        true,
+        halt.cloned(),
+        None,
+        None,
+    )
+    .map(|p| p.with_video_stream_id(scan.video_id))
+}
+
+/// An `mpg://` file's CSS layer (design §4 step 2, m1/m2): with the title key, each scrambled
+/// pack is descrambled where its own pack stuffing puts the PES flags; without one, a
+/// scrambled pack is `CssKeyMissing` (E7023) unless `refuse` is off (`--raw`).
+struct PsFileCss<S> {
+    inner: S,
+    title_key: Option<[u8; 5]>,
+    refuse: bool,
+}
+
+impl<S: SectorSource> SectorSource for PsFileCss<S> {
+    fn capacity_sectors(&self) -> u32 {
+        self.inner.capacity_sectors()
+    }
+
+    fn set_speed(&mut self, kbs: u16) {
+        self.inner.set_speed(kbs);
+    }
+
+    fn set_unit_base(&mut self, lba: u32) {
+        self.inner.set_unit_base(lba);
+    }
+
+    fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+        self.inner.unmapped_stream_files()
+    }
+
+    fn random_access(&self) -> bool {
+        self.inner.random_access()
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> crate::error::Result<usize> {
+        let n = self.inner.read_sectors(lba, count, buf, recovery)?;
+        let len = n.min(buf.len());
+        let got = &mut buf[..len];
+        match &mut self.title_key {
+            Some(key) => crate::css::descramble_ps_region(got, key),
+            None if self.refuse && got.chunks(2048).any(crate::css::is_scrambled_ps_pack) => {
+                return Err(crate::error::Error::CssKeyMissing);
+            }
+            None => {}
+        }
+        Ok(n)
+    }
+}
+
 // Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head
 // for FMKV header or PMT/PAT, then wraps a chained reader (head + remainder)
 // in a BytePrefetcher feeding the demux + parse threads.
@@ -2850,6 +3039,8 @@ mod tests {
         for (i, b) in sec.iter_mut().enumerate().take(0x80).skip(4) {
             *b = (i as u8).wrapping_mul(7).wrapping_add(1); // non-repeating → no crib
         }
+        sec[4] = 0x44; // '01': a 13818-1 pack
+        sec[0x0D] = 0xF8; // pack_stuffing_length 0
         sec[0x14] = 0x10; // scramble flag
         for (i, b) in sec.iter_mut().enumerate().skip(0x80) {
             *b = (i as u8) ^ 0x3C;

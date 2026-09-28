@@ -703,6 +703,7 @@ mod tests {
 
         let mut plaintext = vec![0u8; 2048];
         plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
+        plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // CSS scramble flag (DVD-Video sector header)
         let pat: Vec<u8> = (0..PERIOD)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
@@ -769,6 +770,7 @@ mod tests {
         const PERIOD: usize = 8;
         let mut plaintext = vec![0u8; 2048];
         plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
+        plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
         let pat: Vec<u8> = (0..PERIOD)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
@@ -911,6 +913,8 @@ mod tests {
         // start code; the descrambler requires it before trusting byte 0x14. Without
         // it the fixture is a shape that can't occur on disc, masking a rejecting gate.
         sector[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sector[4] = 0x44; // '01': a 13818-1 pack
+        sector[0x0D] = 0xF8; // pack_stuffing_length 0
         sector[0x14] = 0x30; // scramble flag (bits 4-5)
         sector[0x54..0x59].copy_from_slice(seed);
         let plaintext = sector.clone();
@@ -978,6 +982,7 @@ mod tests {
         // Real scrambled DVD sectors are MPEG-2 PS packs; the scramble policy
         // requires the pack start code as well as the flag bits.
         plaintext[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
         // Periodic run from 0x59 (just above the seed) through 0x80 and on into
         // the encrypted region; phase anchored to offset 0 so it is continuous

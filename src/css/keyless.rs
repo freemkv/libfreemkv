@@ -289,6 +289,7 @@ mod tests {
     fn synth_sector(title_key: &[u8; 5], seed: &[u8; 5], plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut plaintext = vec![0u8; SECTOR_BYTES];
         plaintext[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[FLAG_BYTE] = 0x10;
         plaintext[SEED_OFFSET..SEED_OFFSET + 5].copy_from_slice(seed);
         plaintext[ENCRYPTED_START..ENCRYPTED_START + plain.len()].copy_from_slice(plain);

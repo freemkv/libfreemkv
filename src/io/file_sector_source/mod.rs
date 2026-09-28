@@ -75,6 +75,9 @@ pub struct FileSectorSource {
     drop_window: (u64, u64),
     /// Cached drop chunk size (resolved from env once at open).
     drop_chunk_bytes: u64,
+    /// `Some(file length)` for [`open_padded`](Self::open_padded): a partial tail sector is
+    /// read, zero-filled to 2048 bytes.
+    padded_len: Option<u64>,
 }
 
 impl FileSectorSource {
@@ -110,7 +113,29 @@ impl FileSectorSource {
             capacity,
             drop_window: (0, 0),
             drop_chunk_bytes: read_drop_chunk_bytes(),
+            padded_len: None,
         })
+    }
+
+    /// Like [`open`](Self::open), but a file whose size is not a multiple of 2048 keeps its
+    /// tail: the last sector is zero-padded, synthetic and not counted as loss (an `mpg://`
+    /// source, mpg-output-design v5 §4 step 2, J13).
+    pub(crate) fn open_padded(path: &Path) -> Result<Self> {
+        let mut s = Self::open(path)?;
+        let len = s
+            .file
+            .metadata()
+            .map_err(|e| Error::IoError { source: e })?
+            .len();
+        let sectors = len.div_ceil(SECTOR_BYTES_U64);
+        if sectors > u32::MAX as u64 {
+            return Err(Error::IsoTooLarge {
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        s.capacity = sectors as u32;
+        s.padded_len = Some(len);
+        Ok(s)
     }
 }
 
@@ -145,9 +170,16 @@ impl SectorSource for FileSectorSource {
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|e| Error::IoError { source: e })?;
-        if let Err(e) = self.file.read_exact(&mut out[..bytes]) {
+        // A padded source reads what the file holds and zero-fills the rest of the sector.
+        let real = match self.padded_len {
+            // Clamp in u64 first: on a 32-bit target `as usize` would truncate the distance.
+            Some(len) => len.saturating_sub(offset).min(bytes as u64) as usize,
+            None => bytes,
+        };
+        if let Err(e) = self.file.read_exact(&mut out[..real]) {
             return Err(self.read_error(e, lba, offset + bytes as u64));
         }
+        out[real..bytes].fill(0);
 
         // Queue the next batch's read before the caller processes what we returned.
         // readahead() is non-blocking; the kernel pulls pages into cache while the
@@ -608,5 +640,28 @@ mod tests {
         );
         // And the bound itself keeps the multiply inside u64.
         assert!((READ_DROP_CHUNK_MIB_MAX as u128) * 1024 * 1024 <= u64::MAX as u128);
+    }
+
+    // mpg-output-design v5 §4 step 2 (J13): a size that is not a multiple of 2048 "has its
+    // tail padded with zeros to the sector boundary"; `open` still drops it.
+    #[test]
+    fn open_padded_keeps_a_partial_tail_sector_zero_filled() {
+        let path = std::env::temp_dir().join(format!("fmkv-padded-{}", std::process::id()));
+        let mut data = vec![7u8; 2048 + 100];
+        data[2048] = 9;
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(FileSectorSource::open(&path).unwrap().capacity_sectors(), 1);
+        let mut s = FileSectorSource::open_padded(&path).unwrap();
+        assert_eq!(s.capacity_sectors(), 2);
+        let mut buf = vec![0xAAu8; 4096];
+        assert_eq!(s.read_sectors(0, 2, &mut buf, false).unwrap(), 4096);
+        assert_eq!(&buf[..2048], &data[..2048]);
+        assert_eq!(buf[2048], 9);
+        assert_eq!(&buf[2049..2148], &[7u8; 99][..]);
+        assert!(
+            buf[2148..].iter().all(|&b| b == 0),
+            "the synthetic pad is zeros"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

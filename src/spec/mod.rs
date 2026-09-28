@@ -2,7 +2,7 @@
 //! evidence) that govern libfreemkv's behaviour. Text only: no logic.
 //!
 //! One submodule per design, each with its own ID prefix: [`keys`] holds `KS-n`
-//! (AACS, UDF, libaacs corroboration, evidence), [`stop`] holds `SS-n`. IDs are sequential per prefix and
+//! (AACS, UDF, libaacs corroboration, evidence), [`stop`] holds `SS-n`, [`mpg`] holds `MS-n`. IDs are sequential per prefix and
 //! never reused or renumbered. Const names are `<PREFIX>_<n>_<SHORT>`.
 //!
 //! `text` is the passage as rendered in the source (radix subscripts as `₂`/`₁₆`,
@@ -15,6 +15,7 @@
 //! [`QuoteKind::Informative`] rows; otherwise "corroborated by" or "per evidence".
 
 pub mod keys;
+pub mod mpg;
 pub mod stop;
 
 /// Where a quote's text comes from; binding on how a citing site may word it.
@@ -49,7 +50,7 @@ pub struct SpecQuote {
 }
 
 /// Every quote group, one per submodule. New designs append their group.
-pub const ALL: &[&[&SpecQuote]] = &[keys::ALL, stop::ALL];
+pub const ALL: &[&[&SpecQuote]] = &[keys::ALL, stop::ALL, mpg::ALL];
 
 /// Every quote in [`ALL`], group by group.
 pub fn quotes() -> impl Iterator<Item = &'static SpecQuote> {

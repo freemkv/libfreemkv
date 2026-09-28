@@ -1,6 +1,6 @@
 # Spec-governed code sites (KU design §3.6.1 rule 11): `<file>\t<fn>\t<id>`, one row per
 # (site, quote). `spec_governed_sites_cite_the_spec` checks that the body of `fn <fn>` in
-# `<file>` names `<id>`. KU rows are KS-n; Stop adds its SS-n rows here.
+# `<file>` names `<id>`. KU rows are KS-n; Stop adds its SS-n rows, mpg:// its MS-n.
 src/aacs/content.rs	clear_copy_permission_indicator	KS-5
 src/aacs/content.rs	clear_copy_permission_indicator	KS-6
 src/aacs/content.rs	clear_copy_permission_indicator	KS-22
@@ -36,3 +36,41 @@ src/keys/arrival.rs	side_partners	KS-7
 src/keys/fmts.rs	anchor	KS-26
 src/keys/fmts.rs	phases	KS-25
 src/keys/fmts.rs	phases	KS-26
+src/mux/mpg/pack.rs	pack_header	MS-2
+src/mux/mpg/pack.rs	pack_header	MS-3
+src/mux/mpg/pack.rs	pack_header	MS-4
+src/mux/mpg/pack.rs	system_header	MS-5
+src/mux/mpg/pack.rs	system_header	MS-6
+src/mux/mpg/pack.rs	system_header	MS-7
+src/mux/mpg/pack.rs	crc32	MS-26
+src/mux/mpg/pack.rs	psm	MS-8
+src/mux/mpg/pack.rs	psm	MS-9
+src/mux/mpg/pack.rs	hierarchy_descriptor	MS-23
+src/mux/mpg/pack.rs	iso639_descriptor	MS-24
+src/mux/mpg/pack.rs	fmkv_descriptors	MS-28
+src/mux/mpg/pack.rs	pes_header	MS-10
+src/mux/mpg/pack.rs	pes_header	MS-11
+src/mux/mpg/pack.rs	pes_header	MS-12
+src/mux/mpg/fit.rs	want	MS-22
+src/mux/mpg/fit.rs	want	MS-27
+src/mux/mpg/pstd.rs	room	MS-16
+src/mux/mpg/pstd.rs	push	MS-18
+src/mux/mpg/pstd.rs	emit_pes	MS-14
+src/mux/mpg/pstd.rs	emit_pes	MS-15
+src/mux/mpg/pstd.rs	write_pack	MS-16
+src/mux/mpg/pstd.rs	emit_pes	MS-19
+src/mux/mpg/pstd.rs	emit_pes	MS-21
+src/mux/mpg/pstd.rs	emit_pes	MS-29
+src/mux/mpg/pstd.rs	write_pack	MS-3
+src/mux/mpg/pstd.rs	write_pack	MS-4
+src/mux/mpg/pstd.rs	pump	MS-17
+src/mux/mpg/mod.rs	first_pack_prefix	MS-7
+src/mux/mpg/mod.rs	first_pack_prefix	MS-8
+src/mux/mpg/mod.rs	first_pack_prefix	MS-13
+src/mux/mpg/mod.rs	first_pack_prefix	MS-22
+src/mux/mpg/mod.rs	first_pack_prefix	MS-23
+src/mux/codec/lpcm.rs	dvd_header	MS-30
+src/mux/mpg/scan.rs	parse_map	MS-8
+src/mux/mpg/scan.rs	parse_map	MS-9
+src/mux/mpg/scan.rs	scan	MS-23
+src/css/mod.rs	ps_scrambled_at	MS-31

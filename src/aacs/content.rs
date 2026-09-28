@@ -890,6 +890,7 @@ mod tests {
         let mut ps = vec![0u8; ALIGNED_UNIT_LEN];
         for off in [0usize, 2048, 4096] {
             ps[off..off + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+            ps[off + 4] = 0x44; // '01': a 13818-1 pack
         }
         assert!(
             is_clean(&ps, ContentFormat::MpegPs),
@@ -931,6 +932,7 @@ mod tests {
         let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
         for off in [0usize, 2048, 4096] {
             clear[off..off + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+            clear[off + 4] = 0x44; // '01': a 13818-1 pack
         }
         // PES scrambling_control (byte 20, bits 5-4) == 0 → not encrypted.
         assert!(

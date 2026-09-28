@@ -32,6 +32,65 @@ pub(crate) struct AssembledAu {
     pub discontinuity: bool,
 }
 
+/// Design §2.3 "Reader side (L3)" (MPG2-7): an H.264 stream with one AUD per field splits a
+/// field pair into two assembled AUs, the second without a PES PTS. It is merged back into
+/// its first field (same `frame_num`, opposite parity), so the parser sees the IR frame.
+#[derive(Default)]
+pub(crate) struct SecondFieldMerge {
+    sps: Option<crate::mux::codec::h264::SpsDtsInfo>,
+    /// The last AU, held until the next shows whether it is its second field, and its
+    /// first slice's field info (`None` once paired or when not a field picture).
+    held: Option<(crate::mux::ts::PesPacket, Option<(u32, bool)>)>,
+}
+
+impl SecondFieldMerge {
+    // `(frame_num, bottom_field_flag)` of the AU's first slice when it codes a field;
+    // an SPS in the AU is taken first.
+    fn field_of(&mut self, data: &[u8]) -> Option<(u32, bool)> {
+        use crate::mux::codec::h264::{parse_slice_field_info, parse_sps_dts_info};
+        use crate::mux::codec::startcode::find_start_code;
+        let mut at = find_start_code(data, 0);
+        while let Some(p) = at {
+            let start = p + 3;
+            let next = find_start_code(data, start);
+            let nal = &data[start..next.unwrap_or(data.len())];
+            match nal.first().map(|h| h & 0x1F) {
+                Some(7) => self.sps = parse_sps_dts_info(nal).or(self.sps.take()),
+                Some(1 | 5) => {
+                    let info = parse_slice_field_info(nal, self.sps.as_ref()?)?;
+                    return info.field.map(|bottom| (info.frame_num, bottom));
+                }
+                _ => {}
+            }
+            at = next;
+        }
+        None
+    }
+
+    /// Feed one assembled AU; returns the AUs now complete, in order.
+    pub(crate) fn push(&mut self, au: crate::mux::ts::PesPacket) -> Vec<crate::mux::ts::PesPacket> {
+        let field = self.field_of(&au.data);
+        if au.pts.is_none()
+            && let (Some((frame, bottom)), Some((held, held_field))) = (field, self.held.as_mut())
+            && held_field.is_some_and(|(f, b)| f == frame && b != bottom)
+        {
+            held.data.extend_from_slice(&au.data);
+            *held_field = None;
+            return Vec::new();
+        }
+        self.held
+            .replace((au, field))
+            .map(|(held, _)| held)
+            .into_iter()
+            .collect()
+    }
+
+    /// The AU still held at the end of the stream.
+    pub(crate) fn flush(&mut self) -> Option<crate::mux::ts::PesPacket> {
+        self.held.take().map(|(au, _)| au)
+    }
+}
+
 /// VC-1 (SMPTE 421M Annex E) BDU start-code suffixes, `00 00 01 <type>`.
 const VC1_FRAME: u8 = 0x0D; // coded picture
 const VC1_ENTRY: u8 = 0x0E; // entry-point header

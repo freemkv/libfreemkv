@@ -423,6 +423,80 @@ pub(crate) fn bd_payloads(pcm: &[u8], header: [u8; 2]) -> Vec<(i64, Vec<u8>)> {
     out
 }
 
+// ── DVD LPCM re-pack (the `mpg://` sink; mpg-output-design v5 §1.1 G8) ─────────
+// The exact inverse of `Format::Dvd::convert`, so DVD → IR → DVD is byte-identical.
+
+/// The smallest DVD LPCM quantization (16, 20 or 24 bits) that holds every sample of the
+/// 24-bit IR PCM `ir` exactly: the IR keeps no source depth, and a 16-bit source's IR has
+/// every low byte zero.
+pub(crate) fn dvd_bits_needed(ir: &[u8]) -> u8 {
+    let low = ir.as_chunks::<3>().0.iter().fold(0u8, |acc, s| acc | s[2]);
+    match low {
+        0 => 16,
+        l if l & 0x0F == 0 => 20,
+        _ => 24,
+    }
+}
+
+/// Sample frames in one DVD LPCM packing unit (a 20/24-bit block, or one 16-bit frame).
+pub(crate) fn dvd_unit_frames(channels: usize, bits: u8) -> usize {
+    if bits == 16 { 1 } else { dvd_block(channels).2 }
+}
+
+/// DVD LPCM bytes for 24-bit IR PCM `ir` (a whole number of units) at `bits`.
+pub(crate) fn dvd_pack(ir: &[u8], channels: usize, bits: u8, out: &mut Vec<u8>) {
+    let samples = ir.as_chunks::<3>().0;
+    if bits == 16 {
+        for s in samples {
+            out.extend_from_slice(&s[..2]);
+        }
+        return;
+    }
+    // A group is `g` MSB16 words, then their low bits (a byte each at 24-bit, a nibble each
+    // at 20-bit), as `Format::Dvd::convert` reads it.
+    let (_, g, _) = dvd_block(channels);
+    for grp in samples.chunks_exact(g) {
+        for s in grp {
+            out.extend_from_slice(&s[..2]);
+        }
+        if bits == 24 {
+            out.extend(grp.iter().map(|s| s[2]));
+        } else {
+            out.extend(
+                grp.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| (p[0][2] & 0xF0) | (p[1][2] >> 4)),
+            );
+        }
+    }
+}
+
+/// The 3-byte DVD LPCM audio header (frame number, quantization|rate|channels−1,
+/// dynamic range), or `None` for a rate/channel count it cannot state.
+pub(crate) fn dvd_header(channels: usize, rate: u32, bits: u8) -> Option<[u8; 3]> {
+    let rate_code = match rate {
+        48_000 => 0,
+        96_000 => 1,
+        _ => return None,
+    };
+    let quant = match bits {
+        16 => 0,
+        20 => 1,
+        24 => 2,
+        _ => return None,
+    };
+    if !(1..=8).contains(&channels) {
+        return None;
+    }
+    // MS-30 (FFmpeg pcm_dvd): header[0] 0x0c, header[2] 0x80 (no dynamic range control).
+    Some([
+        0x0C,
+        (quant << 6) | (rate_code << 4) | (channels as u8 - 1),
+        0x80,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +908,62 @@ mod tests {
         let f = p.parse(&pes);
         assert!(!f.is_empty(), "the frame is emitted");
         assert_eq!(f[0].source.map(|s| s.byte), Some(7_777));
+    }
+
+    // G8 (mpg-output-design v5 §1.1): "DVD LPCM re-pack (mirror of bd_payloads)". The
+    // re-pack must invert this parser exactly; per design, do not change without a citation.
+    #[test]
+    fn dvd_pack_inverts_the_dvd_parser_for_every_layout() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        for channels in 1..=8usize {
+            for bits in [16u8, 20, 24] {
+                let frames = dvd_unit_frames(channels, bits) * 7;
+                let mut ir = Vec::with_capacity(frames * channels * 3);
+                for _ in 0..frames * channels {
+                    let lo = match bits {
+                        16 => 0,
+                        20 => next() & 0xF0,
+                        _ => next(),
+                    };
+                    ir.extend_from_slice(&[next(), next(), lo]);
+                }
+                assert!(dvd_bits_needed(&ir) <= bits);
+                let hdr = dvd_header(channels, 48_000, bits).expect("48 kHz, 1-8 ch");
+                let mut es = hdr.to_vec();
+                dvd_pack(&ir, channels, bits, &mut es);
+                let mut p = LpcmParser::new_dvd();
+                let f = p.parse(&make_pes(es, Some(0)));
+                assert_eq!(f.len(), 1, "{channels} ch {bits} bit");
+                assert_eq!(f[0].data, ir, "{channels} ch {bits} bit round trip");
+            }
+        }
+    }
+
+    #[test]
+    fn dvd_bits_needed_is_the_smallest_lossless_depth() {
+        assert_eq!(dvd_bits_needed(&[1, 2, 0, 3, 4, 0]), 16);
+        assert_eq!(dvd_bits_needed(&[1, 2, 0x50, 3, 4, 0]), 20);
+        assert_eq!(dvd_bits_needed(&[1, 2, 0x51, 3, 4, 0]), 24);
+    }
+
+    // MS-30 (FFmpeg pcm_dvd): "stream->lpcm_header[0] = 0x0c; … | st->codecpar->ch_layout.
+    // nb_channels - 1; stream->lpcm_header[2] = 0x80;" — and the parser's own decode.
+    #[test]
+    fn dvd_header_matches_the_parser_and_ffmpeg() {
+        assert_eq!(dvd_header(2, 48_000, 16), Some([0x0C, 0x01, 0x80]));
+        assert_eq!(dvd_header(6, 96_000, 24), Some([0x0C, 0x95, 0x80]));
+        assert_eq!(
+            dvd_header(2, 44_100, 16),
+            None,
+            "mpg carries 48/96 kHz only"
+        );
+        assert_eq!(dvd_header(9, 48_000, 16), None);
+        assert_eq!(dvd_header(0, 48_000, 16), None);
     }
 }

@@ -1309,10 +1309,10 @@ fn real_ext_zero_5_1_commits_after_three_frames() {
     assert_eq!(t.observe(&good), Some(6));
 }
 
-/// A failed mc_crc_check in the middle of a run resets it; a damaged or header-less frame is
-/// skipped and does not.
+/// A failed mc_crc_check in the middle of a run resets it, and so does a damaged or
+/// header-less frame: the three CRC-valid frames must be consecutive.
 #[test]
-fn an_mc_crc_failure_mid_run_resets_it_and_damage_does_not() {
+fn an_mc_crc_failure_or_damage_mid_run_resets_it() {
     let good = frame(with_mc(STEREO_256, MC_3_2_LFE));
     let mut t = ChannelTracker::default();
     assert_eq!(t.observe(&good), None);
@@ -1328,8 +1328,12 @@ fn an_mc_crc_failure_mid_run_resets_it_and_damage_does_not() {
     });
     let mut t = ChannelTracker::default();
     assert_eq!(t.observe(&good), None);
-    assert_eq!(t.observe(&damaged), None, "skipped");
-    assert_eq!(t.observe(&[0u8; 16]), None, "skipped");
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&damaged), None, "reset");
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&good), None);
+    assert_eq!(t.observe(&[0u8; 16]), None, "reset");
+    assert_eq!(t.observe(&good), None);
     assert_eq!(t.observe(&good), None);
     assert_eq!(t.observe(&good), Some(6));
 }

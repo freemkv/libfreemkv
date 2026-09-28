@@ -7914,6 +7914,7 @@ mod tests {
         const PERIOD: usize = 8;
         let mut sec = [0u8; 2048];
         sec[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
+        sec[4] = 0x44; // '01': a 13818-1 pack
         sec[0x14] = 0x10; // scramble flag
         for (i, b) in sec.iter_mut().enumerate().skip(RUN_START) {
             *b = (0xA0u8.wrapping_add((i % PERIOD) as u8)) ^ 0x5A;

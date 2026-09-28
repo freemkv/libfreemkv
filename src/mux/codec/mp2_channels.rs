@@ -127,7 +127,7 @@ impl Header {
 
     // 11172-3 §2.4.3.1 (Layer II): "N = 144 * bitrate / sampling_frequency" slots of one byte,
     // plus one when the padding bit is set.
-    fn frame_bytes(&self) -> Option<usize> {
+    pub(crate) fn frame_bytes(&self) -> Option<usize> {
         let kbps = self.bitrate_kbps? as usize;
         Some(144_000 * kbps / self.sampling_hz as usize + usize::from(self.padding))
     }
@@ -762,9 +762,13 @@ impl ChannelTracker {
                 self.last = Some(why);
                 self.run = None;
             }
-            // Skipped: a failed frame CRC covers the header too, so its nch is not trusted.
-            Frame::Damaged { why, .. } => self.last = Some(why),
-            Frame::NoHeader => {}
+            // A failed frame CRC covers the header too, so its nch is not trusted; like a
+            // header-less frame it breaks the run, which must be consecutive.
+            Frame::Damaged { why, .. } => {
+                self.last = Some(why);
+                self.run = None;
+            }
+            Frame::NoHeader => self.run = None,
         }
         if self.frames >= MAX_FRAMES && self.run.is_none() {
             self.settled = true;

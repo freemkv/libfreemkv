@@ -62,10 +62,16 @@ pub struct PipelinedPesStream {
     /// stream index. (TS titles are AU-complete already, so this is a passthrough
     /// there too — `consume_ts` does not use it.)
     au_asm: Vec<super::au_assembly::AuAssembler>,
+    /// Per-track PAFF second-field merge after the assembler (H.264 only, MPG2-7).
+    field_merge: Vec<Option<super::au_assembly::SecondFieldMerge>>,
     /// Bounds the header pump's wait for in-band codec configs (AAC).
     header_gate: super::header_gate::HeaderGate,
     /// The op's stop token; a never-cancelled stand-in when there is none.
     halt: crate::halt::Halt,
+    /// `mpg://` input: the one video `stream_id` routed; other video ids are left out.
+    video_stream_id: Option<u8>,
+    /// Packets of a video `stream_id` other than `video_stream_id`, dropped.
+    other_video_packets: u64,
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
@@ -102,6 +108,14 @@ impl PipelinedPesStream {
             .iter()
             .map(|s| super::au_assembly::AuAssembler::for_codec(stream_codec(s)))
             .collect();
+        let field_merge = title
+            .streams
+            .iter()
+            .map(|s| {
+                (stream_codec(s) == crate::disc::Codec::H264)
+                    .then(super::au_assembly::SecondFieldMerge::default)
+            })
+            .collect();
         Self {
             title,
             parsers,
@@ -116,9 +130,18 @@ impl PipelinedPesStream {
             resync,
             is_video,
             au_asm,
+            field_merge,
             header_gate: super::header_gate::HeaderGate::default(),
             halt: crate::halt::Halt::new(),
+            video_stream_id: None,
+            other_video_packets: 0,
         }
+    }
+
+    // `mpg://`: route only video `stream_id` `id` (design §4: one video track).
+    pub(crate) fn with_video_stream_id(mut self, id: Option<u8>) -> Self {
+        self.video_stream_id = id;
+        self
     }
 
     // The op's stop token: a cancel ends a blocked `read` with `Halted` (LP11).
@@ -221,6 +244,16 @@ impl PipelinedPesStream {
 
     fn consume_ps(&mut self, packets: Vec<super::ps::PsPacket>) {
         for ps in packets {
+            if let Some(id) = self.video_stream_id
+                && (0xE0..=0xEF).contains(&ps.stream_id)
+                && ps.stream_id != id
+            {
+                if self.other_video_packets == 0 {
+                    tracing::warn!(target: "mux", stream_id = ps.stream_id, "mpg: a second video stream is left out");
+                }
+                self.other_video_packets += 1;
+                continue;
+            }
             // Route by the REAL DVD PID (matching `scan_dvd_titles`) not a synthetic
             // track index. The old `(sub_id & 0x1F) + 1` heuristic collided subtitle
             // sub-id 0x20+j with audio track j+1, feeding VobSub PES into the AC-3 parser.
@@ -289,6 +322,10 @@ impl PipelinedPesStream {
                     discontinuity: false,
                 }],
             };
+            let pkts = match self.field_merge.get_mut(track).and_then(Option::as_mut) {
+                Some(m) => pkts.into_iter().flat_map(|p| m.push(p)).collect(),
+                None => pkts,
+            };
             for pes in &pkts {
                 if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
                     for frame in parser.parse(pes) {
@@ -335,6 +372,7 @@ impl PipelinedPesStream {
                     let resync = &mut self.resync;
                     let is_video = &self.is_video;
                     let au_asm = &mut self.au_asm;
+                    let field_merge = &mut self.field_merge;
                     for (pid, parser) in self.parsers.iter_mut() {
                         let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                             continue;
@@ -344,16 +382,23 @@ impl PipelinedPesStream {
                         // the parser's own buffer (MPEG-2 final GOP, DTS-HD tail).
                         let mut frames = Vec::new();
                         let tail = au_asm.get_mut(track).map(|a| a.flush()).unwrap_or_default();
-                        for au in tail {
-                            let pes = PesPacket {
+                        let mut tail: Vec<PesPacket> = tail
+                            .into_iter()
+                            .map(|au| PesPacket {
                                 source: au.source,
                                 pid: *pid,
                                 pts: au.pts,
                                 dts: au.dts,
                                 data: au.data,
                                 discontinuity: au.discontinuity,
-                            };
-                            frames.extend(parser.parse(&pes));
+                            })
+                            .collect();
+                        if let Some(m) = field_merge.get_mut(track).and_then(Option::as_mut) {
+                            tail = tail.into_iter().flat_map(|p| m.push(p)).collect();
+                            tail.extend(m.flush());
+                        }
+                        for pes in &tail {
+                            frames.extend(parser.parse(pes));
                         }
                         frames.extend(parser.flush());
                         for frame in frames {
@@ -986,6 +1031,89 @@ mod tests {
         let f = stream.read().unwrap().expect("routed MP2 frame");
         assert_eq!((f.track, f.data), (2, vec![0x56]));
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
+    }
+
+    // Design §2.3 "Reader side (L3)" (MPG2-7): one AUD per field splits a PAFF field pair
+    // into two AUs, the second with no PES PTS; it is merged back into its first field, so
+    // the IR frame is the field pair and never a PTS-0 frame.
+    #[test]
+    fn a_pts_less_second_field_merges_into_its_first() {
+        use crate::mux::decode_ts::test_es::{H264Sps, h264_slice};
+        let sps = H264Sps {
+            frame_mbs_only: false,
+            ..H264Sps::default()
+        };
+        let mut title = DiscTitle::empty();
+        title.streams.push(crate::disc::Stream::Video(VideoStream {
+            pid: crate::mux::ps::DVD_VIDEO_PID,
+            codec: Codec::H264,
+            resolution: Resolution::R1080i,
+            frame_rate: FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            crate::mux::ps::DVD_VIDEO_PID,
+            Box::new(CountingParser {
+                per_pes: 1,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let (mut stream, tx) = make_stream(
+            title,
+            parsers,
+            vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)],
+        );
+        let annexb = |nals: Vec<Vec<u8>>| {
+            let mut v = vec![0, 0, 1, 0x09, 0xF0];
+            for n in nals {
+                v.extend_from_slice(&[0, 0, 1]);
+                v.extend(n);
+            }
+            v
+        };
+        let au = [
+            annexb(vec![sps.nal(), h264_slice(&sps, true, 0, 0, Some(false))]),
+            annexb(vec![h264_slice(&sps, true, 0, 0, Some(true))]),
+            annexb(vec![h264_slice(&sps, false, 0, 1, Some(false))]),
+            annexb(vec![h264_slice(&sps, false, 0, 1, Some(true))]),
+            // A frame picture with no PES PTS is its own AU, never merged.
+            annexb(vec![h264_slice(&sps, false, 0, 2, None)]),
+        ];
+        let frag = |pts, data: &[u8]| PsPacket {
+            source: None,
+            stream_id: 0xE0,
+            sub_stream_id: None,
+            pts,
+            dts: None,
+            data: data.to_vec(),
+        };
+        tx.send(DemuxBatch::Ps(vec![
+            frag(Some(9_000), &au[0]),
+            frag(None, &au[1]),
+            frag(Some(12_003), &au[2]),
+            frag(None, &au[3]),
+            frag(None, &au[4]),
+        ]))
+        .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let mut out = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            out.push(f.data);
+        }
+        assert_eq!(
+            out,
+            vec![
+                [au[0].clone(), au[1].clone()].concat(),
+                [au[2].clone(), au[3].clone()].concat(),
+                au[4].clone()
+            ]
+        );
     }
 
     // Single-video-stream title on `codec` + CountingParser; feeds three 0xE0
