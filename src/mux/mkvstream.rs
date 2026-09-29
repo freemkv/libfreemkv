@@ -1594,18 +1594,23 @@ fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHea
                     }
                     remaining -= consumed;
                     if cid == ebml::TRACK_ENTRY {
-                        let (stream, tnum, cp, default_dur, timing, pcm, infer, pt) =
-                            parse_track(r, cs)?;
-                        probe_tracks.push(pt);
-                        if let Some(s) = stream {
+                        let t = parse_track(r, cs)?;
+                        probe_tracks.push(t.probe);
+                        if let Some(s) = t.stream {
                             // Record the TrackNumber alongside the stream it maps
                             // to, in the SAME order, so block routing never has to
                             // guess that TrackNumbers are 1..=N.
                             streams.push(s);
-                            tracks.push(tnum, default_dur, timing, pcm, infer);
+                            tracks.push(
+                                t.number,
+                                t.default_duration_ns,
+                                t.timing,
+                                t.pcm,
+                                t.pcm_infer,
+                            );
                         }
-                        if let Some(cp) = cp {
-                            codec_privates.push((tnum, cp));
+                        if let Some(cp) = t.codec_private {
+                            codec_privates.push((t.number, cp));
                         }
                     } else {
                         skip_bytes(r, cs)?;
@@ -1782,19 +1787,18 @@ fn ts_pid_for_track(tnum: u16) -> io::Result<u16> {
     Ok(pid as u16)
 }
 
-/// (stream, track_number, codec_private_bytes, default_duration_ns) — one
-/// decoded `TrackEntry`. `stream` is `None` for a TrackType this crate does not
-/// carry, in which case the TrackNumber gets no stream index at all.
-type ParsedTrack = (
-    Option<crate::disc::Stream>,
-    u16,
-    Option<Vec<u8>>,
-    Option<u64>,
-    crate::pes::TrackTiming,
-    Option<PcmIn>,
-    Option<PcmInfer>,
-    MkvProbeTrack,
-);
+// One decoded TrackEntry. `stream` is `None` for a TrackType this crate does not carry, in
+// which case the TrackNumber gets no stream index at all.
+struct ParsedTrack {
+    stream: Option<crate::disc::Stream>,
+    number: u16,
+    codec_private: Option<Vec<u8>>,
+    default_duration_ns: Option<u64>,
+    timing: crate::pes::TrackTiming,
+    pcm: Option<PcmIn>,
+    pcm_infer: Option<PcmInfer>,
+    probe: MkvProbeTrack,
+}
 
 // A PCM track that declares no BitDepth: the depth is inferred from the first
 // blocks' byte counts over their duration (see `MkvStream::resolve_pcm_depths`).
@@ -2028,7 +2032,7 @@ fn frame_rate_from_ns(ns: u64) -> FrameRate {
         .unwrap_or(Unknown)
 }
 
-/// Returns (stream, track_number, codec_private_bytes, default_duration_ns)
+// Decode one TrackEntry body.
 fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     let (mut ttype, mut tnum) = (0u64, 0u16);
     /// RFC 9559 §5.1.4.1.13 gives DefaultDuration as nanoseconds per frame with
@@ -2247,16 +2251,16 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         })),
         _ => None,
     };
-    Ok((
+    Ok(ParsedTrack {
         stream,
-        tnum,
-        codec_priv,
-        default_dur,
+        number: tnum,
+        codec_private: codec_priv,
+        default_duration_ns: default_dur,
         timing,
         pcm,
-        infer,
+        pcm_infer: infer,
         probe,
-    ))
+    })
 }
 
 // Read-side map from Matroska TrackNumber to the index of the corresponding entry in
@@ -4477,7 +4481,11 @@ mod tests {
             let mut cur = std::io::Cursor::new(body.clone());
             let parsed = super::parse_track(&mut cur, body.len() as u64)
                 .unwrap_or_else(|e| panic!("track with {freq} Hz must parse: {e}"));
-            let got = match parsed.0.as_ref().expect("an audio track yields a stream") {
+            let got = match parsed
+                .stream
+                .as_ref()
+                .expect("an audio track yields a stream")
+            {
                 Stream::Audio(a) => a.sample_rate,
                 other => panic!("expected an audio stream, got {other:?}"),
             };
