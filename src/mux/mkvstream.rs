@@ -1908,6 +1908,126 @@ impl PcmIn {
     }
 }
 
+// Matroska Video>DisplayUnit (RFC 9559 5.1.4.1.28.13); 3 = aspect ratio, 4 = unknown.
+const DISPLAY_UNIT: u32 = 0x54B2;
+const DISPLAY_UNIT_UNKNOWN: u64 = 4;
+
+// The Video children a remux carries on: pixel and display size, and Colour.
+#[derive(Default)]
+struct VideoMeta {
+    pixel_width: u32,
+    pixel_height: u32,
+    display_width: Option<u64>,
+    display_height: Option<u64>,
+    display_unit: u64,
+    // (matrix, transfer, primaries, range) as declared; `None` = no Colour element.
+    colour: Option<[Option<u64>; 4]>,
+}
+
+impl VideoMeta {
+    // Display shape as a reduced `(w, h)` when it differs from the writer's pixel grid for `res`.
+    fn display_aspect(&self, res: Resolution) -> Option<(u32, u32)> {
+        let (pw, ph) = (u64::from(self.pixel_width), u64::from(self.pixel_height));
+        let (dw, dh) = if self.display_unit == DISPLAY_UNIT_UNKNOWN {
+            (pw, ph)
+        } else {
+            (
+                self.display_width.unwrap_or(pw),
+                self.display_height.unwrap_or(ph),
+            )
+        };
+        let (bw, bh) = res.pixels()?;
+        if dw == 0 || dh == 0 || u128::from(dw) * u128::from(bh) == u128::from(bw) * u128::from(dh)
+        {
+            return None;
+        }
+        let (mut a, mut b) = (dw, dh);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        Some((u32::try_from(dw / a).ok()?, u32::try_from(dh / a).ok()?))
+    }
+
+    // Declared CICP; absent members take their Matroska defaults (2 = unspecified, range 0).
+    fn cicp(&self) -> Option<MeasuredCicp> {
+        let [m, t, p, r] = self.colour?;
+        let code =
+            |v: Option<u64>, default: u8| v.map_or(default, |v| u8::try_from(v).unwrap_or(default));
+        Some(MeasuredCicp {
+            matrix: code(m, 2),
+            transfer: code(t, 2),
+            primaries: code(p, 2),
+            range: code(r, 0),
+        })
+    }
+}
+
+// Parse a TrackEntry's Video body.
+fn parse_video(r: &mut impl Read, size: u64) -> io::Result<VideoMeta> {
+    let mut v = VideoMeta::default();
+    // Untrusted u64: saturate rather than wrap onto a real size.
+    let dim = |x: u64| u32::try_from(x).unwrap_or(u32::MAX);
+    for_each_child(r, size, |r, id, cs| {
+        match id {
+            ebml::PIXEL_WIDTH => v.pixel_width = dim(read_uint_bounded(r, cs)?),
+            ebml::PIXEL_HEIGHT => v.pixel_height = dim(read_uint_bounded(r, cs)?),
+            ebml::DISPLAY_WIDTH => v.display_width = Some(read_uint_bounded(r, cs)?),
+            ebml::DISPLAY_HEIGHT => v.display_height = Some(read_uint_bounded(r, cs)?),
+            DISPLAY_UNIT => v.display_unit = read_uint_bounded(r, cs)?,
+            ebml::COLOUR => {
+                let mut c = [None; 4];
+                for_each_child(r, cs, |r, cid, ccs| {
+                    let slot = match cid {
+                        ebml::MATRIX_COEFFICIENTS => 0,
+                        ebml::TRANSFER_CHARACTERISTICS => 1,
+                        ebml::PRIMARIES => 2,
+                        ebml::RANGE => 3,
+                        _ => return skip_bytes(r, ccs),
+                    };
+                    c[slot] = Some(read_uint_bounded(r, ccs)?);
+                    Ok(())
+                })?;
+                v.colour = Some(c);
+            }
+            _ => skip_bytes(r, cs)?,
+        }
+        Ok(())
+    })?;
+    Ok(v)
+}
+
+// H.273 transfer 16 = PQ (HDR10), 18 = HLG; the container cannot tell HDR10+ or DV apart.
+fn hdr_from_transfer(transfer: u8) -> HdrFormat {
+    match transfer {
+        16 => HdrFormat::Hdr10,
+        18 => HdrFormat::Hlg,
+        _ => HdrFormat::Sdr,
+    }
+}
+
+fn color_space_from_primaries(primaries: u8) -> ColorSpace {
+    match primaries {
+        1 => ColorSpace::Bt709,
+        5 => ColorSpace::Bt470bg,
+        6 => ColorSpace::Smpte170m,
+        9 => ColorSpace::Bt2020,
+        _ => ColorSpace::Unknown,
+    }
+}
+
+// Standard rate whose frame period is within 0.01% of DefaultDuration `ns`.
+fn frame_rate_from_ns(ns: u64) -> FrameRate {
+    use FrameRate::*;
+    [F23_976, F24, F25, F29_97, F30, F50, F59_94, F60]
+        .into_iter()
+        .find(|r| {
+            let (num, den) = r.as_fraction();
+            let exact = 1e9 * f64::from(den) / f64::from(num);
+            (ns as f64 - exact).abs() <= exact * 1e-4
+        })
+        .unwrap_or(Unknown)
+}
+
 /// Returns (stream, track_number, codec_private_bytes, default_duration_ns)
 fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     let (mut ttype, mut tnum) = (0u64, 0u16);
@@ -1918,7 +2038,8 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     let mut default_dur: Option<u64> = None;
     let mut timing = crate::pes::TrackTiming::default();
     let (mut codec_id, mut lang, mut name) = (String::new(), String::from("und"), String::new());
-    let (mut ph, mut sr, mut ch, mut forced) = (0u32, 0.0f64, 0u8, false);
+    let mut video = VideoMeta::default();
+    let (mut sr, mut ch, mut forced) = (0.0f64, 0u8, false);
     let mut bit_depth = 0u64;
     let mut codec_priv: Option<Vec<u8>> = None;
 
@@ -1963,27 +2084,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
             ebml::LANGUAGE => lang = read_string_bounded(r, cs)?,
             ebml::TRACK_NAME => name = read_string_bounded(r, cs)?,
             ebml::FLAG_FORCED => forced = read_uint_bounded(r, cs)? != 0,
-            ebml::VIDEO => {
-                let mut vrem = cs;
-                while vrem > 0 {
-                    let (vid, vs, vhlen) = ebml::read_element_header(r)?;
-                    if vs == u64::MAX {
-                        return Err(crate::error::Error::MkvSourceInvalid.into());
-                    }
-                    // Reject a child overrunning the Video body (same guard as
-                    // BLOCK_GROUP) rather than saturating `vrem` to 0.
-                    let consumed = (vhlen as u64).saturating_add(vs);
-                    if consumed > vrem {
-                        return Err(crate::error::Error::MkvSourceInvalid.into());
-                    }
-                    vrem -= consumed;
-                    if vid == ebml::PIXEL_HEIGHT {
-                        ph = read_uint_bounded(r, vs)? as u32;
-                    } else {
-                        skip_bytes(r, vs)?;
-                    }
-                }
-            }
+            ebml::VIDEO => video = parse_video(r, cs)?,
             ebml::AUDIO => {
                 let mut arem = cs;
                 while arem > 0 {
@@ -2074,7 +2175,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     } else {
         Codec::Unknown(0)
     };
-    let res = Resolution::from_height(ph);
+    let res = Resolution::from_height(video.pixel_height);
     let chs = AudioChannels::from_count(ch);
     let srs = if sr >= 192000.0 {
         SampleRate::S192
@@ -2105,6 +2206,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         codec_id,
         language: lang.clone(),
     };
+    let cicp = video.cicp();
     let stream = match ttype {
         1 => {
             let is_secondary = name.contains("Dolby Vision EL") || name.contains("DV EL");
@@ -2112,15 +2214,17 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
                 pid: ts_pid,
                 codec,
                 resolution: res,
-                frame_rate: FrameRate::Unknown,
-                hdr: HdrFormat::Sdr,
-                color_space: ColorSpace::Bt709,
-                // Remux input: the source MKV's DisplayWidth/Height is preserved
-                // by the writer separately; nothing anamorphic to reconstruct here.
-                display_aspect: None,
+                frame_rate: default_dur.map_or(FrameRate::Unknown, frame_rate_from_ns),
+                hdr: cicp.map_or(HdrFormat::Sdr, |c| hdr_from_transfer(c.transfer)),
+                color_space: cicp.map_or(ColorSpace::Bt709, |c| {
+                    color_space_from_primaries(c.primaries)
+                }),
+                // The writer sizes pixels from the resolution bucket, so any other
+                // shape (scope, anamorphic) travels as the display aspect.
+                display_aspect: video.display_aspect(res),
                 secondary: is_secondary,
                 label: name,
-                measured_cicp: None,
+                measured_cicp: cicp,
             }))
         }
         2 => Some(crate::disc::Stream::Audio(AudioStream {
@@ -6728,5 +6832,183 @@ mod tests {
         assert!(crate::pes::Stream::read(&mut stream).unwrap().is_none());
         assert_eq!(crate::pes::Stream::errors(&stream), 1);
         assert!(crate::pes::Stream::lost_bytes(&stream) > 0);
+    }
+}
+
+// Read-back of TrackEntry metadata that a remux must carry to its output.
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+    use crate::pes::Stream as _;
+    use std::io::Cursor;
+
+    const DISPLAY_UNIT: u32 = 0x54B2;
+
+    fn el(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        ebml::write_id(&mut v, id).unwrap();
+        ebml::write_size(&mut v, body.len() as u64).unwrap();
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn uint(id: u32, val: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        ebml::write_uint(&mut v, id, val).unwrap();
+        v
+    }
+
+    fn string(id: u32, val: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        ebml::write_string(&mut v, id, val).unwrap();
+        v
+    }
+
+    fn entry(tnum: u64, ttype: u64, codec_id: &str, extra: &[u8]) -> Vec<u8> {
+        let body = [
+            uint(ebml::TRACK_NUMBER, tnum),
+            uint(ebml::TRACK_TYPE, ttype),
+            string(ebml::CODEC_ID, codec_id),
+            extra.to_vec(),
+        ]
+        .concat();
+        el(ebml::TRACK_ENTRY, &body)
+    }
+
+    fn mkv(entries: &[Vec<u8>], cluster: &[u8]) -> Vec<u8> {
+        let mut out = el(ebml::EBML, &[]);
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        out.extend(el(ebml::INFO, &[]));
+        out.extend(el(ebml::TRACKS, &entries.concat()));
+        out.extend_from_slice(cluster);
+        out
+    }
+
+    fn open(bytes: Vec<u8>) -> MkvStream {
+        MkvStream::open(Cursor::new(bytes)).expect("opens")
+    }
+
+    fn video_with(video_children: &[u8], extra: &[u8]) -> VideoStream {
+        let body = [el(ebml::VIDEO, video_children), extra.to_vec()].concat();
+        let s = open(mkv(&[entry(1, 1, ebml::CODEC_H264, &body)], &[]));
+        match &s.info().streams[0] {
+            Stream::Video(v) => v.clone(),
+            other => panic!("expected video, got {other:?}"),
+        }
+    }
+
+    fn dims(w: u64, h: u64) -> Vec<u8> {
+        [uint(ebml::PIXEL_WIDTH, w), uint(ebml::PIXEL_HEIGHT, h)].concat()
+    }
+
+    #[test]
+    fn a_scope_frame_keeps_its_shape_on_remux() {
+        let v = video_with(&dims(1920, 800), &[]);
+        let t = MkvTrack::video(&v);
+        assert_eq!(
+            u64::from(t.display_width) * 800,
+            u64::from(t.display_height) * 1920,
+            "display {}x{} must keep the 2.4:1 source shape",
+            t.display_width,
+            t.display_height
+        );
+    }
+
+    #[test]
+    fn an_anamorphic_display_size_survives_remux() {
+        let video = [
+            dims(720, 576),
+            uint(ebml::DISPLAY_WIDTH, 1024),
+            uint(ebml::DISPLAY_HEIGHT, 576),
+        ]
+        .concat();
+        let t = MkvTrack::video(&video_with(&video, &[]));
+        assert_eq!((t.display_width, t.display_height), (1024, 576));
+    }
+
+    #[test]
+    fn a_dar_unit_display_size_is_read_as_a_ratio() {
+        let video = [
+            dims(720, 480),
+            uint(ebml::DISPLAY_WIDTH, 4),
+            uint(ebml::DISPLAY_HEIGHT, 3),
+            uint(DISPLAY_UNIT, 3),
+        ]
+        .concat();
+        let t = MkvTrack::video(&video_with(&video, &[]));
+        assert_eq!((t.display_width, t.display_height), (640, 480));
+    }
+
+    #[test]
+    fn square_pixel_hd_declares_no_display_aspect() {
+        assert_eq!(video_with(&dims(1920, 1080), &[]).display_aspect, None);
+    }
+
+    #[test]
+    fn an_absurd_pixel_height_is_not_truncated_to_a_real_one() {
+        let v = video_with(&dims(1920, (1u64 << 32) + 1080), &[]);
+        assert_ne!(v.resolution, Resolution::R1080p);
+    }
+
+    fn colour(m: u64, t: u64, p: u64, r: u64) -> Vec<u8> {
+        let body = [
+            uint(ebml::MATRIX_COEFFICIENTS, m),
+            uint(ebml::TRANSFER_CHARACTERISTICS, t),
+            uint(ebml::PRIMARIES, p),
+            uint(ebml::RANGE, r),
+        ]
+        .concat();
+        el(ebml::COLOUR, &body)
+    }
+
+    #[test]
+    fn hdr10_colour_is_read_back_and_rewritten() {
+        let video = [dims(3840, 2160), colour(9, 16, 9, 1)].concat();
+        let v = video_with(&video, &[]);
+        assert_eq!(
+            v.measured_cicp,
+            Some(MeasuredCicp {
+                matrix: 9,
+                transfer: 16,
+                primaries: 9,
+                range: 1
+            })
+        );
+        assert_eq!(v.hdr, HdrFormat::Hdr10);
+        assert_eq!(v.color_space, ColorSpace::Bt2020);
+        assert_eq!(super::super::mkv::cicp_for_video(&v), (9, 16, 9, 1));
+    }
+
+    #[test]
+    fn an_hlg_transfer_reads_as_hlg() {
+        let video = [dims(3840, 2160), colour(9, 18, 9, 1)].concat();
+        assert_eq!(video_with(&video, &[]).hdr, HdrFormat::Hlg);
+    }
+
+    #[test]
+    fn no_colour_element_measures_nothing() {
+        let v = video_with(&dims(1920, 1080), &[]);
+        assert_eq!(v.measured_cicp, None);
+        assert_eq!(v.hdr, HdrFormat::Sdr);
+    }
+
+    #[test]
+    fn default_duration_is_read_back_as_the_frame_rate() {
+        for (ns, rate) in [
+            (41_708_333, FrameRate::F23_976),
+            (40_000_000, FrameRate::F25),
+            (16_683_333, FrameRate::F59_94),
+        ] {
+            let extra = uint(ebml::DEFAULT_DURATION, ns);
+            let v = video_with(&dims(1920, 1080), &extra);
+            assert_eq!(v.frame_rate, rate, "{ns} ns");
+            assert_eq!(MkvTrack::video(&v).default_duration_ns, ns);
+        }
+        let odd = uint(ebml::DEFAULT_DURATION, 12_345_678);
+        assert_eq!(
+            video_with(&dims(1920, 1080), &odd).frame_rate,
+            FrameRate::Unknown
+        );
     }
 }
