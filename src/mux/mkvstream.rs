@@ -649,6 +649,7 @@ impl MkvStream {
         // which has no track). Streams after the dependent shift down by one.
         let mut stream_to_track: Vec<Option<usize>> = Vec::with_capacity(title.streams.len());
         let excluded = super::ps::UnstoredExtensions::new(title, "Matroska");
+        let mut unmapped = false;
         for (idx, s) in title.streams.iter().enumerate() {
             if Some(idx) == skip_stream_idx {
                 stream_to_track.push(None);
@@ -658,10 +659,12 @@ impl MkvStream {
                 stream_to_track.push(None);
                 continue;
             }
-            let mut track = match s {
-                crate::disc::Stream::Video(v) => MkvTrack::video(v),
-                crate::disc::Stream::Audio(a) => MkvTrack::audio(a),
-                crate::disc::Stream::Subtitle(s) => MkvTrack::subtitle(s),
+            // No Matroska CodecID: left out (fit_report plans it out), never mislabelled.
+            let Some(mut track) = MkvTrack::from_stream(s) else {
+                tracing::warn!(target: "mux", stream = idx, "codec has no Matroska mapping; left out");
+                unmapped = true;
+                stream_to_track.push(None);
+                continue;
             };
             // Only first video and first audio are default
             if track.is_default {
@@ -678,10 +681,10 @@ impl MkvStream {
             tracks.push(track);
         }
 
-        // Assemble the MVC merge only when active — i.e. a dependent AND a
-        // distinct base video both exist (established above). `base_stream_idx`
-        // then always has a built track, so its remap is `Some` (no panic path).
-        let remap = (!mvc_active && !excluded.is_empty()).then(|| stream_to_track.clone());
+        // The MVC merge needs a dependent, a distinct base and a built base track (an unmapped
+        // base yields no merge). An unmapped stream forces the remap even under MVC.
+        let remap =
+            (unmapped || (!mvc_active && !excluded.is_empty())).then(|| stream_to_track.clone());
         let mvc = match (mvc_active, dep_stream_idx, base_stream_idx) {
             (true, Some(dep_stream_idx), Some(base_stream_idx)) => stream_to_track
                 .get(base_stream_idx)

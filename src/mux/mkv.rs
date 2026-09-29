@@ -9,7 +9,7 @@ use super::ebml;
 // `demux://` sink.
 use super::timeline::TimelineContinuity;
 use crate::disc::{
-    AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
+    AudioStream, Chapter, Codec, CodecKind, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
 };
 // Production code reaches resolutions only through `VideoStream::resolution`;
 // the fixtures below name the variants directly.
@@ -316,25 +316,74 @@ fn language_or_und(lang: &str) -> String {
     }
 }
 
+/// Matroska CodecID for `codec` carried as a `kind` track, or `None` when Matroska has no ID
+/// for it here (text subtitles, whose payload is not in Matroska block form; `Unknown`; a codec
+/// of another kind). Exhaustive, so a new `Codec` variant must be mapped or refused here.
+fn codec_id(codec: Codec, kind: CodecKind) -> Option<&'static str> {
+    // `A_DTS` is the sole registered ID for the whole DTS family; players tell core/HD-HRA/
+    // HD-MA apart from the bitstream. Unregistered `A_DTS/MA`/`A_DTS/HR` break strict parsers.
+    let id = match codec {
+        Codec::H264 => ebml::CODEC_H264,
+        Codec::Hevc => ebml::CODEC_HEVC,
+        Codec::Vc1 => ebml::CODEC_VC1,
+        Codec::Mpeg2 => ebml::CODEC_MPEG2,
+        Codec::Mpeg1 => ebml::CODEC_MPEG1,
+        Codec::Av1 => ebml::CODEC_AV1,
+        Codec::Ac3 => ebml::CODEC_AC3,
+        Codec::Ac3Plus => ebml::CODEC_EAC3,
+        Codec::TrueHd => ebml::CODEC_TRUEHD,
+        Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => ebml::CODEC_DTS,
+        Codec::Lpcm => ebml::CODEC_PCM_BE,
+        Codec::Aac => ebml::CODEC_AAC,
+        Codec::Mp2 => ebml::CODEC_MP2,
+        Codec::Mp3 => ebml::CODEC_MP3,
+        Codec::Flac => ebml::CODEC_FLAC,
+        Codec::Opus => ebml::CODEC_OPUS,
+        Codec::Pgs => ebml::CODEC_PGS,
+        Codec::DvdSub => ebml::CODEC_VOBSUB,
+        Codec::Srt | Codec::Ssa | Codec::Unknown(_) => return None,
+    };
+    (codec.kind() == kind).then_some(id)
+}
+
+/// Whether `s` has a Matroska CodecID, i.e. whether `mkv://` carries it.
+pub(crate) fn is_mappable(s: &crate::disc::Stream) -> bool {
+    match s {
+        crate::disc::Stream::Video(v) => codec_id(v.codec, CodecKind::Video).is_some(),
+        crate::disc::Stream::Audio(a) => codec_id(a.codec, CodecKind::Audio).is_some(),
+        crate::disc::Stream::Subtitle(t) => codec_id(t.codec, CodecKind::Subtitle).is_some(),
+    }
+}
+
+// Test shorthands for [`MkvTrack::from_stream`] on a stream known to be mappable.
+#[cfg(test)]
 impl MkvTrack {
-    /// Build a video track from a [`VideoStream`]. Language defaults to `"und"`;
-    /// colour metadata is derived from the stream's colour space and HDR format
-    /// (PQ for HDR10/HDR10+/DV, HLG for HLG). When `hdr == DolbyVision` a dvcC
-    /// BlockAdditionMapping is attached automatically so players recognise the
-    /// Dolby Vision layer.
     pub fn video(v: &VideoStream) -> Self {
-        let codec_id = match v.codec {
-            Codec::H264 => ebml::CODEC_H264,
-            Codec::Hevc => ebml::CODEC_HEVC,
-            Codec::Vc1 => ebml::CODEC_VC1,
-            Codec::Mpeg2 => ebml::CODEC_MPEG2,
-            Codec::Mpeg1 => ebml::CODEC_MPEG1,
-            Codec::Av1 => ebml::CODEC_AV1,
-            // Every video codec this crate can produce is named above; the remaining
-            // arm is reached only by a non-video/Unknown codec routed here in error
-            // (see the audio counterpart — no error channel exists here either).
-            _ => ebml::CODEC_MPEG2,
-        };
+        Self::try_video(v).expect("mappable video codec")
+    }
+    pub fn audio(a: &AudioStream) -> Self {
+        Self::try_audio(a).expect("mappable audio codec")
+    }
+    pub fn subtitle(s: &SubtitleStream) -> Self {
+        Self::try_subtitle(s).expect("mappable subtitle codec")
+    }
+}
+
+impl MkvTrack {
+    /// Build the track for a title stream, or `None` when its codec has no Matroska CodecID
+    /// (the stream is then left out rather than declared under another codec's ID).
+    pub(crate) fn from_stream(s: &crate::disc::Stream) -> Option<Self> {
+        match s {
+            crate::disc::Stream::Video(v) => Self::try_video(v),
+            crate::disc::Stream::Audio(a) => Self::try_audio(a),
+            crate::disc::Stream::Subtitle(t) => Self::try_subtitle(t),
+        }
+    }
+
+    // Video track: language `und`, colour from `cicp_for_video`, and a dvcC
+    // BlockAdditionMapping when `hdr == DolbyVision`.
+    fn try_video(v: &VideoStream) -> Option<Self> {
+        let codec_id = codec_id(v.codec, CodecKind::Video)?;
         // Unknown resolution -> `pixels()` reports (0, 0) (no default is fabricated),
         // and the writer omits the optional PixelWidth/PixelHeight
         // on 0 per RFC 9559 5.1.4.1.28-29.
@@ -356,7 +405,7 @@ impl MkvTrack {
             Some((an, ad)) if an > 0 && ad > 0 && h > 0 => ((h * an + ad / 2) / ad, h),
             _ => (w, h),
         };
-        Self {
+        Some(Self {
             track_type: ebml::TRACK_TYPE_VIDEO,
             codec_id,
             language: "und".into(),
@@ -397,32 +446,12 @@ impl MkvTrack {
             // (same deferred path FieldOrder uses). `None` here -> omitted unless seen.
             hdr10: None,
             mvc_params: None,
-        }
+        })
     }
 
-    /// Build an audio track from an [`AudioStream`]. The codec ID follows the
-    /// Matroska registry; every DTS family member (core, DTS-HD HR, DTS-HD MA)
-    /// maps to the single registered `A_DTS` ID (see the note below).
-    pub fn audio(a: &AudioStream) -> Self {
-        // `A_DTS` is the sole registered codec ID for the whole DTS family; players
-        // distinguish core/HD-HRA/HD-MA from the bitstream itself. `A_DTS/MA` and
-        // `A_DTS/HR` aren't registered and some strict parsers reject them.
-        let codec_id = match a.codec {
-            Codec::Ac3 => ebml::CODEC_AC3,
-            Codec::Ac3Plus => ebml::CODEC_EAC3,
-            Codec::TrueHd => ebml::CODEC_TRUEHD,
-            Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => ebml::CODEC_DTS,
-            Codec::Lpcm => ebml::CODEC_PCM_BE,
-            Codec::Aac => ebml::CODEC_AAC,
-            Codec::Mp2 => ebml::CODEC_MP2,
-            Codec::Mp3 => ebml::CODEC_MP3,
-            Codec::Flac => ebml::CODEC_FLAC,
-            Codec::Opus => ebml::CODEC_OPUS,
-            // Every audio codec this crate can produce is named above; the remaining
-            // arm (A_AC3, wrong for such a track) is reached only in error, since
-            // `MkvTrack::audio` has no error channel — a test pins each real codec ID.
-            _ => ebml::CODEC_AC3,
-        };
+    // Audio track; every DTS family member maps to the single registered `A_DTS`.
+    fn try_audio(a: &AudioStream) -> Option<Self> {
+        let codec_id = codec_id(a.codec, CodecKind::Audio)?;
         // Unknown sample rate/channels -> accessors return 0, so the serializer omits
         // SamplingFrequency/Channels rather than writing a fabricated 48kHz/6ch value.
         let sr = a.sample_rate.hz();
@@ -430,7 +459,7 @@ impl MkvTrack {
 
         let name = a.label.clone();
 
-        Self {
+        Some(Self {
             track_type: ebml::TRACK_TYPE_AUDIO,
             codec_id,
             language: language_or_und(&a.language),
@@ -461,19 +490,14 @@ impl MkvTrack {
             dv_config: None,
             hdr10: None,
             mvc_params: None,
-        }
+        })
     }
 
-    /// Build a subtitle track from a [`SubtitleStream`]. PGS maps to
-    /// `S_HDMV/PGS` and DVD VobSub to `S_VOBSUB`; the stream's `codec_data`
-    /// (the VobSub `.idx` palette header for DVD) becomes the track's
-    /// CodecPrivate. The forced-display flag is propagated from the stream.
-    pub fn subtitle(s: &SubtitleStream) -> Self {
-        let codec_id = match s.codec {
-            Codec::DvdSub => ebml::CODEC_VOBSUB,
-            _ => ebml::CODEC_PGS,
-        };
-        Self {
+    // Subtitle track (PGS or VobSub); `codec_data` (the VobSub `.idx` palette header) becomes
+    // the CodecPrivate and the forced flag is propagated.
+    fn try_subtitle(s: &SubtitleStream) -> Option<Self> {
+        let codec_id = codec_id(s.codec, CodecKind::Subtitle)?;
+        Some(Self {
             track_type: ebml::TRACK_TYPE_SUBTITLE,
             codec_id,
             language: language_or_und(&s.language),
@@ -499,7 +523,7 @@ impl MkvTrack {
             dv_config: None,
             hdr10: None,
             mvc_params: None,
-        }
+        })
     }
 }
 
@@ -7210,5 +7234,100 @@ mod tests {
         // Agrees with the enum-only mapping the FVI header documents.
         let c = crate::mux::videomap::Colour::from_color_space(ColorSpace::Bt2020);
         assert_eq!(c.transfer, t);
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Cursor<Vec<u8>>>>);
+    impl Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(b)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for SharedBuf {
+        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+            self.0.lock().unwrap().seek(pos)
+        }
+    }
+
+    // A stream whose codec has no Matroska CodecID is left out of the file instead of being
+    // declared A_AC3 / S_HDMV/PGS / V_MPEG2; the mappable tracks keep their frames.
+    #[test]
+    fn mkv_stream_leaves_out_unmappable_codecs() {
+        use crate::pes::Stream as _;
+        let audio = |codec| {
+            crate::disc::Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec,
+                channels: crate::disc::AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: crate::disc::SampleRate::S48,
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: String::new(),
+            })
+        };
+        let sub = |codec| {
+            crate::disc::Stream::Subtitle(SubtitleStream {
+                pid: 0x1200,
+                codec,
+                language: "eng".into(),
+                forced: false,
+                qualifier: crate::disc::LabelQualifier::None,
+                codec_data: None,
+            })
+        };
+        let mut v = uhd_video(HdrFormat::Sdr, ColorSpace::Bt709);
+        v.codec = Codec::H264;
+        let title = crate::disc::DiscTitle {
+            streams: vec![
+                crate::disc::Stream::Video(v),
+                audio(Codec::Unknown(0)),
+                sub(Codec::Srt),
+                audio(Codec::Ac3),
+            ],
+            codec_privates: vec![None; 4],
+            ..crate::disc::DiscTitle::empty()
+        };
+        let out = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Cursor::new(
+            Vec::new(),
+        ))));
+        let mut s = super::super::MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        s.set_track_timing(1, Default::default()).unwrap();
+        for (track, keyframe) in [(0, true), (1, true), (2, true), (3, true)] {
+            s.write(&crate::pes::PesFrame {
+                discard_padding_ns: 0,
+                coding: None,
+                source: None,
+                track,
+                pts: 0,
+                keyframe,
+                data: vec![0x10 + track as u8; 8],
+                duration_ns: None,
+            })
+            .unwrap();
+        }
+        s.finish().unwrap();
+        let bytes = out.0.lock().unwrap().get_ref().clone();
+        let mut back = super::super::MkvStream::open(Cursor::new(bytes)).unwrap();
+        let codecs: Vec<Codec> = (back.info().streams.iter())
+            .map(|s| match s {
+                crate::disc::Stream::Video(v) => v.codec,
+                crate::disc::Stream::Audio(a) => a.codec,
+                crate::disc::Stream::Subtitle(s) => s.codec,
+            })
+            .collect();
+        assert_eq!(
+            codecs,
+            vec![Codec::H264, Codec::Ac3],
+            "only mappable tracks"
+        );
+        let mut got = Vec::new();
+        while let Some(f) = back.read().unwrap() {
+            got.push((f.track, f.data));
+        }
+        assert_eq!(got, vec![(0, vec![0x10; 8]), (1, vec![0x13; 8])]);
     }
 }
