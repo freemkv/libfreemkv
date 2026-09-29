@@ -224,6 +224,11 @@ impl DiscStream {
         raw: bool,
         halt: Option<Halt>,
     ) -> std::io::Result<Self> {
+        // A zero batch reads 0 sectors and never advances (endless loop until
+        // Stop); `MuxOptions::default()` carries 0. Same refusal as the highway.
+        if batch_sectors == 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         let mut title = title;
         let extents = title.extents.clone();
 
@@ -1267,6 +1272,27 @@ mod tests {
             }],
             ..DiscTitle::empty()
         }
+    }
+
+    // MuxOptions::default() carries batch_sectors 0: a zero batch reads 0 sectors
+    // and never advances, so it must be refused up front, not spin until Stop.
+    #[test]
+    fn zero_batch_is_rejected_not_an_endless_zero_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("t.iso");
+        std::fs::write(&iso, vec![0u8; 4 * 2048]).unwrap();
+        let src = crate::io::file_sector_source::FileSectorSource::open(&iso).unwrap();
+        let res = DiscStream::new(
+            Box::new(src),
+            synthetic_title(4),
+            crate::decrypt::DecryptKeys::None,
+            0,
+            ContentFormat::BdTs,
+            false,
+            None,
+        );
+        let err = res.err().expect("batch_sectors 0 must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     // A truncated ISO is not a bad sector: even with skip_errors the missing tail
