@@ -39,6 +39,8 @@ const CICP_TRANSFER_BT709: u8 = 1;
 const CICP_TRANSFER_BT470BG: u8 = 5;
 /// TransferCharacteristics = 6 (BT.601-525 / SMPTE 170M) — ITU-T H.273 Table 3.
 const CICP_TRANSFER_BT601_525: u8 = 6;
+/// TransferCharacteristics = 14 (BT.2020 10-bit, SDR) — ITU-T H.273 Table 3.
+const CICP_TRANSFER_BT2020_10: u8 = 14;
 /// TransferCharacteristics = 16 (SMPTE ST 2084 / PQ — HDR10/HDR10+/DV) — ITU-T
 /// H.273 Table 3.
 const CICP_TRANSFER_PQ: u8 = 16;
@@ -123,9 +125,10 @@ pub(crate) fn cicp_for_video(v: &VideoStream) -> (u8, u8, u8, u8) {
         return (c.matrix, c.transfer, c.primaries, c.range);
     }
     let (m, t, p, r) = match v.color_space {
+        // SDR BT.2020 (UHD MPLS dynamic_range 0); the HDR override below selects PQ/HLG.
         ColorSpace::Bt2020 => (
             CICP_MATRIX_BT2020NC,
-            CICP_TRANSFER_PQ,
+            CICP_TRANSFER_BT2020_10,
             CICP_PRIMARIES_BT2020,
             COLOUR_RANGE_LIMITED,
         ),
@@ -7165,5 +7168,47 @@ mod tests {
         let (data, _) = mux_to_bytes(&[make_video_track()], &[], &frames);
         assert!(find_clusters(&data).len() >= 2, "split expected");
         assert_eq!(parse_cues(&data).len(), 1, "only the keyframe is a cue");
+    }
+
+    fn uhd_video(hdr: HdrFormat, color_space: ColorSpace) -> VideoStream {
+        VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: crate::disc::FrameRate::F23_976,
+            hdr,
+            color_space,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }
+    }
+
+    // An SDR BT.2020 UHD title (MPLS dynamic_range 0) is BT.2020-10 transfer, not PQ; only an
+    // HDR format may select PQ/HLG.
+    #[test]
+    fn sdr_bt2020_is_bt2020_transfer_not_pq() {
+        let (m, t, p, _) = cicp_for_video(&uhd_video(HdrFormat::Sdr, ColorSpace::Bt2020));
+        assert_eq!(
+            (m, t, p),
+            (
+                CICP_MATRIX_BT2020NC,
+                CICP_TRANSFER_BT2020_10,
+                CICP_PRIMARIES_BT2020
+            ),
+            "SDR BT.2020 must not be tagged PQ"
+        );
+        assert_eq!(
+            cicp_for_video(&uhd_video(HdrFormat::Hdr10, ColorSpace::Bt2020)).1,
+            CICP_TRANSFER_PQ
+        );
+        assert_eq!(
+            cicp_for_video(&uhd_video(HdrFormat::Hlg, ColorSpace::Bt2020)).1,
+            CICP_TRANSFER_HLG
+        );
+        // Agrees with the enum-only mapping the FVI header documents.
+        let c = crate::mux::videomap::Colour::from_color_space(ColorSpace::Bt2020);
+        assert_eq!(c.transfer, t);
     }
 }
