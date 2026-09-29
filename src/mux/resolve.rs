@@ -22,6 +22,11 @@ use std::path::{Path, PathBuf};
 /// I/O buffer size for file streams.
 const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
 
+/// File-backed ISO mux read size. Empirically optimal for the CLI: 16 MiB;
+/// 32 MiB regressed from cache pressure and longer per-batch latency.
+/// Image remux uses the same reader pipeline and should use this value too.
+pub const ISO_MUX_BATCH_SECTORS: u16 = 8192;
+
 /// Parsed stream URL.
 #[derive(Debug, Clone)]
 pub enum StreamUrl {
@@ -529,10 +534,7 @@ where
     }
     let title = disc.titles[idx].clone();
     let format = disc.content_format;
-    // ISO file: 8192-sector batch (16 MiB) — sequential read from fast
-    // storage, no bad sectors. Empirically optimal; 16384 sectors regressed
-    // (more cache pressure, longer per-batch latency starves the consumer).
-    const ISO_MUX_BATCH_SECTORS: u16 = 8192;
+    // ISO file: use the same tuned batch as the other file-backed mux path.
 
     // Pass `DecryptKeys::None` to the decrypt decorator when --raw is set —
     // the read stack still flows through the same producer+demux+parse
@@ -594,7 +596,6 @@ where
             tracing::debug!(target: "mux", error = %e, "TrueHD channel-correction probe re-open failed")
         }
     }
-    const ISO_MUX_BATCH_SECTORS: u16 = 8192;
     let title = disc.titles[idx].clone();
     build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, None, None)
 }
