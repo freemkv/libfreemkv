@@ -401,17 +401,19 @@ fn vc1_param(bdu: &[u8]) -> Option<usize> {
     (*bdu.first()? == 0x0F).then_some(1)
 }
 
-// NAL units of an IR frame: length-prefixed (`nal_len` octets), or Annex B when the frame
-// already starts with a start code (the probe `length_prefixed_to_annex_b` uses).
+// NAL units of an IR frame: length-prefixed (`nal_len` octets) as the writer reads it; Annex B
+// only when it starts with a start code and the prefixes do not exactly tile the frame.
 fn nals(es: &[u8], nal_len: usize) -> Nals<'_> {
-    if es.starts_with(&[0, 0, 1]) || es.starts_with(&[0, 0, 0, 1]) {
+    let prefixed = LengthPrefixed {
+        es,
+        nal_len,
+        pos: 0,
+    };
+    let start_code = es.starts_with(&[0, 0, 1]) || es.starts_with(&[0, 0, 0, 1]);
+    if start_code && !prefixed.tiles() {
         Nals::AnnexB(AnnexB::new(es))
     } else {
-        Nals::Prefixed(LengthPrefixed {
-            es,
-            nal_len,
-            pos: 0,
-        })
+        Nals::Prefixed(prefixed)
     }
 }
 
@@ -436,14 +438,34 @@ struct LengthPrefixed<'a> {
     pos: usize,
 }
 
-impl<'a> Iterator for LengthPrefixed<'a> {
-    type Item = &'a [u8];
-    fn next(&mut self) -> Option<&'a [u8]> {
-        let size = if (1..=4).contains(&self.nal_len) {
+impl LengthPrefixed<'_> {
+    fn size(&self) -> usize {
+        if (1..=4).contains(&self.nal_len) {
             self.nal_len
         } else {
             4
-        };
+        }
+    }
+
+    // Whether the length prefixes land exactly on the end of the frame.
+    fn tiles(&self) -> bool {
+        let size = self.size();
+        let mut pos = 0usize;
+        while pos < self.es.len() {
+            let Some(head) = self.es.get(pos..pos + size) else {
+                return false;
+            };
+            let len = head.iter().fold(0usize, |a, &b| (a << 8) | b as usize);
+            pos = pos.saturating_add(size).saturating_add(len);
+        }
+        pos == self.es.len()
+    }
+}
+
+impl<'a> Iterator for LengthPrefixed<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let size = self.size();
         loop {
             let head = self.es.get(self.pos..self.pos + size)?;
             let len = head.iter().fold(0usize, |a, &b| (a << 8) | b as usize);

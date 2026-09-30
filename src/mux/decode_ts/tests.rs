@@ -628,6 +628,41 @@ fn hevc_b_pyramid_uses_the_sps_reorder_depth() {
     assert_eq!(dts, vec![f(-2), f(-1), f(0), None, f(2)]);
 }
 
+// A 4-octet prefix of 1 or 256..=511 starts `00 00 00 01` / `00 00 01`: the frame is
+// still length-prefixed (the writer never probes), so the in-band SPS must be found.
+#[test]
+fn length_prefixed_frame_whose_prefix_looks_like_a_start_code_is_not_annex_b() {
+    for first in [vec![0x4C], {
+        let mut fd = vec![0x4C, 0x01];
+        fd.resize(300, 0xFF);
+        fd
+    }] {
+        let mut hvcc = vec![0u8; 23];
+        hvcc[21] = 0x03;
+        let mut d = DtsDeriver::for_codec(Codec::Hevc, Some(&hvcc));
+        let sps = hevc_sps_vui(2, Some((1, 24)), false);
+        let frames: Vec<_> = [0i64, 4, 2, 1, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let mut au = vec![first.clone(), hevc_slice(1)];
+                if i == 0 {
+                    au.insert(1, sps.clone());
+                }
+                (B + o * F, length_prefixed(&au))
+            })
+            .collect();
+        let f = |n: i64| Some(B + n * F);
+        let want = vec![f(-2), f(-1), f(0), None, f(2)];
+        assert_eq!(
+            run(&mut d, &frames),
+            want,
+            "first NAL {} bytes",
+            first.len()
+        );
+    }
+}
+
 #[test]
 fn hevc_vui_timing_is_reached_through_scaling_lists_pcm_and_rps() {
     for scaling in [false, true] {
