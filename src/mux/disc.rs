@@ -395,6 +395,11 @@ impl DiscStream {
             .unwrap_or(false)
     }
 
+    // A failed read that Stop caused: the reader reports Halted, or our token fired.
+    fn stopped(&self, e: &crate::error::Error) -> bool {
+        matches!(e, crate::error::Error::Halted) || self.is_halted()
+    }
+
     fn emit(&self, kind: EventKind) {
         if let Some(ref f) = self.event_fn {
             f(Event { kind });
@@ -513,6 +518,13 @@ impl DiscStream {
             {
                 return Err(res.unwrap_err().into());
             }
+            // A read failed by Stop (cancelled drive, or a stop mid bad zone) is
+            // not bad media: never shrink, recover or skip it.
+            if let Err(e) = res.as_ref()
+                && self.stopped(e)
+            {
+                return Err(crate::error::Error::Halted.into());
+            }
 
             if let Ok(&got) = res.as_ref() {
                 // read_sectors returns bytes written into buf. All in-tree
@@ -574,6 +586,11 @@ impl DiscStream {
                     && is_key_stop(e)
                 {
                     return Err(rec.unwrap_err().into());
+                }
+                if let Err(e) = rec.as_ref()
+                    && self.stopped(e)
+                {
+                    return Err(crate::error::Error::Halted.into());
                 }
                 if let Ok(&got) = rec.as_ref() {
                     debug_assert!(got <= bytes, "recovery read over-reported byte count");
@@ -1507,6 +1524,114 @@ mod tests {
             stream.is_halted(),
             "with_halt token cancellation must be observed by is_halted()"
         );
+    }
+
+    // Every read fails; the `stop_at`-th read cancels `halt` (Stop pressed inside a
+    // bad zone) and fails with `Halted` (a cancelled drive) or a media error.
+    struct StopInBadZoneReader {
+        halt: Halt,
+        stop_at: usize,
+        reader_halted: bool,
+        log: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl crate::sector::SectorSource for StopInBadZoneReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let mut log = self.log.lock().unwrap();
+            log.push(recovery);
+            if log.len() >= self.stop_at {
+                self.halt.cancel();
+                if self.reader_halted {
+                    return Err(crate::error::Error::Halted);
+                }
+            }
+            Err(crate::error::Error::DiscRead {
+                sector: lba as u64,
+                status: Some(0x02),
+                sense: None,
+            })
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            64
+        }
+    }
+
+    fn stop_in_bad_zone(
+        batch: u16,
+        stop_at: usize,
+        reader_halted: bool,
+        share_halt: bool,
+        skip_errors: bool,
+    ) -> (io::Result<bool>, DiscStream, Vec<bool>) {
+        let halt = Halt::new();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = StopInBadZoneReader {
+            halt: halt.clone(),
+            stop_at,
+            reader_halted,
+            log: log.clone(),
+        };
+        let mut s = DiscStream::new(
+            Box::new(reader),
+            synthetic_title(64),
+            crate::decrypt::DecryptKeys::None,
+            batch,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
+        if share_halt {
+            s = s.with_halt(halt.clone());
+        }
+        s.skip_errors = skip_errors;
+        if stop_at == 0 {
+            halt.cancel();
+        }
+        let res = s.fill_extents();
+        let log = log.lock().unwrap().clone();
+        (res, s, log)
+    }
+
+    // A drive cancelled by Stop fails its read with Halted: that is a stop, not a
+    // bad sector — no 60s recovery read, no skip accounting, no DiscRead.
+    #[test]
+    fn a_halted_read_at_the_bottomed_out_unit_is_a_stop_not_a_bad_sector() {
+        for share_halt in [true, false] {
+            for skip_errors in [true, false] {
+                let (res, s, log) = stop_in_bad_zone(1, 1, true, share_halt, skip_errors);
+                let err = res.expect_err("a halted read must not fill");
+                assert!(
+                    crate::error::is_halt(&err),
+                    "share={share_halt} skip={skip_errors}: got {err}"
+                );
+                assert_eq!(log, vec![false], "no recovery read after a halted read");
+                assert_eq!((s.errors, s.lost_bytes), (0, 0), "no bogus skip");
+            }
+        }
+    }
+
+    // Stop pressed while the read stalls in a failing region returns Halted at once,
+    // never walking the shrink/recovery ladder first.
+    #[test]
+    fn stop_in_a_failing_region_returns_halted_without_more_reads() {
+        let (res, s, log) = stop_in_bad_zone(32, 0, false, true, true);
+        assert!(crate::error::is_halt(&res.expect_err("halted before read")));
+        assert!(log.is_empty(), "no read once already halted: {log:?}");
+        assert_eq!(s.errors, 0);
+
+        let (res, s, log) = stop_in_bad_zone(32, 2, false, true, true);
+        let err = res.expect_err("a stop mid bad zone must not fill");
+        assert!(crate::error::is_halt(&err), "got {err}");
+        assert_eq!(log, vec![false, false], "no read after the stop");
+        assert_eq!((s.errors, s.lost_bytes), (0, 0), "no bogus skip");
     }
 
     /// A key map on the inline live-drive path applies the same FMTS read plan
