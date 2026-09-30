@@ -2085,6 +2085,7 @@ fn an_mpg_source_remuxes_to_mkv() {
             .collect()
     };
     let (_, mpg_title) = (0, read_all(&mpg).unwrap().0);
+    let mut offsets: Vec<i64> = Vec::new();
     for c in [Codec::Mpeg2, Codec::Ac3] {
         let (a, b) = (
             pick(&from_mpg, &mpg_title, c),
@@ -2092,7 +2093,12 @@ fn an_mpg_source_remuxes_to_mkv() {
         );
         assert_eq!(a.len(), b.len(), "{c:?}");
         assert!(a.iter().zip(&b).all(|(x, y)| x.1 == y.1), "{c:?} bytes");
+        offsets.extend(a.iter().zip(&b).map(|(x, y)| y.0 - x.0));
     }
+    // One origin shift for every frame of every track: no per-track drift or skew.
+    offsets.sort_unstable();
+    offsets.dedup();
+    assert_eq!(offsets.len(), 1, "timestamp offsets differ: {offsets:?}");
     let _ = (std::fs::remove_file(&mpg), std::fs::remove_file(&mkv));
 }
 

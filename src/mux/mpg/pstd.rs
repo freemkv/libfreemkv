@@ -1066,12 +1066,10 @@ mod tests {
         m.push(0, au(9_000, 5_000, 3_000));
         m.streams[0].first_pes_done = true;
         m.streams[0].queue[0].sent = 3_000 - 484;
-        let p = m.plan_pes(0, 494, 0);
-        assert!(
-            p.as_ref().is_none_or(|p| p.start.is_none() && p.len <= 484),
-            "{:?}",
-            p.map(|p| (p.len, p.start))
-        );
+        let p = m
+            .plan_pes(0, 494, 0)
+            .expect("the tail is sent, not stalled");
+        assert_eq!((p.len, p.start), (484, None));
     }
 
     // An AU's first byte and its commencement byte share one PES: a PES ends before the next
