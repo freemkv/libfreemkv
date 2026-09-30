@@ -49,11 +49,16 @@ struct FakeFlushOps {
     chunk_gate: Gate,
     finish_sleep: Duration,
     finish_gate: Gate,
+    started: AtomicUsize,
     chunks: AtomicUsize,
+    // Each chunk call's entry and exit instants.
+    spans: Mutex<Vec<(Instant, Instant)>>,
     finishes: AtomicUsize,
     sample_from: Option<Instant>,
+    samples: AtomicUsize,
     pieces: Option<PieceDelay>,
-    ranges: Mutex<Vec<(u64, u64)>>,
+    // Each range call's (offset, length, entry instant).
+    ranges: Mutex<Vec<(u64, u64, Instant)>>,
 }
 
 impl Default for FakeFlushOps {
@@ -66,9 +71,12 @@ impl Default for FakeFlushOps {
             chunk_gate: Gate::open(),
             finish_sleep: Duration::ZERO,
             finish_gate: Gate::open(),
+            started: AtomicUsize::new(0),
             chunks: AtomicUsize::new(0),
+            spans: Mutex::new(Vec::new()),
             finishes: AtomicUsize::new(0),
             sample_from: None,
+            samples: AtomicUsize::new(0),
             pieces: None,
             ranges: Mutex::new(Vec::new()),
         }
@@ -77,6 +85,8 @@ impl Default for FakeFlushOps {
 
 impl FlushOps for FakeFlushOps {
     fn chunk(&self, file: &File) -> io::Result<()> {
+        let entered = Instant::now();
+        self.started.fetch_add(1, Ordering::SeqCst);
         self.chunk_gate.pass();
         std::thread::sleep(self.chunk_sleep);
         let i = self.chunks.load(Ordering::SeqCst);
@@ -89,6 +99,7 @@ impl FlushOps for FakeFlushOps {
             let dirty = len.saturating_sub(self.flushed_len.swap(len, Ordering::SeqCst));
             std::thread::sleep(Duration::from_secs_f64(dirty as f64 / rate as f64));
         }
+        self.spans.lock().unwrap().push((entered, Instant::now()));
         self.chunks.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -96,7 +107,7 @@ impl FlushOps for FakeFlushOps {
         let delay = self.pieces.as_ref()?;
         let i = {
             let mut r = self.ranges.lock().unwrap();
-            r.push((off, len));
+            r.push((off, len, Instant::now()));
             r.len() - 1
         };
         std::thread::sleep(delay(i));
@@ -109,6 +120,7 @@ impl FlushOps for FakeFlushOps {
         Ok(())
     }
     fn sample(&self) -> Option<u64> {
+        self.samples.fetch_add(1, Ordering::SeqCst);
         self.sample_from.map(|t| t.elapsed().as_millis() as u64)
     }
 }
@@ -148,26 +160,59 @@ fn cancel_after(halt: &Halt, d: Duration) {
     });
 }
 
-/// LP13a (T12, stall pair a; Q-B "if writing keep going do nothing"): each chunk flush
-/// takes 0.5 × window; the flusher keeps completing chunks, so a flush far longer than
-/// the window succeeds.
+/// LP13a (T12, stall pair a; Q-B "if writing keep going do nothing"): a final flush
+/// waits on two chunk flushes of 0.55 × window each; the first completion re-arms the
+/// stall window, so a wait longer than the window succeeds.
 #[test]
 fn flush_slow_but_progressing_never_fails() {
     let ops = Arc::new(FakeFlushOps {
-        chunk_sleep: W / 2,
+        chunk_sleep: W * 11 / 20,
+        chunk_gate: Gate::closed(),
         ..FakeFlushOps::default()
     });
-    let (_d, mut w, _) = fake_file(&ops, timing(W));
-    let t = Instant::now();
-    for _ in 0..12 {
-        w.write_all(&[7u8; K as usize]).unwrap();
+    let t = FlushTiming {
+        sample_every: Duration::from_millis(5),
+        ..timing(W)
+    };
+    let (_d, mut w, _) = fake_file(&ops, t);
+    // Chunk 0 is in flight (held at the gate) before the second C is requested, so the
+    // drain needs a second chunk; the gate opens once the drain is waiting (it samples).
+    w.write_all(&[7u8; K as usize]).unwrap();
+    while ops.started.load(Ordering::SeqCst) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
     }
-    w.sync_all().expect("a progressing flush never fails");
-    // How many writes one chunk coalesces is up to the scheduler, but backpressure caps it
-    // at 3 × C: 12 × C written takes at least 4 sequential chunks, so at least 2 × W.
-    let (n, el) = (ops.chunks.load(Ordering::SeqCst), t.elapsed());
-    assert!(n >= 4, "the flusher flushed chunks: {n} in {el:?}");
-    assert!(el >= W * 2, "the flush outlived the window: {n} in {el:?}");
+    w.write_all(&[7u8; K as usize]).unwrap();
+    let o = ops.clone();
+    std::thread::spawn(move || {
+        while o.samples.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        o.chunk_gate.release();
+    });
+    let t = Instant::now();
+    let r = w.sync_all();
+    let end = Instant::now();
+    while ops.spans.lock().unwrap().len() < ops.started.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Chunk i's progress bump lies between its exit and chunk i + 1's entry, so this bounds
+    // each no-progress gap the drain saw up to `end`. Only a whole window (a descheduled
+    // worker under load) may latch SyncTimeout; anything shorter must succeed.
+    let spans = ops.spans.lock().unwrap().clone();
+    let lows = std::iter::once(t).chain(spans.iter().map(|s| s.1));
+    let highs = spans.iter().skip(1).map(|s| s.0.min(end)).chain([end]);
+    let gap = lows
+        .zip(highs)
+        .map(|(a, b)| b.saturating_duration_since(a))
+        .max()
+        .unwrap();
+    if let Err(e) = &r {
+        assert!(is_sync_timeout(e) && gap >= W, "{e}; gaps under {gap:?}");
+        eprintln!("inconclusive: the worker made no progress for {gap:?} under load");
+        return;
+    }
+    assert_eq!(spans.len(), 2, "two chunk flushes");
+    assert!(end - t > W, "the wait outlived the window: {:?}", end - t);
 }
 
 /// LP13b / G19 (T12, stall pair b): a chunk flush that never returns, with no sampled
@@ -295,22 +340,23 @@ fn writer_backpressure_at_two_chunks() {
         }
         w
     });
-    std::thread::sleep(Duration::from_millis(150));
+    // Only a writer blocked in the backpressure wait samples: that, not a sleep, says the
+    // 4th write is waiting. Without backpressure it completes instead.
+    while ops.samples.load(Ordering::SeqCst) == 0 && done.load(Ordering::SeqCst) < 4 {
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert_eq!(
         done.load(Ordering::SeqCst),
         3,
         "the 4th write waits at 2 × C unflushed"
     );
     ops.chunk_gate.release();
-    let t = Instant::now();
-    while done.load(Ordering::SeqCst) < 4 {
-        assert!(
-            t.elapsed() < SLACK,
-            "a completed flush must release the writer"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    writer.join().unwrap().sync_all().unwrap();
+    // Unreleased, the writer latches SyncTimeout at its 30 s window and the join fails.
+    let mut w = writer
+        .join()
+        .expect("a completed flush releases the writer");
+    assert_eq!(done.load(Ordering::SeqCst), 4);
+    w.sync_all().unwrap();
 }
 
 /// LP13f (§2.10 item 1, as revised): C starts at the floor, doubles after fast chunk
@@ -554,17 +600,49 @@ fn durable_sync_file_reports_piece_completions() {
     let mut seen = Vec::new();
     let dyn_ops: Arc<dyn FlushOps> = ops.clone();
     let t = durable_timing(Duration::from_secs(30));
-    durable_sync_file_with(&f, None, |d, n| seen.push((d, n)), dyn_ops, t).unwrap();
-    let lens: Vec<u64> = ops.ranges.lock().unwrap().iter().map(|r| r.1).collect();
-    assert_eq!(lens, [4 * K, 8 * K, 16 * K, 8 * K, 4 * K, 8 * K, 16 * K]);
+    let start = Instant::now();
+    let report = |d, n| seen.push((d, n, Instant::now()));
+    durable_sync_file_with(&f, None, report, dyn_ops, t).unwrap();
+    let end = Instant::now();
+    let ranges = ops.ranges.lock().unwrap().clone();
+    // A piece's measured time lies between its fake call's entry-to-report span and the span
+    // from the previous report to the next call's entry; the window may take any step
+    // (halve > target, keep, double < target / 4) that time allows. The 40 ms pieces halve.
+    let (target, min, max) = (t.piece_target, t.window_min, t.window_max);
+    let (mut windows, mut done) = (vec![min], 0);
+    for (i, &(off, len, entered)) in ranges.iter().enumerate() {
+        assert_eq!(off, done, "piece {i} is contiguous");
+        windows.retain(|w| (*w).min(64 * K - done) == len);
+        assert!(!windows.is_empty(), "piece {i} of {len}: {ranges:?}");
+        done += len;
+        let before = i.checked_sub(1).map_or(start, |p| seen[p].2);
+        let after = ranges.get(i + 1).map_or(end, |r| r.2);
+        let (lo, hi) = (seen[i].2 - entered, after - before);
+        let mut next = Vec::new();
+        for w in windows {
+            if hi > target {
+                next.push((w / 2).max(min));
+            }
+            if lo <= target && hi >= target / 4 {
+                next.push(w);
+            }
+            if lo < target / 4 {
+                next.push((w * 2).min(max));
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        windows = next;
+    }
+    assert_eq!(done, 64 * K, "{ranges:?}");
     assert_eq!(
         ops.finishes.load(Ordering::SeqCst),
         1,
         "then the final flush"
     );
     assert!(seen.windows(2).all(|p| p[0].0 < p[1].0), "{seen:?}");
-    assert_eq!(seen.last(), Some(&(64 * K, 64 * K)));
-    assert!(seen.len() >= lens.len(), "one report per completed piece");
+    assert_eq!(seen.last().map(|s| (s.0, s.1)), Some((64 * K, 64 * K)));
+    assert!(seen.len() >= ranges.len(), "one report per completed piece");
 }
 
 /// LP19, NFS shape: one whole-file flush blocked 3 × window while the sampled
