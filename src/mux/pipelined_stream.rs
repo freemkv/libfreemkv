@@ -47,6 +47,7 @@ pub struct PipelinedPesStream {
     /// Packets of MPEG-2 audio extension streams (`0xD0|n`) with no declared extension track,
     /// reported once at EOF (see `ps::warn_undeclared_extensions`).
     mpeg_extension_packets: [u64; 8],
+    dropped_ps: super::ps::DroppedPs,
     /// Per-track (by stream index) B1 drop-to-keyframe gate. After a TS gap on a
     /// video track, drop inter-coded frames until the next IRAP so the muxed
     /// stream stays decode-clean across an upstream concealed loss (P3/B1).
@@ -129,6 +130,7 @@ impl PipelinedPesStream {
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
+            dropped_ps: Default::default(),
             resync,
             is_video,
             au_asm,
@@ -274,14 +276,8 @@ impl PipelinedPesStream {
                     // Expected DVD navigation packet (PCI/DSI) — tally, no WARN.
                     self.dropped_nav_packets += 1;
                 } else {
-                    // Unexpected unmappable stream_id — a possibly-dropped real
-                    // stream. Keep the individual WARN: its repetition is signal.
-                    tracing::warn!(
-                        target: "mux",
-                        "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                        ps.stream_id,
-                        ps.sub_stream_id,
-                    );
+                    // Unexpected unmappable stream_id: warned once, then counted.
+                    self.dropped_ps.drop_packet(&ps, None);
                 }
                 continue;
             };
@@ -292,13 +288,7 @@ impl PipelinedPesStream {
                     self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
                     continue;
                 }
-                tracing::warn!(
-                    target: "mux",
-                    "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
-                    pid,
-                    ps.stream_id,
-                    ps.sub_stream_id,
-                );
+                self.dropped_ps.drop_packet(&ps, Some(pid));
                 continue;
             };
             // Carry the PS demuxer's byte-exact source stamp through to the codec parser
@@ -376,6 +366,7 @@ impl PipelinedPesStream {
                         );
                     }
                     super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
+                    self.dropped_ps.report();
                     // Drain any AU a parser buffered past the last PES (DTS-HD tail, MPEG-2
                     // final GOP), routing through the SAME B1 gate — flush frames carry their
                     // own `discontinuity`, so a trailing dangling-ref frame must not bypass it.
@@ -1052,6 +1043,40 @@ mod tests {
         let f = stream.read().unwrap().expect("routed MP2 frame");
         assert_eq!((f.track, f.data), (2, vec![0x56]));
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
+    }
+
+    // PS packets with no track (a deselected / undeclared stream, or no DVD PID) warn
+    // once per stream id, not once per packet; the per-id tally goes out at EOF.
+    #[test]
+    fn dropped_ps_packets_warn_once_per_stream() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+        let pkt = |stream_id, sub_stream_id| PsPacket {
+            source: None,
+            stream_id,
+            sub_stream_id,
+            pts: None,
+            dts: None,
+            data: vec![0x0B, 0x77],
+        };
+        let mut batch = Vec::new();
+        for _ in 0..40 {
+            batch.push(pkt(0xBD, Some(0x81))); // unmapped PID 0xBD81
+            batch.push(pkt(0xBD, Some(0x82))); // unmapped PID 0xBD82
+            batch.push(pkt(0xC8, None)); // no DVD PID
+        }
+        tx.send(DemuxBatch::Ps(batch)).unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let (_, ev) = crate::testlog::capture(|| while stream.read().unwrap().is_some() {});
+        let warns = ev
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .count();
+        assert_eq!(warns, 3, "one WARN per dropped stream id, got {warns}");
+        let tally = ev
+            .iter()
+            .filter(|e| e.message().contains("packets=40"))
+            .count();
+        assert_eq!(tally, 3, "each stream's drop count is reported at EOF");
     }
 
     // Design §2.3 "Reader side (L3)" (MPG2-7): one AUD per field splits a PAFF field pair

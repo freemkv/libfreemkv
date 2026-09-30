@@ -160,6 +160,7 @@ pub struct DiscStream {
     /// Packets of MPEG-2 audio extension streams (`0xD0|n`) with no declared extension track,
     /// reported once at EOF (see `ps::warn_undeclared_extensions`).
     mpeg_extension_packets: [u64; 8],
+    dropped_ps: super::ps::DroppedPs,
 
     // Cumulative bytes successfully read from the source. Drives
     // EventKind::BytesRead emission and autorip's per-device progress.
@@ -329,6 +330,7 @@ impl DiscStream {
             eof: false,
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
+            dropped_ps: Default::default(),
             bytes_read_total: 0,
             bytes_total_extents,
             ts_demuxer,
@@ -771,12 +773,7 @@ impl DiscStream {
             if ps.is_nav() {
                 self.dropped_nav_packets += 1;
             } else {
-                tracing::warn!(
-                    target: "mux",
-                    "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                    ps.stream_id,
-                    ps.sub_stream_id,
-                );
+                self.dropped_ps.drop_packet(&ps, None);
             }
             return;
         };
@@ -786,13 +783,7 @@ impl DiscStream {
                 self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
                 return;
             }
-            tracing::warn!(
-                target: "mux",
-                "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
-                pid,
-                ps.stream_id,
-                ps.sub_stream_id,
-            );
+            self.dropped_ps.drop_packet(&ps, Some(pid));
             return;
         };
         let (pts, dts, src) = (
@@ -893,6 +884,7 @@ impl DiscStream {
                     self.route_ps_packet(ps);
                 }
                 super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
+                self.dropped_ps.report();
                 // Drain any access unit a codec parser buffered past the last
                 // PES (DTS-HD's final core+extension unit, assembled across
                 // PES boundaries).
@@ -3125,6 +3117,42 @@ mod tests {
             // Reported once, with the count, after the whole read (not per packet).
             assert_eq!(warns.len(), 1, "{warns:?}");
             assert!(warns[0].contains("stream_id=0xd2 packets=3"), "{warns:?}");
+        }
+
+        /// Packets of an undeclared (or deselected) PS stream warn once, not per packet.
+        #[test]
+        fn ps_stream_warns_once_per_dropped_stream() {
+            use crate::pes::Stream;
+
+            let mut sector = ps_pack_header();
+            for _ in 0..30 {
+                // private_stream_1, no PTS, sub-stream 0x81 (AC-3 #2): no track declared.
+                sector.extend_from_slice(&[0x00, 0x00, 0x01, 0xBD, 0x00, 0x07, 0x81, 0x00, 0x00]);
+                sector.extend_from_slice(&[0x81, 0x01, 0x00, 0x01]);
+            }
+            sector.extend_from_slice(&ps_video_pes(&ps_gop_es(), 0));
+            sector.resize(2048, 0xFF);
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(sector)),
+                mpeg2_video_title(1),
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap();
+            let ((), ev) = crate::testlog::capture(|| while s.read().unwrap().is_some() {});
+            let warns: Vec<&str> = ev
+                .iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .map(|e| e.message())
+                .collect();
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert!(
+                ev.iter().any(|e| e.message().contains("packets=30")),
+                "the drop count is reported at EOF"
+            );
         }
 
         /// A PS video stream of `codec` whose AUs span two PES fragments must reach EOF
