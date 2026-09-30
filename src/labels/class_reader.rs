@@ -8,11 +8,6 @@
 //! No external deps beyond `std`. No `unsafe`. No panics on malformed input — every parse fault
 //! is a typed [`Error`].
 
-// Foundation module — public API is staged for `labels::deluxe` (bytecode
-// walker) and `labels::dbp`'s refactor onto the constant-pool iterator.
-// The dead-code allow comes off once those callers land.
-#![allow(dead_code)]
-
 const CLASS_MAGIC: u32 = 0xCAFEBABE;
 
 // ---------------------------------------------------------------------------
@@ -20,6 +15,10 @@ const CLASS_MAGIC: u32 = 0xCAFEBABE;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "payloads are fault detail for Debug; callers match the variant"
+)]
 pub enum Error {
     UnexpectedEof { needed: &'static str },
     BadMagic(u32),
@@ -42,6 +41,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+#[expect(
+    dead_code,
+    reason = "every JVMS 4.4 tag is decoded; label parsers read only some payloads"
+)]
 pub enum CpInfo {
     /// Index 0 is unused per spec; the slot after Long/Double is also unused.
     Empty,
@@ -130,6 +133,7 @@ impl ConstantPool {
         }
     }
 
+    #[cfg(test)]
     /// Resolve a `CONSTANT_String` entry to its underlying UTF-8.
     pub fn string(&self, index: u16) -> Option<&str> {
         match self.get(index)? {
@@ -138,6 +142,7 @@ impl ConstantPool {
         }
     }
 
+    #[cfg(test)]
     pub fn integer(&self, index: u16) -> Option<i32> {
         match self.get(index)? {
             CpInfo::Integer(v) => Some(*v),
@@ -145,6 +150,7 @@ impl ConstantPool {
         }
     }
 
+    #[cfg(test)]
     /// For `ldc` / `ldc_w` operands: resolve a constant-pool index to a
     /// best-effort string. Supports Utf8, String, Integer, Float, Long,
     /// Double, and Class.
@@ -198,12 +204,12 @@ impl ConstantPool {
         })
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -224,6 +230,10 @@ pub struct MemberRef<'a> {
 // ClassFile + Member + Attribute
 // ---------------------------------------------------------------------------
 
+#[expect(
+    dead_code,
+    reason = "parsed in full per JVMS 4.1; label parsers read the pool and methods"
+)]
 pub struct ClassFile {
     pub minor_version: u16,
     pub major_version: u16,
@@ -237,6 +247,7 @@ pub struct ClassFile {
     pub attributes: Vec<Attribute>,
 }
 
+#[expect(dead_code, reason = "parsed in full per JVMS 4.5/4.6")]
 pub struct Member {
     pub access_flags: u16,
     pub name_index: u16,
@@ -288,6 +299,7 @@ impl ClassFile {
         self.constant_pool.class_name(self.this_class)
     }
 
+    #[cfg(test)]
     pub fn super_class_name(&self) -> Option<&str> {
         self.constant_pool.class_name(self.super_class)
     }
@@ -297,6 +309,7 @@ impl ClassFile {
         self.constant_pool.utf8(m.name_index)
     }
 
+    #[cfg(test)]
     pub fn member_descriptor<'a>(&'a self, m: &Member) -> Option<&'a str> {
         self.constant_pool.utf8(m.descriptor_index)
     }
@@ -317,6 +330,10 @@ impl Member {
 
 pub struct CodeAttribute<'a> {
     pub max_stack: u16,
+    #[expect(
+        dead_code,
+        reason = "parsed per JVMS 4.7.3; the decoder tracks only the stack"
+    )]
     pub max_locals: u16,
     pub code: &'a [u8],
 }
@@ -437,8 +454,7 @@ fn read_constant_pool(r: &mut Reader<'_>) -> Result<ConstantPool> {
 }
 
 // Decode JVM "modified UTF-8" (JVMS §4.4.7): like UTF-8 but U+0000 is 0xC0 0x80, and
-// supplementary chars use a 3-byte-surrogate-pair encoding we don't bother handling — no label
-// string needs it.
+// supplementary chars are two 3-byte surrogate halves, combined here into one char.
 fn decode_modified_utf8(bytes: &[u8]) -> std::result::Result<String, ()> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
@@ -480,14 +496,20 @@ fn decode_modified_utf8(bytes: &[u8]) -> std::result::Result<String, ()> {
             }
             let cp =
                 (((b0 & 0x0F) as u32) << 12) | (((b1 & 0x3F) as u32) << 6) | ((b2 & 0x3F) as u32);
-            // Lone surrogates are valid in modified UTF-8 but invalid
-            // chars in Rust. For label data we'd never see one; treat
-            // as replacement char rather than error to stay robust.
-            match char::from_u32(cp) {
-                Some(c) => out.push(c),
-                None => out.push('\u{FFFD}'),
-            }
             i += 3;
+            // A high surrogate followed by a low one is one supplementary char.
+            if (0xD800..0xDC00).contains(&cp)
+                && let [0xED, b1 @ 0xB0..=0xBF, b2 @ 0x80..=0xBF, ..] = &bytes[i..]
+            {
+                let low = 0xD000 | (((b1 & 0x3F) as u32) << 6) | ((b2 & 0x3F) as u32);
+                if let Some(c) = char::from_u32(0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)) {
+                    out.push(c);
+                    i += 3;
+                    continue;
+                }
+            }
+            // A lone surrogate is invalid in Rust: replacement char, not an error.
+            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
         } else {
             // 4-byte or higher: not valid in modified UTF-8.
             return Err(());
@@ -547,7 +569,8 @@ pub struct Instruction<'a> {
 }
 
 impl Instruction<'_> {
-    /// Mnemonic for this opcode (e.g. "ldc", "invokespecial").
+    #[cfg(test)]
+    /// Mnemonic for the opcodes this reader models (e.g. "ldc"); "?" for others.
     pub fn name(&self) -> &'static str {
         opcode_name(self.opcode)
     }
@@ -683,7 +706,6 @@ fn instruction_size(code: &[u8], pc: usize) -> Option<usize> {
 }
 
 // Opcode table: named opcode constants for the ones we walk in the parser.
-#[allow(dead_code)]
 pub const NOP: u8 = 0x00;
 pub const ACONST_NULL: u8 = 0x01;
 pub const ICONST_M1: u8 = 0x02;
@@ -708,7 +730,14 @@ pub const LSTORE: u8 = 0x37;
 pub const FSTORE: u8 = 0x38;
 pub const DSTORE: u8 = 0x39;
 pub const ASTORE: u8 = 0x3A;
-pub const AASTORE: u8 = 0x53;
+pub const IASTORE: u8 = 0x4F;
+pub const SASTORE: u8 = 0x56;
+pub const DCONST_1: u8 = 0x0F;
+pub const POP: u8 = 0x57;
+pub const POP2: u8 = 0x58;
+pub const DUP: u8 = 0x59;
+pub const GOTO: u8 = 0xA7;
+pub const RETURN: u8 = 0xB1;
 pub const IINC: u8 = 0x84;
 pub const RET: u8 = 0xA9;
 pub const TABLESWITCH: u8 = 0xAA;
@@ -729,6 +758,52 @@ pub const CHECKCAST: u8 = 0xC0;
 pub const INSTANCEOF: u8 = 0xC1;
 pub const WIDE: u8 = 0xC4;
 pub const MULTIANEWARRAY: u8 = 0xC5;
+pub const LCONST_0: u8 = 0x09;
+pub const LCONST_1: u8 = 0x0A;
+pub const DCONST_0: u8 = 0x0E;
+pub const LLOAD_0: u8 = 0x1E;
+pub const LLOAD_3: u8 = 0x21;
+pub const DLOAD_0: u8 = 0x26;
+pub const DLOAD_3: u8 = 0x29;
+pub const ALOAD_3: u8 = 0x2D;
+pub const IALOAD: u8 = 0x2E;
+pub const LALOAD: u8 = 0x2F;
+pub const DALOAD: u8 = 0x31;
+pub const SALOAD: u8 = 0x35;
+pub const ASTORE_3: u8 = 0x4E;
+pub const DUP_X1: u8 = 0x5A;
+pub const DUP_X2: u8 = 0x5B;
+pub const DUP2: u8 = 0x5C;
+pub const DUP2_X1: u8 = 0x5D;
+pub const DUP2_X2: u8 = 0x5E;
+pub const SWAP: u8 = 0x5F;
+pub const IADD: u8 = 0x60;
+pub const DREM: u8 = 0x73;
+pub const INEG: u8 = 0x74;
+pub const DNEG: u8 = 0x77;
+pub const ISHL: u8 = 0x78;
+pub const LXOR: u8 = 0x83;
+pub const I2L: u8 = 0x85;
+pub const I2D: u8 = 0x87;
+pub const L2D: u8 = 0x8A;
+pub const F2L: u8 = 0x8C;
+pub const F2D: u8 = 0x8D;
+pub const D2L: u8 = 0x8F;
+pub const I2S: u8 = 0x93;
+pub const LCMP: u8 = 0x94;
+pub const DCMPG: u8 = 0x98;
+pub const IFEQ: u8 = 0x99;
+pub const IFLE: u8 = 0x9E;
+pub const IF_ICMPEQ: u8 = 0x9F;
+pub const IF_ACMPNE: u8 = 0xA6;
+pub const IRETURN: u8 = 0xAC;
+pub const ARRAYLENGTH: u8 = 0xBE;
+pub const ATHROW: u8 = 0xBF;
+pub const MONITORENTER: u8 = 0xC2;
+pub const MONITOREXIT: u8 = 0xC3;
+pub const IFNULL: u8 = 0xC6;
+pub const IFNONNULL: u8 = 0xC7;
+pub const GOTO_W: u8 = 0xC8;
 
 /// Fixed instruction sizes (opcode + operand bytes). `None` means the
 /// opcode is either variable-length (see `instruction_size`) or
@@ -827,6 +902,7 @@ const FIXED_SIZE: [Option<u8>; 256] = {
     t
 };
 
+#[cfg(test)]
 fn opcode_name(op: u8) -> &'static str {
     match op {
         0x00 => "nop",
@@ -992,6 +1068,8 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
+    const AASTORE: u8 = 0x53;
+
     // Reader::slice takes an attacker-supplied length (JVMS u4/u2 field);
     // pos + len must not overflow/wrap past the bounds check and panic —
     // untrusted disc input must yield an EOF error, not a panic.
@@ -1053,6 +1131,18 @@ mod tests {
     #[test]
     fn modified_utf8_rejects_raw_zero() {
         assert!(decode_modified_utf8(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn modified_utf8_combines_surrogate_pair() {
+        // U+1F600 = D83D DE00, each half as a 3-byte sequence.
+        let s = decode_modified_utf8(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]).unwrap();
+        assert_eq!(s, "\u{1F600}");
+        // A lone high surrogate still degrades to U+FFFD.
+        assert_eq!(
+            decode_modified_utf8(&[0xED, 0xA0, 0xBD]).unwrap(),
+            "\u{FFFD}"
+        );
     }
 
     #[test]

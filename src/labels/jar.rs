@@ -17,8 +17,12 @@ use zip::ZipArchive;
 // so the buffer grows incrementally instead of pre-sizing.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Cap on total bytes one label parse inflates, shared by every sweep over every jar: the
+/// per-entry cap alone lets hostile high-ratio entries drive unbounded inflation.
+pub(crate) const PARSE_INFLATE_BUDGET: u64 = 128 * 1024 * 1024;
+
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
-/// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class`],
+/// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class_budgeted`],
 /// etc.
 pub type Jar = ZipArchive<Cursor<Vec<u8>>>;
 
@@ -52,7 +56,7 @@ where
 }
 
 fn is_jar(e: &crate::udf::DirEntry) -> bool {
-    !e.is_dir && e.name.to_lowercase().ends_with(".jar")
+    !e.is_dir && e.name.to_ascii_lowercase().ends_with(".jar")
 }
 
 /// A seekable byte source for a jar: in memory, or read from disc on demand.
@@ -317,41 +321,54 @@ impl Seek for ExtentReader<'_> {
 /// Used by parsers as a cheap "is this MY framework's jar?" check
 /// (e.g. `has_path_prefix(archive, "com/dbp/")` for dbp,
 /// `has_path_prefix(archive, "com/bydeluxe/")` for Deluxe).
-pub fn has_path_prefix(archive: &Jar, prefix: &str) -> bool {
+pub fn has_path_prefix<Z: Read + Seek>(archive: &ZipArchive<Z>, prefix: &str) -> bool {
     archive.file_names().any(|n| n.starts_with(prefix))
 }
 
-/// Iterate every `.class` entry in the jar, parse it with
-/// [`class_reader`](super::class_reader), and call `f` with `(entry_name, &ClassFile)`.
-///
-/// Entries that fail to read or parse are silently skipped — this is
-/// label-extraction code, robustness matters more than completeness.
-/// Callers that need to know which classes failed should use the
-/// lower-level [`class_reader`](super::class_reader) API directly.
-pub fn for_each_class<F>(archive: &mut Jar, mut f: F)
-where
-    F: FnMut(&str, &ClassFile),
-{
-    // Defer to try_each_class; the callback always yields None so
-    // iteration never short-circuits.
-    try_each_class(archive, |name, class| {
-        f(name, class);
-        None::<()>
-    });
+// Jars up to this size are read whole by `any_jar_has_prefix` (one chunk); larger ones
+// are opened in place so only the tail and central directory are read.
+const DETECT_IN_MEMORY_JAR_BYTES: u64 = CHUNK_SECTORS * 2048;
+
+/// True if any top-level `/BDMV/JAR/*.jar` has a central-directory entry starting
+/// with `prefix`: a framework detector that never reads entry data.
+pub fn any_jar_has_prefix(reader: &mut dyn SectorSource, udf: &UdfFs, prefix: &str) -> bool {
+    // A jar the in-place open cannot handle (unrecorded extent, ZIP64, odd tail) still
+    // detects through the whole-file read `for_each_jar` uses.
+    let mut unopened: Vec<String> = Vec::new();
+    let hit = visit_jars_limited(
+        reader,
+        udf,
+        DETECT_IN_MEMORY_JAR_BYTES,
+        |name, jar| match jar {
+            Some(j) => has_path_prefix(j, prefix).then_some(()),
+            None => {
+                unopened.push(name.to_string());
+                None
+            }
+        },
+    );
+    if hit.is_some() {
+        return true;
+    }
+    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
+        return false;
+    };
+    jar_dir
+        .entries
+        .iter()
+        .filter(|e| e.size <= IN_MEMORY_JAR_BYTES && unopened.contains(&e.name))
+        .any(|e| {
+            udf.read_file(reader, &format!("/BDMV/JAR/{}", e.name))
+                .ok()
+                .and_then(|b| ZipArchive::new(Cursor::new(b)).ok())
+                .is_some_and(|z| has_path_prefix(&z, prefix))
+        })
 }
 
-/// Like [`for_each_class`] but allows the callback to short-circuit
-/// iteration. Returns the first `Some(R)` the callback produces.
-pub fn try_each_class<R, F>(archive: &mut Jar, f: F) -> Option<R>
-where
-    F: FnMut(&str, &ClassFile) -> Option<R>,
-{
-    let mut unbounded = u64::MAX;
-    try_each_class_budgeted(archive, &mut unbounded, f)
-}
-
-/// [`try_each_class`] charging every inflated byte to `budget`; stops (None)
-/// once it is spent, so a caller sweeping many jars bounds total inflation.
+/// Iterate every `.class` entry, parse it with [`class_reader`](super::class_reader)
+/// and call `f` until it returns `Some`. Entries that fail to read or parse are
+/// skipped. Every inflated byte is charged to `budget`; the walk stops once it is
+/// spent, so a caller sweeping many jars bounds total inflation.
 pub fn try_each_class_budgeted<Z: Read + Seek, R, F>(
     archive: &mut ZipArchive<Z>,
     budget: &mut u64,
@@ -364,6 +381,20 @@ where
     try_each_entry(archive, is_class, MAX_CLASS_BYTES, budget, |name, bytes| {
         f(name, &ClassFile::parse(bytes).ok()?)
     })
+}
+
+/// [`try_each_class_budgeted`] visiting every class (no short-circuit).
+pub fn for_each_class_budgeted<Z: Read + Seek, F>(
+    archive: &mut ZipArchive<Z>,
+    budget: &mut u64,
+    mut f: F,
+) where
+    F: FnMut(&str, &ClassFile),
+{
+    let _: Option<()> = try_each_class_budgeted(archive, budget, |name, class| {
+        f(name, class);
+        None
+    });
 }
 
 /// Iterate the NON-`.class`, non-directory entries whose name satisfies `want`
@@ -388,9 +419,9 @@ where
     try_each_entry(archive, is_resource, cap, budget, f)
 }
 
-// Shared entry loop: filter by central-directory name, then inflate at most `cap`
-// bytes into a growing buffer (the declared size is untrusted). An entry the budget
-// cannot cover is not offered and stops the walk; one that exactly fits is complete.
+// Filter by central-directory name, then inflate at most `cap` bytes (declared size is
+// untrusted). An entry the budget cannot cover is not offered and stops the walk (logged
+// once, by the walk that ran it out); one that exactly fits is complete.
 fn try_each_entry<Z: Read + Seek, R>(
     archive: &mut ZipArchive<Z>,
     want: impl Fn(&str) -> bool,
@@ -398,13 +429,20 @@ fn try_each_entry<Z: Read + Seek, R>(
     budget: &mut u64,
     mut f: impl FnMut(&str, &[u8]) -> Option<R>,
 ) -> Option<R> {
-    for i in 0..archive.len() {
-        if *budget == 0 {
-            return None;
+    let had_budget = *budget > 0;
+    let spent = |i: usize| {
+        if had_budget {
+            tracing::warn!(entry = i, "jar: inflate budget exhausted, sweep truncated");
         }
+    };
+    for i in 0..archive.len() {
         match archive.name_for_index(i) {
             Some(n) if want(n) => {}
             _ => continue,
+        }
+        if *budget == 0 {
+            spent(i);
+            return None;
         }
         let Ok(entry) = archive.by_index(i) else {
             continue;
@@ -416,6 +454,7 @@ fn try_each_entry<Z: Read + Seek, R>(
             .read_to_end(&mut bytes);
         if bytes.len() as u64 > *budget {
             *budget = 0;
+            spent(i);
             return None;
         }
         *budget -= bytes.len() as u64;
@@ -432,6 +471,11 @@ fn try_each_entry<Z: Read + Seek, R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A budget no test fixture can exhaust.
+    fn unbounded() -> u64 {
+        u64::MAX
+    }
 
     /// Smallest constant-pool-empty `.class`: magic, versions, cp_count=1
     /// (zero real entries), then empty access/this/super/interfaces/
@@ -547,7 +591,7 @@ mod tests {
             MINIMAL_CLASS.len() as u32,
         ));
         let mut seen = Vec::new();
-        let r: Option<()> = try_each_class(&mut jar, |name, _class| {
+        let r: Option<()> = try_each_class_budgeted(&mut jar, &mut unbounded(), |name, _class| {
             seen.push(name.to_string());
             None
         });
@@ -563,7 +607,7 @@ mod tests {
             MINIMAL_CLASS.len() as u32,
         ));
         let mut count = 0usize;
-        for_each_class(&mut jar, |_, _| count += 1);
+        for_each_class_budgeted(&mut jar, &mut unbounded(), |_, _| count += 1);
         assert_eq!(count, 1);
     }
 
@@ -574,7 +618,7 @@ mod tests {
     fn forged_huge_uncompressed_size_does_not_preallocate() {
         let mut jar = open(build_stored_zip("Evil.class", MINIMAL_CLASS, 0xFFFF_FFFF));
         let mut parsed = false;
-        for_each_class(&mut jar, |name, _class| {
+        for_each_class_budgeted(&mut jar, &mut unbounded(), |name, _class| {
             assert_eq!(name, "Evil.class");
             parsed = true;
         });
@@ -596,7 +640,7 @@ mod tests {
             0xFFFF_FFFF,
         ));
         let mut visited = 0usize;
-        for_each_class(&mut jar, |_, _| visited += 1);
+        for_each_class_budgeted(&mut jar, &mut unbounded(), |_, _| visited += 1);
         assert_eq!(visited, 1);
     }
 
@@ -694,5 +738,162 @@ mod tests {
         });
         assert_eq!(visited, 2);
         assert_eq!(budget, 1_000_000 - payload.len() as u64);
+    }
+
+    // Counts sectors read through it.
+    struct Counting<'a>(&'a mut crate::udf::fixture::MemDisc, u64);
+
+    impl SectorSource for Counting<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.1 += u64::from(count);
+            self.0.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // Framework detection answers from each jar's central directory: a large jar's
+    // entry data is never read.
+    #[test]
+    fn framework_detect_reads_only_the_central_directory() {
+        use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("assets/bg.png", opts).expect("start_file");
+            w.write_all(&vec![0x5Au8; 1024 * 1024]).expect("write");
+            for n in [
+                "com/bydeluxe/A.class",
+                "com/dbp/B.class",
+                "com/foxbd/C.class",
+            ] {
+                w.start_file(n, opts).expect("start_file");
+                w.write_all(MINIMAL_CLASS).expect("write");
+            }
+            w.finish().expect("finish");
+        }
+        let dir = |name: &str, icb, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs,
+        };
+        let jar_dir = dir(
+            "JAR",
+            30,
+            vec![file_with("00000.jar", 32, 4000, buf, true)],
+            vec![],
+        );
+        let root = dir("", 10, vec![], vec![dir("BDMV", 20, vec![], vec![jar_dir])]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let detects: [fn(&mut dyn SectorSource, &UdfFs) -> bool; 3] = [
+            super::super::deluxe::detect,
+            super::super::dbp::detect,
+            super::super::fox::detect,
+        ];
+        for detect in detects {
+            let mut counting = Counting(&mut disc, 0);
+            assert!(detect(&mut counting, &udf));
+            assert!(
+                counting.1 < 128,
+                "read {} sectors of a 512-sector jar",
+                counting.1
+            );
+        }
+    }
+
+    // A large jar whose tail the in-place check rejects (EOCD comment length overruns
+    // the file's ZIP64 sizes) but the zip reader opens still detects, as via `for_each_jar`.
+    #[test]
+    fn framework_detect_falls_back_when_in_place_open_fails() {
+        use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("assets/bg.png", opts).expect("start_file");
+            w.write_all(&vec![0x5Au8; 100 * 1024]).expect("write");
+            w.start_file("com/dbp/B.class", opts).expect("start_file");
+            w.write_all(MINIMAL_CLASS).expect("write");
+            w.finish().expect("finish");
+        }
+        // Rewrite the tail as ZIP64: real sizes move to a ZIP64 EOCD + locator.
+        let eocd = buf.len() - 22;
+        let le32 = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let (cd_size, cd_offset) = (le32(eocd + 12) as u64, le32(eocd + 16) as u64);
+        let entries = u16::from_le_bytes([buf[eocd + 10], buf[eocd + 11]]) as u64;
+        let mut z64 = Vec::new();
+        z64.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        z64.extend_from_slice(&44u64.to_le_bytes());
+        z64.extend_from_slice(&45u16.to_le_bytes());
+        z64.extend_from_slice(&45u16.to_le_bytes());
+        z64.extend_from_slice(&[0u8; 8]); // disk numbers
+        for v in [entries, entries, cd_size, cd_offset] {
+            z64.extend_from_slice(&v.to_le_bytes());
+        }
+        z64.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        z64.extend_from_slice(&0u32.to_le_bytes());
+        z64.extend_from_slice(&(eocd as u64).to_le_bytes());
+        z64.extend_from_slice(&1u32.to_le_bytes());
+        buf[eocd + 12..eocd + 20].fill(0xFF);
+        buf.splice(eocd..eocd, z64);
+        assert!(ZipArchive::new(Cursor::new(buf.clone())).is_ok());
+        let dir = |name: &str, icb, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs,
+        };
+        let jar_dir = dir(
+            "JAR",
+            30,
+            vec![file_with("00000.jar", 32, 4000, buf, true)],
+            vec![],
+        );
+        let root = dir("", 10, vec![], vec![dir("BDMV", 20, vec![], vec![jar_dir])]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert!(super::super::dbp::detect(&mut disc, &udf));
+    }
+
+    // High-ratio deflate entries (each under the per-entry cap) stop being offered
+    // past the per-parse cap.
+    #[test]
+    fn try_each_class_bounds_total_inflation() {
+        use std::io::Write as _;
+        let mut payload = MINIMAL_CLASS.to_vec();
+        payload.extend(std::iter::repeat_n(0u8, 50 * 1024 * 1024));
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for n in ["A.class", "B.class", "C.class"] {
+                w.start_file(n, opts).expect("start_file");
+                w.write_all(&payload).expect("write");
+            }
+            w.finish().expect("finish");
+        }
+        let mut jar = open(buf);
+        let mut visited = 0usize;
+        let mut budget = PARSE_INFLATE_BUDGET;
+        for_each_class_budgeted(&mut jar, &mut budget, |_, _| visited += 1);
+        assert_eq!(visited, 2, "3 x 50 MiB exceeds the 128 MiB inflate budget");
     }
 }

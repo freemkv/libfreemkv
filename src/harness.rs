@@ -214,7 +214,8 @@ fn jar_class_walk_never_panics() {
     // the zip open nor the class walk may panic. Magic: `PK\x03\x04`.
     sweep("jar", &[0x50, 0x4B, 0x03, 0x04], |b| {
         if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(b.to_vec())) {
-            crate::labels::jar::for_each_class(&mut archive, |_name, _class| {});
+            let mut budget = crate::labels::jar::PARSE_INFLATE_BUDGET;
+            crate::labels::jar::for_each_class_budgeted(&mut archive, &mut budget, |_, _| {});
         }
     });
 }

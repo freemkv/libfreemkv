@@ -26,21 +26,20 @@ use std::collections::BTreeMap;
 /// only dbp discs instead of firing on every BD-J disc. `parse()` repeats the
 /// check as belt-and-suspenders.
 pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
-    jar::for_each_jar(reader, udf, |_entry, archive| {
-        jar::has_path_prefix(archive, "com/dbp/").then_some(())
-    })
-    .is_some()
+    jar::any_jar_has_prefix(reader, udf, "com/dbp/")
 }
 
 /// Scan every top-level `/BDMV/JAR/*.jar` for the dbp framework and
 /// extract its stream labels. Returns `None` if no jar carries a
 /// `com/dbp/` package path or none yields any labels.
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
+    // One inflate budget for every jar this parse sweeps.
+    let mut budget = jar::PARSE_INFLATE_BUDGET;
     jar::for_each_jar(reader, udf, |_entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/dbp/") {
             return None;
         }
-        let labels = scan_jar(archive);
+        let labels = scan_jar(archive, &mut budget);
         if labels.is_empty() {
             None
         } else {
@@ -51,14 +50,14 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     })
 }
 
-fn scan_jar(archive: &mut jar::Jar) -> Vec<StreamLabel> {
+fn scan_jar(archive: &mut jar::Jar, budget: &mut u64) -> Vec<StreamLabel> {
     // BTreeMap keeps the last-written label per stream slot deterministic.
     // The same TextField,Audio1,... string can appear in multiple classes
     // (button-state variants, fallbacks); last write should agree, but wins defensively.
     let mut audios: BTreeMap<u16, String> = BTreeMap::new();
     let mut subs: BTreeMap<u16, String> = BTreeMap::new();
 
-    jar::for_each_class(archive, |_class_name, class| {
+    jar::for_each_class_budgeted(archive, budget, |_class_name, class| {
         for (_idx, cp) in class.constant_pool.iter() {
             if let CpInfo::Utf8(s) = cp {
                 collect_textfield(s, &mut audios, &mut subs);
@@ -115,7 +114,10 @@ fn collect_textfield(
         return;
     }
     if let Some(rest) = kind_n.strip_prefix("Audio") {
-        if let Ok(n) = rest.parse::<u16>() {
+        // Stream numbers are 1-based; 0 (NO_STN_SLOT) can never bind.
+        if let Ok(n) = rest.parse::<u16>()
+            && n > 0
+        {
             retain_label(audios, n, label);
         }
     } else if let Some(rest) = kind_n.strip_prefix("Subtitle")
@@ -152,6 +154,11 @@ fn make_label(num: u16, label: String, stream_type: StreamLabelType) -> StreamLa
 mod tests {
     use super::super::{LabelPurpose, LabelQualifier};
     use super::*;
+
+    // A budget no test fixture can exhaust.
+    fn unbounded() -> u64 {
+        u64::MAX
+    }
     use std::io::{Cursor, Write as _};
 
     // Minimal, structurally valid `.class` file (JVMS §4.1) with only the
@@ -196,7 +203,7 @@ mod tests {
         zip::ZipArchive::new(Cursor::new(buf)).expect("valid zip")
     }
 
-    // Wires for_each_class + collect_textfield + make_label into the real
+    // Wires the class sweep + collect_textfield + make_label into the real
     // per-jar scan (unit tests above only cover the pure pieces). Mutation
     // pin: catches scan_jar's body being replaced with `vec![]`.
     #[test]
@@ -209,7 +216,7 @@ mod tests {
         ]);
         let mut archive = build_jar(&[("com/dbp/Menu.class", class_bytes)]);
 
-        let labels = scan_jar(&mut archive);
+        let labels = scan_jar(&mut archive, &mut unbounded());
 
         assert_eq!(
             labels.len(),
@@ -231,6 +238,21 @@ mod tests {
         assert_eq!(sub.qualifier, LabelQualifier::Sdh);
     }
 
+    // One inflate budget covers every jar a parse sweeps: what the first jar
+    // spends is gone for the second.
+    #[test]
+    fn scan_jar_budget_is_shared_across_jars() {
+        let class = build_class(&["LTextField,Audio1,English,Fontstrip_Composite,296,763"]);
+        let len = class.len() as u64;
+        let mut first = build_jar(&[("com/dbp/A.class", class.clone())]);
+        let mut second = build_jar(&[("com/dbp/B.class", class)]);
+        let mut budget = len + len / 2;
+        assert_eq!(scan_jar(&mut first, &mut budget).len(), 1);
+        assert_eq!(budget, len / 2);
+        assert!(scan_jar(&mut second, &mut budget).is_empty());
+        assert_eq!(budget, 0);
+    }
+
     // Immunity pin: stream numbers come from the AudioN/SubtitleN token, not
     // iteration order, so gaps/skipped entries don't shift later labels.
     // Mutation: numbering by iteration order would rebind Audio4/Subtitle3.
@@ -248,7 +270,7 @@ mod tests {
         ]);
         let mut archive = build_jar(&[("com/dbp/Menu.class", class_bytes)]);
 
-        let labels = scan_jar(&mut archive);
+        let labels = scan_jar(&mut archive, &mut unbounded());
         let nums: Vec<(StreamLabelType, u16)> = labels
             .iter()
             .map(|l| (l.stream_type, l.stream_number))
@@ -464,5 +486,14 @@ mod tests {
         let l = make_label(1, "English RNIB".into(), StreamLabelType::Subtitle);
         assert_eq!(l.language, "eng");
         assert_eq!(l.qualifier, LabelQualifier::DescriptiveService);
+    }
+
+    #[test]
+    fn audio_zero_is_not_retained() {
+        let (mut a, mut s) = (BTreeMap::new(), BTreeMap::new());
+        collect_textfield("xTextField,Audio0,English,y", &mut a, &mut s);
+        assert!(a.is_empty(), "Audio0 is NO_STN_SLOT and can never bind");
+        collect_textfield("xTextField,Audio1,English,y", &mut a, &mut s);
+        assert_eq!(a.len(), 1);
     }
 }

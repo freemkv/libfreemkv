@@ -7,9 +7,16 @@
 //! matches each enum's `<clinit>` shape rather than class names.
 
 use super::class_reader::{
-    AASTORE, ANEWARRAY, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC,
-    ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, INVOKESPECIAL, LDC,
-    LDC_W, NEW, NEWARRAY, PUTSTATIC, SIPUSH,
+    ACONST_NULL, ALOAD, ALOAD_3, ANEWARRAY, ARRAYLENGTH, ASTORE, ASTORE_3, ATHROW, BIPUSH,
+    CHECKCAST, ClassFile, CodeAttribute, ConstantPool, CpInfo, D2L, DALOAD, DCMPG, DCONST_0,
+    DCONST_1, DLOAD, DLOAD_0, DLOAD_3, DNEG, DREM, DUP, DUP_X1, DUP_X2, DUP2, DUP2_X1, DUP2_X2,
+    F2D, F2L, FLOAD, GETFIELD, GETSTATIC, GOTO, GOTO_W, I2D, I2L, I2S, IADD, IALOAD, IASTORE,
+    ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, IF_ACMPNE, IF_ICMPEQ,
+    IFEQ, IFLE, IFNONNULL, IFNULL, IINC, ILOAD, INEG, INSTANCEOF, INVOKEINTERFACE, INVOKESPECIAL,
+    INVOKESTATIC, INVOKEVIRTUAL, IRETURN, ISHL, ISTORE, Instruction, L2D, LALOAD, LCMP, LCONST_0,
+    LCONST_1, LDC, LDC_W, LDC2_W, LLOAD, LLOAD_0, LLOAD_3, LOOKUPSWITCH, LXOR, MONITORENTER,
+    MONITOREXIT, MULTIANEWARRAY, NEW, NEWARRAY, NOP, POP, POP2, PUTFIELD, PUTSTATIC, RETURN,
+    SALOAD, SASTORE, SIPUSH, SWAP, TABLESWITCH, WIDE,
 };
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, jar, vocab};
 use crate::sector::SectorSource;
@@ -20,10 +27,7 @@ pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     // Real signal is `com/bydeluxe/` in a jar's central directory: a cheap
     // scan, no bytecode walk, so this parser claims only Deluxe discs.
     // `parse()` repeats the check.
-    jar::for_each_jar(reader, udf, |_entry, archive| {
-        jar::has_path_prefix(archive, "com/bydeluxe/").then_some(())
-    })
-    .is_some()
+    jar::any_jar_has_prefix(reader, udf, "com/bydeluxe/")
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
@@ -31,6 +35,8 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // studios, each shipping `/BDMV/JAR/<n>/config.xml` naming the studio.
     // Matching below is studio-agnostic, so this is informational only (logged).
     let studio = detect_studio(reader, udf);
+    // One inflate budget for every sweep over every jar this parse opens.
+    let mut budget = jar::PARSE_INFLATE_BUDGET;
 
     jar::for_each_jar(reader, udf, |entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/bydeluxe/") {
@@ -38,7 +44,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         }
 
         // Phase A — master enums (Language / Purpose / VideoFormat / Region / Studio).
-        let enums = identify_master_enums(archive);
+        let enums = identify_master_enums(archive, &mut budget);
         if enums.is_empty() {
             tracing::info!(
                 jar = ?entry_name,
@@ -62,7 +68,8 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         // Phase C — find ALL binding-class candidates (audio + subtitle often
         // split across two classes on Deluxe). Each gets its own `<clinit>`
         // walk; constructions union into a single stream list.
-        let binding_classes = find_binding_classes(archive, &master_table.class_name_set());
+        let binding_classes =
+            find_binding_classes(archive, &master_table.class_name_set(), &mut budget);
         if binding_classes.is_empty() {
             tracing::info!(
                 jar = ?entry_name,
@@ -81,15 +88,17 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 
         // Phase D — decode each binding class's <clinit>.
         let mut streams: Vec<Construction> = Vec::new();
+        let mut drift = 0usize;
         for (name, _) in &binding_classes {
             // Cross-class union is bounded by the same cap as each walk.
             let room = MAX_CONSTRUCTIONS.saturating_sub(streams.len());
             if room == 0 {
                 break;
             }
-            let mut decoded = decode_binding(archive, name, &master_table);
-            decoded.truncate(room);
-            streams.extend(decoded);
+            let mut decoded = decode_binding(archive, name, &master_table, &mut budget);
+            drift = drift.saturating_add(decoded.drift);
+            decoded.constructions.truncate(room);
+            streams.extend(decoded.constructions);
         }
         if streams.is_empty() {
             tracing::info!(
@@ -110,9 +119,17 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
             subtitle = labels.iter().filter(|l| l.stream_type == StreamLabelType::Subtitle).count(),
             "deluxe emitted labels",
         );
-        // High confidence: master enums matched, binding class decoded, and at
-        // least one binding resolved to a real (language, purpose, codec) tuple.
-        // Un-named STN slots are back-filled from the MPLS floor by the registry.
+        // High only when the symbolic walk stayed in sync and no sweep was cut
+        // short: drift can bind a label to the wrong STN slot.
+        if drift > 0 || budget == 0 {
+            tracing::warn!(
+                jar = ?entry_name,
+                drift,
+                budget_spent = budget == 0,
+                "deluxe: bytecode decode was not exact, labels downgraded to low confidence"
+            );
+            return Some(ParseResult::low(labels));
+        }
         Some(ParseResult::high(labels))
     })
 }
@@ -288,6 +305,8 @@ struct CandidatePool {
     /// resolve a different master enum on a second run and emit different
     /// labels for unchanged input.
     by_class: BTreeMap<String, Vec<String>>,
+    /// `putstatic` field names of fingerprint-matching classes (Phase D's ordinals).
+    fields: HashMap<String, Vec<String>>,
     /// Retained bytes: class names plus every retained string.
     bytes: usize,
 }
@@ -308,17 +327,32 @@ impl CandidatePool {
         self.by_class.insert(class_name.to_string(), ldcs);
         true
     }
+
+    /// Retain `fields` for an already-inserted class, within the byte budget.
+    /// Returns false when they were rejected (pool full).
+    fn insert_fields(&mut self, class_name: &str, fields: Vec<String>) -> bool {
+        let cost = fields.iter().map(String::len).sum::<usize>();
+        if self.bytes.saturating_add(cost) > MAX_CANDIDATE_TOTAL_BYTES {
+            return false;
+        }
+        self.bytes += cost;
+        self.fields.insert(class_name.to_string(), fields);
+        true
+    }
 }
 
 /// Phase A. Walk every `.class` in `archive`, identify the master
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
-fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnum)> {
+fn identify_master_enums(
+    archive: &mut jar::Jar,
+    budget: &mut u64,
+) -> Vec<(&'static str, MasterEnum)> {
     // First pass: collect every class's <clinit> ldc strings, keyed by the JVM
     // INTERNAL name (`this_class`), not the zip entry name — binding classes
     // reference enum constants as `getstatic <internal>.f`.
     let mut pool = CandidatePool::default();
-    jar::for_each_class(archive, |zip_name, class| {
+    jar::for_each_class_budgeted(archive, budget, |zip_name, class| {
         let Some(ldcs) = clinit_ldc_strings(class) else {
             return;
         };
@@ -326,7 +360,16 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
             return;
         }
         let key = class.this_class_name().unwrap_or(zip_name);
-        if !pool.insert(key, ldcs) {
+        let matches_fp = FINGERPRINTS.iter().any(|fp| fp_matches(fp, &ldcs));
+        if pool.insert(key, ldcs) {
+            if matches_fp && !pool.insert_fields(key, clinit_enum_field_names(class)) {
+                tracing::debug!(
+                    class = ?key,
+                    bytes = pool.bytes,
+                    "deluxe: candidate pool cap hit, enum field names dropped"
+                );
+            }
+        } else {
             tracing::debug!(
                 class = ?key,
                 classes = pool.by_class.len(),
@@ -336,19 +379,17 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
         }
     });
     let candidates = pool.by_class;
+    let mut fields_by_class = pool.fields;
 
     // Second pass: match each fingerprint against the candidate pool.
     let mut out = Vec::new();
     for fp in FINGERPRINTS {
         let mut best: Option<(String, Vec<String>)> = None;
         for (name, ldcs) in &candidates {
-            if !ldcs_match_prefix(ldcs, fp.prefix) {
+            if !fp_matches(fp, ldcs) {
                 continue;
             }
             let count = ldcs.len();
-            if count.abs_diff(fp.expected_count) > fp.count_tolerance {
-                continue;
-            }
             // Prefer exact-count match; otherwise first hit wins.
             match &best {
                 None => best = Some((name.clone(), ldcs.clone())),
@@ -366,18 +407,6 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
     if out.is_empty() {
         return Vec::new();
     }
-
-    // Second pass: capture obfuscated `putstatic` field names for matched
-    // classes so Phase D can resolve `getstatic <enum>.<field>` to an ordinal.
-    // Targeted re-walk of only the matched classes, not the whole jar again.
-    let want: HashSet<&str> = out.iter().map(|(_, name, _)| name.as_str()).collect();
-    let mut fields_by_class: HashMap<String, Vec<String>> = HashMap::new();
-    jar::for_each_class(archive, |zip_name, class| {
-        let iname = class.this_class_name().unwrap_or(zip_name);
-        if want.contains(iname) && !fields_by_class.contains_key(iname) {
-            fields_by_class.insert(iname.to_string(), clinit_enum_field_names(class));
-        }
-    });
 
     out.into_iter()
         .map(|(label, class_name, values)| {
@@ -489,6 +518,12 @@ fn clinit_ldc_strings(class: &super::class_reader::ClassFile) -> Option<Vec<Stri
     if found { Some(out) } else { None }
 }
 
+// Whether a class's `<clinit>` ldc strings fit a fingerprint (prefix and count window).
+fn fp_matches(fp: &Fingerprint, ldcs: &[String]) -> bool {
+    ldcs_match_prefix(ldcs, fp.prefix)
+        && ldcs.len().abs_diff(fp.expected_count) <= fp.count_tolerance
+}
+
 /// True if the first `prefix.len()` entries of `ldcs` match `prefix`
 /// exactly. Case-sensitive (enum names are stable strings, not free
 /// text).
@@ -508,10 +543,11 @@ fn ldcs_match_prefix(ldcs: &[String], prefix: &[&str]) -> bool {
 fn find_binding_classes(
     archive: &mut jar::Jar,
     master_enum_classes: &HashSet<&str>,
+    budget: &mut u64,
 ) -> Vec<(String, usize)> {
     const MIN_GETSTATIC: usize = 4;
     let mut candidates: Vec<(String, usize)> = Vec::new();
-    jar::for_each_class(archive, |class_name, class| {
+    jar::for_each_class_budgeted(archive, budget, |class_name, class| {
         let count = count_master_enum_getstatic(class, master_enum_classes);
         if count >= MIN_GETSTATIC {
             candidates.push((class_name.to_string(), count));
@@ -590,6 +626,24 @@ pub(crate) enum StackVal {
     /// opaque. Lets the walker stay in sync past loads/computed
     /// values it doesn't understand.
     Unknown,
+    /// An opaque long or double: one value, two stack words (JVMS §2.11.1).
+    Wide,
+}
+
+impl StackVal {
+    // Stack words this value occupies.
+    fn words(&self) -> usize {
+        if matches!(self, StackVal::Wide) { 2 } else { 1 }
+    }
+
+    // Opaque value of a field descriptor type.
+    fn of_type(descriptor: &str) -> Self {
+        if matches!(descriptor, "J" | "D") {
+            StackVal::Wide
+        } else {
+            StackVal::Unknown
+        }
+    }
 }
 
 /// Fully-qualified class name of the BD-J spec codec enum that
@@ -600,19 +654,28 @@ const BD_CODING_TYPE_CLASS: &str = "org/bluray/ti/CodingType";
 // decode_binding_class's per-class union and parse's cross-class union).
 const MAX_CONSTRUCTIONS: usize = 4096;
 
-/// Phase D entry point: find the binding class in `archive`, run the
-/// bytecode walker against its `<clinit>`, return one `Construction`
-/// per `new X / invokespecial X.<init>` sequence.
+/// Result of walking a binding class's `<clinit>`.
+#[derive(Debug, Default)]
+pub(crate) struct Decoded {
+    /// One per `new X / invokespecial X.<init>` sequence, in bytecode order.
+    pub constructions: Vec<Construction>,
+    /// Events where the symbolic stack lost sync with the real one.
+    pub drift: usize,
+}
+
+/// Phase D entry point: find the binding class in `archive` and run the
+/// bytecode walker against its `<clinit>`.
 fn decode_binding(
     archive: &mut jar::Jar,
     binding_class_name: &str,
     master: &MasterEnumTable,
-) -> Vec<Construction> {
+    budget: &mut u64,
+) -> Decoded {
     let target_name = binding_class_name.to_string();
-    // Short-circuit on the name match: try_each_class stops iterating (and
+    // Short-circuit on the name match: the sweep stops iterating (and
     // decompressing/parsing remaining .class entries) once the closure
     // returns Some, instead of walking the whole jar past the target.
-    jar::try_each_class(archive, |class_name, class| {
+    jar::try_each_class_budgeted(archive, budget, |class_name, class| {
         if class_name != target_name {
             return None;
         }
@@ -622,13 +685,9 @@ fn decode_binding(
 }
 
 /// Walk every method named `<clinit>` (typically only one) on this
-/// class with the symbolic stack machine. Returns each construction
-/// emitted.
-pub(crate) fn decode_binding_class(
-    class: &ClassFile,
-    master: &MasterEnumTable,
-) -> Vec<Construction> {
-    let mut all: Vec<Construction> = Vec::new();
+/// class with the symbolic stack machine.
+pub(crate) fn decode_binding_class(class: &ClassFile, master: &MasterEnumTable) -> Decoded {
+    let mut all = Decoded::default();
     for m in &class.methods {
         if class.member_name(m) != Some("<clinit>") {
             continue;
@@ -638,15 +697,16 @@ pub(crate) fn decode_binding_class(
         };
         let mut ctx = BindingDecoder::new(&class.constant_pool, master);
         ctx.run(&code);
+        all.drift = all.drift.saturating_add(ctx.drift);
         // Bound the union too: JVMS §4.6 makes (name, descriptor) unique per
         // class so a real class has one `<clinit>`, but this reader does not
         // enforce that and a crafted class can repeat it.
-        let room = MAX_CONSTRUCTIONS.saturating_sub(all.len());
+        let room = MAX_CONSTRUCTIONS.saturating_sub(all.constructions.len());
         if room == 0 {
             break;
         }
         ctx.constructions.truncate(room);
-        all.extend(ctx.constructions);
+        all.constructions.extend(ctx.constructions);
     }
     all
 }
@@ -661,6 +721,8 @@ struct BindingDecoder<'a> {
     /// in [`run`](Self::run). Zero until then.
     max_stack: usize,
     constructions: Vec<Construction>,
+    /// Count of events where the symbolic stack lost sync (see [`Decoded::drift`]).
+    drift: usize,
 }
 
 impl<'a> BindingDecoder<'a> {
@@ -671,6 +733,7 @@ impl<'a> BindingDecoder<'a> {
             stack: Vec::new(),
             max_stack: 0,
             constructions: Vec::new(),
+            drift: 0,
         }
     }
 
@@ -678,8 +741,36 @@ impl<'a> BindingDecoder<'a> {
     /// `constructions` field holds the result.
     pub(crate) fn run(&mut self, code: &CodeAttribute<'_>) {
         self.max_stack = code.max_stack as usize;
+        let mut end = 0;
         for insn in code.instructions() {
+            end = insn.pc + 1 + insn.operands.len();
             self.step(insn);
+        }
+        // The iterator stops at an opcode it cannot size: the rest is never decoded.
+        if end < code.code.len() {
+            self.drift = self.drift.saturating_add(1);
+            tracing::debug!(pc = end, "deluxe: undecodable opcode ends the walk early");
+        }
+    }
+
+    // The symbolic stack no longer matches the real one at `insn`.
+    fn lost_sync(&mut self, insn: &Instruction<'_>) {
+        self.drift = self.drift.saturating_add(1);
+        tracing::debug!(
+            pc = insn.pc,
+            opcode = insn.opcode,
+            "deluxe: symbolic stack drift"
+        );
+    }
+
+    // A `<init>` of `class` whose operands were lost: record an argless construction so the
+    // binding still takes its STN slot (numbering stays aligned); it resolves no label.
+    fn placeholder(&mut self, class: &str, is_container: bool) {
+        if !is_container && self.constructions.len() < MAX_CONSTRUCTIONS {
+            self.constructions.push(Construction {
+                binding_type: class.to_string(),
+                args: Vec::new(),
+            });
         }
     }
 
@@ -688,12 +779,64 @@ impl<'a> BindingDecoder<'a> {
     // crafted class.
     fn push(&mut self, val: StackVal) {
         if self.stack.len() >= self.max_stack {
+            self.drift = self.drift.saturating_add(1);
             return;
         }
         self.stack.push(val);
     }
 
-    fn step(&mut self, insn: super::class_reader::Instruction<'_>) {
+    // Pops `n` values of any category; on underflow resyncs on an empty stack.
+    fn pop_values(&mut self, insn: &Instruction<'_>, n: usize) {
+        match self.stack.len().checked_sub(n) {
+            Some(keep) => self.stack.truncate(keep),
+            None => {
+                self.lost_sync(insn);
+                self.stack.clear();
+            }
+        }
+    }
+
+    // Pops whole values totalling exactly `n` stack words (top last). None, after a
+    // resync, on underflow or when that would split a long/double (JVMS §2.11.1).
+    fn take_words(&mut self, insn: &Instruction<'_>, n: usize) -> Option<Vec<StackVal>> {
+        let (mut at, mut got) = (self.stack.len(), 0);
+        while got < n && at > 0 {
+            at -= 1;
+            got += self.stack[at].words();
+        }
+        if got != n {
+            self.lost_sync(insn);
+            self.stack.clear();
+            return None;
+        }
+        Some(self.stack.split_off(at))
+    }
+
+    // dup, dup_x1/x2, dup2, dup2_x1/x2: copy the top `n` words beneath the next `m`.
+    fn dup_under(&mut self, insn: &Instruction<'_>, n: usize, m: usize) {
+        let Some(top) = self.take_words(insn, n) else {
+            return;
+        };
+        let Some(under) = self.take_words(insn, m) else {
+            return;
+        };
+        for v in top.clone().into_iter().chain(under).chain(top) {
+            self.push(v);
+        }
+    }
+
+    // Pops `n` operands and pushes one result, a long/double when `wide`.
+    fn op(&mut self, insn: &Instruction<'_>, n: usize, wide: bool) {
+        self.pop_values(insn, n);
+        self.push(if wide {
+            StackVal::Wide
+        } else {
+            StackVal::Unknown
+        });
+    }
+
+    fn step(&mut self, insn: Instruction<'_>) {
+        let insn = &insn;
         match insn.opcode {
             // Push small int constants.
             ICONST_M1 => self.push(StackVal::Int(-1)),
@@ -717,6 +860,9 @@ impl<'a> BindingDecoder<'a> {
                     self.push(StackVal::Unknown);
                 }
             }
+            LCONST_0 | LCONST_1 | DCONST_0 | DCONST_1 | LDC2_W => self.push(StackVal::Wide),
+            // aconst_null, fconst_* (the int/long/double constants are taken above).
+            ACONST_NULL..=DCONST_1 => self.push(StackVal::Unknown),
             // ldc/ldc_w: push Int when the operand is an Integer
             // constant; otherwise push Unknown (we don't care about
             // Strings here — labels come via getstatic, not ldc).
@@ -730,6 +876,21 @@ impl<'a> BindingDecoder<'a> {
                     .unwrap_or(StackVal::Unknown);
                 self.push(v);
             }
+            // Local loads and stores (the long/double loads first).
+            LLOAD | DLOAD | LLOAD_0..=LLOAD_3 | DLOAD_0..=DLOAD_3 => self.push(StackVal::Wide),
+            ILOAD..=ALOAD_3 => self.push(StackVal::Unknown),
+            ISTORE..=ASTORE_3 => self.pop_values(insn, 1),
+            WIDE => match insn.operand_u8() {
+                Some(LLOAD | DLOAD) => self.push(StackVal::Wide),
+                Some(ILOAD | FLOAD | ALOAD) => self.push(StackVal::Unknown),
+                Some(ISTORE..=ASTORE) => self.pop_values(insn, 1),
+                Some(IINC) => {}
+                _ => self.lost_sync(insn),
+            },
+            // Array loads pop (arrayref, index); stores also pop the value.
+            LALOAD | DALOAD => self.op(insn, 2, true),
+            IALOAD..=SALOAD => self.op(insn, 2, false),
+            IASTORE..=SASTORE => self.pop_values(insn, 3),
             // new X — push an uninit-object marker. The matching
             // invokespecial will consume this + the args and emit a
             // Construction.
@@ -741,137 +902,155 @@ impl<'a> BindingDecoder<'a> {
                     .to_string();
                 self.push(StackVal::NewObj(class_name));
             }
-            // dup — duplicate top of stack.
-            0x59 /* dup */ => {
-                if let Some(top) = self.stack.last().cloned() {
-                    self.push(top);
+            // Word-level stack ops (a long/double is one two-word value).
+            POP => drop(self.take_words(insn, 1)),
+            POP2 => drop(self.take_words(insn, 2)),
+            DUP => self.dup_under(insn, 1, 0),
+            DUP_X1 => self.dup_under(insn, 1, 1),
+            DUP_X2 => self.dup_under(insn, 1, 2),
+            DUP2 => self.dup_under(insn, 2, 0),
+            DUP2_X1 => self.dup_under(insn, 2, 1),
+            DUP2_X2 => self.dup_under(insn, 2, 2),
+            SWAP => {
+                if let Some(a) = self.take_words(insn, 1)
+                    && let Some(b) = self.take_words(insn, 1)
+                {
+                    for v in a.into_iter().chain(b) {
+                        self.push(v);
+                    }
                 }
             }
+            // Arithmetic: in 0x60..=0x83 the long/double forms are the odd opcodes.
+            IADD..=DREM | ISHL..=LXOR => self.op(insn, 2, insn.opcode % 2 == 1),
+            INEG..=DNEG => self.op(insn, 1, insn.opcode % 2 == 1),
+            IINC => {}
+            I2L | I2D | L2D | F2L | F2D | D2L => self.op(insn, 1, true),
+            I2L..=I2S => self.op(insn, 1, false),
+            LCMP..=DCMPG => self.op(insn, 2, false),
+            // Conditional branches pop their operands; the walk stays linear.
+            IFEQ..=IFLE | IFNULL | IFNONNULL | TABLESWITCH | LOOKUPSWITCH => {
+                self.pop_values(insn, 1)
+            }
+            IF_ICMPEQ..=IF_ACMPNE => self.pop_values(insn, 2),
+            MONITORENTER | MONITOREXIT => self.pop_values(insn, 1),
             // getstatic Y.Z — if Y is one of our master enum classes,
             // resolve Z to an ordinal and push an EnumRef. Otherwise
-            // push Unknown so we stay in sync.
+            // push an opaque value so we stay in sync.
             GETSTATIC => {
-                let val = insn
-                    .cp_index()
-                    .and_then(|i| self.pool.member_ref(i))
-                    .map(|m| {
-                        // Resolution: CodingType.X → CodingType(X); master-enum
-                        // classname.X → EnumRef(kind, ord); else Unknown.
-                        if m.class_name == BD_CODING_TYPE_CLASS {
-                            StackVal::CodingType(m.name.to_string())
-                        } else if let Some((kind, ord)) = self.master.resolve(m.class_name, m.name)
-                        {
-                            StackVal::EnumRef { kind, ordinal: ord }
-                        } else {
-                            StackVal::Unknown
-                        }
-                    })
-                    .unwrap_or(StackVal::Unknown);
+                let Some(m) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
+                    self.lost_sync(insn);
+                    self.push(StackVal::Unknown);
+                    return;
+                };
+                let val = if m.class_name == BD_CODING_TYPE_CLASS {
+                    StackVal::CodingType(m.name.to_string())
+                } else if let Some((kind, ordinal)) = self.master.resolve(m.class_name, m.name) {
+                    StackVal::EnumRef { kind, ordinal }
+                } else {
+                    StackVal::of_type(m.descriptor)
+                };
                 self.push(val);
             }
+            PUTSTATIC => self.pop_values(insn, 1),
+            GETFIELD => {
+                let Some(m) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
+                    self.lost_sync(insn);
+                    return self.op(insn, 1, false);
+                };
+                self.pop_values(insn, 1);
+                self.push(StackVal::of_type(m.descriptor));
+            }
+            PUTFIELD => self.pop_values(insn, 2),
             // invokespecial X.<init>(...) — pop args per descriptor. If the
             // object underneath the args is a NewObj of class X (set by an
             // earlier `new X / dup`), emit a Construction.
             INVOKESPECIAL => {
-                let Some(idx) = insn.cp_index() else { return };
-                let Some(member) = self.pool.member_ref(idx) else { return };
+                let Some(member) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
+                    self.lost_sync(insn);
+                    return;
+                };
                 let arg_count = parse_method_arg_count(member.descriptor);
+                let is_init = member.name == "<init>";
                 // A per-stream binding ctor takes only scalars/enum refs, never an
                 // array; a ctor with an array param is a container/title wrapper and
                 // must not be recorded as a stream binding (stack still unwinds below).
                 let is_container = member.descriptor.contains('[');
                 if self.stack.len() < arg_count + 1 {
-                    // Stack-machine drift: bail on this construction without
-                    // panicking; the walker tolerates malformed input best-effort.
+                    // Underflow: resync on an empty stack, keep the binding's slot.
+                    self.lost_sync(insn);
                     self.stack.clear();
+                    if is_init {
+                        self.placeholder(member.class_name, is_container);
+                    }
                     return;
                 }
-                let args: Vec<StackVal> = self
-                    .stack
-                    .split_off(self.stack.len() - arg_count);
+                let args: Vec<StackVal> = self.stack.split_off(self.stack.len() - arg_count);
                 // Underneath the args: the object the constructor
                 // operates on. For our pattern it's NewObj(X).
-                let receiver = self.stack.pop().unwrap_or(StackVal::Unknown);
-                if let StackVal::NewObj(name) = receiver
-                    && name == member.class_name
-                    && !is_container {
+                match self.stack.pop() {
+                    Some(StackVal::NewObj(name)) if is_init && name == member.class_name => {
                         // Bounded by MAX_CONSTRUCTIONS: an unbounded push here
                         // is ~1 GiB reachable from a crafted `<clinit>`.
-                        if self.constructions.len() >= MAX_CONSTRUCTIONS {
-                            return;
+                        if !is_container && self.constructions.len() < MAX_CONSTRUCTIONS {
+                            self.constructions.push(Construction {
+                                binding_type: name,
+                                args,
+                            });
                         }
-                        self.constructions.push(Construction {
-                            binding_type: name,
-                            args,
-                        });
                     }
+                    // `<clinit>` has no `this`: an `<init>` receiver that is not the
+                    // matching `new` means the args popped are not this call's.
+                    _ if is_init => {
+                        self.lost_sync(insn);
+                        self.placeholder(member.class_name, is_container);
+                    }
+                    _ => self.push_return(member.descriptor),
+                }
             }
             // invokevirtual / invokestatic / invokeinterface — pop
-            // args per descriptor, push a return placeholder unless
-            // descriptor returns V (void).
-            0xB6 /* invokevirtual */ | 0xB8 /* invokestatic */ | 0xB9 /* invokeinterface */ => {
-                let Some(idx) = insn.cp_index() else { return };
-                let Some(member) = self.pool.member_ref(idx) else { return };
-                let arg_count = parse_method_arg_count(member.descriptor);
-                let extra = if insn.opcode == 0xB6 || insn.opcode == 0xB9 { 1 } else { 0 };
-                let to_pop = arg_count + extra;
-                if self.stack.len() < to_pop {
-                    self.stack.clear();
-                } else {
-                    self.stack.truncate(self.stack.len() - to_pop);
-                }
-                // Push return placeholder unless void.
-                if !member.descriptor.ends_with(")V") {
-                    self.push(StackVal::Unknown);
-                }
+            // args per descriptor (plus the receiver), push the return value.
+            INVOKEVIRTUAL | INVOKESTATIC | INVOKEINTERFACE => {
+                let Some(member) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
+                    self.lost_sync(insn);
+                    return;
+                };
+                let receiver = usize::from(insn.opcode != INVOKESTATIC);
+                self.pop_values(insn, parse_method_arg_count(member.descriptor) + receiver);
+                self.push_return(member.descriptor);
             }
-            // pop / pop2 — drop stack values.
-            0x57 /* pop */ => {
-                self.stack.pop();
+            // anewarray / newarray / arraylength / instanceof: pop 1, push a ref or int.
+            ANEWARRAY | NEWARRAY | ARRAYLENGTH | INSTANCEOF => self.op(insn, 1, false),
+            MULTIANEWARRAY => {
+                let dims = insn.operands.get(2).copied().unwrap_or(0);
+                self.op(insn, dims as usize, false);
             }
-            0x58 /* pop2 */ => {
-                self.stack.pop();
-                self.stack.pop();
-            }
-            // anewarray / newarray — pop count, push array ref. Modelled (not
-            // left to `_`) so array constructions inside a container's arg list
-            // keep the symbolic stack aligned for per-stream bindings built alongside.
-            ANEWARRAY | NEWARRAY => {
-                self.stack.pop();
-                self.push(StackVal::Unknown);
-            }
-            // aastore — array store consumes 3 slots (arrayref, index, value).
-            AASTORE => {
-                for _ in 0..3 {
-                    self.stack.pop();
+            // checkcast leaves the (same) reference on the stack.
+            CHECKCAST => {
+                if self.stack.is_empty() {
+                    self.lost_sync(insn);
                 }
             }
-            // putstatic / putfield — drop 1 (putstatic) or 2 (putfield).
-            0xB3 /* putstatic */ => {
-                self.stack.pop();
-            }
-            0xB5 /* putfield */ => {
-                self.stack.pop();
-                self.stack.pop();
-            }
-            // Branches/returns/unhandled — clear stack as a conservative resync.
-            // Binding `<clinit>` is straight-line code in practice, so these
-            // are rarely hit on the verified pattern.
-            0xA7 /* goto */ | 0xB1 /* return */ => {
-                self.stack.clear();
-            }
-            _ => {
-                // Unknown opcode: best-effort, leave stack untouched.
-                // The decoder tolerates drift — a final invokespecial
-                // with mis-aligned stack will just be ignored.
-            }
+            // Unconditional control transfer: nothing flows into the next instruction.
+            GOTO | GOTO_W | IRETURN..=RETURN | ATHROW => self.stack.clear(),
+            NOP => {}
+            // Unmodelled (jsr/ret, invokedynamic, reserved): stack effect unknown, so the
+            // walk is no longer exact.
+            _ => self.lost_sync(insn),
+        }
+    }
+
+    // Pushes a method descriptor's return value (nothing for void).
+    fn push_return(&mut self, descriptor: &str) {
+        match descriptor.rsplit_once(')') {
+            Some((_, "V")) => {}
+            Some((_, ret)) => self.push(StackVal::of_type(ret)),
+            None => self.push(StackVal::Unknown),
         }
     }
 }
 
-// Counts argument slots in a JVMS descriptor like `(IILjava/lang/String;LFoo;)V`.
-// Each field descriptor is one slot (we don't track the JVM's 2-slot
-// long/double layout — the symbolic stack treats every value as 1 slot).
+// Counts argument values in a JVMS descriptor like `(IILjava/lang/String;LFoo;)V`.
+// One per field descriptor: a long/double arg is one (two-word) `StackVal::Wide`.
 fn parse_method_arg_count(descriptor: &str) -> usize {
     let bytes = descriptor.as_bytes();
     let mut i = 1; // skip leading '('
@@ -981,6 +1160,8 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
         let mut lang_ord: Option<u16> = None;
         let mut purpose_ord: Option<u16> = None;
         let mut coding_type: Option<String> = None;
+        let mut slot: Option<CodingSlot> = None;
+        let mut unknown_coding: Option<String> = None;
         let mut stream_idx_hint: Option<i32> = None;
         for arg in &c.args {
             match arg {
@@ -989,8 +1170,13 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
                     "Purpose" => purpose_ord = purpose_ord.or(Some(*ordinal)),
                     _ => {}
                 },
-                StackVal::CodingType(name) => {
-                    coding_type = coding_type.or_else(|| Some(name.clone()));
+                StackVal::CodingType(name) if slot.is_none() => {
+                    slot = coding_slot(name);
+                    if slot == Some(CodingSlot::Audio) {
+                        coding_type = Some(name.clone());
+                    } else if slot.is_none() {
+                        unknown_coding = Some(name.clone());
+                    }
                 }
                 StackVal::Int(n) => {
                     stream_idx_hint = stream_idx_hint.or(Some(*n));
@@ -999,11 +1185,15 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             }
         }
 
+        // Interactive graphics / video: numbered in neither the audio nor the PG list.
+        if slot == Some(CodingSlot::NoSlot) {
+            continue;
+        }
         let Some(lang_ord) = lang_ord else {
             // A recognisable stream binding still occupies its STN slot and must
             // advance the counter, or renumbering skews every surviving label.
             // `saturating_add` is safe here since no label is produced.
-            match slot_kind(c, coding_type.is_some(), &slot_kinds) {
+            match slot_kind(c, slot, &slot_kinds) {
                 Some(StreamLabelType::Audio) => audio_idx = audio_idx.saturating_add(1),
                 Some(StreamLabelType::Subtitle) => sub_idx = sub_idx.saturating_add(1),
                 // Not a stream binding (`new StringBuilder` and friends in the
@@ -1012,6 +1202,13 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             }
             continue;
         };
+
+        // An unrecognised CodingType name is not decisive: take the type from siblings.
+        if let (None, Some(name), Some(StreamLabelType::Audio)) =
+            (slot, unknown_coding, slot_kind(c, None, &slot_kinds))
+        {
+            coding_type = Some(name);
+        }
 
         // Audio when a CodingType is present (audio binding type
         // always references org.bluray.ti.CodingType); subtitle
@@ -1098,20 +1295,25 @@ fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabe
     let mut kinds: HashMap<&str, Option<StreamLabelType>> = HashMap::new();
     for c in constructions {
         let mut has_lang = false;
-        let mut has_coding = false;
+        let mut slot = None;
+        let mut unknown = false;
         for arg in &c.args {
             match arg {
                 StackVal::EnumRef {
                     kind: "Language", ..
                 } => has_lang = true,
-                StackVal::CodingType(_) => has_coding = true,
+                StackVal::CodingType(n) if slot.is_none() => {
+                    slot = coding_slot(n);
+                    unknown |= slot.is_none();
+                }
                 _ => {}
             }
         }
-        if !has_lang {
+        // An unrecognised CodingType name says nothing about the list: not recorded.
+        if !has_lang || slot == Some(CodingSlot::NoSlot) || (slot.is_none() && unknown) {
             continue;
         }
-        let kind = if has_coding {
+        let kind = if slot == Some(CodingSlot::Audio) {
             StreamLabelType::Audio
         } else {
             StreamLabelType::Subtitle
@@ -1129,17 +1331,39 @@ fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabe
 }
 
 // The stream list an unresolved construction occupies a slot in, or None if
-// not a stream binding. A CodingType arg is decisive (only audio gets one);
-// otherwise falls back to what the binding type's resolved siblings showed.
+// not a stream binding. A recognised CodingType arg is decisive; otherwise
+// falls back to what the binding type's resolved siblings showed.
 fn slot_kind(
     c: &Construction,
-    has_coding_type: bool,
+    slot: Option<CodingSlot>,
     slot_kinds: &HashMap<&str, Option<StreamLabelType>>,
 ) -> Option<StreamLabelType> {
-    if has_coding_type {
-        return Some(StreamLabelType::Audio);
+    match slot {
+        Some(CodingSlot::Audio) => Some(StreamLabelType::Audio),
+        Some(CodingSlot::Subtitle) => Some(StreamLabelType::Subtitle),
+        Some(CodingSlot::NoSlot) => None,
+        None => slot_kinds.get(c.binding_type.as_str()).copied().flatten(),
     }
-    slot_kinds.get(c.binding_type.as_str()).copied().flatten()
+}
+
+/// STN list a BD-J `CodingType` stream is numbered in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodingSlot {
+    Audio,
+    Subtitle,
+    /// Interactive graphics or video: no audio or PG slot.
+    NoSlot,
+}
+
+// Classifies an org.bluray.ti.CodingType field name; None for an unrecognised one.
+fn coding_slot(name: &str) -> Option<CodingSlot> {
+    match name {
+        "PRESENTATION_GRAPHICS" | "TEXT_SUBTITLE" => Some(CodingSlot::Subtitle),
+        "INTERACTIVE_GRAPHICS" => Some(CodingSlot::NoSlot),
+        n if n.ends_with("_VIDEO") => Some(CodingSlot::NoSlot),
+        n if n.ends_with("_AUDIO") || n.contains("_AUDIO_") => Some(CodingSlot::Audio),
+        _ => None,
+    }
 }
 
 // Maps an org.bluray.ti.CodingType field name (from getstatic operands on
@@ -1149,20 +1373,17 @@ fn coding_type_to_codec_hint(field: &str) -> &str {
     match field {
         // Lossless / hi-res.
         "DOLBY_LOSSLESS_AUDIO" => "Dolby TrueHD",
-        "DTS_HD_LOSSLESS_AUDIO" | "DTS_HD_MA_AUDIO" => "DTS-HD Master Audio",
+        "DTS_HD_AUDIO_XLL" => "DTS-HD Master Audio",
         "LPCM_AUDIO" => "LPCM",
         // Dolby family.
         "DOLBY_AC3_AUDIO" => "Dolby Digital",
         "DOLBY_DIGITAL_PLUS_AUDIO" => "Dolby Digital Plus",
-        "DOLBY_ATMOS_AUDIO" => "Dolby Atmos",
         // DTS family.
         "DTS_AUDIO" => "DTS",
-        "DTS_HD_AUDIO" | "DTS_HD_HR_AUDIO" => "DTS-HD HR",
-        // MPEG family.
-        "MPEG1_AUDIO_LAYER2" | "MPEG2_AUDIO_LAYER2" => "MPEG Audio",
-        // PG-style subtitle codecs (rare to see in Deluxe bindings;
-        // subtitles usually have NO CodingType arg).
-        "PG_STREAM" | "PRESENTATION_GRAPHICS_STREAM" => "PGS",
+        "DTS_HD_AUDIO" => "DTS-HD",
+        "DTS_HD_AUDIO_EXCEPT_XLL" => "DTS-HD HR",
+        "DTS_HD_AUDIO_LBR" => "DTS Express",
+        "DRA_AUDIO" | "DRA_EXTENSION_AUDIO" => "DRA",
         // Unknown / future — pass through verbatim so the operator
         // can see what the disc actually authored.
         _ => field,
@@ -1191,6 +1412,11 @@ fn deluxe_purpose_to_label(ordinal: u16) -> (LabelPurpose, LabelQualifier) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A budget no test fixture can exhaust.
+    fn unbounded() -> u64 {
+        u64::MAX
+    }
 
     // Raw .class/.jar fixture builders: `identify_master_enums`, `find_binding_classes`
     // and `decode_binding` operate on `jar::Jar` (a real `ZipArchive`), not the
@@ -1610,7 +1836,7 @@ mod tests {
             ("com/bydeluxe/Decoy.class", decoy),
         ]);
         let mut archive = open_jar(zip);
-        let enums = identify_master_enums(&mut archive);
+        let enums = identify_master_enums(&mut archive, &mut unbounded());
         let purpose = enums
             .iter()
             .find(|(label, _)| *label == "Purpose")
@@ -1652,7 +1878,7 @@ mod tests {
                 ),
             ]);
             let mut archive = open_jar(zip);
-            let enums = identify_master_enums(&mut archive);
+            let enums = identify_master_enums(&mut archive, &mut unbounded());
             let purpose = enums
                 .iter()
                 .find(|(label, _)| *label == "Purpose")
@@ -1681,7 +1907,7 @@ mod tests {
         let class = class_with_ldc_strings("BoundaryPurpose", &values);
         let zip = build_zip(&[("com/bydeluxe/B.class", class)]);
         let mut archive = open_jar(zip);
-        let enums = identify_master_enums(&mut archive);
+        let enums = identify_master_enums(&mut archive, &mut unbounded());
         assert!(
             enums.iter().any(|(label, _)| *label == "Purpose"),
             "a class exactly LDC_COUNT_TOLERANCE away from expected_count must still match"
@@ -1695,7 +1921,7 @@ mod tests {
         let unrelated = class_with_ldc_strings("Unrelated", &["Foo", "Bar"]);
         let zip = build_zip(&[("x/Unrelated.class", unrelated)]);
         let mut archive = open_jar(zip);
-        assert!(identify_master_enums(&mut archive).is_empty());
+        assert!(identify_master_enums(&mut archive, &mut unbounded()).is_empty());
     }
 
     // ── Phase C: find_binding_classes / count_master_enum_getstatic ────────
@@ -1736,7 +1962,7 @@ mod tests {
             ("com/bydeluxe/D.class", d),
         ]);
         let mut archive = open_jar(zip);
-        let candidates = find_binding_classes(&mut archive, &master_classes);
+        let candidates = find_binding_classes(&mut archive, &master_classes, &mut unbounded());
         let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -1752,13 +1978,32 @@ mod tests {
         assert_eq!(candidates[1].1, 45);
     }
 
+    // Phase A, C and D share one inflate budget: bytes Phase A inflated are not
+    // available again to Phase C.
+    #[test]
+    fn deluxe_sweeps_share_one_inflate_budget() {
+        let class = class_with_getstatic_refs("com/bydeluxe/Bind", "com/bydeluxe/Lang", 5);
+        let len = class.len() as u64;
+        let mut archive = open_jar(build_zip(&[("com/bydeluxe/Bind.class", class)]));
+        let master_classes: HashSet<&str> = ["com/bydeluxe/Lang"].into_iter().collect();
+        let mut budget = len;
+        assert!(identify_master_enums(&mut archive, &mut budget).is_empty());
+        assert_eq!(budget, 0, "Phase A spent the budget");
+        assert!(find_binding_classes(&mut archive, &master_classes, &mut budget).is_empty());
+        let mut fresh = len;
+        assert_eq!(
+            find_binding_classes(&mut archive, &master_classes, &mut fresh).len(),
+            1
+        );
+    }
+
     #[test]
     fn find_binding_classes_empty_master_set_yields_no_candidates() {
         let master_classes: HashSet<&str> = HashSet::new();
         let a = class_with_getstatic_refs("A", "LanguageEnum", 100);
         let zip = build_zip(&[("com/bydeluxe/A.class", a)]);
         let mut archive = open_jar(zip);
-        assert!(find_binding_classes(&mut archive, &master_classes).is_empty());
+        assert!(find_binding_classes(&mut archive, &master_classes, &mut unbounded()).is_empty());
     }
 
     // ── Phase D: decode_binding (Jar-level short-circuit wrapper) ───────────
@@ -1777,7 +2022,13 @@ mod tests {
         let mut archive = open_jar(zip);
         let master = lang_enum_master();
 
-        let ctors = decode_binding(&mut archive, "com/bydeluxe/Target.class", &master);
+        let ctors = decode_binding(
+            &mut archive,
+            "com/bydeluxe/Target.class",
+            &master,
+            &mut unbounded(),
+        )
+        .constructions;
         assert_eq!(
             ctors.len(),
             1,
@@ -1785,9 +2036,18 @@ mod tests {
         );
         assert_eq!(ctors[0].binding_type, "AudioSlot");
 
-        // A name with no matching entry must yield nothing (try_each_class
+        // A name with no matching entry must yield nothing (the sweep
         // never finds a Some).
-        assert!(decode_binding(&mut archive, "com/bydeluxe/NoSuchClass.class", &master).is_empty());
+        assert!(
+            decode_binding(
+                &mut archive,
+                "com/bydeluxe/NoSuchClass.class",
+                &master,
+                &mut unbounded()
+            )
+            .constructions
+            .is_empty()
+        );
     }
 
     // ── Phase D bytecode walker tests ───────────────────────────────────────
@@ -2257,7 +2517,7 @@ mod tests {
         ];
         let class = class_with_clinit(pool, 4, &code);
         let master = lang_enum_master();
-        let constructions = decode_binding_class(&class, &master);
+        let constructions = decode_binding_class(&class, &master).constructions;
         assert_eq!(
             constructions.len(),
             1,
@@ -2472,6 +2732,146 @@ mod tests {
         );
     }
 
+    // The symbolic stack after running `code` (pool: `AnyClass.m()J` at cp 6),
+    // rendered as ints, "W" (long/double), "?" (opaque) or "new X".
+    fn stack_after(code: &[u8]) -> Vec<String> {
+        let pool = call_ref_pool("()J");
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 16,
+            max_locals: 0,
+            code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        decoder
+            .stack
+            .iter()
+            .map(|v| match v {
+                StackVal::Int(n) => n.to_string(),
+                StackVal::Wide => "W".into(),
+                StackVal::NewObj(c) => format!("new {c}"),
+                _ => "?".into(),
+            })
+            .collect()
+    }
+
+    // JVMS §6.5 dup_x1/dup_x2/dup2/dup2_x1/dup2_x2/swap, every category-1/2 form.
+    #[test]
+    fn binding_decoder_models_the_dup_family_and_swap() {
+        let (c1, c2, c3, c4, l0) = (ICONST_1, ICONST_2, ICONST_3, ICONST_4, 0x09);
+        let cases: &[(&[u8], &[&str])] = &[
+            (&[c1, c2, 0x5A], &["2", "1", "2"]),
+            (&[c1, c2, c3, 0x5B], &["3", "1", "2", "3"]),
+            (&[l0, c1, 0x5B], &["1", "W", "1"]),
+            (&[c1, c2, 0x5C], &["1", "2", "1", "2"]),
+            (&[l0, 0x5C], &["W", "W"]),
+            (&[c1, c2, c3, 0x5D], &["2", "3", "1", "2", "3"]),
+            (&[c1, l0, 0x5D], &["W", "1", "W"]),
+            (&[c1, c2, c3, c4, 0x5E], &["3", "4", "1", "2", "3", "4"]),
+            (&[c1, c2, l0, 0x5E], &["W", "1", "2", "W"]),
+            (&[l0, c1, c2, 0x5E], &["1", "2", "W", "1", "2"]),
+            (&[l0, l0, 0x5E], &["W", "W", "W"]),
+            (&[c1, c2, 0x5F], &["2", "1"]),
+        ];
+        for (code, want) in cases {
+            assert_eq!(stack_after(code), *want, "{code:02x?}");
+        }
+    }
+
+    // pop2 removes one long/double or two category-1 values; pop never splits one.
+    #[test]
+    fn binding_decoder_pop2_respects_value_categories() {
+        assert_eq!(stack_after(&[ICONST_1, 0x09, POP2]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, 0x0E, POP2]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, LDC2_W, 0, 1, POP2]), ["1"]);
+        // A discarded J-returning call.
+        assert_eq!(stack_after(&[ICONST_1, INVOKESTATIC, 0, 6, POP2]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, ICONST_3, POP2]), ["1"]);
+    }
+
+    // Local loads push, stores pop (JVMS §6.5 xload/xstore, incl. wide forms).
+    #[test]
+    fn binding_decoder_models_local_loads_and_stores() {
+        assert_eq!(
+            stack_after(&[0x1A, 0x15, 3, 0x2A, 0x19, 3]),
+            ["?", "?", "?", "?"]
+        );
+        assert_eq!(
+            stack_after(&[0x1E, 0x16, 3, 0x26, 0x18, 3]),
+            ["W", "W", "W", "W"]
+        );
+        assert_eq!(
+            stack_after(&[ICONST_1, ICONST_2, 0x3B, 0x36, 1]),
+            [] as [&str; 0]
+        );
+        assert_eq!(stack_after(&[ICONST_1, 0x09, 0x3F]), ["1"]);
+        assert_eq!(
+            stack_after(&[0xC4, 0x16, 0, 3, 0xC4, 0x15, 0, 4]),
+            ["W", "?"]
+        );
+        // Array loads pop arrayref + index.
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x2F]), ["W"]);
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x2E]), ["?"]);
+    }
+
+    // Arithmetic, conversions, compares and conditional branches (JVMS §6.5).
+    #[test]
+    fn binding_decoder_models_arithmetic_compares_and_branches() {
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x60]), ["?"]);
+        assert_eq!(stack_after(&[0x09, 0x0A, 0x61]), ["W"]);
+        assert_eq!(stack_after(&[0x0E, 0x0E, 0x6F]), ["W"]);
+        assert_eq!(stack_after(&[0x09, ICONST_1, 0x79]), ["W"]);
+        assert_eq!(stack_after(&[ICONST_3, 0x74]), ["?"]);
+        assert_eq!(stack_after(&[ICONST_1, 0x85]), ["W"]);
+        assert_eq!(stack_after(&[0x09, 0x88]), ["?"]);
+        assert_eq!(stack_after(&[0x09, 0x0A, 0x94]), ["?"]);
+        assert_eq!(stack_after(&[ICONST_1, 0x84, 0, 1]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x99, 0, 3]), ["1"]);
+        assert_eq!(
+            stack_after(&[ICONST_1, ICONST_2, 0x9F, 0, 3]),
+            [] as [&str; 0]
+        );
+        assert_eq!(stack_after(&[ICONST_1, ACONST_NULL, 0xC6, 0, 3]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, ACONST_NULL, 0xBE]), ["1", "?"]);
+    }
+
+    // A local load feeding a binding ctor stays aligned with the ctor's args.
+    #[test]
+    fn binding_decoder_local_load_feeds_ctor_args() {
+        let pool = int_ctor_pool();
+        let master = lang_enum_master();
+        // new; dup; bipush 7; iconst_1; istore_0; lload_1; pop2; invokespecial (I)V
+        let code = [
+            NEW,
+            0,
+            2,
+            DUP,
+            BIPUSH,
+            7,
+            ICONST_1,
+            0x3B,
+            0x1F,
+            POP2,
+            INVOKESPECIAL,
+            0,
+            6,
+        ];
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 2,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(decoder.constructions.len(), 1);
+        assert!(matches!(
+            decoder.constructions[0].args[..],
+            [StackVal::Int(7)]
+        ));
+        assert_eq!(decoder.drift, 0);
+    }
+
     // Pool for a single-int-arg constructor `AudioSlot.<init>(I)V`, used to
     // isolate each int-push opcode's (iconst_<i>, bipush, sipush, ldc) exact
     // produced value, not just "a construction happened".
@@ -2538,8 +2938,8 @@ mod tests {
 
     #[test]
     fn binding_decoder_skips_unmatched_invokespecial() {
-        // invokespecial without a preceding `new X; dup` — should
-        // produce zero constructions.
+        // invokespecial without a preceding `new X; dup`: no construction with
+        // args, only a drift event and an argless slot placeholder.
         let code: Vec<u8> = vec![ICONST_0, GETSTATIC, 0, 6, INVOKESPECIAL, 0, 12];
         let pool = build_simple_pool();
         let master = lang_enum_master();
@@ -2550,7 +2950,8 @@ mod tests {
         };
         let mut decoder = BindingDecoder::new(&pool, &master);
         decoder.run(&attr);
-        assert_eq!(decoder.constructions.len(), 0);
+        assert!(decoder.constructions.iter().all(|c| c.args.is_empty()));
+        assert_eq!(decoder.drift, 1);
     }
 
     #[test]
@@ -2614,6 +3015,177 @@ mod tests {
             StackVal::Unknown => {}
             other => panic!("expected Unknown, got {:?}", other),
         }
+    }
+
+    // A `<init>` whose receiver is not its own `new` lost its operands: it still
+    // owns its STN slot, so later bindings keep their numbers.
+    #[test]
+    fn mismatched_ctor_receiver_keeps_later_slots_aligned() {
+        let base = build_simple_pool();
+        let mut entries: Vec<CpInfo> = (0..13).filter_map(|i| base.get(i).cloned()).collect();
+        entries.extend([
+            CpInfo::Utf8("French".into()), // 13
+            CpInfo::NameAndType {
+                name_index: 13,
+                descriptor_index: 4,
+            }, // 14
+            CpInfo::Fieldref {
+                class_index: 2,
+                name_and_type_index: 14,
+            }, // 15
+            CpInfo::Utf8("Other".into()),  // 16
+            CpInfo::Class { name_index: 16 }, // 17
+        ]);
+        let pool = ConstantPool::from_entries(entries);
+        let ctor = |lang: u8| {
+            [
+                NEW,
+                0,
+                8,
+                DUP,
+                GETSTATIC,
+                0,
+                lang,
+                INVOKESPECIAL,
+                0,
+                12,
+                POP,
+            ]
+        };
+        let mut code = ctor(6).to_vec();
+        // new AudioSlot; dup; new Other; getstatic English; invokespecial AudioSlot.<init>
+        code.extend([
+            NEW,
+            0,
+            8,
+            DUP,
+            NEW,
+            0,
+            17,
+            GETSTATIC,
+            0,
+            6,
+            INVOKESPECIAL,
+            0,
+            12,
+            POP,
+            POP,
+        ]);
+        code.extend(ctor(15));
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        let labels = interpret_streams(&decoder.constructions, &master);
+        let got: Vec<_> = labels
+            .iter()
+            .map(|l| (l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(got, vec![("eng", 1), ("fra", 3)]);
+    }
+
+    // Two-class Deluxe jar on a disc: a 70-value Language enum and a binding class
+    // of four `new Slot(Lang.English)`, each preceded by `extra` bytecode.
+    fn deluxe_disc(extra: &[u8]) -> (crate::udf::fixture::MemDisc, crate::udf::UdfFs) {
+        use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+        let mut values = vec!["English", "French", "Spanish", "Dutch"];
+        let rest: Vec<String> = (4..70).map(|i| format!("L{i}")).collect();
+        values.extend(rest.iter().map(String::as_str));
+        let lang = class_with_ldc_strings("com/bydeluxe/Lang", &values);
+        let cp = vec![
+            CpInfo::Empty,
+            CpInfo::Utf8("<clinit>".into()),
+            CpInfo::Utf8("()V".into()),
+            CpInfo::Utf8("Code".into()),
+            CpInfo::Utf8("com/bydeluxe/Lang".into()),
+            CpInfo::Class { name_index: 4 },
+            CpInfo::Utf8("English".into()),
+            CpInfo::Utf8("Lcom/bydeluxe/Lang;".into()),
+            CpInfo::NameAndType {
+                name_index: 6,
+                descriptor_index: 7,
+            },
+            CpInfo::Fieldref {
+                class_index: 5,
+                name_and_type_index: 8,
+            },
+            CpInfo::Utf8("Slot".into()),
+            CpInfo::Class { name_index: 10 },
+            CpInfo::Utf8("<init>".into()),
+            CpInfo::Utf8("(Lcom/bydeluxe/Lang;)V".into()),
+            CpInfo::NameAndType {
+                name_index: 12,
+                descriptor_index: 13,
+            },
+            CpInfo::Methodref {
+                class_index: 11,
+                name_and_type_index: 14,
+            },
+            CpInfo::Utf8("com/bydeluxe/Bind".into()),
+            CpInfo::Class { name_index: 16 },
+        ];
+        let mut code = Vec::new();
+        for _ in 0..4 {
+            code.extend([NEW, 0, 11, DUP]);
+            code.extend_from_slice(extra);
+            code.extend([GETSTATIC, 0, 9, INVOKESPECIAL, 0, 15, POP]);
+        }
+        code.push(RETURN);
+        let bind = encode_class(
+            &cp,
+            17,
+            &[MethodSpec {
+                name_index: 1,
+                descriptor_index: 2,
+                code_attr_name_index: 3,
+                max_stack: 4,
+                code,
+            }],
+        );
+        let jar = build_zip(&[
+            ("com/bydeluxe/Lang.class", lang),
+            ("com/bydeluxe/Bind.class", bind),
+        ]);
+        let dir = |name: &str, icb, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs,
+        };
+        let jar_dir = dir(
+            "JAR",
+            30,
+            vec![file_with("00000.jar", 32, 4000, jar, true)],
+            vec![],
+        );
+        let root = dir("", 10, vec![], vec![dir("BDMV", 20, vec![], vec![jar_dir])]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    #[test]
+    fn exact_binding_decode_is_high_confidence() {
+        let (mut disc, udf) = deluxe_disc(&[]);
+        let r = parse(&mut disc, &udf).expect("deluxe labels");
+        assert_eq!(r.labels.len(), 4);
+        assert_eq!(r.confidence, super::super::Confidence::High);
+    }
+
+    // An opcode the walker does not model (here `jsr`, which pushes) before a
+    // binding ctor: its labels may sit on the wrong slots, so never High.
+    #[test]
+    fn unmodelled_opcode_before_a_binding_ctor_is_not_high_confidence() {
+        let (mut disc, udf) = deluxe_disc(&[0xA8, 0, 3]);
+        let r = parse(&mut disc, &udf).expect("deluxe labels");
+        assert_eq!(r.confidence, super::super::Confidence::Low);
     }
 
     // ── interpret_streams + deluxe_purpose_to_label tests ───────────────────
@@ -2798,10 +3370,120 @@ mod tests {
         );
         assert_eq!(coding_type_to_codec_hint("DTS_AUDIO"), "DTS");
         assert_eq!(
-            coding_type_to_codec_hint("DTS_HD_MA_AUDIO"),
+            coding_type_to_codec_hint("DTS_HD_AUDIO_XLL"),
             "DTS-HD Master Audio"
         );
         assert_eq!(coding_type_to_codec_hint("LPCM_AUDIO"), "LPCM");
+        assert_eq!(coding_type_to_codec_hint("DRA_AUDIO"), "DRA");
+        assert_eq!(coding_type_to_codec_hint("DRA_EXTENSION_AUDIO"), "DRA");
+    }
+
+    #[test]
+    fn graphics_coding_type_binding_is_not_audio() {
+        let master = lang_enum_master();
+        let mk = |ct: &str| Construction {
+            binding_type: "x".into(),
+            args: vec![
+                StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal: 0,
+                },
+                StackVal::CodingType(ct.into()),
+            ],
+        };
+        let out = interpret_streams(&[mk("PRESENTATION_GRAPHICS"), mk("DTS_AUDIO")], &master);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(
+            (out[1].stream_type, out[1].stream_number),
+            (StreamLabelType::Audio, 1)
+        );
+    }
+
+    // Interactive-graphics and video bindings have no audio or PG STN slot: with or
+    // without a resolved language they must not shift later subtitle numbers.
+    #[test]
+    fn interactive_graphics_and_video_bindings_take_no_subtitle_slot() {
+        let master = lang_enum_master();
+        let mk = |ct: &str, lang: Option<u16>| Construction {
+            binding_type: "x".into(),
+            args: vec![
+                lang.map_or(StackVal::Unknown, |ordinal| StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal,
+                }),
+                StackVal::CodingType(ct.into()),
+            ],
+        };
+        let out = interpret_streams(
+            &[
+                mk("INTERACTIVE_GRAPHICS", Some(2)),
+                mk("PRESENTATION_GRAPHICS", Some(0)),
+                mk("MPEG4_AVC_VIDEO", Some(2)),
+                mk("INTERACTIVE_GRAPHICS", None),
+                mk("TEXT_SUBTITLE", Some(1)),
+            ],
+            &master,
+        );
+        let got: Vec<_> = out
+            .iter()
+            .map(|l| (l.stream_type, l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (StreamLabelType::Subtitle, "eng", 1),
+                (StreamLabelType::Subtitle, "fra", 2),
+            ]
+        );
+    }
+
+    // An unrecognised CodingType name is not decisive: a resolved-language construction
+    // takes its list from its binding type's siblings, and records nothing itself.
+    #[test]
+    fn unknown_coding_type_takes_sibling_kind_and_is_not_recorded() {
+        let mk = |bt: &str, ct: &str, ordinal: u16| Construction {
+            binding_type: bt.into(),
+            args: vec![
+                StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal,
+                },
+                StackVal::CodingType(ct.into()),
+            ],
+        };
+        let cs = [
+            mk("T", "DTS_AUDIO", 0),
+            mk("T", "FUTURE_CODEC_X", 1),
+            mk("U", "FUTURE_CODEC_X", 2),
+        ];
+        assert!(!slot_kinds(&cs).contains_key("U"));
+        let out = interpret_streams(&cs[..2], &lang_enum_master());
+        let got: Vec<_> = out
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(StreamLabelType::Audio, 1), (StreamLabelType::Audio, 2)]
+        );
+    }
+
+    // Bytecode the iterator cannot size (a truncated ldc) ends the walk early: the rest
+    // goes undecoded, so it counts as drift.
+    #[test]
+    fn binding_decoder_counts_early_end_of_walk_as_drift() {
+        let code: Vec<u8> = vec![0x00, LDC]; // ldc lacks its operand
+        let pool = build_simple_pool();
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(decoder.drift, 1);
     }
 
     #[test]
@@ -2911,11 +3593,18 @@ mod tests {
     fn universal_binding_class_decodes_real_per_stream_labels() {
         let tl = parse_fixture(UNI_TL_CLASS);
         let master = universal_master();
-        let constructions = decode_binding_class(&tl, &master);
+        let decoded = decode_binding_class(&tl, &master);
+        assert_eq!(decoded.drift, 0, "the real binding table decodes exactly");
+        let constructions = decoded.constructions;
         assert!(
             !constructions.is_empty(),
             "tl.<clinit> must yield per-stream constructions"
         );
+        // Every `np` audio binding (21) and `wb` subtitle binding (46) must survive
+        // the long-constant / array-store stack modelling.
+        let count = |t: &str| constructions.iter().filter(|c| c.binding_type == t).count();
+        let (np, wb) = (count("np"), count("wb"));
+        assert_eq!((np, wb), (21, 46), "np/wb constructions recovered");
         // The title-wrapper `oq` takes array parameters and must be filtered:
         // every retained construction is a scalar/enum-only binding.
         // (np = 4 args incl. CodingType; wb = 4-5 args incl. `mi`.)

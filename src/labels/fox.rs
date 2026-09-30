@@ -43,10 +43,7 @@ pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     if super::jar_file_exists(udf, "dcx.xml") {
         return true;
     }
-    super::jar::for_each_jar(reader, udf, |_, jar| {
-        super::jar::has_path_prefix(jar, "com/foxbd/").then_some(())
-    })
-    .is_some()
+    super::jar::any_jar_has_prefix(reader, udf, "com/foxbd/")
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
