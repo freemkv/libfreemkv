@@ -3209,6 +3209,36 @@ mod tests {
         );
     }
 
+    // A Dolby Vision EL (second video track) must not drive epochs: its old-clip
+    // straggler after a seam would advance the frontier and open a spurious epoch.
+    #[test]
+    fn dv_enhancement_layer_straggler_does_not_open_a_spurious_epoch() {
+        let tracks = [make_video_track(), make_video_track()];
+        let ms = |m: i64| m * 1_000_000;
+        let frames: Vec<(usize, i64, bool, Vec<u8>)> = vec![
+            (0, ms(0), true, vec![0x01; 16]),
+            (1, ms(0), true, vec![0xB0; 8]),
+            (0, ms(600_000), true, vec![0x02; 16]),
+            (1, ms(600_000), true, vec![0xB1; 8]),
+            // Clip 2: BL resets to 0, then clip 1's EL tail straggles in.
+            (0, ms(0), true, vec![0x03; 16]),
+            (1, ms(599_500), true, vec![0xB2; 8]),
+            (1, ms(0), true, vec![0xB3; 8]),
+            (0, ms(5_000), true, vec![0x04; 16]),
+        ];
+        let (data, frame_count) = mux_to_bytes(&tracks, &[], &frames);
+        assert_eq!(frame_count, 8, "all frames written (none dropped)");
+        let tick = |ms: i64| ms * 1_000_000 / TIMESTAMP_SCALE_NS;
+        let ts: Vec<u64> = find_clusters(&data).iter().map(|&(_, _, t)| t).collect();
+        assert!(ts.windows(2).all(|w| w[1] >= w[0]), "monotonic, got {ts:?}");
+        let max = *ts.iter().max().unwrap() as i64;
+        assert!(max >= tick(600_000), "timeline spans the seam, got {max}");
+        assert!(
+            max < tick(1_000_000),
+            "EL straggler must not ratchet the timeline, got {max} ticks"
+        );
+    }
+
     #[test]
     fn mkv_multiple_tracks() {
         let buf = Cursor::new(Vec::new());

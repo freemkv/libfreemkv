@@ -1800,6 +1800,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A second video track (Dolby Vision EL) rides the base layer's epoch: its
+    // old-clip straggler after a seam must not open a spurious epoch.
+    #[test]
+    fn second_video_track_does_not_drive_epochs() {
+        let dir = tempdir();
+        let title = title_with(
+            vec![video_stream(Codec::H264), video_stream(Codec::H264)],
+            vec![None, None],
+        );
+        let mut sink = DemuxSink::create(&dir, &title, &DemuxOptions::default()).unwrap();
+        let fr = |track: usize, pts: i64| PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track,
+            pts,
+            keyframe: true,
+            data: vec![0x00, 0x00, 0x00, 0x01, 0xAA],
+            duration_ns: None,
+        };
+        let s = 1_000_000_000i64;
+        for f in [fr(0, 0), fr(1, 0), fr(0, 600 * s), fr(1, 600 * s), fr(0, 0)] {
+            sink.write(&f).unwrap();
+        }
+        let seam = sink.timeline.offset_ns;
+        assert!(seam >= 600 * s, "base layer reset opens the epoch");
+        // Clip 1's EL tail, EL at the new clip's start, then BL continues.
+        for f in [fr(1, 599 * s + s / 2), fr(1, 0), fr(0, 5 * s)] {
+            sink.write(&f).unwrap();
+        }
+        assert_eq!(
+            sink.timeline.offset_ns, seam,
+            "the EL straggler must not open another epoch"
+        );
+        sink.finish().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── End-to-end sink ──────────────────────────────────────────────────────
 
     #[test]
