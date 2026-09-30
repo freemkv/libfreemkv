@@ -138,7 +138,8 @@ impl TrueHdParser {
             return AuCheck::Unverifiable; // no major sync seen yet — can't check parity
         };
         let Some(shs) = mlp_substr_header_size(au, header_size, nss) else {
-            return AuCheck::Unverifiable; // directory runs off the AU — can't judge
+            // Baseline proven by a CRC-validated major sync: an overrunning directory is corruption.
+            return AuCheck::Corrupt;
         };
         if !mlp_parity_ok(au, header_size, shs) {
             return AuCheck::Corrupt;
@@ -1125,6 +1126,19 @@ mod tests {
                 "only the real 200-byte major syncs survive"
             );
         }
+    }
+
+    #[test]
+    fn au_shorter_than_directory_after_baseline_arms_resync() {
+        // With a proven baseline, a 2-byte AU can't hold its substream directory:
+        // it is corruption, so it is dropped and the next normal AU is dropped forward.
+        let mut parser = TrueHdParser::new();
+        let mut data = valid_major_sync();
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.extend_from_slice(&valid_normal_au());
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 1, "runt AU and its follower are dropped");
+        assert!(parser.dropped_frames() >= 1);
     }
 
     #[test]

@@ -504,7 +504,6 @@ fn mux_keyed(
                 let scope = crate::keys::KeyScope::Titles(vec![title_index]);
                 if !set.is_for(disc) || !set.covers(&scope) {
                     tracing::error!(target: "freemkv::keys", "key set is not for this session's title");
-                    debug_assert!(false, "key set is not for this session's title");
                     return Err(Error::DecryptFailed.into());
                 }
                 let title = disc

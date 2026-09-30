@@ -534,11 +534,7 @@ where
     }
     let title = disc.titles[idx].clone();
     let format = disc.content_format;
-    // ISO file: use the same tuned batch as the other file-backed mux path.
-
-    // Pass `DecryptKeys::None` to the decrypt decorator when --raw is set —
-    // the read stack still flows through the same producer+demux+parse
-    // pipeline, just without the AACS/CSS step. One highway for ISO reads.
+    // `--raw` passes `DecryptKeys::None`: same read pipeline, no AACS/CSS step.
     let effective_keys = if opts.raw {
         crate::decrypt::DecryptKeys::None
     } else {

@@ -145,6 +145,9 @@ pub(crate) fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
             offset += nal_len;
         }
     }
+    if truncated {
+        tracing::warn!(target: "mux", "hvcC truncated; parameter sets may be incomplete");
+    }
     if out.is_empty() { None } else { Some(out) }
 }
 
@@ -286,7 +289,11 @@ pub(crate) fn avcc_to_annex_b(avcc: &[u8]) -> Option<Vec<u8>> {
     if sps_ok && offset < avcc.len() {
         let num_pps = avcc[offset] as usize;
         offset += 1;
-        take(avcc, num_pps, &mut offset, &mut out);
+        if !take(avcc, num_pps, &mut offset, &mut out) {
+            tracing::warn!(target: "mux", "avcC truncated in PPS; parameter sets incomplete");
+        }
+    } else if !sps_ok {
+        tracing::warn!(target: "mux", "avcC truncated in SPS; parameter sets incomplete");
     }
 
     if out.is_empty() { None } else { Some(out) }
@@ -860,5 +867,15 @@ mod tests {
             out, expected,
             "finish must deliver the whole Annex B stream to the sink"
         );
+    }
+
+    #[test]
+    fn avcc_truncated_pps_keeps_sps() {
+        // numPPS=1 but the PPS body runs past the end: SPS is salvaged.
+        let avcc = [
+            1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x42, 1, 0, 9, 0x68,
+        ];
+        let out = avcc_to_annex_b(&avcc).expect("SPS kept");
+        assert_eq!(out, vec![0, 0, 0, 1, 0x67, 0x42]);
     }
 }
