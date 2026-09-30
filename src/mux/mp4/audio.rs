@@ -125,7 +125,7 @@ fn parse_ac3(f: &[u8]) -> Option<DolbyConfig> {
         lfeon,
         bit_rate_code: frmsizecod >> 1,
         data_rate_kbps: 0,
-        sample_rate: FSCOD_RATES.get(fscod as usize).copied().unwrap_or(48_000),
+        sample_rate: *FSCOD_RATES.get(fscod as usize)?,
         channels: DolbyConfig::channel_count(acmod, lfeon),
     })
 }
@@ -145,6 +145,9 @@ fn parse_eac3(f: &[u8]) -> Option<DolbyConfig> {
 
     let (sample_rate, blocks) = if fscod == 0x03 {
         let fscod2 = (f[4] >> 4) & 0x03; // shares bits with numblkscod when fscod==3
+        if fscod2 == 0x03 {
+            return None; // reserved
+        }
         (EAC3_REDUCED_RATES[fscod2 as usize], 6u32)
     } else {
         let blocks = [1u32, 2, 3, 6][numblkscod as usize];
@@ -244,10 +247,11 @@ pub(super) fn audio_sample_entry(
 
 // ── DTS (dtsc/dtsh + ddts) ───────────────────────────────────────────────────
 
-/// DTS core `SFREQ` (4-bit) → sample rate (Hz). Reserved indices → 48 kHz.
+/// DTS core `SFREQ` (4-bit) → sample rate (Hz); 0 marks an invalid code
+/// (0, 4, 5, 9, 10). Codes 14 and 15 map to 96 kHz / 192 kHz.
 const DTS_SFREQ: [u32; 16] = [
-    48_000, 8_000, 16_000, 32_000, 48_000, 48_000, 11_025, 22_050, 44_100, 48_000, 48_000, 12_000,
-    24_000, 48_000, 96_000, 192_000,
+    0, 8_000, 16_000, 32_000, 0, 0, 11_025, 22_050, 44_100, 0, 0, 12_000, 24_000, 48_000, 96_000,
+    192_000,
 ];
 // DTS core base channel count per AMODE (ETSI TS 102 114 §5.3.1); matches the decodability
 // gate's DTS_AMODE_COUNT in dts.rs.
@@ -288,6 +292,9 @@ fn parse_dts(frame: &[u8]) -> Option<DtsConfig> {
     let lfe = lff == 1 || lff == 2;
 
     let sample_rate = DTS_SFREQ[sfreq];
+    if sample_rate == 0 {
+        return None;
+    }
     // AMODE is a 6-bit field, so 16..=63 are reachable but RESERVED (ETSI TS 102 114) —
     // no channel count or speaker mask is known for them. Refuse rather than guess: the
     // old `unwrap_or(6)` invented a count the speaker mask could not match.
@@ -419,8 +426,8 @@ fn dts_entry_rate(max_rate: u32) -> u32 {
     }
 }
 
-/// The MP4 fourcc + config box for an audio frame, or `None` if the codec has no
-/// MP4 mapping here. Together with [`audio_fits`] this is the fit oracle for
+/// The complete MP4 AudioSampleEntry (Dolby and DTS) for an audio frame, or `None`
+/// if the codec has no MP4 mapping here. Together with [`audio_fits`] this is the fit oracle for
 /// audio: only what returns `Some` is muxable.
 /// `stream_hz` is the title's rate for the track (0 if unknown).
 pub(super) fn dolby_sample_entry(
@@ -747,7 +754,7 @@ mod tests {
         // fsize=8 → core_size=9; the EXSS sync sits exactly at byte 9 (right after
         // the core) and MUST be detected → dtsh. Guards the off-by-4 boundary.
         let f = vec![
-            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x64, 0x58, 0x20, 0x25,
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00, 0x80, 0x34, 0x64, 0x58, 0x20, 0x25,
         ];
         let c = parse_dts(&f).expect("parses");
         assert_eq!(c.core_size, 9);
@@ -817,7 +824,7 @@ mod tests {
         // extension substream is still ONE asset, so deriving the flag from "EXSS
         // follows the core" told a parser to select a nonexistent second asset — 0 is honest.
         let f = vec![
-            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x64, 0x58, 0x20, 0x25,
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00, 0x00, 0x80, 0x34, 0x64, 0x58, 0x20, 0x25,
         ];
         let c = parse_dts(&f).expect("parses");
         assert!(c.has_extension, "fixture must exercise the extension path");
@@ -1263,5 +1270,21 @@ mod tests {
         // 8-byte box header + body offset 24 (6+2+8+2+2+2+2) → samplerate at 32;
         // high 16 bits = the integer rate.
         assert_eq!(&e[32..34], &[0xFF, 0xFF], "capped to 65535, not wrapped");
+    }
+
+    #[test]
+    fn reserved_sample_rate_codes_are_refused() {
+        let mut f = eac3_frame_5_1();
+        f[4] = 0b1111_1111; // fscod=3, fscod2=3 (reserved)
+        assert!(parse_dolby(&f).is_none());
+        let mut f = ac3_frame_5_1();
+        f[4] = 0b11_010110; // fscod=3 (reserved)
+        assert!(parse_dolby(&f).is_none());
+        let mut f = vec![
+            0x7F, 0xFE, 0x80, 0x01, 0x00, 0x3C, 0x05, 0xF2, 0x77, 0x00, 0x02, 0x00,
+        ];
+        assert!(parse_dts(&f).is_some());
+        f[8] = 0x43; // SFREQ 0 is invalid
+        assert!(parse_dts(&f).is_none());
     }
 }

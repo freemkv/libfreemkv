@@ -1228,6 +1228,20 @@ impl MkvStream {
                             _ => skip_bytes(&mut rs.reader, cs)?,
                         }
                     }
+                    if block.is_none() {
+                        // Block is mandatory (RFC 9559); count the unit as lost, never silent.
+                        if rs.additions_dropped == 0 {
+                            tracing::warn!(
+                                target: "mux",
+                                bytes = size,
+                                "mkv read-back: dropping a BlockGroup with no Block; \
+                                 counted in lost_bytes/errors."
+                            );
+                        }
+                        rs.additions_dropped = rs.additions_dropped.saturating_add(1);
+                        rs.additions_dropped_bytes =
+                            rs.additions_dropped_bytes.saturating_add(size);
+                    }
                     if let Some(block) = block {
                         // BLOCK_DURATION is TimestampScale ticks, not ms — scale by
                         // ts_scale_ns (1_000_000 for our own 1ms scale, non-default
@@ -1454,8 +1468,8 @@ impl crate::pes::Stream for MkvStream {
         true // MKV has all headers upfront in the EBML header
     }
 
-    // Count of `BlockAdditions` subtrees dropped on read-back (e.g. a 3D MVC
-    // dependent-view AU the PES frame model can't carry). Reported like a
+    // Count of `BlockAdditions` subtrees (e.g. a 3D MVC dependent-view AU the PES
+    // frame model can't carry) and Block-less BlockGroups dropped on read-back. Reported like a
     // disc-read skip: `0` for write side / sources with no `BlockAdditions`.
     fn errors(&self) -> u64 {
         match self.mode {
@@ -1464,7 +1478,7 @@ impl crate::pes::Stream for MkvStream {
         }
     }
 
-    // Cumulative `BlockAdditions` bytes dropped on read-back; counts the whole
+    // Cumulative bytes of the units counted by `errors()`; counts the whole
     // skipped subtree (payload + EBML framing), an upper bound on the payload.
     fn lost_bytes(&self) -> u64 {
         match self.mode {
@@ -1503,12 +1517,10 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
         return Err(crate::error::Error::MkvSourceInvalid.into());
     }
 
-    let (mut got_info, mut got_tracks) = (false, false);
+    let mut chapters: Vec<Chapter> = Vec::new();
 
+    // Runs on past Info+Tracks to the first Cluster so a later Chapters is found.
     loop {
-        if got_info && got_tracks {
-            break;
-        }
         let (id, size, _) = match ebml::read_element_header(r) {
             Ok(h) => h,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -1554,7 +1566,6 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
                         }
                     }
                 }
-                got_info = true;
             }
             ebml::TRACKS => {
                 if size == u64::MAX {
@@ -1591,7 +1602,12 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
                         skip_bytes(r, cs)?;
                     }
                 }
-                got_tracks = true;
+            }
+            ebml::CHAPTERS => {
+                if size == u64::MAX {
+                    return Err(crate::error::Error::MkvSourceInvalid.into());
+                }
+                chapters = parse_chapters(r, size)?;
             }
             ebml::CLUSTER => break,
             _ if size != u64::MAX => {
@@ -1615,6 +1631,7 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
         playlist: title,
         duration_secs: duration_secs.unwrap_or(0.0),
         streams,
+        chapters,
         ..DiscTitle::empty()
     };
     // Clamp the (untrusted) scale to a positive i64 for the tick→ns multiply on
@@ -1631,6 +1648,67 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
         tracks,
         probe,
     })
+}
+
+/// Most chapter marks kept from an untrusted Chapters element.
+const MAX_CHAPTERS: usize = 4096;
+
+/// Read the first EditionEntry's top-level ChapterAtoms (start time + first
+/// ChapString, else a 1-based index) from a Chapters body of `size` bytes.
+fn parse_chapters(r: &mut impl Read, size: u64) -> io::Result<Vec<Chapter>> {
+    // Read `size` bytes of child elements, calling `f` for each; guards overruns.
+    fn children<R: Read>(
+        r: &mut R,
+        size: u64,
+        f: &mut dyn FnMut(&mut R, u32, u64) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut remaining = size;
+        while remaining > 0 {
+            let (cid, cs, hlen) = ebml::read_element_header(r)?;
+            let consumed = (hlen as u64).saturating_add(cs);
+            if cs == u64::MAX || consumed > remaining {
+                return Err(crate::error::Error::MkvSourceInvalid.into());
+            }
+            remaining -= consumed;
+            f(r, cid, cs)?;
+        }
+        Ok(())
+    }
+    let mut out: Vec<Chapter> = Vec::new();
+    let mut edition_done = false;
+    children(r, size, &mut |r, cid, cs| {
+        if cid != ebml::EDITION_ENTRY || edition_done {
+            return skip_bytes(r, cs);
+        }
+        edition_done = true;
+        children(r, cs, &mut |r, cid, cs| {
+            if cid != ebml::CHAPTER_ATOM || out.len() >= MAX_CHAPTERS {
+                return skip_bytes(r, cs);
+            }
+            let (mut start_ns, mut name) = (0u64, None);
+            children(r, cs, &mut |r, cid, cs| match cid {
+                ebml::CHAPTER_TIME_START => {
+                    start_ns = read_uint_bounded(r, cs)?;
+                    Ok(())
+                }
+                ebml::CHAPTER_DISPLAY => children(r, cs, &mut |r, cid, cs| {
+                    if cid == ebml::CHAP_STRING && name.is_none() {
+                        name = Some(read_string_bounded(r, cs)?);
+                        Ok(())
+                    } else {
+                        skip_bytes(r, cs)
+                    }
+                }),
+                _ => skip_bytes(r, cs),
+            })?;
+            out.push(Chapter {
+                time_secs: start_ns as f64 / 1_000_000_000.0,
+                name: name.unwrap_or_else(|| (out.len() + 1).to_string()),
+            });
+            Ok(())
+        })
+    })?;
+    Ok(out)
 }
 
 /// Largest valid 13-bit MPEG-TS PID.
@@ -1919,6 +1997,10 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         Codec::Vc1
     } else if cid == ebml::CODEC_MPEG2 {
         Codec::Mpeg2
+    } else if cid == ebml::CODEC_MPEG1 {
+        Codec::Mpeg1
+    } else if cid == ebml::CODEC_AV1 {
+        Codec::Av1
     } else if cid == ebml::CODEC_AC3 {
         Codec::Ac3
     } else if cid == ebml::CODEC_EAC3 {
@@ -1959,9 +2041,8 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     } else if sr >= 48000.0 {
         SampleRate::S48
     } else {
-        // Below the lowest mapped rate is UNKNOWN, not 48kHz: the ladder's final
-        // `else` used to be S48, so a legal 32kHz AC-3/DTS track was misrecorded as
-        // 48kHz. This float ladder exists only for tolerance vs. `SampleRate::from_hz`.
+        // Below the lowest mapped rate is UNKNOWN, not 48kHz (a legal 32kHz
+        // AC-3/DTS track must not be recorded as 48kHz). This float ladder exists only for tolerance vs. `SampleRate::from_hz`.
         SampleRate::Unknown
     };
 
@@ -6388,5 +6469,93 @@ mod tests {
             None
         );
         assert_eq!(parse_freemkv_version("mkvmerge v80.0 ('x') 64-bit"), None);
+    }
+
+    // Info + Tracks (one entry with `codec_id`) + optional Chapters + one Cluster
+    // holding `cluster_body`, as raw EBML.
+    fn synthetic_mkv(codec_id: &str, chapters: &[u8], cluster_body: &[u8]) -> Vec<u8> {
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        ebml::write_string(&mut entry, ebml::CODEC_ID, codec_id).unwrap();
+        let mut tracks = Vec::new();
+        ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+        tracks.extend_from_slice(&entry);
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+        out.extend_from_slice(chapters);
+        ebml::write_id(&mut out, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        out.extend_from_slice(cluster_body);
+        out
+    }
+
+    #[test]
+    fn read_back_keeps_chapters() {
+        let mut atoms = Vec::new();
+        for (t, name) in [(0u64, "1"), (5_000_000_000, "Two")] {
+            let mut body = Vec::new();
+            ebml::write_uint(&mut body, ebml::CHAPTER_TIME_START, t).unwrap();
+            let mut disp = Vec::new();
+            ebml::write_string(&mut disp, ebml::CHAP_STRING, name).unwrap();
+            ebml::write_id(&mut body, ebml::CHAPTER_DISPLAY).unwrap();
+            ebml::write_size(&mut body, disp.len() as u64).unwrap();
+            body.extend_from_slice(&disp);
+            ebml::write_id(&mut atoms, ebml::CHAPTER_ATOM).unwrap();
+            ebml::write_size(&mut atoms, body.len() as u64).unwrap();
+            atoms.extend_from_slice(&body);
+        }
+        let mut edition = Vec::new();
+        ebml::write_id(&mut edition, ebml::EDITION_ENTRY).unwrap();
+        ebml::write_size(&mut edition, atoms.len() as u64).unwrap();
+        edition.extend_from_slice(&atoms);
+        let mut chapters = Vec::new();
+        ebml::write_id(&mut chapters, ebml::CHAPTERS).unwrap();
+        ebml::write_size(&mut chapters, edition.len() as u64).unwrap();
+        chapters.extend_from_slice(&edition);
+
+        let stream =
+            MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", &chapters, &[]))).unwrap();
+        let got: Vec<(f64, String)> = crate::pes::Stream::info(&stream)
+            .chapters
+            .iter()
+            .map(|c| (c.time_secs, c.name.clone()))
+            .collect();
+        assert_eq!(got, vec![(0.0, "1".to_string()), (5.0, "Two".to_string())]);
+    }
+
+    #[test]
+    fn read_back_maps_mpeg1_and_av1_codec_ids() {
+        for (id, want) in [("V_MPEG1", Codec::Mpeg1), ("V_AV1", Codec::Av1)] {
+            let stream = MkvStream::open(Cursor::new(synthetic_mkv(id, &[], &[]))).unwrap();
+            match &crate::pes::Stream::info(&stream).streams[0] {
+                crate::disc::Stream::Video(v) => assert_eq!(v.codec, want, "{id}"),
+                _ => panic!("expected a video stream"),
+            }
+        }
+    }
+
+    #[test]
+    fn blockless_block_group_is_counted_not_silent() {
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::BLOCK_GROUP).unwrap();
+        let mut body = Vec::new();
+        ebml::write_uint(&mut body, ebml::BLOCK_DURATION, 40).unwrap();
+        ebml::write_size(&mut cluster, body.len() as u64).unwrap();
+        cluster.extend_from_slice(&body);
+        let mut stream =
+            MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", &[], &cluster))).unwrap();
+        assert!(crate::pes::Stream::read(&mut stream).unwrap().is_none());
+        assert_eq!(crate::pes::Stream::errors(&stream), 1);
+        assert!(crate::pes::Stream::lost_bytes(&stream) > 0);
     }
 }

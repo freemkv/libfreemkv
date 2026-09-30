@@ -425,6 +425,9 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     let mut meta: M2tsMeta =
         serde_json::from_slice(&json_buf).map_err(|_| crate::error::Error::NoMetadata)?;
     meta.frame_padding = magic[VERSION_BYTE] >= 2;
+    // The wire track is a u8: cap untrusted timings so timing() stays O(256).
+    meta.timings.retain(|t| t.track < 256);
+    meta.timings.truncate(256);
 
     // Skip padding to next 192-byte boundary (at most BD_SOURCE_PACKET_BYTES-1 bytes →
     // a stack buffer, no heap allocation).
@@ -887,5 +890,22 @@ mod tests {
             assert_eq!(back.frame_padding, version == 2);
             assert_eq!(back.timing(0), timings.first().copied().unwrap_or_default());
         }
+    }
+
+    #[test]
+    fn read_header_caps_untrusted_timings() {
+        let t = video_title(HdrFormat::Sdr, ColorSpace::Bt709);
+        let mut meta = M2tsMeta::from_title(&t);
+        meta.timings = (0..5000)
+            .map(|track| MetaTiming {
+                track,
+                codec_delay_ns: 1,
+                seek_preroll_ns: 1,
+            })
+            .collect();
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).unwrap();
+        let back = read_header(&mut io::Cursor::new(&buf)).unwrap().unwrap();
+        assert!(back.timings.len() <= 256);
     }
 }
