@@ -30,7 +30,6 @@ const BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// `Self::with_size_hint` additionally pre-reserves extents via `fallocate`.
 pub struct LocalFileSink {
     inner: BufWriter<File>,
-    hinted: bool,
 }
 
 impl LocalFileSink {
@@ -44,7 +43,6 @@ impl LocalFileSink {
             .open(path)?;
         Ok(Self {
             inner: BufWriter::with_capacity(BUFFER_BYTES, file),
-            hinted: false,
         })
     }
 
@@ -65,7 +63,6 @@ impl LocalFileSink {
         preallocate::preallocate(&file, size_bytes);
         Ok(Self {
             inner: BufWriter::with_capacity(BUFFER_BYTES, file),
-            hinted: true,
         })
     }
 
@@ -77,11 +74,6 @@ impl LocalFileSink {
     /// object too.
     pub fn sync_all(&mut self) -> io::Result<()> {
         self.inner.flush()?;
-        // Release the KEEP_SIZE reservation past EOF (a same-length truncate frees it).
-        if std::mem::take(&mut self.hinted) {
-            let f = self.inner.get_ref();
-            f.set_len(f.metadata()?.len())?;
-        }
         self.inner.get_ref().sync_all()
     }
 }

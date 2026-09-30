@@ -42,7 +42,7 @@ impl Default for JoinTiming {
 
 // Cached FREEMKV_DEBUG=1 lookup — called per item on the mux hot loop,
 // so the env lock is paid once, not per call.
-fn debug_enabled() -> bool {
+pub fn debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FREEMKV_DEBUG")
