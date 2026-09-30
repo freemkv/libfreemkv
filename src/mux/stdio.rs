@@ -5,14 +5,15 @@
 
 use super::meta;
 use crate::disc::DiscTitle;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 /// Stdio stream — reads PES from stdin, writes PES to stdout.
 /// FMKV metadata header is written/read automatically.
 pub struct StdioStream {
     disc_title: DiscTitle,
-    reader: Option<io::Stdin>,
-    writer: Option<io::BufWriter<io::Stdout>>,
+    // Boxed so tests can drive the header logic without real stdin/stdout.
+    reader: Option<Box<dyn Read + Send>>,
+    writer: Option<io::BufWriter<Box<dyn Write + Send>>>,
     header_written: bool,
     header_read: bool,
     /// True once an FMKV header was actually parsed on the read side
@@ -31,9 +32,13 @@ pub struct StdioStream {
 impl StdioStream {
     /// Create a stdio stream for reading (stdin).
     pub fn input() -> Self {
+        Self::from_reader(Box::new(io::stdin()))
+    }
+
+    fn from_reader(reader: Box<dyn Read + Send>) -> Self {
         Self {
             disc_title: DiscTitle::empty(),
-            reader: Some(io::stdin()),
+            reader: Some(reader),
             writer: None,
             header_written: false,
             header_read: false,
@@ -45,10 +50,14 @@ impl StdioStream {
 
     /// Create a stdio stream for writing (stdout).
     pub fn output(title: &DiscTitle) -> Self {
+        Self::from_writer(title, Box::new(io::stdout()))
+    }
+
+    fn from_writer(title: &DiscTitle, writer: Box<dyn Write + Send>) -> Self {
         Self {
             disc_title: title.clone(),
             reader: None,
-            writer: Some(io::BufWriter::new(io::stdout())),
+            writer: Some(io::BufWriter::new(writer)),
             header_written: false,
             header_read: false,
             meta_parsed: false,
@@ -76,12 +85,15 @@ impl StdioStream {
         if self.header_read {
             return Ok(());
         }
-        self.header_read = true;
         if let Some(ref mut r) = self.reader {
-            // Propagate real header errors: read_header consumes stdin bytes BEFORE it can
-            // fail, so swallowing the Err would misalign the stream and make deserialize read
-            // garbage. Ok(None) (magic mismatch / clean EOF) stays non-error (default title).
-            if let Some(m) = meta::read_header(r)? {
+            // stdin cannot rewind, so any header failure after bytes were consumed is an error
+            // (never a misaligned frame read); only a clean zero-byte EOF is headerless.
+            let mut counted = Counted { inner: r, n: 0 };
+            let header = meta::read_header(&mut counted)?;
+            if header.is_none() && counted.n > 0 {
+                return Err(crate::error::Error::NoMetadata.into());
+            }
+            if let Some(m) = header {
                 self.disc_title = m.to_title();
                 self.timings = (0..self.disc_title.streams.len())
                     .map(|i| m.timing(i))
@@ -90,7 +102,24 @@ impl StdioStream {
                 self.meta_parsed = true;
             }
         }
+        // Set only on success: a failed header leaves the next read() failing, not parsing
+        // mid-header bytes as frames.
+        self.header_read = true;
         Ok(())
+    }
+}
+
+// Counts the bytes a header probe consumed from a non-rewindable reader.
+struct Counted<'a, R: ?Sized> {
+    inner: &'a mut R,
+    n: u64,
+}
+
+impl<R: Read + ?Sized> Read for Counted<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let got = self.inner.read(buf)?;
+        self.n += got as u64;
+        Ok(got)
     }
 }
 
@@ -264,5 +293,100 @@ mod tests {
         let s = StdioStream::input();
         assert!(s.info().streams.is_empty());
         assert_eq!(s.codec_private(0), None);
+    }
+
+    fn frame(data: &[u8]) -> crate::pes::PesFrame {
+        crate::pes::PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 7,
+            keyframe: true,
+            data: data.to_vec(),
+            duration_ns: None,
+        }
+    }
+
+    fn reader(bytes: Vec<u8>) -> StdioStream {
+        StdioStream::from_reader(Box::new(io::Cursor::new(bytes)))
+    }
+
+    fn code(e: &io::Error) -> Option<u16> {
+        crate::error::error_code(e)
+    }
+
+    #[derive(Clone, Default)]
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Write side -> read side over the FMKV wire: header parsed on the first read (title,
+    // codec_private, timing), headers_ready only after it, timing frozen once written.
+    #[test]
+    fn header_round_trips_and_gates_readiness() {
+        let out = Shared::default();
+        let mut w = StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+        let timing = crate::pes::TrackTiming {
+            codec_delay_ns: 5,
+            seek_preroll_ns: 9,
+        };
+        w.set_track_timing(0, timing).unwrap();
+        w.write(&frame(&[1, 2, 3])).unwrap();
+        let e = w.set_track_timing(0, timing).unwrap_err();
+        assert_eq!(code(&e), Some(crate::error::E_STREAM_HEADER_WRITTEN));
+        w.finish().unwrap();
+
+        let mut r = reader(out.0.lock().unwrap().clone());
+        assert!(!r.headers_ready());
+        let f = r.read().unwrap().unwrap();
+        assert_eq!((f.pts, f.data), (7, vec![1, 2, 3]));
+        assert!(r.headers_ready());
+        assert_eq!(r.info().playlist, "StdioTitle");
+        assert_eq!(r.codec_private(0), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(r.track_timing(0), timing);
+        assert!(r.read().unwrap().is_none());
+    }
+
+    // A zero-byte stdin is a clean headerless end, and never header-ready.
+    #[test]
+    fn empty_input_is_clean_eof_not_ready() {
+        let mut r = reader(Vec::new());
+        assert!(r.read().unwrap().is_none());
+        assert!(!r.headers_ready(), "no header was parsed");
+    }
+
+    // Bytes that are not an FMKV header were consumed from a non-rewindable stream, so the
+    // frames after them cannot be aligned: NoMetadata, not a misread frame.
+    #[test]
+    fn non_fmkv_input_is_no_metadata() {
+        for lead in [&[0x00u8][..], b"FMKX\0\x01\0\0"] {
+            let mut bytes = lead.to_vec();
+            frame(&[4, 5]).serialize(&mut bytes).unwrap();
+            let e = reader(bytes).read().unwrap_err();
+            assert_eq!(code(&e), Some(crate::error::E_NO_METADATA), "{lead:?}");
+        }
+    }
+
+    // A header that failed mid-way is not skipped on a retry: the next read must not parse
+    // the rest of the header region as frames.
+    #[test]
+    fn failed_header_is_not_retried_as_frames() {
+        let mut bytes = b"FMKV\0\x01\0\0".to_vec();
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // over the JSON size cap
+        frame(&[4, 5]).serialize(&mut bytes).unwrap();
+        let mut r = reader(bytes);
+        assert_eq!(
+            code(&r.read().unwrap_err()),
+            Some(crate::error::E_NO_METADATA)
+        );
+        assert!(r.read().is_err(), "retry must not yield a frame");
     }
 }
