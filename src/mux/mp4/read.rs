@@ -998,18 +998,33 @@ fn mpeg_audio_layer<R: Read + Seek>(file: &mut R, file_len: u64, offset: u64) ->
 }
 
 /// Nearest standard frame rate (the muxer's table) to the mean `stts` delta, else `Unknown`.
-// Mean, not median: a 1 kHz timescale rounds 41.708 ms frames to a 41/42 ms pattern.
+// Mean over deltas within 1 tick of the median: a 1 kHz timescale rounds 41.708 ms frames
+// to a 41/42 ms pattern, while one long final sample must not skew the rate.
 fn frame_rate_from_stts(timescale: u32, durations: &[u32]) -> FrameRate {
-    let d: Vec<u64> = durations
-        .iter()
-        .filter(|&&d| d > 0)
-        .map(|&d| d as u64)
-        .collect();
-    if d.is_empty() {
+    let mut hist: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    for &d in durations.iter().filter(|&&d| d > 0) {
+        *hist.entry(d as u64).or_default() += 1;
+    }
+    let total: u64 = hist.values().sum();
+    if total == 0 {
         return FrameRate::Unknown;
     }
-    let fps = timescale as f64 * d.len() as f64 / d.iter().sum::<u64>() as f64;
-    match super::nearest_std_rate(fps) {
+    let mut seen = 0;
+    let mut median = 0;
+    for (&d, &c) in &hist {
+        seen += c;
+        if seen * 2 > total {
+            median = d;
+            break;
+        }
+    }
+    let (n, sum) = hist
+        .iter()
+        .filter(|&(&d, _)| d.abs_diff(median) <= 1)
+        .fold((0u64, 0u64), |(n, s), (&d, &c)| (n + c, s + d * c));
+    let fps = timescale as f64 * n as f64 / sum as f64;
+    let rate_ok = |r: f64| (fps - r).abs() <= r * 0.001;
+    match super::nearest_std_rate(fps).filter(|&(ts, dur)| rate_ok(ts as f64 / dur as f64)) {
         Some((24000, 1001)) => FrameRate::F23_976,
         Some((24, 1)) => FrameRate::F24,
         Some((25, 1)) => FrameRate::F25,
@@ -3951,6 +3966,11 @@ mod tests {
         let d = [vec![33; 19], vec![34; 11]].concat();
         assert_eq!(frame_rate_from_stts(1000, &d), FrameRate::F29_97);
         assert_eq!(frame_rate_from_stts(1000, &[40; 9]), FrameRate::F25);
+        // A long final sample must not drag exact 24 fps onto 23.976.
+        let mut d = vec![1000u32; 14_400];
+        d.push(13_000);
+        assert_eq!(frame_rate_from_stts(24000, &d), FrameRate::F24);
+        assert_eq!(frame_rate_from_stts(1000, &[41; 9]), FrameRate::Unknown);
         let rd = Mp4Reader::from_reader(
             std::io::Cursor::new(audio_moov(1000, b"ac-3", &audio_entry(6, 0, &[]))),
             "d".into(),
