@@ -597,8 +597,9 @@ impl Drive {
     }
 
     /// Wait for the drive to become ready: TEST UNIT READY every 500 ms until it
-    /// answers GOOD. Fails with `DeviceNotReady` only after 60 s without progress
-    /// (§2.11): an answer not yet seen in this wait, or a rising progress indicator.
+    /// answers GOOD. Fails with `DeviceNotReady` after 60 s without progress
+    /// (§2.11): an answer not yet seen in this wait, or a rising progress indicator;
+    /// or after an absolute 10 min ceiling, however much progress it shows.
     /// A Stop interrupts between polls; a dead bus fails after 5 s of failures.
     pub fn wait_ready(&mut self) -> Result<()> {
         self.wait_ready_with(WaitReadyTiming::PRODUCTION)
@@ -610,6 +611,7 @@ impl Drive {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "wait_ready", "begin");
         let mut hb = crate::progress::Heartbeat::new("wait_ready");
+        let ceiling_hit: bool;
         // T6: the answers seen so far and the highest progress indicator; either
         // growing re-arms the no-progress window.
         let moved = Progress::new();
@@ -694,7 +696,9 @@ impl Drive {
                     }
                 }
             }
-            if stall.poll(&moved) == crate::halt::Stall::Expired || t0.elapsed() >= timing.ceiling {
+            let stalled = stall.poll(&moved) == crate::halt::Stall::Expired;
+            if stalled || t0.elapsed() >= timing.ceiling {
+                ceiling_hit = !stalled;
                 break;
             }
             self.pause(timing.poll)?;
@@ -704,7 +708,8 @@ impl Drive {
             phase = "wait_ready",
             elapsed_ms = t0.elapsed().as_millis() as u64,
             window_ms = timing.window.as_millis() as u64,
-            "device never became ready: no progress for the whole window"
+            ceiling_hit,
+            "device never became ready: no progress for the window, or the ceiling was hit"
         );
         Err(Error::DeviceNotReady {
             path: self.device_path.clone(),
@@ -1107,8 +1112,14 @@ impl Drive {
     /// OEM VID through it (VID via the OEM path is decoupled from the host cert +
     /// HRL). This mirrors [`Self::has_profile`] — the honest signal is "an
     /// unlocker claims this drive" — rather than the old const `false`.
-    pub fn is_unlocked(&self) -> bool {
+    pub fn has_unlocker(&self) -> bool {
         crate::unlock_bridge::unlocker_name(&self.drive_id).is_some()
+    }
+
+    /// Deprecated alias of [`Self::has_unlocker`].
+    #[deprecated(note = "use has_unlocker")]
+    pub fn is_unlocked(&self) -> bool {
+        self.has_unlocker()
     }
 
     /// Read sectors from the disc. Single-shot — no inline retries, no
@@ -1283,15 +1294,9 @@ impl Drive {
                 {
                     let len = count as usize * 2048;
                     let offset = lba as i64 * 2048;
-                    // Drop the page cache for this region so the read hits the device.
-                    // SAFETY: fd is the block fd this Drive owns; no pointers are passed.
-                    let _ = unsafe {
-                        libc::posix_fadvise(fd, offset, len as i64, libc::POSIX_FADV_DONTNEED)
-                    };
-                    // SAFETY: buf.len() >= len (checked above), so pread writes in bounds.
-                    let n = unsafe {
-                        libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, len, offset)
-                    };
+                    // A Stop that landed since exec's check issues no blocking read.
+                    self.check_token()?;
+                    let n = crate::scsi::linux::pread_uncached(fd, &mut buf[..len], offset);
                     if n == len as isize {
                         // A Stop during the blocking read discards the data, as `exec` does.
                         self.check_token()?;
@@ -1426,7 +1431,7 @@ impl Drive {
     pub fn eject(&mut self) -> Result<()> {
         self.unlock_tray();
         // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted".
-        let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
+        let eject_cdb = allow::EJECT_CDB;
         let mut buf = [0u8; 0];
         self.exec(
             &eject_cdb,
@@ -1443,7 +1448,7 @@ impl Drive {
     pub(crate) fn finish_eject(&mut self) -> Result<()> {
         self.unlock_tray();
         // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted".
-        let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
+        let eject_cdb = allow::EJECT_CDB;
         let mut buf = [0u8; 0];
         let dir = crate::scsi::DataDirection::None;
         self.exec_cleanup(&eject_cdb, dir, &mut buf, 30_000, CleanupCtx::FinishEject)?;
@@ -1505,8 +1510,7 @@ impl Drop for Drive {
         // SgIoTransport::drop() runs next, calling libc::close(fd)
         #[cfg(target_os = "linux")]
         if let Some(fd) = self.block_dev_fd.take() {
-            // SAFETY: fd was opened by this Drive and is taken (closed once) here.
-            unsafe { libc::close(fd) };
+            crate::scsi::linux::close_block_fd(fd);
         }
     }
 }
@@ -1526,15 +1530,7 @@ fn open_block_device_for_sg(sg_path: &Path) -> Option<std::os::unix::io::RawFd> 
         .find_map(|e| e.file_name().into_string().ok())?;
     let block_path = format!("/dev/{}", block_name);
 
-    let mut bytes = block_path.as_bytes().to_vec();
-    bytes.push(0);
-    // SAFETY: bytes is NUL-terminated and outlives the call.
-    let fd = unsafe {
-        libc::open(
-            bytes.as_ptr() as *const libc::c_char,
-            libc::O_RDONLY | libc::O_CLOEXEC,
-        )
-    };
+    let fd = crate::scsi::linux::open_block_ro(&block_path);
     if fd < 0 {
         tracing::debug!(
             target: "freemkv::drive",

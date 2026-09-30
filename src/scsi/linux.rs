@@ -663,6 +663,34 @@ pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
 
 // After a transport failure the fd is reopened in the background and the next
 // execute() adopts it. Needs a real device: FREEMKV_TEST_SG_DEVICE (default sg2).
+/// Open a block device read-only (no O_DIRECT). Negative on failure.
+pub(crate) fn open_block_ro(path: &str) -> i32 {
+    let mut bytes = path.as_bytes().to_vec();
+    bytes.push(0);
+    // SAFETY: bytes is NUL-terminated and outlives the call.
+    unsafe {
+        libc::open(
+            bytes.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    }
+}
+
+/// Close a block fd opened by [`open_block_ro`]; the caller must not reuse it.
+pub(crate) fn close_block_fd(fd: i32) {
+    // SAFETY: the caller owns fd and passes it here exactly once.
+    unsafe { libc::close(fd) };
+}
+
+/// Drop the page cache for the range, then `pread` into `buf` at `offset`.
+/// Returns the byte count, or a negative value on error (errno set).
+pub(crate) fn pread_uncached(fd: i32, buf: &mut [u8], offset: i64) -> isize {
+    // SAFETY: fd is a live block fd; fadvise passes no pointers.
+    let _ = unsafe { libc::posix_fadvise(fd, offset, buf.len() as i64, libc::POSIX_FADV_DONTNEED) };
+    // SAFETY: buf is a valid writable slice of buf.len() bytes.
+    unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), offset) }
+}
+
 #[cfg(test)]
 mod recovery_device_tests {
     use super::*;
