@@ -473,45 +473,57 @@ mod tests {
         }
     }
 
+    // A sink implementing only the required methods must get neutral defaults.
     #[test]
-    fn stream_read_yields_frames_then_eof() {
-        let frames = vec![make_frame(0, 0), make_frame(1, 1_000), make_frame(0, 2_000)];
-        let mut s = MockStream::new(frames.clone());
-
-        let f0 = s.read().unwrap().expect("first frame");
-        assert_eq!(f0.track, frames[0].track);
-        assert_eq!(f0.pts, frames[0].pts);
-        assert!(f0.keyframe);
-
-        let f1 = s.read().unwrap().expect("second frame");
-        assert_eq!(f1.pts, frames[1].pts);
-
-        let f2 = s.read().unwrap().expect("third frame");
-        assert_eq!(f2.pts, frames[2].pts);
-
-        assert!(s.read().unwrap().is_none());
-        assert!(s.read().unwrap().is_none()); // idempotent at EOF
-    }
-
-    #[test]
-    fn stream_write_collects_then_finishes() {
+    fn stream_trait_defaults_are_neutral() {
         let mut s = MockStream::new(Vec::new());
-        let frames = [make_frame(0, 0), make_frame(1, 100), make_frame(2, 200)];
-
-        for f in &frames {
-            s.write(f).unwrap();
-        }
-        assert_eq!(s.written.len(), 3);
-        s.finish().unwrap();
+        assert_eq!(s.track_timing(0), TrackTiming::default());
+        assert!(s.set_track_timing(0, TrackTiming::default()).is_ok());
+        assert!(s.codec_private(0).is_none());
+        assert!(s.headers_ready());
+        assert!(s.config_changes().is_empty());
+        assert!(!s.set_codec_private(0, &[1]).unwrap());
+        assert_eq!(s.errors(), 0);
+        assert_eq!(s.lost_bytes(), 0);
+        assert!(s.undelivered_streams().is_empty());
     }
 
+    // CountingStream forwards reads/finish and sums bytes over several writes.
     #[test]
-    fn stream_via_dyn_object() {
-        let mut s: Box<dyn Stream> = Box::new(MockStream::new(vec![make_frame(0, 0)]));
-        let frame = s.read().unwrap().expect("first frame");
-        s.write(&frame).unwrap();
-        let _ = s.info();
-        s.finish().unwrap();
+    fn counting_stream_forwards_reads_and_sums_writes() {
+        let frames = vec![make_frame(0, 0), make_frame(1, 1_000)];
+        let mut cs = CountingStream::new(Box::new(MockStream::new(frames.clone())));
+        assert_eq!(cs.read().unwrap().expect("frame 0").pts, 0);
+        assert_eq!(cs.read().unwrap().expect("frame 1").pts, 1_000);
+        assert!(cs.read().unwrap().is_none());
+        for f in &frames {
+            cs.write(f).unwrap();
+        }
+        assert_eq!(cs.bytes_written(), 6);
+        cs.finish().unwrap();
+        let _ = cs.info();
+    }
+
+    // The 256 MiB frame ceiling applies on write and on read (before any allocation).
+    #[test]
+    fn frame_size_ceiling_enforced_on_write_and_read() {
+        let code = format!("E{}", crate::error::E_PES_FRAME_TOO_LARGE);
+        let mut big = make_frame(0, 0);
+        big.data = vec![0u8; MAX_FRAME_SIZE + 1];
+        let err = big.serialize(&mut Vec::new()).expect_err("over ceiling");
+        assert!(err.to_string().contains(&code), "got: {err}");
+
+        let mut header = vec![0u8; 22];
+        header[18..22].copy_from_slice(&((MAX_FRAME_SIZE + 1) as u32).to_le_bytes());
+        let err = PesFrame::deserialize(&mut std::io::Cursor::new(header.clone()))
+            .expect_err("over ceiling");
+        assert!(err.to_string().contains(&code), "got: {err}");
+
+        // Exactly at the ceiling passes the check and then hits the missing payload.
+        header[18..22].copy_from_slice(&(MAX_FRAME_SIZE as u32).to_le_bytes());
+        let err =
+            PesFrame::deserialize(&mut std::io::Cursor::new(header)).expect_err("payload missing");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
