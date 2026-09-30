@@ -211,6 +211,7 @@ impl crate::pes::Stream for M2tsStream {
         self.muxer.finish()
     }
 
+    // The source title: its PIDs, not the BD-range PIDs the file and FMKV header carry.
     fn info(&self) -> &crate::disc::DiscTitle {
         &self.disc_title
     }
