@@ -200,7 +200,8 @@ impl SectorSource for MemSource {
 /// keyed file's units carry CPI `11₂` in every packet and are then encrypted
 /// (KS-3, KS-4). Panics on a fixture error; test use only.
 pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
-    let root = fixture_dir();
+    let dir = FixtureDir(fixture_dir());
+    let root = dir.0.clone();
     write(&root.join("AACS/Unit_Key_RO.inf"), uk_ro);
     for f in files {
         write(
@@ -226,7 +227,7 @@ pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
             .expect("fixture read");
     }
     drop(img);
-    let _ = std::fs::remove_dir_all(&root);
+    drop(dir);
     let mut plain = image.clone();
     let unit_sectors = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
     for (f, &(start, sectors)) in files.iter().zip(&extents) {
@@ -259,6 +260,15 @@ fn content_unit(lba: u32, encrypted: bool) -> Vec<u8> {
         p[4] = 0x47;
     }
     u
+}
+
+// Removes its directory on drop, so a panicking fixture build doesn't leak it.
+struct FixtureDir(std::path::PathBuf);
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // A fresh, empty directory for one fixture (removed once the image is read).

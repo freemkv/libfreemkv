@@ -310,10 +310,11 @@ impl FakeTransport {
     }
 
     // Block until released (a new `release` generation) or `limit` passes.
-    fn stall(&self, limit: Duration) -> bool {
+    // `gen0` is the release generation read when the CDB was logged, so a release
+    // between the log and this wait still counts.
+    fn stall(&self, limit: Duration, gen0: u64) -> bool {
         let end = Instant::now() + limit;
         let mut st = self.shared.lock();
-        let gen0 = st.released;
         while st.released == gen0 {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -339,7 +340,7 @@ impl ScsiTransport for FakeTransport {
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
         self.last_progress = None;
-        let (mode, limit) = {
+        let (mode, limit, gen0) = {
             let mut st = self.shared.lock();
             let after_cancel = st.watch.as_ref().is_some_and(Halt::is_cancelled);
             st.log.push(FakeCdb {
@@ -369,7 +370,7 @@ impl ScsiTransport for FakeTransport {
                     break;
                 }
             }
-            (mode, limit)
+            (mode, limit, st.released)
         };
         let r = match mode {
             None => self.serve(cdb, dir, data, timeout_ms),
@@ -381,7 +382,7 @@ impl ScsiTransport for FakeTransport {
                 std::thread::sleep(d);
                 self.serve(cdb, dir, data, timeout_ms)
             }
-            Some(FakeMode::Stall) => match self.stall(limit) {
+            Some(FakeMode::Stall) => match self.stall(limit, gen0) {
                 true => self.serve(cdb, dir, data, timeout_ms),
                 false => Err(transport_failure(cdb[0])),
             },
