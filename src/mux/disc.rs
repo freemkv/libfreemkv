@@ -2897,6 +2897,95 @@ mod tests {
             assert!(warns[0].contains("stream_id=0xd2 packets=3"), "{warns:?}");
         }
 
+        /// A PS video stream of `codec` whose AUs span two PES fragments must reach EOF
+        /// with every AU emitted exactly once (the final one drained at EOF).
+        fn ps_fragmented_au_count(codec: crate::disc::Codec, aus: &[Vec<u8>]) -> usize {
+            use crate::disc::{ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+            use crate::pes::Stream;
+
+            let mut sector = ps_pack_header();
+            for (i, au) in aus.iter().enumerate() {
+                let (head, tail) = au.split_at(au.len() - 6);
+                sector.extend_from_slice(&ps_video_pes(head, 3003 * i as u64));
+                // Continuation fragment carries no PTS: same AU.
+                let mut pes = vec![0x00, 0x00, 0x01, 0xE0u8];
+                let body_len = (3 + tail.len()) as u16;
+                pes.extend_from_slice(&body_len.to_be_bytes());
+                pes.extend_from_slice(&[0x80, 0x00, 0x00]);
+                pes.extend_from_slice(tail);
+                sector.extend_from_slice(&pes);
+            }
+            sector.resize(2048, 0xFF);
+
+            let mut t = synthetic_title(1);
+            t.content_format = ContentFormat::MpegPs;
+            t.streams = vec![crate::disc::Stream::Video(VideoStream {
+                pid: 0xE0,
+                codec,
+                resolution: Resolution::R1080i,
+                frame_rate: FrameRate::F29_97,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })];
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(sector)),
+                t,
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap();
+            let mut n = 0;
+            while s.read().unwrap().is_some() {
+                n += 1;
+            }
+            n
+        }
+
+        /// H.264 in a program stream (HD DVD EVO): AUs split across PES fragments
+        /// are reassembled and the last one is drained once at EOF (known HIGH
+        /// disc.rs:936). MPEG-2 tests cannot catch this: it is Passthrough.
+        #[test]
+        fn ps_stream_h264_fragmented_aus_emit_once_each_through_eof() {
+            let au = |first: bool, body: u8| {
+                let mut d = vec![0x00, 0x00, 0x01, 0x09, 0xF0]; // AUD
+                if first {
+                    d.extend_from_slice(&[0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0x01]);
+                    d.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0xCE, 0x01]);
+                }
+                let nal = if first { 0x65 } else { 0x41 };
+                d.extend_from_slice(&[0x00, 0x00, 0x01, nal, 0x88]);
+                d.extend_from_slice(&[body; 6]);
+                // Second slice of the same picture lands in the continuation fragment.
+                d.extend_from_slice(&[0x00, 0x00, 0x01, 0x41, 0x44, body]);
+                d
+            };
+            let aus = vec![au(true, 0x11), au(false, 0x22), au(false, 0x33)];
+            assert_eq!(ps_fragmented_au_count(crate::disc::Codec::H264, &aus), 3);
+        }
+
+        /// Same for VC-1 (advanced profile BDUs) in a program stream.
+        #[test]
+        fn ps_stream_vc1_fragmented_aus_emit_once_each_through_eof() {
+            let au = |first: bool, body: u8| {
+                let mut d = Vec::new();
+                if first {
+                    d.extend_from_slice(&[0x00, 0x00, 0x01, 0x0F, 0xD0, 0x00, 0x00, 0x00, 0x80]);
+                }
+                d.extend_from_slice(&[0x00, 0x00, 0x01, 0x0D, 0x80]);
+                d.extend_from_slice(&[body; 12]);
+                d
+            };
+            let aus = vec![au(true, 0x11), au(false, 0x22), au(false, 0x33)];
+            assert_eq!(ps_fragmented_au_count(crate::disc::Codec::Vc1, &aus), 3);
+        }
+
         // fed_bytes accumulates ACROSS read buffers, not reset per read: with
         // one GOP per sector (batch_sectors=1), a frame from sector 1 must
         // carry source.byte >= 2048, proving the base carried over.
