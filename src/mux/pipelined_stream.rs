@@ -35,6 +35,8 @@ pub struct PipelinedPesStream {
 
     pending_frames: std::collections::VecDeque<PesFrame>,
     eof: bool,
+    // The terminal read error (kind, rendered code), repeated by every later read.
+    failed: Option<(io::ErrorKind, String)>,
     /// Cached `FREEMKV_SKIP_PARSE` profiling flag. Read once in `new()`
     /// — the env var cannot change for the life of the stream, and
     /// `std::env::var_os` takes a process-wide lock, so the per-batch /
@@ -127,6 +129,7 @@ impl PipelinedPesStream {
             demux_thread,
             pending_frames: std::collections::VecDeque::new(),
             eof: false,
+            failed: None,
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
@@ -440,11 +443,14 @@ impl PipelinedPesStream {
 
 impl Stream for PipelinedPesStream {
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
+        if let Some((kind, code)) = &self.failed {
+            return Err(io::Error::new(*kind, code.clone()));
+        }
         let read = self.read_frame();
         match &read {
             Ok(Some(frame)) => self.header_gate.observe(frame),
             Ok(None) => self.header_gate.expire(),
-            Err(_) => {}
+            Err(e) => self.failed = Some((e.kind(), e.to_string())),
         }
         read
     }
@@ -703,6 +709,28 @@ mod tests {
         .unwrap();
         let err = stream.read().expect_err("Err batch must propagate");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    // The worker exits after a terminal error; a later read repeats that error, not
+    // a misleading "demux thread panicked".
+    #[test]
+    fn a_read_after_a_terminal_error_repeats_it() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        let disc_read = crate::error::Error::DiscRead {
+            sector: 7,
+            status: Some(0x02),
+            sense: None,
+        };
+        tx.send(DemuxBatch::Err(disc_read.into())).unwrap();
+        drop(tx);
+        for _ in 0..2 {
+            let err = stream.read().expect_err("terminal error");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some(crate::error::E_DISC_READ),
+                "got {err}"
+            );
+        }
     }
 
     /// consume_ts must route a PES to the track mapped to its PID and emit
