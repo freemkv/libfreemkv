@@ -201,6 +201,8 @@ pub struct PgsParser {
     /// (L026). Always 0 when `pending` doesn't hold a clear set; reset
     /// whenever `pending` is assigned a fresh set.
     clear_scan_offset: usize,
+    /// A gap was seen: discard segments until the next PCS starts a display set.
+    skip_to_pcs: bool,
     /// Test-only: total iterations of the `complete_clear_pts` walk loop,
     /// proving the walk stays O(n) in the number of appends rather than
     /// O(n^2) (L026).
@@ -220,9 +222,24 @@ impl PgsParser {
         Self {
             pending: None,
             clear_scan_offset: 0,
+            skip_to_pcs: false,
             #[cfg(test)]
             scan_steps: 0,
         }
+    }
+
+    /// True when `data` is whole segments ending in END.
+    fn ends_with_end(data: &[u8]) -> bool {
+        let (mut off, mut last) = (0, 0);
+        while data.len() - off >= 3 {
+            let size = 3 + usize::from(u16::from_be_bytes([data[off + 1], data[off + 2]]));
+            if off + size > data.len() {
+                return false;
+            }
+            last = data[off];
+            off += size;
+        }
+        off == data.len() && last == SEGMENT_END
     }
 
     fn is_clear(data: &[u8]) -> bool {
@@ -332,6 +349,7 @@ impl CodecParser for PgsParser {
             // packets that lose timing when display sets are merged.
             Some(_) => match pts {
                 Some(start) => {
+                    self.skip_to_pcs = false;
                     out.extend(self.emit_pending(Some(start)));
                     // The set's facts are THIS packet's — the one that opened
                     // it. `start` is that packet's PTS by construction.
@@ -348,9 +366,21 @@ impl CodecParser for PgsParser {
             // current display set, or non-standard layout. If we have
             // a pending display, append; otherwise emit as-is.
             None => {
-                // A gap mid-set truncated it; the post-gap segment cannot be spliced on.
+                // A gap: emit a complete held set (the lost PCS would have closed
+                // it), drop a truncated one, and skip orphans up to the next PCS.
                 if pes.discontinuity {
+                    if self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|(_, d)| Self::ends_with_end(d))
+                    {
+                        out.extend(self.emit_pending(None));
+                    }
                     self.pending = None;
+                    self.skip_to_pcs = true;
+                }
+                if self.skip_to_pcs {
+                    return out;
                 }
                 if let Some((_, ref mut buf)) = self.pending {
                     // Bound accumulation: a well-formed display set is small.
@@ -547,6 +577,48 @@ mod tests {
         pes.discontinuity = true;
         assert!(parser.parse(&pes).is_empty());
         assert!(parser.flush().is_empty(), "the truncated set is dropped");
+    }
+
+    #[test]
+    fn post_gap_pts_segments_are_skipped_until_next_pcs() {
+        // Complete pending set (PCS + END) survives the gap; the PTS-bearing
+        // post-gap orphans are dropped up to the next PCS.
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let _ = parser.parse(&make_pes(vec![0x80, 0x00, 0x00], Some(90000)));
+        let mut gap = make_pes(vec![0x15, 0x00, 0x02, 0xAA, 0xBB], Some(180000));
+        gap.discontinuity = true;
+        let out = parser.parse(&gap);
+        assert_eq!(out.len(), 1, "complete held subtitle is emitted");
+        assert_eq!(out[0].duration_ns, Some(DEFAULT_PGS_DURATION_NS));
+        assert!(
+            parser
+                .parse(&make_pes(vec![0x80, 0x00, 0x00], Some(180000)))
+                .is_empty()
+        );
+        assert!(
+            parser
+                .parse(&make_pes(pcs_bytes(1), Some(270000)))
+                .is_empty()
+        );
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].pts_ns, 3_000_000_000);
+    }
+
+    #[test]
+    fn post_gap_pts_segments_drop_incomplete_pending() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let mut gap = make_pes(vec![0x15, 0x00, 0x02, 0xAA, 0xBB], Some(180000));
+        gap.discontinuity = true;
+        assert!(parser.parse(&gap).is_empty());
+        assert!(
+            parser
+                .parse(&make_pes(vec![0x80, 0x00, 0x00], Some(180000)))
+                .is_empty()
+        );
+        assert!(parser.flush().is_empty());
     }
 
     #[test]
