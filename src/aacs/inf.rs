@@ -318,7 +318,7 @@ fn read_mkb_pack(
 
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
 /// Returns the concatenated MKB data from all packs. A short or over-long pack is a
-/// drive fault (`AacsKeyRead`), never a holed MKB; a header-only first pack means no MKB.
+/// drive fault (`AacsKeyRead`), never a holed MKB; a header-only pack in a multi-pack MKB is `AacsKeyRead`; a single header-only pack is an empty MKB.
 pub fn read_mkb_from_drive(
     session: &mut dyn crate::scsi::ScsiTransport,
 ) -> crate::error::Result<Vec<u8>> {
@@ -326,11 +326,18 @@ pub fn read_mkb_from_drive(
     let Some(mut mkb) = first else {
         return Ok(Vec::new());
     };
+    // A header-only pack in a multi-pack MKB is a hole, not an empty MKB.
+    if num_packs > 1 && mkb.is_empty() {
+        return Err(crate::error::Error::AacsKeyRead);
+    }
 
     // Read remaining packs
     for pack in 1..num_packs {
         let (_, body) = read_mkb_pack(session, pack as u32)?;
         let body = body.ok_or(crate::error::Error::AacsKeyRead)?;
+        if body.is_empty() {
+            return Err(crate::error::Error::AacsKeyRead);
+        }
         mkb.extend_from_slice(&body);
     }
 
@@ -656,22 +663,34 @@ mod read_mkb_tests {
         assert!(mkb == expected, "both maximal packs' bytes must be intact");
     }
 
-    /// A pack that declares only the 2-byte header and NO payload contributes
-    /// nothing, and must not push a phantom byte into the MKB — an off-by-one
-    /// at the zero-length boundary corrupts every following pack's alignment.
+    /// A header-only pack inside a multi-pack MKB is a hole: fail rather than return a
+    /// silently shortened MKB. A single-pack header-only response stays an empty MKB.
     #[test]
     fn read_mkb_from_drive_zero_length_pack_contributes_nothing() {
         let mut drive = MkbDrive {
             packs: vec![Vec::new(), vec![0xABu8; 32]],
             cdbs: Vec::new(),
         };
-        let mkb = read_mkb_from_drive(&mut drive).expect("scripted drive answers");
+        assert!(matches!(
+            read_mkb_from_drive(&mut drive),
+            Err(crate::error::Error::AacsKeyRead)
+        ));
+        let mut drive = MkbDrive {
+            packs: vec![vec![0xABu8; 32], Vec::new()],
+            cdbs: Vec::new(),
+        };
+        assert!(matches!(
+            read_mkb_from_drive(&mut drive),
+            Err(crate::error::Error::AacsKeyRead)
+        ));
+        let mut drive = MkbDrive {
+            packs: vec![Vec::new()],
+            cdbs: Vec::new(),
+        };
         assert_eq!(
-            mkb.len(),
-            32,
-            "an empty pack adds no bytes; only pack 1's payload is present"
+            read_mkb_from_drive(&mut drive).expect("single pack"),
+            Vec::<u8>::new()
         );
-        assert!(mkb == vec![0xABu8; 32], "and the bytes are pack 1's");
     }
 
     // A drive-declared length past the 32772-byte buffer is a drive fault: the MKB

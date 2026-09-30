@@ -1089,8 +1089,7 @@ mod tests {
 
     // ── decrypt_bus: one key schedule per unit, not one per sector ─────────
 
-    // Regression pin (production `decrypt_bus_sectors`): used to expand a fresh AES-128 key per sector (3x/unit) for
-    // a loop-invariant key.
+    // Regression pin on production decrypt_bus_sectors: one key schedule per unit, not per sector.
     #[test]
     fn decrypt_bus_expands_the_read_data_key_once_per_unit() {
         use crate::aacs::crypto::KEY_EXPANSIONS;

@@ -121,22 +121,32 @@ fn records_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 
 /// Try each device key in turn (walk -> Kp -> Km) and return the first Media Key that
 /// verifies. On a variant MKB the walk cannot verify a Kp, so a covering-but-wrong key
-/// must not stop the search. Errs with the last chain error, or `ProcessingKeyUnavailable`.
+/// must not stop the search. Errs with the first correction/structural error, else the last
+/// plain miss, or `ProcessingKeyUnavailable`.
 pub(crate) fn derive_media_key_from_device_keys(
     records: &[MkbRecord],
     device_keys: &[DeviceKey],
 ) -> Result<[u8; 16], MediaKeyVariantError> {
     let mut last = MediaKeyVariantError::ProcessingKeyUnavailable;
+    let mut notable: Option<MediaKeyVariantError> = None;
     for dk in device_keys {
         let Some(pkm) = walk_processing_key(records, std::slice::from_ref(dk)) else {
             continue;
         };
         match derive_media_key_variant(records, &pkm.kp) {
             Ok(km) => return Ok(km),
+            Err(
+                e @ (MediaKeyVariantError::SoftCorrectionRequired
+                | MediaKeyVariantError::OnlineChallengeRequired
+                | MediaKeyVariantError::MkbIncomplete
+                | MediaKeyVariantError::VariantsTableUnavailable),
+            ) => {
+                notable.get_or_insert(e);
+            }
             Err(e) => last = e,
         }
     }
-    Err(last)
+    Err(notable.unwrap_or(last))
 }
 
 /// Walk an MKB and return the first `(Kp, uv, cvalue)` that
@@ -268,19 +278,26 @@ pub enum MediaKeyVariantError {
     MediaKeyVerifyFailed,
 }
 
+impl MediaKeyVariantError {
+    /// The stable numeric error code (the `E71xx` family).
+    pub fn code(&self) -> u16 {
+        use crate::error::*;
+        match self {
+            MediaKeyVariantError::NotVariantMkb => E_MKB_VARIANT_NOT_VARIANT,
+            MediaKeyVariantError::MkbIncomplete => E_MKB_VARIANT_INCOMPLETE,
+            MediaKeyVariantError::ProcessingKeyUnavailable => E_MKB_VARIANT_PK_UNAVAILABLE,
+            MediaKeyVariantError::SoftCorrectionRequired => E_MKB_VARIANT_SOFT_CORRECTION,
+            MediaKeyVariantError::OnlineChallengeRequired => E_MKB_VARIANT_ONLINE_CHALLENGE,
+            MediaKeyVariantError::VariantsTableUnavailable => E_MKB_VARIANT_TABLE_UNAVAILABLE,
+            MediaKeyVariantError::VkdIndexOutOfRange => E_MKB_VARIANT_VKD_RANGE,
+            MediaKeyVariantError::MediaKeyVerifyFailed => E_MKB_VARIANT_VERIFY_FAILED,
+        }
+    }
+}
+
 impl std::fmt::Display for MediaKeyVariantError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let code: u16 = match self {
-            MediaKeyVariantError::NotVariantMkb => 7100,
-            MediaKeyVariantError::MkbIncomplete => 7101,
-            MediaKeyVariantError::ProcessingKeyUnavailable => 7102,
-            MediaKeyVariantError::SoftCorrectionRequired => 7103,
-            MediaKeyVariantError::OnlineChallengeRequired => 7104,
-            MediaKeyVariantError::VariantsTableUnavailable => 7106,
-            MediaKeyVariantError::VkdIndexOutOfRange => 7107,
-            MediaKeyVariantError::MediaKeyVerifyFailed => 7108,
-        };
-        write!(f, "E{code}")
+        write!(f, "E{}", self.code())
     }
 }
 
@@ -369,16 +386,29 @@ fn variant_km_for_slot(
     let mut c_block = [0u8; 16];
     c_block.copy_from_slice(c_slice);
 
-    // Step: Kmp = AES-128D(Kp, C) XOR uv  (uv into low 4 bytes).
-    let mut kmp = aes_ecb_decrypt(kp, &c_block);
+    let variants_uv = variants_for_uv(m.records, slot_index);
+    km_from_slot_inputs(kp, &c_block, uv, variants_uv, m.kvn, m.vkd_table, &m.mk_dv)
+}
+
+/// Shared Kp -> Km chain (Kmp, correction bits, Kpnew, VKD, Km, Verify-Media-Key gate) for one
+/// slot's explicit inputs. `variants_uv` is `VARIANTS[uv]`; `None` means the table is short.
+fn km_from_slot_inputs(
+    kp: &[u8; 16],
+    c_block: &[u8; 16],
+    uv: u32,
+    variants_uv: Option<u16>,
+    kvn: u16,
+    vkd_table: &[u8],
+    mk_dv: &[u8; 16],
+) -> Result<[u8; 16], MediaKeyVariantError> {
+    // Kmp = AES-128D(Kp, C) XOR uv (uv into the low 4 bytes).
+    let mut kmp = aes_ecb_decrypt(kp, c_block);
     let uv_bytes = uv.to_be_bytes();
     for i in 0..4 {
         kmp[12 + i] ^= uv_bytes[i];
     }
 
-    // Condition bits on Kmp[15] select the correction mode. Bit 0x02 (SoftKCD)
-    // and 0x04 (online challenge) need out-of-band data we don't model; the
-    // default path (neither bit set) uses the fixed KCD constant.
+    // Bits 0x02 (SoftKCD) / 0x04 (online challenge) need out-of-band data we don't model.
     if kmp[15] & 0b0000_0010 != 0 {
         return Err(MediaKeyVariantError::SoftCorrectionRequired);
     }
@@ -386,36 +416,30 @@ fn variant_km_for_slot(
         return Err(MediaKeyVariantError::OnlineChallengeRequired);
     }
 
-    // Step: Kpnew = Kmp XOR KCD.
+    // Kpnew = Kmp XOR KCD.
     let mut kpnew = [0u8; 16];
     for i in 0..16 {
         kpnew[i] = kmp[i] ^ KEY_CORRECTION_DATA[i];
     }
 
-    // Step: VKD_idx = Kvn XOR VARIANTS[uv];  VKD = vkd_table[VKD_idx]. Kvn = AES-G(Kp, Nonce) &
-    // 0xFFFF is loop-invariant for this Kp (L103): hoisted into `m.kvn` by the caller instead
-    // of being recomputed for each of the ~46k slots this function is tried against.
-    let v_for_uv = variants_for_uv(m.records, slot_index)
-        .ok_or(MediaKeyVariantError::VariantsTableUnavailable)?;
-    let vkd_idx = m.kvn ^ v_for_uv;
-    let off = (vkd_idx as usize) * 16;
-    if off + 16 > m.vkd_table.len() {
+    // VKD_idx = Kvn XOR VARIANTS[uv]; Kvn is loop-invariant for a Kp, hoisted by the caller.
+    let variants_uv = variants_uv.ok_or(MediaKeyVariantError::VariantsTableUnavailable)?;
+    let off = ((kvn ^ variants_uv) as usize) * 16;
+    if off + 16 > vkd_table.len() {
         return Err(MediaKeyVariantError::VkdIndexOutOfRange);
     }
     let mut vkd = [0u8; 16];
-    vkd.copy_from_slice(&m.vkd_table[off..off + 16]);
+    vkd.copy_from_slice(&vkd_table[off..off + 16]);
 
-    // Step: Km = AES-128D(Kpnew, VKD) XOR uv.
+    // Km = AES-128D(Kpnew, VKD) XOR uv.
     let mut km = aes_ecb_decrypt(&kpnew, &vkd);
     for i in 0..4 {
         km[12 + i] ^= uv_bytes[i];
     }
 
-    // Gate: the derived Media Key MUST reproduce the MKB's Verify-Media-Key magic
-    // (the per-match magic in `walk_processing_key` only saw the Precursor). This
-    // is the authoritative check — no unverified key is ever returned.
+    // Authoritative gate: Km must reproduce the MKB's Verify-Media-Key magic.
     const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-    if aes_ecb_decrypt(&km, &m.mk_dv)[..8] != VERIFY_MAGIC {
+    if aes_ecb_decrypt(&km, mk_dv)[..8] != VERIFY_MAGIC {
         return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
     }
     Ok(km)
@@ -502,45 +526,9 @@ pub fn media_key_variant_from_kp(
     let vkd_table = variant_key_data(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let mk_dv = records_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
 
-    // Kmp = AES-128D(Kp, C) XOR uv.
-    let mut kmp = aes_ecb_decrypt(kp, c_block);
-    let uv_bytes = uv.to_be_bytes();
-    for i in 0..4 {
-        kmp[12 + i] ^= uv_bytes[i];
-    }
-    if kmp[15] & 0b0000_0010 != 0 {
-        return Err(MediaKeyVariantError::SoftCorrectionRequired);
-    }
-    if kmp[15] & 0b0000_0100 != 0 {
-        return Err(MediaKeyVariantError::OnlineChallengeRequired);
-    }
-
-    // Kpnew = Kmp XOR KCD.
-    let mut kpnew = [0u8; 16];
-    for i in 0..16 {
-        kpnew[i] = kmp[i] ^ KEY_CORRECTION_DATA[i];
-    }
-
-    // Kvn = AES-G(Kp, Nonce) & 0xFFFF; VKD_idx = Kvn XOR VARIANTS[uv].
     let kvn_block = aes_g(kp, &nonce);
     let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
-    let vkd_idx = kvn ^ variants_uv;
-    let off = (vkd_idx as usize) * 16;
-    if off + 16 > vkd_table.len() {
-        return Err(MediaKeyVariantError::VkdIndexOutOfRange);
-    }
-    let mut vkd = [0u8; 16];
-    vkd.copy_from_slice(&vkd_table[off..off + 16]);
-
-    // Km = AES-128D(Kpnew, VKD) XOR uv, then the authoritative Verify-Media-Key gate.
-    let mut km = aes_ecb_decrypt(&kpnew, &vkd);
-    for i in 0..4 {
-        km[12 + i] ^= uv_bytes[i];
-    }
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-    if aes_ecb_decrypt(&km, &mk_dv)[..8] != VERIFY_MAGIC {
-        return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
-    }
+    let km = km_from_slot_inputs(kp, c_block, uv, Some(variants_uv), kvn, vkd_table, &mk_dv)?;
 
     // Kvu = AES-G(Km, VID).
     let kvu = aes_g(&km, vid);
@@ -1053,6 +1041,10 @@ mod tests {
         ];
         let codes: HashSet<String> = cases.iter().map(|e| e.to_string()).collect();
         assert_eq!(codes.len(), cases.len(), "all error codes must be unique");
+        // Registered in error.rs (whose own test guards cross-module uniqueness).
+        let nums: Vec<u16> = cases.iter().map(|e| e.code()).collect();
+        assert_eq!(nums, [7100, 7101, 7102, 7103, 7104, 7106, 7107, 7108]);
+        assert!(!nums.contains(&7105), "7105 is a reserved gap");
     }
 
     /// A `c_block` planting `Kmp[15]` bit `0x02` must surface
@@ -1706,6 +1698,7 @@ mod tests {
 
     /// A two-slot variant MKB whose SECOND slot is opened by a device key.
     struct PlantedWalk {
+        mkb: Vec<u8>,
         records: Vec<MkbRecord>,
         /// The device key that covers slot 1 with zero descent.
         dk: DeviceKey,
@@ -1814,6 +1807,7 @@ mod tests {
 
         PlantedWalk {
             records: walk_mkb(&mkb),
+            mkb,
             dk: DeviceKey {
                 key: dkey,
                 node: NODE,
@@ -1888,6 +1882,44 @@ mod tests {
             derive_media_key_from_device_keys(&p.records, &[]),
             Err(MediaKeyVariantError::ProcessingKeyUnavailable)
         );
+    }
+
+    /// The resolver must keep searching past a covering-but-wrong key that sorts first.
+    #[test]
+    fn resolve_keys_v21_finds_the_right_key_behind_a_covering_wrong_one() {
+        use crate::aacs::provider::{KeyProvider, SuppliedKey};
+        use crate::aacs::resolve::{ResolveContext, resolve_keys_v21};
+
+        let p = plant_walk_variant_mkb();
+        let mut wrong = p.dk.clone();
+        wrong.key[0] = 0x00;
+        // `Providers::device_keys` sorts by key bytes: the wrong key must come first.
+        assert!(wrong.key < p.dk.key, "fixture: wrong key sorts first");
+        assert!(walk_processing_key(&p.records, std::slice::from_ref(&wrong)).is_some());
+
+        let mut uk_ro = vec![0u8; 256];
+        uk_ro[3] = 0x60;
+        uk_ro[16] = 1;
+        uk_ro[17] = 1;
+        uk_ro[0x60 + 1] = 1;
+        let keys = SuppliedKey {
+            device_keys: vec![p.dk.clone(), wrong],
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
+        let providers: &[&dyn KeyProvider] = &[&keys];
+        let vid = [0x22u8; 16];
+        let r = resolve_keys_v21(&ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &vid,
+            providers,
+            mkb: Some(&p.mkb),
+        })
+        .expect("the right key behind a covering wrong one must resolve");
+        assert_eq!(r.key_source, 1);
+        assert_eq!(r.vuk, Some(crate::aacs::derive::derive_vuk(&p.km, &vid)));
     }
 
     /// The `[C]` §3.2.4 subset-difference gate must reject a device key on

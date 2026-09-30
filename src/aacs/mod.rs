@@ -9,12 +9,16 @@ pub mod content;
 pub mod crypto;
 pub mod derive;
 pub mod host_certs;
+// No production caller; not the live FMTS path.
+#[doc(hidden)]
 pub mod index_select;
 pub mod inf;
 pub mod mkb;
 pub mod provider;
 pub mod resolve;
 pub mod segment;
+// No production caller; not the live FMTS path.
+#[doc(hidden)]
 pub mod segment_key;
 pub mod trace;
 pub mod types;

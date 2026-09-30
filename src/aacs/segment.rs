@@ -151,6 +151,7 @@ pub fn clip_byte_to_lba(extents: &[crate::disc::Extent], clip_byte: u64) -> Opti
 ///
 /// Not used by the live FMTS path (`keys::fmts` + `mux::resolve`); kept as a public
 /// helper for callers that build their own key map from the segment table.
+#[doc(hidden)]
 pub fn fmts_key_ranges(
     segments: &[Segment],
     extents: &[crate::disc::Extent],
