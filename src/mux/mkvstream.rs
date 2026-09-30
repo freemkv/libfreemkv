@@ -4890,6 +4890,63 @@ mod tests {
         t
     }
 
+    // Past MAX_PENDING_FRAMES with no video picture the muxer is built anyway (the audio
+    // prefix precedes any keyframe cluster, so the muxer drops it); later frames must mux.
+    #[test]
+    fn the_pending_frame_cap_builds_the_muxer_and_keeps_later_frames() {
+        let out = SharedOut::new();
+        let mut title = h264_title();
+        title
+            .streams
+            .push(crate::disc::Stream::Audio(crate::disc::AudioStream {
+                pid: 0x1100,
+                codec: crate::disc::Codec::Ac3,
+                channels: crate::disc::AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: crate::disc::SampleRate::S48,
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: String::new(),
+            }));
+        title.codec_privates.push(None);
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        let frame = |track, pts: i64, keyframe, byte| crate::pes::PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track,
+            pts,
+            keyframe,
+            data: vec![byte; 8],
+            duration_ns: None,
+        };
+        let n = MAX_PENDING_FRAMES as i64;
+        for i in 0..=n {
+            s.write(&frame(1, i * 1_000_000, true, 0xA0)).unwrap();
+        }
+        assert!(
+            matches!(s.mode, Mode::Write(WriteMode::Active(_))),
+            "cap builds"
+        );
+        for i in 0..10 {
+            let pts = (n + 1 + i) * 1_000_000;
+            s.write(&frame(0, pts, i == 0, 0xB0)).unwrap();
+            s.write(&frame(1, pts, true, 0xA1)).unwrap();
+        }
+        s.finish().unwrap();
+        let mut r = MkvStream::open(Cursor::new(out.bytes())).unwrap();
+        let (mut video, mut late_audio) = (0, 0);
+        while let Some(f) = r.read().unwrap() {
+            match (f.track, f.data[0]) {
+                (0, 0xB0) => video += 1,
+                (1, 0xA1) => late_audio += 1,
+                (1, 0xA0) => {}
+                other => panic!("frame on the wrong track: {other:?}"),
+            }
+        }
+        assert_eq!((video, late_audio), (10, 10));
+    }
+
     // Writer that errors while `fail` is set (a transient disk/pipe failure).
     struct Flaky(SharedOut, std::sync::Arc<std::sync::atomic::AtomicBool>);
 
