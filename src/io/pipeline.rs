@@ -101,20 +101,10 @@ fn finish_with_grace<R: Send + 'static>(
     leak_err: Error,
     on_poll: &mut dyn FnMut(),
 ) -> Result<R, Error> {
-    // `None` = a grace past `Instant`'s range: wait unbounded.
-    let end = Instant::now().checked_add(grace);
-    let mut handle = handle;
-    loop {
-        let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
-        handle = match join_within(handle, left.min(WAIT_SLICE), None) {
-            Joined::Done(r) => return join_result(r),
-            Joined::Halted(h) | Joined::Pending(h) => h,
-        };
-        on_poll();
-        if end.is_some_and(|e| Instant::now() >= e) {
-            break;
-        }
-    }
+    let mut handle = match wait_grace(handle, grace, on_poll) {
+        Ok(r) => return r,
+        Err(h) => h,
+    };
     // CLAIM abandonment before dropping the handle so the leaked consumer skips further
     // `apply`/`close()`. Compare-exchange, not a store: a consumer already CLOSING wins.
     if state
@@ -170,18 +160,33 @@ fn grace_then_leak<R: Send + 'static>(
     leak_err: Error,
     on_poll: &mut dyn FnMut(),
 ) -> Result<R, Error> {
+    match wait_grace(handle, grace, on_poll) {
+        Ok(r) => r,
+        Err(handle) => {
+            drop(handle);
+            Err(leak_err)
+        }
+    }
+}
+
+// Join within `grace` (polling `on_poll`); `Err(handle)` if it is still running.
+fn wait_grace<R: Send + 'static>(
+    handle: thread::JoinHandle<Result<R, Error>>,
+    grace: Duration,
+    on_poll: &mut dyn FnMut(),
+) -> Result<Result<R, Error>, thread::JoinHandle<Result<R, Error>>> {
+    // `None` = a grace past `Instant`'s range: wait unbounded.
     let end = Instant::now().checked_add(grace);
     let mut handle = handle;
     loop {
         let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
         handle = match join_within(handle, left.min(WAIT_SLICE), None) {
-            Joined::Done(r) => return join_result(r),
+            Joined::Done(r) => return Ok(join_result(r)),
             Joined::Halted(h) | Joined::Pending(h) => h,
         };
         on_poll();
         if end.is_some_and(|e| Instant::now() >= e) {
-            drop(handle);
-            return Err(leak_err);
+            return Err(handle);
         }
     }
 }
@@ -191,9 +196,8 @@ fn grace_then_leak<R: Send + 'static>(
 /// use WRITE_PIPELINE_DEPTH instead.
 pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 
-/// Write pipeline depth. Smaller buffer reduces backpressure risk when
-/// sync_file_range blocks; prevents producer from accumulating too much
-/// work while consumer waits for NFS to drain.
+/// Write pipeline depth: deeper than the default (16 vs 4), so the producer keeps
+/// running while a slow flush (`sync_file_range`, NFS drain) blocks the consumer.
 pub const WRITE_PIPELINE_DEPTH: usize = 16;
 
 /// Channel depth for write-through pipelines. Each `send` fully
@@ -207,9 +211,8 @@ pub const WRITE_THROUGH_DEPTH: usize = 1;
 /// ([`Flow::Continue`]), or stop the pipeline early and run `close()`
 /// ([`Flow::Stop`]).
 ///
-/// `Stop` currently has no in-tree caller (sweep always processes its
-/// full work-list; the mux highway drains to EOF), but it's part of the
-/// fixed `Sink` contract.
+/// `Stop` currently has no in-tree caller (the mux highway drains to EOF; the sweep
+/// moved to freemkv-engine), but it's part of the fixed `Sink` contract.
 pub enum Flow {
     Continue,
     Stop,
@@ -258,7 +261,7 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     /// Set by [`finish_with_grace`] when the grace period expires and the consumer thread is
     /// about to be leaked: it stops applying further items and does NOT call `close()`, so a
     /// leaked consumer can't finalise an output already reported as failed. One of
-    /// [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`]; both transitions are
+    /// [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`] / [`state::CLOSING_STOPPED`]; both transitions are
     /// compare-exchanges so abandoning and finalising are mutually exclusive rather than
     /// racing.
     state: Arc<AtomicU8>,
@@ -513,10 +516,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// the item back if the consumer thread is gone (panicked or
     /// already returned).
     ///
-    /// After [`Flow::Stop`], `send` silently buffers until the channel
-    /// fills, then returns `Err(item)` once the consumer drops its
-    /// receiver — producers that need to stop pushing on `Stop` should
-    /// track an independent signal (e.g. `Halt`) instead.
+    /// After [`Flow::Stop`] the consumer keeps draining (discarding) until the producer
+    /// drops `tx`, so `send` keeps returning `Ok` — producers that need to stop pushing on
+    /// `Stop` should track an independent signal (e.g. `Halt`) instead.
     pub fn send(&self, item: I) -> Result<(), I> {
         // Only timestamp when debug tracing is on — `send` runs per
         // item on the mux highway hot path.

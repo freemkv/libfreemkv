@@ -15,6 +15,7 @@ pub(crate) fn hint_sequential(file: &File, len_bytes: u64) {
         ra_count: bytes as libc::c_int,
     };
     // Best-effort.
+    // SAFETY: a valid borrowed fd and a live stack `radvisory`.
     unsafe {
         libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &mut ra);
     }

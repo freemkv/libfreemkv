@@ -4,7 +4,7 @@
 //! producer re-fills in place, for zero allocations and zero cross-thread frees in the hot
 //! loop. Works for any stream whose source is an `io::Read`, not just a `SectorSource`.
 
-use crate::halt::{Halt, Recv, SendOutcome};
+use crate::halt::{Halt, Joined, Recv, SendOutcome, join_within};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::io::Read;
 use std::thread::JoinHandle;
@@ -31,23 +31,36 @@ pub const DEFAULT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// producer-thread join handle so dropping the shell joins the
 /// producer.
 ///
-/// Drop blocks until the producer exits. For a prompt exit, drop the
-/// forward receiver and recycle sender first (channel disconnection)
-/// or cancel the [`Halt`] passed to [`BytePrefetcher::new`], observed
-/// within one [`WAIT_SLICE`](crate::halt::WAIT_SLICE) even while parked on a channel op.
+/// Drop waits a bounded grace for the producer, then detaches it (a `read()` that never
+/// returns cannot be interrupted). For a prompt exit, drop the forward receiver and recycle
+/// sender first, or cancel the [`Halt`] passed to [`BytePrefetcher::new`].
 pub struct PrefetchShell {
     producer: Option<JoinHandle<()>>,
+}
+
+// How long Drop waits for the producer before detaching it.
+const DROP_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
+
+// Join the producer within `DROP_GRACE`; a producer still blocked in `read()` is detached.
+fn join_or_detach(h: JoinHandle<()>) {
+    if !matches!(join_within(h, DROP_GRACE, None), Joined::Done(_)) {
+        tracing::warn!(target: "freemkv::io", "byte prefetch producer blocked in read; detached");
+    }
 }
 
 impl Drop for PrefetchShell {
     fn drop(&mut self) {
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            join_or_detach(h);
         }
     }
 }
 
-/// Spawned byte prefetcher. Drop joins the producer thread.
+/// Spawned byte prefetcher. Drop joins the producer thread (bounded; see [`PrefetchShell`]).
 pub struct BytePrefetcher {
     // Non-`Option`: `into_channels`/`Drop` swap in a disconnected stand-in (dead-channel
     // `mem::replace`, as `sector::PrefetchedSectorSource` does), so a missing `rx` can
@@ -67,10 +80,10 @@ impl BytePrefetcher {
         chunk_bytes: usize,
         halt: Option<Halt>,
     ) -> std::io::Result<Self> {
-        // A zero-length chunk makes every recycled buffer empty; `reader.read(&mut [])`
-        // returns Ok(0), which the loop below treats as EOF, producing a silent
-        // zero-byte stream. Callers must pass the downstream demuxer's batch size (> 0).
-        debug_assert!(chunk_bytes > 0, "BytePrefetcher chunk_bytes must be > 0");
+        // A zero-length chunk would read Ok(0) at once: a silent empty stream.
+        if chunk_bytes == 0 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         let (tx, rx) = bounded::<Batch>(FORWARD_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(RECYCLE_DEPTH);
 
@@ -102,14 +115,17 @@ impl BytePrefetcher {
                         else {
                             return;
                         };
-                        // Regrow to chunk_bytes (a short read may have truncated len): sound
-                        // resize, was `unsafe set_len` guarded only by capacity (GHSA-j8ww-f5fg-9pmh
-                        // in `sector::prefetched`). No realloc; a no-op if len is already there.
+                        // Regrow to chunk_bytes (a short read may have truncated len): safe
+                        // resize, was `unsafe set_len` (GHSA-j8ww-f5fg-9pmh in `sector::prefetched`).
                         buf.resize(chunk_bytes, 0);
-                        // Read up to one full chunk. Short reads are
-                        // valid and common — pipe `truncate` so the
-                        // consumer sees only the bytes that arrived.
-                        let n = match reader.read(&mut buf[..]) {
+                        // Short reads are valid: truncate so the consumer sees only what arrived.
+                        let n = loop {
+                            match reader.read(&mut buf[..]) {
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                r => break r,
+                            }
+                        };
+                        let n = match n {
                             Ok(0) => return, // EOF — drop tx, consumer sees RecvError
                             Ok(n) => n,
                             Err(e) => {
@@ -176,7 +192,7 @@ impl Drop for BytePrefetcher {
         drop(dead_recv);
         drop(std::mem::replace(&mut self.recycle_tx, dead_send));
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            join_or_detach(h);
         }
     }
 }
@@ -227,6 +243,27 @@ mod tests {
                 .is_ok(),
             "operation did not complete within {secs}s (deadlock)"
         );
+    }
+
+    // A reader blocked forever in read() cannot be interrupted: both Drops must return
+    // after the grace (detaching the producer) instead of wedging the dropping thread.
+    #[test]
+    fn drop_detaches_producer_blocked_in_read() {
+        struct Blocked(crossbeam_channel::Receiver<()>);
+        impl Read for Blocked {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (release, blocked) = bounded::<()>(0);
+        let pf = BytePrefetcher::new(Blocked(blocked.clone()), 8, None).expect("spawn");
+        within(5, move || drop(pf));
+        let (_rx, _recycle, shell) = BytePrefetcher::new(Blocked(blocked), 8, None)
+            .expect("spawn")
+            .into_channels();
+        within(5, move || drop(shell));
+        drop(release);
     }
 
     // CRITICAL regression: dropping the forward receiver + recycle sender after into_channels
@@ -484,6 +521,39 @@ mod tests {
             drop(rx);
             drop(recycle_tx);
             drop(shell);
+        });
+    }
+
+    #[test]
+    fn zero_chunk_is_invalid_input() {
+        let e = BytePrefetcher::new(Cursor::new(vec![1u8; 4]), 0, None)
+            .err()
+            .expect("zero chunk must be rejected");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // EINTR from the reader is retried, not surfaced as a terminal error.
+    #[test]
+    fn interrupted_read_is_retried() {
+        within(10, || {
+            struct Flaky(u8);
+            impl Read for Flaky {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    self.0 += 1;
+                    match self.0 {
+                        1 => Err(std::io::ErrorKind::Interrupted.into()),
+                        2 => {
+                            buf[..3].fill(9);
+                            Ok(3)
+                        }
+                        _ => Ok(0),
+                    }
+                }
+            }
+            let pf = BytePrefetcher::new(Flaky(0), 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none(), "EINTR surfaced: {err:?}");
+            assert_eq!(got, vec![9; 3]);
         });
     }
 

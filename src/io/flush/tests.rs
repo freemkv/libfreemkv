@@ -159,15 +159,15 @@ fn flush_slow_but_progressing_never_fails() {
     });
     let (_d, mut w, _) = fake_file(&ops, timing(W));
     let t = Instant::now();
-    for _ in 0..8 {
+    for _ in 0..12 {
         w.write_all(&[7u8; K as usize]).unwrap();
     }
     w.sync_all().expect("a progressing flush never fails");
-    assert!(
-        ops.chunks.load(Ordering::SeqCst) >= 4,
-        "the flusher flushed chunks"
-    );
-    assert!(t.elapsed() > W * 2, "the flush outlived the window");
+    // How many writes one chunk coalesces is up to the scheduler, but backpressure caps it
+    // at 3 × C: 12 × C written takes at least 4 sequential chunks, so at least 2 × W.
+    let (n, el) = (ops.chunks.load(Ordering::SeqCst), t.elapsed());
+    assert!(n >= 4, "the flusher flushed chunks: {n} in {el:?}");
+    assert!(el >= W * 2, "the flush outlived the window: {n} in {el:?}");
 }
 
 /// LP13b / G19 (T12, stall pair b): a chunk flush that never returns, with no sampled

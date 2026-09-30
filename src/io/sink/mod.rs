@@ -21,8 +21,8 @@ pub use socket::{SocketSink, UdpSocketSink};
 ///
 /// `finish` drains any internal buffering and signals end-of-stream to the transport
 /// (close-write on a socket, flush + fsync on a buffered file, etc.). The default impl flushes
-/// via [`Write::flush`]; every concrete sink here overrides it with its own finalisation. No
-/// blanket `impl SequentialSink for T`
+/// via [`Write::flush`]; every concrete sink here overrides it with its own finalisation. There
+/// is deliberately no blanket `impl SequentialSink for T`.
 pub trait SequentialSink: Write + Send {
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()
@@ -34,66 +34,9 @@ pub trait SequentialSink: Write + Send {
 /// random-access sink is always usable as a sequential sink.
 pub trait RandomAccessSink: SequentialSink + Seek {}
 
-// Picks the right RandomAccessSink impl for `dest` by filesystem type (Linux+NFS ->
-// WritebackFile, else LocalFileSink). Not yet wired into mux::resolve.
-#[allow(dead_code)]
-pub(crate) fn open_for_mkv(
-    dest: &std::path::Path,
-    size_hint: Option<u64>,
-) -> std::io::Result<Box<dyn RandomAccessSink>> {
-    #[cfg(target_os = "linux")]
-    {
-        use crate::platform::fs_type::FsType;
-        if classify_dest(dest) == FsType::Nfs {
-            let wf = match size_hint {
-                Some(n) => crate::io::WritebackFile::create_with_size_hint(dest, n)?,
-                None => crate::io::WritebackFile::create(dest)?,
-            };
-            return Ok(Box::new(wf));
-        }
-    }
-    // Only Linux differentiates the sink by filesystem type; other OSes always use
-    // `LocalFileSink`. Reference `classify_dest` as a value (no call/syscall) so it
-    // isn't flagged dead on non-Linux while avoiding a wasted probe.
-    #[cfg(not(target_os = "linux"))]
-    let _ = classify_dest;
-
-    let sink = match size_hint {
-        Some(n) => LocalFileSink::with_size_hint(dest, n)?,
-        None => LocalFileSink::create(dest)?,
-    };
-    Ok(Box::new(sink))
-}
-
-// Filesystem type of the output location. statfs needs an existing path and
-// `dest` usually is not created yet, so probe its directory.
-fn classify_dest(dest: &std::path::Path) -> crate::platform::fs_type::FsType {
-    crate::platform::fs_type::detect(probe_dir(dest))
-}
-
-fn probe_dir(dest: &std::path::Path) -> &std::path::Path {
-    match dest.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => std::path::Path::new("."),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // `dest` normally does not exist yet, so statfs on it fails (Unknown) and the
-    // NFS branch was unreachable. The classification must come from its directory.
-    #[test]
-    fn classify_dest_probes_the_directory_of_a_new_file() {
-        use std::path::Path;
-        assert_eq!(
-            probe_dir(Path::new("/mnt/nfs/out/Movie.mkv")),
-            Path::new("/mnt/nfs/out")
-        );
-        // A bare file name lives in the current directory.
-        assert_eq!(probe_dir(Path::new("bare.mkv")), Path::new("."));
-    }
 
     // Type-level assertion: the concrete sinks satisfy the trait
     // objects. These functions never run; they just have to type-check.
@@ -113,20 +56,6 @@ mod tests {
         let mut wf = crate::io::WritebackFile::create(&dir.path().join("c.bin")).unwrap();
         _assert_is_sequential(&mut wf);
         _assert_is_random_access(&mut wf);
-    }
-
-    #[test]
-    fn open_for_mkv_returns_a_random_access_sink() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.bin");
-        let mut sink = open_for_mkv(&p, Some(64 * 1024)).unwrap();
-        use std::io::{Seek, SeekFrom, Write};
-        sink.write_all(b"hello").unwrap();
-        sink.seek(SeekFrom::Start(0)).unwrap();
-        sink.finish().unwrap();
-        drop(sink);
-        let bytes = std::fs::read(&p).unwrap();
-        assert_eq!(&bytes[..5], b"hello");
     }
 
     // Regression test for the silent-no-op finish() bug.
@@ -190,20 +119,5 @@ mod tests {
             "default SequentialSink::finish must call Write::flush"
         );
         assert_eq!(bytes.load(Ordering::SeqCst), 3);
-    }
-
-    // Covers the `None` size_hint arm: must still be a random-access sink.
-    #[test]
-    fn open_for_mkv_without_size_hint_is_random_access() {
-        use std::io::{Seek, SeekFrom};
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("nohint.bin");
-        let mut sink = open_for_mkv(&p, None).unwrap();
-        sink.write_all(b"AAAABBBB").unwrap();
-        sink.seek(SeekFrom::Start(4)).unwrap();
-        sink.write_all(b"CCCC").unwrap();
-        sink.finish().unwrap();
-        drop(sink);
-        assert_eq!(std::fs::read(&p).unwrap(), b"AAAACCCC");
     }
 }
