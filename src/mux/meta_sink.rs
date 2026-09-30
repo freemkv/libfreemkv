@@ -173,7 +173,7 @@ fn sample_rates(rate: crate::disc::SampleRate) -> Vec<u32> {
 
 /// Compact id for an audio stream's editorial purpose (no localized prose —
 /// the app maps it to display text). Mirrors the `Codec::id()` convention.
-fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
+pub(crate) fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
     use crate::disc::LabelPurpose::*;
     match p {
         Normal => "normal",

@@ -404,15 +404,12 @@ impl M2tsMeta {
     }
 }
 
-// Wire ids for the label enums; unknown ids read back as the neutral value.
+// Wire ids for the label enums (purpose shares json://'s ids); the neutral value is
+// omitted, and unknown ids read back as it.
 fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
-    use crate::disc::LabelPurpose::*;
     match p {
-        Normal => "",
-        Commentary => "commentary",
-        Descriptive => "descriptive",
-        Score => "score",
-        Ime => "ime",
+        crate::disc::LabelPurpose::Normal => "",
+        p => super::meta_sink::purpose_id(p),
     }
 }
 
