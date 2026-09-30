@@ -653,7 +653,6 @@ mod tests {
     #[test]
     fn crc16_matches_the_ecma167_check_value() {
         assert_eq!(crc16(b"123456789"), 0x31C3);
-        assert_ne!(crc16(b"123456789"), 0x29B1, "not the 0xFFFF-seeded variant");
     }
 
     /// ECMA-167 3/7.2.3: the checksum is the sum of the tag's first 16 bytes

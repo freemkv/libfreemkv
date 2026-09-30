@@ -922,4 +922,26 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    // Exactly MAX_DEPTH levels below the root is accepted; one more is refused.
+    #[test]
+    fn the_nesting_cap_accepts_exactly_max_depth() {
+        let mk = |tag: &str, levels: usize| {
+            let base = std::env::temp_dir().join(format!("fmkv-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            // BDMV is level 1, so the tree is a valid disc layout.
+            let mut deep = base.join("BDMV");
+            for _ in 1..levels {
+                deep = deep.join("d");
+            }
+            std::fs::create_dir_all(&deep).unwrap();
+            base
+        };
+        let ok = mk("depth-ok", MAX_DEPTH as usize);
+        assert!(plan(&ok).is_ok(), "MAX_DEPTH levels must be accepted");
+        let over = mk("depth-over", MAX_DEPTH as usize + 1);
+        assert!(matches!(plan(&over), Err(Error::DirImageTooLarge)));
+        let _ = std::fs::remove_dir_all(&ok);
+        let _ = std::fs::remove_dir_all(&over);
+    }
 }
