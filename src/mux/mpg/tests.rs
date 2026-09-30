@@ -1874,6 +1874,18 @@ fn scan_video() -> Vec<u8> {
     v
 }
 
+// scan() carries the sequence header's aspect (code 2, 4:3) onto the video stream.
+#[test]
+fn scan_sets_the_video_display_aspect() {
+    let ps = scan_pack(&[(0xE0, scan_video())], None);
+    let s = scan::scan_streams(&ps).unwrap();
+    assert!(
+        matches!(&s[0], DiscStream::Video(v) if v.display_aspect == Some((4, 3))),
+        "{:?}",
+        s[0]
+    );
+}
+
 // Design §4 step 3: without a map, a `0xD0-0xD7` packet that starts mid-frame is classified
 // by the first sync word in its bytes, not by its first two bytes.
 #[test]

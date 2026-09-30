@@ -140,12 +140,14 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<Probed> {
             8 => FrameRate::F60,
             _ => FrameRate::Unknown,
         };
-        // aspect_ratio_information: 1 square pixels, 2 = 4:3, 3 = 16:9, 4 = 2.21:1.
-        dar = match h[3] >> 4 {
-            1 => res.pixels(),
-            2 => Some((4, 3)),
-            3 => Some((16, 9)),
-            4 => Some((221, 100)),
+        // aspect_ratio_information: 1 = square pixels (coded size). 2/3/4 are 4:3, 16:9, 2.21:1
+        // only in 13818-2; in 11172-2 they are pel ratios, so MPEG-1 leaves them unknown.
+        let width = (u32::from(h[0]) << 4) | u32::from(h[1] >> 4);
+        dar = match (h[3] >> 4, codec) {
+            (1, _) if width > 0 && height > 0 => Some((width, height)),
+            (2, Codec::Mpeg2) => Some((4, 3)),
+            (3, Codec::Mpeg2) => Some((16, 9)),
+            (4, Codec::Mpeg2) => Some((221, 100)),
             _ => None,
         };
     }
@@ -510,5 +512,21 @@ mod dar_tests {
         let (_, res, _, dar) = probe_video(&es, Some(0x02)).expect("video");
         assert_eq!(res, Resolution::R576p);
         assert_eq!(dar, Some((16, 9)));
+    }
+
+    #[test]
+    fn square_pixel_code_uses_the_coded_size() {
+        // 320x240, aspect code 1 (square pixels), frame-rate code 4.
+        let es = [0, 0, 1, 0xB3, 0x14, 0x00, 0xF0, 0x14, 0, 0];
+        let (_, _, _, dar) = probe_video(&es, Some(0x02)).expect("video");
+        assert_eq!(dar, Some((320, 240)));
+    }
+
+    #[test]
+    fn mpeg1_pel_aspect_code_is_not_a_display_ratio() {
+        // MPEG-1 352x288, code 3 is a pel aspect ratio (11172-2), not 16:9.
+        let es = [0, 0, 1, 0xB3, 0x16, 0x01, 0x20, 0x33, 0, 0];
+        let (_, _, _, dar) = probe_video(&es, Some(0x01)).expect("video");
+        assert_eq!(dar, None);
     }
 }

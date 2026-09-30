@@ -241,8 +241,8 @@ impl MapHeader {
 }
 
 /// Display aspect ratio as `(num, den)`. Anamorphic titles carry an explicit
-/// `display_aspect`; without one, SD is never square-pixel (assume 4:3) and
-/// HD uses the coded pixel dimensions.
+/// `display_aspect`; without one, SD is never square-pixel so its aspect is
+/// unknown `(0, 1)`, and HD uses the coded pixel dimensions.
 fn display_aspect_ratio(v: &VideoStream, w: u32, h: u32) -> (u32, u32) {
     let sd = matches!(
         v.resolution,
@@ -250,7 +250,7 @@ fn display_aspect_ratio(v: &VideoStream, w: u32, h: u32) -> (u32, u32) {
     );
     match v.display_aspect {
         Some((a, b)) if b != 0 => (a, b),
-        _ if sd => (4, 3),
+        _ if sd => (0, 1),
         _ if h != 0 => (w, h),
         _ => (0, 1),
     }
@@ -617,7 +617,7 @@ mod tests {
         let h = MapHeader::from_title(&t, src(Medium::Iso, "iso://x.iso", 2));
         assert_eq!(h.stream.codec, "mpeg2video");
         assert_eq!((h.stream.width, h.stream.height), (720, 576));
-        assert_eq!(h.stream.dar, (4, 3)); // SD is never square-pixel
+        assert_eq!(h.stream.dar, (0, 1)); // SD with no aspect: unknown
         assert_eq!(h.stream.frame_rate, (25, 1));
         assert_eq!(h.stream.scan, Scan::Interlaced);
         assert_eq!(h.stream.colour.matrix, 5);
