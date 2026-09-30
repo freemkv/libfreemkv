@@ -7,7 +7,7 @@
 //! readable unit confirms it. A unit the key does not open is damage, blanked and counted,
 //! when a held key opens a partner or no partner is readable; it stops E7022 / E7032 when
 //! another held key opens it, when partners are readable and none opens, or when a second
-//! partnerless unit (another LBA) opens under no key before any proof.
+//! partnerless unit (another LBA) opens under no key before any proof; never in a clear piece.
 
 use super::{Proof, ProofCache, ResolvedKeySet, StopKind};
 use crate::aacs::content::{
@@ -114,7 +114,7 @@ impl Arrival {
 
     /// Prove and decrypt the lazy-piece units of `buf`, read at `lba` on the unit grid.
     /// Keyed pieces are left to the key map; clear and segment units are untouched. Returns
-    /// how many damaged units it blanked (see [`is_damage`](Self::is_damage)).
+    /// how many damaged units it blanked (see [`unopened`](Self::unopened)).
     pub(crate) fn process(
         &self,
         inner: &mut dyn SectorSource,
@@ -210,6 +210,10 @@ impl Arrival {
         // No key held for a piece not resolved clear (a mux given no set): nothing to prove.
         if self.base == 0 && !self.pieces[span.3].2 {
             return Err(self.stop(at, "no key held"));
+        }
+        // A clear piece has no partners and no key to be wrong: a flagged unit is damage.
+        if self.pieces[span.3].2 {
+            return Ok(());
         }
         let vouch = |ps: &[Vec<u8>]| ps.iter().any(|p| witnesses.iter().any(|&s| opens(p, s)));
         let batch = self.batch_partners(lba, buf, u, span.3);
