@@ -165,7 +165,11 @@ fn transport_field_is_not_reachable_outside_dispatch() {
         ("macos.rs", include_str!("macos.rs")),
         ("windows.rs", include_str!("windows.rs")),
     ] {
-        assert_eq!(count(src, "#[cfg(test)]"), 0, "{name} must go through Drive::exec");
+        assert_eq!(
+            count(src, "#[cfg(test)]"),
+            0,
+            "{name} must go through Drive::exec"
+        );
     }
 }
 
