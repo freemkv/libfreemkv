@@ -565,19 +565,10 @@ mod tests {
     // does NOT fail the rip (a crib false positive, not a stale key).
     #[test]
     fn a_crib_false_positive_keeps_the_cached_key_rather_than_failing() {
-        // Header periodic enough to yield a crib, body random enough that no
-        // LFSR seed reproduces it — crib mismatch, re-crack fails.
-        let mut sector = [0u8; 2048];
-        sector[0x14] = 0x30;
-        for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
-            *b = (i % 4) as u8;
-        }
-        for (i, b) in sector.iter_mut().enumerate().skip(0x80) {
-            *b = ((i * 37 + 11) % 251) as u8;
-        }
+        let mut sector = false_positive_scrambled_pack();
         assert!(
-            has_scramble_flag_bits(&sector),
-            "fixture must be a scrambled sector"
+            is_scrambled_pack(&sector),
+            "fixture must be a real scrambled pack, or descramble_region skips it"
         );
         assert!(
             keyless::attack_crib(&sector).is_some(),
@@ -587,23 +578,40 @@ mod tests {
             keyless::crack_title_key(&sector).is_none(),
             "fixture must be uncrackable, or the failure branch is never entered"
         );
+        let ciphertext = sector;
 
         let key_before = [0xAAu8; 5];
         let mut key = key_before;
+        RECRACK_ATTEMPTS.with(|c| c.set(0));
         let out = descramble_region(&mut sector, &mut key)
             .expect("a crib false positive must NOT fail the rip");
+        assert_eq!(
+            RECRACK_ATTEMPTS.with(|c| c.get()),
+            1,
+            "the sector must reach the failed re-crack, not be skipped"
+        );
+        assert_eq!(
+            sector[0x14] & 0x30,
+            0,
+            "the cached key must still be applied"
+        );
 
         // "No loss term" belongs to the SEAM, not this function: assert it one
         // level up (at `decrypt_sectors`) where the value is assembled and
         // returned, so the arm dispatch and plumbing are exercised too.
         assert_eq!(out, 0);
-        let mut seam_sector = sector;
+        let mut seam_sector = ciphertext;
         let mut seam_keys = crate::decrypt::DecryptKeys::Css { title_key: key };
         assert_eq!(
             crate::decrypt::decrypt_sectors(&mut seam_sector, &mut seam_keys, 0)
                 .expect("a crib false positive must NOT fail the rip at the seam either"),
             0,
             "CSS reports no loss term of its own through decrypt_sectors"
+        );
+        assert_eq!(
+            seam_sector[0x14] & 0x30,
+            0,
+            "the seam must process the pack too"
         );
         assert_eq!(
             key, key_before,
@@ -735,6 +743,39 @@ mod tests {
     }
 
     // ── has_scramble_flag_bits ─────────────────────────────────────────────
+
+    // Length guards on untrusted regions: a short buffer or trailing partial chunk must be
+    // skipped, never indexed (a panic here would abort the rip).
+    #[test]
+    fn short_buffers_are_not_scrambled_packs_and_do_not_panic() {
+        let pack = false_positive_scrambled_pack();
+        for len in [0, 1, 0x14, 0x15, 1024, 2047] {
+            assert!(!is_scrambled_pack(&pack[..len]), "len {len}");
+            assert!(ps_scrambled_at(&pack[..len]).is_none(), "len {len}");
+            assert!(!is_scrambled_ps_pack(&pack[..len]), "len {len}");
+        }
+    }
+
+    #[test]
+    fn descramble_region_leaves_a_trailing_partial_chunk_alone() {
+        let pack = false_positive_scrambled_pack();
+        let mut buf = pack.to_vec();
+        buf.extend_from_slice(&pack[..1500]);
+        let tail = buf[2048..].to_vec();
+        let mut key = [0xAAu8; 5];
+        descramble_region(&mut buf, &mut key).expect("never fails");
+        assert_eq!(
+            buf[2048..],
+            tail[..],
+            "a partial trailing chunk is left as is"
+        );
+        assert_eq!(buf[0x14] & 0x30, 0, "the whole pack before it is processed");
+        let mut short = pack[..1500].to_vec();
+        let before = short.clone();
+        descramble_region(&mut short, &mut key).expect("never fails");
+        descramble_ps_region(&mut short, &mut key);
+        assert_eq!(short, before);
+    }
 
     // A buffer shorter than one sector reports false WITHOUT indexing 0x14
     // (short-circuited before the flag read).
@@ -934,6 +975,8 @@ mod tests {
         /// Every read fails with CSS-locked sense `05/6F/03` (drive refusing
         /// scrambled reads because the bus-auth gate isn't open).
         lock_all: bool,
+        /// LBA ranges whose reads fail CSS-locked (a gate that opens elsewhere).
+        locked: Vec<std::ops::Range<u32>>,
         /// When set, the sector at `crackable.0` is served as a full
         /// crackable scrambled sector instead of the uniform `flag_byte`
         /// fill, so the scan can reach `CrackOutcome::Cracked`.
@@ -954,6 +997,7 @@ mod tests {
                 flag_byte,
                 fail_all: false,
                 lock_all: false,
+                locked: Vec::new(),
                 crackable: None,
                 short_read: None,
                 stream_id: 0x00,
@@ -991,7 +1035,7 @@ mod tests {
             _recovery: bool,
         ) -> Result<usize> {
             self.reads.borrow_mut().push(lba);
-            if self.lock_all {
+            if self.lock_all || self.locked.iter().any(|r| r.contains(&lba)) {
                 return Err(Error::DiscRead {
                     sector: lba as u64,
                     status: Some(2),
@@ -1319,9 +1363,47 @@ mod tests {
         }];
         let _ = crack_key_outcome(&mut src, &extents, 1, None);
         let n = src.reads.borrow().len();
+        assert_eq!(
+            n, CSS_LOCKED_BAIL as usize,
+            "locked scan bails at exactly {CSS_LOCKED_BAIL} reads, not 10000; read {n}"
+        );
+    }
+
+    // A locked run shorter than the bail, then an open gate, must reach the sector.
+    #[test]
+    fn a_short_locked_run_before_an_open_gate_still_cracks() {
+        let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let last = CSS_LOCKED_BAIL - 1;
+        let mut src = MockSource::new(0x00);
+        src.locked.push(0..last);
+        src.crackable = Some((last, crackable_sector(&key, &[1, 2, 3, 4, 5], 8)));
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 10_000,
+        }];
+        let outcome = crack_key_outcome(&mut src, &extents, 1, None);
         assert!(
-            n <= (CSS_LOCKED_BAIL as usize) + 1,
-            "locked scan early-bails near {CSS_LOCKED_BAIL}, not 10000; read {n}"
+            matches!(outcome, CrackOutcome::Cracked(_)),
+            "got {outcome:?}"
+        );
+    }
+
+    // A readable batch resets the locked run: two sub-bail runs split by one open read never bail.
+    #[test]
+    fn a_readable_batch_resets_the_locked_run() {
+        let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let run = CSS_LOCKED_BAIL - 1;
+        let mut src = MockSource::new(0x00);
+        src.locked = vec![0..run, run + 1..2 * run + 1];
+        src.crackable = Some((2 * run + 1, crackable_sector(&key, &[1, 2, 3, 4, 5], 8)));
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 10_000,
+        }];
+        let outcome = crack_key_outcome(&mut src, &extents, 1, None);
+        assert!(
+            matches!(outcome, CrackOutcome::Cracked(_)),
+            "got {outcome:?}"
         );
     }
 
