@@ -248,19 +248,35 @@ fn fox_dcx_labels_never_panics() {
 
 #[test]
 fn bdnav_vm_resolve_never_panics() {
-    // The HDMV nav VM executes an untrusted MovieObject.bdmv command list.
-    // Parse sweep bytes as a MovieObject set and run the VM from First-Play —
-    // the combined parse+execute path the per-parser index/mobj sweeps miss.
+    // The HDMV nav VM executes an untrusted MovieObject.bdmv command list. Random bytes
+    // almost never form a parseable MovieObject (num_cmds*12 overshoots the buffer), so
+    // each case is ALSO wrapped as the command list of a valid object to reach the VM.
     use crate::bdnav::index::{Index, PlaybackObj};
+    let index = Index {
+        first_play: PlaybackObj::Hdmv { id_ref: 0 },
+        top_menu: PlaybackObj::Hdmv { id_ref: 0 },
+        titles: Vec::new(),
+    };
     sweep("bdnav_vm", b"MOBJ", |b| {
         if let Some(mobjs) = crate::bdnav::mobj::parse(b) {
-            let index = Index {
-                first_play: PlaybackObj::Hdmv { id_ref: 0 },
-                top_menu: PlaybackObj::Hdmv { id_ref: 0 },
-                titles: Vec::new(),
-            };
             let _ = crate::bdnav::vm::resolve(&index, &mobjs, &|_| false);
         }
+        let cmds: Vec<[u8; 12]> = b.as_chunks::<12>().0.iter().take(64).copied().collect();
+        let wrapped = crate::bdnav::mobj::tests::build(&[&cmds]);
+        let mobjs = crate::bdnav::mobj::parse(&wrapped).expect("wrapped object parses");
+        let _ = crate::bdnav::vm::resolve(&index, &mobjs, &|_| false);
+    });
+}
+
+#[test]
+fn ifo_table_parsers_never_panic() {
+    // TT_SRPT, PGCIT (with PTT_SRPT) and PGC parse untrusted IFO bytes; the sweep
+    // aims each at a random in-buffer offset as well as offset 0.
+    sweep("ifo", b"DVDVIDEO", |b| {
+        let off = b.get(8).map_or(0, |&o| o as usize * 16);
+        let _ = crate::ifo::parse_tt_srpt(b, off);
+        let _ = crate::ifo::parse_pgcit(b, off, off / 2, &[(5, 1), (3, 2), (1, 255)]);
+        let _ = crate::ifo::parse_pgc(b, off, 3);
     });
 }
 

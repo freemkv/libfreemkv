@@ -558,7 +558,7 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     use crate::aacs::content::{aacs_unit_needs_decrypt, is_unit_aligned};
     use crate::consts::SECTOR_BYTES;
 
-    const UNIT_SECTORS: u32 = 3;
+    const UNIT_SECTORS: u32 = crate::aacs::content::ALIGNED_UNIT_SECTORS;
     // Anchor on the largest TITLE's FIRST extent (video preferred, skipping an
     // obfuscated decoy), never the largest extent anywhere: AACS units are 3 sectors,
     // aligned only at a clip's START — misalignment risks a false clean/encrypted verdict.
