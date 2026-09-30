@@ -240,6 +240,12 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 );
                 continue;
             }
+            // ISO 11172-3 layer field: `Mp3` from the esds OTI covers Layers I-III.
+            if let DiscStream::Audio(a) = &mut stream
+                && a.codec == Codec::Mp3
+            {
+                a.codec = mpeg_audio_layer(&mut file, file_len, offsets[0]).unwrap_or(a.codec);
+            }
             let durations = find_box(stbl, b"stts")
                 .map(|b| parse_stts(b, n))
                 .unwrap_or_default();
@@ -972,28 +978,48 @@ fn color_space_from_primaries(primaries: u8) -> ColorSpace {
     }
 }
 
-/// Nearest standard frame rate to the median `stts` delta, else `Unknown`.
+/// Codec from the layer bits of the MPEG audio frame header at `offset`: Layer II is
+/// `Mp2`, Layer III `Mp3`; unreadable or Layer I gives `None` (caller keeps its label).
+fn mpeg_audio_layer<R: Read + Seek>(file: &mut R, file_len: u64, offset: u64) -> Option<Codec> {
+    if offset.checked_add(2)? > file_len {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut h = [0u8; 2];
+    file.read_exact(&mut h).ok()?;
+    if h[0] != 0xFF || h[1] & 0xE0 != 0xE0 {
+        return None;
+    }
+    match (h[1] >> 1) & 3 {
+        2 => Some(Codec::Mp2),
+        1 => Some(Codec::Mp3),
+        _ => None,
+    }
+}
+
+/// Nearest standard frame rate (the muxer's table) to the mean `stts` delta, else `Unknown`.
+// Mean, not median: a 1 kHz timescale rounds 41.708 ms frames to a 41/42 ms pattern.
 fn frame_rate_from_stts(timescale: u32, durations: &[u32]) -> FrameRate {
-    let mut d: Vec<u32> = durations.iter().copied().filter(|&d| d > 0).collect();
+    let d: Vec<u64> = durations
+        .iter()
+        .filter(|&&d| d > 0)
+        .map(|&d| d as u64)
+        .collect();
     if d.is_empty() {
         return FrameRate::Unknown;
     }
-    d.sort_unstable();
-    let fps = timescale as f64 / d[d.len() / 2] as f64;
-    const RATES: [(f64, FrameRate); 8] = [
-        (24000.0 / 1001.0, FrameRate::F23_976),
-        (24.0, FrameRate::F24),
-        (25.0, FrameRate::F25),
-        (30000.0 / 1001.0, FrameRate::F29_97),
-        (30.0, FrameRate::F30),
-        (50.0, FrameRate::F50),
-        (60000.0 / 1001.0, FrameRate::F59_94),
-        (60.0, FrameRate::F60),
-    ];
-    RATES
-        .iter()
-        .find(|(r, _)| (fps - r).abs() < 0.01)
-        .map_or(FrameRate::Unknown, |&(_, f)| f)
+    let fps = timescale as f64 * d.len() as f64 / d.iter().sum::<u64>() as f64;
+    match super::nearest_std_rate(fps) {
+        Some((24000, 1001)) => FrameRate::F23_976,
+        Some((24, 1)) => FrameRate::F24,
+        Some((25, 1)) => FrameRate::F25,
+        Some((30000, 1001)) => FrameRate::F29_97,
+        Some((30, 1)) => FrameRate::F30,
+        Some((50, 1)) => FrameRate::F50,
+        Some((60000, 1001)) => FrameRate::F59_94,
+        Some((60, 1)) => FrameRate::F60,
+        _ => FrameRate::Unknown,
+    }
 }
 
 /// stsz → per-sample sizes.
@@ -3845,6 +3871,33 @@ mod tests {
         assert!(info.config.is_none());
     }
 
+    // A file whose first box is a `free` box holding `sample`, then `moov` whose single
+    // audio sample points at it.
+    fn mp4_with_first_sample(mut moov: Vec<u8>, sample: &[u8; 10]) -> Vec<u8> {
+        let pos = moov.windows(4).position(|w| w == b"stco").unwrap();
+        moov[pos + 12..pos + 16].copy_from_slice(&8u32.to_be_bytes());
+        let mut f = mp4_box(b"free", sample);
+        f.extend_from_slice(&moov);
+        f
+    }
+
+    #[test]
+    fn mpeg_audio_layer_bits_pick_mp2_or_mp3() {
+        let mut esds = vec![0u8, 0, 0, 0, 0x03, 19, 0, 1, 0, 0x04, 13, 0x6B, 0x15];
+        esds.extend_from_slice(&[0u8; 11]);
+        let entry = audio_entry(2, 0, &mp4_box(b"esds", &esds));
+        let codec_for = |b1: u8| {
+            let moov = audio_moov(48_000, b"mp4a", &entry);
+            let mut s = [0u8; 10];
+            s[..2].copy_from_slice(&[0xFF, b1]);
+            let f = mp4_with_first_sample(moov, &s);
+            read_audio(f).codec
+        };
+        assert_eq!(codec_for(0xFD), Codec::Mp2, "layer bits 10 = Layer II");
+        assert_eq!(codec_for(0xFB), Codec::Mp3, "layer bits 01 = Layer III");
+        assert_eq!(codec_for(0x00), Codec::Mp3, "no sync: keep the OTI label");
+    }
+
     #[test]
     fn ac3_and_ec3_channels_come_from_dac3_dec3_not_channelcount() {
         // dac3: acmod 7 (3/2), lfeon 1 -> 6 channels.
@@ -3876,6 +3929,14 @@ mod tests {
         assert_eq!(hdr_from_cicp(info.cicp, false), HdrFormat::Hdr10);
         assert_eq!(hdr_from_cicp(info.cicp, true), HdrFormat::DolbyVision);
         assert_eq!(color_space_from_primaries(c.primaries), ColorSpace::Bt2020);
+        // full_range_flag (bit 7 of the last byte) -> range 2.
+        *colr.last_mut().unwrap() = 0x80;
+        let entry = visual_entry(3840, 2160, &mp4_box(b"colr", &colr));
+        let c = parse_stsd(&stsd_with(b"hvc1", &entry))
+            .unwrap()
+            .cicp
+            .unwrap();
+        assert_eq!(c.range, 2);
     }
 
     #[test]
@@ -3883,6 +3944,13 @@ mod tests {
         assert_eq!(frame_rate_from_stts(24000, &[1001; 5]), FrameRate::F23_976);
         assert_eq!(frame_rate_from_stts(25, &[1; 5]), FrameRate::F25);
         assert_eq!(frame_rate_from_stts(90_000, &[1234; 5]), FrameRate::Unknown);
+        // Millisecond timescale: 23.976 / 29.97 arrive as 41/42 and 33/34 ms patterns.
+        // 24 frames span 1001 ms (7 x 41 + 17 x 42); 30 frames span 1001 ms (19 x 33 + 11 x 34).
+        let d = [vec![41; 7], vec![42; 17]].concat();
+        assert_eq!(frame_rate_from_stts(1000, &d), FrameRate::F23_976);
+        let d = [vec![33; 19], vec![34; 11]].concat();
+        assert_eq!(frame_rate_from_stts(1000, &d), FrameRate::F29_97);
+        assert_eq!(frame_rate_from_stts(1000, &[40; 9]), FrameRate::F25);
         let rd = Mp4Reader::from_reader(
             std::io::Cursor::new(audio_moov(1000, b"ac-3", &audio_entry(6, 0, &[]))),
             "d".into(),

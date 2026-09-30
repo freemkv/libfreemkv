@@ -685,6 +685,19 @@ const STD_RATES: &[(u32, u32, f64)] = &[
 // not first-wins (see STD_RATES).
 const RATE_TOLERANCE_FPS: f64 = 0.5;
 
+/// Nearest `STD_RATES` entry to `fps` inside the tolerance window, as (timescale, duration).
+// Nearest, not first: first-match declared exact 24/30/60 fps as their 1000/1001 twin.
+pub(super) fn nearest_std_rate(fps: f64) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32, f64)> = None;
+    for &(ts, dur, rate) in STD_RATES {
+        let d = (fps - rate).abs();
+        if d < RATE_TOLERANCE_FPS && best.is_none_or(|(_, _, best_d)| d < best_d) {
+            best = Some((ts, dur, d));
+        }
+    }
+    best.map(|(ts, dur, _)| (ts, dur))
+}
+
 /// Detect the constant frame rate from the median presentation delta, snapping
 /// to the nearest standard rate. Falls back to a 90 kHz timescale with a rounded
 /// duration when nothing matches (non-standard / too few samples).
@@ -705,18 +718,8 @@ fn detect_rate(samples: &[Sample]) -> (u32, u32) {
     deltas.sort_unstable();
     let median = deltas[deltas.len() / 2];
     let fps = NS as f64 / median as f64;
-    // Snap to the NEAREST standard rate inside the tolerance window, not the first
-    // one: first-match depended on table order, so exact 24/30/60 fps sources were
-    // always declared as their 1000/1001 twin (a 0.1% timing error track-wide).
-    let mut best: Option<(u32, u32, f64)> = None;
-    for &(ts, dur, rate) in STD_RATES {
-        let d = (fps - rate).abs();
-        if d < RATE_TOLERANCE_FPS && best.is_none_or(|(_, _, best_d)| d < best_d) {
-            best = Some((ts, dur, d));
-        }
-    }
-    if let Some((ts, dur, _)) = best {
-        return (ts, dur);
+    if let Some(r) = nearest_std_rate(fps) {
+        return r;
     }
     let dur = ((median as i128 * 90_000) / NS as i128).max(1) as u32;
     (90_000, dur)

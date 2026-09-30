@@ -143,7 +143,7 @@ impl crate::pes::Stream for StdioStream {
             return Err(crate::error::Error::StreamHeaderWritten.into());
         }
         let tracks = self.disc_title.streams.len();
-        super::meta::set_timing(&mut self.timings, track, timing, tracks)
+        super::network::set_timing(&mut self.timings, track, timing, tracks)
     }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {

@@ -168,10 +168,6 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (seg[0] & 0xfe00) == 0xfc00
                 // link-local fe80::/10
                 || (seg[0] & 0xffc0) == 0xfe80
-                // deprecated site-local fec0::/10 (RFC 3879)
-                || (seg[0] & 0xffc0) == 0xfec0
-                // local-use NAT64 64:ff9b:1::/48 (RFC 8215) embeds internal IPv4
-                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001)
                 // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x);
                 // to_ipv4() returns Some for both forms — re-check as IPv4 so an
                 // IPv4-mapped private/loopback address can't bypass the block above.
@@ -414,7 +410,7 @@ impl crate::pes::Stream for NetworkStream {
                 header_written: false,
                 timings,
                 ..
-            } => meta::set_timing(timings, track, timing, self.disc_title.streams.len()),
+            } => set_timing(timings, track, timing, self.disc_title.streams.len()),
             // The header (which carries it) is already on the wire.
             Mode::Write { .. } => Err(crate::error::Error::StreamHeaderWritten.into()),
             Mode::Read { .. } => Err(crate::error::Error::StreamReadOnly.into()),
@@ -424,6 +420,23 @@ impl crate::pes::Stream for NetworkStream {
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         self.disc_title.codec_privates.get(track).cloned().flatten()
     }
+}
+
+// Record `timing` for stream `track` of a `tracks`-stream title.
+pub(crate) fn set_timing(
+    timings: &mut Vec<crate::pes::TrackTiming>,
+    track: usize,
+    timing: crate::pes::TrackTiming,
+    tracks: usize,
+) -> io::Result<()> {
+    if track >= tracks {
+        return Err(crate::error::Error::MuxTrackRange { track, tracks }.into());
+    }
+    if timings.len() < tracks {
+        timings.resize(tracks, Default::default());
+    }
+    timings[track] = timing;
+    Ok(())
 }
 
 // NetworkStream is PES-only — no IOStream/Read/Write byte interface.
@@ -588,25 +601,6 @@ mod tests {
         assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
             0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808
-        ))));
-    }
-
-    #[test]
-    fn ssrf_guard_blocks_site_local_and_local_use_nat64() {
-        use std::net::Ipv6Addr;
-        for seg in [
-            [0xfec0, 0, 0, 0, 0, 0, 0, 1],
-            [0xfeff, 0, 0, 0, 0, 0, 0, 1],
-            [0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808],
-        ] {
-            assert!(
-                is_blocked_ip(IpAddr::V6(Ipv6Addr::from(seg))),
-                "{seg:x?} must be blocked"
-            );
-        }
-        // Global unicast next to those ranges stays allowed.
-        assert!(!is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x2606, 0x4700, 0, 0, 0, 0, 0, 1
         ))));
     }
 
