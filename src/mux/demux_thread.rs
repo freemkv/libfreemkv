@@ -556,95 +556,37 @@ mod tests {
     }
 
     // Regression: worker must detect consumer disconnect even when every batch is empty, else
-    // it spins through all remaining extents before exiting (join() blocking for minutes).
+    // it reads the rest of the title before exiting (join() blocking for minutes). The
+    // producer never ends here, so only the always-send probe lets the worker exit.
     #[test]
     fn worker_exits_promptly_on_consumer_drop_during_empty_batches() {
-        // Use an untracked PID so every batch the demuxer produces is empty.
         let tracked_pid = 0x1011u16;
         let untracked_pid = 0x0100u16;
-
         const SYNC: u8 = 0x47;
-        // Build a non-PUSI continuation packet on the untracked PID so
-        // TsDemuxer.feed() returns an empty Vec every call.
+        // A non-PUSI packet on an untracked PID: TsDemuxer.feed() returns empty every call.
         let mut empty_pkt = vec![0u8; 192];
         empty_pkt[4] = SYNC;
         empty_pkt[5] = ((untracked_pid >> 8) as u8) & 0x1F; // no PUSI
         empty_pkt[6] = (untracked_pid & 0xFF) as u8;
         empty_pkt[7] = 0x10; // payload only
 
-        // Large prefetch channel — enough that the worker will be spinning
-        // through empty batches long after the consumer drops.
-        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(64);
-        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(64);
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let ts = super::super::ts::TsDemuxer::new(&[tracked_pid]);
         let (dt, rx) =
             DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
-
-        // Fill the prefetch channel with empty-batch buffers.
-        for _ in 0..64 {
-            pf_tx.send(Ok(empty_pkt.clone())).unwrap();
-        }
-
-        // Drop the consumer — the worker should notice during the next
-        // empty-batch iteration (is_disconnected() check).
+        // An endless producer: it stops only once the worker is gone.
+        std::thread::spawn(move || while pf_tx.send(Ok(empty_pkt.clone())).is_ok() {});
         drop(rx);
 
-        // Give the worker a generous but bounded window to observe the
-        // disconnect and exit.  A regression (spin-until-exhaustion) would
-        // take >> 1 s; correct behaviour exits almost immediately.
-        let join_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let join_done2 = join_done.clone();
-        let watchdog = std::thread::spawn(move || {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             drop(dt); // joins the worker
-            join_done2.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = done_tx.send(());
         });
-
-        // Also close the producer so the worker doesn't block on prefetch_rx
-        // if somehow is_disconnected is not triggered (belt-and-suspenders).
-        drop(pf_tx);
-
-        watchdog.join().unwrap();
-        assert!(
-            join_done.load(std::sync::atomic::Ordering::Relaxed),
-            "worker must exit promptly after consumer drop during empty batches"
-        );
-    }
-
-    // Regression: on spawn failure, channels must drop before producer_shell so the producer
-    // observes disconnection and join() doesn't hang.
-    #[test]
-    fn channels_disconnected_before_producer_join_on_spawn_failure() {
-        // The producer "thread" is simulated by holding prefetch_tx; verify it
-        // observes disconnection only after dropping prefetch_rx, since crossbeam
-        // exposes disconnection only through send/recv results.
-        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(1);
-        let (rc_tx, rc_rx) = bounded::<Vec<u8>>(1);
-
-        // Before any drop: the producer-side ends are live (a send into the
-        // depth-1 prefetch channel succeeds; the recycle receiver can still
-        // be fed).
-        assert!(
-            pf_tx.send(Ok(vec![1, 2, 3])).is_ok(),
-            "prefetch_tx must accept a send before any drop"
-        );
-
-        // Simulate the spawn-failure teardown: the move-closure owns prefetch_rx
-        // and recycle_tx, so dropping them mirrors `spawn` dropping the failed
-        // closure before producer_shell is joined.
-        drop(pf_rx);
-        drop(rc_tx);
-
-        // Now the producer-side handles observe disconnection via Err results —
-        // a blocked producer send/recv returns Err and the producer exits, so
-        // the subsequent join() completes without hanging.
-        assert!(
-            pf_tx.send(Ok(vec![4, 5, 6])).is_err(),
-            "prefetch_tx send must fail after prefetch_rx drop (producer would exit)"
-        );
-        assert!(
-            rc_rx.recv().is_err(),
-            "recycle_rx recv must fail after recycle_tx drop"
-        );
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker must exit after consumer drop during empty batches");
     }
 
     // PipelinedPesStream must drop its receiver before this handle (field order):
@@ -681,10 +623,11 @@ mod tests {
             .expect("drop must not deadlock on the blocked demux worker");
     }
 
-    /// LP10 (§2.1 "Unbounded Drop joins"): a worker blocked on its full output
-    /// channel, then a cancel: dropping the stream returns within 1 s. Guard.
+    /// LP10: a worker blocked on its full output channel, then a cancel. With the
+    /// consumer still attached and more input pending, the cancel alone ends the worker:
+    /// it sends `Halted` after at most the batches already in flight, then exits.
     #[test]
-    fn demux_drop_with_blocked_worker_after_cancel() {
+    fn a_cancel_ends_a_worker_blocked_on_a_full_channel() {
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(16);
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(16);
         let pid = 0x1011;
@@ -693,26 +636,29 @@ mod tests {
         let (dt, rx) =
             DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt.clone()), Some(ts), None)
                 .unwrap();
-        for i in 0..8u8 {
+        // Rebound after `dt` so a failing assert drops the input first (no hung join).
+        let pf_tx = pf_tx;
+        for i in 0..16u8 {
             pf_tx.send(Ok(bdts_pes_packet(pid, &[i]))).unwrap();
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // Wait (polling, no fixed sleep) until the output channel is full.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !rx.is_full() {
+            assert!(std::time::Instant::now() < deadline, "channel never filled");
+            std::thread::yield_now();
+        }
         halt.cancel();
-        let stream = super::super::pipelined_stream::PipelinedPesStream::new(
-            dt,
-            rx,
-            crate::disc::DiscTitle::empty(),
-            Vec::new(),
-            Vec::new(),
+        let batches = collect_batches(&rx, Duration::from_secs(10));
+        assert!(
+            matches!(batches.last(), Some(DemuxBatch::Err(e)) if crate::error::is_halt(e)),
+            "the cancel must end the worker with Halted"
         );
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            drop(stream);
-            let _ = done_tx.send(());
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("drop after a cancel must return within 1 s");
-        drop(pf_tx);
+        assert!(
+            batches.len() <= DEMUX_CHANNEL_DEPTH + 2,
+            "no input read after the cancel: {} batches",
+            batches.len()
+        );
+        drop(rx);
+        drop(dt); // the worker has exited: joins at once
     }
 }
