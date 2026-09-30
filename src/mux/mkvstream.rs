@@ -821,6 +821,17 @@ impl MkvStream {
         Ok(())
     }
 
+    // A frame write that failed mid-cluster leaves the file torn: later writes and
+    // finish() must error. A track-range reject writes nothing, so it is not fatal.
+    fn fail_on_write_error(&mut self, r: io::Result<()>) -> io::Result<()> {
+        if let Err(e) = &r
+            && crate::error::error_code(e) != Some(crate::error::E_MUX_TRACK_RANGE)
+        {
+            self.mode = Mode::Write(WriteMode::Failed);
+        }
+        r
+    }
+
     // Emit one frame on muxer track `track` (overrides `frame.track`) with an optional
     // MVC dependent-view `BlockAdditional`: the first video frame triggers muxer
     // construction (its coding sets FieldOrder); earlier frames buffer.
@@ -833,7 +844,8 @@ impl MkvStream {
         match &mut self.mode {
             Mode::Read(_) => return Err(crate::error::Error::StreamReadOnly.into()),
             Mode::Write(WriteMode::Active(m)) => {
-                return emit_to_muxer(m, track, frame, additional);
+                let r = emit_to_muxer(m, track, frame, additional);
+                return self.fail_on_write_error(r);
             }
             Mode::Write(WriteMode::Building | WriteMode::Failed) => return Err(muxer_unusable()),
             Mode::Write(WriteMode::Pending(_)) => {}
@@ -878,7 +890,8 @@ impl MkvStream {
             // is passed (apply_coding_to_track then logs + leaves UNDETERMINED).
             self.activate(if use_coding { frame.coding } else { None }, use_coding)?;
             if let Mode::Write(WriteMode::Active(m)) = &mut self.mode {
-                return emit_to_muxer(m, track, frame, additional);
+                let r = emit_to_muxer(m, track, frame, additional);
+                return self.fail_on_write_error(r);
             }
             Ok(())
         } else {
@@ -4875,6 +4888,49 @@ mod tests {
         // A minimal avcC so the written TrackEntry carries a CodecPrivate.
         t.codec_privates = vec![Some(vec![0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1])];
         t
+    }
+
+    // Writer that errors while `fail` is set (a transient disk/pipe failure).
+    struct Flaky(SharedOut, std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl io::Write for Flaky {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(io::ErrorKind::Other.into());
+            }
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl io::Seek for Flaky {
+        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    #[test]
+    fn a_failed_frame_write_fails_the_later_finish() {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let w = Flaky(SharedOut::new(), fail.clone());
+        let mut s = MkvStream::create(Box::new(w), &h264_title(), None).unwrap();
+        let frame = |pts, len| crate::pes::PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 0,
+            pts,
+            keyframe: true,
+            data: vec![0; len],
+            duration_ns: None,
+        };
+        s.write(&frame(0, 16)).unwrap();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(s.write(&frame(40_000_000, 4 << 20)).is_err());
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(s.finish().is_err(), "a torn cluster must not finish as Ok");
     }
 
     /// An MPEG-2 multichannel extension track (DVD `0xD0|n`) has no Matroska mapping: it is
