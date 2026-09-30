@@ -163,9 +163,6 @@ fn normalize_device_path(path: &str) -> String {
     if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
         return format!("\\\\.\\{}", trimmed);
     }
-    if path.to_lowercase().starts_with("cdrom") {
-        return format!("\\\\.\\{}", path);
-    }
     format!("\\\\.\\{}", path)
 }
 
@@ -460,12 +457,14 @@ impl ScsiTransport for SptiTransport {
             // SPTI doesn't surface a written-bytes count separate from
             // SenseInfoLength; pass the full K_SENSE_SIZE and let
             // parse_sense key off byte 0's response code (fixed vs descriptor).
-            let parsed = super::parse_sense(&sptwb.sense, K_SENSE_SIZE as u8);
-            self.last_progress = super::parse_sense_progress(&sptwb.sense, K_SENSE_SIZE as u8);
+            let parsed =
+                super::sense_for_status(sptwb.spt.ScsiStatus, &sptwb.sense, K_SENSE_SIZE as u8);
+            self.last_progress =
+                parsed.and_then(|_| super::parse_sense_progress(&sptwb.sense, K_SENSE_SIZE as u8));
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),
                 status: sptwb.spt.ScsiStatus,
-                sense: Some(parsed),
+                sense: parsed,
             });
         }
 
