@@ -1772,10 +1772,26 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
         let mut buf = vec![0u8; 30 * 2048];
         w.read_sectors(b, 30, &mut buf, true).unwrap();
     }
-    let _ = crate::mux::mux_with_keys(
+    // The mux needs a stream to run at all; with none it returns E6009 before reading.
+    let mut title = fx.disc.titles[0].clone();
+    title
+        .streams
+        .push(crate::disc::Stream::Video(crate::disc::VideoStream {
+            pid: 0x1011,
+            codec: crate::disc::Codec::Mpeg2,
+            resolution: crate::disc::Resolution::R1080p,
+            frame_rate: crate::disc::FrameRate::F23_976,
+            hdr: crate::disc::HdrFormat::Sdr,
+            color_space: crate::disc::ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }));
+    let r = crate::mux::mux_with_keys(
         crate::mux::MuxSource::Live {
             reader: Box::new(src.clone()),
-            title: fx.disc.titles[0].clone(),
+            title,
             format: ContentFormat::BdTs,
         },
         Some(&set),
@@ -1786,6 +1802,13 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
         },
         &Halt::new(),
         Arc::new(crate::mux::driver::NoopEvents),
+    );
+    // The fixture TS carries no muxable frames, so a mux that read every unit through the
+    // held keys ends E6008 (MkvInvalid); E6009 would mean it never read.
+    let e = r.expect_err("no muxable frames");
+    assert_eq!(
+        crate::error::error_code(&e),
+        Some(crate::error::E_MKV_INVALID)
     );
     assert_eq!(Arc::strong_count(&f), 1);
     assert_eq!(calls.len(), asked, "nothing asks after resolve");
