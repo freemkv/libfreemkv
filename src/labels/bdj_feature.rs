@@ -465,6 +465,11 @@ mod tests {
             choose_dominant(&[(800, 7000, 6), (801, 4000, 6)]),
             Some(800)
         );
+        // Exactly DOMINANCE_RATIO (1.5x) still counts as dominant.
+        assert_eq!(
+            choose_dominant(&[(800, 6000, 6), (801, 4000, 6)]),
+            Some(800)
+        );
     }
 
     #[test]

@@ -358,6 +358,55 @@ mod tests {
         );
     }
 
+    // ── parse(): the playbackconfig.xml -> stream_map wiring ────────────────
+
+    // Lay /BDMV/JAR/00000/<files> onto an in-memory disc and open its filesystem.
+    fn jar_disc(files: &[(&str, &str)]) -> (crate::udf::fixture::MemDisc, UdfFs) {
+        use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+        let specs = files
+            .iter()
+            .enumerate()
+            .map(|(i, (name, body))| {
+                let n = i as u32;
+                file_with(name, 100 + n, 2000 + n * 4, body.as_bytes().to_vec(), true)
+            })
+            .collect();
+        let dir = |name: &str, icb, data, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: data,
+            files,
+            subdirs,
+        };
+        let sub = dir("00000", 54, 55, specs, vec![]);
+        let jar = dir("JAR", 52, 53, vec![], vec![sub]);
+        let bdmv = dir("BDMV", 12, 13, vec![], vec![jar]);
+        let root = dir("", 10, 11, vec![], vec![bdmv]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    // Dropping the playbackconfig read (or passing an empty map) would number the
+    // streams by fallback order and bind names to the wrong streams.
+    #[test]
+    fn parse_numbers_streams_from_playbackconfig() {
+        let sp = "<AudioStreamInfos><ID>a0</ID><LangInfoID>ENG</LangInfoID></AudioStreamInfos>\
+                  <AudioStreamInfos><ID>a1</ID><LangInfoID>FRA</LangInfoID></AudioStreamInfos>";
+        let pc = "<AudioStreams><StreamID>2</StreamID><StreamInfo_ID>a0</StreamInfo_ID></AudioStreams>\
+                  <AudioStreams><StreamID>1</StreamID><StreamInfo_ID>a1</StreamInfo_ID></AudioStreams>";
+        let (mut disc, udf) = jar_disc(&[("streamproperties.xml", sp), ("playbackconfig.xml", pc)]);
+        let got = parse(&mut disc, &udf).expect("labels");
+        let by_lang: Vec<(&str, u16)> = got
+            .labels
+            .iter()
+            .map(|l| (l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(by_lang, [("eng", 2), ("fra", 1)]);
+    }
+
     // ── Additional hardening tests ─────────────────────────────────────────
 
     /// Spec: audio and subtitle counters are INDEPENDENT — audio fallback counter
@@ -481,8 +530,7 @@ mod tests {
     /// Mutation: drop the skip loop → the fallback reuses a claimed number.
     #[test]
     fn fallback_skips_a_dense_block_of_claimed_numbers() {
-        // Force the counter past u16::MAX by pre-taking all values 1..=u16::MAX.
-        // Doing that for real would be slow; instead inject u16::MAX into taken.
+        // 500 claimed numbers force the fallback counter past a dense block.
         let mut map = HashMap::new();
         for n in 1u16..=500 {
             map.insert(format!("taken_{}", n), n);
@@ -509,8 +557,8 @@ mod tests {
         // This must not panic.
         let nums = assign_stream_numbers(&infos, &map).expect("numbering space not exhausted");
         assert_eq!(nums.len(), 501);
-        // The last (unmapped) entry's number must be > 500 (skipped all taken).
-        assert!(nums[500] > 500);
+        // The unmapped entry skips every claimed number: exactly the next free one.
+        assert_eq!(nums[500], 501);
     }
 
     /// Spec: parse_stream_infos extracts COMMENTARY purpose from the Content element.

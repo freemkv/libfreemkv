@@ -450,6 +450,8 @@ mod tests {
         // Self-closing form with a multi-byte char in an attr value.
         assert_eq!(text(r#"<x a="é"/>"#, "x"), Some("".into()));
         assert_eq!(text("<x>日本語</x>", "x"), Some("日本語".into()));
+        // Multi-byte char directly before the `>` of an unquoted-attr open tag.
+        assert_eq!(text("<x a=é>body</x>", "x"), Some("body".into()));
     }
 
     #[test]
