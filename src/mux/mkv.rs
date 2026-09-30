@@ -1047,7 +1047,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
             } else if track.codec_id == ebml::CODEC_AAC {
                 codec_private_reserves.insert(i, writer.stream_position()?);
-                writer.write_all(&ebml::void_element(CODEC_PRIVATE_RESERVE))?;
+                writer.write_all(&ebml::void_element(CODEC_PRIVATE_RESERVE)?)?;
             }
             // Pre-0.13's deferred codecPrivate path was removed as dead code.
 
@@ -1322,7 +1322,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         el.extend_from_slice(cp);
         if rest >= 2 {
-            el.extend_from_slice(&ebml::void_element(rest));
+            el.extend_from_slice(&ebml::void_element(rest)?);
         }
         let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(pos))?;
@@ -1942,7 +1942,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             if !rw.final_interlaced
                 && let Some((fo_off, fo_len)) = rw.field_order_span
             {
-                interlaced_patches.push((fo_off, ebml::void_element(fo_len as usize)));
+                interlaced_patches.push((fo_off, ebml::void_element(fo_len as usize)?));
             }
             tracing::warn!(
                 target: "mux",
