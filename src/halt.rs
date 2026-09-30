@@ -19,9 +19,6 @@ use crate::error::{Error, Result};
 /// The longest a halt-aware wait sleeps between token checks (§2.1).
 pub const WAIT_SLICE: Duration = Duration::from_millis(20);
 
-/// Alias of [`WAIT_SLICE`], kept until ST-X1b removes it.
-pub const POLL_INTERVAL: Duration = WAIT_SLICE;
-
 // The one place the token's orderings live, shared with the loom model (LT3).
 trait AtomicFlag {
     fn store_flag(&self, v: bool, o: Ordering);

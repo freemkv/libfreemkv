@@ -215,7 +215,7 @@ mod tests {
         });
         let elapsed = started.elapsed();
         assert!(matches!(r, Err(BoundedError::Timeout)));
-        // Must bail near the 100ms deadline (one POLL_INTERVAL slack at
+        // Must bail near the 100ms deadline (one WAIT_SLICE slack at
         // most), not after the 3s op. Allow generous CI slack but stay
         // well under the op's 3s sleep.
         assert!(

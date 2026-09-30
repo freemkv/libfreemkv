@@ -2040,7 +2040,6 @@ fn an_mpg_source_remuxes_to_mkv() {
         skip_errors: false,
         batch_sectors: 8192,
         raw: false,
-        send_deadline: Some(std::time::Duration::from_secs(60)),
         selection: Default::default(),
     };
     let out = {

@@ -60,11 +60,10 @@ fn from_arc_as_arc_are_pointer_exact() {
     assert!(halt2.is_cancelled());
 }
 
-/// §2.1: `POLL_INTERVAL` becomes an alias of the 20 ms `WAIT_SLICE`.
+/// §2.1: the halt-aware check slice is 20 ms.
 #[test]
-fn poll_interval_aliases_wait_slice() {
+fn wait_slice_is_20ms() {
     assert_eq!(WAIT_SLICE, Duration::from_millis(20));
-    assert_eq!(POLL_INTERVAL, WAIT_SLICE);
 }
 
 /// LT1: `check` → `Halted` after cancel; `wait(10 s)` returns `Halted` ≤ 1 s after a
@@ -596,7 +595,7 @@ fn scoped_exec_outside() -> bool {
 
 const LT7_RUNS: usize = 20;
 // Cancel this long after the waiter starts: well inside a 250 ms slice, so the old
-// `POLL_INTERVAL` wakes ~220 ms late on every run, far past the 150 ms bound.
+// 250 ms poll interval wakes ~220 ms late on every run, far past the 150 ms bound.
 const LT7_CANCEL_AFTER: Duration = Duration::from_millis(30);
 const LT7_BOUND: Duration = Duration::from_millis(150);
 const BUDGET: Duration = Duration::from_secs(10);

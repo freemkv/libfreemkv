@@ -8,7 +8,7 @@
 
 use super::meta;
 use crate::disc::DiscTitle;
-use crate::halt::{Halt, POLL_INTERVAL};
+use crate::halt::{Halt, WAIT_SLICE};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -72,7 +72,7 @@ struct HaltRead {
 
 impl HaltRead {
     fn new(stream: TcpStream, halt: Option<Halt>) -> Self {
-        Self::with_tick(stream, halt, POLL_INTERVAL)
+        Self::with_tick(stream, halt, WAIT_SLICE)
     }
 
     fn with_tick(stream: TcpStream, halt: Option<Halt>, tick: std::time::Duration) -> Self {
