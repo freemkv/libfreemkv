@@ -147,6 +147,7 @@ fn probe_evo_streams(
     let mut audio: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
 
     let mut remaining = EVO_PROBE_SECTORS;
+    let mut buf = vec![0u8; 512 * crate::consts::SECTOR_BYTES];
     'outer: for ext in extents {
         let mut lba = ext.start_lba;
         let mut left = ext.sector_count;
@@ -158,8 +159,8 @@ fn probe_evo_streams(
                 return Err(crate::error::Error::Halted);
             }
             let n = left.min(remaining).min(512) as u16;
-            let mut buf = vec![0u8; n as usize * crate::consts::SECTOR_BYTES];
-            match reader.read_sectors(lba, n, &mut buf, false) {
+            let chunk = &mut buf[..n as usize * crate::consts::SECTOR_BYTES];
+            match reader.read_sectors(lba, n, chunk, false) {
                 Ok(_) => {}
                 // A live-drive Stop surfaces HERE, via `Drive::checked_exec`
                 // failing with `Halted`. Swallowing it like other read errors
@@ -167,9 +168,17 @@ fn probe_evo_streams(
                 Err(crate::error::Error::Halted) => {
                     return Err(crate::error::Error::Halted);
                 }
-                Err(_) => break 'outer,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        lba,
+                        code = e.code(),
+                        "evo probe read failed; title keeps the streams found so far"
+                    );
+                    break 'outer;
+                }
             }
-            for pkt in demux.feed(&buf) {
+            for pkt in demux.feed(chunk) {
                 collect_es(&pkt, &mut video, &mut video_pid, &mut audio);
             }
             lba += n as u32;
@@ -348,6 +357,10 @@ const MAX_XPL_DEPTH: usize = 32;
 // small file into huge probe/memory cost.
 const MAX_XPL_TITLES: usize = 512;
 
+// Max XPL file size. A real playlist is KBs; 1 MiB bounds the DOM roxmltree builds from
+// disc-supplied XML.
+const MAX_XPL_BYTES: usize = 1024 * 1024;
+
 const MAX_HDDVD_CLIPS: usize = 512;
 
 const MAX_XPL_CLIPS_PER_TITLE: usize = 256;
@@ -370,10 +383,18 @@ impl EvoProbeCache {
         extents: &[Extent],
         halt: Option<&crate::halt::Halt>,
     ) -> Result<Vec<Stream>> {
-        let key: Vec<(u32, u32)> = extents
-            .iter()
-            .map(|e| (e.start_lba, e.sector_count))
-            .collect();
+        // Key on the head the probe actually reads (first EVO_PROBE_SECTORS), so
+        // titles sharing a head clip but differing later share one probe.
+        let mut budget = EVO_PROBE_SECTORS;
+        let mut key: Vec<(u32, u32)> = Vec::new();
+        for e in extents {
+            if budget == 0 {
+                break;
+            }
+            let n = e.sector_count.min(budget);
+            key.push((e.start_lba, n));
+            budget -= n;
+        }
         if let Some(hit) = self.seen.get(&key) {
             return Ok(hit.clone());
         }
@@ -546,14 +567,66 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
     titles
 }
 
-/// Read the Advanced-Content playlist `ADV_OBJ/VPLST*.XPL`, if present.
-fn read_adv_obj_xpl(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Option<Vec<u8>> {
-    let dir = udf_fs.find_dir("/ADV_OBJ")?;
-    let name = dir.entries.iter().find_map(|e| {
+// Reads `path` refusing anything over MAX_XPL_BYTES (typed error, no over-read).
+fn read_xpl_capped(
+    reader: &mut dyn SectorSource,
+    udf_fs: &udf::UdfFs,
+    path: &str,
+) -> Result<Vec<u8>> {
+    let bytes = udf_fs.read_file_prefix(reader, path, MAX_XPL_BYTES + 1)?;
+    if bytes.len() > MAX_XPL_BYTES {
+        return Err(crate::error::Error::IsoTooLarge {
+            path: path.to_string(),
+        });
+    }
+    Ok(bytes)
+}
+
+/// Read the Advanced-Content playlist `ADV_OBJ/VPLST*.XPL`, if present. `Err` only on
+/// `Halted`; an unreadable or oversized playlist is logged and reads as absent.
+fn read_adv_obj_xpl(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Result<Option<Vec<u8>>> {
+    let Some(dir) = udf_fs.find_dir("/ADV_OBJ") else {
+        return Ok(None);
+    };
+    let Some(name) = dir.entries.iter().find_map(|e| {
         let lower = e.name.to_ascii_lowercase();
         (!e.is_dir && lower.starts_with("vplst") && lower.ends_with(".xpl")).then(|| e.name.clone())
-    })?;
-    udf_fs.read_file(reader, &format!("/ADV_OBJ/{name}")).ok()
+    }) else {
+        return Ok(None);
+    };
+    // The name came from the directory listing, so a failure is a real error.
+    match read_xpl_capped(reader, udf_fs, &format!("/ADV_OBJ/{name}")) {
+        Ok(b) => Ok(Some(b)),
+        Err(crate::error::Error::Halted) => Err(crate::error::Error::Halted),
+        Err(e) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                xpl = ?name,
+                code = e.code(),
+                "playlist unreadable; falling back to the per-clip heuristic"
+            );
+            Ok(None)
+        }
+    }
+}
+
+// Filters a file's (lba, sectors) list to readable extents. The flag is set when a non-empty
+// extent at lba 0 was dropped, so the plan is short of the declared size.
+fn usable_extents(file_exts: &[(u32, u32)]) -> (Vec<Extent>, bool) {
+    let mut truncated = false;
+    let mut extents = Vec::new();
+    for &(lba, sectors) in file_exts {
+        if sectors > 0 && lba == 0 {
+            truncated = true;
+        }
+        if sectors > 0 && lba > 0 {
+            extents.push(Extent {
+                start_lba: lba,
+                sector_count: sectors,
+            });
+        }
+    }
+    (extents, truncated)
 }
 
 // Composes DiscTitles from parsed XPL titles: resolves clips to extents,
@@ -576,6 +649,11 @@ fn compose_xpl_titles(
         // composing around it emits a title short by that clip's bytes while
         // its durations and chapter offsets still assume them.
         if t.clips.iter().any(|c| unusable.contains(&c.evo)) {
+            continue;
+        }
+        // A clip absent from the disc (or dropped by MAX_HDDVD_CLIPS) is equally
+        // unrenderable: drop the title rather than emit it short.
+        if t.clips.iter().any(|c| !clip_extents.contains_key(&c.evo)) {
             continue;
         }
         let mut extents = Vec::new();
@@ -704,16 +782,10 @@ impl Disc {
                 return Err(crate::error::Error::Halted);
             }
             let mut extents = Vec::new();
+            let mut truncated = false;
             match udf_fs.file_extents(reader, &format!("/HVDVD_TS/{name}")) {
                 Ok(file_exts) => {
-                    for (lba, sectors) in file_exts {
-                        if sectors > 0 && lba > 0 {
-                            extents.push(Extent {
-                                start_lba: lba,
-                                sector_count: sectors,
-                            });
-                        }
-                    }
+                    (extents, truncated) = usable_extents(&file_exts);
                 }
                 Err(crate::error::Error::UdfUnrecordedExtent { .. }) => {
                     // Marking unusable drops every title naming this clip;
@@ -744,7 +816,7 @@ impl Disc {
             // `Ok` with NO usable extent (empty/filtered AD list) is unusable
             // too: else a zero-byte `FEATURE_2.EVO` beside a healthy part one
             // silently composed a whole-runtime title missing half the movie.
-            if extents.is_empty() {
+            if extents.is_empty() || truncated {
                 if unusable.insert(name.to_ascii_lowercase()) {
                     // Not the neighbouring 6017: an empty AD list is not an
                     // unrecorded extent, and flattening the two would account a
@@ -764,7 +836,7 @@ impl Disc {
         // Authoritative composition from `ADV_OBJ/VPLST*.XPL`, if present and
         // parseable. The clip-name heuristic below is the fallback when it's
         // absent, unparseable, or resolves to no on-disc clips.
-        if let Some(xpl) = read_adv_obj_xpl(reader, udf_fs) {
+        if let Some(xpl) = read_adv_obj_xpl(reader, udf_fs)? {
             let composed = compose_xpl_titles(
                 reader,
                 &parse_xpl_titles(&xpl),
@@ -2253,6 +2325,109 @@ mod tests {
         );
     }
 
+    // ── audit b03-hddvd fixes ──
+
+    #[test]
+    fn usable_extents_flags_a_dropped_lba0_data_extent() {
+        let (exts, truncated) = usable_extents(&[(0, 10), (500, 4)]);
+        assert_eq!(exts.len(), 1);
+        assert!(truncated, "lba-0 data extent dropped => truncated plan");
+        let (_, truncated) = usable_extents(&[(0, 0), (500, 4)]);
+        assert!(!truncated, "empty extent is harmless");
+    }
+
+    #[test]
+    fn compose_xpl_titles_drops_a_title_naming_an_absent_clip() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [(
+            "a.evo".to_string(),
+            (
+                "A.EVO".to_string(),
+                1000u64,
+                vec![Extent {
+                    start_lba: 1,
+                    sector_count: 1,
+                }],
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let clip = |evo: &str, b: f64, e: f64| XplClip {
+            evo: evo.to_string(),
+            begin_secs: b,
+            end_secs: e,
+        };
+        let xpl_titles = vec![XplTitle {
+            number: 1,
+            name: "T".to_string(),
+            duration_secs: 20.0,
+            clips: vec![clip("a.evo", 0.0, 10.0), clip("gone.evo", 10.0, 20.0)],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(
+            &mut disc,
+            &xpl_titles,
+            &clip_extents,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("compose");
+        assert!(
+            titles.is_empty(),
+            "title with an absent clip must be dropped"
+        );
+    }
+
+    #[test]
+    fn probe_cache_shares_titles_with_the_same_probed_head() {
+        let ext = |l, n| Extent {
+            start_lba: l,
+            sector_count: n,
+        };
+        let mut counter = ProbeCounter::new(MemDisc::new(), vec![1000]);
+        let mut cache = EvoProbeCache::default();
+        // Both extent lists are identical over the first EVO_PROBE_SECTORS.
+        let a = [ext(1000, EVO_PROBE_SECTORS), ext(5000, 10)];
+        let b = [ext(1000, EVO_PROBE_SECTORS), ext(6000, 10)];
+        cache.streams(&mut counter, &a, None).expect("a");
+        cache.streams(&mut counter, &b, None).expect("b");
+        assert_eq!(counter.hits[0], 1, "same probed head must cost one probe");
+    }
+
+    #[test]
+    fn read_xpl_capped_rejects_an_oversized_playlist() {
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "ADV_OBJ".to_string(),
+                icb_lba: 30,
+                dir_data_lba: 31,
+                files: vec![file_with(
+                    "VPLST000.XPL",
+                    40,
+                    4000,
+                    vec![b' '; MAX_XPL_BYTES + 1],
+                    true,
+                )],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let r = read_xpl_capped(&mut disc, &udf, "/ADV_OBJ/VPLST000.XPL");
+        assert!(matches!(r, Err(crate::error::Error::IsoTooLarge { .. })));
+        assert!(
+            read_adv_obj_xpl(&mut disc, &udf)
+                .expect("no halt")
+                .is_none()
+        );
+    }
+
     // ── read_adv_obj_xpl: prefix AND suffix are both required ──────────────
 
     /// A file matching the `vplst` prefix but NOT the `.xpl` suffix must not
@@ -2284,7 +2459,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
         assert!(
-            read_adv_obj_xpl(&mut disc, &udf).is_none(),
+            read_adv_obj_xpl(&mut disc, &udf).expect("read").is_none(),
             "prefix match alone (not ending .xpl) must not select a file"
         );
     }
