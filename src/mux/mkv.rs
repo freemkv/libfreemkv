@@ -1447,16 +1447,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_ns: Option<u64>,
         block_additional: Option<&[u8]>,
         src_byte: Option<u64>,
-        scan_progressive: Option<bool>,
+        scan: Option<super::codec::FieldOrder>,
     ) -> io::Result<()> {
-        use super::codec::FieldOrder;
-        let scan = scan_progressive.map(|p| {
-            if p {
-                FieldOrder::Progressive
-            } else {
-                FieldOrder::Tff
-            }
-        });
         self.write_frame_at_with_padding(
             track_idx,
             pts_ns,
@@ -2946,7 +2938,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(true),
+                Some(crate::mux::codec::FieldOrder::Progressive),
             )
             .unwrap();
         for (i, pts) in [40_000_000i64, 80_000_000, 120_000_000].iter().enumerate() {
@@ -2959,7 +2951,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some(false),
+                    Some(crate::mux::codec::FieldOrder::Tff),
                 )
                 .unwrap();
         }
