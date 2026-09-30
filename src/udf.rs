@@ -6027,6 +6027,10 @@ pub(crate) mod fixture {
         pub(crate) size: u64,
         pub(crate) long_ad: bool,
         pub(crate) contents: Vec<u8>,
+        /// When non-empty, the file's ICB carries exactly these `(partition-relative
+        /// LBA, byte length)` allocation descriptors (in order) instead of the single
+        /// `data_lba`/`size` one. A zero length terminates the list, as on a real disc.
+        pub(crate) ads: Vec<(u32, u32)>,
     }
 
     /// A directory node: ICB LBA, FID-list LBA, child files and subdirectories.
@@ -6054,6 +6058,26 @@ pub(crate) mod fixture {
         let ad_len = (size.min(u32::MAX as u64) as u32) & 0x3FFF_FFFF;
         s[216..220].copy_from_slice(&ad_len.to_le_bytes());
         s[220..224].copy_from_slice(&data_lba.to_le_bytes());
+        s
+    }
+
+    /// Extended File Entry ICB carrying every `(lba, byte_len)` in `ads` as a recorded AD.
+    pub(crate) fn build_file_icb_ads(ads: &[(u32, u32)], long_ad: bool) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes());
+        if long_ad {
+            s[34..36].copy_from_slice(&1u16.to_le_bytes());
+        }
+        let total: u64 = ads.iter().map(|a| a.1 as u64).sum();
+        s[56..64].copy_from_slice(&total.to_le_bytes());
+        let ad_size: usize = if long_ad { 16 } else { 8 };
+        s[212..216].copy_from_slice(&((ads.len() * ad_size) as u32).to_le_bytes());
+        let mut off = 216;
+        for &(lba, len) in ads {
+            s[off..off + 4].copy_from_slice(&(len & 0x3FFF_FFFF).to_le_bytes());
+            s[off + 4..off + 8].copy_from_slice(&lba.to_le_bytes());
+            off += ad_size;
+        }
         s
     }
 
@@ -6100,7 +6124,11 @@ pub(crate) mod fixture {
             push_fid(&mut fids, &f.name, f.icb_lba, false, false);
             disc.put(
                 PART_START + f.icb_lba,
-                build_file_icb(f.size, f.data_lba, f.long_ad),
+                if f.ads.is_empty() {
+                    build_file_icb(f.size, f.data_lba, f.long_ad)
+                } else {
+                    build_file_icb_ads(&f.ads, f.long_ad)
+                },
             );
             if !f.contents.is_empty() {
                 disc.put_bytes(PART_START + f.data_lba, &f.contents);
@@ -6160,6 +6188,7 @@ pub(crate) mod fixture {
             size,
             long_ad,
             contents: Vec::new(),
+            ads: Vec::new(),
         }
     }
 
@@ -6177,6 +6206,25 @@ pub(crate) mod fixture {
             size: contents.len() as u64,
             long_ad,
             contents,
+            ads: Vec::new(),
+        }
+    }
+
+    /// A file whose ICB lists exactly `ads` as `(partition-relative LBA, byte length)`.
+    pub(crate) fn file_ads(
+        name: &str,
+        icb_lba: u32,
+        ads: &[(u32, u32)],
+        long_ad: bool,
+    ) -> FileSpec {
+        FileSpec {
+            name: name.to_string(),
+            icb_lba,
+            data_lba: 0,
+            size: 0,
+            long_ad,
+            contents: Vec::new(),
+            ads: ads.to_vec(),
         }
     }
 }
