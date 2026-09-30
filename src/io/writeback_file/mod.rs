@@ -490,6 +490,45 @@ mod tests {
         assert_eq!(read_back(&p), b"durable-tail");
     }
 
+    // The page cache serves the bytes back whether or not a durable sync ran, so count the
+    // final flush: `finish()` on a boxed sink must reach it (the trait default does not).
+    #[test]
+    fn finish_through_trait_object_runs_the_durable_sync() {
+        use crate::io::sink::RandomAccessSink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Default)]
+        struct CountFinish(AtomicUsize);
+        impl FlushOps for CountFinish {
+            fn chunk(&self, _: &File) -> io::Result<()> {
+                Ok(())
+            }
+            fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
+                None
+            }
+            fn finish(&self, _: &File) -> io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn sample(&self) -> Option<u64> {
+                None
+            }
+        }
+        let ops = Arc::new(CountFinish::default());
+        let w = WritebackFile::with_flush_ops(
+            tempfile::tempfile().unwrap(),
+            ops.clone(),
+            FlushTiming::default(),
+        )
+        .unwrap();
+        let mut boxed: Box<dyn RandomAccessSink> = Box::new(w);
+        boxed.write_all(b"durable-tail").unwrap();
+        boxed.finish().unwrap();
+        assert!(
+            ops.0.load(Ordering::SeqCst) > 0,
+            "finish() skipped the final flush"
+        );
+    }
+
     // A writeback error the pipeline latched (Linux: a failed WAIT_AFTER already
     // consumed it, so fsync returns 0) must fail sync_all and every later write.
     #[test]
@@ -559,6 +598,8 @@ mod tests {
         // Seek to the current end (offset 4) — a no-move seek.
         let off = w.seek(SeekFrom::Start(4)).unwrap();
         assert_eq!(off, 4);
+        // A no-move seek must not reset the pipeline's chunk tracking.
+        assert_eq!(w.seek_count, 0, "redundant seek counted as a boundary");
         w.write_all(b"BBBB").unwrap();
         w.sync_all().unwrap();
         drop(w);
