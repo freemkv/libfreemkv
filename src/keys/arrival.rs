@@ -149,7 +149,7 @@ impl Arrival {
                         self.clear_strike(span.3);
                         s
                     } else {
-                        self.unopened(inner, lba, buf, u, span, candidate, &[s], unit_keys)?;
+                        self.unopened(inner, lba, buf, u, &[s], unit_keys)?;
                         buf[range].fill(0);
                         blanked += 1;
                         continue;
@@ -188,19 +188,20 @@ impl Arrival {
     /// head can keep its CPI flag and TS sync. A wrong key opens no unit of the piece; damage
     /// fails one. So it stops only when another held key opens `u`, when readable partners
     /// exist and no witness opens one, or at a second partnerless unopened unit.
-    #[allow(clippy::too_many_arguments)]
     fn unopened(
         &self,
         inner: &mut dyn SectorSource,
         lba: u32,
         buf: &[u8],
         u: usize,
-        span: (u32, u32, u64, usize),
-        candidate: Option<usize>,
         witnesses: &[usize],
         unit_keys: &[(u32, [u8; 16])],
     ) -> Result<()> {
         let at = lba.saturating_add(u as u32 * UNIT as u32);
+        let Some(span) = self.span_at(at) else {
+            return Ok(());
+        };
+        let candidate = self.pieces[span.3].1;
         let unit = &buf[u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN];
         let opens = |p: &[u8], s: usize| self.opens(p, &unit_keys[s].1);
         if self.held(candidate).any(|s| opens(unit, s)) {
@@ -284,7 +285,7 @@ impl Arrival {
             .collect();
         if openers.is_empty() {
             let held: Vec<usize> = self.held(candidate).collect();
-            self.unopened(inner, lba, buf, u, span, candidate, &held, unit_keys)?;
+            self.unopened(inner, lba, buf, u, &held, unit_keys)?;
             return Ok(None);
         }
         self.clear_strike(span.3);
