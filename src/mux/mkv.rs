@@ -4883,7 +4883,49 @@ mod tests {
             .write_frame(1, 20_000_000, true, &[0xCC; 8], None, None)
             .unwrap();
         let err = muxer.finish().unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Exactly MkvInvalid: the code that marks an empty title as a skippable stub.
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_MKV_INVALID)
+        );
+        assert!(crate::error::is_skippable_title_stub(&err));
+    }
+
+    // A seam plan that drops MORE frames than were written fails SeamPlanDroppedMost; dropping
+    // exactly as many as were written still succeeds.
+    #[test]
+    fn seam_plan_dropping_most_frames_fails_the_mux() {
+        let clip = |id: &str, secs: u32| crate::disc::Clip {
+            feed_span: None,
+            clip_id: id.into(),
+            in_time: secs * 45_000,
+            out_time: (secs + 100) * 45_000,
+            duration_secs: 100.0,
+            source_packets: 0,
+        };
+        let clips = [clip("00000", 100), clip("00001", 200)];
+        let run = |kept: &[i64]| {
+            let mut m = MkvMuxer::new(
+                Cursor::new(Vec::new()),
+                &[make_video_track()],
+                None,
+                100.0,
+                &[],
+            )
+            .unwrap();
+            m.set_clips(&clips, crate::disc::ContentFormat::BdTs);
+            // 0 s and 1 s sit before the first IN mark: both dropped.
+            for pts in [0, 1_000_000_000].iter().chain(kept) {
+                let _ = m.write_frame(0, *pts, true, &[0x01; 16], None, None);
+            }
+            m.finish().map(|_| ())
+        };
+        let e = run(&[150_000_000_000]).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some(crate::error::E_SEAM_PLAN_DROPPED_MOST)
+        );
+        run(&[150_000_000_000, 151_000_000_000]).expect("2 dropped, 2 written");
     }
 
     #[test]
@@ -4894,7 +4936,11 @@ mod tests {
         let tracks = [make_video_track()];
         let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let err = muxer.finish().unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_MKV_INVALID)
+        );
+        assert!(crate::error::is_skippable_title_stub(&err));
     }
 
     // A seam-plan clip list whose marks exclude every frame must fail with `SinkWroteNothing`,
