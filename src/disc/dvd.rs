@@ -130,18 +130,10 @@ impl Disc {
                     );
                 }
 
-                // Extents = cell sector ranges (absolute = vob_start + cell offset) from the
-                // feature-start cell. Non-first angle-block cells duplicate angle 1: skip
-                // them unless that would leave nothing.
-                let mut feature_cells: Vec<&ifo::DvdCell> = dvd_title.cells[feature_start..]
+                // Build extents from cell sector ranges (absolute = vob_start + cell offset),
+                // starting at the resolved feature-start cell.
+                let extents: Vec<Extent> = dvd_title.cells[feature_start..]
                     .iter()
-                    .filter(|c| !ifo::CellCategory::decode(c.category).is_secondary_block_piece())
-                    .collect();
-                if feature_cells.is_empty() {
-                    feature_cells = dvd_title.cells[feature_start..].iter().collect();
-                }
-                let extents: Vec<Extent> = feature_cells
-                    .into_iter()
                     .map(|cell| {
                         let start = ts.vob_start_sector.saturating_add(cell.first_sector);
                         let count = cell
@@ -2009,26 +2001,6 @@ mod tests {
             .expect("scan")
             .0
             .remove(0)
-    }
-
-    // Non-first angle cells in the middle of a title must not become extents.
-    #[test]
-    fn scan_dvd_titles_drops_mid_title_secondary_angle_cells() {
-        let t = scan_cells(
-            &[
-                (0, 99, 0x00, 0x10),
-                (100, 199, 0x50, 0x10),
-                (200, 299, 0x90, 0x10),
-                (300, 399, 0xD0, 0x10),
-                (400, 499, 0x00, 0x10),
-            ],
-            &[1],
-            1,
-        );
-        assert_eq!(t.extents.len(), 3, "angle 1 only");
-        assert_eq!(t.extents[1].start_lba, 9000 + 1000 + 100);
-        assert_eq!(t.extents[2].start_lba, 9000 + 1000 + 400);
-        assert_eq!(t.size_bytes, 300 * 2048);
     }
 
     // Dropped head time comes off the duration, and head chapters collapse to one mark at 0.
