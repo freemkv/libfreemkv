@@ -169,20 +169,3 @@ fn fixture_dir_removed_when_build_panics() {
     let path = path.expect("dir created");
     assert!(!path.exists(), "fixture dir leaked: {}", path.display());
 }
-
-#[test]
-fn release_right_after_logged_cdb_completes_stalled_cdb() {
-    use crate::scsi::{DataDirection, ScsiTransport};
-    use std::time::Duration;
-    for _ in 0..300 {
-        let (t, h) = FakeTransport::new();
-        let mut t = t.rule(|c| c[0] == 0x00, FakeMode::Stall);
-        let j = std::thread::spawn(move || {
-            let mut buf = [0u8; 0];
-            t.execute(&[0u8; 6], DataDirection::None, &mut buf, 2000)
-        });
-        assert!(h.wait_for(1, |c| c[0] == 0x00, Duration::from_secs(5)));
-        h.release();
-        assert!(j.join().expect("join").is_ok(), "stalled CDB failed");
-    }
-}

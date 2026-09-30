@@ -231,6 +231,7 @@ pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
     let mut plain = image.clone();
     let unit_sectors = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
     for (f, &(start, sectors)) in files.iter().zip(&extents) {
+        assert_eq!(sectors % unit_sectors, 0, "{}: whole aligned units", f.path);
         for u in 0..sectors / unit_sectors {
             let lba = start + u * unit_sectors;
             let mut unit = content_unit(lba, f.key.is_some());
