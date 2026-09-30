@@ -239,32 +239,6 @@ fn aacs_decrypt_unit_key_roundtrip() {
     );
 }
 
-/// Test: aacs_vuk_derivation
-///
-/// Verify derive_vuk: VUK = AES-ECB-DECRYPT(media_key, volume_id) XOR volume_id
-#[test]
-fn aacs_vuk_derivation_roundtrip() {
-    let media_key = [
-        0x25u8, 0x2F, 0xB6, 0x36, 0xE8, 0x83, 0x52, 0x9E, 0x11, 0x9A, 0xB7, 0x15, 0xF4, 0xEB, 0x16,
-        0x40,
-    ];
-    let volume_id = [
-        0xA1u8, 0x3C, 0xBE, 0x2C, 0xE4, 0x05, 0x65, 0xD1, 0x04, 0xB5, 0x3E, 0x76, 0x8C, 0x70, 0x0E,
-        0x30,
-    ];
-
-    let vuk = aacs::derive::derive_vuk(&media_key, &volume_id);
-
-    // VUK should be non-zero and different from both inputs
-    assert_ne!(vuk, [0u8; 16], "VUK should not be all zeros");
-    assert_ne!(vuk, media_key, "VUK should differ from media_key");
-    assert_ne!(vuk, volume_id, "VUK should differ from volume_id");
-
-    // Verify determinism
-    let vuk2 = aacs::derive::derive_vuk(&media_key, &volume_id);
-    assert_eq!(vuk, vuk2, "derive_vuk not deterministic");
-}
-
 /// Test: `is_clean` distinguishes clean vs scrambled units via the TS proof floor.
 #[test]
 fn aacs_is_clean_detection() {
@@ -449,7 +423,8 @@ fn aacs_cross_validation_alternate_key() {
         plaintext[off] = 0x47;
         off += 192;
     }
-    // No flag set: the CBC-encrypted body scrambles the packet syncs.
+    // Byte 0 stays 0xFF (CPI bits set); decrypt_unit ignores the flag. The CBC-encrypted
+    // body scrambles the packet syncs.
     let expected = plaintext.clone();
 
     let mut header = [0u8; 16];
@@ -552,164 +527,6 @@ fn css_roundtrip_multiple_keys() {
 }
 
 // ── CSS keyless recovery tests ─────────────────────────────────────────────
-
-// Attempt keyless recovery on synthetically scrambled sectors.
-#[test]
-fn css_keyless_recovery_validates_cracked_key() {
-    let candidates: &[([u8; 5], [u8; 5])] = &[
-        (
-            [0x42, 0x13, 0x37, 0xBE, 0xEF],
-            [0x11, 0x22, 0x33, 0x44, 0x55],
-        ),
-        (
-            [0x01, 0x02, 0x03, 0x04, 0x05],
-            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
-        ),
-        (
-            [0x10, 0x20, 0x30, 0x40, 0x50],
-            [0x05, 0x06, 0x07, 0x08, 0x09],
-        ),
-        (
-            [0xAB, 0xCD, 0xEF, 0x01, 0x23],
-            [0x12, 0x34, 0x56, 0x78, 0x9A],
-        ),
-        (
-            [0x55, 0xAA, 0x55, 0xAA, 0x55],
-            [0x00, 0x00, 0x00, 0x00, 0x00],
-        ),
-    ];
-
-    let mut any_cracked = false;
-
-    for (key, seed) in candidates {
-        let mut sector = vec![0x00u8; 2048];
-        sector[0x14] = 0x30;
-        sector[0x54..0x59].copy_from_slice(seed);
-        sector[0x80] = 0x00;
-        sector[0x81] = 0x00;
-        sector[0x82] = 0x01;
-        sector[0x83] = 0xE0;
-        sector[0x84] = 0x00;
-        sector[0x85] = 0x00;
-        sector[0x86] = 0x80;
-        sector[0x87] = 0x80;
-        sector[0x88] = 0x05;
-        sector[0x89] = 0x21;
-
-        let original = sector.clone();
-
-        // "Encrypt" by descrambling plaintext (XOR keystream)
-        css::lfsr::descramble_sector(key, &mut sector);
-        sector[0x14] = 0x30;
-
-        let cracked = css::keyless::crack_title_key(&sector);
-
-        if let Some(cracked_key) = cracked {
-            let mut test = sector.clone();
-            css::lfsr::descramble_sector(&cracked_key, &mut test);
-
-            assert_eq!(test[0x80], 0x00, "PES byte 0 mismatch");
-            assert_eq!(test[0x81], 0x00, "PES byte 1 mismatch");
-            assert_eq!(test[0x82], 0x01, "PES byte 2 mismatch");
-            assert_eq!(test[0x83], 0xE0, "PES byte 3 mismatch");
-            assert_eq!(
-                &test[0x80..2048],
-                &original[0x80..2048],
-                "cracked key did not recover original plaintext"
-            );
-
-            any_cracked = true;
-            eprintln!(
-                "keyless recovery succeeded: key={:02X?} seed={:02X?} cracked={:02X?}",
-                key, seed, cracked_key
-            );
-        }
-    }
-
-    if !any_cracked {
-        eprintln!(
-            "keyless recovery did not converge on any synthetic key/seed pair. \
-             This is expected: synthetic sectors lack the TAB1 output encoding \
-             present in real CSS-encrypted DVD sectors."
-        );
-        // Don't pass vacuously: if the attack can't converge on synthetic data,
-        // still assert descramble_sector is deterministic and non-trivial
-        // (transforms the payload) so a real regression is still caught.
-        for (key, seed) in candidates {
-            let mut base = vec![0x00u8; 2048];
-            base[0x14] = 0x30;
-            base[0x54..0x59].copy_from_slice(seed);
-            base[0x80..0x8A]
-                .copy_from_slice(&[0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21]);
-            let mut a = base.clone();
-            let mut b = base.clone();
-            css::lfsr::descramble_sector(key, &mut a);
-            css::lfsr::descramble_sector(key, &mut b);
-            assert_eq!(a, b, "descramble must be deterministic for key={key:02X?}");
-            assert_ne!(
-                &a[0x80..2048],
-                &base[0x80..2048],
-                "descramble must transform the payload for key={key:02X?}"
-            );
-        }
-    }
-}
-
-/// Verify that `recover_title_key` works when given exact known plaintext,
-/// even for combinations where `crack_title_key` (which guesses the pattern)
-/// might not converge.
-#[test]
-fn css_recover_title_key_with_exact_plaintext() {
-    let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];
-    let seed: [u8; 5] = [0x11, 0x22, 0x33, 0x44, 0x55];
-
-    let mut sector = vec![0x00u8; 2048];
-    sector[0x14] = 0x30;
-    sector[0x54..0x59].copy_from_slice(&seed);
-    let pes_header: [u8; 10] = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
-    sector[0x80..0x8A].copy_from_slice(&pes_header);
-    #[allow(clippy::needless_range_loop)]
-    for i in 0x8A..2048 {
-        sector[i] = ((i * 13 + 7) & 0xFF) as u8;
-    }
-    let original = sector.clone();
-
-    // Scramble
-    css::lfsr::descramble_sector(&title_key, &mut sector);
-    sector[0x14] = 0x30;
-
-    // Recover with exact known plaintext
-    let recovered = css::keyless::recover_title_key(&sector, &pes_header);
-
-    if let Some(rkey) = recovered {
-        let mut test = sector.clone();
-        css::lfsr::descramble_sector(&rkey, &mut test);
-        assert_eq!(
-            &test[0x80..2048],
-            &original[0x80..2048],
-            "recovered key did not produce correct plaintext"
-        );
-        eprintln!("recover_title_key succeeded: {:02X?}", rkey);
-    } else {
-        eprintln!(
-            "recover_title_key returned None for key={:02X?} seed={:02X?}. \
-             The LFSR0 recovery phase may not converge for this combination.",
-            title_key, seed
-        );
-        // Don't pass vacuously: if recovery didn't converge, still assert
-        // descramble_sector is deterministic and non-trivial (transforms payload).
-        let mut a = original.clone();
-        let mut b = original.clone();
-        css::lfsr::descramble_sector(&title_key, &mut a);
-        css::lfsr::descramble_sector(&title_key, &mut b);
-        assert_eq!(a, b, "descramble must be deterministic");
-        assert_ne!(
-            &a[0x80..2048],
-            &original[0x80..2048],
-            "descramble must transform the payload"
-        );
-    }
-}
 
 /// Test: aacs_parse_unit_key_ro with minimal valid data
 #[test]

@@ -55,6 +55,7 @@ fn main() {
             Ok(_) => {
                 writer.write_all(&buf).unwrap();
                 ok += 1;
+                bytes += buf.len() as u64;
             }
             Err(e) => {
                 fail += 1;
@@ -65,7 +66,6 @@ fn main() {
                 writer.write_all(&buf).unwrap();
             }
         }
-        bytes += buf.len() as u64;
 
         if i % 50 == 0 && i > 0 {
             let elapsed = start.elapsed().as_secs_f64();
