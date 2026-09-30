@@ -45,6 +45,12 @@ pub struct DtsParser {
     /// [`Self::stamp_pts`] usage) so every SURVIVING AU keeps the exact timestamp it
     /// would have had — a drop becomes a silence gap, never a shift.
     tally: super::dropgate::DropTally,
+    /// A core sync has been framed, so extension-only PES are DTS-HD extensions.
+    core_seen: bool,
+    /// Core-less DTS Express (EXSS only): frames are chained EXSS substreams.
+    exss_only: bool,
+    /// Last `(samples, rate)` read from EXSS static fields, for frames that omit them.
+    exss_timing: Option<(u64, u64)>,
 }
 
 impl Default for DtsParser {
@@ -61,6 +67,9 @@ impl DtsParser {
             last_front_pts: PTS_UNSET,
             next_pts_ns: PTS_UNSET,
             tally: super::dropgate::DropTally::new("dts"),
+            core_seen: false,
+            exss_only: false,
+            exss_timing: None,
         }
     }
 
@@ -145,6 +154,119 @@ impl DtsParser {
         }
     }
 
+    /// No core in the buffer: latch EXSS-only mode once `EXSS_ONLY_MIN_CHAIN` EXSS
+    /// frames chain at their declared sizes with no core; a shorter run (a DTS-HD
+    /// stream starting mid-AU or missing its first cores) is held, then dropped.
+    fn probe_exss_only(&mut self) -> Step {
+        let Some(p) = find_sync(self.acc.as_slice(), &DTS_HD_EXT_SYNC) else {
+            return Step::NotExss;
+        };
+        if p > 0 {
+            self.drain_front(p);
+        }
+        let buf = self.acc.as_slice();
+        let (mut pos, mut chained) = (0, 0);
+        while chained < EXSS_ONLY_MIN_CHAIN {
+            if buf.len() < pos + SYNCWORD_BYTES {
+                return Step::Break; // can't see what follows yet
+            }
+            if !buf[pos..].starts_with(&DTS_HD_EXT_SYNC) {
+                break;
+            }
+            let Some(sz) = exss_frame_size(&buf[pos..]) else {
+                return Step::Break; // header not fully buffered
+            };
+            if !(SYNCWORD_BYTES..=MAX_AU_BYTES).contains(&sz) {
+                break;
+            }
+            if buf.len() < pos + sz {
+                return Step::Break;
+            }
+            pos += sz;
+            chained += 1;
+        }
+        if chained == EXSS_ONLY_MIN_CHAIN {
+            self.exss_only = true;
+        } else {
+            // Chain broken: drop the leading extension (or bogus sync) and rescan.
+            let first = exss_frame_size(buf)
+                .filter(|sz| (SYNCWORD_BYTES..=MAX_AU_BYTES).contains(sz))
+                .unwrap_or(SYNCWORD_BYTES);
+            self.drain_front(first);
+        }
+        Step::Continue
+    }
+
+    /// EXSS-only mode: drop `n` resync bytes, counted as a (collateral) drop.
+    fn drop_exss_junk(&mut self, n: usize) {
+        if n > 0 {
+            let pts = self.front_pts();
+            self.tally.record_collateral_drop(pts, 0, n, "exss-resync");
+            self.drain_front(n);
+        }
+    }
+
+    /// EXSS frame duration; frames without static fields reuse the last parsed timing.
+    fn exss_duration_ns(&mut self, au: &[u8]) -> u64 {
+        if let Some(t) = exss_timing(au) {
+            self.exss_timing = Some(t);
+        }
+        let (samples, rate) = self.exss_timing.unwrap_or((512, 48_000));
+        (samples * 1_000_000_000 + rate / 2) / rate
+    }
+
+    /// Emit one frame per EXSS substream (core-less DTS Express).
+    /// A valid core sync at or before the next EXSS leaves EXSS-only mode for good.
+    fn frame_exss(&mut self, out: &mut Vec<Frame>) -> Step {
+        let exss = find_sync(self.acc.as_slice(), &DTS_HD_EXT_SYNC);
+        if let Some(q) =
+            first_core_candidate(self.acc.as_slice(), 0).filter(|&q| exss.is_none_or(|p| q <= p))
+        {
+            if self.acc.len() - q < CORE_HEADER_MIN_BYTES {
+                return Step::Break; // decide once the core header is buffered
+            }
+            self.exss_only = false;
+            return Step::Continue;
+        }
+        let Some(p) = exss else {
+            let tail = self.acc.len().saturating_sub(SYNCWORD_BYTES - 1);
+            self.drop_exss_junk(tail);
+            return Step::Break;
+        };
+        self.drop_exss_junk(p);
+        let Some(sz) = exss_frame_size(self.acc.as_slice()) else {
+            return Step::Break;
+        };
+        if !(SYNCWORD_BYTES..=MAX_AU_BYTES).contains(&sz) {
+            self.drop_exss_junk(SYNCWORD_BYTES);
+            return Step::Continue;
+        }
+        if self.acc.len() < sz {
+            return Step::Break;
+        }
+        let au = self.acc.as_slice()[..sz].to_vec();
+        let dur_ns = self.exss_duration_ns(&au) as i64;
+        let pts = self.stamp_pts(self.front_pts(), dur_ns);
+        let src = self.front_source();
+        self.tally.record_kept();
+        out.push(Frame {
+            discontinuity: false,
+            coding: None,
+            source: src,
+            pts_ns: pts,
+            keyframe: true,
+            data: au,
+            duration_ns: Some(dur_ns as u64),
+        });
+        self.drain_front(sz);
+        self.pending_pts = if self.acc.is_empty() {
+            PTS_UNSET
+        } else {
+            self.front_pts()
+        };
+        Step::Continue
+    }
+
     /// Drop `n` bytes from the front, rebasing attribution onto the new front.
     fn drain_front(&mut self, n: usize) {
         #[cfg(test)]
@@ -168,6 +290,13 @@ impl DtsParser {
     }
 }
 
+/// Loop control for the EXSS-only helpers; `NotExss` = no EXSS present.
+enum Step {
+    Continue,
+    Break,
+    NotExss,
+}
+
 // Test-only count of `drain_front` calls, proving a bogus-sync resync is one drain.
 #[cfg(test)]
 thread_local! {
@@ -178,6 +307,10 @@ thread_local! {
 /// A DTS-HD MA frame is at most a few tens of KB; if the buffer grows past
 /// this without a clean boundary we resync rather than stall or balloon.
 const MAX_AU_BYTES: usize = 65536;
+
+// Chained core-less EXSS frames needed to enter EXSS-only mode, so the orphan
+// extensions of one or two lost leading cores in a DTS-HD MA/HRA stream can't.
+const EXSS_ONLY_MIN_CHAIN: usize = 3;
 
 // "Enough bytes to read the fsize field" — a HEADER-LAYOUT minimum, distinct from
 // MIN_CORE_FRAME_BYTES (the decoded-size validity floor).
@@ -245,9 +378,22 @@ impl CodecParser for DtsParser {
         let mut frames = Vec::new();
 
         loop {
+            if self.exss_only {
+                match self.frame_exss(&mut frames) {
+                    Step::Continue => continue,
+                    _ => break,
+                }
+            }
             // Resync to the first candidate core sync; drop leading junk and any run of
             // bogus (implausibly sized) syncs in ONE drain rather than 4 bytes at a time.
             let Some(start) = first_core_candidate(self.acc.as_slice(), 0) else {
+                if !self.core_seen {
+                    match self.probe_exss_only() {
+                        Step::Continue => continue,
+                        Step::Break => break,
+                        Step::NotExss => {}
+                    }
+                }
                 // No candidate core sync yet — keep at most a 3-byte tail so a
                 // sync split across PES packets can still be found next time.
                 if self.acc.len() > 3 {
@@ -256,6 +402,7 @@ impl CodecParser for DtsParser {
                 }
                 break;
             };
+            self.core_seen = true;
             if start > 0 {
                 self.drain_front(start);
                 // The sync `find_sync` located at offset `start` is now at
@@ -537,6 +684,28 @@ fn exss_frame_size(buf: &[u8]) -> Option<usize> {
     Some(fsize_minus_one as usize + 1)
 }
 
+// `(samples, rate)` of one EXSS frame: `512 * (nuExSSFrameDurationCode + 1)` samples at the
+// `nuRefClockCode` rate (32/44.1/48 kHz). `None` without static fields.
+fn exss_timing(buf: &[u8]) -> Option<(u64, u64)> {
+    let mut r = BitReader::new(buf.get(SYNCWORD_BYTES..)?);
+    r.skip_bits(EXSS_USER_DEFINED_BITS + EXSS_INDEX_BITS)?;
+    let (hbits, fbits) = if r.read_bits(EXSS_HEADER_SIZE_TYPE_BITS)? == EXSS_HEADER_SIZE_TYPE_LONG {
+        (EXSS_HDRSIZE_BITS_LONG, EXSS_FSIZE_BITS_LONG)
+    } else {
+        (EXSS_HDRSIZE_BITS_SHORT, EXSS_FSIZE_BITS_SHORT)
+    };
+    r.skip_bits(hbits + fbits)?;
+    if r.read_bit()? == 0 {
+        return None;
+    }
+    let rate = match r.read_bits(2)? {
+        0 => 32_000u64,
+        1 => 44_100,
+        _ => 48_000,
+    };
+    Some((512 * (r.read_bits(3)? as u64 + 1), rate))
+}
+
 // Offset where the current AU ends (start of the next core frame): trailing extensions are
 // skipped PRECISELY by declared size, so a false core sync in XLL payload can't be mistaken for
 // the boundary.
@@ -620,18 +789,6 @@ fn dts_core_frame_size(data: &[u8]) -> usize {
     fsize + 1
 }
 
-/// DTS core `SFREQ` → sample rate (Hz). 4-bit index; reserved/invalid entries
-/// fall back to 48 kHz (the DVD/UHD norm) so a bogus value never yields a zero
-/// rate (division) or a wildly wrong frame duration.
-const DTS_CORE_SAMPLE_RATES: [u32; 16] = [
-    48_000, // 0: invalid → fallback
-    8_000, 16_000, 32_000, 48_000, // 4: invalid → fallback
-    48_000, // 5: invalid → fallback
-    11_025, 22_050, 44_100, 48_000, // 9: invalid → fallback
-    48_000, // 10: invalid → fallback
-    12_000, 24_000, 48_000, 96_000, 192_000,
-];
-
 // Samples per DTS core frame: `(NBLKS + 1) * 32`. NBLKS (7 bits, ETSI TS 102 114) = byte4 bit0
 // + byte5 bits7-2, after FTYPE/SHORT/CPF.
 fn dts_core_samples(data: &[u8]) -> u32 {
@@ -642,14 +799,17 @@ fn dts_core_samples(data: &[u8]) -> u32 {
     (nblks + 1) * 32
 }
 
-/// DTS core sample rate (Hz) from `SFREQ` (4 bits: byte8 bits5-2), with a 48 kHz
-/// fallback for reserved indices.
+/// DTS core sample rate (Hz) from `SFREQ` (4 bits: byte8 bits5-2); reserved
+/// indices fall back to 48 kHz so the rate is never zero.
 fn dts_core_sample_rate(data: &[u8]) -> u32 {
     if data.len() < CORE_HEADER_MIN_BYTES {
         return 48_000;
     }
     let sfreq = (data[8] as usize >> 2) & 0x0F;
-    DTS_CORE_SAMPLE_RATES[sfreq]
+    match DTS_CORE_SR_VALID[sfreq] {
+        0 => 48_000,
+        r => r,
+    }
 }
 
 /// Duration of one DTS core access unit in nanoseconds: `samples / rate`,
@@ -1775,6 +1935,127 @@ mod tests {
     }
 
     // --- find_sync ---
+
+    // make_exss with static fields: refclock code `rc`, frame-duration code `dc`.
+    fn make_exss_dur(total: usize, rc: u8, dc: u8) -> Vec<u8> {
+        let mut d = make_exss(total, None);
+        d[8] |= 0x10 | (rc << 2) | (dc >> 1);
+        d[9] |= (dc & 1) << 7;
+        d
+    }
+
+    #[test]
+    fn exss_only_stream_yields_one_frame_per_exss_with_header_duration() {
+        let mut parser = DtsParser::new();
+        let mut d = make_exss_dur(200, 2, 1); // 1024 samples @ 48 kHz
+        d.extend_from_slice(&make_exss_dur(300, 2, 1));
+        let mut frames = parser.parse(&make_pes(d, Some(90_000)));
+        // A later PES with its own PTS re-bases; the last frame emits without a follower.
+        frames.extend(parser.parse(&make_pes(make_exss_dur(250, 2, 1), Some(99_000))));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 3);
+        let dur = (1024u64 * 1_000_000_000 + 24_000) / 48_000;
+        assert_eq!(frames[0].data.len(), 200);
+        assert_eq!(frames[1].data.len(), 300);
+        assert_eq!(frames[2].data.len(), 250);
+        assert_eq!(frames[0].pts_ns, pts_to_ns(90_000));
+        assert_eq!(frames[1].pts_ns, pts_to_ns(90_000) + dur as i64);
+        assert_eq!(frames[2].pts_ns, pts_to_ns(99_000));
+        for f in &frames {
+            assert_eq!(f.duration_ns, Some(dur));
+        }
+        assert_eq!(parser.dropped_frames(), 0);
+    }
+
+    #[test]
+    fn exss_duration_uses_ref_clock_rate() {
+        let mut parser = DtsParser::new();
+        // No static fields and nothing seen yet: 512 samples at 48 kHz.
+        assert_eq!(parser.exss_duration_ns(&make_exss(64, None)), 10_666_667);
+        let dur = (2048u64 * 1_000_000_000 + 22_050) / 44_100;
+        assert_eq!(parser.exss_duration_ns(&make_exss_dur(64, 1, 3)), dur);
+        // A later frame without static fields inherits the last parsed timing.
+        assert_eq!(parser.exss_duration_ns(&make_exss(64, None)), dur);
+    }
+
+    // Reviewer case: a DTS-HD MA stream missing its first two cores (two orphan EXSS
+    // PES), then core+EXSS pairs, must frame core AUs, not latch EXSS-only mode.
+    #[test]
+    fn lost_leading_cores_do_not_trap_dts_hd_in_exss_only_mode() {
+        let mut parser = DtsParser::new();
+        let mut frames = Vec::new();
+        let mut pts = 90_000;
+        for _ in 0..2 {
+            frames.extend(parser.parse(&make_pes(make_exss(64, None), Some(pts))));
+            pts += 960;
+        }
+        for _ in 0..4 {
+            frames.extend(parser.parse(&make_pes(make_dts_core(512), Some(pts))));
+            frames.extend(parser.parse(&make_pes(make_exss(64, None), Some(pts + 1))));
+            pts += 960;
+        }
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 4);
+        for f in &frames {
+            assert_eq!(&f.data[..4], &DTS_CORE_SYNC, "every AU is a core AU");
+            assert_eq!(f.data.len(), 512 + 64);
+        }
+        assert_eq!(parser.dropped_frames(), 0);
+    }
+
+    // Even once latched, a valid core sync ahead of the next EXSS leaves EXSS-only mode.
+    #[test]
+    fn core_sync_unlatches_exss_only_mode() {
+        let mut parser = DtsParser::new();
+        let mut d = Vec::new();
+        for _ in 0..3 {
+            d.extend_from_slice(&make_exss(64, None));
+        }
+        let mut frames = parser.parse(&make_pes(d, Some(90_000)));
+        assert_eq!(frames.len(), 3);
+        assert!(parser.exss_only);
+        for i in 0..3 {
+            let mut au = make_dts_core(512);
+            au.extend_from_slice(&make_exss(64, None));
+            frames.extend(parser.parse(&make_pes(au, Some(99_000 + i * 960))));
+        }
+        frames.extend(parser.flush());
+        assert!(!parser.exss_only);
+        assert_eq!(frames.len(), 6);
+        for f in &frames[3..] {
+            assert_eq!(&f.data[..4], &DTS_CORE_SYNC);
+            assert_eq!(f.data.len(), 512 + 64);
+        }
+    }
+
+    // Bytes skipped while resyncing in EXSS-only mode are tallied as drops.
+    #[test]
+    fn exss_only_resync_junk_is_counted_as_a_drop() {
+        let mut parser = DtsParser::new();
+        let mut d = Vec::new();
+        for _ in 0..3 {
+            d.extend_from_slice(&make_exss(64, None));
+        }
+        d.extend_from_slice(&[0xAB; 20]);
+        d.extend_from_slice(&make_exss(64, None));
+        let frames = parser.parse(&make_pes(d, Some(90_000)));
+        assert_eq!(frames.len(), 4);
+        assert_eq!(parser.dropped_frames(), 1);
+    }
+
+    #[test]
+    fn extension_only_first_pes_of_dts_hd_is_not_a_drop() {
+        let mut parser = DtsParser::new();
+        let mut frames = parser.parse(&make_pes(make_exss(64, None), Some(80_000)));
+        let mut core = make_dts_core(512);
+        core.extend_from_slice(&make_exss(64, None));
+        core.extend_from_slice(&make_dts_core(512));
+        frames.extend(parser.parse(&make_pes(core, Some(90_000))));
+        frames.extend(parser.flush());
+        assert_eq!(parser.dropped_frames(), 0);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(&frames[0].data[..4], &DTS_CORE_SYNC);
+    }
 
     #[test]
     fn find_sync_locates_core() {

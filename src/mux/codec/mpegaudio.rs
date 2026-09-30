@@ -4,7 +4,7 @@
 //! 13818-3:1994 (lower sampling frequencies, ID '0'). The version field value '00' ("MPEG
 //! 2.5") is a de facto extension that neither standard defines.
 
-use super::audio_frames::{AudioFrames, Header, Sync};
+use super::audio_frames::{AudioFrames, Header, SyncSpec};
 #[cfg(test)]
 use super::pts_to_ns;
 use super::{CodecParser, Frame, PesPacket};
@@ -202,7 +202,7 @@ impl MpegAudioParser {
         Self {
             frames: AudioFrames::new(
                 "mpegaudio",
-                Sync {
+                SyncSpec {
                     mask: 0xe0,
                     frame_len: mpa_frame_len,
                     fixed: mpa_stream_key,

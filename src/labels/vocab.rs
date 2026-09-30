@@ -371,10 +371,16 @@ const ISO_639_1_TO_2: &[(&str, &str)] = &[
 ];
 
 // Withdrawn ISO 639-1 codes DVD-Video still carries (frozen at the 1988 edition).
-const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[("iw", "he"), ("in", "id"), ("ji", "yi")];
+const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[
+    ("iw", "he"),
+    ("in", "id"),
+    ("ji", "yi"),
+    ("jw", "jv"),
+    ("mo", "ro"),
+];
 
 /// Map an ISO 639-1 two-letter language code to its ISO 639-2/T three-letter
-/// code, accepting the withdrawn DVD-era spellings (`iw`, `in`, `ji`) as
+/// code, accepting the withdrawn DVD-era spellings (`iw`, `in`, `ji`, `jw`, `mo`) as
 /// aliases for their replacements.
 ///
 /// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only spans the languages
@@ -488,6 +494,12 @@ fn has_word(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso639_1_accepts_jw_and_mo_dvd_aliases() {
+        assert_eq!(iso639_1_to_iso639_2("jw"), Some("jav"));
+        assert_eq!(iso639_1_to_iso639_2("mo"), Some("ron"));
+    }
 
     #[test]
     fn codec_known_aliases() {

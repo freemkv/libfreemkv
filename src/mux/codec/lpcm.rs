@@ -199,6 +199,8 @@ pub struct LpcmParser {
     /// Last BD header byte 2 (channel_assignment|rate), reported as codec_private so
     /// an M2TS re-mux keeps the exact layout (e.g. 2/2 vs 3/1).
     bd_layout_byte: Option<u8>,
+    /// Packets refused for a reserved header code (counted, never poisoning).
+    tally: super::dropgate::DropTally,
 }
 
 impl Default for LpcmParser {
@@ -216,7 +218,13 @@ impl LpcmParser {
             anchor_ns: 0,
             samples_since_anchor: 0,
             bd_layout_byte: None,
+            tally: super::dropgate::DropTally::new("lpcm"),
         }
+    }
+
+    /// Packets dropped for a reserved or unsupported LPCM header.
+    pub fn dropped_frames(&self) -> u64 {
+        self.tally.dropped_frames()
     }
 
     /// BD-TS LPCM parser (4-byte BD LPCM header per PES).
@@ -253,6 +261,12 @@ impl CodecParser for LpcmParser {
         };
         // Reserved header codes: drop the packet, as ffmpeg does (INVALIDDATA).
         let Some(format) = parsed else {
+            if self.tally.dropped_frames() == 0 {
+                tracing::warn!(target: "mux", "lpcm: reserved/unsupported header; dropping packets");
+            }
+            let pts = pes.pts.or(pes.dts).map_or(0, pts_to_ns);
+            self.tally
+                .record_collateral_drop(pts, 0, pes.data.len(), "reserved-header");
             return Vec::new();
         };
         if self.bd {
@@ -307,8 +321,7 @@ impl CodecParser for LpcmParser {
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
-        self.bd_layout_byte
-            .map(|b| [LAYOUT_TAG.as_slice(), &[b]].concat())
+        self.bd_layout_byte.map(tagged_layout)
     }
 }
 
@@ -539,6 +552,14 @@ mod tests {
 
     fn all(frames: &[Frame]) -> Vec<u8> {
         frames.iter().flat_map(|f| f.data.clone()).collect()
+    }
+
+    #[test]
+    fn reserved_header_code_is_counted() {
+        let mut p = LpcmParser::new();
+        // bits_code 0 is reserved for BD LPCM.
+        assert!(p.parse(&make_pes(bd(3, 0, &[0; 8]), Some(0))).is_empty());
+        assert_eq!(p.dropped_frames(), 1);
     }
 
     #[test]
