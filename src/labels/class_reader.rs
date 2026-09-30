@@ -8,10 +8,6 @@
 //! No external deps beyond `std`. No `unsafe`. No panics on malformed input — every parse fault
 //! is a typed [`Error`].
 
-// The reader models the class format fully (every cp tag, error payload, opcode), but
-// deluxe/dbp use only part of it, so unused items are expected.
-#![allow(dead_code)]
-
 const CLASS_MAGIC: u32 = 0xCAFEBABE;
 
 // ---------------------------------------------------------------------------
@@ -19,6 +15,10 @@ const CLASS_MAGIC: u32 = 0xCAFEBABE;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "payloads are fault detail for Debug; callers match the variant"
+)]
 pub enum Error {
     UnexpectedEof { needed: &'static str },
     BadMagic(u32),
@@ -41,6 +41,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+#[expect(
+    dead_code,
+    reason = "every JVMS 4.4 tag is decoded; label parsers read only some payloads"
+)]
 pub enum CpInfo {
     /// Index 0 is unused per spec; the slot after Long/Double is also unused.
     Empty,
@@ -129,6 +133,7 @@ impl ConstantPool {
         }
     }
 
+    #[cfg(test)]
     /// Resolve a `CONSTANT_String` entry to its underlying UTF-8.
     pub fn string(&self, index: u16) -> Option<&str> {
         match self.get(index)? {
@@ -137,6 +142,7 @@ impl ConstantPool {
         }
     }
 
+    #[cfg(test)]
     pub fn integer(&self, index: u16) -> Option<i32> {
         match self.get(index)? {
             CpInfo::Integer(v) => Some(*v),
@@ -144,6 +150,7 @@ impl ConstantPool {
         }
     }
 
+    #[cfg(test)]
     /// For `ldc` / `ldc_w` operands: resolve a constant-pool index to a
     /// best-effort string. Supports Utf8, String, Integer, Float, Long,
     /// Double, and Class.
@@ -197,12 +204,12 @@ impl ConstantPool {
         })
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -223,6 +230,10 @@ pub struct MemberRef<'a> {
 // ClassFile + Member + Attribute
 // ---------------------------------------------------------------------------
 
+#[expect(
+    dead_code,
+    reason = "parsed in full per JVMS 4.1; label parsers read the pool and methods"
+)]
 pub struct ClassFile {
     pub minor_version: u16,
     pub major_version: u16,
@@ -236,6 +247,7 @@ pub struct ClassFile {
     pub attributes: Vec<Attribute>,
 }
 
+#[expect(dead_code, reason = "parsed in full per JVMS 4.5/4.6")]
 pub struct Member {
     pub access_flags: u16,
     pub name_index: u16,
@@ -287,6 +299,7 @@ impl ClassFile {
         self.constant_pool.class_name(self.this_class)
     }
 
+    #[cfg(test)]
     pub fn super_class_name(&self) -> Option<&str> {
         self.constant_pool.class_name(self.super_class)
     }
@@ -296,6 +309,7 @@ impl ClassFile {
         self.constant_pool.utf8(m.name_index)
     }
 
+    #[cfg(test)]
     pub fn member_descriptor<'a>(&'a self, m: &Member) -> Option<&'a str> {
         self.constant_pool.utf8(m.descriptor_index)
     }
@@ -316,6 +330,10 @@ impl Member {
 
 pub struct CodeAttribute<'a> {
     pub max_stack: u16,
+    #[expect(
+        dead_code,
+        reason = "parsed per JVMS 4.7.3; the decoder tracks only the stack"
+    )]
     pub max_locals: u16,
     pub code: &'a [u8],
 }
@@ -551,6 +569,7 @@ pub struct Instruction<'a> {
 }
 
 impl Instruction<'_> {
+    #[cfg(test)]
     /// Mnemonic for the opcodes this reader models (e.g. "ldc"); "?" for others.
     pub fn name(&self) -> &'static str {
         opcode_name(self.opcode)
@@ -687,7 +706,6 @@ fn instruction_size(code: &[u8], pc: usize) -> Option<usize> {
 }
 
 // Opcode table: named opcode constants for the ones we walk in the parser.
-#[allow(dead_code)]
 pub const NOP: u8 = 0x00;
 pub const ACONST_NULL: u8 = 0x01;
 pub const ICONST_M1: u8 = 0x02;
@@ -712,7 +730,6 @@ pub const LSTORE: u8 = 0x37;
 pub const FSTORE: u8 = 0x38;
 pub const DSTORE: u8 = 0x39;
 pub const ASTORE: u8 = 0x3A;
-pub const AASTORE: u8 = 0x53;
 pub const IASTORE: u8 = 0x4F;
 pub const SASTORE: u8 = 0x56;
 pub const DCONST_1: u8 = 0x0F;
@@ -885,6 +902,7 @@ const FIXED_SIZE: [Option<u8>; 256] = {
     t
 };
 
+#[cfg(test)]
 fn opcode_name(op: u8) -> &'static str {
     match op {
         0x00 => "nop",
@@ -1049,6 +1067,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AASTORE: u8 = 0x53;
 
     // Reader::slice takes an attacker-supplied length (JVMS u4/u2 field);
     // pos + len must not overflow/wrap past the bounds check and panic —
