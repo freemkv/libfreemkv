@@ -332,12 +332,15 @@ impl CandidatePool {
     }
 
     /// Retain `fields` for an already-inserted class, within the byte budget.
-    fn insert_fields(&mut self, class_name: &str, fields: Vec<String>) {
+    /// Returns false when they were rejected (pool full).
+    fn insert_fields(&mut self, class_name: &str, fields: Vec<String>) -> bool {
         let cost = fields.iter().map(String::len).sum::<usize>();
-        if self.bytes.saturating_add(cost) <= MAX_CANDIDATE_TOTAL_BYTES {
-            self.bytes += cost;
-            self.fields.insert(class_name.to_string(), fields);
+        if self.bytes.saturating_add(cost) > MAX_CANDIDATE_TOTAL_BYTES {
+            return false;
         }
+        self.bytes += cost;
+        self.fields.insert(class_name.to_string(), fields);
+        true
     }
 }
 
@@ -360,13 +363,14 @@ fn identify_master_enums(
             return;
         }
         let key = class.this_class_name().unwrap_or(zip_name);
-        let matches_fp = FINGERPRINTS.iter().any(|fp| {
-            ldcs_match_prefix(&ldcs, fp.prefix)
-                && ldcs.len().abs_diff(fp.expected_count) <= fp.count_tolerance
-        });
+        let matches_fp = FINGERPRINTS.iter().any(|fp| fp_matches(fp, &ldcs));
         if pool.insert(key, ldcs) {
-            if matches_fp {
-                pool.insert_fields(key, clinit_enum_field_names(class));
+            if matches_fp && !pool.insert_fields(key, clinit_enum_field_names(class)) {
+                tracing::debug!(
+                    class = ?key,
+                    bytes = pool.bytes,
+                    "deluxe: candidate pool cap hit, enum field names dropped"
+                );
             }
         } else {
             tracing::debug!(
@@ -385,13 +389,10 @@ fn identify_master_enums(
     for fp in FINGERPRINTS {
         let mut best: Option<(String, Vec<String>)> = None;
         for (name, ldcs) in &candidates {
-            if !ldcs_match_prefix(ldcs, fp.prefix) {
+            if !fp_matches(fp, ldcs) {
                 continue;
             }
             let count = ldcs.len();
-            if count.abs_diff(fp.expected_count) > fp.count_tolerance {
-                continue;
-            }
             // Prefer exact-count match; otherwise first hit wins.
             match &best {
                 None => best = Some((name.clone(), ldcs.clone())),
@@ -518,6 +519,12 @@ fn clinit_ldc_strings(class: &super::class_reader::ClassFile) -> Option<Vec<Stri
         }
     }
     if found { Some(out) } else { None }
+}
+
+// Whether a class's `<clinit>` ldc strings fit a fingerprint (prefix and count window).
+fn fp_matches(fp: &Fingerprint, ldcs: &[String]) -> bool {
+    ldcs_match_prefix(ldcs, fp.prefix)
+        && ldcs.len().abs_diff(fp.expected_count) <= fp.count_tolerance
 }
 
 /// True if the first `prefix.len()` entries of `ldcs` match `prefix`
@@ -1352,12 +1359,12 @@ fn coding_type_to_codec_hint(field: &str) -> &str {
         // Dolby family.
         "DOLBY_AC3_AUDIO" => "Dolby Digital",
         "DOLBY_DIGITAL_PLUS_AUDIO" => "Dolby Digital Plus",
-        "DOLBY_ATMOS_AUDIO" => "Dolby Atmos",
         // DTS family.
         "DTS_AUDIO" => "DTS",
         "DTS_HD_AUDIO" => "DTS-HD",
         "DTS_HD_AUDIO_EXCEPT_XLL" => "DTS-HD HR",
         "DTS_HD_AUDIO_LBR" => "DTS Express",
+        "DRA_AUDIO" | "DRA_EXTENSION_AUDIO" => "DRA",
         // Unknown / future — pass through verbatim so the operator
         // can see what the disc actually authored.
         _ => field,
@@ -3348,6 +3355,8 @@ mod tests {
             "DTS-HD Master Audio"
         );
         assert_eq!(coding_type_to_codec_hint("LPCM_AUDIO"), "LPCM");
+        assert_eq!(coding_type_to_codec_hint("DRA_AUDIO"), "DRA");
+        assert_eq!(coding_type_to_codec_hint("DRA_EXTENSION_AUDIO"), "DRA");
     }
 
     #[test]
