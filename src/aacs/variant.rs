@@ -78,7 +78,7 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
 // ── Subset-difference walk that exposes (Kp, uv) ──────────────────────────
 
 // Shared with the classical walk in super::derive to keep the SD tree byte-identical.
-use super::derive::{calc_pk_from_dk, calc_v_mask};
+use super::derive::{VERIFY_MAGIC, calc_pk_from_dk, calc_v_mask};
 
 /// Outcome of a subset-difference walk against an MKB. Carries the
 /// processing key and the matching `uv` slot — both needed as inputs
@@ -193,7 +193,6 @@ pub fn walk_processing_key(
                         km_candidate[12 + i] ^= uv_bytes[i];
                     }
                     let dec_vd = aes_ecb_decrypt(&km_candidate, &mk_dv);
-                    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
                     // On classical MKBs this magic must match. On variant MKBs
                     // it won't — `km_candidate` is really Kmp, so the magic
                     // check is moot; the chain enforces semantics downstream.
@@ -394,7 +393,6 @@ fn variant_km_for_slot(
     // Gate: the derived Media Key MUST reproduce the MKB's Verify-Media-Key magic
     // (the per-match magic in `walk_processing_key` only saw the Precursor). This
     // is the authoritative check — no unverified key is ever returned.
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if aes_ecb_decrypt(&km, &m.mk_dv)[..8] != VERIFY_MAGIC {
         return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
     }
@@ -517,7 +515,6 @@ pub fn media_key_variant_from_kp(
     for i in 0..4 {
         km[12 + i] ^= uv_bytes[i];
     }
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if aes_ecb_decrypt(&km, &mk_dv)[..8] != VERIFY_MAGIC {
         return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
     }
@@ -1252,7 +1249,6 @@ mod tests {
         for i in 0..4 {
             km[12 + i] ^= uv_bytes[i];
         }
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         if aes_ecb_decrypt(&km, &m.mk_dv)[..8] != VERIFY_MAGIC {
             return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
         }

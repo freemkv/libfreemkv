@@ -730,6 +730,37 @@ mod tests {
         );
     }
 
+    // The per-track cap stops one track at OPENING_FRAMES_PER_TRACK records without
+    // affecting another, and an out-of-range track index is ignored.
+    #[test]
+    fn opening_capture_caps_each_track_and_ignores_unknown_tracks() {
+        let path = std::env::temp_dir().join(format!("fmk-diag-cap-{}.bin", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut cap = OpeningCapture {
+            file,
+            counts: vec![0; 2],
+        };
+        for _ in 0..OPENING_FRAMES_PER_TRACK + 5 {
+            cap.record(0, 0, true, b"x");
+        }
+        cap.record(1, 0, false, b"y");
+        cap.record(2, 0, true, b"z");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cap.counts, vec![OPENING_FRAMES_PER_TRACK, 1]);
+        assert_eq!(len as usize, (OPENING_FRAMES_PER_TRACK + 1) * 15);
+    }
+
+    // With the diag target off, no side file is created and the rip is unaffected.
+    #[test]
+    fn opening_capture_new_is_none_when_diag_is_off() {
+        let path = std::env::temp_dir().join(format!("fmk-diag-off-{}.mkv", std::process::id()));
+        assert!(OpeningCapture::new(&path, 3).is_none());
+        let mut side = path.as_os_str().to_os_string();
+        side.push(".opening.bin");
+        assert!(!std::path::Path::new(&side).exists());
+    }
+
     #[test]
     fn res_str_keeps_interlace_marker() {
         assert_eq!(res_str(Resolution::R576i), "576i");

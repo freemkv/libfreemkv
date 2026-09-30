@@ -6,6 +6,9 @@ use super::inf::*;
 use super::mkb::*;
 use super::types::*;
 
+/// `[C]` §3.2.5.1.4 Verify-Media-Key plaintext prefix.
+pub(super) const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+
 /// Derive Media Key from MKB data using processing keys.
 ///
 /// A Processing Key is **terminal**: tried *directly* against the MKB
@@ -98,7 +101,6 @@ fn validate_processing_key_with_cipher(
 
     // Step 3 + 4: dec_vd = AES-128D(mk, mk_dv); verify magic.
     let dec_vd = aes_ecb_decrypt(&mk, mk_dv);
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if dec_vd[..8] == VERIFY_MAGIC {
         return Some(mk);
     }
@@ -130,7 +132,6 @@ pub(crate) fn validate_processing_key(
 
     // Step 3 + 4: dec_vd = AES-128D(mk, mk_dv); verify magic.
     let dec_vd = aes_ecb_decrypt(&mk, mk_dv);
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if dec_vd[..8] == VERIFY_MAGIC {
         return Some(mk);
     }
@@ -1047,9 +1048,6 @@ mod position_recovery_tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
 
-    /// `[C]` §3.2.5.1.4 Verify-Media-Key plaintext prefix.
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-
     /// An MKB record: 1-byte type + BE24 total length (header included) + body.
     fn rec(t: u8, body: &[u8]) -> Vec<u8> {
         let total = 4 + body.len();
@@ -1612,6 +1610,21 @@ mod position_recovery_tests {
             try_pk_against_tables(&[_pk], &ok_uvs, &ok_cvalues, &mk_dv).is_some(),
             "sanity: the same PK/cvalue pair does resolve when present"
         );
+    }
+
+    // A keydb device key with u_mask_shift >= 32 must be skipped at the DK-side guard;
+    // an unguarded `0xFFFF_FFFF << 200` panics in debug on keydb-supplied input.
+    #[test]
+    fn dk_walk_skips_a_device_key_with_u_mask_shift_past_u32() {
+        let (dkey, _mk, _pk, cv, mk_dv) = four_level_parts();
+        let mkb = build_mkb(&[(U_MASK_SHIFT, UV_SLOT4)], &cv, &mk_dv);
+        let dk = DeviceKey {
+            key: dkey,
+            node: 0x0101,
+            uv: UV_ANC4,
+            u_mask_shift: 200,
+        };
+        assert_eq!(derive_media_key_and_pk_from_dk(&mkb, &[dk]), None);
     }
 
     // ── L104: cvalue-loop cipher hoist — equivalence, call-count, and spec quote ──────
