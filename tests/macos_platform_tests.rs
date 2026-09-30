@@ -1,7 +1,7 @@
 //! macOS platform-integration tests that do NOT require an optical drive.
 //!
-//! These exercise the Mac-only code paths under `platform/fs_type/macos.rs`,
-//! `io/platform_macos.rs`, and `io/writeback_file` end-to-end against the real
+//! These exercise the Mac-only code paths under `io/platform_macos.rs`
+//! and `io/writeback_file` end-to-end against the real
 //! kernel. They run under `cargo test` without `--ignored`, so CI on macOS
 //! (and the local `cargo test` a developer would run before pushing) covers
 //! them automatically.

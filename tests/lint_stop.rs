@@ -535,7 +535,6 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         r#"cfg_attr(not(target_os="linux"),allow(unused_variables))"#,
         1,
     ),
-    ("src/io/sink/mod.rs", r#"allow(dead_code)"#, 1),
     (
         "src/keys/arrival.rs",
         r#"allow(clippy::too_many_arguments)"#,
@@ -564,9 +563,8 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     (
         "src/platform/fs_type/linux.rs",
         r#"allow(clippy::unnecessary_cast)"#,
-        3,
+        2,
     ),
-    ("src/platform/fs_type/mod.rs", r#"allow(dead_code)"#, 1),
     ("src/scsi/linux.rs", r#"allow(non_camel_case_types)"#, 1),
     ("src/scsi/mod.rs", r#"allow(dead_code)"#, 1),
     (

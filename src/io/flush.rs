@@ -306,7 +306,7 @@ pub(crate) fn wait_failure(e: BoundedError, what: &str) -> io::Error {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rc(r: libc::c_int) -> io::Result<()> {
     if r == 0 {
         Ok(())
