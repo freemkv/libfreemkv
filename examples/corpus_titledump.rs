@@ -43,9 +43,9 @@ fn dump_one(path: &Path) -> String {
         Ok(r) => r,
         Err(e) => {
             return format!(
-                "{{\"iso\":{},\"error\":\"open: {:?}\"}}",
+                "{{\"iso\":{},\"error\":{}}}",
                 jstr(name),
-                format!("{e}")
+                jstr(&format!("open: {e}"))
             );
         }
     };
@@ -55,9 +55,9 @@ fn dump_one(path: &Path) -> String {
         Ok(d) => d,
         Err(e) => {
             return format!(
-                "{{\"iso\":{},\"error\":\"scan: {}\"}}",
+                "{{\"iso\":{},\"error\":{}}}",
                 jstr(name),
-                jstr(&format!("{e}"))
+                jstr(&format!("scan: {e}"))
             );
         }
     };
