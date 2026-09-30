@@ -133,6 +133,12 @@ pub struct DirEntry {
 }
 
 impl UdfFs {
+    /// Test hook: relocate the physical partition (ICBs stay put via the metadata map).
+    #[cfg(test)]
+    pub(crate) fn set_partition_start(&mut self, start: u32) {
+        self.partition_start = start;
+    }
+
     /// Physical partition start sector.
     pub fn partition_start(&self) -> u32 {
         self.partition_start
