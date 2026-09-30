@@ -3191,10 +3191,10 @@ mod tests {
             max >= tick(600_000),
             "timeline must span past the boundary, got {max} ticks"
         );
-        // And does NOT ratchet far beyond clip1+clip2 (~605s): well under 2× clip1.
+        // And does NOT ratchet beyond clip1+clip2 (~605s), within a 1 s tolerance.
         assert!(
-            max < tick(1_000_000),
-            "no ratchet: max cluster ts {max} ticks must stay near 605s"
+            max < tick(606_000),
+            "no ratchet: max cluster ts {max} ticks must stay within 1 s of 605 s"
         );
     }
 
@@ -3251,8 +3251,8 @@ mod tests {
         // index 0 driving epochs) the lagging-audio straggler ratchets the
         // frontier and inflates the timeline well past this bound.
         assert!(
-            max < tick(1_000_000),
-            "no ratchet: max cluster ts {max} ticks must stay near 605s"
+            max < tick(606_000),
+            "no ratchet: max cluster ts {max} ticks must stay within 1 s of 605 s"
         );
     }
 
@@ -3281,7 +3281,7 @@ mod tests {
         let max = *ts.iter().max().unwrap() as i64;
         assert!(max >= tick(600_000), "timeline spans the seam, got {max}");
         assert!(
-            max < tick(1_000_000),
+            max < tick(606_000),
             "EL straggler must not ratchet the timeline, got {max} ticks"
         );
     }
