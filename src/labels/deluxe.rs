@@ -7,10 +7,16 @@
 //! matches each enum's `<clinit>` shape rather than class names.
 
 use super::class_reader::{
-    ACONST_NULL, ANEWARRAY, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, DCONST_1, DUP,
-    GETSTATIC, GOTO, IASTORE, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5,
-    ICONST_M1, INVOKEINTERFACE, INVOKESPECIAL, INVOKESTATIC, INVOKEVIRTUAL, LDC, LDC_W, LDC2_W,
-    NEW, NEWARRAY, NOP, POP, POP2, PUTFIELD, PUTSTATIC, RETURN, SASTORE, SIPUSH,
+    ACONST_NULL, ALOAD, ALOAD_3, ANEWARRAY, ARRAYLENGTH, ASTORE, ASTORE_3, ATHROW, BIPUSH,
+    CHECKCAST, ClassFile, CodeAttribute, ConstantPool, CpInfo, D2L, DALOAD, DCMPG, DCONST_0,
+    DCONST_1, DLOAD, DLOAD_0, DLOAD_3, DNEG, DREM, DUP, DUP_X1, DUP_X2, DUP2, DUP2_X1, DUP2_X2,
+    F2D, F2L, FLOAD, GETFIELD, GETSTATIC, GOTO, GOTO_W, I2D, I2L, I2S, IADD, IALOAD, IASTORE,
+    ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, IF_ACMPNE, IF_ICMPEQ,
+    IFEQ, IFLE, IFNONNULL, IFNULL, IINC, ILOAD, INEG, INSTANCEOF, INVOKEINTERFACE, INVOKESPECIAL,
+    INVOKESTATIC, INVOKEVIRTUAL, IRETURN, ISHL, ISTORE, Instruction, L2D, LALOAD, LCMP, LCONST_0,
+    LCONST_1, LDC, LDC_W, LDC2_W, LLOAD, LLOAD_0, LLOAD_3, LOOKUPSWITCH, LXOR, MONITORENTER,
+    MONITOREXIT, MULTIANEWARRAY, NEW, NEWARRAY, NOP, POP, POP2, PUTFIELD, PUTSTATIC, RETURN,
+    SALOAD, SASTORE, SIPUSH, SWAP, TABLESWITCH, WIDE,
 };
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, jar, vocab};
 use crate::sector::SectorSource;
@@ -616,6 +622,24 @@ pub(crate) enum StackVal {
     /// opaque. Lets the walker stay in sync past loads/computed
     /// values it doesn't understand.
     Unknown,
+    /// An opaque long or double: one value, two stack words (JVMS §2.11.1).
+    Wide,
+}
+
+impl StackVal {
+    // Stack words this value occupies.
+    fn words(&self) -> usize {
+        if matches!(self, StackVal::Wide) { 2 } else { 1 }
+    }
+
+    // Opaque value of a field descriptor type.
+    fn of_type(descriptor: &str) -> Self {
+        if matches!(descriptor, "J" | "D") {
+            StackVal::Wide
+        } else {
+            StackVal::Unknown
+        }
+    }
 }
 
 /// Fully-qualified class name of the BD-J spec codec enum that
@@ -719,7 +743,7 @@ impl<'a> BindingDecoder<'a> {
     }
 
     // The symbolic stack no longer matches the real one at `insn`.
-    fn lost_sync(&mut self, insn: &super::class_reader::Instruction<'_>) {
+    fn lost_sync(&mut self, insn: &Instruction<'_>) {
         self.drift = self.drift.saturating_add(1);
         tracing::debug!(
             pc = insn.pc,
@@ -750,7 +774,58 @@ impl<'a> BindingDecoder<'a> {
         self.stack.push(val);
     }
 
-    fn step(&mut self, insn: super::class_reader::Instruction<'_>) {
+    // Pops `n` values of any category; on underflow resyncs on an empty stack.
+    fn pop_values(&mut self, insn: &Instruction<'_>, n: usize) {
+        match self.stack.len().checked_sub(n) {
+            Some(keep) => self.stack.truncate(keep),
+            None => {
+                self.lost_sync(insn);
+                self.stack.clear();
+            }
+        }
+    }
+
+    // Pops whole values totalling exactly `n` stack words (top last). None, after a
+    // resync, on underflow or when that would split a long/double (JVMS §2.11.1).
+    fn take_words(&mut self, insn: &Instruction<'_>, n: usize) -> Option<Vec<StackVal>> {
+        let (mut at, mut got) = (self.stack.len(), 0);
+        while got < n && at > 0 {
+            at -= 1;
+            got += self.stack[at].words();
+        }
+        if got != n {
+            self.lost_sync(insn);
+            self.stack.clear();
+            return None;
+        }
+        Some(self.stack.split_off(at))
+    }
+
+    // dup, dup_x1/x2, dup2, dup2_x1/x2: copy the top `n` words beneath the next `m`.
+    fn dup_under(&mut self, insn: &Instruction<'_>, n: usize, m: usize) {
+        let Some(top) = self.take_words(insn, n) else {
+            return;
+        };
+        let Some(under) = self.take_words(insn, m) else {
+            return;
+        };
+        for v in top.clone().into_iter().chain(under).chain(top) {
+            self.push(v);
+        }
+    }
+
+    // Pops `n` operands and pushes one result, a long/double when `wide`.
+    fn op(&mut self, insn: &Instruction<'_>, n: usize, wide: bool) {
+        self.pop_values(insn, n);
+        self.push(if wide {
+            StackVal::Wide
+        } else {
+            StackVal::Unknown
+        });
+    }
+
+    fn step(&mut self, insn: Instruction<'_>) {
+        let insn = &insn;
         match insn.opcode {
             // Push small int constants.
             ICONST_M1 => self.push(StackVal::Int(-1)),
@@ -774,10 +849,9 @@ impl<'a> BindingDecoder<'a> {
                     self.push(StackVal::Unknown);
                 }
             }
-            // aconst_null, l/f/dconst_*, ldc2_w: one symbolic slot, opaque value.
-            // (iconst_* arms above take 0x02..=0x08 first.)
+            LCONST_0 | LCONST_1 | DCONST_0 | DCONST_1 | LDC2_W => self.push(StackVal::Wide),
+            // aconst_null, fconst_* (the int/long/double constants are taken above).
             ACONST_NULL..=DCONST_1 => self.push(StackVal::Unknown),
-            LDC2_W => self.push(StackVal::Unknown),
             // ldc/ldc_w: push Int when the operand is an Integer
             // constant; otherwise push Unknown (we don't care about
             // Strings here — labels come via getstatic, not ldc).
@@ -791,6 +865,21 @@ impl<'a> BindingDecoder<'a> {
                     .unwrap_or(StackVal::Unknown);
                 self.push(v);
             }
+            // Local loads and stores (the long/double loads first).
+            LLOAD | DLOAD | LLOAD_0..=LLOAD_3 | DLOAD_0..=DLOAD_3 => self.push(StackVal::Wide),
+            ILOAD..=ALOAD_3 => self.push(StackVal::Unknown),
+            ISTORE..=ASTORE_3 => self.pop_values(insn, 1),
+            WIDE => match insn.operand_u8() {
+                Some(LLOAD | DLOAD) => self.push(StackVal::Wide),
+                Some(ILOAD | FLOAD | ALOAD) => self.push(StackVal::Unknown),
+                Some(ISTORE..=ASTORE) => self.pop_values(insn, 1),
+                Some(IINC) => {}
+                _ => self.lost_sync(insn),
+            },
+            // Array loads pop (arrayref, index); stores also pop the value.
+            LALOAD | DALOAD => self.op(insn, 2, true),
+            IALOAD..=SALOAD => self.op(insn, 2, false),
+            IASTORE..=SASTORE => self.pop_values(insn, 3),
             // new X — push an uninit-object marker. The matching
             // invokespecial will consume this + the args and emit a
             // Construction.
@@ -802,40 +891,71 @@ impl<'a> BindingDecoder<'a> {
                     .to_string();
                 self.push(StackVal::NewObj(class_name));
             }
-            // dup — duplicate top of stack.
-            DUP => {
-                if let Some(top) = self.stack.last().cloned() {
-                    self.push(top);
+            // Word-level stack ops (a long/double is one two-word value).
+            POP => drop(self.take_words(insn, 1)),
+            POP2 => drop(self.take_words(insn, 2)),
+            DUP => self.dup_under(insn, 1, 0),
+            DUP_X1 => self.dup_under(insn, 1, 1),
+            DUP_X2 => self.dup_under(insn, 1, 2),
+            DUP2 => self.dup_under(insn, 2, 0),
+            DUP2_X1 => self.dup_under(insn, 2, 1),
+            DUP2_X2 => self.dup_under(insn, 2, 2),
+            SWAP => {
+                if let Some(a) = self.take_words(insn, 1)
+                    && let Some(b) = self.take_words(insn, 1)
+                {
+                    for v in a.into_iter().chain(b) {
+                        self.push(v);
+                    }
                 }
             }
+            // Arithmetic: in 0x60..=0x83 the long/double forms are the odd opcodes.
+            IADD..=DREM | ISHL..=LXOR => self.op(insn, 2, insn.opcode % 2 == 1),
+            INEG..=DNEG => self.op(insn, 1, insn.opcode % 2 == 1),
+            IINC => {}
+            I2L | I2D | L2D | F2L | F2D | D2L => self.op(insn, 1, true),
+            I2L..=I2S => self.op(insn, 1, false),
+            LCMP..=DCMPG => self.op(insn, 2, false),
+            // Conditional branches pop their operands; the walk stays linear.
+            IFEQ..=IFLE | IFNULL | IFNONNULL | TABLESWITCH | LOOKUPSWITCH => {
+                self.pop_values(insn, 1)
+            }
+            IF_ICMPEQ..=IF_ACMPNE => self.pop_values(insn, 2),
+            MONITORENTER | MONITOREXIT => self.pop_values(insn, 1),
             // getstatic Y.Z — if Y is one of our master enum classes,
             // resolve Z to an ordinal and push an EnumRef. Otherwise
-            // push Unknown so we stay in sync.
+            // push an opaque value so we stay in sync.
             GETSTATIC => {
-                let val = insn
-                    .cp_index()
-                    .and_then(|i| self.pool.member_ref(i))
-                    .map(|m| {
-                        // Resolution: CodingType.X → CodingType(X); master-enum
-                        // classname.X → EnumRef(kind, ord); else Unknown.
-                        if m.class_name == BD_CODING_TYPE_CLASS {
-                            StackVal::CodingType(m.name.to_string())
-                        } else if let Some((kind, ord)) = self.master.resolve(m.class_name, m.name)
-                        {
-                            StackVal::EnumRef { kind, ordinal: ord }
-                        } else {
-                            StackVal::Unknown
-                        }
-                    })
-                    .unwrap_or(StackVal::Unknown);
+                let Some(m) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
+                    self.lost_sync(insn);
+                    self.push(StackVal::Unknown);
+                    return;
+                };
+                let val = if m.class_name == BD_CODING_TYPE_CLASS {
+                    StackVal::CodingType(m.name.to_string())
+                } else if let Some((kind, ordinal)) = self.master.resolve(m.class_name, m.name) {
+                    StackVal::EnumRef { kind, ordinal }
+                } else {
+                    StackVal::of_type(m.descriptor)
+                };
                 self.push(val);
             }
+            PUTSTATIC => self.pop_values(insn, 1),
+            GETFIELD => {
+                let Some(m) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
+                    self.lost_sync(insn);
+                    return self.op(insn, 1, false);
+                };
+                self.pop_values(insn, 1);
+                self.push(StackVal::of_type(m.descriptor));
+            }
+            PUTFIELD => self.pop_values(insn, 2),
             // invokespecial X.<init>(...) — pop args per descriptor. If the
             // object underneath the args is a NewObj of class X (set by an
             // earlier `new X / dup`), emit a Construction.
             INVOKESPECIAL => {
                 let Some(member) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
-                    self.lost_sync(&insn);
+                    self.lost_sync(insn);
                     return;
                 };
                 let arg_count = parse_method_arg_count(member.descriptor);
@@ -846,7 +966,7 @@ impl<'a> BindingDecoder<'a> {
                 let is_container = member.descriptor.contains('[');
                 if self.stack.len() < arg_count + 1 {
                     // Underflow: resync on an empty stack, keep the binding's slot.
-                    self.lost_sync(&insn);
+                    self.lost_sync(insn);
                     self.stack.clear();
                     if is_init {
                         self.placeholder(member.class_name, is_container);
@@ -857,7 +977,7 @@ impl<'a> BindingDecoder<'a> {
                 // Underneath the args: the object the constructor
                 // operates on. For our pattern it's NewObj(X).
                 match self.stack.pop() {
-                    Some(StackVal::NewObj(name)) if name == member.class_name => {
+                    Some(StackVal::NewObj(name)) if is_init && name == member.class_name => {
                         // Bounded by MAX_CONSTRUCTIONS: an unbounded push here
                         // is ~1 GiB reachable from a crafted `<clinit>`.
                         if !is_container && self.constructions.len() < MAX_CONSTRUCTIONS {
@@ -870,83 +990,56 @@ impl<'a> BindingDecoder<'a> {
                     // `<clinit>` has no `this`: an `<init>` receiver that is not the
                     // matching `new` means the args popped are not this call's.
                     _ if is_init => {
-                        self.lost_sync(&insn);
+                        self.lost_sync(insn);
                         self.placeholder(member.class_name, is_container);
                     }
-                    _ => {}
+                    _ => self.push_return(member.descriptor),
                 }
             }
             // invokevirtual / invokestatic / invokeinterface — pop
-            // args per descriptor, push a return placeholder unless
-            // descriptor returns V (void).
+            // args per descriptor (plus the receiver), push the return value.
             INVOKEVIRTUAL | INVOKESTATIC | INVOKEINTERFACE => {
                 let Some(member) = insn.cp_index().and_then(|i| self.pool.member_ref(i)) else {
-                    self.lost_sync(&insn);
+                    self.lost_sync(insn);
                     return;
                 };
-                let arg_count = parse_method_arg_count(member.descriptor);
-                let extra = if insn.opcode == INVOKEVIRTUAL || insn.opcode == INVOKEINTERFACE {
-                    1
-                } else {
-                    0
-                };
-                let to_pop = arg_count + extra;
-                if self.stack.len() < to_pop {
-                    self.lost_sync(&insn);
-                    self.stack.clear();
-                } else {
-                    self.stack.truncate(self.stack.len() - to_pop);
-                }
-                // Push return placeholder unless void.
-                if !member.descriptor.ends_with(")V") {
-                    self.push(StackVal::Unknown);
+                let receiver = usize::from(insn.opcode != INVOKESTATIC);
+                self.pop_values(insn, parse_method_arg_count(member.descriptor) + receiver);
+                self.push_return(member.descriptor);
+            }
+            // anewarray / newarray / arraylength / instanceof: pop 1, push a ref or int.
+            ANEWARRAY | NEWARRAY | ARRAYLENGTH | INSTANCEOF => self.op(insn, 1, false),
+            MULTIANEWARRAY => {
+                let dims = insn.operands.get(2).copied().unwrap_or(0);
+                self.op(insn, dims as usize, false);
+            }
+            // checkcast leaves the (same) reference on the stack.
+            CHECKCAST => {
+                if self.stack.is_empty() {
+                    self.lost_sync(insn);
                 }
             }
-            // pop / pop2 — drop stack values.
-            POP => {
-                self.stack.pop();
-            }
-            POP2 => {
-                self.stack.pop();
-                self.stack.pop();
-            }
-            // anewarray / newarray — pop count, push array ref. Modelled (not
-            // left to `_`) so array constructions inside a container's arg list
-            // keep the symbolic stack aligned for per-stream bindings built alongside.
-            ANEWARRAY | NEWARRAY => {
-                self.stack.pop();
-                self.push(StackVal::Unknown);
-            }
-            // i/l/f/d/a/b/c/sastore — array store consumes 3 slots (arrayref, index, value).
-            IASTORE..=SASTORE => {
-                for _ in 0..3 {
-                    self.stack.pop();
-                }
-            }
-            // putstatic / putfield — drop 1 (putstatic) or 2 (putfield).
-            PUTSTATIC => {
-                self.stack.pop();
-            }
-            PUTFIELD => {
-                self.stack.pop();
-                self.stack.pop();
-            }
-            // Branches/returns/unhandled — clear stack as a conservative resync.
-            // Binding `<clinit>` is straight-line code in practice, so these
-            // are rarely hit on the verified pattern.
-            GOTO | RETURN => {
-                self.stack.clear();
-            }
+            // Unconditional control transfer: nothing flows into the next instruction.
+            GOTO | GOTO_W | IRETURN..=RETURN | ATHROW => self.stack.clear(),
             NOP => {}
-            // Unmodelled opcode: its stack effect is unknown, so the walk is no longer exact.
-            _ => self.lost_sync(&insn),
+            // Unmodelled (jsr/ret, invokedynamic, reserved): stack effect unknown, so the
+            // walk is no longer exact.
+            _ => self.lost_sync(insn),
+        }
+    }
+
+    // Pushes a method descriptor's return value (nothing for void).
+    fn push_return(&mut self, descriptor: &str) {
+        match descriptor.rsplit_once(')') {
+            Some((_, "V")) => {}
+            Some((_, ret)) => self.push(StackVal::of_type(ret)),
+            None => self.push(StackVal::Unknown),
         }
     }
 }
 
-// Counts argument slots in a JVMS descriptor like `(IILjava/lang/String;LFoo;)V`.
-// Each field descriptor is one slot (we don't track the JVM's 2-slot
-// long/double layout — the symbolic stack treats every value as 1 slot).
+// Counts argument values in a JVMS descriptor like `(IILjava/lang/String;LFoo;)V`.
+// One per field descriptor: a long/double arg is one (two-word) `StackVal::Wide`.
 fn parse_method_arg_count(descriptor: &str) -> usize {
     let bytes = descriptor.as_bytes();
     let mut i = 1; // skip leading '('
@@ -2590,6 +2683,146 @@ mod tests {
             0,
             "stack-underflowing invoke must clear defensively, not underflow-subtract"
         );
+    }
+
+    // The symbolic stack after running `code` (pool: `AnyClass.m()J` at cp 6),
+    // rendered as ints, "W" (long/double), "?" (opaque) or "new X".
+    fn stack_after(code: &[u8]) -> Vec<String> {
+        let pool = call_ref_pool("()J");
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 16,
+            max_locals: 0,
+            code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        decoder
+            .stack
+            .iter()
+            .map(|v| match v {
+                StackVal::Int(n) => n.to_string(),
+                StackVal::Wide => "W".into(),
+                StackVal::NewObj(c) => format!("new {c}"),
+                _ => "?".into(),
+            })
+            .collect()
+    }
+
+    // JVMS §6.5 dup_x1/dup_x2/dup2/dup2_x1/dup2_x2/swap, every category-1/2 form.
+    #[test]
+    fn binding_decoder_models_the_dup_family_and_swap() {
+        let (c1, c2, c3, c4, l0) = (ICONST_1, ICONST_2, ICONST_3, ICONST_4, 0x09);
+        let cases: &[(&[u8], &[&str])] = &[
+            (&[c1, c2, 0x5A], &["2", "1", "2"]),
+            (&[c1, c2, c3, 0x5B], &["3", "1", "2", "3"]),
+            (&[l0, c1, 0x5B], &["1", "W", "1"]),
+            (&[c1, c2, 0x5C], &["1", "2", "1", "2"]),
+            (&[l0, 0x5C], &["W", "W"]),
+            (&[c1, c2, c3, 0x5D], &["2", "3", "1", "2", "3"]),
+            (&[c1, l0, 0x5D], &["W", "1", "W"]),
+            (&[c1, c2, c3, c4, 0x5E], &["3", "4", "1", "2", "3", "4"]),
+            (&[c1, c2, l0, 0x5E], &["W", "1", "2", "W"]),
+            (&[l0, c1, c2, 0x5E], &["1", "2", "W", "1", "2"]),
+            (&[l0, l0, 0x5E], &["W", "W", "W"]),
+            (&[c1, c2, 0x5F], &["2", "1"]),
+        ];
+        for (code, want) in cases {
+            assert_eq!(stack_after(code), *want, "{code:02x?}");
+        }
+    }
+
+    // pop2 removes one long/double or two category-1 values; pop never splits one.
+    #[test]
+    fn binding_decoder_pop2_respects_value_categories() {
+        assert_eq!(stack_after(&[ICONST_1, 0x09, POP2]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, 0x0E, POP2]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, LDC2_W, 0, 1, POP2]), ["1"]);
+        // A discarded J-returning call.
+        assert_eq!(stack_after(&[ICONST_1, INVOKESTATIC, 0, 6, POP2]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, ICONST_3, POP2]), ["1"]);
+    }
+
+    // Local loads push, stores pop (JVMS §6.5 xload/xstore, incl. wide forms).
+    #[test]
+    fn binding_decoder_models_local_loads_and_stores() {
+        assert_eq!(
+            stack_after(&[0x1A, 0x15, 3, 0x2A, 0x19, 3]),
+            ["?", "?", "?", "?"]
+        );
+        assert_eq!(
+            stack_after(&[0x1E, 0x16, 3, 0x26, 0x18, 3]),
+            ["W", "W", "W", "W"]
+        );
+        assert_eq!(
+            stack_after(&[ICONST_1, ICONST_2, 0x3B, 0x36, 1]),
+            [] as [&str; 0]
+        );
+        assert_eq!(stack_after(&[ICONST_1, 0x09, 0x3F]), ["1"]);
+        assert_eq!(
+            stack_after(&[0xC4, 0x16, 0, 3, 0xC4, 0x15, 0, 4]),
+            ["W", "?"]
+        );
+        // Array loads pop arrayref + index.
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x2F]), ["W"]);
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x2E]), ["?"]);
+    }
+
+    // Arithmetic, conversions, compares and conditional branches (JVMS §6.5).
+    #[test]
+    fn binding_decoder_models_arithmetic_compares_and_branches() {
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x60]), ["?"]);
+        assert_eq!(stack_after(&[0x09, 0x0A, 0x61]), ["W"]);
+        assert_eq!(stack_after(&[0x0E, 0x0E, 0x6F]), ["W"]);
+        assert_eq!(stack_after(&[0x09, ICONST_1, 0x79]), ["W"]);
+        assert_eq!(stack_after(&[ICONST_3, 0x74]), ["?"]);
+        assert_eq!(stack_after(&[ICONST_1, 0x85]), ["W"]);
+        assert_eq!(stack_after(&[0x09, 0x88]), ["?"]);
+        assert_eq!(stack_after(&[0x09, 0x0A, 0x94]), ["?"]);
+        assert_eq!(stack_after(&[ICONST_1, 0x84, 0, 1]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, ICONST_2, 0x99, 0, 3]), ["1"]);
+        assert_eq!(
+            stack_after(&[ICONST_1, ICONST_2, 0x9F, 0, 3]),
+            [] as [&str; 0]
+        );
+        assert_eq!(stack_after(&[ICONST_1, ACONST_NULL, 0xC6, 0, 3]), ["1"]);
+        assert_eq!(stack_after(&[ICONST_1, ACONST_NULL, 0xBE]), ["1", "?"]);
+    }
+
+    // A local load feeding a binding ctor stays aligned with the ctor's args.
+    #[test]
+    fn binding_decoder_local_load_feeds_ctor_args() {
+        let pool = int_ctor_pool();
+        let master = lang_enum_master();
+        // new; dup; bipush 7; iconst_1; istore_0; lload_1; pop2; invokespecial (I)V
+        let code = [
+            NEW,
+            0,
+            2,
+            DUP,
+            BIPUSH,
+            7,
+            ICONST_1,
+            0x3B,
+            0x1F,
+            POP2,
+            INVOKESPECIAL,
+            0,
+            6,
+        ];
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 2,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(decoder.constructions.len(), 1);
+        assert!(matches!(
+            decoder.constructions[0].args[..],
+            [StackVal::Int(7)]
+        ));
+        assert_eq!(decoder.drift, 0);
     }
 
     // Pool for a single-int-arg constructor `AudioSlot.<init>(I)V`, used to
