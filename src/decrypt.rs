@@ -485,6 +485,8 @@ fn apply_aacs_map(
     let verify_failed = std::sync::atomic::AtomicBool::new(false);
     // Per mapped key: (failed, verified) FMTS units of this read.
     let tally: Vec<[AtomicUsize; 2]> = unit_keys.iter().map(|_| Default::default()).collect();
+    // A failing FMTS unit another held key opens: a wrong mapped key, never damage.
+    let opened_elsewhere = std::sync::atomic::AtomicBool::new(false);
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
@@ -551,15 +553,31 @@ fn apply_aacs_map(
             }
             return;
         }
-        aacs::content::decrypt_unit(chunk, key);
         // Correct-phase forensic verify: a failing unit is blanked; the read is judged below.
         if matches!(phase, Phase::Even | Phase::Odd) {
+            let mut ciphertext = [0u8; aacs::content::ALIGNED_UNIT_LEN];
+            ciphertext.copy_from_slice(chunk);
+            aacs::content::decrypt_unit(chunk, key);
             let clean = aacs::content::is_clean(chunk, format);
             tally[key_idx][clean as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !clean {
+                let opens = |k: &[u8; 16]| {
+                    let mut c = ciphertext;
+                    aacs::content::decrypt_unit(&mut c, k);
+                    aacs::content::is_clean(&c, format)
+                };
+                if unit_keys
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (_, k))| j != key_idx && opens(k))
+                {
+                    opened_elsewhere.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 chunk.fill(0);
                 return;
             }
+        } else {
+            aacs::content::decrypt_unit(chunk, key);
         }
         // KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted": a unit
         // we decrypted (damaged or not) is no longer ciphertext (KU design §5.4, K-13).
@@ -590,15 +608,15 @@ fn apply_aacs_map(
         return Err(crate::error::Error::DecryptFailed);
     }
     // A wrong key fails every unit it keys (resolve's phase probe catches it first); damage
-    // fails one. Two or more failures, none verifying, under one key or the read: E7013.
+    // fails one. E7013 per key only: two or more failures, none verifying, or a failing unit
+    // another held key opens. Lone failures under different keys are damage.
     let tally: Vec<[usize; 2]> = tally
         .into_iter()
         .map(|t| t.map(|n| n.into_inner()))
         .collect();
-    let read = tally.iter().fold([0, 0], |a, t| [a[0] + t[0], a[1] + t[1]]);
     let wrong = |t: &[usize; 2]| t[0] >= WRONG_KEY_FAILURES && t[1] == 0;
-    let failed = read[0];
-    if wrong(&read) || tally.iter().any(wrong) {
+    let failed: usize = tally.iter().map(|t| t[0]).sum();
+    if opened_elsewhere.into_inner() || tally.iter().any(wrong) {
         tracing::error!(
             target: "freemkv::decrypt",
             lba = base_lba,
@@ -619,8 +637,8 @@ fn apply_aacs_map(
     Ok(failed)
 }
 
-/// FMTS units of one read that must fail their verify, none verifying, under one key or
-/// across the read, before it is a wrong key rather than damage: a wrong key fails them all.
+/// FMTS units of one read that must fail their verify, none verifying, under one key before
+/// it is a wrong key rather than damage: a wrong key fails them all.
 const WRONG_KEY_FAILURES: usize = 2;
 
 /// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
