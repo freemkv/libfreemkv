@@ -1012,6 +1012,20 @@ mod transport_helper_tests {
         assert!(one(3, 0x11, 0).is_err(), "not a NOT READY key");
     }
 
+    // A transport failure carries no sense: it must bubble up on the first
+    // poll (a wedged drive is not "no disc"), never map to Absent or retry.
+    #[test]
+    fn tur_disc_presence_bubbles_a_no_sense_transport_failure() {
+        let wedge = Err(Error::ScsiError {
+            opcode: SCSI_TEST_UNIT_READY,
+            status: SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        });
+        let (r, calls) = presence(vec![wedge]);
+        assert!(r.is_err(), "no-sense failure must be an error, got {r:?}");
+        assert_eq!(calls, 1, "a wedge is not retried");
+    }
+
     // A UNIT ATTENTION says nothing about the medium, and several can be queued
     // (06/29 reset, then 06/28 medium change): re-issue TUR up to 4 times.
     #[test]

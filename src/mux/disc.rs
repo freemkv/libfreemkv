@@ -1803,6 +1803,85 @@ mod tests {
         );
     }
 
+    // Fast read fails at bad_sector (0x02); the recovery read returns `rec_err()`.
+    struct RecoveryErrReader {
+        bad_sector: u32,
+        rec_err: fn() -> crate::error::Error,
+    }
+
+    impl crate::sector::SectorSource for RecoveryErrReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if self.bad_sector >= lba && self.bad_sector < lba + count as u32 {
+                if recovery {
+                    return Err((self.rec_err)());
+                }
+                return Err(crate::error::Error::DiscRead {
+                    sector: self.bad_sector as u64,
+                    status: Some(0x02),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            10
+        }
+    }
+
+    // A key stop or dead source on the RECOVERY read must abort even under
+    // skip_errors, never be zero-filled as a skipped sector.
+    #[test]
+    fn key_stop_or_dead_source_on_recovery_read_aborts_even_with_skip_errors() {
+        type MkErr = fn() -> crate::error::Error;
+        let cases: [(&str, MkErr); 3] = [
+            ("NoDiscKey", || crate::error::Error::NoDiscKey {
+                disc_hash: String::new(),
+            }),
+            ("WholeDiscKeyMissing", || {
+                crate::error::Error::WholeDiscKeyMissing
+            }),
+            ("SourceTerminated", || crate::error::Error::SourceTerminated),
+        ];
+        for (name, rec_err) in cases {
+            let mut stream = DiscStream::new(
+                Box::new(RecoveryErrReader {
+                    bad_sector: 4,
+                    rec_err,
+                }),
+                synthetic_title(10),
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap();
+            stream.skip_errors = true;
+            let mut res = Ok(true);
+            for _ in 0..1000 {
+                res = stream.fill_extents();
+                if !matches!(res, Ok(true)) {
+                    break;
+                }
+            }
+            assert!(
+                res.is_err(),
+                "{name} on the recovery read must abort, got {res:?}"
+            );
+            assert_eq!(stream.errors, 0, "{name}: must not count as a skip");
+            assert_eq!(stream.lost_bytes, 0, "{name}: must not zero-fill");
+        }
+    }
+
     // Regression: a USB-bridge transport crash (0xFF) during a single-pass
     // disc://->mkv:// rip must ABORT immediately, even under skip_errors=true
     // — mirrors the multipass sweep's short-circuit; exactly one read issued.
@@ -3145,6 +3224,14 @@ mod tests {
                 b.streak_sectors, 0,
                 "the streak resets so the next probe needs a fresh clean run"
             );
+
+            // A failure mid-streak must reset it: no probe right after a failure.
+            let mut b = AdaptiveBatch::new(64);
+            b.on_failure();
+            b.on_success(30);
+            assert!(b.streak_sectors > 0);
+            b.on_failure();
+            assert_eq!(b.streak_sectors, 0, "a failure must reset the clean streak");
 
             // At the preferred size a clean run must NOT keep firing events.
             let mut b = AdaptiveBatch::new(64);

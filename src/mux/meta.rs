@@ -892,6 +892,70 @@ mod tests {
         }
     }
 
+    // Non-default pid / frame_rate / hdr / sample_rate must survive the header.
+    #[test]
+    fn pid_frame_rate_hdr_and_sample_rate_round_trip() {
+        use crate::disc::{AudioChannels, AudioStream, LabelPurpose, SampleRate};
+        let mut t = video_title(HdrFormat::DolbyVision, ColorSpace::Bt2020);
+        if let Stream::Video(v) = &mut t.streams[0] {
+            v.pid = 0x1012;
+            v.frame_rate = FrameRate::F59_94;
+        }
+        t.streams.push(Stream::Audio(AudioStream {
+            pid: 0x1101,
+            codec: Codec::Dts,
+            channels: AudioChannels::Surround51,
+            language: "eng".into(),
+            sample_rate: SampleRate::S96,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        let mut buf = Vec::new();
+        write_header(&mut buf, &M2tsMeta::from_title(&t)).unwrap();
+        let back = read_header(&mut io::Cursor::new(buf))
+            .unwrap()
+            .unwrap()
+            .to_title();
+        match &back.streams[0] {
+            Stream::Video(v) => {
+                assert_eq!(v.pid, 0x1012);
+                assert_eq!(v.frame_rate, FrameRate::F59_94);
+                assert_eq!(v.hdr, HdrFormat::DolbyVision);
+            }
+            _ => panic!("expected video stream"),
+        }
+        match &back.streams[1] {
+            Stream::Audio(a) => {
+                assert_eq!(a.pid, 0x1101);
+                assert_eq!(a.sample_rate, SampleRate::S96);
+            }
+            _ => panic!("expected audio stream"),
+        }
+    }
+
+    // Timing on a later track with default tracks before it: the index is
+    // taken before the default filter, so it must not shift onto track 0/1.
+    #[test]
+    fn timing_keeps_its_track_index_past_default_tracks() {
+        let t = video_title(HdrFormat::Sdr, ColorSpace::Bt709);
+        let timing = crate::pes::TrackTiming {
+            codec_delay_ns: 6_500_000,
+            seek_preroll_ns: 80_000_000,
+        };
+        let timings = [
+            crate::pes::TrackTiming::default(),
+            crate::pes::TrackTiming::default(),
+            timing,
+        ];
+        let mut buf = Vec::new();
+        write_header(&mut buf, &M2tsMeta::from_title(&t).with_timings(&timings)).unwrap();
+        let back = read_header(&mut io::Cursor::new(&buf)).unwrap().unwrap();
+        assert_eq!(back.timing(2), timing);
+        assert_eq!(back.timing(0), crate::pes::TrackTiming::default());
+        assert_eq!(back.timing(1), crate::pes::TrackTiming::default());
+    }
+
     #[test]
     fn read_header_caps_untrusted_timings() {
         let t = video_title(HdrFormat::Sdr, ColorSpace::Bt709);

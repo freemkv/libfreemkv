@@ -732,6 +732,24 @@ mod tests {
         assert_eq!(last, 300);
     }
 
+    /// Spec: past the u16 STN space both audio and sub stop emitting; the last
+    /// number is u16::MAX and none wraps to 0. Mutation: `as u16` cast → wrap.
+    #[test]
+    fn stream_numbers_stop_at_u16_max_on_audio_and_sub() {
+        let cells = vec!["eng"; u16::MAX as usize + 2].join(",");
+        let feature = format!(r#"<playlist name="Feature" aud="{cells}" sub="{cells}" />"#);
+        let labels = labels_from_feature(&feature);
+        let max = u16::MAX as usize;
+        for (kind, ls) in [("aud", audio(&labels)), ("sub", subs(&labels))] {
+            assert_eq!(ls.len(), max, "{kind}: cells past u16::MAX are dropped");
+            assert_eq!(ls[max - 1].stream_number, u16::MAX, "{kind}");
+            assert!(
+                ls.iter().all(|l| l.stream_number != 0),
+                "{kind}: no wrap to 0"
+            );
+        }
+    }
+
     /// Spec: a `forced_sub` cell with surrounding whitespace still classifies.
     /// Mutation: drop the `trim()` → " 3 " falls through to the unrecognised
     /// arm and the disc's forced-narrative track loses its label.
