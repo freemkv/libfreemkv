@@ -272,6 +272,12 @@ impl Drop for FixtureDir {
     }
 }
 
+thread_local! {
+    // The most recent fixture dir made on this thread, so tests can observe it.
+    static LAST_FIXTURE_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 // A fresh, empty directory for one fixture (removed once the image is read).
 fn fixture_dir() -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -279,6 +285,7 @@ fn fixture_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("libfreemkv-test-util-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("fixture dir");
+    LAST_FIXTURE_DIR.with(|d| *d.borrow_mut() = Some(dir.clone()));
     dir
 }
 

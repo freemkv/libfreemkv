@@ -159,13 +159,15 @@ fn decrypt_unit_inverts_encrypt_unit() {
 
 #[test]
 fn fixture_dir_removed_when_build_panics() {
-    let mut path = None;
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let d = FixtureDir(fixture_dir());
-        path = Some(d.0.clone());
-        panic!("fixture failure");
-    }));
+    let bad = [BdFile {
+        path: "AACS/Unit_Key_RO.inf/x".into(),
+        sectors: 3,
+        key: None,
+    }];
+    let r = std::panic::catch_unwind(|| encrypted_bd_image(&bad, &[0u8; 4]));
     assert!(r.is_err());
-    let path = path.expect("dir created");
-    assert!(!path.exists(), "fixture dir leaked: {}", path.display());
+    let dir = crate::test_util::LAST_FIXTURE_DIR
+        .with(|d| d.borrow().clone())
+        .expect("dir");
+    assert!(!dir.exists(), "fixture dir leaked: {}", dir.display());
 }
