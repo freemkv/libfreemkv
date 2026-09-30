@@ -332,10 +332,37 @@ const DETECT_IN_MEMORY_JAR_BYTES: u64 = CHUNK_SECTORS * 2048;
 /// True if any top-level `/BDMV/JAR/*.jar` has a central-directory entry starting
 /// with `prefix`: a framework detector that never reads entry data.
 pub fn any_jar_has_prefix(reader: &mut dyn SectorSource, udf: &UdfFs, prefix: &str) -> bool {
-    visit_jars_limited(reader, udf, DETECT_IN_MEMORY_JAR_BYTES, |_, jar| {
-        jar.filter(|j| has_path_prefix(j, prefix)).map(|_| ())
-    })
-    .is_some()
+    // A jar the in-place open cannot handle (unrecorded extent, ZIP64, odd tail) still
+    // detects through the whole-file read `for_each_jar` uses.
+    let mut unopened: Vec<String> = Vec::new();
+    let hit = visit_jars_limited(
+        reader,
+        udf,
+        DETECT_IN_MEMORY_JAR_BYTES,
+        |name, jar| match jar {
+            Some(j) => has_path_prefix(j, prefix).then_some(()),
+            None => {
+                unopened.push(name.to_string());
+                None
+            }
+        },
+    );
+    if hit.is_some() {
+        return true;
+    }
+    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
+        return false;
+    };
+    jar_dir
+        .entries
+        .iter()
+        .filter(|e| e.size <= IN_MEMORY_JAR_BYTES && unopened.contains(&e.name))
+        .any(|e| {
+            udf.read_file(reader, &format!("/BDMV/JAR/{}", e.name))
+                .ok()
+                .and_then(|b| ZipArchive::new(Cursor::new(b)).ok())
+                .is_some_and(|z| has_path_prefix(&z, prefix))
+        })
 }
 
 /// Iterate every `.class` entry, parse it with [`class_reader`](super::class_reader)
@@ -784,6 +811,65 @@ mod tests {
                 counting.1
             );
         }
+    }
+
+    // A large jar whose tail the in-place check rejects (EOCD comment length overruns
+    // the file's ZIP64 sizes) but the zip reader opens still detects, as via `for_each_jar`.
+    #[test]
+    fn framework_detect_falls_back_when_in_place_open_fails() {
+        use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("assets/bg.png", opts).expect("start_file");
+            w.write_all(&vec![0x5Au8; 100 * 1024]).expect("write");
+            w.start_file("com/dbp/B.class", opts).expect("start_file");
+            w.write_all(MINIMAL_CLASS).expect("write");
+            w.finish().expect("finish");
+        }
+        // Rewrite the tail as ZIP64: real sizes move to a ZIP64 EOCD + locator.
+        let eocd = buf.len() - 22;
+        let le32 = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let (cd_size, cd_offset) = (le32(eocd + 12) as u64, le32(eocd + 16) as u64);
+        let entries = u16::from_le_bytes([buf[eocd + 10], buf[eocd + 11]]) as u64;
+        let mut z64 = Vec::new();
+        z64.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        z64.extend_from_slice(&44u64.to_le_bytes());
+        z64.extend_from_slice(&45u16.to_le_bytes());
+        z64.extend_from_slice(&45u16.to_le_bytes());
+        z64.extend_from_slice(&[0u8; 8]); // disk numbers
+        for v in [entries, entries, cd_size, cd_offset] {
+            z64.extend_from_slice(&v.to_le_bytes());
+        }
+        z64.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        z64.extend_from_slice(&0u32.to_le_bytes());
+        z64.extend_from_slice(&(eocd as u64).to_le_bytes());
+        z64.extend_from_slice(&1u32.to_le_bytes());
+        buf[eocd + 12..eocd + 20].fill(0xFF);
+        buf.splice(eocd..eocd, z64);
+        assert!(ZipArchive::new(Cursor::new(buf.clone())).is_ok());
+        let dir = |name: &str, icb, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs,
+        };
+        let jar_dir = dir(
+            "JAR",
+            30,
+            vec![file_with("00000.jar", 32, 4000, buf, true)],
+            vec![],
+        );
+        let root = dir("", 10, vec![], vec![dir("BDMV", 20, vec![], vec![jar_dir])]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert!(super::super::dbp::detect(&mut disc, &udf));
     }
 
     // High-ratio deflate entries (each under the per-entry cap) stop being offered

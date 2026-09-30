@@ -741,8 +741,15 @@ impl<'a> BindingDecoder<'a> {
     /// `constructions` field holds the result.
     pub(crate) fn run(&mut self, code: &CodeAttribute<'_>) {
         self.max_stack = code.max_stack as usize;
+        let mut end = 0;
         for insn in code.instructions() {
+            end = insn.pc + 1 + insn.operands.len();
             self.step(insn);
+        }
+        // The iterator stops at an opcode it cannot size: the rest is never decoded.
+        if end < code.code.len() {
+            self.drift = self.drift.saturating_add(1);
+            tracing::debug!(pc = end, "deluxe: undecodable opcode ends the walk early");
         }
     }
 
@@ -1154,6 +1161,7 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
         let mut purpose_ord: Option<u16> = None;
         let mut coding_type: Option<String> = None;
         let mut slot: Option<CodingSlot> = None;
+        let mut unknown_coding: Option<String> = None;
         let mut stream_idx_hint: Option<i32> = None;
         for arg in &c.args {
             match arg {
@@ -1166,6 +1174,8 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
                     slot = coding_slot(name);
                     if slot == Some(CodingSlot::Audio) {
                         coding_type = Some(name.clone());
+                    } else if slot.is_none() {
+                        unknown_coding = Some(name.clone());
                     }
                 }
                 StackVal::Int(n) => {
@@ -1192,6 +1202,13 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             }
             continue;
         };
+
+        // An unrecognised CodingType name is not decisive: take the type from siblings.
+        if let (None, Some(name), Some(StreamLabelType::Audio)) =
+            (slot, unknown_coding, slot_kind(c, None, &slot_kinds))
+        {
+            coding_type = Some(name);
+        }
 
         // Audio when a CodingType is present (audio binding type
         // always references org.bluray.ti.CodingType); subtitle
@@ -1279,16 +1296,21 @@ fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabe
     for c in constructions {
         let mut has_lang = false;
         let mut slot = None;
+        let mut unknown = false;
         for arg in &c.args {
             match arg {
                 StackVal::EnumRef {
                     kind: "Language", ..
                 } => has_lang = true,
-                StackVal::CodingType(n) if slot.is_none() => slot = coding_slot(n),
+                StackVal::CodingType(n) if slot.is_none() => {
+                    slot = coding_slot(n);
+                    unknown |= slot.is_none();
+                }
                 _ => {}
             }
         }
-        if !has_lang || slot == Some(CodingSlot::NoSlot) {
+        // An unrecognised CodingType name says nothing about the list: not recorded.
+        if !has_lang || slot == Some(CodingSlot::NoSlot) || (slot.is_none() && unknown) {
             continue;
         }
         let kind = if slot == Some(CodingSlot::Audio) {
@@ -3414,6 +3436,54 @@ mod tests {
                 (StreamLabelType::Subtitle, "fra", 2),
             ]
         );
+    }
+
+    // An unrecognised CodingType name is not decisive: a resolved-language construction
+    // takes its list from its binding type's siblings, and records nothing itself.
+    #[test]
+    fn unknown_coding_type_takes_sibling_kind_and_is_not_recorded() {
+        let mk = |bt: &str, ct: &str, ordinal: u16| Construction {
+            binding_type: bt.into(),
+            args: vec![
+                StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal,
+                },
+                StackVal::CodingType(ct.into()),
+            ],
+        };
+        let cs = [
+            mk("T", "DTS_AUDIO", 0),
+            mk("T", "FUTURE_CODEC_X", 1),
+            mk("U", "FUTURE_CODEC_X", 2),
+        ];
+        assert!(!slot_kinds(&cs).contains_key("U"));
+        let out = interpret_streams(&cs[..2], &lang_enum_master());
+        let got: Vec<_> = out
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(StreamLabelType::Audio, 1), (StreamLabelType::Audio, 2)]
+        );
+    }
+
+    // Bytecode the iterator cannot size (a truncated ldc) ends the walk early: the rest
+    // goes undecoded, so it counts as drift.
+    #[test]
+    fn binding_decoder_counts_early_end_of_walk_as_drift() {
+        let code: Vec<u8> = vec![0x00, LDC]; // ldc lacks its operand
+        let pool = build_simple_pool();
+        let master = lang_enum_master();
+        let attr = super::super::class_reader::CodeAttribute {
+            max_stack: 4,
+            max_locals: 0,
+            code: &code,
+        };
+        let mut decoder = BindingDecoder::new(&pool, &master);
+        decoder.run(&attr);
+        assert_eq!(decoder.drift, 1);
     }
 
     #[test]
