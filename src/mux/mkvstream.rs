@@ -1172,7 +1172,7 @@ impl MkvStream {
                 ebml::SIMPLE_BLOCK => {
                     let block =
                         ebml::read_binary_val(&mut rs.reader, checked_size(size, MAX_BLOCK_SIZE)?)?;
-                    if rs.tracks.is_undecodable(&block) {
+                    if rs.tracks.is_undecodable(&block) || block_is_malformed(&block) {
                         rs.count_lost(size);
                         continue;
                     }
@@ -1280,7 +1280,10 @@ impl MkvStream {
                         rs.additions_dropped_bytes =
                             rs.additions_dropped_bytes.saturating_add(size);
                     }
-                    if block.as_ref().is_some_and(|b| rs.tracks.is_undecodable(b)) {
+                    if block
+                        .as_ref()
+                        .is_some_and(|b| rs.tracks.is_undecodable(b) || block_is_malformed(b))
+                    {
                         rs.count_lost(size);
                         continue;
                     }
@@ -1511,7 +1514,7 @@ impl crate::pes::Stream for MkvStream {
     }
 
     // Units dropped on read-back: `BlockAdditions` (e.g. a 3D MVC dependent view), Block-less
-    // BlockGroups and blocks of undecodable (encrypted) tracks. Reported like a disc-read
+    // BlockGroups, malformed blocks and blocks of undecodable tracks. Reported like a disc-read
     // skip: `0` for the write side / sources with none.
     fn errors(&self) -> u64 {
         match self.mode {
@@ -2722,7 +2725,7 @@ fn parse_block_raw(
         return Ok(Vec::new());
     }
     // Track 0 is invalid (RFC 9559 §5.1.4.1.1: "range: not 0"). block_vint also
-    // returns 0 for an unsupported 5+ byte VINT, so a corrupt/zero-track block
+    // returns 0 for an undecodable VINT, so a corrupt/zero-track block
     // must be skipped rather than attributed to the first stream.
     if track == 0 {
         return Ok(Vec::new());
@@ -2820,32 +2823,18 @@ fn parse_block_raw(
     Ok(out)
 }
 
+// Block TrackNumber VINT (1..=8 octets); `(0, 1)` for an undecodable one, `(0, 0)` when empty.
 fn block_vint(d: &[u8]) -> (u64, usize) {
     if d.is_empty() {
         return (0, 0);
     }
-    if d[0] & 0x80 != 0 {
-        return ((d[0] & 0x7F) as u64, 1);
-    }
-    if d[0] & 0x40 != 0 && d.len() >= 2 {
-        return ((((d[0] & 0x3F) as u64) << 8) | d[1] as u64, 2);
-    }
-    if d[0] & 0x20 != 0 && d.len() >= 3 {
-        return (
-            (((d[0] & 0x1F) as u64) << 16) | ((d[1] as u64) << 8) | d[2] as u64,
-            3,
-        );
-    }
-    if d[0] & 0x10 != 0 && d.len() >= 4 {
-        return (
-            (((d[0] & 0x0F) as u64) << 24)
-                | ((d[1] as u64) << 16)
-                | ((d[2] as u64) << 8)
-                | d[3] as u64,
-            4,
-        );
-    }
-    (0, 1) // Unsupported 5+ byte VINT — treat as track 0
+    lace_vint(d).unwrap_or((0, 1))
+}
+
+// A (Simple)Block too short for its header or naming TrackNumber 0: never a frame.
+fn block_is_malformed(block: &[u8]) -> bool {
+    let (track, vl) = block_vint(block);
+    block.len() < 4 || track == 0 || vl + 3 > block.len()
 }
 
 #[cfg(test)]
@@ -3969,10 +3958,10 @@ mod tests {
         // A 2-byte marker but only 1 byte available falls through to the
         // catch-all (0, 1) — treated as track 0 (skipped by parse_block).
         assert_eq!(block_vint(&[0x40]), (0, 1));
-        // A 5+ byte VINT (0x08 marker) is unsupported → (0, 1), so the block
-        // is skipped rather than mis-decoded.
-        assert_eq!(block_vint(&[0x08, 0, 0, 0, 0]), (0, 1));
-        // 0x00 first byte: no marker in bits 7..4 → unsupported → (0, 1).
+        // 5..=8-octet VINTs decode (RFC 8794); a 0-valued one is track 0 (skipped).
+        assert_eq!(block_vint(&[0x08, 0, 0, 0, 0]), (0, 5));
+        assert_eq!(block_vint(&[0x01, 0, 0, 0, 0, 0, 0, 7]), (7, 8));
+        // 0x00 first byte: wider than 8 octets → unsupported → (0, 1).
         assert_eq!(block_vint(&[0x00, 0x11]), (0, 1));
     }
 
@@ -7477,6 +7466,42 @@ mod readback_tests {
         for bad in [f64::NAN, f64::INFINITY, -1.0] {
             assert_eq!(probe_info(&duration(bad)).duration_secs, None, "{bad}");
         }
+    }
+
+    fn cluster_of(blocks: &[&[u8]]) -> Vec<u8> {
+        let mut c = el(ebml::CLUSTER, &[]);
+        c.truncate(c.len() - 1);
+        ebml::write_unknown_size(&mut c).unwrap();
+        c.extend(uint(ebml::CLUSTER_TIMESTAMP, 0));
+        for b in blocks {
+            c.extend(el(ebml::SIMPLE_BLOCK, b));
+        }
+        c
+    }
+
+    #[test]
+    fn a_long_form_track_number_vint_is_decoded() {
+        let block = [0x08, 0, 0, 0, 1, 0x00, 0x00, 0x80, 0xAB];
+        let bytes = mkv(&[entry(1, 2, ebml::CODEC_AC3, &[])], &cluster_of(&[&block]));
+        let frames = drain_all(&mut open(bytes));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, [0xAB]);
+    }
+
+    #[test]
+    fn a_malformed_block_is_counted_not_silently_skipped() {
+        let bytes = mkv(
+            &[entry(1, 2, ebml::CODEC_AC3, &[])],
+            &cluster_of(&[
+                &[0x81, 0x00],
+                &[0x80, 0, 0, 0x80, 1],
+                &[0x81, 0, 0, 0x80, 2],
+            ]),
+        );
+        let mut s = open(bytes);
+        assert_eq!(drain_all(&mut s).len(), 1);
+        assert_eq!(s.errors(), 2);
+        assert_eq!(s.lost_bytes(), 7);
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
