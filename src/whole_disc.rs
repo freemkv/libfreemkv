@@ -9,7 +9,8 @@ use crate::error::{Error, Result};
 use crate::sector::{DecryptingSectorSource, SectorSource};
 
 /// Sectors in one AACS aligned unit (6144 bytes).
-pub(crate) const UNIT: u64 = (crate::aacs::content::ALIGNED_UNIT_LEN / 2048) as u64;
+pub(crate) const UNIT: u64 =
+    (crate::aacs::content::ALIGNED_UNIT_LEN / crate::consts::SECTOR_BYTES) as u64;
 
 /// Units probed per unplayed content file: its first unit, then evenly across it.
 const PROBES: u64 = 32;
@@ -68,17 +69,28 @@ pub(crate) fn content_files_in(
     for path in paths {
         let mut extents: Vec<(u32, u32)> = Vec::new();
         for (lba, n) in fs.file_extents(reader, &path)? {
-            match extents.last_mut() {
-                Some(last) if n > 0 && last.0 as u64 + last.1 as u64 == lba as u64 => last.1 += n,
-                _ if n > 0 => extents.push((lba, n)),
-                _ => {}
-            }
+            push_extent(&mut extents, lba, n);
         }
         if !extents.is_empty() {
             files.push(extents);
         }
     }
     Ok(files)
+}
+
+// Append `(lba, n)`, joining it to a contiguous last extent unless the count would overflow.
+fn push_extent(extents: &mut Vec<(u32, u32)>, lba: u32, n: u32) {
+    if n == 0 {
+        return;
+    }
+    let joined = extents.last_mut().and_then(|last| {
+        let sum = last.1.checked_add(n)?;
+        (last.0 as u64 + last.1 as u64 == lba as u64).then(|| last.1 = sum)
+    });
+    if joined.is_some() {
+        return;
+    }
+    extents.push((lba, n));
 }
 
 /// A content extent `(start, count)` and the LBA its unit grid is anchored at: the
@@ -227,11 +239,10 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
-        const SECTOR: usize = 2048;
         let end = lba as u64 + count as u64;
         let mut cur = lba as u64;
         while cur < end {
-            let off = (cur - lba as u64) as usize * SECTOR;
+            let off = (cur - lba as u64) as usize * crate::consts::SECTOR_BYTES;
             let Some((s, n, anchor)) = span_at(&self.spans, cur) else {
                 // Outside every content span: a plain read up to the next span.
                 let i = self.spans.partition_point(|&(s, _, _)| s as u64 <= cur);
@@ -239,7 +250,7 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
                     .spans
                     .get(i)
                     .map_or(end, |&(s, _, _)| end.min(s as u64));
-                let want = (next - cur) as usize * SECTOR;
+                let want = (next - cur) as usize * crate::consts::SECTOR_BYTES;
                 self.inner.set_unit_base(cur as u32);
                 let got = self.inner.read_sectors_fua(
                     cur as u32,
@@ -263,7 +274,7 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
             // Capped so the widened read still fits one u16-count request.
             let piece_end = end.min(e).min(a0 + (u16::MAX as u64 / UNIT - 1) * UNIT);
             let a1 = e.min(a0 + (piece_end - a0).div_ceil(UNIT) * UNIT);
-            let len = (a1 - a0) as usize * SECTOR;
+            let len = (a1 - a0) as usize * crate::consts::SECTOR_BYTES;
             self.scratch.resize(len, 0);
             self.inner.set_unit_base(a0 as u32);
             let got = self.inner.read_sectors_fua(
@@ -273,8 +284,8 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
                 recovery,
                 fua,
             )?;
-            let skip = (cur - a0) as usize * SECTOR;
-            let want = (piece_end - cur) as usize * SECTOR;
+            let skip = (cur - a0) as usize * crate::consts::SECTOR_BYTES;
+            let want = (piece_end - cur) as usize * crate::consts::SECTOR_BYTES;
             let have = got.saturating_sub(skip).min(want);
             buf[off..off + have].copy_from_slice(&self.scratch[skip..skip + have]);
             if have < want {
@@ -282,7 +293,7 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
             }
             cur = piece_end;
         }
-        Ok(count as usize * SECTOR)
+        Ok(count as usize * crate::consts::SECTOR_BYTES)
     }
 
     fn set_speed(&mut self, kbs: u16) {

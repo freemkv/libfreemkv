@@ -174,6 +174,24 @@ fn unit_aligned_widens_reads_onto_each_files_grid() {
 }
 
 #[test]
+fn unit_aligned_propagates_inner_read_errors_on_both_paths() {
+    let mut r = reader(vec![(100, 30, 100)]);
+    r.inner.fail = Some(|| Error::Halted);
+    let mut buf = vec![0u8; 3 * 2048];
+    // Outside every span: plain read path.
+    assert!(matches!(
+        r.read_sectors(10, 3, &mut buf, false),
+        Err(Error::Halted)
+    ));
+    // Inside a span: unit-widened path.
+    assert!(matches!(
+        r.read_sectors(101, 3, &mut buf, false),
+        Err(Error::Halted)
+    ));
+    assert_eq!(r.inner.reads, vec![(10, 3), (100, 6)]);
+}
+
+#[test]
 fn unit_aligned_refuses_a_unit_split_across_extents() {
     let mut r = reader(vec![(100, 4, 100), (300, 5, 299)]);
     let mut buf = vec![0u8; 2048];
@@ -352,4 +370,15 @@ fn raw_whole_disc_reader_passes_every_sector_through() {
         lba += n;
     }
     assert!(buf == image, "a raw read returns the image unchanged");
+}
+
+#[test]
+fn push_extent_does_not_overflow_count() {
+    let mut e = vec![(0u32, u32::MAX - 1)];
+    push_extent(&mut e, u32::MAX - 1, 5);
+    assert_eq!(e, vec![(0, u32::MAX - 1), (u32::MAX - 1, 5)]);
+    let mut e = vec![(10u32, 4)];
+    push_extent(&mut e, 14, 6);
+    push_extent(&mut e, 20, 0);
+    assert_eq!(e, vec![(10, 10)]);
 }
