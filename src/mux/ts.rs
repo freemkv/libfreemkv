@@ -362,8 +362,8 @@ impl TsDemuxer {
         // Aligned-packets fast path — reads directly out of `data`.
         while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
             if data[offset + 4] != SYNC_BYTE {
-                // Lost sync (a byte slip): the next corroborated packet boundary, the aligned
-                // one first. Lost packets surface as CC gaps on their PIDs.
+                // No sync byte: a zero-filled gap or a byte slip. Packets lost in a slip
+                // surface as CC gaps on their PIDs.
                 offset = self.resync(data, offset);
                 continue;
             }
@@ -392,19 +392,25 @@ impl TsDemuxer {
         completed
     }
 
-    // Offset of the next credible packet boundary after the unsynced `offset`, or the end.
+    // Next packet start after the unsynced `offset`: the first grid slot with a sync byte
+    // (zero-filled gaps keep the grid), or an off-grid point corroborated by a second sync
+    // 192 bytes on (a byte slip). With neither, the last grid slot, so alignment carries over.
     fn resync(&mut self, data: &[u8], offset: usize) -> usize {
-        if !self.sync_lost_logged {
-            self.sync_lost_logged = true;
-            tracing::warn!(target: "mux", offset, "bd-ts: lost packet sync; resyncing");
+        let step = BD_SOURCE_PACKET_BYTES;
+        for p in offset + 1..data.len().saturating_sub(4) {
+            if (p - offset).is_multiple_of(step) {
+                if data[p + 4] == SYNC_BYTE {
+                    return p;
+                }
+            } else if data[p + 4] == SYNC_BYTE && data.get(p + step + 4) == Some(&SYNC_BYTE) {
+                if !self.sync_lost_logged {
+                    self.sync_lost_logged = true;
+                    tracing::warn!(target: "mux", offset = p, "bd-ts: packet sync slipped; resynced");
+                }
+                return p;
+            }
         }
-        let aligned = offset + BD_SOURCE_PACKET_BYTES;
-        if aligned + BD_SOURCE_PACKET_BYTES <= data.len() && is_resync_point(data, aligned) {
-            return aligned;
-        }
-        (offset + 1..data.len())
-            .find(|&p| is_resync_point(data, p))
-            .unwrap_or(data.len())
+        offset + (data.len() - offset) / step * step
     }
 
     // Demux a single 192-byte BD-TS packet (4-byte TP_extra_header + 188-byte
@@ -1151,6 +1157,23 @@ mod tests {
         assert!(out[0].data.starts_with(b"AAAA"));
         assert!(out[0].data[175..].starts_with(b"BBBB"), "continuation kept");
         assert!(out[1].data.starts_with(b"CCCC"));
+    }
+
+    // Zero-filled gaps (unreadable sectors) keep the packet grid: a lone packet after one
+    // is still read, without a second packet to corroborate it.
+    #[test]
+    fn lone_packets_between_zero_filled_gaps_are_kept() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut data = vec![0u8; 5 * BD_SOURCE_PACKET_BYTES];
+        data.extend(ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        data.extend(vec![0u8; 3 * BD_SOURCE_PACKET_BYTES]);
+        data.extend(ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")));
+        data.extend(vec![0u8; 2 * BD_SOURCE_PACKET_BYTES]);
+        let mut out = demux.feed(&data);
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[1].data.starts_with(b"BBBB"));
     }
 
     // A packet flagged transport_error_indicator is damaged: its PES is dropped, not
