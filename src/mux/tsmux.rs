@@ -19,14 +19,14 @@ use crate::consts::TS_PAYLOAD_BYTES;
 /// PID range treated as video (HEVC, triggers Annex-B conversion + RAI
 /// on keyframes). Both `write_frame` and `build_pes_header` consult this
 /// so a PID's stream_id and its NAL handling can never disagree.
-const VIDEO_PID_RANGE: std::ops::RangeInclusive<u16> = 0x1011..=0x101F;
+pub(crate) const VIDEO_PID_RANGE: std::ops::RangeInclusive<u16> = 0x1011..=0x101F;
 
 // Largest PES payload that fits a bounded `PES_packet_length` (u16) on a
 // `0xBD` stream after the 8 PES-header bytes. Frames larger than this split
 // into multiple PES (unbounded `0` length is video-only).
 const MAX_BD_PES_PAYLOAD: usize = u16::MAX as usize - 8;
 
-fn is_video_pid(pid: u16) -> bool {
+pub(crate) fn is_video_pid(pid: u16) -> bool {
     VIDEO_PID_RANGE.contains(&pid)
 }
 
