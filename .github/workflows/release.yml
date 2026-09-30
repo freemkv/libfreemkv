@@ -11,13 +11,14 @@ on:
       - '!v*-rc*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - name: Verify Cargo.toml version matches tag
         run: |
           CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
@@ -28,23 +29,24 @@ jobs:
           echo "Version match: $CARGO_VER"
 
   # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
-  # publish/release jobs do NOT `needs:` this job. The tag decision was already
+  # release job does NOT `needs:` this job. The tag decision was already
   # gated by CI (ci.yml on dev, then a green qa.yml on the same commit). Binary consumers
   # (freemkv/autorip/bdemu) git-tag-pin libfreemkv and therefore start building
-  # the instant this tag exists — so this test job and the crates.io publish
-  # below must NOT sit on their critical path.
+  # the instant this tag exists — so this test job must NOT sit on their
+  # critical path.
   test:
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ steps.msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Cargo.lock is now committed (issue #15), but --locked is still omitted:
       # the sibling path-patch layout resolves the freemkv crates as path
       # packages, which --locked can't satisfy.
@@ -58,12 +60,15 @@ jobs:
 
   release:
     # Only needs `verify`; the GitHub Release can be cut as soon as the version
-    # check passes, in parallel with test + publish.
+    # check passes, in parallel with test.
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true

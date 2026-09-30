@@ -1,8 +1,11 @@
 version: 2
 
+# NOTE: the cargo updater cannot resolve the out-of-repo `freemkv-unlock` path
+# dep on dev, so it opens no PRs; advisory coverage there is cargo-deny (ci.yml).
+#
 # Dependency updates land on `dev`, never on `main`.
 #
-# `main` here is a RELEASE POINTER that release.sh moves to each tag. A bot
+# `main` here is a RELEASE POINTER that moves to each tag. A bot
 # commit on it would put work there that no tag contains, which is exactly the
 # state that aborted the 1.6.2 cascade at the last step -- so pointing
 # Dependabot at main would recreate that failure on a schedule.
@@ -23,7 +26,7 @@ updates:
           - patch
     ignore:
       # The freemkv crates depend on each other by GIT TAG, re-pinned by
-      # release.sh as part of the release commit. Dependabot cannot see that
+      # release-orchestrate.yml as part of the release commit. Dependabot cannot see that
       # cascade, so a PR bumping one of these would fight the release process
       # and could pin a version whose tag does not exist yet.
       - dependency-name: freemkv-unlock
@@ -49,8 +52,8 @@ updates:
     ignore:
       # NOT a dependency: `dtolnay/rust-toolchain` is versioned by the RUST
       # release it installs, and the tag we pin is the toolchain CI is pinned
-      # to on purpose -- precommit.sh runs the same one locally so a lint that
-      # passes on a developer's newer default cannot pass CI by accident.
+      # to on purpose, so a lint that passes on a newer default cannot pass CI
+      # by accident.
       #
       # Dependabot reads those tags as semver and proposed 1.97.0 -> 1.100.0,
       # a Rust version that does not exist. Every such PR 404s on toolchain
@@ -59,5 +62,5 @@ updates:
       # decides whether dev is green.
       #
       # Bumping the toolchain is a deliberate, all-eight-repos change, made by
-      # hand together with precommit.sh. There is nothing here for a bot.
+      # hand. There is nothing here for a bot.
       - dependency-name: dtolnay/rust-toolchain

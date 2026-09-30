@@ -42,8 +42,7 @@ pub trait SectorSource: Send {
         buf: &mut [u8],
         recovery: bool,
     ) -> Result<usize>;
-    // Enforced via `debug_assert!` in the primary impl (`FileSectorSource`);
-    // release builds panic on the out-of-bounds slice instead.
+    // `FileSectorSource` checks this and returns `DiscRead` instead of panicking.
 
     /// Like [`read_sectors`], but with an explicit Force Unit Access request.
     ///

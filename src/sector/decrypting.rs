@@ -240,6 +240,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                 .unit_base
                 .is_some_and(|b| crate::aacs::content::is_unit_aligned(lba, b))
         {
+            tracing::warn!(target: "freemkv::decrypt", lba, base = ?self.unit_base, "AACS content read off the unit grid");
             return Err(crate::error::Error::DecryptFailed);
         }
         let n = self

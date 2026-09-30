@@ -9,8 +9,9 @@ version = 1
 # Rust sources, documentation, configuration, workflows, scripts, binary assets,
 # and the byte-exact `.golden` test fixtures — is covered here instead.
 #
-# The whole repository is the project's own work under the MIT licence; there is
-# no third-party vendored source here.
+# The repository is the project's own work under the MIT licence, except the
+# MPEG audio ISO reference tables under src/mux/codec/testdata/dist10, which are
+# test data derived from that reference software and covered here for lint only.
 
 [[annotations]]
 path = [
@@ -35,6 +36,12 @@ path = [
     "Makefile",
     "LICENSE",
     "build.rs",
+    "**/*.c",
+    "**/*.mp2",
+    "**/*.class",
+    "**/PROVENANCE",
+    "**/testdata/dist10/alloc_*",
+    "tests/*.txt",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Matthew Jackson & Contributors"
