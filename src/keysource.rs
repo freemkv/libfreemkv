@@ -368,6 +368,7 @@ pub trait KeySource {
 /// candidate against.
 /// Lives in the library, not a key-source crate: carving units is decryption *mechanism*.
 /// "Encrypted" is the AACS CPI (`buf[0] & 0xc0`), NOT the `is_clean` TS-sync heuristic.
+/// A Stop ends sampling early with the partial set; callers must check their own `Halt`.
 pub fn read_encrypted_units(
     reader: &mut dyn crate::sector::SectorSource,
     title: &crate::disc::DiscTitle,
@@ -381,6 +382,9 @@ pub fn read_encrypted_units(
     const PROBES_PER_EXTENT: u32 = 8;
 
     let mut out: Vec<Vec<u8>> = Vec::new();
+    if n == 0 {
+        return out;
+    }
     for ext in &title.extents {
         let total_units = ext.sector_count / ALIGNED_UNIT_SECTORS;
         if total_units == 0 {
@@ -410,8 +414,11 @@ pub fn read_encrypted_units(
             // `false` = no recovery retries; reader is the raw drive/file (no
             // decrypt decorator). A read error skips only THAT probe — it must not
             // abandon the rest of the extent (the old `break` blinded the sampler).
-            if reader.read_sectors(lba, count, &mut buf, false).is_err() {
-                continue;
+            match reader.read_sectors(lba, count, &mut buf, false) {
+                Ok(_) => {}
+                // A Stop ends sampling: every remaining probe would only re-hit the drive.
+                Err(crate::error::Error::Halted) => return out,
+                Err(_) => continue,
             }
             for i in 0..units_this as usize {
                 let o = i * ALIGNED_UNIT_LEN;
@@ -526,12 +533,127 @@ mod tests {
         assert_eq!(ctx.mkb().unwrap(), &[1, 2, 3]);
         assert_eq!(ctx.enc_title_keys().unwrap(), &[key_bytes]);
         assert_eq!(ctx.samples(2).unwrap().len(), 2, "samples truncates to n");
+        assert_eq!(ctx.unit_key_ro(), &inputs.unit_key_ro[..]);
 
         // Non-zero VID → Some(vid).
         let mut inputs2 = inputs.clone();
         inputs2.volume_id = [0x42u8; 16];
         let ctx2 = DiscInputsCtx::new(&inputs2);
         assert_eq!(ctx2.vid(), Some(Vid([0x42u8; 16])));
+    }
+
+    // The documented contract: garbage Unit_Key_RO parses to no keys, not an error.
+    #[test]
+    fn malformed_unit_key_ro_yields_an_empty_key_set() {
+        for garbage in [vec![0xFFu8; 7], vec![0xFF; 96], vec![0u8; 3]] {
+            let mut inputs = empty_inputs();
+            inputs.unit_key_ro = garbage;
+            let ctx = DiscInputsCtx::new(&inputs);
+            assert!(ctx.enc_title_keys().unwrap().is_empty());
+        }
+    }
+
+    // A source scripted per read: `Ok` fills every unit CPI-set; errors are by call index.
+    struct ScriptedSource {
+        calls: Vec<u32>,
+        fail: fn(usize) -> Option<crate::error::Error>,
+    }
+    impl crate::sector::SectorSource for ScriptedSource {
+        fn capacity_sectors(&self) -> u32 {
+            u32::MAX
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _r: bool,
+        ) -> crate::error::Result<usize> {
+            self.calls.push(lba);
+            if let Some(e) = (self.fail)(self.calls.len() - 1) {
+                return Err(e);
+            }
+            let bytes = count as usize * 2048;
+            for c in buf[..bytes].chunks_mut(crate::aacs::content::ALIGNED_UNIT_LEN) {
+                c.fill(0xAB);
+                c[0] = 0xC0;
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn title_at(start_lba: u32, units: u32) -> crate::disc::DiscTitle {
+        crate::disc::DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![crate::disc::Extent {
+                start_lba,
+                sector_count: units * crate::aacs::content::ALIGNED_UNIT_SECTORS,
+            }],
+            content_format: crate::disc::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    // An ordinary read error skips that probe only; a Stop ends sampling at once.
+    #[test]
+    fn read_encrypted_units_skips_errors_but_stops_on_halt() {
+        let title = title_at(1000, 600);
+        let mut src = ScriptedSource {
+            calls: Vec::new(),
+            fail: |i| {
+                (i == 0).then_some(crate::error::Error::DiscRead {
+                    sector: 0,
+                    status: None,
+                    sense: None,
+                })
+            },
+        };
+        let got = read_encrypted_units(&mut src, &title, 3);
+        assert_eq!(got.len(), 3, "later probes still sampled after one error");
+
+        let mut src = ScriptedSource {
+            calls: Vec::new(),
+            fail: |_| Some(crate::error::Error::Halted),
+        };
+        let got = read_encrypted_units(&mut src, &title, 3);
+        assert!(got.is_empty());
+        assert_eq!(src.calls.len(), 1, "no probe after Halted");
+    }
+
+    // `n == 0` reads nothing and returns nothing.
+    #[test]
+    fn read_encrypted_units_zero_wanted_reads_nothing() {
+        let mut src = ScriptedSource {
+            calls: Vec::new(),
+            fail: |_| None,
+        };
+        assert!(read_encrypted_units(&mut src, &title_at(1000, 600), 0).is_empty());
+        assert!(src.calls.is_empty());
+    }
+
+    // Extent LBAs are untrusted: near u32::MAX the arithmetic saturates, never panics.
+    #[test]
+    fn read_encrypted_units_saturates_lba_near_u32_max() {
+        let mut src = ScriptedSource {
+            calls: Vec::new(),
+            fail: |_| {
+                Some(crate::error::Error::DiscRead {
+                    sector: 0,
+                    status: None,
+                    sense: None,
+                })
+            },
+        };
+        let title = title_at(u32::MAX - 10, 600);
+        assert!(read_encrypted_units(&mut src, &title, 3).is_empty());
+        assert!(!src.calls.is_empty());
+        assert!(src.calls.iter().all(|&l| l >= u32::MAX - 10));
     }
 
     // ── fetch_unit_keys (the one shared fetch path) ───────────────────────────

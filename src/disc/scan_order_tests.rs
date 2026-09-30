@@ -256,6 +256,11 @@ fn bd_disc(aacs: Option<bool>) -> MemDisc {
     mem
 }
 
+// A drive over an unencrypted BD that scans successfully.
+pub(crate) fn scannable_drive() -> Drive {
+    Rig::new(bd_disc(None), |_| {}).drive
+}
+
 struct Rig {
     drive: Drive,
     log: Log,
