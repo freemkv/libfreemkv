@@ -517,7 +517,7 @@ fn parse_tt_srpt(
 
 // ── VTS parser ──────────────────────────────────────────────────────────────
 
-/// Parse VTS_XX_0.IFO for one title set.
+/// Parse VTS_XX_0.IFO for one title set, falling back to its VTS_XX_0.BUP copy.
 ///
 /// `titles_info` is a list of (chapter_count, vts_title_number) from TT_SRPT.
 fn parse_vts(
@@ -527,7 +527,34 @@ fn parse_vts(
     titles_info: &[(u16, u8)],
 ) -> Result<DvdTitleSet> {
     let path = format!("/VIDEO_TS/VTS_{vts_number:02}_0.IFO");
-    let vts_data = udf.read_file(reader, &path)?;
+    let err = match parse_vts_file(reader, udf, &path, &path, vts_number, titles_info) {
+        Ok(ts) => return Ok(ts),
+        Err(Error::Halted) => return Err(Error::Halted),
+        Err(e) => e,
+    };
+    let bup = format!("/VIDEO_TS/VTS_{vts_number:02}_0.BUP");
+    match parse_vts_file(reader, udf, &bup, &path, vts_number, titles_info) {
+        Ok(ts) => {
+            tracing::warn!(target: "freemkv::scan", vts = vts_number, code = err.code(), "VTS IFO bad; using BUP");
+            Ok(ts)
+        }
+        Err(Error::Halted) => Err(Error::Halted),
+        Err(_) => Err(err),
+    }
+}
+
+// Parses the IFO bytes at `src` (IFO or BUP). Cell sectors are relative to the IFO's LBA, so
+// `ifo_path` anchors the title VOBS even when the bytes come from the BUP.
+fn parse_vts_file(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    src: &str,
+    ifo_path: &str,
+    vts_number: u8,
+    titles_info: &[(u16, u8)],
+) -> Result<DvdTitleSet> {
+    let path = ifo_path;
+    let vts_data = udf.read_file(reader, src)?;
 
     // Validate VTS magic
     if vts_data.len() < 12 || &vts_data[0..12] != VTS_MAGIC {
@@ -552,7 +579,7 @@ fn parse_vts(
     // are relative to (offset 0xC0/`vtsm_vobs` is the *menu* VOBS, not the movie).
     // It's relative to this IFO file, so rebase by the IFO's on-disc LBA (UDF FS).
     let vtstt_vobs = be_u32(&vts_data, VTSTT_VOBS_OFFSET)?;
-    let ifo_lba = udf.file_start_lba(reader, &path)?;
+    let ifo_lba = udf.file_start_lba(reader, path)?;
     let vob_start_sector = ifo_lba.saturating_add(vtstt_vobs);
 
     // Video attributes at offset 0x200 (2 bytes)

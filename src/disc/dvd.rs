@@ -5,6 +5,17 @@ use crate::ifo;
 use crate::sector::SectorSource;
 use crate::udf;
 
+// Reads and parses a VMG copy (VIDEO_TS.IFO or .BUP), returning its bytes for dvdnav reuse.
+fn load_vmg(
+    reader: &mut dyn SectorSource,
+    udf_fs: &udf::UdfFs,
+    path: &str,
+) -> Result<(Vec<u8>, ifo::DvdInfo)> {
+    let bytes = udf_fs.read_file(reader, path)?;
+    let info = ifo::parse_vmg_with(reader, udf_fs, Some(&bytes))?;
+    Ok((bytes, info))
+}
+
 impl Disc {
     // Scan DVD titles; a cancelled read is Err(Error::Halted), never an empty list. Also
     // returns the nav-resolved main feature, or None.
@@ -19,23 +30,24 @@ impl Disc {
         // Read VIDEO_TS.IFO once and reuse for both the VMG parse and the nav
         // resolver below; otherwise the VTS reads in parse_vmg evict the single
         // sector-cache window, forcing a duplicate physical read of the same file.
-        let vmg_bytes = match udf_fs.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO") {
-            Ok(bytes) => bytes,
+        let (vmg_bytes, dvd_info) = match load_vmg(reader, udf_fs, "/VIDEO_TS/VIDEO_TS.IFO") {
+            Ok(v) => v,
             Err(Error::Halted) => return Err(Error::Halted),
-            // No IFO at all: a VIDEO_TS dir with nothing to enumerate, not a fault.
-            Err(Error::UdfNotFound { .. }) => return Ok((Vec::new(), None)),
-            Err(e) => {
-                tracing::warn!(target: "freemkv::scan", code = e.code(), "dvd: VIDEO_TS.IFO unreadable");
-                return Err(e);
-            }
-        };
-        let dvd_info = match ifo::parse_vmg_with(reader, udf_fs, Some(&vmg_bytes)) {
-            Ok(info) => info,
-            Err(Error::Halted) => return Err(Error::Halted),
-            Err(e) => {
-                tracing::warn!(target: "freemkv::scan", code = e.code(), "dvd: VIDEO_TS.IFO parse failed");
-                return Err(e);
-            }
+            Err(ifo_err) => match load_vmg(reader, udf_fs, "/VIDEO_TS/VIDEO_TS.BUP") {
+                Ok(v) => {
+                    tracing::warn!(target: "freemkv::scan", code = ifo_err.code(), "dvd: VIDEO_TS.IFO bad; using BUP");
+                    v
+                }
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(bup_err) => {
+                    // Neither copy usable: nothing to enumerate (a missing pair is not a fault).
+                    let missing = |e: &Error| matches!(e, Error::UdfNotFound { .. });
+                    if !(missing(&ifo_err) && missing(&bup_err)) {
+                        tracing::warn!(target: "freemkv::scan", ifo = ifo_err.code(), bup = bup_err.code(), "dvd: VIDEO_TS.IFO and BUP unusable");
+                    }
+                    return Ok((Vec::new(), None));
+                }
+            },
         };
 
         // Follow the disc's First-Play navigation like a player would, to find the
@@ -2026,24 +2038,42 @@ mod tests {
         assert_eq!(t.chapters[0].name, "1");
     }
 
-    // An IFO that exists but does not parse is an error, not an empty disc.
-    #[test]
-    fn scan_dvd_titles_garbage_ifo_is_an_error() {
+    // VIDEO_TS / VTS IFOs are garbage or real, BUPs are garbage or real.
+    fn scan_ifo_bup(ifo_ok: bool, bup_ok: bool) -> Result<Vec<DiscTitle>> {
         let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        let vts = build_vts_cells(1000, 0x00, &[(0, 99, 0x00, 0x10)], &[1]);
+        let pick = |ok: bool, good: &Vec<u8>| if ok { good.clone() } else { vec![0x55; 4096] };
+        let spec = |name: &str, icb_lba, data_lba, contents| FileSpec {
+            name: name.into(),
+            icb_lba,
+            data_lba,
+            contents,
+        };
         let udf = build_video_ts_fs(
             &mut disc,
-            &[FileSpec {
-                name: "VIDEO_TS.IFO".into(),
-                icb_lba: 60,
-                data_lba: 5000,
-                contents: vec![0x55; 4096],
-            }],
+            &[
+                spec("VIDEO_TS.IFO", 60, 5000, pick(ifo_ok, &vmg)),
+                spec("VTS_01_0.IFO", 62, 6000, pick(ifo_ok, &vts)),
+                spec("VIDEO_TS.BUP", 64, 7000, pick(bup_ok, &vmg)),
+                spec("VTS_01_0.BUP", 66, 8000, pick(bup_ok, &vts)),
+            ],
         );
-        let res = Disc::scan_dvd_titles(&mut disc, &udf, None);
-        assert!(
-            matches!(res, Err(crate::error::Error::IfoParse)),
-            "{:?}",
-            res.map(|r| r.0.len())
-        );
+        Disc::scan_dvd_titles(&mut disc, &udf, None).map(|r| r.0)
+    }
+
+    // A bad IFO falls back to its BUP; VOBs stay anchored at the IFO's own LBA.
+    #[test]
+    fn scan_dvd_titles_bad_ifo_uses_bup() {
+        let good = scan_ifo_bup(true, false).expect("good ifo");
+        let bup = scan_ifo_bup(false, true).expect("bup");
+        assert_eq!(bup.len(), 1);
+        assert_eq!(bup[0].extents[0].start_lba, good[0].extents[0].start_lba);
+    }
+
+    // IFO and BUP both bad: no titles, not a scan error (base behaviour).
+    #[test]
+    fn scan_dvd_titles_bad_ifo_and_bup_is_empty() {
+        assert_eq!(scan_ifo_bup(false, false).expect("no error").len(), 0);
     }
 }
