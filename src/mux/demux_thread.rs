@@ -359,12 +359,17 @@ mod tests {
             let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
             let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
             let halt = Halt::new();
+            // Without the close the worker only sees the cancel at its loop-top check, and
+            // it blocks in recv() once past it, so raise the flag before it can start.
+            if !close_first {
+                halt.cancel();
+            }
             let ts = super::super::ts::TsDemuxer::new(&[0x1011]);
             let (dt, rx) =
                 DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt.clone()), Some(ts), None)
                     .unwrap();
-            halt.cancel();
             if close_first {
+                halt.cancel();
                 drop(pf_tx);
                 let b = collect_batches(&rx, Duration::from_secs(5));
                 drop(rx);
@@ -386,6 +391,33 @@ mod tests {
             );
             assert!(!b.iter().any(|x| matches!(x, DemuxBatch::Eof)), "no Eof");
         }
+    }
+
+    #[test]
+    fn ts_pes_source_offsets_advance_across_buffers() {
+        // Each buffer is fed at the running byte offset, so a PES cut from the second
+        // buffer is stamped 192, not 0.
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+        let pid = 0x1011;
+        let ts = super::super::ts::TsDemuxer::new(&[pid]);
+        let (_dt, rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        pf_tx.send(Ok(bdts_pes_packet(pid, &[0x01]))).unwrap();
+        pf_tx.send(Ok(bdts_pes_packet(pid, &[0x02]))).unwrap();
+        drop(pf_tx);
+
+        let batches = collect_batches(&rx, Duration::from_secs(5));
+        let srcs: Vec<u64> = batches
+            .iter()
+            .filter_map(|b| match b {
+                DemuxBatch::Ts(p) => Some(p),
+                _ => None,
+            })
+            .flatten()
+            .map(|p| p.source.expect("stamped").byte)
+            .collect();
+        assert_eq!(srcs, vec![0, 192]);
     }
 
     #[test]
