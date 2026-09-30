@@ -4,9 +4,9 @@
 //! `freemkv::diag`, routed to `log.txt` at `--log-level 3`. Every line is prefixed `tag=`
 //! (`disc`, `title`, `bd.clip`, `extent`, `stream`, `decision`, `decision.demoted`, `aacs`,
 //! `dvd.cell`, `dvd.pgc`, `dvd.chap`, `dvd.vobs`, `dvd.vattr`, `dvd.aattr`, `dvd.sattr`,
-//! `dvd.substream`, `dvd.aroute`, `mkv.track`, `mkv.opening.*`) so a log scraper can filter, and
-//! raw bytes are shown as `0xNN` beside
-//! their decode. This module only reads already-parsed scan state.
+//! `dvd.astctl`, `dvd.spstctl`, `dvd.substream`, `dvd.aroute`, `mkv.track`, `mkv.opening.*`,
+//! `mp2.channels`) so a log scraper can filter. Raw bytes are shown as `0xNN` beside their
+//! decode. This module only reads already-parsed scan state.
 
 use crate::disc::{ColorSpace, Disc, DiscTitle, FrameRate, HdrFormat, Resolution, Stream};
 use crate::ifo::{CellCategory, DvdTitle};
