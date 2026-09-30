@@ -23,10 +23,23 @@ fn main() {
             &target_arch // x86_64 → x86_64
         };
 
+        // Match rustc's deployment target so the shim does not strongly link
+        // symbols newer than the app promises to run on (IOMainPort is 12+).
+        let min_ver = std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| {
+            if target_arch == "aarch64" {
+                "11.0"
+            } else {
+                "10.12"
+            }
+            .to_string()
+        });
+        let min_flag = format!("-mmacosx-version-min={min_ver}");
+
         let cc_status = std::process::Command::new("cc")
             .args([
                 "-arch",
                 clang_arch,
+                &min_flag,
                 "-c",
                 "src/scsi/macos_shim.c",
                 "-o",

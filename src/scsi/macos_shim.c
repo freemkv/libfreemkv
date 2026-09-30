@@ -1,5 +1,6 @@
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFPlugIn.h>
+#include <IOKit/storage/IOMedia.h>
 #include <IOKit/scsi/SCSITaskLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
@@ -178,7 +179,7 @@ static int registry_entry_bsd_name(io_registry_entry_t entry, char *buf, size_t 
     return ok;
 }
 
-// Empty optical drives have an IOBDServices node but no IOMedia node, hence
+// Empty optical drives have a service node but no IOMedia node, hence
 // no BSD diskN name. Use the service's IOKit registry ID as an opaque selector
 // until media appears. It is process/boot-local, which is sufficient for the
 // list-then-open GUI flow.
@@ -187,6 +188,71 @@ static int registry_id_selector(io_registry_entry_t entry, char *buf, size_t buf
     if (IORegistryEntryGetRegistryEntryID(entry, &registry_id) != KERN_SUCCESS) return 0;
     int n = snprintf(buf, buflen, "ioreg:%" PRIu64, registry_id);
     return n > 0 && (size_t)n < buflen;
+}
+
+// BD, DVD and CD-only drives publish distinct service and driver classes
+// (IOBDServices / IODVDServices / IOCDServices and the matching
+// IO*BlockStorageDriver). All three are optical drives; IOServiceMatching
+// matches a class and its subclasses only, so each is queried in turn.
+static const char *const k_optical_services[] = {
+    "IOBDServices", "IODVDServices", "IOCDServices", NULL
+};
+static const char *const k_optical_drivers[] = {
+    "IOBDBlockStorageDriver", "IODVDBlockStorageDriver", "IOCDBlockStorageDriver", NULL
+};
+
+static int conforms_to_any(io_object_t obj, const char *const *classes) {
+    for (; *classes; classes++) {
+        if (IOObjectConformsTo(obj, *classes)) return 1;
+    }
+    return 0;
+}
+
+// IOMainPort is macOS 12+; IOMasterPort is its deprecated pre-12 name.
+static kern_return_t shim_main_port(mach_port_t *mp) {
+    if (__builtin_available(macOS 12.0, *)) {
+        return IOMainPort(0, mp);
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return IOMasterPort(0, mp);
+#pragma clang diagnostic pop
+}
+
+// Visitor result: 0 = continue (svc released), 1 = stop and return svc
+// (retained), 2 = stop (svc released).
+typedef int (*optical_visit_fn)(io_service_t svc, void *ctx);
+
+static io_service_t for_each_optical_service(mach_port_t mp, optical_visit_fn visit, void *ctx) {
+    for (int i = 0; k_optical_services[i]; i++) {
+        CFMutableDictionaryRef matching = IOServiceMatching(k_optical_services[i]);
+        if (!matching) continue;
+        io_iterator_t iter;
+        if (IOServiceGetMatchingServices(mp, matching, &iter) != KERN_SUCCESS) continue;
+        io_service_t svc;
+        while ((svc = IOIteratorNext(iter)) != 0) {
+            // A service matched by an earlier class was already visited.
+            int seen = 0;
+            for (int j = 0; j < i && !seen; j++) {
+                seen = IOObjectConformsTo(svc, k_optical_services[j]);
+            }
+            int act = seen ? 0 : visit(svc, ctx);
+            if (act == 1) {
+                io_service_t kept = svc, rest;
+                while ((rest = IOIteratorNext(iter)) != 0) IOObjectRelease(rest);
+                IOObjectRelease(iter);
+                return kept;
+            }
+            IOObjectRelease(svc);
+            if (act == 2) {
+                while ((svc = IOIteratorNext(iter)) != 0) IOObjectRelease(svc);
+                IOObjectRelease(iter);
+                return 0;
+            }
+        }
+        IOObjectRelease(iter);
+    }
+    return 0;
 }
 
 static int parse_registry_id_selector(const char *selector, uint64_t *registry_id) {
@@ -205,25 +271,14 @@ static int parse_registry_id_selector(const char *selector, uint64_t *registry_i
     return 1;
 }
 
+static int visit_registry_id(io_service_t svc, void *ctx) {
+    uint64_t candidate = 0;
+    return IORegistryEntryGetRegistryEntryID(svc, &candidate) == KERN_SUCCESS
+        && candidate == *(const uint64_t *)ctx;
+}
+
 static io_service_t find_bdsvc_by_registry_id(mach_port_t mp, uint64_t registry_id) {
-    CFMutableDictionaryRef matching = IOServiceMatching("IOBDServices");
-    if (!matching) return 0;
-    io_iterator_t iter;
-    if (IOServiceGetMatchingServices(mp, matching, &iter) != KERN_SUCCESS) return 0;
-    io_service_t result = 0;
-    io_service_t svc;
-    while ((svc = IOIteratorNext(iter)) != 0) {
-        uint64_t candidate = 0;
-        if (IORegistryEntryGetRegistryEntryID(svc, &candidate) == KERN_SUCCESS
-            && candidate == registry_id) {
-            result = svc;
-            break;
-        }
-        IOObjectRelease(svc);
-    }
-    while ((svc = IOIteratorNext(iter)) != 0) IOObjectRelease(svc);
-    IOObjectRelease(iter);
-    return result;
+    return for_each_optical_service(mp, visit_registry_id, &registry_id);
 }
 
 static io_registry_entry_t find_iomedia_child(io_registry_entry_t parent) {
@@ -236,7 +291,8 @@ static io_registry_entry_t find_iomedia_child(io_registry_entry_t parent) {
         char cls[128];
         kr = IOObjectGetClass(child, cls);
         if (kr == KERN_SUCCESS) {
-            if (strcmp(cls, "IOMedia") == 0 || strcmp(cls, "IOBDMedia") == 0) {
+            // DVD and CD discs publish IODVDMedia / IOCDMedia, subclasses of IOMedia.
+            if (IOObjectConformsTo(child, kIOMediaClass)) {
                 IOObjectRelease(iter);
                 return child;
             }
@@ -247,16 +303,14 @@ static io_registry_entry_t find_iomedia_child(io_registry_entry_t parent) {
     return 0;
 }
 
-static io_registry_entry_t find_child_of_class(io_registry_entry_t parent, const char *target_class) {
+static io_registry_entry_t find_child_of_class(io_registry_entry_t parent, const char *const *classes) {
     io_iterator_t iter;
     kern_return_t kr = IORegistryEntryGetChildIterator(parent, kIOServicePlane, &iter);
     if (kr != KERN_SUCCESS) return 0;
 
     io_registry_entry_t child;
     while ((child = IOIteratorNext(iter)) != 0) {
-        char cls[128];
-        kr = IOObjectGetClass(child, cls);
-        if (kr == KERN_SUCCESS && strcmp(cls, target_class) == 0) {
+        if (conforms_to_any(child, classes)) {
             IOObjectRelease(iter);
             return child;
         }
@@ -266,24 +320,22 @@ static io_registry_entry_t find_child_of_class(io_registry_entry_t parent, const
     return 0;
 }
 
-static io_registry_entry_t find_parent_of_class(io_registry_entry_t entry, const char *target_class) {
+static io_registry_entry_t find_parent_of_class(io_registry_entry_t entry, const char *const *classes) {
     io_registry_entry_t parent;
     kern_return_t kr = IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent);
     if (kr != KERN_SUCCESS) return 0;
 
-    char cls[128];
-    kr = IOObjectGetClass(parent, cls);
-    if (kr == KERN_SUCCESS && strcmp(cls, target_class) == 0) {
+    if (conforms_to_any(parent, classes)) {
         return parent;
     }
     IOObjectRelease(parent);
     return 0;
 }
 
-// Given an IOBDServices, find the BSD name of its IOMedia child.
-// Chain: IOBDServices -> IOBDBlockStorageDriver -> IOMedia (has "BSD Name")
+// Given an optical service (BD/DVD/CD), find the BSD name of its IOMedia child.
+// Chain: service -> IO*BlockStorageDriver -> IOMedia (has "BSD Name")
 static int bdsvc_to_bsd_name(io_registry_entry_t bdsvc, char *buf, size_t buflen) {
-    io_registry_entry_t driver = find_child_of_class(bdsvc, "IOBDBlockStorageDriver");
+    io_registry_entry_t driver = find_child_of_class(bdsvc, k_optical_drivers);
     if (!driver) return 0;
 
     io_registry_entry_t media = find_iomedia_child(driver);
@@ -295,7 +347,7 @@ static int bdsvc_to_bsd_name(io_registry_entry_t bdsvc, char *buf, size_t buflen
     return ok;
 }
 
-// Given an IOBDServices, extract Device Characteristics strings.
+// Given an optical service, extract Device Characteristics strings.
 static void bdsvc_device_info(io_registry_entry_t bdsvc, ShimDriveInfo *info) {
     // "Device Characteristics" is declared a dictionary, but the value is
     // driver-published and the registry contract does not enforce the type.
@@ -325,44 +377,22 @@ static void bdsvc_device_info(io_registry_entry_t bdsvc, ShimDriveInfo *info) {
     CFRelease(dc);
 }
 
-// Find the IOBDServices that owns the given BSD name.
-// Returns a retained io_service_t (caller must release), or 0.
-static io_service_t find_bdsvc_by_bsd_name(mach_port_t mp, const char *bsd_name) {
-    CFMutableDictionaryRef matching = IOServiceMatching("IOBDServices");
-    if (!matching) return 0;
-
-    io_iterator_t iter;
-    kern_return_t kr = IOServiceGetMatchingServices(mp, matching, &iter);
-    if (kr != KERN_SUCCESS) return 0;
-
-    io_service_t result = 0;
-    io_service_t svc;
-    while ((svc = IOIteratorNext(iter)) != 0) {
-        char name[64];
-        if (bdsvc_to_bsd_name(svc, name, sizeof(name))) {
-            if (strcmp(name, bsd_name) == 0) {
-                result = svc;
-                break;
-            }
-        }
-        IOObjectRelease(svc);
-    }
-
-    if (!result) {
-        IOIteratorReset(iter);
-        while ((svc = IOIteratorNext(iter)) != 0) {
-            IOObjectRelease(svc);
-        }
-    }
-
-    IOObjectRelease(iter);
-    return result;
+static int visit_bsd_name(io_service_t svc, void *ctx) {
+    char name[64];
+    return bdsvc_to_bsd_name(svc, name, sizeof(name))
+        && strcmp(name, (const char *)ctx) == 0;
 }
 
-// Find the IOBDServices that owns the given BSD name by walking from
+// Find the optical service that owns the given BSD name.
+// Returns a retained io_service_t (caller must release), or 0.
+static io_service_t find_bdsvc_by_bsd_name(mach_port_t mp, const char *bsd_name) {
+    return for_each_optical_service(mp, visit_bsd_name, (void *)bsd_name);
+}
+
+// Find the optical service that owns the given BSD name by walking from
 // IOMedia upward. Used as fallback when bdsvc_to_bsd_name fails
 // (e.g. disc under exclusive access, no IOMedia child).
-// Chain: IOMedia -> IOBDBlockStorageDriver -> IOBDServices
+// Chain: IOMedia -> IO*BlockStorageDriver -> IO*Services
 static io_service_t find_bdsvc_from_iomedia(mach_port_t mp, const char *bsd_name) {
     CFMutableDictionaryRef matching = IOServiceMatching("IOMedia");
     if (!matching) return 0;
@@ -378,9 +408,9 @@ static io_service_t find_bdsvc_from_iomedia(mach_port_t mp, const char *bsd_name
         if (registry_entry_bsd_name(media, name, sizeof(name))
             && strcmp(name, bsd_name) == 0)
         {
-            io_registry_entry_t driver = find_parent_of_class(media, "IOBDBlockStorageDriver");
+            io_registry_entry_t driver = find_parent_of_class(media, k_optical_drivers);
             if (driver) {
-                io_registry_entry_t bdsvc = find_parent_of_class(driver, "IOBDServices");
+                io_registry_entry_t bdsvc = find_parent_of_class(driver, k_optical_services);
                 IOObjectRelease(driver);
                 if (bdsvc) {
                     result = bdsvc;
@@ -542,6 +572,11 @@ static void da_release(void) {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
+// The IOReturn/HRESULT behind the last negative shim_open_exclusive result (0 if none).
+static volatile int32_t g_last_open_kr;
+
+int32_t shim_last_open_kr(void) { return g_last_open_kr; }
+
 int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     kern_return_t kr;
     HRESULT hr;
@@ -551,6 +586,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     // check-then-act TOCTOU, and a concurrent shim_close must not tear down scsi/
     // mmc/plugin mid-setup. Released before the self-locking da_hold (5 s wait).
     pthread_mutex_lock(&g_handle_lock);
+    g_last_open_kr = 0;
 
     // A Stop before the open does nothing at all: no unmount is started.
     if (shim_cancelled(cancel)) {
@@ -563,31 +599,42 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         return 0;
     }
 
+    // The selector is user-supplied: resolve it to an optical drive BEFORE
+    // unmounting, so a wrong /dev/diskN never touches another disk.
+    if (strlen(selector) >= 32) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return -1;
+    }
     uint64_t registry_id = 0;
     int is_registry_selector = parse_registry_id_selector(selector, &registry_id);
     char bsd_name[32] = {0};
     io_service_t svc = 0;
     mach_port_t mp = MACH_PORT_NULL;
+    // On failure IOMainPort leaves `mp` untouched; never use it unchecked.
+    if (shim_main_port(&mp) != kIOReturnSuccess) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return -1;
+    }
     if (is_registry_selector) {
-        if (IOMainPort(0, &mp) != kIOReturnSuccess) {
-            pthread_mutex_unlock(&g_handle_lock);
-            return -1;
-        }
         svc = find_bdsvc_by_registry_id(mp, registry_id);
-        if (!svc) {
-            pthread_mutex_unlock(&g_handle_lock);
-            return -1;
+        if (svc) {
+            // With an empty tray there is no BSD disk to unmount or claim.
+            bdsvc_to_bsd_name(svc, bsd_name, sizeof(bsd_name));
         }
-        // If media is present, retain the old unmount/claim behavior. With an
-        // empty tray there is no BSD disk to unmount or hand to DiskArbitration.
-        bdsvc_to_bsd_name(svc, bsd_name, sizeof(bsd_name));
     } else {
-        strlcpy(bsd_name, selector, sizeof(bsd_name));
+        svc = find_bdsvc_by_bsd_name(mp, selector);
+        if (!svc) svc = find_bdsvc_from_iomedia(mp, selector);
+        if (svc) strlcpy(bsd_name, selector, sizeof(bsd_name));
+    }
+    if (!svc) {
+        pthread_mutex_unlock(&g_handle_lock);
+        return -1;
     }
 
     // Unmount via diskutil, invoked directly with posix_spawn (no shell) so the
-    // BSD device name is a discrete argv element and never shell syntax. A killed
-    // unmount is fine: ObtainExclusiveAccess below is the real gate (-5).
+    // BSD device name is a discrete argv element and never shell syntax. Only a
+    // name confirmed to belong to an optical drive above reaches this point. A
+    // killed unmount is fine: ObtainExclusiveAccess below is the real gate (-5).
     if (bsd_name[0]) {
         char *const argv[] = {
             "diskutil", "unmountDisk", "force", bsd_name, NULL
@@ -596,55 +643,10 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         if (run_and_reap("/usr/sbin/diskutil", argv, SHIM_DISKUTIL_BUDGET_MS, cancel, NULL)
                 == SHIM_CANCELLED
             || sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) {
-            if (svc) IOObjectRelease(svc);
+            IOObjectRelease(svc);
             pthread_mutex_unlock(&g_handle_lock);
             return SHIM_CANCELLED;
         }
-    }
-
-    // Check the return before using the port. On failure IOMainPort leaves `mp`
-    // untouched, so every IOKit call below would run against an uninitialised
-    // mach port. shim_list_drives does check it; this path did not.
-    if (mp == MACH_PORT_NULL && IOMainPort(0, &mp) != kIOReturnSuccess) {
-        pthread_mutex_unlock(&g_handle_lock);
-        return -1;
-    }
-
-    if (!svc) svc = find_bdsvc_by_bsd_name(mp, bsd_name);
-    if (!svc && !is_registry_selector) {
-        svc = find_bdsvc_from_iomedia(mp, bsd_name);
-    }
-    if (!svc) {
-        // Last-resort fallback: enumerate IOBDServices directly. This must still
-        // HONOR the requested bsd_name — grabbing IOServiceGetMatchingService's
-        // first/arbitrary match would open the wrong drive on a multi-drive host.
-        // So iterate and accept only the service whose IOMedia BSD name equals the
-        // requested one; if none matches, leave svc == 0 and fail below.
-        //
-        // IOServiceMatching returns NULL on allocation failure (checked here, as
-        // the other call sites do); IOServiceGetMatchingServices consumes the
-        // matching-dictionary reference whether it succeeds or fails.
-        CFMutableDictionaryRef matching = IOServiceMatching("IOBDServices");
-        if (matching) {
-            io_iterator_t iter;
-            if (IOServiceGetMatchingServices(mp, matching, &iter) == KERN_SUCCESS) {
-                io_service_t cand;
-                while ((cand = IOIteratorNext(iter)) != 0) {
-                    char name[64];
-                    if (bdsvc_to_bsd_name(cand, name, sizeof(name))
-                        && strcmp(name, bsd_name) == 0) {
-                        svc = cand; // retained; released after the plug-in is built
-                        break;
-                    }
-                    IOObjectRelease(cand);
-                }
-                IOObjectRelease(iter);
-            }
-        }
-    }
-    if (!svc) {
-        pthread_mutex_unlock(&g_handle_lock);
-        return -1;
     }
 
     kr = IOCreatePlugInInterfaceForService(svc,
@@ -653,6 +655,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     IOObjectRelease(svc);
 
     if (kr != KERN_SUCCESS || !g_handle.plugin) {
+        g_last_open_kr = (int32_t)kr;
         pthread_mutex_unlock(&g_handle_lock);
         return -2;
     }
@@ -660,6 +663,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     hr = (*g_handle.plugin)->QueryInterface(g_handle.plugin,
         CFUUIDGetUUIDBytes(kIOMMCDeviceInterfaceID), (LPVOID *)&g_handle.mmc);
     if (hr != S_OK || !g_handle.mmc) {
+        g_last_open_kr = (int32_t)hr;
         IODestroyPlugInInterface(g_handle.plugin);
         g_handle.plugin = NULL;
         pthread_mutex_unlock(&g_handle_lock);
@@ -668,6 +672,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
 
     g_handle.scsi = (*g_handle.mmc)->GetSCSITaskDeviceInterface(g_handle.mmc);
     if (!g_handle.scsi) {
+        g_last_open_kr = (int32_t)kIOReturnNoDevice;
         (*g_handle.mmc)->Release(g_handle.mmc);
         IODestroyPlugInInterface(g_handle.plugin);
         g_handle.mmc = NULL;
@@ -683,6 +688,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         if (sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) { cancelled = 1; break; }
     }
     if (kr != kIOReturnSuccess) {
+        g_last_open_kr = (int32_t)kr;
         (*g_handle.scsi)->Release(g_handle.scsi);
         (*g_handle.mmc)->Release(g_handle.mmc);
         IODestroyPlugInInterface(g_handle.plugin);
@@ -806,7 +812,7 @@ int shim_execute(const unsigned char *cdb, unsigned char cdb_len,
 // Returns 1 (media present), 0 (no media), or -1 (IOKit unavailable).
 int shim_media_present(const char *selector) {
     mach_port_t mp;
-    if (IOMainPort(0, &mp) != kIOReturnSuccess) return -1;
+    if (shim_main_port(&mp) != kIOReturnSuccess) return -1;
 
     uint64_t registry_id = 0;
     if (parse_registry_id_selector(selector, &registry_id)) {
@@ -848,47 +854,31 @@ int shim_media_present(const char *selector) {
 
 // ── Registry-based drive enumeration ──────────────────────────────────────
 //
-// Walks IOBDServices entries in the IOKit registry. No exclusive access,
-// no SCSI commands, no unmounts. Returns up to max_entries drives.
+// Walks optical (BD/DVD/CD) service entries in the IOKit registry. No exclusive
+// access, no SCSI commands, no unmounts. Returns up to max_entries drives.
+
+typedef struct { ShimDriveInfo *out; int count; int max; } ListCtx;
+
+static int visit_list(io_service_t svc, void *ctx) {
+    ListCtx *lc = (ListCtx *)ctx;
+    ShimDriveInfo *info = &lc->out[lc->count];
+    memset(info, 0, sizeof(*info));
+
+    bdsvc_device_info(svc, info);
+    if (!bdsvc_to_bsd_name(svc, info->device_selector, sizeof(info->device_selector))) {
+        registry_id_selector(svc, info->device_selector, sizeof(info->device_selector));
+    }
+    if (info->device_selector[0]) lc->count++;
+    return lc->count >= lc->max ? 2 : 0;
+}
 
 int shim_list_drives(ShimDriveInfo *out, int max_entries) {
     mach_port_t mp;
-    IOReturn ret = IOMainPort(0, &mp);
-    if (ret != kIOReturnSuccess) return 0;
+    if (max_entries <= 0 || shim_main_port(&mp) != kIOReturnSuccess) return 0;
 
-    CFMutableDictionaryRef matching = IOServiceMatching("IOBDServices");
-    if (!matching) return 0;
-
-    io_iterator_t iter;
-    kern_return_t kr = IOServiceGetMatchingServices(mp, matching, &iter);
-    if (kr != KERN_SUCCESS) return 0;
-
-    int count = 0;
-    io_service_t svc;
-    // Test count BEFORE calling IOIteratorNext: each IOIteratorNext returns a
-    // retained io_service_t the caller must release. With the count check second,
-    // the iteration that fills the last slot would call IOIteratorNext once more
-    // (obtaining, and then leaking, one extra service) before the loop exits.
-    // Short-circuiting on count first means no unreleased service is ever obtained;
-    // any entries left unvisited in the iterator are freed by IOObjectRelease(iter).
-    while (count < max_entries && (svc = IOIteratorNext(iter)) != 0) {
-        ShimDriveInfo *info = &out[count];
-        memset(info, 0, sizeof(*info));
-
-        bdsvc_device_info(svc, info);
-        if (!bdsvc_to_bsd_name(svc, info->device_selector, sizeof(info->device_selector))) {
-            registry_id_selector(svc, info->device_selector, sizeof(info->device_selector));
-        }
-
-        if (info->device_selector[0]) {
-            count++;
-        }
-
-        IOObjectRelease(svc);
-    }
-
-    IOObjectRelease(iter);
-    return count;
+    ListCtx lc = { out, 0, max_entries };
+    for_each_optical_service(mp, visit_list, &lc);
+    return lc.count;
 }
 
 // ── shim_selftest hooks (stop design §5.1 LM1) ────────────────────────────

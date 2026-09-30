@@ -85,6 +85,54 @@ pub(crate) fn checked_cdb_len(cdb: &[u8], max: usize) -> Result<u8> {
     Ok(cdb.len() as u8)
 }
 
+/// Timeout every backend applies when a caller passes `timeout_ms == 0`.
+pub(crate) const DEFAULT_TIMEOUT_MS: u32 = 60_000;
+
+// A caller's `timeout_ms`, with 0 (no timeout given) mapped to [`DEFAULT_TIMEOUT_MS`].
+pub(crate) fn effective_timeout_ms(timeout_ms: u32) -> u32 {
+    if timeout_ms == 0 {
+        DEFAULT_TIMEOUT_MS
+    } else {
+        timeout_ms
+    }
+}
+
+// SPC-4 defines sense data only for CHECK CONDITION; any other non-GOOD status (BUSY,
+// RESERVATION CONFLICT, ...) carries none, so it must not become a fabricated 0/0/0 triple.
+pub(crate) fn sense_for_status(status: u8, sense: &[u8], sb_len_wr: u8) -> Option<ScsiSense> {
+    (status == SCSI_STATUS_CHECK_CONDITION).then(|| parse_sense(sense, sb_len_wr))
+}
+
+#[cfg(test)]
+mod transport_arg_tests {
+    use super::*;
+
+    #[test]
+    fn zero_timeout_means_one_default_everywhere() {
+        assert_eq!(effective_timeout_ms(0), DEFAULT_TIMEOUT_MS);
+        assert_eq!(effective_timeout_ms(1), 1);
+        assert_eq!(effective_timeout_ms(12_345), 12_345);
+        assert_eq!(spti_timeout_secs(0), 60);
+    }
+
+    #[test]
+    fn only_check_condition_carries_sense() {
+        let mut sense = [0u8; 32];
+        sense[0] = 0x70;
+        sense[2] = 0x05;
+        sense[12] = 0x24;
+        let s = sense_for_status(SCSI_STATUS_CHECK_CONDITION, &sense, 32).expect("CHECK CONDITION");
+        assert_eq!((s.sense_key, s.asc), (0x05, 0x24));
+        // BUSY (08h), RESERVATION CONFLICT (18h), TASK SET FULL (28h): no sense on the wire.
+        for status in [0x08u8, 0x18, 0x28] {
+            assert!(
+                sense_for_status(status, &[0u8; 32], 0).is_none(),
+                "{status:#x}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod cdb_len_tests {
     use super::*;
@@ -508,8 +556,6 @@ pub(crate) fn open_with(device: &Path, halt: &crate::halt::Halt) -> Result<Box<d
     }
 }
 
-// scsi::reset()/usb_reset() (removed 0.13.6/0.13.4) and hardware-touching API surface history:
-
 /// One optical drive on the system. Returned by [`list_drives`]. The
 /// fields are populated from a single INQUIRY at enumeration time —
 /// no firmware reset, no init.
@@ -610,11 +656,29 @@ pub struct InquiryResult {
     pub raw: Vec<u8>,
 }
 
-/// Send INQUIRY and parse standard response fields.
+// Timeout for the identification commands (INQUIRY, GET CONFIGURATION 010Ch).
+const IDENTIFY_TIMEOUT_MS: u32 = 5_000;
+// Standard INQUIRY allocation length, and the shortest reply that holds the identity fields
+// (SPC-4 §6.4.2: firmware revision ends at byte 36).
+const INQUIRY_ALLOC: usize = 96;
+const INQUIRY_MIN_LEN: usize = 36;
+
+/// Send INQUIRY and parse standard response fields. A reply shorter than the identity
+/// fields is an error, never a blank identity.
 pub fn inquiry(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
-    let cdb = [SCSI_INQUIRY, 0x00, 0x00, 0x00, 0x60, 0x00];
-    let mut buf = [0u8; 96];
-    scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
+    let cdb = [SCSI_INQUIRY, 0x00, 0x00, 0x00, INQUIRY_ALLOC as u8, 0x00];
+    let mut buf = [0u8; INQUIRY_ALLOC];
+    let r = scsi.execute(
+        &cdb,
+        DataDirection::FromDevice,
+        &mut buf,
+        IDENTIFY_TIMEOUT_MS,
+    )?;
+    if r.bytes_transferred < INQUIRY_MIN_LEN {
+        return Err(Error::IoError {
+            source: std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+        });
+    }
 
     Ok(InquiryResult {
         vendor_id: String::from_utf8_lossy(&buf[8..16]).trim().to_string(),
@@ -642,7 +706,12 @@ pub fn get_config_010c(scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
         0x00,
     ];
     let mut buf = [0u8; ALLOC as usize];
-    let r = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
+    let r = scsi.execute(
+        &cdb,
+        DataDirection::FromDevice,
+        &mut buf,
+        IDENTIFY_TIMEOUT_MS,
+    )?;
     Ok(buf[..gc_reply_len(&buf, r.bytes_transferred)].to_vec())
 }
 
@@ -857,10 +926,17 @@ pub(crate) fn sanitize_alignment_mask(raw: u32) -> usize {
     (smeared as usize).min(MAX_ALIGNMENT_MASK)
 }
 
-/// SPTI TimeOutValue: whole seconds, rounded up, at least 1, never wrapping.
+// Round `p` up to satisfy an SPTI AlignmentMask (`(p + mask) & !mask`); mask=0 means no
+// alignment requirement.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn align_up(p: usize, mask: usize) -> usize {
+    (p + mask) & !mask
+}
+
+/// SPTI TimeOutValue: whole seconds, rounded up, never wrapping; 0 ms is the default timeout.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn spti_timeout_secs(timeout_ms: u32) -> u32 {
-    timeout_ms.div_ceil(1000).max(1)
+    effective_timeout_ms(timeout_ms).div_ceil(1000)
 }
 
 #[cfg(test)]
@@ -1030,10 +1106,46 @@ mod transport_helper_tests {
     // timeout must saturate, not wrap to 1 s (or panic in debug).
     #[test]
     fn spti_timeout_rounds_up_without_overflow() {
-        assert_eq!(spti_timeout_secs(0), 1);
+        assert_eq!(spti_timeout_secs(0), 60);
         assert_eq!(spti_timeout_secs(1_500), 2);
         assert_eq!(spti_timeout_secs(5_000), 5);
         assert_eq!(spti_timeout_secs(u32::MAX), u32::MAX.div_ceil(1000));
+    }
+
+    // A GOOD reply that moved no data must not parse as a blank identity.
+    #[test]
+    fn inquiry_rejects_a_short_reply_and_parses_a_full_one() {
+        struct Inq(usize);
+        impl ScsiTransport for Inq {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                let mut reply = [0u8; 36];
+                reply[0] = 0x05;
+                reply[8..32].fill(b' ');
+                reply[8..16].copy_from_slice(b"HL-DT-ST");
+                reply[16..27].copy_from_slice(b"BD-RE BU40N");
+                reply[32..36].copy_from_slice(b"1.03");
+                data[..36].copy_from_slice(&reply);
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: self.0,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        assert!(inquiry(&mut Inq(0)).is_err(), "zero-byte reply");
+        assert!(inquiry(&mut Inq(35)).is_err(), "truncated before firmware");
+        let r = inquiry(&mut Inq(36)).unwrap();
+        assert_eq!(
+            (r.vendor_id.as_str(), r.model.as_str()),
+            ("HL-DT-ST", "BD-RE BU40N")
+        );
+        assert_eq!(r.firmware, "1.03");
     }
 
     // Feature 010Ch is an 8-byte header plus a 20-byte descriptor (Additional
@@ -1067,13 +1179,6 @@ mod transport_helper_tests {
         assert_eq!(v.len(), 28, "header + full 010Ch descriptor");
         assert_eq!(&v[12..24], b"202101311259", "date through the minute");
     }
-}
-
-// Round `p` up to satisfy an SPTI AlignmentMask (`(p + mask) & !mask`); mask=0 means no
-// alignment requirement.
-#[allow(dead_code)]
-pub(crate) fn align_up(p: usize, mask: usize) -> usize {
-    (p + mask) & !mask
 }
 
 #[cfg(test)]
