@@ -281,3 +281,42 @@ fn scan_with_stop_after_scan_keeps_the_key_sources() {
     assert!(s.disc.is_none());
     assert_eq!(s.spec.key_sources.len(), 1);
 }
+
+/// FT2 (§2.5 "Follow-ups use the held handle"): a session adopted over an open drive
+/// sends no bring-up CDB; reads through `source_mut` keep the handle in the session, and
+/// `finish(Eject)` after a Stop ejects on that same handle.
+#[test]
+fn from_drive_reads_then_ejects_on_the_held_handle() {
+    let h = Halt::new();
+    let (t, fake) = FakeTransport::new();
+    let t = t
+        .with_image(vec![0u8; 2048 * 4])
+        .watch(&h)
+        .allow_after_cancel(is_eject);
+    let mut s = DiscSession::from_drive(Drive::from_transport_with(Box::new(t), &h));
+    assert!(fake.cdbs().is_empty(), "no bring-up: {:02x?}", fake.cdbs());
+    let mut buf = vec![0u8; 2048];
+    let src = s.source_mut().expect("the held drive");
+    src.read_sectors(0, 1, &mut buf, false).expect("read");
+    assert_eq!(
+        fake.live_handles(),
+        1,
+        "the read left the handle in the session"
+    );
+    h.cancel();
+    s.finish(Finish::Eject).expect("eject on the held handle");
+    assert_eq!(after_cancel(&fake).len(), 1, "{:02x?}", after_cancel(&fake));
+    assert!(is_eject(&after_cancel(&fake)[0]));
+    assert_eq!(fake.live_handles(), 0, "the handle is closed");
+}
+
+/// `source_mut` prefers the staged reader and is `None` once the source has left.
+#[test]
+fn source_mut_follows_the_staged_reader() {
+    let (t, _fake) = FakeTransport::new();
+    let mut s = DiscSession::from_drive(Drive::from_transport(Box::new(t)));
+    s.stage_drive_as_reader();
+    assert!(s.source_mut().is_some(), "the staged drive");
+    let _reader = s.take_reader();
+    assert!(s.source_mut().is_none());
+}
