@@ -68,17 +68,28 @@ pub(crate) fn content_files_in(
     for path in paths {
         let mut extents: Vec<(u32, u32)> = Vec::new();
         for (lba, n) in fs.file_extents(reader, &path)? {
-            match extents.last_mut() {
-                Some(last) if n > 0 && last.0 as u64 + last.1 as u64 == lba as u64 => last.1 += n,
-                _ if n > 0 => extents.push((lba, n)),
-                _ => {}
-            }
+            push_extent(&mut extents, lba, n);
         }
         if !extents.is_empty() {
             files.push(extents);
         }
     }
     Ok(files)
+}
+
+// Append `(lba, n)`, joining it to a contiguous last extent unless the count would overflow.
+fn push_extent(extents: &mut Vec<(u32, u32)>, lba: u32, n: u32) {
+    if n == 0 {
+        return;
+    }
+    let joined = extents.last_mut().and_then(|last| {
+        let sum = last.1.checked_add(n)?;
+        (last.0 as u64 + last.1 as u64 == lba as u64).then(|| last.1 = sum)
+    });
+    if joined.is_some() {
+        return;
+    }
+    extents.push((lba, n));
 }
 
 /// A content extent `(start, count)` and the LBA its unit grid is anchored at: the

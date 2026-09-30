@@ -353,3 +353,14 @@ fn raw_whole_disc_reader_passes_every_sector_through() {
     }
     assert!(buf == image, "a raw read returns the image unchanged");
 }
+
+#[test]
+fn push_extent_does_not_overflow_count() {
+    let mut e = vec![(0u32, u32::MAX - 1)];
+    push_extent(&mut e, u32::MAX - 1, 5);
+    assert_eq!(e, vec![(0, u32::MAX - 1), (u32::MAX - 1, 5)]);
+    let mut e = vec![(10u32, 4)];
+    push_extent(&mut e, 14, 6);
+    push_extent(&mut e, 20, 0);
+    assert_eq!(e, vec![(10, 10)]);
+}
