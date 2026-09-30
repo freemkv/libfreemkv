@@ -51,11 +51,11 @@ updates:
           - patch
     ignore:
       # NOT a dependency: `dtolnay/rust-toolchain` is versioned by the RUST
-      # release it installs, and the tag we pin is the toolchain CI is pinned
-      # to on purpose, so a lint that passes on a newer default cannot pass CI
-      # by accident.
+      # release it installs, and CI selects the toolchain through the `toolchain:`
+      # input on the @master/@stable branch refs, so a lint that passes on a
+      # newer default cannot pass CI by accident.
       #
-      # Dependabot reads those tags as semver and proposed 1.97.0 -> 1.100.0,
+      # Dependabot reads its tags as semver and proposed 1.97.0 -> 1.100.0,
       # a Rust version that does not exist. Every such PR 404s on toolchain
       # download across all eight repos, and they regenerate weekly -- eight
       # permanently-red PRs that promote.yml then has to special-case when it

@@ -16,7 +16,7 @@ jobs:
     env:
       FREEMKV_FFMPEG_ARTIFACT_DIR: ${{ github.workspace }}/ffmpeg-artifacts
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -29,7 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       - name: Install software encoders and decoders
@@ -48,7 +48,7 @@ jobs:
           cargo test --release --lib ffmpeg_ -- --ignored --nocapture 2>&1 | tee "$FREEMKV_FFMPEG_ARTIFACT_DIR/tests.log"
       - name: Upload fixtures, probes, hashes and logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ffmpeg-validation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.FREEMKV_FFMPEG_ARTIFACT_DIR }}

@@ -11,7 +11,7 @@ version = 1
 #
 # The repository is the project's own work under the MIT licence, except the
 # MPEG audio ISO reference tables under src/mux/codec/testdata/dist10, which are
-# test data derived from that reference software and covered here for lint only.
+# third-party test data and carry their own annotation at the end of this file.
 
 [[annotations]]
 path = [
@@ -40,9 +40,17 @@ path = [
     "**/*.mp2",
     "**/*.class",
     "**/PROVENANCE",
-    "**/testdata/dist10/alloc_*",
     "tests/*.txt",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Matthew Jackson & Contributors"
 SPDX-License-Identifier = "MIT"
+
+# Table 3-B.2a-d allocation data copied from the ISO/IEC 11172-5 reference
+# software (dist10, ISO/MPEG Audio Subgroup Software Simulation Group); this is
+# not the project's work and is not MIT-licensed.
+[[annotations]]
+path = "src/mux/codec/testdata/dist10/alloc_*"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "ISO/IEC JTC1/SC29/WG11 (MPEG) and the ISO/MPEG Audio Subgroup Software Simulation Group"
+SPDX-License-Identifier = "LicenseRef-ISO-dist10"

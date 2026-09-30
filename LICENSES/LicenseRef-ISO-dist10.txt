@@ -1,0 +1,11 @@
+ISO/IEC 11172-5 reference software (dist10) -- table data
+
+src/mux/codec/testdata/dist10/alloc_0..3 are the Table 3-B.2a-d bit-allocation
+tables of ISO/IEC 11172-3 Annex B, as shipped in the ISO/MPEG Audio Subgroup
+Software Simulation Group's dist10 reference software (commit ea3c5ee of
+joncampbell123/iso-dist10). They are used here only as test data to check the
+Layer II parser.
+
+Copyright remains with ISO/IEC and the original authors of that software. No
+separate licence text accompanies these files; they are not covered by this
+project's MIT licence, and their terms are those of the dist10 distribution.

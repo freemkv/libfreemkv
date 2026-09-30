@@ -84,7 +84,8 @@ rustix = { version = "1", default-features = false, features = ["std", "event"],
 roxmltree = { version = "0.20", optional = true }
 # Trace-level instrumentation for the read/transport path (SgIoTransport::execute
 # and friends). Part of the `scsi` feature — the transport layer traces here.
-# Debug/trace logging is the permitted string output. Consumers (autorip) wire a tracing subscriber and pipe events into the JSONL debug log.
+# Debug/trace logging is the permitted string output. Consumers (autorip) wire a
+# tracing subscriber and pipe events into the JSONL debug log.
 tracing = { version = "0.1", optional = true }
 # Bounded MPSC channel with kernel-wakeup send_timeout. Used by `io::pipeline`
 # so the halt-aware send/finish loops can BLOCK on consumer drain instead of
