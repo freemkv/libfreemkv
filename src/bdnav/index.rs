@@ -153,4 +153,23 @@ mod tests {
             "title count over MAX_TITLES must be rejected"
         );
     }
+
+    #[test]
+    fn rejects_zero_titles() {
+        let d = build(hdmv_obj(0), bdj_obj(), &[]);
+        assert!(parse(&d).is_none(), "num_titles == 0 must be rejected");
+    }
+
+    #[test]
+    fn unknown_object_types_parse_as_unknown() {
+        let mut none = [0u8; 12]; // object_type 0
+        let mut reserved = [0u8; 12];
+        reserved[0] = 3 << 6; // object_type 3
+        none[0] = 0x3F; // low bits set must not leak into the type
+        let d = build(none, reserved, &[reserved]);
+        let idx = parse(&d).expect("parses");
+        assert_eq!(idx.first_play, PlaybackObj::Unknown);
+        assert_eq!(idx.top_menu, PlaybackObj::Unknown);
+        assert_eq!(idx.titles[0], PlaybackObj::Unknown);
+    }
 }

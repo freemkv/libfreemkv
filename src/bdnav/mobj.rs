@@ -157,4 +157,13 @@ pub(crate) mod tests {
     // No command-count cap exists to test: `num_cmds` is a u16 (max 65535) and
     // each object's span is bounded against the input length, so the former
     // MAX_CMDS check was dead code and was removed rather than left flagged.
+
+    #[test]
+    fn decode_cmd_masks_ignore_reserved_bits() {
+        // b2/b3 upper bits are reserved and must not leak into cmp_opt/set_opt.
+        let c = decode_cmd(&cmd(0xFF, 0xFF, 0xF3, 0xE5, 0, 0));
+        assert_eq!((c.op_cnt, c.grp, c.sub_grp), (7, 3, 7));
+        assert!(c.imm_op1 && c.imm_op2);
+        assert_eq!((c.branch_opt, c.cmp_opt, c.set_opt), (0x0f, 0x03, 0x05));
+    }
 }

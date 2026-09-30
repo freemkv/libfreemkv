@@ -65,10 +65,6 @@ const AUTOSTART: u8 = 1;
 // gracefully rather than mis-reject a readable table.
 const MAGIC: u32 = u32::from_be_bytes(*b"BDJO");
 
-// Cap on applications parsed from one AMT. `number_of_applications` is a u8, so
-// 255 is the hard ceiling already; the cap is a belt-and-suspenders bound.
-const MAX_APPS: usize = 256;
-
 /// Parse a `.bdjo` file's Application Management Table. Returns the list of
 /// application records (in file order), or `None` on any structural problem.
 pub(crate) fn parse(data: &[u8]) -> Option<Vec<BdjoApp>> {
@@ -108,9 +104,7 @@ pub(crate) fn parse(data: &[u8]) -> Option<Vec<BdjoApp>> {
     r.skip(32)?; // length
     let num_app = r.read(8)? as usize;
     r.skip(8)?; // padding
-    if num_app > MAX_APPS {
-        return None;
-    }
+    // num_app is a u8 read, so it is bounded at 255 by construction.
     let mut apps = Vec::with_capacity(num_app);
     for _ in 0..num_app {
         apps.push(parse_app(&mut r)?);
