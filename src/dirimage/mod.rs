@@ -183,8 +183,12 @@ impl DirImage {
             self.open.insert(0, entry);
             return Ok(&mut self.open[0].1);
         }
-        let f = File::open(&self.files[file].host).map_err(Error::from)?;
-        let md = f.metadata().map_err(Error::from)?;
+        // A file that vanished or became unreadable is a change; name it.
+        let changed = |_| Error::DirImageFileChanged {
+            path: self.files[file].disc_path.clone(),
+        };
+        let f = File::open(&self.files[file].host).map_err(changed)?;
+        let md = f.metadata().map_err(changed)?;
         // Size AND mtime: size alone is content-blind, and VOB placement depends on
         // IFO bytes 0xC0/0xC4 — an IFO rewritten in place keeps its sector-aligned
         // length, so size alone would miss it. mtime only compared if both present.
@@ -207,7 +211,7 @@ impl DirImage {
 
     // Fill `out` (whole sectors) from one data range starting at `lba`. `out`
     // is pre-zeroed, so a tail sector zero-pads — matching `file_extents`'
-    // div_ceil(2048) (udf.rs:816) that every consumer expects.
+    // div_ceil(2048) (`udf::file_extents`) that every consumer expects.
     fn fill(&mut self, r: &DataRange, lba: u32, out: &mut [u8]) -> Result<()> {
         let within = (lba - r.start_lba) as u64 * SECTOR as u64;
         let want = (r.bytes.saturating_sub(within)).min(out.len() as u64) as usize;

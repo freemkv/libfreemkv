@@ -198,7 +198,7 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
             );
             continue;
         }
-        names.push(as_read.to_ascii_uppercase());
+        let key = as_read.to_ascii_uppercase();
         if ft.is_dir() {
             // Link count (child dirs + 1) is stored in 16 bits; the global entry
             // cap alone permits a single directory holding more than that, which
@@ -208,6 +208,7 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
                     path: disc_path.to_string(),
                 });
             }
+            names.push(key);
             dirs.push(walk(&entry.path(), &child_path, depth + 1, entries)?);
         } else {
             let meta = match std::fs::metadata(entry.path()) {
@@ -230,6 +231,7 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
                 );
                 continue;
             }
+            names.push(key);
             files.push(FileNode {
                 name,
                 disc_path: child_path,
@@ -246,6 +248,13 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
     // `find_dir`/`read_file` match path components case-insensitively, so two
     // entries differing only in case are indistinguishable to every consumer —
     // the second would silently shadow the first. Only on a case-sensitive host.
+    let dir_len = dir_bytes(&dirs, &files);
+    if dir_len.div_ceil(SECTOR) > (crate::udf::MAX_DIR_BYTES as usize) / SECTOR {
+        // The UDF reader rejects a larger directory; refuse it here, naming it.
+        return Err(Error::DirImageFanout {
+            path: disc_path.to_string(),
+        });
+    }
     names.sort();
     for pair in names.windows(2) {
         if pair[0] == pair[1] {
@@ -334,14 +343,17 @@ fn be_u32(buf: &[u8], off: usize) -> Option<u32> {
 // Read the first `n` bytes of an IFO so its placement offsets can be resolved. Errors propagate
 // — an empty buffer would record NO placement constraint and the rip would read the wrong
 // sectors.
-fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
+fn read_head(path: &Path, disc_path: &str, n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
     // `read_exact`, not `read`: a single `read` may legally return fewer bytes on
     // a network/FUSE mount (a NAS-hosted backup is normal here). A short buffer
     // records NO constraint, so the rip reads the wrong sectors at exit 0.
-    let mut f = std::fs::File::open(path).map_err(Error::from)?;
-    f.read_exact(&mut buf).map_err(Error::from)?;
+    let unreadable = |_| Error::DirImagePlacement {
+        path: disc_path.to_string(),
+    };
+    let mut f = std::fs::File::open(path).map_err(unreadable)?;
+    f.read_exact(&mut buf).map_err(unreadable)?;
     Ok(buf)
 }
 
@@ -397,7 +409,7 @@ fn place_video_ts(vts: &mut DirNode, start: u32) -> Result<u32> {
         if let Some(c) = class
             && c.role == Role::Ifo
         {
-            let head = read_head(&vts.files[i].host, 0xC8)?;
+            let head = read_head(&vts.files[i].host, &vts.files[i].disc_path, 0xC8)?;
             let menu = be_u32(&head, 0xC0).unwrap_or(0);
             // One group per title set: `VTS_01_0.IFO` and `VTS_1_0.IFO` parse to
             // the same group, and a second insert would overwrite the first's
@@ -507,9 +519,8 @@ fn count_nodes(dir: &DirNode, dirs: &mut u32, files: &mut u32) {
     }
 }
 
-/// Total blocks the metadata region needs: File Set Descriptor, its
-/// Terminating Descriptor, one File Entry per node, and each directory's FID
-/// list.
+/// Blocks for the File Entries and FID lists below `dir`; the FSD and
+/// Terminating Descriptor are added by `metadata_block_count`.
 fn metadata_blocks(dir: &DirNode) -> u64 {
     let mut n = 1 + dir.files.len() as u64;
     n += dir_bytes(&dir.dirs, &dir.files).div_ceil(SECTOR) as u64;
@@ -549,8 +560,10 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
 
     // Metadata: block 0 is the FSD, block 1 its Terminating Descriptor.
     let mut next = 2u32;
-    let mut uid = 0u64;
+    // UDF 3.2.1.1 reserves Unique IDs 1-15: the root is 0, the rest start at 16.
+    let mut uid = 16u64;
     assign_metadata(&mut tree, 0, &mut next, &mut uid);
+    tree.unique_id = 0;
     tree.parent_icb_lba = tree.icb_lba; // root's parent FID points at itself
 
     let part_start = MIN_PART_START;
@@ -608,10 +621,19 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "FREEMKV".to_string());
-    // UDF volume identifiers are a 32-byte d-string: one compression byte, the
-    // characters, and a trailing length byte. Trim rather than let
-    // `put_dstring` cut a multi-byte character in half.
-    let volume_id: String = volume_id.chars().take(30).collect();
+    // A 32-byte d-string holds 30 ASCII chars, but only 15 UTF-16 units once
+    // non-ASCII forces CS0 ID 16. Trim here so `put_dstring` never cuts a char.
+    let mut volume_id: String = volume_id.chars().take(30).collect();
+    if !volume_id.is_ascii() {
+        let mut units = 0;
+        volume_id = volume_id
+            .chars()
+            .take_while(|c| {
+                units += c.len_utf16();
+                units <= 15
+            })
+            .collect();
+    }
 
     Ok(Layout {
         part_start,

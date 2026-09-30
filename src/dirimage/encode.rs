@@ -406,7 +406,7 @@ fn file_entry(
     s[24..26].copy_from_slice(&1u16.to_le_bytes()); // max number of entries
     s[27] = if is_dir { 4 } else { 5 }; // file type: directory / byte sequence
     // s[28..34] parent ICB location: not recorded (permitted).
-    // s[34..36] ICB flags: 0 => short allocation descriptors. `udf.rs:601`
+    // s[34..36] ICB flags: 0 => short allocation descriptors. `udf::read_filesystem`
     // reads exactly this word to pick its AD stride.
     s[34..36].copy_from_slice(&0u16.to_le_bytes());
     // UDF's sentinel for "not specified" is 0xFFFFFFFF, not 0 — 0 is a real

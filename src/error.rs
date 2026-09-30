@@ -883,7 +883,8 @@ pub enum Error {
     DirNameTooLong {
         path: String,
     },
-    /// One directory holds more subdirectories than a UDF link count can express.
+    /// One directory holds more subdirectories than a UDF link count can express,
+    /// or more entries than the reader's per-directory size cap allows.
     ///
     /// A directory's File Entry records its link count in 16 bits, and that
     /// count is one per child directory plus one for its own entry in its

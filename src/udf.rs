@@ -16,7 +16,7 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 // Cap on a single directory's on-disc data, well above any legitimate BD-ROM
 // directory, so a corrupt 30-bit allocation length can't force a huge alloc.
-const MAX_DIR_BYTES: u32 = 1024 * 1024;
+pub(crate) const MAX_DIR_BYTES: u32 = 1024 * 1024;
 
 // Smallest Main VDS extent ECMA-167 3/10.2.1 permits an AVDP to record (16
 // sectors). A smaller extent is unusable, so it's ignored in favour of

@@ -1121,3 +1121,92 @@ fn read_structure_files_propagates_halt() {
         res.map(|f| f.len())
     );
 }
+
+// ── Audit fixes: planning edge cases ────────────────────────────────────────
+
+/// A symlink skipped from the image must not take part in the case-collision check.
+#[cfg(unix)]
+#[test]
+fn a_skipped_symlink_does_not_collide_with_a_same_name_file() {
+    let (s, _, _) = bdmv_scratch();
+    // The reader trims the leading space, so both names read back as `A.M2TS`.
+    s.file("BDMV/STREAM/A.M2TS", b"x");
+    std::os::unix::fs::symlink("/nonexistent-target", s.path().join("BDMV/STREAM/ A.M2TS"))
+        .unwrap();
+    DirImage::open(s.path()).expect("dangling symlink is omitted, not a collision");
+}
+
+/// A directory whose FID list exceeds the UDF reader's cap is refused at plan time, by name.
+#[test]
+fn an_over_wide_directory_is_refused_at_plan_time() {
+    let (s, _, _) = bdmv_scratch();
+    for i in 0..24_000 {
+        s.file(&format!("BDMV/STREAM/{i:05}"), b"");
+    }
+    let err = DirImage::open(s.path()).unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FANOUT);
+    assert!(err.to_string().contains("/BDMV/STREAM"), "got {err}");
+}
+
+/// A truncated IFO is a typed error naming the file.
+#[test]
+fn a_truncated_ifo_names_the_file() {
+    let s = Scratch::new("dvdshort");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &[0u8; 8]);
+    let err = DirImage::open(s.path()).unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_PLACEMENT);
+    assert!(err.to_string().contains("VTS_01_0.IFO"), "got {err}");
+}
+
+/// A file that vanishes after planning names the file.
+#[test]
+fn a_file_removed_after_planning_names_the_file() {
+    let (s, _, _) = bdmv_scratch();
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let (lba, sectors) = fs
+        .file_extents(&mut img, "/BDMV/STREAM/00000.m2ts")
+        .unwrap()[0];
+    std::fs::remove_file(s.path().join("BDMV/STREAM/00000.m2ts")).unwrap();
+    let mut buf = vec![0u8; sectors as usize * SECTOR];
+    let err = img
+        .read_sectors(lba, sectors as u16, &mut buf, false)
+        .unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FILE_CHANGED);
+    assert!(err.to_string().contains("00000.m2ts"), "got {err}");
+}
+
+/// UDF reserves Unique IDs 1-15; only the root may be below 16.
+#[test]
+fn synthesized_unique_ids_avoid_the_reserved_range() {
+    let (s, _, _) = bdmv_scratch();
+    let plan = layout::plan(s.path()).unwrap();
+    fn check(d: &layout::DirNode, is_root: bool) {
+        if is_root {
+            assert_eq!(d.unique_id, 0);
+        } else {
+            assert!(d.unique_id >= 16, "dir uid {}", d.unique_id);
+        }
+        for f in &d.files {
+            assert!(f.unique_id >= 16, "file uid {}", f.unique_id);
+        }
+        for s in &d.dirs {
+            check(s, false);
+        }
+    }
+    check(&plan.root, true);
+    assert!(plan.next_unique_id >= 16);
+}
+
+/// A non-ASCII folder name must read back from the UDF exactly as `volume_id()` reports it.
+#[test]
+fn a_non_ascii_volume_id_matches_what_the_reader_sees() {
+    let base = Scratch::new("vol");
+    let name = "Am\u{e9}lie (2001) Blu-ray \u{1F600}\u{1F600}";
+    base.file(&format!("{name}/BDMV/index.bdmv"), &pattern(1, 16));
+    base.file(&format!("{name}/BDMV/STREAM/00000.m2ts"), &pattern(2, 4096));
+    let mut img = DirImage::open(&base.path().join(name)).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    assert_eq!(fs.volume_id, img.volume_id());
+}
