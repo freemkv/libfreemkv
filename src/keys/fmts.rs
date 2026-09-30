@@ -31,7 +31,7 @@ pub(crate) struct Layout {
 // Bytes per source packet (the SPN unit).
 const SPN_BYTES: u64 = 192;
 
-/// Read the disc's forensic layout. `Ok(None)`: not FMTS (no or empty segment table).
+/// Read the disc's forensic layout. `Ok(None)`: not FMTS (no or empty segment table); an unparseable table is refused.
 pub(crate) fn layout(
     fs: &crate::udf::UdfFs,
     reader: &mut dyn SectorSource,
@@ -43,7 +43,8 @@ pub(crate) fn layout(
     };
     let Some(segments) = parse_individual_segments(&tbl) else {
         tracing::warn!(target: "freemkv::keys", "fmts: IndividualSegment.tbl present but unparseable");
-        return Ok(None);
+        // Ok(None) would rip forensic units as base content: refuse.
+        return Err(Error::FmtsKeyMissing);
     };
     if segments.is_empty() {
         return Ok(None);

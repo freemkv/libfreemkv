@@ -27,7 +27,8 @@ const RETRY_CAP: Duration = Duration::from_secs(8);
 const NO_ANSWER_WINDOW: Duration = Duration::from_secs(60);
 /// Encrypted units sent in one per-piece request, at most.
 const SAMPLE_CAP: usize = 32;
-// Most keys a run holds: real discs declare few CPS units; a service cannot flood the pool.
+// Most keys taken from one source answer: real discs declare few CPS units; a source cannot
+// flood the pool or starve a later source.
 const MAX_POOL_KEYS: usize = 256;
 
 /// Time for the J13 retry: injected so tests use a fake clock and never sleep.
@@ -145,11 +146,10 @@ impl Run<'_> {
 
     // Add keys to the pool (deduplicated): the pool only grows during `resolve`.
     fn add_keys(&mut self, keys: &[[u8; 16]], who: &'static str) {
-        for k in keys {
-            if self.pool.len() >= MAX_POOL_KEYS {
-                tracing::warn!(target: "freemkv::keys", who, "key pool full: extra keys ignored");
-                break;
-            }
+        if keys.len() > MAX_POOL_KEYS {
+            tracing::warn!(target: "freemkv::keys", who, "source answer truncated: extra keys ignored");
+        }
+        for k in keys.iter().take(MAX_POOL_KEYS) {
             if !self.pool.contains(k) {
                 self.pool.push(*k);
                 self.origin.push(who);

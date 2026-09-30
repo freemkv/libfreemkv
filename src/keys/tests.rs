@@ -1502,6 +1502,23 @@ fn fmts_fixture() -> Fx {
     fx
 }
 
+/// A present but unparseable segment table is a refusal, never "not FMTS" (which would rip
+/// forensic units as base content).
+#[test]
+fn fmts_malformed_segment_table_is_refused() {
+    let mut fx = fmts_fixture();
+    let at = fx.file(2).0 as usize * 2048;
+    // record_size (bytes 6..8) no longer matches the record length.
+    fx.img.image[at + 6..at + 8].copy_from_slice(&15u16.to_be_bytes());
+    let calls = Calls::default();
+    let r = resolve(
+        &fx,
+        KeyScope::Titles(vec![2]),
+        &[Spec::keydb(&[K1, K2], &calls)],
+    );
+    assert!(matches!(r, Err(Error::FmtsKeyMissing)), "{:?}", r.err());
+}
+
 fn fmts_online(calls: &Calls) -> Spec {
     let mut s = Spec::online(&[K2], calls);
     s.fmts = vec![F1, F2];
@@ -2782,6 +2799,40 @@ fn pieces_survive_extents_near_the_lba_limit() {
     let files = vec![vec![(u32::MAX - 4, 10)]];
     let spans = crate::keys::resolve::whole_disc_pieces(&fx.disc, &files);
     assert!(!spans.is_empty());
+}
+
+/// The push-closure path (a title extent no file covers) survives an extent near u32::MAX.
+#[test]
+fn uncovered_title_extent_near_the_lba_limit_survives() {
+    let mut fx = two_units();
+    fx.disc.titles[0].extents = vec![Extent {
+        start_lba: u32::MAX - 4,
+        sector_count: 10,
+    }];
+    let spans = crate::keys::resolve::whole_disc_pieces(&fx.disc, &[]);
+    assert!(!spans.is_empty());
+}
+
+/// One source flooding the pool cannot starve a later source's real key.
+#[test]
+fn a_flooding_source_does_not_starve_a_later_source() {
+    let fx = two_units();
+    let junk: Vec<[u8; 16]> = (0..300u32)
+        .map(|i| {
+            let mut k = [0u8; 16];
+            k[..4].copy_from_slice(&(i + 1).to_be_bytes());
+            k
+        })
+        .collect();
+    let calls = Calls::default();
+    let mut later = Spec::keydb(&[K1, K2], &calls);
+    later.who = "later";
+    let r = resolve(
+        &fx,
+        KeyScope::WholeDisc,
+        &[Spec::keydb(&junk, &calls), later],
+    );
+    assert!(r.is_ok(), "{:?}", r.err());
 }
 
 /// A key service cannot flood the pool: keys past the cap are ignored.
