@@ -75,7 +75,7 @@ pub struct WritebackFile {
     ops: Arc<dyn FlushOps>,
     timing: FlushTiming,
     halt: Option<Halt>,
-    /// A size hint reserved extents past EOF; trimmed at sync/drop.
+    /// A size hint reserved extents past EOF on a local FS; released at `sync_all` or drop.
     hinted: bool,
 }
 
@@ -219,18 +219,26 @@ impl WritebackFile {
     /// extent allocation is preallocated.
     pub fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
         let file = File::create(path)?;
-        platform::preallocate(&file, size_bytes);
+        let reserved = platform::preallocate(&file, size_bytes);
         let mut w = Self::new(file)?;
-        w.hinted = true;
+        w.hinted = reserved;
         Ok(w)
     }
 
-    // Release the KEEP_SIZE reservation past EOF: a same-length truncate frees it.
+    // Release the KEEP_SIZE reservation past EOF (a same-length truncate); `hinted` is set
+    // only on a detected local FS. Skipped once degraded or failed: the setattr could then be
+    // a halt-blind full flush. A failure only warns.
     fn release_reservation(&mut self) {
-        if std::mem::take(&mut self.hinted)
-            && let Ok(m) = self.file.metadata()
+        let clean = self.flusher.is_none() && self.check_writeback().is_ok();
+        if !std::mem::take(&mut self.hinted) || self.pipeline.needs_flusher() || !clean {
+            return;
+        }
+        if let Err(e) = self
+            .file
+            .metadata()
+            .and_then(|m| self.file.set_len(m.len()))
         {
-            let _ = self.file.set_len(m.len());
+            tracing::warn!(target: "mux", error = %e, "WritebackFile size-hint reservation kept");
         }
     }
 
@@ -260,7 +268,6 @@ impl WritebackFile {
             );
         }
         self.pipeline.finalize();
-        self.release_reservation();
         let synced = self.drain(self.halt.clone().as_ref()).and_then(|()| {
             let timing = DurableTiming {
                 stall: self.timing.stall,
@@ -280,7 +287,12 @@ impl WritebackFile {
         // WAIT_AFTER consumed it, so fsync can return 0 over lost data.
         match self.pipeline.error() {
             Some(e) => Err(e),
-            None => synced,
+            None => {
+                if synced.is_ok() {
+                    self.release_reservation();
+                }
+                synced
+            }
         }
     }
 
@@ -375,10 +387,11 @@ impl Drop for WritebackFile {
         // without `sync_all` leaves the trailing chunk in cache. No `self.file.sync_all()`
         // here — `Drop`-triggered fsync would swallow errors; `finalize` is idempotent.
         self.pipeline.finalize();
-        self.release_reservation();
         if let Some(e) = self.pipeline.error() {
             tracing::error!(target: "mux", error = %e, "WritebackFile dropped with a writeback error");
         }
+        // Muxers close via `flush` + drop, never `sync_all`: release the reservation here too.
+        self.release_reservation();
     }
 }
 
@@ -656,6 +669,53 @@ mod tests {
         w.sync_all().unwrap();
         let blocks = std::fs::metadata(&p).unwrap().blocks();
         assert!(blocks < 1024, "reservation kept: {blocks} 512-byte blocks");
+    }
+
+    // The mux path (resolve.rs `writeback_file`): BufWriter over the hinted file, closed by
+    // flush + drop only, never `sync_all`. The reservation must still be released.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn size_hint_reservation_is_released_on_mux_close() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hint-mux.bin");
+        let f = WritebackFile::create_with_size_hint(&p, 64 * 1024 * 1024).unwrap();
+        let mut w = std::io::BufWriter::with_capacity(64 * 1024, f);
+        w.write_all(&[7u8; 100 * 1024]).unwrap();
+        w.flush().unwrap();
+        drop(w);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 100 * 1024);
+        let blocks = std::fs::metadata(&p).unwrap().blocks();
+        assert!(blocks < 4096, "reservation kept: {blocks} 512-byte blocks");
+    }
+
+    // The reservation is released only after a successful sync: a failed (or halted) sync
+    // must not truncate, as that setattr is a halt-blind full flush on NFS.
+    #[test]
+    fn failed_sync_keeps_size_hint_reservation() {
+        struct FailFinish;
+        impl FlushOps for FailFinish {
+            fn chunk(&self, _: &File) -> io::Result<()> {
+                Ok(())
+            }
+            fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
+                None
+            }
+            fn finish(&self, _: &File) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(5))
+            }
+            fn sample(&self) -> Option<u64> {
+                None
+            }
+        }
+        let file = tempfile::tempfile().unwrap();
+        let mut w =
+            WritebackFile::with_flush_ops(file, Arc::new(FailFinish), FlushTiming::default())
+                .unwrap();
+        w.hinted = true;
+        w.write_all(b"partial").unwrap();
+        assert!(w.sync_all().is_err(), "the final flush failed");
+        assert!(w.hinted, "reservation released before a successful sync");
     }
 
     // `sync_all` is idempotent: calling it twice, then Drop (also
