@@ -22,6 +22,8 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - name: Read the crate's MSRV
         id: msrv
         working-directory: libfreemkv

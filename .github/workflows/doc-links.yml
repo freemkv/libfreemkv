@@ -1,9 +1,9 @@
 name: doc-links
 
 # Thin caller → the canonical reusable doc-links gate in freemkv/.github.
-# libfreemkv path-deps freemkv-unlock, so the reusable checks it out as a sibling
-# (no [patch] needed — the layout resolves the path dep) and resolves the
-# toolchain from rust-version.
+# libfreemkv deps freemkv-unlock by version (git-tag override), so the reusable
+# checks it out as a sibling and path-patches it, and resolves the toolchain
+# from rust-version.
 on: [push, pull_request]
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,3 +15,4 @@ jobs:
     with:
       self: libfreemkv
       checkout: freemkv-unlock
+      patch: freemkv-unlock
