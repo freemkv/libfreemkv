@@ -23,10 +23,7 @@ const NAL_SEI_SUFFIX: u8 = 40;
 // Mastering Display Colour Volume (D.2.28) = 137, Content Light Level Info (D.2.35) = 144.
 const SEI_MASTERING_DISPLAY_COLOUR_VOLUME: u32 = 137;
 const SEI_CONTENT_LIGHT_LEVEL_INFO: u32 = 144;
-// Dolby Vision RPU (Reference Processing Unit) — NAL type 62 (UNSPEC62).
-// This is NOT filtered: all NAL types except VPS/SPS/PPS/AUD pass through
-// to frame data, so DV enhancement layer RPU NALs are preserved automatically.
-const _NAL_UNSPEC62_DV_RPU: u8 = 62;
+// Dolby Vision RPU NALs (type 62) pass through: only VPS/SPS/PPS/AUD are filtered.
 // IRAP types (keyframes): BLA, IDR, CRA
 const NAL_BLA_W_LP: u8 = 16;
 const NAL_RSV_IRAP_VCL23: u8 = 23;
@@ -445,6 +442,8 @@ impl CodecParser for HevcParser {
 
         let data = &pes.data;
         let mut keyframe = false;
+        // Set once the first CRA of a non-seamless join is seen in this AU.
+        let mut bla_au = false;
         // Picture coding type, MEASURED from the first coded slice's header.
         let mut coding_type: Option<CodingType> = None;
         // Track whether THIS access unit already carried each param-set type
@@ -537,18 +536,17 @@ impl CodecParser for HevcParser {
                             // non-seamless boundary becomes BLA_W_LP so NoRaslOutput
                             // drops RASL. Any IRAP clears the flag; only CRA is rewritten.
                             if self.pending_clip_boundary && t == NAL_CRA_NUT {
-                                // First CRA after a non-seamless boundary: rewrite
-                                // its header type to BLA_W_LP. NAL type is bits 1-6
-                                // of byte 0: byte = (byte & 0x81) | (type << 1).
-                                self.pending_clip_boundary = false;
+                                bla_au = true;
+                            }
+                            self.pending_clip_boundary = false;
+                            if bla_au && t == NAL_CRA_NUT {
+                                // Rewrite EVERY CRA slice of this picture (7.4.2.4.4:
+                                // one type per picture). NAL type is bits 1-6 of
+                                // byte 0: byte = (byte & 0x81) | (type << 1).
                                 let mut rewritten = data[nal_start..end].to_vec();
                                 rewritten[0] = (rewritten[0] & 0x81) | (NAL_BLA_W_LP << 1);
                                 push_length_prefixed(&mut frame_data, &rewritten);
                             } else {
-                                // Any IRAP clears a pending boundary (it's been
-                                // reached and handled — an IDR needs no rewrite),
-                                // but only a CRA is modified.
-                                self.pending_clip_boundary = false;
                                 push_length_prefixed(&mut frame_data, &data[nal_start..end]);
                             }
                         }
@@ -725,13 +723,14 @@ impl CodecParser for HevcParser {
         record.push(3); // VPS, SPS, PPS
 
         // VPS array
-        record.push(0x20 | (NAL_VPS & 0x3F)); // array_completeness + NAL type
+        record.push(0x20 | (NAL_VPS & 0x3F)); // array_completeness (0) + NAL type
         record.extend_from_slice(&[0, 1]); // numNalus = 1
         record.push((vps.len() >> 8) as u8);
         record.push(vps.len() as u8);
         record.extend_from_slice(vps);
 
         // SPS array
+        // array_completeness = 0: param sets are also re-asserted in-band.
         record.push(0x20 | (NAL_SPS & 0x3F));
         record.extend_from_slice(&[0, 1]);
         record.push((sps.len() >> 8) as u8);
@@ -915,7 +914,7 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
     // sps_seq_parameter_set_id ue(v)
     r.read_ue()?;
     // chroma_format_idc ue(v)
-    let chroma_format_idc = r.read_ue()? as u8;
+    let chroma_format_idc = u8::try_from(r.read_ue()?).ok().filter(|&c| c <= 3)?;
     if chroma_format_idc == 3 {
         // separate_colour_plane_flag u(1)
         r.skip_bits(1)?;
@@ -931,8 +930,8 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
         r.read_ue()?;
     }
     // bit_depth_luma_minus8 ue(v), bit_depth_chroma_minus8 ue(v)
-    let bit_depth_luma_minus8 = r.read_ue()? as u8;
-    let bit_depth_chroma_minus8 = r.read_ue()? as u8;
+    let bit_depth_luma_minus8 = u8::try_from(r.read_ue()?).ok().filter(|&d| d <= 8)?;
+    let bit_depth_chroma_minus8 = u8::try_from(r.read_ue()?).ok().filter(|&d| d <= 8)?;
     // The ordering-info tail is optional to the hvcC caller: a cut-short SPS keeps
     // its chroma fields and only loses R.
     let (max_num_reorder_pics, picture_period_ticks) =
@@ -1126,10 +1125,8 @@ fn parse_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> Op
             level_present[i] = r.read_bit()? == 1;
         }
         // reserved_zero_2bits for i in max_sub_layers_minus1..8
-        if max_sub_layers_minus1 < 8 {
-            for _ in max_sub_layers_minus1..8 {
-                r.skip_bits(2)?;
-            }
+        for _ in max_sub_layers_minus1..8 {
+            r.skip_bits(2)?;
         }
         for i in 0..max_sub_layers_minus1 as usize {
             if profile_present[i] {
@@ -2260,6 +2257,21 @@ mod tests {
         d
     }
 
+    /// Every slice NAL of the spliced CRA picture must get the same BLA type.
+    #[test]
+    fn multi_slice_cra_at_boundary_all_rewritten() {
+        let mut parser = HevcParser::new();
+        parser.mark_clip_boundary();
+        let mut au = cra_au(&[0x10, 0x20]);
+        au.extend_from_slice(&cra_au(&[0x30, 0x40]));
+        let frames = parser.parse(&make_pes(au, Some(0)));
+        let types: Vec<u8> = nals_of(&frames[0].data)
+            .iter()
+            .map(|n| nal_type_of(n))
+            .collect();
+        assert_eq!(types, vec![NAL_BLA_W_LP, NAL_BLA_W_LP]);
+    }
+
     /// Test 1: a CRA at a MARKED non-seamless boundary is rewritten to BLA_W_LP.
     #[test]
     fn cra_at_marked_boundary_rewritten_to_bla() {
@@ -2944,6 +2956,12 @@ mod tests {
         let mut sps = hevc_nal_header(33).to_vec();
         sps.extend_from_slice(&w.bytes);
         sps
+    }
+
+    #[test]
+    fn sps_chroma_rejects_out_of_range_values() {
+        assert!(parse_sps_chroma(&make_sps_with_chroma(259, 0, 0)).is_none());
+        assert!(parse_sps_chroma(&make_sps_with_chroma(1, 259, 0)).is_none());
     }
 
     fn codec_private_from_sps(sps_nal: &[u8]) -> Vec<u8> {

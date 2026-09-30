@@ -273,14 +273,7 @@ impl CodecParser for H264Parser {
                         }
                     }
                     saw_vcl |= is_slice;
-                    // A NAL longer than u32::MAX can't be length-prefixed in the
-                    // 4-byte field; skip it rather than mis-frame the output.
-                    // Unreachable in practice (no real AU is >4 GiB).
-                    let Ok(len) = u32::try_from(nal.len()) else {
-                        continue;
-                    };
-                    frame_data.extend_from_slice(&len.to_be_bytes());
-                    frame_data.extend_from_slice(nal);
+                    push_length_prefixed(&mut frame_data, nal);
                 }
             }
         }
@@ -536,8 +529,9 @@ pub(crate) struct SpsDtsInfo {
 }
 
 // Profiles whose SPS carries chroma_format_idc, bit depths and scaling lists (H.264 §7.3.2.1.1).
-const SPS_CHROMA_PROFILES: [u32; 13] =
-    [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+const SPS_CHROMA_PROFILES: [u32; 14] = [
+    100, 110, 122, 144, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+];
 
 // Intra profiles when constraint_set3_flag = 1: no reordering (design §2.3 step 2, H.264 E.2.1 [I]).
 const INTRA_PROFILES: [u32; 6] = [44, 86, 100, 110, 122, 244];
@@ -2124,6 +2118,20 @@ mod tests {
         ];
         sps.extend_from_slice(&payload);
         sps
+    }
+
+    #[test]
+    fn dts_info_walks_chroma_block_for_profile_144() {
+        // sps_id 0, chroma 1, depths 0/0, no bypass/scaling, log2_max_frame_num_minus4 0,
+        // poc type 2, 1 ref, no gaps, 1x1 MB, frame_mbs_only, direct8x8, no crop/VUI, stop.
+        let bits = "1010110010110100111100 1".replace(' ', "");
+        let mut bytes = vec![0x67, 144, 0x00, 0x28];
+        let padded = format!("{bits:0<32}");
+        for c in padded.as_bytes().chunks(8) {
+            bytes.push(u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap());
+        }
+        let info = parse_sps_dts_info(&bytes).expect("sps parses");
+        assert_eq!(info.log2_max_frame_num, 4);
     }
 
     fn feed_sps_pps(parser: &mut H264Parser, sps_bytes: &[u8]) {
