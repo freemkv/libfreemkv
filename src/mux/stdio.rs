@@ -12,8 +12,8 @@ use std::io::{self, Read, Write};
 pub struct StdioStream {
     disc_title: DiscTitle,
     // Boxed so tests can drive the header logic without real stdin/stdout.
-    reader: Option<Box<dyn Read + Send>>,
-    writer: Option<io::BufWriter<Box<dyn Write + Send>>>,
+    reader: Option<Box<dyn Read + Send + Sync>>,
+    writer: Option<io::BufWriter<Box<dyn Write + Send + Sync>>>,
     header_written: bool,
     header_read: bool,
     /// True once an FMKV header was actually parsed on the read side
@@ -35,7 +35,7 @@ impl StdioStream {
         Self::from_reader(Box::new(io::stdin()))
     }
 
-    fn from_reader(reader: Box<dyn Read + Send>) -> Self {
+    fn from_reader(reader: Box<dyn Read + Send + Sync>) -> Self {
         Self {
             disc_title: DiscTitle::empty(),
             reader: Some(reader),
@@ -53,7 +53,7 @@ impl StdioStream {
         Self::from_writer(title, Box::new(io::stdout()))
     }
 
-    fn from_writer(title: &DiscTitle, writer: Box<dyn Write + Send>) -> Self {
+    fn from_writer(title: &DiscTitle, writer: Box<dyn Write + Send + Sync>) -> Self {
         Self {
             disc_title: title.clone(),
             reader: None,
@@ -197,6 +197,13 @@ impl crate::pes::Stream for StdioStream {
 mod tests {
     use super::*;
     use crate::pes::Stream as _;
+
+    // The pub type keeps the auto traits it had when it held Stdin/Stdout.
+    #[test]
+    fn stdio_stream_is_send_and_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<StdioStream>();
+    }
 
     fn title_with_codec_privates() -> DiscTitle {
         use crate::disc::{Codec, Stream, VideoStream};
