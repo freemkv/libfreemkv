@@ -313,6 +313,21 @@ impl ReadState {
         self.additions_dropped = self.additions_dropped.saturating_add(1);
         self.additions_dropped_bytes = self.additions_dropped_bytes.saturating_add(bytes);
     }
+
+    // Count frames whose ContentEncoding could not be undone (see `parse_block_counted`).
+    fn count_undecoded(&mut self, lost: &[u64]) {
+        if !lost.is_empty() && self.additions_dropped == 0 {
+            tracing::warn!(
+                target: "mux",
+                code = crate::error::E_MKV_SOURCE_INVALID,
+                "mkv read-back: a compressed frame could not be inflated; dropped and \
+                 counted in lost_bytes/errors"
+            );
+        }
+        for &bytes in lost {
+            self.count_lost(bytes);
+        }
+    }
 }
 
 // Safety cap on frames buffered before the first video frame triggers muxer
@@ -1189,13 +1204,14 @@ impl MkvStream {
                         rs.count_lost(size);
                         continue;
                     }
-                    let frames = parse_block(
+                    let (frames, lost) = parse_block_counted(
                         &block,
                         rs.cluster_ts_ticks,
                         rs.ts_scale_ns,
                         &rs.tracks,
                         None,
                     )?;
+                    rs.count_undecoded(&lost);
                     rs.pending.extend(frames);
                     if let Some(frame) = rs.pending.pop_front() {
                         return Ok(Some(frame));
@@ -1217,6 +1233,9 @@ impl MkvStream {
                     // so reading it broke every MPEG-2 frame (always this path).
                     let mut has_reference = false;
                     let mut discard_padding_ns = 0i64;
+                    // BlockAdditions (count, bytes), tallied only if the Block itself is kept,
+                    // so a dropped group is counted once.
+                    let mut additions = (0u64, 0u64);
                     while remaining > 0 {
                         let (cid, cs, hlen) = ebml::read_element_header(&mut rs.reader)?;
                         if cs == u64::MAX {
@@ -1258,22 +1277,8 @@ impl MkvStream {
                                 skip_bytes(&mut rs.reader, cs)?;
                             }
                             ebml::BLOCK_ADDITIONS => {
-                                // Carries the MVC dependent-view AU for 3D titles; `PesFrame`
-                                // has no side-payload field so it can't be reconstructed, and a
-                                // 3D re-mux silently became 2D. Must NOT be silent: account it.
-                                if rs.additions_dropped == 0 {
-                                    tracing::warn!(
-                                        target: "mux",
-                                        bytes = cs,
-                                        "mkv read-back: dropping a BlockAdditions payload this \
-                                         reader cannot carry (a Blu-ray 3D MVC dependent view is \
-                                         the expected case); the output will be base-view only. \
-                                         Counted in lost_bytes/errors."
-                                    );
-                                }
-                                rs.additions_dropped = rs.additions_dropped.saturating_add(1);
-                                rs.additions_dropped_bytes =
-                                    rs.additions_dropped_bytes.saturating_add(cs);
+                                additions.0 += 1;
+                                additions.1 = additions.1.saturating_add(cs);
                                 skip_bytes(&mut rs.reader, cs)?;
                             }
                             _ => skip_bytes(&mut rs.reader, cs)?,
@@ -1300,19 +1305,37 @@ impl MkvStream {
                         rs.count_lost(size);
                         continue;
                     }
+                    if block.is_some() && additions.0 > 0 {
+                        // Carries the MVC dependent-view AU for 3D titles; `PesFrame` has no
+                        // side-payload field, so a 3D re-mux becomes 2D. Never silent: counted.
+                        if rs.additions_dropped == 0 {
+                            tracing::warn!(
+                                target: "mux",
+                                bytes = additions.1,
+                                "mkv read-back: dropping a BlockAdditions payload this \
+                                 reader cannot carry (a Blu-ray 3D MVC dependent view is \
+                                 the expected case); the output will be base-view only. \
+                                 Counted in lost_bytes/errors."
+                            );
+                        }
+                        rs.additions_dropped = rs.additions_dropped.saturating_add(additions.0);
+                        rs.additions_dropped_bytes =
+                            rs.additions_dropped_bytes.saturating_add(additions.1);
+                    }
                     if let Some(block) = block {
                         // BLOCK_DURATION is TimestampScale ticks, not ms — scale by
                         // ts_scale_ns (1_000_000 for our own 1ms scale, non-default
                         // in foreign MKVs), same scaling PTS uses.
                         let dur_ns =
                             duration_ms.map(|ticks| ticks.saturating_mul(rs.ts_scale_ns as u64));
-                        let frames = parse_block(
+                        let (frames, lost) = parse_block_counted(
                             &block,
                             rs.cluster_ts_ticks,
                             rs.ts_scale_ns,
                             &rs.tracks,
                             dur_ns,
                         )?;
+                        rs.count_undecoded(&lost);
                         // Override the flag-bit guess from `parse_block`
                         // (meaningful for SimpleBlock only) with the
                         // BlockGroup's authoritative signal.
@@ -2352,14 +2375,22 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         );
         codec_priv = None;
     }
-    let codec_priv = match codec_priv {
-        Some(cp) => Some(decode_content(
-            &enc.private,
-            cp,
-            MAX_CODEC_PRIVATE as usize,
-        )?),
-        None => None,
-    };
+    // A CodecPrivate that cannot be undone makes the track undecodable, not the file.
+    let codec_priv =
+        match codec_priv.map(|cp| decode_content(&enc.private, cp, MAX_CODEC_PRIVATE as usize)) {
+            Some(Ok(cp)) => Some(cp),
+            Some(Err(_)) => {
+                tracing::warn!(
+                    target: "mux",
+                    code = crate::error::E_MKV_SOURCE_INVALID,
+                    track_number = tnum,
+                    "mkv read-back: compressed CodecPrivate could not be inflated; track dropped"
+                );
+                enc.undecodable = true;
+                None
+            }
+            None => None,
+        };
     // &str consts can't be `match` patterns, so compare via guards — this keeps
     // the single source of truth in `ebml::CODEC_*` shared with the muxer.
     let cid = codec_id.as_str();
@@ -2693,6 +2724,7 @@ pub(crate) fn split_lacing(lacing: u8, body: &[u8]) -> Option<Vec<&[u8]>> {
 
 // Parse a (Simple)Block payload into zero or more PesFrames: zero means SKIPPED (too
 // short/track 0/undeclared TrackNumber), >1 means LACED, `Err` means a malformed lacing header.
+#[cfg(test)]
 fn parse_block(
     block: &[u8],
     cluster_ts_ticks: i64,
@@ -2700,16 +2732,38 @@ fn parse_block(
     tracks: &TrackTable,
     duration_ns: Option<u64>,
 ) -> io::Result<Vec<crate::pes::PesFrame>> {
-    let mut frames = parse_block_raw(block, cluster_ts_ticks, ts_scale_ns, tracks, duration_ns)?;
-    for f in &mut frames {
+    parse_block_counted(block, cluster_ts_ticks, ts_scale_ns, tracks, duration_ns).map(|(f, _)| f)
+}
+
+// `parse_block` plus the encoded sizes of frames whose ContentEncoding could not be undone
+// (corrupt zlib, past the size cap): those frames are dropped, never passed on raw.
+fn parse_block_counted(
+    block: &[u8],
+    cluster_ts_ticks: i64,
+    ts_scale_ns: i64,
+    tracks: &TrackTable,
+    duration_ns: Option<u64>,
+) -> io::Result<(Vec<crate::pes::PesFrame>, Vec<u64>)> {
+    let frames = parse_block_raw(block, cluster_ts_ticks, ts_scale_ns, tracks, duration_ns)?;
+    let mut kept = Vec::with_capacity(frames.len());
+    let mut lost = Vec::new();
+    for mut f in frames {
         if let Some(steps) = tracks.decode.get(f.track).filter(|s| !s.is_empty()) {
-            f.data = decode_content(steps, std::mem::take(&mut f.data), MAX_BLOCK_SIZE as usize)?;
+            let len = f.data.len() as u64;
+            match decode_content(steps, std::mem::take(&mut f.data), MAX_BLOCK_SIZE as usize) {
+                Ok(d) => f.data = d,
+                Err(_) => {
+                    lost.push(len);
+                    continue;
+                }
+            }
         }
         if let Some(Some(layout)) = tracks.pcm.get(f.track) {
             f.data = layout.to_be24(&f.data);
         }
+        kept.push(f);
     }
-    Ok(frames)
+    Ok((kept, lost))
 }
 
 fn parse_block_raw(
@@ -7750,6 +7804,60 @@ mod readback_tests {
             };
             assert_eq!(a.sample_rate, want, "{hz}");
         }
+    }
+
+    #[test]
+    fn a_corrupt_zlib_frame_is_dropped_and_counted_not_fatal() {
+        let good = b"a vobsub packet".to_vec();
+        let mut bad_block = vec![0x81, 0x00, 0x00, 0x80];
+        bad_block.extend_from_slice(&[0x78, 0x9C, 0xFF, 0xFF, 0xFF]);
+        let mut good_block = vec![0x81, 0x00, 0x00, 0x80];
+        good_block.extend(zlib(&good));
+        let enc = encodings(&compression(None, &[]));
+        let bytes = mkv(
+            &[entry(1, 17, ebml::CODEC_VOBSUB, &enc)],
+            &cluster_of(&[&bad_block, &good_block]),
+        );
+        let mut s = open(bytes);
+        let frames = drain_all(&mut s);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, good);
+        assert_eq!(s.errors(), 1);
+        assert_eq!(s.lost_bytes(), 5);
+    }
+
+    #[test]
+    fn a_corrupt_compressed_codec_private_drops_the_track_not_the_file() {
+        let mut extra =
+            encodings(&[uint(CONTENT_ENCODING_SCOPE, 2), compression(Some(0), &[])].concat());
+        ebml::write_binary(&mut extra, ebml::CODEC_PRIVATE, &[0x78, 0x9C, 0xFF]).unwrap();
+        let entries = [
+            entry(1, 1, ebml::CODEC_H264, &[]),
+            entry(2, 17, ebml::CODEC_VOBSUB, &extra),
+        ];
+        let s = MkvStream::open(Cursor::new(mkv(&entries, &[]))).expect("file still opens");
+        assert_eq!(s.info().streams.len(), 1);
+        let p = probe_mkv(Cursor::new(mkv(&entries, &[]))).expect("probe still works");
+        assert_eq!(p.tracks.len(), 2);
+    }
+
+    #[test]
+    fn a_block_group_of_a_dropped_track_is_counted_once() {
+        let enc =
+            encodings(&[uint(CONTENT_ENCODING_TYPE, 1), el(CONTENT_ENCRYPTION, &[])].concat());
+        let group = [
+            el(ebml::BLOCK, &[0x81, 0x00, 0x00, 0x00, 0xDE]),
+            el(ebml::BLOCK_ADDITIONS, &[0u8; 4]),
+        ]
+        .concat();
+        let mut c = el(ebml::CLUSTER, &[]);
+        c.truncate(c.len() - 1);
+        ebml::write_unknown_size(&mut c).unwrap();
+        c.extend(uint(ebml::CLUSTER_TIMESTAMP, 0));
+        c.extend(el(ebml::BLOCK_GROUP, &group));
+        let mut s = open(mkv(&[entry(1, 2, ebml::CODEC_AC3, &enc)], &c));
+        assert!(drain_all(&mut s).is_empty());
+        assert_eq!(s.errors(), 1);
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
