@@ -812,8 +812,10 @@ pub(crate) fn parse_pgcit(
     let mut skipped = 0usize;
 
     for &(chapter_count, vts_title_num) in titles_info {
-        // TTN -> PGC goes through PTT_SRPT; without it assume 1:1 (TTN is 1-based).
+        // TTN -> PGC goes through PTT_SRPT; without it (or when its PGCN is past the
+        // table) assume 1:1 (TTN is 1-based).
         let pgc_index = ptt_srpt_pgc_index(data, ptt_offset, vts_title_num)
+            .filter(|&i| i < num_pgcs as usize)
             .unwrap_or(vts_title_num.saturating_sub(1) as usize);
         if pgc_index >= num_pgcs as usize {
             skipped += 1;
@@ -931,20 +933,9 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         );
     }
 
-    // Only one angle plays, so non-first angle cells after the leading (dropped, and
-    // shifted out by the scanner) cells add no time.
-    let lead = leading_secondary_cells(&cells);
-    let plays =
-        |i: usize, cat: u8| i < lead || !CellCategory::decode(cat).is_secondary_block_piece();
-
     // Recalculate duration from cell times if PGC-level time is zero.
     let duration_secs = if duration_secs == 0.0 && !cells.is_empty() {
-        cells
-            .iter()
-            .enumerate()
-            .filter(|&(i, c)| plays(i, c.category))
-            .map(|(_, c)| c.duration_secs)
-            .sum()
+        cells.iter().map(|c| c.duration_secs).sum()
     } else {
         duration_secs
     };
@@ -966,10 +957,6 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
             for i in 0..num_cells {
                 let co = cell_base + i * 24;
                 if co + 8 > data.len() {
-                    cell_frames.push((0, 0.0));
-                    continue;
-                }
-                if !plays(i, data[co]) {
                     cell_frames.push((0, 0.0));
                     continue;
                 }
@@ -2723,6 +2710,22 @@ mod tests {
         assert_eq!(titles[0].duration_secs, 11.011);
     }
 
+    /// A PTT_SRPT PGCN past the table falls back to the 1:1 mapping, not a dropped title.
+    #[test]
+    fn pgcit_ptt_pgcn_past_table_falls_back_to_one_to_one() {
+        let pgc0 = build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None);
+        let pgc1 = build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None);
+        let pgcit = build_pgcit(&[pgc0, pgc1]);
+        let pgcit_at = 512usize;
+        let mut data = vec![0u8; pgcit_at];
+        data.extend_from_slice(&pgcit);
+        let ptt_at = data.len();
+        data.extend_from_slice(&build_ptt_srpt(&[9, 9]));
+        let titles = parse_pgcit(&data, pgcit_at, ptt_at, &[(5, 1), (6, 2)]).unwrap();
+        let got: Vec<f64> = titles.iter().map(|t| t.duration_secs).collect();
+        assert_eq!(got, vec![11.011, 22.022]);
+    }
+
     /// A title number past num_pgcs is dropped, even when an in-buffer 8-byte
     /// "entry" happens to sit at that index.
     #[test]
@@ -2736,37 +2739,6 @@ mod tests {
         data[28..32].copy_from_slice(&(pgc1_at as u32).to_be_bytes());
         let titles = parse_pgcit(&data, 0, 0, &[(5, 3)]).unwrap();
         assert!(titles.is_empty(), "TTN 3 of a 2-PGC table must be omitted");
-    }
-
-    // Cell category bytes for an angle block: block_type=1, block_mode 1/2/3.
-    const ANGLE_FIRST: u8 = 0b0101_0000;
-    const ANGLE_MID: u8 = 0b1001_0000;
-    const ANGLE_LAST: u8 = 0b1101_0000;
-
-    /// Only one angle plays: the other angles' cells add no time to later chapters
-    /// or to the zero-PGC-time duration fallback.
-    #[test]
-    fn pgc_multi_angle_cells_count_once_in_chapter_times_and_duration() {
-        let cells = [
-            (0x00, bcd_secs(10), 0, 9),
-            (ANGLE_FIRST, bcd_secs(20), 10, 19),
-            (ANGLE_MID, bcd_secs(20), 20, 29),
-            (ANGLE_LAST, bcd_secs(20), 30, 39),
-            (0x00, bcd_secs(30), 40, 49),
-        ];
-        let pgc = build_pgc(bcd_secs(59), &cells, &[1, 2, 5], None);
-        let title = parse_pgc(&pgc, 0, 3).unwrap();
-        let want = [0.0, 10.01, 30.03];
-        for (g, w) in title.chapter_times.iter().zip(want) {
-            assert!((g - w).abs() < 1e-9, "chapters {:?}", title.chapter_times);
-        }
-        let zero_time = build_pgc([0; 4], &cells, &[1, 2, 5], None);
-        let title = parse_pgc(&zero_time, 0, 3).unwrap();
-        assert!(
-            (title.duration_secs - 60.06).abs() < 1e-6,
-            "duration {}",
-            title.duration_secs
-        );
     }
 
     /// Cells with no rate flag fall back to literal seconds; in a mixed-rate PGC the

@@ -210,6 +210,8 @@ pub struct AacsKeyMap {
     // (start_lba, end_lba, key_idx, phase). An LBA in NO range is passed through
     // untouched — the map is a positive list of "this key here", nothing more.
     ranges: Vec<(u32, u32, usize, Phase)>,
+    // Parallel to `ranges`: the original start each piece's unit parity is measured from.
+    anchors: Vec<u32>,
     // Distinct, sorted key indices the map selects — derived from `ranges` once at
     // construction so the per-batch decrypt bounds check does not re-allocate/sort
     // it on every read. Kept in sync by building both in `from_ranges_phased`.
@@ -233,24 +235,38 @@ impl AacsKeyMap {
     /// for base/CPS). Ranges are sorted; an LBA in no range is passed through.
     pub(crate) fn from_ranges_phased(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Self {
         ranges.sort_by_key(|&(start, _, _, _)| start);
-        // Enforce disjointness (entry_for relies on it): a range starting inside its
-        // predecessor takes over from there, and the predecessor is cut at that start.
+        // Disjointness (entry_for relies on it): each boundary-to-boundary stretch goes to
+        // the covering range that starts last; `anchors` keeps the ORIGINAL start that
+        // FMTS unit parity is measured from.
+        let mut bounds: Vec<u32> = ranges.iter().flat_map(|r| [r.0, r.1]).collect();
+        bounds.sort_unstable();
+        bounds.dedup();
         let mut disjoint: Vec<(u32, u32, usize, Phase)> = Vec::with_capacity(ranges.len());
-        for r in ranges {
-            if let Some(prev) = disjoint.last_mut()
-                && prev.1 > r.0
+        let mut anchors: Vec<u32> = Vec::with_capacity(ranges.len());
+        let mut srcs: Vec<usize> = Vec::with_capacity(ranges.len());
+        let mut overlapped = false;
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mut cover = (0..ranges.len()).rev().filter(|&i| {
+                let r = ranges[i];
+                r.0 <= a && b <= r.1 && r.0 < r.1
+            });
+            let Some(win) = cover.next() else { continue };
+            overlapped |= cover.next().is_some();
+            if srcs.last() == Some(&win)
+                && let Some(last) = disjoint.last_mut()
+                && last.1 == a
             {
-                tracing::warn!(
-                    start = r.0,
-                    prev_start = prev.0,
-                    "overlapping AACS key ranges; the later range takes over"
-                );
-                prev.1 = r.0;
+                last.1 = b;
+                continue;
             }
-            disjoint.retain(|&(s, e, _, _)| s < e);
-            if r.0 < r.1 {
-                disjoint.push(r);
-            }
+            let r = ranges[win];
+            disjoint.push((a, b, r.2, r.3));
+            anchors.push(r.0);
+            srcs.push(win);
+        }
+        if overlapped {
+            tracing::warn!("overlapping AACS key ranges; the later-starting range takes over");
         }
         let ranges = disjoint;
         let mut key_indices: Vec<usize> = ranges.iter().map(|&(_, _, i, _)| i).collect();
@@ -258,6 +274,7 @@ impl AacsKeyMap {
         key_indices.dedup();
         Self {
             ranges,
+            anchors,
             key_indices,
         }
     }
@@ -267,20 +284,17 @@ impl AacsKeyMap {
     /// the unit through untouched). O(log n). `range_start_lba` lets the mapped
     /// decrypt compute a unit's parity WITHIN a forensic segment (`Even`/`Odd`).
     pub fn entry_for(&self, lba: u32) -> Option<(usize, Phase, u32)> {
-        match self
+        let i = match self
             .ranges
             .binary_search_by(|&(start, _, _, _)| start.cmp(&lba))
         {
-            Ok(i) => {
-                let (start, _, idx, ph) = self.ranges[i];
-                Some((idx, ph, start))
-            }
-            Err(0) => None,
-            Err(i) => {
-                let (start, end, idx, ph) = self.ranges[i - 1];
-                (lba >= start && lba < end).then_some((idx, ph, start))
-            }
-        }
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let (start, end, idx, ph) = self.ranges[i];
+        (lba >= start && lba < end)
+            .then(|| (idx, ph, self.anchors.get(i).copied().unwrap_or(start)))
     }
 
     /// The unit-key index for the aligned unit at `lba`, or `None` when no range
@@ -1853,6 +1867,37 @@ mod tests {
     }
 
     // Overlapping ranges are made disjoint (later start wins) so entry_for stays sound.
+    #[test]
+    fn nested_key_range_keeps_outer_tail_and_phase_anchor() {
+        let map =
+            AacsKeyMap::from_ranges_phased(vec![(0, 100, 0, Phase::Even), (20, 60, 1, Phase::All)]);
+        assert_eq!(map.key_idx_for(80), Some(0));
+        assert_eq!(map.key_idx_for(40), Some(1));
+        assert_eq!(map.entry_for(80), Some((0, Phase::Even, 0)));
+        assert_eq!(map.entry_for(10), Some((0, Phase::Even, 0)));
+    }
+
+    /// Every sector of every input range resolves to some key.
+    #[test]
+    fn every_sector_of_every_input_range_gets_a_key() {
+        let input = vec![
+            (0, 100, 0),
+            (20, 30, 1),
+            (25, 60, 2),
+            (90, 120, 3),
+            (110, 115, 4),
+        ];
+        let map = AacsKeyMap::from_ranges(input.clone());
+        for (s, e, _) in input {
+            for lba in s..e {
+                assert!(map.key_idx_for(lba).is_some(), "lba {lba} lost its key");
+            }
+        }
+        assert_eq!(map.key_idx_for(60), Some(0));
+        assert_eq!(map.key_idx_for(116), Some(3));
+        assert_eq!(map.key_idx_for(120), None);
+    }
+
     #[test]
     fn overlapping_key_ranges_are_made_disjoint() {
         let map = AacsKeyMap::from_ranges(vec![(0, 100, 0), (20, 30, 1), (25, 60, 2), (60, 60, 3)]);
