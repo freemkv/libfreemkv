@@ -702,6 +702,8 @@ fn mpeg_audio_layer(data: &[u8], pid: u16) -> Option<u8> {
 // boundaries. Returns the section bytes (from table_id) or None.
 fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec<u8>> {
     let mut offset = 0;
+    // First complete copy, used only if no copy passes `psi_section_ok`.
+    let mut fallback = None;
     while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
         if !is_resync_point(data, offset) {
             offset += 1;
@@ -735,7 +737,12 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             section.extend_from_slice(&payload[sec_start..]);
             if section.len() >= total {
                 section.truncate(total);
-                return Some(section);
+                if psi_section_ok(&section) {
+                    return Some(section);
+                }
+                fallback.get_or_insert(section);
+                offset += BD_SOURCE_PACKET_BYTES;
+                continue;
             }
             // Need continuation packets: same PID, no PUSI. Use the canonical `cc_is_gap`
             // (§2.4.3.3) shared with `process_packet`, not a local test — a prior local
@@ -785,14 +792,25 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             }
             if section.len() >= total {
                 section.truncate(total);
-                return Some(section);
+                if psi_section_ok(&section) {
+                    return Some(section);
+                }
+                fallback.get_or_insert(section);
+                offset += BD_SOURCE_PACKET_BYTES;
+                continue;
             }
             // Incomplete section (truncated input) — stop looking.
-            return None;
+            return fallback;
         }
         offset += BD_SOURCE_PACKET_BYTES;
     }
-    None
+    fallback
+}
+
+// A long-form PSI section that is current (current_next_indicator 1) and passes its
+// CRC_32 (H.222.0 Annex A: over the whole section including the CRC, the register ends at 0).
+fn psi_section_ok(section: &[u8]) -> bool {
+    section.len() >= 12 && section[5] & 0x01 == 1 && super::mpg::pack::crc32(section) == 0
 }
 
 /// Scan BD-TS data for streams by parsing PAT and PMT tables.
@@ -1426,7 +1444,7 @@ mod tests {
         body[i + 9] = 0x01;
         body[i + 10] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
         body[i + 11] = (pmt_pid & 0xFF) as u8;
-        // (CRC bytes left as 0xFF — scanner doesn't validate CRC)
+        // (CRC left as 0xFF: with no valid copy the scanner uses the first one)
         let _ = &mut i;
         bdts_packet(body, 0, true)
     }
@@ -1571,6 +1589,32 @@ mod tests {
                 .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
             "H.264 video must be found past the adaptation field"
         );
+    }
+
+    // Give a single-packet PSI fixture (pointer_field 0) its real CRC_32.
+    fn with_psi_crc(mut pkt: Vec<u8>) -> Vec<u8> {
+        let total = 3 + ((((pkt[10] & 0x0F) as usize) << 8) | pkt[11] as usize);
+        let crc = crate::mux::mpg::pack::crc32(&pkt[9..9 + total - 4]);
+        pkt[9 + total - 4..9 + total].copy_from_slice(&crc.to_be_bytes());
+        pkt
+    }
+
+    // A PMT copy failing its CRC_32 (or not current) is skipped for a later valid copy.
+    #[test]
+    fn scan_streams_prefers_a_crc_valid_current_pmt() {
+        use crate::disc::{Codec, Stream};
+        let good = [(0x1b, 0x1011), (0x81, 0x1100)];
+        let mut flipped = with_psi_crc(pmt_packet(0x100, &good));
+        flipped[9 + 12 + 5] = 0x87; // second entry's stream_type, after the CRC was set
+        let mut next = with_psi_crc(pmt_packet(0x100, &[(0x1b, 0x1011), (0x87, 0x1100)]));
+        next[9 + 5] &= !0x01; // current_next_indicator 0: not yet applicable
+        let next = with_psi_crc(next);
+        let mut data = with_psi_crc(pat_packet(0x100));
+        for p in [flipped, next, with_psi_crc(pmt_packet(0x100, &good))] {
+            data.extend(p);
+        }
+        let streams = scan_streams(&data).unwrap();
+        assert!(matches!(&streams[1], Stream::Audio(a) if a.codec == Codec::Ac3));
     }
 
     #[test]
