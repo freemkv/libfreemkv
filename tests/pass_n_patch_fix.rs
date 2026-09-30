@@ -88,12 +88,6 @@ fn decrypt_keys_is_encrypted_variants() {
     let none = DecryptKeys::None;
     assert!(!none.is_encrypted());
 
-    let aacs = DecryptKeys::Aacs {
-        unit_keys: vec![],
-        format: libfreemkv::disc::ContentFormat::BdTs,
-    };
-    assert!(aacs.is_encrypted());
-
     let css = DecryptKeys::Css {
         title_key: [0u8; 5],
     };

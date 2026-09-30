@@ -520,22 +520,16 @@ fn dump_aacs(disc: &Disc) {
         }
         return;
     };
-    // CPS-unit / unit-key counts: at scan `unit_keys` is empty (keys are
-    // resolved later); the unit-key count is the BE16 in the raw
-    // Unit_Key_RO.inf if captured. Report both: resolved count and raw len.
+    // Key material is never on the disc (KU §2.2); report the raw AACS inputs' sizes.
     tracing::debug!(
         target: DIAG,
-        "tag=aacs version={} bus_enc={} mkb_version={} disc_hash={} key_source={:?} \
-    vuk={} unit_keys_resolved={} uk_ro_bytes={} mkb_bytes={}",
+        "tag=aacs version={} bus_enc={} mkb_version={} disc_hash={} uk_ro_bytes={} mkb_bytes={}",
         a.version,
         a.bus_encryption,
         a.mkb_version
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         a.disc_hash,
-        a.key_source,
-        a.vuk.is_some(),
-        a.unit_keys.len(),
         a.uk_ro.len(),
         a.mkb.len(),
     );

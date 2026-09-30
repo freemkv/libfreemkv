@@ -101,10 +101,10 @@ fn finish_release_and_unlock() {
 /// typed error, `Release` is a no-op.
 #[test]
 fn finish_without_a_drive() {
-    let s = DiscSession::from_parts_for_test(None, None, None);
+    let s = DiscSession::from_parts_for_test(None, None);
     assert!(s.finish(Finish::Release).is_ok());
     for how in [Finish::Unlock, Finish::Eject] {
-        let s = DiscSession::from_parts_for_test(None, None, None);
+        let s = DiscSession::from_parts_for_test(None, None);
         assert!(
             matches!(s.finish(how), Err(Error::DeviceNotReady { .. })),
             "{how:?}"

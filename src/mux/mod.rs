@@ -84,9 +84,7 @@ pub(crate) mod videomap;
 // The provenance types ARE public: `output()` takes a `SourceInfo` so an `fvi://`
 // destination records the INPUT it was built from (§6.2), not the file written.
 pub use disc::DiscStream;
-pub use driver::{
-    MuxEvents, MuxInput, MuxOptions, MuxOutcome, MuxSource, mux_stream, mux_with_keys,
-};
+pub use driver::{MuxEvents, MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
 pub use fit::{FitReport, SkipReason, fit_report};
 pub use m2ts::M2tsStream;
 pub use mkvstream::{
@@ -102,8 +100,6 @@ pub use mpg::MpgSink;
 pub use network::NetworkStream;
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
-pub use resolve::build_iso_pipeline;
-pub use resolve::resolve_mux_key_map;
 pub use resolve::{InputOptions, StreamUrl, input, output, parse_url};
 pub use stdio::StdioStream;
 
@@ -120,6 +116,8 @@ use std::io::{Seek, Write};
 pub trait WriteSeek: Write + Seek {}
 impl<T: Write + Seek> WriteSeek for T {}
 
+#[cfg(test)]
+mod fvi_pipeline_tests;
 #[cfg(test)]
 pub(crate) mod interop_tests;
 

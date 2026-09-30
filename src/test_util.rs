@@ -8,12 +8,13 @@
 //!   per aligned unit on each file's own grid (KS-1, KS-2, KS-3).
 //! - [`CountingSource`]: a [`SectorSource`] wrapper that logs every read.
 //! - [`decrypt_unit`]: the aligned-unit decrypt, for tests that check ciphertext.
+//! - [`damage_unit_seed`]: an aligned unit whose first sector read back as garbage.
 //! - [`FakeTransport`]: a scripted drive with a state model for Stop tests (stop §5.0).
 
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::aacs::mkb::AacsVersion;
 use crate::consts::{BD_SOURCE_PACKET_BYTES, SECTOR_BYTES};
-use crate::disc::{AacsState, KeyOrigin};
+use crate::disc::AacsState;
 use crate::error::Result;
 use crate::sector::SectorSource;
 use std::sync::{Arc, Mutex};
@@ -64,8 +65,7 @@ pub fn unit_key_ro(
 
 /// Builds an [`AacsState`] for a test: start from [`aacs_state`], set what the test
 /// needs, then [`AacsStateBuilder::build`]. Defaults: AACS 1.0, no bus encryption,
-/// no MKB version, empty disc hash, [`KeyOrigin::ExternalUk`], no VUK, no unit keys,
-/// a zero Volume ID, and empty `uk_ro` / `mkb`.
+/// no MKB version, empty disc hash, a zero Volume ID, and empty `uk_ro` / `mkb`.
 #[must_use]
 pub struct AacsStateBuilder {
     state: AacsState,
@@ -79,9 +79,6 @@ pub fn aacs_state() -> AacsStateBuilder {
             bus_encryption: false,
             mkb_version: None,
             disc_hash: String::new(),
-            key_source: KeyOrigin::ExternalUk,
-            vuk: None,
-            unit_keys: Vec::new(),
             volume_id: [0u8; 16],
             uk_ro: Vec::new(),
             mkb: Vec::new(),
@@ -104,18 +101,6 @@ impl AacsStateBuilder {
     }
     pub fn disc_hash(mut self, hash: impl Into<String>) -> Self {
         self.state.disc_hash = hash.into();
-        self
-    }
-    pub fn key_source(mut self, origin: KeyOrigin) -> Self {
-        self.state.key_source = origin;
-        self
-    }
-    pub fn vuk(mut self, vuk: Option<[u8; 16]>) -> Self {
-        self.state.vuk = vuk;
-        self
-    }
-    pub fn unit_keys(mut self, keys: Vec<(u32, [u8; 16])>) -> Self {
-        self.state.unit_keys = keys;
         self
     }
     pub fn volume_id(mut self, vid: [u8; 16]) -> Self {
@@ -378,6 +363,17 @@ impl<S: SectorSource> SectorSource for CountingSource<S> {
 /// test-side door to the unit decrypt, so no consumer test needs the internal one.
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     crate::aacs::content::decrypt_unit(unit, unit_key)
+}
+
+/// Overwrite the first sector of an aligned unit with garbage that keeps the encrypted flag
+/// (CPI 11₂, KS-5) but not the seed's TS sync at byte 4 (KS-2, KS-4): read damage that no
+/// key opens, as a drive returning the wrong bytes leaves it.
+pub fn damage_unit_seed(unit: &mut [u8]) {
+    for (i, b) in unit[..SECTOR_BYTES].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37) ^ 0xA5;
+    }
+    unit[0] |= 0xC0;
+    unit[4] = 0x00;
 }
 
 #[path = "test_util_fake.rs"]

@@ -44,8 +44,8 @@ pub struct ExtractOptions<'a> {
     pub halt: Option<crate::halt::Halt>,
     /// The rip's up-front key set (KU §3.1), scope `WholeDisc`. For an AACS disc every file
     /// is read through the set's reader: proven files by its map, the rest proven on
-    /// arrival, and a readable unit no held key opens stops the run (E7032). `None` keeps
-    /// the legacy disc-banked keys (until KU-X2).
+    /// arrival, and a readable unit no held key opens stops the run (E7032). `None`
+    /// decrypts no AACS: the caller's `check_decryptable` gate refuses an AACS disc first.
     pub keys: Option<&'a crate::keys::ResolvedKeySet>,
 }
 
@@ -120,7 +120,7 @@ impl Disc {
     ///
     /// `reader` is consumed for content reads. `dest` receives the tree
     /// STRAIGHT IN (no auto-named subfolder). The caller must have run the
-    /// pre-flight decrypt gate ([`ensure_decryptable`](Disc::ensure_decryptable)).
+    /// pre-flight decrypt gate ([`check_decryptable`](crate::keys::check_decryptable)).
     ///
     /// Bad sectors become zero-filled holes (the run does not abort); files
     /// are written `<name>.partial` and renamed on success.
@@ -192,10 +192,8 @@ impl Disc {
         }
 
         // Per-VTS CSS key map (DVD only): "VTS_xx" -> DecryptKeys. Built lazily
-        // when a scrambled VOB group needs it. AACS / None discs keep the
-        // disc-wide keys for every file.
+        // when a scrambled VOB group needs it. An AACS disc reads through the rip's set.
         let mut base_keys = self.decrypt_keys();
-        // The rip's key set replaces the disc-banked keys and the count rule below (K-2).
         let keyed = opts.keys.filter(|s| s.is_aacs());
         if let Some(set) = keyed {
             crate::keys::check_decryptable(
@@ -207,45 +205,15 @@ impl Disc {
             base_keys = set.decrypt_keys();
         }
 
-        // AACS key map, by CPS-unit count. Single-CPS: one Unit Key opens
-        // everything, so a blanket key-0 map covers even orphan clips. Multi-CPS
-        // builds an exact per-title map instead (a blanket map would mis-decrypt).
-        let key_map = match &base_keys {
-            _ if keyed.is_some() => None,
-            DecryptKeys::Aacs { unit_keys, .. } if unit_keys.len() <= 1 => {
-                Some(std::sync::Arc::new(
-                    crate::decrypt::AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]),
-                ))
-            }
-            DecryptKeys::Aacs { .. } => {
-                match self.resolve_content_key_map(reader, &mut base_keys, None, opts.halt.as_ref())
-                {
-                    Ok(map) => Some(std::sync::Arc::new(map)),
-                    // A Stop is a halted run, not an error (same as the CSS arm).
-                    Err(Error::Halted) => {
-                        return Ok(ExtractResult {
-                            halted: true,
-                            ..Default::default()
-                        });
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            _ => None,
-        };
-
         // Phase 2: stream each file through the decrypting decorator, which owns a
         // borrowing wrapper so the caller keeps `reader`. Keys swap per CSS VTS
-        // group via `set_keys`; AACS/None keep `base_keys` throughout.
+        // group via `set_keys`; AACS reads through the set's reader.
         let mut dec = match keyed {
             Some(set) => {
                 set.decrypting(Borrowed(reader), None, crate::keys::StopKind::Image, false)?
             }
             None => DecryptingSectorSource::new(Borrowed(reader), base_keys.clone()),
         };
-        if let Some(map) = key_map {
-            dec = dec.with_key_map(map);
-        }
 
         let mut result = ExtractResult::default();
         let total_bytes = required;
@@ -710,6 +678,7 @@ fn extract_one_file<S: SectorSource>(
             let batch = whole_unit_batch(sectors - sector_off);
             let want = batch as usize * SECTOR_BYTES;
             let start = abs_lba.checked_add(sector_off);
+            let blanked_before = dec.blanked_units();
             let read_ok = match start.filter(|l| l.checked_add(batch - 1).is_some()) {
                 // Crafted extent past u32::MAX: no such sector — a hole, not a wrapped read.
                 None => false,
@@ -726,7 +695,13 @@ fn extract_one_file<S: SectorSource>(
             let usable = chunk_bytes.min(remaining) as usize;
             if read_ok {
                 write_all(&mut writer, &buf[..usable], &partial_path)?;
-                fr.bytes_good = fr.bytes_good.saturating_add(usable as u64);
+                // Damaged AACS units the reader blanked are unreadable, not good bytes.
+                let unit = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
+                let blanked = (dec.blanked_units() - blanked_before) * unit;
+                let blanked = blanked.min(usable as u64);
+                fr.bytes_good = fr.bytes_good.saturating_add(usable as u64 - blanked);
+                fr.bytes_unreadable = fr.bytes_unreadable.saturating_add(blanked);
+                *done_unreadable = done_unreadable.saturating_add(blanked);
             } else {
                 // Bad sector(s): zero-fill this byte range, record the hole,
                 // keep going (no abort, no sweep-skip).
@@ -1362,9 +1337,9 @@ mod tests {
         unit
     }
 
-    // A `Disc` carrying an AACS unit key so `decrypt_keys()` engages the
-    // unit-alignment gate. Content is genuinely encrypted under the key, so a
-    // clean decrypt isolates the GATE from a false decrypt-loss tally.
+    // An AACS `Disc`: its key comes from a set over it (`keyed_for_test`), which engages
+    // the unit-alignment gate. Content is genuinely encrypted under the key, so a clean
+    // decrypt isolates the GATE from a false decrypt-loss tally.
     fn aacs_disc() -> Disc {
         let mut d = clear_disc();
         d.encrypted = true;
@@ -1373,9 +1348,6 @@ mod tests {
             bus_encryption: false,
             mkb_version: None,
             disc_hash: String::new(),
-            key_source: crate::disc::KeyOrigin::ExternalUk,
-            vuk: None,
-            unit_keys: vec![(0u32, [0u8; 16])],
             volume_id: [0u8; 16],
             uk_ro: Vec::new(),
             mkb: Vec::new(),
@@ -1947,8 +1919,19 @@ mod tests {
         disc.put_bytes(PART_START + 11, &root_fids);
 
         let out = TmpDir::new("multiextent_aacs");
-        let res = aacs_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+        let d = aacs_disc();
+        let (a, b) = (PART_START + DATA_A, PART_START + DATA_B);
+        let set = crate::keys::ResolvedKeySet::keyed_for_test(
+            &d,
+            key,
+            &[(a, a + SECTORS_EACH), (b, b + SECTORS_EACH)],
+        );
+        let opts = ExtractOptions {
+            keys: Some(&set),
+            ..Default::default()
+        };
+        let res = d
+            .extract_tree(&mut disc, out.path(), &opts)
             .expect("extract");
 
         let got = read_out(out.path(), "BDMV/STREAM/00001.m2ts").expect("file written");
@@ -3059,42 +3042,6 @@ mod tests {
         let res = d
             .extract_tree(&mut src, out.path(), &ExtractOptions::default())
             .expect("a drive Stop during the crack is a halt, not CssKeyMissing");
-        assert!(res.halted);
-        assert!(res.files.is_empty());
-    }
-
-    // A Stop during multi-CPS AACS key-map resolution is a halt (Ok + halted),
-    // matching the CSS arm, not an Err(Halted) out of extract_tree.
-    #[test]
-    fn halt_during_aacs_key_map_resolution_is_a_halt() {
-        let root = DirSpec {
-            name: String::new(),
-            icb_lba: 10,
-            dir_data_lba: 11,
-            files: vec![file("a.bin", 30, 31, b"x".to_vec(), false)],
-            subdirs: vec![],
-        };
-        let mut disc = build_disc(root);
-        let mut d = aacs_disc();
-        if let Some(a) = d.aacs.as_mut() {
-            a.unit_keys = vec![(0, [1u8; 16]), (1, [2u8; 16])];
-        }
-        let mut t = crate::disc::DiscTitle::empty();
-        t.extents = vec![crate::disc::Extent {
-            start_lba: PART_START + 31,
-            sector_count: 3,
-        }];
-        d.titles = vec![t];
-        let halt = crate::halt::Halt::new();
-        halt.cancel();
-        let opts = ExtractOptions {
-            halt: Some(halt),
-            ..Default::default()
-        };
-        let out = TmpDir::new("aacs_map_halt");
-        let res = d
-            .extract_tree(&mut disc, out.path(), &opts)
-            .expect("a Stop during key-map resolution is a halt, not an error");
         assert!(res.halted);
         assert!(res.files.is_empty());
     }

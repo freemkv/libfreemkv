@@ -1,341 +1,40 @@
 use super::*;
-use crate::aacs::content::encrypt_unit;
 
-const SECTOR: usize = 2048;
-const K0: [u8; 16] = [0x11; 16];
-const K1: [u8; 16] = [0x22; 16];
-const K2: [u8; 16] = [0x33; 16];
-const STRANGER: [u8; 16] = [0x77; 16];
-
-// A clear content unit for the unit starting at `lba`: varied payload, TS sync at
-// offset 4 of every 192-byte source packet, CPI bits clear.
-fn clear_unit(lba: u32) -> Vec<u8> {
-    let mut u: Vec<u8> = (0..6144u32)
-        .map(|i| (lba.wrapping_mul(7919).wrapping_add(i) % 251) as u8 | 1)
-        .collect();
-    for off in (4..6144).step_by(192) {
-        u[off] = 0x47;
-    }
-    u[0] &= 0x3F;
-    u
-}
-
-/// An in-memory image: stream files laid out on their own unit grid, the listed
-/// units encrypted under the file's key; sectors outside every file are
-/// CPI-flagged-looking clear data (the freemkv#55 shape).
-struct Img {
-    data: Vec<u8>,
-    plain: Vec<u8>,
-    /// One-unit reads starting in `[start, end)` fail (probes of a damaged area).
-    probe_fail: Option<(u32, u32)>,
-    reads: Vec<(u32, u16)>,
-}
-
-// One file: start, sectors, key, and which of its units are encrypted.
-type FileSpec = (u32, u32, [u8; 16], &'static [u32]);
-
-// Every unit of a 30-sector file.
-const ALL: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-
-fn img(capacity: u32, files: &[FileSpec]) -> Img {
-    let mut data = vec![0u8; capacity as usize * SECTOR];
-    for lba in 0..capacity {
-        let o = lba as usize * SECTOR;
-        for (i, b) in data[o..o + SECTOR].iter_mut().enumerate() {
-            *b = (lba as usize + i) as u8;
-        }
-        data[o] = 0xC0;
-    }
-    let mut plain = data.clone();
-    for (start, n, key, enc) in files {
-        for u in 0..n / 3 {
-            let lba = start + u * 3;
-            let o = lba as usize * SECTOR;
-            let mut unit = clear_unit(lba);
-            if enc.contains(&u) {
-                unit[0] |= 0xC0;
-                plain[o..o + 6144].copy_from_slice(&unit);
-                assert!(encrypt_unit(&mut unit, key));
-            } else {
-                plain[o..o + 6144].copy_from_slice(&unit);
-            }
-            data[o..o + 6144].copy_from_slice(&unit);
-        }
-    }
-    Img {
-        data,
-        plain,
-        probe_fail: None,
-        reads: Vec::new(),
-    }
-}
-
-impl SectorSource for Img {
-    fn capacity_sectors(&self) -> u32 {
-        (self.data.len() / SECTOR) as u32
-    }
-    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
-        self.reads.push((lba, count));
-        if count == 3 && self.probe_fail.is_some_and(|(s, e)| (s..e).contains(&lba)) {
-            return Err(Error::DiscRead {
-                sector: lba as u64,
-                status: None,
-                sense: None,
-            });
-        }
-        let (o, n) = (lba as usize * SECTOR, count as usize * SECTOR);
-        buf[..n].copy_from_slice(&self.data[o..o + n]);
-        Ok(n)
-    }
-}
-
-fn pool(keys: &[[u8; 16]]) -> DecryptKeys {
-    DecryptKeys::Aacs {
-        unit_keys: keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (i as u32, *k))
-            .collect(),
-        format: crate::ContentFormat::BdTs,
-    }
-}
-
-fn rule(single: Option<usize>) -> KeyRule<'static> {
-    KeyRule {
-        format: crate::ContentFormat::BdTs,
-        single,
-        fetch: None,
-        halt: None,
-    }
-}
-
-/// Key `files` the way [`whole_disc_reader`] does; the kept title plays file 0 with slot 0.
-fn plan(
-    src: &mut Img,
-    keys: &mut DecryptKeys,
-    files: &[Vec<(u32, u32)>],
-    rule: &KeyRule,
-) -> Result<ContentKeys> {
-    let (s, n) = files[0][0];
-    let title = AacsKeyMap::from_ranges(vec![(s, s + n, 0)]);
-    let spans = unit_spans(files, &[]);
-    key_content_files(src, rule, keys, title, files, &spans)
-}
-
-fn one_file_each(specs: &[FileSpec]) -> Vec<Vec<(u32, u32)>> {
-    specs.iter().map(|f| vec![(f.0, f.1)]).collect()
-}
-
-/// Wire the reader over `src` from a plan and copy the whole image with `write_image`.
-fn write_through(
-    src: Img,
-    keys: DecryptKeys,
-    files: &[Vec<(u32, u32)>],
-    planned: ContentKeys,
-) -> Result<Vec<u8>> {
-    let content = merge_ranges(files.iter().flatten().copied().collect());
-    let cap = src.capacity_sectors();
-    let dec = DecryptingSectorSource::new(src, keys)
-        .with_key_map(std::sync::Arc::new(planned.map))
-        .with_content_ranges(std::sync::Arc::from(content));
-    let mut r = UnitAligned::new(dec, unit_spans(files, &[]));
-    r.unproven = planned.unproven;
-    let dir = tempfile::tempdir().map_err(|e| Error::IoError { source: e })?;
-    let dest = dir.path().join("out.iso");
-    crate::write_image(&mut r, &dest, cap, &crate::halt::Halt::new(), |_| {})?;
-    std::fs::read(&dest).map_err(|e| Error::IoError { source: e })
-}
-
-// `bytes` equals the image's plaintext, where each decrypted unit (`specs`) reads with
-// CPI 00₂ in every source packet (KS-5; KU design §5.4) and every other sector is verbatim.
-fn assert_plain(img_plain: &[u8], bytes: &[u8], specs: &[FileSpec]) {
-    assert_eq!(bytes.len(), img_plain.len());
-    let mut want = img_plain.to_vec();
-    for (start, n, _, enc) in specs {
-        for u in enc.iter().filter(|&&u| u < n / 3) {
-            let o = (start + u * 3) as usize * SECTOR;
-            let unit = crate::aacs::content::cpi_cleared(want[o..o + 6144].to_vec());
-            want[o..o + 6144].copy_from_slice(&unit);
-        }
-    }
-    for (lba, (got, want)) in bytes.chunks(SECTOR).zip(want.chunks(SECTOR)).enumerate() {
-        assert!(got == want, "sector {lba} not decrypted as expected");
-    }
-}
-
-#[test]
-fn every_unplayed_file_is_keyed_and_the_image_decrypts_across_batches() {
-    // Second file misaligned (start % 3 != 0) and crossing a 2048-sector batch edge.
-    let specs = [(300, 30, K0, ALL), (2041, 30, K0, ALL)];
-    let files = one_file_each(&specs);
-    let mut src = img(2200, &specs);
-    let mut keys = pool(&[K0]);
-    let planned = plan(&mut src, &mut keys, &files, &rule(Some(0))).unwrap();
-    assert!(planned.unproven.is_empty());
-    let want = src.plain.clone();
-    let bytes = write_through(img(2200, &specs), keys, &files, planned).unwrap();
-    assert_plain(&want, &bytes, &specs);
-}
-
-/// Back-to-back unplayed files in different CPS units each get their own key.
-#[test]
-fn adjacent_files_in_different_cps_units_each_get_their_own_key() {
-    let specs = [(300, 30, K0, ALL), (600, 30, K1, ALL), (630, 30, K2, ALL)];
-    let files = one_file_each(&specs);
-    let mut keys = pool(&[K0, K1, K2]);
-    let planned = plan(&mut img(1200, &specs), &mut keys, &files, &rule(None)).unwrap();
-    assert_eq!(planned.map.entry_for(600).map(|e| e.0), Some(1));
-    assert_eq!(planned.map.entry_for(630).map(|e| e.0), Some(2));
-    let bytes = write_through(img(1200, &specs), keys, &files, planned).unwrap();
-    assert_plain(&img(1200, &specs).plain, &bytes, &specs);
-}
-
-/// Ciphertext no held key opens refuses the plan: multi-CPS pool, and a single key.
-#[test]
-fn a_file_no_held_key_opens_is_refused_up_front() {
-    let specs = [(300, 30, K0, ALL), (600, 30, STRANGER, ALL)];
-    let files = one_file_each(&specs);
-    for (p, single) in [(&[K0, K1][..], None), (&[K0][..], Some(0))] {
-        let r = plan(&mut img(1200, &specs), &mut pool(p), &files, &rule(single));
-        assert!(
-            matches!(r, Err(Error::WholeDiscKeyMissing)),
-            "pool {}: {:?}",
-            p.len(),
-            r.err()
-        );
-    }
-}
-
-/// The resolver's evenly spaced samples miss a file encrypted only at its ends; the
-/// probes cover every unit of a short file and prove the other held key twice.
-#[test]
-fn another_held_key_opening_two_probes_keys_the_file() {
-    let specs = [(300, 30, K0, ALL), (600, 30, K1, &[0, 9][..])];
-    let files = one_file_each(&specs);
-    let mut src = img(1200, &specs);
-    let planned = plan(&mut src, &mut pool(&[K0, K1]), &files, &rule(None)).unwrap();
-    assert_eq!(planned.map.entry_for(600).map(|e| e.0), Some(1));
-    assert!(planned.unproven.is_empty());
-}
-
-/// One opened probe is no proof: a chance TS-sync pass must not key a whole file.
-/// With no unit left unopened the file is unproven (keyed only on single-CPS).
-#[test]
-fn a_key_opening_a_single_probe_is_not_trusted() {
-    let specs = [(300, 30, K0, ALL), (600, 30, K1, &[0])];
-    let files = one_file_each(&specs);
-    let planned = plan(
-        &mut img(1200, &specs),
-        &mut pool(&[K0, K1]),
-        &files,
-        &rule(None),
-    )
-    .unwrap();
-    assert_eq!(planned.map.entry_for(600), None);
-    assert_eq!(planned.unproven, vec![(600, 630)]);
-    let planned = plan(
-        &mut img(1200, &specs),
-        &mut pool(&[K0, K1]),
-        &files,
-        &rule(Some(0)),
-    )
-    .unwrap();
-    assert_eq!(planned.map.entry_for(600).map(|e| e.0), Some(0));
-}
-
-/// A key that opens one probe while another encrypted unit opens under none is
-/// demonstrably unkeyable: refused, not trusted on the one pass.
-#[test]
-fn a_single_opened_probe_beside_an_unopenable_unit_is_refused() {
-    let mut src = img(1200, &[(300, 30, K0, ALL), (600, 30, K1, &[0])]);
-    let other = img(1200, &[(600, 30, STRANGER, &[5])]);
-    let (a, b) = (615 * SECTOR, 618 * SECTOR);
-    src.data[a..b].copy_from_slice(&other.data[a..b]);
-    let files = vec![vec![(300, 30)], vec![(600, 30)]];
-    let r = plan(&mut src, &mut pool(&[K0, K1]), &files, &rule(None));
-    assert!(
-        matches!(r, Err(Error::WholeDiscKeyMissing)),
-        "{:?}",
-        r.err()
-    );
-}
-
-/// Alternates are the held BASE keys only: a forensic (FMTS-tagged) pool key never
-/// keys a whole file, while another base key still does.
-#[test]
-fn alternates_never_use_forensic_pool_keys() {
-    // Only the ends encrypted: the resolver's samples miss the file.
-    let specs = [(300, 30, K0, ALL), (600, 30, K1, &[0, 9][..])];
-    let files = one_file_each(&specs);
-    let mut src = img(1200, &specs);
-    let tagged = |extra: &[(u32, [u8; 16])]| {
-        let mut unit_keys = vec![(0u32, K0)];
-        unit_keys.extend_from_slice(extra);
-        DecryptKeys::Aacs {
-            unit_keys,
-            format: crate::ContentFormat::BdTs,
-        }
-    };
-    let mut forensic = tagged(&[(1 << 24, K1)]);
-    let r = plan(&mut src, &mut forensic, &files, &rule(None));
-    assert!(
-        matches!(r, Err(Error::WholeDiscKeyMissing)),
-        "{:?}",
-        r.err()
-    );
-    let mut base = tagged(&[(1 << 24, STRANGER), (1, K1)]);
-    let planned = plan(&mut src, &mut base, &files, &rule(None)).unwrap();
-    assert_eq!(planned.map.entry_for(600).map(|e| e.0), Some(2));
-}
-
-/// Last resort: no probe is readable, so the file stays unkeyed and the copy stops
-/// at its first encrypted unit with E7032, never writing ciphertext.
-#[test]
-fn an_unreadable_probe_leaves_the_file_unproven_and_the_copy_stops_with_e7032() {
-    let specs = [(300, 30, K0, ALL), (600, 30, STRANGER, ALL)];
-    let files = one_file_each(&specs);
-    let mut src = img(1200, &specs);
-    src.probe_fail = Some((600, 630));
-    let mut keys = pool(&[K0, K1]);
-    let planned = plan(&mut src, &mut keys, &files, &rule(None)).unwrap();
-    assert_eq!(planned.unproven, vec![(600, 630)]);
-    let r = write_through(img(1200, &specs), keys, &files, planned);
-    assert!(
-        matches!(r, Err(Error::WholeDiscKeyMissing)),
-        "{:?}",
-        r.err()
-    );
-}
-
-/// A stop request is honoured between probes.
-#[test]
-fn probing_honours_a_stop() {
-    let specs = [(300, 30, K0, ALL), (600, 30, K1, ALL)];
-    let files = one_file_each(&specs);
-    let halt = crate::halt::Halt::new();
-    halt.cancel();
-    let rule = KeyRule {
-        halt: Some(&halt),
-        ..rule(None)
-    };
-    let r = plan(&mut img(1200, &specs), &mut pool(&[K0, K1]), &files, &rule);
-    assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
-}
-
-/// SSIF re-lists an m2ts's extents: that file is probed once, the map stays disjoint.
-#[test]
-fn a_relisted_file_is_keyed_once_into_a_disjoint_map() {
-    let files = vec![vec![(300, 30)], vec![(600, 30)], vec![(600, 30)]];
-    let mut src = img(1200, &[(300, 30, K0, ALL), (600, 30, K0, ALL)]);
-    let planned = plan(&mut src, &mut pool(&[K0]), &files, &rule(Some(0))).unwrap();
-    let r = planned.map.ranges();
-    assert!(r.windows(2).all(|w| w[0].1 <= w[1].0), "disjoint: {r:?}");
-    let probes = src
-        .reads
+// The key set's whole-disc pieces (`keys::whole_disc_pieces`) over `files`, with one
+// title playing `title_extents`: each piece's unit spans.
+fn pieces(files: &[Vec<(u32, u32)>], title_extents: &[(u32, u32)]) -> Vec<Vec<UnitSpan>> {
+    let mut title = crate::DiscTitle::empty();
+    title.extents = title_extents
         .iter()
-        .filter(|&&(l, n)| l >= 600 && n == 3)
-        .count();
-    assert!(probes <= PROBES as usize + 8, "probed twice: {probes}");
+        .map(|&(start_lba, sector_count)| crate::Extent {
+            start_lba,
+            sector_count,
+        })
+        .collect();
+    let disc = crate::Disc {
+        volume_id: String::new(),
+        meta_title: None,
+        format: crate::DiscFormat::BluRay,
+        capacity_sectors: 1000,
+        capacity_bytes: 1000 * 2048,
+        layers: 1,
+        titles: vec![title],
+        region: crate::disc::DiscRegion::Free,
+        aacs: None,
+        css: None,
+        encrypted: true,
+        aacs_error: None,
+        css_error: None,
+        content_format: crate::ContentFormat::BdTs,
+    };
+    crate::keys::whole_disc_pieces(&disc, files)
+}
+
+// The unit spans the key set's whole-disc reader holds: every piece's, sorted.
+fn unit_spans(files: &[Vec<(u32, u32)>], title_extents: &[(u32, u32)]) -> Vec<UnitSpan> {
+    let mut spans: Vec<UnitSpan> = pieces(files, title_extents).into_iter().flatten().collect();
+    spans.sort_unstable_by_key(|s| s.0);
+    spans
 }
 
 #[test]
@@ -346,56 +45,6 @@ fn probes_start_at_the_first_unit_and_spread_to_the_end() {
     let long = probe_units(3200);
     assert_eq!(long.len(), PROBES as usize);
     assert_eq!((long[0], long[1], long[31]), (0, 100, 3100));
-}
-
-// A minimal AACS 1.0 `Unit_Key_RO.inf` declaring `units` CPS units.
-fn unit_key_ro(units: u16) -> Vec<u8> {
-    let mut v = vec![0u8; 96 + 48 * units as usize];
-    v[..4].copy_from_slice(&48u32.to_be_bytes());
-    v[48..50].copy_from_slice(&units.to_be_bytes());
-    v
-}
-
-fn aacs_disc(declared: u16) -> crate::Disc {
-    crate::Disc {
-        volume_id: String::new(),
-        meta_title: None,
-        format: crate::DiscFormat::BluRay,
-        capacity_sectors: 1000,
-        capacity_bytes: 1000 * 2048,
-        layers: 1,
-        titles: Vec::new(),
-        region: crate::disc::DiscRegion::Free,
-        aacs: Some(crate::disc::AacsState {
-            version: 1,
-            bus_encryption: false,
-            mkb_version: None,
-            disc_hash: String::new(),
-            key_source: crate::disc::KeyOrigin::DeviceKey,
-            vuk: None,
-            unit_keys: vec![(1, K0)],
-            volume_id: [0; 16],
-            uk_ro: unit_key_ro(declared),
-            mkb: Vec::new(),
-        }),
-        css: None,
-        encrypted: true,
-        aacs_error: None,
-        css_error: None,
-        content_format: crate::ContentFormat::BdTs,
-    }
-}
-
-/// Single-CPS is the DECLARED unit count, never the pool size.
-#[test]
-fn single_cps_follows_the_declared_unit_count_not_the_pool() {
-    let empty = AacsKeyMap::from_ranges(Vec::new());
-    let keys = pool(&[K0]);
-    assert_eq!(single_cps_key_slot(&aacs_disc(1), &keys, &empty), Some(0));
-    assert_eq!(single_cps_key_slot(&aacs_disc(2), &keys, &empty), None);
-    let mut fmts = aacs_disc(1);
-    fmts.format = crate::DiscFormat::Fmts;
-    assert_eq!(single_cps_key_slot(&fmts, &keys, &empty), None);
 }
 
 #[test]
@@ -534,22 +183,6 @@ fn unit_aligned_refuses_a_unit_split_across_extents() {
     ));
 }
 
-/// A decrypt refusal is E7032 only inside an unproven piece.
-#[test]
-fn a_refusal_in_an_unproven_piece_is_the_mkv_or_raw_error() {
-    let mut r = reader(vec![(100, 30, 100)]);
-    r.unproven = vec![(110, 130)];
-    r.inner.fail = Some(|| Error::DecryptFailed);
-    let mut buf = vec![0u8; 2048];
-    let got = r.read_sectors(111, 1, &mut buf, false);
-    assert!(matches!(got, Err(Error::WholeDiscKeyMissing)), "{got:?}");
-    let got = r.read_sectors(101, 1, &mut buf, false);
-    assert!(matches!(got, Err(Error::DecryptFailed)), "{got:?}");
-    r.inner.fail = Some(|| Error::Halted);
-    let got = r.read_sectors(111, 1, &mut buf, false);
-    assert!(matches!(got, Err(Error::Halted)), "{got:?}");
-}
-
 #[test]
 fn unit_block_end_pulls_back_to_the_straddling_units_head() {
     let r = reader(vec![(100, 30, 100)]);
@@ -557,27 +190,6 @@ fn unit_block_end_pulls_back_to_the_straddling_units_head() {
     assert_eq!(r.unit_block_end(90, 103), 103);
     assert_eq!(r.unit_block_end(103, 104), 104);
     assert_eq!(r.unit_block_end(0, 50), 50);
-}
-
-/// An AACS disc with titles but no stream folder names the missing folder (E6003),
-/// not a key failure: no key refresh can fix a tree with no content files.
-#[test]
-fn titles_without_a_stream_folder_name_the_missing_folder() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("BDMV")).unwrap();
-    std::fs::write(dir.path().join("BDMV/index.bdmv"), b"INDX0200").unwrap();
-    let img = crate::DirImage::open(dir.path()).unwrap();
-    let mut d = aacs_disc(1);
-    let mut title = crate::DiscTitle::empty();
-    title.extents = vec![crate::Extent {
-        start_lba: 300,
-        sector_count: 30,
-    }];
-    d.titles = vec![title];
-    match whole_disc_reader(&d, img, true, None, None) {
-        Err(Error::UdfNotFound { path }) => assert_eq!(path, "/BDMV/STREAM"),
-        other => panic!("expected UdfNotFound, got {:?}", other.err()),
-    }
 }
 
 // Spec guards (keys-upfront-design §7.8) on the per-file unit grid.
@@ -691,8 +303,7 @@ mod spec_guards {
                 .text
                 .contains("aligned to Aligned Unit boundary")
         );
-        let specs = [(300, 30, K0, ALL), (600, 30, K1, ALL)];
-        let m2ts = one_file_each(&specs);
+        let m2ts = vec![vec![(300, 30)], vec![(600, 30)]];
         // The SSIF re-lists the second clip from sector 601: its own grid would be 601+3k.
         let mut with_ssif = m2ts.clone();
         with_ssif.push(vec![(601, 29)]);
@@ -701,18 +312,11 @@ mod spec_guards {
             unit_spans(&m2ts, &[]),
             "not re-gridded"
         );
-        let run = |files: &[Vec<(u32, u32)>]| {
-            let mut src = img(1200, &specs);
-            let planned = plan(&mut src, &mut pool(&[K0, K1]), files, &rule(None)).unwrap();
-            (planned.map.ranges().to_vec(), src.reads)
-        };
-        let (map, reads) = run(&m2ts);
         assert_eq!(
-            run(&with_ssif),
-            (map.clone(), reads),
-            "not re-keyed, not re-probed"
+            pieces(&with_ssif, &[]),
+            pieces(&m2ts, &[]),
+            "no piece of its own: not re-keyed, not re-probed"
         );
-        assert!(map.iter().any(|&(s, _, slot, _)| s <= 600 && slot == 1));
     }
 }
 
@@ -724,75 +328,28 @@ fn unit_aligned_forwards_unmapped_stream_files() {
     assert_forwards(UnitAligned::new(Reports(vec![m2ts1()]), Vec::new()));
 }
 
-/// LK21 (K-13), per spec — KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not
-/// encrypted"; corroborated by KS-22 (libaacs clears it per source packet). A decrypted
-/// image says so in every packet, so re-scanning it finds only clear pieces and asks nothing.
+/// The raw (`--raw`) whole-disc reader never decrypts: AACS ciphertext and a CSS-scrambled
+/// pack pass through byte for byte, as the pre-KU-X2 reader did with `decrypt: false`.
 #[test]
-fn decrypt_clears_cpi_on_every_source_packet() {
-    use crate::spec::keys::{KS_5_CPI, KS_22_LIBAACS_VERIFY_TS};
-    assert!(KS_5_CPI.text.contains("00₂ if the data is not encrypted"));
-    assert!(KS_22_LIBAACS_VERIFY_TS.text.contains("buf[i] &= ~0xc0;"));
-    let specs = [(300, 30, K0, ALL), (600, 30, K1, ALL)];
-    let files = one_file_each(&specs);
-    let mut keys = pool(&[K0, K1]);
-    let planned = plan(&mut img(1200, &specs), &mut keys, &files, &rule(None)).unwrap();
-    let bytes = write_through(img(1200, &specs), keys, &files, planned).unwrap();
-    for &(start, n, _, _) in &specs {
-        for lba in (start..start + n).step_by(3) {
-            let o = lba as usize * SECTOR;
-            for i in (0..6144).step_by(192) {
-                assert_eq!(bytes[o + i] & 0xC0, 0, "LBA {lba}, packet byte {i}: CPI");
-            }
-        }
+fn raw_whole_disc_reader_passes_every_sector_through() {
+    use crate::test_util::{BdFile, MemSource, encrypted_bd_image, unit_key_ro};
+    let uk_ro = unit_key_ro(crate::aacs::mkb::AacsVersion::V10, &[[0xEE; 16]], &[1]);
+    let files = [BdFile::new("BDMV/STREAM/00001.m2ts", 30, Some([0x11; 16]))];
+    let mut image = encrypted_bd_image(&files, &uk_ro).image;
+    // A CSS-scrambled MPEG-2 pack (bits 4-5 of byte 0x14 set) in sector 1.
+    image[2048..2052].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+    image[2048 + 4] = 0x44;
+    image[2048 + 0x14] |= 0x30;
+    let sectors = (image.len() / 2048) as u32;
+    let mut r = raw_whole_disc_reader(MemSource::new(image.clone()));
+    let mut buf = vec![0u8; image.len()];
+    let mut lba = 0;
+    while lba < sectors {
+        let n = (sectors - lba).min(30);
+        let at = lba as usize * 2048;
+        let got = r.read_sectors(lba, n as u16, &mut buf[at..at + n as usize * 2048], false);
+        assert_eq!(got.unwrap(), n as usize * 2048);
+        lba += n;
     }
-    // Re-scan the decrypted image: every piece reads Clear, and no source is asked.
-    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let seen = asked.clone();
-    let fetch = KeyFetch::unit_only(std::sync::Arc::new(move |_| {
-        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(Vec::new())
-    }));
-    let rescan_rule = KeyRule {
-        format: crate::ContentFormat::BdTs,
-        single: None,
-        fetch: Some(&fetch),
-        halt: None,
-    };
-    let mut decrypted = Img {
-        plain: bytes.clone(),
-        data: bytes,
-        probe_fail: None,
-        reads: Vec::new(),
-    };
-    let replanned = plan(&mut decrypted, &mut pool(&[K0, K1]), &files, &rescan_rule);
-    assert!(replanned.is_ok(), "{:?}", replanned.err());
-    assert_eq!(
-        asked.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "requests"
-    );
-}
-
-/// K-8: the declared count is read through `parse_title_keys`, so an HD DVD title-key
-/// file counts too. Per spec KS-14 ("Num_of_CPS_Unit … the number of CPS Units on the
-/// disc") for BD; HD DVD has no public book, per evidence KS-27.
-#[test]
-fn single_cps_reads_hd_dvd_title_keys_too() {
-    use crate::spec::keys::{KS_14_UNIT_KEY_BLOCK, KS_27_HDDVD_EVIDENCE};
-    assert!(
-        KS_14_UNIT_KEY_BLOCK
-            .text
-            .contains("indicates the number of CPS Units")
-    );
-    assert_eq!(KS_27_HDDVD_EVIDENCE.kind, crate::spec::QuoteKind::Evidence);
-    // A VTKF with one available Title Key Entry (AV_FLG set in slot 0).
-    let mut vtkf = vec![0u8; 2480];
-    vtkf[..12].copy_from_slice(crate::aacs::inf::VTKF_MAGIC);
-    vtkf[0x80] = 0x80;
-    let mut disc = aacs_disc(1);
-    disc.format = crate::DiscFormat::HdDvd;
-    disc.content_format = crate::ContentFormat::MpegPs;
-    disc.aacs.as_mut().unwrap().uk_ro = vtkf;
-    let empty = AacsKeyMap::from_ranges(Vec::new());
-    assert_eq!(single_cps_key_slot(&disc, &pool(&[K0]), &empty), Some(0));
+    assert!(buf == image, "a raw read returns the image unchanged");
 }

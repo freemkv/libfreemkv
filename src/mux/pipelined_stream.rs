@@ -68,6 +68,8 @@ pub struct PipelinedPesStream {
     header_gate: super::header_gate::HeaderGate,
     /// The op's stop token; a never-cancelled stand-in when there is none.
     halt: crate::halt::Halt,
+    /// Damaged AACS units the decrypting reader blanked (reported as loss).
+    blanked: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// `mpg://` input: the one video `stream_id` routed; other video ids are left out.
     video_stream_id: Option<u8>,
     /// Packets of a video `stream_id` other than `video_stream_id`, dropped.
@@ -133,6 +135,7 @@ impl PipelinedPesStream {
             field_merge,
             header_gate: super::header_gate::HeaderGate::default(),
             halt: crate::halt::Halt::new(),
+            blanked: std::sync::Arc::default(),
             video_stream_id: None,
             other_video_packets: 0,
         }
@@ -141,6 +144,15 @@ impl PipelinedPesStream {
     // `mpg://`: route only video `stream_id` `id` (design §4: one video track).
     pub(crate) fn with_video_stream_id(mut self, id: Option<u8>) -> Self {
         self.video_stream_id = id;
+        self
+    }
+
+    // The decrypting reader's blanked-unit counter, reported as `errors` / `lost_bytes`.
+    pub(crate) fn with_blanked(
+        mut self,
+        blanked: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.blanked = blanked;
         self
     }
 
@@ -456,6 +468,15 @@ impl Stream for PipelinedPesStream {
 
     fn info(&self) -> &DiscTitle {
         &self.title
+    }
+
+    fn errors(&self) -> u64 {
+        self.blanked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn lost_bytes(&self) -> u64 {
+        // Each blanked unit is one whole aligned unit of zeros (KS-2: 6144 bytes).
+        self.errors() * crate::aacs::content::ALIGNED_UNIT_LEN as u64
     }
 
     fn config_changes(&self) -> Vec<(usize, u64)> {

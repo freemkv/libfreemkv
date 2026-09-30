@@ -274,6 +274,8 @@ struct Spec {
     dependent: bool,
     keys: Vec<[u8; 16]>,
     fmts: Vec<[u8; 16]>,
+    // The online service only returns the full set for its held index-1 phase.
+    match_fmts_phase: bool,
     answer: Answer,
     calls: Calls,
     clock: Option<Arc<FakeClock>>,
@@ -295,6 +297,7 @@ impl Spec {
             dependent: false,
             keys: keys.to_vec(),
             fmts: Vec::new(),
+            match_fmts_phase: false,
             answer: Answer::All,
             calls: calls.clone(),
             clock: None,
@@ -348,6 +351,16 @@ impl Fake {
             &self.spec.keys
         };
         Ok(match self.spec.answer {
+            _ if forensic && self.spec.match_fmts_phase => {
+                if held
+                    .first()
+                    .is_some_and(|key| samples.iter().all(|s| opens(s, key)))
+                {
+                    held.clone()
+                } else {
+                    Vec::new()
+                }
+            }
             // KS-26 (evidence): an index-1 anchor gets the whole forensic set.
             _ if forensic => held.clone(),
             Answer::All => held.clone(),
@@ -1159,6 +1172,228 @@ fn on_arrival_proof() {
     );
 }
 
+// File B (K2) Lazy as in `lazy_b`, its image first damaged by `damage`.
+fn lazy_b_damaged(pool: &[[u8; 16]], damage: impl Fn(&mut Fx)) -> (Fx, ResolvedKeySet, Faulty) {
+    let mut fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        2,
+        &[&[0, 1]],
+    );
+    damage(&mut fx);
+    let (b, n) = fx.file(1);
+    let src = fx.source();
+    src.kill(b, b + n);
+    let calls = Calls::default();
+    let set = resolve_with(
+        &fx,
+        &mut src.clone(),
+        KeyScope::WholeDisc,
+        &[Spec::keydb(pool, &calls)],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    )
+    .unwrap();
+    src.heal();
+    (fx, set, src)
+}
+
+// Unit `u` of file `i`: its first sector read back as garbage (seed damaged), or zero-filled.
+fn damage_seed(fx: &mut Fx, i: usize, u: u32) {
+    let at = fx.unit(i, u) as usize * 2048;
+    crate::test_util::damage_unit_seed(&mut fx.img.image[at..at + ALIGNED_UNIT_LEN]);
+}
+fn zero_unit(fx: &mut Fx, i: usize, u: u32) {
+    let at = fx.unit(i, u) as usize * 2048;
+    fx.img.image[at..at + ALIGNED_UNIT_LEN].fill(0);
+}
+
+/// ⚑ per spec; do not change without a spec citation. KU §2.4 proves a key on READABLE units:
+/// a zero unit (KS-5: CPI "00₂ if the data is not encrypted") or a damaged seed (KS-4: "The
+/// first 16 bytes of each Aligned Unit is used as the seed") is a hole, never proof or disproof.
+#[test]
+fn on_arrival_read_damage_neither_proves_nor_refutes() {
+    assert!(
+        crate::spec::keys::KS_4_SEED
+            .text
+            .contains("used as the seed")
+    );
+    assert!(
+        crate::spec::keys::KS_5_CPI
+            .text
+            .contains("00₂ if the data is not encrypted")
+    );
+    let edge = |fx: &mut Fx| {
+        damage_seed(fx, 1, 0);
+        zero_unit(fx, 1, 1);
+    };
+    let holes = vec![0u8; 2 * ALIGNED_UNIT_LEN];
+    // (a) damage alone proves nothing and reads as holes; the first intact unit proves K2.
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], edge);
+    let b = fx.file(1).0;
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(read(&mut r, &fx, 1, 0, 2).unwrap(), holes);
+    assert_eq!(set.proof_cache().get(b), None, "a hole is not proof");
+    assert_eq!(
+        read(&mut r, &fx, 1, 2, 2).unwrap(),
+        fx.plain(fx.unit(1, 2), 2)
+    );
+    assert_eq!(set.proof_cache().get(b), Some(Proof::Proven(1)));
+
+    // (b) no held key opens B: the damage is still holes, the first intact unit stops E7022.
+    let (fx, set, src) = lazy_b_damaged(&[K1], edge);
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        read(&mut r, &fx, 1, 0, 2).unwrap(),
+        holes,
+        "a hole is not disproof"
+    );
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 2, 1)),
+        E7022,
+        "a wrong key still stops"
+    );
+
+    // (c) damaged neighbours are not partners: the one intact unit is a provisional proof.
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| {
+        (0..10)
+            .filter(|&u| u != 5)
+            .for_each(|u| damage_seed(fx, 1, u));
+    });
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        read(&mut r, &fx, 1, 5, 1).unwrap(),
+        fx.plain(fx.unit(1, 5), 1)
+    );
+    assert_eq!(
+        set.proof_cache().get(fx.file(1).0),
+        Some(Proof::Provisional(1))
+    );
+}
+
+// Unit `u` of file `i`: a garbage head that keeps both the CPI flag and the TS sync at byte 4
+// (~1 in 341 damaged heads), so the seed test cannot tell it from an intact unit.
+fn garble_keeping_sync(fx: &mut Fx, i: usize, u: u32) {
+    damage_seed(fx, i, u);
+    let at = fx.unit(i, u) as usize * 2048;
+    fx.img.image[at + 4] = 0x47;
+}
+
+/// KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed". A unit
+/// no held key opens while a held key opens its partners is damage: blanked and counted,
+/// never E7022, whether it would prove the key (a) or confirm a provisional one (b). (c) A
+/// wrong key opens no unit at all and still stops E7022. Partners come from the batch only.
+#[test]
+fn on_arrival_a_garbled_head_keeping_sync_is_blanked_never_e7022() {
+    // (a) the unit that would prove the key.
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| garble_keeping_sync(fx, 1, 0));
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    let mut want = fx.plain(fx.unit(1, 0), 4);
+    want[..ALIGNED_UNIT_LEN].fill(0);
+    assert_eq!(read(&mut r, &fx, 1, 0, 4).expect("damage, not E7022"), want);
+    assert_eq!(r.blanked_units(), 1);
+    assert_eq!(set.proof_cache().get(fx.file(1).0), Some(Proof::Proven(1)));
+
+    // (b) the unit that would confirm a provisional key (dead neighbours made it provisional).
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| garble_keeping_sync(fx, 1, 7));
+    let (b, n) = fx.file(1);
+    src.kill(b, fx.unit(1, 5));
+    src.kill(fx.unit(1, 6), b + n);
+    let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
+    read(&mut r, &fx, 1, 5, 1).expect("provisional under K2");
+    assert_eq!(set.proof_cache().get(b), Some(Proof::Provisional(1)));
+    src.heal();
+    let mut want = fx.plain(fx.unit(1, 7), 3);
+    want[..ALIGNED_UNIT_LEN].fill(0);
+    let got = read(&mut r, &fx, 1, 7, 3).expect("damage does not contradict a key");
+    assert_eq!(got, want);
+    assert_eq!(r.blanked_units(), 1);
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Proven(1)),
+        "unit 8 confirms"
+    );
+
+    // (c) no held key opens B: the garbled unit and its partners alike, so E7022.
+    let (fx, set, src) = lazy_b_damaged(&[K1], |fx| garble_keeping_sync(fx, 1, 0));
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 0, 4)),
+        E7022,
+        "a wrong key still stops"
+    );
+}
+
+/// KU §2.4 step 1: a unit that opens, whose only partners in the read are damaged (garbled
+/// heads that kept their sync), looks further in side reads before any verdict: never E7022.
+#[test]
+fn on_arrival_damaged_batch_partners_fall_back_to_side_reads() {
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| garble_keeping_sync(fx, 1, 1));
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    let got = read(&mut r, &fx, 1, 0, 2).expect("a side read finds an intact partner");
+    assert_eq!(&got[..ALIGNED_UNIT_LEN], &fx.plain(fx.unit(1, 0), 1)[..]);
+    assert_eq!(set.proof_cache().get(fx.file(1).0), Some(Proof::Proven(1)));
+}
+
+/// Sweep, patch and image→ISO read through the whole-disc reader, one call per block. A
+/// cluster of damaged units (KS-4: "The first 16 bytes of each Aligned Unit is used as the
+/// seed") is blanked and counted wherever it falls, never E7013: multipass must not error.
+#[test]
+fn whole_disc_reader_blanks_clustered_damage() {
+    let fx = fixture(
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        2,
+        &[&[0, 1]],
+    );
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1, K2], &calls)]).unwrap();
+    let mut fx = fx;
+    (3..6).for_each(|u| damage_seed(&mut fx, 1, u));
+    let holes = vec![0u8; 3 * ALIGNED_UNIT_LEN];
+    let read = |w: &mut WholeDiscReader<Faulty>, u: u32, n: u32| {
+        let mut buf = vec![0u8; n as usize * ALIGNED_UNIT_LEN];
+        w.read_sectors(fx.unit(1, u), (n * 3) as u16, &mut buf, true)
+            .map(|_| masked(&buf))
+    };
+    // The cluster read first, then after an intact block: blanked and counted both ways.
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    assert_eq!(read(&mut w, 3, 3).unwrap(), holes, "a cluster read first");
+    assert_eq!(read(&mut w, 0, 3).unwrap(), fx.plain(fx.unit(1, 0), 3));
+    assert_eq!(w.blanked_units(), 3);
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    assert_eq!(read(&mut w, 0, 3).unwrap(), fx.plain(fx.unit(1, 0), 3));
+    assert_eq!(read(&mut w, 3, 3).unwrap(), holes, "a cluster read later");
+    assert_eq!(read(&mut w, 6, 4).unwrap(), fx.plain(fx.unit(1, 6), 4));
+    assert_eq!(w.blanked_units(), 3);
+}
+
+/// Extract (a decrypted folder) blanks a cluster of damaged units and reports their bytes as
+/// unreadable, never E7013 or E7032. KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned
+/// Unit is used as the seed" — no key opens a damaged one, so it is neither proof nor disproof.
+#[test]
+fn extract_tree_blanks_clustered_damage() {
+    let (fx, set, mut src) =
+        lazy_b_damaged(&[K1, K2], |fx| (3..6).for_each(|u| damage_seed(fx, 1, u)));
+    let dest = tempfile::tempdir().unwrap();
+    let opts = crate::disc::ExtractOptions {
+        keys: Some(&set),
+        ..Default::default()
+    };
+    let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
+    assert!(
+        !res.halted && res.files.iter().all(|f| f.complete),
+        "every file is written"
+    );
+    assert!(
+        !res.complete,
+        "a folder with blanked units is not reported clean"
+    );
+    assert_eq!(res.bytes_unreadable, 3 * ALIGNED_UNIT_LEN as u64);
+    let got = std::fs::read(dest.path().join("BDMV/STREAM/00002.m2ts")).unwrap();
+    let mut want = fx.plain(fx.file(1).0, 10);
+    want[3 * ALIGNED_UNIT_LEN..6 * ALIGNED_UNIT_LEN].fill(0);
+    assert_eq!(masked(&got), want);
+}
+
 /// SG25 ⚑ — per spec; do not change without a spec citation — KS-1 [BD] §3.10.1:
 /// "encryption is applied to every Aligned Unit in the file"; KS-2. The final unit of a Lazy
 /// piece is decrypted (proven backward), never a read error.
@@ -1249,6 +1484,43 @@ fn fmts_online(calls: &Calls) -> Spec {
     let mut s = Spec::online(&[K2], calls);
     s.fmts = vec![F1, F2];
     s
+}
+
+// KS-26: the base-key request is separate from the forensic A/B anchor. Stop on
+// A's success; an empty A answer must leave the source available for B.
+#[test]
+fn fmts_phase_a_success_stops_and_phase_a_miss_tries_b() {
+    for held_phase in [0, 1] {
+        let mut fx = fmts_fixture();
+        if held_phase == 1 {
+            for (a, b, key) in [(0, 16, F1), (20, 36, F2)] {
+                for u in a..b {
+                    fx.reencrypt(1, u, if u % 2 == 1 { &key } else { &ALT });
+                }
+            }
+        }
+        let calls = Calls::default();
+        let mut source = fmts_online(&calls);
+        source.keys = vec![K1, K2];
+        source.match_fmts_phase = true;
+        let set = resolve(&fx, KeyScope::Titles(vec![2]), &[source]).unwrap();
+        assert_eq!(set.status().forensic, ForensicState::Resolved);
+        let anchors = calls.of("online").iter().filter(|c| c.forensic).count();
+        assert_eq!(anchors, held_phase + 1, "only ask B when A has no key");
+        let before = calls.len();
+        let mut reader = set.title_reader(&fx.disc, 2, fx.source()).unwrap();
+        let got = read(&mut reader, &fx, 1, 0, 16).unwrap();
+        let plain = fx.plain(fx.file(1).0, 16);
+        for u in 0..16 {
+            let range = u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN;
+            if u % 2 == held_phase {
+                assert_eq!(got[range.clone()], plain[range]);
+            } else {
+                assert_ne!(got[range.clone()], plain[range]);
+            }
+        }
+        assert_eq!(calls.len(), before, "muxing never asks again");
+    }
 }
 
 /// LK12. KS-25, KS-26 (evidence, no public FMTS spec): the forensic set is fetched once for
@@ -1510,7 +1782,7 @@ fn scannable_image() -> (EncryptedBdImage, Disc) {
 }
 
 /// `InputOptions::keys` (KU §3.1, §3.5): an `iso://` AACS source opens through the rip's set,
-/// gated by `check_decryptable`, where the legacy path (no banked key) refuses E7022.
+/// gated by `check_decryptable`; with no set it refuses E7022.
 #[test]
 fn iso_input_reads_through_the_key_set() {
     let _serial = crate::sector::prefetched::holder_test_lock();
@@ -1530,8 +1802,8 @@ fn iso_input_reads_through_the_key_set() {
     let path = dir.path().join("disc.iso");
     std::fs::write(&path, &img.image).unwrap();
     let url = format!("iso://{}", path.display());
-    let legacy = crate::input(&url, &crate::InputOptions::default());
-    assert_eq!(crate::error_code(&legacy.err().unwrap()), Some(E7022));
+    let keyless = crate::input(&url, &crate::InputOptions::default());
+    assert_eq!(crate::error_code(&keyless.err().unwrap()), Some(E7022));
     let opts = crate::InputOptions {
         keys: Some(set),
         ..Default::default()
@@ -1550,7 +1822,6 @@ fn session_resolves_a_key_set_through_its_reader() {
     let mut session = crate::session::DiscSession::from_parts_for_test(
         Some(two_units().disc),
         Some(Box::new(fx.source())),
-        None,
     );
     let r = session
         .resolve_key_set(KeyScope::WholeDisc, &f, ResolveKeysOptions::default())
@@ -1622,17 +1893,19 @@ fn live_stream_stops_on_an_unkeyed_piece_without_recovery() {
         let (fx, set, src) = lazy_b(&[K1]);
         let recovery = Arc::new(Mutex::new(0u32));
         let reader = RecoveryCount(src, recovery.clone());
-        let mut stream = crate::mux::DiscStream::new(
-            Box::new(reader),
-            fx.disc.titles[0].clone(),
-            set.decrypt_keys(),
-            30,
-            ContentFormat::BdTs,
-            false,
-            None,
+        let mut stream = super::install_key_map(
+            crate::mux::DiscStream::new(
+                Box::new(reader),
+                fx.disc.titles[0].clone(),
+                set.decrypt_keys(),
+                30,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap(),
+            set.key_map(),
         )
-        .unwrap()
-        .with_key_map(set.key_map())
         .with_arrival(set.arrival(set.title_stop()).expect("B is Lazy"));
         stream.skip_errors = skip;
         let got = loop {
@@ -1798,17 +2071,19 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
     let set = ResolvedKeySet::keyless_for(&title, ContentFormat::BdTs);
     for skip in [false, true] {
         let recovery = Arc::new(Mutex::new(0u32));
-        let mut stream = crate::mux::DiscStream::new(
-            Box::new(RecoveryCount(fx.source(), recovery.clone())),
-            title.clone(),
-            set.decrypt_keys(),
-            3,
-            ContentFormat::BdTs,
-            false,
-            None,
+        let mut stream = super::install_key_map(
+            crate::mux::DiscStream::new(
+                Box::new(RecoveryCount(fx.source(), recovery.clone())),
+                title.clone(),
+                set.decrypt_keys(),
+                3,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap(),
+            set.key_map(),
         )
-        .unwrap()
-        .with_key_map(set.key_map())
         .with_arrival(set.arrival(set.title_stop()).expect("every extent is lazy"));
         stream.skip_errors = skip;
         // Start past the inner extent: its first read is unit 4 of the outer one.
@@ -2320,3 +2595,160 @@ fn a_source_halted_mid_request_keeps_the_asked_step() {
 }
 
 mod stop_tests;
+
+/// LK21 (K-13), per spec — KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not
+/// encrypted"; corroborated by KS-22 (libaacs clears it per source packet). A decrypted
+/// image says so in every packet, so re-scanning it finds only clear pieces and asks nothing.
+#[test]
+fn decrypt_clears_cpi_on_every_source_packet() {
+    use crate::spec::keys::{KS_5_CPI, KS_22_LIBAACS_VERIFY_TS};
+    assert!(KS_5_CPI.text.contains("00₂ if the data is not encrypted"));
+    assert!(KS_22_LIBAACS_VERIFY_TS.text.contains("buf[i] &= ~0xc0;"));
+    let mut fx = two_units();
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1, K2], &calls)]).unwrap();
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.iso");
+    let cap = fx.disc.capacity_sectors;
+    crate::write_image(&mut w, &dest, cap, &Halt::new(), |_| {}).unwrap();
+    let bytes = std::fs::read(&dest).unwrap();
+    for i in 0..2 {
+        let (start, n) = fx.file(i);
+        for lba in (start..start + n).step_by(3) {
+            let o = lba as usize * 2048;
+            for p in (0..ALIGNED_UNIT_LEN).step_by(192) {
+                assert_eq!(bytes[o + p] & 0xC0, 0, "LBA {lba}, packet byte {p}: CPI");
+            }
+        }
+    }
+    // Re-scan the decrypted image: every piece reads Clear, and no source is asked.
+    fx.img.image = bytes;
+    let calls = Calls::default();
+    let specs = [
+        Spec::keydb(&[K1, K2], &calls),
+        Spec::online(&[K1, K2], &calls),
+    ];
+    let set = resolve(&fx, KeyScope::WholeDisc, &specs).unwrap();
+    assert_eq!((set.status().clear, set.status().lazy), (2, 0));
+    assert_eq!((calls.len(), set.source_requests()), (0, 0), "requests");
+}
+
+/// K-8: `n_decl` is read through `parse_title_keys`, so an HD DVD title-key file counts
+/// too. Per spec KS-14 ("Num_of_CPS_Unit … the number of CPS Units on the disc") for BD;
+/// HD DVD has no public book, per evidence KS-27.
+#[test]
+fn declared_cps_units_reads_hd_dvd_title_keys_too() {
+    use crate::spec::keys::{KS_14_UNIT_KEY_BLOCK, KS_27_HDDVD_EVIDENCE};
+    assert!(
+        KS_14_UNIT_KEY_BLOCK
+            .text
+            .contains("indicates the number of CPS Units")
+    );
+    assert_eq!(KS_27_HDDVD_EVIDENCE.kind, crate::spec::QuoteKind::Evidence);
+    // A VTKF with one available Title Key Entry (AV_FLG set in slot 0).
+    let mut vtkf = vec![0u8; 2480];
+    vtkf[..12].copy_from_slice(crate::aacs::inf::VTKF_MAGIC);
+    vtkf[0x80] = 0x80;
+    let mut fx = two_units();
+    fx.disc.format = DiscFormat::HdDvd;
+    fx.disc.content_format = ContentFormat::MpegPs;
+    fx.disc.aacs.as_mut().unwrap().uk_ro = vtkf;
+    assert_eq!(fx.disc.declared_cps_units(), Some(1));
+}
+
+/// The whole-disc reader's E6003 (kept from the pre-KU-X2 reader, engine
+/// `an_empty_stream_map_with_titles_fails_loud`): an AACS disc whose titles have content
+/// but whose image has no stream folder names the missing folder before any output.
+#[test]
+fn whole_disc_reader_refuses_titles_without_a_stream_folder() {
+    let uk_ro = unit_key_ro(AacsVersion::V10, &[[0xEE; 16]], &[1]);
+    let files = [
+        BdFile::new("BDMV/index.bdmv", 1, None),
+        BdFile::new("BDMV/AUXDATA/00000.bin", 30, None),
+    ];
+    let img = encrypted_bd_image(&files, &uk_ro);
+    let disc = disc_over(&img, &uk_ro, &[&[1]], DiscFormat::BluRay);
+    let fx = Fx { img, disc };
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    match set.whole_disc_reader(&fx.disc, fx.source(), None) {
+        Err(Error::UdfNotFound { path }) => assert_eq!(path, "/BDMV/STREAM"),
+        other => panic!("expected E6003, got {:?}", other.err()),
+    }
+}
+
+/// KU §2.1 (6) "Refuse first": a whole-disc sweep reads every unit, so a Lazy piece
+/// holding a readable encrypted probe no held key opens is refused E7032 by the reader,
+/// before any output (engine `a_multi_cps_sweep_refuses_a_first_unit_no_key_opens_*`).
+#[test]
+fn whole_disc_reader_refuses_a_lazy_piece_no_held_key_opens() {
+    let mut fx = fixture(&[stream(1, 10, Some(K1)), stream(2, 10, None)], 2, &[&[0]]);
+    let at = fx.unit(1, 0) as usize * 2048;
+    // An intact unit: TS sync at byte 4 of each packet, so its seed is not damage (KS-4).
+    fx.img.plain[at..at + ALIGNED_UNIT_LEN]
+        .chunks_mut(192)
+        .for_each(|p| p[4] = 0x47);
+    fx.reencrypt(1, 0, &WRONG);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let (b, n) = fx.file(1);
+    assert_eq!(
+        set.lazy(),
+        &[(b, b + n)],
+        "one unopened unit: Lazy (step 9.2)"
+    );
+    assert_eq!(
+        code(
+            set.whole_disc_reader(&fx.disc, fx.source(), None)
+                .map(|_| ())
+        ),
+        E7032
+    );
+    // A title rip that never reads B is unaffected.
+    assert!(set.title_reader(&fx.disc, 0, fx.source()).is_ok());
+}
+
+/// E7013 option A with the E7032 refusal above: a probe whose seed is damaged (no TS sync,
+/// KS-4 [BD] §3.10.1 "The first 16 bytes of each Aligned Unit is used as the seed") opens
+/// under no key and is blanked on read, never a stop, so it refuses no sweep up front.
+#[test]
+fn whole_disc_reader_does_not_refuse_a_damaged_probe() {
+    let mut fx = fixture(&[stream(1, 10, Some(K1)), stream(2, 10, None)], 2, &[&[0]]);
+    let at = fx.unit(1, 0) as usize * 2048;
+    // A damaged seed: no TS sync at byte 4.
+    fx.img.plain[at..at + ALIGNED_UNIT_LEN]
+        .chunks_mut(192)
+        .for_each(|p| p[4] = 0);
+    fx.reencrypt(1, 0, &WRONG);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let r = set
+        .whole_disc_reader(&fx.disc, fx.source(), None)
+        .map(|_| ());
+    assert!(r.is_ok(), "{:?} lazy={:?}", r.err(), set.lazy());
+}
+
+/// With cb76dcc's damage rule (KU §2.4): a unit no held key opens while a held key opens a
+/// partner in its batch is blanked, not a stop. So a Lazy piece with a probe a held key
+/// opens is left to the on-arrival proof, never refused up front.
+#[test]
+fn whole_disc_reader_leaves_a_piece_with_an_opened_probe_to_arrival() {
+    let mut fx = fixture(&[stream(1, 10, Some(K1)), stream(2, 10, None)], 2, &[&[0]]);
+    for (u, key) in [(0, WRONG), (1, K1)] {
+        let at = fx.unit(1, u) as usize * 2048;
+        fx.img.plain[at..at + ALIGNED_UNIT_LEN]
+            .chunks_mut(192)
+            .for_each(|p| p[4] = 0x47);
+        fx.reencrypt(1, u, &key);
+    }
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let (b, n) = fx.file(1);
+    assert_eq!(
+        set.lazy(),
+        &[(b, b + n)],
+        "one opened, one unopened probe: Lazy"
+    );
+    assert!(set.whole_disc_reader(&fx.disc, fx.source(), None).is_ok());
+}

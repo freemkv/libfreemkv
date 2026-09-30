@@ -402,6 +402,16 @@ fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) ->
     out
 }
 
+// Each whole-disc piece's unit spans, for the unit-grid guards in `whole_disc_tests`.
+#[cfg(test)]
+pub(crate) fn whole_disc_pieces(disc: &Disc, files: &[Vec<(u32, u32)>]) -> Vec<Vec<UnitSpan>> {
+    let sel: Vec<usize> = (0..disc.titles.len()).collect();
+    pieces(disc, files, &sel, true)
+        .into_iter()
+        .map(|p| p.spans)
+        .collect()
+}
+
 fn in_segment(segments: &[(u32, u32)], lba: u32) -> bool {
     let i = segments.partition_point(|s| s.0 <= lba);
     i > 0 && lba < segments[i - 1].1
@@ -635,6 +645,7 @@ fn resolve_hddvd(
         }
     }
     let mut inner = aacs_inner(run);
+    inner.no_stream_files = files.is_empty();
     inner.best_effort = true;
     inner.origin = run.origin.first().copied();
     inner.proven = vec![0];
@@ -794,6 +805,17 @@ fn resolve_bd(
         return Err(failure.unwrap_or_else(|| missing_error(scope, disc)));
     }
     let mut inner = aacs_inner(run);
+    inner.no_stream_files = files.is_empty();
+    // Refused up front only if no probe of the piece opens: arrival blanks a unit whose batch
+    // partner opens (damage), and a damaged seed opens under no key (E7013 option A).
+    inner.lazy_unopened = ps.iter().any(|p| {
+        let opened = |u: &Vec<u8>| (0..run.pool.len()).any(|s| run.opens(u, s));
+        matches!(p.verdict, Verdict::Lazy(_))
+            && !p.enc.iter().any(opened)
+            && p.enc
+                .iter()
+                .any(|u| crate::aacs::content::aacs_unit_on_grid(u, format))
+    });
     // Step 6 (continued): forensic keys, reused from the seed or anchored once.
     let forensic = match &layout {
         None => None,

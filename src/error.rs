@@ -1420,7 +1420,7 @@ pub fn is_skippable_title_stub(e: &std::io::Error) -> bool {
 
 /// Whether an [`io::Error`](std::io::Error) is a cooperative user stop
 /// ([`Error::Halted`], code [`E_HALTED`]) — vs a structural failure. A stop is
-/// resumable, not a rip failure: `mux_stream` maps a mid-run halt to
+/// resumable, not a rip failure: `mux_with_keys` maps a mid-run halt to
 /// `completed = false`, and consumers preserve staging rather than quarantining.
 /// Typed replacement for the consumers' `E<code>`-leading-token string match.
 pub fn is_halt(e: &std::io::Error) -> bool {
@@ -1544,7 +1544,7 @@ mod tests {
     #[test]
     fn is_skippable_title_stub_excludes_malformed_mkv_input() {
         // The two skippable per-title codes, round-tripped through io::Error as
-        // `mux_stream` returns them. `MkvInvalid` now means ONLY the no-muxable-
+        // `mux_with_keys` returns them. `MkvInvalid` now means ONLY the no-muxable-
         // frames stub, matching this predicate's documented meaning.
         let mkv: std::io::Error = Error::MkvInvalid.into();
         let css: std::io::Error = Error::CssKeyMissing.into();

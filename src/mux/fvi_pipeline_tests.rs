@@ -1,17 +1,19 @@
 //! End-to-end `fvi://` tests: drive a REAL MPEG-2 Program-Stream image through
-//! the public highway (`build_iso_pipeline`, MpegPs → PS demux → `Mpeg2Parser`)
+//! the highway (`build_iso_pipeline`, MpegPs → PS demux → `Mpeg2Parser`)
 //! and into the `fvi://` sink built by `output()`, then parse the `.fvi` back
 //! and assert the per-picture index is correct.
 //!
-//! These tests deliberately use only the public API and the real parser /
-//! pipeline — no stubbed frames that bypass the demuxer or the codec parse.
+//! These tests use the real parser / pipeline — no stubbed frames that bypass the
+//! demuxer or the codec parse. `build_iso_pipeline` is crate-private (KU §3.1).
 
-use libfreemkv::disc::{
+use crate::decrypt::DecryptKeys;
+use crate::disc::{
     Codec, ColorSpace, ContentFormat, DiscTitle, Extent, FrameRate, HdrFormat, Resolution, Stream,
     VideoStream,
 };
-use libfreemkv::pes::Stream as PesStream;
-use libfreemkv::{DecryptKeys, Medium, SectorSource, SourceInfo, build_iso_pipeline, output};
+use crate::mux::resolve::build_iso_pipeline;
+use crate::pes::Stream as PesStream;
+use crate::{Medium, SectorSource, SourceInfo, output};
 use std::path::PathBuf;
 
 /// DVD video PES stream_id (0xE0).
@@ -107,7 +109,7 @@ impl SectorSource for MemSource {
         count: u16,
         buf: &mut [u8],
         _recovery: bool,
-    ) -> libfreemkv::error::Result<usize> {
+    ) -> crate::error::Result<usize> {
         let start = lba as usize * 2048;
         let want = count as usize * 2048;
         for (i, b) in buf[..want].iter_mut().enumerate() {
@@ -169,6 +171,7 @@ fn two_gop_image() -> Vec<u8> {
 
 /// Drive the real highway and write every frame into the `fvi://` sink.
 fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
+    let _drive = crate::sector::prefetched::holder_test_lock();
     let mut input = build_iso_pipeline(
         MemSource { data: image },
         title.clone(),
@@ -176,7 +179,6 @@ fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
         3, // 3-sector (one AACS unit) batches → one source stamp per GOP region
         ContentFormat::MpegPs,
         false,
-        None,
         None,
         None,
     )
@@ -318,7 +320,7 @@ fn fvi_sink_indexes_real_mpeg2_pipeline_output() {
 // `type:"?"`/`src:null` just because `PictureInfo` is MPEG-2-specific.
 #[test]
 fn fvi_sink_indexes_non_mpeg2_frames_codec_agnostically() {
-    use libfreemkv::pes::{PesFrame, SourcePos};
+    use crate::pes::{PesFrame, SourcePos};
 
     let dir = tempdir();
     let path = dir.join("nocoding.fvi");

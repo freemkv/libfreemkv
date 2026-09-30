@@ -2027,7 +2027,7 @@ mod tests {
     }
 
     // ── resolve_keys_with_reason / classify_resolve_failure ────────────────
-    // Also exercised end-to-end via `ensure_decryptable` in `disc/mod.rs`; these
+    // Also exercised end-to-end via the decrypt gate (`keys::disc_gate`); these
     // pin the *classifier* directly, covering branches that gate test doesn't.
 
     /// A `SuppliedKey` provider with the given derivation material and no

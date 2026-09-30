@@ -14,11 +14,15 @@
 
 mod arrival;
 mod fmts;
+#[cfg(doctest)]
+mod public_api_cannot_decrypt_aacs;
 mod resolve;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use arrival::Arrival;
+#[cfg(test)]
+pub(crate) use resolve::whole_disc_pieces;
 
 use crate::aacs::trace::ResolutionTrace;
 use crate::decrypt::{AacsKeyMap, DecryptKeys};
@@ -30,6 +34,33 @@ use crate::session::KeySourceFactory;
 use crate::whole_disc::{UnitSpan, WholeDiscReader};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+// A title's `DiscStream` read through `map`: the read plan, then each unit's mapped key.
+pub(crate) fn install_key_map(
+    mut stream: crate::mux::DiscStream,
+    map: Arc<AacsKeyMap>,
+) -> crate::mux::DiscStream {
+    stream.plan_reads(&map);
+    stream.reader_mut().set_key_map(map);
+    stream
+}
+
+// A test's own phased map; map construction stays in `keys` (KU §2.2).
+#[cfg(test)]
+pub(crate) fn test_key_map(
+    ranges: Vec<(u32, u32, usize, crate::decrypt::Phase)>,
+) -> Arc<AacsKeyMap> {
+    Arc::new(AacsKeyMap::from_ranges_phased(ranges))
+}
+
+// `src` reading through a test's map, for the tests outside `keys`.
+#[cfg(test)]
+pub(crate) fn test_keyed_source<S: SectorSource>(
+    src: DecryptingSectorSource<S>,
+    map: Arc<AacsKeyMap>,
+) -> DecryptingSectorSource<S> {
+    src.with_key_map(map)
+}
 
 /// What a rip decrypts, and so what `resolve` must key (KU §2.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +235,10 @@ pub(crate) struct Inner {
     pub(crate) fmts_phases: HashMap<u16, crate::decrypt::Phase>,
     pub(crate) map: Arc<AacsKeyMap>,
     pub(crate) spans: Vec<UnitSpan>,
+    // `resolve` found no stream file (no `/BDMV/STREAM` or `/HVDVD_TS`, or an empty one).
+    pub(crate) no_stream_files: bool,
+    // A Lazy piece has intact encrypted probes and no held key opens any (KU §2.3 step 9.2).
+    pub(crate) lazy_unopened: bool,
     pub(crate) arrival: Vec<ArrivalPiece>,
     pub(crate) lazy: Vec<(u32, u32)>,
     pub(crate) proven: Vec<usize>,
@@ -234,6 +269,8 @@ impl Inner {
             fmts_phases: HashMap::new(),
             map: Arc::new(AacsKeyMap::from_ranges(Vec::new())),
             spans: Vec::new(),
+            no_stream_files: false,
+            lazy_unopened: false,
             arrival: Vec::new(),
             lazy: Vec::new(),
             proven: Vec::new(),
@@ -722,6 +759,20 @@ impl ResolvedKeySet {
         if !self.covers(&KeyScope::WholeDisc) {
             return Err(Self::caller_bug("whole disc outside the key set's scope"));
         }
+        if self.0.no_stream_files && !content.is_empty() {
+            // Titles but no stream file: sweeping would key bare title extents (freemkv#55).
+            tracing::warn!(target: "freemkv::scan", "titles but no AACS content files");
+            let path = match disc.format {
+                DiscFormat::HdDvd => "/HVDVD_TS",
+                _ => "/BDMV/STREAM",
+            };
+            return Err(Error::UdfNotFound { path: path.into() });
+        }
+        if self.0.lazy_unopened {
+            // KU §2.1 (6) "Refuse first": a sweep reads that unit, and no held key opens it.
+            tracing::error!(target: "freemkv::keys", code = crate::error::E_WHOLE_DISC_KEY_MISSING, "a stream file holds a unit no held key opens: refusing the sweep before any output");
+            return Err(Error::WholeDiscKeyMissing);
+        }
         let mut dec = self.decrypting(inner, None, StopKind::Image, false)?;
         content.extend(self.0.spans.iter().map(|&(s, n, _)| (s, n)));
         let content = crate::whole_disc::merge_ranges(content);
@@ -736,8 +787,7 @@ impl ResolvedKeySet {
 }
 
 /// Whether `disc` can be decrypted with `keys` (KU §3.5). CSS is read from `disc.css` /
-/// `css_error` exactly as [`Disc::ensure_decryptable_keys`] does. With `keys == None` the
-/// legacy disc-banked AACS keys decide (the library fallback until KU-X2).
+/// `css_error`; an AACS disc needs a set for it, so `keys == None` is `AacsKeysMissing`.
 pub fn decrypt_status(disc: &Disc, keys: Option<&ResolvedKeySet>) -> DecryptStatus {
     if disc.css_error.is_some() {
         return DecryptStatus::CssNotCracked(Error::CssNoDiscKey);
@@ -758,7 +808,7 @@ pub fn decrypt_status(disc: &Disc, keys: Option<&ResolvedKeySet>) -> DecryptStat
                 DecryptStatus::Ready
             }
         }
-        _ => match disc.ensure_decryptable_keys(false, &disc.decrypt_keys()) {
+        _ => match disc_gate(disc, false) {
             Ok(()) => DecryptStatus::Ready,
             Err(e) => DecryptStatus::AacsKeysMissing(e),
         },
@@ -767,8 +817,7 @@ pub fn decrypt_status(disc: &Disc, keys: Option<&ResolvedKeySet>) -> DecryptStat
 
 /// The pre-flight decrypt gate over a set (KU §3.5): `Ok` when `scope` can be decrypted
 /// from `keys`, else the typed refusal, before any output. `raw` always passes. CSS is read
-/// from `disc.css` / `css_error` as [`Disc::ensure_decryptable_keys`] does; `keys == None`
-/// falls back to the legacy disc-banked AACS keys (until KU-X2).
+/// from `disc.css` / `css_error`; an AACS disc with no AACS set refuses.
 pub fn check_decryptable(
     disc: &Disc,
     raw: bool,
@@ -791,9 +840,46 @@ pub fn check_decryptable(
             }
             Ok(())
         }
-        Some(_) if disc.aacs.is_some() && disc.css.is_none() => {
-            disc.ensure_decryptable_keys(false, &DecryptKeys::None)
-        }
-        _ => disc.ensure_decryptable(false),
+        _ => disc_gate(disc, false),
     }
+}
+
+/// The disc-wide gate with no AACS set: `Ok` for a clear disc or a cracked CSS disc, else
+/// the typed refusal. `raw` always passes. An AACS disc refuses with the scan's
+/// handshake or key-service failure when it recorded one, else `NoDiscKey`.
+pub(crate) fn disc_gate(disc: &Disc, raw: bool) -> Result<()> {
+    if raw {
+        return Ok(());
+    }
+    // Scrambled-but-uncracked CSS is a WHOLE-DISC verdict (`CssNoDiscKey`), never the
+    // per-title `CssKeyMissing`, which would log "empty stub" per title and exit 0.
+    if disc.css_error.is_some() {
+        return Err(Error::CssNoDiscKey);
+    }
+    if !matches!(disc.decrypt_keys(), DecryptKeys::None) {
+        return Ok(());
+    }
+    if disc.aacs.is_some() {
+        // E7017 vs E7022: a handshake or key-service failure surfaces as itself, else
+        // operators hunt a VUK during an outage.
+        if let Some(e) = disc
+            .aacs_error
+            .as_ref()
+            .and_then(crate::disc::handshake_class_error)
+        {
+            return Err(e);
+        }
+        return Err(match disc.aacs_error {
+            Some(Error::KeyServiceUnavailable) => Error::KeyServiceUnavailable,
+            Some(Error::KeyServiceUnauthorized) => Error::KeyServiceUnauthorized,
+            Some(Error::KeyServiceRateLimited) => Error::KeyServiceRateLimited,
+            _ => Error::NoDiscKey {
+                disc_hash: disc.aacs_disc_hash(),
+            },
+        });
+    }
+    if disc.css.is_some() {
+        return Err(Error::CssKeyMissing);
+    }
+    Ok(())
 }

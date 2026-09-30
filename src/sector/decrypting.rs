@@ -14,55 +14,6 @@ use std::sync::Arc;
 
 use super::SectorSource;
 
-/// A closure resolving keys from encrypted-content samples — the shape of both
-/// [`KeyFetch`] operations. `Ok(empty)` = no key; `Err` = the key source failed
-/// (reported as itself, not as a missing key).
-pub type KeyFetchFn = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Result<Vec<[u8; 16]>> + Send + Sync>;
-
-/// Resolves keys from encrypted-content samples for [`DecryptingSectorSource`].
-///
-/// Two operations: [`unit_keys`](Self::unit_keys) resolves the base Unit
-/// Key(s) for a CPS unit from real encrypted samples; [`fmts_indexes`](Self::fmts_indexes)
-/// resolves the disc's AACS 2.1 forensic index key set from an index-1
-/// anchor batch. Both return additional keys to add to the pool and retry
-/// with; empty if the source can't help, `Err` if it failed. The library does no key lookup or
-/// network I/O itself — this is the caller's seam to its key source.
-#[derive(Clone)]
-pub struct KeyFetch {
-    unit: KeyFetchFn,
-    fmts: KeyFetchFn,
-}
-
-impl KeyFetch {
-    /// Build a resolver from its two operations: `unit` resolves base Unit Keys
-    /// from a CPS unit's samples; `fmts` resolves the forensic index set from an
-    /// index-1 anchor batch.
-    pub fn new(unit: KeyFetchFn, fmts: KeyFetchFn) -> Self {
-        Self { unit, fmts }
-    }
-
-    /// A resolver that serves ONLY base Unit Keys; [`fmts_indexes`](Self::fmts_indexes)
-    /// is always empty. For read paths that never resolve forensic keys — the
-    /// sweep/patch recovery decorator, which handles CPS units only.
-    pub fn unit_only(unit: KeyFetchFn) -> Self {
-        Self::new(unit, std::sync::Arc::new(|_| Ok(Vec::new())))
-    }
-
-    /// Resolve the base Unit Key(s) for a CPS unit from `samples` (real encrypted
-    /// units drawn from it). Normally one key; the caller adds whatever it returns
-    /// to the pool.
-    pub fn unit_keys(&self, samples: &[Vec<u8>]) -> Result<Vec<[u8; 16]>> {
-        (self.unit)(samples)
-    }
-
-    /// Resolve the disc's AACS 2.1 forensic index keys from an index-1 single-
-    /// phase `anchor` batch. The source returns the COMPLETE ordered set (index i
-    /// = element i); the caller trusts any non-empty result as all of them.
-    pub fn fmts_indexes(&self, anchor: &[Vec<u8>]) -> Result<Vec<[u8; 16]>> {
-        (self.fmts)(anchor)
-    }
-}
-
 /// Decorator: read from `inner`, then run the configured
 /// AACS / CSS decrypt over the bytes that landed in `buf`.
 ///
@@ -98,6 +49,21 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// The key set's on-arrival proof for pieces `resolve` could not prove up front
     /// (KU §2.4). `None` for every reader not built by a `ResolvedKeySet`.
     arrival: Option<Box<crate::keys::Arrival>>,
+    /// Damaged AACS units blanked so far (see [`blanked_units`](Self::blanked_units)).
+    blanked: BlankTally,
+}
+
+// The blanked-unit count, shared with the stream that reports it as loss; logged once when
+// the reader is dropped, so a damaged rip never reads as clean.
+struct BlankTally(Arc<std::sync::atomic::AtomicU64>);
+
+impl Drop for BlankTally {
+    fn drop(&mut self) {
+        let n = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            tracing::warn!(target: "freemkv::decrypt", units = n, "{n} damaged AACS units blanked");
+        }
+    }
 }
 
 /// Does the sector span `[lba, lba+count)` intersect any encrypted-content range?
@@ -110,9 +76,9 @@ fn span_touches_content(content: Option<&[(u32, u32)]>, lba: u32, count: u16) ->
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
-    /// Wrap `inner` with the given keys. For an AACS source, install a key map
-    /// via [`with_key_map`](Self::with_key_map) before reading — AACS decrypts
-    /// only through the map and fails loud without one.
+    /// Wrap `inner` with the given keys. AACS decrypts only through a key map, which
+    /// only a [`ResolvedKeySet`](crate::keys::ResolvedKeySet) reader installs; an AACS
+    /// source built here fails loud on its first encrypted unit.
     pub fn new(inner: S, keys: DecryptKeys) -> Self {
         Self {
             inner,
@@ -121,6 +87,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             content_ranges: None,
             key_map: None,
             arrival: None,
+            blanked: BlankTally(Arc::default()),
         }
     }
 
@@ -140,7 +107,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// resolved one key per CPS unit / segment up front, so every aligned unit is
     /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check.
     /// AACS-only; a CSS / clear disc ignores it.
-    pub fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
+    pub(crate) fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
         self.key_map = Some(map);
         self
     }
@@ -149,7 +116,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// proactive map on an already-constructed source (the inline live-drive
     /// [`DiscStream`](crate::mux::DiscStream) builds the decorator first, then
     /// installs the map via its own `with_key_map`).
-    pub fn set_key_map(&mut self, map: Arc<crate::decrypt::AacsKeyMap>) {
+    pub(crate) fn set_key_map(&mut self, map: Arc<crate::decrypt::AacsKeyMap>) {
         self.key_map = Some(map);
     }
 
@@ -177,6 +144,17 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// [`set_unit_base`](SectorSource::set_unit_base) anchors the next one.
     pub fn clear_unit_base(&mut self) {
         self.unit_base = None;
+    }
+
+    /// Damaged AACS units this reader blanked (zero-filled) so far: flagged units no key can
+    /// open, read damage the rip carries on past.
+    pub fn blanked_units(&self) -> u64 {
+        self.blanked.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The shared blanked-unit counter, for a stream that reports it after this reader moves.
+    pub(crate) fn blanked_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.blanked.0.clone()
     }
 
     /// Borrow the inner source. Useful for tests and for adapters
@@ -268,24 +246,30 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
 
+        // Read damage before any key sees the units: a damaged unit is blanked and counted,
+        // never a key verdict (E7013 here, E7022 on arrival). "We rip bad discs."
+        self.blank_damage(lba, &mut buf[..n], content_ref);
+
         // KU §2.4: units of a piece left unproven are proven now, from the held keys only.
         if let (Some(arrival), DecryptKeys::Aacs { unit_keys, .. }) =
             (self.arrival.as_deref(), &self.keys)
         {
-            arrival.process(&mut self.inner, lba, &mut buf[..n], unit_keys)?;
+            let blanked = arrival.process(&mut self.inner, lba, &mut buf[..n], unit_keys)?;
+            self.count_blanked(blanked);
         }
 
         // Proactive map path (storm-free mux): keys were resolved per unit up front,
         // so decrypt with the mapped key and trust it (no per-unit `is_clean`). A
         // resolver gap fails loud; bad TS and units outside content extents pass through.
         if let Some(map) = self.key_map.clone() {
-            crate::decrypt::decrypt_sectors_mapped_in_content(
+            let blanked = crate::decrypt::decrypt_sectors_mapped_in_content(
                 &mut buf[..n],
                 &self.keys,
                 lba,
                 &map,
                 content_ref,
             )?;
+            self.count_blanked(blanked);
             return Ok(n);
         }
 
@@ -302,6 +286,30 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
 
     fn set_unit_base(&mut self, lba: u32) {
         self.unit_base = Some(lba);
+    }
+}
+
+impl<S: SectorSource> DecryptingSectorSource<S> {
+    // Blank and count the damaged AACS units of a read at `lba` (see
+    // `decrypt::blank_damaged_units`): judged are content units the map keys or arrival covers.
+    fn blank_damage(&mut self, lba: u32, buf: &mut [u8], content: Option<&[(u32, u32)]>) {
+        let DecryptKeys::Aacs { format, .. } = self.keys else {
+            return;
+        };
+        let (map, arrival) = (self.key_map.as_deref(), self.arrival.as_deref());
+        let covered = |at: u32| {
+            content.is_none_or(|r| crate::decrypt::span_in_content_ranges(at, 1, r))
+                && (map.is_some_and(|m| m.entry_for(at).is_some())
+                    || arrival.is_some_and(|a| a.covers(at)))
+        };
+        let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered);
+        self.count_blanked(n);
+    }
+
+    fn count_blanked(&self, n: usize) {
+        self.blanked
+            .0
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -981,18 +989,32 @@ mod tests {
         );
     }
 
-    // A wrong explicit base (disc grid) cuts chunks across real units: their seed has
-    // no TS sync at byte 4, so the decrypt refuses instead of returning garbage.
+    // A wrong explicit base (disc grid) cuts chunks across real units: a flagged chunk's seed
+    // has no TS sync at byte 4, so no key opens it. Like any damaged unit it is blanked and
+    // counted, never E7013 (1.7.7 muxed through; "multi pass shouldn't error").
     #[test]
-    fn aacs_read_on_wrong_unit_grid_fails_loud() {
+    fn aacs_read_on_wrong_unit_grid_is_blanked_not_e7013() {
         let mut dec = misaligned_file_source();
         let mut buf = vec![0u8; 2 * crate::aacs::content::ALIGNED_UNIT_LEN];
         dec.set_unit_base(FILE_LBA + 1);
-        let r = dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false);
+        let mut raw = vec![0u8; buf.len()];
+        dec.inner_mut()
+            .read_sectors(FILE_LBA + 1, 6, &mut raw, false)
+            .unwrap();
+        let flagged: Vec<usize> = (0..2).filter(|&u| raw[u * 6144] & 0xC0 != 0).collect();
         assert!(
-            matches!(r, Err(crate::error::Error::DecryptFailed)),
-            "an off-grid read must be DecryptFailed, got Ok"
+            !flagged.is_empty(),
+            "the fixture cuts at least one flagged chunk"
         );
+        dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false)
+            .expect("an off-grid read is blanked, never E7013");
+        for &u in &flagged {
+            assert!(
+                buf[u * 6144..(u + 1) * 6144].iter().all(|&b| b == 0),
+                "unit {u} blanked"
+            );
+        }
+        assert_eq!(dec.blanked_units(), flagged.len() as u64);
 
         // The file's own grid decrypts both units byte-exact.
         dec.set_unit_base(FILE_LBA);
@@ -1001,5 +1023,181 @@ mod tests {
         let mut want = clear_aacs_unit();
         want.extend(clear_aacs_unit());
         assert_eq!(buf, crate::aacs::content::cpi_cleared(want));
+    }
+
+    // A file at FILE_LBA of `units` units under one key; `damaged` units have a garbage seed.
+    fn damaged_file_source(units: u32, damaged: &[u32]) -> DecryptingSectorSource<MisalignedFile> {
+        let key = [0x5Au8; 16];
+        let mut data = Vec::new();
+        for u in 0..units {
+            let mut unit = encrypt_aacs_unit(&key);
+            if damaged.contains(&u) {
+                crate::test_util::damage_unit_seed(&mut unit);
+            }
+            data.extend(unit);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let end = FILE_LBA + units * 3;
+        let map = Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+            FILE_LBA, end, 0,
+        )]));
+        let mut dec = DecryptingSectorSource::new(MisalignedFile(data), keys).with_key_map(map);
+        dec.set_unit_base(FILE_LBA);
+        dec
+    }
+
+    // Read `units` units from unit `from` of the damaged file.
+    fn read_units(
+        dec: &mut DecryptingSectorSource<MisalignedFile>,
+        from: u32,
+        units: u32,
+    ) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; units as usize * crate::aacs::content::ALIGNED_UNIT_LEN];
+        dec.read_sectors(FILE_LBA + from * 3, (units * 3) as u16, &mut buf, false)?;
+        Ok(buf)
+    }
+
+    /// A lone unit whose seed is damaged, among units that decrypt on the grid, is a hole
+    /// (zeros), never E7013. KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is
+    /// used as the seed for calculating the Block Key." — no key opens a damaged seed.
+    #[test]
+    fn a_damaged_unit_seed_on_the_grid_is_a_hole() {
+        assert!(
+            crate::spec::keys::KS_4_SEED
+                .text
+                .contains("used as the seed")
+        );
+        let mut dec = damaged_file_source(3, &[1]);
+        let buf = read_units(&mut dec, 0, 3).expect("read damage is not a key failure");
+        let clear = crate::aacs::content::cpi_cleared(clear_aacs_unit());
+        let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+        assert_eq!(&buf[..ul], &clear[..]);
+        assert!(
+            buf[ul..2 * ul].iter().all(|&b| b == 0),
+            "the damaged unit is a hole"
+        );
+        assert_eq!(&buf[2 * ul..], &clear[..]);
+        assert_eq!(dec.blanked_units(), 1);
+    }
+
+    /// A cluster of damaged units is blanked and counted however it is read: alone, first,
+    /// with no intact unit around it. KS-2 [BD] §3.10.1: "Each MPEG source packet consists of
+    /// the TP_extra_header (4 bytes) and an MPEG Transport packet".
+    #[test]
+    fn a_cluster_of_damaged_units_is_blanked_and_counted() {
+        assert!(
+            crate::spec::keys::KS_2_ALIGNED_UNIT
+                .text
+                .contains("TP_extra_header (4 bytes)")
+        );
+        let mut dec = damaged_file_source(4, &[1, 2]);
+        let buf = read_units(&mut dec, 1, 2).expect("a damage cluster is blanked, never E7013");
+        assert_eq!(dec.blanked_units(), 2);
+        assert!(buf.iter().all(|&b| b == 0), "both damaged units are holes");
+    }
+
+    /// A sweep's zero run need not be unit-aligned. A unit whose tail sectors are zero keeps
+    /// its seed: its head sector decrypts and the zeros stay zeros. A unit whose head sector is
+    /// zero lost its seed (KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used
+    /// as the seed"), so its ciphertext rest is a hole too — never E7013, never ciphertext out.
+    #[test]
+    fn partial_zero_units_at_both_edges_of_a_run_are_holes() {
+        let mut dec = damaged_file_source(4, &[]);
+        dec.inner_mut().0[4 * 2048..7 * 2048].fill(0); // unit 1 sectors 1-2, unit 2 sector 0
+        let buf = read_units(&mut dec, 0, 4).expect("a partial zero run is read damage");
+        let clear = crate::aacs::content::cpi_cleared(clear_aacs_unit());
+        let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+        assert_eq!(&buf[..ul], &clear[..]);
+        // Packets 0-9 lie wholly in unit 1's intact head sector (10 × 192 = 1920 bytes).
+        assert_eq!(
+            &buf[ul..ul + 1920],
+            &clear[..1920],
+            "the kept head decrypts"
+        );
+        assert!(
+            buf[ul + 2112..2 * ul].iter().all(|&b| b == 0),
+            "its zero tail stays zero"
+        );
+        assert!(
+            buf[2 * ul..3 * ul].iter().all(|&b| b == 0),
+            "a lost seed is a hole"
+        );
+        assert_eq!(&buf[3 * ul..], &clear[..]);
+        assert_eq!(
+            dec.blanked_units(),
+            1,
+            "the lost-seed unit; the kept head is not blanked"
+        );
+    }
+
+    // An FMTS Even-phase segment of `units` units under `key`, the map pointing at `map_key`;
+    // units in `garbled` read back with a garbage head that kept the CPI flag and TS sync.
+    fn fmts_file_source(
+        units: u32,
+        garbled: &[u32],
+        key: [u8; 16],
+        map_key: [u8; 16],
+    ) -> DecryptingSectorSource<MisalignedFile> {
+        let mut data = Vec::new();
+        for u in 0..units {
+            let mut unit = encrypt_aacs_unit(&key);
+            if garbled.contains(&u) {
+                crate::test_util::damage_unit_seed(&mut unit);
+                unit[4] = 0x47;
+            }
+            data.extend(unit);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, map_key)],
+            format: crate::disc::ContentFormat::BdTs,
+        };
+        let end = FILE_LBA + units * 3;
+        let map = crate::decrypt::AacsKeyMap::from_ranges_phased(vec![(
+            FILE_LBA,
+            end,
+            0,
+            crate::decrypt::Phase::Even,
+        )]);
+        let mut dec =
+            DecryptingSectorSource::new(MisalignedFile(data), keys).with_key_map(Arc::new(map));
+        dec.set_unit_base(FILE_LBA);
+        dec
+    }
+
+    /// A lone FMTS unit that fails the correct-phase verify (a garbled head that kept its
+    /// sync) is damage: blanked and counted, never E7013, read with its segment or alone.
+    /// KS-3 [BD] §3.10.1: "A new CBC cipher chain is started for each Aligned Unit".
+    #[test]
+    fn a_lone_fmts_verify_failure_is_blanked_never_e7013() {
+        let key = [0x5Au8; 16];
+        let mut dec = fmts_file_source(4, &[2], key, key);
+        let buf = read_units(&mut dec, 0, 4).expect("damage, not E7013");
+        let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+        let fmt = crate::disc::ContentFormat::BdTs;
+        assert!(
+            crate::aacs::content::is_clean(&buf[..ul], fmt),
+            "unit 0 decrypts"
+        );
+        assert!(
+            buf[2 * ul..3 * ul].iter().all(|&b| b == 0),
+            "unit 2 blanked"
+        );
+        assert_eq!(dec.blanked_units(), 1);
+        let alone = read_units(&mut dec, 2, 1).expect("alone, still damage");
+        assert!(alone.iter().all(|&b| b == 0));
+        assert_eq!(dec.blanked_units(), 2);
+    }
+
+    /// A wrong FMTS key fails every unit it keys: that stops E7013, never a blank.
+    #[test]
+    fn a_wrong_fmts_key_still_stops_e7013() {
+        let mut dec = fmts_file_source(4, &[], [0x5Au8; 16], [0xCCu8; 16]);
+        assert!(matches!(
+            read_units(&mut dec, 0, 4),
+            Err(crate::error::Error::DecryptFailed)
+        ));
     }
 }

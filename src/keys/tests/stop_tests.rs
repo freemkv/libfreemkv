@@ -147,11 +147,8 @@ fn session_token_wins_over_the_callers_in_resolve() {
     let reader = fx.source();
     let (session_tok, caller_tok) = (Halt::new(), Halt::new());
     let (f, seen) = spies(&session_tok, true);
-    let mut s = crate::session::DiscSession::from_parts_for_test(
-        Some(fx.disc),
-        Some(Box::new(reader)),
-        None,
-    );
+    let mut s =
+        crate::session::DiscSession::from_parts_for_test(Some(fx.disc), Some(Box::new(reader)));
     s.set_halt_for_test(&session_tok);
     let opts = ResolveKeysOptions {
         halt: Some(&caller_tok),

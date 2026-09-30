@@ -147,7 +147,7 @@ fn aacs_decrypt_unit_roundtrip() {
     ));
 
     // Now decrypt
-    aacs::content::decrypt_unit(&mut plain, &unit_key);
+    libfreemkv::test_util::decrypt_unit(&mut plain, &unit_key);
     assert!(
         aacs::content::is_clean(&plain, libfreemkv::disc::ContentFormat::BdTs),
         "decrypted unit should read as clear (TS syncs restored)"
@@ -424,7 +424,7 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
     );
 
     // -- Decrypt with the library --
-    aacs::content::decrypt_unit(&mut plaintext, &unit_key);
+    libfreemkv::test_util::decrypt_unit(&mut plaintext, &unit_key);
 
     // Decryption clears no flag, so the unit round-trips byte-for-byte.
     assert_eq!(
@@ -465,7 +465,7 @@ fn aacs_cross_validation_alternate_key() {
         &mut plaintext[16..aacs::content::ALIGNED_UNIT_LEN],
     );
 
-    aacs::content::decrypt_unit(&mut plaintext, &unit_key);
+    libfreemkv::test_util::decrypt_unit(&mut plaintext, &unit_key);
 
     // Decryption clears no flag, so the unit round-trips byte-for-byte.
     assert_eq!(&plaintext[..], &expected[..]);

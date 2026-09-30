@@ -7,13 +7,12 @@
 //! libfreemkv resolves no keys and reads no keydb: the consumer supplies its
 //! own key material via [`KeySpec`], forwarded to [`ScanOptions`] at scan time.
 
-use crate::aacs::trace::ResolutionTrace;
 use crate::disc::{Disc, DiscId, DriveCredentials, ScanOptions};
 use crate::drive::{Drive, find_drive};
 use crate::error::{Error, Result};
 use crate::halt::{Halt, Progress};
-use crate::keysource::{KeySource, MIN_SAMPLE_UNITS, key_fetch, resolve_and_apply_traced};
-use crate::sector::{FileSectorSource, KeyFetch, SectorSource};
+use crate::keysource::KeySource;
+use crate::sector::{FileSectorSource, SectorSource};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,71 +20,12 @@ use std::sync::Arc;
 ///
 /// libfreemkv builds no key sources itself (the `freemkv_keysources` crate that
 /// implements [`KeySource`] depends on libfreemkv, not the other way round), so
-/// the consumer hands in a way to (re)build its sources. It is invoked once for
-/// the up-front resolve and again per on-decrypt-miss fetch (the cold path), so
-/// it stays `Send + Sync` without requiring `KeySource: Send`. Mirrors the
-/// `make_sources` argument [`key_fetch`] already takes.
+/// the consumer hands in a way to build its sources. [`ResolvedKeySet::resolve`]
+/// calls it once and keeps nothing; it stays `Send + Sync` without requiring
+/// `KeySource: Send`.
+///
+/// [`ResolvedKeySet::resolve`]: crate::keys::ResolvedKeySet::resolve
 pub type KeySourceFactory = Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>;
-
-/// The outcome of resolving a disc's base AACS unit keys: the structured
-/// per-source [`ResolutionTrace`] (for the consumer to render) plus the
-/// read-time [`KeyFetch`] built from the disc's public inputs.
-///
-/// `key_fetch` is `None` only for a disc that carries no AACS inputs (an
-/// unencrypted / CSS / non-AACS disc); it is `Some` whenever the disc is AACS,
-/// independent of whether a key actually resolved — the on-decrypt-miss fetch is
-/// wired the same way regardless.
-pub struct ResolvedKeys {
-    /// Per-source walk of the resolve, for the consumer to render (English-free
-    /// typed enums only; the app layer maps them to text).
-    pub trace: ResolutionTrace,
-    /// The read-time fetch closure, or `None` for a non-AACS disc.
-    pub key_fetch: Option<KeyFetch>,
-}
-
-/// Resolve and bank a keyless-scanned disc's BASE AACS unit keys, and build the
-/// read-time [`KeyFetch`] — the one place the sampling / ordered-apply / banking
-/// / fetch-construction glue lives, so the CLI and autorip stop hand-rolling it.
-///
-/// Samples ciphertext from the disc via `reader` (a live [`Drive`] or a
-/// file-backed [`SectorSource`] from [`scan_iso`]), runs the ordered `sources`
-/// first-valid-wins, banks any winning unit keys onto `disc`, and builds the
-/// read-time [`KeyFetch`] used for later on-decrypt-miss fetches.
-pub fn resolve_keys_for(
-    reader: &mut dyn SectorSource,
-    disc: &mut Disc,
-    sources: KeySourceFactory,
-) -> ResolvedKeys {
-    // A disc with no captured AACS inputs is unencrypted / CSS / non-AACS —
-    // nothing to resolve, nothing to fetch.
-    let Some(mut inputs) = disc.inputs() else {
-        return ResolvedKeys {
-            trace: ResolutionTrace::new(),
-            key_fetch: None,
-        };
-    };
-
-    // Build the ordered sources once for the up-front resolve. Skip the disc-reading
-    // sample step when there is no source to validate against (a dropped / SSRF-
-    // rejected online-only source) — resolution is a miss regardless; the read is waste.
-    let src_vec = sources();
-    if !src_vec.is_empty() {
-        inputs.samples = disc.content_samples(reader, MIN_SAMPLE_UNITS);
-    }
-
-    // Ordered, first-valid-wins; banks the winning unit keys onto `disc`.
-    let (_resolved, trace) = resolve_and_apply_traced(&src_vec, &inputs, disc);
-
-    // Build the read-time fetch from the disc's public inputs (fresh, so it
-    // reflects any banked state); its per-fetch `samples` are filled by the
-    // closure. `inputs()` is still `Some` here (the disc is AACS).
-    let fetch_inputs = disc.inputs().unwrap_or(inputs);
-    let fetch = key_fetch(fetch_inputs, sources);
-    ResolvedKeys {
-        trace,
-        key_fetch: Some(fetch),
-    }
-}
 
 /// Which optical device a [`DiscSession`] should open.
 pub enum DeviceTarget {
@@ -154,10 +94,6 @@ pub struct DiscSession {
     /// file path stages a `FileSectorSource`; the live-drive path stages the
     /// drive itself via [`Self::stage_drive_as_reader`].
     reader: Option<Box<dyn SectorSource>>,
-    /// The read-time AACS fetch closure, built by [`Self::resolve_keys`] and
-    /// retained so a later mux (step 4) can install it into the decrypt
-    /// decorator. `None` until keys are resolved / for a non-AACS disc.
-    key_fetch: Option<KeyFetch>,
     /// The op token from [`Self::open_with`] (stop design §2.2): every CDB, the scan and
     /// the key resolution observe it. `None` for [`Self::open`].
     halt: Option<Halt>,
@@ -262,7 +198,6 @@ impl DiscSession {
             spec,
             disc: None,
             reader: None,
-            key_fetch: None,
             halt,
             progress: None,
         })
@@ -285,7 +220,7 @@ impl DiscSession {
     /// Fast disc identification — name/format only, no playlist parse. Wraps
     /// [`Disc::identify`].
     pub fn identify(&mut self) -> Result<DiscId> {
-        // Same reachability as `scan`/`resolve_keys`: public `stage_drive_as_reader`/
+        // Same reachability as `scan`/`resolve_key_set`: public `stage_drive_as_reader`/
         // `into_drive` move the drive out, so this slot can legitimately be empty.
         // A library must not panic from public API, so return typed `DeviceNotReady`.
         let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
@@ -357,41 +292,6 @@ impl DiscSession {
         }
     }
 
-    /// Resolve and bank the scanned disc's base AACS unit keys from the
-    /// consumer-supplied `sources`, and retain the read-time [`KeyFetch`] on the
-    /// session (see [`Self::key_fetch`]) for a later mux.
-    ///
-    /// Samples ciphertext through the session's own reader — the staged file
-    /// reader if one is present, otherwise the live drive — so it works for both
-    /// a live-drive session and a file-backed one. Returns the structured
-    /// [`ResolutionTrace`] for the consumer to render; a non-AACS disc resolves
-    /// to an empty trace with no error. Requires [`Self::scan`] to have run.
-    pub fn resolve_keys(&mut self, sources: KeySourceFactory) -> Result<ResolutionTrace> {
-        // The disc must have been scanned so its AACS inputs are captured.
-        if self.disc.is_none() {
-            return Err(Error::DeviceNotReady {
-                path: self.device.clone(),
-            });
-        }
-        // Sample through the staged reader when present (file-backed), else the
-        // live drive. `self.reader` / `self.disc` / `self.drive` are disjoint
-        // fields, so the borrows below don't conflict.
-        let resolved = if let Some(reader) = self.reader.as_mut() {
-            let disc = self.disc.as_mut().expect("disc present (checked above)");
-            resolve_keys_for(reader.as_mut(), disc, sources)
-        } else {
-            // Same reachability as `scan` above: the drive may have been staged
-            // into the reader slot by the public `stage_drive_as_reader`.
-            let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
-                path: self.device.clone(),
-            })?;
-            let disc = self.disc.as_mut().expect("disc present (checked above)");
-            resolve_keys_for(drive, disc, sources)
-        };
-        self.key_fetch = resolved.key_fetch;
-        Ok(resolved.trace)
-    }
-
     /// Resolve the rip's key set for `scope` up front (KU §3.1): one
     /// [`ResolvedKeySet::resolve`](crate::keys::ResolvedKeySet::resolve) through the
     /// session's staged reader, else its drive. The session keeps nothing: the set is the
@@ -444,13 +344,6 @@ impl DiscSession {
         }
     }
 
-    /// The read-time AACS fetch closure retained by [`Self::resolve_keys`], for a
-    /// later mux (step 4) to install into the decrypt decorator. `None` before
-    /// keys are resolved, or for a non-AACS disc.
-    pub fn key_fetch(&self) -> Option<&KeyFetch> {
-        self.key_fetch.as_ref()
-    }
-
     /// The scanned disc, if [`Self::scan`] has run.
     pub fn disc(&self) -> Option<&Disc> {
         self.disc.as_ref()
@@ -498,7 +391,7 @@ impl DiscSession {
 
     /// Stage the owned drive as the session's boxed sector source so a live
     /// single-pass mux can drive it through
-    /// [`MuxInput::Session`](crate::mux::MuxInput::Session). Moves the `Drive`
+    /// [`MuxSource::Session`](crate::mux::MuxSource::Session). Moves the `Drive`
     /// (itself a [`SectorSource`]) into the `reader` slot; the cached
     /// [`Self::device_path`] keeps the device name available afterward. A no-op
     /// if the drive was already staged or moved out.
@@ -515,8 +408,8 @@ impl DiscSession {
     }
 
     /// Take the staged sector source out of the session by mutable borrow,
-    /// leaving `None` behind. Used by [`crate::mux::mux_stream`]'s
-    /// [`MuxInput::Session`](crate::mux::MuxInput::Session) arm, which drives
+    /// leaving `None` behind. Used by [`crate::mux::mux_with_keys`]'s
+    /// [`MuxSource::Session`](crate::mux::MuxSource::Session) arm, which drives
     /// the mux from `&mut DiscSession` and so cannot consume the whole session.
     /// A second call (or a call before the reader is staged) returns `None`, and
     /// the driver maps that to a clean error rather than a panic (see Q2 of the
@@ -526,12 +419,11 @@ impl DiscSession {
     }
 
     // Test-only: build a session over an injected reader + already-scanned disc without opening
-    // a live Drive, to exercise the mux/resolve_keys test paths.
+    // a live Drive, to exercise the mux test paths.
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(
         disc: Option<Disc>,
         reader: Option<Box<dyn SectorSource>>,
-        key_fetch: Option<KeyFetch>,
     ) -> DiscSession {
         DiscSession {
             drive: None,
@@ -539,7 +431,6 @@ impl DiscSession {
             spec: KeySpec::default(),
             disc,
             reader,
-            key_fetch,
             halt: None,
             progress: None,
         }
@@ -557,7 +448,6 @@ impl DiscSession {
             spec: KeySpec::default(),
             disc: None,
             reader: None,
-            key_fetch: None,
             halt: None,
             progress: None,
         }
@@ -778,44 +668,7 @@ mod tests {
         assert!(spec.key_sources.is_empty());
     }
 
-    // ── resolve_keys_for: sampling → ordered apply → bank → fetch ─────────────
-
-    /// A no-op reader — the resolve tests use discs with no titles, so no
-    /// sampling read fires; this satisfies the `&mut dyn SectorSource` seam.
-    struct NullReader;
-    impl SectorSource for NullReader {
-        fn capacity_sectors(&self) -> u32 {
-            0
-        }
-        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
-            Ok(0)
-        }
-    }
-
-    /// A source that hands back one terminal Unit Key.
-    struct HasUnitKey([u8; 16]);
-    impl KeySource for HasUnitKey {
-        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>> {
-            Ok(vec![UnitKey::new(0, self.0)])
-        }
-        fn label(&self) -> &'static str {
-            "has-key"
-        }
-    }
-
-    /// A source with no key for this disc.
-    struct NoUnitKey;
-    impl KeySource for NoUnitKey {
-        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>> {
-            Ok(Vec::new())
-        }
-        fn label(&self) -> &'static str {
-            "empty"
-        }
-    }
-
-    /// A minimal keyless AACS `Disc` — `inputs()` returns `Some`, so
-    /// `resolve_keys_for` proceeds to the sources. No titles (no sampling read).
+    /// A minimal keyless AACS `Disc`: `inputs()` returns `Some`. No titles.
     fn aacs_disc() -> Disc {
         Disc {
             volume_id: "TEST".into(),
@@ -831,9 +684,6 @@ mod tests {
                 bus_encryption: false,
                 mkb_version: None,
                 disc_hash: "0xabc".into(),
-                key_source: crate::disc::KeyOrigin::KeyDb,
-                vuk: None,
-                unit_keys: Vec::new(),
                 volume_id: [0u8; 16],
                 uk_ro: Vec::new(),
                 mkb: Vec::new(),
@@ -844,121 +694,6 @@ mod tests {
             css_error: None,
             content_format: crate::ContentFormat::BdTs,
         }
-    }
-
-    fn factory_of<S: KeySource + 'static>(make: fn() -> S) -> KeySourceFactory {
-        Arc::new(move || vec![Box::new(make()) as Box<dyn KeySource>])
-    }
-
-    // The happy path: a source's Unit Key is banked onto the disc's AACS state
-    // and a `KeyFetch` is retained. Guards against dropping the banking step
-    // (`resolve_and_apply_traced`), which would leave `decrypt_keys()` `None`.
-    #[test]
-    fn resolve_keys_for_banks_unit_key_and_builds_fetch() {
-        use crate::decrypt::DecryptKeys;
-        const K: [u8; 16] = [0x5A; 16];
-        let mut disc = aacs_disc();
-        let mut reader = NullReader;
-
-        let resolved = resolve_keys_for(&mut reader, &mut disc, factory_of(|| HasUnitKey(K)));
-
-        match disc.decrypt_keys() {
-            DecryptKeys::Aacs { unit_keys, .. } => {
-                // CPS-unit number is positional index + 1 (idx 0 → unit 1).
-                assert_eq!(unit_keys, vec![(1u32, K)], "the source's key is banked");
-            }
-            _ => panic!("expected banked AACS keys"),
-        }
-        assert!(
-            resolved.key_fetch.is_some(),
-            "an AACS disc always retains a read-time fetch"
-        );
-        // The trace recorded exactly one source, which resolved.
-        assert_eq!(resolved.trace.keys.len(), 1);
-    }
-
-    /// A source with no key: nothing is banked (`decrypt_keys()` stays `None`),
-    /// but a `KeyFetch` is STILL built (the on-decrypt-miss path is wired
-    /// regardless of the up-front resolve succeeding).
-    #[test]
-    fn resolve_keys_for_no_key_leaves_disc_unkeyed_but_builds_fetch() {
-        use crate::decrypt::DecryptKeys;
-        let mut disc = aacs_disc();
-        let mut reader = NullReader;
-
-        let resolved = resolve_keys_for(&mut reader, &mut disc, factory_of(|| NoUnitKey));
-
-        assert!(
-            matches!(disc.decrypt_keys(), DecryptKeys::None),
-            "no source key ⇒ disc stays unkeyed"
-        );
-        assert!(
-            resolved.key_fetch.is_some(),
-            "an AACS disc retains a fetch even when the up-front resolve misses"
-        );
-    }
-
-    /// A counting reader over zeros — records the highest LBA sampled so the test
-    /// can prove the LARGEST title's extent (not the small one) was read.
-    struct SamplingReader {
-        reads: u32,
-        max_lba: u32,
-    }
-    impl SectorSource for SamplingReader {
-        fn capacity_sectors(&self) -> u32 {
-            100_000
-        }
-        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
-            self.reads += 1;
-            self.max_lba = self.max_lba.max(lba);
-            let want = count as usize * 2048;
-            buf[..want].fill(0);
-            Ok(want)
-        }
-    }
-
-    // `resolve_keys_for` samples the LARGEST title's ciphertext through the
-    // reader when a source is configured. Other tests use a title-less disc
-    // (no sampling read); this one covers the sampling branch with two titles.
-    #[test]
-    fn resolve_keys_for_samples_largest_title_through_reader() {
-        use crate::disc::{DiscTitle, Extent};
-        let mut disc = aacs_disc();
-        let mut small = DiscTitle::empty();
-        small.size_bytes = 1_000;
-        small.extents = vec![Extent {
-            start_lba: 100,
-            sector_count: 300,
-        }];
-        let mut large = DiscTitle::empty();
-        large.size_bytes = 9_000_000;
-        large.extents = vec![Extent {
-            start_lba: 9_000,
-            sector_count: 300,
-        }];
-        disc.titles = vec![small, large];
-        let mut reader = SamplingReader {
-            reads: 0,
-            max_lba: 0,
-        };
-
-        // Non-empty source ⇒ the sampling read is NOT skipped.
-        let resolved = resolve_keys_for(&mut reader, &mut disc, factory_of(|| HasUnitKey([1; 16])));
-
-        assert!(
-            reader.reads > 0,
-            "the largest title was sampled via the reader"
-        );
-        assert!(
-            reader.max_lba >= 9_000,
-            "sampling read the LARGER title's extent (lba>=9000), not the small one \
-             (max_lba={})",
-            reader.max_lba
-        );
-        assert!(
-            resolved.key_fetch.is_some(),
-            "an AACS disc still retains a read-time fetch"
-        );
     }
 
     // `inputs_with_samples` carries real encrypted units from the main feature, so
@@ -984,59 +719,17 @@ mod tests {
         disc.titles = vec![t];
         assert!(disc.inputs().expect("aacs").samples.is_empty());
         let inputs = disc
-            .inputs_with_samples(&mut Encrypted, MIN_SAMPLE_UNITS)
+            .inputs_with_samples(&mut Encrypted, crate::keysource::MIN_SAMPLE_UNITS)
             .expect("aacs");
-        assert_eq!(inputs.samples.len(), MIN_SAMPLE_UNITS);
-    }
-
-    /// A non-AACS disc (CSS / unencrypted — `inputs()` is `None`): resolution is a
-    /// no-op. Empty trace, NO fetch, disc untouched. This is the out-of-the-box
-    /// CSS/None path that must keep working with no keydb.
-    #[test]
-    fn resolve_keys_for_non_aacs_disc_is_a_noop() {
-        use crate::decrypt::DecryptKeys;
-        let mut disc = aacs_disc();
-        disc.aacs = None; // now carries no AACS inputs
-        disc.encrypted = false;
-        let mut reader = NullReader;
-
-        let resolved = resolve_keys_for(&mut reader, &mut disc, factory_of(|| HasUnitKey([1; 16])));
-
-        assert!(
-            resolved.trace.keys.is_empty() && resolved.trace.unlock.is_empty(),
-            "a non-AACS disc yields an empty trace"
-        );
-        assert!(
-            resolved.key_fetch.is_none(),
-            "a non-AACS disc has nothing to fetch"
-        );
-        assert!(
-            matches!(disc.decrypt_keys(), DecryptKeys::None),
-            "the disc is left untouched"
-        );
-    }
-
-    // `resolve_keys` called before `scan` (disc slot still `None`) must return
-    // the typed `DeviceNotReady` guard, never reach the `.expect(...)` below it
-    // and panic. Guards against dropping the `if self.disc.is_none()` early return.
-    #[test]
-    fn resolve_keys_before_scan_is_clean_device_not_ready() {
-        let mut session = DiscSession::from_parts_for_test(None, None, None);
-        let err = session
-            .resolve_keys(factory_of(|| HasUnitKey([1; 16])))
-            .expect_err("resolve_keys before scan must error, not panic");
-        assert!(
-            matches!(err, Error::DeviceNotReady { .. }),
-            "expected DeviceNotReady, got {err:?}"
-        );
+        assert_eq!(inputs.samples.len(), crate::keysource::MIN_SAMPLE_UNITS);
     }
 
     // `identify` after the drive has left the session (both `stage_drive_as_reader`
     // and `into_drive` permit that ordering) must return `DeviceNotReady`, not
-    // reach `drive_mut`'s `.expect(...)` and panic. Sibling of scan/resolve_keys.
+    // reach `drive_mut`'s `.expect(...)` and panic. Sibling of scan.
     #[test]
     fn identify_without_a_drive_is_clean_device_not_ready() {
-        let mut session = DiscSession::from_parts_for_test(None, None, None);
+        let mut session = DiscSession::from_parts_for_test(None, None);
         let err = session
             .identify()
             .expect_err("identify without a drive must error, not panic");
@@ -1134,7 +827,7 @@ mod tests {
     /// (already staged or moved out): the reader slot stays empty.
     #[test]
     fn stage_drive_as_reader_is_noop_without_a_drive() {
-        let mut session = DiscSession::from_parts_for_test(None, None, None);
+        let mut session = DiscSession::from_parts_for_test(None, None);
         session.stage_drive_as_reader();
         assert!(
             session.into_reader().is_none(),
