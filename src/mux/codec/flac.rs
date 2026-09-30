@@ -217,6 +217,42 @@ mod tests {
     }
 
     #[test]
+    fn pes_dts_used_when_pts_absent() {
+        let mut p = FlacParser::new();
+        let mut pes = make_pes(make_flac_frame(100), None);
+        pes.dts = Some(180_000);
+        let f = p.parse(&pes);
+        assert_eq!(f[0].pts_ns, pts_to_ns(180_000));
+    }
+
+    #[test]
+    fn pes_discontinuity_propagates_to_frame() {
+        let mut p = FlacParser::new();
+        let mut pes = make_pes(make_flac_frame(100), Some(90_000));
+        pes.discontinuity = true;
+        assert!(p.parse(&pes)[0].discontinuity);
+        assert!(!p.parse(&make_pes(make_flac_frame(100), Some(96_000)))[0].discontinuity);
+    }
+
+    #[test]
+    fn poisoned_track_drops_even_valid_frames() {
+        let mut p = FlacParser::new();
+        // A run of verified-corrupt frames poisons the track (200-AU verdict gate).
+        for i in 0..400 {
+            let mut bad = make_flac_frame(100);
+            bad[20] ^= 0xFF;
+            assert!(p.parse(&make_pes(bad, Some(i * 90))).is_empty());
+        }
+        assert!(p.tally.is_poisoned());
+        let before = p.dropped_frames();
+        assert!(
+            p.parse(&make_pes(make_flac_frame(100), Some(1_000_000)))
+                .is_empty()
+        );
+        assert_eq!(p.dropped_frames(), before + 1);
+    }
+
+    #[test]
     fn non_flac_packet_passes_through() {
         // A packet without the FLAC sync isn't a frame we can validate — never
         // false-drop it.

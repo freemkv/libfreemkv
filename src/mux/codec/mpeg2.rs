@@ -1358,16 +1358,15 @@ mod tests {
     // --- parameter-set-only stream: seq header, no picture → no frame ---
 
     #[test]
-    fn sequence_header_only_emits_no_frame_but_captures_codec_private() {
+    fn sequence_header_only_emits_no_frame_and_captures_no_codec_private() {
         let mut parser = Mpeg2Parser::new();
         let mut data = make_seq_header(1920, 1080, 3, 4);
         data.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE, 0x14, 0x8A]);
         // No picture start code at all.
         let frames = parse_then_flush(&mut parser, &make_pes(data, Some(0)));
         assert!(frames.is_empty(), "no coded picture → no frame");
-        // codec_private only captured when an AU is emitted; a header-only
-        // stream emits nothing, so nothing is captured — and there is no frame
-        // to need it. (Real streams always follow the header with a picture.)
+        // A header-only AU returns before extract_seq_header: nothing is captured.
+        assert!(parser.codec_private().is_none());
     }
 
     // --- buffer cap: corrupt stream with no second boundary is force-flushed ---
@@ -1385,6 +1384,77 @@ mod tests {
         frames.extend(parser.flush());
         assert_eq!(frames.len(), 1, "over-cap AU force-flushed, not dropped");
         assert!(frames[0].keyframe);
+    }
+
+    // Frame-count cap: a run of pictures with no GOP/sequence boundary is force-flushed
+    // during parse at MAX_PENDING_FRAMES, not held until EOF.
+    #[test]
+    fn gop_frame_cap_flushes_during_parse() {
+        let mut parser = Mpeg2Parser::new();
+        let mut data = Vec::new();
+        for _ in 0..MAX_PENDING_FRAMES + 100 {
+            data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+            data.extend_from_slice(&[0xAA; 4]);
+        }
+        let out = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(out.len(), MAX_PENDING_FRAMES, "cap flushed one full run");
+    }
+
+    // Byte cap: few-but-huge pictures are force-flushed once the buffered bytes reach
+    // MAX_PENDING_BYTES, even far below the frame cap.
+    #[test]
+    fn gop_byte_cap_flushes_during_parse() {
+        let mut parser = Mpeg2Parser::new();
+        let mut data = Vec::new();
+        for _ in 0..2 {
+            data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+            data.extend(std::iter::repeat_n(0xAA, MAX_PENDING_BYTES / 2));
+        }
+        data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+        data.extend_from_slice(&[0xAA; 4]);
+        let out = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(out.len(), 2, "byte cap flushed the two huge pictures");
+    }
+
+    // Parser-level timing for a progressive sequence: rff counts 4 fields (tff=0) or 6 (tff=1)
+    // only when the sequence extension's progressive_sequence is honoured.
+    #[test]
+    fn progressive_sequence_rff_durations_via_parser() {
+        let mut parser = Mpeg2Parser::new();
+        let field = 20_000_000u64; // 25 fps
+        let mut au = make_seq_header(720, 576, 3, 3);
+        au.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE, 0x10, 0x08]); // progressive_sequence
+        au.extend_from_slice(&gop());
+        for (ct, tr, tff) in [(1u8, 0u16, 0u8), (2, 1, 1)] {
+            au.extend_from_slice(&make_picture_header_tr(ct, tr));
+            au.extend_from_slice(&pic_coding_ext(tff, 1, 0, true));
+            au.extend_from_slice(&[0xAA; 8]);
+        }
+        let f = parse_then_flush(&mut parser, &make_pes(au, Some(0)));
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].duration_ns, Some(4 * field), "rff, tff=0 → 4 fields");
+        assert_eq!(f[1].duration_ns, Some(6 * field), "rff, tff=1 → 6 fields");
+        assert_eq!(f[1].pts_ns as u64, 4 * field);
+    }
+
+    // Parser-level timing for field pictures: each occupies one field period.
+    #[test]
+    fn field_pictures_occupy_one_field_via_parser() {
+        let mut parser = Mpeg2Parser::new();
+        let field = 20_000_000u64; // 25 fps
+        let mut au = make_seq_header(720, 576, 3, 3);
+        au.extend_from_slice(&gop());
+        for (ct, e2) in [(1u8, 0x01u8), (2, 0x02)] {
+            au.extend_from_slice(&make_picture_header(ct));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            au.extend_from_slice(&[0xAA; 8]);
+        }
+        let f = parse_then_flush(&mut parser, &make_pes(au, Some(0)));
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].duration_ns, Some(field));
+        assert_eq!(f[1].duration_ns, Some(field));
     }
 
     // --- parse_resolution: 12-bit field packing (ISO 13818-2 §6.2.2.1) ---

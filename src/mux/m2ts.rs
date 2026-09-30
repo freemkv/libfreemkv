@@ -462,6 +462,12 @@ mod tests {
             let mut demux = crate::mux::ts::TsDemuxer::new(&[AUDIO_PID]);
             let mut pes = demux.feed(ts);
             pes.extend(demux.flush());
+            // Each 5 ms BD sub-payload carries its own offset PTS, so none repeat.
+            let pts: Vec<i64> = pes.iter().map(|p| p.pts.expect("PES PTS")).collect();
+            assert!(
+                pts.windows(2).all(|w| w[0] < w[1]),
+                "{channels:?} x{samples}: PES PTS strictly increasing, got {pts:?}"
+            );
             let mut parser = crate::mux::codec::lpcm::LpcmParser::new();
             let got: Vec<u8> = pes
                 .iter()

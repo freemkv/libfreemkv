@@ -214,17 +214,6 @@ mod tests {
     use crate::mux::codec::coding::{CodingType, Mpeg2Coding};
     use crate::mux::videomap::Medium;
     use crate::pes::SourcePos;
-    use std::path::PathBuf;
-
-    /// Tiny unique temp dir helper (avoids a dev-dependency on `tempfile`).
-    fn tempdir() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("fmkv_fvi_test_{}_{}", std::process::id(), n));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
 
     fn mpeg2_title() -> DiscTitle {
         let mut t = DiscTitle::empty();
@@ -301,18 +290,21 @@ mod tests {
 
     #[test]
     fn sink_is_write_only() {
-        let dir = tempdir();
-        let mut sink =
-            FviSink::create(&dir.join("x.fvi"), &mpeg2_title(), SourceInfo::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = FviSink::create(
+            &dir.path().join("x.fvi"),
+            &mpeg2_title(),
+            SourceInfo::default(),
+        )
+        .unwrap();
         let err = Stream::read(&mut sink).expect_err("read must error");
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn sink_writes_header_and_only_video_records() {
-        let dir = tempdir();
-        let path = dir.join("movie.fvi");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.fvi");
         let mut sink = FviSink::create(
             &path,
             &mpeg2_title(),
@@ -366,27 +358,46 @@ mod tests {
             rec.get("gop").is_none(),
             "no GOP-closure signal → gop omitted"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secondary_video_stream_is_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pip.fvi");
+        let mut title = mpeg2_title();
+        let mut second = title.streams[0].clone();
+        if let DiscStream::Video(v) = &mut second {
+            v.pid = 0x1012;
+            v.secondary = true;
+        }
+        title.streams.push(second);
+        let mut sink = FviSink::create(&path, &title, SourceInfo::default()).unwrap();
+        sink.write(&vframe(0, Some(i_pic()), Some(SourcePos::at_byte(0))))
+            .unwrap();
+        sink.write(&vframe(1, Some(i_pic()), Some(SourcePos::at_byte(2048))))
+            .unwrap();
+        sink.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "header + primary record only");
     }
 
     #[test]
     fn empty_title_still_emits_valid_header() {
-        let dir = tempdir();
-        let path = dir.join("empty.fvi");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.fvi");
         let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
         sink.finish().unwrap(); // no frames
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1, "header only");
         let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(header["format"], "freemkv/video-index");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn extension_jsonl_is_still_json_lines() {
         // Output is always JSON Lines regardless of extension (one format today).
-        let dir = tempdir();
-        let path = dir.join("idx.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.jsonl");
         let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
         sink.write(&vframe(0, Some(i_pic()), None)).unwrap();
         sink.finish().unwrap();
@@ -394,7 +405,6 @@ mod tests {
         // null src on a provenance-absent frame.
         let rec: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
         assert_eq!(rec["src"], serde_json::Value::Null);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -402,8 +412,8 @@ mod tests {
         // A non-MPEG2 stream (coding None) whose parser sets keyframe must still
         // produce USEFUL records: key/type from the frame keyframe flag, src +
         // pts populated, and NO mpeg2-only field members.
-        let dir = tempdir();
-        let path = dir.join("uhd.fvi");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uhd.fvi");
         let mut sink = FviSink::create(
             &path,
             &hevc_title(),
@@ -438,6 +448,5 @@ mod tests {
         assert_eq!(recs[1]["key"], false);
         assert_eq!(recs[1]["type"], "P");
         assert_eq!(recs[1]["src"]["sector"], 10); // 20480 / 2048
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

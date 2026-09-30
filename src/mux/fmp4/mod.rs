@@ -598,7 +598,7 @@ mod tests {
         let minf = child(&mdia[8..], b"minf").expect("minf");
 
         // ── mdhd. Version 0 layout: vflags(4) creation(4) modification(4)
-        // timescale(4) duration(4) language(2) pre_defined(2) = 20 bytes.
+        // timescale(4) duration(4) language(2) pre_defined(2) = 24 bytes.
         let mdhd = child(&mdia[8..], b"mdhd").expect("mdia must carry mdhd");
         let body = &mdhd[8..];
         assert_eq!(body[0], 0, "mdhd version 0 (32-bit times)");

@@ -376,4 +376,38 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "no two frames share a display PTS");
     }
+
+    #[test]
+    fn unanchored_gops_continue_after_the_previous_gop() {
+        use CodingType::*;
+        // GOPs 1-2 carry anchors (calibrating dur); GOPs 3-4 carry none and must
+        // continue at origin + count*dur, not collide.
+        let dur = 40_000_000i64;
+        let mut r = SparsePtsReorder::new();
+        let mut got: Vec<i64> = Vec::new();
+        for anchor in [Some(0i64), Some(3 * dur), None, None] {
+            for (k, ct) in [I, P, P].into_iter().enumerate() {
+                let p = if k == 0 { anchor } else { None };
+                got.extend(r.push(p, frame(ct, k == 0)).iter().map(|f| f.pts_ns));
+            }
+        }
+        got.extend(r.flush().iter().map(|f| f.pts_ns));
+        let want: Vec<i64> = (0..12).map(|i| i * dur).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn single_anchor_uses_fallback_duration() {
+        use CodingType::*;
+        let mut r = SparsePtsReorder::new();
+        let mut got = Vec::new();
+        for (k, ct) in [I, P, P].into_iter().enumerate() {
+            got.extend(r.push((k == 0).then_some(1_000), frame(ct, k == 0)));
+        }
+        got.extend(r.flush());
+        let pts: Vec<i64> = got.iter().map(|f| f.pts_ns).collect();
+        let d = FALLBACK_FRAME_DUR_NS;
+        assert_eq!(pts, vec![1_000, 1_000 + d, 1_000 + 2 * d]);
+        assert!(got.iter().all(|f| f.duration_ns == Some(d as u64)));
+    }
 }

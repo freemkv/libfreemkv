@@ -336,6 +336,33 @@ mod tests {
     }
 
     #[test]
+    fn mpeg2_nb_fields_rff_on_interlaced_frame_is_two() {
+        // Spec-forbidden rff on a non-progressive interlaced frame: treated as 2.
+        for tff in [false, true] {
+            assert_eq!(
+                mpeg2(CodingType::P, tff, true, false, false, true).nb_fields(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn mpeg2_field_picture_reports_pair_order_not_progressive() {
+        // Field picture: order comes from the stored pair order, even when the
+        // progressive flags are set.
+        for (prog_frame, prog_seq) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                mpeg2(CodingType::P, true, false, prog_frame, prog_seq, false).field_order(),
+                Some(FieldOrder::Tff)
+            );
+            assert_eq!(
+                mpeg2(CodingType::P, false, false, prog_frame, prog_seq, false).field_order(),
+                Some(FieldOrder::Bff)
+            );
+        }
+    }
+
+    #[test]
     fn mpeg2_progressive_accessor() {
         assert_eq!(
             mpeg2(CodingType::I, true, false, true, false, true).progressive(),
