@@ -2399,9 +2399,12 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     };
 
     // Map MKV track numbers to BD-TS PIDs, computed in u32 so `0x1100 + (tnum - 2)`
-    // can't wrap u16 for large track numbers (a 13-bit PID tops out at 0x1FFF);
-    // reject anything landing outside the valid PID space.
-    let ts_pid = ts_pid_for_track(tnum)?;
+    // can't wrap u16 (a 13-bit PID tops out at 0x1FFF); out of range is rejected. Only
+    // carried track types need one: a dropped type never fails the file.
+    let ts_pid = match ttype {
+        1 | 2 | 17 => ts_pid_for_track(tnum)?,
+        _ => 0,
+    };
 
     let probe = MkvProbeTrack {
         number: tnum,
@@ -7389,6 +7392,16 @@ mod readback_tests {
             entry(1, 2, ebml::CODEC_DTS, &[]),
         ];
         assert!(MkvStream::open(Cursor::new(mkv(&entries, &[]))).is_err());
+    }
+
+    #[test]
+    fn a_high_track_number_on_a_dropped_track_type_does_not_fail_the_file() {
+        let entries = [
+            entry(1, 1, ebml::CODEC_H264, &[]),
+            entry(0x1000, 0x21, "D_WEBVTT/METADATA", &[]),
+        ];
+        let s = MkvStream::open(Cursor::new(mkv(&entries, &[]))).expect("opens");
+        assert_eq!(s.info().streams.len(), 1);
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
