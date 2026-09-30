@@ -2063,6 +2063,23 @@ mod tests {
         assert!(buf[2 * ul..3 * ul].iter().all(|&b| b == 0));
     }
 
+    /// Option A (E7013): a garbage seed with its CPI bits clear lost the TS sync every BD-TS
+    /// unit carries at byte 4 (KS-2): damage, blanked and counted; clear and zero units are not.
+    #[test]
+    fn blank_damaged_units_counts_a_garbage_seed_with_cpi_clear() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let mut garbage = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut garbage, &[0xAAu8; 16]);
+        crate::test_util::damage_unit_seed(&mut garbage);
+        garbage[0] &= 0x3F;
+        let mut buf = [garbage, clear_ts_unit(), vec![0u8; ul]].concat();
+        let n = blank_damaged_units(&mut buf, 0, ContentFormat::BdTs, &|_| true);
+        assert_eq!(n, 1);
+        assert!(buf[..ul].iter().all(|&b| b == 0));
+        assert_eq!(&buf[ul..2 * ul], &clear_ts_unit()[..]);
+    }
+
     /// Phase::All (multi-CPS / base) decrypts EVERY unit and never runs the verify
     /// — the common-disc path is byte-for-byte unchanged.
     #[test]
