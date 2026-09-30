@@ -1633,6 +1633,12 @@ fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHea
                     remaining -= consumed;
                     if cid == ebml::TRACK_ENTRY {
                         let t = parse_track(r, cs)?;
+                        // TrackNumber is unique (RFC 9559 5.1.4.1.1); the count bounds allocation.
+                        if probe_tracks.len() >= MAX_TRACK_ENTRIES
+                            || probe_tracks.iter().any(|p| p.number == t.number)
+                        {
+                            return Err(crate::error::Error::MkvSourceInvalid.into());
+                        }
                         probe_tracks.push(t.probe);
                         if let Some(s) = t.stream {
                             // Record the TrackNumber alongside the stream it maps
@@ -1808,6 +1814,9 @@ fn parse_chapters(body: &[u8]) -> io::Result<Vec<Chapter>> {
 
 /// Largest valid 13-bit MPEG-TS PID.
 const MAX_TS_PID: u32 = 0x1FFF;
+
+// Most TrackEntry elements accepted from one (untrusted) Tracks element.
+const MAX_TRACK_ENTRIES: usize = 512;
 
 // Map an MKV track number to a synthetic BD-TS PID, rejecting overflow of the
 // 13-bit PID space. Track 1 -> video PID (0x1011); others -> 0x1100+(tnum-2),
@@ -7358,6 +7367,28 @@ mod readback_tests {
             "{} frames buffered by the probe",
             rs.pending.len()
         );
+    }
+
+    #[test]
+    fn a_tracks_element_past_the_entry_cap_is_rejected() {
+        let entries: Vec<_> = (1..=MAX_TRACK_ENTRIES as u64 + 1)
+            .map(|n| entry(n, 99, "X", &[]))
+            .collect();
+        let e = MkvStream::open(Cursor::new(mkv(&entries, &[]))).err();
+        assert!(e.is_some(), "{} entries accepted", entries.len());
+        let at_cap: Vec<_> = (1..=MAX_TRACK_ENTRIES as u64)
+            .map(|n| entry(n, 99, "X", &[]))
+            .collect();
+        assert!(MkvStream::open(Cursor::new(mkv(&at_cap, &[]))).is_ok());
+    }
+
+    #[test]
+    fn a_duplicate_track_number_is_rejected() {
+        let entries = [
+            entry(1, 2, ebml::CODEC_AC3, &[]),
+            entry(1, 2, ebml::CODEC_DTS, &[]),
+        ];
+        assert!(MkvStream::open(Cursor::new(mkv(&entries, &[]))).is_err());
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
