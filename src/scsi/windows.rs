@@ -497,6 +497,16 @@ impl ScsiTransport for SptiTransport {
 mod tests {
     use super::*;
 
+    // A drive root like `D:\` must open the volume, not the root directory.
+    #[test]
+    fn normalize_device_path_maps_drive_forms_to_the_volume_path() {
+        assert_eq!(normalize_device_path("D:"), r"\\.\D:");
+        assert_eq!(normalize_device_path(r"D:\"), r"\\.\D:");
+        assert_eq!(normalize_device_path(r"\\.\D:"), r"\\.\D:");
+        assert_eq!(normalize_device_path(r"\\.\CdRom0"), r"\\.\CdRom0");
+        assert_eq!(normalize_device_path("CdRom0"), r"\\.\CdRom0");
+    }
+
     // Regression guard: `StorageAdapterDescriptor` must match `STORAGE_ADAPTER_DESCRIPTOR`
     // (winioctl.h) field-for-field.
     #[test]
