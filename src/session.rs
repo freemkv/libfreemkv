@@ -115,6 +115,14 @@ fn forward_key_material(spec: &mut KeySpec, mut opts: ScanOptions) -> ScanOption
     opts
 }
 
+// A failed scan hands back the sources `forward_key_material` moved, so a retry on the
+// same session still has them.
+fn restore_key_sources(spec: &mut KeySpec, opts: &mut ScanOptions, took: bool) {
+    if took {
+        spec.key_sources = std::mem::take(&mut opts.key_sources);
+    }
+}
+
 impl DiscSession {
     /// Open a drive and bring the SCSI transport up.
     ///
@@ -231,16 +239,27 @@ impl DiscSession {
 
     /// Full structure scan. Forwards the session's [`KeySpec`] credentials /
     /// key-sources into `opts` (without clobbering anything the caller already
-    /// set), runs [`Disc::scan`], stores the result, and returns a borrow.
+    /// set), runs [`Disc::scan`], stores the result, and returns a borrow. A failed
+    /// scan leaves the session's key sources in place for a retry.
     pub fn scan(&mut self, opts: ScanOptions) -> Result<&Disc> {
-        let opts = forward_key_material(&mut self.spec, opts);
+        let took = opts.key_sources.is_empty() && !self.spec.key_sources.is_empty();
+        let mut opts = forward_key_material(&mut self.spec, opts);
         // `stage_drive_as_reader` is PUBLIC and moves the drive out, so this slot can
         // legitimately be empty here. "No shipped consumer calls it in that order" is
         // not "cannot happen" — the public surface permits it, so it must be an error.
-        let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
-            path: self.device.clone(),
-        })?;
-        let disc = Disc::scan(drive, &opts)?;
+        let scanned = match self.drive.as_mut() {
+            Some(drive) => Disc::scan(drive, &opts),
+            None => Err(Error::DeviceNotReady {
+                path: self.device.clone(),
+            }),
+        };
+        let disc = match scanned {
+            Ok(d) => d,
+            Err(e) => {
+                restore_key_sources(&mut self.spec, &mut opts, took);
+                return Err(e);
+            }
+        };
         self.disc = Some(disc);
         Ok(self.disc.as_ref().expect("disc just stored"))
     }
@@ -250,16 +269,27 @@ impl DiscSession {
     /// wins), and a Stop after the scan's last CDB still ends it `Halted`, storing no
     /// [`Disc`].
     pub fn scan_with(&mut self, opts: ScanOptions) -> Result<&Disc> {
-        let opts = forward_key_material(&mut self.spec, opts);
-        let drive = self.drive.as_mut().ok_or_else(|| Error::DeviceNotReady {
-            path: self.device.clone(),
-        })?;
+        let took = opts.key_sources.is_empty() && !self.spec.key_sources.is_empty();
+        let mut opts = forward_key_material(&mut self.spec, opts);
         // `Disc::scan` applies the alias rule and checks the drive's token last (LS6).
-        let disc = Disc::scan(drive, &opts)?;
+        let scanned = match self.drive.as_mut() {
+            Some(drive) => Disc::scan(drive, &opts),
+            None => Err(Error::DeviceNotReady {
+                path: self.device.clone(),
+            }),
+        };
         // The session's own final check: a Stop on the op token stores no `Disc`.
-        if let Some(h) = &self.halt {
-            h.check()?;
-        }
+        let scanned = scanned.and_then(|d| match &self.halt {
+            Some(h) => h.check().map(|()| d),
+            None => Ok(d),
+        });
+        let disc = match scanned {
+            Ok(d) => d,
+            Err(e) => {
+                restore_key_sources(&mut self.spec, &mut opts, took);
+                return Err(e);
+            }
+        };
         self.disc = Some(disc);
         Ok(self.disc.as_ref().expect("disc just stored"))
     }

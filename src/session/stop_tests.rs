@@ -187,3 +187,56 @@ fn open_without_a_token_stays_advisory() {
     let s = DiscSession::bring_up(drive, KeySpec::default(), None).expect("advisory");
     assert!(s.token().is_none());
 }
+
+/// A failing eject at session level reaches the caller, not swallowed.
+#[test]
+fn finish_eject_propagates_the_eject_error() {
+    let h = Halt::new();
+    let (t, _fake) = FakeTransport::new();
+    let t = t.rule(is_eject, crate::test_util::FakeMode::Fault);
+    let s = session_over(t, &h).expect("brought up");
+    assert!(s.finish(Finish::Eject).is_err());
+}
+
+/// The advisory bring-up steps failing never fail `open`: the later scan gates.
+#[test]
+fn bring_up_failures_stay_advisory() {
+    let (t, _fake) = FakeTransport::new();
+    let t = t.rule(|_| true, crate::test_util::FakeMode::Fault);
+    let drive = Drive::from_transport(Box::new(t));
+    let s = DiscSession::bring_up(drive, KeySpec::default(), None).expect("advisory");
+    assert!(s.token().is_none());
+}
+
+struct NoKeys;
+impl crate::keysource::KeySource for NoKeys {
+    fn get_unit_keys(
+        &self,
+        _ctx: &dyn crate::keysource::ResolveCtx,
+    ) -> Result<Vec<crate::aacs::types::UnitKey>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A failed scan leaves the session's key sources for a retry.
+#[test]
+fn failed_scan_keeps_the_key_sources() {
+    let (t, _fake) = FakeTransport::new();
+    let drive = Drive::from_transport(Box::new(t));
+    let spec = KeySpec {
+        key_sources: vec![Box::new(NoKeys)],
+        ..KeySpec::default()
+    };
+    let mut s = DiscSession::bring_up(drive, spec, None).expect("brought up");
+    s.stage_drive_as_reader();
+    for scan in [
+        DiscSession::scan as fn(&mut DiscSession, ScanOptions) -> Result<&Disc>,
+        DiscSession::scan_with,
+    ] {
+        assert!(matches!(
+            scan(&mut s, ScanOptions::default()),
+            Err(Error::DeviceNotReady { .. })
+        ));
+        assert_eq!(s.spec.key_sources.len(), 1);
+    }
+}

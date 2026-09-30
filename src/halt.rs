@@ -280,7 +280,7 @@ fn backoff_poll<T>(
     d: Duration,
     mut attempt: impl FnMut(T) -> std::result::Result<(), SendFail<T>>,
 ) -> std::result::Result<(), SendFail<T>> {
-    let end = Instant::now() + d;
+    let end = Instant::now().checked_add(d);
     let mut pending = v;
     let mut backoff = Duration::from_millis(1);
     loop {
@@ -288,7 +288,7 @@ fn backoff_poll<T>(
             Err(SendFail::Timeout(back)) => pending = back,
             done => return done,
         }
-        let left = end.saturating_duration_since(Instant::now());
+        let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
         if left.is_zero() {
             return Err(SendFail::Timeout(pending));
         }
@@ -383,8 +383,10 @@ impl Progress {
     }
 
     fn busy_state(&self) -> (bool, u64) {
-        let epoch = self.0.busy_epoch.load(Ordering::Relaxed);
-        (self.0.busy.load(Ordering::Relaxed) > 0, epoch)
+        // Read `busy` first: a guard bumps the epoch before it decrements, so an
+        // observed decrement implies the bump is visible to the epoch load.
+        let busy = self.0.busy.load(Ordering::Acquire) > 0;
+        (busy, self.0.busy_epoch.load(Ordering::Acquire))
     }
 }
 
@@ -395,8 +397,8 @@ pub struct BusyGuard(Progress);
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.0.0.busy.fetch_sub(1, Ordering::Relaxed);
         self.0.0.busy_epoch.fetch_add(1, Ordering::Relaxed);
+        self.0.0.busy.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -589,7 +591,9 @@ impl<R> DriveHolder<R> {
 
     /// Join the thread: its result, or its panic payload.
     pub fn join(mut self) -> thread::Result<R> {
-        let h = self.handle.take().expect("DriveHolder joined twice");
+        let Some(h) = self.handle.take() else {
+            return Err(Box::new("DriveHolder joined twice"));
+        };
         if h.is_finished() {
             return join_finished(h);
         }

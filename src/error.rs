@@ -1188,7 +1188,10 @@ impl std::fmt::Display for Error {
                 required,
                 available,
             } => write!(f, "E{}: {}/{}", self.code(), required, available),
-            Error::DirNameCollision { host } => write!(f, "E{}: {}", self.code(), host),
+            // `host` is a raw disc name: escape control characters.
+            Error::DirNameCollision { host } => {
+                write!(f, "E{}: {}", self.code(), host.escape_debug())
+            }
             // errno is Option: emit it after the code when present, else the
             // bare code (mirrors NoDiscKey's empty-field handling — no dangling
             // "colon space" suffix).
@@ -1398,6 +1401,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an `io::Error` in
 /// this crate.
 pub fn error_code(e: &std::io::Error) -> Option<u16> {
+    // Typed payload first: exact, and immune to a foreign message that looks like a code.
+    if let Some(typed) = e.get_ref().and_then(|i| i.downcast_ref::<Error>()) {
+        return Some(typed.code());
+    }
     // Round-tripped: `From<Error> for io::Error` renders as "E<code>[: …]".
     let s = e.to_string();
     let digits = s.strip_prefix('E')?;
@@ -1617,6 +1624,54 @@ mod tests {
         .into();
         assert!(is_disc_level_no_key(&aacs));
         assert!(!is_skippable_title_stub(&aacs));
+    }
+
+    // A stop maps to Interrupted, not the 6xxx InvalidData arm it sits inside.
+    #[test]
+    fn halted_maps_to_interrupted() {
+        let e: std::io::Error = Error::Halted.into();
+        assert_eq!(e.kind(), std::io::ErrorKind::Interrupted);
+        assert!(is_halt(&e));
+    }
+
+    // Every whole-disc key code, and only those, is disc-level.
+    #[test]
+    fn disc_level_no_key_covers_every_documented_code() {
+        for e in [
+            Error::KeydbLoad { path: "p".into() },
+            Error::AacsNoKeys,
+            Error::KeyServiceUnavailable,
+            Error::KeyServiceUnauthorized,
+            Error::KeyServiceRateLimited,
+        ] {
+            let io: std::io::Error = e.into();
+            assert!(is_disc_level_no_key(&io), "{io}");
+        }
+        let per_title: std::io::Error = Error::MkvInvalid.into();
+        assert!(!is_disc_level_no_key(&per_title));
+    }
+
+    // A typed payload is read directly; a bare io::Error keeps the string fallback.
+    #[test]
+    fn error_code_reads_the_typed_payload() {
+        let typed: std::io::Error = Error::Halted.into();
+        assert_eq!(error_code(&typed), Some(E_HALTED));
+        assert_eq!(
+            error_code(&std::io::Error::other("E6010: x")),
+            Some(E_HALTED)
+        );
+        assert_eq!(error_code(&std::io::Error::other("plain")), None);
+    }
+
+    // A raw disc name with control bytes cannot inject terminal escapes via Display.
+    #[test]
+    fn dir_name_collision_display_escapes_control_characters() {
+        let e = Error::DirNameCollision {
+            host: "A\x1b[2JB\n".into(),
+        };
+        let shown = e.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.contains("A\\u{1b}[2JB\\n"), "{shown}");
     }
 
     #[test]

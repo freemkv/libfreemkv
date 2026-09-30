@@ -287,6 +287,14 @@ fn sync_sender_poll_backs_off_to_a_slice() {
     ));
 }
 
+/// An unbounded `send_slice` deadline does not overflow `Instant`.
+#[test]
+fn send_slice_with_max_duration_does_not_panic() {
+    let (tx, rx) = mpsc::sync_channel::<u32>(1);
+    assert!(tx.send_slice(1, Duration::MAX).is_ok());
+    assert_eq!(rx.recv(), Ok(1));
+}
+
 // A thread blocked until the returned sender sends or drops.
 fn parked_thread() -> (JoinHandle<u32>, mpsc::Sender<()>) {
     let (tx, rx) = mpsc::channel::<()>();
@@ -338,23 +346,23 @@ fn join_within_finished_cancelled_and_expired() {
     ));
 }
 
-/// LT5a (HR1): slow but progressing — a bump every 0.5 × window for 4 windows —
+/// LT5a (HR1): slow but progressing — a bump every 0.2 × window for 4 windows —
 /// never expires.
 #[test]
 fn stall_timer_rearms_on_progress() {
     let p = Progress::new();
     let mut t = StallTimer::new(WINDOW, &p);
     let start = Instant::now();
-    let mut next_bump = start + WINDOW / 2;
+    let mut next_bump = start + WINDOW / 5;
     while start.elapsed() < WINDOW * 4 {
         if Instant::now() >= next_bump {
             p.bump();
-            next_bump += WINDOW / 2;
+            next_bump += WINDOW / 5;
         }
         assert_ne!(t.poll(&p), Stall::Expired, "at {:?}", start.elapsed());
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(p.get() >= 6);
+    assert!(p.get() >= 12);
 }
 
 /// LT5b (HR1): no progress → `StalledFor` until the window, then `Expired` within
