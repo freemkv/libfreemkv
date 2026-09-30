@@ -1818,6 +1818,9 @@ const MAX_TS_PID: u32 = 0x1FFF;
 // Most TrackEntry elements accepted from one (untrusted) Tracks element.
 const MAX_TRACK_ENTRIES: usize = 512;
 
+// TrackEntry LanguageBCP47 (RFC 9559 5.1.4.1.21); when present, Language is ignored.
+const LANGUAGE_BCP47: u32 = 0x22_B59D;
+
 // Map an MKV track number to a synthetic BD-TS PID, rejecting overflow of the
 // 13-bit PID space. Track 1 -> video PID (0x1011); others -> 0x1100+(tnum-2),
 // computed in `u32` so the addition can never wrap.
@@ -2211,6 +2214,17 @@ fn inflate_capped(data: &[u8], cap: usize) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+// ISO 639-2 code for a BCP 47 tag's primary language subtag ("und" when unmappable).
+fn iso639_2_from_bcp47(tag: &str) -> String {
+    let primary = tag.split('-').next().unwrap_or_default();
+    match primary.len() {
+        2 => crate::labels::vocab::iso639_1_to_iso639_2(primary).map(str::to_string),
+        3 if primary.bytes().all(|b| b.is_ascii_alphabetic()) => Some(primary.to_ascii_lowercase()),
+        _ => None,
+    }
+    .unwrap_or_else(|| "und".into())
+}
+
 // Decode one TrackEntry body.
 fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     let (mut ttype, mut tnum) = (0u64, 0u16);
@@ -2220,7 +2234,9 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     const MAX_DEFAULT_DURATION_NS: u64 = 60 * 1_000_000_000;
     let mut default_dur: Option<u64> = None;
     let mut timing = crate::pes::TrackTiming::default();
-    let (mut codec_id, mut lang, mut name) = (String::new(), String::from("und"), String::new());
+    // RFC 9559 5.1.4.1.20: Language defaults to "eng".
+    let (mut codec_id, mut lang, mut name) = (String::new(), String::from("eng"), String::new());
+    let mut bcp47: Option<String> = None;
     let mut video = VideoMeta::default();
     let (mut sr, mut ch, mut forced) = (0.0f64, 0u8, false);
     let mut bit_depth = 0u64;
@@ -2266,6 +2282,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
                 )?)
             }
             ebml::LANGUAGE => lang = read_string_bounded(r, cs)?,
+            LANGUAGE_BCP47 => bcp47 = Some(read_string_bounded(r, cs)?),
             ebml::TRACK_NAME => name = read_string_bounded(r, cs)?,
             ebml::FLAG_FORCED => forced = read_uint_bounded(r, cs)? != 0,
             ebml::VIDEO => video = parse_video(r, cs)?,
@@ -2303,6 +2320,9 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         }
     }
 
+    if let Some(tag) = bcp47 {
+        lang = iso639_2_from_bcp47(&tag);
+    }
     if enc.undecodable {
         tracing::warn!(
             target: "mux",
@@ -6803,7 +6823,7 @@ mod tests {
         assert_eq!(p.tracks.len(), 2);
         assert_eq!(p.tracks[0].kind, MkvTrackKind::Video);
         assert_eq!(p.tracks[0].codec_id, ebml::CODEC_HEVC);
-        assert_eq!(p.tracks[0].language, "und");
+        assert_eq!(p.tracks[0].language, "eng", "RFC 9559 default");
         assert_eq!(p.tracks[1].number, 2);
         assert_eq!(p.tracks[1].kind, MkvTrackKind::Audio);
         assert_eq!(p.tracks[1].codec_id, ebml::CODEC_TRUEHD);
@@ -7402,6 +7422,31 @@ mod readback_tests {
         ];
         let s = MkvStream::open(Cursor::new(mkv(&entries, &[]))).expect("opens");
         assert_eq!(s.info().streams.len(), 1);
+    }
+
+    fn audio_language(extra: &[u8]) -> String {
+        let s = open(mkv(&[entry(1, 2, ebml::CODEC_AC3, extra)], &[]));
+        match &s.info().streams[0] {
+            Stream::Audio(a) => a.language.clone(),
+            other => panic!("expected audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_language_reads_as_the_matroska_default_english() {
+        assert_eq!(audio_language(&[]), "eng");
+    }
+
+    #[test]
+    fn language_bcp47_overrides_the_legacy_language() {
+        let extra = [
+            string(ebml::LANGUAGE, "eng"),
+            string(LANGUAGE_BCP47, "fr-CA"),
+        ]
+        .concat();
+        assert_eq!(audio_language(&extra), "fra");
+        assert_eq!(audio_language(&string(LANGUAGE_BCP47, "deu")), "deu");
+        assert_eq!(audio_language(&string(LANGUAGE_BCP47, "x-klingon")), "und");
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
