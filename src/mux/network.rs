@@ -694,6 +694,27 @@ mod tests {
         }
     }
 
+    // Frame track ids are a u8: a header declaring more than 256 streams is refused
+    // (E9008) before any per-stream state is built from it.
+    #[test]
+    fn a_header_with_more_streams_than_track_ids_is_refused() {
+        let mut title = sample_title();
+        let audio = title.streams[1].clone();
+        for n in [256usize, 257] {
+            title.streams.resize(n, audio.clone());
+            let mut wire = Vec::new();
+            meta::write_header(&mut wire, &meta::M2tsMeta::from_title(&title)).unwrap();
+            let res = meta::read_header(&mut wire.as_slice());
+            match n {
+                256 => assert_eq!(res.unwrap().unwrap().streams.len(), 256),
+                _ => assert_eq!(
+                    crate::error::error_code(&res.expect_err("too many streams")),
+                    Some(crate::error::E_NO_METADATA)
+                ),
+            }
+        }
+    }
+
     // A dead first address falls through to the next one.
     #[test]
     fn connect_first_falls_through_a_dead_address() {

@@ -527,6 +527,10 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     let mut meta: M2tsMeta =
         serde_json::from_slice(&json_buf).map_err(|_| crate::error::Error::NoMetadata)?;
     meta.frame_padding = magic[VERSION_BYTE] >= 2;
+    // The wire track is a u8: a frame can address at most 256 streams.
+    if meta.streams.len() > 256 {
+        return Err(crate::error::Error::NoMetadata.into());
+    }
     // The wire track is a u8: cap untrusted timings so timing() stays O(256).
     meta.timings.retain(|t| t.track < 256);
     meta.timings.truncate(256);
