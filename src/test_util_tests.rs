@@ -156,3 +156,34 @@ fn decrypt_unit_inverts_encrypt_unit() {
     crate::test_util::decrypt_unit(&mut u, &K1);
     assert_eq!(u, plain);
 }
+
+#[test]
+fn fixture_dir_removed_when_build_panics() {
+    let bad = [BdFile {
+        path: "AACS/Unit_Key_RO.inf/x".into(),
+        sectors: 3,
+        key: None,
+    }];
+    let r = std::panic::catch_unwind(|| encrypted_bd_image(&bad, &[0u8; 4]));
+    assert!(r.is_err());
+    let dir = crate::test_util::LAST_FIXTURE_DIR
+        .with(|d| d.borrow().clone())
+        .expect("dir");
+    assert!(!dir.exists(), "fixture dir leaked: {}", dir.display());
+}
+
+#[test]
+fn encrypted_bd_image_pads_a_partial_final_unit() {
+    let inf = unit_key_ro(AacsVersion::V10, &[[0u8; 16]; 1], &[1]);
+    let img = encrypted_bd_image(&[BdFile::new("BDMV/STREAM/00001.m2ts", 7, Some(K1))], &inf);
+    let (start, sectors) = img.files[0];
+    assert_eq!(sectors, 9, "7 sectors round up to 3 whole units");
+    for u in 0..3 {
+        let lba = start + u * 3;
+        assert!(
+            aacs_unit_encrypted(&unit(&img.image, lba), ContentFormat::BdTs),
+            "unit {u}"
+        );
+        assert_ne!(unit(&img.image, lba), unit(&img.plain, lba), "unit {u}");
+    }
+}

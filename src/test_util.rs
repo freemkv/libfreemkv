@@ -121,8 +121,8 @@ impl AacsStateBuilder {
 }
 
 /// One stream file of an [`encrypted_bd_image`]: its path under the image root
-/// (e.g. `"BDMV/STREAM/00001.m2ts"`), its length in sectors (a multiple of 3 for
-/// whole aligned units), and the CPS unit key its units are encrypted with
+/// (e.g. `"BDMV/STREAM/00001.m2ts"`), its length in sectors (rounded up to a whole
+/// number of aligned units, the tail padded), and the CPS unit key its units are encrypted with
 /// (`None`: clear content, every Copy_permission_indicator `00₂`).
 #[derive(Debug, Clone)]
 pub struct BdFile {
@@ -200,12 +200,16 @@ impl SectorSource for MemSource {
 /// keyed file's units carry CPI `11₂` in every packet and are then encrypted
 /// (KS-3, KS-4). Panics on a fixture error; test use only.
 pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
-    let root = fixture_dir();
+    let dir = FixtureDir(fixture_dir());
+    let root = dir.0.clone();
     write(&root.join("AACS/Unit_Key_RO.inf"), uk_ro);
+    let unit_sectors = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
     for f in files {
+        // A partial final unit is padded out to a whole aligned unit.
+        let sectors = f.sectors.div_ceil(unit_sectors) * unit_sectors;
         write(
             &root.join(&f.path),
-            &vec![0u8; f.sectors as usize * SECTOR_BYTES],
+            &vec![0u8; sectors as usize * SECTOR_BYTES],
         );
     }
     let mut img = crate::DirImage::open(&root).expect("fixture DirImage");
@@ -226,10 +230,10 @@ pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
             .expect("fixture read");
     }
     drop(img);
-    let _ = std::fs::remove_dir_all(&root);
+    drop(dir);
     let mut plain = image.clone();
-    let unit_sectors = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
     for (f, &(start, sectors)) in files.iter().zip(&extents) {
+        debug_assert_eq!(sectors % unit_sectors, 0, "{}: whole aligned units", f.path);
         for u in 0..sectors / unit_sectors {
             let lba = start + u * unit_sectors;
             let mut unit = content_unit(lba, f.key.is_some());
@@ -261,6 +265,21 @@ fn content_unit(lba: u32, encrypted: bool) -> Vec<u8> {
     u
 }
 
+// Removes its directory on drop, so a panicking fixture build doesn't leak it.
+struct FixtureDir(std::path::PathBuf);
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+thread_local! {
+    // The most recent fixture dir made on this thread, so tests can observe it.
+    static LAST_FIXTURE_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 // A fresh, empty directory for one fixture (removed once the image is read).
 fn fixture_dir() -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -268,6 +287,7 @@ fn fixture_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("libfreemkv-test-util-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("fixture dir");
+    LAST_FIXTURE_DIR.with(|d| *d.borrow_mut() = Some(dir.clone()));
     dir
 }
 
