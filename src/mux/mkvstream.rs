@@ -307,6 +307,14 @@ struct ReadState {
     additions_dropped_bytes: u64,
 }
 
+impl ReadState {
+    // Count one dropped unit (a block of an undecodable track) in errors()/lost_bytes().
+    fn count_lost(&mut self, bytes: u64) {
+        self.additions_dropped = self.additions_dropped.saturating_add(1);
+        self.additions_dropped_bytes = self.additions_dropped_bytes.saturating_add(bytes);
+    }
+}
+
 // Safety cap on frames buffered before the first video frame triggers muxer
 // construction (backstop for a pathological audio-only-prefix stream); past
 // it we build with no measured field order (logged) rather than buffer forever.
@@ -1142,6 +1150,10 @@ impl MkvStream {
                 ebml::SIMPLE_BLOCK => {
                     let block =
                         ebml::read_binary_val(&mut rs.reader, checked_size(size, MAX_BLOCK_SIZE)?)?;
+                    if rs.tracks.is_undecodable(&block) {
+                        rs.count_lost(size);
+                        continue;
+                    }
                     let frames = parse_block(
                         &block,
                         rs.cluster_ts_ticks,
@@ -1245,6 +1257,10 @@ impl MkvStream {
                         rs.additions_dropped = rs.additions_dropped.saturating_add(1);
                         rs.additions_dropped_bytes =
                             rs.additions_dropped_bytes.saturating_add(size);
+                    }
+                    if block.as_ref().is_some_and(|b| rs.tracks.is_undecodable(b)) {
+                        rs.count_lost(size);
+                        continue;
                     }
                     if let Some(block) = block {
                         // BLOCK_DURATION is TimestampScale ticks, not ms — scale by
@@ -1472,9 +1488,9 @@ impl crate::pes::Stream for MkvStream {
         true // MKV has all headers upfront in the EBML header
     }
 
-    // Count of `BlockAdditions` subtrees (e.g. a 3D MVC dependent-view AU the PES
-    // frame model can't carry) and Block-less BlockGroups dropped on read-back. Reported like a
-    // disc-read skip: `0` for write side / sources with no `BlockAdditions`.
+    // Units dropped on read-back: `BlockAdditions` (e.g. a 3D MVC dependent view), Block-less
+    // BlockGroups and blocks of undecodable (encrypted) tracks. Reported like a disc-read
+    // skip: `0` for the write side / sources with none.
     fn errors(&self) -> u64 {
         match self.mode {
             Mode::Read(ref rs) => rs.additions_dropped,
@@ -1607,7 +1623,11 @@ fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHea
                                 t.timing,
                                 t.pcm,
                                 t.pcm_infer,
+                                t.decode,
                             );
+                        }
+                        if t.undecodable {
+                            tracks.undecodable.push(t.number);
                         }
                         if let Some(cp) = t.codec_private {
                             codec_privates.push((t.number, cp));
@@ -1798,6 +1818,10 @@ struct ParsedTrack {
     pcm: Option<PcmIn>,
     pcm_infer: Option<PcmInfer>,
     probe: MkvProbeTrack,
+    // ContentEncodings to undo on each frame.
+    decode: Vec<Decode>,
+    // Encrypted / unsupported compression: carried as no stream, its blocks counted.
+    undecodable: bool,
 }
 
 // A PCM track that declares no BitDepth: the depth is inferred from the first
@@ -2032,6 +2056,128 @@ fn frame_rate_from_ns(ns: u64) -> FrameRate {
         .unwrap_or(Unknown)
 }
 
+// Matroska ContentEncodings (RFC 9559 5.1.4.1.31).
+const CONTENT_ENCODINGS: u32 = 0x6D80;
+const CONTENT_ENCODING: u32 = 0x6240;
+const CONTENT_ENCODING_ORDER: u32 = 0x5031;
+const CONTENT_ENCODING_SCOPE: u32 = 0x5032;
+const CONTENT_ENCODING_TYPE: u32 = 0x5033;
+const CONTENT_COMPRESSION: u32 = 0x5034;
+const CONTENT_COMP_ALGO: u32 = 0x4254;
+const CONTENT_COMP_SETTINGS: u32 = 0x4255;
+const CONTENT_ENCRYPTION: u32 = 0x5035;
+// Most ContentEncoding entries accepted on one track.
+const MAX_CONTENT_ENCODINGS: usize = 8;
+
+// One reversible content encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Decode {
+    // ContentCompAlgo 3 (header stripping): the bytes to put back in front.
+    Prefix(Vec<u8>),
+    // ContentCompAlgo 0.
+    Zlib,
+}
+
+// A track's ContentEncodings, each list in decode order (highest ContentEncodingOrder first).
+#[derive(Default)]
+struct Encodings {
+    frames: Vec<Decode>,
+    private: Vec<Decode>,
+    // Encrypted, or compressed with an algorithm this reader lacks (bzlib, lzo).
+    undecodable: bool,
+}
+
+fn parse_content_encodings(r: &mut impl Read, size: u64) -> io::Result<Encodings> {
+    // (order, scope, step); `None` = undecodable.
+    let mut list: Vec<(u64, u64, Option<Decode>)> = Vec::new();
+    for_each_child(r, size, |r, id, cs| {
+        if id != CONTENT_ENCODING {
+            return skip_bytes(r, cs);
+        }
+        if list.len() >= MAX_CONTENT_ENCODINGS {
+            return Err(crate::error::Error::MkvSourceInvalid.into());
+        }
+        // RFC defaults: order 0, scope 1 (frames), type 0 (compression), algo 0 (zlib).
+        let (mut order, mut scope, mut etype, mut algo) = (0, 1, 0, 0);
+        let (mut settings, mut encrypted) = (Vec::new(), false);
+        for_each_child(r, cs, |r, cid, ccs| {
+            match cid {
+                CONTENT_ENCODING_ORDER => order = read_uint_bounded(r, ccs)?,
+                CONTENT_ENCODING_SCOPE => scope = read_uint_bounded(r, ccs)?,
+                CONTENT_ENCODING_TYPE => etype = read_uint_bounded(r, ccs)?,
+                CONTENT_COMPRESSION => for_each_child(r, ccs, |r, k, ks| {
+                    match k {
+                        CONTENT_COMP_ALGO => algo = read_uint_bounded(r, ks)?,
+                        CONTENT_COMP_SETTINGS => {
+                            settings = ebml::read_binary_val(r, checked_size(ks, MAX_STRING_LEN)?)?
+                        }
+                        _ => skip_bytes(r, ks)?,
+                    }
+                    Ok(())
+                })?,
+                CONTENT_ENCRYPTION => {
+                    encrypted = true;
+                    skip_bytes(r, ccs)?
+                }
+                _ => skip_bytes(r, ccs)?,
+            }
+            Ok(())
+        })?;
+        let step = match (etype, algo) {
+            (0, 0) if !encrypted => Some(Decode::Zlib),
+            (0, 3) if !encrypted => Some(Decode::Prefix(std::mem::take(&mut settings))),
+            _ => None,
+        };
+        list.push((order, scope, step));
+        Ok(())
+    })?;
+    list.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let mut enc = Encodings::default();
+    for (_, scope, step) in list {
+        let Some(step) = step else {
+            enc.undecodable = true;
+            continue;
+        };
+        if scope & 2 != 0 {
+            enc.private.push(step.clone());
+        }
+        if scope & 1 != 0 {
+            enc.frames.push(step);
+        }
+    }
+    Ok(enc)
+}
+
+// Undo `steps` on one payload; the result may not exceed `cap` bytes (zlib bomb guard).
+fn decode_content(steps: &[Decode], mut data: Vec<u8>, cap: usize) -> io::Result<Vec<u8>> {
+    for step in steps {
+        data = match step {
+            Decode::Prefix(p) => {
+                if p.len().saturating_add(data.len()) > cap {
+                    return Err(crate::error::Error::MkvSourceInvalid.into());
+                }
+                [p.as_slice(), &data].concat()
+            }
+            Decode::Zlib => inflate_capped(&data, cap)?,
+        };
+    }
+    Ok(data)
+}
+
+// Inflate a zlib stream, refusing (not truncating) output past `cap` bytes.
+fn inflate_capped(data: &[u8], cap: usize) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    flate2::read::ZlibDecoder::new(data)
+        .take(limit)
+        .read_to_end(&mut out)
+        .map_err(|_| io::Error::from(crate::error::Error::MkvSourceInvalid))?;
+    if out.len() > cap {
+        return Err(crate::error::Error::MkvSourceInvalid.into());
+    }
+    Ok(out)
+}
+
 // Decode one TrackEntry body.
 fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     let (mut ttype, mut tnum) = (0u64, 0u16);
@@ -2046,6 +2192,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     let (mut sr, mut ch, mut forced) = (0.0f64, 0u8, false);
     let mut bit_depth = 0u64;
     let mut codec_priv: Option<Vec<u8>> = None;
+    let mut enc = Encodings::default();
 
     let mut remaining = size;
     while remaining > 0 {
@@ -2089,6 +2236,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
             ebml::TRACK_NAME => name = read_string_bounded(r, cs)?,
             ebml::FLAG_FORCED => forced = read_uint_bounded(r, cs)? != 0,
             ebml::VIDEO => video = parse_video(r, cs)?,
+            CONTENT_ENCODINGS => enc = parse_content_encodings(r, cs)?,
             ebml::AUDIO => {
                 let mut arem = cs;
                 while arem > 0 {
@@ -2122,6 +2270,24 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         }
     }
 
+    if enc.undecodable {
+        tracing::warn!(
+            target: "mux",
+            code = crate::error::E_MKV_SOURCE_INVALID,
+            track_number = tnum,
+            "mkv read-back: track is encrypted or uses an unsupported compression; \
+             dropped, its blocks counted in lost_bytes/errors"
+        );
+        codec_priv = None;
+    }
+    let codec_priv = match codec_priv {
+        Some(cp) => Some(decode_content(
+            &enc.private,
+            cp,
+            MAX_CODEC_PRIVATE as usize,
+        )?),
+        None => None,
+    };
     // &str consts can't be `match` patterns, so compare via guards — this keeps
     // the single source of truth in `ebml::CODEC_*` shared with the muxer.
     let cid = codec_id.as_str();
@@ -2251,6 +2417,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         })),
         _ => None,
     };
+    let stream = stream.filter(|_| !enc.undecodable);
     Ok(ParsedTrack {
         stream,
         number: tnum,
@@ -2260,6 +2427,8 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         pcm,
         pcm_infer: infer,
         probe,
+        decode: enc.frames,
+        undecodable: enc.undecodable,
     })
 }
 
@@ -2279,6 +2448,10 @@ struct TrackTable {
     pcm: Vec<Option<PcmIn>>,
     /// PCM tracks whose depth is still to be inferred from their blocks.
     pcm_infer: Vec<Option<PcmInfer>>,
+    /// ContentEncodings undone on each frame, per stream index.
+    decode: Vec<Vec<Decode>>,
+    /// TrackNumbers dropped as undecodable; their blocks are counted as lost.
+    undecodable: Vec<u16>,
 }
 
 impl TrackTable {
@@ -2289,7 +2462,9 @@ impl TrackTable {
         timing: crate::pes::TrackTiming,
         pcm: Option<PcmIn>,
         infer: Option<PcmInfer>,
+        decode: Vec<Decode>,
     ) {
+        self.decode.push(decode);
         self.nums.push(num);
         self.timings.push(timing);
         self.default_durations.push(default_duration_ns);
@@ -2307,6 +2482,12 @@ impl TrackTable {
         self.nums.iter().position(|&n| n == num)
     }
 
+    /// Whether a (Simple)Block belongs to a track dropped as undecodable.
+    fn is_undecodable(&self, block: &[u8]) -> bool {
+        let (num, _) = block_vint(block);
+        u16::try_from(num).is_ok_and(|n| n != 0 && self.undecodable.contains(&n))
+    }
+
     /// TrackNumber of a stream index (the inverse of `index_of`).
     fn num_of(&self, idx: usize) -> Option<u16> {
         self.nums.get(idx).copied()
@@ -2322,6 +2503,8 @@ impl TrackTable {
             timings: vec![Default::default(); n],
             pcm: vec![None; n],
             pcm_infer: vec![None; n],
+            decode: vec![Vec::new(); n],
+            undecodable: Vec::new(),
         }
     }
 }
@@ -2455,6 +2638,9 @@ fn parse_block(
 ) -> io::Result<Vec<crate::pes::PesFrame>> {
     let mut frames = parse_block_raw(block, cluster_ts_ticks, ts_scale_ns, tracks, duration_ns)?;
     for f in &mut frames {
+        if let Some(steps) = tracks.decode.get(f.track).filter(|s| !s.is_empty()) {
+            f.data = decode_content(steps, std::mem::take(&mut f.data), MAX_BLOCK_SIZE as usize)?;
+        }
         if let Some(Some(layout)) = tracks.pcm.get(f.track) {
             f.data = layout.to_be24(&f.data);
         }
@@ -3563,6 +3749,7 @@ mod tests {
                 timings: vec![Default::default()],
                 pcm: vec![None],
                 pcm_infer: vec![None],
+                ..Default::default()
             }
             .index_of(65535),
             Some(0),
@@ -7018,5 +7205,113 @@ mod readback_tests {
             video_with(&dims(1920, 1080), &odd).frame_rate,
             FrameRate::Unknown
         );
+    }
+
+    // ContentEncodings (RFC 9559 5.1.4.1.31): header stripping and zlib are undone on read.
+    const CONTENT_ENCODINGS: u32 = 0x6D80;
+    const CONTENT_ENCODING: u32 = 0x6240;
+    const CONTENT_ENCODING_SCOPE: u32 = 0x5032;
+    const CONTENT_ENCODING_TYPE: u32 = 0x5033;
+    const CONTENT_COMPRESSION: u32 = 0x5034;
+    const CONTENT_COMP_ALGO: u32 = 0x4254;
+    const CONTENT_COMP_SETTINGS: u32 = 0x4255;
+    const CONTENT_ENCRYPTION: u32 = 0x5035;
+
+    fn encodings(encoding_children: &[u8]) -> Vec<u8> {
+        el(CONTENT_ENCODINGS, &el(CONTENT_ENCODING, encoding_children))
+    }
+
+    fn compression(algo: Option<u64>, settings: &[u8]) -> Vec<u8> {
+        let mut body = algo.map_or_else(Vec::new, |a| uint(CONTENT_COMP_ALGO, a));
+        if !settings.is_empty() {
+            ebml::write_binary(&mut body, CONTENT_COMP_SETTINGS, settings).unwrap();
+        }
+        el(CONTENT_COMPRESSION, &body)
+    }
+
+    fn one_block_cluster(track: u8, payload: &[u8]) -> Vec<u8> {
+        let mut block = vec![0x80 | track, 0x00, 0x00, 0x80];
+        block.extend_from_slice(payload);
+        let mut c = el(ebml::CLUSTER, &[]);
+        c.truncate(c.len() - 1);
+        ebml::write_unknown_size(&mut c).unwrap();
+        c.extend(uint(ebml::CLUSTER_TIMESTAMP, 0));
+        c.extend(el(ebml::SIMPLE_BLOCK, &block));
+        c
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn header_stripped_frames_get_their_header_back() {
+        let enc = encodings(&compression(Some(3), &[0x0B, 0x77]));
+        let bytes = mkv(
+            &[entry(1, 2, ebml::CODEC_AC3, &enc)],
+            &one_block_cluster(1, &[0x11, 0x22]),
+        );
+        let frames = drain_all(&mut open(bytes));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![0x0B, 0x77, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn zlib_compressed_vobsub_frames_are_inflated() {
+        let packet = b"a vobsub packet, repeated repeated repeated".to_vec();
+        let enc = encodings(&compression(None, &[]));
+        let bytes = mkv(
+            &[entry(1, 17, ebml::CODEC_VOBSUB, &enc)],
+            &one_block_cluster(1, &zlib(&packet)),
+        );
+        let frames = drain_all(&mut open(bytes));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, packet);
+    }
+
+    #[test]
+    fn a_zlib_scoped_codec_private_is_inflated() {
+        let idx = b"size: 720x480\npalette: 000000".to_vec();
+        let mut extra =
+            encodings(&[uint(CONTENT_ENCODING_SCOPE, 3), compression(Some(0), &[])].concat());
+        ebml::write_binary(&mut extra, ebml::CODEC_PRIVATE, &zlib(&idx)).unwrap();
+        let s = open(mkv(&[entry(1, 17, ebml::CODEC_VOBSUB, &extra)], &[]));
+        assert_eq!(s.codec_private(0), Some(idx));
+    }
+
+    #[test]
+    fn an_encrypted_track_is_dropped_and_its_blocks_counted() {
+        let enc =
+            encodings(&[uint(CONTENT_ENCODING_TYPE, 1), el(CONTENT_ENCRYPTION, &[])].concat());
+        let bytes = mkv(
+            &[entry(1, 2, ebml::CODEC_AC3, &enc)],
+            &one_block_cluster(1, &[0xDE, 0xAD]),
+        );
+        let mut s = open(bytes);
+        assert!(
+            s.info().streams.is_empty(),
+            "no stream for an undecodable track"
+        );
+        assert!(drain_all(&mut s).is_empty());
+        assert_eq!(s.errors(), 1);
+        assert!(s.lost_bytes() > 0);
+    }
+
+    #[test]
+    fn a_zlib_bomb_is_refused_past_the_block_cap() {
+        let big = zlib(&vec![0u8; 4096]);
+        assert!(inflate_capped(&big, 4096).is_ok());
+        assert!(inflate_capped(&big, 4095).is_err());
+    }
+
+    fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
+        let mut out = Vec::new();
+        while let Some(f) = s.read().expect("no read error") {
+            out.push(f);
+        }
+        out
     }
 }

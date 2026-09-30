@@ -322,6 +322,7 @@ dependencies = [
  "aes",
  "base64",
  "crossbeam-channel",
+ "flate2",
  "freemkv-unlock",
  "libc",
  "libfreemkv",
