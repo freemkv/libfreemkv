@@ -549,6 +549,8 @@ pub const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
 /// to select this BlockAdditionMapping. Values ≥ 2 (1 is the default plain
 /// BlockAdditional). Used by the MVC (`mvcC`) mapping for Blu-ray 3D.
 pub const BLOCK_ADD_ID_VALUE: u32 = 0x41F0;
+/// MaxBlockAdditionID (RFC 9559 5.1.4.1.16): highest BlockAddID used on the track.
+pub const MAX_BLOCK_ADDITION_ID: u32 = 0x55EE;
 
 // Block additions inside a BlockGroup — per-frame side data. For Blu-ray 3D (MVC),
 // dependent (right-eye) NAL units ride as a BlockAdditional under `mvcC` (RFC 9559
@@ -610,6 +612,9 @@ pub const CHAPTER_UID: u32 = 0x73C4;
 pub const CHAPTER_TIME_START: u32 = 0x91;
 pub const CHAPTER_DISPLAY: u32 = 0x80;
 pub const CHAP_STRING: u32 = 0x85;
+pub const EDITION_FLAG_DEFAULT: u32 = 0xDB;
+pub const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+pub const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
 pub const CHAP_LANGUAGE: u32 = 0x437C;
 
 // Track types

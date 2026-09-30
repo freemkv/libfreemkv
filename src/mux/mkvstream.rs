@@ -67,9 +67,10 @@ impl MkvTrackKind {
 }
 
 /// Read the EBML header, Segment Info and Tracks of a Matroska file and stop:
-/// no cluster is touched, so this is cheap enough to run over a whole library.
+/// no cluster, Chapters, Attachments or Tags is touched, so this is cheap
+/// enough to run over a whole library.
 pub fn probe_mkv(mut r: impl Read) -> io::Result<MkvProbe> {
-    Ok(parse_mkv_header(&mut r)?.probe)
+    Ok(parse_mkv_header(&mut r, false)?.probe)
 }
 
 /// [`probe_mkv`] plus `last_cue_secs`: follows the SeekHead to the Cues element
@@ -77,7 +78,7 @@ pub fn probe_mkv(mut r: impl Read) -> io::Result<MkvProbe> {
 /// when the file has no Cues.
 pub fn probe_mkv_with_cues(mut r: impl Read + io::Seek) -> io::Result<MkvProbe> {
     r.seek(io::SeekFrom::Start(0))?;
-    let mut probe = parse_mkv_header(&mut r)?.probe;
+    let mut probe = parse_mkv_header(&mut r, false)?.probe;
     r.seek(io::SeekFrom::Start(0))?;
     let last_cue_ticks = last_cue_ticks(&mut r)?;
     probe.last_cue_secs =
@@ -891,7 +892,7 @@ impl MkvStream {
             ts_scale_ns,
             tracks,
             probe: _,
-        } = parse_mkv_header(&mut reader)?;
+        } = parse_mkv_header(&mut reader, true)?;
         let mut stream = Self {
             disc_title,
             mvc: None,
@@ -1228,6 +1229,20 @@ impl MkvStream {
                             _ => skip_bytes(&mut rs.reader, cs)?,
                         }
                     }
+                    if block.is_none() {
+                        // Block is mandatory (RFC 9559); count the unit as lost, never silent.
+                        if rs.additions_dropped == 0 {
+                            tracing::warn!(
+                                target: "mux",
+                                bytes = size,
+                                "mkv read-back: dropping a BlockGroup with no Block; \
+                                 counted in lost_bytes/errors."
+                            );
+                        }
+                        rs.additions_dropped = rs.additions_dropped.saturating_add(1);
+                        rs.additions_dropped_bytes =
+                            rs.additions_dropped_bytes.saturating_add(size);
+                    }
                     if let Some(block) = block {
                         // BLOCK_DURATION is TimestampScale ticks, not ms — scale by
                         // ts_scale_ns (1_000_000 for our own 1ms scale, non-default
@@ -1454,8 +1469,8 @@ impl crate::pes::Stream for MkvStream {
         true // MKV has all headers upfront in the EBML header
     }
 
-    // Count of `BlockAdditions` subtrees dropped on read-back (e.g. a 3D MVC
-    // dependent-view AU the PES frame model can't carry). Reported like a
+    // Count of `BlockAdditions` subtrees (e.g. a 3D MVC dependent-view AU the PES
+    // frame model can't carry) and Block-less BlockGroups dropped on read-back. Reported like a
     // disc-read skip: `0` for write side / sources with no `BlockAdditions`.
     fn errors(&self) -> u64 {
         match self.mode {
@@ -1464,7 +1479,7 @@ impl crate::pes::Stream for MkvStream {
         }
     }
 
-    // Cumulative `BlockAdditions` bytes dropped on read-back; counts the whole
+    // Cumulative bytes of the units counted by `errors()`; counts the whole
     // skipped subtree (payload + EBML framing), an upper bound on the payload.
     fn lost_bytes(&self) -> u64 {
         match self.mode {
@@ -1476,8 +1491,9 @@ impl crate::pes::Stream for MkvStream {
 
 // ── MKV header parsing (read side) ────────────────────────────
 
-// Reads the EBML header, then the Segment's Info + Tracks, stopping at the first Cluster.
-fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
+// Reads the EBML header, then the Segment's Info + Tracks. With `want_chapters` it runs on to
+// the first Cluster to find Chapters (best effort); without, it stops once Info + Tracks are read.
+fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHeader> {
     let mut title = String::new();
     // EBML `DURATION` is a float expressed in TimestampScale ticks, not
     // milliseconds (Matroska spec). Converted to seconds as ticks * ts_scale_ns / 1e9.
@@ -1503,10 +1519,11 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
         return Err(crate::error::Error::MkvSourceInvalid.into());
     }
 
+    let mut chapters: Vec<Chapter> = Vec::new();
     let (mut got_info, mut got_tracks) = (false, false);
 
     loop {
-        if got_info && got_tracks {
+        if !want_chapters && got_info && got_tracks {
             break;
         }
         let (id, size, _) = match ebml::read_element_header(r) {
@@ -1593,10 +1610,26 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
                 }
                 got_tracks = true;
             }
-            ebml::CLUSTER => break,
-            _ if size != u64::MAX => {
-                skip_bytes(r, size)?;
+            ebml::CHAPTERS if want_chapters && size != u64::MAX => {
+                // Chapters are optional metadata: a bad or truncated element is dropped.
+                match read_chapters_buf(r, size) {
+                    Ok(buf) => match parse_chapters(&buf) {
+                        Ok(c) => chapters = c,
+                        Err(e) => {
+                            tracing::warn!(target: "mux", error = %e, "ignoring malformed MKV Chapters element")
+                        }
+                    },
+                    Err(e) if is_truncation(&e) => break,
+                    Err(e) => return Err(e),
+                }
             }
+            ebml::CLUSTER => break,
+            _ if size != u64::MAX => match skip_bytes(r, size) {
+                Ok(()) => {}
+                // Truncated Attachments/Tags before the first Cluster: stop scanning.
+                Err(e) if want_chapters && is_truncation(&e) => break,
+                Err(e) => return Err(e),
+            },
             _ => break,
         }
     }
@@ -1615,6 +1648,7 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
         playlist: title,
         duration_secs: duration_secs.unwrap_or(0.0),
         streams,
+        chapters,
         ..DiscTitle::empty()
     };
     // Clamp the (untrusted) scale to a positive i64 for the tick→ns multiply on
@@ -1631,6 +1665,95 @@ fn parse_mkv_header(r: &mut impl Read) -> io::Result<MkvHeader> {
         tracks,
         probe,
     })
+}
+
+/// Most chapter marks kept from an untrusted Chapters element.
+const MAX_CHAPTERS: usize = 4096;
+/// Largest Chapters body that is parsed; a bigger one is skipped.
+const MAX_CHAPTERS_BYTES: u64 = 4 * 1024 * 1024;
+
+// A short read / bad element: the data is truncated or malformed, not an I/O failure.
+fn is_truncation(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+    )
+}
+
+// Read a Chapters body of `size` bytes into memory; over the cap it is skipped (empty).
+fn read_chapters_buf(r: &mut impl Read, size: u64) -> io::Result<Vec<u8>> {
+    if size > MAX_CHAPTERS_BYTES {
+        skip_bytes(r, size)?;
+        return Ok(Vec::new());
+    }
+    let mut buf = Vec::new();
+    r.take(size).read_to_end(&mut buf)?;
+    if buf.len() as u64 != size {
+        return Err(crate::error::Error::MkvSourceInvalid.into());
+    }
+    Ok(buf)
+}
+
+/// Read the default EditionEntry's (else the first) top-level ChapterAtoms
+/// (start time + first ChapString, else a 1-based index) from a Chapters
+/// body, skipping hidden and disabled atoms.
+fn parse_chapters(body: &[u8]) -> io::Result<Vec<Chapter>> {
+    let mut editions: Vec<(bool, Vec<Chapter>)> = Vec::new();
+    for_each_child(&mut &body[..], body.len() as u64, |r, cid, cs| {
+        if cid != ebml::EDITION_ENTRY {
+            return skip_bytes(r, cs);
+        }
+        let (mut is_default, mut out) = (false, Vec::<Chapter>::new());
+        for_each_child(r, cs, |r, cid, cs| match cid {
+            ebml::EDITION_FLAG_DEFAULT => {
+                is_default = read_uint_bounded(r, cs)? != 0;
+                Ok(())
+            }
+            ebml::CHAPTER_ATOM if out.len() < MAX_CHAPTERS => {
+                let (mut start_ns, mut name) = (0u64, None);
+                let (mut hidden, mut enabled) = (false, true);
+                for_each_child(r, cs, |r, cid, cs| match cid {
+                    ebml::CHAPTER_TIME_START => {
+                        start_ns = read_uint_bounded(r, cs)?;
+                        Ok(())
+                    }
+                    ebml::CHAPTER_FLAG_HIDDEN => {
+                        hidden = read_uint_bounded(r, cs)? != 0;
+                        Ok(())
+                    }
+                    ebml::CHAPTER_FLAG_ENABLED => {
+                        enabled = read_uint_bounded(r, cs)? != 0;
+                        Ok(())
+                    }
+                    ebml::CHAPTER_DISPLAY => for_each_child(r, cs, |r, cid, cs| {
+                        if cid == ebml::CHAP_STRING && name.is_none() {
+                            name = Some(read_string_bounded(r, cs)?);
+                            Ok(())
+                        } else {
+                            skip_bytes(r, cs)
+                        }
+                    }),
+                    _ => skip_bytes(r, cs),
+                })?;
+                if !hidden && enabled {
+                    out.push(Chapter {
+                        time_secs: start_ns as f64 / 1_000_000_000.0,
+                        name: name.unwrap_or_else(|| (out.len() + 1).to_string()),
+                    });
+                }
+                Ok(())
+            }
+            _ => skip_bytes(r, cs),
+        })?;
+        editions.push((is_default, out));
+        Ok(())
+    })?;
+    let pick = editions.iter().position(|e| e.0).unwrap_or(0);
+    Ok(editions
+        .into_iter()
+        .nth(pick)
+        .map(|e| e.1)
+        .unwrap_or_default())
 }
 
 /// Largest valid 13-bit MPEG-TS PID.
@@ -1919,6 +2042,10 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         Codec::Vc1
     } else if cid == ebml::CODEC_MPEG2 {
         Codec::Mpeg2
+    } else if cid == ebml::CODEC_MPEG1 {
+        Codec::Mpeg1
+    } else if cid == ebml::CODEC_AV1 {
+        Codec::Av1
     } else if cid == ebml::CODEC_AC3 {
         Codec::Ac3
     } else if cid == ebml::CODEC_EAC3 {
@@ -1959,9 +2086,8 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     } else if sr >= 48000.0 {
         SampleRate::S48
     } else {
-        // Below the lowest mapped rate is UNKNOWN, not 48kHz: the ladder's final
-        // `else` used to be S48, so a legal 32kHz AC-3/DTS track was misrecorded as
-        // 48kHz. This float ladder exists only for tolerance vs. `SampleRate::from_hz`.
+        // Below the lowest mapped rate is UNKNOWN, not 48kHz (a legal 32kHz
+        // AC-3/DTS track must not be recorded as 48kHz). This float ladder exists only for tolerance vs. `SampleRate::from_hz`.
         SampleRate::Unknown
     };
 
@@ -6388,5 +6514,187 @@ mod tests {
             None
         );
         assert_eq!(parse_freemkv_version("mkvmerge v80.0 ('x') 64-bit"), None);
+    }
+
+    // Info + Tracks (one entry with `codec_id`) + optional Chapters + one Cluster
+    // holding `cluster_body`, as raw EBML.
+    fn synthetic_mkv(codec_id: &str, chapters: &[u8], cluster_body: &[u8]) -> Vec<u8> {
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        ebml::write_string(&mut entry, ebml::CODEC_ID, codec_id).unwrap();
+        let mut tracks = Vec::new();
+        ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+        tracks.extend_from_slice(&entry);
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+        out.extend_from_slice(chapters);
+        ebml::write_id(&mut out, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        out.extend_from_slice(cluster_body);
+        out
+    }
+
+    #[test]
+    fn read_back_keeps_chapters() {
+        let mut atoms = Vec::new();
+        for (t, name) in [(0u64, "1"), (5_000_000_000, "Two")] {
+            let mut body = Vec::new();
+            ebml::write_uint(&mut body, ebml::CHAPTER_TIME_START, t).unwrap();
+            let mut disp = Vec::new();
+            ebml::write_string(&mut disp, ebml::CHAP_STRING, name).unwrap();
+            ebml::write_id(&mut body, ebml::CHAPTER_DISPLAY).unwrap();
+            ebml::write_size(&mut body, disp.len() as u64).unwrap();
+            body.extend_from_slice(&disp);
+            ebml::write_id(&mut atoms, ebml::CHAPTER_ATOM).unwrap();
+            ebml::write_size(&mut atoms, body.len() as u64).unwrap();
+            atoms.extend_from_slice(&body);
+        }
+        let mut edition = Vec::new();
+        ebml::write_id(&mut edition, ebml::EDITION_ENTRY).unwrap();
+        ebml::write_size(&mut edition, atoms.len() as u64).unwrap();
+        edition.extend_from_slice(&atoms);
+        let mut chapters = Vec::new();
+        ebml::write_id(&mut chapters, ebml::CHAPTERS).unwrap();
+        ebml::write_size(&mut chapters, edition.len() as u64).unwrap();
+        chapters.extend_from_slice(&edition);
+
+        let stream =
+            MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", &chapters, &[]))).unwrap();
+        let got: Vec<(f64, String)> = crate::pes::Stream::info(&stream)
+            .chapters
+            .iter()
+            .map(|c| (c.time_secs, c.name.clone()))
+            .collect();
+        assert_eq!(got, vec![(0.0, "1".to_string()), (5.0, "Two".to_string())]);
+    }
+
+    fn el(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        ebml::write_id(&mut v, id).unwrap();
+        ebml::write_size(&mut v, body.len() as u64).unwrap();
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn atom(t: u64, name: &str, flags: &[(u32, u64)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        ebml::write_uint(&mut b, ebml::CHAPTER_TIME_START, t).unwrap();
+        for &(id, v) in flags {
+            ebml::write_uint(&mut b, id, v).unwrap();
+        }
+        let mut d = Vec::new();
+        ebml::write_string(&mut d, ebml::CHAP_STRING, name).unwrap();
+        b.extend(el(ebml::CHAPTER_DISPLAY, &d));
+        el(ebml::CHAPTER_ATOM, &b)
+    }
+
+    fn chapter_names(chapters: &[u8]) -> Vec<String> {
+        let s = MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", chapters, &[]))).unwrap();
+        crate::pes::Stream::info(&s)
+            .chapters
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn chapters_use_default_edition_and_skip_hidden_disabled() {
+        let mut e1 = atom(0, "first-ed", &[]);
+        e1.extend(atom(1, "x", &[]));
+        let mut e2 = Vec::new();
+        ebml::write_uint(&mut e2, ebml::EDITION_FLAG_DEFAULT, 1).unwrap();
+        e2.extend(atom(0, "keep", &[]));
+        e2.extend(atom(1, "hid", &[(ebml::CHAPTER_FLAG_HIDDEN, 1)]));
+        e2.extend(atom(2, "off", &[(ebml::CHAPTER_FLAG_ENABLED, 0)]));
+        e2.extend(atom(3, "keep2", &[(ebml::CHAPTER_FLAG_ENABLED, 1)]));
+        let mut body = el(ebml::EDITION_ENTRY, &e1);
+        body.extend(el(ebml::EDITION_ENTRY, &e2));
+        let ch = el(ebml::CHAPTERS, &body);
+        assert_eq!(chapter_names(&ch), vec!["keep", "keep2"]);
+    }
+
+    #[test]
+    fn malformed_chapters_still_open_and_mux() {
+        let mut bad_name = Vec::new();
+        ebml::write_id(&mut bad_name, ebml::CHAP_STRING).unwrap();
+        ebml::write_size(&mut bad_name, 2).unwrap();
+        bad_name.extend_from_slice(&[0xFF, 0xFE]);
+        let mut a = Vec::new();
+        ebml::write_uint(&mut a, ebml::CHAPTER_TIME_START, 0).unwrap();
+        a.extend(el(ebml::CHAPTER_DISPLAY, &bad_name));
+        let ch = el(
+            ebml::CHAPTERS,
+            &el(ebml::EDITION_ENTRY, &el(ebml::CHAPTER_ATOM, &a)),
+        );
+        // Oversized ChapString (> 64 KiB) inside otherwise well-formed elements.
+        let mut big = Vec::new();
+        ebml::write_id(&mut big, ebml::CHAP_STRING).unwrap();
+        ebml::write_size(&mut big, MAX_STRING_LEN + 1).unwrap();
+        big.resize(big.len() + MAX_STRING_LEN as usize + 1, b'a');
+        let mut a2 = Vec::new();
+        a2.extend(el(ebml::CHAPTER_DISPLAY, &big));
+        let ch2 = el(
+            ebml::CHAPTERS,
+            &el(ebml::EDITION_ENTRY, &el(ebml::CHAPTER_ATOM, &a2)),
+        );
+        for c in [ch, ch2] {
+            let bytes = synthetic_mkv("V_MPEG2", &c, &[]);
+            assert!(chapter_names(&c).is_empty());
+            assert!(probe_mkv(Cursor::new(bytes.clone())).is_ok());
+            let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
+            assert!(crate::pes::Stream::read(&mut s).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn truncated_tags_before_cluster_still_opens() {
+        let mut tags = Vec::new();
+        ebml::write_id(&mut tags, ebml::TAGS).unwrap();
+        ebml::write_size(&mut tags, 1000).unwrap();
+        tags.extend_from_slice(&[0u8; 10]);
+        // Tags claims 1000 bytes but the file ends: no Cluster follows.
+        let mut bytes = synthetic_mkv("V_MPEG2", &[], &[]);
+        let cut = bytes.len() - 12; // drop the Cluster header (ID 4 + unknown size 8)
+        bytes.truncate(cut);
+        bytes.extend_from_slice(&tags);
+        assert!(probe_mkv(Cursor::new(bytes.clone())).is_ok());
+        let s = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(crate::pes::Stream::info(&s).streams.len(), 1);
+    }
+
+    #[test]
+    fn read_back_maps_mpeg1_and_av1_codec_ids() {
+        for (id, want) in [("V_MPEG1", Codec::Mpeg1), ("V_AV1", Codec::Av1)] {
+            let stream = MkvStream::open(Cursor::new(synthetic_mkv(id, &[], &[]))).unwrap();
+            match &crate::pes::Stream::info(&stream).streams[0] {
+                crate::disc::Stream::Video(v) => assert_eq!(v.codec, want, "{id}"),
+                _ => panic!("expected a video stream"),
+            }
+        }
+    }
+
+    #[test]
+    fn blockless_block_group_is_counted_not_silent() {
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::BLOCK_GROUP).unwrap();
+        let mut body = Vec::new();
+        ebml::write_uint(&mut body, ebml::BLOCK_DURATION, 40).unwrap();
+        ebml::write_size(&mut cluster, body.len() as u64).unwrap();
+        cluster.extend_from_slice(&body);
+        let mut stream =
+            MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", &[], &cluster))).unwrap();
+        assert!(crate::pes::Stream::read(&mut stream).unwrap().is_none());
+        assert_eq!(crate::pes::Stream::errors(&stream), 1);
+        assert!(crate::pes::Stream::lost_bytes(&stream) > 0);
     }
 }
