@@ -77,7 +77,7 @@ pub struct PipelinedPesStream {
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
-fn stream_codec(s: &crate::disc::Stream) -> crate::disc::Codec {
+pub(super) fn stream_codec(s: &crate::disc::Stream) -> crate::disc::Codec {
     use crate::disc::Stream;
     match s {
         Stream::Video(v) => v.codec,
