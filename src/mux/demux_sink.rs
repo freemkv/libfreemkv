@@ -1476,6 +1476,17 @@ mod tests {
         compositions
     }
 
+    // A visible PCS with no duration has no known wipe time: neither write nor finish adds a clear.
+    #[test]
+    fn pgs_sup_visible_pcs_without_duration_gets_no_clear_at_finish() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        let f = sup_frame(1_000_000_000, None, true);
+        writer.write_frame(&mut bytes, &f, f.pts).unwrap();
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(sup_compositions(&bytes), [(90_000, 1)]);
+    }
+
     #[test]
     fn pgs_sup_preserves_original_clear_without_a_duplicate_or_later_clear() {
         let mut writer = PgsSupWriter::default();

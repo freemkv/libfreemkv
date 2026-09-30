@@ -1319,6 +1319,27 @@ mod tests {
             .count()
     }
 
+    /// The declared-only warning check must cover finish() too; captures are thread-local, so the
+    /// sink is finished on the capturing thread instead of the consumer thread.
+    #[test]
+    fn declared_only_mp2_extension_gives_no_warning_at_finish() {
+        let title = mp2_ext_title();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().display();
+        for url in [
+            format!("mkv://{d}/o.mkv"),
+            format!("m2ts://{d}/o.m2ts"),
+            format!("demux://{d}/demux"),
+            format!("audio://{d}/audio"),
+        ] {
+            let mut sink = crate::mux::resolve::output(&url, &title, None).expect("sink opens");
+            let (res, ev) = crate::testlog::capture(|| sink.finish());
+            let _ = res;
+            assert_eq!(mp2_extension_warnings(&ev), 0, "{url}: declared only");
+            assert!(sink.undelivered_streams().is_empty(), "{url}");
+        }
+    }
+
     /// Guard (mpg design §7): every sink but mpg/network/stdio lists an MPEG-2 multichannel
     /// extension track as excluded once its packets arrive, so lost surround is never silent;
     /// IFO coding mode 3 alone (no `0xD0|n` packet) gives no warning and no note.
@@ -2181,7 +2202,8 @@ mod tests {
             assert!(mkv.set_codec_private(i + 1, cp).expect("patch"));
             assert!(!mkv.set_codec_private(i + 1, cp).expect("second patch"));
         }
-        assert!(!mkv.set_codec_private(1, &[0; 14]).expect("too big"));
+        // Track 4 still holds its reserve, so this reaches the size guard.
+        assert!(!mkv.set_codec_private(4, &[0; 14]).expect("too big"));
         mkv.write(&frame(1)).expect("audio frame");
         mkv.finish().expect("finish");
         let back = crate::mux::mkvstream::MkvStream::open(std::fs::File::open(&path).unwrap())

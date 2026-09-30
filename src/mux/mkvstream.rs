@@ -5550,6 +5550,31 @@ mod tests {
         );
     }
 
+    // Several EBML size deltas in a row, mixed signs: each is relative to the PREVIOUS size,
+    // and a delta that drives a size below zero rejects the whole lace.
+    #[test]
+    fn an_ebml_lace_accumulates_signed_deltas_and_rejects_negative_sizes() {
+        // Sizes 3, +2, -3, +2 = 3, 5, 2, 4; the last frame is the remainder (6).
+        // 1-octet svint: 0x80 | (delta + 63).
+        let mut body = vec![0x04, 0x83, 0xC1, 0xBC, 0xC1];
+        let sizes = [3usize, 5, 2, 4, 6];
+        for (i, n) in sizes.iter().enumerate() {
+            body.extend(std::iter::repeat_n(i as u8 + 1, *n));
+        }
+        let frames = split_lacing(LACING_EBML, &body).expect("well-formed lace");
+        assert_eq!(frames.len(), 5);
+        for (i, (f, n)) in frames.iter().zip(sizes).enumerate() {
+            assert_eq!(*f, vec![i as u8 + 1; n].as_slice(), "frame {i}");
+        }
+        // 3 then -4 = -1: negative size.
+        assert_eq!(
+            split_lacing(LACING_EBML, &[0x02, 0x83, 0xBB, 0, 0, 0]),
+            None
+        );
+        // The delta VINT is missing.
+        assert_eq!(split_lacing(LACING_EBML, &[0x02, 0x83]), None);
+    }
+
     // The shortest usable (Simple)Block is 4 bytes (track VINT + rel-ts + flags,
     // empty payload) — exactly the boundary of the short-block guards, where an
     // off-by-one drops a legal frame or indexes past the buffer end.
@@ -5925,7 +5950,11 @@ mod tests {
         ebml::write_binary(&mut group, ebml::DISCARD_PADDING, &[0; 9]).unwrap();
         ebml::write_binary(&mut cluster, ebml::BLOCK_GROUP, &group).unwrap();
         let bytes = mkv_with_tracks_and_cluster(&[TrackSpec::new(1, 2)], &cluster);
-        assert!(MkvStream::open(Cursor::new(bytes)).unwrap().read().is_err());
+        let e = MkvStream::open(Cursor::new(bytes))
+            .unwrap()
+            .read()
+            .unwrap_err();
+        assert!(is_mkv_source_invalid(&e), "{e:?}");
     }
 
     fn av_frame(track: usize, pts: i64, keyframe: bool, data: Vec<u8>) -> crate::pes::PesFrame {
