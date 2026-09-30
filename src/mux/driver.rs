@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::decrypt::DecryptKeys;
@@ -824,7 +824,7 @@ fn drive_mux(
         progress: &flush,
         halt,
     };
-    let mut output_stream = output_with(dest_url, &out_title, source, Some(out_flush))?;
+    let mut output_stream = open_output(dest_url, &out_title, source, out_flush)?;
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
@@ -858,10 +858,12 @@ fn drive_mux(
     // overlaps the next `stream.read()`. `bytes` mirrors the consumer's running
     // written-byte count out to the driving thread for `on_write_progress`.
     let bytes = Arc::new(AtomicU64::new(0));
+    let read_failed = Arc::new(AtomicBool::new(false));
     let sink = WriteSink {
         output: output_stream,
         bytes: bytes.clone(),
         late_configs: late_configs.clone(),
+        read_failed: read_failed.clone(),
     };
     let consumer_progress = flush.progress().clone();
     let pipe = Pipeline::spawn_named_with_progress(
@@ -926,6 +928,7 @@ fn drive_mux(
                     // Drain + join the consumer, then report the ROOT cause: a
                     // write failure (e.g. volume full) precedes and explains the
                     // read error, so prefer it — except Halt/join-timeout, not root causes.
+                    read_failed.store(true, Ordering::Relaxed);
                     match pipe.finish_with_halt(Some(halt)) {
                         Err(w @ (Error::Halted | Error::PipelineJoinTimeout)) => {
                             tracing::debug!(
@@ -1049,6 +1052,20 @@ fn drops_mp2_extensions(dest_url: &str) -> bool {
     )
 }
 
+// The sink for `dest_url`; a test may substitute its own (thread-local seam).
+fn open_output(
+    dest_url: &str,
+    title: &DiscTitle,
+    source: Option<&SourceInfo>,
+    flush: super::resolve::OutputFlush<'_>,
+) -> std::io::Result<Box<dyn Stream>> {
+    #[cfg(test)]
+    if let Some(sink) = tests::TEST_SINK.with(|s| s.borrow_mut().take()) {
+        return Ok(sink);
+    }
+    output_with(dest_url, title, source, Some(flush))
+}
+
 // What the write consumer hands back once the container is finalised.
 struct SinkClose {
     bytes: u64,
@@ -1062,9 +1079,25 @@ struct WriteSink {
     output: CountingStream,
     bytes: Arc<AtomicU64>,
     late_configs: LateConfigs,
+    // Set by the driver when the title's read failed: the output is incomplete.
+    read_failed: Arc<AtomicBool>,
 }
 
 impl WriteSink {
+    fn end(mut self, complete: bool) -> Result<SinkClose, Error> {
+        self.apply_late_configs()?;
+        match complete {
+            true => self.output.finish(),
+            false => self.output.finish_incomplete(),
+        }
+        .map_err(Error::from)?;
+        // Sample AFTER finish(): the mp4 sink decides its drops there.
+        Ok(SinkClose {
+            bytes: self.output.bytes_written(),
+            undelivered: self.output.undelivered_streams(),
+        })
+    }
+
     fn apply_late_configs(&mut self) -> Result<(), Error> {
         let late = std::mem::take(&mut *lock_late(&self.late_configs));
         for (track, cp) in late {
@@ -1092,14 +1125,14 @@ impl Sink<PesFrame> for WriteSink {
         Ok(Flow::Continue)
     }
 
-    fn close(mut self) -> Result<SinkClose, Error> {
-        self.apply_late_configs()?;
-        self.output.finish().map_err(Error::from)?;
-        // Sample AFTER finish(): the mp4 sink decides its drops there.
-        Ok(SinkClose {
-            bytes: self.output.bytes_written(),
-            undelivered: self.output.undelivered_streams(),
-        })
+    fn close(self) -> Result<SinkClose, Error> {
+        let complete = !self.read_failed.load(Ordering::Relaxed);
+        self.end(complete)
+    }
+
+    // A stopped title is incomplete too: a wire sink must not end it cleanly.
+    fn close_stopped(self) -> Result<SinkClose, Error> {
+        self.end(false)
     }
 }
 
@@ -1107,7 +1140,109 @@ impl Sink<PesFrame> for WriteSink {
 mod tests {
     use super::*;
     use crate::disc::DiscTitle;
-    use std::sync::atomic::AtomicBool;
+
+    thread_local! {
+        // A sink `drive_mux` opens instead of its URL's, once (see `open_output`).
+        pub(super) static TEST_SINK: std::cell::RefCell<Option<Box<dyn Stream>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // A sink that logs how it ended ("finish" / "finish_incomplete") and can fail
+    // its `fail_at`-th write with E9000.
+    struct EndSpy {
+        info: DiscTitle,
+        writes: usize,
+        fail_at: Option<usize>,
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Stream for EndSpy {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            Ok(None)
+        }
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            self.writes += 1;
+            if self.fail_at.is_some_and(|n| self.writes >= n) {
+                return Err(Error::StreamReadOnly.into());
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            self.log.lock().unwrap().push("finish");
+            Ok(())
+        }
+        fn finish_incomplete(&mut self) -> std::io::Result<()> {
+            self.log.lock().unwrap().push("finish_incomplete");
+            Ok(())
+        }
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+    }
+
+    // Run `stream` into an `EndSpy`; returns the result and the sink's end log.
+    fn run_into_spy(
+        stream: FakeStream,
+        halt: &Halt,
+        fail_at: Option<usize>,
+    ) -> (std::io::Result<MuxOutcome>, Vec<&'static str>) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spy = EndSpy {
+            info: stream.info.clone(),
+            writes: 0,
+            fail_at,
+            log: log.clone(),
+        };
+        TEST_SINK.with(|s| *s.borrow_mut() = Some(Box::new(spy)));
+        let res = drive_mux(Box::new(stream), "null://", halt, &NoopEvents, None, None);
+        TEST_SINK.with(|s| s.borrow_mut().take());
+        let log = log.lock().unwrap().clone();
+        (res, log)
+    }
+
+    // A read failure mid-title is the reported error; the consumer is joined and
+    // ends the output as incomplete (a network receiver sees a failure).
+    #[test]
+    fn a_read_failure_mid_title_is_the_error_and_ends_the_output_incomplete() {
+        let mut fs = FakeStream::new(1).with_frames(10);
+        fs.fail_read_at = Some(4);
+        let (res, log) = run_into_spy(fs, &Halt::new(), None);
+        let err = res.expect_err("a read failure is an error");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DISC_READ)
+        );
+        assert_eq!(log, vec!["finish_incomplete"], "joined, ended incomplete");
+    }
+
+    // The sink failed first: its write error is the root cause, not the later read error.
+    #[test]
+    fn a_write_failure_is_reported_over_the_read_failure_it_precedes() {
+        let mut fs = FakeStream::new(1).with_frames(10);
+        fs.fail_read_at = Some(6);
+        let (res, log) = run_into_spy(fs, &Halt::new(), Some(2));
+        let err = res.expect_err("a write failure is an error");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_STREAM_READ_ONLY),
+            "got {err}"
+        );
+        assert!(log.is_empty(), "a failed sink is never finalised: {log:?}");
+    }
+
+    // A stop ends the output incomplete; a clean drain finishes it.
+    #[test]
+    fn only_a_clean_drain_finishes_the_output() {
+        let halt = Halt::new();
+        let fs = FakeStream::new(1).with_frames(10).cancels(halt.clone(), 3);
+        let (res, log) = run_into_spy(fs, &halt, None);
+        assert!(!res.expect("a stop is not an error").completed);
+        assert_eq!(log, vec!["finish_incomplete"]);
+
+        let (res, log) = run_into_spy(FakeStream::new(1).with_frames(10), &Halt::new(), None);
+        assert!(res.expect("clean drain").completed);
+        assert_eq!(log, vec!["finish"]);
+    }
 
     /// A synthetic [`Stream`] the tests fully control: a queue of frames, a
     /// configurable `headers_ready` behaviour, and an optional halt it cancels
@@ -1130,6 +1265,8 @@ mod tests {
         /// value — simulating a halt landing DURING a blocking `fill_extents` read
         /// (the common operator-stop case).
         halt_err_at_read: Option<usize>,
+        /// If set, `read()` fails with a disc read error (not a halt) at this read.
+        fail_read_at: Option<usize>,
         /// If set, `headers_ready` also flips once `read()` has returned `None`.
         ready_on_eof: bool,
         eof_seen: bool,
@@ -1163,6 +1300,7 @@ mod tests {
                 cancel_halt: None,
                 read_observer: None,
                 halt_err_at_read: None,
+                fail_read_at: None,
                 ready_on_eof: false,
                 eof_seen: false,
             }
@@ -1210,6 +1348,14 @@ mod tests {
                 && self.reads >= after
             {
                 return Err(crate::error::Error::Halted.into());
+            }
+            if self.fail_read_at.is_some_and(|at| self.reads >= at) {
+                return Err(crate::error::Error::DiscRead {
+                    sector: 0,
+                    status: Some(0x02),
+                    sense: None,
+                }
+                .into());
             }
             let f = self.frames.pop_front();
             self.eof_seen |= f.is_none();
@@ -2468,6 +2614,7 @@ mod tests {
             })),
             bytes: Arc::new(AtomicU64::new(0)),
             late_configs: LateConfigs::default(),
+            read_failed: Arc::default(),
         };
         let SinkClose { bytes, undelivered } = sink.close().expect("close succeeds");
         assert_eq!(bytes, 0);

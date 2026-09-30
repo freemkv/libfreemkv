@@ -201,6 +201,8 @@ enum Mode {
         header_written: bool,
         timings: Vec<crate::pes::TrackTiming>,
         padded: bool,
+        // Set once `finish` sent the clean end; otherwise drop resets the connection.
+        ended: bool,
     },
     Read {
         reader: BufReader<HaltRead>,
@@ -245,6 +247,7 @@ impl NetworkStream {
                 header_written: false,
                 timings: Vec::new(),
                 padded: false,
+                ended: false,
             },
         })
     }
@@ -367,6 +370,7 @@ impl crate::pes::Stream for NetworkStream {
                 header_written,
                 timings,
                 padded,
+                ..
             } => {
                 ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
                 frame.serialize_ext(writer, *padded)
@@ -380,6 +384,7 @@ impl crate::pes::Stream for NetworkStream {
             header_written,
             timings,
             padded,
+            ended,
         } = &mut self.mode
         {
             // Always emit the FMKV header before shutdown, even for a zero-frame stream,
@@ -388,6 +393,15 @@ impl crate::pes::Stream for NetworkStream {
             ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
             writer.flush()?;
             writer.get_ref().shutdown(std::net::Shutdown::Write)?;
+            *ended = true;
+        }
+        Ok(())
+    }
+    // A failed or stopped title: reset instead of the clean end, so the receiver
+    // reports an error rather than a complete (truncated) title.
+    fn finish_incomplete(&mut self) -> io::Result<()> {
+        if let Mode::Write { writer, .. } = &self.mode {
+            reset_on_close(writer.get_ref());
         }
         Ok(())
     }
@@ -437,6 +451,25 @@ pub(crate) fn set_timing(
     }
     timings[track] = timing;
     Ok(())
+}
+
+// Make the socket's close an RST, not a FIN: the FMKV wire has no end marker, so
+// a FIN reads as a complete title. Nonblocking so the BufWriter's drop flush
+// cannot hang on a stalled receiver. Best effort: a failure leaves a FIN.
+fn reset_on_close(stream: &TcpStream) {
+    let _ = socket2::SockRef::from(stream).set_linger(Some(std::time::Duration::ZERO));
+    let _ = stream.set_nonblocking(true);
+}
+
+// A sender dropped without `finish` (error, panic, stop) must not end cleanly.
+impl Drop for NetworkStream {
+    fn drop(&mut self) {
+        if let Mode::Write { writer, ended, .. } = &self.mode
+            && !*ended
+        {
+            reset_on_close(writer.get_ref());
+        }
+    }
 }
 
 // NetworkStream is PES-only — no IOStream/Read/Write byte interface.
@@ -705,6 +738,87 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].track, 0);
         assert_eq!(frames[0].pts, 90000);
+    }
+
+    // Accept one sender and read to the end; returns the frame count and the
+    // terminal read result (Ok(None) = a clean end, Err = a failed sender).
+    type ReadEnd = (usize, io::Result<Option<crate::pes::PesFrame>>);
+
+    fn spawn_ending_reader() -> (std::net::SocketAddr, std::thread::JoinHandle<ReadEnd>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut ns = NetworkStream::accept_from(listener).unwrap();
+            let mut n = 0;
+            loop {
+                match crate::pes::Stream::read(&mut ns) {
+                    Ok(Some(_)) => n += 1,
+                    end => return (n, end),
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    fn one_frame() -> crate::pes::PesFrame {
+        crate::pes::PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0x47; 192],
+            duration_ns: None,
+        }
+    }
+
+    // A sender that fails mid-title (never finished, or finished incomplete) must
+    // reach the receiver as an error, never as the clean end of a short title.
+    #[test]
+    fn a_sender_that_fails_mid_title_is_an_error_at_the_receiver() {
+        use crate::pes::Stream as _;
+        for incomplete in [false, true] {
+            let (addr, handle) = spawn_ending_reader();
+            let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+                .unwrap()
+                .meta(&sample_title());
+            writer.write(&one_frame()).unwrap();
+            if incomplete {
+                writer.finish_incomplete().unwrap();
+            }
+            drop(writer);
+            let (_, end) = handle.join().unwrap();
+            assert!(end.is_err(), "incomplete={incomplete}: got {end:?}");
+        }
+        // A finished sender still ends cleanly.
+        let (addr, handle) = spawn_ending_reader();
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        writer.write(&one_frame()).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        let (n, end) = handle.join().unwrap();
+        assert!(matches!(end, Ok(None)), "got {end:?}");
+        assert_eq!(n, 1);
+    }
+
+    // A connection cut inside a frame (even with a clean FIN) is an error.
+    #[test]
+    fn a_connection_cut_mid_frame_is_an_error_at_the_receiver() {
+        let (addr, handle) = spawn_ending_reader();
+        let mut raw = TcpStream::connect(addr).unwrap();
+        let m = meta::M2tsMeta::from_title(&sample_title());
+        meta::write_header(&mut raw, &m).unwrap();
+        let mut frame = Vec::new();
+        one_frame().serialize(&mut frame).unwrap();
+        raw.write_all(&frame).unwrap();
+        raw.write_all(&frame[..frame.len() / 2]).unwrap();
+        raw.shutdown(std::net::Shutdown::Write).unwrap();
+        let (n, end) = handle.join().unwrap();
+        assert_eq!(n, 1, "the whole frame arrives");
+        assert!(end.is_err(), "the cut frame must fail, got {end:?}");
     }
 
     #[test]
