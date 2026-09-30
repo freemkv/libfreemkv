@@ -7505,4 +7505,27 @@ mod tests {
             Some(crate::error::E_MKV_UNENCODABLE)
         );
     }
+
+    // Untrusted SPU chains: a 2-node cycle, a next offset past the end, a 0x07 length overrun
+    // and a sub-header SPU all end as None. The cycle runs on a thread with a deadline so an
+    // unbounded walk fails instead of hanging the suite.
+    #[test]
+    fn vobsub_display_ns_rejects_malformed_chains() {
+        // DCSQ A at 4 -> B at 10 -> A, each STA_DSP + CMD_END, no stop.
+        let cycle = vec![0, 16, 0, 4, 0, 0, 0, 10, 0x01, 0xFF, 0, 0, 0, 4, 0x01, 0xFF];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(vobsub_display_ns(&cycle)));
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(got, Ok(None), "2-node cycle must terminate with None");
+        let past_end = [0, 9, 0, 4, 0, 0, 0, 200, 0xFF];
+        assert_eq!(vobsub_display_ns(&past_end), None);
+        let overrun = [0, 12, 0, 4, 0, 0, 0, 4, 0x07, 0xFF, 0xFF, 0x02];
+        assert_eq!(vobsub_display_ns(&overrun), None);
+        assert_eq!(vobsub_display_ns(&[0, 3, 0]), None);
+        // Control: the stop in the SECOND DCSQ is found.
+        let ok = [
+            0, 16, 0, 4, 0, 0, 0, 10, 0x01, 0xFF, 0, 10, 0, 10, 0x02, 0xFF,
+        ];
+        assert_eq!(vobsub_display_ns(&ok), Some(10 * SPU_DELAY_NS));
+    }
 }
