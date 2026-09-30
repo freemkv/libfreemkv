@@ -3138,6 +3138,30 @@ mod tests {
         assert_eq!(audio[1].pts, 42_000_000);
     }
 
+    // End to end 3D: the written file declares the mvcC mapping and carries each
+    // dependent AU as a BlockAdditional on its paired base frame.
+    #[test]
+    fn a_3d_title_writes_the_mvc_mapping_and_block_additions() {
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &mvc_title(), None).unwrap();
+        let dep = lp(&[&SUBSET_SPS, &DEP_PPS, &DEP_SLICE]);
+        for (i, pts) in [0i64, 41_708_333].into_iter().enumerate() {
+            s.write(&mvc_frame(0, pts, i == 0, vec![0x65, 0x88, i as u8]))
+                .unwrap();
+            s.write(&mvc_frame(1, pts, i == 0, dep.clone())).unwrap();
+        }
+        s.finish().unwrap();
+        let bytes = out.bytes();
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&[0x41, 0xE4]), "BlockAdditionMapping declared");
+        assert!(has(&SUBSET_SPS), "mvcC carries the dependent subset SPS");
+        let mut r = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let base: Vec<_> = drain(&mut r).into_iter().filter(|f| f.track == 0).collect();
+        assert_eq!(base.len(), 2, "both base frames written once");
+        assert_eq!(r.errors(), 2, "one BlockAdditions per paired base frame");
+        assert!(r.lost_bytes() >= 2 * dep.len() as u64);
+    }
+
     // The dependent must NOT become its own track (it folds into the base as
     // BlockAdditional): a silently-disabled merge yields two H.264 tracks, not 3D.
     #[test]
