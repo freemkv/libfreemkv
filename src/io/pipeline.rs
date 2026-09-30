@@ -935,7 +935,9 @@ mod tests {
         type Output = ();
 
         fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
-            panic!("synthetic test panic");
+            // resume_unwind skips the process-global panic hook, so no test has to
+            // swap the hook (a race between parallel tests) to keep output quiet.
+            std::panic::resume_unwind(Box::new("synthetic test panic"));
         }
 
         fn close(self) -> Result<(), Error> {
@@ -945,11 +947,6 @@ mod tests {
 
     #[test]
     fn consumer_panic_becomes_io_error() {
-        // Silence the panic message that would otherwise pollute the
-        // test output — we expect this panic.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-
         let pipe =
             Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn should succeed");
         // First send may succeed (item buffered before panic) or fail
@@ -961,8 +958,6 @@ mod tests {
             let _ = pipe.send(i);
         }
         let res = pipe.finish();
-
-        std::panic::set_hook(prev);
 
         // A consumer panic surfaces as the numeric variant, not an
         // English-carrying io::Error. The original panic payload is
@@ -1256,8 +1251,6 @@ mod tests {
     // try_send must report Disconnected once the consumer has exited (via panic here).
     #[test]
     fn try_send_reports_disconnected_after_consumer_gone() {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
         // Drive the consumer to panic and fully exit. Spin until a
         // try_send observes the closed channel.
@@ -1274,7 +1267,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::panic::set_hook(prev);
         let _ = pipe.finish();
         assert!(
             saw_disconnect,
@@ -1285,8 +1277,6 @@ mod tests {
     // Plain send must hand the item back via Err(item) once the consumer has panicked.
     #[test]
     fn send_returns_item_after_consumer_panicked() {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
         let end = Instant::now() + Duration::from_secs(2);
         let mut returned = None;
@@ -1298,7 +1288,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::panic::set_hook(prev);
         let _ = pipe.finish();
         assert_eq!(
             returned,
@@ -1310,8 +1299,6 @@ mod tests {
     // send_with_halt must return the exact item via Err(item) on the Disconnected arm.
     #[test]
     fn send_with_halt_returns_item_on_disconnect() {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
         // Force the consumer to panic + exit: send until the channel
         // closes (plain send returns Err).
@@ -1324,7 +1311,6 @@ mod tests {
         }
         let halt = crate::halt::Halt::new(); // never cancelled
         let res = pipe.send_with_halt(0xABCD_u64, &halt, Duration::from_secs(5));
-        std::panic::set_hook(prev);
         let _ = pipe.finish();
         assert!(
             matches!(res, Err(0xABCD)),

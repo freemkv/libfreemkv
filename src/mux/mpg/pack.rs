@@ -421,6 +421,25 @@ mod tests {
         );
     }
 
+    // MS-8 boundary: one entry makes length = 14 + descriptors; 1018 fits, 1019 does not.
+    #[test]
+    fn psm_length_cap_is_exactly_1018() {
+        let with = |n: usize| {
+            psm(
+                &[],
+                &[PsmEntry {
+                    stream_type: 0x06,
+                    stream_id: 0xBD,
+                    descriptors: vec![0; n],
+                }],
+            )
+        };
+        let at = with(1018 - 14).expect("length 1018 is allowed");
+        assert_eq!(at.len() - 6, 1018);
+        assert!(with(1018 - 14 + 1).is_none(), "length 1019 is over the cap");
+        assert_eq!(MAX_PSM_LENGTH, 1018);
+    }
+
     // MS-23 guard: Table 2-44 values 5 and 15, the base's embedded index undefined.
     #[test]
     fn hierarchy_descriptor_values() {

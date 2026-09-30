@@ -644,6 +644,33 @@ mod tests {
         assert_eq!(visited, 1);
     }
 
+    // A Deflated entry far larger than the cap must stop inflating at the cap.
+    // The post-read budget check alone would return the same visible result.
+    #[test]
+    fn deflated_entry_is_inflated_only_up_to_the_cap() {
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("big.xml", opts).unwrap();
+            w.write_all(&vec![7u8; 1 << 20]).unwrap();
+            w.finish().unwrap();
+        }
+        let mut jar = open(buf);
+        let mut budget = u64::MAX;
+        let got = try_each_resource(
+            &mut jar,
+            |_| true,
+            1000,
+            &mut budget,
+            |_, bytes| Some(bytes.len()),
+        );
+        assert_eq!(got, Some(1000));
+        assert_eq!(budget, u64::MAX - 1000);
+    }
+
     #[test]
     fn try_each_resource_reads_non_class_entries_and_skips_classes() {
         let xml = b"<dcx><disc/></dcx>";

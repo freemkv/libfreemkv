@@ -575,6 +575,35 @@ mod tests {
         );
     }
 
+    // p95 of a full window is its top sample (index 15 of 16): one slow wait among fast
+    // ones grows the chunk. Uniform samples cannot tell `sorted[15]` from `sorted[0]`.
+    #[test]
+    fn record_wait_takes_the_top_sample_as_p95() {
+        let (_f, mut p) = local_pipeline(16 * 1024 * 1024);
+        for _ in 0..ADAPTIVE_WINDOW - 1 {
+            p.record_wait(1);
+        }
+        p.record_wait(ADAPTIVE_GROW_MS + 50);
+        assert_eq!(p.chunk_bytes, 32 * 1024 * 1024);
+    }
+
+    // The window evicts its OLDEST sample: a slow wait stays in the window for exactly
+    // ADAPTIVE_WINDOW pushes, then leaves and the chunk shrinks.
+    #[test]
+    fn record_wait_evicts_the_oldest_sample() {
+        let (_f, mut p) = local_pipeline(16 * 1024 * 1024);
+        for _ in 0..ADAPTIVE_WINDOW - 1 {
+            p.record_wait(1);
+        }
+        p.record_wait(ADAPTIVE_GROW_MS + 50); // push #16: grows, stays in the window
+        for _ in 0..ADAPTIVE_WINDOW - 1 {
+            p.record_wait(1); // pushes #17..#31: the slow sample is still inside
+        }
+        assert_eq!(p.chunk_bytes, CHUNK_BYTES_MAX);
+        p.record_wait(1); // push #32 evicts it: all fast, so shrink
+        assert_eq!(p.chunk_bytes, CHUNK_BYTES_MAX / 2);
+    }
+
     #[test]
     fn record_wait_clamps_to_chunk_bounds() {
         // Grow past the max.

@@ -581,6 +581,63 @@ mod tests {
         });
     }
 
+    // A cancel must release a producer parked on the recycle channel (consumer holds every
+    // buffer). Producer exit shows as the forward channel disconnecting.
+    #[test]
+    fn halt_releases_producer_parked_on_recycle() {
+        let halt = Halt::new();
+        let pf = BytePrefetcher::new(EndlessReader, 64, Some(halt.clone())).expect("spawn");
+        let (rx, recycle_tx, shell) = pf.into_channels();
+        // Take all RECYCLE_DEPTH buffers and never return them.
+        let held: Vec<_> = (0..RECYCLE_DEPTH)
+            .map(|_| rx.recv().expect("batch").expect("read ok"))
+            .collect();
+        halt.cancel();
+        let r = rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(r, Err(crossbeam_channel::RecvTimeoutError::Disconnected)),
+            "producer still parked on recycle after cancel: {r:?}"
+        );
+        drop((held, recycle_tx, shell));
+    }
+
+    // A buffer truncated by a short read must be regrown before its next read, or the chunk
+    // size shrinks for good. Records the buffer length each read() is offered.
+    #[test]
+    fn truncated_buffer_is_regrown_when_reused() {
+        use std::sync::{Arc, Mutex};
+        struct ShortReads {
+            left: u8,
+            lens: Arc<Mutex<Vec<usize>>>,
+        }
+        impl Read for ShortReads {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.lens.lock().unwrap().push(buf.len());
+                if self.left == 0 {
+                    return Ok(0);
+                }
+                self.left -= 1;
+                buf[..3].fill(1);
+                Ok(3)
+            }
+        }
+        within(10, || {
+            let lens = Arc::new(Mutex::new(Vec::new()));
+            // 6 short reads over 3 buffers: every buffer is truncated, then reused.
+            let r = ShortReads {
+                left: 6,
+                lens: lens.clone(),
+            };
+            let pf = BytePrefetcher::new(r, 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none());
+            assert_eq!(got.len(), 18);
+            let lens = lens.lock().unwrap();
+            assert_eq!(lens.len(), 7);
+            assert!(lens.iter().all(|&l| l == 8), "buffer not regrown: {lens:?}");
+        });
+    }
+
     /// LP9 (×2, §2.1 "Unbounded Drop joins stay plain joins"): after a cancel, dropping
     /// the prefetcher, or its shell with both channel ends still held, returns within
     /// 1 s. Guard.
