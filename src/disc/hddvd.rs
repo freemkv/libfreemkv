@@ -1074,25 +1074,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_vti_clip_order_caps_hits_on_a_crafted_vti() {
-        // A crafted VTI packed with far more than MAX_VTI_HITS `.EVO` tokens must
-        // not scan/collect them all (a CPU/memory amplification on a routine
-        // scan). The result is capped, and parsing stays fast.
-        let mut vti = Vec::with_capacity(1_000_000);
-        vti.extend_from_slice(HDDVD_VTI_MAGIC);
-        // ~160k tokens of the form "X.EVO\0" — well over the 8192 cap.
-        for _ in 0..(MAX_VTI_HITS * 20) {
-            vti.extend_from_slice(b"X.EVO\0");
-        }
-        let out = parse_vti_clip_order(&vti);
-        assert!(
-            out.len() <= MAX_VTI_HITS,
-            "collected hits capped at MAX_VTI_HITS, got {}",
-            out.len()
-        );
-    }
-
-    #[test]
     fn parse_vti_clip_order_is_deterministic_on_a_bucket_size_tie() {
         // Two equal-size buckets must resolve to the SAME winner every call:
         // `HashMap` iteration is randomized, so `max_by_key` without a
@@ -1110,6 +1091,8 @@ mod tests {
         put(&mut vti, 0x290, "B2.EVO");
 
         let first = parse_vti_clip_order(&vti);
+        // The tie goes to the bucket with the smallest offset (A).
+        assert_eq!(first, vec!["A1.EVO".to_string(), "A2.EVO".to_string()]);
         for _ in 0..20 {
             assert_eq!(
                 parse_vti_clip_order(&vti),
@@ -2124,6 +2107,16 @@ mod tests {
         assert_eq!(parse_xpl_titles(tricky.as_bytes()).len(), 2);
     }
 
+    // More than MAX_XPL_DEPTH fake open tags inside a comment / PI must not count as nesting.
+    #[test]
+    fn xpl_depth_ignores_open_tags_inside_comments_and_pis() {
+        let fake = "<a>".repeat(MAX_XPL_DEPTH + 10);
+        assert!(xpl_depth_within_limit(&format!("<r><!-- {fake} --></r>")));
+        assert!(xpl_depth_within_limit(&format!("<r><?pi {fake} ?></r>")));
+        // Control: the same tags as real elements are over the limit.
+        assert!(!xpl_depth_within_limit(&format!("<r>{fake}</r>")));
+    }
+
     // Builds a UDF with HVDVD_TS/ .evo clips plus an ADV_OBJ/VPLST000.XPL
     // carrying `xpl`, so scan_hddvd_titles takes the playlist path.
     fn make_hddvd_fs_xpl(
@@ -2220,6 +2213,36 @@ mod tests {
         assert_eq!(mm.chapters[0].name, "1", "bare ordinal chapter name");
         // Both feature halves are in ONE title's extents.
         assert!(!mm.extents.is_empty());
+    }
+
+    // An XPL whose titles all name absent clips composes to nothing; the scan must fall
+    // back to the per-clip heuristic instead of listing zero titles.
+    #[test]
+    fn scan_hddvd_falls_back_when_xpl_composes_to_nothing() {
+        let mut disc = MemDisc::new();
+        let xpl = r#"<?xml version="1.0"?><Playlist><TitleSet><Title>
+            <PrimaryAudioVideoClip src="GONE.EVO"/></Title></TitleSet></Playlist>"#;
+        let udf = make_hddvd_fs_xpl(&mut disc, &[("REAL.EVO", 100, 5000)], xpl.as_bytes());
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan");
+        assert_eq!(titles.len(), 1, "heuristic fallback lists the real clip");
+        assert_eq!(titles[0].playlist, "REAL.EVO");
+    }
+
+    // Many XPL titles naming one clip must cost ONE probe (the XPL path's memo).
+    #[test]
+    fn compose_xpl_titles_probes_once_for_titles_sharing_a_clip() {
+        const TITLES: usize = 64;
+        let mut xpl = String::from(r#"<?xml version="1.0"?><Playlist><TitleSet>"#);
+        for _ in 0..TITLES {
+            xpl.push_str(r#"<Title><PrimaryAudioVideoClip src="A.EVO"/></Title>"#);
+        }
+        xpl.push_str("</TitleSet></Playlist>");
+        let mut disc = MemDisc::new();
+        let udf = make_hddvd_fs_xpl(&mut disc, &[("A.EVO", 4, 5000)], xpl.as_bytes());
+        let mut counter = ProbeCounter::new(disc, vec![PART_START + 5000]);
+        let titles = Disc::scan_hddvd_titles(&mut counter, &udf, None).expect("scan");
+        assert_eq!(titles.len(), TITLES, "every XPL title is composed");
+        assert_eq!(counter.hits[0], 1, "one probe for {TITLES} titles");
     }
 
     // ── parse_vti_clip_order: bound / cap / termination edge cases ────────
