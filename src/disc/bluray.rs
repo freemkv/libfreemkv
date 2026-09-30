@@ -10,6 +10,10 @@ use crate::udf;
 // `.fmts`, 3D uses `.ssif`. HD-DVD's `.evo` is a different tree and does NOT belong here.
 const CLIP_STREAM_EXTS: [&str; 3] = ["m2ts", "fmts", "ssif"];
 
+// MPLS/CLPI timestamps tick at 45 kHz; playlists shorter than this are menus/stubs.
+const MPLS_TICKS_PER_SEC: f64 = 45000.0;
+const MIN_TITLE_SECS: f64 = 30.0;
+
 impl Disc {
     // Scan Blu-ray titles from MPLS playlists. `halt` is polled between playlists and once more
     // after the loop; a Halted read propagates instead of being swallowed.
@@ -24,7 +28,10 @@ impl Disc {
                 if halt.is_some_and(|h| h.is_cancelled()) {
                     return Err(Error::Halted);
                 }
-                if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
+                if !entry.is_dir
+                    && entry.name.len() >= 5
+                    && entry.name.as_bytes()[entry.name.len() - 5..].eq_ignore_ascii_case(b".mpls")
+                {
                     let path = format!("/BDMV/PLAYLIST/{}", entry.name);
                     let mpls_data = match udf_fs.read_file(reader, &path) {
                         Ok(data) => data,
@@ -35,7 +42,14 @@ impl Disc {
                         // Every other read failure keeps the pre-existing
                         // best-effort skip: one unreadable playlist is not a
                         // reason to abandon the disc.
-                        Err(_) => continue,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                playlist = ?entry.name,
+                                "E{}", e.code()
+                            );
+                            continue;
+                        }
                     };
                     if let Some(title) =
                         Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)?
@@ -62,8 +76,12 @@ impl Disc {
         filename: &str,
         data: &[u8],
     ) -> Result<Option<DiscTitle>> {
-        let Ok(parsed) = mpls::parse(data) else {
-            return Ok(None);
+        let parsed = match mpls::parse(data) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(target: "freemkv::disc", playlist = ?filename, "E{}", e.code());
+                return Ok(None);
+            }
         };
 
         // Calculate duration from play items
@@ -72,10 +90,10 @@ impl Disc {
             .iter()
             .map(|pi| (pi.out_time.saturating_sub(pi.in_time)) as u64)
             .sum();
-        let duration_secs = duration_ticks as f64 / 45000.0;
+        let duration_secs = duration_ticks as f64 / MPLS_TICKS_PER_SEC;
 
-        // Skip very short playlists (< 30 seconds)
-        if duration_secs < 30.0 {
+        // Skip very short playlists
+        if duration_secs < MIN_TITLE_SECS {
             return Ok(None);
         }
 
@@ -97,37 +115,48 @@ impl Disc {
         let mut feed_pos: u64 = 0;
         let mut spans: std::collections::HashMap<String, (u64, u64)> =
             std::collections::HashMap::new();
+        // Packet count per clip_id: a repeated PlayItem must not re-read/re-parse its .clpi
+        // (a hostile MPLS naming one large clip thousands of times would never finish).
+        let mut clip_pkts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for play_item in &parsed.play_items {
-            let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
+            let clip_dur =
+                play_item.out_time.saturating_sub(play_item.in_time) as f64 / MPLS_TICKS_PER_SEC;
 
-            let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
-            // A `.clpi` that cannot be read or parsed is NOT a benign miss:
-            // `duration_ticks` already claims the full runtime, so drop the
-            // title instead of silently shipping it missing bytes.
-            let clip_info = match udf_fs
-                .read_file(reader, &clpi_path)
-                .and_then(|clpi_data| clpi::parse(&clpi_data))
-            {
-                Ok(info) => info,
-                // The operator's Stop, not a disc defect: every remaining command
-                // fails the same way once the drive's flag is set, so classifying
-                // it as unresolvable would truncate the title list at success.
-                Err(Error::Halted) => return Err(Error::Halted),
-                Err(e) => {
-                    // The REAL code, not a fixed one: DiscRead, UdfNotFound and
-                    // ClpiParse are different populations, and flattening them
-                    // would send anyone triaging the first after the third.
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        playlist = ?filename,
-                        clip = ?play_item.clip_id,
-                        "E{}", e.code()
-                    );
-                    return Ok(None);
-                }
+            let pkt_count: u32 = if let Some(&n) = clip_pkts.get(&play_item.clip_id) {
+                n
+            } else {
+                let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
+                // A `.clpi` that cannot be read or parsed is NOT a benign miss:
+                // `duration_ticks` already claims the full runtime, so drop the
+                // title instead of silently shipping it missing bytes.
+                let clip_info = match udf_fs
+                    .read_file(reader, &clpi_path)
+                    .and_then(|clpi_data| clpi::parse(&clpi_data))
+                {
+                    Ok(info) => info,
+                    // The operator's Stop, not a disc defect: every remaining command
+                    // fails the same way once the drive's flag is set, so classifying
+                    // it as unresolvable would truncate the title list at success.
+                    Err(Error::Halted) => return Err(Error::Halted),
+                    Err(e) => {
+                        // The REAL code, not a fixed one: DiscRead, UdfNotFound and
+                        // ClpiParse are different populations, and flattening them
+                        // would send anyone triaging the first after the third.
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            playlist = ?filename,
+                            clip = ?play_item.clip_id,
+                            "E{}", e.code()
+                        );
+                        return Ok(None);
+                    }
+                };
+                let n = clip_info.source_packet_count;
+                clip_pkts.insert(play_item.clip_id.clone(), n);
+                n
             };
-            let pkt_count: u32 = clip_info.source_packet_count;
 
             // The clip is marked seen only after its .clpi parses. That ordering
             // used to matter because a transient failure must not permanently
@@ -140,7 +169,7 @@ impl Disc {
                 // WHOLE-clip size/extents on purpose (no EP-map seek): out-of-mark
                 // bytes are dropped downstream by PTS at the SeamPlan — see
                 // `SeamPlan::place` (src/mux/timeline.rs) `raw_ns >= in_ns && <= out_ns`.
-                total_size += pkt_count as u64 * 192;
+                total_size += pkt_count as u64 * crate::consts::BD_SOURCE_PACKET_BYTES as u64;
 
                 // Get stream file extents from UDF allocation descriptors (dual-
                 // layer discs split files across layers). Normally `.m2ts`; AACS 2.1
@@ -211,7 +240,18 @@ impl Disc {
                             "E{}", code
                         );
                     }
-                    _ => {}
+                    // Every candidate was merely absent: the clip's bytes are gone, same
+                    // as a missing .clpi, so refuse the title rather than ship it short.
+                    (None, None) => {
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            playlist = ?filename,
+                            clip = ?play_item.clip_id,
+                            "E{}", crate::error::E_UDF_NOT_FOUND
+                        );
+                        return Ok(None);
+                    }
+                    (Some(_), None) => {}
                 }
                 // KNOWN GAP, deliberately left open: an empty-but-Ok `file_extents`
                 // leaves the clip with no extents while size/timing still count it —
@@ -323,6 +363,7 @@ impl Disc {
                     // Stream type 4 = IG, unknown types -- skip.
                     other => {
                         tracing::warn!(
+                            target: "freemkv::disc",
                             "dropping STN stream entry: unhandled stream_type {} (PID {:#06x}, coding_type {:#04x})",
                             other,
                             s.pid,
@@ -369,9 +410,9 @@ impl Disc {
                 let pi = parsed.play_items.get(pi_idx)?;
                 let preceding: f64 = parsed.play_items[..pi_idx]
                     .iter()
-                    .map(|p| p.out_time.saturating_sub(p.in_time) as f64 / 45000.0)
+                    .map(|p| p.out_time.saturating_sub(p.in_time) as f64 / MPLS_TICKS_PER_SEC)
                     .sum();
-                let within = (m.timestamp as f64 - pi.in_time as f64) / 45000.0;
+                let within = (m.timestamp as f64 - pi.in_time as f64) / MPLS_TICKS_PER_SEC;
                 let time_secs = preceding + within;
                 Some(Chapter {
                     time_secs: if time_secs < 0.0 { 0.0 } else { time_secs },
@@ -426,7 +467,11 @@ impl Disc {
                 let xml_files: Vec<_> = dl_dir
                     .entries
                     .iter()
-                    .filter(|e| !e.is_dir && e.name.to_lowercase().ends_with(".xml"))
+                    .filter(|e| {
+                        !e.is_dir
+                            && e.name.len() >= 4
+                            && e.name.as_bytes()[e.name.len() - 4..].eq_ignore_ascii_case(b".xml")
+                    })
                     .collect();
 
                 let eng = xml_files
@@ -441,7 +486,7 @@ impl Disc {
                         if let Some(start) = xml.find("<di:name>") {
                             let s = start + "<di:name>".len();
                             if let Some(end) = xml[s..].find("</di:name>") {
-                                let title = xml[s..s + end].trim().to_string();
+                                let title = xml_text_decode(xml[s..s + end].trim());
                                 if !title.is_empty() && title != "Blu-ray" {
                                     return Some(title);
                                 }
@@ -453,6 +498,53 @@ impl Disc {
         }
         None
     }
+}
+
+// Decode the five predefined XML entities and numeric char refs in element text, and unwrap a
+// CDATA section; unknown or malformed references are kept literally.
+fn xml_text_decode(raw: &str) -> String {
+    if let Some(inner) = raw
+        .strip_prefix("<![CDATA[")
+        .and_then(|r| r.strip_suffix("]]>"))
+    {
+        return inner.trim().to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let decoded = rest.find(';').filter(|&semi| semi <= 10).and_then(|semi| {
+            let ent = &rest[1..semi];
+            let ch = match ent {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => ent.strip_prefix('#').and_then(|n| {
+                    match n.strip_prefix(['x', 'X']) {
+                        Some(h) => u32::from_str_radix(h, 16).ok(),
+                        None => n.parse::<u32>().ok(),
+                    }
+                    .and_then(char::from_u32)
+                }),
+            };
+            ch.map(|c| (c, semi))
+        });
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -2437,5 +2529,112 @@ mod tests {
         let mut disc = MemDisc::new();
         let udf = make_min_fs(&mut disc);
         assert_eq!(Disc::read_meta_title(&mut disc, &udf), None);
+    }
+
+    #[test]
+    fn xml_text_decode_entities_and_cdata() {
+        assert_eq!(xml_text_decode("Tom &amp; Jerry"), "Tom & Jerry");
+        assert_eq!(
+            xml_text_decode("&lt;A&gt; &#65;&#x42; &bogus; &"),
+            "<A> AB &bogus; &"
+        );
+        assert_eq!(xml_text_decode("<![CDATA[Tom & Jerry]]>"), "Tom & Jerry");
+    }
+
+    // A clip whose stream file is absent under every name must drop the title (like a
+    // missing .clpi), not keep it counting bytes that have no extents.
+    #[test]
+    fn parse_playlist_missing_stream_yields_no_title() {
+        // CLIPINF has the .clpi but STREAM has no stream file.
+        let mut disc = MemDisc::new();
+        let udf = {
+            let bdmv = DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![
+                    DirSpec {
+                        name: "STREAM".to_string(),
+                        icb_lba: 22,
+                        dir_data_lba: 23,
+                        files: Vec::new(),
+                        subdirs: vec![],
+                    },
+                    DirSpec {
+                        name: "CLIPINF".to_string(),
+                        icb_lba: 24,
+                        dir_data_lba: 25,
+                        files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+                        subdirs: vec![],
+                    },
+                ],
+            };
+            let root = DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: vec![bdmv],
+            };
+            build_udf_skeleton(&mut disc, 10);
+            lay_dir(&mut disc, &root);
+            udf::read_filesystem(&mut disc).expect("fs")
+        };
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("scan");
+        assert!(t.is_none(), "missing stream file must drop the title");
+    }
+
+    struct CountingDisc {
+        inner: MemDisc,
+        reads: usize,
+    }
+    impl SectorSource for CountingDisc {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            self.reads += 1;
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // Repeated PlayItems of one clip must not re-read its .clpi.
+    #[test]
+    fn parse_playlist_repeated_clip_reads_clpi_once() {
+        let pi = |i: u32| PiSpec {
+            clip_id: *b"00001",
+            in_time: i * 60 * 45000,
+            out_time: (i + 1) * 60 * 45000,
+        };
+        let mut reads = Vec::new();
+        for n in [1u32, 6] {
+            let mut disc = MemDisc::new();
+            let udf = make_bdmv_fs(&mut disc, &[("00001", 1000, 4000, 5000)]);
+            let mut cd = CountingDisc {
+                inner: disc,
+                reads: 0,
+            };
+            let items: Vec<PiSpec> = (0..n).map(pi).collect();
+            let mpls = build_mpls(&items, (0, 0, 0, 0, 0, 0, 0, 0), &[], &[]);
+            Disc::parse_playlist(&mut cd, &udf, "00001.mpls", &mpls)
+                .expect("scan")
+                .expect("title");
+            reads.push(cd.reads);
+        }
+        assert_eq!(reads[0], reads[1], "extra PlayItems of a seen clip re-read");
     }
 }
