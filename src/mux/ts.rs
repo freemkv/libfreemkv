@@ -416,6 +416,10 @@ impl TsDemuxer {
         // adaptation == 0x02 (AF only) already returned above, so only 0x03
         // (AF + payload) can carry an adaptation field here.
         let discontinuity_flag = adaptation == 0x03 && ts[4] > 0 && (ts[5] & 0x80) != 0;
+        // A duplicate (same CC, no discontinuity) repeats the previous packet: nothing new.
+        if asm.last_cc == Some(cc) && !discontinuity_flag {
+            return;
+        }
         let cc_gap = cc_is_gap(asm.last_cc, cc);
         asm.last_cc = Some(cc);
         // A gap means packets for this PID were lost. Sticky flag rides to the first
@@ -436,10 +440,12 @@ impl TsDemuxer {
                 asm.pending_discontinuity = true;
             }
             if header_len == 0 {
-                // PUSI packet whose payload is not a valid PES start. Do
-                // NOT push it — those bytes are not elementary-stream data
-                // and would inject a spurious start code / garbage.
+                // Payload is not a PES start: open no PES (its continuations would form a
+                // headless frame) and flag the loss for the next one.
+                asm.buffer.clear();
+                asm.active = false;
                 asm.header_remaining = 0;
+                asm.pending_discontinuity = true;
             } else if header_len <= payload.len() {
                 // Header fits in this packet (the common case).
                 asm.header_remaining = 0;
@@ -973,6 +979,41 @@ mod tests {
         v
     }
 
+    // A duplicate packet (same CC, h222 2.4.3.3) carries no new data: neither a repeated
+    // continuation nor a repeated PUSI may change the PES.
+    #[test]
+    fn duplicate_packets_are_ignored() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let start = ts_payload_packet(pid, true, 0, &pes_start(&[b'A'; 175]));
+        let cont = ts_payload_packet(pid, false, 1, &[b'B'; 184]);
+        let mut out = Vec::new();
+        for p in [&start, &start, &cont, &cont] {
+            out.extend(demux.feed(p));
+        }
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "one PES");
+        let mut want = vec![b'A'; 175];
+        want.extend_from_slice(&[b'B'; 184]);
+        assert_eq!(out[0].data, want);
+        assert!(!out[0].discontinuity);
+    }
+
+    // A PUSI whose payload is not a PES start leaves no PES open: the continuations after it
+    // are not emitted as a headless frame, and the next PES is flagged.
+    #[test]
+    fn pusi_without_a_pes_header_opens_no_pes() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 0, &[0xAB; 184]));
+        out.extend(demux.feed(&ts_payload_packet(pid, false, 1, &[0xCD; 184])));
+        out.extend(demux.feed(&ts_payload_packet(pid, true, 2, &pes_start(b"NEXT"))));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "only the valid PES: {out:?}");
+        assert!(out[0].data.starts_with(b"NEXT"));
+        assert!(out[0].discontinuity, "the dropped unit is a gap");
+    }
+
     // Regression: a non-PUSI continuation with a CC gap means packets were
     // dropped — the partial PES must be discarded, not spliced onto. A clean
     // follow-on PUSI then produces exactly the next PES, not a corrupt splice.
@@ -1228,6 +1269,19 @@ mod tests {
 
     // ── scan_streams PMT parsing ──────────────────────────────────────────
 
+    // Next continuity_counter for `pid` in this test thread, so fixture packets form a
+    // well-formed per-PID sequence (a repeated CC is a duplicate packet).
+    fn next_cc(pid: u16) -> u8 {
+        thread_local!(static CC: std::cell::RefCell<std::collections::HashMap<u16, u8>> =
+            Default::default());
+        CC.with(|m| {
+            let mut m = m.borrow_mut();
+            let c = m.entry(pid).or_insert(0x0F);
+            *c = (*c + 1) & 0x0F;
+            *c
+        })
+    }
+
     /// Wrap a 188-byte TS packet body in a 192-byte BD-TS packet
     /// (4-byte timecode prefix the scanner skips).
     fn bdts_packet(body: [u8; 184], pid: u16, pusi: bool) -> Vec<u8> {
@@ -1239,7 +1293,7 @@ mod tests {
             pkt[5] |= 0x40;
         }
         pkt[6] = (pid & 0xFF) as u8;
-        pkt[7] = 0x10; // payload only, no adaptation field
+        pkt[7] = 0x10 | next_cc(pid); // payload only, no adaptation field
         pkt[8..8 + 184].copy_from_slice(&body);
         pkt
     }
@@ -1314,7 +1368,7 @@ mod tests {
             pkt[5] |= 0x40;
         }
         pkt[6] = (pid & 0xFF) as u8;
-        pkt[7] = 0x10; // payload only, no adaptation field
+        pkt[7] = 0x10 | next_cc(pid); // payload only, no adaptation field
         let room = TS_PACKET_BYTES - 4; // 184 ES bytes after the 4-byte TS header
         let n = payload.len().min(room);
         pkt[8..8 + n].copy_from_slice(&payload[..n]);
@@ -1386,30 +1440,11 @@ mod tests {
             "garbage PUSI packet must not complete a PES on its own"
         );
 
-        // Continuation packet (no PUSI) carrying real ES bytes.
-        let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        stream.extend(demux.feed(&data_packet(pid, false, &es)));
+        // A continuation after it belongs to no PES (headless): nothing is emitted, so
+        // none of the garbage (0xAA, the embedded 00 00 01) can reach the ES.
+        stream.extend(demux.feed(&data_packet(pid, false, &[0xDE, 0xAD, 0xBE, 0xEF])));
         stream.extend(demux.flush());
-
-        assert_eq!(stream.len(), 1, "one PES assembled from the continuation");
-        let pes = &stream[0];
-        // The continuation ES bytes survive…
-        assert!(
-            pes.data.windows(es.len()).any(|w| w == es),
-            "continuation ES bytes present, got {:02X?}",
-            pes.data
-        );
-        // …but none of the garbage PUSI payload leaked in. In particular the
-        // 0xAA filler and the embedded 00 00 01 sequence must be absent — the
-        // malformed PES header contributed ZERO bytes to the elementary stream.
-        assert!(
-            !pes.data.contains(&0xAA),
-            "garbage PES-header bytes must not appear in the elementary stream"
-        );
-        assert!(
-            !pes.data.windows(3).any(|w| w == [0x00, 0x00, 0x01]),
-            "no injected start code leaked from the malformed PES header"
-        );
+        assert!(stream.is_empty(), "no PES without a PES header: {stream:?}");
     }
 
     #[test]
@@ -1668,7 +1703,7 @@ mod tests {
     }
 
     // A duplicate TS packet (same CC, identical payload) is explicitly legal;
-    // `process_packet` already tolerates it. The PSI reassembler must too:
+    // `process_packet` skips it. The PSI reassembler must too:
     // treat it as a duplicate (not appended twice), not as a desync.
     #[test]
     fn scan_streams_tolerates_duplicate_pmt_continuation_packet() {
@@ -1765,6 +1800,7 @@ mod tests {
             let payload_off = 8 + pad;
             pkt[payload_off..payload_off + payload.len()].copy_from_slice(payload);
         }
+        pkt[7] |= next_cc(pid);
         pkt
     }
 
@@ -2381,10 +2417,9 @@ mod tests {
         pes_start.extend_from_slice(&[0xAB; 10]);
         demux.feed(&es_packet_exact(pid, true, &pes_start));
         let payload = [0xCCu8; 184];
-        let cont_pkt = data_packet(pid, false, &payload);
         let mut high_water = 0usize;
         for _ in 0..(expected_share / 184 + 64) {
-            demux.feed(&cont_pkt);
+            demux.feed(&data_packet(pid, false, &payload));
             let idx = demux.pid_index[pid as usize] as usize;
             high_water = high_water.max(demux.assemblers[idx].buffer.len());
         }
@@ -2415,11 +2450,10 @@ mod tests {
         // Continuation packets with 184-byte payloads, no PUSI.  Each call to
         // feed() processes one 192-byte BD-TS packet.
         let payload = [0xCCu8; 184];
-        let cont_pkt = data_packet(pid, false, &payload);
         let packets_needed = MAX_PES_BUFFER / 184 + 2;
         let mut mid_out: Vec<PesPacket> = Vec::new();
         for _ in 0..packets_needed {
-            mid_out.extend(demux.feed(&cont_pkt));
+            mid_out.extend(demux.feed(&data_packet(pid, false, &payload)));
             // Verify the internal buffer is bounded: no assembler may hold
             // more than MAX_PES_BUFFER bytes at any point.
             for asm in &demux.assemblers {
