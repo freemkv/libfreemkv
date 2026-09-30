@@ -306,6 +306,15 @@ pub(crate) fn wait_failure(e: BoundedError, what: &str) -> io::Error {
     }
 }
 
+#[cfg(unix)]
+fn rc(r: libc::c_int) -> io::Result<()> {
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 // The production primitives for `file`.
 pub(crate) fn os_ops(file: &File) -> Arc<dyn FlushOps> {
     Arc::new(platform::OsFlushOps::for_file(file))
@@ -337,14 +346,6 @@ mod platform {
                 ranged: regular && !nfs,
                 nfs_path,
             }
-        }
-    }
-
-    fn rc(r: libc::c_int) -> io::Result<()> {
-        if r == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
         }
     }
 
@@ -405,14 +406,6 @@ mod platform {
     impl OsFlushOps {
         pub(super) fn for_file(_file: &File) -> Self {
             Self
-        }
-    }
-
-    fn rc(r: libc::c_int) -> io::Result<()> {
-        if r == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
         }
     }
 

@@ -75,6 +75,8 @@ pub struct WritebackFile {
     ops: Arc<dyn FlushOps>,
     timing: FlushTiming,
     halt: Option<Halt>,
+    /// A size hint reserved extents past EOF; trimmed at sync/drop.
+    hinted: bool,
 }
 
 impl WritebackFile {
@@ -113,6 +115,7 @@ impl WritebackFile {
             ops,
             timing,
             halt: None,
+            hinted: false,
         })
     }
 
@@ -217,7 +220,18 @@ impl WritebackFile {
     pub fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
         let file = File::create(path)?;
         platform::preallocate(&file, size_bytes);
-        Self::new(file)
+        let mut w = Self::new(file)?;
+        w.hinted = true;
+        Ok(w)
+    }
+
+    // Release the KEEP_SIZE reservation past EOF: a same-length truncate frees it.
+    fn release_reservation(&mut self) {
+        if std::mem::take(&mut self.hinted)
+            && let Ok(m) = self.file.metadata()
+        {
+            let _ = self.file.set_len(m.len());
+        }
     }
 
     /// Open an existing file at `path` for writing (no truncation) and
@@ -246,6 +260,7 @@ impl WritebackFile {
             );
         }
         self.pipeline.finalize();
+        self.release_reservation();
         let synced = self.drain(self.halt.clone().as_ref()).and_then(|()| {
             let timing = DurableTiming {
                 stall: self.timing.stall,
@@ -360,6 +375,7 @@ impl Drop for WritebackFile {
         // without `sync_all` leaves the trailing chunk in cache. No `self.file.sync_all()`
         // here — `Drop`-triggered fsync would swallow errors; `finalize` is idempotent.
         self.pipeline.finalize();
+        self.release_reservation();
         if let Some(e) = self.pipeline.error() {
             tracing::error!(target: "mux", error = %e, "WritebackFile dropped with a writeback error");
         }
@@ -626,6 +642,20 @@ mod tests {
         let bytes = read_back(&p);
         assert_eq!(bytes.len(), 5, "size hint must not inflate logical length");
         assert_eq!(&bytes, b"hello");
+    }
+
+    // The size-hint reservation past EOF must be released once writing ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn size_hint_reservation_is_released_after_sync() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hint-trim.bin");
+        let mut w = WritebackFile::create_with_size_hint(&p, 64 * 1024 * 1024).unwrap();
+        w.write_all(b"hello").unwrap();
+        w.sync_all().unwrap();
+        let blocks = std::fs::metadata(&p).unwrap().blocks();
+        assert!(blocks < 1024, "reservation kept: {blocks} 512-byte blocks");
     }
 
     // `sync_all` is idempotent: calling it twice, then Drop (also

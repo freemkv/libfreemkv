@@ -25,7 +25,7 @@ const BATCH_SECTORS: u32 = 2048;
 /// Reads 2048-sector batches from LBA 0 in order; decrypts nothing. Batches are not whole
 /// 3-sector AACS units: wrap an AACS decrypting source to read on the unit grid, or it fails
 /// the first misaligned batch ([`Error::DecryptFailed`]). `on_progress` gets cumulative bytes
-/// per batch (must not block); `halt` is checked per batch, keeping the partial file.
+/// per batch (must not block); `halt` keeps the partial file, any other failure removes it.
 ///
 /// # Errors
 ///
@@ -62,6 +62,31 @@ fn write_image_with(
     }
 
     let file = File::create(dest).map_err(|source| Error::IoError { source })?;
+    let r = copy_out(
+        reader,
+        file,
+        dest,
+        total_sectors,
+        halt,
+        &mut on_progress,
+        sync_dir,
+    );
+    // A failed copy leaves no truncated image at the final name; a halt keeps its partial.
+    if matches!(&r, Err(e) if !matches!(e, Error::Halted)) {
+        let _ = std::fs::remove_file(dest);
+    }
+    r
+}
+
+fn copy_out(
+    reader: &mut dyn SectorSource,
+    file: File,
+    dest: &Path,
+    total_sectors: u32,
+    halt: &Halt,
+    on_progress: &mut impl FnMut(u64),
+    sync_dir: fn(&Path) -> std::io::Result<()>,
+) -> Result<u64> {
     let mut out = BufWriter::with_capacity(BATCH_SECTORS as usize * SECTOR_BYTES, file);
 
     let mut buf = vec![0u8; BATCH_SECTORS as usize * SECTOR_BYTES];
@@ -212,6 +237,20 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("fmkv-image-writer-{name}-{}", std::process::id()));
         p
+    }
+
+    // A failed copy must not leave a truncated image at the final name.
+    #[test]
+    fn failed_copy_removes_the_incomplete_image() {
+        let td = tempfile::tempdir().unwrap();
+        let dest = td.path().join("bad.iso");
+        let mut src = PatternSource {
+            sectors: 4096,
+            short_after: Some(2048),
+        };
+        let r = write_image(&mut src, &dest, 4096, &Halt::new(), |_| {});
+        assert!(matches!(r, Err(Error::ShortImageRead { .. })), "{r:?}");
+        assert!(!dest.exists(), "truncated image left at the final name");
     }
 
     // A failing parent-directory fsync must fail write_image, not report Ok.

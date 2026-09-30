@@ -18,6 +18,7 @@ pub(super) fn preallocate(file: &File, size_bytes: u64) {
     // while pre-reserving extents. Clamp to `off_t` range; an unchecked `as i64`
     // cast would wrap a >= 2^63 size to a negative length (EINVAL no-op).
     let len = i64::try_from(size_bytes).unwrap_or(i64::MAX);
+    // SAFETY: a valid borrowed fd; the kernel reads no user memory.
     let rc = unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
     tracing::debug!(
         target: "mux",

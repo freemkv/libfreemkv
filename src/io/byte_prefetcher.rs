@@ -67,10 +67,10 @@ impl BytePrefetcher {
         chunk_bytes: usize,
         halt: Option<Halt>,
     ) -> std::io::Result<Self> {
-        // A zero-length chunk makes every recycled buffer empty; `reader.read(&mut [])`
-        // returns Ok(0), which the loop below treats as EOF, producing a silent
-        // zero-byte stream. Callers must pass the downstream demuxer's batch size (> 0).
-        debug_assert!(chunk_bytes > 0, "BytePrefetcher chunk_bytes must be > 0");
+        // A zero-length chunk would read Ok(0) at once: a silent empty stream.
+        if chunk_bytes == 0 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         let (tx, rx) = bounded::<Batch>(FORWARD_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(RECYCLE_DEPTH);
 
@@ -102,14 +102,17 @@ impl BytePrefetcher {
                         else {
                             return;
                         };
-                        // Regrow to chunk_bytes (a short read may have truncated len): sound
-                        // resize, was `unsafe set_len` guarded only by capacity (GHSA-j8ww-f5fg-9pmh
-                        // in `sector::prefetched`). No realloc; a no-op if len is already there.
+                        // Regrow to chunk_bytes (a short read may have truncated len): safe
+                        // resize, was `unsafe set_len` (GHSA-j8ww-f5fg-9pmh in `sector::prefetched`).
                         buf.resize(chunk_bytes, 0);
-                        // Read up to one full chunk. Short reads are
-                        // valid and common — pipe `truncate` so the
-                        // consumer sees only the bytes that arrived.
-                        let n = match reader.read(&mut buf[..]) {
+                        // Short reads are valid: truncate so the consumer sees only what arrived.
+                        let n = loop {
+                            match reader.read(&mut buf[..]) {
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                r => break r,
+                            }
+                        };
+                        let n = match n {
                             Ok(0) => return, // EOF — drop tx, consumer sees RecvError
                             Ok(n) => n,
                             Err(e) => {
@@ -484,6 +487,39 @@ mod tests {
             drop(rx);
             drop(recycle_tx);
             drop(shell);
+        });
+    }
+
+    #[test]
+    fn zero_chunk_is_invalid_input() {
+        let e = BytePrefetcher::new(Cursor::new(vec![1u8; 4]), 0, None)
+            .err()
+            .expect("zero chunk must be rejected");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // EINTR from the reader is retried, not surfaced as a terminal error.
+    #[test]
+    fn interrupted_read_is_retried() {
+        within(10, || {
+            struct Flaky(u8);
+            impl Read for Flaky {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    self.0 += 1;
+                    match self.0 {
+                        1 => Err(std::io::ErrorKind::Interrupted.into()),
+                        2 => {
+                            buf[..3].fill(9);
+                            Ok(3)
+                        }
+                        _ => Ok(0),
+                    }
+                }
+            }
+            let pf = BytePrefetcher::new(Flaky(0), 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none(), "EINTR surfaced: {err:?}");
+            assert_eq!(got, vec![9; 3]);
         });
     }
 

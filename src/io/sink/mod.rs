@@ -21,8 +21,8 @@ pub use socket::{SocketSink, UdpSocketSink};
 ///
 /// `finish` drains any internal buffering and signals end-of-stream to the transport
 /// (close-write on a socket, flush + fsync on a buffered file, etc.). The default impl flushes
-/// via [`Write::flush`]; every concrete sink here overrides it with its own finalisation. No
-/// blanket `impl SequentialSink for T`
+/// via [`Write::flush`]; every concrete sink here overrides it with its own finalisation. There
+/// is deliberately no blanket `impl SequentialSink for T`.
 pub trait SequentialSink: Write + Send {
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()

@@ -14,6 +14,7 @@ pub(super) fn preallocate_impl(file: &File, size_bytes: u64) {
     // fallocate rejects with EINVAL (silent no-op).
     let len = i64::try_from(size_bytes).unwrap_or(i64::MAX);
     // FALLOC_FL_KEEP_SIZE = 0x01.
+    // SAFETY: a valid borrowed fd; the kernel reads no user memory.
     let rc = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len) };
     tracing::debug!(
         target: "mux",

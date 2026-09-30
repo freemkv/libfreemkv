@@ -112,6 +112,14 @@ impl Flusher {
 
     /// Backpressure before a write: wait while more than `2 × C` is unflushed.
     pub(super) fn wait_room(&self, written: u64, halt: Option<&Halt>) -> io::Result<()> {
+        {
+            // Never block on bytes the worker was not asked to flush (chunk may have shrunk).
+            let mut st = self.lock();
+            if written > st.requested && written.saturating_sub(st.flushed) > 2 * st.chunk {
+                st.requested = written;
+                self.shared.cv.notify_all();
+            }
+        }
         self.wait(halt, halt, |st| {
             written.saturating_sub(st.flushed) <= 2 * st.chunk
         })
@@ -237,5 +245,51 @@ fn run(file: File, ops: &dyn FlushOps, shared: &Shared, timing: FlushTiming) {
             }
         }
         shared.cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Instant0;
+    impl FlushOps for Instant0 {
+        fn chunk(&self, _: &File) -> io::Result<()> {
+            Ok(())
+        }
+        fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
+            None
+        }
+        fn finish(&self, _: &File) -> io::Result<()> {
+            Ok(())
+        }
+        fn sample(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    // Bytes past `requested` (left over after the chunk shrank) must be handed to the worker
+    // by a blocked writer, not waited on until the stall latches `SyncTimeout`.
+    #[test]
+    fn wait_room_requests_unrequested_bytes() {
+        let file = tempfile::tempfile().unwrap();
+        let timing = FlushTiming {
+            stall: Duration::from_millis(400),
+            slow_chunk: Duration::from_secs(10),
+            chunk_min: 100,
+            chunk_max: 100,
+            sample_every: Duration::from_millis(50),
+        };
+        let f = Flusher::spawn(
+            &file,
+            Arc::new(Instant0),
+            timing,
+            FlushProgress::default(),
+            0,
+        )
+        .unwrap();
+        f.wait_room(10_000, None).unwrap();
+        assert!(f.error().is_none());
     }
 }

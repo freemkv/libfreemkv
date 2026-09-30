@@ -27,10 +27,12 @@ pub(super) fn preallocate_impl(file: &File, size_bytes: u64) {
         fst_length: len,
         fst_bytesalloc: 0,
     };
+    // SAFETY: a valid borrowed fd and a live stack `Fstore`.
     let mut rc = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store as *mut Fstore) };
     if rc == -1 {
         // Fall back to non-contiguous only.
         store.fst_flags = F_ALLOCATEALL;
+        // SAFETY: as above.
         rc = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store as *mut Fstore) };
     }
     tracing::debug!(

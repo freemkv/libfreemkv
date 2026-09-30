@@ -24,10 +24,12 @@ pub(super) fn preallocate(file: &File, size_bytes: u64) {
         fst_bytesalloc: 0,
     };
     // First attempt: contiguous.
+    // SAFETY: a valid borrowed fd and a live stack `Fstore`.
     let mut rc = unsafe { libc::fcntl(file.as_raw_fd(), F_PREALLOCATE, &mut fst) };
     if rc == -1 {
         // Fall back: drop the contiguous hint, allow scattered extents.
         fst.fst_flags = F_ALLOCATEALL;
+        // SAFETY: as above.
         rc = unsafe { libc::fcntl(file.as_raw_fd(), F_PREALLOCATE, &mut fst) };
     }
     tracing::debug!(
