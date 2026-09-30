@@ -2444,7 +2444,7 @@ mod tests {
         let merged = merge_ranges(&ranges);
         // No panic; result is a single merged range starting at the first.
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].0, u32::MAX - 1);
+        assert_eq!(merged[0], (u32::MAX - 1, 1));
     }
 
     #[test]
@@ -2537,8 +2537,9 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_oversized_extent_before_allocating() {
-        // data_len just over the 64 MiB cap must error, not allocate.
+    fn read_file_rejects_oversized_file_before_allocating() {
+        // A file (entry.size and its extent) just over the 64 MiB cap must
+        // error, not allocate.
         let oversized = MAX_FILE_BYTES as u32 + 2048;
         let icb = build_efe_icb(oversized as u64, oversized, 100);
         let mut reader = MemReader::new();
@@ -2893,7 +2894,7 @@ mod tests {
         );
         let res = fs.file_extents(&mut reader, "/SP");
         assert!(
-            res.is_err(),
+            matches!(res, Err(Error::UdfUnrecordedExtent { .. })),
             "an unrecorded extent must never reach the title's extent list as \
              readable content; got {res:?}"
         );
