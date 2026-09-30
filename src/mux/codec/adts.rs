@@ -150,27 +150,30 @@ fn adts_header(
     // The ASC replaces the ADTS header (payload carries no header/CRC).
     // CodecPrivate is fixed per track: a later config change keeps the
     // first ASC and is counted.
-    let mut asc = vec![
+    let base = [
         (object_type << 3) | (rate_index >> 1),
         (rate_index << 7) | (channels << 3),
     ];
     // channel_configuration 0: the layout is an in-band PCE, which the ASC must carry.
-    if channels == 0
-        && data.len() >= bytes
-        && let Some(pce) = adts_pce(&data[skip..bytes])
-    {
-        asc.extend(pce);
-    }
+    let pce = if channels == 0 && data.len() >= bytes {
+        adts_pce(&data[skip..bytes])
+    } else {
+        None
+    };
+    let full = |pce: &Option<Vec<u8>>| [&base[..], pce.as_deref().unwrap_or(&[])].concat();
     match config {
-        None => *config = Some(asc),
-        Some(first) if first[..2] != asc[..2] => {
+        None => *config = Some(full(&pce)),
+        Some(first)
+            if first[..2] != base
+                || (first.len() > 2 && pce.as_ref().is_some_and(|p| first[2..] != p[..])) =>
+        {
             if *changes == 0 {
                 tracing::warn!(target: "mux", pid, "AAC config changed mid-stream; keeping the first");
             }
             *changes += 1;
         }
         // Seeded before the PCE was in view: upgrade to the PCE-bearing form.
-        Some(first) if first.len() == 2 && asc.len() > 2 => *first = asc,
+        Some(first) if first.len() == 2 && pce.is_some() => *first = full(&pce),
         Some(_) => {}
     }
     // [§8.1.1.2] "Number of raw_data_block()'s ... is equal to number_of_raw_data_blocks_in_frame
