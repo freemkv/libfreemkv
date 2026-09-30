@@ -425,9 +425,7 @@ pub mod probe {
     /// `AES-D(km, mk_dv)[0..8] == 01 23 45 67 89 AB CD EF`.
     pub fn km_verifies(mkb: &[u8], km: &[u8; 16]) -> bool {
         match super::mkb_find_mk_dv(mkb) {
-            Some(mk_dv) => {
-                aes_ecb_decrypt(km, &mk_dv)[..8] == [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
-            }
+            Some(mk_dv) => aes_ecb_decrypt(km, &mk_dv)[..8] == super::VERIFY_MAGIC,
             None => false,
         }
     }
@@ -600,14 +598,13 @@ mod resolve_candidate_tests {
     fn km_verifies_accepts_only_the_key_its_record_was_built_for() {
         use crate::aacs::mkb::mkb_find_mk_dv;
 
-        const MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         let km: [u8; 16] = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
         ];
 
         let mut plain = [0u8; 16];
-        plain[..8].copy_from_slice(&MAGIC);
+        plain[..8].copy_from_slice(&VERIFY_MAGIC);
         plain[8..].copy_from_slice(&[0xA5; 8]);
         let mk_dv = aes_ecb_encrypt(&km, &plain);
 

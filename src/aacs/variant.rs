@@ -1096,7 +1096,6 @@ mod tests {
     fn plant_variant_mkb() -> PlantedVariant {
         use crate::aacs::crypto::{aes_ecb_encrypt, aes_g};
 
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         const UV: u32 = 2;
         const U_MASK_SHIFT: u8 = 3;
 
@@ -1696,7 +1695,6 @@ mod tests {
     fn plant_walk_variant_mkb() -> PlantedWalk {
         use crate::aacs::crypto::{aes_ecb_encrypt, aes_g};
 
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         const UV_DECOY: u32 = 0x0000_0800;
         const UV_REAL: u32 = 0x0000_0400;
         const U_MASK_SHIFT: u8 = 12;
@@ -1970,7 +1968,6 @@ mod tests {
     #[test]
     fn walk_processing_key_authenticates_a_classical_match_through_the_verify_magic() {
         use crate::aacs::crypto::aes_ecb_encrypt;
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         const UV: u32 = 0x0000_0400;
         const U_MASK_SHIFT: u8 = 12;
 
