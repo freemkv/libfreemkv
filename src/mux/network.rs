@@ -11,7 +11,7 @@ use crate::disc::DiscTitle;
 use crate::halt::{Halt, WAIT_SLICE};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 
 /// I/O buffer size for network reads/writes.
 const NET_BUF_SIZE: usize = 256 * 1024;
@@ -179,20 +179,37 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-// Resolve `addr` and return the first IP not blocked by `is_blocked_ip`;
-// errors NetworkAddrBlocked if all are blocked, since the returned
-// SocketAddr is a vetted IP literal (no second DNS lookup possible).
-fn resolve_allowed_addr(addr: &str) -> io::Result<std::net::SocketAddr> {
-    // Zero resolved addresses and "all resolved addresses blocked" both
-    // mean there is no safe address to connect to — same error either way.
-    addr.to_socket_addrs()?
-        .find(|sa| !is_blocked_ip(sa.ip()))
-        .ok_or_else(|| {
-            crate::error::Error::NetworkAddrBlocked {
-                addr: addr.to_string(),
-            }
-            .into()
-        })
+// Every resolved address of `addr` not blocked by `is_blocked_ip`, in order. Vetted IP
+// literals (no second DNS lookup). Zero resolved or all blocked: NetworkAddrBlocked.
+fn allowed_addrs(
+    addr: &str,
+    resolved: impl Iterator<Item = SocketAddr>,
+) -> io::Result<Vec<SocketAddr>> {
+    let allowed: Vec<SocketAddr> = resolved.filter(|sa| !is_blocked_ip(sa.ip())).collect();
+    if allowed.is_empty() {
+        return Err(crate::error::Error::NetworkAddrBlocked {
+            addr: addr.to_string(),
+        }
+        .into());
+    }
+    Ok(allowed)
+}
+
+// Bounds a connect to one address (the OS SYN timeout is 75 s or more, and Stop
+// cannot interrupt a blocking connect).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// Connect to the first reachable address (a dual-stack host with a dead v6 route
+// still reaches v4), as `TcpStream::connect(&str)` does.
+fn connect_first(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut last = io::Error::from(io::ErrorKind::AddrNotAvailable);
+    for a in addrs {
+        match TcpStream::connect_timeout(a, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 enum Mode {
@@ -231,8 +248,8 @@ impl NetworkStream {
         // settings-save validation and now can't redirect us to a loopback/private/
         // link-local host (SSRF).
         let stream = if vet {
-            let vetted = resolve_allowed_addr(addr)?;
-            TcpStream::connect(vetted)?
+            let vetted = allowed_addrs(addr, addr.to_socket_addrs()?)?;
+            connect_first(&vetted)?
         } else {
             TcpStream::connect(addr)?
         };
@@ -240,6 +257,8 @@ impl NetworkStream {
         // so the final sub-MSS flush after finish() isn't held by Nagle — the 256 KB
         // BufWriter coalesces bulk writes, so this only affects the tail.
         stream.set_nodelay(true)?;
+        // A crashed or unplugged receiver fails the send instead of hanging it.
+        arm_keepalive(&stream);
         Ok(Self {
             disc_title: DiscTitle::empty(),
             mode: Mode::Write {
@@ -651,6 +670,41 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    // The SSRF filter keeps every allowed address in order (not just the first) and
+    // refuses an all-blocked or empty resolution.
+    #[test]
+    fn allowed_addrs_keeps_every_public_address_and_refuses_none() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let mixed = [
+            a("127.0.0.1:9"),
+            a("[2001:db8::1]:9"),
+            a("224.0.0.1:9"),
+            a("8.8.8.8:9"),
+        ];
+        let got = allowed_addrs("h:9", mixed.into_iter()).unwrap();
+        assert_eq!(got, vec![a("[2001:db8::1]:9"), a("8.8.8.8:9")]);
+        for list in [vec![a("127.0.0.1:9"), a("[::1]:9")], vec![]] {
+            let err = allowed_addrs("h:9", list.into_iter()).expect_err("no safe address");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some(crate::error::E_NETWORK_ADDR_BLOCKED)
+            );
+        }
+    }
+
+    // A dead first address falls through to the next one.
+    #[test]
+    fn connect_first_falls_through_a_dead_address() {
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let live = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = connect_first(&[dead, live.local_addr().unwrap()]).expect("reaches live");
+        assert_eq!(stream.peer_addr().unwrap(), live.local_addr().unwrap());
+        assert!(connect_first(&[dead]).is_err());
     }
 
     fn sample_title() -> DiscTitle {
