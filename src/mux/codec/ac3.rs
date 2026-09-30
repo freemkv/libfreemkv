@@ -1614,6 +1614,26 @@ mod tests {
     }
 
     #[test]
+    fn acmod_channels_every_mode_with_and_without_lfe() {
+        // A/52 Table 5.8 base counts, spelled independently of ACMOD_CHANNELS. lfeon sits
+        // after cmixlev/surmixlev/dsurmod, so a misplaced cursor misreads it.
+        let base = [2u8, 1, 2, 3, 3, 4, 4, 5];
+        for (acmod, &n) in base.iter().enumerate() {
+            let acmod = acmod as u8;
+            assert_eq!(
+                acmod_channels(&make_bsi(acmod, false)),
+                Some(n),
+                "acmod {acmod}"
+            );
+            assert_eq!(
+                acmod_channels(&make_bsi(acmod, true)),
+                Some(n + 1),
+                "acmod {acmod} + LFE"
+            );
+        }
+    }
+
+    #[test]
     fn acmod_channels_short_frame_is_none() {
         // Fewer than 8 bytes cannot carry the BSI bits → None (caller falls
         // back to the IFO-claimed channel count).
@@ -2173,6 +2193,36 @@ mod tests {
         );
     }
 
+    // An access unit that keeps gaining substreams past MAX_AC3_BUF is dropped WITH its held
+    // state, so the next PES starts clean instead of resuming a stale HeldAu.
+    #[test]
+    fn an_oversized_held_access_unit_is_dropped_with_its_held_state() {
+        const PER_PES: usize = 128;
+        let mut data = eac3_substream_frame(0, 0);
+        for _ in 1..PER_PES {
+            data.extend_from_slice(&eac3_substream_frame(1, 0));
+        }
+        let mut parser = Ac3Parser::new();
+        let mut fed = 0usize;
+        while fed <= MAX_AC3_BUF {
+            assert!(parser.parse(&make_eac3_pes(data.clone())).is_empty());
+            fed += data.len();
+            // Later PES start with a dependent: it only extends the held unit.
+            data = eac3_substream_frame(1, 0).repeat(PER_PES);
+        }
+        assert_eq!(parser.acc.len(), 0, "the oversized carry-over is dropped");
+
+        // A stale HeldAu (end ~1 MiB) would index past this 256-byte buffer.
+        assert!(
+            parser
+                .parse(&make_eac3_pes(eac3_substream_frame(0, 0)))
+                .is_empty()
+        );
+        let out = parser.flush();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data.len(), 256, "only the post-guard unit survives");
+    }
+
     // helper: PES with a generic pts for E-AC-3 tests
     fn make_eac3_pes(data: Vec<u8>) -> PesPacket {
         PesPacket {
@@ -2281,5 +2331,27 @@ mod tests {
             parser.dropped_frames() > CORRUPT_AUS as u64,
             "the held unit must be ACCOUNTED as a drop, not silently discarded"
         );
+    }
+
+    // An access unit starting in a LATER PES adopts that PES's PTS even when it differs from
+    // the running cadence, so a real PTS jump is followed rather than drifted past.
+    #[test]
+    fn an_access_unit_in_a_later_pes_adopts_its_pts_over_the_cadence() {
+        let mut parser = Ac3Parser::new();
+        let frame = make_ac3_frame(0, 4);
+        let pes = |pts: i64| PesPacket {
+            source: None,
+            pid: 0,
+            pts: Some(pts),
+            dts: None,
+            data: frame.clone(),
+            discontinuity: false,
+        };
+        let f1 = parser.parse(&pes(90_000));
+        assert_eq!(f1[0].pts_ns, pts_to_ns(90_000));
+        // Cadence would put this one at 90_000 + 32 ms; the PES says 180_000.
+        let f2 = parser.parse(&pes(180_000));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f2[0].pts_ns, pts_to_ns(180_000));
     }
 }
