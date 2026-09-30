@@ -204,6 +204,10 @@ impl Mpeg2Parser {
         // datum into one codec-agnostic `PictureInfo`; `nb_fields()`, `keyframe()`,
         // and `field_order()` all derive from it, so nothing re-parses the stream.
         let (mut tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
+        // A GOP or sequence header always starts a new pair; drop a stale lone field.
+        if gop_boundary {
+            self.pending_first_field = None;
+        }
         if frame_picture {
             self.pending_first_field = None;
         } else if let Some(first_top) = self.pending_first_field.take()
@@ -510,9 +514,8 @@ mod tests {
         use crate::mux::codec::coding::FieldOrder;
         let mut p = Mpeg2Parser::new();
         let mut frames = Vec::new();
-        let mut fields = [(1u8, 0x01u8), (2, 0x02), (1, 0x01), (2, 0x02)].into_iter();
         let mut first = true;
-        for (i, (ct, e2)) in fields.by_ref().enumerate() {
+        for (ct, e2) in [(1u8, 0x01u8), (2, 0x02), (1, 0x01), (2, 0x02)] {
             let mut au = Vec::new();
             if first {
                 au.extend_from_slice(&make_seq_header(720, 576, 3, 3));
@@ -530,12 +533,45 @@ mod tests {
                 data: au,
                 discontinuity: false,
             }));
-            let _ = i;
         }
         frames.extend(p.flush());
         assert_eq!(frames.len(), 4);
         for f in &frames {
             assert_eq!(f.coding.unwrap().field_order(), Some(FieldOrder::Tff));
+        }
+    }
+
+    #[test]
+    fn gop_header_resets_stale_lone_field() {
+        use crate::mux::codec::coding::FieldOrder;
+        let mut p = Mpeg2Parser::new();
+        let mut frames = Vec::new();
+        let feed = |p: &mut Mpeg2Parser, prefix: Vec<u8>, ct: u8, e2: u8| {
+            let mut au = prefix;
+            au.extend_from_slice(&make_picture_header(ct));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            p.parse(&PesPacket {
+                source: None,
+                pid: 0x1011,
+                pts: None,
+                dts: None,
+                data: au,
+                discontinuity: false,
+            })
+        };
+        // Stray lone top field, then a new GOP coded BFF (bottom, top) x2.
+        frames.extend(feed(&mut p, make_seq_header(720, 576, 3, 3), 1, 0x01));
+        let gop = vec![0x00, 0x00, 0x01, GOP_CODE, 0, 0, 0, 0];
+        frames.extend(feed(&mut p, gop, 1, 0x02));
+        frames.extend(feed(&mut p, Vec::new(), 2, 0x01));
+        frames.extend(feed(&mut p, Vec::new(), 2, 0x02));
+        frames.extend(feed(&mut p, Vec::new(), 2, 0x01));
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 5);
+        for f in &frames[1..] {
+            assert_eq!(f.coding.unwrap().field_order(), Some(FieldOrder::Bff));
         }
     }
 
