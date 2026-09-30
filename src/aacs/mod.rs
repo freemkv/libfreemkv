@@ -9,23 +9,24 @@ pub mod content;
 pub mod crypto;
 pub mod derive;
 pub mod host_certs;
+// No production caller; not the live FMTS path.
+#[doc(hidden)]
 pub mod index_select;
 pub mod inf;
 pub mod mkb;
 pub mod provider;
 pub mod resolve;
 pub mod segment;
+// No production caller; not the live FMTS path.
+#[doc(hidden)]
 pub mod segment_key;
 pub mod trace;
 pub mod types;
 pub mod variant;
 
-/// On-disc UDF paths to the AACS key-input files, plus HD DVD AACS-directory
-/// discovery (never hardcoded — see [`find_hddvd_aacs_dir`], [`role_paths`]).
-///
-/// Each [`AacsRole`] resolves to an ordered candidate list, walked by
-/// [`read_first`] to the first that reads, so every reader shares one source
-/// of truth for disc_hash / MKB / VID.
+// On-disc UDF paths to the AACS key-input files; each AacsRole resolves to an ordered
+// candidate list walked by read_first (see role_paths, find_hddvd_aacs_dir).
+/// Primary Unit Key file path.
 pub const PATH_UNIT_KEY_RO: &str = "/AACS/Unit_Key_RO.inf";
 pub const PATH_UNIT_KEY_RO_DUPLICATE: &str = "/AACS/DUPLICATE/Unit_Key_RO.inf";
 pub const PATH_MKB_RO: &str = "/AACS/MKB_RO.inf";

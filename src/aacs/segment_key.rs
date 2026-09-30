@@ -129,6 +129,7 @@ mod tests {
         assert_eq!(t.record_size(), 536);
         let rec = t.record(0x1234).expect("record");
         assert_eq!(rec.len(), 536);
+        assert_eq!(rec[8], 0x34, "record 0x1234 carries its own fixture tag");
         assert_eq!(&rec[..8], &[0x01, 0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x02]);
         assert_eq!(t.record_payload(0x1234).unwrap().len(), 528);
     }

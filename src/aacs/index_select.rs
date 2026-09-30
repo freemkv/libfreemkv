@@ -4,7 +4,7 @@
 //! tags each segment with an index (see [`super::segment`]). Segments matching our
 //! index are kept, others dropped; everything outside a segment is ordinary (index-0)
 //! content. This module owns that classification only — no I/O, no keys, no cipher.
-//! The decrypt pipeline consumes the [`UnitDisposition`] it returns.
+//! Standalone helper: the live FMTS path is `keys::fmts` + `mux::resolve`, not this module.
 
 use super::segment::{Segment, segment_for_unit};
 use super::types::UnitKey;

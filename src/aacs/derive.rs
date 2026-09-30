@@ -538,13 +538,23 @@ pub fn resolve_candidate(
     };
 
     match candidate {
-        KeyCandidate::Uk(uk) => Some(ResolvedChain {
-            unit_keys: vec![(uk.idx, uk.key)],
-            vuk: None,
-            mk: None,
-            pk: None,
-            dk: None,
-        }),
+        KeyCandidate::Uk(uk) => {
+            // `uk.idx` is positional; surface the declared CPS-unit number like the other arms,
+            // falling back to the position if the file does not parse or lacks that slot.
+            let version = mkb_type(mkb)
+                .map(|t| t.generation())
+                .unwrap_or(AacsVersion::V10);
+            let declared = parse_title_keys(unit_key_ro, version)
+                .and_then(|f| f.encrypted_keys.get(uk.idx as usize).map(|k| k.0))
+                .unwrap_or(uk.idx);
+            Some(ResolvedChain {
+                unit_keys: vec![(declared, uk.key)],
+                vuk: None,
+                mk: None,
+                pk: None,
+                dk: None,
+            })
+        }
         KeyCandidate::Vuk(v) => Some(ResolvedChain {
             unit_keys: boil(*v)?,
             vuk: Some(*v),
@@ -714,6 +724,15 @@ mod resolve_candidate_tests {
         let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[], None).expect("uk is terminal");
         assert_eq!(r.unit_keys, vec![(2, uk.key)]);
         assert!(r.vuk.is_none() && r.mk.is_none());
+    }
+
+    /// A UK candidate's positional idx is reported as the declared CPS-unit number.
+    #[test]
+    fn resolve_candidate_uk_reports_the_declared_cps_unit_number() {
+        let inf = synth_inf(&[[0x11u8; 16], [0x22u8; 16]]);
+        let uk = UnitKey::new(1, [0x9u8; 16]);
+        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &inf, None).expect("terminal");
+        assert_eq!(r.unit_keys, vec![(2, uk.key)]);
     }
 
     /// MK/PK/DK paths derive the VUK from a VID; without one, derivation stops.

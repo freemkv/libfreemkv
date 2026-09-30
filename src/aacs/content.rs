@@ -1089,15 +1089,14 @@ mod tests {
 
     // ── decrypt_bus: one key schedule per unit, not one per sector ─────────
 
-    // Regression pin: `decrypt_bus` used to expand a fresh AES-128 key per sector (3x/unit) for
-    // a loop-invariant key.
+    // Regression pin on production decrypt_bus_sectors: one key schedule per unit, not per sector.
     #[test]
     fn decrypt_bus_expands_the_read_data_key_once_per_unit() {
         use crate::aacs::crypto::KEY_EXPANSIONS;
         let mut unit = clear_unit();
         let rdk = [0x4Eu8; 16];
         KEY_EXPANSIONS.with(|c| c.set(0));
-        decrypt_bus(&mut unit, &rdk);
+        decrypt_bus_sectors(&mut unit, &rdk);
         let n = KEY_EXPANSIONS.with(|c| c.get());
         assert_eq!(
             n, 1,
@@ -1455,24 +1454,26 @@ mod tests {
     // ── is_clean / ts_sync_count edge cases ────────────────────────────────
 
     #[test]
-    fn ts_sync_destroyed_false_for_sub_unit_length() {
-        // The function guards on `len >= ALIGNED_UNIT_LEN` first; anything
-        // shorter is reported NOT scrambled (so the decrypt gate skips it)
-        // rather than indexing past the end.
-        assert!(crate::aacs::content::is_clean(
-            &[],
+    fn is_clean_ts_short_buffers_are_judged_on_content() {
+        // No length guard: a short buffer is judged over the packets it holds.
+        // All-zero (or empty) has no content packets, so it is clean.
+        for len in [0, ALIGNED_UNIT_LEN - 1] {
+            assert!(crate::aacs::content::is_clean(
+                &vec![0u8; len],
+                crate::disc::ContentFormat::BdTs
+            ));
+        }
+        // Non-zero payload without a sync byte in a 1-short buffer is NOT clean.
+        let mut noisy = vec![0u8; ALIGNED_UNIT_LEN - 1];
+        noisy[192 + 4] = 0x00;
+        noisy[192 + 5] = 0x55;
+        assert!(!crate::aacs::content::is_clean(
+            &noisy,
             crate::disc::ContentFormat::BdTs
         ));
+        noisy[192 + 4] = TS_SYNC;
         assert!(crate::aacs::content::is_clean(
-            &vec![0u8; ALIGNED_UNIT_LEN - 1],
-            crate::disc::ContentFormat::BdTs
-        ));
-        // A scrambled-looking buffer that is one byte short is still "not
-        // scrambled" by the length guard.
-        let mut almost = vec![0u8; ALIGNED_UNIT_LEN - 1];
-        almost[4] = 0x00; // no syncs
-        assert!(crate::aacs::content::is_clean(
-            &almost,
+            &noisy,
             crate::disc::ContentFormat::BdTs
         ));
     }

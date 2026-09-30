@@ -141,6 +141,15 @@ pub const E_AACS_NO_USABLE_HOST_CERT: u16 = 7033;
 /// carries a `vidfp`: the key is derivable only from the disc's Volume ID.
 /// "the server must tell the two apart by code" (keys-upfront-design J11).
 pub const E_AACS_VID_NEEDS_DISC: u16 = 7034;
+// AACS 2.1 variant media-key chain (`MediaKeyVariantError`); 7105 is a reserved gap.
+pub const E_MKB_VARIANT_NOT_VARIANT: u16 = 7100;
+pub const E_MKB_VARIANT_INCOMPLETE: u16 = 7101;
+pub const E_MKB_VARIANT_PK_UNAVAILABLE: u16 = 7102;
+pub const E_MKB_VARIANT_SOFT_CORRECTION: u16 = 7103;
+pub const E_MKB_VARIANT_ONLINE_CHALLENGE: u16 = 7104;
+pub const E_MKB_VARIANT_TABLE_UNAVAILABLE: u16 = 7106;
+pub const E_MKB_VARIANT_VKD_RANGE: u16 = 7107;
+pub const E_MKB_VARIANT_VERIFY_FAILED: u16 = 7108;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
