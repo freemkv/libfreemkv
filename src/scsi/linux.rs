@@ -345,15 +345,9 @@ impl ScsiTransport for SgIoTransport {
             }
             self.fd = recovered;
         } else if self.fd < 0 {
-            // The post-wedge reopen failed; retry so a transient ENOENT/ENODEV
-            // during re-enumeration does not kill the transport for good.
-            let fd = Self::reopen_fd(&self.device_path);
-            if fd < 0 {
-                return Err(Error::DeviceNotFound {
-                    path: self.device_path.display().to_string(),
-                });
-            }
-            self.fd = fd;
+            return Err(Error::DeviceNotFound {
+                path: self.device_path.display().to_string(),
+            });
         }
 
         if data.len() > u32::MAX as usize {
@@ -470,7 +464,7 @@ impl ScsiTransport for SgIoTransport {
                 };
             if !reopened_async {
                 // Over the cap or no thread: reopen inline (blocking this call
-                // briefly); a failure is retried by the next execute().
+                // briefly); a failure leaves fd < 0 (DeviceNotFound from then on).
                 let new_fd = Self::reopen_fd(&path);
                 if new_fd >= 0 {
                     self.fd = new_fd;

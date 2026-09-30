@@ -25,6 +25,7 @@ fn main() {
 
         // Match rustc's deployment target so the shim does not strongly link
         // symbols newer than the app promises to run on (IOMainPort is 12+).
+        println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
         let min_ver = std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| {
             if target_arch == "aarch64" {
                 "11.0"

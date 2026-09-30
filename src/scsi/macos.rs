@@ -521,6 +521,7 @@ mod tests {
         fn shim_selftest_reaped(pid: i32) -> i32;
         fn shim_selftest_install_fake_device() -> i32;
         fn shim_selftest_last_timeout_ms() -> u32;
+        fn shim_selftest_fake_optical(on: i32);
     }
 
     /// A wait that is never cancelled would run this long; every cancelled wait must end far sooner.
@@ -722,6 +723,50 @@ mod tests {
         assert!(
             !OPEN.load(Ordering::Acquire),
             "a failed open left OPEN held"
+        );
+    }
+
+    /// §2.9 M2 end to end: a resolved drive's open hands its token to the unmount and 500 ms
+    /// settle waits. The unmount of a missing disk ends at once, so the cancel lands in the settle.
+    #[test]
+    fn shim_selftest_cancel_mid_open_is_halted() {
+        struct FakeOptical;
+        impl Drop for FakeOptical {
+            fn drop(&mut self) {
+                unsafe { shim_selftest_fake_optical(0) };
+            }
+        }
+        let _globals = shim_globals();
+        unsafe { shim_selftest_fake_optical(1) };
+        let _fake = FakeOptical;
+        let (r, wake) = {
+            let halt = Halt::new();
+            let canceller = {
+                let halt = halt.clone();
+                thread::spawn(move || {
+                    thread::sleep(CANCEL_AFTER);
+                    let at = Instant::now();
+                    halt.cancel();
+                    at
+                })
+            };
+            let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &halt);
+            let returned = Instant::now();
+            let cancelled_at = canceller.join().expect("canceller thread");
+            (r, returned.saturating_duration_since(cancelled_at))
+        };
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "expected Halted, got {:?}",
+            r.err()
+        );
+        assert!(
+            wake <= WAKE_BOUND,
+            "open returned {wake:?} after the cancel"
+        );
+        assert!(
+            !OPEN.load(Ordering::Acquire),
+            "a cancelled open left OPEN held"
         );
     }
 

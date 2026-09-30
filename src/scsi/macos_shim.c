@@ -191,11 +191,11 @@ static int registry_id_selector(io_registry_entry_t entry, char *buf, size_t buf
 }
 
 // BD, DVD and CD-only drives publish distinct service and driver classes
-// (IOBDServices / IODVDServices / IOCDServices and the matching
+// (IOBDServices / IODVDServices / IOCompactDiscServices and the matching
 // IO*BlockStorageDriver). All three are optical drives; IOServiceMatching
 // matches a class and its subclasses only, so each is queried in turn.
 static const char *const k_optical_services[] = {
-    "IOBDServices", "IODVDServices", "IOCDServices", NULL
+    "IOBDServices", "IODVDServices", "IOCompactDiscServices", NULL
 };
 static const char *const k_optical_drivers[] = {
     "IOBDBlockStorageDriver", "IODVDBlockStorageDriver", "IOCDBlockStorageDriver", NULL
@@ -574,6 +574,8 @@ static void da_release(void) {
 
 // The IOReturn/HRESULT behind the last negative shim_open_exclusive result (0 if none).
 static volatile int32_t g_last_open_kr;
+// Selftest only: an unresolved BSD selector resolves to a stand-in service.
+static volatile int g_selftest_fake_optical;
 
 int32_t shim_last_open_kr(void) { return g_last_open_kr; }
 
@@ -624,6 +626,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     } else {
         svc = find_bdsvc_by_bsd_name(mp, selector);
         if (!svc) svc = find_bdsvc_from_iomedia(mp, selector);
+        if (!svc && g_selftest_fake_optical) svc = IORegistryGetRootEntry(mp);
         if (svc) strlcpy(bsd_name, selector, sizeof(bsd_name));
     }
     if (!svc) {
@@ -967,5 +970,9 @@ __attribute__((visibility("hidden"))) int shim_selftest_install_fake_device(void
     pthread_mutex_unlock(&g_handle_lock);
     return 0;
 }
+
+// Makes shim_open_exclusive treat any BSD selector as an optical drive (its
+// plugin creation then fails), so a cancel in the unmount/settle wait is testable.
+__attribute__((visibility("hidden"))) void shim_selftest_fake_optical(int on) { g_selftest_fake_optical = on; }
 
 __attribute__((visibility("hidden"))) unsigned int shim_selftest_last_timeout_ms(void) { return g_selftest_timeout_ms; }
