@@ -274,6 +274,8 @@ struct Spec {
     dependent: bool,
     keys: Vec<[u8; 16]>,
     fmts: Vec<[u8; 16]>,
+    // The online service only returns the full set for its held index-1 phase.
+    match_fmts_phase: bool,
     answer: Answer,
     calls: Calls,
     clock: Option<Arc<FakeClock>>,
@@ -295,6 +297,7 @@ impl Spec {
             dependent: false,
             keys: keys.to_vec(),
             fmts: Vec::new(),
+            match_fmts_phase: false,
             answer: Answer::All,
             calls: calls.clone(),
             clock: None,
@@ -348,6 +351,16 @@ impl Fake {
             &self.spec.keys
         };
         Ok(match self.spec.answer {
+            _ if forensic && self.spec.match_fmts_phase => {
+                if held
+                    .first()
+                    .is_some_and(|key| samples.iter().all(|s| opens(s, key)))
+                {
+                    held.clone()
+                } else {
+                    Vec::new()
+                }
+            }
             // KS-26 (evidence): an index-1 anchor gets the whole forensic set.
             _ if forensic => held.clone(),
             Answer::All => held.clone(),
@@ -1471,6 +1484,43 @@ fn fmts_online(calls: &Calls) -> Spec {
     let mut s = Spec::online(&[K2], calls);
     s.fmts = vec![F1, F2];
     s
+}
+
+// KS-26: the base-key request is separate from the forensic A/B anchor. Stop on
+// A's success; an empty A answer must leave the source available for B.
+#[test]
+fn fmts_phase_a_success_stops_and_phase_a_miss_tries_b() {
+    for held_phase in [0, 1] {
+        let mut fx = fmts_fixture();
+        if held_phase == 1 {
+            for (a, b, key) in [(0, 16, F1), (20, 36, F2)] {
+                for u in a..b {
+                    fx.reencrypt(1, u, if u % 2 == 1 { &key } else { &ALT });
+                }
+            }
+        }
+        let calls = Calls::default();
+        let mut source = fmts_online(&calls);
+        source.keys = vec![K1, K2];
+        source.match_fmts_phase = true;
+        let set = resolve(&fx, KeyScope::Titles(vec![2]), &[source]).unwrap();
+        assert_eq!(set.status().forensic, ForensicState::Resolved);
+        let anchors = calls.of("online").iter().filter(|c| c.forensic).count();
+        assert_eq!(anchors, held_phase + 1, "only ask B when A has no key");
+        let before = calls.len();
+        let mut reader = set.title_reader(&fx.disc, 2, fx.source()).unwrap();
+        let got = read(&mut reader, &fx, 1, 0, 16).unwrap();
+        let plain = fx.plain(fx.file(1).0, 16);
+        for u in 0..16 {
+            let range = u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN;
+            if u % 2 == held_phase {
+                assert_eq!(got[range.clone()], plain[range]);
+            } else {
+                assert_ne!(got[range.clone()], plain[range]);
+            }
+        }
+        assert_eq!(calls.len(), before, "muxing never asks again");
+    }
 }
 
 /// LK12. KS-25, KS-26 (evidence, no public FMTS spec): the forensic set is fetched once for
