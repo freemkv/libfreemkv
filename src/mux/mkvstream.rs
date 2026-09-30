@@ -7065,6 +7065,35 @@ mod tests {
         assert_eq!(p.last_cue_secs, None);
     }
 
+    // An unfinished file (SeekPosition 0) or a SeekHead pointing past EOF must be an
+    // error, never "no Cues": verify then falls back to the header Duration.
+    #[test]
+    fn probe_with_cues_rejects_a_bad_seekhead_target_and_takes_a_direct_hit() {
+        let seekhead = |pos: u64| {
+            let mut seek = Vec::new();
+            ebml::write_binary(&mut seek, ebml::SEEK_ID, &ebml::CUES.to_be_bytes()).unwrap();
+            ebml::write_id(&mut seek, ebml::SEEK_POSITION).unwrap();
+            ebml::write_size(&mut seek, 8).unwrap();
+            seek.extend_from_slice(&pos.to_be_bytes());
+            master(ebml::SEEK_HEAD, &master(ebml::SEEK, &seek))
+        };
+        let it = info_and_tracks(&[]);
+        let cluster = master(ebml::CLUSTER, &[0u8; 64]);
+        for pos in [0, 1 << 20] {
+            let out = segment(&[&seekhead(pos), &it, &cluster]);
+            assert!(
+                probe_mkv_with_cues(Cursor::new(out)).is_err(),
+                "SeekPosition {pos}"
+            );
+        }
+        let mut cp = Vec::new();
+        ebml::write_uint(&mut cp, ebml::CUE_TIME, 3_000).unwrap();
+        let cues = master(ebml::CUES, &master(ebml::CUE_POINT, &cp));
+        let out = segment(&[&it, &cues, &cluster]);
+        let p = probe_mkv_with_cues(Cursor::new(out)).unwrap();
+        assert_eq!(p.last_cue_secs, Some(3.0));
+    }
+
     #[test]
     fn parse_freemkv_version_accepts_freemkv_stamps_only() {
         assert_eq!(
