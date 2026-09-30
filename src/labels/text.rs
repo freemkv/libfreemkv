@@ -13,10 +13,24 @@
 /// Non-printable bytes (including `\t`, `\n`, NUL) terminate the
 /// current run. Output strings are guaranteed valid UTF-8 (they're
 /// pure 7-bit ASCII). Strings shorter than `min_len` are dropped.
+#[cfg(test)]
 pub fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
+    extract_ascii_strings_capped(data, min_len, usize::MAX)
+}
+
+/// [`extract_ascii_strings`], stopping after `max_strings` runs so untrusted
+/// input can't amplify into millions of owned `String`s.
+pub fn extract_ascii_strings_capped(
+    data: &[u8],
+    min_len: usize,
+    max_strings: usize,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     for &b in data {
+        if out.len() >= max_strings {
+            return out;
+        }
         if (0x20..=0x7E).contains(&b) {
             current.push(b as char);
         } else if !current.is_empty() && current.len() >= min_len {
@@ -25,7 +39,7 @@ pub fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
             current.clear();
         }
     }
-    if !current.is_empty() && current.len() >= min_len {
+    if !current.is_empty() && current.len() >= min_len && out.len() < max_strings {
         out.push(current);
     }
     out
@@ -34,6 +48,12 @@ pub fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_extraction_stops_at_the_cap() {
+        let got = extract_ascii_strings_capped(b"abcd\0abcd\0abcd\0abcd", 4, 2);
+        assert_eq!(got.len(), 2);
+    }
 
     #[test]
     fn extracts_simple_runs() {

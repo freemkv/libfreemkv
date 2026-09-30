@@ -16,6 +16,7 @@
 //!
 //! `forced_sub` is an ENUMERATION, not a boolean — see [`ForcedSub`].
 
+use super::MIN_FEATURE_SECS;
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
@@ -29,7 +30,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     let data = super::read_jar_file(reader, udf, "playlists.xml")?;
     let text = std::str::from_utf8(&data).ok()?;
 
-    // Find the feature playlist — longest duration or name="Feature"
+    // Find the feature playlist (three tiers, see find_feature_playlist).
     let feature = find_feature_playlist(text)?;
 
     let labels = labels_from_feature(feature);
@@ -201,11 +202,6 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
 pub(crate) fn feature_hint(text: &str) -> Option<super::FeaturePlaylistHint> {
     element_hint(find_feature_playlist(text)?)
 }
-
-// A playlist must run at least this long (seconds) to be the feature — kills the
-// `_Start_Angle` 2-second decoy (Sony SM3 UHD id 00243). Applied only when a
-// duration is actually stated; absent, it stays inert. Shared with fox.
-use super::MIN_FEATURE_SECS;
 
 // A `<playlist>` element's stated running time in seconds, if any. Read from the
 // first present of a set of duration-like attributes (the corpus is not a spec;

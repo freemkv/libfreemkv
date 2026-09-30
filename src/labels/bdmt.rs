@@ -16,6 +16,21 @@ use std::collections::BTreeMap;
 // metadata; real files are a few KB.
 const MAX_BDMT_BYTES: u64 = 1024 * 1024;
 
+// Retained title/description cap (bytes): bounds memory across up to 26^3 languages.
+const MAX_BDMT_TEXT: usize = 1024;
+
+// Truncate to at most `MAX_BDMT_TEXT` bytes on a char boundary.
+fn cap_text(mut s: String) -> String {
+    if s.len() > MAX_BDMT_TEXT {
+        let mut end = MAX_BDMT_TEXT;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 /// Disc-level metadata extracted from `/BDMV/META/DL/bdmt_*.xml`.
 ///
 /// All maps are keyed by 3-char ISO 639-2 language code (e.g.
@@ -131,12 +146,13 @@ pub(crate) type BdmtFields = (String, Option<String>, Option<(u32, u32)>);
 // Parse one bdmt_<lang>.xml document into (title, description?, disc_set?). None if no title
 // could be located.
 pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
-    let title = extract_title(xml_text)?;
+    let title = cap_text(extract_title(xml_text)?);
     // xml::text already returns a trimmed string (see xml::text), so the
     // description is only filtered for emptiness and XML-fragment noise.
     let description = xml::text(xml_text, "description")
         .filter(|s| !s.is_empty())
-        .filter(|s| !looks_like_xml(s));
+        .filter(|s| !looks_like_xml(s))
+        .map(cap_text);
     let disc_set = extract_disc_set(xml_text);
     Some((title, description, disc_set))
 }
@@ -168,6 +184,7 @@ fn extract_title(xml_text: &str) -> Option<String> {
     for tag in ["name", "title"] {
         if let Some(s) = xml::text(xml_text, tag)
             && !s.is_empty()
+            && !looks_like_xml(&s)
         {
             return Some(s);
         }
@@ -185,11 +202,13 @@ fn extract_title(xml_text: &str) -> Option<String> {
     None
 }
 
-/// Extract `(discNumber, numSets)` if both are present and parse as
+/// Extract `(setNumber, numSets)` if both are present and parse as
 /// `u32`. Accepts either `<di:numSets>` or `<di:numberOfSets>` for
 /// the denominator (both forms appear in the wild).
 fn extract_disc_set(xml_text: &str) -> Option<(u32, u32)> {
-    let n = xml::text(xml_text, "discNumber")?
+    // Real discs carry <di:setNumber>; <di:discNumber> is kept as a fallback.
+    let n = xml::text(xml_text, "setNumber")
+        .or_else(|| xml::text(xml_text, "discNumber"))?
         .trim()
         .parse::<u32>()
         .ok()?;
@@ -210,6 +229,28 @@ fn extract_disc_set(xml_text: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_container_markup_is_not_a_title() {
+        let xml = "<discInfo><di:title><di:name/><di:numSets>1</di:numSets></di:title></discInfo>";
+        assert_eq!(parse_bdmt_xml(xml), None);
+    }
+
+    #[test]
+    fn set_number_is_read() {
+        let xml =
+            "<d><di:name>X</di:name><di:numSets>3</di:numSets><di:setNumber>2</di:setNumber></d>";
+        assert_eq!(parse_bdmt_xml(xml).expect("parse").2, Some((2, 3)));
+    }
+
+    #[test]
+    fn long_title_and_description_are_capped() {
+        let big = "é".repeat(5000);
+        let xml = format!("<d><di:name>{big}</di:name><di:description>{big}</di:description></d>");
+        let (t, d, _) = parse_bdmt_xml(&xml).expect("parse");
+        assert!(t.len() <= MAX_BDMT_TEXT && !t.is_empty());
+        assert!(d.expect("desc").len() <= MAX_BDMT_TEXT);
+    }
 
     #[test]
     fn extract_simple_title() {
