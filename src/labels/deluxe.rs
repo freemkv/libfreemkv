@@ -1149,6 +1149,7 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
         let mut lang_ord: Option<u16> = None;
         let mut purpose_ord: Option<u16> = None;
         let mut coding_type: Option<String> = None;
+        let mut slot: Option<CodingSlot> = None;
         let mut stream_idx_hint: Option<i32> = None;
         for arg in &c.args {
             match arg {
@@ -1157,8 +1158,11 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
                     "Purpose" => purpose_ord = purpose_ord.or(Some(*ordinal)),
                     _ => {}
                 },
-                StackVal::CodingType(name) if is_audio_coding_type(name) => {
-                    coding_type = coding_type.or_else(|| Some(name.clone()));
+                StackVal::CodingType(name) if slot.is_none() => {
+                    slot = coding_slot(name);
+                    if slot == Some(CodingSlot::Audio) {
+                        coding_type = Some(name.clone());
+                    }
                 }
                 StackVal::Int(n) => {
                     stream_idx_hint = stream_idx_hint.or(Some(*n));
@@ -1167,11 +1171,15 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
             }
         }
 
+        // Interactive graphics / video: numbered in neither the audio nor the PG list.
+        if slot == Some(CodingSlot::NoSlot) {
+            continue;
+        }
         let Some(lang_ord) = lang_ord else {
             // A recognisable stream binding still occupies its STN slot and must
             // advance the counter, or renumbering skews every surviving label.
             // `saturating_add` is safe here since no label is produced.
-            match slot_kind(c, coding_type.is_some(), &slot_kinds) {
+            match slot_kind(c, slot, &slot_kinds) {
                 Some(StreamLabelType::Audio) => audio_idx = audio_idx.saturating_add(1),
                 Some(StreamLabelType::Subtitle) => sub_idx = sub_idx.saturating_add(1),
                 // Not a stream binding (`new StringBuilder` and friends in the
@@ -1266,20 +1274,20 @@ fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabe
     let mut kinds: HashMap<&str, Option<StreamLabelType>> = HashMap::new();
     for c in constructions {
         let mut has_lang = false;
-        let mut has_coding = false;
+        let mut slot = None;
         for arg in &c.args {
             match arg {
                 StackVal::EnumRef {
                     kind: "Language", ..
                 } => has_lang = true,
-                StackVal::CodingType(n) if is_audio_coding_type(n) => has_coding = true,
+                StackVal::CodingType(n) if slot.is_none() => slot = coding_slot(n),
                 _ => {}
             }
         }
-        if !has_lang {
+        if !has_lang || slot == Some(CodingSlot::NoSlot) {
             continue;
         }
-        let kind = if has_coding {
+        let kind = if slot == Some(CodingSlot::Audio) {
             StreamLabelType::Audio
         } else {
             StreamLabelType::Subtitle
@@ -1297,26 +1305,39 @@ fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabe
 }
 
 // The stream list an unresolved construction occupies a slot in, or None if
-// not a stream binding. A CodingType arg is decisive (only audio gets one);
-// otherwise falls back to what the binding type's resolved siblings showed.
+// not a stream binding. A recognised CodingType arg is decisive; otherwise
+// falls back to what the binding type's resolved siblings showed.
 fn slot_kind(
     c: &Construction,
-    has_coding_type: bool,
+    slot: Option<CodingSlot>,
     slot_kinds: &HashMap<&str, Option<StreamLabelType>>,
 ) -> Option<StreamLabelType> {
-    if has_coding_type {
-        return Some(StreamLabelType::Audio);
+    match slot {
+        Some(CodingSlot::Audio) => Some(StreamLabelType::Audio),
+        Some(CodingSlot::Subtitle) => Some(StreamLabelType::Subtitle),
+        Some(CodingSlot::NoSlot) => None,
+        None => slot_kinds.get(c.binding_type.as_str()).copied().flatten(),
     }
-    slot_kinds.get(c.binding_type.as_str()).copied().flatten()
 }
 
-// False for CodingType constants that are not audio (subtitle/graphics/video streams):
-// only audio bindings occupy an audio STN slot.
-fn is_audio_coding_type(name: &str) -> bool {
-    !matches!(
-        name,
-        "PRESENTATION_GRAPHICS" | "INTERACTIVE_GRAPHICS" | "TEXT_SUBTITLE"
-    ) && !name.ends_with("_VIDEO")
+/// STN list a BD-J `CodingType` stream is numbered in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodingSlot {
+    Audio,
+    Subtitle,
+    /// Interactive graphics or video: no audio or PG slot.
+    NoSlot,
+}
+
+// Classifies an org.bluray.ti.CodingType field name; None for an unrecognised one.
+fn coding_slot(name: &str) -> Option<CodingSlot> {
+    match name {
+        "PRESENTATION_GRAPHICS" | "TEXT_SUBTITLE" => Some(CodingSlot::Subtitle),
+        "INTERACTIVE_GRAPHICS" => Some(CodingSlot::NoSlot),
+        n if n.ends_with("_VIDEO") => Some(CodingSlot::NoSlot),
+        n if n.ends_with("_AUDIO") || n.contains("_AUDIO_") => Some(CodingSlot::Audio),
+        _ => None,
+    }
 }
 
 // Maps an org.bluray.ti.CodingType field name (from getstatic operands on
@@ -3348,6 +3369,44 @@ mod tests {
         assert_eq!(
             (out[1].stream_type, out[1].stream_number),
             (StreamLabelType::Audio, 1)
+        );
+    }
+
+    // Interactive-graphics and video bindings have no audio or PG STN slot: with or
+    // without a resolved language they must not shift later subtitle numbers.
+    #[test]
+    fn interactive_graphics_and_video_bindings_take_no_subtitle_slot() {
+        let master = lang_enum_master();
+        let mk = |ct: &str, lang: Option<u16>| Construction {
+            binding_type: "x".into(),
+            args: vec![
+                lang.map_or(StackVal::Unknown, |ordinal| StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal,
+                }),
+                StackVal::CodingType(ct.into()),
+            ],
+        };
+        let out = interpret_streams(
+            &[
+                mk("INTERACTIVE_GRAPHICS", Some(2)),
+                mk("PRESENTATION_GRAPHICS", Some(0)),
+                mk("MPEG4_AVC_VIDEO", Some(2)),
+                mk("INTERACTIVE_GRAPHICS", None),
+                mk("TEXT_SUBTITLE", Some(1)),
+            ],
+            &master,
+        );
+        let got: Vec<_> = out
+            .iter()
+            .map(|l| (l.stream_type, l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (StreamLabelType::Subtitle, "eng", 1),
+                (StreamLabelType::Subtitle, "fra", 2),
+            ]
         );
     }
 
