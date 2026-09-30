@@ -115,7 +115,10 @@ fn collect_textfield(
         return;
     }
     if let Some(rest) = kind_n.strip_prefix("Audio") {
-        if let Ok(n) = rest.parse::<u16>() {
+        // Stream numbers are 1-based; 0 (NO_STN_SLOT) can never bind.
+        if let Ok(n) = rest.parse::<u16>()
+            && n > 0
+        {
             retain_label(audios, n, label);
         }
     } else if let Some(rest) = kind_n.strip_prefix("Subtitle")
@@ -464,5 +467,14 @@ mod tests {
         let l = make_label(1, "English RNIB".into(), StreamLabelType::Subtitle);
         assert_eq!(l.language, "eng");
         assert_eq!(l.qualifier, LabelQualifier::DescriptiveService);
+    }
+
+    #[test]
+    fn audio_zero_is_not_retained() {
+        let (mut a, mut s) = (BTreeMap::new(), BTreeMap::new());
+        collect_textfield("xTextField,Audio0,English,y", &mut a, &mut s);
+        assert!(a.is_empty(), "Audio0 is NO_STN_SLOT and can never bind");
+        collect_textfield("xTextField,Audio1,English,y", &mut a, &mut s);
+        assert_eq!(a.len(), 1);
     }
 }

@@ -7,9 +7,10 @@
 //! matches each enum's `<clinit>` shape rather than class names.
 
 use super::class_reader::{
-    AASTORE, ANEWARRAY, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC,
-    ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, INVOKESPECIAL, LDC,
-    LDC_W, NEW, NEWARRAY, PUTSTATIC, SIPUSH,
+    ACONST_NULL, ANEWARRAY, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, DCONST_1, DUP,
+    GETSTATIC, GOTO, IASTORE, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5,
+    ICONST_M1, INVOKEINTERFACE, INVOKESPECIAL, INVOKESTATIC, INVOKEVIRTUAL, LDC, LDC_W, LDC2_W,
+    NEW, NEWARRAY, POP, POP2, PUTFIELD, PUTSTATIC, RETURN, SASTORE, SIPUSH,
 };
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, jar, vocab};
 use crate::sector::SectorSource;
@@ -288,6 +289,8 @@ struct CandidatePool {
     /// resolve a different master enum on a second run and emit different
     /// labels for unchanged input.
     by_class: BTreeMap<String, Vec<String>>,
+    /// `putstatic` field names of fingerprint-matching classes (Phase D's ordinals).
+    fields: HashMap<String, Vec<String>>,
     /// Retained bytes: class names plus every retained string.
     bytes: usize,
 }
@@ -308,6 +311,15 @@ impl CandidatePool {
         self.by_class.insert(class_name.to_string(), ldcs);
         true
     }
+
+    /// Retain `fields` for an already-inserted class, within the byte budget.
+    fn insert_fields(&mut self, class_name: &str, fields: Vec<String>) {
+        let cost = fields.iter().map(String::len).sum::<usize>();
+        if self.bytes.saturating_add(cost) <= MAX_CANDIDATE_TOTAL_BYTES {
+            self.bytes += cost;
+            self.fields.insert(class_name.to_string(), fields);
+        }
+    }
 }
 
 /// Phase A. Walk every `.class` in `archive`, identify the master
@@ -326,7 +338,15 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
             return;
         }
         let key = class.this_class_name().unwrap_or(zip_name);
-        if !pool.insert(key, ldcs) {
+        let matches_fp = FINGERPRINTS.iter().any(|fp| {
+            ldcs_match_prefix(&ldcs, fp.prefix)
+                && ldcs.len().abs_diff(fp.expected_count) <= fp.count_tolerance
+        });
+        if pool.insert(key, ldcs) {
+            if matches_fp {
+                pool.insert_fields(key, clinit_enum_field_names(class));
+            }
+        } else {
             tracing::debug!(
                 class = ?key,
                 classes = pool.by_class.len(),
@@ -336,6 +356,7 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
         }
     });
     let candidates = pool.by_class;
+    let mut fields_by_class = pool.fields;
 
     // Second pass: match each fingerprint against the candidate pool.
     let mut out = Vec::new();
@@ -366,18 +387,6 @@ fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnu
     if out.is_empty() {
         return Vec::new();
     }
-
-    // Second pass: capture obfuscated `putstatic` field names for matched
-    // classes so Phase D can resolve `getstatic <enum>.<field>` to an ordinal.
-    // Targeted re-walk of only the matched classes, not the whole jar again.
-    let want: HashSet<&str> = out.iter().map(|(_, name, _)| name.as_str()).collect();
-    let mut fields_by_class: HashMap<String, Vec<String>> = HashMap::new();
-    jar::for_each_class(archive, |zip_name, class| {
-        let iname = class.this_class_name().unwrap_or(zip_name);
-        if want.contains(iname) && !fields_by_class.contains_key(iname) {
-            fields_by_class.insert(iname.to_string(), clinit_enum_field_names(class));
-        }
-    });
 
     out.into_iter()
         .map(|(label, class_name, values)| {
@@ -717,6 +726,10 @@ impl<'a> BindingDecoder<'a> {
                     self.push(StackVal::Unknown);
                 }
             }
+            // aconst_null, l/f/dconst_*, ldc2_w: one symbolic slot, opaque value.
+            // (iconst_* arms above take 0x02..=0x08 first.)
+            ACONST_NULL..=DCONST_1 => self.push(StackVal::Unknown),
+            LDC2_W => self.push(StackVal::Unknown),
             // ldc/ldc_w: push Int when the operand is an Integer
             // constant; otherwise push Unknown (we don't care about
             // Strings here — labels come via getstatic, not ldc).
@@ -742,7 +755,7 @@ impl<'a> BindingDecoder<'a> {
                 self.push(StackVal::NewObj(class_name));
             }
             // dup — duplicate top of stack.
-            0x59 /* dup */ => {
+            DUP => {
                 if let Some(top) = self.stack.last().cloned() {
                     self.push(top);
                 }
@@ -774,7 +787,9 @@ impl<'a> BindingDecoder<'a> {
             // earlier `new X / dup`), emit a Construction.
             INVOKESPECIAL => {
                 let Some(idx) = insn.cp_index() else { return };
-                let Some(member) = self.pool.member_ref(idx) else { return };
+                let Some(member) = self.pool.member_ref(idx) else {
+                    return;
+                };
                 let arg_count = parse_method_arg_count(member.descriptor);
                 // A per-stream binding ctor takes only scalars/enum refs, never an
                 // array; a ctor with an array param is a container/title wrapper and
@@ -786,34 +801,39 @@ impl<'a> BindingDecoder<'a> {
                     self.stack.clear();
                     return;
                 }
-                let args: Vec<StackVal> = self
-                    .stack
-                    .split_off(self.stack.len() - arg_count);
+                let args: Vec<StackVal> = self.stack.split_off(self.stack.len() - arg_count);
                 // Underneath the args: the object the constructor
                 // operates on. For our pattern it's NewObj(X).
                 let receiver = self.stack.pop().unwrap_or(StackVal::Unknown);
                 if let StackVal::NewObj(name) = receiver
                     && name == member.class_name
-                    && !is_container {
-                        // Bounded by MAX_CONSTRUCTIONS: an unbounded push here
-                        // is ~1 GiB reachable from a crafted `<clinit>`.
-                        if self.constructions.len() >= MAX_CONSTRUCTIONS {
-                            return;
-                        }
-                        self.constructions.push(Construction {
-                            binding_type: name,
-                            args,
-                        });
+                    && !is_container
+                {
+                    // Bounded by MAX_CONSTRUCTIONS: an unbounded push here
+                    // is ~1 GiB reachable from a crafted `<clinit>`.
+                    if self.constructions.len() >= MAX_CONSTRUCTIONS {
+                        return;
                     }
+                    self.constructions.push(Construction {
+                        binding_type: name,
+                        args,
+                    });
+                }
             }
             // invokevirtual / invokestatic / invokeinterface — pop
             // args per descriptor, push a return placeholder unless
             // descriptor returns V (void).
-            0xB6 /* invokevirtual */ | 0xB8 /* invokestatic */ | 0xB9 /* invokeinterface */ => {
+            INVOKEVIRTUAL | INVOKESTATIC | INVOKEINTERFACE => {
                 let Some(idx) = insn.cp_index() else { return };
-                let Some(member) = self.pool.member_ref(idx) else { return };
+                let Some(member) = self.pool.member_ref(idx) else {
+                    return;
+                };
                 let arg_count = parse_method_arg_count(member.descriptor);
-                let extra = if insn.opcode == 0xB6 || insn.opcode == 0xB9 { 1 } else { 0 };
+                let extra = if insn.opcode == INVOKEVIRTUAL || insn.opcode == INVOKEINTERFACE {
+                    1
+                } else {
+                    0
+                };
                 let to_pop = arg_count + extra;
                 if self.stack.len() < to_pop {
                     self.stack.clear();
@@ -826,10 +846,10 @@ impl<'a> BindingDecoder<'a> {
                 }
             }
             // pop / pop2 — drop stack values.
-            0x57 /* pop */ => {
+            POP => {
                 self.stack.pop();
             }
-            0x58 /* pop2 */ => {
+            POP2 => {
                 self.stack.pop();
                 self.stack.pop();
             }
@@ -840,24 +860,24 @@ impl<'a> BindingDecoder<'a> {
                 self.stack.pop();
                 self.push(StackVal::Unknown);
             }
-            // aastore — array store consumes 3 slots (arrayref, index, value).
-            AASTORE => {
+            // i/l/f/d/a/b/c/sastore — array store consumes 3 slots (arrayref, index, value).
+            IASTORE..=SASTORE => {
                 for _ in 0..3 {
                     self.stack.pop();
                 }
             }
             // putstatic / putfield — drop 1 (putstatic) or 2 (putfield).
-            0xB3 /* putstatic */ => {
+            PUTSTATIC => {
                 self.stack.pop();
             }
-            0xB5 /* putfield */ => {
+            PUTFIELD => {
                 self.stack.pop();
                 self.stack.pop();
             }
             // Branches/returns/unhandled — clear stack as a conservative resync.
             // Binding `<clinit>` is straight-line code in practice, so these
             // are rarely hit on the verified pattern.
-            0xA7 /* goto */ | 0xB1 /* return */ => {
+            GOTO | RETURN => {
                 self.stack.clear();
             }
             _ => {
@@ -989,7 +1009,7 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
                     "Purpose" => purpose_ord = purpose_ord.or(Some(*ordinal)),
                     _ => {}
                 },
-                StackVal::CodingType(name) => {
+                StackVal::CodingType(name) if is_audio_coding_type(name) => {
                     coding_type = coding_type.or_else(|| Some(name.clone()));
                 }
                 StackVal::Int(n) => {
@@ -1104,7 +1124,7 @@ fn slot_kinds(constructions: &[Construction]) -> HashMap<&str, Option<StreamLabe
                 StackVal::EnumRef {
                     kind: "Language", ..
                 } => has_lang = true,
-                StackVal::CodingType(_) => has_coding = true,
+                StackVal::CodingType(n) if is_audio_coding_type(n) => has_coding = true,
                 _ => {}
             }
         }
@@ -1142,6 +1162,15 @@ fn slot_kind(
     slot_kinds.get(c.binding_type.as_str()).copied().flatten()
 }
 
+// False for CodingType constants that are not audio (subtitle/graphics/video streams):
+// only audio bindings occupy an audio STN slot.
+fn is_audio_coding_type(name: &str) -> bool {
+    !matches!(
+        name,
+        "PRESENTATION_GRAPHICS" | "INTERACTIVE_GRAPHICS" | "TEXT_SUBTITLE"
+    ) && !name.ends_with("_VIDEO")
+}
+
 // Maps an org.bluray.ti.CodingType field name (from getstatic operands on
 // Deluxe binding classes) to a human-readable codec hint. Unknown field
 // names pass through unchanged so unfamiliar codecs still surface something.
@@ -1149,7 +1178,7 @@ fn coding_type_to_codec_hint(field: &str) -> &str {
     match field {
         // Lossless / hi-res.
         "DOLBY_LOSSLESS_AUDIO" => "Dolby TrueHD",
-        "DTS_HD_LOSSLESS_AUDIO" | "DTS_HD_MA_AUDIO" => "DTS-HD Master Audio",
+        "DTS_HD_AUDIO_XLL" => "DTS-HD Master Audio",
         "LPCM_AUDIO" => "LPCM",
         // Dolby family.
         "DOLBY_AC3_AUDIO" => "Dolby Digital",
@@ -1157,12 +1186,9 @@ fn coding_type_to_codec_hint(field: &str) -> &str {
         "DOLBY_ATMOS_AUDIO" => "Dolby Atmos",
         // DTS family.
         "DTS_AUDIO" => "DTS",
-        "DTS_HD_AUDIO" | "DTS_HD_HR_AUDIO" => "DTS-HD HR",
-        // MPEG family.
-        "MPEG1_AUDIO_LAYER2" | "MPEG2_AUDIO_LAYER2" => "MPEG Audio",
-        // PG-style subtitle codecs (rare to see in Deluxe bindings;
-        // subtitles usually have NO CodingType arg).
-        "PG_STREAM" | "PRESENTATION_GRAPHICS_STREAM" => "PGS",
+        "DTS_HD_AUDIO" => "DTS-HD",
+        "DTS_HD_AUDIO_EXCEPT_XLL" => "DTS-HD HR",
+        "DTS_HD_AUDIO_LBR" => "DTS Express",
         // Unknown / future — pass through verbatim so the operator
         // can see what the disc actually authored.
         _ => field,
@@ -2798,10 +2824,32 @@ mod tests {
         );
         assert_eq!(coding_type_to_codec_hint("DTS_AUDIO"), "DTS");
         assert_eq!(
-            coding_type_to_codec_hint("DTS_HD_MA_AUDIO"),
+            coding_type_to_codec_hint("DTS_HD_AUDIO_XLL"),
             "DTS-HD Master Audio"
         );
         assert_eq!(coding_type_to_codec_hint("LPCM_AUDIO"), "LPCM");
+    }
+
+    #[test]
+    fn graphics_coding_type_binding_is_not_audio() {
+        let master = lang_enum_master();
+        let mk = |ct: &str| Construction {
+            binding_type: "x".into(),
+            args: vec![
+                StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal: 0,
+                },
+                StackVal::CodingType(ct.into()),
+            ],
+        };
+        let out = interpret_streams(&[mk("PRESENTATION_GRAPHICS"), mk("DTS_AUDIO")], &master);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(
+            (out[1].stream_type, out[1].stream_number),
+            (StreamLabelType::Audio, 1)
+        );
     }
 
     #[test]
@@ -2916,6 +2964,11 @@ mod tests {
             !constructions.is_empty(),
             "tl.<clinit> must yield per-stream constructions"
         );
+        // Every `np` audio binding (21) and `wb` subtitle binding (46) must survive
+        // the long-constant / array-store stack modelling.
+        let count = |t: &str| constructions.iter().filter(|c| c.binding_type == t).count();
+        let (np, wb) = (count("np"), count("wb"));
+        assert_eq!((np, wb), (21, 46), "np/wb constructions recovered");
         // The title-wrapper `oq` takes array parameters and must be filtered:
         // every retained construction is a scalar/enum-only binding.
         // (np = 4 args incl. CodingType; wb = 4-5 args incl. `mi`.)

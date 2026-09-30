@@ -8,9 +8,8 @@
 //! No external deps beyond `std`. No `unsafe`. No panics on malformed input — every parse fault
 //! is a typed [`Error`].
 
-// Foundation module — public API is staged for `labels::deluxe` (bytecode
-// walker) and `labels::dbp`'s refactor onto the constant-pool iterator.
-// The dead-code allow comes off once those callers land.
+// The reader models the class format fully (every cp tag, error payload, opcode), but
+// deluxe/dbp use only part of it, so unused items are expected.
 #![allow(dead_code)]
 
 const CLASS_MAGIC: u32 = 0xCAFEBABE;
@@ -437,8 +436,7 @@ fn read_constant_pool(r: &mut Reader<'_>) -> Result<ConstantPool> {
 }
 
 // Decode JVM "modified UTF-8" (JVMS §4.4.7): like UTF-8 but U+0000 is 0xC0 0x80, and
-// supplementary chars use a 3-byte-surrogate-pair encoding we don't bother handling — no label
-// string needs it.
+// supplementary chars are two 3-byte surrogate halves, combined here into one char.
 fn decode_modified_utf8(bytes: &[u8]) -> std::result::Result<String, ()> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
@@ -480,14 +478,20 @@ fn decode_modified_utf8(bytes: &[u8]) -> std::result::Result<String, ()> {
             }
             let cp =
                 (((b0 & 0x0F) as u32) << 12) | (((b1 & 0x3F) as u32) << 6) | ((b2 & 0x3F) as u32);
-            // Lone surrogates are valid in modified UTF-8 but invalid
-            // chars in Rust. For label data we'd never see one; treat
-            // as replacement char rather than error to stay robust.
-            match char::from_u32(cp) {
-                Some(c) => out.push(c),
-                None => out.push('\u{FFFD}'),
-            }
             i += 3;
+            // A high surrogate followed by a low one is one supplementary char.
+            if (0xD800..0xDC00).contains(&cp)
+                && let [0xED, b1 @ 0xB0..=0xBF, b2 @ 0x80..=0xBF, ..] = &bytes[i..]
+            {
+                let low = 0xD000 | (((b1 & 0x3F) as u32) << 6) | ((b2 & 0x3F) as u32);
+                if let Some(c) = char::from_u32(0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)) {
+                    out.push(c);
+                    i += 3;
+                    continue;
+                }
+            }
+            // A lone surrogate is invalid in Rust: replacement char, not an error.
+            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
         } else {
             // 4-byte or higher: not valid in modified UTF-8.
             return Err(());
@@ -547,7 +551,7 @@ pub struct Instruction<'a> {
 }
 
 impl Instruction<'_> {
-    /// Mnemonic for this opcode (e.g. "ldc", "invokespecial").
+    /// Mnemonic for the opcodes this reader models (e.g. "ldc"); "?" for others.
     pub fn name(&self) -> &'static str {
         opcode_name(self.opcode)
     }
@@ -709,6 +713,14 @@ pub const FSTORE: u8 = 0x38;
 pub const DSTORE: u8 = 0x39;
 pub const ASTORE: u8 = 0x3A;
 pub const AASTORE: u8 = 0x53;
+pub const IASTORE: u8 = 0x4F;
+pub const SASTORE: u8 = 0x56;
+pub const DCONST_1: u8 = 0x0F;
+pub const POP: u8 = 0x57;
+pub const POP2: u8 = 0x58;
+pub const DUP: u8 = 0x59;
+pub const GOTO: u8 = 0xA7;
+pub const RETURN: u8 = 0xB1;
 pub const IINC: u8 = 0x84;
 pub const RET: u8 = 0xA9;
 pub const TABLESWITCH: u8 = 0xAA;
@@ -1053,6 +1065,18 @@ mod tests {
     #[test]
     fn modified_utf8_rejects_raw_zero() {
         assert!(decode_modified_utf8(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn modified_utf8_combines_surrogate_pair() {
+        // U+1F600 = D83D DE00, each half as a 3-byte sequence.
+        let s = decode_modified_utf8(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]).unwrap();
+        assert_eq!(s, "\u{1F600}");
+        // A lone high surrogate still degrades to U+FFFD.
+        assert_eq!(
+            decode_modified_utf8(&[0xED, 0xA0, 0xBD]).unwrap(),
+            "\u{FFFD}"
+        );
     }
 
     #[test]

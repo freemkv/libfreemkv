@@ -17,6 +17,10 @@ use zip::ZipArchive;
 // so the buffer grows incrementally instead of pre-sizing.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 
+// Cap on total bytes inflated by one `.class` sweep: the per-entry cap alone lets a hostile jar
+// of high-ratio entries drive unbounded inflation.
+const MAX_SWEEP_BYTES: u64 = 128 * 1024 * 1024;
+
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
 /// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class`],
 /// etc.
@@ -52,7 +56,7 @@ where
 }
 
 fn is_jar(e: &crate::udf::DirEntry) -> bool {
-    !e.is_dir && e.name.to_lowercase().ends_with(".jar")
+    !e.is_dir && e.name.to_ascii_lowercase().ends_with(".jar")
 }
 
 /// A seekable byte source for a jar: in memory, or read from disc on demand.
@@ -346,8 +350,8 @@ pub fn try_each_class<R, F>(archive: &mut Jar, f: F) -> Option<R>
 where
     F: FnMut(&str, &ClassFile) -> Option<R>,
 {
-    let mut unbounded = u64::MAX;
-    try_each_class_budgeted(archive, &mut unbounded, f)
+    let mut budget = MAX_SWEEP_BYTES;
+    try_each_class_budgeted(archive, &mut budget, f)
 }
 
 /// [`try_each_class`] charging every inflated byte to `budget`; stops (None)
@@ -694,5 +698,29 @@ mod tests {
         });
         assert_eq!(visited, 2);
         assert_eq!(budget, 1_000_000 - payload.len() as u64);
+    }
+
+    // The unbudgeted-looking wrappers still bound a sweep: high-ratio deflate
+    // entries (each under the per-entry cap) stop being offered past the total cap.
+    #[test]
+    fn try_each_class_bounds_total_inflation() {
+        use std::io::Write as _;
+        let mut payload = MINIMAL_CLASS.to_vec();
+        payload.extend(std::iter::repeat_n(0u8, 50 * 1024 * 1024));
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for n in ["A.class", "B.class", "C.class"] {
+                w.start_file(n, opts).expect("start_file");
+                w.write_all(&payload).expect("write");
+            }
+            w.finish().expect("finish");
+        }
+        let mut jar = open(buf);
+        let mut visited = 0usize;
+        for_each_class(&mut jar, |_, _| visited += 1);
+        assert_eq!(visited, 2, "3 x 50 MiB exceeds the 128 MiB sweep cap");
     }
 }
