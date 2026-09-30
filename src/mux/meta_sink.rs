@@ -561,4 +561,110 @@ mod tests {
         assert_eq!(sample_rates(SampleRate::S48_192), vec![48_000, 192_000]);
         assert!(sample_rates(SampleRate::Unknown).is_empty());
     }
+
+    /// Two streams of each kind, interleaved: every per-kind cursor must advance,
+    /// or the second stream's fields land on the first's entry.
+    #[test]
+    fn json_per_kind_cursors_and_title_fields() {
+        use crate::disc::{
+            AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, DiscTitle,
+            FrameRate, HdrFormat, LabelPurpose, LabelQualifier, Resolution, SampleRate,
+            Stream as DiscStream, SubtitleStream, VideoStream,
+        };
+        let vid = |pid| {
+            DiscStream::Video(VideoStream {
+                pid,
+                codec: Codec::Hevc,
+                resolution: Resolution::R2160p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt2020,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })
+        };
+        let aud = |pid| {
+            DiscStream::Audio(AudioStream {
+                pid,
+                codec: Codec::Ac3,
+                channels: AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: String::new(),
+            })
+        };
+        let sub = |pid| {
+            DiscStream::Subtitle(SubtitleStream {
+                pid,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+                qualifier: LabelQualifier::None,
+                codec_data: None,
+            })
+        };
+        let mut t = DiscTitle::empty();
+        t.streams = vec![
+            aud(0x1100),
+            vid(0x1011),
+            aud(0x1101),
+            sub(0x1200),
+            sub(0x1201),
+            vid(0x1012),
+        ];
+        t.content_format = ContentFormat::BdTs;
+        t.playlist_id = 801;
+        t.clips = vec![Clip {
+            feed_span: None,
+            clip_id: "00007".into(),
+            in_time: 0,
+            out_time: 45_000,
+            duration_secs: 1.0,
+            source_packets: 42,
+        }];
+        let v = title_json(&t);
+        for (kind, pids) in [
+            ("video", [0x1011, 0x1012]),
+            ("audio", [0x1100, 0x1101]),
+            ("subtitles", [0x1200, 0x1201]),
+        ] {
+            assert_eq!(v[kind][0]["pid"], pids[0], "{kind}[0]");
+            assert_eq!(v[kind][1]["pid"], pids[1], "{kind}[1]");
+        }
+        assert_eq!(v["format"], "BdTs");
+        assert_eq!(v["playlist_id"], 801);
+        assert_eq!(v["clips"][0]["clip_id"], "00007");
+        assert_eq!(v["clips"][0]["source_packets"], 42);
+        assert_eq!(v["clips"][0]["duration_secs"], 1.0);
+    }
+
+    /// create() output read back: the extension selects the chapter format and
+    /// the JSON file holds the title document.
+    #[test]
+    fn chapters_and_json_create_write_readable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = DiscTitle::empty();
+        t.chapters = chaps();
+        t.playlist = "MAIN".into();
+        for (name, marker) in [
+            ("c.txt", "CHAPTER01="),
+            ("c.VTT", "WEBVTT"),
+            ("c.xml", "<Chapters>"),
+        ] {
+            let path = dir.path().join(name);
+            ChaptersSink::create(&path, &t).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains(marker), "{name}: {text}");
+        }
+        let path = dir.path().join("t.json");
+        JsonSink::create(&path, &t).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["playlist"], "MAIN");
+        assert_eq!(v["chapter_marks"][1]["n"], 2);
+    }
 }
