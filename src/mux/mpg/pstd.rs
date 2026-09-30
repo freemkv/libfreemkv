@@ -19,10 +19,13 @@ const LEAD27: u64 = HZ27 * 95 / 100;
 pub(crate) const MAX_PTS_GAP_TICKS: u64 = 63_000;
 /// MS-17: SCR fields in successive packs ≤ 0.7 s apart.
 pub(crate) const MAX_SCR_GAP27: u64 = HZ27 * 7 / 10;
-/// Widest timestamp gap bridged with padding packs; a wider one is re-based away.
-const MAX_PAD_GAP27: u64 = 5 * HZ27;
-/// Padding allowed beyond twice the input bytes pushed, so amplification stays bounded.
+/// Widest timestamp gap bridged with padding packs; a wider one is re-based away. Above
+/// the longest finite DVD cell still (254 s), so real stills keep their timing.
+const MAX_PAD_GAP27: u64 = 300 * HZ27;
+/// Padding allowed beyond `PAD_RATIO` × the input bytes pushed, so amplification stays
+/// bounded while sparse low-bitrate stills are still padded.
 const PAD_FLOOR_BYTES: u64 = 256 * 1024;
+const PAD_RATIO: u64 = 16;
 /// Per-track lookahead before the clock may pass `t` (design §2.4 step 1).
 const LOOKAHEAD27: u64 = HZ27;
 /// Max-interleave cap: a track this far behind the others is treated as sparse.
@@ -718,9 +721,12 @@ impl<W: Write> Mux<W> {
                 continue;
             };
             match self.last_scr {
+                // A wake within the lead may be a written AU's removal, which no re-base
+                // moves: pad it (one pack), so the loop always progresses.
                 Some(last)
                     if next.saturating_sub(last) > MAX_PAD_GAP27
-                        || self.pad_over_budget(next, last) =>
+                        || (next.saturating_sub(last) > LEAD27
+                            && self.pad_over_budget(next, last)) =>
                 {
                     self.rebase(last, next);
                 }
@@ -734,17 +740,17 @@ impl<W: Write> Mux<W> {
         }
     }
 
-    // Padding written stays within a floor plus twice the input, whatever the gaps.
+    // Padding written stays within a floor plus `PAD_RATIO` × the input, whatever the gaps.
     fn pad_over_budget(&self, next: u64, last: u64) -> bool {
         let packs = next.saturating_sub(last) / MAX_SCR_GAP27;
         (self.counters.padding_packs + packs) * pack::PACK_BYTES as u64
-            > PAD_FLOOR_BYTES + 2 * self.pushed_bytes
+            > PAD_FLOOR_BYTES + PAD_RATIO * self.pushed_bytes
     }
 
-    // Every stream is quiet until `next`: shift all timestamps back so it lands one SCR
-    // step after `last`. All streams move together, so their sync is kept.
+    // Every stream is quiet until `next`: shift queued timestamps back so it lands within
+    // one SCR step of `last` (rounded up). Written AUs keep their decoding times.
     fn rebase(&mut self, last: u64, next: u64) {
-        let d90 = (next - last - MAX_SCR_GAP27) / 300;
+        let d90 = next.saturating_sub(last + MAX_SCR_GAP27).div_ceil(300);
         let d27 = d90 * 300;
         if d27 == 0 {
             self.t = Some(next);
@@ -760,9 +766,6 @@ impl<W: Write> Mux<W> {
                 q.au.pts = q.au.pts.saturating_sub(d90);
                 q.au.dts = q.au.dts.map(|d| d.saturating_sub(d90));
             }
-        }
-        for e in &mut self.entries {
-            e.dec27 = e.dec27.saturating_sub(d27);
         }
         self.t = Some(next - d27);
     }
@@ -881,6 +884,112 @@ mod tests {
         m.finish().unwrap();
         let out = m.into_writer();
         assert!(out.len() < 8 << 20, "{}", out.len());
+    }
+
+    // Video-only stills 10 s apart are real content: padded to full length, never re-based.
+    #[test]
+    fn ten_second_video_stills_keep_their_timing() {
+        let mut m = video_mux();
+        for k in 0..20u64 {
+            m.push(0, au(90_000 + k * 900_000, 8_000, 0));
+        }
+        m.finish().unwrap();
+        let c = m.counters();
+        assert_eq!(c.rebased_gaps, 0);
+        assert!(c.padding_packs >= 19 * 14, "{}", c.padding_packs);
+        let s = scrs(&m.into_writer());
+        assert!(s.iter().max().copied().unwrap_or(0) >= 190 * HZ27);
+    }
+
+    // Many gaps under the re-base threshold: the padding budget alone bounds the output.
+    #[test]
+    fn many_sub_threshold_gaps_stay_within_the_padding_budget() {
+        let mut m = video_mux();
+        for k in 0..100u64 {
+            m.push(0, au(9_000 + k * 60 * 90_000, 10, 0));
+        }
+        m.finish().unwrap();
+        let c = m.counters();
+        assert!(c.rebased_gaps > 0);
+        assert!(c.padding_packs * 2_048 <= PAD_FLOOR_BYTES + PAD_RATIO * 1_000);
+    }
+
+    // Over budget, a wait on a written AU's removal is padded, not re-based: no re-base
+    // can move that removal, so re-basing it would loop forever.
+    #[test]
+    fn an_over_budget_removal_wait_still_progresses() {
+        let d = 100 * HZ27;
+        let mut m = video_mux();
+        m.first = None;
+        m.entries.push(Entry {
+            stream: 0,
+            id: u64::MAX,
+            dec27: d,
+            bytes: 232 * 1_024,
+            complete: true,
+        });
+        m.last_scr = Some(d - HZ27 * 8 / 10);
+        m.t = m.last_scr;
+        m.counters.padding_packs = 1 << 20;
+        m.push(0, au(d / 300 + 3_600, 1_000, 0));
+        m.finish().unwrap();
+        assert!(scrs(&m.into_writer()).iter().all(|&s| s <= d + HZ27));
+    }
+
+    // A re-base lands the next SCR at most 0.7 s after the last one (MS-17), whatever
+    // the alignment of the last SCR.
+    #[test]
+    fn a_rebase_never_steps_scr_past_the_limit() {
+        for len in (100..4_000).step_by(37) {
+            let mut m = video_mux();
+            m.push(0, au(9_000, len, 0));
+            m.push(0, au(9_000 + 2 * 3_600 * 90_000, 100, 0));
+            m.finish().unwrap();
+            let s = scrs(&m.into_writer());
+            let step = s.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+            assert!(step <= MAX_SCR_GAP27, "len {len}: step {step}");
+        }
+    }
+
+    // AUs already written keep their decoding times: a re-base must not let the next AU
+    // into a buffer they still occupy (MS-16).
+    #[test]
+    fn a_rebase_keeps_written_aus_in_the_buffer() {
+        let size = 232 * 1_024;
+        let mut m = video_mux();
+        m.push(0, au(90_000, 200_000, 0));
+        m.push(0, au(90_000 + 2 * 3_600 * 90_000, 200_000, 0));
+        m.finish().unwrap();
+        assert_eq!(m.counters().rebased_gaps, 1);
+        let out = m.into_writer();
+        let (mut sent, mut a_dec) = (0usize, None);
+        for p in out
+            .chunks(pack::PACK_BYTES)
+            .filter(|p| p.len() == pack::PACK_BYTES)
+        {
+            let scr = scrs(p)[0];
+            let at = pack::PACK_HEADER_BYTES + usize::from(p[13] & 7);
+            if p[at + 3] != 0xE0 {
+                continue;
+            }
+            let len = usize::from(u16::from_be_bytes([p[at + 4], p[at + 5]]));
+            if a_dec.is_none() && p[at + 7] & 0x80 != 0 {
+                let t = &p[at + 9..];
+                let pts = (u64::from(t[0]) >> 1 & 7) << 30
+                    | u64::from(t[1]) << 22
+                    | (u64::from(t[2]) >> 1) << 15
+                    | u64::from(t[3]) << 7
+                    | u64::from(t[4]) >> 1;
+                a_dec = Some(pts * 300);
+            }
+            sent += len - 3 - usize::from(p[at + 8]);
+            if a_dec.is_some_and(|d| scr < d) {
+                assert!(
+                    sent <= size,
+                    "{sent} bytes in a {size}-byte buffer at {scr}"
+                );
+            }
+        }
     }
 
     // Nit (r2): the forced EOF pass that lifts the 0.95 s lead is counted, not silent.
