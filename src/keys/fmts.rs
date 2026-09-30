@@ -539,6 +539,41 @@ mod probe_tests {
             "a faulting first segment must not block resolving from the next same-index one"
         );
     }
+
+    // A READABLE but unclean same-index segment (wrong-key signature) must not
+    // stop the probe: a later same-index segment can still anchor the phase.
+    #[test]
+    fn probe_index_phase_falls_through_unclean_segment_to_next() {
+        use crate::decrypt::Phase;
+        let mut unclean = a_segment(1);
+        unclean.start_spn = 1;
+        let segs = vec![unclean, a_segment(1)];
+        let key = [0x55u8; 16];
+        let clean = encrypted_clean_unit(&key);
+        let other = encrypted_clean_unit(&[0x66u8; 16]); // decrypts to junk under `key`
+        let got = super::probe_index_phase(
+            &segs,
+            1,
+            8,
+            16,
+            ContentFormat::BdTs,
+            &key,
+            |seg, unit| {
+                if seg.start_spn == 1 {
+                    Some(other.clone())
+                } else if unit % 2 == 0 {
+                    Some(clean.clone())
+                } else {
+                    Some(vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN])
+                }
+            },
+        );
+        assert_eq!(
+            got,
+            super::IndexProbe::Phase(Phase::Even),
+            "an unclean first segment must not end the probe as WrongKey"
+        );
+    }
 }
 
 #[cfg(test)]
