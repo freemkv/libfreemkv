@@ -100,6 +100,8 @@ impl Disc {
         let parsed = match mpls::parse(data) {
             Ok(p) => p,
             Err(e) => {
+                // Real code, matching the CLPI path: a malformed playlist is
+                // dropped, but never silently.
                 tracing::warn!(target: "freemkv::disc", playlist = ?filename, "E{}", e.code());
                 return Ok(None);
             }
@@ -781,11 +783,16 @@ mod tests {
         let mut disc = MemDisc::new();
         let udf = make_min_fs(&mut disc);
         let junk = vec![0u8; 100];
-        assert!(
-            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &junk)
-                .expect("scan")
-                .is_none()
-        );
+        let (t, events) = crate::testlog::capture(|| {
+            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &junk).expect("scan")
+        });
+        assert!(t.is_none());
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc")
+            .unwrap_or_else(|| panic!("a dropped playlist must be logged; got {events:?}"));
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(line.message(), format!("E{}", crate::error::E_MPLS_PARSE));
     }
 
     /// Build the minimal fixture: an empty `BDMV/` directory (no STREAM,
