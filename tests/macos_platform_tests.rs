@@ -76,6 +76,13 @@ fn writeback_file_create_with_size_hint_preallocates() {
         4096,
         "reported length should equal bytes written"
     );
+    // F_PREALLOCATE reserves the hint's extents (st_blocks is in 512-byte units); the
+    // call is best-effort in production, so only this check observes it.
+    let allocated = std::os::unix::fs::MetadataExt::blocks(&meta) * 512;
+    assert!(
+        allocated >= hint,
+        "hint not preallocated: {allocated} bytes"
+    );
 }
 
 #[test]
