@@ -171,3 +171,19 @@ fn fixture_dir_removed_when_build_panics() {
         .expect("dir");
     assert!(!dir.exists(), "fixture dir leaked: {}", dir.display());
 }
+
+#[test]
+fn encrypted_bd_image_pads_a_partial_final_unit() {
+    let inf = unit_key_ro(AacsVersion::V10, &[[0u8; 16]; 1], &[1]);
+    let img = encrypted_bd_image(&[BdFile::new("BDMV/STREAM/00001.m2ts", 7, Some(K1))], &inf);
+    let (start, sectors) = img.files[0];
+    assert_eq!(sectors, 9, "7 sectors round up to 3 whole units");
+    for u in 0..3 {
+        let lba = start + u * 3;
+        assert!(
+            aacs_unit_encrypted(&unit(&img.image, lba), ContentFormat::BdTs),
+            "unit {u}"
+        );
+        assert_ne!(unit(&img.image, lba), unit(&img.plain, lba), "unit {u}");
+    }
+}

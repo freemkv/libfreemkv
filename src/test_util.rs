@@ -121,8 +121,8 @@ impl AacsStateBuilder {
 }
 
 /// One stream file of an [`encrypted_bd_image`]: its path under the image root
-/// (e.g. `"BDMV/STREAM/00001.m2ts"`), its length in sectors (a multiple of 3 for
-/// whole aligned units), and the CPS unit key its units are encrypted with
+/// (e.g. `"BDMV/STREAM/00001.m2ts"`), its length in sectors (rounded up to a whole
+/// number of aligned units, the tail padded), and the CPS unit key its units are encrypted with
 /// (`None`: clear content, every Copy_permission_indicator `00₂`).
 #[derive(Debug, Clone)]
 pub struct BdFile {
@@ -203,10 +203,13 @@ pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
     let dir = FixtureDir(fixture_dir());
     let root = dir.0.clone();
     write(&root.join("AACS/Unit_Key_RO.inf"), uk_ro);
+    let unit_sectors = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
     for f in files {
+        // A partial final unit is padded out to a whole aligned unit.
+        let sectors = f.sectors.div_ceil(unit_sectors) * unit_sectors;
         write(
             &root.join(&f.path),
-            &vec![0u8; f.sectors as usize * SECTOR_BYTES],
+            &vec![0u8; sectors as usize * SECTOR_BYTES],
         );
     }
     let mut img = crate::DirImage::open(&root).expect("fixture DirImage");
@@ -229,9 +232,8 @@ pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
     drop(img);
     drop(dir);
     let mut plain = image.clone();
-    let unit_sectors = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
     for (f, &(start, sectors)) in files.iter().zip(&extents) {
-        assert_eq!(sectors % unit_sectors, 0, "{}: whole aligned units", f.path);
+        debug_assert_eq!(sectors % unit_sectors, 0, "{}: whole aligned units", f.path);
         for u in 0..sectors / unit_sectors {
             let lba = start + u * unit_sectors;
             let mut unit = content_unit(lba, f.key.is_some());
