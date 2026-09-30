@@ -1476,4 +1476,28 @@ mod tests {
             );
         }
     }
+
+    // An attacker-sized EBML length must not size an allocation: a huge claim against a
+    // 4-byte source is a clean MkvSourceInvalid (usize::MAX would overflow any up-front buffer).
+    #[test]
+    fn read_binary_val_huge_declared_len_is_source_invalid() {
+        for len in [1usize << 40, usize::MAX] {
+            let e = read_binary_val(&mut Cursor::new(&[1u8, 2, 3, 4]), len).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&e),
+                Some(crate::error::E_MKV_SOURCE_INVALID),
+                "{len}"
+            );
+        }
+    }
+
+    // Invalid UTF-8 in an untrusted string element is MkvSourceInvalid, never lossy/panic.
+    #[test]
+    fn read_string_val_invalid_utf8_is_source_invalid() {
+        let e = read_string_val(&mut Cursor::new(&[0xFFu8, 0xFE]), 2).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some(crate::error::E_MKV_SOURCE_INVALID)
+        );
+    }
 }
