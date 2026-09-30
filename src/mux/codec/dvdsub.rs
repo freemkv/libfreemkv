@@ -648,25 +648,18 @@ mod tests {
 
     #[test]
     fn continuation_appends_bounded_by_max_spu() {
-        // A continuation must not push the buffer past MAX_SPU_BYTES. Declared a
-        // huge size so it never completes naturally, then flood continuations.
+        // Declared the largest size (0xFFFF), so the SPU completes exactly when the clamp
+        // fills the buffer: an unclamped append would emit a longer frame.
         let mut parser = DvdSubParser::new(None);
-        let mut head = vec![0xFF, 0xFE]; // declared 0xFFFE
+        let mut head = vec![0xFF, 0xFF];
         head.extend(std::iter::repeat_n(0x11, 1000));
         assert!(parser.parse(&make_pes(head, Some(90000))).is_empty());
-        // Flood continuations far exceeding the cap.
+        let mut frames = Vec::new();
         for _ in 0..100 {
-            let _ = parser.parse(&make_pes(vec![0x22u8; 2000], None));
+            frames.extend(parser.parse(&make_pes(vec![0x22u8; 2000], None)));
         }
-        let pending_len = parser
-            .pending
-            .as_ref()
-            .map(|(_, _, b)| b.len())
-            .unwrap_or(0);
-        assert!(
-            pending_len <= MAX_SPU_BYTES,
-            "pending {pending_len} exceeded MAX_SPU_BYTES {MAX_SPU_BYTES}"
-        );
+        assert_eq!(frames.len(), 1, "the SPU completes once");
+        assert_eq!(frames[0].data.len(), MAX_SPU_BYTES, "clamped to the cap");
     }
 
     // --- one-byte head: too short to carry SPU_size ---
