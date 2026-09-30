@@ -2300,6 +2300,22 @@ mod tests {
         );
     }
 
+    /// A seamless clip join restarts CC (flagged as a gap) with continuous PTS; the next CRA's
+    /// RASL stay decodable, so it must not become BLA (the decoder would drop them).
+    #[test]
+    fn cra_after_a_seamless_join_is_left_a_cra() {
+        let mut parser = HevcParser::new();
+        let mut join = make_pes(vec![0, 0, 1, 0x02, 0x01, 0x80], Some(0));
+        join.discontinuity = true;
+        parser.parse(&join);
+        let f = parser.parse(&make_pes(cra_au(&[0x10]), Some(3000)));
+        assert_eq!(
+            nal_type_of(&nals_of(&f[0].data)[0]),
+            NAL_CRA_NUT,
+            "a CRA at a seamless join must stay a CRA"
+        );
+    }
+
     /// Test 2: a CRA with NO boundary marker is left unchanged (CRA stays CRA).
     #[test]
     fn cra_without_boundary_unchanged() {

@@ -98,8 +98,11 @@ fn lang_of(bytes: [u8; 3]) -> String {
     }
 }
 
-// MPEG-2 (or MPEG-1) video from its sequence header: codec, resolution, frame rate.
-fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<(Codec, Resolution, FrameRate)> {
+// Codec, resolution, frame rate and display aspect from a sequence header.
+type Probed = (Codec, Resolution, FrameRate, Option<(u32, u32)>);
+
+// MPEG-2 (or MPEG-1) video probed from its sequence header.
+fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<Probed> {
     let seq = es.windows(4).position(|w| w == [0, 0, 1, 0xB3]);
     let ext = es
         .windows(5)
@@ -114,6 +117,7 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<(Codec, Resolution, Fr
         None => return None,
     };
     let (mut res, mut rate) = (Resolution::Unknown, FrameRate::Unknown);
+    let mut dar = None;
     if let Some(h) = seq.and_then(|s| es.get(s + 4..s + 8)) {
         let height = (u32::from(h[1] & 0x0F) << 8) | u32::from(h[2]);
         let progressive = ext
@@ -136,8 +140,18 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<(Codec, Resolution, Fr
             8 => FrameRate::F60,
             _ => FrameRate::Unknown,
         };
+        // aspect_ratio_information: 1 = square pixels (coded size). 2/3/4 are 4:3, 16:9, 2.21:1
+        // only in 13818-2; in 11172-2 they are pel ratios, so MPEG-1 leaves them unknown.
+        let width = (u32::from(h[0]) << 4) | u32::from(h[1] >> 4);
+        dar = match (h[3] >> 4, codec) {
+            (1, _) if width > 0 && height > 0 => Some((width, height)),
+            (2, Codec::Mpeg2) => Some((4, 3)),
+            (3, Codec::Mpeg2) => Some((16, 9)),
+            (4, Codec::Mpeg2) => Some((221, 100)),
+            _ => None,
+        };
     }
-    Some((codec, res, rate))
+    Some((codec, res, rate, dar))
 }
 
 // Design §4 step 3 "MPEG audio | header + mc_header": Layer II frames from `at` go through
@@ -343,7 +357,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     tracing::warn!(target: "mux", stream_id = key.0, "mpg: a second video stream; left out");
                     continue;
                 }
-                let Some((codec, res, rate)) = probe_video(es, ty) else {
+                let Some((codec, res, rate, dar)) = probe_video(es, ty) else {
                     tracing::warn!(target: "mux", stream_id = key.0, "mpg: video stream with no MPEG-1/2 sequence header in the head; left out");
                     continue;
                 };
@@ -360,7 +374,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     } else {
                         ColorSpace::Bt709
                     },
-                    display_aspect: None,
+                    display_aspect: dar,
                     secondary: false,
                     label: String::new(),
                     measured_cicp: None,
@@ -485,4 +499,34 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
         streams.remove(i);
     }
     (!streams.is_empty()).then_some(Scan { streams, video_id })
+}
+
+#[cfg(test)]
+mod dar_tests {
+    use super::*;
+
+    #[test]
+    fn probe_video_reports_the_sequence_header_aspect() {
+        // 720x576, aspect code 3 (16:9), frame-rate code 3 (25 fps).
+        let es = [0, 0, 1, 0xB3, 0x2D, 0x02, 0x40, 0x33, 0, 0];
+        let (_, res, _, dar) = probe_video(&es, Some(0x02)).expect("video");
+        assert_eq!(res, Resolution::R576p);
+        assert_eq!(dar, Some((16, 9)));
+    }
+
+    #[test]
+    fn square_pixel_code_uses_the_coded_size() {
+        // 320x240, aspect code 1 (square pixels), frame-rate code 4.
+        let es = [0, 0, 1, 0xB3, 0x14, 0x00, 0xF0, 0x14, 0, 0];
+        let (_, _, _, dar) = probe_video(&es, Some(0x02)).expect("video");
+        assert_eq!(dar, Some((320, 240)));
+    }
+
+    #[test]
+    fn mpeg1_pel_aspect_code_is_not_a_display_ratio() {
+        // MPEG-1 352x288, code 3 is a pel aspect ratio (11172-2), not 16:9.
+        let es = [0, 0, 1, 0xB3, 0x16, 0x01, 0x20, 0x33, 0, 0];
+        let (_, _, _, dar) = probe_video(&es, Some(0x01)).expect("video");
+        assert_eq!(dar, None);
+    }
 }
