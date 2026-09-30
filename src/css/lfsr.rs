@@ -12,19 +12,12 @@ use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 
 /// Descramble a CSS-encrypted DVD sector in place.
 ///
-/// Registers are seeded from `title_key XOR sector_seed` (bytes
-/// `0x54..0x59`). Only the body, bytes `0x80..0x800`, is transformed:
-/// `body[i] = TAB1[body[i]] ^ (keystream & 0xff)`. The scramble flag at byte
-/// `0x14` (bits 4-5) is CLEARED after unscrambling, so a descrambled sector
-/// reads as `sector[0x14] & 0x30 == 0`.
+/// Seeded from `title_key XOR sector_seed` (bytes `0x54..0x59`); transforms only
+/// the body `0x80..0x800`: `body[i] = TAB1[body[i]] ^ (keystream & 0xff)`.
+/// Flag bits 4-5 at byte `0x14` are cleared afterwards.
 ///
-/// No-op (returns without modifying `sector`) if `sector.len() < 2048` or the scramble flag
-/// bits are already zero.
+/// No-op if `sector.len() < 2048` or the scramble flag bits are already zero.
 pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
-    debug_assert!(
-        sector.len() >= 2048,
-        "descramble_sector: buffer shorter than one 2048-byte sector"
-    );
     if sector.len() < 2048 {
         return;
     }

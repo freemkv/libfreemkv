@@ -425,6 +425,10 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
     lfsr::descramble_sector(&state.title_key, sector);
 }
 
+// How many mismatches a failed re-crack's "false positive" verdict covers before the next retry —
+// bounded so a genuine key change right after a false-positive run is still picked up.
+const RECRACK_RETRY_EVERY: u32 = 16;
+
 /// Descramble a whole CSS buffer in place, re-cracking the title key on a VOB region boundary.
 /// `title_key` is a CACHE of the last crack: validated against the clear-header crib on every
 /// scrambled sector and re-cracked on a miss. A crib-less sector rides the cached key.
@@ -433,10 +437,6 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 ///
 /// Never returns `Err` — `Result` only matches the decrypt seam this is
 /// dispatched from (see [`crate::decrypt::decrypt_sectors`]).
-// How many mismatches a failed re-crack's "false positive" verdict covers before the next retry —
-// bounded so a genuine key change right after a false-positive run is still picked up.
-const RECRACK_RETRY_EVERY: u32 = 16;
-
 pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
     // `is_scrambled_pack`, NOT the looser `is_scrambled`: this sees arbitrary
     // regions (IFO/UDF/ISO 9660) where raw byte 0x14 isn't a reliable flag.
