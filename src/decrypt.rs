@@ -2012,6 +2012,39 @@ mod tests {
         ));
     }
 
+    /// Option A (E7013): one damaged forensic unit under each of two keys (garbled heads that
+    /// kept flag and sync), no other forensic unit in the read, is damage: blanked, never E7013.
+    #[test]
+    fn mapped_phase_lone_damage_under_two_keys_is_blanked_not_e7013() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let (key_a, key_b) = ([0xAAu8; 16], [0xBBu8; 16]);
+        let mut buf = vec![0u8; 4 * ul];
+        for (i, k) in [key_a, key_a, key_b, key_b].iter().enumerate() {
+            let mut u = clear_ts_unit();
+            aacs_encrypt_unit_for_test(&mut u, k);
+            if i % 2 == 0 {
+                crate::test_util::damage_unit_seed(&mut u);
+                u[4] = 0x47;
+            }
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b)],
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges_phased(vec![
+            (0, 2 * usz, 0, Phase::Even),
+            (2 * usz, 4 * usz, 1, Phase::Even),
+        ]);
+        let blanked = decrypt_sectors_mapped_in_content(&mut buf, &keys, 0, &map, None)
+            .expect("damage, not E7013");
+        assert_eq!(blanked, 2);
+        assert!(buf[..ul].iter().all(|&b| b == 0));
+        assert!(buf[2 * ul..3 * ul].iter().all(|&b| b == 0));
+    }
+
     /// Phase::All (multi-CPS / base) decrypts EVERY unit and never runs the verify
     /// — the common-disc path is byte-for-byte unchanged.
     #[test]
