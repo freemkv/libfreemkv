@@ -78,9 +78,6 @@ impl UnknownParts {
     }
 }
 
-// Retained-run cap for the label blob (far above any real disc's token count).
-const MAX_STRINGS: usize = 65_536;
-
 pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "bluray_project.bin")
 }
@@ -88,8 +85,8 @@ pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     let data = super::read_jar_file(reader, udf, "bluray_project.bin")?;
     // The token grammar is `{lang3}_{codec?}_{purpose?}_{region?}_` so the
-    // shortest meaningful run is 4 chars (lang + underscore). Capped: untrusted blob.
-    let strings = text::extract_ascii_strings_capped(&data, 4, MAX_STRINGS);
+    // shortest meaningful run is 4 chars (lang + underscore). The extractor caps run count (untrusted blob).
+    let strings = text::extract_ascii_strings(&data, 4);
 
     // Collects uncatalogued token components; if any, confidence downgrades to Medium
     // and they're reported once (see `UnknownParts`). Sequential parse, so a plain

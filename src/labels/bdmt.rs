@@ -207,11 +207,8 @@ fn extract_title(xml_text: &str) -> Option<String> {
 /// the denominator (both forms appear in the wild).
 fn extract_disc_set(xml_text: &str) -> Option<(u32, u32)> {
     // Real discs carry <di:setNumber>; <di:discNumber> is kept as a fallback.
-    let n = xml::text(xml_text, "setNumber")
-        .or_else(|| xml::text(xml_text, "discNumber"))?
-        .trim()
-        .parse::<u32>()
-        .ok()?;
+    let num = |tag| xml::text(xml_text, tag).and_then(|t| t.trim().parse::<u32>().ok());
+    let n = num("setNumber").or_else(|| num("discNumber"))?;
     let total = xml::text(xml_text, "numSets")
         .or_else(|| xml::text(xml_text, "numberOfSets"))?
         .trim()
@@ -240,6 +237,13 @@ mod tests {
     fn set_number_is_read() {
         let xml =
             "<d><di:name>X</di:name><di:numSets>3</di:numSets><di:setNumber>2</di:setNumber></d>";
+        assert_eq!(parse_bdmt_xml(xml).expect("parse").2, Some((2, 3)));
+    }
+
+    #[test]
+    fn non_numeric_set_number_falls_back_to_disc_number() {
+        let xml = "<d><di:name>X</di:name><di:numSets>3</di:numSets>\
+                   <di:setNumber>two</di:setNumber><di:discNumber>2</di:discNumber></d>";
         assert_eq!(parse_bdmt_xml(xml).expect("parse").2, Some((2, 3)));
     }
 

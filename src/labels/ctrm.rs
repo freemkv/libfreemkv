@@ -242,11 +242,16 @@ mod tests {
 
     #[test]
     fn menu_base_tie_order_is_deterministic_by_prefix() {
-        let labels = parse_props(
-            "b_1.class=AudioButton\nb_1.streamNumber=2\nb_1.name=Second\n\
-             a_1.class=AudioButton\na_1.streamNumber=2\na_1.name=First\n",
-        );
-        assert_eq!(labels[0].name, "First");
+        // Inserted in reverse; many prefixes so hash order can't match by luck.
+        let mut text = String::new();
+        for i in (0..64).rev() {
+            text.push_str(&format!(
+                "p{i:02}.class=AudioButton\np{i:02}.streamNumber=2\np{i:02}.name=N{i:02}\n"
+            ));
+        }
+        let names: Vec<String> = parse_props(&text).into_iter().map(|l| l.name).collect();
+        let want: Vec<String> = (0..64).map(|i| format!("N{i:02}")).collect();
+        assert_eq!(names, want);
     }
 
     #[test]
