@@ -2420,7 +2420,10 @@ mod tests {
             assert_eq!(b.capacity_sectors(), 42, "capacity_sectors must forward");
             b.set_speed(7200);
             b.set_unit_base(1234);
-            assert!(!b.random_access(), "random_access must forward, not default");
+            assert!(
+                !b.random_access(),
+                "random_access must forward, not default"
+            );
         }
         assert_eq!(inner.last_speed, Some(7200), "set_speed must forward");
         assert_eq!(

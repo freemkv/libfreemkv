@@ -551,14 +551,8 @@ mod probe_tests {
         let key = [0x55u8; 16];
         let clean = encrypted_clean_unit(&key);
         let other = encrypted_clean_unit(&[0x66u8; 16]); // decrypts to junk under `key`
-        let got = super::probe_index_phase(
-            &segs,
-            1,
-            8,
-            16,
-            ContentFormat::BdTs,
-            &key,
-            |seg, unit| {
+        let got =
+            super::probe_index_phase(&segs, 1, 8, 16, ContentFormat::BdTs, &key, |seg, unit| {
                 if seg.start_spn == 1 {
                     Some(other.clone())
                 } else if unit % 2 == 0 {
@@ -566,8 +560,7 @@ mod probe_tests {
                 } else {
                     Some(vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN])
                 }
-            },
-        );
+            });
         assert_eq!(
             got,
             super::IndexProbe::Phase(Phase::Even),

@@ -901,12 +901,16 @@ mod tests {
     #[test]
     fn ddts_channel_layout_masks_are_exact_per_amode() {
         let expect: [u16; 16] = [
-            0x0001, 0x0002, 0x0002, 0x0002, 0x0002, 0x0003, 0x0012, 0x0013, 0x0006, 0x0007,
-            0x0206, 0x0143, 0x0053, 0x0207, 0x0246, 0x0217,
+            0x0001, 0x0002, 0x0002, 0x0002, 0x0002, 0x0003, 0x0012, 0x0013, 0x0006, 0x0007, 0x0206,
+            0x0143, 0x0053, 0x0207, 0x0246, 0x0217,
         ];
         for (amode, want) in expect.iter().enumerate() {
             assert_eq!(dts_channel_layout(amode, false), *want, "AMODE {amode}");
-            assert_eq!(dts_channel_layout(amode, true), *want | 0x0008, "AMODE {amode}+LFE");
+            assert_eq!(
+                dts_channel_layout(amode, true),
+                *want | 0x0008,
+                "AMODE {amode}+LFE"
+            );
         }
     }
 

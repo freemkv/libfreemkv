@@ -743,7 +743,10 @@ mod tests {
         for (kind, ls) in [("aud", audio(&labels)), ("sub", subs(&labels))] {
             assert_eq!(ls.len(), max, "{kind}: cells past u16::MAX are dropped");
             assert_eq!(ls[max - 1].stream_number, u16::MAX, "{kind}");
-            assert!(ls.iter().all(|l| l.stream_number != 0), "{kind}: no wrap to 0");
+            assert!(
+                ls.iter().all(|l| l.stream_number != 0),
+                "{kind}: no wrap to 0"
+            );
         }
     }
 

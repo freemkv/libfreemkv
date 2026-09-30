@@ -1873,7 +1873,10 @@ mod tests {
                     break;
                 }
             }
-            assert!(res.is_err(), "{name} on the recovery read must abort, got {res:?}");
+            assert!(
+                res.is_err(),
+                "{name} on the recovery read must abort, got {res:?}"
+            );
             assert_eq!(stream.errors, 0, "{name}: must not count as a skip");
             assert_eq!(stream.lost_bytes, 0, "{name}: must not zero-fill");
         }
