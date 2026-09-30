@@ -17,12 +17,12 @@ use zip::ZipArchive;
 // so the buffer grows incrementally instead of pre-sizing.
 const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 
-// Cap on total bytes inflated by one `.class` sweep: the per-entry cap alone lets a hostile jar
-// of high-ratio entries drive unbounded inflation.
-const MAX_SWEEP_BYTES: u64 = 128 * 1024 * 1024;
+/// Cap on total bytes one label parse inflates, shared by every sweep over every jar: the
+/// per-entry cap alone lets hostile high-ratio entries drive unbounded inflation.
+pub(crate) const PARSE_INFLATE_BUDGET: u64 = 128 * 1024 * 1024;
 
 /// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
-/// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class`],
+/// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class_budgeted`],
 /// etc.
 pub type Jar = ZipArchive<Cursor<Vec<u8>>>;
 
@@ -325,37 +325,10 @@ pub fn has_path_prefix(archive: &Jar, prefix: &str) -> bool {
     archive.file_names().any(|n| n.starts_with(prefix))
 }
 
-/// Iterate every `.class` entry in the jar, parse it with
-/// [`class_reader`](super::class_reader), and call `f` with `(entry_name, &ClassFile)`.
-///
-/// Entries that fail to read or parse are silently skipped — this is
-/// label-extraction code, robustness matters more than completeness.
-/// Callers that need to know which classes failed should use the
-/// lower-level [`class_reader`](super::class_reader) API directly.
-pub fn for_each_class<F>(archive: &mut Jar, mut f: F)
-where
-    F: FnMut(&str, &ClassFile),
-{
-    // Defer to try_each_class; the callback always yields None so
-    // iteration never short-circuits.
-    try_each_class(archive, |name, class| {
-        f(name, class);
-        None::<()>
-    });
-}
-
-/// Like [`for_each_class`] but allows the callback to short-circuit
-/// iteration. Returns the first `Some(R)` the callback produces.
-pub fn try_each_class<R, F>(archive: &mut Jar, f: F) -> Option<R>
-where
-    F: FnMut(&str, &ClassFile) -> Option<R>,
-{
-    let mut budget = MAX_SWEEP_BYTES;
-    try_each_class_budgeted(archive, &mut budget, f)
-}
-
-/// [`try_each_class`] charging every inflated byte to `budget`; stops (None)
-/// once it is spent, so a caller sweeping many jars bounds total inflation.
+/// Iterate every `.class` entry, parse it with [`class_reader`](super::class_reader)
+/// and call `f` until it returns `Some`. Entries that fail to read or parse are
+/// skipped. Every inflated byte is charged to `budget`; the walk stops once it is
+/// spent, so a caller sweeping many jars bounds total inflation.
 pub fn try_each_class_budgeted<Z: Read + Seek, R, F>(
     archive: &mut ZipArchive<Z>,
     budget: &mut u64,
@@ -368,6 +341,20 @@ where
     try_each_entry(archive, is_class, MAX_CLASS_BYTES, budget, |name, bytes| {
         f(name, &ClassFile::parse(bytes).ok()?)
     })
+}
+
+/// [`try_each_class_budgeted`] visiting every class (no short-circuit).
+pub fn for_each_class_budgeted<Z: Read + Seek, F>(
+    archive: &mut ZipArchive<Z>,
+    budget: &mut u64,
+    mut f: F,
+) where
+    F: FnMut(&str, &ClassFile),
+{
+    let _: Option<()> = try_each_class_budgeted(archive, budget, |name, class| {
+        f(name, class);
+        None
+    });
 }
 
 /// Iterate the NON-`.class`, non-directory entries whose name satisfies `want`
@@ -392,9 +379,9 @@ where
     try_each_entry(archive, is_resource, cap, budget, f)
 }
 
-// Shared entry loop: filter by central-directory name, then inflate at most `cap`
-// bytes into a growing buffer (the declared size is untrusted). An entry the budget
-// cannot cover is not offered and stops the walk; one that exactly fits is complete.
+// Filter by central-directory name, then inflate at most `cap` bytes (declared size is
+// untrusted). An entry the budget cannot cover is not offered and stops the walk (logged
+// once, by the walk that ran it out); one that exactly fits is complete.
 fn try_each_entry<Z: Read + Seek, R>(
     archive: &mut ZipArchive<Z>,
     want: impl Fn(&str) -> bool,
@@ -402,13 +389,20 @@ fn try_each_entry<Z: Read + Seek, R>(
     budget: &mut u64,
     mut f: impl FnMut(&str, &[u8]) -> Option<R>,
 ) -> Option<R> {
-    for i in 0..archive.len() {
-        if *budget == 0 {
-            return None;
+    let had_budget = *budget > 0;
+    let spent = |i: usize| {
+        if had_budget {
+            tracing::warn!(entry = i, "jar: inflate budget exhausted, sweep truncated");
         }
+    };
+    for i in 0..archive.len() {
         match archive.name_for_index(i) {
             Some(n) if want(n) => {}
             _ => continue,
+        }
+        if *budget == 0 {
+            spent(i);
+            return None;
         }
         let Ok(entry) = archive.by_index(i) else {
             continue;
@@ -420,6 +414,7 @@ fn try_each_entry<Z: Read + Seek, R>(
             .read_to_end(&mut bytes);
         if bytes.len() as u64 > *budget {
             *budget = 0;
+            spent(i);
             return None;
         }
         *budget -= bytes.len() as u64;
@@ -436,6 +431,11 @@ fn try_each_entry<Z: Read + Seek, R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A budget no test fixture can exhaust.
+    fn unbounded() -> u64 {
+        u64::MAX
+    }
 
     /// Smallest constant-pool-empty `.class`: magic, versions, cp_count=1
     /// (zero real entries), then empty access/this/super/interfaces/
@@ -551,7 +551,7 @@ mod tests {
             MINIMAL_CLASS.len() as u32,
         ));
         let mut seen = Vec::new();
-        let r: Option<()> = try_each_class(&mut jar, |name, _class| {
+        let r: Option<()> = try_each_class_budgeted(&mut jar, &mut unbounded(), |name, _class| {
             seen.push(name.to_string());
             None
         });
@@ -567,7 +567,7 @@ mod tests {
             MINIMAL_CLASS.len() as u32,
         ));
         let mut count = 0usize;
-        for_each_class(&mut jar, |_, _| count += 1);
+        for_each_class_budgeted(&mut jar, &mut unbounded(), |_, _| count += 1);
         assert_eq!(count, 1);
     }
 
@@ -578,7 +578,7 @@ mod tests {
     fn forged_huge_uncompressed_size_does_not_preallocate() {
         let mut jar = open(build_stored_zip("Evil.class", MINIMAL_CLASS, 0xFFFF_FFFF));
         let mut parsed = false;
-        for_each_class(&mut jar, |name, _class| {
+        for_each_class_budgeted(&mut jar, &mut unbounded(), |name, _class| {
             assert_eq!(name, "Evil.class");
             parsed = true;
         });
@@ -600,7 +600,7 @@ mod tests {
             0xFFFF_FFFF,
         ));
         let mut visited = 0usize;
-        for_each_class(&mut jar, |_, _| visited += 1);
+        for_each_class_budgeted(&mut jar, &mut unbounded(), |_, _| visited += 1);
         assert_eq!(visited, 1);
     }
 
@@ -700,8 +700,8 @@ mod tests {
         assert_eq!(budget, 1_000_000 - payload.len() as u64);
     }
 
-    // The unbudgeted-looking wrappers still bound a sweep: high-ratio deflate
-    // entries (each under the per-entry cap) stop being offered past the total cap.
+    // High-ratio deflate entries (each under the per-entry cap) stop being offered
+    // past the per-parse cap.
     #[test]
     fn try_each_class_bounds_total_inflation() {
         use std::io::Write as _;
@@ -720,7 +720,8 @@ mod tests {
         }
         let mut jar = open(buf);
         let mut visited = 0usize;
-        for_each_class(&mut jar, |_, _| visited += 1);
-        assert_eq!(visited, 2, "3 x 50 MiB exceeds the 128 MiB sweep cap");
+        let mut budget = PARSE_INFLATE_BUDGET;
+        for_each_class_budgeted(&mut jar, &mut budget, |_, _| visited += 1);
+        assert_eq!(visited, 2, "3 x 50 MiB exceeds the 128 MiB inflate budget");
     }
 }

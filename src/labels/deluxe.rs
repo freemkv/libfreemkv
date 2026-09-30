@@ -32,6 +32,8 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // studios, each shipping `/BDMV/JAR/<n>/config.xml` naming the studio.
     // Matching below is studio-agnostic, so this is informational only (logged).
     let studio = detect_studio(reader, udf);
+    // One inflate budget for every sweep over every jar this parse opens.
+    let mut budget = jar::PARSE_INFLATE_BUDGET;
 
     jar::for_each_jar(reader, udf, |entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/bydeluxe/") {
@@ -39,7 +41,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         }
 
         // Phase A — master enums (Language / Purpose / VideoFormat / Region / Studio).
-        let enums = identify_master_enums(archive);
+        let enums = identify_master_enums(archive, &mut budget);
         if enums.is_empty() {
             tracing::info!(
                 jar = ?entry_name,
@@ -63,7 +65,8 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         // Phase C — find ALL binding-class candidates (audio + subtitle often
         // split across two classes on Deluxe). Each gets its own `<clinit>`
         // walk; constructions union into a single stream list.
-        let binding_classes = find_binding_classes(archive, &master_table.class_name_set());
+        let binding_classes =
+            find_binding_classes(archive, &master_table.class_name_set(), &mut budget);
         if binding_classes.is_empty() {
             tracing::info!(
                 jar = ?entry_name,
@@ -88,7 +91,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
             if room == 0 {
                 break;
             }
-            let mut decoded = decode_binding(archive, name, &master_table);
+            let mut decoded = decode_binding(archive, name, &master_table, &mut budget);
             decoded.truncate(room);
             streams.extend(decoded);
         }
@@ -325,12 +328,15 @@ impl CandidatePool {
 /// Phase A. Walk every `.class` in `archive`, identify the master
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
-fn identify_master_enums(archive: &mut jar::Jar) -> Vec<(&'static str, MasterEnum)> {
+fn identify_master_enums(
+    archive: &mut jar::Jar,
+    budget: &mut u64,
+) -> Vec<(&'static str, MasterEnum)> {
     // First pass: collect every class's <clinit> ldc strings, keyed by the JVM
     // INTERNAL name (`this_class`), not the zip entry name — binding classes
     // reference enum constants as `getstatic <internal>.f`.
     let mut pool = CandidatePool::default();
-    jar::for_each_class(archive, |zip_name, class| {
+    jar::for_each_class_budgeted(archive, budget, |zip_name, class| {
         let Some(ldcs) = clinit_ldc_strings(class) else {
             return;
         };
@@ -517,10 +523,11 @@ fn ldcs_match_prefix(ldcs: &[String], prefix: &[&str]) -> bool {
 fn find_binding_classes(
     archive: &mut jar::Jar,
     master_enum_classes: &HashSet<&str>,
+    budget: &mut u64,
 ) -> Vec<(String, usize)> {
     const MIN_GETSTATIC: usize = 4;
     let mut candidates: Vec<(String, usize)> = Vec::new();
-    jar::for_each_class(archive, |class_name, class| {
+    jar::for_each_class_budgeted(archive, budget, |class_name, class| {
         let count = count_master_enum_getstatic(class, master_enum_classes);
         if count >= MIN_GETSTATIC {
             candidates.push((class_name.to_string(), count));
@@ -616,12 +623,13 @@ fn decode_binding(
     archive: &mut jar::Jar,
     binding_class_name: &str,
     master: &MasterEnumTable,
+    budget: &mut u64,
 ) -> Vec<Construction> {
     let target_name = binding_class_name.to_string();
-    // Short-circuit on the name match: try_each_class stops iterating (and
+    // Short-circuit on the name match: the sweep stops iterating (and
     // decompressing/parsing remaining .class entries) once the closure
     // returns Some, instead of walking the whole jar past the target.
-    jar::try_each_class(archive, |class_name, class| {
+    jar::try_each_class_budgeted(archive, budget, |class_name, class| {
         if class_name != target_name {
             return None;
         }
@@ -1218,6 +1226,11 @@ fn deluxe_purpose_to_label(ordinal: u16) -> (LabelPurpose, LabelQualifier) {
 mod tests {
     use super::*;
 
+    // A budget no test fixture can exhaust.
+    fn unbounded() -> u64 {
+        u64::MAX
+    }
+
     // Raw .class/.jar fixture builders: `identify_master_enums`, `find_binding_classes`
     // and `decode_binding` operate on `jar::Jar` (a real `ZipArchive`), not the
     // in-memory `ClassFile` struct other tests build, so these need real `.class` bytes.
@@ -1636,7 +1649,7 @@ mod tests {
             ("com/bydeluxe/Decoy.class", decoy),
         ]);
         let mut archive = open_jar(zip);
-        let enums = identify_master_enums(&mut archive);
+        let enums = identify_master_enums(&mut archive, &mut unbounded());
         let purpose = enums
             .iter()
             .find(|(label, _)| *label == "Purpose")
@@ -1678,7 +1691,7 @@ mod tests {
                 ),
             ]);
             let mut archive = open_jar(zip);
-            let enums = identify_master_enums(&mut archive);
+            let enums = identify_master_enums(&mut archive, &mut unbounded());
             let purpose = enums
                 .iter()
                 .find(|(label, _)| *label == "Purpose")
@@ -1707,7 +1720,7 @@ mod tests {
         let class = class_with_ldc_strings("BoundaryPurpose", &values);
         let zip = build_zip(&[("com/bydeluxe/B.class", class)]);
         let mut archive = open_jar(zip);
-        let enums = identify_master_enums(&mut archive);
+        let enums = identify_master_enums(&mut archive, &mut unbounded());
         assert!(
             enums.iter().any(|(label, _)| *label == "Purpose"),
             "a class exactly LDC_COUNT_TOLERANCE away from expected_count must still match"
@@ -1721,7 +1734,7 @@ mod tests {
         let unrelated = class_with_ldc_strings("Unrelated", &["Foo", "Bar"]);
         let zip = build_zip(&[("x/Unrelated.class", unrelated)]);
         let mut archive = open_jar(zip);
-        assert!(identify_master_enums(&mut archive).is_empty());
+        assert!(identify_master_enums(&mut archive, &mut unbounded()).is_empty());
     }
 
     // ── Phase C: find_binding_classes / count_master_enum_getstatic ────────
@@ -1762,7 +1775,7 @@ mod tests {
             ("com/bydeluxe/D.class", d),
         ]);
         let mut archive = open_jar(zip);
-        let candidates = find_binding_classes(&mut archive, &master_classes);
+        let candidates = find_binding_classes(&mut archive, &master_classes, &mut unbounded());
         let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -1778,13 +1791,32 @@ mod tests {
         assert_eq!(candidates[1].1, 45);
     }
 
+    // Phase A, C and D share one inflate budget: bytes Phase A inflated are not
+    // available again to Phase C.
+    #[test]
+    fn deluxe_sweeps_share_one_inflate_budget() {
+        let class = class_with_getstatic_refs("com/bydeluxe/Bind", "com/bydeluxe/Lang", 5);
+        let len = class.len() as u64;
+        let mut archive = open_jar(build_zip(&[("com/bydeluxe/Bind.class", class)]));
+        let master_classes: HashSet<&str> = ["com/bydeluxe/Lang"].into_iter().collect();
+        let mut budget = len;
+        assert!(identify_master_enums(&mut archive, &mut budget).is_empty());
+        assert_eq!(budget, 0, "Phase A spent the budget");
+        assert!(find_binding_classes(&mut archive, &master_classes, &mut budget).is_empty());
+        let mut fresh = len;
+        assert_eq!(
+            find_binding_classes(&mut archive, &master_classes, &mut fresh).len(),
+            1
+        );
+    }
+
     #[test]
     fn find_binding_classes_empty_master_set_yields_no_candidates() {
         let master_classes: HashSet<&str> = HashSet::new();
         let a = class_with_getstatic_refs("A", "LanguageEnum", 100);
         let zip = build_zip(&[("com/bydeluxe/A.class", a)]);
         let mut archive = open_jar(zip);
-        assert!(find_binding_classes(&mut archive, &master_classes).is_empty());
+        assert!(find_binding_classes(&mut archive, &master_classes, &mut unbounded()).is_empty());
     }
 
     // ── Phase D: decode_binding (Jar-level short-circuit wrapper) ───────────
@@ -1803,7 +1835,12 @@ mod tests {
         let mut archive = open_jar(zip);
         let master = lang_enum_master();
 
-        let ctors = decode_binding(&mut archive, "com/bydeluxe/Target.class", &master);
+        let ctors = decode_binding(
+            &mut archive,
+            "com/bydeluxe/Target.class",
+            &master,
+            &mut unbounded(),
+        );
         assert_eq!(
             ctors.len(),
             1,
@@ -1811,9 +1848,17 @@ mod tests {
         );
         assert_eq!(ctors[0].binding_type, "AudioSlot");
 
-        // A name with no matching entry must yield nothing (try_each_class
+        // A name with no matching entry must yield nothing (the sweep
         // never finds a Some).
-        assert!(decode_binding(&mut archive, "com/bydeluxe/NoSuchClass.class", &master).is_empty());
+        assert!(
+            decode_binding(
+                &mut archive,
+                "com/bydeluxe/NoSuchClass.class",
+                &master,
+                &mut unbounded()
+            )
+            .is_empty()
+        );
     }
 
     // ── Phase D bytecode walker tests ───────────────────────────────────────
