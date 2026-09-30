@@ -78,7 +78,7 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
 // ── Subset-difference walk that exposes (Kp, uv) ──────────────────────────
 
 // Shared with the classical walk in super::derive to keep the SD tree byte-identical.
-use super::derive::{calc_pk_from_dk, calc_v_mask};
+use super::derive::{VERIFY_MAGIC, calc_pk_from_dk, calc_v_mask};
 
 /// Outcome of a subset-difference walk against an MKB. Carries the
 /// processing key and the matching `uv` slot — both needed as inputs
@@ -193,7 +193,6 @@ pub fn walk_processing_key(
                         km_candidate[12 + i] ^= uv_bytes[i];
                     }
                     let dec_vd = aes_ecb_decrypt(&km_candidate, &mk_dv);
-                    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
                     // On classical MKBs this magic must match. On variant MKBs
                     // it won't — `km_candidate` is really Kmp, so the magic
                     // check is moot; the chain enforces semantics downstream.
@@ -394,7 +393,6 @@ fn variant_km_for_slot(
     // Gate: the derived Media Key MUST reproduce the MKB's Verify-Media-Key magic
     // (the per-match magic in `walk_processing_key` only saw the Precursor). This
     // is the authoritative check — no unverified key is ever returned.
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if aes_ecb_decrypt(&km, &m.mk_dv)[..8] != VERIFY_MAGIC {
         return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
     }
@@ -517,7 +515,6 @@ pub fn media_key_variant_from_kp(
     for i in 0..4 {
         km[12 + i] ^= uv_bytes[i];
     }
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if aes_ecb_decrypt(&km, &mk_dv)[..8] != VERIFY_MAGIC {
         return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
     }
@@ -1099,7 +1096,6 @@ mod tests {
     fn plant_variant_mkb() -> PlantedVariant {
         use crate::aacs::crypto::{aes_ecb_encrypt, aes_g};
 
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         const UV: u32 = 2;
         const U_MASK_SHIFT: u8 = 3;
 
@@ -1252,7 +1248,6 @@ mod tests {
         for i in 0..4 {
             km[12 + i] ^= uv_bytes[i];
         }
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         if aes_ecb_decrypt(&km, &m.mk_dv)[..8] != VERIFY_MAGIC {
             return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
         }
@@ -1700,7 +1695,6 @@ mod tests {
     fn plant_walk_variant_mkb() -> PlantedWalk {
         use crate::aacs::crypto::{aes_ecb_encrypt, aes_g};
 
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         const UV_DECOY: u32 = 0x0000_0800;
         const UV_REAL: u32 = 0x0000_0400;
         const U_MASK_SHIFT: u8 = 12;
@@ -1974,7 +1968,6 @@ mod tests {
     #[test]
     fn walk_processing_key_authenticates_a_classical_match_through_the_verify_magic() {
         use crate::aacs::crypto::aes_ecb_encrypt;
-        const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         const UV: u32 = 0x0000_0400;
         const U_MASK_SHIFT: u8 = 12;
 

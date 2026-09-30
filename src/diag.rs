@@ -2,9 +2,11 @@
 //!
 //! Emits one terse line per row (title, cell, stream, decision) under the `tracing` target
 //! `freemkv::diag`, routed to `log.txt` at `--log-level 3`. Every line is prefixed `tag=`
-//! (`disc`, `title`, `dvd.cell`, `dvd.vattr`, `dvd.aattr`, `bd.clip`, `bd.mark`, `aacs`,
-//! `stream`, `decision`) so a log scraper can filter, and raw bytes are shown as `0xNN` beside
-//! their decode. This module only reads already-parsed scan state.
+//! (`disc`, `title`, `bd.clip`, `extent`, `stream`, `decision`, `decision.demoted`, `aacs`,
+//! `dvd.cell`, `dvd.pgc`, `dvd.chap`, `dvd.vobs`, `dvd.vattr`, `dvd.aattr`, `dvd.sattr`,
+//! `dvd.astctl`, `dvd.spstctl`, `dvd.substream`, `dvd.aroute`, `mkv.track`, `mkv.opening.*`,
+//! `mp2.channels`) so a log scraper can filter. Raw bytes are shown as `0xNN` beside their
+//! decode. This module only reads already-parsed scan state.
 
 use crate::disc::{ColorSpace, Disc, DiscTitle, FrameRate, HdrFormat, Resolution, Stream};
 use crate::ifo::{CellCategory, DvdTitle};
@@ -298,7 +300,7 @@ fn codec_private_hex(cp: Option<&[u8]>) -> String {
 // (no I/O); `record` appends the returned bytes to the side file.
 fn frame_record(track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) -> Vec<u8> {
     let mut rec = Vec::with_capacity(14 + data.len());
-    rec.push(track_idx as u8);
+    rec.push(u8::try_from(track_idx).unwrap_or(u8::MAX));
     rec.push(keyframe as u8);
     rec.extend_from_slice(&pts_ns.to_le_bytes());
     rec.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -406,23 +408,26 @@ impl OpeningCapture {
 
     /// Record one coded frame for `track_idx` if that track is still under its
     /// per-track cap. Writes the framed raw bytes to the side file and logs a
-    /// one-line summary. A write error disables further capture for the track
-    /// (counter pinned to the cap) but never propagates — the rip is unaffected.
+    /// one-line summary. A write error disables further capture for all tracks
+    /// (counters pinned to the cap) but never propagates — the rip is unaffected.
     pub fn record(&mut self, track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) {
         let Some(count) = self.counts.get_mut(track_idx) else {
             return;
         };
-        if *count >= OPENING_FRAMES_PER_TRACK {
+        // The record's track field is a u8; skip higher indices rather than alias them.
+        if *count >= OPENING_FRAMES_PER_TRACK || track_idx > usize::from(u8::MAX) {
             return;
         }
         use std::io::Write;
         let rec = frame_record(track_idx, pts_ns, keyframe, data);
         if let Err(e) = self.file.write_all(&rec) {
-            // Stop trying on this track; a broken side file must not stall mux.
-            *count = OPENING_FRAMES_PER_TRACK;
+            // A torn record desyncs a len-framed reader: stop capture on every track.
+            self.counts
+                .iter_mut()
+                .for_each(|c| *c = OPENING_FRAMES_PER_TRACK);
             tracing::debug!(
                 target: DIAG,
-                "tag=mkv.opening.frame track={track_idx} write_failed={e} (capture stopped for track)",
+                "tag=mkv.opening.frame track={track_idx} write_failed={e} (capture stopped)",
             );
             return;
         }
@@ -562,7 +567,7 @@ fn dump_title(ti: usize, title: &DiscTitle) {
     for (ci, c) in title.clips.iter().enumerate() {
         tracing::debug!(
             target: DIAG,
-            "tag=clip title={ti} idx={ci} id={:?} in={} out={} dur={:.1}s src_packets={}",
+            "tag=bd.clip title={ti} idx={ci} id={:?} in={} out={} dur={:.1}s src_packets={}",
             c.clip_id,
             c.in_time,
             c.out_time,
@@ -689,6 +694,71 @@ mod tests {
             "main_feature_order(nav-feature, authoring-feature, standalone, has-video, fits-disc, largest-size, longest, richest-audio, more-video, more-subs, lowest-playlist-id)",
             "the reason must name the selection keys (authoring, standalone-over-composite, and has-video gates, then the physical keys) in priority order"
         );
+    }
+
+    // A track index that does not fit the u8 record field is skipped, not aliased.
+    #[test]
+    fn opening_capture_skips_track_indices_above_255() {
+        let path = std::env::temp_dir().join(format!("fmk-diag-hi-{}.bin", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut cap = OpeningCapture {
+            file,
+            counts: vec![0; 300],
+        };
+        cap.record(256, 0, true, b"x");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(len, 0, "idx 256 must not write an aliased track-0 record");
+        assert_eq!(cap.counts[256], 0);
+    }
+
+    // A failed write may leave a torn record, so capture stops on every track.
+    #[test]
+    fn opening_capture_write_error_disables_all_tracks() {
+        let path = std::env::temp_dir().join(format!("fmk-diag-ro-{}.bin", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::File::open(&path).unwrap(); // read-only: writes fail
+        let mut cap = OpeningCapture {
+            file,
+            counts: vec![0; 2],
+        };
+        cap.record(0, 0, true, b"x");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            cap.counts[1], OPENING_FRAMES_PER_TRACK,
+            "other tracks must stop after a write error"
+        );
+    }
+
+    // The per-track cap stops one track at OPENING_FRAMES_PER_TRACK records without
+    // affecting another, and an out-of-range track index is ignored.
+    #[test]
+    fn opening_capture_caps_each_track_and_ignores_unknown_tracks() {
+        let path = std::env::temp_dir().join(format!("fmk-diag-cap-{}.bin", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut cap = OpeningCapture {
+            file,
+            counts: vec![0; 2],
+        };
+        for _ in 0..OPENING_FRAMES_PER_TRACK + 5 {
+            cap.record(0, 0, true, b"x");
+        }
+        cap.record(1, 0, false, b"y");
+        cap.record(2, 0, true, b"z");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cap.counts, vec![OPENING_FRAMES_PER_TRACK, 1]);
+        assert_eq!(len as usize, (OPENING_FRAMES_PER_TRACK + 1) * 15);
+    }
+
+    // With the diag target off, no side file is created and the rip is unaffected.
+    #[test]
+    fn opening_capture_new_is_none_when_diag_is_off() {
+        let path = std::env::temp_dir().join(format!("fmk-diag-off-{}.mkv", std::process::id()));
+        assert!(OpeningCapture::new(&path, 3).is_none());
+        let mut side = path.as_os_str().to_os_string();
+        side.push(".opening.bin");
+        assert!(!std::path::Path::new(&side).exists());
     }
 
     #[test]

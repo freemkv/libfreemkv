@@ -358,9 +358,7 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
             // UNIQUE pass via km_verifies is this disc's Km); mk_dv is hoisted out.
             let mks = providers.media_keys();
             let chosen_mk = mkb_find_mk_dv(mkb).and_then(|mk_dv| {
-                unique_verifying_mk(&mks, |mk| {
-                    aes_ecb_decrypt(mk, &mk_dv)[..8] == MK_VERIFY_MAGIC
-                })
+                unique_verifying_mk(&mks, |mk| aes_ecb_decrypt(mk, &mk_dv)[..8] == VERIFY_MAGIC)
             });
             if let Some(mk) = chosen_mk {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
@@ -418,11 +416,6 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
 
     None
 }
-
-/// First 8 bytes of the plaintext behind an MKB Verify Media Key record — the
-/// AACS "this is the right Km" sentinel (`0123456789ABCDEF`). A candidate MK
-/// verifies when AES-128-ECB-D(mk, mk_dv) starts with it.
-const MK_VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
 
 // Path 2.5's MK-pool selection rule: a Media Key must be the EXACTLY ONE distinct verifying
 // candidate (dupes across providers are one candidate).
