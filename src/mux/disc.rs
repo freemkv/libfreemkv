@@ -2153,6 +2153,7 @@ mod tests {
 
         // Drive the whole title. Bounded so a regression cannot hang the suite.
         let mut completed_clean = false;
+        let mut failure = None;
         for _ in 0..(COUNT as usize * 4) {
             match stream.fill_extents() {
                 Ok(true) => continue,
@@ -2160,9 +2161,17 @@ mod tests {
                     completed_clean = true;
                     break;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    failure = crate::error::error_code(&e);
+                    break;
+                }
             }
         }
+        assert_eq!(
+            failure,
+            Some(crate::error::E_SOURCE_TERMINATED),
+            "a dead producer aborts with SourceTerminated, not another error"
+        );
         assert!(
             !completed_clean,
             "the producer died at sector 4, so sectors 4..{COUNT} were never \
@@ -3051,6 +3060,124 @@ mod tests {
                 measured_cicp: None,
             })];
             t
+        }
+
+        // One frame per PES; a keyframe iff the ES starts with `K`. Carries the PES's
+        // discontinuity so the live stream's B1 gate is driven end to end.
+        struct KeyframeParser;
+        impl crate::mux::codec::CodecParser for KeyframeParser {
+            fn parse(&mut self, pes: &PesPacket) -> Vec<crate::mux::codec::Frame> {
+                vec![crate::mux::codec::Frame {
+                    coding: None,
+                    source: None,
+                    pts_ns: pes.pts.unwrap_or(0),
+                    keyframe: pes.data.first() == Some(&b'K'),
+                    discontinuity: pes.discontinuity,
+                    data: pes.data.clone(),
+                    duration_ns: None,
+                }]
+            }
+            fn flush(&mut self) -> Vec<crate::mux::codec::Frame> {
+                Vec::new()
+            }
+            fn codec_private(&self) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        // A 192-byte BD-TS packet on `pid` with continuity counter `cc`, carrying one
+        // complete video PES (no PTS) whose ES is `es`; padded with stuffing.
+        fn ts_video_packet(pid: u16, cc: u8, es: &[u8]) -> Vec<u8> {
+            let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+            pes.extend_from_slice(es);
+            let mut pkt = vec![0u8; 192];
+            pkt[4] = 0x47;
+            pkt[5] = 0x40 | ((pid >> 8) as u8 & 0x1F);
+            pkt[6] = pid as u8;
+            let pad = 184 - pes.len();
+            pkt[7] = 0x30 | (cc & 0x0F); // adaptation field + payload
+            pkt[8] = (pad - 1) as u8;
+            if pad > 1 {
+                pkt[9] = 0x00;
+                pkt[10..8 + pad].fill(0xFF);
+            }
+            pkt[8 + pad..].copy_from_slice(&pes);
+            pkt
+        }
+
+        // The live stream runs the same B1 gate as the highway: after a TS continuity
+        // gap on a video track, inter frames are dropped until the next keyframe.
+        #[test]
+        fn live_ts_video_drops_to_keyframe_after_a_continuity_gap() {
+            use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+            let pid = 0x1011;
+            // CC 0,1 then a lost packet (2), then 3,4,5,6.
+            let es: [(&[u8], u8); 6] = [
+                (b"K0", 0),
+                (b"P1", 1),
+                (b"P2", 3),
+                (b"P3", 4),
+                (b"K4", 5),
+                (b"P5", 6),
+            ];
+            let mut image: Vec<u8> = es
+                .iter()
+                .flat_map(|(e, cc)| ts_video_packet(pid, *cc, e))
+                .collect();
+            let null = {
+                let mut p = vec![0u8; 192];
+                p[4] = 0x47;
+                p[5] = 0x1F;
+                p[6] = 0xFF;
+                p[7] = 0x10;
+                p
+            };
+            while image.len() < 6144 {
+                image.extend_from_slice(&null);
+            }
+            let mut title = synthetic_title(3);
+            title.streams = vec![crate::disc::Stream::Video(VideoStream {
+                pid,
+                codec: Codec::Hevc,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })];
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(image)),
+                title,
+                crate::decrypt::DecryptKeys::None,
+                3,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap();
+            s.parsers = vec![(pid, Box::new(KeyframeParser))];
+            let mut emitted = Vec::new();
+            while let Some(f) = s.read().unwrap() {
+                emitted.push(f.data);
+            }
+            assert_eq!(
+                emitted,
+                vec![
+                    b"K0".to_vec(),
+                    b"P1".to_vec(),
+                    b"K4".to_vec(),
+                    b"P5".to_vec()
+                ],
+                "post-gap inter frames dropped, the stream resumes at the keyframe"
+            );
+            assert_eq!(
+                PesStream::errors(&s),
+                2,
+                "the two dropped frames are counted"
+            );
         }
 
         /// The PS path (`ps_demuxer` + `Mpeg2Parser`) must forward `ps.source`
