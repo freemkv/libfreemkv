@@ -2114,6 +2114,26 @@ mod tests {
         }
     }
 
+    // A truncated run may still assert "not forced" (positive evidence: a non-forced set was
+    // seen) when the shape gate allows demotion, but never a forced verdict (an absence claim).
+    #[test]
+    fn a_truncated_run_asserts_only_a_demotable_not_forced_verdict() {
+        let full = TrackEvidence {
+            observed: true,
+            non_forced: true,
+            displays: 20,
+            ..Default::default()
+        };
+        let flagged = TrackEvidence {
+            observed: true,
+            forced_seen: true,
+            displays: 20,
+            ..Default::default()
+        };
+        let ev = HashMap::from([(0x1200u16, full), (0x1201u16, flagged)]);
+        assert_eq!(verdicts(&ev, false), HashMap::from([(0x1200u16, false)]));
+    }
+
     // Coverage is what makes a memo replayable: an entry from a thin sample must not answer a
     // question needing a thorough one.
     #[test]

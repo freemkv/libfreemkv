@@ -4155,6 +4155,12 @@ mod tests {
         assert!(d.contains("redacted"), "AacsState missing marker: {d}");
 
         for k in [
+            Key::Device(vec![crate::aacs::types::DeviceKey {
+                key: [0xD5; 16],
+                node: 0,
+                uv: 0,
+                u_mask_shift: 0,
+            }]),
             Key::Unit(vec![(1, [0xD5; 16])]),
             Key::Volume([0xD5; 16]),
             Key::Processing(vec![[0xD5; 16]]),
@@ -7094,6 +7100,30 @@ mod tests {
         assert_eq!(
             result.main_at_risk_ms, 2000.0,
             "the range is entirely inside the title's extent"
+        );
+    }
+
+    // Many ranges: sorted largest-first, capped at 50 with the overflow counted.
+    // Input is ascending, so a flipped sort keeps the smallest and reports its gap.
+    // bps = 2048 B/s, so range i (i+1 sectors) lasts (i+1) * 1000 ms.
+    #[test]
+    fn locate_ranges_sorts_largest_first_and_truncates_at_fifty() {
+        let mut title = title_with_size(204_800, vec![]);
+        title.duration_secs = 100.0;
+        let raw: Vec<(u64, u64)> = (0..53u64)
+            .map(|i| (i * 100 * 2048, (i + 1) * 2048))
+            .collect();
+        let r = locate_ranges(&raw, &title);
+        assert_eq!(r.num_ranges, 53);
+        assert_eq!(r.truncated, 3);
+        assert_eq!(r.ranges.len(), 50);
+        assert_eq!(r.largest_gap_ms, 53_000.0);
+        assert_eq!(r.ranges[0].count, 53);
+        assert_eq!(r.ranges[49].count, 4, "the three smallest were dropped");
+        assert!(
+            r.ranges
+                .windows(2)
+                .all(|w| w[0].duration_ms > w[1].duration_ms)
         );
     }
 
