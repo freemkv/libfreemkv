@@ -896,6 +896,20 @@ mod tests {
         }
     }
 
+    // Pins each AMODE's exact speaker mask (ETSI TS 102 114 table); the count
+    // check above cannot tell two same-count AMODEs (11 vs 12) apart.
+    #[test]
+    fn ddts_channel_layout_masks_are_exact_per_amode() {
+        let expect: [u16; 16] = [
+            0x0001, 0x0002, 0x0002, 0x0002, 0x0002, 0x0003, 0x0012, 0x0013, 0x0006, 0x0007,
+            0x0206, 0x0143, 0x0053, 0x0207, 0x0246, 0x0217,
+        ];
+        for (amode, want) in expect.iter().enumerate() {
+            assert_eq!(dts_channel_layout(amode, false), *want, "AMODE {amode}");
+            assert_eq!(dts_channel_layout(amode, true), *want | 0x0008, "AMODE {amode}+LFE");
+        }
+    }
+
     #[test]
     fn dts_reserved_amode_is_rejected_not_guessed() {
         // AMODE (6 bits) 16..=63 are RESERVED — no channel count/mask is known; the
