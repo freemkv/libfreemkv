@@ -74,6 +74,10 @@ struct PesAssembler {
     /// partial PES would inject corrupt bytes. The partial PES is dropped and
     /// the assembler resyncs on the next PUSI. `None` until the first packet.
     last_cc: Option<u8>,
+    /// PUSI bit and payload of that packet: a same-CC packet is a duplicate (h222 2.4.3.3)
+    /// only if it repeats them; otherwise it is new data after a gap (e.g. a clip join).
+    last_pusi: bool,
+    last_payload: Vec<u8>,
     /// Absolute source byte offset of the in-progress PES's first byte (the
     /// PUSI packet that began it), or `None` when no source base is threaded.
     /// Stamped at PES start, emitted on the completed packet — provenance is
@@ -115,6 +119,8 @@ impl PesAssembler {
             header_remaining: 0,
             head: Vec::new(),
             last_cc: None,
+            last_pusi: false,
+            last_payload: Vec::new(),
             pes_source: None,
             pending_discontinuity: false,
         }
@@ -493,12 +499,17 @@ impl TsDemuxer {
         // adaptation == 0x02 (AF only) already returned above, so only 0x03
         // (AF + payload) can carry an adaptation field here.
         let discontinuity_flag = adaptation == 0x03 && ts[4] > 0 && (ts[5] & 0x80) != 0;
-        // A duplicate (same CC, no discontinuity) repeats the previous packet: nothing new.
-        if asm.last_cc == Some(cc) && !discontinuity_flag {
+        // A duplicate repeats the previous packet (same CC and payload; the adaptation field,
+        // e.g. PCR, may differ): nothing new. A same-CC packet with other data is a gap.
+        let same_cc = asm.last_cc == Some(cc) && !discontinuity_flag;
+        if same_cc && asm.last_pusi == pusi && asm.last_payload == payload {
             return;
         }
-        let cc_gap = cc_is_gap(asm.last_cc, cc);
+        let cc_gap = same_cc || cc_is_gap(asm.last_cc, cc);
         asm.last_cc = Some(cc);
+        asm.last_pusi = pusi;
+        asm.last_payload.clear();
+        asm.last_payload.extend_from_slice(payload);
         // A gap means packets for this PID were lost. Sticky flag rides to the first
         // post-gap PES so the codec consumer drops forward to the next keyframe (B1).
         let gap = discontinuity_flag || cc_gap;
@@ -1180,6 +1191,27 @@ mod tests {
         assert_eq!(out.len(), 1, "A is dropped: {out:?}");
         assert!(out[0].data.starts_with(b"CCCC"));
         assert!(out[0].discontinuity);
+    }
+
+    // Clips joined through one demuxer restart the CC arbitrarily: a new clip's PUSI with
+    // the previous packet's CC is new data, not a duplicate, and must start its own PES.
+    #[test]
+    fn same_cc_packet_with_new_data_is_not_a_duplicate() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = Vec::new();
+        for p in [
+            ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")),
+            ts_payload_packet(pid, false, 1, &[b'a'; 184]),
+            ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")),
+            ts_payload_packet(pid, false, 2, &[b'b'; 184]),
+        ] {
+            out.extend(demux.feed(&p));
+        }
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].data.starts_with(b"AAAA") && out[0].data.ends_with(&[b'a'; 184]));
+        assert!(out[1].data.starts_with(b"BBBB") && out[1].data.ends_with(&[b'b'; 184]));
     }
 
     // A PUSI whose payload is not a PES start leaves no PES open: the continuations after it
