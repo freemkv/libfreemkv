@@ -112,16 +112,17 @@ impl Flusher {
 
     /// Backpressure before a write: wait while more than `2 × C` is unflushed.
     pub(super) fn wait_room(&self, written: u64, halt: Option<&Halt>) -> io::Result<()> {
-        {
-            // Never block on bytes the worker was not asked to flush (chunk may have shrunk).
-            let mut st = self.lock();
-            if written > st.requested && written.saturating_sub(st.flushed) > 2 * st.chunk {
+        self.wait(halt, halt, |st| {
+            if written.saturating_sub(st.flushed) <= 2 * st.chunk {
+                return true;
+            }
+            // Never block on bytes the worker was not asked to flush: re-checked under the
+            // lock on every wake, as the chunk may shrink while this writer waits.
+            if written > st.requested {
                 st.requested = written;
                 self.shared.cv.notify_all();
             }
-        }
-        self.wait(halt, halt, |st| {
-            written.saturating_sub(st.flushed) <= 2 * st.chunk
+            false
         })
     }
 
@@ -151,7 +152,7 @@ impl Flusher {
         &self,
         abort: Option<&Halt>,
         stop: Option<&Halt>,
-        done: impl Fn(&State) -> bool,
+        mut done: impl FnMut(&mut State) -> bool,
     ) -> io::Result<()> {
         let progress = self.lock().flush.progress().clone();
         let mut timer = StallTimer::new(self.timing.stall, &progress);
@@ -161,7 +162,7 @@ impl Flusher {
             if let Some(e) = st.error {
                 return Err(e.error());
             }
-            if done(&st) {
+            if done(&mut st) {
                 return Ok(());
             }
             st = self
@@ -180,7 +181,7 @@ impl Flusher {
             }
             let stalled = timer.poll(&progress) == Stall::Expired;
             st = self.lock();
-            if stalled && !done(&st) {
+            if stalled && !done(&mut st) {
                 tracing::error!(
                     target: "freemkv::io",
                     stall_s = self.timing.stall.as_secs(),
@@ -290,6 +291,42 @@ mod tests {
         )
         .unwrap();
         f.wait_room(10_000, None).unwrap();
+        assert!(f.error().is_none());
+    }
+
+    // Unrequested bytes appearing after the writer blocked (the chunk shrank mid-wait) must
+    // still be handed over; a one-shot check before the wait idles the worker to a stall.
+    #[test]
+    fn wait_room_requests_bytes_unrequested_while_blocked() {
+        let file = tempfile::tempfile().unwrap();
+        let timing = FlushTiming {
+            stall: Duration::from_millis(400),
+            slow_chunk: Duration::from_secs(10),
+            chunk_min: 100,
+            chunk_max: 100,
+            sample_every: Duration::from_millis(50),
+        };
+        let f = Arc::new(
+            Flusher::spawn(
+                &file,
+                Arc::new(Instant0),
+                timing,
+                FlushProgress::default(),
+                0,
+            )
+            .unwrap(),
+        );
+        // Once the worker idles: requested but not notified, so the writer blocks and hands
+        // nothing over; the bytes then become unrequested while it waits.
+        std::thread::sleep(Duration::from_millis(50));
+        f.lock().requested = 10_000;
+        let writer = {
+            let f = f.clone();
+            std::thread::spawn(move || f.wait_room(10_000, None))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        f.lock().requested = 0;
+        writer.join().unwrap().unwrap();
         assert!(f.error().is_none());
     }
 }

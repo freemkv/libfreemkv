@@ -4,7 +4,7 @@
 //! producer re-fills in place, for zero allocations and zero cross-thread frees in the hot
 //! loop. Works for any stream whose source is an `io::Read`, not just a `SectorSource`.
 
-use crate::halt::{Halt, Recv, SendOutcome};
+use crate::halt::{Halt, Joined, Recv, SendOutcome, join_within};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::io::Read;
 use std::thread::JoinHandle;
@@ -31,23 +31,36 @@ pub const DEFAULT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// producer-thread join handle so dropping the shell joins the
 /// producer.
 ///
-/// Drop blocks until the producer exits. For a prompt exit, drop the
-/// forward receiver and recycle sender first (channel disconnection)
-/// or cancel the [`Halt`] passed to [`BytePrefetcher::new`], observed
-/// within one [`WAIT_SLICE`](crate::halt::WAIT_SLICE) even while parked on a channel op.
+/// Drop waits a bounded grace for the producer, then detaches it (a `read()` that never
+/// returns cannot be interrupted). For a prompt exit, drop the forward receiver and recycle
+/// sender first, or cancel the [`Halt`] passed to [`BytePrefetcher::new`].
 pub struct PrefetchShell {
     producer: Option<JoinHandle<()>>,
+}
+
+// How long Drop waits for the producer before detaching it.
+const DROP_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
+
+// Join the producer within `DROP_GRACE`; a producer still blocked in `read()` is detached.
+fn join_or_detach(h: JoinHandle<()>) {
+    if !matches!(join_within(h, DROP_GRACE, None), Joined::Done(_)) {
+        tracing::warn!(target: "freemkv::io", "byte prefetch producer blocked in read; detached");
+    }
 }
 
 impl Drop for PrefetchShell {
     fn drop(&mut self) {
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            join_or_detach(h);
         }
     }
 }
 
-/// Spawned byte prefetcher. Drop joins the producer thread.
+/// Spawned byte prefetcher. Drop joins the producer thread (bounded; see [`PrefetchShell`]).
 pub struct BytePrefetcher {
     // Non-`Option`: `into_channels`/`Drop` swap in a disconnected stand-in (dead-channel
     // `mem::replace`, as `sector::PrefetchedSectorSource` does), so a missing `rx` can
@@ -179,7 +192,7 @@ impl Drop for BytePrefetcher {
         drop(dead_recv);
         drop(std::mem::replace(&mut self.recycle_tx, dead_send));
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            join_or_detach(h);
         }
     }
 }
@@ -230,6 +243,27 @@ mod tests {
                 .is_ok(),
             "operation did not complete within {secs}s (deadlock)"
         );
+    }
+
+    // A reader blocked forever in read() cannot be interrupted: both Drops must return
+    // after the grace (detaching the producer) instead of wedging the dropping thread.
+    #[test]
+    fn drop_detaches_producer_blocked_in_read() {
+        struct Blocked(crossbeam_channel::Receiver<()>);
+        impl Read for Blocked {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (release, blocked) = bounded::<()>(0);
+        let pf = BytePrefetcher::new(Blocked(blocked.clone()), 8, None).expect("spawn");
+        within(5, move || drop(pf));
+        let (_rx, _recycle, shell) = BytePrefetcher::new(Blocked(blocked), 8, None)
+            .expect("spawn")
+            .into_channels();
+        within(5, move || drop(shell));
+        drop(release);
     }
 
     // CRITICAL regression: dropping the forward receiver + recycle sender after into_channels
