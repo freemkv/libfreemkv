@@ -23,6 +23,9 @@ impl Disc {
         halt: Option<&crate::halt::Halt>,
     ) -> Result<Vec<DiscTitle>> {
         let mut titles = Vec::new();
+        // clip_id -> packet count, shared across playlists so each .clpi is read once per scan.
+        let mut clip_pkts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
             for entry in &playlist_dir.entries {
                 if halt.is_some_and(|h| h.is_cancelled()) {
@@ -51,9 +54,13 @@ impl Disc {
                             continue;
                         }
                     };
-                    if let Some(title) =
-                        Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)?
-                    {
+                    if let Some(title) = Self::parse_playlist_memo(
+                        reader,
+                        udf_fs,
+                        &entry.name,
+                        &mpls_data,
+                        &mut clip_pkts,
+                    )? {
                         titles.push(title);
                     }
                 }
@@ -70,11 +77,25 @@ impl Disc {
 
     // Parse one MPLS playlist into a DiscTitle. `Ok(None)` covers both benign misses
     // (unparseable, sub-30s) and deliberate drops; `Err` (only Halted) means the scan is over.
+    #[cfg(test)]
     pub(super) fn parse_playlist(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         filename: &str,
         data: &[u8],
+    ) -> Result<Option<DiscTitle>> {
+        let mut clip_pkts = std::collections::HashMap::new();
+        Self::parse_playlist_memo(reader, udf_fs, filename, data, &mut clip_pkts)
+    }
+
+    // As `parse_playlist`, with a caller-owned clip_id -> packet-count memo. Failures are never
+    // inserted, so a transient .clpi error is retried by the next playlist.
+    pub(super) fn parse_playlist_memo(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        filename: &str,
+        data: &[u8],
+        clip_pkts: &mut std::collections::HashMap<String, u32>,
     ) -> Result<Option<DiscTitle>> {
         let parsed = match mpls::parse(data) {
             Ok(p) => p,
@@ -115,10 +136,8 @@ impl Disc {
         let mut feed_pos: u64 = 0;
         let mut spans: std::collections::HashMap<String, (u64, u64)> =
             std::collections::HashMap::new();
-        // Packet count per clip_id: a repeated PlayItem must not re-read/re-parse its .clpi
-        // (a hostile MPLS naming one large clip thousands of times would never finish).
-        let mut clip_pkts: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        // `clip_pkts` memoizes the packet count per clip_id: neither a repeated PlayItem nor
+        // another playlist may re-read/re-parse a .clpi (hostile MPLS floods would never finish).
 
         for play_item in &parsed.play_items {
             let clip_dur =
@@ -2428,6 +2447,48 @@ mod tests {
         );
     }
 
+    /// Entities in <di:name> are decoded by read_meta_title itself.
+    #[test]
+    fn read_meta_title_decodes_xml_entities() {
+        let mut disc = MemDisc::new();
+        let xml = b"<x><di:name>Tom &amp; Jerry</di:name></x>".to_vec();
+        let dl = DirSpec {
+            name: "DL".to_string(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![file_with("bdmt_eng.xml", 104, 50000, xml, false)],
+            subdirs: vec![],
+        };
+        let meta = DirSpec {
+            name: "META".to_string(),
+            icb_lba: 28,
+            dir_data_lba: 29,
+            files: Vec::new(),
+            subdirs: vec![dl],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![meta],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(
+            Disc::read_meta_title(&mut disc, &udf),
+            Some("Tom & Jerry".to_string())
+        );
+    }
+
     /// The placeholder title "Blu-ray" and empty titles are rejected
     /// (bluray.rs `!title.is_empty() && title != "Blu-ray"`).
     #[test]
@@ -2636,6 +2697,45 @@ mod tests {
             reads.push(cd.reads);
         }
         assert_eq!(reads[0], reads[1], "extra PlayItems of a seen clip re-read");
+    }
+
+    // Reads that touch one LBA (the .clpi of clip 00001 at 8000).
+    struct LbaWatch {
+        inner: MemDisc,
+        lba: u32,
+        hits: u32,
+    }
+    impl SectorSource for LbaWatch {
+        fn capacity_sectors(&self) -> u32 {
+            self.inner.capacity_sectors()
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            if lba <= self.lba && self.lba < lba + count as u32 {
+                self.hits += 1;
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // N playlists naming one clip must read its .clpi once per scan, not once per playlist.
+    #[test]
+    fn scan_bluray_titles_reads_shared_clpi_once_across_playlists() {
+        let mut disc = MemDisc::new();
+        let udf = two_playlist_bd_fs(&mut disc);
+        let mut w = LbaWatch {
+            inner: disc,
+            lba: PART_START + 8000,
+            hits: 0,
+        };
+        let titles = Disc::scan_bluray_titles(&mut w, &udf, None).expect("scan");
+        assert_eq!(titles.len(), 2);
+        assert_eq!(w.hits, 1, "shared .clpi re-read per playlist");
     }
 
     // The in-loop poll must fire before any playlist is read (the post-loop poll alone would
