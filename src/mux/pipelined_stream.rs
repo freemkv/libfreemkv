@@ -462,12 +462,15 @@ impl Stream for PipelinedPesStream {
     }
 
     fn errors(&self) -> u64 {
-        self.blanked.load(std::sync::atomic::Ordering::Relaxed)
+        // Blanked units plus frames the B1 gates dropped, as `DiscStream::errors` counts.
+        let dropped: u64 = self.resync.iter().map(|g| g.dropped_total()).sum();
+        self.blanked.load(std::sync::atomic::Ordering::Relaxed) + dropped
     }
 
     fn lost_bytes(&self) -> u64 {
         // Each blanked unit is one whole aligned unit of zeros (KS-2: 6144 bytes).
-        self.errors() * crate::aacs::content::ALIGNED_UNIT_LEN as u64
+        let blanked = self.blanked.load(std::sync::atomic::Ordering::Relaxed);
+        blanked * crate::aacs::content::ALIGNED_UNIT_LEN as u64
     }
 
     fn config_changes(&self) -> Vec<(usize, u64)> {
@@ -1043,6 +1046,21 @@ mod tests {
         let f = stream.read().unwrap().expect("routed MP2 frame");
         assert_eq!((f.track, f.data), (2, vec![0x56]));
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
+    }
+
+    // Frames the B1 gates dropped count as errors (as on the live DiscStream), but
+    // are not lost read bytes: lost_bytes stays the blanked-unit total.
+    #[test]
+    fn errors_include_frames_the_resync_gate_dropped() {
+        use crate::pes::Stream as _;
+        let (mut stream, _tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+        stream.resync.push(super::super::resync::ResyncGate::new());
+        let gate = stream.resync.last_mut().unwrap();
+        assert!(!gate.admit(true, true, false));
+        assert!(!gate.admit(true, false, false));
+        assert!(gate.admit(true, false, true));
+        assert_eq!(stream.errors(), 2, "dropped frames survive the resync");
+        assert_eq!(stream.lost_bytes(), 0, "no read bytes were lost");
     }
 
     // PS packets with no track (a deselected / undeclared stream, or no DVD PID) warn
