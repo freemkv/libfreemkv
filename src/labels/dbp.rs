@@ -26,10 +26,7 @@ use std::collections::BTreeMap;
 /// only dbp discs instead of firing on every BD-J disc. `parse()` repeats the
 /// check as belt-and-suspenders.
 pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
-    jar::for_each_jar(reader, udf, |_entry, archive| {
-        jar::has_path_prefix(archive, "com/dbp/").then_some(())
-    })
-    .is_some()
+    jar::any_jar_has_prefix(reader, udf, "com/dbp/")
 }
 
 /// Scan every top-level `/BDMV/JAR/*.jar` for the dbp framework and

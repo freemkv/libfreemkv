@@ -27,10 +27,7 @@ pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     // Real signal is `com/bydeluxe/` in a jar's central directory: a cheap
     // scan, no bytecode walk, so this parser claims only Deluxe discs.
     // `parse()` repeats the check.
-    jar::for_each_jar(reader, udf, |_entry, archive| {
-        jar::has_path_prefix(archive, "com/bydeluxe/").then_some(())
-    })
-    .is_some()
+    jar::any_jar_has_prefix(reader, udf, "com/bydeluxe/")
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {

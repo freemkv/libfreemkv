@@ -321,8 +321,21 @@ impl Seek for ExtentReader<'_> {
 /// Used by parsers as a cheap "is this MY framework's jar?" check
 /// (e.g. `has_path_prefix(archive, "com/dbp/")` for dbp,
 /// `has_path_prefix(archive, "com/bydeluxe/")` for Deluxe).
-pub fn has_path_prefix(archive: &Jar, prefix: &str) -> bool {
+pub fn has_path_prefix<Z: Read + Seek>(archive: &ZipArchive<Z>, prefix: &str) -> bool {
     archive.file_names().any(|n| n.starts_with(prefix))
+}
+
+// Jars up to this size are read whole by `any_jar_has_prefix` (one chunk); larger ones
+// are opened in place so only the tail and central directory are read.
+const DETECT_IN_MEMORY_JAR_BYTES: u64 = CHUNK_SECTORS * 2048;
+
+/// True if any top-level `/BDMV/JAR/*.jar` has a central-directory entry starting
+/// with `prefix`: a framework detector that never reads entry data.
+pub fn any_jar_has_prefix(reader: &mut dyn SectorSource, udf: &UdfFs, prefix: &str) -> bool {
+    visit_jars_limited(reader, udf, DETECT_IN_MEMORY_JAR_BYTES, |_, jar| {
+        jar.filter(|j| has_path_prefix(j, prefix)).map(|_| ())
+    })
+    .is_some()
 }
 
 /// Iterate every `.class` entry, parse it with [`class_reader`](super::class_reader)
@@ -698,6 +711,79 @@ mod tests {
         });
         assert_eq!(visited, 2);
         assert_eq!(budget, 1_000_000 - payload.len() as u64);
+    }
+
+    // Counts sectors read through it.
+    struct Counting<'a>(&'a mut crate::udf::fixture::MemDisc, u64);
+
+    impl SectorSource for Counting<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.1 += u64::from(count);
+            self.0.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // Framework detection answers from each jar's central directory: a large jar's
+    // entry data is never read.
+    #[test]
+    fn framework_detect_reads_only_the_central_directory() {
+        use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("assets/bg.png", opts).expect("start_file");
+            w.write_all(&vec![0x5Au8; 1024 * 1024]).expect("write");
+            for n in [
+                "com/bydeluxe/A.class",
+                "com/dbp/B.class",
+                "com/foxbd/C.class",
+            ] {
+                w.start_file(n, opts).expect("start_file");
+                w.write_all(MINIMAL_CLASS).expect("write");
+            }
+            w.finish().expect("finish");
+        }
+        let dir = |name: &str, icb, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs,
+        };
+        let jar_dir = dir(
+            "JAR",
+            30,
+            vec![file_with("00000.jar", 32, 4000, buf, true)],
+            vec![],
+        );
+        let root = dir("", 10, vec![], vec![dir("BDMV", 20, vec![], vec![jar_dir])]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let detects: [fn(&mut dyn SectorSource, &UdfFs) -> bool; 3] = [
+            super::super::deluxe::detect,
+            super::super::dbp::detect,
+            super::super::fox::detect,
+        ];
+        for detect in detects {
+            let mut counting = Counting(&mut disc, 0);
+            assert!(detect(&mut counting, &udf));
+            assert!(
+                counting.1 < 128,
+                "read {} sectors of a 512-sector jar",
+                counting.1
+            );
+        }
     }
 
     // High-ratio deflate entries (each under the per-entry cap) stop being offered
