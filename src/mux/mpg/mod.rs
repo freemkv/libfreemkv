@@ -43,8 +43,10 @@ const R0_SD: u32 = 10_080_000 / 8 / 50;
 const R0_HD: u32 = 128_000_000 / 8 / 50;
 /// MPEG audio and extension buffers: 16 KiB, scale 0 (design §2.4 table).
 const AUDIO_BOUND: u16 = 16 * 1024 / 128;
-/// `0xBD`: the largest 13-bit bound, scale 1 (J11).
-const PRIVATE_BOUND: u16 = 8191;
+/// The largest 13-bit buffer bound.
+const MAX_BOUND: u16 = 8191;
+/// `0xBD`: the largest bound, scale 1 (J11).
+const PRIVATE_BOUND: u16 = MAX_BOUND;
 /// Video buffer when no `vbv_buffer_size` parses: the same 13-bit maximum.
 const VIDEO_BOUND_MAX: u64 = 8191 * 1024;
 
@@ -112,6 +114,7 @@ pub struct MpgSink<W: Write + Send> {
     origin_saturated: u64,
     frames: u64,
     finished: bool,
+    failed: bool,
 }
 
 // The offset of the first picture start code (`00 00 01 00`): where a video AU commences
@@ -180,10 +183,20 @@ impl<W: Write + Send> MpgSink<W> {
         let mut route = vec![None; title.streams.len()];
         let mut private_buffer = None;
         // Video first, then every other carried track in track order.
-        let order = std::iter::once(video_track)
-            .chain((0..title.streams.len()).filter(|&i| i != video_track));
-        for i in order {
+        let mut order: VecDeque<usize> = std::iter::once(video_track)
+            .chain((0..title.streams.len()).filter(|&i| i != video_track))
+            .collect();
+        let mut deferred = vec![false; title.streams.len()];
+        while let Some(i) = order.pop_front() {
             let Some(c) = plan.carriage[i] else { continue };
+            // An extension listed ahead of its base waits, once, for the base's output slot.
+            if let Carriage::Mp2Extension { base, .. } = c
+                && route[base].is_none()
+                && !std::mem::replace(&mut deferred[i], true)
+            {
+                order.push_back(i);
+                continue;
+            }
             let (stream_id, payload, kind, sparse) = match c {
                 Carriage::Video { mpeg1 } => (
                     pack::VIDEO_ID,
@@ -203,7 +216,9 @@ impl<W: Write + Send> MpgSink<W> {
                     )
                 }
                 Carriage::Mp2Extension { stream_id, base } => {
-                    let base_out = route[base].unwrap_or(0);
+                    let Some(base_out) = route[base] else {
+                        continue;
+                    };
                     (
                         stream_id,
                         Payload::WholeAu,
@@ -242,7 +257,7 @@ impl<W: Write + Send> MpgSink<W> {
                     buffers.push(BufferSpec {
                         stream_id,
                         scale_1024: true,
-                        size: 8191,
+                        size: MAX_BOUND,
                     });
                     buffers.len() - 1
                 }
@@ -306,6 +321,7 @@ impl<W: Write + Send> MpgSink<W> {
             origin_saturated: 0,
             frames: 0,
             finished: false,
+            failed: false,
         })
     }
 
@@ -338,10 +354,9 @@ impl<W: Write + Send> MpgSink<W> {
         }
         let pts = pts.max(0) as u64;
         let dts = dts.map(|d| d.max(0) as u64).filter(|&d| d != pts);
-        let mux = self
-            .mux
-            .as_mut()
-            .expect("the mux exists once the origin is set");
+        let Some(mux) = self.mux.as_mut() else {
+            return Err(crate::error::Error::StreamClosed.into());
+        };
         mux.push(
             out,
             Au {
@@ -442,7 +457,9 @@ impl<W: Write + Send> MpgSink<W> {
             return Ok(());
         }
         let spanned = self.span.is_some_and(|(lo, hi)| hi - lo >= WINDOW_TICKS);
-        if !eof && (!spanned || self.deriver.pending()) {
+        // Past the byte cap the origin is set from what is held, however short the span.
+        let over_cap = self.window_bytes > HOLD_CAP_BYTES;
+        if !eof && !over_cap && (!spanned || self.deriver.pending()) {
             return Ok(());
         }
         // Design §2.3 (MPG3-8): the lowest first DTS/PTS over ALL tracks maps to 1.5 s.
@@ -461,8 +478,11 @@ impl<W: Write + Send> MpgSink<W> {
             _ => R0_HD,
         };
         let specs = self.outs.iter().map(|o| o.spec.clone()).collect();
-        let writer = self.writer.take().expect("the writer is handed over once");
+        let Some(writer) = self.writer.take() else {
+            return Err(crate::error::Error::StreamClosed.into());
+        };
         self.mux = Some(Mux::new(writer, specs, self.buffers.clone(), first, r0));
+        self.window_bytes = 0;
         for (out, au) in std::mem::take(&mut self.window) {
             self.accept(out, au)?;
         }
@@ -694,9 +714,29 @@ impl<W: Write + Send> Stream for MpgSink<W> {
 
     fn finish(&mut self) -> io::Result<()> {
         if self.finished {
-            return Ok(());
+            return match self.failed {
+                true => Err(crate::error::Error::StreamClosed.into()),
+                false => Ok(()),
+            };
         }
         self.finished = true;
+        let r = self.finish_inner();
+        self.failed = r.is_err();
+        r
+    }
+
+    fn info(&self) -> &DiscTitle {
+        &self.title
+    }
+
+    fn undelivered_streams(&self) -> Vec<usize> {
+        // An extension whose base is not carried, once its packets arrived (J23).
+        self.excluded.seen()
+    }
+}
+
+impl<W: Write + Send> MpgSink<W> {
+    fn finish_inner(&mut self) -> io::Result<()> {
         self.deriver.finish();
         self.drain_video()?;
         for out in 0..self.outs.len() {
@@ -721,6 +761,7 @@ impl<W: Write + Send> Stream for MpgSink<W> {
                 pstd_late_aus = c.pstd.late_aus,
                 pts_gap_over_0_7s = c.pstd.pts_gaps,
                 interleave_cap = c.pstd.interleave_cap,
+                rebased_gaps = c.pstd.rebased_gaps,
                 origin_saturated = c.origin_saturated,
                 "mpg: program stream needed corrections (counted, not refused)"
             );
@@ -729,14 +770,5 @@ impl<W: Write + Send> Stream for MpgSink<W> {
             Some(m) => m.finish(),
             None => Err(crate::error::Error::MuxEmpty.into()),
         }
-    }
-
-    fn info(&self) -> &DiscTitle {
-        &self.title
-    }
-
-    fn undelivered_streams(&self) -> Vec<usize> {
-        // An extension whose base is not carried, once its packets arrived (J23).
-        self.excluded.seen()
     }
 }

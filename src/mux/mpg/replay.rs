@@ -340,7 +340,7 @@ pub(super) fn replay(p: &Parsed, aus: &Aus) -> Result<Found, String> {
             }
             if let Some(pts) = x.pts {
                 if key.1.is_none_or(|s| !(0x20..=0x3F).contains(&s))
-                    && last_pts.is_some_and(|l| pts.abs_diff(l) > 63_000)
+                    && last_pts.is_some_and(|l| pts.abs_diff(l) > super::pstd::MAX_PTS_GAP_TICKS)
                 {
                     found.pts_gaps += 1;
                 }

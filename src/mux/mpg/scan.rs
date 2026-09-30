@@ -8,7 +8,7 @@ use crate::disc::{
     LabelQualifier, Resolution, SampleRate, Stream, SubtitleStream, VideoStream,
 };
 use crate::mux::ps::{PsDemuxer, PsPacket};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bytes of each stream's first packets kept for the probes.
 const PROBE_BYTES: usize = 64 * 1024;
@@ -98,8 +98,31 @@ fn lang_of(bytes: [u8; 3]) -> String {
     }
 }
 
-// Codec, resolution, frame rate and display aspect from a sequence header.
-type Probed = (Codec, Resolution, FrameRate, Option<(u32, u32)>);
+// Codec, resolution, frame rate, display aspect and colour from a sequence header.
+type Probed = (Codec, Resolution, FrameRate, Option<(u32, u32)>, ColorSpace);
+
+// SD takes its standard's colour as the DVD scan does (576/288 lines PAL, 480/240 NTSC).
+fn sd_colour(height: u32) -> ColorSpace {
+    match height {
+        576 | 288 => ColorSpace::Bt470bg,
+        480 | 240 => ColorSpace::Smpte170m,
+        _ => ColorSpace::Bt709,
+    }
+}
+
+// A sequence_display_extension (id 2) with colour_description names the colour outright.
+fn signalled_colour(es: &[u8]) -> Option<ColorSpace> {
+    let at = es
+        .windows(5)
+        .position(|w| w[..4] == [0, 0, 1, 0xB5] && w[4] >> 4 == 2 && w[4] & 1 == 1)?;
+    let d = es.get(at + 5..at + 8)?;
+    match (d[0], d[2]) {
+        (1, _) | (_, 1) => Some(ColorSpace::Bt709),
+        (5, _) | (_, 5) => Some(ColorSpace::Bt470bg),
+        (6, _) | (_, 6) => Some(ColorSpace::Smpte170m),
+        _ => None,
+    }
+}
 
 // MPEG-2 (or MPEG-1) video probed from its sequence header.
 fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<Probed> {
@@ -118,11 +141,13 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<Probed> {
     };
     let (mut res, mut rate) = (Resolution::Unknown, FrameRate::Unknown);
     let mut dar = None;
+    let mut colour = ColorSpace::Bt709;
     if let Some(h) = seq.and_then(|s| es.get(s + 4..s + 8)) {
         let height = (u32::from(h[1] & 0x0F) << 8) | u32::from(h[2]);
         let progressive = ext
             .and_then(|e| es.get(e + 5))
             .is_none_or(|b| b & 0x08 != 0);
+        colour = signalled_colour(es).unwrap_or_else(|| sd_colour(height));
         res = match (height, progressive) {
             (480, false) => Resolution::R480i,
             (576, false) => Resolution::R576i,
@@ -151,7 +176,7 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<Probed> {
             _ => None,
         };
     }
-    Some((codec, res, rate, dar))
+    Some((codec, res, rate, dar, colour))
 }
 
 // Design §4 step 3 "MPEG audio | header + mc_header": Layer II frames from `at` go through
@@ -303,24 +328,27 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
     // Track order: the map's entries (0xBD expanded by the FMKV table), then anything seen
     // that it does not name, in id order (design §4 step 3).
     let mut order: Vec<Key> = Vec::new();
+    // Each key once, whatever the map lists: bounds the streams a crafted map can name.
+    let mut listed: BTreeSet<Key> = BTreeSet::new();
     let mut map_type: BTreeMap<u8, (u8, Vec<u8>)> = BTreeMap::new();
     if let Some(m) = &map {
         for (ty, id, desc) in &m.entries {
             map_type.insert(*id, (*ty, desc.clone()));
             if *id == pack::PRIVATE_STREAM_1 {
-                order.extend(
-                    m.subs
-                        .iter()
-                        .map(|s| (pack::PRIVATE_STREAM_1, Some(s.sub_id))),
-                );
-            } else {
+                for s in &m.subs {
+                    let key = (pack::PRIVATE_STREAM_1, Some(s.sub_id));
+                    if listed.insert(key) {
+                        order.push(key);
+                    }
+                }
+            } else if listed.insert((*id, None)) {
                 order.push((*id, None));
             }
         }
     }
     let mut rest: Vec<Key> = seen
         .keys()
-        .filter(|k| !order.contains(k))
+        .filter(|k| !listed.contains(k))
         .copied()
         .collect();
     // Without a map: video, MPEG audio, then private sub-streams (audio before subpictures).
@@ -357,7 +385,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     tracing::warn!(target: "mux", stream_id = key.0, "mpg: a second video stream; left out");
                     continue;
                 }
-                let Some((codec, res, rate, dar)) = probe_video(es, ty) else {
+                let Some((codec, res, rate, dar, colour)) = probe_video(es, ty) else {
                     tracing::warn!(target: "mux", stream_id = key.0, "mpg: video stream with no MPEG-1/2 sequence header in the head; left out");
                     continue;
                 };
@@ -369,11 +397,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     resolution: res,
                     frame_rate: rate,
                     hdr: HdrFormat::Sdr,
-                    color_space: if res.pixels().is_some_and(|(_, h)| h == 576) {
-                        ColorSpace::Bt470bg
-                    } else {
-                        ColorSpace::Bt709
-                    },
+                    color_space: colour,
                     display_aspect: dar,
                     secondary: false,
                     label: String::new(),
@@ -463,7 +487,10 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                             .and_then(|m| m.palette.as_ref())
                             .map(|p| idx_text(p, video_res)),
                     }),
-                    _ => continue,
+                    _ => {
+                        tracing::warn!(target: "mux", sub_id = sub, "mpg: private_stream_1 sub-stream of an unhandled kind; left out");
+                        continue;
+                    }
                 };
                 streams.push(s);
             }
@@ -509,7 +536,7 @@ mod dar_tests {
     fn probe_video_reports_the_sequence_header_aspect() {
         // 720x576, aspect code 3 (16:9), frame-rate code 3 (25 fps).
         let es = [0, 0, 1, 0xB3, 0x2D, 0x02, 0x40, 0x33, 0, 0];
-        let (_, res, _, dar) = probe_video(&es, Some(0x02)).expect("video");
+        let (_, res, _, dar, _) = probe_video(&es, Some(0x02)).expect("video");
         assert_eq!(res, Resolution::R576p);
         assert_eq!(dar, Some((16, 9)));
     }
@@ -518,7 +545,7 @@ mod dar_tests {
     fn square_pixel_code_uses_the_coded_size() {
         // 320x240, aspect code 1 (square pixels), frame-rate code 4.
         let es = [0, 0, 1, 0xB3, 0x14, 0x00, 0xF0, 0x14, 0, 0];
-        let (_, _, _, dar) = probe_video(&es, Some(0x02)).expect("video");
+        let (_, _, _, dar, _) = probe_video(&es, Some(0x02)).expect("video");
         assert_eq!(dar, Some((320, 240)));
     }
 
@@ -526,7 +553,7 @@ mod dar_tests {
     fn mpeg1_pel_aspect_code_is_not_a_display_ratio() {
         // MPEG-1 352x288, code 3 is a pel aspect ratio (11172-2), not 16:9.
         let es = [0, 0, 1, 0xB3, 0x16, 0x01, 0x20, 0x33, 0, 0];
-        let (_, _, _, dar) = probe_video(&es, Some(0x01)).expect("video");
+        let (_, _, _, dar, _) = probe_video(&es, Some(0x01)).expect("video");
         assert_eq!(dar, None);
     }
 }

@@ -49,7 +49,7 @@ pub struct PsPacket {
     pub dts: Option<u64>,
     /// Elementary stream payload data.
     pub data: Vec<u8>,
-    /// Source position of this PES's first ES byte, stamped at the demux seam
+    /// Source position of this PES's start code, stamped at the demux seam
     /// from the producer's known stream offset. `None` when the demuxer was fed
     /// without a base offset.
     pub source: Option<crate::pes::SourcePos>,
@@ -448,6 +448,11 @@ impl PsDemuxer {
                                 // a corrupt unbounded PES could stream endless non-boundary
                                 // bytes; cap the buffer to stop unbounded alloc, then flush.
                                 if self.buffer.len() - sc > MAX_PS_BUFFER {
+                                    tracing::warn!(
+                                        target: "mux",
+                                        stream_id = id,
+                                        "ps: unbounded PES passed the buffer cap; emitted truncated"
+                                    );
                                     self.pending_scan = None;
                                     self.buffer.len()
                                 } else {
