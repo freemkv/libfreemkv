@@ -9,6 +9,7 @@
 use super::meta;
 use crate::disc::DiscTitle;
 use crate::halt::{Halt, WAIT_SLICE};
+use crate::sector::stage::Stage;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -222,7 +223,7 @@ enum Mode {
         ended: bool,
     },
     Read {
-        reader: BufReader<HaltRead>,
+        reader: BufReader<Stage<HaltRead>>,
         meta: meta::M2tsMeta,
     },
 }
@@ -296,7 +297,12 @@ impl NetworkStream {
     /// [`listen`](Self::listen) that a [`Halt`] can interrupt, while waiting for
     /// the sender to connect and while blocked on a stalled sender.
     pub fn listen_with_halt(addr: &str, halt: Option<Halt>) -> io::Result<Self> {
-        Self::accept_from_with_halt(TcpListener::bind(addr)?, halt)
+        Self::listen_staged(addr, halt, false)
+    }
+
+    // `listen_with_halt` whose decryption stage passes ciphertext when `raw`.
+    pub(crate) fn listen_staged(addr: &str, halt: Option<Halt>, raw: bool) -> io::Result<Self> {
+        Self::accept_staged(TcpListener::bind(addr)?, halt, raw)
     }
 
     /// Accept one connection from an already-bound listener and read from it.
@@ -309,11 +315,15 @@ impl NetworkStream {
 
     /// [`accept_from`](Self::accept_from) that a [`Halt`] can interrupt.
     pub fn accept_from_with_halt(listener: TcpListener, halt: Option<Halt>) -> io::Result<Self> {
+        Self::accept_staged(listener, halt, false)
+    }
+
+    fn accept_staged(listener: TcpListener, halt: Option<Halt>, raw: bool) -> io::Result<Self> {
         let Some(h) = halt else {
             let (stream, _peer) = listener.accept()?;
             stream.set_nodelay(true)?;
             arm_keepalive(&stream);
-            return Self::read_from(stream, None);
+            return Self::read_from(stream, None, raw);
         };
         listener.set_nonblocking(true)?;
         let halt = Some(h);
@@ -334,16 +344,17 @@ impl NetworkStream {
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         arm_keepalive(&stream);
-        Self::read_from(stream, halt)
+        Self::read_from(stream, halt, raw)
     }
 
-    // Wrap an accepted connection and read its FMKV header.
-    fn read_from(stream: TcpStream, halt: Option<Halt>) -> io::Result<Self> {
-        let mut reader = BufReader::with_capacity(NET_BUF_SIZE, HaltRead::new(stream, halt));
+    // Wrap an accepted connection in the decryption stage and read its FMKV header.
+    fn read_from(stream: TcpStream, halt: Option<Halt>, raw: bool) -> io::Result<Self> {
+        let staged = Stage::lazy(HaltRead::new(stream, halt), raw);
+        let mut reader = BufReader::with_capacity(NET_BUF_SIZE, staged);
 
         // Read FMKV metadata header
         let meta = meta::read_header(&mut reader)
-            .map_err(|e| reader.get_ref().halted_or(e))?
+            .map_err(|e| reader.get_ref().get_ref().halted_or(e))?
             .ok_or_else(|| -> io::Error { crate::error::Error::NoMetadata.into() })?;
 
         Ok(Self {
@@ -377,7 +388,7 @@ impl crate::pes::Stream for NetworkStream {
         match &mut self.mode {
             Mode::Read { reader, meta } => {
                 crate::pes::PesFrame::deserialize_ext(reader, meta.frame_padding)
-                    .map_err(|e| reader.get_ref().halted_or(e))
+                    .map_err(|e| reader.get_ref().get_ref().halted_or(e))
             }
             _ => Err(crate::error::Error::StreamWriteOnly.into()),
         }
@@ -1210,9 +1221,11 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let ns = NetworkStream::accept_from(listener).unwrap();
             match &ns.mode {
-                Mode::Read { reader, .. } => socket2::SockRef::from(&reader.get_ref().stream)
-                    .keepalive()
-                    .unwrap(),
+                Mode::Read { reader, .. } => {
+                    socket2::SockRef::from(&reader.get_ref().get_ref().stream)
+                        .keepalive()
+                        .unwrap()
+                }
                 Mode::Write { .. } => false,
             }
         });
@@ -1242,7 +1255,9 @@ mod tests {
             let halt = crate::halt::Halt::new();
             let ns = NetworkStream::accept_from_with_halt(listener, Some(halt)).unwrap();
             match &ns.mode {
-                Mode::Read { reader, .. } => reader.get_ref().stream.read_timeout().unwrap(),
+                Mode::Read { reader, .. } => {
+                    reader.get_ref().get_ref().stream.read_timeout().unwrap()
+                }
                 Mode::Write { .. } => None,
             }
         });
@@ -1327,9 +1342,11 @@ mod tests {
             let halt = crate::halt::Halt::new();
             let mut ns = NetworkStream::accept_from_with_halt(listener, Some(halt)).unwrap();
             let keepalive = match &ns.mode {
-                Mode::Read { reader, .. } => socket2::SockRef::from(&reader.get_ref().stream)
-                    .keepalive()
-                    .unwrap(),
+                Mode::Read { reader, .. } => {
+                    socket2::SockRef::from(&reader.get_ref().get_ref().stream)
+                        .keepalive()
+                        .unwrap()
+                }
                 Mode::Write { .. } => false,
             };
             (

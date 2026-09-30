@@ -410,6 +410,26 @@ fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) ->
     out
 }
 
+// A loose clip file's one piece, in the shape `pieces` builds for a disc: every aligned unit
+// of the file (KS-1) on its own grid from byte 0, title 0, proven on arrival.
+pub(crate) fn loose_file_piece(capacity: u32) -> super::ArrivalPiece {
+    let p = Piece {
+        spans: vec![(0, capacity, 0)],
+        titles: vec![0],
+        rank: 0,
+        units: 0,
+        enc: Vec::new(),
+        faults: 0,
+        verdict: Verdict::Lazy(None),
+    };
+    super::ArrivalPiece {
+        id: p.id(),
+        spans: p.spans,
+        candidate: None,
+        clear: false,
+    }
+}
+
 // Each whole-disc piece's unit spans, for the unit-grid guards in `whole_disc_tests`.
 #[cfg(test)]
 pub(crate) fn whole_disc_pieces(disc: &Disc, files: &[Vec<(u32, u32)>]) -> Vec<Vec<UnitSpan>> {

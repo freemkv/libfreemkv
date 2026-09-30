@@ -51,7 +51,28 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     arrival: Option<Box<crate::keys::Arrival>>,
     /// Damaged AACS units blanked so far (see [`blanked_units`](Self::blanked_units)).
     blanked: BlankTally,
+    /// Content-detected stage: `Some` until the first read reaches the verdict.
+    detect: Option<Box<StageOptions>>,
+    /// Where CSS pack flags are judged: DVD-Video (disc-keyed) or from each pack's stuffing.
+    packs: crate::css::Packs,
+    /// Loose BD-TS: a CPI-flagged unit that is clean TS is clear (its flag is stale).
+    stale_cpi: bool,
+    /// A PS the crack left keyless: a scrambled pack read later is refused (E7023).
+    watch_css: bool,
 }
+
+/// What the content-detected stage may do with what it finds (from `InputOptions`).
+#[derive(Clone, Default)]
+pub(crate) struct StageOptions {
+    /// Pass ciphertext through: never crack, decrypt or refuse.
+    pub(crate) raw: bool,
+    /// Held AACS keys for a loose BD-TS file.
+    pub(crate) keys: Option<crate::keys::ResolvedKeySet>,
+    pub(crate) halt: Option<crate::halt::Halt>,
+}
+
+// Sectors per CSS crack-scan read (the mpg:// batch).
+const CRACK_BATCH: u16 = 8192;
 
 // The blanked-unit count, shared with the stream that reports it as loss; logged once when
 // the reader is dropped, so a damaged rip never reads as clean.
@@ -88,7 +109,70 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             key_map: None,
             arrival: None,
             blanked: BlankTally(Arc::default()),
+            detect: None,
+            packs: crate::css::Packs::DvdVideo,
+            stale_cpi: false,
+            watch_css: false,
         }
+    }
+
+    /// The content-detected stage (every input but a disc, image or folder): the first read
+    /// classifies the head and resolves once (D3). A PS is cracked, a BD-TS read through
+    /// [`ResolvedKeySet::loose_file`](crate::keys::ResolvedKeySet::loose_file), else clear.
+    pub(crate) fn detecting(inner: S, opts: StageOptions) -> Self {
+        let mut s = Self::new(inner, DecryptKeys::None);
+        s.detect = Some(Box::new(opts));
+        s
+    }
+
+    // Reach the verdict and install what it needs. On `Err` the stage stays undecided.
+    fn resolve_detect(&mut self) -> Result<()> {
+        use super::stage::{HEAD_SECTORS, Kind, classify};
+        let Some(opts) = self.detect.as_deref() else {
+            return Ok(());
+        };
+        let cap = self.inner.capacity_sectors();
+        let n = cap.min(HEAD_SECTORS);
+        let mut head = vec![0u8; n as usize * crate::consts::SECTOR_BYTES];
+        let got = match n {
+            0 => 0,
+            n => self.inner.read_sectors(0, n as u16, &mut head, false)?,
+        };
+        head.truncate(got);
+        match classify(&head) {
+            Kind::Ps { mpeg2 } if !opts.raw => {
+                self.packs = crate::css::Packs::ProgramStream;
+                // B2: an 11172-1 stream cannot be CSS; it is never cracked.
+                if mpeg2 {
+                    let whole = [crate::disc::Extent {
+                        start_lba: 0,
+                        sector_count: cap,
+                    }];
+                    let packs = crate::css::Packs::ProgramStream;
+                    let halt = opts.halt.as_ref();
+                    self.keys = crate::css::crack_title_key(
+                        &mut self.inner,
+                        &whole,
+                        CRACK_BATCH,
+                        halt,
+                        packs,
+                    )
+                    .map_err(crate::error::Error::from)?;
+                }
+                self.watch_css = !self.keys.is_encrypted();
+            }
+            Kind::BdTs if !opts.raw => {
+                let set = crate::keys::ResolvedKeySet::loose_file(opts.keys.as_ref(), cap);
+                self.keys = set.decrypt_keys();
+                self.key_map = Some(set.key_map());
+                self.arrival = set.arrival(set.title_stop()).map(Box::new);
+                self.unit_base = Some(0);
+                self.stale_cpi = true;
+            }
+            _ => {}
+        }
+        self.detect = None;
+        Ok(())
     }
 
     /// Install the key set's on-arrival proof (KU §2.4): an encrypted unit of a piece
@@ -182,11 +266,15 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         keys: &mut DecryptKeys,
         lba: u32,
         content: Option<&[(u32, u32)]>,
+        packs: crate::css::Packs,
     ) -> Result<usize> {
         // The `unit_key_idx` arg on `decrypt_sectors[_in_content]` is a legacy
         // inert param (AACS is map-only; CSS/None ignore it) — pass 0.
         match content {
             Some(ranges) => decrypt_sectors_in_content(buf, keys, 0, lba, ranges),
+            None if packs != crate::css::Packs::DvdVideo => {
+                crate::decrypt::decrypt_sectors_packs(buf, keys, packs)
+            }
             None => decrypt_sectors(buf, keys, 0),
         }
     }
@@ -225,6 +313,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
+        if self.detect.is_some() {
+            self.resolve_detect()?;
+        }
         // Content-extent map (whole-disc readers): units outside the encrypted
         // extents are clear filesystem / nav and pass through untouched. Cheap Arc
         // bump; frees the &self borrow so we can decrypt against `&mut buf`.
@@ -246,6 +337,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         let n = self
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
+        self.judge_detected(&mut buf[..n])?;
 
         // Read damage before any key sees the units: a damaged unit is blanked and counted,
         // never a key verdict (E7013 here, E7022 on arrival). "We rip bad discs."
@@ -277,7 +369,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // No map installed: `decrypt_buf` does CSS self-descramble / clear pass-through
         // (units outside the content extents pass through untouched). A can't-decrypt
         // (misalignment, or mapless AACS here — a bug) fails loud; broken TS is the muxer's concern.
-        Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref)?;
+        Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref, self.packs)?;
         Ok(n)
     }
 
@@ -291,6 +383,29 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
+    // The content-detected stage's per-read rules, before any key sees the bytes: a stale CPI
+    // flag on clean TS is cleared (KS-5: "00₂ if the data is not encrypted"), and a keyless
+    // PS refuses a scrambled pack rather than pass ciphertext as clear.
+    fn judge_detected(&self, buf: &mut [u8]) -> Result<()> {
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, is_clean};
+        if self.stale_cpi {
+            let ts = crate::disc::ContentFormat::BdTs;
+            for unit in buf.as_chunks_mut::<ALIGNED_UNIT_LEN>().0 {
+                if aacs_unit_encrypted(unit, ts) && is_clean(unit, ts) {
+                    crate::aacs::content::clear_copy_permission_indicator(unit, ts);
+                }
+            }
+        }
+        if self.watch_css
+            && buf
+                .chunks(crate::consts::SECTOR_BYTES)
+                .any(|c| self.packs.scrambled_at(c).is_some())
+        {
+            return Err(crate::error::Error::CssKeyMissing);
+        }
+        Ok(())
+    }
+
     // Blank and count the damaged AACS units of a read at `lba` (see
     // `decrypt::blank_damaged_units`): judged are content units the map keys or arrival covers.
     fn blank_damage(&mut self, lba: u32, buf: &mut [u8], content: Option<&[(u32, u32)]>) {
@@ -303,7 +418,10 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                 && (map.is_some_and(|m| m.entry_for(at).is_some())
                     || arrival.is_some_and(|a| a.covers(at)))
         };
-        let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered);
+        let cap = self.inner.capacity_sectors();
+        let end = lba as u64 + buf.len().div_ceil(crate::consts::SECTOR_BYTES) as u64;
+        let at_end = cap != 0 && end >= cap as u64;
+        let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered, at_end);
         self.count_blanked(n);
     }
 

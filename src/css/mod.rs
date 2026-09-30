@@ -135,12 +135,32 @@ pub fn crack_key_outcome(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> CrackOutcome {
-    crack_key_scan_with(reader, extents, batch_sectors, halt, |s| {
-        is_scrambled_pack(s).then_some(0x14)
-    })
+    crack_key_scan_with(reader, extents, batch_sectors, halt, Packs::DvdVideo)
 }
 
-// The SINGLE place every DVD read path obtains a title key when the caller supplied none. A
+/// Where a scrambled pack's PES flags sit, by what the pack stream is known to be. The two
+/// verdicts cannot be one predicate: they disagree on a stuffed pack, a map-first pack and an
+/// MPEG-1-style PES, which the disc path descrambles (libdvdcss parity) and a file must not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Packs {
+    /// DVD-Video proven by the disc scan: flags at 0x14 ([`is_scrambled_pack`]).
+    DvdVideo,
+    /// A pack stream known only from its content: flags where the pack's stuffing puts them,
+    /// judged on a well-formed PES header ([`ps_scrambled_at`]).
+    ProgramStream,
+}
+
+impl Packs {
+    /// The offset of a scrambled pack's flags byte, else `None`.
+    pub(crate) fn scrambled_at(self, sector: &[u8]) -> Option<usize> {
+        match self {
+            Packs::DvdVideo => is_scrambled_pack(sector).then_some(0x14),
+            Packs::ProgramStream => ps_scrambled_at(sector),
+        }
+    }
+}
+
+// A DVD title's key when the caller supplied none: [`crack_title_key`] over its extents. A
 // scrambled-but-uncrackable title is a hard, skippable per-title CssKeyMissing (another VTS may
 // still crack).
 pub(crate) fn resolve_dvd_title_key(
@@ -161,28 +181,34 @@ pub(crate) fn resolve_dvd_title_key(
     if matches!(keys, crate::decrypt::DecryptKeys::None)
         && format == crate::disc::ContentFormat::MpegPs
     {
-        // `halt` threads the caller's cancellation token so /api/stop can
-        // interrupt a long crack scan (the old scan-time crack honored it too).
-        match crack_key_outcome(reader, extents, batch_sectors, halt) {
-            CrackOutcome::Cracked(state) => {
-                *keys = crate::decrypt::DecryptKeys::Css {
-                    title_key: state.title_key,
-                };
-            }
-            CrackOutcome::ScrambledUncracked => {
-                return Err(crate::error::Error::CssKeyMissing.into());
-            }
-            CrackOutcome::Unreadable(e) => return Err(e.into()),
-            // A cancelled crack is a TRUNCATED scan, not a verdict.
-            CrackOutcome::Halted => return Err(crate::error::Error::Halted.into()),
-            CrackOutcome::Unencrypted => {}
-        }
+        *keys = crack_title_key(reader, extents, batch_sectors, halt, Packs::DvdVideo)?;
     }
     Ok(())
 }
 
+// The SINGLE place every read path (disc, image, loose PS file) cracks a CSS title key: the
+// keys, or `None` for clear content. `halt` lets /api/stop interrupt a long scan.
+pub(crate) fn crack_title_key(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    batch_sectors: u16,
+    halt: Option<&crate::halt::Halt>,
+    packs: Packs,
+) -> std::io::Result<crate::decrypt::DecryptKeys> {
+    match crack_key_scan_with(reader, extents, batch_sectors, halt, packs) {
+        CrackOutcome::Cracked(state) => Ok(crate::decrypt::DecryptKeys::Css {
+            title_key: state.title_key,
+        }),
+        CrackOutcome::ScrambledUncracked => Err(crate::error::Error::CssKeyMissing.into()),
+        CrackOutcome::Unreadable(e) => Err(e.into()),
+        // A cancelled crack is a TRUNCATED scan, not a verdict.
+        CrackOutcome::Halted => Err(crate::error::Error::Halted.into()),
+        CrackOutcome::Unencrypted => Ok(crate::decrypt::DecryptKeys::None),
+    }
+}
+
 /// Where a 13818-1 pack's first PES header flags byte sits, `Some` only when that PES is
-/// scrambled: the `mpg://` file's test (m1, B-1). Leading packets with no PES header (a
+/// scrambled: the [`Packs::ProgramStream`] test (m1, B-1). Leading packets with no PES header (a
 /// system header, a map, padding) are walked by their length; only the first PES is judged.
 pub(crate) fn ps_scrambled_at(sector: &[u8]) -> Option<usize> {
     if sector.len() < 2048 || sector[..4] != PACK_START || sector[4] >> 6 != 0b01 {
@@ -211,11 +237,6 @@ pub(crate) fn ps_scrambled_at(sector: &[u8]) -> Option<usize> {
     }
 }
 
-/// [`ps_scrambled_at`] as a test.
-pub(crate) fn is_scrambled_ps_pack(sector: &[u8]) -> bool {
-    ps_scrambled_at(sector).is_some()
-}
-
 // Run `f` on `sector` with its flags byte `at` presented at 0x14, where the LFSR and the
 // keyless crack read it; both bytes are put back after (a stuffed pack, m1/m2).
 fn with_flags_at_0x14<T>(sector: &mut [u8], at: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
@@ -230,39 +251,19 @@ fn with_flags_at_0x14<T>(sector: &mut [u8], at: usize, f: impl FnOnce(&mut [u8])
     out
 }
 
-/// The `mpg://` file's crack (design §4 step 2.1, D3): raw = false, judging each pack by
-/// [`ps_scrambled_at`]; the resolved keys, `DecryptKeys::None` when the file is clear.
-pub(crate) fn resolve_ps_file_title_key(
-    reader: &mut dyn SectorSource,
-    extents: &[Extent],
-    batch_sectors: u16,
-    halt: Option<&crate::halt::Halt>,
-) -> std::io::Result<crate::decrypt::DecryptKeys> {
-    match crack_key_scan_with(reader, extents, batch_sectors, halt, ps_scrambled_at) {
-        CrackOutcome::Cracked(state) => Ok(crate::decrypt::DecryptKeys::Css {
-            title_key: state.title_key,
-        }),
-        CrackOutcome::Unencrypted => Ok(crate::decrypt::DecryptKeys::None),
-        CrackOutcome::ScrambledUncracked => Err(crate::error::Error::CssKeyMissing.into()),
-        CrackOutcome::Unreadable(e) => Err(e.into()),
-        CrackOutcome::Halted => Err(crate::error::Error::Halted.into()),
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     /// Crack scans run on this thread (test-only: the mpg:// path must scan once).
     pub(crate) static CRACK_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// The crack scan with its test: `scrambled_at` gives a scrambled pack's flags offset (always
-// 0x14 on the disc path; `ps_scrambled_at` for mpg:// files).
+// The crack scan, judging each sector as `packs` says.
 fn crack_key_scan_with(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
-    scrambled_at: fn(&[u8]) -> Option<usize>,
+    packs: Packs,
 ) -> CrackOutcome {
     #[cfg(test)]
     CRACK_SCANS.with(|n| n.set(n.get() + 1));
@@ -346,9 +347,9 @@ fn crack_key_scan_with(
                         // HARDENED pack-gated check: a clear stub sector with
                         // stray bits at 0x14 must NOT count as scramble evidence,
                         // or an unencrypted title falsely reports E7023.
-                        if let Some(at) = scrambled_at(sect) {
+                        if let Some(at) = packs.scrambled_at(sect) {
                             saw_scrambled = true;
-                            // An mpg:// pack's flags may sit past 0x14 (m1); the disc's never do.
+                            // A stuffed pack's flags may sit past 0x14 (m1); DvdVideo's never do.
                             let key = if at == 0x14 {
                                 keyless::crack_title_key(sect)
                             } else {
@@ -431,27 +432,24 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
     // `is_scrambled_pack`, NOT the looser `is_scrambled`: this sees arbitrary
     // regions (IFO/UDF/ISO 9660) where raw byte 0x14 isn't a reliable flag.
     // Measured: an IFO misread this way was destroyed, dropping titles 38→10.
-    descramble_region_with(buf, title_key, |c| is_scrambled_pack(c).then_some(0x14))
+    descramble_packs(buf, title_key, Packs::DvdVideo)
 }
 
-/// [`descramble_region`] for an `mpg://` file: each pack is judged, and its flags cleared,
-/// where its own pack stuffing puts them ([`ps_scrambled_at`], m2).
-pub(crate) fn descramble_ps_region(buf: &mut [u8], title_key: &mut [u8; 5]) {
-    let _ = descramble_region_with(buf, title_key, ps_scrambled_at);
-}
-
-// `scrambled_at(chunk)`: the offset of a scrambled pack's flags byte, else `None`.
-fn descramble_region_with(
+/// [`descramble_region`] judging each pack, and clearing its flags, as `packs` says (m2).
+pub(crate) fn descramble_packs(
     buf: &mut [u8],
     title_key: &mut [u8; 5],
-    scrambled_at: fn(&[u8]) -> Option<usize>,
+    packs: Packs,
 ) -> crate::error::Result<usize> {
     // Consecutive crib mismatches since the last re-crack attempt (0 = none
     // pending). Reset by a validated cache hit; a fresh run always attempts
     // on its first mismatch, then at most once every RECRACK_RETRY_EVERY.
     let mut mismatches_since_attempt: u32 = 0;
     for chunk in buf.chunks_mut(2048) {
-        let Some(at) = (chunk.len() >= 2048).then(|| scrambled_at(chunk)).flatten() else {
+        let Some(at) = (chunk.len() >= 2048)
+            .then(|| packs.scrambled_at(chunk))
+            .flatten()
+        else {
             continue;
         };
         with_flags_at_0x14(chunk, at, |chunk| {
@@ -743,7 +741,6 @@ mod tests {
         for len in [0, 1, 0x14, 0x15, 1024, 2047] {
             assert!(!is_scrambled_pack(&pack[..len]), "len {len}");
             assert!(ps_scrambled_at(&pack[..len]).is_none(), "len {len}");
-            assert!(!is_scrambled_ps_pack(&pack[..len]), "len {len}");
         }
     }
 
@@ -764,7 +761,7 @@ mod tests {
         let mut short = pack[..1500].to_vec();
         let before = short.clone();
         descramble_region(&mut short, &mut key).expect("never fails");
-        descramble_ps_region(&mut short, &mut key);
+        let _ = descramble_packs(&mut short, &mut key, Packs::ProgramStream);
         assert_eq!(short, before);
     }
 
@@ -834,7 +831,10 @@ mod tests {
             s[at..at + 4].copy_from_slice(&[0, 0, 1, 0xE0]);
             s[at + 4..at + 6].copy_from_slice(&0x07EBu16.to_be_bytes());
             s[at + 6] = 0x81;
-            assert!(!is_scrambled_ps_pack(&s), "pack_stuffing_length {stuffing}");
+            assert!(
+                ps_scrambled_at(&s).is_none(),
+                "pack_stuffing_length {stuffing}"
+            );
         }
     }
 

@@ -422,7 +422,8 @@ pub(crate) fn decrypt_sectors_mapped_in_content(
         // CSS re-cracks into its title key, so it needs its own mutable copy.
         _ => {
             let mut keys = keys.clone();
-            decrypt_span(buf, &mut keys, base_lba, Some(map), content).map(|_| 0)
+            let packs = css::Packs::DvdVideo;
+            decrypt_span(buf, &mut keys, base_lba, Some(map), content, packs).map(|_| 0)
         }
     }
 }
@@ -644,15 +645,16 @@ const WRONG_KEY_FAILURES: usize = 2;
 /// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
 /// zero-fill them, like a sweep's unread sector, and return how many. Damaged: no TS sync at
 /// byte 4, flagged (CPI) or not; unflagged only when not clean TS either (a zeroed head over
-/// clear TS is a sweep hole). No key opens them: read damage, never a key verdict or E7013,
-/// alone, clustered, or off the grid (1.7.7 muxed through all three). Only units `covered`
-/// (keyed or proven on arrival) are judged. A flagged garbage seed that keeps 0x47 at byte 4
-/// (~1 in 256) is not caught here: it decrypts as garbage, or on arrival reads as unopened.
+/// clear TS is a sweep hole), or a flagged partial unit ending the source (`tail_at_end`).
+/// No key opens them: read damage, never a key verdict or E7013, alone, clustered, or off the
+/// grid (1.7.7 muxed through all three). Only units `covered` (keyed or proven on arrival) are
+/// judged. A flagged garbage seed keeping 0x47 at byte 4 (~1 in 256) is not caught here.
 pub(crate) fn blank_damaged_units(
     buf: &mut [u8],
     base_lba: u32,
     format: crate::disc::ContentFormat,
     covered: &dyn Fn(u32) -> bool,
+    tail_at_end: bool,
 ) -> usize {
     if format != crate::disc::ContentFormat::BdTs {
         return 0;
@@ -678,10 +680,23 @@ pub(crate) fn blank_damaged_units(
             damaged.push(i);
         }
     }
+    // A truncated copy's flagged last partial unit cannot be opened as a unit (KS-3); a partial
+    // read mid-content is a caller bug, left for the decrypt to refuse.
+    let whole = buf.len() / unit_len;
+    let tail = &buf[whole * unit_len..];
+    let at = base_lba.saturating_add(whole as u32 * aacs::content::ALIGNED_UNIT_SECTORS);
+    if tail_at_end
+        && !tail.is_empty()
+        && covered(at)
+        && aacs::content::aacs_unit_seed_encrypted(tail, format)
+    {
+        damaged.push(whole);
+    }
     // KS-3 [BD] §3.10.1: "A new CBC cipher chain is started for each Aligned Unit", so the
     // loss is this unit alone.
     for &i in &damaged {
-        buf[i * unit_len..(i + 1) * unit_len].fill(0);
+        let end = ((i + 1) * unit_len).min(buf.len());
+        buf[i * unit_len..end].fill(0);
     }
     if let Some(&first) = damaged.first() {
         tracing::warn!(
@@ -707,7 +722,16 @@ pub fn decrypt_sectors(
     unit_key_idx: usize,
 ) -> Result<usize, crate::error::Error> {
     let _ = unit_key_idx;
-    decrypt_span(buf, keys, 0, None, None)
+    decrypt_span(buf, keys, 0, None, None, css::Packs::DvdVideo)
+}
+
+/// [`decrypt_sectors`] judging CSS packs as `packs` says (the content-detected stage).
+pub(crate) fn decrypt_sectors_packs(
+    buf: &mut [u8],
+    keys: &mut DecryptKeys,
+    packs: css::Packs,
+) -> Result<usize, crate::error::Error> {
+    decrypt_span(buf, keys, 0, None, None, packs)
 }
 
 /// Legacy alias of [`decrypt_sectors`]. Under the keymap-only model AACS decrypts
@@ -726,7 +750,8 @@ pub fn decrypt_sectors_in_content(
     content_ranges: &[(u32, u32)],
 ) -> Result<usize, crate::error::Error> {
     let _ = unit_key_idx;
-    decrypt_span(buf, keys, base_lba, None, Some(content_ranges))
+    let packs = css::Packs::DvdVideo;
+    decrypt_span(buf, keys, base_lba, None, Some(content_ranges), packs)
 }
 
 // THE decrypt orchestrator: every path into this crate's decryption goes through here. Resolve
@@ -737,6 +762,7 @@ fn decrypt_span(
     base_lba: u32,
     map: Option<&AacsKeyMap>,
     content: Option<&[(u32, u32)]>,
+    packs: css::Packs,
 ) -> Result<usize, crate::error::Error> {
     let dropped: usize = match keys {
         DecryptKeys::None => 0,
@@ -756,7 +782,7 @@ fn decrypt_span(
             // CSS SELF-recovers: the title key changes per VOB region and is re-cracked
             // constantly, but always FROM THE DATA ITSELF (see `css::descramble_region`),
             // so it needs none of the external-input recovery seam AACS key-fetch uses.
-            css::descramble_region(buf, title_key)?
+            css::descramble_packs(buf, title_key, packs)?
         }
     };
     Ok(dropped)
@@ -1643,16 +1669,30 @@ mod tests {
             format: ContentFormat::BdTs,
         };
         let mut buf = vec![0u8; ul];
-        let aacs_no_map = decrypt_span(&mut buf, &mut aacs_keys, 0, None, None)
-            .expect_err("an AACS reader with no key map cannot prove any key");
+        let aacs_no_map = decrypt_span(
+            &mut buf,
+            &mut aacs_keys,
+            0,
+            None,
+            None,
+            css::Packs::DvdVideo,
+        )
+        .expect_err("an AACS reader with no key map cannot prove any key");
 
         // AACS, encrypted, mapped but the unit falls outside every range.
         let mut orphan = clear_ts_unit();
         aacs_encrypt_unit_for_test(&mut orphan, &[0xCCu8; 16]);
         let mut buf = orphan.to_vec();
         let empty = AacsKeyMap::from_ranges(vec![]);
-        let aacs_unmapped = decrypt_span(&mut buf, &mut aacs_keys, 0, Some(&empty), None)
-            .expect_err("an encrypted unit no range covers cannot be keyed");
+        let aacs_unmapped = decrypt_span(
+            &mut buf,
+            &mut aacs_keys,
+            0,
+            Some(&empty),
+            None,
+            css::Packs::DvdVideo,
+        )
+        .expect_err("an encrypted unit no range covers cannot be keyed");
 
         let want = crate::error::Error::DecryptFailed.code();
         for (what, e) in [
@@ -1672,7 +1712,15 @@ mod tests {
         let mut none_keys = DecryptKeys::None;
         let mut buf = vec![0u8; 2048];
         assert!(
-            decrypt_span(&mut buf, &mut none_keys, 0, None, None).is_ok(),
+            decrypt_span(
+                &mut buf,
+                &mut none_keys,
+                0,
+                None,
+                None,
+                css::Packs::DvdVideo
+            )
+            .is_ok(),
             "clear media has no key to prove and must pass through"
         );
     }
@@ -2071,7 +2119,7 @@ mod tests {
         crate::test_util::damage_unit_seed(&mut garbage);
         garbage[0] &= 0x3F;
         let mut buf = [garbage, clear_ts_unit(), vec![0u8; ul]].concat();
-        let n = blank_damaged_units(&mut buf, 0, ContentFormat::BdTs, &|_| true);
+        let n = blank_damaged_units(&mut buf, 0, ContentFormat::BdTs, &|_| true, false);
         assert_eq!(n, 1);
         assert!(buf[..ul].iter().all(|&b| b == 0));
         assert_eq!(&buf[ul..2 * ul], &clear_ts_unit()[..]);

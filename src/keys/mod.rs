@@ -695,6 +695,39 @@ impl ResolvedKeySet {
         ResolvedKeySet(Arc::new(i))
     }
 
+    // A loose clip file's set (no CPS-unit map): `held`'s base keys, proven on arrival over the
+    // file's one piece. Title scope, so a unit no held key opens stops E7022 (KU §2.4).
+    pub(crate) fn loose_file(held: Option<&ResolvedKeySet>, capacity: u32) -> Self {
+        let mut i = Inner::empty();
+        i.aacs = true;
+        i.scope = KeyScope::Titles(vec![0]);
+        i.capacity = capacity;
+        if let Some(h) = held.filter(|h| h.is_aacs()) {
+            i.pool = h.0.pool.clone();
+            i.disc_hash = h.0.disc_hash.clone();
+        }
+        let piece = resolve::loose_file_piece(capacity);
+        i.spans = piece.spans.clone();
+        i.lazy = piece
+            .spans
+            .iter()
+            .map(|&(s, n, _)| (s, s.saturating_add(n)))
+            .collect();
+        i.arrival.push(piece);
+        Self(Arc::new(i))
+    }
+
+    // A set holding `keys` as base keys and no disc: a loose file's key set in tests.
+    #[cfg(test)]
+    pub(crate) fn held_for_test(keys: &[[u8; 16]]) -> Self {
+        let mut i = Inner::empty();
+        i.aacs = true;
+        i.scope = KeyScope::WholeDisc;
+        i.pool = keys.to_vec();
+        i.proven = (0..keys.len()).collect();
+        ResolvedKeySet(Arc::new(i))
+    }
+
     /// The decrypting reader for title `idx` of `disc` over the raw, random-access `inner`:
     /// keyed pieces through the set's map, the rest proven on arrival (a readable unit no
     /// held key opens stops with E7022). E7013 if the set is not for `disc`, does not cover
