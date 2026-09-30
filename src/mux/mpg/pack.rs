@@ -17,10 +17,10 @@ pub(crate) const MAX_PACK_STUFFING: usize = 7;
 /// `rate_bound`: the largest 22-bit value, legal for any per-pack rate (design §2.4).
 pub(crate) const RATE_BOUND: u32 = 0x3F_FFFF;
 
-pub(crate) const PSM_ID: u8 = 0xBC;
-pub(crate) const PRIVATE_STREAM_1: u8 = 0xBD;
-pub(crate) const PADDING_STREAM: u8 = 0xBE;
-pub(crate) const VIDEO_ID: u8 = 0xE0;
+pub(crate) const PSM_ID: u8 = crate::consts::pes_stream_id::PROGRAM_STREAM_MAP;
+pub(crate) const PRIVATE_STREAM_1: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
+pub(crate) const PADDING_STREAM: u8 = crate::consts::pes_stream_id::PADDING_STREAM;
+pub(crate) const VIDEO_ID: u8 = crate::consts::pes_stream_id::VIDEO;
 
 /// `pack_header()` (MS-2) at SCR `scr27` (27 MHz), `mux_rate` in 50 B/s units, then
 /// `stuffing` 0xFF bytes (MS-3: at most 7).

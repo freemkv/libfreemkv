@@ -2083,3 +2083,112 @@ fn an_mpg_source_remuxes_to_mkv() {
     }
     let _ = (std::fs::remove_file(&mpg), std::fs::remove_file(&mkv));
 }
+
+// An extension listed before its base still routes to the base's output, so the base keeps
+// its hierarchy descriptor.
+#[test]
+fn an_extension_ahead_of_its_base_still_finds_it() {
+    let mut fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    fx.title.streams.swap(1, 2);
+    let sink = MpgSink::create(Vec::new(), &fx.title).unwrap();
+    let ext = sink
+        .outs
+        .iter()
+        .find_map(|o| match o.kind {
+            OutKind::Extension { base_out } => Some(base_out),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(sink.outs[ext].spec.stream_id, 0xC0);
+    assert!(matches!(
+        sink.outs[ext].kind,
+        OutKind::MpegAudio { has_ext: true }
+    ));
+}
+
+// A source that never spans the 1 s origin window cannot grow the window without bound.
+#[test]
+fn the_origin_window_is_byte_capped() {
+    let fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let mut sink = MpgSink::create(Vec::new(), &fx.title).unwrap();
+    let f = PesFrame {
+        track: 1,
+        pts: VIDEO_START_NS,
+        keyframe: true,
+        data: vec![0x55; 1 << 20],
+        duration_ns: None,
+        discard_padding_ns: 0,
+        source: None,
+        coding: None,
+    };
+    for _ in 0..(HOLD_CAP_BYTES >> 20) + 2 {
+        sink.write(&f).unwrap();
+    }
+    assert!(sink.offset.is_some(), "the origin was never forced");
+    assert!(sink.window_bytes <= HOLD_CAP_BYTES);
+}
+
+// A failed finish stays failed: a retry is not an Ok on a truncated stream.
+#[test]
+fn a_second_finish_after_an_error_is_an_error() {
+    let fx = fixture(&Opts::default());
+    let mut sink = MpgSink::create(Vec::new(), &fx.title).unwrap();
+    assert!(sink.finish().is_err());
+    assert!(sink.finish().is_err());
+}
+
+// One 0xBD entry in the map expands to the FMKV sub-streams once, however often it is listed.
+#[test]
+fn repeated_private_map_entries_do_not_multiply_tracks() {
+    let mut e = vec![pack::PsmEntry {
+        stream_type: 0x02,
+        stream_id: 0xE0,
+        descriptors: vec![],
+    }];
+    for _ in 0..40 {
+        e.push(pack::PsmEntry {
+            stream_type: 0x06,
+            stream_id: 0xBD,
+            descriptors: vec![],
+        });
+    }
+    let subs: Vec<pack::SubStreamInfo> = (0x80..0x84)
+        .map(|sub_id| pack::SubStreamInfo {
+            sub_id,
+            lang: *b"eng",
+            forced: false,
+        })
+        .collect();
+    let info = pack::fmkv_descriptors(&subs, None);
+    let m = pack::psm(&info, &e).unwrap();
+    let ps = scan_pack(&[(0xE0, scan_video())], Some(&m));
+    let s = scan::scan_streams(&ps).unwrap();
+    assert_eq!(s.len(), 1 + subs.len(), "{}", s.len());
+}
+
+// SD colour follows the line count as the DVD scan does: 480/240 is SMPTE 170M, 576/288
+// BT.470BG, and only HD is BT.709.
+#[test]
+fn scanned_sd_video_takes_its_standards_colour() {
+    let colour = |h: u16| {
+        let mut v = seq_header(720, h, 3, 112, false);
+        v.extend(test_es::mpeg2_pic(1, 3));
+        let s = scan::scan_streams(&scan_pack(&[(0xE0, v)], None)).unwrap();
+        match &s[0] {
+            DiscStream::Video(v) => v.color_space,
+            _ => unreachable!(),
+        }
+    };
+    assert_eq!(colour(480), ColorSpace::Smpte170m);
+    assert_eq!(colour(576), ColorSpace::Bt470bg);
+    assert_eq!(colour(288), ColorSpace::Bt470bg);
+    assert_eq!(colour(1080), ColorSpace::Bt709);
+}

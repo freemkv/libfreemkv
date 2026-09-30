@@ -8,7 +8,7 @@ use crate::disc::{
     LabelQualifier, Resolution, SampleRate, Stream, SubtitleStream, VideoStream,
 };
 use crate::mux::ps::{PsDemuxer, PsPacket};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bytes of each stream's first packets kept for the probes.
 const PROBE_BYTES: usize = 64 * 1024;
@@ -99,7 +99,19 @@ fn lang_of(bytes: [u8; 3]) -> String {
 }
 
 // MPEG-2 (or MPEG-1) video from its sequence header: codec, resolution, frame rate.
-fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<(Codec, Resolution, FrameRate)> {
+// SD takes its standard's colour as the DVD scan does (576/288 lines PAL, 480/240 NTSC).
+fn sd_colour(height: u32) -> ColorSpace {
+    match height {
+        576 | 288 => ColorSpace::Bt470bg,
+        480 | 240 => ColorSpace::Smpte170m,
+        _ => ColorSpace::Bt709,
+    }
+}
+
+fn probe_video(
+    es: &[u8],
+    map_type: Option<u8>,
+) -> Option<(Codec, Resolution, FrameRate, ColorSpace)> {
     let seq = es.windows(4).position(|w| w == [0, 0, 1, 0xB3]);
     let ext = es
         .windows(5)
@@ -114,11 +126,13 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<(Codec, Resolution, Fr
         None => return None,
     };
     let (mut res, mut rate) = (Resolution::Unknown, FrameRate::Unknown);
+    let mut colour = ColorSpace::Bt709;
     if let Some(h) = seq.and_then(|s| es.get(s + 4..s + 8)) {
         let height = (u32::from(h[1] & 0x0F) << 8) | u32::from(h[2]);
         let progressive = ext
             .and_then(|e| es.get(e + 5))
             .is_none_or(|b| b & 0x08 != 0);
+        colour = sd_colour(height);
         res = match (height, progressive) {
             (480, false) => Resolution::R480i,
             (576, false) => Resolution::R576i,
@@ -137,7 +151,7 @@ fn probe_video(es: &[u8], map_type: Option<u8>) -> Option<(Codec, Resolution, Fr
             _ => FrameRate::Unknown,
         };
     }
-    Some((codec, res, rate))
+    Some((codec, res, rate, colour))
 }
 
 // Design §4 step 3 "MPEG audio | header + mc_header": Layer II frames from `at` go through
@@ -289,24 +303,27 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
     // Track order: the map's entries (0xBD expanded by the FMKV table), then anything seen
     // that it does not name, in id order (design §4 step 3).
     let mut order: Vec<Key> = Vec::new();
+    // Each key once, whatever the map lists: bounds the streams a crafted map can name.
+    let mut listed: BTreeSet<Key> = BTreeSet::new();
     let mut map_type: BTreeMap<u8, (u8, Vec<u8>)> = BTreeMap::new();
     if let Some(m) = &map {
         for (ty, id, desc) in &m.entries {
             map_type.insert(*id, (*ty, desc.clone()));
             if *id == pack::PRIVATE_STREAM_1 {
-                order.extend(
-                    m.subs
-                        .iter()
-                        .map(|s| (pack::PRIVATE_STREAM_1, Some(s.sub_id))),
-                );
-            } else {
+                for s in &m.subs {
+                    let key = (pack::PRIVATE_STREAM_1, Some(s.sub_id));
+                    if listed.insert(key) {
+                        order.push(key);
+                    }
+                }
+            } else if listed.insert((*id, None)) {
                 order.push((*id, None));
             }
         }
     }
     let mut rest: Vec<Key> = seen
         .keys()
-        .filter(|k| !order.contains(k))
+        .filter(|k| !listed.contains(k))
         .copied()
         .collect();
     // Without a map: video, MPEG audio, then private sub-streams (audio before subpictures).
@@ -343,7 +360,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     tracing::warn!(target: "mux", stream_id = key.0, "mpg: a second video stream; left out");
                     continue;
                 }
-                let Some((codec, res, rate)) = probe_video(es, ty) else {
+                let Some((codec, res, rate, colour)) = probe_video(es, ty) else {
                     tracing::warn!(target: "mux", stream_id = key.0, "mpg: video stream with no MPEG-1/2 sequence header in the head; left out");
                     continue;
                 };
@@ -355,11 +372,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     resolution: res,
                     frame_rate: rate,
                     hdr: HdrFormat::Sdr,
-                    color_space: if res.pixels().is_some_and(|(_, h)| h == 576) {
-                        ColorSpace::Bt470bg
-                    } else {
-                        ColorSpace::Bt709
-                    },
+                    color_space: colour,
                     display_aspect: None,
                     secondary: false,
                     label: String::new(),
@@ -449,7 +462,10 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                             .and_then(|m| m.palette.as_ref())
                             .map(|p| idx_text(p, video_res)),
                     }),
-                    _ => continue,
+                    _ => {
+                        tracing::warn!(target: "mux", sub_id = sub, "mpg: private_stream_1 sub-stream of an unhandled kind; left out");
+                        continue;
+                    }
                 };
                 streams.push(s);
             }

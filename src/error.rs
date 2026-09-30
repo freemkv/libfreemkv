@@ -303,6 +303,10 @@ pub const E_TIMED_OUT: u16 = 9073;
 /// `mpg://` output but the title has no video track a program stream can carry
 /// (MPEG-1/2, H.264, HEVC or VC-1). The `mpg://` twin of [`E_MP4_NO_VIDEO_TRACK`].
 pub const E_MPG_NO_VIDEO_TRACK: u16 = 9074;
+/// `mpg://` reached end of input with access units no pack could take.
+pub const E_MPG_UNPACKETIZED: u16 = 9075;
+/// `mpg://` source timestamps jump further than the muxer will bridge with padding packs.
+pub const E_MPG_TIMESTAMP_GAP: u16 = 9076;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -919,6 +923,10 @@ pub enum Error {
     /// `mpg://` target title has no video track a program stream can carry. See
     /// [`E_MPG_NO_VIDEO_TRACK`]. Declared ahead of the `mpg://` sink that raises it.
     MpgNoVideoTrack,
+    /// `mpg://` end of input left access units unwritten. See [`E_MPG_UNPACKETIZED`].
+    MpgUnpacketized,
+    /// `mpg://` timestamp gap beyond the padding cap. See [`E_MPG_TIMESTAMP_GAP`].
+    MpgTimestampGap,
 }
 
 impl Error {
@@ -1060,6 +1068,8 @@ impl Error {
             Error::StreamHeaderWritten => E_STREAM_HEADER_WRITTEN,
             Error::TimedOut { .. } => E_TIMED_OUT,
             Error::MpgNoVideoTrack => E_MPG_NO_VIDEO_TRACK,
+            Error::MpgUnpacketized => E_MPG_UNPACKETIZED,
+            Error::MpgTimestampGap => E_MPG_TIMESTAMP_GAP,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
@@ -1338,6 +1348,8 @@ impl From<Error> for std::io::Error {
             // video track / missing codec-private config. All are invalid data.
             E_MP4_NO_VIDEO_TRACK
             | E_MPG_NO_VIDEO_TRACK
+            | E_MPG_UNPACKETIZED
+            | E_MPG_TIMESTAMP_GAP
             | E_MP4_INVALID
             | E_MP4_MISSING_CODEC_PRIVATE
             | E_MP4_UNKNOWN_RESOLUTION => std::io::ErrorKind::InvalidData,
@@ -1676,6 +1688,8 @@ mod tests {
             Error::AacsVidNeedsDisc.code(),
             Error::TimedOut { op: "verify" }.code(),
             Error::MpgNoVideoTrack.code(),
+            Error::MpgUnpacketized.code(),
+            Error::MpgTimestampGap.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1767,6 +1781,8 @@ mod tests {
             (Error::AacsVidNeedsDisc, E_AACS_VID_NEEDS_DISC),
             (Error::TimedOut { op: "verify" }, E_TIMED_OUT),
             (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
+            (Error::MpgUnpacketized, E_MPG_UNPACKETIZED),
+            (Error::MpgTimestampGap, E_MPG_TIMESTAMP_GAP),
             (
                 Error::BusStreamUnmapped {
                     files: "/BDMV/STREAM/00002.m2ts".into(),
@@ -2138,6 +2154,8 @@ mod tests {
             (Error::StreamHeaderWritten, E_STREAM_HEADER_WRITTEN),
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
+            (Error::MpgUnpacketized, E_MPG_UNPACKETIZED),
+            (Error::MpgTimestampGap, E_MPG_TIMESTAMP_GAP),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
             (Error::Mp4UnknownResolution, E_MP4_UNKNOWN_RESOLUTION),

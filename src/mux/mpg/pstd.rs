@@ -15,8 +15,12 @@ pub(crate) const HZ27: u64 = 27_000_000;
 /// A chunk that commences an AU may go when that AU decodes within 0.95 s (design §2.4
 /// step 3), under MS-16's "less than or equal to one second" delay bound.
 const LEAD27: u64 = HZ27 * 95 / 100;
+/// 0.7 s in 90 kHz ticks: a PTS step over it is counted as a content gap.
+pub(crate) const MAX_PTS_GAP_TICKS: u64 = 63_000;
 /// MS-17: SCR fields in successive packs ≤ 0.7 s apart.
 pub(crate) const MAX_SCR_GAP27: u64 = HZ27 * 7 / 10;
+/// Widest timestamp gap bridged with padding packs (one hour, ~10k packs); more is refused.
+const MAX_PAD_GAP27: u64 = 3_600 * HZ27;
 /// Per-track lookahead before the clock may pass `t` (design §2.4 step 1).
 const LOOKAHEAD27: u64 = HZ27;
 /// Max-interleave cap: a track this far behind the others is treated as sparse.
@@ -221,11 +225,11 @@ impl<W: Write> Mux<W> {
     /// Queue one AU of stream `si`, in that stream's decode order.
     pub(crate) fn push(&mut self, si: usize, au: Au) {
         let s = &mut self.streams[si];
-        let dec27 = au.dts.unwrap_or(au.pts) * 300;
+        let dec27 = au.dts.unwrap_or(au.pts).saturating_mul(300);
         // MS-18 / MPG2-11: a gap over 0.7 s is the content's own (a still or slideshow); count it.
         if s.spec.av
             && let Some(prev) = s.last_pts
-            && au.pts.abs_diff(prev) > 63_000
+            && au.pts.abs_diff(prev) > MAX_PTS_GAP_TICKS
         {
             self.counters.pts_gaps += 1;
         }
@@ -528,8 +532,8 @@ impl<W: Write> Mux<W> {
                 return pack::RATE_BOUND;
             }
             let packs = bytes.div_ceil(EST_PAYLOAD) + 1;
-            let need =
-                (u128::from(packs) * 2048 * TICKS_PER_BYTE_UNIT).div_ceil(u128::from(dec - t));
+            let need = (u128::from(packs) * pack::PACK_BYTES as u128 * TICKS_PER_BYTE_UNIT)
+                .div_ceil(u128::from(dec - t));
             units = units.max(need);
         }
         units.min(u128::from(pack::RATE_BOUND)) as u32
@@ -677,9 +681,12 @@ impl<W: Write> Mux<W> {
                 // what still cannot go is an error, never a silent Ok.
                 if self.forcing {
                     let left: usize = self.streams.iter().map(|s| s.queue.len()).sum();
-                    return Err(io::Error::other(format!(
-                        "mpg: {left} access unit(s) could not be packetized"
-                    )));
+                    tracing::error!(
+                        target: "mux",
+                        access_units = left,
+                        "mpg: access units could not be packetized"
+                    );
+                    return Err(crate::error::Error::MpgUnpacketized.into());
                 }
                 self.forcing = true;
                 self.counters.forced_eof += 1;
@@ -698,8 +705,11 @@ impl<W: Write> Mux<W> {
                 continue;
             };
             match self.last_scr {
-                Some(last) if next > last + MAX_SCR_GAP27 => {
-                    let at = (last + MAX_SCR_GAP27).max(t);
+                Some(last) if next.saturating_sub(last) > MAX_PAD_GAP27 => {
+                    return Err(crate::error::Error::MpgTimestampGap.into());
+                }
+                Some(last) if next > last.saturating_add(MAX_SCR_GAP27) => {
+                    let at = last.saturating_add(MAX_SCR_GAP27).max(t);
                     self.counters.padding_packs += 1;
                     self.write_pack(at, true)?;
                 }
@@ -776,6 +786,20 @@ mod tests {
             data: vec![0x55; len],
             lpcm_bits: 0,
         }
+    }
+
+    // A far-future timestamp is refused, not bridged with millions of padding packs.
+    #[test]
+    fn a_huge_timestamp_gap_is_refused() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 100, 0));
+        m.push(0, au(9_000 + 2 * 3_600 * 90_000, 100, 0));
+        let e = m.finish().unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some(crate::error::E_MPG_TIMESTAMP_GAP)
+        );
+        assert!(m.into_writer().len() < 1 << 20);
     }
 
     // Nit (r2): the forced EOF pass that lifts the 0.95 s lead is counted, not silent.

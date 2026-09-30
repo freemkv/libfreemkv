@@ -111,6 +111,8 @@ pub mod pes_stream_id {
     /// (rate/bound bounds), never an elementary stream. On a DVD NAV pack it
     /// follows the pack header, so it lands at sector offset 0x11.
     pub const SYSTEM_HEADER: u8 = 0xBB;
+    /// program_stream_map — the `00 00 01 BC` structural table (MS-8).
+    pub const PROGRAM_STREAM_MAP: u8 = 0xBC;
     /// private_stream_1 — AC-3 / DTS / LPCM / PGS subtitle payloads.
     pub const PRIVATE_STREAM_1: u8 = 0xBD;
     /// padding_stream — stuffing bytes only, no payload to demux.
