@@ -568,7 +568,6 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     ),
     ("src/platform/fs_type/mod.rs", r#"allow(dead_code)"#, 1),
     ("src/scsi/linux.rs", r#"allow(non_camel_case_types)"#, 1),
-    ("src/scsi/mod.rs", r#"allow(dead_code)"#, 1),
     (
         "src/scsi/mod.rs",
         r#"cfg_attr(not(any(feature="rip",target_os="windows")),allow(dead_code))"#,
@@ -592,7 +591,7 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     (
         "src/scsi/mod.rs",
         r#"cfg_attr(not(target_os="windows"),allow(dead_code))"#,
-        2,
+        3,
     ),
     (
         "src/scsi/mod.rs",
@@ -600,7 +599,6 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         1,
     ),
     ("src/scsi/windows.rs", r#"allow(non_snake_case)"#, 3),
-    ("src/udf.rs", r#"allow(clippy::only_used_in_recursion)"#, 1),
     ("src/udf.rs", r#"allow(clippy::too_many_arguments)"#, 1),
 ];
 
