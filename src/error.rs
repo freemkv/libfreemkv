@@ -1651,7 +1651,8 @@ mod tests {
         assert!(!is_disc_level_no_key(&per_title));
     }
 
-    // A typed payload is read directly; a bare io::Error keeps the string fallback.
+    // Pin, not a guard: typed and string paths agree for every `Error` (Display leads
+    // with its code). The fallback stays for consumers' string-coded io::Errors.
     #[test]
     fn error_code_reads_the_typed_payload() {
         let typed: std::io::Error = Error::Halted.into();

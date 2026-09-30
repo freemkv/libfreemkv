@@ -368,6 +368,7 @@ pub trait KeySource {
 /// candidate against.
 /// Lives in the library, not a key-source crate: carving units is decryption *mechanism*.
 /// "Encrypted" is the AACS CPI (`buf[0] & 0xc0`), NOT the `is_clean` TS-sync heuristic.
+/// A Stop ends sampling early with the partial set; callers must check their own `Halt`.
 pub fn read_encrypted_units(
     reader: &mut dyn crate::sector::SectorSource,
     title: &crate::disc::DiscTitle,

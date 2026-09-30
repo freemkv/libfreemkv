@@ -240,3 +240,44 @@ fn failed_scan_keeps_the_key_sources() {
         assert_eq!(s.spec.key_sources.len(), 1);
     }
 }
+
+fn keyed_session(t: FakeTransport, halt: Option<Halt>) -> DiscSession {
+    let drive = Drive::from_transport(Box::new(t));
+    let spec = KeySpec {
+        key_sources: vec![Box::new(NoKeys)],
+        ..KeySpec::default()
+    };
+    DiscSession::bring_up(drive, spec, halt).expect("brought up")
+}
+
+/// A `Disc::scan` failure on a present drive (not the missing-drive arm) keeps the sources.
+#[test]
+fn scan_error_on_a_faulting_drive_keeps_the_key_sources() {
+    let (t, _fake) = FakeTransport::new();
+    let mut s = keyed_session(t, None);
+    s.drive = Some(Drive::from_transport(Box::new(
+        FakeTransport::new()
+            .0
+            .rule(|_| true, crate::test_util::FakeMode::Fault),
+    )));
+    assert!(s.scan(ScanOptions::default()).is_err());
+    assert_eq!(s.spec.key_sources.len(), 1);
+    assert!(s.scan_with(ScanOptions::default()).is_err());
+    assert_eq!(s.spec.key_sources.len(), 1);
+}
+
+/// `scan_with`'s own post-scan halt check (a Stop after a scan that succeeded) keeps the
+/// sources too: the drive's own token is live, only the session's op token is cancelled.
+#[test]
+fn scan_with_stop_after_scan_keeps_the_key_sources() {
+    use crate::disc::scan_order_tests::scannable_drive;
+    let h = Halt::new();
+    let (t, _fake) = FakeTransport::new();
+    let mut s = keyed_session(t, Some(h.clone()));
+    s.drive = Some(scannable_drive());
+    h.cancel();
+    let r = s.scan_with(ScanOptions::default());
+    assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
+    assert!(s.disc.is_none());
+    assert_eq!(s.spec.key_sources.len(), 1);
+}

@@ -172,9 +172,8 @@ impl std::fmt::Display for DriveId {
 
 // A GET CONFIGURATION text field: trims spaces and the NUL padding `trim` keeps.
 fn gc_text(field: &[u8]) -> String {
-    printable(&String::from_utf8_lossy(field))
-        .trim_matches(|c: char| c.is_whitespace() || c == '\0')
-        .to_string()
+    let text = String::from_utf8_lossy(field);
+    printable(text.trim_matches(|c: char| c.is_whitespace() || c == '\0'))
 }
 
 // Drive-supplied text is untrusted: control characters (bar NUL padding) become `?`
@@ -298,7 +297,8 @@ mod tests {
         assert!(DriveId::from_drive(&mut script(None)).is_ok());
     }
 
-    // A lying INQUIRY transfer count is clamped to the buffer, not trusted.
+    // A lying INQUIRY transfer count is not trusted. Pin only: `truncate` past the
+    // length is a no-op, so the `.min` clamp is behaviour-neutral.
     #[test]
     fn from_drive_clamps_oversized_inquiry_count() {
         let mut t = script(None);
@@ -315,6 +315,8 @@ mod tests {
         let id = DriveId::from_drive(&mut t).expect("from_drive");
         assert_eq!(id.vendor_id, "A?[31mZ ");
         assert_eq!(gc_text(b"SN\r\n1\x1b "), "SN??1?");
+        // Trailing padding is trimmed before sanitising, not turned into '?'.
+        assert_eq!(gc_text(b"SN1\r\n\t\0 "), "SN1");
     }
 
     // INQUIRY byte 0: low 5 bits are the peripheral device type (5 = MMC), the

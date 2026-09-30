@@ -18,7 +18,7 @@ mod hddvd;
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
 #[cfg(test)]
-mod scan_order_tests;
+pub(crate) mod scan_order_tests;
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
