@@ -188,7 +188,7 @@ mod tests {
     /// Zip `entries` (name -> bytes) into an in-memory, Stored (uncompressed)
     /// `jar::Jar` via the `zip` crate's own writer — a real archive, not a
     /// hand-rolled central directory.
-    fn build_jar(entries: &[(&str, Vec<u8>)]) -> jar::Jar {
+    fn build_jar_bytes(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
@@ -200,7 +200,60 @@ mod tests {
             }
             writer.finish().expect("finish zip");
         }
-        zip::ZipArchive::new(Cursor::new(buf)).expect("valid zip")
+        buf
+    }
+
+    fn build_jar(entries: &[(&str, Vec<u8>)]) -> jar::Jar {
+        zip::ZipArchive::new(Cursor::new(build_jar_bytes(entries))).expect("valid zip")
+    }
+
+    // An in-memory disc holding one `/BDMV/JAR/<name>` jar per entry.
+    fn jar_disc(jars: &[(&str, Vec<u8>)]) -> (crate::udf::fixture::MemDisc, UdfFs) {
+        use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+        let specs = jars
+            .iter()
+            .enumerate()
+            .map(|(i, (name, bytes))| {
+                let n = i as u32;
+                file_with(name, 100 + n, 2000 + n * 4, bytes.clone(), true)
+            })
+            .collect();
+        let dir = |name: &str, icb, data, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: data,
+            files,
+            subdirs,
+        };
+        let jar = dir("JAR", 52, 53, specs, vec![]);
+        let bdmv = dir("BDMV", 12, 13, vec![], vec![jar]);
+        let root = dir("", 10, 11, vec![], vec![bdmv]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    // The com/dbp/ prefix is the only thing keeping this parser (ahead of
+    // deluxe in PARSERS) off other BD-J discs that carry a TextField string.
+    #[test]
+    fn detect_and_parse_require_the_dbp_package_prefix() {
+        let class =
+            || build_class(&["LTextField,Audio1,English Dolby Atmos,Fontstrip_Composite,296,763"]);
+        let (mut other, udf) = jar_disc(&[(
+            "00000.jar",
+            build_jar_bytes(&[("com/other/Menu.class", class())]),
+        )]);
+        assert!(!detect(&mut other, &udf));
+        assert!(parse(&mut other, &udf).is_none());
+
+        let (mut dbp, udf) = jar_disc(&[(
+            "00000.jar",
+            build_jar_bytes(&[("com/dbp/Menu.class", class())]),
+        )]);
+        assert!(detect(&mut dbp, &udf));
+        assert_eq!(parse(&mut dbp, &udf).expect("labels").labels.len(), 1);
     }
 
     // Wires the class sweep + collect_textfield + make_label into the real

@@ -1754,6 +1754,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn constant_pool_double_entry_occupies_two_slots_via_real_parse() {
+        // Same shape as the Long test with tag 6: the Utf8 must land at index 3.
+        let mut buf = vec![
+            0xCA, 0xFE, 0xBA, 0xBE, // magic
+            0x00, 0x00, 0x00, 0x34, // minor / major
+            0x00, 0x04, // cp_count = 4 (0=Empty,1=Double,2=Empty tail,3=Utf8)
+            6,    // Double tag
+        ];
+        buf.extend_from_slice(&2.5f64.to_bits().to_be_bytes());
+        buf.push(1); // Utf8 tag
+        buf.extend_from_slice(&6u16.to_be_bytes());
+        buf.extend_from_slice(b"marker");
+        buf.extend_from_slice(&[0; 8]); // access, this, super, interfaces_count
+        buf.extend_from_slice(&[0; 6]); // fields, methods, attributes counts
+
+        let cf = ClassFile::parse(&buf).expect("well-formed synthetic class file");
+        assert_eq!(cf.constant_pool.len(), 4);
+        assert_eq!(cf.constant_pool.utf8(3), Some("marker"));
+        assert_eq!(cf.constant_pool.utf8(2), None);
+        assert!(matches!(cf.constant_pool.get(1), Some(CpInfo::Double(v)) if *v == 2.5));
+    }
+
+    #[test]
+    fn instruction_size_switch_padding_depends_on_pc() {
+        // Padding is (pc+1+3)&!3 - pc - 1: 3,2,1,0 bytes for pc%4 = 0,1,2,3.
+        // pc=0 alone cannot tell `& !3` or `pc + 4` from the real alignment.
+        for pc in 0usize..8 {
+            let start = (pc + 1 + 3) & !3;
+            let mut code = vec![0u8; pc];
+            code.push(TABLESWITCH);
+            code.resize(start, 0);
+            code.extend_from_slice(&[0; 4]); // default
+            code.extend_from_slice(&0i32.to_be_bytes()); // low
+            code.extend_from_slice(&1i32.to_be_bytes()); // high: 2 entries
+            code.extend_from_slice(&[0; 8]);
+            assert_eq!(
+                instruction_size(&code, pc),
+                Some(start - pc + 12 + 8),
+                "tableswitch pc={pc}"
+            );
+
+            let mut code = vec![0u8; pc];
+            code.push(LOOKUPSWITCH);
+            code.resize(start, 0);
+            code.extend_from_slice(&[0; 4]); // default
+            code.extend_from_slice(&1i32.to_be_bytes()); // npairs
+            code.extend_from_slice(&[0; 8]);
+            assert_eq!(
+                instruction_size(&code, pc),
+                Some(start - pc + 8 + 8),
+                "lookupswitch pc={pc}"
+            );
+        }
+    }
+
     // instruction_size: tableswitch/lookupswitch with non-degenerate
     // low/high/npairs — existing tests only cover the all-zero case, which
     // can't distinguish `-` from `+` in the entry-count arithmetic.
