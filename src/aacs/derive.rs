@@ -371,7 +371,11 @@ pub(crate) fn resolve_dk_node(
             return Some(dk);
         }
     }
-    // Degenerate MKB (no gating bit): fall back to the node itself.
+    // Parsed tables but no node gates: the position is unwalkable, so don't bank it.
+    if tables.is_some() {
+        return None;
+    }
+    // No parseable tables: fall back to the node itself.
     Some(DeviceKey {
         key: *key,
         node: (uv & 0xFFFF) as u16,
@@ -1209,6 +1213,17 @@ mod position_recovery_tests {
             p.uv & v_mask,
             "a node equal to uv under v_mask does not gate — the walk would \
              skip the slot entirely"
+        );
+    }
+
+    // Parsed tables where no node gates (key not in this MKB's slot): resolving must
+    // fail rather than return a key that can never derive.
+    #[test]
+    fn resolve_dk_node_rejects_an_unwalkable_position() {
+        let p = plant_mkb();
+        assert!(
+            resolve_dk_node(&p.mkb, &[0x11; 16], p.uv, p.u_mask_shift).is_none(),
+            "no node gates for a key the MKB does not open"
         );
     }
 
