@@ -3104,6 +3104,18 @@ mod command_tests {
         );
     }
 
+    // An event length too short to hold a Media Event Descriptor means byte 5 is not a
+    // Media Status, even with NEA clear and class Media: fall back to TUR.
+    #[test]
+    fn drive_status_rejects_a_too_short_descriptor_length() {
+        for len in [0u16, 2, 5] {
+            let mut reply = media_event_reply(0x00);
+            reply[0..2].copy_from_slice(&len.to_be_bytes());
+            let mut d = drive_with(reply);
+            assert_eq!(d.drive_status(), DriveStatus::DiscPresent, "len {len}");
+        }
+    }
+
     #[test]
     fn drive_status_short_transfer_falls_back_to_tur() {
         // bytes_transferred < 6 (buffer len 8, payload 4) means the GET EVENT reply
@@ -4080,20 +4092,67 @@ mod command_tests {
         }
     }
 
+    /// Logs every CDB (unlike `RecordingTransport`, which keeps the last) and answers
+    /// each command with `payload`.
+    struct LogTransport {
+        log: Arc<Mutex<Vec<Vec<u8>>>>,
+        payload: Vec<u8>,
+    }
+    impl ScsiTransport for LogTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.log.lock().unwrap().push(cdb.to_vec());
+            let n = self.payload.len().min(data.len());
+            data[..n].copy_from_slice(&self.payload[..n]);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: n,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn logging(payload: Vec<u8>) -> (Drive, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let t = LogTransport {
+            log: log.clone(),
+            payload,
+        };
+        (Drive::from_transport_for_test(Box::new(t)), log)
+    }
+
     #[test]
     fn eject_unlocks_then_sends_start_stop_with_loej() {
-        let RecordingHarness {
-            drive: mut d,
-            cdb,
-            timeouts: _to,
-        } = recording(TransportOutcome::Ok(0));
+        let (mut d, log) = logging(Vec::new());
         d.eject().unwrap();
-        // The mock only records the LAST cdb; eject's own START STOP UNIT
-        // (with LOEJ=1, byte 4 == 0x02) must be what's left recorded, not
-        // the PREVENT/ALLOW from unlock_tray it calls first.
-        let c = cdb.lock().unwrap();
-        assert_eq!(c[0], SCSI_START_STOP_UNIT);
-        assert_eq!(c[4], 0x02, "START=0, LOEJ=1 -> eject");
+        let log = log.lock().unwrap();
+        let first = &log[0];
+        assert_eq!(first[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL, "unlock first");
+        assert_eq!(first[4], 0x00, "ALLOW");
+        let last = log.last().unwrap();
+        assert_eq!(last[0], SCSI_START_STOP_UNIT);
+        assert_eq!(last[4], 0x02, "START=0, LOEJ=1 -> eject");
+    }
+
+    #[test]
+    fn enable_recovered_error_reporting_sends_mode_select10_with_payload_length() {
+        // 8-byte MODE(10) header, no block descriptor, 12-byte error-recovery page.
+        let mut sense = vec![0u8; 20];
+        sense[1] = 18; // mode data length
+        sense[8] = MODE_PAGE_ERROR_RECOVERY;
+        sense[9] = 0x0A;
+        let (mut d, log) = logging(sense);
+        assert!(d.enable_recovered_error_reporting());
+        let log = log.lock().unwrap();
+        let c = log.last().unwrap();
+        assert_eq!(c[0], SCSI_MODE_SELECT);
+        assert_eq!(c[1], 0x10, "PF=1, SP=0");
+        assert_eq!(&c[7..9], &[0x00, 20], "parameter list length");
     }
 
     /// `SectorSource for Drive` must actually forward to `Drive`'s own
