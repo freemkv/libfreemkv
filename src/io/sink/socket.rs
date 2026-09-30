@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_sink_is_sequential_only() {
+    fn socket_sink_coerces_to_sequential_sink() {
         // Compile-time assertion via dyn — if this ever started
         // satisfying `RandomAccessSink`, the trait split would be broken.
         fn _assert_seq(_: &mut dyn super::super::SequentialSink) {}
@@ -236,9 +236,23 @@ mod tests {
         });
         let mut sink = SocketSink::connect(addr, None).unwrap();
         _assert_seq(&mut sink);
-        // No `is_not<T>` to assert the negative directly, but `SocketSink` doesn't
-        // impl `Seek`, so it can't unify with `RandomAccessSink`'s super-bound —
-        // the blanket `impl<T: SequentialSink + Seek> RandomAccessSink for T {}` excludes it.
+        // Only the positive coercion is checked: `RandomAccessSink` impls are explicit
+        // (local_file, writeback_file), so a socket needs a deliberate new impl + `Seek`.
+    }
+
+    #[test]
+    fn udp_socket_sink_binds_ipv6_for_an_ipv6_peer() {
+        let Ok(receiver) = UdpSocket::bind("[::1]:0") else {
+            return; // host has no IPv6 loopback
+        };
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut sink = UdpSocketSink::connect(receiver.local_addr().unwrap(), None).unwrap();
+        sink.write_all(&[7, 8, 9]).unwrap();
+        let mut buf = [0u8; 8];
+        let n = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &[7, 8, 9]);
     }
 
     #[test]

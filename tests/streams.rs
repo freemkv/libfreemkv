@@ -126,11 +126,7 @@ fn open_input_bare_path_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(
-        msg.contains("not a valid stream URL") || msg.contains("E9002"),
-        "got: {}",
-        msg
-    );
+    assert!(msg.contains("E9002"), "got: {}", msg);
 }
 
 #[test]
@@ -142,11 +138,7 @@ fn open_output_bare_path_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(
-        msg.contains("not a valid stream URL") || msg.contains("E9002"),
-        "got: {}",
-        msg
-    );
+    assert!(msg.contains("E9002"), "got: {}", msg);
 }
 
 #[test]
@@ -157,11 +149,7 @@ fn open_input_m2ts_empty_path_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(
-        msg.contains("requires a file path") || msg.contains("E9003"),
-        "got: {}",
-        msg
-    );
+    assert!(msg.contains("E9003"), "got: {}", msg);
 }
 
 #[test]
@@ -172,11 +160,7 @@ fn open_output_null_input_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(
-        msg.contains("write-only") || msg.contains("E9001"),
-        "got: {}",
-        msg
-    );
+    assert!(msg.contains("E9001"), "got: {}", msg);
 }
 
 #[test]
@@ -188,11 +172,7 @@ fn open_output_disc_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(
-        msg.contains("read-only") || msg.contains("E9000"),
-        "got: {}",
-        msg
-    );
+    assert!(msg.contains("E9000"), "got: {}", msg);
 }
 
 #[test]
@@ -203,11 +183,7 @@ fn open_input_network_no_port_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(
-        msg.contains("PES pipeline") || msg.contains("missing port") || msg.contains("E9004"),
-        "got: {}",
-        msg
-    );
+    assert!(msg.contains("E9004"), "got: {}", msg);
 }
 
 #[test]
@@ -377,6 +353,20 @@ fn disc_title_empty() {
     assert_eq!(dt.streams.len(), 0);
     assert_eq!(dt.duration_secs, 0.0);
     assert!(dt.playlist.is_empty());
+}
+
+// Every named codec must round-trip through its serialized id (FMKV meta headers).
+#[test]
+fn codec_id_roundtrips_for_every_named_codec() {
+    use Codec::*;
+    let all = [
+        Hevc, H264, Vc1, Mpeg2, Mpeg1, Av1, TrueHd, DtsHdMa, DtsHdHr, Dts, Ac3, Ac3Plus, Lpcm, Aac,
+        Mp2, Mp3, Flac, Opus, Pgs, DvdSub, Srt, Ssa,
+    ];
+    for c in all {
+        assert_ne!(c.id(), "unknown", "{c:?} missing from the codec table");
+        assert_eq!(c.id().parse::<Codec>(), Ok(c), "{c:?} id must parse back");
+    }
 }
 
 // ── Meta codec roundtrip ─────────────────────────────────────

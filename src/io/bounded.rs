@@ -144,7 +144,7 @@ mod tests {
         let halt = Halt::new();
         let halt2 = halt.clone();
         // Flip halt after ~300ms, long enough that the receive loop has rolled
-        // at least one 250ms slice and is back in `recv_timeout`.
+        // several WAIT_SLICE polls and is back in `recv_timeout`.
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(300));
             halt2.cancel();
@@ -165,28 +165,6 @@ mod tests {
             panic!("intentional test panic");
         });
         assert!(matches!(r, Err(BoundedError::WorkerLost)));
-    }
-
-    #[test]
-    fn halt_already_set_before_call_still_returns_halted() {
-        // Halt observed on the very first poll slice. The op blocks
-        // forever; we must not wait the full timeout to notice the
-        // halt is already set.
-        let halt = Halt::new();
-        halt.cancel();
-        let started = Instant::now();
-        let r = bounded_syscall(Some(&halt), Duration::from_secs(10), || {
-            thread::sleep(Duration::from_secs(10));
-            0u32
-        });
-        assert!(matches!(r, Err(BoundedError::Halted)));
-        // Should bail out within ~1 s; allow 2 s of slack for slow
-        // CI hosts.
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "halt-already-set took {:?}",
-            started.elapsed()
-        );
     }
 
     #[test]
@@ -222,7 +200,7 @@ mod tests {
         // The op closure must not have been scheduled at all.
         assert!(
             !ran.load(Ordering::SeqCst),
-            "op ran despite pre-cancelled halt — short-circuit at line 108 broken"
+            "op ran despite pre-cancelled halt — start() short-circuit broken"
         );
     }
 
@@ -279,6 +257,17 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A panicking worker is `WorkerLost` in the stall variant, not a stall `Timeout`.
+    #[test]
+    fn stall_variant_reports_worker_lost_on_panic() {
+        let p = Progress::new();
+        let mut timer = StallTimer::new(Duration::from_secs(5), &p);
+        let r = bounded_syscall_stall(None, &p, &mut timer, &mut || {}, || -> u8 {
+            panic!("intentional test panic");
+        });
+        assert!(matches!(r, Err(BoundedError::WorkerLost)));
     }
 
     /// HR1 for one blocked call: a worker blocked past the window while `tick` bumps the

@@ -188,8 +188,11 @@ fn scan_iso_propagates_scan_error() {
         .suffix(".iso")
         .tempfile()
         .expect("tempfile create");
-    tmp.write_all(&vec![0u8; 8 * SECTOR_SIZE]).expect("write");
+    tmp.write_all(&vec![0u8; 300 * SECTOR_SIZE]).expect("write");
     tmp.flush().expect("flush");
     let result = libfreemkv::scan_iso(tmp.path(), ScanOptions::default());
-    assert!(result.is_err(), "non-UDF image must error");
+    assert!(
+        matches!(result, Err(libfreemkv::error::Error::UdfNotFilesystem)),
+        "non-UDF image must surface the not-UDF verdict"
+    );
 }

@@ -15,7 +15,8 @@ fn test_drive_read_per_cdb_timeout_bounds_call() {
     let path = Path::new(&device);
 
     let mut drive = libfreemkv::Drive::open(path).expect("open drive");
-    let timeout_ms: u32 = 5_000;
+    // Mirrors the crate-private scsi::READ_TIMEOUT_MS used by Drive::read.
+    let timeout_ms: u32 = 10_000;
 
     let start = std::time::Instant::now();
     let _ = drive.read(0, 1, &mut [0u8; 2048], false);

@@ -347,6 +347,37 @@ fn a_file_that_shrinks_after_planning_fails_the_read() {
     assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FILE_CHANGED);
 }
 
+/// Bump a file's mtime by a minute without changing its length.
+fn touch_later(path: &std::path::Path) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let t = f.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+    f.set_modified(t).unwrap();
+}
+
+/// An IFO rewritten in place at the SAME length still moves VOB placement, so a later
+/// mtime must fail the read; a same-length, later-mtime VOB (size-only check) must not.
+#[test]
+fn an_ifo_rewritten_at_the_same_length_fails_but_a_touched_vob_does_not() {
+    let s = Scratch::new("ifo-mtime");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 1));
+    s.file("VIDEO_TS/VTS_01_1.VOB", &pattern(1, SECTOR));
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let ext = |img: &mut DirImage, p: &str| fs.file_extents(img, p).unwrap()[0];
+    let (ifo_lba, _) = ext(&mut img, "/VIDEO_TS/VTS_01_0.IFO");
+    let (vob_lba, _) = ext(&mut img, "/VIDEO_TS/VTS_01_1.VOB");
+    let mut buf = vec![0u8; SECTOR];
+
+    touch_later(&s.path().join("VIDEO_TS/VTS_01_1.VOB"));
+    img.read_sectors(vob_lba, 1, &mut buf, false)
+        .expect("size-only files ignore mtime");
+
+    touch_later(&s.path().join("VIDEO_TS/VTS_01_0.IFO"));
+    let err = img.read_sectors(ifo_lba, 1, &mut buf, false).unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FILE_CHANGED);
+}
+
 // ── DVD placement ───────────────────────────────────────────────────────────
 
 /// Build a `VTS_01_0.IFO` body whose VOB pointers are the given sector

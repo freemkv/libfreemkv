@@ -447,29 +447,26 @@ mod tests {
         );
     }
 
+    // read_sectors must feed take_drop_window with the real read offsets (the helper
+    // is tested alone above); a small chunk lets the window state show the wiring.
     #[test]
-    fn drop_chunk_size_env_override() {
-        // Explicit 8 MiB via env var. SAFETY: set_var is `unsafe` since Rust 2024
-        // (can race with other threads/TLS), but this test runs single-threaded
-        // and in-process before any FileSectorSource construction.
-        unsafe {
-            std::env::set_var("FREEMKV_READ_DROP_CHUNK_MIB", "8");
-        }
-        assert_eq!(read_drop_chunk_bytes(), 8 * 1024 * 1024);
-
-        unsafe {
-            std::env::remove_var("FREEMKV_READ_DROP_CHUNK_MIB");
-        }
-        assert_eq!(read_drop_chunk_bytes(), READ_DROP_CHUNK_BYTES_DEFAULT);
-
-        // Garbage env value falls back to default.
-        unsafe {
-            std::env::set_var("FREEMKV_READ_DROP_CHUNK_MIB", "not-a-number");
-        }
-        assert_eq!(read_drop_chunk_bytes(), READ_DROP_CHUNK_BYTES_DEFAULT);
-        unsafe {
-            std::env::remove_var("FREEMKV_READ_DROP_CHUNK_MIB");
-        }
+    fn read_sectors_advances_the_drop_window() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dw.iso");
+        make_iso(&path, 32);
+        let mut src = FileSectorSource::open(&path).unwrap();
+        src.drop_chunk_bytes = 64 * SECTOR_BYTES_U64;
+        let mut buf = vec![0u8; 2 * SECTOR_BYTES];
+        src.read_sectors(10, 2, &mut buf, false).unwrap();
+        assert_eq!(
+            src.drop_window,
+            (10 * SECTOR_BYTES_U64, 12 * SECTOR_BYTES_U64)
+        );
+        src.read_sectors(12, 2, &mut buf, false).unwrap();
+        assert_eq!(
+            src.drop_window,
+            (10 * SECTOR_BYTES_U64, 14 * SECTOR_BYTES_U64)
+        );
     }
 
     // Additional coverage. count==0 must short-circuit to Ok(0) before any

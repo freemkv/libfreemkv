@@ -441,6 +441,27 @@ mod tests {
     }
 
     #[test]
+    fn secondary_first_or_only_track_is_never_default() {
+        let mut t = DiscTitle::empty();
+        t.streams = vec![
+            video(Codec::Hevc, Resolution::R2160p, true),
+            video(Codec::Hevc, Resolution::R2160p, false),
+            audio("eng", true, LabelPurpose::Commentary, "Director"),
+            audio("eng", false, LabelPurpose::Normal, ""),
+        ];
+        let p = TitleProfile::from_title(&t, 0, true);
+        assert!(!p.video[0].default && p.video[1].default);
+        assert!(!p.audio[0].default && p.audio[1].default);
+        // Only a secondary track of each kind: nothing is default.
+        t.streams = vec![
+            video(Codec::Hevc, Resolution::R2160p, true),
+            audio("eng", true, LabelPurpose::Commentary, ""),
+        ];
+        let p = TitleProfile::from_title(&t, 0, true);
+        assert!(!p.video[0].default && !p.audio[0].default);
+    }
+
+    #[test]
     fn second_default_cleared_when_two_non_secondary_audio() {
         // DVD title: BOTH audio tracks are non-secondary. Only the first keeps
         // the default flag (mirrors the muxer's "keep only first default").
