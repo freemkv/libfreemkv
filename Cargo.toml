@@ -83,7 +83,7 @@ rustix = { version = "1", default-features = false, features = ["std", "event"],
 # — untrusted disc bytes — into authoritative titles/clips/chapters. A real
 # parser, not a hand-rolled scanner: the XPL is genuine XML (comments, varied
 # attribute order, self-closing tags).
-roxmltree = { version = "0.20", optional = true }
+roxmltree = { version = "0.21", optional = true }
 # Trace-level instrumentation for the read/transport path (SgIoTransport::execute
 # and friends). Part of the `scsi` feature — the transport layer traces here.
 # Debug/trace logging is the permitted string output. Consumers (autorip) wire a
