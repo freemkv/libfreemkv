@@ -12,6 +12,7 @@ use crate::aacs::content::{
     ALIGNED_UNIT_LEN, aacs_unit_encrypted, aacs_unit_on_grid, clear_copy_permission_indicator,
     decrypt_unit, is_clean,
 };
+use crate::consts::SECTOR_BYTES;
 use crate::disc::ContentFormat;
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
@@ -132,11 +133,13 @@ impl Arrival {
             let (id, candidate) = self.pieces[span.3];
             let slot = match self.cache.get(id) {
                 Some(Proof::Proven(s)) => s,
-                Some(Proof::Provisional(s)) => {
+                Some(Proof::Provisional(s, from)) => {
                     // KU §2.4: the next readable unit confirms a provisional key or stops;
                     // one no held key opens while the key opens a batch partner is damage.
                     if self.opens(&buf[range.clone()], &unit_keys[s].1) {
-                        self.cache.set(id, Proof::Proven(s));
+                        if at != from {
+                            self.cache.set(id, Proof::Proven(s));
+                        }
                         s
                     } else if self.is_damage(
                         &buf[range.clone()],
@@ -269,7 +272,7 @@ impl Arrival {
             None if !any_partner => {
                 // No readable partner: provisional one-unit proof, false-accept ≈ pool × 1e-5.
                 tracing::debug!(target: "freemkv::keys", lba = at, "provisional one-unit proof");
-                self.cache.set(id, Proof::Provisional(openers[0]));
+                self.cache.set(id, Proof::Provisional(openers[0], at));
                 Ok(Some(openers[0]))
             }
             None => Err(self.stop(at, "no held key opens the unit and a partner")),
@@ -313,7 +316,7 @@ impl Arrival {
         let (Ok(lba), Ok(count)) = (u32::try_from(from), u16::try_from(to - from)) else {
             return Vec::new();
         };
-        let mut side = vec![0u8; count as usize * 2048];
+        let mut side = vec![0u8; count as usize * SECTOR_BYTES];
         match inner.read_sectors(lba, count, &mut side, false) {
             Ok(n) => side[..n.min(side.len())]
                 .chunks(ALIGNED_UNIT_LEN)
