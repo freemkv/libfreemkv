@@ -3581,4 +3581,189 @@ mod tests {
             assert_eq!(live.lost_bytes, iso.lost_bytes, "phase {phase}");
         }
     }
+
+    // Clear BD-TS audio: `units` aligned units, each 32 one-packet audio PES on PID 0x1100.
+    fn clear_audio_image(units: usize) -> Vec<u8> {
+        let pkt = bdts_data_packet(0x1100, true, &audio_pes(&PLAIN_ES));
+        pkt.repeat(units * 32)
+    }
+
+    // Serves an in-memory image; any read covering `bad` fails as a disc read error.
+    struct BadSectorImage {
+        data: Vec<u8>,
+        bad: Option<u32>,
+    }
+    impl SectorSource for BadSectorImage {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if self
+                .bad
+                .is_some_and(|b| (lba..lba + count as u32).contains(&b))
+            {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(0x02),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            let start = lba as usize * 2048;
+            for (i, b) in buf[..bytes].iter_mut().enumerate() {
+                *b = self.data.get(start + i).copied().unwrap_or(0);
+            }
+            Ok(bytes)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            (self.data.len() / 2048) as u32
+        }
+    }
+
+    // A two-audio-stream (0x1100, 0x1101) title over `units` clear units.
+    fn clear_title(units: usize) -> DiscTitle {
+        let mut title = aac_audio_title(0x1100);
+        title.streams.extend(aac_audio_title(0x1101).streams);
+        title.extents = vec![crate::disc::Extent {
+            start_lba: 0,
+            sector_count: units as u32 * 3,
+        }];
+        title
+    }
+
+    fn clear_live(units: usize, bad: Option<u32>) -> MuxSource<'static> {
+        MuxSource::Live {
+            reader: Box::new(BadSectorImage {
+                data: clear_audio_image(units),
+                bad,
+            }),
+            title: clear_title(units),
+            format: crate::disc::ContentFormat::BdTs,
+        }
+    }
+
+    // `raw` routes a clear Live source through mux_unkeyed; otherwise mux_keyed runs it
+    // over the keyless set.
+    fn clear_opts(raw: bool) -> MuxOptions {
+        MuxOptions {
+            raw,
+            ..keyed_opts()
+        }
+    }
+
+    // skip_errors reaches the live DiscStream on every arm that builds one.
+    #[test]
+    fn skip_errors_reaches_every_live_arm() {
+        let session = |bad| {
+            let mut disc = aacs_session_disc(clear_title(2));
+            disc.aacs = None;
+            disc.encrypted = false;
+            let reader = BadSectorImage {
+                data: clear_audio_image(2),
+                bad,
+            };
+            DiscSession::from_parts_for_test(Some(disc), Some(Box::new(reader)))
+        };
+        for arm in ["live-unkeyed", "live-keyed", "session"] {
+            for skip in [true, false] {
+                let mut s = session(Some(4));
+                let (src, raw) = match arm {
+                    "live-unkeyed" => (clear_live(2, Some(4)), true),
+                    "live-keyed" => (clear_live(2, Some(4)), false),
+                    _ => (
+                        MuxSource::Session {
+                            session: &mut s,
+                            title_index: 0,
+                        },
+                        false,
+                    ),
+                };
+                let opts = MuxOptions {
+                    skip_errors: skip,
+                    ..clear_opts(raw)
+                };
+                let res = mux_with_keys(
+                    src,
+                    None,
+                    "null://",
+                    &opts,
+                    &Halt::new(),
+                    Arc::new(NoopEvents),
+                );
+                match skip {
+                    true => {
+                        let out = res.expect("the bad sector is skipped");
+                        assert!(out.completed && out.errors > 0, "{arm}");
+                    }
+                    false => assert_eq!(
+                        crate::error::error_code(&res.expect_err("bad sector")),
+                        Some(crate::error::E_DISC_READ),
+                        "{arm}"
+                    ),
+                }
+            }
+        }
+    }
+
+    // The selection prunes the opened title on every MuxSource arm.
+    #[test]
+    fn the_selection_prunes_every_arm() {
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("clip.iso");
+        std::fs::write(&iso, clear_audio_image(2)).unwrap();
+        let mut disc = aacs_session_disc(clear_title(2));
+        disc.aacs = None;
+        disc.encrypted = false;
+        let mut session = DiscSession::from_parts_for_test(
+            Some(disc),
+            Some(Box::new(BadSectorImage {
+                data: clear_audio_image(2),
+                bad: None,
+            })),
+        );
+        let sel = crate::StreamSelection {
+            audio: crate::mux::select::PidFilter::Only(vec![0x1100]),
+            ..Default::default()
+        };
+        for arm in [
+            "live-unkeyed",
+            "live-keyed",
+            "iso-unkeyed",
+            "iso-keyed",
+            "session",
+        ] {
+            let (src, raw) = match arm {
+                "live-unkeyed" => (clear_live(2, None), true),
+                "live-keyed" => (clear_live(2, None), false),
+                "session" => (
+                    MuxSource::Session {
+                        session: &mut session,
+                        title_index: 0,
+                    },
+                    false,
+                ),
+                _ => (
+                    MuxSource::Iso {
+                        path: &iso,
+                        title: clear_title(2),
+                        format: crate::disc::ContentFormat::BdTs,
+                    },
+                    arm == "iso-unkeyed",
+                ),
+            };
+            let opts = MuxOptions {
+                selection: sel.clone(),
+                ..clear_opts(raw)
+            };
+            let spy = Arc::new(TitleSpy(std::sync::Mutex::new(None)));
+            mux_with_keys(src, None, "null://", &opts, &Halt::new(), spy.clone())
+                .unwrap_or_else(|e| panic!("{arm}: {e}"));
+            let opened = spy.0.lock().unwrap().take().expect("opened");
+            assert_eq!(opened.streams.len(), 1, "{arm}");
+        }
+    }
 }
