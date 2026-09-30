@@ -474,6 +474,11 @@ impl DiscSession {
         self.reader.take()
     }
 
+    // The staged sector source, still in place (checks that must not consume it).
+    pub(crate) fn staged_reader(&self) -> Option<&dyn SectorSource> {
+        self.reader.as_deref()
+    }
+
     // Test-only: build a session over an injected reader + already-scanned disc without opening
     // a live Drive, to exercise the mux test paths.
     #[cfg(test)]

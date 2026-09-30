@@ -510,9 +510,13 @@ fn mux_keyed(
                     .unwrap_or_else(|| disc.volume_id.clone());
                 (title, disc.content_format, playlist, source)
             };
-            let reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
-                path: session.device_path().to_string(),
-            })?;
+            // Refuse the selection / the set's gate BEFORE taking the reader, so a
+            // refused mux leaves the session retryable (as mux_unkeyed does).
+            let path = session.device_path().to_string();
+            let not_ready = || Error::DeviceNotReady { path: path.clone() };
+            let staged = session.staged_reader().ok_or_else(not_ready)?;
+            let title = live_keyed_title(staged, title, set, opts)?;
+            let reader = session.take_reader().ok_or_else(not_ready)?;
             let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
             (stream, Some(playlist), source)
         }
@@ -526,6 +530,7 @@ fn mux_keyed(
                 playlist: title.playlist.clone(),
                 ..SourceInfo::default()
             };
+            let title = live_keyed_title(&*reader, title, set, opts)?;
             let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
             (stream, None, source)
         }
@@ -545,16 +550,13 @@ fn mux_keyed(
     )
 }
 
-// The inline live-drive `DiscStream` over the set: its keys, map and on-arrival proof.
-fn live_keyed(
-    reader: Box<dyn SectorSource>,
+// The live title after the selection, once the set's gate admits it over `reader`.
+fn live_keyed_title(
+    reader: &dyn SectorSource,
     mut title: DiscTitle,
-    format: crate::disc::ContentFormat,
     set: &crate::keys::ResolvedKeySet,
     opts: &MuxOptions,
-    halt: &Halt,
-    events: &std::sync::Arc<dyn MuxEvents>,
-) -> std::io::Result<Box<dyn Stream>> {
+) -> std::io::Result<DiscTitle> {
     opts.selection
         .apply(&mut title)
         .map_err(std::io::Error::from)?;
@@ -564,6 +566,20 @@ fn live_keyed(
         .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
         .collect();
     set.gate(reader.random_access(), Some(&ranges), false)?;
+    Ok(title)
+}
+
+// The inline live-drive `DiscStream` over the set (`title` from `live_keyed_title`): its
+// keys, map and on-arrival proof.
+fn live_keyed(
+    reader: Box<dyn SectorSource>,
+    title: DiscTitle,
+    format: crate::disc::ContentFormat,
+    set: &crate::keys::ResolvedKeySet,
+    opts: &MuxOptions,
+    halt: &Halt,
+    events: &std::sync::Arc<dyn MuxEvents>,
+) -> std::io::Result<Box<dyn Stream>> {
     let stream = crate::mux::DiscStream::new(
         reader,
         title,
@@ -3069,6 +3085,40 @@ mod tests {
         )
         .expect("the set's key opens the unit");
         assert!(out.completed && out.bytes_written > 0);
+    }
+
+    /// A refused selection leaves the session's reader staged: a retry on the same
+    /// session muxes instead of failing DeviceNotReady.
+    #[test]
+    fn mux_with_keys_session_keeps_its_reader_when_the_selection_is_refused() {
+        let key = [0x5A; 16];
+        let (reader, title, _) = keyed_live(key);
+        let mut disc = aacs_session_disc(title);
+        disc.capacity_sectors = 16;
+        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
+        let mut bad = keyed_opts();
+        bad.selection.audio = crate::mux::select::PidFilter::Only(vec![0x0FFF]);
+        let run = |session: &mut DiscSession, opts: &MuxOptions| {
+            mux_with_keys(
+                MuxSource::Session {
+                    session,
+                    title_index: 0,
+                },
+                Some(&set),
+                "null://",
+                opts,
+                &Halt::new(),
+                Arc::new(NoopEvents),
+            )
+        };
+        let err = run(&mut session, &bad).expect_err("unknown PID is refused");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_SELECTION_PID_UNKNOWN)
+        );
+        let out = run(&mut session, &keyed_opts()).expect("the retry still has its reader");
+        assert!(out.completed);
     }
 
     /// A key set for another disc is a typed E7013 on a session, never a debug-build panic.
