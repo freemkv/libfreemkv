@@ -2192,3 +2192,16 @@ fn scanned_sd_video_takes_its_standards_colour() {
     assert_eq!(colour(288), ColorSpace::Bt470bg);
     assert_eq!(colour(1080), ColorSpace::Bt709);
 }
+
+// A sequence_display_extension that signals BT.709 wins over the SD line count.
+#[test]
+fn scanned_sd_video_keeps_its_signalled_colour() {
+    let mut v = seq_header(720, 480, 3, 112, false);
+    v.extend([0, 0, 1, 0xB5, 0x23, 1, 1, 1, 0, 0, 0, 0]);
+    v.extend(test_es::mpeg2_pic(1, 3));
+    let s = scan::scan_streams(&scan_pack(&[(0xE0, v)], None)).unwrap();
+    match &s[0] {
+        DiscStream::Video(v) => assert_eq!(v.color_space, ColorSpace::Bt709),
+        _ => unreachable!(),
+    }
+}

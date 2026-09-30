@@ -19,8 +19,10 @@ const LEAD27: u64 = HZ27 * 95 / 100;
 pub(crate) const MAX_PTS_GAP_TICKS: u64 = 63_000;
 /// MS-17: SCR fields in successive packs ≤ 0.7 s apart.
 pub(crate) const MAX_SCR_GAP27: u64 = HZ27 * 7 / 10;
-/// Widest timestamp gap bridged with padding packs (one hour, ~10k packs); more is refused.
-const MAX_PAD_GAP27: u64 = 3_600 * HZ27;
+/// Widest timestamp gap bridged with padding packs; a wider one is re-based away.
+const MAX_PAD_GAP27: u64 = 5 * HZ27;
+/// Padding allowed beyond twice the input bytes pushed, so amplification stays bounded.
+const PAD_FLOOR_BYTES: u64 = 256 * 1024;
 /// Per-track lookahead before the clock may pass `t` (design §2.4 step 1).
 const LOOKAHEAD27: u64 = HZ27;
 /// Max-interleave cap: a track this far behind the others is treated as sparse.
@@ -146,6 +148,8 @@ pub(crate) struct PstdCounters {
     pub padding_packs: u64,
     /// EOF passes that lifted the lead and whole-frame waits to drain what was stuck.
     pub forced_eof: u64,
+    /// Quiet timestamp gaps closed by shifting later timestamps back, not padding.
+    pub rebased_gaps: u64,
 }
 
 /// The pack writer.
@@ -163,6 +167,9 @@ pub(crate) struct Mux<W: Write> {
     next_id: u64,
     queued_bytes: usize,
     counters: PstdCounters,
+    /// Total 27 MHz shift removed from timestamps by re-basing; applied to later AUs.
+    shift27: u64,
+    pushed_bytes: u64,
     /// EOF with nothing schedulable: the lead and whole-frame waits are lifted (B1).
     forcing: bool,
 }
@@ -209,6 +216,8 @@ impl<W: Write> Mux<W> {
             next_id: 0,
             queued_bytes: 0,
             counters: PstdCounters::default(),
+            shift27: 0,
+            pushed_bytes: 0,
             forcing: false,
         }
     }
@@ -223,7 +232,11 @@ impl<W: Write> Mux<W> {
     }
 
     /// Queue one AU of stream `si`, in that stream's decode order.
-    pub(crate) fn push(&mut self, si: usize, au: Au) {
+    pub(crate) fn push(&mut self, si: usize, mut au: Au) {
+        let sh90 = self.shift27 / 300;
+        au.pts = au.pts.saturating_sub(sh90);
+        au.dts = au.dts.map(|d| d.saturating_sub(sh90));
+        self.pushed_bytes += au.data.len() as u64;
         let s = &mut self.streams[si];
         let dec27 = au.dts.unwrap_or(au.pts).saturating_mul(300);
         // MS-18 / MPG2-11: a gap over 0.7 s is the content's own (a still or slideshow); count it.
@@ -705,8 +718,11 @@ impl<W: Write> Mux<W> {
                 continue;
             };
             match self.last_scr {
-                Some(last) if next.saturating_sub(last) > MAX_PAD_GAP27 => {
-                    return Err(crate::error::Error::MpgTimestampGap.into());
+                Some(last)
+                    if next.saturating_sub(last) > MAX_PAD_GAP27
+                        || self.pad_over_budget(next, last) =>
+                {
+                    self.rebase(last, next);
                 }
                 Some(last) if next > last.saturating_add(MAX_SCR_GAP27) => {
                     let at = last.saturating_add(MAX_SCR_GAP27).max(t);
@@ -716,6 +732,39 @@ impl<W: Write> Mux<W> {
                 _ => self.t = Some(next),
             }
         }
+    }
+
+    // Padding written stays within a floor plus twice the input, whatever the gaps.
+    fn pad_over_budget(&self, next: u64, last: u64) -> bool {
+        let packs = next.saturating_sub(last) / MAX_SCR_GAP27;
+        (self.counters.padding_packs + packs) * pack::PACK_BYTES as u64
+            > PAD_FLOOR_BYTES + 2 * self.pushed_bytes
+    }
+
+    // Every stream is quiet until `next`: shift all timestamps back so it lands one SCR
+    // step after `last`. All streams move together, so their sync is kept.
+    fn rebase(&mut self, last: u64, next: u64) {
+        let d90 = (next - last - MAX_SCR_GAP27) / 300;
+        let d27 = d90 * 300;
+        if d27 == 0 {
+            self.t = Some(next);
+            return;
+        }
+        self.counters.rebased_gaps += 1;
+        self.shift27 += d27;
+        for s in &mut self.streams {
+            s.last_dec27 = s.last_dec27.saturating_sub(d27);
+            s.last_pts = s.last_pts.map(|p| p.saturating_sub(d90));
+            for q in &mut s.queue {
+                q.dec27 = q.dec27.saturating_sub(d27);
+                q.au.pts = q.au.pts.saturating_sub(d90);
+                q.au.dts = q.au.dts.map(|d| d.saturating_sub(d90));
+            }
+        }
+        for e in &mut self.entries {
+            e.dec27 = e.dec27.saturating_sub(d27);
+        }
+        self.t = Some(next - d27);
     }
 
     /// Drain everything and write `MPEG_program_end_code`.
@@ -788,18 +837,50 @@ mod tests {
         }
     }
 
-    // A far-future timestamp is refused, not bridged with millions of padding packs.
+    fn scrs(out: &[u8]) -> Vec<u64> {
+        let mut v = Vec::new();
+        for i in (0..out.len().saturating_sub(10)).step_by(pack::PACK_BYTES) {
+            let h = &out[i..];
+            let b = |k: usize| u64::from(h[k]);
+            let base = ((b(4) >> 3) & 7) << 30
+                | (b(4) & 3) << 28
+                | b(5) << 20
+                | (b(6) >> 3) << 15
+                | (b(6) & 3) << 13
+                | b(7) << 5
+                | b(8) >> 3;
+            v.push(base * 300 + ((b(8) & 3) << 7 | b(9) >> 1));
+        }
+        v
+    }
+
+    // A far-future timestamp is re-based, not bridged with millions of padding packs.
     #[test]
-    fn a_huge_timestamp_gap_is_refused() {
+    fn a_huge_forward_gap_is_rebased() {
         let mut m = video_mux();
         m.push(0, au(9_000, 100, 0));
         m.push(0, au(9_000 + 2 * 3_600 * 90_000, 100, 0));
-        let e = m.finish().unwrap_err();
-        assert_eq!(
-            crate::error::error_code(&e),
-            Some(crate::error::E_MPG_TIMESTAMP_GAP)
+        m.finish().unwrap();
+        assert_eq!(m.counters().rebased_gaps, 1);
+        let out = m.into_writer();
+        assert!(out.len() < 1 << 20, "{}", out.len());
+        let s = scrs(&out);
+        assert!(
+            s.windows(2)
+                .all(|w| w[1] >= w[0] && w[1] - w[0] <= MAX_SCR_GAP27)
         );
-        assert!(m.into_writer().len() < 1 << 20);
+    }
+
+    // Many 59-minute steps: padding stays a small multiple of the input.
+    #[test]
+    fn repeated_huge_gaps_stay_bounded() {
+        let mut m = video_mux();
+        for k in 0..2_000u64 {
+            m.push(0, au(9_000 + k * 59 * 60 * 90_000, 10, 0));
+        }
+        m.finish().unwrap();
+        let out = m.into_writer();
+        assert!(out.len() < 8 << 20, "{}", out.len());
     }
 
     // Nit (r2): the forced EOF pass that lifts the 0.95 s lead is counted, not silent.

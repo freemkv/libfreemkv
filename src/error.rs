@@ -305,8 +305,6 @@ pub const E_TIMED_OUT: u16 = 9073;
 pub const E_MPG_NO_VIDEO_TRACK: u16 = 9074;
 /// `mpg://` reached end of input with access units no pack could take.
 pub const E_MPG_UNPACKETIZED: u16 = 9075;
-/// `mpg://` source timestamps jump further than the muxer will bridge with padding packs.
-pub const E_MPG_TIMESTAMP_GAP: u16 = 9076;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -925,8 +923,6 @@ pub enum Error {
     MpgNoVideoTrack,
     /// `mpg://` end of input left access units unwritten. See [`E_MPG_UNPACKETIZED`].
     MpgUnpacketized,
-    /// `mpg://` timestamp gap beyond the padding cap. See [`E_MPG_TIMESTAMP_GAP`].
-    MpgTimestampGap,
 }
 
 impl Error {
@@ -1069,7 +1065,6 @@ impl Error {
             Error::TimedOut { .. } => E_TIMED_OUT,
             Error::MpgNoVideoTrack => E_MPG_NO_VIDEO_TRACK,
             Error::MpgUnpacketized => E_MPG_UNPACKETIZED,
-            Error::MpgTimestampGap => E_MPG_TIMESTAMP_GAP,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
@@ -1349,7 +1344,6 @@ impl From<Error> for std::io::Error {
             E_MP4_NO_VIDEO_TRACK
             | E_MPG_NO_VIDEO_TRACK
             | E_MPG_UNPACKETIZED
-            | E_MPG_TIMESTAMP_GAP
             | E_MP4_INVALID
             | E_MP4_MISSING_CODEC_PRIVATE
             | E_MP4_UNKNOWN_RESOLUTION => std::io::ErrorKind::InvalidData,
@@ -1689,7 +1683,6 @@ mod tests {
             Error::TimedOut { op: "verify" }.code(),
             Error::MpgNoVideoTrack.code(),
             Error::MpgUnpacketized.code(),
-            Error::MpgTimestampGap.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1782,7 +1775,6 @@ mod tests {
             (Error::TimedOut { op: "verify" }, E_TIMED_OUT),
             (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
             (Error::MpgUnpacketized, E_MPG_UNPACKETIZED),
-            (Error::MpgTimestampGap, E_MPG_TIMESTAMP_GAP),
             (
                 Error::BusStreamUnmapped {
                     files: "/BDMV/STREAM/00002.m2ts".into(),
@@ -2155,7 +2147,6 @@ mod tests {
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
             (Error::MpgUnpacketized, E_MPG_UNPACKETIZED),
-            (Error::MpgTimestampGap, E_MPG_TIMESTAMP_GAP),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
             (Error::Mp4UnknownResolution, E_MP4_UNKNOWN_RESOLUTION),

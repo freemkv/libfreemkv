@@ -108,6 +108,20 @@ fn sd_colour(height: u32) -> ColorSpace {
     }
 }
 
+// A sequence_display_extension (id 2) with colour_description names the colour outright.
+fn signalled_colour(es: &[u8]) -> Option<ColorSpace> {
+    let at = es
+        .windows(5)
+        .position(|w| w[..4] == [0, 0, 1, 0xB5] && w[4] >> 4 == 2 && w[4] & 1 == 1)?;
+    let d = es.get(at + 5..at + 8)?;
+    match (d[0], d[2]) {
+        (1, _) | (_, 1) => Some(ColorSpace::Bt709),
+        (5, _) | (_, 5) => Some(ColorSpace::Bt470bg),
+        (6, _) | (_, 6) => Some(ColorSpace::Smpte170m),
+        _ => None,
+    }
+}
+
 fn probe_video(
     es: &[u8],
     map_type: Option<u8>,
@@ -132,7 +146,7 @@ fn probe_video(
         let progressive = ext
             .and_then(|e| es.get(e + 5))
             .is_none_or(|b| b & 0x08 != 0);
-        colour = sd_colour(height);
+        colour = signalled_colour(es).unwrap_or_else(|| sd_colour(height));
         res = match (height, progressive) {
             (480, false) => Resolution::R480i,
             (576, false) => Resolution::R576i,

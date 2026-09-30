@@ -761,6 +761,7 @@ impl<W: Write + Send> MpgSink<W> {
                 pstd_late_aus = c.pstd.late_aus,
                 pts_gap_over_0_7s = c.pstd.pts_gaps,
                 interleave_cap = c.pstd.interleave_cap,
+                rebased_gaps = c.pstd.rebased_gaps,
                 origin_saturated = c.origin_saturated,
                 "mpg: program stream needed corrections (counted, not refused)"
             );
