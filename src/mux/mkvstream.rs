@@ -2017,6 +2017,11 @@ impl PcmIn {
 // Matroska Video>DisplayUnit (RFC 9559 5.1.4.1.28.13); 3 = aspect ratio, 4 = unknown.
 const DISPLAY_UNIT: u32 = 0x54B2;
 const DISPLAY_UNIT_UNKNOWN: u64 = 4;
+// Video>PixelCrop{Bottom,Top,Left,Right} (RFC 9559 5.1.4.1.28.8-11).
+const PIXEL_CROP_BOTTOM: u32 = 0x54AA;
+const PIXEL_CROP_TOP: u32 = 0x54BB;
+const PIXEL_CROP_LEFT: u32 = 0x54CC;
+const PIXEL_CROP_RIGHT: u32 = 0x54DD;
 
 // The Video children a remux carries on: pixel and display size, and Colour.
 #[derive(Default)]
@@ -2026,6 +2031,8 @@ struct VideoMeta {
     display_width: Option<u64>,
     display_height: Option<u64>,
     display_unit: u64,
+    // PixelCrop (bottom, top, left, right).
+    crop: [u64; 4],
     // (matrix, transfer, primaries, range) as declared; `None` = no Colour element.
     colour: Option<[Option<u64>; 4]>,
 }
@@ -2033,7 +2040,10 @@ struct VideoMeta {
 impl VideoMeta {
     // Display shape as a reduced `(w, h)` when it differs from the writer's pixel grid for `res`.
     fn display_aspect(&self, res: Resolution) -> Option<(u32, u32)> {
-        let (pw, ph) = (u64::from(self.pixel_width), u64::from(self.pixel_height));
+        // RFC 9559: the Display size defaults to the pixel size minus the PixelCrop edges.
+        let [cb, ct, cl, cr] = self.crop;
+        let pw = u64::from(self.pixel_width).saturating_sub(cl.saturating_add(cr));
+        let ph = u64::from(self.pixel_height).saturating_sub(ct.saturating_add(cb));
         let (dw, dh) = if self.display_unit == DISPLAY_UNIT_UNKNOWN {
             (pw, ph)
         } else {
@@ -2080,6 +2090,10 @@ fn parse_video(r: &mut impl Read, size: u64) -> io::Result<VideoMeta> {
             ebml::DISPLAY_WIDTH => v.display_width = Some(read_uint_bounded(r, cs)?),
             ebml::DISPLAY_HEIGHT => v.display_height = Some(read_uint_bounded(r, cs)?),
             DISPLAY_UNIT => v.display_unit = read_uint_bounded(r, cs)?,
+            PIXEL_CROP_BOTTOM => v.crop[0] = read_uint_bounded(r, cs)?,
+            PIXEL_CROP_TOP => v.crop[1] = read_uint_bounded(r, cs)?,
+            PIXEL_CROP_LEFT => v.crop[2] = read_uint_bounded(r, cs)?,
+            PIXEL_CROP_RIGHT => v.crop[3] = read_uint_bounded(r, cs)?,
             ebml::COLOUR => {
                 let mut c = [None; 4];
                 for_each_child(r, cs, |r, cid, ccs| {
@@ -7858,6 +7872,17 @@ mod readback_tests {
         let mut s = open(mkv(&[entry(1, 2, ebml::CODEC_AC3, &enc)], &c));
         assert!(drain_all(&mut s).is_empty());
         assert_eq!(s.errors(), 1);
+    }
+
+    #[test]
+    fn a_cropped_frame_without_display_size_takes_the_cropped_shape() {
+        let video = [
+            dims(1920, 1080),
+            uint(PIXEL_CROP_TOP, 140),
+            uint(PIXEL_CROP_BOTTOM, 140),
+        ]
+        .concat();
+        assert_eq!(video_with(&video, &[]).display_aspect, Some((12, 5)));
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
