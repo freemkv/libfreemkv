@@ -521,6 +521,7 @@ mod tests {
         fn shim_selftest_reaped(pid: i32) -> i32;
         fn shim_selftest_install_fake_device() -> i32;
         fn shim_selftest_last_timeout_ms() -> u32;
+        fn shim_selftest_set_execute(kr: i32, status: u8, count: u64, sense: *const u8);
         fn shim_selftest_fake_optical(on: i32);
     }
 
@@ -795,5 +796,99 @@ mod tests {
         assert_eq!(unsafe { shim_selftest_last_timeout_ms() }, 60_000);
         drop(transport);
         assert!(!OPEN.load(Ordering::Acquire), "drop released OPEN");
+    }
+
+    // Runs `execute` on the fake device after `shim_selftest_set_execute(kr, status, count, sense)`.
+    fn execute_on_fake(
+        kr: i32,
+        status: u8,
+        count: u64,
+        sense: Option<&[u8; 32]>,
+        data: &mut [u8],
+    ) -> (
+        MacScsiTransport,
+        crate::error::Result<crate::scsi::ScsiResult>,
+    ) {
+        assert!(
+            !OPEN.swap(true, Ordering::Acquire),
+            "OPEN held outside SHIM_GLOBALS"
+        );
+        assert_eq!(unsafe { shim_selftest_install_fake_device() }, 0);
+        unsafe {
+            shim_selftest_set_execute(
+                kr,
+                status,
+                count,
+                sense.map_or(std::ptr::null(), |s| s.as_ptr()),
+            )
+        };
+        let mut transport = MacScsiTransport {
+            last_progress: None,
+        };
+        let r = transport.execute(&[0u8; 6], DataDirection::FromDevice, data, 1_000);
+        (transport, r)
+    }
+
+    /// CHECK CONDITION is an error carrying the parsed sense and its progress indication;
+    /// any other nonzero status is an error with no sense.
+    #[test]
+    fn shim_selftest_check_condition_and_other_statuses_are_errors() {
+        let _globals = shim_globals();
+        // Fixed format, NOT READY / 04h 01h (becoming ready), SKSV set, progress 0x1234.
+        let mut sense = [0u8; 32];
+        sense[0] = 0x70;
+        sense[2] = 0x02;
+        sense[12] = 0x04;
+        sense[13] = 0x01;
+        sense[15] = 0x80;
+        sense[16..18].copy_from_slice(&0x1234u16.to_be_bytes());
+        let (t, r) = execute_on_fake(0, 0x02, 0, Some(&sense), &mut [0u8; 8]);
+        match r {
+            Err(Error::ScsiError {
+                status: 0x02,
+                sense: Some(s),
+                ..
+            }) => assert_eq!((s.sense_key, s.asc, s.ascq), (2, 0x04, 0x01)),
+            other => panic!("expected CHECK CONDITION with sense, got {other:?}"),
+        }
+        assert_eq!(t.last_sense_progress(), Some(0x1234));
+        drop(t);
+
+        // BUSY (08h) carries no sense on the wire, and no progress.
+        let (t, r) = execute_on_fake(0, 0x08, 0, Some(&sense), &mut [0u8; 8]);
+        assert!(matches!(
+            r,
+            Err(Error::ScsiError {
+                status: 0x08,
+                sense: None,
+                ..
+            })
+        ));
+        assert_eq!(t.last_sense_progress(), None);
+    }
+
+    /// A failing IOKit return is a transport failure, whatever status the task reported.
+    #[test]
+    fn shim_selftest_iokit_failure_is_a_transport_failure() {
+        let _globals = shim_globals();
+        let (_t, r) = execute_on_fake(0x2c2, 0, 8, None, &mut [0u8; 8]);
+        assert!(matches!(
+            r,
+            Err(Error::ScsiError {
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+                ..
+            })
+        ));
+    }
+
+    /// `bytes_transferred` is what the device moved, never more than the buffer holds.
+    #[test]
+    fn shim_selftest_transfer_count_is_clamped_to_the_buffer() {
+        let _globals = shim_globals();
+        for (count, want) in [(100u64, 100usize), (512, 512), (4096, 512), (u64::MAX, 512)] {
+            let (_t, r) = execute_on_fake(0, 0, count, None, &mut [0u8; 512]);
+            assert_eq!(r.expect("GOOD").bytes_transferred, want, "count {count}");
+        }
     }
 }
