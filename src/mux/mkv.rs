@@ -3433,18 +3433,12 @@ mod tests {
         let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
 
-        // FlagDefault ID is 0x88. When is_default is true, FlagDefault is NOT written
-        // (MKV default is 1). When is_default is false, FlagDefault=0 IS written.
-        // So we should find at least one FlagDefault element (for the non-default track).
-        let flag_default_id = ebml::FLAG_DEFAULT.to_be_bytes();
-        let _needle = &[flag_default_id[3]]; // 0x88 is a 1-byte ID
-        let count = data.windows(1).filter(|w| w[0] == 0x88).count();
-        // 0x88 appears as FlagDefault + as TrackType (also 0x83... no, 0x83 != 0x88)
-        // FlagDefault (0x88) should appear for the non-default track
-        assert!(
-            count >= 1,
-            "FlagDefault should be written for non-default tracks"
-        );
+        // FlagDefault defaults to 1, so only the non-default third track carries FlagDefault=0.
+        let flags: Vec<Option<u64>> = track_entries(&data)
+            .iter()
+            .map(|&te| child_uint(&data, te, ebml::FLAG_DEFAULT))
+            .collect();
+        assert_eq!(flags, vec![None, None, Some(0)]);
     }
 
     /// Read back the value of the FIRST `Language` element in `data` as a
@@ -3694,27 +3688,34 @@ mod tests {
     #[test]
     fn mkv_forced_flag_on_forced_subtitle() {
         use crate::disc::SubtitleStream;
-        let video = make_video_track();
-        let forced_sub = MkvTrack::subtitle(&SubtitleStream {
-            pid: 0x1200,
-            codec: Codec::Pgs,
-            language: "eng".into(),
-            forced: true,
-            qualifier: crate::disc::LabelQualifier::Forced,
-            codec_data: None,
-        });
-        assert!(forced_sub.is_forced);
-
-        let buf = Cursor::new(Vec::new());
-        let tracks = [video, forced_sub];
-        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
-        let data = muxer.writer.into_inner();
-
-        // FlagForced ID: 0x55AA (2-byte ID)
-        assert!(
-            find_id(&data, ebml::FLAG_FORCED).is_some(),
-            "FlagForced element should be present for forced subtitle track"
-        );
+        // PGS always reserves FlagForced, so the VALUE must carry is_forced; a forced VobSub
+        // writes FlagForced=1 and an unforced one omits it.
+        let sub = |codec, forced| {
+            MkvTrack::subtitle(&SubtitleStream {
+                pid: 0x20,
+                codec,
+                language: "eng".into(),
+                forced,
+                qualifier: crate::disc::LabelQualifier::None,
+                codec_data: None,
+            })
+        };
+        let tracks = [
+            sub(Codec::Pgs, true),
+            sub(Codec::Pgs, false),
+            sub(Codec::DvdSub, true),
+            sub(Codec::DvdSub, false),
+        ];
+        assert!(tracks[0].is_forced);
+        let data = MkvMuxer::new(Cursor::new(Vec::new()), &tracks, None, 60.0, &[])
+            .unwrap()
+            .writer
+            .into_inner();
+        let flags: Vec<Option<u64>> = track_entries(&data)
+            .iter()
+            .map(|&te| child_uint(&data, te, ebml::FLAG_FORCED))
+            .collect();
+        assert_eq!(flags, vec![Some(1), Some(0), Some(1), None]);
     }
 
     #[test]
@@ -4107,6 +4108,27 @@ mod tests {
             .find(|(id, _, _)| *id == ebml::TRACK_ENTRY)
             .expect("TrackEntry present");
         (te_start, te_size as usize)
+    }
+
+    // Every TrackEntry body (start, size), walked through Segment -> Tracks.
+    fn track_entries(data: &[u8]) -> Vec<(usize, usize)> {
+        let (tracks_start, tracks_size) = segment_children(data)
+            .into_iter()
+            .find_map(|(id, off, sz)| (id == ebml::TRACKS).then_some((off, sz as usize)))
+            .expect("Tracks element present");
+        master_children(data, tracks_start, tracks_size)
+            .into_iter()
+            .filter(|(id, _, _)| *id == ebml::TRACK_ENTRY)
+            .map(|(_, off, sz)| (off, sz as usize))
+            .collect()
+    }
+
+    // The uint value of the direct child `id` of a master body, if present.
+    fn child_uint(data: &[u8], (start, size): (usize, usize), id: u32) -> Option<u64> {
+        let (_, off, sz) = master_children(data, start, size)
+            .into_iter()
+            .find(|(cid, _, _)| *cid == id)?;
+        ebml::read_uint_val(&mut Cursor::new(&data[off..]), sz as usize).ok()
     }
 
     /// Find every Cluster: returns Vec<(cluster_data_start_abs, cluster_data_size, cluster_timestamp_ms)>.
