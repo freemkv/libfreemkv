@@ -38,6 +38,28 @@ const STEP_BUDGET: usize = 1024;
 /// untrusted u16, so it is clamped to this format maximum.
 const MAX_CMDS: usize = 128;
 
+// Compare ops (libdvdnav eval_compare).
+const CMP_AND: u8 = 1;
+const CMP_EQ: u8 = 2;
+const CMP_NE: u8 = 3;
+const CMP_GE: u8 = 4;
+const CMP_GT: u8 = 5;
+const CMP_LE: u8 = 6;
+const CMP_LT: u8 = 7;
+
+// Set-op codes (libdvdnav eval_set_op).
+const SET_MOV: u8 = 1;
+const SET_SWAP: u8 = 2;
+const SET_ADD: u8 = 3;
+const SET_SUB: u8 = 4;
+const SET_MUL: u8 = 5;
+const SET_DIV: u8 = 6;
+const SET_MOD: u8 = 7;
+const SET_RND: u8 = 8;
+const SET_AND: u8 = 9;
+const SET_OR: u8 = 10;
+const SET_XOR: u8 = 11;
+
 /// Maximum TT_SRPT entries honoured — the DVD-Video 99-title format maximum
 /// (the on-disc count is an untrusted u16). Shared with the IFO parser so the
 /// two can never diverge.
@@ -144,13 +166,13 @@ impl Vm {
             self.reg(c.rhs_reg)
         };
         let result = match c.op {
-            1 => (l & r) != 0,
-            2 => l == r,
-            3 => l != r,
-            4 => l >= r,
-            5 => l > r,
-            6 => l <= r,
-            7 => l < r,
+            CMP_AND => (l & r) != 0,
+            CMP_EQ => l == r,
+            CMP_NE => l != r,
+            CMP_GE => l >= r,
+            CMP_GT => l > r,
+            CMP_LE => l <= r,
+            CMP_LT => l < r,
             _ => false,
         };
         (result, tainted)
@@ -172,23 +194,23 @@ impl Vm {
         // Each arm sets (new value, new taint). `mov` overwrites with the source's
         // taint alone (clearing prior taint); accumulating ops union both.
         let (nv, nt) = match op {
-            1 => (v, src_tainted), // mov
-            2 => {
+            SET_MOV => (v, src_tainted), // mov
+            SET_SWAP => {
                 // swap: reg2 (byte5 low nibble) takes the old value first.
                 let reg2 = (src & 0x0F) as usize;
                 self.gprm[reg2] = cur;
                 self.gprm_tainted[reg2] = cur_tainted;
                 (v, src_tainted)
             }
-            3 => (cur.saturating_add(v), t),
-            4 => (cur.saturating_sub(v), t),
-            5 => (cur.saturating_mul(v), t), // libdvdnav's i32 product overflows (C UB) past 0x7FFF_FFFF
-            6 => (cur.checked_div(v).unwrap_or(0xFFFF), t),
-            7 => (cur.checked_rem(v).unwrap_or(0xFFFF), t),
-            8 => (cur, true), // rnd: non-deterministic
-            9 => (cur & v, t),
-            10 => (cur | v, t),
-            11 => (cur ^ v, t),
+            SET_ADD => (cur.saturating_add(v), t),
+            SET_SUB => (cur.saturating_sub(v), t),
+            SET_MUL => (cur.saturating_mul(v), t), // libdvdnav's i32 product overflows (C UB) past 0x7FFF_FFFF
+            SET_DIV => (cur.checked_div(v).unwrap_or(0xFFFF), t),
+            SET_MOD => (cur.checked_rem(v).unwrap_or(0xFFFF), t),
+            SET_RND => (cur, true), // rnd: non-deterministic
+            SET_AND => (cur & v, t),
+            SET_OR => (cur | v, t),
+            SET_XOR => (cur ^ v, t),
             _ => (cur, self.gprm_tainted[idx]), // unknown op: no-op
         };
         self.gprm[idx] = nv;
