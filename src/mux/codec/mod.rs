@@ -70,8 +70,8 @@ pub struct Frame {
     /// Frame data (elementary stream bytes).
     pub data: Vec<u8>,
     /// Optional duration in nanoseconds — only set by parsers that
-    /// can compute one (currently PGS, which pairs a display PCS
-    /// with the following empty PCS). When `Some`, the MKV muxer
+    /// can compute one (PGS pairs a display PCS with the following empty PCS;
+    /// AC-3, DTS, ADTS/MPEG audio, MPEG-2 and the reorder path also set it). When `Some`, the MKV muxer
     /// emits a `BlockGroup` with `BlockDuration` instead of a
     /// `SimpleBlock`; without it players guess the display interval
     /// (subtitles linger past their end-time).

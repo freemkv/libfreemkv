@@ -133,14 +133,18 @@ impl SparsePtsReorder {
         match self.held.take() {
             Some(held) => {
                 // Calibrate a per-frame duration from the two anchors' spacing over
-                // the held GOP's frame count. Approximate, but each GOP re-locks
+                // their display-slot distance. Approximate, but each GOP re-locks
                 // its own origin, so this only sets intra-GOP spacing.
                 if self.dur_ns == 0
-                    && let (Some((p_held, _)), Some((p_next, _))) = (held.anchor, gop.anchor)
+                    && let (Some((p_held, d_held)), Some((p_next, d_next))) =
+                        (held.anchor, gop.anchor)
                 {
+                    // Slots between the anchors: the held GOP's frames after its
+                    // anchor plus the next anchor's own display offset.
                     let span = p_next - p_held;
-                    if span > 0 && held.count > 0 {
-                        self.dur_ns = (span / held.count).max(1);
+                    let slots = held.count - d_held + d_next;
+                    if span > 0 && slots > 0 {
+                        self.dur_ns = (span / slots).max(1);
                     }
                 }
                 out = self.emit_gop(held);
@@ -330,6 +334,27 @@ mod tests {
             emitted >= MAX_GOP_FRAMES,
             "cap force-flushed GOPs before EOF (emitted {emitted})"
         );
+    }
+
+    #[test]
+    fn calibration_accounts_for_open_gop_leading_bs() {
+        use CodingType::*;
+        // Closed GOP (I at display 0) then an open GOP whose I follows two leading Bs.
+        let dur = 41_708_333i64;
+        let mut r = SparsePtsReorder::new();
+        let mut got: Vec<i64> = Vec::new();
+        let gops = [
+            ([I, P, P, P], 0i64),
+            ([I, B, B, P], 6 * dur), // I displays after B B, at slot 6
+        ];
+        for (types, pts) in gops {
+            for (k, ct) in types.into_iter().enumerate() {
+                let p = (k == 0).then_some(pts);
+                got.extend(r.push(p, frame(ct, k == 0)).iter().map(|f| f.pts_ns));
+            }
+        }
+        got.extend(r.flush().iter().map(|f| f.pts_ns));
+        assert_eq!(&got[..4], &[0, dur, 2 * dur, 3 * dur]);
     }
 
     #[test]
