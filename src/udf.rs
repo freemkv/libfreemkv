@@ -917,14 +917,9 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
                 _ => continue,
             }
         }
-        if partition_start != 0 {
-            // A fault before the LVD would parse the disc as single-partition and launder
-            // into a cacheable UdfNotFilesystem: surface it as the retryable fault.
-            if lvd_sector.is_none()
-                && let Some(e) = sweep_err.take()
-            {
-                return Err(e);
-            }
+        // A fault before the LVD leaves the next candidate to try; the fault is only
+        // surfaced below where the disc would otherwise read as not UDF.
+        if partition_start != 0 && (lvd_sector.is_some() || sweep_err.is_none()) {
             break;
         }
     }
@@ -944,10 +939,12 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // The metadata file is stored at lba=0 of the physical partition
     let mut meta_extents: Vec<(u32, u32)> = Vec::new();
     let metadata_start = if num_partition_maps >= 2 {
-        let lvd_sec = lvd_sector.ok_or(Error::DiscRead {
-            sector: 0,
-            status: None,
-            sense: None,
+        let lvd_sec = lvd_sector.ok_or_else(|| {
+            sweep_err.take().unwrap_or(Error::DiscRead {
+                sector: 0,
+                status: None,
+                sense: None,
+            })
         })?;
 
         // Read LVD to check partition map type
@@ -1044,7 +1041,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     }
     if !fsd_found {
         // A read fault is transient; "read fine, no FSD" is structurally not UDF.
-        return Err(fsd_err.unwrap_or(Error::UdfNotFilesystem));
+        return Err(fsd_err.or(sweep_err).unwrap_or(Error::UdfNotFilesystem));
     }
 
     // Root Directory ICB: long_ad at FSD offset 400
@@ -1384,6 +1381,11 @@ fn read_directory(
             break;
         }
         if fid_tag != 257 {
+            tracing::warn!(target: "freemkv::udf", fid_tag, icb_abs, "corrupt directory: bad FID tag");
+            if depth > 0 {
+                entries.clear();
+                break;
+            }
             return Err(Error::DiscRead {
                 sector: icb_abs as u64,
                 status: None,
@@ -1415,6 +1417,11 @@ fn read_directory(
             let name_start = pos + 38 + l_iu;
             let name_end = name_start + l_fi;
             if name_end > dir_end {
+                tracing::warn!(target: "freemkv::udf", icb_abs, "corrupt directory: name overruns FID data");
+                if depth > 0 {
+                    entries.clear();
+                    break;
+                }
                 return Err(Error::DiscRead {
                     sector: icb_abs as u64,
                     status: None,
@@ -6348,6 +6355,75 @@ mod audit_tests {
         assert!(matches!(err, Error::DiscRead { .. }), "{err:?}");
     }
 
+    struct FaultAt(MemDisc, u32);
+    impl SectorSource for FaultAt {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            if lba == self.1 {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                });
+            }
+            self.0.read_sectors(lba, count, buf, r)
+        }
+    }
+
+    #[test]
+    fn single_partition_disc_with_an_unreadable_lvd_still_mounts() {
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        fixture::lay_dir(
+            &mut disc,
+            &fixture::DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: Vec::new(),
+            },
+        );
+        let fs = read_filesystem(&mut FaultAt(disc, 33)).expect("must still mount");
+        assert_eq!(fs.partition_start, PART_START);
+    }
+
+    // Corrupt (non-FID) tag inside a subdirectory: that dir lists empty, the scan survives.
+    #[test]
+    fn a_corrupt_fid_tag_in_a_subdirectory_lists_it_empty() {
+        let mut r = GenReader::new(0);
+        let mut root = efe(8);
+        let mut f = vec![0u8; 44];
+        f[0..2].copy_from_slice(&257u16.to_le_bytes());
+        f[18] = 0x02;
+        f[19] = 4;
+        f[24..28].copy_from_slice(&1000u32.to_le_bytes());
+        f[38..42].copy_from_slice(&[8, b'D', b'A', b'B']);
+        put_ad(&mut root, 0, f.len() as u32, 6);
+        r.over.insert(5, root);
+        let mut s = [0u8; 2048];
+        s[..f.len()].copy_from_slice(&f);
+        r.over.insert(6, s);
+        let mut d = efe(8);
+        put_ad(&mut d, 0, 64, 7);
+        r.over.insert(1000, d);
+        let mut bad = [0u8; 2048];
+        bad[0..2].copy_from_slice(&266u16.to_le_bytes());
+        r.over.insert(7, bad);
+        let root = read_directory(
+            &mut r,
+            &mut 0,
+            &MetaMap::contiguous(0),
+            5,
+            "",
+            0,
+            &mut 0,
+            &mut HashSet::new(),
+        )
+        .expect("subdirectory corruption must not fail the walk");
+        assert_eq!(root.entries.len(), 1);
+        assert!(root.entries[0].entries.is_empty());
+    }
+
     #[test]
     fn directory_walk_caps_sectors_read_across_subdirectories() {
         // Root lists 100 subdirectories; each declares a 1 MiB extent of no FIDs.
@@ -6375,6 +6451,10 @@ mod audit_tests {
             put_ad(&mut d, 0, MAX_DIR_BYTES, 100_000);
             r.over.insert(1000 + k, d);
         }
+        // Zeroed data: each subdirectory lists empty, so only the tree-wide budget can trip.
+        for s in 100_000..100_000 + MAX_DIR_BYTES / 2048 {
+            r.over.insert(s, [0u8; 2048]);
+        }
         let res = read_directory(
             &mut r,
             &mut 0,
@@ -6386,6 +6466,13 @@ mod audit_tests {
             &mut HashSet::new(),
         );
         assert!(res.is_err(), "tree-wide sector budget must trip");
+        let data_reads: usize = (100_000..100_000 + MAX_DIR_BYTES / 2048)
+            .map(|s| r.reads.get(&s).copied().unwrap_or(0))
+            .sum();
+        assert!(
+            data_reads <= (MAX_TOTAL_DIR_SECTORS + MAX_DIR_BYTES / 2048) as usize,
+            "sectors read must stay near the cap: {data_reads}"
+        );
     }
 
     #[test]

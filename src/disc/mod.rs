@@ -1939,8 +1939,10 @@ impl Disc {
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
         tracing::info!(target: "freemkv::scan", capacity, "phase: UDF read");
         // Pre-read small files (AACS, MPLS, CLPI, META, *.bdmv): one command each otherwise.
-        if let Ok(ranges) = udf_fs.metadata_sector_ranges(&mut buffered) {
-            buffered.prefetch_ranges(&ranges)?;
+        match udf_fs.metadata_sector_ranges(&mut buffered) {
+            Ok(ranges) => buffered.prefetch_ranges(&ranges)?,
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => {} // prefetch is optional
         }
 
         let aacs = if aacs_dir_present(&udf_fs) {
