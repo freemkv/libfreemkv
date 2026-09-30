@@ -2041,11 +2041,11 @@ mod tests {
             Arc::new(NoopEvents),
         )
         .expect_err("a missing staged reader must be a clean error, not a panic");
-        // The device-name-carrying DeviceNotReady (code E4xxx) round-trips through
-        // io::Error; assert it is NOT a decrypt/other-shaped failure.
-        assert!(
-            err.to_string().starts_with('E'),
-            "expected a typed libfreemkv error (E<code>…), got: {err}"
+        // The device-name-carrying DeviceNotReady round-trips through io::Error.
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DEVICE_NOT_READY),
+            "got {err}"
         );
     }
 
@@ -2660,12 +2660,14 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         const FRAME: usize = 64 * 1024 * 1024; // 64 MiB per frame
         let cap_frames = HEADER_BUFFER_CAP_BYTES / FRAME; // 8 frames == cap
-        const MANY: usize = 200; // vastly more than the cap needs
+        // A few past the cap: enough to prove the cap stops the pump, without
+        // allocating (commit-charged on Windows) hundreds of 64 MiB frames.
+        let many = cap_frames + 4;
 
         let reads_seen = Arc::new(AtomicUsize::new(0));
         let mut fs = FakeStream::new(1).never_ready();
         fs.read_observer = Some(reads_seen.clone());
-        for i in 0..MANY {
+        for i in 0..many {
             fs.frames.push_back(PesFrame {
                 discard_padding_ns: 0,
                 track: 0,
@@ -2698,7 +2700,7 @@ mod tests {
         let reads = reads_seen.load(Ordering::SeqCst);
         assert!(
             reads <= cap_frames + 1,
-            "must fail after ~{cap_frames} frames (cap), not drain all {MANY} (read {reads})"
+            "must fail after ~{cap_frames} frames (cap), not drain all {many} (read {reads})"
         );
     }
 
@@ -3203,9 +3205,12 @@ mod tests {
             &Halt::new(),
             Arc::new(NoopEvents),
         );
-        assert!(
-            rescanned.is_err(),
-            "a URL source scans the image, which has no filesystem"
+        // The scan reads the UDF anchor (LBA 256) past this 16-sector image's end.
+        let err = rescanned.expect_err("a URL source scans the image, which has no filesystem");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_IMAGE_ENDS_BEFORE_READ),
+            "got {err}"
         );
     }
 
@@ -3652,6 +3657,45 @@ mod tests {
             raw,
             ..keyed_opts()
         }
+    }
+
+    // Stop pressed while the sink is wedged in a write: the join gives up after the
+    // grace and the run is reported incomplete (finalize_failed), not a hard error.
+    #[test]
+    fn a_wedged_sink_at_stop_forces_an_incomplete_outcome() {
+        struct WedgedFinish {
+            info: DiscTitle,
+            halt: Halt,
+        }
+        impl Stream for WedgedFinish {
+            fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+                Ok(None)
+            }
+            fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+                self.halt.cancel();
+                std::thread::sleep(Duration::from_secs(9));
+                Ok(())
+            }
+            fn finish(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn info(&self) -> &DiscTitle {
+                &self.info
+            }
+        }
+        let fs = FakeStream::new(1).with_frames(5);
+        let halt = Halt::new();
+        let sink = WedgedFinish {
+            info: fs.info.clone(),
+            halt: halt.clone(),
+        };
+        TEST_SINK.with(|s| *s.borrow_mut() = Some(Box::new(sink)));
+        let t = std::time::Instant::now();
+        let out = drive_mux(Box::new(fs), "null://", &halt, &NoopEvents, None, None)
+            .expect("a wedged finalise is an incomplete run, not an error");
+        TEST_SINK.with(|s| s.borrow_mut().take());
+        assert!(!out.completed && out.output_opened);
+        assert!(t.elapsed() < Duration::from_secs(8), "bounded by the grace");
     }
 
     // skip_errors reaches the live DiscStream on every arm that builds one.
