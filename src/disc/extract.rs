@@ -969,21 +969,23 @@ fn sanitize_component(name: &str) -> Result<String> {
 /// Whether `base` (the name component before any extension) matches a Windows
 /// reserved device name. These are reserved by the OS regardless of extension
 /// and silently alias a device (e.g. `NUL` discards writes). Case-insensitive.
-fn is_windows_reserved(base: &str) -> bool {
-    const RESERVED: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"];
-    if RESERVED.iter().any(|r| base.eq_ignore_ascii_case(r)) {
+pub(super) fn is_windows_reserved(base: &str) -> bool {
+    let up = base.trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(
+        up.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
         return true;
     }
-    let up = base.to_ascii_uppercase();
-    for prefix in ["COM", "LPT"] {
-        if let Some(rest) = up.strip_prefix(prefix)
-            && rest.len() == 1
-            && matches!(rest.as_bytes()[0], b'1'..=b'9')
-        {
-            return true;
-        }
-    }
-    false
+    ["COM", "LPT"].iter().any(|p| {
+        up.strip_prefix(p).is_some_and(|d| {
+            let mut c = d.chars();
+            matches!(
+                (c.next(), c.next()),
+                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+            )
+        })
+    })
 }
 
 /// DVD VTS group key for a `VTS_xx_*` file name, else `None`. e.g.
@@ -1724,6 +1726,10 @@ mod tests {
         assert_eq!(sanitize_component("conin$").unwrap(), "_conin$");
         // A non-reserved lookalike is untouched.
         assert_eq!(sanitize_component("COM10").unwrap(), "COM10");
+        // COM0 and the superscript digits are reserved too.
+        assert_eq!(sanitize_component("COM0").unwrap(), "_COM0");
+        assert_eq!(sanitize_component("LPT\u{b2}").unwrap(), "_LPT\u{b2}");
+        assert_eq!(sanitize_component("CLOCK$").unwrap(), "_CLOCK$");
         assert_eq!(sanitize_component("CONSOLE").unwrap(), "CONSOLE");
         // A trailing dot/space is stripped, not rejected outright.
         assert_eq!(sanitize_component("name. ").unwrap(), "name");
