@@ -540,7 +540,31 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         r#"allow(clippy::too_many_arguments)"#,
         1,
     ),
-    ("src/labels/class_reader.rs", r#"allow(dead_code)"#, 2),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="everyJVMS4.4tagisdecoded;labelparsersreadonlysomepayloads")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="parsedinfullperJVMS4.1;labelparsersreadthepoolandmethods")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="parsedinfullperJVMS4.5/4.6")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="parsedperJVMS4.7.3;thedecodertracksonlythestack")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="payloadsarefaultdetailforDebug;callersmatchthevariant")"#,
+        1,
+    ),
     (
         "src/labels/ctrm.rs",
         r#"allow(clippy::items_after_test_module)"#,
