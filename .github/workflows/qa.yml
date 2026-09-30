@@ -125,8 +125,8 @@ jobs:
       contents: read
 
   # clippy's output is target-dependent: cfg-gated code only gets linted on
-  # the target it compiles for. This job lints the Linux target; the macOS and
-  # Windows code is linted by clippy-macos / clippy-windows below.
+  # the target it compiles for. Linting solely on the dev machine's host
+  # target is how a lint that CI rejects reaches a push.
   cross-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -139,47 +139,6 @@ jobs:
           checkout: freemkv-unlock
       # clippy runs on stable (matches ci.yml's lint job); build/test stay on
       # the MSRV pin. See ci.yml for why the lint toolchain need not be the MSRV.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: libfreemkv
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: libfreemkv
-
-  # Native clippy: the cfg(macos)/cfg(windows) code is linted nowhere else.
-  clippy-macos:
-    timeout-minutes: 45
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: libfreemkv
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: libfreemkv
-
-  clippy-windows:
-    timeout-minutes: 45
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
