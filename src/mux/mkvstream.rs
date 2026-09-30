@@ -1615,7 +1615,9 @@ fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHea
                 match read_chapters_buf(r, size) {
                     Ok(buf) => match parse_chapters(&buf) {
                         Ok(c) => chapters = c,
-                        Err(e) => eprintln!("mkv: ignoring malformed Chapters: {e}"),
+                        Err(e) => {
+                            tracing::warn!(target: "mux", error = %e, "ignoring malformed MKV Chapters element")
+                        }
                     },
                     Err(e) if is_truncation(&e) => break,
                     Err(e) => return Err(e),
@@ -6662,7 +6664,7 @@ mod tests {
         tags.extend_from_slice(&[0u8; 10]);
         // Tags claims 1000 bytes but the file ends: no Cluster follows.
         let mut bytes = synthetic_mkv("V_MPEG2", &[], &[]);
-        let cut = bytes.len() - 5; // drop the Cluster header, then append truncated Tags
+        let cut = bytes.len() - 12; // drop the Cluster header (ID 4 + unknown size 8)
         bytes.truncate(cut);
         bytes.extend_from_slice(&tags);
         assert!(probe_mkv(Cursor::new(bytes.clone())).is_ok());
