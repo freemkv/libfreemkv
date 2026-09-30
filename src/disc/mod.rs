@@ -1212,6 +1212,7 @@ impl AudioChannels {
             3 => AudioChannels::Stereo,
             6 => AudioChannels::Surround51,
             // 12 is the stereo + multichannel combo; the layout is not knowable here.
+            12 => AudioChannels::Unknown,
             other => {
                 tracing::warn!(audio_format = other, "unknown MPLS audio_format byte");
                 AudioChannels::Unknown
@@ -1806,10 +1807,10 @@ impl Disc {
 
     // Layer count inferred from capacity against the format's per-layer size.
     fn layers_for(format: DiscFormat, capacity: u32) -> u8 {
-        // Upper sector bounds of (1, 2) layers; above the second is 3 (BD-100).
+        // Upper sector bounds of (1, 2) layers; above the second is 3 (BD-100, HD DVD TL).
         let (one, two) = match format {
             DiscFormat::Dvd => (2_400_000, u32::MAX),
-            DiscFormat::HdDvd => (8_000_000, u32::MAX),
+            DiscFormat::HdDvd => (8_000_000, 16_000_000),
             DiscFormat::BluRay | DiscFormat::Uhd | DiscFormat::Fmts => (12_500_000, 40_000_000),
             DiscFormat::Unknown => (12_500_000, u32::MAX),
         };
@@ -8736,6 +8737,7 @@ mod tests {
             (DiscFormat::Dvd, 4_173_824, 2),
             (DiscFormat::HdDvd, 7_300_000, 1),
             (DiscFormat::HdDvd, 14_600_000, 2),
+            (DiscFormat::HdDvd, 22_000_000, 3),
             (DiscFormat::BluRay, 12_219_392, 1),
             (DiscFormat::BluRay, 24_438_784, 2),
             (DiscFormat::Uhd, 48_878_592, 3),
