@@ -180,6 +180,15 @@ impl PesAssembler {
         }
     }
 
+    // Drop the open PES (its data has a hole) and flag the next one; resyncs on the next PUSI.
+    fn drop_partial(&mut self) {
+        self.buffer.clear();
+        self.active = false;
+        self.header_remaining = 0;
+        self.head.clear();
+        self.pending_discontinuity = true;
+    }
+
     // Take PUSI payload bytes into the PES header; once it and its PTS/DTS are complete, set
     // the timestamps and pass the rest on as ES. A payload that is not a PES start opens no
     // PES (its continuations would form a headless frame) and flags the loss.
@@ -190,10 +199,7 @@ impl PesAssembler {
         };
         let head = std::mem::take(&mut self.head);
         if header_len == 0 {
-            self.buffer.clear();
-            self.active = false;
-            self.header_remaining = 0;
-            self.pending_discontinuity = true;
+            self.drop_partial();
         } else {
             self.pts = pts;
             self.dts = dts;
@@ -402,11 +408,7 @@ impl TsDemuxer {
                 // A concealed unit may have dropped packets from any open PES, leaving a
                 // hole mid-access-unit. Drop it like a mid-PES continuity break and flag
                 // pending so the next completed PES resyncs (mirrors the non-PUSI cc_gap path).
-                a.buffer.clear();
-                a.active = false;
-                a.header_remaining = 0;
-                a.head.clear();
-                a.pending_discontinuity = true;
+                a.drop_partial();
             }
             return;
         }
@@ -417,6 +419,12 @@ impl TsDemuxer {
             -1
         };
         if idx < 0 {
+            return;
+        }
+        // transport_error_indicator: the packet is damaged, so its payload and CC are not
+        // trusted. Drop the open PES like a continuity break; the next PUSI resyncs.
+        if ts[1] & 0x80 != 0 {
+            self.assemblers[idx as usize].drop_partial();
             return;
         }
         // adaptation_field_control == 0b00 is reserved (ISO 13818-1) and
@@ -496,10 +504,7 @@ impl TsDemuxer {
                         pid = asm.pid,
                         "TS continuity break on non-PUSI continuation; dropping partial PES",
                     );
-                    asm.buffer.clear();
-                    asm.active = false;
-                    asm.header_remaining = 0;
-                    asm.head.clear();
+                    asm.drop_partial();
                     return;
                 }
             }
@@ -1065,6 +1070,23 @@ mod tests {
             assert_eq!(out[0].pts, Some(0x1_2345_6789), "split {split}");
             assert_eq!(out[0].dts, Some(0x1_2345_0000), "split {split}");
         }
+    }
+
+    // A packet flagged transport_error_indicator is damaged: its PES is dropped, not
+    // spliced, and the next PES is flagged.
+    #[test]
+    fn transport_error_packet_drops_its_pes() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut bad = ts_payload_packet(pid, false, 1, b"XXXX");
+        bad[5] |= 0x80;
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        out.extend(demux.feed(&bad));
+        out.extend(demux.feed(&ts_payload_packet(pid, true, 2, &pes_start(b"CCCC"))));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "A is dropped: {out:?}");
+        assert!(out[0].data.starts_with(b"CCCC"));
+        assert!(out[0].discontinuity);
     }
 
     // A PUSI whose payload is not a PES start leaves no PES open: the continuations after it
