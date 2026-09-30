@@ -1128,7 +1128,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
                 } else if track.codec_id == ebml::CODEC_MPEG2 {
                     // Only MPEG-2 pictures measure a field order: reserve its size for finish().
-                    writer.write_all(&ebml::void_element(FIELD_ORDER_LEN))?;
+                    writer.write_all(&ebml::void_element(FIELD_ORDER_LEN)?)?;
                 }
                 let end = writer.stream_position()?;
                 let field_order_span = (end > start).then_some((start, end - start));
