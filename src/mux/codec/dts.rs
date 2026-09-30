@@ -638,18 +638,6 @@ fn dts_core_frame_size(data: &[u8]) -> usize {
     fsize + 1
 }
 
-/// DTS core `SFREQ` → sample rate (Hz). 4-bit index; reserved/invalid entries
-/// fall back to 48 kHz (the DVD/UHD norm) so a bogus value never yields a zero
-/// rate (division) or a wildly wrong frame duration.
-const DTS_CORE_SAMPLE_RATES: [u32; 16] = [
-    48_000, // 0: invalid → fallback
-    8_000, 16_000, 32_000, 48_000, // 4: invalid → fallback
-    48_000, // 5: invalid → fallback
-    11_025, 22_050, 44_100, 48_000, // 9: invalid → fallback
-    48_000, // 10: invalid → fallback
-    12_000, 24_000, 48_000, 96_000, 192_000,
-];
-
 // Samples per DTS core frame: `(NBLKS + 1) * 32`. NBLKS (7 bits, ETSI TS 102 114) = byte4 bit0
 // + byte5 bits7-2, after FTYPE/SHORT/CPF.
 fn dts_core_samples(data: &[u8]) -> u32 {
@@ -660,14 +648,17 @@ fn dts_core_samples(data: &[u8]) -> u32 {
     (nblks + 1) * 32
 }
 
-/// DTS core sample rate (Hz) from `SFREQ` (4 bits: byte8 bits5-2), with a 48 kHz
-/// fallback for reserved indices.
+/// DTS core sample rate (Hz) from `SFREQ` (4 bits: byte8 bits5-2); reserved
+/// indices fall back to 48 kHz so the rate is never zero.
 fn dts_core_sample_rate(data: &[u8]) -> u32 {
     if data.len() < CORE_HEADER_MIN_BYTES {
         return 48_000;
     }
     let sfreq = (data[8] as usize >> 2) & 0x0F;
-    DTS_CORE_SAMPLE_RATES[sfreq]
+    match DTS_CORE_SR_VALID[sfreq] {
+        0 => 48_000,
+        r => r,
+    }
 }
 
 /// Duration of one DTS core access unit in nanoseconds: `samples / rate`,
