@@ -606,6 +606,24 @@ mod tests {
         assert_eq!(fvi_codec_id(Codec::Vc1), "vc1");
     }
 
+    // Scan follows the resolution: progressive formats must not read interlaced.
+    #[test]
+    fn header_scan_is_progressive_for_progressive_video() {
+        for res in [Resolution::R1080p, Resolution::R2160p] {
+            let t = video_title(Codec::Hevc, res, FrameRate::F23_976, ColorSpace::Bt709);
+            let h = MapHeader::from_title(&t, src(Medium::Iso, "iso://x.iso", 1));
+            assert_eq!(h.stream.scan, Scan::Progressive, "{res:?}");
+        }
+        let t = video_title(
+            Codec::H264,
+            Resolution::R1080i,
+            FrameRate::F25,
+            ColorSpace::Bt709,
+        );
+        let h = MapHeader::from_title(&t, src(Medium::Iso, "iso://x.iso", 1));
+        assert_eq!(h.stream.scan, Scan::Interlaced);
+    }
+
     #[test]
     fn header_from_title_pulls_video_facts() {
         let t = video_title(
