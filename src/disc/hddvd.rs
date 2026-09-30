@@ -567,19 +567,14 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
     titles
 }
 
-// Reads `path` refusing anything over MAX_XPL_BYTES (typed error, no over-read).
+// Reads `path`; `Ok(None)` when it exceeds MAX_XPL_BYTES (no over-read).
 fn read_xpl_capped(
     reader: &mut dyn SectorSource,
     udf_fs: &udf::UdfFs,
     path: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     let bytes = udf_fs.read_file_prefix(reader, path, MAX_XPL_BYTES + 1)?;
-    if bytes.len() > MAX_XPL_BYTES {
-        return Err(crate::error::Error::IsoTooLarge {
-            path: path.to_string(),
-        });
-    }
-    Ok(bytes)
+    Ok((bytes.len() <= MAX_XPL_BYTES).then_some(bytes))
 }
 
 /// Read the Advanced-Content playlist `ADV_OBJ/VPLST*.XPL`, if present. `Err` only on
@@ -596,7 +591,16 @@ fn read_adv_obj_xpl(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Resul
     };
     // The name came from the directory listing, so a failure is a real error.
     match read_xpl_capped(reader, udf_fs, &format!("/ADV_OBJ/{name}")) {
-        Ok(b) => Ok(Some(b)),
+        Ok(Some(b)) => Ok(Some(b)),
+        Ok(None) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                xpl = ?name,
+                code = crate::error::E_XPL_TOO_LARGE,
+                "playlist exceeds the parser cap; falling back to the per-clip heuristic"
+            );
+            Ok(None)
+        }
         Err(crate::error::Error::Halted) => Err(crate::error::Error::Halted),
         Err(e) => {
             tracing::warn!(
@@ -1399,6 +1403,68 @@ mod tests {
             line.field("code"),
             Some(crate::error::E_UDF_NO_USABLE_EXTENT.to_string().as_str()),
             "the condition's OWN code, not a neighbouring one: {line:?}"
+        );
+    }
+
+    // A file whose only dropped extent is a non-empty one at abs LBA 0 must not compose
+    // a short clip: the scan wiring (`|| truncated`) has to refuse it, with its own code.
+    #[test]
+    fn scan_hddvd_does_not_compose_a_feature_over_a_part_with_a_dropped_lba0_extent() {
+        let mut disc = MemDisc::new();
+        let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO", "TRAILER.EVO"]);
+        let files = vec![
+            file("FEATURE_1.EVO", 100, 5000, 10 * 2048, false),
+            file("FEATURE_2.EVO", 101, 8000, 14 * 2048, false),
+            file("TRAILER.EVO", 102, 12000, 2 * 2048, false),
+            file_with("HVA00001.VTI", 103, 15000, vti, false),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        // Two short ADs: 10 sectors at rel LBA 0, then 4 at 8000.
+        let mut icb = build_file_icb(14 * 2048, 0, false);
+        icb[212..216].copy_from_slice(&16u32.to_le_bytes());
+        icb[216..220].copy_from_slice(&(10u32 * 2048).to_le_bytes());
+        icb[224..228].copy_from_slice(&(4u32 * 2048).to_le_bytes());
+        icb[228..232].copy_from_slice(&8000u32.to_le_bytes());
+        disc.put_bytes(PART_START + 101, &icb);
+        let mut udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        // Data LBAs become absolute, so rel LBA 0 is abs LBA 0.
+        udf.set_partition_start(0);
+
+        let (titles, events) = crate::testlog::capture(|| {
+            Disc::scan_hddvd_titles(&mut disc, &udf, None).expect("scan")
+        });
+
+        assert!(
+            !titles.iter().any(|t| t.playlist == "FEATURE"),
+            "a part with a dropped lba-0 extent must not be composed short; got {:?}",
+            titles
+                .iter()
+                .map(|t| (&t.playlist, t.size_bytes))
+                .collect::<Vec<_>>()
+        );
+        assert!(titles.iter().any(|t| t.playlist == "FEATURE_1.EVO"));
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc" && e.field("clip") == Some("\"FEATURE_2.EVO\""))
+            .unwrap_or_else(|| panic!("the dropped clip must be logged; got {events:?}"));
+        assert_eq!(
+            line.field("code"),
+            Some(crate::error::E_UDF_NO_USABLE_EXTENT.to_string().as_str()),
+            "{line:?}"
         );
     }
 
@@ -2394,8 +2460,8 @@ mod tests {
         assert_eq!(counter.hits[0], 1, "same probed head must cost one probe");
     }
 
-    #[test]
-    fn read_xpl_capped_rejects_an_oversized_playlist() {
+    // A disc with `ADV_OBJ/VPLST000.XPL` of `len` spaces.
+    fn xpl_disc(len: usize) -> (MemDisc, crate::udf::UdfFs) {
         let mut disc = MemDisc::new();
         let root = DirSpec {
             name: String::new(),
@@ -2406,25 +2472,114 @@ mod tests {
                 name: "ADV_OBJ".to_string(),
                 icb_lba: 30,
                 dir_data_lba: 31,
-                files: vec![file_with(
-                    "VPLST000.XPL",
-                    40,
-                    4000,
-                    vec![b' '; MAX_XPL_BYTES + 1],
-                    true,
-                )],
+                files: vec![file_with("VPLST000.XPL", 40, 4000, vec![b' '; len], true)],
                 subdirs: vec![],
             }],
         };
         build_udf_skeleton(&mut disc, 10);
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    // Fails every read with the error `mk` builds.
+    struct FailReader(fn() -> crate::error::Error);
+
+    impl SectorSource for FailReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            Err((self.0)())
+        }
+    }
+
+    fn disc_read_err() -> crate::error::Error {
+        crate::error::Error::DiscRead {
+            sector: 0,
+            status: None,
+            sense: None,
+        }
+    }
+
+    #[test]
+    fn read_xpl_capped_rejects_an_oversized_playlist() {
+        let (mut disc, udf) = xpl_disc(MAX_XPL_BYTES + 1);
         let r = read_xpl_capped(&mut disc, &udf, "/ADV_OBJ/VPLST000.XPL");
-        assert!(matches!(r, Err(crate::error::Error::IsoTooLarge { .. })));
-        assert!(
-            read_adv_obj_xpl(&mut disc, &udf)
-                .expect("no halt")
-                .is_none()
+        assert!(matches!(r, Ok(None)));
+        let (r, events) =
+            crate::testlog::capture(|| read_adv_obj_xpl(&mut disc, &udf).expect("no halt"));
+        assert!(r.is_none());
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc" && e.field("xpl") == Some("\"VPLST000.XPL\""))
+            .unwrap_or_else(|| panic!("oversized playlist must be logged; got {events:?}"));
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(
+            line.field("code"),
+            Some(crate::error::E_XPL_TOO_LARGE.to_string().as_str()),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn read_xpl_capped_accepts_a_playlist_of_exactly_the_cap() {
+        let (mut disc, udf) = xpl_disc(MAX_XPL_BYTES);
+        let r = read_xpl_capped(&mut disc, &udf, "/ADV_OBJ/VPLST000.XPL").expect("read");
+        assert_eq!(r.map(|b| b.len()), Some(MAX_XPL_BYTES));
+    }
+
+    #[test]
+    fn read_adv_obj_xpl_logs_an_unreadable_playlist_and_reads_as_absent() {
+        let (_, udf) = xpl_disc(100);
+        let mut bad = FailReader(disc_read_err);
+        let (r, events) =
+            crate::testlog::capture(|| read_adv_obj_xpl(&mut bad, &udf).expect("no halt"));
+        assert!(r.is_none());
+        let line = events
+            .iter()
+            .find(|e| e.field("xpl") == Some("\"VPLST000.XPL\""))
+            .unwrap_or_else(|| panic!("unreadable playlist must be logged; got {events:?}"));
+        assert_eq!(
+            line.field("code"),
+            Some(disc_read_err().code().to_string().as_str()),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn read_adv_obj_xpl_propagates_halted() {
+        let (_, udf) = xpl_disc(100);
+        let mut halted = FailReader(|| crate::error::Error::Halted);
+        assert!(matches!(
+            read_adv_obj_xpl(&mut halted, &udf),
+            Err(crate::error::Error::Halted)
+        ));
+    }
+
+    #[test]
+    fn probe_evo_streams_logs_a_read_failure_and_keeps_going_without_streams() {
+        let mut bad = FailReader(disc_read_err);
+        let ext = Extent {
+            start_lba: 777,
+            sector_count: 4,
+        };
+        let (streams, events) = crate::testlog::capture(|| {
+            probe_evo_streams(&mut bad, std::slice::from_ref(&ext), None).expect("probe")
+        });
+        assert!(streams.is_empty());
+        let line = events
+            .iter()
+            .find(|e| e.target == "freemkv::disc" && e.field("lba") == Some("777"))
+            .unwrap_or_else(|| panic!("probe failure must be logged; got {events:?}"));
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(
+            line.field("code"),
+            Some(disc_read_err().code().to_string().as_str()),
+            "{line:?}"
         );
     }
 

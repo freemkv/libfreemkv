@@ -70,6 +70,9 @@ pub const E_BUS_STREAM_UNMAPPED: u16 = 6021;
 /// whole-disc image (`iso://` copy, `dir://` extract): only the chosen titles, nav
 /// and UDF were ever read, so the rest of it is not disc data.
 pub const E_IMAGE_SCOPED: u16 = 6022;
+/// An HD-DVD `ADV_OBJ/VPLST*.XPL` playlist exceeds the parser's size cap. Logged by
+/// `disc::hddvd`, which then falls back to the per-clip heuristic; no [`Error`] variant.
+pub const E_XPL_TOO_LARGE: u16 = 6023;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -2091,6 +2094,7 @@ mod tests {
         assert!((6000..7000).contains(&E_IMAGE_ENDS_BEFORE_READ));
         assert!((6000..7000).contains(&E_BUS_STREAM_UNMAPPED));
         assert!((6000..7000).contains(&E_IMAGE_SCOPED));
+        assert!((6000..7000).contains(&E_XPL_TOO_LARGE));
         // AACS (7xxx)
         assert!((7000..8000).contains(&E_AACS_NO_KEYS));
         assert!((7000..8000).contains(&E_NO_DISC_KEY));
