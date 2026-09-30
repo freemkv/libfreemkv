@@ -66,7 +66,7 @@ pub struct FitReport {
 /// The pre-mux fit plan of `title` for `dest`. Every stream is either included or
 /// skipped with a reason, except a declared-only MPEG-2 extension track, which is
 /// in neither: whether it is lost is known only once its packets arrive (J23).
-/// Destinations that carry everything (`mkv://`, the FMKV wire, …) skip nothing.
+/// `mkv://` skips only codecs Matroska has no CodecID for; the FMKV wire skips nothing.
 pub fn fit_report(dest: &StreamUrl, title: &DiscTitle) -> FitReport {
     if let StreamUrl::Mpg { .. } = dest {
         return super::mpg::plan(title).report;
@@ -102,6 +102,11 @@ pub fn fit_report(dest: &StreamUrl, title: &DiscTitle) -> FitReport {
                     .is_none()
                     .then_some(SkipReason::UnmappableAudio)
             }
+            (StreamUrl::Mkv { .. }, s) if !super::mkv::is_mappable(s) => Some(match s {
+                Stream::Video(_) => SkipReason::UnmappableVideo,
+                Stream::Audio(_) => SkipReason::UnmappableAudio,
+                Stream::Subtitle(_) => SkipReason::UnmappableSubtitle,
+            }),
             _ => None,
         };
         match refused {
@@ -291,5 +296,32 @@ mod tests {
             assert_eq!(r.included, vec![0, 1, 2], "{url}");
             assert!(r.skipped.is_empty(), "{url}");
         }
+    }
+
+    // A codec with no Matroska CodecID (text subs from an FMKV header, Unknown from a
+    // read-back) is planned out for mkv://, never declared under another codec's ID.
+    #[test]
+    fn mkv_plans_out_codecs_matroska_cannot_name() {
+        let mut srt = pgs();
+        if let Stream::Subtitle(s) = &mut srt {
+            s.codec = Codec::Srt;
+        }
+        let t = title(vec![
+            video(Codec::Unknown(0)),
+            audio(0x1100, Codec::Unknown(0), SampleRate::S48, ""),
+            audio(0x1101, Codec::Ac3, SampleRate::S48, ""),
+            srt,
+            pgs(),
+        ]);
+        let r = fit_report(&parse_url("mkv:///o/x.mkv"), &t);
+        assert_eq!(r.included, vec![2, 4]);
+        assert_eq!(
+            r.skipped,
+            vec![
+                (0, SkipReason::UnmappableVideo),
+                (1, SkipReason::UnmappableAudio),
+                (3, SkipReason::UnmappableSubtitle),
+            ]
+        );
     }
 }

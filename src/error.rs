@@ -317,6 +317,23 @@ pub const E_TIMED_OUT: u16 = 9073;
 pub const E_MPG_NO_VIDEO_TRACK: u16 = 9074;
 /// `mpg://` reached end of input with access units no pack could take.
 pub const E_MPG_UNPACKETIZED: u16 = 9075;
+// 9076: burned/retired — do not reuse.
+/// A finished remux output failed its read-back check. See [`RemuxVerifyKind`].
+pub const E_REMUX_VERIFY_FAILED: u16 = 9077;
+/// A title's mux returned without completing and no Stop was requested.
+pub const E_MUX_INCOMPLETE: u16 = 9078;
+/// A remux staging path collides with the target or its own `.partial`.
+pub const E_REMUX_STAGING_INVALID: u16 = 9079;
+/// Copying a staged output into place wrote a different byte count than the source holds.
+pub const E_STAGED_COPY_SIZE_MISMATCH: u16 = 9080;
+/// A remux worker thread (`op`: "copy", "verify") was lost before it reported.
+pub const E_WORKER_LOST: u16 = 9081;
+/// A multipass rip was asked to decrypt: multipass recovers a raw whole-disc image.
+pub const E_MULTIPASS_REQUIRES_RAW: u16 = 9082;
+/// A requested audio/subtitle language tag resolves to no known language.
+pub const E_STREAM_LANGUAGE_UNKNOWN: u16 = 9083;
+/// A remux target already exists and replacing it was not requested.
+pub const E_REMUX_TARGET_EXISTS: u16 = 9084;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -936,6 +953,64 @@ pub enum Error {
     MpgNoVideoTrack,
     /// `mpg://` end of input left access units unwritten. See [`E_MPG_UNPACKETIZED`].
     MpgUnpacketized,
+    /// A finished remux output failed its read-back check. See [`E_REMUX_VERIFY_FAILED`].
+    /// `path` is the file that failed.
+    RemuxVerifyFailed {
+        kind: RemuxVerifyKind,
+        path: String,
+    },
+    /// A title's mux returned incomplete without a Stop. `title` is 1-based.
+    MuxIncomplete {
+        title: usize,
+    },
+    /// See [`E_REMUX_STAGING_INVALID`].
+    RemuxStagingInvalid,
+    /// A staged copy wrote `have` bytes where the source holds `want`.
+    StagedCopySizeMismatch {
+        have: u64,
+        want: u64,
+    },
+    /// See [`E_WORKER_LOST`]. `op` is a stable identifier, like [`Error::TimedOut`]'s.
+    WorkerLost {
+        op: &'static str,
+    },
+    /// See [`E_MULTIPASS_REQUIRES_RAW`].
+    MultipassRequiresRaw,
+    /// `tag` is the caller's unresolvable language tag, verbatim.
+    StreamLanguageUnknown {
+        tag: String,
+    },
+    /// See [`E_REMUX_TARGET_EXISTS`].
+    RemuxTargetExists {
+        path: String,
+    },
+}
+
+/// Why a finished remux output failed read-back ([`Error::RemuxVerifyFailed`]).
+/// Displayed as a stable identifier ([`RemuxVerifyKind::key`]), never prose.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum RemuxVerifyKind {
+    /// The output file is zero bytes.
+    Empty,
+    /// The output carries no tracks.
+    NoTracks,
+    /// The title declares a runtime but the output records none.
+    NoRuntime,
+    /// The output's runtime is outside tolerance of the title's declared runtime.
+    RuntimeMismatch { have_secs: f64, want_secs: f64 },
+}
+
+impl RemuxVerifyKind {
+    /// Stable, language-neutral identifier for this kind.
+    pub fn key(&self) -> &'static str {
+        match self {
+            RemuxVerifyKind::Empty => "empty",
+            RemuxVerifyKind::NoTracks => "no-tracks",
+            RemuxVerifyKind::NoRuntime => "no-runtime",
+            RemuxVerifyKind::RuntimeMismatch { .. } => "runtime-mismatch",
+        }
+    }
 }
 
 impl Error {
@@ -1080,6 +1155,14 @@ impl Error {
             Error::MpgUnpacketized => E_MPG_UNPACKETIZED,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
+            Error::RemuxVerifyFailed { .. } => E_REMUX_VERIFY_FAILED,
+            Error::MuxIncomplete { .. } => E_MUX_INCOMPLETE,
+            Error::RemuxStagingInvalid => E_REMUX_STAGING_INVALID,
+            Error::StagedCopySizeMismatch { .. } => E_STAGED_COPY_SIZE_MISMATCH,
+            Error::WorkerLost { .. } => E_WORKER_LOST,
+            Error::MultipassRequiresRaw => E_MULTIPASS_REQUIRES_RAW,
+            Error::StreamLanguageUnknown { .. } => E_STREAM_LANGUAGE_UNKNOWN,
+            Error::RemuxTargetExists { .. } => E_REMUX_TARGET_EXISTS,
         }
     }
 }
@@ -1260,9 +1343,32 @@ impl std::fmt::Display for Error {
             }
             // `op` is a stable, language-neutral identifier (e.g. "verify",
             // "artifact_lock"), not translatable prose.
-            Error::TimedOut { op } => write!(f, "E{}: {op}", self.code()),
+            Error::TimedOut { op } | Error::WorkerLost { op } => {
+                write!(f, "E{}: {op}", self.code())
+            }
             Error::BusStreamUnmapped { files } => write!(f, "E{}: {files}", self.code()),
             Error::ImageScoped { path } => write!(f, "E{}: {path}", self.code()),
+            Error::RemuxVerifyFailed { kind, path } => match kind {
+                RemuxVerifyKind::RuntimeMismatch {
+                    have_secs,
+                    want_secs,
+                } => write!(
+                    f,
+                    "E{}: {} {have_secs:.1}/{want_secs:.1} {path}",
+                    self.code(),
+                    kind.key()
+                ),
+                _ => write!(f, "E{}: {} {path}", self.code(), kind.key()),
+            },
+            Error::MuxIncomplete { title } => write!(f, "E{}: {title}", self.code()),
+            Error::StagedCopySizeMismatch { have, want } => {
+                write!(f, "E{}: {have}/{want}", self.code())
+            }
+            // `tag` is raw user input: escape control characters.
+            Error::StreamLanguageUnknown { tag } => {
+                write!(f, "E{}: {}", self.code(), tag.escape_debug())
+            }
+            Error::RemuxTargetExists { path } => write!(f, "E{}: {path}", self.code()),
             _ => write!(f, "E{}", self.code()),
         }
     }
@@ -1398,6 +1504,12 @@ impl From<Error> for std::io::Error {
             E_DIR_IMAGE_FILE_CHANGED => std::io::ErrorKind::InvalidData,
             // 9073 TimedOut: a StallTimer expired with no forward progress.
             E_TIMED_OUT => std::io::ErrorKind::TimedOut,
+            // Remux/engine codes keep the kinds their io::Error texts carried.
+            E_REMUX_VERIFY_FAILED | E_STAGED_COPY_SIZE_MISMATCH => std::io::ErrorKind::InvalidData,
+            E_REMUX_STAGING_INVALID | E_MULTIPASS_REQUIRES_RAW | E_STREAM_LANGUAGE_UNKNOWN => {
+                std::io::ErrorKind::InvalidInput
+            }
+            E_REMUX_TARGET_EXISTS => std::io::ErrorKind::AlreadyExists,
             _ => std::io::ErrorKind::Other,
         };
         // Carry the typed value itself as the payload, not its stringification.
@@ -1768,6 +1880,18 @@ mod tests {
             .code(),
             Error::BusStreamUnmapped { files: "x".into() }.code(),
             Error::ImageScoped { path: "x".into() }.code(),
+            Error::RemuxVerifyFailed {
+                kind: RemuxVerifyKind::Empty,
+                path: "/m/a.mkv".into(),
+            }
+            .code(),
+            Error::MuxIncomplete { title: 1 }.code(),
+            Error::RemuxStagingInvalid.code(),
+            Error::StagedCopySizeMismatch { have: 0, want: 1 }.code(),
+            Error::WorkerLost { op: "copy" }.code(),
+            Error::MultipassRequiresRaw.code(),
+            Error::StreamLanguageUnknown { tag: "x".into() }.code(),
+            Error::RemuxTargetExists { path: "x".into() }.code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
@@ -2344,6 +2468,113 @@ mod tests {
         let io: std::io::Error = e.into();
         assert_eq!(io.kind(), ErrorKind::PermissionDenied);
         assert!(declared_error_codes().contains(&("E_AACS_VID_NEEDS_DISC", E_AACS_VID_NEEDS_DISC)));
+    }
+
+    /// Engine remux/core codes E9077-E9084: code, exact Display and ErrorKind for
+    /// each, plus a typed io::Error round trip that keeps the fields.
+    #[test]
+    fn engine_remux_codes_display_and_kind() {
+        use std::io::ErrorKind;
+        let cases: Vec<(Error, u16, &str, ErrorKind)> = vec![
+            (
+                Error::RemuxVerifyFailed {
+                    kind: RemuxVerifyKind::Empty,
+                    path: "/m/a.mkv".into(),
+                },
+                9077,
+                "E9077: empty /m/a.mkv",
+                ErrorKind::InvalidData,
+            ),
+            (
+                Error::RemuxVerifyFailed {
+                    kind: RemuxVerifyKind::NoTracks,
+                    path: "/m/a.mkv".into(),
+                },
+                9077,
+                "E9077: no-tracks /m/a.mkv",
+                ErrorKind::InvalidData,
+            ),
+            (
+                Error::RemuxVerifyFailed {
+                    kind: RemuxVerifyKind::NoRuntime,
+                    path: "/m/a.mkv".into(),
+                },
+                9077,
+                "E9077: no-runtime /m/a.mkv",
+                ErrorKind::InvalidData,
+            ),
+            (
+                Error::RemuxVerifyFailed {
+                    kind: RemuxVerifyKind::RuntimeMismatch {
+                        have_secs: 5400.04,
+                        want_secs: 7200.0,
+                    },
+                    path: "/m/a.mkv".into(),
+                },
+                9077,
+                "E9077: runtime-mismatch 5400.0/7200.0 /m/a.mkv",
+                ErrorKind::InvalidData,
+            ),
+            (
+                Error::MuxIncomplete { title: 3 },
+                9078,
+                "E9078: 3",
+                ErrorKind::Other,
+            ),
+            (
+                Error::RemuxStagingInvalid,
+                9079,
+                "E9079",
+                ErrorKind::InvalidInput,
+            ),
+            (
+                Error::StagedCopySizeMismatch { have: 10, want: 12 },
+                9080,
+                "E9080: 10/12",
+                ErrorKind::InvalidData,
+            ),
+            (
+                Error::WorkerLost { op: "verify" },
+                9081,
+                "E9081: verify",
+                ErrorKind::Other,
+            ),
+            (
+                Error::MultipassRequiresRaw,
+                9082,
+                "E9082",
+                ErrorKind::InvalidInput,
+            ),
+            (
+                Error::StreamLanguageUnknown {
+                    tag: "xx\nyy".into(),
+                },
+                9083,
+                "E9083: xx\\nyy",
+                ErrorKind::InvalidInput,
+            ),
+            (
+                Error::RemuxTargetExists {
+                    path: "/m/a.mkv".into(),
+                },
+                9084,
+                "E9084: /m/a.mkv",
+                ErrorKind::AlreadyExists,
+            ),
+        ];
+        for (e, code, shown, kind) in cases {
+            assert_eq!(e.code(), code, "{e:?}");
+            assert_eq!(e.to_string(), shown, "{e:?}");
+            let io: std::io::Error = e.into();
+            assert_eq!(io.kind(), kind, "E{code}");
+            assert_eq!(error_code(&io), Some(code));
+        }
+        let back: Error =
+            std::io::Error::from(Error::StagedCopySizeMismatch { have: 1, want: 2 }).into();
+        assert!(matches!(
+            back,
+            Error::StagedCopySizeMismatch { have: 1, want: 2 }
+        ));
     }
 
     // is_scsi_transport_failure is true for the 0xFF sentinel and non-SCSI

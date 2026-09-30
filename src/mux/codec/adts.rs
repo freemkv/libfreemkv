@@ -142,7 +142,7 @@ fn adts_header(
     let skip = if data[1] & 1 == 0 { 9 } else { 7 };
     let blocks = data[6] & 3;
     // A Matroska AAC block is one raw_data_block: with CRC, multi-block frames keep per-block
-    // CRC words in the payload, so refuse them (as ffmpeg's aac_adtstoasc does).
+    // CRC words in the payload, so refuse them.
     if blocks > 0 && skip == 9 {
         return None;
     }

@@ -30,7 +30,7 @@ KS-22	static int _verify_ts(uint8_t *buf) { int i; for (i = 0; i < ALIGNED_UNIT_
 KS-23	crypto_error = crypto_aes128e(aacs->uk->uk[curr_uk].key, out_buf, key); if (crypto_error) { LOG_CRYPTO_ERROR(DBG_AACS, "unit key derivation failed", crypto_error); return 1; } for (a = 0; a < 16; a++) { key[a] ^= out_buf[a]; /* here out_buf is plain data from in_buf */ }	// test-only reference
 KS-24	/* plain ? */ if (!(buf[0] & 0xc0)) { // TP_extra_header Copy_permission_indicator == 0, unit is not encrypted return 1; }	// test-only reference
 KS-25	AACS 2.x (UHD): the 64-byte Unit_Key_RO.inf stride and the FMTS IndividualSegment.tbl / .fmts model have no public book. They are pinned by the qa UHD fixture and aacs-unit-grid.md §2.
-KS-26	FMTS anchor contract: the decode server returns the whole set only for an index-1 anchor, and 422 for the wrong phase (kdb decode-server main.rs:1640-1688)
+KS-26	FMTS anchor contract: the decode server returns the whole set only for an index-1 anchor, and 422 for the wrong phase (key service FMTS anchor handler)
 KS-27	Please note: The AACS Specifications books for HD DVD and CBHD have been removed from this AACS website due to inactivity.
 KS-28	File-anchored grid on real discs: 32/32 sync on the file grid vs 0–1/32 on the disc-LBA grid (aacs-unit-grid.md §2 table). This corroborates KS-1.
 KS-29	The Licensed Drive reads Volume ID (Volume_ID) from the media and calculates a message authentication code (Dm) from the Volume ID and the Bus Key (BK) calculated in step 26 in Section 4.3.	// test-only reference

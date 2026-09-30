@@ -41,27 +41,15 @@ fn url_medium(parsed: &StreamUrl) -> Medium {
     }
 }
 
-// Effectively-unbounded per-frame send deadline for `send_deadline == None` (CLI interactive
-// stdout/network): blocks on backpressure without timing out (halt is still checked every 250
-// ms).
-const NO_SEND_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
-
-// Resolve `MuxOptions::send_deadline` into the concrete per-frame deadline:
-// `Some(d)` is autorip's watchdog timeout; `None` is `NO_SEND_DEADLINE`
-// (CLI blocks on a slow-but-alive sink instead).
-fn effective_send_deadline(send_deadline: Option<Duration>) -> Duration {
-    send_deadline.unwrap_or(NO_SEND_DEADLINE)
-}
-
 // Ceiling on bytes buffered while waiting for `headers_ready()`, so a damaged title whose
 // `codec_private` never resolves fails fast instead of OOM-killing the process.
 pub(crate) const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
 
 /// Tuning / behaviour knobs for a mux run.
 ///
-/// `Default` = keep-everything, no-skip, decrypt, no send deadline — the
-/// archival default. Added so callers set only the fields they care about
-/// (and so the additive `selection` field doesn't churn every constructor).
+/// `Default` = keep-everything, no-skip, decrypt — the archival default. Added
+/// so callers set only the fields they care about (and so an additive field
+/// doesn't churn every constructor).
 #[derive(Default)]
 pub struct MuxOptions {
     /// Skip past read errors (zero-fill + continue) on the live-drive path
@@ -81,10 +69,6 @@ pub struct MuxOptions {
     /// caller sets `InputOptions::selection` instead. Setting this field for a Url
     /// input has no effect.
     pub selection: crate::StreamSelection,
-    /// Per-frame write-pipeline send deadline. `Some(d)` returns
-    /// `completed = false` if backpressure lasts longer than `d`.
-    /// `None` waits while the downstream is alive, unless halted.
-    pub send_deadline: Option<Duration>,
 }
 
 /// Progress / event callbacks the consumer implements (CLI `CliProgress`,
@@ -362,7 +346,6 @@ fn mux_unkeyed(
         halt,
         events.as_ref(),
         playlist_name.as_deref(),
-        effective_send_deadline(opts.send_deadline),
         Some(&source),
     )
 }
@@ -558,7 +541,6 @@ fn mux_keyed(
         halt,
         events.as_ref(),
         playlist.as_deref(),
-        effective_send_deadline(opts.send_deadline),
         Some(&source),
     )
 }
@@ -696,7 +678,6 @@ fn drive_mux(
     halt: &Halt,
     events: &dyn MuxEvents,
     playlist_name: Option<&str>,
-    send_deadline: Duration,
     source: Option<&SourceInfo>,
 ) -> std::io::Result<MuxOutcome> {
     // Title assembled from the scanned metadata; the playlist name (disc name)
@@ -893,10 +874,9 @@ fn drive_mux(
     // The op's token, not the wedge token `finish_pumped` may pass (§2.5 `.partial` rule).
     pipe.set_op_token(halt);
 
-    // ── Frame pump ── Per-frame send deadline is a hard bound (autorip) or
-    // effectively unbounded (CLI). Either way `send_with_halt` re-checks halt
-    // every `WAIT_SLICE`, so Ctrl-C / `/api/stop` stays responsive.
-    let deadline = send_deadline;
+    // ── Frame pump ── No per-frame deadline (T27): a slow-but-alive sink blocks and
+    // Stop is the bound; `send_with_halt` re-checks halt every `WAIT_SLICE`.
+    let deadline = Duration::MAX;
     let mut interrupted = false;
     // A send refused with no halt and a healthy consumer ran out its deadline.
     let mut send_timed_out = false;
@@ -1406,16 +1386,7 @@ mod tests {
         let stream = Box::new(FakeStream::new(1).with_frames(2));
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        drive_mux(
-            stream,
-            &url,
-            &halt,
-            &spy,
-            None,
-            Duration::from_secs(60),
-            Some(&source),
-        )
-        .expect("fvi mux runs");
+        drive_mux(stream, &url, &halt, &spy, None, Some(&source)).expect("fvi mux runs");
 
         let text = std::fs::read_to_string(&dst).expect("index written");
         let hdr: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
@@ -1453,16 +1424,8 @@ mod tests {
         let (_dir, url) = tmp("out.xml");
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        let out = drive_mux(
-            stream,
-            &url,
-            &halt,
-            &spy,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("chapters must short-circuit");
+        let out =
+            drive_mux(stream, &url, &halt, &spy, None, None).expect("chapters must short-circuit");
         assert!(out.completed, "metadata sink completes without headers");
         assert!(out.output_opened);
         assert!(spy.opened.load(Ordering::SeqCst), "sink was opened");
@@ -1475,16 +1438,8 @@ mod tests {
         let url = format!("json://{}", dir.path().join("out.json").display());
         let stream = Box::new(FakeStream::new(1).never_ready());
         let halt = Halt::new();
-        let out = drive_mux(
-            stream,
-            &url,
-            &halt,
-            &NoopEvents,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("json must short-circuit");
+        let out = drive_mux(stream, &url, &halt, &NoopEvents, None, None)
+            .expect("json must short-circuit");
         assert!(out.completed);
         assert!(out.output_opened);
     }
@@ -1495,16 +1450,8 @@ mod tests {
     fn header_gate_rejects_unresolved_codec_private() {
         let stream = Box::new(FakeStream::new(1).with_frames(3).never_ready());
         let halt = Halt::new();
-        let err = drive_mux(
-            stream,
-            "null://",
-            &halt,
-            &NoopEvents,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect_err("unresolved headers must be refused");
+        let err = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
+            .expect_err("unresolved headers must be refused");
         // This gate is the GENUINE stub case: no video track's codec_private
         // resolved. `MkvInvalid` now means only this (bad `mkv://` input is
         // `MkvSourceInvalid`), and must stay skippable for all-titles rips.
@@ -1521,16 +1468,8 @@ mod tests {
     fn zero_output_gate_refuses_empty_drain() {
         let stream = Box::new(FakeStream::new(1)); // headers ready, no frames
         let halt = Halt::new();
-        let err = drive_mux(
-            stream,
-            "null://",
-            &halt,
-            &NoopEvents,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect_err("empty drain must be refused");
+        let err = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
+            .expect_err("empty drain must be refused");
         assert_eq!(err.to_string(), format!("E{}", crate::error::E_NO_STREAMS));
     }
 
@@ -1544,16 +1483,8 @@ mod tests {
                 .with_frames(1000)
                 .cancels(halt.clone(), 2),
         );
-        let out = drive_mux(
-            stream,
-            "null://",
-            &halt,
-            &NoopEvents,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("halt is a clean stop, not an error");
+        let out = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
+            .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
         assert!(out.output_opened, "the sink was opened before the halt");
     }
@@ -1567,16 +1498,8 @@ mod tests {
         fs.headers_ready_after = usize::MAX;
         fs.ready_on_eof = true;
         let events = SpyEvents::new();
-        let out = drive_mux(
-            Box::new(fs),
-            "null://",
-            &halt,
-            &events,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("halt is a clean stop");
+        let out = drive_mux(Box::new(fs), "null://", &halt, &events, None, None)
+            .expect("halt is a clean stop");
         assert!(!out.completed);
         assert!(!out.output_opened, "no sink may be opened after a halt");
         assert!(!events.opened.load(Ordering::SeqCst));
@@ -1590,16 +1513,8 @@ mod tests {
         let halt = Halt::new();
         // Headers ready immediately; the 3rd read (in the frame pump) errors Halted.
         let stream = Box::new(FakeStream::new(1).with_frames(1000).halt_errs_at(2));
-        let out = drive_mux(
-            stream,
-            "null://",
-            &halt,
-            &NoopEvents,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("a halt mid frame-read is a clean stop, not an Err");
+        let out = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
+            .expect("a halt mid frame-read is a clean stop, not an Err");
         assert!(!out.completed, "interrupted mux is not complete");
         assert!(out.output_opened, "sink opened before the mid-read halt");
     }
@@ -1614,16 +1529,8 @@ mod tests {
                 .never_ready()
                 .halt_errs_at(1),
         );
-        let out = drive_mux(
-            stream,
-            "null://",
-            &halt,
-            &NoopEvents,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("a halt mid header-read is a clean stop, not an Err");
+        let out = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
+            .expect("a halt mid header-read is a clean stop, not an Err");
         assert!(!out.completed, "interrupted mux is not complete");
         assert!(
             !out.output_opened,
@@ -1637,16 +1544,8 @@ mod tests {
         let stream = Box::new(FakeStream::new(2).with_frames(10));
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        let out = drive_mux(
-            stream,
-            "null://",
-            &halt,
-            &spy,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("normal mux completes");
+        let out =
+            drive_mux(stream, "null://", &halt, &spy, None, None).expect("normal mux completes");
         assert!(out.completed);
         assert!(out.output_opened);
         assert!(spy.opened.load(Ordering::SeqCst));
@@ -1829,7 +1728,6 @@ mod tests {
             skip_errors: false,
             batch_sectors: 8192,
             raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
             selection: Default::default(),
         };
         let halt = Halt::new();
@@ -1956,7 +1854,6 @@ mod tests {
             skip_errors: false,
             batch_sectors: 3,
             raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
             selection: Default::default(),
         };
         let halt = Halt::new();
@@ -2031,7 +1928,6 @@ mod tests {
             skip_errors: false,
             batch_sectors: 3,
             raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
             selection: Default::default(),
         };
         let halt = Halt::new();
@@ -2153,7 +2049,6 @@ mod tests {
             &halt,
             &NoopEvents,
             None,
-            Duration::from_secs(60),
             None,
         )
         .expect("mux succeeds");
@@ -2274,7 +2169,6 @@ mod tests {
             &halt,
             &NoopEvents,
             None,
-            Duration::from_secs(60),
             None,
         )
         .expect("mux succeeds");
@@ -2379,8 +2273,7 @@ mod tests {
     }
 
     fn run(src: LpcmSource, url: &str, spy: &TitleSpy) -> MuxOutcome {
-        let d = Duration::from_secs(60);
-        drive_mux(Box::new(src), url, &Halt::new(), spy, None, d, None).unwrap()
+        drive_mux(Box::new(src), url, &Halt::new(), spy, None, None).unwrap()
     }
 
     // Every entry point (Url/Session/Iso/Live) funnels into drive_mux: the BD LPCM
@@ -2504,8 +2397,7 @@ mod tests {
             // m2ts: an MKV with a declared but frameless video track is refused.
             let url = format!("m2ts://{}", dir.path().join("o.m2ts").display());
             let spy = TitleSpy::default();
-            let d = Duration::from_secs(60);
-            drive_mux(Box::new(src), &url, &Halt::new(), &spy, None, d, None).unwrap();
+            drive_mux(Box::new(src), &url, &Halt::new(), &spy, None, None).unwrap();
             let t = spy.0.lock().unwrap().clone().unwrap();
             let crate::disc::Stream::Audio(a) = t.streams.last().unwrap() else {
                 panic!("audio")
@@ -2612,16 +2504,8 @@ mod tests {
             });
         }
         let halt = Halt::new();
-        let err = drive_mux(
-            Box::new(fs),
-            "null://",
-            &halt,
-            &NoopEvents,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect_err("over-cap header buffer must fail fast, not OOM");
+        let err = drive_mux(Box::new(fs), "null://", &halt, &NoopEvents, None, None)
+            .expect_err("over-cap header buffer must fail fast, not OOM");
         // The cap overflow must carry its OWN code, not `MkvInvalid`: that code
         // means "skippable empty stub" and would silently drop a title that
         // had just produced 512 MiB of real frames.
@@ -2666,16 +2550,8 @@ mod tests {
             writes: AtomicU64::new(0),
         };
         let halt = Halt::new();
-        let out = drive_mux(
-            Box::new(fs),
-            "null://",
-            &halt,
-            &events,
-            None,
-            Duration::from_secs(60),
-            None,
-        )
-        .expect("K-frame stream muxes cleanly");
+        let out = drive_mux(Box::new(fs), "null://", &halt, &events, None, None)
+            .expect("K-frame stream muxes cleanly");
         assert!(out.completed);
         assert_eq!(
             events.writes.load(Ordering::SeqCst),
@@ -2724,61 +2600,26 @@ mod tests {
         );
     }
 
-    // ── Regression E: send_deadline routing (Some vs None) ──────────────────
-    // autorip passes `Some(60s)`; CLI passes `None`, which must map to an
-    // unbounded deadline so a slow-but-alive downstream isn't reported interrupted.
+    // T27 / ST-X1b: `MuxOptions` has no per-frame deadline; no source names it again.
     #[test]
-    fn effective_send_deadline_routes_some_and_none() {
-        // Some(d) → exactly d.
-        assert_eq!(
-            effective_send_deadline(Some(Duration::from_secs(60))),
-            Duration::from_secs(60),
-            "Some(d) must resolve to the bounded per-frame deadline d"
-        );
-        assert_eq!(
-            effective_send_deadline(Some(Duration::from_secs(5))),
-            Duration::from_secs(5),
-        );
-        // None → the effectively-unbounded no-timeout sentinel, far larger than
-        // any real Some deadline so backpressure never trips it.
-        let none = effective_send_deadline(None);
-        assert_eq!(
-            none, NO_SEND_DEADLINE,
-            "None must resolve to NO_SEND_DEADLINE"
-        );
-        assert!(
-            none >= Duration::from_secs(365 * 24 * 60 * 60),
-            "None must be effectively unbounded (>= 1 year), got {none:?}"
-        );
-        assert!(
-            none > Duration::from_secs(60),
-            "None must NOT collapse to the old fixed 60s deadline"
-        );
-    }
-
-    // MuxOptions must actually carry the send_deadline knob end-to-end so a
-    // consumer can pick the bounded (autorip) vs unbounded (CLI) policy.
-    #[test]
-    fn mux_options_carries_send_deadline() {
-        let cli = MuxOptions {
-            skip_errors: false,
-            batch_sectors: 0,
-            raw: false,
-            send_deadline: None,
-            selection: Default::default(),
-        };
-        assert_eq!(effective_send_deadline(cli.send_deadline), NO_SEND_DEADLINE);
-        let autorip = MuxOptions {
-            skip_errors: false,
-            batch_sectors: 8192,
-            raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
-            selection: Default::default(),
-        };
-        assert_eq!(
-            effective_send_deadline(autorip.send_deadline),
-            Duration::from_secs(60)
-        );
+    fn removed_deadline_field_is_named_nowhere() {
+        fn walk(dir: &std::path::Path, needle: &str, hits: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, needle, hits);
+                } else if path.extension().is_some_and(|x| x == "rs")
+                    && std::fs::read_to_string(&path).is_ok_and(|src| src.contains(needle))
+                {
+                    hits.push(path.display().to_string());
+                }
+            }
+        }
+        let needle = ["send", "deadline"].join("_");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        walk(&root, &needle, &mut hits);
+        assert!(hits.is_empty(), "{needle} still named in: {hits:?}");
     }
 
     #[test]
@@ -2917,7 +2758,6 @@ mod tests {
             &Halt::new(),
             &SpyEvents::new(),
             None,
-            Duration::from_secs(60),
             None,
         )
         .expect("mkv remux runs");
@@ -3003,7 +2843,6 @@ mod tests {
             skip_errors: false,
             batch_sectors: 3,
             raw: false,
-            send_deadline: Some(Duration::from_secs(60)),
             selection: Default::default(),
         }
     }

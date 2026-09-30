@@ -4,6 +4,7 @@
 
 ### Added
 
+- Error codes for the engine's remux and preflight refusals: `Error::RemuxVerifyFailed { kind: RemuxVerifyKind, path }` (E9077, `E9077: <kind> <path>`, or `E9077: runtime-mismatch <have>/<want> <path>` in seconds), `MuxIncomplete { title }` (E9078), `RemuxStagingInvalid` (E9079), `StagedCopySizeMismatch { have, want }` (E9080), `WorkerLost { op }` (E9081, `E9081: <op>`), `MultipassRequiresRaw` (E9082), `StreamLanguageUnknown { tag }` (E9083), `RemuxTargetExists { path }` (E9084). E9076 is retired.
 - `probe_mkv` reads a Matroska file's Info and Tracks (muxing/writing app, declared duration, title, timestamp scale, per-track kind/codec/language) without reading a cluster; `probe_mkv_with_cues` also reports the last Cues timestamp. `parse_freemkv_version` extracts the version from freemkv's muxing-app stamp.
 
 ### Changed

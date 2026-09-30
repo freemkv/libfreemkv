@@ -1349,6 +1349,98 @@ fn on_arrival_damaged_batch_partners_fall_back_to_side_reads() {
     assert_eq!(set.proof_cache().get(fx.file(1).0), Some(Proof::Proven(1)));
 }
 
+/// Option A (E7013): a unit that opens, whose only partners are damaged (a garbled head that
+/// kept its sync) and whose side reads find none, is a provisional proof, never E7022.
+#[test]
+fn on_arrival_only_damaged_partners_is_provisional_never_e7022() {
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| garble_keeping_sync(fx, 1, 5));
+    let (b, n) = fx.file(1);
+    src.kill(b, fx.unit(1, 4));
+    src.kill(fx.unit(1, 6), b + n);
+    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    let mut want = fx.plain(fx.unit(1, 4), 2);
+    want[ALIGNED_UNIT_LEN..].fill(0);
+    assert_eq!(read(&mut r, &fx, 1, 4, 2).expect("damage, not E7022"), want);
+    assert_eq!(r.blanked_units(), 1);
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Provisional(1, fx.unit(1, 4)))
+    );
+}
+
+/// Option A (E7013): a damaged unit read alone after a provisional proof, with no readable
+/// partner to vouch, is blanked and counted, never E7022; a second one is a stop.
+#[test]
+fn on_arrival_lone_damage_after_a_provisional_proof_is_blanked() {
+    let (fx, set, src) = lazy_b_damaged(&[K1, K2], |fx| {
+        garble_keeping_sync(fx, 1, 7);
+        garble_keeping_sync(fx, 1, 8);
+    });
+    let (b, n) = fx.file(1);
+    let isolate = |u: u32| {
+        src.heal();
+        src.kill(b, fx.unit(1, u));
+        src.kill(fx.unit(1, u + 1), b + n);
+    };
+    isolate(5);
+    let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
+    read(&mut r, &fx, 1, 5, 1).expect("provisional under K2");
+    isolate(7);
+    let got = read(&mut r, &fx, 1, 7, 1).expect("damage does not contradict a key");
+    assert_eq!(got, vec![0u8; ALIGNED_UNIT_LEN]);
+    assert_eq!(r.blanked_units(), 1);
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Provisional(1, fx.unit(1, 5)))
+    );
+    isolate(8);
+    assert_eq!(
+        code(read(&mut r, &fx, 1, 8, 1)),
+        E7022,
+        "two intact seeds no key opens"
+    );
+}
+
+/// Option A (E7013): a garbled head that kept its CPI flag and sync inside a clear piece is
+/// damage: blanked and counted, never E7032.
+#[test]
+fn on_arrival_a_garbled_head_in_a_clear_piece_is_blanked_never_e7032() {
+    let fx = fixture(&[stream(1, 10, None), stream(2, 10, None)], 2, &[&[0, 1]]);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let mut fx = fx;
+    garble_keeping_sync(&mut fx, 0, 4);
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    for (u, n) in [(4, 1), (3, 3)] {
+        let mut buf = vec![0u8; n as usize * ALIGNED_UNIT_LEN];
+        w.read_sectors(fx.unit(0, u), (n * 3) as u16, &mut buf, true)
+            .expect("damage, not E7032");
+        let at = (4 - u) as usize * ALIGNED_UNIT_LEN;
+        assert!(buf[at..at + ALIGNED_UNIT_LEN].iter().all(|&b| b == 0));
+    }
+    assert_eq!(w.blanked_units(), 2);
+}
+
+/// Option A (E7013): a clear piece never has partners, so every garbled flagged unit in it,
+/// at any LBA, is damage: blanked and counted, never a second-strike E7032.
+#[test]
+fn on_arrival_garbled_heads_at_two_lbas_of_a_clear_piece_are_blanked() {
+    let fx = fixture(&[stream(1, 10, None), stream(2, 10, None)], 2, &[&[0, 1]]);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let mut fx = fx;
+    garble_keeping_sync(&mut fx, 0, 2);
+    garble_keeping_sync(&mut fx, 0, 7);
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    for u in [2, 7] {
+        let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
+        w.read_sectors(fx.unit(0, u), 3, &mut buf, true)
+            .expect("damage, not E7032");
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+    assert_eq!(w.blanked_units(), 2);
+}
+
 /// Sweep, patch and image→ISO read through the whole-disc reader, one call per block. A
 /// cluster of damaged units (KS-4: "The first 16 bytes of each Aligned Unit is used as the
 /// seed") is blanked and counted wherever it falls, never E7013: multipass must not error.
@@ -2026,16 +2118,19 @@ fn single_unit_rule_never_overrides_a_piece_another_key_opened() {
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
 }
 
-/// KU §2.4 (review item 5): the held keys are tried on U before any side read. A readable
-/// unit no held key opens stops at once, with no side read of a (possibly damaged) area.
+/// KU §2.4 (review item 5): the held keys are tried on U first. A readable unit no held key
+/// opens, alone in its read, stops within the read once one side read (never retried) finds
+/// a readable partner no held key opens either (option A: a lone failure alone is damage).
 #[test]
-fn unopenable_unit_stops_before_any_side_read() {
+fn unopenable_unit_stops_after_one_side_read() {
     let (fx, set, src) = lazy_b(&[K1]);
     let counted = CountingSource::new(src);
     let log = counted.log();
     let mut r = set.title_reader(&fx.disc, 0, counted).unwrap();
     assert_eq!(code(read(&mut r, &fx, 1, 4, 1)), E7022);
-    assert_eq!(log.reads(), [(fx.unit(1, 4), 3)], "only the requested read");
+    let reads = log.reads();
+    assert_eq!(reads[0], (fx.unit(1, 4), 3), "the requested read first");
+    assert_eq!(reads.len(), 2, "then one side read");
 }
 
 /// KU §2.3 step 10 under invariant 2, "never guessed" (J22, review r2 M1). KS-14 [BD]

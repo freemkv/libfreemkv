@@ -453,16 +453,15 @@ pub const VOID: u32 = 0xEC;
 
 /// A Void element (0xEC) that occupies EXACTLY `total_len` bytes in place: 1-byte
 /// id + 1-byte size VINT + zeroed payload. Used to neutralise a fixed element
-/// without shifting the bytes after it. `total_len` must be in `2..=129` (the
-/// 1-byte-size range, which covers every fixed element the muxer voids in place).
-pub fn void_element(total_len: usize) -> Vec<u8> {
-    assert!(
-        (2..=129).contains(&total_len),
-        "void_element: total_len {total_len} outside the 1-byte-size range 2..=129"
-    );
+/// without shifting the bytes after it. `total_len` must be in `2..=128`: a
+/// 127-byte payload would need size byte 0xFF, the reserved unknown-size VINT.
+pub fn void_element(total_len: usize) -> io::Result<Vec<u8>> {
+    if !(2..=128).contains(&total_len) {
+        return Err(crate::error::Error::MkvUnencodable.into());
+    }
     let mut v = vec![VOID as u8, 0x80 | (total_len - 2) as u8];
     v.resize(total_len, 0);
-    v
+    Ok(v)
 }
 pub const SEEK_ID: u32 = 0x53AB;
 pub const SEEK_POSITION: u32 = 0x53AC;
@@ -1458,5 +1457,47 @@ mod tests {
             want[7 - i as usize] = 0x5A;
             assert_eq!(fixed_width_vint8(0x5Au64 << (8 * i)), want, "octet {i}");
         }
+    }
+
+    // void_element fills exactly `total_len` bytes with a 1-byte size VINT; 129 would need
+    // the reserved all-ones size byte 0xFF and is refused.
+    #[test]
+    fn void_element_range_and_encoding() {
+        assert_eq!(void_element(2).unwrap(), vec![0xEC, 0x80]);
+        let v = void_element(128).unwrap();
+        assert_eq!((v.len(), v[0], v[1]), (128, 0xEC, 0xFE));
+        assert!(v[2..].iter().all(|&b| b == 0));
+        for bad in [0, 1, 129] {
+            let e = void_element(bad).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&e),
+                Some(crate::error::E_MKV_UNENCODABLE),
+                "{bad}"
+            );
+        }
+    }
+
+    // An attacker-sized EBML length must not size an allocation: a huge claim against a
+    // 4-byte source is a clean MkvSourceInvalid (usize::MAX would overflow any up-front buffer).
+    #[test]
+    fn read_binary_val_huge_declared_len_is_source_invalid() {
+        for len in [1usize << 40, usize::MAX] {
+            let e = read_binary_val(&mut Cursor::new(&[1u8, 2, 3, 4]), len).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&e),
+                Some(crate::error::E_MKV_SOURCE_INVALID),
+                "{len}"
+            );
+        }
+    }
+
+    // Invalid UTF-8 in an untrusted string element is MkvSourceInvalid, never lossy/panic.
+    #[test]
+    fn read_string_val_invalid_utf8_is_source_invalid() {
+        let e = read_string_val(&mut Cursor::new(&[0xFFu8, 0xFE]), 2).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some(crate::error::E_MKV_SOURCE_INVALID)
+        );
     }
 }

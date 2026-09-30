@@ -1045,6 +1045,7 @@ fn build(
                         Verdict::Lazy(c) => c,
                         _ => None,
                     },
+                    clear: p.verdict == Verdict::Clear,
                 });
             }
             Verdict::Missing | Verdict::Ask => {}

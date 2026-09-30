@@ -1,7 +1,7 @@
 Real-encoder MPEG-1 Layer II fixtures for mp2_channels_tests.rs
 (ffmpeg_encoded_frames_walk_to_the_end_of_every_frame).
 
-Content: a synthetic 440 Hz sine tone from FFmpeg's lavfi `sine` source, 0.1 s.
+Content: a synthetic 440 Hz sine tone from the FFmpeg lavfi `sine` source, 0.1 s.
 No recorded or copyrighted material. Generated for this repository and covered
 by its licence (MIT, see /LICENSE).
 

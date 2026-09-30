@@ -485,6 +485,8 @@ fn apply_aacs_map(
     let verify_failed = std::sync::atomic::AtomicBool::new(false);
     // Per mapped key: (failed, verified) FMTS units of this read.
     let tally: Vec<[AtomicUsize; 2]> = unit_keys.iter().map(|_| Default::default()).collect();
+    // A failing FMTS unit another held key opens: a wrong mapped key, never damage.
+    let opened_elsewhere = std::sync::atomic::AtomicBool::new(false);
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
@@ -551,15 +553,31 @@ fn apply_aacs_map(
             }
             return;
         }
-        aacs::content::decrypt_unit(chunk, key);
         // Correct-phase forensic verify: a failing unit is blanked; the read is judged below.
         if matches!(phase, Phase::Even | Phase::Odd) {
+            let mut ciphertext = [0u8; aacs::content::ALIGNED_UNIT_LEN];
+            ciphertext.copy_from_slice(chunk);
+            aacs::content::decrypt_unit(chunk, key);
             let clean = aacs::content::is_clean(chunk, format);
             tally[key_idx][clean as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !clean {
+                let opens = |k: &[u8; 16]| {
+                    let mut c = ciphertext;
+                    aacs::content::decrypt_unit(&mut c, k);
+                    aacs::content::is_clean(&c, format)
+                };
+                if unit_keys
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (_, k))| j != key_idx && opens(k))
+                {
+                    opened_elsewhere.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 chunk.fill(0);
                 return;
             }
+        } else {
+            aacs::content::decrypt_unit(chunk, key);
         }
         // KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted": a unit
         // we decrypted (damaged or not) is no longer ciphertext (KU design §5.4, K-13).
@@ -590,15 +608,15 @@ fn apply_aacs_map(
         return Err(crate::error::Error::DecryptFailed);
     }
     // A wrong key fails every unit it keys (resolve's phase probe catches it first); damage
-    // fails one. Two or more failures, none verifying, under one key or the read: E7013.
+    // fails one. E7013 per key only: two or more failures, none verifying, or a failing unit
+    // another held key opens. Lone failures under different keys are damage.
     let tally: Vec<[usize; 2]> = tally
         .into_iter()
         .map(|t| t.map(|n| n.into_inner()))
         .collect();
-    let read = tally.iter().fold([0, 0], |a, t| [a[0] + t[0], a[1] + t[1]]);
     let wrong = |t: &[usize; 2]| t[0] >= WRONG_KEY_FAILURES && t[1] == 0;
-    let failed = read[0];
-    if wrong(&read) || tally.iter().any(wrong) {
+    let failed: usize = tally.iter().map(|t| t[0]).sum();
+    if opened_elsewhere.into_inner() || tally.iter().any(wrong) {
         tracing::error!(
             target: "freemkv::decrypt",
             lba = base_lba,
@@ -619,16 +637,16 @@ fn apply_aacs_map(
     Ok(failed)
 }
 
-/// FMTS units of one read that must fail their verify, none verifying, under one key or
-/// across the read, before it is a wrong key rather than damage: a wrong key fails them all.
+/// FMTS units of one read that must fail their verify, none verifying, under one key before
+/// it is a wrong key rather than damage: a wrong key fails them all.
 const WRONG_KEY_FAILURES: usize = 2;
 
 /// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
-/// zero-fill them, like a sweep's unread sector, and return how many. Damaged: flagged (CPI)
-/// with no TS sync in the seed, or a zero-filled first sector over a non-TS rest. No key opens
-/// either, so it is read damage, never a key verdict and never E7013, whether the unit is
-/// alone, in a cluster, or a read cut off its grid (1.7.7 muxed through all three). Only units
-/// `covered` (keyed or proven on arrival) are judged. A garbage seed that keeps 0x47 at byte 4
+/// zero-fill them, like a sweep's unread sector, and return how many. Damaged: no TS sync at
+/// byte 4, flagged (CPI) or not; unflagged only when not clean TS either (a zeroed head over
+/// clear TS is a sweep hole). No key opens them: read damage, never a key verdict or E7013,
+/// alone, clustered, or off the grid (1.7.7 muxed through all three). Only units `covered`
+/// (keyed or proven on arrival) are judged. A flagged garbage seed that keeps 0x47 at byte 4
 /// (~1 in 256) is not caught here: it decrypts as garbage, or on arrival reads as unopened.
 pub(crate) fn blank_damaged_units(
     buf: &mut [u8],
@@ -646,18 +664,15 @@ pub(crate) fn blank_damaged_units(
         if !covered(lba) {
             continue;
         }
+        // KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed";
+        // KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport
+        // packet", so an intact unit, clear or not, has the TS sync at byte 4 (KS-22 too).
         let lost = if aacs::content::aacs_unit_seed_encrypted(unit, format) {
-            // KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed";
-            // KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport
-            // packet", so an intact seed carries the TS sync at byte 4 (KS-22 corroborates).
             !aacs::content::aacs_unit_on_grid(unit, format)
         } else {
-            // A zero-filled head took the seed (KS-4); a non-zero rest that is not TS is
-            // ciphertext no key opens. A trailing zero run keeps its head and decrypts.
-            let (head, rest) = unit.split_at(crate::consts::SECTOR_BYTES);
-            head.iter().all(|&b| b == 0)
-                && rest.iter().any(|&b| b != 0)
-                && !aacs::content::is_clean(unit, format)
+            // A zeroed or garbled head over a rest that is not TS: ciphertext no key opens.
+            // A trailing zero run keeps its head; an all-zero unit is clean (a sweep hole).
+            unit[4] != 0x47 && !aacs::content::is_clean(unit, format)
         };
         if lost {
             damaged.push(i);
@@ -2010,6 +2025,56 @@ mod tests {
             decrypt_sectors_mapped(&mut buf, &keys, 0, &map),
             Err(crate::error::Error::DecryptFailed)
         ));
+    }
+
+    /// Option A (E7013): one damaged forensic unit under each of two keys (garbled heads that
+    /// kept flag and sync), no other forensic unit in the read, is damage: blanked, never E7013.
+    #[test]
+    fn mapped_phase_lone_damage_under_two_keys_is_blanked_not_e7013() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let (key_a, key_b) = ([0xAAu8; 16], [0xBBu8; 16]);
+        let mut buf = vec![0u8; 4 * ul];
+        for (i, k) in [key_a, key_a, key_b, key_b].iter().enumerate() {
+            let mut u = clear_ts_unit();
+            aacs_encrypt_unit_for_test(&mut u, k);
+            if i % 2 == 0 {
+                crate::test_util::damage_unit_seed(&mut u);
+                u[4] = 0x47;
+            }
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b)],
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges_phased(vec![
+            (0, 2 * usz, 0, Phase::Even),
+            (2 * usz, 4 * usz, 1, Phase::Even),
+        ]);
+        let blanked = decrypt_sectors_mapped_in_content(&mut buf, &keys, 0, &map, None)
+            .expect("damage, not E7013");
+        assert_eq!(blanked, 2);
+        assert!(buf[..ul].iter().all(|&b| b == 0));
+        assert!(buf[2 * ul..3 * ul].iter().all(|&b| b == 0));
+    }
+
+    /// Option A (E7013): a garbage seed with its CPI bits clear lost the TS sync every BD-TS
+    /// unit carries at byte 4 (KS-2): damage, blanked and counted; clear and zero units are not.
+    #[test]
+    fn blank_damaged_units_counts_a_garbage_seed_with_cpi_clear() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let mut garbage = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut garbage, &[0xAAu8; 16]);
+        crate::test_util::damage_unit_seed(&mut garbage);
+        garbage[0] &= 0x3F;
+        let mut buf = [garbage, clear_ts_unit(), vec![0u8; ul]].concat();
+        let n = blank_damaged_units(&mut buf, 0, ContentFormat::BdTs, &|_| true);
+        assert_eq!(n, 1);
+        assert!(buf[..ul].iter().all(|&b| b == 0));
+        assert_eq!(&buf[ul..2 * ul], &clear_ts_unit()[..]);
     }
 
     /// Phase::All (multi-CPS / base) decrypts EVERY unit and never runs the verify

@@ -815,7 +815,7 @@ mod tests {
     // and a stuffed 13818-1 pack header moves the PES there: neither is scramble evidence.
     #[test]
     fn is_scrambled_pack_only_reads_an_unstuffed_13818_pack() {
-        // FFmpeg's MPEG-1 packet: STD buffer '01' at 0x12, then '0010' + PTS at 0x14.
+        // An ISO/IEC 11172-1 packet: STD buffer '01' at 0x12, then '0010' + PTS at 0x14.
         let mut s = vec![0u8; 2048];
         s[..12].copy_from_slice(&[0, 0, 1, 0xBA, 0x21, 0, 1, 0, 1, 0x80, 0x1B, 0x83]);
         s[12..16].copy_from_slice(&[0, 0, 1, 0xE0]);

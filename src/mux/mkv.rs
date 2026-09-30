@@ -9,7 +9,7 @@ use super::ebml;
 // `demux://` sink.
 use super::timeline::TimelineContinuity;
 use crate::disc::{
-    AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
+    AudioStream, Chapter, Codec, CodecKind, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
 };
 // Production code reaches resolutions only through `VideoStream::resolution`;
 // the fixtures below name the variants directly.
@@ -39,6 +39,8 @@ const CICP_TRANSFER_BT709: u8 = 1;
 const CICP_TRANSFER_BT470BG: u8 = 5;
 /// TransferCharacteristics = 6 (BT.601-525 / SMPTE 170M) — ITU-T H.273 Table 3.
 const CICP_TRANSFER_BT601_525: u8 = 6;
+/// TransferCharacteristics = 14 (BT.2020 10-bit, SDR) — ITU-T H.273 Table 3.
+const CICP_TRANSFER_BT2020_10: u8 = 14;
 /// TransferCharacteristics = 16 (SMPTE ST 2084 / PQ — HDR10/HDR10+/DV) — ITU-T
 /// H.273 Table 3.
 const CICP_TRANSFER_PQ: u8 = 16;
@@ -123,9 +125,10 @@ pub(crate) fn cicp_for_video(v: &VideoStream) -> (u8, u8, u8, u8) {
         return (c.matrix, c.transfer, c.primaries, c.range);
     }
     let (m, t, p, r) = match v.color_space {
+        // SDR BT.2020 (UHD MPLS dynamic_range 0); the HDR override below selects PQ/HLG.
         ColorSpace::Bt2020 => (
             CICP_MATRIX_BT2020NC,
-            CICP_TRANSFER_PQ,
+            CICP_TRANSFER_BT2020_10,
             CICP_PRIMARIES_BT2020,
             COLOUR_RANGE_LIMITED,
         ),
@@ -237,6 +240,20 @@ pub fn dolby_vision_config(profile: u8, level: u8, bl_compat_id: u8) -> Vec<u8> 
     v
 }
 
+// Dolby Vision level for a disc Profile 7 title: the base layer is always 3840x2160 (the
+// DV-tagged stream is often the 1080p EL), so the level follows the frame rate alone
+// (Dolby Vision Profiles and Levels: 6 = 2160p24, 7 = p30, 8 = p48, 9 = p60).
+fn dv_level_2160p(num: u32, den: u32) -> u8 {
+    let (num, den) = (u64::from(num), u64::from(den.max(1)));
+    if num == 0 {
+        return 6;
+    }
+    [24, 30, 48]
+        .iter()
+        .position(|&max| num <= max * den)
+        .map_or(9, |i| 6 + i as u8)
+}
+
 /// SEI chromaticity unit (Rec. ITU-T H.265 D.3.28): `display_primaries_*` and
 /// `white_point_*` are in increments of 0.00002. Matroska chromaticity elements
 /// are floats in the [0, 1] range, so the conversion is `value * 0.00002`.
@@ -313,25 +330,74 @@ fn language_or_und(lang: &str) -> String {
     }
 }
 
+/// Matroska CodecID for `codec` carried as a `kind` track, or `None` when Matroska has no ID
+/// for it here (text subtitles, whose payload is not in Matroska block form; `Unknown`; a codec
+/// of another kind). Exhaustive, so a new `Codec` variant must be mapped or refused here.
+fn codec_id(codec: Codec, kind: CodecKind) -> Option<&'static str> {
+    // `A_DTS` is the sole registered ID for the whole DTS family; players tell core/HD-HRA/
+    // HD-MA apart from the bitstream. Unregistered `A_DTS/MA`/`A_DTS/HR` break strict parsers.
+    let id = match codec {
+        Codec::H264 => ebml::CODEC_H264,
+        Codec::Hevc => ebml::CODEC_HEVC,
+        Codec::Vc1 => ebml::CODEC_VC1,
+        Codec::Mpeg2 => ebml::CODEC_MPEG2,
+        Codec::Mpeg1 => ebml::CODEC_MPEG1,
+        Codec::Av1 => ebml::CODEC_AV1,
+        Codec::Ac3 => ebml::CODEC_AC3,
+        Codec::Ac3Plus => ebml::CODEC_EAC3,
+        Codec::TrueHd => ebml::CODEC_TRUEHD,
+        Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => ebml::CODEC_DTS,
+        Codec::Lpcm => ebml::CODEC_PCM_BE,
+        Codec::Aac => ebml::CODEC_AAC,
+        Codec::Mp2 => ebml::CODEC_MP2,
+        Codec::Mp3 => ebml::CODEC_MP3,
+        Codec::Flac => ebml::CODEC_FLAC,
+        Codec::Opus => ebml::CODEC_OPUS,
+        Codec::Pgs => ebml::CODEC_PGS,
+        Codec::DvdSub => ebml::CODEC_VOBSUB,
+        Codec::Srt | Codec::Ssa | Codec::Unknown(_) => return None,
+    };
+    (codec.kind() == kind).then_some(id)
+}
+
+/// Whether `s` has a Matroska CodecID, i.e. whether `mkv://` carries it.
+pub(crate) fn is_mappable(s: &crate::disc::Stream) -> bool {
+    match s {
+        crate::disc::Stream::Video(v) => codec_id(v.codec, CodecKind::Video).is_some(),
+        crate::disc::Stream::Audio(a) => codec_id(a.codec, CodecKind::Audio).is_some(),
+        crate::disc::Stream::Subtitle(t) => codec_id(t.codec, CodecKind::Subtitle).is_some(),
+    }
+}
+
+// Test shorthands for [`MkvTrack::from_stream`] on a stream known to be mappable.
+#[cfg(test)]
 impl MkvTrack {
-    /// Build a video track from a [`VideoStream`]. Language defaults to `"und"`;
-    /// colour metadata is derived from the stream's colour space and HDR format
-    /// (PQ for HDR10/HDR10+/DV, HLG for HLG). When `hdr == DolbyVision` a dvcC
-    /// BlockAdditionMapping is attached automatically so players recognise the
-    /// Dolby Vision layer.
     pub fn video(v: &VideoStream) -> Self {
-        let codec_id = match v.codec {
-            Codec::H264 => ebml::CODEC_H264,
-            Codec::Hevc => ebml::CODEC_HEVC,
-            Codec::Vc1 => ebml::CODEC_VC1,
-            Codec::Mpeg2 => ebml::CODEC_MPEG2,
-            Codec::Mpeg1 => ebml::CODEC_MPEG1,
-            Codec::Av1 => ebml::CODEC_AV1,
-            // Every video codec this crate can produce is named above; the remaining
-            // arm is reached only by a non-video/Unknown codec routed here in error
-            // (see the audio counterpart — no error channel exists here either).
-            _ => ebml::CODEC_MPEG2,
-        };
+        Self::try_video(v).expect("mappable video codec")
+    }
+    pub fn audio(a: &AudioStream) -> Self {
+        Self::try_audio(a).expect("mappable audio codec")
+    }
+    pub fn subtitle(s: &SubtitleStream) -> Self {
+        Self::try_subtitle(s).expect("mappable subtitle codec")
+    }
+}
+
+impl MkvTrack {
+    /// Build the track for a title stream, or `None` when its codec has no Matroska CodecID
+    /// (the stream is then left out rather than declared under another codec's ID).
+    pub(crate) fn from_stream(s: &crate::disc::Stream) -> Option<Self> {
+        match s {
+            crate::disc::Stream::Video(v) => Self::try_video(v),
+            crate::disc::Stream::Audio(a) => Self::try_audio(a),
+            crate::disc::Stream::Subtitle(t) => Self::try_subtitle(t),
+        }
+    }
+
+    // Video track: language `und`, colour from `cicp_for_video`, and a dvcC
+    // BlockAdditionMapping when `hdr == DolbyVision`.
+    fn try_video(v: &VideoStream) -> Option<Self> {
+        let codec_id = codec_id(v.codec, CodecKind::Video)?;
         // Unknown resolution -> `pixels()` reports (0, 0) (no default is fabricated),
         // and the writer omits the optional PixelWidth/PixelHeight
         // on 0 per RFC 9559 5.1.4.1.28-29.
@@ -350,10 +416,14 @@ impl MkvTrack {
         // anamorphic — coded pixels aren't square, so derive width from the DAR
         // (e.g. 720x576 16:9 -> 1024x576) or players show 5:4/3:2 instead of 16:9.
         let (display_width, display_height) = match v.display_aspect {
-            Some((an, ad)) if an > 0 && ad > 0 && h > 0 => ((h * an + ad / 2) / ad, h),
+            // u64: a caller-supplied ratio must not overflow; an unrepresentable width keeps (w, h).
+            Some((an, ad)) if an > 0 && ad > 0 && h > 0 => {
+                let dw = (u64::from(h) * u64::from(an) + u64::from(ad) / 2) / u64::from(ad);
+                u32::try_from(dw).map_or((w, h), |dw| (dw, h))
+            }
             _ => (w, h),
         };
-        Self {
+        Some(Self {
             track_type: ebml::TRACK_TYPE_VIDEO,
             codec_id,
             language: "und".into(),
@@ -385,7 +455,7 @@ impl MkvTrack {
             // The DV layer (hdr=DolbyVision) carries the dvcC so the track is
             // recognised as Dolby Vision (disc Profile 7 dual-layer).
             dv_config: if matches!(v.hdr, HdrFormat::DolbyVision) {
-                Some(dolby_vision_config(7, 6, 0))
+                Some(dolby_vision_config(7, dv_level_2160p(num, den), 0))
             } else {
                 None
             },
@@ -394,32 +464,12 @@ impl MkvTrack {
             // (same deferred path FieldOrder uses). `None` here -> omitted unless seen.
             hdr10: None,
             mvc_params: None,
-        }
+        })
     }
 
-    /// Build an audio track from an [`AudioStream`]. The codec ID follows the
-    /// Matroska registry; every DTS family member (core, DTS-HD HR, DTS-HD MA)
-    /// maps to the single registered `A_DTS` ID (see the note below).
-    pub fn audio(a: &AudioStream) -> Self {
-        // `A_DTS` is the sole registered codec ID for the whole DTS family; players
-        // distinguish core/HD-HRA/HD-MA from the bitstream itself. `A_DTS/MA` and
-        // `A_DTS/HR` aren't registered and some strict parsers reject them.
-        let codec_id = match a.codec {
-            Codec::Ac3 => ebml::CODEC_AC3,
-            Codec::Ac3Plus => ebml::CODEC_EAC3,
-            Codec::TrueHd => ebml::CODEC_TRUEHD,
-            Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => ebml::CODEC_DTS,
-            Codec::Lpcm => ebml::CODEC_PCM_BE,
-            Codec::Aac => ebml::CODEC_AAC,
-            Codec::Mp2 => ebml::CODEC_MP2,
-            Codec::Mp3 => ebml::CODEC_MP3,
-            Codec::Flac => ebml::CODEC_FLAC,
-            Codec::Opus => ebml::CODEC_OPUS,
-            // Every audio codec this crate can produce is named above; the remaining
-            // arm (A_AC3, wrong for such a track) is reached only in error, since
-            // `MkvTrack::audio` has no error channel — a test pins each real codec ID.
-            _ => ebml::CODEC_AC3,
-        };
+    // Audio track; every DTS family member maps to the single registered `A_DTS`.
+    fn try_audio(a: &AudioStream) -> Option<Self> {
+        let codec_id = codec_id(a.codec, CodecKind::Audio)?;
         // Unknown sample rate/channels -> accessors return 0, so the serializer omits
         // SamplingFrequency/Channels rather than writing a fabricated 48kHz/6ch value.
         let sr = a.sample_rate.hz();
@@ -427,7 +477,7 @@ impl MkvTrack {
 
         let name = a.label.clone();
 
-        Self {
+        Some(Self {
             track_type: ebml::TRACK_TYPE_AUDIO,
             codec_id,
             language: language_or_und(&a.language),
@@ -458,19 +508,14 @@ impl MkvTrack {
             dv_config: None,
             hdr10: None,
             mvc_params: None,
-        }
+        })
     }
 
-    /// Build a subtitle track from a [`SubtitleStream`]. PGS maps to
-    /// `S_HDMV/PGS` and DVD VobSub to `S_VOBSUB`; the stream's `codec_data`
-    /// (the VobSub `.idx` palette header for DVD) becomes the track's
-    /// CodecPrivate. The forced-display flag is propagated from the stream.
-    pub fn subtitle(s: &SubtitleStream) -> Self {
-        let codec_id = match s.codec {
-            Codec::DvdSub => ebml::CODEC_VOBSUB,
-            _ => ebml::CODEC_PGS,
-        };
-        Self {
+    // Subtitle track (PGS or VobSub); `codec_data` (the VobSub `.idx` palette header) becomes
+    // the CodecPrivate and the forced flag is propagated.
+    fn try_subtitle(s: &SubtitleStream) -> Option<Self> {
+        let codec_id = codec_id(s.codec, CodecKind::Subtitle)?;
+        Some(Self {
             track_type: ebml::TRACK_TYPE_SUBTITLE,
             codec_id,
             language: language_or_und(&s.language),
@@ -496,7 +541,7 @@ impl MkvTrack {
             dv_config: None,
             hdr10: None,
             mvc_params: None,
-        }
+        })
     }
 }
 
@@ -1020,7 +1065,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
             } else if track.codec_id == ebml::CODEC_AAC {
                 codec_private_reserves.insert(i, writer.stream_position()?);
-                writer.write_all(&ebml::void_element(CODEC_PRIVATE_RESERVE))?;
+                writer.write_all(&ebml::void_element(CODEC_PRIVATE_RESERVE)?)?;
             }
             // Pre-0.13's deferred codecPrivate path was removed as dead code.
 
@@ -1120,8 +1165,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             // Blu-ray 3D (MVC) signaling: BlockAdditionMapping carries the mvcC record
             // so players recognise the dependent (right-eye) view riding as a
             // per-frame BlockAdditional under this mapping (BlockAddIDValue = 2).
-            match mvc_record.as_ref() {
-                Some(record) => {
+            match (mvc_record.as_ref(), track.mvc_params.as_ref()) {
+                (Some(record), _) => {
                     let map_pos = ebml::start_master(&mut writer, ebml::BLOCK_ADDITION_MAPPING)?;
                     ebml::write_uint(
                         &mut writer,
@@ -1135,8 +1180,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 // `mvc_params` present but the record failed to build (malformed params):
                 // no mapping, `track_has_mvc_mapping` is already `false`, so
                 // BlockAdditionals are dropped — file stays conforming, no orphan BlockAddID.
-                None if track.mvc_params.is_some() => {
-                    let (s, p) = track.mvc_params.as_ref().unwrap();
+                (None, Some((s, p))) => {
                     tracing::warn!(
                         target: "mux",
                         "MVC track: could not build MVCDecoderConfigurationRecord from the \
@@ -1146,7 +1190,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                         p.len(),
                     );
                 }
-                None => {}
+                (None, None) => {}
             }
 
             // Dolby Vision signaling — BlockAdditionMapping is a child of the
@@ -1295,7 +1339,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         el.extend_from_slice(cp);
         if rest >= 2 {
-            el.extend_from_slice(&ebml::void_element(rest));
+            el.extend_from_slice(&ebml::void_element(rest)?);
         }
         let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(pos))?;
@@ -1795,7 +1839,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 target: "mux",
                 dropped = self.dropped_pre_cluster,
                 frames_written = self.frame_count,
-                "frames were discarded before the first cluster opened (no track-0 video keyframe had arrived yet); they are absent from the output"
+                driver_track = self.primary_video_track.unwrap_or(0),
+                "frames were discarded before the first cluster opened (no keyframe on the cluster-driving track had arrived yet); they are absent from the output"
             );
         }
         // Frames excluded by the playlist's clip marks are dropped on purpose (a join
@@ -1915,7 +1960,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             if !rw.final_interlaced
                 && let Some((fo_off, fo_len)) = rw.field_order_span
             {
-                interlaced_patches.push((fo_off, ebml::void_element(fo_len as usize)));
+                interlaced_patches.push((fo_off, ebml::void_element(fo_len as usize)?));
             }
             tracing::warn!(
                 target: "mux",
@@ -1962,9 +2007,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
             let offset = match fixup.target_id {
                 ebml::INFO => self.info_offset,
                 ebml::TRACKS => self.tracks_offset,
-                ebml::CHAPTERS => self
-                    .chapters_offset
-                    .expect("CHAPTERS seek fixup present => chapters_offset is Some"),
+                // The CHAPTERS entry is reserved only with chapters, which set the offset.
+                ebml::CHAPTERS => match self.chapters_offset {
+                    Some(off) => off,
+                    None => return Err(crate::error::Error::MkvUnencodable.into()),
+                },
                 ebml::CUES => cues_offset,
                 _ => 0,
             };
@@ -3144,10 +3191,10 @@ mod tests {
             max >= tick(600_000),
             "timeline must span past the boundary, got {max} ticks"
         );
-        // And does NOT ratchet far beyond clip1+clip2 (~605s): well under 2× clip1.
+        // And does NOT ratchet beyond clip1+clip2 (~605s), within a 1 s tolerance.
         assert!(
-            max < tick(1_000_000),
-            "no ratchet: max cluster ts {max} ticks must stay near 605s"
+            max < tick(606_000),
+            "no ratchet: max cluster ts {max} ticks must stay within 1 s of 605 s"
         );
     }
 
@@ -3204,8 +3251,8 @@ mod tests {
         // index 0 driving epochs) the lagging-audio straggler ratchets the
         // frontier and inflates the timeline well past this bound.
         assert!(
-            max < tick(1_000_000),
-            "no ratchet: max cluster ts {max} ticks must stay near 605s"
+            max < tick(606_000),
+            "no ratchet: max cluster ts {max} ticks must stay within 1 s of 605 s"
         );
     }
 
@@ -3234,7 +3281,7 @@ mod tests {
         let max = *ts.iter().max().unwrap() as i64;
         assert!(max >= tick(600_000), "timeline spans the seam, got {max}");
         assert!(
-            max < tick(1_000_000),
+            max < tick(606_000),
             "EL straggler must not ratchet the timeline, got {max} ticks"
         );
     }
@@ -3386,18 +3433,12 @@ mod tests {
         let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
 
-        // FlagDefault ID is 0x88. When is_default is true, FlagDefault is NOT written
-        // (MKV default is 1). When is_default is false, FlagDefault=0 IS written.
-        // So we should find at least one FlagDefault element (for the non-default track).
-        let flag_default_id = ebml::FLAG_DEFAULT.to_be_bytes();
-        let _needle = &[flag_default_id[3]]; // 0x88 is a 1-byte ID
-        let count = data.windows(1).filter(|w| w[0] == 0x88).count();
-        // 0x88 appears as FlagDefault + as TrackType (also 0x83... no, 0x83 != 0x88)
-        // FlagDefault (0x88) should appear for the non-default track
-        assert!(
-            count >= 1,
-            "FlagDefault should be written for non-default tracks"
-        );
+        // FlagDefault defaults to 1, so only the non-default third track carries FlagDefault=0.
+        let flags: Vec<Option<u64>> = track_entries(&data)
+            .iter()
+            .map(|&te| child_uint(&data, te, ebml::FLAG_DEFAULT))
+            .collect();
+        assert_eq!(flags, vec![None, None, Some(0)]);
     }
 
     /// Read back the value of the FIRST `Language` element in `data` as a
@@ -3647,27 +3688,34 @@ mod tests {
     #[test]
     fn mkv_forced_flag_on_forced_subtitle() {
         use crate::disc::SubtitleStream;
-        let video = make_video_track();
-        let forced_sub = MkvTrack::subtitle(&SubtitleStream {
-            pid: 0x1200,
-            codec: Codec::Pgs,
-            language: "eng".into(),
-            forced: true,
-            qualifier: crate::disc::LabelQualifier::Forced,
-            codec_data: None,
-        });
-        assert!(forced_sub.is_forced);
-
-        let buf = Cursor::new(Vec::new());
-        let tracks = [video, forced_sub];
-        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
-        let data = muxer.writer.into_inner();
-
-        // FlagForced ID: 0x55AA (2-byte ID)
-        assert!(
-            find_id(&data, ebml::FLAG_FORCED).is_some(),
-            "FlagForced element should be present for forced subtitle track"
-        );
+        // PGS always reserves FlagForced, so the VALUE must carry is_forced; a forced VobSub
+        // writes FlagForced=1 and an unforced one omits it.
+        let sub = |codec, forced| {
+            MkvTrack::subtitle(&SubtitleStream {
+                pid: 0x20,
+                codec,
+                language: "eng".into(),
+                forced,
+                qualifier: crate::disc::LabelQualifier::None,
+                codec_data: None,
+            })
+        };
+        let tracks = [
+            sub(Codec::Pgs, true),
+            sub(Codec::Pgs, false),
+            sub(Codec::DvdSub, true),
+            sub(Codec::DvdSub, false),
+        ];
+        assert!(tracks[0].is_forced);
+        let data = MkvMuxer::new(Cursor::new(Vec::new()), &tracks, None, 60.0, &[])
+            .unwrap()
+            .writer
+            .into_inner();
+        let flags: Vec<Option<u64>> = track_entries(&data)
+            .iter()
+            .map(|&te| child_uint(&data, te, ebml::FLAG_FORCED))
+            .collect();
+        assert_eq!(flags, vec![Some(1), Some(0), Some(1), None]);
     }
 
     #[test]
@@ -4060,6 +4108,27 @@ mod tests {
             .find(|(id, _, _)| *id == ebml::TRACK_ENTRY)
             .expect("TrackEntry present");
         (te_start, te_size as usize)
+    }
+
+    // Every TrackEntry body (start, size), walked through Segment -> Tracks.
+    fn track_entries(data: &[u8]) -> Vec<(usize, usize)> {
+        let (tracks_start, tracks_size) = segment_children(data)
+            .into_iter()
+            .find_map(|(id, off, sz)| (id == ebml::TRACKS).then_some((off, sz as usize)))
+            .expect("Tracks element present");
+        master_children(data, tracks_start, tracks_size)
+            .into_iter()
+            .filter(|(id, _, _)| *id == ebml::TRACK_ENTRY)
+            .map(|(_, off, sz)| (off, sz as usize))
+            .collect()
+    }
+
+    // The uint value of the direct child `id` of a master body, if present.
+    fn child_uint(data: &[u8], (start, size): (usize, usize), id: u32) -> Option<u64> {
+        let (_, off, sz) = master_children(data, start, size)
+            .into_iter()
+            .find(|(cid, _, _)| *cid == id)?;
+        ebml::read_uint_val(&mut Cursor::new(&data[off..]), sz as usize).ok()
     }
 
     /// Find every Cluster: returns Vec<(cluster_data_start_abs, cluster_data_size, cluster_timestamp_ms)>.
@@ -4814,7 +4883,49 @@ mod tests {
             .write_frame(1, 20_000_000, true, &[0xCC; 8], None, None)
             .unwrap();
         let err = muxer.finish().unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Exactly MkvInvalid: the code that marks an empty title as a skippable stub.
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_MKV_INVALID)
+        );
+        assert!(crate::error::is_skippable_title_stub(&err));
+    }
+
+    // A seam plan that drops MORE frames than were written fails SeamPlanDroppedMost; dropping
+    // exactly as many as were written still succeeds.
+    #[test]
+    fn seam_plan_dropping_most_frames_fails_the_mux() {
+        let clip = |id: &str, secs: u32| crate::disc::Clip {
+            feed_span: None,
+            clip_id: id.into(),
+            in_time: secs * 45_000,
+            out_time: (secs + 100) * 45_000,
+            duration_secs: 100.0,
+            source_packets: 0,
+        };
+        let clips = [clip("00000", 100), clip("00001", 200)];
+        let run = |kept: &[i64]| {
+            let mut m = MkvMuxer::new(
+                Cursor::new(Vec::new()),
+                &[make_video_track()],
+                None,
+                100.0,
+                &[],
+            )
+            .unwrap();
+            m.set_clips(&clips, crate::disc::ContentFormat::BdTs);
+            // 0 s and 1 s sit before the first IN mark: both dropped.
+            for pts in [0, 1_000_000_000].iter().chain(kept) {
+                let _ = m.write_frame(0, *pts, true, &[0x01; 16], None, None);
+            }
+            m.finish().map(|_| ())
+        };
+        let e = run(&[150_000_000_000]).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some(crate::error::E_SEAM_PLAN_DROPPED_MOST)
+        );
+        run(&[150_000_000_000, 151_000_000_000]).expect("2 dropped, 2 written");
     }
 
     #[test]
@@ -4825,7 +4936,11 @@ mod tests {
         let tracks = [make_video_track()];
         let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let err = muxer.finish().unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_MKV_INVALID)
+        );
+        assert!(crate::error::is_skippable_title_stub(&err));
     }
 
     // A seam-plan clip list whose marks exclude every frame must fail with `SinkWroteNothing`,
@@ -4892,14 +5007,13 @@ mod tests {
         for t in &ts {
             assert!(*t <= i64::MAX as u64, "cluster ts must not have wrapped");
         }
-        // Every block's relative timestamp stays within the i16 range (no silent
-        // wrap from the 40s back-jump).
-        for (cluster_ts, rel, abs) in all_block_timestamps(&data) {
-            assert!(
-                (MIN_BLOCK_REL..=MAX_BLOCK_REL).contains(&(rel as i64)),
-                "block rel {rel} wrapped i16 (cluster_ts={cluster_ts}, abs={abs})"
-            );
-        }
+        // Every block's cluster ts + i16 rel reconstructs its own pts (0.1 ms ticks): a
+        // wrapped rel from the 40s back-jump would land the audio elsewhere.
+        let abs: Vec<i64> = all_block_timestamps(&data)
+            .iter()
+            .map(|&(_, _, abs)| abs)
+            .collect();
+        assert_eq!(abs, vec![0, 400_000, 0], "video 0 s, video 40 s, audio 0 s");
         // Every cluster carries a Cue (including the back-dated split cluster),
         // so the seek index has no hole.
         assert_eq!(
@@ -5038,6 +5152,37 @@ mod tests {
         assert!(
             rels.contains(&10_000),
             "second block rel ts must be 10_000 ticks"
+        );
+    }
+
+    // Open-GOP B-frames shown before the cluster's keyframe carry a NEGATIVE rel ts, and the
+    // positive i16 edge 32767 stays in the cluster. (A step back past the 3 s discontinuity
+    // threshold is re-based, so -32768 is not reachable for video.)
+    #[test]
+    fn simple_block_rel_ts_negative_and_i16_edge() {
+        let data = mux_with_durations(
+            &[make_video_track()],
+            &[
+                (0, 0, true, vec![0xAA], None),
+                (0, 4_000_000_000, true, vec![0xAB], None), // cluster 2 at 40_000 ticks
+                (0, 3_600_000_000, false, vec![0xAC], None), // -4_000
+                (0, 1_100_000_000, false, vec![0xAD], None), // -29_000
+                (0, 7_276_700_000, false, vec![0xAE], None), // 40_000 + 32_767
+            ],
+        );
+        let second: Vec<(i16, i64)> = all_block_timestamps(&data)
+            .iter()
+            .filter(|&&(c, _, _)| c == 40_000)
+            .map(|&(_, r, a)| (r, a))
+            .collect();
+        assert_eq!(
+            second,
+            vec![
+                (0, 40_000),
+                (-4_000, 36_000),
+                (-29_000, 11_000),
+                (32_767, 72_767)
+            ]
         );
     }
 
@@ -5378,18 +5523,18 @@ mod tests {
     #[test]
     fn keyframe_at_cluster_boundary_opens_new_cluster() {
         let tracks = [make_video_track()];
-        // Keyframe at exactly 3000 ms (>= the 3 s cluster window) → new cluster.
+        // Keyframe at exactly 2000 ms (== the 2 s cluster window) → new cluster.
         let data = mux_with_durations(
             &tracks,
             &[
                 (0, 0, true, vec![0xAA], None),
-                (0, 3_000_000_000, true, vec![0xBB], None),
+                (0, 2_000_000_000, true, vec![0xBB], None),
             ],
         );
         assert_eq!(
             find_clusters(&data).len(),
             2,
-            "keyframe at the 3s boundary must open a second cluster"
+            "keyframe at the 2s boundary must open a second cluster"
         );
     }
 
@@ -7165,5 +7310,222 @@ mod tests {
         let (data, _) = mux_to_bytes(&[make_video_track()], &[], &frames);
         assert!(find_clusters(&data).len() >= 2, "split expected");
         assert_eq!(parse_cues(&data).len(), 1, "only the keyframe is a cue");
+    }
+
+    fn uhd_video(hdr: HdrFormat, color_space: ColorSpace) -> VideoStream {
+        VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: crate::disc::FrameRate::F23_976,
+            hdr,
+            color_space,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }
+    }
+
+    // An SDR BT.2020 UHD title (MPLS dynamic_range 0) is BT.2020-10 transfer, not PQ; only an
+    // HDR format may select PQ/HLG.
+    #[test]
+    fn sdr_bt2020_is_bt2020_transfer_not_pq() {
+        let (m, t, p, _) = cicp_for_video(&uhd_video(HdrFormat::Sdr, ColorSpace::Bt2020));
+        assert_eq!(
+            (m, t, p),
+            (
+                CICP_MATRIX_BT2020NC,
+                CICP_TRANSFER_BT2020_10,
+                CICP_PRIMARIES_BT2020
+            ),
+            "SDR BT.2020 must not be tagged PQ"
+        );
+        assert_eq!(
+            cicp_for_video(&uhd_video(HdrFormat::Hdr10, ColorSpace::Bt2020)).1,
+            CICP_TRANSFER_PQ
+        );
+        assert_eq!(
+            cicp_for_video(&uhd_video(HdrFormat::Hlg, ColorSpace::Bt2020)).1,
+            CICP_TRANSFER_HLG
+        );
+        // Agrees with the enum-only mapping the FVI header documents.
+        let c = crate::mux::videomap::Colour::from_color_space(ColorSpace::Bt2020);
+        assert_eq!(c.transfer, t);
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Cursor<Vec<u8>>>>);
+    impl Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(b)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for SharedBuf {
+        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+            self.0.lock().unwrap().seek(pos)
+        }
+    }
+
+    // A stream whose codec has no Matroska CodecID is left out of the file instead of being
+    // declared A_AC3 / S_HDMV/PGS / V_MPEG2; the mappable tracks keep their frames.
+    #[test]
+    fn mkv_stream_leaves_out_unmappable_codecs() {
+        use crate::pes::Stream as _;
+        let audio = |codec| {
+            crate::disc::Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec,
+                channels: crate::disc::AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: crate::disc::SampleRate::S48,
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: String::new(),
+            })
+        };
+        let sub = |codec| {
+            crate::disc::Stream::Subtitle(SubtitleStream {
+                pid: 0x1200,
+                codec,
+                language: "eng".into(),
+                forced: false,
+                qualifier: crate::disc::LabelQualifier::None,
+                codec_data: None,
+            })
+        };
+        let mut v = uhd_video(HdrFormat::Sdr, ColorSpace::Bt709);
+        v.codec = Codec::H264;
+        let title = crate::disc::DiscTitle {
+            streams: vec![
+                crate::disc::Stream::Video(v),
+                audio(Codec::Unknown(0)),
+                sub(Codec::Srt),
+                audio(Codec::Ac3),
+            ],
+            codec_privates: vec![None; 4],
+            ..crate::disc::DiscTitle::empty()
+        };
+        let out = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Cursor::new(
+            Vec::new(),
+        ))));
+        let mut s = super::super::MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        s.set_track_timing(1, Default::default()).unwrap();
+        for (track, keyframe) in [(0, true), (1, true), (2, true), (3, true)] {
+            s.write(&crate::pes::PesFrame {
+                discard_padding_ns: 0,
+                coding: None,
+                source: None,
+                track,
+                pts: 0,
+                keyframe,
+                data: vec![0x10 + track as u8; 8],
+                duration_ns: None,
+            })
+            .unwrap();
+        }
+        s.finish().unwrap();
+        let bytes = out.0.lock().unwrap().get_ref().clone();
+        let mut back = super::super::MkvStream::open(Cursor::new(bytes)).unwrap();
+        let codecs: Vec<Codec> = (back.info().streams.iter())
+            .map(|s| match s {
+                crate::disc::Stream::Video(v) => v.codec,
+                crate::disc::Stream::Audio(a) => a.codec,
+                crate::disc::Stream::Subtitle(s) => s.codec,
+            })
+            .collect();
+        assert_eq!(
+            codecs,
+            vec![Codec::H264, Codec::Ac3],
+            "only mappable tracks"
+        );
+        let mut got = Vec::new();
+        while let Some(f) = back.read().unwrap() {
+            got.push((f.track, f.data));
+        }
+        assert_eq!(got, vec![(0, vec![0x10; 8]), (1, vec![0x13; 8])]);
+    }
+
+    // dvcC level follows the 2160p frame rate; unknown rate keeps the 2160p24 level.
+    #[test]
+    fn dv_level_follows_the_frame_rate() {
+        use crate::disc::FrameRate as F;
+        for (fr, want) in [
+            (F::F23_976, 6),
+            (F::F24, 6),
+            (F::F25, 7),
+            (F::F29_97, 7),
+            (F::F50, 9),
+            (F::F59_94, 9),
+            (F::Unknown, 6),
+        ] {
+            let mut v = uhd_video(HdrFormat::DolbyVision, ColorSpace::Bt2020);
+            v.frame_rate = fr;
+            let c = MkvTrack::video(&v).dv_config.unwrap();
+            assert_eq!(((c[2] & 1) << 5) | (c[3] >> 3), want, "{fr:?}");
+        }
+    }
+
+    // A huge caller-supplied display aspect must not overflow DisplayWidth; an
+    // unrepresentable width falls back to the pixel grid. DVD 16:9 still widens.
+    #[test]
+    fn display_aspect_overflow_keeps_pixel_grid() {
+        let mut v = uhd_video(HdrFormat::Sdr, ColorSpace::Bt709);
+        v.display_aspect = Some((u32::MAX, 1));
+        let t = MkvTrack::video(&v);
+        assert_eq!((t.display_width, t.display_height), (3840, 2160));
+        v.display_aspect = Some((u32::MAX / 2, u32::MAX / 4));
+        assert_eq!(MkvTrack::video(&v).display_width, 4320, "2:1 of 2160");
+    }
+
+    // The CHAPTERS SeekHead back-patch with no recorded offset is a typed error, not a
+    // panic after the whole mux.
+    #[test]
+    fn chapters_fixup_without_offset_is_an_error() {
+        let ch = [Chapter {
+            time_secs: 0.0,
+            name: "1".into(),
+        }];
+        let mut m = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &ch,
+        )
+        .unwrap();
+        m.write_frame(0, 0, true, &[0x65, 1], None, None).unwrap();
+        m.chapters_offset = None;
+        let e = m.finish().unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some(crate::error::E_MKV_UNENCODABLE)
+        );
+    }
+
+    // Untrusted SPU chains: a 2-node cycle, a next offset past the end, a 0x07 length overrun
+    // and a sub-header SPU all end as None. The cycle runs on a thread with a deadline so an
+    // unbounded walk fails instead of hanging the suite.
+    #[test]
+    fn vobsub_display_ns_rejects_malformed_chains() {
+        // DCSQ A at 4 -> B at 10 -> A, each STA_DSP + CMD_END, no stop.
+        let cycle = vec![0, 16, 0, 4, 0, 0, 0, 10, 0x01, 0xFF, 0, 0, 0, 4, 0x01, 0xFF];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(vobsub_display_ns(&cycle)));
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(got, Ok(None), "2-node cycle must terminate with None");
+        let past_end = [0, 9, 0, 4, 0, 0, 0, 200, 0xFF];
+        assert_eq!(vobsub_display_ns(&past_end), None);
+        let overrun = [0, 12, 0, 4, 0, 0, 0, 4, 0x07, 0xFF, 0xFF, 0x02];
+        assert_eq!(vobsub_display_ns(&overrun), None);
+        assert_eq!(vobsub_display_ns(&[0, 3, 0]), None);
+        // Control: the stop in the SECOND DCSQ is found.
+        let ok = [
+            0, 16, 0, 4, 0, 0, 0, 10, 0x01, 0xFF, 0, 10, 0, 10, 0x02, 0xFF,
+        ];
+        assert_eq!(vobsub_display_ns(&ok), Some(10 * SPU_DELAY_NS));
     }
 }

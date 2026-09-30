@@ -1153,13 +1153,12 @@ mod tests {
         assert!(resolve_with(&keydb, &mkb, &[0x22u8; 16]).is_some());
     }
 
-    // Known-answer vector: FIPS 180 SHA-1("abc").
+    // Known-answer vector: FIPS 180 SHA-1("abc"), as the standard's H0..H4 words.
     #[test]
     fn disc_hash_matches_the_sha1_known_answer() {
-        assert_eq!(
-            disc_hash_hex(&disc_hash(b"abc")),
-            "0xA9993E364706816ABA3E25717850C26C9CD0D89D"
-        );
+        let h: [u32; 5] = [0xA9993E36, 0x4706816A, 0xBA3E2571, 0x7850C26C, 0x9CD0D89D];
+        let want: String = h.iter().map(|w| format!("{w:08X}")).collect();
+        assert_eq!(disc_hash_hex(&disc_hash(b"abc")), format!("0x{want}"));
     }
 
     #[test]

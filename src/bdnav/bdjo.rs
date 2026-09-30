@@ -262,8 +262,8 @@ mod tests {
         initial_class: &'static str,
     }
 
-    // Optional content the minimal fixture leaves empty, laid out per the BDJO
-    // format (libbluray bdjo_parse.c): cache items, accessible playlists, and
+    // Optional content the minimal fixture leaves empty, laid out per the BD-J
+    // Object (BDJO) file format: cache items, accessible playlists, and
     // per-app profiles / application_name bytes / parameter bytes.
     #[derive(Default)]
     struct Extras {
