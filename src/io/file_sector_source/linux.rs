@@ -14,6 +14,7 @@ use std::os::unix::io::AsRawFd;
 pub(crate) fn hint_sequential(file: &File, _len_bytes: u64) {
     // Best-effort: return value ignored. A fadvise failure has no
     // user-observable consequence.
+    // SAFETY: a valid borrowed fd; an advisory call.
     unsafe {
         libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
     }
@@ -23,6 +24,7 @@ pub(crate) fn hint_sequential(file: &File, _len_bytes: u64) {
 /// the page cache. Called periodically by `read_sectors` to bound the
 /// read-side page cache pressure.
 pub(crate) fn drop_window(file: &File, start: u64, len: u64) {
+    // SAFETY: a valid borrowed fd; an advisory call.
     unsafe {
         libc::posix_fadvise(
             file.as_raw_fd(),
@@ -36,6 +38,7 @@ pub(crate) fn drop_window(file: &File, start: u64, len: u64) {
 // Async-prefetch `len` bytes at `offset`: queues readahead(2) without waiting, so the next
 // batch's I/O overlaps current-batch processing.
 pub(crate) fn prefetch(file: &File, offset: u64, len: u64) {
+    // SAFETY: a valid borrowed fd; an advisory call.
     unsafe {
         libc::readahead(file.as_raw_fd(), offset as i64, len as usize);
     }

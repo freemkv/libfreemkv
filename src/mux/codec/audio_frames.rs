@@ -31,7 +31,7 @@ pub(super) struct Header {
 }
 
 /// How a codec's syncframes are recognised without parser side effects.
-pub(super) struct Sync {
+pub(super) struct SyncSpec {
     /// Mask over the byte after 0xFF. Both syncwords are "The bit string '1111 1111 1111'."
     /// ([13818-7 §8.1.1.2], [11172-3 §2.4.2.3]): 0xF0 for ADTS; 0xE0 for MPEG audio, whose
     /// twelfth bit MPEG 2.5 (not ISO) reuses.
@@ -71,7 +71,7 @@ struct Placed {
 /// principle; do not change without a user decision.
 pub(super) struct AudioFrames {
     buf: PesBuf,
-    sync: Sync,
+    sync: SyncSpec,
     framed: bool,
     anchor: Option<i64>,
     next_pts: i64,
@@ -99,7 +99,7 @@ pub(super) struct AudioFrames {
 }
 
 impl AudioFrames {
-    pub fn new(codec: &'static str, sync: Sync) -> Self {
+    pub fn new(codec: &'static str, sync: SyncSpec) -> Self {
         Self {
             buf: PesBuf::with_capacity(8192),
             sync,
@@ -265,7 +265,7 @@ impl AudioFrames {
                 };
                 placed = Some(p);
             }
-            let Some(h) = header(data).filter(|_| chained) else {
+            let Some(h) = chained.then(|| header(data)).flatten() else {
                 self.skip_byte(consumed, sync);
                 consumed += 1;
                 continue;
@@ -393,7 +393,9 @@ impl AudioFrames {
             && r.mid != Some(p)
         {
             if self.holds(r, p) {
-                self.resync.as_mut().unwrap().mid = Some(p);
+                if let Some(r) = self.resync.as_mut() {
+                    r.mid = Some(p);
+                }
             } else {
                 self.settle_run();
                 self.anchor = None;
@@ -697,7 +699,7 @@ mod tests {
     fn drops_after_poison_are_collateral() {
         let mut af = AudioFrames::new(
             "test",
-            Sync {
+            SyncSpec {
                 mask: 0xf0,
                 frame_len: |_| None,
                 fixed: |_| 0,

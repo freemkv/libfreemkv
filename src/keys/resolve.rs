@@ -2,7 +2,7 @@
 
 use super::{
     ArrivalPiece, ForensicState, Inner, KeyResolution, KeyScope, ProofCache, ResolveKeysOptions,
-    ResolvedKeySet,
+    ResolvedKeySet, overlaps,
 };
 use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, decrypt_unit, is_clean};
 use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace};
@@ -27,6 +27,9 @@ const RETRY_CAP: Duration = Duration::from_secs(8);
 const NO_ANSWER_WINDOW: Duration = Duration::from_secs(60);
 /// Encrypted units sent in one per-piece request, at most.
 const SAMPLE_CAP: usize = 32;
+// Most keys taken from one source answer: real discs declare few CPS units; a source cannot
+// flood the pool or starve a later source.
+const MAX_POOL_KEYS: usize = 256;
 
 /// Time for the J13 retry: injected so tests use a fake clock and never sleep.
 pub(crate) trait Clock {
@@ -143,7 +146,10 @@ impl Run<'_> {
 
     // Add keys to the pool (deduplicated): the pool only grows during `resolve`.
     fn add_keys(&mut self, keys: &[[u8; 16]], who: &'static str) {
-        for k in keys {
+        if keys.len() > MAX_POOL_KEYS {
+            tracing::warn!(target: "freemkv::keys", who, "source answer truncated: extra keys ignored");
+        }
+        for k in keys.iter().take(MAX_POOL_KEYS) {
             if !self.pool.contains(k) {
                 self.pool.push(*k);
                 self.origin.push(who);
@@ -322,10 +328,6 @@ fn sorted_ranges(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     out
 }
 
-fn overlaps(a: &[(u32, u32)], s: u32, e: u32) -> bool {
-    a.iter().any(|&(x, y)| x < e && s < y)
-}
-
 // The pieces of `scope`: each content file the scope touches (on its own unit grid, KS-1),
 // minus sectors an earlier file claimed (an SSIF re-lists m2ts sectors), then title extents
 // no file covers (anchored at the extent start).
@@ -353,7 +355,10 @@ fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) ->
     let mut claimed: Vec<(u32, u32)> = Vec::new();
     let mut out = Vec::new();
     let push = |spans: Vec<UnitSpan>, out: &mut Vec<Piece>| {
-        let ranges: Vec<(u32, u32)> = spans.iter().map(|&(s, n, _)| (s, s + n)).collect();
+        let ranges: Vec<(u32, u32)> = spans
+            .iter()
+            .map(|&(s, n, _)| (s, s.saturating_add(n)))
+            .collect();
         let titles = touches(&ranges);
         let rank = titles
             .iter()
@@ -371,7 +376,10 @@ fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) ->
         });
     };
     for file in files {
-        let ends: Vec<(u32, u32)> = file.iter().map(|&(s, n)| (s, s + n)).collect();
+        let ends: Vec<(u32, u32)> = file
+            .iter()
+            .map(|&(s, n)| (s, s.saturating_add(n)))
+            .collect();
         if !whole && touches(&ends).is_empty() {
             continue;
         }
@@ -455,10 +463,18 @@ fn probe(
                     p.enc.push(buf.clone());
                 }
             }
+            // A gone source or a Stop is not a soft fault: report it, not a missing key.
+            Err(e) if fatal_read(&e) => return Err(e),
             _ => p.faults += 1,
         }
     }
     Ok(())
+}
+
+fn fatal_read(e: &Error) -> bool {
+    matches!(e, Error::Halted)
+        || e.is_source_terminated()
+        || (e.is_scsi_transport_failure() && !matches!(e, Error::IoError { .. }))
 }
 
 fn missing_error(scope: &KeyScope, disc: &Disc) -> Error {
@@ -628,7 +644,14 @@ fn resolve_hddvd(
             disc_hash: disc.aacs_disc_hash(),
         });
     }
-    let files = crate::whole_disc::content_files(reader).unwrap_or_default();
+    let files = match crate::whole_disc::content_files(reader) {
+        Ok(f) => f,
+        Err(e) if *scope == KeyScope::WholeDisc => return Err(e),
+        Err(e) => {
+            tracing::warn!(target: "freemkv::keys", error = %e, "no HD DVD file list: keying title extents");
+            Vec::new()
+        }
+    };
     let ps = pieces(disc, &files, sel, *scope == KeyScope::WholeDisc);
     if run.pool.is_empty() {
         let samples = disc.content_samples(reader, MIN_SAMPLE_UNITS);
@@ -684,7 +707,10 @@ fn resolve_bd(
         Some(fs) => match crate::whole_disc::content_files_in(fs, reader) {
             Ok(f) => f,
             Err(e) if *scope == KeyScope::WholeDisc => return Err(e),
-            Err(_) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(target: "freemkv::keys", error = %e, "no file list: keying title extents");
+                Vec::new()
+            }
         },
         None => Vec::new(),
     };
@@ -1000,7 +1026,7 @@ fn build(
                     })
                     .collect();
                 // Base content around the forensic segments keeps the piece's own key (K-3).
-                ranges.extend(crate::mux::resolve::fill_base_key_gaps(
+                ranges.extend(crate::keys::fmts::fill_base_key_gaps(
                     &extents,
                     &seg_ranges,
                     slot,

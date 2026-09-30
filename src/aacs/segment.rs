@@ -16,7 +16,7 @@
 /// Fixed size of one `IndividualSegment.tbl` record.
 pub const SEGMENT_RECORD_LEN: usize = 16;
 /// Bytes per BDAV source packet (188-byte TS + 4-byte arrival-time header).
-pub const SOURCE_PACKET_LEN: u64 = 192;
+pub const SOURCE_PACKET_LEN: u64 = crate::consts::BD_SOURCE_PACKET_BYTES as u64;
 
 /// One forensic segment: the inclusive source-packet range it occupies in the
 /// FMTS clip.
@@ -73,7 +73,7 @@ pub const PACKETS_PER_UNIT: u32 =
 /// byte and this offset lines up with the source-packet grid the segment map
 /// uses.
 pub fn lba_byte_offset(lba: u32) -> u64 {
-    lba as u64 * 2048
+    lba as u64 * crate::consts::SECTOR_BYTES_U64
 }
 
 /// The forensic segment an AACS aligned unit belongs to, if any, given the
@@ -149,8 +149,9 @@ pub fn clip_byte_to_lba(extents: &[crate::disc::Extent], clip_byte: u64) -> Opti
 /// segment are left for the map's default (the Unit Key). A segment straddling a UDF extent
 /// boundary is skipped rather than emitting a wrong span.
 ///
-/// Feeds `AacsKeyMap::from_ranges`
-/// with the Unit-Key index as the default.
+/// Not used by the live FMTS path (`keys::fmts` + `mux::resolve`); kept as a public
+/// helper for callers that build their own key map from the segment table.
+#[doc(hidden)]
 pub fn fmts_key_ranges(
     segments: &[Segment],
     extents: &[crate::disc::Extent],

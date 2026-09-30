@@ -22,13 +22,11 @@ pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 /// Reserve one of `max` recovery-thread slots on `counter`, atomically (no
 /// load-then-add TOCTOU). `false` past the cap, with nothing left reserved.
 pub(crate) fn reserve_recovery_slot(counter: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
-    use std::sync::atomic::Ordering::AcqRel;
-    if counter.fetch_add(1, AcqRel) < max {
-        true
-    } else {
-        counter.fetch_sub(1, AcqRel);
-        false
-    }
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    // CAS loop: a refused reserver never bumps the counter, so it can't starve a fitting one.
+    counter
+        .fetch_update(AcqRel, Acquire, |n| (n < max).then_some(n + 1))
+        .is_ok()
 }
 
 /// Give back a slot taken by [`reserve_recovery_slot`].

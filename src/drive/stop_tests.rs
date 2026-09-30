@@ -84,6 +84,7 @@ fn timing(window: Duration, dead_bus: Duration) -> WaitReadyTiming {
         poll: (window / 120).min(MS(10)),
         window,
         dead_bus,
+        ceiling: Duration::from_secs(600),
     }
 }
 
@@ -146,6 +147,30 @@ fn no_raw_execute_outside_dispatch() {
         1,
         "from_drive only"
     );
+}
+
+/// LD2 (structural): the transport field is touched only by its three known uses in
+/// drive/mod.rs (dispatch, sense progress, max transfer) and by no sibling submodule.
+#[test]
+fn transport_field_is_not_reachable_outside_dispatch() {
+    let count = |src: &str, cut: &str| {
+        let end = src.find(cut).unwrap_or(src.len());
+        src[..end].matches("self.scsi.").count()
+    };
+    let cut = "#[cfg(test)]\nmod halt_tests";
+    assert_eq!(count(include_str!("mod.rs"), cut), 3, "mod.rs");
+    for (name, src) in [
+        ("allow.rs", include_str!("allow.rs")),
+        ("linux.rs", include_str!("linux.rs")),
+        ("macos.rs", include_str!("macos.rs")),
+        ("windows.rs", include_str!("windows.rs")),
+    ] {
+        assert_eq!(
+            count(src, "#[cfg(test)]"),
+            0,
+            "{name} must go through Drive::exec"
+        );
+    }
 }
 
 /// LD3: a READ that completes after a cancel is discarded: `Halted`, not good data.

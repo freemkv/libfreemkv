@@ -1,8 +1,7 @@
-//! Regression tests for Pass N (patch) fix — decrypt key inversion bug.
+//! Decrypt-seam checks behind the Pass N (patch) key inversion fix.
 //!
-//! Tests that decrypt_sectors is invoked correctly when opts.decrypt=true.
-//! The 2026-05-03 bug at `libfreemkv/src/disc/mod.rs:1938-1942` inverted
-//! the decrypt key arms, causing patch to pass DecryptKeys::None on encrypted discs.
+//! The patch pass itself now lives in freemkv-engine, so this file cannot guard the arm
+//! selection; it pins the libfreemkv decrypt seam that pass relies on.
 
 use libfreemkv::{aacs, decrypt::DecryptKeys};
 

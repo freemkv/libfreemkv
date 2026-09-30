@@ -19,10 +19,11 @@ jobs:
   # cannot drift. clippy and `consumers` deliberately run on `stable`.
   resolve-msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -32,8 +33,9 @@ jobs:
   # whose entry isn't written yet is not blocked.
   changelog:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Require a CHANGELOG entry for the crate version on main
         shell: bash
         run: |
@@ -55,8 +57,9 @@ jobs:
   lint:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -64,12 +67,13 @@ jobs:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           components: clippy
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       - run: cargo fmt --check
@@ -80,8 +84,9 @@ jobs:
   test:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -90,10 +95,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       - run: cargo test --tests
+        working-directory: libfreemkv
+      # `--tests` skips doctests; the keys compile_fail doctests enforce spec LK19.
+      - run: cargo test --doc
         working-directory: libfreemkv
 
   # The memory orderings in `scsi::fd_handoff` (and `halt`) compile to the same instructions
@@ -105,10 +113,11 @@ jobs:
   loom:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       RUSTFLAGS: --cfg loom
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -118,7 +127,7 @@ jobs:
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       - run: cargo test --lib --no-default-features --features scsi fd_handoff
@@ -133,15 +142,18 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          toolchain: stable
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories bans licenses sources
           manifest-path: libfreemkv/Cargo.toml
@@ -153,8 +165,9 @@ jobs:
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -163,7 +176,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       - run: cargo check
@@ -173,8 +186,9 @@ jobs:
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -183,7 +197,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       # Build the tests: forces full codegen of the Windows-only SPTI transport
@@ -198,8 +212,9 @@ jobs:
   # engine fixture break the moment it landed, so it stays on the dev fast lane.
   consumers:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { path: libfreemkv }
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
@@ -227,7 +242,9 @@ jobs:
       # satisfies the highest dependent floor (the library's own lower MSRV, which
       # the `test` job verifies, cannot compile them).
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             freemkv-keysources
@@ -249,8 +266,9 @@ jobs:
   coverage:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -260,13 +278,13 @@ jobs:
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@72f835688cb6c15903b796f704b01e652a2b8835 # cargo-llvm-cov
       - run: cargo llvm-cov --workspace --ignore-run-fail --lcov --output-path lcov.info
         working-directory: libfreemkv
-      - uses: codecov/codecov-action@v7
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: libfreemkv/lcov.info

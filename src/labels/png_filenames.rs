@@ -113,6 +113,13 @@ mod tests {
         assert_eq!(filename_lang("Movie_UHD01_Zzz_Composite1.png"), None);
     }
 
+    // A recognised language after the marker still needs the `_Composite` asset suffix.
+    #[test]
+    fn marker_without_composite_suffix_is_none() {
+        assert_eq!(filename_lang("Feature_UHD01_Eng_Background.png"), None);
+        assert_eq!(filename_lang("Feature_UHD01_Eng.png"), None);
+    }
+
     #[test]
     fn dedups_and_numbers_distinct_languages() {
         let names = vec![

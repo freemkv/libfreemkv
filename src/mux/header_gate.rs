@@ -268,4 +268,27 @@ mod tests {
         }));
         assert!(!g.ready(&t, |_| None));
     }
+
+    #[test]
+    fn secondary_video_never_gates() {
+        let mut t = DiscTitle::empty();
+        for (pid, secondary) in [(0x1011, false), (0x1012, true)] {
+            t.streams.push(Stream::Video(crate::disc::VideoStream {
+                pid,
+                codec: Codec::Hevc,
+                resolution: crate::disc::Resolution::R2160p,
+                frame_rate: crate::disc::FrameRate::F23_976,
+                hdr: crate::disc::HdrFormat::Hdr10,
+                color_space: crate::disc::ColorSpace::Bt2020,
+                display_aspect: None,
+                secondary,
+                label: String::new(),
+                measured_cicp: None,
+            }));
+        }
+        let g = HeaderGate::default();
+        // Only the primary's config is awaited; the PiP / DV-EL track has none.
+        assert!(g.ready(&t, |i| (i == 0).then(|| vec![1])));
+        assert!(!g.ready(&t, |i| (i == 1).then(|| vec![1])));
+    }
 }

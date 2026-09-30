@@ -197,13 +197,14 @@ mod tests {
     }
 
     #[test]
-    fn is_disc_source_only_for_disc_and_iso() {
+    fn is_disc_source_only_for_disc_iso_and_dir() {
         // is_disc_source gates the "raw sector copy" path. Per the doc table
-        // only disc:// and iso:// are disc sources; mkv/m2ts/network/etc must
+        // only disc://, iso:// and dir:// are disc sources; mkv/m2ts/network/etc must
         // NOT be (they are container/stream formats, not raw sector media).
         assert!(parse_url("disc://").is_disc_source());
         assert!(parse_url("disc:///dev/sg1").is_disc_source());
         assert!(parse_url("iso://x.iso").is_disc_source());
+        assert!(parse_url("dir://x").is_disc_source());
         assert!(!parse_url("m2ts://x").is_disc_source());
         assert!(!parse_url("mkv://x").is_disc_source());
         assert!(!parse_url("network://h:1").is_disc_source());

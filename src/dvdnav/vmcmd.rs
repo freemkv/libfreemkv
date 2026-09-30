@@ -134,6 +134,8 @@ const TYPE_SET_GPRM: u8 = 3;
 // Special (type 0) sub-commands — `byte1` bits 3-0.
 const SP_GOTO: u8 = 1;
 const SP_BREAK: u8 = 2;
+// SetTmpPML: sets SPRM13 (parental level), then gotos like SP_GOTO when cond holds.
+const SP_SET_TMP_PML: u8 = 3;
 
 // Jump/Call (type 1, direct=1) sub-commands.
 const JP_EXIT: u8 = 1;
@@ -279,7 +281,8 @@ pub(crate) fn decode(b: &[u8; 8]) -> Command {
             _ => Instr::Nop,
         },
         TYPE_SPECIAL => match cmd {
-            SP_GOTO => Instr::Goto { line: b[7] },
+            // No parental model: SPRM13 is not tracked, only the goto is followed.
+            SP_GOTO | SP_SET_TMP_PML => Instr::Goto { line: b[7] },
             SP_BREAK => Instr::Break,
             _ => Instr::Nop,
         },
@@ -325,6 +328,20 @@ mod tests {
             .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
             .collect();
         v.try_into().unwrap()
+    }
+
+    // A set's link flag covers sub-ops 0..=LINKSUB_MAX inclusive; above it, no link.
+    #[test]
+    fn set_link_flag_boundary_at_linksub_max() {
+        assert!(decode(&h("7101000000010010")).link, "sub-op 0x10 is a link");
+        assert!(!decode(&h("7101000000010011")).link, "sub-op 0x11 is not");
+    }
+
+    // Special sub-command 3 (SetTmpPML) sets SPRM13 then gotos byte7 when cond holds.
+    #[test]
+    fn set_tmp_pml_decodes_as_goto() {
+        let c = decode(&h("0003000000000005"));
+        assert_eq!(c.instr, Instr::Goto { line: 5 });
     }
 
     // KATs taken from real-world First-Play command streams.

@@ -443,6 +443,29 @@ fn no_raw_execute_in_drive_or_identity() {
     check("raw transport execute outside Drive::exec", hits, ALLOW);
 }
 
+/// The lowercased receiver token before the atomic op at `i`. Trailing whitespace is
+/// trimmed first, so a rustfmt-wrapped `self.cancel\n    .load(..)` still names `cancel`.
+fn atomic_receiver(code: &str, i: usize) -> String {
+    code[..i]
+        .trim_end()
+        .rsplit(|c: char| c.is_whitespace() || "(&*!,{;=".contains(c))
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+#[test]
+fn atomic_receiver_sees_through_wrapped_chains() {
+    for code in [
+        "if self.cancel.load(x)",
+        "if self.cancel\n        .load(x)",
+        "if self.Cancel  \n\t.load(x)",
+    ] {
+        let recv = atomic_receiver(code, code.find(".load(").unwrap());
+        assert_eq!(recv, "self.cancel", "{code:?}");
+    }
+}
+
 /// §5.8 "A raw-halt-load grep test. Its allow-list: the `from_arc` bridges and the patch
 /// latch." A `Halt`'s flag is read via `check` / `is_cancelled`, never as a raw atomic.
 /// The patch latch is the engine's (§4.2 `EngineHalt`); libfreemkv has none.
@@ -489,11 +512,7 @@ fn no_raw_halt_loads_in_production() {
         }
         for pat in ATOMIC_OPS {
             for i in s.hits(pat) {
-                let recv = s.code[..i]
-                    .rsplit(|c: char| c.is_whitespace() || "(&*!,{;=".contains(c))
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
+                let recv = atomic_receiver(&s.code, i);
                 if recv.contains("halt") || recv.contains("cancel") {
                     hits.push((s, i));
                 }
@@ -535,13 +554,36 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         r#"cfg_attr(not(target_os="linux"),allow(unused_variables))"#,
         1,
     ),
-    ("src/io/sink/mod.rs", r#"allow(dead_code)"#, 1),
     (
         "src/keys/arrival.rs",
         r#"allow(clippy::too_many_arguments)"#,
         1,
     ),
-    ("src/labels/class_reader.rs", r#"allow(dead_code)"#, 2),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="everyJVMS4.4tagisdecoded;labelparsersreadonlysomepayloads")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="parsedinfullperJVMS4.1;labelparsersreadthepoolandmethods")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="parsedinfullperJVMS4.5/4.6")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="parsedperJVMS4.7.3;thedecodertracksonlythestack")"#,
+        1,
+    ),
+    (
+        "src/labels/class_reader.rs",
+        r#"expect(dead_code,reason="payloadsarefaultdetailforDebug;callersmatchthevariant")"#,
+        1,
+    ),
     (
         "src/labels/ctrm.rs",
         r#"allow(clippy::items_after_test_module)"#,
@@ -564,11 +606,9 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     (
         "src/platform/fs_type/linux.rs",
         r#"allow(clippy::unnecessary_cast)"#,
-        3,
+        2,
     ),
-    ("src/platform/fs_type/mod.rs", r#"allow(dead_code)"#, 1),
     ("src/scsi/linux.rs", r#"allow(non_camel_case_types)"#, 1),
-    ("src/scsi/mod.rs", r#"allow(dead_code)"#, 1),
     (
         "src/scsi/mod.rs",
         r#"cfg_attr(not(any(feature="rip",target_os="windows")),allow(dead_code))"#,
@@ -592,7 +632,7 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     (
         "src/scsi/mod.rs",
         r#"cfg_attr(not(target_os="windows"),allow(dead_code))"#,
-        2,
+        3,
     ),
     (
         "src/scsi/mod.rs",
@@ -600,7 +640,6 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         1,
     ),
     ("src/scsi/windows.rs", r#"allow(non_snake_case)"#, 3),
-    ("src/udf.rs", r#"allow(clippy::only_used_in_recursion)"#, 1),
     ("src/udf.rs", r#"allow(clippy::too_many_arguments)"#, 1),
 ];
 

@@ -3,6 +3,8 @@
 //! documented binary format, never executed: every field is bounds-checked and
 //! any malformed input yields `None` (the nav resolver then abstains).
 
+use super::be_u16;
+
 /// One playback/title object in `index.bdmv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlaybackObj {
@@ -29,9 +31,6 @@ const OBJ_LEN: usize = 12;
 /// Sanity cap on the title count (real discs have well under this).
 const MAX_TITLES: usize = 4096;
 
-fn be_u16(d: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?]))
-}
 fn be_u32(d: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_be_bytes([
         *d.get(o)?,
@@ -152,5 +151,24 @@ mod tests {
             parse(&d).is_none(),
             "title count over MAX_TITLES must be rejected"
         );
+    }
+
+    #[test]
+    fn rejects_zero_titles() {
+        let d = build(hdmv_obj(0), bdj_obj(), &[]);
+        assert!(parse(&d).is_none(), "num_titles == 0 must be rejected");
+    }
+
+    #[test]
+    fn unknown_object_types_parse_as_unknown() {
+        let mut none = [0u8; 12]; // object_type 0
+        let mut reserved = [0u8; 12];
+        reserved[0] = 3 << 6; // object_type 3
+        none[0] = 0x3F; // low bits set must not leak into the type
+        let d = build(none, reserved, &[reserved]);
+        let idx = parse(&d).expect("parses");
+        assert_eq!(idx.first_play, PlaybackObj::Unknown);
+        assert_eq!(idx.top_menu, PlaybackObj::Unknown);
+        assert_eq!(idx.titles[0], PlaybackObj::Unknown);
     }
 }

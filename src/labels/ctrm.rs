@@ -7,7 +7,12 @@
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, vocab};
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+// Untrusted-input caps: labels per language_streams, distinct menu_base prefixes,
+// and properties kept per prefix.
+const MAX_CTRM_LABELS: usize = 4096;
+const MAX_PROPS_PER_PREFIX: usize = 64;
 
 /// Cheap signature check: a CTRM disc ships `menu_base.prop` and/or
 /// `language_streams.txt` inside a `/BDMV/JAR/*` archive.
@@ -44,12 +49,16 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 
 fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
     // language_streams has better type/purpose data, menu_base has button names
-    // Match by stream number + type, take name from menu_base
+    // Match by stream number + type, take name from menu_base (first match wins).
+    let mut mb_first: HashMap<(StreamLabelType, u16), &StreamLabel> = HashMap::new();
+    for m in &mb {
+        mb_first
+            .entry((m.stream_type, m.stream_number))
+            .or_insert(m);
+    }
     let mut result = ls;
     for label in &mut result {
-        if let Some(mb_match) = mb
-            .iter()
-            .find(|m| m.stream_type == label.stream_type && m.stream_number == label.stream_number)
+        if let Some(mb_match) = mb_first.get(&(label.stream_type, label.stream_number))
             && label.name.is_empty()
             && !mb_match.name.is_empty()
         {
@@ -59,11 +68,12 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
     // Append menu_base-only streams (present in mb but not in ls by
     // (stream_type, stream_number)); language_streams is authoritative for
     // type/purpose but not necessarily a superset of menu_base.
+    let mut seen: HashSet<(StreamLabelType, u16)> = result
+        .iter()
+        .map(|l| (l.stream_type, l.stream_number))
+        .collect();
     for mb_label in mb {
-        let already = result.iter().any(|l| {
-            l.stream_type == mb_label.stream_type && l.stream_number == mb_label.stream_number
-        });
-        if !already {
+        if seen.insert((mb_label.stream_type, mb_label.stream_number)) {
             result.push(mb_label);
         }
     }
@@ -98,6 +108,9 @@ fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
     let mut labels = Vec::new();
 
     for line in text.lines() {
+        if labels.len() >= MAX_CTRM_LABELS {
+            break;
+        }
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -225,6 +238,59 @@ mod tests {
     /// menu_base.prop body so tests exercise production code directly.
     fn parse_props(text: &str) -> Vec<StreamLabel> {
         parse_menu_base_text(text)
+    }
+
+    #[test]
+    fn menu_base_tie_order_is_deterministic_by_prefix() {
+        // Inserted in reverse; many prefixes so hash order can't match by luck.
+        let mut text = String::new();
+        for i in (0..64).rev() {
+            text.push_str(&format!(
+                "p{i:02}.class=AudioButton\np{i:02}.streamNumber=2\np{i:02}.name=N{i:02}\n"
+            ));
+        }
+        let names: Vec<String> = parse_props(&text).into_iter().map(|l| l.name).collect();
+        let want: Vec<String> = (0..64).map(|i| format!("N{i:02}")).collect();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn menu_base_spaces_around_separator_are_accepted() {
+        let labels = parse_props("audio_1.streamNumber = 3\naudio_1.name = Foo\n");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].stream_number, 3);
+        assert_eq!(labels[0].name, "Foo");
+    }
+
+    #[test]
+    fn parsers_cap_retained_entries() {
+        let mut mb = String::new();
+        let mut ls = String::new();
+        for i in 0..(MAX_CTRM_LABELS + 100) {
+            mb.push_str(&format!("audio_{i}.streamNumber=1\n"));
+            ls.push_str("x,audio_production,1,eng\n");
+        }
+        assert!(parse_menu_base_text(&mb).len() <= MAX_CTRM_LABELS);
+        assert_eq!(parse_language_streams_text(&ls).len(), MAX_CTRM_LABELS);
+    }
+
+    #[test]
+    fn merge_fills_names_and_appends_only_missing() {
+        let mk = |n: u16, name: &str| StreamLabel {
+            stream_id: None,
+            stream_number: n,
+            stream_type: StreamLabelType::Audio,
+            language: String::new(),
+            name: name.into(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: String::new(),
+            variant: String::new(),
+        };
+        let out = merge(vec![mk(1, "")], vec![mk(1, "A"), mk(1, "B"), mk(2, "C")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "A");
+        assert_eq!(out[1].name, "C");
     }
 
     #[test]
@@ -762,7 +828,8 @@ fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<Str
 // Returns labels sorted by (type, number).
 fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
     // Parse key=value, group by prefix
-    let mut entries: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // BTreeMap: deterministic prefix order so equal (type, number) ties sort stably.
+    let mut entries: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -773,16 +840,19 @@ fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
             Some(p) => p,
             None => continue,
         };
-        let full_key = &line[..eq_pos];
-        let value = &line[eq_pos + 1..];
+        let full_key = line[..eq_pos].trim();
+        let value = line[eq_pos + 1..].trim_start();
 
         if let Some(dot_pos) = full_key.rfind('.') {
             let prefix = full_key[..dot_pos].to_string();
             let key = full_key[dot_pos + 1..].to_string();
-            entries
-                .entry(prefix)
-                .or_default()
-                .insert(key, value.to_string());
+            if !entries.contains_key(&prefix) && entries.len() >= MAX_CTRM_LABELS {
+                continue;
+            }
+            let props = entries.entry(prefix).or_default();
+            if props.len() < MAX_PROPS_PER_PREFIX || props.contains_key(&key) {
+                props.insert(key, value.to_string());
+            }
         }
     }
 

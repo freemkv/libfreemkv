@@ -71,6 +71,8 @@ fn resolve_with_budget(
         }
         (budget == 0).then_some(Stop::BudgetSpent)
     });
+    // A full candidate set means later jars were skipped: like a spent budget, abstain.
+    complete &= candidates.len() < MAX_CANDIDATES;
     match stop {
         Some(Stop::Tier1(hint)) => {
             tracing::info!(?hint, "bdj menu-walk: Tier-1 embedded manifest hint");
@@ -384,7 +386,10 @@ fn real_playlist_ids(udf: &UdfFs) -> HashSet<u16> {
             continue;
         }
         let stem = &e.name[..e.name.len() - ".mpls".len()];
-        if let Ok(id) = stem.parse::<u16>() {
+        if stem.len() == 5
+            && stem.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(id) = stem.parse::<u16>()
+        {
             out.insert(id);
         }
     }
@@ -458,6 +463,11 @@ mod tests {
         // 7000 vs 4000 = 1.75x → dominant.
         assert_eq!(
             choose_dominant(&[(800, 7000, 6), (801, 4000, 6)]),
+            Some(800)
+        );
+        // Exactly DOMINANCE_RATIO (1.5x) still counts as dominant.
+        assert_eq!(
+            choose_dominant(&[(800, 6000, 6), (801, 4000, 6)]),
             Some(800)
         );
     }
@@ -730,6 +740,23 @@ mod tests {
         let hint = resolve(&mut disc, &udf, &[]).expect("Tier-2 hint");
         assert_eq!(hint.playlist_id, Some(800));
         assert_eq!(hint.filename.as_deref(), Some("00800.mpls"));
+    }
+
+    #[test]
+    fn tier2_abstains_when_the_candidate_cap_truncates_the_harvest() {
+        // 1100 distinct locators overrun MAX_CANDIDATES: the field is partial, so no hint.
+        let strings: Vec<String> = (0..1100).map(|i| format!("{i:05}.mpls")).collect();
+        let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        let jar = build_jar(&[("com/studio/MainXlet.class", build_class(&refs))]);
+        let (mut disc, udf) = build_disc(
+            vec![
+                ("00800.mpls", build_mpls(7000, 6)),
+                ("00801.mpls", build_mpls(120, 2)),
+            ],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        assert_eq!(resolve(&mut disc, &udf, &[]), None);
     }
 
     #[test]

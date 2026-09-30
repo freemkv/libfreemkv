@@ -43,10 +43,7 @@ pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     if super::jar_file_exists(udf, "dcx.xml") {
         return true;
     }
-    super::jar::for_each_jar(reader, udf, |_, jar| {
-        super::jar::has_path_prefix(jar, "com/foxbd/").then_some(())
-    })
-    .is_some()
+    super::jar::any_jar_has_prefix(reader, udf, "com/foxbd/")
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
@@ -88,6 +85,9 @@ pub(crate) fn labels_from_dcx(text: &str) -> Vec<StreamLabel> {
         .unwrap_or_default()
 }
 
+/// Per-type label cap; dcx.xml is untrusted disc input.
+const MAX_LABELS_PER_TYPE: usize = 512;
+
 // Stream labels from the selected `<playlist name="feature">` element.
 fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
     let mut labels = Vec::new();
@@ -95,6 +95,9 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
     // Audio streams.
     let mut from = 0;
     while let Some((s, e)) = xml::find_element(feature, "audio", from) {
+        if labels.len() >= MAX_LABELS_PER_TYPE {
+            break;
+        }
         let el = &feature[s..e];
         from = e;
         let Some(stream_number) = stream_number_from_id(&xml::attr(el, "id")) else {
@@ -121,7 +124,11 @@ fn labels_from_feature(feature: &str) -> Vec<StreamLabel> {
 
     // Subtitle streams.
     let mut from = 0;
+    let audio_count = labels.len();
     while let Some((s, e)) = xml::find_element(feature, "subtitle", from) {
+        if labels.len() - audio_count >= MAX_LABELS_PER_TYPE {
+            break;
+        }
         let el = &feature[s..e];
         from = e;
         let Some(stream_number) = stream_number_from_id(&xml::attr(el, "id")) else {
@@ -464,6 +471,17 @@ mod tests {
     }
 
     /// `id="NN"` becomes the 1-based STN slot; a missing/zero id names no slot.
+    #[test]
+    fn labels_per_type_are_capped() {
+        let mut f = String::new();
+        for i in 1..=2000 {
+            f.push_str(&format!("<audio id=\"{i}\" lang=\"eng\"/>"));
+            f.push_str(&format!("<subtitle id=\"{i}\" lang=\"eng\"/>"));
+        }
+        let labels = labels_from_feature(&f);
+        assert_eq!(labels.len(), 2 * MAX_LABELS_PER_TYPE);
+    }
+
     #[test]
     fn stream_number_from_id_digits_only() {
         assert_eq!(stream_number_from_id(&Some("01".into())), Some(1));

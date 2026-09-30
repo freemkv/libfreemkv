@@ -70,7 +70,7 @@ pub enum DriveStatus {
 
 // SCSI opcodes used in drive control
 const SCSI_TEST_UNIT_READY: u8 = 0x00;
-const SCSI_START_STOP_UNIT: u8 = 0x1B;
+const SCSI_START_STOP_UNIT: u8 = allow::START_STOP_UNIT;
 /// Idle time the disc sits spun-down during [`Drive::spin_cycle`] before it's
 /// spun back up — long enough for the mechanism's fast-fail wedge state to
 /// clear. Validated at 5–6 s live.
@@ -78,11 +78,11 @@ const SPIN_DOWN_IDLE_SECS: u64 = 5;
 /// Settle time after spin-up in [`Drive::spin_cycle`] before the caller reads
 /// again, so the first post-cycle read doesn't hit a transient NOT_READY.
 const SPIN_UP_SETTLE_SECS: u64 = 10;
-const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
+const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = allow::PREVENT_ALLOW;
 const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
 const SCSI_MODE_SENSE: u8 = 0x5A;
 const SCSI_MODE_SELECT: u8 = 0x55;
-const SCSI_REPORT_KEY: u8 = 0xA4;
+const SCSI_REPORT_KEY: u8 = allow::REPORT_KEY;
 
 // SBC/MMC Read-Write Error Recovery mode page. Flipping PER makes the drive REPORT recovered
 // reads instead of silently returning best-effort GOOD data.
@@ -597,8 +597,9 @@ impl Drive {
     }
 
     /// Wait for the drive to become ready: TEST UNIT READY every 500 ms until it
-    /// answers GOOD. Fails with `DeviceNotReady` only after 60 s without progress
-    /// (§2.11): an answer not yet seen in this wait, or a rising progress indicator.
+    /// answers GOOD. Fails with `DeviceNotReady` after 60 s without progress
+    /// (§2.11): an answer not yet seen in this wait, or a rising progress indicator;
+    /// or after an absolute 10 min ceiling, however much progress it shows.
     /// A Stop interrupts between polls; a dead bus fails after 5 s of failures.
     pub fn wait_ready(&mut self) -> Result<()> {
         self.wait_ready_with(WaitReadyTiming::PRODUCTION)
@@ -610,6 +611,7 @@ impl Drive {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "wait_ready", "begin");
         let mut hb = crate::progress::Heartbeat::new("wait_ready");
+        let ceiling_hit: bool;
         // T6: the answers seen so far and the highest progress indicator; either
         // growing re-arms the no-progress window.
         let moved = Progress::new();
@@ -694,7 +696,9 @@ impl Drive {
                     }
                 }
             }
-            if stall.poll(&moved) == crate::halt::Stall::Expired {
+            let stalled = stall.poll(&moved) == crate::halt::Stall::Expired;
+            if stalled || t0.elapsed() >= timing.ceiling {
+                ceiling_hit = !stalled;
                 break;
             }
             self.pause(timing.poll)?;
@@ -704,7 +708,8 @@ impl Drive {
             phase = "wait_ready",
             elapsed_ms = t0.elapsed().as_millis() as u64,
             window_ms = timing.window.as_millis() as u64,
-            "device never became ready: no progress for the whole window"
+            ceiling_hit,
+            "device never became ready: no progress for the window, or the ceiling was hit"
         );
         Err(Error::DeviceNotReady {
             path: self.device_path.clone(),
@@ -861,12 +866,9 @@ impl Drive {
     /// Initialize drive — drive-prep unlock + init.
     /// Optional. Adds features: removes riplock, enables UHD reads, speed control.
     ///
-    /// The drive-prep (OEM) unlock is required for BD/UHD (AACS) reads,
-    /// but it puts the drive in an extended-access state where stock CSS
-    /// authentication no longer works — so a CSS-protected DVD can't be read.
-    /// For a DVD we therefore SKIP the unlock and run the drive in its normal
-    /// stock mode; the DVD path then issues standard CSS commands, which a stock
-    /// drive honors. BD/UHD and any non-DVD/unknown media keep today's behavior.
+    /// Drive-prep runs for every disc, DVD included: drive features are
+    /// disc-independent, and the AACS/CSS handshakes run later, gated on disc kind.
+    /// A transport fault aborts init; other errors fall through to stock mode.
     pub fn init(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "init", "begin");
@@ -1110,8 +1112,14 @@ impl Drive {
     /// OEM VID through it (VID via the OEM path is decoupled from the host cert +
     /// HRL). This mirrors [`Self::has_profile`] — the honest signal is "an
     /// unlocker claims this drive" — rather than the old const `false`.
-    pub fn is_unlocked(&self) -> bool {
+    pub fn has_unlocker(&self) -> bool {
         crate::unlock_bridge::unlocker_name(&self.drive_id).is_some()
+    }
+
+    /// Deprecated alias of [`Self::has_unlocker`].
+    #[deprecated(note = "use has_unlocker")]
+    pub fn is_unlocked(&self) -> bool {
+        self.has_unlocker()
     }
 
     /// Read sectors from the disc. Single-shot — no inline retries, no
@@ -1286,16 +1294,12 @@ impl Drive {
                 {
                     let len = count as usize * 2048;
                     let offset = lba as i64 * 2048;
-                    // Drop kernel cache for this region so we get
-                    // a fresh device read, not stale page-cache
-                    // data from a prior successful neighbour read.
-                    let _ = unsafe {
-                        libc::posix_fadvise(fd, offset, len as i64, libc::POSIX_FADV_DONTNEED)
-                    };
-                    let n = unsafe {
-                        libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, len, offset)
-                    };
+                    // A Stop that landed since exec's check issues no blocking read.
+                    self.check_token()?;
+                    let n = crate::scsi::linux::pread_uncached(fd, &mut buf[..len], offset);
                     if n == len as isize {
+                        // A Stop during the blocking read discards the data, as `exec` does.
+                        self.check_token()?;
                         tracing::info!(
                             target: "freemkv::drive",
                             lba,
@@ -1427,7 +1431,7 @@ impl Drive {
     pub fn eject(&mut self) -> Result<()> {
         self.unlock_tray();
         // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted".
-        let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
+        let eject_cdb = allow::EJECT_CDB;
         let mut buf = [0u8; 0];
         self.exec(
             &eject_cdb,
@@ -1444,7 +1448,7 @@ impl Drive {
     pub(crate) fn finish_eject(&mut self) -> Result<()> {
         self.unlock_tray();
         // SS-6 MMC-6 Table 633: LoEj 1, Start 0 = "Eject the disc if permitted".
-        let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
+        let eject_cdb = allow::EJECT_CDB;
         let mut buf = [0u8; 0];
         let dir = crate::scsi::DataDirection::None;
         self.exec_cleanup(&eject_cdb, dir, &mut buf, 30_000, CleanupCtx::FinishEject)?;
@@ -1506,7 +1510,7 @@ impl Drop for Drive {
         // SgIoTransport::drop() runs next, calling libc::close(fd)
         #[cfg(target_os = "linux")]
         if let Some(fd) = self.block_dev_fd.take() {
-            unsafe { libc::close(fd) };
+            crate::scsi::linux::close_block_fd(fd);
         }
     }
 }
@@ -1526,14 +1530,7 @@ fn open_block_device_for_sg(sg_path: &Path) -> Option<std::os::unix::io::RawFd> 
         .find_map(|e| e.file_name().into_string().ok())?;
     let block_path = format!("/dev/{}", block_name);
 
-    let mut bytes = block_path.as_bytes().to_vec();
-    bytes.push(0);
-    let fd = unsafe {
-        libc::open(
-            bytes.as_ptr() as *const libc::c_char,
-            libc::O_RDONLY | libc::O_CLOEXEC,
-        )
-    };
+    let fd = crate::scsi::linux::open_block_ro(&block_path);
     if fd < 0 {
         tracing::debug!(
             target: "freemkv::drive",
@@ -1718,6 +1715,9 @@ const WAIT_READY_MAX_EMPTY_POLLS: u32 = 10;
 // first one's completion, before wait_ready calls the bus dead.
 const WAIT_READY_DEAD_BUS_BUDGET: Duration = Duration::from_secs(5);
 
+// Absolute wait_ready ceiling: a drive cycling fresh answers can't re-arm the window forever.
+const WAIT_READY_CEILING: Duration = Duration::from_secs(600);
+
 /// `wait_ready`'s durations (§2.11, T3/T5/T6), parameters so tests run in ms.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WaitReadyTiming {
@@ -1727,6 +1727,8 @@ pub(crate) struct WaitReadyTiming {
     pub window: Duration,
     /// T5: an unbroken run of transport failures this long is a dead bus.
     pub dead_bus: Duration,
+    /// Absolute cap on the whole wait, however the drive's answers vary.
+    pub ceiling: Duration,
 }
 
 impl WaitReadyTiming {
@@ -1735,6 +1737,7 @@ impl WaitReadyTiming {
         poll: Duration::from_millis(500),
         window: Duration::from_secs(60),
         dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+        ceiling: WAIT_READY_CEILING,
     };
 }
 
@@ -3101,6 +3104,18 @@ mod command_tests {
         );
     }
 
+    // An event length too short to hold a Media Event Descriptor means byte 5 is not a
+    // Media Status, even with NEA clear and class Media: fall back to TUR.
+    #[test]
+    fn drive_status_rejects_a_too_short_descriptor_length() {
+        for len in [0u16, 2, 5] {
+            let mut reply = media_event_reply(0x00);
+            reply[0..2].copy_from_slice(&len.to_be_bytes());
+            let mut d = drive_with(reply);
+            assert_eq!(d.drive_status(), DriveStatus::DiscPresent, "len {len}");
+        }
+    }
+
     #[test]
     fn drive_status_short_transfer_falls_back_to_tur() {
         // bytes_transferred < 6 (buffer len 8, payload 4) means the GET EVENT reply
@@ -3318,11 +3333,54 @@ mod command_tests {
             poll: std::time::Duration::from_millis(10),
             window: std::time::Duration::from_millis(300),
             dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+            ceiling: std::time::Duration::from_secs(600),
         });
         assert!(
             matches!(r, Err(Error::DeviceNotReady { .. })),
             "a drive that never answers TUR successfully must be DeviceNotReady, got {r:?}"
         );
+    }
+
+    // A drive that keeps answering with a fresh sense triple every poll re-arms the
+    // no-progress window forever; the absolute ceiling must still end the wait.
+    #[test]
+    fn wait_ready_ceiling_bounds_a_cycling_drive() {
+        struct Cycling(u16);
+        impl ScsiTransport for Cycling {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                self.0 = self.0.wrapping_add(1);
+                let mut sense = [0u8; 32];
+                sense[0] = 0x70;
+                sense[2] = 0x02;
+                sense[12] = (self.0 >> 8) as u8;
+                sense[13] = self.0 as u8;
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: 2,
+                    sense: Some(crate::scsi::ScsiSense {
+                        sense_key: 2,
+                        asc: sense[12],
+                        ascq: sense[13],
+                    }),
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(Cycling(0x0500)));
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready_with(WaitReadyTiming {
+            poll: std::time::Duration::from_millis(5),
+            window: std::time::Duration::from_secs(30),
+            dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+            ceiling: std::time::Duration::from_millis(300),
+        });
+        assert!(matches!(r, Err(Error::DeviceNotReady { .. })), "{r:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
     }
 
     // A dead bus (transport failures in a row) will never spin up, so wait_ready
@@ -4034,20 +4092,67 @@ mod command_tests {
         }
     }
 
+    /// Logs every CDB (unlike `RecordingTransport`, which keeps the last) and answers
+    /// each command with `payload`.
+    struct LogTransport {
+        log: Arc<Mutex<Vec<Vec<u8>>>>,
+        payload: Vec<u8>,
+    }
+    impl ScsiTransport for LogTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.log.lock().unwrap().push(cdb.to_vec());
+            let n = self.payload.len().min(data.len());
+            data[..n].copy_from_slice(&self.payload[..n]);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: n,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn logging(payload: Vec<u8>) -> (Drive, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let t = LogTransport {
+            log: log.clone(),
+            payload,
+        };
+        (Drive::from_transport_for_test(Box::new(t)), log)
+    }
+
     #[test]
     fn eject_unlocks_then_sends_start_stop_with_loej() {
-        let RecordingHarness {
-            drive: mut d,
-            cdb,
-            timeouts: _to,
-        } = recording(TransportOutcome::Ok(0));
+        let (mut d, log) = logging(Vec::new());
         d.eject().unwrap();
-        // The mock only records the LAST cdb; eject's own START STOP UNIT
-        // (with LOEJ=1, byte 4 == 0x02) must be what's left recorded, not
-        // the PREVENT/ALLOW from unlock_tray it calls first.
-        let c = cdb.lock().unwrap();
-        assert_eq!(c[0], SCSI_START_STOP_UNIT);
-        assert_eq!(c[4], 0x02, "START=0, LOEJ=1 -> eject");
+        let log = log.lock().unwrap();
+        let first = &log[0];
+        assert_eq!(first[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL, "unlock first");
+        assert_eq!(first[4], 0x00, "ALLOW");
+        let last = log.last().unwrap();
+        assert_eq!(last[0], SCSI_START_STOP_UNIT);
+        assert_eq!(last[4], 0x02, "START=0, LOEJ=1 -> eject");
+    }
+
+    #[test]
+    fn enable_recovered_error_reporting_sends_mode_select10_with_payload_length() {
+        // 8-byte MODE(10) header, no block descriptor, 12-byte error-recovery page.
+        let mut sense = vec![0u8; 20];
+        sense[1] = 18; // mode data length
+        sense[8] = MODE_PAGE_ERROR_RECOVERY;
+        sense[9] = 0x0A;
+        let (mut d, log) = logging(sense);
+        assert!(d.enable_recovered_error_reporting());
+        let log = log.lock().unwrap();
+        let c = log.last().unwrap();
+        assert_eq!(c[0], SCSI_MODE_SELECT);
+        assert_eq!(c[1], 0x10, "PF=1, SP=0");
+        assert_eq!(&c[7..9], &[0x00, 20], "parameter list length");
     }
 
     /// `SectorSource for Drive` must actually forward to `Drive`'s own

@@ -4,7 +4,7 @@
 //! 13818-3:1994 (lower sampling frequencies, ID '0'). The version field value '00' ("MPEG
 //! 2.5") is a de facto extension that neither standard defines.
 
-use super::audio_frames::{AudioFrames, Header, Sync};
+use super::audio_frames::{AudioFrames, Header, SyncSpec};
 #[cfg(test)]
 use super::pts_to_ns;
 use super::{CodecParser, Frame, PesPacket};
@@ -202,7 +202,7 @@ impl MpegAudioParser {
         Self {
             frames: AudioFrames::new(
                 "mpegaudio",
-                Sync {
+                SyncSpec {
                     mask: 0xe0,
                     frame_len: mpa_frame_len,
                     fixed: mpa_stream_key,
@@ -458,7 +458,9 @@ mod tests {
         let mut data = vec![0xFF, 0xFB, 0x00, 0x00];
         data.extend_from_slice(&free_frame().repeat(3));
         let f = MpegAudioParser::new().parse(&make_pes(data, Some(0)));
-        assert!(f.len() >= 2, "framing proceeds, got {} frames", f.len());
+        // The header 4 bytes in is skipped, so the first frame spans to the one at 304.
+        let sizes: Vec<usize> = f.iter().map(|fr| fr.data.len()).collect();
+        assert_eq!(sizes, [304, 300]);
     }
 
     // The learned size is re-checked against the next header: a new stream after a gap

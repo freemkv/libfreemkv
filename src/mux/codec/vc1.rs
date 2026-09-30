@@ -17,32 +17,32 @@ const SC_FRAME: u8 = 0x0D;
 // Read the advanced-profile sequence header's `INTERLACE` flag (SMPTE 421M §6.1.1), bit 41
 // after the start code. `None` for simple/main profile.
 fn parse_vc1_interlace(sh: &[u8]) -> Option<bool> {
-    if sh.len() < 8 || (sh[4] >> 6) & 0x03 != 3 {
-        return None; // need the start code + advanced profile (PROFILE == 3)
+    // 48 bits; INTERLACE is bit index 41 from the MSB, so 6 from the LSB.
+    Some((vc1_adv_seq_bits(sh, 6)? >> 6) & 1 == 1)
+}
+
+// First `n` (<= 8) de-escaped bytes after the start code of an advanced-profile (PROFILE == 3)
+// sequence header, packed big-endian. VC-1 Annex-B may carry emulation-prevention bytes.
+fn vc1_adv_seq_bits(sh: &[u8], n: usize) -> Option<u64> {
+    if sh.len() <= 4 || (sh[4] >> 6) & 0x03 != 3 {
+        return None;
     }
-    // Collect the first 6 de-escaped bytes (48 bits ≥ the 42 we need).
-    let mut deesc = Vec::with_capacity(6);
+    let mut bits: u64 = 0;
+    let mut got = 0;
     let mut zeros = 0u8;
     for &b in &sh[4..] {
         if zeros >= 2 && b == 0x03 {
             zeros = 0; // drop the emulation-prevention byte
             continue;
         }
-        deesc.push(b);
-        if deesc.len() == 6 {
-            break;
+        bits = (bits << 8) | b as u64;
+        got += 1;
+        if got == n {
+            return Some(bits);
         }
         zeros = if b == 0x00 { zeros + 1 } else { 0 };
     }
-    if deesc.len() < 6 {
-        return None;
-    }
-    let mut bits: u64 = 0;
-    for &b in &deesc {
-        bits = (bits << 8) | b as u64;
-    }
-    // 48 bits; INTERLACE is bit index 41 from the MSB → (48 - 1 - 41) = 6 from LSB.
-    Some((bits >> 6) & 1 == 1)
+    None
 }
 
 // Decode the advanced-profile **progressive** picture PTYPE VLC (SMPTE 421M §7.1.1.4). Only
@@ -137,8 +137,7 @@ fn handle_header(
     first: &mut Option<Vec<u8>>,
     cur: &mut Option<Vec<u8>>,
     unit: &[u8],
-    prefix: &mut Vec<u8>,
-) -> bool {
+) -> Option<Vec<u8>> {
     let is_first = first.is_none();
     if is_first {
         first.replace(unit.to_vec()); // seeds codecPrivate; stripped here
@@ -147,13 +146,11 @@ fn handle_header(
     if changed {
         *cur = Some(unit.to_vec());
     }
-    // Strip the seeding occurrence and any unit that doesn't change the
-    // active header. Emit only a genuine change.
+    // Strip the seeding occurrence and any unit that doesn't change the active header.
     if is_first || !changed {
-        return false;
+        return None;
     }
-    prefix.extend_from_slice(unit);
-    true
+    Some(unit.to_vec())
 }
 
 impl CodecParser for Vc1Parser {
@@ -195,31 +192,20 @@ impl CodecParser for Vc1Parser {
                             self.width = w;
                             self.height = h;
                         }
-                    // Collect into a scratch Vec so handle_header can
-                    // append; we discard the Vec and only keep the flag.
-                    let mut scratch = Vec::new();
-                    let changed = handle_header(
-                        &mut self.seq_header,
-                        &mut self.cur_seq_header,
-                        sh,
-                        &mut scratch,
-                    );
-                    if changed {
-                        redefined_seq = Some(scratch);
+                    if let Some(v) = handle_header(&mut self.seq_header, &mut self.cur_seq_header, sh)
+                    {
+                        redefined_seq = Some(v);
                     }
                     has_seq_header = true;
                 }
                 SC_ENTRY_POINT => {
                     let end = find_start_code(data, pos + 4).unwrap_or(data.len());
-                    let mut scratch = Vec::new();
-                    let changed = handle_header(
+                    if let Some(v) = handle_header(
                         &mut self.entry_point,
                         &mut self.cur_entry_point,
                         &data[pos..end],
-                        &mut scratch,
-                    );
-                    if changed {
-                        redefined_ep = Some(scratch);
+                    ) {
+                        redefined_ep = Some(v);
                     }
                     has_entry_point = true;
                 }
@@ -357,47 +343,9 @@ impl CodecParser for Vc1Parser {
 // Parse width and height from a VC-1 advanced profile sequence header (00 00 01 0F...). Coded
 // dimensions are 12-bit fields.
 fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
-    // sh starts at the start code (00 00 01 0F ...)
-    if sh.len() < 8 {
-        return None;
-    }
-    let byte4 = sh[4]; // first byte after start code
-    let profile = (byte4 >> 6) & 0x03;
-    if profile != 3 {
-        // Simple/Main profile: resolution not in sequence header
-        return None;
-    }
-    // Advanced profile seq-header layout (SMPTE 421M, from sh[4]): PROFILE(2)+
-    // LEVEL(3)+COLORDIFF_FORMAT(2)+FRMRTQ_POSTPROC(3)+BITRTQ_POSTPROC(5)+
-    // POSTPROCFLAG(1)=16 bits, then MAX_CODED_WIDTH(12)+HEIGHT(12) = 40 bits total = 5 bytes.
-    if sh.len() < 9 {
-        return None;
-    }
-    // VC-1 Annex-B EBDU may carry emulation-prevention bytes (0x03 after 00 00).
-    // De-escape before bit extraction so an EP byte doesn't shift subsequent
-    // bits and corrupt MAX_CODED_WIDTH/HEIGHT; collect just the 5 bytes needed.
-    let payload = &sh[4..];
-    let mut deesc = Vec::with_capacity(5);
-    let mut zeros = 0u8;
-    for &b in payload {
-        if zeros >= 2 && b == 0x03 {
-            zeros = 0; // drop the emulation-prevention byte
-            continue;
-        }
-        deesc.push(b);
-        if deesc.len() == 5 {
-            break;
-        }
-        zeros = if b == 0x00 { zeros + 1 } else { 0 };
-    }
-    if deesc.len() < 5 {
-        return None;
-    }
-    // Build a u64 from the 5 de-escaped bytes for easy bit extraction.
-    let mut bits: u64 = 0;
-    for &b in &deesc {
-        bits = (bits << 8) | b as u64;
-    }
+    // Advanced profile layout (SMPTE 421M, from sh[4]): 16 bits of PROFILE..POSTPROCFLAG, then
+    // MAX_CODED_WIDTH(12)+HEIGHT(12) = 40 bits = 5 bytes. Simple/Main carry no resolution.
+    let bits = vc1_adv_seq_bits(sh, 5)?;
     // bits holds 40 significant bits: [16 leading][WIDTH:12][HEIGHT:12], so
     // WIDTH starts 12 bits from the LSB end and HEIGHT occupies the low 12 (shift 0).
     const WIDTH_SHIFT: u64 = 12; // 40 - 16 - 12
@@ -490,6 +438,52 @@ mod tests {
             f[0].coding.is_none(),
             "interlaced VC-1 → coding omitted, never a guessed type"
         );
+    }
+
+    // `with_ps_reorder(true)` (HD-DVD EVO) must INSTALL the reorderer, and `flush()` must drain
+    // the frames it still holds at EOF; without it nothing is buffered.
+    #[test]
+    fn vc1_ps_reorder_is_installed_and_flush_drains_its_frames() {
+        // Progressive advanced-profile header, so PTYPE is measured (I '110', P '0', B '10').
+        let seq = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0];
+        let pic = |ptype: u8| vec![0x00, 0x00, 0x01, SC_FRAME, ptype];
+        let gop = |anchor: i64| {
+            vec![
+                (([&seq[..], &pic(0xC0)]).concat(), Some(anchor)), // I: keyframe anchor
+                (pic(0x00), None),                                 // P
+                (pic(0x80), None),                                 // B
+                (pic(0x00), None),                                 // P
+                (pic(0x80), None),                                 // B
+            ]
+        };
+        let feed = |reorder: bool| -> (Vec<Frame>, Vec<Frame>) {
+            let mut p = Vc1Parser::new().with_ps_reorder(reorder);
+            let mut during = Vec::new();
+            // Two GOPs; the second anchor is 5 frames later (90 kHz: 5 x 3750).
+            for (data, pts) in gop(0).into_iter().chain(gop(18_750)) {
+                during.extend(p.parse(&make_pes(data, pts)));
+            }
+            let tail = p.flush();
+            (during, tail)
+        };
+
+        let (during, tail) = feed(true);
+        assert!(
+            !tail.is_empty(),
+            "the reorderer holds frames; flush releases them"
+        );
+        assert!(tail.iter().all(|f| !f.data.is_empty()), "real coded bytes");
+        let mut pts: Vec<i64> = during.iter().chain(&tail).map(|f| f.pts_ns).collect();
+        assert_eq!(pts.len(), 10, "every access unit is emitted exactly once");
+        pts.sort_unstable();
+        pts.dedup();
+        assert_eq!(pts.len(), 10, "reconstructed PTS are all distinct");
+
+        // Off: nothing is buffered, and the sparse-PTS frames collide on the anchor's 0.
+        let (raw_during, raw_tail) = feed(false);
+        assert!(raw_tail.is_empty(), "no reorderer installed");
+        assert_eq!(raw_during.len(), 10);
+        assert!(raw_during.iter().filter(|f| f.pts_ns == 0).count() >= 4);
     }
 
     /// Build a VC-1 PES with sequence header + entry point + frame start code.

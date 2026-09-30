@@ -132,6 +132,19 @@ impl SgIoTransport {
         }
     }
 
+    // `open_fd` for the reopen after a transport failure; a failure is logged.
+    fn reopen_fd(device: &Path) -> i32 {
+        let fd = Self::open_fd(device);
+        if fd < 0 {
+            tracing::warn!(
+                target: "freemkv::scsi",
+                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                "reopen after transport failure failed"
+            );
+        }
+        fd
+    }
+
     // Map errno from a failed open(): permission-denied -> DevicePermission,
     // else DeviceNotFound. Path carried in the error; no English text (app
     // layer localizes).
@@ -360,7 +373,7 @@ impl ScsiTransport for SgIoTransport {
         hdr.dxferp = data.as_mut_ptr();
         hdr.cmdp = cdb.as_ptr();
         hdr.sbp = sense.as_mut_ptr();
-        hdr.timeout = timeout_ms;
+        hdr.timeout = super::effective_timeout_ms(timeout_ms);
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
         // The single blocking syscall: returns on response, kernel timeout,
@@ -411,59 +424,50 @@ impl ScsiTransport for SgIoTransport {
             let dead = self.dead.clone();
 
             // Cap outstanding recovery threads (past MAX a sustained wedge spawns
-            // unbounded threads); the atomic reservation lives in `fd_handoff`.
-            if reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS) {
-                std::thread::spawn(move || {
+            // unbounded threads); the atomic reservation lives in `fd_handoff`. A
+            // failed spawn (resource limit) gives the slot back and works inline.
+            let closed_async = reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS) && {
+                let spawned = std::thread::Builder::new().spawn(move || {
                     if old_fd >= 0 {
                         unsafe { libc::close(old_fd) };
                     }
                     release_recovery_slot(&RECOVERY_THREADS);
                 });
-            } else if old_fd >= 0 {
+                if spawned.is_err() {
+                    release_recovery_slot(&RECOVERY_THREADS);
+                }
+                spawned.is_ok()
+            };
+            if !closed_async && old_fd >= 0 {
                 unsafe { libc::close(old_fd) };
             }
 
-            if reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS) {
-                std::thread::spawn(move || {
-                    // Don't unwrap: a device path with an interior NUL would
-                    // panic this detached thread (silently swallowed). Bail
-                    // and leave fd_recovery untouched instead.
-                    let c_path = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            release_recovery_slot(&RECOVERY_THREADS);
-                            return;
+            let reopened_async = reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS)
+                && {
+                    let thread_path = path.clone();
+                    let spawned = std::thread::Builder::new().spawn(move || {
+                        let new_fd = Self::reopen_fd(&thread_path);
+                        if new_fd >= 0 {
+                            // Hand the fd to the transport. Comes back to us only if
+                            // nobody there will ever close it: another recovery thread
+                            // won the slot, or Drop already tore the transport down.
+                            if let Some(orphan) = publish_recovered_fd(&recovery, &dead, new_fd) {
+                                unsafe { libc::close(orphan) };
+                            }
                         }
-                    };
-                    let new_fd = unsafe {
-                        libc::open(
-                            c_path.as_ptr() as *const libc::c_char,
-                            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                        )
-                    };
-                    if new_fd >= 0 {
-                        // Hand the fd to the transport. Comes back to us only if
-                        // nobody there will ever close it: another recovery thread
-                        // won the slot, or Drop already tore the transport down.
-                        if let Some(orphan) = publish_recovered_fd(&recovery, &dead, new_fd) {
-                            unsafe { libc::close(orphan) };
-                        }
+                        release_recovery_slot(&RECOVERY_THREADS);
+                    });
+                    if spawned.is_err() {
+                        release_recovery_slot(&RECOVERY_THREADS);
                     }
-                    release_recovery_slot(&RECOVERY_THREADS);
-                });
-            } else {
-                // Over the cap: reopen inline (blocking this call briefly)
-                // instead of spawning a 9th thread.
-                if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-                    let new_fd = unsafe {
-                        libc::open(
-                            c_path.as_ptr() as *const libc::c_char,
-                            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                        )
-                    };
-                    if new_fd >= 0 {
-                        self.fd = new_fd;
-                    }
+                    spawned.is_ok()
+                };
+            if !reopened_async {
+                // Over the cap or no thread: reopen inline (blocking this call
+                // briefly); a failure leaves fd < 0 (DeviceNotFound from then on).
+                let new_fd = Self::reopen_fd(&path);
+                if new_fd >= 0 {
+                    self.fd = new_fd;
                 }
             }
 
@@ -478,23 +482,24 @@ impl ScsiTransport for SgIoTransport {
         // Parse the full SPC-4 sense triple so callers can route on
         // `ScsiSense::is_medium_error()` etc.
         if hdr.status != 0 {
-            let parsed = super::parse_sense(&sense, hdr.sb_len_wr);
-            self.last_progress = super::parse_sense_progress(&sense, hdr.sb_len_wr);
+            let parsed = super::sense_for_status(hdr.status, &sense, hdr.sb_len_wr);
+            self.last_progress =
+                parsed.and_then(|_| super::parse_sense_progress(&sense, hdr.sb_len_wr));
             tracing::trace!(
                 target: "freemkv::scsi",
                 phase = "scsi_err",
                 opcode = opcode,
                 status = hdr.status,
-                sense_key = parsed.sense_key,
-                asc = parsed.asc,
-                ascq = parsed.ascq,
+                sense_key = parsed.map_or(0, |s| s.sense_key),
+                asc = parsed.map_or(0, |s| s.asc),
+                ascq = parsed.map_or(0, |s| s.ascq),
                 exec_elapsed_ms,
                 "SCSI status non-zero"
             );
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: hdr.status,
-                sense: Some(parsed),
+                sense: parsed,
             });
         }
 
@@ -663,6 +668,34 @@ pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
 
 // After a transport failure the fd is reopened in the background and the next
 // execute() adopts it. Needs a real device: FREEMKV_TEST_SG_DEVICE (default sg2).
+/// Open a block device read-only (no O_DIRECT). Negative on failure.
+pub(crate) fn open_block_ro(path: &str) -> i32 {
+    let mut bytes = path.as_bytes().to_vec();
+    bytes.push(0);
+    // SAFETY: bytes is NUL-terminated and outlives the call.
+    unsafe {
+        libc::open(
+            bytes.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    }
+}
+
+/// Close a block fd opened by [`open_block_ro`]; the caller must not reuse it.
+pub(crate) fn close_block_fd(fd: i32) {
+    // SAFETY: the caller owns fd and passes it here exactly once.
+    unsafe { libc::close(fd) };
+}
+
+/// Drop the page cache for the range, then `pread` into `buf` at `offset`.
+/// Returns the byte count, or a negative value on error (errno set).
+pub(crate) fn pread_uncached(fd: i32, buf: &mut [u8], offset: i64) -> isize {
+    // SAFETY: fd is a live block fd; fadvise passes no pointers.
+    let _ = unsafe { libc::posix_fadvise(fd, offset, buf.len() as i64, libc::POSIX_FADV_DONTNEED) };
+    // SAFETY: buf is a valid writable slice of buf.len() bytes.
+    unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), offset) }
+}
+
 #[cfg(test)]
 mod recovery_device_tests {
     use super::*;

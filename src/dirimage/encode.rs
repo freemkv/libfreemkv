@@ -136,7 +136,7 @@ fn put_domain_id(buf: &mut [u8]) {
 /// OSTA CS0 d-string: a compression-ID byte, the characters, then the used
 /// length in the FIELD'S LAST byte (ECMA-167 1/7.2.12 + UDF 2.1.3). An
 /// all-zero field is the empty string.
-fn put_dstring(buf: &mut [u8], s: &str) {
+pub(super) fn put_dstring(buf: &mut [u8], s: &str) {
     if s.is_empty() {
         return;
     }
@@ -406,7 +406,7 @@ fn file_entry(
     s[24..26].copy_from_slice(&1u16.to_le_bytes()); // max number of entries
     s[27] = if is_dir { 4 } else { 5 }; // file type: directory / byte sequence
     // s[28..34] parent ICB location: not recorded (permitted).
-    // s[34..36] ICB flags: 0 => short allocation descriptors. `udf.rs:601`
+    // s[34..36] ICB flags: 0 => short allocation descriptors. `udf::read_filesystem`
     // reads exactly this word to pick its AD stride.
     s[34..36].copy_from_slice(&0u16.to_le_bytes());
     // UDF's sentinel for "not specified" is 0xFFFFFFFF, not 0 — 0 is a real
@@ -653,7 +653,6 @@ mod tests {
     #[test]
     fn crc16_matches_the_ecma167_check_value() {
         assert_eq!(crc16(b"123456789"), 0x31C3);
-        assert_ne!(crc16(b"123456789"), 0x29B1, "not the 0xFFFF-seeded variant");
     }
 
     /// ECMA-167 3/7.2.3: the checksum is the sum of the tag's first 16 bytes
@@ -681,7 +680,7 @@ mod tests {
     }
 
     /// ASCII takes compression ID 8; anything above takes 16 (UTF-16BE),
-    /// because `parse_udf_name` decodes compression-8 bytes as UTF-8.
+    /// because `parse_udf_name` decodes compression-8 bytes as Latin-1.
     #[test]
     fn cs0_picks_the_encoding_the_parser_can_decode() {
         assert_eq!(encode_cs0("AB"), vec![8, b'A', b'B']);

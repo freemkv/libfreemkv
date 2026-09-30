@@ -13,6 +13,7 @@ use super::{
 };
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
+use std::collections::HashSet;
 
 /// True iff `/BDMV/PLAYLIST/` exists and contains at least one
 /// `.mpls` file. Cheap directory walk only — no sector reads.
@@ -27,7 +28,7 @@ pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
 
 /// Walk every `*.mpls` in `/BDMV/PLAYLIST/`, parse it, and convert
 /// each StreamEntry to a [`StreamLabel`]. Streams shared across
-/// playlists (same PID) are deduped.
+/// playlists (same clip and PID) are deduped.
 ///
 /// Returns `None` if no labels could be produced (e.g. no .mpls files
 /// parsed successfully, or every parsed stream was a type we skip
@@ -48,7 +49,10 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         return None;
     }
 
-    let mut playlists: Vec<crate::mpls::Playlist> = Vec::new();
+    // Labels are built per playlist and each Playlist dropped, so a crafted
+    // directory of huge playlists never holds more than one in memory.
+    let mut labels: Vec<StreamLabel> = Vec::new();
+    let mut seen: HashSet<super::StreamId> = HashSet::new();
     for name in &mpls_names {
         let path = format!("/BDMV/PLAYLIST/{}", name);
         let Ok(data) = udf.read_file(reader, &path) else {
@@ -57,10 +61,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         let Ok(playlist) = crate::mpls::parse(&data) else {
             continue;
         };
-        playlists.push(playlist);
+        add_playlist_labels(&playlist, &mut labels, &mut seen);
     }
 
-    let labels = build_labels(&playlists);
     if labels.is_empty() {
         return None;
     }
@@ -72,17 +75,27 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 }
 
 // Converts stream entries into StreamLabels; identity is (clip, PID).
+#[cfg(test)]
 fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
-    use std::collections::HashSet;
     let mut labels: Vec<StreamLabel> = Vec::new();
     let mut seen: HashSet<super::StreamId> = HashSet::new();
-
     for playlist in playlists {
+        add_playlist_labels(playlist, &mut labels, &mut seen);
+    }
+    labels
+}
+
+fn add_playlist_labels(
+    playlist: &crate::mpls::Playlist,
+    labels: &mut Vec<StreamLabel>,
+    seen: &mut HashSet<super::StreamId>,
+) {
+    {
         // `Playlist::streams` is the FIRST play item's STN table, so every entry
         // here is a stream of that play item's clip, matching `disc::bluray`'s
         // `clips[0]` — that pairing is what makes the PID an identity.
         let Some(clip_id) = playlist.play_items.first().map(|pi| pi.clip_id.clone()) else {
-            continue;
+            return;
         };
 
         // 1-based STN slot within THIS playlist's table, per type — matches how
@@ -131,7 +144,6 @@ fn build_labels(playlists: &[crate::mpls::Playlist]) -> Vec<StreamLabel> {
             });
         }
     }
-    labels
 }
 
 // Per-type numbering list an STN entry belongs to, or None if unlabellable. MUST agree with
@@ -266,7 +278,7 @@ fn build_codec_hint(label_type: StreamLabelType, entry: &crate::mpls::StreamEntr
         1 => Some("mono"),
         3 => Some("2.0"),
         6 => Some("5.1"),
-        12 => Some("7.1"),
+        // 12 is the BD "combo" type (stereo core + extension), not 7.1: state no channels.
         _ => None,
     };
     if let Some(ch) = channels {
@@ -355,7 +367,7 @@ mod tests {
 
     #[test]
     fn mpls_audio_streams_become_labels() {
-        // Two audio streams: English TrueHD 7.1 48k, French AC-3 5.1 48k.
+        // Two audio streams: English TrueHD combo 48k, French AC-3 5.1 48k.
         let pl = playlist_with(vec![
             audio_entry(0x1100, 0x83, 12, 1, "eng"),
             audio_entry(0x1101, 0x81, 6, 1, "fra"),
@@ -363,13 +375,13 @@ mod tests {
         let labels = labels_from_playlists(&[pl]);
         assert_eq!(labels.len(), 2);
 
-        // English TrueHD 7.1
+        // English TrueHD
         let a = &labels[0];
         assert_eq!(a.stream_type, StreamLabelType::Audio);
         assert_eq!(a.stream_number, 1);
         assert_eq!(a.language, "eng");
         assert_eq!(a.name, "English");
-        assert_eq!(a.codec_hint, "TrueHD 7.1");
+        assert_eq!(a.codec_hint, "TrueHD");
         assert_eq!(a.purpose, LabelPurpose::Normal);
         assert_eq!(a.qualifier, LabelQualifier::None);
         assert_eq!(a.variant, "");
@@ -610,7 +622,8 @@ mod tests {
         );
         assert_eq!(
             build_codec_hint(StreamLabelType::Audio, &surround_71),
-            "TrueHD 7.1"
+            "TrueHD",
+            "12 is the combo type, not 7.1: no channel suffix"
         );
         assert_eq!(build_codec_hint(StreamLabelType::Audio, &unknown), "TrueHD");
     }
@@ -751,10 +764,10 @@ mod tests {
     fn build_codec_hint_48k_omitted_96k_shown() {
         let e48 = audio_entry(1, 0x83, 12, 1, "eng");
         let e96 = audio_entry(2, 0x83, 12, 4, "eng");
-        assert_eq!(build_codec_hint(StreamLabelType::Audio, &e48), "TrueHD 7.1");
+        assert_eq!(build_codec_hint(StreamLabelType::Audio, &e48), "TrueHD");
         assert_eq!(
             build_codec_hint(StreamLabelType::Audio, &e96),
-            "TrueHD 7.1 96kHz"
+            "TrueHD 96kHz"
         );
     }
 
@@ -796,12 +809,9 @@ mod tests {
     /// Mutation: skip lowercase normalization → "ENG" stays "ENG" in the label.
     #[test]
     fn normalize_language_lowercases_and_trims() {
-        assert_eq!(
-            // trim + lowercase, mirroring production normalize_language
-            super::super::mpls_universal::language_display_name(
-                &"  ENG  ".trim().to_ascii_lowercase(),
-            ),
-            "English"
-        );
+        assert_eq!(normalize_language("  ENG  "), "eng");
+        assert_eq!(normalize_language("   "), "");
+        // An unknown code keeps its trimmed lowercase form.
+        assert_eq!(normalize_language(" XYZ "), "xyz");
     }
 }

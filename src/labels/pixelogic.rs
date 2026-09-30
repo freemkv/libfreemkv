@@ -84,9 +84,8 @@ pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     let data = super::read_jar_file(reader, udf, "bluray_project.bin")?;
-    // min_len=4 matches the prior local extract_strings impl. The token
-    // grammar is `{lang3}_{codec?}_{purpose?}_{region?}_` so the
-    // shortest meaningful run is 4 chars (lang + underscore).
+    // The token grammar is `{lang3}_{codec?}_{purpose?}_{region?}_` so the
+    // shortest meaningful run is 4 chars (lang + underscore). The extractor caps run count (untrusted blob).
     let strings = text::extract_ascii_strings(&data, 4);
 
     // Collects uncatalogued token components; if any, confidence downgrades to Medium
@@ -376,8 +375,6 @@ fn parse_token_inner(s: &str, mut unknown: Option<&mut UnknownParts>) -> Option<
         variant,
     })
 }
-
-// extract_strings removed — replaced by super::text::extract_ascii_strings(data, 4).
 
 #[cfg(test)]
 mod tests {

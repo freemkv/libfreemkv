@@ -536,11 +536,11 @@ impl TimelineContinuity {
         let prev_raw = self.last_raw_ns[track].replace(raw_pts_ns);
         // Monotonic epoch identity, NOT epoch_offsets.len() (which is capped at
         // MAX_EPOCHS and would stop distinguishing epochs past the cap).
-        let retired = self.epoch_seq;
+        let current_seq = self.epoch_seq;
 
         // A provisional only survives until the video opens the epoch for real.
         if let Some((taken_at, _)) = self.provisional[track]
-            && taken_at != retired
+            && taken_at != current_seq
         {
             self.provisional[track] = None;
         }
@@ -557,7 +557,7 @@ impl TimelineContinuity {
                     .saturating_sub(mapped)
                     .saturating_add(DISCONTINUITY_GAP_NS);
                 let off = effective.saturating_add(off);
-                self.provisional[track] = Some((retired, off));
+                self.provisional[track] = Some((current_seq, off));
                 return off;
             }
         }

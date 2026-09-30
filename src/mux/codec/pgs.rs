@@ -201,6 +201,8 @@ pub struct PgsParser {
     /// (L026). Always 0 when `pending` doesn't hold a clear set; reset
     /// whenever `pending` is assigned a fresh set.
     clear_scan_offset: usize,
+    /// A gap was seen: discard segments until the next PCS starts a display set.
+    skip_to_pcs: bool,
     /// Test-only: total iterations of the `complete_clear_pts` walk loop,
     /// proving the walk stays O(n) in the number of appends rather than
     /// O(n^2) (L026).
@@ -220,9 +222,24 @@ impl PgsParser {
         Self {
             pending: None,
             clear_scan_offset: 0,
+            skip_to_pcs: false,
             #[cfg(test)]
             scan_steps: 0,
         }
+    }
+
+    /// True when `data` is whole segments ending in END.
+    fn ends_with_end(data: &[u8]) -> bool {
+        let (mut off, mut last) = (0, 0);
+        while data.len() - off >= 3 {
+            let size = 3 + usize::from(u16::from_be_bytes([data[off + 1], data[off + 2]]));
+            if off + size > data.len() {
+                return false;
+            }
+            last = data[off];
+            off += size;
+        }
+        off == data.len() && last == SEGMENT_END
     }
 
     fn is_clear(data: &[u8]) -> bool {
@@ -332,15 +349,11 @@ impl CodecParser for PgsParser {
             // packets that lose timing when display sets are merged.
             Some(_) => match pts {
                 Some(start) => {
+                    self.skip_to_pcs = false;
                     out.extend(self.emit_pending(Some(start)));
                     // The set's facts are THIS packet's — the one that opened
                     // it. `start` is that packet's PTS by construction.
                     self.pending = Some((super::pesbuf::PesFacts::of(pes), pes.data.clone()));
-                    debug_assert_eq!(
-                        super::pesbuf::PesFacts::of(pes).presentation_ns(),
-                        Some(start),
-                        "the opening packet's PTS is the set's start"
-                    );
                 }
                 // A PCS with no PTS has an unknown start time. Don't
                 // store it with a 0 sentinel (wrong start, absurd duration).
@@ -353,6 +366,22 @@ impl CodecParser for PgsParser {
             // current display set, or non-standard layout. If we have
             // a pending display, append; otherwise emit as-is.
             None => {
+                // A gap: emit a complete held set (the lost PCS would have closed
+                // it), drop a truncated one, and skip orphans up to the next PCS.
+                if pes.discontinuity {
+                    if self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|(_, d)| Self::ends_with_end(d))
+                    {
+                        out.extend(self.emit_pending(None));
+                    }
+                    self.pending = None;
+                    self.skip_to_pcs = true;
+                }
+                if self.skip_to_pcs {
+                    return out;
+                }
                 if let Some((_, ref mut buf)) = self.pending {
                     // Bound accumulation: a well-formed display set is small.
                     // Past the cap, drop further appends (malformed stream);
@@ -360,7 +389,7 @@ impl CodecParser for PgsParser {
                     if buf.len() + pes.data.len() <= MAX_PGS_PENDING_BYTES {
                         buf.extend_from_slice(&pes.data);
                     }
-                } else if pes.pts.is_some() {
+                } else if let Some(pts_ns) = pts {
                     // A lone non-PCS segment with a real PTS — pass it through.
                     // (A missing PTS falls through to the drop path below: a
                     // bitmap with no timing reference would land at 00:00:00.)
@@ -371,7 +400,7 @@ impl CodecParser for PgsParser {
                         // this packet's -- the same rule as a pending set,
                         // which takes the facts of the packet that opened it.
                         source: super::pesbuf::PesFacts::of(pes).source,
-                        pts_ns: pts.unwrap_or(0),
+                        pts_ns,
                         keyframe: true,
                         data: pes.data.clone(),
                         duration_ns: Some(DEFAULT_PGS_DURATION_NS),
@@ -441,6 +470,19 @@ mod tests {
         // Truncated (no flags byte) → None, no panic.
         assert_eq!(display_set_is_forced(&pcs_display(true)[..15]), None);
         assert_eq!(display_set_is_forced(&[]), None);
+    }
+
+    // One non-forced display set anywhere settles the track as not forced, even when the LAST
+    // set is forced.
+    #[test]
+    fn a_forced_last_display_set_does_not_make_a_mixed_track_forced() {
+        let mut t = ForcedTracker::new();
+        for forced in [true, false, true] {
+            t.observe(&pcs_display(forced));
+        }
+        assert!(!t.is_forced());
+        assert!(t.settled_not_forced());
+        assert_eq!(t.facts().forced_displays, 2);
     }
 
     // `observed()` distinguishes "unknown" (leave the vendor flag alone) from a settled
@@ -538,6 +580,58 @@ mod tests {
         assert_eq!(frames.len(), 1);
         let data = &frames[0].data;
         assert!(data.windows(5).any(|w| w == [0x15, 0x00, 0x02, 0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn post_gap_segment_is_not_spliced_onto_pending_set() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let mut pes = make_pes(vec![0x15, 0x00, 0x02, 0xAA, 0xBB], None);
+        pes.discontinuity = true;
+        assert!(parser.parse(&pes).is_empty());
+        assert!(parser.flush().is_empty(), "the truncated set is dropped");
+    }
+
+    #[test]
+    fn post_gap_pts_segments_are_skipped_until_next_pcs() {
+        // Complete pending set (PCS + END) survives the gap; the PTS-bearing
+        // post-gap orphans are dropped up to the next PCS.
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let _ = parser.parse(&make_pes(vec![0x80, 0x00, 0x00], Some(90000)));
+        let mut gap = make_pes(vec![0x15, 0x00, 0x02, 0xAA, 0xBB], Some(180000));
+        gap.discontinuity = true;
+        let out = parser.parse(&gap);
+        assert_eq!(out.len(), 1, "complete held subtitle is emitted");
+        assert_eq!(out[0].duration_ns, Some(DEFAULT_PGS_DURATION_NS));
+        assert!(
+            parser
+                .parse(&make_pes(vec![0x80, 0x00, 0x00], Some(180000)))
+                .is_empty()
+        );
+        assert!(
+            parser
+                .parse(&make_pes(pcs_bytes(1), Some(270000)))
+                .is_empty()
+        );
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].pts_ns, 3_000_000_000);
+    }
+
+    #[test]
+    fn post_gap_pts_segments_drop_incomplete_pending() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let mut gap = make_pes(vec![0x15, 0x00, 0x02, 0xAA, 0xBB], Some(180000));
+        gap.discontinuity = true;
+        assert!(parser.parse(&gap).is_empty());
+        assert!(
+            parser
+                .parse(&make_pes(vec![0x80, 0x00, 0x00], Some(180000)))
+                .is_empty()
+        );
+        assert!(parser.flush().is_empty());
     }
 
     #[test]
@@ -922,6 +1016,16 @@ mod tests {
             demotable(facts(DEMOTE_MIN_DISPLAY_SETS, 0), true, 8),
             "at the threshold, with the shape of the busiest track, it is demotable"
         );
+    }
+
+    // The share rule at its edge against a 2 000-set busiest track: 500 sets is exactly one
+    // quarter (in), 499 is under it (out). Literal counts, so a changed divisor fails.
+    #[test]
+    fn the_share_of_busiest_boundary_is_one_quarter() {
+        assert!(demotable(facts(500, 0), true, 2_000));
+        assert!(!demotable(facts(499, 0), true, 2_000));
+        // A vendor-forced track at 30% of the busiest is a full track, not a forced one.
+        assert!(demotable(facts(600, 0), true, 2_000));
     }
 
     /// Never on no evidence at all: a track nobody observed cannot contradict

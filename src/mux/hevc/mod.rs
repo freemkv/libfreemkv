@@ -107,8 +107,17 @@ impl<W: Write> HevcMux<W> {
 // truth for hvcC -> Annex B across all muxers (HEVC ES, BD-TS, standard MPEG-TS) — do not
 // reimplement.
 pub(crate) fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
+    let (out, truncated) = hvcc_parse(hvcc);
+    if truncated {
+        tracing::warn!(target: "mux", "hvcC truncated; parameter sets may be incomplete");
+    }
+    out
+}
+
+// Returns the Annex B bytes and whether the record was cut short.
+fn hvcc_parse(hvcc: &[u8]) -> (Option<Vec<u8>>, bool) {
     if hvcc.len() < 23 {
-        return None;
+        return (None, false);
     }
     let num_arrays = hvcc[22] as usize;
     let mut out = Vec::new();
@@ -118,7 +127,11 @@ pub(crate) fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
     // array header and synthesize spurious parameter-set NALs.
     let mut truncated = false;
     for _ in 0..num_arrays {
-        if truncated || offset + 3 > hvcc.len() {
+        if truncated {
+            break;
+        }
+        if offset + 3 > hvcc.len() {
+            truncated = true;
             break;
         }
         offset += 1; // array_completeness + nal_type byte
@@ -145,7 +158,7 @@ pub(crate) fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
             offset += nal_len;
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    (if out.is_empty() { None } else { Some(out) }, truncated)
 }
 
 // Convert length-prefixed NALs ([u32-BE len][NAL] repeated) to Annex B; already-Annex-B input
@@ -246,12 +259,21 @@ fn starts_with_start_code(data: &[u8]) -> bool {
 // Convert an AVCDecoderConfigurationRecord (avcC) into Annex B NAL units; H.264 counterpart to
 // hvcc_to_annex_b and single source of truth for avcC -> Annex B across all muxers.
 pub(crate) fn avcc_to_annex_b(avcc: &[u8]) -> Option<Vec<u8>> {
+    let (out, truncated) = avcc_parse(avcc);
+    if truncated {
+        tracing::warn!(target: "mux", "avcC truncated; parameter sets incomplete");
+    }
+    out
+}
+
+// Returns the Annex B bytes and whether the record was cut short.
+fn avcc_parse(avcc: &[u8]) -> (Option<Vec<u8>>, bool) {
     // avcC fixed header is 5 bytes; byte 5 carries the SPS count (low 5 bits),
     // then the SPS array begins at byte 6 (ISO/IEC 14496-15 §5.3.3.1.2).
     const AVCC_HEADER_LEN: usize = 5;
     const NUM_SPS_MASK: u8 = 0x1F; // numOfSequenceParameterSets: low 5 bits
     if avcc.len() < AVCC_HEADER_LEN + 1 {
-        return None;
+        return (None, false);
     }
     let num_sps = (avcc[AVCC_HEADER_LEN] & NUM_SPS_MASK) as usize;
     let mut offset = AVCC_HEADER_LEN + 1;
@@ -282,14 +304,19 @@ pub(crate) fn avcc_to_annex_b(avcc: &[u8]) -> Option<Vec<u8>> {
         true
     }
 
-    let sps_ok = take(avcc, num_sps, &mut offset, &mut out);
-    if sps_ok && offset < avcc.len() {
-        let num_pps = avcc[offset] as usize;
-        offset += 1;
-        take(avcc, num_pps, &mut offset, &mut out);
+    let mut truncated = !take(avcc, num_sps, &mut offset, &mut out);
+    if !truncated {
+        // numOfPictureParameterSets is mandatory, so a missing byte is truncation too.
+        if offset < avcc.len() {
+            let num_pps = avcc[offset] as usize;
+            offset += 1;
+            truncated = !take(avcc, num_pps, &mut offset, &mut out);
+        } else {
+            truncated = true;
+        }
     }
 
-    if out.is_empty() { None } else { Some(out) }
+    (if out.is_empty() { None } else { Some(out) }, truncated)
 }
 
 #[cfg(test)]
@@ -860,5 +887,43 @@ mod tests {
             out, expected,
             "finish must deliver the whole Annex B stream to the sink"
         );
+    }
+
+    #[test]
+    fn avcc_truncated_pps_keeps_sps() {
+        // numPPS=1 but the PPS body runs past the end: SPS is salvaged.
+        let avcc = [
+            1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x42, 1, 0, 9, 0x68,
+        ];
+        let (out, truncated) = avcc_parse(&avcc);
+        assert_eq!(out.expect("SPS kept"), vec![0, 0, 0, 1, 0x67, 0x42]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn avcc_missing_pps_count_is_truncated() {
+        let avcc = [1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x42];
+        let (out, truncated) = avcc_parse(&avcc);
+        assert!(out.is_some());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn hvcc_cut_array_header_is_truncated() {
+        // Two arrays declared; the first (one 2-byte NAL) parses, the second header is absent.
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(2);
+        hvcc.extend_from_slice(&[0x20, 0, 1, 0, 2, 0x40, 0x01]);
+        let (out, truncated) = hvcc_parse(&hvcc);
+        assert!(out.is_some());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn hvcc_complete_is_not_truncated() {
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(1);
+        hvcc.extend_from_slice(&[0x20, 0, 1, 0, 2, 0x40, 0x01]);
+        assert!(!hvcc_parse(&hvcc).1);
     }
 }

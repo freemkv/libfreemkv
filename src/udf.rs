@@ -1,4 +1,4 @@
-//! UDF filesystem reader — read files from Blu-ray discs.
+//! UDF filesystem reader — read files from Blu-ray discs (and plain UDF images).
 //!
 //! Blu-ray discs use UDF 2.50 with metadata partitions. The read sequence
 //! follows pointers through the disc structure: AVDP → VDS → Metadata
@@ -6,6 +6,7 @@
 //! → BDMV/PLAYLIST/*.mpls, BDMV/CLIPINF/*.clpi. Each step reads one or two
 //! sectors; no bulk reads needed.
 
+use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 use std::collections::HashSet;
@@ -16,7 +17,21 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 // Cap on a single directory's on-disc data, well above any legitimate BD-ROM
 // directory, so a corrupt 30-bit allocation length can't force a huge alloc.
-const MAX_DIR_BYTES: u32 = 1024 * 1024;
+pub(crate) const MAX_DIR_BYTES: u32 = 1024 * 1024;
+
+// Cap on the UDF-structure range `metadata_sector_ranges` prefetches from LBA 0 (64 MiB); real
+// volume structures and metadata partitions are a few MiB, and both ends are disc-controlled.
+const MAX_STRUCT_SECTORS: u32 = 32_768;
+
+// Cap on range tuples collected by one tree walk; real discs need a few thousand. Bounds the
+// memory a crafted extent chain shared by many entries can force.
+const MAX_WALK_RANGES: usize = 65_536;
+
+// Cap on one contiguous `prefetch` (16 MiB), so a disc-controlled length can't drive a huge alloc.
+const MAX_PREFETCH_RUN_SECTORS: u32 = 8192;
+
+// Files larger than this are not cached by `metadata_sector_ranges` (MKB_RO.inf is ~134 MB).
+const MAX_CACHED_FILE_BYTES: u64 = 50_000_000;
 
 // Smallest Main VDS extent ECMA-167 3/10.2.1 permits an AVDP to record (16
 // sectors). A smaller extent is unusable, so it's ignored in favour of
@@ -133,6 +148,12 @@ pub struct DirEntry {
 }
 
 impl UdfFs {
+    /// Test hook: relocate the physical partition (ICBs stay put via the metadata map).
+    #[cfg(test)]
+    pub(crate) fn set_partition_start(&mut self, start: u32) {
+        self.partition_start = start;
+    }
+
     /// Physical partition start sector.
     pub fn partition_start(&self) -> u32 {
         self.partition_start
@@ -165,32 +186,7 @@ impl UdfFs {
     /// Get the absolute starting LBA of a file's first data extent on disc.
     /// Used by the rip pipeline to locate m2ts content sectors.
     pub fn file_start_lba(&self, reader: &mut dyn SectorSource, path: &str) -> Result<u32> {
-        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        let mut current = &self.root;
-        for part in &parts[..parts.len() - 1] {
-            current = current
-                .entries
-                .iter()
-                .find(|e| e.is_dir && e.name.eq_ignore_ascii_case(part))
-                .ok_or_else(|| Error::UdfNotFound {
-                    path: part.to_string(),
-                })?;
-        }
-        let filename = match parts.last() {
-            Some(f) => f,
-            None => {
-                return Err(Error::UdfNotFound {
-                    path: path.to_string(),
-                });
-            }
-        };
-        let entry = current
-            .entries
-            .iter()
-            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(filename))
-            .ok_or_else(|| Error::UdfNotFound {
-                path: path.to_string(),
-            })?;
+        let entry = self.entry_at(path)?;
         let data_lba = self.read_icb_extent(reader, entry.meta_lba)?.lba;
         self.partition_start
             .checked_add(data_lba)
@@ -231,36 +227,7 @@ impl UdfFs {
         path: &str,
         max_bytes: Option<usize>,
     ) -> Result<Vec<u8>> {
-        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        let mut current = &self.root;
-
-        // Navigate to parent directory
-        for part in &parts[..parts.len() - 1] {
-            current = current
-                .entries
-                .iter()
-                .find(|e| e.is_dir && e.name.eq_ignore_ascii_case(part))
-                .ok_or_else(|| Error::UdfNotFound {
-                    path: part.to_string(),
-                })?;
-        }
-
-        // Find the file
-        let filename = match parts.last() {
-            Some(f) => f,
-            None => {
-                return Err(Error::UdfNotFound {
-                    path: path.to_string(),
-                });
-            }
-        };
-        let entry = current
-            .entries
-            .iter()
-            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(filename))
-            .ok_or_else(|| Error::UdfNotFound {
-                path: path.to_string(),
-            })?;
+        let entry = self.entry_at(path)?;
 
         // `max_bytes == None` => read the whole file; `Some(n)` => read at most
         // n bytes (rounded up to a sector) and skip the anti-DoS caps below.
@@ -300,7 +267,7 @@ impl UdfFs {
             .min(limit)
             .min(MAX_FILE_BYTES as usize);
         let mut data = Vec::with_capacity(cap_hint);
-        let mut sector = [0u8; 2048];
+        let mut sector = [0u8; SECTOR_BYTES];
         'extents: for ext in extents {
             let (data_lba, data_len) = (ext.lba, ext.len);
             if max_bytes.is_none() {
@@ -317,7 +284,7 @@ impl UdfFs {
                     });
                 }
             }
-            let sector_count = (data_len as u64).div_ceil(2048) as u32;
+            let sector_count = (data_len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
             // ECMA-167 4/14.14.1.1 type 1: allocated-not-recorded. Its bytes are defined
             // as zeros, so emit zeros WITHOUT reading media. Skipping the extent instead
             // would slide every later extent's bytes down by this hole's length.
@@ -326,7 +293,7 @@ impl UdfFs {
                     if data.len() >= limit {
                         break 'extents;
                     }
-                    data.extend_from_slice(&[0u8; 2048]);
+                    data.extend_from_slice(&[0u8; SECTOR_BYTES]);
                 }
                 continue;
             }
@@ -375,13 +342,21 @@ impl UdfFs {
 
         // UDF structure: sector 0 through end of metadata partition
         // Covers AVDP, VDS, partition descriptor, metadata ICB, FSD, all directories
+        // Both ends are disc-controlled: clamp, and cover the metadata start separately.
         let meta_end = self.meta.start().saturating_add(self.metadata_sectors);
-        ranges.push((0, meta_end));
+        ranges.push((0, meta_end.min(MAX_STRUCT_SECTORS)));
+        if meta_end > MAX_STRUCT_SECTORS {
+            ranges.push((
+                self.meta.start(),
+                self.metadata_sectors.min(MAX_STRUCT_SECTORS),
+            ));
+        }
         // A fragmented Metadata File's later extents live elsewhere on disc.
         ranges.extend(self.meta.0.iter().skip(1).copied());
 
         // Walk tree, collect ranges for each metadata file
-        self.collect_file_ranges(reader, &self.root, &mut ranges)?;
+        let mut seen = HashSet::new();
+        self.collect_file_ranges(reader, &self.root, &mut ranges, &mut seen)?;
 
         // Merge overlapping/adjacent ranges and sort
         ranges.sort_by_key(|r| r.0);
@@ -404,33 +379,34 @@ impl UdfFs {
         let mut ranges = vec![(0, self.partition_start)];
         ranges.push((self.meta.start(), self.metadata_sectors.max(1)));
         ranges.extend(self.meta.0.iter().copied().filter(|&(_, n)| n > 0));
-        let stream = self.find_dir("/BDMV/STREAM").map(|d| d as *const DirEntry);
-        // (directory, inside /BDMV/STREAM): there only the File Entries are staged.
+        let stream = self.find_dir("/BDMV/STREAM");
+        // (entry, inside /BDMV/STREAM): there only the File Entries are staged.
         let mut stack = vec![(&self.root, false)];
-        let mut entries: Vec<(&DirEntry, bool)> = vec![(&self.root, false)];
-        while let Some((dir, in_stream)) = stack.pop() {
-            for e in &dir.entries {
-                let in_stream = in_stream || stream == Some(e as *const DirEntry);
-                if e.is_dir {
-                    stack.push((e, in_stream));
+        let mut seen = HashSet::new();
+        while let Some((e, in_stream)) = stack.pop() {
+            if e.is_dir {
+                for c in &e.entries {
+                    stack.push((c, in_stream || stream.is_some_and(|s| std::ptr::eq(s, c))));
                 }
-                entries.push((e, in_stream));
             }
-        }
-        for (e, in_stream) in entries {
             ranges.push((self.meta_to_abs(e.meta_lba)?, 1));
             if !e.is_dir && in_stream {
+                continue;
+            }
+            // Entries can share one ICB: read its extents once.
+            if !seen.insert(e.meta_lba) {
                 continue;
             }
             match self.extents_abs_at(reader, e.meta_lba) {
                 Ok(exts) => ranges.extend(
                     exts.iter()
                         .filter(|x| x.recorded && x.len > 0)
-                        .map(|x| (x.lba, (x.len as u64).div_ceil(2048) as u32)),
+                        .map(|x| (x.lba, (x.len as u64).div_ceil(SECTOR_BYTES_U64) as u32)),
                 ),
                 Err(Error::Halted) => return Err(Error::Halted),
                 Err(_) => {} // embedded data, or unreadable: nothing to stage
             }
+            compact_ranges(&mut ranges, self.meta.start())?;
         }
         ranges.sort_by_key(|r| r.0);
         Ok(merge_ranges(&ranges))
@@ -441,6 +417,7 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
         entry: &DirEntry,
         ranges: &mut Vec<(u32, u32)>,
+        seen: &mut HashSet<u32>,
     ) -> Result<()> {
         for child in &entry.entries {
             if child.is_dir {
@@ -448,31 +425,37 @@ impl UdfFs {
                 if child.name.eq_ignore_ascii_case("STREAM") {
                     continue;
                 }
-                self.collect_file_ranges(reader, child, ranges)?;
+                self.collect_file_ranges(reader, child, ranges, seen)?;
             } else {
                 // Include the ICB sector itself (in metadata partition)
                 ranges.push((self.meta_to_abs(child.meta_lba)?, 1));
 
                 // Include file data — skip only truly huge files (MKB_RO.inf = 134MB)
-                if child.size > 50_000_000 {
+                if child.size > MAX_CACHED_FILE_BYTES {
                     continue;
                 }
 
-                // Push every extent: a fragmented AACS cert / MPLS / CLPI can
-                // span multiple extents, and key readers downstream need all
-                // of them (mirror collect_all_file_ranges).
-                if let Ok(extents) = self.read_icb_extents(reader, child.meta_lba) {
-                    for ext in extents {
-                        // An unrecorded extent holds nothing to cache.
-                        if !ext.recorded {
-                            continue;
+                // Push every extent (a fragmented AACS cert / MPLS / CLPI spans several);
+                // entries can share one ICB, so read its extents once.
+                if !seen.insert(child.meta_lba) {
+                    continue;
+                }
+                match self.read_icb_extents(reader, child.meta_lba) {
+                    Err(Error::Halted) => return Err(Error::Halted),
+                    Err(_) => {}
+                    Ok(extents) => {
+                        for ext in extents {
+                            // An unrecorded extent holds nothing to cache.
+                            if !ext.recorded {
+                                continue;
+                            }
+                            let Some(abs_start) = self.partition_start.checked_add(ext.lba) else {
+                                continue;
+                            };
+                            let sector_count = (ext.len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
+                            ranges.push((abs_start, sector_count));
                         }
-                        let abs_start = match self.partition_start.checked_add(ext.lba) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        let sector_count = (ext.len as u64).div_ceil(2048) as u32;
-                        ranges.push((abs_start, sector_count));
+                        compact_ranges(ranges, self.meta.start())?;
                     }
                 }
             }
@@ -513,7 +496,7 @@ impl UdfFs {
         meta_lba: u32,
     ) -> Result<Option<Vec<u8>>> {
         let icb_abs = self.meta_to_abs(meta_lba)?;
-        let mut icb = [0u8; 2048];
+        let mut icb = [0u8; SECTOR_BYTES];
         read_sector(reader, icb_abs, &mut icb)?;
         let tag = u16::from_le_bytes([icb[0], icb[1]]);
         let (ad_offset, l_ad) = match tag {
@@ -557,7 +540,7 @@ impl UdfFs {
         meta_lba: u32,
     ) -> Result<Vec<IcbExtent>> {
         let icb_abs = self.meta_to_abs(meta_lba)?;
-        let mut icb = [0u8; 2048];
+        let mut icb = [0u8; SECTOR_BYTES];
         read_sector(reader, icb_abs, &mut icb)?;
 
         let tag = u16::from_le_bytes([icb[0], icb[1]]);
@@ -694,9 +677,7 @@ impl UdfFs {
                         // Continuation: the rest of the ADs live in the block
                         // at data_lba (metadata-partition-relative). Stop
                         // scanning this block and follow the pointer.
-                        if data_len > 0 {
-                            next_block = Some(data_lba);
-                        }
+                        next_block = Some(data_lba);
                         break;
                     }
                     // Unreachable: `extent_type` is 2-bit `raw_len >> 30`, 0-3 all
@@ -786,10 +767,7 @@ impl UdfFs {
                 path: path.to_string(),
             });
         }
-        Ok(abs
-            .iter()
-            .map(|e| (e.lba, (e.len as u64).div_ceil(2048) as u32))
-            .collect())
+        span_extents(&abs)
     }
 
     /// Resolve `path` to its directory entry. Shared by both extent
@@ -831,12 +809,26 @@ impl UdfFs {
         path: &str,
     ) -> Result<Vec<(u32, u32)>> {
         let meta_lba = self.entry_at(path)?.meta_lba;
-        Ok(self
-            .extents_abs_at(reader, meta_lba)?
-            .iter()
-            .map(|e| (e.lba, (e.len as u64).div_ceil(2048) as u32))
-            .collect())
+        span_extents(&self.extents_abs_at(reader, meta_lba)?)
     }
+}
+
+// `(lba, sectors)` per extent; an extent whose end passes the u32 LBA space is corrupt (callers
+// add the two).
+fn span_extents(abs: &[AbsExtent]) -> Result<Vec<(u32, u32)>> {
+    abs.iter()
+        .map(|e| {
+            let n = (e.len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
+            e.lba
+                .checked_add(n)
+                .map(|_| (e.lba, n))
+                .ok_or(Error::DiscRead {
+                    sector: e.lba as u64,
+                    status: None,
+                    sense: None,
+                })
+        })
+        .collect()
 }
 
 /// Read the UDF filesystem from a Blu-ray disc.
@@ -851,7 +843,7 @@ impl UdfFs {
 pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // Step 1: Anchor Volume Descriptor Pointer at sector 256
     // ECMA-167 §10.2 — always at sector 256
-    let mut avdp = [0u8; 2048];
+    let mut avdp = [0u8; SECTOR_BYTES];
     read_sector(reader, 256, &mut avdp)?;
 
     let tag_id = u16::from_le_bytes([avdp[0], avdp[1]]);
@@ -869,7 +861,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // Candidates: recorded extent then customary location. Recorded is used only
     // if SHAPE is valid (>=16 sectors, non-zero, non-wrapping, ECMA-167 3/10.2.1);
     // fallback also retried on OUTCOME if recorded yields no Partition Descriptor.
-    let recorded = match vds_len_bytes.div_ceil(2048) {
+    let recorded = match vds_len_bytes.div_ceil(SECTOR_BYTES as u32) {
         n if n >= VDS_MIN_SECTORS && vds_lba > 0 && vds_lba.checked_add(n).is_some() => {
             Some((vds_lba, n.min(VDS_MAX_SECTORS)))
         }
@@ -898,7 +890,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
 
     for (vds_start, vds_sectors) in candidates {
         for i in vds_start..vds_start.saturating_add(vds_sectors) {
-            let mut desc = [0u8; 2048];
+            let mut desc = [0u8; SECTOR_BYTES];
             if let Err(e) = read_sector(reader, i, &mut desc) {
                 sweep_err = Some(e);
                 break;
@@ -931,7 +923,9 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
                 _ => continue,
             }
         }
-        if partition_start != 0 {
+        // A fault before the LVD leaves the next candidate to try; the fault is only
+        // surfaced below where the disc would otherwise read as not UDF.
+        if partition_start != 0 && (lvd_sector.is_some() || sweep_err.is_none()) {
             break;
         }
     }
@@ -951,22 +945,23 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // The metadata file is stored at lba=0 of the physical partition
     let mut meta_extents: Vec<(u32, u32)> = Vec::new();
     let metadata_start = if num_partition_maps >= 2 {
-        let lvd_sec = lvd_sector.ok_or(Error::DiscRead {
-            sector: 0,
-            status: None,
-            sense: None,
+        let lvd_sec = lvd_sector.ok_or_else(|| {
+            sweep_err.take().unwrap_or(Error::DiscRead {
+                sector: 0,
+                status: None,
+                sense: None,
+            })
         })?;
 
         // Read LVD to check partition map type
-        let mut lvd = [0u8; 2048];
+        let mut lvd = [0u8; SECTOR_BYTES];
         read_sector(reader, lvd_sec, &mut lvd)?;
 
         // Parse partition maps starting at offset 440
         // Map 0 = Type 1 (physical), Map 1 = Type 2 (metadata)
-        let _pm1_type = lvd[440]; // First map type
         let pm1_len = lvd[441] as usize;
 
-        if pm1_len > 0 && 440 + pm1_len < 2048 {
+        if pm1_len > 0 && 440 + pm1_len < SECTOR_BYTES {
             let pm2_map = 440 + pm1_len;
             let pm2_type = lvd[pm2_map]; // Second map type
 
@@ -977,7 +972,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
                 let recorded = metadata_file_location(&lvd, pm2_map)
                     .and_then(|loc| partition_start.checked_add(loc));
                 let mut meta_file_lba = partition_start;
-                let mut meta_icb = [0u8; 2048];
+                let mut meta_icb = [0u8; SECTOR_BYTES];
                 let mut meta_tag = 0u16;
                 // Track whether ANY candidate was readable: "read fine, not a File
                 // Entry" is deterministic, "could not read either" is transient —
@@ -1034,7 +1029,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
 
     // Step 4: File Set Descriptor at the block the LVD records (ECMA-167 3/10.6.13),
     // falling back to metadata block 0 (the customary location).
-    let mut fsd = [0u8; 2048];
+    let mut fsd = [0u8; SECTOR_BYTES];
     let mut fsd_found = false;
     let mut fsd_err = None;
     for cand in fsd_block.into_iter().chain(std::iter::once(0)) {
@@ -1052,7 +1047,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     }
     if !fsd_found {
         // A read fault is transient; "read fine, no FSD" is structurally not UDF.
-        return Err(fsd_err.unwrap_or(Error::UdfNotFilesystem));
+        return Err(fsd_err.or(sweep_err).unwrap_or(Error::UdfNotFilesystem));
     }
 
     // Root Directory ICB: long_ad at FSD offset 400
@@ -1066,7 +1061,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     let mut visited: HashSet<u64> = HashSet::from([root_icb_key]);
     let root = read_directory(
         reader,
-        partition_start,
+        &mut 0,
         &meta,
         root_lba,
         "",
@@ -1075,7 +1070,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
         &mut visited,
     )?;
 
-    let metadata_sectors = (metadata_size_bytes as u64).div_ceil(2048) as u32;
+    let metadata_sectors = (metadata_size_bytes as u64).div_ceil(SECTOR_BYTES_U64) as u32;
 
     Ok(UdfFs {
         root,
@@ -1089,7 +1084,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
 // The Metadata File's recorded extents `(abs_start, sectors)` from its File Entry, plus the
 // first extent's byte length. Only recorded (type 0) ADs can hold metadata blocks.
 fn metadata_file_extents(
-    fe: &[u8; 2048],
+    fe: &[u8; SECTOR_BYTES],
     partition_start: u32,
     fe_lba: u32,
 ) -> Result<(Vec<(u32, u32)>, u32)> {
@@ -1144,7 +1139,7 @@ fn metadata_file_extents(
         if i == 0 {
             first_bytes = len;
         }
-        extents.push((abs, len.div_ceil(2048)));
+        extents.push((abs, len.div_ceil(SECTOR_BYTES as u32)));
     }
     Ok((extents, first_bytes))
 }
@@ -1152,7 +1147,7 @@ fn metadata_file_extents(
 // UDF 2.50 2.2.10 Metadata File Location: partition-relative block of the Metadata File's File
 // Entry, at offset 40 of the Type 2 map at `map`. None if the map doesn't fit, or isn't "*UDF
 // Metadata Partition".
-fn metadata_file_location(lvd: &[u8; 2048], map: usize) -> Option<u32> {
+fn metadata_file_location(lvd: &[u8; SECTOR_BYTES], map: usize) -> Option<u32> {
     // ECMA-167 3/10.7.3 fixes the Type 2 map at 64 bytes.
     if map.checked_add(64)? > lvd.len() {
         return None;
@@ -1179,14 +1174,17 @@ const MAX_DIR_DEPTH: u32 = 8;
 // terminate in microseconds instead of an astronomical number of visits.
 const MAX_TOTAL_DIR_ENTRIES: usize = 100_000;
 
+// Tree-wide cap on directory sectors read (32 MiB); `sectors_read` below only bounds one
+// directory, and distinct subdirectory ICBs can each declare a full-size extent.
+const MAX_TOTAL_DIR_SECTORS: u32 = 16_384;
+
 // Recursive UDF directory-tree walk (up to MAX_DIR_DEPTH); `budget` caps FIDs visited
-// tree-wide, `visited` detects ICB-LBA cycles. Wide arg list is inherent to the walk, not a
-// refactor smell.
-#[allow(clippy::only_used_in_recursion)]
+// tree-wide, `dir_sectors` caps sectors read tree-wide, `visited` detects ICB-LBA cycles.
+// Wide arg list is inherent to the walk, not a refactor smell.
 #[allow(clippy::too_many_arguments)]
 fn read_directory(
     reader: &mut dyn SectorSource,
-    part_start: u32,
+    dir_sectors: &mut u32,
     meta: &MetaMap,
     meta_lba: u32,
     name: &str,
@@ -1196,7 +1194,7 @@ fn read_directory(
 ) -> Result<DirEntry> {
     // Read ICB for this directory
     let icb_abs = meta.to_abs(meta_lba)?;
-    let mut icb = [0u8; 2048];
+    let mut icb = [0u8; SECTOR_BYTES];
     read_sector(reader, icb_abs, &mut icb)?;
 
     let tag = u16::from_le_bytes([icb[0], icb[1]]);
@@ -1322,10 +1320,18 @@ fn read_directory(
                 }
                 // Bound total sectors READ (not bytes kept): each tiny extent still
                 // costs a whole sector, and `data_len` is a disc-controlled 30-bit value.
-                let sector_count = data_len.div_ceil(2048);
-                let add = sector_count as usize * 2048;
+                let sector_count = data_len.div_ceil(SECTOR_BYTES as u32);
+                let add = sector_count as usize * SECTOR_BYTES;
                 sectors_read = sectors_read.saturating_add(sector_count);
-                if sectors_read > MAX_DIR_BYTES / 2048 {
+                if sectors_read > MAX_DIR_BYTES / SECTOR_BYTES as u32 {
+                    return Err(Error::DiscRead {
+                        sector: meta.start() as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                *dir_sectors = dir_sectors.saturating_add(sector_count);
+                if *dir_sectors > MAX_TOTAL_DIR_SECTORS {
                     return Err(Error::DiscRead {
                         sector: meta.start() as u64,
                         status: None,
@@ -1341,8 +1347,8 @@ fn read_directory(
                         sense: None,
                     })?;
                     let abs = meta.to_abs(rel)?;
-                    let o = base + s as usize * 2048;
-                    read_sector(reader, abs, &mut dir_data[o..o + 2048])?;
+                    let o = base + s as usize * SECTOR_BYTES;
+                    read_sector(reader, abs, &mut dir_data[o..o + SECTOR_BYTES])?;
                 }
                 // Drop the sector padding so the next extent's FIDs follow directly.
                 dir_data.truncate(base + data_len as usize);
@@ -1372,13 +1378,25 @@ fn read_directory(
     let mut entries = Vec::new();
     let mut pos = 0;
 
-    // `<=`, not `<`: a FID's fixed 38-byte header ending exactly at the declared boundary
-    // (pos + 38 == dir_end) is fully present and must be read (strict `<` dropped it). The
-    // name may run past the header but is bounded against `dir_end` below, so a FID whose header fits but whose NAME spills past the length is still rejected.
+    // `<=`, not `<`: a header ending exactly at the declared boundary (pos + 38 == dir_end) is
+    // fully present. A NAME spilling past `dir_end` is corruption and errors below.
     while pos + 38 <= dir_end {
         let fid_tag = u16::from_le_bytes([dir_data[pos], dir_data[pos + 1]]);
-        if fid_tag != 257 {
+        // Zero is trailing padding; anything else inside the declared length is corruption.
+        if fid_tag == 0 {
             break;
+        }
+        if fid_tag != 257 {
+            tracing::warn!(target: "freemkv::udf", fid_tag, icb_abs, "corrupt directory: bad FID tag");
+            if depth > 0 {
+                entries.clear();
+                break;
+            }
+            return Err(Error::DiscRead {
+                sector: icb_abs as u64,
+                status: None,
+                sense: None,
+            });
         }
 
         let file_chars = dir_data[pos + 18];
@@ -1405,7 +1423,16 @@ fn read_directory(
             let name_start = pos + 38 + l_iu;
             let name_end = name_start + l_fi;
             if name_end > dir_end {
-                break;
+                tracing::warn!(target: "freemkv::udf", icb_abs, "corrupt directory: name overruns FID data");
+                if depth > 0 {
+                    entries.clear();
+                    break;
+                }
+                return Err(Error::DiscRead {
+                    sector: icb_abs as u64,
+                    status: None,
+                    sense: None,
+                });
             }
             let entry_name = parse_udf_name(&dir_data[name_start..name_end]);
 
@@ -1447,7 +1474,7 @@ fn read_directory(
                         // (e.g. BDMV/BACKUP/BDJO/*.bdjo is 3 levels deep).
                         let subdir = match read_directory(
                             reader,
-                            part_start,
+                            dir_sectors,
                             meta,
                             icb_lba,
                             &entry_name,
@@ -1496,10 +1523,10 @@ fn read_directory(
     })
 }
 
-/// Read file size (info_length) from an Extended File Entry ICB.
+/// Read file size (info_length) from a File Entry (261) or Extended File Entry (266) ICB.
 fn read_file_size(reader: &mut dyn SectorSource, meta: &MetaMap, meta_lba: u32) -> Result<u64> {
     let abs = meta.to_abs(meta_lba)?;
-    let mut icb = [0u8; 2048];
+    let mut icb = [0u8; SECTOR_BYTES];
     read_sector(reader, abs, &mut icb)?;
 
     let tag = u16::from_le_bytes([icb[0], icb[1]]);
@@ -1513,33 +1540,46 @@ fn read_file_size(reader: &mut dyn SectorSource, meta: &MetaMap, meta_lba: u32) 
     }
 }
 
-// Parse a UDF filename: first byte is a compression ID (8 = ASCII, 16 = UTF-16BE).
-pub(crate) fn parse_udf_name(data: &[u8]) -> String {
-    if data.is_empty() {
+// Decode an OSTA CS0 string: first byte is a compression ID (8 = one byte per code point,
+// i.e. Latin-1; 16 = UTF-16BE). NULs are dropped.
+fn decode_cs0(data: &[u8]) -> String {
+    let Some((&comp, rest)) = data.split_first() else {
         return String::new();
-    }
+    };
+    let s: String = match comp {
+        16 => rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter_map(|&c| char::from_u32(u16::from_be_bytes(c) as u32))
+            .collect(),
+        8 => rest.iter().map(|&b| b as char).collect(),
+        _ => String::from_utf8_lossy(rest).into_owned(),
+    };
+    s.replace('\0', "").trim().to_string()
+}
 
-    match data[0] {
-        8 => {
-            // 8-bit ASCII
-            String::from_utf8_lossy(&data[1..]).trim().to_string()
-        }
-        16 => {
-            // 16-bit big-endian Unicode
-            let mut s = String::new();
-            let chars = &data[1..];
-            for i in (0..chars.len()).step_by(2) {
-                if i + 1 < chars.len() {
-                    let c = ((chars[i] as u16) << 8) | chars[i + 1] as u16;
-                    if let Some(ch) = char::from_u32(c as u32) {
-                        s.push(ch);
-                    }
-                }
-            }
-            s.trim().to_string()
-        }
-        _ => String::from_utf8_lossy(&data[1..]).trim().to_string(),
+// Parse a UDF filename (an OSTA CS0 string).
+pub(crate) fn parse_udf_name(data: &[u8]) -> String {
+    decode_cs0(data)
+}
+
+// Keeps a walk's range list bounded: past MAX_WALK_RANGES, sort+merge in place, and fail (the
+// list is disc-controlled) if it is still more than half the cap.
+fn compact_ranges(ranges: &mut Vec<(u32, u32)>, meta_start: u32) -> Result<()> {
+    if ranges.len() <= MAX_WALK_RANGES {
+        return Ok(());
     }
+    ranges.sort_by_key(|r| r.0);
+    *ranges = merge_ranges(ranges);
+    if ranges.len() > MAX_WALK_RANGES / 2 {
+        return Err(Error::DiscRead {
+            sector: meta_start as u64,
+            status: None,
+            sense: None,
+        });
+    }
+    Ok(())
 }
 
 /// Merge overlapping or adjacent (start, count) ranges. Caller sorts by start
@@ -1572,8 +1612,8 @@ pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
 
 /// Parse a UDF d-string (fixed-length field with length byte at the end).
 /// Used for Volume Identifier and other UDF descriptor strings.
-/// The first byte of content is a compression ID: 8 = ASCII, 16 = UTF-16BE.
-fn parse_dstring(data: &[u8]) -> String {
+/// The first byte of content is a compression ID: 8 = Latin-1, 16 = UTF-16BE.
+pub(crate) fn parse_dstring(data: &[u8]) -> String {
     let Some(&len) = data.last() else {
         return String::new();
     };
@@ -1581,35 +1621,7 @@ fn parse_dstring(data: &[u8]) -> String {
     if len == 0 || len > data.len() {
         return String::new();
     }
-    let content = &data[..len];
-    if content.is_empty() {
-        return String::new();
-    }
-    match content[0] {
-        8 => String::from_utf8_lossy(&content[1..])
-            .trim_end_matches('\0')
-            .trim()
-            .to_string(),
-        16 => {
-            let mut s = String::new();
-            let chars = &content[1..];
-            for i in (0..chars.len()).step_by(2) {
-                if i + 1 < chars.len() {
-                    let c = ((chars[i] as u16) << 8) | chars[i + 1] as u16;
-                    if c != 0
-                        && let Some(ch) = char::from_u32(c as u32)
-                    {
-                        s.push(ch);
-                    }
-                }
-            }
-            s.trim().to_string()
-        }
-        _ => String::from_utf8_lossy(&content[1..])
-            .trim_end_matches('\0')
-            .trim()
-            .to_string(),
-    }
+    decode_cs0(&data[..len])
 }
 
 /// Test-only view of [`parse_dstring`], so the `dirimage` encoder can assert
@@ -1662,24 +1674,22 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
     /// A failed batch ends the prefetch (the reads fall back to the sliding window);
     /// a Stop is returned, so the scan never reads on past it (§2.8).
     pub(crate) fn prefetch(&mut self, start_lba: u32, count: u32) -> crate::error::Result<()> {
-        // Cap to 8192 sectors (16 MiB) so a disc-controlled ad_len cannot
-        // drive a multi-hundred-MiB allocation before any sectors are read.
-        let count = count.min(8192);
+        let count = count.min(MAX_PREFETCH_RUN_SECTORS);
         // Clamp to u32 LBA space: `start_lba` is an unconstrained disc Uint32, so a
         // partition near the top overflowed `start_lba + offset` below (debug panic;
         // release wrap filled the cache with the wrong region). Unaddressable anyway.
         let count = count.min(u32::MAX - start_lba);
-        let total = count as usize * 2048;
+        let total = count as usize * SECTOR_BYTES;
         self.cache.resize(total, 0);
         let mut offset = 0u32;
         let mut halted = false;
         while offset < count {
             let batch = (count - offset).min(self.batch as u32) as u16;
-            let buf_off = offset as usize * 2048;
+            let buf_off = offset as usize * SECTOR_BYTES;
             match self.inner.read_sectors(
                 start_lba + offset,
                 batch,
-                &mut self.cache[buf_off..buf_off + batch as usize * 2048],
+                &mut self.cache[buf_off..buf_off + batch as usize * SECTOR_BYTES],
                 true,
             ) {
                 Ok(_) => offset += batch as u32,
@@ -1697,15 +1707,14 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
         Ok(())
     }
 
-    // Pre-read multiple sector ranges into the permanent per-sector HashMap cache (bulk-loads
-    // AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS to bound RAM against
-    // a crafted UDF.
-    /// A Stop ends it with `Halted` between (or within) ranges; any other failed
-    /// batch skips the rest of that range, as before.
+    /// Pre-read multiple sector ranges into the permanent per-sector HashMap cache
+    /// (bulk-loads AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS
+    /// to bound RAM against a crafted UDF. A Stop ends it with `Halted` between (or within)
+    /// ranges; any other failed batch skips the rest of that range.
     pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) -> crate::error::Result<()> {
-        // 2048 bytes/sector → 512 Ki sectors ≈ 1 GiB of permanent cache.
-        const MAX_PREFETCH_SECTORS: u64 = 512 * 1024;
-        let mut tmp = vec![0u8; self.batch as usize * 2048];
+        // 2048 bytes/sector → 128 Ki sectors ≈ 256 MiB of permanent cache.
+        const MAX_PREFETCH_SECTORS: u64 = 128 * 1024;
+        let mut tmp = vec![0u8; self.batch as usize * SECTOR_BYTES];
         let total: u64 = ranges.iter().map(|&(_, c)| c as u64).sum();
         let mut cached: u64 = 0;
         let mut done: u64 = 0;
@@ -1719,7 +1728,7 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
             while offset < count {
                 hb.tick(done, total);
                 let batch = (count - offset).min(self.batch as u32) as u16;
-                let bytes = batch as usize * 2048;
+                let bytes = batch as usize * SECTOR_BYTES;
                 match self
                     .inner
                     .read_sectors(start + offset, batch, &mut tmp[..bytes], true)
@@ -1735,9 +1744,9 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
                         // read path below, just without the bulk pre-load.
                         return Ok(());
                     }
-                    let s = i as usize * 2048;
+                    let s = i as usize * SECTOR_BYTES;
                     self.prefetched
-                        .insert(start + offset + i, tmp[s..s + 2048].to_vec());
+                        .insert(start + offset + i, tmp[s..s + SECTOR_BYTES].to_vec());
                     cached += 1;
                 }
                 offset += batch as u32;
@@ -1759,27 +1768,27 @@ impl<S: SectorSource + ?Sized> SectorSource for BufferedSectorReader<'_, S> {
         if count == 1 {
             // Contract: a single-sector read needs at least one sector of
             // destination. Return an error rather than panicking on the slice.
-            if buf.len() < 2048 {
+            if buf.len() < SECTOR_BYTES {
                 return Err(crate::error::Error::UdfBufferTooSmall);
             }
             // Check permanent prefetch cache first (HashMap)
             if let Some(data) = self.prefetched.get(&lba) {
-                buf[..2048].copy_from_slice(data);
-                return Ok(2048);
+                buf[..SECTOR_BYTES].copy_from_slice(data);
+                return Ok(SECTOR_BYTES);
             }
             // Tested as a DISTANCE from `cache_start`, not `cache_start + cache_sectors`:
             // `cache_start` is disc-controlled, so the sum overflowed near `u32::MAX`
             // (debug panic; release wrap silently disabled the cache).
             if lba >= self.cache_start && lba - self.cache_start < self.cache_sectors {
-                let offset = (lba - self.cache_start) as usize * 2048;
-                buf[..2048].copy_from_slice(&self.cache[offset..offset + 2048]);
-                return Ok(2048);
+                let offset = (lba - self.cache_start) as usize * SECTOR_BYTES;
+                buf[..SECTOR_BYTES].copy_from_slice(&self.cache[offset..offset + SECTOR_BYTES]);
+                return Ok(SECTOR_BYTES);
             }
             let block = self.batch;
             // Invalidate before the buffer is touched: a failed read below would
             // otherwise leave the old window pointing at shrunk/overwritten bytes.
             self.cache_sectors = 0;
-            self.cache.resize(block as usize * 2048, 0);
+            self.cache.resize(block as usize * SECTOR_BYTES, 0);
             match self.inner.read_sectors(lba, block, &mut self.cache, true) {
                 Ok(_) => {
                     self.cache_start = lba;
@@ -1789,14 +1798,14 @@ impl<S: SectorSource + ?Sized> SectorSource for BufferedSectorReader<'_, S> {
                     // By design: a batch read past the last recorded sector fails as a
                     // unit, so retry just the one sector requested — a genuinely bad
                     // single sector still propagates via `?`.
-                    self.cache.resize(2048, 0);
+                    self.cache.resize(SECTOR_BYTES, 0);
                     self.inner.read_sectors(lba, 1, &mut self.cache, true)?;
                     self.cache_start = lba;
                     self.cache_sectors = 1;
                 }
             }
-            buf[..2048].copy_from_slice(&self.cache[..2048]);
-            Ok(2048)
+            buf[..SECTOR_BYTES].copy_from_slice(&self.cache[..SECTOR_BYTES]);
+            Ok(SECTOR_BYTES)
         } else {
             // Multi-sector read — pass through
             self.inner.read_sectors(lba, count, buf, true)
@@ -1839,7 +1848,7 @@ fn read_sector(reader: &mut dyn SectorSource, lba: u32, buf: &mut [u8]) -> Resul
 fn read_aed(
     reader: &mut dyn SectorSource,
     abs: u32,
-    block: &mut [u8; 2048],
+    block: &mut [u8; SECTOR_BYTES],
     seen: &mut Vec<u32>,
 ) -> Result<(usize, usize)> {
     if seen.contains(&abs) {
@@ -2448,7 +2457,7 @@ mod tests {
         let merged = merge_ranges(&ranges);
         // No panic; result is a single merged range starting at the first.
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].0, u32::MAX - 1);
+        assert_eq!(merged[0], (u32::MAX - 1, 1));
     }
 
     #[test]
@@ -2541,8 +2550,9 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_oversized_extent_before_allocating() {
-        // data_len just over the 64 MiB cap must error, not allocate.
+    fn read_file_rejects_oversized_file_before_allocating() {
+        // A file (entry.size and its extent) just over the 64 MiB cap must
+        // error, not allocate.
         let oversized = MAX_FILE_BYTES as u32 + 2048;
         let icb = build_efe_icb(oversized as u64, oversized, 100);
         let mut reader = MemReader::new();
@@ -2634,7 +2644,7 @@ mod tests {
 
         let err = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "DIR",
@@ -2656,7 +2666,7 @@ mod tests {
         // directory data at meta_start(0) + ad_pos(50) = 50 reads as zeros.
         let dir = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "DIR",
@@ -2897,7 +2907,7 @@ mod tests {
         );
         let res = fs.file_extents(&mut reader, "/SP");
         assert!(
-            res.is_err(),
+            matches!(res, Err(Error::UdfUnrecordedExtent { .. })),
             "an unrecorded extent must never reach the title's extent list as \
              readable content; got {res:?}"
         );
@@ -3052,7 +3062,7 @@ mod tests {
         // real size, so the failure below is the ICB read and nothing else.
         let ok = read_directory(
             &mut inner,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -3074,7 +3084,7 @@ mod tests {
 
         let err = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -3116,7 +3126,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -3157,7 +3167,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -3765,7 +3775,7 @@ mod tests {
         let mut budget: usize = MAX_TOTAL_DIR_ENTRIES - 10;
         let err = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -3809,7 +3819,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -3841,7 +3851,7 @@ mod tests {
 
         let err = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "BDMV",
@@ -3862,7 +3872,7 @@ mod tests {
         ok_reader.put(5, build_efe_icb(2048, 2048, 60));
         let dir = read_directory(
             &mut ok_reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "BDMV",
@@ -4652,7 +4662,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -4697,7 +4707,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -4743,7 +4753,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -4798,7 +4808,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -4851,7 +4861,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -4895,7 +4905,7 @@ mod tests {
 
         let err = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -4931,7 +4941,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -4966,7 +4976,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5006,7 +5016,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5023,7 +5033,7 @@ mod tests {
     fn read_directory_ignores_fid_bytes_past_the_declared_directory_length() {
         // Information length (short_ad length) bounds the FID list; the sector-rounded buffer
         // has trailing bytes past it that aren't the directory, so over-scanning reads a stale
-        // deleted FID as live. Layout: FID "A" (40B) at 0, "GHOST" at 40, declared length 78.
+        // deleted FID as live. Layout: FID "A" (40B) at 0, "GHOST" at 40, declared length 40.
         let mut fids = Vec::new();
         push_fid_iu(&mut fids, "A", 7, false, false, 0);
         assert_eq!(
@@ -5036,14 +5046,14 @@ mod tests {
         dir[..fids.len()].copy_from_slice(&fids);
 
         let mut reader = MemReader::new();
-        reader.put(5, build_dir_icb_tagged(266, 0, 78, 60));
+        reader.put(5, build_dir_icb_tagged(266, 0, 40, 60));
         reader.put(60, dir);
         reader.put(7, build_efe_icb(11, 2048, 0));
         reader.put(8, build_efe_icb(22, 2048, 0));
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5060,10 +5070,9 @@ mod tests {
     }
 
     #[test]
-    fn read_directory_stops_at_a_descriptor_whose_tag_is_not_a_fid() {
-        // ECMA-167 3/7.2.1: the tag identifier is a 16-bit LE field (257 = FID); the FID list
-        // ends at the first non-FID. A single-byte compare would accept 0x0201 (513) as 257
-        // since both share low byte 0x01, wrongly parsing post-terminator bytes as FIDs.
+    fn read_directory_rejects_a_descriptor_whose_tag_is_not_a_fid() {
+        // ECMA-167 3/7.2.1: the tag identifier is a 16-bit LE field (257 = FID). A single-byte
+        // compare would accept 0x0201 (513) as 257 (same low byte); it must be an error.
         let mut fids = Vec::new();
         push_fid_iu(&mut fids, "REAL.MPLS", 7, false, false, 0);
         let mut dir = [0u8; 2048];
@@ -5083,9 +5092,9 @@ mod tests {
         reader.put(60, dir);
         reader.put(7, build_efe_icb(1, 2048, 0));
 
-        let parsed = read_directory(
+        let err = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5093,12 +5102,8 @@ mod tests {
             &mut 0,
             &mut HashSet::new(),
         )
-        .expect("dir parses");
-        assert_eq!(
-            child_names(&parsed),
-            vec!["REAL.MPLS".to_string()],
-            "both bytes of the descriptor tag must be compared"
-        );
+        .expect_err("a non-FID descriptor inside the declared length is corruption");
+        assert!(matches!(err, Error::DiscRead { .. }), "{err:?}");
     }
 
     #[test]
@@ -5121,7 +5126,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5135,9 +5140,9 @@ mod tests {
     }
 
     #[test]
-    fn read_directory_stops_instead_of_panicking_when_a_name_runs_past_the_buffer() {
+    fn read_directory_errors_instead_of_panicking_when_a_name_runs_past_the_buffer() {
         // L_IU (ECMA-167 4/14.4.7) is disc-controlled, so a malformed FID can
-        // place the name tens of KB past the buffer end. The scan must stop;
+        // place the name tens of KB past the buffer end. The scan must error;
         // slicing there would panic out of the public API on a damaged disc.
         let mut fids = Vec::new();
         push_fid_iu(&mut fids, "OK.MPLS", 7, false, false, 0);
@@ -5155,9 +5160,9 @@ mod tests {
         reader.put(60, dir);
         reader.put(7, build_efe_icb(5, 2048, 0));
 
-        let parsed = read_directory(
+        let err = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5165,12 +5170,8 @@ mod tests {
             &mut 0,
             &mut HashSet::new(),
         )
-        .expect("an out-of-range File Identifier must end the scan, not fail the read");
-        assert_eq!(
-            child_names(&parsed),
-            vec!["OK.MPLS".to_string()],
-            "entries read before the malformed FID are kept"
-        );
+        .expect_err("an out-of-range File Identifier is corruption, not a short listing");
+        assert!(matches!(err, Error::DiscRead { .. }), "{err:?}");
     }
 
     #[test]
@@ -5191,7 +5192,7 @@ mod tests {
         let mut budget = MAX_TOTAL_DIR_ENTRIES - 1;
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5252,7 +5253,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             100,
             "ROOT",
@@ -5307,7 +5308,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5342,7 +5343,7 @@ mod tests {
 
             let parsed = read_directory(
                 &mut reader,
-                0,
+                &mut 0,
                 &MetaMap::contiguous(0),
                 5,
                 "ROOT",
@@ -5367,7 +5368,7 @@ mod tests {
 
             let err = read_directory(
                 &mut reader,
-                0,
+                &mut 0,
                 &MetaMap::contiguous(0),
                 5,
                 "ROOT",
@@ -5401,7 +5402,7 @@ mod tests {
 
             let parsed = read_directory(
                 &mut reader,
-                0,
+                &mut 0,
                 &MetaMap::contiguous(0),
                 5,
                 "ROOT",
@@ -5437,7 +5438,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5473,7 +5474,7 @@ mod tests {
 
             let parsed = read_directory(
                 &mut reader,
-                0,
+                &mut 0,
                 &MetaMap::contiguous(0),
                 5,
                 "ROOT",
@@ -5505,7 +5506,7 @@ mod tests {
 
             let err = read_directory(
                 &mut reader,
-                0,
+                &mut 0,
                 &MetaMap::contiguous(0),
                 5,
                 "ROOT",
@@ -5538,7 +5539,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5568,7 +5569,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5679,7 +5680,7 @@ mod tests {
 
             let parsed = read_directory(
                 &mut reader,
-                0,
+                &mut 0,
                 &MetaMap::contiguous(0),
                 5,
                 "ROOT",
@@ -5723,7 +5724,7 @@ mod tests {
 
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5764,7 +5765,7 @@ mod tests {
         reader.put(51, build_cont_block(&cont_b));
         let res = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5791,7 +5792,7 @@ mod tests {
         reader.put(8, build_efe_icb(22, 2048, 0));
         let res = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -5930,7 +5931,7 @@ mod tests {
         reader.put(50, not_aed);
         let parsed = read_directory(
             &mut reader,
-            0,
+            &mut 0,
             &MetaMap::contiguous(0),
             5,
             "ROOT",
@@ -6026,6 +6027,10 @@ pub(crate) mod fixture {
         pub(crate) size: u64,
         pub(crate) long_ad: bool,
         pub(crate) contents: Vec<u8>,
+        /// When non-empty, the file's ICB carries exactly these `(partition-relative
+        /// LBA, byte length)` allocation descriptors (in order) instead of the single
+        /// `data_lba`/`size` one. A zero length terminates the list, as on a real disc.
+        pub(crate) ads: Vec<(u32, u32)>,
     }
 
     /// A directory node: ICB LBA, FID-list LBA, child files and subdirectories.
@@ -6053,6 +6058,26 @@ pub(crate) mod fixture {
         let ad_len = (size.min(u32::MAX as u64) as u32) & 0x3FFF_FFFF;
         s[216..220].copy_from_slice(&ad_len.to_le_bytes());
         s[220..224].copy_from_slice(&data_lba.to_le_bytes());
+        s
+    }
+
+    /// Extended File Entry ICB carrying every `(lba, byte_len)` in `ads` as a recorded AD.
+    pub(crate) fn build_file_icb_ads(ads: &[(u32, u32)], long_ad: bool) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes());
+        if long_ad {
+            s[34..36].copy_from_slice(&1u16.to_le_bytes());
+        }
+        let total: u64 = ads.iter().map(|a| a.1 as u64).sum();
+        s[56..64].copy_from_slice(&total.to_le_bytes());
+        let ad_size: usize = if long_ad { 16 } else { 8 };
+        s[212..216].copy_from_slice(&((ads.len() * ad_size) as u32).to_le_bytes());
+        let mut off = 216;
+        for &(lba, len) in ads {
+            s[off..off + 4].copy_from_slice(&(len & 0x3FFF_FFFF).to_le_bytes());
+            s[off + 4..off + 8].copy_from_slice(&lba.to_le_bytes());
+            off += ad_size;
+        }
         s
     }
 
@@ -6099,7 +6124,11 @@ pub(crate) mod fixture {
             push_fid(&mut fids, &f.name, f.icb_lba, false, false);
             disc.put(
                 PART_START + f.icb_lba,
-                build_file_icb(f.size, f.data_lba, f.long_ad),
+                if f.ads.is_empty() {
+                    build_file_icb(f.size, f.data_lba, f.long_ad)
+                } else {
+                    build_file_icb_ads(&f.ads, f.long_ad)
+                },
             );
             if !f.contents.is_empty() {
                 disc.put_bytes(PART_START + f.data_lba, &f.contents);
@@ -6159,6 +6188,7 @@ pub(crate) mod fixture {
             size,
             long_ad,
             contents: Vec::new(),
+            ads: Vec::new(),
         }
     }
 
@@ -6176,6 +6206,335 @@ pub(crate) mod fixture {
             size: contents.len() as u64,
             long_ad,
             contents,
+            ads: Vec::new(),
         }
+    }
+
+    /// A file whose ICB lists exactly `ads` as `(partition-relative LBA, byte length)`.
+    pub(crate) fn file_ads(
+        name: &str,
+        icb_lba: u32,
+        ads: &[(u32, u32)],
+        long_ad: bool,
+    ) -> FileSpec {
+        FileSpec {
+            name: name.to_string(),
+            icb_lba,
+            data_lba: 0,
+            size: 0,
+            long_ad,
+            contents: Vec::new(),
+            ads: ads.to_vec(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::fixture::{MemDisc, PART_START, build_udf_skeleton};
+    use super::*;
+    use std::collections::HashMap;
+
+    // Serves a generated File Entry for every LBA (`ads` short ADs at LBAs derived from the
+    // ICB's own LBA, so distinct ICBs never overlap); `over` replaces chosen sectors.
+    struct GenReader {
+        ads: usize,
+        reads: HashMap<u32, usize>,
+        over: HashMap<u32, [u8; 2048]>,
+        halt_from: Option<u32>,
+    }
+
+    impl GenReader {
+        fn new(ads: usize) -> Self {
+            Self {
+                ads,
+                reads: HashMap::new(),
+                over: HashMap::new(),
+                halt_from: None,
+            }
+        }
+    }
+
+    fn efe(l_ad: usize) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes());
+        s[212..216].copy_from_slice(&(l_ad as u32).to_le_bytes());
+        s
+    }
+
+    fn put_ad(s: &mut [u8; 2048], i: usize, len: u32, lba: u32) {
+        let o = 216 + i * 8;
+        s[o..o + 4].copy_from_slice(&len.to_le_bytes());
+        s[o + 4..o + 8].copy_from_slice(&lba.to_le_bytes());
+    }
+
+    impl SectorSource for GenReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            if self.halt_from.is_some_and(|h| lba >= h) {
+                return Err(Error::Halted);
+            }
+            for i in 0..count as u32 {
+                *self.reads.entry(lba + i).or_default() += 1;
+                let s = match self.over.get(&(lba + i)) {
+                    Some(s) => *s,
+                    None => {
+                        let mut s = efe(self.ads * 8);
+                        for k in 0..self.ads {
+                            put_ad(&mut s, k, 2048, (lba + i) * 1000 + k as u32 * 2);
+                        }
+                        s
+                    }
+                };
+                let off = i as usize * 2048;
+                buf[off..off + 2048].copy_from_slice(&s);
+            }
+            Ok(count as usize * 2048)
+        }
+    }
+
+    fn file(name: &str, meta_lba: u32) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            is_dir: false,
+            meta_lba,
+            size: 2048,
+            entries: Vec::new(),
+        }
+    }
+
+    fn fs_of(meta_start: u32, metadata_sectors: u32, entries: Vec<DirEntry>) -> UdfFs {
+        UdfFs {
+            root: DirEntry {
+                name: String::new(),
+                is_dir: true,
+                meta_lba: 0,
+                size: 0,
+                entries,
+            },
+            volume_id: String::new(),
+            partition_start: 0,
+            meta: MetaMap::contiguous(meta_start),
+            metadata_sectors,
+        }
+    }
+
+    #[test]
+    fn metadata_ranges_clamp_a_hostile_metadata_size() {
+        let fs = fs_of(1_000_000, 500_000, Vec::new());
+        let ranges = fs
+            .metadata_sector_ranges(&mut MemDisc::new())
+            .expect("ranges");
+        assert!(
+            ranges.iter().all(|r| r.1 <= MAX_STRUCT_SECTORS),
+            "no range may exceed the structure cap: {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn range_walks_fail_instead_of_collecting_unbounded_extents() {
+        let files: Vec<DirEntry> = (1..=400).map(|i| file(&format!("F{i}"), i)).collect();
+        let fs = fs_of(0, 1, files);
+        let a = fs.metadata_sector_ranges(&mut GenReader::new(228));
+        assert!(a.is_err(), "collect_file_ranges must cap its list");
+        let b = fs.non_stream_ranges(&mut GenReader::new(228));
+        assert!(b.is_err(), "non_stream_ranges must cap its list");
+    }
+
+    #[test]
+    fn range_walks_read_a_shared_icb_once() {
+        let files: Vec<DirEntry> = (0..50).map(|i| file(&format!("F{i}"), 5)).collect();
+        let fs = fs_of(0, 1, files);
+        let mut r = GenReader::new(3);
+        fs.metadata_sector_ranges(&mut r).expect("ranges");
+        assert_eq!(r.reads[&5], 1, "shared ICB read once (collect_file_ranges)");
+        let mut r = GenReader::new(3);
+        fs.non_stream_ranges(&mut r).expect("ranges");
+        assert_eq!(r.reads[&5], 1, "shared ICB read once (non_stream_ranges)");
+    }
+
+    #[test]
+    fn metadata_ranges_propagate_a_stop() {
+        let fs = fs_of(0, 1, vec![file("F", 7)]);
+        let mut r = GenReader::new(1);
+        r.halt_from = Some(1);
+        assert!(matches!(
+            fs.metadata_sector_ranges(&mut r),
+            Err(Error::Halted)
+        ));
+    }
+
+    #[test]
+    fn file_extents_refuse_an_extent_that_ends_past_the_lba_space() {
+        let fs = fs_of(0, 1, vec![file("F", 7)]);
+        let mut r = GenReader::new(0);
+        let mut e = efe(8);
+        put_ad(&mut e, 0, 4096, u32::MAX);
+        r.over.insert(7, e);
+        assert!(fs.file_extents(&mut r, "/F").is_err());
+        assert!(fs.file_extents_addressing(&mut r, "/F").is_err());
+    }
+
+    #[test]
+    fn vds_fault_after_the_partition_descriptor_is_not_a_verdict() {
+        struct Fault(MemDisc);
+        impl SectorSource for Fault {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                r: bool,
+            ) -> Result<usize> {
+                if lba == 33 {
+                    return Err(Error::DiscRead {
+                        sector: 33,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.0.read_sectors(lba, count, buf, r)
+            }
+        }
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        // Block 0 of the partition is a File Entry, as on a metadata-partition disc.
+        disc.put_bytes(PART_START, &266u16.to_le_bytes());
+        let err = read_filesystem(&mut Fault(disc)).expect_err("fault must surface");
+        assert!(matches!(err, Error::DiscRead { .. }), "{err:?}");
+    }
+
+    struct FaultAt(MemDisc, u32);
+    impl SectorSource for FaultAt {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            if lba == self.1 {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                });
+            }
+            self.0.read_sectors(lba, count, buf, r)
+        }
+    }
+
+    #[test]
+    fn single_partition_disc_with_an_unreadable_lvd_still_mounts() {
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        fixture::lay_dir(
+            &mut disc,
+            &fixture::DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: Vec::new(),
+            },
+        );
+        let fs = read_filesystem(&mut FaultAt(disc, 33)).expect("must still mount");
+        assert_eq!(fs.partition_start, PART_START);
+    }
+
+    // Corrupt (non-FID) tag inside a subdirectory: that dir lists empty, the scan survives.
+    #[test]
+    fn a_corrupt_fid_tag_in_a_subdirectory_lists_it_empty() {
+        let mut r = GenReader::new(0);
+        let mut root = efe(8);
+        let mut f = vec![0u8; 44];
+        f[0..2].copy_from_slice(&257u16.to_le_bytes());
+        f[18] = 0x02;
+        f[19] = 4;
+        f[24..28].copy_from_slice(&1000u32.to_le_bytes());
+        f[38..42].copy_from_slice(&[8, b'D', b'A', b'B']);
+        put_ad(&mut root, 0, f.len() as u32, 6);
+        r.over.insert(5, root);
+        let mut s = [0u8; 2048];
+        s[..f.len()].copy_from_slice(&f);
+        r.over.insert(6, s);
+        let mut d = efe(8);
+        put_ad(&mut d, 0, 64, 7);
+        r.over.insert(1000, d);
+        let mut bad = [0u8; 2048];
+        bad[0..2].copy_from_slice(&266u16.to_le_bytes());
+        r.over.insert(7, bad);
+        let root = read_directory(
+            &mut r,
+            &mut 0,
+            &MetaMap::contiguous(0),
+            5,
+            "",
+            0,
+            &mut 0,
+            &mut HashSet::new(),
+        )
+        .expect("subdirectory corruption must not fail the walk");
+        assert_eq!(root.entries.len(), 1);
+        assert!(root.entries[0].entries.is_empty());
+    }
+
+    #[test]
+    fn directory_walk_caps_sectors_read_across_subdirectories() {
+        // Root lists 100 subdirectories; each declares a 1 MiB extent of no FIDs.
+        let mut fids = Vec::new();
+        for k in 0..100u32 {
+            let mut f = vec![0u8; 44];
+            f[0..2].copy_from_slice(&257u16.to_le_bytes());
+            f[18] = 0x02;
+            f[19] = 4;
+            f[24..28].copy_from_slice(&(1000 + k).to_le_bytes());
+            f[38..42].copy_from_slice(&[8, b'D', b'0' + (k / 10) as u8, b'0' + (k % 10) as u8]);
+            fids.extend_from_slice(&f);
+        }
+        let mut r = GenReader::new(0);
+        let mut root = efe(8);
+        put_ad(&mut root, 0, fids.len() as u32, 6);
+        r.over.insert(5, root);
+        for (i, c) in fids.chunks(2048).enumerate() {
+            let mut s = [0u8; 2048];
+            s[..c.len()].copy_from_slice(c);
+            r.over.insert(6 + i as u32, s);
+        }
+        for k in 0..100u32 {
+            let mut d = efe(8);
+            put_ad(&mut d, 0, MAX_DIR_BYTES, 100_000);
+            r.over.insert(1000 + k, d);
+        }
+        // Zeroed data: each subdirectory lists empty, so only the tree-wide budget can trip.
+        for s in 100_000..100_000 + MAX_DIR_BYTES / 2048 {
+            r.over.insert(s, [0u8; 2048]);
+        }
+        let res = read_directory(
+            &mut r,
+            &mut 0,
+            &MetaMap::contiguous(0),
+            5,
+            "",
+            0,
+            &mut 0,
+            &mut HashSet::new(),
+        );
+        assert!(res.is_err(), "tree-wide sector budget must trip");
+        let data_reads: usize = (100_000..100_000 + MAX_DIR_BYTES / 2048)
+            .map(|s| r.reads.get(&s).copied().unwrap_or(0))
+            .sum();
+        assert!(
+            data_reads <= (MAX_TOTAL_DIR_SECTORS + MAX_DIR_BYTES / 2048) as usize,
+            "sectors read must stay near the cap: {data_reads}"
+        );
+    }
+
+    #[test]
+    fn eight_bit_cs0_is_latin1() {
+        assert_eq!(parse_udf_name(&[8, 0xE9, b'A']), "\u{e9}A");
+        let mut field = [0u8; 32];
+        field[..3].copy_from_slice(&[8, 0xC4, 0]);
+        field[31] = 3;
+        assert_eq!(parse_dstring(&field), "\u{c4}");
     }
 }

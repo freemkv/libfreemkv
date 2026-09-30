@@ -19,10 +19,8 @@ const MAX_SPU_BYTES: usize = 0xFFFF;
 pub struct DvdSubParser {
     /// Pre-formatted VobSub .idx palette header for codec_private.
     codec_data: Option<Vec<u8>>,
-    /// In-progress SPU reassembly: (head PTS in ns, declared SPU_size, bytes).
-    /// The SPU being accumulated, with the facts of the PES that STARTED it.
-    /// An SPU spans PES packets, so its timestamp and source offset are the
-    /// opening packet's — the same rule every other buffering parser applies.
+    /// In-progress SPU reassembly: (facts of the PES that STARTED it, declared SPU_size, bytes).
+    /// An SPU spans PES packets, so its timestamp and source offset are the opening packet's.
     pending: Option<(super::pesbuf::PesFacts, usize, Vec<u8>)>,
 }
 
@@ -77,6 +75,10 @@ impl CodecParser for DvdSubParser {
         // force-emits it truncated rather than swallowing all later SPUs.
         let pts = match pes.pts {
             None => {
+                // A gap truncated the open SPU; its continuation cannot be spliced.
+                if pes.discontinuity {
+                    self.pending = None;
+                }
                 if self.pending.is_some() {
                     // Continuation: append, bounded by MAX_SPU_BYTES.
                     if let Some((_, _, buf)) = self.pending.as_mut() {
@@ -240,6 +242,17 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    #[test]
+    fn post_gap_continuation_is_not_spliced_onto_pending_spu() {
+        let mut parser = DvdSubParser::new(None);
+        let head = vec![0x00, 0x08, 0xDE, 0xAD];
+        assert!(parser.parse(&make_pes(head, Some(90000))).is_empty());
+        let mut cont = make_pes(vec![1, 2, 3, 4], None);
+        cont.discontinuity = true;
+        assert!(parser.parse(&cont).is_empty(), "no spliced SPU emitted");
+        assert!(parser.flush().is_empty());
     }
 
     #[test]
@@ -635,25 +648,18 @@ mod tests {
 
     #[test]
     fn continuation_appends_bounded_by_max_spu() {
-        // A continuation must not push the buffer past MAX_SPU_BYTES. Declared a
-        // huge size so it never completes naturally, then flood continuations.
+        // Declared the largest size (0xFFFF), so the SPU completes exactly when the clamp
+        // fills the buffer: an unclamped append would emit a longer frame.
         let mut parser = DvdSubParser::new(None);
-        let mut head = vec![0xFF, 0xFE]; // declared 0xFFFE
+        let mut head = vec![0xFF, 0xFF];
         head.extend(std::iter::repeat_n(0x11, 1000));
         assert!(parser.parse(&make_pes(head, Some(90000))).is_empty());
-        // Flood continuations far exceeding the cap.
+        let mut frames = Vec::new();
         for _ in 0..100 {
-            let _ = parser.parse(&make_pes(vec![0x22u8; 2000], None));
+            frames.extend(parser.parse(&make_pes(vec![0x22u8; 2000], None)));
         }
-        let pending_len = parser
-            .pending
-            .as_ref()
-            .map(|(_, _, b)| b.len())
-            .unwrap_or(0);
-        assert!(
-            pending_len <= MAX_SPU_BYTES,
-            "pending {pending_len} exceeded MAX_SPU_BYTES {MAX_SPU_BYTES}"
-        );
+        assert_eq!(frames.len(), 1, "the SPU completes once");
+        assert_eq!(frames[0].data.len(), MAX_SPU_BYTES, "clamped to the cap");
     }
 
     // --- one-byte head: too short to carry SPU_size ---

@@ -40,13 +40,14 @@ pub enum FieldOrder {
 
 /// MPEG-2 picture coding extension signals, decoded once at the parse site.
 ///
-/// All four bits are read from ISO/IEC 13818-2 §6.3.10 (picture coding
+/// These flags are read from ISO/IEC 13818-2 §6.3.10 (picture coding
 /// extension) and §6.3.5 (sequence extension `progressive_sequence`); this
 /// struct is the raw record the agnostic accessors derive from. Consumers do
 /// NOT read these fields directly — they go through [`PictureInfo`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mpeg2Coding {
-    /// `top_field_first` (picture coding extension).
+    /// `top_field_first` (picture coding extension) for a frame picture; for a
+    /// field picture (§6.3.10 forces it 0) the pair's field order, set by the parser.
     pub top_field_first: bool,
     /// `repeat_first_field` (picture coding extension) — the 2:3 pulldown bit.
     pub repeat_first_field: bool,
@@ -163,15 +164,14 @@ impl PictureInfo {
 
     /// Field display order for this picture, or `None` when the codec could not
     /// determine it (signal absent / not yet wired). MPEG-2: derived from
-    /// `top_field_first` and the progressive flags (ISO/IEC 13818-2 §6.3.10) —
+    /// `top_field_first` (the pair's order for field pictures) and the progressive flags (ISO/IEC 13818-2 §6.3.10) —
     /// a progressive frame/sequence reports [`FieldOrder::Progressive`].
     pub fn field_order(&self) -> Option<FieldOrder> {
         match self.detail {
             CodingDetail::Mpeg2(m) => {
                 if !m.frame_picture {
-                    // Field pictures are coded top/bottom by picture_structure, not
-                    // top_field_first (§6.3.10 forces it to 0 here). picture_structure
-                    // isn't retained on this carrier, so this is a best-effort hint.
+                    // §6.3.10 forces top_field_first to 0 in a field picture, so the
+                    // parser stores `picture_structure == top field` there instead.
                     Some(if m.top_field_first {
                         FieldOrder::Tff
                     } else {
@@ -333,6 +333,33 @@ mod tests {
             mpeg2(CodingType::P, false, true, false, true, true).nb_fields(),
             4
         );
+    }
+
+    #[test]
+    fn mpeg2_nb_fields_rff_on_interlaced_frame_is_two() {
+        // Spec-forbidden rff on a non-progressive interlaced frame: treated as 2.
+        for tff in [false, true] {
+            assert_eq!(
+                mpeg2(CodingType::P, tff, true, false, false, true).nb_fields(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn mpeg2_field_picture_reports_pair_order_not_progressive() {
+        // Field picture: order comes from the stored pair order, even when the
+        // progressive flags are set.
+        for (prog_frame, prog_seq) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                mpeg2(CodingType::P, true, false, prog_frame, prog_seq, false).field_order(),
+                Some(FieldOrder::Tff)
+            );
+            assert_eq!(
+                mpeg2(CodingType::P, false, false, prog_frame, prog_seq, false).field_order(),
+                Some(FieldOrder::Bff)
+            );
+        }
     }
 
     #[test]

@@ -50,8 +50,8 @@ fn scan_image_empty_reader() {
     let opts = ScanOptions::default();
     let result = Disc::scan_image(&mut reader, 0, &opts);
     assert!(
-        result.is_err(),
-        "scan_image should fail with empty reader (no AVDP)"
+        matches!(result, Err(libfreemkv::error::Error::UdfNotFilesystem)),
+        "empty reader (no AVDP) must surface the not-UDF verdict"
     );
 }
 

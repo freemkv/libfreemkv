@@ -199,6 +199,8 @@ pub struct LpcmParser {
     /// Last BD header byte 2 (channel_assignment|rate), reported as codec_private so
     /// an M2TS re-mux keeps the exact layout (e.g. 2/2 vs 3/1).
     bd_layout_byte: Option<u8>,
+    /// Packets refused for a reserved header code (counted, never poisoning).
+    tally: super::dropgate::DropTally,
 }
 
 impl Default for LpcmParser {
@@ -216,7 +218,13 @@ impl LpcmParser {
             anchor_ns: 0,
             samples_since_anchor: 0,
             bd_layout_byte: None,
+            tally: super::dropgate::DropTally::new("lpcm"),
         }
+    }
+
+    /// Packets dropped for a reserved or unsupported LPCM header.
+    pub fn dropped_frames(&self) -> u64 {
+        self.tally.dropped_frames()
     }
 
     /// BD-TS LPCM parser (4-byte BD LPCM header per PES).
@@ -253,6 +261,12 @@ impl CodecParser for LpcmParser {
         };
         // Reserved header codes: drop the packet, as ffmpeg does (INVALIDDATA).
         let Some(format) = parsed else {
+            if self.tally.dropped_frames() == 0 {
+                tracing::warn!(target: "mux", "lpcm: reserved/unsupported header; dropping packets");
+            }
+            let pts = pes.pts.or(pes.dts).map_or(0, pts_to_ns);
+            self.tally
+                .record_collateral_drop(pts, 0, pes.data.len(), "reserved-header");
             return Vec::new();
         };
         if self.bd {
@@ -307,8 +321,7 @@ impl CodecParser for LpcmParser {
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
-        self.bd_layout_byte
-            .map(|b| [LAYOUT_TAG.as_slice(), &[b]].concat())
+        self.bd_layout_byte.map(tagged_layout)
     }
 }
 
@@ -539,6 +552,14 @@ mod tests {
 
     fn all(frames: &[Frame]) -> Vec<u8> {
         frames.iter().flat_map(|f| f.data.clone()).collect()
+    }
+
+    #[test]
+    fn reserved_header_code_is_counted() {
+        let mut p = LpcmParser::new();
+        // bits_code 0 is reserved for BD LPCM.
+        assert!(p.parse(&make_pes(bd(3, 0, &[0; 8]), Some(0))).is_empty());
+        assert_eq!(p.dropped_frames(), 1);
     }
 
     #[test]
@@ -832,6 +853,49 @@ mod tests {
                 0xA0, 0xA1, 0xA2, 0xB0, 0xB1, 0xB2, 0xC0, 0xC1, 0xC2, 0xD0, 0xD1, 0xD2
             ]
         );
+    }
+
+    // A carried partial sample belongs to the format and stretch it came from: a format change
+    // or a gap drops it instead of gluing it to the next PES.
+    #[test]
+    fn dvd_carry_is_dropped_on_a_format_change_or_a_discontinuity() {
+        let stale = [0xEEu8; 2];
+        let next = [1u8, 2, 3, 4];
+        // 16-bit stereo, then 2 bytes of the next sample held back.
+        let seed = || {
+            let mut p = LpcmParser::new_dvd();
+            p.parse(&make_pes(
+                dvd(0x01, &[[0u8; 4].as_slice(), &stale].concat()),
+                Some(0),
+            ));
+            p
+        };
+        // Same format, gap: the carry must not lead the post-gap sample.
+        let mut p = seed();
+        let mut gap = make_pes(dvd(0x01, &next), Some(90_000));
+        gap.discontinuity = true;
+        assert_eq!(all(&p.parse(&gap)), w24(&next), "gap drops the carry");
+
+        // Format change (16-bit -> 24-bit stereo): one 12-byte block is 2 sample frames.
+        let block = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut fresh = LpcmParser::new_dvd();
+        let want = all(&fresh.parse(&make_pes(dvd(0x81, &block), Some(90_000))));
+        let mut p = seed();
+        let got = p.parse(&make_pes(dvd(0x81, &block), Some(90_000)));
+        assert_eq!(all(&got), want, "format change drops the carry");
+        assert_eq!(got[0].pts_ns, 1_000_000_000, "and the PTS is not led back");
+    }
+
+    // BD PES hold whole sample frames: a trailing partial one is discarded, never glued onto
+    // the next PES.
+    #[test]
+    fn bd_trailing_partial_sample_is_not_carried_into_the_next_pes() {
+        let mut p = LpcmParser::new();
+        let first = p.parse(&make_pes(bd(3, 1, &[9, 9, 9, 9, 0xEE, 0xEE]), Some(0)));
+        assert_eq!(all(&first), w24(&[9, 9, 9, 9]), "the whole sample only");
+        let next = [1u8, 2, 3, 4];
+        let got = p.parse(&make_pes(bd(3, 1, &next), Some(90_000)));
+        assert_eq!(all(&got), w24(&next), "the discarded tail does not lead it");
     }
 
     #[test]

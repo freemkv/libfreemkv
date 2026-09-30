@@ -922,11 +922,10 @@ mod tests {
         assert_eq!(st.mkb_version, None);
     }
 
-    /// A supplied handshake's volume_id and read_data_key propagate onto the
-    /// AacsState (encrypt.rs `handshake.map(|h| h.volume_id)` /
-    /// `handshake.and_then(|h| h.read_data_key)`).
+    /// A supplied handshake's volume_id propagates onto the AacsState
+    /// (encrypt.rs `handshake.map(|h| h.volume_id)`).
     #[test]
-    fn vid_only_propagates_handshake_vid_and_rdk() {
+    fn vid_only_propagates_handshake_vid() {
         let mut disc = MemDisc::new();
         let udf = build_aacs_fs(
             &mut disc,

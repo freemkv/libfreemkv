@@ -371,10 +371,16 @@ const ISO_639_1_TO_2: &[(&str, &str)] = &[
 ];
 
 // Withdrawn ISO 639-1 codes DVD-Video still carries (frozen at the 1988 edition).
-const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[("iw", "he"), ("in", "id"), ("ji", "yi")];
+const ISO_639_1_DEPRECATED: &[(&str, &str)] = &[
+    ("iw", "he"),
+    ("in", "id"),
+    ("ji", "yi"),
+    ("jw", "jv"),
+    ("mo", "ro"),
+];
 
 /// Map an ISO 639-1 two-letter language code to its ISO 639-2/T three-letter
-/// code, accepting the withdrawn DVD-era spellings (`iw`, `in`, `ji`) as
+/// code, accepting the withdrawn DVD-era spellings (`iw`, `in`, `ji`, `jw`, `mo`) as
 /// aliases for their replacements.
 ///
 /// Covers the WHOLE of ISO 639-1, unlike [`menu_lang`], whose table only spans the languages
@@ -488,6 +494,12 @@ fn has_word(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso639_1_accepts_jw_and_mo_dvd_aliases() {
+        assert_eq!(iso639_1_to_iso639_2("jw"), Some("jav"));
+        assert_eq!(iso639_1_to_iso639_2("mo"), Some("ron"));
+    }
 
     #[test]
     fn codec_known_aliases() {
@@ -750,8 +762,8 @@ mod tests {
         assert_eq!(codec("dts"), "dts");
     }
 
-    /// Spec: all 36 bare-lang entries must resolve correctly.
-    /// Mutation: swap two entries in BARE_LANGS → wrong code returned.
+    /// Spec: every BARE_LANGS entry must resolve to its code.
+    /// Mutation: swap two entries' codes in BARE_LANGS -> wrong code returned.
     #[test]
     fn lang_bare_all_entries_spot_check() {
         let cases = [
@@ -762,22 +774,65 @@ mod tests {
             ("Italian", "ita"),
             ("Japanese", "jpn"),
             ("Chinese", "zho"),
-            ("Korean", "kor"),
+            ("Mandarin", "zho"),
+            ("Cantonese", "zho"),
             ("Portuguese", "por"),
             ("Polish", "pol"),
             ("Czech", "ces"),
             ("Hungarian", "hun"),
             ("Dutch", "nld"),
+            ("Korean", "kor"),
             ("Arabic", "ara"),
-            ("Russian", "rus"),
+            ("Hindi", "hin"),
+            ("Turkish", "tur"),
+            ("Thai", "tha"),
             ("Swedish", "swe"),
+            ("Norwegian", "nor"),
+            ("Danish", "dan"),
             ("Finnish", "fin"),
+            ("Hebrew", "heb"),
+            ("Russian", "rus"),
+            ("Greek", "ell"),
+            ("Vietnamese", "vie"),
+            ("Indonesian", "ind"),
+            ("Malay", "msa"),
+            ("Ukrainian", "ukr"),
+            ("Romanian", "ron"),
+            ("Bulgarian", "bul"),
+            ("Croatian", "hrv"),
+            ("Serbian", "srp"),
+            ("Slovak", "slk"),
+            ("Slovenian", "slv"),
+            ("Estonian", "est"),
+            ("Latvian", "lav"),
+            ("Lithuanian", "lit"),
+            ("Icelandic", "isl"),
+            ("Basque", "eus"),
+            ("Catalan", "cat"),
+            ("Galician", "glg"),
         ];
+        assert_eq!(
+            cases.len(),
+            BARE_LANGS.len(),
+            "table and cases must stay in step"
+        );
         for (name, code) in cases {
             let r = lang(name).unwrap_or_else(|| panic!("lang({:?}) must be Some", name));
             assert_eq!(r.code, code, "wrong code for {}", name);
             assert_eq!(r.variant, "", "bare lang {} must have empty variant", name);
         }
+    }
+
+    /// Needles embedded in longer words must not match in qualifier/purpose/lang.
+    /// Mutation: has_word -> contains() in any of the three -> a false hit.
+    #[test]
+    fn embedded_needles_do_not_match_word_classifiers() {
+        assert_eq!(qualifier("xsdhx"), LabelQualifier::None);
+        assert_eq!(qualifier("uncaptions"), LabelQualifier::None);
+        assert_eq!(purpose("uncommentary"), LabelPurpose::Normal);
+        assert_eq!(purpose("scorecard"), LabelPurpose::Normal);
+        assert_eq!(lang("englishman"), None);
+        assert_eq!(lang("thaiwan"), None);
     }
 
     /// Word boundary: "sdh" inside "lambdash" must not match.

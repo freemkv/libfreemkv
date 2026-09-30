@@ -70,6 +70,9 @@ pub const E_BUS_STREAM_UNMAPPED: u16 = 6021;
 /// whole-disc image (`iso://` copy, `dir://` extract): only the chosen titles, nav
 /// and UDF were ever read, so the rest of it is not disc data.
 pub const E_IMAGE_SCOPED: u16 = 6022;
+/// An HD-DVD `ADV_OBJ/VPLST*.XPL` playlist exceeds the parser's size cap. Logged by
+/// `disc::hddvd`, which then falls back to the per-clip heuristic; no [`Error`] variant.
+pub const E_XPL_TOO_LARGE: u16 = 6023;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -138,6 +141,15 @@ pub const E_AACS_NO_USABLE_HOST_CERT: u16 = 7033;
 /// carries a `vidfp`: the key is derivable only from the disc's Volume ID.
 /// "the server must tell the two apart by code" (keys-upfront-design J11).
 pub const E_AACS_VID_NEEDS_DISC: u16 = 7034;
+// AACS 2.1 variant media-key chain (`MediaKeyVariantError`); 7105 is a reserved gap.
+pub const E_MKB_VARIANT_NOT_VARIANT: u16 = 7100;
+pub const E_MKB_VARIANT_INCOMPLETE: u16 = 7101;
+pub const E_MKB_VARIANT_PK_UNAVAILABLE: u16 = 7102;
+pub const E_MKB_VARIANT_SOFT_CORRECTION: u16 = 7103;
+pub const E_MKB_VARIANT_ONLINE_CHALLENGE: u16 = 7104;
+pub const E_MKB_VARIANT_TABLE_UNAVAILABLE: u16 = 7106;
+pub const E_MKB_VARIANT_VKD_RANGE: u16 = 7107;
+pub const E_MKB_VARIANT_VERIFY_FAILED: u16 = 7108;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -197,7 +209,7 @@ pub const E_DIR_IMAGE_SSIF_UNSUPPORTED: u16 = 9061;
 /// A `dir://` SOURCE `VIDEO_TS` folder's IFO-declared VOB offsets cannot be
 /// satisfied by any placement: the required start sector of a VOB lies BELOW
 /// the end of the file that must precede it. Carries the offending file's disc
-/// path. A silently misplaced VOB would rip the wrong sectors.
+/// path. Also raised for an IFO too short to resolve its placement offsets.
 pub const E_DIR_IMAGE_PLACEMENT: u16 = 9062;
 /// A `dir://` SOURCE folder still carries live AACS-encrypted content: it has
 /// an `AACS/` directory AND the sampled content units are genuinely scrambled.
@@ -217,7 +229,7 @@ pub const E_DIR_IMAGE_TOO_LARGE: u16 = 9066;
 /// File Identifier Descriptor stores the encoded length in one byte.
 pub const E_DIR_NAME_TOO_LONG: u16 = 9067;
 /// One directory in the folder holds more subdirectories than a UDF link count
-/// can express (it is 16 bits, one per child plus one for its own entry).
+/// can express (16 bits), or more entries than the reader's directory size cap.
 pub const E_DIR_IMAGE_FANOUT: u16 = 9068;
 /// A title's clip marks excluded more frames than they kept.
 pub const E_SEAM_PLAN_DROPPED_MOST: u16 = 9069;
@@ -303,6 +315,8 @@ pub const E_TIMED_OUT: u16 = 9073;
 /// `mpg://` output but the title has no video track a program stream can carry
 /// (MPEG-1/2, H.264, HEVC or VC-1). The `mpg://` twin of [`E_MP4_NO_VIDEO_TRACK`].
 pub const E_MPG_NO_VIDEO_TRACK: u16 = 9074;
+/// `mpg://` reached end of input with access units no pack could take.
+pub const E_MPG_UNPACKETIZED: u16 = 9075;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -883,7 +897,8 @@ pub enum Error {
     DirNameTooLong {
         path: String,
     },
-    /// One directory holds more subdirectories than a UDF link count can express.
+    /// One directory holds more subdirectories than a UDF link count can express,
+    /// or more entries than the reader's per-directory size cap allows.
     ///
     /// A directory's File Entry records its link count in 16 bits, and that
     /// count is one per child directory plus one for its own entry in its
@@ -919,6 +934,8 @@ pub enum Error {
     /// `mpg://` target title has no video track a program stream can carry. See
     /// [`E_MPG_NO_VIDEO_TRACK`]. Declared ahead of the `mpg://` sink that raises it.
     MpgNoVideoTrack,
+    /// `mpg://` end of input left access units unwritten. See [`E_MPG_UNPACKETIZED`].
+    MpgUnpacketized,
 }
 
 impl Error {
@@ -1060,6 +1077,7 @@ impl Error {
             Error::StreamHeaderWritten => E_STREAM_HEADER_WRITTEN,
             Error::TimedOut { .. } => E_TIMED_OUT,
             Error::MpgNoVideoTrack => E_MPG_NO_VIDEO_TRACK,
+            Error::MpgUnpacketized => E_MPG_UNPACKETIZED,
             Error::DirImageFileChanged { .. } => E_DIR_IMAGE_FILE_CHANGED,
             Error::DirImageTooLarge => E_DIR_IMAGE_TOO_LARGE,
         }
@@ -1188,7 +1206,10 @@ impl std::fmt::Display for Error {
                 required,
                 available,
             } => write!(f, "E{}: {}/{}", self.code(), required, available),
-            Error::DirNameCollision { host } => write!(f, "E{}: {}", self.code(), host),
+            // `host` is a raw disc name: escape control characters.
+            Error::DirNameCollision { host } => {
+                write!(f, "E{}: {}", self.code(), host.escape_debug())
+            }
             // errno is Option: emit it after the code when present, else the
             // bare code (mirrors NoDiscKey's empty-field handling — no dangling
             // "colon space" suffix).
@@ -1338,6 +1359,7 @@ impl From<Error> for std::io::Error {
             // video track / missing codec-private config. All are invalid data.
             E_MP4_NO_VIDEO_TRACK
             | E_MPG_NO_VIDEO_TRACK
+            | E_MPG_UNPACKETIZED
             | E_MP4_INVALID
             | E_MP4_MISSING_CODEC_PRIVATE
             | E_MP4_UNKNOWN_RESOLUTION => std::io::ErrorKind::InvalidData,
@@ -1398,6 +1420,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`From<Error> for io::Error`] is the ONLY path from a typed [`Error`] to an `io::Error` in
 /// this crate.
 pub fn error_code(e: &std::io::Error) -> Option<u16> {
+    // Typed payload first: exact, and immune to a foreign message that looks like a code.
+    if let Some(typed) = e.get_ref().and_then(|i| i.downcast_ref::<Error>()) {
+        return Some(typed.code());
+    }
     // Round-tripped: `From<Error> for io::Error` renders as "E<code>[: …]".
     let s = e.to_string();
     let digits = s.strip_prefix('E')?;
@@ -1619,6 +1645,55 @@ mod tests {
         assert!(!is_skippable_title_stub(&aacs));
     }
 
+    // A stop maps to Interrupted, not the 6xxx InvalidData arm it sits inside.
+    #[test]
+    fn halted_maps_to_interrupted() {
+        let e: std::io::Error = Error::Halted.into();
+        assert_eq!(e.kind(), std::io::ErrorKind::Interrupted);
+        assert!(is_halt(&e));
+    }
+
+    // Every whole-disc key code, and only those, is disc-level.
+    #[test]
+    fn disc_level_no_key_covers_every_documented_code() {
+        for e in [
+            Error::KeydbLoad { path: "p".into() },
+            Error::AacsNoKeys,
+            Error::KeyServiceUnavailable,
+            Error::KeyServiceUnauthorized,
+            Error::KeyServiceRateLimited,
+        ] {
+            let io: std::io::Error = e.into();
+            assert!(is_disc_level_no_key(&io), "{io}");
+        }
+        let per_title: std::io::Error = Error::MkvInvalid.into();
+        assert!(!is_disc_level_no_key(&per_title));
+    }
+
+    // Pin, not a guard: typed and string paths agree for every `Error` (Display leads
+    // with its code). The fallback stays for consumers' string-coded io::Errors.
+    #[test]
+    fn error_code_reads_the_typed_payload() {
+        let typed: std::io::Error = Error::Halted.into();
+        assert_eq!(error_code(&typed), Some(E_HALTED));
+        assert_eq!(
+            error_code(&std::io::Error::other("E6010: x")),
+            Some(E_HALTED)
+        );
+        assert_eq!(error_code(&std::io::Error::other("plain")), None);
+    }
+
+    // A raw disc name with control bytes cannot inject terminal escapes via Display.
+    #[test]
+    fn dir_name_collision_display_escapes_control_characters() {
+        let e = Error::DirNameCollision {
+            host: "A\x1b[2JB\n".into(),
+        };
+        let shown = e.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.contains("A\\u{1b}[2JB\\n"), "{shown}");
+    }
+
     #[test]
     fn new_variants_have_distinct_codes() {
         let codes = [
@@ -1676,6 +1751,7 @@ mod tests {
             Error::AacsVidNeedsDisc.code(),
             Error::TimedOut { op: "verify" }.code(),
             Error::MpgNoVideoTrack.code(),
+            Error::MpgUnpacketized.code(),
             Error::ShortImageRead {
                 lba: 0,
                 expected: 1,
@@ -1767,6 +1843,7 @@ mod tests {
             (Error::AacsVidNeedsDisc, E_AACS_VID_NEEDS_DISC),
             (Error::TimedOut { op: "verify" }, E_TIMED_OUT),
             (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
+            (Error::MpgUnpacketized, E_MPG_UNPACKETIZED),
             (
                 Error::BusStreamUnmapped {
                     files: "/BDMV/STREAM/00002.m2ts".into(),
@@ -2091,6 +2168,7 @@ mod tests {
         assert!((6000..7000).contains(&E_IMAGE_ENDS_BEFORE_READ));
         assert!((6000..7000).contains(&E_BUS_STREAM_UNMAPPED));
         assert!((6000..7000).contains(&E_IMAGE_SCOPED));
+        assert!((6000..7000).contains(&E_XPL_TOO_LARGE));
         // AACS (7xxx)
         assert!((7000..8000).contains(&E_AACS_NO_KEYS));
         assert!((7000..8000).contains(&E_NO_DISC_KEY));
@@ -2138,6 +2216,7 @@ mod tests {
             (Error::StreamHeaderWritten, E_STREAM_HEADER_WRITTEN),
             (Error::Mp4NoVideoTrack, E_MP4_NO_VIDEO_TRACK),
             (Error::MpgNoVideoTrack, E_MPG_NO_VIDEO_TRACK),
+            (Error::MpgUnpacketized, E_MPG_UNPACKETIZED),
             (Error::Mp4Invalid, E_MP4_INVALID),
             (Error::Mp4MissingCodecPrivate, E_MP4_MISSING_CODEC_PRIVATE),
             (Error::Mp4UnknownResolution, E_MP4_UNKNOWN_RESOLUTION),

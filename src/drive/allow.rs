@@ -7,6 +7,8 @@
 pub(crate) const PREVENT_ALLOW: u8 = 0x1E;
 /// START STOP UNIT.
 pub(crate) const START_STOP_UNIT: u8 = 0x1B;
+/// START STOP UNIT with LoEj=1, Start=0: eject the disc if permitted (MMC-6 Table 633).
+pub(crate) const EJECT_CDB: [u8; 6] = [START_STOP_UNIT, 0, 0, 0, 0x02, 0];
 /// REPORT KEY.
 pub(crate) const REPORT_KEY: u8 = 0xA4;
 
@@ -78,7 +80,7 @@ mod tests {
 
     const ALLOW: [u8; 6] = [0x1E, 0, 0, 0, 0x00, 0];
     const PREVENT: [u8; 6] = [0x1E, 0, 0, 0, 0x01, 0];
-    const EJECT: [u8; 6] = [0x1B, 0, 0, 0, 0x02, 0];
+    const EJECT: [u8; 6] = EJECT_CDB;
     const START: [u8; 6] = [0x1B, 0, 0, 0, 0x01, 0];
     const READ: [u8; 10] = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
 
@@ -132,5 +134,8 @@ mod tests {
         alloc[10] = 0x00;
         assert_eq!(invalidated_agid(&alloc), None, "format 0 allocates");
         assert_eq!(invalidated_agid(&[0xA4, 0, 0]), None, "short CDB");
+        let mut other = release(3);
+        other[0] = 0x00;
+        assert_eq!(invalidated_agid(&other), None, "not REPORT KEY");
     }
 }

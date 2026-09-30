@@ -1,7 +1,8 @@
 //! `MS-n`: the quotes behind the `mpg://` program stream sink (mpg-output-design v5
-//! §2.2-§2.4, L2): ITU-T Rec. H.222.0 (02/2000) | ISO/IEC 13818-1:2000, the local
-//! `/private/tmp/h222.txt` (J24: the 2000 edition), plus FFmpeg corroboration of the
-//! DVD private_stream_1 sub-stream headers, which the standard leaves "user definable".
+//! §2.2-§2.4, L2): ITU-T Rec. H.222.0 (02/2000) | ISO/IEC 13818-1:2000
+//! (the 2000 edition; `h222:N` locators are line numbers of a local text copy), plus
+//! FFmpeg corroboration of the DVD private_stream_1 sub-stream headers, which the
+//! standard leaves "user definable".
 
 use super::{QuoteKind, SpecQuote};
 

@@ -214,8 +214,10 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
                 // rest — Terminate / Link — fall through). A logo/pre-roll whose
                 // id isn't a feature candidate lets autoplay resume at pc + 1.
                 2 if matches!(c.branch_opt, 0x00..=0x02) => {
-                    let id = dst as u16;
-                    if is_feature(id) {
+                    // A playlist id is 16-bit; an operand that doesn't fit is not one.
+                    if let Ok(id) = u16::try_from(dst)
+                        && is_feature(id)
+                    {
                         return Some(id);
                     }
                 }
@@ -224,7 +226,7 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
             // CMP — skip the next command when the compare is false.
             1 => {
                 let truth = match c.cmp_opt {
-                    0x01 => (dst & !src) == 0,
+                    0x01 => (src & !dst) == 0, // BC: every src bit set in dst
                     0x02 => dst == src,
                     0x03 => dst != src,
                     0x04 => dst >= src,
@@ -575,5 +577,152 @@ mod tests {
         let mobjs = mobj::parse(&d).unwrap();
         let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
         assert_eq!(resolve(&index, &mobjs, &|id| id == 1 || id == 800), None);
+    }
+
+    fn run_gpr0(prog: &[[u8; 12]], gprs: usize) -> Vec<u32> {
+        let d = build(&[prog]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        let mut vm = Vm::new(&mobjs, &index);
+        assert_eq!(run(&mut vm, 0, &|_| false), None);
+        vm.gpr[..gprs].to_vec()
+    }
+
+    fn set_imm(opt: u8, reg: u32, imm: u32) -> [u8; 12] {
+        cmd((2 << 5) | (2 << 3), 0x40, 0, opt, reg, imm)
+    }
+
+    // CMP dst(GPR0 = a) against imm b: true falls through to PlayPL 1, false skips to 2.
+    fn cmp_picks_true(opt: u8, a: u32, b: u32) -> bool {
+        let cmp = cmd((2 << 5) | (1 << 3), 0x40, opt, 0, 0, b);
+        let d = build(&[&[set_imm(0x01, 0, a), cmp, play_pl(1), play_pl(2)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        resolve(&index, &mobjs, &|id| id == 1 || id == 2) == Some(1)
+    }
+
+    #[test]
+    fn cmp_ops_ge_gt_le_lt_ne() {
+        // (cmp_opt, a, b, expected)
+        let cases = [
+            (0x04, 5, 5, true),
+            (0x04, 4, 5, false),
+            (0x04, 6, 5, true),
+            (0x05, 5, 5, false),
+            (0x05, 6, 5, true),
+            (0x05, 4, 5, false),
+            (0x06, 5, 5, true),
+            (0x06, 6, 5, false),
+            (0x06, 4, 5, true),
+            (0x07, 5, 5, false),
+            (0x07, 4, 5, true),
+            (0x07, 6, 5, false),
+            (0x03, 5, 5, false),
+            (0x03, 5, 6, true),
+        ];
+        for (opt, a, b, want) in cases {
+            assert_eq!(cmp_picks_true(opt, a, b), want, "opt {opt:#x} {a} vs {b}");
+        }
+    }
+
+    // libbluray INSN_BC: true iff every bit of src is set in dst (src & ~dst == 0).
+    #[test]
+    fn cmp_bc_tests_src_bits_within_dst() {
+        assert!(cmp_picks_true(0x01, 0b1110, 0b0110));
+        assert!(!cmp_picks_true(0x01, 0b0100, 0b0110));
+        assert!(!cmp_picks_true(0x01, 0b0110, 0b1110));
+    }
+
+    #[test]
+    fn set_arithmetic_and_logic_ops() {
+        // (set_opt, a, b, expected)
+        let cases = [
+            (0x03, 2, 3, 5),
+            (0x04, 10, 3, 7),
+            (0x04, 3, 10, 0),
+            (0x05, 2, 3, 6),
+            (0x06, 10, 3, 3),
+            (0x06, 10, 0, 0xffff_ffff),
+            (0x07, 10, 3, 1),
+            (0x07, 10, 0, 0xffff_ffff),
+            (0x09, 0b1100, 0b1010, 0b1000),
+            (0x0a, 0b1100, 0b1010, 0b1110),
+            (0x0b, 0b1100, 0b1010, 0b0110),
+            (0x0c, 0, 3, 8),
+            (0x0d, 0xf, 1, 0xd),
+            (0x0e, 1, 4, 16),
+            (0x0f, 0x100, 4, 0x10),
+        ];
+        for (opt, a, b, want) in cases {
+            let g = run_gpr0(&[set_imm(0x01, 0, a), set_imm(opt, 0, b)], 1);
+            assert_eq!(g[0], want, "set_opt {opt:#x} on {a}, {b}");
+        }
+    }
+
+    #[test]
+    fn branch_or_compare_on_rnd_value_abstains() {
+        // GPR0 = RND; then PlayPL GPR0 (branch grp, dst tainted).
+        let rnd = set_imm(0x08, 0, 10);
+        let d = build(&[&[rnd, play_pl_reg(0), play_pl(1)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+        // Compare with a clean dst (GPR1) and a tainted register src (GPR0).
+        let cmp = cmd((2 << 5) | (1 << 3), 0x00, 0x02, 0, 1, 0);
+        let d = build(&[&[rnd, cmp, play_pl(1), play_pl(2)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+    }
+
+    #[test]
+    fn set_from_rnd_source_taints_destination() {
+        // GPR0 = RND; GPR1 (clean) += GPR0 (register src); PlayPL GPR1 must abstain.
+        let rnd = set_imm(0x08, 0, 10);
+        let add = cmd((2 << 5) | (2 << 3), 0x00, 0, 0x03, 1, 0);
+        let d = build(&[&[rnd, add, play_pl_reg(1), play_pl(1)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+    }
+
+    #[test]
+    fn playpl_operand_over_16_bits_is_not_a_playlist_id() {
+        // 0x1_0001 must not alias playlist 1; the VM falls through to 800.
+        let wide = cmd((1 << 5) | 2, 0x80, 0, 0, 0x1_0001, 0);
+        let d = build(&[&[wide, play_pl(800)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(
+            resolve(&index, &mobjs, &|id| id == 1 || id == 800),
+            Some(800)
+        );
+    }
+
+    #[test]
+    fn power_on_psr_defaults_are_visible_to_compares() {
+        // (psr, expected power-on value)
+        let cases: [(u32, u32); 12] = [
+            (0, 1),
+            (1, 0xff),
+            (3, 1),
+            (4, 0xffff),
+            (5, 0xffff),
+            (6, 0),
+            (7, 0),
+            (8, 0),
+            (20, 2),
+            (31, 0x0003_0200),
+            (48, 0xffff_ffff),
+            (62, 0),
+        ];
+        for (psr, want) in cases {
+            // CMP PSR == want (imm): true plays 1, false plays 2.
+            let cmp = cmd((2 << 5) | (1 << 3), 0x40, 0x02, 0, 0x8000_0000 | psr, want);
+            let d = build(&[&[cmp, play_pl(1), play_pl(2)]]);
+            let mobjs = mobj::parse(&d).unwrap();
+            let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+            let got = resolve(&index, &mobjs, &|id| id == 1 || id == 2);
+            assert_eq!(got, Some(1), "PSR{psr} != {want:#x}");
+        }
     }
 }

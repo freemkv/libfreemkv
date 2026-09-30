@@ -172,16 +172,23 @@ impl std::fmt::Display for DriveId {
 
 // A GET CONFIGURATION text field: trims spaces and the NUL padding `trim` keeps.
 fn gc_text(field: &[u8]) -> String {
-    String::from_utf8_lossy(field)
-        .trim_matches(|c: char| c.is_whitespace() || c == '\0')
-        .to_string()
+    let text = String::from_utf8_lossy(field);
+    printable(text.trim_matches(|c: char| c.is_whitespace() || c == '\0'))
+}
+
+// Drive-supplied text is untrusted: control characters (bar NUL padding) become `?`
+// so they cannot reach a terminal or log through `Display`.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\0' { '?' } else { c })
+        .collect()
 }
 
 /// Extract an ASCII string field from raw SCSI data.
 fn ascii_field(data: &[u8], start: usize, end: usize) -> String {
     if data.len() > start {
         let e = end.min(data.len());
-        String::from_utf8_lossy(&data[start..e]).to_string()
+        printable(&String::from_utf8_lossy(&data[start..e]))
     } else {
         String::new()
     }
@@ -230,6 +237,86 @@ mod tests {
         let id = DriveId::from_drive(&mut t).expect("from_drive must not error");
         // raw_gc_010c is clamped to the 256-byte buffer, never the lie.
         assert_eq!(id.raw_gc_010c.len(), 256);
+    }
+
+    // Answers INQUIRY with `inq` (reporting `inq_count` bytes) and fails the GET
+    // CONFIGURATION whose feature byte is `halt_feature` with `Halted`.
+    struct ScriptTransport {
+        inq: Vec<u8>,
+        inq_count: usize,
+        halt_feature: Option<u8>,
+    }
+
+    impl ScsiTransport for ScriptTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            buf: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            if cdb[0] == 0x46 && Some(cdb[3]) == self.halt_feature {
+                return Err(crate::error::Error::Halted);
+            }
+            let mut n = 0;
+            if cdb[0] == 0x12 {
+                n = self.inq.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.inq[..n]);
+                n = self.inq_count;
+            }
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: n,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn script(halt_feature: Option<u8>) -> ScriptTransport {
+        let mut inq = vec![0u8; 96];
+        inq[0] = 0x05;
+        inq[8..16].copy_from_slice(b"VENDOR  ");
+        ScriptTransport {
+            inq,
+            inq_count: 96,
+            halt_feature,
+        }
+    }
+
+    // A stop during either best-effort GET CONFIGURATION probe aborts identification.
+    #[test]
+    fn from_drive_propagates_halted_from_both_gc_probes() {
+        for feature in [0x0C, 0x08] {
+            let mut t = script(Some(feature));
+            let r = DriveId::from_drive(&mut t);
+            assert!(
+                matches!(r, Err(crate::error::Error::Halted)),
+                "feature {feature:#x}: {r:?}"
+            );
+        }
+        assert!(DriveId::from_drive(&mut script(None)).is_ok());
+    }
+
+    // A lying INQUIRY transfer count is not trusted. Pin only: `truncate` past the
+    // length is a no-op, so the `.min` clamp is behaviour-neutral.
+    #[test]
+    fn from_drive_clamps_oversized_inquiry_count() {
+        let mut t = script(None);
+        t.inq_count = 96 + 4096;
+        let id = DriveId::from_drive(&mut t).expect("from_drive must not error");
+        assert_eq!(id.raw_inquiry.len(), 96);
+    }
+
+    // Control characters from the drive never reach the identity strings.
+    #[test]
+    fn drive_text_control_characters_are_replaced() {
+        let mut t = script(None);
+        t.inq[8..16].copy_from_slice(b"A\x1b[31mZ ");
+        let id = DriveId::from_drive(&mut t).expect("from_drive");
+        assert_eq!(id.vendor_id, "A?[31mZ ");
+        assert_eq!(gc_text(b"SN\r\n1\x1b "), "SN??1?");
+        // Trailing padding is trimmed before sanitising, not turned into '?'.
+        assert_eq!(gc_text(b"SN1\r\n\t\0 "), "SN1");
     }
 
     // INQUIRY byte 0: low 5 bits are the peripheral device type (5 = MMC), the

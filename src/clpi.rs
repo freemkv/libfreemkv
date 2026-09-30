@@ -36,7 +36,8 @@ pub(crate) struct ClpiStream {
 
 /// Parse a CLPI file from raw bytes.
 pub fn parse(data: &[u8]) -> Result<ClipInfo> {
-    if data.len() < 40 {
+    // 60 bytes: the ClipInfo section through source_packet_count at [56..60].
+    if data.len() < 60 {
         return Err(Error::ClpiParse);
     }
 
@@ -45,20 +46,14 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
     }
 
     // Header offsets
-    let _seq_info_start = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
     let prog_info_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
 
     // ClipInfo section at offset 40
     // source_packet_count at offset 40 + 4(len) + 2(reserved) + 1(stream_type) + 1(app_type) + 4(reserved) + 4(ts_rate)
-    let source_packet_count = if data.len() >= 60 {
-        u32::from_be_bytes([data[56], data[57], data[58], data[59]])
-    } else {
-        0
-    };
+    let source_packet_count = u32::from_be_bytes([data[56], data[57], data[58], data[59]]);
 
     // Parse ProgramInfo (per-stream language + codec), best-effort: malformed
     // program_info doesn't fail the parse, just yields an empty streams list.
-    // EP map is unaffected — sector-range lookups still work.
     let streams = if prog_info_start > 0 && prog_info_start + 6 < data.len() {
         parse_program_info(&data[prog_info_start..])
     } else {
@@ -72,7 +67,7 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
 }
 
 // Parse the ProgramInfo section: per-stream (pid, coding_type, language, codec sub-fields).
-// Returns Vec::new() on any structural mismatch.
+// On a structural mismatch, returns the fully validated entries parsed so far.
 fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
     use crate::consts::coding_type as c;
     let mut out = Vec::new();
@@ -112,16 +107,15 @@ fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
                 // Video — MPEG-2, H.264, HEVC
                 c::MPEG2_VIDEO | c::H264 | c::HEVC => {}
                 // Primary audio — LPCM, AC-3, DTS, TrueHD, AC-3+, DTS-HD HR, DTS-HD MA
-                c::LPCM..=c::DTS_HD_MA => {
+                // and secondary audio (AC-3+ secondary, DTS-HD secondary)
+                c::LPCM..=c::DTS_HD_MA | c::AC3_PLUS_SECONDARY | c::DTS_HD_SECONDARY => {
                     if sci.len() >= 5 {
                         language = String::from_utf8_lossy(&sci[2..5]).to_string();
                     }
                 }
-                // Secondary audio (AC-3+ secondary, DTS-HD secondary)
-                c::AC3_PLUS_SECONDARY | c::DTS_HD_SECONDARY => {
-                    if sci.len() >= 5 {
-                        language = String::from_utf8_lossy(&sci[2..5]).to_string();
-                    }
+                // TextST: coding_type + character_code + 3-byte language
+                c::TEXT_SUBTITLE if sci.len() >= 5 => {
+                    language = String::from_utf8_lossy(&sci[2..5]).to_string();
                 }
                 // PG, IG: coding_type + 3-byte language [+ char_code for PG]
                 c::PG | c::IG if sci.len() >= 4 => {
@@ -176,16 +170,14 @@ mod tests {
     #[test]
     fn parse_truncated_clipinfo_no_panic() {
         // 57/58/59-byte CLPI with valid magic: passes the data.len() < 40
-        // guard but data[56..60] needs 60 bytes. Must not panic.
+        // guard but data[56..60] needs 60 bytes. Must error, not panic.
         for len in 40..60usize {
             let mut data = vec![0u8; len];
             data[0..4].copy_from_slice(b"HDMV");
             if len >= 8 {
                 data[4..8].copy_from_slice(b"0200");
             }
-            let clip = parse(&data).expect("short CLPI should parse, not panic");
-            // source_packet_count is unreadable below 60 bytes → 0.
-            assert_eq!(clip.source_packet_count, 0);
+            assert!(parse(&data).is_err(), "len {len} lacks source_packet_count");
         }
     }
 
@@ -267,8 +259,8 @@ mod tests {
         assert!(parse(&data).is_err());
     }
 
-    /// Under-40-byte input is rejected before any field read
-    /// (`data.len() < 40` guard).
+    /// Input shorter than the 60-byte ClipInfo head is rejected before any
+    /// field read (`data.len() < 60` guard).
     #[test]
     fn under_40_bytes_rejected() {
         assert!(parse(&[0u8; 39]).is_err());
@@ -480,6 +472,60 @@ mod tests {
         data.extend_from_slice(&[0u8; 2]); // only 2 of the 3 stream bytes
         assert_eq!(data.len(), 16);
         assert!(parse_program_info(&data).is_empty());
+    }
+
+    /// TextST (0x92): coding_type + character_code + 3-byte language, so the
+    /// language sits at sci[2..5].
+    #[test]
+    fn program_info_text_subtitle_lang_offset() {
+        let sci = vec![0x92u8, 0x01, b'd', b'e', b'u'];
+        let pi = build_program_info(&[(0x1800, sci)]);
+        let clip = parse(&build_clpi_with_proginfo(100, &pi, None)).expect("parse");
+        assert_eq!(clip.streams[0].coding_type, 0x92);
+        assert_eq!(clip.streams[0].language, "deu");
+    }
+
+    /// IG (0x91) shares the PG layout: language at sci[1..4].
+    #[test]
+    fn program_info_ig_lang_offset() {
+        let sci = vec![0x91u8, b'e', b's', b'p'];
+        let pi = build_program_info(&[(0x1400, sci)]);
+        let clip = parse(&build_clpi_with_proginfo(100, &pi, None)).expect("parse");
+        assert_eq!(clip.streams[0].language, "esp");
+    }
+
+    /// Streams from every program are collected, in order.
+    #[test]
+    fn program_info_multiple_programs_all_collected() {
+        let mut body = vec![0u8, 2]; // reserved, num_programs = 2
+        for (pid, lang) in [(0x1200u16, b"fra"), (0x1201u16, b"jpn")] {
+            body.extend_from_slice(&[0u8; 6]); // spn + pmt_pid
+            body.extend_from_slice(&[1, 0]); // num_streams, num_groups
+            body.extend_from_slice(&pid.to_be_bytes());
+            body.push(4);
+            body.push(0x90);
+            body.extend_from_slice(lang);
+        }
+        let mut pi = (body.len() as u32).to_be_bytes().to_vec();
+        pi.extend_from_slice(&body);
+        let clip = parse(&build_clpi_with_proginfo(100, &pi, None)).expect("parse");
+        assert_eq!(clip.streams.len(), 2);
+        assert_eq!(clip.streams[0].language, "fra");
+        assert_eq!(clip.streams[1].pid, 0x1201);
+        assert_eq!(clip.streams[1].language, "jpn");
+    }
+
+    /// A trailing CPI section after ProgramInfo does not disturb parsing.
+    #[test]
+    fn cpi_section_present_still_parses() {
+        let pi = build_program_info(&[(0x1200, vec![0x90u8, b'f', b'r', b'a'])]);
+        let cpi = [0u8, 0, 0, 2, 0, 0];
+        let data = build_clpi_with_proginfo(777, &pi, Some(&cpi));
+        let clip = parse(&data).expect("parse");
+        assert_eq!(clip.source_packet_count, 777);
+        assert_eq!(clip.streams.len(), 1);
+        let clip = parse(&build_clpi(5, Some(&cpi))).expect("parse");
+        assert_eq!(clip.source_packet_count, 5);
     }
 
     // ─────────────────────────────────────────────────────────────────────

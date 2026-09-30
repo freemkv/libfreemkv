@@ -4,9 +4,9 @@
 //! never parses MPLS/CLPI/UDF directly.
 //!
 //! Usage:
-//!   let disc = Disc::scan(&mut session)?;
-//!   for title in disc.titles() { ... }
-//!   for stream in title.streams() { ... }
+//!   let disc = Disc::scan(&mut drive, &ScanOptions::default())?;
+//!   for title in &disc.titles { ... }
+//!   for stream in &title.streams { ... }
 
 mod bluray;
 mod dvd;
@@ -18,7 +18,7 @@ mod hddvd;
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
 #[cfg(test)]
-mod scan_order_tests;
+pub(crate) mod scan_order_tests;
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
@@ -817,7 +817,7 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
 }
 
 /// Calculate how many bytes of bad/unreadable data fall within a title's extents.
-/// `pub(crate)` so autorip can use it for main-movie lost_ms computation.
+/// Public so autorip can use it for main-movie lost_ms computation.
 pub fn bytes_bad_in_title(title: &DiscTitle, bad_ranges: &[(u64, u64)]) -> u64 {
     if bad_ranges.is_empty() || title.extents.is_empty() {
         return 0;
@@ -1211,7 +1211,8 @@ impl AudioChannels {
             1 => AudioChannels::Mono,
             3 => AudioChannels::Stereo,
             6 => AudioChannels::Surround51,
-            12 => AudioChannels::Surround71,
+            // 12 is the stereo + multichannel combo; the layout is not knowable here.
+            12 => AudioChannels::Unknown,
             other => {
                 tracing::warn!(audio_format = other, "unknown MPLS audio_format byte");
                 AudioChannels::Unknown
@@ -1792,7 +1793,7 @@ impl Disc {
         // longer defaults to BluRay or defers UHD/FMTS to the full scan.
         let format = Self::detect_disc_format(&mut buffered, &udf_fs, &[]);
         let encrypted = aacs_dir_present(&udf_fs);
-        let layers = if capacity > 24_000_000 { 2 } else { 1 };
+        let layers = Self::layers_for(format, capacity);
 
         Ok(DiscId {
             volume_id: udf_fs.volume_id,
@@ -1802,6 +1803,24 @@ impl Disc {
             encrypted,
             layers,
         })
+    }
+
+    // Layer count inferred from capacity against the format's per-layer size.
+    fn layers_for(format: DiscFormat, capacity: u32) -> u8 {
+        // Upper sector bounds of (1, 2) layers; above the second is 3 (BD-100, HD DVD TL).
+        let (one, two) = match format {
+            DiscFormat::Dvd => (2_400_000, u32::MAX),
+            DiscFormat::HdDvd => (8_000_000, 16_000_000),
+            DiscFormat::BluRay | DiscFormat::Uhd | DiscFormat::Fmts => (12_500_000, 40_000_000),
+            DiscFormat::Unknown => (12_500_000, u32::MAX),
+        };
+        if capacity <= one {
+            1
+        } else if capacity <= two {
+            2
+        } else {
+            3
+        }
     }
 
     /// Disc capacity in GB
@@ -1929,7 +1948,7 @@ impl Disc {
     fn scan_live(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         let dvd = session.disc_is_dvd();
         // Max read speed; removes riplock on DVD.
-        session.set_speed(0xFFFF);
+        session.set_speed(Drive::SPEED_MAX_KBPS);
         // CSS bus-auth before any read, else the UDF prefetch hits scrambled VOB extents.
         if dvd {
             Self::css_bus_step(session)?;
@@ -1939,8 +1958,10 @@ impl Disc {
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
         tracing::info!(target: "freemkv::scan", capacity, "phase: UDF read");
         // Pre-read small files (AACS, MPLS, CLPI, META, *.bdmv): one command each otherwise.
-        if let Ok(ranges) = udf_fs.metadata_sector_ranges(&mut buffered) {
-            buffered.prefetch_ranges(&ranges)?;
+        match udf_fs.metadata_sector_ranges(&mut buffered) {
+            Ok(ranges) => buffered.prefetch_ranges(&ranges)?,
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => {} // prefetch is optional
         }
 
         let aacs = if aacs_dir_present(&udf_fs) {
@@ -2388,7 +2409,9 @@ impl Disc {
                     out.push((rel, bytes));
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                Err(_) => {} // unreadable file: skipped, as when absent
+                Err(e) => {
+                    tracing::warn!(target: "freemkv::scan", file = %rel, code = e.code(), "structure file unreadable; skipped");
+                }
             }
         }
         if omitted > 0 {
@@ -2522,6 +2545,10 @@ impl Disc {
         // rip leaves it off since the muxer detects forced without a second read.
         if opts.probe_forced_subtitles {
             Self::probe_forced_subtitles_for_bdts_titles(reader, &mut titles, halt);
+            // The probe swallows a Stop; surface it as the live scan does.
+            if let Some(h) = halt {
+                h.check()?;
+            }
         }
         crate::labels::fill_defaults(&mut titles);
 
@@ -2529,14 +2556,13 @@ impl Disc {
         //    layers. Region coding is not decoded yet — every disc reports
         //    Region-free (correct for UHD; a stub until BD/DVD region detection).
         let format = Self::detect_disc_format(reader, &udf_fs, &titles);
-        let layers = if capacity > 24_000_000 { 2 } else { 1 };
+        let layers = Self::layers_for(format, capacity);
         let region = DiscRegion::Free;
 
         // 6. CSS detection for DVDs is deferred to `Disc::scan`'s drive-auth path
         // (has `&mut Drive`), run after this returns — the reader-based crack path
         // is NOT run here: on a CSS disc it would fail ~50,000 sectors one-by-one.
         let css = None;
-        let encrypted = encrypted || css.is_some();
 
         tracing::info!(
             target: "freemkv::scan",
@@ -2827,7 +2853,10 @@ impl Disc {
         // one format but enumerated as another (e.g. BD titles tagged HdDvd).
         if udf_fs.find_dir("/BDMV").is_some() {
             // Only the Type-and-Version record (first record) is needed.
-            if let Ok(mkb) = udf_fs.read_file_prefix(reader, "/AACS/MKB_RO.inf", 64) {
+            let mkb_paths = crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::Mkb);
+            if let Ok(mkb) =
+                crate::aacs::read_first(&mkb_paths, |p| udf_fs.read_file_prefix(reader, p, 64))
+            {
                 match mkb_type(&mkb).map(|t| t.generation()) {
                     Some(AacsVersion::V21) => return DiscFormat::Fmts,
                     Some(AacsVersion::V20) => return DiscFormat::Uhd,
@@ -2872,29 +2901,7 @@ impl Disc {
     }
 
     fn read_capacity(session: &mut Drive) -> Result<u32> {
-        let cdb = [
-            crate::scsi::SCSI_READ_CAPACITY,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-        ];
-        let mut buf = [0u8; 8];
-        let result = session.exec(
-            &cdb,
-            crate::scsi::DataDirection::FromDevice,
-            &mut buf,
-            5_000,
-        )?;
-        // Share the decoder with `Drive::capacity` rather than re-deriving it — a
-        // hand-rolled copy previously dropped the short-transfer check, so a drive
-        // answering GOOD with an empty data phase decoded to a 1-sector disc.
-        crate::drive::decode_read_capacity(&buf, result.bytes_transferred)
+        session.read_capacity()
     }
 }
 
@@ -3073,23 +3080,9 @@ fn is_plain_file_name(name: &str) -> bool {
     }) {
         return false;
     }
-    // Windows reserved device names, matched on the stem with trailing spaces ignored.
-    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
-    let stem = stem.to_ascii_uppercase();
-    let numbered = |p: &str| {
-        stem.strip_prefix(p).is_some_and(|d| {
-            let mut c = d.chars();
-            matches!(
-                (c.next(), c.next()),
-                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
-            )
-        })
-    };
-    !(matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) || numbered("COM")
-        || numbered("LPT"))
+    // Matched on the stem with trailing spaces ignored.
+    let stem = name.split('.').next().unwrap_or(name);
+    !extract::is_windows_reserved(stem)
 }
 
 impl Disc {
@@ -3274,7 +3267,7 @@ impl Disc {
     /// Path to the mapfile for a given output path.
     ///
     /// For `/dev/null` output, returns
-    /// `{temp_dir}/{volume_id_or_title}.mapfile` (temp dir is
+    /// `{temp_dir}/{volume_id_or_title}-{pid}.mapfile` (temp dir is
     /// `TMPDIR`-aware and cross-platform). For regular files, returns
     /// `{path}.mapfile`.
     pub fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
@@ -3292,7 +3285,9 @@ impl Disc {
                     }
                 })
                 .collect();
-            std::env::temp_dir().join(format!("{name}.mapfile"))
+            // Per-process, so a stale or concurrent same-label run is never resumed.
+            let pid = std::process::id();
+            std::env::temp_dir().join(format!("{name}-{pid}.mapfile"))
         } else {
             mapfile_path_for(path)
         }
@@ -4160,6 +4155,12 @@ mod tests {
         assert!(d.contains("redacted"), "AacsState missing marker: {d}");
 
         for k in [
+            Key::Device(vec![crate::aacs::types::DeviceKey {
+                key: [0xD5; 16],
+                node: 0,
+                uv: 0,
+                u_mask_shift: 0,
+            }]),
             Key::Unit(vec![(1, [0xD5; 16])]),
             Key::Volume([0xD5; 16]),
             Key::Processing(vec![[0xD5; 16]]),
@@ -7102,6 +7103,30 @@ mod tests {
         );
     }
 
+    // Many ranges: sorted largest-first, capped at 50 with the overflow counted.
+    // Input is ascending, so a flipped sort keeps the smallest and reports its gap.
+    // bps = 2048 B/s, so range i (i+1 sectors) lasts (i+1) * 1000 ms.
+    #[test]
+    fn locate_ranges_sorts_largest_first_and_truncates_at_fifty() {
+        let mut title = title_with_size(204_800, vec![]);
+        title.duration_secs = 100.0;
+        let raw: Vec<(u64, u64)> = (0..53u64)
+            .map(|i| (i * 100 * 2048, (i + 1) * 2048))
+            .collect();
+        let r = locate_ranges(&raw, &title);
+        assert_eq!(r.num_ranges, 53);
+        assert_eq!(r.truncated, 3);
+        assert_eq!(r.ranges.len(), 50);
+        assert_eq!(r.largest_gap_ms, 53_000.0);
+        assert_eq!(r.ranges[0].count, 53);
+        assert_eq!(r.ranges[49].count, 4, "the three smallest were dropped");
+        assert!(
+            r.ranges
+                .windows(2)
+                .all(|w| w[0].duration_ms > w[1].duration_ms)
+        );
+    }
+
     // bps computed exactly 0.0: duration_ms/main_at_risk_ms must stay 0.0,
     // never inf/NaN. Kills `bps > 0.0` flipped to `>=` at both sites (the
     // boundary exactly zero would wrongly take the division branch).
@@ -8711,14 +8736,118 @@ mod tests {
         disc.meta_title = Some("A-B_c1 d!é".into());
         assert_eq!(
             disc.mapfile_for(std::path::Path::new("/dev/null")),
-            std::env::temp_dir().join("A-B_c1_d__.mapfile")
+            std::env::temp_dir().join(format!("A-B_c1_d__-{}.mapfile", std::process::id()))
         );
         // The UDF volume id is the fallback when the disc carries no META/DL
         // title.
         disc.meta_title = None;
         assert_eq!(
             disc.mapfile_for(std::path::Path::new("/dev/null")),
-            std::env::temp_dir().join("VOLUME_ID.mapfile")
+            std::env::temp_dir().join(format!("VOLUME_ID-{}.mapfile", std::process::id()))
+        );
+    }
+
+    // Two runs (or same-label discs) must not share a /dev/null mapfile.
+    #[test]
+    fn mapfile_for_dev_null_is_per_process() {
+        let disc = make_test_disc(1_000, "BDROM");
+        let name = disc.mapfile_for(std::path::Path::new("/dev/null"));
+        let name = name.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(name.contains(&std::process::id().to_string()), "{name}");
+    }
+
+    // STN audio_format 12 is the stereo+multichannel combo, not a 7.1 layout.
+    #[test]
+    fn audio_format_combo_is_not_claimed_as_7_1() {
+        assert_eq!(AudioChannels::from_audio_format(12), AudioChannels::Unknown);
+    }
+
+    #[test]
+    fn layers_follow_the_format_capacity() {
+        for (fmt, sectors, want) in [
+            (DiscFormat::Dvd, 2_298_496, 1),
+            (DiscFormat::Dvd, 4_173_824, 2),
+            (DiscFormat::HdDvd, 7_300_000, 1),
+            (DiscFormat::HdDvd, 14_600_000, 2),
+            (DiscFormat::HdDvd, 22_000_000, 3),
+            (DiscFormat::BluRay, 12_219_392, 1),
+            (DiscFormat::BluRay, 24_438_784, 2),
+            (DiscFormat::Uhd, 48_878_592, 3),
+        ] {
+            assert_eq!(Disc::layers_for(fmt, sectors), want, "{fmt:?} {sectors}");
+        }
+    }
+
+    // A Stop during the image scan's forced-subtitle probe must not yield Ok(Disc).
+    #[test]
+    fn scan_image_stopped_during_forced_probe_is_halted() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let opts = ScanOptions {
+            halt: Some(halt),
+            probe_forced_subtitles: true,
+            ..ScanOptions::default()
+        };
+        let err = Disc::scan_image(&mut disc, 1_000, &opts).expect_err("stopped");
+        assert_eq!(err.code(), Error::Halted.code());
+    }
+
+    // The primary MKB may be unreadable while the /AACS/DUPLICATE copy is intact.
+    #[test]
+    fn detect_disc_format_falls_back_to_the_duplicate_mkb() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "BDMV".into(),
+                    icb_lba: 12,
+                    dir_data_lba: 13,
+                    files: Vec::new(),
+                    subdirs: vec![],
+                },
+                DirSpec {
+                    name: "AACS".into(),
+                    icb_lba: 14,
+                    dir_data_lba: 15,
+                    files: Vec::new(),
+                    subdirs: vec![DirSpec {
+                        name: "DUPLICATE".into(),
+                        icb_lba: 17,
+                        dir_data_lba: 18,
+                        files: vec![file_with(
+                            "MKB_RO.inf",
+                            16,
+                            5000,
+                            mkb_type_record(0x4814_1003),
+                            true,
+                        )],
+                        subdirs: vec![],
+                    }],
+                },
+            ],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(
+            Disc::detect_disc_format(&mut disc, &udf, &[]),
+            DiscFormat::Uhd
         );
     }
 

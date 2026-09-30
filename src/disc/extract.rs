@@ -16,14 +16,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
-/// AACS aligned unit = 3 sectors / 6144 bytes. Content reads are issued in
-/// multiples of this so the decrypt step always sees whole units.
-const AACS_UNIT_SECTORS: u32 = 3;
+/// Content reads are issued in multiples of the AACS aligned unit (3 sectors) so the
+/// decrypt step always sees whole units.
+const AACS_UNIT_SECTORS: u32 = crate::aacs::content::ALIGNED_UNIT_SECTORS;
 /// Read batch in sectors for content streaming (a throughput knob, not a
 /// correctness one). A multiple of 3 so AACS units stay whole.
 const READ_BATCH_SECTORS: u32 = 1536; // 3 MiB, multiple of 3
 /// Bounded per-extent retries on a read that fails before a recorded hole.
 const READ_RETRIES: u32 = 3;
+/// Failed unit reads (one attempt each) per batch after which the rest is zero-filled unread.
+const MAX_FAILED_UNIT_READS: u32 = 4;
+/// Drive error granularity: a BD ECC cluster (32 sectors), also a whole number of DVD
+/// ECC blocks (16). After a bad unit, reading resumes past this boundary.
+const ECC_BLOCK_SECTORS: u64 = 32;
+/// Sectors per read while cracking a VTS title key.
+const CRACK_BATCH_SECTORS: u16 = 64;
 /// Attempts to delete the case-probe marker before giving up.
 const PROBE_REMOVE_ATTEMPTS: u32 = 3;
 
@@ -342,7 +349,7 @@ impl Disc {
         // PLAYBACK ORDER — do NOT sort (the 1.5.1 bug: see `decrypt_keys_for_title`).
         // Crack the raw inner reader, NOT the decrypting view. A cancelled crack
         // (token or drive) is `Halted`, never a cached verdict.
-        match crate::css::crack_key_outcome(dec.inner_mut(), &extents, 64, halt) {
+        match crate::css::crack_key_outcome(dec.inner_mut(), &extents, CRACK_BATCH_SECTORS, halt) {
             crate::css::CrackOutcome::Cracked(state) => Ok(DecryptKeys::Css {
                 title_key: state.title_key,
             }),
@@ -490,7 +497,7 @@ fn plan_tree(
         {
             continue;
         }
-        let safe = sanitize_component(&entry.name)?;
+        let safe = sanitize_component(&entry.name);
         let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
         // Collision: two distinct disc paths → one host FILE. Case-insensitive folds
@@ -502,9 +509,7 @@ fn plan_tree(
             } else {
                 key.to_string_lossy().into_owned()
             };
-            if let Some(prev) = seen_hosts.insert(folded, child_disc.clone())
-                && prev != child_disc
-            {
+            if seen_hosts.insert(folded, child_disc.clone()).is_some() {
                 return Err(Error::DirNameCollision {
                     host: key.to_string_lossy().into_owned(),
                 });
@@ -599,13 +604,10 @@ fn extract_one_file<S: SectorSource>(
     let final_path = dest.join(&pf.host_rel);
     let partial_path = with_partial_suffix(&final_path);
 
-    let file =
-        crate::io::WritebackFile::create_with_size_hint(&partial_path, pf.size).map_err(|e| {
-            Error::DirWriteFailed {
-                errno: e.raw_os_error(),
-            }
+    let mut writer = crate::io::WritebackFile::create_with_size_hint(&partial_path, pf.size)
+        .map_err(|e| Error::DirWriteFailed {
+            errno: e.raw_os_error(),
         })?;
-    let mut writer = file;
 
     let mut fr = FileResult {
         path: pf.host_rel.clone(),
@@ -620,6 +622,10 @@ fn extract_one_file<S: SectorSource>(
         let n = (pf.size as usize).min(bytes.len());
         write_all(&mut writer, &bytes[..n], &partial_path)?;
         fr.bytes_good = n as u64;
+        // Data shorter than the declared size: the padded tail is lost, not good.
+        let gap = pf.size - n as u64;
+        fr.bytes_unreadable = gap;
+        *done_unreadable = done_unreadable.saturating_add(gap);
         finalize_file(writer, &partial_path, pf.size, &final_path)?;
         fr.complete = true;
         *done_bytes = done_bytes.saturating_add(pf.size);
@@ -679,38 +685,35 @@ fn extract_one_file<S: SectorSource>(
             let want = batch as usize * SECTOR_BYTES;
             let start = abs_lba.checked_add(sector_off);
             let blanked_before = dec.blanked_units();
-            let read_ok = match start.filter(|l| l.checked_add(batch - 1).is_some()) {
+            // Bytes of this batch that could not be read (zero-filled below).
+            let lost: u64;
+            match start.filter(|l| l.checked_add(batch - 1).is_some()) {
                 // Crafted extent past u32::MAX: no such sector — a hole, not a wrapped read.
-                None => false,
-                Some(lba) => match read_batch(dec, lba, batch, &mut buf[..want]) {
-                    Ok(ok) => ok,
+                None => lost = want as u64,
+                Some(lba) => match read_batch_narrowed(dec, lba, batch, &mut buf[..want]) {
+                    Ok(l) => lost = l,
                     // Drive-level Stop: leave the `.partial`, same as an opts halt.
                     Err(Error::Halted) => return Ok((fr, true)),
                     Err(e) => return Err(e),
                 },
-            };
+            }
             let chunk_bytes = want as u64;
             // Clip the chunk to the remaining file size on the final extent.
             let remaining = pf.size.saturating_sub(written);
             let usable = chunk_bytes.min(remaining) as usize;
-            if read_ok {
+            {
+                // Unreadable ranges were zero-filled by `read_batch_narrowed`; record the
+                // holes and keep going (no abort, no sweep-skip).
+                let lost = lost.min(usable as u64);
                 write_all(&mut writer, &buf[..usable], &partial_path)?;
                 // Damaged AACS units the reader blanked are unreadable, not good bytes.
                 let unit = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
                 let blanked = (dec.blanked_units() - blanked_before) * unit;
-                let blanked = blanked.min(usable as u64);
-                fr.bytes_good = fr.bytes_good.saturating_add(usable as u64 - blanked);
-                fr.bytes_unreadable = fr.bytes_unreadable.saturating_add(blanked);
-                *done_unreadable = done_unreadable.saturating_add(blanked);
-            } else {
-                // Bad sector(s): zero-fill this byte range, record the hole,
-                // keep going (no abort, no sweep-skip).
-                for b in buf[..usable].iter_mut() {
-                    *b = 0;
-                }
-                write_all(&mut writer, &buf[..usable], &partial_path)?;
-                fr.bytes_unreadable = fr.bytes_unreadable.saturating_add(usable as u64);
-                *done_unreadable = done_unreadable.saturating_add(usable as u64);
+                let blanked = blanked.min(usable as u64 - lost);
+                let bad = lost + blanked;
+                fr.bytes_good = fr.bytes_good.saturating_add(usable as u64 - bad);
+                fr.bytes_unreadable = fr.bytes_unreadable.saturating_add(bad);
+                *done_unreadable = done_unreadable.saturating_add(bad);
             }
             written = written.saturating_add(usable as u64);
             *done_bytes = done_bytes.saturating_add(usable as u64);
@@ -726,9 +729,14 @@ fn extract_one_file<S: SectorSource>(
         }
     }
 
-    // Pad with a zero hole if the extents under-covered the declared size
-    // (sparse / allocated-not-recorded). The size hint already set the file
-    // length target; explicit truncate guarantees it.
+    // Extents that under-cover the declared size leave a zero-padded tail: count it lost
+    // so the file is not reported clean.
+    if written < pf.size {
+        let gap = pf.size - written;
+        fr.bytes_unreadable = fr.bytes_unreadable.saturating_add(gap);
+        *done_unreadable = done_unreadable.saturating_add(gap);
+        *done_bytes = done_bytes.saturating_add(gap);
+    }
     finalize_file(writer, &partial_path, pf.size, &final_path)?;
     fr.complete = true;
     Ok((fr, false))
@@ -744,6 +752,65 @@ fn whole_unit_batch(remaining: u32) -> u32 {
     batch
 }
 
+// Reads a batch (one retry); if it fails, re-reads it one AACS unit at a time, once each. A
+// media-bad unit zero-fills, unread, up to the first unit at/after its ECC block's end; past
+// MAX_FAILED_UNIT_READS the rest is zero-filled; an undecryptable unit loses only itself. Returns zero-filled bytes; Err = stop/key set.
+fn read_batch_narrowed<S: SectorSource>(
+    dec: &mut DecryptingSectorSource<S>,
+    lba: u32,
+    count: u32,
+    buf: &mut [u8],
+) -> Result<u64> {
+    if count <= AACS_UNIT_SECTORS {
+        if read_batch(dec, lba, count, buf)? {
+            return Ok(0);
+        }
+        buf.fill(0);
+        return Ok(buf.len() as u64);
+    }
+    if read_tries(dec, lba, count, buf, 1)? == Tried::Good {
+        return Ok(0);
+    }
+    let mut lost = 0u64;
+    let mut off = 0u32;
+    let mut failed = 0u32;
+    while off < count {
+        let n = AACS_UNIT_SECTORS.min(count - off);
+        let unit = &mut buf[off as usize * SECTOR_BYTES..(off + n) as usize * SECTOR_BYTES];
+        let tried = read_tries(dec, lba + off, n, unit, 0)?;
+        if tried == Tried::Good {
+            off += n;
+            continue;
+        }
+        failed += 1;
+        if tried == Tried::Undecryptable {
+            unit.fill(0);
+            lost += unit.len() as u64;
+            off += n;
+            if failed >= MAX_FAILED_UNIT_READS {
+                buf[off as usize * SECTOR_BYTES..count as usize * SECTOR_BYTES].fill(0);
+                lost += u64::from(count - off) * SECTOR_BYTES as u64;
+                off = count;
+            }
+            continue;
+        }
+        // End of the ECC block holding the unit's last sector (a straddled boundary skips
+        // the later block), rounded up to a unit start; the rest when over budget.
+        let end = u64::from(lba) + u64::from(off + n);
+        let gap = (end.div_ceil(ECC_BLOCK_SECTORS) * ECC_BLOCK_SECTORS - end) as u32;
+        let next = if failed >= MAX_FAILED_UNIT_READS {
+            count
+        } else {
+            (off + n + gap.div_ceil(AACS_UNIT_SECTORS) * AACS_UNIT_SECTORS).min(count)
+        };
+        let hole = &mut buf[off as usize * SECTOR_BYTES..next as usize * SECTOR_BYTES];
+        hole.fill(0);
+        lost += hole.len() as u64;
+        off = next;
+    }
+    Ok(lost)
+}
+
 // One batch with bounded retries; Ok(false) = hole. Short reads retry; DecryptFailed
 // holes at once (never succeeds). The only Err is `Halted` (a user Stop).
 fn read_batch<S: SectorSource>(
@@ -752,20 +819,41 @@ fn read_batch<S: SectorSource>(
     count: u32,
     buf: &mut [u8],
 ) -> Result<bool> {
-    for attempt in 0..=READ_RETRIES {
+    Ok(read_tries(dec, lba, count, buf, READ_RETRIES)? == Tried::Good)
+}
+
+#[derive(PartialEq)]
+enum Tried {
+    Good,
+    // Media/read failure: the drive lost the whole ECC block.
+    Media,
+    // Read fine but the unit cannot be decrypted; the next unit may still be fine.
+    Undecryptable,
+}
+
+fn read_tries<S: SectorSource>(
+    dec: &mut DecryptingSectorSource<S>,
+    lba: u32,
+    count: u32,
+    buf: &mut [u8],
+    retries: u32,
+) -> Result<Tried> {
+    let mut attempt = 0;
+    loop {
+        let last = attempt >= retries;
         match dec.read_sectors(lba, count as u16, buf, true) {
-            Ok(n) if n >= buf.len() => return Ok(true),
-            Ok(_) if attempt < READ_RETRIES => continue,
-            Ok(_) => return Ok(false),
+            Ok(n) if n >= buf.len() => return Ok(Tried::Good),
+            Ok(_) if last => return Ok(Tried::Media),
+            Ok(_) => {}
             Err(Error::Halted) => return Err(Error::Halted),
             // The key set's loud stop (KU §2.4): never a hole, the run stops `.partial`.
             Err(e @ (Error::WholeDiscKeyMissing | Error::NoDiscKey { .. })) => return Err(e),
-            Err(Error::DecryptFailed) => return Ok(false),
-            Err(_) if attempt < READ_RETRIES => continue,
-            Err(_) => return Ok(false),
+            Err(Error::DecryptFailed) => return Ok(Tried::Undecryptable),
+            Err(_) if last => return Ok(Tried::Media),
+            Err(_) => {}
         }
+        attempt += 1;
     }
-    Ok(false)
 }
 
 fn write_all(writer: &mut crate::io::WritebackFile, data: &[u8], path: &Path) -> Result<()> {
@@ -925,65 +1013,50 @@ fn dir_is_non_empty(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// Sanitizes ONE disc-path component: rejects `..`, host-illegal chars, control bytes; strips
-// trailing dot/space (Windows); substitutes (not rejects) a Windows reserved device name.
-fn sanitize_component(name: &str) -> Result<String> {
-    if name == ".." || name == "." {
-        return Err(Error::DirNameCollision {
-            host: name.to_string(),
-        });
-    }
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        match ch {
-            '\0' | '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' => {
-                return Err(Error::DirNameCollision {
-                    host: name.to_string(),
-                });
-            }
-            c if (c as u32) < 0x20 => {
-                return Err(Error::DirNameCollision {
-                    host: name.to_string(),
-                });
-            }
-            c => out.push(c),
-        }
-    }
-    // Trailing dot / space are illegal on Windows.
-    let trimmed = out.trim_end_matches([' ', '.']);
+// Sanitizes ONE disc-path component: host-illegal chars and control bytes become `_`, trailing
+// dot/space are stripped, a Windows reserved device name gets a `_` prefix. Names that
+// collapse together are caught by the collision check.
+fn sanitize_component(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = mapped.trim_end_matches([' ', '.']);
     if trimmed.is_empty() {
-        return Err(Error::DirNameCollision {
-            host: name.to_string(),
-        });
+        return "_".to_string();
     }
-    // Windows reserved device names (case-insensitive, base before extension).
-    // `NUL` silently discards writes on Windows, so `NUL.cfg` (legal on
-    // UDF/Linux) must not pass through verbatim; prefix `_` instead of aborting.
+    // The device name is the stem before any extension, ignoring trailing spaces.
     let base = trimmed.split('.').next().unwrap_or(trimmed);
-    if is_windows_reserved(base) {
-        return Ok(format!("_{trimmed}"));
+    if is_windows_reserved(base.trim_end_matches(' ')) {
+        return format!("_{trimmed}");
     }
-    Ok(trimmed.to_string())
+    trimmed.to_string()
 }
 
 /// Whether `base` (the name component before any extension) matches a Windows
 /// reserved device name. These are reserved by the OS regardless of extension
 /// and silently alias a device (e.g. `NUL` discards writes). Case-insensitive.
-fn is_windows_reserved(base: &str) -> bool {
-    const RESERVED: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"];
-    if RESERVED.iter().any(|r| base.eq_ignore_ascii_case(r)) {
+pub(super) fn is_windows_reserved(base: &str) -> bool {
+    let up = base.trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(
+        up.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
         return true;
     }
-    let up = base.to_ascii_uppercase();
-    for prefix in ["COM", "LPT"] {
-        if let Some(rest) = up.strip_prefix(prefix)
-            && rest.len() == 1
-            && matches!(rest.as_bytes()[0], b'1'..=b'9')
-        {
-            return true;
-        }
-    }
-    false
+    ["COM", "LPT"].iter().any(|p| {
+        up.strip_prefix(p).is_some_and(|d| {
+            let mut c = d.chars();
+            matches!(
+                (c.next(), c.next()),
+                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+            )
+        })
+    })
 }
 
 /// DVD VTS group key for a `VTS_xx_*` file name, else `None`. e.g.
@@ -1708,27 +1781,41 @@ mod tests {
     /// Path sanitization rejects a host-illegal component in a disc file name.
     #[test]
     fn sanitize_rejects_illegal_component() {
-        assert!(sanitize_component("good_name.m2ts").is_ok());
-        assert!(sanitize_component("..").is_err());
-        assert!(sanitize_component("a/b").is_err());
-        assert!(sanitize_component("a:b").is_err());
-        assert!(sanitize_component("a*b").is_err());
+        assert_eq!(sanitize_component("good_name.m2ts"), "good_name.m2ts");
+        assert_eq!(sanitize_component(".."), "_");
+        assert_eq!(sanitize_component("a/b"), "a_b");
+        assert_eq!(sanitize_component("a:b"), "a_b");
+        assert_eq!(sanitize_component("a*b"), "a_b");
         // Windows reserved device names are substituted (prefixed `_`), not
         // rejected — a single such file must not abort the whole tree walk.
-        assert_eq!(sanitize_component("CON").unwrap(), "_CON");
-        assert_eq!(sanitize_component("com1").unwrap(), "_com1");
-        assert_eq!(sanitize_component("LPT9").unwrap(), "_LPT9");
+        assert_eq!(sanitize_component("CON"), "_CON");
+        assert_eq!(sanitize_component("com1"), "_com1");
+        assert_eq!(sanitize_component("LPT9"), "_LPT9");
         // Reserved base with an extension is still substituted (the device name
         // aliases regardless of extension on Windows).
-        assert_eq!(sanitize_component("NUL.cfg").unwrap(), "_NUL.cfg");
-        assert_eq!(sanitize_component("conin$").unwrap(), "_conin$");
+        assert_eq!(sanitize_component("NUL.cfg"), "_NUL.cfg");
+        assert_eq!(sanitize_component("conin$"), "_conin$");
         // A non-reserved lookalike is untouched.
-        assert_eq!(sanitize_component("COM10").unwrap(), "COM10");
-        assert_eq!(sanitize_component("CONSOLE").unwrap(), "CONSOLE");
+        assert_eq!(sanitize_component("COM10"), "COM10");
+        // COM0 and the superscript digits are reserved too.
+        assert_eq!(sanitize_component("COM0"), "_COM0");
+        assert_eq!(sanitize_component("LPT\u{b2}"), "_LPT\u{b2}");
+        assert_eq!(sanitize_component("CLOCK$"), "_CLOCK$");
+        assert_eq!(sanitize_component("CONSOLE"), "CONSOLE");
         // A trailing dot/space is stripped, not rejected outright.
-        assert_eq!(sanitize_component("name. ").unwrap(), "name");
+        assert_eq!(sanitize_component("name. "), "name");
         // ...unless stripping empties it.
-        assert!(sanitize_component(". ").is_err());
+        assert_eq!(sanitize_component(". "), "_");
+    }
+
+    /// Every host-illegal character is replaced, including the Windows path
+    /// separator, so a disc name cannot climb out of the extract root.
+    #[test]
+    fn sanitize_replaces_every_reserved_character() {
+        for c in ['/', '\\', ':', '<', '>', '"', '|', '?', '*'] {
+            assert_eq!(sanitize_component(&format!("a{c}b")), "a_b", "{c:?}");
+        }
+        assert_eq!(sanitize_component("a\\..\\x"), "a_.._x");
     }
 
     /// Two distinct disc paths that sanitize to the same host path are a hard
@@ -2318,6 +2405,9 @@ mod tests {
             fn set_unit_base(&mut self, lba: u32) {
                 self.last_unit_base = Some(lba);
             }
+            fn random_access(&self) -> bool {
+                false
+            }
         }
 
         let mut inner = Recorder {
@@ -2330,6 +2420,10 @@ mod tests {
             assert_eq!(b.capacity_sectors(), 42, "capacity_sectors must forward");
             b.set_speed(7200);
             b.set_unit_base(1234);
+            assert!(
+                !b.random_access(),
+                "random_access must forward, not default"
+            );
         }
         assert_eq!(inner.last_speed, Some(7200), "set_speed must forward");
         assert_eq!(
@@ -2624,26 +2718,16 @@ mod tests {
         );
     }
 
-    /// A raw control byte (below 0x20, distinct from the separately-rejected
-    /// NUL) in a disc-authored name must be rejected, not passed through into
-    /// the host filename.
+    /// A raw control byte (below 0x20) in a disc-authored name must be replaced,
+    /// not passed through into the host filename.
     #[test]
     fn sanitize_rejects_control_bytes() {
-        assert!(
-            sanitize_component("a\u{1}b").is_err(),
-            "0x01 must be rejected"
-        );
-        assert!(
-            sanitize_component("a\nb").is_err(),
-            "0x0A (newline) must be rejected"
-        );
-        assert!(
-            sanitize_component("a\u{1f}b").is_err(),
-            "0x1F must be rejected"
-        );
+        assert_eq!(sanitize_component("a\u{1}b"), "a_b", "0x01 replaced");
+        assert_eq!(sanitize_component("a\nb"), "a_b", "0x0A replaced");
+        assert_eq!(sanitize_component("a\u{1f}b"), "a_b", "0x1F replaced");
         // 0x20 (space) is NOT a control byte -- allowed mid-name (only
         // trimmed if trailing).
-        assert!(sanitize_component("a b").is_ok());
+        assert_eq!(sanitize_component("a b"), "a b");
     }
 
     /// The VTS group number must be EXACTLY 2 ASCII digits -- neither a
@@ -3073,5 +3157,300 @@ mod tests {
             "a short read must not be reported as a full good batch"
         );
         assert_eq!(dec.inner().0, READ_RETRIES + 1, "short reads are retried");
+    }
+
+    fn planned(
+        size: u64,
+        inline: Option<Vec<u8>>,
+        extents: Vec<crate::udf::AbsExtent>,
+    ) -> PlannedFile {
+        PlannedFile {
+            host_rel: PathBuf::from("f.bin"),
+            disc_name: "f.bin".into(),
+            size,
+            inline,
+            extents,
+            unmapped: false,
+        }
+    }
+
+    // One bad sector costs the rest of its ECC block (ends at 128), not the whole batch.
+    #[test]
+    fn bad_sector_holes_its_ecc_block_not_the_batch() {
+        let mut m = MemDisc::new();
+        for i in 0..9u32 {
+            m.put(124 + i, [i as u8 + 1; 2048]);
+        }
+        m.bad.insert(125);
+        let len = 9 * SECTOR_BYTES as u32;
+        let pf = planned(
+            len as u64,
+            None,
+            vec![crate::udf::AbsExtent {
+                lba: 124,
+                len,
+                recorded: true,
+            }],
+        );
+        let out = TmpDir::new("narrow");
+        std::fs::create_dir_all(out.path()).unwrap();
+        let mut dec = DecryptingSectorSource::new(m, DecryptKeys::None);
+        let (mut done, mut bad) = (0u64, 0u64);
+        let (fr, _) = extract_one_file(
+            &mut dec,
+            out.path(),
+            &pf,
+            len as u64,
+            &mut done,
+            &mut bad,
+            &ExtractOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fr.bytes_unreadable, 6 * SECTOR_BYTES as u64);
+        assert_eq!(fr.bytes_good, 3 * SECTOR_BYTES as u64);
+        assert_eq!(bad, 6 * SECTOR_BYTES as u64);
+        let data = std::fs::read(out.path().join("f.bin")).unwrap();
+        assert_eq!(data[0], 0, "bad unit zero-filled");
+        assert_eq!(
+            data[3 * SECTOR_BYTES],
+            0,
+            "unit straddling the block end unread"
+        );
+        assert_eq!(data[6 * SECTOR_BYTES], 7, "later unit kept");
+    }
+
+    // Counts reads; a read touching a `bad` LBA, or one of the first `fail_first`, fails.
+    struct CountingBad {
+        bad: fn(u32) -> bool,
+        fail_first: u32,
+        calls: u32,
+        fails: u32,
+    }
+    impl SectorSource for CountingBad {
+        fn capacity_sectors(&self) -> u32 {
+            100_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            self.calls += 1;
+            if self.calls <= self.fail_first || (lba..lba + count as u32).any(self.bad) {
+                self.fails += 1;
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                });
+            }
+            let need = count as usize * SECTOR_BYTES;
+            buf[..need].fill(0x22);
+            Ok(need)
+        }
+    }
+
+    // Reads one READ_BATCH_SECTORS batch at LBA 1000: (lost, reads, failed reads, buf).
+    fn narrowed(bad: fn(u32) -> bool, fail_first: u32) -> (u64, u32, u32, Vec<u8>) {
+        let src = CountingBad {
+            bad,
+            fail_first,
+            calls: 0,
+            fails: 0,
+        };
+        let mut dec = DecryptingSectorSource::new(src, DecryptKeys::None);
+        let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_BYTES];
+        let lost = read_batch_narrowed(&mut dec, 1000, READ_BATCH_SECTORS, &mut buf).unwrap();
+        (lost, dec.inner().calls, dec.inner().fails, buf)
+    }
+
+    // Byte range of batch-relative sectors [a, b).
+    fn sectors(a: u32, b: u32) -> std::ops::Range<usize> {
+        a as usize * SECTOR_BYTES..b as usize * SECTOR_BYTES
+    }
+
+    // Contiguous damage must cost a handful of reads per batch, not one retry loop per unit.
+    #[test]
+    fn narrowed_all_bad_batch_is_read_boundedly() {
+        let (lost, calls, _, buf) = narrowed(|l| (1000..2536).contains(&l), 0);
+        assert_eq!(lost, buf.len() as u64);
+        assert!(buf.iter().all(|&b| b == 0));
+        // 2 batch reads + 4 bad units x 1 attempt, then the budget zero-fills the rest.
+        assert_eq!(calls, 6, "{calls} reads for one bad batch");
+    }
+
+    // One bad ECC block mid-batch loses that block only; data after it is still read.
+    #[test]
+    fn narrowed_bad_ecc_block_loses_only_that_block() {
+        let (lost, calls, _, buf) = narrowed(|l| (1600..1632).contains(&l), 0);
+        // Units start at 1000 + 3k: 1630..1633 straddles the block end, so 1632 goes unread.
+        assert_eq!(lost, 33 * SECTOR_BYTES as u64);
+        assert!(buf[sectors(600, 633)].iter().all(|&b| b == 0));
+        assert!(buf[sectors(0, 600)].iter().all(|&b| b == 0x22));
+        assert!(buf[sectors(633, 1536)].iter().all(|&b| b == 0x22));
+        // 2 batch reads + 200 good units + 1 bad unit + 301 good units.
+        assert_eq!(calls, 2 + 200 + 1 + 301);
+    }
+
+    // A lone bad sector loses its ECC block (the drive fails the whole block anyway).
+    #[test]
+    fn narrowed_single_bad_sector_loses_its_ecc_block() {
+        let (lost, _, _, buf) = narrowed(|l| l == 1700, 0);
+        // Unit 1699..1702 fails; skip to the first unit at or after the block end 1728.
+        assert_eq!(lost, 30 * SECTOR_BYTES as u64);
+        assert!(buf[sectors(699, 729)].iter().all(|&b| b == 0));
+        assert_eq!(buf.iter().filter(|&&b| b == 0).count(), 30 * SECTOR_BYTES);
+    }
+
+    // Scattered damage (every other unit bad) stops at the per-batch failed-read budget.
+    #[test]
+    fn narrowed_alternating_damage_is_capped() {
+        let (lost, calls, fails, buf) = narrowed(|l| (l - 1000) / 3 % 2 == 1, 0);
+        assert_eq!(fails, 2 + MAX_FAILED_UNIT_READS);
+        // Good units 0, 8 and 30 were read; the rest is zero-filled.
+        assert_eq!(calls, fails + 3);
+        assert_eq!(lost, buf.len() as u64 - 9 * SECTOR_BYTES as u64);
+        assert!(buf[sectors(24, 27)].iter().all(|&b| b == 0x22));
+    }
+
+    // Fails to decrypt (not a media error) for LBAs in `bad`.
+    struct DecryptBad(fn(u32) -> bool);
+    impl SectorSource for DecryptBad {
+        fn capacity_sectors(&self) -> u32 {
+            100_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            if (lba..lba + count as u32).any(self.0) {
+                return Err(Error::DecryptFailed);
+            }
+            let need = count as usize * SECTOR_BYTES;
+            buf[..need].fill(0x22);
+            Ok(need)
+        }
+    }
+
+    // An undecryptable unit loses only itself: no ECC-block skip past it.
+    #[test]
+    fn narrowed_undecryptable_unit_loses_only_that_unit() {
+        let src = DecryptBad(|l| l == 1300);
+        let mut dec = DecryptingSectorSource::new(src, DecryptKeys::None);
+        let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_BYTES];
+        let lost = read_batch_narrowed(&mut dec, 1000, READ_BATCH_SECTORS, &mut buf).unwrap();
+        assert_eq!(lost, 3 * SECTOR_BYTES as u64);
+        assert!(buf[sectors(300, 303)].iter().all(|&b| b == 0));
+        assert!(buf[sectors(303, 1536)].iter().all(|&b| b == 0x22));
+    }
+
+    // A transient whole-batch failure is recovered by one batch re-read, no unit reads.
+    #[test]
+    fn narrowed_transient_batch_failure_rereads_the_batch() {
+        let (lost, calls, _, buf) = narrowed(|_| false, 1);
+        assert_eq!(lost, 0);
+        assert_eq!(calls, 2);
+        assert!(buf.iter().all(|&b| b == 0x22));
+    }
+
+    // Extents covering less than the declared size: the gap is lost bytes, not a clean file.
+    #[test]
+    fn undercovered_extents_count_the_gap_as_unreadable() {
+        let mut m = MemDisc::new();
+        m.put(100, [5; 2048]);
+        let len = SECTOR_BYTES as u32;
+        let size = 3 * SECTOR_BYTES as u64;
+        let pf = planned(
+            size,
+            None,
+            vec![crate::udf::AbsExtent {
+                lba: 100,
+                len,
+                recorded: true,
+            }],
+        );
+        let out = TmpDir::new("undercover");
+        std::fs::create_dir_all(out.path()).unwrap();
+        let mut dec = DecryptingSectorSource::new(m, DecryptKeys::None);
+        let (mut done, mut bad) = (0u64, 0u64);
+        let (fr, _) = extract_one_file(
+            &mut dec,
+            out.path(),
+            &pf,
+            size,
+            &mut done,
+            &mut bad,
+            &ExtractOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fr.bytes_good, SECTOR_BYTES as u64);
+        assert_eq!(fr.bytes_unreadable, 2 * SECTOR_BYTES as u64);
+        assert_eq!(done, size);
+        assert_eq!(bad, 2 * SECTOR_BYTES as u64);
+    }
+
+    // Inline data shorter than the declared size: same accounting.
+    #[test]
+    fn short_inline_data_counts_the_gap_as_unreadable() {
+        let pf = planned(5000, Some(vec![7u8; 100]), Vec::new());
+        let out = TmpDir::new("inline_short");
+        std::fs::create_dir_all(out.path()).unwrap();
+        let mut dec = DecryptingSectorSource::new(MemDisc::new(), DecryptKeys::None);
+        let (mut done, mut bad) = (0u64, 0u64);
+        let (fr, _) = extract_one_file(
+            &mut dec,
+            out.path(),
+            &pf,
+            5000,
+            &mut done,
+            &mut bad,
+            &ExtractOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fr.bytes_good, 100);
+        assert_eq!(fr.bytes_unreadable, 4900);
+    }
+
+    // Reserved names with trailing spaces before the extension, and superscript digits.
+    #[test]
+    fn sanitize_substitutes_space_padded_and_superscript_reserved_names() {
+        assert_eq!(sanitize_component("NUL .txt"), "_NUL .txt");
+        assert_eq!(sanitize_component("COM\u{B9}"), "_COM\u{B9}");
+        assert_eq!(sanitize_component("lpt\u{B3}.x"), "_lpt\u{B3}.x");
+    }
+
+    // Illegal characters are substituted, not reported as a collision that aborts the run.
+    #[test]
+    fn sanitize_substitutes_illegal_chars() {
+        assert_eq!(sanitize_component("a:b"), "a_b");
+        assert_eq!(sanitize_component("a\u{1}b"), "a_b");
+        assert_eq!(sanitize_component(".."), "_");
+        assert_eq!(sanitize_component(". "), "_");
+    }
+
+    // Two entries with the SAME name in one directory must collide, not overwrite.
+    #[test]
+    fn duplicate_identical_names_collide() {
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: vec![
+                file("movie", 30, 31, b"a".to_vec(), false),
+                file("movie", 32, 33, b"b".to_vec(), false),
+            ],
+            subdirs: vec![],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("dup_names");
+        let err = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect_err("duplicate names must collide");
+        assert!(matches!(err, Error::DirNameCollision { .. }));
     }
 }

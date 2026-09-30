@@ -15,8 +15,18 @@ pub(crate) const HZ27: u64 = 27_000_000;
 /// A chunk that commences an AU may go when that AU decodes within 0.95 s (design §2.4
 /// step 3), under MS-16's "less than or equal to one second" delay bound.
 const LEAD27: u64 = HZ27 * 95 / 100;
+/// 0.7 s in 90 kHz ticks: a PTS step over it is counted as a content gap.
+pub(crate) const MAX_PTS_GAP_TICKS: u64 = 63_000;
 /// MS-17: SCR fields in successive packs ≤ 0.7 s apart.
 pub(crate) const MAX_SCR_GAP27: u64 = HZ27 * 7 / 10;
+/// Widest timestamp gap bridged with padding packs; a wider one is re-based away. Above
+/// the longest finite DVD cell still (254 s); a narrower gap is re-based only when the
+/// padding budget runs out (under about 183 B of input per second of gap).
+const MAX_PAD_GAP27: u64 = 300 * HZ27;
+/// Padding allowed beyond `PAD_RATIO` × the input bytes pushed, so amplification stays
+/// bounded while sparse low-bitrate stills are still padded.
+const PAD_FLOOR_BYTES: u64 = 256 * 1024;
+const PAD_RATIO: u64 = 16;
 /// Per-track lookahead before the clock may pass `t` (design §2.4 step 1).
 const LOOKAHEAD27: u64 = HZ27;
 /// Max-interleave cap: a track this far behind the others is treated as sparse.
@@ -142,6 +152,8 @@ pub(crate) struct PstdCounters {
     pub padding_packs: u64,
     /// EOF passes that lifted the lead and whole-frame waits to drain what was stuck.
     pub forced_eof: u64,
+    /// Quiet timestamp gaps closed by shifting later timestamps back, not padding.
+    pub rebased_gaps: u64,
 }
 
 /// The pack writer.
@@ -159,6 +171,9 @@ pub(crate) struct Mux<W: Write> {
     next_id: u64,
     queued_bytes: usize,
     counters: PstdCounters,
+    /// Total 27 MHz shift removed from timestamps by re-basing; applied to later AUs.
+    shift27: u64,
+    pushed_bytes: u64,
     /// EOF with nothing schedulable: the lead and whole-frame waits are lifted (B1).
     forcing: bool,
 }
@@ -205,6 +220,8 @@ impl<W: Write> Mux<W> {
             next_id: 0,
             queued_bytes: 0,
             counters: PstdCounters::default(),
+            shift27: 0,
+            pushed_bytes: 0,
             forcing: false,
         }
     }
@@ -219,13 +236,17 @@ impl<W: Write> Mux<W> {
     }
 
     /// Queue one AU of stream `si`, in that stream's decode order.
-    pub(crate) fn push(&mut self, si: usize, au: Au) {
+    pub(crate) fn push(&mut self, si: usize, mut au: Au) {
+        let sh90 = self.shift27 / 300;
+        au.pts = au.pts.saturating_sub(sh90);
+        au.dts = au.dts.map(|d| d.saturating_sub(sh90));
+        self.pushed_bytes += au.data.len() as u64;
         let s = &mut self.streams[si];
-        let dec27 = au.dts.unwrap_or(au.pts) * 300;
+        let dec27 = au.dts.unwrap_or(au.pts).saturating_mul(300);
         // MS-18 / MPG2-11: a gap over 0.7 s is the content's own (a still or slideshow); count it.
         if s.spec.av
             && let Some(prev) = s.last_pts
-            && au.pts.abs_diff(prev) > 63_000
+            && au.pts.abs_diff(prev) > MAX_PTS_GAP_TICKS
         {
             self.counters.pts_gaps += 1;
         }
@@ -528,8 +549,8 @@ impl<W: Write> Mux<W> {
                 return pack::RATE_BOUND;
             }
             let packs = bytes.div_ceil(EST_PAYLOAD) + 1;
-            let need =
-                (u128::from(packs) * 2048 * TICKS_PER_BYTE_UNIT).div_ceil(u128::from(dec - t));
+            let need = (u128::from(packs) * pack::PACK_BYTES as u128 * TICKS_PER_BYTE_UNIT)
+                .div_ceil(u128::from(dec - t));
             units = units.max(need);
         }
         units.min(u128::from(pack::RATE_BOUND)) as u32
@@ -677,9 +698,12 @@ impl<W: Write> Mux<W> {
                 // what still cannot go is an error, never a silent Ok.
                 if self.forcing {
                     let left: usize = self.streams.iter().map(|s| s.queue.len()).sum();
-                    return Err(io::Error::other(format!(
-                        "mpg: {left} access unit(s) could not be packetized"
-                    )));
+                    tracing::error!(
+                        target: "mux",
+                        access_units = left,
+                        "mpg: access units could not be packetized"
+                    );
+                    return Err(crate::error::Error::MpgUnpacketized.into());
                 }
                 self.forcing = true;
                 self.counters.forced_eof += 1;
@@ -698,14 +722,58 @@ impl<W: Write> Mux<W> {
                 continue;
             };
             match self.last_scr {
-                Some(last) if next > last + MAX_SCR_GAP27 => {
-                    let at = (last + MAX_SCR_GAP27).max(t);
+                // A wake within the lead may be a written AU's removal, which no re-base
+                // moves: pad it (one pack), so the loop always progresses.
+                Some(last)
+                    if next.saturating_sub(last) > MAX_PAD_GAP27
+                        || (next.saturating_sub(last) > LEAD27
+                            && self.pad_over_budget(next, last)) =>
+                {
+                    self.rebase(last, next);
+                }
+                Some(last) if next > last.saturating_add(MAX_SCR_GAP27) => {
+                    let at = last.saturating_add(MAX_SCR_GAP27).max(t);
                     self.counters.padding_packs += 1;
                     self.write_pack(at, true)?;
                 }
                 _ => self.t = Some(next),
             }
         }
+    }
+
+    // Padding stays within a floor plus `PAD_RATIO` × the input, and at most one pack per
+    // wait inside the 0.95 s lead.
+    fn pad_over_budget(&self, next: u64, last: u64) -> bool {
+        let packs = next.saturating_sub(last) / MAX_SCR_GAP27;
+        (self.counters.padding_packs + packs) * pack::PACK_BYTES as u64
+            > PAD_FLOOR_BYTES + PAD_RATIO * self.pushed_bytes
+    }
+
+    // Every stream is quiet until `next`: shift queued timestamps back so it lands within
+    // one SCR step of `last` (rounded up). Written AUs keep their decoding times, except
+    // those a forced EOF drain wrote past the lead: only moving them lets the loop progress.
+    fn rebase(&mut self, last: u64, next: u64) {
+        let d90 = next.saturating_sub(last + MAX_SCR_GAP27).div_ceil(300);
+        let d27 = d90 * 300;
+        if d27 == 0 {
+            self.t = Some(next);
+            return;
+        }
+        self.counters.rebased_gaps += 1;
+        self.shift27 += d27;
+        for s in &mut self.streams {
+            s.last_dec27 = s.last_dec27.saturating_sub(d27);
+            s.last_pts = s.last_pts.map(|p| p.saturating_sub(d90));
+            for q in &mut s.queue {
+                q.dec27 = q.dec27.saturating_sub(d27);
+                q.au.pts = q.au.pts.saturating_sub(d90);
+                q.au.dts = q.au.dts.map(|d| d.saturating_sub(d90));
+            }
+        }
+        for e in self.entries.iter_mut().filter(|e| e.dec27 > last + LEAD27) {
+            e.dec27 = e.dec27.saturating_sub(d27);
+        }
+        self.t = Some(next - d27);
     }
 
     /// Drain everything and write `MPEG_program_end_code`.
@@ -778,6 +846,175 @@ mod tests {
         }
     }
 
+    fn scrs(out: &[u8]) -> Vec<u64> {
+        let mut v = Vec::new();
+        for i in (0..out.len().saturating_sub(10)).step_by(pack::PACK_BYTES) {
+            let h = &out[i..];
+            let b = |k: usize| u64::from(h[k]);
+            let base = ((b(4) >> 3) & 7) << 30
+                | (b(4) & 3) << 28
+                | b(5) << 20
+                | (b(6) >> 3) << 15
+                | (b(6) & 3) << 13
+                | b(7) << 5
+                | b(8) >> 3;
+            v.push(base * 300 + ((b(8) & 3) << 7 | b(9) >> 1));
+        }
+        v
+    }
+
+    // A far-future timestamp is re-based, not bridged with millions of padding packs.
+    #[test]
+    fn a_huge_forward_gap_is_rebased() {
+        let mut m = video_mux();
+        m.push(0, au(9_000, 100, 0));
+        m.push(0, au(9_000 + 2 * 3_600 * 90_000, 100, 0));
+        m.finish().unwrap();
+        assert_eq!(m.counters().rebased_gaps, 1);
+        let out = m.into_writer();
+        assert!(out.len() < 1 << 20, "{}", out.len());
+        let s = scrs(&out);
+        assert!(
+            s.windows(2)
+                .all(|w| w[1] >= w[0] && w[1] - w[0] <= MAX_SCR_GAP27)
+        );
+    }
+
+    // Many 59-minute steps: padding stays a small multiple of the input.
+    #[test]
+    fn repeated_huge_gaps_stay_bounded() {
+        let mut m = video_mux();
+        for k in 0..2_000u64 {
+            m.push(0, au(9_000 + k * 59 * 60 * 90_000, 10, 0));
+        }
+        m.finish().unwrap();
+        let out = m.into_writer();
+        assert!(out.len() < 8 << 20, "{}", out.len());
+    }
+
+    // Video-only stills 10 s apart are real content: padded to full length, never re-based.
+    #[test]
+    fn ten_second_video_stills_keep_their_timing() {
+        let mut m = video_mux();
+        for k in 0..20u64 {
+            m.push(0, au(90_000 + k * 900_000, 8_000, 0));
+        }
+        m.finish().unwrap();
+        let c = m.counters();
+        assert_eq!(c.rebased_gaps, 0);
+        assert!(c.padding_packs >= 19 * 14, "{}", c.padding_packs);
+        let s = scrs(&m.into_writer());
+        assert!(s.iter().max().copied().unwrap_or(0) >= 190 * HZ27);
+    }
+
+    // Many gaps under the re-base threshold: the padding budget alone bounds the output.
+    #[test]
+    fn many_sub_threshold_gaps_stay_within_the_padding_budget() {
+        let mut m = video_mux();
+        for k in 0..100u64 {
+            m.push(0, au(9_000 + k * 60 * 90_000, 10, 0));
+        }
+        m.finish().unwrap();
+        let c = m.counters();
+        assert!(c.rebased_gaps > 0);
+        assert!(c.padding_packs * 2_048 <= PAD_FLOOR_BYTES + PAD_RATIO * 1_000);
+    }
+
+    // Over budget, a wait on a written AU's removal is padded, not re-based: no re-base
+    // can move that removal, so re-basing it would loop forever.
+    #[test]
+    fn an_over_budget_removal_wait_still_progresses() {
+        let d = 100 * HZ27;
+        let mut m = video_mux();
+        m.first = None;
+        m.entries.push(Entry {
+            stream: 0,
+            id: u64::MAX,
+            dec27: d,
+            bytes: 232 * 1_024,
+            complete: true,
+        });
+        m.last_scr = Some(d - HZ27 * 8 / 10);
+        m.t = m.last_scr;
+        m.counters.padding_packs = 1 << 20;
+        m.push(0, au(d / 300 + 3_600, 1_000, 0));
+        m.finish().unwrap();
+        assert!(scrs(&m.into_writer()).iter().all(|&s| s <= d + HZ27));
+    }
+
+    // A forced EOF drain writes AUs ahead of the lead; a later wait on their removal must
+    // still re-base and finish, not spin (run on a thread so a regression fails, not hangs).
+    #[test]
+    fn a_forced_drain_then_huge_gaps_still_finishes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut m = video_mux();
+            m.push(0, au(9_000, 0, 0));
+            for k in 0..3u64 {
+                m.push(0, au(12_600 + k * 400 * 90_000, 200_000, 0));
+            }
+            let _ = tx.send(m.finish().is_ok());
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(20));
+        assert_eq!(done, Ok(true), "the forced drain never finished");
+    }
+
+    // A re-base lands the next SCR at most 0.7 s after the last one (MS-17), whatever
+    // the alignment of the last SCR.
+    #[test]
+    fn a_rebase_never_steps_scr_past_the_limit() {
+        for len in (100..4_000).step_by(37) {
+            let mut m = video_mux();
+            m.push(0, au(9_000, len, 0));
+            m.push(0, au(9_000 + 2 * 3_600 * 90_000, 100, 0));
+            m.finish().unwrap();
+            let s = scrs(&m.into_writer());
+            let step = s.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+            assert!(step <= MAX_SCR_GAP27, "len {len}: step {step}");
+        }
+    }
+
+    // AUs already written keep their decoding times: a re-base must not let the next AU
+    // into a buffer they still occupy (MS-16).
+    #[test]
+    fn a_rebase_keeps_written_aus_in_the_buffer() {
+        let size = 232 * 1_024;
+        let mut m = video_mux();
+        m.push(0, au(90_000, 200_000, 0));
+        m.push(0, au(90_000 + 2 * 3_600 * 90_000, 200_000, 0));
+        m.finish().unwrap();
+        assert_eq!(m.counters().rebased_gaps, 1);
+        let out = m.into_writer();
+        let (mut sent, mut a_dec) = (0usize, None);
+        for p in out
+            .chunks(pack::PACK_BYTES)
+            .filter(|p| p.len() == pack::PACK_BYTES)
+        {
+            let scr = scrs(p)[0];
+            let at = pack::PACK_HEADER_BYTES + usize::from(p[13] & 7);
+            if p[at + 3] != 0xE0 {
+                continue;
+            }
+            let len = usize::from(u16::from_be_bytes([p[at + 4], p[at + 5]]));
+            if a_dec.is_none() && p[at + 7] & 0x80 != 0 {
+                let t = &p[at + 9..];
+                let pts = (u64::from(t[0]) >> 1 & 7) << 30
+                    | u64::from(t[1]) << 22
+                    | (u64::from(t[2]) >> 1) << 15
+                    | u64::from(t[3]) << 7
+                    | u64::from(t[4]) >> 1;
+                a_dec = Some(pts * 300);
+            }
+            sent += len - 3 - usize::from(p[at + 8]);
+            if a_dec.is_some_and(|d| scr < d) {
+                assert!(
+                    sent <= size,
+                    "{sent} bytes in a {size}-byte buffer at {scr}"
+                );
+            }
+        }
+    }
+
     // Nit (r2): the forced EOF pass that lifts the 0.95 s lead is counted, not silent.
     #[test]
     fn a_forced_eof_drain_is_counted() {
@@ -829,12 +1066,10 @@ mod tests {
         m.push(0, au(9_000, 5_000, 3_000));
         m.streams[0].first_pes_done = true;
         m.streams[0].queue[0].sent = 3_000 - 484;
-        let p = m.plan_pes(0, 494, 0);
-        assert!(
-            p.as_ref().is_none_or(|p| p.start.is_none() && p.len <= 484),
-            "{:?}",
-            p.map(|p| (p.len, p.start))
-        );
+        let p = m
+            .plan_pes(0, 494, 0)
+            .expect("the tail is sent, not stalled");
+        assert_eq!((p.len, p.start), (484, None));
     }
 
     // An AU's first byte and its commencement byte share one PES: a PES ends before the next

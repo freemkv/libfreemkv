@@ -208,12 +208,7 @@ struct AnnexBWriter {
     /// avcC/hvcC may declare 1 or 2, and reading those as u32-BE parses no NALs
     /// at all, so the raw prefixed bytes would be emitted as if already Annex B.
     length_size: usize,
-    /// Reused length-prefixed -> Annex-B conversion buffer. `write_frame` used to
-    /// allocate and free a whole-frame Vec per video frame; extracting the video ES
-    /// of a UHD title is ~200,000 frames of 150-400 KB, every one over the
-    /// allocator's mmap threshold, so that was ~200,000 mmap/munmap pairs plus
-    /// millions of first-touch page faults of pure overhead. Kept on the writer and
-    /// cleared per frame instead, matching what tsmux.rs already does.
+    /// Reused length-prefixed -> Annex-B buffer, cleared per frame (avoids a per-frame alloc).
     scratch: Vec<u8>,
 }
 
@@ -662,32 +657,15 @@ pub struct DemuxSink {
     /// Index = track id; `None` for unselected tracks.
     tracks: Vec<Option<TrackOut>>,
     ref_video_track: Option<usize>,
-    /// Every VIDEO track index, recorded before the kind filter.
-    ///
-    /// The filtered `tracks` slots are `None` for a class this export drops, so
-    /// they cannot answer "is this video" for a frame that still flows through
-    /// `write()`.
+    /// Every VIDEO track index, recorded before the kind filter drops slots.
     video_tracks: std::collections::HashSet<usize>,
-    /// First PTS observed on `ref_video_track`, recorded in `write()` REGARDLESS
-    /// of whether that track has a `TrackOut`. The DELAY reference cannot live in
-    /// `TrackOut::first_pts_ns`: `audio://` / `sub://` filter the video track's
-    /// output away in `create()`, so no `TrackOut` exists to record it, and the
-    /// old `unwrap_or(0)` fallback then measured every delay against a reference
-    /// of zero and baked a plausible-looking wrong `DELAY` into the filename.
-    /// `None` = no reference seen → no delay is emitted at all (see
-    /// `apply_delays`).
+    /// First PTS seen on `ref_video_track`, even when that track has no `TrackOut`.
+    /// `None` = no reference seen, so no delay is emitted (see `apply_delays`).
     ref_first_pts_ns: Option<i64>,
     timeline: TimelineContinuity,
     finished: bool,
-    /// Frames actually PERSISTED to a track file — the drop gate's denominator.
-    ///
-    /// Counted in `write()` only inside the `Some(TrackOut)` arm, so a frame for
-    /// a track this export filters out (e.g. video during an `audio://` export)
-    /// flows through the timeline but does NOT count here. The gate in `finish()`
-    /// pairs this with `timeline.dropped_for(persisted_tracks)` so numerator and
-    /// denominator cover the SAME set of tracks: were it "frames the timeline
-    /// placed", a filtered-out track's clip-join drops would measure against a
-    /// count that never included them, wrongly tripping `SeamPlanDroppedMost`/`SinkWroteNothing`.
+    /// Frames persisted to a track file (drop gate denominator); filtered-out tracks
+    /// are not counted, matching `timeline.dropped_for(persisted_tracks)` in `finish()`.
     frames_mapped: u64,
     /// MPEG-2 multichannel extension tracks (no ES file form), reported once packets arrive.
     excluded: super::ps::UnstoredExtensions,
@@ -1498,6 +1476,17 @@ mod tests {
         compositions
     }
 
+    // A visible PCS with no duration has no known wipe time: neither write nor finish adds a clear.
+    #[test]
+    fn pgs_sup_visible_pcs_without_duration_gets_no_clear_at_finish() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        let f = sup_frame(1_000_000_000, None, true);
+        writer.write_frame(&mut bytes, &f, f.pts).unwrap();
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(sup_compositions(&bytes), [(90_000, 1)]);
+    }
+
     #[test]
     fn pgs_sup_preserves_original_clear_without_a_duplicate_or_later_clear() {
         let mut writer = PgsSupWriter::default();
@@ -1817,6 +1806,44 @@ mod tests {
             "video (track 1) must drive the epoch: offset_ns should have advanced \
              past the previous high, got {}",
             sink.timeline.offset_ns
+        );
+        sink.finish().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A second video track (Dolby Vision EL) rides the base layer's epoch: its
+    // old-clip straggler after a seam must not open a spurious epoch.
+    #[test]
+    fn second_video_track_does_not_drive_epochs() {
+        let dir = tempdir();
+        let title = title_with(
+            vec![video_stream(Codec::H264), video_stream(Codec::H264)],
+            vec![None, None],
+        );
+        let mut sink = DemuxSink::create(&dir, &title, &DemuxOptions::default()).unwrap();
+        let fr = |track: usize, pts: i64| PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track,
+            pts,
+            keyframe: true,
+            data: vec![0x00, 0x00, 0x00, 0x01, 0xAA],
+            duration_ns: None,
+        };
+        let s = 1_000_000_000i64;
+        for f in [fr(0, 0), fr(1, 0), fr(0, 600 * s), fr(1, 600 * s), fr(0, 0)] {
+            sink.write(&f).unwrap();
+        }
+        let seam = sink.timeline.offset_ns;
+        assert!(seam >= 600 * s, "base layer reset opens the epoch");
+        // Clip 1's EL tail, EL at the new clip's start, then BL continues.
+        for f in [fr(1, 599 * s + s / 2), fr(1, 0), fr(0, 5 * s)] {
+            sink.write(&f).unwrap();
+        }
+        assert_eq!(
+            sink.timeline.offset_ns, seam,
+            "the EL straggler must not open another epoch"
         );
         sink.finish().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

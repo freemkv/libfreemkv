@@ -256,6 +256,11 @@ fn bd_disc(aacs: Option<bool>) -> MemDisc {
     mem
 }
 
+// A drive over an unencrypted BD that scans successfully.
+pub(crate) fn scannable_drive() -> Drive {
+    Rig::new(bd_disc(None), |_| {}).drive
+}
+
 struct Rig {
     drive: Drive,
     log: Log,
@@ -917,12 +922,17 @@ fn bus_step_stop_and_transport_share_bus_step_guard() {
         );
     }
     let enc = include_str!("encrypt.rs");
+    // Comment lines are dropped so a commented-out call cannot satisfy the check.
     let body = |src: &'static str, f: &str| {
         let i = src.find(f).unwrap();
-        &src[i..i + src[i..]
+        src[i..i + src[i..]
             .find("\n}\n")
             .or_else(|| src[i..].find("\n    }\n"))
             .unwrap()]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     assert!(body(enc, "pub(super) fn aacs_bus_step(").contains("bus_step_guard("));
     assert!(body(include_str!("mod.rs"), "fn css_bus_step(").contains("bus_step_guard("));

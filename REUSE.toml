@@ -9,8 +9,9 @@ version = 1
 # Rust sources, documentation, configuration, workflows, scripts, binary assets,
 # and the byte-exact `.golden` test fixtures — is covered here instead.
 #
-# The whole repository is the project's own work under the MIT licence; there is
-# no third-party vendored source here.
+# The repository is the project's own work under the MIT licence, except the
+# MPEG audio ISO reference tables under src/mux/codec/testdata/dist10, which are
+# third-party test data and carry their own annotation at the end of this file.
 
 [[annotations]]
 path = [
@@ -35,7 +36,21 @@ path = [
     "Makefile",
     "LICENSE",
     "build.rs",
+    "**/*.c",
+    "**/*.mp2",
+    "**/*.class",
+    "**/PROVENANCE",
+    "tests/*.txt",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Matthew Jackson & Contributors"
 SPDX-License-Identifier = "MIT"
+
+# Table 3-B.2a-d allocation data copied from the ISO/IEC 11172-5 reference
+# software (dist10, ISO/MPEG Audio Subgroup Software Simulation Group); this is
+# not the project's work and is not MIT-licensed.
+[[annotations]]
+path = "src/mux/codec/testdata/dist10/alloc_*"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "ISO/IEC JTC1/SC29/WG11 (MPEG) and the ISO/MPEG Audio Subgroup Software Simulation Group"
+SPDX-License-Identifier = "LicenseRef-ISO-dist10"

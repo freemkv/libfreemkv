@@ -58,12 +58,8 @@ pub(crate) struct WritebackPipeline {
     /// we skip it entirely and let the NFS client handle commit on
     /// close.
     is_nfs: bool,
-    /// Set the first time WAIT_AFTER exceeds [`WAIT_AFTER_TIMEOUT`].
-    /// Once set, behaviour matches the NFS path for the rest of the
-    /// pipeline's life. A plain `AtomicBool`: the flag is only ever
-    /// touched on the owning thread (the spawned WAIT_AFTER worker never
-    /// reads or writes it). `AtomicBool` over `bool` only because the
-    /// load/store sites read cleanly; no sharing is needed today.
+    /// Set when WAIT_AFTER exceeds [`WAIT_AFTER_TIMEOUT`]; behaves like NFS from then on.
+    /// Owning-thread access only.
     degraded: AtomicBool,
     /// False for fds `sync_file_range` rejects (pipes, char devices such as
     /// `/dev/null`): those skip kickoff, WAIT_AFTER and DONTNEED entirely.
@@ -83,6 +79,7 @@ pub(crate) struct WritebackPipeline {
 type WaitOp = fn(RawFd, u64, u64) -> i32;
 
 fn sys_wait_after(fd: RawFd, off: u64, len: u64) -> i32 {
+    // SAFETY: a plain syscall on an fd; no user memory is touched.
     let rc = unsafe {
         libc::sync_file_range(fd, off as i64, len as i64, libc::SYNC_FILE_RANGE_WAIT_AFTER)
     };
@@ -99,6 +96,8 @@ enum WaitOutcome {
     Done(u64),
     Failed(i32),
     TimedOut,
+    // No WAIT_AFTER ran (worker lost): nothing durable, nothing to time.
+    Skipped,
 }
 
 impl WritebackPipeline {
@@ -238,6 +237,7 @@ impl WritebackPipeline {
                         wait_ms = ms;
                         self.flush.add_durable(prev_len);
                         let t_fadv = Instant::now();
+                        // SAFETY: a valid fd; an advisory call.
                         unsafe {
                             libc::posix_fadvise(
                                 self.fd,
@@ -250,6 +250,7 @@ impl WritebackPipeline {
                         self.record_wait(wait_ms);
                     }
                     WaitOutcome::Failed(errno) => self.latch_error(errno, prev_off, prev_len),
+                    WaitOutcome::Skipped => {}
                     WaitOutcome::TimedOut => {
                         // Timeout branch: switch to NFS-style skip for the rest of the
                         // pipeline's life. Do NOT call DONTNEED — if WAIT_AFTER hasn't
@@ -409,6 +410,7 @@ impl WritebackPipeline {
                 }
             }
             WaitOutcome::Failed(errno) => self.latch_error(errno, prev_off, prev_len),
+            WaitOutcome::Skipped => {}
             WaitOutcome::TimedOut => {
                 self.degraded.store(true, Ordering::Relaxed);
                 tracing::error!(
@@ -483,7 +485,7 @@ fn wait_after_with_timeout(
         | Err(crate::io::bounded::BoundedError::Halted) => WaitOutcome::TimedOut,
         // Worker spawn failed or panicked before sending: no syscall ran, so
         // nothing was consumed. Benign, not a degrade trigger.
-        Err(crate::io::bounded::BoundedError::WorkerLost) => WaitOutcome::Done(0),
+        Err(crate::io::bounded::BoundedError::WorkerLost) => WaitOutcome::Skipped,
     }
 }
 
@@ -499,6 +501,16 @@ mod tests {
         let f = NamedTempFile::new().expect("tempfile create");
         let pipeline = WritebackPipeline::new(f.as_file(), 0, chunk_bytes);
         (f, pipeline)
+    }
+
+    // A lost worker ran no WAIT_AFTER: it must not count as a completed (0 ms) wait.
+    #[test]
+    fn lost_wait_worker_is_skipped_not_done() {
+        fn panicking(_: RawFd, _: u64, _: u64) -> i32 {
+            panic!("intentional test panic");
+        }
+        let out = wait_after_with_timeout(None, -1, 0, 1, panicking, Duration::from_secs(2));
+        assert!(matches!(out, WaitOutcome::Skipped));
     }
 
     #[test]
@@ -561,6 +573,35 @@ mod tests {
             p.chunk_bytes, initial,
             "chunk must not change before window is full"
         );
+    }
+
+    // p95 of a full window is its top sample (index 15 of 16): one slow wait among fast
+    // ones grows the chunk. Uniform samples cannot tell `sorted[15]` from `sorted[0]`.
+    #[test]
+    fn record_wait_takes_the_top_sample_as_p95() {
+        let (_f, mut p) = local_pipeline(16 * 1024 * 1024);
+        for _ in 0..ADAPTIVE_WINDOW - 1 {
+            p.record_wait(1);
+        }
+        p.record_wait(ADAPTIVE_GROW_MS + 50);
+        assert_eq!(p.chunk_bytes, 32 * 1024 * 1024);
+    }
+
+    // The window evicts its OLDEST sample: a slow wait stays in the window for exactly
+    // ADAPTIVE_WINDOW pushes, then leaves and the chunk shrinks.
+    #[test]
+    fn record_wait_evicts_the_oldest_sample() {
+        let (_f, mut p) = local_pipeline(16 * 1024 * 1024);
+        for _ in 0..ADAPTIVE_WINDOW - 1 {
+            p.record_wait(1);
+        }
+        p.record_wait(ADAPTIVE_GROW_MS + 50); // push #16: grows, stays in the window
+        for _ in 0..ADAPTIVE_WINDOW - 1 {
+            p.record_wait(1); // pushes #17..#31: the slow sample is still inside
+        }
+        assert_eq!(p.chunk_bytes, CHUNK_BYTES_MAX);
+        p.record_wait(1); // push #32 evicts it: all fast, so shrink
+        assert_eq!(p.chunk_bytes, CHUNK_BYTES_MAX / 2);
     }
 
     #[test]

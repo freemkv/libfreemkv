@@ -27,8 +27,8 @@ codegen-units = 1
 #           none of the ripping dependency tree.
 # `rip`   — the full ripping tree (drive lifecycle, disc/UDF/MPLS/CLPI parsing,
 #           AACS/CSS decrypt, PES/mux pipeline, keydb, freemkv-unlock seam). All
-#           heavy deps (serde, zip, rayon, roxmltree, rand, crossbeam, memchr,
-#           sha1, aes, base64, freemkv-unlock, serde_json) live here.
+#           heavy deps (serde, zip, rayon, roxmltree, crossbeam, memchr,
+#           sha1, sha2, aes, base64, socket2, rustix, freemkv-unlock, serde_json) live here.
 # `default = ["rip", "scsi"]` preserves today's full build byte-for-byte;
 # consumers wanting transport only use `default-features = false, features =
 # ["scsi"]`. `rip` implies `scsi` because the ripping tree reads through it.
@@ -84,9 +84,8 @@ rustix = { version = "1", default-features = false, features = ["std", "event"],
 roxmltree = { version = "0.20", optional = true }
 # Trace-level instrumentation for the read/transport path (SgIoTransport::execute
 # and friends). Part of the `scsi` feature — the transport layer traces here.
-# Permitted
-# under CLAUDE.md ("Acceptable strings: debug/trace logging"). Consumers (autorip)
-# wire a tracing subscriber and pipe events into the JSONL debug log.
+# Debug/trace logging is the permitted string output. Consumers (autorip) wire a
+# tracing subscriber and pipe events into the JSONL debug log.
 tracing = { version = "0.1", optional = true }
 # Bounded MPSC channel with kernel-wakeup send_timeout. Used by `io::pipeline`
 # so the halt-aware send/finish loops can BLOCK on consumer drain instead of

@@ -133,14 +133,18 @@ impl SparsePtsReorder {
         match self.held.take() {
             Some(held) => {
                 // Calibrate a per-frame duration from the two anchors' spacing over
-                // the held GOP's frame count. Approximate, but each GOP re-locks
+                // their display-slot distance. Approximate, but each GOP re-locks
                 // its own origin, so this only sets intra-GOP spacing.
                 if self.dur_ns == 0
-                    && let (Some((p_held, _)), Some((p_next, _))) = (held.anchor, gop.anchor)
+                    && let (Some((p_held, d_held)), Some((p_next, d_next))) =
+                        (held.anchor, gop.anchor)
                 {
+                    // Slots between the anchors: the held GOP's frames after its
+                    // anchor plus the next anchor's own display offset.
                     let span = p_next - p_held;
-                    if span > 0 && held.count > 0 {
-                        self.dur_ns = (span / held.count).max(1);
+                    let slots = held.count - d_held + d_next;
+                    if span > 0 && slots > 0 {
+                        self.dur_ns = (span / slots).max(1);
                     }
                 }
                 out = self.emit_gop(held);
@@ -333,6 +337,27 @@ mod tests {
     }
 
     #[test]
+    fn calibration_accounts_for_open_gop_leading_bs() {
+        use CodingType::*;
+        // Closed GOP (I at display 0) then an open GOP whose I follows two leading Bs.
+        let dur = 41_708_333i64;
+        let mut r = SparsePtsReorder::new();
+        let mut got: Vec<i64> = Vec::new();
+        let gops = [
+            ([I, P, P, P], 0i64),
+            ([I, B, B, P], 6 * dur), // I displays after B B, at slot 6
+        ];
+        for (types, pts) in gops {
+            for (k, ct) in types.into_iter().enumerate() {
+                let p = (k == 0).then_some(pts);
+                got.extend(r.push(p, frame(ct, k == 0)).iter().map(|f| f.pts_ns));
+            }
+        }
+        got.extend(r.flush().iter().map(|f| f.pts_ns));
+        assert_eq!(&got[..4], &[0, dur, 2 * dur, 3 * dur]);
+    }
+
+    #[test]
     fn no_pts_collisions_within_a_gop() {
         use CodingType::*;
         // Every frame distinct in DISPLAY order — the property the mkv muxer
@@ -350,5 +375,39 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "no two frames share a display PTS");
+    }
+
+    #[test]
+    fn unanchored_gops_continue_after_the_previous_gop() {
+        use CodingType::*;
+        // GOPs 1-2 carry anchors (calibrating dur); GOPs 3-4 carry none and must
+        // continue at origin + count*dur, not collide.
+        let dur = 40_000_000i64;
+        let mut r = SparsePtsReorder::new();
+        let mut got: Vec<i64> = Vec::new();
+        for anchor in [Some(0i64), Some(3 * dur), None, None] {
+            for (k, ct) in [I, P, P].into_iter().enumerate() {
+                let p = if k == 0 { anchor } else { None };
+                got.extend(r.push(p, frame(ct, k == 0)).iter().map(|f| f.pts_ns));
+            }
+        }
+        got.extend(r.flush().iter().map(|f| f.pts_ns));
+        let want: Vec<i64> = (0..12).map(|i| i * dur).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn single_anchor_uses_fallback_duration() {
+        use CodingType::*;
+        let mut r = SparsePtsReorder::new();
+        let mut got = Vec::new();
+        for (k, ct) in [I, P, P].into_iter().enumerate() {
+            got.extend(r.push((k == 0).then_some(1_000), frame(ct, k == 0)));
+        }
+        got.extend(r.flush());
+        let pts: Vec<i64> = got.iter().map(|f| f.pts_ns).collect();
+        let d = FALLBACK_FRAME_DUR_NS;
+        assert_eq!(pts, vec![1_000, 1_000 + d, 1_000 + 2 * d]);
+        assert!(got.iter().all(|f| f.duration_ns == Some(d as u64)));
     }
 }

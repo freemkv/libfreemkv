@@ -23,10 +23,7 @@ const NAL_SEI_SUFFIX: u8 = 40;
 // Mastering Display Colour Volume (D.2.28) = 137, Content Light Level Info (D.2.35) = 144.
 const SEI_MASTERING_DISPLAY_COLOUR_VOLUME: u32 = 137;
 const SEI_CONTENT_LIGHT_LEVEL_INFO: u32 = 144;
-// Dolby Vision RPU (Reference Processing Unit) — NAL type 62 (UNSPEC62).
-// This is NOT filtered: all NAL types except VPS/SPS/PPS/AUD pass through
-// to frame data, so DV enhancement layer RPU NALs are preserved automatically.
-const _NAL_UNSPEC62_DV_RPU: u8 = 62;
+// Dolby Vision RPU NALs (type 62) pass through: only VPS/SPS/PPS/AUD are filtered.
 // IRAP types (keyframes): BLA, IDR, CRA
 const NAL_BLA_W_LP: u8 = 16;
 const NAL_RSV_IRAP_VCL23: u8 = 23;
@@ -445,6 +442,8 @@ impl CodecParser for HevcParser {
 
         let data = &pes.data;
         let mut keyframe = false;
+        // Set once the first CRA of a non-seamless join is seen in this AU.
+        let mut bla_au = false;
         // Picture coding type, MEASURED from the first coded slice's header.
         let mut coding_type: Option<CodingType> = None;
         // Track whether THIS access unit already carried each param-set type
@@ -537,18 +536,17 @@ impl CodecParser for HevcParser {
                             // non-seamless boundary becomes BLA_W_LP so NoRaslOutput
                             // drops RASL. Any IRAP clears the flag; only CRA is rewritten.
                             if self.pending_clip_boundary && t == NAL_CRA_NUT {
-                                // First CRA after a non-seamless boundary: rewrite
-                                // its header type to BLA_W_LP. NAL type is bits 1-6
-                                // of byte 0: byte = (byte & 0x81) | (type << 1).
-                                self.pending_clip_boundary = false;
+                                bla_au = true;
+                            }
+                            self.pending_clip_boundary = false;
+                            if bla_au && t == NAL_CRA_NUT {
+                                // Rewrite EVERY CRA slice of this picture (7.4.2.4.4:
+                                // one type per picture). NAL type is bits 1-6 of
+                                // byte 0: byte = (byte & 0x81) | (type << 1).
                                 let mut rewritten = data[nal_start..end].to_vec();
                                 rewritten[0] = (rewritten[0] & 0x81) | (NAL_BLA_W_LP << 1);
                                 push_length_prefixed(&mut frame_data, &rewritten);
                             } else {
-                                // Any IRAP clears a pending boundary (it's been
-                                // reached and handled — an IDR needs no rewrite),
-                                // but only a CRA is modified.
-                                self.pending_clip_boundary = false;
                                 push_length_prefixed(&mut frame_data, &data[nal_start..end]);
                             }
                         }
@@ -725,13 +723,14 @@ impl CodecParser for HevcParser {
         record.push(3); // VPS, SPS, PPS
 
         // VPS array
-        record.push(0x20 | (NAL_VPS & 0x3F)); // array_completeness + NAL type
+        record.push(0x20 | (NAL_VPS & 0x3F)); // array_completeness (0) + NAL type
         record.extend_from_slice(&[0, 1]); // numNalus = 1
         record.push((vps.len() >> 8) as u8);
         record.push(vps.len() as u8);
         record.extend_from_slice(vps);
 
         // SPS array
+        // array_completeness = 0: param sets are also re-asserted in-band.
         record.push(0x20 | (NAL_SPS & 0x3F));
         record.extend_from_slice(&[0, 1]);
         record.push((sps.len() >> 8) as u8);
@@ -915,7 +914,7 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
     // sps_seq_parameter_set_id ue(v)
     r.read_ue()?;
     // chroma_format_idc ue(v)
-    let chroma_format_idc = r.read_ue()? as u8;
+    let chroma_format_idc = u8::try_from(r.read_ue()?).ok().filter(|&c| c <= 3)?;
     if chroma_format_idc == 3 {
         // separate_colour_plane_flag u(1)
         r.skip_bits(1)?;
@@ -931,8 +930,8 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
         r.read_ue()?;
     }
     // bit_depth_luma_minus8 ue(v), bit_depth_chroma_minus8 ue(v)
-    let bit_depth_luma_minus8 = r.read_ue()? as u8;
-    let bit_depth_chroma_minus8 = r.read_ue()? as u8;
+    let bit_depth_luma_minus8 = u8::try_from(r.read_ue()?).ok().filter(|&d| d <= 8)?;
+    let bit_depth_chroma_minus8 = u8::try_from(r.read_ue()?).ok().filter(|&d| d <= 8)?;
     // The ordering-info tail is optional to the hvcC caller: a cut-short SPS keeps
     // its chroma fields and only loses R.
     let (max_num_reorder_pics, picture_period_ticks) =
@@ -1126,10 +1125,8 @@ fn parse_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> Op
             level_present[i] = r.read_bit()? == 1;
         }
         // reserved_zero_2bits for i in max_sub_layers_minus1..8
-        if max_sub_layers_minus1 < 8 {
-            for _ in max_sub_layers_minus1..8 {
-                r.skip_bits(2)?;
-            }
+        for _ in max_sub_layers_minus1..8 {
+            r.skip_bits(2)?;
         }
         for i in 0..max_sub_layers_minus1 as usize {
             if profile_present[i] {
@@ -1786,6 +1783,24 @@ mod tests {
         );
     }
 
+    // An IRAP slice header carries no_output_of_prior_pics_flag before the PPS id; skipping it
+    // is what lands slice_type on the right bit, whatever the flag's value.
+    #[test]
+    fn irap_slices_report_their_coding_type() {
+        use super::super::coding::CodingType;
+        // first_slice=1, no_output=X, pps_id ue '1'=0, slice_type ue '011'=2 (I), pad.
+        for (nal_type, body) in [(19, 0xECu8), (19, 0xAC), (21, 0xEC), (21, 0xAC)] {
+            let mut data = nal_bytes(NAL_PPS, &[0xC0]);
+            data.extend_from_slice(&nal_bytes(nal_type, &[body]));
+            let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+            assert_eq!(
+                frames[0].coding.expect("PictureInfo").coding_type(),
+                CodingType::I,
+                "NAL {nal_type} body {body:#x}"
+            );
+        }
+    }
+
     // --- VPS+SPS+PPS → codec_private ---
 
     #[test]
@@ -2260,6 +2275,21 @@ mod tests {
         d
     }
 
+    /// Every slice NAL of the spliced CRA picture must get the same BLA type.
+    #[test]
+    fn multi_slice_cra_at_boundary_all_rewritten() {
+        let mut parser = HevcParser::new();
+        parser.mark_clip_boundary();
+        let mut au = cra_au(&[0x10, 0x20]);
+        au.extend_from_slice(&cra_au(&[0x30, 0x40]));
+        let frames = parser.parse(&make_pes(au, Some(0)));
+        let types: Vec<u8> = nals_of(&frames[0].data)
+            .iter()
+            .map(|n| nal_type_of(n))
+            .collect();
+        assert_eq!(types, vec![NAL_BLA_W_LP, NAL_BLA_W_LP]);
+    }
+
     /// Test 1: a CRA at a MARKED non-seamless boundary is rewritten to BLA_W_LP.
     #[test]
     fn cra_at_marked_boundary_rewritten_to_bla() {
@@ -2285,6 +2315,22 @@ mod tests {
             nal_type_of(&nals_of(&f2[0].data)[0]),
             NAL_CRA_NUT,
             "only the first CRA after a boundary is rewritten"
+        );
+    }
+
+    /// A seamless clip join restarts CC (flagged as a gap) with continuous PTS; the next CRA's
+    /// RASL stay decodable, so it must not become BLA (the decoder would drop them).
+    #[test]
+    fn cra_after_a_seamless_join_is_left_a_cra() {
+        let mut parser = HevcParser::new();
+        let mut join = make_pes(vec![0, 0, 1, 0x02, 0x01, 0x80], Some(0));
+        join.discontinuity = true;
+        parser.parse(&join);
+        let f = parser.parse(&make_pes(cra_au(&[0x10]), Some(3000)));
+        assert_eq!(
+            nal_type_of(&nals_of(&f[0].data)[0]),
+            NAL_CRA_NUT,
+            "a CRA at a seamless join must stay a CRA"
         );
     }
 
@@ -2946,6 +2992,12 @@ mod tests {
         sps
     }
 
+    #[test]
+    fn sps_chroma_rejects_out_of_range_values() {
+        assert!(parse_sps_chroma(&make_sps_with_chroma(259, 0, 0)).is_none());
+        assert!(parse_sps_chroma(&make_sps_with_chroma(1, 259, 0)).is_none());
+    }
+
     fn codec_private_from_sps(sps_nal: &[u8]) -> Vec<u8> {
         let mut parser = HevcParser::new();
         // VPS + the given SPS + PPS, all length-prefixed in one PES.
@@ -3315,6 +3367,25 @@ mod tests {
         max_sub_layers_minus1: u32,
         conformance_window: bool,
     ) -> Vec<u8> {
+        let flags = vec![(true, true); max_sub_layers_minus1 as usize];
+        make_sps_sublayers(
+            chroma_idc,
+            bd_luma_m8,
+            bd_chroma_m8,
+            &flags,
+            conformance_window,
+        )
+    }
+
+    // As `make_sps_full`, with each sub-layer's (profile_present, level_present) flags chosen.
+    fn make_sps_sublayers(
+        chroma_idc: u32,
+        bd_luma_m8: u32,
+        bd_chroma_m8: u32,
+        sub_layer_flags: &[(bool, bool)],
+        conformance_window: bool,
+    ) -> Vec<u8> {
+        let max_sub_layers_minus1 = sub_layer_flags.len() as u32;
         let mut w = BitWriter::new();
         w.put_bits(0, 4); // sps_video_parameter_set_id
         w.put_bits(max_sub_layers_minus1, 3);
@@ -3325,27 +3396,23 @@ mod tests {
         }
         // Sub-layer flags + sub-layer PTL when max_sub_layers_minus1 > 0.
         if max_sub_layers_minus1 > 0 {
-            let mut profile_present = Vec::new();
-            let mut level_present = Vec::new();
-            for _ in 0..max_sub_layers_minus1 {
+            for &(profile, level) in sub_layer_flags {
                 // sub_layer_profile_present_flag, sub_layer_level_present_flag.
-                w.put_bit(1); // profile present
-                w.put_bit(1); // level present
-                profile_present.push(true);
-                level_present.push(true);
+                w.put_bit(profile as u32);
+                w.put_bit(level as u32);
             }
             if max_sub_layers_minus1 < 8 {
                 for _ in max_sub_layers_minus1..8 {
                     w.put_bits(0, 2); // reserved_zero_2bits
                 }
             }
-            for i in 0..max_sub_layers_minus1 as usize {
-                if profile_present[i] {
+            for &(profile, level) in sub_layer_flags {
+                if profile {
                     for _ in 0..88 {
                         w.put_bit(0); // sub-layer profile block
                     }
                 }
-                if level_present[i] {
+                if level {
                     w.put_bits(0, 8); // sub_layer_level_idc
                 }
             }
@@ -3390,6 +3457,25 @@ mod tests {
             (3 << 3) | (1 << 2) | 0x03,
             "numTemporalLayers = 3, temporalIdNested = 1, lengthSizeMinusOne = 3"
         );
+    }
+
+    // Each sub-layer's profile block (88 bits) and level byte (8 bits) are skipped on their OWN
+    // flag, so any mix of the two flags must still land on the bit depths.
+    #[test]
+    fn hvcc_parses_chroma_through_sublayers_with_mixed_ptl_flags() {
+        let cases: [&[(bool, bool)]; 5] = [
+            &[(true, false)],
+            &[(false, true)],
+            &[(false, false)],
+            &[(true, false), (false, true)],
+            &[(false, true), (true, false), (false, false)],
+        ];
+        for flags in cases {
+            let cp = codec_private_from_sps(&make_sps_sublayers(1, 4, 2, flags, false));
+            assert_eq!(cp[16], 0xFC | 1, "chroma with flags {flags:?}");
+            assert_eq!(cp[17], 0xF8 | 4, "luma depth with flags {flags:?}");
+            assert_eq!(cp[18], 0xF8 | 2, "chroma depth with flags {flags:?}");
+        }
     }
 
     #[test]

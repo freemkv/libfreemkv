@@ -14,7 +14,7 @@ use crate::mux::ts::TsDemuxer;
 use crate::sector::SectorSource;
 use std::collections::HashMap;
 
-const SECTOR_BYTES: usize = 2048;
+use crate::consts::SECTOR_BYTES;
 // Read the clip in ~2 MiB chunks: a whole number of AACS aligned units (3 sectors / 6144 B;
 // 1023 = 341 units).
 const CHUNK_SECTORS: u16 = 1023;
@@ -548,6 +548,11 @@ pub(crate) fn probe_and_set_forced<S: SectorSource + ?Sized>(
             }
         }
         if let Some(reason) = cut_short {
+            // Exhausted is judged from THIS extent's tracks only; a later extent may still owe
+            // evidence for a track the cache answered here.
+            if reason == StopReason::Exhausted {
+                continue;
+            }
             stop = reason;
             break 'outer;
         }
@@ -2109,6 +2114,26 @@ mod tests {
         }
     }
 
+    // A truncated run may still assert "not forced" (positive evidence: a non-forced set was
+    // seen) when the shape gate allows demotion, but never a forced verdict (an absence claim).
+    #[test]
+    fn a_truncated_run_asserts_only_a_demotable_not_forced_verdict() {
+        let full = TrackEvidence {
+            observed: true,
+            non_forced: true,
+            displays: 20,
+            ..Default::default()
+        };
+        let flagged = TrackEvidence {
+            observed: true,
+            forced_seen: true,
+            displays: 20,
+            ..Default::default()
+        };
+        let ev = HashMap::from([(0x1200u16, full), (0x1201u16, flagged)]);
+        assert_eq!(verdicts(&ev, false), HashMap::from([(0x1200u16, false)]));
+    }
+
     // Coverage is what makes a memo replayable: an entry from a thin sample must not answer a
     // question needing a thorough one.
     #[test]
@@ -2273,5 +2298,49 @@ mod tests {
         }];
         probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
         assert!(forced_flag(&title, pid), "nothing was left unread");
+    }
+
+    // An early Exhausted decided on one extent's fresh tracks must not skip a later extent that
+    // still owes evidence for a track the cache answered on the first.
+    #[test]
+    fn exhausted_on_one_extent_does_not_skip_a_later_extent_owing_another_track() {
+        let (x, y) = (0x1200u16, 0x1201u16);
+        // A spans several read chunks so X settles mid-extent.
+        let a = Extent {
+            start_lba: 0,
+            sector_count: 3000,
+        };
+        let b = Extent {
+            start_lba: 4002,
+            sector_count: 30,
+        };
+        let shape = |pid, first_sector, count, forced| TrackShape {
+            pid,
+            first_sector,
+            period_sectors: 3,
+            count,
+            forced,
+        };
+        let mut reader =
+            SyntheticClipReader::new(vec![shape(x, 0, 4, false), shape(y, 4002, 2, true)]);
+        let mut title = pgs_title(x, false);
+        title.streams.push(subtitle_stream(y, false));
+        title.extents = vec![a, b];
+        let mut cache = ForcedProbeCache::new();
+        cache.insert(
+            (a.start_lba, a.sector_count, y),
+            CachedEvidence {
+                evidence: TrackEvidence {
+                    observed: true,
+                    ..TrackEvidence::default()
+                },
+                covered: a.sector_count,
+            },
+        );
+        probe_and_set_forced(&mut reader, &mut title, &mut cache, None);
+        assert!(
+            reader.reads.iter().any(|&(lba, _)| lba >= b.start_lba),
+            "extent B still owes evidence for track Y and must be read"
+        );
     }
 }

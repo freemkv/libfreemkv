@@ -132,11 +132,14 @@ impl PrefetchedSectorSource {
             .map(|e| e.sector_count as u64)
             .sum::<u64>()
             .min(u32::MAX as u64) as u32;
-        let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
+        let bytes_total_extents: u64 = extents
+            .iter()
+            .map(|e| e.sector_count as u64 * crate::consts::SECTOR_BYTES_U64)
+            .sum();
         let unmapped = reader.unmapped_stream_files().to_vec();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
-        let batch_bytes = batch_sectors as usize * 2048;
+        let batch_bytes = batch_sectors as usize * crate::consts::SECTOR_BYTES;
         // A never-cancelled stand-in keeps one halt-aware code path without a token.
         let wait = halt.clone().unwrap_or_default();
 
@@ -191,7 +194,7 @@ impl PrefetchedSectorSource {
                     } else {
                         sectors = unit_align;
                     }
-                    let bytes = sectors as usize * 2048;
+                    let bytes = sectors as usize * crate::consts::SECTOR_BYTES;
                     // Halt-aware: a cancel does not disconnect the channel, so a
                     // plain recv() would never re-reach the check. Disconnected =
                     // the consumer dropped both channels.
@@ -212,12 +215,12 @@ impl PrefetchedSectorSource {
                             // A short read must not desync the stream: advance by
                             // sectors actually read, and reject a non-whole-sector
                             // count (belt-and-braces; FileSectorSource read_exact's).
-                            if n % 2048 != 0 {
+                            if n % crate::consts::SECTOR_BYTES != 0 {
                                 let e = crate::error::Error::ExtentNotUnitAligned.into();
                                 send_or_stop(&wait, &tx, Err(e));
                                 return;
                             }
-                            let sectors_read = (n / 2048) as u32;
+                            let sectors_read = (n / crate::consts::SECTOR_BYTES) as u32;
                             // A zero-byte read isn't EOF (extents still have
                             // `remaining`) and would spin forever; send a terminal
                             // sentinel instead of a clean EOF that reports success.
@@ -808,8 +811,49 @@ mod tests {
     #[test]
     fn zero_batch_rejected() {
         let _serial = serial();
-        let err = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 0, None);
-        assert!(err.is_err(), "zero batch_sectors must be rejected");
+        let res = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 0, None);
+        let Err(crate::error::Error::IoError { source }) = res else {
+            panic!("zero batch_sectors must be rejected with InvalidInput");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // A batch below one unit is clamped up to a unit, never splitting an AACS unit.
+    #[test]
+    fn sub_unit_batch_is_clamped_to_one_unit() {
+        let _serial = serial();
+        with_watchdog(Duration::from_secs(10), || {
+            for batch in [1u16, 2] {
+                let ext = vec![Extent {
+                    start_lba: 0,
+                    sector_count: 6,
+                }];
+                let mut pf =
+                    PrefetchedSectorSource::new(PatternSource { capacity: 6 }, ext, batch, None)
+                        .expect("spawn");
+                let mut buf = vec![0u8; 3 * 2048];
+                for _ in 0..2 {
+                    let n = pf.read_sectors(0, 3, &mut buf, false).unwrap();
+                    assert_eq!(n, 3 * 2048, "batch {batch} must read a whole unit");
+                }
+                assert_eq!(pf.read_sectors(0, 3, &mut buf, false).unwrap(), 0);
+            }
+        });
+    }
+
+    // Prefetched reads are producer-ordered, so the KU §2.4 layering gate must see `false`
+    // through the by-reference wrapper too.
+    #[test]
+    fn random_access_is_false() {
+        let _serial = serial();
+        let ext = vec![Extent {
+            start_lba: 0,
+            sector_count: 6,
+        }];
+        let mut pf = PrefetchedSectorSource::new(EndlessZeroSource, ext, 3, None).unwrap();
+        assert!(!pf.random_access());
+        let by_ref: &mut dyn SectorSource = &mut pf;
+        assert!(!SectorSource::random_access(&by_ref));
     }
 
     // `unit_align == 0` must be rejected by the constructor, not a producer-thread
@@ -867,18 +911,24 @@ mod tests {
     fn event_fn_fires_bytes_read_per_batch() {
         let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
-            // 24 sectors = 8 aligned units; batch of 3 gives 8 batches.
-            let extents = vec![Extent {
-                start_lba: 0,
-                sector_count: 24,
-            }];
+            // Two 12-sector extents = 8 aligned units; batch of 3 gives 8 batches.
+            let extents = vec![
+                Extent {
+                    start_lba: 0,
+                    sector_count: 12,
+                },
+                Extent {
+                    start_lba: 12,
+                    sector_count: 12,
+                },
+            ];
             let src = PatternSource { capacity: 24 };
 
-            let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let seen = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
             let seen_cb = seen.clone();
             let event_fn: EventFn = Box::new(move |ev: Event| {
-                if let EventKind::BytesRead { bytes, .. } = ev.kind {
-                    seen_cb.lock().unwrap().push(bytes);
+                if let EventKind::BytesRead { bytes, total } = ev.kind {
+                    seen_cb.lock().unwrap().push((bytes, total));
                 }
             });
 
@@ -903,26 +953,10 @@ mod tests {
             }
             assert_eq!(total, 24 * 2048, "all 24 sectors drained");
 
+            // One event per batch, each cumulative, all carrying the summed extent total.
             let events = seen.lock().unwrap().clone();
-            assert!(
-                !events.is_empty(),
-                "event_fn must fire at least one BytesRead event"
-            );
-            // Cumulative byte count is non-decreasing and reaches the
-            // full extent size by the last event.
-            for w in events.windows(2) {
-                assert!(
-                    w[1] >= w[0],
-                    "cumulative bytes must be non-decreasing: {:?}",
-                    events
-                );
-            }
-            assert_eq!(
-                *events.last().unwrap(),
-                24 * 2048,
-                "final BytesRead must report the full extent: {:?}",
-                events
-            );
+            let want: Vec<(u64, u64)> = (1..=8u64).map(|k| (k * 3 * 2048, 24 * 2048)).collect();
+            assert_eq!(events, want);
         });
     }
 

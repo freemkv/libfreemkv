@@ -147,6 +147,8 @@ struct Faulty {
     inner: MemSource,
     dead: Arc<Mutex<Vec<(u32, u32)>>>,
     halt_after: Option<(Halt, Arc<Mutex<u32>>)>,
+    // Dead ranges fail as a gone source, not a media fault.
+    fatal: bool,
 }
 
 impl Faulty {
@@ -155,6 +157,7 @@ impl Faulty {
             inner,
             dead: Arc::default(),
             halt_after: None,
+            fatal: false,
         }
     }
     fn kill(&self, start: u32, end: u32) {
@@ -186,6 +189,9 @@ impl SectorSource for Faulty {
             .iter()
             .any(|&(s, e)| s < end && lba < e)
         {
+            if self.fatal {
+                return Err(Error::SourceTerminated);
+            }
             return Err(Error::DiscRead {
                 sector: lba as u64,
                 status: None,
@@ -490,16 +496,9 @@ fn read<S: SectorSource>(
     Ok(masked(&buf))
 }
 
-// A caller bug refuses with E7013 plus a debug assertion (KU §6): a panic in a debug
-// build, `Err(E7013)` in a release build.
+// A caller bug refuses with E7013 (KU §6), in debug and release builds alike.
 fn caller_bug<T>(f: impl FnOnce() -> Result<T>) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Err(_) => {
-            #[cfg(not(debug_assertions))]
-            panic!("only a debug build asserts");
-        }
-        Ok(r) => assert_eq!(code(r), crate::error::E_DECRYPT_FAILED),
-    }
+    assert_eq!(code(f()), crate::error::E_DECRYPT_FAILED);
 }
 
 const E7013: u16 = crate::error::E_DECRYPT_FAILED;
@@ -1112,12 +1111,22 @@ fn on_arrival_proof() {
     let (b, n) = fx.file(1);
     src.kill(b, fx.unit(1, 5));
     src.kill(fx.unit(1, 6), b + n);
-    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
     assert_eq!(
         read(&mut r, &fx, 1, 5, 1).unwrap(),
         fx.plain(fx.unit(1, 5), 1)
     );
-    assert_eq!(set.proof_cache().get(b), Some(Proof::Provisional(1)));
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Provisional(1, fx.unit(1, 5)))
+    );
+    // A re-read of the proving unit is not independent confirmation.
+    let mut r2 = set.title_reader(&fx.disc, 0, src).unwrap();
+    read(&mut r2, &fx, 1, 5, 1).unwrap();
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Provisional(1, fx.unit(1, 5)))
+    );
 
     // (e) across 3 passes: a tail unit with permanently dead neighbours is decrypted every
     // pass; passes 2 and 3 reuse the ProofCache (shared by the set's clones): 0 side reads.
@@ -1163,7 +1172,10 @@ fn on_arrival_proof() {
     src.kill(fx.unit(1, 6), b + n);
     let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
     read(&mut r, &fx, 1, 5, 1).expect("provisional under K1");
-    assert_eq!(set.proof_cache().get(b), Some(Proof::Provisional(0)));
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Provisional(0, fx.unit(1, 5)))
+    );
     src.heal();
     assert_eq!(
         code(read(&mut r, &fx, 1, 7, 1)),
@@ -1266,7 +1278,7 @@ fn on_arrival_read_damage_neither_proves_nor_refutes() {
     );
     assert_eq!(
         set.proof_cache().get(fx.file(1).0),
-        Some(Proof::Provisional(1))
+        Some(Proof::Provisional(1, fx.unit(1, 5)))
     );
 }
 
@@ -1300,7 +1312,10 @@ fn on_arrival_a_garbled_head_keeping_sync_is_blanked_never_e7022() {
     src.kill(fx.unit(1, 6), b + n);
     let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
     read(&mut r, &fx, 1, 5, 1).expect("provisional under K2");
-    assert_eq!(set.proof_cache().get(b), Some(Proof::Provisional(1)));
+    assert_eq!(
+        set.proof_cache().get(b),
+        Some(Proof::Provisional(1, fx.unit(1, 5)))
+    );
     src.heal();
     let mut want = fx.plain(fx.unit(1, 7), 3);
     want[..ALIGNED_UNIT_LEN].fill(0);
@@ -1478,6 +1493,23 @@ fn fmts_fixture() -> Fx {
         }
     }
     fx
+}
+
+/// A present but unparseable segment table is a refusal, never "not FMTS" (which would rip
+/// forensic units as base content).
+#[test]
+fn fmts_malformed_segment_table_is_refused() {
+    let mut fx = fmts_fixture();
+    let at = fx.file(2).0 as usize * 2048;
+    // record_size (bytes 6..8) no longer matches the record length.
+    fx.img.image[at + 6..at + 8].copy_from_slice(&15u16.to_be_bytes());
+    let calls = Calls::default();
+    let r = resolve(
+        &fx,
+        KeyScope::Titles(vec![2]),
+        &[Spec::keydb(&[K1, K2], &calls)],
+    );
+    assert!(matches!(r, Err(Error::FmtsKeyMissing)), "{:?}", r.err());
 }
 
 fn fmts_online(calls: &Calls) -> Spec {
@@ -1740,10 +1772,26 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
         let mut buf = vec![0u8; 30 * 2048];
         w.read_sectors(b, 30, &mut buf, true).unwrap();
     }
-    let _ = crate::mux::mux_with_keys(
+    // The mux needs a stream to run at all; with none it returns E6009 before reading.
+    let mut title = fx.disc.titles[0].clone();
+    title
+        .streams
+        .push(crate::disc::Stream::Video(crate::disc::VideoStream {
+            pid: 0x1011,
+            codec: crate::disc::Codec::Mpeg2,
+            resolution: crate::disc::Resolution::R1080p,
+            frame_rate: crate::disc::FrameRate::F23_976,
+            hdr: crate::disc::HdrFormat::Sdr,
+            color_space: crate::disc::ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }));
+    let r = crate::mux::mux_with_keys(
         crate::mux::MuxSource::Live {
             reader: Box::new(src.clone()),
-            title: fx.disc.titles[0].clone(),
+            title,
             format: ContentFormat::BdTs,
         },
         Some(&set),
@@ -1754,6 +1802,13 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
         },
         &Halt::new(),
         Arc::new(crate::mux::driver::NoopEvents),
+    );
+    // The fixture TS carries no muxable frames, so a mux that read every unit through the
+    // held keys ends E6008 (MkvInvalid); E6009 would mean it never read.
+    let e = r.expect_err("no muxable frames");
+    assert_eq!(
+        crate::error::error_code(&e),
+        Some(crate::error::E_MKV_INVALID)
     );
     assert_eq!(Arc::strong_count(&f), 1);
     assert_eq!(calls.len(), asked, "nothing asks after resolve");
@@ -2751,4 +2806,84 @@ fn whole_disc_reader_leaves_a_piece_with_an_opened_probe_to_arrival() {
         "one opened, one unopened probe: Lazy"
     );
     assert!(set.whole_disc_reader(&fx.disc, fx.source(), None).is_ok());
+}
+
+/// A file extent near u32::MAX (untrusted UDF) must not overflow the piece math.
+#[test]
+fn pieces_survive_extents_near_the_lba_limit() {
+    let fx = two_units();
+    let files = vec![vec![(u32::MAX - 4, 10)]];
+    let spans = crate::keys::resolve::whole_disc_pieces(&fx.disc, &files);
+    assert!(!spans.is_empty());
+}
+
+/// The push-closure path (a title extent no file covers) survives an extent near u32::MAX.
+#[test]
+fn uncovered_title_extent_near_the_lba_limit_survives() {
+    let mut fx = two_units();
+    fx.disc.titles[0].extents = vec![Extent {
+        start_lba: u32::MAX - 4,
+        sector_count: 10,
+    }];
+    let spans = crate::keys::resolve::whole_disc_pieces(&fx.disc, &[]);
+    assert!(!spans.is_empty());
+}
+
+/// One source flooding the pool cannot starve a later source's real key.
+#[test]
+fn a_flooding_source_does_not_starve_a_later_source() {
+    let fx = two_units();
+    let junk: Vec<[u8; 16]> = (0..300u32)
+        .map(|i| {
+            let mut k = [0u8; 16];
+            k[..4].copy_from_slice(&(i + 1).to_be_bytes());
+            k
+        })
+        .collect();
+    let calls = Calls::default();
+    let mut later = Spec::keydb(&[K1, K2], &calls);
+    later.who = "later";
+    let r = resolve(
+        &fx,
+        KeyScope::WholeDisc,
+        &[Spec::keydb(&junk, &calls), later],
+    );
+    assert!(r.is_ok(), "{:?}", r.err());
+}
+
+/// A key service cannot flood the pool: keys past the cap are ignored.
+#[test]
+fn key_pool_is_capped() {
+    let fx = two_units();
+    let mut keys = vec![K1, K2];
+    keys.extend((0..300u32).map(|i| {
+        let mut k = [0u8; 16];
+        k[..4].copy_from_slice(&(i + 1).to_be_bytes());
+        k
+    }));
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&keys, &calls)]).unwrap();
+    assert!(format!("{set:?}").contains("keys_len: 256"), "{set:?}");
+}
+
+/// A gone source during probing is reported, not counted as a soft fault.
+#[test]
+fn probe_reports_a_terminated_source() {
+    let fx = two_units();
+    let mut src = fx.source();
+    src.fatal = true;
+    for i in 0..2 {
+        let (b, n) = fx.file(i);
+        src.kill(b, b + n);
+    }
+    let calls = Calls::default();
+    let r = resolve_with(
+        &fx,
+        &mut src,
+        KeyScope::WholeDisc,
+        &[Spec::keydb(&[K1, K2], &calls)],
+        ResolveKeysOptions::default(),
+        &FakeClock::default(),
+    );
+    assert!(matches!(r, Err(Error::SourceTerminated)), "{r:?}");
 }

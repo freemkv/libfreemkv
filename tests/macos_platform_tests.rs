@@ -1,7 +1,7 @@
 //! macOS platform-integration tests that do NOT require an optical drive.
 //!
-//! These exercise the Mac-only code paths under `platform/fs_type/macos.rs`,
-//! `io/platform_macos.rs`, and `io/writeback_file` end-to-end against the real
+//! These exercise the Mac-only code paths under `io/platform_macos.rs`
+//! and `io/writeback_file` end-to-end against the real
 //! kernel. They run under `cargo test` without `--ignored`, so CI on macOS
 //! (and the local `cargo test` a developer would run before pushing) covers
 //! them automatically.
@@ -75,6 +75,13 @@ fn writeback_file_create_with_size_hint_preallocates() {
         meta.len(),
         4096,
         "reported length should equal bytes written"
+    );
+    // F_PREALLOCATE reserves the hint's extents (st_blocks is in 512-byte units); the
+    // call is best-effort in production, so only this check observes it.
+    let allocated = std::os::unix::fs::MetadataExt::blocks(&meta) * 512;
+    assert!(
+        allocated >= hint,
+        "hint not preallocated: {allocated} bytes"
     );
 }
 

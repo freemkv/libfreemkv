@@ -3,7 +3,7 @@
 //! Each parser module represents one BD-J authoring framework. To add a
 //! new format:
 //!   1. Create `src/labels/myformat.rs`
-//!   2. Implement `pub fn detect(udf: &UdfFs) -> bool`
+//!   2. Implement `pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool`
 //!   3. Implement `pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult>`
 //!      (set [`ParseResult::confidence`] to drive tie-breaking)
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
@@ -219,8 +219,7 @@ pub(crate) fn stated_duration_secs(element: &str, keys: &[&str]) -> Option<u64> 
 /// Successful parser result. `None` from `parse()` still means "this
 /// isn't my disc" (no labels at all); `Some(ParseResult { labels, .. })`
 /// with `labels.is_empty()` is also a "no labels" case but reachable
-/// via the analyzer (used by deluxe today to signal "I recognized the
-/// framework but Phase D not yet implemented").
+/// via the analyzer.
 #[derive(Debug, Clone)]
 pub struct ParseResult {
     pub labels: Vec<StreamLabel>,
@@ -363,14 +362,48 @@ pub(crate) const MIN_FEATURE_SECS: u64 = 60;
 // insensitive), or either side is empty ("unknown", never a contradiction).
 fn languages_compatible(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
-    a.is_empty() || b.is_empty() || a.eq_ignore_ascii_case(b)
+    a.is_empty() || b.is_empty() || same_language(a, b)
+}
+
+// ISO 639-2/B -> /T for the twenty languages that differ. MPLS keeps the raw /B code while
+// vendor labels go through vocab::lang (/T).
+fn to_iso639_t(code: &str) -> String {
+    let c = code.to_ascii_lowercase();
+    let t = match c.as_str() {
+        "alb" => "sqi",
+        "arm" => "hye",
+        "baq" => "eus",
+        "bur" => "mya",
+        "chi" => "zho",
+        "cze" => "ces",
+        "dut" => "nld",
+        "fre" => "fra",
+        "geo" => "kat",
+        "ger" => "deu",
+        "gre" => "ell",
+        "ice" => "isl",
+        "mac" => "mkd",
+        "mao" => "mri",
+        "may" => "msa",
+        "per" => "fas",
+        "rum" => "ron",
+        "slo" => "slk",
+        "tib" => "bod",
+        "wel" => "cym",
+        _ => return c,
+    };
+    t.to_string()
+}
+
+fn same_language(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b) || to_iso639_t(a) == to_iso639_t(b)
 }
 
 /// Stricter form of [`languages_compatible`]: both sides actually state a
 /// language and they are the same. "Unknown" is not agreement.
 fn languages_agree(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
-    !a.is_empty() && a.eq_ignore_ascii_case(b)
+    !a.is_empty() && same_language(a, b)
 }
 
 // The VENDOR label occupying 1-based STN slot `n` of `stream_type`, if any (derived labels bind
@@ -423,7 +456,8 @@ fn find_anchor(
         if n < MIN_ANCHOR_STREAMS || n < extent {
             continue;
         }
-        let Some(score) = anchor_score(labels, title, stream_type) else {
+        // A zero-confirmation title (e.g. all-empty label languages) proves nothing.
+        let Some(score) = anchor_score(labels, title, stream_type).filter(|&s| s > 0) else {
             continue;
         };
         if best.is_none_or(|(bs, bn, _)| (score, n) > (bs, bn)) {
@@ -515,19 +549,6 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
     for (title_idx, title) in titles.iter_mut().enumerate() {
         let mut audio_idx: u16 = 0;
         let mut sub_idx: u16 = 0;
-        // The anchor facts that reach this title: those recorded against a
-        // clip it plays. Narrowed once per title rather than per stream, so a
-        // title with hundreds of clip references costs one pass over the map.
-        let known_pids: HashMap<u16, usize> = {
-            let clips: std::collections::HashSet<&str> =
-                title.clips.iter().map(|c| c.clip_id.as_str()).collect();
-            pid_map
-                .iter()
-                .filter(|((clip, _), _)| clips.contains(clip.as_str()))
-                .map(|((_, pid), pos)| (*pid, *pos))
-                .collect()
-        };
-
         // The clip whose STN table this title's stream list was built from —
         // `disc::bluray` takes the streams from the first play item — so it is
         // the clip half of every id that can match a stream of this title.
@@ -536,6 +557,14 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
             .first()
             .map(|c| c.clip_id.clone())
             .unwrap_or_default();
+
+        // Anchor PID facts for this title: only those recorded against clip0, the
+        // clip its stream table came from (a later clip may reuse a PID).
+        let known_pids: HashMap<u16, usize> = pid_map
+            .iter()
+            .filter(|((clip, _), _)| *clip == clip0)
+            .map(|((_, pid), pos)| (*pid, *pos))
+            .collect();
 
         // Resolve one stream to (label, authoritative). Authoritative means the
         // label is known to belong to THIS stream rather than guessed onto it
@@ -664,10 +693,6 @@ pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
                         v.secondary,
                     );
                 }
-                Stream::Subtitle(s) if s.forced => {
-                    // Ensure forced subs are labeled even if BD-J didn't set a name
-                    // (subtitle labels are generally not set — this just marks forced)
-                }
                 _ => {}
             }
         }
@@ -771,8 +796,9 @@ fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
     }
 
     match codec {
-        Codec::TrueHd => says_truehd || says_atmos,
-        Codec::Ac3Plus => says_ddp || says_atmos,
+        // Atmos rides either carrier; it only fits when the hint doesn't name the other one.
+        Codec::TrueHd => says_truehd || (says_atmos && !says_ddp && !says_ac3),
+        Codec::Ac3Plus => says_ddp || (says_atmos && !says_truehd && !says_ac3),
         Codec::Ac3 => says_ac3,
         Codec::DtsHdMa => says_dts_ma || says_dtsx,
         Codec::DtsHdHr => says_dts_hr || says_dtsx,
@@ -911,17 +937,12 @@ fn extract(
 
     // The MPLS floor: framework parsers under-yield on multi-track discs, only
     // shipping editorial labels for "interesting" streams (Atmos, SDH). MPLS
-    // names every stream a playlist references, filling the gaps.
+    // names every stream a playlist references (parsed once, in the loop above).
     if name != "mpls_universal"
-        && let Some(mpls_result) = mpls_universal::parse(reader, udf)
+        && let Some((_, mpls_result)) = candidates.iter().find(|(n, _)| *n == "mpls_universal")
     {
         merge_mpls_floor(&mut labels, &mpls_result.labels);
     }
-
-    // CLPI orphan streams: PIDs in /BDMV/CLIPINF/*.clpi ProgramInfo that no MPLS
-    // playlist references (physically on disc, not menu-reachable). Appended
-    // under the id they name, so a title reaches one only if it carries it.
-    let _orphans_added = append_clpi_orphans(&mut labels, reader, udf);
 
     (labels, feature_playlist)
 }
@@ -979,116 +1000,6 @@ fn type_tag(t: StreamLabelType) -> u8 {
     }
 }
 
-// Append CLPI streams (present but unreferenced by MPLS) not already named; each binds by its
-// own (clip, PID), no invented ordinal. Returns count appended.
-fn append_clpi_orphans(
-    labels: &mut Vec<StreamLabel>,
-    reader: &mut dyn SectorSource,
-    udf: &UdfFs,
-) -> usize {
-    use crate::consts::coding_type as c;
-    // Two exclusions: exact (a stream some label already NAMES is not an orphan)
-    // and fuzzy (the pre-existing (type, language, codec_hint) test, kept to
-    // bound this list to a handful of entries per disc, not one per stream).
-    use std::collections::HashSet;
-    let named: HashSet<&StreamId> = labels.iter().filter_map(|l| l.stream_id.as_ref()).collect();
-    let existing: HashSet<(StreamLabelType, String, String)> = labels
-        .iter()
-        .map(|l| (l.stream_type, l.language.clone(), l.codec_hint.clone()))
-        .collect();
-
-    // Walk CLPI files, collect distinct (type, pid, coding_type, lang)
-    // tuples not already in `existing`. Dedup by PID across files so
-    // a stream appearing in two clips only gets added once.
-    let Some(dir) = udf.find_dir("/BDMV/CLIPINF") else {
-        return 0;
-    };
-    let names: Vec<String> = dir
-        .entries
-        .iter()
-        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".clpi"))
-        .map(|e| e.name.clone())
-        .collect();
-    let mut seen_pids: HashSet<u16> = HashSet::new();
-    let mut candidates: Vec<(StreamLabelType, StreamId, u8, String)> = Vec::new();
-    for name in names {
-        // The CLPI filename without its extension IS the clip id, so a stream
-        // read out of this file is identified exactly: `(clip, PID)`.
-        let clip_id = name
-            .rsplit_once('.')
-            .map(|(stem, _)| stem.to_string())
-            .unwrap_or_else(|| name.clone());
-        let path = format!("/BDMV/CLIPINF/{}", name);
-        let Ok(data) = udf.read_file(reader, &path) else {
-            continue;
-        };
-        let Ok(clip) = crate::clpi::parse(&data) else {
-            continue;
-        };
-        for s in clip.streams {
-            if !seen_pids.insert(s.pid) {
-                continue;
-            }
-            // Translate CLPI coding_type → label stream_type. 0x90 = Presentation
-            // Graphics (PG subtitle); 0x91 = Interactive Graphics (BD-J menu
-            // overlay), NOT a user-facing subtitle — skip it, matching MPLS.
-            let stype = match s.coding_type {
-                c::LPCM..=c::DTS_HD_MA | c::AC3_PLUS_SECONDARY | c::DTS_HD_SECONDARY => {
-                    StreamLabelType::Audio
-                }
-                c::PG => StreamLabelType::Subtitle,
-                _ => continue, // IG / video / unknown — skip
-            };
-            // Same dedup logic as MPLS: normalize language, build codec
-            // hint, check against existing label set.
-            let lang_norm = s.language.trim().to_ascii_lowercase();
-            let codec_hint = mpls_universal::codec_name(s.coding_type).to_string();
-            if existing.contains(&(stype, lang_norm.clone(), codec_hint.clone())) {
-                continue;
-            }
-            let id = StreamId {
-                clip_id: clip_id.clone(),
-                pid: s.pid,
-            };
-            if named.contains(&id) {
-                continue;
-            }
-            candidates.push((stype, id, s.coding_type, lang_norm));
-        }
-    }
-
-    if candidates.is_empty() {
-        return 0;
-    }
-
-    let added = candidates.len();
-    for (stype, stream_id, coding_type, language) in candidates {
-        let codec_hint = mpls_universal::codec_name(coding_type).to_string();
-        let name = mpls_universal::language_display_name(&language);
-        labels.push(StreamLabel {
-            stream_id: Some(stream_id),
-            // NO_STN_SLOT: an orphan is by definition absent from every
-            // playlist's stream table, so there is no slot to state.
-            stream_number: NO_STN_SLOT,
-            stream_type: stype,
-            language,
-            name,
-            purpose: LabelPurpose::Normal,
-            qualifier: LabelQualifier::None,
-            codec_hint,
-            variant: String::new(),
-        });
-    }
-    if added > 0 {
-        tracing::info!(
-            clpi_orphans_added = added,
-            "CLPI-only streams appended (PIDs not referenced by any MPLS playlist)"
-        );
-        sort_labels(labels);
-    }
-    added
-}
-
 // Pick the winning parser result: highest Confidence among non-empty results, earliest array
 // position wins ties (matches extract()'s scan).
 fn select_result<'a>(
@@ -1136,14 +1047,11 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
     };
 
     // The MPLS floor: same merge as `extract()`. Skipped when MPLS was itself
-    // the chosen parser (its labels ARE the labels). This diagnostic path stops
-    // here — `extract()` also appends the CLPI orphans, which `analyze` never does.
+    // the chosen parser (its labels ARE the labels).
     let gap_fill_added = if parser.is_some() && parser != Some("mpls_universal") {
         let before = labels.len();
-        // Re-run MPLS unconditionally: we only ran framework parsers above (to
-        // know which to pick), and in the common case where MPLS would have
-        // detected but wasn't chosen we still need its labels for the merge.
-        if let Some(mpls_result) = mpls_universal::parse(reader, udf) {
+        // The registry loop above already parsed MPLS; reuse that result.
+        if let Some((_, mpls_result)) = all_results.iter().find(|(n, _)| *n == "mpls_universal") {
             merge_mpls_floor(&mut labels, &mpls_result.labels);
         }
         labels.len().saturating_sub(before)
@@ -1310,31 +1218,39 @@ pub(crate) fn jar_file_exists(udf: &UdfFs, filename: &str) -> bool {
     find_jar_file(udf, filename).is_some()
 }
 
-/// Find a file in any BDMV/JAR subdirectory, return its path.
-pub(crate) fn find_jar_file(udf: &UdfFs, filename: &str) -> Option<String> {
-    let jar_dir = udf.find_dir("/BDMV/JAR")?;
-    for entry in &jar_dir.entries {
-        if entry.is_dir {
-            let path = format!("/BDMV/JAR/{}/{}", entry.name, filename);
-            // Check if file exists in this subdirectory
-            for child in &entry.entries {
-                if !child.is_dir && child.name.eq_ignore_ascii_case(filename) {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
+/// Every BDMV/JAR subdirectory path holding `filename`, in directory order.
+fn jar_file_paths(udf: &UdfFs, filename: &str) -> Vec<String> {
+    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
+        return Vec::new();
+    };
+    jar_dir
+        .entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .filter(|e| {
+            e.entries
+                .iter()
+                .any(|c| !c.is_dir && c.name.eq_ignore_ascii_case(filename))
+        })
+        .map(|e| format!("/BDMV/JAR/{}/{}", e.name, filename))
+        .collect()
 }
 
-/// Read a file from any BDMV/JAR subdirectory by filename.
+/// Find a file in any BDMV/JAR subdirectory, return its path.
+pub(crate) fn find_jar_file(udf: &UdfFs, filename: &str) -> Option<String> {
+    jar_file_paths(udf, filename).into_iter().next()
+}
+
+/// Read a file from any BDMV/JAR subdirectory by filename; the first copy
+/// that reads successfully and is non-empty wins.
 pub(crate) fn read_jar_file(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
     filename: &str,
 ) -> Option<Vec<u8>> {
-    let path = find_jar_file(udf, filename)?;
-    udf.read_file(reader, &path).ok().filter(|d| !d.is_empty())
+    jar_file_paths(udf, filename)
+        .into_iter()
+        .find_map(|path| udf.read_file(reader, &path).ok().filter(|d| !d.is_empty()))
 }
 
 // ── Registry-level tests ────────────────────────────────────────────────────
@@ -1700,31 +1616,6 @@ mod gap_fill_tests {
             .map(|l| l.codec_hint.as_str())
             .collect();
         assert_eq!(vendor_hints, vec!["Atmos", "Commentary", "PG SDH"]);
-    }
-
-    #[test]
-    fn orphan_append_skips_matching_type_lang_codec_tuples() {
-        // If a "would-be orphan" shares (type, lang, codec) with a label we
-        // already have, drop it to avoid a confusing duplicate. This fuzzy
-        // test bounds the orphan list; it's a population rule, not a binding rule.
-        let labels = [
-            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
-            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
-        ];
-        use std::collections::HashSet;
-        let existing: HashSet<(StreamLabelType, String, String)> = labels
-            .iter()
-            .map(|l| (l.stream_type, l.language.clone(), l.codec_hint.clone()))
-            .collect();
-        let candidate = (
-            StreamLabelType::Audio,
-            "eng".to_string(),
-            "TrueHD".to_string(),
-        );
-        assert!(
-            existing.contains(&candidate),
-            "matching tuple must be detected as duplicate"
-        );
     }
 
     /// Sort order is presentation only: audios first, vendor slots ahead of the
@@ -2855,13 +2746,10 @@ mod apply_tests {
         assert!(codec_hint_consistent("Master Audio", &Codec::DtsHdMa));
     }
 
-    // Isolates the Codec::TrueHd => says_truehd || says_atmos arm.
+    // Isolates the Codec::TrueHd atmos arm: Atmos with a family that is not the other carrier.
     #[test]
     fn codec_hint_consistent_truehd_arm_atmos_alone() {
-        assert!(codec_hint_consistent(
-            "Dolby Digital Plus Atmos",
-            &Codec::TrueHd
-        ));
+        assert!(codec_hint_consistent("LPCM Atmos", &Codec::TrueHd));
     }
 
     // Spec: Codec::Dts is consistent ONLY when says_dts is true, not via any other named
@@ -3065,6 +2953,92 @@ mod apply_tests {
         );
     }
 
+    // Spec: an anchor PID fact reaches a title only through that title's FIRST clip (its
+    // stream table's clip), not any later clip it merely plays.
+    #[test]
+    fn an_anchor_pid_fact_does_not_reach_a_title_through_a_later_clip() {
+        let labels = vec![
+            sub_label(1, "eng", LabelQualifier::Sdh),
+            sub_label(2, "fra", LabelQualifier::None),
+        ];
+        let mut titles = vec![
+            title_on_clips(
+                "00800.mpls",
+                &["00082", "00090"],
+                vec![subtitle(0x1200, "eng"), subtitle(0x1201, "fra")],
+            ),
+            // Own table is 00050's; it only continues into the anchor's clip 00082.
+            title_on_clips(
+                "00451.mpls",
+                &["00050", "00082"],
+                vec![subtitle(0x1200, "spa")],
+            ),
+        ];
+        apply_labels(&labels, &mut titles);
+        assert_eq!(
+            sub_state(&titles[1]),
+            vec![(0x1200, false, LabelQualifier::None)]
+        );
+    }
+
+    // Spec: a label list whose languages are all empty confirms nothing, so it anchors to no title.
+    #[test]
+    fn an_all_empty_language_list_anchors_to_no_title() {
+        let labels = vec![
+            sub_label(1, "", LabelQualifier::None),
+            sub_label(2, "", LabelQualifier::None),
+        ];
+        let titles = vec![
+            title_on_clips(
+                "00800.mpls",
+                &["00001"],
+                vec![subtitle(0x1200, "eng"), subtitle(0x1201, "fra")],
+            ),
+            title_on_clips(
+                "00801.mpls",
+                &["00002"],
+                vec![
+                    subtitle(0x1200, "eng"),
+                    subtitle(0x1201, "fra"),
+                    subtitle(0x1202, "spa"),
+                ],
+            ),
+        ];
+        assert_eq!(
+            find_anchor(&labels, &titles, StreamLabelType::Subtitle),
+            None
+        );
+    }
+
+    // Spec: ISO 639-2/B and /T spellings of one language agree.
+    #[test]
+    fn language_b_and_t_codes_agree() {
+        assert!(languages_compatible("fre", "fra"));
+        assert!(languages_agree("ger", "deu"));
+        assert!(languages_agree("CHI", "zho"));
+        assert!(!languages_agree("fre", "deu"));
+        assert!(!languages_compatible("fre", "deu"));
+    }
+
+    // Spec: an Atmos hint that names the OTHER carrier is a mis-bind.
+    #[test]
+    fn atmos_hint_naming_the_other_carrier_is_inconsistent() {
+        assert!(!codec_hint_consistent(
+            "Dolby Digital Plus Atmos",
+            &Codec::TrueHd
+        ));
+        assert!(codec_hint_consistent(
+            "Dolby Digital Plus Atmos",
+            &Codec::Ac3Plus
+        ));
+        assert!(!codec_hint_consistent(
+            "Dolby TrueHD Atmos",
+            &Codec::Ac3Plus
+        ));
+        assert!(codec_hint_consistent("Dolby TrueHD Atmos", &Codec::TrueHd));
+        assert!(codec_hint_consistent("Atmos", &Codec::TrueHd));
+    }
+
     // Spec: a vendor codec/variant claim does not follow the ordinal onto a bonus clip that
     // carries a different codec.
     #[test]
@@ -3226,26 +3200,10 @@ mod fill_gaps_sort_tests {
     }
 }
 
-// ── append_clpi_orphans ─────────────────────────────────────────────────────
+// ── CLPI fixtures (shared with clpi_audit tests) ────────────────────────────
 
 #[cfg(test)]
 mod clpi_orphan_tests {
-    use super::*;
-    use crate::udf::fixture::*;
-
-    fn label(t: StreamLabelType, n: u16, lang: &str, codec: &str) -> StreamLabel {
-        StreamLabel {
-            stream_id: None,
-            stream_number: n,
-            stream_type: t,
-            language: lang.into(),
-            name: String::new(),
-            purpose: LabelPurpose::Normal,
-            qualifier: LabelQualifier::None,
-            codec_hint: codec.into(),
-            variant: String::new(),
-        }
-    }
 
     // Build a CLPI ProgramInfo section for one program from (pid, stream_coding_info) pairs,
     // per crate::clpi::parse_program_info.
@@ -3300,162 +3258,6 @@ mod clpi_orphan_tests {
         buf[56..60].copy_from_slice(&1000u32.to_be_bytes()); // source_packet_count
         buf.extend_from_slice(&pi);
         buf
-    }
-
-    /// Lay a minimal BDMV/CLIPINF/00001.clpi tree on `disc`, with the CLPI
-    /// declaring the given synthetic streams, and return the parsed UdfFs.
-    fn fs_with_clpi(disc: &mut MemDisc, streams: &[(u16, u8, &str)]) -> crate::udf::UdfFs {
-        let clpi_data = build_clpi(streams);
-        let clipinf = DirSpec {
-            name: "CLIPINF".to_string(),
-            icb_lba: 24,
-            dir_data_lba: 25,
-            files: vec![file_with("00001.clpi", 26, 8000, clpi_data, false)],
-            subdirs: vec![],
-        };
-        let bdmv = DirSpec {
-            name: "BDMV".to_string(),
-            icb_lba: 20,
-            dir_data_lba: 21,
-            files: Vec::new(),
-            subdirs: vec![clipinf],
-        };
-        let root = DirSpec {
-            name: String::new(),
-            icb_lba: 10,
-            dir_data_lba: 11,
-            files: Vec::new(),
-            subdirs: vec![bdmv],
-        };
-        build_udf_skeleton(disc, 10);
-        lay_dir(disc, &root);
-        crate::udf::read_filesystem(disc).expect("fs")
-    }
-
-    /// (a) A PG-coded CLPI orphan becomes a Subtitle label.
-    #[test]
-    fn pg_orphan_becomes_subtitle() {
-        let mut disc = MemDisc::new();
-        let udf = fs_with_clpi(
-            &mut disc,
-            &[(0x1200, crate::consts::coding_type::PG, "eng")],
-        );
-        let mut labels: Vec<StreamLabel> = Vec::new();
-        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
-        assert_eq!(added, 1);
-        assert_eq!(labels.len(), 1);
-        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
-        assert_eq!(
-            labels[0].stream_id,
-            Some(StreamId {
-                clip_id: "00001".into(),
-                pid: 0x1200
-            }),
-            "the orphan names the stream it was read from"
-        );
-    }
-
-    /// (b) An audio-range-coded orphan (here DTS-HD MA, the top of the
-    /// `LPCM..=DTS_HD_MA` primary-audio range) becomes an Audio label.
-    #[test]
-    fn audio_range_orphan_becomes_audio() {
-        let mut disc = MemDisc::new();
-        let udf = fs_with_clpi(
-            &mut disc,
-            &[(0x1100, crate::consts::coding_type::DTS_HD_MA, "eng")],
-        );
-        let mut labels: Vec<StreamLabel> = Vec::new();
-        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
-        assert_eq!(added, 1);
-        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
-    }
-
-    /// (b, secondary) AC3_PLUS_SECONDARY is outside the primary
-    /// `LPCM..=DTS_HD_MA` range and must be classified through the
-    /// dedicated secondary-audio arm.
-    #[test]
-    fn secondary_audio_orphan_becomes_audio() {
-        let mut disc = MemDisc::new();
-        let udf = fs_with_clpi(
-            &mut disc,
-            &[(
-                0x1A00,
-                crate::consts::coding_type::AC3_PLUS_SECONDARY,
-                "eng",
-            )],
-        );
-        let mut labels: Vec<StreamLabel> = Vec::new();
-        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
-        assert_eq!(added, 1);
-        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
-    }
-
-    /// (c) IG (0x91, BD-J menu overlay) is not a user-facing subtitle and
-    /// must be skipped entirely, not appended as anything.
-    #[test]
-    fn ig_orphan_is_skipped() {
-        let mut disc = MemDisc::new();
-        let udf = fs_with_clpi(
-            &mut disc,
-            &[(0x1201, crate::consts::coding_type::IG, "eng")],
-        );
-        let mut labels: Vec<StreamLabel> = Vec::new();
-        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
-        assert_eq!(added, 0);
-        assert!(labels.is_empty());
-    }
-
-    // (d) An orphan states NO STN slot, and is identified by the stream it was read from
-    // instead (an invented ordinal could reach it).
-    #[test]
-    fn orphans_state_no_stn_slot_and_name_their_stream() {
-        let mut disc = MemDisc::new();
-        let udf = fs_with_clpi(
-            &mut disc,
-            &[
-                (0x1100, crate::consts::coding_type::TRUEHD, "eng"),
-                (0x1101, crate::consts::coding_type::AC3, "fra"),
-            ],
-        );
-        let mut labels = vec![label(StreamLabelType::Audio, 3, "jpn", "DTS")];
-        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
-        assert_eq!(added, 2);
-        let orphans: Vec<&StreamLabel> = labels
-            .iter()
-            .filter(|l| l.stream_type == StreamLabelType::Audio && l.language != "jpn")
-            .collect();
-        for o in &orphans {
-            assert_eq!(o.stream_number, NO_STN_SLOT, "an orphan holds no slot");
-        }
-        let mut ids: Vec<u16> = orphans
-            .iter()
-            .filter_map(|o| o.stream_id.as_ref().map(|i| i.pid))
-            .collect();
-        ids.sort();
-        assert_eq!(ids, vec![0x1100, 0x1101]);
-
-        // And the slot lookup cannot reach one, whatever the ordinal.
-        for n in 0..=6u16 {
-            assert!(
-                label_at(&labels, StreamLabelType::Audio, n).is_none_or(|l| l.language == "jpn"),
-                "slot {n} must resolve to the vendor label or to nothing"
-            );
-        }
-    }
-
-    /// (e) A CLPI stream whose (type, language, codec) tuple already exists
-    /// in `existing` is a duplicate and must be skipped, not double-listed.
-    #[test]
-    fn duplicate_type_lang_codec_already_in_existing_is_skipped() {
-        let mut disc = MemDisc::new();
-        let udf = fs_with_clpi(
-            &mut disc,
-            &[(0x1100, crate::consts::coding_type::TRUEHD, "eng")],
-        );
-        let mut labels = vec![label(StreamLabelType::Audio, 1, "eng", "TrueHD")];
-        let added = append_clpi_orphans(&mut labels, &mut disc, &udf);
-        assert_eq!(added, 0);
-        assert_eq!(labels.len(), 1);
     }
 }
 

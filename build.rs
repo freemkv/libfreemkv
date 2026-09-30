@@ -23,10 +23,24 @@ fn main() {
             &target_arch // x86_64 → x86_64
         };
 
+        // Match rustc's deployment target so the shim does not strongly link
+        // symbols newer than the app promises to run on (IOMainPort is 12+).
+        println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+        let min_ver = std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| {
+            if target_arch == "aarch64" {
+                "11.0"
+            } else {
+                "10.12"
+            }
+            .to_string()
+        });
+        let min_flag = format!("-mmacosx-version-min={min_ver}");
+
         let cc_status = std::process::Command::new("cc")
             .args([
                 "-arch",
                 clang_arch,
+                &min_flag,
                 "-c",
                 "src/scsi/macos_shim.c",
                 "-o",
@@ -61,7 +75,7 @@ fn main() {
 
 /// Bake the git short hash into the build as `GIT_SUFFIX` so any muxed MKV or
 /// FVI index is traceable to the exact source revision (e.g. ` (g835cc99)`).
-/// Empty when git or the repo is unavailable (e.g. a crates.io tarball build),
+/// Empty when git or the repo is unavailable (e.g. a source-archive build),
 /// leaving just the package version. Always emitted so `env!("GIT_SUFFIX")`
 /// resolves on every target.
 fn emit_git_suffix() {

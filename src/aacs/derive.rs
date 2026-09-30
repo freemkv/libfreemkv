@@ -6,6 +6,9 @@ use super::inf::*;
 use super::mkb::*;
 use super::types::*;
 
+/// `[C]` §3.2.5.1.4 Verify-Media-Key plaintext prefix.
+pub(super) const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+
 /// Derive Media Key from MKB data using processing keys.
 ///
 /// A Processing Key is **terminal**: tried *directly* against the MKB
@@ -98,7 +101,6 @@ fn validate_processing_key_with_cipher(
 
     // Step 3 + 4: dec_vd = AES-128D(mk, mk_dv); verify magic.
     let dec_vd = aes_ecb_decrypt(&mk, mk_dv);
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if dec_vd[..8] == VERIFY_MAGIC {
         return Some(mk);
     }
@@ -130,7 +132,6 @@ pub(crate) fn validate_processing_key(
 
     // Step 3 + 4: dec_vd = AES-128D(mk, mk_dv); verify magic.
     let dec_vd = aes_ecb_decrypt(&mk, mk_dv);
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     if dec_vd[..8] == VERIFY_MAGIC {
         return Some(mk);
     }
@@ -371,7 +372,11 @@ pub(crate) fn resolve_dk_node(
             return Some(dk);
         }
     }
-    // Degenerate MKB (no gating bit): fall back to the node itself.
+    // Parsed tables but no node gates: the position is unwalkable, so don't bank it.
+    if tables.is_some() {
+        return None;
+    }
+    // No parseable tables: fall back to the node itself.
     Some(DeviceKey {
         key: *key,
         node: (uv & 0xFFFF) as u16,
@@ -420,9 +425,7 @@ pub mod probe {
     /// `AES-D(km, mk_dv)[0..8] == 01 23 45 67 89 AB CD EF`.
     pub fn km_verifies(mkb: &[u8], km: &[u8; 16]) -> bool {
         match super::mkb_find_mk_dv(mkb) {
-            Some(mk_dv) => {
-                aes_ecb_decrypt(km, &mk_dv)[..8] == [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
-            }
+            Some(mk_dv) => aes_ecb_decrypt(km, &mk_dv)[..8] == super::VERIFY_MAGIC,
             None => false,
         }
     }
@@ -535,13 +538,23 @@ pub fn resolve_candidate(
     };
 
     match candidate {
-        KeyCandidate::Uk(uk) => Some(ResolvedChain {
-            unit_keys: vec![(uk.idx, uk.key)],
-            vuk: None,
-            mk: None,
-            pk: None,
-            dk: None,
-        }),
+        KeyCandidate::Uk(uk) => {
+            // `uk.idx` is positional; surface the declared CPS-unit number like the other arms,
+            // falling back to the position if the file does not parse or lacks that slot.
+            let version = mkb_type(mkb)
+                .map(|t| t.generation())
+                .unwrap_or(AacsVersion::V10);
+            let declared = parse_title_keys(unit_key_ro, version)
+                .and_then(|f| f.encrypted_keys.get(uk.idx as usize).map(|k| k.0))
+                .unwrap_or(uk.idx);
+            Some(ResolvedChain {
+                unit_keys: vec![(declared, uk.key)],
+                vuk: None,
+                mk: None,
+                pk: None,
+                dk: None,
+            })
+        }
         KeyCandidate::Vuk(v) => Some(ResolvedChain {
             unit_keys: boil(*v)?,
             vuk: Some(*v),
@@ -595,14 +608,13 @@ mod resolve_candidate_tests {
     fn km_verifies_accepts_only_the_key_its_record_was_built_for() {
         use crate::aacs::mkb::mkb_find_mk_dv;
 
-        const MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         let km: [u8; 16] = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
         ];
 
         let mut plain = [0u8; 16];
-        plain[..8].copy_from_slice(&MAGIC);
+        plain[..8].copy_from_slice(&VERIFY_MAGIC);
         plain[8..].copy_from_slice(&[0xA5; 8]);
         let mk_dv = aes_ecb_encrypt(&km, &plain);
 
@@ -712,6 +724,15 @@ mod resolve_candidate_tests {
         let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[], None).expect("uk is terminal");
         assert_eq!(r.unit_keys, vec![(2, uk.key)]);
         assert!(r.vuk.is_none() && r.mk.is_none());
+    }
+
+    /// A UK candidate's positional idx is reported as the declared CPS-unit number.
+    #[test]
+    fn resolve_candidate_uk_reports_the_declared_cps_unit_number() {
+        let inf = synth_inf(&[[0x11u8; 16], [0x22u8; 16]]);
+        let uk = UnitKey::new(1, [0x9u8; 16]);
+        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &inf, None).expect("terminal");
+        assert_eq!(r.unit_keys, vec![(2, uk.key)]);
     }
 
     /// MK/PK/DK paths derive the VUK from a VID; without one, derivation stops.
@@ -1043,9 +1064,6 @@ mod position_recovery_tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
 
-    /// `[C]` §3.2.5.1.4 Verify-Media-Key plaintext prefix.
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-
     /// An MKB record: 1-byte type + BE24 total length (header included) + body.
     fn rec(t: u8, body: &[u8]) -> Vec<u8> {
         let total = 4 + body.len();
@@ -1209,6 +1227,17 @@ mod position_recovery_tests {
             p.uv & v_mask,
             "a node equal to uv under v_mask does not gate — the walk would \
              skip the slot entirely"
+        );
+    }
+
+    // Parsed tables where no node gates (key not in this MKB's slot): resolving must
+    // fail rather than return a key that can never derive.
+    #[test]
+    fn resolve_dk_node_rejects_an_unwalkable_position() {
+        let p = plant_mkb();
+        assert!(
+            resolve_dk_node(&p.mkb, &[0x11; 16], p.uv, p.u_mask_shift).is_none(),
+            "no node gates for a key the MKB does not open"
         );
     }
 
@@ -1597,6 +1626,21 @@ mod position_recovery_tests {
             try_pk_against_tables(&[_pk], &ok_uvs, &ok_cvalues, &mk_dv).is_some(),
             "sanity: the same PK/cvalue pair does resolve when present"
         );
+    }
+
+    // A keydb device key with u_mask_shift >= 32 must be skipped at the DK-side guard;
+    // an unguarded `0xFFFF_FFFF << 200` panics in debug on keydb-supplied input.
+    #[test]
+    fn dk_walk_skips_a_device_key_with_u_mask_shift_past_u32() {
+        let (dkey, _mk, _pk, cv, mk_dv) = four_level_parts();
+        let mkb = build_mkb(&[(U_MASK_SHIFT, UV_SLOT4)], &cv, &mk_dv);
+        let dk = DeviceKey {
+            key: dkey,
+            node: 0x0101,
+            uv: UV_ANC4,
+            u_mask_shift: 200,
+        };
+        assert_eq!(derive_media_key_and_pk_from_dk(&mkb, &[dk]), None);
     }
 
     // ── L104: cvalue-loop cipher hoist — equivalence, call-count, and spec quote ──────

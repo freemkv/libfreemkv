@@ -30,6 +30,9 @@ static DECRYPT_THREADS: AtomicUsize = AtomicUsize::new(0);
 // Current rayon pool. `set_decrypt_threads` swaps it without leaking the old one; in-flight
 // calls hold their own `Arc` via `decrypt_pool` and finish on it.
 static DECRYPT_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
+// Set once a pool build fails (e.g. OS thread limit) so later reads go serial without retrying
+// the spawn every buffer; `set_decrypt_threads` clears it.
+static POOL_BUILD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Configure how many threads to use for AACS unit decryption. A value
 /// of `0` resets to the env / default resolution. `1` forces serial.
@@ -47,34 +50,54 @@ pub fn set_decrypt_threads(n: usize) {
     // skipping the swap would keep the STALE pool alive, making the setting no-op.
     let mut guard = DECRYPT_POOL.write().unwrap_or_else(|e| e.into_inner());
     *guard = None;
+    POOL_BUILD_FAILED.store(false, Ordering::Relaxed);
 }
 
 // Get (or lazily build) the pool; `Arc` so in-flight work survives a concurrent
 // `set_decrypt_threads` swap. `None` if unbuildable (e.g. OS thread limit) — caller falls back
 // to serial.
 fn decrypt_pool() -> Option<Arc<rayon::ThreadPool>> {
+    pool_or_build(&DECRYPT_POOL, &POOL_BUILD_FAILED, || {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(decrypt_threads())
+            .thread_name(|i| format!("freemkv-decrypt-{i}"))
+            .build()
+            .ok()
+    })
+}
+
+// `slot` holds the pool; `failed` remembers a failed `build` so it is attempted (and logged) once.
+fn pool_or_build(
+    slot: &RwLock<Option<Arc<rayon::ThreadPool>>>,
+    failed: &std::sync::atomic::AtomicBool,
+    build: impl FnOnce() -> Option<rayon::ThreadPool>,
+) -> Option<Arc<rayon::ThreadPool>> {
     // Fast path: pool already built. A poisoned read lock still yields a
     // usable guard (the pool Arc is immutable once stored).
     {
-        let guard = DECRYPT_POOL.read().unwrap_or_else(|e| e.into_inner());
+        let guard = slot.read().unwrap_or_else(|e| e.into_inner());
         if let Some(pool) = guard.as_ref() {
             return Some(Arc::clone(pool));
         }
     }
+    if failed.load(Ordering::Relaxed) {
+        return None;
+    }
     // Slow path: build a new one under the write lock, recovering the guard on
     // poisoning (a prior panic) rather than propagating a secondary panic — we
     // simply rebuild. Double-check after acquiring in case another caller won.
-    let mut guard = DECRYPT_POOL.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
     if let Some(pool) = guard.as_ref() {
         return Some(Arc::clone(pool));
     }
-    let n = decrypt_threads();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .thread_name(|i| format!("freemkv-decrypt-{i}"))
-        .build()
-        .ok()
-        .map(Arc::new)?;
+    if failed.load(Ordering::Relaxed) {
+        return None;
+    }
+    let Some(pool) = build().map(Arc::new) else {
+        failed.store(true, Ordering::Relaxed);
+        tracing::warn!("decrypt thread pool could not be built; decrypting serially");
+        return None;
+    };
     *guard = Some(Arc::clone(&pool));
     Some(pool)
 }
@@ -187,6 +210,8 @@ pub struct AacsKeyMap {
     // (start_lba, end_lba, key_idx, phase). An LBA in NO range is passed through
     // untouched — the map is a positive list of "this key here", nothing more.
     ranges: Vec<(u32, u32, usize, Phase)>,
+    // Parallel to `ranges`: the original start each piece's unit parity is measured from.
+    anchors: Vec<u32>,
     // Distinct, sorted key indices the map selects — derived from `ranges` once at
     // construction so the per-batch decrypt bounds check does not re-allocate/sort
     // it on every read. Kept in sync by building both in `from_ranges_phased`.
@@ -210,11 +235,46 @@ impl AacsKeyMap {
     /// for base/CPS). Ranges are sorted; an LBA in no range is passed through.
     pub(crate) fn from_ranges_phased(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Self {
         ranges.sort_by_key(|&(start, _, _, _)| start);
+        // Disjointness (entry_for relies on it): each boundary-to-boundary stretch goes to
+        // the covering range that starts last; `anchors` keeps the ORIGINAL start that
+        // FMTS unit parity is measured from.
+        let mut bounds: Vec<u32> = ranges.iter().flat_map(|r| [r.0, r.1]).collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        let mut disjoint: Vec<(u32, u32, usize, Phase)> = Vec::with_capacity(ranges.len());
+        let mut anchors: Vec<u32> = Vec::with_capacity(ranges.len());
+        let mut srcs: Vec<usize> = Vec::with_capacity(ranges.len());
+        let mut overlapped = false;
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mut cover = (0..ranges.len()).rev().filter(|&i| {
+                let r = ranges[i];
+                r.0 <= a && b <= r.1 && r.0 < r.1
+            });
+            let Some(win) = cover.next() else { continue };
+            overlapped |= cover.next().is_some();
+            if srcs.last() == Some(&win)
+                && let Some(last) = disjoint.last_mut()
+                && last.1 == a
+            {
+                last.1 = b;
+                continue;
+            }
+            let r = ranges[win];
+            disjoint.push((a, b, r.2, r.3));
+            anchors.push(r.0);
+            srcs.push(win);
+        }
+        if overlapped {
+            tracing::warn!("overlapping AACS key ranges; the later-starting range takes over");
+        }
+        let ranges = disjoint;
         let mut key_indices: Vec<usize> = ranges.iter().map(|&(_, _, i, _)| i).collect();
         key_indices.sort_unstable();
         key_indices.dedup();
         Self {
             ranges,
+            anchors,
             key_indices,
         }
     }
@@ -224,20 +284,17 @@ impl AacsKeyMap {
     /// the unit through untouched). O(log n). `range_start_lba` lets the mapped
     /// decrypt compute a unit's parity WITHIN a forensic segment (`Even`/`Odd`).
     pub fn entry_for(&self, lba: u32) -> Option<(usize, Phase, u32)> {
-        match self
+        let i = match self
             .ranges
             .binary_search_by(|&(start, _, _, _)| start.cmp(&lba))
         {
-            Ok(i) => {
-                let (start, _, idx, ph) = self.ranges[i];
-                Some((idx, ph, start))
-            }
-            Err(0) => None,
-            Err(i) => {
-                let (start, end, idx, ph) = self.ranges[i - 1];
-                (lba >= start && lba < end).then_some((idx, ph, start))
-            }
-        }
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let (start, end, idx, ph) = self.ranges[i];
+        (lba >= start && lba < end)
+            .then(|| (idx, ph, self.anchors.get(i).copied().unwrap_or(start)))
     }
 
     /// The unit-key index for the aligned unit at `lba`, or `None` when no range
@@ -412,7 +469,7 @@ fn apply_aacs_map(
     };
 
     let unit_len = aacs::content::ALIGNED_UNIT_LEN;
-    let unit_sectors = (unit_len / 2048) as u32;
+    let unit_sectors = aacs::content::ALIGNED_UNIT_SECTORS;
 
     // Validate every selectable index up front (fail loud) so the per-unit hot
     // loop can index without bounds churn and a resolver gap never silently
@@ -1744,6 +1801,9 @@ mod tests {
         let ul = aacs::content::ALIGNED_UNIT_LEN;
         let usz = (ul / 2048) as u32;
         let key2 = [0x78u8; 16];
+        // Force the parallel branch (else a 1-core runner / FREEMKV_THREADS=1 runs serial).
+        set_decrypt_threads(4);
+        assert!(decrypt_threads() > 1);
         let n = PARALLEL_MIN_UNITS * 4; // well past the parallel threshold
         let half = n / 2;
         // DISTINCT plaintext per unit and a second key for the upper half, so a
@@ -1776,6 +1836,80 @@ mod tests {
                 "unit {i} must recover to its own plaintext on the parallel path"
             );
         }
+        set_decrypt_threads(0);
+    }
+
+    // A failed pool build is remembered: later calls go serial without re-running the builder.
+    #[test]
+    fn failed_pool_build_is_cached_not_retried() {
+        let slot = RwLock::new(None);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0u32);
+        for _ in 0..3 {
+            let got = pool_or_build(&slot, &failed, || {
+                calls.set(calls.get() + 1);
+                None
+            });
+            assert!(got.is_none());
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "the failing builder must run once, not per call"
+        );
+        // A successful build is stored and reused.
+        let slot = RwLock::new(None);
+        let ok = std::sync::atomic::AtomicBool::new(false);
+        let build = || rayon::ThreadPoolBuilder::new().num_threads(1).build().ok();
+        let first = pool_or_build(&slot, &ok, build).expect("pool builds");
+        let second = pool_or_build(&slot, &ok, || None).expect("pool reused");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    // Overlapping ranges are made disjoint (later start wins) so entry_for stays sound.
+    #[test]
+    fn nested_key_range_keeps_outer_tail_and_phase_anchor() {
+        let map =
+            AacsKeyMap::from_ranges_phased(vec![(0, 100, 0, Phase::Even), (20, 60, 1, Phase::All)]);
+        assert_eq!(map.key_idx_for(80), Some(0));
+        assert_eq!(map.key_idx_for(40), Some(1));
+        assert_eq!(map.entry_for(80), Some((0, Phase::Even, 0)));
+        assert_eq!(map.entry_for(10), Some((0, Phase::Even, 0)));
+    }
+
+    /// Every sector of every input range resolves to some key.
+    #[test]
+    fn every_sector_of_every_input_range_gets_a_key() {
+        let input = vec![
+            (0, 100, 0),
+            (20, 30, 1),
+            (25, 60, 2),
+            (90, 120, 3),
+            (110, 115, 4),
+        ];
+        let map = AacsKeyMap::from_ranges(input.clone());
+        for (s, e, _) in input {
+            for lba in s..e {
+                assert!(map.key_idx_for(lba).is_some(), "lba {lba} lost its key");
+            }
+        }
+        assert_eq!(map.key_idx_for(60), Some(0));
+        assert_eq!(map.key_idx_for(116), Some(3));
+        assert_eq!(map.key_idx_for(120), None);
+    }
+
+    #[test]
+    fn overlapping_key_ranges_are_made_disjoint() {
+        let map = AacsKeyMap::from_ranges(vec![(0, 100, 0), (20, 30, 1), (25, 60, 2), (60, 60, 3)]);
+        let r = map.ranges();
+        assert!(
+            r.windows(2).all(|w| w[0].1 <= w[1].0),
+            "not disjoint: {r:?}"
+        );
+        assert_eq!(map.key_idx_for(10), Some(0));
+        assert_eq!(map.key_idx_for(22), Some(1));
+        assert_eq!(map.key_idx_for(40), Some(2));
+        assert_eq!(map.key_indices(), &[0, 1, 2]);
     }
 
     // The mapped descramble indexes the committed key pool POSITIONALLY, so the ORDER of the

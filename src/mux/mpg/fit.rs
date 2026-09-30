@@ -353,6 +353,32 @@ mod tests {
         );
     }
 
+    // Pass 1 keeps a source sub-id only inside the codec's own range and only once: an AC-3
+    // track under a DTS-range id is re-allocated, and a duplicate id takes the lowest free.
+    #[test]
+    fn source_sub_ids_out_of_range_or_duplicated_are_reallocated() {
+        let t = title(vec![
+            video(Codec::Mpeg2),
+            audio(0xBD89, Codec::Ac3, SampleRate::S48, ""),
+            audio(0xBD81, Codec::Ac3, SampleRate::S48, ""),
+            audio(0xBD81, Codec::Ac3, SampleRate::S48, ""),
+        ]);
+        let p = plan(&t);
+        let ac3 = |sub_id| {
+            Some(Carriage::Private {
+                sub_id,
+                kind: PrivateKind::Ac3,
+            })
+        };
+        assert_eq!(p.carriage[1], ac3(0x80), "0x89 is DTS range, not kept");
+        assert_eq!(p.carriage[2], ac3(0x81), "first 0x81 keeps its id");
+        assert_eq!(
+            p.carriage[3],
+            ac3(0x82),
+            "duplicate 0x81 takes the lowest free id"
+        );
+    }
+
     // J23: a declared extension whose base is not carried is in neither half (seen-only).
     #[test]
     fn an_extension_without_a_carried_base_is_not_planned_out() {

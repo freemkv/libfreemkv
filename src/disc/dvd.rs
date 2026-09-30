@@ -5,6 +5,17 @@ use crate::ifo;
 use crate::sector::SectorSource;
 use crate::udf;
 
+// Reads and parses a VMG copy (VIDEO_TS.IFO or .BUP), returning its bytes for dvdnav reuse.
+fn load_vmg(
+    reader: &mut dyn SectorSource,
+    udf_fs: &udf::UdfFs,
+    path: &str,
+) -> Result<(Vec<u8>, ifo::DvdInfo)> {
+    let bytes = udf_fs.read_file(reader, path)?;
+    let info = ifo::parse_vmg_with(reader, udf_fs, Some(&bytes))?;
+    Ok((bytes, info))
+}
+
 impl Disc {
     // Scan DVD titles; a cancelled read is Err(Error::Halted), never an empty list. Also
     // returns the nav-resolved main feature, or None.
@@ -19,15 +30,24 @@ impl Disc {
         // Read VIDEO_TS.IFO once and reuse for both the VMG parse and the nav
         // resolver below; otherwise the VTS reads in parse_vmg evict the single
         // sector-cache window, forcing a duplicate physical read of the same file.
-        let vmg_bytes = match udf_fs.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO") {
-            Ok(bytes) => bytes,
+        let (vmg_bytes, dvd_info) = match load_vmg(reader, udf_fs, "/VIDEO_TS/VIDEO_TS.IFO") {
+            Ok(v) => v,
             Err(Error::Halted) => return Err(Error::Halted),
-            Err(_) => return Ok((Vec::new(), None)),
-        };
-        let dvd_info = match ifo::parse_vmg_with(reader, udf_fs, Some(&vmg_bytes)) {
-            Ok(info) => info,
-            Err(Error::Halted) => return Err(Error::Halted),
-            Err(_) => return Ok((Vec::new(), None)),
+            Err(ifo_err) => match load_vmg(reader, udf_fs, "/VIDEO_TS/VIDEO_TS.BUP") {
+                Ok(v) => {
+                    tracing::warn!(target: "freemkv::scan", code = ifo_err.code(), "dvd: VIDEO_TS.IFO bad; using BUP");
+                    v
+                }
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(bup_err) => {
+                    // Neither copy usable: nothing to enumerate (a missing pair is not a fault).
+                    let missing = |e: &Error| matches!(e, Error::UdfNotFound { .. });
+                    if !(missing(&ifo_err) && missing(&bup_err)) {
+                        tracing::warn!(target: "freemkv::scan", ifo = ifo_err.code(), bup = bup_err.code(), "dvd: VIDEO_TS.IFO and BUP unusable");
+                    }
+                    return Ok((Vec::new(), None));
+                }
+            },
         };
 
         // Follow the disc's First-Play navigation like a player would, to find the
@@ -197,15 +217,20 @@ impl Disc {
                 streams.extend(title_audio_streams(ts, dvd_title, title_number));
                 streams.extend(subtitle_streams);
 
-                // Chapter times are absolute from the PGC start. When leading cells are
-                // dropped, the muxed video shifts earlier by their total duration, so shift
-                // chapter marks too (clamping any that fell inside the dropped head to 0).
-                let chapters: Vec<Chapter> = dvd_title
+                // Chapter times are absolute from the PGC start: shift them by the dropped
+                // head's duration; marks inside the head collapse to one at 0.0.
+                let shifted: Vec<f64> = dvd_title
                     .chapter_times
                     .iter()
+                    .map(|&t| (t - dropped_secs).max(0.0))
+                    .collect();
+                let in_head = shifted.iter().filter(|&&t| t <= 0.0).count();
+                let chapters: Vec<Chapter> = shifted
+                    .into_iter()
+                    .skip(in_head.saturating_sub(1))
                     .enumerate()
-                    .map(|(i, &t)| Chapter {
-                        time_secs: (t - dropped_secs).max(0.0),
+                    .map(|(i, time_secs)| Chapter {
+                        time_secs,
                         name: chapter_name(i),
                     })
                     .collect();
@@ -213,7 +238,7 @@ impl Disc {
                 titles.push(DiscTitle {
                     playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
                     playlist_id: title_number,
-                    duration_secs: dvd_title.duration_secs,
+                    duration_secs: (dvd_title.duration_secs - dropped_secs).max(0.0),
                     size_bytes,
                     clips: Vec::new(),
                     streams,
@@ -1961,5 +1986,94 @@ mod tests {
             })
             .collect();
         assert_eq!(audio_pids, vec![0x00C0u16, 0x00C1u16]);
+    }
+
+    fn scan_cells(cells: &[(u32, u32, u8, u8)], programs: &[u8], nchap: u16) -> DiscTitle {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(nchap, 1, 1)]);
+        let vts = build_vts_cells(1000, 0x00, cells, programs);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0
+            .remove(0)
+    }
+
+    // Dropped head time comes off the duration, and head chapters collapse to one mark at 0.
+    #[test]
+    fn scan_dvd_titles_dropped_head_adjusts_duration_and_chapters() {
+        let t = scan_cells(
+            &[
+                (0, 9, 0x90, 0x05),
+                (10, 19, 0x90, 0x05),
+                (100, 199, 0x00, 0x20),
+                (300, 399, 0x00, 0x20),
+            ],
+            &[1, 2, 3, 4],
+            4,
+        );
+        assert!(
+            (t.duration_secs - 40.0).abs() < 0.01,
+            "got {}",
+            t.duration_secs
+        );
+        let times: Vec<f64> = t.chapters.iter().map(|c| c.time_secs).collect();
+        assert_eq!(times.iter().filter(|&&x| x <= 0.0).count(), 1, "{times:?}");
+        assert_eq!(t.chapters[0].name, "1");
+    }
+
+    // VIDEO_TS / VTS IFOs are garbage or real, BUPs are garbage or real.
+    fn scan_ifo_bup(ifo_ok: bool, bup_ok: bool) -> Result<Vec<DiscTitle>> {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        let vts = build_vts_cells(1000, 0x00, &[(0, 99, 0x00, 0x10)], &[1]);
+        let pick = |ok: bool, good: &Vec<u8>| if ok { good.clone() } else { vec![0x55; 4096] };
+        let spec = |name: &str, icb_lba, data_lba, contents| FileSpec {
+            name: name.into(),
+            icb_lba,
+            data_lba,
+            contents,
+        };
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                spec("VIDEO_TS.IFO", 60, 5000, pick(ifo_ok, &vmg)),
+                spec("VTS_01_0.IFO", 62, 6000, pick(ifo_ok, &vts)),
+                spec("VIDEO_TS.BUP", 64, 7000, pick(bup_ok, &vmg)),
+                spec("VTS_01_0.BUP", 66, 8000, pick(bup_ok, &vts)),
+            ],
+        );
+        Disc::scan_dvd_titles(&mut disc, &udf, None).map(|r| r.0)
+    }
+
+    // A bad IFO falls back to its BUP; VOBs stay anchored at the IFO's own LBA.
+    #[test]
+    fn scan_dvd_titles_bad_ifo_uses_bup() {
+        let good = scan_ifo_bup(true, false).expect("good ifo");
+        let bup = scan_ifo_bup(false, true).expect("bup");
+        assert_eq!(bup.len(), 1);
+        assert_eq!(bup[0].extents[0].start_lba, good[0].extents[0].start_lba);
+    }
+
+    // IFO and BUP both bad: no titles, not a scan error (base behaviour).
+    #[test]
+    fn scan_dvd_titles_bad_ifo_and_bup_is_empty() {
+        assert_eq!(scan_ifo_bup(false, false).expect("no error").len(), 0);
     }
 }

@@ -101,20 +101,10 @@ fn finish_with_grace<R: Send + 'static>(
     leak_err: Error,
     on_poll: &mut dyn FnMut(),
 ) -> Result<R, Error> {
-    // `None` = a grace past `Instant`'s range: wait unbounded.
-    let end = Instant::now().checked_add(grace);
-    let mut handle = handle;
-    loop {
-        let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
-        handle = match join_within(handle, left.min(WAIT_SLICE), None) {
-            Joined::Done(r) => return join_result(r),
-            Joined::Halted(h) | Joined::Pending(h) => h,
-        };
-        on_poll();
-        if end.is_some_and(|e| Instant::now() >= e) {
-            break;
-        }
-    }
+    let mut handle = match wait_grace(handle, grace, on_poll) {
+        Ok(r) => return r,
+        Err(h) => h,
+    };
     // CLAIM abandonment before dropping the handle so the leaked consumer skips further
     // `apply`/`close()`. Compare-exchange, not a store: a consumer already CLOSING wins.
     if state
@@ -170,18 +160,33 @@ fn grace_then_leak<R: Send + 'static>(
     leak_err: Error,
     on_poll: &mut dyn FnMut(),
 ) -> Result<R, Error> {
+    match wait_grace(handle, grace, on_poll) {
+        Ok(r) => r,
+        Err(handle) => {
+            drop(handle);
+            Err(leak_err)
+        }
+    }
+}
+
+// Join within `grace` (polling `on_poll`); `Err(handle)` if it is still running.
+fn wait_grace<R: Send + 'static>(
+    handle: thread::JoinHandle<Result<R, Error>>,
+    grace: Duration,
+    on_poll: &mut dyn FnMut(),
+) -> Result<Result<R, Error>, thread::JoinHandle<Result<R, Error>>> {
+    // `None` = a grace past `Instant`'s range: wait unbounded.
     let end = Instant::now().checked_add(grace);
     let mut handle = handle;
     loop {
         let left = end.map_or(WAIT_SLICE, |e| e.saturating_duration_since(Instant::now()));
         handle = match join_within(handle, left.min(WAIT_SLICE), None) {
-            Joined::Done(r) => return join_result(r),
+            Joined::Done(r) => return Ok(join_result(r)),
             Joined::Halted(h) | Joined::Pending(h) => h,
         };
         on_poll();
         if end.is_some_and(|e| Instant::now() >= e) {
-            drop(handle);
-            return Err(leak_err);
+            return Err(handle);
         }
     }
 }
@@ -191,9 +196,8 @@ fn grace_then_leak<R: Send + 'static>(
 /// use WRITE_PIPELINE_DEPTH instead.
 pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 
-/// Write pipeline depth. Smaller buffer reduces backpressure risk when
-/// sync_file_range blocks; prevents producer from accumulating too much
-/// work while consumer waits for NFS to drain.
+/// Write pipeline depth: deeper than the default (16 vs 4), so the producer keeps
+/// running while a slow flush (`sync_file_range`, NFS drain) blocks the consumer.
 pub const WRITE_PIPELINE_DEPTH: usize = 16;
 
 /// Channel depth for write-through pipelines. Each `send` fully
@@ -207,9 +211,8 @@ pub const WRITE_THROUGH_DEPTH: usize = 1;
 /// ([`Flow::Continue`]), or stop the pipeline early and run `close()`
 /// ([`Flow::Stop`]).
 ///
-/// `Stop` currently has no in-tree caller (sweep always processes its
-/// full work-list; the mux highway drains to EOF), but it's part of the
-/// fixed `Sink` contract.
+/// `Stop` currently has no in-tree caller (the mux highway drains to EOF; the sweep
+/// moved to freemkv-engine), but it's part of the fixed `Sink` contract.
 pub enum Flow {
     Continue,
     Stop,
@@ -258,7 +261,7 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     /// Set by [`finish_with_grace`] when the grace period expires and the consumer thread is
     /// about to be leaked: it stops applying further items and does NOT call `close()`, so a
     /// leaked consumer can't finalise an output already reported as failed. One of
-    /// [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`]; both transitions are
+    /// [`state::RUNNING`] / [`state::ABANDONED`] / [`state::CLOSING`] / [`state::CLOSING_STOPPED`]; both transitions are
     /// compare-exchanges so abandoning and finalising are mutually exclusive rather than
     /// racing.
     state: Arc<AtomicU8>,
@@ -513,10 +516,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// the item back if the consumer thread is gone (panicked or
     /// already returned).
     ///
-    /// After [`Flow::Stop`], `send` silently buffers until the channel
-    /// fills, then returns `Err(item)` once the consumer drops its
-    /// receiver — producers that need to stop pushing on `Stop` should
-    /// track an independent signal (e.g. `Halt`) instead.
+    /// After [`Flow::Stop`] the consumer keeps draining (discarding) until the producer
+    /// drops `tx`, so `send` keeps returning `Ok` — producers that need to stop pushing on
+    /// `Stop` should track an independent signal (e.g. `Halt`) instead.
     pub fn send(&self, item: I) -> Result<(), I> {
         // Only timestamp when debug tracing is on — `send` runs per
         // item on the mux highway hot path.
@@ -933,7 +935,9 @@ mod tests {
         type Output = ();
 
         fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
-            panic!("synthetic test panic");
+            // resume_unwind skips the process-global panic hook, so no test has to
+            // swap the hook (a race between parallel tests) to keep output quiet.
+            std::panic::resume_unwind(Box::new("synthetic test panic"));
         }
 
         fn close(self) -> Result<(), Error> {
@@ -943,11 +947,6 @@ mod tests {
 
     #[test]
     fn consumer_panic_becomes_io_error() {
-        // Silence the panic message that would otherwise pollute the
-        // test output — we expect this panic.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-
         let pipe =
             Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn should succeed");
         // First send may succeed (item buffered before panic) or fail
@@ -959,8 +958,6 @@ mod tests {
             let _ = pipe.send(i);
         }
         let res = pipe.finish();
-
-        std::panic::set_hook(prev);
 
         // A consumer panic surfaces as the numeric variant, not an
         // English-carrying io::Error. The original panic payload is
@@ -1254,8 +1251,6 @@ mod tests {
     // try_send must report Disconnected once the consumer has exited (via panic here).
     #[test]
     fn try_send_reports_disconnected_after_consumer_gone() {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
         // Drive the consumer to panic and fully exit. Spin until a
         // try_send observes the closed channel.
@@ -1272,7 +1267,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::panic::set_hook(prev);
         let _ = pipe.finish();
         assert!(
             saw_disconnect,
@@ -1283,8 +1277,6 @@ mod tests {
     // Plain send must hand the item back via Err(item) once the consumer has panicked.
     #[test]
     fn send_returns_item_after_consumer_panicked() {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
         let end = Instant::now() + Duration::from_secs(2);
         let mut returned = None;
@@ -1296,7 +1288,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::panic::set_hook(prev);
         let _ = pipe.finish();
         assert_eq!(
             returned,
@@ -1308,8 +1299,6 @@ mod tests {
     // send_with_halt must return the exact item via Err(item) on the Disconnected arm.
     #[test]
     fn send_with_halt_returns_item_on_disconnect() {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
         // Force the consumer to panic + exit: send until the channel
         // closes (plain send returns Err).
@@ -1322,7 +1311,6 @@ mod tests {
         }
         let halt = crate::halt::Halt::new(); // never cancelled
         let res = pipe.send_with_halt(0xABCD_u64, &halt, Duration::from_secs(5));
-        std::panic::set_hook(prev);
         let _ = pipe.finish();
         assert!(
             matches!(res, Err(0xABCD)),

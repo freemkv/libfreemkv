@@ -56,6 +56,7 @@ const FRAME_RATES: [(u32, u32); 9] = [
 ];
 
 /// Aspect ratio table (index from sequence header aspect_ratio_information).
+/// Code 1 is a 1:1 sample aspect ratio; codes 2-4 are display aspect ratios.
 const ASPECT_RATIOS: [(u8, u8); 5] = [
     (0, 0),     // 0: forbidden
     (1, 1),     // 1: square pixels (1:1 SAR)
@@ -99,6 +100,9 @@ pub struct Mpeg2Parser {
     /// each GOP's first PES PTS so video stays in sync with the PES-timestamped
     /// audio. None until the first PES timestamp is seen.
     origin_pts_ns: Option<i64>,
+    /// Top-parity of an unpaired first field picture; the next opposite-parity
+    /// field is its second field and inherits the pair's (first field's) order.
+    pending_first_field: Option<bool>,
 }
 
 /// One coded picture buffered awaiting its GOP's completion (see `gop_buf`).
@@ -133,6 +137,7 @@ impl Mpeg2Parser {
             gop_bytes: 0,
             emitted_fields: 0,
             origin_pts_ns: None,
+            pending_first_field: None,
         }
     }
 
@@ -198,7 +203,21 @@ impl Mpeg2Parser {
         // Decode the picture coding extension ONCE here and fold every per-picture
         // datum into one codec-agnostic `PictureInfo`; `nb_fields()`, `keyframe()`,
         // and `field_order()` all derive from it, so nothing re-parses the stream.
-        let (tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
+        let (mut tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
+        // A GOP or sequence header always starts a new pair; drop a stale lone field.
+        if gop_boundary {
+            self.pending_first_field = None;
+        }
+        if frame_picture {
+            self.pending_first_field = None;
+        } else if let Some(first_top) = self.pending_first_field.take()
+            && first_top != tff
+        {
+            // Second field of a pair: report the first field's order.
+            tff = first_top;
+        } else {
+            self.pending_first_field = Some(tff);
+        }
         let info = PictureInfo::mpeg2(
             coding_type_from_raw(raw_coding_type),
             Mpeg2Coding {
@@ -414,7 +433,13 @@ fn picture_coding_flags(au: &[u8]) -> (bool, bool, bool, bool) {
         };
         // picture_structure (e2 bits 1-0): 11 = frame picture; 01/10 = field.
         let frame_picture = e2 & 0x03 == 0b11;
-        let tff = (e3 >> 7) & 1 == 1;
+        // A field picture forces top_field_first to 0 (§6.3.10); its order is
+        // picture_structure (01 = top field), carried in `tff` instead.
+        let tff = if frame_picture {
+            (e3 >> 7) & 1 == 1
+        } else {
+            e2 & 0x03 == 0b01
+        };
         let rff = (e3 >> 1) & 1 == 1;
         let progressive_frame = (e4 >> 7) & 1 == 1;
         return (tff, rff, progressive_frame, frame_picture);
@@ -430,42 +455,6 @@ fn coding_type_from_raw(raw: u8) -> CodingType {
         3 => CodingType::B,
         _ => CodingType::P,
     }
-}
-
-// Number of field-display periods a coded picture occupies (2:3 pulldown).
-fn picture_nb_fields(au: &[u8], progressive_sequence: bool) -> u8 {
-    let mut search = 0;
-    while let Some(q) = find_code(au, search, SEQ_EXT_CODE) {
-        search = q + 4;
-        // The picture coding extension is the B5 whose ext-id nibble is 1000.
-        if au.get(q + 4).map(|b| b >> 4) != Some(0b1000) {
-            continue;
-        }
-        // Extension bytes e2..=e4 = au[q+6 ..= q+8].
-        let (Some(&e2), Some(&e3), Some(&e4)) = (au.get(q + 6), au.get(q + 7), au.get(q + 8))
-        else {
-            break;
-        };
-        // picture_structure (e2 bits 1-0): 11 = frame picture. A field picture
-        // (01/10) occupies a single field; two combine into one frame upstream.
-        if e2 & 0x03 != 0b11 {
-            return 1;
-        }
-        let tff = (e3 >> 7) & 1;
-        let rff = (e3 >> 1) & 1;
-        let progressive_frame = (e4 >> 7) & 1;
-        let repeat_pict = if rff == 0 {
-            0
-        } else if progressive_sequence {
-            if tff == 1 { 4 } else { 2 }
-        } else if progressive_frame == 1 {
-            1
-        } else {
-            0
-        };
-        return repeat_pict + 2;
-    }
-    2
 }
 
 // Read `progressive_sequence` from the sequence extension; false when absent.
@@ -487,7 +476,7 @@ mod tests {
     use crate::mux::ts::PesPacket;
 
     /// Build a picture coding extension (`00 00 01 B5`, ext-id 1000) carrying the
-    /// given pulldown flags, for `picture_nb_fields` tests.
+    /// given pulldown flags, for parser tests.
     fn pic_coding_ext(tff: u8, rff: u8, progressive_frame: u8, frame_picture: bool) -> Vec<u8> {
         let e0 = 0x80; // ext-id 1000, f_code high nibble 0
         let e1 = 0x00;
@@ -498,35 +487,92 @@ mod tests {
     }
 
     #[test]
-    fn nb_fields_normal_frame_is_two() {
-        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 0, 0, true), false), 2);
+    fn field_picture_order_follows_picture_structure() {
+        use crate::mux::codec::coding::FieldOrder;
+        let mk = |e2: u8| {
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            let (tff, rff, pf, fp) = picture_coding_flags(&ext);
+            PictureInfo::mpeg2(
+                CodingType::I,
+                Mpeg2Coding {
+                    top_field_first: tff,
+                    repeat_first_field: rff,
+                    progressive_frame: pf,
+                    progressive_sequence: false,
+                    frame_picture: fp,
+                },
+            )
+            .field_order()
+        };
+        assert_eq!(mk(0x01), Some(FieldOrder::Tff));
+        assert_eq!(mk(0x02), Some(FieldOrder::Bff));
     }
 
     #[test]
-    fn nb_fields_telecine_repeat_field_is_three() {
-        // NTSC 2:3 soft telecine: interlaced sequence, progressive frame, rff=1.
-        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 1, 1, true), false), 3);
+    fn field_pair_second_field_inherits_first_order() {
+        use crate::mux::codec::coding::FieldOrder;
+        let mut p = Mpeg2Parser::new();
+        let mut frames = Vec::new();
+        let mut first = true;
+        for (ct, e2) in [(1u8, 0x01u8), (2, 0x02), (1, 0x01), (2, 0x02)] {
+            let mut au = Vec::new();
+            if first {
+                au.extend_from_slice(&make_seq_header(720, 576, 3, 3));
+                first = false;
+            }
+            au.extend_from_slice(&make_picture_header(ct));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            frames.extend(p.parse(&PesPacket {
+                source: None,
+                pid: 0x1011,
+                pts: None,
+                dts: None,
+                data: au,
+                discontinuity: false,
+            }));
+        }
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 4);
+        for f in &frames {
+            assert_eq!(f.coding.unwrap().field_order(), Some(FieldOrder::Tff));
+        }
     }
 
     #[test]
-    fn nb_fields_field_picture_is_one() {
-        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 0, 0, false), false), 1);
-    }
-
-    #[test]
-    fn nb_fields_progressive_seq_rff_tff_is_six() {
-        assert_eq!(picture_nb_fields(&pic_coding_ext(1, 1, 0, true), true), 6);
-    }
-
-    #[test]
-    fn nb_fields_progressive_seq_rff_no_tff_is_four() {
-        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 1, 0, true), true), 4);
-    }
-
-    #[test]
-    fn nb_fields_no_picture_ext_defaults_two() {
-        // A picture header with no coding extension → assume a normal 2-field frame.
-        assert_eq!(picture_nb_fields(&[0, 0, 1, 0x00, 0, 0], false), 2);
+    fn gop_header_resets_stale_lone_field() {
+        use crate::mux::codec::coding::FieldOrder;
+        let mut p = Mpeg2Parser::new();
+        let mut frames = Vec::new();
+        let feed = |p: &mut Mpeg2Parser, prefix: Vec<u8>, ct: u8, e2: u8| {
+            let mut au = prefix;
+            au.extend_from_slice(&make_picture_header(ct));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            p.parse(&PesPacket {
+                source: None,
+                pid: 0x1011,
+                pts: None,
+                dts: None,
+                data: au,
+                discontinuity: false,
+            })
+        };
+        // Stray lone top field, then a new GOP coded BFF (bottom, top) x2.
+        frames.extend(feed(&mut p, make_seq_header(720, 576, 3, 3), 1, 0x01));
+        let gop = vec![0x00, 0x00, 0x01, GOP_CODE, 0, 0, 0, 0];
+        frames.extend(feed(&mut p, gop, 1, 0x02));
+        frames.extend(feed(&mut p, Vec::new(), 2, 0x01));
+        frames.extend(feed(&mut p, Vec::new(), 2, 0x02));
+        frames.extend(feed(&mut p, Vec::new(), 2, 0x01));
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 5);
+        for f in &frames[1..] {
+            assert_eq!(f.coding.unwrap().field_order(), Some(FieldOrder::Bff));
+        }
     }
 
     #[test]
@@ -1312,16 +1358,15 @@ mod tests {
     // --- parameter-set-only stream: seq header, no picture → no frame ---
 
     #[test]
-    fn sequence_header_only_emits_no_frame_but_captures_codec_private() {
+    fn sequence_header_only_emits_no_frame_and_captures_no_codec_private() {
         let mut parser = Mpeg2Parser::new();
         let mut data = make_seq_header(1920, 1080, 3, 4);
         data.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE, 0x14, 0x8A]);
         // No picture start code at all.
         let frames = parse_then_flush(&mut parser, &make_pes(data, Some(0)));
         assert!(frames.is_empty(), "no coded picture → no frame");
-        // codec_private only captured when an AU is emitted; a header-only
-        // stream emits nothing, so nothing is captured — and there is no frame
-        // to need it. (Real streams always follow the header with a picture.)
+        // A header-only AU returns before extract_seq_header: nothing is captured.
+        assert!(parser.codec_private().is_none());
     }
 
     // --- buffer cap: corrupt stream with no second boundary is force-flushed ---
@@ -1339,6 +1384,77 @@ mod tests {
         frames.extend(parser.flush());
         assert_eq!(frames.len(), 1, "over-cap AU force-flushed, not dropped");
         assert!(frames[0].keyframe);
+    }
+
+    // Frame-count cap: a run of pictures with no GOP/sequence boundary is force-flushed
+    // during parse at MAX_PENDING_FRAMES, not held until EOF.
+    #[test]
+    fn gop_frame_cap_flushes_during_parse() {
+        let mut parser = Mpeg2Parser::new();
+        let mut data = Vec::new();
+        for _ in 0..MAX_PENDING_FRAMES + 100 {
+            data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+            data.extend_from_slice(&[0xAA; 4]);
+        }
+        let out = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(out.len(), MAX_PENDING_FRAMES, "cap flushed one full run");
+    }
+
+    // Byte cap: few-but-huge pictures are force-flushed once the buffered bytes reach
+    // MAX_PENDING_BYTES, even far below the frame cap.
+    #[test]
+    fn gop_byte_cap_flushes_during_parse() {
+        let mut parser = Mpeg2Parser::new();
+        let mut data = Vec::new();
+        for _ in 0..2 {
+            data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+            data.extend(std::iter::repeat_n(0xAA, MAX_PENDING_BYTES / 2));
+        }
+        data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+        data.extend_from_slice(&[0xAA; 4]);
+        let out = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(out.len(), 2, "byte cap flushed the two huge pictures");
+    }
+
+    // Parser-level timing for a progressive sequence: rff counts 4 fields (tff=0) or 6 (tff=1)
+    // only when the sequence extension's progressive_sequence is honoured.
+    #[test]
+    fn progressive_sequence_rff_durations_via_parser() {
+        let mut parser = Mpeg2Parser::new();
+        let field = 20_000_000u64; // 25 fps
+        let mut au = make_seq_header(720, 576, 3, 3);
+        au.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE, 0x10, 0x08]); // progressive_sequence
+        au.extend_from_slice(&gop());
+        for (ct, tr, tff) in [(1u8, 0u16, 0u8), (2, 1, 1)] {
+            au.extend_from_slice(&make_picture_header_tr(ct, tr));
+            au.extend_from_slice(&pic_coding_ext(tff, 1, 0, true));
+            au.extend_from_slice(&[0xAA; 8]);
+        }
+        let f = parse_then_flush(&mut parser, &make_pes(au, Some(0)));
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].duration_ns, Some(4 * field), "rff, tff=0 → 4 fields");
+        assert_eq!(f[1].duration_ns, Some(6 * field), "rff, tff=1 → 6 fields");
+        assert_eq!(f[1].pts_ns as u64, 4 * field);
+    }
+
+    // Parser-level timing for field pictures: each occupies one field period.
+    #[test]
+    fn field_pictures_occupy_one_field_via_parser() {
+        let mut parser = Mpeg2Parser::new();
+        let field = 20_000_000u64; // 25 fps
+        let mut au = make_seq_header(720, 576, 3, 3);
+        au.extend_from_slice(&gop());
+        for (ct, e2) in [(1u8, 0x01u8), (2, 0x02)] {
+            au.extend_from_slice(&make_picture_header(ct));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            au.extend_from_slice(&[0xAA; 8]);
+        }
+        let f = parse_then_flush(&mut parser, &make_pes(au, Some(0)));
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].duration_ns, Some(field));
+        assert_eq!(f[1].duration_ns, Some(field));
     }
 
     // --- parse_resolution: 12-bit field packing (ISO 13818-2 §6.2.2.1) ---

@@ -12,19 +12,13 @@ use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 
 /// Descramble a CSS-encrypted DVD sector in place.
 ///
-/// Registers are seeded from `title_key XOR sector_seed` (bytes
-/// `0x54..0x59`). Only the body, bytes `0x80..0x800`, is transformed:
-/// `body[i] = TAB1[body[i]] ^ (keystream & 0xff)`. The scramble flag at byte
-/// `0x14` (bits 4-5) is CLEARED after unscrambling, so a descrambled sector
-/// reads as `sector[0x14] & 0x30 == 0`.
+/// Seeded from `title_key XOR sector_seed` (bytes `0x54..0x59`); transforms only
+/// the body `0x80..0x800`: `body[i] = TAB1[body[i]] ^ (keystream & 0xff)`.
+/// Flag bits 4-5 at byte `0x14` are cleared afterwards.
 ///
-/// No-op (returns without modifying `sector`) if `sector.len() < 2048` or the scramble flag
-/// bits are already zero.
+/// No-op if `sector.len() < 2048` or the scramble flag bits are already zero.
+#[doc(hidden)]
 pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
-    debug_assert!(
-        sector.len() >= 2048,
-        "descramble_sector: buffer shorter than one 2048-byte sector"
-    );
     if sector.len() < 2048 {
         return;
     }
@@ -138,10 +132,10 @@ mod tests {
         assert_eq!(sector, original);
     }
 
-    // Regression vector pinning the implementation's deterministic output. key = 42 13 37 BE
-    // EF, seed = DE AD BE EF 42, body = 0xAA.
+    // Regression vector pinning this implementation's own output (NOT an independent CSS
+    // known-answer). key = 42 13 37 BE EF, seed = DE AD BE EF 42, body = 0xAA.
     #[test]
-    fn descramble_produces_the_reference_css_vector() {
+    fn descramble_output_is_pinned_regression_vector() {
         let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
         let mut sector = vec![0xAAu8; 2048];
         sector[0x14] = 0x30;
@@ -153,12 +147,12 @@ mod tests {
                 0x81, 0x92, 0x24, 0xA2, 0x46, 0x70, 0x3C, 0x64, 0xA6, 0x91, 0x84, 0xF5, 0x1F, 0x98,
                 0xA0, 0x31
             ],
-            "descramble body head must match the reference CSS vector"
+            "descramble body head changed from the pinned output"
         );
         assert_eq!(
             &sector[0x7F8..0x800],
             &[0x46, 0x94, 0x80, 0x0E, 0x67, 0x36, 0x65, 0xBC],
-            "descramble body tail must match the reference CSS vector"
+            "descramble body tail changed from the pinned output"
         );
     }
 
@@ -226,8 +220,7 @@ mod tests {
         );
     }
 
-    // TAB1 is a substitution table used in key mangling; verify it is a
-    // permutation of 0..255 (no two inputs map to the same output).
+    // TAB1 is a substitution table; verify it is a permutation of 0..255.
     #[test]
     fn css_tab1_is_permutation() {
         let mut seen = [false; 256];
@@ -235,15 +228,6 @@ mod tests {
             let v = *tab1_val as usize;
             assert!(!seen[v], "TAB1 maps two inputs to {:#04x}", v);
             seen[v] = true;
-        }
-        // Check involution property: TAB1[TAB1[x]] should map back predictably
-        // TAB1 is not necessarily a strict involution, but we verify the
-        // composition TAB1[TAB1[x]] is also a permutation
-        let mut seen2 = [false; 256];
-        for i in 0..256 {
-            let v = TAB1[TAB1[i] as usize] as usize;
-            assert!(!seen2[v], "TAB1[TAB1[x]] maps two inputs to {:#04x}", v);
-            seen2[v] = true;
         }
     }
 

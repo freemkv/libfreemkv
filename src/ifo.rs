@@ -132,6 +132,22 @@ impl CellCategory {
     }
 }
 
+// Count of leading secondary angle-block cells (see `DvdTitle::feature_start_cell`).
+fn leading_secondary_cells(cells: &[DvdCell]) -> usize {
+    let n = cells.len();
+    let mut idx = 0;
+    while idx < n {
+        // Stop at the first cell that is genuine feature content.
+        if !CellCategory::decode(cells[idx].category).is_secondary_block_piece() {
+            break;
+        }
+        idx += 1;
+    }
+    // Never drop everything: if every leading cell looked like a secondary
+    // block piece (pathological/corrupt category bytes), keep all cells.
+    if idx >= n { 0 } else { idx }
+}
+
 impl DvdTitle {
     /// Index of the first cell to include in the muxed feature.
     ///
@@ -141,23 +157,7 @@ impl DvdTitle {
     /// plain-feature cell; cells before it are dropped from the feature extents. Conservative:
     /// only ever skips a prefix, never past the last cell or to zero cells.
     pub fn feature_start_cell(&self) -> usize {
-        let n = self.cells.len();
-        if n == 0 {
-            return 0;
-        }
-        let mut idx = 0;
-        while idx < n {
-            let cat = CellCategory::decode(self.cells[idx].category);
-            // Stop at the first cell that is genuine feature content.
-            if !cat.is_secondary_block_piece() {
-                break;
-            }
-            idx += 1;
-        }
-        // Never drop everything: if every leading cell looked like a secondary
-        // block piece (pathological/corrupt category bytes), fall back to
-        // keeping all cells rather than producing an empty feature.
-        if idx >= n { 0 } else { idx }
+        leading_secondary_cells(&self.cells)
     }
 
     /// The feature cells after the leading-cell filter ([`Self::feature_start_cell`]).
@@ -469,13 +469,14 @@ pub(crate) const MAX_TT_SRPT_TITLES: usize = 99;
 // Parses the VMG TT_SRPT into a per-title-set map of (chapter_count, vts_title_number). Clamps
 // the declared entry count to MAX_TT_SRPT_TITLES and drops duplicate (vts_number,
 // vts_title_num) pairs.
-fn parse_tt_srpt(
+pub(crate) fn parse_tt_srpt(
     vmg_data: &[u8],
     tt_srpt_offset: usize,
 ) -> Result<std::collections::BTreeMap<u8, Vec<(u16, u8)>>> {
     let num_titles = be_u16(vmg_data, tt_srpt_offset)? as usize;
     if num_titles > MAX_TT_SRPT_TITLES {
         tracing::warn!(
+            target: "freemkv::scan",
             declared = num_titles,
             cap = MAX_TT_SRPT_TITLES,
             "TT_SRPT title count exceeds the DVD-Video maximum, clamping"
@@ -499,7 +500,8 @@ fn parse_tt_srpt(
         let vts_number = byte_at(vmg_data, base + 6)?;
         let vts_title_num = byte_at(vmg_data, base + 7)?;
 
-        if vts_number == 0 {
+        // Both numbers are 1-based; a 0 title number would alias title 1's PGC.
+        if vts_number == 0 || vts_title_num == 0 {
             continue; // invalid
         }
         if !seen.insert((vts_number, vts_title_num)) {
@@ -517,7 +519,7 @@ fn parse_tt_srpt(
 
 // ── VTS parser ──────────────────────────────────────────────────────────────
 
-/// Parse VTS_XX_0.IFO for one title set.
+/// Parse VTS_XX_0.IFO for one title set, falling back to its VTS_XX_0.BUP copy.
 ///
 /// `titles_info` is a list of (chapter_count, vts_title_number) from TT_SRPT.
 fn parse_vts(
@@ -527,7 +529,34 @@ fn parse_vts(
     titles_info: &[(u16, u8)],
 ) -> Result<DvdTitleSet> {
     let path = format!("/VIDEO_TS/VTS_{vts_number:02}_0.IFO");
-    let vts_data = udf.read_file(reader, &path)?;
+    let err = match parse_vts_file(reader, udf, &path, &path, vts_number, titles_info) {
+        Ok(ts) => return Ok(ts),
+        Err(Error::Halted) => return Err(Error::Halted),
+        Err(e) => e,
+    };
+    let bup = format!("/VIDEO_TS/VTS_{vts_number:02}_0.BUP");
+    match parse_vts_file(reader, udf, &bup, &path, vts_number, titles_info) {
+        Ok(ts) => {
+            tracing::warn!(target: "freemkv::scan", vts = vts_number, code = err.code(), "VTS IFO bad; using BUP");
+            Ok(ts)
+        }
+        Err(Error::Halted) => Err(Error::Halted),
+        Err(_) => Err(err),
+    }
+}
+
+// Parses the IFO bytes at `src` (IFO or BUP). Cell sectors are relative to the IFO's LBA, so
+// `ifo_path` anchors the title VOBS even when the bytes come from the BUP.
+fn parse_vts_file(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    src: &str,
+    ifo_path: &str,
+    vts_number: u8,
+    titles_info: &[(u16, u8)],
+) -> Result<DvdTitleSet> {
+    let path = ifo_path;
+    let vts_data = udf.read_file(reader, src)?;
 
     // Validate VTS magic
     if vts_data.len() < 12 || &vts_data[0..12] != VTS_MAGIC {
@@ -543,6 +572,7 @@ fn parse_vts(
     // spec (the VTSI management table). The offsets are constant; the sector
     // values they point to are per-disc.
     const VTSTT_VOBS_OFFSET: usize = 0xC4; // VTS title VOBS start sector (feature)
+    const VTS_PTT_SRPT_OFFSET: usize = 0xC8; // VTS_PTT_SRPT sector pointer
     const VTS_PGCIT_OFFSET: usize = 0xCC; // VTS_PGCIT sector pointer
 
     // VTS_PGCIT sector pointer
@@ -552,7 +582,7 @@ fn parse_vts(
     // are relative to (offset 0xC0/`vtsm_vobs` is the *menu* VOBS, not the movie).
     // It's relative to this IFO file, so rebase by the IFO's on-disc LBA (UDF FS).
     let vtstt_vobs = be_u32(&vts_data, VTSTT_VOBS_OFFSET)?;
-    let ifo_lba = udf.file_start_lba(reader, &path)?;
+    let ifo_lba = udf.file_start_lba(reader, path)?;
     let vob_start_sector = ifo_lba.saturating_add(vtstt_vobs);
 
     // Video attributes at offset 0x200 (2 bytes)
@@ -590,7 +620,11 @@ fn parse_vts(
     let pgcit_offset = (pgcit_sector as usize)
         .checked_mul(SECTOR_BYTES)
         .ok_or(Error::IfoParse)?;
-    let titles = parse_pgcit(&vts_data, pgcit_offset, titles_info)?;
+    // PTT_SRPT maps each title number to its PGC; sector 0 means absent.
+    let ptt_offset = (be_u32(&vts_data, VTS_PTT_SRPT_OFFSET)? as usize)
+        .checked_mul(SECTOR_BYTES)
+        .ok_or(Error::IfoParse)?;
+    let titles = parse_pgcit(&vts_data, pgcit_offset, ptt_offset, titles_info)?;
 
     Ok(DvdTitleSet {
         vts_number,
@@ -762,10 +796,31 @@ fn dvd_lang_to_iso639_2(raw: &str) -> String {
 
 // ── PGC parser ──────────────────────────────────────────────────────────────
 
+// 0-based PGC index of title `ttn`'s first part-of-title, from VTS_PTT_SRPT at `ptt_offset`
+// (count, reserved, last byte, u32 offsets to (pgcn, pgn) entries); None if absent/unusable.
+fn ptt_srpt_pgc_index(data: &[u8], ptt_offset: usize, ttn: u8) -> Option<usize> {
+    if ptt_offset == 0 || ttn == 0 {
+        return None;
+    }
+    let count = be_u16(data, ptt_offset).ok()? as usize;
+    let last_byte = be_u32(data, ptt_offset + 4).ok()? as usize;
+    if ttn as usize > count {
+        return None;
+    }
+    let rel = be_u32(data, ptt_offset + 8 + (ttn as usize - 1) * 4).ok()? as usize;
+    if rel.checked_add(4)? > last_byte.checked_add(1)? {
+        return None; // title has no PTT entry inside the table
+    }
+    let pgcn = be_u16(data, ptt_offset.checked_add(rel)?).ok()? as usize;
+    pgcn.checked_sub(1)
+}
+
 /// Parse VTS_PGCIT (Program Chain Information Table) to extract titles.
-fn parse_pgcit(
+/// `ptt_offset` is the VTS_PTT_SRPT byte offset (0 = absent).
+pub(crate) fn parse_pgcit(
     data: &[u8],
     pgcit_offset: usize,
+    ptt_offset: usize,
     titles_info: &[(u16, u8)],
 ) -> Result<Vec<DvdTitle>> {
     if pgcit_offset + 8 > data.len() {
@@ -784,8 +839,11 @@ fn parse_pgcit(
     let mut skipped = 0usize;
 
     for &(chapter_count, vts_title_num) in titles_info {
-        // VTS title numbers are 1-based; map to PGC index (typically 1:1)
-        let pgc_index = vts_title_num.saturating_sub(1) as usize;
+        // TTN -> PGC goes through PTT_SRPT; without it (or when its PGCN is past the
+        // table) assume 1:1 (TTN is 1-based).
+        let pgc_index = ptt_srpt_pgc_index(data, ptt_offset, vts_title_num)
+            .filter(|&i| i < num_pgcs as usize)
+            .unwrap_or(vts_title_num.saturating_sub(1) as usize);
         if pgc_index >= num_pgcs as usize {
             skipped += 1;
             tracing::warn!(
@@ -854,7 +912,7 @@ fn parse_pgcit(
 }
 
 /// Parse a single PGC (Program Chain) to extract duration and cells.
-fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> {
+pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> {
     // PGC needs at least 0xE8 bytes for the cell playback info offset
     if pgc_offset + 0xEA > data.len() {
         return Err(Error::IfoParse);
@@ -893,18 +951,18 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         }
     }
 
-    // Recalculate duration from cell times if PGC-level time is zero
-    let duration_secs = if duration_secs == 0.0 && !cells.is_empty() && cell_playback_offset > 0 {
-        let cell_base = pgc_offset + cell_playback_offset;
-        let mut total = 0.0;
-        for i in 0..cells.len() {
-            // Cell playback info: 24 bytes per cell, BCD time at offset 4-7
-            let co = cell_base + i * 24;
-            if co + 8 <= data.len() {
-                total += bcd_to_secs(&data[co + 4..co + 8]);
-            }
-        }
-        total
+    if cells.len() < num_cells {
+        tracing::warn!(
+            target: "freemkv::scan",
+            declared = num_cells,
+            kept = cells.len(),
+            "PGC cell table runs past the IFO; its title keeps only the leading cells"
+        );
+    }
+
+    // Recalculate duration from cell times if PGC-level time is zero.
+    let duration_secs = if duration_secs == 0.0 && !cells.is_empty() {
+        cells.iter().map(|c| c.duration_secs).sum()
     } else {
         duration_secs
     };
@@ -1181,65 +1239,6 @@ mod tests {
         assert!(be_u16(&data, 1).is_ok());
         assert!(be_u16(&data, 2).is_err()); // only 1 byte left
         assert!(be_u32(&data, 0).is_err()); // only 3 bytes
-    }
-
-    #[test]
-    fn struct_construction() {
-        let cell = DvdCell {
-            first_sector: 100,
-            last_sector: 200,
-            category: 0,
-            duration_secs: 0.0,
-        };
-        assert_eq!(cell.first_sector, 100);
-        assert_eq!(cell.last_sector, 200);
-
-        let title = DvdTitle {
-            chapters: 5,
-            duration_secs: 3600.0,
-            cells: vec![cell.clone()],
-            chapter_times: Vec::new(),
-            palette: None,
-            ast_ctl: [0; 8],
-            spst_ctl: [0; 32],
-            vts_title_num: 0,
-        };
-        assert_eq!(title.chapters, 5);
-        assert!((title.duration_secs - 3600.0).abs() < 0.01);
-        assert_eq!(title.cells.len(), 1);
-
-        let video = DvdVideoAttr {
-            codec: Codec::Mpeg2,
-            resolution: Resolution::R480i,
-            aspect: DvdAspect::R16x9,
-            standard: TvSystem::Ntsc,
-        };
-        assert_eq!(video.codec, Codec::Mpeg2);
-
-        let audio = DvdAudioAttr {
-            codec: Codec::Ac3,
-            channels: 6,
-            sample_rate: 48000,
-            language: "en".to_string(),
-            mpeg_ext: false,
-        };
-        assert_eq!(audio.channels, 6);
-
-        let ts = DvdTitleSet {
-            vts_number: 1,
-            vob_start_sector: 512,
-            video,
-            audio_streams: vec![audio],
-            subtitle_streams: Vec::new(),
-            titles: vec![title],
-        };
-        assert_eq!(ts.vts_number, 1);
-        assert_eq!(ts.audio_streams.len(), 1);
-
-        let info = DvdInfo {
-            title_sets: vec![ts],
-        };
-        assert_eq!(info.title_sets.len(), 1);
     }
 
     /// mpucoder PGC_SPST_CTL: "Stream number for 4:3", "for wide", "for letterbox", "for
@@ -1654,14 +1653,20 @@ mod tests {
         assert_eq!(attr.language, "und");
     }
 
-    /// Audio sample_rate flag (b0>>3 & 0x03): 0=48kHz, 1=96kHz, else 48kHz.
-    /// Verify flag 2/3 fall back to 48kHz (catch-all).
+    /// Audio sample_rate flag (byte 1 bits 5-4): 0=48kHz, 1=96kHz, 2/3 reserved -> 48kHz.
     #[test]
     fn audio_attr_reserved_rate_defaults_48k() {
-        let mut data = vec![0u8; 8];
-        data[0] = 0b0001_0000; // sample-rate flag (bits 4-3) = 0b10
-        let attr = parse_audio_attr(&data, 0).unwrap();
-        assert_eq!(attr.sample_rate, 48000);
+        for (b1, want) in [(0b0000_0000u8, 48000), (0b0001_0000, 96000)] {
+            let mut data = vec![0u8; 8];
+            data[1] = b1;
+            assert_eq!(parse_audio_attr(&data, 0).unwrap().sample_rate, want);
+        }
+        for b1 in [0b0010_0000u8, 0b0011_0000] {
+            let mut data = vec![0u8; 8];
+            data[1] = b1;
+            let attr = parse_audio_attr(&data, 0).unwrap();
+            assert_eq!(attr.sample_rate, 48000, "b1={b1:#010b}");
+        }
     }
 
     /// Subtitle language is at [offset+2..+4]. Verify a valid 2-letter code
@@ -2501,18 +2506,18 @@ mod tests {
         let data = build_pgcit(&[pgc0, pgc1]);
 
         // vts_title_num is 1-based: title 2 → PGC index 1.
-        let titles = parse_pgcit(&data, 0, &[(5, 2)]).unwrap();
+        let titles = parse_pgcit(&data, 0, 0, &[(5, 2)]).unwrap();
         assert_eq!(titles.len(), 1);
         assert_eq!(titles[0].duration_secs, 22.022);
         assert_eq!(titles[0].cells[0].first_sector, 50);
 
-        let titles = parse_pgcit(&data, 0, &[(5, 1)]).unwrap();
+        let titles = parse_pgcit(&data, 0, 0, &[(5, 1)]).unwrap();
         assert_eq!(titles.len(), 1);
         assert_eq!(titles[0].duration_secs, 11.011);
         assert_eq!(titles[0].cells[0].first_sector, 0);
 
         // Both titles, in order.
-        let titles = parse_pgcit(&data, 0, &[(5, 1), (7, 2)]).unwrap();
+        let titles = parse_pgcit(&data, 0, 0, &[(5, 1), (7, 2)]).unwrap();
         assert_eq!(titles.len(), 2);
         assert_eq!(titles[0].duration_secs, 11.011);
         assert_eq!(titles[1].duration_secs, 22.022);
@@ -2524,11 +2529,11 @@ mod tests {
     #[test]
     fn pgcit_header_boundary() {
         let data = vec![0u8; 8];
-        let titles = parse_pgcit(&data, 0, &[(5, 1)]).expect("complete header parses");
+        let titles = parse_pgcit(&data, 0, 0, &[(5, 1)]).expect("complete header parses");
         assert!(titles.is_empty());
         for len in 0..8usize {
             assert!(
-                parse_pgcit(&vec![0u8; len], 0, &[(5, 1)]).is_err(),
+                parse_pgcit(&vec![0u8; len], 0, 0, &[(5, 1)]).is_err(),
                 "len={len}"
             );
         }
@@ -2543,7 +2548,7 @@ mod tests {
         // entry for PGC index 2 (offset 24..32) is entirely past the end.
         let mut data = vec![0u8; 20];
         data[0..2].copy_from_slice(&3u16.to_be_bytes());
-        let titles = parse_pgcit(&data, 0, &[(5, 3)])
+        let titles = parse_pgcit(&data, 0, 0, &[(5, 3)])
             .expect("a truncated SRP entry is skipped, not an error");
         assert!(titles.is_empty());
     }
@@ -2672,5 +2677,303 @@ mod tests {
             "a declared count of u16::MAX over {PRESENT} real entries must be \
              clamped to {MAX_TT_SRPT_TITLES}, got {total}"
         );
+    }
+
+    // ── Review-round tests: PTT_SRPT, angles, chapter rates, VMG/VTS ─────
+
+    /// VTS_TTN is 1-based: an entry carrying title number 0 would alias title 1.
+    #[test]
+    fn tt_srpt_skips_title_number_zero() {
+        let vmg = vmg_with_tt_srpt(1, &[(9, 1, 0), (4, 1, 1)]);
+        let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+        assert_eq!(map[&1], vec![(4, 1)], "the title-number-0 entry is dropped");
+    }
+
+    // PTT_SRPT bytes: header, one u32 offset per title, then one (pgcn, pgn) entry per title.
+    fn build_ptt_srpt(pgcn_per_title: &[u16]) -> Vec<u8> {
+        let n = pgcn_per_title.len();
+        let total = 8 + n * 4 + n * 4;
+        let mut d = vec![0u8; total];
+        d[0..2].copy_from_slice(&(n as u16).to_be_bytes());
+        d[4..8].copy_from_slice(&((total - 1) as u32).to_be_bytes());
+        for (i, &pgcn) in pgcn_per_title.iter().enumerate() {
+            let entry = 8 + n * 4 + i * 4;
+            d[8 + i * 4..12 + i * 4].copy_from_slice(&(entry as u32).to_be_bytes());
+            d[entry..entry + 2].copy_from_slice(&pgcn.to_be_bytes());
+            d[entry + 2..entry + 4].copy_from_slice(&1u16.to_be_bytes());
+        }
+        d
+    }
+
+    /// TTN -> PGC goes through VTS_PTT_SRPT, not "TTN N is PGCIT entry N"; the PGCIT
+    /// sits at a NON-ZERO offset so the pgcit base term is exercised, and the real TTN
+    /// is stamped on each title (disc/dvd.rs joins on it).
+    #[test]
+    fn pgcit_maps_title_numbers_through_ptt_srpt() {
+        let pgc0 = build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None);
+        let pgc1 = build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None);
+        let pgcit = build_pgcit(&[pgc0, pgc1]);
+        let pgcit_at = 512usize;
+        let mut data = vec![0u8; pgcit_at];
+        data.extend_from_slice(&pgcit);
+        let ptt_at = data.len();
+        // Title 1 -> PGC 2, title 2 -> PGC 1, title 3 -> PGC 2 (past... TTN > num_pgcs).
+        data.extend_from_slice(&build_ptt_srpt(&[2, 1, 2]));
+
+        let titles = parse_pgcit(&data, pgcit_at, ptt_at, &[(5, 1), (6, 2), (7, 3)]).unwrap();
+        let got: Vec<(u8, f64)> = titles
+            .iter()
+            .map(|t| (t.vts_title_num, t.duration_secs))
+            .collect();
+        assert_eq!(got, vec![(1, 22.022), (2, 11.011), (3, 22.022)]);
+
+        // No PTT_SRPT (offset 0), or a PGCN of 0: fall back to the 1:1 assumption.
+        let titles = parse_pgcit(&data, pgcit_at, 0, &[(5, 1)]).unwrap();
+        assert_eq!(titles[0].duration_secs, 11.011);
+        let mut bad = data.clone();
+        let entry = ptt_at + 8 + 3 * 4; // title 1's (pgcn, pgn)
+        bad[entry..entry + 2].copy_from_slice(&0u16.to_be_bytes());
+        let titles = parse_pgcit(&bad, pgcit_at, ptt_at, &[(5, 1)]).unwrap();
+        assert_eq!(titles[0].duration_secs, 11.011);
+    }
+
+    /// A PTT_SRPT PGCN past the table falls back to the 1:1 mapping, not a dropped title.
+    #[test]
+    fn pgcit_ptt_pgcn_past_table_falls_back_to_one_to_one() {
+        let pgc0 = build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None);
+        let pgc1 = build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None);
+        let pgcit = build_pgcit(&[pgc0, pgc1]);
+        let pgcit_at = 512usize;
+        let mut data = vec![0u8; pgcit_at];
+        data.extend_from_slice(&pgcit);
+        let ptt_at = data.len();
+        data.extend_from_slice(&build_ptt_srpt(&[9, 9]));
+        let titles = parse_pgcit(&data, pgcit_at, ptt_at, &[(5, 1), (6, 2)]).unwrap();
+        let got: Vec<f64> = titles.iter().map(|t| t.duration_secs).collect();
+        assert_eq!(got, vec![11.011, 22.022]);
+    }
+
+    /// A title number past num_pgcs is dropped, even when an in-buffer 8-byte
+    /// "entry" happens to sit at that index.
+    #[test]
+    fn pgcit_title_past_num_pgcs_is_dropped() {
+        let pgc0 = build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None);
+        let pgc1 = build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None);
+        let mut data = build_pgcit(&[pgc0.clone(), pgc0.clone()]);
+        // Entry index 2 lands inside PGC 0's bytes; make it point at a valid PGC.
+        let pgc1_at = data.len();
+        data.extend_from_slice(&pgc1);
+        data[28..32].copy_from_slice(&(pgc1_at as u32).to_be_bytes());
+        let titles = parse_pgcit(&data, 0, 0, &[(5, 3)]).unwrap();
+        assert!(titles.is_empty(), "TTN 3 of a 2-PGC table must be omitted");
+    }
+
+    /// Cells with no rate flag fall back to literal seconds; in a mixed-rate PGC the
+    /// first rate seen wins for every frame count.
+    #[test]
+    fn pgc_chapter_times_unknown_and_mixed_rates() {
+        let unknown = |secs: u8| [0, 0, secs, 0];
+        let pgc = build_pgc(
+            bcd_secs(59),
+            &[
+                (0x00, unknown(0x10), 0, 9),
+                (0x00, bcd_secs(20), 10, 19),
+                (0x00, unknown(0x05), 20, 29),
+            ],
+            &[1, 2, 3],
+            None,
+        );
+        let t = parse_pgc(&pgc, 0, 3).unwrap();
+        let want = [0.0, 10.0, 30.02];
+        for (g, w) in t.chapter_times.iter().zip(want) {
+            assert!(
+                (g - w).abs() < 1e-9,
+                "unknown-rate chapters {:?}",
+                t.chapter_times
+            );
+        }
+        // PAL (25 fps) cell first, then NTSC cells: everything is read at the PAL rate.
+        let pal10 = [0, 0, 0x10, 0b01_000000];
+        let pgc = build_pgc(
+            bcd_secs(59),
+            &[
+                (0x00, pal10, 0, 9),
+                (0x00, bcd_secs(20), 10, 19),
+                (0x00, bcd_secs(10), 20, 29),
+            ],
+            &[1, 3],
+            None,
+        );
+        let t = parse_pgc(&pgc, 0, 2).unwrap();
+        // (250 + 600) frames at 1/25 s.
+        assert!(
+            (t.chapter_times[1] - 34.0).abs() < 1e-9,
+            "{:?}",
+            t.chapter_times
+        );
+    }
+
+    // ── VMG / VTS through a real UDF image ───────────────────────────────
+
+    use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+
+    // A VTS_XX_0.IFO: header at sector 0, PGCIT at sector 2, optional PTT_SRPT at sector 3.
+    fn build_vts_ifo(audio: u16, subs: u16, pgcs: &[Vec<u8>], ptt: Option<&[u16]>) -> Vec<u8> {
+        let mut d = vec![0u8; 4 * 2048];
+        d[0..12].copy_from_slice(VTS_MAGIC);
+        d[0xC4..0xC8].copy_from_slice(&7u32.to_be_bytes()); // vtstt_vobs
+        d[0xCC..0xD0].copy_from_slice(&2u32.to_be_bytes()); // PGCIT sector
+        d[0x202..0x204].copy_from_slice(&audio.to_be_bytes());
+        d[0x254..0x256].copy_from_slice(&subs.to_be_bytes());
+        let pgcit = build_pgcit(pgcs);
+        d[2 * 2048..2 * 2048 + pgcit.len()].copy_from_slice(&pgcit);
+        if let Some(p) = ptt {
+            d[0xC8..0xCC].copy_from_slice(&3u32.to_be_bytes());
+            let t = build_ptt_srpt(p);
+            d[3 * 2048..3 * 2048 + t.len()].copy_from_slice(&t);
+        }
+        d
+    }
+
+    fn video_ts_disc(files: Vec<(&str, Vec<u8>)>) -> (MemDisc, UdfFs) {
+        let files = files
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, c))| file_with(n, 30 + i as u32, 5000 + 100 * i as u32, c, false))
+            .collect();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    fn one_pgc() -> Vec<Vec<u8>> {
+        vec![build_pgc(
+            bcd_secs(22),
+            &[(0x00, bcd_secs(22), 50, 59)],
+            &[],
+            None,
+        )]
+    }
+
+    /// The 8 audio / 32 subtitle stream caps, the ptt pointer at 0xC8 and the vob
+    /// start rebase, all through parse_vts.
+    #[test]
+    fn parse_vts_caps_streams_and_reads_ptt_and_vob_start() {
+        let two = vec![
+            build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None),
+            build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None),
+        ];
+        let ifo = build_vts_ifo(0xFFFF, 0xFFFF, &two, Some(&[2]));
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", ifo)]);
+        let ts = parse_vts(&mut disc, &udf, 1, &[(5, 1)]).expect("vts parses");
+        assert_eq!(ts.audio_streams.len(), 8);
+        assert_eq!(ts.subtitle_streams.len(), 32);
+        let lba = udf
+            .file_start_lba(&mut disc, "/VIDEO_TS/VTS_01_0.IFO")
+            .unwrap();
+        assert_eq!(ts.vob_start_sector, lba + 7);
+        assert_eq!(ts.titles[0].duration_secs, 22.022, "TTN 1 -> PGC 2 via PTT");
+    }
+
+    #[test]
+    fn parse_vts_rejects_bad_magic_and_short_files() {
+        let mut bad_magic = build_vts_ifo(0, 0, &one_pgc(), None);
+        bad_magic[0] = b'X';
+        let short = bad_magic[..0x100].to_vec();
+        let mut short_ok_magic = short.clone();
+        short_ok_magic[0..12].copy_from_slice(VTS_MAGIC);
+        let (mut disc, udf) = video_ts_disc(vec![
+            ("VTS_01_0.IFO", bad_magic),
+            ("VTS_02_0.IFO", short_ok_magic),
+        ]);
+        for n in [1u8, 2] {
+            let r = parse_vts(&mut disc, &udf, n, &[(5, 1)]);
+            assert!(matches!(r, Err(Error::IfoParse)), "vts {n}: {r:?}");
+        }
+    }
+
+    fn vmg_at_sector(sector: u32, entries: &[(u16, u8, u8)]) -> Vec<u8> {
+        vmg_with_tt_srpt(sector, entries)
+    }
+
+    /// parse_vmg_with reads the TT_SRPT pointer at 0xC4 as a SECTOR offset, guards
+    /// magic/length/bounds, and skips a title set whose IFO is missing.
+    #[test]
+    fn parse_vmg_with_reads_sector_pointer_and_skips_failed_title_sets() {
+        let vts = build_vts_ifo(1, 1, &one_pgc(), None);
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", vts)]);
+        // Sector 3 (not 1): a byte-offset or wrong-field read would find nothing.
+        let vmg = vmg_at_sector(3, &[(5, 1, 1), (5, 2, 1)]);
+        let info = parse_vmg_with(&mut disc, &udf, Some(&vmg)).expect("vmg parses");
+        assert_eq!(info.title_sets.len(), 1, "VTS 2 has no IFO: skipped");
+        assert_eq!(info.title_sets[0].vts_number, 1);
+        assert_eq!(info.title_sets[0].titles[0].vts_title_num, 1);
+
+        let mut bad_magic = vmg.clone();
+        bad_magic[0] = b'X';
+        let short = vmg[..0xC7].to_vec();
+        let mut oob = vmg.clone();
+        oob[0xC4..0xC8].copy_from_slice(&1000u32.to_be_bytes());
+        let mut huge = vmg.clone();
+        huge[0xC4..0xC8].copy_from_slice(&u32::MAX.to_be_bytes());
+        for (name, v) in [
+            ("magic", bad_magic),
+            ("short", short),
+            ("oob", oob),
+            ("huge", huge),
+        ] {
+            let r = parse_vmg_with(&mut disc, &udf, Some(&v));
+            assert!(matches!(r, Err(Error::IfoParse)), "{name}: {r:?}");
+        }
+    }
+
+    // Reader that reports a halt once armed.
+    struct HaltingDisc {
+        inner: MemDisc,
+        halted: bool,
+    }
+    impl SectorSource for HaltingDisc {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            if self.halted {
+                return Err(Error::Halted);
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    /// A halted drive is not a placeholder title set: Halted propagates instead of
+    /// silently truncating the scan.
+    #[test]
+    fn parse_vmg_with_propagates_halted() {
+        let vts = build_vts_ifo(0, 0, &one_pgc(), None);
+        let (disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", vts)]);
+        let mut reader = HaltingDisc {
+            inner: disc,
+            halted: true,
+        };
+        let vmg = vmg_at_sector(1, &[(5, 1, 1)]);
+        let r = parse_vmg_with(&mut reader, &udf, Some(&vmg));
+        assert!(matches!(r, Err(Error::Halted)), "got {r:?}");
     }
 }

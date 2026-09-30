@@ -273,14 +273,7 @@ impl CodecParser for H264Parser {
                         }
                     }
                     saw_vcl |= is_slice;
-                    // A NAL longer than u32::MAX can't be length-prefixed in the
-                    // 4-byte field; skip it rather than mis-frame the output.
-                    // Unreachable in practice (no real AU is >4 GiB).
-                    let Ok(len) = u32::try_from(nal.len()) else {
-                        continue;
-                    };
-                    frame_data.extend_from_slice(&len.to_be_bytes());
-                    frame_data.extend_from_slice(nal);
+                    push_length_prefixed(&mut frame_data, nal);
                 }
             }
         }
@@ -536,8 +529,9 @@ pub(crate) struct SpsDtsInfo {
 }
 
 // Profiles whose SPS carries chroma_format_idc, bit depths and scaling lists (H.264 §7.3.2.1.1).
-const SPS_CHROMA_PROFILES: [u32; 13] =
-    [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+const SPS_CHROMA_PROFILES: [u32; 14] = [
+    100, 110, 122, 144, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+];
 
 // Intra profiles when constraint_set3_flag = 1: no reordering (design §2.3 step 2, H.264 E.2.1 [I]).
 const INTRA_PROFILES: [u32; 6] = [44, 86, 100, 110, 122, 244];
@@ -908,6 +902,36 @@ mod tests {
         );
     }
 
+    // The escaped slice header must be unescaped at the parse call site: a second slice with
+    // first_mb_in_slice=65535 (00 00 03 escape) is intra only when read unescaped.
+    #[test]
+    fn parse_unescapes_later_slice_header_before_reading_it() {
+        let au = vec![
+            0x00, 0x00, 0x01, 0x61, 0x88, 0x00, // slice 1: first_mb=0, I
+            0x00, 0x00, 0x01, 0x61, 0x00, 0x00, 0x03, 0x80, 0x00, 0x30, // slice 2: 65535, I
+        ];
+        let mut parser = H264Parser::new();
+        let frames = parser.parse(&make_pes(au, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].keyframe,
+            "every slice reads intra only if the escape byte is removed"
+        );
+    }
+
+    // The gap flag on a PES must reach the frame, or the resync gate never arms for H.264.
+    #[test]
+    fn pes_discontinuity_propagates_to_frame() {
+        let au = vec![0x00, 0x00, 0x01, 0x61, 0x88, 0x00];
+        for flag in [true, false] {
+            let mut pes = make_pes(au.clone(), Some(0));
+            pes.discontinuity = flag;
+            let frames = H264Parser::new().parse(&pes);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].discontinuity, flag);
+        }
+    }
+
     // Guard the promotion's precision: a non-intra (P) AU must NOT become a
     // keyframe, or resync would resume on inter-referenced dropped data.
     #[test]
@@ -1147,9 +1171,11 @@ mod tests {
         for i in 0..30i64 {
             let au = annexb(0x65, &vec![0x88u8; 300_000]);
             let f = parser.parse(&make_pes(au, Some(3600 * (i + 1))));
-            // The re-assert really happened (otherwise the count is vacuously 0).
-            assert!(
-                f[0].data.len() > 300_000,
+            // The re-assert really happened (otherwise the count is vacuously 0):
+            // length-prefixed slice + SPS (4+1+body) + PPS (4+1+2).
+            assert_eq!(
+                f[0].data.len(),
+                (4 + 1 + 300_000) + (4 + 1 + big_sps.len()) + (4 + 1 + 2),
                 "keyframe {i} must carry the re-asserted parameter sets"
             );
         }
@@ -2126,6 +2152,20 @@ mod tests {
         sps
     }
 
+    #[test]
+    fn dts_info_walks_chroma_block_for_profile_144() {
+        // sps_id 0, chroma 1, depths 0/0, no bypass/scaling, log2_max_frame_num_minus4 0,
+        // poc type 2, 1 ref, no gaps, 1x1 MB, frame_mbs_only, direct8x8, no crop/VUI, stop.
+        let bits = "1010110010110100111100 1".replace(' ', "");
+        let mut bytes = vec![0x67, 144, 0x00, 0x28];
+        let padded = format!("{bits:0<32}");
+        for c in padded.as_bytes().chunks(8) {
+            bytes.push(u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap());
+        }
+        let info = parse_sps_dts_info(&bytes).expect("sps parses");
+        assert_eq!(info.log2_max_frame_num, 4);
+    }
+
     fn feed_sps_pps(parser: &mut H264Parser, sps_bytes: &[u8]) {
         // Feed a PES containing: custom SPS + a minimal PPS + an IDR slice.
         let mut data = Vec::new();
@@ -2197,8 +2237,9 @@ mod tests {
     /// extension bytes.
     #[test]
     fn avcc_high_profile_extension_carries_correct_values() {
-        // profile_idc=100, chroma_format_idc=3 (4:4:4), depth_luma=2, depth_chroma=2.
-        let sps = build_high_profile_sps(100, 3, 2, 2);
+        // profile_idc=100, chroma_format_idc=3 (4:4:4), depth_luma=2, depth_chroma=5
+        // (unequal, so a luma/chroma swap shows).
+        let sps = build_high_profile_sps(100, 3, 2, 5);
         let mut parser = H264Parser::new();
         feed_sps_pps(&mut parser, &sps);
 
@@ -2209,8 +2250,8 @@ mod tests {
         assert_eq!(cp[ext_off + 1] & 0x07, 2, "bit_depth_luma_minus8 must be 2");
         assert_eq!(
             cp[ext_off + 2] & 0x07,
-            2,
-            "bit_depth_chroma_minus8 must be 2"
+            5,
+            "bit_depth_chroma_minus8 must be 5"
         );
         assert_eq!(
             cp[ext_off + 3],

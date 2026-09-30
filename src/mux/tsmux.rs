@@ -371,7 +371,7 @@ impl<W: Write> TsMuxer<W> {
                 pts: pts_90k,
                 dts: dts_90k,
             };
-            self.write_pes_chain(track, pid, times, is_video, keyframe, es_data)
+            self.write_pes_chain(track, times, is_video, keyframe, es_data)
         } else {
             let mut first_pes = true;
             let mut res = Ok(());
@@ -384,8 +384,7 @@ impl<W: Write> TsMuxer<W> {
                 } else {
                     PesTimes::None
                 };
-                res =
-                    self.write_pes_chain(track, pid, times, is_video, keyframe && first_pes, chunk);
+                res = self.write_pes_chain(track, times, is_video, keyframe && first_pes, chunk);
                 if res.is_err() {
                     break;
                 }
@@ -408,12 +407,12 @@ impl<W: Write> TsMuxer<W> {
     fn write_pes_chain(
         &mut self,
         track: usize,
-        pid: u16,
         times: PesTimes,
         is_video: bool,
         keyframe: bool,
         es_data: &[u8],
     ) -> io::Result<()> {
+        let pid = self.pids[track];
         let pes_header = build_pes_header(pid, times, es_data.len());
 
         // Logical PES packet = header bytes followed by es_data. It is
@@ -552,6 +551,14 @@ impl<W: Write> TsMuxer<W> {
         }
         if self.frame_count == 0 {
             return Err(crate::error::Error::MuxEmpty.into());
+        }
+        for (t, armed) in self.arrival_armed.iter().enumerate() {
+            if is_video_pid(self.pids[t]) && !armed {
+                tracing::warn!(
+                    track = t,
+                    "bd-ts: video track never saw a keyframe; no video written"
+                );
+            }
         }
         self.writer.flush()
     }

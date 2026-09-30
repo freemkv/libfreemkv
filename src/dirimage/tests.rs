@@ -347,6 +347,37 @@ fn a_file_that_shrinks_after_planning_fails_the_read() {
     assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FILE_CHANGED);
 }
 
+/// Bump a file's mtime by a minute without changing its length.
+fn touch_later(path: &std::path::Path) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let t = f.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+    f.set_modified(t).unwrap();
+}
+
+/// An IFO rewritten in place at the SAME length still moves VOB placement, so a later
+/// mtime must fail the read; a same-length, later-mtime VOB (size-only check) must not.
+#[test]
+fn an_ifo_rewritten_at_the_same_length_fails_but_a_touched_vob_does_not() {
+    let s = Scratch::new("ifo-mtime");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 1));
+    s.file("VIDEO_TS/VTS_01_1.VOB", &pattern(1, SECTOR));
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let ext = |img: &mut DirImage, p: &str| fs.file_extents(img, p).unwrap()[0];
+    let (ifo_lba, _) = ext(&mut img, "/VIDEO_TS/VTS_01_0.IFO");
+    let (vob_lba, _) = ext(&mut img, "/VIDEO_TS/VTS_01_1.VOB");
+    let mut buf = vec![0u8; SECTOR];
+
+    touch_later(&s.path().join("VIDEO_TS/VTS_01_1.VOB"));
+    img.read_sectors(vob_lba, 1, &mut buf, false)
+        .expect("size-only files ignore mtime");
+
+    touch_later(&s.path().join("VIDEO_TS/VTS_01_0.IFO"));
+    let err = img.read_sectors(ifo_lba, 1, &mut buf, false).unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FILE_CHANGED);
+}
+
 // ── DVD placement ───────────────────────────────────────────────────────────
 
 /// Build a `VTS_01_0.IFO` body whose VOB pointers are the given sector
@@ -1119,5 +1150,355 @@ fn read_structure_files_propagates_halt() {
         matches!(res, Err(crate::error::Error::Halted)),
         "got {:?}",
         res.map(|f| f.len())
+    );
+}
+
+// ── Audit fixes: planning edge cases ────────────────────────────────────────
+
+/// A symlink skipped from the image must not take part in the case-collision check.
+#[cfg(unix)]
+#[test]
+fn a_skipped_symlink_does_not_collide_with_a_same_name_file() {
+    let (s, _, _) = bdmv_scratch();
+    // The reader trims the leading space, so both names read back as `A.M2TS`.
+    s.file("BDMV/STREAM/A.M2TS", b"x");
+    std::os::unix::fs::symlink("/nonexistent-target", s.path().join("BDMV/STREAM/ A.M2TS"))
+        .unwrap();
+    DirImage::open(s.path()).expect("dangling symlink is omitted, not a collision");
+}
+
+/// A directory whose FID list exceeds the UDF reader's cap is refused at plan time, by name.
+#[test]
+fn an_over_wide_directory_is_refused_at_plan_time() {
+    let (s, _, _) = bdmv_scratch();
+    for i in 0..24_000 {
+        s.file(&format!("BDMV/STREAM/{i:05}"), b"");
+    }
+    let err = DirImage::open(s.path()).unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FANOUT);
+    assert!(err.to_string().contains("/BDMV/STREAM"), "got {err}");
+}
+
+/// A truncated IFO is a typed error naming the file.
+#[test]
+fn a_truncated_ifo_names_the_file() {
+    let s = Scratch::new("dvdshort");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &[0u8; 8]);
+    let err = DirImage::open(s.path()).unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_PLACEMENT);
+    assert!(err.to_string().contains("VTS_01_0.IFO"), "got {err}");
+}
+
+/// A file that vanishes after planning names the file.
+#[test]
+fn a_file_removed_after_planning_names_the_file() {
+    let (s, _, _) = bdmv_scratch();
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let (lba, sectors) = fs
+        .file_extents(&mut img, "/BDMV/STREAM/00000.m2ts")
+        .unwrap()[0];
+    std::fs::remove_file(s.path().join("BDMV/STREAM/00000.m2ts")).unwrap();
+    let mut buf = vec![0u8; sectors as usize * SECTOR];
+    let err = img
+        .read_sectors(lba, sectors as u16, &mut buf, false)
+        .unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_FILE_CHANGED);
+    assert!(err.to_string().contains("00000.m2ts"), "got {err}");
+}
+
+/// UDF reserves Unique IDs 1-15; only the root may be below 16.
+#[test]
+fn synthesized_unique_ids_avoid_the_reserved_range() {
+    let (s, _, _) = bdmv_scratch();
+    let plan = layout::plan(s.path()).unwrap();
+    fn check(d: &layout::DirNode, is_root: bool) {
+        if is_root {
+            assert_eq!(d.unique_id, 0);
+        } else {
+            assert!(d.unique_id >= 16, "dir uid {}", d.unique_id);
+        }
+        for f in &d.files {
+            assert!(f.unique_id >= 16, "file uid {}", f.unique_id);
+        }
+        for s in &d.dirs {
+            check(s, false);
+        }
+    }
+    check(&plan.root, true);
+    assert!(plan.next_unique_id >= 16);
+}
+
+/// A non-ASCII folder name must read back from the UDF exactly as `volume_id()` reports it.
+#[test]
+fn a_non_ascii_volume_id_matches_what_the_reader_sees() {
+    let base = Scratch::new("vol");
+    let name = "Am\u{e9}lie (2001) Blu-ray \u{1F600}\u{1F600}";
+    base.file(&format!("{name}/BDMV/index.bdmv"), &pattern(1, 16));
+    base.file(&format!("{name}/BDMV/STREAM/00000.m2ts"), &pattern(2, 4096));
+    let mut img = DirImage::open(&base.path().join(name)).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    assert_eq!(fs.volume_id, img.volume_id());
+}
+
+/// A folder name with an emoji and a trailing space INSIDE the 15-unit cut still matches the reader.
+#[test]
+fn a_volume_id_cut_inside_emoji_or_space_matches_the_reader() {
+    for (tag, name) in [
+        ("volemoji", "Film \u{1F600} x"),
+        ("volspace", "Cr\u{e8}me br\u{fb}l\u{e9}e 1 x"),
+    ] {
+        let base = Scratch::new(tag);
+        base.file(&format!("{name}/BDMV/index.bdmv"), &pattern(1, 16));
+        base.file(&format!("{name}/BDMV/STREAM/00000.m2ts"), &pattern(2, 4096));
+        let mut img = DirImage::open(&base.path().join(name)).unwrap();
+        let fs = udf::read_filesystem(&mut img).unwrap();
+        assert_eq!(fs.volume_id, img.volume_id(), "{name}");
+    }
+}
+
+/// An unreadable (not vanished) file keeps its IoError so engine retry logic still sees it.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_is_an_io_error_not_file_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, _, _) = bdmv_scratch();
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let (lba, sectors) = fs
+        .file_extents(&mut img, "/BDMV/STREAM/00000.m2ts")
+        .unwrap()[0];
+    let p = s.path().join("BDMV/STREAM/00000.m2ts");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&p).is_ok() {
+        return; // running as root: permissions not enforced
+    }
+    let mut buf = vec![0u8; sectors as usize * SECTOR];
+    let err = img
+        .read_sectors(lba, sectors as u16, &mut buf, false)
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::IoError { .. }),
+        "expected IoError, got {err:?}"
+    );
+}
+
+/// An unreadable IFO is an IoError; only a short one is a placement error.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_ifo_is_an_io_error_not_placement() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("dvdperm");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vec![0u8; SECTOR]);
+    let p = s.path().join("VIDEO_TS/VTS_01_0.IFO");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&p).is_ok() {
+        return; // running as root: permissions not enforced
+    }
+    let err = DirImage::open(s.path()).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::IoError { .. }),
+        "expected IoError, got {err:?}"
+    );
+}
+
+// Two IFOs that parse to the same title-set group (VTS_01_0 vs VTS_1_0) must be refused, or the
+// second's constraint silently overwrites the first's.
+#[test]
+fn duplicate_group_ifos_are_refused() {
+    let s = Scratch::new("dvddup");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 0));
+    s.file("VIDEO_TS/VTS_1_0.IFO", &vts_ifo(SECTOR, 0, 0));
+    let err = DirImage::open(s.path()).expect_err("duplicate title-set IFOs");
+    assert!(
+        matches!(err, crate::error::Error::DirNameCollision { .. }),
+        "expected DirNameCollision, got {err:?}"
+    );
+}
+
+// VIDEO_TS.IFO's 0xC0 points at the VMG menu VOB; it must land exactly there.
+#[test]
+fn vmg_menu_vob_lands_at_the_ifo_0xc0_offset() {
+    let s = Scratch::new("dvdvmg");
+    let mut vmg = vec![0u8; SECTOR];
+    vmg[0xC0..0xC4].copy_from_slice(&5u32.to_be_bytes());
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vmg);
+    s.file("VIDEO_TS/VIDEO_TS.VOB", &pattern(4, SECTOR));
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let ifo = fs
+        .file_start_lba(&mut img, "/VIDEO_TS/VIDEO_TS.IFO")
+        .unwrap();
+    let vob = fs
+        .file_start_lba(&mut img, "/VIDEO_TS/VIDEO_TS.VOB")
+        .unwrap();
+    assert_eq!(vob, ifo + 5, "VMG menu VOB must sit at IFO + 0xC0");
+}
+
+fn ifo_folder(tag: &str) -> Scratch {
+    let s = Scratch::new(tag);
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 1));
+    s.file("VIDEO_TS/VTS_01_1.VOB", &pattern(1, SECTOR));
+    s
+}
+
+fn ifo_lba(img: &mut DirImage) -> u32 {
+    let fs = udf::read_filesystem(img).unwrap();
+    fs.file_start_lba(img, "/VIDEO_TS/VTS_01_0.IFO").unwrap()
+}
+
+// An IFO rewritten in place with the same size but a new mtime must be refused at read time.
+#[test]
+fn an_ifo_with_a_changed_mtime_is_refused_on_read() {
+    let s = ifo_folder("mtime");
+    let mut img = DirImage::open(s.path()).unwrap();
+    let lba = ifo_lba(&mut img);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(s.path().join("VIDEO_TS/VTS_01_0.IFO"))
+        .unwrap();
+    let t = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    f.set_modified(t).unwrap();
+    let mut buf = vec![0u8; SECTOR];
+    let err = img.read_sectors(lba, 1, &mut buf, false).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::DirImageFileChanged { .. }),
+        "expected DirImageFileChanged, got {err:?}"
+    );
+}
+
+// A file that shrinks after its handle is open surfaces as DirImageFileChanged via fill's EOF arm.
+#[test]
+fn a_file_truncated_after_open_is_reported_as_changed() {
+    let s = ifo_folder("shrink");
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let vob = fs
+        .file_start_lba(&mut img, "/VIDEO_TS/VTS_01_1.VOB")
+        .unwrap();
+    let mut buf = vec![0u8; SECTOR];
+    img.read_sectors(vob, 1, &mut buf, false).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(s.path().join("VIDEO_TS/VTS_01_1.VOB"))
+        .unwrap();
+    f.set_len(10).unwrap();
+    let err = img.read_sectors(vob, 1, &mut buf, false).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::DirImageFileChanged { .. }),
+        "expected DirImageFileChanged, got {err:?}"
+    );
+}
+
+// Independently verify every assembled descriptor's tag (checksum, CRC, CRC length, location),
+// including the FIDs of a directory large enough to span several blocks.
+#[test]
+fn every_assembled_descriptor_has_a_valid_tag() {
+    let s = Scratch::new("tags");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 1));
+    s.file("VIDEO_TS/VTS_01_1.VOB", &pattern(1, SECTOR));
+    for i in 0..150 {
+        s.file(&format!("EXTRA/a_rather_long_file_name_{i:04}.bin"), b"x");
+    }
+    let img = DirImage::open(s.path()).unwrap();
+
+    let check = |sec: &[u8], at: usize, len: usize, want_loc: u32, what: &str| {
+        let t = &sec[at..at + 16];
+        let sum = t
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 4)
+            .fold(0u8, |a, (_, b)| a.wrapping_add(*b));
+        assert_eq!(t[4], sum, "{what}: checksum");
+        let crc_len = u16::from_le_bytes([t[10], t[11]]) as usize;
+        assert_eq!(crc_len, len - 16, "{what}: CRC length");
+        let crc = u16::from_le_bytes([t[8], t[9]]);
+        let mut c = 0u16;
+        for &b in &sec[at + 16..at + 16 + crc_len] {
+            c ^= (b as u16) << 8;
+            for _ in 0..8 {
+                c = if c & 0x8000 != 0 {
+                    (c << 1) ^ 0x1021
+                } else {
+                    c << 1
+                };
+            }
+        }
+        assert_eq!(crc, c, "{what}: CRC");
+        let loc = u32::from_le_bytes([t[12], t[13], t[14], t[15]]);
+        assert_eq!(loc, want_loc, "{what}: location");
+    };
+
+    // The File Set Descriptor sits at partition block 0, which fixes the partition start.
+    let part_start = *img
+        .meta
+        .iter()
+        .find(|(_, s)| u16::from_le_bytes([s[0], s[1]]) == 256)
+        .expect("file set descriptor")
+        .0;
+    let mut dirs_seen = 0;
+    let mut multi_block_dir = false;
+    for (&lba, sec) in &img.meta {
+        let sec: &[u8] = &sec[..];
+        let id = u16::from_le_bytes([sec[0], sec[1]]);
+        // Directory-data blocks can begin mid-descriptor; only descriptors are tagged here.
+        if lba > part_start && !matches!(id, 8 | 256 | 261) {
+            continue;
+        }
+        match id {
+            // The partition's own terminating descriptor is partition-relative.
+            8 if lba > part_start => check(sec, 0, 512, lba - part_start, "partition terminator"),
+            1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 => {
+                // Length is recoverable from the tag itself; volume-space tags are absolute.
+                let len = u16::from_le_bytes([sec[10], sec[11]]) as usize + 16;
+                check(sec, 0, len, lba, &format!("VDS tag {id} @ {lba}"));
+            }
+            256 => check(sec, 0, 512, lba - part_start, "file set"),
+            261 => {
+                let l_ad = u32::from_le_bytes([sec[172], sec[173], sec[174], sec[175]]) as usize;
+                check(sec, 0, 176 + l_ad, lba - part_start, "file entry");
+                if sec[27] != 4 {
+                    continue;
+                }
+                dirs_seen += 1;
+                let len =
+                    u32::from_le_bytes([sec[176], sec[177], sec[178], sec[179]]) & 0x3FFF_FFFF;
+                let blk = u32::from_le_bytes([sec[180], sec[181], sec[182], sec[183]]);
+                multi_block_dir |= len as usize > SECTOR;
+                let mut data = Vec::new();
+                for b in 0..(len as usize).div_ceil(SECTOR) {
+                    data.extend_from_slice(&img.meta[&(part_start + blk + b as u32)][..]);
+                }
+                let mut pos = 0usize;
+                while pos < len as usize {
+                    let l_fi = data[pos + 19] as usize;
+                    let l_iu = u16::from_le_bytes([data[pos + 36], data[pos + 37]]) as usize;
+                    let unpadded = 38 + l_iu + l_fi;
+                    assert_eq!(u16::from_le_bytes([data[pos], data[pos + 1]]), 257);
+                    check(
+                        &data,
+                        pos,
+                        unpadded,
+                        blk + (pos / SECTOR) as u32,
+                        &format!("FID @ dir byte {pos}"),
+                    );
+                    pos += unpadded.div_ceil(4) * 4;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        dirs_seen >= 3,
+        "expected several directories, saw {dirs_seen}"
+    );
+    assert!(
+        multi_block_dir,
+        "fixture must include a multi-block directory"
     );
 }

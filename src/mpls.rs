@@ -76,7 +76,7 @@ pub struct StreamEntry {
     pub video_format: u8,
     /// Video frame rate (1=23.976, 2=24, 3=25, 4=29.97, 6=50, 7=59.94)
     pub video_rate: u8,
-    /// Audio channel layout (1=mono, 3=stereo, 6=5.1, 12=7.1)
+    /// Audio channel layout (1=mono, 3=stereo, 6=5.1, 12=combo)
     pub audio_format: u8,
     /// Audio sample rate (1=48kHz, 4=96kHz, 5=192kHz)
     pub audio_rate: u8,
@@ -127,11 +127,11 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 
     for item_idx in 0..num_play_items {
         if pos + 2 > pl.len() {
-            break;
+            return Err(Error::MplsParse);
         }
         let item_length = u16::from_be_bytes([pl[pos], pl[pos + 1]]) as usize;
         if pos + 2 + item_length > pl.len() {
-            break;
+            return Err(Error::MplsParse);
         }
 
         let item = &pl[pos + 2..pos + 2 + item_length];
@@ -217,7 +217,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                 if let Some((mut entry, next)) =
                     parse_stream_entry(item, spos, STREAM_CATEGORY_AUDIO)
                 {
-                    entry.stream_type = 5;
+                    entry.stream_type = STREAM_CATEGORY_SECONDARY_AUDIO;
                     entry.secondary = true;
                     streams.push(entry);
                     // Skip extra ref bytes: num_refs(1) + reserved(1) + refs + padding
@@ -236,7 +236,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                 if let Some((mut entry, next)) =
                     parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO)
                 {
-                    entry.stream_type = 6;
+                    entry.stream_type = STREAM_CATEGORY_SECONDARY_VIDEO;
                     entry.secondary = true;
                     streams.push(entry);
                     // Skip extra ref bytes (audio refs + PG refs). `next < item.len()`
@@ -263,7 +263,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                 if let Some((mut entry, next)) =
                     parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO)
                 {
-                    entry.stream_type = 7;
+                    entry.stream_type = STREAM_CATEGORY_DV_EL;
                     entry.secondary = true;
                     streams.push(entry);
                     spos = next;
@@ -289,27 +289,25 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     // at least 6 bytes (length(4) + num_marks(2)).
     if mark_start > 0 && mark_start + 6 <= data.len() {
         let ms = &data[mark_start..];
-        {
-            let num_marks = u16::from_be_bytes([ms[4], ms[5]]) as usize;
-            let mut mpos = 6;
-            for _ in 0..num_marks {
-                if mpos + 14 > ms.len() {
-                    break;
-                }
-                // PlayListMark entry: reserved(1) + mark_type(1) +
-                // ref_to_PlayItem_id(2) + mark_time_stamp(4) +
-                // entry_ES_PID(2) + duration(4). mark_type is at +1, not +0.
-                let mark_type = ms[mpos + 1];
-                let play_item_ref = u16::from_be_bytes([ms[mpos + 2], ms[mpos + 3]]);
-                let timestamp =
-                    u32::from_be_bytes([ms[mpos + 4], ms[mpos + 5], ms[mpos + 6], ms[mpos + 7]]);
-                marks.push(PlaylistMark {
-                    mark_type,
-                    play_item_ref,
-                    timestamp,
-                });
-                mpos += 14;
+        let num_marks = u16::from_be_bytes([ms[4], ms[5]]) as usize;
+        let mut mpos = 6;
+        for _ in 0..num_marks {
+            if mpos + 14 > ms.len() {
+                break;
             }
+            // PlayListMark entry: reserved(1) + mark_type(1) +
+            // ref_to_PlayItem_id(2) + mark_time_stamp(4) +
+            // entry_ES_PID(2) + duration(4). mark_type is at +1, not +0.
+            let mark_type = ms[mpos + 1];
+            let play_item_ref = u16::from_be_bytes([ms[mpos + 2], ms[mpos + 3]]);
+            let timestamp =
+                u32::from_be_bytes([ms[mpos + 4], ms[mpos + 5], ms[mpos + 6], ms[mpos + 7]]);
+            marks.push(PlaylistMark {
+                mark_type,
+                play_item_ref,
+                timestamp,
+            });
+            mpos += 14;
         }
     }
 
@@ -339,13 +337,16 @@ const STREAM_ENTRY_SUBPATH_SUBCLIP: u8 = 0x02; // stream in a SubPath SubClip
 const STREAM_ENTRY_SUBPATH_CLIP: u8 = 0x03; // stream in a SubPath clip
 const STREAM_ENTRY_SUBPATH_DV_EL: u8 = 0x04; // SubPath Dolby Vision enhancement layer
 
-/// STN-table primary stream categories — the `stream_type` tag carried on each
-/// [`StreamEntry`]. Secondary streams reuse the primary category and set the
-/// `secondary` flag rather than carrying a distinct code.
+/// STN-table stream categories — the `stream_type` tag carried on each
+/// [`StreamEntry`]. `parse` re-tags secondary audio/video and the DV
+/// enhancement layer with the SECONDARY_*/DV_EL codes and sets `secondary`.
 pub(crate) const STREAM_CATEGORY_VIDEO: u8 = 1;
 pub(crate) const STREAM_CATEGORY_AUDIO: u8 = 2;
 const STREAM_CATEGORY_PG_SUBTITLE: u8 = 3;
 const STREAM_CATEGORY_IG: u8 = 4;
+const STREAM_CATEGORY_SECONDARY_AUDIO: u8 = 5;
+const STREAM_CATEGORY_SECONDARY_VIDEO: u8 = 6;
+const STREAM_CATEGORY_DV_EL: u8 = 7;
 
 fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(StreamEntry, usize)> {
     use crate::consts::coding_type as c;
@@ -1101,7 +1102,7 @@ mod tests {
 
     // connection_condition is the LOW nibble of PlayItem byte[10] (high nibble
     // is reserved + is_multi_angle flag). byte[9] is reserved and must not leak
-    // in; byte[10] = 0xF5 must yield 5 even with a non-zero byte[9].
+    // in; byte[10] = 0xE5 must yield 5 even with a non-zero byte[9].
     #[test]
     fn connection_condition_is_low_nibble_only() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
@@ -1115,7 +1116,7 @@ mod tests {
         // byte[9] fully reserved — set it to prove it does not leak in.
         data[item_base + 9] = 0xFF;
         // byte[10] high nibble set — parser must mask to the low nibble.
-        data[item_base + 10] = 0xF5;
+        data[item_base + 10] = 0xE5; // multi-angle bit (0x10) clear
         let pl = parse(&data).expect("should parse");
         assert_eq!(pl.play_items[0].connection_condition, 0x05);
     }
@@ -1799,5 +1800,106 @@ mod tests {
         );
         assert!(mk(1).is_chapter_mark());
         assert!(!mk(2).is_chapter_mark(), "type 2 is a link point");
+    }
+
+    // ---- audit tests ----
+
+    /// Item with a 32-byte PlayItem head followed by a single-angle STN
+    /// holding `entries` (counts: n_video only).
+    fn item_with_stn(n_video: u8, entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut it = play_item_20(b"00001", 1, 0, 9000);
+        it.resize(32, 0);
+        it.extend_from_slice(&[0u8; 4]);
+        it.push(n_video);
+        it.extend_from_slice(&[0u8; 11]);
+        for e in entries {
+            it.extend_from_slice(e);
+        }
+        it
+    }
+
+    #[test]
+    fn truncated_play_item_is_an_error() {
+        let full = build_mpls_raw_items(&[play_item_20(b"00001", 1, 0, 9000)]);
+        // Cut into the item body: declared item_length runs past EOF.
+        assert!(parse(&full[..full.len() - 3]).is_err());
+        // num_play_items overshoots the items actually present.
+        let mut over = full.clone();
+        over[46..48].copy_from_slice(&2u16.to_be_bytes());
+        assert!(parse(&over).is_err());
+    }
+
+    #[test]
+    fn streams_come_only_from_first_play_item() {
+        let v1 = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let v2 = build_stream_entry_video(0x1012, 0x1B, 6, 1, None);
+        let data = build_mpls_raw_items(&[item_with_stn(1, &[v1]), item_with_stn(1, &[v2])]);
+        let pl = parse(&data).expect("parse");
+        assert_eq!(pl.play_items.len(), 2);
+        assert_eq!(pl.streams.len(), 1);
+        assert_eq!(pl.streams[0].pid, 0x1011);
+    }
+
+    #[test]
+    fn duration_ticks_sums_and_saturates_inverted_items() {
+        let pi = |i, o| PlayItem {
+            clip_id: String::new(),
+            in_time: i,
+            out_time: o,
+            connection_condition: 1,
+        };
+        let pl = Playlist {
+            version: String::new(),
+            play_items: vec![pi(10, 110), pi(500, 100), pi(0, 50)],
+            streams: vec![],
+            marks: vec![],
+        };
+        assert_eq!(pl.duration_ticks(), 150);
+    }
+
+    #[test]
+    fn stream_entry_type3_pid_at_offset_3() {
+        // se_len=4: type(1) + subpath_id(1) + pid(2); attrs: H264 + 1080p.
+        let se = vec![
+            4,
+            STREAM_ENTRY_SUBPATH_CLIP,
+            0xAA,
+            0x12,
+            0x34,
+            2,
+            0x1B,
+            0x61,
+        ];
+        let data = build_mpls_raw_items(&[item_with_stn(1, &[se])]);
+        let pl = parse(&data).expect("parse");
+        assert_eq!(pl.streams[0].pid, 0x1234);
+    }
+
+    #[test]
+    fn stream_attributes_past_item_end_are_dropped() {
+        // sa_len=200 runs far past the item end; must not slice out of bounds.
+        let se = vec![3, STREAM_ENTRY_PLAYITEM_CLIP, 0x10, 0x11, 200, 0x1B];
+        let data = build_mpls_raw_items(&[item_with_stn(1, &[se])]);
+        let pl = parse(&data).expect("parse");
+        assert!(pl.streams.is_empty());
+    }
+
+    #[test]
+    fn short_audio_attributes_do_not_panic() {
+        let audio = |attrs: &[u8]| {
+            let mut e = vec![3, STREAM_ENTRY_PLAYITEM_CLIP, 0x11, 0x00, attrs.len() as u8];
+            e.extend_from_slice(attrs);
+            e
+        };
+        let mut it = item_with_stn(
+            0,
+            &[audio(&[0x83, 0x61, b'e', b'n']), audio(&[0x90, b'e', b'n'])],
+        );
+        it[32 + 5] = 2; // n_audio
+        let pl = parse(&build_mpls_raw_items(&[it])).expect("parse");
+        assert_eq!(pl.streams.len(), 2);
+        assert_eq!(pl.streams[0].audio_format, 6);
+        assert_eq!(pl.streams[0].language, "");
+        assert_eq!(pl.streams[1].language, "");
     }
 }

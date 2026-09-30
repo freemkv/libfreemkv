@@ -7,6 +7,8 @@
 //! byte 50. Each object is `flags`(1) + reserved(1) + `num_cmds`(u16) followed
 //! by `num_cmds` 12-byte navigation commands.
 
+use super::be_u16;
+
 // One decoded 12-byte navigation command.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cmd {
@@ -35,10 +37,6 @@ const CMD_LEN: usize = 12;
 /// object's command span is bounded against the input length below, so a
 /// separate cap would be dead code.
 const MAX_OBJECTS: usize = 4096;
-
-fn be_u16(d: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?]))
-}
 
 /// Decode one 12-byte command. Caller guarantees `b.len() == 12`.
 fn decode_cmd(b: &[u8]) -> Cmd {
@@ -157,4 +155,13 @@ pub(crate) mod tests {
     // No command-count cap exists to test: `num_cmds` is a u16 (max 65535) and
     // each object's span is bounded against the input length, so the former
     // MAX_CMDS check was dead code and was removed rather than left flagged.
+
+    #[test]
+    fn decode_cmd_masks_ignore_reserved_bits() {
+        // b2/b3 upper bits are reserved and must not leak into cmp_opt/set_opt.
+        let c = decode_cmd(&cmd(0xFF, 0xFF, 0xF3, 0xE5, 0, 0));
+        assert_eq!((c.op_cnt, c.grp, c.sub_grp), (7, 3, 7));
+        assert!(c.imm_op1 && c.imm_op2);
+        assert_eq!((c.branch_opt, c.cmp_opt, c.set_opt), (0x0f, 0x03, 0x05));
+    }
 }

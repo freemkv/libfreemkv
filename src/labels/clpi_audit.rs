@@ -116,9 +116,9 @@ impl ClpiVsMplsAudit {
 pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
     // CLPI: the clip id is the file stem.
     let mut clpi_by_key: BTreeMap<(String, u16), (u8, String)> = BTreeMap::new();
-    for (name, data) in read_dir_files(reader, udf, "/BDMV/CLIPINF", ".clpi") {
+    for_each_dir_file(reader, udf, "/BDMV/CLIPINF", ".clpi", |name, data| {
         let Ok(clip) = crate::clpi::parse(&data) else {
-            continue;
+            return;
         };
         let clip_id = name[..name.len() - ".clpi".len()].to_string();
         for s in clip.streams {
@@ -129,14 +129,14 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
                     .or_insert((s.coding_type, s.language));
             }
         }
-    }
+    });
 
     // MPLS: `streams` is the first PlayItem's STN_table, so it describes that clip.
     let mut mpls_by_key: BTreeMap<(String, u16), (u8, String)> = BTreeMap::new();
     let mut mpls_clips: Vec<String> = Vec::new();
-    for (_, data) in read_dir_files(reader, udf, "/BDMV/PLAYLIST", ".mpls") {
+    for_each_dir_file(reader, udf, "/BDMV/PLAYLIST", ".mpls", |_, data| {
         let Ok(pl) = crate::mpls::parse(&data) else {
-            continue;
+            return;
         };
         // A first clip is covered only if its STN kept a stream to compare.
         if let Some(pi) = pl.play_items.first()
@@ -149,7 +149,7 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
                     .or_insert_with(|| (s.coding_type, s.language.clone()));
             }
         }
-    }
+    });
 
     // Merge views over auditable clips (those an MPLS STN describes).
     let covered: std::collections::BTreeSet<&str> = mpls_clips.iter().map(String::as_str).collect();
@@ -177,15 +177,17 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
     ClpiVsMplsAudit { rows }
 }
 
-// (file name, bytes) of every readable `*<ext>` file directly under `dir`.
-fn read_dir_files(
+// Calls `f(file name, bytes)` for every readable `*<ext>` file directly under `dir`, reading
+// and dropping one file at a time so a hostile directory can't pin N large files at once.
+fn for_each_dir_file(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
     dir: &str,
     ext: &str,
-) -> Vec<(String, Vec<u8>)> {
+    mut f: impl FnMut(&str, Vec<u8>),
+) {
     let Some(d) = udf.find_dir(dir) else {
-        return Vec::new();
+        return;
     };
     let names: Vec<String> = d
         .entries
@@ -193,13 +195,11 @@ fn read_dir_files(
         .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(ext))
         .map(|e| e.name.clone())
         .collect();
-    names
-        .into_iter()
-        .filter_map(|name| {
-            let data = udf.read_file(reader, &format!("{dir}/{name}")).ok()?;
-            Some((name, data))
-        })
-        .collect()
+    for name in names {
+        if let Ok(data) = udf.read_file(reader, &format!("{dir}/{name}")) {
+            f(&name, data);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -240,6 +240,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                 .unit_base
                 .is_some_and(|b| crate::aacs::content::is_unit_aligned(lba, b))
         {
+            tracing::warn!(target: "freemkv::decrypt", lba, base = ?self.unit_base, "AACS content read off the unit grid");
             return Err(crate::error::Error::DecryptFailed);
         }
         let n = self
@@ -421,6 +422,10 @@ mod tests {
             for (i, b) in buf.iter_mut().enumerate() {
                 *b = (i as u8).wrapping_mul(29).wrapping_add(3);
             }
+            // A real MPEG-2 pack header, or `is_scrambled_pack` skips the sector.
+            buf[..4].copy_from_slice(&[0, 0, 1, 0xBA]);
+            buf[4] = 0x44;
+            buf[0x11] = 0xE0;
             buf[0x14] = 0x30; // scramble-control bits set → flags == 0x03
         }
     }
@@ -575,9 +580,59 @@ mod tests {
         );
     }
 
-    /// A read error from the inner source must propagate unchanged and
-    /// the decrypt step must NOT run after it. Grounding: the `?` on the
-    /// inner read in `read_sectors`.
+    // Records the fua flag of every read; the default read_sectors_fua drops it.
+    struct FuaProbe {
+        fua: Vec<bool>,
+    }
+    impl SectorSource for FuaProbe {
+        fn read_sectors(&mut self, _: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            let n = count as usize * 2048;
+            buf[..n].fill(0);
+            Ok(n)
+        }
+        fn read_sectors_fua(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+            fua: bool,
+        ) -> Result<usize> {
+            self.fua.push(fua);
+            self.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // Pass-N FUA recovery must reach the drive through the decrypting decorator.
+    #[test]
+    fn read_sectors_fua_forwards_fua_to_the_inner_source() {
+        let mut d = DecryptingSectorSource::new(FuaProbe { fua: vec![] }, DecryptKeys::None);
+        let mut buf = vec![0u8; 2048];
+        d.read_sectors_fua(0, 1, &mut buf, true, true).unwrap();
+        d.read_sectors_fua(0, 1, &mut buf, true, false).unwrap();
+        assert_eq!(d.inner().fua, [true, false]);
+    }
+
+    // The decorator reports its inner's answer, not a constant: over a prefetcher it is false.
+    #[test]
+    fn random_access_follows_the_inner_source() {
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let ext = vec![crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 6,
+        }];
+        let inner = ArgRecorder {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let pf = crate::sector::PrefetchedSectorSource::new(inner, ext, 3, None).unwrap();
+        let d = DecryptingSectorSource::new(pf, DecryptKeys::None);
+        assert!(!d.random_access());
+        let d = DecryptingSectorSource::new(FuaProbe { fua: vec![] }, DecryptKeys::None);
+        assert!(d.random_access());
+    }
+
+    /// A read error from the inner source must propagate unchanged.
+    /// Grounding: the `?` on the inner read in `read_sectors`.
     #[test]
     fn inner_read_error_propagates() {
         let mut wrapped = DecryptingSectorSource::new(FailingSource, DecryptKeys::None);
@@ -601,6 +656,8 @@ mod tests {
                 format: crate::disc::ContentFormat::BdTs,
             },
         );
+        // On the unit grid, so the alignment gate passes and the mapless arm answers.
+        wrapped.set_unit_base(0);
         let mut buf = vec![0u8; 2048];
         let r = wrapped.read_sectors(0, 1, &mut buf, false);
         let err = r.expect_err("missing unit key must error, not pass through encrypted");

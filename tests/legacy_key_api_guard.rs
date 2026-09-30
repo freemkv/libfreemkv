@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 /// §2.2, the libfreemkv row of the structural guards.
 const BANNED: &[&str] = &[
-    ".get_unit_keys(",
-    ".get_fmts_indexes(",
-    ".resolve_unit_keys(",
+    "get_unit_keys(",
+    "get_fmts_indexes(",
+    "resolve_unit_keys(",
     "decrypt_with(",
     "AacsKeyMap::from_ranges",
     "with_key_map(",
@@ -154,6 +154,17 @@ fn hits(rel: &str, src: &str) -> Vec<(usize, &'static str)> {
             if code[k..k + t.len()] != t[..] || inside(k) {
                 continue;
             }
+            // The three trait ops are banned as calls (method or UFCS), not as `fn` items.
+            let method = matches!(
+                tok,
+                "get_unit_keys(" | "get_fmts_indexes(" | "resolve_unit_keys("
+            );
+            let before = code[..k].last().copied().unwrap_or(' ');
+            let is_item =
+                code[..k].ends_with(&['f', 'n', ' ']) || before.is_alphanumeric() || before == '_';
+            if method && is_item {
+                continue;
+            }
             let via_helper = k >= helper.len() && code[k - helper.len()..k] == helper[..];
             if tok == "decrypt_unit(" && via_helper {
                 continue;
@@ -223,6 +234,10 @@ fn the_structural_guard_skips_comments_and_keeps_its_allow_path() {
     );
     let url = "let u = \"http://x\"; AacsKeyMap::from_ranges_phased(r);\n";
     assert_eq!(hits("src/x.rs", url), [(1, "AacsKeyMap::from_ranges")]);
+    let ufcs = "fn f() { KeySource::get_unit_keys(&s, c); }\n";
+    assert_eq!(hits("src/mux/x.rs", ufcs), [(1, "get_unit_keys(")], "UFCS");
+    let item = "impl K for S { fn get_unit_keys(&self) {} fn my_resolve_unit_keys(&self) {} }\n";
+    assert!(hits("src/x.rs", item).is_empty(), "fn items are not calls");
     let raw = "let s = r#\"x.get_fmts_indexes( // \"#; s.resolve_unit_keys(c);\n";
     assert_eq!(
         hits("src/x.rs", raw).len(),

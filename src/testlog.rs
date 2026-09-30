@@ -122,7 +122,7 @@ fn install() {
 }
 
 // Run `f` with every `tracing` event it emits on this thread captured; returns `f`'s value
-// alongside the events, in emission order. One global subscriber, not scoped `with_default`
+// alongside the events, in emission order. One global subscriber (see `install`), not scoped `with_default`.
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
     install();
     let sink: Sink = Arc::default();
@@ -134,7 +134,6 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
     (out, events)
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
 

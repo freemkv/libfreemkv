@@ -1,5 +1,6 @@
 //! UDF parser tests using a MockSectorReader.
 
+use libfreemkv::error::Error;
 use libfreemkv::error::Result;
 use libfreemkv::{SectorSource, read_filesystem};
 use std::collections::HashMap;
@@ -209,58 +210,14 @@ fn make_file_icb(data_lba: u32, data_len: u32, file_size: u64) -> Vec<u8> {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn mock_sector_reader_roundtrip() {
-    let mut reader = MockSectorReader::new();
-
-    // Write a recognizable pattern to sector 100
-    let mut data = vec![0u8; SECTOR_SIZE];
-    data[0] = 0xAB;
-    data[1] = 0xCD;
-    data[2047] = 0xFF;
-    reader.set_sector(100, data.clone());
-
-    // Read it back
-    let mut buf = vec![0u8; SECTOR_SIZE];
-    let n = reader.read_sectors(100, 1, &mut buf, true).unwrap();
-    assert_eq!(n, SECTOR_SIZE);
-    assert_eq!(buf[0], 0xAB);
-    assert_eq!(buf[1], 0xCD);
-    assert_eq!(buf[2047], 0xFF);
-
-    // Reading an unmapped sector returns zeros
-    let mut buf2 = vec![0xFFu8; SECTOR_SIZE];
-    let n2 = reader.read_sectors(999, 1, &mut buf2, true).unwrap();
-    assert_eq!(n2, SECTOR_SIZE);
-    assert_eq!(buf2[0], 0);
-    assert_eq!(buf2[2047], 0);
-}
-
-#[test]
-fn mock_sector_reader_multi_sector() {
-    let mut reader = MockSectorReader::new();
-
-    let mut s10 = vec![0u8; SECTOR_SIZE];
-    s10[0] = 10;
-    reader.set_sector(10, s10);
-
-    let mut s11 = vec![0u8; SECTOR_SIZE];
-    s11[0] = 11;
-    reader.set_sector(11, s11);
-
-    // Read 2 consecutive sectors
-    let mut buf = vec![0u8; SECTOR_SIZE * 2];
-    let n = reader.read_sectors(10, 2, &mut buf, true).unwrap();
-    assert_eq!(n, SECTOR_SIZE * 2);
-    assert_eq!(buf[0], 10);
-    assert_eq!(buf[SECTOR_SIZE], 11);
-}
-
-#[test]
 fn read_filesystem_no_avdp() {
     // Empty reader — sector 256 is all zeros, tag_id=0 != 2
     let mut reader = MockSectorReader::new();
     let result = read_filesystem(&mut reader);
-    assert!(result.is_err(), "should fail when no AVDP at sector 256");
+    assert!(
+        matches!(result, Err(Error::UdfNotFilesystem)),
+        "no AVDP at sector 256 is the deterministic not-UDF verdict"
+    );
 }
 
 #[test]
@@ -272,7 +229,10 @@ fn read_filesystem_bad_avdp_tag() {
     reader.set_sector(256, bad);
 
     let result = read_filesystem(&mut reader);
-    assert!(result.is_err(), "should fail when AVDP tag_id is not 2");
+    assert!(
+        matches!(result, Err(Error::UdfNotFilesystem)),
+        "AVDP tag_id != 2 is the not-UDF verdict"
+    );
 }
 
 #[test]
@@ -285,8 +245,8 @@ fn read_filesystem_no_partition_descriptor() {
 
     let result = read_filesystem(&mut reader);
     assert!(
-        result.is_err(),
-        "should fail when no partition descriptor in VDS"
+        matches!(result, Err(Error::UdfNotFilesystem)),
+        "no partition descriptor is the not-UDF verdict"
     );
 }
 
@@ -305,7 +265,10 @@ fn read_filesystem_bad_fsd_tag() {
     // FSD should be at sector partition_start but we leave it as zeros (tag_id=0 != 256).
 
     let result = read_filesystem(&mut reader);
-    assert!(result.is_err(), "should fail when FSD tag_id is not 256");
+    assert!(
+        matches!(result, Err(Error::UdfNotFilesystem)),
+        "FSD tag_id != 256 is the not-UDF verdict"
+    );
 }
 
 #[test]
@@ -454,17 +417,4 @@ fn find_dir_case_insensitive() {
     // Nonexistent
     assert!(fs.find_dir("BDMV/STREAM").is_none());
     assert!(fs.find_dir("NONEXISTENT").is_none());
-}
-
-#[test]
-fn sector_reader_is_object_safe() {
-    // Verify SectorSource can be used as a trait object
-    let mut reader = MockSectorReader::new();
-    reader.set_sector(0, vec![42u8; SECTOR_SIZE]);
-
-    let dyn_reader: &mut dyn SectorSource = &mut reader;
-    let mut buf = vec![0u8; SECTOR_SIZE];
-    let n = dyn_reader.read_sectors(0, 1, &mut buf, true).unwrap();
-    assert_eq!(n, SECTOR_SIZE);
-    assert_eq!(buf[0], 42);
 }

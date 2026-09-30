@@ -5,6 +5,7 @@
 //!
 //! Read-only. For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy`.
 
+use super::ts::PesPacket;
 use crate::disc::{DiscTitle, Extent};
 use crate::drive::extract_scsi_context;
 use crate::event::{BatchSizeReason, Event, EventKind};
@@ -200,6 +201,10 @@ pub struct DiscStream {
     /// Whether each stream (by track index) is video — audio/subtitle frames are
     /// independent and always admit.
     is_video: Vec<bool>,
+    /// Per-track PS access-unit assembler and H.264 second-field merge, as in
+    /// `PipelinedPesStream`; PS video AUs span many PES fragments.
+    au_asm: Vec<super::au_assembly::AuAssembler>,
+    field_merge: Vec<Option<super::au_assembly::SecondFieldMerge>>,
     /// Bounds the header pump's wait for in-band codec configs (AAC).
     header_gate: super::header_gate::HeaderGate,
 }
@@ -284,6 +289,21 @@ impl DiscStream {
         let resync = (0..title.streams.len())
             .map(|_| super::resync::ResyncGate::new())
             .collect();
+        let au_asm = title
+            .streams
+            .iter()
+            .map(|s| {
+                super::au_assembly::AuAssembler::for_codec(super::pipelined_stream::stream_codec(s))
+            })
+            .collect();
+        let field_merge = title
+            .streams
+            .iter()
+            .map(|s| {
+                (super::pipelined_stream::stream_codec(s) == crate::disc::Codec::H264)
+                    .then(super::au_assembly::SecondFieldMerge::default)
+            })
+            .collect();
 
         Ok(Self {
             reader,
@@ -316,6 +336,8 @@ impl DiscStream {
             fed_bytes: 0,
             resync,
             is_video,
+            au_asm,
+            field_merge,
             header_gate: super::header_gate::HeaderGate::default(),
         })
     }
@@ -702,7 +724,97 @@ fn prof_tick(stage: &str, ns: u128, bytes: u64) {
     });
 }
 
+// B1 gate for one parsed frame: `true` to emit, `false` to drop. Streams without a gate admit.
+fn admit(
+    resync: &mut [super::resync::ResyncGate],
+    is_video: &[bool],
+    track: usize,
+    frame: &super::codec::Frame,
+) -> bool {
+    match resync.get_mut(track) {
+        Some(gate) => gate.admit(
+            is_video.get(track).copied().unwrap_or(false),
+            frame.discontinuity,
+            frame.keyframe,
+        ),
+        None => true,
+    }
+}
+
 impl DiscStream {
+    // Route one PS packet by its real DVD PID through the AU assembler to the codec parser,
+    // the same path as `PipelinedPesStream::consume_ps`. Takes the packet by value.
+    fn route_ps_packet(&mut self, ps: super::ps::PsPacket) {
+        let Some(pid) = ps.dvd_pid() else {
+            if ps.is_nav() {
+                self.dropped_nav_packets += 1;
+            } else {
+                tracing::warn!(
+                    target: "mux",
+                    "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
+                    ps.stream_id,
+                    ps.sub_stream_id,
+                );
+            }
+            return;
+        };
+        let Some((_, track)) = self.pid_to_track.iter().find(|(p, _)| *p == pid).copied() else {
+            if let Some(base) = super::ps::dvd_mpeg_audio_extension_base(pid) {
+                // Counted and reported once at EOF: no extension track was declared.
+                self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
+                return;
+            }
+            tracing::warn!(
+                target: "mux",
+                "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
+                pid,
+                ps.stream_id,
+                ps.sub_stream_id,
+            );
+            return;
+        };
+        let (pts, dts, src) = (
+            ps.pts.map(|p| p as i64),
+            ps.dts.map(|d| d as i64),
+            ps.source,
+        );
+        // PS path: no AACS conceal, no gap flag.
+        let pkts: Vec<PesPacket> = match self.au_asm.get_mut(track) {
+            Some(asm) => asm
+                .push_owned(ps.data, pts, dts, src, false)
+                .into_iter()
+                .map(|au| PesPacket {
+                    source: au.source,
+                    pid,
+                    pts: au.pts,
+                    dts: au.dts,
+                    data: au.data,
+                    discontinuity: au.discontinuity,
+                })
+                .collect(),
+            None => vec![PesPacket {
+                source: src,
+                pid,
+                pts,
+                dts,
+                data: ps.data,
+                discontinuity: false,
+            }],
+        };
+        let pkts = match self.field_merge.get_mut(track).and_then(Option::as_mut) {
+            Some(m) => pkts.into_iter().flat_map(|p| m.push(p)).collect(),
+            None => pkts,
+        };
+        if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
+            for pes in &pkts {
+                for frame in parser.parse(pes) {
+                    self.pending_frames
+                        .push_back(crate::pes::PesFrame::from_codec_frame(track, frame));
+                }
+            }
+        }
+    }
+
     fn read_frame(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(Some(frame));
@@ -739,14 +851,7 @@ impl DiscStream {
                             for frame in parser.parse(pes) {
                                 // Same B1 gate — a concealed gap can leave a
                                 // post-gap frame in the demuxer's final flush.
-                                let emit = match resync.get_mut(*track) {
-                                    Some(gate) => gate.admit(
-                                        is_video.get(*track).copied().unwrap_or(false),
-                                        frame.discontinuity,
-                                        frame.keyframe,
-                                    ),
-                                    None => true,
-                                };
+                                let emit = admit(resync, is_video, *track, &frame);
                                 if emit {
                                     pending.push_back(crate::pes::PesFrame::from_codec_frame(
                                         *track, frame,
@@ -757,63 +862,13 @@ impl DiscStream {
                     }
                 }
                 // PS demuxer flush (DVD)
-                if let Some(ref mut demuxer) = self.ps_demuxer {
-                    for ps in &demuxer.flush() {
-                        // Route by the REAL DVD PID (see consume_ps in
-                        // pipelined_stream.rs); the old (sub_id & 0x1F)+1
-                        // heuristic mis-routed VobSub into the AC-3 parser.
-                        let Some(pid) = ps.dvd_pid() else {
-                            if ps.is_nav() {
-                                // Expected DVD navigation packet (PCI/DSI) —
-                                // tally, no WARN.
-                                self.dropped_nav_packets += 1;
-                            } else {
-                                // Unexpected unmappable stream_id (a
-                                // possibly-dropped real stream). Keep the WARN.
-                                tracing::warn!(
-                                    target: "mux",
-                                    "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                                    ps.stream_id,
-                                    ps.sub_stream_id,
-                                );
-                            }
-                            continue;
-                        };
-                        let Some((_, track)) =
-                            self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
-                        else {
-                            if let Some(base) = super::ps::dvd_mpeg_audio_extension_base(pid) {
-                                // Counted and reported once at EOF: no extension track was declared.
-                                self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
-                                continue;
-                            }
-                            tracing::warn!(
-                                target: "mux",
-                                "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
-                                pid,
-                                ps.stream_id,
-                                ps.sub_stream_id,
-                            );
-                            continue;
-                        };
-                        let pes = super::ts::PesPacket {
-                            source: ps.source,
-                            pid,
-                            pts: ps.pts.map(|p| p as i64),
-                            dts: ps.dts.map(|d| d as i64),
-                            data: ps.data.clone(),
-                            // PS (DVD/CSS) path: no AACS conceal, no gap flag.
-                            discontinuity: false,
-                        };
-                        if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid)
-                        {
-                            for frame in parser.parse(&pes) {
-                                self.pending_frames.push_back(
-                                    crate::pes::PesFrame::from_codec_frame(track, frame),
-                                );
-                            }
-                        }
-                    }
+                let flushed = self
+                    .ps_demuxer
+                    .as_mut()
+                    .map(|d| d.flush())
+                    .unwrap_or_default();
+                for ps in flushed {
+                    self.route_ps_packet(ps);
                 }
                 super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
                 // Drain any access unit a codec parser buffered past the last
@@ -823,22 +878,39 @@ impl DiscStream {
                 let pending = &mut self.pending_frames;
                 let resync = &mut self.resync;
                 let is_video = &self.is_video;
+                let au_asm = &mut self.au_asm;
+                let field_merge = &mut self.field_merge;
                 for (pid, parser) in self.parsers.iter_mut() {
                     let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                         continue;
                     };
-                    // Flush frames carry their own per-frame `discontinuity`, so
-                    // route them through the SAME B1 gate as the in-stream path —
-                    // otherwise a trailing dangling-reference frame bypasses resync.
-                    for frame in parser.flush() {
-                        let emit = match resync.get_mut(track) {
-                            Some(gate) => gate.admit(
-                                is_video.get(track).copied().unwrap_or(false),
-                                frame.discontinuity,
-                                frame.keyframe,
-                            ),
-                            None => true,
-                        };
+                    // Flush frames go through the SAME B1 gate as the in-stream path. The
+                    // PS assembler's held AU(s) come first, then the parser's own tail.
+                    let mut tail: Vec<PesPacket> = au_asm
+                        .get_mut(track)
+                        .map(|a| a.flush())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|au| PesPacket {
+                            source: au.source,
+                            pid: *pid,
+                            pts: au.pts,
+                            dts: au.dts,
+                            data: au.data,
+                            discontinuity: au.discontinuity,
+                        })
+                        .collect();
+                    if let Some(m) = field_merge.get_mut(track).and_then(Option::as_mut) {
+                        tail = tail.into_iter().flat_map(|p| m.push(p)).collect();
+                        tail.extend(m.flush());
+                    }
+                    let mut frames = Vec::new();
+                    for pes in &tail {
+                        frames.extend(parser.parse(pes));
+                    }
+                    frames.extend(parser.flush());
+                    for frame in frames {
+                        let emit = admit(resync, is_video, track, &frame);
                         if emit {
                             pending.push_back(crate::pes::PesFrame::from_codec_frame(track, frame));
                         }
@@ -912,14 +984,7 @@ impl DiscStream {
                                 // B1: after a concealed/lost gap, drop forward to
                                 // the next keyframe on a video track so no frame
                                 // with a dangling reference is emitted.
-                                let emit = match resync.get_mut(track) {
-                                    Some(gate) => gate.admit(
-                                        is_video.get(track).copied().unwrap_or(false),
-                                        frame.discontinuity,
-                                        frame.keyframe,
-                                    ),
-                                    None => true,
-                                };
+                                let emit = admit(resync, is_video, track, &frame);
                                 if emit {
                                     pending.push_back(crate::pes::PesFrame::from_codec_frame(
                                         track, frame,
@@ -935,61 +1000,8 @@ impl DiscStream {
                 }
             } else if let Some(ref mut demuxer) = self.ps_demuxer {
                 let packets = demuxer.feed_at(buf_base, &self.read_buf[..bytes]);
-                for ps in &packets {
-                    // Route by the REAL DVD PID (see consume_ps in
-                    // pipelined_stream.rs); the old (sub_id & 0x1F)+1
-                    // heuristic mis-routed VobSub into the AC-3 parser.
-                    let Some(pid) = ps.dvd_pid() else {
-                        if ps.is_nav() {
-                            // Expected DVD navigation packet (PCI/DSI) — tally,
-                            // no WARN.
-                            self.dropped_nav_packets += 1;
-                        } else {
-                            // Unexpected unmappable stream_id (a possibly-dropped
-                            // real stream). Keep the individual WARN.
-                            tracing::warn!(
-                                target: "mux",
-                                "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                                ps.stream_id,
-                                ps.sub_stream_id,
-                            );
-                        }
-                        continue;
-                    };
-                    let Some((_, track)) =
-                        self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
-                    else {
-                        if let Some(base) = super::ps::dvd_mpeg_audio_extension_base(pid) {
-                            // Counted and reported once at EOF: no extension track was declared.
-                            self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
-                            continue;
-                        }
-                        tracing::warn!(
-                            target: "mux",
-                            "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
-                            pid,
-                            ps.stream_id,
-                            ps.sub_stream_id,
-                        );
-                        continue;
-                    };
-
-                    let pes = super::ts::PesPacket {
-                        source: ps.source,
-                        pid,
-                        pts: ps.pts.map(|p| p as i64),
-                        dts: ps.dts.map(|d| d as i64),
-                        data: ps.data.clone(),
-                        // PS (DVD/CSS) path: no AACS conceal, no gap flag.
-                        discontinuity: false,
-                    };
-
-                    if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
-                        for frame in parser.parse(&pes) {
-                            self.pending_frames
-                                .push_back(crate::pes::PesFrame::from_codec_frame(track, frame));
-                        }
-                    }
+                for ps in packets {
+                    self.route_ps_packet(ps);
                 }
             }
 
@@ -1789,6 +1801,85 @@ mod tests {
                 .any(|&(lba, count, rec)| rec && lba == bad && count == 1),
             "expected a recovery=true read at the bad sector to have been attempted; got {reads:?}"
         );
+    }
+
+    // Fast read fails at bad_sector (0x02); the recovery read returns `rec_err()`.
+    struct RecoveryErrReader {
+        bad_sector: u32,
+        rec_err: fn() -> crate::error::Error,
+    }
+
+    impl crate::sector::SectorSource for RecoveryErrReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if self.bad_sector >= lba && self.bad_sector < lba + count as u32 {
+                if recovery {
+                    return Err((self.rec_err)());
+                }
+                return Err(crate::error::Error::DiscRead {
+                    sector: self.bad_sector as u64,
+                    status: Some(0x02),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            10
+        }
+    }
+
+    // A key stop or dead source on the RECOVERY read must abort even under
+    // skip_errors, never be zero-filled as a skipped sector.
+    #[test]
+    fn key_stop_or_dead_source_on_recovery_read_aborts_even_with_skip_errors() {
+        type MkErr = fn() -> crate::error::Error;
+        let cases: [(&str, MkErr); 3] = [
+            ("NoDiscKey", || crate::error::Error::NoDiscKey {
+                disc_hash: String::new(),
+            }),
+            ("WholeDiscKeyMissing", || {
+                crate::error::Error::WholeDiscKeyMissing
+            }),
+            ("SourceTerminated", || crate::error::Error::SourceTerminated),
+        ];
+        for (name, rec_err) in cases {
+            let mut stream = DiscStream::new(
+                Box::new(RecoveryErrReader {
+                    bad_sector: 4,
+                    rec_err,
+                }),
+                synthetic_title(10),
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap();
+            stream.skip_errors = true;
+            let mut res = Ok(true);
+            for _ in 0..1000 {
+                res = stream.fill_extents();
+                if !matches!(res, Ok(true)) {
+                    break;
+                }
+            }
+            assert!(
+                res.is_err(),
+                "{name} on the recovery read must abort, got {res:?}"
+            );
+            assert_eq!(stream.errors, 0, "{name}: must not count as a skip");
+            assert_eq!(stream.lost_bytes, 0, "{name}: must not zero-fill");
+        }
     }
 
     // Regression: a USB-bridge transport crash (0xFF) during a single-pass
@@ -2885,6 +2976,95 @@ mod tests {
             assert!(warns[0].contains("stream_id=0xd2 packets=3"), "{warns:?}");
         }
 
+        /// A PS video stream of `codec` whose AUs span two PES fragments must reach EOF
+        /// with every AU emitted exactly once (the final one drained at EOF).
+        fn ps_fragmented_au_count(codec: crate::disc::Codec, aus: &[Vec<u8>]) -> usize {
+            use crate::disc::{ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+            use crate::pes::Stream;
+
+            let mut sector = ps_pack_header();
+            for (i, au) in aus.iter().enumerate() {
+                let (head, tail) = au.split_at(au.len() - 6);
+                sector.extend_from_slice(&ps_video_pes(head, 3003 * i as u64));
+                // Continuation fragment carries no PTS: same AU.
+                let mut pes = vec![0x00, 0x00, 0x01, 0xE0u8];
+                let body_len = (3 + tail.len()) as u16;
+                pes.extend_from_slice(&body_len.to_be_bytes());
+                pes.extend_from_slice(&[0x80, 0x00, 0x00]);
+                pes.extend_from_slice(tail);
+                sector.extend_from_slice(&pes);
+            }
+            sector.resize(2048, 0xFF);
+
+            let mut t = synthetic_title(1);
+            t.content_format = ContentFormat::MpegPs;
+            t.streams = vec![crate::disc::Stream::Video(VideoStream {
+                pid: 0xE0,
+                codec,
+                resolution: Resolution::R1080i,
+                frame_rate: FrameRate::F29_97,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })];
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(sector)),
+                t,
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap();
+            let mut n = 0;
+            while s.read().unwrap().is_some() {
+                n += 1;
+            }
+            n
+        }
+
+        /// H.264 in a program stream (HD DVD EVO): AUs split across PES fragments
+        /// are reassembled and the last one is drained once at EOF (known HIGH
+        /// disc.rs:936). MPEG-2 tests cannot catch this: it is Passthrough.
+        #[test]
+        fn ps_stream_h264_fragmented_aus_emit_once_each_through_eof() {
+            let au = |first: bool, body: u8| {
+                let mut d = vec![0x00, 0x00, 0x01, 0x09, 0xF0]; // AUD
+                if first {
+                    d.extend_from_slice(&[0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0x01]);
+                    d.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0xCE, 0x01]);
+                }
+                let nal = if first { 0x65 } else { 0x41 };
+                d.extend_from_slice(&[0x00, 0x00, 0x01, nal, 0x88]);
+                d.extend_from_slice(&[body; 6]);
+                // Second slice of the same picture lands in the continuation fragment.
+                d.extend_from_slice(&[0x00, 0x00, 0x01, 0x41, 0x44, body]);
+                d
+            };
+            let aus = vec![au(true, 0x11), au(false, 0x22), au(false, 0x33)];
+            assert_eq!(ps_fragmented_au_count(crate::disc::Codec::H264, &aus), 3);
+        }
+
+        /// Same for VC-1 (advanced profile BDUs) in a program stream.
+        #[test]
+        fn ps_stream_vc1_fragmented_aus_emit_once_each_through_eof() {
+            let au = |first: bool, body: u8| {
+                let mut d = Vec::new();
+                if first {
+                    d.extend_from_slice(&[0x00, 0x00, 0x01, 0x0F, 0xD0, 0x00, 0x00, 0x00, 0x80]);
+                }
+                d.extend_from_slice(&[0x00, 0x00, 0x01, 0x0D, 0x80]);
+                d.extend_from_slice(&[body; 12]);
+                d
+            };
+            let aus = vec![au(true, 0x11), au(false, 0x22), au(false, 0x33)];
+            assert_eq!(ps_fragmented_au_count(crate::disc::Codec::Vc1, &aus), 3);
+        }
+
         // fed_bytes accumulates ACROSS read buffers, not reset per read: with
         // one GOP per sector (batch_sectors=1), a frame from sector 1 must
         // carry source.byte >= 2048, proving the base carried over.
@@ -3044,6 +3224,14 @@ mod tests {
                 b.streak_sectors, 0,
                 "the streak resets so the next probe needs a fresh clean run"
             );
+
+            // A failure mid-streak must reset it: no probe right after a failure.
+            let mut b = AdaptiveBatch::new(64);
+            b.on_failure();
+            b.on_success(30);
+            assert!(b.streak_sectors > 0);
+            b.on_failure();
+            assert_eq!(b.streak_sectors, 0, "a failure must reset the clean streak");
 
             // At the preferred size a clean run must NOT keep firing events.
             let mut b = AdaptiveBatch::new(64);

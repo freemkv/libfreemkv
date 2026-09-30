@@ -144,11 +144,10 @@ fn recover_title_key_from_plain(
 /// `plain` is the expected plaintext at byte 0x80 (≥10 bytes); returns the key only
 /// if it descrambles the sector back to `plain`, guarding a rare spurious LFSR match.
 ///
-/// TEST-ONLY: the production crack path uses [`crack_title_key`], which derives
-/// its own crib. `recover_title_key` is a known-plaintext helper exercised only
-/// by this module's unit tests and `tests/crypto_tests.rs`. It stays `pub` so
-/// that integration test (a separate crate linking the non-`cfg(test)` build)
-/// can reach it — do NOT gate it behind `#[cfg(test)]`, which would break it.
+/// TEST-ONLY: production cracks via [`crack_title_key`], which derives its own
+/// crib. This helper is used by unit tests and `tests/crypto_tests.rs`; it stays
+/// `pub` (not `#[cfg(test)]`) so that separate integration-test crate can reach it.
+#[doc(hidden)]
 pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
     if sector.len() < SECTOR_BYTES || plain.len() < 10 {
         return None;
@@ -157,13 +156,7 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
         return None;
     }
 
-    let seed: [u8; 5] = [
-        sector[SEED_OFFSET],
-        sector[SEED_OFFSET + 1],
-        sector[SEED_OFFSET + 2],
-        sector[SEED_OFFSET + 3],
-        sector[SEED_OFFSET + 4],
-    ];
+    let seed = sector_seed(sector);
 
     let crypted = &sector[ENCRYPTED_START..ENCRYPTED_START + 10];
     let key = recover_title_key_from_plain(crypted, plain, &seed)?;
@@ -173,6 +166,12 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
     } else {
         None
     }
+}
+
+fn sector_seed(sector: &[u8]) -> [u8; 5] {
+    let mut seed = [0u8; 5];
+    seed.copy_from_slice(&sector[SEED_OFFSET..SEED_OFFSET + 5]);
+    seed
 }
 
 /// Verify a title key by descrambling a copy of `sector` and checking the
@@ -185,13 +184,9 @@ fn descramble_matches(sector: &[u8], title: &[u8; 5], plain: &[u8]) -> bool {
     test[ENCRYPTED_START..ENCRYPTED_START + n] == plain[..n]
 }
 
-/// Find a repeating pattern just before the encrypted region and assume the
-/// plaintext at 0x80 continues it — the known-plaintext step of the recovery.
-/// Scans cleartext `sec[0x00..0x80]` for the longest run that repeats
-/// with a cycle length in 2..0x2F. If the run is long enough (`plen > 3` and at
-/// least two full cycles), the known plaintext at 0x80 is taken to be the
-/// periodic run continuing forward, and [`recover_title_key_from_plain`] is
-/// applied.
+/// Crack the CSS title key from one scrambled sector with no external crib.
+/// The crib is the periodic cleartext run before 0x80 (see `attack_crib`),
+/// continued into the encrypted region and fed to `recover_title_key_from_plain`.
 pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
     if sector.len() < SECTOR_BYTES {
         return None;
@@ -263,14 +258,8 @@ pub(crate) fn attack_crib(sector: &[u8]) -> Option<[u8; 10]> {
 
 fn crack_title_key_inner(sector: &[u8]) -> Option<[u8; 5]> {
     let plain = attack_crib(sector)?;
-    let seed: [u8; 5] = [
-        sector[SEED_OFFSET],
-        sector[SEED_OFFSET + 1],
-        sector[SEED_OFFSET + 2],
-        sector[SEED_OFFSET + 3],
-        sector[SEED_OFFSET + 4],
-    ];
-    let crypted = &sector[0x80..0x80 + 10];
+    let seed = sector_seed(sector);
+    let crypted = &sector[ENCRYPTED_START..ENCRYPTED_START + 10];
     if let Some(key) = recover_title_key_from_plain(crypted, &plain, &seed) {
         // Verify against the same predicted plaintext.
         if descramble_matches(sector, &key, &plain) {

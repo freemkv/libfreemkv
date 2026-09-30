@@ -6,9 +6,10 @@
 
 use std::fs::File;
 
-pub(super) fn preallocate(_file: &File, size_bytes: u64) {
+pub(super) fn preallocate(_file: &File, size_bytes: u64) -> bool {
     tracing::debug!(
         target: "mux",
         "WritebackFile preallocate size_hint={size_bytes} skipped (no-op on windows)"
     );
+    false
 }

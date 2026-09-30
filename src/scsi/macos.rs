@@ -20,10 +20,6 @@ const K_SENSE_DATA_SIZE: usize = 32;
 /// shim so a pathological >255-byte slice can't wrap a `u8`.
 const K_MAX_CDB_SIZE: usize = 16;
 
-// The timeout a caller's `timeout_ms == 0` gets: Linux SG_IO's default, include/linux/blkdev.h
-// "#define BLK_DEFAULT_SG_TIMEOUT (60 * HZ)". On macOS 0 would mean "Wait Forever".
-const ZERO_TIMEOUT_MS: u32 = 60_000;
-
 // The C shim uses a single global IOKit handle, so only one MacScsiTransport may exist at a
 // time — a second open() would race the shared handle with the first drop().
 static OPEN: AtomicBool = AtomicBool::new(false);
@@ -43,6 +39,7 @@ const SHIM_CANCELLED: i32 = -6;
 unsafe extern "C" {
     fn shim_open_exclusive(bsd_name: *const u8, cancel: *const u8) -> i32;
     fn shim_close();
+    fn shim_last_open_kr() -> i32;
     fn shim_execute(
         cdb: *const u8,
         cdb_len: u8,
@@ -86,25 +83,24 @@ fn device_path_for_selector(selector: &str) -> String {
 }
 
 // Maps a shim_open_exclusive failure sentinel (negative rc, not an IOReturn) to its typed Error
-// variant, pulled out standalone so the mapping can be unit-tested.
-fn map_shim_open_error(rc: i32, path: String) -> Error {
+// variant; `kr` is the IOReturn behind it. Standalone so the mapping can be unit-tested.
+fn map_shim_open_error(rc: i32, path: String, kr: u32) -> Error {
     match rc {
         // The caller's token was cancelled during an open wait (§2.9 M2).
         SHIM_CANCELLED => Error::Halted,
         // -2/-3/-4: IOCreatePlugInInterfaceForService /
         // QueryInterface MMCDeviceInterface /
         // GetSCSITaskDeviceInterface failed.
-        -4..=-2 => Error::IoKitPluginFailed { path, kr: 0 },
+        -4..=-2 => Error::IoKitPluginFailed { path, kr },
         // -5: ObtainExclusiveAccess failed (held by another
         // process).
-        -5 => Error::DeviceLocked { path, kr: 0 },
+        -5 => Error::DeviceLocked { path, kr },
         // -1 and anything else: device not present.
         _ => Error::DeviceNotFound { path },
     }
 }
 
 pub struct MacScsiTransport {
-    _bsd_name: String,
     /// The last command's sense-key specific progress indication (§2.11).
     last_progress: Option<u16>,
 }
@@ -134,11 +130,11 @@ impl MacScsiTransport {
             // Release the single-instance lock taken by the OPEN.swap above;
             // a failed open must not leave it held or every later open wedges.
             OPEN.store(false, Ordering::Release);
-            return Err(map_shim_open_error(rc, bsd_name.to_string()));
+            let kr = unsafe { shim_last_open_kr() } as u32;
+            return Err(map_shim_open_error(rc, bsd_name.to_string(), kr));
         }
 
         Ok(MacScsiTransport {
-            _bsd_name: bsd_name.to_string(),
             last_progress: None,
         })
     }
@@ -177,8 +173,13 @@ impl ScsiTransport for MacScsiTransport {
 
         let data_in = match direction {
             DataDirection::FromDevice => 1,
-            DataDirection::ToDevice => 0,
-            DataDirection::None => 0,
+            DataDirection::ToDevice | DataDirection::None => 0,
+        };
+        // The shim picks the transfer direction from the length: None never transfers.
+        let buf_len = if direction == DataDirection::None {
+            0
+        } else {
+            data.len() as u32
         };
 
         let mut sense = [0u8; K_SENSE_DATA_SIZE];
@@ -194,18 +195,14 @@ impl ScsiTransport for MacScsiTransport {
                 cdb.as_ptr(),
                 cdb_len,
                 data.as_mut_ptr(),
-                data.len() as u32,
+                buf_len,
                 data_in,
                 sense.as_mut_ptr(),
                 K_SENSE_DATA_SIZE as u32,
                 &mut task_status,
                 &mut transfer_count,
-                // SCSITaskLib.h SetTimeoutDuration: "A value of zero is equivalent to "Wait Forever"".
-                if timeout_ms == 0 {
-                    ZERO_TIMEOUT_MS
-                } else {
-                    timeout_ms
-                },
+                // SCSITaskLib.h SetTimeoutDuration: zero is "Wait Forever", so 0 becomes the default.
+                super::effective_timeout_ms(timeout_ms),
             )
         };
 
@@ -227,12 +224,13 @@ impl ScsiTransport for MacScsiTransport {
         }
 
         if task_status != 0 {
-            let parsed = super::parse_sense(&sense, K_SENSE_DATA_SIZE as u8);
-            self.last_progress = super::parse_sense_progress(&sense, K_SENSE_DATA_SIZE as u8);
+            let parsed = super::sense_for_status(task_status, &sense, K_SENSE_DATA_SIZE as u8);
+            self.last_progress =
+                parsed.and_then(|_| super::parse_sense_progress(&sense, K_SENSE_DATA_SIZE as u8));
             return Err(Error::ScsiError {
                 opcode: cdb.first().copied().unwrap_or(0),
                 status: task_status,
-                sense: Some(parsed),
+                sense: parsed,
             });
         }
 
@@ -456,23 +454,23 @@ mod tests {
     #[test]
     fn map_shim_open_error_distinguishes_every_sentinel() {
         for rc in [-2, -3, -4] {
-            match map_shim_open_error(rc, "disk4".into()) {
+            match map_shim_open_error(rc, "disk4".into(), 0xE00002C7) {
                 Error::IoKitPluginFailed { path, kr } => {
                     assert_eq!(path, "disk4");
-                    assert_eq!(kr, 0);
+                    assert_eq!(kr, 0xE00002C7, "the real IOReturn is carried, not 0");
                 }
                 other => panic!("rc={rc}: expected IoKitPluginFailed, got {other:?}"),
             }
         }
-        match map_shim_open_error(-5, "disk4".into()) {
+        match map_shim_open_error(-5, "disk4".into(), 0xE00002C5) {
             Error::DeviceLocked { path, kr } => {
                 assert_eq!(path, "disk4");
-                assert_eq!(kr, 0);
+                assert_eq!(kr, 0xE00002C5);
             }
             other => panic!("expected DeviceLocked, got {other:?}"),
         }
         for rc in [-1, -7, i32::MIN] {
-            match map_shim_open_error(rc, "disk4".into()) {
+            match map_shim_open_error(rc, "disk4".into(), 0) {
                 Error::DeviceNotFound { path } => assert_eq!(path, "disk4"),
                 other => panic!("rc={rc}: expected DeviceNotFound, got {other:?}"),
             }
@@ -523,6 +521,8 @@ mod tests {
         fn shim_selftest_reaped(pid: i32) -> i32;
         fn shim_selftest_install_fake_device() -> i32;
         fn shim_selftest_last_timeout_ms() -> u32;
+        fn shim_selftest_set_execute(kr: i32, status: u8, count: u64, sense: *const u8);
+        fn shim_selftest_fake_optical(on: i32);
     }
 
     /// A wait that is never cancelled would run this long; every cancelled wait must end far sooner.
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn shim_selftest_cancelled_open_is_halted() {
         assert!(matches!(
-            map_shim_open_error(SHIM_CANCELLED, "disk4".into()),
+            map_shim_open_error(SHIM_CANCELLED, "disk4".into(), 0),
             Error::Halted
         ));
 
@@ -704,11 +704,42 @@ mod tests {
         );
     }
 
-    /// §2.9 M2 end to end: shim_open_exclusive hands its token to its own waits. The unmount of
-    /// a missing disk ends at once, so the cancel lands in the 500 ms settle (or the unmount).
+    /// A selector that is not an optical drive is refused before anything is unmounted: the
+    /// open fails at once (no 500 ms settle sleep, no diskutil) and releases the lock.
+    #[test]
+    fn open_of_a_non_optical_selector_is_refused_before_any_unmount() {
+        let _globals = shim_globals();
+        let t0 = Instant::now();
+        let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &Halt::new());
+        assert!(
+            matches!(r, Err(Error::DeviceNotFound { .. })),
+            "expected DeviceNotFound, got {:?}",
+            r.err()
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(250),
+            "refusal took {:?}: the post-unmount settle sleep ran",
+            t0.elapsed()
+        );
+        assert!(
+            !OPEN.load(Ordering::Acquire),
+            "a failed open left OPEN held"
+        );
+    }
+
+    /// §2.9 M2 end to end: a resolved drive's open hands its token to the unmount and 500 ms
+    /// settle waits. The unmount of a missing disk ends at once, so the cancel lands in the settle.
     #[test]
     fn shim_selftest_cancel_mid_open_is_halted() {
+        struct FakeOptical;
+        impl Drop for FakeOptical {
+            fn drop(&mut self) {
+                unsafe { shim_selftest_fake_optical(0) };
+            }
+        }
         let _globals = shim_globals();
+        unsafe { shim_selftest_fake_optical(1) };
+        let _fake = FakeOptical;
         let (r, wake) = {
             let halt = Halt::new();
             let canceller = {
@@ -751,7 +782,6 @@ mod tests {
         );
         assert_eq!(unsafe { shim_selftest_install_fake_device() }, 0);
         let mut transport = MacScsiTransport {
-            _bsd_name: "selftest".into(),
             last_progress: None,
         };
         for timeout_ms in [1, 5_000, 10_000, 12_345, 60_000] {
@@ -766,5 +796,108 @@ mod tests {
         assert_eq!(unsafe { shim_selftest_last_timeout_ms() }, 60_000);
         drop(transport);
         assert!(!OPEN.load(Ordering::Acquire), "drop released OPEN");
+    }
+
+    // Holds SHIM_GLOBALS for a test that scripts the fake device, and puts the knob back to
+    // its defaults on drop (panic included) before the lock is released.
+    struct FakeDeviceGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl Drop for FakeDeviceGuard {
+        fn drop(&mut self) {
+            unsafe { shim_selftest_set_execute(0, 0, 0, std::ptr::null()) };
+        }
+    }
+
+    // Runs `execute` on the fake device after `shim_selftest_set_execute(kr, status, count, sense)`.
+    fn execute_on_fake(
+        kr: i32,
+        status: u8,
+        count: u64,
+        sense: Option<&[u8; 32]>,
+        data: &mut [u8],
+    ) -> (
+        MacScsiTransport,
+        crate::error::Result<crate::scsi::ScsiResult>,
+    ) {
+        assert!(
+            !OPEN.swap(true, Ordering::Acquire),
+            "OPEN held outside SHIM_GLOBALS"
+        );
+        assert_eq!(unsafe { shim_selftest_install_fake_device() }, 0);
+        unsafe {
+            shim_selftest_set_execute(
+                kr,
+                status,
+                count,
+                sense.map_or(std::ptr::null(), |s| s.as_ptr()),
+            )
+        };
+        let mut transport = MacScsiTransport {
+            last_progress: None,
+        };
+        let r = transport.execute(&[0u8; 6], DataDirection::FromDevice, data, 1_000);
+        (transport, r)
+    }
+
+    /// CHECK CONDITION is an error carrying the parsed sense and its progress indication;
+    /// any other nonzero status is an error with no sense.
+    #[test]
+    fn shim_selftest_check_condition_and_other_statuses_are_errors() {
+        let _globals = FakeDeviceGuard(shim_globals());
+        // Fixed format, NOT READY / 04h 01h (becoming ready), SKSV set, progress 0x1234.
+        let mut sense = [0u8; 32];
+        sense[0] = 0x70;
+        sense[2] = 0x02;
+        sense[12] = 0x04;
+        sense[13] = 0x01;
+        sense[15] = 0x80;
+        sense[16..18].copy_from_slice(&0x1234u16.to_be_bytes());
+        let (t, r) = execute_on_fake(0, 0x02, 0, Some(&sense), &mut [0u8; 8]);
+        match r {
+            Err(Error::ScsiError {
+                status: 0x02,
+                sense: Some(s),
+                ..
+            }) => assert_eq!((s.sense_key, s.asc, s.ascq), (2, 0x04, 0x01)),
+            other => panic!("expected CHECK CONDITION with sense, got {other:?}"),
+        }
+        assert_eq!(t.last_sense_progress(), Some(0x1234));
+        drop(t);
+
+        // BUSY (08h) carries no sense on the wire, and no progress.
+        let (t, r) = execute_on_fake(0, 0x08, 0, Some(&sense), &mut [0u8; 8]);
+        assert!(matches!(
+            r,
+            Err(Error::ScsiError {
+                status: 0x08,
+                sense: None,
+                ..
+            })
+        ));
+        assert_eq!(t.last_sense_progress(), None);
+    }
+
+    /// A failing IOKit return is a transport failure, whatever status the task reported.
+    #[test]
+    fn shim_selftest_iokit_failure_is_a_transport_failure() {
+        let _globals = FakeDeviceGuard(shim_globals());
+        let (_t, r) = execute_on_fake(0x2c2, 0, 8, None, &mut [0u8; 8]);
+        assert!(matches!(
+            r,
+            Err(Error::ScsiError {
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+                ..
+            })
+        ));
+    }
+
+    /// `bytes_transferred` is what the device moved, never more than the buffer holds.
+    #[test]
+    fn shim_selftest_transfer_count_is_clamped_to_the_buffer() {
+        let _globals = FakeDeviceGuard(shim_globals());
+        for (count, want) in [(100u64, 100usize), (512, 512), (4096, 512), (u64::MAX, 512)] {
+            let (_t, r) = execute_on_fake(0, 0, count, None, &mut [0u8; 512]);
+            assert_eq!(r.expect("GOOD").bytes_transferred, want, "count {count}");
+        }
     }
 }
