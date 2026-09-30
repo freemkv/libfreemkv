@@ -2406,23 +2406,12 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
     };
     let res = Resolution::from_height(video.pixel_height);
     let chs = AudioChannels::from_count(ch);
-    let srs = if sr >= 192000.0 {
-        SampleRate::S192
-    } else if sr >= 176400.0 {
-        SampleRate::S176_4
-    } else if sr >= 96000.0 {
-        SampleRate::S96
-    } else if sr >= 88200.0 {
-        SampleRate::S88_2
-    } else if (44100.0..48000.0).contains(&sr) {
-        SampleRate::S44_1
-    } else if sr >= 48000.0 {
-        SampleRate::S48
-    } else {
-        // Below the lowest mapped rate is UNKNOWN, not 48kHz (a legal 32kHz
-        // AC-3/DTS track must not be recorded as 48kHz). This float ladder exists only for tolerance vs. `SampleRate::from_hz`.
-        SampleRate::Unknown
-    };
+    // The standard rate within 0.1% of SamplingFrequency; any other rate is Unknown, never a
+    // neighbouring bucket.
+    let srs = [44100u32, 48000, 88200, 96000, 176400, 192000]
+        .into_iter()
+        .find(|&hz| (sr - f64::from(hz)).abs() <= f64::from(hz) * 1e-3)
+        .map_or(SampleRate::Unknown, SampleRate::from_hz);
 
     // Map MKV track numbers to BD-TS PIDs, computed in u32 so `0x1100 + (tnum - 2)`
     // can't wrap u16 (a 13-bit PID tops out at 0x1FFF); out of range is rejected. Only
@@ -7502,6 +7491,29 @@ mod readback_tests {
         assert_eq!(drain_all(&mut s).len(), 1);
         assert_eq!(s.errors(), 2);
         assert_eq!(s.lost_bytes(), 7);
+    }
+
+    #[test]
+    fn a_sampling_frequency_maps_only_to_its_own_standard_rate() {
+        for (hz, want) in [
+            (48000.0, SampleRate::S48),
+            (47999.99, SampleRate::S48),
+            (44100.0, SampleRate::S44_1),
+            (96000.0, SampleRate::S96),
+            (64000.0, SampleRate::Unknown),
+            (128000.0, SampleRate::Unknown),
+            (32000.0, SampleRate::Unknown),
+        ] {
+            let audio = el(
+                ebml::AUDIO,
+                &el(ebml::SAMPLING_FREQUENCY, &f64::to_be_bytes(hz)),
+            );
+            let s = open(mkv(&[entry(1, 2, ebml::CODEC_AC3, &audio)], &[]));
+            let Stream::Audio(a) = &s.info().streams[0] else {
+                panic!("audio")
+            };
+            assert_eq!(a.sample_rate, want, "{hz}");
+        }
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
