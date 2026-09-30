@@ -680,7 +680,7 @@ mod tests {
     }
 
     /// ASCII takes compression ID 8; anything above takes 16 (UTF-16BE),
-    /// because `parse_udf_name` decodes compression-8 bytes as UTF-8.
+    /// because `parse_udf_name` decodes compression-8 bytes as Latin-1.
     #[test]
     fn cs0_picks_the_encoding_the_parser_can_decode() {
         assert_eq!(encode_cs0("AB"), vec![8, b'A', b'B']);
