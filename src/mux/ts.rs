@@ -249,6 +249,8 @@ pub struct TsDemuxer {
     /// True once a caller has threaded a source base via [`Self::feed_at`]. Until
     /// then no `SourcePos` is stamped (keeps existing callers byte-identical).
     has_base: bool,
+    /// Set once sync loss has been logged, so a damaged input warns only once.
+    sync_lost_logged: bool,
 }
 
 impl TsDemuxer {
@@ -281,6 +283,7 @@ impl TsDemuxer {
             remainder: Vec::new(),
             feed_base: 0,
             has_base: false,
+            sync_lost_logged: false,
         }
     }
 
@@ -352,6 +355,12 @@ impl TsDemuxer {
 
         // Aligned-packets fast path — reads directly out of `data`.
         while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
+            if data[offset + 4] != SYNC_BYTE {
+                // Lost sync (a byte slip): the next corroborated packet boundary, the aligned
+                // one first. Lost packets surface as CC gaps on their PIDs.
+                offset = self.resync(data, offset);
+                continue;
+            }
             let packet = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
             let src = self.pkt_source(offset);
             offset += BD_SOURCE_PACKET_BYTES;
@@ -375,6 +384,21 @@ impl TsDemuxer {
         }
 
         completed
+    }
+
+    // Offset of the next credible packet boundary after the unsynced `offset`, or the end.
+    fn resync(&mut self, data: &[u8], offset: usize) -> usize {
+        if !self.sync_lost_logged {
+            self.sync_lost_logged = true;
+            tracing::warn!(target: "mux", offset, "bd-ts: lost packet sync; resyncing");
+        }
+        let aligned = offset + BD_SOURCE_PACKET_BYTES;
+        if aligned + BD_SOURCE_PACKET_BYTES <= data.len() && is_resync_point(data, aligned) {
+            return aligned;
+        }
+        (offset + 1..data.len())
+            .find(|&p| is_resync_point(data, p))
+            .unwrap_or(data.len())
     }
 
     // Demux a single 192-byte BD-TS packet (4-byte TP_extra_header + 188-byte
@@ -1088,6 +1112,23 @@ mod tests {
             assert_eq!(out[0].pts, Some(0x1_2345_6789), "split {split}");
             assert_eq!(out[0].dts, Some(0x1_2345_0000), "split {split}");
         }
+    }
+
+    // A byte slip mid-stream loses only the packets it hits: the demuxer resyncs.
+    #[test]
+    fn byte_slip_resyncs_to_the_next_packet_boundary() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut data = ts_payload_packet(pid, true, 0, &pes_start(b"AAAA"));
+        data.push(0x00);
+        data.extend(ts_payload_packet(pid, false, 1, b"BBBB"));
+        data.extend(ts_payload_packet(pid, true, 2, &pes_start(b"CCCC")));
+        let mut out = demux.feed(&data);
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].data.starts_with(b"AAAA"));
+        assert!(out[0].data[175..].starts_with(b"BBBB"), "continuation kept");
+        assert!(out[1].data.starts_with(b"CCCC"));
     }
 
     // A packet flagged transport_error_indicator is damaged: its PES is dropped, not
