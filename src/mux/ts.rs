@@ -392,11 +392,14 @@ impl TsDemuxer {
         completed
     }
 
-    // Next packet start after the unsynced `offset`: the first grid slot with a sync byte
-    // (zero-filled gaps keep the grid), or an off-grid point corroborated by a second sync
-    // 192 bytes on (a byte slip). With neither, the last grid slot, so alignment carries over.
+    // Next packet start after the unsynced `offset`: the next grid slot if it has a sync byte,
+    // else the first grid slot with one or an off-grid point confirmed 192 bytes on (a slip).
+    // With neither, the last grid slot, so alignment carries over.
     fn resync(&mut self, data: &[u8], offset: usize) -> usize {
         let step = BD_SOURCE_PACKET_BYTES;
+        if data.get(offset + step + 4) == Some(&SYNC_BYTE) {
+            return offset + step;
+        }
         for p in offset + 1..data.len().saturating_sub(4) {
             if (p - offset).is_multiple_of(step) {
                 if data[p + 4] == SYNC_BYTE {
@@ -1157,6 +1160,26 @@ mod tests {
         assert!(out[0].data.starts_with(b"AAAA"));
         assert!(out[0].data[175..].starts_with(b"BBBB"), "continuation kept");
         assert!(out[1].data.starts_with(b"CCCC"));
+    }
+
+    // A lone damaged sync byte keeps the grid even when stray 0x47 bytes 192 apart would
+    // pass for an off-grid packet boundary.
+    #[test]
+    fn resync_prefers_the_next_grid_slot_over_an_off_grid_pair() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut bad = ts_payload_packet(pid, false, 1, &[0xAA; 184]);
+        bad[4] = 0x00;
+        bad[50] = SYNC_BYTE;
+        let mut b = ts_payload_packet(pid, true, 2, &pes_start(&[0xBB; 60]));
+        b[50] = SYNC_BYTE;
+        let mut data = ts_payload_packet(pid, true, 0, &pes_start(b"AAAA"));
+        data.extend(bad);
+        data.extend(b);
+        let mut out = demux.feed(&data);
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[1].data.starts_with(&[0xBB; 30]));
     }
 
     // Zero-filled gaps (unreadable sectors) keep the packet grid: a lone packet after one
