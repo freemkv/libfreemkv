@@ -1436,6 +1436,62 @@ mod tests {
         assert_eq!(RBSP_COPIES.with(|c| c.get()), 0);
     }
 
+    // Counts this thread's heap allocations so a test can measure what `scan_sei` itself does.
+    struct CountingAlloc;
+    thread_local! {
+        static ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    // SAFETY: forwards every call to `System`; the counter is a const-initialised Cell.
+    unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { std::alloc::System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { std::alloc::System.realloc(p, l, n) }
+        }
+    }
+    #[global_allocator]
+    static COUNTING: CountingAlloc = CountingAlloc;
+
+    // MEASURED on `scan_sei` itself (RBSP_COPIES cannot see it: it walks a copy-free iterator):
+    // a payload that is not wanted is skipped, never collected into a Vec.
+    #[test]
+    fn scan_sei_allocates_only_for_a_payload_it_captures() {
+        let mastering = mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, 9, 10);
+        // Drop the start code: scan_sei takes the NAL from its 2-byte header.
+        let nal = |msgs: &[Vec<u8>]| sei_nal(msgs)[3..].to_vec();
+        let allocs = |p: &mut HevcParser, n: &[u8]| {
+            let before = ALLOCS.with(|c| c.get());
+            p.scan_sei(n);
+            ALLOCS.with(|c| c.get()) - before
+        };
+        let big = sei_message(5, &[0x42; 600]); // user_data_unregistered: never wanted
+        let mut parser = HevcParser::new();
+        let first = nal(&[sei_message(SEI_MASTERING_DISPLAY_COLOUR_VOLUME, &mastering)]);
+        assert!(
+            allocs(&mut parser, &first) > 0,
+            "control: a capture allocates"
+        );
+        assert!(parser.sei_mastering.is_some() && parser.sei_content_light.is_none());
+
+        // Content-light is still absent, so the walk runs: mastering (already held) and the
+        // big payload are both skipped.
+        let skipped = nal(&[
+            big.clone(),
+            sei_message(SEI_MASTERING_DISPLAY_COLOUR_VOLUME, &mastering),
+        ]);
+        assert_eq!(
+            allocs(&mut parser, &skipped),
+            0,
+            "unwanted payloads are not copied"
+        );
+    }
+
     /// Only the mastering-display SEI (no content-light SEI) → metadata is NOT
     /// surfaced. HDR10 requires BOTH; a half-populated record is never emitted.
     #[test]
@@ -1781,6 +1837,24 @@ mod tests {
             bare[0].coding.is_none(),
             "no active PPS → coding omitted, never a guessed type"
         );
+    }
+
+    // An IRAP slice header carries no_output_of_prior_pics_flag before the PPS id; skipping it
+    // is what lands slice_type on the right bit, whatever the flag's value.
+    #[test]
+    fn irap_slices_report_their_coding_type() {
+        use super::super::coding::CodingType;
+        // first_slice=1, no_output=X, pps_id ue '1'=0, slice_type ue '011'=2 (I), pad.
+        for (nal_type, body) in [(19, 0xECu8), (19, 0xAC), (21, 0xEC), (21, 0xAC)] {
+            let mut data = nal_bytes(NAL_PPS, &[0xC0]);
+            data.extend_from_slice(&nal_bytes(nal_type, &[body]));
+            let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+            assert_eq!(
+                frames[0].coding.expect("PictureInfo").coding_type(),
+                CodingType::I,
+                "NAL {nal_type} body {body:#x}"
+            );
+        }
     }
 
     // --- VPS+SPS+PPS → codec_private ---
@@ -3349,6 +3423,25 @@ mod tests {
         max_sub_layers_minus1: u32,
         conformance_window: bool,
     ) -> Vec<u8> {
+        let flags = vec![(true, true); max_sub_layers_minus1 as usize];
+        make_sps_sublayers(
+            chroma_idc,
+            bd_luma_m8,
+            bd_chroma_m8,
+            &flags,
+            conformance_window,
+        )
+    }
+
+    // As `make_sps_full`, with each sub-layer's (profile_present, level_present) flags chosen.
+    fn make_sps_sublayers(
+        chroma_idc: u32,
+        bd_luma_m8: u32,
+        bd_chroma_m8: u32,
+        sub_layer_flags: &[(bool, bool)],
+        conformance_window: bool,
+    ) -> Vec<u8> {
+        let max_sub_layers_minus1 = sub_layer_flags.len() as u32;
         let mut w = BitWriter::new();
         w.put_bits(0, 4); // sps_video_parameter_set_id
         w.put_bits(max_sub_layers_minus1, 3);
@@ -3359,27 +3452,23 @@ mod tests {
         }
         // Sub-layer flags + sub-layer PTL when max_sub_layers_minus1 > 0.
         if max_sub_layers_minus1 > 0 {
-            let mut profile_present = Vec::new();
-            let mut level_present = Vec::new();
-            for _ in 0..max_sub_layers_minus1 {
+            for &(profile, level) in sub_layer_flags {
                 // sub_layer_profile_present_flag, sub_layer_level_present_flag.
-                w.put_bit(1); // profile present
-                w.put_bit(1); // level present
-                profile_present.push(true);
-                level_present.push(true);
+                w.put_bit(profile as u32);
+                w.put_bit(level as u32);
             }
             if max_sub_layers_minus1 < 8 {
                 for _ in max_sub_layers_minus1..8 {
                     w.put_bits(0, 2); // reserved_zero_2bits
                 }
             }
-            for i in 0..max_sub_layers_minus1 as usize {
-                if profile_present[i] {
+            for &(profile, level) in sub_layer_flags {
+                if profile {
                     for _ in 0..88 {
                         w.put_bit(0); // sub-layer profile block
                     }
                 }
-                if level_present[i] {
+                if level {
                     w.put_bits(0, 8); // sub_layer_level_idc
                 }
             }
@@ -3424,6 +3513,25 @@ mod tests {
             (3 << 3) | (1 << 2) | 0x03,
             "numTemporalLayers = 3, temporalIdNested = 1, lengthSizeMinusOne = 3"
         );
+    }
+
+    // Each sub-layer's profile block (88 bits) and level byte (8 bits) are skipped on their OWN
+    // flag, so any mix of the two flags must still land on the bit depths.
+    #[test]
+    fn hvcc_parses_chroma_through_sublayers_with_mixed_ptl_flags() {
+        let cases: [&[(bool, bool)]; 5] = [
+            &[(true, false)],
+            &[(false, true)],
+            &[(false, false)],
+            &[(true, false), (false, true)],
+            &[(false, true), (true, false), (false, false)],
+        ];
+        for flags in cases {
+            let cp = codec_private_from_sps(&make_sps_sublayers(1, 4, 2, flags, false));
+            assert_eq!(cp[16], 0xFC | 1, "chroma with flags {flags:?}");
+            assert_eq!(cp[17], 0xF8 | 4, "luma depth with flags {flags:?}");
+            assert_eq!(cp[18], 0xF8 | 2, "chroma depth with flags {flags:?}");
+        }
     }
 
     #[test]
