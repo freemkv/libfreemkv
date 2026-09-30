@@ -440,6 +440,52 @@ mod tests {
         );
     }
 
+    // `with_ps_reorder(true)` (HD-DVD EVO) must INSTALL the reorderer, and `flush()` must drain
+    // the frames it still holds at EOF; without it nothing is buffered.
+    #[test]
+    fn vc1_ps_reorder_is_installed_and_flush_drains_its_frames() {
+        // Progressive advanced-profile header, so PTYPE is measured (I '110', P '0', B '10').
+        let seq = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0];
+        let pic = |ptype: u8| vec![0x00, 0x00, 0x01, SC_FRAME, ptype];
+        let gop = |anchor: i64| {
+            vec![
+                (([&seq[..], &pic(0xC0)]).concat(), Some(anchor)), // I: keyframe anchor
+                (pic(0x00), None),                                 // P
+                (pic(0x80), None),                                 // B
+                (pic(0x00), None),                                 // P
+                (pic(0x80), None),                                 // B
+            ]
+        };
+        let feed = |reorder: bool| -> (Vec<Frame>, Vec<Frame>) {
+            let mut p = Vc1Parser::new().with_ps_reorder(reorder);
+            let mut during = Vec::new();
+            // Two GOPs; the second anchor is 5 frames later (90 kHz: 5 x 3750).
+            for (data, pts) in gop(0).into_iter().chain(gop(18_750)) {
+                during.extend(p.parse(&make_pes(data, pts)));
+            }
+            let tail = p.flush();
+            (during, tail)
+        };
+
+        let (during, tail) = feed(true);
+        assert!(
+            !tail.is_empty(),
+            "the reorderer holds frames; flush releases them"
+        );
+        assert!(tail.iter().all(|f| !f.data.is_empty()), "real coded bytes");
+        let mut pts: Vec<i64> = during.iter().chain(&tail).map(|f| f.pts_ns).collect();
+        assert_eq!(pts.len(), 10, "every access unit is emitted exactly once");
+        pts.sort_unstable();
+        pts.dedup();
+        assert_eq!(pts.len(), 10, "reconstructed PTS are all distinct");
+
+        // Off: nothing is buffered, and the sparse-PTS frames collide on the anchor's 0.
+        let (raw_during, raw_tail) = feed(false);
+        assert!(raw_tail.is_empty(), "no reorderer installed");
+        assert_eq!(raw_during.len(), 10);
+        assert!(raw_during.iter().filter(|f| f.pts_ns == 0).count() >= 4);
+    }
+
     /// Build a VC-1 PES with sequence header + entry point + frame start code.
     fn build_vc1_iframe_pes() -> Vec<u8> {
         let mut data = Vec::new();
