@@ -642,11 +642,11 @@ fn apply_aacs_map(
 const WRONG_KEY_FAILURES: usize = 2;
 
 /// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
-/// zero-fill them, like a sweep's unread sector, and return how many. Damaged: flagged (CPI)
-/// with no TS sync in the seed, or a zero-filled first sector over a non-TS rest. No key opens
-/// either, so it is read damage, never a key verdict and never E7013, whether the unit is
-/// alone, in a cluster, or a read cut off its grid (1.7.7 muxed through all three). Only units
-/// `covered` (keyed or proven on arrival) are judged. A garbage seed that keeps 0x47 at byte 4
+/// zero-fill them, like a sweep's unread sector, and return how many. Damaged: no TS sync at
+/// byte 4, flagged (CPI) or not; unflagged only when not clean TS either (a zeroed head over
+/// clear TS is a sweep hole). No key opens them: read damage, never a key verdict or E7013,
+/// alone, clustered, or off the grid (1.7.7 muxed through all three). Only units `covered`
+/// (keyed or proven on arrival) are judged. A flagged garbage seed that keeps 0x47 at byte 4
 /// (~1 in 256) is not caught here: it decrypts as garbage, or on arrival reads as unopened.
 pub(crate) fn blank_damaged_units(
     buf: &mut [u8],
@@ -664,18 +664,15 @@ pub(crate) fn blank_damaged_units(
         if !covered(lba) {
             continue;
         }
+        // KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed";
+        // KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport
+        // packet", so an intact unit, clear or not, has the TS sync at byte 4 (KS-22 too).
         let lost = if aacs::content::aacs_unit_seed_encrypted(unit, format) {
-            // KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed";
-            // KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport
-            // packet", so an intact seed carries the TS sync at byte 4 (KS-22 corroborates).
             !aacs::content::aacs_unit_on_grid(unit, format)
         } else {
-            // A zero-filled head took the seed (KS-4); a non-zero rest that is not TS is
-            // ciphertext no key opens. A trailing zero run keeps its head and decrypts.
-            let (head, rest) = unit.split_at(crate::consts::SECTOR_BYTES);
-            head.iter().all(|&b| b == 0)
-                && rest.iter().any(|&b| b != 0)
-                && !aacs::content::is_clean(unit, format)
+            // A zeroed or garbled head over a rest that is not TS: ciphertext no key opens.
+            // A trailing zero run keeps its head; an all-zero unit is clean (a sweep hole).
+            unit[4] != 0x47 && !aacs::content::is_clean(unit, format)
         };
         if lost {
             damaged.push(i);
