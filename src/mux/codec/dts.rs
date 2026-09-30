@@ -45,6 +45,8 @@ pub struct DtsParser {
     /// [`Self::stamp_pts`] usage) so every SURVIVING AU keeps the exact timestamp it
     /// would have had — a drop becomes a silence gap, never a shift.
     tally: super::dropgate::DropTally,
+    /// A core sync has been framed; extension-only PES before any core are unsupported.
+    core_seen: bool,
 }
 
 impl Default for DtsParser {
@@ -61,6 +63,7 @@ impl DtsParser {
             last_front_pts: PTS_UNSET,
             next_pts_ns: PTS_UNSET,
             tally: super::dropgate::DropTally::new("dts"),
+            core_seen: false,
         }
     }
 
@@ -248,6 +251,20 @@ impl CodecParser for DtsParser {
             // Resync to the first candidate core sync; drop leading junk and any run of
             // bogus (implausibly sized) syncs in ONE drain rather than 4 bytes at a time.
             let Some(start) = first_core_candidate(self.acc.as_slice(), 0) else {
+                // Core-less stream (DTS Express/LBR: EXSS only): not framed, so say so.
+                if !self.core_seen && find_sync(self.acc.as_slice(), &DTS_HD_EXT_SYNC).is_some() {
+                    if self.tally.dropped_frames() == 0 {
+                        tracing::warn!(target: "mux", "dts: core-less extension stream (DTS Express) is unsupported; track will be empty");
+                    }
+                    self.tally.record_collateral_drop(
+                        pts_ns,
+                        0,
+                        self.acc.len(),
+                        "exss-only-unsupported",
+                    );
+                    self.drain_front(self.acc.len() - 3);
+                    break;
+                }
                 // No candidate core sync yet — keep at most a 3-byte tail so a
                 // sync split across PES packets can still be found next time.
                 if self.acc.len() > 3 {
@@ -256,6 +273,7 @@ impl CodecParser for DtsParser {
                 }
                 break;
             };
+            self.core_seen = true;
             if start > 0 {
                 self.drain_front(start);
                 // The sync `find_sync` located at offset `start` is now at
@@ -1775,6 +1793,15 @@ mod tests {
     }
 
     // --- find_sync ---
+
+    #[test]
+    fn core_less_exss_stream_is_counted_not_silently_dropped() {
+        let mut parser = DtsParser::new();
+        let mut d = DTS_HD_EXT_SYNC.to_vec();
+        d.extend_from_slice(&[0u8; 60]);
+        assert!(parser.parse(&make_pes(d, Some(90_000))).is_empty());
+        assert_eq!(parser.dropped_frames(), 1);
+    }
 
     #[test]
     fn find_sync_locates_core() {

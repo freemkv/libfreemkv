@@ -336,11 +336,6 @@ impl CodecParser for PgsParser {
                     // The set's facts are THIS packet's — the one that opened
                     // it. `start` is that packet's PTS by construction.
                     self.pending = Some((super::pesbuf::PesFacts::of(pes), pes.data.clone()));
-                    debug_assert_eq!(
-                        super::pesbuf::PesFacts::of(pes).presentation_ns(),
-                        Some(start),
-                        "the opening packet's PTS is the set's start"
-                    );
                 }
                 // A PCS with no PTS has an unknown start time. Don't
                 // store it with a 0 sentinel (wrong start, absurd duration).
@@ -353,6 +348,10 @@ impl CodecParser for PgsParser {
             // current display set, or non-standard layout. If we have
             // a pending display, append; otherwise emit as-is.
             None => {
+                // A gap mid-set truncated it; the post-gap segment cannot be spliced on.
+                if pes.discontinuity {
+                    self.pending = None;
+                }
                 if let Some((_, ref mut buf)) = self.pending {
                     // Bound accumulation: a well-formed display set is small.
                     // Past the cap, drop further appends (malformed stream);
@@ -360,7 +359,7 @@ impl CodecParser for PgsParser {
                     if buf.len() + pes.data.len() <= MAX_PGS_PENDING_BYTES {
                         buf.extend_from_slice(&pes.data);
                     }
-                } else if pes.pts.is_some() {
+                } else if let Some(pts_ns) = pts {
                     // A lone non-PCS segment with a real PTS — pass it through.
                     // (A missing PTS falls through to the drop path below: a
                     // bitmap with no timing reference would land at 00:00:00.)
@@ -371,7 +370,7 @@ impl CodecParser for PgsParser {
                         // this packet's -- the same rule as a pending set,
                         // which takes the facts of the packet that opened it.
                         source: super::pesbuf::PesFacts::of(pes).source,
-                        pts_ns: pts.unwrap_or(0),
+                        pts_ns,
                         keyframe: true,
                         data: pes.data.clone(),
                         duration_ns: Some(DEFAULT_PGS_DURATION_NS),
@@ -538,6 +537,16 @@ mod tests {
         assert_eq!(frames.len(), 1);
         let data = &frames[0].data;
         assert!(data.windows(5).any(|w| w == [0x15, 0x00, 0x02, 0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn post_gap_segment_is_not_spliced_onto_pending_set() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let mut pes = make_pes(vec![0x15, 0x00, 0x02, 0xAA, 0xBB], None);
+        pes.discontinuity = true;
+        assert!(parser.parse(&pes).is_empty());
+        assert!(parser.flush().is_empty(), "the truncated set is dropped");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! ISO/IEC 11172-3 (the public CD text of §2.4.2.3, which 13818-7 refers to). MPEG-4 ADTS
 //! (ID '0', 7350 Hz at index 0xc) follows ISO/IEC 14496-3, which is not quoted here.
 
-use super::audio_frames::{AudioFrames, Header, Sync};
+use super::audio_frames::{AudioFrames, Header, SyncSpec};
 #[cfg(test)]
 use super::pts_to_ns;
 use super::{CodecParser, Frame, PesPacket};
@@ -17,6 +17,9 @@ const ADTS_SAMPLE_RATE_VALID: [u32; 16] = [
 ];
 
 /// ADTS header verdict for the packet head.
+// Length of the fixed ADTS header without CRC.
+const ADTS_HEADER_BYTES: usize = 7;
+
 enum AdtsVerdict {
     /// No 12-bit ADTS sync at the head — not an ADTS frame we can validate.
     NoSync,
@@ -28,7 +31,7 @@ enum AdtsVerdict {
 
 fn adts_verdict(data: &[u8]) -> AdtsVerdict {
     // Need the full 7-byte fixed+variable header to read frame_length.
-    if data.len() < 7 {
+    if data.len() < ADTS_HEADER_BYTES {
         return AdtsVerdict::NoSync;
     }
     // [13818-7 §8.1.1.2] syncword: "The bit string '1111 1111 1111'."
@@ -95,13 +98,13 @@ impl AdtsParser {
         Self {
             frames: AudioFrames::new(
                 "aac",
-                Sync {
+                SyncSpec {
                     mask: 0xf0,
                     frame_len: adts_frame_len,
                     fixed: adts_fixed_key,
                     frame_ns: adts_frame_ns,
                     // [13818-7 §8.1.1.2] frame_length "including headers": at least 7 bytes.
-                    min_frame: 7,
+                    min_frame: ADTS_HEADER_BYTES,
                 },
             ),
             config: None,
@@ -136,31 +139,105 @@ fn adts_header(
     let rate_index = (data[2] >> 2) & 15;
     let object_type = (data[2] >> 6) + 1;
     let channels = ((data[2] & 1) << 2) | (data[3] >> 6);
+    let skip = if data[1] & 1 == 0 { 9 } else { 7 };
+    let blocks = data[6] & 3;
+    // A Matroska AAC block is one raw_data_block: with CRC, multi-block frames keep per-block
+    // CRC words in the payload, so refuse them (as ffmpeg's aac_adtstoasc does).
+    if blocks > 0 && skip == 9 {
+        return None;
+    }
+    let bytes = adts_frame_len(data)?;
     // The ASC replaces the ADTS header (payload carries no header/CRC).
     // CodecPrivate is fixed per track: a later config change keeps the
     // first ASC and is counted.
-    let asc = [
+    let mut asc = vec![
         (object_type << 3) | (rate_index >> 1),
         (rate_index << 7) | (channels << 3),
     ];
+    // channel_configuration 0: the layout is an in-band PCE, which the ASC must carry.
+    if channels == 0
+        && data.len() >= bytes
+        && let Some(pce) = adts_pce(&data[skip..bytes])
+    {
+        asc.extend(pce);
+    }
     match config {
-        None => *config = Some(asc.to_vec()),
-        Some(first) if first[..] != asc => {
+        None => *config = Some(asc),
+        Some(first) if first[..2] != asc[..2] => {
             if *changes == 0 {
                 tracing::warn!(target: "mux", pid, "AAC config changed mid-stream; keeping the first");
             }
             *changes += 1;
         }
+        // Seeded before the PCE was in view: upgrade to the PCE-bearing form.
+        Some(first) if first.len() == 2 && asc.len() > 2 => *first = asc,
         Some(_) => {}
     }
     // [§8.1.1.2] "Number of raw_data_block()'s ... is equal to number_of_raw_data_blocks_in_frame
     // + 1", and [§8.2.1.1] each holds "audio data for a time period of 1024 samples".
     Some(Header {
-        bytes: adts_frame_len(data)?,
-        skip: if data[1] & 1 == 0 { 9 } else { 7 },
-        samples: 1024 * (u32::from(data[6] & 3) + 1),
+        bytes,
+        skip,
+        samples: 1024 * (u32::from(blocks) + 1),
         rate: ADTS_SAMPLE_RATE_VALID[usize::from(rate_index)],
     })
+}
+
+// Bit copier from a raw_data_block into an ASC-side buffer.
+struct PceCopy<'a> {
+    block: &'a [u8],
+    src: usize,
+    out: Vec<u8>,
+    nbits: usize,
+}
+
+impl PceCopy<'_> {
+    fn copy(&mut self, n: usize) -> Option<usize> {
+        let mut v = 0;
+        for _ in 0..n {
+            let byte = *self.block.get(self.src / 8)?;
+            let bit = usize::from(byte >> (7 - self.src % 8) & 1);
+            self.src += 1;
+            if self.nbits & 7 == 0 {
+                self.out.push(0);
+            }
+            *self.out.last_mut()? |= (bit as u8) << (7 - self.nbits % 8);
+            self.nbits += 1;
+            v = v << 1 | bit;
+        }
+        Some(v)
+    }
+}
+
+// The program_config_element() opening a raw_data_block (ID_PCE, [14496-3 §4.4.1.1]), re-packed
+// for the ASC: alignment is relative to the ASC start there, to the block start here.
+fn adts_pce(block: &[u8]) -> Option<Vec<u8>> {
+    let mut c = PceCopy {
+        block,
+        src: 0,
+        out: Vec::new(),
+        nbits: 0,
+    };
+    if c.copy(3)? != 5 {
+        return None;
+    }
+    c.out.clear();
+    c.nbits = 0;
+    c.copy(10)?;
+    let five = c.copy(4)? + c.copy(4)? + c.copy(4)?;
+    let four = c.copy(2)? + c.copy(3)?;
+    let cc = c.copy(4)?;
+    for extra in [4, 4, 3] {
+        if c.copy(1)? == 1 {
+            c.copy(extra)?;
+        }
+    }
+    c.copy(5 * (five + cc) + 4 * four)?;
+    c.src += (8 - c.src % 8) % 8;
+    c.nbits += (8 - c.nbits % 8) % 8;
+    let comment = c.copy(8)?;
+    c.copy(comment * 8)?;
+    Some(c.out)
 }
 
 impl CodecParser for AdtsParser {
@@ -172,12 +249,11 @@ impl CodecParser for AdtsParser {
             // A frame still awaiting its successor is emitted before the gap clears it.
             out = self
                 .frames
-                .drain_before_gap(7, |d| adts_header(d, config, changes, pid));
+                .drain_before_gap(ADTS_HEADER_BYTES, |d| adts_header(d, config, changes, pid));
         }
-        out.extend(
-            self.frames
-                .parse(pes, 7, |d| adts_header(d, config, changes, pid)),
-        );
+        out.extend(self.frames.parse(pes, ADTS_HEADER_BYTES, |d| {
+            adts_header(d, config, changes, pid)
+        }));
         self.pid = pid;
         out
     }
@@ -185,7 +261,7 @@ impl CodecParser for AdtsParser {
     fn flush(&mut self) -> Vec<Frame> {
         let (config, changes, pid) = (&mut self.config, &mut self.config_changes, self.pid);
         self.frames
-            .flush_with(7, |d| adts_header(d, config, changes, pid))
+            .flush_with(ADTS_HEADER_BYTES, |d| adts_header(d, config, changes, pid))
     }
     fn codec_private(&self) -> Option<Vec<u8>> {
         self.config.clone()
@@ -263,6 +339,58 @@ mod tests {
         f[4] = ((fl >> 3) & 0xFF) as u8;
         f[5] = (((fl & 0x07) << 5) as u8) | 0x1F; // low 3 bits of len + buffer-fullness bits
         f
+    }
+
+    #[test]
+    fn unchained_candidate_after_gap_does_not_touch_config() {
+        let mut p = AdtsParser::new();
+        p.parse(&make_pes(adts_frame(400), Some(90000)));
+        // A false stereo->mono header inside a post-gap fragment, followed by junk.
+        let mut fake = adts_frame(20);
+        fake[3] |= 0x40;
+        fake.extend_from_slice(&[0x55; 40]);
+        let mut pes = make_pes(fake, Some(180000));
+        pes.discontinuity = true;
+        p.parse(&pes);
+        p.flush();
+        assert_eq!(p.config_changes(), 0);
+    }
+
+    #[test]
+    fn multi_block_frame_with_crc_is_refused() {
+        let mut p = AdtsParser::new();
+        let mut f = adts_frame(400);
+        f[1] = 0xF0; // protection_absent = 0
+        f[6] |= 1; // two raw_data_blocks
+        assert!(p.parse(&make_pes(f, Some(0))).is_empty());
+        assert!(p.codec_private().is_none());
+    }
+
+    #[test]
+    fn channel_config_0_carries_the_in_band_pce_in_the_asc() {
+        // PCE: one front CPE, no mixdown, no comment.
+        let mut bits = String::from("101"); // ID_PCE
+        let pce = "0000 01 0100 0001 0000 0000 00 000 0000 0 0 0 10000";
+        bits.push_str(&pce.replace(' ', ""));
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        bits.push_str("00000000"); // comment_field_bytes
+        let mut f = adts_frame(0);
+        f.extend(
+            (0..bits.len() / 8).map(|i| u8::from_str_radix(&bits[i * 8..i * 8 + 8], 2).unwrap()),
+        );
+        let total = f.len() as u32;
+        f[2] &= !1;
+        f[3] = (f[3] & 0x3C) | ((total >> 11) & 3) as u8;
+        f[4] = (total >> 3) as u8;
+        f[5] = (((total & 7) << 5) as u8) | 0x1F;
+        let mut p = AdtsParser::new();
+        assert_eq!(p.parse(&make_pes(f, Some(0))).len(), 1);
+        let asc = p.codec_private().unwrap();
+        // 2-byte AudioSpecificConfig, then the PCE re-aligned to the ASC start.
+        assert_eq!(&asc[..2], &[0x12, 0x00]);
+        assert_eq!(&asc[2..], &[0x05, 0x04, 0x00, 0x00, 0x20, 0x00]);
     }
 
     #[test]

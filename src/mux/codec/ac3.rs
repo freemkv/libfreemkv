@@ -22,6 +22,8 @@ const EAC3_REDUCED_RATES: [u32; 4] = [24_000, 22_050, 16_000, 48_000];
 // (~4). Rejects the frmsiz=0/1 sub-header junk `eac3_frame_size` could
 // otherwise report as a 2/4-byte "frame".
 const MIN_FRAME_BYTES: usize = 6;
+// Largest (E-)AC-3 frame accepted.
+const MAX_FRAME_BYTES: usize = 8192;
 
 /// AC-3 (legacy) always carries 6 audio blocks × 256 samples = 1536 samples.
 const AC3_SAMPLES_PER_FRAME: u32 = 1536;
@@ -36,12 +38,8 @@ pub struct Ac3Parser {
     /// began in an earlier packet takes THAT packet's source offset, not the
     /// one that happened to complete it.
     acc: super::pesbuf::PesBuf,
-    /// Reused working copy of `acc`, kept across calls so the per-PES scan does
-    /// not allocate. `parse` runs once per PES packet on an audio track — of
-    /// the order of 10^5 times per title — and previously built a fresh `Vec`
-    /// each time. The copy itself is unavoidable without restructuring the
-    /// borrow relationship (the scanner needs `&mut self.tally` while it reads
-    /// these bytes); the ALLOCATION is not.
+    /// Working copy of `acc` reused across PES (the scanner needs `&mut self.tally` while reading
+    /// it); the per-PES marks snapshot still allocates.
     scratch: Vec<u8>,
     /// PTS (ns) to stamp on the frame that begins the carry-over `buf` — i.e.
     /// the running per-frame PTS at the point the partial tail was retained.
@@ -166,7 +164,7 @@ impl Ac3Parser {
 
             let remaining = &data[start..];
 
-            if remaining.len() < 6 {
+            if remaining.len() < MIN_FRAME_BYTES {
                 // Not enough data to determine frame size — keep for next PES
                 break;
             }
@@ -178,7 +176,7 @@ impl Ac3Parser {
                 ac3_frame_size(remaining)
             };
 
-            if !(MIN_FRAME_BYTES..=8192).contains(&frame_size) {
+            if !(MIN_FRAME_BYTES..=MAX_FRAME_BYTES).contains(&frame_size) {
                 // Invalid/sub-header frame size (e.g. an E-AC-3 frmsiz of 0/1
                 // sizing to a 2/4-byte fragment) — skip this sync word.
                 pos = start + 2;
