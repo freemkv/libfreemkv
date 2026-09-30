@@ -4961,14 +4961,13 @@ mod tests {
         for t in &ts {
             assert!(*t <= i64::MAX as u64, "cluster ts must not have wrapped");
         }
-        // Every block's relative timestamp stays within the i16 range (no silent
-        // wrap from the 40s back-jump).
-        for (cluster_ts, rel, abs) in all_block_timestamps(&data) {
-            assert!(
-                (MIN_BLOCK_REL..=MAX_BLOCK_REL).contains(&(rel as i64)),
-                "block rel {rel} wrapped i16 (cluster_ts={cluster_ts}, abs={abs})"
-            );
-        }
+        // Every block's cluster ts + i16 rel reconstructs its own pts (0.1 ms ticks): a
+        // wrapped rel from the 40s back-jump would land the audio elsewhere.
+        let abs: Vec<i64> = all_block_timestamps(&data)
+            .iter()
+            .map(|&(_, _, abs)| abs)
+            .collect();
+        assert_eq!(abs, vec![0, 400_000, 0], "video 0 s, video 40 s, audio 0 s");
         // Every cluster carries a Cue (including the back-dated split cluster),
         // so the seek index has no hole.
         assert_eq!(
@@ -5447,18 +5446,18 @@ mod tests {
     #[test]
     fn keyframe_at_cluster_boundary_opens_new_cluster() {
         let tracks = [make_video_track()];
-        // Keyframe at exactly 3000 ms (>= the 3 s cluster window) → new cluster.
+        // Keyframe at exactly 2000 ms (== the 2 s cluster window) → new cluster.
         let data = mux_with_durations(
             &tracks,
             &[
                 (0, 0, true, vec![0xAA], None),
-                (0, 3_000_000_000, true, vec![0xBB], None),
+                (0, 2_000_000_000, true, vec![0xBB], None),
             ],
         );
         assert_eq!(
             find_clusters(&data).len(),
             2,
-            "keyframe at the 3s boundary must open a second cluster"
+            "keyframe at the 2s boundary must open a second cluster"
         );
     }
 
