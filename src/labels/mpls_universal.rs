@@ -809,12 +809,9 @@ mod tests {
     /// Mutation: skip lowercase normalization → "ENG" stays "ENG" in the label.
     #[test]
     fn normalize_language_lowercases_and_trims() {
-        assert_eq!(
-            // trim + lowercase, mirroring production normalize_language
-            super::super::mpls_universal::language_display_name(
-                &"  ENG  ".trim().to_ascii_lowercase(),
-            ),
-            "English"
-        );
+        assert_eq!(normalize_language("  ENG  "), "eng");
+        assert_eq!(normalize_language("   "), "");
+        // An unknown code keeps its trimmed lowercase form.
+        assert_eq!(normalize_language(" XYZ "), "xyz");
     }
 }
