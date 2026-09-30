@@ -5155,6 +5155,37 @@ mod tests {
         );
     }
 
+    // Open-GOP B-frames shown before the cluster's keyframe carry a NEGATIVE rel ts, and the
+    // positive i16 edge 32767 stays in the cluster. (A step back past the 3 s discontinuity
+    // threshold is re-based, so -32768 is not reachable for video.)
+    #[test]
+    fn simple_block_rel_ts_negative_and_i16_edge() {
+        let data = mux_with_durations(
+            &[make_video_track()],
+            &[
+                (0, 0, true, vec![0xAA], None),
+                (0, 4_000_000_000, true, vec![0xAB], None), // cluster 2 at 40_000 ticks
+                (0, 3_600_000_000, false, vec![0xAC], None), // -4_000
+                (0, 1_100_000_000, false, vec![0xAD], None), // -29_000
+                (0, 7_276_700_000, false, vec![0xAE], None), // 40_000 + 32_767
+            ],
+        );
+        let second: Vec<(i16, i64)> = all_block_timestamps(&data)
+            .iter()
+            .filter(|&&(c, _, _)| c == 40_000)
+            .map(|&(_, r, a)| (r, a))
+            .collect();
+        assert_eq!(
+            second,
+            vec![
+                (0, 40_000),
+                (-4_000, 36_000),
+                (-29_000, 11_000),
+                (32_767, 72_767)
+            ]
+        );
+    }
+
     // BlockGroup (Matroska §6.2.4): a Block inside a BlockGroup carries BlockDuration,
     // and its keyframe flag bit (0x80) MUST be 0 (keyframe-ness is signalled by
     // absence of ReferenceBlock). PGS subtitle frames take this path.
