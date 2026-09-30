@@ -84,6 +84,7 @@ fn timing(window: Duration, dead_bus: Duration) -> WaitReadyTiming {
         poll: (window / 120).min(MS(10)),
         window,
         dead_bus,
+        ceiling: Duration::from_secs(600),
     }
 }
 

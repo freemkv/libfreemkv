@@ -70,7 +70,7 @@ pub enum DriveStatus {
 
 // SCSI opcodes used in drive control
 const SCSI_TEST_UNIT_READY: u8 = 0x00;
-const SCSI_START_STOP_UNIT: u8 = 0x1B;
+const SCSI_START_STOP_UNIT: u8 = allow::START_STOP_UNIT;
 /// Idle time the disc sits spun-down during [`Drive::spin_cycle`] before it's
 /// spun back up — long enough for the mechanism's fast-fail wedge state to
 /// clear. Validated at 5–6 s live.
@@ -78,11 +78,11 @@ const SPIN_DOWN_IDLE_SECS: u64 = 5;
 /// Settle time after spin-up in [`Drive::spin_cycle`] before the caller reads
 /// again, so the first post-cycle read doesn't hit a transient NOT_READY.
 const SPIN_UP_SETTLE_SECS: u64 = 10;
-const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
+const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = allow::PREVENT_ALLOW;
 const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
 const SCSI_MODE_SENSE: u8 = 0x5A;
 const SCSI_MODE_SELECT: u8 = 0x55;
-const SCSI_REPORT_KEY: u8 = 0xA4;
+const SCSI_REPORT_KEY: u8 = allow::REPORT_KEY;
 
 // SBC/MMC Read-Write Error Recovery mode page. Flipping PER makes the drive REPORT recovered
 // reads instead of silently returning best-effort GOOD data.
@@ -694,7 +694,7 @@ impl Drive {
                     }
                 }
             }
-            if stall.poll(&moved) == crate::halt::Stall::Expired {
+            if stall.poll(&moved) == crate::halt::Stall::Expired || t0.elapsed() >= timing.ceiling {
                 break;
             }
             self.pause(timing.poll)?;
@@ -861,12 +861,9 @@ impl Drive {
     /// Initialize drive — drive-prep unlock + init.
     /// Optional. Adds features: removes riplock, enables UHD reads, speed control.
     ///
-    /// The drive-prep (OEM) unlock is required for BD/UHD (AACS) reads,
-    /// but it puts the drive in an extended-access state where stock CSS
-    /// authentication no longer works — so a CSS-protected DVD can't be read.
-    /// For a DVD we therefore SKIP the unlock and run the drive in its normal
-    /// stock mode; the DVD path then issues standard CSS commands, which a stock
-    /// drive honors. BD/UHD and any non-DVD/unknown media keep today's behavior.
+    /// Drive-prep runs for every disc, DVD included: drive features are
+    /// disc-independent, and the AACS/CSS handshakes run later, gated on disc kind.
+    /// A transport fault aborts init; other errors fall through to stock mode.
     pub fn init(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "init", "begin");
@@ -1286,16 +1283,18 @@ impl Drive {
                 {
                     let len = count as usize * 2048;
                     let offset = lba as i64 * 2048;
-                    // Drop kernel cache for this region so we get
-                    // a fresh device read, not stale page-cache
-                    // data from a prior successful neighbour read.
+                    // Drop the page cache for this region so the read hits the device.
+                    // SAFETY: fd is the block fd this Drive owns; no pointers are passed.
                     let _ = unsafe {
                         libc::posix_fadvise(fd, offset, len as i64, libc::POSIX_FADV_DONTNEED)
                     };
+                    // SAFETY: buf.len() >= len (checked above), so pread writes in bounds.
                     let n = unsafe {
                         libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, len, offset)
                     };
                     if n == len as isize {
+                        // A Stop during the blocking read discards the data, as `exec` does.
+                        self.check_token()?;
                         tracing::info!(
                             target: "freemkv::drive",
                             lba,
@@ -1506,6 +1505,7 @@ impl Drop for Drive {
         // SgIoTransport::drop() runs next, calling libc::close(fd)
         #[cfg(target_os = "linux")]
         if let Some(fd) = self.block_dev_fd.take() {
+            // SAFETY: fd was opened by this Drive and is taken (closed once) here.
             unsafe { libc::close(fd) };
         }
     }
@@ -1528,6 +1528,7 @@ fn open_block_device_for_sg(sg_path: &Path) -> Option<std::os::unix::io::RawFd> 
 
     let mut bytes = block_path.as_bytes().to_vec();
     bytes.push(0);
+    // SAFETY: bytes is NUL-terminated and outlives the call.
     let fd = unsafe {
         libc::open(
             bytes.as_ptr() as *const libc::c_char,
@@ -1718,6 +1719,9 @@ const WAIT_READY_MAX_EMPTY_POLLS: u32 = 10;
 // first one's completion, before wait_ready calls the bus dead.
 const WAIT_READY_DEAD_BUS_BUDGET: Duration = Duration::from_secs(5);
 
+// Absolute wait_ready ceiling: a drive cycling fresh answers can't re-arm the window forever.
+const WAIT_READY_CEILING: Duration = Duration::from_secs(600);
+
 /// `wait_ready`'s durations (§2.11, T3/T5/T6), parameters so tests run in ms.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WaitReadyTiming {
@@ -1727,6 +1731,8 @@ pub(crate) struct WaitReadyTiming {
     pub window: Duration,
     /// T5: an unbroken run of transport failures this long is a dead bus.
     pub dead_bus: Duration,
+    /// Absolute cap on the whole wait, however the drive's answers vary.
+    pub ceiling: Duration,
 }
 
 impl WaitReadyTiming {
@@ -1735,6 +1741,7 @@ impl WaitReadyTiming {
         poll: Duration::from_millis(500),
         window: Duration::from_secs(60),
         dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+        ceiling: WAIT_READY_CEILING,
     };
 }
 
@@ -3318,11 +3325,54 @@ mod command_tests {
             poll: std::time::Duration::from_millis(10),
             window: std::time::Duration::from_millis(300),
             dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+            ceiling: std::time::Duration::from_secs(600),
         });
         assert!(
             matches!(r, Err(Error::DeviceNotReady { .. })),
             "a drive that never answers TUR successfully must be DeviceNotReady, got {r:?}"
         );
+    }
+
+    // A drive that keeps answering with a fresh sense triple every poll re-arms the
+    // no-progress window forever; the absolute ceiling must still end the wait.
+    #[test]
+    fn wait_ready_ceiling_bounds_a_cycling_drive() {
+        struct Cycling(u16);
+        impl ScsiTransport for Cycling {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                self.0 = self.0.wrapping_add(1);
+                let mut sense = [0u8; 32];
+                sense[0] = 0x70;
+                sense[2] = 0x02;
+                sense[12] = (self.0 >> 8) as u8;
+                sense[13] = self.0 as u8;
+                Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: 2,
+                    sense: Some(crate::scsi::ScsiSense {
+                        sense_key: 2,
+                        asc: sense[12],
+                        ascq: sense[13],
+                    }),
+                })
+            }
+        }
+        let mut d = Drive::from_transport_for_test(Box::new(Cycling(0x0500)));
+        let t0 = std::time::Instant::now();
+        let r = d.wait_ready_with(WaitReadyTiming {
+            poll: std::time::Duration::from_millis(5),
+            window: std::time::Duration::from_secs(30),
+            dead_bus: WAIT_READY_DEAD_BUS_BUDGET,
+            ceiling: std::time::Duration::from_millis(300),
+        });
+        assert!(matches!(r, Err(Error::DeviceNotReady { .. })), "{r:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
     }
 
     // A dead bus (transport failures in a row) will never spin up, so wait_ready

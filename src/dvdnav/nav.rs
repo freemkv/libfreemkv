@@ -38,6 +38,15 @@ const STEP_BUDGET: usize = 1024;
 /// untrusted u16, so it is clamped to this format maximum.
 const MAX_CMDS: usize = 128;
 
+// Compare ops (libdvdnav eval_compare).
+const CMP_AND: u8 = 1;
+const CMP_EQ: u8 = 2;
+const CMP_NE: u8 = 3;
+const CMP_GE: u8 = 4;
+const CMP_GT: u8 = 5;
+const CMP_LE: u8 = 6;
+const CMP_LT: u8 = 7;
+
 /// Maximum TT_SRPT entries honoured — the DVD-Video 99-title format maximum
 /// (the on-disc count is an untrusted u16). Shared with the IFO parser so the
 /// two can never diverge.
@@ -144,13 +153,13 @@ impl Vm {
             self.reg(c.rhs_reg)
         };
         let result = match c.op {
-            1 => (l & r) != 0,
-            2 => l == r,
-            3 => l != r,
-            4 => l >= r,
-            5 => l > r,
-            6 => l <= r,
-            7 => l < r,
+            CMP_AND => (l & r) != 0,
+            CMP_EQ => l == r,
+            CMP_NE => l != r,
+            CMP_GE => l >= r,
+            CMP_GT => l > r,
+            CMP_LE => l <= r,
+            CMP_LT => l < r,
             _ => false,
         };
         (result, tainted)
