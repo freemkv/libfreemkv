@@ -33,10 +33,11 @@ jobs:
   # clippy (cross-lint) runs on stable instead.
   resolve-msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -56,11 +57,14 @@ jobs:
   #
   # release.yml excludes v*-rc* so a candidate never publishes a release.
   rc-tag:
+    # A manual dispatch from another branch must not stamp a candidate.
+    if: github.ref_name == 'qa'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Stamp the next rc
@@ -71,10 +75,16 @@ jobs:
           [ -n "$v" ] || { echo "no version in Cargo.toml" >&2; exit 1; }
           # Numeric sort on the rc ordinal: -rc10 must beat -rc9, and a plain
           # lexical sort gets that backwards from the tenth candidate on.
-          n=$(git tag -l "v$v-rc*" | sed "s|^v$v-rc||" | sort -n | tail -1)
-          tag="v$v-rc$(( ${n:-0} + 1 ))"
-          git tag "$tag"
-          git push origin "$tag"
+          # Retry on a lost race for the same ordinal: refetch tags, recompute.
+          for attempt in 1 2 3 4 5; do
+            git fetch --tags --force origin
+            n=$(git tag -l "v$v-rc*" | sed "s|^v$v-rc||" | sort -n | tail -1)
+            tag="v$v-rc$(( ${n:-0} + 1 ))"
+            git tag "$tag"
+            git push origin "$tag" && break
+            git tag -d "$tag"
+            [ "$attempt" -lt 5 ] || { echo "could not push an rc tag" >&2; exit 1; }
+          done
           echo "### Candidate \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
   # The debug suite runs on every dev push. Release is a DIFFERENT build:
@@ -88,8 +98,9 @@ jobs:
       matrix:
         os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -98,10 +109,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       - run: cargo test --release --tests
+        working-directory: libfreemkv
+      - run: cargo test --release --doc
         working-directory: libfreemkv
 
   # Independent decoder/remux verification uses generated media and belongs
@@ -112,12 +125,13 @@ jobs:
       contents: read
 
   # clippy's output is target-dependent: cfg-gated code only gets linted on
-  # the target it compiles for. Linting solely on the dev machine's host
-  # target is how a lint that CI rejects reaches a push.
+  # the target it compiles for. This job lints the Linux target; the macOS and
+  # Windows code is linted by clippy-macos / clippy-windows below.
   cross-lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -127,12 +141,53 @@ jobs:
       # the MSRV pin. See ci.yml for why the lint toolchain need not be the MSRV.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
-      - run: rustup target add x86_64-unknown-linux-gnu
-      - run: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: libfreemkv
+
+  # Native clippy: the cfg(macos)/cfg(windows) code is linted nowhere else.
+  clippy-macos:
+    timeout-minutes: 45
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: libfreemkv
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+        with:
+          checkout: freemkv-unlock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: libfreemkv
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: libfreemkv
+
+  clippy-windows:
+    timeout-minutes: 45
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: libfreemkv
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+        with:
+          checkout: freemkv-unlock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: libfreemkv
+      - run: cargo clippy --all-targets -- -D warnings
         working-directory: libfreemkv
 
   # Windows compiles the tests but does not run them, matching the policy
@@ -142,8 +197,9 @@ jobs:
   windows-build:
     needs: resolve-msrv
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -152,7 +208,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: libfreemkv
       - run: cargo build --release --tests

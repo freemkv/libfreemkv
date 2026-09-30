@@ -61,7 +61,7 @@ fn main() {
 
 /// Bake the git short hash into the build as `GIT_SUFFIX` so any muxed MKV or
 /// FVI index is traceable to the exact source revision (e.g. ` (g835cc99)`).
-/// Empty when git or the repo is unavailable (e.g. a crates.io tarball build),
+/// Empty when git or the repo is unavailable (e.g. a source-archive build),
 /// leaving just the package version. Always emitted so `env!("GIT_SUFFIX")`
 /// resolves on every target.
 fn emit_git_suffix() {

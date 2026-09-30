@@ -132,11 +132,14 @@ impl PrefetchedSectorSource {
             .map(|e| e.sector_count as u64)
             .sum::<u64>()
             .min(u32::MAX as u64) as u32;
-        let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
+        let bytes_total_extents: u64 = extents
+            .iter()
+            .map(|e| e.sector_count as u64 * crate::consts::SECTOR_BYTES_U64)
+            .sum();
         let unmapped = reader.unmapped_stream_files().to_vec();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
-        let batch_bytes = batch_sectors as usize * 2048;
+        let batch_bytes = batch_sectors as usize * crate::consts::SECTOR_BYTES;
         // A never-cancelled stand-in keeps one halt-aware code path without a token.
         let wait = halt.clone().unwrap_or_default();
 
@@ -191,7 +194,7 @@ impl PrefetchedSectorSource {
                     } else {
                         sectors = unit_align;
                     }
-                    let bytes = sectors as usize * 2048;
+                    let bytes = sectors as usize * crate::consts::SECTOR_BYTES;
                     // Halt-aware: a cancel does not disconnect the channel, so a
                     // plain recv() would never re-reach the check. Disconnected =
                     // the consumer dropped both channels.
@@ -212,12 +215,12 @@ impl PrefetchedSectorSource {
                             // A short read must not desync the stream: advance by
                             // sectors actually read, and reject a non-whole-sector
                             // count (belt-and-braces; FileSectorSource read_exact's).
-                            if n % 2048 != 0 {
+                            if n % crate::consts::SECTOR_BYTES != 0 {
                                 let e = crate::error::Error::ExtentNotUnitAligned.into();
                                 send_or_stop(&wait, &tx, Err(e));
                                 return;
                             }
-                            let sectors_read = (n / 2048) as u32;
+                            let sectors_read = (n / crate::consts::SECTOR_BYTES) as u32;
                             // A zero-byte read isn't EOF (extents still have
                             // `remaining`) and would spin forever; send a terminal
                             // sentinel instead of a clean EOF that reports success.
