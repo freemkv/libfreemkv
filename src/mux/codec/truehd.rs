@@ -1739,12 +1739,34 @@ mod tests {
 
     #[test]
     fn ac3_frame_at_head_needs_more_when_buffer_short() {
-        // < 6 bytes buffered → NeedMore (can't read the AC-3 header).
+        let ac3 = make_ac3_frame(); // 128 bytes
+        let size = |bytes: &[u8]| {
+            let mut p = TrueHdParser::new();
+            p.acc.seed(bytes);
+            p.ac3_frame_at_head()
+        };
+        // Too short to read the header, then a valid header whose frame is not all here.
+        assert!(matches!(size(&ac3[..5]), Ac3Size::NeedMore));
+        assert!(matches!(size(&ac3[..100]), Ac3Size::NeedMore));
+        assert!(matches!(size(&ac3), Ac3Size::Frame(128)));
+        // frmsizecod 55 is out of the table: resync, not wait.
+        let mut bad = ac3.clone();
+        bad[4] = 55;
+        assert!(matches!(size(&bad), Ac3Size::Unmappable));
+
+        // An AC-3 frame split across PES is held, then skipped whole: the TrueHD unit that
+        // follows it comes out intact.
         let mut parser = TrueHdParser::new();
-        parser.acc.seed(&[0x0B, 0x77, 0x00]);
-        // Drive through parse: a short 0x0B77 head must wait, not emit.
-        let f = parser.parse(&make_pes(vec![0x0B, 0x77, 0x00], Some(0)));
-        assert!(f.is_empty());
+        assert!(
+            parser
+                .parse(&make_pes(ac3[..100].to_vec(), Some(0)))
+                .is_empty()
+        );
+        let mut rest = ac3[100..].to_vec();
+        rest.extend_from_slice(&make_truehd_unit(200));
+        let f = parser.parse(&make_pes(rest, None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data.len(), 200);
     }
 
     // --- #2 sample rate from the major-sync rate nibble ---

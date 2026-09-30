@@ -472,6 +472,19 @@ mod tests {
         assert_eq!(display_set_is_forced(&[]), None);
     }
 
+    // One non-forced display set anywhere settles the track as not forced, even when the LAST
+    // set is forced.
+    #[test]
+    fn a_forced_last_display_set_does_not_make_a_mixed_track_forced() {
+        let mut t = ForcedTracker::new();
+        for forced in [true, false, true] {
+            t.observe(&pcs_display(forced));
+        }
+        assert!(!t.is_forced());
+        assert!(t.settled_not_forced());
+        assert_eq!(t.facts().forced_displays, 2);
+    }
+
     // `observed()` distinguishes "unknown" (leave the vendor flag alone) from a settled
     // verdict, so an unread/undecrypted track can't overwrite a correct vendor "forced" flag
     // with "not forced".
@@ -1003,6 +1016,16 @@ mod tests {
             demotable(facts(DEMOTE_MIN_DISPLAY_SETS, 0), true, 8),
             "at the threshold, with the shape of the busiest track, it is demotable"
         );
+    }
+
+    // The share rule at its edge against a 2 000-set busiest track: 500 sets is exactly one
+    // quarter (in), 499 is under it (out). Literal counts, so a changed divisor fails.
+    #[test]
+    fn the_share_of_busiest_boundary_is_one_quarter() {
+        assert!(demotable(facts(500, 0), true, 2_000));
+        assert!(!demotable(facts(499, 0), true, 2_000));
+        // A vendor-forced track at 30% of the busiest is a full track, not a forced one.
+        assert!(demotable(facts(600, 0), true, 2_000));
     }
 
     /// Never on no evidence at all: a track nobody observed cannot contradict

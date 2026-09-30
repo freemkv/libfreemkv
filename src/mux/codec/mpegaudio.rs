@@ -458,7 +458,9 @@ mod tests {
         let mut data = vec![0xFF, 0xFB, 0x00, 0x00];
         data.extend_from_slice(&free_frame().repeat(3));
         let f = MpegAudioParser::new().parse(&make_pes(data, Some(0)));
-        assert!(f.len() >= 2, "framing proceeds, got {} frames", f.len());
+        // The header 4 bytes in is skipped, so the first frame spans to the one at 304.
+        let sizes: Vec<usize> = f.iter().map(|fr| fr.data.len()).collect();
+        assert_eq!(sizes, [304, 300]);
     }
 
     // The learned size is re-checked against the next header: a new stream after a gap

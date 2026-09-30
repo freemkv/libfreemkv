@@ -937,9 +937,19 @@ static IOReturn selftest_set_sg(void *task, SCSITaskSGElement *sg, UInt8 entries
 static IOReturn selftest_set_timeout(void *task, UInt32 ms) {
     (void)task; g_selftest_timeout_ms = ms; return kIOReturnSuccess;
 }
+// What the fake's ExecuteTaskSync reports; defaults to success (GOOD, 0 bytes, no sense).
+static volatile IOReturn g_selftest_kr;
+static volatile SCSITaskStatus g_selftest_status;
+static volatile UInt64 g_selftest_count;
+static UInt8 g_selftest_sense[32];
+
 static IOReturn selftest_execute(void *task, SCSI_Sense_Data *sense, SCSITaskStatus *status,
                                  UInt64 *count) {
-    (void)task; (void)sense; *status = kSCSITaskStatus_GOOD; *count = 0; return kIOReturnSuccess;
+    (void)task;
+    *status = g_selftest_status;
+    *count = g_selftest_count;
+    memcpy(sense, g_selftest_sense, sizeof(*sense) < sizeof(g_selftest_sense) ? sizeof(*sense) : sizeof(g_selftest_sense));
+    return g_selftest_kr;
 }
 
 static SCSITaskInterface g_selftest_task_vt = {
@@ -967,8 +977,24 @@ __attribute__((visibility("hidden"))) int shim_selftest_install_fake_device(void
     g_handle.scsi = &g_selftest_device;
     g_handle.exclusive = 1;
     g_selftest_timeout_ms = 0;
+    g_selftest_kr = kIOReturnSuccess;
+    g_selftest_status = kSCSITaskStatus_GOOD;
+    g_selftest_count = 0;
+    memset(g_selftest_sense, 0, sizeof(g_selftest_sense));
     pthread_mutex_unlock(&g_handle_lock);
     return 0;
+}
+
+// Sets what the fake device's next tasks report: IOReturn, SCSI status, bytes moved, and
+// (32 bytes, or NULL for none) the sense data.
+__attribute__((visibility("hidden"))) void shim_selftest_set_execute(int kr, unsigned char status,
+                                                                     unsigned long long count,
+                                                                     const unsigned char *sense) {
+    g_selftest_kr = (IOReturn)kr;
+    g_selftest_status = (SCSITaskStatus)status;
+    g_selftest_count = count;
+    memset(g_selftest_sense, 0, sizeof(g_selftest_sense));
+    if (sense) memcpy(g_selftest_sense, sense, sizeof(g_selftest_sense));
 }
 
 // Makes shim_open_exclusive treat any BSD selector as an optical drive (its

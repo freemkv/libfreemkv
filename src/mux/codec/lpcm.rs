@@ -855,6 +855,49 @@ mod tests {
         );
     }
 
+    // A carried partial sample belongs to the format and stretch it came from: a format change
+    // or a gap drops it instead of gluing it to the next PES.
+    #[test]
+    fn dvd_carry_is_dropped_on_a_format_change_or_a_discontinuity() {
+        let stale = [0xEEu8; 2];
+        let next = [1u8, 2, 3, 4];
+        // 16-bit stereo, then 2 bytes of the next sample held back.
+        let seed = || {
+            let mut p = LpcmParser::new_dvd();
+            p.parse(&make_pes(
+                dvd(0x01, &[[0u8; 4].as_slice(), &stale].concat()),
+                Some(0),
+            ));
+            p
+        };
+        // Same format, gap: the carry must not lead the post-gap sample.
+        let mut p = seed();
+        let mut gap = make_pes(dvd(0x01, &next), Some(90_000));
+        gap.discontinuity = true;
+        assert_eq!(all(&p.parse(&gap)), w24(&next), "gap drops the carry");
+
+        // Format change (16-bit -> 24-bit stereo): one 12-byte block is 2 sample frames.
+        let block = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut fresh = LpcmParser::new_dvd();
+        let want = all(&fresh.parse(&make_pes(dvd(0x81, &block), Some(90_000))));
+        let mut p = seed();
+        let got = p.parse(&make_pes(dvd(0x81, &block), Some(90_000)));
+        assert_eq!(all(&got), want, "format change drops the carry");
+        assert_eq!(got[0].pts_ns, 1_000_000_000, "and the PTS is not led back");
+    }
+
+    // BD PES hold whole sample frames: a trailing partial one is discarded, never glued onto
+    // the next PES.
+    #[test]
+    fn bd_trailing_partial_sample_is_not_carried_into_the_next_pes() {
+        let mut p = LpcmParser::new();
+        let first = p.parse(&make_pes(bd(3, 1, &[9, 9, 9, 9, 0xEE, 0xEE]), Some(0)));
+        assert_eq!(all(&first), w24(&[9, 9, 9, 9]), "the whole sample only");
+        let next = [1u8, 2, 3, 4];
+        let got = p.parse(&make_pes(bd(3, 1, &next), Some(90_000)));
+        assert_eq!(all(&got), w24(&next), "the discarded tail does not lead it");
+    }
+
     #[test]
     fn carried_bytes_are_stamped_before_the_pes_pts() {
         // DVD 16-bit stereo: 2 of a sample's 4 bytes arrive in the previous PES. The

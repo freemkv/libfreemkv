@@ -1285,6 +1285,54 @@ mod tests {
         }
     }
 
+    // 0xc is reserved for MPEG-2 (ID=1) but 7350 Hz for MPEG-4 (ID=0, [14496-3]).
+    #[test]
+    fn sampling_frequency_index_0xc_is_7350_hz_for_mpeg4_only() {
+        let mpeg4 = Adts {
+            id: 0,
+            sfi: 0xc,
+            ..LC_44K_STEREO
+        };
+        assert_eq!(mpeg4.header().map(|h| h.rate), Some(7350));
+        let mpeg2 = Adts { id: 1, ..mpeg4 };
+        assert!(matches!(mpeg2.verdict(), AdtsVerdict::Invalid));
+    }
+
+    // The ASC is objectType(5) | sfi(4) | channelConfiguration(4), so an odd sfi sets the top
+    // bit of byte 1 and channel_configuration 4..7 needs the ADTS high bit from byte 2.
+    #[test]
+    fn asc_packs_rate_index_and_all_channel_configurations() {
+        for sfi in [3u8, 4] {
+            for channels in 1..8u8 {
+                let a = Adts {
+                    sfi,
+                    channels,
+                    ..LC_44K_STEREO
+                };
+                let mut config = None;
+                adts_header(&a.bytes(), &mut config, &mut 0, 0).unwrap();
+                let want = [2 << 3 | sfi >> 1, (sfi & 1) << 7 | channels << 3];
+                assert_eq!(config.unwrap(), want, "sfi {sfi} channels {channels}");
+            }
+        }
+    }
+
+    // The resync clock counts every raw_data_block in the frame, not just the first.
+    #[test]
+    fn frame_duration_counts_every_raw_data_block() {
+        for blocks in 0..4u8 {
+            let a = Adts {
+                blocks,
+                ..LC_44K_STEREO
+            };
+            assert_eq!(
+                adts_frame_ns(&a.bytes()),
+                Some(1024 * (u64::from(blocks) + 1) * 1_000_000_000 / 44100),
+                "blocks {blocks}"
+            );
+        }
+    }
+
     // [13818-7 §8.1.1.2] protection_absent: "Indicates whether error_check() data is present or
     // not." [11172-3 §2.4.2.3] protection_bit: "'0' if redundancy has been added".
     #[test]
