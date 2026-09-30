@@ -2637,4 +2637,164 @@ mod tests {
         }
         assert_eq!(reads[0], reads[1], "extra PlayItems of a seen clip re-read");
     }
+
+    // The in-loop poll must fire before any playlist is read (the post-loop poll alone would
+    // also yield Halted, so count reads).
+    #[test]
+    fn scan_bluray_titles_polls_halt_before_reading_each_playlist() {
+        let mut disc = MemDisc::new();
+        let udf = two_playlist_bd_fs(&mut disc);
+        let mut cd = CountingDisc {
+            inner: disc,
+            reads: 0,
+        };
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let res = Disc::scan_bluray_titles(&mut cd, &udf, Some(&halt));
+        assert!(matches!(res, Err(Error::Halted)), "got {res:?}");
+        assert_eq!(cd.reads, 0, "a cancelled scan must not read any playlist");
+    }
+
+    // Each clip's feed_span is its byte range in the concatenated extents; a repeated clip
+    // reuses its first span and adds no bytes.
+    #[test]
+    fn parse_playlist_feed_spans_follow_extent_order_and_repeat() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(
+            &mut disc,
+            &[("00001", 1000, 4000, 5000), ("00002", 500, 2000, 9000)],
+        );
+        let pi = |c: &[u8; 5], i: u32| PiSpec {
+            clip_id: *c,
+            in_time: i * 60 * 45000,
+            out_time: (i + 1) * 60 * 45000,
+        };
+        let mpls = build_mpls(
+            &[pi(b"00001", 0), pi(b"00002", 1), pi(b"00001", 2)],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        assert_eq!(t.extents.len(), 2);
+        let s1 = 1000u64 * 2048;
+        let s2 = s1 + 500 * 2048;
+        assert_eq!(t.clips[0].feed_span, Some((0, s1)));
+        assert_eq!(t.clips[1].feed_span, Some((s1, s2)));
+        assert_eq!(t.clips[2].feed_span, Some((0, s1)), "repeat reuses span");
+    }
+
+    // A zero-length stream file yields no extent, so the clip has no feed_span and later clips
+    // start at feed offset 0.
+    #[test]
+    fn parse_playlist_empty_extent_is_skipped_without_advancing_feed() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(
+            &mut disc,
+            &[("00001", 0, 4000, 5000), ("00002", 500, 2000, 9000)],
+        );
+        let pi = |c: &[u8; 5], i: u32| PiSpec {
+            clip_id: *c,
+            in_time: i * 60 * 45000,
+            out_time: (i + 1) * 60 * 45000,
+        };
+        let mpls = build_mpls(
+            &[pi(b"00001", 0), pi(b"00002", 1)],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        assert_eq!(t.extents.len(), 1, "empty extent must be filtered");
+        assert_eq!(t.clips[0].feed_span, None);
+        assert_eq!(t.clips[1].feed_span, Some((0, 500 * 2048)));
+    }
+
+    // Chapter names number the surviving entry marks 1..n, not their original mark index.
+    #[test]
+    fn parse_playlist_chapter_names_are_dense_ordinals_after_filter() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mk = |mark_type: u8, secs: u32| MarkSpec {
+            mark_type,
+            play_item_ref: 0,
+            timestamp: secs * 45000,
+        };
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 120 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[mk(2, 0), mk(1, 10), mk(2, 20), mk(1, 30), mk(1, 40)],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        let names: Vec<&str> = t.chapters.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["1", "2", "3"]);
+    }
+
+    // With both bdmt_eng.xml and another language present, English wins regardless of order;
+    // with no English file the first XML is used.
+    #[test]
+    fn read_meta_title_prefers_english_then_falls_back_to_first() {
+        let title_of = |names: &[&str]| {
+            let mut disc = MemDisc::new();
+            let files = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let xml = format!("<x><di:name>T-{n}</di:name></x>").into_bytes();
+                    file_with(n, 104 + i as u32, 50000 + i as u32 * 10, xml, false)
+                })
+                .collect();
+            let dl = DirSpec {
+                name: "DL".to_string(),
+                icb_lba: 30,
+                dir_data_lba: 31,
+                files,
+                subdirs: vec![],
+            };
+            let meta = DirSpec {
+                name: "META".to_string(),
+                icb_lba: 28,
+                dir_data_lba: 29,
+                files: Vec::new(),
+                subdirs: vec![dl],
+            };
+            let bdmv = DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![meta],
+            };
+            let root = DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: vec![bdmv],
+            };
+            build_udf_skeleton(&mut disc, 10);
+            lay_dir(&mut disc, &root);
+            let udf = udf::read_filesystem(&mut disc).expect("fs");
+            Disc::read_meta_title(&mut disc, &udf)
+        };
+        assert_eq!(
+            title_of(&["bdmt_fra.xml", "bdmt_eng.xml"]).as_deref(),
+            Some("T-bdmt_eng.xml")
+        );
+        assert_eq!(
+            title_of(&["bdmt_fra.xml", "bdmt_deu.xml"]).as_deref(),
+            Some("T-bdmt_fra.xml")
+        );
+    }
 }
