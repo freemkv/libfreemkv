@@ -172,9 +172,15 @@ impl PesAssembler {
                 self.header_remaining = 0;
                 // A dropped partial PES is a gap in the elementary stream — flag
                 // it so the NEXT completed PES carries a discontinuity, matching
-                // every other partial-drop path in this file (lines 395/479/504).
+                // every other partial-drop path in this file (`drop_partial`).
                 self.pending_discontinuity = true;
                 return;
+            }
+            // Grow by doubling but never past `cap`, so the allocation honours the share too.
+            let need = self.buffer.len() + data.len();
+            if need > self.buffer.capacity() {
+                let target = need.max(self.buffer.capacity() * 2).min(self.cap);
+                self.buffer.reserve_exact(target - self.buffer.len());
             }
             self.buffer.extend_from_slice(data);
         }
@@ -2658,6 +2664,27 @@ mod tests {
             high_water > expected_share / 2,
             "sanity: the flood must actually have filled the share, got {high_water}"
         );
+    }
+
+    // The buffer's allocation, not just its length, stays within the PID's share: doubling
+    // past a non-power-of-two cap would overshoot the aggregate ceiling.
+    #[test]
+    fn pes_buffer_capacity_stays_within_the_pid_share() {
+        let pids: Vec<u16> = (0..48).map(|i| 0x1100 + i).collect();
+        let mut demux = TsDemuxer::new(&pids);
+        let pid = pids[0];
+        let cap = demux.assemblers[0].cap;
+        assert!(!cap.is_power_of_two());
+        demux.feed(&es_packet_exact(pid, true, &pes_start(&[])));
+        for _ in 0..cap / 184 {
+            demux.feed(&data_packet(pid, false, &[0xCC; 184]));
+            let a = &demux.assemblers[0];
+            assert!(
+                a.buffer.capacity() <= cap,
+                "{} > {cap}",
+                a.buffer.capacity()
+            );
+        }
     }
 
     #[test]
