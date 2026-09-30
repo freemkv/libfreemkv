@@ -17,6 +17,7 @@ use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 /// Flag bits 4-5 at byte `0x14` are cleared afterwards.
 ///
 /// No-op if `sector.len() < 2048` or the scramble flag bits are already zero.
+#[doc(hidden)]
 pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
     if sector.len() < 2048 {
         return;

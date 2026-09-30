@@ -26,6 +26,9 @@ use crate::sector::SectorSource;
 // 50_000-sector budget. Resets to 0 on any readable batch.
 const CSS_LOCKED_BAIL: u32 = 64;
 
+// Sector budget for one crack scan.
+const MAX_TRIES: u32 = 50_000;
+
 // Test-only: how many times descramble_region called the expensive re-crack.
 // Pins a WORK bound (at most one per contiguous false-positive run).
 #[cfg(test)]
@@ -80,7 +83,7 @@ pub fn crack_key(
     extents: &[Extent],
     batch_sectors: u16,
 ) -> Option<CssState> {
-    crack_key_scan(reader, extents, batch_sectors, None).into_state()
+    crack_key_outcome(reader, extents, batch_sectors, None).into_state()
 }
 
 /// Outcome of a CSS crack scan. Only `Unencrypted` lets a caller treat the data as
@@ -132,7 +135,9 @@ pub fn crack_key_outcome(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> CrackOutcome {
-    crack_key_scan(reader, extents, batch_sectors, halt)
+    crack_key_scan_with(reader, extents, batch_sectors, halt, |s| {
+        is_scrambled_pack(s).then_some(0x14)
+    })
 }
 
 // The SINGLE place every DVD read path obtains a title key when the caller supplied none. A
@@ -250,20 +255,6 @@ thread_local! {
     pub(crate) static CRACK_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// The crack scan, returning the full CrackOutcome. Tracks `saw_scrambled` so
-// a scrambled-but-uncracked disc is distinguished from a genuinely
-// unencrypted one (crack_key's Option wrapper collapses both to None).
-fn crack_key_scan(
-    reader: &mut dyn SectorSource,
-    extents: &[Extent],
-    batch_sectors: u16,
-    halt: Option<&crate::halt::Halt>,
-) -> CrackOutcome {
-    crack_key_scan_with(reader, extents, batch_sectors, halt, |s| {
-        is_scrambled_pack(s).then_some(0x14)
-    })
-}
-
 // The crack scan with its test: `scrambled_at` gives a scrambled pack's flags offset (always
 // 0x14 on the disc path; `ps_scrambled_at` for mpg:// files).
 fn crack_key_scan_with(
@@ -288,7 +279,6 @@ fn crack_key_scan_with(
         .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
         .reduce(|(amin, amax), (bmin, bmax)| (amin.min(bmin), amax.max(bmax)));
     let mut tried = 0u32;
-    let max_tries = 50_000u32;
     let mut buf = vec![0u8; batch as usize * 2048];
     let mut hb = crate::progress::Heartbeat::new("css_crack");
     // Track whether ANY scrambled sector was observed: if the budget is
@@ -306,7 +296,7 @@ fn crack_key_scan_with(
 
     'outer: for (extent_idx, ext) in extents.iter().enumerate() {
         let mut i = 0u32;
-        while i < ext.sector_count && tried < max_tries {
+        while i < ext.sector_count && tried < MAX_TRIES {
             // Cooperative cancellation — poll once per batch, the same cadence
             // sweep/patch use, so a Stop / watchdog can interrupt the scan.
             if halt.is_some_and(|h| h.is_cancelled()) {
@@ -317,7 +307,7 @@ fn crack_key_scan_with(
             // Liveness beacon: a long scan over a damaged disc stays visible.
             // The heartbeat is time-throttled; only when it actually beats do
             // we emit the crack-specific context (tried/lba/extent_idx).
-            if hb.tick(tried as u64, max_tries as u64) {
+            if hb.tick(tried as u64, MAX_TRIES as u64) {
                 tracing::debug!(
                     target: "freemkv::heartbeat",
                     phase = "css_crack",
@@ -372,7 +362,7 @@ fn crack_key_scan_with(
                                 });
                             }
                         }
-                        if tried >= max_tries {
+                        if tried >= MAX_TRIES {
                             break 'outer;
                         }
                     }
@@ -435,8 +425,8 @@ const RECRACK_RETRY_EVERY: u32 = 16;
 ///
 /// # Errors
 ///
-/// Never returns `Err` — `Result` only matches the decrypt seam this is
-/// dispatched from (see [`crate::decrypt::decrypt_sectors`]).
+/// Never returns `Err` and always returns `Ok(0)` (CSS drops no sectors); `Result` only
+/// matches the decrypt seam this is dispatched from (see [`crate::decrypt::decrypt_sectors`]).
 pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
     // `is_scrambled_pack`, NOT the looser `is_scrambled`: this sees arbitrary
     // regions (IFO/UDF/ISO 9660) where raw byte 0x14 isn't a reliable flag.
@@ -525,6 +515,7 @@ fn descramble_one(chunk: &mut [u8], title_key: &mut [u8; 5], mismatches_since_at
 /// code, which every genuinely scrambled VOB sector carries and no IFO sector
 /// does. This stays public only because an integration test asserts the flag
 /// extraction directly; it has no production callers.
+#[doc(hidden)]
 pub fn has_scramble_flag_bits(sector: &[u8]) -> bool {
     sector.len() >= 2048 && (sector[0x14] >> 4) & 0x03 != 0
 }
@@ -1101,7 +1092,7 @@ mod tests {
             start_lba: 100,
             sector_count: 4,
         }];
-        let _ = crack_key_scan(&mut src, &ext, 4, None);
+        let _ = crack_key_outcome(&mut src, &ext, 4, None);
         let reads = src.reads.borrow().clone();
         assert_eq!(
             reads,
@@ -1122,7 +1113,7 @@ mod tests {
             start_lba: 0,
             sector_count: 8,
         }];
-        let outcome = crack_key_scan(&mut src, &ext, 4, None);
+        let outcome = crack_key_outcome(&mut src, &ext, 4, None);
         assert!(
             outcome.is_scrambled_uncracked(),
             "nothing was read → no verdict, fail closed (never Unencrypted)"
@@ -1149,7 +1140,7 @@ mod tests {
             start_lba: 0,
             sector_count: 60_000,
         }];
-        let _ = crack_key_scan(&mut src, &ext, 4, None);
+        let _ = crack_key_outcome(&mut src, &ext, 4, None);
         let reads = src.reads.borrow().len();
         assert!(
             reads <= MAX_TRIES,
