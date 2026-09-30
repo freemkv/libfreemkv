@@ -326,8 +326,8 @@ pub const E_MUX_INCOMPLETE: u16 = 9078;
 pub const E_REMUX_STAGING_INVALID: u16 = 9079;
 /// Copying a staged output into place wrote a different byte count than the source holds.
 pub const E_STAGED_COPY_SIZE_MISMATCH: u16 = 9080;
-/// The remux read-back verify worker thread was lost before it reported.
-pub const E_VERIFY_WORKER_LOST: u16 = 9081;
+/// A remux worker thread (`op`: "copy", "verify") was lost before it reported.
+pub const E_WORKER_LOST: u16 = 9081;
 /// A multipass rip was asked to decrypt: multipass recovers a raw whole-disc image.
 pub const E_MULTIPASS_REQUIRES_RAW: u16 = 9082;
 /// A requested audio/subtitle language tag resolves to no known language.
@@ -970,8 +970,10 @@ pub enum Error {
         have: u64,
         want: u64,
     },
-    /// See [`E_VERIFY_WORKER_LOST`].
-    VerifyWorkerLost,
+    /// See [`E_WORKER_LOST`]. `op` is a stable identifier, like [`Error::TimedOut`]'s.
+    WorkerLost {
+        op: &'static str,
+    },
     /// See [`E_MULTIPASS_REQUIRES_RAW`].
     MultipassRequiresRaw,
     /// `tag` is the caller's unresolvable language tag, verbatim.
@@ -1157,7 +1159,7 @@ impl Error {
             Error::MuxIncomplete { .. } => E_MUX_INCOMPLETE,
             Error::RemuxStagingInvalid => E_REMUX_STAGING_INVALID,
             Error::StagedCopySizeMismatch { .. } => E_STAGED_COPY_SIZE_MISMATCH,
-            Error::VerifyWorkerLost => E_VERIFY_WORKER_LOST,
+            Error::WorkerLost { .. } => E_WORKER_LOST,
             Error::MultipassRequiresRaw => E_MULTIPASS_REQUIRES_RAW,
             Error::StreamLanguageUnknown { .. } => E_STREAM_LANGUAGE_UNKNOWN,
             Error::RemuxTargetExists { .. } => E_REMUX_TARGET_EXISTS,
@@ -1341,7 +1343,9 @@ impl std::fmt::Display for Error {
             }
             // `op` is a stable, language-neutral identifier (e.g. "verify",
             // "artifact_lock"), not translatable prose.
-            Error::TimedOut { op } => write!(f, "E{}: {op}", self.code()),
+            Error::TimedOut { op } | Error::WorkerLost { op } => {
+                write!(f, "E{}: {op}", self.code())
+            }
             Error::BusStreamUnmapped { files } => write!(f, "E{}: {files}", self.code()),
             Error::ImageScoped { path } => write!(f, "E{}: {path}", self.code()),
             Error::RemuxVerifyFailed { kind, path } => match kind {
@@ -1884,7 +1888,7 @@ mod tests {
             Error::MuxIncomplete { title: 1 }.code(),
             Error::RemuxStagingInvalid.code(),
             Error::StagedCopySizeMismatch { have: 0, want: 1 }.code(),
-            Error::VerifyWorkerLost.code(),
+            Error::WorkerLost { op: "copy" }.code(),
             Error::MultipassRequiresRaw.code(),
             Error::StreamLanguageUnknown { tag: "x".into() }.code(),
             Error::RemuxTargetExists { path: "x".into() }.code(),
@@ -2529,7 +2533,12 @@ mod tests {
                 "E9080: 10/12",
                 ErrorKind::InvalidData,
             ),
-            (Error::VerifyWorkerLost, 9081, "E9081", ErrorKind::Other),
+            (
+                Error::WorkerLost { op: "verify" },
+                9081,
+                "E9081: verify",
+                ErrorKind::Other,
+            ),
             (
                 Error::MultipassRequiresRaw,
                 9082,
