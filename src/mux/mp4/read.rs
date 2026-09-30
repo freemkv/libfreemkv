@@ -10,8 +10,8 @@
 //! `traf`/`trun`) is out of scope for now.
 
 use crate::disc::{
-    AudioChannels, AudioStream, Codec, DiscTitle, Resolution, SampleRate, Stream as DiscStream,
-    VideoStream,
+    AudioChannels, AudioStream, Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat, MeasuredCicp,
+    Resolution, SampleRate, Stream as DiscStream, VideoStream,
 };
 use crate::labels::LabelPurpose;
 use crate::pes::{PesFrame, Stream};
@@ -133,6 +133,8 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 codec,
                 height,
                 config,
+                cicp,
+                dolby_vision,
                 channels,
                 sample_rate: entry_sample_rate,
                 dts_max_rate,
@@ -147,18 +149,20 @@ impl<R: Read + Seek> Mp4Reader<R> {
             };
 
             // Build the stream model for this track.
-            let stream = match handler {
+            let mut stream = match handler {
                 Some(h) if &h == b"vide" => DiscStream::Video(VideoStream {
                     pid: 0x1011 + track_idx as u16,
                     codec,
                     resolution: Resolution::from_height(height as u32),
-                    frame_rate: crate::disc::FrameRate::Unknown,
-                    hdr: crate::disc::HdrFormat::Sdr,
-                    color_space: crate::disc::ColorSpace::Unknown,
+                    frame_rate: FrameRate::Unknown,
+                    hdr: hdr_from_cicp(cicp, dolby_vision),
+                    color_space: cicp.map_or(crate::disc::ColorSpace::Unknown, |c| {
+                        color_space_from_primaries(c.primaries)
+                    }),
                     display_aspect: None,
                     secondary: false,
                     label: String::new(),
-                    measured_cicp: None,
+                    measured_cicp: cicp,
                 }),
                 Some(h) if &h == b"soun" => DiscStream::Audio(AudioStream {
                     pid: 0x1100 + track_idx as u16,
@@ -197,7 +201,6 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 codec_privates.push(config);
                 continue;
             }
-            sample_budget -= n;
             let chunk_offsets = find_box(stbl, b"stco")
                 .map(|b| parse_stco(b, false))
                 .or_else(|| find_box(stbl, b"co64").map(|b| parse_stco(b, true)))
@@ -254,6 +257,14 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 // degenerate all-zero timing for the unmapped tail.
                 continue;
             }
+            // Charge the shared budget only for tracks that survive every drop guard.
+            sample_budget = sample_budget.saturating_sub(n);
+            if let DiscStream::Video(v) = &mut stream {
+                v.frame_rate = frame_rate_from_stts(timescale, &durations);
+            }
+            let track_secs =
+                durations.iter().map(|&d| d as u64).sum::<u64>() as f64 / timescale as f64;
+            title.duration_secs = title.duration_secs.max(track_secs);
             let ctts = find_box(stbl, b"ctts")
                 .map(|b| parse_ctts(b, n))
                 .unwrap_or_default();
@@ -390,7 +401,9 @@ fn read_moov<R: Read + Seek>(file: &mut R) -> io::Result<Vec<u8>> {
         let box_size: u64 = match size32 {
             1 => {
                 let mut ext = [0u8; 8];
-                file.read_exact(&mut ext)?;
+                if file.read_exact(&mut ext).is_err() {
+                    return Err(crate::error::Error::Mp4Invalid.into());
+                }
                 u64::from_be_bytes(ext)
             }
             0 => file_end.saturating_sub(pos),
@@ -673,6 +686,10 @@ struct StsdInfo {
     codec: Codec,
     height: u16,
     config: Option<Vec<u8>>,
+    /// Video `colr`/`nclx` colour tags, when present.
+    cicp: Option<MeasuredCicp>,
+    /// Video sample entry carries a Dolby Vision `dvcC`/`dvvC` config.
+    dolby_vision: bool,
     channels: u16,
     /// Integer sample rate (Hz) from the AudioSampleEntry 16.16 samplerate
     /// field (high 16 bits). `0` when absent/video — the caller then falls
@@ -728,6 +745,9 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             codec,
             height,
             config,
+            cicp: find_box(children, b"colr").and_then(parse_colr_nclx),
+            dolby_vision: find_box(children, b"dvcC").is_some()
+                || find_box(children, b"dvvC").is_some(),
             channels: 0,
             sample_rate: 0,
             dts_max_rate: None,
@@ -758,11 +778,23 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             _ if body.len() >= 28 => (be16(body, 16), be16(body, 24) as u32, 28),
             _ => (2, 0, body.len()),
         };
-        let config = if matches!(codec, Codec::Aac) {
-            find_box(&body[children..], b"esds").and_then(parse_esds_asc)
-        } else {
-            None
+        let esds = (codec == Codec::Aac)
+            .then(|| find_box(&body[children..], b"esds").and_then(parse_esds))
+            .flatten();
+        // mp4a also carries MPEG-1/2 audio (objectTypeIndication 0x6B / 0x69).
+        let (codec, config) = match esds {
+            Some((0x69 | 0x6B, _)) => (Codec::Mp3, None),
+            Some((_, asc)) => (codec, asc),
+            None => (codec, None),
         };
+        // ETSI TS 102 366 F.3/F.5: the entry's ChannelCount is ignored for AC-3/E-AC-3;
+        // dac3/dec3 carry the real layout.
+        let channels = match codec {
+            Codec::Ac3 => find_box(&body[children..], b"dac3").and_then(ac3_channels),
+            Codec::Ac3Plus => find_box(&body[children..], b"dec3").and_then(ec3_channels),
+            _ => None,
+        }
+        .unwrap_or(channels);
         // ISO AudioSampleEntryV1 carries rates above 65535 in `srat`.
         let sample_rate = find_box(&body[children..], b"srat")
             .filter(|b| b.len() >= 8)
@@ -780,6 +812,8 @@ fn parse_stsd(b: &[u8]) -> Option<StsdInfo> {
             codec,
             height: 0,
             config,
+            cicp: None,
+            dolby_vision: false,
             channels,
             sample_rate,
             dts_max_rate,
@@ -826,10 +860,16 @@ fn read_descriptor_len(b: &[u8], pos: &mut usize) -> usize {
     len
 }
 
-/// esds → AAC AudioSpecificConfig (the A_AAC CodecPrivate), or `None`. Walks
+/// esds → AAC AudioSpecificConfig (the A_AAC CodecPrivate), or `None`.
+#[cfg(test)]
+fn parse_esds_asc(b: &[u8]) -> Option<Vec<u8>> {
+    parse_esds(b).and_then(|(_, asc)| asc)
+}
+
+/// esds → (objectTypeIndication, AudioSpecificConfig if present). Walks
 /// ES_Descriptor(0x03) → DecoderConfigDescriptor(0x04) → DecoderSpecificInfo(0x05).
 /// Fully bounds-checked: a malformed/truncated esds returns None, never panics.
-fn parse_esds_asc(b: &[u8]) -> Option<Vec<u8>> {
+fn parse_esds(b: &[u8]) -> Option<(u8, Option<Vec<u8>>)> {
     // esds is a FullBox: version+flags(4), then the ES_Descriptor.
     let mut pos = 4;
     if *b.get(pos)? != 0x03 {
@@ -855,18 +895,105 @@ fn parse_esds_asc(b: &[u8]) -> Option<Vec<u8>> {
     }
     pos += 1;
     read_descriptor_len(b, &mut pos);
+    let oti = *b.get(pos)?;
     // objectTypeIndication(1) + streamType/bufferSizeDB(4) + maxBitrate(4) + avgBitrate(4)
     pos += 13;
-    if *b.get(pos)? != 0x05 {
-        return None; // DecoderSpecificInfo
+    if b.get(pos) != Some(&0x05) {
+        return Some((oti, None)); // no DecoderSpecificInfo
     }
     pos += 1;
     let asc_len = read_descriptor_len(b, &mut pos);
-    let end = pos.checked_add(asc_len)?;
-    if asc_len == 0 || end > b.len() {
+    let asc = pos
+        .checked_add(asc_len)
+        .filter(|&end| asc_len != 0 && end <= b.len())
+        .map(|end| b[pos..end].to_vec());
+    Some((oti, asc))
+}
+
+/// dac3 → total channel count (full-range + LFE).
+fn ac3_channels(b: &[u8]) -> Option<u16> {
+    // fscod(2) bsid(5) bsmod(3) acmod(3) lfeon(1) bit_rate_code(5) reserved(2)
+    let b1 = *b.get(1)?;
+    Some(ac3_acmod_channels((b1 >> 3) & 7) + ((b1 >> 2) & 1) as u16)
+}
+
+/// dec3 → channel count of the first independent substream plus any dependent
+/// substreams' `chan_loc` (each pair bit adds 2, each single 1, LFE2 1).
+fn ec3_channels(b: &[u8]) -> Option<u16> {
+    // data_rate(13) num_ind_sub(3), then fscod(2) bsid(5) res(1) asvc(1) bsmod(3)
+    // acmod(3) lfeon(1) res(3) num_dep_sub(4) chan_loc-or-res(9 | 1).
+    let b3 = *b.get(3)?;
+    let mut n = ac3_acmod_channels((b3 >> 1) & 7) + (b3 & 1) as u16;
+    let b4 = *b.get(4)?;
+    if (b4 >> 1) & 0x0F != 0 {
+        let loc = ((b4 as u16 & 1) << 8) | *b.get(5)? as u16;
+        // MSB-first: Lc/Rc, Lrs/Rrs, Cs, Ts, Lsd/Rsd, Lw/Rw, Lvh/Rvh, Cvh, LFE2.
+        const PAIRS: u16 = 0b1_1001_1100;
+        n += (loc & PAIRS).count_ones() as u16 * 2 + (loc & !PAIRS & 0x1FF).count_ones() as u16;
+    }
+    Some(n)
+}
+
+fn ac3_acmod_channels(acmod: u8) -> u16 {
+    [2, 1, 2, 3, 3, 4, 4, 5][(acmod & 7) as usize]
+}
+
+/// colr → CICP triple when the colour type is `nclx`.
+fn parse_colr_nclx(b: &[u8]) -> Option<MeasuredCicp> {
+    // 'nclx'(4) primaries(2) transfer(2) matrix(2) full_range(1 bit)
+    if b.len() < 11 || &b[..4] != b"nclx" {
         return None;
     }
-    Some(b[pos..end].to_vec())
+    let code = |o| be16(b, o).min(u8::MAX as u16) as u8;
+    Some(MeasuredCicp {
+        primaries: code(4),
+        transfer: code(6),
+        matrix: code(8),
+        range: if b[10] & 0x80 != 0 { 2 } else { 1 },
+    })
+}
+
+fn hdr_from_cicp(cicp: Option<MeasuredCicp>, dolby_vision: bool) -> HdrFormat {
+    match cicp.map(|c| c.transfer) {
+        _ if dolby_vision => HdrFormat::DolbyVision,
+        Some(16) => HdrFormat::Hdr10,
+        Some(18) => HdrFormat::Hlg,
+        _ => HdrFormat::Sdr,
+    }
+}
+
+fn color_space_from_primaries(primaries: u8) -> ColorSpace {
+    match primaries {
+        1 => ColorSpace::Bt709,
+        5 => ColorSpace::Bt470bg,
+        6 => ColorSpace::Smpte170m,
+        9 => ColorSpace::Bt2020,
+        _ => ColorSpace::Unknown,
+    }
+}
+
+/// Nearest standard frame rate to the median `stts` delta, else `Unknown`.
+fn frame_rate_from_stts(timescale: u32, durations: &[u32]) -> FrameRate {
+    let mut d: Vec<u32> = durations.iter().copied().filter(|&d| d > 0).collect();
+    if d.is_empty() {
+        return FrameRate::Unknown;
+    }
+    d.sort_unstable();
+    let fps = timescale as f64 / d[d.len() / 2] as f64;
+    const RATES: [(f64, FrameRate); 8] = [
+        (24000.0 / 1001.0, FrameRate::F23_976),
+        (24.0, FrameRate::F24),
+        (25.0, FrameRate::F25),
+        (30000.0 / 1001.0, FrameRate::F29_97),
+        (30.0, FrameRate::F30),
+        (50.0, FrameRate::F50),
+        (60000.0 / 1001.0, FrameRate::F59_94),
+        (60.0, FrameRate::F60),
+    ];
+    RATES
+        .iter()
+        .find(|(r, _)| (fps - r).abs() < 0.01)
+        .map_or(FrameRate::Unknown, |&(_, f)| f)
 }
 
 /// stsz → per-sample sizes.
@@ -3678,6 +3805,92 @@ mod tests {
             0,
             "the second track must be left with zero budget, not a grown or \
              partially-decremented one"
+        );
+    }
+
+    #[test]
+    fn dropped_track_does_not_consume_the_shared_sample_budget() {
+        use std::io::Cursor;
+        // Track 0: lying stsz count, stco renamed away so it is dropped.
+        let mut bad = audio_trak_hostile_count();
+        let pos = bad.windows(4).position(|w| w == b"stco").unwrap();
+        bad[pos..pos + 4].copy_from_slice(b"free");
+        let mut traks = bad;
+        traks.extend_from_slice(&audio_trak(48_000));
+        let rd = Mp4Reader::from_reader(Cursor::new(mp4_box(b"moov", &traks)), "b".into()).unwrap();
+        assert_eq!(rd.info().streams.len(), 1, "the stco-less track is dropped");
+        assert_eq!(rd.samples.len(), 1, "the valid track must keep its sample");
+    }
+
+    #[test]
+    fn truncated_largesize_is_mp4_invalid_not_eof() {
+        let mut f = 1u32.to_be_bytes().to_vec();
+        f.extend_from_slice(b"moov");
+        f.extend_from_slice(&[0, 0, 0, 0]); // only 4 of the 8 largesize bytes
+        let err = read_moov(&mut std::io::Cursor::new(f)).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("E{}", crate::error::E_MP4_INVALID)),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn mp4a_with_mpeg_audio_object_type_is_not_labelled_aac() {
+        let mut esds = vec![0u8, 0, 0, 0, 0x03, 19, 0, 1, 0, 0x04, 13, 0x6B, 0x15];
+        esds.extend_from_slice(&[0u8; 11]);
+        let entry = audio_entry(2, 0, &mp4_box(b"esds", &esds));
+        let info = parse_stsd(&stsd_with(b"mp4a", &entry)).unwrap();
+        assert_eq!(info.codec, Codec::Mp3);
+        assert!(info.config.is_none());
+    }
+
+    #[test]
+    fn ac3_and_ec3_channels_come_from_dac3_dec3_not_channelcount() {
+        // dac3: acmod 7 (3/2), lfeon 1 -> 6 channels.
+        let dac3 = mp4_box(b"dac3", &[0x10, (7 << 3) | (1 << 2), 0]);
+        let entry = audio_entry(2, 0, &dac3);
+        let info = parse_stsd(&stsd_with(b"ac-3", &entry)).unwrap();
+        assert_eq!(info.channels, 6);
+        // dec3: acmod 7, lfeon 1, one dependent substream with chan_loc Lrs/Rrs -> 8.
+        let dec3 = mp4_box(b"dec3", &[0, 0, 0, (7 << 1) | 1, (1 << 1), 0x80]);
+        let entry = audio_entry(2, 0, &dec3);
+        let info = parse_stsd(&stsd_with(b"ec-3", &entry)).unwrap();
+        assert_eq!(info.channels, 8);
+        // Without dec3 the entry ChannelCount is the fallback.
+        let info = parse_stsd(&stsd_with(b"ec-3", &audio_entry(2, 0, &[]))).unwrap();
+        assert_eq!(info.channels, 2);
+    }
+
+    #[test]
+    fn video_entry_colr_nclx_and_dolby_vision_are_read() {
+        let mut colr = b"nclx".to_vec();
+        for v in [9u16, 16, 9] {
+            colr.extend_from_slice(&v.to_be_bytes());
+        }
+        colr.push(0);
+        let entry = visual_entry(3840, 2160, &mp4_box(b"colr", &colr));
+        let info = parse_stsd(&stsd_with(b"hvc1", &entry)).unwrap();
+        let c = info.cicp.expect("nclx parsed");
+        assert_eq!((c.primaries, c.transfer, c.matrix, c.range), (9, 16, 9, 1));
+        assert_eq!(hdr_from_cicp(info.cicp, false), HdrFormat::Hdr10);
+        assert_eq!(hdr_from_cicp(info.cicp, true), HdrFormat::DolbyVision);
+        assert_eq!(color_space_from_primaries(c.primaries), ColorSpace::Bt2020);
+    }
+
+    #[test]
+    fn frame_rate_and_duration_are_derived() {
+        assert_eq!(frame_rate_from_stts(24000, &[1001; 5]), FrameRate::F23_976);
+        assert_eq!(frame_rate_from_stts(25, &[1; 5]), FrameRate::F25);
+        assert_eq!(frame_rate_from_stts(90_000, &[1234; 5]), FrameRate::Unknown);
+        let rd = Mp4Reader::from_reader(
+            std::io::Cursor::new(audio_moov(1000, b"ac-3", &audio_entry(6, 0, &[]))),
+            "d".into(),
+        )
+        .unwrap();
+        assert!(
+            (rd.info().duration_secs - 1.0).abs() < 1e-9,
+            "1000 ticks at 1000 Hz"
         );
     }
 }

@@ -432,6 +432,9 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
+        if self.finished {
+            return Err(crate::error::Error::StreamClosed.into());
+        }
         if self.excluded.drop_frame(frame.track) {
             if !self.dropped.iter().any(|&(i, _)| i == frame.track) {
                 self.dropped
@@ -624,7 +627,11 @@ impl VideoTiming {
         let min_pts = samples.iter().map(|s| s.pts_ns).min().unwrap_or(0);
         let cts = samples
             .iter()
-            .map(|s| ((s.pts_ns - min_pts) as i128 * timescale as i128 / NS as i128) as i64)
+            .map(|s| {
+                // Round to nearest tick: truncation lands CFR PTS one tick low.
+                let num = (s.pts_ns - min_pts) as i128 * timescale as i128;
+                ((num + NS as i128 / 2) / NS as i128) as i64
+            })
             .collect();
         Self {
             timescale,
@@ -675,8 +682,7 @@ const STD_RATES: &[(u32, u32, f64)] = &[
 ];
 
 // How far the measured rate may sit from a STD_RATES entry and still snap to it; nearest-wins,
-// not first-wins (see STD_RATES). Two `<`→`<=` mutants on the snapping loop are believed
-// unreachable.
+// not first-wins (see STD_RATES).
 const RATE_TOLERANCE_FPS: f64 = 0.5;
 
 /// Detect the constant frame rate from the median presentation delta, snapping
@@ -2148,6 +2154,39 @@ mod tests {
                 .starts_with(&format!("E{}", crate::error::E_STREAM_WRITE_ONLY)),
             "an Mp4Sink is write-only; read() must report that, not silently return Ok(None); \
              got {err}"
+        );
+    }
+
+    #[test]
+    fn write_after_finish_is_rejected() {
+        let t = title(vec![hevc_video()], vec![Some(vec![1, 2, 3])]);
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        s.write(&frame(0, 0, true, vec![1, 2, 3])).unwrap();
+        s.finish().unwrap();
+        let err = s.write(&frame(0, 40_000_000, false, vec![4])).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("E{}", crate::error::E_STREAM_CLOSED)),
+            "write after finish must be StreamClosed; got {err}"
+        );
+    }
+
+    #[test]
+    fn video_cts_rounds_to_nearest_tick() {
+        let samples: Vec<Sample> = (0..5i64)
+            .map(|i| Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: i * 1001 * 1_000_000_000 / 24000,
+                keyframe: true,
+            })
+            .collect();
+        let timing = VideoTiming::derive(&samples);
+        assert_eq!(timing.timescale, 24000);
+        assert!(
+            timing.ctts().iter().all(|&c| c == 0),
+            "CFR video must have zero ctts; got {:?}",
+            timing.ctts()
         );
     }
 }

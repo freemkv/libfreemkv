@@ -442,6 +442,23 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
 // Serialization uses Codec::id() / HdrFormat::id() and Display impls.
 // Deserialization uses FromStr impls (.parse()) on each enum.
 
+// Record `timing` for stream `track` of a `tracks`-stream title.
+pub(crate) fn set_timing(
+    timings: &mut Vec<crate::pes::TrackTiming>,
+    track: usize,
+    timing: crate::pes::TrackTiming,
+    tracks: usize,
+) -> io::Result<()> {
+    if track >= tracks {
+        return Err(crate::error::Error::MuxTrackRange { track, tracks }.into());
+    }
+    if timings.len() < tracks {
+        timings.resize(tracks, Default::default());
+    }
+    timings[track] = timing;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
