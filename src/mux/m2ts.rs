@@ -64,6 +64,8 @@ impl M2tsStream {
     /// LPCM that BD LPCM can't carry (e.g. 44.1 kHz DVD) is dropped from the output.
     pub fn create(mut writer: impl Write + Send + 'static, title: &DiscTitle) -> io::Result<Self> {
         let mut out = title.clone();
+        // The output is BD-TS (LPCM repacked) whatever the source; the header says so.
+        out.content_format = crate::disc::ContentFormat::BdTs;
         out.streams.clear();
         out.codec_privates.clear();
         let mut route = Vec::with_capacity(title.streams.len());
@@ -280,6 +282,20 @@ mod tests {
                 hvcc
             })],
         }
+    }
+
+    // The file is BD-TS whatever the source was, so its header must say so.
+    #[test]
+    fn a_dvd_title_written_to_m2ts_reads_back_as_bd_ts() {
+        let mut title = make_title();
+        title.content_format = ContentFormat::MpegPs;
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        drop(M2tsStream::create(SharedSink(buf.clone()), &title).unwrap());
+        let bytes = buf.lock().unwrap().clone();
+        let meta = meta::read_header(&mut io::Cursor::new(bytes))
+            .unwrap()
+            .expect("header");
+        assert_eq!(meta.to_title().content_format, ContentFormat::BdTs);
     }
 
     fn fake_idr_pes_data() -> Vec<u8> {
