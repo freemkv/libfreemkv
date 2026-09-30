@@ -416,7 +416,11 @@ impl MkvTrack {
         // anamorphic — coded pixels aren't square, so derive width from the DAR
         // (e.g. 720x576 16:9 -> 1024x576) or players show 5:4/3:2 instead of 16:9.
         let (display_width, display_height) = match v.display_aspect {
-            Some((an, ad)) if an > 0 && ad > 0 && h > 0 => ((h * an + ad / 2) / ad, h),
+            // u64: a caller-supplied ratio must not overflow; an unrepresentable width keeps (w, h).
+            Some((an, ad)) if an > 0 && ad > 0 && h > 0 => {
+                let dw = (u64::from(h) * u64::from(an) + u64::from(ad) / 2) / u64::from(ad);
+                u32::try_from(dw).map_or((w, h), |dw| (dw, h))
+            }
             _ => (w, h),
         };
         Some(Self {
@@ -1161,8 +1165,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             // Blu-ray 3D (MVC) signaling: BlockAdditionMapping carries the mvcC record
             // so players recognise the dependent (right-eye) view riding as a
             // per-frame BlockAdditional under this mapping (BlockAddIDValue = 2).
-            match mvc_record.as_ref() {
-                Some(record) => {
+            match (mvc_record.as_ref(), track.mvc_params.as_ref()) {
+                (Some(record), _) => {
                     let map_pos = ebml::start_master(&mut writer, ebml::BLOCK_ADDITION_MAPPING)?;
                     ebml::write_uint(
                         &mut writer,
@@ -1176,8 +1180,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 // `mvc_params` present but the record failed to build (malformed params):
                 // no mapping, `track_has_mvc_mapping` is already `false`, so
                 // BlockAdditionals are dropped — file stays conforming, no orphan BlockAddID.
-                None if track.mvc_params.is_some() => {
-                    let (s, p) = track.mvc_params.as_ref().unwrap();
+                (None, Some((s, p))) => {
                     tracing::warn!(
                         target: "mux",
                         "MVC track: could not build MVCDecoderConfigurationRecord from the \
@@ -1187,7 +1190,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                         p.len(),
                     );
                 }
-                None => {}
+                (None, None) => {}
             }
 
             // Dolby Vision signaling — BlockAdditionMapping is a child of the
@@ -2003,9 +2006,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
             let offset = match fixup.target_id {
                 ebml::INFO => self.info_offset,
                 ebml::TRACKS => self.tracks_offset,
-                ebml::CHAPTERS => self
-                    .chapters_offset
-                    .expect("CHAPTERS seek fixup present => chapters_offset is Some"),
+                // The CHAPTERS entry is reserved only with chapters, which set the offset.
+                ebml::CHAPTERS => match self.chapters_offset {
+                    Some(off) => off,
+                    None => return Err(crate::error::Error::MkvUnencodable.into()),
+                },
                 ebml::CUES => cues_offset,
                 _ => 0,
             };
@@ -7363,5 +7368,42 @@ mod tests {
             let c = MkvTrack::video(&v).dv_config.unwrap();
             assert_eq!(((c[2] & 1) << 5) | (c[3] >> 3), want, "{fr:?}");
         }
+    }
+
+    // A huge caller-supplied display aspect must not overflow DisplayWidth; an
+    // unrepresentable width falls back to the pixel grid. DVD 16:9 still widens.
+    #[test]
+    fn display_aspect_overflow_keeps_pixel_grid() {
+        let mut v = uhd_video(HdrFormat::Sdr, ColorSpace::Bt709);
+        v.display_aspect = Some((u32::MAX, 1));
+        let t = MkvTrack::video(&v);
+        assert_eq!((t.display_width, t.display_height), (3840, 2160));
+        v.display_aspect = Some((u32::MAX / 2, u32::MAX / 4));
+        assert_eq!(MkvTrack::video(&v).display_width, 4320, "2:1 of 2160");
+    }
+
+    // The CHAPTERS SeekHead back-patch with no recorded offset is a typed error, not a
+    // panic after the whole mux.
+    #[test]
+    fn chapters_fixup_without_offset_is_an_error() {
+        let ch = [Chapter {
+            time_secs: 0.0,
+            name: "1".into(),
+        }];
+        let mut m = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &ch,
+        )
+        .unwrap();
+        m.write_frame(0, 0, true, &[0x65, 1], None, None).unwrap();
+        m.chapters_offset = None;
+        let e = m.finish().unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some(crate::error::E_MKV_UNENCODABLE)
+        );
     }
 }
