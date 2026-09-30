@@ -16,7 +16,7 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 // Cap on a single directory's on-disc data, well above any legitimate BD-ROM
 // directory, so a corrupt 30-bit allocation length can't force a huge alloc.
-const MAX_DIR_BYTES: u32 = 1024 * 1024;
+pub(crate) const MAX_DIR_BYTES: u32 = 1024 * 1024;
 
 // Smallest Main VDS extent ECMA-167 3/10.2.1 permits an AVDP to record (16
 // sectors). A smaller extent is unusable, so it's ignored in favour of
@@ -1579,7 +1579,7 @@ pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
 /// Parse a UDF d-string (fixed-length field with length byte at the end).
 /// Used for Volume Identifier and other UDF descriptor strings.
 /// The first byte of content is a compression ID: 8 = ASCII, 16 = UTF-16BE.
-fn parse_dstring(data: &[u8]) -> String {
+pub(crate) fn parse_dstring(data: &[u8]) -> String {
     let Some(&len) = data.last() else {
         return String::new();
     };
