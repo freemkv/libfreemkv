@@ -22,12 +22,20 @@ impl Disc {
         let vmg_bytes = match udf_fs.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO") {
             Ok(bytes) => bytes,
             Err(Error::Halted) => return Err(Error::Halted),
-            Err(_) => return Ok((Vec::new(), None)),
+            // No IFO at all: a VIDEO_TS dir with nothing to enumerate, not a fault.
+            Err(Error::UdfNotFound { .. }) => return Ok((Vec::new(), None)),
+            Err(e) => {
+                tracing::warn!(target: "freemkv::scan", code = e.code(), "dvd: VIDEO_TS.IFO unreadable");
+                return Err(e);
+            }
         };
         let dvd_info = match ifo::parse_vmg_with(reader, udf_fs, Some(&vmg_bytes)) {
             Ok(info) => info,
             Err(Error::Halted) => return Err(Error::Halted),
-            Err(_) => return Ok((Vec::new(), None)),
+            Err(e) => {
+                tracing::warn!(target: "freemkv::scan", code = e.code(), "dvd: VIDEO_TS.IFO parse failed");
+                return Err(e);
+            }
         };
 
         // Follow the disc's First-Play navigation like a player would, to find the
@@ -122,10 +130,18 @@ impl Disc {
                     );
                 }
 
-                // Build extents from cell sector ranges (absolute = vob_start + cell offset),
-                // starting at the resolved feature-start cell.
-                let extents: Vec<Extent> = dvd_title.cells[feature_start..]
+                // Extents = cell sector ranges (absolute = vob_start + cell offset) from the
+                // feature-start cell. Non-first angle-block cells duplicate angle 1: skip
+                // them unless that would leave nothing.
+                let mut feature_cells: Vec<&ifo::DvdCell> = dvd_title.cells[feature_start..]
                     .iter()
+                    .filter(|c| !ifo::CellCategory::decode(c.category).is_secondary_block_piece())
+                    .collect();
+                if feature_cells.is_empty() {
+                    feature_cells = dvd_title.cells[feature_start..].iter().collect();
+                }
+                let extents: Vec<Extent> = feature_cells
+                    .into_iter()
                     .map(|cell| {
                         let start = ts.vob_start_sector.saturating_add(cell.first_sector);
                         let count = cell
@@ -197,15 +213,20 @@ impl Disc {
                 streams.extend(title_audio_streams(ts, dvd_title, title_number));
                 streams.extend(subtitle_streams);
 
-                // Chapter times are absolute from the PGC start. When leading cells are
-                // dropped, the muxed video shifts earlier by their total duration, so shift
-                // chapter marks too (clamping any that fell inside the dropped head to 0).
-                let chapters: Vec<Chapter> = dvd_title
+                // Chapter times are absolute from the PGC start: shift them by the dropped
+                // head's duration; marks inside the head collapse to one at 0.0.
+                let shifted: Vec<f64> = dvd_title
                     .chapter_times
                     .iter()
+                    .map(|&t| (t - dropped_secs).max(0.0))
+                    .collect();
+                let in_head = shifted.iter().filter(|&&t| t <= 0.0).count();
+                let chapters: Vec<Chapter> = shifted
+                    .into_iter()
+                    .skip(in_head.saturating_sub(1))
                     .enumerate()
-                    .map(|(i, &t)| Chapter {
-                        time_secs: (t - dropped_secs).max(0.0),
+                    .map(|(i, time_secs)| Chapter {
+                        time_secs,
                         name: chapter_name(i),
                     })
                     .collect();
@@ -213,7 +234,7 @@ impl Disc {
                 titles.push(DiscTitle {
                     playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
                     playlist_id: title_number,
-                    duration_secs: dvd_title.duration_secs,
+                    duration_secs: (dvd_title.duration_secs - dropped_secs).max(0.0),
                     size_bytes,
                     clips: Vec::new(),
                     streams,
@@ -1961,5 +1982,96 @@ mod tests {
             })
             .collect();
         assert_eq!(audio_pids, vec![0x00C0u16, 0x00C1u16]);
+    }
+
+    fn scan_cells(cells: &[(u32, u32, u8, u8)], programs: &[u8], nchap: u16) -> DiscTitle {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(nchap, 1, 1)]);
+        let vts = build_vts_cells(1000, 0x00, cells, programs);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0
+            .remove(0)
+    }
+
+    // Non-first angle cells in the middle of a title must not become extents.
+    #[test]
+    fn scan_dvd_titles_drops_mid_title_secondary_angle_cells() {
+        let t = scan_cells(
+            &[
+                (0, 99, 0x00, 0x10),
+                (100, 199, 0x50, 0x10),
+                (200, 299, 0x90, 0x10),
+                (300, 399, 0xD0, 0x10),
+                (400, 499, 0x00, 0x10),
+            ],
+            &[1],
+            1,
+        );
+        assert_eq!(t.extents.len(), 3, "angle 1 only");
+        assert_eq!(t.extents[1].start_lba, 9000 + 1000 + 100);
+        assert_eq!(t.extents[2].start_lba, 9000 + 1000 + 400);
+        assert_eq!(t.size_bytes, 300 * 2048);
+    }
+
+    // Dropped head time comes off the duration, and head chapters collapse to one mark at 0.
+    #[test]
+    fn scan_dvd_titles_dropped_head_adjusts_duration_and_chapters() {
+        let t = scan_cells(
+            &[
+                (0, 9, 0x90, 0x05),
+                (10, 19, 0x90, 0x05),
+                (100, 199, 0x00, 0x20),
+                (300, 399, 0x00, 0x20),
+            ],
+            &[1, 2, 3, 4],
+            4,
+        );
+        assert!(
+            (t.duration_secs - 40.0).abs() < 0.01,
+            "got {}",
+            t.duration_secs
+        );
+        let times: Vec<f64> = t.chapters.iter().map(|c| c.time_secs).collect();
+        assert_eq!(times.iter().filter(|&&x| x <= 0.0).count(), 1, "{times:?}");
+        assert_eq!(t.chapters[0].name, "1");
+    }
+
+    // An IFO that exists but does not parse is an error, not an empty disc.
+    #[test]
+    fn scan_dvd_titles_garbage_ifo_is_an_error() {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vec![0x55; 4096],
+            }],
+        );
+        let res = Disc::scan_dvd_titles(&mut disc, &udf, None);
+        assert!(
+            matches!(res, Err(crate::error::Error::IfoParse)),
+            "{:?}",
+            res.map(|r| r.0.len())
+        );
     }
 }
