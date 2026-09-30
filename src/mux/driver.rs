@@ -26,18 +26,27 @@ use super::resolve::{
 };
 use super::videomap::{Medium, SourceInfo};
 
-// The source medium a parsed input URL denotes, used only for provenance. Non-legal-input URLs
-// never reach a sink, so their arm is immaterial — falls to the `File` default.
+// The source medium a parsed input URL denotes, used only for provenance. Exhaustive, so a
+// new scheme must be placed; sink-only schemes never reach here and take the `File` default.
 fn url_medium(parsed: &StreamUrl) -> Medium {
     match parsed {
         StreamUrl::Disc { .. } => Medium::Disc,
-        StreamUrl::Iso { .. } => Medium::Iso,
+        // `dir://` is an image-level source: a UDF volume synthesized over the folder.
+        StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => Medium::Iso,
         StreamUrl::Mkv { .. }
         | StreamUrl::M2ts { .. }
         | StreamUrl::Mp4 { .. }
         | StreamUrl::Mpg { .. } => Medium::File,
         StreamUrl::Network { .. } | StreamUrl::Stdio => Medium::Stream,
-        _ => Medium::File,
+        StreamUrl::Null
+        | StreamUrl::Demux { .. }
+        | StreamUrl::Video { .. }
+        | StreamUrl::Audio { .. }
+        | StreamUrl::Sub { .. }
+        | StreamUrl::Fvi { .. }
+        | StreamUrl::Chapters { .. }
+        | StreamUrl::Json { .. }
+        | StreamUrl::Unknown { .. } => Medium::File,
     }
 }
 
@@ -1575,6 +1584,8 @@ mod tests {
         assert_eq!(url_medium(&parse_url("mp4://m.mp4")), Medium::File);
         assert_eq!(url_medium(&parse_url("network://h:9000")), Medium::Stream);
         assert_eq!(url_medium(&parse_url("stdio://")), Medium::Stream);
+        // A disc folder is an image-level source (a synthesized UDF volume).
+        assert_eq!(url_medium(&parse_url("dir:///m/BD")), Medium::Iso);
     }
 
     // ── chapters:// / json:// short-circuit runs even when headers never
