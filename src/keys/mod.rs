@@ -490,7 +490,7 @@ impl ResolvedKeySet {
             .map(|(s, k)| (s as u32 + 1, *k))
             .collect();
         for (j, k) in i.fmts_keys.iter().enumerate() {
-            let tag = crate::mux::resolve::FMTS_POOL_TAG_BASE.saturating_add(j as u32);
+            let tag = crate::keys::fmts::FMTS_POOL_TAG_BASE.saturating_add(j as u32);
             unit_keys.push((tag, *k));
         }
         DecryptKeys::Aacs {
@@ -530,7 +530,6 @@ impl ResolvedKeySet {
     // or over a source that cannot seek.
     fn caller_bug(what: &'static str) -> Error {
         tracing::error!(target: "freemkv::keys", what, "key set used incorrectly (caller bug)");
-        debug_assert!(false, "key set used incorrectly: {what}");
         Error::DecryptFailed
     }
 

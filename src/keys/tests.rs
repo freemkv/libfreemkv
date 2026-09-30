@@ -490,16 +490,9 @@ fn read<S: SectorSource>(
     Ok(masked(&buf))
 }
 
-// A caller bug refuses with E7013 plus a debug assertion (KU §6): a panic in a debug
-// build, `Err(E7013)` in a release build.
+// A caller bug refuses with E7013 (KU §6), in debug and release builds alike.
 fn caller_bug<T>(f: impl FnOnce() -> Result<T>) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Err(_) => {
-            #[cfg(not(debug_assertions))]
-            panic!("only a debug build asserts");
-        }
-        Ok(r) => assert_eq!(code(r), crate::error::E_DECRYPT_FAILED),
-    }
+    assert_eq!(code(f()), crate::error::E_DECRYPT_FAILED);
 }
 
 const E7013: u16 = crate::error::E_DECRYPT_FAILED;
