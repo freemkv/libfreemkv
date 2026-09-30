@@ -277,17 +277,7 @@ impl Disc {
                 // not closed since it's unclear that's always a defect (see hddvd.rs).
                 if let Some(file_exts) = file_exts {
                     let span_start = feed_pos;
-                    for (lba, sectors) in file_exts {
-                        if sectors > 0 && lba > 0 {
-                            extents.push(Extent {
-                                start_lba: lba,
-                                sector_count: sectors,
-                            });
-                            feed_pos = feed_pos.saturating_add(
-                                sectors as u64 * crate::consts::SECTOR_BYTES as u64,
-                            );
-                        }
-                    }
+                    push_extents(file_exts, &mut extents, &mut feed_pos);
                     if feed_pos > span_start {
                         spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
                     }
@@ -521,6 +511,21 @@ impl Disc {
 
 // Decode the five predefined XML entities and numeric char refs in element text, and unwrap a
 // CDATA section; unknown or malformed references are kept literally.
+/// Append each usable `(lba, sectors)` to `extents`, advancing `feed_pos` by its bytes. An extent
+/// with no sectors or at LBA 0 occupies no readable bytes and is skipped without moving `feed_pos`.
+fn push_extents(file_exts: Vec<(u32, u32)>, extents: &mut Vec<Extent>, feed_pos: &mut u64) {
+    for (lba, sectors) in file_exts {
+        if sectors > 0 && lba > 0 {
+            extents.push(Extent {
+                start_lba: lba,
+                sector_count: sectors,
+            });
+            *feed_pos =
+                feed_pos.saturating_add(sectors as u64 * crate::consts::SECTOR_BYTES as u64);
+        }
+    }
+}
+
 fn xml_text_decode(raw: &str) -> String {
     if let Some(inner) = raw
         .strip_prefix("<![CDATA[")
@@ -2786,10 +2791,11 @@ mod tests {
         assert_eq!(t.clips[2].feed_span, Some((0, s1)), "repeat reuses span");
     }
 
-    // A zero-length stream file yields no extent, so the clip has no feed_span and later clips
-    // start at feed offset 0.
+    // A clip with no extents gets no feed_span and does not shift later clips' spans. (UDF
+    // itself yields no entry for a zero-length file, so this is the empty-span guard, not the
+    // extent filter; the filter is covered by `push_extents_*` below.)
     #[test]
-    fn parse_playlist_empty_extent_is_skipped_without_advancing_feed() {
+    fn parse_playlist_clip_without_extents_gets_no_feed_span() {
         let mut disc = MemDisc::new();
         let udf = make_bdmv_fs(
             &mut disc,
@@ -2809,9 +2815,125 @@ mod tests {
         let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
             .expect("scan")
             .expect("title");
-        assert_eq!(t.extents.len(), 1, "empty extent must be filtered");
+        assert_eq!(t.extents.len(), 1);
         assert_eq!(t.clips[0].feed_span, None);
         assert_eq!(t.clips[1].feed_span, Some((0, 500 * 2048)));
+    }
+
+    // The extent filter: zero-sector and LBA-0 extents are dropped and do not advance feed_pos.
+    // Each half is pinned separately (a lone `sectors > 0` or lone `lba > 0` must fail).
+    #[test]
+    fn push_extents_drops_empty_and_lba_zero_extents_without_advancing() {
+        let mut extents = Vec::new();
+        let mut pos = 0u64;
+        push_extents(
+            vec![(100, 2), (200, 0), (0, 5), (300, 3)],
+            &mut extents,
+            &mut pos,
+        );
+        let got: Vec<(u32, u32)> = extents
+            .iter()
+            .map(|e| (e.start_lba, e.sector_count))
+            .collect();
+        assert_eq!(got, vec![(100, 2), (300, 3)]);
+        assert_eq!(pos, 5 * 2048);
+    }
+
+    #[test]
+    fn push_extents_drops_zero_sector_extent_alone() {
+        let mut extents = Vec::new();
+        let mut pos = 0u64;
+        push_extents(vec![(200, 0), (300, 1)], &mut extents, &mut pos);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(pos, 2048);
+    }
+
+    #[test]
+    fn push_extents_drops_lba_zero_extent_alone() {
+        let mut extents = Vec::new();
+        let mut pos = 0u64;
+        push_extents(vec![(0, 4), (300, 1)], &mut extents, &mut pos);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(pos, 2048);
+    }
+
+    // A clip whose file has several allocation descriptors: its extents are all kept in
+    // order, its feed_span covers their sum, and the next clip starts after it. A zero-length
+    // AD ends the list (ECMA-167 4/12), so a descriptor after it never appears.
+    #[test]
+    fn parse_playlist_multi_extent_clip_feed_span_covers_sum() {
+        let mut disc = MemDisc::new();
+        let stream = vec![
+            file_ads(
+                "00001.m2ts",
+                100,
+                &[
+                    (5000, 300 * 2048),
+                    (7000, 200 * 2048),
+                    (0, 0),
+                    (8000, 99 * 2048),
+                ],
+                true,
+            ),
+            file("00002.m2ts", 101, 9000, 500 * 2048, true),
+        ];
+        let clipinf = vec![
+            file_with("00001.clpi", 102, 6000, build_clpi(4000), false),
+            file_with("00002.clpi", 103, 6100, build_clpi(2000), false),
+        ];
+        let mk = |name: &str, icb, dd, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: dd,
+            files,
+            subdirs,
+        };
+        let root = mk(
+            "",
+            10,
+            11,
+            Vec::new(),
+            vec![mk(
+                "BDMV",
+                20,
+                21,
+                Vec::new(),
+                vec![
+                    mk("STREAM", 22, 23, stream, vec![]),
+                    mk("CLIPINF", 24, 25, clipinf, vec![]),
+                ],
+            )],
+        );
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+        let pi = |c: &[u8; 5], i: u32| PiSpec {
+            clip_id: *c,
+            in_time: i * 60 * 45000,
+            out_time: (i + 1) * 60 * 45000,
+        };
+        let mpls = build_mpls(
+            &[pi(b"00001", 0), pi(b"00002", 1)],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        let got: Vec<(u32, u32)> = t
+            .extents
+            .iter()
+            .map(|e| (e.start_lba, e.sector_count))
+            .collect();
+        let ps = udf.partition_start();
+        assert_eq!(
+            got,
+            vec![(ps + 5000, 300), (ps + 7000, 200), (ps + 9000, 500)]
+        );
+        let s1 = 500u64 * 2048;
+        assert_eq!(t.clips[0].feed_span, Some((0, s1)));
+        assert_eq!(t.clips[1].feed_span, Some((s1, s1 + 500 * 2048)));
     }
 
     // Chapter names number the surviving entry marks 1..n, not their original mark index.
