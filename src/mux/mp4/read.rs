@@ -1580,6 +1580,10 @@ mod tests {
         let d = 41_708_333i64;
         let vid0 = vec![0x11u8; 700];
         let vid1 = vec![0x22u8; 350];
+        // Same-length audio samples with distinct bytes, so a wrong co64 offset shows.
+        let mut ac3b = ac3.clone();
+        ac3b[8] = 0x5A;
+        ac3b[9] = 0xA5;
 
         let mut buf = Vec::new();
         {
@@ -1597,7 +1601,7 @@ mod tests {
             sink.write(&mk(0, 0, true, vid0.clone())).unwrap();
             sink.write(&mk(1, 0, true, ac3.clone())).unwrap();
             sink.write(&mk(0, d, false, vid1.clone())).unwrap();
-            sink.write(&mk(1, 32_000_000, true, ac3.clone())).unwrap();
+            sink.write(&mk(1, 32_000_000, true, ac3b.clone())).unwrap();
             sink.finish().unwrap();
         }
 
@@ -1613,13 +1617,18 @@ mod tests {
         // Read all frames back; match them to what we wrote by (track, size).
         let mut got = Vec::new();
         while let Some(f) = rd.read().unwrap() {
-            got.push((f.track, f.data.len(), f.keyframe));
+            got.push((f.track, f.data.len(), f.keyframe, f.data));
         }
         assert_eq!(got.len(), 4, "4 samples round-trip");
-        let vids: Vec<_> = got.iter().filter(|(t, _, _)| *t == 0).collect();
-        let auds: Vec<_> = got.iter().filter(|(t, _, _)| *t == 1).collect();
+        let vids: Vec<_> = got.iter().filter(|(t, ..)| *t == 0).collect();
+        let auds: Vec<_> = got.iter().filter(|(t, ..)| *t == 1).collect();
         assert_eq!(vids.len(), 2);
         assert_eq!(auds.len(), 2);
+        // Payload bytes, not just sizes, must come back from the right offsets.
+        assert_eq!(vids[0].3, vid0);
+        assert_eq!(vids[1].3, vid1);
+        assert_eq!(auds[0].3, ac3);
+        assert_eq!(auds[1].3, ac3b);
         assert_eq!(vids[0].1, 700, "first video sample size");
         assert_eq!(vids[1].1, 350, "second video sample size");
         assert!(vids[0].2, "first video frame is a keyframe");
