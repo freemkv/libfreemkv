@@ -20,7 +20,8 @@ pub(crate) const MAX_PTS_GAP_TICKS: u64 = 63_000;
 /// MS-17: SCR fields in successive packs ≤ 0.7 s apart.
 pub(crate) const MAX_SCR_GAP27: u64 = HZ27 * 7 / 10;
 /// Widest timestamp gap bridged with padding packs; a wider one is re-based away. Above
-/// the longest finite DVD cell still (254 s), so real stills keep their timing.
+/// the longest finite DVD cell still (254 s); a narrower gap is re-based only when the
+/// padding budget runs out (under about 183 B of input per second of gap).
 const MAX_PAD_GAP27: u64 = 300 * HZ27;
 /// Padding allowed beyond `PAD_RATIO` × the input bytes pushed, so amplification stays
 /// bounded while sparse low-bitrate stills are still padded.
@@ -740,7 +741,8 @@ impl<W: Write> Mux<W> {
         }
     }
 
-    // Padding written stays within a floor plus `PAD_RATIO` × the input, whatever the gaps.
+    // Padding stays within a floor plus `PAD_RATIO` × the input, and at most one pack per
+    // wait inside the 0.95 s lead.
     fn pad_over_budget(&self, next: u64, last: u64) -> bool {
         let packs = next.saturating_sub(last) / MAX_SCR_GAP27;
         (self.counters.padding_packs + packs) * pack::PACK_BYTES as u64
@@ -748,7 +750,8 @@ impl<W: Write> Mux<W> {
     }
 
     // Every stream is quiet until `next`: shift queued timestamps back so it lands within
-    // one SCR step of `last` (rounded up). Written AUs keep their decoding times.
+    // one SCR step of `last` (rounded up). Written AUs keep their decoding times, except
+    // those a forced EOF drain wrote past the lead: only moving them lets the loop progress.
     fn rebase(&mut self, last: u64, next: u64) {
         let d90 = next.saturating_sub(last + MAX_SCR_GAP27).div_ceil(300);
         let d27 = d90 * 300;
@@ -766,6 +769,9 @@ impl<W: Write> Mux<W> {
                 q.au.pts = q.au.pts.saturating_sub(d90);
                 q.au.dts = q.au.dts.map(|d| d.saturating_sub(d90));
             }
+        }
+        for e in self.entries.iter_mut().filter(|e| e.dec27 > last + LEAD27) {
+            e.dec27 = e.dec27.saturating_sub(d27);
         }
         self.t = Some(next - d27);
     }
@@ -934,6 +940,23 @@ mod tests {
         m.push(0, au(d / 300 + 3_600, 1_000, 0));
         m.finish().unwrap();
         assert!(scrs(&m.into_writer()).iter().all(|&s| s <= d + HZ27));
+    }
+
+    // A forced EOF drain writes AUs ahead of the lead; a later wait on their removal must
+    // still re-base and finish, not spin (run on a thread so a regression fails, not hangs).
+    #[test]
+    fn a_forced_drain_then_huge_gaps_still_finishes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut m = video_mux();
+            m.push(0, au(9_000, 0, 0));
+            for k in 0..3u64 {
+                m.push(0, au(12_600 + k * 400 * 90_000, 200_000, 0));
+            }
+            let _ = tx.send(m.finish().is_ok());
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(20));
+        assert_eq!(done, Ok(true), "the forced drain never finished");
     }
 
     // A re-base lands the next SCR at most 0.7 s after the last one (MS-17), whatever
