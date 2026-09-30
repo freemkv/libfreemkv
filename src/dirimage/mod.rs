@@ -183,9 +183,12 @@ impl DirImage {
             self.open.insert(0, entry);
             return Ok(&mut self.open[0].1);
         }
-        // A file that vanished or became unreadable is a change; name it.
-        let changed = |_| Error::DirImageFileChanged {
-            path: self.files[file].disc_path.clone(),
+        // A vanished file is a change; name it. Other io errors stay retryable IoError.
+        let changed = |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::DirImageFileChanged {
+                path: self.files[file].disc_path.clone(),
+            },
+            _ => Error::from(e),
         };
         let f = File::open(&self.files[file].host).map_err(changed)?;
         let md = f.metadata().map_err(changed)?;

@@ -197,7 +197,7 @@ pub const E_DIR_IMAGE_SSIF_UNSUPPORTED: u16 = 9061;
 /// A `dir://` SOURCE `VIDEO_TS` folder's IFO-declared VOB offsets cannot be
 /// satisfied by any placement: the required start sector of a VOB lies BELOW
 /// the end of the file that must precede it. Carries the offending file's disc
-/// path. A silently misplaced VOB would rip the wrong sectors.
+/// path. Also raised for an IFO too short to resolve its placement offsets.
 pub const E_DIR_IMAGE_PLACEMENT: u16 = 9062;
 /// A `dir://` SOURCE folder still carries live AACS-encrypted content: it has
 /// an `AACS/` directory AND the sampled content units are genuinely scrambled.
@@ -217,7 +217,7 @@ pub const E_DIR_IMAGE_TOO_LARGE: u16 = 9066;
 /// File Identifier Descriptor stores the encoded length in one byte.
 pub const E_DIR_NAME_TOO_LONG: u16 = 9067;
 /// One directory in the folder holds more subdirectories than a UDF link count
-/// can express (it is 16 bits, one per child plus one for its own entry).
+/// can express (16 bits), or more entries than the reader's directory size cap.
 pub const E_DIR_IMAGE_FANOUT: u16 = 9068;
 /// A title's clip marks excluded more frames than they kept.
 pub const E_SEAM_PLAN_DROPPED_MOST: u16 = 9069;

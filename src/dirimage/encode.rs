@@ -136,7 +136,7 @@ fn put_domain_id(buf: &mut [u8]) {
 /// OSTA CS0 d-string: a compression-ID byte, the characters, then the used
 /// length in the FIELD'S LAST byte (ECMA-167 1/7.2.12 + UDF 2.1.3). An
 /// all-zero field is the empty string.
-fn put_dstring(buf: &mut [u8], s: &str) {
+pub(super) fn put_dstring(buf: &mut [u8], s: &str) {
     if s.is_empty() {
         return;
     }

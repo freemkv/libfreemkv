@@ -245,9 +245,6 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
         }
     }
 
-    // `find_dir`/`read_file` match path components case-insensitively, so two
-    // entries differing only in case are indistinguishable to every consumer —
-    // the second would silently shadow the first. Only on a case-sensitive host.
     let dir_len = dir_bytes(&dirs, &files);
     if dir_len.div_ceil(SECTOR) > (crate::udf::MAX_DIR_BYTES as usize) / SECTOR {
         // The UDF reader rejects a larger directory; refuse it here, naming it.
@@ -255,6 +252,9 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
             path: disc_path.to_string(),
         });
     }
+    // `find_dir`/`read_file` match path components case-insensitively, so two
+    // entries differing only in case are indistinguishable to every consumer —
+    // the second would silently shadow the first. Only on a case-sensitive host.
     names.sort();
     for pair in names.windows(2) {
         if pair[0] == pair[1] {
@@ -349,11 +349,14 @@ fn read_head(path: &Path, disc_path: &str, n: usize) -> Result<Vec<u8>> {
     // `read_exact`, not `read`: a single `read` may legally return fewer bytes on
     // a network/FUSE mount (a NAS-hosted backup is normal here). A short buffer
     // records NO constraint, so the rip reads the wrong sectors at exit 0.
-    let unreadable = |_| Error::DirImagePlacement {
-        path: disc_path.to_string(),
-    };
-    let mut f = std::fs::File::open(path).map_err(unreadable)?;
-    f.read_exact(&mut buf).map_err(unreadable)?;
+    let mut f = std::fs::File::open(path).map_err(Error::from)?;
+    f.read_exact(&mut buf).map_err(|e| match e.kind() {
+        // A short IFO cannot resolve placement; other errors stay retryable IoError.
+        std::io::ErrorKind::UnexpectedEof => Error::DirImagePlacement {
+            path: disc_path.to_string(),
+        },
+        _ => Error::from(e),
+    })?;
     Ok(buf)
 }
 
@@ -621,19 +624,24 @@ pub(super) fn plan(root: &Path) -> Result<Layout> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "FREEMKV".to_string());
-    // A 32-byte d-string holds 30 ASCII chars, but only 15 UTF-16 units once
-    // non-ASCII forces CS0 ID 16. Trim here so `put_dstring` never cuts a char.
-    let mut volume_id: String = volume_id.chars().take(30).collect();
-    if !volume_id.is_ascii() {
-        let mut units = 0;
-        volume_id = volume_id
-            .chars()
-            .take_while(|c| {
-                units += c.len_utf16();
-                units <= 15
-            })
-            .collect();
-    }
+    // A 32-byte d-string holds 30 ASCII chars, or 15 UTF-16 units once non-ASCII
+    // forces CS0 ID 16. Round-trip through the encoder and the reader so `volume_id`
+    // is exactly what the reader decodes (it drops surrogates and trims).
+    let mut units = 0;
+    let cut: String = volume_id
+        .chars()
+        .take_while(|c| {
+            units += if volume_id.is_ascii() {
+                1
+            } else {
+                c.len_utf16()
+            };
+            units <= if volume_id.is_ascii() { 30 } else { 15 }
+        })
+        .collect();
+    let mut field = [0u8; 32];
+    super::encode::put_dstring(&mut field, &cut);
+    let volume_id = crate::udf::parse_dstring(&field);
 
     Ok(Layout {
         part_start,

@@ -1211,6 +1211,68 @@ fn a_non_ascii_volume_id_matches_what_the_reader_sees() {
     assert_eq!(fs.volume_id, img.volume_id());
 }
 
+/// A folder name with an emoji and a trailing space INSIDE the 15-unit cut still matches the reader.
+#[test]
+fn a_volume_id_cut_inside_emoji_or_space_matches_the_reader() {
+    for (tag, name) in [
+        ("volemoji", "Film \u{1F600} x"),
+        ("volspace", "Cr\u{e8}me br\u{fb}l\u{e9}e 1 x"),
+    ] {
+        let base = Scratch::new(tag);
+        base.file(&format!("{name}/BDMV/index.bdmv"), &pattern(1, 16));
+        base.file(&format!("{name}/BDMV/STREAM/00000.m2ts"), &pattern(2, 4096));
+        let mut img = DirImage::open(&base.path().join(name)).unwrap();
+        let fs = udf::read_filesystem(&mut img).unwrap();
+        assert_eq!(fs.volume_id, img.volume_id(), "{name}");
+    }
+}
+
+/// An unreadable (not vanished) file keeps its IoError so engine retry logic still sees it.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_is_an_io_error_not_file_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, _, _) = bdmv_scratch();
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let (lba, sectors) = fs
+        .file_extents(&mut img, "/BDMV/STREAM/00000.m2ts")
+        .unwrap()[0];
+    let p = s.path().join("BDMV/STREAM/00000.m2ts");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&p).is_ok() {
+        return; // running as root: permissions not enforced
+    }
+    let mut buf = vec![0u8; sectors as usize * SECTOR];
+    let err = img
+        .read_sectors(lba, sectors as u16, &mut buf, false)
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::IoError { .. }),
+        "expected IoError, got {err:?}"
+    );
+}
+
+/// An unreadable IFO is an IoError; only a short one is a placement error.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_ifo_is_an_io_error_not_placement() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("dvdperm");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vec![0u8; SECTOR]);
+    let p = s.path().join("VIDEO_TS/VTS_01_0.IFO");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&p).is_ok() {
+        return; // running as root: permissions not enforced
+    }
+    let err = DirImage::open(s.path()).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::IoError { .. }),
+        "expected IoError, got {err:?}"
+    );
+}
+
 // Two IFOs that parse to the same title-set group (VTS_01_0 vs VTS_1_0) must be refused, or the
 // second's constraint silently overwrites the first's.
 #[test]
