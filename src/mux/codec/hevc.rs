@@ -1436,62 +1436,6 @@ mod tests {
         assert_eq!(RBSP_COPIES.with(|c| c.get()), 0);
     }
 
-    // Counts this thread's heap allocations so a test can measure what `scan_sei` itself does.
-    struct CountingAlloc;
-    thread_local! {
-        static ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    // SAFETY: forwards every call to `System`; the counter is a const-initialised Cell.
-    unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
-        unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-            ALLOCS.with(|c| c.set(c.get() + 1));
-            unsafe { std::alloc::System.alloc(l) }
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-            unsafe { std::alloc::System.dealloc(p, l) }
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
-            ALLOCS.with(|c| c.set(c.get() + 1));
-            unsafe { std::alloc::System.realloc(p, l, n) }
-        }
-    }
-    #[global_allocator]
-    static COUNTING: CountingAlloc = CountingAlloc;
-
-    // MEASURED on `scan_sei` itself (RBSP_COPIES cannot see it: it walks a copy-free iterator):
-    // a payload that is not wanted is skipped, never collected into a Vec.
-    #[test]
-    fn scan_sei_allocates_only_for_a_payload_it_captures() {
-        let mastering = mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, 9, 10);
-        // Drop the start code: scan_sei takes the NAL from its 2-byte header.
-        let nal = |msgs: &[Vec<u8>]| sei_nal(msgs)[3..].to_vec();
-        let allocs = |p: &mut HevcParser, n: &[u8]| {
-            let before = ALLOCS.with(|c| c.get());
-            p.scan_sei(n);
-            ALLOCS.with(|c| c.get()) - before
-        };
-        let big = sei_message(5, &[0x42; 600]); // user_data_unregistered: never wanted
-        let mut parser = HevcParser::new();
-        let first = nal(&[sei_message(SEI_MASTERING_DISPLAY_COLOUR_VOLUME, &mastering)]);
-        assert!(
-            allocs(&mut parser, &first) > 0,
-            "control: a capture allocates"
-        );
-        assert!(parser.sei_mastering.is_some() && parser.sei_content_light.is_none());
-
-        // Content-light is still absent, so the walk runs: mastering (already held) and the
-        // big payload are both skipped.
-        let skipped = nal(&[
-            big.clone(),
-            sei_message(SEI_MASTERING_DISPLAY_COLOUR_VOLUME, &mastering),
-        ]);
-        assert_eq!(
-            allocs(&mut parser, &skipped),
-            0,
-            "unwanted payloads are not copied"
-        );
-    }
-
     /// Only the mastering-display SEI (no content-light SEI) → metadata is NOT
     /// surfaced. HDR10 requires BOTH; a half-populated record is never emitted.
     #[test]

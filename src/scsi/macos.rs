@@ -798,6 +798,15 @@ mod tests {
         assert!(!OPEN.load(Ordering::Acquire), "drop released OPEN");
     }
 
+    // Holds SHIM_GLOBALS for a test that scripts the fake device, and puts the knob back to
+    // its defaults on drop (panic included) before the lock is released.
+    struct FakeDeviceGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl Drop for FakeDeviceGuard {
+        fn drop(&mut self) {
+            unsafe { shim_selftest_set_execute(0, 0, 0, std::ptr::null()) };
+        }
+    }
+
     // Runs `execute` on the fake device after `shim_selftest_set_execute(kr, status, count, sense)`.
     fn execute_on_fake(
         kr: i32,
@@ -833,7 +842,7 @@ mod tests {
     /// any other nonzero status is an error with no sense.
     #[test]
     fn shim_selftest_check_condition_and_other_statuses_are_errors() {
-        let _globals = shim_globals();
+        let _globals = FakeDeviceGuard(shim_globals());
         // Fixed format, NOT READY / 04h 01h (becoming ready), SKSV set, progress 0x1234.
         let mut sense = [0u8; 32];
         sense[0] = 0x70;
@@ -870,7 +879,7 @@ mod tests {
     /// A failing IOKit return is a transport failure, whatever status the task reported.
     #[test]
     fn shim_selftest_iokit_failure_is_a_transport_failure() {
-        let _globals = shim_globals();
+        let _globals = FakeDeviceGuard(shim_globals());
         let (_t, r) = execute_on_fake(0x2c2, 0, 8, None, &mut [0u8; 8]);
         assert!(matches!(
             r,
@@ -885,7 +894,7 @@ mod tests {
     /// `bytes_transferred` is what the device moved, never more than the buffer holds.
     #[test]
     fn shim_selftest_transfer_count_is_clamped_to_the_buffer() {
-        let _globals = shim_globals();
+        let _globals = FakeDeviceGuard(shim_globals());
         for (count, want) in [(100u64, 100usize), (512, 512), (4096, 512), (u64::MAX, 512)] {
             let (_t, r) = execute_on_fake(0, 0, count, None, &mut [0u8; 512]);
             assert_eq!(r.expect("GOOD").bytes_transferred, want, "count {count}");
