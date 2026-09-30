@@ -2098,16 +2098,19 @@ fn single_unit_rule_never_overrides_a_piece_another_key_opened() {
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
 }
 
-/// KU §2.4 (review item 5): the held keys are tried on U before any side read. A readable
-/// unit no held key opens stops at once, with no side read of a (possibly damaged) area.
+/// KU §2.4 (review item 5): the held keys are tried on U first. A readable unit no held key
+/// opens, alone in its read, stops within the read once one side read (never retried) finds
+/// a readable partner no held key opens either (option A: a lone failure alone is damage).
 #[test]
-fn unopenable_unit_stops_before_any_side_read() {
+fn unopenable_unit_stops_after_one_side_read() {
     let (fx, set, src) = lazy_b(&[K1]);
     let counted = CountingSource::new(src);
     let log = counted.log();
     let mut r = set.title_reader(&fx.disc, 0, counted).unwrap();
     assert_eq!(code(read(&mut r, &fx, 1, 4, 1)), E7022);
-    assert_eq!(log.reads(), [(fx.unit(1, 4), 3)], "only the requested read");
+    let reads = log.reads();
+    assert_eq!(reads[0], (fx.unit(1, 4), 3), "the requested read first");
+    assert_eq!(reads.len(), 2, "then one side read");
 }
 
 /// KU §2.3 step 10 under invariant 2, "never guessed" (J22, review r2 M1). KS-14 [BD]

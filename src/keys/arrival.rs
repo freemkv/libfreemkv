@@ -3,9 +3,11 @@
 //!
 //! A partner is another readable non-segment `Enc` unit of the piece, from the batch, else one
 //! backward and one forward side read (`recovery = false`, never retried, failures swallowed).
-//! A held key opening the unit and a partner is `Proven`; with no partner, `Provisional` until
-//! the next readable unit confirms it or stops (key conflict). A unit no held key opens stops
-//! E7022 / E7032, unless a held key opens a batch partner: then it is damage, blanked.
+//! A held key opening the unit and a partner is `Proven`; else `Provisional` until another
+//! readable unit confirms it. A unit the key does not open is damage, blanked and counted,
+//! when a held key opens a partner or no partner is readable; it stops E7022 / E7032 when
+//! another held key opens it, when partners are readable and none opens, or when a second
+//! partnerless unit (another LBA) opens under no key before any proof.
 
 use super::{Proof, ProofCache, ResolvedKeySet, StopKind};
 use crate::aacs::content::{
@@ -17,6 +19,7 @@ use crate::disc::ContentFormat;
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 use crate::whole_disc::UNIT;
+use std::sync::Mutex;
 
 /// Units a side read covers at most, each way (KU §2.4: "up to 32 units").
 const SIDE_UNITS: u64 = 32;
@@ -26,13 +29,15 @@ const SIDE_UNITS: u64 = 32;
 pub(crate) struct Arrival {
     // (start, end, anchor, piece index), sorted by start, disjoint.
     spans: Vec<(u32, u32, u64, usize)>,
-    // (piece id, candidate slot).
-    pieces: Vec<(u32, Option<usize>)>,
+    // (piece id, candidate slot, resolved clear).
+    pieces: Vec<(u32, Option<usize>, bool)>,
     base: usize,
     segments: Vec<(u32, u32)>,
     cache: ProofCache,
     format: ContentFormat,
     stop: StopKind,
+    // Per piece: the LBA of a partnerless unit no held key opened since the last proof.
+    strikes: Mutex<Vec<Option<u32>>>,
 }
 
 impl Arrival {
@@ -41,7 +46,7 @@ impl Arrival {
         let mut spans = Vec::new();
         let mut pieces = Vec::with_capacity(i.arrival.len());
         for (p, piece) in i.arrival.iter().enumerate() {
-            pieces.push((piece.id, piece.candidate));
+            pieces.push((piece.id, piece.candidate, piece.clear));
             for &(s, n, anchor) in &piece.spans {
                 spans.push((s, s.saturating_add(n), anchor, p));
             }
@@ -57,6 +62,7 @@ impl Arrival {
             cache: i.proofs.clone(),
             format: i.content_format,
             stop,
+            strikes: Mutex::new(vec![None; i.arrival.len()]),
         }
     }
 
@@ -130,29 +136,23 @@ impl Arrival {
             if self.in_segment(at) || !aacs_unit_encrypted(&buf[range.clone()], self.format) {
                 continue;
             }
-            let (id, candidate) = self.pieces[span.3];
+            let (id, candidate, _) = self.pieces[span.3];
             let slot = match self.cache.get(id) {
                 Some(Proof::Proven(s)) => s,
                 Some(Proof::Provisional(s, from)) => {
-                    // KU §2.4: the next readable unit confirms a provisional key or stops;
-                    // one no held key opens while the key opens a batch partner is damage.
+                    // KU §2.4: another readable unit confirms a provisional key; one it does
+                    // not open is damage or a stop (`unopened`).
                     if self.opens(&buf[range.clone()], &unit_keys[s].1) {
                         if at != from {
                             self.cache.set(id, Proof::Proven(s));
                         }
+                        self.clear_strike(span.3);
                         s
-                    } else if self.is_damage(
-                        &buf[range.clone()],
-                        &self.batch_partners(lba, buf, u, span.3),
-                        candidate,
-                        &[s],
-                        unit_keys,
-                    ) {
+                    } else {
+                        self.unopened(inner, lba, buf, u, span, candidate, &[s], unit_keys)?;
                         buf[range].fill(0);
                         blanked += 1;
                         continue;
-                    } else {
-                        return Err(self.stop(at, "provisional key contradicted"));
                     }
                 }
                 None => match self.prove(inner, lba, buf, u, span, candidate, unit_keys)? {
@@ -171,7 +171,7 @@ impl Arrival {
                 target: "freemkv::keys",
                 lba,
                 units = blanked,
-                "damaged AACS unit (no held key opens it, one opens its partners): blanked"
+                "damaged AACS unit (no held key opens it): blanked, the rip carries on"
             );
         }
         Ok(blanked)
@@ -183,24 +183,64 @@ impl Arrival {
         candidate.into_iter().chain(rest)
     }
 
-    /// Is `unit` damage rather than a key failure? KS-4 \[BD\] §3.10.1: "The first 16 bytes of
-    /// each Aligned Unit is used as the seed", and a garbled head can keep its CPI flag and TS
-    /// sync. A wrong key opens no unit of the piece; damage fails one. So: no held key opens
-    /// it and one of `witnesses` opens a batch partner (no side read: KU §2.4 stops an
-    /// unopenable unit before any). A blanked unit proves nothing itself.
-    fn is_damage(
+    /// Unit `u`, which no key of `witnesses` opens: `Ok` is damage, to blank. KS-4 \[BD\]
+    /// §3.10.1: "The first 16 bytes of each Aligned Unit is used as the seed", and a garbled
+    /// head can keep its CPI flag and TS sync. A wrong key opens no unit of the piece; damage
+    /// fails one. So it stops only when another held key opens `u`, when readable partners
+    /// exist and no witness opens one, or at a second partnerless unopened unit.
+    #[allow(clippy::too_many_arguments)]
+    fn unopened(
         &self,
-        unit: &[u8],
-        partners: &[Vec<u8>],
+        inner: &mut dyn SectorSource,
+        lba: u32,
+        buf: &[u8],
+        u: usize,
+        span: (u32, u32, u64, usize),
         candidate: Option<usize>,
         witnesses: &[usize],
         unit_keys: &[(u32, [u8; 16])],
-    ) -> bool {
-        let opens = |u: &[u8], s: usize| self.opens(u, &unit_keys[s].1);
-        !self.held(candidate).any(|s| opens(unit, s))
-            && partners
-                .iter()
-                .any(|p| witnesses.iter().any(|&s| opens(p, s)))
+    ) -> Result<()> {
+        let at = lba.saturating_add(u as u32 * UNIT as u32);
+        let unit = &buf[u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN];
+        let opens = |p: &[u8], s: usize| self.opens(p, &unit_keys[s].1);
+        if self.held(candidate).any(|s| opens(unit, s)) {
+            return Err(self.stop(at, "another held key opens the unit"));
+        }
+        // No key held for a piece not resolved clear (a mux given no set): nothing to prove.
+        if self.base == 0 && !self.pieces[span.3].2 {
+            return Err(self.stop(at, "no key held"));
+        }
+        let vouch = |ps: &[Vec<u8>]| ps.iter().any(|p| witnesses.iter().any(|&s| opens(p, s)));
+        let batch = self.batch_partners(lba, buf, u, span.3);
+        if vouch(&batch) {
+            return Ok(());
+        }
+        let side = self.side_partners(inner, at, span);
+        if vouch(&side) {
+            return Ok(());
+        }
+        if !batch.is_empty() || !side.is_empty() {
+            return Err(self.stop(at, "no held key opens the unit or a partner"));
+        }
+        let mut strikes = self.strikes.lock().unwrap_or_else(|e| e.into_inner());
+        match strikes.get_mut(span.3) {
+            Some(Some(prev)) if *prev != at => {
+                Err(self.stop(at, "a second partnerless unit no held key opens"))
+            }
+            Some(slot) => {
+                *slot = Some(at);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    // A unit of piece `piece` opened: forget its partnerless failure.
+    fn clear_strike(&self, piece: usize) {
+        let mut strikes = self.strikes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = strikes.get_mut(piece) {
+            *slot = None;
+        }
     }
 
     // Unit `u`'s partners already in the batch, both ways (KU §2.4 step 1).
@@ -223,7 +263,7 @@ impl Arrival {
     }
 
     // Find the held key for unit `u` of `buf` (KU §2.4 steps 1–2) and record it. `None`:
-    // no held key opens U but one opens a partner, so U is damage (`is_damage`), not proof.
+    // no held key opens U and `unopened` judged it damage, not proof.
     #[allow(clippy::too_many_arguments)]
     fn prove(
         &self,
@@ -244,24 +284,19 @@ impl Arrival {
             .collect();
         if openers.is_empty() {
             let held: Vec<usize> = self.held(candidate).collect();
-            let partners = self.batch_partners(lba, buf, u, span.3);
-            if self.is_damage(unit, &partners, candidate, &held, unit_keys) {
-                return Ok(None);
-            }
-            return Err(self.stop(at, "no held key opens the unit"));
+            self.unopened(inner, lba, buf, u, span, candidate, &held, unit_keys)?;
+            return Ok(None);
         }
+        self.clear_strike(span.3);
         // Step 1: partners already in the batch, both ways; then the side reads, also when
         // no batch partner opens (they may be damaged heads that kept their sync).
         let find = |partners: &[Vec<u8>]| {
             let opens = |s: usize| partners.iter().any(|p| self.opens(p, &unit_keys[s].1));
             openers.iter().copied().find(|&s| opens(s))
         };
-        let batch = self.batch_partners(lba, buf, u, span.3);
-        let (mut proven, mut any_partner) = (find(&batch), !batch.is_empty());
+        let mut proven = find(&self.batch_partners(lba, buf, u, span.3));
         if proven.is_none() {
-            let side = self.side_partners(inner, at, span);
-            any_partner |= !side.is_empty();
-            proven = find(&side);
+            proven = find(&self.side_partners(inner, at, span));
         }
         let id = self.pieces[span.3].0;
         match proven {
@@ -269,13 +304,13 @@ impl Arrival {
                 self.cache.set(id, Proof::Proven(s));
                 Ok(Some(s))
             }
-            None if !any_partner => {
-                // No readable partner: provisional one-unit proof, false-accept ≈ pool × 1e-5.
+            None => {
+                // No partner opens (none readable, or all damaged): a provisional one-unit
+                // proof, false-accept ≈ pool × 1e-5; a unit the key fails decides later.
                 tracing::debug!(target: "freemkv::keys", lba = at, "provisional one-unit proof");
                 self.cache.set(id, Proof::Provisional(openers[0], at));
                 Ok(Some(openers[0]))
             }
-            None => Err(self.stop(at, "no held key opens the unit and a partner")),
         }
     }
 

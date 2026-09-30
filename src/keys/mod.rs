@@ -218,6 +218,8 @@ pub(crate) struct ArrivalPiece {
     pub(crate) id: u32,
     pub(crate) spans: Vec<UnitSpan>,
     pub(crate) candidate: Option<usize>,
+    // Resolved clear (every probe unflagged), not left to a key.
+    pub(crate) clear: bool,
 }
 
 // Everything a set holds. Key bytes and the VID never leave the crate.
@@ -650,6 +652,7 @@ impl ResolvedKeySet {
                 id: s,
                 spans: vec![span],
                 candidate: None,
+                clear: false,
             });
         }
         i
