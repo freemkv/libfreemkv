@@ -176,17 +176,17 @@ fn unit_aligned_widens_reads_onto_each_files_grid() {
 #[test]
 fn unit_aligned_propagates_inner_read_errors_on_both_paths() {
     let mut r = reader(vec![(100, 30, 100)]);
-    r.inner.fail = Some(|| Error::DecryptFailed);
+    r.inner.fail = Some(|| Error::Halted);
     let mut buf = vec![0u8; 3 * 2048];
     // Outside every span: plain read path.
     assert!(matches!(
         r.read_sectors(10, 3, &mut buf, false),
-        Err(Error::DecryptFailed)
+        Err(Error::Halted)
     ));
     // Inside a span: unit-widened path.
     assert!(matches!(
         r.read_sectors(101, 3, &mut buf, false),
-        Err(Error::DecryptFailed)
+        Err(Error::Halted)
     ));
     assert_eq!(r.inner.reads, vec![(10, 3), (100, 6)]);
 }
