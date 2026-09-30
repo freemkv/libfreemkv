@@ -3162,6 +3162,71 @@ mod tests {
         assert!(r.lost_bytes() >= 2 * dep.len() as u64);
     }
 
+    // set_codec_private takes a stream index: through the MVC map before the header
+    // (pending track) and after it (a reserved AAC CodecPrivate filled in place).
+    #[test]
+    fn set_codec_private_translates_stream_indices_on_a_3d_title() {
+        let mut title = mvc_title();
+        if let crate::disc::Stream::Audio(a) = &mut title.streams[2] {
+            a.codec = Codec::Aac;
+        }
+        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title, None).unwrap();
+        let mut s = s;
+        assert!(
+            !s.set_codec_private(1, &[9]).unwrap(),
+            "the dependent has no track"
+        );
+        assert!(s.set_codec_private(0, &[1, 2]).unwrap());
+        assert_eq!(
+            pending_tracks(&s)[0].codec_private.as_deref(),
+            Some(&[1, 2][..])
+        );
+        assert_eq!(pending_tracks(&s)[1].codec_private, None);
+
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
+        let dep = lp(&[&SUBSET_SPS, &DEP_PPS, &DEP_SLICE]);
+        s.write(&mvc_frame(0, 0, true, vec![0x65, 0x88])).unwrap();
+        s.write(&mvc_frame(1, 0, true, dep)).unwrap();
+        assert!(matches!(s.mode, Mode::Write(WriteMode::Active(_))));
+        let asc = [0x11, 0x90];
+        assert!(
+            s.set_codec_private(2, &asc).unwrap(),
+            "audio stream 2 is track 1"
+        );
+        s.finish().unwrap();
+        let r = MkvStream::open(Cursor::new(out.bytes())).unwrap();
+        assert_eq!(r.codec_private(1), Some(asc.to_vec()));
+    }
+
+    #[test]
+    fn set_codec_private_skips_a_left_out_stream_and_remaps_the_rest() {
+        let mut title = h264_title();
+        let mp2 = |pid, label: &str| {
+            crate::disc::Stream::Audio(crate::disc::AudioStream {
+                pid,
+                codec: crate::disc::Codec::Mp2,
+                channels: crate::disc::AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: crate::disc::SampleRate::S48,
+                secondary: false,
+                purpose: crate::disc::LabelPurpose::Normal,
+                label: label.into(),
+            })
+        };
+        title
+            .streams
+            .push(mp2(0x00D0, crate::disc::MP2_EXTENSION_LABEL));
+        title.streams.push(mp2(0x00C0, ""));
+        title.codec_privates.extend([None, None]);
+        let mut s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title, None).unwrap();
+        assert!(!s.set_codec_private(1, &[7]).unwrap(), "left-out stream");
+        assert!(s.set_codec_private(2, &[8]).unwrap());
+        let tracks = pending_tracks(&s);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[1].codec_private.as_deref(), Some(&[8][..]));
+    }
+
     // The dependent must NOT become its own track (it folds into the base as
     // BlockAdditional): a silently-disabled merge yields two H.264 tracks, not 3D.
     #[test]
