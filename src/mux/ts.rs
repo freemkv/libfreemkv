@@ -64,6 +64,9 @@ struct PesAssembler {
     /// HEVC/H264 that reads as a spurious start code / corrupt slice
     /// payload. Tracks how many header bytes remain across packets.
     header_remaining: usize,
+    /// Payload bytes since the PUSI while the PES header (fixed part or PTS/DTS) is still
+    /// incomplete: h222 lets it span packets. Empty otherwise.
+    head: Vec<u8>,
     /// 4-bit continuity_counter of the last payload-bearing TS packet seen
     /// on this PID. A non-PUSI continuation whose CC is not `(prev + 1) & 0xf`
     /// — or whose adaptation field flags a discontinuity — means one or more
@@ -110,6 +113,7 @@ impl PesAssembler {
             dts: None,
             active: false,
             header_remaining: 0,
+            head: Vec::new(),
             last_cc: None,
             pes_source: None,
             pending_discontinuity: false,
@@ -172,8 +176,36 @@ impl PesAssembler {
         }
     }
 
+    // Take PUSI payload bytes into the PES header; once it and its PTS/DTS are complete, set
+    // the timestamps and pass the rest on as ES. A payload that is not a PES start opens no
+    // PES (its continuations would form a headless frame) and flags the loss.
+    fn take_head(&mut self, bytes: &[u8]) {
+        self.head.extend_from_slice(bytes);
+        let Some((pts, dts, header_len)) = pes_header_complete(&self.head) else {
+            return;
+        };
+        let head = std::mem::take(&mut self.head);
+        if header_len == 0 {
+            self.buffer.clear();
+            self.active = false;
+            self.header_remaining = 0;
+            self.pending_discontinuity = true;
+        } else {
+            self.pts = pts;
+            self.dts = dts;
+            if header_len < head.len() {
+                self.push(&head[header_len..]);
+            } else {
+                self.header_remaining = header_len - head.len();
+            }
+        }
+        self.head = head;
+        self.head.clear();
+    }
+
     /// Flush remaining data as a PES packet.
     fn flush(&mut self) -> Option<PesPacket> {
+        self.head.clear();
         if self.active && !self.buffer.is_empty() {
             self.active = false;
             let discontinuity = self.pending_discontinuity;
@@ -367,6 +399,7 @@ impl TsDemuxer {
                 a.buffer.clear();
                 a.active = false;
                 a.header_remaining = 0;
+                a.head.clear();
                 a.pending_discontinuity = true;
             }
             return;
@@ -427,36 +460,19 @@ impl TsDemuxer {
         let gap = discontinuity_flag || cc_gap;
 
         if pusi {
-            // `header_len` is the FULL (uncapped) PES-header length:
-            // 0 = malformed (payload is not a PES start), else 6/9+N.
-            let (pts, dts, header_len) = parse_pes_header(payload);
-            // Flush the previous PES first — a gap on this PUSI packet belongs to
-            // the PES starting now, not the one completing. Set `pending_discontinuity`
-            // after start(), else it wrongly stamps the pre-gap frame instead.
-            if let Some(prev) = asm.start(pts, dts, source) {
+            // Flush the previous PES first — a gap on this PUSI packet belongs to the PES
+            // starting now (as does a lost PES whose header never completed). Set
+            // `pending_discontinuity` after start(), else it stamps the pre-gap frame.
+            let lost_head = !asm.head.is_empty();
+            if let Some(prev) = asm.start(None, None, source) {
                 completed.push(prev);
             }
-            if gap {
+            if gap || lost_head {
                 asm.pending_discontinuity = true;
             }
-            if header_len == 0 {
-                // Payload is not a PES start: open no PES (its continuations would form a
-                // headless frame) and flag the loss for the next one.
-                asm.buffer.clear();
-                asm.active = false;
-                asm.header_remaining = 0;
-                asm.pending_discontinuity = true;
-            } else if header_len <= payload.len() {
-                // Header fits in this packet (the common case).
-                asm.header_remaining = 0;
-                if header_len < payload.len() {
-                    asm.push(&payload[header_len..]);
-                }
-            } else {
-                // Header spills past this packet — skip the remainder on
-                // the following continuation packet(s).
-                asm.header_remaining = header_len - payload.len();
-            }
+            asm.head.clear();
+            asm.header_remaining = 0;
+            asm.take_head(payload);
         } else {
             // Non-PUSI continuation.
             if gap {
@@ -472,10 +488,14 @@ impl TsDemuxer {
                     asm.buffer.clear();
                     asm.active = false;
                     asm.header_remaining = 0;
+                    asm.head.clear();
                     return;
                 }
             }
-            if asm.header_remaining > 0 {
+            if !asm.head.is_empty() {
+                // The PES header is still arriving.
+                asm.take_head(payload);
+            } else if asm.header_remaining > 0 {
                 // Continuation packet still inside a PES header that spanned
                 // the boundary — consume header bytes before any ES data.
                 let skip = asm.header_remaining.min(payload.len());
@@ -501,6 +521,32 @@ impl TsDemuxer {
     }
 }
 
+// Stream ids whose PES has no header extension (ISO 13818-1 Table 2-22: program_stream_map,
+// padding, private_stream_2, ECM, EMM, DSMCC, H.222.1 type E, program_stream_directory).
+fn no_pes_extension(stream_id: u8) -> bool {
+    matches!(
+        stream_id,
+        0xBC | 0xBE | 0xBF | 0xF0 | 0xF1 | 0xF2 | 0xF8 | 0xFF
+    )
+}
+
+// `parse_pes_header` of `data` once it holds the fixed header and any flagged PTS/DTS;
+// `None` while more bytes are needed (and what arrived still matches a start code).
+fn pes_header_complete(data: &[u8]) -> Option<(Option<i64>, Option<i64>, usize)> {
+    let need = match data {
+        [_, _, _, id, _, _, _, flags, hdl, ..] if !no_pes_extension(*id) => {
+            let (f, hdl) = (flags >> 6, *hdl as usize);
+            9 + if f >= 2 && hdl >= 5 { 5 } else { 0 } + if f == 3 && hdl >= 10 { 5 } else { 0 }
+        }
+        _ => 9,
+    };
+    let prefix = data.len().min(3);
+    if data.len() < need && data[..prefix] == [0, 0, 1][..prefix] {
+        return None;
+    }
+    Some(parse_pes_header(data))
+}
+
 // Parse a PES header, extracting PTS/DTS. Returns `(pts, dts, header_len)` where
 // `header_len` is the FULL uncapped header length (9 + data_length, or 6 without
 // the extension; 0 = not a valid PES start) — caller skips it, carrying remainder.
@@ -512,18 +558,7 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
 
     let stream_id = data[3];
 
-    // Some stream IDs don't carry the standard PES header extension
-    // (ISO 13818-1 Table 2-22: program_stream_map, padding, private_stream_2,
-    // ECM, EMM, DSMCC_stream 0xF2, H.222.1 type E 0xF8, program_stream_directory).
-    if stream_id == 0xBC
-        || stream_id == 0xBE
-        || stream_id == 0xBF
-        || stream_id == 0xF0
-        || stream_id == 0xF1
-        || stream_id == 0xF2
-        || stream_id == 0xF8
-        || stream_id == 0xFF
-    {
+    if no_pes_extension(stream_id) {
         return (None, None, 6);
     }
 
@@ -532,9 +567,8 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
     // this function and nothing shrinks `data` since, so no re-check here.
     let pts_dts_flags = (data[7] >> 6) & 0x03;
     let header_data_len = data[8] as usize;
-    // Full, uncapped header length. PTS/DTS (if present) live in the
-    // first ~19 bytes, always within this packet's payload, so they parse
-    // here; only the *skip* length may extend into the next packet.
+    // Full, uncapped header length. `pes_header_complete` gathers the first 19 bytes (PTS/DTS)
+    // before parsing; only the *skip* length may extend into later packets.
     let header_len = 9 + header_data_len;
 
     let mut pts = None;
@@ -997,6 +1031,29 @@ mod tests {
         want.extend_from_slice(&[b'B'; 184]);
         assert_eq!(out[0].data, want);
         assert!(!out[0].discontinuity);
+    }
+
+    // h222 lets a PES header span packets: a PUSI payload too short for the fixed header or
+    // its PTS/DTS is completed by the continuation, and the timestamps are kept.
+    #[test]
+    fn pes_header_split_across_packets_keeps_its_timestamps() {
+        let pid = 0x1011;
+        // PTS 0x1_2345_6789 and DTS 0x1_2345_0000 ('11' flags, header_data_length 10).
+        let mut hdr = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0xC0, 0x0A];
+        hdr.extend_from_slice(&[0x39, 0x8D, 0x15, 0xCF, 0x13]);
+        hdr.extend_from_slice(&[0x19, 0x8D, 0x15, 0x00, 0x01]);
+        for split in [4, 11, 16] {
+            let mut demux = TsDemuxer::new(&[pid]);
+            let mut rest = hdr[split..].to_vec();
+            rest.extend_from_slice(b"ES");
+            let mut out = demux.feed(&es_packet_exact(pid, true, &hdr[..split]));
+            out.extend(demux.feed(&es_packet_exact(pid, false, &rest)));
+            out.extend(demux.flush());
+            assert_eq!(out.len(), 1, "split {split}");
+            assert_eq!(out[0].data, b"ES", "split {split}");
+            assert_eq!(out[0].pts, Some(0x1_2345_6789), "split {split}");
+            assert_eq!(out[0].dts, Some(0x1_2345_0000), "split {split}");
+        }
     }
 
     // A PUSI whose payload is not a PES start leaves no PES open: the continuations after it
