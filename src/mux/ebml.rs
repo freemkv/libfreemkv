@@ -1240,6 +1240,22 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }
 
+    #[test]
+    fn read_size_truncated_inside_the_vint_errors_at_every_width() {
+        // A width-w size VINT needs w bytes; supply one fewer, never a decoded size.
+        for w in 2..=8usize {
+            let mut bytes = vec![0u8; w - 1];
+            bytes[0] = 0x80 >> (w - 1);
+            let e = read_size(&mut Cursor::new(&bytes)).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "width {w}");
+        }
+        let mut buf = Vec::new();
+        write_id(&mut buf, SIMPLE_BLOCK).unwrap();
+        buf.push(0x40);
+        let e = read_element_header(&mut Cursor::new(&buf)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
     // write_size — every declared width-boundary, asserting the exact VINT bytes.
     // Width W encodes 7*W payload bits; the highest value of each width is reserved.
 

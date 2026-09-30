@@ -376,6 +376,83 @@ mod tests {
         assert_eq!(set, None);
     }
 
+    // A UDF with `/BDMV/META/DL/` holding `files` (name, contents), or no DL dir when `dl` is false.
+    fn disc_with_dl(files: &[(&str, Vec<u8>)], dl: bool) -> (crate::udf::fixture::MemDisc, UdfFs) {
+        use crate::udf::fixture::*;
+        let dl_files = files
+            .iter()
+            .enumerate()
+            .map(|(i, (n, c))| file_with(n, 30 + i as u32, 100 + 2_000 * i as u32, c.clone(), true))
+            .collect();
+        let dir = |name: &str, icb, data, files, subdirs| DirSpec {
+            name: name.into(),
+            icb_lba: icb,
+            dir_data_lba: data,
+            files,
+            subdirs,
+        };
+        let leaf = if dl {
+            dir("DL", 16, 17, dl_files, vec![])
+        } else {
+            dir("OTHER", 16, 17, dl_files, vec![])
+        };
+        let meta = dir("META", 14, 15, vec![], vec![leaf]);
+        let bdmv = dir("BDMV", 12, 13, vec![], vec![meta]);
+        let root = dir("", 10, 11, vec![], vec![bdmv]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        (disc, udf)
+    }
+
+    #[test]
+    fn parse_aggregates_languages_and_first_disc_set_wins() {
+        let xml = |name: &str, set: u32| {
+            format!(
+                "<d><di:name>{name}</di:name><di:setNumber>{set}</di:setNumber>\
+                 <di:numSets>2</di:numSets></d>"
+            )
+            .into_bytes()
+        };
+        let mut fra = xml("Titre", 2);
+        fra.extend_from_slice(b"<di:description>Suite.</di:description>");
+        let mut big = xml("Too Big", 1);
+        big.resize(MAX_BDMT_BYTES as usize + 1, b' ');
+        let (mut disc, udf) = disc_with_dl(
+            &[
+                ("bdmt_eng.xml", xml("Title", 1)),
+                ("bdmt_fra.xml", fra),
+                ("bdmt_deu.xml", big),
+                ("bdmt_xx.xml", xml("Bad Lang", 1)),
+                ("notes.xml", xml("Not BDMT", 1)),
+            ],
+            true,
+        );
+        assert!(detect(&udf));
+        let meta = parse(&mut disc, &udf).expect("titles found");
+        let titles: Vec<_> = meta
+            .titles
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(titles, [("eng", "Title"), ("fra", "Titre")]);
+        assert_eq!(meta.descriptions.len(), 1);
+        assert_eq!(meta.descriptions["fra"], "Suite.");
+        assert_eq!(meta.disc_number, Some((1, 2)), "the first file's set wins");
+    }
+
+    #[test]
+    fn parse_and_detect_are_none_without_bdmt_files() {
+        let (mut disc, udf) = disc_with_dl(&[("bdmt_eng.xml", b"<d/>".to_vec())], false);
+        assert!(!detect(&udf));
+        assert!(parse(&mut disc, &udf).is_none());
+        // A DL dir with only a title-less bdmt file: detected, but nothing to parse.
+        let (mut disc, udf) = disc_with_dl(&[("bdmt_eng.xml", b"<d/>".to_vec())], true);
+        assert!(detect(&udf));
+        assert!(parse(&mut disc, &udf).is_none());
+    }
+
     #[test]
     fn multiple_languages_keyed_correctly() {
         // Drive parse_bdmt_xml from two synthetic XML blobs and aggregate

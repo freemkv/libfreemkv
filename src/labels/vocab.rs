@@ -762,8 +762,8 @@ mod tests {
         assert_eq!(codec("dts"), "dts");
     }
 
-    /// Spec: all 36 bare-lang entries must resolve correctly.
-    /// Mutation: swap two entries in BARE_LANGS → wrong code returned.
+    /// Spec: every BARE_LANGS entry must resolve to its code.
+    /// Mutation: swap two entries' codes in BARE_LANGS -> wrong code returned.
     #[test]
     fn lang_bare_all_entries_spot_check() {
         let cases = [
@@ -774,22 +774,65 @@ mod tests {
             ("Italian", "ita"),
             ("Japanese", "jpn"),
             ("Chinese", "zho"),
-            ("Korean", "kor"),
+            ("Mandarin", "zho"),
+            ("Cantonese", "zho"),
             ("Portuguese", "por"),
             ("Polish", "pol"),
             ("Czech", "ces"),
             ("Hungarian", "hun"),
             ("Dutch", "nld"),
+            ("Korean", "kor"),
             ("Arabic", "ara"),
-            ("Russian", "rus"),
+            ("Hindi", "hin"),
+            ("Turkish", "tur"),
+            ("Thai", "tha"),
             ("Swedish", "swe"),
+            ("Norwegian", "nor"),
+            ("Danish", "dan"),
             ("Finnish", "fin"),
+            ("Hebrew", "heb"),
+            ("Russian", "rus"),
+            ("Greek", "ell"),
+            ("Vietnamese", "vie"),
+            ("Indonesian", "ind"),
+            ("Malay", "msa"),
+            ("Ukrainian", "ukr"),
+            ("Romanian", "ron"),
+            ("Bulgarian", "bul"),
+            ("Croatian", "hrv"),
+            ("Serbian", "srp"),
+            ("Slovak", "slk"),
+            ("Slovenian", "slv"),
+            ("Estonian", "est"),
+            ("Latvian", "lav"),
+            ("Lithuanian", "lit"),
+            ("Icelandic", "isl"),
+            ("Basque", "eus"),
+            ("Catalan", "cat"),
+            ("Galician", "glg"),
         ];
+        assert_eq!(
+            cases.len(),
+            BARE_LANGS.len(),
+            "table and cases must stay in step"
+        );
         for (name, code) in cases {
             let r = lang(name).unwrap_or_else(|| panic!("lang({:?}) must be Some", name));
             assert_eq!(r.code, code, "wrong code for {}", name);
             assert_eq!(r.variant, "", "bare lang {} must have empty variant", name);
         }
+    }
+
+    /// Needles embedded in longer words must not match in qualifier/purpose/lang.
+    /// Mutation: has_word -> contains() in any of the three -> a false hit.
+    #[test]
+    fn embedded_needles_do_not_match_word_classifiers() {
+        assert_eq!(qualifier("xsdhx"), LabelQualifier::None);
+        assert_eq!(qualifier("uncaptions"), LabelQualifier::None);
+        assert_eq!(purpose("uncommentary"), LabelPurpose::Normal);
+        assert_eq!(purpose("scorecard"), LabelPurpose::Normal);
+        assert_eq!(lang("englishman"), None);
+        assert_eq!(lang("thaiwan"), None);
     }
 
     /// Word boundary: "sdh" inside "lambdash" must not match.

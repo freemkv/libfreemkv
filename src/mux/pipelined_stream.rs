@@ -1124,8 +1124,10 @@ mod tests {
         .unwrap();
         tx.send(DemuxBatch::Eof).unwrap();
         let mut out = Vec::new();
+        let mut pts = Vec::new();
         while let Some(f) = stream.read().unwrap() {
             out.push(f.data);
+            pts.push(f.pts);
         }
         assert_eq!(
             out,
@@ -1135,6 +1137,8 @@ mod tests {
                 au[4].clone()
             ]
         );
+        // A merged pair keeps its FIRST field's PTS; only the PTS-less frame reads 0.
+        assert_eq!(pts, [9_000, 12_003, 0]);
     }
 
     // Single-video-stream title on `codec` + CountingParser; feeds three 0xE0
