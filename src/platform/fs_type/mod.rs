@@ -17,9 +17,9 @@ use std::path::Path;
 pub enum FsType {
     /// A local on-disk filesystem (ext4, xfs, btrfs, apfs, ntfs, …).
     Local,
-    /// A network filesystem with NFS-like semantics. The current
-    /// detector lumps SMB / UNC into this on Windows because the
-    /// buffering policy outcome is the same.
+    /// A network filesystem with NFS-like semantics. Only the Windows
+    /// detector lumps SMB / UNC into this (same buffering outcome); Linux
+    /// maps cifs to `Unknown` and macOS maps smbfs/webdav to `Local`.
     Nfs,
     /// `statfs` failed, the filesystem type is not on our recognised
     /// list, or we are on an OS without a real implementation.

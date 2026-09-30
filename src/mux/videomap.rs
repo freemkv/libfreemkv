@@ -8,7 +8,7 @@
 //! `VideoMap` is PURE DATA — it knows no output format; the `fvi://` sink does the
 //! serialization to the on-disk FVI format.
 
-use crate::disc::{ColorSpace, DiscTitle, Stream as DiscStream, VideoStream};
+use crate::disc::{ColorSpace, DiscTitle, Resolution, Stream as DiscStream, VideoStream};
 use crate::mux::codec::PictureInfo;
 use crate::mux::codec::coding::{CodingType, FieldOrder};
 use crate::pes::{PesFrame, SourcePos};
@@ -241,10 +241,16 @@ impl MapHeader {
 }
 
 /// Display aspect ratio as `(num, den)`. Anamorphic titles carry an explicit
-/// `display_aspect`; square-pixel titles use the coded pixel dimensions.
+/// `display_aspect`; without one, SD is never square-pixel (assume 4:3) and
+/// HD uses the coded pixel dimensions.
 fn display_aspect_ratio(v: &VideoStream, w: u32, h: u32) -> (u32, u32) {
+    let sd = matches!(
+        v.resolution,
+        Resolution::R480i | Resolution::R480p | Resolution::R576i | Resolution::R576p
+    );
     match v.display_aspect {
         Some((a, b)) if b != 0 => (a, b),
+        _ if sd => (4, 3),
         _ if h != 0 => (w, h),
         _ => (0, 1),
     }
@@ -611,7 +617,7 @@ mod tests {
         let h = MapHeader::from_title(&t, src(Medium::Iso, "iso://x.iso", 2));
         assert_eq!(h.stream.codec, "mpeg2video");
         assert_eq!((h.stream.width, h.stream.height), (720, 576));
-        assert_eq!(h.stream.dar, (720, 576)); // square-pixel fallback
+        assert_eq!(h.stream.dar, (4, 3)); // SD is never square-pixel
         assert_eq!(h.stream.frame_rate, (25, 1));
         assert_eq!(h.stream.scan, Scan::Interlaced);
         assert_eq!(h.stream.colour.matrix, 5);

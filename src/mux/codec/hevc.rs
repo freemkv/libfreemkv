@@ -419,6 +419,11 @@ impl CodecParser for HevcParser {
         let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
         let pts_ns = explicit_pts.unwrap_or(0);
 
+        // A concealed gap orphans RASL that follow the next CRA; arm the CRA->BLA rewrite.
+        if pes.discontinuity {
+            self.pending_clip_boundary = true;
+        }
+
         // Auto-detect a non-seamless clip boundary: mpls connection_condition
         // isn't plumbed through the (threaded) mux pipeline, so a PTS backstep
         // beyond `BACKSTEP_TICKS` on the unwrapped/high-water timeline arms the rewrite.
@@ -2285,6 +2290,21 @@ mod tests {
             nal_type_of(&nals_of(&f2[0].data)[0]),
             NAL_CRA_NUT,
             "only the first CRA after a boundary is rewritten"
+        );
+    }
+
+    /// A gap-flagged PES arms the rewrite so the next CRA's RASL are discarded by the decoder.
+    #[test]
+    fn cra_after_a_gap_is_rewritten_to_bla() {
+        let mut parser = HevcParser::new();
+        let mut gap = make_pes(vec![0, 0, 1, 0x02, 0x01, 0x80], Some(0));
+        gap.discontinuity = true;
+        parser.parse(&gap);
+        let f = parser.parse(&make_pes(cra_au(&[0x10]), Some(3000)));
+        assert_eq!(
+            nal_type_of(&nals_of(&f[0].data)[0]),
+            NAL_BLA_W_LP,
+            "the first CRA after a gap must become BLA_W_LP"
         );
     }
 

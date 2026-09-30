@@ -590,7 +590,7 @@ fn is_resync_point(data: &[u8], offset: usize) -> bool {
 // Byte offset of the PSI payload (pointer_field) for a BD-TS packet at `pkt`.
 // `None` when the packet carries no payload (AFC 0b10 = AF only, or reserved
 // 0b00) or the adaptation field runs past the packet. `pkt` >= BD_SOURCE_PACKET_BYTES.
-fn psi_payload_base(pkt: &[u8]) -> Option<usize> {
+fn ts_payload_base(pkt: &[u8]) -> Option<usize> {
     // TS header is pkt[4..]; byte pkt[7] holds AFC in bits 5:4.
     let afc = (pkt[7] >> 4) & 0x03;
     match afc {
@@ -623,7 +623,7 @@ fn mpeg_audio_layer(data: &[u8], pid: u16) -> Option<u8> {
         let pkt = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
         let pkt_pid = (((pkt[5] & 0x1F) as u16) << 8) | pkt[6] as u16;
         if pkt_pid == pid && pkt[5] & 0x40 != 0 {
-            let pes = &pkt[psi_payload_base(pkt)?..];
+            let pes = &pkt[ts_payload_base(pkt)?..];
             if pes.get(..3)? != [0, 0, 1] {
                 return None;
             }
@@ -658,8 +658,7 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             // Locate the payload (pointer_field) accounting for any
             // adaptation field. A packet with no payload (AF only) or an
             // AF that overruns the packet is skipped.
-            let Some(payload_off) =
-                psi_payload_base(&data[offset..offset + BD_SOURCE_PACKET_BYTES])
+            let Some(payload_off) = ts_payload_base(&data[offset..offset + BD_SOURCE_PACKET_BYTES])
             else {
                 offset += BD_SOURCE_PACKET_BYTES;
                 continue;
@@ -700,7 +699,7 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                 if cpid == target_pid && !cpusi {
                     // `None` = no payload (AF-only or malformed AF): §2.4.3.3 doesn't
                     // increment the CC for those, so they skip the continuity check.
-                    let Some(cbase) = psi_payload_base(&data[scan..scan + BD_SOURCE_PACKET_BYTES])
+                    let Some(cbase) = ts_payload_base(&data[scan..scan + BD_SOURCE_PACKET_BYTES])
                     else {
                         scan += BD_SOURCE_PACKET_BYTES;
                         continue;
@@ -2682,22 +2681,22 @@ mod tests {
         assert_eq!(MAX_PES_BUFFER_TOTAL, 512 * 1024 * 1024);
     }
 
-    // `psi_payload_base` must reject an AF that consumes the whole 184-byte
+    // `ts_payload_base` must reject an AF that consumes the whole 184-byte
     // payload (af_len == 183, base == 192), leaving no pointer_field byte —
     // admitting it would index-panic the next line on disc-derived data.
     #[test]
-    fn psi_payload_base_rejects_af_that_consumes_the_whole_payload() {
+    fn ts_payload_base_rejects_af_that_consumes_the_whole_payload() {
         let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[7] = 0x30; // AFC 0b11 in the TS-header byte at pkt[7] (4+3)
         pkt[8] = 183; // af_len: base = 9 + 183 = 192, exactly BD_SOURCE_PACKET_BYTES
         assert_eq!(
-            psi_payload_base(&pkt),
+            ts_payload_base(&pkt),
             None,
             "an AF that fills the whole payload area leaves no pointer_field byte"
         );
         // One less: base = 191, still inside the packet — must be accepted.
         pkt[8] = 182;
-        assert_eq!(psi_payload_base(&pkt), Some(191));
+        assert_eq!(ts_payload_base(&pkt), Some(191));
     }
 
     // The NULL_PID concealment marker requires a non-zero af_len before reading

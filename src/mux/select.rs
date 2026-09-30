@@ -54,28 +54,22 @@ impl StreamSelection {
         // Validate every listed PID before mutating (unknown PID → no partial prune),
         // PER CLASS: scanning both classes let a PID in the WRONG filter pass, then
         // `keeps` matched it only against its own class, silently dropping the track.
-        if let PidFilter::Only(pids) = &self.audio {
-            for &pid in pids {
-                let present = title
-                    .streams
-                    .iter()
-                    .any(|s| matches!(s, Stream::Audio(_)) && stream_pid(s) == Some(pid));
-                if !present {
-                    return Err(Error::SelectionPidUnknown { pid });
+        let check = |filter: &PidFilter, is_class: fn(&Stream) -> bool| -> Result<()> {
+            if let PidFilter::Only(pids) = filter {
+                for &pid in pids {
+                    let present = title
+                        .streams
+                        .iter()
+                        .any(|s| is_class(s) && stream_pid(s) == Some(pid));
+                    if !present {
+                        return Err(Error::SelectionPidUnknown { pid });
+                    }
                 }
             }
-        }
-        if let PidFilter::Only(pids) = &self.subtitle {
-            for &pid in pids {
-                let present = title
-                    .streams
-                    .iter()
-                    .any(|s| matches!(s, Stream::Subtitle(_)) && stream_pid(s) == Some(pid));
-                if !present {
-                    return Err(Error::SelectionPidUnknown { pid });
-                }
-            }
-        }
+            Ok(())
+        };
+        check(&self.audio, |s| matches!(s, Stream::Audio(_)))?;
+        check(&self.subtitle, |s| matches!(s, Stream::Subtitle(_)))?;
 
         let effective = self.with_mp2_extension_bases(title);
         // Retain by index so we can prune the parallel codec_privates in lockstep.
