@@ -582,7 +582,7 @@ fn final_au_end(buf: &[u8], core_size: usize) -> usize {
 }
 
 // Where extensions after a core begin: an EXSS is 4-byte aligned after a core whose size is
-// not a multiple of 4 (as ffmpeg's dcadec frames it), so skip up to 3 padding bytes to it.
+// not a multiple of 4, so skip up to 3 padding bytes to it.
 fn exss_start(buf: &[u8], core_size: usize) -> usize {
     let aligned = core_size.next_multiple_of(4);
     let padded_exss = buf
@@ -1238,7 +1238,7 @@ mod tests {
     }
 
     // A core whose size is not a multiple of 4 is padded to a 4-byte boundary before its
-    // EXSS (ffmpeg dcadec aligns the same way); the extension must still be kept.
+    // EXSS; the extension must still be kept.
     #[test]
     fn exss_after_unaligned_core_is_kept() {
         let core = make_dts_core(2013);

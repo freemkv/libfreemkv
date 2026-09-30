@@ -309,7 +309,7 @@ pub const KS_26_FMTS_ANCHOR_EVIDENCE: SpecQuote = SpecQuote {
     kind: QuoteKind::Evidence,
     source: EVIDENCE,
     section: "FMTS anchor contract (key decode server)",
-    locator: "kdb decode-server main.rs:1640-1688",
+    locator: "key service FMTS anchor handler",
     url: "",
     text: "the decode server returns the whole set only for an index-1 anchor, and 422 for the \
            wrong phase",

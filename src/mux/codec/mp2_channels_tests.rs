@@ -705,7 +705,7 @@ fn split(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// FFmpeg 9.0.2 `-c:a mp2` output (plain MPEG-1, one per 3-B.2 table): the walk must end
-/// where FFmpeg's own allocation filled the frame, not generate-then-parse its own layout.
+/// where the encoder's own allocation filled the frame, not generate-then-parse its own layout.
 #[test]
 fn ffmpeg_encoded_frames_walk_to_the_end_of_every_frame() {
     let fixtures: [(&[u8], u8); 7] = [
@@ -1142,8 +1142,8 @@ fn configuration_field_lengths_follow_the_tables() {
 
 // ── joint stereo bound (Opus defect 4) ─────────────────────────────────────
 
-/// "bound==16" above 3-B.2c's sblimit 8 is capped at sblimit, as FFmpeg's mp_decode_layer2
-/// ("if (bound > sblimit) bound = sblimit") does, so the frame walks on to its mc_header
+/// "bound==16" above 3-B.2c's sblimit 8 is capped at sblimit (no subband past sblimit is
+/// coded, so a larger bound means sblimit), so the frame walks on to its mc_header
 /// instead of falling back. This is per spec; do not change without a citation otherwise.
 #[test]
 fn joint_stereo_bound_is_capped_at_sblimit() {

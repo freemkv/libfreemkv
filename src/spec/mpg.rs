@@ -8,9 +8,8 @@ use super::{QuoteKind, SpecQuote};
 
 const H222: &str = "ITU-T Rec. H.222.0 (02/2000) | ISO/IEC 13818-1:2000";
 const H222_URL: &str = "https://www.itu.int/rec/T-REC-H.222.0-200002-S/en";
-const FFMPEG_MPEGENC: &str = "FFmpeg 6.1.3, libavformat/mpegenc.c";
-const FFMPEG_MPEGENC_URL: &str =
-    "https://github.com/FFmpeg/FFmpeg/blob/n6.1.3/libavformat/mpegenc.c";
+const FFMPEG_MPEGENC: &str = "FFmpeg 6.1.3 MPEG-PS muxer, mpegenc.c";
+const FFMPEG_MPEGENC_URL: &str = "https://github.com/FFmpeg/FFmpeg/tree/n6.1.3";
 
 pub const MS_1_PACK: SpecQuote = SpecQuote {
     id: "MS-1",

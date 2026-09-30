@@ -959,7 +959,7 @@ impl MkvStream {
     }
 
     // `(track, Some(depth) | None=undecidable)` for tracks decidable from `frames`.
-    // Past the budget, a measured but ambiguous span takes ffmpeg's 16-bit default.
+    // Past the budget, a measured but ambiguous span takes the common 16-bit default.
     fn try_infer_pcm(
         &self,
         frames: &[crate::pes::PesFrame],
