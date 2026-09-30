@@ -1690,14 +1690,24 @@ fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHea
         }
     }
 
-    let duration_secs = duration_ticks.map(|t| t * (ts_scale as f64) / 1_000_000_000.0);
+    // Clamp the (untrusted) scale to a positive i64 for the tick→ns multiply on
+    // the read path; default to 1 ms if absent or absurd. Duration and the probe use the
+    // same clamped scale as the frames; a non-finite or negative Duration is absent.
+    let ts_scale_ns = if ts_scale == 0 || ts_scale > i64::MAX as u64 {
+        1_000_000
+    } else {
+        ts_scale as i64
+    };
+    let duration_secs = duration_ticks
+        .map(|t| t * (ts_scale_ns as f64) / 1_000_000_000.0)
+        .filter(|s| s.is_finite() && *s >= 0.0);
     let probe = MkvProbe {
         muxing_app,
         writing_app,
         duration_secs,
         title: title_seen.then(|| title.clone()),
         tracks: probe_tracks,
-        timestamp_scale: ts_scale,
+        timestamp_scale: ts_scale_ns as u64,
         last_cue_secs: None,
     };
     let disc_title = DiscTitle {
@@ -1706,13 +1716,6 @@ fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHea
         streams,
         chapters,
         ..DiscTitle::empty()
-    };
-    // Clamp the (untrusted) scale to a positive i64 for the tick→ns multiply on
-    // the read path; default to 1 ms if absent or absurd.
-    let ts_scale_ns = if ts_scale == 0 || ts_scale > i64::MAX as u64 {
-        1_000_000
-    } else {
-        ts_scale as i64
     };
     Ok(MkvHeader {
         title: disc_title,
@@ -7447,6 +7450,33 @@ mod readback_tests {
         assert_eq!(audio_language(&extra), "fra");
         assert_eq!(audio_language(&string(LANGUAGE_BCP47, "deu")), "deu");
         assert_eq!(audio_language(&string(LANGUAGE_BCP47, "x-klingon")), "und");
+    }
+
+    fn probe_info(info: &[u8]) -> MkvProbe {
+        let mut out = el(ebml::EBML, &[]);
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        out.extend(el(ebml::INFO, info));
+        out.extend(el(ebml::TRACKS, &entry(1, 1, ebml::CODEC_H264, &[])));
+        probe_mkv(Cursor::new(out)).unwrap()
+    }
+
+    fn duration(ticks: f64) -> Vec<u8> {
+        el(ebml::DURATION, &ticks.to_be_bytes())
+    }
+
+    #[test]
+    fn a_zero_timestamp_scale_times_the_duration_like_the_frames() {
+        let p = probe_info(&[uint(ebml::TIMESTAMP_SCALE, 0), duration(5000.0)].concat());
+        assert_eq!(p.timestamp_scale, 1_000_000);
+        assert_eq!(p.duration_secs, Some(5.0));
+    }
+
+    #[test]
+    fn a_non_finite_or_negative_duration_is_absent() {
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(probe_info(&duration(bad)).duration_secs, None, "{bad}");
+        }
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
