@@ -24,10 +24,8 @@ const AACS_UNIT_SECTORS: u32 = crate::aacs::content::ALIGNED_UNIT_SECTORS;
 const READ_BATCH_SECTORS: u32 = 1536; // 3 MiB, multiple of 3
 /// Bounded per-extent retries on a read that fails before a recorded hole.
 const READ_RETRIES: u32 = 3;
-/// Retries per AACS unit when narrowing a failed batch (the batch read already failed once).
-const UNIT_RETRIES: u32 = 1;
-/// Failed unit reads per batch after which the rest of the batch is zero-filled unread.
-const MAX_FAILED_UNIT_READS: u32 = 8;
+/// Failed unit reads (one attempt each) per batch after which the rest is zero-filled unread.
+const MAX_FAILED_UNIT_READS: u32 = 4;
 /// Drive error granularity: a BD ECC cluster (32 sectors), also a whole number of DVD
 /// ECC blocks (16). After a bad unit, reading resumes past this boundary.
 const ECC_BLOCK_SECTORS: u64 = 32;
@@ -754,9 +752,9 @@ fn whole_unit_batch(remaining: u32) -> u32 {
     batch
 }
 
-// Reads a batch (one retry); if it fails, re-reads it one AACS unit at a time. A bad unit
-// zero-fills, unread, up to the first unit at/after its ECC block's end; past
-// MAX_FAILED_UNIT_READS the rest is zero-filled. Returns zero-filled bytes; Err = stop/key set.
+// Reads a batch (one retry); if it fails, re-reads it one AACS unit at a time, once each. A
+// media-bad unit zero-fills, unread, up to the first unit at/after its ECC block's end; past
+// MAX_FAILED_UNIT_READS the rest is zero-filled; an undecryptable unit loses only itself. Returns zero-filled bytes; Err = stop/key set.
 fn read_batch_narrowed<S: SectorSource>(
     dec: &mut DecryptingSectorSource<S>,
     lba: u32,
@@ -770,7 +768,7 @@ fn read_batch_narrowed<S: SectorSource>(
         buf.fill(0);
         return Ok(buf.len() as u64);
     }
-    if read_tries(dec, lba, count, buf, 1)? {
+    if read_tries(dec, lba, count, buf, 1)? == Tried::Good {
         return Ok(0);
     }
     let mut lost = 0u64;
@@ -779,11 +777,23 @@ fn read_batch_narrowed<S: SectorSource>(
     while off < count {
         let n = AACS_UNIT_SECTORS.min(count - off);
         let unit = &mut buf[off as usize * SECTOR_BYTES..(off + n) as usize * SECTOR_BYTES];
-        if read_tries(dec, lba + off, n, unit, UNIT_RETRIES)? {
+        let tried = read_tries(dec, lba + off, n, unit, 0)?;
+        if tried == Tried::Good {
             off += n;
             continue;
         }
-        failed += 1 + UNIT_RETRIES;
+        failed += 1;
+        if tried == Tried::Undecryptable {
+            unit.fill(0);
+            lost += unit.len() as u64;
+            off += n;
+            if failed >= MAX_FAILED_UNIT_READS {
+                buf[off as usize * SECTOR_BYTES..count as usize * SECTOR_BYTES].fill(0);
+                lost += u64::from(count - off) * SECTOR_BYTES as u64;
+                off = count;
+            }
+            continue;
+        }
         // End of the ECC block holding the unit's last sector (a straddled boundary skips
         // the later block), rounded up to a unit start; the rest when over budget.
         let end = u64::from(lba) + u64::from(off + n);
@@ -809,7 +819,16 @@ fn read_batch<S: SectorSource>(
     count: u32,
     buf: &mut [u8],
 ) -> Result<bool> {
-    read_tries(dec, lba, count, buf, READ_RETRIES)
+    Ok(read_tries(dec, lba, count, buf, READ_RETRIES)? == Tried::Good)
+}
+
+#[derive(PartialEq)]
+enum Tried {
+    Good,
+    // Media/read failure: the drive lost the whole ECC block.
+    Media,
+    // Read fine but the unit cannot be decrypted; the next unit may still be fine.
+    Undecryptable,
 }
 
 fn read_tries<S: SectorSource>(
@@ -818,19 +837,19 @@ fn read_tries<S: SectorSource>(
     count: u32,
     buf: &mut [u8],
     retries: u32,
-) -> Result<bool> {
+) -> Result<Tried> {
     let mut attempt = 0;
     loop {
         let last = attempt >= retries;
         match dec.read_sectors(lba, count as u16, buf, true) {
-            Ok(n) if n >= buf.len() => return Ok(true),
-            Ok(_) if last => return Ok(false),
+            Ok(n) if n >= buf.len() => return Ok(Tried::Good),
+            Ok(_) if last => return Ok(Tried::Media),
             Ok(_) => {}
             Err(Error::Halted) => return Err(Error::Halted),
             // The key set's loud stop (KU §2.4): never a hole, the run stops `.partial`.
             Err(e @ (Error::WholeDiscKeyMissing | Error::NoDiscKey { .. })) => return Err(e),
-            Err(Error::DecryptFailed) => return Ok(false),
-            Err(_) if last => return Ok(false),
+            Err(Error::DecryptFailed) => return Ok(Tried::Undecryptable),
+            Err(_) if last => return Ok(Tried::Media),
             Err(_) => {}
         }
         attempt += 1;
@@ -3238,8 +3257,8 @@ mod tests {
         let (lost, calls, _, buf) = narrowed(|l| (1000..2536).contains(&l), 0);
         assert_eq!(lost, buf.len() as u64);
         assert!(buf.iter().all(|&b| b == 0));
-        // 2 batch reads + 4 bad units x 2 attempts, then the budget zero-fills the rest.
-        assert_eq!(calls, 10, "{calls} reads for one bad batch");
+        // 2 batch reads + 4 bad units x 1 attempt, then the budget zero-fills the rest.
+        assert_eq!(calls, 6, "{calls} reads for one bad batch");
     }
 
     // One bad ECC block mid-batch loses that block only; data after it is still read.
@@ -3251,8 +3270,8 @@ mod tests {
         assert!(buf[sectors(600, 633)].iter().all(|&b| b == 0));
         assert!(buf[sectors(0, 600)].iter().all(|&b| b == 0x22));
         assert!(buf[sectors(633, 1536)].iter().all(|&b| b == 0x22));
-        // 2 batch reads + 200 good units + 1 bad unit x 2 + 301 good units.
-        assert_eq!(calls, 2 + 200 + 2 + 301);
+        // 2 batch reads + 200 good units + 1 bad unit + 301 good units.
+        assert_eq!(calls, 2 + 200 + 1 + 301);
     }
 
     // A lone bad sector loses its ECC block (the drive fails the whole block anyway).
@@ -3274,6 +3293,40 @@ mod tests {
         assert_eq!(calls, fails + 3);
         assert_eq!(lost, buf.len() as u64 - 9 * SECTOR_BYTES as u64);
         assert!(buf[sectors(24, 27)].iter().all(|&b| b == 0x22));
+    }
+
+    // Fails to decrypt (not a media error) for LBAs in `bad`.
+    struct DecryptBad(fn(u32) -> bool);
+    impl SectorSource for DecryptBad {
+        fn capacity_sectors(&self) -> u32 {
+            100_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            if (lba..lba + count as u32).any(self.0) {
+                return Err(Error::DecryptFailed);
+            }
+            let need = count as usize * SECTOR_BYTES;
+            buf[..need].fill(0x22);
+            Ok(need)
+        }
+    }
+
+    // An undecryptable unit loses only itself: no ECC-block skip past it.
+    #[test]
+    fn narrowed_undecryptable_unit_loses_only_that_unit() {
+        let src = DecryptBad(|l| l == 1300);
+        let mut dec = DecryptingSectorSource::new(src, DecryptKeys::None);
+        let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_BYTES];
+        let lost = read_batch_narrowed(&mut dec, 1000, READ_BATCH_SECTORS, &mut buf).unwrap();
+        assert_eq!(lost, 3 * SECTOR_BYTES as u64);
+        assert!(buf[sectors(300, 303)].iter().all(|&b| b == 0));
+        assert!(buf[sectors(303, 1536)].iter().all(|&b| b == 0x22));
     }
 
     // A transient whole-batch failure is recovered by one batch re-read, no unit reads.
