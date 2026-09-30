@@ -67,6 +67,8 @@ struct PesAssembler {
     /// Payload bytes since the PUSI while the PES header (fixed part or PTS/DTS) is still
     /// incomplete: h222 lets it span packets. Empty otherwise.
     head: Vec<u8>,
+    /// ES bytes a bounded PES (non-zero PES_packet_length) carries; `None` if unbounded.
+    es_len: Option<usize>,
     /// 4-bit continuity_counter of the last payload-bearing TS packet seen
     /// on this PID. A non-PUSI continuation whose CC is not `(prev + 1) & 0xf`
     /// — or whose adaptation field flags a discontinuity — means one or more
@@ -114,6 +116,7 @@ impl PesAssembler {
             active: false,
             header_remaining: 0,
             head: Vec::new(),
+            es_len: None,
             last_cc: None,
             pes_source: None,
             pending_discontinuity: false,
@@ -146,6 +149,7 @@ impl PesAssembler {
         };
         self.pts = pts;
         self.dts = dts;
+        self.es_len = None;
         self.active = true;
         self.pes_source = source;
         completed
@@ -193,6 +197,8 @@ impl PesAssembler {
         } else {
             self.pts = pts;
             self.dts = dts;
+            let pes_len = usize::from(u16::from_be_bytes([head[4], head[5]]));
+            self.es_len = (pes_len > 0).then(|| (pes_len + 6).saturating_sub(header_len));
             if header_len < head.len() {
                 self.push(&head[header_len..]);
             } else {
@@ -464,6 +470,11 @@ impl TsDemuxer {
             // starting now (as does a lost PES whose header never completed). Set
             // `pending_discontinuity` after start(), else it stamps the pre-gap frame.
             let lost_head = !asm.head.is_empty();
+            // The lost packets may be the open PES's tail: flag it unless its bounded length
+            // shows it complete.
+            if gap && asm.es_len.is_none_or(|n| asm.buffer.len() < n) {
+                asm.pending_discontinuity = true;
+            }
             if let Some(prev) = asm.start(None, None, source) {
                 completed.push(prev);
             }
@@ -1117,9 +1128,9 @@ mod tests {
         );
     }
 
-    // B1 plumbing: a gap on a PUSI must stamp `discontinuity` on the PES
-    // STARTING after the gap, not the one flushed at the boundary — that PES
-    // is the one whose data actually references the lost packets.
+    // B1 plumbing: a gap on a PUSI stamps `discontinuity` on the PES starting after it
+    // (whose data may reference lost units) and on the unbounded PES flushed at the
+    // boundary, whose tail may be among the lost packets.
     #[test]
     fn continuity_gap_stamps_discontinuity_on_next_pes() {
         let pid = 0x1011;
@@ -1138,15 +1149,14 @@ mod tests {
             "in-sequence PES is not a discontinuity"
         );
 
-        // C's PUSI jumps cc 1 -> 5: packets were lost between B and C. B (flushed
-        // here) is PRE-gap and stays clean — the gap belongs to C, which starts
-        // after the lost packets.
+        // C's PUSI jumps cc 1 -> 5: packets were lost between B and C, possibly B's tail
+        // (B is unbounded, so nothing proves it complete).
         let out = demux.feed(&ts_payload_packet(pid, true, 5, &pes_start(b"CCCC")));
         assert_eq!(out.len(), 1, "B completes");
         assert_eq!(&out[0].data[..4], b"BBBB");
         assert!(
-            !out[0].discontinuity,
-            "the pre-gap PES flushed at the boundary must NOT be flagged"
+            out[0].discontinuity,
+            "an unbounded PES flushed at a gap may be truncated"
         );
 
         // C carries the discontinuity — it is the first post-gap PES.
@@ -1157,6 +1167,23 @@ mod tests {
             out[0].discontinuity,
             "the post-gap PES must be flagged so B1 resyncs at/after it"
         );
+    }
+
+    // A bounded PES whose PES_packet_length is met before a gap is complete: only the
+    // PES after the gap is flagged.
+    #[test]
+    fn complete_bounded_pes_before_a_gap_stays_clean() {
+        let pid = 0x1100;
+        let mut demux = TsDemuxer::new(&[pid]);
+        // private_stream_1, PES_packet_length 7 = 3 header bytes + "AAAA".
+        let a = [0, 0, 1, 0xBD, 0, 7, 0x80, 0, 0, b'A', b'A', b'A', b'A'];
+        assert!(demux.feed(&es_packet_exact(pid, true, &a)).is_empty());
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 9, &pes_start(b"CCCC")));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].data, b"AAAA");
+        assert!(!out[0].discontinuity, "A is complete by its length");
+        assert!(out[1].discontinuity, "C follows the gap");
     }
 
     /// One 192-byte BD source packet that is a B1 concealment marker: a PID-0x1FFF
