@@ -1808,6 +1808,16 @@ mod tests {
         assert_eq!(sanitize_component(". "), "_");
     }
 
+    /// Every host-illegal character is replaced, including the Windows path
+    /// separator, so a disc name cannot climb out of the extract root.
+    #[test]
+    fn sanitize_replaces_every_reserved_character() {
+        for c in ['/', '\\', ':', '<', '>', '"', '|', '?', '*'] {
+            assert_eq!(sanitize_component(&format!("a{c}b")), "a_b", "{c:?}");
+        }
+        assert_eq!(sanitize_component("a\\..\\x"), "a_.._x");
+    }
+
     /// Two distinct disc paths that sanitize to the same host path are a hard
     /// error (collision), never a silent overwrite.
     #[test]
@@ -2395,6 +2405,9 @@ mod tests {
             fn set_unit_base(&mut self, lba: u32) {
                 self.last_unit_base = Some(lba);
             }
+            fn random_access(&self) -> bool {
+                false
+            }
         }
 
         let mut inner = Recorder {
@@ -2407,6 +2420,7 @@ mod tests {
             assert_eq!(b.capacity_sectors(), 42, "capacity_sectors must forward");
             b.set_speed(7200);
             b.set_unit_base(1234);
+            assert!(!b.random_access(), "random_access must forward, not default");
         }
         assert_eq!(inner.last_speed, Some(7200), "set_speed must forward");
         assert_eq!(
