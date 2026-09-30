@@ -691,9 +691,10 @@ fn ts_payload_base(pkt: &[u8]) -> Option<usize> {
     }
 }
 
-// MPEG audio layer (1-3) from the first frame header at the start of `pid`'s
-// first PES in `data`; `None` when no such PES or header is in the scan window.
-fn mpeg_audio_layer(data: &[u8], pid: u16) -> Option<u8> {
+// Per PID, the MPEG audio layer (1-3) from the frame header at the start of its first PES
+// in `data` (`None` when that PES has no such header), found in one walk over `data`.
+fn mpeg_audio_layers(data: &[u8]) -> std::collections::HashMap<u16, Option<u8>> {
+    let mut layers = std::collections::HashMap::new();
     let mut offset = 0;
     while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
         if !is_resync_point(data, offset) {
@@ -702,24 +703,31 @@ fn mpeg_audio_layer(data: &[u8], pid: u16) -> Option<u8> {
         }
         let pkt = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
         let pkt_pid = (((pkt[5] & 0x1F) as u16) << 8) | pkt[6] as u16;
-        if pkt_pid == pid && pkt[5] & 0x40 != 0 {
-            let pes = &pkt[ts_payload_base(pkt)?..];
-            if pes.get(..3)? != [0, 0, 1] {
-                return None;
-            }
-            let es = pes.get(9 + *pes.get(8)? as usize..)?;
-            let (b0, b1) = (*es.first()?, *es.get(1)?);
-            if b0 != 0xFF || b1 & 0xE0 != 0xE0 {
-                return None;
-            }
-            return match (b1 >> 1) & 0x03 {
-                0 => None,
-                l => Some(4 - l),
-            };
+        if pkt[5] & 0x40 != 0 {
+            layers
+                .entry(pkt_pid)
+                .or_insert_with(|| first_pes_layer(pkt));
         }
         offset += BD_SOURCE_PACKET_BYTES;
     }
-    None
+    layers
+}
+
+// MPEG audio layer of the frame header opening the PES that starts in `pkt`.
+fn first_pes_layer(pkt: &[u8]) -> Option<u8> {
+    let pes = &pkt[ts_payload_base(pkt)?..];
+    if pes.get(..3)? != [0, 0, 1] {
+        return None;
+    }
+    let es = pes.get(9 + *pes.get(8)? as usize..)?;
+    let (b0, b1) = (*es.first()?, *es.get(1)?);
+    if b0 != 0xFF || b1 & 0xE0 != 0xE0 {
+        return None;
+    }
+    match (b1 >> 1) & 0x03 {
+        0 => None,
+        l => Some(4 - l),
+    }
 }
 
 // Reassemble a single PSI section (PAT/PMT) for `target_pid`/`table_id` across TS-packet
@@ -886,6 +894,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
         let prog_info_len =
             ((((pmt[10] & 0x0F) as usize) << 8) | pmt[11] as usize).min(end.saturating_sub(12));
         let mut pos = 12 + prog_info_len;
+        let mut layers = None;
 
         while pos + 5 <= end {
             let stream_type = pmt[pos];
@@ -896,7 +905,14 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
             // absent from Blu-ray's STN table. Keep that distinction local to TS.
             let codec = match stream_type {
                 // MPEG-1/2 audio covers Layers I-III; only the ES says which.
-                0x03 | 0x04 if mpeg_audio_layer(data, es_pid) == Some(3) => Codec::Mp3,
+                0x03 | 0x04
+                    if layers
+                        .get_or_insert_with(|| mpeg_audio_layers(data))
+                        .get(&es_pid)
+                        == Some(&Some(3)) =>
+                {
+                    Codec::Mp3
+                }
                 0x03 | 0x04 => Codec::Mp2,
                 0x0f => Codec::Aac,
                 0x87 => Codec::Ac3Plus,
@@ -1630,6 +1646,25 @@ mod tests {
                 .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
             "H.264 video must be found past the adaptation field"
         );
+    }
+
+    // Many MPEG-audio PMT entries over a sync-free head: one walk, each PID keeps its layer.
+    #[test]
+    fn scan_streams_labels_many_mpeg_audio_pids_in_one_walk() {
+        use crate::disc::{Codec, Stream};
+        let mut entries = vec![(0x1b, 0x1011)];
+        entries.extend((0..60u16).map(|i| (0x03, 0x1100 + i)));
+        let mut data = pat_packet(0x100);
+        data.extend(pmt_two_packets(0x100, &entries));
+        for (pid, b1) in [(0x1100, 0xFB), (0x1101, 0xFD)] {
+            let mut pes = vec![0x00, 0x00, 0x01, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00];
+            pes.extend_from_slice(&[0xFF, b1, 0x90, 0x64]);
+            data.extend(es_packet_exact(pid, true, &pes));
+        }
+        data.resize(data.len() + (1 << 20), 0);
+        let streams = scan_streams(&data).unwrap();
+        assert!(matches!(&streams[1], Stream::Audio(a) if a.codec == Codec::Mp3));
+        assert!(matches!(&streams[2], Stream::Audio(a) if a.codec == Codec::Mp2));
     }
 
     // Give a single-packet PSI fixture (pointer_field 0) its real CRC_32.
