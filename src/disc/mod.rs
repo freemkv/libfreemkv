@@ -3266,10 +3266,10 @@ pub(crate) fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf
 impl Disc {
     /// Path to the mapfile for a given output path.
     ///
-    /// For `/dev/null` output, returns
-    /// `{temp_dir}/{volume_id_or_title}-{pid}.mapfile` (temp dir is
-    /// `TMPDIR`-aware and cross-platform). For regular files, returns
-    /// `{path}.mapfile`.
+    /// For `/dev/null` output, returns `{dir}/{volume_id_or_title}.mapfile`
+    /// where `{dir}` is a directory this process created under the temp dir
+    /// (owner-only on Unix, unpredictable name, stable for the process). For
+    /// regular files, returns `{path}.mapfile`.
     pub fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
         if path.as_os_str() == "/dev/null" {
             let name: String = self
@@ -3285,13 +3285,58 @@ impl Disc {
                     }
                 })
                 .collect();
-            // Per-process, so a stale or concurrent same-label run is never resumed.
-            let pid = std::process::id();
-            std::env::temp_dir().join(format!("{name}-{pid}.mapfile"))
+            null_mapfile_dir().join(format!("{name}.mapfile"))
         } else {
             mapfile_path_for(path)
         }
     }
+}
+
+// Private per-process dir for `/dev/null` mapfiles. Created fresh (never
+// reused) so another user cannot pre-create, plant or symlink the path.
+fn null_mapfile_dir() -> std::path::PathBuf {
+    static DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+    let mut dir = DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(d) = dir.as_ref() {
+        return d.clone();
+    }
+    let mut last = std::path::PathBuf::new();
+    for _ in 0..8 {
+        last = std::env::temp_dir().join(format!(
+            "freemkv-{}-{:016x}",
+            std::process::id(),
+            random_u64()
+        ));
+        match create_private_dir(&last) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            _ => break,
+        }
+    }
+    // Remembered even if not created, so every call agrees; a mapfile
+    // under a dir that failed to create then fails to open.
+    *dir = Some(last.clone());
+    last
+}
+
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(path)
+}
+
+// OS-seeded, per-call random value from std's SipHash keys.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
 }
 
 const MAX_BATCH_SECTORS: u16 = 510;
@@ -8727,33 +8772,48 @@ mod tests {
     }
 
     // /dev/null output cannot host a sibling mapfile, so it's named from the
-    // disc and placed in the temp dir, sanitized to [A-Za-z0-9-_] since it's
-    // used verbatim as a filename.
+    // disc, sanitized to [A-Za-z0-9-_] since it's used verbatim as a filename.
     #[test]
-    fn mapfile_for_dev_null_sanitizes_the_disc_name_into_a_temp_path() {
+    fn mapfile_for_dev_null_sanitizes_the_disc_name() {
         let mut disc = make_test_disc(1_000, "VOLUME_ID");
         // Keeps: alphanumeric, '-', '_'. Replaces: space, '!', non-ASCII.
         disc.meta_title = Some("A-B_c1 d!é".into());
+        let p = disc.mapfile_for(std::path::Path::new("/dev/null"));
         assert_eq!(
-            disc.mapfile_for(std::path::Path::new("/dev/null")),
-            std::env::temp_dir().join(format!("A-B_c1_d__-{}.mapfile", std::process::id()))
+            p.file_name().and_then(|n| n.to_str()),
+            Some("A-B_c1_d__.mapfile")
         );
-        // The UDF volume id is the fallback when the disc carries no META/DL
-        // title.
+        // The UDF volume id is the fallback when the disc has no META/DL title.
         disc.meta_title = None;
+        let p = disc.mapfile_for(std::path::Path::new("/dev/null"));
         assert_eq!(
-            disc.mapfile_for(std::path::Path::new("/dev/null")),
-            std::env::temp_dir().join(format!("VOLUME_ID-{}.mapfile", std::process::id()))
+            p.file_name().and_then(|n| n.to_str()),
+            Some("VOLUME_ID.mapfile")
         );
     }
 
-    // Two runs (or same-label discs) must not share a /dev/null mapfile.
+    // Not a guessable shared-temp path: a fresh dir this process created
+    // (owner-only on Unix), stable across calls so passes find their mapfile.
     #[test]
-    fn mapfile_for_dev_null_is_per_process() {
+    fn mapfile_for_dev_null_is_in_a_private_per_process_dir() {
         let disc = make_test_disc(1_000, "BDROM");
-        let name = disc.mapfile_for(std::path::Path::new("/dev/null"));
-        let name = name.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let p = disc.mapfile_for(std::path::Path::new("/dev/null"));
+        assert_eq!(p, disc.mapfile_for(std::path::Path::new("/dev/null")));
+        let dir = p.parent().unwrap_or(std::path::Path::new(""));
+        assert_ne!(dir, std::env::temp_dir().as_path());
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert!(name.contains(&std::process::id().to_string()), "{name}");
+        let md = std::fs::symlink_metadata(dir).expect("dir created");
+        assert!(md.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(md.permissions().mode() & 0o077, 0);
+        }
+        // Writable by us: the mapfile can actually be created there.
+        std::fs::write(&p, b"").expect("mapfile writable");
+        let _ = std::fs::remove_file(&p);
     }
 
     // STN audio_format 12 is the stereo+multichannel combo, not a 7.1 layout.
