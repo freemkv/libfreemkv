@@ -924,10 +924,14 @@ impl MkvStream {
         Ok(stream)
     }
 
-    // Decide the depth of each PCM track without BitDepth from its first blocks.
-    // Read-ahead stops at PCM_PROBE_BYTES or PCM_PROBE_FRAMES of the track itself.
+    // Decide the depth of each PCM track without BitDepth from its first blocks. Read-ahead
+    // stops at PCM_PROBE_BYTES, PCM_PROBE_MAX_FRAMES in all, or PCM_PROBE_FRAMES of the track.
     fn resolve_pcm_depths(&mut self) -> io::Result<()> {
         let mut buffered: Vec<crate::pes::PesFrame> = Vec::new();
+        // Indices into `buffered` per track, so a probe step never rescans every frame.
+        let mut by_track: Vec<Vec<usize>> = Vec::new();
+        // Track of the last frame read; `None` = consider every track.
+        let mut focus: Option<usize> = None;
         let mut bytes = 0usize;
         loop {
             let (open, lace) = match &self.mode {
@@ -940,12 +944,15 @@ impl MkvStream {
             if !open {
                 break;
             }
-            let end = if bytes.saturating_add(lace) >= PCM_PROBE_BYTES {
+            let end = if bytes.saturating_add(lace) >= PCM_PROBE_BYTES
+                || buffered.len() >= PCM_PROBE_MAX_FRAMES
+            {
                 ProbeEnd::Capped
             } else {
                 ProbeEnd::Reading
             };
-            let decided = self.try_infer_pcm(&buffered, end);
+            let only = focus.filter(|_| end == ProbeEnd::Reading);
+            let decided = self.try_infer_pcm(&buffered, &by_track, end, only);
             if !decided.is_empty() {
                 self.apply_pcm_decisions(&decided, &mut buffered);
                 continue;
@@ -953,10 +960,15 @@ impl MkvStream {
             match self.read_parsed()? {
                 Some(f) => {
                     bytes = bytes.saturating_add(f.data.len());
+                    if by_track.len() <= f.track {
+                        by_track.resize_with(f.track + 1, Vec::new);
+                    }
+                    by_track[f.track].push(buffered.len());
+                    focus = Some(f.track);
                     buffered.push(f);
                 }
                 None => {
-                    let decided = self.try_infer_pcm(&buffered, ProbeEnd::Eof);
+                    let decided = self.try_infer_pcm(&buffered, &by_track, ProbeEnd::Eof, None);
                     self.apply_pcm_decisions(&decided, &mut buffered);
                 }
             }
@@ -969,12 +981,14 @@ impl MkvStream {
         Ok(())
     }
 
-    // `(track, Some(depth) | None=undecidable)` for tracks decidable from `frames`.
-    // Past the budget, a measured but ambiguous span takes the common 16-bit default.
+    // `(track, Some(depth) | None=undecidable)` for tracks decidable from `frames` (only
+    // track `only` when set). Past the budget, an ambiguous span takes the common 16-bit default.
     fn try_infer_pcm(
         &self,
         frames: &[crate::pes::PesFrame],
+        by_track: &[Vec<usize>],
         end: ProbeEnd,
+        only: Option<usize>,
     ) -> Vec<(usize, Option<u64>)> {
         let Mode::Read(rs) = &self.mode else {
             return Vec::new();
@@ -982,7 +996,15 @@ impl MkvStream {
         let mut out = Vec::new();
         for (idx, info) in rs.tracks.pcm_infer.iter().enumerate() {
             let Some(info) = info else { continue };
-            let mine: Vec<_> = frames.iter().filter(|f| f.track == idx).collect();
+            if only.is_some_and(|t| t != idx) {
+                continue;
+            }
+            let mine: Vec<_> = by_track
+                .get(idx)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(|&i| frames.get(i))
+                .collect();
             let depth = match pcm_depth_fit(&mine, *info, rs.ts_scale_ns) {
                 PcmFit::One(w) => Some(w * 8),
                 PcmFit::Neither => None,
@@ -1835,6 +1857,8 @@ struct PcmInfer {
 
 // Frames of one PCM track a depth probe may buffer before settling on a default.
 const PCM_PROBE_FRAMES: usize = 512;
+// Frames of all tracks a depth probe may buffer (empty blocks cost no payload bytes).
+const PCM_PROBE_MAX_FRAMES: usize = 16 * PCM_PROBE_FRAMES;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProbeEnd {
@@ -7305,6 +7329,35 @@ mod readback_tests {
         let big = zlib(&vec![0u8; 4096]);
         assert!(inflate_capped(&big, 4096).is_ok());
         assert!(inflate_capped(&big, 4095).is_err());
+    }
+
+    // A BitDepth-less PCM track next to a flood of empty blocks of another track.
+    #[test]
+    fn a_pcm_depth_probe_stops_buffering_at_a_frame_cap() {
+        let n = 3 * PCM_PROBE_MAX_FRAMES;
+        let mut c = el(ebml::CLUSTER, &[]);
+        c.truncate(c.len() - 1);
+        ebml::write_unknown_size(&mut c).unwrap();
+        c.extend(uint(ebml::CLUSTER_TIMESTAMP, 0));
+        for _ in 0..n {
+            c.extend(el(ebml::SIMPLE_BLOCK, &[0x82, 0x00, 0x00, 0x80]));
+        }
+        let bytes = mkv(
+            &[
+                entry(1, 2, ebml::CODEC_PCM_LE, &[]),
+                entry(2, 2, ebml::CODEC_AC3, &[]),
+            ],
+            &c,
+        );
+        let s = open(bytes);
+        let Mode::Read(rs) = &s.mode else {
+            panic!("read mode")
+        };
+        assert!(
+            rs.pending.len() <= PCM_PROBE_MAX_FRAMES,
+            "{} frames buffered by the probe",
+            rs.pending.len()
+        );
     }
 
     fn drain_all(s: &mut MkvStream) -> Vec<crate::pes::PesFrame> {
