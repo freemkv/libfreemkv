@@ -1421,6 +1421,26 @@ fn on_arrival_a_garbled_head_in_a_clear_piece_is_blanked_never_e7032() {
     assert_eq!(w.blanked_units(), 2);
 }
 
+/// Option A (E7013): a clear piece never has partners, so every garbled flagged unit in it,
+/// at any LBA, is damage: blanked and counted, never a second-strike E7032.
+#[test]
+fn on_arrival_garbled_heads_at_two_lbas_of_a_clear_piece_are_blanked() {
+    let fx = fixture(&[stream(1, 10, None), stream(2, 10, None)], 2, &[&[0, 1]]);
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+    let mut fx = fx;
+    garble_keeping_sync(&mut fx, 0, 2);
+    garble_keeping_sync(&mut fx, 0, 7);
+    let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
+    for u in [2, 7] {
+        let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
+        w.read_sectors(fx.unit(0, u), 3, &mut buf, true)
+            .expect("damage, not E7032");
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+    assert_eq!(w.blanked_units(), 2);
+}
+
 /// Sweep, patch and image→ISO read through the whole-disc reader, one call per block. A
 /// cluster of damaged units (KS-4: "The first 16 bytes of each Aligned Unit is used as the
 /// seed") is blanked and counted wherever it falls, never E7013: multipass must not error.
