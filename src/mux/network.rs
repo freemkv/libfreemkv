@@ -1132,7 +1132,7 @@ mod tests {
             let r = NetworkStream::accept_from_with_halt(listener, Some(h)).map(|_| ());
             let _ = tx.send(r);
         });
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // No sender ever connects: the accept observes the cancel wherever it lands.
         halt.cancel();
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -1149,9 +1149,11 @@ mod tests {
         let halt = crate::halt::Halt::new();
         let h = halt.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut ns = NetworkStream::accept_from_with_halt(listener, Some(h)).unwrap();
-            let _ = tx.send(pes::Stream::read(&mut ns).map(|_| ()));
+            let r = NetworkStream::accept_from_with_halt(listener, Some(h));
+            let _ = ready_tx.send(());
+            let _ = tx.send(r.and_then(|mut ns| pes::Stream::read(&mut ns).map(|_| ())));
         });
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
@@ -1166,7 +1168,10 @@ mod tests {
             ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
             w.flush().unwrap();
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Handshake, not a sleep: cancel once the header is in and the frame read begins.
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the receiver accepted");
         halt.cancel();
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(5))
