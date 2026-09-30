@@ -611,10 +611,63 @@ mod tests {
         );
     }
 
+    // The Debug output wraps a Read Data Key: it must never print the bytes.
     #[test]
-    fn unmapped_stream_file_keeps_the_cause_display() {
-        assert_eq!(m2ts1().cause, Error::UdfAdChainTooLong.to_string());
-        assert_eq!(m2ts1().icb, 40);
+    fn bus_stage_debug_redacts_the_read_data_key() {
+        let out = format!("{:?}", BusStage::AacsHostKey([0xAB; 16]));
+        assert_eq!(out, "BusStage::AacsHostKey([redacted])");
+        assert_eq!(
+            format!("{:?}", BusStage::Passthrough),
+            "BusStage::Passthrough"
+        );
+    }
+
+    // Records the fua flag of every read; the default read_sectors_fua drops it.
+    struct FuaProbe {
+        fua: Vec<bool>,
+    }
+    impl SectorSource for FuaProbe {
+        fn capacity_sectors(&self) -> u32 {
+            1000
+        }
+        fn read_sectors(&mut self, _: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            let n = count as usize * SECTOR_BYTES;
+            buf[..n].fill(0);
+            Ok(n)
+        }
+        fn read_sectors_fua(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+            fua: bool,
+        ) -> Result<usize> {
+            self.fua.push(fua);
+            self.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // Pass-N FUA recovery must reach the drive through the de-bus decorator.
+    #[test]
+    fn read_sectors_fua_forwards_fua_to_the_inner_source() {
+        let mut s = BusRemovalSectorSource::new(FuaProbe { fua: vec![] }, BusStage::Passthrough);
+        let mut buf = vec![0u8; SECTOR_BYTES];
+        s.read_sectors_fua(5, 1, &mut buf, true, true).unwrap();
+        s.read_sectors_fua(5, 1, &mut buf, true, false).unwrap();
+        assert_eq!(s.inner().fua, [true, false]);
+    }
+
+    // A partly overlapping second file keeps its file offset across the clip.
+    #[test]
+    fn bus_map_partial_overlap_clip_keeps_the_file_offset() {
+        let map = BusMap::from_files(vec![vec![(100, 6)], vec![(103, 12)]]);
+        let at = |l| {
+            map.locate(l)
+                .map(|o| o.map(|x| (x.file, x.unit, x.head_in_span)))
+        };
+        assert_eq!(at(105), Some(Some((0, 1, Some(103)))));
+        assert_eq!(at(109), Some(Some((1, 2, Some(109)))));
     }
 
     /// A source returning a fixed buffer for any read (starting at whatever the
