@@ -76,7 +76,7 @@ pub struct StreamEntry {
     pub video_format: u8,
     /// Video frame rate (1=23.976, 2=24, 3=25, 4=29.97, 6=50, 7=59.94)
     pub video_rate: u8,
-    /// Audio channel layout (1=mono, 3=stereo, 6=5.1, 12=7.1)
+    /// Audio channel layout (1=mono, 3=stereo, 6=5.1, 12=combo)
     pub audio_format: u8,
     /// Audio sample rate (1=48kHz, 4=96kHz, 5=192kHz)
     pub audio_rate: u8,
