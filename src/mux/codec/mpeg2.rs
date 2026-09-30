@@ -100,6 +100,9 @@ pub struct Mpeg2Parser {
     /// each GOP's first PES PTS so video stays in sync with the PES-timestamped
     /// audio. None until the first PES timestamp is seen.
     origin_pts_ns: Option<i64>,
+    /// Top-parity of an unpaired first field picture; the next opposite-parity
+    /// field is its second field and inherits the pair's (first field's) order.
+    pending_first_field: Option<bool>,
 }
 
 /// One coded picture buffered awaiting its GOP's completion (see `gop_buf`).
@@ -134,6 +137,7 @@ impl Mpeg2Parser {
             gop_bytes: 0,
             emitted_fields: 0,
             origin_pts_ns: None,
+            pending_first_field: None,
         }
     }
 
@@ -199,7 +203,17 @@ impl Mpeg2Parser {
         // Decode the picture coding extension ONCE here and fold every per-picture
         // datum into one codec-agnostic `PictureInfo`; `nb_fields()`, `keyframe()`,
         // and `field_order()` all derive from it, so nothing re-parses the stream.
-        let (tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
+        let (mut tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
+        if frame_picture {
+            self.pending_first_field = None;
+        } else if let Some(first_top) = self.pending_first_field.take()
+            && first_top != tff
+        {
+            // Second field of a pair: report the first field's order.
+            tff = first_top;
+        } else {
+            self.pending_first_field = Some(tff);
+        }
         let info = PictureInfo::mpeg2(
             coding_type_from_raw(raw_coding_type),
             Mpeg2Coding {
@@ -489,6 +503,40 @@ mod tests {
         };
         assert_eq!(mk(0x01), Some(FieldOrder::Tff));
         assert_eq!(mk(0x02), Some(FieldOrder::Bff));
+    }
+
+    #[test]
+    fn field_pair_second_field_inherits_first_order() {
+        use crate::mux::codec::coding::FieldOrder;
+        let mut p = Mpeg2Parser::new();
+        let mut frames = Vec::new();
+        let mut fields = [(1u8, 0x01u8), (2, 0x02), (1, 0x01), (2, 0x02)].into_iter();
+        let mut first = true;
+        for (i, (ct, e2)) in fields.by_ref().enumerate() {
+            let mut au = Vec::new();
+            if first {
+                au.extend_from_slice(&make_seq_header(720, 576, 3, 3));
+                first = false;
+            }
+            au.extend_from_slice(&make_picture_header(ct));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            frames.extend(p.parse(&PesPacket {
+                source: None,
+                pid: 0x1011,
+                pts: None,
+                dts: None,
+                data: au,
+                discontinuity: false,
+            }));
+            let _ = i;
+        }
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 4);
+        for f in &frames {
+            assert_eq!(f.coding.unwrap().field_order(), Some(FieldOrder::Tff));
+        }
     }
 
     #[test]

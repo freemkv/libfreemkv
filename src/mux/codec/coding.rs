@@ -46,7 +46,8 @@ pub enum FieldOrder {
 /// NOT read these fields directly — they go through [`PictureInfo`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mpeg2Coding {
-    /// `top_field_first` (picture coding extension).
+    /// `top_field_first` (picture coding extension) for a frame picture; for a
+    /// field picture (§6.3.10 forces it 0) the pair's field order, set by the parser.
     pub top_field_first: bool,
     /// `repeat_first_field` (picture coding extension) — the 2:3 pulldown bit.
     pub repeat_first_field: bool,
@@ -163,7 +164,7 @@ impl PictureInfo {
 
     /// Field display order for this picture, or `None` when the codec could not
     /// determine it (signal absent / not yet wired). MPEG-2: derived from
-    /// `top_field_first` and the progressive flags (ISO/IEC 13818-2 §6.3.10) —
+    /// `top_field_first` (the pair's order for field pictures) and the progressive flags (ISO/IEC 13818-2 §6.3.10) —
     /// a progressive frame/sequence reports [`FieldOrder::Progressive`].
     pub fn field_order(&self) -> Option<FieldOrder> {
         match self.detail {

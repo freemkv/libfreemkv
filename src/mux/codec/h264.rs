@@ -273,14 +273,7 @@ impl CodecParser for H264Parser {
                         }
                     }
                     saw_vcl |= is_slice;
-                    // A NAL longer than u32::MAX can't be length-prefixed in the
-                    // 4-byte field; skip it rather than mis-frame the output.
-                    // Unreachable in practice (no real AU is >4 GiB).
-                    let Ok(len) = u32::try_from(nal.len()) else {
-                        continue;
-                    };
-                    frame_data.extend_from_slice(&len.to_be_bytes());
-                    frame_data.extend_from_slice(nal);
+                    push_length_prefixed(&mut frame_data, nal);
                 }
             }
         }
