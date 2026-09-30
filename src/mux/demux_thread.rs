@@ -404,7 +404,9 @@ mod tests {
         let (_dt, rx) =
             DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
         pf_tx.send(Ok(bdts_pes_packet(pid, &[0x01]))).unwrap();
-        pf_tx.send(Ok(bdts_pes_packet(pid, &[0x02]))).unwrap();
+        let mut second = bdts_pes_packet(pid, &[0x02]);
+        second[7] |= 1; // next CC: a same-CC packet is a duplicate
+        pf_tx.send(Ok(second)).unwrap();
         drop(pf_tx);
 
         let batches = collect_batches(&rx, Duration::from_secs(5));

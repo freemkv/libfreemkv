@@ -64,6 +64,9 @@ struct PesAssembler {
     /// HEVC/H264 that reads as a spurious start code / corrupt slice
     /// payload. Tracks how many header bytes remain across packets.
     header_remaining: usize,
+    /// Payload bytes since the PUSI while the PES header (fixed part or PTS/DTS) is still
+    /// incomplete: h222 lets it span packets. Empty otherwise.
+    head: Vec<u8>,
     /// 4-bit continuity_counter of the last payload-bearing TS packet seen
     /// on this PID. A non-PUSI continuation whose CC is not `(prev + 1) & 0xf`
     /// — or whose adaptation field flags a discontinuity — means one or more
@@ -71,6 +74,10 @@ struct PesAssembler {
     /// partial PES would inject corrupt bytes. The partial PES is dropped and
     /// the assembler resyncs on the next PUSI. `None` until the first packet.
     last_cc: Option<u8>,
+    /// PUSI bit and payload of that packet: a same-CC packet is a duplicate (h222 2.4.3.3)
+    /// only if it repeats them; otherwise it is new data after a gap (e.g. a clip join).
+    last_pusi: bool,
+    last_payload: Vec<u8>,
     /// Absolute source byte offset of the in-progress PES's first byte (the
     /// PUSI packet that began it), or `None` when no source base is threaded.
     /// Stamped at PES start, emitted on the completed packet — provenance is
@@ -110,7 +117,10 @@ impl PesAssembler {
             dts: None,
             active: false,
             header_remaining: 0,
+            head: Vec::new(),
             last_cc: None,
+            last_pusi: false,
+            last_payload: Vec::new(),
             pes_source: None,
             pending_discontinuity: false,
         }
@@ -164,16 +174,56 @@ impl PesAssembler {
                 self.header_remaining = 0;
                 // A dropped partial PES is a gap in the elementary stream — flag
                 // it so the NEXT completed PES carries a discontinuity, matching
-                // every other partial-drop path in this file (lines 395/479/504).
+                // every other partial-drop path in this file (`drop_partial`).
                 self.pending_discontinuity = true;
                 return;
+            }
+            // Grow by doubling but never past `cap`, so the allocation honours the share too.
+            let need = self.buffer.len() + data.len();
+            if need > self.buffer.capacity() {
+                let target = need.max(self.buffer.capacity() * 2).min(self.cap);
+                self.buffer.reserve_exact(target - self.buffer.len());
             }
             self.buffer.extend_from_slice(data);
         }
     }
 
+    // Drop the open PES (its data has a hole) and flag the next one; resyncs on the next PUSI.
+    fn drop_partial(&mut self) {
+        self.buffer.clear();
+        self.active = false;
+        self.header_remaining = 0;
+        self.head.clear();
+        self.pending_discontinuity = true;
+    }
+
+    // Take PUSI payload bytes into the PES header; once it and its PTS/DTS are complete, set
+    // the timestamps and pass the rest on as ES. A payload that is not a PES start opens no
+    // PES (its continuations would form a headless frame) and flags the loss.
+    fn take_head(&mut self, bytes: &[u8]) {
+        self.head.extend_from_slice(bytes);
+        let Some((pts, dts, header_len)) = pes_header_complete(&self.head) else {
+            return;
+        };
+        let head = std::mem::take(&mut self.head);
+        if header_len == 0 {
+            self.drop_partial();
+        } else {
+            self.pts = pts;
+            self.dts = dts;
+            if header_len < head.len() {
+                self.push(&head[header_len..]);
+            } else {
+                self.header_remaining = header_len - head.len();
+            }
+        }
+        self.head = head;
+        self.head.clear();
+    }
+
     /// Flush remaining data as a PES packet.
     fn flush(&mut self) -> Option<PesPacket> {
+        self.head.clear();
         if self.active && !self.buffer.is_empty() {
             self.active = false;
             let discontinuity = self.pending_discontinuity;
@@ -205,6 +255,8 @@ pub struct TsDemuxer {
     /// True once a caller has threaded a source base via [`Self::feed_at`]. Until
     /// then no `SourcePos` is stamped (keeps existing callers byte-identical).
     has_base: bool,
+    /// Set once sync loss has been logged, so a damaged input warns only once.
+    sync_lost_logged: bool,
 }
 
 impl TsDemuxer {
@@ -237,6 +289,7 @@ impl TsDemuxer {
             remainder: Vec::new(),
             feed_base: 0,
             has_base: false,
+            sync_lost_logged: false,
         }
     }
 
@@ -308,6 +361,12 @@ impl TsDemuxer {
 
         // Aligned-packets fast path — reads directly out of `data`.
         while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
+            if data[offset + 4] != SYNC_BYTE {
+                // No sync byte: a zero-filled gap or a byte slip. Packets lost in a slip
+                // surface as CC gaps on their PIDs.
+                offset = self.resync(data, offset);
+                continue;
+            }
             let packet = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
             let src = self.pkt_source(offset);
             offset += BD_SOURCE_PACKET_BYTES;
@@ -331,6 +390,30 @@ impl TsDemuxer {
         }
 
         completed
+    }
+
+    // Next packet start after the unsynced `offset`: the next grid slot if it has a sync byte,
+    // else the first grid slot with one or an off-grid point confirmed 192 bytes on (a slip).
+    // With neither, the last grid slot, so alignment carries over.
+    fn resync(&mut self, data: &[u8], offset: usize) -> usize {
+        let step = BD_SOURCE_PACKET_BYTES;
+        if data.get(offset + step + 4) == Some(&SYNC_BYTE) {
+            return offset + step;
+        }
+        for p in offset + 1..data.len().saturating_sub(4) {
+            if (p - offset).is_multiple_of(step) {
+                if data[p + 4] == SYNC_BYTE {
+                    return p;
+                }
+            } else if data[p + 4] == SYNC_BYTE && data.get(p + step + 4) == Some(&SYNC_BYTE) {
+                if !self.sync_lost_logged {
+                    self.sync_lost_logged = true;
+                    tracing::warn!(target: "mux", offset = p, "bd-ts: packet sync slipped; resynced");
+                }
+                return p;
+            }
+        }
+        offset + (data.len() - offset) / step * step
     }
 
     // Demux a single 192-byte BD-TS packet (4-byte TP_extra_header + 188-byte
@@ -364,10 +447,7 @@ impl TsDemuxer {
                 // A concealed unit may have dropped packets from any open PES, leaving a
                 // hole mid-access-unit. Drop it like a mid-PES continuity break and flag
                 // pending so the next completed PES resyncs (mirrors the non-PUSI cc_gap path).
-                a.buffer.clear();
-                a.active = false;
-                a.header_remaining = 0;
-                a.pending_discontinuity = true;
+                a.drop_partial();
             }
             return;
         }
@@ -378,6 +458,12 @@ impl TsDemuxer {
             -1
         };
         if idx < 0 {
+            return;
+        }
+        // transport_error_indicator: the packet is damaged, so its payload and CC are not
+        // trusted. Drop the open PES like a continuity break; the next PUSI resyncs.
+        if ts[1] & 0x80 != 0 {
+            self.assemblers[idx as usize].drop_partial();
             return;
         }
         // adaptation_field_control == 0b00 is reserved (ISO 13818-1) and
@@ -416,41 +502,35 @@ impl TsDemuxer {
         // adaptation == 0x02 (AF only) already returned above, so only 0x03
         // (AF + payload) can carry an adaptation field here.
         let discontinuity_flag = adaptation == 0x03 && ts[4] > 0 && (ts[5] & 0x80) != 0;
-        let cc_gap = cc_is_gap(asm.last_cc, cc);
+        // A duplicate repeats the previous packet (same CC and payload; the adaptation field,
+        // e.g. PCR, may differ): nothing new. A same-CC packet with other data is a gap.
+        let same_cc = asm.last_cc == Some(cc) && !discontinuity_flag;
+        if same_cc && asm.last_pusi == pusi && asm.last_payload == payload {
+            return;
+        }
+        let cc_gap = same_cc || cc_is_gap(asm.last_cc, cc);
         asm.last_cc = Some(cc);
+        asm.last_pusi = pusi;
+        asm.last_payload.clear();
+        asm.last_payload.extend_from_slice(payload);
         // A gap means packets for this PID were lost. Sticky flag rides to the first
         // post-gap PES so the codec consumer drops forward to the next keyframe (B1).
         let gap = discontinuity_flag || cc_gap;
 
         if pusi {
-            // `header_len` is the FULL (uncapped) PES-header length:
-            // 0 = malformed (payload is not a PES start), else 6/9+N.
-            let (pts, dts, header_len) = parse_pes_header(payload);
-            // Flush the previous PES first — a gap on this PUSI packet belongs to
-            // the PES starting now, not the one completing. Set `pending_discontinuity`
-            // after start(), else it wrongly stamps the pre-gap frame instead.
-            if let Some(prev) = asm.start(pts, dts, source) {
+            // Flush the previous PES first — a gap on this PUSI packet belongs to the PES
+            // starting now (as does a lost PES whose header never completed). Set
+            // `pending_discontinuity` after start(), else it stamps the pre-gap frame.
+            let lost_head = !asm.head.is_empty();
+            if let Some(prev) = asm.start(None, None, source) {
                 completed.push(prev);
             }
-            if gap {
+            if gap || lost_head {
                 asm.pending_discontinuity = true;
             }
-            if header_len == 0 {
-                // PUSI packet whose payload is not a valid PES start. Do
-                // NOT push it — those bytes are not elementary-stream data
-                // and would inject a spurious start code / garbage.
-                asm.header_remaining = 0;
-            } else if header_len <= payload.len() {
-                // Header fits in this packet (the common case).
-                asm.header_remaining = 0;
-                if header_len < payload.len() {
-                    asm.push(&payload[header_len..]);
-                }
-            } else {
-                // Header spills past this packet — skip the remainder on
-                // the following continuation packet(s).
-                asm.header_remaining = header_len - payload.len();
-            }
+            asm.head.clear();
+            asm.header_remaining = 0;
+            asm.take_head(payload);
         } else {
             // Non-PUSI continuation.
             if gap {
@@ -463,13 +543,14 @@ impl TsDemuxer {
                         pid = asm.pid,
                         "TS continuity break on non-PUSI continuation; dropping partial PES",
                     );
-                    asm.buffer.clear();
-                    asm.active = false;
-                    asm.header_remaining = 0;
+                    asm.drop_partial();
                     return;
                 }
             }
-            if asm.header_remaining > 0 {
+            if !asm.head.is_empty() {
+                // The PES header is still arriving.
+                asm.take_head(payload);
+            } else if asm.header_remaining > 0 {
                 // Continuation packet still inside a PES header that spanned
                 // the boundary — consume header bytes before any ES data.
                 let skip = asm.header_remaining.min(payload.len());
@@ -495,6 +576,32 @@ impl TsDemuxer {
     }
 }
 
+// Stream ids whose PES has no header extension (ISO 13818-1 Table 2-22: program_stream_map,
+// padding, private_stream_2, ECM, EMM, DSMCC, H.222.1 type E, program_stream_directory).
+fn no_pes_extension(stream_id: u8) -> bool {
+    matches!(
+        stream_id,
+        0xBC | 0xBE | 0xBF | 0xF0 | 0xF1 | 0xF2 | 0xF8 | 0xFF
+    )
+}
+
+// `parse_pes_header` of `data` once it holds the fixed header and any flagged PTS/DTS;
+// `None` while more bytes are needed (and what arrived still matches a start code).
+fn pes_header_complete(data: &[u8]) -> Option<(Option<i64>, Option<i64>, usize)> {
+    let need = match data {
+        [_, _, _, id, _, _, _, flags, hdl, ..] if !no_pes_extension(*id) => {
+            let (f, hdl) = (flags >> 6, *hdl as usize);
+            9 + if f >= 2 && hdl >= 5 { 5 } else { 0 } + if f == 3 && hdl >= 10 { 5 } else { 0 }
+        }
+        _ => 9,
+    };
+    let prefix = data.len().min(3);
+    if data.len() < need && data[..prefix] == [0, 0, 1][..prefix] {
+        return None;
+    }
+    Some(parse_pes_header(data))
+}
+
 // Parse a PES header, extracting PTS/DTS. Returns `(pts, dts, header_len)` where
 // `header_len` is the FULL uncapped header length (9 + data_length, or 6 without
 // the extension; 0 = not a valid PES start) — caller skips it, carrying remainder.
@@ -506,18 +613,7 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
 
     let stream_id = data[3];
 
-    // Some stream IDs don't carry the standard PES header extension
-    // (ISO 13818-1 Table 2-22: program_stream_map, padding, private_stream_2,
-    // ECM, EMM, DSMCC_stream 0xF2, H.222.1 type E 0xF8, program_stream_directory).
-    if stream_id == 0xBC
-        || stream_id == 0xBE
-        || stream_id == 0xBF
-        || stream_id == 0xF0
-        || stream_id == 0xF1
-        || stream_id == 0xF2
-        || stream_id == 0xF8
-        || stream_id == 0xFF
-    {
+    if no_pes_extension(stream_id) {
         return (None, None, 6);
     }
 
@@ -526,9 +622,8 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
     // this function and nothing shrinks `data` since, so no re-check here.
     let pts_dts_flags = (data[7] >> 6) & 0x03;
     let header_data_len = data[8] as usize;
-    // Full, uncapped header length. PTS/DTS (if present) live in the
-    // first ~19 bytes, always within this packet's payload, so they parse
-    // here; only the *skip* length may extend into the next packet.
+    // Full, uncapped header length. `pes_header_complete` gathers the first 19 bytes (PTS/DTS)
+    // before parsing; only the *skip* length may extend into later packets.
     let header_len = 9 + header_data_len;
 
     let mut pts = None;
@@ -611,9 +706,10 @@ fn ts_payload_base(pkt: &[u8]) -> Option<usize> {
     }
 }
 
-// MPEG audio layer (1-3) from the first frame header at the start of `pid`'s
-// first PES in `data`; `None` when no such PES or header is in the scan window.
-fn mpeg_audio_layer(data: &[u8], pid: u16) -> Option<u8> {
+// Per PID, the MPEG audio layer (1-3) from the frame header at the start of its first PES
+// in `data` (`None` when that PES has no such header), found in one walk over `data`.
+fn mpeg_audio_layers(data: &[u8]) -> std::collections::HashMap<u16, Option<u8>> {
+    let mut layers = std::collections::HashMap::new();
     let mut offset = 0;
     while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
         if !is_resync_point(data, offset) {
@@ -622,30 +718,39 @@ fn mpeg_audio_layer(data: &[u8], pid: u16) -> Option<u8> {
         }
         let pkt = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
         let pkt_pid = (((pkt[5] & 0x1F) as u16) << 8) | pkt[6] as u16;
-        if pkt_pid == pid && pkt[5] & 0x40 != 0 {
-            let pes = &pkt[ts_payload_base(pkt)?..];
-            if pes.get(..3)? != [0, 0, 1] {
-                return None;
-            }
-            let es = pes.get(9 + *pes.get(8)? as usize..)?;
-            let (b0, b1) = (*es.first()?, *es.get(1)?);
-            if b0 != 0xFF || b1 & 0xE0 != 0xE0 {
-                return None;
-            }
-            return match (b1 >> 1) & 0x03 {
-                0 => None,
-                l => Some(4 - l),
-            };
+        if pkt[5] & 0x40 != 0 {
+            layers
+                .entry(pkt_pid)
+                .or_insert_with(|| first_pes_layer(pkt));
         }
         offset += BD_SOURCE_PACKET_BYTES;
     }
-    None
+    layers
+}
+
+// MPEG audio layer of the frame header opening the PES that starts in `pkt`.
+fn first_pes_layer(pkt: &[u8]) -> Option<u8> {
+    let pes = &pkt[ts_payload_base(pkt)?..];
+    if pes.get(..3)? != [0, 0, 1] {
+        return None;
+    }
+    let es = pes.get(9 + *pes.get(8)? as usize..)?;
+    let (b0, b1) = (*es.first()?, *es.get(1)?);
+    if b0 != 0xFF || b1 & 0xE0 != 0xE0 {
+        return None;
+    }
+    match (b1 >> 1) & 0x03 {
+        0 => None,
+        l => Some(4 - l),
+    }
 }
 
 // Reassemble a single PSI section (PAT/PMT) for `target_pid`/`table_id` across TS-packet
 // boundaries. Returns the section bytes (from table_id) or None.
 fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec<u8>> {
     let mut offset = 0;
+    // First complete copy, used only if no copy passes `psi_section_ok`.
+    let mut fallback = None;
     while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
         if !is_resync_point(data, offset) {
             offset += 1;
@@ -679,7 +784,12 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             section.extend_from_slice(&payload[sec_start..]);
             if section.len() >= total {
                 section.truncate(total);
-                return Some(section);
+                if psi_section_ok(&section) {
+                    return Some(section);
+                }
+                fallback.get_or_insert(section);
+                offset += BD_SOURCE_PACKET_BYTES;
+                continue;
             }
             // Need continuation packets: same PID, no PUSI. Use the canonical `cc_is_gap`
             // (§2.4.3.3) shared with `process_packet`, not a local test — a prior local
@@ -729,14 +839,25 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             }
             if section.len() >= total {
                 section.truncate(total);
-                return Some(section);
+                if psi_section_ok(&section) {
+                    return Some(section);
+                }
+                fallback.get_or_insert(section);
+                offset += BD_SOURCE_PACKET_BYTES;
+                continue;
             }
             // Incomplete section (truncated input) — stop looking.
-            return None;
+            return fallback;
         }
         offset += BD_SOURCE_PACKET_BYTES;
     }
-    None
+    fallback
+}
+
+// A long-form PSI section that is current (current_next_indicator 1) and passes its
+// CRC_32 (H.222.0 Annex A: over the whole section including the CRC, the register ends at 0).
+fn psi_section_ok(section: &[u8]) -> bool {
+    section.len() >= 12 && section[5] & 0x01 == 1 && super::mpg::pack::crc32(section) == 0
 }
 
 /// Scan BD-TS data for streams by parsing PAT and PMT tables.
@@ -788,6 +909,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
         let prog_info_len =
             ((((pmt[10] & 0x0F) as usize) << 8) | pmt[11] as usize).min(end.saturating_sub(12));
         let mut pos = 12 + prog_info_len;
+        let mut layers = None;
 
         while pos + 5 <= end {
             let stream_type = pmt[pos];
@@ -798,7 +920,14 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
             // absent from Blu-ray's STN table. Keep that distinction local to TS.
             let codec = match stream_type {
                 // MPEG-1/2 audio covers Layers I-III; only the ES says which.
-                0x03 | 0x04 if mpeg_audio_layer(data, es_pid) == Some(3) => Codec::Mp3,
+                0x03 | 0x04
+                    if layers
+                        .get_or_insert_with(|| mpeg_audio_layers(data))
+                        .get(&es_pid)
+                        == Some(&Some(3)) =>
+                {
+                    Codec::Mp3
+                }
                 0x03 | 0x04 => Codec::Mp2,
                 0x0f => Codec::Aac,
                 0x87 => Codec::Ac3Plus,
@@ -971,6 +1100,156 @@ mod tests {
         let mut v = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
         v.extend_from_slice(es);
         v
+    }
+
+    // A duplicate packet (same CC, h222 2.4.3.3) carries no new data: neither a repeated
+    // continuation nor a repeated PUSI may change the PES.
+    #[test]
+    fn duplicate_packets_are_ignored() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let start = ts_payload_packet(pid, true, 0, &pes_start(&[b'A'; 175]));
+        let cont = ts_payload_packet(pid, false, 1, &[b'B'; 184]);
+        let mut out = Vec::new();
+        for p in [&start, &start, &cont, &cont] {
+            out.extend(demux.feed(p));
+        }
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "one PES");
+        let mut want = vec![b'A'; 175];
+        want.extend_from_slice(&[b'B'; 184]);
+        assert_eq!(out[0].data, want);
+        assert!(!out[0].discontinuity);
+    }
+
+    // h222 lets a PES header span packets: a PUSI payload too short for the fixed header or
+    // its PTS/DTS is completed by the continuation, and the timestamps are kept.
+    #[test]
+    fn pes_header_split_across_packets_keeps_its_timestamps() {
+        let pid = 0x1011;
+        // PTS 0x1_2345_6789 and DTS 0x1_2345_0000 ('11' flags, header_data_length 10).
+        let mut hdr = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0xC0, 0x0A];
+        hdr.extend_from_slice(&[0x39, 0x8D, 0x15, 0xCF, 0x13]);
+        hdr.extend_from_slice(&[0x19, 0x8D, 0x15, 0x00, 0x01]);
+        for split in [4, 11, 16] {
+            let mut demux = TsDemuxer::new(&[pid]);
+            let mut rest = hdr[split..].to_vec();
+            rest.extend_from_slice(b"ES");
+            let mut out = demux.feed(&es_packet_exact(pid, true, &hdr[..split]));
+            out.extend(demux.feed(&es_packet_exact(pid, false, &rest)));
+            out.extend(demux.flush());
+            assert_eq!(out.len(), 1, "split {split}");
+            assert_eq!(out[0].data, b"ES", "split {split}");
+            assert_eq!(out[0].pts, Some(0x1_2345_6789), "split {split}");
+            assert_eq!(out[0].dts, Some(0x1_2345_0000), "split {split}");
+        }
+    }
+
+    // A byte slip mid-stream loses only the packets it hits: the demuxer resyncs.
+    #[test]
+    fn byte_slip_resyncs_to_the_next_packet_boundary() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut data = ts_payload_packet(pid, true, 0, &pes_start(b"AAAA"));
+        data.push(0x00);
+        data.extend(ts_payload_packet(pid, false, 1, b"BBBB"));
+        data.extend(ts_payload_packet(pid, true, 2, &pes_start(b"CCCC")));
+        let mut out = demux.feed(&data);
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].data.starts_with(b"AAAA"));
+        assert!(out[0].data[175..].starts_with(b"BBBB"), "continuation kept");
+        assert!(out[1].data.starts_with(b"CCCC"));
+    }
+
+    // A lone damaged sync byte keeps the grid even when stray 0x47 bytes 192 apart would
+    // pass for an off-grid packet boundary.
+    #[test]
+    fn resync_prefers_the_next_grid_slot_over_an_off_grid_pair() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut bad = ts_payload_packet(pid, false, 1, &[0xAA; 184]);
+        bad[4] = 0x00;
+        bad[50] = SYNC_BYTE;
+        let mut b = ts_payload_packet(pid, true, 2, &pes_start(&[0xBB; 60]));
+        b[50] = SYNC_BYTE;
+        let mut data = ts_payload_packet(pid, true, 0, &pes_start(b"AAAA"));
+        data.extend(bad);
+        data.extend(b);
+        let mut out = demux.feed(&data);
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[1].data.starts_with(&[0xBB; 30]));
+    }
+
+    // Zero-filled gaps (unreadable sectors) keep the packet grid: a lone packet after one
+    // is still read, without a second packet to corroborate it.
+    #[test]
+    fn lone_packets_between_zero_filled_gaps_are_kept() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut data = vec![0u8; 5 * BD_SOURCE_PACKET_BYTES];
+        data.extend(ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        data.extend(vec![0u8; 3 * BD_SOURCE_PACKET_BYTES]);
+        data.extend(ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")));
+        data.extend(vec![0u8; 2 * BD_SOURCE_PACKET_BYTES]);
+        let mut out = demux.feed(&data);
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[1].data.starts_with(b"BBBB"));
+    }
+
+    // A packet flagged transport_error_indicator is damaged: its PES is dropped, not
+    // spliced, and the next PES is flagged.
+    #[test]
+    fn transport_error_packet_drops_its_pes() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut bad = ts_payload_packet(pid, false, 1, b"XXXX");
+        bad[5] |= 0x80;
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        out.extend(demux.feed(&bad));
+        out.extend(demux.feed(&ts_payload_packet(pid, true, 2, &pes_start(b"CCCC"))));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "A is dropped: {out:?}");
+        assert!(out[0].data.starts_with(b"CCCC"));
+        assert!(out[0].discontinuity);
+    }
+
+    // Clips joined through one demuxer restart the CC arbitrarily: a new clip's PUSI with
+    // the previous packet's CC is new data, not a duplicate, and must start its own PES.
+    #[test]
+    fn same_cc_packet_with_new_data_is_not_a_duplicate() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = Vec::new();
+        for p in [
+            ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")),
+            ts_payload_packet(pid, false, 1, &[b'a'; 184]),
+            ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")),
+            ts_payload_packet(pid, false, 2, &[b'b'; 184]),
+        ] {
+            out.extend(demux.feed(&p));
+        }
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].data.starts_with(b"AAAA") && out[0].data.ends_with(&[b'a'; 184]));
+        assert!(out[1].data.starts_with(b"BBBB") && out[1].data.ends_with(&[b'b'; 184]));
+    }
+
+    // A PUSI whose payload is not a PES start leaves no PES open: the continuations after it
+    // are not emitted as a headless frame, and the next PES is flagged.
+    #[test]
+    fn pusi_without_a_pes_header_opens_no_pes() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 0, &[0xAB; 184]));
+        out.extend(demux.feed(&ts_payload_packet(pid, false, 1, &[0xCD; 184])));
+        out.extend(demux.feed(&ts_payload_packet(pid, true, 2, &pes_start(b"NEXT"))));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "only the valid PES: {out:?}");
+        assert!(out[0].data.starts_with(b"NEXT"));
+        assert!(out[0].discontinuity, "the dropped unit is a gap");
     }
 
     // Regression: a non-PUSI continuation with a CC gap means packets were
@@ -1228,6 +1507,19 @@ mod tests {
 
     // ── scan_streams PMT parsing ──────────────────────────────────────────
 
+    // Next continuity_counter for `pid` in this test thread, so fixture packets form a
+    // well-formed per-PID sequence (a repeated CC is a duplicate packet).
+    fn next_cc(pid: u16) -> u8 {
+        thread_local!(static CC: std::cell::RefCell<std::collections::HashMap<u16, u8>> =
+            Default::default());
+        CC.with(|m| {
+            let mut m = m.borrow_mut();
+            let c = m.entry(pid).or_insert(0x0F);
+            *c = (*c + 1) & 0x0F;
+            *c
+        })
+    }
+
     /// Wrap a 188-byte TS packet body in a 192-byte BD-TS packet
     /// (4-byte timecode prefix the scanner skips).
     fn bdts_packet(body: [u8; 184], pid: u16, pusi: bool) -> Vec<u8> {
@@ -1239,7 +1531,7 @@ mod tests {
             pkt[5] |= 0x40;
         }
         pkt[6] = (pid & 0xFF) as u8;
-        pkt[7] = 0x10; // payload only, no adaptation field
+        pkt[7] = 0x10 | next_cc(pid); // payload only, no adaptation field
         pkt[8..8 + 184].copy_from_slice(&body);
         pkt
     }
@@ -1266,7 +1558,7 @@ mod tests {
         body[i + 9] = 0x01;
         body[i + 10] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
         body[i + 11] = (pmt_pid & 0xFF) as u8;
-        // (CRC bytes left as 0xFF — scanner doesn't validate CRC)
+        // (CRC left as 0xFF: with no valid copy the scanner uses the first one)
         let _ = &mut i;
         bdts_packet(body, 0, true)
     }
@@ -1314,7 +1606,7 @@ mod tests {
             pkt[5] |= 0x40;
         }
         pkt[6] = (pid & 0xFF) as u8;
-        pkt[7] = 0x10; // payload only, no adaptation field
+        pkt[7] = 0x10 | next_cc(pid); // payload only, no adaptation field
         let room = TS_PACKET_BYTES - 4; // 184 ES bytes after the 4-byte TS header
         let n = payload.len().min(room);
         pkt[8..8 + n].copy_from_slice(&payload[..n]);
@@ -1386,30 +1678,11 @@ mod tests {
             "garbage PUSI packet must not complete a PES on its own"
         );
 
-        // Continuation packet (no PUSI) carrying real ES bytes.
-        let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        stream.extend(demux.feed(&data_packet(pid, false, &es)));
+        // A continuation after it belongs to no PES (headless): nothing is emitted, so
+        // none of the garbage (0xAA, the embedded 00 00 01) can reach the ES.
+        stream.extend(demux.feed(&data_packet(pid, false, &[0xDE, 0xAD, 0xBE, 0xEF])));
         stream.extend(demux.flush());
-
-        assert_eq!(stream.len(), 1, "one PES assembled from the continuation");
-        let pes = &stream[0];
-        // The continuation ES bytes survive…
-        assert!(
-            pes.data.windows(es.len()).any(|w| w == es),
-            "continuation ES bytes present, got {:02X?}",
-            pes.data
-        );
-        // …but none of the garbage PUSI payload leaked in. In particular the
-        // 0xAA filler and the embedded 00 00 01 sequence must be absent — the
-        // malformed PES header contributed ZERO bytes to the elementary stream.
-        assert!(
-            !pes.data.contains(&0xAA),
-            "garbage PES-header bytes must not appear in the elementary stream"
-        );
-        assert!(
-            !pes.data.windows(3).any(|w| w == [0x00, 0x00, 0x01]),
-            "no injected start code leaked from the malformed PES header"
-        );
+        assert!(stream.is_empty(), "no PES without a PES header: {stream:?}");
     }
 
     #[test]
@@ -1430,6 +1703,51 @@ mod tests {
                 .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
             "H.264 video must be found past the adaptation field"
         );
+    }
+
+    // Many MPEG-audio PMT entries over a sync-free head: one walk, each PID keeps its layer.
+    #[test]
+    fn scan_streams_labels_many_mpeg_audio_pids_in_one_walk() {
+        use crate::disc::{Codec, Stream};
+        let mut entries = vec![(0x1b, 0x1011)];
+        entries.extend((0..60u16).map(|i| (0x03, 0x1100 + i)));
+        let mut data = pat_packet(0x100);
+        data.extend(pmt_two_packets(0x100, &entries));
+        for (pid, b1) in [(0x1100, 0xFB), (0x1101, 0xFD)] {
+            let mut pes = vec![0x00, 0x00, 0x01, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00];
+            pes.extend_from_slice(&[0xFF, b1, 0x90, 0x64]);
+            data.extend(es_packet_exact(pid, true, &pes));
+        }
+        data.resize(data.len() + (1 << 20), 0);
+        let streams = scan_streams(&data).unwrap();
+        assert!(matches!(&streams[1], Stream::Audio(a) if a.codec == Codec::Mp3));
+        assert!(matches!(&streams[2], Stream::Audio(a) if a.codec == Codec::Mp2));
+    }
+
+    // Give a single-packet PSI fixture (pointer_field 0) its real CRC_32.
+    fn with_psi_crc(mut pkt: Vec<u8>) -> Vec<u8> {
+        let total = 3 + ((((pkt[10] & 0x0F) as usize) << 8) | pkt[11] as usize);
+        let crc = crate::mux::mpg::pack::crc32(&pkt[9..9 + total - 4]);
+        pkt[9 + total - 4..9 + total].copy_from_slice(&crc.to_be_bytes());
+        pkt
+    }
+
+    // A PMT copy failing its CRC_32 (or not current) is skipped for a later valid copy.
+    #[test]
+    fn scan_streams_prefers_a_crc_valid_current_pmt() {
+        use crate::disc::{Codec, Stream};
+        let good = [(0x1b, 0x1011), (0x81, 0x1100)];
+        let mut flipped = with_psi_crc(pmt_packet(0x100, &good));
+        flipped[9 + 12 + 5] = 0x87; // second entry's stream_type, after the CRC was set
+        let mut next = with_psi_crc(pmt_packet(0x100, &[(0x1b, 0x1011), (0x87, 0x1100)]));
+        next[9 + 5] &= !0x01; // current_next_indicator 0: not yet applicable
+        let next = with_psi_crc(next);
+        let mut data = with_psi_crc(pat_packet(0x100));
+        for p in [flipped, next, with_psi_crc(pmt_packet(0x100, &good))] {
+            data.extend(p);
+        }
+        let streams = scan_streams(&data).unwrap();
+        assert!(matches!(&streams[1], Stream::Audio(a) if a.codec == Codec::Ac3));
     }
 
     #[test]
@@ -1668,7 +1986,7 @@ mod tests {
     }
 
     // A duplicate TS packet (same CC, identical payload) is explicitly legal;
-    // `process_packet` already tolerates it. The PSI reassembler must too:
+    // `process_packet` skips it. The PSI reassembler must too:
     // treat it as a duplicate (not appended twice), not as a desync.
     #[test]
     fn scan_streams_tolerates_duplicate_pmt_continuation_packet() {
@@ -1765,6 +2083,7 @@ mod tests {
             let payload_off = 8 + pad;
             pkt[payload_off..payload_off + payload.len()].copy_from_slice(payload);
         }
+        pkt[7] |= next_cc(pid);
         pkt
     }
 
@@ -2381,10 +2700,9 @@ mod tests {
         pes_start.extend_from_slice(&[0xAB; 10]);
         demux.feed(&es_packet_exact(pid, true, &pes_start));
         let payload = [0xCCu8; 184];
-        let cont_pkt = data_packet(pid, false, &payload);
         let mut high_water = 0usize;
         for _ in 0..(expected_share / 184 + 64) {
-            demux.feed(&cont_pkt);
+            demux.feed(&data_packet(pid, false, &payload));
             let idx = demux.pid_index[pid as usize] as usize;
             high_water = high_water.max(demux.assemblers[idx].buffer.len());
         }
@@ -2397,6 +2715,27 @@ mod tests {
             high_water > expected_share / 2,
             "sanity: the flood must actually have filled the share, got {high_water}"
         );
+    }
+
+    // The buffer's allocation, not just its length, stays within the PID's share: doubling
+    // past a non-power-of-two cap would overshoot the aggregate ceiling.
+    #[test]
+    fn pes_buffer_capacity_stays_within_the_pid_share() {
+        let pids: Vec<u16> = (0..48).map(|i| 0x1100 + i).collect();
+        let mut demux = TsDemuxer::new(&pids);
+        let pid = pids[0];
+        let cap = demux.assemblers[0].cap;
+        assert!(!cap.is_power_of_two());
+        demux.feed(&es_packet_exact(pid, true, &pes_start(&[])));
+        for _ in 0..cap / 184 {
+            demux.feed(&data_packet(pid, false, &[0xCC; 184]));
+            let a = &demux.assemblers[0];
+            assert!(
+                a.buffer.capacity() <= cap,
+                "{} > {cap}",
+                a.buffer.capacity()
+            );
+        }
     }
 
     #[test]
@@ -2415,11 +2754,10 @@ mod tests {
         // Continuation packets with 184-byte payloads, no PUSI.  Each call to
         // feed() processes one 192-byte BD-TS packet.
         let payload = [0xCCu8; 184];
-        let cont_pkt = data_packet(pid, false, &payload);
         let packets_needed = MAX_PES_BUFFER / 184 + 2;
         let mut mid_out: Vec<PesPacket> = Vec::new();
         for _ in 0..packets_needed {
-            mid_out.extend(demux.feed(&cont_pkt));
+            mid_out.extend(demux.feed(&data_packet(pid, false, &payload)));
             // Verify the internal buffer is bounded: no assembler may hold
             // more than MAX_PES_BUFFER bytes at any point.
             for asm in &demux.assemblers {

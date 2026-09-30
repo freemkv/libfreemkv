@@ -19,14 +19,14 @@ use crate::consts::TS_PAYLOAD_BYTES;
 /// PID range treated as video (HEVC, triggers Annex-B conversion + RAI
 /// on keyframes). Both `write_frame` and `build_pes_header` consult this
 /// so a PID's stream_id and its NAL handling can never disagree.
-const VIDEO_PID_RANGE: std::ops::RangeInclusive<u16> = 0x1011..=0x101F;
+pub(crate) const VIDEO_PID_RANGE: std::ops::RangeInclusive<u16> = 0x1011..=0x101F;
 
 // Largest PES payload that fits a bounded `PES_packet_length` (u16) on a
 // `0xBD` stream after the 8 PES-header bytes. Frames larger than this split
 // into multiple PES (unbounded `0` length is video-only).
 const MAX_BD_PES_PAYLOAD: usize = u16::MAX as usize - 8;
 
-fn is_video_pid(pid: u16) -> bool {
+pub(crate) fn is_video_pid(pid: u16) -> bool {
     VIDEO_PID_RANGE.contains(&pid)
 }
 
@@ -807,6 +807,8 @@ mod tests {
             // IDR: should carry codec_private NALs prepended.
             let idr = fake_hevc_nal(19, 50);
             mux.write_frame(0, 41_000_000, true, &idr).unwrap();
+            // A later IDR: the parameter sets are not prepended again.
+            mux.write_frame(0, 82_000_000, true, &idr).unwrap();
             mux.finish().unwrap();
         }
         let packets = parse_bd_ts(&sink);
@@ -830,6 +832,12 @@ mod tests {
         assert!(
             pos_marker < pos_idr,
             "codec_private must precede IDR in TS payload"
+        );
+        let markers = video_bytes.windows(marker.len()).filter(|w| *w == marker);
+        assert_eq!(
+            markers.count(),
+            1,
+            "codec_private only before the first IDR"
         );
     }
 
@@ -1084,6 +1092,34 @@ mod tests {
 
     /// The default (`video_codec` = HEVC) still converts, so the test above is
     /// pinning the flag rather than a no-op. Same input, opposite expectation.
+    // An avcC declaring 2-octet NAL lengths (lengthSizeMinusOne 1) must be converted with
+    // 2-octet prefixes, not the 4-octet default.
+    #[test]
+    fn avcc_nal_length_size_drives_the_annex_b_conversion() {
+        let (a, b): (&[u8], &[u8]) = (&[0x65, 0x88, 0x84, 0x21, 0x43], &[0x06, 0x05, 0x01]);
+        let mut es = Vec::new();
+        for nal in [a, b] {
+            es.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            es.extend_from_slice(nal);
+        }
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            mux.set_video_codec(0, crate::disc::Codec::H264).unwrap();
+            // avcC header only: lengthSizeMinusOne = 1, no SPS/PPS.
+            mux.set_codec_private(0, vec![1, 0x42, 0xC0, 0x1E, 0xFD, 0xE0, 0])
+                .unwrap();
+            mux.write_frame(0, 0, true, &es).unwrap();
+            mux.finish().unwrap();
+        }
+        let out = reassemble_es(&parse_bd_ts(&sink), VIDEO_PID);
+        let mut want = vec![0, 0, 0, 1];
+        want.extend_from_slice(a);
+        want.extend_from_slice(&[0, 0, 0, 1]);
+        want.extend_from_slice(b);
+        assert_eq!(out, want);
+    }
+
     #[test]
     fn nal_video_es_is_converted_to_annex_b_by_default() {
         let es: Vec<u8> = vec![0x00, 0x00, 0x00, 0x06, 0xB3, 0x12, 0x34, 0x56, 0x78, 0x9A];
@@ -1434,7 +1470,27 @@ mod tests {
     /// mutated definition would still pass those assertions.
     #[test]
     fn max_bd_pes_payload_has_the_documented_value() {
-        assert_eq!(MAX_BD_PES_PAYLOAD, u16::MAX as usize - 8);
+        assert_eq!(MAX_BD_PES_PAYLOAD, 65_527);
+    }
+
+    // A private_stream_1 frame of exactly the limit fills one PES to PES_packet_length
+    // 0xFFFF; one byte more splits into two.
+    #[test]
+    fn bd_audio_split_boundary_is_exact() {
+        for (len, pes) in [(65_527usize, 1usize), (65_528, 2)] {
+            let mut sink: Vec<u8> = Vec::new();
+            {
+                let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+                mux.write_frame(0, 0, false, &vec![0x5A; len]).unwrap();
+                mux.finish().unwrap();
+            }
+            let packets = parse_bd_ts(&sink);
+            let starts: Vec<&TsPacket> = packets.iter().filter(|p| p.pusi).collect();
+            assert_eq!(starts.len(), pes, "{len} bytes");
+            let first = u16::from_be_bytes([starts[0].payload[4], starts[0].payload[5]]);
+            assert_eq!(first, 0xFFFF, "{len} bytes: the first PES is full");
+            assert_eq!(reassemble_es(&packets, AUDIO_PID), vec![0x5A; len]);
+        }
     }
 
     // An oversized video access unit must stay ONE PES (unbounded-length

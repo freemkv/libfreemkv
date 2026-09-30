@@ -19,6 +19,33 @@ pub(crate) fn lpcm_bd_header(a: &crate::disc::AudioStream, cp: Option<&[u8]>) ->
     super::codec::lpcm::bd_header(a.channels.count(), a.sample_rate.hz() as u32, src)
 }
 
+fn stream_pid(s: &DiscStream) -> u16 {
+    match s {
+        DiscStream::Video(v) => v.pid,
+        DiscStream::Audio(a) => a.pid,
+        DiscStream::Subtitle(s) => s.pid,
+    }
+}
+
+// tsmux picks stream_id and NAL handling by PID, so video must sit in its video range and
+// nothing else may; DVD ids (0xE0, 0xBD80) and the null PID are not carriable at all.
+fn pid_fits(s: &DiscStream, pid: u16) -> bool {
+    let video = matches!(s, DiscStream::Video(_));
+    video == super::tsmux::is_video_pid(pid) && (0x0010..=0x1FFE).contains(&pid)
+}
+
+// Lowest free carriable PID for `s`, searched from its BD base.
+fn free_pid(s: &DiscStream, used: &[bool]) -> Option<u16> {
+    let base = match s {
+        DiscStream::Video(_) => *super::tsmux::VIDEO_PID_RANGE.start(),
+        DiscStream::Audio(_) => 0x1100,
+        DiscStream::Subtitle(_) => 0x1200,
+    };
+    (base..=0x1FFE)
+        .chain(0x0010..base)
+        .find(|&p| pid_fits(s, p) && !used[p as usize])
+}
+
 /// BD transport stream write sink with embedded FMKV metadata
 /// header.
 pub struct M2tsStream {
@@ -41,6 +68,21 @@ impl M2tsStream {
         out.codec_privates.clear();
         let mut route = Vec::with_capacity(title.streams.len());
         let excluded = super::ps::UnstoredExtensions::new(title, "M2TS");
+        // Keep each carriable source PID (first use wins); the rest are remapped below and
+        // the header records the PID actually written.
+        let mut used = vec![false; 0x2000];
+        let keep: Vec<bool> = title
+            .streams
+            .iter()
+            .map(|s| {
+                let pid = stream_pid(s);
+                let k = pid_fits(s, pid) && !used[pid as usize];
+                if k {
+                    used[pid as usize] = true;
+                }
+                k
+            })
+            .collect();
         for (i, s) in title.streams.iter().enumerate() {
             let mut cp = title.codec_privates.get(i).cloned().flatten();
             // No descriptor binds a 13818-3 extension PID to its base, so a player could not
@@ -67,8 +109,22 @@ impl M2tsStream {
                 }
                 _ => None,
             };
+            let mut s = s.clone();
+            if !keep[i] {
+                let Some(pid) = free_pid(&s, &used) else {
+                    tracing::warn!(target: "mux", track = i, "no free BD-TS PID; track omitted from M2TS");
+                    route.push(None);
+                    continue;
+                };
+                used[pid as usize] = true;
+                match &mut s {
+                    DiscStream::Video(v) => v.pid = pid,
+                    DiscStream::Audio(a) => a.pid = pid,
+                    DiscStream::Subtitle(t) => t.pid = pid,
+                }
+            }
             route.push(Some((out.streams.len(), lpcm)));
-            out.streams.push(s.clone());
+            out.streams.push(s);
             out.codec_privates.push(cp);
         }
         // Write FMKV header unconditionally: skipping it for a zero-stream title
@@ -76,15 +132,7 @@ impl M2tsStream {
         // read-back (read_header → Ok(None) → PMT fallback). Empty array is valid.
         let m = meta::M2tsMeta::from_title(&out);
         meta::write_header(&mut writer, &m)?;
-        let pids: Vec<u16> = out
-            .streams
-            .iter()
-            .map(|s| match s {
-                DiscStream::Video(v) => v.pid,
-                DiscStream::Audio(a) => a.pid,
-                DiscStream::Subtitle(s) => s.pid,
-            })
-            .collect();
+        let pids: Vec<u16> = out.streams.iter().map(stream_pid).collect();
         let boxed: Box<dyn Write + Send> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
         // Declaring the codec decides both ES framing (HEVC/H.264 are length-
@@ -163,6 +211,7 @@ impl crate::pes::Stream for M2tsStream {
         self.muxer.finish()
     }
 
+    // The source title: its PIDs, not the BD-range PIDs the file and FMKV header carry.
     fn info(&self) -> &crate::disc::DiscTitle {
         &self.disc_title
     }
@@ -781,6 +830,131 @@ mod tests {
             dep_t, base_t,
             "each dependent AU carries its base AU's PTS and DTS (dependent first: {dependent_first})"
         );
+    }
+
+    // Write one frame per track of `title` and return (header pids, BD-TS bytes).
+    fn mux_one_frame_each(title: &DiscTitle, data: &[Vec<u8>]) -> (Vec<u16>, Vec<u8>) {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), title).unwrap();
+        for (track, d) in data.iter().enumerate() {
+            stream.write(&frame(track, 0, true, d.clone())).unwrap();
+        }
+        stream.finish().unwrap();
+        drop(stream);
+        let buf = shared.lock().unwrap().clone();
+        let (meta, ts) = ts_after_header(&buf);
+        let pids = meta
+            .to_title()
+            .streams
+            .iter()
+            .map(|s| match s {
+                DiscStream::Video(v) => v.pid,
+                DiscStream::Audio(a) => a.pid,
+                DiscStream::Subtitle(s) => s.pid,
+            })
+            .collect();
+        (pids, ts)
+    }
+
+    fn ac3_audio(pid: u16) -> DiscStream {
+        DiscStream::Audio(crate::disc::AudioStream {
+            pid,
+            codec: Codec::Ac3,
+            channels: crate::disc::AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: crate::disc::SampleRate::S48,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
+            label: String::new(),
+        })
+    }
+
+    // DVD ids (video 0xE0, audio 0xBD80) are not 13-bit TS PIDs: the header must name
+    // the PID the packets actually carry, and video must use the video path.
+    #[test]
+    fn dvd_stream_ids_get_bd_pids_that_the_header_records() {
+        let mut title = make_title();
+        if let DiscStream::Video(v) = &mut title.streams[0] {
+            v.pid = 0xE0;
+            v.codec = Codec::H264;
+        }
+        title.streams.push(ac3_audio(0xBD80));
+        title.codec_privates = vec![None, None];
+        let audio = vec![0x0B, 0x77, 1, 2, 3, 4, 5, 6];
+        let (pids, ts) = mux_one_frame_each(&title, &[fake_idr_pes_data(), audio.clone()]);
+        assert!(pids.iter().all(|&p| p <= 0x1FFF), "13-bit PIDs: {pids:x?}");
+        let mut demux = crate::mux::ts::TsDemuxer::new(&pids);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        let got = |pid| pes.iter().find(|p| p.pid == pid).map(|p| p.data.clone());
+        assert_eq!(got(pids[1]), Some(audio), "audio found on its header PID");
+        let v = got(pids[0]).expect("video found on its header PID");
+        assert!(v.starts_with(&[0, 0, 0, 1]), "video converted to Annex B");
+        assert!(
+            pes_times(&ts, pids[0]).len() == 1,
+            "video PES on the header PID"
+        );
+    }
+
+    // An audio track on a video-range PID (MKV whose track 1 is audio) must pass verbatim.
+    #[test]
+    fn audio_on_a_video_range_pid_is_not_treated_as_video() {
+        let mut title = make_title();
+        title.streams = vec![ac3_audio(0x1011)];
+        title.codec_privates = vec![None];
+        let audio = vec![0, 0, 0, 4, 0x0B, 0x77, 9, 9];
+        let (pids, ts) = mux_one_frame_each(&title, std::slice::from_ref(&audio));
+        let mut demux = crate::mux::ts::TsDemuxer::new(&pids);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        assert_eq!(pes.len(), 1);
+        assert_eq!(pes[0].data, audio, "audio bytes pass through unconverted");
+    }
+
+    // BD PiP (0x1B00) and MKV non-first video (0x1100+) move into the video range; BD PIDs
+    // already in their range are kept, and each track reads back on its header PID.
+    #[test]
+    fn out_of_range_video_moves_into_the_video_range_and_bd_pids_stay() {
+        let mut title = make_title();
+        let DiscStream::Video(v) = title.streams[0].clone() else {
+            unreachable!()
+        };
+        for pid in [0x1B00, 0x1100] {
+            title
+                .streams
+                .push(DiscStream::Video(VideoStream { pid, ..v.clone() }));
+        }
+        title.streams.push(ac3_audio(0x1101));
+        title
+            .streams
+            .push(DiscStream::Subtitle(crate::disc::SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+                qualifier: crate::disc::LabelQualifier::None,
+                codec_data: None,
+            }));
+        title.codec_privates = vec![None; 5];
+        let audio = vec![0x0B, 0x77, 1, 2];
+        let sub = vec![0x16, 0, 0];
+        let v = fake_idr_pes_data();
+        let data = [v.clone(), v.clone(), v, audio.clone(), sub.clone()];
+        let (pids, ts) = mux_one_frame_each(&title, &data);
+        assert_eq!(pids, [0x1011, 0x1012, 0x1013, 0x1101, 0x1200]);
+        let mut demux = crate::mux::ts::TsDemuxer::new(&pids);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        let got = |pid| pes.iter().find(|p| p.pid == pid).map(|p| p.data.clone());
+        for &pid in &pids[..3] {
+            let v = got(pid).expect("video found on its header PID");
+            assert!(
+                v.starts_with(&[0, 0, 0, 1]),
+                "video {pid:#x} converted to Annex B"
+            );
+        }
+        assert_eq!(got(0x1101), Some(audio));
+        assert_eq!(got(0x1200), Some(sub));
     }
 
     #[test]
