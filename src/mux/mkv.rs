@@ -240,6 +240,20 @@ pub fn dolby_vision_config(profile: u8, level: u8, bl_compat_id: u8) -> Vec<u8> 
     v
 }
 
+// Dolby Vision level for a disc Profile 7 title: the base layer is always 3840x2160 (the
+// DV-tagged stream is often the 1080p EL), so the level follows the frame rate alone
+// (Dolby Vision Profiles and Levels: 6 = 2160p24, 7 = p30, 8 = p48, 9 = p60).
+fn dv_level_2160p(num: u32, den: u32) -> u8 {
+    let (num, den) = (u64::from(num), u64::from(den.max(1)));
+    if num == 0 {
+        return 6;
+    }
+    [24, 30, 48]
+        .iter()
+        .position(|&max| num <= max * den)
+        .map_or(9, |i| 6 + i as u8)
+}
+
 /// SEI chromaticity unit (Rec. ITU-T H.265 D.3.28): `display_primaries_*` and
 /// `white_point_*` are in increments of 0.00002. Matroska chromaticity elements
 /// are floats in the [0, 1] range, so the conversion is `value * 0.00002`.
@@ -437,7 +451,7 @@ impl MkvTrack {
             // The DV layer (hdr=DolbyVision) carries the dvcC so the track is
             // recognised as Dolby Vision (disc Profile 7 dual-layer).
             dv_config: if matches!(v.hdr, HdrFormat::DolbyVision) {
-                Some(dolby_vision_config(7, 6, 0))
+                Some(dolby_vision_config(7, dv_level_2160p(num, den), 0))
             } else {
                 None
             },
@@ -7329,5 +7343,25 @@ mod tests {
             got.push((f.track, f.data));
         }
         assert_eq!(got, vec![(0, vec![0x10; 8]), (1, vec![0x13; 8])]);
+    }
+
+    // dvcC level follows the 2160p frame rate; unknown rate keeps the 2160p24 level.
+    #[test]
+    fn dv_level_follows_the_frame_rate() {
+        use crate::disc::FrameRate as F;
+        for (fr, want) in [
+            (F::F23_976, 6),
+            (F::F24, 6),
+            (F::F25, 7),
+            (F::F29_97, 7),
+            (F::F50, 9),
+            (F::F59_94, 9),
+            (F::Unknown, 6),
+        ] {
+            let mut v = uhd_video(HdrFormat::DolbyVision, ColorSpace::Bt2020);
+            v.frame_rate = fr;
+            let c = MkvTrack::video(&v).dv_config.unwrap();
+            assert_eq!(((c[2] & 1) << 5) | (c[3] >> 3), want, "{fr:?}");
+        }
     }
 }
