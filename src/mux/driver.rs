@@ -504,7 +504,6 @@ fn mux_keyed(
                 let scope = crate::keys::KeyScope::Titles(vec![title_index]);
                 if !set.is_for(disc) || !set.covers(&scope) {
                     tracing::error!(target: "freemkv::keys", "key set is not for this session's title");
-                    debug_assert!(false, "key set is not for this session's title");
                     return Err(Error::DecryptFailed.into());
                 }
                 let title = disc
@@ -3062,6 +3061,34 @@ mod tests {
         )
         .expect("the set's key opens the unit");
         assert!(out.completed && out.bytes_written > 0);
+    }
+
+    /// A key set for another disc is a typed E7013 on a session, never a debug-build panic.
+    #[test]
+    fn mux_with_keys_session_wrong_disc_set_is_e7013() {
+        let key = [0x5A; 16];
+        let (reader, title, _) = keyed_live(key);
+        let mut other = aacs_session_disc(title.clone());
+        let mut disc = aacs_session_disc(title);
+        disc.capacity_sectors = 16;
+        if let Some(a) = other.aacs.as_mut() {
+            a.disc_hash = "0xdef".into();
+        }
+        let set = crate::keys::ResolvedKeySet::keyed_for_test(&other, key, &[(0, 3)]);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
+        let err = mux_with_keys(
+            MuxSource::Session {
+                session: &mut session,
+                title_index: 0,
+            },
+            Some(&set),
+            "null://",
+            &keyed_opts(),
+            &Halt::new(),
+            Arc::new(NoopEvents),
+        )
+        .expect_err("a set for another disc is refused");
+        assert!(err.to_string().contains("E7013"), "got: {err}");
     }
 
     /// J14: `MuxSource::Iso` muxes the caller's already-scanned title out of an image with

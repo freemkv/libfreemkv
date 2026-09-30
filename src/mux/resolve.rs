@@ -524,7 +524,7 @@ where
                 // Non-fatal: a failed re-open leaves MPLS 7.1/Atmos counts
                 // uncorrected (as 5.1). Log the actual error so it's
                 // diagnosable, not swallowed by a bare `.ok()` -> None.
-                tracing::debug!(
+                tracing::warn!(
                     target: "mux",
                     error = %e,
                     "TrueHD channel-correction probe re-open failed"
@@ -588,14 +588,42 @@ where
     match reopen() {
         Ok(probe) => match set.title_reader(&disc, idx, probe) {
             Ok(mut dec) => crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]),
-            Err(e) => tracing::debug!(target: "mux", error = %e, "TrueHD probe reader refused"),
+            Err(e) => tracing::warn!(target: "mux", error = %e, "TrueHD probe reader refused"),
         },
         Err(e) => {
-            tracing::debug!(target: "mux", error = %e, "TrueHD channel-correction probe re-open failed")
+            tracing::warn!(target: "mux", error = %e, "TrueHD channel-correction probe re-open failed")
         }
     }
     let title = disc.titles[idx].clone();
     build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, None, None)
+}
+
+// A `DemuxSink` over `dir`, its base name seeded from the playlist name.
+fn demux_sink_output(
+    dir: &std::path::Path,
+    title: &DiscTitle,
+    mut opts: super::demux_sink::DemuxOptions,
+) -> io::Result<Box<dyn crate::pes::Stream>> {
+    if !title.playlist.is_empty() {
+        opts.base = title.playlist.clone();
+    }
+    Ok(Box::new(super::demux_sink::DemuxSink::create(
+        dir, title, &opts,
+    )?))
+}
+
+// `video://`/`audio://`/`sub://`: a `demux://` restricted to one track class, no chapters sidecar.
+fn track_sink_output(
+    dir: &std::path::Path,
+    title: &DiscTitle,
+    kind: super::demux_sink::TrackKind,
+) -> io::Result<Box<dyn crate::pes::Stream>> {
+    let opts = super::demux_sink::DemuxOptions {
+        kind_filter: Some(kind),
+        export_chapters: false,
+        ..Default::default()
+    };
+    demux_sink_output(dir, title, opts)
 }
 
 /// Open a PES output stream (consumes PES frames).
@@ -707,37 +735,22 @@ pub(crate) fn output_with(
             // Full `--demux/--naming/--delay/--container/--chapters` flags
             // are parsed in the CLI, which builds `DemuxSink` directly. This
             // bare arm uses defaults but seeds `base` from the playlist name.
-            let mut opts = super::demux_sink::DemuxOptions::default();
-            if !title.playlist.is_empty() {
-                opts.base = title.playlist.clone();
-            }
-            Ok(Box::new(super::demux_sink::DemuxSink::create(
-                dir, title, &opts,
-            )?))
+            demux_sink_output(dir, title, super::demux_sink::DemuxOptions::default())
         }
         // `video://`, `audio://`, `sub://` are `demux://` restricted to one
         // track class. No chapters sidecar (that's a `demux://`/`chapters://`
         // concern).
-        StreamUrl::Video { ref dir }
-        | StreamUrl::Audio { ref dir }
-        | StreamUrl::Sub { ref dir } => {
-            let (scheme, kind) = match parsed {
-                StreamUrl::Video { .. } => ("video", super::demux_sink::TrackKind::Video),
-                StreamUrl::Audio { .. } => ("audio", super::demux_sink::TrackKind::Audio),
-                _ => ("sub", super::demux_sink::TrackKind::Subtitle),
-            };
-            validate_file_path(dir, scheme)?;
-            let mut opts = super::demux_sink::DemuxOptions {
-                kind_filter: Some(kind),
-                export_chapters: false,
-                ..Default::default()
-            };
-            if !title.playlist.is_empty() {
-                opts.base = title.playlist.clone();
-            }
-            Ok(Box::new(super::demux_sink::DemuxSink::create(
-                dir, title, &opts,
-            )?))
+        StreamUrl::Video { ref dir } => {
+            validate_file_path(dir, "video")?;
+            track_sink_output(dir, title, super::demux_sink::TrackKind::Video)
+        }
+        StreamUrl::Audio { ref dir } => {
+            validate_file_path(dir, "audio")?;
+            track_sink_output(dir, title, super::demux_sink::TrackKind::Audio)
+        }
+        StreamUrl::Sub { ref dir } => {
+            validate_file_path(dir, "sub")?;
+            track_sink_output(dir, title, super::demux_sink::TrackKind::Subtitle)
         }
         // `fvi://` writes the per-picture video index. The header's `source` describes the
         // INPUT, from caller-supplied `source` — never `path`, which previously broke
@@ -819,94 +832,6 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
     (parsers, pid_to_track, ts, ps)
 }
 
-// Tag for an FMTS forensic index key banked into the key pool (base + slot); separates disc
-// BASE CPS unit keys (< this) from forensic ones (>= this).
-pub(crate) const FMTS_POOL_TAG_BASE: u32 = 1 << 24;
-
-// FMTS forensic feature clip's own extents — the byte space every `IndividualSegment.tbl` SPN
-// is relative to — or None if not exactly one such clip.
-pub(crate) fn forensic_clip_extents(
-    udf: &crate::udf::UdfFs,
-    reader: &mut dyn SectorSource,
-) -> io::Result<Option<Vec<crate::disc::Extent>>> {
-    let Some(dir) = udf.find_dir("/BDMV/STREAM") else {
-        return Ok(None);
-    };
-    let mut names = dir
-        .entries
-        .iter()
-        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".fmts"))
-        .map(|e| e.name.clone());
-    let Some(name) = names.next() else {
-        return Ok(None);
-    };
-    if names.next().is_some() {
-        tracing::warn!(target: "freemkv::keysource", "fmts: more than one forensic clip on the disc — segment byte space is ambiguous");
-        return Ok(None);
-    }
-    // Addressing variant: these extents are a byte-space map for the forensic
-    // segment table (`clip_byte_to_lba`), not a read plan — an unrecorded
-    // extent must stay in place here or every later segment offset shifts.
-    let exts: Vec<crate::disc::Extent> = udf
-        .file_extents_addressing(reader, &format!("/BDMV/STREAM/{name}"))
-        .map_err(io::Error::from)?
-        .into_iter()
-        .filter(|&(lba, sectors)| lba > 0 && sectors > 0)
-        .map(|(start_lba, sector_count)| crate::disc::Extent {
-            start_lba,
-            sector_count,
-        })
-        .collect();
-    Ok((!exts.is_empty()).then_some(exts))
-}
-
-// Keep only forensic segments addressable within the FORENSIC CLIP's extents; stale/foreign
-// records past the clip's end are dropped. Extracted from resolve_fmts_key_map for direct
-// testing.
-pub(crate) fn filter_addressable_segments(
-    segments: Vec<crate::aacs::segment::Segment>,
-    extents: &[crate::disc::Extent],
-) -> Vec<crate::aacs::segment::Segment> {
-    segments
-        .into_iter()
-        .filter(|s| {
-            crate::aacs::segment::clip_byte_to_lba(extents, s.start_spn as u64 * 192).is_some()
-        })
-        .collect()
-}
-
-// Back-fill LBA gaps NOT covered by forensic segment ranges with the base Unit Key, so the map
-// is a COMPLETE positive list over the title's content extents.
-pub(crate) fn fill_base_key_gaps(
-    extents: &[crate::disc::Extent],
-    forensic_ranges: &[(u32, u32, usize, crate::decrypt::Phase)],
-    base_idx: usize,
-) -> Vec<(u32, u32, usize, crate::decrypt::Phase)> {
-    let cuts: Vec<(u32, u32)> = {
-        let mut c: Vec<(u32, u32)> = forensic_ranges.iter().map(|&(s, e, _, _)| (s, e)).collect();
-        c.sort_unstable();
-        c
-    };
-    let mut fills = Vec::new();
-    for ext in extents {
-        let end = ext.start_lba.saturating_add(ext.sector_count);
-        let mut cur = ext.start_lba;
-        for &(cs, ce) in &cuts {
-            if ce <= cur || cs >= end {
-                continue; // cut outside this extent
-            }
-            if cs > cur {
-                fills.push((cur, cs, base_idx, crate::decrypt::Phase::All));
-            }
-            cur = cur.max(ce);
-        }
-        if cur < end {
-            fills.push((cur, end, base_idx, crate::decrypt::Phase::All));
-        }
-    }
-    fills
-}
-
 /// Assemble the ISO mux pipeline (read+decrypt → demux → parse) for a title with no
 /// AACS key set (clear, CSS, or `raw`); an AACS title goes through
 /// [`build_iso_pipeline_keyed`]. `keys` is `DecryptKeys::None` for raw/unencrypted
@@ -982,7 +907,6 @@ pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
         || !set.covers_extents(&title.extents)
     {
         tracing::error!(target: "freemkv::keys", "key set does not cover this image title");
-        debug_assert!(false, "key set does not cover this image title");
         return Err(crate::error::Error::DecryptFailed.into());
     }
     let full_extents = title.extents.clone();
@@ -2037,193 +1961,5 @@ mod tests {
             res.is_err(),
             "a scrambled DVD title with no key must hard-fail, not build a scrambled-passthrough pipeline"
         );
-    }
-
-    // ── resolve_fmts_key_map decision helpers (behaviors flagged by audit) ──
-
-    // BEHAVIOR 1 — segment filter: a segment mapping inside the title's extents is kept,
-    // past-clip dropped, all-outside -> empty.
-    #[test]
-    fn filter_addressable_segments_keeps_only_in_title_segments() {
-        use crate::aacs::segment::Segment;
-        // One extent covering clip bytes [0, 60*2048) = [0, 122880).
-        let extents = vec![Extent {
-            start_lba: 500,
-            sector_count: 60,
-        }];
-        // start_spn 100 → clip byte 19200 < 122880 → maps to an LBA → KEEP.
-        let inside = Segment {
-            index: 1,
-            start_spn: 100,
-            end_spn: 199,
-        };
-        // start_spn 1000 → clip byte 192000 >= 122880 → clip_byte_to_lba None → DROP.
-        let outside = Segment {
-            index: 2,
-            start_spn: 1000,
-            end_spn: 1099,
-        };
-        let kept = super::filter_addressable_segments(vec![inside, outside], &extents);
-        assert_eq!(kept, vec![inside], "only the in-title segment survives");
-        // All-outside → empty; `resolve_fmts_key_map` maps this to Ok(None).
-        assert!(
-            super::filter_addressable_segments(vec![outside], &extents).is_empty(),
-            "no addressable segment → empty (→ resolver Ok(None))"
-        );
-        // Boundary: a segment whose start is the LAST clip byte still maps (Some);
-        // one exactly at the clip end (122880) does not.
-        let at_last = Segment {
-            index: 3,
-            start_spn: (122_879 / 192) as u32, // 639 → byte 122688 < 122880
-            end_spn: 700,
-        };
-        let at_end = Segment {
-            index: 4,
-            start_spn: (122_880 / 192) as u32, // 640 → byte 122880 == clip end → None
-            end_spn: 700,
-        };
-        assert_eq!(
-            super::filter_addressable_segments(vec![at_last, at_end], &extents),
-            vec![at_last],
-            "start inside the clip is kept; start at/after the clip end is dropped"
-        );
-    }
-
-    // forensic + fills must cover every LBA of every extent EXACTLY once: no gap, no overlap.
-    fn assert_gapless(
-        extents: &[Extent],
-        forensic: &[(u32, u32, usize, crate::decrypt::Phase)],
-        fills: &[(u32, u32, usize, crate::decrypt::Phase)],
-    ) {
-        let mut spans: Vec<(u32, u32)> = forensic.iter().map(|&(s, e, _, _)| (s, e)).collect();
-        spans.extend(fills.iter().map(|&(s, e, _, _)| (s, e)));
-        spans.sort_unstable();
-        for w in spans.windows(2) {
-            assert!(w[0].1 <= w[1].0, "spans overlap: {:?} vs {:?}", w[0], w[1]);
-        }
-        for ext in extents {
-            let end = ext.start_lba + ext.sector_count;
-            for lba in ext.start_lba..end {
-                let covering = spans.iter().filter(|&&(s, e)| lba >= s && lba < e).count();
-                assert_eq!(
-                    covering, 1,
-                    "LBA {lba} covered {covering}× (want exactly 1)"
-                );
-            }
-        }
-    }
-
-    // BEHAVIOR 3 — gap-fill range arithmetic, exhaustive over segment positions.
-    #[test]
-    fn fill_base_key_gaps_is_gapless_over_every_extent() {
-        use crate::decrypt::Phase::{All, Even, Odd};
-        let base = 0usize;
-
-        // No segments → the whole extent is base key.
-        let ext = vec![Extent {
-            start_lba: 100,
-            sector_count: 60,
-        }];
-        let forensic: Vec<(u32, u32, usize, crate::decrypt::Phase)> = vec![];
-        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
-        assert_eq!(fills, vec![(100, 160, base, All)], "no segments → all base");
-        assert_gapless(&ext, &forensic, &fills);
-
-        // One segment mid-extent → base | forensic | base, gapless.
-        let forensic = vec![(120, 130, 5, Even)];
-        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
-        assert_eq!(
-            fills,
-            vec![(100, 120, base, All), (130, 160, base, All)],
-            "mid-extent segment → leading + trailing base"
-        );
-        assert_gapless(&ext, &forensic, &fills);
-
-        // Segment at extent START → only a trailing base fill (no zero-length lead).
-        let forensic = vec![(100, 130, 5, Even)];
-        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
-        assert_eq!(
-            fills,
-            vec![(130, 160, base, All)],
-            "segment at start → no leading base, one trailing"
-        );
-        assert_gapless(&ext, &forensic, &fills);
-
-        // Segment at extent END → only a leading base fill (no zero-length trail).
-        let forensic = vec![(130, 160, 5, Even)];
-        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
-        assert_eq!(
-            fills,
-            vec![(100, 130, base, All)],
-            "segment at end → one leading base, no trailing"
-        );
-        assert_gapless(&ext, &forensic, &fills);
-
-        // Whole extent is one segment → no base fill at all, still gapless.
-        let forensic = vec![(100, 160, 5, Even)];
-        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
-        assert!(
-            fills.is_empty(),
-            "segment spans whole extent → no base fill"
-        );
-        assert_gapless(&ext, &forensic, &fills);
-
-        // Adjacent segments (touching, no gap between) → NO zero-length base range
-        // between them (guards the `cs > cur` off-by-one).
-        let forensic = vec![(110, 120, 5, Even), (120, 130, 6, Odd)];
-        let fills = super::fill_base_key_gaps(&ext, &forensic, base);
-        assert_eq!(
-            fills,
-            vec![(100, 110, base, All), (130, 160, base, All)],
-            "adjacent segments → no zero-length fill between them"
-        );
-        assert_gapless(&ext, &forensic, &fills);
-
-        // Multi-extent: a segment mid-first-extent and one at the start of the
-        // second. Fills are per-extent and the union is gapless across both.
-        let exts = vec![
-            Extent {
-                start_lba: 100,
-                sector_count: 60,
-            }, // [100, 160)
-            Extent {
-                start_lba: 1000,
-                sector_count: 40,
-            }, // [1000, 1040)
-        ];
-        let forensic = vec![(120, 130, 5, Even), (1000, 1010, 7, Odd)];
-        let fills = super::fill_base_key_gaps(&exts, &forensic, base);
-        assert_eq!(
-            fills,
-            vec![
-                (100, 120, base, All),
-                (130, 160, base, All),
-                (1010, 1040, base, All),
-            ],
-            "each extent filled independently"
-        );
-        assert_gapless(&exts, &forensic, &fills);
-    }
-
-    // Forensic ranges arrive in table RECORD order, not LBA order; the gap walk's forward sweep
-    // needs them sorted.
-    #[test]
-    fn fill_base_key_gaps_sorts_cuts_that_arrive_in_table_order_not_lba_order() {
-        use crate::decrypt::Phase::{All, Even, Odd};
-        let ext = vec![Extent {
-            start_lba: 100,
-            sector_count: 60,
-        }];
-        // Table order: the HIGH segment recorded before the LOW one.
-        let forensic = vec![(140, 150, 6, Odd), (110, 120, 5, Even)];
-        let fills = super::fill_base_key_gaps(&ext, &forensic, 0);
-        assert_eq!(
-            fills,
-            vec![(100, 110, 0, All), (120, 140, 0, All), (150, 160, 0, All),],
-            "the gaps around BOTH forensic cuts must be filled, whatever order the \
-             segment table listed them in"
-        );
-        // The load-bearing invariant: exactly one range covers every content LBA.
-        assert_gapless(&ext, &forensic, &fills);
     }
 }

@@ -208,12 +208,7 @@ struct AnnexBWriter {
     /// avcC/hvcC may declare 1 or 2, and reading those as u32-BE parses no NALs
     /// at all, so the raw prefixed bytes would be emitted as if already Annex B.
     length_size: usize,
-    /// Reused length-prefixed -> Annex-B conversion buffer. `write_frame` used to
-    /// allocate and free a whole-frame Vec per video frame; extracting the video ES
-    /// of a UHD title is ~200,000 frames of 150-400 KB, every one over the
-    /// allocator's mmap threshold, so that was ~200,000 mmap/munmap pairs plus
-    /// millions of first-touch page faults of pure overhead. Kept on the writer and
-    /// cleared per frame instead, matching what tsmux.rs already does.
+    /// Reused length-prefixed -> Annex-B buffer, cleared per frame (avoids a per-frame alloc).
     scratch: Vec<u8>,
 }
 
@@ -662,32 +657,15 @@ pub struct DemuxSink {
     /// Index = track id; `None` for unselected tracks.
     tracks: Vec<Option<TrackOut>>,
     ref_video_track: Option<usize>,
-    /// Every VIDEO track index, recorded before the kind filter.
-    ///
-    /// The filtered `tracks` slots are `None` for a class this export drops, so
-    /// they cannot answer "is this video" for a frame that still flows through
-    /// `write()`.
+    /// Every VIDEO track index, recorded before the kind filter drops slots.
     video_tracks: std::collections::HashSet<usize>,
-    /// First PTS observed on `ref_video_track`, recorded in `write()` REGARDLESS
-    /// of whether that track has a `TrackOut`. The DELAY reference cannot live in
-    /// `TrackOut::first_pts_ns`: `audio://` / `sub://` filter the video track's
-    /// output away in `create()`, so no `TrackOut` exists to record it, and the
-    /// old `unwrap_or(0)` fallback then measured every delay against a reference
-    /// of zero and baked a plausible-looking wrong `DELAY` into the filename.
-    /// `None` = no reference seen → no delay is emitted at all (see
-    /// `apply_delays`).
+    /// First PTS seen on `ref_video_track`, even when that track has no `TrackOut`.
+    /// `None` = no reference seen, so no delay is emitted (see `apply_delays`).
     ref_first_pts_ns: Option<i64>,
     timeline: TimelineContinuity,
     finished: bool,
-    /// Frames actually PERSISTED to a track file — the drop gate's denominator.
-    ///
-    /// Counted in `write()` only inside the `Some(TrackOut)` arm, so a frame for
-    /// a track this export filters out (e.g. video during an `audio://` export)
-    /// flows through the timeline but does NOT count here. The gate in `finish()`
-    /// pairs this with `timeline.dropped_for(persisted_tracks)` so numerator and
-    /// denominator cover the SAME set of tracks: were it "frames the timeline
-    /// placed", a filtered-out track's clip-join drops would measure against a
-    /// count that never included them, wrongly tripping `SeamPlanDroppedMost`/`SinkWroteNothing`.
+    /// Frames persisted to a track file (drop gate denominator); filtered-out tracks
+    /// are not counted, matching `timeline.dropped_for(persisted_tracks)` in `finish()`.
     frames_mapped: u64,
     /// MPEG-2 multichannel extension tracks (no ES file form), reported once packets arrive.
     excluded: super::ps::UnstoredExtensions,

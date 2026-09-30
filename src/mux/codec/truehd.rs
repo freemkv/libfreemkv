@@ -119,7 +119,7 @@ impl TrueHdParser {
                 // (num_substreams from a prior clean major sync) exists — before
                 // that, arming drop-forward risks silently dropping the whole track.
                 if self.num_substreams.is_some() {
-                    return AuCheck::Corrupt; // real corruption vs a proven baseline
+                    return AuCheck::Corrupt("major-sync-crc"); // real corruption vs a proven baseline
                 }
                 return AuCheck::Unverifiable; // no baseline yet — keep, don't nuke the track
             }
@@ -138,10 +138,11 @@ impl TrueHdParser {
             return AuCheck::Unverifiable; // no major sync seen yet — can't check parity
         };
         let Some(shs) = mlp_substr_header_size(au, header_size, nss) else {
-            return AuCheck::Unverifiable; // directory runs off the AU — can't judge
+            // Baseline proven by a CRC-validated major sync: an overrunning directory is corruption.
+            return AuCheck::Corrupt("directory-overrun");
         };
         if !mlp_parity_ok(au, header_size, shs) {
-            return AuCheck::Corrupt;
+            return AuCheck::Corrupt("parity");
         }
         if is_major_sync {
             AuCheck::ValidMajorSync { format_info }
@@ -191,8 +192,8 @@ fn ac3_boundary_corroborated(buf: &[u8], frame_bytes: usize) -> bool {
 /// Decodability verdict for one TrueHD/MLP access unit.
 enum AuCheck {
     /// Verified undecodable: a major-sync header whose CRC failed, or any AU
-    /// whose substream-directory parity failed. Feeds the poison verdict.
-    Corrupt,
+    /// whose substream-directory parity failed. Feeds the poison verdict. Carries the drop reason.
+    Corrupt(&'static str),
     /// A CRC-validated major sync — a safe re-init / resync point. `format_info`
     /// (AU bytes 8..12, present when the AU is long enough) is trustworthy here,
     /// so the caller refines the PTS cadence ONLY from this validated path.
@@ -426,18 +427,13 @@ impl CodecParser for TrueHdParser {
                         self.resync_pending = false;
                         emit_keyframe = Some(true);
                     }
-                    AuCheck::Corrupt => {
+                    AuCheck::Corrupt(r) => {
                         if self.resync_pending {
                             // Part of the current drop-forward run — collateral.
                             drop_reason = Some(("resync", false));
                         } else {
                             // The trigger: one verified corruption that starts the
                             // drop-forward. Only this counts toward poison.
-                            let r = if is_major_sync {
-                                "major-sync-crc"
-                            } else {
-                                "parity"
-                            };
                             drop_reason = Some((r, true));
                             self.resync_pending = true;
                         }
@@ -555,18 +551,7 @@ pub fn truehd_lfe(format_info: u32) -> u8 {
 /// decode its true channel count. The stream may interleave AC-3; we scan for
 /// the major-sync word anywhere and read the following `format_info`.
 pub fn truehd_channels_from_stream(data: &[u8]) -> Option<u8> {
-    let mut p = 0;
-    while p + 8 <= data.len() {
-        let w = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
-        // 0xBA only: `truehd_channels` reads the TrueHD `format_info` channel
-        // masks, which an MLP (0xBB) major sync does not carry.
-        if is_truehd_major_sync(w) {
-            let fi = u32::from_be_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]);
-            return truehd_channels(fi);
-        }
-        p += 1;
-    }
-    None
+    truehd_sync_info_from_stream(data).and_then(|s| truehd_channels(s.format_info))
 }
 
 /// Real sample rate (Hz) from a TrueHD major-sync `format_info` word.
@@ -1125,6 +1110,19 @@ mod tests {
                 "only the real 200-byte major syncs survive"
             );
         }
+    }
+
+    #[test]
+    fn au_shorter_than_directory_after_baseline_arms_resync() {
+        // With a proven baseline, a 2-byte AU can't hold its substream directory:
+        // it is corruption, so it is dropped and the next normal AU is dropped forward.
+        let mut parser = TrueHdParser::new();
+        let mut data = valid_major_sync();
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.extend_from_slice(&valid_normal_au());
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 1, "runt AU and its follower are dropped");
+        assert!(parser.dropped_frames() >= 1);
     }
 
     #[test]

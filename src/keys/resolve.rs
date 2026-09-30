@@ -1026,7 +1026,7 @@ fn build(
                     })
                     .collect();
                 // Base content around the forensic segments keeps the piece's own key (K-3).
-                ranges.extend(crate::mux::resolve::fill_base_key_gaps(
+                ranges.extend(crate::keys::fmts::fill_base_key_gaps(
                     &extents,
                     &seg_ranges,
                     slot,
