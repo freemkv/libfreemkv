@@ -103,8 +103,9 @@ pub struct KeyResolution {
 pub(crate) enum Proof {
     /// The key opened the piece's unit and a partner unit.
     Proven(usize),
-    /// The key opened one unit with no readable partner; the next readable unit confirms it.
-    Provisional(usize),
+    /// The key opened the unit at this LBA with no readable partner; a different readable
+    /// unit confirms it (a re-read of the same unit is not independent).
+    Provisional(usize, u32),
 }
 
 /// The rip's in-memory record of on-arrival proofs (KU §2.4, J2, J16): which HELD key
@@ -315,7 +316,7 @@ fn norm_hash(h: &str) -> String {
     crate::hex::strip_hex_prefix(h).to_ascii_lowercase()
 }
 
-fn overlaps(a: &[(u32, u32)], s: u32, e: u32) -> bool {
+pub(super) fn overlaps(a: &[(u32, u32)], s: u32, e: u32) -> bool {
     a.iter().any(|&(x, y)| x < e && s < y)
 }
 
@@ -619,6 +620,10 @@ impl ResolvedKeySet {
     // extent is left to the on-arrival proof, which has no key to try, so the first
     // AACS-flagged unit stops with E7022 and clear units pass. For a mux given no AACS set.
     pub(crate) fn keyless_for(title: &crate::disc::DiscTitle, format: ContentFormat) -> Self {
+        Self(Arc::new(Self::keyless_inner(title, format)))
+    }
+
+    fn keyless_inner(title: &crate::disc::DiscTitle, format: ContentFormat) -> Inner {
         let mut i = Inner::empty();
         i.aacs = true;
         i.content_format = format;
@@ -648,15 +653,14 @@ impl ResolvedKeySet {
                 candidate: None,
             });
         }
-        ResolvedKeySet(Arc::new(i))
+        i
     }
 
     // `keyless_for` title `idx` of `disc`, carrying the disc's identity: its E7022 names the
     // disc, and it passes `is_for` on that disc (a Session mux given no set, over no key).
     pub(crate) fn keyless_for_disc(disc: &Disc, idx: usize) -> Option<Self> {
         let title = disc.titles.get(idx)?;
-        let mut set = Self::keyless_for(title, disc.content_format);
-        let i = Arc::get_mut(&mut set.0).expect("a fresh set has one owner");
+        let mut i = Self::keyless_inner(title, disc.content_format);
         i.disc_hash = disc
             .aacs
             .as_ref()
@@ -664,7 +668,7 @@ impl ResolvedKeySet {
             .unwrap_or_default();
         i.format = disc.format;
         i.capacity = disc.capacity_sectors;
-        Some(set)
+        Some(Self(Arc::new(i)))
     }
 
     // A set keying `ranges` (`[start, end)`) with `key` as proven pieces: the mux tests'

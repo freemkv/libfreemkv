@@ -3,11 +3,13 @@
 
 use crate::aacs::content::ALIGNED_UNIT_LEN;
 use crate::aacs::segment::{Segment, clip_byte_to_lba, parse_individual_segments};
+use crate::consts::SECTOR_BYTES_U64;
 use crate::decrypt::Phase;
 use crate::disc::{ContentFormat, Extent};
 use crate::error::{Error, Result};
 use crate::halt::Halt;
 use crate::sector::SectorSource;
+use crate::whole_disc::UNIT;
 use std::collections::HashMap;
 
 /// Units per anchor or phase batch: the key service's sample floor.
@@ -26,7 +28,10 @@ pub(crate) struct Layout {
     pub(crate) unresolved: bool,
 }
 
-/// Read the disc's forensic layout. `Ok(None)`: not FMTS (no or empty segment table).
+// Bytes per source packet (the SPN unit).
+const SPN_BYTES: u64 = 192;
+
+/// Read the disc's forensic layout. `Ok(None)`: not FMTS (no or empty segment table); an unparseable table is refused.
 pub(crate) fn layout(
     fs: &crate::udf::UdfFs,
     reader: &mut dyn SectorSource,
@@ -36,9 +41,14 @@ pub(crate) fn layout(
         Err(Error::UdfNotFound { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let Some(segments) = parse_individual_segments(&tbl).filter(|s| !s.is_empty()) else {
-        return Ok(None);
+    let Some(segments) = parse_individual_segments(&tbl) else {
+        tracing::warn!(target: "freemkv::keys", "fmts: IndividualSegment.tbl present but unparseable");
+        // Ok(None) would rip forensic units as base content: refuse.
+        return Err(Error::FmtsKeyMissing);
     };
+    if segments.is_empty() {
+        return Ok(None);
+    }
     let Some(clip) = crate::mux::resolve::forensic_clip_extents(fs, reader)? else {
         // No defensible anchor for the segment byte space: refuse rather than guess.
         tracing::warn!(target: "freemkv::keys", "fmts: forensic clip not identifiable");
@@ -48,7 +58,10 @@ pub(crate) fn layout(
     let mut ranges = Vec::with_capacity(segments.len());
     let mut unresolved = false;
     for seg in &segments {
-        let (start, end) = (seg.start_spn as u64 * 192, (seg.end_spn as u64 + 1) * 192);
+        let (start, end) = (
+            seg.start_spn as u64 * SPN_BYTES,
+            (seg.end_spn as u64 + 1) * SPN_BYTES,
+        );
         let (Some(a), Some(b)) = (
             clip_byte_to_lba(&clip, start),
             clip_byte_to_lba(&clip, end.saturating_sub(1)),
@@ -56,7 +69,10 @@ pub(crate) fn layout(
             unresolved = true;
             continue;
         };
-        if seg.start_spn <= seg.end_spn && b >= a && (b - a) as u64 == (end - 1 - start) / 2048 {
+        if seg.start_spn <= seg.end_spn
+            && b >= a
+            && (b - a) as u64 == (end - 1 - start) / SECTOR_BYTES_U64
+        {
             ranges.push((a, b + 1, seg.index));
         } else {
             unresolved = true;
@@ -88,10 +104,10 @@ fn read_unit(
     seg: &Segment,
     index: usize,
 ) -> Option<Vec<u8>> {
-    let byte = seg.start_spn as u64 * 192 + index as u64 * ALIGNED_UNIT_LEN as u64;
+    let byte = seg.start_spn as u64 * SPN_BYTES + index as u64 * ALIGNED_UNIT_LEN as u64;
     let lba = clip_byte_to_lba(clip, byte)?;
     let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
-    match reader.read_sectors(lba, 3, &mut unit, false) {
+    match reader.read_sectors(lba, UNIT as u16, &mut unit, false) {
         Ok(n) if n == ALIGNED_UNIT_LEN => Some(unit),
         _ => None,
     }
@@ -183,17 +199,13 @@ pub(crate) fn phases(
 
 // Decide a forensic index's decrypt phase from clean-sample counts of its EVEN vs ODD aligned
 // units under that index's key. Extracted for unit-testing.
-fn resolve_tie_phase(
-    even_clean: usize,
-    odd_clean: usize,
-) -> std::io::Result<crate::decrypt::Phase> {
+fn resolve_tie_phase(even_clean: usize, odd_clean: usize) -> Option<Phase> {
+    use std::cmp::Ordering;
     match even_clean.cmp(&odd_clean) {
-        std::cmp::Ordering::Greater => Ok(crate::decrypt::Phase::Even),
-        std::cmp::Ordering::Less => Ok(crate::decrypt::Phase::Odd),
-        std::cmp::Ordering::Equal if even_clean == 0 => {
-            Err(crate::error::Error::FmtsKeyMissing.into())
-        }
-        std::cmp::Ordering::Equal => Ok(crate::decrypt::Phase::Even),
+        Ordering::Greater => Some(Phase::Even),
+        Ordering::Less => Some(Phase::Odd),
+        Ordering::Equal if even_clean == 0 => None,
+        Ordering::Equal => Some(Phase::Even),
     }
 }
 
@@ -252,7 +264,7 @@ pub(crate) fn probe_index_phase(
         // A clean parity or padding tie (even == odd > 0) resolves the phase;
         // even == odd == 0 is this segment's wrong-key signature, but a
         // different same-index segment could still anchor, so keep trying.
-        if let Ok(phase) = resolve_tie_phase(even, odd) {
+        if let Some(phase) = resolve_tie_phase(even, odd) {
             return IndexProbe::Phase(phase);
         }
     }
@@ -289,14 +301,8 @@ mod probe_tests {
             "even == odd > 0 → default Even"
         );
         assert_eq!(super::resolve_tie_phase(1, 1).unwrap(), Phase::Even);
-        // Neither half clean (even == odd == 0): fail loud with FmtsKeyMissing.
-        let err = super::resolve_tie_phase(0, 0).unwrap_err();
-        let expected = std::io::Error::from(crate::error::Error::FmtsKeyMissing).to_string();
-        assert_eq!(
-            err.to_string(),
-            expected,
-            "even == odd == 0 → FmtsKeyMissing"
-        );
+        // Neither half clean (even == odd == 0): no evidence.
+        assert_eq!(super::resolve_tie_phase(0, 0), None);
     }
 
     // ── Fix 1: FMTS phase-probe read-fault vs wrong-key distinction ─────────
