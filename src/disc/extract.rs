@@ -24,6 +24,10 @@ const AACS_UNIT_SECTORS: u32 = crate::aacs::content::ALIGNED_UNIT_SECTORS;
 const READ_BATCH_SECTORS: u32 = 1536; // 3 MiB, multiple of 3
 /// Bounded per-extent retries on a read that fails before a recorded hole.
 const READ_RETRIES: u32 = 3;
+/// Retries per AACS unit when narrowing a failed batch (the batch read already failed once).
+const UNIT_RETRIES: u32 = 1;
+/// Consecutive bad units after which the rest of a failed batch is zero-filled unread.
+const BAD_UNIT_RUN_LIMIT: u32 = 2;
 /// Sectors per read while cracking a VTS title key.
 const CRACK_BATCH_SECTORS: u16 = 64;
 /// Attempts to delete the case-probe marker before giving up.
@@ -748,7 +752,8 @@ fn whole_unit_batch(remaining: u32) -> u32 {
 }
 
 // Reads a batch; if it fails, re-reads it one AACS unit at a time so only the bad unit(s) are
-// lost. Returns the bytes zero-filled in `buf`. The only Err is a stop or key-set error.
+// lost. After BAD_UNIT_RUN_LIMIT consecutive bad units the rest is zero-filled unread (contiguous
+// damage). Returns the bytes zero-filled in `buf`. The only Err is a stop or key-set error.
 fn read_batch_narrowed<S: SectorSource>(
     dec: &mut DecryptingSectorSource<S>,
     lba: u32,
@@ -768,11 +773,15 @@ fn read_batch_narrowed<S: SectorSource>(
     let unit_bytes = AACS_UNIT_SECTORS as usize * SECTOR_BYTES;
     let mut lost = 0u64;
     let mut off = 0u32;
+    let mut bad_run = 0u32;
     for chunk in buf.chunks_mut(unit_bytes) {
         let n = (chunk.len() / SECTOR_BYTES) as u32;
-        if !read_batch(dec, lba + off, n, chunk)? {
+        if bad_run >= BAD_UNIT_RUN_LIMIT || !read_tries(dec, lba + off, n, chunk, UNIT_RETRIES)? {
             chunk.fill(0);
             lost += chunk.len() as u64;
+            bad_run += 1;
+        } else {
+            bad_run = 0;
         }
         off += n;
     }
@@ -3152,6 +3161,65 @@ mod tests {
         assert_eq!(data[0], 1);
         assert_eq!(data[3 * SECTOR_BYTES], 0, "bad unit zero-filled");
         assert_eq!(data[6 * SECTOR_BYTES], 7, "later unit kept");
+    }
+
+    // Counts reads; LBAs in `bad` fail with a drive error.
+    struct CountingBad {
+        bad: std::ops::Range<u32>,
+        calls: u32,
+    }
+    impl SectorSource for CountingBad {
+        fn capacity_sectors(&self) -> u32 {
+            100_000
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            self.calls += 1;
+            if (lba..lba + count as u32).any(|l| self.bad.contains(&l)) {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: None,
+                    sense: None,
+                });
+            }
+            let need = count as usize * SECTOR_BYTES;
+            buf[..need].fill(0x22);
+            Ok(need)
+        }
+    }
+
+    fn narrowed(bad: std::ops::Range<u32>) -> (u64, u32, Vec<u8>) {
+        let src = CountingBad { bad, calls: 0 };
+        let mut dec = DecryptingSectorSource::new(src, DecryptKeys::None);
+        let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_BYTES];
+        let lost = read_batch_narrowed(&mut dec, 1000, READ_BATCH_SECTORS, &mut buf).unwrap();
+        (lost, dec.inner().calls, buf)
+    }
+
+    // Contiguous damage must cost a handful of reads per batch, not one retry loop per unit.
+    #[test]
+    fn narrowed_all_bad_batch_is_read_boundedly() {
+        let (lost, calls, buf) = narrowed(1000..1000 + READ_BATCH_SECTORS);
+        assert_eq!(lost, buf.len() as u64);
+        assert!(buf.iter().all(|&b| b == 0));
+        assert!(calls <= 8, "{calls} reads for one bad batch");
+    }
+
+    // A lone bad sector loses only its AACS unit.
+    #[test]
+    fn narrowed_single_bad_sector_loses_only_its_unit() {
+        let (lost, calls, buf) = narrowed(1700..1701);
+        let unit = AACS_UNIT_SECTORS as usize * SECTOR_BYTES;
+        assert_eq!(lost, unit as u64);
+        let hole = 699 * SECTOR_BYTES;
+        assert!(buf[hole..hole + unit].iter().all(|&b| b == 0));
+        assert_eq!(buf.iter().filter(|&&b| b == 0).count(), unit);
+        assert!(calls <= 1 + 512 + READ_RETRIES, "{calls}");
     }
 
     // Extents covering less than the declared size: the gap is lost bytes, not a clean file.
