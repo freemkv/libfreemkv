@@ -7,6 +7,8 @@
 //! byte 50. Each object is `flags`(1) + reserved(1) + `num_cmds`(u16) followed
 //! by `num_cmds` 12-byte navigation commands.
 
+use super::be_u16;
+
 // One decoded 12-byte navigation command.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cmd {
@@ -35,10 +37,6 @@ const CMD_LEN: usize = 12;
 /// object's command span is bounded against the input length below, so a
 /// separate cap would be dead code.
 const MAX_OBJECTS: usize = 4096;
-
-fn be_u16(d: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?]))
-}
 
 /// Decode one 12-byte command. Caller guarantees `b.len() == 12`.
 fn decode_cmd(b: &[u8]) -> Cmd {

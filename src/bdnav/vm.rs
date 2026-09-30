@@ -675,6 +675,17 @@ mod tests {
     }
 
     #[test]
+    fn set_from_rnd_source_taints_destination() {
+        // GPR0 = RND; GPR1 (clean) += GPR0 (register src); PlayPL GPR1 must abstain.
+        let rnd = set_imm(0x08, 0, 10);
+        let add = cmd((2 << 5) | (2 << 3), 0x00, 0, 0x03, 1, 0);
+        let d = build(&[&[rnd, add, play_pl_reg(1), play_pl(1)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+    }
+
+    #[test]
     fn playpl_operand_over_16_bits_is_not_a_playlist_id() {
         // 0x1_0001 must not alias playlist 1; the VM falls through to 800.
         let wide = cmd((1 << 5) | 2, 0x80, 0, 0, 0x1_0001, 0);

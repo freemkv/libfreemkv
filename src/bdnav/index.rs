@@ -3,6 +3,8 @@
 //! documented binary format, never executed: every field is bounds-checked and
 //! any malformed input yields `None` (the nav resolver then abstains).
 
+use super::be_u16;
+
 /// One playback/title object in `index.bdmv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlaybackObj {
@@ -29,9 +31,6 @@ const OBJ_LEN: usize = 12;
 /// Sanity cap on the title count (real discs have well under this).
 const MAX_TITLES: usize = 4096;
 
-fn be_u16(d: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?]))
-}
 fn be_u32(d: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_be_bytes([
         *d.get(o)?,

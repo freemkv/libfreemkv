@@ -14,6 +14,10 @@ pub(crate) mod vm;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
+pub(super) fn be_u16(d: &[u8], o: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?]))
+}
+
 // Resolve the playlist id First-Play navigation plays as the feature, among ids the caller
 // marks as feature candidates (`is_feature_candidate`). Returns `None` for BD-J discs,
 // malformed nav data, or non-convergence.
