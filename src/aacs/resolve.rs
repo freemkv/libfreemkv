@@ -207,25 +207,23 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
         if let Some(mkb) = ctx.mkb {
             let recs = super::mkb::walk_mkb(mkb);
             let all_dks = providers.device_keys();
-            if let Some(pkm) = super::variant::walk_processing_key(&recs, &all_dks) {
-                match super::variant::derive_media_key_variant(&recs, &pkm.kp) {
-                    Ok(km) => {
-                        let kvu = derive_vuk(&km, ctx.volume_id);
-                        tracing::debug!(
-                            target: "freemkv::disc",
-                            phase = "resolve_keys_v21_path1_hit",
-                            "Variant chain produced Km + Kvu"
-                        );
-                        return Some(build(Some(kvu), derive_uks(&kvu), 1));
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "freemkv::disc",
-                            phase = "resolve_keys_v21_path1_miss",
-                            error_code = %e,
-                            "Variant chain failed"
-                        );
-                    }
+            match super::variant::derive_media_key_from_device_keys(&recs, &all_dks) {
+                Ok(km) => {
+                    let kvu = derive_vuk(&km, ctx.volume_id);
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "resolve_keys_v21_path1_hit",
+                        "Variant chain produced Km + Kvu"
+                    );
+                    return Some(build(Some(kvu), derive_uks(&kvu), 1));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "resolve_keys_v21_path1_miss",
+                        error_code = %e,
+                        "Variant chain failed"
+                    );
                 }
             }
         }
@@ -1076,6 +1074,98 @@ mod tests {
         assert!(
             result.is_none(),
             "resolve_keys with VID=0 and no matching disc-hash entry must return None"
+        );
+    }
+
+    // Synthetic single-slot MKB keyed by `pk`: cvalue = AES-E(pk, mk ^ uv), verify record
+    // for `mk`. Returns (mkb, mk).
+    fn planted_pk_mkb(pk: &[u8; 16]) -> (Vec<u8>, [u8; 16]) {
+        let mk = [0xA5u8; 16];
+        let uv: u32 = 0x0000_0400;
+        let mut raw = mk;
+        for (a, b) in raw[12..16].iter_mut().zip(uv.to_be_bytes()) {
+            *a ^= b;
+        }
+        let cv = aes_ecb_encrypt(pk, &raw);
+        let mut vd = [0x5Au8; 16];
+        vd[..8].copy_from_slice(&MK_VERIFY_MAGIC);
+        let mut sub = vec![12u8];
+        sub.extend_from_slice(&uv.to_be_bytes());
+        let mut mkb = mkb_record(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]);
+        mkb.extend_from_slice(&mkb_record(0x86, &aes_ecb_encrypt(&mk, &vd)));
+        mkb.extend_from_slice(&mkb_record(0x04, &sub));
+        mkb.extend_from_slice(&mkb_record(0x05, &cv));
+        (mkb, mk)
+    }
+
+    fn resolve_with(keydb: &SuppliedKey, mkb: &[u8], vid: &[u8; 16]) -> Option<ResolvedKeys> {
+        let uk_ro = minimal_unit_key_ro();
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[keydb];
+        resolve_keys_v1(&ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: vid,
+            providers,
+            mkb: Some(mkb),
+        })
+    }
+
+    #[test]
+    fn resolve_keys_path2_processing_key_derives_vuk() {
+        let pk = [0x3Cu8; 16];
+        let (mkb, mk) = planted_pk_mkb(&pk);
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: vec![pk],
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
+        let vid = [0x22u8; 16];
+        let r = resolve_with(&keydb, &mkb, &vid).expect("path 2 resolves");
+        assert_eq!(r.key_source, 2);
+        assert_eq!(r.vuk, Some(derive_vuk(&mk, &vid)));
+    }
+
+    #[test]
+    fn resolve_keys_path1_device_key_derives_vuk() {
+        let dkey = [0x1Du8; 16];
+        let (mkb, mk) = planted_pk_mkb(&aesg3(&dkey, 1));
+        let dk = super::super::derive::recover_dk_position(&mkb, &dkey)
+            .expect("planted key applies to the MKB");
+        let keydb = SuppliedKey {
+            device_keys: vec![dk],
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
+        let vid = [0x22u8; 16];
+        let r = resolve_with(&keydb, &mkb, &vid).expect("path 1 resolves");
+        assert_eq!(r.key_source, 1);
+        assert_eq!(r.vuk, Some(derive_vuk(&mk, &vid)));
+    }
+
+    // With a real MKB and derivation material present, a zero VID must still skip paths 1/2/2.5;
+    // only the has_vid gate stops them (the MKB itself would resolve).
+    #[test]
+    fn resolve_keys_zero_vid_gate_blocks_mkb_paths_even_with_a_resolvable_mkb() {
+        let pk = [0x3Cu8; 16];
+        let (mkb, mk) = planted_pk_mkb(&pk);
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: vec![pk],
+            media_keys: vec![mk],
+            disc_entry: None,
+        };
+        assert!(resolve_with(&keydb, &mkb, &[0u8; 16]).is_none());
+        assert!(resolve_with(&keydb, &mkb, &[0x22u8; 16]).is_some());
+    }
+
+    // Known-answer vector: FIPS 180 SHA-1("abc").
+    #[test]
+    fn disc_hash_matches_the_sha1_known_answer() {
+        assert_eq!(
+            disc_hash_hex(&disc_hash(b"abc")),
+            "0xA9993E364706816ABA3E25717850C26C9CD0D89D"
         );
     }
 

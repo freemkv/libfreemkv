@@ -17,9 +17,9 @@ pub struct DeviceKey {
 /// Host certificate + private key for AACS SCSI authentication.
 #[derive(Clone)]
 pub struct HostCert {
-    /// AACS 1.0: 20 bytes. AACS 2.0: 32 bytes.
+    /// AACS 1.0 host private key, 20 bytes (AACS 2.0 uses `private_key_v2`).
     pub private_key: [u8; 20],
-    /// AACS 1.0: 92 bytes. AACS 2.0: 132 bytes.
+    /// AACS 1.0 host certificate, 92 bytes (AACS 2.0 uses `certificate_v2`).
     pub certificate: Vec<u8>,
     /// AACS 2.0 host private key (P-256, 32 bytes). None for AACS 1.0 only.
     pub private_key_v2: Option<[u8; 32]>,

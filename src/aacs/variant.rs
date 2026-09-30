@@ -109,7 +109,7 @@ impl std::fmt::Debug for ProcessingKeyMatch {
     }
 }
 
-fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
+fn records_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
     let r = records.iter().find(|r| {
         (r.rec_type == REC_VERIFY_MEDIA_KEY_V1 || r.rec_type == REC_VERIFY_MEDIA_KEY_V2)
             && r.body.len() >= 16
@@ -117,6 +117,26 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
     let mut out = [0u8; 16];
     out.copy_from_slice(&r.body[..16]);
     Some(out)
+}
+
+/// Try each device key in turn (walk -> Kp -> Km) and return the first Media Key that
+/// verifies. On a variant MKB the walk cannot verify a Kp, so a covering-but-wrong key
+/// must not stop the search. Errs with the last chain error, or `ProcessingKeyUnavailable`.
+pub(crate) fn derive_media_key_from_device_keys(
+    records: &[MkbRecord],
+    device_keys: &[DeviceKey],
+) -> Result<[u8; 16], MediaKeyVariantError> {
+    let mut last = MediaKeyVariantError::ProcessingKeyUnavailable;
+    for dk in device_keys {
+        let Some(pkm) = walk_processing_key(records, std::slice::from_ref(dk)) else {
+            continue;
+        };
+        match derive_media_key_variant(records, &pkm.kp) {
+            Ok(km) => return Ok(km),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// Walk an MKB and return the first `(Kp, uv, cvalue)` that
@@ -129,7 +149,7 @@ pub fn walk_processing_key(
     records: &[MkbRecord],
     device_keys: &[DeviceKey],
 ) -> Option<ProcessingKeyMatch> {
-    let mk_dv = mkb_find_mk_dv(records)?;
+    let mk_dv = records_find_mk_dv(records)?;
     let uvs = mkb_find_body(records, REC_SUBSET_DIFFERENCE)?;
     // Real variant MKBs carry per-uv cvalues in record `0x0c` (46,101x16, one
     // per `0x04` slot); fall back to `0x05` (never the `0x07` SD index).
@@ -423,7 +443,7 @@ pub fn derive_media_key_variant(
     let cvalues = mkb_find_body(mkb_records, REC_MEDIA_KEY_VARIANT_DATA)
         .or_else(|| mkb_find_body(mkb_records, REC_MEDIA_KEY_DATA))
         .ok_or(MediaKeyVariantError::MkbIncomplete)?;
-    let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    let mk_dv = records_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let slots = variant_uv_slots(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     // Kvn = AES-G(Kp, Nonce) & 0xFFFF depends only on `pk` and the MKB's Nonce — neither
     // varies per slot — so compute it ONCE here rather than once per slot in
@@ -480,7 +500,7 @@ pub fn media_key_variant_from_kp(
 ) -> Result<([u8; 16], [u8; 16]), MediaKeyVariantError> {
     let nonce = variant_nonce(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let vkd_table = variant_key_data(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
-    let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    let mk_dv = records_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
 
     // Kmp = AES-128D(Kp, C) XOR uv.
     let mut kmp = aes_ecb_decrypt(kp, c_block);
@@ -1270,7 +1290,7 @@ mod tests {
         let cvalues = mkb_find_body(records, REC_MEDIA_KEY_VARIANT_DATA)
             .or_else(|| mkb_find_body(records, REC_MEDIA_KEY_DATA))
             .expect("cvalues present");
-        let mk_dv = mkb_find_mk_dv(records).expect("0x86 present");
+        let mk_dv = records_find_mk_dv(records).expect("0x86 present");
         let kvn_block = aes_g(kp, &nonce);
         let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
         (
@@ -1457,17 +1477,17 @@ mod tests {
         );
     }
 
-    /// `mkb_find_mk_dv` must supply the ACTUAL `0x86` bytes, not a fixed block.
+    /// `records_find_mk_dv` must supply the ACTUAL `0x86` bytes, not a fixed block.
     #[test]
     fn mkb_find_mk_dv_returns_the_verify_records_actual_bytes() {
         let p = plant_variant_mkb();
         assert_eq!(
-            mkb_find_mk_dv(&p.records),
+            records_find_mk_dv(&p.records),
             Some(p.mk_dv),
             "mk_dv must be the bytes the 0x86 record carries"
         );
-        assert_ne!(mkb_find_mk_dv(&p.records), Some([0u8; 16]));
-        assert_ne!(mkb_find_mk_dv(&p.records), Some([1u8; 16]));
+        assert_ne!(records_find_mk_dv(&p.records), Some([0u8; 16]));
+        assert_ne!(records_find_mk_dv(&p.records), Some([1u8; 16]));
 
         // And it is the block the gate actually uses: swapping the 0x86 record
         // for an unrelated one must break the derivation that just succeeded.
@@ -1849,6 +1869,24 @@ mod tests {
             derive_media_key_variant(&p.records, &m.kp),
             Ok(p.km),
             "the walked Processing Key must derive the planted Media Key"
+        );
+    }
+
+    /// A covering-but-wrong device key ahead of the right one must not hide the Media Key.
+    #[test]
+    fn device_key_search_continues_past_a_covering_wrong_key() {
+        let p = plant_walk_variant_mkb();
+        let mut wrong = p.dk.clone();
+        wrong.key[0] ^= 0xFF;
+        assert!(walk_processing_key(&p.records, std::slice::from_ref(&wrong)).is_some());
+        assert_eq!(
+            derive_media_key_from_device_keys(&p.records, &[wrong.clone(), p.dk.clone()]),
+            Ok(p.km)
+        );
+        assert!(derive_media_key_from_device_keys(&p.records, &[wrong]).is_err());
+        assert_eq!(
+            derive_media_key_from_device_keys(&p.records, &[]),
+            Err(MediaKeyVariantError::ProcessingKeyUnavailable)
         );
     }
 

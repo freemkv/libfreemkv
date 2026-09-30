@@ -275,6 +275,26 @@ mod tests {
         assert!(nodes.contains(&5) && nodes.contains(&6));
     }
 
+    #[test]
+    fn providers_device_keys_dedup_keeps_distinct_uv_and_mask_shift() {
+        // Same key and node, differing only in uv or u_mask_shift, are distinct positions.
+        let base = dk(0x22, 7);
+        let uv = DeviceKey {
+            uv: 2,
+            ..dk(0x22, 7)
+        };
+        let shift = DeviceKey {
+            u_mask_shift: 3,
+            ..dk(0x22, 7)
+        };
+        let a = Fixed {
+            dks: vec![base.clone(), uv, shift, base],
+            ..Default::default()
+        };
+        let arr: &[&dyn KeyProvider] = &[&a];
+        assert_eq!(Providers(arr).device_keys().len(), 3);
+    }
+
     // ── Disc-keyed lookups: array-order short-circuit ──────────────────────
 
     #[test]
