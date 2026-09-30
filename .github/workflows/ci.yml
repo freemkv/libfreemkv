@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
@@ -120,7 +120,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
@@ -147,7 +147,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
@@ -191,7 +191,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
@@ -216,7 +216,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { path: libfreemkv }
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock freemkv-keysources freemkv-engine freemkv-i18n freemkv bdemu
       - name: Point every dependent at THIS libfreemkv commit
@@ -271,7 +271,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           checkout: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
