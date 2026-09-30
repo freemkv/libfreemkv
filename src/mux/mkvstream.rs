@@ -580,7 +580,7 @@ fn emit_to_muxer(
         // Provenance: which clip this frame came from is a lookup, not a guess.
         frame.source.map(|s| s.byte),
         // This picture's measured scan type, tallied for the FlagInterlaced majority.
-        frame.coding.as_ref().and_then(|c| c.progressive()),
+        frame.coding.as_ref().and_then(|c| c.field_order()),
         frame.discard_padding_ns,
     )
 }
@@ -813,7 +813,7 @@ impl MkvStream {
                 f.duration_ns,
                 additional.as_deref(),
                 f.source.map(|s| s.byte),
-                f.coding.as_ref().and_then(|c| c.progressive()),
+                f.coding.as_ref().and_then(|c| c.field_order()),
                 f.discard_padding_ns,
             )?;
         }
@@ -5751,6 +5751,11 @@ mod tests {
             Some(ebml::INTERLACED_INTERLACED),
             "a progressive FIRST picture on a mostly-interlaced title must not flip \
              the whole track to progressive — the majority scan wins"
+        );
+        assert_eq!(
+            muxed_field_order(&out.bytes()),
+            Some(ebml::FIELD_ORDER_TFF),
+            "the promoted track carries the measured majority field order"
         );
     }
 
