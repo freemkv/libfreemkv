@@ -1839,7 +1839,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 target: "mux",
                 dropped = self.dropped_pre_cluster,
                 frames_written = self.frame_count,
-                "frames were discarded before the first cluster opened (no track-0 video keyframe had arrived yet); they are absent from the output"
+                driver_track = self.primary_video_track.unwrap_or(0),
+                "frames were discarded before the first cluster opened (no keyframe on the cluster-driving track had arrived yet); they are absent from the output"
             );
         }
         // Frames excluded by the playlist's clip marks are dropped on purpose (a join
