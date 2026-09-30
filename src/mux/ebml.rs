@@ -612,6 +612,9 @@ pub const CHAPTER_UID: u32 = 0x73C4;
 pub const CHAPTER_TIME_START: u32 = 0x91;
 pub const CHAPTER_DISPLAY: u32 = 0x80;
 pub const CHAP_STRING: u32 = 0x85;
+pub const EDITION_FLAG_DEFAULT: u32 = 0xDB;
+pub const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+pub const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
 pub const CHAP_LANGUAGE: u32 = 0x437C;
 
 // Track types
