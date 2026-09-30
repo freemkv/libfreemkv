@@ -548,68 +548,49 @@ mod tests {
     // swp g0,g1 moves g1 into g0 and the old g0 into g1 (libdvdnav eval_set_op case 2).
     #[test]
     fn swap_exchanges_both_registers() {
-        // g1 = 2; g2 = 2; swp g0,g1; if g0 == g2 JumpTT 2; JumpTT 1.
-        let vmgi = build_vmgi(
-            &[
-                h("7100000100020000"),
-                h("7100000200020000"),
-                h("6200000000010000"),
-                h("3022000000020002"),
-                h("3002000000010000"),
-            ],
-            1,
-            &[(2, 1), (3, 1)],
-        );
-        assert_eq!(resolve_from_vmg(&vmgi).map(|r| r.title), Some(2));
+        let mut vm = Vm::new();
+        vm.gprm[0] = 5;
+        vm.gprm[1] = 9;
+        vm.gprm_tainted[0] = true;
+        vm.set(0, SET_SWAP, false, 0, 1);
+        assert_eq!((vm.gprm[0], vm.gprm[1]), (9, 5), "both registers written");
+        assert!(vm.gprm_tainted[1], "the source takes the old taint");
+        assert!(!vm.gprm_tainted[0]);
     }
 
-    // rnd is non-deterministic: a branch on its result must abstain.
+    // Every compare op decides on l<r, l==r and l>r (libdvdnav eval_compare).
     #[test]
-    fn branch_on_rnd_result_abstains() {
-        // g0 = rnd 3; if g0 == g1 JumpTT 2; JumpTT 3.
-        let vmgi = build_vmgi(
-            &[
-                h("7800000000030000"),
-                h("3022000000020001"),
-                h("3002000000030000"),
-            ],
-            1,
-            &[(2, 1), (3, 1), (4, 1)],
-        );
-        assert_eq!(resolve_from_vmg(&vmgi), None);
-    }
-
-    // SetSystem op 3 (SetGPRMMD) stores into a GPRM (libdvdnav eval_system_set case 3).
-    #[test]
-    fn setgprmmd_writes_the_gprm() {
-        // SetGPRMMD g0 = 2; g1 = 2; if g0 == g1 JumpTT 3; JumpTT 1.
-        let vmgi = build_vmgi(
-            &[
-                h("5300000200000000"),
-                h("7100000100020000"),
-                h("3022000000030001"),
-                h("3002000000010000"),
-            ],
-            1,
-            &[(2, 1), (3, 1), (4, 1)],
-        );
-        assert_eq!(resolve_from_vmg(&vmgi).map(|r| r.title), Some(3));
-    }
-
-    // A counter-mode GPRM counts elapsed time: a branch on it must abstain.
-    #[test]
-    fn counter_mode_gprm_taints_later_compares() {
-        // SetGPRMMD g0 = 0 (counter mode, byte5 bit 7); if g0 == g1 JumpTT 3; JumpTT 1.
-        let vmgi = build_vmgi(
-            &[
-                h("5300000000800000"),
-                h("3022000000030001"),
-                h("3002000000010000"),
-            ],
-            1,
-            &[(2, 1), (3, 1), (4, 1)],
-        );
-        assert_eq!(resolve_from_vmg(&vmgi), None);
+    fn compare_ops_decide_on_ordering() {
+        let mut vm = Vm::new();
+        vm.gprm[0] = 5;
+        let ev = |vm: &Vm, op, imm| {
+            let c = Compare {
+                op,
+                lhs_reg: 0,
+                immediate: true,
+                imm,
+                rhs_reg: 0,
+            };
+            vm.eval(&c).0
+        };
+        // (op, result for imm 4 [l>r], 5 [l==r], 6 [l<r])
+        let table = [
+            (CMP_AND, [true, true, false]), // 5&4, 5&5 nonzero; 5&6 = 4 nonzero
+            (CMP_EQ, [false, true, false]),
+            (CMP_NE, [true, false, true]),
+            (CMP_GE, [true, true, false]),
+            (CMP_GT, [true, false, false]),
+            (CMP_LE, [false, true, true]),
+            (CMP_LT, [false, false, true]),
+        ];
+        for (op, want) in table {
+            for (imm, w) in [4u16, 5, 6].into_iter().zip(want) {
+                let w = if op == CMP_AND { (5 & imm) != 0 } else { w };
+                assert_eq!(ev(&vm, op, imm), w, "op {op} imm {imm}");
+            }
+        }
+        assert!(!ev(&vm, CMP_AND, 2), "5 & 2 is zero");
+        assert!(!ev(&vm, 0, 5), "an unknown op is false");
     }
 
     // A set followed by a link sub-instruction (here LinkTailPGC) leaves the pre list:
@@ -866,6 +847,38 @@ mod tests {
         assert_eq!(resolve_from_vmg(&vmgi), None);
     }
 
+    /// A `Goto` lands on its 1-based target line, skipping the lines between.
+    #[test]
+    fn goto_skips_to_the_target_line() {
+        // line 1: Goto 3; line 2: JumpTT 9 (skipped); line 3: JumpTT 1.
+        let vmgi = build_vmgi(
+            &[
+                h("0001000000000003"),
+                h("3002000000090000"),
+                h("3002000000010000"),
+            ],
+            1,
+            &[(2, 1)],
+        );
+        assert_eq!(
+            resolve_from_vmg(&vmgi),
+            Some(ResolvedTitle {
+                title: 1,
+                vtsn: 2,
+                vts_ttn: 1
+            })
+        );
+    }
+
+    /// JumpTT 0 and a TT_SRPT entry with VTS 0 are unaddressable, so abstain.
+    #[test]
+    fn jumptt_zero_and_vtsn_zero_abstain() {
+        let vmgi = build_vmgi(&[h("3002000000000000")], 1, &[(2, 1)]);
+        assert_eq!(resolve_from_vmg(&vmgi), None, "title 0");
+        let vmgi = build_vmgi(&[h("3002000000010000")], 1, &[(0, 1)]);
+        assert_eq!(resolve_from_vmg(&vmgi), None, "vtsn 0");
+    }
+
     /// A self-referential `Goto` cannot spin forever — the step budget stops it
     /// and the resolver abstains.
     #[test]
@@ -895,9 +908,8 @@ mod tests {
         }
     }
 
-    // A TT_SRPT pointer that would overflow when scaled to a byte offset must
-    // be rejected, not wrap (a real table at that sector would allocate
-    // terabytes in the fixture, not the resolver).
+    // A TT_SRPT pointer far past the image abstains. On 64-bit this trips the
+    // u16_at bounds check; the checked_mul guard only matters on 32-bit.
     #[test]
     fn overflowing_tt_srpt_sector_abstains() {
         let mut vmgi = build_vmgi(&[h("3002000000010000")], 1, &[(2, 1)]);

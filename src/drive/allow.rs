@@ -134,5 +134,8 @@ mod tests {
         alloc[10] = 0x00;
         assert_eq!(invalidated_agid(&alloc), None, "format 0 allocates");
         assert_eq!(invalidated_agid(&[0xA4, 0, 0]), None, "short CDB");
+        let mut other = release(3);
+        other[0] = 0x00;
+        assert_eq!(invalidated_agid(&other), None, "not REPORT KEY");
     }
 }

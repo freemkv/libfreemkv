@@ -275,8 +275,13 @@ fn rescan_returns_stable_disc_identity() {
             .map(|a| (a.disc_hash.clone(), a.mkb_version, a.volume_id))
     };
 
+    assert_eq!(
+        first_snapshot.is_some(),
+        second_snapshot.is_some(),
+        "AACS state appeared or vanished across rescans"
+    );
     let (Some(a), Some(b)) = (first_snapshot, second_snapshot) else {
-        return;
+        return; // clear/DVD disc: no AACS state to compare
     };
     assert_eq!(a.0, b.0, "disc_hash drifted across rescans");
     assert_eq!(a.1, b.1, "mkb_version drifted across rescans");

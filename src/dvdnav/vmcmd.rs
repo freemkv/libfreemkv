@@ -330,6 +330,13 @@ mod tests {
         v.try_into().unwrap()
     }
 
+    // A set's link flag covers sub-ops 0..=LINKSUB_MAX inclusive; above it, no link.
+    #[test]
+    fn set_link_flag_boundary_at_linksub_max() {
+        assert!(decode(&h("7101000000010010")).link, "sub-op 0x10 is a link");
+        assert!(!decode(&h("7101000000010011")).link, "sub-op 0x11 is not");
+    }
+
     // Special sub-command 3 (SetTmpPML) sets SPRM13 then gotos byte7 when cond holds.
     #[test]
     fn set_tmp_pml_decodes_as_goto() {

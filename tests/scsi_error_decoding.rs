@@ -1,6 +1,8 @@
 //! Integration tests for the SCSI error-decoding contract.
 //!
-//! Pins the contract every backend must satisfy via a mock `ScsiTransport`:
+//! Pins how the error type classifies pre-built outcomes handed back by a mock
+//! `ScsiTransport`; no backend or sense parser runs here (see `scsi::parse_sense` tests).
+//! The contract a backend must satisfy:
 //! healthy result → `Ok(ScsiResult { .. })`; transport-level failure →
 //! `Error::ScsiError { status: SCSI_STATUS_TRANSPORT_FAILURE, sense: None }`
 //! ([`Error::is_scsi_transport_failure`] true); SCSI-level failure (CHECK
@@ -280,30 +282,6 @@ fn test_asc_ascq_round_trip_through_error() {
     assert_eq!(sense.sense_key, SENSE_KEY_MEDIUM_ERROR);
     assert_eq!(sense.asc, 0x11);
     assert_eq!(sense.ascq, 0x05);
-}
-
-// ── 12. Healthy short transfer (resid > 0) ────────────────────────────────
-
-#[test]
-fn test_healthy_short_transfer_reports_partial_bytes() {
-    // Transport reported back fewer bytes than requested (resid = 16).
-    // For a 96-byte buffer that means bytes_transferred = 80.
-    let payload = vec![0u8; 96];
-    let mut transport = MockTransport::new(vec![MockOutcome::Ok {
-        data: payload,
-        resid: 16,
-    }]);
-
-    let cdb = [libfreemkv::scsi::SCSI_INQUIRY, 0, 0, 0, 0x60, 0];
-    let mut buf = [0u8; 96];
-    let r = transport
-        .execute(&cdb, DataDirection::FromDevice, &mut buf, 1_000)
-        .expect("ok");
-    assert_eq!(r.status, 0);
-    assert_eq!(
-        r.bytes_transferred, 80,
-        "bytes_transferred must equal data.len() - resid"
-    );
 }
 
 // ── 13. Error::Display does not leak English in the SCSI variant ──────────
