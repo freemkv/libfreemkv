@@ -487,6 +487,11 @@ mod provenance_guard {
         let mut i = 0;
         while let Some(p) = src[i..].find("Frame {") {
             let start = i + p;
+            // Skip longer names ending in `Frame {` (e.g. `PesFrame {`).
+            if start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
+                i = start + "Frame {".len();
+                continue;
+            }
             let open = start + src[start..].find('{').unwrap();
             let (mut depth, mut k) = (0usize, open);
             while k < b.len() {
@@ -518,7 +523,7 @@ mod provenance_guard {
                 // `source: None` fixtures are fine). Two loss spellings: explicit
                 // `source: None`, or omitting it (Frame derives Default, so `..` yields None).
                 let explicit_none = blk.contains("source: None");
-                let no_source_field = !blk.contains("source:");
+                let no_source_field = !blk.contains("source:") && !blk.contains("source,");
                 if explicit_none || no_source_field {
                     let line = src[..src.find(blk).unwrap_or(0)].lines().count() + 1;
                     let how = if explicit_none {

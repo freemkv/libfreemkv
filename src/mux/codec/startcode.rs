@@ -327,4 +327,12 @@ mod tests {
         let data = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(BitReader::new(&data).read_ue(), Some(u32::MAX >> 1));
     }
+
+    #[test]
+    fn read_ue_thirty_two_leading_zeros_is_rejected() {
+        // 32 zeros, a stop bit, 32 info bits: one past the cap, so None (not a code
+        // whose `1 << 32` would overflow).
+        let data = [0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(BitReader::new(&data).read_ue(), None);
+    }
 }

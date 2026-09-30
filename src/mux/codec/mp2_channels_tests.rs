@@ -1,13 +1,17 @@
 use super::*;
 
+// Spec quotes kept as reference text; the tests assert the behaviour directly.
 /// 13818-3 (2nd ed.) §2.5.3.1, the rule the whole module follows.
+#[allow(dead_code)]
 const SPEC_DETECTION: &str = "The MPEG-1 ancillary data field is initially assumed to contain \
      the coded multichannel extension. If the mandatory CRC-check yields a valid result, then \
      multichannel decoding will be started.";
 /// 13818-3 §2.5.1.3 (Layer II): the base frame's parts, in order.
+#[allow(dead_code)]
 const SPEC_BASE_FRAME: &str = "base_frame() { mpeg1_header() mpeg1_error_check() \
      mpeg1_audio_data() mc_extension_data_part1() mpeg1_ancillary_data() }";
 /// 13818-3 §2.5.2.14: what `mc_crc_check` covers.
+#[allow(dead_code)]
 const SPEC_MC_CRC: &str = "In Layer I and II, the calculation begins with the first bit of the \
      multichannel header and ends with the last bit of the scfsi field, but excluding the \
      mc_crc_check field itself.";
@@ -778,7 +782,6 @@ fn frame_crc_is_checked_when_protection_bit_is_zero() {
 /// A frame whose mc_crc_check verifies is multichannel; one that does not, is not.
 #[test]
 fn multichannel_needs_a_valid_mc_crc_check() {
-    let _ = (SPEC_DETECTION, SPEC_BASE_FRAME, SPEC_MC_CRC);
     let good = with_mc(STEREO_256, MC_3_2_LFE);
     // §2.5.3.1: "If the mandatory CRC-check yields a valid result, then multichannel decoding
     // will be started."
@@ -1044,6 +1047,25 @@ fn missing_channels_copy_their_allocation_as_the_tables_say() {
     assert_eq!(src(0, 1, &st(1, 2, false), 0), "T1");
     // 3/0 '0' "T2": transmitted.
     assert_eq!(src(1, 0, &st(0, 0, false), 0), "read");
+    // 3/2 '0011' T2 missing across every tc: 1|7 from Lo, 2|6 from Ro, the rest by dyn_cross_LR.
+    for (tc, lr, want) in [
+        (7, true, "T0"),
+        (6, false, "T1"),
+        (4, false, "T0"),
+        (4, true, "T1"),
+    ] {
+        assert_eq!(src(1, 2, &st(3, tc, lr), 0), want, "3/2 tc {tc} lr {lr}");
+    }
+    // 3/1 '011' T3 missing: tc 4|5 copy from Ro, else Lo unless tc<3 with dyn_cross_LR.
+    for (tc, lr, want) in [
+        (4, false, "T1"),
+        (5, false, "T1"),
+        (3, false, "T0"),
+        (7, true, "T0"),
+        (0, true, "T1"),
+    ] {
+        assert_eq!(src(1, 1, &st(3, tc, lr), 1), want, "3/1 tc {tc} lr {lr}");
+    }
 }
 
 /// §2.5.2.13 centre "'11' centre bandwidth limited (Phantom coding)": "the subbands above
@@ -1459,7 +1481,7 @@ fn random_bytes_never_panic() {
         let mut f: Vec<u8> = (0..len).map(|_| next() as u8).collect();
         if i % 2 == 0 && len >= 4 {
             f[0] = 0xFF;
-            f[1] = 0xFC | (f[1] & 0x03); // syncword, ID 1, Layer II
+            f[1] = 0xFC | (f[1] & 0x01); // syncword, ID 1, Layer II ('10')
         }
         if i % 3 == 0 {
             f = seeds[i % seeds.len()].clone();
