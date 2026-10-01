@@ -291,8 +291,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     }
 
     // Decrypt `buf` with the active keys, gated by content ranges when set.
-    // Shared by the first read and post-fetch retry so both agree on which
-    // units are content and the unit-key try order.
     fn decrypt_buf(
         buf: &mut [u8],
         keys: &mut DecryptKeys,
@@ -1394,6 +1392,32 @@ mod tests {
         );
         assert_eq!(&buf[2 * ul..], &clear[..]);
         assert_eq!(dec.blanked_units(), 1);
+    }
+
+    /// A blanked unit reaches the run: its loss counter and one `UnitBlanked` at the read's
+    /// LBA; a read with no damage reports nothing.
+    #[test]
+    fn blanked_units_are_reported_to_the_run() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let ctx =
+            crate::ctx::Ctx::default().with_events(Arc::new(move |e: &crate::event::Event<'_>| {
+                if let crate::event::Event::UnitBlanked { lba, units } = e {
+                    sink.lock().unwrap().push((*lba, *units));
+                }
+            }));
+        let mut dec = damaged_file_source(4, &[1, 2]);
+        dec.observe(&ctx);
+        read_units(&mut dec, 0, 1).expect("intact unit");
+        assert!(seen.lock().unwrap().is_empty(), "no damage, no event");
+        assert_eq!(ctx.stats.snapshot().units_blanked, 0);
+        read_units(&mut dec, 1, 2).expect("a damage cluster is blanked");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(u64::from(FILE_LBA) + 3, 2)],
+            "one event: the read's LBA and the unit count"
+        );
+        assert_eq!(ctx.stats.snapshot().units_blanked, 2);
     }
 
     /// A cluster of damaged units is blanked and counted however it is read: alone, first,

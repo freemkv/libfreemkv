@@ -122,6 +122,7 @@ fn every_drive_cdb_goes_through_exec() {
     assert!(d.mode_sense_page(0x2A).is_none());
     assert!(d.read_buffer(2, 0xF1, 16).is_none());
     assert!(d.report_key_rpc_state().is_none());
+    assert!(!d.disc_is_dvd());
     assert!(!d.enable_recovered_error_reporting());
     assert!(matches!(d.eject(), Err(Error::Halted)));
     assert!(matches!(
@@ -196,6 +197,18 @@ fn read_postcheck_discards_after_cancel() {
         1,
         "the in-flight READ ran to completion"
     );
+}
+
+/// LD3: every READ-class opcode is checked again on completion, not only READ(10).
+#[test]
+fn read_class_covers_every_read_opcode() {
+    for op in [crate::scsi::SCSI_READ_10, 0xA8, 0x88, 0xBE, 0xB9] {
+        assert!(is_read_class(&[op, 0, 0]), "{op:#04x}");
+    }
+    for op in [SCSI_TEST_UNIT_READY, 0x1E, 0x46, 0x25] {
+        assert!(!is_read_class(&[op, 0, 0]), "{op:#04x}");
+    }
+    assert!(!is_read_class(&[]));
 }
 
 /// LD4 (Drive half): `exec_cleanup` admits the ALLOW for a tray this Drive locked

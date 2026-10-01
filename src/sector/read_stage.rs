@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // Ramp back to the preferred batch size after this many clean sectors (100
 // MiB = 51,200 sectors) — long enough that noisy zones can't trigger a
 // premature probe, short enough an isolated failure doesn't lock size 1.
-const PROBE_THRESHOLD_SECTORS: u32 = 100 * 1024 * 1024 / 2048;
+const PROBE_THRESHOLD_SECTORS: u32 = (100 * 1024 * 1024 / SECTOR) as u32;
 
 const SECTOR: usize = crate::consts::SECTOR_BYTES;
 

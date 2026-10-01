@@ -42,7 +42,8 @@ pub struct DriveId {
     /// Drive serial number — GET CONFIGURATION Feature 0108h
     pub serial_number: String,
 
-    /// Raw 96-byte INQUIRY response for additional parsing if needed.
+    /// Raw INQUIRY response for additional parsing if needed: what the drive
+    /// sent, 36 to 96 bytes.
     pub raw_inquiry: Vec<u8>,
 
     /// Raw GET CONFIGURATION Feature 010Ch response bytes.
@@ -661,6 +662,18 @@ mod tests {
         assert_eq!(id.serial_number, "ABCD1234");
         assert_eq!(id.firmware_date, "201604250000");
         assert_eq!(id.raw_gc_010c.len(), 28, "header + 20-byte descriptor");
+    }
+
+    // MMC-6 §5.3.10: the date is CCYYMMDDHHMI, 12 characters; longer vendor
+    // payload in the descriptor is not part of it.
+    #[test]
+    fn from_drive_firmware_date_is_capped_at_12_characters() {
+        let mut t = GcReplyTransport {
+            firmware: gc_reply(0x010C, b"201604250000EXTRA"),
+            serial: gc_reply(0x0108, b"ABCD1234"),
+        };
+        let id = DriveId::from_drive(&mut t).unwrap();
+        assert_eq!(id.firmware_date, "201604250000");
     }
 
     // A drive lacking the feature answers RT=10b with only the 8-byte header.
