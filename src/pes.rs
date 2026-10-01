@@ -1,10 +1,10 @@
-//! Stream — read PES frames in, write PES frames out.
+//! PES frames — the unit that moves between an input and an output.
 //!
-//! A stream is a stream. You read() from it or write() to it.
-//! The stream handles its own format internally.
+//! A [`PesSource`] yields frames with `read()`; a [`PesSink`] takes them with `write()`.
+//! Each handles its own format internally.
 //!
-//! disc.read()  → PES frame (sectors → decrypt → demux internally)
-//! mkv.write(frame) → MKV file (mux internally)
+//! source.read()     → PES frame (sectors → decrypt → demux internally)
+//! sink.write(frame) → output file or wire (mux internally)
 
 // Shared by `serialize`/`deserialize` so the wire format round-trips.
 // Oversized frames are rejected on write rather than hard-erroring

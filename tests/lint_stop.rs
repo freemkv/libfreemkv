@@ -398,17 +398,27 @@ fn no_thread_sleep_on_op_paths() {
     let mut hits = Vec::new();
     for s in srcs.iter().filter(|s| in_dirs(s, OP_DIRS)) {
         hits.extend(s.hits("thread::sleep").into_iter().map(|i| (s, i)));
-        for i in s.hits("thread::{") {
-            let group = &s.code[i..close_of(s.code.as_bytes(), i + 8)];
-            if group
-                .split(|c: char| !is_ident(c as u8))
-                .any(|w| w == "sleep")
-            {
-                hits.push((s, i));
-            }
-        }
+        hits.extend(sleep_imports(&s.code).into_iter().map(|i| (s, i)));
     }
     check("thread::sleep on an op path", hits, ALLOW);
+}
+
+// Offsets of `thread::{...}` import groups that bring `sleep` into scope.
+fn sleep_imports(code: &str) -> Vec<usize> {
+    code.match_indices("thread::{")
+        .map(|(i, _)| i)
+        .filter(|&i| {
+            code[i..close_of(code.as_bytes(), i + 8)]
+                .split(|c: char| !is_ident(c as u8))
+                .any(|w| w == "sleep")
+        })
+        .collect()
+}
+
+#[test]
+fn sleep_imports_finds_a_grouped_sleep_only() {
+    let code = "use std::thread::{self, sleep};\nuse std::thread::{self, spawn};\nuse a::thread::{sleeper};";
+    assert_eq!(sleep_imports(code), vec![code.find("thread::{").unwrap()]);
 }
 
 /// §2.2: "**Every** raw `self.scsi.as_mut().execute` in `drive/mod.rs` and `identity.rs`

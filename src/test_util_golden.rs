@@ -37,7 +37,7 @@ impl Golden {
         self
     }
 
-    /// Record the length and SHA-256 of `bytes` under `key`.
+    /// Record the length and the first 16 bytes (hex) of the SHA-256 of `bytes` under `key`.
     pub fn bytes(&mut self, key: &str, bytes: &[u8]) -> &mut Self {
         use sha2::{Digest, Sha256};
         let digest: String = Sha256::digest(bytes)

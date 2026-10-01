@@ -1253,8 +1253,10 @@ impl std::fmt::Display for Error {
                 (None, None) => write!(f, "E{}: {}", self.code(), sector),
             },
             Error::Halted => write!(f, "E{}", self.code()),
-            Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
-            Error::UdfUnrecordedExtent { path } => write!(f, "E{}: {}", self.code(), path),
+            // Disc- or backup-folder-derived names: escape control characters.
+            Error::UdfNotFound { path } | Error::UdfUnrecordedExtent { path } => {
+                write!(f, "E{}: {}", self.code(), path.escape_debug())
+            }
             Error::SeamPlanDroppedMost { dropped, written } => {
                 write!(f, "E{} {dropped}/{written}", self.code())
             }
@@ -1265,7 +1267,7 @@ impl std::fmt::Display for Error {
             | Error::DirImageFileChanged { path }
             | Error::DirNameTooLong { path }
             | Error::DirImageFanout { path } => {
-                write!(f, "E{}: {}", self.code(), path)
+                write!(f, "E{}: {}", self.code(), path.escape_debug())
             }
             Error::DiscTitleRange { index, count } => {
                 write!(f, "E{}: {}/{}", self.code(), index, count)
@@ -1331,8 +1333,10 @@ impl std::fmt::Display for Error {
             Error::TimedOut { op } | Error::WorkerLost { op } => {
                 write!(f, "E{}: {op}", self.code())
             }
-            Error::BusStreamUnmapped { files } => write!(f, "E{}: {files}", self.code()),
-            Error::ImageScoped { path } => write!(f, "E{}: {path}", self.code()),
+            Error::BusStreamUnmapped { files } => {
+                write!(f, "E{}: {}", self.code(), files.escape_debug())
+            }
+            Error::ImageScoped { path } => write!(f, "E{}: {}", self.code(), path.escape_debug()),
             Error::RemuxVerifyFailed { kind, path } => match kind {
                 RemuxVerifyKind::RuntimeMismatch {
                     have_secs,
@@ -1409,21 +1413,21 @@ impl From<Error> for std::io::Error {
             9000..=9001 => std::io::ErrorKind::Unsupported,
             9002..=9008 => std::io::ErrorKind::InvalidInput,
             // 9010 HevcParamParse: malformed hvcC payload.
-            9010 => std::io::ErrorKind::InvalidData,
+            E_HEVC_PARAM_PARSE => std::io::ErrorKind::InvalidData,
             // 9011 MuxTrackRange: caller passed a bad track index.
-            9011 => std::io::ErrorKind::InvalidInput,
+            E_MUX_TRACK_RANGE => std::io::ErrorKind::InvalidInput,
             // 9012 Fmp4Unimplemented: sink can't emit media yet.
-            9012 => std::io::ErrorKind::Unsupported,
+            E_FMP4_UNIMPLEMENTED => std::io::ErrorKind::Unsupported,
             // 9014 PipelineJoinTimeout: consumer drain exceeded deadline.
             E_PIPELINE_JOIN_TIMEOUT => std::io::ErrorKind::TimedOut,
             // 9017 PesTrackTooLarge: out-of-range track index on serialize.
-            9017 => std::io::ErrorKind::InvalidInput,
+            E_PES_TRACK_TOO_LARGE => std::io::ErrorKind::InvalidInput,
             // 9020 DiscCapacityOverflow: disc reported a capacity sentinel
             // we can't represent — treat as bad/invalid device data.
-            9020 => std::io::ErrorKind::InvalidData,
+            E_DISC_CAPACITY_OVERFLOW => std::io::ErrorKind::InvalidData,
             // 9021 M2tsPacketMalformed: a muxer invariant break produced
             // a non-188-byte packet — treat as invalid data.
-            9021 => std::io::ErrorKind::InvalidData,
+            E_M2TS_PACKET_MALFORMED => std::io::ErrorKind::InvalidData,
             // 9022 NetworkAddrBlocked: the output host resolved only to
             // invalid (unspecified/multicast/broadcast/reserved) addresses.
             E_NETWORK_ADDR_BLOCKED => std::io::ErrorKind::PermissionDenied,
@@ -1440,7 +1444,7 @@ impl From<Error> for std::io::Error {
             // truncated — invalid input data.
             E_MKV_SOURCE_INVALID => std::io::ErrorKind::InvalidData,
             // 9054 MkvUnencodable: the writer was asked for an element size EBML
-            // cannot represent. An output-side limit, not bad input.
+            // cannot represent; the data it was given cannot be encoded.
             E_MKV_UNENCODABLE => std::io::ErrorKind::InvalidData,
             // mp4:// demux errors: a malformed/truncated source file
             // (E_MP4_INVALID), or a source whose tracks the mux can't use — no
@@ -1457,10 +1461,10 @@ impl From<Error> for std::io::Error {
             E_SYNC_TIMEOUT | E_SYNC_WORKER_LOST => std::io::ErrorKind::TimedOut,
             // 9030 ExtentNotUnitAligned: a malformed/non-AACS-aligned
             // extent was handed to the prefetch producer.
-            9030 => std::io::ErrorKind::InvalidInput,
+            E_EXTENT_NOT_UNIT_ALIGNED => std::io::ErrorKind::InvalidInput,
             // 9047 DiscCapacityMalformed: the drive returned an unusable
             // READ CAPACITY response (short transfer / overflow).
-            9047 => std::io::ErrorKind::InvalidData,
+            E_DISC_CAPACITY_MALFORMED => std::io::ErrorKind::InvalidData,
             // dir:// usage / footgun gates (9019, 9024–9026, 9028): the caller
             // gave an invalid flag/source/name combination — InvalidInput.
             E_DIR_RAW_REJECTED
@@ -1785,6 +1789,36 @@ mod tests {
         let shown = e.to_string();
         assert!(!shown.chars().any(char::is_control), "{shown:?}");
         assert!(shown.contains("A\\u{1b}[2JB\\n"), "{shown}");
+    }
+
+    #[test]
+    fn disc_derived_names_cannot_inject_terminal_escapes_via_display() {
+        let n = || "A\x1b[2JB".to_string();
+        let errors = [
+            Error::UdfNotFound { path: n() },
+            Error::UdfUnrecordedExtent { path: n() },
+            Error::DirImagePlacement { path: n() },
+            Error::DirImageFileChanged { path: n() },
+            Error::DirNameTooLong { path: n() },
+            Error::DirImageFanout { path: n() },
+            Error::BusStreamUnmapped { files: n() },
+            Error::ImageScoped { path: n() },
+        ];
+        for e in errors {
+            let shown = e.to_string();
+            assert!(!shown.chars().any(char::is_control), "{shown:?}");
+            assert_eq!(shown, format!("E{}: A\\u{{1b}}[2JB", e.code()));
+        }
+    }
+
+    #[test]
+    fn image_ends_before_read_display_is_lba_then_have_slash_want() {
+        let e = Error::ImageEndsBeforeRead {
+            lba: 111,
+            have: 222,
+            want: 333,
+        };
+        assert_eq!(e.to_string(), format!("E{}: 111 222/333", e.code()));
     }
 
     #[test]
