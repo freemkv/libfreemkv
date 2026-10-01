@@ -183,6 +183,32 @@ mod tests {
         assert!(waiting(&g));
     }
 
+    // After a forward discontinuity the clock rebases: normal PTS past the jump counts again.
+    #[test]
+    fn the_clock_runs_again_after_a_forward_pts_jump() {
+        let mut g = HeaderGate::default();
+        for pts in [0, S, 100 * S, 101 * S, 102 * S, 103 * S, 104 * S] {
+            g.account(0, pts, 0);
+        }
+        assert!(!waiting(&g), "5 s of content on either side of the jump");
+    }
+
+    // A subtitle track has no codec_private and never holds the headers.
+    #[test]
+    fn subtitle_tracks_never_gate() {
+        let mut t = DiscTitle::empty();
+        t.streams
+            .push(Stream::Subtitle(crate::disc::SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+                qualifier: crate::disc::LabelQualifier::None,
+                codec_data: None,
+            }));
+        assert!(HeaderGate::default().ready(&t, |_| None));
+    }
+
     // Decode-order reordering (B-frames) must not inflate elapsed time.
     #[test]
     fn reordered_pts_count_once() {

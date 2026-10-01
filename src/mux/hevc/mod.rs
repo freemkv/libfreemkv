@@ -495,6 +495,23 @@ mod tests {
         assert_eq!(&out[..], &[0x00, 0x00, 0x00, 0x01, 0x40, 0x01]);
     }
 
+    // An hvcC ending 1-2 bytes into the next array header is truncated, not read past its end.
+    #[test]
+    fn hvcc_cut_inside_an_array_header_is_truncated_not_out_of_bounds() {
+        for tail in [&[32u8][..], &[32, 0]] {
+            let mut hvcc = vec![0u8; 22];
+            hvcc.push(2); // numArrays = 2
+            hvcc.push(32);
+            hvcc.extend_from_slice(&1u16.to_be_bytes());
+            hvcc.extend_from_slice(&2u16.to_be_bytes());
+            hvcc.extend_from_slice(&[0x40, 0x01]);
+            hvcc.extend_from_slice(tail);
+            let (out, truncated) = hvcc_parse(&hvcc);
+            assert!(truncated, "tail {tail:?}");
+            assert_eq!(out.unwrap(), [0x00, 0x00, 0x00, 0x01, 0x40, 0x01]);
+        }
+    }
+
     // --- length_prefixed_to_annex_b additional branches ---
 
     #[test]

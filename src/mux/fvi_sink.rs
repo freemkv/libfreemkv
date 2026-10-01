@@ -338,6 +338,24 @@ mod tests {
         assert_eq!(n, [0, 1]);
     }
 
+    // Known provenance (playlist, volume id) and picture count are carried into the header.
+    #[test]
+    fn header_carries_playlist_volume_id_and_picture_count_when_known() {
+        let source = SourceInfo {
+            playlist: "00800.mpls".into(),
+            volume_id: "DISC_LABEL".into(),
+            ..SourceInfo::default()
+        };
+        let mut header = MapHeader::from_title(&mpeg2_title(), source);
+        header.picture_count = Some(7);
+        let mut out = Vec::new();
+        write_fvi_header(&mut out, &header).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["source"]["playlist"], "00800.mpls");
+        assert_eq!(v["source"]["volume_id"], "DISC_LABEL");
+        assert_eq!(v["picture_count"], 7);
+    }
+
     #[test]
     fn sink_writes_header_and_only_video_records() {
         let dir = tempfile::tempdir().unwrap();

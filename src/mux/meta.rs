@@ -675,6 +675,94 @@ mod tests {
         assert_eq!(cursor.position() as usize % BD_SOURCE_PACKET_BYTES, 0);
     }
 
+    // Every stream field the receiver acts on survives an FMKV hop (network://, stdio://, m2ts://).
+    #[test]
+    fn stream_fields_round_trip_through_the_header() {
+        use crate::disc::{
+            AudioChannels, AudioStream, LabelPurpose, LabelQualifier, MVC_DEPENDENT_LABEL,
+            SampleRate, SubtitleStream,
+        };
+        let mut t = video_title(HdrFormat::Hdr10, ColorSpace::Bt2020);
+        if let Stream::Video(v) = &mut t.streams[0] {
+            v.label = MVC_DEPENDENT_LABEL.into();
+            v.secondary = true;
+        }
+        for (i, purpose) in [
+            LabelPurpose::Commentary,
+            LabelPurpose::Descriptive,
+            LabelPurpose::Score,
+            LabelPurpose::Ime,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            t.streams.push(Stream::Audio(AudioStream {
+                pid: 0x1100 + i as u16,
+                codec: Codec::Dts,
+                channels: AudioChannels::Surround71,
+                language: "fra".into(),
+                sample_rate: SampleRate::S96,
+                secondary: true,
+                purpose,
+                label: format!("audio {i}"),
+            }));
+        }
+        for qualifier in [
+            LabelQualifier::Sdh,
+            LabelQualifier::DescriptiveService,
+            LabelQualifier::Forced,
+        ] {
+            t.streams.push(Stream::Subtitle(SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "deu".into(),
+                forced: true,
+                qualifier,
+                codec_data: None,
+            }));
+        }
+        let back = M2tsMeta::from_title(&t).to_title();
+        let Stream::Video(v) = &back.streams[0] else {
+            panic!("video first")
+        };
+        assert!(v.is_mvc_dependent());
+        let dbg = |s: &crate::disc::Stream| format!("{s:?}");
+        let (want, got): (Vec<_>, Vec<_>) = t
+            .streams
+            .iter()
+            .zip(&back.streams)
+            .map(|(a, b)| (dbg(a), dbg(b)))
+            .unzip();
+        assert_eq!(got, want);
+    }
+
+    // The wire track is a u8: a header declaring more than 256 streams is refused.
+    #[test]
+    fn a_header_with_more_than_256_streams_is_refused() {
+        let title_of = |n: usize| {
+            let mut t = DiscTitle::empty();
+            for pid in 0..n {
+                t.streams
+                    .push(Stream::Subtitle(crate::disc::SubtitleStream {
+                        pid: pid as u16,
+                        codec: Codec::Pgs,
+                        language: String::new(),
+                        forced: false,
+                        qualifier: crate::disc::LabelQualifier::None,
+                        codec_data: None,
+                    }));
+            }
+            t
+        };
+        let read = |n| {
+            let mut buf = Vec::new();
+            write_header(&mut buf, &M2tsMeta::from_title(&title_of(n))).unwrap();
+            read_header(&mut io::Cursor::new(buf))
+        };
+        assert!(read(256).unwrap().is_some());
+        assert!(read(257).is_err());
+    }
+
     #[test]
     fn audio_and_subtitle_codec_private_round_trip() {
         use crate::disc::{AudioChannels, AudioStream, LabelPurpose, SampleRate, SubtitleStream};
