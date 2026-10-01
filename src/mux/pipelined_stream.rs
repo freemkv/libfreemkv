@@ -872,6 +872,43 @@ mod tests {
         );
     }
 
+    /// A parser that holds one inter frame, flagged discontinuous, until flush.
+    struct HeldDanglingParser;
+    impl CodecParser for HeldDanglingParser {
+        fn parse(&mut self, _: &PesPacket) -> Vec<super::super::codec::Frame> {
+            vec![]
+        }
+        fn flush(&mut self) -> Vec<super::super::codec::Frame> {
+            vec![super::super::codec::Frame {
+                coding: None,
+                source: None,
+                pts_ns: 0,
+                keyframe: false,
+                discontinuity: true,
+                data: b"P".to_vec(),
+                duration_ns: None,
+            }]
+        }
+        fn codec_private(&self) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    // B1 at EOF: a final inter frame held by the parser and flagged discontinuous goes
+    // through the same gate: it is dropped and counted, not written with dangling references.
+    #[test]
+    fn b1_gate_applies_to_the_frame_flushed_at_eof() {
+        let title = video_title(false);
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> =
+            vec![(0x1011, Box::new(HeldDanglingParser))];
+        let (mut stream, tx) = make_stream(title, parsers, vec![(0x1011u16, 0usize)]);
+        tx.send(DemuxBatch::Ts(vec![ts_pes(0x1011, vec![1])]))
+            .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        assert!(stream.read().unwrap().is_none(), "the dangling frame is dropped");
+        assert_eq!(stream.errors(), 1, "and counted");
+    }
+
     /// Counterpart to B1: a discontinuity on a NON-video track must NOT drop
     /// frames — audio/subtitle access units are independent, so the gate admits
     /// every frame the parser still produces.
