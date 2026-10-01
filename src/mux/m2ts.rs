@@ -1227,7 +1227,10 @@ mod tests {
         title.codec_privates = vec![None; 3];
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
-        assert!(stream.undelivered_streams().is_empty(), "nothing arrived yet");
+        assert!(
+            stream.undelivered_streams().is_empty(),
+            "nothing arrived yet"
+        );
         stream
             .write(&frame(0, 0, true, fake_idr_pes_data()))
             .unwrap();

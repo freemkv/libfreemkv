@@ -1049,7 +1049,8 @@ mod tests {
         );
         let e = m.finish().expect_err("an AU that cannot be packetized");
         assert!(
-            e.to_string().contains(&crate::error::Error::MpgUnpacketized.to_string()),
+            e.to_string()
+                .contains(&crate::error::Error::MpgUnpacketized.to_string()),
             "{e}"
         );
     }

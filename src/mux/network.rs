@@ -761,7 +761,9 @@ mod tests {
             .meta(&sample_title());
         writer.write(&one_frame()).unwrap();
         let linger = |w: &NetworkStream| match &w.mode {
-            Mode::Write { writer, .. } => socket2::SockRef::from(writer.get_ref()).linger().unwrap(),
+            Mode::Write { writer, .. } => {
+                socket2::SockRef::from(writer.get_ref()).linger().unwrap()
+            }
             Mode::Read { .. } => unreachable!(),
         };
         assert_eq!(linger(&writer), None);

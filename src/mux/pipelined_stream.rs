@@ -905,7 +905,10 @@ mod tests {
         tx.send(DemuxBatch::Ts(vec![ts_pes(0x1011, vec![1])]))
             .unwrap();
         tx.send(DemuxBatch::Eof).unwrap();
-        assert!(stream.read().unwrap().is_none(), "the dangling frame is dropped");
+        assert!(
+            stream.read().unwrap().is_none(),
+            "the dangling frame is dropped"
+        );
         assert_eq!(stream.errors(), 1, "and counted");
     }
 

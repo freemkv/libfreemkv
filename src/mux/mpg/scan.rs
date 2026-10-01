@@ -601,7 +601,12 @@ mod probe_tests {
         ];
         for (i, rate) in want.into_iter().enumerate() {
             let es = video(720, 576, i as u8 + 1, false);
-            assert_eq!(probe_video(&es, Some(0x02)).unwrap().2, rate, "code {}", i + 1);
+            assert_eq!(
+                probe_video(&es, Some(0x02)).unwrap().2,
+                rate,
+                "code {}",
+                i + 1
+            );
         }
         let es = video(720, 576, 0, false);
         assert_eq!(probe_video(&es, Some(0x02)).unwrap().2, FrameRate::Unknown);

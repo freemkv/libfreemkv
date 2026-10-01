@@ -1449,7 +1449,8 @@ mod tests {
             let mut mux = TsMuxer::new(&mut sink, &pids);
             mux.set_program(types.to_vec()).unwrap();
             for t in 0..types.len() {
-                mux.write_frame(t, 0, true, &[0xFF, 0xF1, 0x4C, 0x80]).unwrap();
+                mux.write_frame(t, 0, true, &[0xFF, 0xF1, 0x4C, 0x80])
+                    .unwrap();
             }
             mux.finish().unwrap();
         }

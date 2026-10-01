@@ -197,9 +197,17 @@ mod tests {
             subtitle: PidFilter::All,
         };
         let s = SelectedSource::wrap(Box::new(src), &sel).unwrap();
-        assert_eq!(s.track_timing(0).codec_delay_ns, 20, "inner track 2's timing");
+        assert_eq!(
+            s.track_timing(0).codec_delay_ns,
+            20,
+            "inner track 2's timing"
+        );
         assert_eq!(s.track_timing(1), TrackTiming::default());
-        assert_eq!(s.config_changes(), vec![(0, 7)], "renumbered, unkept dropped");
+        assert_eq!(
+            s.config_changes(),
+            vec![(0, 7)],
+            "renumbered, unkept dropped"
+        );
         assert_eq!((s.errors(), s.lost_bytes()), (5, 9));
         assert!(!s.headers_ready());
     }

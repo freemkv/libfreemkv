@@ -2330,7 +2330,10 @@ fn a_timestamp_below_the_origin_is_clamped_and_counted() {
     let out = sink.mux.take().unwrap().into_writer();
     let parsed = replay::parse(&out).unwrap();
     assert!(
-        parsed.pes.iter().any(|x| x.key.0 == 0xC0 && x.pts == Some(0)),
+        parsed
+            .pes
+            .iter()
+            .any(|x| x.key.0 == 0xC0 && x.pts == Some(0)),
         "the clamped AU is stamped 0"
     );
 }
@@ -2412,7 +2415,7 @@ fn a_partial_lpcm_unit_at_eof_is_padded_not_lost() {
         secs: 2,
         ..Opts::default()
     });
-    let last = fx.frames.iter().filter(|f| f.track == 6).last().unwrap();
+    let last = fx.frames.iter().rfind(|f| f.track == 6).unwrap();
     // Three stereo 24-bit sample frames: under any packing unit.
     let tail = PesFrame {
         pts: last.pts + 10 * MS,
@@ -2494,8 +2497,16 @@ fn a_map_pairing_an_extension_with_the_wrong_base_drops_it() {
     };
     let e = [
         entry(0x02, 0xE0, vec![]),
-        entry(0x04, 0xC0, pack::hierarchy_descriptor(pack::HIERARCHY_BASE, 0, 0).to_vec()),
-        entry(0x04, 0xC1, pack::hierarchy_descriptor(pack::HIERARCHY_BASE, 2, 0).to_vec()),
+        entry(
+            0x04,
+            0xC0,
+            pack::hierarchy_descriptor(pack::HIERARCHY_BASE, 0, 0).to_vec(),
+        ),
+        entry(
+            0x04,
+            0xC1,
+            pack::hierarchy_descriptor(pack::HIERARCHY_BASE, 2, 0).to_vec(),
+        ),
         // 0xD1 embeds layer 0 (base 0xC0), but the IR pairs 0xD1 only with 0xC1.
         entry(
             0x04,

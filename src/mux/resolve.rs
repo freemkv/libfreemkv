@@ -992,7 +992,9 @@ pub(crate) fn build_keyed_pipeline<S: SectorSource + Send + 'static>(
         )
         .map_err(io::Error::from)?;
     let plan = IsoPlan {
-        extents: set.key_map().read_plan(&full_extents, u32::from(AACS_UNIT_SECTORS)),
+        extents: set
+            .key_map()
+            .read_plan(&full_extents, u32::from(AACS_UNIT_SECTORS)),
         full_extents,
         policy,
         unit_align: AACS_UNIT_SECTORS,
