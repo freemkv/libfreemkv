@@ -144,7 +144,7 @@ pub enum DecryptKeys {
     /// Stream, HD-DVD `.evo` = Program Stream); it travels with the keys because
     /// both are resolved once per disc, and the key SELECTOR (`is_clean`) needs it
     /// to prove a key structurally against the right container. Only a
-    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet) builds one (KU §2.2).
+    /// [`KeyRing`](crate::keys::KeyRing) builds one (KU §2.2).
     #[non_exhaustive]
     Aacs {
         unit_keys: Vec<(u32, [u8; 16])>,

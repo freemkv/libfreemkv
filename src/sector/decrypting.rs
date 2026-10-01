@@ -47,7 +47,7 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// is a bug and fails loud on the first unit (AACS decrypts only via the map).
     key_map: Option<Arc<crate::decrypt::AacsKeyMap>>,
     /// The key set's on-arrival proof for pieces `resolve` could not prove up front
-    /// (KU §2.4). `None` for every reader not built by a `ResolvedKeySet`.
+    /// (KU §2.4). `None` for every reader not built by a `KeyRing`.
     arrival: Option<Box<crate::keys::Arrival>>,
     /// Damaged AACS units blanked so far (see [`blanked_units`](Self::blanked_units)).
     blanked: BlankTally,
@@ -69,7 +69,7 @@ pub(crate) struct StageOptions {
     /// Pass ciphertext through: never crack, decrypt or refuse.
     pub(crate) raw: bool,
     /// Held AACS keys for a loose BD-TS file.
-    pub(crate) keys: Option<crate::keys::ResolvedKeySet>,
+    pub(crate) keys: Option<crate::keys::KeyRing>,
     /// The run: its halt ends the crack scan, its stats count blanked units.
     pub(crate) ctx: crate::ctx::Ctx,
 }
@@ -101,7 +101,7 @@ fn span_touches_content(content: Option<&[(u32, u32)]>, lba: u32, count: u16) ->
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
     /// Wrap `inner` with the given keys. AACS decrypts only through a key map, which
-    /// only a [`ResolvedKeySet`](crate::keys::ResolvedKeySet) reader installs; an AACS
+    /// only a [`KeyRing`](crate::keys::KeyRing) reader installs; an AACS
     /// source built here fails loud on its first encrypted unit.
     pub fn new(inner: S, keys: DecryptKeys) -> Self {
         Self {
@@ -122,7 +122,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
 
     /// The content-detected stage (every input but a disc, image or folder): the first read
     /// classifies the head and resolves once (D3). A PS is cracked, a BD-TS read through
-    /// [`ResolvedKeySet::loose_file`](crate::keys::ResolvedKeySet::loose_file), else clear.
+    /// [`KeyRing::loose_file`](crate::keys::KeyRing::loose_file), else clear.
     pub(crate) fn detecting(inner: S, opts: StageOptions) -> Self {
         #[cfg(test)]
         super::stage::STAGES.with(|n| n.set(n.get() + 1));
@@ -170,7 +170,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                 self.watch_css = !self.keys.is_encrypted();
             }
             Kind::BdTs if !opts.raw => {
-                let set = crate::keys::ResolvedKeySet::loose_file(opts.keys.as_ref(), cap);
+                let set = crate::keys::KeyRing::loose_file(opts.keys.as_ref(), cap);
                 self.keys = set.decrypt_keys();
                 self.key_map = Some(set.key_map());
                 self.arrival = set.arrival(set.title_stop()).map(Box::new);

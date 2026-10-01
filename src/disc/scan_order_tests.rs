@@ -1036,10 +1036,11 @@ fn cancelled_scan_then_resolve_returns_halted_and_builds_no_set() {
     assert!(matches!(r, Err(Error::Halted)), "{r:?}");
     assert!(s.disc().is_none(), "a stopped scan stores no Disc");
     let sources: crate::session::KeySourceFactory = Arc::new(Vec::new);
-    let r = s.resolve_key_set(
+    let r = s.acquire_keys(
         crate::keys::KeyScope::WholeDisc,
         &sources,
         Default::default(),
+        &crate::ctx::Ctx::default(),
     );
     assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
     let reads = fake.count(is_read10);

@@ -144,6 +144,29 @@ pub enum KeyOutcome {
     NoKey,
 }
 
+/// Where an acquired key came from, for the ring's trace and the engine's key status.
+/// Variants are ordered root-of-trust → per-disc leaf.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeyOrigin {
+    /// MKB + device keys → subset-difference tree → VUK
+    DeviceKey,
+    /// MKB + processing keys → media key → VUK
+    ProcessingKey,
+    /// Media key + Volume ID from KEYDB → derived VUK
+    KeyDbDerived,
+    /// VUK found directly in KEYDB by disc hash
+    KeyDb,
+    /// Pre-decrypted unit keys taken directly from KEYDB by disc hash.
+    /// No VUK present in the entry — `AacsState::vuk` is `None`.
+    KeyDbUnitKeys,
+    /// Unit key supplied directly by the caller (the external Unit Key path).
+    /// No keydb, no derivation — `AacsState::vuk` is `None`.
+    ExternalUk,
+}
+
+// No `KeyOrigin::name()`: the library holds ZERO user-facing English. Callers
+// map variants to display text (see freemkv's `disc_info::key_origin_label`).
+
 #[cfg(test)]
 mod tests {
     use super::*;

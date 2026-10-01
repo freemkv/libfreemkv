@@ -354,7 +354,7 @@ impl DiscStream {
         &mut self.reader
     }
 
-    /// Install a [`ResolvedKeySet`](crate::keys::ResolvedKeySet)'s on-arrival proof on the
+    /// Install a [`KeyRing`](crate::keys::KeyRing)'s on-arrival proof on the
     /// inline reader (KU §2.4): a piece the set left unproven is proven when first read.
     pub(crate) fn with_arrival(mut self, arrival: crate::keys::Arrival) -> Self {
         self.reader.set_arrival(arrival);

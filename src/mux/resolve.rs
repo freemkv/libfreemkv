@@ -366,7 +366,7 @@ pub struct InputOptions {
     pub selection: crate::StreamSelection,
     /// The rip's up-front key set (KU §3.1). An AACS image is read through the set's
     /// reader, with no lookup here; `None` refuses an AACS image before any output.
-    pub keys: Option<crate::keys::ResolvedKeySet>,
+    pub keys: Option<crate::keys::KeyRing>,
 }
 
 // Hand-rolled so `InputOptions` stays printable without dumping key material.
@@ -603,7 +603,7 @@ fn keyed_image_input<S, F>(
     reader: S,
     mut disc: crate::disc::Disc,
     opts: &InputOptions,
-    set: &crate::keys::ResolvedKeySet,
+    set: &crate::keys::KeyRing,
     reopen: F,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream>
@@ -930,14 +930,14 @@ struct IsoPlan {
     format: ContentFormat,
 }
 
-/// The ISO title mux over a [`ResolvedKeySet`](crate::keys::ResolvedKeySet) (KU §3.1): the
+/// The ISO title mux over a [`KeyRing`](crate::keys::KeyRing) (KU §3.1): the
 /// set's decrypting reader (its map and on-arrival proof) under the prefetcher, with no
 /// resolution here. `title` is an already-scanned title; E7013 if the set does not cover
 /// its extents or the image is not a sector-exact copy of the set's disc.
 pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
     reader: S,
     title: DiscTitle,
-    set: &crate::keys::ResolvedKeySet,
+    set: &crate::keys::KeyRing,
     batch_sectors: u16,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {

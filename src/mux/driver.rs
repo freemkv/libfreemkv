@@ -317,7 +317,7 @@ fn mux_unkeyed(
 }
 
 /// Where [`mux_with_keys`] reads its PES frames from (KU §3.1). No variant carries key
-/// material: keys come only from the rip's [`ResolvedKeySet`](crate::keys::ResolvedKeySet).
+/// material: keys come only from the rip's [`KeyRing`](crate::keys::KeyRing).
 pub enum MuxSource<'a> {
     /// Live single-pass mux off an opened [`DiscSession`] (its reader staged).
     Session {
@@ -354,7 +354,7 @@ pub enum MuxSource<'a> {
 /// during the open or the pump alike, yields `completed = false, halted = true`, not an error.
 pub fn mux_with_keys(
     source: MuxSource,
-    keys: Option<&crate::keys::ResolvedKeySet>,
+    keys: Option<&crate::keys::KeyRing>,
     dest_url: &str,
     opts: &MuxOptions,
     ctx: &Ctx,
@@ -370,7 +370,7 @@ pub fn mux_with_keys(
 // `mux_with_keys` before its one halt rule: picks the keyed or unkeyed arms.
 fn mux_routed(
     source: MuxSource,
-    keys: Option<&crate::keys::ResolvedKeySet>,
+    keys: Option<&crate::keys::KeyRing>,
     dest_url: &str,
     opts: &MuxOptions,
     ctx: &Ctx,
@@ -383,7 +383,7 @@ fn mux_routed(
         (MuxSource::Iso { title, format, .. } | MuxSource::Live { title, format, .. }, None)
             if !opts.raw && *format == crate::disc::ContentFormat::BdTs =>
         {
-            Some(crate::keys::ResolvedKeySet::keyless_for(title, *format))
+            Some(crate::keys::KeyRing::keyless_for(title, *format))
         }
         // A Session over an AACS disc with no set: BD-TS as above; HD DVD is never
         // probed (KU §2.6), so it refuses up front.
@@ -401,7 +401,7 @@ fn mux_routed(
                     }
                     .into());
                 }
-                crate::keys::ResolvedKeySet::keyless_for_disc(d, *title_index)
+                crate::keys::KeyRing::keyless_for_disc(d, *title_index)
             }
             _ => None,
         },
@@ -423,7 +423,7 @@ fn mux_routed(
 // The keyed arms of `mux_with_keys`: the set's readers, never a resolve.
 fn mux_keyed(
     source: MuxSource,
-    set: &crate::keys::ResolvedKeySet,
+    set: &crate::keys::KeyRing,
     dest_url: &str,
     opts: &MuxOptions,
     ctx: &Ctx,
@@ -459,7 +459,7 @@ fn mux_keyed(
                     path: session.device_path().to_string(),
                 })?;
                 let scope = crate::keys::KeyScope::Titles(vec![title_index]);
-                if !set.is_for(disc) || !set.covers(&scope) {
+                if !set.is_for(&disc.media_id()) || !set.covers(&scope) {
                     tracing::error!(target: "freemkv::keys", "key set is not for this session's title");
                     return Err(Error::DecryptFailed.into());
                 }
@@ -521,7 +521,7 @@ fn mux_keyed(
 fn live_keyed_title(
     reader: &dyn SectorSource,
     mut title: DiscTitle,
-    set: &crate::keys::ResolvedKeySet,
+    set: &crate::keys::KeyRing,
     opts: &MuxOptions,
 ) -> std::io::Result<DiscTitle> {
     opts.selection
@@ -542,7 +542,7 @@ fn live_keyed(
     reader: Box<dyn SectorSource>,
     title: DiscTitle,
     format: crate::disc::ContentFormat,
-    set: &crate::keys::ResolvedKeySet,
+    set: &crate::keys::KeyRing,
     opts: &MuxOptions,
     ctx: &Ctx,
 ) -> std::io::Result<Box<dyn Stream>> {
@@ -1943,7 +1943,7 @@ mod tests {
 
     /// A synthetic AACS `Disc` with one title whose sole extent is the encrypted unit at
     /// LBA 0..3 — the disc a `MuxSource::Session` mux scans off a live drive, minus the
-    /// hardware. It holds no key: AACS keys come only from a `ResolvedKeySet`.
+    /// hardware. It holds no key: AACS keys come only from a `KeyRing`.
     fn aacs_session_disc(title: DiscTitle) -> crate::disc::Disc {
         crate::disc::Disc {
             volume_id: "TEST".into(),
@@ -3015,7 +3015,7 @@ mod tests {
     }
 
     // One encrypted audio unit at LBA 0..3 under `key`, its title, and a set keying it.
-    fn keyed_live(key: [u8; 16]) -> (Box<AacsUnitReader>, DiscTitle, crate::keys::ResolvedKeySet) {
+    fn keyed_live(key: [u8; 16]) -> (Box<AacsUnitReader>, DiscTitle, crate::keys::KeyRing) {
         let reader = Box::new(AacsUnitReader {
             unit: encrypted_audio_unit(&key),
             capacity: 16,
@@ -3027,7 +3027,7 @@ mod tests {
         }];
         let mut disc = aacs_session_disc(title.clone());
         disc.capacity_sectors = 16;
-        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
+        let set = crate::keys::KeyRing::keyed_for_test(&disc, key, &[(0, 3)]);
         (reader, title, set)
     }
 
@@ -3073,7 +3073,7 @@ mod tests {
         let (reader, title, _) = keyed_live(key);
         let mut disc = aacs_session_disc(title);
         disc.capacity_sectors = 16;
-        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
+        let set = crate::keys::KeyRing::keyed_for_test(&disc, key, &[(0, 3)]);
         let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
         let out = mux_with_keys(
             MuxSource::Session {
@@ -3097,7 +3097,7 @@ mod tests {
         let (reader, title, _) = keyed_live(key);
         let mut disc = aacs_session_disc(title);
         disc.capacity_sectors = 16;
-        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
+        let set = crate::keys::KeyRing::keyed_for_test(&disc, key, &[(0, 3)]);
         let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
         let mut bad = keyed_opts();
         bad.selection.audio = crate::mux::select::PidFilter::Only(vec![0x0FFF]);
@@ -3133,7 +3133,7 @@ mod tests {
         if let Some(a) = other.aacs.as_mut() {
             a.disc_hash = "0xdef".into();
         }
-        let set = crate::keys::ResolvedKeySet::keyed_for_test(&other, key, &[(0, 3)]);
+        let set = crate::keys::KeyRing::keyed_for_test(&other, key, &[(0, 3)]);
         let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
         let err = mux_with_keys(
             MuxSource::Session {
@@ -3206,8 +3206,8 @@ mod tests {
     fn mux_with_keys_without_an_aacs_set_refuses_aacs_content() {
         let _serial = crate::sector::prefetched::holder_test_lock();
         let key = [0x5A; 16];
-        let none = crate::keys::ResolvedKeySet::none();
-        let live = |keys: Option<&crate::keys::ResolvedKeySet>, raw: bool, unit: Vec<u8>| {
+        let none = crate::keys::KeyRing::none();
+        let live = |keys: Option<&crate::keys::KeyRing>, raw: bool, unit: Vec<u8>| {
             let (_, title, _) = keyed_live(key);
             let reader = Box::new(AacsUnitReader { unit, capacity: 16 });
             let opts = MuxOptions {
@@ -3307,7 +3307,7 @@ mod tests {
         tempfile::TempDir,
         std::path::PathBuf,
         DiscTitle,
-        crate::keys::ResolvedKeySet,
+        crate::keys::KeyRing,
     ) {
         let (_, mut title, _) = keyed_live(key);
         let sectors = units * 3;
@@ -3318,7 +3318,7 @@ mod tests {
         let mut disc = aacs_session_disc(title.clone());
         disc.aacs.as_mut().unwrap().bus_encryption = true;
         disc.capacity_sectors = sectors + 16;
-        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, sectors)]);
+        let set = crate::keys::KeyRing::keyed_for_test(&disc, key, &[(0, sectors)]);
         let mut image = encrypted_audio_unit(&key).repeat(units as usize);
         damage(&mut image);
         image.resize((sectors + 16) as usize * 2048, 0);
@@ -3331,7 +3331,7 @@ mod tests {
     fn mux_damaged_iso(
         path: &std::path::Path,
         title: DiscTitle,
-        set: &crate::keys::ResolvedKeySet,
+        set: &crate::keys::KeyRing,
         dest: &str,
     ) -> std::io::Result<MuxOutcome> {
         mux_with_keys(

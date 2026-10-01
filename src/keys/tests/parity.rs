@@ -60,7 +60,7 @@ fn copy_image(g: &mut Golden, tag: &str, fx: &Fx, reader: &mut dyn SectorSource)
     }
 }
 
-fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&ResolvedKeySet>, src: Faulty) {
+fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&KeyRing>, src: Faulty) {
     let dest = tempfile::tempdir().unwrap();
     let opts = crate::disc::ExtractOptions {
         keys,
@@ -99,7 +99,7 @@ fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&ResolvedKeySet>, sr
     }
 }
 
-fn mux_cells(g: &mut Golden, fx: &Fx, set: Option<&ResolvedKeySet>, dead: Option<(u32, u32)>) {
+fn mux_cells(g: &mut Golden, fx: &Fx, set: Option<&KeyRing>, dead: Option<(u32, u32)>) {
     let _serial = crate::sector::prefetched::holder_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let iso = write_iso(fx, dir.path());
@@ -185,7 +185,7 @@ fn image_cell(name: &str, fx: &Fx, pool: &[[u8; 16]], dead: Option<(u32, u32)>) 
         &mut fx.source(),
         KeyScope::WholeDisc,
         &specs,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     );
     if !refused(&mut g, "resolve-whole", &whole) {
@@ -210,7 +210,7 @@ fn image_cell(name: &str, fx: &Fx, pool: &[[u8; 16]], dead: Option<(u32, u32)>) 
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &specs,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     );
     if !refused(&mut g, "resolve-title", &titles) {

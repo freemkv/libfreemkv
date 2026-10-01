@@ -192,7 +192,7 @@ pub use identity::DriveId;
 
 // ─── Unlock seam: drive/disc unlocking (firmware, AACS cert, CSS bus-auth) lives entirely in `freemkv-unlock`; consumed via `unlock_bridge`, exposes nothing. ───
 
-// ─── Decryption (AACS/CSS): AACS keys come only from `keys::ResolvedKeySet` (KU §2.2); `decrypt_sectors()` is for raw sector buffers (ISO patching). ───
+// ─── Decryption (AACS/CSS): AACS keys come only from `keys::KeyRing` (KU §2.2); `decrypt_sectors()` is for raw sector buffers (ISO patching). ───
 #[cfg(feature = "rip")]
 pub use decrypt::{decrypt_sectors, decrypt_threads, set_decrypt_threads};
 
@@ -200,13 +200,15 @@ pub use decrypt::{decrypt_sectors, decrypt_threads, set_decrypt_threads};
 // `Disc::scan()` fully populates `Disc`; `Disc::identify()` is a UDF-only fast path
 // for name/format display. Codec enums are canonical; never compare display strings.
 #[cfg(feature = "rip")]
+pub use aacs::trace::KeyOrigin;
+#[cfg(feature = "rip")]
 pub use dirimage::DirImage;
 #[cfg(feature = "rip")]
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
     DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
-    FileResult, FrameRate, HdrFormat, Key, KeyOrigin, LabelPurpose, LabelQualifier, Resolution,
-    SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
+    FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, Resolution, SampleRate,
+    ScanOptions, Stream, SubtitleStream, VideoStream,
 };
 #[cfg(feature = "rip")]
 pub use keysource::{DiscInputs, KeySource, read_encrypted_units};

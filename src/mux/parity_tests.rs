@@ -7,7 +7,7 @@ use super::resolve::{InputOptions, input};
 use super::select::{PidFilter, StreamSelection};
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::consts::BD_SOURCE_PACKET_BYTES as PKT;
-use crate::keys::ResolvedKeySet;
+use crate::keys::KeyRing;
 use crate::test_util::{CLIP_AUDIO_PIDS, Golden, synthetic_bd_clip};
 use std::path::Path;
 
@@ -334,7 +334,7 @@ fn record_source(g: &mut Golden, tag: &str, scheme: &str, bytes: &[u8], opts: &I
 
 fn keyed(keys: &[[u8; 16]]) -> InputOptions {
     InputOptions {
-        keys: Some(ResolvedKeySet::held_for_test(keys)),
+        keys: Some(KeyRing::held_for_test(keys)),
         ..Default::default()
     }
 }

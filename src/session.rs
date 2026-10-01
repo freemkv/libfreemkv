@@ -20,11 +20,11 @@ use std::sync::Arc;
 ///
 /// libfreemkv builds no key sources itself (the `freemkv_keysources` crate that
 /// implements [`KeySource`] depends on libfreemkv, not the other way round), so
-/// the consumer hands in a way to build its sources. [`ResolvedKeySet::resolve`]
+/// the consumer hands in a way to build its sources. [`KeyRing::resolve`]
 /// calls it once and keeps nothing; it stays `Send + Sync` without requiring
 /// `KeySource: Send`.
 ///
-/// [`ResolvedKeySet::resolve`]: crate::keys::ResolvedKeySet::resolve
+/// [`KeyRing::resolve`]: crate::keys::KeyRing::resolve
 pub type KeySourceFactory = Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>;
 
 /// Which optical device a [`DiscSession`] should open.
@@ -338,36 +338,37 @@ impl DiscSession {
         }
     }
 
-    /// Resolve the rip's key set for `scope` up front (KU §3.1): one
-    /// [`ResolvedKeySet::resolve`](crate::keys::ResolvedKeySet::resolve) through the
-    /// session's staged reader, else its drive. The session keeps nothing: the set is the
+    /// Acquire the rip's key ring for `scope` up front (KU §3.1): one
+    /// [`KeyRing::acquire_for_disc`](crate::keys::KeyRing::acquire_for_disc) through the
+    /// session's staged reader, else its drive. The session keeps nothing: the ring is the
     /// caller's, and no source is retained. Requires [`Self::scan`] to have run.
-    pub fn resolve_key_set(
+    pub fn acquire_keys(
         &mut self,
         scope: crate::keys::KeyScope,
         sources: &KeySourceFactory,
-        opts: crate::keys::ResolveKeysOptions,
+        opts: crate::keys::AcquireOptions,
+        ctx: &crate::ctx::Ctx,
     ) -> Result<crate::keys::KeyResolution> {
-        // Under `open_with` the session's op token governs the resolve too (§2.12).
+        // Under `open_with` the session's op token governs the acquire too (§2.12).
         let (op, progress) = (self.halt.clone(), self.progress.clone());
-        if let Some(h) = &op {
-            h.check()?;
-        }
-        let mut opts = opts;
-        if let Some(h) = &op {
-            // As `Drive::alias` (§2.2): the session's op token wins over the caller's.
-            if opts
-                .halt
-                .is_some_and(|c| !Arc::ptr_eq(c.as_arc(), h.as_arc()))
-            {
-                tracing::warn!(
-                    target: "freemkv::session",
-                    phase = "halt_alias",
-                    "ResolveKeysOptions.halt differs from the session's op token; the session token wins"
-                );
+        let ctx = match op {
+            Some(h) => {
+                h.check()?;
+                if !Arc::ptr_eq(ctx.halt.as_arc(), h.as_arc()) {
+                    // As `Drive::alias` (§2.2): the session's op token wins over the caller's.
+                    tracing::warn!(
+                        target: "freemkv::session",
+                        phase = "halt_alias",
+                        "the run context's halt differs from the session's op token; the session token wins"
+                    );
+                }
+                crate::ctx::Ctx {
+                    halt: h,
+                    ..ctx.clone()
+                }
             }
-            opts.halt = Some(h);
-        }
+            None => ctx.clone(),
+        };
         let Some(disc) = self.disc.as_ref() else {
             return Err(Error::DeviceNotReady {
                 path: self.device.clone(),
@@ -382,12 +383,9 @@ impl DiscSession {
                 });
             }
         };
-        match &progress {
-            Some(p) => crate::keys::ResolvedKeySet::resolve_with_progress(
-                disc, reader, scope, sources, opts, p,
-            ),
-            None => crate::keys::ResolvedKeySet::resolve(disc, reader, scope, sources, opts),
-        }
+        let mut opts = opts;
+        opts.liveness = opts.liveness.or(progress.as_ref());
+        crate::keys::KeyRing::acquire_for_disc(disc, reader, scope, sources, opts, &ctx)
     }
 
     /// The scanned disc, if [`Self::scan`] has run.

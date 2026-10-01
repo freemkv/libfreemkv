@@ -4,7 +4,7 @@
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::consts::BD_SOURCE_PACKET_BYTES as PKT;
 use crate::error::{E_CSS_KEY_MISSING, E_MP4_INVALID, E_NO_DISC_KEY, E_NO_STREAMS, error_code};
-use crate::keys::ResolvedKeySet;
+use crate::keys::KeyRing;
 use crate::mux::resolve::{InputOptions, input};
 use crate::pes::PesFrame;
 
@@ -107,7 +107,7 @@ fn read(scheme: &str, bytes: &[u8], opts: &InputOptions) -> std::io::Result<(Vec
 
 fn keyed() -> InputOptions {
     InputOptions {
-        keys: Some(ResolvedKeySet::held_for_test(&[[0x11; 16], KEY])),
+        keys: Some(KeyRing::held_for_test(&[[0x11; 16], KEY])),
         ..Default::default()
     }
 }
@@ -155,7 +155,7 @@ fn an_aacs_m2ts_with_no_keys_is_refused_before_any_frame() {
 fn an_aacs_m2ts_no_held_key_opens_is_refused() {
     let enc = flagged(&clear_clip(), Some(&KEY));
     let opts = InputOptions {
-        keys: Some(ResolvedKeySet::held_for_test(&[[0x22; 16]])),
+        keys: Some(KeyRing::held_for_test(&[[0x22; 16]])),
         ..Default::default()
     };
     let e = read("m2ts", &enc, &opts).unwrap_err();

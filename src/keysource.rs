@@ -341,7 +341,7 @@ pub trait KeySource {
     }
 
     /// Whether this source's answer depends on the content samples it is sent. `true` (the
-    /// default): `ResolvedKeySet::resolve` asks it once per unopened piece, with that piece's
+    /// default): `KeyRing::resolve` asks it once per unopened piece, with that piece's
     /// samples. `false` (a keydb keyed by disc hash): asked once per resolve (KU §2.3 step 8).
     fn answer_depends_on_samples(&self) -> bool {
         true
@@ -374,6 +374,16 @@ pub fn read_encrypted_units(
     title: &crate::disc::DiscTitle,
     n: usize,
 ) -> Vec<Vec<u8>> {
+    encrypted_units_in(reader, &title.extents, title.content_format, n)
+}
+
+// `read_encrypted_units` over bare extents (the key sampler's main-feature samples).
+pub(crate) fn encrypted_units_in(
+    reader: &mut dyn crate::sector::SectorSource,
+    extents: &[crate::disc::Extent],
+    format: crate::disc::ContentFormat,
+    n: usize,
+) -> Vec<Vec<u8>> {
     use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
     const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
     // Probe several evenly-spaced points across EACH extent, not just midpoint
@@ -385,7 +395,7 @@ pub fn read_encrypted_units(
     if n == 0 {
         return out;
     }
-    for ext in &title.extents {
+    for ext in extents {
         let total_units = ext.sector_count / ALIGNED_UNIT_SECTORS;
         if total_units == 0 {
             continue;
@@ -426,7 +436,7 @@ pub fn read_encrypted_units(
                     break;
                 }
                 let u = &buf[o..o + ALIGNED_UNIT_LEN];
-                if aacs_unit_encrypted(u, title.content_format) {
+                if aacs_unit_encrypted(u, format) {
                     out.push(u.to_vec());
                     if out.len() >= n {
                         return out;

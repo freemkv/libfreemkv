@@ -10,7 +10,7 @@
 //! partnerless unit (another LBA) opens under no key before any proof; never in a clear piece.
 //! An image or folder (`StopKind::Image`) never stops: those units are blanked and counted.
 
-use super::{Proof, ProofCache, ResolvedKeySet, StopKind};
+use super::{KeyRing, Proof, ProofCache, StopKind};
 use crate::aacs::content::{
     ALIGNED_UNIT_LEN, aacs_unit_encrypted, aacs_unit_on_grid, clear_copy_permission_indicator,
     decrypt_unit, is_clean,
@@ -42,7 +42,7 @@ pub(crate) struct Arrival {
 }
 
 impl Arrival {
-    pub(crate) fn new(set: &ResolvedKeySet, stop: StopKind) -> Self {
+    pub(crate) fn new(set: &KeyRing, stop: StopKind) -> Self {
         let i = &set.0;
         let mut spans = Vec::new();
         let mut pieces = Vec::with_capacity(i.arrival.len());

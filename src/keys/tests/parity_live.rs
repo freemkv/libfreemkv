@@ -72,7 +72,7 @@ fn mux(
     g: &mut Golden,
     tag: &str,
     s: &mut DiscSession,
-    set: Option<&ResolvedKeySet>,
+    set: Option<&KeyRing>,
     opts: &MuxOptions,
     halt: &Halt,
 ) {
@@ -100,11 +100,16 @@ fn opts(skip: bool) -> MuxOptions {
     }
 }
 
-fn keys(s: &mut DiscSession, kdb: &[[u8; 16]]) -> crate::error::Result<ResolvedKeySet> {
+fn keys(s: &mut DiscSession, kdb: &[[u8; 16]]) -> crate::error::Result<KeyRing> {
     let calls = Calls::default();
     let f = factory(&[Spec::keydb(kdb, &calls)]);
-    s.resolve_key_set(KeyScope::Titles(vec![0]), &f, ResolveKeysOptions::default())
-        .map(|r| r.keys)
+    s.acquire_keys(
+        KeyScope::Titles(vec![0]),
+        &f,
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
+    )
+    .map(|r| r.keys)
 }
 
 #[test]
@@ -164,12 +169,13 @@ fn parity_live_bd_lazy_piece() {
     let disc = session(t2.with_image(img.image.clone()), &halt, &clip)
         .take_disc()
         .unwrap();
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &disc,
         &mut dead.clone(),
         KeyScope::Titles(vec![0]),
         &f,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap()
     .keys;

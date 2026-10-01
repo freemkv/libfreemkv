@@ -1,7 +1,10 @@
-//! Keys up front, memory only (keys-upfront design, KU).
+//! Keys up front, memory only (keys-upfront design, KU; pipeline design §2.6).
 //!
-//! [`ResolvedKeySet::resolve`] is the one place that asks a [`crate::KeySource`] for keys.
-//! It runs once per rip, before any output, over the rip's [`KeyScope`]. It proves each
+//! [`KeyRing::acquire`] is the one place that asks a [`crate::KeySource`] for keys. It
+//! takes [`KeyEvidence`] (what the source can tell: identity, AACS structures, pieces) and
+//! a [`Sampler`] over that source, never a `Disc`; [`KeyEvidence::from_disc`] builds the
+//! evidence from a scanned disc. It runs once per rip, before any output, over the rip's
+//! [`KeyScope`]. It proves each
 //! held key against real ciphertext of each stream file (a *piece*), counting CPS units by
 //! the DECLARED `Num_of_CPS_Unit` (KS-14), never by the keys held. The result is an
 //! immutable, in-memory set: keys and the disc's Volume ID live in it for this rip only,
@@ -13,6 +16,7 @@
 //! readable unit is never withheld; one that no held key opens is a loud stop.
 
 mod arrival;
+mod evidence;
 mod fmts;
 #[cfg(doctest)]
 mod public_api_cannot_decrypt_aacs;
@@ -21,14 +25,16 @@ mod resolve;
 mod tests;
 
 pub(crate) use arrival::Arrival;
+pub use evidence::{Detector, KeyEvidence, MediaId, Piece, Sampler};
 #[cfg(test)]
 pub(crate) use resolve::whole_disc_pieces;
 
 use crate::aacs::trace::ResolutionTrace;
+use crate::ctx::Ctx;
 use crate::decrypt::{AacsKeyMap, DecryptKeys};
 use crate::disc::{ContentFormat, Disc, DiscFormat};
 use crate::error::{Error, Result};
-use crate::halt::Halt;
+use crate::halt::{Halt, Liveness};
 use crate::sector::{DecryptingSectorSource, SectorSource};
 use crate::session::KeySourceFactory;
 use crate::whole_disc::{UnitSpan, WholeDiscReader};
@@ -62,7 +68,7 @@ pub(crate) fn test_keyed_source<S: SectorSource>(
     src.with_key_map(map)
 }
 
-/// What a rip decrypts, and so what `resolve` must key (KU §2.5).
+/// What a rip decrypts, and so what `acquire` must key (KU §2.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyScope {
     /// Nothing is decrypted (a raw copy): no key-source call at all.
@@ -73,28 +79,29 @@ pub enum KeyScope {
     WholeDisc,
 }
 
-/// Options for [`ResolvedKeySet::resolve`].
+/// Options for [`KeyRing::acquire`]. The stop token is the run's [`Ctx`].
 #[derive(Default)]
-pub struct ResolveKeysOptions<'a> {
-    /// Stop token: checked before each piece, probe and request; interrupts retry waits.
-    pub halt: Option<&'a Halt>,
-    /// A set this rip already holds (e.g. from `info` or the scan): its keys join the pool
-    /// first, and its in-memory VID is used when the disc has none (KU §5.4).
-    pub seed: Option<&'a ResolvedKeySet>,
+pub struct AcquireOptions<'a> {
+    /// A ring this rip already holds (e.g. from `info` or the scan): its keys join the pool
+    /// first, and its in-memory VID is used when the evidence has none (KU §5.4).
+    pub seed: Option<&'a KeyRing>,
     /// An in-memory VID the caller re-read from the drive (KU §4.2). Never written.
     pub vid: Option<[u8; 16]>,
-    /// Set by `resolve` when no VID was in hand and one would help (KU J23): a source
-    /// reported a Media Key it could not finish without the VID (`KeyNode::NoVid`), or a
-    /// configured source [`uses_vid`](crate::KeySource::uses_vid). Never cleared.
+    /// Set when no VID was in hand and one would help (KU J23): a source reported a Media
+    /// Key it could not finish without the VID (`KeyNode::NoVid`), or a configured source
+    /// [`uses_vid`](crate::KeySource::uses_vid). Never cleared.
     pub vid_would_help: Option<&'a std::sync::atomic::AtomicBool>,
     /// Filled with the per-source walk on `Ok` and on `Err` alike, so a refusal still says
     /// which source answered what. It holds labels, node enums and counts, never key bytes.
     pub trace: Option<&'a Mutex<ResolutionTrace>>,
+    /// The op's progress (stop design §2.1, T29): every source call runs
+    /// [`busy`](Liveness::busy) on it, and each source's ctx hands it out.
+    pub liveness: Option<&'a Liveness>,
 }
 
-/// The outcome of [`ResolvedKeySet::resolve`]: the set, plus the per-source walk.
+/// The outcome of [`KeyRing::acquire`]: the ring, plus the per-source walk.
 pub struct KeyResolution {
-    pub keys: ResolvedKeySet,
+    pub keys: KeyRing,
     pub trace: ResolutionTrace,
 }
 
@@ -287,19 +294,19 @@ impl Inner {
     }
 }
 
-/// The rip's keys, resolved up front and held in memory only (KU §2.1).
+/// The rip's keys, acquired up front and held in memory only (KU §2.1).
 ///
-/// Immutable and cheap to clone (an `Arc`); `Send + Sync`. Bound to one disc
+/// Immutable and cheap to clone (an `Arc`); `Send + Sync`. Bound to one medium
 /// ([`is_for`](Self::is_for)) and one [`KeyScope`]. Holds no key-source factory, so nothing
-/// can ask a source after [`resolve`](Self::resolve) returns. No `Serialize`, no accessor
+/// can ask a source after [`acquire`](Self::acquire) returns. No `Serialize`, no accessor
 /// for key bytes or the Volume ID, and a redacting `Debug`.
 #[derive(Clone)]
-pub struct ResolvedKeySet(pub(crate) Arc<Inner>);
+pub struct KeyRing(pub(crate) Arc<Inner>);
 
-impl std::fmt::Debug for ResolvedKeySet {
+impl std::fmt::Debug for KeyRing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let i = &self.0;
-        f.debug_struct("ResolvedKeySet")
+        f.debug_struct("KeyRing")
             .field("aacs", &i.aacs)
             .field("disc_hash", &i.disc_hash)
             .field("scope", &i.scope)
@@ -319,6 +326,11 @@ pub(super) fn overlaps(a: &[(u32, u32)], s: u32, e: u32) -> bool {
     a.iter().any(|&(x, y)| x < e && s < y)
 }
 
+// `SHA-256("freemkv-vid-fp-v1" ‖ VID)`, the only form of a VID that may be written.
+pub(crate) fn vid_fp(vid: &[u8; 16]) -> [u8; 32] {
+    sha256(b"freemkv-vid-fp-v1", vid)
+}
+
 // SHA-256 over a domain tag and bytes (KU §4.1 fingerprints).
 fn sha256(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
     use sha2::Digest;
@@ -328,49 +340,42 @@ fn sha256(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-impl ResolvedKeySet {
-    /// Resolve the keys `scope` needs, once, before any output (KU §2.3). The only code in
-    /// the product that asks a [`crate::KeySource`] for keys; `sources` is called once and
-    /// every source it builds is dropped before this returns (LK7).
+impl KeyRing {
+    /// Acquire the keys `ev.scope()` needs, once, before any output (KU §2.3). The only
+    /// code in the product that asks a [`crate::KeySource`] for keys; `sources` is called
+    /// once and every source it builds is dropped before this returns (LK7). `sampler`
+    /// reads the evidence's pieces from the same raw source; `ctx.halt` stops it.
     ///
     /// `Err` refuses the rip before any output: E7022 (a title piece is Missing), E7032 (an
     /// image or folder piece is Missing), E7013 (a single declared key opens none of the
     /// ciphertext), E7026 (forensic keys Missing), E7028–30 (a source failed), `Halted`.
-    pub fn resolve(
-        disc: &Disc,
-        reader: &mut dyn SectorSource,
-        scope: KeyScope,
+    pub fn acquire(
+        ev: &KeyEvidence,
+        sampler: &mut Sampler,
         sources: &KeySourceFactory,
-        opts: ResolveKeysOptions,
+        opts: AcquireOptions,
+        ctx: &Ctx,
     ) -> Result<KeyResolution> {
-        resolve::resolve(
-            disc,
-            reader,
-            scope,
-            sources,
-            opts,
-            &resolve::RealClock::new(),
-        )
+        resolve::acquire(ev, sampler, sources, opts, ctx, &resolve::RealClock::new())
     }
 
-    /// [`resolve`](Self::resolve), reporting to the op's `progress` (stop design §2.1,
-    /// T29): every source call runs [`busy`](crate::halt::Liveness::busy) on it, and each
-    /// source's ctx hands it out as [`ResolveCtx::progress`](crate::keysource::ResolveCtx::progress).
-    pub fn resolve_with_progress(
+    /// [`from_disc`](KeyEvidence::from_disc) then [`acquire`](Self::acquire) over the same
+    /// raw `reader`: the scanned-disc form until the Layout stage supplies evidence.
+    pub fn acquire_for_disc(
         disc: &Disc,
         reader: &mut dyn SectorSource,
         scope: KeyScope,
         sources: &KeySourceFactory,
-        opts: ResolveKeysOptions,
-        progress: &crate::halt::Liveness,
+        opts: AcquireOptions,
+        ctx: &Ctx,
     ) -> Result<KeyResolution> {
-        let clock = resolve::RealClock::new();
-        resolve::resolve_observed(disc, reader, scope, sources, opts, &clock, Some(progress))
+        let ev = KeyEvidence::from_disc(disc, reader, scope, ctx)?;
+        Self::acquire(&ev, &mut Sampler::new(reader), sources, opts, ctx)
     }
 
     /// A set holding no keys: for a raw copy, or a disc with no AACS.
-    pub fn none() -> ResolvedKeySet {
-        ResolvedKeySet(Arc::new(Inner::empty()))
+    pub fn none() -> KeyRing {
+        KeyRing(Arc::new(Inner::empty()))
     }
 
     /// Whether this set keys AACS content: `false` for [`none`](Self::none), which a caller
@@ -379,27 +384,22 @@ impl ResolvedKeySet {
         self.0.aacs
     }
 
-    /// Whether this set was resolved for `disc`: the same disc hash, capacity and format,
+    /// Whether this ring was acquired for `media`: the same disc hash, capacity and format,
     /// and the same VID fingerprint when both are known. [`none`](Self::none) holds nothing
-    /// and fits any disc.
-    pub fn is_for(&self, disc: &Disc) -> bool {
+    /// and fits any medium.
+    pub fn is_for(&self, media: &MediaId) -> bool {
         let i = &self.0;
         if !i.aacs {
             return true;
         }
-        let Some(aacs) = disc.aacs.as_ref() else {
-            return false;
-        };
-        if norm_hash(&aacs.disc_hash) != norm_hash(&i.disc_hash)
-            || disc.format != i.format
-            || (disc.capacity_sectors != 0
-                && i.capacity != 0
-                && disc.capacity_sectors != i.capacity)
+        if norm_hash(&media.disc_hash) != norm_hash(&i.disc_hash)
+            || media.format != i.format
+            || (media.capacity != 0 && i.capacity != 0 && media.capacity != i.capacity)
         {
             return false;
         }
-        match (i.vid, aacs.volume_id) {
-            (Some(held), vid) if vid != [0u8; 16] => held == vid,
+        match (self.vid_fingerprint(), media.vid_fingerprint) {
+            (Some(held), Some(fp)) => held == fp,
             _ => true,
         }
     }
@@ -440,7 +440,7 @@ impl ResolvedKeySet {
     /// `SHA-256("freemkv-vid-fp-v1" ‖ VID)`: the only form of the VID that may be written
     /// (KU §4.1). `None` when the set holds no VID.
     pub fn vid_fingerprint(&self) -> Option<[u8; 32]> {
-        self.0.vid.map(|v| sha256(b"freemkv-vid-fp-v1", &v))
+        self.0.vid.as_ref().map(vid_fp)
     }
 
     /// `SHA-256("freemkv-key-fp-v1" ‖ key)[..8]` of each proven base key: the legacy
@@ -692,12 +692,12 @@ impl ResolvedKeySet {
         i.map = Arc::new(AacsKeyMap::from_ranges(
             ranges.iter().map(|&(s, e)| (s, e, 0)).collect(),
         ));
-        ResolvedKeySet(Arc::new(i))
+        KeyRing(Arc::new(i))
     }
 
     // A loose clip file's set (no CPS-unit map): `held`'s base keys, proven on arrival over the
     // file's one piece. Title scope, so a unit no held key opens stops E7022 (KU §2.4).
-    pub(crate) fn loose_file(held: Option<&ResolvedKeySet>, capacity: u32) -> Self {
+    pub(crate) fn loose_file(held: Option<&KeyRing>, capacity: u32) -> Self {
         let mut i = Inner::empty();
         i.aacs = true;
         i.scope = KeyScope::Titles(vec![0]);
@@ -725,7 +725,7 @@ impl ResolvedKeySet {
         i.scope = KeyScope::WholeDisc;
         i.pool = keys.to_vec();
         i.proven = (0..keys.len()).collect();
-        ResolvedKeySet(Arc::new(i))
+        KeyRing(Arc::new(i))
     }
 
     /// The decrypting reader for title `idx` of `disc` over the raw, random-access `inner`:
@@ -738,7 +738,7 @@ impl ResolvedKeySet {
         idx: usize,
         inner: S,
     ) -> Result<DecryptingSectorSource<S>> {
-        if !self.is_for(disc) {
+        if !self.is_for(&disc.media_id()) {
             return Err(Self::caller_bug("key set is not for this disc"));
         }
         let title = disc.titles.get(idx).ok_or(Error::DiscTitleRange {
@@ -778,7 +778,7 @@ impl ResolvedKeySet {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        if !self.is_for(disc) {
+        if !self.is_for(&disc.media_id()) {
             return Err(Self::caller_bug("key set is not for this disc"));
         }
         let mut content = disc.encrypted_content_ranges();
@@ -819,7 +819,7 @@ impl ResolvedKeySet {
 
 /// Whether `disc` can be decrypted with `keys` (KU §3.5). CSS is read from `disc.css` /
 /// `css_error`; an AACS disc needs a set for it, so `keys == None` is `AacsKeysMissing`.
-pub fn decrypt_status(disc: &Disc, keys: Option<&ResolvedKeySet>) -> DecryptStatus {
+pub fn decrypt_status(disc: &Disc, keys: Option<&KeyRing>) -> DecryptStatus {
     if disc.css_error.is_some() {
         return DecryptStatus::CssNotCracked(Error::CssNoDiscKey);
     }
@@ -831,7 +831,7 @@ pub fn decrypt_status(disc: &Disc, keys: Option<&ResolvedKeySet>) -> DecryptStat
     }
     match keys {
         Some(set) if set.is_aacs() => {
-            if !set.is_for(disc) {
+            if !set.is_for(&disc.media_id()) {
                 DecryptStatus::AacsKeysMissing(Error::DecryptFailed)
             } else if set.forensic_pending() {
                 DecryptStatus::ForensicPending
@@ -852,7 +852,7 @@ pub fn decrypt_status(disc: &Disc, keys: Option<&ResolvedKeySet>) -> DecryptStat
 pub fn check_decryptable(
     disc: &Disc,
     raw: bool,
-    keys: Option<&ResolvedKeySet>,
+    keys: Option<&KeyRing>,
     scope: &KeyScope,
 ) -> Result<()> {
     if raw || matches!(scope, KeyScope::None) {
@@ -860,11 +860,11 @@ pub fn check_decryptable(
     }
     match keys {
         Some(set) if set.is_aacs() && disc.css.is_none() && disc.css_error.is_none() => {
-            if !set.is_for(disc) {
-                return Err(ResolvedKeySet::caller_bug("key set is not for this disc"));
+            if !set.is_for(&disc.media_id()) {
+                return Err(KeyRing::caller_bug("key set is not for this disc"));
             }
             if !set.covers(scope) {
-                return Err(ResolvedKeySet::caller_bug("scope outside the key set"));
+                return Err(KeyRing::caller_bug("scope outside the key set"));
             }
             if set.forensic_pending() {
                 return Err(Error::FmtsKeyMissing);

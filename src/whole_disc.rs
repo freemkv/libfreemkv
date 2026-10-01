@@ -1,5 +1,5 @@
 //! The pieces of the whole-disc decrypting reader
-//! ([`ResolvedKeySet::whole_disc_reader`](crate::keys::ResolvedKeySet::whole_disc_reader))
+//! ([`KeyRing::whole_disc_reader`](crate::keys::KeyRing::whole_disc_reader))
 //! behind every decrypted disc/image → ISO copy, so the GUI, the CLI and the image path
 //! share one set of rules. AACS content is every content file (`/BDMV/STREAM`, HD DVD
 //! `/HVDVD_TS/*.EVO`), not just the kept titles. Reads follow each file's own 3-sector
@@ -20,7 +20,7 @@ pub type WholeDiscReader<S> = UnitAligned<DecryptingSectorSource<S>>;
 
 /// The whole-disc reader for a raw (`--raw`) copy. It never decrypts: AACS ciphertext and
 /// CSS-scrambled sectors pass through byte for byte. A decrypting copy reads through
-/// [`ResolvedKeySet::whole_disc_reader`](crate::keys::ResolvedKeySet::whole_disc_reader).
+/// [`KeyRing::whole_disc_reader`](crate::keys::KeyRing::whole_disc_reader).
 pub fn raw_whole_disc_reader<S: SectorSource>(reader: S) -> WholeDiscReader<S> {
     UnitAligned::new(
         DecryptingSectorSource::new(reader, crate::decrypt::DecryptKeys::None),

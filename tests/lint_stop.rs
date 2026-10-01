@@ -536,7 +536,6 @@ fn no_is_finished_spins_outside_halt() {
 // The `#[allow]` / `#[expect]` sites present when ST-X2 landed, per (file, attribute):
 // each is a §5.8 violation awaiting a per-site fix. The list only shrinks.
 const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
-    ("src/aacs/provider.rs", r#"allow(dead_code)"#, 1),
     (
         "src/disc/extract.rs",
         r#"allow(clippy::too_many_arguments)"#,

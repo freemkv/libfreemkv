@@ -59,24 +59,21 @@ fn spies(op: &Halt, cancel_last: bool) -> (KeySourceFactory, Arc<Mutex<Vec<Seen>
     (f, seen)
 }
 
-/// LSe4 (stop design §5.1, retargeted by §2.12 onto `ResolvedKeySet::resolve`): "a spy
-/// sees `ctx.halt()` cancelled". Every source's ctx carries the op token itself, so a
-/// Stop reaches a source mid-call; `resolve` then ends `Halted` and builds no set.
+/// LSe4 (stop design §5.1, retargeted by §2.12 onto `KeyRing::acquire`): "a spy
+/// sees `ctx.halt()` cancelled". Every source's ctx carries the run context's token
+/// itself, so a Stop reaches a source mid-call; `acquire` then ends `Halted`, no ring.
 #[test]
 fn resolve_passes_halt_to_every_source_ctx() {
     let fx = two_units();
     let op = Halt::new();
     let (f, seen) = spies(&op, true);
-    let opts = ResolveKeysOptions {
-        halt: Some(&op),
-        ..Default::default()
-    };
-    let r = ResolvedKeySet::resolve(
+    let r = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &f,
-        opts,
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::new(op.clone()),
     );
     assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
     let seen = seen.lock().unwrap().clone();
@@ -99,13 +96,17 @@ fn resolve_holds_busy_around_every_source_call() {
     let fx = two_units();
     let (op, p) = (Halt::new(), Liveness::new());
     let (f, seen) = spies(&op, false);
-    let r = ResolvedKeySet::resolve_with_progress(
+    let opts = AcquireOptions {
+        liveness: Some(&p),
+        ..Default::default()
+    };
+    let r = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &f,
-        ResolveKeysOptions::default(),
-        &p,
+        opts,
+        &crate::ctx::Ctx::new(op.clone()),
     );
     assert!(r.is_err(), "no source holds a key: a refusal");
     let seen = seen.lock().unwrap().clone();
@@ -117,25 +118,22 @@ fn resolve_holds_busy_around_every_source_call() {
     assert!(!p.is_busy(), "no busy span outlives resolve");
 }
 
-/// Guard: a ctx built with no token or progress hands out `None` for both (defaults).
+/// Guard: with no liveness in the options, a source's ctx hands out no progress.
 #[test]
-fn resolve_without_stop_hands_out_no_token_or_progress() {
+fn resolve_without_liveness_hands_out_no_progress() {
     let fx = two_units();
     let (f, seen) = spies(&Halt::new(), false);
-    let r = ResolvedKeySet::resolve(
+    let r = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &f,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
     );
     assert!(r.is_err());
     let seen = seen.lock().unwrap().clone();
-    assert!(
-        seen.iter()
-            .all(|s| s.halt_is_op.is_none() && s.busy.is_none()),
-        "{seen:?}"
-    );
+    assert!(seen.iter().all(|s| s.busy.is_none()), "{seen:?}");
 }
 
 /// Review minor 1 (§2.2 alias rule, as `Drive::alias`): under `open_with` the session's
@@ -150,11 +148,13 @@ fn session_token_wins_over_the_callers_in_resolve() {
     let mut s =
         crate::session::DiscSession::from_parts_for_test(Some(fx.disc), Some(Box::new(reader)));
     s.set_halt_for_test(&session_tok);
-    let opts = ResolveKeysOptions {
-        halt: Some(&caller_tok),
-        ..Default::default()
-    };
-    let r = s.resolve_key_set(KeyScope::Titles(vec![0]), &f, opts);
+    let ctx = crate::ctx::Ctx::new(caller_tok.clone());
+    let r = s.acquire_keys(
+        KeyScope::Titles(vec![0]),
+        &f,
+        AcquireOptions::default(),
+        &ctx,
+    );
     assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
     let seen = seen.lock().unwrap().clone();
     assert!(

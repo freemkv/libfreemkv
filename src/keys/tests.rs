@@ -250,7 +250,7 @@ impl Clock for FakeClock {
     fn now(&self) -> Duration {
         *self.now.lock().unwrap()
     }
-    fn sleep(&self, d: Duration, halt: Option<&Halt>) -> Result<()> {
+    fn sleep(&self, d: Duration, halt: &Halt) -> Result<()> {
         let mut now = self.now.lock().unwrap();
         *now += d;
         if let Some((at, h)) = &self.cancel_at
@@ -258,10 +258,7 @@ impl Clock for FakeClock {
         {
             h.cancel();
         }
-        match halt {
-            Some(h) => h.check(),
-            None => Ok(()),
-        }
+        halt.check()
     }
 }
 
@@ -452,20 +449,35 @@ fn resolve_with(
     reader: &mut dyn SectorSource,
     scope: KeyScope,
     specs: &[Spec],
-    opts: ResolveKeysOptions,
+    opts: AcquireOptions,
     clock: &dyn Clock,
-) -> Result<ResolvedKeySet> {
-    let f = factory(specs);
-    super::resolve::resolve(&fx.disc, reader, scope, &f, opts, clock).map(|r| r.keys)
+) -> Result<KeyRing> {
+    resolve_halted(fx, reader, scope, specs, opts, clock, &Halt::new())
 }
 
-fn resolve(fx: &Fx, scope: KeyScope, specs: &[Spec]) -> Result<ResolvedKeySet> {
+// `resolve_with` under the run's stop token `halt`.
+fn resolve_halted(
+    fx: &Fx,
+    reader: &mut dyn SectorSource,
+    scope: KeyScope,
+    specs: &[Spec],
+    opts: AcquireOptions,
+    clock: &dyn Clock,
+    halt: &Halt,
+) -> Result<KeyRing> {
+    let f = factory(specs);
+    let ctx = crate::ctx::Ctx::new(halt.clone());
+    let ev = KeyEvidence::from_disc(&fx.disc, reader, scope, &ctx)?;
+    super::resolve::acquire(&ev, &mut Sampler::new(reader), &f, opts, &ctx, clock).map(|r| r.keys)
+}
+
+fn resolve(fx: &Fx, scope: KeyScope, specs: &[Spec]) -> Result<KeyRing> {
     resolve_with(
         fx,
         &mut fx.source(),
         scope,
         specs,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
 }
@@ -587,7 +599,7 @@ fn single_declared_unit_keys_lazy_pieces() {
         &mut src.clone(),
         KeyScope::Titles(vec![0]),
         &[Spec::keydb(&[K1], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -658,7 +670,7 @@ fn damaged_extent_never_inherits_neighbour_key() {
             &mut src.clone(),
             KeyScope::Titles(vec![0]),
             &[Spec::keydb(&pool, &calls)],
-            ResolveKeysOptions::default(),
+            AcquireOptions::default(),
             &FakeClock::default(),
         )
         .unwrap();
@@ -704,7 +716,7 @@ fn each_piece_request_has_eight_units_and_the_vid() {
     let mut image = two_units();
     image.disc.aacs.as_mut().unwrap().volume_id = [0u8; 16];
     let calls = Calls::default();
-    let opts = ResolveKeysOptions {
+    let opts = AcquireOptions {
         seed: Some(&seed),
         ..Default::default()
     };
@@ -824,7 +836,7 @@ fn one_opened_probe_is_lazy_never_keyed() {
         &mut src.clone(),
         KeyScope::Titles(vec![0]),
         &[Spec::keydb(&[K1, K2], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -867,7 +879,7 @@ fn transient_source_failure_retried_until_it_answers() {
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &[online],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         clock.as_ref(),
     )
     .unwrap();
@@ -884,17 +896,15 @@ fn transient_source_failure_retried_until_it_answers() {
 fn transient_source_gives_up_after_60s_without_an_answer() {
     let fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
     let run = |specs: &[Spec], clock: &FakeClock, halt: Option<&Halt>| {
-        let opts = ResolveKeysOptions {
-            halt,
-            ..Default::default()
-        };
-        resolve_with(
+        let idle = Halt::new();
+        resolve_halted(
             &fx,
             &mut fx.source(),
             KeyScope::Titles(vec![0]),
             specs,
-            opts,
+            AcquireOptions::default(),
             clock,
+            halt.unwrap_or(&idle),
         )
     };
     let calls = Calls::default();
@@ -975,16 +985,16 @@ fn key_set_bound_to_disc_and_debug_redacts_keys_and_vid() {
     let fx = two_units();
     let calls = Calls::default();
     let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1, K2], &calls)]).unwrap();
-    assert!(set.is_for(&fx.disc));
+    assert!(set.is_for(&fx.disc.media_id()));
     let mut other = two_units();
     other.disc.aacs.as_mut().unwrap().disc_hash = "0xffff".into();
-    assert!(!set.is_for(&other.disc));
+    assert!(!set.is_for(&other.disc.media_id()));
     let mut other = two_units();
     other.disc.aacs.as_mut().unwrap().volume_id = [1; 16];
-    assert!(!set.is_for(&other.disc));
+    assert!(!set.is_for(&other.disc.media_id()));
     let mut other = two_units();
     other.disc.capacity_sectors += 3;
-    assert!(!set.is_for(&other.disc));
+    assert!(!set.is_for(&other.disc.media_id()));
     caller_bug(|| set.title_reader(&other.disc, 0, fx.source()));
     assert!(set.vid_fingerprint().is_some());
     assert_eq!(set.proven_key_fingerprints().len(), 2);
@@ -1006,34 +1016,34 @@ fn stop_during_resolve_builds_no_set() {
     let mut src = fx.source();
     src.halt_after = Some((halt.clone(), Arc::new(Mutex::new(40))));
     let calls = Calls::default();
-    let opts = ResolveKeysOptions {
-        halt: Some(&halt),
+    let opts = AcquireOptions {
         ..Default::default()
     };
-    let r = resolve_with(
+    let r = resolve_halted(
         &fx,
         &mut src,
         KeyScope::WholeDisc,
         &[Spec::keydb(&[K1, K2], &calls)],
         opts,
         &FakeClock::default(),
+        &halt,
     );
     assert!(matches!(r, Err(Error::Halted)));
 
     let halt = Halt::new();
     let mut online = Spec::online(&[K1, K2], &calls);
     online.cancel = Some(halt.clone());
-    let opts = ResolveKeysOptions {
-        halt: Some(&halt),
+    let opts = AcquireOptions {
         ..Default::default()
     };
-    let r = resolve_with(
+    let r = resolve_halted(
         &fx,
         &mut fx.source(),
         KeyScope::WholeDisc,
         &[online],
         opts,
         &FakeClock::default(),
+        &halt,
     );
     assert!(matches!(r, Err(Error::Halted)));
 }
@@ -1041,7 +1051,7 @@ fn stop_during_resolve_builds_no_set() {
 // ── §2.4: proof on first read ───────────────────────────────────────────────
 
 // File B (K2) Lazy: every probe of it faulted at resolve time. Pool K1 + K2.
-fn lazy_b(pool: &[[u8; 16]]) -> (Fx, ResolvedKeySet, Faulty) {
+fn lazy_b(pool: &[[u8; 16]]) -> (Fx, KeyRing, Faulty) {
     let fx = fixture(
         &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
         2,
@@ -1056,7 +1066,7 @@ fn lazy_b(pool: &[[u8; 16]]) -> (Fx, ResolvedKeySet, Faulty) {
         &mut src.clone(),
         KeyScope::WholeDisc,
         &[Spec::keydb(pool, &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -1163,7 +1173,7 @@ fn on_arrival_proof() {
         &mut src.clone(),
         KeyScope::WholeDisc,
         &[Spec::keydb(&[K1, K2], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -1185,7 +1195,7 @@ fn on_arrival_proof() {
 }
 
 // File B (K2) Lazy as in `lazy_b`, its image first damaged by `damage`.
-fn lazy_b_damaged(pool: &[[u8; 16]], damage: impl Fn(&mut Fx)) -> (Fx, ResolvedKeySet, Faulty) {
+fn lazy_b_damaged(pool: &[[u8; 16]], damage: impl Fn(&mut Fx)) -> (Fx, KeyRing, Faulty) {
     let mut fx = fixture(
         &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
         2,
@@ -1201,7 +1211,7 @@ fn lazy_b_damaged(pool: &[[u8; 16]], damage: impl Fn(&mut Fx)) -> (Fx, ResolvedK
         &mut src.clone(),
         KeyScope::WholeDisc,
         &[Spec::keydb(pool, &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -1698,7 +1708,7 @@ fn fmts_all_anchors_unreadable_is_pending() {
         &mut src.clone(),
         KeyScope::WholeDisc,
         &[Spec::keydb(&[K1], &calls), fmts_online(&calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -1751,7 +1761,7 @@ fn on_arrival_proof_skips_forensic_segment_units() {
             &mut src.clone(),
             KeyScope::WholeDisc,
             &[Spec::keydb(&[K1, K2], &calls), fmts_online(&calls)],
-            ResolveKeysOptions::default(),
+            AcquireOptions::default(),
             &FakeClock::default(),
         )
         .unwrap();
@@ -1857,12 +1867,13 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
     src.kill(b, b + n);
     let calls = Calls::default();
     let f = factory(&[Spec::keydb(&[K1, K2], &calls)]);
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut src.clone(),
         KeyScope::WholeDisc,
         &f,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap()
     .keys;
@@ -1947,12 +1958,13 @@ fn iso_input_reads_through_the_key_set() {
     let (img, disc) = scannable_image();
     let calls = Calls::default();
     let f = factory(&[Spec::keydb(&[K1], &calls)]);
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &disc,
         &mut MemSource::new(img.image.clone()),
         KeyScope::Titles(vec![0]),
         &f,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap()
     .keys;
@@ -1987,7 +1999,12 @@ fn session_resolves_a_key_set_through_its_reader() {
         Some(Box::new(fx.source())),
     );
     let r = session
-        .resolve_key_set(KeyScope::WholeDisc, &f, ResolveKeysOptions::default())
+        .acquire_keys(
+            KeyScope::WholeDisc,
+            &f,
+            AcquireOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
         .unwrap();
     assert_eq!(r.keys.status().keyed, 2);
     assert_eq!(calls.len(), 1);
@@ -2127,7 +2144,7 @@ fn single_unit_rule_never_overrides_a_piece_another_key_opened() {
         &mut src.clone(),
         KeyScope::Titles(vec![0]),
         &[Spec::keydb(&[K1, K2], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -2200,7 +2217,7 @@ fn single_unit_rule_keys_only_pieces_the_proven_key_opens() {
         &mut src.clone(),
         KeyScope::Titles(vec![0]),
         &[Spec::keydb(&[K1, K2], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -2237,7 +2254,7 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
             sector_count: 6,
         },
     ];
-    let set = ResolvedKeySet::keyless_for(&title, ContentFormat::BdTs);
+    let set = KeyRing::keyless_for(&title, ContentFormat::BdTs);
     for skip in [false, true] {
         let recovery = Arc::new(Mutex::new(0u32));
         let mut stream = super::install_key_map(
@@ -2299,7 +2316,7 @@ fn single_unit_rule_never_keys_a_piece_with_no_readable_probe() {
         &mut src.clone(),
         KeyScope::Titles(vec![0]),
         &[Spec::keydb(&[K1], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -2326,7 +2343,7 @@ fn keyless_set_keeps_adjacent_clips_on_their_own_grids() {
             sector_count,
         })
         .collect();
-    let set = ResolvedKeySet::keyless_for(&title, ContentFormat::BdTs);
+    let set = KeyRing::keyless_for(&title, ContentFormat::BdTs);
     assert_eq!(set.0.spans, [(100, 31, 100), (131, 30, 131)]);
     let anchors: Vec<u64> = set.0.arrival.iter().map(|p| p.spans[0].2).collect();
     assert_eq!(anchors, [100, 131]);
@@ -2338,14 +2355,14 @@ fn keyless_set_keeps_adjacent_clips_on_their_own_grids() {
 #[test]
 fn keyless_session_set_is_bound_to_its_disc() {
     let fx = two_units();
-    let set = ResolvedKeySet::keyless_for_disc(&fx.disc, 0).expect("title 0");
-    assert!(set.is_for(&fx.disc));
+    let set = KeyRing::keyless_for_disc(&fx.disc, 0).expect("title 0");
+    assert!(set.is_for(&fx.disc.media_id()));
     let mut other = two_units();
     other.disc.aacs.as_mut().unwrap().disc_hash = "0xffff".into();
-    assert!(!set.is_for(&other.disc));
-    assert!(ResolvedKeySet::keyless_for_disc(&fx.disc, 9).is_none());
-    let bare = ResolvedKeySet::keyless_for(&fx.disc.titles[0], ContentFormat::BdTs);
-    assert!(!bare.is_for(&fx.disc), "no identity, no bypass");
+    assert!(!set.is_for(&other.disc.media_id()));
+    assert!(KeyRing::keyless_for_disc(&fx.disc, 9).is_none());
+    let bare = KeyRing::keyless_for(&fx.disc.titles[0], ContentFormat::BdTs);
+    assert!(!bare.is_for(&fx.disc.media_id()), "no identity, no bypass");
 }
 
 /// J22 with J21 parity (review r4). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits)
@@ -2372,7 +2389,7 @@ fn single_unit_rule_needs_two_probes_unless_one_unit_long() {
         &mut src.clone(),
         KeyScope::Titles(vec![0]),
         &[Spec::keydb(&[K1], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     )
     .unwrap();
@@ -2392,13 +2409,13 @@ fn single_unit_rule_needs_two_probes_unless_one_unit_long() {
 
 // Resolve `Titles([1])` of `two_units` (K2 held by no source) with the disc's VID zeroed or
 // not; returns the refusal and the `vid_would_help` flag.
-fn vid_help(zero_vid: bool, specs: &[Spec]) -> (Result<ResolvedKeySet>, bool) {
+fn vid_help(zero_vid: bool, specs: &[Spec]) -> (Result<KeyRing>, bool) {
     let mut fx = two_units();
     if zero_vid {
         fx.disc.aacs.as_mut().unwrap().volume_id = [0u8; 16];
     }
     let flag = std::sync::atomic::AtomicBool::new(false);
-    let opts = ResolveKeysOptions {
+    let opts = AcquireOptions {
         vid_would_help: Some(&flag),
         ..Default::default()
     };
@@ -2458,13 +2475,14 @@ fn a_matched_miss_keeps_its_reason_in_the_trace() {
         ..Spec::keydb(&[], &calls)
     };
     let f = factory(&[km_no_vid, Spec::keydb(&[K1], &calls)]);
-    let opts = ResolveKeysOptions::default();
-    let r = ResolvedKeySet::resolve(
+    let opts = AcquireOptions::default();
+    let r = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &f,
         opts,
+        &crate::ctx::Ctx::default(),
     )
     .unwrap();
     assert_eq!(
@@ -2515,7 +2533,7 @@ fn an_unreachable_service_is_never_coded_missing() {
         &mut fx.source(),
         KeyScope::Titles(vec![0, 1]),
         &[down],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     );
     assert_eq!(code(r), E7028);
@@ -2541,18 +2559,18 @@ fn a_stop_during_backoff_keeps_the_asked_step() {
     dead.clock = Some(clock.clone());
     dead.down_until = Some(Duration::MAX);
     let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
-    let opts = ResolveKeysOptions {
-        halt: Some(&halt),
+    let opts = AcquireOptions {
         trace: Some(&out),
         ..Default::default()
     };
-    let r = resolve_with(
+    let r = resolve_halted(
         &fx,
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &[dead],
         opts,
         &*clock,
+        &halt,
     );
     assert!(matches!(r, Err(Error::Halted)), "{r:?}");
     let t = out.lock().unwrap().clone();
@@ -2563,13 +2581,13 @@ fn a_stop_during_backoff_keeps_the_asked_step() {
 // ── KU-E1: the trace on Ok and Err; `is_aacs` ──────────────────────────────
 
 /// The per-source walk ("keydb > matched disc > online > …") answers "why no key", so
-/// `resolve` hands it back through `ResolveKeysOptions::trace` on a refusal too.
+/// `resolve` hands it back through `AcquireOptions::trace` on a refusal too.
 #[test]
 fn resolve_returns_the_trace_on_ok_and_on_err() {
     let fx = two_units();
     let calls = Calls::default();
     let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
-    let opts = ResolveKeysOptions {
+    let opts = AcquireOptions {
         trace: Some(&out),
         ..Default::default()
     };
@@ -2587,17 +2605,18 @@ fn resolve_returns_the_trace_on_ok_and_on_err() {
     assert_eq!(t.keys[0].who, "keydb");
 
     let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
-    let opts = ResolveKeysOptions {
+    let opts = AcquireOptions {
         trace: Some(&out),
         ..Default::default()
     };
     let f = factory(&[Spec::keydb(&[K1], &calls)]);
-    let ok = ResolvedKeySet::resolve(
+    let ok = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &f,
         opts,
+        &crate::ctx::Ctx::default(),
     )
     .unwrap();
     assert_eq!(*out.lock().unwrap(), ok.trace);
@@ -2620,12 +2639,13 @@ fn the_resolution_trace_holds_no_key_vid_or_mkb_bytes() {
         Spec::keydb(&[K1, K2], &calls),
         Spec::online(&[K1, K2], &calls),
     ]);
-    let r = ResolvedKeySet::resolve(
+    let r = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::Titles(vec![0, 1]),
         &f,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap();
     let text = format!("{:?} {:#?}", r.trace, r.trace);
@@ -2644,7 +2664,7 @@ fn the_resolution_trace_holds_no_key_vid_or_mkb_bytes() {
 #[test]
 fn is_aacs_tells_none_from_a_resolved_set() {
     let fx = two_units();
-    assert!(!ResolvedKeySet::none().is_aacs());
+    assert!(!KeyRing::none().is_aacs());
     let set = resolve(
         &fx,
         KeyScope::Titles(vec![0]),
@@ -2663,7 +2683,7 @@ fn a_stop_seen_before_the_retry_keeps_the_asked_step() {
         fn now(&self) -> Duration {
             Duration::ZERO
         }
-        fn sleep(&self, _d: Duration, _halt: Option<&Halt>) -> Result<()> {
+        fn sleep(&self, _d: Duration, _halt: &Halt) -> Result<()> {
             self.0.cancel();
             Ok(())
         }
@@ -2674,19 +2694,19 @@ fn a_stop_seen_before_the_retry_keeps_the_asked_step() {
     let mut dead = Spec::online(&[K1], &calls);
     dead.down_until = Some(Duration::MAX);
     let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
-    let opts = ResolveKeysOptions {
-        halt: Some(&halt),
+    let opts = AcquireOptions {
         trace: Some(&out),
         ..Default::default()
     };
     let clock = WakeOnStop(halt.clone());
-    let r = resolve_with(
+    let r = resolve_halted(
         &fx,
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &[dead],
         opts,
         &clock,
+        &halt,
     );
     assert!(matches!(r, Err(Error::Halted)), "{r:?}");
     assert_eq!(
@@ -2743,7 +2763,7 @@ fn a_source_halted_mid_request_keeps_the_asked_step() {
     let mut stopped = Spec::online(&[K1], &calls);
     stopped.fails = Some(|| Error::Halted);
     let out = Mutex::new(crate::aacs::trace::ResolutionTrace::new());
-    let opts = ResolveKeysOptions {
+    let opts = AcquireOptions {
         trace: Some(&out),
         ..Default::default()
     };
@@ -2998,8 +3018,57 @@ fn probe_reports_a_terminated_source() {
         &mut src,
         KeyScope::WholeDisc,
         &[Spec::keydb(&[K1, K2], &calls)],
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     );
     assert!(matches!(r, Err(Error::SourceTerminated)), "{r:?}");
+}
+
+// ── Pipeline 3a: evidence with no captured identity (KA9) ─────────────────
+
+/// KA9: evidence whose disc hash was never captured is still looked up by its title-key
+/// file: the source is sent SHA-1(`Unit_Key_RO.inf`), the hash a keydb keys entries by,
+/// and the ring binds to that hash.
+#[test]
+fn evidence_without_a_hash_is_looked_up_by_its_title_key_file() {
+    struct HashSpy(Arc<Mutex<Vec<String>>>);
+    impl KeySource for HashSpy {
+        fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>> {
+            self.0.lock().unwrap().push(ctx.disc_hash().to_string());
+            Ok(vec![UnitKey::new(1, K1), UnitKey::new(2, K2)])
+        }
+        fn answer_depends_on_samples(&self) -> bool {
+            false
+        }
+    }
+    let mut fx = two_units();
+    let aacs = fx.disc.aacs.as_mut().unwrap();
+    let want = crate::aacs::inf::disc_hash_hex(&crate::aacs::inf::disc_hash(&aacs.uk_ro));
+    aacs.disc_hash = String::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let spy = seen.clone();
+    let f: crate::session::KeySourceFactory =
+        Arc::new(move || vec![Box::new(HashSpy(spy.clone())) as Box<dyn KeySource>]);
+    let ring = KeyRing::acquire_for_disc(
+        &fx.disc,
+        &mut fx.source(),
+        KeyScope::Titles(vec![0]),
+        &f,
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
+    )
+    .unwrap()
+    .keys;
+    assert_eq!(*seen.lock().unwrap(), std::slice::from_ref(&want));
+    let media = MediaId {
+        disc_hash: want,
+        ..fx.disc.media_id()
+    };
+    assert!(ring.is_for(&media));
+    assert_eq!(
+        fx.disc.media_id().disc_hash,
+        media.disc_hash,
+        "the disc derives it too"
+    );
+    assert!(ring.is_for(&fx.disc.media_id()));
 }

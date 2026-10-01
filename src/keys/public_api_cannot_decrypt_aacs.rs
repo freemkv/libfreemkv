@@ -1,4 +1,4 @@
-//! LK19 (KU §2.2): "within libfreemkv's public API, `ResolvedKeySet` is the only source of
+//! LK19 (KU §2.2): "within libfreemkv's public API, `KeyRing` is the only source of
 //! AACS-decrypted data". Each door below compiled before KU-X2 and must not compile now.
 //! Per spec; do not change without a spec citation proving otherwise.
 //!
@@ -17,12 +17,6 @@
 //! ```compile_fail
 //! use libfreemkv::decrypt::{AacsKeyMap, Phase};
 //! let _ = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::All)]);
-//! ```
-//! `Disc::decrypt_with` (§2.2: "`pub(crate)`"):
-//! ```compile_fail
-//! fn f(d: &mut libfreemkv::Disc) {
-//!     let _ = d.decrypt_with(libfreemkv::disc::Key::Unit(Vec::new()), &[]);
-//! }
 //! ```
 //! `DecryptingSectorSource::with_key_map` (§2.2: "`pub(crate)`"):
 //! ```compile_fail

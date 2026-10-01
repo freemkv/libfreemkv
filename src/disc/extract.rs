@@ -44,7 +44,7 @@ pub struct ExtractOptions<'a> {
     /// is read through the set's reader: proven files by its map, the rest proven on
     /// arrival, and a readable unit no held key opens stops the run (E7032). `None`
     /// decrypts no AACS: the caller's `check_decryptable` gate refuses an AACS disc first.
-    pub keys: Option<&'a crate::keys::ResolvedKeySet>,
+    pub keys: Option<&'a crate::keys::KeyRing>,
 }
 
 /// Per-file extraction outcome.
@@ -2042,7 +2042,7 @@ mod tests {
         let out = TmpDir::new("multiextent_aacs");
         let d = aacs_disc();
         let (a, b) = (PART_START + DATA_A, PART_START + DATA_B);
-        let set = crate::keys::ResolvedKeySet::keyed_for_test(
+        let set = crate::keys::KeyRing::keyed_for_test(
             &d,
             key,
             &[(a, a + SECTORS_EACH), (b, b + SECTORS_EACH)],
