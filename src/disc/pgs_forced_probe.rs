@@ -2279,6 +2279,44 @@ mod tests {
         );
     }
 
+    // A window that runs past the top of the 32-bit LBA space is skipped, never wrapped
+    // onto an unrelated low region.
+    #[test]
+    fn a_window_past_the_top_of_the_lba_space_is_not_wrapped() {
+        struct LbaLog(Vec<u32>);
+        impl SectorSource for LbaLog {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                _count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> crate::error::Result<usize> {
+                self.0.push(lba);
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+        let start = u32::MAX - 10;
+        let mut title = pgs_title(0x1200, false);
+        title.extents = vec![Extent {
+            start_lba: start,
+            sector_count: 2_000_000,
+        }];
+        let mut reader = LbaLog(Vec::new());
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        assert!(
+            reader.0.iter().all(|&l| l >= start),
+            "read below the extent: {:?}",
+            reader
+                .0
+                .iter()
+                .filter(|&&l| l < start)
+                .take(3)
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ...but a COMPLETE read has no unread gap to hide a non-forced set in, so a genuine
     // single-sign forced track is still promoted.
     #[test]

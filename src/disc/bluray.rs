@@ -190,7 +190,10 @@ impl Disc {
                 // WHOLE-clip size/extents on purpose (no EP-map seek): out-of-mark
                 // bytes are dropped downstream by PTS at the SeamPlan — see
                 // `SeamPlan::place` (src/mux/timeline.rs) `raw_ns >= in_ns && <= out_ns`.
-                total_size += pkt_count as u64 * crate::consts::BD_SOURCE_PACKET_BYTES as u64;
+                let clpi_bytes = pkt_count as u64 * crate::consts::BD_SOURCE_PACKET_BYTES as u64;
+                // The .ssif interleaves the dependent view, so the CLPI count (base
+                // view only) under-sizes what the extents deliver.
+                let mut from_ssif = false;
 
                 // Get stream file extents from UDF allocation descriptors (dual-
                 // layer discs split files across layers). Normally `.m2ts`; AACS 2.1
@@ -211,6 +214,7 @@ impl Disc {
                 let file_exts = match udf_fs.file_extents(reader, &ssif) {
                     Ok(exts) => {
                         is_3d = true;
+                        from_ssif = true;
                         Some(exts)
                     }
                     Err(e) => {
@@ -282,11 +286,13 @@ impl Disc {
                     push_extents(file_exts, &mut extents, &mut feed_pos);
                     if feed_pos > span_start {
                         spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
-                        // A damaged CLPI reports no packet count: size the clip by its extents.
-                        if pkt_count == 0 {
-                            total_size += feed_pos - span_start;
-                        }
                     }
+                    // A damaged CLPI reports no packet count: size the clip by its extents.
+                    total_size += if pkt_count == 0 || from_ssif {
+                        feed_pos - span_start
+                    } else {
+                        clpi_bytes
+                    };
                 }
             }
 
@@ -341,8 +347,8 @@ impl Disc {
                         measured_cicp: None,
                     })),
                     2 | 5 => {
-                        // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),
-                        // this is a misaligned stream -- treat as subtitle, not audio
+                        // Guard: if coding_type is the PGS subtitle codec (0x90), this
+                        // is a misaligned stream -- treat as subtitle, not audio
                         if matches!(codec, Codec::Pgs) {
                             Some(Stream::Subtitle(SubtitleStream {
                                 pid: s.pid,
@@ -501,7 +507,13 @@ impl Disc {
                         if let Some(start) = xml.find("<di:name>") {
                             let s = start + "<di:name>".len();
                             if let Some(end) = xml[s..].find("</di:name>") {
-                                let title = xml_text_decode(xml[s..s + end].trim());
+                                // Disc-authored text reaches terminals and file names:
+                                // control characters (decoded from `&#27;` too) are dropped.
+                                let title: String = xml_text_decode(xml[s..s + end].trim())
+                                    .chars()
+                                    .filter(|c| !c.is_control())
+                                    .collect();
+                                let title = title.trim().to_string();
                                 if !title.is_empty() && title != "Blu-ray" {
                                     return Some(title);
                                 }
@@ -515,8 +527,6 @@ impl Disc {
     }
 }
 
-// Decode the five predefined XML entities and numeric char refs in element text, and unwrap a
-// CDATA section; unknown or malformed references are kept literally.
 /// Append each usable `(lba, sectors)` to `extents`, advancing `feed_pos` by its bytes. An extent
 /// with no sectors or at LBA 0 occupies no readable bytes and is skipped without moving `feed_pos`.
 fn push_extents(file_exts: Vec<(u32, u32)>, extents: &mut Vec<Extent>, feed_pos: &mut u64) {
@@ -532,6 +542,8 @@ fn push_extents(file_exts: Vec<(u32, u32)>, extents: &mut Vec<Extent>, feed_pos:
     }
 }
 
+// Decode the five predefined XML entities and numeric char refs in element text, and unwrap a
+// CDATA section; unknown or malformed references are kept literally.
 fn xml_text_decode(raw: &str) -> String {
     if let Some(inner) = raw
         .strip_prefix("<![CDATA[")
@@ -1852,6 +1864,184 @@ mod tests {
         assert_eq!(
             dep_count, 1,
             "an already-present stream at base_pid + 1 must not be duplicated"
+        );
+    }
+
+    /// The 3D `.ssif` interleaves the dependent view, so `size_bytes` follows the
+    /// extents the read plan covers, not the base-view-only CLPI packet count.
+    #[test]
+    fn parse_playlist_3d_size_covers_the_interleaved_extents() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs_ssif(&mut disc, &[("00001", 1000, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se_video(0x1011, 0x1B)],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        assert_eq!(t.size_bytes, 1000 * 2048);
+    }
+
+    fn se_raw(pid: u16, attrs: &[u8]) -> Vec<u8> {
+        let mut out = vec![3u8, 0x01];
+        out.extend_from_slice(&pid.to_be_bytes());
+        out.push(attrs.len() as u8);
+        out.extend_from_slice(attrs);
+        out
+    }
+
+    /// The MPLS format/rate nibbles reach the right `Stream` fields, and the
+    /// secondary-video (6) and Dolby Vision EL (7) categories are kept as video.
+    #[test]
+    fn parse_playlist_maps_format_rate_nibbles_and_secondary_video() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 1, 0, 0, 0, 1, 0, 1),
+            &[
+                se_raw(0x1011, &[0x1B, 0x63]),                   // 1080p, 25 fps
+                se_raw(0x1100, &[0x81, 0x64, b'e', b'n', b'g']), // 5.1, 96 kHz
+                // Secondary video carries audio-ref and PG-ref counts after the entry.
+                [se_raw(0x1B00, &[0x1B, 0x63]), vec![0u8; 4]].concat(),
+                se_raw(0x1015, &[0x24, 0x63]),
+            ],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        let videos: Vec<_> = t.video_streams().collect();
+        let audio = t.audio_streams().next().expect("audio");
+        assert_eq!(videos.len(), 3, "primary, secondary and EL video kept");
+        assert_eq!(videos[0].resolution, Resolution::R1080p);
+        assert_eq!(videos[0].frame_rate, FrameRate::F25);
+        assert_eq!(audio.channels, AudioChannels::Surround51);
+        assert_eq!(audio.sample_rate, SampleRate::S96);
+    }
+
+    /// One unreadable playlist is skipped with a warning; the healthy one survives.
+    #[test]
+    fn scan_bluray_titles_skips_an_unreadable_playlist() {
+        struct FailingReader<'a> {
+            inner: &'a mut MemDisc,
+            fail_lba: u32,
+        }
+        impl SectorSource for FailingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba == self.fail_lba {
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: Some(0x02),
+                        sense: None,
+                    });
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+        let mut disc = MemDisc::new();
+        let udf = two_playlist_bd_fs(&mut disc);
+        let mut reader = FailingReader {
+            inner: &mut disc,
+            fail_lba: PART_START + 30000, // 00800.mpls's data extent
+        };
+        let titles = Disc::scan_bluray_titles(&mut reader, &udf, None).expect("scan survives");
+        assert_eq!(titles.len(), 1);
+        assert_eq!(titles[0].playlist, "00801.mpls");
+    }
+
+    /// A Stop that lands during the final playlist's reads is `Halted`, not a
+    /// silently truncated list.
+    #[test]
+    fn scan_bluray_titles_polls_halt_after_the_last_playlist() {
+        struct CancellingReader<'a> {
+            inner: &'a mut MemDisc,
+            halt: crate::halt::Halt,
+            cancel_lba: u32,
+        }
+        impl SectorSource for CancellingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba == self.cancel_lba {
+                    self.halt.cancel();
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+        let mut disc = MemDisc::new();
+        let udf = two_playlist_bd_fs(&mut disc);
+        let halt = crate::halt::Halt::new();
+        let mut reader = CancellingReader {
+            inner: &mut disc,
+            halt: halt.clone(),
+            cancel_lba: PART_START + 40000, // 00801.mpls, the last playlist
+        };
+        let res = Disc::scan_bluray_titles(&mut reader, &udf, Some(&halt));
+        assert!(matches!(res, Err(Error::Halted)), "got {res:?}");
+    }
+
+    /// Control characters in the disc-authored title never reach a front end,
+    /// whether raw or written as a character reference.
+    #[test]
+    fn read_meta_title_drops_control_characters() {
+        let mut disc = MemDisc::new();
+        let xml = b"<x><di:name>A&#27;[2JB\x07C</di:name></x>".to_vec();
+        let dl = DirSpec {
+            name: "DL".to_string(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![file_with("bdmt_eng.xml", 104, 50000, xml, false)],
+            subdirs: vec![],
+        };
+        let meta = DirSpec {
+            name: "META".to_string(),
+            icb_lba: 28,
+            dir_data_lba: 29,
+            files: Vec::new(),
+            subdirs: vec![dl],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![meta],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(
+            Disc::read_meta_title(&mut disc, &udf),
+            Some("A[2JBC".to_string())
         );
     }
 

@@ -1658,6 +1658,11 @@ mod tests {
             sub.codec_data.is_some(),
             "non-zero palette must yield codec_data"
         );
+        let idx = String::from_utf8(sub.codec_data.clone().expect("codec_data")).expect("utf8");
+        assert!(
+            idx.starts_with("size: 720x480\npalette: "),
+            "the .idx carries the NTSC coded frame size, then the palette: {idx:?}"
+        );
     }
 
     /// Multiple titles in one VTS each become their own DiscTitle with a
@@ -1772,6 +1777,109 @@ mod tests {
         // The promotion mapped that target to the second scanned title.
         assert_eq!(nav_feature, Some(2));
         assert_eq!(titles[1].playlist_id, 2);
+    }
+
+    // The nav target joins on the VTS number AND the in-set title number: VTS 2 also has an
+    // in-set title 1, which must not take the promotion from VTS 1's.
+    #[test]
+    fn scan_dvd_titles_nav_target_is_matched_by_vts_number() {
+        let mut disc = MemDisc::new();
+        let mut vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+        stamp_first_play_jumptt(&mut vmg, 1);
+        let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+        let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts1,
+                },
+                FileSpec {
+                    name: "VTS_02_0.IFO".into(),
+                    icb_lba: 64,
+                    data_lba: 7000,
+                    contents: vts2,
+                },
+            ],
+        );
+        let (titles, nav_feature) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        assert_eq!(titles.len(), 2);
+        assert_eq!(nav_feature, Some(1));
+    }
+
+    fn one_title_dvd(disc: &mut MemDisc) -> udf::UdfFs {
+        build_video_ts_fs(
+            disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: build_vts(0, 0x00, &[], &[], &[(0, 9)], false),
+                },
+            ],
+        )
+    }
+
+    // A Stop raised before the scan, or during its last reads, is `Halted`, never a list.
+    #[test]
+    fn scan_dvd_titles_honours_the_halt_token() {
+        struct CancellingReader<'a> {
+            inner: &'a mut MemDisc,
+            halt: crate::halt::Halt,
+            reads: u32,
+        }
+        impl SectorSource for CancellingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> crate::error::Result<usize> {
+                self.reads += 1;
+                if lba >= PART_START + 6000 {
+                    self.halt.cancel();
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+        let mut disc = MemDisc::new();
+        let udf = one_title_dvd(&mut disc);
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let mut reader = CancellingReader {
+            inner: &mut disc,
+            halt: halt.clone(),
+            reads: 0,
+        };
+        let res = Disc::scan_dvd_titles(&mut reader, &udf, Some(&halt));
+        assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
+        assert_eq!(reader.reads, 0, "a cancelled scan reads nothing");
+
+        let halt = crate::halt::Halt::new();
+        let mut reader = CancellingReader {
+            inner: &mut disc,
+            halt: halt.clone(),
+            reads: 0,
+        };
+        let res = Disc::scan_dvd_titles(&mut reader, &udf, Some(&halt));
+        assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
     }
 
     /// chapter_times from the IFO become Chapter entries with ordinal
