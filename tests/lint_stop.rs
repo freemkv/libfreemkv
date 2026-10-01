@@ -583,11 +583,6 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         r#"expect(dead_code,reason="payloadsarefaultdetailforDebug;callersmatchthevariant")"#,
         1,
     ),
-    (
-        "src/labels/ctrm.rs",
-        r#"allow(clippy::items_after_test_module)"#,
-        1,
-    ),
     ("src/mpls.rs", r#"allow(dead_code)"#, 2),
     ("src/mux/demux_sink.rs", r#"allow(dead_code)"#, 2),
     ("src/mux/demux_thread.rs", r#"allow(dead_code)"#, 1),
