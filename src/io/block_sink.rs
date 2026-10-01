@@ -128,9 +128,8 @@ impl BlockSink for NullBlockSink {
 }
 
 /// Open the block output `url`: `iso://<path>` (an image, created now) or `null://`.
-/// `dir://` is the folder output of a whole-disc extraction ([`crate::Disc::extract_tree`]);
-/// a PES output scheme is refused with [`Error::StreamWriteOnly`]'s sibling
-/// [`Error::StreamUrlInvalid`].
+/// `dir://` is the folder output of a whole-disc extraction ([`crate::Disc::extract_tree`])
+/// and is refused here, as is a PES output scheme, with [`Error::StreamUrlInvalid`].
 pub fn open_block_sink(url: &str) -> Result<Box<dyn BlockSink>> {
     match crate::mux::parse_url(url) {
         crate::mux::StreamUrl::Iso { path } => {
