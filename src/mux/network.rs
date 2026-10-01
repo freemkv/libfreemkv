@@ -750,6 +750,57 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    // `finish_incomplete` arms the reset itself; a sender that never reaches its drop (or a
+    // receiver waiting on the close) still sees the abort mark.
+    #[test]
+    fn finish_incomplete_resets_the_connection_at_once() {
+        use crate::pes::PesSink as _;
+        let (addr, handle) = spawn_ending_reader();
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        writer.write(&one_frame()).unwrap();
+        let linger = |w: &NetworkStream| match &w.mode {
+            Mode::Write { writer, .. } => socket2::SockRef::from(writer.get_ref()).linger().unwrap(),
+            Mode::Read { .. } => unreachable!(),
+        };
+        assert_eq!(linger(&writer), None);
+        writer.finish_incomplete().unwrap();
+        assert_eq!(linger(&writer), Some(std::time::Duration::ZERO));
+        drop(writer);
+        let _ = handle.join().unwrap();
+    }
+
+    // A timing set for a stream the title does not have is an error, not an out-of-range
+    // index; one set after the header is on the wire is refused, not silently dropped.
+    #[test]
+    fn track_timing_is_range_and_header_checked() {
+        use crate::pes::PesSink as _;
+        let timing = crate::pes::TrackTiming {
+            codec_delay_ns: 1,
+            seek_preroll_ns: 2,
+        };
+        let mut timings = Vec::new();
+        assert!(set_timing(&mut timings, 1, timing, 2).is_ok());
+        assert_eq!(timings, vec![Default::default(), timing]);
+        assert!(set_timing(&mut timings, 2, timing, 2).is_err());
+
+        let (addr, handle) = spawn_ending_reader();
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        writer.write(&one_frame()).unwrap();
+        let e = writer.set_track_timing(0, timing).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains(&crate::error::Error::StreamHeaderWritten.to_string()),
+            "{e}"
+        );
+        writer.finish().unwrap();
+        drop(writer);
+        let _ = handle.join().unwrap();
+    }
+
     // A connection cut inside a frame (even with a clean FIN) is an error.
     #[test]
     fn a_connection_cut_mid_frame_is_an_error_at_the_receiver() {
