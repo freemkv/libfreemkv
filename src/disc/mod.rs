@@ -49,9 +49,10 @@ pub struct Disc {
     pub capacity_bytes: u64,
     /// Number of layers (1 = single, 2 = dual)
     pub layers: u8,
-    /// Titles sorted by duration (longest first), then playlist name
+    /// Titles in main-feature order: `titles[0]` is the selected main feature (nav or
+    /// authoring pick first, else largest physical size), not necessarily the longest
     pub titles: Vec<DiscTitle>,
-    /// Disc region
+    /// Disc region. Not decoded yet: scans always report [`DiscRegion::Free`].
     pub region: DiscRegion,
     /// AACS state -- None if disc is unencrypted or keys unavailable
     pub aacs: Option<AacsState>,
@@ -713,8 +714,8 @@ fn bus_map(files: StreamFiles, titles: &[DiscTitle]) -> crate::sector::bus_remov
     crate::sector::bus_removal::BusMap::new(files, &unknown)
 }
 
-// Corrects a title's TrueHD channels/sample-rate/Atmos by probing the first decrypted major
-// sync (`reader` must yield DECRYPTED sectors: mux time, not scan).
+// Test-only: corrects a title's TrueHD channels/sample-rate/Atmos by probing the first decrypted
+// major sync. The production path is `correct_truehd_stream`, driven from mux/driver.rs.
 #[cfg(test)]
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
     let pids: Vec<u16> = title
@@ -2277,7 +2278,10 @@ impl Disc {
             // whole content is captured; otherwise records may run past the
             // prefix — grow and retry, bounded by MAX_BYTES.
             if (n > 0 && n < buf.len()) || buf.len() < want || want >= MAX_BYTES {
-                return Ok(crate::aacs::mkb::trim_mkb(buf));
+                // The prefix buffer is sized for the padded file; release the unused capacity.
+                let mut mkb = crate::aacs::mkb::trim_mkb(buf);
+                mkb.shrink_to_fit();
+                return Ok(mkb);
             }
             want = (want * 2).min(MAX_BYTES);
         }
@@ -2532,15 +2536,14 @@ impl Disc {
         crate::labels::fill_defaults(&mut titles);
 
         // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD) and
-        //    layers. Region coding is not decoded yet — every disc reports
-        //    Region-free (correct for UHD; a stub until BD/DVD region detection).
+        //    layers. Region coding is not decoded yet: every disc reports Region-free.
         let format = Self::detect_disc_format(reader, &udf_fs, &titles);
         let layers = Self::layers_for(format, capacity);
         let region = DiscRegion::Free;
 
-        // 6. CSS detection for DVDs is deferred to `Disc::scan`'s drive-auth path
-        // (has `&mut Drive`), run after this returns — the reader-based crack path
-        // is NOT run here: on a CSS disc it would fail ~50,000 sectors one-by-one.
+        // 6. CSS: `scan_image` cracks the title key after this returns and `scan_live` only
+        // runs bus-auth. The reader-based crack is NOT run here: on a CSS disc it would
+        // fail ~50,000 sectors one-by-one.
         let css = None;
 
         tracing::info!(
@@ -2833,15 +2836,20 @@ impl Disc {
         if udf_fs.find_dir("/BDMV").is_some() {
             // Only the Type-and-Version record (first record) is needed.
             let mkb_paths = crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::Mkb);
-            if let Ok(mkb) =
-                crate::aacs::read_first(&mkb_paths, |p| udf_fs.read_file_prefix(reader, p, 64))
-            {
-                match mkb_type(&mkb).map(|t| t.generation()) {
+            match crate::aacs::read_first(&mkb_paths, |p| udf_fs.read_file_prefix(reader, p, 64)) {
+                Ok(mkb) => match mkb_type(&mkb).map(|t| t.generation()) {
                     Some(AacsVersion::V21) => return DiscFormat::Fmts,
                     Some(AacsVersion::V20) => return DiscFormat::Uhd,
                     Some(AacsVersion::V10) => return DiscFormat::BluRay,
                     None => {}
-                }
+                },
+                // No MKB at all is an unencrypted disc, not a fault.
+                Err(Error::AacsNoKeys) => {}
+                Err(e) => tracing::warn!(
+                    target: "freemkv::scan",
+                    error_code = e.code(),
+                    "MKB prefix unreadable; classifying the disc by resolution"
+                ),
             }
             // Unencrypted/unreadable MKB: refine by resolution, but a BD-tree disc
             // is never below Blu-ray — `detect_format` can return Dvd for an SD
@@ -3190,13 +3198,17 @@ pub(crate) fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf
     std::path::PathBuf::from(s)
 }
 
+// Disc-authored names can be arbitrarily long; the sanitised name stays well under NAME_MAX.
+const NULL_MAPFILE_NAME_MAX_CHARS: usize = 128;
+
 impl Disc {
     /// Path to the mapfile for a given output path.
     ///
     /// For the null device ([`crate::io::null_device`]), returns `{dir}/{volume_id_or_title}.mapfile`
     /// where `{dir}` is a directory this process created under the temp dir
     /// (owner-only on Unix, unpredictable name, stable for the process). For
-    /// regular files, returns `{path}.mapfile`.
+    /// regular files, returns `{path}.mapfile`. The null-device directory and the mapfile in it
+    /// outlive the process; removing them is the caller's job.
     pub fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
         if crate::io::is_null_device(path) {
             let name: String = self
@@ -3204,6 +3216,7 @@ impl Disc {
                 .as_deref()
                 .unwrap_or(&self.volume_id)
                 .chars()
+                .take(NULL_MAPFILE_NAME_MAX_CHARS)
                 .map(|c| {
                     if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                         c
@@ -3341,10 +3354,6 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
         DEFAULT_BATCH_SECTORS_BLOCK
     }
 }
-
-// ─── Format helpers ────────────────────────────────────────────────────────
-
-// Old format_* functions replaced by Resolution/FrameRate/AudioChannels/SampleRate enums
 
 #[cfg(test)]
 mod tests {
@@ -8703,6 +8712,196 @@ mod tests {
     #[test]
     fn audio_format_combo_is_not_claimed_as_7_1() {
         assert_eq!(AudioChannels::from_audio_format(12), AudioChannels::Unknown);
+    }
+
+    // The BD-ROM STN attribute nibbles decode through these tables into the fields
+    // that feed muxer timing and metadata.
+    #[test]
+    fn mpls_attribute_nibbles_decode_to_the_spec_values() {
+        use Resolution::*;
+        for (vf, want) in [
+            (1, R480i),
+            (2, R576i),
+            (3, R480p),
+            (4, R1080i),
+            (5, R720p),
+            (6, R1080p),
+            (7, R576p),
+            (8, R2160p),
+            (0, Unknown),
+        ] {
+            assert_eq!(Resolution::from_video_format(vf), want, "video_format {vf}");
+        }
+        for (vr, want, frac) in [
+            (1, FrameRate::F23_976, (24000, 1001)),
+            (2, FrameRate::F24, (24, 1)),
+            (3, FrameRate::F25, (25, 1)),
+            (4, FrameRate::F29_97, (30000, 1001)),
+            (5, FrameRate::F30, (30, 1)),
+            (6, FrameRate::F50, (50, 1)),
+            (7, FrameRate::F59_94, (60000, 1001)),
+            (8, FrameRate::F60, (60, 1)),
+        ] {
+            assert_eq!(FrameRate::from_video_rate(vr), want, "video_rate {vr}");
+            assert_eq!(want.as_fraction(), frac, "{want:?}");
+        }
+        assert_eq!(FrameRate::from_video_rate(0), FrameRate::Unknown);
+        for (af, want) in [
+            (1, AudioChannels::Mono),
+            (3, AudioChannels::Stereo),
+            (6, AudioChannels::Surround51),
+        ] {
+            assert_eq!(
+                AudioChannels::from_audio_format(af),
+                want,
+                "audio_format {af}"
+            );
+        }
+        for (ar, want) in [
+            (1, SampleRate::S48),
+            (4, SampleRate::S96),
+            (5, SampleRate::S192),
+            (12, SampleRate::S48_192),
+            (14, SampleRate::S48_96),
+            (0, SampleRate::Unknown),
+        ] {
+            assert_eq!(SampleRate::from_audio_rate(ar), want, "audio_rate {ar}");
+        }
+    }
+
+    #[test]
+    fn coding_type_maps_every_known_stream_to_its_codec() {
+        use crate::consts::coding_type as c;
+        for (ct, want) in [
+            (c::HEVC, Codec::Hevc),
+            (c::H264, Codec::H264),
+            (c::H264_MVC, Codec::H264),
+            (c::VC1, Codec::Vc1),
+            (c::MPEG2_VIDEO, Codec::Mpeg2),
+            (c::TRUEHD, Codec::TrueHd),
+            (c::DTS_HD_MA, Codec::DtsHdMa),
+            (c::DTS_HD_HR, Codec::DtsHdHr),
+            (c::DTS, Codec::Dts),
+            (c::AC3, Codec::Ac3),
+            (c::AC3_PLUS, Codec::Ac3Plus),
+            (c::AC3_PLUS_SECONDARY, Codec::Ac3Plus),
+            (c::LPCM, Codec::Lpcm),
+            (c::DTS_HD_SECONDARY, Codec::DtsHdHr),
+            (c::PG, Codec::Pgs),
+        ] {
+            assert_eq!(Codec::from_coding_type(ct), want, "coding_type {ct:#04x}");
+        }
+    }
+
+    #[test]
+    fn every_hd_resolution_is_hd_and_detects_as_bluray() {
+        for r in [
+            Resolution::R720p,
+            Resolution::R1080i,
+            Resolution::R1080p,
+            Resolution::R2160p,
+        ] {
+            assert!(r.is_hd(), "{r:?}");
+        }
+        for r in [
+            Resolution::R480i,
+            Resolution::R480p,
+            Resolution::R576i,
+            Resolution::R576p,
+            Resolution::Unknown,
+        ] {
+            assert!(!r.is_hd(), "{r:?}");
+        }
+        for r in [Resolution::R720p, Resolution::R1080i] {
+            let titles = vec![title_with_video(Codec::H264, r)];
+            assert_eq!(Disc::detect_format(&titles), DiscFormat::BluRay, "{r:?}");
+        }
+    }
+
+    // Key sampling skips a size-inflated streamless decoy, and falls back to the
+    // largest title when none has video.
+    #[test]
+    fn main_title_prefers_the_largest_title_with_video() {
+        let mut disc = make_test_disc(1_000, "BDROM");
+        let mut decoy = DiscTitle::empty();
+        decoy.playlist = "decoy".into();
+        decoy.size_bytes = 9_000_000_000;
+        let mut feature = title_with_video(Codec::H264, Resolution::R1080p);
+        feature.playlist = "feature".into();
+        feature.size_bytes = 1_000;
+        disc.titles = vec![decoy.clone(), feature];
+        assert_eq!(
+            disc.main_title().map(|t| t.playlist.as_str()),
+            Some("feature")
+        );
+        let mut small = decoy.clone();
+        small.playlist = "small".into();
+        small.size_bytes = 5;
+        disc.titles = vec![small, decoy];
+        assert_eq!(
+            disc.main_title().map(|t| t.playlist.as_str()),
+            Some("decoy")
+        );
+    }
+
+    // The key-service label is the trimmed volume id, else the BDMV title; the AACS
+    // inputs come from the captured state.
+    #[test]
+    fn inputs_label_is_the_trimmed_volume_id_else_the_meta_title() {
+        let mut disc = make_test_disc(1_000, "  TITLE_2024  ");
+        let mut st = aacs_empty();
+        st.uk_ro = vec![1, 2, 3];
+        st.mkb = vec![4, 5];
+        disc.aacs = Some(st);
+        let i = disc.inputs().expect("inputs");
+        assert_eq!(i.volume_label.as_deref(), Some("TITLE_2024"));
+        assert_eq!(i.unit_key_ro, vec![1, 2, 3]);
+        assert_eq!(i.mkb, vec![4, 5]);
+        disc.volume_id = "   ".into();
+        disc.meta_title = Some("Meta".into());
+        assert_eq!(
+            disc.inputs().expect("inputs").volume_label.as_deref(),
+            Some("Meta")
+        );
+    }
+
+    #[test]
+    fn mapfile_for_dev_null_caps_a_long_disc_name() {
+        let disc = make_test_disc(1_000, &"x".repeat(1_000));
+        let p = disc.mapfile_for(std::path::Path::new("/dev/null"));
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(name.len() < 255, "{} bytes", name.len());
+    }
+
+    // A padded MKB is trimmed to its record stream, and the buffer does not keep the
+    // capacity of the padded prefix it was read into.
+    #[test]
+    fn read_mkb_content_releases_the_padding_capacity() {
+        use crate::udf::fixture::*;
+        let mut mkb = vec![0x04, 0x00, 0x10, 0x00];
+        mkb.resize(0x1000, 0xAA);
+        mkb.extend_from_slice(&[0, 0, 0, 0]);
+        mkb.resize(17 * 1024 * 1024, 0);
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "AACS".into(),
+                icb_lba: 12,
+                dir_data_lba: 13,
+                files: vec![file_with("MKB_RO.inf", 14, 1000, mkb, true)],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let got = Disc::read_mkb_content(&mut disc, &udf).expect("mkb");
+        assert_eq!(got.len(), 0x1000);
+        assert!(got.capacity() < 1024 * 1024, "capacity {}", got.capacity());
     }
 
     #[test]
