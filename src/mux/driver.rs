@@ -1002,6 +1002,19 @@ impl WriteSink {
         })
     }
 
+    // End an output that `cause` cut short. The cause is the title's verdict: ending the
+    // output can fail (an mkv with no frames is `MkvInvalid`), which is logged, never returned.
+    fn end_cut_short(self, cause: &str) -> Result<SinkClose, Error> {
+        let bytes = self.bytes.clone();
+        self.end(false).or_else(|e| {
+            tracing::warn!(target: "mux", error = %e, "ending the output {cause} cut short failed");
+            Ok(SinkClose {
+                bytes: bytes.load(Ordering::Relaxed),
+                undelivered: Vec::new(),
+            })
+        })
+    }
+
     fn apply_late_configs(&mut self) -> Result<(), Error> {
         let late = std::mem::take(&mut *lock_late(&self.late_configs));
         for (track, cp) in late {
@@ -1029,24 +1042,16 @@ impl Sink<PesFrame> for WriteSink {
         Ok(Flow::Continue)
     }
 
-    // After a read failure the read error is the title's failure: ending the output it
-    // cut short can fail (an mkv with no frames is `MkvInvalid`) but never replaces it.
     fn close(self) -> Result<SinkClose, Error> {
-        if !self.read_failed.load(Ordering::Relaxed) {
-            return self.end(true);
+        match self.read_failed.load(Ordering::Relaxed) {
+            true => self.end_cut_short("a read failure"),
+            false => self.end(true),
         }
-        self.end(false).or_else(|e| {
-            tracing::warn!(target: "mux", error = %e, "ending the output a read failure cut short failed");
-            Ok(SinkClose {
-                bytes: 0,
-                undelivered: Vec::new(),
-            })
-        })
     }
 
     // A stopped title is incomplete too: a wire sink must not end it cleanly.
     fn close_stopped(self) -> Result<SinkClose, Error> {
-        self.end(false)
+        self.end_cut_short("a stop")
     }
 }
 
@@ -1176,6 +1181,20 @@ mod tests {
             "got {err}"
         );
         assert!(!crate::error::is_skippable_title_stub(&err));
+    }
+
+    // A Stop after the mkv output opens but before any frame reaches it: a halted outcome,
+    // never the zero-frame `MkvInvalid` from ending the empty output.
+    #[test]
+    fn a_stop_before_any_frame_reaches_an_open_mkv_is_halted_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("mkv://{}", dir.path().join("o.mkv").display());
+        let halt = Halt::new();
+        let fs = FakeStream::new(1).with_frames(10).cancels(halt.clone(), 0);
+        let ctx = crate::ctx::Ctx::new(halt.clone());
+        let o = drive_mux(Box::new(fs), &url, &ctx, None, None).expect("a stop is not an error");
+        assert!(o.output_opened && !o.completed && o.halted, "{o:?}");
+        assert_eq!(o.bytes_written, 0);
     }
 
     // A stop ends the output incomplete; a clean drain finishes it.
