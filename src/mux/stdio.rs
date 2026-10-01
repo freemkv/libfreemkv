@@ -392,6 +392,51 @@ mod tests {
         assert!(r.read().unwrap().is_none());
     }
 
+    // A zero-frame title still puts the header on the wire: the reader sees the title.
+    #[test]
+    fn finish_without_frames_still_writes_the_header() {
+        let out = Shared::default();
+        let mut w = StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+        w.finish().unwrap();
+        let mut r = reader(out.0.lock().unwrap().clone());
+        r.prime().unwrap();
+        assert_eq!(r.info().playlist, "StdioTitle");
+        assert!(r.read().unwrap().is_none());
+    }
+
+    // Frame framing follows the header: with no timing set (v1) frames carry no padding field
+    // and read back whole; with a timing set (v2) the DiscardPadding survives.
+    #[test]
+    fn frame_padding_follows_the_header_version() {
+        let round_trip = |timed: bool, padding: i64| {
+            let out = Shared::default();
+            let mut w =
+                StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+            if timed {
+                let timing = crate::pes::TrackTiming {
+                    codec_delay_ns: 5,
+                    seek_preroll_ns: 9,
+                };
+                w.set_track_timing(0, timing).unwrap();
+            }
+            let mut f = frame(&[1, 2, 3]);
+            f.discard_padding_ns = padding;
+            w.write(&f).unwrap();
+            w.write(&frame(&[4, 5])).unwrap();
+            w.finish().unwrap();
+            let mut r = reader(out.0.lock().unwrap().clone());
+            let a = r.read().unwrap().unwrap();
+            let b = r.read().unwrap().unwrap();
+            assert!(r.read().unwrap().is_none());
+            (a.discard_padding_ns, a.data, b.data)
+        };
+        assert_eq!(round_trip(false, 0), (0, vec![1, 2, 3], vec![4, 5]));
+        assert_eq!(
+            round_trip(true, -2_500_000),
+            (-2_500_000, vec![1, 2, 3], vec![4, 5])
+        );
+    }
+
     // prime() reads the header up front: info() is the stream's title before any frame,
     // and the first read still returns the first frame.
     #[test]
