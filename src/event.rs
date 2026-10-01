@@ -1,114 +1,36 @@
-//! Event system for progress and status reporting.
+//! The one event vocabulary every stage reports through (pipeline design §2.5).
 //!
-//! The lib fires events during operations like rip().
-//! The app registers a callback to receive them.
-//! No display logic, no English text — just data.
-//!
-//! ```rust,ignore
-//! disc.rip(&mut session, 0, output, |event| {
-//!     match event.kind {
-//!         EventKind::BytesRead { bytes, total } => update_progress(bytes, total),
-//!         EventKind::SectorSkipped { sector } => log_skip(sector),
-//!         EventKind::BatchSizeChanged { new_size, .. } => note_recovery(new_size),
-//!         _ => {}
-//!     }
-//! });
-//! ```
-//!
-//! Note: the library currently emits only `BytesRead`, `SectorSkipped`,
-//! and `BatchSizeChanged`. The other [`EventKind`] variants are part of
-//! the stable event vocabulary for consumers (and future emit sites) but
-//! are not produced by the library today.
+//! A stage emits through [`Ctx::events`](crate::Ctx); a consumer implements [`Events`] once
+//! and matches the variants it renders. Data only: no display logic, no English text.
 
-use crate::error::Error;
+use crate::disc::DiscTitle;
+use crate::progress::PassProgress;
 
-/// An event fired by the lib during operations.
-#[derive(Debug)]
-pub struct Event {
-    pub kind: EventKind,
-}
-
-/// Types of events the lib can fire.
-#[derive(Debug)]
-pub enum EventKind {
-    // ── Init sequence events ────────────────────────────────────────
-    /// Drive opened successfully.
-    DriveOpened { device: String },
-
-    /// Drive is ready (disc spun up).
-    DriveReady,
-
-    /// Firmware init completed.
-    InitComplete { success: bool },
-
-    /// Disc probe completed.
-    ProbeComplete { success: bool },
-
-    /// Disc scan completed.
-    ScanComplete { titles: usize },
-
-    // ── Read events ─────────────────────────────────────────────────
-    /// Bytes successfully read and written to output.
-    BytesRead {
-        /// Bytes written so far.
-        bytes: u64,
-        /// Total bytes expected (0 if unknown).
-        total: u64,
-    },
-
-    /// A read error occurred. The lib will retry automatically.
-    ReadError {
-        /// Sector that failed.
-        sector: u64,
-        /// Error code.
-        error: Error,
-    },
-
-    /// Retrying a failed read.
-    Retry {
-        /// Current attempt number (1-based).
-        attempt: u32,
-    },
-
-    /// Drive speed changed (error recovery or restoration).
-    SpeedChange {
-        /// New speed in KB/s (0xFFFF = max).
-        speed_kbs: u16,
-    },
-
-    /// Starting a new disc extent.
-    ExtentStart {
-        /// Extent index (0-based).
-        index: usize,
-        /// First sector of extent.
-        start_sector: u64,
-        /// Number of sectors in extent.
-        sector_count: u64,
-    },
-
-    /// Sector recovered after a retry (Drive::read multi-phase recovery).
-    SectorRecovered { sector: u64 },
-
-    /// Sector unreadable, zero-filled (skip mode).
-    SectorSkipped { sector: u64 },
-
-    /// Adaptive batch sizer changed the read size.
-    ///
-    /// Fires on shrink (read failed at larger size) and on probe-up
-    /// (enough clean reads to try larger again). Consumers use this to
-    /// display a "recovering" state distinct from "ripping normally".
+/// What a stage reports while it runs. Borrowed: an [`Events`] impl copies out what it keeps.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum Event<'a> {
+    /// Source bytes delivered so far by the read stage, of `total` planned (0 if unknown).
+    BytesRead { bytes: u64, total: u64 },
+    /// A read error at `lba` was zero-filled and skipped (skip-errors policy).
+    SectorSkipped { lba: u64 },
+    /// `units` damaged AACS units in the read starting at `lba` were blanked and counted.
+    UnitBlanked { lba: u64, units: u64 },
+    /// The adaptive live read batch changed to `new_size` sectors.
     BatchSizeChanged {
         new_size: u16,
         reason: BatchSizeReason,
     },
-
-    /// Operation complete.
-    Complete {
-        /// Total bytes written.
-        bytes: u64,
-        /// Total read errors encountered.
-        errors: u32,
-    },
+    /// A recovery, extract or image pass's running totals.
+    Pass(&'a PassProgress),
+    /// Bytes handed to the output so far, of the planned `total` (0 if unknown).
+    BytesWritten { bytes: u64, total: u64 },
+    /// While the output is flushed at the end: bytes made durable so far. At most 4 per
+    /// second and none while nothing moves, so silence means a stalled flush (stop §4.5).
+    BytesDurable { bytes: u64, total: u64 },
+    /// The output opened for `title` as it will be written: streams the sink refused are
+    /// left out (indices compact); `MuxOutcome::undelivered_streams` keeps source indices.
+    OutputOpened { title: &'a DiscTitle },
 }
 
 /// Why the adaptive batch sizer changed size.
@@ -120,26 +42,32 @@ pub enum BatchSizeReason {
     Probed,
 }
 
-/// A no-op event handler. Ignores all events.
-pub fn ignore(_event: Event) {}
+/// A consumer of [`Event`]s. Called from stage threads (the read producer, the mux pump):
+/// keep it cheap and non-blocking.
+pub trait Events: Send + Sync {
+    /// One event. The default ignores it.
+    fn event(&self, _e: &Event<'_>) {}
+}
+
+/// An [`Events`] that ignores everything.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEvents;
+
+impl Events for NoEvents {}
+
+impl<F: Fn(&Event<'_>) + Send + Sync> Events for F {
+    fn event(&self, e: &Event<'_>) {
+        self(e)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // Shrunk != Probed: distinct meanings (error vs. recovery), must not compare equal.
-    // Mutation: bad PartialEq derive could make distinct variants equal.
     #[test]
     fn batch_size_reason_variants_are_not_equal() {
         assert_ne!(BatchSizeReason::Shrunk, BatchSizeReason::Probed);
-    }
-
-    // Clone + Copy: cloning doesn't move; required since BatchSizeChanged embeds by value.
-    // Mutation: removing Copy would break callers that pass reason by value.
-    #[test]
-    fn batch_size_reason_is_copy() {
-        let r = BatchSizeReason::Shrunk;
-        let _r2 = r; // copy, not move
-        let _r3 = r; // r still usable after copy
     }
 }

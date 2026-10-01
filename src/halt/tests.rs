@@ -349,7 +349,7 @@ fn join_within_finished_cancelled_and_expired() {
 /// never expires.
 #[test]
 fn stall_timer_rearms_on_progress() {
-    let p = Progress::new();
+    let p = Liveness::new();
     let mut t = StallTimer::new(WINDOW, &p);
     let start = Instant::now();
     let mut next_bump = start + WINDOW / 5;
@@ -368,7 +368,7 @@ fn stall_timer_rearms_on_progress() {
 /// window + slack; never before the window.
 #[test]
 fn stall_timer_expires_without_progress() {
-    let p = Progress::new();
+    let p = Liveness::new();
     p.bump();
     let start = Instant::now();
     let mut t = StallTimer::new(WINDOW, &p);
@@ -392,10 +392,10 @@ fn stall_timer_expires_without_progress() {
 }
 
 /// LT5c (ST3-5): with a live `busy()` guard an `idle_only` timer does not expire,
-/// while a plain timer on the same `Progress` expires at its window.
+/// while a plain timer on the same `Liveness` expires at its window.
 #[test]
 fn busy_pauses_only_idle_only_timers() {
-    let p = Progress::new();
+    let p = Liveness::new();
     let mut plain = StallTimer::new(WINDOW, &p);
     let mut idle = StallTimer::idle_only(WINDOW, &p);
     let guard = p.busy();
@@ -432,7 +432,7 @@ fn busy_pauses_only_idle_only_timers() {
 /// A busy span that starts and ends between two polls counts as busy, not idle.
 #[test]
 fn idle_only_ignores_a_busy_span_between_polls() {
-    let p = Progress::new();
+    let p = Liveness::new();
     let mut idle = StallTimer::idle_only(WINDOW, &p);
     let g = p.busy();
     std::thread::sleep(WINDOW * 2);

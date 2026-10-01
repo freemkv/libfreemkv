@@ -1,10 +1,10 @@
 //! Pipeline-progress reporting for the rip pipeline.
 //!
 //! Architecture rule: ONE progress signal type. Every long-running
-//! pipeline operation (`freemkv_engine::recovery::{copy, patch}`) emits the
-//! same [`PassProgress`] shape via the [`Progress`] trait. Consumers (autorip)
-//! compute their own single derived view from these fields and never reach
-//! into per-pass internals.
+//! pipeline operation (`freemkv_engine::recovery::{copy, patch}`, extract) emits the
+//! same [`PassProgress`] shape as [`Event::Pass`](crate::Event::Pass) through the run's
+//! [`Ctx`](crate::Ctx). Consumers compute their own single derived view from these fields
+//! and never reach into per-pass internals.
 
 /// Identifies which pipeline phase the progress event belongs to.
 ///
@@ -27,6 +27,8 @@ pub enum PassKind {
     Mux,
     /// Sector verification — reads every sector and classifies health.
     Verify,
+    /// A disc's decrypted file tree written out (`dir://`).
+    Extract,
 }
 
 /// One located bad/not-yet-good range, annotated with the chapter and movie
@@ -232,26 +234,6 @@ impl Heartbeat {
             elapsed_ms,
             "alive"
         );
-    }
-}
-
-/// A consumer of pipeline progress events. Library code calls
-/// `Progress::report` once per inner-loop iteration (throttling is the
-/// consumer's job — `report` is cheap; the library doesn't gate it).
-///
-/// Returns `true` to continue, `false` to request early stop.
-///
-/// No `Send`/`Sync` bound — `report` is always called from the same thread
-/// running the pipeline, so closures with non-`Sync` captures (e.g.
-/// `RefCell<PassProgressState>`) work directly. Blanket impl below lets
-/// callers pass closures without explicit struct types.
-pub trait Progress {
-    fn report(&self, p: &PassProgress) -> bool;
-}
-
-impl<F: Fn(&PassProgress) -> bool> Progress for F {
-    fn report(&self, p: &PassProgress) -> bool {
-        (self)(p)
     }
 }
 
@@ -495,50 +477,5 @@ mod pass_progress_tests {
             30.0,
             "pending_pct must read bytes_pending_total"
         );
-    }
-
-    // A closure is a `Progress` via the blanket impl; its return value is the
-    // cancellation signal. A constant-returning blanket body would make every
-    // closure-based consumer uncancellable.
-    #[test]
-    fn the_closure_blanket_impl_returns_the_closures_own_verdict() {
-        fn ask<P: Progress>(p: &P, s: &PassProgress) -> bool {
-            p.report(s)
-        }
-
-        let keep_going = |_: &PassProgress| true;
-        let cancel = |_: &PassProgress| false;
-
-        assert!(ask(&keep_going, &sample()), "true must survive the forward");
-        assert!(
-            !ask(&cancel, &sample()),
-            "a closure returning false is a CANCEL and must not be reported as \
-             keep-going; a constant-true blanket impl makes cancellation a no-op"
-        );
-    }
-
-    /// The blanket impl must hand the closure the caller's sample, not a
-    /// fabricated one — a consumer decides whether to cancel FROM the numbers.
-    #[test]
-    fn the_closure_blanket_impl_passes_the_sample_through() {
-        use std::sync::{Arc, Mutex};
-        fn ask<P: Progress>(p: &P, s: &PassProgress) -> bool {
-            p.report(s)
-        }
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let recorder = move |p: &PassProgress| {
-            sink.lock().unwrap().push((p.work_done, p.work_total));
-            true
-        };
-
-        let s = PassProgress {
-            work_done: 7,
-            work_total: 9,
-            ..sample()
-        };
-        assert!(ask(&recorder, &s));
-        assert_eq!(*seen.lock().unwrap(), vec![(7, 9)]);
     }
 }

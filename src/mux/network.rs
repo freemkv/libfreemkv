@@ -1329,9 +1329,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.m2ts");
         std::fs::write(&path, &clip).unwrap();
-        let mut src =
-            crate::mux::resolve::input(&format!("m2ts://{}", path.display()), &Default::default())
-                .unwrap();
+        let mut src = crate::mux::resolve::input(
+            &format!("m2ts://{}", path.display()),
+            &Default::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .unwrap();
         let title = src.info().clone();
         let mut frames = Vec::new();
         while let Some(f) = src.read().unwrap() {

@@ -1625,7 +1625,9 @@ mod tests {
         // `mp4://` reads the same file through the decryption stage: a clear container
         // (Opaque) is handed through untouched, seeks included.
         let url = format!("mp4://{}", path.display());
-        let mut staged = crate::mux::resolve::input(&url, &Default::default()).unwrap();
+        let mut staged =
+            crate::mux::resolve::input(&url, &Default::default(), &crate::ctx::Ctx::default())
+                .unwrap();
         let mut again = Vec::new();
         while let Some(f) = staged.read().unwrap() {
             again.push((f.track, f.data.len(), f.keyframe, f.data));

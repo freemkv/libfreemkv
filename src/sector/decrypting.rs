@@ -51,6 +51,8 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     arrival: Option<Box<crate::keys::Arrival>>,
     /// Damaged AACS units blanked so far (see [`blanked_units`](Self::blanked_units)).
     blanked: BlankTally,
+    /// The run that also hears of each blanked unit (`UnitBlanked`, `Stats`).
+    ctx: Option<crate::ctx::Ctx>,
     /// Content-detected stage: `Some` until the first read reaches the verdict.
     detect: Option<Box<StageOptions>>,
     /// Loose BD-TS: a CPI-flagged unit that is clean TS is clear (its flag is stale).
@@ -68,7 +70,8 @@ pub(crate) struct StageOptions {
     pub(crate) raw: bool,
     /// Held AACS keys for a loose BD-TS file.
     pub(crate) keys: Option<crate::keys::ResolvedKeySet>,
-    pub(crate) halt: Option<crate::halt::Halt>,
+    /// The run: its halt ends the crack scan, its stats count blanked units.
+    pub(crate) ctx: crate::ctx::Ctx,
 }
 
 // Sectors per CSS crack-scan read (the mpg:// batch).
@@ -109,6 +112,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             key_map: None,
             arrival: None,
             blanked: BlankTally(Arc::default()),
+            ctx: None,
             detect: None,
             stale_cpi: false,
             watch_css: false,
@@ -123,8 +127,14 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         #[cfg(test)]
         super::stage::STAGES.with(|n| n.set(n.get() + 1));
         let mut s = Self::new(inner, DecryptKeys::None);
+        s.observe(&opts.ctx);
         s.detect = Some(Box::new(opts));
         s
+    }
+
+    /// Report each blanked unit to `ctx` too: an `UnitBlanked` event and its loss counter.
+    pub(crate) fn observe(&mut self, ctx: &crate::ctx::Ctx) {
+        self.ctx = Some(ctx.clone());
     }
 
     // Reach the verdict and install what it needs. On `Err` the stage stays undecided.
@@ -143,7 +153,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                         start_lba: 0,
                         sector_count: cap,
                     }];
-                    let halt = opts.halt.as_ref();
+                    let halt = Some(&opts.ctx.halt);
                     let cracked =
                         crate::css::crack_title_key(&mut self.inner, &whole, CRACK_BATCH, halt);
                     self.keys = match cracked {
@@ -346,7 +356,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             (self.arrival.as_deref(), &self.keys)
         {
             let blanked = arrival.process(&mut self.inner, lba, &mut buf[..n], unit_keys)?;
-            self.count_blanked(blanked);
+            self.count_blanked(lba, blanked);
         }
 
         // Proactive map path (storm-free mux): keys were resolved per unit up front,
@@ -360,7 +370,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                 &map,
                 content_ref,
             )?;
-            self.count_blanked(blanked);
+            self.count_blanked(lba, blanked);
             return Ok(n);
         }
 
@@ -462,13 +472,20 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         let end = lba as u64 + buf.len().div_ceil(crate::consts::SECTOR_BYTES) as u64;
         let at_end = cap != 0 && end >= cap as u64;
         let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered, at_end);
-        self.count_blanked(n);
+        self.count_blanked(lba, n);
     }
 
-    fn count_blanked(&self, n: usize) {
+    fn count_blanked(&self, lba: u32, n: usize) {
         self.blanked
             .0
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if let (Some(ctx), 1..) = (&self.ctx, n) {
+            ctx.stats.add_blanked(n as u64);
+            ctx.emit(crate::event::Event::UnitBlanked {
+                lba: u64::from(lba),
+                units: n as u64,
+            });
+        }
     }
 }
 
@@ -525,7 +542,7 @@ mod tests {
         let opts = StageOptions {
             raw: false,
             keys: None,
-            halt: None,
+            ctx: Default::default(),
         };
         let mut stage = DecryptingSectorSource::detecting(src, opts);
         let scans = crate::css::CRACK_SCANS.with(|n| n.get());
@@ -837,7 +854,9 @@ mod tests {
         let inner = ArgRecorder {
             calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let pf = crate::sector::PrefetchedSectorSource::new(inner, ext, 3, None).unwrap();
+        let pf =
+            crate::sector::PrefetchedSectorSource::new(inner, ext, 3, &crate::ctx::Ctx::default())
+                .unwrap();
         let d = DecryptingSectorSource::new(pf, DecryptKeys::None);
         assert!(!d.random_access());
         let d = DecryptingSectorSource::new(FuaProbe { fua: vec![] }, DecryptKeys::None);

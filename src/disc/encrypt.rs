@@ -427,13 +427,13 @@ fn cert_unlock_outcome(e: CertUnlockFailure) -> crate::aacs::trace::UnlockOutcom
 }
 
 // The scan's one bus step (§2.3), shared by AACS and CSS: the op token is checked before
-// and after, ahead of any result mapping; the Drive's `Progress` is busy throughout, as
+// and after, ahead of any result mapping; the Drive's `Liveness` is busy throughout, as
 // it spans the first keydb parse in `host_certs` (ST4-2).
 pub(super) fn bus_step_guard<T>(
     session: &mut crate::drive::Drive,
     step: impl FnOnce(&mut crate::drive::Drive) -> T,
 ) -> Result<T> {
-    let _busy = session.progress().map(crate::halt::Progress::busy);
+    let _busy = session.progress().map(crate::halt::Liveness::busy);
     session.check_token()?;
     let r = step(session);
     session.check_token()?;

@@ -1,6 +1,6 @@
 //! Bounded-syscall primitive: run a (potentially-blocking) operation on a worker thread
 //! while the caller waits halt-aware, bounded by a deadline (`bounded_syscall`, one
-//! call's "no answer" bound) or by a stall window over a [`Progress`]
+//! call's "no answer" bound) or by a stall window over a [`Liveness`]
 //! ([`bounded_syscall_stall`], HR1). The calling thread is never trapped in a kernel call.
 //!
 //! Escape hatch for syscalls a cooperative [`Halt`] can't interrupt (`sync_file_range`,
@@ -11,7 +11,7 @@ use std::thread;
 #[cfg(any(target_os = "linux", test))]
 use std::time::Duration;
 
-use crate::halt::{Halt, Progress, Recv, Stall, StallTimer, WAIT_SLICE};
+use crate::halt::{Halt, Liveness, Recv, Stall, StallTimer, WAIT_SLICE};
 
 /// Failure outcome from a bounded syscall wrapper.
 #[derive(Debug)]
@@ -83,7 +83,7 @@ where
 // on `progress` (HR1: no progress for its window, never elapsed time).
 pub(crate) fn bounded_syscall_stall<F, R>(
     halt: Option<&Halt>,
-    progress: &Progress,
+    progress: &Liveness,
     timer: &mut StallTimer,
     tick: &mut dyn FnMut(),
     op: F,
@@ -262,7 +262,7 @@ mod tests {
     /// A panicking worker is `WorkerLost` in the stall variant, not a stall `Timeout`.
     #[test]
     fn stall_variant_reports_worker_lost_on_panic() {
-        let p = Progress::new();
+        let p = Liveness::new();
         let mut timer = StallTimer::new(Duration::from_secs(5), &p);
         let r = bounded_syscall_stall(None, &p, &mut timer, &mut || {}, || -> u8 {
             panic!("intentional test panic");
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn stall_bound_rearms_on_progress_and_expires_without() {
         let w = Duration::from_millis(100);
-        let p = Progress::new();
+        let p = Liveness::new();
         let mut timer = StallTimer::new(w, &p);
         let bump = p.clone();
         let r = bounded_syscall_stall(None, &p, &mut timer, &mut || bump.bump(), || {

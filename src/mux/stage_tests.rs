@@ -90,7 +90,11 @@ fn read(scheme: &str, bytes: &[u8], opts: &InputOptions) -> std::io::Result<(Vec
     let p = path(scheme);
     std::fs::write(&p, bytes).unwrap();
     let got = (|| {
-        let mut s = input(&format!("{scheme}://{}", p.display()), opts)?;
+        let mut s = input(
+            &format!("{scheme}://{}", p.display()),
+            opts,
+            &crate::ctx::Ctx::default(),
+        )?;
         let mut frames = Vec::new();
         while let Some(f) = s.read()? {
             frames.push(f);
@@ -135,7 +139,11 @@ fn an_aacs_m2ts_is_decrypted_with_the_held_keys() {
 fn an_aacs_m2ts_with_no_keys_is_refused_before_any_frame() {
     let p = path("nokeys");
     std::fs::write(&p, flagged(&clear_clip(), Some(&KEY))).unwrap();
-    let opened = input(&format!("m2ts://{}", p.display()), &Default::default());
+    let opened = input(
+        &format!("m2ts://{}", p.display()),
+        &Default::default(),
+        &crate::ctx::Ctx::default(),
+    );
     let _ = std::fs::remove_file(&p);
     assert_eq!(
         opened.err().and_then(|e| error_code(&e)),

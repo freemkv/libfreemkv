@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::ctx::Ctx;
 use crate::decrypt::DecryptKeys;
 use crate::disc::DiscTitle;
 use crate::error::Error;
-use crate::event::{BatchSizeReason, Event, EventKind};
+use crate::event::Event;
 use crate::halt::Halt;
 use crate::io::FlushProgress;
 use crate::io::pipeline::{Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH};
@@ -22,7 +23,7 @@ use crate::sector::{FileSectorSource, SectorSource};
 use crate::session::DiscSession;
 
 use super::resolve::{
-    InputOptions, StreamUrl, build_iso_pipeline, input_with_halt, output, output_with, parse_url,
+    InputOptions, StreamUrl, build_iso_pipeline, input, output, output_with, parse_url,
 };
 use super::videomap::{Medium, SourceInfo};
 
@@ -80,49 +81,15 @@ pub struct MuxOptions {
     pub selection: crate::StreamSelection,
 }
 
-/// Progress / event callbacks the consumer implements (CLI `CliProgress`,
-/// autorip's stream event handler). Every method has a no-op default so a
-/// consumer overrides only what it renders.
-///
-/// `Send + Sync + 'static` so [`mux_with_keys`] can clone the handle into the reader constructors'
-/// `'static` `EventFn`. Progress is split into read-side and write-side callbacks (CLI renders
-/// WRITE, autorip READ).
-pub trait MuxEvents: Send + Sync + 'static {
-    /// Fired once, immediately after the output sink is created. The title lists
-    /// only streams the sink will write (tracks it refused are removed, so indices
-    /// compact); `MuxOutcome::undelivered_streams` keeps source-title indices.
-    fn on_output_opened(&self, _title: &DiscTitle) {}
-    /// Fired periodically from the reader side with the running read-byte count
-    /// and the source extents' total byte estimate.
-    fn on_read_progress(&self, _bytes_read: u64, _bytes_total: u64) {}
-    /// Fired periodically during the frame pump with the running written-byte
-    /// count and the title's total byte estimate.
-    fn on_write_progress(&self, _bytes_written: u64, _bytes_total: u64) {}
-    /// A bad sector was skipped (zero-filled) at `lba`.
-    fn on_sector_skipped(&self, _lba: u32) {}
-    /// The adaptive read batch size changed.
-    fn on_batch_size_changed(&self, _batch: u16, _reason: BatchSizeReason) {}
-    /// A read error occurred at `lba`.
-    fn on_read_error(&self, _lba: u32) {}
-    /// While the output is being flushed at the end (the driver waiting on a closing
-    /// consumer): more bytes became durable. One call per increase, at most 4 per second,
-    /// none while nothing moves, so silence means a stalled flush (stop design §4.5).
-    fn on_flush_progress(&self, _bytes_durable: u64, _bytes_total: u64) {}
-}
-
-/// A [`MuxEvents`] that ignores everything — test-only (production callers
-/// supply their own events sink).
-#[cfg(test)]
-pub(crate) struct NoopEvents;
-#[cfg(test)]
-impl MuxEvents for NoopEvents {}
-
 /// The result of a [`mux_with_keys`] run.
 #[derive(Debug, Clone)]
 pub struct MuxOutcome {
     /// The mux drained to a natural EOF, finalised cleanly, and produced real
     /// output. `false` on interrupt (halt), or a wedged/failed finalise.
     pub completed: bool,
+    /// The run's halt stopped it: during the open or the pump alike (`completed` is
+    /// `false`). A wedged finalise with no Stop is `completed = false, halted = false`.
+    pub halted: bool,
     /// The output sink was created (`output()` succeeded). `false` if the mux
     /// bailed before opening the sink (header gate, halt during header read).
     pub output_opened: bool,
@@ -145,18 +112,32 @@ pub struct MuxOutcome {
     pub undelivered_streams: Vec<usize>,
 }
 
+impl MuxOutcome {
+    // A run that `ctx.halt` stopped before any frame reached a sink.
+    fn stopped_before_output(errors: u64, lost_bytes: u64) -> Self {
+        MuxOutcome {
+            completed: false,
+            halted: true,
+            output_opened: false,
+            bytes_written: 0,
+            errors,
+            lost_bytes,
+            streams: 0,
+            undelivered_streams: Vec::new(),
+        }
+    }
+}
+
 // The mux of a source with no AACS key set (clear, CSS, `raw`, or a URL that scans):
 // construct the source stream, open the `dest_url` sink and pump it (`drive_mux`).
 fn mux_unkeyed(
     input_src: MuxSource,
     dest_url: &str,
     opts: &MuxOptions,
-    halt: &Halt,
-    events: std::sync::Arc<dyn MuxEvents>,
+    ctx: &Ctx,
 ) -> std::io::Result<MuxOutcome> {
-    // Construct the source stream (ISO/live/URL) — reader constructors need a
-    // `'static` EventFn, so we clone `Arc<dyn MuxEvents>` into `reader_event_fn`.
-    // Each arm also derives SourceInfo since `output()` has no access to source.
+    // Construct the source stream (ISO/live/URL) under `ctx`. Each arm also derives
+    // SourceInfo since `output()` has no access to source.
     let (stream, playlist_name, mut source): (Box<dyn Stream>, Option<String>, SourceInfo) =
         match input_src {
             // The Url path builds its demux INSIDE `input()`, pruned via
@@ -172,22 +153,7 @@ fn mux_unkeyed(
                     title: in_opts.title_index.unwrap_or(0),
                     ..SourceInfo::default()
                 };
-                // A Stop while `network://` waits for its sender is a clean interrupt.
-                let stream = match input_with_halt(url, &in_opts, Some(halt)) {
-                    Ok(s) => s,
-                    Err(e) if crate::error::is_halt(&e) => {
-                        return Ok(MuxOutcome {
-                            completed: false,
-                            output_opened: false,
-                            bytes_written: 0,
-                            errors: 0,
-                            lost_bytes: 0,
-                            streams: 0,
-                            undelivered_streams: Vec::new(),
-                        });
-                    }
-                    Err(e) => return Err(e),
-                };
+                let stream = input(url, &in_opts, ctx)?;
                 let source = SourceInfo {
                     playlist: stream.info().playlist.clone(),
                     ..source
@@ -223,8 +189,7 @@ fn mux_unkeyed(
                     opts.batch_sectors,
                     format,
                     opts.raw,
-                    Some(halt.clone()),
-                    Some(reader_event_fn(events.clone())),
+                    ctx,
                 )?;
                 (Box::new(stream), None, source)
             }
@@ -287,16 +252,12 @@ fn mux_unkeyed(
                     opts.batch_sectors,
                     format,
                     opts.raw,
-                    Some(halt.clone()),
+                    ctx,
                 )?;
                 if opts.raw {
                     stream.set_raw();
                 }
                 stream.skip_errors = opts.skip_errors;
-                // Live path: the `DiscStream` emits the full reader-side vocabulary
-                // (`SectorSkipped` on skip-mode zero-fill, `BatchSizeChanged` on the
-                // adaptive sizer, `BytesRead` progress) — forward them all.
-                stream.on_event(reader_event_fn(events.clone()));
                 (Box::new(stream), Some(playlist), source)
             }
             MuxSource::Live {
@@ -329,15 +290,12 @@ fn mux_unkeyed(
                     opts.batch_sectors,
                     format,
                     opts.raw,
-                    Some(halt.clone()),
+                    ctx,
                 )?;
                 if opts.raw {
                     stream.set_raw();
                 }
                 stream.skip_errors = opts.skip_errors;
-                // Same reader-side event vocabulary as the `Session` arm
-                // (`SectorSkipped` / `BatchSizeChanged` / `BytesRead`).
-                stream.on_event(reader_event_fn(events.clone()));
                 (Box::new(stream), None, source)
             }
         };
@@ -352,8 +310,7 @@ fn mux_unkeyed(
     drive_mux(
         stream,
         dest_url,
-        halt,
-        events.as_ref(),
+        ctx,
         playlist_name.as_deref(),
         Some(&source),
     )
@@ -393,14 +350,30 @@ pub enum MuxSource<'a> {
 /// `opts.raw`: no AACS decryption (CSS and clear discs decrypt as before). E7013 when the
 /// set is not for the disc or does not cover the title; E7026 when the title needs
 /// forensic keys that are Pending. Unresolved codec headers are [`Error::MkvInvalid`], a
-/// zero-output drain [`Error::NoStreams`]; a `halt` mid-run yields `completed = false`.
+/// zero-output drain [`Error::NoStreams`]. Every stage runs under `ctx`; a Stop of its halt,
+/// during the open or the pump alike, yields `completed = false, halted = true`, not an error.
 pub fn mux_with_keys(
     source: MuxSource,
     keys: Option<&crate::keys::ResolvedKeySet>,
     dest_url: &str,
     opts: &MuxOptions,
-    halt: &Halt,
-    events: std::sync::Arc<dyn MuxEvents>,
+    ctx: &Ctx,
+) -> std::io::Result<MuxOutcome> {
+    match mux_routed(source, keys, dest_url, opts, ctx) {
+        Err(e) if crate::error::is_halt(&e) && ctx.halt.is_cancelled() => {
+            Ok(MuxOutcome::stopped_before_output(0, 0))
+        }
+        r => r,
+    }
+}
+
+// `mux_with_keys` before its one halt rule: picks the keyed or unkeyed arms.
+fn mux_routed(
+    source: MuxSource,
+    keys: Option<&crate::keys::ResolvedKeySet>,
+    dest_url: &str,
+    opts: &MuxOptions,
+    ctx: &Ctx,
 ) -> std::io::Result<MuxOutcome> {
     let set = keys.filter(|s| s.is_aacs() && !opts.raw);
     // KU §3.1: "`keys` must be `Some` for AACS". A BD-TS Iso/Live mux with no AACS set reads
@@ -440,16 +413,10 @@ pub fn mux_with_keys(
             if let Some(k) = keys {
                 o.keys = Some(k.clone());
             }
-            mux_unkeyed(
-                MuxSource::Url { url, opts: o },
-                dest_url,
-                opts,
-                halt,
-                events,
-            )
+            mux_unkeyed(MuxSource::Url { url, opts: o }, dest_url, opts, ctx)
         }
-        (src, None) => mux_unkeyed(src, dest_url, opts, halt, events),
-        (src, Some(set)) => mux_keyed(src, set, dest_url, opts, halt, events),
+        (src, None) => mux_unkeyed(src, dest_url, opts, ctx),
+        (src, Some(set)) => mux_keyed(src, set, dest_url, opts, ctx),
     }
 }
 
@@ -459,8 +426,7 @@ fn mux_keyed(
     set: &crate::keys::ResolvedKeySet,
     dest_url: &str,
     opts: &MuxOptions,
-    halt: &Halt,
-    events: std::sync::Arc<dyn MuxEvents>,
+    ctx: &Ctx,
 ) -> std::io::Result<MuxOutcome> {
     let (stream, playlist, source): (Box<dyn Stream>, Option<String>, SourceInfo) = match source {
         MuxSource::Iso { path, title, .. } => {
@@ -480,8 +446,7 @@ fn mux_keyed(
                 title,
                 set,
                 opts.batch_sectors,
-                Some(halt.clone()),
-                Some(reader_event_fn(events.clone())),
+                ctx,
             )?;
             (Box::new(stream), None, source)
         }
@@ -526,7 +491,7 @@ fn mux_keyed(
             let staged = session.staged_reader().ok_or_else(not_ready)?;
             let title = live_keyed_title(staged, title, set, opts)?;
             let reader = session.take_reader().ok_or_else(not_ready)?;
-            let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
+            let stream = live_keyed(reader, title, format, set, opts, ctx)?;
             (stream, Some(playlist), source)
         }
         MuxSource::Live {
@@ -540,7 +505,7 @@ fn mux_keyed(
                 ..SourceInfo::default()
             };
             let title = live_keyed_title(&*reader, title, set, opts)?;
-            let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
+            let stream = live_keyed(reader, title, format, set, opts, ctx)?;
             (stream, None, source)
         }
         MuxSource::Url { .. } => unreachable!("mux_with_keys routes Url to mux_unkeyed"),
@@ -549,14 +514,7 @@ fn mux_keyed(
     if let Some(name) = playlist.as_deref() {
         source.playlist = name.to_string();
     }
-    drive_mux(
-        stream,
-        dest_url,
-        halt,
-        events.as_ref(),
-        playlist.as_deref(),
-        Some(&source),
-    )
+    drive_mux(stream, dest_url, ctx, playlist.as_deref(), Some(&source))
 }
 
 // The live title after the selection, once the set's gate admits it over `reader`.
@@ -586,8 +544,7 @@ fn live_keyed(
     format: crate::disc::ContentFormat,
     set: &crate::keys::ResolvedKeySet,
     opts: &MuxOptions,
-    halt: &Halt,
-    events: &std::sync::Arc<dyn MuxEvents>,
+    ctx: &Ctx,
 ) -> std::io::Result<Box<dyn Stream>> {
     let stream = crate::mux::DiscStream::new(
         reader,
@@ -596,14 +553,13 @@ fn live_keyed(
         opts.batch_sectors,
         format,
         false,
-        Some(halt.clone()),
+        ctx,
     )?;
     let mut stream = crate::keys::install_key_map(stream, set.key_map());
     if let Some(a) = set.arrival(set.title_stop()) {
         stream = stream.with_arrival(a);
     }
     stream.skip_errors = opts.skip_errors;
-    stream.on_event(reader_event_fn(events.clone()));
     Ok(Box::new(stream))
 }
 
@@ -618,19 +574,6 @@ fn session_mux_keys(disc: &crate::disc::Disc) -> DecryptKeys {
     }
 }
 
-// Adapt reader events to mux progress callbacks with an owned, 'static closure.
-fn reader_event_fn(events: Arc<dyn MuxEvents>) -> crate::sector::prefetched::EventFn {
-    Box::new(move |e: Event| match e.kind {
-        EventKind::BytesRead { bytes, total } => events.on_read_progress(bytes, total),
-        EventKind::SectorSkipped { sector } => events.on_sector_skipped(sector as u32),
-        EventKind::BatchSizeChanged { new_size, reason } => {
-            events.on_batch_size_changed(new_size, reason)
-        }
-        EventKind::ReadError { sector, .. } => events.on_read_error(sector as u32),
-        _ => {}
-    })
-}
-
 // Join the write consumer after the pump. A send that hit its deadline means the
 // consumer is wedged, so the join gets only the short grace, not JOIN_TIMEOUT.
 // While it waits, each increase of the output's durable bytes is forwarded (§4.5, LP20).
@@ -639,11 +582,11 @@ fn finish_pumped<I: Send + 'static, R: Send + 'static>(
     halt: &Halt,
     send_timed_out: bool,
     flush: &FlushProgress,
-    events: &dyn MuxEvents,
+    ctx: &Ctx,
 ) -> Result<R, Error> {
     let mut fwd = FlushForwarder {
         flush,
-        events,
+        ctx,
         last: flush.bytes_durable(),
         last_call: None,
     };
@@ -660,14 +603,14 @@ fn finish_pumped<I: Send + 'static, R: Send + 'static>(
     joined
 }
 
-// At most one `on_flush_progress` per this long (4 Hz, §4.5).
+// At most one `BytesDurable` per this long (4 Hz, §4.5).
 const FLUSH_PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
-// Forwards increases of the output's durable bytes to `MuxEvents::on_flush_progress`:
-// one call per increase, rate-limited, none while nothing moves.
+// Forwards increases of the output's durable bytes as `Event::BytesDurable`:
+// one event per increase, rate-limited, none while nothing moves.
 struct FlushForwarder<'a> {
     flush: &'a FlushProgress,
-    events: &'a dyn MuxEvents,
+    ctx: &'a Ctx,
     last: u64,
     last_call: Option<std::time::Instant>,
 }
@@ -680,8 +623,10 @@ impl FlushForwarder<'_> {
             .last_call
             .is_none_or(|t| t.elapsed() >= FLUSH_PROGRESS_EVERY);
         if done > self.last && (due || last_word) {
-            self.events
-                .on_flush_progress(done, self.flush.bytes_total());
+            self.ctx.emit(Event::BytesDurable {
+                bytes: done,
+                total: self.flush.bytes_total(),
+            });
             self.last = done;
             self.last_call = Some(std::time::Instant::now());
         }
@@ -700,11 +645,11 @@ fn mux_run_completed(interrupted: bool, finalize_failed: bool, halt_cancelled: b
 fn drive_mux(
     mut stream: Box<dyn Stream>,
     dest_url: &str,
-    halt: &Halt,
-    events: &dyn MuxEvents,
+    ctx: &Ctx,
     playlist_name: Option<&str>,
     source: Option<&SourceInfo>,
 ) -> std::io::Result<MuxOutcome> {
+    let halt = &ctx.halt;
     // Title assembled from the scanned metadata; the playlist name (disc name)
     // overrides `info().playlist` where the consumer supplied one.
     let mut out_title = stream.info().clone();
@@ -720,10 +665,11 @@ fn drive_mux(
         StreamUrl::Chapters { .. } | StreamUrl::Json { .. }
     ) {
         let mut sink = CountingStream::new(output(dest_url, &out_title, source)?);
-        events.on_output_opened(&out_title);
+        ctx.emit(Event::OutputOpened { title: &out_title });
         sink.finish()?;
         return Ok(MuxOutcome {
             completed: true,
+            halted: false,
             output_opened: true,
             bytes_written: sink.bytes_written(),
             errors: stream.errors(),
@@ -740,15 +686,10 @@ fn drive_mux(
     let mut buffered_bytes: usize = 0;
     while !stream.headers_ready() {
         if halt.is_cancelled() {
-            return Ok(MuxOutcome {
-                completed: false,
-                output_opened: false,
-                bytes_written: 0,
-                errors: stream.errors(),
-                lost_bytes: stream.lost_bytes(),
-                streams: 0,
-                undelivered_streams: Vec::new(),
-            });
+            return Ok(MuxOutcome::stopped_before_output(
+                stream.errors(),
+                stream.lost_bytes(),
+            ));
         }
         let read = match stream.read() {
             Ok(r) => r,
@@ -756,15 +697,10 @@ fn drive_mux(
             // (reads dominate wall-clock, so a stop usually lands here). Not a
             // failure — yield `completed = false` so stop-preserves-staging runs.
             Err(e) if crate::error::is_halt(&e) => {
-                return Ok(MuxOutcome {
-                    completed: false,
-                    output_opened: false,
-                    bytes_written: 0,
-                    errors: stream.errors(),
-                    lost_bytes: stream.lost_bytes(),
-                    streams: 0,
-                    undelivered_streams: Vec::new(),
-                });
+                return Ok(MuxOutcome::stopped_before_output(
+                    stream.errors(),
+                    stream.lost_bytes(),
+                ));
             }
             Err(e) => return Err(e),
         };
@@ -798,15 +734,10 @@ fn drive_mux(
     // highway path a halt can end the stream as `Ok(None)`, and that EOF also
     // releases the in-band config wait, so a ready gate does not mean the pump finished.
     if halt.is_cancelled() {
-        return Ok(MuxOutcome {
-            completed: false,
-            output_opened: false,
-            bytes_written: 0,
-            errors: stream.errors(),
-            lost_bytes: stream.lost_bytes(),
-            streams: 0,
-            undelivered_streams: Vec::new(),
-        });
+        return Ok(MuxOutcome::stopped_before_output(
+            stream.errors(),
+            stream.lost_bytes(),
+        ));
     }
     // The pump can break on EOF without headers resolving. Finalising then would
     // write a track header with no CODEC_PRIVATE — a structurally-invalid MKV the
@@ -844,7 +775,7 @@ fn drive_mux(
 
     // ── Open the sink, wrap in a byte counter, hand it to the write pipeline ──
     // The output file's flush counters share the consumer's progress (§2.10 item 3).
-    let flush = FlushProgress::new(crate::halt::Progress::new());
+    let flush = FlushProgress::new(crate::halt::Liveness::new());
     let out_flush = super::resolve::OutputFlush {
         progress: &flush,
         halt,
@@ -863,7 +794,7 @@ fn drive_mux(
         }));
     }
     if refused.is_empty() {
-        events.on_output_opened(&out_title);
+        ctx.emit(Event::OutputOpened { title: &out_title });
     } else {
         let mut opened = out_title.clone();
         let keep = |i: &usize| !refused.contains(i);
@@ -875,13 +806,13 @@ fn drive_mux(
             .filter(keep)
             .map(|i| out_title.codec_privates[i].clone())
             .collect();
-        events.on_output_opened(&opened);
+        ctx.emit(Event::OutputOpened { title: &opened });
     }
     let output_stream = CountingStream::new(output_stream);
 
     // The write consumer runs on its own thread so the latency-bound sink write
     // overlaps the next `stream.read()`. `bytes` mirrors the consumer's running
-    // written-byte count out to the driving thread for `on_write_progress`.
+    // written-byte count out to the driving thread for `BytesWritten`.
     let bytes = Arc::new(AtomicU64::new(0));
     let read_failed = Arc::new(AtomicBool::new(false));
     let sink = WriteSink {
@@ -916,9 +847,12 @@ fn drive_mux(
             break;
         }
         // Feed write-side progress during the drain exactly as the steady-state
-        // loop below does — the watchdog is fed only from `on_write_progress`,
+        // loop below does — the watchdog is fed only from `BytesWritten`,
         // and no `stream.read()` runs here to do it for us.
-        events.on_write_progress(bytes.load(Ordering::Relaxed), total_bytes);
+        ctx.emit(Event::BytesWritten {
+            bytes: bytes.load(Ordering::Relaxed),
+            total: total_bytes,
+        });
     }
 
     // Then the remainder of the stream.
@@ -939,7 +873,10 @@ fn drive_mux(
                         send_timed_out = !halt.is_cancelled() && !pipe.consumer_failed();
                         break;
                     }
-                    events.on_write_progress(bytes.load(Ordering::Relaxed), total_bytes);
+                    ctx.emit(Event::BytesWritten {
+                        bytes: bytes.load(Ordering::Relaxed),
+                        total: total_bytes,
+                    });
                 }
                 Ok(None) => break,
                 // A halt landing mid-read is a clean operator stop, not a read
@@ -991,7 +928,7 @@ fn drive_mux(
     // the container. On halt/wedge this returns an error variant, translated
     // to `completed = false` rather than a hard failure.
     let (bytes_written, undelivered_streams, finalize_failed) =
-        match finish_pumped(pipe, halt, send_timed_out, &flush, events) {
+        match finish_pumped(pipe, halt, send_timed_out, &flush, ctx) {
             Ok(c) => (c.bytes, c.undelivered, false),
             Err(Error::Halted | Error::PipelineJoinTimeout) => {
                 (bytes.load(Ordering::Relaxed), Vec::new(), true)
@@ -1019,6 +956,7 @@ fn drive_mux(
     if !mux_run_completed(interrupted, finalize_failed, halt.is_cancelled()) {
         return Ok(MuxOutcome {
             completed: false,
+            halted: halt.is_cancelled(),
             output_opened: true,
             bytes_written,
             errors: stream.errors(),
@@ -1037,6 +975,7 @@ fn drive_mux(
 
     Ok(MuxOutcome {
         completed: true,
+        halted: false,
         output_opened: true,
         bytes_written,
         errors: stream.errors(),
@@ -1219,7 +1158,13 @@ mod tests {
             log: log.clone(),
         };
         TEST_SINK.with(|s| *s.borrow_mut() = Some(Box::new(spy)));
-        let res = drive_mux(Box::new(stream), "null://", halt, &NoopEvents, None, None);
+        let res = drive_mux(
+            Box::new(stream),
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        );
         TEST_SINK.with(|s| s.borrow_mut().take());
         let log = log.lock().unwrap().clone();
         (res, log)
@@ -1409,20 +1354,22 @@ mod tests {
         }
     }
 
-    /// Records whether `on_output_opened` fired.
+    /// Records whether `OutputOpened` fired.
     struct SpyEvents {
         opened: AtomicBool,
     }
     impl SpyEvents {
-        fn new() -> Self {
-            SpyEvents {
+        fn new() -> Arc<Self> {
+            Arc::new(SpyEvents {
                 opened: AtomicBool::new(false),
-            }
+            })
         }
     }
-    impl MuxEvents for SpyEvents {
-        fn on_output_opened(&self, _title: &DiscTitle) {
-            self.opened.store(true, Ordering::SeqCst);
+    impl crate::event::Events for SpyEvents {
+        fn event(&self, e: &Event<'_>) {
+            if let Event::OutputOpened { .. } = e {
+                self.opened.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -1557,7 +1504,14 @@ mod tests {
         let stream = Box::new(FakeStream::new(1).with_frames(2));
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        drive_mux(stream, &url, &halt, &spy, None, Some(&source)).expect("fvi mux runs");
+        drive_mux(
+            stream,
+            &url,
+            &crate::ctx::Ctx::new(halt.clone()).with_events(spy.clone()),
+            None,
+            Some(&source),
+        )
+        .expect("fvi mux runs");
 
         let text = std::fs::read_to_string(&dst).expect("index written");
         let hdr: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
@@ -1597,8 +1551,14 @@ mod tests {
         let (_dir, url) = tmp("out.xml");
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        let out =
-            drive_mux(stream, &url, &halt, &spy, None, None).expect("chapters must short-circuit");
+        let out = drive_mux(
+            stream,
+            &url,
+            &crate::ctx::Ctx::new(halt.clone()).with_events(spy.clone()),
+            None,
+            None,
+        )
+        .expect("chapters must short-circuit");
         assert!(out.completed, "metadata sink completes without headers");
         assert!(out.output_opened);
         assert!(spy.opened.load(Ordering::SeqCst), "sink was opened");
@@ -1611,8 +1571,14 @@ mod tests {
         let url = format!("json://{}", dir.path().join("out.json").display());
         let stream = Box::new(FakeStream::new(1).never_ready());
         let halt = Halt::new();
-        let out = drive_mux(stream, &url, &halt, &NoopEvents, None, None)
-            .expect("json must short-circuit");
+        let out = drive_mux(
+            stream,
+            &url,
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect("json must short-circuit");
         assert!(out.completed);
         assert!(out.output_opened);
     }
@@ -1623,8 +1589,14 @@ mod tests {
     fn header_gate_rejects_unresolved_codec_private() {
         let stream = Box::new(FakeStream::new(1).with_frames(3).never_ready());
         let halt = Halt::new();
-        let err = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
-            .expect_err("unresolved headers must be refused");
+        let err = drive_mux(
+            stream,
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect_err("unresolved headers must be refused");
         // This gate is the GENUINE stub case: no video track's codec_private
         // resolved. `MkvInvalid` now means only this (bad `mkv://` input is
         // `MkvSourceInvalid`), and must stay skippable for all-titles rips.
@@ -1641,9 +1613,42 @@ mod tests {
     fn zero_output_gate_refuses_empty_drain() {
         let stream = Box::new(FakeStream::new(1)); // headers ready, no frames
         let halt = Halt::new();
-        let err = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
-            .expect_err("empty drain must be refused");
+        let err = drive_mux(
+            stream,
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect_err("empty drain must be refused");
         assert_eq!(err.to_string(), format!("E{}", crate::error::E_NO_STREAMS));
+    }
+
+    // HP2: a Stop landing during the open (here the CSS crack of a `Live` DVD title) is the
+    // same outcome as one in the pump: `completed = false, halted = true`, never an error.
+    #[test]
+    fn a_stop_during_the_open_is_a_halted_outcome_not_an_error() {
+        let ctx = Ctx::default();
+        ctx.halt.cancel();
+        let title = DiscTitle {
+            extents: vec![crate::disc::Extent {
+                start_lba: 0,
+                sector_count: 16,
+            }],
+            ..DiscTitle::empty()
+        };
+        let reader = crate::test_util::MemSource::new(vec![0u8; 16 * 2048]);
+        let src = MuxSource::Live {
+            reader: Box::new(reader),
+            title,
+            format: crate::disc::ContentFormat::MpegPs,
+        };
+        let opts = MuxOptions {
+            batch_sectors: 16,
+            ..Default::default()
+        };
+        let out = mux_with_keys(src, None, "null://", &opts, &ctx).expect("a Stop is not an error");
+        assert!(out.halted && !out.completed && !out.output_opened);
     }
 
     // ── halt mid-pump stops cleanly with completed=false, no panic. ──
@@ -1656,8 +1661,14 @@ mod tests {
                 .with_frames(1000)
                 .cancels(halt.clone(), 2),
         );
-        let out = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
-            .expect("halt is a clean stop, not an error");
+        let out = drive_mux(
+            stream,
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
         assert!(out.output_opened, "the sink was opened before the halt");
     }
@@ -1671,8 +1682,14 @@ mod tests {
         fs.headers_ready_after = usize::MAX;
         fs.ready_on_eof = true;
         let events = SpyEvents::new();
-        let out = drive_mux(Box::new(fs), "null://", &halt, &events, None, None)
-            .expect("halt is a clean stop");
+        let out = drive_mux(
+            Box::new(fs),
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()).with_events(events.clone()),
+            None,
+            None,
+        )
+        .expect("halt is a clean stop");
         assert!(!out.completed);
         assert!(!out.output_opened, "no sink may be opened after a halt");
         assert!(!events.opened.load(Ordering::SeqCst));
@@ -1686,8 +1703,14 @@ mod tests {
         let halt = Halt::new();
         // Headers ready immediately; the 3rd read (in the frame pump) errors Halted.
         let stream = Box::new(FakeStream::new(1).with_frames(1000).halt_errs_at(2));
-        let out = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
-            .expect("a halt mid frame-read is a clean stop, not an Err");
+        let out = drive_mux(
+            stream,
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect("a halt mid frame-read is a clean stop, not an Err");
         assert!(!out.completed, "interrupted mux is not complete");
         assert!(out.output_opened, "sink opened before the mid-read halt");
     }
@@ -1702,8 +1725,14 @@ mod tests {
                 .never_ready()
                 .halt_errs_at(1),
         );
-        let out = drive_mux(stream, "null://", &halt, &NoopEvents, None, None)
-            .expect("a halt mid header-read is a clean stop, not an Err");
+        let out = drive_mux(
+            stream,
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect("a halt mid header-read is a clean stop, not an Err");
         assert!(!out.completed, "interrupted mux is not complete");
         assert!(
             !out.output_opened,
@@ -1717,8 +1746,14 @@ mod tests {
         let stream = Box::new(FakeStream::new(2).with_frames(10));
         let halt = Halt::new();
         let spy = SpyEvents::new();
-        let out =
-            drive_mux(stream, "null://", &halt, &spy, None, None).expect("normal mux completes");
+        let out = drive_mux(
+            stream,
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()).with_events(spy.clone()),
+            None,
+            None,
+        )
+        .expect("normal mux completes");
         assert!(out.completed);
         assert!(out.output_opened);
         assert!(spy.opened.load(Ordering::SeqCst));
@@ -1728,21 +1763,16 @@ mod tests {
 
     // ── reader-side event forwarding through the Arc ────────────────────────
 
-    /// A [`MuxEvents`] backed by atomics that records every callback so a test
-    /// can assert reader-side events actually flowed through the `Arc` clone.
+    /// An [`Events`](crate::event::Events) backed by atomics that records the events a test
+    /// asserts reached the run's context.
     struct CountingEvents {
         opened: AtomicBool,
         progress_calls: AtomicU64,
-        /// Set once `on_read_progress` is called with a `total` equal to the ISO
-        /// extents' byte total — the fingerprint of the *read-side* `BytesRead`
-        /// event (the write-side `on_write_progress` carries the title's
-        /// `size_bytes`, a different number), so it isolates the `EventFn`
-        /// translation.
+        /// Set once `BytesRead` carries a `total` equal to the ISO extents' byte total — the
+        /// fingerprint of the *read-side* event (the write-side `BytesWritten` carries the
+        /// title's `size_bytes`, a different number).
         saw_read_total: AtomicBool,
         read_total: u64,
-        skipped: AtomicU64,
-        batch_changed: AtomicU64,
-        read_errors: AtomicU64,
     }
     impl CountingEvents {
         fn new(read_total: u64) -> std::sync::Arc<Self> {
@@ -1751,85 +1781,22 @@ mod tests {
                 progress_calls: AtomicU64::new(0),
                 saw_read_total: AtomicBool::new(false),
                 read_total,
-                skipped: AtomicU64::new(0),
-                batch_changed: AtomicU64::new(0),
-                read_errors: AtomicU64::new(0),
             })
         }
     }
-    impl MuxEvents for CountingEvents {
-        fn on_output_opened(&self, _title: &DiscTitle) {
-            self.opened.store(true, Ordering::SeqCst);
-        }
-        fn on_read_progress(&self, _bytes_read: u64, bytes_total: u64) {
-            self.progress_calls.fetch_add(1, Ordering::SeqCst);
-            if bytes_total == self.read_total {
-                self.saw_read_total.store(true, Ordering::SeqCst);
+    impl crate::event::Events for CountingEvents {
+        fn event(&self, e: &Event<'_>) {
+            match *e {
+                Event::OutputOpened { .. } => self.opened.store(true, Ordering::SeqCst),
+                Event::BytesRead { total, .. } => {
+                    self.progress_calls.fetch_add(1, Ordering::SeqCst);
+                    if total == self.read_total {
+                        self.saw_read_total.store(true, Ordering::SeqCst);
+                    }
+                }
+                _ => {}
             }
         }
-        fn on_sector_skipped(&self, _lba: u32) {
-            self.skipped.fetch_add(1, Ordering::SeqCst);
-        }
-        fn on_batch_size_changed(&self, _batch: u16, _reason: BatchSizeReason) {
-            self.batch_changed.fetch_add(1, Ordering::SeqCst);
-        }
-        fn on_read_error(&self, _lba: u32) {
-            self.read_errors.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    // `reader_event_fn` maps every real `EventKind` onto the matching
-    // `MuxEvents` method. Mutation: dropping a match arm leaves that
-    // counter at 0 and fails here.
-    #[test]
-    fn reader_event_fn_translates_every_variant() {
-        let events = CountingEvents::new(6144);
-        let f = reader_event_fn(events.clone());
-        f(Event {
-            kind: EventKind::BytesRead {
-                bytes: 4096,
-                total: 6144,
-            },
-        });
-        f(Event {
-            kind: EventKind::SectorSkipped { sector: 42 },
-        });
-        f(Event {
-            kind: EventKind::BatchSizeChanged {
-                new_size: 8,
-                reason: BatchSizeReason::Shrunk,
-            },
-        });
-        f(Event {
-            kind: EventKind::ReadError {
-                sector: 7,
-                error: Error::NoStreams,
-            },
-        });
-        assert_eq!(
-            events.progress_calls.load(Ordering::SeqCst),
-            1,
-            "BytesRead → on_read_progress"
-        );
-        assert!(
-            events.saw_read_total.load(Ordering::SeqCst),
-            "read-side total forwarded"
-        );
-        assert_eq!(
-            events.skipped.load(Ordering::SeqCst),
-            1,
-            "SectorSkipped → on_sector_skipped"
-        );
-        assert_eq!(
-            events.batch_changed.load(Ordering::SeqCst),
-            1,
-            "BatchSizeChanged → on_batch_size_changed"
-        );
-        assert_eq!(
-            events.read_errors.load(Ordering::SeqCst),
-            1,
-            "ReadError → on_read_error"
-        );
     }
 
     /// A 192-byte BD-TS packet carrying `payload` as a payload-only TS packet on
@@ -1875,10 +1842,9 @@ mod tests {
     }
 
     // End-to-end through `mux_unkeyed` on the ISO path: asserts reader-side
-    // progress AND `on_output_opened` reach the `Arc<dyn MuxEvents>`.
-    // Mutation: dropping `reader_event_fn` leaves `saw_read_total` false.
+    // progress AND `OutputOpened` reach the run's events.
     #[test]
-    fn mux_iso_forwards_reader_progress_through_arc() {
+    fn mux_iso_reports_reader_progress_to_the_ctx() {
         // Spawns the prefetch producer, a Drive holder.
         let _serial = crate::sector::prefetched::holder_test_lock();
         let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
@@ -1912,23 +1878,22 @@ mod tests {
             },
             "null://",
             &opts,
-            &halt,
-            events.clone(),
+            &crate::ctx::Ctx::new(halt.clone()).with_events(events.clone()),
         )
         .expect("audio-only ISO muxes to null sink");
 
         assert!(out.completed, "the clip drained and finalised");
         assert!(
             events.saw_read_total.load(Ordering::SeqCst),
-            "the reader-side BytesRead (total=6144) reached the Arc via the EventFn"
+            "the reader-side BytesRead (total=6144) reached the ctx's events"
         );
         assert!(
             events.opened.load(Ordering::SeqCst),
-            "on_output_opened fired through the Arc"
+            "OutputOpened reached the ctx's events"
         );
         assert!(
             events.progress_calls.load(Ordering::SeqCst) > 0,
-            "at least one on_read_progress call observed"
+            "at least one BytesRead observed"
         );
     }
 
@@ -2037,8 +2002,7 @@ mod tests {
             },
             "null://",
             &opts,
-            &halt,
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::new(halt.clone()),
         )
         .expect_err("a missing staged reader must be a clean error, not a panic");
         // The device-name-carrying DeviceNotReady round-trips through io::Error.
@@ -2111,8 +2075,7 @@ mod tests {
             },
             "null://",
             &opts,
-            &halt,
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::new(halt.clone()),
         )
         .expect_err("an out-of-range title index must be a clean error, not a panic");
         // MuxTrackRange renders as "E9011: track/tracks".
@@ -2219,8 +2182,7 @@ mod tests {
         let out = drive_mux(
             Box::new(LateAacStream::new()),
             &format!("mkv://{}", path.display()),
-            &halt,
-            &NoopEvents,
+            &crate::ctx::Ctx::new(halt.clone()),
             None,
             None,
         )
@@ -2339,8 +2301,7 @@ mod tests {
         let out = drive_mux(
             Box::new(LateAacStream::new()),
             "null://",
-            &halt,
-            &NoopEvents,
+            &crate::ctx::Ctx::new(halt.clone()),
             None,
             None,
         )
@@ -2436,17 +2397,20 @@ mod tests {
         }
     }
 
-    /// Keeps the title handed to `on_output_opened`.
+    /// Keeps the title of `OutputOpened`.
     #[derive(Default)]
     struct TitleSpy(std::sync::Mutex<Option<DiscTitle>>);
-    impl MuxEvents for TitleSpy {
-        fn on_output_opened(&self, title: &DiscTitle) {
-            *self.0.lock().unwrap() = Some(title.clone());
+    impl crate::event::Events for TitleSpy {
+        fn event(&self, e: &Event<'_>) {
+            if let Event::OutputOpened { title } = *e {
+                *self.0.lock().unwrap() = Some(title.clone());
+            }
         }
     }
 
-    fn run(src: LpcmSource, url: &str, spy: &TitleSpy) -> MuxOutcome {
-        drive_mux(Box::new(src), url, &Halt::new(), spy, None, None).unwrap()
+    fn run(src: LpcmSource, url: &str, spy: &Arc<TitleSpy>) -> MuxOutcome {
+        let ctx = crate::ctx::Ctx::default().with_events(spy.clone());
+        drive_mux(Box::new(src), url, &ctx, None, None).unwrap()
     }
 
     // Every entry point (Url/Session/Iso/Live) funnels into drive_mux: the BD LPCM
@@ -2458,7 +2422,7 @@ mod tests {
         let url = format!("mkv://{}", dir.path().join("o.mkv").display());
         let layout = Some(b"BDLP\xB4\x18".to_vec());
         let src = LpcmSource::new(AudioChannels::Surround51, SampleRate::S48, layout);
-        let spy = TitleSpy::default();
+        let spy = Arc::new(TitleSpy::default());
         run(src, &url, &spy);
         let t = spy.0.lock().unwrap().clone().unwrap();
         let crate::disc::Stream::Audio(a) = &t.streams[0] else {
@@ -2569,8 +2533,15 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             // m2ts: an MKV with a declared but frameless video track is refused.
             let url = format!("m2ts://{}", dir.path().join("o.m2ts").display());
-            let spy = TitleSpy::default();
-            drive_mux(Box::new(src), &url, &Halt::new(), &spy, None, None).unwrap();
+            let spy = Arc::new(TitleSpy::default());
+            drive_mux(
+                Box::new(src),
+                &url,
+                &crate::ctx::Ctx::default().with_events(spy.clone()),
+                None,
+                None,
+            )
+            .unwrap();
             let t = spy.0.lock().unwrap().clone().unwrap();
             let crate::disc::Stream::Audio(a) = t.streams.last().unwrap() else {
                 panic!("audio")
@@ -2589,7 +2560,7 @@ mod tests {
         let mut src = LpcmSource::new(AudioChannels::Stereo, SampleRate::S48, None);
         let other = LpcmSource::new(AudioChannels::Stereo, SampleRate::S44_1, None);
         src.info.streams.extend(other.info.streams);
-        let spy = TitleSpy::default();
+        let spy = Arc::new(TitleSpy::default());
         let out = run(src, &url, &spy);
         assert_eq!(out.undelivered_streams, vec![1]);
         let opened = spy.0.lock().unwrap().clone().unwrap();
@@ -2614,7 +2585,7 @@ mod tests {
             purpose: LabelPurpose::Normal,
             label: crate::disc::MP2_EXTENSION_LABEL.into(),
         }));
-        let spy = TitleSpy::default();
+        let spy = Arc::new(TitleSpy::default());
         let (out, ev) = crate::testlog::capture(|| run(src, &url, &spy));
         let opened = spy.0.lock().unwrap().clone().unwrap();
         assert!(
@@ -2680,8 +2651,14 @@ mod tests {
             });
         }
         let halt = Halt::new();
-        let err = drive_mux(Box::new(fs), "null://", &halt, &NoopEvents, None, None)
-            .expect_err("over-cap header buffer must fail fast, not OOM");
+        let err = drive_mux(
+            Box::new(fs),
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect_err("over-cap header buffer must fail fast, not OOM");
         // The cap overflow must carry its OWN code, not `MkvInvalid`: that code
         // means "skippable empty stub" and would silently drop a title that
         // had just produced 512 MiB of real frames.
@@ -2706,7 +2683,7 @@ mod tests {
 
     // ── Regression B: watchdog fed during the buffered header drain ─────────
     // Headers resolve only after K frames buffer, then flush to the sink.
-    // Every flushed frame must fire `on_write_progress`, the sole watchdog feed.
+    // Every flushed frame must fire `BytesWritten`, the sole watchdog feed.
     #[test]
     fn write_progress_fed_during_header_drain() {
         const K: usize = 6;
@@ -2717,22 +2694,30 @@ mod tests {
         struct WriteProgressCounter {
             writes: AtomicU64,
         }
-        impl MuxEvents for WriteProgressCounter {
-            fn on_write_progress(&self, _bytes_written: u64, _bytes_total: u64) {
-                self.writes.fetch_add(1, Ordering::SeqCst);
+        impl crate::event::Events for WriteProgressCounter {
+            fn event(&self, e: &Event<'_>) {
+                if let Event::BytesWritten { .. } = e {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                }
             }
         }
-        let events = WriteProgressCounter {
+        let events = Arc::new(WriteProgressCounter {
             writes: AtomicU64::new(0),
-        };
+        });
         let halt = Halt::new();
-        let out = drive_mux(Box::new(fs), "null://", &halt, &events, None, None)
-            .expect("K-frame stream muxes cleanly");
+        let out = drive_mux(
+            Box::new(fs),
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()).with_events(events.clone()),
+            None,
+            None,
+        )
+        .expect("K-frame stream muxes cleanly");
         assert!(out.completed);
         assert_eq!(
             events.writes.load(Ordering::SeqCst),
             K as u64,
-            "each of the K buffered header frames must feed on_write_progress on drain"
+            "each of the K buffered header frames must feed BytesWritten on drain"
         );
     }
 
@@ -2862,7 +2847,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let flush = FlushProgress::default();
-            let _ = tx.send(finish_pumped(pipe, &halt, true, &flush, &NoopEvents).is_err());
+            let _ = tx.send(
+                finish_pumped(pipe, &halt, true, &flush, &crate::ctx::Ctx::default()).is_err(),
+            );
         });
         let failed = rx
             .recv_timeout(Duration::from_secs(30))
@@ -2931,8 +2918,7 @@ mod tests {
         let out = drive_mux(
             stream,
             &format!("mkv://{}", dst.display()),
-            &Halt::new(),
-            &SpyEvents::new(),
+            &crate::ctx::Ctx::default().with_events(SpyEvents::new()),
             None,
             None,
         )
@@ -2942,13 +2928,15 @@ mod tests {
         assert_eq!(back.track_timing(0), timing);
     }
 
-    // Records every `on_flush_progress` call.
+    // Records every `BytesDurable` event.
     #[derive(Default)]
     struct FlushSpy(std::sync::Mutex<Vec<(u64, u64)>>);
 
-    impl MuxEvents for FlushSpy {
-        fn on_flush_progress(&self, durable: u64, total: u64) {
-            self.0.lock().unwrap().push((durable, total));
+    impl crate::event::Events for FlushSpy {
+        fn event(&self, e: &Event<'_>) {
+            if let Event::BytesDurable { bytes, total } = *e {
+                self.0.lock().unwrap().push((bytes, total));
+            }
         }
     }
 
@@ -2977,7 +2965,7 @@ mod tests {
     }
 
     fn finish_flushing(steps: u64, gap: Duration, tail: Duration) -> Vec<(u64, u64)> {
-        let flush = FlushProgress::new(crate::halt::Progress::new());
+        let flush = FlushProgress::new(crate::halt::Liveness::new());
         let sink = FlushingClose {
             flush: flush.clone(),
             steps,
@@ -2986,13 +2974,16 @@ mod tests {
         };
         let progress = flush.progress().clone();
         let pipe = Pipeline::spawn_named_with_progress("t-flush", 4, sink, progress).unwrap();
-        let spy = FlushSpy::default();
-        finish_pumped(pipe, &Halt::new(), false, &flush, &spy).unwrap();
+        let spy = Arc::new(FlushSpy::default());
+        let ctx = crate::ctx::Ctx::default().with_events(spy.clone());
+        finish_pumped(pipe, &Halt::new(), false, &flush, &ctx).unwrap();
+        drop(ctx);
+        let spy = Arc::try_unwrap(spy).ok().expect("the only handle");
         spy.0.into_inner().unwrap()
     }
 
     /// LP20 (§4.5): while the driver waits on a closing consumer, each increase of the
-    /// flusher's bytes produces one `on_flush_progress`, and none while it is static.
+    /// flusher's bytes produces one `BytesDurable`, and none while it is static.
     #[test]
     fn finish_with_halt_forwards_flush_progress() {
         let calls = finish_flushing(4, Duration::from_millis(300), Duration::from_millis(600));
@@ -3065,8 +3056,7 @@ mod tests {
             Some(&set),
             &format!("mkv://{}", out_path.display()),
             &keyed_opts(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
         .expect("the set's key opens the unit");
         assert!(out.completed);
@@ -3093,8 +3083,7 @@ mod tests {
             Some(&set),
             "null://",
             &keyed_opts(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
         .expect("the set's key opens the unit");
         assert!(out.completed && out.bytes_written > 0);
@@ -3121,8 +3110,7 @@ mod tests {
                 Some(&set),
                 "null://",
                 opts,
-                &Halt::new(),
-                Arc::new(NoopEvents),
+                &crate::ctx::Ctx::default(),
             )
         };
         let err = run(&mut session, &bad).expect_err("unknown PID is refused");
@@ -3155,8 +3143,7 @@ mod tests {
             Some(&set),
             "null://",
             &keyed_opts(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
         .expect_err("a set for another disc is refused");
         assert!(err.to_string().contains("E7013"), "got: {err}");
@@ -3184,8 +3171,7 @@ mod tests {
             Some(&set),
             &format!("mkv://{}", out_path.display()),
             &keyed_opts(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
         .expect("no rescan: the scanned title is muxed as given");
         assert!(out.completed);
@@ -3202,8 +3188,7 @@ mod tests {
             Some(&set),
             "null://",
             &keyed_opts(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         );
         // The scan reads the UDF anchor (LBA 256) past this 16-sector image's end.
         let err = rescanned.expect_err("a URL source scans the image, which has no filesystem");
@@ -3238,8 +3223,7 @@ mod tests {
                 keys,
                 "null://",
                 &opts,
-                &Halt::new(),
-                Arc::new(NoopEvents),
+                &crate::ctx::Ctx::default(),
             )
         };
         let code = |r: std::io::Result<MuxOutcome>| r.err().and_then(|e| crate::error_code(&e));
@@ -3274,8 +3258,7 @@ mod tests {
             None,
             "null://",
             &keyed_opts(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         );
         assert_eq!(code(iso), e7022);
 
@@ -3302,8 +3285,7 @@ mod tests {
                 None,
                 "null://",
                 &keyed_opts(),
-                &Halt::new(),
-                Arc::new(NoopEvents),
+                &crate::ctx::Ctx::default(),
             );
             let err = r.expect_err("no key, no mux");
             assert_eq!(crate::error_code(&err), e7022, "{format:?}");
@@ -3364,8 +3346,7 @@ mod tests {
                 batch_sectors: 64,
                 ..keyed_opts()
             },
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
     }
 
@@ -3490,8 +3471,7 @@ mod tests {
             Some(&set),
             "null://",
             &opts,
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         );
         let live = mux_with_keys(
             MuxSource::Live {
@@ -3502,8 +3482,7 @@ mod tests {
             Some(&set),
             "null://",
             &opts,
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         );
         [iso, live]
     }
@@ -3691,8 +3670,14 @@ mod tests {
         };
         TEST_SINK.with(|s| *s.borrow_mut() = Some(Box::new(sink)));
         let t = std::time::Instant::now();
-        let out = drive_mux(Box::new(fs), "null://", &halt, &NoopEvents, None, None)
-            .expect("a wedged finalise is an incomplete run, not an error");
+        let out = drive_mux(
+            Box::new(fs),
+            "null://",
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect("a wedged finalise is an incomplete run, not an error");
         TEST_SINK.with(|s| s.borrow_mut().take());
         assert!(!out.completed && out.output_opened);
         assert!(t.elapsed() < Duration::from_secs(8), "bounded by the grace");
@@ -3729,14 +3714,7 @@ mod tests {
                     skip_errors: skip,
                     ..clear_opts(raw)
                 };
-                let res = mux_with_keys(
-                    src,
-                    None,
-                    "null://",
-                    &opts,
-                    &Halt::new(),
-                    Arc::new(NoopEvents),
-                );
+                let res = mux_with_keys(src, None, "null://", &opts, &crate::ctx::Ctx::default());
                 match skip {
                     true => {
                         let out = res.expect("the bad sector is skipped");
@@ -3804,8 +3782,14 @@ mod tests {
                 ..clear_opts(raw)
             };
             let spy = Arc::new(TitleSpy(std::sync::Mutex::new(None)));
-            mux_with_keys(src, None, "null://", &opts, &Halt::new(), spy.clone())
-                .unwrap_or_else(|e| panic!("{arm}: {e}"));
+            mux_with_keys(
+                src,
+                None,
+                "null://",
+                &opts,
+                &crate::ctx::Ctx::default().with_events(spy.clone()),
+            )
+            .unwrap_or_else(|e| panic!("{arm}: {e}"));
             let opened = spy.0.lock().unwrap().take().expect("opened");
             assert_eq!(opened.streams.len(), 1, "{arm}");
         }

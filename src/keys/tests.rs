@@ -1485,7 +1485,10 @@ fn extract_tree_blanks_clustered_damage() {
         keys: Some(&set),
         ..Default::default()
     };
-    let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
+    let res = fx
+        .disc
+        .extract_tree(&mut src, dest.path(), &opts, &crate::ctx::Ctx::default())
+        .unwrap();
     assert!(
         !res.halted && res.files.iter().all(|f| f.complete),
         "every file is written"
@@ -1813,7 +1816,10 @@ fn extract_tree_blanks_a_file_no_key_opens() {
         keys: Some(&set),
         ..Default::default()
     };
-    let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
+    let res = fx
+        .disc
+        .extract_tree(&mut src, dest.path(), &opts, &crate::ctx::Ctx::default())
+        .unwrap();
     let got = std::fs::read(dest.path().join("BDMV/STREAM/00002.m2ts")).unwrap();
     assert!(got.iter().all(|&b| b == 0), "B is blanked, not ciphertext");
     assert!(!res.complete, "blanked units are not good bytes");
@@ -1824,7 +1830,10 @@ fn extract_tree_blanks_a_file_no_key_opens() {
         keys: Some(&set),
         ..Default::default()
     };
-    let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
+    let res = fx
+        .disc
+        .extract_tree(&mut src, dest.path(), &opts, &crate::ctx::Ctx::default())
+        .unwrap();
     assert!(res.complete);
     for (i, name) in [(0, "00001"), (1, "00002")] {
         let got = std::fs::read(dest.path().join(format!("BDMV/STREAM/{name}.m2ts"))).unwrap();
@@ -1895,8 +1904,7 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
             batch_sectors: 30,
             ..Default::default()
         },
-        &Halt::new(),
-        Arc::new(crate::mux::driver::NoopEvents),
+        &crate::ctx::Ctx::default(),
     );
     // The fixture TS carries no muxable frames, so a mux that read every unit through the
     // held keys ends E6008 (MkvInvalid); E6009 would mean it never read.
@@ -1952,13 +1960,18 @@ fn iso_input_reads_through_the_key_set() {
     let path = dir.path().join("disc.iso");
     std::fs::write(&path, &img.image).unwrap();
     let url = format!("iso://{}", path.display());
-    let keyless = crate::input(&url, &crate::InputOptions::default());
+    let keyless = crate::input(
+        &url,
+        &crate::InputOptions::default(),
+        &crate::ctx::Ctx::default(),
+    );
     assert_eq!(crate::error_code(&keyless.err().unwrap()), Some(E7022));
     let opts = crate::InputOptions {
         keys: Some(set),
         ..Default::default()
     };
-    let stream = crate::input(&url, &opts).expect("the set keys the title");
+    let stream =
+        crate::input(&url, &opts, &crate::ctx::Ctx::default()).expect("the set keys the title");
     assert_eq!(stream.info().extents, disc.titles[0].extents);
 }
 
@@ -2054,7 +2067,7 @@ fn live_stream_stops_on_an_unkeyed_piece_without_recovery() {
                 30,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap(),
             set.key_map(),
@@ -2235,7 +2248,7 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
                 3,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap(),
             set.key_map(),
@@ -2769,7 +2782,7 @@ fn decrypt_clears_cpi_on_every_source_packet() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.iso");
     let cap = fx.disc.capacity_sectors;
-    crate::write_image(&mut w, &dest, cap, &Halt::new(), |_| {}).unwrap();
+    crate::write_image(&mut w, &dest, cap, &crate::ctx::Ctx::default()).unwrap();
     let bytes = std::fs::read(&dest).unwrap();
     for i in 0..2 {
         let (start, n) = fx.file(i);

@@ -42,8 +42,7 @@ pub(crate) use macos as platform;
 pub(crate) use windows as platform;
 
 use crate::error::{Error, Result};
-use crate::event::Event;
-use crate::halt::{Halt, Progress};
+use crate::halt::{Halt, Liveness};
 use crate::identity::DriveId;
 use crate::scsi::ScsiTransport;
 use crate::sector::SectorSource;
@@ -124,11 +123,9 @@ pub struct Drive {
     /// The op token every CDB is checked against (§2.2).
     slot: Slot,
     /// Bumped on every `exec` completion, busy while one is in flight (T29 feed).
-    progress: Option<Progress>,
+    progress: Option<Liveness>,
     /// AGIDs allocated through this Drive and not yet invalidated (§2.2 ledger).
     agids: u8,
-    /// Event handler — fires for read errors and library-level state changes.
-    event_fn: Option<Box<dyn Fn(Event) + Send>>,
     /// The SINGLE AACS bus-encryption removal point. Decided ONCE from the
     /// unlock/handshake result during [`crate::disc::Disc::scan`] and applied on
     /// every read below this drive, so every reader above (sampler, mux, sweep,
@@ -275,7 +272,6 @@ impl Drive {
             slot,
             progress: None,
             agids: 0,
-            event_fn: None,
             bus_stage: crate::sector::bus_removal::BusStage::Passthrough,
             bus_gate: None,
             #[cfg(target_os = "linux")]
@@ -380,11 +376,6 @@ impl Drive {
         }
     }
 
-    /// Set an event handler for read recovery events.
-    pub fn on_event(&mut self, f: impl Fn(Event) + Send + 'static) {
-        self.event_fn = Some(Box::new(f));
-    }
-
     /// The token every CDB is checked against, or `None` once [`detach`](Self::detach)ed.
     pub fn token(&self) -> Option<&Halt> {
         self.slot.token()
@@ -406,12 +397,12 @@ impl Drive {
     }
 
     /// Report forward progress to `p`: bumped on every CDB completion, and
-    /// [`busy`](Progress::busy) while a CDB (or a scan bus step) is in flight.
-    pub fn attach_progress(&mut self, p: &Progress) {
+    /// [`busy`](Liveness::busy) while a CDB (or a scan bus step) is in flight.
+    pub fn attach_progress(&mut self, p: &Liveness) {
         self.progress = Some(p.clone());
     }
 
-    pub(crate) fn progress(&self) -> Option<&Progress> {
+    pub(crate) fn progress(&self) -> Option<&Liveness> {
         self.progress.as_ref()
     }
 
@@ -532,7 +523,7 @@ impl Drive {
         buf: &mut [u8],
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
-        let busy = self.progress.as_ref().map(Progress::busy);
+        let busy = self.progress.as_ref().map(Liveness::busy);
         let r = self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms);
         drop(busy);
         if let Some(p) = &self.progress {
@@ -614,7 +605,7 @@ impl Drive {
         let ceiling_hit: bool;
         // T6: the answers seen so far and the highest progress indicator; either
         // growing re-arms the no-progress window.
-        let moved = Progress::new();
+        let moved = Liveness::new();
         let mut stall = crate::halt::StallTimer::new(timing.window, &moved);
         let mut seen: Vec<Option<(u8, u8, u8)>> = Vec::new();
         let mut best: Option<u16> = None;

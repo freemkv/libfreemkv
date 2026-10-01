@@ -120,7 +120,11 @@ fn parse_url_m2ts_relative() {
 
 #[test]
 fn open_input_bare_path_errors() {
-    let result = libfreemkv::input("Movie.mkv", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input(
+        "Movie.mkv",
+        &libfreemkv::InputOptions::default(),
+        &libfreemkv::Ctx::default(),
+    );
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
@@ -143,7 +147,11 @@ fn open_output_bare_path_errors() {
 
 #[test]
 fn open_input_m2ts_empty_path_errors() {
-    let result = libfreemkv::input("m2ts://", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input(
+        "m2ts://",
+        &libfreemkv::InputOptions::default(),
+        &libfreemkv::Ctx::default(),
+    );
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
@@ -154,7 +162,11 @@ fn open_input_m2ts_empty_path_errors() {
 
 #[test]
 fn open_output_null_input_errors() {
-    let result = libfreemkv::input("null://", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input(
+        "null://",
+        &libfreemkv::InputOptions::default(),
+        &libfreemkv::Ctx::default(),
+    );
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
@@ -177,7 +189,11 @@ fn open_output_disc_errors() {
 
 #[test]
 fn open_input_network_no_port_errors() {
-    let result = libfreemkv::input("network://192.0.2.1", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input(
+        "network://192.0.2.1",
+        &libfreemkv::InputOptions::default(),
+        &libfreemkv::Ctx::default(),
+    );
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),

@@ -2,16 +2,14 @@
 //! every sink driven through `mux_with_keys`, over the synthetic BD clip. Pinned as output
 //! hashes, loss counters and refusal codes (see [`Golden`]); cells are `parity_*`.
 
-use super::driver::{MuxOptions, MuxOutcome, MuxSource, NoopEvents, mux_with_keys};
+use super::driver::{MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
 use super::resolve::{InputOptions, input};
 use super::select::{PidFilter, StreamSelection};
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::consts::BD_SOURCE_PACKET_BYTES as PKT;
-use crate::halt::Halt;
 use crate::keys::ResolvedKeySet;
 use crate::test_util::{CLIP_AUDIO_PIDS, Golden, synthetic_bd_clip};
 use std::path::Path;
-use std::sync::Arc;
 
 // A synthetic test key, not key material from any disc.
 const KEY: [u8; 16] = [0x5A; 16];
@@ -129,8 +127,7 @@ fn sinks(
             None,
             &dest,
             mopts,
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         );
         record_run(g, sink, &r);
         record_tree(g, sink, &out);
@@ -223,8 +220,7 @@ fn parity_sinks_from_mkv_mpg_and_fmkv_sources() {
             None,
             &format!("{scheme}://{}", p.display()),
             &MuxOptions::default(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         let bytes = std::fs::read(&p).unwrap();
@@ -237,7 +233,12 @@ fn parity_sinks_from_mkv_mpg_and_fmkv_sources() {
             &Default::default(),
         );
         let tag = format!("{scheme}-src");
-        let mut s = input(&format!("{scheme}://{}", p.display()), &Default::default()).unwrap();
+        let mut s = input(
+            &format!("{scheme}://{}", p.display()),
+            &Default::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .unwrap();
         record_frames(&mut g, &tag, s.as_mut());
     }
     g.check();
@@ -293,7 +294,11 @@ fn record_source(g: &mut Golden, tag: &str, scheme: &str, bytes: &[u8], opts: &I
     // Keep the temp file until the stream is drained (the sector pipeline reads lazily).
     let p = std::env::temp_dir().join(format!("fmkv-parity-{tag}-{}", std::process::id()));
     std::fs::write(&p, bytes).unwrap();
-    let r = input(&format!("{scheme}://{}", p.display()), opts);
+    let r = input(
+        &format!("{scheme}://{}", p.display()),
+        opts,
+        &crate::ctx::Ctx::default(),
+    );
     match r {
         Ok(mut s) => {
             let mut digest = Vec::new();
@@ -399,8 +404,7 @@ pub(crate) fn clear_mpg() -> Vec<u8> {
         None,
         &format!("mpg://{}", dst.display()),
         &MuxOptions::default(),
-        &Halt::new(),
-        Arc::new(NoopEvents),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap();
     std::fs::read(&dst).unwrap()

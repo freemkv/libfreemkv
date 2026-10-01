@@ -25,7 +25,9 @@
 //! ```no_run
 //! # fn run() -> std::io::Result<()> {
 //! let opts = libfreemkv::InputOptions::default();
-//! let mut input = libfreemkv::input("iso://disc.iso", &opts)?;
+//! // One run context: its halt stops every stage, its events hear the progress.
+//! let ctx = libfreemkv::Ctx::default();
+//! let mut input = libfreemkv::input("iso://disc.iso", &opts, &ctx)?;
 //! let title = input.info().clone();
 //! let mut output = libfreemkv::output("mkv://Movie.mkv", &title, None)?;
 //! // Propagate read errors instead of silently stopping on the first one.
@@ -75,6 +77,8 @@ pub(crate) mod clpi;
 pub mod consts;
 #[cfg(feature = "rip")]
 pub mod css;
+#[cfg(feature = "rip")]
+pub mod ctx;
 #[cfg(feature = "rip")]
 pub mod decrypt;
 #[cfg(feature = "rip")]
@@ -178,9 +182,11 @@ pub use io::WritebackFile;
 #[cfg(feature = "rip")]
 pub use io::image_writer::write_image;
 
-// ─── Drive events (low-level callbacks) ─────────────────────────────────────
+// ─── Run context: halt, events, loss counters (pipeline design §2.5) ────────
 #[cfg(feature = "rip")]
-pub use event::{BatchSizeReason, Event, EventKind};
+pub use ctx::{Ctx, Diag, LossReport, Stats};
+#[cfg(feature = "rip")]
+pub use event::{BatchSizeReason, Event, Events, NoEvents};
 #[cfg(feature = "rip")]
 pub use identity::DriveId;
 
@@ -246,7 +252,7 @@ pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
 #[cfg(feature = "rip")]
 pub use mux::select::{PidFilter, StreamSelection};
 #[cfg(feature = "rip")]
-pub use mux::{MuxEvents, MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
+pub use mux::{MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
 pub use scsi::{
     DiscPresence, DriveInfo, ScsiSense, ScsiTransport, SenseFamily, disc_presence, drive_has_disc,
     list_drives,

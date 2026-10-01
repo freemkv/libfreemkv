@@ -354,7 +354,7 @@ impl ResolvedKeySet {
     }
 
     /// [`resolve`](Self::resolve), reporting to the op's `progress` (stop design §2.1,
-    /// T29): every source call runs [`busy`](crate::halt::Progress::busy) on it, and each
+    /// T29): every source call runs [`busy`](crate::halt::Liveness::busy) on it, and each
     /// source's ctx hands it out as [`ResolveCtx::progress`](crate::keysource::ResolveCtx::progress).
     pub fn resolve_with_progress(
         disc: &Disc,
@@ -362,7 +362,7 @@ impl ResolvedKeySet {
         scope: KeyScope,
         sources: &KeySourceFactory,
         opts: ResolveKeysOptions,
-        progress: &crate::halt::Progress,
+        progress: &crate::halt::Liveness,
     ) -> Result<KeyResolution> {
         let clock = resolve::RealClock::new();
         resolve::resolve_observed(disc, reader, scope, sources, opts, &clock, Some(progress))

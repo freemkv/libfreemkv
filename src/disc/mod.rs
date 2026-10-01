@@ -8659,7 +8659,12 @@ mod tests {
         let (mut d, disc) = live_bus_scan(mem, Some(rdk)).expect("scan");
         let dest = tempfile::tempdir().unwrap();
         let res = disc
-            .extract_tree(&mut d, dest.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut d,
+                dest.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect(SPEC_BD_3_7_NOTE);
         let stream = dest.path().join("BDMV/STREAM");
         assert_eq!(

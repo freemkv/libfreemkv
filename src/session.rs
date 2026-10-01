@@ -10,7 +10,7 @@
 use crate::disc::{Disc, DiscId, DriveCredentials, ScanOptions};
 use crate::drive::{Drive, find_drive};
 use crate::error::{Error, Result};
-use crate::halt::{Halt, Progress};
+use crate::halt::{Halt, Liveness};
 use crate::keysource::KeySource;
 use crate::sector::{FileSectorSource, SectorSource};
 use std::path::{Path, PathBuf};
@@ -99,7 +99,7 @@ pub struct DiscSession {
     halt: Option<Halt>,
     /// The op's progress from [`Self::attach_progress`] (T29): the drive's CDBs and each
     /// key-source call report to it.
-    progress: Option<Progress>,
+    progress: Option<Liveness>,
 }
 
 // Overlay the session's key material onto `opts` without clobbering what the
@@ -234,7 +234,7 @@ impl DiscSession {
 
     /// Report the op's forward progress to `p` (T29): every drive CDB (as
     /// [`Drive::attach_progress`]) and every key-source call in [`Self::resolve_key_set`].
-    pub fn attach_progress(&mut self, p: &Progress) {
+    pub fn attach_progress(&mut self, p: &Liveness) {
         if let Some(drive) = self.drive.as_mut() {
             drive.attach_progress(p);
         }

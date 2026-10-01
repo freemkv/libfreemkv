@@ -13,7 +13,7 @@ use crate::udf;
 use std::io::Write;
 
 /// A scratch directory that removes itself.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
@@ -34,7 +34,7 @@ impl Scratch {
         ));
         p
     }
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
     fn file(&self, rel: &str, bytes: &[u8]) {
@@ -623,7 +623,7 @@ pub(crate) fn minimal_clpi(source_packets: u32) -> Vec<u8> {
 
 // A BD folder that enumerates a title, so the AACS content probe has an extent to sample;
 // `scrambled` sets the CPI bits and withholds TS sync.
-fn playable_bdmv(tag: &str, scrambled: bool) -> Scratch {
+pub(crate) fn playable_bdmv(tag: &str, scrambled: bool) -> Scratch {
     let s = Scratch::new(tag);
     let packets = 4096u32;
     let mut m2ts = vec![0x5Au8; packets as usize * 192];
@@ -722,14 +722,45 @@ fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
 
     // Door 2 — the PES input path the CLI actually rips through.
     let url = format!("dir://{}", s.path().display());
-    let stream = crate::input(&url, &crate::InputOptions::default())
-        .expect("dir:// input must open a clear folder, exactly as scan_dir does");
+    let stream = crate::input(
+        &url,
+        &crate::InputOptions::default(),
+        &crate::ctx::Ctx::default(),
+    )
+    .expect("dir:// input must open a clear folder, exactly as scan_dir does");
     assert_eq!(
         stream.info().extents,
         scanned_extents,
         "the two doors selected different titles from the same folder"
     );
     drop(stream);
+}
+
+// HP3: the `Url` arm reports read progress like every other arm (it used to pass no events).
+#[test]
+fn a_dir_url_mux_reports_read_progress_to_the_ctx() {
+    let _serial = crate::sector::prefetched::holder_test_lock();
+    let s = playable_bdmv("direvents", false);
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen = read.clone();
+    let ctx =
+        crate::Ctx::default().with_events(std::sync::Arc::new(move |e: &crate::Event<'_>| {
+            if let crate::Event::BytesRead { bytes, .. } = *e {
+                seen.store(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    let url = format!("dir://{}", s.path().display());
+    let src = crate::MuxSource::Url {
+        url: &url,
+        opts: crate::InputOptions::default(),
+    };
+    // The fixture's TS carries no PES, so the drain refuses as NoStreams after reading it all.
+    let _ = crate::mux_with_keys(src, None, "null://", &crate::MuxOptions::default(), &ctx);
+    assert_eq!(
+        read.load(std::sync::atomic::Ordering::Relaxed),
+        4096 * 192,
+        "every byte of the title's extent was reported read"
+    );
 }
 
 // The other verdict, same door: a truly scrambled folder is refused with the TYPED code, not
@@ -741,7 +772,11 @@ fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
     s.file("AACS/MKB_RO.inf", &[0u8; 64]);
 
     let url = format!("dir://{}", s.path().display());
-    let err = match crate::input(&url, &crate::InputOptions::default()) {
+    let err = match crate::input(
+        &url,
+        &crate::InputOptions::default(),
+        &crate::ctx::Ctx::default(),
+    ) {
         Ok(_) => panic!("a scrambled folder must not open as a PES source"),
         Err(e) => e,
     };

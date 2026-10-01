@@ -52,7 +52,8 @@ for title in &disc.titles {
 
 // Stream pipeline — read PES frames from any source, write to any output
 let opts = libfreemkv::InputOptions::default();
-let mut input = libfreemkv::input("iso://Disc.iso", &opts)?;
+let ctx = libfreemkv::Ctx::default(); // halt, events, loss counters for the run
+let mut input = libfreemkv::input("iso://Disc.iso", &opts, &ctx)?;
 let title = input.info().clone();
 let mut output = libfreemkv::output("mkv://Movie.mkv", &title)?;
 while let Ok(Some(frame)) = input.read() {

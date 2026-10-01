@@ -9,7 +9,7 @@ use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace};
 use crate::decrypt::{AacsKeyMap, Phase};
 use crate::disc::{ContentFormat, Disc, DiscFormat, Extent};
 use crate::error::{Error, Result};
-use crate::halt::{Halt, Progress};
+use crate::halt::{Halt, Liveness};
 use crate::keysource::{DiscInputs, DiscInputsCtx, KeySource, MIN_SAMPLE_UNITS};
 use crate::sector::SectorSource;
 use crate::session::KeySourceFactory;
@@ -119,7 +119,7 @@ enum Asked {
 struct Run<'a> {
     halt: Option<&'a Halt>,
     // The op's progress: busy around each source call (stop design §2.1 item 2).
-    progress: Option<&'a Progress>,
+    progress: Option<&'a Liveness>,
     clock: &'a dyn Clock,
     format: ContentFormat,
     sources: Vec<Box<dyn KeySource>>,
@@ -189,7 +189,7 @@ impl Run<'_> {
             let who = src.label().to_string();
             // Stop §2.1 item 2 (ST4-2): a source call (a keydb parse, a key-service call)
             // moves no CDB, so it is busy for the idle-only T29 probe.
-            let busy = self.progress.map(Progress::busy);
+            let busy = self.progress.map(Liveness::busy);
             let answer = if forensic {
                 src.get_fmts_indexes(&ctx).map(|k| (k, None))
             } else {
@@ -526,7 +526,7 @@ pub(crate) fn resolve_observed(
     sources: &KeySourceFactory,
     opts: ResolveKeysOptions,
     clock: &dyn Clock,
-    progress: Option<&Progress>,
+    progress: Option<&Liveness>,
 ) -> Result<KeyResolution> {
     let halt = opts.halt;
     if let Some(h) = halt {

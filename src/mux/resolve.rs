@@ -381,16 +381,13 @@ impl std::fmt::Debug for InputOptions {
     }
 }
 
-/// Open a PES input stream (produces PES frames).
-pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
-    input_with_halt(url, opts, None)
-}
-
-// `input` whose blocking network receive (`network://`) a halt can interrupt.
-pub(crate) fn input_with_halt(
+/// Open a PES input stream (produces PES frames) for the run `ctx`. Its halt reaches the
+/// image/PS/TS pipelines' scan, crack, reads and demux and the network receive (`stdio://`,
+/// `mkv://`, `mp4://` read inline); image and PS reads report `BytesRead`; stats count loss.
+pub fn input(
     url: &str,
     opts: &InputOptions,
-    halt: Option<&crate::halt::Halt>,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
@@ -415,6 +412,7 @@ pub(crate) fn input_with_halt(
                         .map_err(|e| -> io::Error { e.into() })
                 },
                 false,
+                ctx,
             )?;
             Ok(Box::new(stream))
         }
@@ -433,6 +431,7 @@ pub(crate) fn input_with_halt(
                         .map_err(|e| -> io::Error { e.into() })
                 },
                 true,
+                ctx,
             )?;
             Ok(Box::new(stream))
         }
@@ -442,11 +441,13 @@ pub(crate) fn input_with_halt(
             let stage = crate::sector::DecryptingSectorSource::detecting(
                 Box::new(crate::io::file_sector_source::FileSectorSource::open_padded(path)?)
                     as Box<dyn SectorSource>,
-                stage_options(opts, halt, opts.raw),
+                stage_options(opts, ctx, opts.raw),
             );
             let blanked = stage.blanked_counter();
             let reader = crate::sector::stage::SectorBytes::new(stage, len);
-            Ok(Box::new(build_m2ts_pipeline(reader)?.with_blanked(blanked)))
+            Ok(Box::new(
+                build_m2ts_pipeline(reader, ctx)?.with_blanked(blanked),
+            ))
         }
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
@@ -458,7 +459,7 @@ pub(crate) fn input_with_halt(
             validate_network_addr(addr)?;
             Ok(Box::new(NetworkStream::listen_staged(
                 addr,
-                halt.cloned(),
+                Some(ctx.halt.clone()),
                 opts.raw,
             )?))
         }
@@ -477,7 +478,7 @@ pub(crate) fn input_with_halt(
         }
         StreamUrl::Mpg { ref path } => {
             validate_file_path(path, "mpg")?;
-            Ok(Box::new(build_ps_pipeline(path, opts, halt)?))
+            Ok(Box::new(build_ps_pipeline(path, opts, ctx)?))
         }
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. }
@@ -502,15 +503,20 @@ fn image_input<S, F>(
     // A FOLDER's `encrypted` flag comes from tree shape and can be wrong; an
     // image's cannot. See `session::apply_folder_encryption_verdict`.
     is_folder: bool,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
     F: FnOnce() -> io::Result<S>,
 {
     let capacity = reader.capacity_sectors();
-    let mut disc =
-        crate::disc::Disc::scan_image(&mut reader, capacity, &crate::disc::ScanOptions::default())
-            .map_err(|e| -> io::Error { e.into() })?;
+    // BUG-4: the scan and every pipeline stage below observe the run's halt.
+    let scan = crate::disc::ScanOptions {
+        halt: Some(ctx.halt.clone()),
+        ..Default::default()
+    };
+    let mut disc = crate::disc::Disc::scan_image(&mut reader, capacity, &scan)
+        .map_err(|e| -> io::Error { e.into() })?;
     // Without this a folder reached here with a tree-shape verdict while
     // `session::scan_dir` reached the opposite one from its CONTENT, so the
     // same folder ripped through one door and failed through the other.
@@ -519,7 +525,7 @@ where
             .map_err(|e| -> io::Error { e.into() })?;
     }
     if let Some(set) = opts.keys.as_ref().filter(|s| s.is_aacs() && !opts.raw) {
-        return keyed_image_input(reader, disc, opts, set, reopen);
+        return keyed_image_input(reader, disc, opts, set, reopen, ctx);
     }
     // Pre-flight decrypt gate: fails fast on a scrambled-but-uncracked CSS disc or an
     // AACS disc with no key set (else muxes garbage). Per-title CSS is checked below.
@@ -586,8 +592,7 @@ where
         ISO_MUX_BATCH_SECTORS,
         format,
         opts.raw,
-        None,
-        None,
+        ctx,
     )?;
     Ok(stream)
 }
@@ -600,6 +605,7 @@ fn keyed_image_input<S, F>(
     opts: &InputOptions,
     set: &crate::keys::ResolvedKeySet,
     reopen: F,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
@@ -632,7 +638,7 @@ where
         }
     }
     let title = disc.titles[idx].clone();
-    build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, None, None)
+    build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, ctx)
 }
 
 // A `DemuxSink` over `dir`, its base name seeded from the playlist name.
@@ -871,7 +877,7 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
 /// Assemble the ISO mux pipeline (read+decrypt → demux → parse) for a title with no
 /// AACS key set (clear, CSS, or `raw`); an AACS title goes through
 /// [`build_iso_pipeline_keyed`]. `keys` is `DecryptKeys::None` for raw/unencrypted
-/// reads; `raw` skips the per-title CSS crack. `halt` is a cooperative cancel token.
+/// reads; `raw` skips the per-title CSS crack. Every stage runs under `ctx`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     mut reader: S,
@@ -880,13 +886,11 @@ pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     batch_sectors: u16,
     format: ContentFormat,
     raw: bool,
-    halt: Option<crate::halt::Halt>,
-    event_fn: Option<crate::sector::prefetched::EventFn>,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
     let extents = title.extents.clone();
     // CSS (DVD) key resolution — shared per-title step. A `None`/MPEG-PS
-    // title cracks its own key; `raw` skips it. `halt` lets /api/stop
-    // interrupt the crack scan.
+    // title cracks its own key; `raw` skips it. A Stop interrupts the crack scan.
     crate::css::resolve_dvd_title_key(
         &mut reader,
         &extents,
@@ -894,7 +898,7 @@ pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         batch_sectors,
         format,
         raw,
-        halt.as_ref(),
+        Some(&ctx.halt),
     )?;
     // Unit alignment is an AACS concept (whole 3-sector units); forcing it
     // on CSS/unencrypted (per-2048-byte-sector) would reject any extent
@@ -913,7 +917,7 @@ pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         unit_align,
         format,
     };
-    iso_pipeline_tail(decrypting, plan, title, halt, event_fn)
+    iso_pipeline_tail(decrypting, plan, title, ctx)
 }
 
 // The read plan of an ISO title mux: the extents read (FMTS alternate phase dropped), the
@@ -935,8 +939,7 @@ pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
     title: DiscTitle,
     set: &crate::keys::ResolvedKeySet,
     batch_sectors: u16,
-    halt: Option<crate::halt::Halt>,
-    event_fn: Option<crate::sector::prefetched::EventFn>,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
     let cap = reader.capacity_sectors();
     if (cap != 0 && set.capacity() != 0 && cap != set.capacity())
@@ -965,7 +968,7 @@ pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
         unit_align: 3,
         format: set.content_format(),
     };
-    iso_pipeline_tail(decrypting, plan, title, halt, event_fn)
+    iso_pipeline_tail(decrypting, plan, title, ctx)
 }
 
 // The shared tail of the ISO title mux: decrypting reader → prefetcher → demux → parse.
@@ -973,8 +976,7 @@ fn iso_pipeline_tail(
     mut decrypting: crate::sector::DecryptingSectorSource<Box<dyn SectorSource>>,
     plan: IsoPlan,
     title: DiscTitle,
-    halt: Option<crate::halt::Halt>,
-    event_fn: Option<crate::sector::prefetched::EventFn>,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
     let IsoPlan {
         extents,
@@ -1004,32 +1006,26 @@ fn iso_pipeline_tail(
     }
     crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
     decrypting.clear_unit_base();
+    decrypting.observe(ctx);
     let blanked = decrypting.blanked_counter();
 
-    let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
+    let prefetched = crate::sector::PrefetchedSectorSource::with_alignment(
         decrypting,
         extents,
         batch_sectors,
         unit_align,
-        halt.clone(),
-        event_fn,
+        ctx,
     )
     .map_err(|e| -> io::Error { e.into() })?;
     let (rx, recycle_tx, shell) = prefetched.into_channels();
 
     let (parsers, pid_to_track, ts, ps) = build_demux_state(&title, format);
-    let (demux_thread, demux_rx) = super::demux_thread::DemuxThread::spawn_zero_copy(
-        rx,
-        recycle_tx,
-        shell,
-        halt.clone(),
-        ts,
-        ps,
-    )
-    .map_err(|e| -> io::Error { e.into() })?;
+    let (demux_thread, demux_rx) =
+        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, ctx, ts, ps)
+            .map_err(|e| -> io::Error { e.into() })?;
     Ok(
         PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
-            .with_halt(halt)
+            .with_ctx(ctx)
             .with_blanked(blanked),
     )
 }
@@ -1037,13 +1033,13 @@ fn iso_pipeline_tail(
 // The decryption stage's options for a content-detected input.
 fn stage_options(
     opts: &InputOptions,
-    halt: Option<&crate::halt::Halt>,
+    ctx: &crate::ctx::Ctx,
     raw: bool,
 ) -> crate::sector::decrypting::StageOptions {
     crate::sector::decrypting::StageOptions {
         raw,
         keys: opts.keys.clone(),
-        halt: halt.cloned(),
+        ctx: ctx.clone(),
     }
 }
 
@@ -1071,7 +1067,7 @@ fn read_head(src: &mut dyn SectorSource, sectors: u32, batch: u16) -> io::Result
 fn build_ps_pipeline(
     path: &Path,
     opts: &InputOptions,
-    halt: Option<&crate::halt::Halt>,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
     const PS_MUX_BATCH_SECTORS: u16 = 8192;
     const HEAD_SECTORS: u32 = 2048; // 4 MiB
@@ -1079,7 +1075,7 @@ fn build_ps_pipeline(
         let file = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
         Ok(crate::sector::DecryptingSectorSource::detecting(
             Box::new(file) as Box<dyn SectorSource>,
-            stage_options(opts, halt, raw),
+            stage_options(opts, ctx, raw),
         ))
     };
     let mut stage = open(opts.raw)?;
@@ -1133,8 +1129,7 @@ fn build_ps_pipeline(
         unit_align: 1,
         format: ContentFormat::MpegPs,
     };
-    iso_pipeline_tail(stage, plan, title, halt.cloned(), None)
-        .map(|p| p.with_video_stream_id(scan.video_id))
+    iso_pipeline_tail(stage, plan, title, ctx).map(|p| p.with_video_stream_id(scan.video_id))
 }
 
 // Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head
@@ -1142,6 +1137,7 @@ fn build_ps_pipeline(
 // in a BytePrefetcher feeding the demux + parse threads.
 fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
     mut reader: R,
+    ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
     use super::meta;
     use std::io::Read;
@@ -1195,21 +1191,15 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
     let prefetcher = crate::io::byte_prefetcher::BytePrefetcher::new(
         chained,
         crate::io::byte_prefetcher::DEFAULT_CHUNK_BYTES,
-        None,
+        Some(ctx.halt.clone()),
     )?;
     let (rx, recycle_tx, shell) = prefetcher.into_channels();
 
     let (parsers, pid_to_track, ts, ps) = build_demux_state(&title, ContentFormat::BdTs);
     let (demux_thread, demux_rx) =
-        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, None, ts, ps)
+        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, ctx, ts, ps)
             .map_err(|e| -> io::Error { e.into() })?;
-    Ok(PipelinedPesStream::new(
-        demux_thread,
-        demux_rx,
-        title,
-        parsers,
-        pid_to_track,
-    ))
+    Ok(PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track).with_ctx(ctx))
 }
 
 #[cfg(test)]
@@ -1321,7 +1311,7 @@ mod tests {
     // Box<dyn Stream> isn't Debug, so unwrap_err() won't compile — these
     // helpers extract io::ErrorKind from the Err arm (panic on Ok) instead.
     fn input_err_kind(url: &str) -> std::io::ErrorKind {
-        match input(url, &Default::default()) {
+        match input(url, &Default::default(), &crate::ctx::Ctx::default()) {
             Ok(_) => panic!("expected input({url}) to error"),
             Err(e) => e.kind(),
         }
@@ -1715,8 +1705,7 @@ mod tests {
             8192,
             ContentFormat::BdTs,
             false,
-            None,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .expect("pipeline builds");
         let first = stream.read().expect("read must not error on clean EOF");
@@ -1756,8 +1745,7 @@ mod tests {
             8192,
             ContentFormat::BdTs,
             false,
-            None,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .expect("pipeline builds");
 
@@ -1848,8 +1836,7 @@ mod tests {
             8192,
             ContentFormat::BdTs,
             false,
-            None,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .expect("pipeline builds");
 
@@ -1888,8 +1875,7 @@ mod tests {
             0,
             ContentFormat::BdTs,
             false,
-            None,
-            None,
+            &crate::ctx::Ctx::default(),
         );
         assert!(res.is_err(), "zero batch_sectors must be rejected");
     }
@@ -1929,12 +1915,99 @@ mod tests {
             8192,
             ContentFormat::MpegPs,
             false,
-            None,
-            None,
+            &crate::ctx::Ctx::default(),
         );
         assert!(
             res.is_err(),
             "a scrambled DVD title with no key must hard-fail, not build a scrambled-passthrough pipeline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::{InputOptions, image_input};
+    use crate::pes::Stream as _;
+    use crate::sector::SectorSource;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // A folder image whose prefetch producer stalls in its first read until released: the
+    // shape of a drive grinding on a bad sector under an `iso://`/`dir://` mux.
+    struct StallsInPrefetch {
+        inner: crate::DirImage,
+        entered: mpsc::Sender<()>,
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl StallsInPrefetch {
+        fn new(dir: &std::path::Path) -> (Self, mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let s = Self {
+                inner: crate::DirImage::open(dir).unwrap(),
+                entered,
+                release: std::sync::Mutex::new(release_rx),
+            };
+            (s, entered_rx, release_tx)
+        }
+    }
+
+    impl SectorSource for StallsInPrefetch {
+        fn capacity_sectors(&self) -> u32 {
+            self.inner.capacity_sectors()
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if std::thread::current().name() == Some("freemkv-prefetch") {
+                let _ = self.entered.send(());
+                // Blocks until the test drops the sender, then fails the read.
+                let _ = self.release.lock().unwrap().recv();
+                return Err(crate::error::Error::SourceTerminated);
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // BUG-4: Stop reaches an image pipeline blocked inside a read; the read ends Halted
+    // within a wait slice instead of waiting on the stalled source.
+    #[test]
+    fn stop_reaches_a_dir_pipeline_blocked_in_a_read() {
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let s = crate::dirimage::tests::playable_bdmv("stopblocked", false);
+        let (src, entered_rx, release_tx) = StallsInPrefetch::new(s.path());
+        let ctx = crate::ctx::Ctx::default();
+        let probe = s.path().to_path_buf();
+        // The TrueHD probe reads on this thread, so its copy never stalls.
+        let reopen = move || Ok(StallsInPrefetch::new(&probe).0);
+        let mut stream = image_input(src, &InputOptions::default(), reopen, true, &ctx)
+            .expect("the folder opens");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the producer reached its read");
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let r = stream.read().map(|f| f.is_some());
+            let _ = done_tx.send(());
+            (r, stream)
+        });
+        ctx.halt.cancel();
+        let stopped = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        drop(release_tx);
+        let (r, stream) = reader.join().unwrap();
+        drop(stream);
+        assert!(
+            stopped,
+            "a Stop must end the blocked read without the source"
+        );
+        assert!(
+            crate::error::is_halt(&r.expect_err("a stopped read is not a frame")),
+            "the blocked read ends Halted"
         );
     }
 }

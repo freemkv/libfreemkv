@@ -129,8 +129,13 @@ fn open_with_succeeds_after_stopped_op_drops() {
         start_lba: 0,
         sector_count: 300,
     }];
-    let pf = crate::sector::PrefetchedSectorSource::new(drive, extents, 3, Some(h1.clone()))
-        .expect("spawn");
+    let pf = crate::sector::PrefetchedSectorSource::new(
+        drive,
+        extents,
+        3,
+        &crate::ctx::Ctx::new(h1.clone()),
+    )
+    .expect("spawn");
     std::thread::sleep(Duration::from_millis(20));
     h1.cancel();
     drop(pf);

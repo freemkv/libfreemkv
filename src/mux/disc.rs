@@ -6,10 +6,10 @@
 //! Read-only. For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy`.
 
 use super::ts::PesPacket;
+use crate::ctx::Ctx;
 use crate::disc::{DiscTitle, Extent};
 use crate::drive::extract_scsi_context;
-use crate::event::{BatchSizeReason, Event, EventKind};
-use crate::halt::Halt;
+use crate::event::{BatchSizeReason, Event};
 use crate::sector::{DecryptingSectorSource, SectorSource};
 use std::io;
 #[cfg(test)]
@@ -62,14 +62,14 @@ impl AdaptiveBatch {
 
     /// Record a successful read of `sectors`. Returns an event if the
     /// sizer probed up to a larger batch size.
-    fn on_success(&mut self, sectors: u16) -> Option<EventKind> {
+    fn on_success(&mut self, sectors: u16) -> Option<Event<'static>> {
         self.streak_sectors = self.streak_sectors.saturating_add(sectors as u32);
         if self.current < self.preferred && self.streak_sectors >= PROBE_THRESHOLD_SECTORS {
             let new_size = double_batch_size(self.current, self.preferred);
             if new_size != self.current {
                 self.current = new_size;
                 self.streak_sectors = 0;
-                return Some(EventKind::BatchSizeChanged {
+                return Some(Event::BatchSizeChanged {
                     new_size,
                     reason: BatchSizeReason::Probed,
                 });
@@ -80,14 +80,14 @@ impl AdaptiveBatch {
 
     /// Record a read failure. Returns an event if the sizer shrank.
     /// Does nothing at size 1 (caller handles skip/error).
-    fn on_failure(&mut self) -> Option<EventKind> {
+    fn on_failure(&mut self) -> Option<Event<'static>> {
         self.streak_sectors = 0;
         if self.current <= 1 {
             return None;
         }
         let new_size = halve_batch_size(self.current);
         self.current = new_size;
-        Some(EventKind::BatchSizeChanged {
+        Some(Event::BatchSizeChanged {
             new_size,
             reason: BatchSizeReason::Shrunk,
         })
@@ -145,13 +145,9 @@ pub struct DiscStream {
     /// the event count.
     lost_bytes: u64,
     pub skip_errors: bool,
-    /// When set and the token is cancelled, fill_extents returns Err(Halted)
-    /// at the next retry boundary. Unlike skip_errors, this propagates the
-    /// error up so the rip terminates cleanly. Construct with
-    /// [`DiscStream::with_halt`], passing the same `Halt` clone handed to
-    /// sweep / patch / mux so every phase observes one Stop signal.
-    halt: Option<Halt>,
-    event_fn: Option<Box<dyn Fn(Event) + Send>>,
+    /// The run's context: once `halt` is cancelled, fill_extents returns Err(Halted) at the
+    /// next retry boundary; events and loss counters go to it too.
+    ctx: Ctx,
     eof: bool,
     /// Count of dropped DVD navigation packets (private_stream_2, 0xBF) — these
     /// are expected on every disc; tallied and summarised once at EOF instead of
@@ -163,10 +159,10 @@ pub struct DiscStream {
     dropped_ps: super::ps::DroppedPs,
 
     // Cumulative bytes successfully read from the source. Drives
-    // EventKind::BytesRead emission and autorip's per-device progress.
+    // Event::BytesRead emission and autorip's per-device progress.
     bytes_read_total: u64,
     // Pre-computed total of all extents in bytes (or 0 if extents are
-    // empty). Carried in EventKind::BytesRead.total so consumers can show
+    // empty). Carried in Event::BytesRead.total so consumers can show
     // a percent without a separate API call.
     bytes_total_extents: u64,
 
@@ -178,16 +174,10 @@ pub struct DiscStream {
     parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
     pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
     pid_to_track: Vec<(u16, usize)>,
-    /// Cached `FREEMKV_SKIP_PARSE` profiling flag. The env var cannot
-    /// change at runtime, and `std::env::var_os` takes a process-wide
-    /// lock; reading it once at construction keeps it out of the
-    /// per-batch read() hot loop.
+    /// `ctx.diag.skip_parse`: bypass the codec parsers (profiling).
     skip_parse: bool,
-    /// Cached `FREEMKV_PROFILE` presence, read once at construction. When
-    /// false, the read() loop skips the four `Instant::now()` captures and the
-    /// `prof_tick` calls entirely, so profiling-off runs pay no per-iteration
-    /// timestamp cost or `prof_active()` env-var lookup (which takes a
-    /// process-wide lock).
+    /// `ctx.diag.profile`. When false, the read() loop skips the four `Instant::now()`
+    /// captures and the `prof_tick` calls entirely.
     profiling: bool,
     /// Cumulative bytes fed to the demuxer across all read buffers,
     /// used to stamp byte-exact provenance (`SourcePos`) onto demuxed packets.
@@ -223,7 +213,7 @@ impl DiscStream {
         batch_sectors: u16,
         content_format: crate::disc::ContentFormat,
         raw: bool,
-        halt: Option<Halt>,
+        ctx: &Ctx,
     ) -> std::io::Result<Self> {
         // A zero batch reads 0 sectors and never advances (endless loop until
         // Stop); `MuxOptions::default()` carries 0. Same refusal as the highway.
@@ -234,8 +224,7 @@ impl DiscStream {
         let extents = title.extents.clone();
 
         // Resolve this title's CSS key here (same step build_iso_pipeline uses,
-        // so passes descramble identically); no-op for AACS/clear/raw. `halt` is
-        // passed now, not via `with_halt`, since the scan runs before attach.
+        // so passes descramble identically); no-op for AACS/clear/raw. A Stop ends the crack.
         crate::css::resolve_dvd_title_key(
             &mut *reader,
             &extents,
@@ -243,7 +232,7 @@ impl DiscStream {
             batch_sectors,
             content_format,
             raw,
-            halt.as_ref(),
+            Some(&ctx.halt),
         )?;
         let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
@@ -260,6 +249,7 @@ impl DiscStream {
         // VOB bytes before the AC-3 probe reads real `acmod`s. A unit that
         // decrypts to broken TS is the muxer's concern, not loss to conceal.
         let mut reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
+        reader.observe(ctx);
 
         // Diagnostics only: logs each physical AC-3 sub-stream's real channel count
         // at --log-level 3. Routing is the scanner's PGC AST_CTL map.
@@ -293,7 +283,7 @@ impl DiscStream {
             .map(|s| matches!(s, crate::disc::Stream::Video(_)))
             .collect();
         let resync = (0..title.streams.len())
-            .map(|_| super::resync::ResyncGate::new())
+            .map(|_| super::resync::ResyncGate::counted(ctx.stats.clone()))
             .collect();
         let au_asm = title
             .streams
@@ -325,8 +315,7 @@ impl DiscStream {
             errors: 0,
             lost_bytes: 0,
             skip_errors: false,
-            halt,
-            event_fn: None,
+            ctx: ctx.clone(),
             eof: false,
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
@@ -338,8 +327,8 @@ impl DiscStream {
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
-            skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
-            profiling: std::env::var_os("FREEMKV_PROFILE").is_some(),
+            skip_parse: ctx.diag.skip_parse,
+            profiling: ctx.diag.profile,
             fed_bytes: 0,
             resync,
             is_video,
@@ -347,24 +336,6 @@ impl DiscStream {
             field_merge,
             header_gate: super::header_gate::HeaderGate::default(),
         })
-    }
-
-    /// Set event handler for sector-level events (binary search, skip, recover).
-    pub fn on_event(&mut self, f: impl Fn(Event) + Send + 'static) {
-        self.event_fn = Some(Box::new(f));
-    }
-
-    /// Constructor-time builder: attach a [`Halt`] token so that when
-    /// any clone is cancelled, the next read-retry boundary inside
-    /// `fill_extents` returns `Err(Halted)`. Required for Stop to work
-    /// during dense bad-sector regions (where the outer PES read() loop
-    /// can spend minutes inside fill_extents before emitting a frame).
-    ///
-    /// Pass the same `Halt` clone you hand to sweep / patch / mux so every
-    /// phase observes a single Stop signal.
-    pub fn with_halt(mut self, halt: Halt) -> Self {
-        self.halt = Some(halt);
-        self
     }
 
     // The extent walk becomes `map`'s read plan: an FMTS forensic segment keeps only our-phase
@@ -391,10 +362,7 @@ impl DiscStream {
     }
 
     fn is_halted(&self) -> bool {
-        self.halt
-            .as_ref()
-            .map(|h| h.is_cancelled())
-            .unwrap_or(false)
+        self.ctx.halt.is_cancelled()
     }
 
     // A failed read that Stop caused: the reader reports Halted, or our token fired.
@@ -402,10 +370,8 @@ impl DiscStream {
         matches!(e, crate::error::Error::Halted) || self.is_halted()
     }
 
-    fn emit(&self, kind: EventKind) {
-        if let Some(ref f) = self.event_fn {
-            f(Event { kind });
-        }
+    fn emit(&self, e: Event<'_>) {
+        self.ctx.emit(e);
     }
 
     /// Skip decryption — return raw encrypted bytes. Updates both
@@ -433,7 +399,8 @@ impl DiscStream {
             self.read_buf[got..bytes].fill(0);
             self.errors += 1;
             self.lost_bytes = self.lost_bytes.saturating_add((bytes - got) as u64);
-            self.emit(EventKind::SectorSkipped { sector: lba as u64 });
+            self.ctx.stats.add_skip((bytes - got) as u64);
+            self.emit(Event::SectorSkipped { lba: lba as u64 });
         }
         self.buf_valid = bytes;
         // `bytes` is always a whole number of 2048-byte logical sectors (it is
@@ -443,7 +410,7 @@ impl DiscStream {
         // Only the bytes the source actually delivered count as read; the
         // zero-filled tail is loss, already charged to `lost_bytes`.
         self.bytes_read_total = self.bytes_read_total.saturating_add(got as u64);
-        self.emit(EventKind::BytesRead {
+        self.emit(Event::BytesRead {
             bytes: self.bytes_read_total,
             total: self.bytes_total_extents,
         });
@@ -643,7 +610,8 @@ impl DiscStream {
                     // zero-filled. One AACS event can skip a whole 6144-byte
                     // unit, so loss estimates must use lost_bytes, not errors*2048.
                     self.lost_bytes = self.lost_bytes.saturating_add(zb as u64);
-                    self.emit(EventKind::SectorSkipped { sector: lba as u64 });
+                    self.ctx.stats.add_skip(zb as u64);
+                    self.emit(Event::SectorSkipped { lba: lba as u64 });
                     self.current_offset += sectors as u32;
                     break;
                 } else {
@@ -683,7 +651,7 @@ fn is_key_stop(e: &crate::error::Error) -> bool {
     )
 }
 
-// Per-stage profiling state, populated only when FREEMKV_PROFILE is set.
+// Per-stage profiling state, populated only under `Diag::profile`.
 // Logs a percentage breakdown via tracing (target "mux") every
 // PROFILE_INTERVAL. Zero overhead otherwise.
 struct StageProf {
@@ -701,17 +669,10 @@ thread_local! {
     static STAGE_PROF: std::cell::RefCell<Option<StageProf>> = const { std::cell::RefCell::new(None) };
 }
 
-fn prof_active() -> bool {
-    std::env::var_os("FREEMKV_PROFILE").is_some()
-}
-
 fn prof_tick(stage: &str, ns: u128, bytes: u64) {
     STAGE_PROF.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            if !prof_active() {
-                return;
-            }
             let now = std::time::Instant::now();
             *slot = Some(StageProf {
                 started: now,
@@ -838,7 +799,7 @@ impl DiscStream {
         }
 
         loop {
-            // Profiling timestamps only when FREEMKV_PROFILE is set; otherwise
+            // Profiling timestamps only under `Diag::profile`; otherwise
             // these stay None and no Instant::now() is taken in the hot loop.
             let t0 = self.profiling.then(std::time::Instant::now);
             if !self.fill_extents()? {
@@ -1075,7 +1036,7 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn headers_ready(&self) -> bool {
-        // FREEMKV_SKIP_PARSE bypasses codec parsers entirely, so
+        // `Diag::skip_parse` bypasses codec parsers entirely, so
         // codec_private is never populated — pretend headers are ready
         // immediately in that mode so the CLI loop doesn't hang.
         if self.skip_parse {
@@ -1116,6 +1077,7 @@ mod tests {
     //! interior types fail at compile time.
     use super::*;
     use crate::disc::{ContentFormat, DiscTitle};
+    use crate::halt::Halt;
     use crate::pes::Stream;
 
     // Static-assert DiscStream: Send (Stream has Send as a supertrait) — a
@@ -1179,6 +1141,10 @@ mod tests {
     }
 
     fn short_read_stream(skip_errors: bool) -> DiscStream {
+        short_read_stream_in(skip_errors, &crate::ctx::Ctx::default())
+    }
+
+    fn short_read_stream_in(skip_errors: bool, ctx: &crate::ctx::Ctx) -> DiscStream {
         let mut s = DiscStream::new(
             Box::new(ShortReader { capacity: 64 }),
             synthetic_title(64),
@@ -1186,7 +1152,7 @@ mod tests {
             8, // request 8 sectors (16384 B); the source delivers 1 (2048 B)
             ContentFormat::BdTs,
             false,
-            None,
+            ctx,
         )
         .unwrap();
         s.skip_errors = skip_errors;
@@ -1261,7 +1227,7 @@ mod tests {
                     8,
                     ContentFormat::BdTs,
                     false,
-                    None,
+                    &crate::ctx::Ctx::default(),
                 )
                 .unwrap();
                 s.fill_extents()
@@ -1298,7 +1264,7 @@ mod tests {
             0,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         );
         let err = res.err().expect("batch_sectors 0 must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1320,7 +1286,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         stream.skip_errors = true;
@@ -1355,7 +1321,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
 
@@ -1464,7 +1430,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
 
@@ -1494,11 +1460,10 @@ mod tests {
         );
     }
 
-    /// `is_halted()` must observe a cancellation signal installed via
-    /// `with_halt(Halt)` — flipping the token must cause the next
+    /// `is_halted()` must observe the context's token — flipping it must cause the next
     /// `fill_extents` retry boundary to bail.
     #[test]
-    fn halt_via_with_halt_observed_by_is_halted() {
+    fn halt_of_the_ctx_observed_by_is_halted() {
         let halt = Halt::new();
         let stream = DiscStream::new(
             Box::new(ZeroReader { capacity: 8 }),
@@ -1507,15 +1472,14 @@ mod tests {
             8,
             crate::disc::ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::new(halt.clone()),
         )
-        .unwrap()
-        .with_halt(halt.clone());
+        .unwrap();
         assert!(!stream.is_halted());
         halt.cancel();
         assert!(
             stream.is_halted(),
-            "with_halt token cancellation must be observed by is_halted()"
+            "the ctx token's cancellation must be observed by is_halted()"
         );
     }
 
@@ -1571,6 +1535,11 @@ mod tests {
             reader_halted,
             log: log.clone(),
         };
+        let ctx = if share_halt {
+            crate::ctx::Ctx::new(halt.clone())
+        } else {
+            crate::ctx::Ctx::default()
+        };
         let mut s = DiscStream::new(
             Box::new(reader),
             synthetic_title(64),
@@ -1578,12 +1547,9 @@ mod tests {
             batch,
             ContentFormat::BdTs,
             false,
-            None,
+            &ctx,
         )
         .unwrap();
-        if share_halt {
-            s = s.with_halt(halt.clone());
-        }
         s.skip_errors = skip_errors;
         if stop_at == 0 {
             halt.cancel();
@@ -1649,7 +1615,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         let stream = crate::keys::install_key_map(stream, map);
@@ -1800,7 +1766,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         // skip_errors=false: if the recovery read did NOT succeed, fill_extents
@@ -1910,7 +1876,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         stream.skip_errors = true;
@@ -2006,7 +1972,7 @@ mod tests {
                 8,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
             stream.skip_errors = true;
@@ -2046,7 +2012,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         stream.skip_errors = true;
@@ -2082,7 +2048,7 @@ mod tests {
             bad_sector: 4,
             log: log.clone(),
         };
-        let mut prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
+        let mut prefetched = crate::sector::PrefetchedSectorSource::with_alignment(
             reader,
             vec![crate::disc::Extent {
                 start_lba: 0,
@@ -2090,8 +2056,7 @@ mod tests {
             }],
             8,
             1,
-            None,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .expect("spawn producer");
 
@@ -2128,7 +2093,7 @@ mod tests {
             bad_sector: 4,
             log: log.clone(),
         };
-        let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
+        let prefetched = crate::sector::PrefetchedSectorSource::with_alignment(
             reader,
             vec![crate::disc::Extent {
                 start_lba: 0,
@@ -2136,8 +2101,7 @@ mod tests {
             }],
             8,
             1,
-            None,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .expect("spawn producer");
         let mut stream = DiscStream::new(
@@ -2147,7 +2111,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         stream.skip_errors = true;
@@ -2211,7 +2175,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         // AACS decrypts only through a key map; without one every read is a decrypt refusal.
@@ -2308,7 +2272,7 @@ mod tests {
             8,
             ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         stream.skip_errors = true;
@@ -2343,7 +2307,7 @@ mod tests {
     }
 
     #[test]
-    fn halt_via_with_halt_from_arc_observed_by_is_halted() {
+    fn halt_from_arc_observed_by_is_halted() {
         let arc = Arc::new(AtomicBool::new(false));
         let stream = DiscStream::new(
             Box::new(ZeroReader { capacity: 8 }),
@@ -2352,15 +2316,14 @@ mod tests {
             8,
             crate::disc::ContentFormat::BdTs,
             false,
-            None,
+            &crate::ctx::Ctx::new(Halt::from_arc(arc.clone())),
         )
-        .unwrap()
-        .with_halt(Halt::from_arc(arc.clone()));
+        .unwrap();
         assert!(!stream.is_halted());
         arc.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(
             stream.is_halted(),
-            "with_halt(Halt::from_arc) must observe Arc-side flips"
+            "a ctx over Halt::from_arc must observe Arc-side flips"
         );
     }
 
@@ -2408,7 +2371,7 @@ mod tests {
             8,
             ContentFormat::MpegPs,
             false,
-            None,
+            &crate::ctx::Ctx::default(),
         );
         assert!(
             res.is_err(),
@@ -2428,7 +2391,7 @@ mod tests {
             8,
             ContentFormat::MpegPs,
             true, // raw
-            None,
+            &crate::ctx::Ctx::default(),
         );
         assert!(
             res.is_ok(),
@@ -2621,7 +2584,7 @@ mod tests {
                 8,
                 ContentFormat::MpegPs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap()
         }
@@ -2717,7 +2680,7 @@ mod tests {
                 8,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
             let pes = |pid: u16, data: Vec<u8>| crate::mux::ts::PesPacket {
@@ -2774,7 +2737,7 @@ mod tests {
                 8,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap()
         }
@@ -2815,26 +2778,34 @@ mod tests {
             assert!(PesStream::headers_ready(&s), "5 s of source time elapsed");
         }
 
-        // ── on_event() / emit() ───────────────────────────────────────────
+        // ── ctx events / stats ────────────────────────────────────────────
 
-        /// `on_event()` installs the sink and `emit()` feeds it. If either is a
-        /// no-op the CLI's progress bar never moves and skipped sectors are never
-        /// reported — the rip looks clean and stalled at 0 %.
+        /// The ctx's events hear every skip and progress tick, and its stats count the skip.
+        /// If either is lost the CLI's progress bar never moves and skipped sectors are
+        /// never reported — the rip looks clean and stalled at 0 %.
         #[test]
-        fn installed_event_sink_receives_skip_and_progress_events() {
+        fn ctx_events_and_stats_receive_skip_and_progress() {
             let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let sink = log.clone();
-            let mut s = short_read_stream(true);
-            s.on_event(move |e| {
-                let tag = match e.kind {
-                    EventKind::SectorSkipped { sector } => format!("skip:{sector}"),
-                    EventKind::BytesRead { bytes, total } => format!("bytes:{bytes}/{total}"),
-                    other => format!("other:{other:?}"),
-                };
-                sink.lock().unwrap().push(tag);
-            });
+            let ctx = crate::ctx::Ctx::default().with_events(std::sync::Arc::new(
+                move |e: &Event<'_>| {
+                    let tag = match *e {
+                        Event::SectorSkipped { lba } => format!("skip:{lba}"),
+                        Event::BytesRead { bytes, total } => format!("bytes:{bytes}/{total}"),
+                        other => format!("other:{other:?}"),
+                    };
+                    sink.lock().unwrap().push(tag);
+                },
+            ));
+            let mut s = short_read_stream_in(true, &ctx);
 
             assert!(s.fill_extents().expect("short read absorbed"));
+            let loss = ctx.stats.snapshot();
+            assert_eq!(
+                (loss.read_skips, loss.bytes_lost),
+                (1, 14336),
+                "7 of 8 sectors zero-filled"
+            );
 
             let got = log.lock().unwrap().clone();
             assert!(
@@ -2864,7 +2835,7 @@ mod tests {
                 3,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
             assert!(
@@ -2961,7 +2932,7 @@ mod tests {
                 1,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
 
@@ -3156,7 +3127,7 @@ mod tests {
                 3,
                 ContentFormat::BdTs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
             s.parsers = vec![(pid, Box::new(KeyframeParser))];
@@ -3199,7 +3170,7 @@ mod tests {
                 8,
                 ContentFormat::MpegPs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
 
@@ -3233,7 +3204,7 @@ mod tests {
                 8,
                 ContentFormat::MpegPs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
             let ((), ev) = crate::testlog::capture(|| while s.read().unwrap().is_some() {});
@@ -3267,7 +3238,7 @@ mod tests {
                 8,
                 ContentFormat::MpegPs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
             let ((), ev) = crate::testlog::capture(|| while s.read().unwrap().is_some() {});
@@ -3324,7 +3295,7 @@ mod tests {
                 8,
                 ContentFormat::MpegPs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
             let mut n = 0;
@@ -3394,7 +3365,7 @@ mod tests {
                 1, // one sector per read → separate feed_at calls per sector
                 ContentFormat::MpegPs,
                 false,
-                None,
+                &crate::ctx::Ctx::default(),
             )
             .unwrap();
 
@@ -3488,7 +3459,7 @@ mod tests {
             assert!(
                 matches!(
                     b.on_failure(),
-                    Some(EventKind::BatchSizeChanged {
+                    Some(Event::BatchSizeChanged {
                         new_size: 30,
                         reason: BatchSizeReason::Shrunk
                     })
@@ -3515,7 +3486,7 @@ mod tests {
             assert!(
                 matches!(
                     ev,
-                    EventKind::BatchSizeChanged {
+                    Event::BatchSizeChanged {
                         new_size: 60,
                         reason: BatchSizeReason::Probed
                     }

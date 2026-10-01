@@ -2,7 +2,7 @@
 //! the op's token and progress (§2.12, :575), and each source call is busy (§2.1 item 2).
 
 use super::*;
-use crate::halt::Progress;
+use crate::halt::Liveness;
 
 // What one spy call saw: `ctx.halt()` is the op token, it was cancelled, and
 // `ctx.progress()` was present and busy.
@@ -30,7 +30,7 @@ impl KeySource for Spy {
                 .halt()
                 .map(|h| Arc::ptr_eq(h.as_arc(), self.op.as_arc())),
             cancelled: ctx.halt().is_some_and(Halt::is_cancelled),
-            busy: ctx.progress().map(Progress::is_busy),
+            busy: ctx.progress().map(Liveness::is_busy),
         });
         Ok(Vec::new())
     }
@@ -93,11 +93,11 @@ fn resolve_passes_halt_to_every_source_ctx() {
 
 /// ST4-2 / §2.1 item 2: "Each source call and each CSS crack in KU's `resolve` holds
 /// `busy()` on `ResolveCtx::progress()`" — so the idle-only T29 probe never counts a
-/// slow keydb parse as idle. The op's `Progress` is the ctx's, busy inside each call only.
+/// slow keydb parse as idle. The op's `Liveness` is the ctx's, busy inside each call only.
 #[test]
 fn resolve_holds_busy_around_every_source_call() {
     let fx = two_units();
-    let (op, p) = (Halt::new(), Progress::new());
+    let (op, p) = (Halt::new(), Liveness::new());
     let (f, seen) = spies(&op, false);
     let r = ResolvedKeySet::resolve_with_progress(
         &fx.disc,

@@ -63,11 +63,13 @@ impl DemuxThread {
         prefetch_rx: Receiver<std::io::Result<Vec<u8>>>,
         recycle_tx: Sender<Vec<u8>>,
         producer_shell: S,
-        halt: Option<Halt>,
+        ctx: &crate::ctx::Ctx,
         ts: Option<super::ts::TsDemuxer>,
         ps: Option<super::ps::PsDemuxer>,
     ) -> crate::error::Result<(Self, Receiver<DemuxBatch>)> {
         let (tx, rx) = bounded::<DemuxBatch>(DEMUX_CHANNEL_DEPTH);
+        let halt = Some(ctx.halt.clone());
+        let prof = ctx.diag.profile;
         let mut ts = ts;
         let mut ps = ps;
 
@@ -77,7 +79,6 @@ impl DemuxThread {
         let spawn_result = std::thread::Builder::new()
             .name("freemkv-demux".into())
             .spawn(move || {
-                let prof = std::env::var_os("FREEMKV_PROFILE").is_some();
                 let mut prof_started = std::time::Instant::now();
                 let mut prof_last_dump = prof_started;
                 let mut prof_read_ns: u128 = 0;
@@ -301,8 +302,15 @@ mod tests {
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let pid = 0x1011;
         let ts = super::super::ts::TsDemuxer::new(&[pid]);
-        let (_dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (_dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
 
         pf_tx.send(Ok(bdts_pes_packet(pid, &[0xDE, 0xAD]))).unwrap();
         drop(pf_tx); // producer done → EOF
@@ -331,8 +339,15 @@ mod tests {
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let pid = 0x1011;
         let ts = super::super::ts::TsDemuxer::new(&[pid]);
-        let (_dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (_dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
 
         pf_tx
             .send(Ok(bdts_pes_packet(pid, &[0x11, 0x22, 0x33])))
@@ -365,9 +380,15 @@ mod tests {
                 halt.cancel();
             }
             let ts = super::super::ts::TsDemuxer::new(&[0x1011]);
-            let (dt, rx) =
-                DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt.clone()), Some(ts), None)
-                    .unwrap();
+            let (dt, rx) = DemuxThread::spawn_zero_copy(
+                pf_rx,
+                rc_tx,
+                (),
+                &crate::ctx::Ctx::new(halt.clone()),
+                Some(ts),
+                None,
+            )
+            .unwrap();
             if close_first {
                 halt.cancel();
                 drop(pf_tx);
@@ -401,8 +422,15 @@ mod tests {
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let pid = 0x1011;
         let ts = super::super::ts::TsDemuxer::new(&[pid]);
-        let (_dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (_dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
         pf_tx.send(Ok(bdts_pes_packet(pid, &[0x01]))).unwrap();
         let mut second = bdts_pes_packet(pid, &[0x02]);
         second[7] |= 1; // next CC: a same-CC packet is a duplicate
@@ -429,8 +457,15 @@ mod tests {
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let ts = super::super::ts::TsDemuxer::new(&[0x1011]);
-        let (_dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (_dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
 
         pf_tx.send(Err(std::io::Error::other("boom"))).unwrap();
         drop(pf_tx);
@@ -456,8 +491,15 @@ mod tests {
         let (rc_tx, rc_rx) = bounded::<Vec<u8>>(4);
         let pid = 0x1011;
         let ts = super::super::ts::TsDemuxer::new(&[pid]);
-        let (_dt, _rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (_dt, _rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
 
         pf_tx.send(Ok(bdts_pes_packet(pid, &[0xAA]))).unwrap();
         let recycled = rc_rx.recv_timeout(Duration::from_secs(5));
@@ -474,8 +516,15 @@ mod tests {
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let ps = super::super::ps::PsDemuxer::new();
-        let (_dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, None, Some(ps)).unwrap();
+        let (_dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            None,
+            Some(ps),
+        )
+        .unwrap();
 
         // PES (video 0xE0, bounded length 5) + program-end delimiter.
         let mut buf = vec![
@@ -503,7 +552,9 @@ mod tests {
         // and terminate with Eof — also forward an empty batch per buffer for disconnect detection.
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rc_tx, rc_rx) = bounded::<Vec<u8>>(4);
-        let (_dt, rx) = DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, None, None).unwrap();
+        let (_dt, rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), &crate::ctx::Ctx::default(), None, None)
+                .unwrap();
 
         pf_tx.send(Ok(vec![0u8; 192])).unwrap();
         assert!(
@@ -534,8 +585,15 @@ mod tests {
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let pid = 0x1011;
         let ts = super::super::ts::TsDemuxer::new(&[pid]);
-        let (_dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (_dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
 
         // A non-PUSI packet on a tracked PID with header_remaining 0 and no
         // active PES: process_packet pushes nothing (asm inactive), so feed
@@ -573,8 +631,15 @@ mod tests {
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
         let ts = super::super::ts::TsDemuxer::new(&[tracked_pid]);
-        let (dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
         // An endless producer: it stops only once the worker is gone.
         std::thread::spawn(move || while pf_tx.send(Ok(empty_pkt.clone())).is_ok() {});
         drop(rx);
@@ -597,8 +662,15 @@ mod tests {
         let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(16);
         let pid = 0x1011;
         let ts = super::super::ts::TsDemuxer::new(&[pid]);
-        let (dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, Some(ts), None).unwrap();
+        let (dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            Some(ts),
+            None,
+        )
+        .unwrap();
         for i in 0..8u8 {
             let mut chunk = bdts_pes_packet(pid, &[i]);
             chunk.extend(bdts_pes_packet(pid, &[i, i]));
@@ -638,9 +710,15 @@ mod tests {
         let pid = 0x1011;
         let ts = super::super::ts::TsDemuxer::new(&[pid]);
         let halt = Halt::new();
-        let (dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), Some(halt.clone()), Some(ts), None)
-                .unwrap();
+        let (dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::new(halt.clone()),
+            Some(ts),
+            None,
+        )
+        .unwrap();
         // Rebound after `dt` so a failing assert drops the input first (no hung join).
         let pf_tx = pf_tx;
         for i in 0..16u8 {

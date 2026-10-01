@@ -127,7 +127,7 @@ impl WritebackFile {
     }
 
     /// Share `flush`'s counters (§2.10 item 3): give it the pipeline consumer's
-    /// [`Progress`](crate::halt::Progress) so a flushing `close()` counts as progress.
+    /// [`Progress`](crate::halt::Liveness) so a flushing `close()` counts as progress.
     /// Call before the first write.
     pub fn set_flush_progress(&mut self, flush: FlushProgress) {
         flush.note_total(self.flush.bytes_total());

@@ -4,7 +4,7 @@
 //! see [`Golden`](crate::test_util::Golden) for the re-bless command.
 
 use super::*;
-use crate::mux::driver::{MuxOptions, MuxSource, NoopEvents, mux_with_keys};
+use crate::mux::driver::{MuxOptions, MuxSource, mux_with_keys};
 use crate::mux::parity_tests::{golden, record_run, record_tree};
 use crate::mux::select::{PidFilter, StreamSelection};
 use crate::test_util::{CLIP_AUDIO_PIDS, Golden, synthetic_bd_clip};
@@ -48,7 +48,7 @@ fn copy_image(g: &mut Golden, tag: &str, fx: &Fx, reader: &mut dyn SectorSource)
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.iso");
     let cap = fx.disc.capacity_sectors;
-    let r = crate::io::image_writer::write_image(reader, &dest, cap, &Halt::new(), |_| {});
+    let r = crate::io::image_writer::write_image(reader, &dest, cap, &crate::ctx::Ctx::default());
     match r {
         Ok(n) => {
             g.kv(&format!("{tag} written"), n);
@@ -67,7 +67,10 @@ fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&ResolvedKeySet>, sr
         ..Default::default()
     };
     let mut src = src;
-    match fx.disc.extract_tree(&mut src, dest.path(), &opts) {
+    match fx
+        .disc
+        .extract_tree(&mut src, dest.path(), &opts, &crate::ctx::Ctx::default())
+    {
         Ok(r) => {
             g.kv(
                 &format!("{tag} result"),
@@ -148,7 +151,7 @@ fn mux_cells(g: &mut Golden, fx: &Fx, set: Option<&ResolvedKeySet>, dead: Option
                 format,
             }
         };
-        let r = mux_with_keys(source, set, &dest, opts, &Halt::new(), Arc::new(NoopEvents));
+        let r = mux_with_keys(source, set, &dest, opts, &crate::ctx::Ctx::default());
         record_run(g, tag, &r);
         record_tree(g, tag, &out);
     };
@@ -438,7 +441,12 @@ fn parity_bug1_live_dvd_folder_is_descrambled() {
     let dest = tempfile::tempdir().unwrap();
     let mut src = fx.source();
     fx.disc
-        .extract_tree(&mut src, dest.path(), &Default::default())
+        .extract_tree(
+            &mut src,
+            dest.path(),
+            &Default::default(),
+            &crate::ctx::Ctx::default(),
+        )
         .unwrap();
     for vts in ["VTS_01_1.VOB", "VTS_02_1.VOB"] {
         let got = std::fs::read(dest.path().join("VIDEO_TS").join(vts)).unwrap();

@@ -6,7 +6,7 @@ use super::*;
 use crate::dirimage::tests::{minimal_clpi, one_item_mpls};
 use crate::disc::ScanOptions;
 use crate::drive::Drive;
-use crate::mux::driver::{MuxOptions, MuxSource, NoopEvents, mux_with_keys};
+use crate::mux::driver::{MuxOptions, MuxSource, mux_with_keys};
 use crate::mux::parity_tests::{golden, record_run, record_tree};
 use crate::session::{DiscSession, KeySpec};
 use crate::test_util::{FakeMode, FakeTransport, Golden, synthetic_bd_clip};
@@ -86,8 +86,7 @@ fn mux(
         set,
         &dest,
         opts,
-        halt,
-        Arc::new(NoopEvents),
+        &crate::ctx::Ctx::new(halt.clone()),
     );
     record_run(g, tag, &r);
     record_tree(g, tag, dir.path());
@@ -236,8 +235,7 @@ fn parity_live_bd_stop_mid_read() {
             batch_sectors: 2,
             ..Default::default()
         },
-        &halt,
-        Arc::new(NoopEvents),
+        &crate::ctx::Ctx::new(halt.clone()),
     );
     let o = r.as_ref().map(|o| (o.completed, o.errors, o.lost_bytes));
     g.kv("stop", format_args!("{o:?}"));

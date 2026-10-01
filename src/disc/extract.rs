@@ -40,28 +40,11 @@ pub struct ExtractOptions<'a> {
     /// Overwrite into a non-empty destination directory. Without it a
     /// non-empty target is refused (mixing two discs' trees).
     pub force: bool,
-    /// Optional progress sink. `report` returning `false` requests an early
-    /// stop (the run finalizes whatever completed; in-flight files stay
-    /// `.partial`).
-    pub progress: Option<&'a dyn crate::progress::Progress>,
-    /// Cooperative cancel token. When cancelled (e.g. the CLI bridges its
-    /// SIGINT flag here), the run stops at the next file / batch boundary and
-    /// the in-flight file is left as `.partial` — never a half-written file
-    /// that looks complete. `None` disables cancellation.
-    pub halt: Option<crate::halt::Halt>,
     /// The rip's up-front key set (KU §3.1), scope `WholeDisc`. For an AACS disc every file
     /// is read through the set's reader: proven files by its map, the rest proven on
     /// arrival, and a readable unit no held key opens stops the run (E7032). `None`
     /// decrypts no AACS: the caller's `check_decryptable` gate refuses an AACS disc first.
     pub keys: Option<&'a crate::keys::ResolvedKeySet>,
-}
-
-impl ExtractOptions<'_> {
-    /// Whether the caller asked to stop (halt cancelled or a progress sink
-    /// returned `false` on its last report).
-    fn cancelled(&self, progress_continue: bool) -> bool {
-        !progress_continue || self.halt.as_ref().is_some_and(|h| h.is_cancelled())
-    }
 }
 
 /// Per-file extraction outcome.
@@ -129,13 +112,15 @@ impl Disc {
     /// STRAIGHT IN (no auto-named subfolder). The caller must have run the
     /// pre-flight decrypt gate ([`check_decryptable`](crate::keys::check_decryptable)).
     ///
-    /// Bad sectors become zero-filled holes (the run does not abort); files
-    /// are written `<name>.partial` and renamed on success.
+    /// Bad sectors become zero-filled holes; files are written `<name>.partial` and renamed
+    /// on success. Progress is `PassKind::Extract` events, loss goes to `ctx.stats`; a Stop
+    /// ends the run at a file or batch boundary, the in-flight file left `.partial`.
     pub fn extract_tree(
         &self,
         reader: &mut dyn SectorSource,
         dest: &Path,
         opts: &ExtractOptions,
+        ctx: &crate::ctx::Ctx,
     ) -> Result<ExtractResult> {
         // ── Output dir policy (pre-flight, before any read) ──────────────
         std::fs::create_dir_all(dest).map_err(|e| Error::DirWriteFailed {
@@ -221,6 +206,7 @@ impl Disc {
             }
             None => DecryptingSectorSource::new(Borrowed(reader), base_keys.clone()),
         };
+        dec.observe(ctx);
 
         let mut result = ExtractResult::default();
         let total_bytes = required;
@@ -235,7 +221,7 @@ impl Disc {
             std::collections::HashMap::new();
 
         for pf in &planned {
-            if opts.cancelled(true) {
+            if ctx.halt.is_cancelled() {
                 result.halted = true;
                 break;
             }
@@ -243,7 +229,7 @@ impl Disc {
             // cannot be located to de-bus, so it is lost whole rather than written still encrypted.
             if pf.unmapped {
                 let (fr, halted) =
-                    unmapped_file(pf, total_bytes, &mut done_bytes, &mut done_unreadable, opts);
+                    unmapped_file(pf, total_bytes, &mut done_bytes, &mut done_unreadable, ctx);
                 result.bytes_unreadable =
                     result.bytes_unreadable.saturating_add(fr.bytes_unreadable);
                 result.files.push(fr);
@@ -261,7 +247,7 @@ impl Disc {
                     let key = match vts_keys.get(&vts) {
                         Some(k) => k.clone(),
                         None => {
-                            let halt = opts.halt.as_ref();
+                            let halt = Some(&ctx.halt);
                             let k = match self
                                 .resolve_vts_key(&vts, &planned, &mut dec, &base_keys, halt)
                             {
@@ -290,7 +276,7 @@ impl Disc {
                 total_bytes,
                 &mut done_bytes,
                 &mut done_unreadable,
-                opts,
+                ctx,
             )?;
 
             result.bytes_good = result.bytes_good.saturating_add(fr.bytes_good);
@@ -570,7 +556,7 @@ fn unmapped_file(
     total_bytes: u64,
     done_bytes: &mut u64,
     done_unreadable: &mut u64,
-    opts: &ExtractOptions,
+    ctx: &crate::ctx::Ctx,
 ) -> (FileResult, bool) {
     tracing::warn!(
         target: "freemkv::extract",
@@ -579,14 +565,14 @@ fn unmapped_file(
     );
     *done_bytes = done_bytes.saturating_add(pf.size);
     *done_unreadable = done_unreadable.saturating_add(pf.size);
-    let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
+    report(ctx, *done_bytes, *done_unreadable, total_bytes);
     let fr = FileResult {
         path: pf.host_rel.clone(),
         bytes_good: 0,
         bytes_unreadable: pf.size,
         complete: false,
     };
-    (fr, opts.cancelled(cont))
+    (fr, ctx.halt.is_cancelled())
 }
 
 // Extracts one file via `<host>.partial` (bad sectors -> zero holes), then renames.
@@ -599,7 +585,7 @@ fn extract_one_file<S: SectorSource>(
     total_bytes: u64,
     done_bytes: &mut u64,
     done_unreadable: &mut u64,
-    opts: &ExtractOptions,
+    ctx: &crate::ctx::Ctx,
 ) -> Result<(FileResult, bool)> {
     let final_path = dest.join(&pf.host_rel);
     let partial_path = with_partial_suffix(&final_path);
@@ -629,8 +615,8 @@ fn extract_one_file<S: SectorSource>(
         finalize_file(writer, &partial_path, pf.size, &final_path)?;
         fr.complete = true;
         *done_bytes = done_bytes.saturating_add(pf.size);
-        let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
-        return Ok((fr, opts.cancelled(cont)));
+        report(ctx, *done_bytes, *done_unreadable, total_bytes);
+        return Ok((fr, ctx.halt.is_cancelled()));
     }
 
     let mut written: u64 = 0;
@@ -662,8 +648,8 @@ fn extract_one_file<S: SectorSource>(
                 left -= n as u64;
             }
             fr.bytes_good = fr.bytes_good.saturating_add(hole_bytes);
-            let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
-            if opts.cancelled(cont) {
+            report(ctx, *done_bytes, *done_unreadable, total_bytes);
+            if ctx.halt.is_cancelled() {
                 return Ok((fr, true));
             }
             if written >= pf.size {
@@ -705,6 +691,9 @@ fn extract_one_file<S: SectorSource>(
                 // Unreadable ranges were zero-filled by `read_batch_narrowed`; record the
                 // holes and keep going (no abort, no sweep-skip).
                 let lost = lost.min(usable as u64);
+                if lost > 0 {
+                    ctx.stats.add_skip(lost);
+                }
                 write_all(&mut writer, &buf[..usable], &partial_path)?;
                 // Damaged AACS units the reader blanked are unreadable, not good bytes.
                 let unit = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
@@ -717,9 +706,9 @@ fn extract_one_file<S: SectorSource>(
             }
             written = written.saturating_add(usable as u64);
             *done_bytes = done_bytes.saturating_add(usable as u64);
-            let cont = report(opts, *done_bytes, *done_unreadable, total_bytes);
+            report(ctx, *done_bytes, *done_unreadable, total_bytes);
             sector_off += batch;
-            if opts.cancelled(cont) {
+            if ctx.halt.is_cancelled() {
                 // Leave the `.partial`; do NOT rename — this file stays incomplete.
                 return Ok((fr, true));
             }
@@ -906,33 +895,27 @@ fn finalize_file(
     Ok(())
 }
 
-/// Emit a progress report. Returns `true` to continue, `false` if the sink
-/// requested an early stop (or there is no sink — always continue).
-fn report(opts: &ExtractOptions, done: u64, unreadable: u64, total: u64) -> bool {
-    match opts.progress {
-        Some(p) => {
-            let pp = crate::progress::PassProgress {
-                kind: crate::progress::PassKind::Mux,
-                work_done: done,
-                work_total: total,
-                // `done` counts good AND unreadable bytes together; split them so a
-                // live-progress-only consumer sees a holed extraction as holed,
-                // not a clean climb to 100% (this used to pin unreadable at 0).
-                bytes_good_total: done.saturating_sub(unreadable),
-                bytes_unreadable_total: unreadable,
-                bytes_pending_total: 0,
-                bytes_retryable_total: 0,
-                bytes_total_disc: total,
-                disc_duration_secs: None,
-                bytes_bad_in_main_title: 0,
-                main_title_duration_secs: None,
-                main_title_size_bytes: None,
-                located: Default::default(),
-            };
-            p.report(&pp)
-        }
-        None => true,
-    }
+/// Emit the run's progress as an [`Event::Pass`](crate::Event::Pass).
+fn report(ctx: &crate::ctx::Ctx, done: u64, unreadable: u64, total: u64) {
+    let pp = crate::progress::PassProgress {
+        kind: crate::progress::PassKind::Extract,
+        work_done: done,
+        work_total: total,
+        // `done` counts good AND unreadable bytes together; split them so a
+        // live-progress-only consumer sees a holed extraction as holed,
+        // not a clean climb to 100% (this used to pin unreadable at 0).
+        bytes_good_total: done.saturating_sub(unreadable),
+        bytes_unreadable_total: unreadable,
+        bytes_pending_total: 0,
+        bytes_retryable_total: 0,
+        bytes_total_disc: total,
+        disc_duration_secs: None,
+        bytes_bad_in_main_title: 0,
+        main_title_duration_secs: None,
+        main_title_size_bytes: None,
+        located: Default::default(),
+    };
+    ctx.emit(crate::event::Event::Pass(&pp));
 }
 
 /// Append `.partial` to a path's filename.
@@ -1516,7 +1499,12 @@ mod tests {
         let mut disc = build_disc(root);
         let out = TmpDir::new("bdmv");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
 
         assert_eq!(
@@ -1571,8 +1559,13 @@ mod tests {
         let out = TmpDir::new("hddvd");
         let mut d = clear_disc();
         d.content_format = crate::disc::ContentFormat::MpegPs;
-        d.extract_tree(&mut disc, out.path(), &ExtractOptions::default())
-            .expect("extract");
+        d.extract_tree(
+            &mut disc,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .expect("extract");
         assert_eq!(read_out(out.path(), "HVDVD_TS/MAIN.EVO"), Some(evo));
         assert!(!out.path().join("AAC!").exists(), "AAC!/ must be stripped");
     }
@@ -1607,7 +1600,12 @@ mod tests {
         let mut d = clear_disc();
         d.content_format = crate::disc::ContentFormat::MpegPs;
         let res = d
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
         assert_eq!(read_out(out.path(), "VIDEO_TS/VIDEO_TS.IFO"), Some(ifo));
         assert_eq!(read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB"), Some(vob));
@@ -1665,7 +1663,12 @@ mod tests {
             crack_span: None,
         });
         let res = d
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
         let got = read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB").expect("vob");
         // Descrambled output matches the plaintext, with the scramble flag
@@ -1708,7 +1711,12 @@ mod tests {
         }
         let out = TmpDir::new("badsector");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract does not abort on bad sectors");
         let got = read_out(out.path(), "BDMV/STREAM/00001.m2ts").expect("file written");
         assert_eq!(
@@ -1755,7 +1763,12 @@ mod tests {
         }
         let out = TmpDir::new("decryptfail");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract does not abort on an undecryptable unit");
         let got = read_out(out.path(), "BDMV/STREAM/00001.m2ts").expect("file written");
         assert_eq!(
@@ -1838,7 +1851,12 @@ mod tests {
         let mut disc = build_disc(root);
         let out = TmpDir::new("collision");
         let err = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect_err("collision must error");
         assert!(matches!(err, Error::DirNameCollision { .. }));
     }
@@ -1866,7 +1884,12 @@ mod tests {
         std::fs::create_dir_all(out.path()).unwrap();
         // Expectation from an independent std-only oracle, NOT the probe under test.
         let insensitive = oracle_case_insensitive(out.path());
-        let res = clear_disc().extract_tree(&mut disc, out.path(), &ExtractOptions::default());
+        let res = clear_disc().extract_tree(
+            &mut disc,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        );
         if insensitive {
             let err = res.expect_err("two names that fold to one host file must collide");
             assert!(matches!(err, Error::DirNameCollision { .. }), "got {err:?}");
@@ -1896,7 +1919,12 @@ mod tests {
         let mut disc = build_disc(root);
         let out = TmpDir::new("partial_collision");
         let err = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect_err(
                 "X's temp path IS X.partial's final path — one host file for two \
                  disc files, so it must be refused up front",
@@ -1920,7 +1948,12 @@ mod tests {
 
         let mut disc = build_disc(root);
         let err = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect_err("non-empty dir without --force must error");
         assert!(matches!(err, Error::DirNotEmpty));
 
@@ -1937,7 +1970,7 @@ mod tests {
             ..Default::default()
         };
         let res = clear_disc()
-            .extract_tree(&mut disc2, out.path(), &opts)
+            .extract_tree(&mut disc2, out.path(), &opts, &crate::ctx::Ctx::default())
             .expect("force proceeds");
         assert_eq!(read_out(out.path(), "a.bin"), Some(b"hello".to_vec()));
         assert!(res.complete);
@@ -2019,7 +2052,7 @@ mod tests {
             ..Default::default()
         };
         let res = d
-            .extract_tree(&mut disc, out.path(), &opts)
+            .extract_tree(&mut disc, out.path(), &opts, &crate::ctx::Ctx::default())
             .expect("extract");
 
         let got = read_out(out.path(), "BDMV/STREAM/00001.m2ts").expect("file written");
@@ -2068,7 +2101,12 @@ mod tests {
 
         let out = TmpDir::new("unrecorded_extent");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
 
         let got = read_out(out.path(), "INDEX.BDMV").expect("file written");
@@ -2138,39 +2176,15 @@ mod tests {
 
         let out = TmpDir::new("inline");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
         assert_eq!(read_out(out.path(), "tiny.inf"), Some(payload));
         assert!(res.complete);
-    }
-
-    // ── Mutation-triage additions ───────────────────────────────────────────
-
-    /// `cancelled` must stop on EITHER signal alone (a disjunction) — a
-    /// progress sink asking to stop must cancel even with no halt token, and a
-    /// cancelled halt token must cancel even when progress says continue.
-    #[test]
-    fn cancelled_stops_on_either_signal_alone() {
-        let opts_no_halt = ExtractOptions::default();
-        assert!(
-            opts_no_halt.cancelled(false),
-            "a progress sink asking to stop must cancel even with no halt token"
-        );
-        assert!(
-            !opts_no_halt.cancelled(true),
-            "neither signal firing must not cancel"
-        );
-
-        let halt = crate::halt::Halt::new();
-        halt.cancel();
-        let opts_halted = ExtractOptions {
-            halt: Some(halt),
-            ..Default::default()
-        };
-        assert!(
-            opts_halted.cancelled(true),
-            "a cancelled halt token must cancel even when progress says continue"
-        );
     }
 
     // The free-space pre-check must fire whenever the disc's declared total
@@ -2196,7 +2210,12 @@ mod tests {
 
         let out = TmpDir::new("insufficient_space");
         let err = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect_err("an absurdly large declared size must trip the space gate");
         assert!(matches!(err, Error::DirInsufficientSpace { .. }));
     }
@@ -2259,7 +2278,12 @@ mod tests {
             crack_span: None,
         });
         let res = d
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
 
         let got_1 = read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB").expect("vts01 vob");
@@ -2342,7 +2366,12 @@ mod tests {
             crack_span: None,
         });
         let err = d
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect_err(
                 "a VTS whose key could not be recovered must be a hard error, \
                  not a silent extract under another VTS's key",
@@ -2478,7 +2507,12 @@ mod tests {
 
         let out = TmpDir::new("extent_bounds");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
 
         let got = read_out(out.path(), "big.bin").expect("file written");
@@ -2571,17 +2605,23 @@ mod tests {
         assert_eq!(dec.inner().calls, READ_RETRIES + 1);
     }
 
-    /// `report` must reflect the sink's verdict -- a sink asking to stop must
-    /// actually halt the run mid-file, not be swallowed.
-    #[test]
-    fn progress_sink_stop_halts_run_mid_file() {
-        struct StopImmediately;
-        impl crate::progress::Progress for StopImmediately {
-            fn report(&self, _p: &crate::progress::PassProgress) -> bool {
-                false
-            }
-        }
+    // A run whose events cancel its own halt at the first pass report (a UI's Stop).
+    fn stop_on_first_pass() -> crate::ctx::Ctx {
+        let halt = crate::halt::Halt::new();
+        let stop = halt.clone();
+        crate::ctx::Ctx::new(halt).with_events(std::sync::Arc::new(
+            move |e: &crate::event::Event<'_>| {
+                if let crate::event::Event::Pass(p) = e {
+                    assert_eq!(p.kind, crate::progress::PassKind::Extract);
+                    stop.cancel();
+                }
+            },
+        ))
+    }
 
+    /// A Stop raised from the progress events must halt the run mid-file, not be swallowed.
+    #[test]
+    fn stop_from_the_progress_events_halts_run_mid_file() {
         let good = vec![0x66u8; 4 * 2048];
         let root = DirSpec {
             name: String::new(),
@@ -2604,16 +2644,16 @@ mod tests {
         };
         let mut disc = build_disc(root);
         let out = TmpDir::new("progress_stop");
-        let sink = StopImmediately;
-        let opts = ExtractOptions {
-            progress: Some(&sink),
-            ..Default::default()
-        };
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &opts)
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &stop_on_first_pass(),
+            )
             .expect("extract does not error on a progress halt");
 
-        assert!(res.halted, "a sink returning false must halt the run");
+        assert!(res.halted, "a Stop at the first report must halt the run");
         assert!(
             !res.files[0].complete,
             "the in-flight file must be left incomplete, not finalized"
@@ -2672,7 +2712,12 @@ mod tests {
         let mut disc = two_clip_disc_with_first_unmapped();
         let out = TmpDir::new("unmapped_icb");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("extract");
         assert_eq!(
             read_out(out.path(), "BDMV/STREAM/00002.m2ts"),
@@ -2685,23 +2730,18 @@ mod tests {
         assert!(!res.complete && !res.halted);
     }
 
-    // A progress Stop reported on the lost file ends the run there, like any other file.
+    // A Stop at the lost file's report ends the run there, like any other file.
     #[test]
     fn progress_stop_on_an_unmapped_stream_file_halts_the_run() {
-        struct StopImmediately;
-        impl crate::progress::Progress for StopImmediately {
-            fn report(&self, _p: &crate::progress::PassProgress) -> bool {
-                false
-            }
-        }
         let mut disc = two_clip_disc_with_first_unmapped();
         let out = TmpDir::new("unmapped_stop");
-        let opts = ExtractOptions {
-            progress: Some(&StopImmediately),
-            ..Default::default()
-        };
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &opts)
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &stop_on_first_pass(),
+            )
             .expect("a progress halt is not an error");
         assert!(res.halted);
         assert_eq!(res.files.len(), 1, "the run stops after the lost file");
@@ -2920,7 +2960,12 @@ mod tests {
         }
         let out = TmpDir::new("drive_halt");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("a Stop is a halt, not an error");
         assert!(res.halted, "drive-level Halted must halt the run");
         assert_eq!(res.files.len(), 1, "no file may start after the Stop");
@@ -2966,7 +3011,6 @@ mod tests {
         std::fs::create_dir_all(out.path()).unwrap();
         let mut dec = DecryptingSectorSource::new(AllBad(Vec::new()), DecryptKeys::None);
         let (mut done, mut bad) = (0u64, 0u64);
-        let opts = ExtractOptions::default();
         let (fr, halted) = extract_one_file(
             &mut dec,
             out.path(),
@@ -2974,7 +3018,7 @@ mod tests {
             len as u64,
             &mut done,
             &mut bad,
-            &opts,
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         assert!(!halted);
@@ -3030,12 +3074,13 @@ mod tests {
             title_key: [0xFFu8; 5],
             crack_span: None,
         });
-        let opts = ExtractOptions {
-            halt: Some(halt.clone()),
-            ..Default::default()
-        };
         let res = d
-            .extract_tree(&mut src, out.path(), &opts)
+            .extract_tree(
+                &mut src,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::new(halt.clone()),
+            )
             .expect("a Stop during the crack is a halt, not CssKeyMissing");
         assert!(res.halted);
         assert!(res.files.is_empty());
@@ -3044,12 +3089,6 @@ mod tests {
     // A stop requested on an INLINE file's report must not be dropped.
     #[test]
     fn progress_stop_on_inline_file_halts_the_run() {
-        struct StopOnce(std::cell::Cell<bool>);
-        impl crate::progress::Progress for StopOnce {
-            fn report(&self, _p: &crate::progress::PassProgress) -> bool {
-                self.0.replace(true)
-            }
-        }
         let inline_icb = |payload: &[u8]| {
             let mut icb = [0u8; 2048];
             icb[0..2].copy_from_slice(&266u16.to_le_bytes());
@@ -3070,14 +3109,14 @@ mod tests {
         disc.put_bytes(PART_START + 11, &root_fids);
         build_udf_skeleton(&mut disc, 10);
 
-        let sink = StopOnce(std::cell::Cell::new(false));
-        let opts = ExtractOptions {
-            progress: Some(&sink),
-            ..Default::default()
-        };
         let out = TmpDir::new("inline_stop");
         let res = clear_disc()
-            .extract_tree(&mut disc, out.path(), &opts)
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &stop_on_first_pass(),
+            )
             .expect("extract");
         assert!(res.halted, "the inline file's stop request was dropped");
         assert_eq!(res.files.len(), 1);
@@ -3130,7 +3169,12 @@ mod tests {
             crack_span: None,
         });
         let res = d
-            .extract_tree(&mut src, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut src,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect("a drive Stop during the crack is a halt, not CssKeyMissing");
         assert!(res.halted);
         assert!(res.files.is_empty());
@@ -3209,7 +3253,7 @@ mod tests {
             len as u64,
             &mut done,
             &mut bad,
-            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         assert_eq!(fr.bytes_unreadable, 6 * SECTOR_BYTES as u64);
@@ -3391,7 +3435,7 @@ mod tests {
             size,
             &mut done,
             &mut bad,
-            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         assert_eq!(fr.bytes_good, SECTOR_BYTES as u64);
@@ -3415,7 +3459,7 @@ mod tests {
             5000,
             &mut done,
             &mut bad,
-            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         assert_eq!(fr.bytes_good, 100);
@@ -3455,7 +3499,12 @@ mod tests {
         let mut disc = build_disc(root);
         let out = TmpDir::new("dup_names");
         let err = clear_disc()
-            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect_err("duplicate names must collide");
         assert!(matches!(err, Error::DirNameCollision { .. }));
     }

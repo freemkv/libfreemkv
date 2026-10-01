@@ -159,10 +159,10 @@ pub trait ResolveCtx {
     fn halt(&self) -> Option<&crate::halt::Halt> {
         None
     }
-    /// The op's [`Progress`](crate::halt::Progress) (§2.7, T29): a source bumps it per
-    /// byte moved and holds [`busy`](crate::halt::Progress::busy) while a call is in
+    /// The op's [`Liveness`](crate::halt::Liveness) (§2.7, T29): a source bumps it per
+    /// byte moved and holds [`busy`](crate::halt::Liveness::busy) while a call is in
     /// flight. `None` when nothing watches the op. Defaulted like [`Self::halt`].
-    fn progress(&self) -> Option<&crate::halt::Progress> {
+    fn progress(&self) -> Option<&crate::halt::Liveness> {
         None
     }
 }
@@ -177,7 +177,7 @@ pub struct DiscInputsCtx<'a> {
     inner: &'a DiscInputs,
     enc_keys: Vec<[u8; 16]>,
     halt: Option<&'a crate::halt::Halt>,
-    progress: Option<&'a crate::halt::Progress>,
+    progress: Option<&'a crate::halt::Liveness>,
 }
 
 impl<'a> DiscInputsCtx<'a> {
@@ -211,7 +211,7 @@ impl<'a> DiscInputsCtx<'a> {
     pub(crate) fn with_stop(
         self,
         halt: Option<&'a crate::halt::Halt>,
-        progress: Option<&'a crate::halt::Progress>,
+        progress: Option<&'a crate::halt::Liveness>,
     ) -> Self {
         Self {
             halt,
@@ -250,7 +250,7 @@ impl ResolveCtx for DiscInputsCtx<'_> {
     fn halt(&self) -> Option<&crate::halt::Halt> {
         self.halt
     }
-    fn progress(&self) -> Option<&crate::halt::Progress> {
+    fn progress(&self) -> Option<&crate::halt::Liveness> {
         self.progress
     }
 }

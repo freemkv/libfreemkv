@@ -25,14 +25,20 @@ pub(crate) struct ResyncGate {
     /// trace at all. That is the common case — most gaps do resolve — which
     /// made concealed video loss invisible to every consumer.
     dropped_total: u64,
+    /// The run's loss counters, bumped per dropped frame.
+    stats: Option<std::sync::Arc<crate::ctx::Stats>>,
 }
 
 impl ResyncGate {
     pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    // A gate that also counts its drops into the run's `stats`.
+    pub(crate) fn counted(stats: std::sync::Arc<crate::ctx::Stats>) -> Self {
         Self {
-            armed: false,
-            dropped: 0,
-            dropped_total: 0,
+            stats: Some(stats),
+            ..Self::default()
         }
     }
 
@@ -53,6 +59,9 @@ impl ResyncGate {
             } else {
                 self.dropped += 1;
                 self.dropped_total += 1;
+                if let Some(s) = &self.stats {
+                    s.add_resync_dropped(1);
+                }
                 false
             }
         } else {

@@ -143,7 +143,7 @@ fn fake_file(
     let file = File::create(dir.path().join("out.bin")).unwrap();
     let ops: Arc<dyn FlushOps> = ops.clone();
     let mut w = WritebackFile::with_flush_ops(file, ops, t).unwrap();
-    let flush = FlushProgress::new(Progress::new());
+    let flush = FlushProgress::new(Liveness::new());
     w.set_flush_progress(flush.clone());
     (dir, w, flush)
 }
@@ -753,7 +753,7 @@ fn mountstats_parser() {
 fn real_flush_progress() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = WritebackFile::create(&dir.path().join("real.bin")).unwrap();
-    let flush = FlushProgress::new(Progress::new());
+    let flush = FlushProgress::new(Liveness::new());
     w.set_flush_progress(flush.clone());
     let block = vec![9u8; 1024 * 1024];
     for _ in 0..8 {

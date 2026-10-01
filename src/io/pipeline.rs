@@ -14,7 +14,7 @@ use crossbeam_channel::{Sender, TrySendError, bounded};
 
 use crate::error::Error;
 use crate::halt::join_within;
-use crate::halt::{Halt, Halted, Joined, Progress, SendOutcome, Stall, StallTimer, WAIT_SLICE};
+use crate::halt::{Halt, Halted, Joined, Liveness, SendOutcome, Stall, StallTimer, WAIT_SLICE};
 
 /// `finish_with_halt`'s join window (T7): this long with no consumer progress is
 /// `PipelineJoinTimeout`. A stall window, not a total (HR1).
@@ -96,7 +96,7 @@ fn join_result<R>(r: thread::Result<Result<R, Error>>) -> Result<R, Error> {
 fn finish_with_grace<R: Send + 'static>(
     handle: thread::JoinHandle<Result<R, Error>>,
     state: &Arc<AtomicU8>,
-    progress: &Progress,
+    progress: &Liveness,
     grace: Duration,
     leak_err: Error,
     on_poll: &mut dyn FnMut(),
@@ -274,7 +274,7 @@ pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     /// [`Pipeline::send`] users.
     failed: Arc<AtomicBool>,
     /// The consumer's forward progress (T7): shared with the sink's output.
-    progress: Progress,
+    progress: Liveness,
     /// The op's token, read by the consumer when it commits to `close()` (§2.5).
     op: Arc<OnceLock<Halt>>,
 }
@@ -297,17 +297,17 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         depth: usize,
         sink: S,
     ) -> Result<Self, Error> {
-        Self::spawn_named_with_progress(name, depth, sink, Progress::new())
+        Self::spawn_named_with_progress(name, depth, sink, Liveness::new())
     }
 
-    /// Like [`Pipeline::spawn_named`], with the consumer's [`Progress`] supplied, so the
+    /// Like [`Pipeline::spawn_named`], with the consumer's [`Liveness`] supplied, so the
     /// sink's output (a [`WritebackFile`](crate::io::WritebackFile) given the same counter)
     /// shares it (stop design §2.10 item 3).
     pub fn spawn_named_with_progress<S: Sink<I, Output = R>>(
         name: &str,
         depth: usize,
         sink: S,
-        progress: Progress,
+        progress: Liveness,
     ) -> Result<Self, Error> {
         let (tx, rx) = bounded::<I>(depth);
         let state = Arc::new(AtomicU8::new(state::RUNNING));
@@ -494,7 +494,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
 
     /// The consumer's forward-progress counter: bumped per item applied and at
     /// `close()` entry and exit; [`finish_with_halt`](Self::finish_with_halt) waits on it.
-    pub fn progress(&self) -> &Progress {
+    pub fn progress(&self) -> &Liveness {
         &self.progress
     }
 
@@ -723,7 +723,7 @@ mod tests {
             finish_with_grace(
                 handle,
                 &state,
-                &Progress::new(),
+                &Liveness::new(),
                 Duration::MAX,
                 Error::Halted,
                 &mut || {},
@@ -1711,7 +1711,7 @@ mod tests {
         let res = finish_with_grace(
             handle,
             &state,
-            &Progress::new(),
+            &Liveness::new(),
             grace,
             Error::Halted,
             &mut || {},

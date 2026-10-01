@@ -37,10 +37,7 @@ pub struct PipelinedPesStream {
     eof: bool,
     // The terminal read error (kind, rendered code), repeated by every later read.
     failed: Option<(io::ErrorKind, String)>,
-    /// Cached `FREEMKV_SKIP_PARSE` profiling flag. Read once in `new()`
-    /// — the env var cannot change for the life of the stream, and
-    /// `std::env::var_os` takes a process-wide lock, so the per-batch /
-    /// per-poll reads it replaces were needless hot-path overhead.
+    /// `ctx.diag.skip_parse`: bypass the codec parsers (profiling).
     skip_parse: bool,
     /// Count of dropped DVD navigation packets (private_stream_2, 0xBF). These
     /// are expected on every disc; instead of a per-packet WARN they're tallied
@@ -130,7 +127,7 @@ impl PipelinedPesStream {
             pending_frames: std::collections::VecDeque::new(),
             eof: false,
             failed: None,
-            skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
+            skip_parse: false,
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
             dropped_ps: Default::default(),
@@ -161,9 +158,14 @@ impl PipelinedPesStream {
         self
     }
 
-    // The op's stop token: a cancel ends a blocked `read` with `Halted` (LP11).
-    pub(crate) fn with_halt(mut self, halt: Option<crate::halt::Halt>) -> Self {
-        self.halt = halt.unwrap_or_default();
+    // The run: its halt ends a blocked `read` with `Halted` (LP11), its stats count
+    // resync drops, its diagnostics apply.
+    pub(crate) fn with_ctx(mut self, ctx: &crate::ctx::Ctx) -> Self {
+        self.halt = ctx.halt.clone();
+        self.skip_parse = ctx.diag.skip_parse;
+        for gate in &mut self.resync {
+            *gate = super::resync::ResyncGate::counted(ctx.stats.clone());
+        }
         self
     }
 
@@ -492,7 +494,7 @@ impl Stream for PipelinedPesStream {
 
     fn headers_ready(&self) -> bool {
         // Match DiscStream semantics: video tracks need codec_private before the
-        // consumer can write the container header. FREEMKV_SKIP_PARSE forces ready
+        // consumer can write the container header. `Diag::skip_parse` forces ready
         // (no parser populates codec_private in that mode).
         if self.skip_parse {
             return true;
@@ -539,8 +541,15 @@ mod tests {
         let (_pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(1);
         let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(2);
         // No TS/PS demuxer; the worker just drains (nothing) and exits Eof.
-        let (dt, _own_rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), None, None, None).expect("spawn");
+        let (dt, _own_rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rec_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            None,
+            None,
+        )
+        .expect("spawn");
         dt
     }
 
@@ -614,7 +623,7 @@ mod tests {
     fn pipelined_stream_cancel_unblocks_reader() {
         let (stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         let halt = crate::halt::Halt::new();
-        let mut stream = stream.with_halt(Some(halt.clone()));
+        let mut stream = stream.with_ctx(&crate::ctx::Ctx::new(halt.clone()));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -641,11 +650,17 @@ mod tests {
         let halt = crate::halt::Halt::new();
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(8);
-        let (dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), Some(halt.clone()), None, None)
-                .expect("spawn");
+        let (dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rec_tx,
+            (),
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect("spawn");
         let mut stream = PipelinedPesStream::new(dt, rx, DiscTitle::empty(), vec![], vec![])
-            .with_halt(Some(halt.clone()));
+            .with_ctx(&crate::ctx::Ctx::new(halt.clone()));
         pf_tx.send(Ok(vec![0u8; 188])).unwrap();
         halt.cancel();
         // The halted prefetcher closes its channel.
@@ -666,7 +681,7 @@ mod tests {
 
         let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         let halt = crate::halt::Halt::new();
-        stream = stream.with_halt(Some(halt.clone()));
+        stream = stream.with_ctx(&crate::ctx::Ctx::new(halt.clone()));
         halt.cancel();
         tx.send(DemuxBatch::Eof).unwrap();
         let e = stream.read().expect_err("an Eof after a Stop is not clean");
