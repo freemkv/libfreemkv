@@ -36,7 +36,8 @@ pub trait SectorSource: Send {
     ///
     /// # Panics
     ///
-    /// Implementations may panic if `buf` is undersized.
+    /// Implementations may panic if `buf` is undersized; `FileSectorSource`
+    /// returns `DiscRead` instead.
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -44,7 +45,6 @@ pub trait SectorSource: Send {
         buf: &mut [u8],
         recovery: bool,
     ) -> Result<usize>;
-    // `FileSectorSource` checks this and returns `DiscRead` instead of panicking.
 
     /// Like [`read_sectors`], but with an explicit Force Unit Access request.
     ///
@@ -265,6 +265,50 @@ mod tests {
     // are exercised.
     fn set_unit_base_generic<S: SectorSource>(mut s: S, base: u32) {
         s.set_unit_base(base);
+    }
+
+    // FUA and random-access answers must cross the forwarding impls, or Pass-N recovery
+    // reads lose Force Unit Access and a prefetcher claims random access.
+    struct FuaSpy(Arc<Mutex<Vec<bool>>>);
+    impl SectorSource for FuaSpy {
+        fn capacity_sectors(&self) -> u32 {
+            0
+        }
+        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+            self.0.lock().unwrap().push(false);
+            Ok(0)
+        }
+        fn read_sectors_fua(
+            &mut self,
+            _: u32,
+            _: u16,
+            _: &mut [u8],
+            _: bool,
+            fua: bool,
+        ) -> Result<usize> {
+            self.0.lock().unwrap().push(fua);
+            Ok(0)
+        }
+        fn random_access(&self) -> bool {
+            false
+        }
+    }
+
+    fn fua_through<S: SectorSource>(mut s: S) -> bool {
+        s.read_sectors_fua(0, 1, &mut [0u8; 2048], false, true)
+            .unwrap();
+        s.random_access()
+    }
+
+    #[test]
+    fn forwarding_impls_keep_fua_and_random_access() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let boxed: Box<dyn SectorSource> = Box::new(FuaSpy(seen.clone()));
+        assert!(!fua_through(boxed));
+        let mut spy = FuaSpy(seen.clone());
+        let by_ref: &mut dyn SectorSource = &mut spy;
+        assert!(!fua_through(by_ref));
+        assert_eq!(*seen.lock().unwrap(), vec![true, true]);
     }
 
     // Leaf sources with no bus stage: image bytes on file are already bus-clear.

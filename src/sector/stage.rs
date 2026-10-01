@@ -448,6 +448,35 @@ mod tests {
         );
     }
 
+    // A stream shorter than one unit is BD-TS only if every source packet is synced at byte 4.
+    #[test]
+    fn a_short_stream_is_bd_ts_only_when_every_packet_syncs() {
+        let unit = ts_unit(false);
+        let short = unit[..3 * BD_SOURCE_PACKET_BYTES].to_vec();
+        assert_eq!(classify(&short), Kind::BdTs);
+        let mut one_bad = short.clone();
+        one_bad[BD_SOURCE_PACKET_BYTES + 4] = 0x00;
+        assert_eq!(classify(&one_bad), Kind::Opaque, "one packet off sync");
+        let mut sync_at_0 = short;
+        for p in sync_at_0.chunks_mut(BD_SOURCE_PACKET_BYTES) {
+            p[0] = 0x47;
+            p[4] = 0x00;
+        }
+        assert_eq!(classify(&sync_at_0), Kind::Opaque, "sync belongs at byte 4");
+    }
+
+    // KS-5: a decrypter that leaves CPI set on units it has already decrypted still streams:
+    // clear TS is never a missing-key refusal, wherever its CPI flag says otherwise.
+    #[test]
+    fn clear_ts_with_a_cpi_flag_is_not_refused() {
+        let bytes: Vec<u8> = (0..4).flat_map(|_| ts_unit(true)).collect();
+        let mut stage = Stage::lazy(Cursor::new(bytes.clone()), false);
+        let mut out = Vec::new();
+        stage.read_to_end(&mut out).expect("clear TS is not E7022");
+        assert_eq!(out, bytes);
+        assert_eq!(stage.kind(), Some(Kind::BdTs));
+    }
+
     // An Opaque stream is handed through byte-identical, even if a later sector looks like a
     // scrambled pack (a VOB muxed into an MKV attachment stays untouched).
     #[test]

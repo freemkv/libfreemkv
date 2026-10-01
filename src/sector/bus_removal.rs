@@ -330,12 +330,18 @@ impl BusGate {
                     Some(h) => head_byte0(h),
                     None => None,
                 };
-                // An unreadable or unmapped head is cached as encrypted: never re-read.
+                // An unreadable head is a guess, not a measurement: it is not
+                // remembered, so a later read that has the head decides for real.
+                // An unmapped head can never be measured, so that guess is stable.
                 let e = byte0.is_none_or(|b| b & CPI_MASK != 0);
-                if self.cpi.len() >= CPI_CACHE_MAX {
-                    self.cpi.clear();
+                if byte0.is_some() || head.is_none() {
+                    if self.cpi.len() >= CPI_CACHE_MAX {
+                        self.cpi.clear();
+                    }
+                    self.cpi.insert(key, e);
+                } else {
+                    return e;
                 }
-                self.cpi.insert(key, e);
                 e
             }
         };
@@ -656,6 +662,39 @@ mod tests {
         s.read_sectors_fua(5, 1, &mut buf, true, true).unwrap();
         s.read_sectors_fua(5, 1, &mut buf, true, false).unwrap();
         assert_eq!(s.inner().fua, [true, false]);
+    }
+
+    // The wrapper is transparent to the inner source's capabilities and speed control.
+    #[test]
+    fn bus_removal_forwards_random_access_and_set_speed() {
+        struct Seq {
+            speed: u16,
+        }
+        impl SectorSource for Seq {
+            fn capacity_sectors(&self) -> u32 {
+                0
+            }
+            fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+                Ok(0)
+            }
+            fn random_access(&self) -> bool {
+                false
+            }
+            fn set_speed(&mut self, kbs: u16) {
+                self.speed = kbs;
+            }
+        }
+        let mut s = BusRemovalSectorSource::new(Seq { speed: 0 }, BusStage::Passthrough);
+        assert!(!s.random_access());
+        s.set_speed(4500);
+        assert_eq!(s.inner().speed, 4500);
+    }
+
+    // An extent running past the 32-bit LBA space is clipped at it, never wrapped.
+    #[test]
+    fn bus_map_extent_past_the_lba_space_is_clipped() {
+        let map = BusMap::from_files(vec![vec![(0xFFFF_FFF0, 100)]]);
+        assert_eq!(map.covered_ranges(), vec![(0xFFFF_FFF0, 16)]);
     }
 
     // A partly overlapping second file keeps its file offset across the clip.
@@ -987,10 +1026,10 @@ mod tests {
         assert_eq!(buf, clear, "unknown head CPI must de-bus");
     }
 
-    // A unit head that fails to read is fetched once, fast-path (recovery=false),
-    // and cached as encrypted: neighbours never re-read it.
+    // A unit head that fails to read is fetched fast-path (recovery=false) and the
+    // unit guessed encrypted; the guess is not remembered, so each read retries.
     #[test]
-    fn host_key_failed_head_fetch_is_cached_as_encrypted() {
+    fn host_key_failed_head_fetch_guesses_encrypted_without_caching() {
         struct BadHead {
             bytes: Vec<u8>,
             reads: Vec<(u32, bool)>,
@@ -1036,9 +1075,89 @@ mod tests {
         assert_eq!(got, clear);
         assert_eq!(
             s.inner().reads,
-            vec![(301, true), (300, false), (302, true)],
-            "one fast head fetch, then cached"
+            vec![(301, true), (300, false), (302, true), (300, false)],
+            "the unreadable head is retried, never cached"
         );
+    }
+
+    // A head that was unreadable once and is clear when later read: the guess made
+    // meanwhile must not decide the whole unit.
+    #[test]
+    fn host_key_head_guess_is_replaced_by_the_measured_head() {
+        let rdk = [0x62u8; 16];
+        let mut clear = clear_content(3); // LBAs 300..303
+        for l in 0..3 {
+            clear[l * SECTOR_BYTES] &= !0xC0;
+        }
+        let mut wire = clear.clone();
+        encrypt_bus(&mut wire, &rdk);
+        let map = Arc::new(BusMap::from_files(vec![vec![(300, 3)]]));
+        let mut g = BusGate::new(map);
+        // First pass: sector 301 alone, head 300 unreadable -> guessed encrypted.
+        let mut b = sector(&wire, 300, 301).to_vec();
+        g.debus(&mut b, &rdk, 301, &mut |_| None);
+        // Second pass: the whole unit with its real (clear) head.
+        let mut all = clear.clone();
+        g.debus(&mut all, &rdk, 300, &mut |_| {
+            unreachable!("head is in the buffer")
+        });
+        assert_eq!(all, clear, "a clear unit must pass through untouched");
+    }
+
+    // Any copy-permission bit set means encrypted (CPI 01/10/11), not just the top bit.
+    #[test]
+    fn host_key_any_cpi_bit_marks_the_unit_encrypted() {
+        let rdk = [0x63u8; 16];
+        for (head, encrypted) in [(0x00u8, false), (0x40, true), (0x80, true), (0xC0, true)] {
+            let mut clear = clear_content(3);
+            clear[0] = (clear[0] & !0xC0) | head;
+            let mut wire = clear.clone();
+            if encrypted {
+                encrypt_bus(&mut wire, &rdk);
+            }
+            let mut g = BusGate::new(Arc::new(BusMap::from_files(vec![vec![(300, 3)]])));
+            g.debus(&mut wire, &rdk, 300, &mut |_| None);
+            assert_eq!(wire, clear, "head byte0 {head:#x}");
+        }
+    }
+
+    // The decision is kept per (file, unit): interleaved reads of two files' mid-unit
+    // sectors fetch each head once, and unit 0 of one file does not decide the other's.
+    #[test]
+    fn host_key_decisions_are_keyed_by_file_and_unit() {
+        let rdk = [0x64u8; 16];
+        let mut clear = clear_content(6); // file 0 = 300..303 (CPI set), file 1 = 303..306 (clear)
+        clear[3 * SECTOR_BYTES] &= !0xC0;
+        let mut wire = clear.clone();
+        encrypt_bus(&mut wire[..3 * SECTOR_BYTES], &rdk);
+        let map = Arc::new(BusMap::from_files(vec![vec![(300, 3)], vec![(303, 3)]]));
+        let mut g = BusGate::new(map);
+        let mut heads = Vec::new();
+        for lba in [301u32, 304, 302, 305] {
+            let mut b = sector(&wire, 300, lba).to_vec();
+            g.debus(&mut b, &rdk, lba, &mut |h| {
+                heads.push(h);
+                Some(sector(&clear, 300, h)[0])
+            });
+            assert_eq!(b, sector(&clear, 300, lba), "lba {lba}");
+        }
+        assert_eq!(heads, vec![300, 303], "each head fetched once");
+    }
+
+    // The per-unit cache is bounded: it is cleared rather than growing with the disc.
+    #[test]
+    fn host_key_cpi_cache_stays_bounded() {
+        let units = CPI_CACHE_MAX as u32 + 8;
+        let map = Arc::new(BusMap::from_files(vec![vec![(0, units * 3)]]));
+        let mut g = BusGate::new(map);
+        let rdk = [0x65u8; 16];
+        let mut buf = clear_content(1);
+        buf[0] &= !0xC0;
+        for u in 0..units {
+            g.debus(&mut buf, &rdk, u * 3 + 1, &mut |_| Some(0));
+            assert!(g.cpi.len() <= CPI_CACHE_MAX);
+        }
+        assert!(g.cpi.len() < units as usize);
     }
 
     // Unrecorded extents keep file offsets: [500,1) + hole(1) + [700,4) puts
