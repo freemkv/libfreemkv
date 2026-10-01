@@ -966,6 +966,30 @@ mod tests {
         assert_eq!(got, pcm);
     }
 
+    // Odd counts are coded with a pad channel: the payload_size field and the layout must say so,
+    // and the parser must read the bytes back.
+    #[test]
+    fn bd_payloads_pad_odd_channel_counts_and_round_trip() {
+        for channels in 1u8..=8 {
+            let h = bd_header(channels, 48_000, None, 24).unwrap();
+            let n = usize::from(channels);
+            let pcm: Vec<u8> = (0..5 * n * 3).map(|i| (i % 251) as u8 + 1).collect();
+            let parts = bd_payloads(&pcm, h);
+            assert_eq!(parts.len(), 1);
+            let coded = (n + n % 2) * 3;
+            let p = &parts[0].1;
+            assert_eq!(p.len(), 4 + 5 * coded, "{channels} ch");
+            assert_eq!(
+                usize::from(u16::from_be_bytes([p[0], p[1]])),
+                5 * coded,
+                "payload_size of {channels} ch"
+            );
+            assert_eq!(&p[2..4], &h);
+            let got = LpcmParser::new().parse(&make_pes(p.clone(), Some(0)));
+            assert_eq!(got[0].data, pcm, "{channels} ch round trip");
+        }
+    }
+
     #[test]
     fn bd_payloads_are_5ms_pes_like_ffmpeg_blurayenc() {
         // 20000 stereo samples @ 48 kHz -> 83 full 240-sample PES + one of 80.
@@ -1089,6 +1113,86 @@ mod tests {
                 assert_eq!(f[0].data, want, "{channels} ch {bits} bit round trip");
             }
         }
+    }
+
+    // The channel_assignment table: count and the reorder into WAVE channel order, by value.
+    #[test]
+    fn bd_channel_assignments_map_to_wave_order() {
+        // (assignment, source channel values in BD order, expected WAVE-order values)
+        let cases: [(u8, &[u8], &[u8]); 10] = [
+            (1, &[1], &[1]),
+            (3, &[1, 2], &[1, 2]),
+            (4, &[1, 2, 3], &[1, 2, 3]),
+            (5, &[1, 2, 3], &[1, 2, 3]),
+            (6, &[1, 2, 3, 4], &[1, 2, 3, 4]),
+            (7, &[1, 2, 3, 4], &[1, 2, 3, 4]),
+            (8, &[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5]),
+            (9, &[1, 2, 3, 4, 5, 6], &[1, 2, 3, 6, 4, 5]),
+            (10, &[1, 2, 3, 4, 5, 6, 7], &[1, 2, 3, 5, 6, 4, 7]),
+            (11, &[1, 2, 3, 4, 5, 6, 7, 8], &[1, 2, 3, 8, 5, 6, 4, 7]),
+        ];
+        for (assign, src, want) in cases {
+            // 16-bit, coded channels padded to even.
+            let mut pcm: Vec<u8> = src.iter().flat_map(|&c| [c, c]).collect();
+            if src.len() % 2 == 1 {
+                pcm.extend_from_slice(&[0, 0]);
+            }
+            let mut p = LpcmParser::new();
+            let f = p.parse(&make_pes(bd(assign, 1, &pcm), Some(0)));
+            let expect: Vec<u8> = want.iter().flat_map(|&c| [c, c]).collect();
+            assert_eq!(f[0].data, expect, "assignment {assign}");
+        }
+    }
+
+    // Timeline advance across a PTS-less PES uses the header's sample rate (10 ms of stereo
+    // 16-bit audio per packet).
+    #[test]
+    fn a_ptsless_packet_advances_by_the_headers_sample_rate() {
+        for (code, hz) in [(1u8, 48_000usize), (4, 96_000), (5, 192_000)] {
+            let mut pes = vec![0x00, 0x00, (3 << 4) | code, 1 << 6];
+            pes.extend(vec![0u8; hz / 100 * 4]);
+            let mut p = LpcmParser::new();
+            p.parse(&make_pes(pes.clone(), Some(0)));
+            let f = p.parse(&make_pes(pes, None));
+            assert_eq!(f[0].pts_ns, 10_000_000, "BD rate code {code} = {hz} Hz");
+        }
+        for (freq, hz) in [(0u8, 48_000usize), (1, 96_000), (2, 44_100), (3, 32_000)] {
+            let mut pes = vec![0x00, (freq << 4) | 1, 0x80];
+            pes.extend(vec![0u8; hz / 100 * 4]);
+            let mut p = LpcmParser::new_dvd();
+            p.parse(&make_pes(pes.clone(), Some(0)));
+            let f = p.parse(&make_pes(pes, None));
+            assert_eq!(f[0].pts_ns, 10_000_000, "DVD rate code {freq} = {hz} Hz");
+        }
+    }
+
+    // The M2TS re-mux header, against the pcm-blurayenc.c tables: assignment for each count,
+    // rate nibble, and the bits field.
+    #[test]
+    fn bd_header_encodes_assignment_rate_and_depth() {
+        for (channels, assign) in [
+            (1u8, 1u8),
+            (2, 3),
+            (3, 4),
+            (4, 6),
+            (5, 8),
+            (6, 9),
+            (7, 10),
+            (8, 11),
+        ] {
+            for (hz, code) in [(48_000u32, 1u8), (96_000, 4), (192_000, 5)] {
+                assert_eq!(
+                    bd_header(channels, hz, None, 24),
+                    Some([(assign << 4) | code, 0xC0]),
+                    "{channels} ch {hz} Hz"
+                );
+            }
+        }
+        assert_eq!(bd_header(2, 48_000, None, 16).unwrap()[1], 0x40);
+        assert_eq!(bd_header(9, 48_000, None, 24), None);
+        // A source layout byte is reused only when it agrees with the count and rate.
+        assert_eq!(bd_header(6, 48_000, Some(0x71), 24), Some([0x91, 0xC0]));
+        assert_eq!(bd_header(4, 48_000, Some(0x71), 24), Some([0x71, 0xC0]));
     }
 
     #[test]

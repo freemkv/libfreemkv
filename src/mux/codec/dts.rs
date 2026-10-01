@@ -23,10 +23,12 @@ pub struct DtsParser {
     /// its FIRST byte, so an AU whose core arrived in an earlier PES keeps that
     /// core's timestamp and source offset when its extensions arrive later.
     acc: super::pesbuf::PesBuf,
-    /// PTS of the access unit currently being assembled in `buf` (the unit
+    /// PTS of the access unit currently being assembled in `acc` (the unit
     /// starting at the first buffered core sync). Captured when that core
     /// frame's PES first arrived; the trailing extension-substream PES
     /// packets carry their own (later) PTS which must NOT override it.
+    /// `PTS_UNSET` after a gap or a forced flush; `front_pts` falls back to it
+    /// only when the front packet carries no timestamp.
     pending_pts: i64,
     /// The `front_pts` of the PREVIOUS emitted access unit. When the current
     /// AU's `front_pts` differs, it began a new PES → re-base to it. When it is
@@ -73,8 +75,8 @@ impl DtsParser {
         }
     }
 
-    /// Number of access units dropped as undecodable so far. The mux/CLI reads
-    /// this to surface the count ("dropped N damaged DTS frames").
+    /// Number of access units dropped as undecodable so far. Only the tally's
+    /// end-of-stream summary logs it; no mux or CLI consumer reads this accessor.
     pub fn dropped_frames(&self) -> u64 {
         self.tally.dropped_frames()
     }
@@ -2448,6 +2450,66 @@ mod tests {
         d[11] |= 0x01;
         d[12] |= 0xC0;
         assert_eq!(core_header_drop_reason(&d), Some(DropReason::PcmRes));
+    }
+
+    // CPF=1 inserts a 16-bit header CRC before the PCM resolution; the gate must skip exactly
+    // those bits. PCMR sits at absolute bits 95..=97 without the CRC, 111..=113 with it.
+    #[test]
+    fn a_crc_protected_core_header_reads_pcmr_after_the_16_crc_bits() {
+        let mut crc = make_dts_core(512);
+        crc[4] |= 0x02; // CPF
+        // The CRC bits are arbitrary, and set to a reserved code where PCMR sits without it.
+        crc[11] |= 0x01;
+        crc[12] = 0xFF;
+        crc[13] |= 0xFE;
+        assert_eq!(core_header_drop_reason(&crc), None);
+
+        // Decodable PCMR 3 whose trailing neighbours would read as reserved code 4 if the
+        // skip ran two bits long.
+        let mut d = make_dts_core(512);
+        d[4] |= 0x02;
+        d[14] |= 0xC0;
+        assert_eq!(core_header_drop_reason(&d), None);
+
+        // Reserved PCMR 7 is found at the shifted position.
+        let mut d = make_dts_core(512);
+        d[4] |= 0x02;
+        d[13] |= 0x01;
+        d[14] |= 0xC0;
+        assert_eq!(core_header_drop_reason(&d), Some(DropReason::PcmRes));
+    }
+
+    // Substreams over 64 KiB use the long header form (12-bit header size, 20-bit Fsize).
+    fn long_form_exss(total: usize, static_fields: Option<(&str, &str)>) -> Vec<u8> {
+        let mut bits = format!(
+            "{}{}1{}{:020b}",
+            "0".repeat(8),
+            "00",
+            "0".repeat(12),
+            total - 1
+        );
+        if let Some((rate, dur)) = static_fields {
+            bits.push_str(&format!("1{rate}{dur}"));
+        }
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let mut d = vec![0u8; total.max(4 + bits.len() / 8)];
+        d[0..4].copy_from_slice(&DTS_HD_EXT_SYNC);
+        for (i, chunk) in bits.as_bytes().chunks(8).enumerate() {
+            d[4 + i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 2).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn exss_long_header_form_sizes_and_times_substreams_over_64_kib() {
+        let d = long_form_exss(70_000, Some(("10", "001")));
+        assert_eq!(exss_frame_size(&d), Some(70_000));
+        assert_eq!(exss_timing(&d), Some((1024, 48_000)));
+        let d = long_form_exss(1_000_000, None);
+        assert_eq!(exss_frame_size(&d), Some(1_000_000));
+        assert_eq!(exss_timing(&d), None);
     }
 
     #[test]

@@ -492,9 +492,9 @@ impl CodecParser for Ac3Parser {
                 );
                 self.acc.clear();
                 self.held = None;
-                // Advance the cadence, as the other two paths out of this block do,
-                // so all three cannot disagree. Defensive: no input parsing frames
-                // and leaving a residue this large is currently reachable.
+                // Advance the cadence like the other two paths out of this block.
+                // No known input reaches this branch; it must still drop the held
+                // AU and advance, or a stale HeldAu would resume after the resync.
                 self.flush_pts_ns = frame_pts_ns;
             } else {
                 self.acc.drain(keep_from);
