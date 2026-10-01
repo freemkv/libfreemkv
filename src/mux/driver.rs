@@ -1029,9 +1029,19 @@ impl Sink<PesFrame> for WriteSink {
         Ok(Flow::Continue)
     }
 
+    // After a read failure the read error is the title's failure: ending the output it
+    // cut short can fail (an mkv with no frames is `MkvInvalid`) but never replaces it.
     fn close(self) -> Result<SinkClose, Error> {
-        let complete = !self.read_failed.load(Ordering::Relaxed);
-        self.end(complete)
+        if !self.read_failed.load(Ordering::Relaxed) {
+            return self.end(true);
+        }
+        self.end(false).or_else(|e| {
+            tracing::warn!(target: "mux", error = %e, "ending the output a read failure cut short failed");
+            Ok(SinkClose {
+                bytes: 0,
+                undelivered: Vec::new(),
+            })
+        })
     }
 
     // A stopped title is incomplete too: a wire sink must not end it cleanly.
@@ -1148,6 +1158,24 @@ mod tests {
             "got {err}"
         );
         assert!(log.is_empty(), "a failed sink is never finalised: {log:?}");
+    }
+
+    // A strict read failure before any frame lands: the mkv's zero-frame `MkvInvalid` on
+    // ending the output is a skippable stub code and must not replace the read error.
+    #[test]
+    fn a_read_failure_before_any_frame_is_not_a_skippable_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("mkv://{}", dir.path().join("o.mkv").display());
+        let mut fs = FakeStream::new(1).with_frames(10);
+        fs.fail_read_at = Some(0);
+        let ctx = crate::ctx::Ctx::new(Halt::new());
+        let err = drive_mux(Box::new(fs), &url, &ctx, None, None).expect_err("a read failure");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DISC_READ),
+            "got {err}"
+        );
+        assert!(!crate::error::is_skippable_title_stub(&err));
     }
 
     // A stop ends the output incomplete; a clean drain finishes it.
