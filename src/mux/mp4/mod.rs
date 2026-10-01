@@ -484,8 +484,7 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
         {
             // A rate the title could not name (e.g. 22.05 kHz MP3) comes from the entry.
             if self.tracks[slot].audio_timescale == 0 {
-                self.tracks[slot].audio_timescale =
-                    u32::from_be_bytes([entry[32], entry[33], entry[34], entry[35]]) >> 16;
+                self.tracks[slot].audio_timescale = audio::entry_sample_rate(&entry).unwrap_or(0);
             }
             self.tracks[slot].audio_entry = Some(entry);
         }
@@ -628,7 +627,6 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
 
 // ── per-track box assembly ───────────────────────────────────────────────────
 
-/// Build a track's `trak` box and return `(bytes, duration_seconds)`.
 /// Per-track start delay: how far each track's first sample lies after the earliest
 /// sample of all tracks (the shared t=0).
 fn start_delays_ns(tracks: &[Track]) -> Vec<i64> {
@@ -636,7 +634,7 @@ fn start_delays_ns(tracks: &[Track]) -> Vec<i64> {
     let origin = tracks.iter().filter_map(first).min().unwrap_or(0);
     tracks
         .iter()
-        .map(|t| first(t).map_or(0, |f| f - origin))
+        .map(|t| first(t).map_or(0, |f| f.saturating_sub(origin)))
         .collect()
 }
 
@@ -660,6 +658,7 @@ fn build_edts(delay_ns: i64, media_secs: f64) -> Vec<u8> {
     bx(b"edts", &fullbox(b"elst", 1, 0, &body))
 }
 
+/// Build a track's `trak` box and return `(bytes, duration_seconds)`.
 fn build_trak_at(t: &Track, delay_ns: i64) -> (Vec<u8>, f64) {
     match t.media {
         Media::Video => build_video_trak_full(t, delay_ns),
@@ -670,7 +669,8 @@ fn build_trak_at(t: &Track, delay_ns: i64) -> (Vec<u8>, f64) {
 fn build_video_trak_full(t: &Track, delay_ns: i64) -> (Vec<u8>, f64) {
     let timing = VideoTiming::derive(&t.samples);
     let media_dur = timing.total_duration();
-    let secs = media_dur as f64 / timing.timescale as f64;
+    // Presentation, not decode, extent: lost frames leave CTS beyond `media_dur`.
+    let secs = timing.presentation_end() as f64 / timing.timescale as f64;
 
     let stsd = build_visual_stsd(t.codec, &t.codec_private, t.width, t.height, t.colr);
     let stbl = build_video_stbl(stsd, &t.samples, &timing);
@@ -749,6 +749,12 @@ impl VideoTiming {
     }
     fn total_duration(&self) -> u64 {
         self.cts.len() as u64 * self.sample_dur as u64
+    }
+    // Where the last frame to present ends; past `total_duration` when frames were lost.
+    fn presentation_end(&self) -> u64 {
+        let last = self.cts.iter().copied().max().unwrap_or(0).max(0) as u64;
+        self.total_duration()
+            .max(last.saturating_add(self.sample_dur as u64))
     }
     fn ctts(&self) -> Vec<i32> {
         self.cts
@@ -2127,6 +2133,93 @@ mod tests {
             elst(&tracks[1], delays[1]).is_none(),
             "the earliest track needs no edit"
         );
+    }
+
+    // Frames lost to a damaged span leave the last CTS past n*d; the edit list must still
+    // cover the whole presentation or players cut the tail.
+    #[test]
+    fn edit_list_covers_the_last_frame_when_frames_were_lost() {
+        let mut samples: Vec<Sample> = (0..4)
+            .map(|i| Sample {
+                offset: 0,
+                size: 1,
+                pts_ns: i * 40_000_000,
+                keyframe: i == 0,
+            })
+            .collect();
+        samples.push(Sample {
+            offset: 0,
+            size: 1,
+            pts_ns: 10_000_000_000,
+            keyframe: false,
+        });
+        let t = Track {
+            media: Media::Video,
+            track_id: 1,
+            stream_idx: 0,
+            codec: Codec::Hevc,
+            codec_private: vec![1],
+            width: 16,
+            height: 16,
+            colr: None,
+            language: [0x55, 0xC4],
+            audio_entry: None,
+            audio_timescale: 0,
+            samples,
+        };
+        let (trak, secs) = build_trak_at(&t, 40_000_000);
+        let edts = find_child(&trak[8..], b"edts").unwrap();
+        let e = find_child(edts, b"elst").unwrap();
+        let seg = u64::from_be_bytes(e[28..36].try_into().unwrap());
+        assert!(seg >= 10 * MOVIE_TIMESCALE as u64, "segment {seg}");
+        assert!(secs >= 10.04, "{secs}");
+    }
+
+    // AAC / MP3 entries come from the MPEG branch; a rate the title could not name is
+    // taken from the entry for the mdhd timescale.
+    #[test]
+    fn mp3_track_gets_an_entry_and_its_rate_from_the_first_frame() {
+        let mut mp3 = audio(Codec::Mp3, "eng");
+        if let DiscStream::Audio(a) = &mut mp3 {
+            a.sample_rate = SampleRate::Unknown;
+        }
+        let t = title(vec![hevc_video(), mp3], vec![Some(vec![1, 2, 3, 4]), None]);
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        s.write(&frame(0, 0, true, vec![0xAB; 800])).unwrap();
+        // MPEG-2 Layer III header, 22.05 kHz, mono.
+        let mp3_frame = vec![0xFF, 0xF3, 0x90, 0xC4, 0, 0, 0, 0];
+        s.write(&frame(1, 0, true, mp3_frame.clone())).unwrap();
+        s.write(&frame(1, 26_122_449, true, mp3_frame)).unwrap();
+        s.finish().unwrap();
+        assert!(s.undelivered_streams().is_empty());
+        assert_eq!(s.tracks[1].audio_timescale, 22_050);
+        assert!(s.tracks[1].audio_entry.is_some());
+    }
+
+    // Extreme first timestamps (a clamped reader) must not overflow the start delay.
+    #[test]
+    fn start_delays_saturate_on_extreme_timestamps() {
+        let mk = |id, pts_ns| Track {
+            media: Media::Audio,
+            track_id: id,
+            stream_idx: 0,
+            codec: Codec::Ac3,
+            codec_private: Vec::new(),
+            width: 0,
+            height: 0,
+            colr: None,
+            language: [0x55, 0xC4],
+            audio_entry: None,
+            audio_timescale: 48_000,
+            samples: vec![Sample {
+                offset: 0,
+                size: 1,
+                pts_ns,
+                keyframe: true,
+            }],
+        };
+        let delays = start_delays_ns(&[mk(1, i64::MAX), mk(2, i64::MIN)]);
+        assert_eq!(delays, vec![i64::MAX, 0]);
     }
 
     #[test]
