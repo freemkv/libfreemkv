@@ -3013,7 +3013,7 @@ mod tests {
                 .windows(2)
                 .position(|w| w == [ebml::FIELD_ORDER as u8, 0x81])
                 .expect("FieldOrder element present");
-            assert_eq!(data[at + 2], want as u8);
+            assert_eq!(data[at + 2], want);
         }
     }
 
