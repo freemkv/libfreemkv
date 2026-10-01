@@ -1563,7 +1563,7 @@ fn read_file_size(reader: &mut dyn SectorSource, meta: &MetaMap, meta_lba: u32) 
 
 // Decode an OSTA CS0 string: first byte is a compression ID (8 = one byte per code point,
 // i.e. Latin-1; 16 = UTF-16BE, surrogate pairs combined). Control characters (NUL included)
-// are dropped and '/' becomes '_'.
+// are dropped.
 fn decode_cs0(data: &[u8]) -> String {
     let Some((&comp, rest)) = data.split_first() else {
         return String::new();
@@ -1580,10 +1580,10 @@ fn decode_cs0(data: &[u8]) -> String {
         8 => rest.iter().map(|&b| b as char).collect(),
         _ => String::from_utf8_lossy(rest).into_owned(),
     };
-    // Names reach error text and logs: no control characters, and '/' would split a path.
+    // Names reach error text and logs: no control characters. A '/' is kept so the
+    // structure-file filter still rejects the name.
     s.chars()
         .filter(|c| !c.is_control())
-        .map(|c| if c == '/' { '_' } else { c })
         .collect::<String>()
         .trim()
         .to_string()
@@ -6697,10 +6697,10 @@ mod audit_tests {
     }
 
     #[test]
-    fn cs0_names_carry_no_control_characters_or_slashes() {
+    fn cs0_names_carry_no_control_characters() {
         assert_eq!(
-            parse_udf_name(&[8, b'a', 0x1B, b'[', b'2', b'J', b'/', b'b']),
-            "a[2J_b"
+            parse_udf_name(&[8, b'a', 0x1B, b'[', b'2', b'J', b'b']),
+            "a[2Jb"
         );
     }
 
