@@ -37,8 +37,8 @@ pub struct PrefetchedSectorSource {
     /// cross-thread alloc/free was the dominant cost in the demux
     /// thread before this).
     recycle_tx: Sender<Vec<u8>>,
-    /// The producer, a Drive holder (§2.5): joined on drop.
-    producer: Option<DriveHolder<()>>,
+    /// The producer (a Drive holder for a disc or image, §2.5): joined on drop.
+    producer: Option<Producer>,
     /// Total sector count across all extents, computed once at
     /// construction (the sum of each extent's `sector_count`) and
     /// returned by [`capacity_sectors`]. Never updated by reads.
@@ -55,6 +55,30 @@ pub struct PrefetchedSectorSource {
     unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
     /// The op's token: once cancelled, the closed channel is a stop, not EOF (L096).
     halt: Halt,
+}
+
+// The producer thread: a Drive holder (§2.5) for a disc or image read, a plain thread for a
+// file's byte view (`m2ts://`), which holds no Drive.
+enum Producer {
+    Drive(DriveHolder<()>),
+    File(std::thread::JoinHandle<()>),
+}
+
+impl Producer {
+    fn join(self) {
+        match self {
+            Producer::Drive(h) => drop(h.join()),
+            Producer::File(h) => drop(h.join()),
+        }
+    }
+}
+
+/// A file's byte view through the Read stage (`m2ts://`): `prefix` (the bytes already read
+/// past the head scan) goes out first, then the chunks, ending after `len` chunk bytes (the
+/// file's real length, short of its zero-padded last sector).
+pub(crate) struct ByteView {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) len: u64,
 }
 
 // Hand `item` to the consumer, waiting on a full channel; `false` once the consumer is
@@ -111,11 +135,40 @@ impl PrefetchedSectorSource {
     /// batches, or a live drive's adaptive, recovering reads), in `unit_align`-sector
     /// units. Also returns the read loss the stage counts.
     pub(crate) fn with_policy<S>(
+        reader: S,
+        extents: Vec<crate::disc::Extent>,
+        policy: crate::sector::read_stage::ReadPolicy,
+        unit_align: u16,
+        ctx: &Ctx,
+    ) -> Result<(Self, std::sync::Arc<crate::sector::read_stage::ReadLoss>)>
+    where
+        S: SectorSource + Send + 'static,
+    {
+        Self::spawn(reader, extents, policy, unit_align, ctx, None)
+    }
+
+    /// The producer over a file's byte view (`m2ts://`): the same Read stage under `policy`
+    /// in single-sector units, its chunks preceded by `view.prefix` and clipped to `view.len`.
+    pub(crate) fn file_bytes<S>(
+        reader: S,
+        extents: Vec<crate::disc::Extent>,
+        policy: crate::sector::read_stage::ReadPolicy,
+        ctx: &Ctx,
+        view: ByteView,
+    ) -> Result<(Self, std::sync::Arc<crate::sector::read_stage::ReadLoss>)>
+    where
+        S: SectorSource + Send + 'static,
+    {
+        Self::spawn(reader, extents, policy, 1, ctx, Some(view))
+    }
+
+    fn spawn<S>(
         mut reader: S,
         extents: Vec<crate::disc::Extent>,
         policy: crate::sector::read_stage::ReadPolicy,
         unit_align: u16,
         ctx: &Ctx,
+        view: Option<ByteView>,
     ) -> Result<(Self, std::sync::Arc<crate::sector::read_stage::ReadLoss>)>
     where
         S: SectorSource + Send + 'static,
@@ -142,14 +195,23 @@ impl PrefetchedSectorSource {
 
         #[cfg(test)]
         assert!(
-            crate::halt::DRIVE_HOLDER_TEST_LOCK.try_lock().is_err(),
+            view.is_some() || crate::halt::DRIVE_HOLDER_TEST_LOCK.try_lock().is_err(),
             "a test that spawns a prefetcher (a Drive holder) must hold DRIVE_HOLDER_TEST_LOCK"
         );
-        let producer = crate::halt::spawn_drive_holder("prefetch", move || {
+        let file_view = view.is_some();
+        let body = move || {
+            // A byte view: what is still to go out after the prefix.
+            let (prefix, mut left) = match view {
+                Some(v) => (v.prefix, Some(v.len)),
+                None => (Vec::new(), None),
+            };
             // catch_unwind so a panic (decrypt source, read path, events) isn't
             // mistaken for clean EOF: a dropped `tx` alone would finalize a
             // TRUNCATED mux as success. Locals are thread-local, so this is sound.
             let body = std::panic::AssertUnwindSafe(|| {
+                if !prefix.is_empty() && !send_or_stop(&wait, &tx, Ok(prefix)) {
+                    return;
+                }
                 loop {
                     if wait.is_cancelled() {
                         return;
@@ -163,8 +225,17 @@ impl PrefetchedSectorSource {
                     };
                     match walk.next(&mut reader, &mut buf) {
                         Ok(true) => {
-                            if !send_or_stop(&wait, &tx, Ok(buf)) {
+                            // A byte view ends at the file's real length.
+                            let last = left.is_some_and(|l| buf.len() as u64 >= l);
+                            if let Some(l) = left.as_mut() {
+                                buf.truncate((*l).min(buf.len() as u64) as usize);
+                                *l -= buf.len() as u64;
+                            }
+                            if !buf.is_empty() && !send_or_stop(&wait, &tx, Ok(buf)) {
                                 return; // consumer dropped, or stopped
+                            }
+                            if last {
+                                return;
                             }
                         }
                         // Drop tx — the consumer sees RecvError → EOF.
@@ -183,7 +254,14 @@ impl PrefetchedSectorSource {
                 let e = crate::error::Error::DemuxThreadPanicked.into();
                 send_or_stop(&wait, &tx, Err(e));
             }
-        })
+        };
+        let producer = match file_view {
+            false => crate::halt::spawn_drive_holder("prefetch", body).map(Producer::Drive),
+            true => std::thread::Builder::new()
+                .name("freemkv-prefetch".into())
+                .spawn(body)
+                .map(Producer::File),
+        }
         .map_err(|e| crate::error::Error::IoError { source: e })?;
 
         Ok((
@@ -224,7 +302,7 @@ impl PrefetchedSectorSource {
 /// producer thread join handle so dropping the shell joins the
 /// producer, even though the channels have been peeled off.
 pub struct PrefetchShell {
-    producer: Option<DriveHolder<()>>,
+    producer: Option<Producer>,
 }
 
 // Every test that spawns a producer holds this (the halt module's Drive-holder test lock).
@@ -238,7 +316,7 @@ pub(crate) fn holder_test_lock() -> std::sync::MutexGuard<'static, ()> {
 impl Drop for PrefetchShell {
     fn drop(&mut self) {
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            h.join();
         }
     }
 }
@@ -258,7 +336,7 @@ impl Drop for PrefetchedSectorSource {
         // joining gives a deterministic shutdown — no detached thread can outlive
         // the source.
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            h.join();
         }
     }
 }

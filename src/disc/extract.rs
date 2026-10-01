@@ -10,9 +10,14 @@
 use super::Disc;
 use crate::decrypt::DecryptKeys;
 use crate::error::{Error, Result};
+use crate::io::tree_sink::TreeSink;
+#[cfg(test)]
+use crate::io::tree_sink::{
+    available_space, dir_is_case_insensitive, probe_case_insensitive, sanitize_component,
+    unique_probe_token,
+};
 use crate::sector::{DecryptingSectorSource, SectorSource};
 use crate::udf::{self, DirEntry, UdfFs};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
@@ -31,8 +36,6 @@ const MAX_FAILED_UNIT_READS: u32 = 4;
 const ECC_BLOCK_SECTORS: u64 = 32;
 /// Sectors per read while cracking a VTS title key.
 const CRACK_BATCH_SECTORS: u16 = 64;
-/// Attempts to delete the case-probe marker before giving up.
-const PROBE_REMOVE_ATTEMPTS: u32 = 3;
 
 /// Options for [`Disc::extract_tree`].
 #[derive(Default)]
@@ -122,14 +125,22 @@ impl Disc {
         opts: &ExtractOptions,
         ctx: &crate::ctx::Ctx,
     ) -> Result<ExtractResult> {
-        // ── Output dir policy (pre-flight, before any read) ──────────────
-        std::fs::create_dir_all(dest).map_err(|e| Error::DirWriteFailed {
-            errno: e.raw_os_error(),
-        })?;
-        if !opts.force && dir_is_non_empty(dest) {
-            return Err(Error::DirNotEmpty);
-        }
+        // Output dir policy (pre-flight, before any read).
+        let mut sink = TreeSink::create(dest, opts.force)?;
+        self.extract_into(reader, &mut sink, opts.keys, ctx)
+    }
 
+    /// The `dir://` chain: this disc's file tree read off `reader` (bad sectors zero-filled
+    /// and counted per file), decrypted through `keys` (AACS) or per VTS (CSS), into
+    /// `sink` ([`crate::io::open_tree_sink`]). The caller must have run the pre-flight
+    /// decrypt gate ([`check_decryptable`](crate::keys::check_decryptable)).
+    pub fn extract_into(
+        &self,
+        reader: &mut dyn SectorSource,
+        sink: &mut TreeSink,
+        keys: Option<&crate::keys::KeyRing>,
+        ctx: &crate::ctx::Ctx,
+    ) -> Result<ExtractResult> {
         // ── Phase 1: read the FS structure + all file extents (raw) ──────
         let fs = udf::read_filesystem(reader)?;
         let unmapped: Vec<u32> = reader
@@ -139,11 +150,9 @@ impl Disc {
             .collect();
         let mut planned: Vec<PlannedFile> = Vec::new();
         let mut dirs: Vec<PathBuf> = Vec::new();
-        let mut seen_hosts: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
         // The collision fold depends on the REAL target volume: fold case only
         // where the host would (APFS/NTFS), never on a case-sensitive volume.
-        let case_insensitive = dir_is_case_insensitive(dest);
+        sink.probe_case();
         plan_tree(
             reader,
             &fs,
@@ -151,11 +160,10 @@ impl Disc {
             Path::new(""),
             "",
             true,
-            case_insensitive,
+            sink,
             &unmapped,
             &mut planned,
             &mut dirs,
-            &mut seen_hosts,
         )?;
 
         // Free-space pre-check: refuse up front if the tree won't fit, before
@@ -165,28 +173,16 @@ impl Disc {
             .iter()
             .map(|p| p.size)
             .fold(0u64, |a, b| a.saturating_add(b));
-        if let Some(available) = available_space(dest)
-            && available < required
-        {
-            return Err(Error::DirInsufficientSpace {
-                required,
-                available,
-            });
-        }
+        sink.reserve(required)?;
 
         // Create directories up-front so a leaf write never races a missing
-        // parent. The root itself already exists (create_dir_all above).
-        for d in &dirs {
-            let abs = dest.join(d);
-            std::fs::create_dir_all(&abs).map_err(|e| Error::DirWriteFailed {
-                errno: e.raw_os_error(),
-            })?;
-        }
+        // parent. The root itself already exists.
+        sink.make_dirs(&dirs)?;
 
         // Per-VTS CSS key map (DVD only): "VTS_xx" -> DecryptKeys. Built lazily
         // when a scrambled VOB group needs it. An AACS disc reads through the rip's set.
         let mut base_keys = self.decrypt_keys();
-        let keyed = opts.keys.filter(|s| s.is_aacs());
+        let keyed = keys.filter(|s| s.is_aacs());
         if let Some(set) = keyed {
             crate::keys::check_decryptable(
                 self,
@@ -274,7 +270,7 @@ impl Disc {
             // zero-fills it into bytes_unreadable, the same bucket as media damage.
             let (fr, halted) = extract_one_file(
                 &mut dec,
-                dest,
+                sink,
                 pf,
                 total_bytes,
                 &mut done_bytes,
@@ -387,69 +383,6 @@ impl SectorSource for Borrowed<'_> {
     }
 }
 
-/// Whether `dir` lives on a case-INSENSITIVE filesystem (macOS APFS/HFS+ and
-/// Windows NTFS default). Probes the real target: create a lowercase marker
-/// and test whether its uppercase spelling resolves to the same file. On a
-/// case-SENSITIVE volume (typical Linux ext4, or a case-sensitive APFS) two
-/// disc names differing only by case are DISTINCT host files that coexist, so
-/// folding them together would wrongly abort a legitimate extract. If the probe
-/// can't run (e.g. a read-only dir), assume case-insensitive — the conservative
-/// choice that never MISSES a real overwrite collision.
-fn dir_is_case_insensitive(dir: &Path) -> bool {
-    probe_case_insensitive(dir, |p| std::fs::remove_file(p))
-}
-
-// `dir_is_case_insensitive` with the marker removal injectable (tests fail it).
-fn probe_case_insensitive(
-    dir: &Path,
-    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
-) -> bool {
-    // Unique per attempt: a FIXED name let concurrent extracts race — one's
-    // `remove_file` could delete another's marker between create and `exists()`
-    // (a TOCTOU flip). A per-call token keeps each probe's pair on private paths.
-    let token = unique_probe_token();
-    let lower_name = format!(".fmkv_case_probe_{token}");
-    let lower = dir.join(&lower_name);
-    if std::fs::File::create(&lower).is_err() {
-        return true;
-    }
-    // The upper spelling is the SAME name uppercased end-to-end (hex token
-    // letters `a-f` fold to `A-F`), so on a case-insensitive volume it resolves
-    // to the file just created and on a case-sensitive one it does not exist.
-    let upper = dir.join(lower_name.to_ascii_uppercase());
-    let insensitive = upper.exists();
-    // Retry: a transient delete failure (Windows AV/indexer handle) would leave the
-    // marker in the user's target, failing a re-run's non-empty check.
-    for attempt in 0..PROBE_REMOVE_ATTEMPTS {
-        match remove(&lower) {
-            Ok(()) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(_) if attempt + 1 < PROBE_REMOVE_ATTEMPTS => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            // Still failing: best-effort by design; the probe's answer stands.
-            Err(_) => {}
-        }
-    }
-    insensitive
-}
-
-/// A process-unique, lowercase-hex token for the case-probe filename. No `rand`
-/// dependency: a monotonic counter (distinguishes concurrent same-process
-/// probes) mixed with the pid and a nanosecond clock (distinguishes processes /
-/// runs). Hex digits are case-foldable, which the probe relies on.
-fn unique_probe_token() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{pid:x}_{nanos:x}_{n:x}")
-}
-
 /// Recursively plan the host tree: collect directories to create and files to
 /// extract, sanitizing each component and detecting host-path collisions.
 /// Skips the top-level `AACS/`, `CERTIFICATE/`, and HD DVD's discovered `X!`
@@ -462,11 +395,10 @@ fn plan_tree(
     host_rel: &Path,
     disc_path: &str,
     is_root: bool,
-    case_insensitive: bool,
+    sink: &mut TreeSink,
     unmapped: &[u32],
     files: &mut Vec<PlannedFile>,
     dirs: &mut Vec<PathBuf>,
-    seen_hosts: &mut std::collections::HashMap<String, String>,
 ) -> Result<()> {
     // Same discovery the AACS capture reads use, so the two can't drift.
     let hddvd_aacs_dir = is_root
@@ -477,38 +409,14 @@ fn plan_tree(
             // The "parent" FID (".") has an empty name — skip.
             continue;
         }
-        // Strip AACS / CERTIFICATE at the top level only (a deeper dir of the
-        // same name is content).
-        if is_root
-            && (entry.name.eq_ignore_ascii_case("AACS")
-                || entry.name.eq_ignore_ascii_case("CERTIFICATE")
-                || hddvd_aacs_dir.is_some_and(|d| std::ptr::eq(d, entry)))
-        {
+        // The sink strips AACS / CERTIFICATE at the top level only (a deeper dir of
+        // the same name is content).
+        let aacs_dir = hddvd_aacs_dir.is_some_and(|d| std::ptr::eq(d, entry));
+        if is_root && !TreeSink::keeps_top_level(&entry.name, aacs_dir) {
             continue;
         }
-        let safe = sanitize_component(&entry.name);
-        let child_rel = host_rel.join(&safe);
         let child_disc = format!("{disc_path}/{}", entry.name);
-        // Collision: two distinct disc paths → one host FILE. Case-insensitive folds
-        // `Movie`/`movie`; case-sensitive collides only on EXACT match (else names
-        // coexist). `.partial` shares the final-name namespace, so `X`/`X.partial` collide.
-        let mut register = |key: PathBuf| -> Result<()> {
-            let folded = if case_insensitive {
-                key.to_string_lossy().to_lowercase()
-            } else {
-                key.to_string_lossy().into_owned()
-            };
-            if seen_hosts.insert(folded, child_disc.clone()).is_some() {
-                return Err(Error::DirNameCollision {
-                    host: key.to_string_lossy().into_owned(),
-                });
-            }
-            Ok(())
-        };
-        register(child_rel.clone())?;
-        if !entry.is_dir {
-            register(with_partial_suffix(&child_rel))?;
-        }
+        let child_rel = sink.claim(host_rel, &entry.name, &child_disc, entry.is_dir)?;
         if entry.is_dir {
             dirs.push(child_rel.clone());
             plan_tree(
@@ -518,11 +426,10 @@ fn plan_tree(
                 &child_rel,
                 &child_disc,
                 false,
-                case_insensitive,
+                sink,
                 unmapped,
                 files,
                 dirs,
-                seen_hosts,
             )?;
         } else if unmapped.contains(&entry.meta_lba) {
             files.push(PlannedFile {
@@ -583,20 +490,14 @@ fn unmapped_file(
 // `.partial`; a finished inline file is already renamed).
 fn extract_one_file<S: SectorSource>(
     dec: &mut DecryptingSectorSource<S>,
-    dest: &Path,
+    sink: &TreeSink,
     pf: &PlannedFile,
     total_bytes: u64,
     done_bytes: &mut u64,
     done_unreadable: &mut u64,
     ctx: &crate::ctx::Ctx,
 ) -> Result<(FileResult, bool)> {
-    let final_path = dest.join(&pf.host_rel);
-    let partial_path = with_partial_suffix(&final_path);
-
-    let mut writer = crate::io::WritebackFile::create_with_size_hint(&partial_path, pf.size)
-        .map_err(|e| Error::DirWriteFailed {
-            errno: e.raw_os_error(),
-        })?;
+    let mut file = sink.begin(&pf.host_rel, pf.size)?;
 
     let mut fr = FileResult {
         path: pf.host_rel.clone(),
@@ -609,13 +510,13 @@ fn extract_one_file<S: SectorSource>(
     // files are clear). Write verbatim, trimmed to size.
     if let Some(bytes) = &pf.inline {
         let n = (pf.size as usize).min(bytes.len());
-        write_all(&mut writer, &bytes[..n], &partial_path)?;
+        file.write(&bytes[..n])?;
         fr.bytes_good = n as u64;
         // Data shorter than the declared size: the padded tail is lost, not good.
         let gap = pf.size - n as u64;
         fr.bytes_unreadable = gap;
         *done_unreadable = done_unreadable.saturating_add(gap);
-        finalize_file(writer, &partial_path, pf.size, &final_path)?;
+        file.finish()?;
         fr.complete = true;
         *done_bytes = done_bytes.saturating_add(pf.size);
         report(ctx, *done_bytes, *done_unreadable, total_bytes);
@@ -645,7 +546,7 @@ fn extract_one_file<S: SectorSource>(
             }
             while left > 0 {
                 let n = left.min(buf.len() as u64) as usize;
-                write_all(&mut writer, &buf[..n], &partial_path)?;
+                file.write(&buf[..n])?;
                 written = written.saturating_add(n as u64);
                 *done_bytes = done_bytes.saturating_add(n as u64);
                 left -= n as u64;
@@ -697,7 +598,7 @@ fn extract_one_file<S: SectorSource>(
                 if lost > 0 {
                     ctx.stats.add_skip(lost);
                 }
-                write_all(&mut writer, &buf[..usable], &partial_path)?;
+                file.write(&buf[..usable])?;
                 // Damaged AACS units the reader blanked are unreadable, not good bytes.
                 let unit = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
                 let blanked = (dec.blanked_units() - blanked_before) * unit;
@@ -729,7 +630,7 @@ fn extract_one_file<S: SectorSource>(
         *done_unreadable = done_unreadable.saturating_add(gap);
         *done_bytes = done_bytes.saturating_add(gap);
     }
-    finalize_file(writer, &partial_path, pf.size, &final_path)?;
+    file.finish()?;
     fr.complete = true;
     Ok((fr, false))
 }
@@ -848,56 +749,6 @@ fn read_tries<S: SectorSource>(
     }
 }
 
-fn write_all(writer: &mut crate::io::WritebackFile, data: &[u8], path: &Path) -> Result<()> {
-    writer.write_all(data).map_err(|e| {
-        let _ = std::fs::remove_file(path);
-        Error::DirWriteFailed {
-            errno: e.raw_os_error(),
-        }
-    })
-}
-
-/// Flush, sync, set the final length, and rename `.partial` → final.
-fn finalize_file(
-    mut writer: crate::io::WritebackFile,
-    partial: &Path,
-    size: u64,
-    final_path: &Path,
-) -> Result<()> {
-    writer.sync_all().map_err(|e| Error::DirWriteFailed {
-        errno: e.raw_os_error(),
-    })?;
-    drop(writer);
-    // Set the exact declared length (covers both an over-read final sector and
-    // an under-covered sparse tail).
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(partial)
-        .map_err(|e| Error::DirWriteFailed {
-            errno: e.raw_os_error(),
-        })?;
-    f.set_len(size).map_err(|e| Error::DirWriteFailed {
-        errno: e.raw_os_error(),
-    })?;
-    // `set_len` is a separate kernel op on this second handle; without an fsync
-    // here, a crash between `set_len` and the rename can leave the file at its
-    // pre-truncation length. Sync the new metadata (length) before publishing.
-    f.sync_all().map_err(|e| Error::DirWriteFailed {
-        errno: e.raw_os_error(),
-    })?;
-    drop(f);
-    std::fs::rename(partial, final_path).map_err(|e| Error::DirWriteFailed {
-        errno: e.raw_os_error(),
-    })?;
-    // Durably commit the new dirent: on POSIX filesystems a crash right after a
-    // rename can lose the directory entry even though the rename returned. Best
-    // effort (swallowed on failure); no-op on Windows. Matches `write_atomic`.
-    if let Some(dir) = final_path.parent() {
-        crate::io::fsync::dir(dir);
-    }
-    Ok(())
-}
-
 /// Emit the run's progress as an [`Event::Pass`](crate::Event::Pass).
 fn report(ctx: &crate::ctx::Ctx, done: u64, unreadable: u64, total: u64) {
     let pp = crate::progress::PassProgress {
@@ -919,130 +770,6 @@ fn report(ctx: &crate::ctx::Ctx, done: u64, unreadable: u64, total: u64) {
         located: Default::default(),
     };
     ctx.emit(crate::event::Event::Pass(&pp));
-}
-
-/// Append `.partial` to a path's filename.
-fn with_partial_suffix(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".partial");
-    path.with_file_name(name)
-}
-
-/// Available free bytes on the filesystem holding `dir`, or `None` when the
-/// platform doesn't expose it (the free-space gate is then skipped).
-#[cfg(unix)]
-fn available_space(dir: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let cpath = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    // No safe std API for free space. SAFETY: `statvfs` is plain-old-data (all-zero is
-    // valid); `cpath` is NUL-terminated and outlives the call; `st` is a valid out-pointer.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut st) };
-    if rc != 0 {
-        return None;
-    }
-    // `statvfs` field integer widths differ by platform; cast both to `u64`
-    // for the product (no-op where already `u64` — allow lint for portability).
-    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
-    let avail = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
-    Some(avail)
-}
-
-// Windows has no `statvfs`; queries free space via `GetDiskFreeSpaceExW` (declared directly
-// against kernel32, matching `scsi::windows`) so the free-space gate still runs.
-#[cfg(windows)]
-fn available_space(dir: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-
-    unsafe extern "system" {
-        fn GetDiskFreeSpaceExW(
-            lpDirectoryName: *const u16,
-            lpFreeBytesAvailableToCaller: *mut u64,
-            lpTotalNumberOfBytes: *mut u64,
-            lpTotalNumberOfFreeBytes: *mut u64,
-        ) -> i32;
-    }
-
-    // Wide, NUL-terminated. An interior NUL cannot reach the API, so reject it
-    // rather than silently truncating the path and measuring the wrong volume.
-    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
-    if wide.contains(&0) {
-        return None;
-    }
-    wide.push(0);
-
-    let mut avail: u64 = 0;
-    // FreeBytesAvailableToCaller honours per-user quotas (unix `f_bavail`).
-    // SAFETY: `wide` is NUL-terminated and outlives the call; `avail` is a valid
-    // out-pointer; the two NULL out-params are documented optional.
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut avail,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 { None } else { Some(avail) }
-}
-
-/// Neither unix nor Windows: no way to ask, so the gate is skipped.
-#[cfg(not(any(unix, windows)))]
-fn available_space(_dir: &Path) -> Option<u64> {
-    None
-}
-
-/// Whether a directory exists and contains any entry.
-fn dir_is_non_empty(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false)
-}
-
-// Sanitizes ONE disc-path component: host-illegal chars and control bytes become `_`, trailing
-// dot/space are stripped, a Windows reserved device name gets a `_` prefix. Names that
-// collapse together are caught by the collision check.
-fn sanitize_component(name: &str) -> String {
-    let mapped: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' => '_',
-            c if (c as u32) < 0x20 => '_',
-            c => c,
-        })
-        .collect();
-    let trimmed = mapped.trim_end_matches([' ', '.']);
-    if trimmed.is_empty() {
-        return "_".to_string();
-    }
-    // The device name is the stem before any extension, ignoring trailing spaces.
-    let base = trimmed.split('.').next().unwrap_or(trimmed);
-    if is_windows_reserved(base.trim_end_matches(' ')) {
-        return format!("_{trimmed}");
-    }
-    trimmed.to_string()
-}
-
-/// Whether `base` (the name component before any extension) matches a Windows
-/// reserved device name. These are reserved by the OS regardless of extension
-/// and silently alias a device (e.g. `NUL` discards writes). Case-insensitive.
-pub(super) fn is_windows_reserved(base: &str) -> bool {
-    let up = base.trim_end_matches(' ').to_ascii_uppercase();
-    if matches!(
-        up.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
-    ) {
-        return true;
-    }
-    ["COM", "LPT"].iter().any(|p| {
-        up.strip_prefix(p).is_some_and(|d| {
-            let mut c = d.chars();
-            matches!(
-                (c.next(), c.next()),
-                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
-            )
-        })
-    })
 }
 
 /// DVD VTS group key for a `VTS_xx_*` file name, else `None`. e.g.
@@ -2953,7 +2680,11 @@ mod tests {
         let mut disc = build_disc(root);
         let fs = udf::read_filesystem(&mut disc).unwrap();
         let plan = |disc: &mut MemDisc, ci: bool| {
-            let (mut files, mut dirs, mut seen) = (Vec::new(), Vec::new(), HashMap::new());
+            let (mut files, mut dirs) = (Vec::new(), Vec::new());
+            let out = tempfile::tempdir().unwrap();
+            let mut sink = TreeSink::create(out.path(), true)
+                .unwrap()
+                .with_case_insensitive(ci);
             plan_tree(
                 disc,
                 &fs,
@@ -2961,11 +2692,10 @@ mod tests {
                 Path::new(""),
                 "",
                 true,
-                ci,
+                &mut sink,
                 &[],
                 &mut files,
                 &mut dirs,
-                &mut seen,
             )
             .map(|()| files.len())
         };
@@ -3068,7 +2798,7 @@ mod tests {
         let (mut done, mut bad) = (0u64, 0u64);
         let (fr, halted) = extract_one_file(
             &mut dec,
-            out.path(),
+            &TreeSink::create(out.path(), true).unwrap(),
             &pf,
             len as u64,
             &mut done,
@@ -3303,7 +3033,7 @@ mod tests {
         let (mut done, mut bad) = (0u64, 0u64);
         let (fr, _) = extract_one_file(
             &mut dec,
-            out.path(),
+            &TreeSink::create(out.path(), true).unwrap(),
             &pf,
             len as u64,
             &mut done,
@@ -3485,7 +3215,7 @@ mod tests {
         let (mut done, mut bad) = (0u64, 0u64);
         let (fr, _) = extract_one_file(
             &mut dec,
-            out.path(),
+            &TreeSink::create(out.path(), true).unwrap(),
             &pf,
             size,
             &mut done,
@@ -3509,7 +3239,7 @@ mod tests {
         let (mut done, mut bad) = (0u64, 0u64);
         let (fr, _) = extract_one_file(
             &mut dec,
-            out.path(),
+            &TreeSink::create(out.path(), true).unwrap(),
             &pf,
             5000,
             &mut done,

@@ -3009,7 +3009,7 @@ fn is_plain_file_name(name: &str) -> bool {
     }
     // Matched on the stem with trailing spaces ignored.
     let stem = name.split('.').next().unwrap_or(name);
-    !extract::is_windows_reserved(stem)
+    !crate::io::tree_sink::is_windows_reserved(stem)
 }
 
 impl Disc {

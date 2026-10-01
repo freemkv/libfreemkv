@@ -287,6 +287,23 @@ impl<S: SectorSource> SectorBytes<S> {
     }
 }
 
+impl<S: SectorSource> SectorBytes<S> {
+    /// The stage back, after a head read: the bytes it holds past the read position (up to
+    /// the real length) and the sector its next refill would read.
+    pub(crate) fn into_rest(self) -> (S, Vec<u8>, u32) {
+        let buf_end = self.buf_start + self.buf.len() as u64;
+        let held = self.pos.clamp(self.buf_start, buf_end)..buf_end.min(self.len);
+        let rest = match held.start < held.end {
+            true => self.buf
+                [(held.start - self.buf_start) as usize..(held.end - self.buf_start) as usize]
+                .to_vec(),
+            false => Vec::new(),
+        };
+        let next = (buf_end / SECTOR_BYTES as u64) as u32;
+        (self.src, rest, next)
+    }
+}
+
 impl<S: SectorSource> Read for SectorBytes<S> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.len || out.is_empty() {

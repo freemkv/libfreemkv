@@ -5,7 +5,7 @@
 //! parse on the caller's thread and emitting `PesFrame`s one at a time.
 //!
 //! ```text
-//! Thread A: read + decrypt   (PrefetchedSectorSource / BytePrefetcher)
+//! Thread A: read + decrypt   (PrefetchedSectorSource)
 //! Thread B: M2TS demux       (DemuxThread)
 //! Thread C: codec parse      (this struct, on the caller's thread)
 //! ```

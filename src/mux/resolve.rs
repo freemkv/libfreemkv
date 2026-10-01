@@ -438,7 +438,7 @@ fn open_container(
             let blanked = stage.blanked_counter();
             let reader = crate::sector::stage::SectorBytes::new(stage, len);
             Ok(Box::new(
-                build_m2ts_pipeline(reader, ctx)?.with_blanked(blanked),
+                build_m2ts_pipeline(reader, len, ctx)?.with_blanked(blanked),
             ))
         }
         StreamUrl::Mkv { ref path } => {
@@ -1160,11 +1160,17 @@ fn build_ps_pipeline(
     iso_pipeline_tail(stage, plan, title, ctx).map(|p| p.with_video_stream_id(scan.video_id))
 }
 
-// Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head
-// for FMKV header or PMT/PAT, then wraps a chained reader (head + remainder)
-// in a BytePrefetcher feeding the demux + parse threads.
-fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
-    mut reader: R,
+// Sectors per m2ts read: whole AACS units, ~1 MiB (the stage's byte-view refill).
+const M2TS_READ_SECTORS: u16 = 510;
+
+// Assemble the M2TS file mux pipeline (read -> demux -> parse). Scans the head for an FMKV
+// header or PMT/PAT through the stage's byte view, then hands the stage to the one Read
+// stage and prefetcher, whose chunks follow the head's unconsumed bytes into the demux.
+fn build_m2ts_pipeline(
+    mut reader: crate::sector::stage::SectorBytes<
+        crate::sector::DecryptingSectorSource<Box<dyn SectorSource>>,
+    >,
+    len: u64,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
     use super::meta;
@@ -1211,23 +1217,40 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
         }
     };
 
-    // Chain: any un-consumed head bytes + the remainder of the
-    // reader. The demuxer sees a contiguous M2TS byte stream.
-    let remaining_head = head[head_consumed..].to_vec();
-    let chained: Box<dyn Read + Send> = Box::new(io::Cursor::new(remaining_head).chain(reader));
-
-    let prefetcher = crate::io::byte_prefetcher::BytePrefetcher::new(
-        chained,
-        crate::io::byte_prefetcher::DEFAULT_CHUNK_BYTES,
-        Some(ctx.halt.clone()),
-    )?;
-    let (rx, recycle_tx, shell) = prefetcher.into_channels();
+    // The demuxer sees one contiguous M2TS byte stream: the head's unconsumed bytes and what
+    // the byte view already holds, then the Read stage's chunks from the next sector on.
+    let (stage, rest, next) = reader.into_rest();
+    let mut prefix = head[head_consumed..].to_vec();
+    prefix.extend_from_slice(&rest);
+    let cap = stage.capacity_sectors();
+    let extents = match cap > next {
+        true => vec![crate::disc::Extent {
+            start_lba: next,
+            sector_count: cap - next,
+        }],
+        false => Vec::new(),
+    };
+    let view = crate::sector::prefetched::ByteView {
+        prefix,
+        len: len.saturating_sub(u64::from(next) * crate::consts::SECTOR_BYTES_U64),
+    };
+    let policy = crate::sector::read_stage::ReadPolicy::Image {
+        batch: M2TS_READ_SECTORS,
+    };
+    let (prefetched, read_loss) =
+        crate::sector::PrefetchedSectorSource::file_bytes(stage, extents, policy, ctx, view)
+            .map_err(|e| -> io::Error { e.into() })?;
+    let (rx, recycle_tx, shell) = prefetched.into_channels();
 
     let (parsers, pid_to_track, ts, ps) = build_demux_state(&title, ContentFormat::BdTs);
     let (demux_thread, demux_rx) =
         super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, ctx, ts, ps)
             .map_err(|e| -> io::Error { e.into() })?;
-    Ok(PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track).with_ctx(ctx))
+    Ok(
+        PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
+            .with_ctx(ctx)
+            .with_read_loss(read_loss),
+    )
 }
 
 #[cfg(test)]

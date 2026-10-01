@@ -56,9 +56,8 @@ impl DemuxThread {
     /// returned to `recycle_tx` for the producer to re-fill.
     ///
     /// `producer_shell` is an opaque handle that outlives the demux thread and joins the
-    /// upstream producer on drop. Accepts a shell from
-    /// [`crate::sector::PrefetchedSectorSource::into_channels`] or
-    /// [`crate::io::byte_prefetcher::BytePrefetcher::into_channels`].
+    /// upstream producer on drop: the shell from
+    /// [`crate::sector::PrefetchedSectorSource::into_channels`].
     pub fn spawn_zero_copy<S: Send + 'static>(
         prefetch_rx: Receiver<std::io::Result<Vec<u8>>>,
         recycle_tx: Sender<Vec<u8>>,
