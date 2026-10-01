@@ -528,6 +528,45 @@ mod tests {
         assert_eq!(feature_hint(doc).and_then(|h| h.playlist_id), Some(900));
     }
 
+    /// A full tie (same stream count, same `durs`) keeps the first feature.
+    #[test]
+    fn full_tie_keeps_the_first_feature() {
+        let doc = r#"<dcx><disc>
+            <playlist id="00800" name="feature" durs="7000"><audio id="01" lang="eng"/></playlist>
+            <playlist id="00900" name="feature" durs="7000"><audio id="01" lang="eng"/></playlist>
+        </disc></dcx>"#;
+        assert_eq!(feature_hint(doc).and_then(|h| h.playlist_id), Some(800));
+    }
+
+    /// Stream count outranks duration: a shorter but richer feature wins.
+    #[test]
+    fn stream_count_outranks_duration() {
+        let doc = r#"<dcx><disc>
+            <playlist id="00800" name="feature" durs="9000"><audio id="01" lang="eng"/></playlist>
+            <playlist id="00900" name="feature" durs="7000">
+                <audio id="01" lang="eng"/><audio id="02" lang="fra"/>
+            </playlist>
+        </disc></dcx>"#;
+        assert_eq!(feature_hint(doc).and_then(|h| h.playlist_id), Some(900));
+    }
+
+    /// Attribute values from the untrusted manifest are matched case-insensitively.
+    #[test]
+    fn manifest_attribute_values_are_case_insensitive() {
+        let doc = r#"<dcx><disc>
+            <playlist id="00800" name="FEATURE" durs="7000">
+                <audio id="01" lang="ENG" type="RNIB"/>
+                <subtitle id="01" lang="ENG" type="Feature" form="SDH"/>
+                <subtitle id="02" lang="FRA" type="EMBED"/>
+            </playlist>
+        </disc></dcx>"#;
+        let labels = labels_from_dcx(doc);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0].purpose, LabelPurpose::Descriptive);
+        assert_eq!(labels[1].qualifier, LabelQualifier::Sdh);
+        assert_eq!(labels[2].qualifier, LabelQualifier::Forced);
+    }
+
     /// A stated sub-minute `name="feature"` is a decoy and is skipped in favour
     /// of the real (longer) feature.
     #[test]

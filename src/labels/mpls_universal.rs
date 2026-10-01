@@ -15,6 +15,10 @@ use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::HashSet;
 
+// Retained-label cap: a crafted image can carry tens of thousands of playlists, each
+// naming distinct clips with a full STN table.
+const MAX_MPLS_LABELS: usize = 4096;
+
 /// True iff `/BDMV/PLAYLIST/` exists and contains at least one
 /// `.mpls` file. Cheap directory walk only — no sector reads.
 pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
@@ -54,6 +58,9 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     let mut labels: Vec<StreamLabel> = Vec::new();
     let mut seen: HashSet<super::StreamId> = HashSet::new();
     for name in &mpls_names {
+        if labels.len() >= MAX_MPLS_LABELS {
+            break;
+        }
         let path = format!("/BDMV/PLAYLIST/{}", name);
         let Ok(data) = udf.read_file(reader, &path) else {
             continue;
@@ -123,6 +130,9 @@ fn add_playlist_labels(
                 clip_id: clip_id.clone(),
                 pid: entry.pid,
             };
+            if labels.len() >= MAX_MPLS_LABELS {
+                return;
+            }
             if !seen.insert(stream_id.clone()) {
                 continue;
             }
@@ -156,16 +166,18 @@ fn label_type_for(entry: &crate::mpls::StreamEntry) -> Option<StreamLabelType> {
     match entry.stream_type {
         2 | 5 if entry.coding_type == c::PG => Some(StreamLabelType::Subtitle),
         2 | 5 => Some(StreamLabelType::Audio),
+        // PiP PG is the secondary-video overlay, not a stream of the title.
+        3 if entry.secondary => None,
         3 => Some(StreamLabelType::Subtitle),
         _ => None,
     }
 }
 
 fn has_mpls_extension(name: &str) -> bool {
-    // Case-insensitive ".mpls" suffix (discs use both cases). UDF names are
-    // decoded via from_utf8_lossy, so a multi-byte replacement char can straddle
-    // byte index n-5; `ends_with` on a lowercased copy avoids that boundary panic.
-    name.len() >= 5 && name.to_ascii_lowercase().ends_with(".mpls")
+    // Case-insensitive ".mpls" suffix (discs use both cases). Compared on a lowercased
+    // copy, never by slicing: UDF names are lossily decoded, so byte n-5 may fall
+    // inside a multi-byte replacement char.
+    name.to_ascii_lowercase().ends_with(".mpls")
 }
 
 // Lowercase + trim the raw 3-char ISO 639-2 code; if vocab::lang maps
@@ -363,6 +375,104 @@ mod tests {
     // there are actually caught here.
     fn labels_from_playlists(playlists: &[Playlist]) -> Vec<StreamLabel> {
         build_labels(playlists)
+    }
+
+    // Minimal MPLS: one play item on `clip` whose STN lists one primary audio stream `pid`.
+    fn mpls_bytes(clip: &[u8; 5], pid: u16) -> Vec<u8> {
+        let mut item = Vec::new();
+        item.extend_from_slice(clip);
+        item.extend_from_slice(b"M2TS");
+        item.extend_from_slice(&[0u8; 3]);
+        item.extend_from_slice(&0u32.to_be_bytes());
+        item.extend_from_slice(&(7000u32 * 45000).to_be_bytes());
+        item.extend_from_slice(&[0u8; 12]); // UO mask, misc, still
+        item.extend_from_slice(&[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        item.extend_from_slice(&[3, 0x01]);
+        item.extend_from_slice(&pid.to_be_bytes());
+        item.extend_from_slice(&[5, 0x81, 0x61]);
+        item.extend_from_slice(b"eng");
+        let mut pl = vec![0u8; 6];
+        pl.extend_from_slice(&1u16.to_be_bytes());
+        pl.extend_from_slice(&[0u8; 2]);
+        pl.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        pl.extend_from_slice(&item);
+        let pl_len = (pl.len() - 4) as u32;
+        pl[0..4].copy_from_slice(&pl_len.to_be_bytes());
+        let mut buf = b"MPLS0200".to_vec();
+        buf.extend_from_slice(&40u32.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 28]);
+        buf.extend_from_slice(&pl);
+        buf
+    }
+
+    // The same stream named by two playlists yields one label; an unparseable playlist
+    // between them is skipped, not fatal.
+    #[test]
+    fn parse_dedups_across_playlists_and_skips_a_bad_one() {
+        use crate::udf::fixture::*;
+        let files = vec![
+            file_with("00800.mpls", 32, 8200, mpls_bytes(b"00001", 0x1100), false),
+            file_with("00801.mpls", 33, 8300, b"not an mpls".to_vec(), false),
+            file_with("00802.mpls", 34, 8400, mpls_bytes(b"00001", 0x1100), false),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![DirSpec {
+                    name: "PLAYLIST".to_string(),
+                    icb_lba: 30,
+                    dir_data_lba: 31,
+                    files,
+                    subdirs: vec![],
+                }],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        let got = parse(&mut disc, &udf).expect("labels");
+        assert_eq!(got.labels.len(), 1);
+    }
+
+    #[test]
+    fn playlist_without_play_items_yields_no_labels() {
+        let mut pl = playlist_with(vec![audio_entry(0x1100, 0x81, 6, 1, "eng")]);
+        pl.play_items.clear();
+        assert!(labels_from_playlists(&[pl]).is_empty());
+    }
+
+    #[test]
+    fn pip_pg_streams_are_not_labelled_and_take_no_slot() {
+        let mut pip = pg_entry(0x1B00, "eng");
+        pip.secondary = true;
+        let pl = playlist_with(vec![pg_entry(0x1200, "eng"), pip, pg_entry(0x1201, "fra")]);
+        let labels = labels_from_playlists(&[pl]);
+        let got: Vec<(u16, u16)> = labels
+            .iter()
+            .map(|l| (l.stream_id.as_ref().unwrap().pid, l.stream_number))
+            .collect();
+        assert_eq!(got, [(0x1200, 1), (0x1201, 2)]);
+    }
+
+    #[test]
+    fn retained_labels_are_capped() {
+        let playlists: Vec<Playlist> = (0..MAX_MPLS_LABELS + 50)
+            .map(|i| {
+                playlist_on(
+                    &format!("{i:05}"),
+                    vec![audio_entry(0x1100, 0x81, 6, 1, "eng")],
+                )
+            })
+            .collect();
+        assert_eq!(labels_from_playlists(&playlists).len(), MAX_MPLS_LABELS);
     }
 
     #[test]

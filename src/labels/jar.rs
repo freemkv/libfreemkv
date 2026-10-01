@@ -710,6 +710,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn is_jar_matches_files_with_a_case_insensitive_extension() {
+        let entry = |name: &str, is_dir| crate::udf::DirEntry {
+            name: name.to_string(),
+            is_dir,
+            meta_lba: 0,
+            size: 0,
+            entries: Vec::new(),
+        };
+        assert!(is_jar(&entry("00000.jar", false)));
+        assert!(is_jar(&entry("00000.JAR", false)));
+        assert!(!is_jar(&entry("00000.jar", true)));
+        assert!(!is_jar(&entry("00000.xml", false)));
+    }
+
+    // Directory entries and upper-case `.CLASS` bytecode are never offered as resources.
+    #[test]
+    fn try_each_resource_skips_directory_entries_and_upper_case_class() {
+        use std::io::{Cursor, Write as _};
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.add_directory("assets/", opts).unwrap();
+            w.start_file("com/x/Menu.CLASS", opts).unwrap();
+            w.write_all(MINIMAL_CLASS).unwrap();
+            w.start_file("assets/a.xml", opts).unwrap();
+            w.write_all(b"<a/>").unwrap();
+            w.finish().unwrap();
+        }
+        let mut jar = open(buf);
+        let mut seen: Vec<String> = Vec::new();
+        let mut budget = u64::MAX;
+        let _: Option<()> = try_each_resource(
+            &mut jar,
+            |_| true,
+            1024,
+            &mut budget,
+            |name, _| {
+                seen.push(name.to_string());
+                None
+            },
+        );
+        assert_eq!(seen, ["assets/a.xml"]);
+    }
+
     // An entry the name filter rejects is never inflated: it costs no budget.
     #[test]
     fn unwanted_resources_are_not_inflated() {

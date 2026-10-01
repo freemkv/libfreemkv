@@ -43,8 +43,8 @@ pub struct DiscMetadata {
     pub titles: BTreeMap<String, String>,
     /// First-line / short description, per lang
     pub descriptions: BTreeMap<String, String>,
-    /// Disc N of M, returned whenever both `<di:discNumber>` and
-    /// `<di:numSets>` are present and sane (including `(1, 1)` for a
+    /// Disc N of M, returned whenever both `<di:setNumber>` (or the
+    /// `<di:discNumber>` fallback) and `<di:numSets>` are present and sane (including `(1, 1)` for a
     /// single-disc release); `None` if either is missing or invalid.
     pub disc_number: Option<(u32, u32)>,
 }
@@ -147,11 +147,8 @@ pub(crate) type BdmtFields = (String, Option<String>, Option<(u32, u32)>);
 // could be located.
 pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
     let title = cap_text(extract_title(xml_text)?);
-    // xml::text already returns a trimmed string (see xml::text), so the
-    // description is only filtered for emptiness and XML-fragment noise.
     let description = xml::text(xml_text, "description")
-        .filter(|s| !s.is_empty())
-        .filter(|s| !looks_like_xml(s))
+        .and_then(|s| field_text(&s))
         .map(cap_text);
     let disc_set = extract_disc_set(xml_text);
     Some((title, description, disc_set))
@@ -174,6 +171,66 @@ fn looks_like_xml(s: &str) -> bool {
     })
 }
 
+/// Turn a raw element body into display text: a whole-value CDATA section is
+/// unwrapped, otherwise the predefined and numeric character entities are decoded.
+/// `None` for empty values and for values carrying element markup.
+fn field_text(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let out = match raw
+        .strip_prefix("<![CDATA[")
+        .and_then(|r| r.strip_suffix("]]>"))
+    {
+        Some(inner) if !inner.contains("]]>") => inner.trim().to_string(),
+        Some(_) => return None,
+        None if looks_like_xml(raw) => return None,
+        None => decode_entities(raw),
+    };
+    if out.is_empty() || looks_like_xml(&out) {
+        return None;
+    }
+    Some(out)
+}
+
+// Decode `&amp; &lt; &gt; &quot; &apos; &#N; &#xH;`; anything else is kept verbatim.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').filter(|&e| e <= 10).and_then(|e| {
+            let c = match &rest[1..e] {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                n => {
+                    let n = n.strip_prefix('#')?;
+                    let cp = match n.strip_prefix(['x', 'X']) {
+                        Some(h) => u32::from_str_radix(h, 16).ok()?,
+                        None => n.parse().ok()?,
+                    };
+                    char::from_u32(cp).filter(|c| !c.is_control())?
+                }
+            };
+            Some((c, e + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Try title-bearing element variants in priority order. The `xml`
 /// helpers are case- and namespace-insensitive, so callers pass the
 /// bare local name (no `di:` prefix).
@@ -182,10 +239,7 @@ fn extract_title(xml_text: &str) -> Option<String> {
     // tableOfContents/titleName. xml::text trims, so an empty string here
     // means a genuinely empty element.
     for tag in ["name", "title"] {
-        if let Some(s) = xml::text(xml_text, tag)
-            && !s.is_empty()
-            && !looks_like_xml(&s)
-        {
+        if let Some(s) = xml::text(xml_text, tag).and_then(|s| field_text(&s)) {
             return Some(s);
         }
     }
@@ -193,9 +247,7 @@ fn extract_title(xml_text: &str) -> Option<String> {
     // don't accidentally pick a stray <titleName> from elsewhere.
     if let Some((s, e)) = xml::find_element(xml_text, "tableOfContents", 0) {
         let block = &xml_text[s..e];
-        if let Some(t) = xml::text(block, "titleName")
-            && !t.is_empty()
-        {
+        if let Some(t) = xml::text(block, "titleName").and_then(|s| field_text(&s)) {
             return Some(t);
         }
     }
@@ -254,6 +306,35 @@ mod tests {
         let (t, d, _) = parse_bdmt_xml(&xml).expect("parse");
         assert!(t.len() <= MAX_BDMT_TEXT && !t.is_empty());
         assert!(d.expect("desc").len() <= MAX_BDMT_TEXT);
+    }
+
+    #[test]
+    fn cap_text_cuts_on_a_char_boundary() {
+        let s = format!("aa{}", "\u{4e16}".repeat(400));
+        let t = cap_text(s);
+        assert!(t.len() <= MAX_BDMT_TEXT && t.chars().all(|c| c == 'a' || c == '\u{4e16}'));
+    }
+
+    #[test]
+    fn entities_and_cdata_are_decoded() {
+        let xml = "<d><di:name>Tom &amp; Jerry &#39;s &#x41;</di:name>\
+                   <di:description><![CDATA[a < b & c]]></di:description></d>";
+        let (t, d, _) = parse_bdmt_xml(xml).expect("parse");
+        assert_eq!(t, "Tom & Jerry 's A");
+        assert_eq!(d.as_deref(), Some("a < b & c"));
+    }
+
+    #[test]
+    fn cdata_title_is_unwrapped() {
+        let xml = "<d><di:name><![CDATA[Real]]></di:name></d>";
+        assert_eq!(parse_bdmt_xml(xml).expect("parse").0, "Real");
+    }
+
+    #[test]
+    fn toc_title_name_with_markup_is_rejected() {
+        let xml = "<d><tableOfContents><titleName>Real <di:thumbnail/></titleName>\
+                   </tableOfContents></d>";
+        assert_eq!(parse_bdmt_xml(xml), None);
     }
 
     #[test]

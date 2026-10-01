@@ -455,6 +455,20 @@ mod tests {
     }
 
     #[test]
+    fn collect_skips_entries_with_an_empty_or_missing_label() {
+        let mut audios = BTreeMap::new();
+        let mut subs = BTreeMap::new();
+        for s in [
+            "XTextField,Audio1,,rest",
+            "XTextField,Audio2",
+            "XTextField,Subtitle1, ,rest",
+        ] {
+            collect_textfield(s, &mut audios, &mut subs);
+        }
+        assert!(audios.is_empty() && subs.is_empty());
+    }
+
+    #[test]
     fn collect_ignores_non_textfield_strings() {
         let mut audios = BTreeMap::new();
         let mut subs = BTreeMap::new();
