@@ -815,6 +815,43 @@ fn ptt_srpt_pgc_index(data: &[u8], ptt_offset: usize, ttn: u8) -> Option<usize> 
     pgcn.checked_sub(1)
 }
 
+// Distinct PGCs title `ttn`'s part-of-title entries point at. A title split across
+// PGCs (one per chapter) is read from its first PGC only; the caller warns on > 1.
+fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
+    let entries = || -> Option<Vec<u16>> {
+        let count = be_u16(data, ptt_offset).ok()? as usize;
+        let last_byte = be_u32(data, ptt_offset + 4).ok()? as usize;
+        if ttn as usize > count {
+            return None;
+        }
+        let at = |t: usize| {
+            be_u32(data, ptt_offset + 8 + (t - 1) * 4)
+                .ok()
+                .map(|r| r as usize)
+        };
+        let start = at(ttn as usize)?;
+        let end = if (ttn as usize) < count {
+            at(ttn as usize + 1)?
+        } else {
+            last_byte.checked_add(1)?
+        };
+        let mut pgcns = Vec::new();
+        let mut rel = start;
+        while rel.checked_add(4)? <= end {
+            pgcns.push(be_u16(data, ptt_offset.checked_add(rel)?).ok()?);
+            rel += 4;
+        }
+        Some(pgcns)
+    };
+    if ptt_offset == 0 || ttn == 0 {
+        return 0;
+    }
+    let mut pgcns = entries().unwrap_or_default();
+    pgcns.sort_unstable();
+    pgcns.dedup();
+    pgcns.len()
+}
+
 /// Parse VTS_PGCIT (Program Chain Information Table) to extract titles.
 /// `ptt_offset` is the VTS_PTT_SRPT byte offset (0 = absent).
 pub(crate) fn parse_pgcit(
@@ -853,6 +890,16 @@ pub(crate) fn parse_pgcit(
                 "title points past the end of the PGC table; its title is omitted"
             );
             continue;
+        }
+
+        let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
+        if pgcs > 1 {
+            tracing::warn!(
+                target: "freemkv::scan",
+                vts_title_num,
+                pgcs,
+                "title spans several PGCs; only its first PGC is read, the rest of the title is missing"
+            );
         }
 
         let entry_offset = entries_start + pgc_index * 8;
@@ -2703,6 +2750,28 @@ mod tests {
             d[entry + 2..entry + 4].copy_from_slice(&1u16.to_be_bytes());
         }
         d
+    }
+
+    #[test]
+    fn ptt_srpt_counts_the_pgcs_a_title_spans() {
+        // Title 1: one PTT per PGC (1, 2, 3); title 2: two PTTs in PGC 4.
+        let entries: [(u16, u16); 5] = [(1, 1), (2, 1), (3, 1), (4, 1), (4, 2)];
+        let total = 8 + 2 * 4 + entries.len() * 4;
+        let mut d = vec![0u8; total];
+        d[0..2].copy_from_slice(&2u16.to_be_bytes());
+        d[4..8].copy_from_slice(&((total - 1) as u32).to_be_bytes());
+        d[8..12].copy_from_slice(&16u32.to_be_bytes());
+        d[12..16].copy_from_slice(&28u32.to_be_bytes());
+        for (i, (pgcn, pgn)) in entries.iter().enumerate() {
+            d[16 + i * 4..18 + i * 4].copy_from_slice(&pgcn.to_be_bytes());
+            d[18 + i * 4..20 + i * 4].copy_from_slice(&pgn.to_be_bytes());
+        }
+        assert_eq!(ptt_srpt_pgc_count(&d, 0, 1), 0);
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&d);
+        assert_eq!(ptt_srpt_pgc_count(&buf, 4, 1), 3);
+        assert_eq!(ptt_srpt_pgc_count(&buf, 4, 2), 1);
+        assert_eq!(ptt_srpt_pgc_count(&buf, 4, 3), 0);
     }
 
     /// TTN -> PGC goes through VTS_PTT_SRPT, not "TTN N is PGCIT entry N"; the PGCIT

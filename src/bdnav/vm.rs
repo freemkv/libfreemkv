@@ -226,7 +226,7 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
             // CMP — skip the next command when the compare is false.
             1 => {
                 let truth = match c.cmp_opt {
-                    0x01 => (src & !dst) == 0, // BC: every src bit set in dst
+                    0x01 => (dst & !src) == 0, // BC: every dst bit set in src (hdmv_vm.c)
                     0x02 => dst == src,
                     0x03 => dst != src,
                     0x04 => dst >= src,
@@ -625,12 +625,13 @@ mod tests {
         }
     }
 
-    // libbluray INSN_BC: true iff every bit of src is set in dst (src & ~dst == 0).
+    // libbluray INSN_BC skips the next command when `dst & ~src` is non-zero:
+    // true iff every bit of dst is set in src.
     #[test]
-    fn cmp_bc_tests_src_bits_within_dst() {
-        assert!(cmp_picks_true(0x01, 0b1110, 0b0110));
-        assert!(!cmp_picks_true(0x01, 0b0100, 0b0110));
-        assert!(!cmp_picks_true(0x01, 0b0110, 0b1110));
+    fn cmp_bc_tests_dst_bits_within_src() {
+        assert!(!cmp_picks_true(0x01, 0b1110, 0b0110));
+        assert!(cmp_picks_true(0x01, 0b0100, 0b0110));
+        assert!(cmp_picks_true(0x01, 0b0110, 0b1110));
     }
 
     #[test]

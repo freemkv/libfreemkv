@@ -449,9 +449,11 @@ impl CodecParser for HevcParser {
         // Track whether THIS access unit already carried each param-set type
         // in-band (a redefinition vs codecPrivate). Used after the scan to
         // re-assert the active set at a keyframe the source left bare.
-        let mut emitted_vps = false;
-        let mut emitted_sps = false;
-        let mut emitted_pps = false;
+        // Redefinitions are held aside so they lead the AU in VPS, SPS, PPS order: a
+        // re-asserted PPS ahead of a redefined SPS is dropped by the decoder.
+        let mut inband_vps = Vec::new();
+        let mut inband_sps = Vec::new();
+        let mut inband_pps = Vec::new();
         // Pre-sized to input length plus PARAM_REASSERT_HEADROOM: UHD frames are
         // 150-300 KB and an unsized Vec otherwise reallocs 5-7x per frame; the
         // headroom also lets the keyframe param-set re-assert splice in without reallocating.
@@ -493,20 +495,20 @@ impl CodecParser for HevcParser {
 
                     match nal_type {
                         NAL_VPS => {
-                            emitted_vps |= handle_param_set(
+                            handle_param_set(
                                 &mut self.vps,
                                 &mut self.cur_vps,
                                 &data[nal_start..end],
-                                &mut frame_data,
-                            )
+                                &mut inband_vps,
+                            );
                         }
                         NAL_SPS => {
-                            emitted_sps |= handle_param_set(
+                            handle_param_set(
                                 &mut self.sps,
                                 &mut self.cur_sps,
                                 &data[nal_start..end],
-                                &mut frame_data,
-                            )
+                                &mut inband_sps,
+                            );
                         }
                         NAL_PPS => {
                             // Store the PPS under its own id so a later slice's
@@ -519,12 +521,12 @@ impl CodecParser for HevcParser {
                             {
                                 *slot = hevc_num_extra_slice_header_bits(pps);
                             }
-                            emitted_pps |= handle_param_set(
+                            handle_param_set(
                                 &mut self.pps,
                                 &mut self.cur_pps,
                                 &data[nal_start..end],
-                                &mut frame_data,
-                            )
+                                &mut inband_pps,
+                            );
                         }
                         // Drop Access Unit Delimiters: Matroska HEVC frame data
                         // omits AUDs (the container delimits access units), so
@@ -569,18 +571,31 @@ impl CodecParser for HevcParser {
             }
         }
 
-        if frame_data.is_empty() {
+        if frame_data.is_empty()
+            && inband_vps.is_empty()
+            && inband_sps.is_empty()
+            && inband_pps.is_empty()
+        {
             return Vec::new();
         }
 
         // A player re-applies hvcC param sets at every keyframe; if the active
         // set was redefined mid-title and the source stopped repeating it, the
         // reversion desyncs CABAC. Re-assert in-band at every keyframe (self-heals).
-        if keyframe {
+        // A type this AU redefined goes in-band in its place instead.
+        {
             let mut prefix = Vec::with_capacity(PARAM_REASSERT_HEADROOM);
-            reassert_active(&mut prefix, &self.cur_vps, emitted_vps);
-            reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
-            reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
+            for (inband, cur) in [
+                (&inband_vps, &self.cur_vps),
+                (&inband_sps, &self.cur_sps),
+                (&inband_pps, &self.cur_pps),
+            ] {
+                if !inband.is_empty() {
+                    prefix.extend_from_slice(inband);
+                } else if keyframe {
+                    reassert_active(&mut prefix, cur, false);
+                }
+            }
             if !prefix.is_empty() {
                 // Splice prefix into frame_data in place via PARAM_REASSERT_HEADROOM,
                 // avoiding the extra whole-frame alloc+copy per keyframe the old
@@ -2656,6 +2671,39 @@ mod tests {
     }
 
     // --- parameter-set redefinition (mid-title redefinition bug) ---
+
+    // An IRAP whose SPS changed but whose PPS did not: the re-asserted PPS must follow
+    // the new SPS, or the decoder parses it against the old one and drops it.
+    #[test]
+    fn reasserted_pps_follows_a_redefined_sps() {
+        let mut parser = HevcParser::new();
+        let nal = |t: u8, body: u8| {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.extend_from_slice(&[body, body]);
+            v
+        };
+        let au = |sps: u8| {
+            let mut d = nal(32, 0x11); // VPS
+            d.extend(nal(33, sps)); // SPS
+            d.extend(nal(34, 0x33)); // PPS
+            d.extend(nal(19, 0x44)); // IDR_W_RADL
+            d
+        };
+        let types = |fd: &[u8]| {
+            let (mut t, mut o) = (Vec::new(), 0usize);
+            while o + 4 <= fd.len() {
+                let len = u32::from_be_bytes([fd[o], fd[o + 1], fd[o + 2], fd[o + 3]]) as usize;
+                o += 4;
+                t.push((fd[o] >> 1) & 0x3F);
+                o += len;
+            }
+            t
+        };
+        parser.parse(&make_pes(au(0x22), Some(0)));
+        let f = parser.parse(&make_pes(au(0x23), Some(1)));
+        assert_eq!(types(&f[0].data), vec![32, 33, 34, 19]);
+    }
 
     // A parameter set REDEFINED mid-stream must be emitted INLINE so the decoder re-activates
     // it.

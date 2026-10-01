@@ -188,11 +188,13 @@ pub(crate) fn name_words(s: &str) -> Vec<String> {
     let mut words = Vec::new();
     for part in s.split(|c: char| !c.is_ascii_alphabetic()) {
         let mut word = String::new();
+        // The boundary test reads the source char: `word` holds it lower-cased.
+        let mut prev_lower = false;
         for c in part.chars() {
-            if c.is_ascii_uppercase() && word.chars().last().is_some_and(|l| l.is_ascii_lowercase())
-            {
+            if c.is_ascii_uppercase() && prev_lower {
                 words.push(std::mem::take(&mut word));
             }
+            prev_lower = c.is_ascii_lowercase();
             word.push(c.to_ascii_lowercase());
         }
         if !word.is_empty() {
@@ -1258,6 +1260,15 @@ pub(crate) fn read_jar_file(
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn name_words_splits_camel_case_but_not_all_caps() {
+        assert_eq!(name_words("MAIN_FEATURE"), ["main", "feature"]);
+        assert_eq!(name_words("FEATURE_A"), ["feature", "a"]);
+        assert_eq!(name_words("Feature_TRAILER"), ["feature", "trailer"]);
+        assert_eq!(name_words("MainFeature_A"), ["main", "feature", "a"]);
+        assert_eq!(name_words("FeatureHD"), ["feature", "hd"]);
+    }
 
     fn dir_entry(
         name: &str,

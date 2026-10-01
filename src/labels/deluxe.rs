@@ -22,6 +22,7 @@ use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelT
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     // Real signal is `com/bydeluxe/` in a jar's central directory: a cheap
@@ -548,6 +549,13 @@ fn find_binding_classes(
     const MIN_GETSTATIC: usize = 4;
     let mut candidates: Vec<(String, usize)> = Vec::new();
     jar::for_each_class_budgeted(archive, budget, |class_name, class| {
+        // A master enum's own <clinit> reads every constant into $VALUES; it is not a binding.
+        if class
+            .this_class_name()
+            .is_some_and(|n| master_enum_classes.contains(n))
+        {
+            return;
+        }
         let count = count_master_enum_getstatic(class, master_enum_classes);
         if count >= MIN_GETSTATIC {
             candidates.push((class_name.to_string(), count));
@@ -618,10 +626,10 @@ pub(crate) enum StackVal {
     // Reference to org.bluray.ti.CodingType; field name (e.g.
     // DOLBY_AC3_AUDIO) is the codec id — NOT a Deluxe-internal enum, read
     // straight from the binding constructor's getstatic operand.
-    CodingType(String),
+    CodingType(Rc<str>),
     /// An uninitialized `new` object — popped by the matching
     /// invokespecial.
-    NewObj(String),
+    NewObj(Rc<str>),
     /// Anything we can't model — stack effect tracked but content
     /// opaque. Lets the walker stay in sync past loads/computed
     /// values it doesn't understand.
@@ -898,9 +906,9 @@ impl<'a> BindingDecoder<'a> {
                 let class_name = insn
                     .cp_index()
                     .and_then(|i| self.pool.class_name(i))
-                    .unwrap_or("")
-                    .to_string();
-                self.push(StackVal::NewObj(class_name));
+                    .unwrap_or("");
+                // Rc: `dup` copies the handle, not a name of up to 64 KiB.
+                self.push(StackVal::NewObj(class_name.into()));
             }
             // Word-level stack ops (a long/double is one two-word value).
             POP => drop(self.take_words(insn, 1)),
@@ -943,7 +951,7 @@ impl<'a> BindingDecoder<'a> {
                     return;
                 };
                 let val = if m.class_name == BD_CODING_TYPE_CLASS {
-                    StackVal::CodingType(m.name.to_string())
+                    StackVal::CodingType(m.name.into())
                 } else if let Some((kind, ordinal)) = self.master.resolve(m.class_name, m.name) {
                     StackVal::EnumRef { kind, ordinal }
                 } else {
@@ -988,12 +996,12 @@ impl<'a> BindingDecoder<'a> {
                 // Underneath the args: the object the constructor
                 // operates on. For our pattern it's NewObj(X).
                 match self.stack.pop() {
-                    Some(StackVal::NewObj(name)) if is_init && name == member.class_name => {
+                    Some(StackVal::NewObj(name)) if is_init && *name == *member.class_name => {
                         // Bounded by MAX_CONSTRUCTIONS: an unbounded push here
                         // is ~1 GiB reachable from a crafted `<clinit>`.
                         if !is_container && self.constructions.len() < MAX_CONSTRUCTIONS {
                             self.constructions.push(Construction {
-                                binding_type: name,
+                                binding_type: name.to_string(),
                                 args,
                             });
                         }
@@ -1173,9 +1181,9 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
                 StackVal::CodingType(name) if slot.is_none() => {
                     slot = coding_slot(name);
                     if slot == Some(CodingSlot::Audio) {
-                        coding_type = Some(name.clone());
+                        coding_type = Some(name.to_string());
                     } else if slot.is_none() {
-                        unknown_coding = Some(name.clone());
+                        unknown_coding = Some(name.to_string());
                     }
                 }
                 StackVal::Int(n) => {
@@ -1997,6 +2005,25 @@ mod tests {
         );
     }
 
+    // A master enum's own <clinit> getstatics every constant (old-javac $VALUES):
+    // counting it would set the 40% bar and drop the real binding classes.
+    #[test]
+    fn find_binding_classes_skips_the_master_enum_itself() {
+        let master_classes: HashSet<&str> = ["LanguageEnum"].into_iter().collect();
+        let lang = class_with_getstatic_refs("LanguageEnum", "LanguageEnum", 70);
+        let audio = class_with_getstatic_refs("Audio", "LanguageEnum", 6);
+        let subs = class_with_getstatic_refs("Subs", "LanguageEnum", 8);
+        let zip = build_zip(&[
+            ("LanguageEnum.class", lang),
+            ("Audio.class", audio),
+            ("Subs.class", subs),
+        ]);
+        let mut archive = open_jar(zip);
+        let candidates = find_binding_classes(&mut archive, &master_classes, &mut unbounded());
+        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["Subs.class", "Audio.class"]);
+    }
+
     #[test]
     fn find_binding_classes_empty_master_set_yields_no_candidates() {
         let master_classes: HashSet<&str> = HashSet::new();
@@ -2623,7 +2650,7 @@ mod tests {
         );
         for v in &decoder.stack {
             match v {
-                StackVal::NewObj(name) => assert_eq!(name, "AudioSlot"),
+                StackVal::NewObj(name) => assert_eq!(&**name, "AudioSlot"),
                 other => panic!("expected NewObj(\"AudioSlot\") x2, got {other:?}"),
             }
         }

@@ -212,9 +212,11 @@ impl CodecParser for H264Parser {
         let mut all_vcl_intra = true;
         let mut saw_vcl = false;
         let mut first_pic_done = false;
-        // Did this access unit already carry each param-set type in-band?
-        let mut emitted_sps = false;
-        let mut emitted_pps = false;
+        // In-band redefinitions, held aside so they lead the AU in SPS, PPS order:
+        // a PPS is parsed against the SPS before it, so a re-asserted PPS must
+        // never precede a redefined SPS.
+        let mut inband_sps = Vec::new();
+        let mut inband_pps = Vec::new();
         // Pre-sized to input length plus PARAM_REASSERT_HEADROOM so the mux hot
         // path avoids repeated reallocs and the keyframe param-set re-assert
         // below can be spliced in front without reallocating (see that site).
@@ -232,12 +234,10 @@ impl CodecParser for H264Parser {
                 // in-band on any change. In MVC passthrough these fall through to
                 // the default arm so subset SPS/PPS stay in-band (self-contained AU).
                 NAL_SPS if !mvc => {
-                    emitted_sps |=
-                        handle_param_set(&mut self.sps, &mut self.cur_sps, nal, &mut frame_data)
+                    handle_param_set(&mut self.sps, &mut self.cur_sps, nal, &mut inband_sps);
                 }
                 NAL_PPS if !mvc => {
-                    emitted_pps |=
-                        handle_param_set(&mut self.pps, &mut self.cur_pps, nal, &mut frame_data)
+                    handle_param_set(&mut self.pps, &mut self.cur_pps, nal, &mut inband_pps);
                 }
                 // Access unit delimiters: drop. Matroska H.264 frame data omits
                 // AUDs (the container delimits access units), so keeping them
@@ -278,7 +278,7 @@ impl CodecParser for H264Parser {
             }
         }
 
-        if frame_data.is_empty() {
+        if frame_data.is_empty() && inband_sps.is_empty() && inband_pps.is_empty() {
             return Vec::new();
         }
 
@@ -291,11 +291,17 @@ impl CodecParser for H264Parser {
 
         // Every keyframe is self-contained: re-assert active SPS/PPS in-band so a
         // decoder that dropped the set recovers, and a stale avcC re-apply can't
-        // revert it. Skipped per-type only when this AU already carried it.
-        if keyframe && !mvc {
+        // revert it. A type this AU redefined goes in-band instead, in its place.
+        {
+            let reassert = keyframe && !mvc;
             let mut prefix = Vec::with_capacity(PARAM_REASSERT_HEADROOM);
-            reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
-            reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
+            for (inband, cur) in [(&inband_sps, &self.cur_sps), (&inband_pps, &self.cur_pps)] {
+                if !inband.is_empty() {
+                    prefix.extend_from_slice(inband);
+                } else if reassert {
+                    reassert_active(&mut prefix, cur, false);
+                }
+            }
             if !prefix.is_empty() {
                 // Splice prefix into frame_data in place, sized via
                 // PARAM_REASSERT_HEADROOM to avoid the extra whole-frame alloc+copy
@@ -1742,6 +1748,22 @@ mod tests {
             off += len;
         }
         types
+    }
+
+    // An IDR whose SPS changed but whose PPS did not: the re-asserted PPS must follow
+    // the new SPS (§7.3.2.2: a PPS is parsed against its SPS).
+    #[test]
+    fn reasserted_pps_follows_a_redefined_sps() {
+        let mut parser = H264Parser::new();
+        let au = |sps: u8| {
+            let mut d = vec![0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, sps];
+            d.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0x11]);
+            d.extend_from_slice(&[0x00, 0x00, 0x01, 0x65, 0x10, 0x20]);
+            d
+        };
+        parser.parse(&make_pes(au(0xAA), Some(0)));
+        let f = parser.parse(&make_pes(au(0xAB), Some(90000)));
+        assert_eq!(frame_nal_types(&f[0].data), vec![7, 8, 5]);
     }
 
     #[test]
