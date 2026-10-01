@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Attempts to delete the case-probe marker before giving up.
@@ -30,8 +30,14 @@ impl TreeSink {
         std::fs::create_dir_all(dest).map_err(|e| Error::DirWriteFailed {
             errno: e.raw_os_error(),
         })?;
-        if !force && dir_is_non_empty(dest) {
-            return Err(Error::DirNotEmpty);
+        if !force {
+            // An unlistable folder is not known to be empty: refuse rather than mix trees.
+            let non_empty = dir_is_non_empty(dest).map_err(|e| Error::DirWriteFailed {
+                errno: e.raw_os_error(),
+            })?;
+            if non_empty {
+                return Err(Error::DirNotEmpty);
+            }
         }
         Ok(TreeSink {
             dest: dest.to_path_buf(),
@@ -389,11 +395,9 @@ pub(crate) fn available_space(_dir: &Path) -> Option<u64> {
     None
 }
 
-/// Whether a directory exists and contains any entry.
-pub(crate) fn dir_is_non_empty(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false)
+/// Whether a directory contains any entry; an unlistable one is an error.
+pub(crate) fn dir_is_non_empty(dir: &Path) -> io::Result<bool> {
+    Ok(std::fs::read_dir(dir)?.next().is_some())
 }
 
 #[cfg(test)]
@@ -419,6 +423,23 @@ mod tests {
         f.finish().unwrap();
         assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), b"abc");
         assert!(!dir.path().join("a.bin.partial").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_target_is_refused_not_treated_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("tree");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("old.bin"), b"x").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let listable = std::fs::read_dir(&out).is_ok();
+        let r = TreeSink::create(&out, false);
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !listable {
+            assert!(matches!(r, Err(Error::DirWriteFailed { .. })));
+        }
     }
 
     #[test]
