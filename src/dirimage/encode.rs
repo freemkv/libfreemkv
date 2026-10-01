@@ -221,9 +221,9 @@ fn primary_volume(volume_id: &str, lba: u32, seq: u32) -> Box<[u8; SECTOR]> {
     put_dstring(&mut s[24..56], volume_id);
     s[56..58].copy_from_slice(&1u16.to_le_bytes()); // volume sequence number
     s[58..60].copy_from_slice(&1u16.to_le_bytes()); // max volume sequence number
-    // Level 3 (not 2): permits a file to span multiple extents, which a
-    // large VOB/M2TS on a hybrid video disc needs.
-    s[60..62].copy_from_slice(&3u16.to_le_bytes()); // interchange level
+    // UDF 2.2.2.1: level 2 for a single-volume set, max level 3. Multi-extent files
+    // come from the File Set Descriptor's level 3.
+    s[60..62].copy_from_slice(&2u16.to_le_bytes()); // interchange level
     s[62..64].copy_from_slice(&3u16.to_le_bytes()); // max interchange level
     s[64..68].copy_from_slice(&1u32.to_le_bytes()); // character set list
     s[68..72].copy_from_slice(&1u32.to_le_bytes()); // max character set list
@@ -700,19 +700,20 @@ mod tests {
         assert_eq!(crate::udf::parse_dstring_for_test(&field), "FREEMKV");
     }
 
-    /// L089: the PVD's interchange level must be 3 (not 2) — the level that
-    /// permits a file to span multiple extents, needed for a large VOB/M2TS
-    /// on a hybrid video disc. `file_set` already writes 3 for the same reason.
+    /// The PVD of a single-volume set records interchange level 2 (max 3); the File Set
+    /// Descriptor's level 3 is what permits a file to span multiple extents.
     #[test]
-    fn primary_volume_interchange_level_permits_multi_extent_files() {
+    fn primary_volume_interchange_level_is_two_of_max_three_and_the_file_set_is_three() {
         let pvd = primary_volume("FREEMKV", 16, 0);
         assert_eq!(
             (
                 u16::from_le_bytes([pvd[60], pvd[61]]),
                 u16::from_le_bytes([pvd[62], pvd[63]]),
             ),
-            (3, 3),
-            "PVD interchange level / max must be 3, permitting multi-extent files"
+            (2, 3),
+            "single-volume PVD: interchange level 2, max 3"
         );
+        let fsd = file_set("FREEMKV", 0, 16);
+        assert_eq!(u16::from_le_bytes([fsd[28], fsd[29]]), 3);
     }
 }

@@ -216,7 +216,14 @@ fn walk(dir: &Path, disc_path: &str, depth: u32, entries: &mut usize) -> Result<
                 // A broken symlink or a file gone between readdir and stat: skip it
                 // rather than plan an unreadable extent. Anything else (e.g. perm
                 // denied) is NOT a missing file, so skipping it would drop it silently.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        target: "freemkv::dirimage",
+                        path = %child_path.escape_debug(),
+                        "entry is a dangling link or vanished mid-walk; omitted from the image"
+                    );
+                    continue;
+                }
                 Err(e) => return Err(Error::from(e)),
             };
             if !meta.is_file() {
@@ -676,7 +683,7 @@ pub(super) fn flatten<'a>(dir: &'a DirNode, out: &mut Vec<&'a FileNode>) {
     }
 }
 
-/// Metadata footprint in blocks, for diagnostics.
+/// Metadata footprint in blocks; `plan` bounds it against `MAX_META_BYTES`.
 pub(super) fn metadata_block_count(root: &DirNode) -> u64 {
     2 + metadata_blocks(root)
 }
@@ -904,6 +911,26 @@ mod tests {
             "expected DirImageFanout, got {err:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `walk` counts every entry against `MAX_ENTRIES`: the entry that would pass it is refused.
+    #[test]
+    fn the_entry_cap_refuses_the_entry_past_max_entries() {
+        let dir = std::env::temp_dir().join(format!("fmkv-entries-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.bin"), b"x").unwrap();
+        let mut at_cap = MAX_ENTRIES - 1;
+        assert!(
+            walk(&dir, "/", 0, &mut at_cap).is_ok(),
+            "the last allowed entry"
+        );
+        let mut past = MAX_ENTRIES;
+        assert!(matches!(
+            walk(&dir, "/", 0, &mut past),
+            Err(Error::DirImageTooLarge)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

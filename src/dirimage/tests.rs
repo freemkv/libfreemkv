@@ -201,6 +201,59 @@ fn a_file_past_the_ad_ceiling_reads_back_as_multiple_extents() {
     );
 }
 
+// Past the 30-bit AD ceiling, each extent reads its own bytes of the file: a read at an
+// extent's start, one sector in, and a batch crossing the extent boundary.
+#[test]
+fn a_multi_extent_file_reads_each_extents_own_bytes() {
+    use std::io::Seek;
+    let s = Scratch::new("bigdata");
+    s.file("BDMV/index.bdmv", &pattern(1, 16));
+    s.dir("BDMV/STREAM");
+    let big = s.path().join("BDMV/STREAM/00000.m2ts");
+    let ad = super::layout::MAX_AD_BYTES;
+    let size = ad + 3 * SECTOR as u64;
+    let mut f = std::fs::File::create(&big).unwrap();
+    f.set_len(size).unwrap();
+    for (at, b) in [
+        (0, 0xA1u8),
+        (ad - SECTOR as u64, 0xB2),
+        (ad, 0xC3),
+        (ad + SECTOR as u64, 0xD4),
+    ] {
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&[b]).unwrap();
+    }
+    drop(f);
+
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let exts = fs
+        .file_extents(&mut img, "/BDMV/STREAM/00000.m2ts")
+        .unwrap();
+    assert_eq!(exts.len(), 2);
+    let (first, second) = (exts[0].0, exts[1].0);
+    let head = |img: &mut DirImage, lba: u32, n: u16| {
+        let mut buf = vec![0u8; n as usize * SECTOR];
+        img.read_sectors(lba, n, &mut buf, false).unwrap();
+        (0..n as usize)
+            .map(|i| buf[i * SECTOR])
+            .collect::<Vec<u8>>()
+    };
+    assert_eq!(head(&mut img, first, 1), [0xA1]);
+    assert_eq!(head(&mut img, second, 1), [0xC3]);
+    assert_eq!(
+        head(&mut img, second + 1, 1),
+        [0xD4],
+        "one sector into the extent"
+    );
+    let last = first + exts[0].1 - 1;
+    assert_eq!(
+        head(&mut img, last, 3),
+        [0xB2, 0xC3, 0xD4],
+        "a batch crossing the extent boundary"
+    );
+}
+
 /// An IN-RANGE gap (a sector below capacity that no extent covers) reads as
 /// zeros, not an error — a real image has unrecorded sectors too, and
 /// `read_filesystem` probes fixed LBAs (256, the VDS window) before it knows
@@ -1195,6 +1248,47 @@ fn a_skipped_symlink_does_not_collide_with_a_same_name_file() {
     std::os::unix::fs::symlink("/nonexistent-target", s.path().join("BDMV/STREAM/ A.M2TS"))
         .unwrap();
     DirImage::open(s.path()).expect("dangling symlink is omitted, not a collision");
+}
+
+/// A tree whose metadata exceeds the in-memory ceiling is refused at plan time.
+#[test]
+fn an_oversized_metadata_footprint_is_refused_at_plan_time() {
+    let (s, _, _) = bdmv_scratch();
+    for dir in ["BDMV/STREAM", "BDMV/CLIPINF"] {
+        for i in 0..17_000 {
+            s.file(&format!("{dir}/{i:05}"), b"");
+        }
+    }
+    let err = DirImage::open(s.path()).unwrap_err();
+    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_TOO_LARGE, "got {err}");
+}
+
+/// A symlink to a directory is omitted, and does not take part in the collision check.
+#[cfg(unix)]
+#[test]
+fn a_directory_symlink_is_omitted_from_the_image() {
+    let (s, _, _) = bdmv_scratch();
+    s.file("BDMV/STREAM/A.M2TS", b"x");
+    s.dir("elsewhere");
+    std::os::unix::fs::symlink(
+        s.path().join("elsewhere"),
+        s.path().join("BDMV/STREAM/ A.M2TS"),
+    )
+    .unwrap();
+    let mut img = DirImage::open(s.path()).expect("a directory link is omitted, not a collision");
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let names: Vec<_> = fs
+        .find_dir("/BDMV/STREAM")
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert_eq!(
+        names.iter().filter(|n| n.trim() == "A.M2TS").count(),
+        1,
+        "{names:?}"
+    );
 }
 
 /// A directory whose FID list exceeds the UDF reader's cap is refused at plan time, by name.
