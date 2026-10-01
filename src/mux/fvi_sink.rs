@@ -12,7 +12,7 @@ use crate::mux::videomap::{
     FVI_FORMAT, FVI_GENERATOR, FVI_SECTOR_SIZE, FVI_TIMESCALE, FVI_VERSION, MapHeader,
     PictureRecord, SourceInfo, field_order_label, is_random_access, type_label,
 };
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSink};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -164,12 +164,7 @@ impl FviSink {
     }
 }
 
-impl Stream for FviSink {
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
-        // Write-only sink, per the Stream trait contract.
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
-
+impl PesSink for FviSink {
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
         // Only index pictures of the primary video track. Audio / subtitle /
         // secondary-video frames carry no PictureInfo and are not part of the
@@ -341,19 +336,6 @@ mod tests {
             })
             .collect();
         assert_eq!(n, [0, 1]);
-    }
-
-    #[test]
-    fn sink_is_write_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut sink = FviSink::create(
-            &dir.path().join("x.fvi"),
-            &mpeg2_title(),
-            SourceInfo::default(),
-        )
-        .unwrap();
-        let err = Stream::read(&mut sink).expect_err("read must error");
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]

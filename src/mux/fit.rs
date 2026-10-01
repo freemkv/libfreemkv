@@ -5,7 +5,7 @@
 //! The plan is a PREDICTION made before any frame moves. Exclusions that only the
 //! mux can see (a DVD MPEG-2 multichannel extension track whose packets arrive, an
 //! mp4 track with no sample) are reported post-mux through
-//! [`Stream::undelivered_streams`](crate::pes::Stream::undelivered_streams) and
+//! [`Stream::undelivered_streams`](crate::pes::PesSink::undelivered_streams) and
 //! [`Mp4Sink::final_report`](super::mp4::Mp4Sink::final_report), never here: a
 //! declared-only extension track is never planned out (J23).
 

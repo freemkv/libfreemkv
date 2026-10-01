@@ -240,14 +240,7 @@ impl M2tsStream {
     }
 }
 
-impl crate::pes::Stream for M2tsStream {
-    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
-        // Write-only sink. The m2ts:// read direction is served by
-        // `super::resolve::build_m2ts_pipeline` → `PipelinedPesStream`; routing
-        // reads through this type was removed when the highway became sole ingress.
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
-
+impl crate::pes::PesSink for M2tsStream {
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         if self.excluded.drop_frame(frame.track) {
             return Ok(());
@@ -306,13 +299,6 @@ impl crate::pes::Stream for M2tsStream {
         out.sort_unstable();
         out
     }
-
-    fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {
-        // Write side doesn't have parsers; codec_private flows in
-        // via the title metadata at `create` time and gets baked
-        // into the FMKV header. Nothing to surface back here.
-        None
-    }
 }
 
 #[cfg(test)]
@@ -322,7 +308,7 @@ mod tests {
         Codec, ColorSpace, ContentFormat, DiscTitle, FrameRate, HdrFormat, Resolution,
         Stream as DiscStream, VideoStream,
     };
-    use crate::pes::{PesFrame, Stream as PesStreamTrait};
+    use crate::pes::{PesFrame, PesSink as _};
 
     const VIDEO_PID: u16 = 0x1011;
 

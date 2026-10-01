@@ -1,7 +1,7 @@
 //! Integration tests for the PES stream pipeline.
 
 use libfreemkv::mux::meta::M2tsMeta;
-use libfreemkv::pes::Stream as PesStream;
+use libfreemkv::pes::PesSink;
 use libfreemkv::*;
 use std::io::{Cursor, Write};
 
@@ -300,12 +300,12 @@ fn m2ts_stream_write_read() {
             data: vec![i; 100],
             duration_ns: None,
         };
-        PesStream::write(&mut stream, &frame).unwrap();
+        PesSink::write(&mut stream, &frame).unwrap();
     }
-    PesStream::finish(&mut stream).unwrap();
+    PesSink::finish(&mut stream).unwrap();
 
     // Verify the info is correct
-    let info = PesStream::info(&stream);
+    let info = PesSink::info(&stream);
     assert_eq!(info.streams.len(), 4);
     assert_eq!(info.duration_secs, 7200.0);
 }
@@ -348,17 +348,9 @@ fn m2ts_implements_pes_stream() {
     let output = Cursor::new(Vec::new());
     let stream = M2tsStream::create(output, &dt).unwrap();
 
-    let boxed: Box<dyn PesStream> = Box::new(stream);
+    let boxed: Box<dyn PesSink> = Box::new(stream);
     let meta = boxed.info();
     assert_eq!(meta.streams.len(), 4);
-}
-
-#[test]
-fn m2ts_read_returns_error_on_write_stream() {
-    let dt = sample_disc_title();
-    let output = Cursor::new(Vec::new());
-    let mut stream = M2tsStream::create(output, &dt).unwrap();
-    assert!(PesStream::read(&mut stream).is_err());
 }
 
 // ── DiscTitle::empty ──────────────────────────────────────────
@@ -614,11 +606,11 @@ fn mkvstream_write_finish() {
             data: vec![i; 100],
             duration_ns: None,
         };
-        PesStream::write(&mut stream, &frame).unwrap();
+        PesSink::write(&mut stream, &frame).unwrap();
     }
 
     // finish should not panic even without valid codec data
-    PesStream::finish(&mut stream).unwrap();
+    PesSink::finish(&mut stream).unwrap();
 }
 
 #[test]
@@ -627,7 +619,7 @@ fn mkvstream_meta_sets_title() {
     let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
     let stream = MkvStream::create(writer, &dt, None).unwrap();
 
-    let info = PesStream::info(&stream);
+    let info = PesSink::info(&stream);
     assert_eq!(info.playlist, "Test Movie");
     assert_eq!(info.duration_secs, 7200.0);
     assert_eq!(info.streams.len(), 4);
@@ -678,13 +670,13 @@ fn mkvstream_roundtrip_bdts() {
             data: vec![i; 100],
             duration_ns: None,
         };
-        PesStream::write(&mut stream, &frame).unwrap();
+        PesSink::write(&mut stream, &frame).unwrap();
     }
 
-    PesStream::finish(&mut stream).unwrap();
+    PesSink::finish(&mut stream).unwrap();
 
     // Verify the info is correct
-    let info = PesStream::info(&stream);
+    let info = PesSink::info(&stream);
     assert_eq!(info.streams.len(), 1);
     assert_eq!(info.playlist, "Audio Only");
 }
@@ -756,7 +748,7 @@ fn mkvstream_meta_preserves_all_streams() {
     let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
     let stream = MkvStream::create(writer, &dt, None).unwrap();
 
-    let info = PesStream::info(&stream);
+    let info = PesSink::info(&stream);
     assert_eq!(info.streams.len(), 5, "all 5 streams should be preserved");
     assert_eq!(info.playlist, "Stream Test");
     assert_eq!(info.duration_secs, 3600.0);
@@ -878,7 +870,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         data: es_data,
         duration_ns: None,
     };
-    PesStream::write(&mut stream2, &frame1).unwrap();
+    PesSink::write(&mut stream2, &frame1).unwrap();
 
     // Write a second non-IDR frame
     let frame2 = libfreemkv::pes::PesFrame {
@@ -891,8 +883,8 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         data: es_data2,
         duration_ns: None,
     };
-    PesStream::write(&mut stream2, &frame2).unwrap();
-    PesStream::finish(&mut stream2).unwrap();
+    PesSink::write(&mut stream2, &frame2).unwrap();
+    PesSink::finish(&mut stream2).unwrap();
 
     let data = output2.lock().unwrap().clone().into_inner();
 

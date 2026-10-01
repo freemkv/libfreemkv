@@ -715,11 +715,8 @@ fn bus_map(files: StreamFiles, titles: &[DiscTitle]) -> crate::sector::bus_remov
 
 // Corrects a title's TrueHD channels/sample-rate/Atmos by probing the first decrypted major
 // sync (`reader` must yield DECRYPTED sectors: mux time, not scan).
+#[cfg(test)]
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
-    use crate::mux::codec::truehd::{
-        truehd_channels, truehd_lfe, truehd_sample_rate_hz, truehd_sync_info_from_stream,
-    };
-
     let pids: Vec<u16> = title
         .streams
         .iter()
@@ -770,50 +767,61 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
         let Some(payload) = payloads.get(&a.pid) else {
             continue;
         };
-        // One major-sync read yields channels, sample rate and the Atmos signal.
-        let Some(info) = truehd_sync_info_from_stream(payload) else {
-            continue;
+        correct_truehd_stream(a, payload);
+    }
+}
+
+/// Correct one TrueHD track from its stream bytes (the playlist understates 7.1/Atmos as
+/// 5.1): channels, sample rate and label from the first major sync in `payload`. Returns
+/// `false` when `payload` holds no major sync yet.
+pub(crate) fn correct_truehd_stream(a: &mut AudioStream, payload: &[u8]) -> bool {
+    use crate::mux::codec::truehd::{
+        truehd_channels, truehd_lfe, truehd_sample_rate_hz, truehd_sync_info_from_stream,
+    };
+    // One major-sync read yields channels, sample rate and the Atmos signal.
+    let Some(info) = truehd_sync_info_from_stream(payload) else {
+        return false;
+    };
+
+    // Whether the label is still the plain descriptor (no richer editorial
+    // label). Captured against the CURRENT channels before any correction so
+    // a label promotion only happens when nothing editorial is present.
+    let was_basic =
+        a.label == crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
+
+    // (1) Channels — only when the major sync resolves a different layout.
+    if let Some(count) = truehd_channels(info.format_info) {
+        let lfe = truehd_lfe(info.format_info);
+        let new_ch = match AudioChannels::from_layout(count.saturating_sub(lfe), lfe) {
+            AudioChannels::Unknown => AudioChannels::from_count(count),
+            named => named,
         };
-
-        // Whether the label is still the plain descriptor (no richer editorial
-        // label). Captured against the CURRENT channels before any correction so
-        // a label promotion only happens when nothing editorial is present.
-        let was_basic =
-            a.label == crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
-
-        // (1) Channels — only when the major sync resolves a different layout.
-        if let Some(count) = truehd_channels(info.format_info) {
-            let lfe = truehd_lfe(info.format_info);
-            let new_ch = match AudioChannels::from_layout(count.saturating_sub(lfe), lfe) {
-                AudioChannels::Unknown => AudioChannels::from_count(count),
-                named => named,
-            };
-            if new_ch != AudioChannels::Unknown && new_ch != a.channels {
-                a.channels = new_ch;
-            }
-        }
-
-        // (2) Sample rate — whitelisted rates only; an unknown nibble or a rate
-        // that maps to no enum variant leaves the container value untouched
-        // (never write a wrong SamplingFrequency).
-        if let Some(hz) = truehd_sample_rate_hz(info.format_info) {
-            let new_sr = SampleRate::from_hz(hz);
-            if new_sr != SampleRate::Unknown && new_sr != a.sample_rate {
-                a.sample_rate = new_sr;
-            }
-        }
-
-        // (3) Label — refresh to the corrected channels; promote to the Atmos
-        // form only when the stream carried the basic descriptor (no editorial
-        // Atmos already) AND a 4th substream was positively detected.
-        if was_basic {
-            a.label = if info.is_atmos == Some(true) {
-                crate::labels::generate_audio_label_atmos(&a.codec, &a.channels, a.secondary)
-            } else {
-                crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary)
-            };
+        if new_ch != AudioChannels::Unknown && new_ch != a.channels {
+            a.channels = new_ch;
         }
     }
+
+    // (2) Sample rate — whitelisted rates only; an unknown nibble or a rate
+    // that maps to no enum variant leaves the container value untouched
+    // (never write a wrong SamplingFrequency).
+    if let Some(hz) = truehd_sample_rate_hz(info.format_info) {
+        let new_sr = SampleRate::from_hz(hz);
+        if new_sr != SampleRate::Unknown && new_sr != a.sample_rate {
+            a.sample_rate = new_sr;
+        }
+    }
+
+    // (3) Label — refresh to the corrected channels; promote to the Atmos
+    // form only when the stream carried the basic descriptor (no editorial
+    // Atmos already) AND a 4th substream was positively detected.
+    if was_basic {
+        a.label = if info.is_atmos == Some(true) {
+            crate::labels::generate_audio_label_atmos(&a.codec, &a.channels, a.secondary)
+        } else {
+            crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary)
+        };
+    }
+    true
 }
 
 /// Calculate how many bytes of bad/unreadable data fall within a title's extents.

@@ -246,7 +246,7 @@ fn parity_sinks_from_mkv_mpg_and_fmkv_sources() {
 
 // The frames a source yields (count, a digest over track/pts/keyframe/data), its stream
 // list, and the stream's loss counters; or the code that refused it first.
-fn record_frames(g: &mut Golden, tag: &str, s: &mut dyn crate::pes::Stream) {
+fn record_frames(g: &mut Golden, tag: &str, s: &mut dyn crate::pes::PesSource) {
     let streams: Vec<String> = s
         .info()
         .streams

@@ -388,7 +388,7 @@ pub fn input(
     url: &str,
     opts: &InputOptions,
     ctx: &crate::ctx::Ctx,
-) -> io::Result<Box<dyn crate::pes::Stream>> {
+) -> io::Result<Box<dyn crate::pes::PesSource>> {
     let source = super::source::open_source(url, crate::disc::ScanOptions::default(), ctx)?;
     let mux = super::driver::MuxOptions {
         raw: opts.raw,
@@ -397,15 +397,6 @@ pub fn input(
         ..Default::default()
     };
     super::driver::open_pes(source, opts.keys.as_ref(), &mux, ctx)
-}
-
-// A probed image's reader opened again, for the TrueHD header probe.
-pub(crate) fn reopen_image(path: &Path, folder: bool) -> io::Result<Box<dyn SectorSource>> {
-    Ok(if folder {
-        Box::new(crate::dirimage::DirImage::open(path)?)
-    } else {
-        Box::new(crate::io::file_sector_source::FileSectorSource::open(path)?)
-    })
 }
 
 pub(crate) fn validate_path(path: &Path, scheme: &str) -> crate::error::Result<()> {
@@ -418,7 +409,22 @@ pub(crate) fn open_stream_url(
     url: &str,
     opts: &InputOptions,
     ctx: &crate::ctx::Ctx,
-) -> io::Result<Box<dyn crate::pes::Stream>> {
+) -> io::Result<Box<dyn crate::pes::PesSource>> {
+    let source = open_container(url, opts, ctx)?;
+    if matches!(parse_url(url), StreamUrl::Mpg { .. }) {
+        // A program stream is demuxed here: its title was pruned before the demux.
+        return Ok(source);
+    }
+    // A container's tracks arrive framed: the selection keeps a subset of them (DM5).
+    super::selected::SelectedSource::wrap(source, &opts.selection).map_err(io::Error::from)
+}
+
+// The container or stream input `url`, all of its tracks.
+fn open_container(
+    url: &str,
+    opts: &InputOptions,
+    ctx: &crate::ctx::Ctx,
+) -> io::Result<Box<dyn crate::pes::PesSource>> {
     let parsed = parse_url(url);
     match parsed {
         StreamUrl::M2ts { ref path } => {
@@ -489,19 +495,17 @@ pub(crate) fn open_stream_url(
 
 // Shared body of every IMAGE-level PES source (`iso://`/`dir://`) over the probe's reader
 // and layout (`open_source` scanned it, and judged a folder's AACS verdict from content).
-pub(crate) fn image_input_scanned<S, F>(
+pub(crate) fn image_input_scanned<S>(
     reader: S,
     mut disc: crate::disc::Disc,
     opts: &InputOptions,
-    reopen: F,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
-    F: FnOnce() -> io::Result<S>,
 {
     if let Some(set) = opts.keys.as_ref().filter(|s| s.is_aacs() && !opts.raw) {
-        return keyed_image_input(reader, disc, opts, set, reopen, ctx);
+        return keyed_image_input(reader, disc, opts, set, ctx);
     }
     // Pre-flight decrypt gate: fails fast on a scrambled-but-uncracked CSS disc or an
     // AACS disc with no key set (else muxes garbage). Per-title CSS is checked below.
@@ -517,9 +521,8 @@ where
         }
         .into());
     }
-    // Prune to selected audio/subtitle streams now, pre-`probe_and_remap`,
-    // so all downstream consumers (TrueHD probe, title clone,
-    // `build_iso_pipeline`) see the pruned list. Video always kept.
+    // Prune to selected audio/subtitle streams now, so the title clone and
+    // `build_iso_pipeline` see the pruned list. Video always kept.
     opts.selection
         .apply(&mut disc.titles[idx])
         .map_err(|e| -> io::Error { e.into() })?;
@@ -531,26 +534,6 @@ where
     } else {
         disc.decrypt_keys()
     };
-    // TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1) are corrected by
-    // probing decrypted units via a fresh reader; skipped in --raw (no point).
-    if !opts.raw {
-        match reopen() {
-            Ok(probe) => {
-                let mut dec = crate::sector::DecryptingSectorSource::new(probe, keys.clone());
-                crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
-            }
-            Err(e) => {
-                // Non-fatal: a failed re-open leaves MPLS 7.1/Atmos counts
-                // uncorrected (as 5.1). Log the actual error so it's
-                // diagnosable, not swallowed by a bare `.ok()` -> None.
-                tracing::warn!(
-                    target: "mux",
-                    error = %e,
-                    "TrueHD channel-correction probe re-open failed"
-                );
-            }
-        }
-    }
     let title = disc.titles[idx].clone();
     let format = disc.content_format;
     // Pass `DecryptKeys::None` to the decrypt decorator when --raw is set —
@@ -574,18 +557,16 @@ where
 }
 
 // `image_input` over the rip's key set (KU §3.1, §3.5): the gate is `check_decryptable`,
-// and the TrueHD probe and the mux read through the set's reader. No lookup, no banking.
-fn keyed_image_input<S, F>(
+// and the mux reads through the set's reader. No lookup, no banking.
+fn keyed_image_input<S>(
     reader: S,
     mut disc: crate::disc::Disc,
     opts: &InputOptions,
     set: &crate::keys::KeyRing,
-    reopen: F,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
-    F: FnOnce() -> io::Result<S>,
 {
     if disc.titles.is_empty() {
         return Err(crate::error::Error::NoStreams.into());
@@ -604,15 +585,6 @@ where
     opts.selection
         .apply(&mut disc.titles[idx])
         .map_err(|e| -> io::Error { e.into() })?;
-    match reopen() {
-        Ok(probe) => match set.title_reader(&disc, idx, probe) {
-            Ok(mut dec) => crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]),
-            Err(e) => tracing::warn!(target: "mux", error = %e, "TrueHD probe reader refused"),
-        },
-        Err(e) => {
-            tracing::warn!(target: "mux", error = %e, "TrueHD channel-correction probe re-open failed")
-        }
-    }
     let title = disc.titles[idx].clone();
     build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, ctx)
 }
@@ -622,7 +594,7 @@ fn demux_sink_output(
     dir: &std::path::Path,
     title: &DiscTitle,
     mut opts: super::demux_sink::DemuxOptions,
-) -> io::Result<Box<dyn crate::pes::Stream>> {
+) -> io::Result<Box<dyn crate::pes::PesSink>> {
     if !title.playlist.is_empty() {
         opts.base = title.playlist.clone();
     }
@@ -636,13 +608,60 @@ fn track_sink_output(
     dir: &std::path::Path,
     title: &DiscTitle,
     kind: super::demux_sink::TrackKind,
-) -> io::Result<Box<dyn crate::pes::Stream>> {
+) -> io::Result<Box<dyn crate::pes::PesSink>> {
     let opts = super::demux_sink::DemuxOptions {
         kind_filter: Some(kind),
         export_chapters: false,
         ..Default::default()
     };
     demux_sink_output(dir, title, opts)
+}
+
+/// What an output scheme can take (pipeline design §2.2 sink caps): the one table the mux
+/// consults, instead of matching on schemes in the pump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkCaps {
+    /// The sink consumes PES frames. `false` for `chapters://` and `json://`, which write
+    /// their whole file from the (header-completed) title when opened.
+    pub needs_frames: bool,
+    /// The sink writes a DVD MPEG-2 multichannel extension track (13818-3 `ext_frame`s).
+    /// `mkv://`, `mp4://`, `m2ts://`, `demux://` and `audio://` have no mapping for it.
+    pub carries_mp2_extensions: bool,
+}
+
+impl SinkCaps {
+    /// The caps of the output scheme `url`.
+    pub fn of(url: &StreamUrl) -> SinkCaps {
+        let full = SinkCaps {
+            needs_frames: true,
+            carries_mp2_extensions: true,
+        };
+        match url {
+            StreamUrl::Chapters { .. } | StreamUrl::Json { .. } => SinkCaps {
+                needs_frames: false,
+                ..full
+            },
+            StreamUrl::Mkv { .. }
+            | StreamUrl::Mp4 { .. }
+            | StreamUrl::M2ts { .. }
+            | StreamUrl::Demux { .. }
+            | StreamUrl::Audio { .. } => SinkCaps {
+                carries_mp2_extensions: false,
+                ..full
+            },
+            StreamUrl::Mpg { .. }
+            | StreamUrl::Network { .. }
+            | StreamUrl::Stdio
+            | StreamUrl::Null
+            | StreamUrl::Video { .. }
+            | StreamUrl::Sub { .. }
+            | StreamUrl::Fvi { .. }
+            | StreamUrl::Disc { .. }
+            | StreamUrl::Iso { .. }
+            | StreamUrl::Dir { .. }
+            | StreamUrl::Unknown { .. } => full,
+        }
+    }
 }
 
 /// Open a PES output stream (consumes PES frames).
@@ -656,7 +675,7 @@ pub fn output(
     url: &str,
     title: &crate::disc::DiscTitle,
     source: Option<&super::videomap::SourceInfo>,
-) -> io::Result<Box<dyn crate::pes::Stream>> {
+) -> io::Result<Box<dyn crate::pes::PesSink>> {
     output_with(url, title, source, None)
 }
 
@@ -687,7 +706,7 @@ pub(crate) fn output_with(
     title: &crate::disc::DiscTitle,
     source: Option<&super::videomap::SourceInfo>,
     flush: Option<OutputFlush>,
-) -> io::Result<Box<dyn crate::pes::Stream>> {
+) -> io::Result<Box<dyn crate::pes::PesSink>> {
     let flush = flush.as_ref();
     let parsed = parse_url(url);
     match parsed {
@@ -1187,7 +1206,7 @@ mod tests {
     use super::{build_demux_state, build_iso_pipeline, input, output};
     use crate::decrypt::DecryptKeys;
     use crate::disc::{ContentFormat, DiscTitle, Extent};
-    use crate::pes::Stream as _;
+    use crate::pes::PesSource as _;
     use crate::sector::SectorSource;
     use std::path::PathBuf;
 
@@ -1915,16 +1934,14 @@ mod stop_tests {
     use super::{InputOptions, PipelinedPesStream, image_input_scanned};
 
     // `open_source`'s image probe, then the image stream, over a test reader.
-    fn image_input<S, F>(
+    fn image_input<S>(
         mut reader: S,
         opts: &InputOptions,
-        reopen: F,
         folder: bool,
         ctx: &crate::ctx::Ctx,
     ) -> std::io::Result<PipelinedPesStream>
     where
         S: SectorSource + Send + 'static,
-        F: FnOnce() -> std::io::Result<S>,
     {
         let cap = reader.capacity_sectors();
         let scan = crate::disc::ScanOptions {
@@ -1935,9 +1952,9 @@ mod stop_tests {
         if folder {
             crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)?;
         }
-        image_input_scanned(reader, disc, opts, reopen, ctx)
+        image_input_scanned(reader, disc, opts, ctx)
     }
-    use crate::pes::Stream as _;
+    use crate::pes::PesSource as _;
     use crate::sector::SectorSource;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1992,11 +2009,8 @@ mod stop_tests {
         let s = crate::dirimage::tests::playable_bdmv("stopblocked", false);
         let (src, entered_rx, release_tx) = StallsInPrefetch::new(s.path());
         let ctx = crate::ctx::Ctx::default();
-        let probe = s.path().to_path_buf();
-        // The TrueHD probe reads on this thread, so its copy never stalls.
-        let reopen = move || Ok(StallsInPrefetch::new(&probe).0);
-        let mut stream = image_input(src, &InputOptions::default(), reopen, true, &ctx)
-            .expect("the folder opens");
+        let mut stream =
+            image_input(src, &InputOptions::default(), true, &ctx).expect("the folder opens");
         entered_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("the producer reached its read");

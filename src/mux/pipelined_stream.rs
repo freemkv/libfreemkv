@@ -14,7 +14,7 @@ use super::codec::CodecParser;
 use super::demux_thread::{DemuxBatch, DemuxThread};
 use super::ts::PesPacket;
 use crate::disc::DiscTitle;
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSource};
 use crossbeam_channel::Receiver;
 use std::io;
 
@@ -443,7 +443,7 @@ impl PipelinedPesStream {
     }
 }
 
-impl Stream for PipelinedPesStream {
+impl PesSource for PipelinedPesStream {
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
         if let Some((kind, code)) = &self.failed {
             return Err(io::Error::new(*kind, code.clone()));
@@ -455,14 +455,6 @@ impl Stream for PipelinedPesStream {
             Err(e) => self.failed = Some((e.kind(), e.to_string())),
         }
         read
-    }
-
-    fn write(&mut self, _: &PesFrame) -> io::Result<()> {
-        Err(crate::error::Error::StreamReadOnly.into())
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        Ok(())
     }
 
     fn info(&self) -> &DiscTitle {
@@ -516,10 +508,6 @@ impl Stream for PipelinedPesStream {
             // FLAC/Opus ES carry no init data: keep what the source header supplied.
             .or_else(|| self.title.codec_privates.get(track).cloned().flatten())
     }
-
-    // `lost_bytes` uses the trait default (0): the file-backed highway has no
-    // read-error zero-fill term (resolve/mapfile tracks physical read loss
-    // separately) and the decrypt path no longer reports a decrypt-loss term.
 }
 
 #[cfg(test)]
@@ -1099,7 +1087,7 @@ mod tests {
     // are not lost read bytes: lost_bytes stays the blanked-unit total.
     #[test]
     fn errors_include_frames_the_resync_gate_dropped() {
-        use crate::pes::Stream as _;
+        use crate::pes::PesSource as _;
         let (mut stream, _tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
         stream.resync.push(super::super::resync::ResyncGate::new());
         let gate = stream.resync.last_mut().unwrap();
@@ -1358,25 +1346,6 @@ mod tests {
         assert_eq!(f.data, vec![0x55], "did not stop on the empty first batch");
     }
 
-    /// write() on the read-only pipeline must return StreamReadOnly
-    /// (E9000 → Unsupported) — the highway is input-only.
-    #[test]
-    fn write_is_read_only_error() {
-        let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
-        let frame = PesFrame {
-            discard_padding_ns: 0,
-            coding: None,
-            source: None,
-            track: 0,
-            pts: 0,
-            keyframe: false,
-            data: vec![1],
-            duration_ns: None,
-        };
-        let err = stream.write(&frame).expect_err("write must error");
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    }
-
     fn video_title(secondary: bool) -> DiscTitle {
         let mut t = DiscTitle::empty();
         t.streams.push(crate::disc::Stream::Video(VideoStream {
@@ -1504,14 +1473,6 @@ mod tests {
         }));
         let (stream, _tx) = make_stream(title, vec![], vec![]);
         assert!(stream.headers_ready(), "no video → always ready");
-    }
-
-    /// finish() on the read-only pipeline is a no-op that returns Ok — the
-    /// consumer drives termination via read() returning None.
-    #[test]
-    fn finish_is_ok_noop() {
-        let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
-        assert!(stream.finish().is_ok());
     }
 
     // --- AAC AudioSpecificConfig must exist before headers are finalised ---

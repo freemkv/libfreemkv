@@ -24,7 +24,7 @@ use pstd::{Au, BufferSpec, Mux, Payload, PstdCounters, StreamSpec};
 use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
 use crate::mux::codec::ns_to_ticks;
 use crate::mux::decode_ts::{DtsCounters, DtsDeriver};
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSink};
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
@@ -653,11 +653,7 @@ impl<W: Write + Send> MpgSink<W> {
     }
 }
 
-impl<W: Write + Send> Stream for MpgSink<W> {
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
-
+impl<W: Write + Send> PesSink for MpgSink<W> {
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
         if self.finished {
             return Err(crate::error::Error::StreamClosed.into());

@@ -235,48 +235,21 @@ pub struct TrackTiming {
     pub seek_preroll_ns: u64,
 }
 
-/// A PES frame stream. One trait per format — same type opens for read
-/// (`open()` / `listen()` / `input()`) or write (`create()` / `connect()` /
-/// `output()`). Calling the wrong-direction method returns a typed
-/// `StreamReadOnly` / `StreamWriteOnly` error.
+/// Where PES frames come from (pipeline design §2.2): an opened input's title (its
+/// [`DiscTitle`](crate::disc::DiscTitle) track table) and its frames. Built by
+/// [`crate::input`] / [`crate::open_source`] for every input scheme.
 ///
-/// `Send` is required so streams can move across the producer/consumer
-/// threads in autorip's mux pipeline.
-pub trait Stream: Send {
-    /// Read the next frame, or `Ok(None)` at end of stream. Returns
-    /// `StreamWriteOnly` on a stream opened for writing.
+/// `Send` so a source can move to the mux's producer thread.
+pub trait PesSource: Send {
+    /// Read the next frame, or `Ok(None)` at end of stream.
     fn read(&mut self) -> std::io::Result<Option<PesFrame>>;
 
-    /// Write a frame to the sink. Returns `StreamReadOnly` on a stream
-    /// opened for reading.
-    fn write(&mut self, frame: &PesFrame) -> std::io::Result<()>;
-
-    /// Finalize the stream: flush buffered frames, write any container
-    /// index (MKV `Cues`), close the underlying file/socket. Idempotent
-    /// for read-only streams (no-op).
-    fn finish(&mut self) -> std::io::Result<()>;
-
-    /// End a stream whose producer failed or was stopped before the end of the
-    /// title. Default: [`finish`](Self::finish) (a file keeps its partial output);
-    /// a wire sink overrides it so its receiver sees a failure, not a clean end.
-    fn finish_incomplete(&mut self) -> std::io::Result<()> {
-        self.finish()
-    }
-
-    /// Stream metadata. Stable across reads — implementors must return a
-    /// consistent reference for the lifetime of the stream.
+    /// The title being read: its tracks, codec setup, chapters. Stable across reads.
     fn info(&self) -> &crate::disc::DiscTitle;
 
     /// Container timing metadata, indexed in the same order as `info().streams`.
     fn track_timing(&self, _track: usize) -> TrackTiming {
         TrackTiming::default()
-    }
-
-    /// Set timing before the first frame is written. Carried by `mkv://` and the
-    /// FMKV `network://` / `stdio://` wire; `m2ts://` has no field for it and
-    /// `mp4://` carries no Opus track, so those keep the no-op default.
-    fn set_track_timing(&mut self, _track: usize, _timing: TrackTiming) -> std::io::Result<()> {
-        Ok(())
     }
 
     /// Codec initialization data for a track (SPS/PPS, AC-3 fscod, etc.).
@@ -300,47 +273,66 @@ pub trait Stream: Send {
         Vec::new()
     }
 
+    /// Cumulative count of read errors the source skipped past (zero-filled bad sectors,
+    /// blanked damaged units, frames the resync gate dropped).
+    fn errors(&self) -> u64 {
+        0
+    }
+
+    /// Cumulative bytes actually skipped (zero-filled) past read errors. Distinct from
+    /// [`errors`](Self::errors), which counts skip *events*: one AACS skip covers a whole
+    /// 6144-byte unit, so consumers estimating lost time scale by this byte count.
+    fn lost_bytes(&self) -> u64 {
+        0
+    }
+}
+
+/// Where PES frames go (pipeline design §2.2): a container or wire writer, opened by
+/// [`crate::output`] for every output scheme with the title it writes.
+///
+/// `Send` so a sink can move to the mux's write consumer thread.
+pub trait PesSink: Send {
+    /// Write a frame.
+    fn write(&mut self, frame: &PesFrame) -> std::io::Result<()>;
+
+    /// Finalize: flush buffered frames, write any container index (MKV `Cues`), close the
+    /// underlying file/socket.
+    fn finish(&mut self) -> std::io::Result<()>;
+
+    /// End a sink whose producer failed or was stopped before the end of the title.
+    /// Default: [`finish`](Self::finish) (a file keeps its partial output); a wire sink
+    /// overrides it so its receiver sees a failure, not a clean end.
+    fn finish_incomplete(&mut self) -> std::io::Result<()> {
+        self.finish()
+    }
+
+    /// The title this sink was opened with.
+    fn info(&self) -> &crate::disc::DiscTitle;
+
+    /// Set timing before the first frame is written. Carried by `mkv://` and the
+    /// FMKV `network://` / `stdio://` wire; `m2ts://` has no field for it and
+    /// `mp4://` carries no Opus track, so those keep the no-op default.
+    fn set_track_timing(&mut self, _track: usize, _timing: TrackTiming) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Supply a codec_private that resolved after the header was written (late
     /// AAC config). `Ok(true)` when the sink recorded it; default `Ok(false)`.
     fn set_codec_private(&mut self, _track: usize, _data: &[u8]) -> std::io::Result<bool> {
         Ok(false)
     }
 
-    /// Cumulative count of read errors the stream skipped past (e.g.
-    /// zero-filled bad sectors on a live drive). Default `0` for
-    /// streams that don't have a notion of skip-on-error (file ISO,
-    /// network, stdio, the pipeline highway, etc.); concrete impls
-    /// with adaptive retry (`DiscStream` on the drive single-pass
-    /// path) override.
-    fn errors(&self) -> u64 {
-        0
-    }
-
-    /// Cumulative bytes actually skipped (zero-filled) past read errors.
-    /// Distinct from [`errors`](Self::errors), which counts skip *events*:
-    /// a single AACS skip event covers a whole 6144-byte unit, so
-    /// `errors * 2048` understates real loss. Consumers estimating lost
-    /// video time must scale by this byte count, not the event count.
-    /// Default `0` for streams with no skip-on-error notion; `DiscStream`
-    /// overrides.
-    fn lost_bytes(&self) -> u64 {
-        0
-    }
-
-    /// Sink side: `info().streams` indices this sink PLANNED to carry (and
-    /// accepted frames for) but could not put in the finished container, valid
-    /// after [`finish`](Self::finish). Empty for every sink that writes everything
-    /// it accepted, except `mp4://` (audio with no parseable sample entry, known at
-    /// finish) and `m2ts://` (LPCM BD LPCM can't carry, known from creation).
+    /// `info().streams` indices this sink PLANNED to carry (and accepted frames for) but
+    /// could not put in the finished container, valid after [`finish`](Self::finish).
+    /// Empty for every sink that writes everything it accepted, except `mp4://` (audio
+    /// with no parseable sample entry, known at finish) and `m2ts://` (LPCM BD LPCM can't
+    /// carry, known from creation).
     fn undelivered_streams(&self) -> Vec<usize> {
-        // Without this, such a drop would silently contradict the pre-mux
-        // plan the crate publishes (`mp4_fit_report`); the driver folds
-        // this into `MuxOutcome::undelivered_streams`.
         Vec::new()
     }
 }
 
-/// Wraps any output stream and counts bytes written.
+/// Wraps any output sink and counts bytes written.
 ///
 /// Progress tracking is a CLI concern — streams don't know their size.
 /// Wrap the output with `CountingStream`, then query `bytes_written()`.
@@ -353,12 +345,12 @@ pub trait Stream: Send {
 /// }
 /// ```
 pub struct CountingStream {
-    inner: Box<dyn Stream>,
+    inner: Box<dyn PesSink>,
     written: u64,
 }
 
 impl CountingStream {
-    pub fn new(inner: Box<dyn Stream>) -> Self {
+    pub fn new(inner: Box<dyn PesSink>) -> Self {
         Self { inner, written: 0 }
     }
 
@@ -368,11 +360,7 @@ impl CountingStream {
     }
 }
 
-impl Stream for CountingStream {
-    fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
-        self.inner.read()
-    }
-
+impl crate::pes::PesSink for CountingStream {
     fn write(&mut self, frame: &PesFrame) -> std::io::Result<()> {
         // Only count bytes that actually made it to the inner sink, so a
         // failed write doesn't permanently inflate bytes_written().
@@ -393,39 +381,16 @@ impl Stream for CountingStream {
         self.inner.info()
     }
 
-    fn track_timing(&self, track: usize) -> TrackTiming {
-        self.inner.track_timing(track)
-    }
     fn set_track_timing(&mut self, track: usize, timing: TrackTiming) -> std::io::Result<()> {
         self.inner.set_track_timing(track, timing)
-    }
-
-    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
-        self.inner.codec_private(track)
-    }
-
-    fn headers_ready(&self) -> bool {
-        self.inner.headers_ready()
-    }
-
-    fn config_changes(&self) -> Vec<(usize, u64)> {
-        self.inner.config_changes()
     }
 
     fn set_codec_private(&mut self, track: usize, data: &[u8]) -> std::io::Result<bool> {
         self.inner.set_codec_private(track, data)
     }
 
-    fn errors(&self) -> u64 {
-        self.inner.errors()
-    }
-
     fn undelivered_streams(&self) -> Vec<usize> {
         self.inner.undelivered_streams()
-    }
-
-    fn lost_bytes(&self) -> u64 {
-        self.inner.lost_bytes()
     }
 }
 
@@ -465,11 +430,17 @@ mod tests {
         }
     }
 
-    impl Stream for MockStream {
+    impl crate::pes::PesSource for MockStream {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             Ok(self.read_queue.next())
         }
 
+        fn info(&self) -> &DiscTitle {
+            &self.title
+        }
+    }
+
+    impl crate::pes::PesSink for MockStream {
         fn write(&mut self, frame: &PesFrame) -> std::io::Result<()> {
             self.written.push(frame.clone());
             Ok(())
@@ -499,20 +470,17 @@ mod tests {
         assert!(s.undelivered_streams().is_empty());
     }
 
-    // CountingStream forwards reads/finish and sums bytes over several writes.
+    // CountingStream forwards finish and sums bytes over several writes.
     #[test]
-    fn counting_stream_forwards_reads_and_sums_writes() {
+    fn counting_stream_sums_writes() {
         let frames = vec![make_frame(0, 0), make_frame(1, 1_000)];
         let mut cs = CountingStream::new(Box::new(MockStream::new(frames.clone())));
-        assert_eq!(cs.read().unwrap().expect("frame 0").pts, 0);
-        assert_eq!(cs.read().unwrap().expect("frame 1").pts, 1_000);
-        assert!(cs.read().unwrap().is_none());
         for f in &frames {
             cs.write(f).unwrap();
         }
         assert_eq!(cs.bytes_written(), 6);
         cs.finish().unwrap();
-        let _ = cs.info();
+        let _ = PesSink::info(&cs);
     }
 
     // The 256 MiB frame ceiling applies on write and on read (before any allocation).
@@ -585,16 +553,25 @@ mod tests {
         title: DiscTitle,
     }
 
-    impl Stream for FailingWriteStream {
+    impl crate::pes::PesSource for FailingWriteStream {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             Ok(None)
         }
+
+        fn info(&self) -> &DiscTitle {
+            &self.title
+        }
+    }
+
+    impl crate::pes::PesSink for FailingWriteStream {
         fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
         }
+
         fn finish(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+
         fn info(&self) -> &DiscTitle {
             &self.title
         }

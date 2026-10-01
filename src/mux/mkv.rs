@@ -2375,17 +2375,17 @@ mod tests {
         }
 
         let mut s = crate::mux::mkvstream::MkvStream::open(Cursor::new(data)).unwrap();
-        let f0 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        let f0 = crate::pes::PesSource::read(&mut s).unwrap().unwrap();
         assert!(
             f0.keyframe,
             "BlockGroup I-frame must read back keyframe=true"
         );
-        let f1 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        let f1 = crate::pes::PesSource::read(&mut s).unwrap().unwrap();
         assert!(
             !f1.keyframe,
             "BlockGroup P-frame must read back keyframe=false"
         );
-        let f2 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        let f2 = crate::pes::PesSource::read(&mut s).unwrap().unwrap();
         assert!(
             !f2.keyframe,
             "BlockGroup B-frame must read back keyframe=false"
@@ -2419,12 +2419,12 @@ mod tests {
         let data = muxer.writer.into_inner();
 
         let mut s = crate::mux::mkvstream::MkvStream::open(Cursor::new(data)).unwrap();
-        let f0 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        let f0 = crate::pes::PesSource::read(&mut s).unwrap().unwrap();
         assert!(
             f0.keyframe,
             "SimpleBlock keyframe must read back keyframe=true"
         );
-        let f1 = crate::pes::Stream::read(&mut s).unwrap().unwrap();
+        let f1 = crate::pes::PesSource::read(&mut s).unwrap().unwrap();
         assert!(
             !f1.keyframe,
             "SimpleBlock non-keyframe must read back keyframe=false"
@@ -2482,7 +2482,7 @@ mod tests {
                 data: vec![0xCC; 768],
                 duration_ns: None,
             };
-            crate::pes::Stream::write(&mut s, &f).unwrap();
+            crate::pes::PesSink::write(&mut s, &f).unwrap();
         }
         // Then the true video keyframe — duration-bearing, as MPEG-2 always is,
         // so it is written as a BlockGroup (where the keyframe bit is reserved).
@@ -2496,20 +2496,20 @@ mod tests {
             data: vec![0xAA; 188_459],
             duration_ns: Some(33_366_667),
         };
-        crate::pes::Stream::write(&mut s, &vf).unwrap();
-        crate::pes::Stream::finish(&mut s).unwrap();
+        crate::pes::PesSink::write(&mut s, &vf).unwrap();
+        crate::pes::PesSink::finish(&mut s).unwrap();
         drop(s);
 
         let f = std::fs::File::open(&path).unwrap();
         let mut r = crate::mux::mkvstream::MkvStream::open(f).unwrap();
-        let f0 = crate::pes::Stream::read(&mut r).unwrap().unwrap();
+        let f0 = crate::pes::PesSource::read(&mut r).unwrap().unwrap();
         assert_eq!(f0.track, 0, "first readback frame must be track 0 (video)");
         assert!(
             f0.keyframe,
             "video keyframe written with 5 audio frames ahead of it must read back keyframe=true"
         );
         for i in 0..5 {
-            let audio = crate::pes::Stream::read(&mut r)
+            let audio = crate::pes::PesSource::read(&mut r)
                 .unwrap()
                 .expect("buffered audio must survive");
             assert_eq!(audio.track, 1);
@@ -2517,7 +2517,7 @@ mod tests {
             assert_eq!(audio.data, vec![0xCC; 768]);
         }
         assert!(
-            crate::pes::Stream::read(&mut r).unwrap().is_none(),
+            crate::pes::PesSource::read(&mut r).unwrap().is_none(),
             "trigger frame must not be duplicated"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -5652,7 +5652,7 @@ mod tests {
 
     #[test]
     fn muxed_frames_round_trip_through_reader() {
-        use crate::pes::Stream as _;
+        use crate::pes::PesSource as _;
         let tracks = [make_video_track(), make_audio_track()];
         // Two video keyframes + interleaved audio, all within one cluster.
         let frames = vec![
@@ -7422,7 +7422,7 @@ mod tests {
     // declared A_AC3 / S_HDMV/PGS / V_MPEG2; the mappable tracks keep their frames.
     #[test]
     fn mkv_stream_leaves_out_unmappable_codecs() {
-        use crate::pes::Stream as _;
+        use crate::pes::{PesSink as _, PesSource as _};
         let audio = |codec| {
             crate::disc::Stream::Audio(AudioStream {
                 pid: 0x1100,

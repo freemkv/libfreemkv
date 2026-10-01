@@ -1362,11 +1362,69 @@ impl MkvStream {
     }
 }
 
-impl crate::pes::Stream for MkvStream {
+impl MkvStream {
+    /// The title being read or written (both directions open this type).
+    pub fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
+}
+
+impl crate::pes::PesSource for MkvStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         self.read_parsed()
     }
 
+    fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
+
+    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
+        match &self.mode {
+            Mode::Read(rs) => rs.tracks.timings.get(track).copied().unwrap_or_default(),
+            _ => Default::default(),
+        }
+    }
+
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        if let Mode::Read(ref rs) = self.mode {
+            // `track` is a stream index but `codec_privates` is keyed by Matroska
+            // TrackNumber (RFC 9559 §5.1.4.1.1 requires only non-zero) — translate
+            // through the real map instead of assuming `track + 1`.
+            let track_num = rs.tracks.num_of(track)?;
+            rs.codec_privates
+                .iter()
+                .find(|(tn, _)| *tn == track_num)
+                .map(|(_, data)| data.clone())
+        } else {
+            None
+        }
+    }
+
+    fn headers_ready(&self) -> bool {
+        true // MKV has all headers upfront in the EBML header
+    }
+
+    // Units dropped on read-back: `BlockAdditions` (e.g. a 3D MVC dependent view), Block-less
+    // BlockGroups, malformed blocks and blocks of undecodable tracks. Reported like a disc-read
+    // skip: `0` for the write side / sources with none.
+    fn errors(&self) -> u64 {
+        match self.mode {
+            Mode::Read(ref rs) => rs.additions_dropped,
+            _ => 0,
+        }
+    }
+
+    // Cumulative bytes of the units counted by `errors()`; counts the whole
+    // skipped subtree (payload + EBML framing), an upper bound on the payload.
+    fn lost_bytes(&self) -> u64 {
+        match self.mode {
+            Mode::Read(ref rs) => rs.additions_dropped_bytes,
+            _ => 0,
+        }
+    }
+}
+
+impl crate::pes::PesSink for MkvStream {
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         if matches!(self.mode, Mode::Read(_)) {
             return Err(crate::error::Error::StreamReadOnly.into());
@@ -1452,13 +1510,6 @@ impl crate::pes::Stream for MkvStream {
         self.excluded.seen()
     }
 
-    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
-        match &self.mode {
-            Mode::Read(rs) => rs.tracks.timings.get(track).copied().unwrap_or_default(),
-            _ => Default::default(),
-        }
-    }
-
     fn set_track_timing(
         &mut self,
         track: usize,
@@ -1518,44 +1569,6 @@ impl crate::pes::Stream for MkvStream {
             },
             Mode::Write(WriteMode::Active(m)) => m.set_codec_private(track, data),
             _ => Ok(false),
-        }
-    }
-
-    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
-        if let Mode::Read(ref rs) = self.mode {
-            // `track` is a stream index but `codec_privates` is keyed by Matroska
-            // TrackNumber (RFC 9559 §5.1.4.1.1 requires only non-zero) — translate
-            // through the real map instead of assuming `track + 1`.
-            let track_num = rs.tracks.num_of(track)?;
-            rs.codec_privates
-                .iter()
-                .find(|(tn, _)| *tn == track_num)
-                .map(|(_, data)| data.clone())
-        } else {
-            None
-        }
-    }
-
-    fn headers_ready(&self) -> bool {
-        true // MKV has all headers upfront in the EBML header
-    }
-
-    // Units dropped on read-back: `BlockAdditions` (e.g. a 3D MVC dependent view), Block-less
-    // BlockGroups, malformed blocks and blocks of undecodable tracks. Reported like a disc-read
-    // skip: `0` for the write side / sources with none.
-    fn errors(&self) -> u64 {
-        match self.mode {
-            Mode::Read(ref rs) => rs.additions_dropped,
-            _ => 0,
-        }
-    }
-
-    // Cumulative bytes of the units counted by `errors()`; counts the whole
-    // skipped subtree (payload + EBML framing), an upper bound on the payload.
-    fn lost_bytes(&self) -> u64 {
-        match self.mode {
-            Mode::Read(ref rs) => rs.additions_dropped_bytes,
-            _ => 0,
         }
     }
 }
@@ -2922,7 +2935,7 @@ mod tests {
         assert_eq!(laced, vec![&[1u8, 2][..], &[3, 4][..], &[5, 6][..]]);
     }
     use super::*;
-    use crate::pes::Stream as _;
+    use crate::pes::{PesSink as _, PesSource as _};
     use std::io::Cursor;
 
     /// Length-prefix (4-byte big-endian) each NAL, as the H.264 parser emits.
@@ -7280,7 +7293,7 @@ mod tests {
 
         let stream =
             MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", &chapters, &[]))).unwrap();
-        let got: Vec<(f64, String)> = crate::pes::Stream::info(&stream)
+        let got: Vec<(f64, String)> = crate::pes::PesSource::info(&stream)
             .chapters
             .iter()
             .map(|c| (c.time_secs, c.name.clone()))
@@ -7310,7 +7323,7 @@ mod tests {
 
     fn chapter_names(chapters: &[u8]) -> Vec<String> {
         let s = MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", chapters, &[]))).unwrap();
-        crate::pes::Stream::info(&s)
+        crate::pes::PesSource::info(&s)
             .chapters
             .iter()
             .map(|c| c.name.clone())
@@ -7362,7 +7375,7 @@ mod tests {
             assert!(chapter_names(&c).is_empty());
             assert!(probe_mkv(Cursor::new(bytes.clone())).is_ok());
             let mut s = MkvStream::open(Cursor::new(bytes)).unwrap();
-            assert!(crate::pes::Stream::read(&mut s).unwrap().is_none());
+            assert!(crate::pes::PesSource::read(&mut s).unwrap().is_none());
         }
     }
 
@@ -7379,14 +7392,14 @@ mod tests {
         bytes.extend_from_slice(&tags);
         assert!(probe_mkv(Cursor::new(bytes.clone())).is_ok());
         let s = MkvStream::open(Cursor::new(bytes)).unwrap();
-        assert_eq!(crate::pes::Stream::info(&s).streams.len(), 1);
+        assert_eq!(crate::pes::PesSource::info(&s).streams.len(), 1);
     }
 
     #[test]
     fn read_back_maps_mpeg1_and_av1_codec_ids() {
         for (id, want) in [("V_MPEG1", Codec::Mpeg1), ("V_AV1", Codec::Av1)] {
             let stream = MkvStream::open(Cursor::new(synthetic_mkv(id, &[], &[]))).unwrap();
-            match &crate::pes::Stream::info(&stream).streams[0] {
+            match &crate::pes::PesSource::info(&stream).streams[0] {
                 crate::disc::Stream::Video(v) => assert_eq!(v.codec, want, "{id}"),
                 _ => panic!("expected a video stream"),
             }
@@ -7403,9 +7416,9 @@ mod tests {
         cluster.extend_from_slice(&body);
         let mut stream =
             MkvStream::open(Cursor::new(synthetic_mkv("V_MPEG2", &[], &cluster))).unwrap();
-        assert!(crate::pes::Stream::read(&mut stream).unwrap().is_none());
-        assert_eq!(crate::pes::Stream::errors(&stream), 1);
-        assert!(crate::pes::Stream::lost_bytes(&stream) > 0);
+        assert!(crate::pes::PesSource::read(&mut stream).unwrap().is_none());
+        assert_eq!(crate::pes::PesSource::errors(&stream), 1);
+        assert!(crate::pes::PesSource::lost_bytes(&stream) > 0);
     }
 }
 
@@ -7413,7 +7426,7 @@ mod tests {
 #[cfg(test)]
 mod readback_tests {
     use super::*;
-    use crate::pes::Stream as _;
+    use crate::pes::PesSource as _;
     use std::io::Cursor;
 
     const DISPLAY_UNIT: u32 = 0x54B2;

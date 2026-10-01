@@ -219,7 +219,7 @@ pub use keysource::{DiscInputs, KeySource, read_encrypted_units};
 #[cfg(feature = "rip")]
 pub use pes::PesFrame;
 #[cfg(feature = "rip")]
-pub use pes::Stream as PesStream;
+pub use pes::{PesSink, PesSource};
 
 #[cfg(feature = "rip")]
 pub use mux::DiscStream;
@@ -238,7 +238,7 @@ pub use mux::WriteSeek;
 #[cfg(feature = "rip")]
 pub use mux::{FitReport, SkipReason, fit_report};
 #[cfg(feature = "rip")]
-pub use mux::{InputOptions, StreamUrl, disc_root_of, input, output, parse_url};
+pub use mux::{InputOptions, SinkCaps, StreamUrl, disc_root_of, input, output, parse_url};
 #[cfg(feature = "rip")]
 pub use mux::{Medium, SourceInfo};
 #[cfg(feature = "rip")]

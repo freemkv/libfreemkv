@@ -23,6 +23,7 @@ pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
 pub mod select;
+mod selected;
 pub mod source;
 
 // Internal-only modules (referenced only via `crate::mux::…`; not public API).
@@ -102,7 +103,7 @@ pub use mpg::MpgSink;
 pub use network::{NetworkStream, is_blocked_ip};
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
-pub use resolve::{InputOptions, StreamUrl, disc_root_of, input, output, parse_url};
+pub use resolve::{InputOptions, SinkCaps, StreamUrl, disc_root_of, input, output, parse_url};
 pub use stdio::StdioStream;
 
 use std::io::{Seek, Write};

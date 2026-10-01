@@ -2070,7 +2070,7 @@ impl SectorSource for RecoveryCount {
 /// never zero-filled as a bad sector.
 #[test]
 fn live_stream_stops_on_an_unkeyed_piece_without_recovery() {
-    use crate::pes::Stream;
+    use crate::pes::PesSource;
     for skip in [true, false] {
         let (fx, set, src) = lazy_b(&[K1]);
         let recovery = Arc::new(Mutex::new(0u32));
@@ -2239,7 +2239,7 @@ fn single_unit_rule_keys_only_pieces_the_proven_key_opens() {
 /// DecryptFailed handled as bad media, in both skip modes.
 #[test]
 fn keyless_set_over_overlapping_extents_stops_e7022() {
-    use crate::pes::Stream;
+    use crate::pes::PesSource;
     let fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
     let a = fx.file(0).0;
     let mut title = fx.disc.titles[0].clone();

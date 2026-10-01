@@ -17,11 +17,13 @@ use crate::event::Event;
 use crate::halt::Halt;
 use crate::io::FlushProgress;
 use crate::io::pipeline::{Flow, Pipeline, Sink, WRITE_PIPELINE_DEPTH};
-use crate::pes::{CountingStream, PesFrame, Stream};
+use crate::pes::{CountingStream, PesFrame, PesSink, PesSource};
 use crate::sector::{FileSectorSource, SectorSource};
 use crate::session::DiscSession;
 
-use super::resolve::{InputOptions, StreamUrl, build_iso_pipeline, output, output_with, parse_url};
+use super::resolve::{
+    InputOptions, SinkCaps, StreamUrl, build_iso_pipeline, output, output_with, parse_url,
+};
 #[cfg(test)]
 use super::source::ScannedTitle;
 use super::source::{Origin, Source};
@@ -200,7 +202,7 @@ pub(crate) fn open_pes(
     keys: Option<&crate::keys::KeyRing>,
     opts: &MuxOptions,
     ctx: &Ctx,
-) -> std::io::Result<Box<dyn Stream>> {
+) -> std::io::Result<Box<dyn PesSource>> {
     let set = keys.filter(|s| s.is_aacs() && !opts.raw);
     let idx = opts.title_index;
     let input_opts = || InputOptions {
@@ -211,21 +213,12 @@ pub(crate) fn open_pes(
     };
     match source.origin {
         Origin::Stream { url } => super::resolve::open_stream_url(&url, &input_opts(), ctx),
-        Origin::Image {
-            path,
-            folder,
+        Origin::Image { reader, disc, .. } => Ok(Box::new(super::resolve::image_input_scanned(
             reader,
             disc,
-        } => {
-            let reopen = move || super::resolve::reopen_image(&path, folder);
-            Ok(Box::new(super::resolve::image_input_scanned(
-                reader,
-                disc,
-                &input_opts(),
-                reopen,
-                ctx,
-            )?))
-        }
+            &input_opts(),
+            ctx,
+        )?)),
         Origin::Prescanned { path, title: t } => {
             let (title, format) = (t.title, t.format);
             let keyless = keyless_ring(&title, format, set, opts);
@@ -308,7 +301,7 @@ fn session_pes(
     set: Option<&crate::keys::KeyRing>,
     opts: &MuxOptions,
     ctx: &Ctx,
-) -> std::io::Result<Box<dyn Stream>> {
+) -> std::io::Result<Box<dyn PesSource>> {
     let idx = opts.title_index;
     let path = session.device_path().to_string();
     let not_ready = || Error::DeviceNotReady { path: path.clone() };
@@ -375,7 +368,7 @@ fn live_unkeyed(
     keys: DecryptKeys,
     opts: &MuxOptions,
     ctx: &Ctx,
-) -> std::io::Result<Box<dyn Stream>> {
+) -> std::io::Result<Box<dyn PesSource>> {
     let mut stream = crate::mux::DiscStream::new(
         reader,
         title,
@@ -420,7 +413,7 @@ fn live_keyed(
     set: &crate::keys::KeyRing,
     opts: &MuxOptions,
     ctx: &Ctx,
-) -> std::io::Result<Box<dyn Stream>> {
+) -> std::io::Result<Box<dyn PesSource>> {
     let stream = crate::mux::DiscStream::new(
         reader,
         title,
@@ -518,7 +511,7 @@ fn mux_run_completed(interrupted: bool, finalize_failed: bool, halt_cancelled: b
 // Split out so it can be unit-tested against a synthetic Stream (the
 // injection seam), independent of which constructor built `stream`.
 fn drive_mux(
-    mut stream: Box<dyn Stream>,
+    mut stream: Box<dyn PesSource>,
     dest_url: &str,
     ctx: &Ctx,
     playlist_name: Option<&str>,
@@ -532,13 +525,28 @@ fn drive_mux(
         out_title.playlist = name.to_string();
     }
 
-    // ── chapters:// / json:// short-circuit — BEFORE the header pump/gate ──
+    let caps = SinkCaps::of(&parse_url(dest_url));
+    let mut buffered: Vec<PesFrame> = Vec::new();
+    let mut buffered_bytes: usize = 0;
+
+    // ── Metadata sinks (`needs_frames = false`) — BEFORE the header pump/gate ──
     // These sinks write their whole file at `output()` time and consume no PES
-    // frames — running the header gate first could false-fail a metadata export.
-    if matches!(
-        parse_url(dest_url),
-        StreamUrl::Chapters { .. } | StreamUrl::Json { .. }
-    ) {
+    // frames — running the header gate first could false-fail a metadata export. The
+    // title's TrueHD labels are still completed from the stream first.
+    if !caps.needs_frames {
+        let done = complete_truehd(
+            &mut *stream,
+            &mut buffered,
+            &mut buffered_bytes,
+            &mut out_title.streams,
+            halt,
+        )?;
+        if !done {
+            return Ok(MuxOutcome::stopped_before_output(
+                stream.errors(),
+                stream.lost_bytes(),
+            ));
+        }
         let mut sink = CountingStream::new(output(dest_url, &out_title, source)?);
         ctx.emit(Event::OutputOpened { title: &out_title });
         sink.finish()?;
@@ -557,8 +565,6 @@ fn drive_mux(
     // ── Header pump ── Buffer frames until every video (and AAC) track's
     // codec_private has resolved; MKV can't write a track header without codec init data.
     // The loop breaks on EOF/None too, so the gate below re-checks.
-    let mut buffered: Vec<PesFrame> = Vec::new();
-    let mut buffered_bytes: usize = 0;
     while !stream.headers_ready() {
         if halt.is_cancelled() {
             return Ok(MuxOutcome::stopped_before_output(
@@ -621,9 +627,23 @@ fn drive_mux(
         return Err(Error::MkvInvalid.into());
     }
 
-    // Assemble the output title now that codec_privates have resolved.
+    // Assemble the output title now that codec_privates have resolved, its TrueHD
+    // labels completed from the stream (BUG-6).
     let info = stream.info().clone();
     out_title.streams = info.streams.clone();
+    let done = complete_truehd(
+        &mut *stream,
+        &mut buffered,
+        &mut buffered_bytes,
+        &mut out_title.streams,
+        halt,
+    )?;
+    if !done {
+        return Ok(MuxOutcome::stopped_before_output(
+            stream.errors(),
+            stream.lost_bytes(),
+        ));
+    }
     out_title.size_bytes = info.size_bytes;
     out_title.codec_privates = (0..info.streams.len())
         .map(|i| stream.codec_private(i))
@@ -663,7 +683,7 @@ fn drive_mux(
     // mapping never writes an MPEG-2 extension track (reported lost only once its packets
     // arrive); the opened title lists only what will be written.
     let mut refused = output_stream.undelivered_streams();
-    if drops_mp2_extensions(dest_url) {
+    if !caps.carries_mp2_extensions {
         refused.extend((out_title.streams.iter().enumerate()).filter_map(|(i, s)| {
             matches!(s, crate::disc::Stream::Audio(a) if a.is_mp2_extension()).then_some(i)
         }));
@@ -868,7 +888,7 @@ fn lock_late(q: &LateConfigs) -> std::sync::MutexGuard<'_, Vec<(usize, Vec<u8>)>
 }
 
 // Move tracks whose codec_private has now resolved from `pending` to the queue.
-fn collect_late_configs(stream: &dyn Stream, pending: &mut Vec<usize>, out: &LateConfigs) {
+fn collect_late_configs(stream: &dyn PesSource, pending: &mut Vec<usize>, out: &LateConfigs) {
     pending.retain(|&track| match stream.codec_private(track) {
         Some(cp) => {
             lock_late(out).push((track, cp));
@@ -878,17 +898,66 @@ fn collect_late_configs(stream: &dyn Stream, pending: &mut Vec<usize>, out: &Lat
     });
 }
 
-// Sinks that never write a DVD MPEG-2 multichannel extension track (no mapping for 13818-3
-// `ext_frame`s); the FMKV wire (network://, stdio://) carries it.
-fn drops_mp2_extensions(dest_url: &str) -> bool {
-    matches!(
-        parse_url(dest_url),
-        StreamUrl::Mkv { .. }
-            | StreamUrl::Mp4 { .. }
-            | StreamUrl::M2ts { .. }
-            | StreamUrl::Demux { .. }
-            | StreamUrl::Audio { .. }
-    )
+// Bytes of frames read past the header gate while looking for TrueHD major syncs: about
+// the 8 MiB of title start the playlist-era probe read.
+const TRUEHD_PROBE_BYTES: usize = 8 * 1024 * 1024;
+// Bytes of one TrueHD track kept for the major-sync parse.
+const TRUEHD_PROBE_TRACK_BYTES: usize = 1024 * 1024;
+
+// Header completion (BUG-6): a playlist labels a 7.1/Atmos TrueHD track 5.1, so read on
+// (into `buffered`) until each TrueHD track in `streams` shows its first major sync, or
+// for at most `TRUEHD_PROBE_BYTES`, and label the track from it. Every source passes here.
+// `Ok(false)` when a Stop ended the read.
+fn complete_truehd(
+    stream: &mut dyn PesSource,
+    buffered: &mut Vec<PesFrame>,
+    buffered_bytes: &mut usize,
+    streams: &mut [crate::disc::Stream],
+    halt: &Halt,
+) -> std::io::Result<bool> {
+    use crate::disc::{Codec, Stream as Track};
+    let mut pending: Vec<usize> = (0..streams.len())
+        .filter(|&i| matches!(&streams[i], Track::Audio(a) if matches!(a.codec, Codec::TrueHd)))
+        .collect();
+    let mut payload: std::collections::HashMap<usize, Vec<u8>> = Default::default();
+    let start = *buffered_bytes;
+    let mut seen = 0;
+    while !pending.is_empty() {
+        while seen < buffered.len() && !pending.is_empty() {
+            let f = &buffered[seen];
+            seen += 1;
+            let Some(pos) = pending.iter().position(|&t| t == f.track) else {
+                continue;
+            };
+            let buf = payload.entry(f.track).or_default();
+            if buf.len() >= TRUEHD_PROBE_TRACK_BYTES {
+                continue;
+            }
+            buf.extend_from_slice(&f.data);
+            let has_sync = f.data.windows(4).any(|w| w == [0xF8, 0x72, 0x6F, 0xBA]);
+            if let (true, Track::Audio(a)) = (has_sync, &mut streams[f.track])
+                && crate::disc::correct_truehd_stream(a, buf)
+            {
+                pending.remove(pos);
+            }
+        }
+        if pending.is_empty() || *buffered_bytes - start > TRUEHD_PROBE_BYTES {
+            break;
+        }
+        if halt.is_cancelled() {
+            return Ok(false);
+        }
+        match stream.read() {
+            Ok(Some(f)) => {
+                *buffered_bytes = buffered_bytes.saturating_add(f.data.len());
+                buffered.push(f);
+            }
+            Ok(None) => break,
+            Err(e) if crate::error::is_halt(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
 }
 
 // The sink for `dest_url`; a test may substitute its own (thread-local seam).
@@ -897,7 +966,7 @@ fn open_output(
     title: &DiscTitle,
     source: Option<&SourceInfo>,
     flush: super::resolve::OutputFlush<'_>,
-) -> std::io::Result<Box<dyn Stream>> {
+) -> std::io::Result<Box<dyn PesSink>> {
     #[cfg(test)]
     if let Some(sink) = tests::TEST_SINK.with(|s| s.borrow_mut().take()) {
         return Ok(sink);
@@ -982,7 +1051,7 @@ mod tests {
 
     thread_local! {
         // A sink `drive_mux` opens instead of its URL's, once (see `open_output`).
-        pub(super) static TEST_SINK: std::cell::RefCell<Option<Box<dyn Stream>>> =
+        pub(super) static TEST_SINK: std::cell::RefCell<Option<Box<dyn PesSink>>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -995,10 +1064,17 @@ mod tests {
         log: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
-    impl Stream for EndSpy {
+    impl crate::pes::PesSource for EndSpy {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             Ok(None)
         }
+
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+    }
+
+    impl crate::pes::PesSink for EndSpy {
         fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
             self.writes += 1;
             if self.fail_at.is_some_and(|n| self.writes >= n) {
@@ -1006,14 +1082,17 @@ mod tests {
             }
             Ok(())
         }
+
         fn finish(&mut self) -> std::io::Result<()> {
             self.log.lock().unwrap().push("finish");
             Ok(())
         }
+
         fn finish_incomplete(&mut self) -> std::io::Result<()> {
             self.log.lock().unwrap().push("finish_incomplete");
             Ok(())
         }
+
         fn info(&self) -> &DiscTitle {
             &self.info
         }
@@ -1182,7 +1261,7 @@ mod tests {
         }
     }
 
-    impl Stream for FakeStream {
+    impl crate::pes::PesSource for FakeStream {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             if let Some((halt, after)) = &self.cancel_halt
                 && self.reads >= *after
@@ -1212,20 +1291,31 @@ mod tests {
             }
             Ok(f)
         }
-        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn finish(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+
         fn info(&self) -> &DiscTitle {
             &self.info
         }
+
         fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {
             self.codec_private_ready.then(|| vec![1, 2, 3])
         }
+
         fn headers_ready(&self) -> bool {
             self.reads >= self.headers_ready_after || (self.ready_on_eof && self.eof_seen)
+        }
+    }
+
+    impl crate::pes::PesSink for FakeStream {
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn info(&self) -> &DiscTitle {
+            &self.info
         }
     }
 
@@ -1245,6 +1335,77 @@ mod tests {
             if let Event::OutputOpened { .. } = e {
                 self.opened.store(true, Ordering::SeqCst);
             }
+        }
+    }
+
+    // BUG-6: a playlist labels a 7.1/Atmos TrueHD track 5.1 at 48 kHz. Every source's mux
+    // completes the label from the track's first major sync before the output opens, and a
+    // metadata sink (no frames) still gets the completed title.
+    #[test]
+    fn truehd_labels_complete_from_the_stream_for_every_sink() {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        // format_info: top nibble 0x1 -> 96 kHz; low 13 bits 0x1F -> 7.1 (8ch); 4 substreams.
+        let mut es = vec![0u8; 24];
+        es[0] = 0xAA;
+        es[1] = 0xBB;
+        es[2..6].copy_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        es[6..10].copy_from_slice(&((0x1u32 << 28) | 0x1F).to_be_bytes());
+        es[2 + 16] = 4 << 4;
+        let opened_with = |dest: &str| {
+            let mut s = FakeStream::new(0);
+            s.info.streams = vec![Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::TrueHd,
+                channels: AudioChannels::Surround51,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: crate::labels::generate_audio_label(
+                    &Codec::TrueHd,
+                    &AudioChannels::Surround51,
+                    false,
+                ),
+            })];
+            for pts in 0..3 {
+                s.frames.push_back(PesFrame {
+                    discard_padding_ns: 0,
+                    track: 0,
+                    pts,
+                    keyframe: true,
+                    data: es.clone(),
+                    duration_ns: None,
+                    source: None,
+                    coding: None,
+                });
+            }
+            let seen: Arc<std::sync::Mutex<Option<DiscTitle>>> = Arc::default();
+            let got = seen.clone();
+            let ctx = Ctx::default().with_events(Arc::new(move |e: &Event<'_>| {
+                if let Event::OutputOpened { title } = e {
+                    *got.lock().unwrap() = Some((*title).clone());
+                }
+            }));
+            let _ = drive_mux(Box::new(s), dest, &ctx, None, None);
+            let t = seen.lock().unwrap().take().expect("output opened");
+            let Stream::Audio(a) = &t.streams[0] else {
+                panic!("audio")
+            };
+            (a.channels, a.sample_rate, a.label.clone())
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let json = format!("json://{}", dir.path().join("t.json").display());
+        let atmos = crate::labels::generate_audio_label_atmos(
+            &Codec::TrueHd,
+            &AudioChannels::Surround71,
+            false,
+        );
+        for dest in ["null://", json.as_str()] {
+            assert_eq!(
+                opened_with(dest),
+                (AudioChannels::Surround71, SampleRate::S96, atmos.clone()),
+                "{dest}"
+            );
         }
     }
 
@@ -2023,26 +2184,36 @@ mod tests {
         }
     }
 
-    impl Stream for LateAacStream {
+    impl crate::pes::PesSource for LateAacStream {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             let f = self.frames.pop_front();
             self.aac_seen |= f.as_ref().is_some_and(|f| f.track == 1);
             Ok(f)
         }
-        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn finish(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+
         fn info(&self) -> &DiscTitle {
             &self.info
         }
+
         fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
             match track {
                 0 => Some(vec![1, 0x64, 0, 0x28, 0xFF, 0xE0, 0, 0]),
                 _ => self.aac_seen.then(|| vec![0x12, 0x10]),
             }
+        }
+    }
+
+    impl crate::pes::PesSink for LateAacStream {
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn info(&self) -> &DiscTitle {
+            &self.info
         }
     }
 
@@ -2189,19 +2360,29 @@ mod tests {
         info: DiscTitle,
     }
 
-    impl Stream for UndeliveringSink {
+    impl crate::pes::PesSource for UndeliveringSink {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             Ok(None)
         }
-        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn finish(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+
         fn info(&self) -> &DiscTitle {
             &self.info
         }
+    }
+
+    impl crate::pes::PesSink for UndeliveringSink {
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+
         fn undelivered_streams(&self) -> Vec<usize> {
             vec![1]
         }
@@ -2239,7 +2420,7 @@ mod tests {
             }
         }
     }
-    impl Stream for LpcmSource {
+    impl crate::pes::PesSource for LpcmSource {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             if self.frames == 0 {
                 return Ok(None);
@@ -2256,17 +2437,27 @@ mod tests {
                 coding: None,
             }))
         }
-        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn finish(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+
         fn info(&self) -> &DiscTitle {
             &self.info
         }
+
         fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {
             self.layout.clone()
+        }
+    }
+
+    impl crate::pes::PesSink for LpcmSource {
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn info(&self) -> &DiscTitle {
+            &self.info
         }
     }
 
@@ -2344,7 +2535,7 @@ mod tests {
             self.info.streams.len() - 1
         }
     }
-    impl Stream for GatedLpcm {
+    impl crate::pes::PesSource for GatedLpcm {
         fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
             use crate::mux::codec::CodecParser as _;
             let Some(data) = self.pes.pop_front() else {
@@ -2373,15 +2564,11 @@ mod tests {
             self.gate.observe(&frame);
             Ok(Some(frame))
         }
-        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn finish(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+
         fn info(&self) -> &DiscTitle {
             &self.info
         }
+
         fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
             use crate::mux::codec::CodecParser as _;
             if track == self.lpcm_track() {
@@ -2390,8 +2577,23 @@ mod tests {
                 Some(vec![1, 0x64, 0, 0x28, 0xFF, 0xE0, 0, 0]) // minimal avcC
             }
         }
+
         fn headers_ready(&self) -> bool {
             self.gate.ready(&self.info, |i| self.codec_private(i))
+        }
+    }
+
+    impl crate::pes::PesSink for GatedLpcm {
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn info(&self) -> &DiscTitle {
+            &self.info
         }
     }
 
@@ -3497,18 +3699,27 @@ mod tests {
             info: DiscTitle,
             halt: Halt,
         }
-        impl Stream for WedgedFinish {
+        impl crate::pes::PesSource for WedgedFinish {
             fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
                 Ok(None)
             }
+
+            fn info(&self) -> &DiscTitle {
+                &self.info
+            }
+        }
+
+        impl crate::pes::PesSink for WedgedFinish {
             fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
                 self.halt.cancel();
                 std::thread::sleep(Duration::from_secs(9));
                 Ok(())
             }
+
             fn finish(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
+
             fn info(&self) -> &DiscTitle {
                 &self.info
             }

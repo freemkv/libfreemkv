@@ -12,7 +12,7 @@ use crate::disc::{
     VideoStream,
 };
 use crate::mux::resolve::build_iso_pipeline;
-use crate::pes::Stream as PesStream;
+use crate::pes::PesSource;
 use crate::{Medium, SectorSource, SourceInfo, output};
 use std::path::PathBuf;
 

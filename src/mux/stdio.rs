@@ -131,7 +131,14 @@ impl<R: Read + ?Sized> Read for Counted<'_, R> {
     }
 }
 
-impl crate::pes::Stream for StdioStream {
+impl StdioStream {
+    /// The title being read or written (both directions open this type).
+    pub fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
+}
+
+impl crate::pes::PesSource for StdioStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         self.ensure_header_read()?;
         match &mut self.reader {
@@ -139,26 +146,7 @@ impl crate::pes::Stream for StdioStream {
             None => Err(crate::error::Error::StreamWriteOnly.into()),
         }
     }
-    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
-        if self.writer.is_none() {
-            return Err(crate::error::Error::StreamReadOnly.into());
-        }
-        self.ensure_header_written()?;
-        match &mut self.writer {
-            Some(w) => frame.serialize_ext(w, self.padded),
-            None => Err(crate::error::Error::StreamReadOnly.into()),
-        }
-    }
-    fn finish(&mut self) -> io::Result<()> {
-        // Emit the header even when write() was never called, so a zero-frame
-        // title still produces the FMKV magic + metadata header on stdout
-        // (symmetric with the read side's read_header()).
-        self.ensure_header_written()?;
-        if let Some(w) = &mut self.writer {
-            w.flush()?;
-        }
-        Ok(())
-    }
+
     fn info(&self) -> &DiscTitle {
         &self.disc_title
     }
@@ -166,21 +154,6 @@ impl crate::pes::Stream for StdioStream {
     // Read side: the header's timing, available once the first read parsed it.
     fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
         self.timings.get(track).copied().unwrap_or_default()
-    }
-
-    fn set_track_timing(
-        &mut self,
-        track: usize,
-        timing: crate::pes::TrackTiming,
-    ) -> io::Result<()> {
-        if self.writer.is_none() {
-            return Err(crate::error::Error::StreamReadOnly.into());
-        }
-        if self.header_written {
-            return Err(crate::error::Error::StreamHeaderWritten.into());
-        }
-        let tracks = self.disc_title.streams.len();
-        super::network::set_timing(&mut self.timings, track, timing, tracks)
     }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
@@ -201,10 +174,53 @@ impl crate::pes::Stream for StdioStream {
     }
 }
 
+impl crate::pes::PesSink for StdioStream {
+    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        if self.writer.is_none() {
+            return Err(crate::error::Error::StreamReadOnly.into());
+        }
+        self.ensure_header_written()?;
+        match &mut self.writer {
+            Some(w) => frame.serialize_ext(w, self.padded),
+            None => Err(crate::error::Error::StreamReadOnly.into()),
+        }
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        // Emit the header even when write() was never called, so a zero-frame
+        // title still produces the FMKV magic + metadata header on stdout
+        // (symmetric with the read side's read_header()).
+        self.ensure_header_written()?;
+        if let Some(w) = &mut self.writer {
+            w.flush()?;
+        }
+        Ok(())
+    }
+
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
+
+    fn set_track_timing(
+        &mut self,
+        track: usize,
+        timing: crate::pes::TrackTiming,
+    ) -> io::Result<()> {
+        if self.writer.is_none() {
+            return Err(crate::error::Error::StreamReadOnly.into());
+        }
+        if self.header_written {
+            return Err(crate::error::Error::StreamHeaderWritten.into());
+        }
+        let tracks = self.disc_title.streams.len();
+        super::network::set_timing(&mut self.timings, track, timing, tracks)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pes::Stream as _;
+    use crate::pes::{PesSink as _, PesSource as _};
 
     // The pub type keeps the auto traits it had when it held Stdin/Stdout.
     #[test]

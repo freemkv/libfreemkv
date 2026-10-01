@@ -989,7 +989,7 @@ impl DiscStream {
     }
 }
 
-impl crate::pes::Stream for DiscStream {
+impl crate::pes::PesSource for DiscStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         let read = self.read_frame();
         match &read {
@@ -998,14 +998,6 @@ impl crate::pes::Stream for DiscStream {
             Err(_) => {}
         }
         read
-    }
-
-    fn write(&mut self, _frame: &crate::pes::PesFrame) -> io::Result<()> {
-        Err(crate::error::Error::StreamReadOnly.into())
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        Ok(())
     }
 
     fn info(&self) -> &DiscTitle {
@@ -1078,7 +1070,7 @@ mod tests {
     use super::*;
     use crate::disc::{ContentFormat, DiscTitle};
     use crate::halt::Halt;
-    use crate::pes::Stream;
+    use crate::pes::PesSource;
 
     // Static-assert DiscStream: Send (Stream has Send as a supertrait) — a
     // future non-Send field fails this at compile time, before the runtime
@@ -1325,7 +1317,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut src: Box<dyn Stream> = Box::new(stream);
+        let mut src: Box<dyn PesSource> = Box::new(stream);
 
         // Empty-title fixture has no streams configured, so headers are
         // trivially ready and codec_private() yields nothing on track 0.
@@ -2406,7 +2398,7 @@ mod tests {
         //! stalls the mux, so each is constrained against a value that is neither
         //! the mutation constant nor the initial state.
         use super::*;
-        use crate::pes::Stream as PesStream;
+        use crate::pes::PesSource;
 
         // ── errors() / lost_bytes(): honest loss reporting ─────────────────
 
@@ -2418,8 +2410,8 @@ mod tests {
 
             // Before any read the stream is clean — establishes the accessors are
             // not simply echoing a preloaded value.
-            assert_eq!(PesStream::errors(&s), 0);
-            assert_eq!(PesStream::lost_bytes(&s), 0);
+            assert_eq!(PesSource::errors(&s), 0);
+            assert_eq!(PesSource::lost_bytes(&s), 0);
 
             for _ in 0..2 {
                 assert!(
@@ -2431,18 +2423,18 @@ mod tests {
             // Two 8-sector (16384 B) requests, 2048 B delivered each: two skip
             // events, 2 * (16384 - 2048) = 28672 bytes lost.
             assert_eq!(
-                PesStream::errors(&s),
+                PesSource::errors(&s),
                 2,
                 "errors() must report BOTH short reads, not a constant"
             );
             assert_eq!(
-                PesStream::lost_bytes(&s),
+                PesSource::lost_bytes(&s),
                 28_672,
                 "lost_bytes() must report the byte total, not an event count or a constant"
             );
             assert_ne!(
-                PesStream::errors(&s),
-                PesStream::lost_bytes(&s),
+                PesSource::errors(&s),
+                PesSource::lost_bytes(&s),
                 "the two accessors must read different fields"
             );
         }
@@ -2452,7 +2444,7 @@ mod tests {
         #[test]
         fn errors_reports_frames_the_resync_gate_dropped_after_the_gap_resolves() {
             let mut s = short_read_stream(true);
-            assert_eq!(PesStream::errors(&s), 0, "clean before anything happens");
+            assert_eq!(PesSource::errors(&s), 0, "clean before anything happens");
 
             // Drive a gate directly: a discontinuity, two dropped inter-coded
             // frames, then a keyframe that resyncs and zeroes the per-run count
@@ -2469,7 +2461,7 @@ mod tests {
             );
 
             assert_eq!(
-                PesStream::errors(&s),
+                PesSource::errors(&s),
                 2,
                 "the two discarded frames must still reach the caller after the \
                  gap resolved; reading the per-run counter here would report 0"
@@ -2477,31 +2469,6 @@ mod tests {
         }
 
         // ── write(): DiscStream is read-only ──────────────────────────────
-
-        // Ok(()) would make a caller muxing INTO it believe frames landed;
-        // it must refuse with the numeric code E_STREAM_READ_ONLY.
-        #[test]
-        fn write_refuses_with_the_read_only_code() {
-            let mut s = short_read_stream(false);
-            let frame = crate::pes::PesFrame {
-                discard_padding_ns: 0,
-                coding: None,
-                source: None,
-                track: 0,
-                pts: 0,
-                keyframe: true,
-                data: vec![0u8; 4],
-                duration_ns: None,
-            };
-            let err = PesStream::write(&mut s, &frame)
-                .expect_err("a read-only stream must never accept a frame");
-            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-            let code = format!("E{}", crate::error::Error::StreamReadOnly.code());
-            assert!(
-                err.to_string().contains(&code),
-                "expected the read-only code {code}, got {err}"
-            );
-        }
 
         // ── codec_private() / headers_ready() ─────────────────────────────
 
@@ -2597,11 +2564,11 @@ mod tests {
             let mut s = mixed_stream();
 
             assert!(
-                PesStream::codec_private(&s, 1).is_none(),
+                PesSource::codec_private(&s, 1).is_none(),
                 "no sequence header parsed yet"
             );
             assert!(
-                !PesStream::headers_ready(&s),
+                !PesSource::headers_ready(&s),
                 "a non-secondary video track without codec private must NOT be reported ready"
             );
 
@@ -2629,7 +2596,7 @@ mod tests {
             next.extend_from_slice(&[0xBB; 16]);
             let _ = parser.parse(&pes(next, None));
 
-            let cp = PesStream::codec_private(&s, 1)
+            let cp = PesSource::codec_private(&s, 1)
                 .expect("codec_private must reach the VIDEO track's parser, not track 0's");
             assert_eq!(
                 &cp[..4],
@@ -2639,14 +2606,14 @@ mod tests {
             assert_eq!(&cp[4..7], &[0x2D, 0x01, 0xE0], "720x480 as authored");
 
             assert!(
-                PesStream::headers_ready(&s),
+                PesSource::headers_ready(&s),
                 "with the video's codec private present the mux may start"
             );
             // The AC-3 track genuinely has none — so the Some() above is a real
             // per-track lookup, not a fixed answer.
-            assert!(PesStream::codec_private(&s, 0).is_none());
+            assert!(PesSource::codec_private(&s, 0).is_none());
             // And a track index past the end of the pid map has none either.
-            assert!(PesStream::codec_private(&s, 7).is_none());
+            assert!(PesSource::codec_private(&s, 7).is_none());
         }
 
         // A resolved video config must not finalise headers while an AAC track
@@ -2703,17 +2670,17 @@ mod tests {
             au.extend_from_slice(&[0xAA; 16]);
             let _ = parser(&mut s, 0x1011).parse(&pes(0x1011, au));
             let _ = parser(&mut s, 0x1011).parse(&pes(0x1011, picture_header(3)));
-            assert!(PesStream::codec_private(&s, 1).is_some());
+            assert!(PesSource::codec_private(&s, 1).is_some());
             assert!(
-                !PesStream::headers_ready(&s),
+                !PesSource::headers_ready(&s),
                 "AAC track 2 has no AudioSpecificConfig yet"
             );
 
             let mut adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x02, 0x9F, 0xFC];
             adts.extend_from_slice(&[0u8; 13]); // frame_length = 20
             let _ = parser(&mut s, 0x1100).parse(&pes(0x1100, adts));
-            assert_eq!(PesStream::codec_private(&s, 2), Some(vec![0x12, 0x10]));
-            assert!(PesStream::headers_ready(&s));
+            assert_eq!(PesSource::codec_private(&s, 2), Some(vec![0x12, 0x10]));
+            assert!(PesSource::headers_ready(&s));
         }
 
         fn aac_only_stream() -> DiscStream {
@@ -2746,12 +2713,12 @@ mod tests {
         #[test]
         fn read_eof_releases_a_silent_aac_track() {
             let mut s = aac_only_stream();
-            assert!(!PesStream::headers_ready(&s));
+            assert!(!PesSource::headers_ready(&s));
             assert!(
-                PesStream::read(&mut s).unwrap().is_none(),
+                PesSource::read(&mut s).unwrap().is_none(),
                 "all-zero source"
             );
-            assert!(PesStream::headers_ready(&s), "EOF expires the AAC wait");
+            assert!(PesSource::headers_ready(&s), "EOF expires the AAC wait");
         }
 
         // read() must feed the header gate every frame it returns.
@@ -2771,11 +2738,11 @@ mod tests {
                 });
             }
             for sec in 0..5 {
-                assert!(PesStream::read(&mut s).unwrap().is_some());
-                assert!(!PesStream::headers_ready(&s), "{sec} s: still waiting");
+                assert!(PesSource::read(&mut s).unwrap().is_some());
+                assert!(!PesSource::headers_ready(&s), "{sec} s: still waiting");
             }
-            assert!(PesStream::read(&mut s).unwrap().is_some());
-            assert!(PesStream::headers_ready(&s), "5 s of source time elapsed");
+            assert!(PesSource::read(&mut s).unwrap().is_some());
+            assert!(PesSource::headers_ready(&s), "5 s of source time elapsed");
         }
 
         // ── ctx events / stats ────────────────────────────────────────────
@@ -2871,7 +2838,7 @@ mod tests {
         #[test]
         fn disc_stream_stamps_source_provenance() {
             use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
-            use crate::pes::Stream;
+            use crate::pes::PesSource;
 
             // Build 1 TS packet containing a complete PES for PID 0x1011
             // 4-byte BD prefix + 188-byte TS packet (PUSI=1, PID=0x1011)
@@ -3146,7 +3113,7 @@ mod tests {
                 "post-gap inter frames dropped, the stream resumes at the keyframe"
             );
             assert_eq!(
-                PesStream::errors(&s),
+                PesSource::errors(&s),
                 2,
                 "the two dropped frames are counted"
             );
@@ -3157,7 +3124,7 @@ mod tests {
         /// second half of commit a0d4dd3 (the first half is the TS path above).
         #[test]
         fn ps_stream_stamps_source_provenance() {
-            use crate::pes::Stream;
+            use crate::pes::PesSource;
 
             let mut sector = ps_pack_header();
             sector.extend_from_slice(&ps_video_pes(&ps_gop_es(), 0));
@@ -3187,7 +3154,7 @@ mod tests {
         /// A DVD read with no declared extension track reports `0xD0|n` packets once at EOF.
         #[test]
         fn ps_stream_reports_undeclared_extension_packets_once() {
-            use crate::pes::Stream;
+            use crate::pes::PesSource;
 
             let mut sector = ps_pack_header();
             for _ in 0..3 {
@@ -3221,7 +3188,7 @@ mod tests {
         /// Packets of an undeclared (or deselected) PS stream warn once, not per packet.
         #[test]
         fn ps_stream_warns_once_per_dropped_stream() {
-            use crate::pes::Stream;
+            use crate::pes::PesSource;
 
             let mut sector = ps_pack_header();
             for _ in 0..30 {
@@ -3258,7 +3225,7 @@ mod tests {
         /// with every AU emitted exactly once (the final one drained at EOF).
         fn ps_fragmented_au_count(codec: crate::disc::Codec, aus: &[Vec<u8>]) -> usize {
             use crate::disc::{ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
-            use crate::pes::Stream;
+            use crate::pes::PesSource;
 
             let mut sector = ps_pack_header();
             for (i, au) in aus.iter().enumerate() {
@@ -3348,7 +3315,7 @@ mod tests {
         // carry source.byte >= 2048, proving the base carried over.
         #[test]
         fn ps_stream_carries_feed_base_across_reads() {
-            use crate::pes::Stream;
+            use crate::pes::PesSource;
 
             let mut image = ps_pack_header();
             image.extend_from_slice(&ps_video_pes(&ps_gop_es(), 0));

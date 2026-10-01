@@ -342,7 +342,14 @@ fn ensure_header_written(
     Ok(())
 }
 
-impl crate::pes::Stream for NetworkStream {
+impl NetworkStream {
+    /// The title being read or written (both directions open this type).
+    pub fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
+}
+
+impl crate::pes::PesSource for NetworkStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         match &mut self.mode {
             Mode::Read { reader, meta } => {
@@ -352,6 +359,25 @@ impl crate::pes::Stream for NetworkStream {
             _ => Err(crate::error::Error::StreamWriteOnly.into()),
         }
     }
+
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
+
+    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
+        match &self.mode {
+            Mode::Read { meta, .. } => meta.timing(track),
+            Mode::Write { .. } => Default::default(),
+        }
+    }
+
+    // The sender's codec privates travel in the FMKV header (as for stdio).
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        self.disc_title.codec_privates.get(track).cloned().flatten()
+    }
+}
+
+impl crate::pes::PesSink for NetworkStream {
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.mode {
             Mode::Write {
@@ -367,6 +393,7 @@ impl crate::pes::Stream for NetworkStream {
             _ => Err(crate::error::Error::StreamReadOnly.into()),
         }
     }
+
     fn finish(&mut self) -> io::Result<()> {
         if let Mode::Write {
             writer,
@@ -386,6 +413,7 @@ impl crate::pes::Stream for NetworkStream {
         }
         Ok(())
     }
+
     // A failed or stopped title: reset instead of the clean end, so the receiver
     // reports an error rather than a complete (truncated) title.
     fn finish_incomplete(&mut self) -> io::Result<()> {
@@ -394,15 +422,11 @@ impl crate::pes::Stream for NetworkStream {
         }
         Ok(())
     }
+
     fn info(&self) -> &DiscTitle {
         &self.disc_title
     }
-    fn track_timing(&self, track: usize) -> crate::pes::TrackTiming {
-        match &self.mode {
-            Mode::Read { meta, .. } => meta.timing(track),
-            Mode::Write { .. } => Default::default(),
-        }
-    }
+
     fn set_track_timing(
         &mut self,
         track: usize,
@@ -418,10 +442,6 @@ impl crate::pes::Stream for NetworkStream {
             Mode::Write { .. } => Err(crate::error::Error::StreamHeaderWritten.into()),
             Mode::Read { .. } => Err(crate::error::Error::StreamReadOnly.into()),
         }
-    }
-    // The sender's codec privates travel in the FMKV header (as for stdio).
-    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
-        self.disc_title.codec_privates.get(track).cloned().flatten()
     }
 }
 
@@ -632,9 +652,9 @@ mod tests {
         let handle = std::thread::spawn(move || {
             addr_tx.send(addr).unwrap();
             let mut ns = NetworkStream::accept_from(listener).unwrap();
-            let info = pes::Stream::info(&ns).clone();
+            let info = pes::PesSource::info(&ns).clone();
             let mut frames = Vec::new();
-            while let Ok(Some(f)) = pes::Stream::read(&mut ns) {
+            while let Ok(Some(f)) = pes::PesSource::read(&mut ns) {
                 frames.push(f);
             }
             (info, frames)
@@ -655,8 +675,8 @@ mod tests {
             data: vec![0x47; 192],
             duration_ns: None,
         };
-        pes::Stream::write(&mut writer, &frame).unwrap();
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::write(&mut writer, &frame).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
 
         let (info, frames) = handle.join().unwrap();
         assert_eq!(info.playlist, "NetworkTest");
@@ -677,7 +697,7 @@ mod tests {
             let mut ns = NetworkStream::accept_from(listener).unwrap();
             let mut n = 0;
             loop {
-                match crate::pes::Stream::read(&mut ns) {
+                match crate::pes::PesSource::read(&mut ns) {
                     Ok(Some(_)) => n += 1,
                     end => return (n, end),
                 }
@@ -703,7 +723,7 @@ mod tests {
     // reach the receiver as an error, never as the clean end of a short title.
     #[test]
     fn a_sender_that_fails_mid_title_is_an_error_at_the_receiver() {
-        use crate::pes::Stream as _;
+        use crate::pes::PesSink as _;
         for incomplete in [false, true] {
             let (addr, handle) = spawn_ending_reader();
             let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
@@ -763,7 +783,7 @@ mod tests {
             addr_tx.send(addr).unwrap();
             // listen()'s read_header must succeed (header present), not error.
             let ns = NetworkStream::accept_from(listener).unwrap();
-            pes::Stream::info(&ns).playlist.clone()
+            pes::PesSource::info(&ns).playlist.clone()
         });
 
         let addr = addr_rx.recv().unwrap();
@@ -772,7 +792,7 @@ mod tests {
             .unwrap()
             .meta(&dt);
         // No write() at all — straight to finish().
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
 
         let playlist = handle.join().unwrap();
         assert_eq!(
@@ -806,9 +826,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let mut ns = NetworkStream::accept_from(listener).unwrap();
-            let info = pes::Stream::info(&ns).clone();
+            let info = pes::PesSource::info(&ns).clone();
             let mut frames = Vec::new();
-            while let Ok(Some(f)) = pes::Stream::read(&mut ns) {
+            while let Ok(Some(f)) = pes::PesSource::read(&mut ns) {
                 frames.push(f);
             }
             (info, frames)
@@ -830,7 +850,7 @@ mod tests {
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&dt);
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
         let (_info, _frames) = handle.join().unwrap();
 
         // Now build a fresh read-side stream and confirm its write() errors.
@@ -850,14 +870,14 @@ mod tests {
                 duration_ns: None,
             };
             // Read side: writing must be a typed StreamReadOnly error.
-            let err = pes::Stream::write(&mut ns, &frame).expect_err("read side write must error");
+            let err = pes::PesSink::write(&mut ns, &frame).expect_err("read side write must error");
             err.kind()
         });
         // Drive the accept: connect + send header so accept_from completes.
         let mut w2 = NetworkStream::connect_vetted(&addr2.to_string(), false)
             .unwrap()
             .meta(&dt);
-        pes::Stream::finish(&mut w2).unwrap();
+        pes::PesSink::finish(&mut w2).unwrap();
         let kind = h.join().unwrap();
         // E_STREAM_READ_ONLY (9000) maps to Unsupported.
         assert_eq!(kind, io::ErrorKind::Unsupported);
@@ -874,10 +894,10 @@ mod tests {
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&dt);
-        let err = pes::Stream::read(&mut writer).expect_err("write side read must error");
+        let err = pes::PesSource::read(&mut writer).expect_err("write side read must error");
         // E_STREAM_WRITE_ONLY (9001) maps to Unsupported.
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
         let _ = handle.join().unwrap();
     }
 
@@ -903,9 +923,9 @@ mod tests {
                 data: vec![i; 100 + i as usize],
                 duration_ns: None,
             };
-            pes::Stream::write(&mut writer, &frame).unwrap();
+            pes::PesSink::write(&mut writer, &frame).unwrap();
         }
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
         let (info, frames) = handle.join().unwrap();
         // Title parsed once and intact.
         assert_eq!(info.streams.len(), 2);
@@ -935,7 +955,7 @@ mod tests {
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&dt);
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
         let (info, _frames) = handle.join().unwrap();
         // The receiver default title is empty (playlist ""); it must have
         // been replaced by the sender's header-carried title.
@@ -1004,7 +1024,7 @@ mod tests {
         std::thread::spawn(move || {
             let r = NetworkStream::accept_from_with_halt(listener, Some(h));
             let _ = ready_tx.send(());
-            let _ = tx.send(r.and_then(|mut ns| pes::Stream::read(&mut ns).map(|_| ())));
+            let _ = tx.send(r.and_then(|mut ns| pes::PesSource::read(&mut ns).map(|_| ())));
         });
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
@@ -1104,7 +1124,7 @@ mod tests {
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&sample_title());
-        crate::pes::Stream::finish(&mut writer).unwrap();
+        crate::pes::PesSink::finish(&mut writer).unwrap();
         assert_eq!(handle.join().unwrap(), None);
     }
 
@@ -1191,7 +1211,7 @@ mod tests {
             };
             (
                 keepalive,
-                pes::Stream::read(&mut ns).map(|f| f.map(|f| f.data)),
+                pes::PesSource::read(&mut ns).map(|f| f.map(|f| f.data)),
             )
         });
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
@@ -1218,8 +1238,8 @@ mod tests {
             data: vec![7; 4],
             duration_ns: None,
         };
-        pes::Stream::write(&mut writer, &frame).unwrap();
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::write(&mut writer, &frame).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
         let (keepalive, read) = handle.join().unwrap();
         assert!(keepalive, "keepalive must be armed");
         assert_eq!(read.unwrap(), Some(vec![7; 4]));
@@ -1236,7 +1256,7 @@ mod tests {
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&title);
-        pes::Stream::finish(&mut writer).unwrap();
+        pes::PesSink::finish(&mut writer).unwrap();
         let cps = handle.join().unwrap();
         assert_eq!(cps, title.codec_privates);
     }
@@ -1245,7 +1265,7 @@ mod tests {
         std::net::SocketAddr,
         std::thread::JoinHandle<Vec<Option<Vec<u8>>>>,
     ) {
-        use crate::pes::Stream as _;
+        use crate::pes::PesSource as _;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
@@ -1259,7 +1279,7 @@ mod tests {
     // survive the PES wire hop.
     #[test]
     fn opus_track_timing_and_padding_survive_network_to_mkv() {
-        use crate::pes::{self, Stream as _};
+        use crate::pes::{self, PesSink as _, PesSource as _};
         let mut title = sample_title();
         title.streams.truncate(1);
         title.streams[0] = Stream::Audio(AudioStream {
@@ -1323,7 +1343,7 @@ mod tests {
     // frames a receiver reads back (public `connect` refuses loopback, so this seam).
     #[test]
     fn parity_network_fmkv_wire() {
-        use crate::pes::Stream as _;
+        use crate::pes::{PesSink as _, PesSource as _};
         use std::io::Read as _;
         let clip = crate::test_util::synthetic_bd_clip(6);
         let dir = tempfile::tempdir().unwrap();
