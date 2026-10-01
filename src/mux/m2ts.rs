@@ -162,8 +162,7 @@ impl M2tsStream {
                     Repack::Adts(h)
                 }
                 DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => {
-                    let h = lpcm_bd_header(a, cp.as_deref());
-                    if h.is_none() {
+                    let Some(h) = lpcm_bd_header(a, cp.as_deref()) else {
                         tracing::warn!(
                             target: "mux",
                             track = i,
@@ -171,11 +170,11 @@ impl M2tsStream {
                         );
                         route.push(None);
                         continue;
-                    }
+                    };
                     // Advertise the layout actually packed, not a rejected source byte.
                     let depth = super::codec::lpcm::output_depth(cp.as_deref());
-                    cp = h.map(|h| super::codec::lpcm::tagged_layout(h[0], depth));
-                    h.map_or(Repack::Verbatim, Repack::Lpcm)
+                    cp = Some(super::codec::lpcm::tagged_layout(h[0], depth));
+                    Repack::Lpcm(h)
                 }
                 _ => Repack::Verbatim,
             };
@@ -1175,5 +1174,114 @@ mod tests {
     #[test]
     fn mvc_dependent_view_arriving_first_still_matches_the_base_dts() {
         mvc_dependent_dts(true);
+    }
+
+    // An AAC track whose config cannot be signalled in ADTS is left out, not written as raw AUs.
+    #[test]
+    fn aac_without_a_usable_config_is_omitted() {
+        let mut title = make_title();
+        title.streams.push(audio(0x1100, Codec::Aac));
+        title.codec_privates.push(None);
+        let data = [fake_idr_pes_data(), vec![0x21, 0x10, 0x04]];
+        let (pids, ts) = mux_one_frame_each(&title, &data);
+        assert_eq!(pids.len(), 1, "only the video track is advertised");
+        assert!(
+            !ts.as_chunks::<192>().0.iter().any(|p| p[5] & 0x1F == 0x11),
+            "no packets on the AAC PID"
+        );
+    }
+
+    // Two tracks asking for one PID are not interleaved on it: the second moves.
+    #[test]
+    fn tracks_sharing_a_pid_get_distinct_pids() {
+        let mut title = make_title();
+        title.streams = vec![ac3_audio(0x1100), ac3_audio(0x1100)];
+        title.codec_privates = vec![None, None];
+        let a = vec![0x0B, 0x77, 1, 2];
+        let b = vec![0x0B, 0x77, 3, 4];
+        let (pids, ts) = mux_one_frame_each(&title, &[a.clone(), b.clone()]);
+        assert_ne!(pids[0], pids[1], "{pids:x?}");
+        let mut demux = crate::mux::ts::TsDemuxer::new(&pids);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        let got = |pid| pes.iter().find(|p| p.pid == pid).map(|p| p.data.clone());
+        assert_eq!(got(pids[0]), Some(a));
+        assert_eq!(got(pids[1]), Some(b));
+    }
+
+    // An MPEG-2 multichannel extension has no BD-TS binding: never written, reported lost
+    // once its packets arrive.
+    #[test]
+    fn an_mp2_extension_track_is_left_out_and_reported() {
+        let mut title = make_title();
+        let DiscStream::Audio(base) = audio(0x00C0, Codec::Mp2) else {
+            unreachable!()
+        };
+        let ext = crate::disc::AudioStream {
+            pid: 0x00D0,
+            label: crate::disc::MP2_EXTENSION_LABEL.into(),
+            ..base.clone()
+        };
+        title.streams.push(DiscStream::Audio(base));
+        title.streams.push(DiscStream::Audio(ext));
+        title.codec_privates = vec![None; 3];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        assert!(stream.undelivered_streams().is_empty(), "nothing arrived yet");
+        stream
+            .write(&frame(0, 0, true, fake_idr_pes_data()))
+            .unwrap();
+        stream
+            .write(&frame(2, 0, true, vec![0x7F, 0xF0, 1, 2]))
+            .unwrap();
+        assert_eq!(stream.undelivered_streams(), vec![2]);
+        stream.finish().unwrap();
+        drop(stream);
+        let (meta, _) = ts_after_header(&shared.lock().unwrap());
+        assert_eq!(meta.streams.len(), 2, "video and the base only");
+    }
+
+    // The PMT stream_type of each codec reads back as that codec.
+    #[test]
+    fn stream_types_read_back_as_their_codecs() {
+        let mut title = make_title();
+        let codecs = [
+            Codec::Ac3,
+            Codec::Dts,
+            Codec::TrueHd,
+            Codec::Ac3Plus,
+            Codec::DtsHdHr,
+            Codec::DtsHdMa,
+        ];
+        for (k, c) in codecs.into_iter().enumerate() {
+            title.streams.push(audio(0x1100 + k as u16, c));
+        }
+        title
+            .streams
+            .push(DiscStream::Subtitle(crate::disc::SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+                qualifier: crate::disc::LabelQualifier::None,
+                codec_data: None,
+            }));
+        title.codec_privates = vec![None; title.streams.len()];
+        let mut data = vec![fake_idr_pes_data()];
+        data.extend((0..codecs.len() + 1).map(|_| vec![0x0B, 0x77, 1, 2]));
+        let (_, ts) = mux_one_frame_each(&title, &data);
+        let got: Vec<Codec> = crate::mux::ts::scan_streams(&ts)
+            .expect("PAT/PMT present")
+            .iter()
+            .map(|s| match s {
+                DiscStream::Video(v) => v.codec,
+                DiscStream::Audio(a) => a.codec,
+                DiscStream::Subtitle(t) => t.codec,
+            })
+            .collect();
+        let mut want = vec![Codec::Hevc];
+        want.extend(codecs);
+        want.push(Codec::Pgs);
+        assert_eq!(got, want);
     }
 }
