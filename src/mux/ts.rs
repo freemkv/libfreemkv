@@ -939,7 +939,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                 // MPEG-1/2 audio covers Layers I-III; only the ES says which.
                 0x03 | 0x04 if head().and_then(|h| h.1) == Some(AudioSync::Layer(3)) => Codec::Mp3,
                 0x03 | 0x04 => Codec::Mp2,
-                // PES private data (FFmpeg's m2ts mode): an MPEG-audio stream_id plus the ES
+                // PES private data (as other m2ts muxers write it): an MPEG-audio stream_id plus the ES
                 // sync names AAC/MP2/MP3 (13818-1 Table 2-22); anything else stays unknown.
                 0x06 => match head() {
                     Some((0xC0..=0xDF, Some(AudioSync::Adts))) => Codec::Aac,
@@ -1804,7 +1804,7 @@ mod tests {
         }
     }
 
-    // FFmpeg's m2ts mode declares AAC/MP2/MP3 as PES private data (0x06); the
+    // Other m2ts muxers declare AAC/MP2/MP3 as PES private data (0x06); the
     // MPEG-audio stream_id and the ES sync name the codec.
     #[test]
     fn scan_streams_types_private_data_audio_from_its_es() {
