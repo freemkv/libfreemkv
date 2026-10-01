@@ -16,7 +16,8 @@ use std::io::{self, Write};
 /// pre-mux plan ([`super::fit::fit_report`]) so the two cannot disagree.
 pub(crate) fn lpcm_bd_header(a: &crate::disc::AudioStream, cp: Option<&[u8]>) -> Option<[u8; 2]> {
     let src = cp.and_then(super::codec::lpcm::layout_byte);
-    super::codec::lpcm::bd_header(a.channels.count(), a.sample_rate.hz() as u32, src)
+    let depth = super::codec::lpcm::output_depth(cp);
+    super::codec::lpcm::bd_header(a.channels.count(), a.sample_rate.hz() as u32, src, depth)
 }
 
 fn stream_pid(s: &DiscStream) -> u16 {
@@ -106,7 +107,8 @@ impl M2tsStream {
                         continue;
                     }
                     // Advertise the layout actually packed, not a rejected source byte.
-                    cp = h.map(|h| super::codec::lpcm::tagged_layout(h[0]));
+                    let depth = super::codec::lpcm::output_depth(cp.as_deref());
+                    cp = h.map(|h| super::codec::lpcm::tagged_layout(h[0], depth));
                     h
                 }
                 _ => None,
@@ -186,7 +188,7 @@ impl crate::pes::Stream for M2tsStream {
         match self.route.get(frame.track).copied() {
             // Dropped at create (already warned): nothing to write.
             Some(None) => Ok(()),
-            // Parser output is plain 24-bit PCM; BD-TS needs the BD LPCM framing back.
+            // Parser output is plain PCM (16 or 24-bit); BD-TS needs the BD LPCM framing back.
             Some(Some((track, Some(header)))) => {
                 for (offset_ns, payload) in super::codec::lpcm::bd_payloads(&frame.data, header) {
                     self.muxer.write_frame(
@@ -624,7 +626,7 @@ mod tests {
         // A source 2/2 (assignment 7) must not be re-labelled 3/1 (4ch default 6).
         use crate::disc::{AudioChannels, SampleRate};
         let mut title = lpcm_title(AudioChannels::Quad, SampleRate::S48);
-        title.codec_privates = vec![None, Some(b"BDLP\x71".to_vec())];
+        title.codec_privates = vec![None, Some(b"BDLP\x71\x18".to_vec())];
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
         stream
@@ -692,12 +694,42 @@ mod tests {
         assert_eq!(stream.undelivered_streams(), vec![1]);
     }
     #[test]
+    fn sixteen_bit_lpcm_is_repacked_as_16_bit_bd_lpcm() {
+        use crate::disc::{AudioChannels, SampleRate};
+        let mut title = lpcm_title(AudioChannels::Stereo, SampleRate::S48);
+        title.codec_privates = vec![None, Some(b"DVLP\x10".to_vec())];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        stream
+            .write(&PesFrame {
+                discard_padding_ns: 0,
+                coding: None,
+                source: None,
+                track: 1,
+                pts: 0,
+                keyframe: true,
+                data: vec![0; 240 * 2 * 2],
+                duration_ns: None,
+            })
+            .unwrap();
+        stream.finish().unwrap();
+        drop(stream);
+        let buf = shared.lock().unwrap().clone();
+        let (_, ts) = ts_after_header(&buf);
+        let mut demux = crate::mux::ts::TsDemuxer::new(&[0x1100]);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        assert_eq!(pes[0].data[3] >> 6, 1, "16-bit quantization code");
+        assert_eq!(pes[0].data.len(), 4 + 240 * 2 * 2);
+    }
+
+    #[test]
     fn fmkv_header_carries_the_layout_byte_actually_used() {
         // 2ch stream with a stale 5.1 layout byte: packing falls back to stereo, so
         // the FMKV header must carry the stereo byte, not the rejected 5.1 one.
         use crate::disc::{AudioChannels, SampleRate};
         let mut title = lpcm_title(AudioChannels::Stereo, SampleRate::S48);
-        title.codec_privates = vec![None, Some(b"BDLP\x91".to_vec())];
+        title.codec_privates = vec![None, Some(b"BDLP\x91\x18".to_vec())];
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
         drop(stream);
@@ -705,7 +737,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(&buf);
         let meta = super::meta::read_header(&mut cursor).unwrap().unwrap();
         let back = meta.to_title();
-        assert_eq!(back.codec_privates[1], Some(b"BDLP\x31".to_vec()));
+        assert_eq!(back.codec_privates[1], Some(b"BDLP\x31\x18".to_vec()));
     }
 
     /// (PTS, DTS) of every PES start on `pid` in `ts` (BD-TS after the FMKV header).

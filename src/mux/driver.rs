@@ -2456,7 +2456,7 @@ mod tests {
         use crate::disc::{AudioChannels, SampleRate};
         let dir = tempfile::tempdir().unwrap();
         let url = format!("mkv://{}", dir.path().join("o.mkv").display());
-        let layout = Some(b"BDLP\xB4".to_vec());
+        let layout = Some(b"BDLP\xB4\x18".to_vec());
         let src = LpcmSource::new(AudioChannels::Surround51, SampleRate::S48, layout);
         let spy = TitleSpy::default();
         run(src, &url, &spy);

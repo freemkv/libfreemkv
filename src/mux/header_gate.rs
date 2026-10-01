@@ -78,7 +78,7 @@ impl HeaderGate {
     }
 
     /// Primary video always needs its config; AAC (ASC, mandatory for ADTS-stripped
-    /// A_AAC) and BD LPCM (layout byte: playlists say "5.1") until the wait expires.
+    /// A_AAC) and LPCM (BD layout byte: playlists say "5.1"; output depth) until the wait expires.
     pub(crate) fn ready(
         &self,
         title: &DiscTitle,
@@ -90,9 +90,7 @@ impl HeaderGate {
                 // Secondary (commentary) AAC is not exempt: without its ASC it is
                 // undecodable too, and the wait is bounded anyway.
                 Stream::Audio(a) => {
-                    let bd_lpcm = a.codec == Codec::Lpcm
-                        && title.content_format == crate::disc::ContentFormat::BdTs;
-                    (a.codec == Codec::Aac || bd_lpcm) && !self.expired
+                    (a.codec == Codec::Aac || a.codec == Codec::Lpcm) && !self.expired
                 }
                 Stream::Subtitle(_) => false,
             };
@@ -140,16 +138,15 @@ mod tests {
     }
 
     #[test]
-    fn bd_lpcm_waits_for_its_layout_byte_until_expiry() {
+    fn lpcm_waits_for_its_codec_private_until_expiry() {
         use crate::disc::ContentFormat;
         let bd = lpcm_title(ContentFormat::BdTs);
         let mut g = HeaderGate::default();
+        let dvd = lpcm_title(ContentFormat::MpegPs);
         assert!(!g.ready(&bd, |_| None), "BD LPCM needs its layout byte");
+        assert!(!g.ready(&dvd, |_| None), "DVD LPCM needs its output depth");
         assert!(g.ready(&bd, |_| Some(vec![1])));
-        assert!(
-            g.ready(&lpcm_title(ContentFormat::MpegPs), |_| None),
-            "DVD LPCM has no layout byte to wait for"
-        );
+        assert!(g.ready(&dvd, |_| Some(vec![1])));
         g.expire();
         assert!(g.ready(&bd, |_| None), "bounded like AAC");
     }

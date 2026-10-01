@@ -687,6 +687,10 @@ impl MkvStream {
             if let Some(cp) = title.codec_privates.get(idx).and_then(|c| c.as_ref()) {
                 track.codec_private = Some(cp.clone());
             }
+            if matches!(s, crate::disc::Stream::Audio(a) if a.codec == Codec::Lpcm) {
+                let cp = title.codec_privates.get(idx).and_then(|c| c.as_deref());
+                track.bit_depth = super::codec::lpcm::output_depth(cp);
+            }
             stream_to_track.push(Some(tracks.len()));
             tracks.push(track);
         }
@@ -3252,6 +3256,38 @@ mod tests {
         s.finish().unwrap();
         let r = MkvStream::open(Cursor::new(out.bytes())).unwrap();
         assert_eq!(r.codec_private(1), Some(asc.to_vec()));
+    }
+
+    // A 16-bit LPCM source stays 16-bit: BitDepth follows the parser's declared depth.
+    #[test]
+    fn lpcm_bit_depth_follows_the_parser_codec_private() {
+        let mut title = h264_title();
+        for cp in [
+            None,
+            Some(b"DVLP\x10".to_vec()),
+            Some(b"BDLP\x31\x18".to_vec()),
+        ] {
+            title
+                .streams
+                .push(crate::disc::Stream::Audio(crate::disc::AudioStream {
+                    pid: 0x1100,
+                    codec: crate::disc::Codec::Lpcm,
+                    channels: crate::disc::AudioChannels::Stereo,
+                    language: "eng".into(),
+                    sample_rate: crate::disc::SampleRate::S48,
+                    secondary: false,
+                    purpose: crate::disc::LabelPurpose::Normal,
+                    label: String::new(),
+                }));
+            title.codec_privates.push(cp);
+        }
+        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title, None).unwrap();
+        let depths: Vec<u8> = pending_tracks(&s)
+            .iter()
+            .skip(1)
+            .map(|t| t.bit_depth)
+            .collect();
+        assert_eq!(depths, [24, 16, 24]);
     }
 
     #[test]
