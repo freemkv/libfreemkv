@@ -543,18 +543,12 @@ where
     };
     let title = disc.titles[idx].clone();
     let format = disc.content_format;
-    // Pass `DecryptKeys::None` to the decrypt decorator when --raw is set —
-    // the read stack still flows through the same producer+demux+parse
-    // pipeline, just without the AACS/CSS step. One highway for ISO reads.
-    let effective_keys = if opts.raw {
-        crate::decrypt::DecryptKeys::None
-    } else {
-        keys
-    };
+    // `--raw` keys are already `None`: the read stack still flows through the same
+    // producer+demux+parse pipeline, just without the AACS/CSS step.
     let stream = build_iso_pipeline(
         reader,
         title,
-        effective_keys,
+        keys,
         ISO_MUX_BATCH_SECTORS,
         format,
         opts.raw,
@@ -563,7 +557,7 @@ where
     Ok(stream)
 }
 
-// `image_input` over the rip's key set (KU §3.1, §3.5): the gate is `check_decryptable`,
+// `image_input_scanned` over the rip's key set (KU §3.1, §3.5): the gate is `check_decryptable`,
 // and the mux reads through the set's reader. No lookup, no banking.
 fn keyed_image_input<S>(
     reader: S,
@@ -925,7 +919,7 @@ pub(crate) fn build_sector_pipeline<S: SectorSource + Send + 'static>(
     // on CSS/unencrypted (per-2048-byte-sector) would reject any extent
     // whose sector count isn't a multiple of 3.
     let unit_align: u16 = match &keys {
-        crate::decrypt::DecryptKeys::Aacs { .. } => 3,
+        crate::decrypt::DecryptKeys::Aacs { .. } => AACS_UNIT_SECTORS,
         _ => 1,
     };
     let full_extents = extents.clone();
@@ -998,10 +992,10 @@ pub(crate) fn build_keyed_pipeline<S: SectorSource + Send + 'static>(
         )
         .map_err(io::Error::from)?;
     let plan = IsoPlan {
-        extents: set.key_map().read_plan(&full_extents, 3),
+        extents: set.key_map().read_plan(&full_extents, u32::from(AACS_UNIT_SECTORS)),
         full_extents,
         policy,
-        unit_align: 3,
+        unit_align: AACS_UNIT_SECTORS,
         format: set.content_format(),
     };
     iso_pipeline_tail(decrypting, plan, title, ctx)
@@ -1166,6 +1160,9 @@ fn build_ps_pipeline(
     };
     iso_pipeline_tail(stage, plan, title, ctx).map(|p| p.with_video_stream_id(scan.video_id))
 }
+
+// Sectors in one AACS aligned unit: the `unit_align` of every keyed read plan.
+const AACS_UNIT_SECTORS: u16 = crate::aacs::content::ALIGNED_UNIT_SECTORS as u16;
 
 // Sectors per m2ts read: whole AACS units, ~1 MiB (the stage's byte-view refill).
 const M2TS_READ_SECTORS: u16 = 510;
