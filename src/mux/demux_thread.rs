@@ -545,6 +545,55 @@ mod tests {
         assert!(saw, "PS PES must be demuxed and delivered");
     }
 
+    // A PS input commonly ends with no program-end code: the last PES is only completed by
+    // flush() and must still be delivered, before the Eof, and every PES is stamped with its
+    // position in the whole input, across buffers.
+    #[test]
+    fn ps_tail_without_a_program_end_is_flushed_with_its_source() {
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+        let ps = super::super::ps::PsDemuxer::new();
+        let (_dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            None,
+            Some(ps),
+        )
+        .unwrap();
+
+        // A bounded PES (11 bytes), then, in the next buffer, an unbounded one.
+        let first = vec![
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x77, 0x88,
+        ];
+        let second = vec![
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x99, 0xAA,
+        ];
+        pf_tx.send(Ok(first.clone())).unwrap();
+        pf_tx.send(Ok(second)).unwrap();
+        drop(pf_tx);
+
+        let batches = collect_batches(&rx, Duration::from_secs(5));
+        assert!(matches!(batches.last(), Some(DemuxBatch::Eof)));
+        let got: Vec<(Vec<u8>, u64)> = batches
+            .iter()
+            .filter_map(|b| match b {
+                DemuxBatch::Ps(p) => Some(p),
+                _ => None,
+            })
+            .flatten()
+            .map(|x| (x.data.clone(), x.source.expect("stamped").byte))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (vec![0x77, 0x88], 0),
+                (vec![0x99, 0xAA], first.len() as u64)
+            ]
+        );
+    }
+
     #[test]
     fn no_demuxer_configured_still_recycles_and_eofs() {
         // With neither ts nor ps set, the worker must still recycle buffers
