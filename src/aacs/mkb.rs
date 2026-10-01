@@ -94,8 +94,8 @@ pub(crate) fn mkb_find_body(records: &[MkbRecord], rec_type: u8) -> Option<&[u8]
 
 /// AACS protection generation a disc carries.
 ///
-/// The content cert type byte distinguishes V10 (`0x00`) from V20 (`0x10`; any
-/// non-zero, see [`super::inf::parse_content_cert`]). A V21 disc carries a V20
+/// The content cert type byte distinguishes V10 (`0x00`) from V20 (`0x10`; any other
+/// byte is rejected, see [`super::inf::parse_content_cert`]). A V21 disc carries a V20
 /// cert and is upgraded to `V21` only when the MKB has Variant records `0x2d`/`0x2f`.
 ///
 /// Key-storage stride in `Unit_Key_RO.inf` is 48 bytes for V10 and 64

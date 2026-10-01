@@ -53,6 +53,12 @@ pub struct M2tsMeta {
     /// Readers that predate it ignore the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timings: Vec<MetaTiming>,
+    /// Chapter marks; absent in older headers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chapters: Vec<MetaChapter>,
+    /// Frame format of the source ("mpeg_ps"); empty/absent = BD-TS.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_format: String,
     /// Frames on the wire carry the DiscardPadding extension (header v2). Taken
     /// from the version byte, not the JSON.
     #[serde(skip)]
@@ -67,6 +73,14 @@ pub struct MetaTiming {
     pub codec_delay_ns: u64,
     #[serde(default)]
     pub seek_preroll_ns: u64,
+}
+
+/// One chapter mark carried in the FMKV header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaChapter {
+    pub time_secs: f64,
+    #[serde(default)]
+    pub name: String,
 }
 
 /// A single stream descriptor in the metadata.
@@ -95,6 +109,12 @@ pub enum MetaStream {
         /// Base64-encoded codec initialization data (HEVCDecoderConfigurationRecord, etc.)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codec_private: Option<String>,
+        /// Display aspect `[w, h]` when it differs from the pixel grid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_aspect: Option<[u32; 2]>,
+        /// Measured CICP `[matrix, transfer, primaries, range]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cicp: Option<[u8; 4]>,
     },
     #[serde(rename = "audio")]
     Audio {
@@ -115,6 +135,9 @@ pub enum MetaStream {
         /// emit audio tracks missing their init data versus a direct rip.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codec_private: Option<String>,
+        /// Stream purpose ("commentary", "descriptive", "score", "ime"); empty = normal.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        purpose: String,
     },
     #[serde(rename = "subtitle")]
     Subtitle {
@@ -127,6 +150,9 @@ pub enum MetaStream {
         /// Base64-encoded codec initialization data (e.g. VobSub idx palette).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codec_private: Option<String>,
+        /// Qualifier ("sdh", "descriptive_service", "forced"); empty = none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        qualifier: String,
     },
 }
 
@@ -159,6 +185,10 @@ impl M2tsMeta {
                     label: v.label.clone(),
                     secondary: v.secondary,
                     codec_private: codec_private_b64(i),
+                    display_aspect: v.display_aspect.map(|(w, h)| [w, h]),
+                    cicp: v
+                        .measured_cicp
+                        .map(|c| [c.matrix, c.transfer, c.primaries, c.range]),
                 },
                 Stream::Audio(a) => MetaStream::Audio {
                     pid: a.pid,
@@ -169,6 +199,7 @@ impl M2tsMeta {
                     label: a.label.clone(),
                     secondary: a.secondary,
                     codec_private: codec_private_b64(i),
+                    purpose: purpose_id(a.purpose).into(),
                 },
                 Stream::Subtitle(s) => MetaStream::Subtitle {
                     pid: s.pid,
@@ -176,6 +207,7 @@ impl M2tsMeta {
                     language: s.language.clone(),
                     forced: s.forced,
                     codec_private: codec_private_b64(i),
+                    qualifier: qualifier_id(s.qualifier).into(),
                 },
             })
             .collect();
@@ -186,6 +218,20 @@ impl M2tsMeta {
             duration: title.duration_secs,
             streams,
             timings: Vec::new(),
+            // A non-finite time would serialize as null and fail the whole header on read.
+            chapters: title
+                .chapters
+                .iter()
+                .filter(|c| c.time_secs.is_finite())
+                .map(|c| MetaChapter {
+                    time_secs: c.time_secs,
+                    name: c.name.clone(),
+                })
+                .collect(),
+            content_format: match title.content_format {
+                crate::disc::ContentFormat::BdTs => String::new(),
+                crate::disc::ContentFormat::MpegPs => "mpeg_ps".into(),
+            },
             frame_padding: false,
         }
     }
@@ -235,6 +281,8 @@ impl M2tsMeta {
                     label,
                     secondary,
                     codec_private: _,
+                    display_aspect,
+                    cicp,
                 } => {
                     let hdr_fmt = hdr.parse().unwrap_or(crate::disc::HdrFormat::Sdr);
                     // Prefer the stored color space; pre-0.30.7 metadata has none,
@@ -258,10 +306,17 @@ impl M2tsMeta {
                             .unwrap_or(crate::disc::FrameRate::Unknown),
                         hdr: hdr_fmt,
                         color_space: cs,
-                        display_aspect: None,
+                        display_aspect: display_aspect.map(|[w, h]| (w, h)),
                         secondary: *secondary,
                         label: label.clone(),
-                        measured_cicp: None,
+                        measured_cicp: cicp.map(|[matrix, transfer, primaries, range]| {
+                            crate::disc::MeasuredCicp {
+                                matrix,
+                                transfer,
+                                primaries,
+                                range,
+                            }
+                        }),
                     })
                 }
                 MetaStream::Audio {
@@ -273,6 +328,7 @@ impl M2tsMeta {
                     label,
                     secondary,
                     codec_private: _,
+                    purpose,
                 } => Stream::Audio(AudioStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
@@ -284,7 +340,7 @@ impl M2tsMeta {
                         .parse()
                         .unwrap_or(crate::disc::SampleRate::Unknown),
                     secondary: *secondary,
-                    purpose: crate::disc::LabelPurpose::Normal,
+                    purpose: purpose_from_id(purpose),
                     label: label.clone(),
                 }),
                 MetaStream::Subtitle {
@@ -293,12 +349,13 @@ impl M2tsMeta {
                     language,
                     forced,
                     codec_private,
+                    qualifier,
                 } => Stream::Subtitle(SubtitleStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
                     language: language.clone(),
                     forced: *forced,
-                    qualifier: crate::disc::LabelQualifier::None,
+                    qualifier: qualifier_from_id(qualifier),
                     codec_data: decode_codec_private(codec_private),
                 }),
             })
@@ -311,9 +368,19 @@ impl M2tsMeta {
             size_bytes: 0,
             clips: Vec::new(),
             streams,
-            chapters: Vec::new(),
+            chapters: self
+                .chapters
+                .iter()
+                .map(|c| crate::disc::Chapter {
+                    time_secs: c.time_secs,
+                    name: c.name.clone(),
+                })
+                .collect(),
             extents: Vec::new(),
-            content_format: crate::disc::ContentFormat::BdTs,
+            content_format: match self.content_format.as_str() {
+                "mpeg_ps" => crate::disc::ContentFormat::MpegPs,
+                _ => crate::disc::ContentFormat::BdTs,
+            },
             codec_privates: self.codec_privates(),
         }
     }
@@ -335,6 +402,41 @@ impl M2tsMeta {
             })
             .collect()
     }
+}
+
+// Wire ids for the label enums (purpose shares json://'s ids); the neutral value is
+// omitted, and unknown ids read back as it.
+fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
+    match p {
+        crate::disc::LabelPurpose::Normal => "",
+        p => super::meta_sink::purpose_id(p),
+    }
+}
+
+fn purpose_from_id(id: &str) -> crate::disc::LabelPurpose {
+    use crate::disc::LabelPurpose::*;
+    [Commentary, Descriptive, Score, Ime]
+        .into_iter()
+        .find(|p| purpose_id(*p) == id)
+        .unwrap_or(Normal)
+}
+
+fn qualifier_id(q: crate::disc::LabelQualifier) -> &'static str {
+    use crate::disc::LabelQualifier::*;
+    match q {
+        None => "",
+        Sdh => "sdh",
+        DescriptiveService => "descriptive_service",
+        Forced => "forced",
+    }
+}
+
+fn qualifier_from_id(id: &str) -> crate::disc::LabelQualifier {
+    use crate::disc::LabelQualifier::*;
+    [Sdh, DescriptiveService, Forced]
+        .into_iter()
+        .find(|q| qualifier_id(*q) == id)
+        .unwrap_or(None)
 }
 
 /// Decode an optional base64 codec_private string into raw bytes. Invalid
@@ -425,6 +527,10 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     let mut meta: M2tsMeta =
         serde_json::from_slice(&json_buf).map_err(|_| crate::error::Error::NoMetadata)?;
     meta.frame_padding = magic[VERSION_BYTE] >= 2;
+    // The wire track is a u8: a frame can address at most 256 streams.
+    if meta.streams.len() > 256 {
+        return Err(crate::error::Error::NoMetadata.into());
+    }
     // The wire track is a u8: cap untrusted timings so timing() stays O(256).
     meta.timings.retain(|t| t.track < 256);
     meta.timings.truncate(256);
@@ -971,5 +1077,123 @@ mod tests {
         write_header(&mut buf, &meta).unwrap();
         let back = read_header(&mut io::Cursor::new(&buf)).unwrap().unwrap();
         assert!(back.timings.len() <= 256);
+    }
+
+    // Everything a receiver's muxer uses must survive the FMKV header.
+    fn full_title() -> DiscTitle {
+        let mut t = video_title(HdrFormat::Sdr, ColorSpace::Bt709);
+        if let Stream::Video(v) = &mut t.streams[0] {
+            v.display_aspect = Some((16, 9));
+            v.measured_cicp = Some(crate::disc::MeasuredCicp {
+                matrix: 6,
+                transfer: 6,
+                primaries: 5,
+                range: 1,
+            });
+        }
+        t.streams.push(Stream::Audio(AudioStream {
+            pid: 0x80,
+            codec: Codec::Ac3,
+            channels: crate::disc::AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: crate::disc::SampleRate::S48,
+            secondary: false,
+            purpose: crate::disc::LabelPurpose::Commentary,
+            label: String::new(),
+        }));
+        t.streams.push(Stream::Subtitle(SubtitleStream {
+            pid: 0x20,
+            codec: Codec::DvdSub,
+            language: "eng".into(),
+            forced: false,
+            qualifier: crate::disc::LabelQualifier::Sdh,
+            codec_data: None,
+        }));
+        t.chapters = vec![
+            crate::disc::Chapter {
+                time_secs: 0.0,
+                name: "1".into(),
+            },
+            crate::disc::Chapter {
+                time_secs: 312.5,
+                name: "2".into(),
+            },
+        ];
+        t.content_format = crate::disc::ContentFormat::MpegPs;
+        t
+    }
+
+    fn over_the_wire(t: &DiscTitle) -> DiscTitle {
+        let mut buf = Vec::new();
+        write_header(&mut buf, &M2tsMeta::from_title(t)).unwrap();
+        read_header(&mut io::Cursor::new(buf))
+            .unwrap()
+            .expect("header")
+            .to_title()
+    }
+
+    #[test]
+    fn display_shape_colour_labels_chapters_and_format_survive_the_header() {
+        let back = over_the_wire(&full_title());
+        let Stream::Video(v) = &back.streams[0] else {
+            panic!("video first")
+        };
+        assert_eq!(v.display_aspect, Some((16, 9)));
+        assert_eq!(
+            v.measured_cicp
+                .map(|c| (c.matrix, c.transfer, c.primaries, c.range)),
+            Some((6, 6, 5, 1))
+        );
+        let Stream::Audio(a) = &back.streams[1] else {
+            panic!("audio second")
+        };
+        assert_eq!(a.purpose, crate::disc::LabelPurpose::Commentary);
+        let Stream::Subtitle(s) = &back.streams[2] else {
+            panic!("subtitle third")
+        };
+        assert_eq!(s.qualifier, crate::disc::LabelQualifier::Sdh);
+        let marks: Vec<_> = back
+            .chapters
+            .iter()
+            .map(|c| (c.time_secs, c.name.as_str()))
+            .collect();
+        assert_eq!(marks, [(0.0, "1"), (312.5, "2")]);
+        assert_eq!(back.content_format, crate::disc::ContentFormat::MpegPs);
+    }
+
+    #[test]
+    fn a_header_without_the_optional_fields_still_reads_with_the_old_defaults() {
+        let old = r#"{"v":1,"title":"t","duration":1.0,"streams":[
+            {"type":"video","pid":4113,"codec":"hevc"},
+            {"type":"audio","pid":128,"codec":"ac3"},
+            {"type":"subtitle","pid":32,"codec":"pgs"}]}"#;
+        let t = serde_json::from_str::<M2tsMeta>(old).unwrap().to_title();
+        let Stream::Video(v) = &t.streams[0] else {
+            panic!("video")
+        };
+        assert_eq!((v.display_aspect, v.measured_cicp), (None, None));
+        assert!(t.chapters.is_empty());
+        assert_eq!(t.content_format, crate::disc::ContentFormat::BdTs);
+    }
+
+    #[test]
+    fn unknown_fields_from_a_newer_writer_are_ignored() {
+        let newer = r#"{"v":1,"title":"t","duration":1.0,"future":[1],"streams":[
+            {"type":"audio","pid":128,"codec":"ac3","future":{"x":1}}]}"#;
+        assert_eq!(
+            serde_json::from_str::<M2tsMeta>(newer)
+                .unwrap()
+                .streams
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_non_finite_chapter_time_does_not_break_the_header() {
+        let mut t = full_title();
+        t.chapters[1].time_secs = f64::NAN;
+        let back = over_the_wire(&t);
+        assert_eq!(back.chapters.len(), 1);
     }
 }

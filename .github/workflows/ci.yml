@@ -65,6 +65,8 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -92,6 +94,8 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -123,6 +127,8 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -150,13 +156,15 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check advisories bans licenses sources
-          manifest-path: libfreemkv/Cargo.toml
+      - uses: taiki-e/install-action@cargo-deny
+      # Run from the repo dir so the generated .cargo/config.toml path patches apply.
+      - run: cargo deny --all-features check advisories bans licenses sources
+        working-directory: libfreemkv
 
   # dev is the FAST lane: the platform jobs run on qa/main only (qa.yml also
   # covers macOS/Windows). `if` SKIPS (does not queue) so a never-scheduled job
@@ -173,6 +181,8 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -194,6 +204,8 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -230,6 +242,7 @@ jobs:
           freemkv-keysources = { path = "../freemkv-keysources" }
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
+          freemkv-unlock = { path = "../freemkv-unlock" }
           EOF
           done
       # freemkv's app build (`--features gui`) compiles a GTK4 + libadwaita
@@ -274,6 +287,8 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: freemkv-unlock
+          patch: freemkv-unlock
+          self: libfreemkv
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}

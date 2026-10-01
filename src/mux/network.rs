@@ -11,7 +11,7 @@ use crate::disc::DiscTitle;
 use crate::halt::{Halt, WAIT_SLICE};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 
 /// I/O buffer size for network reads/writes.
 const NET_BUF_SIZE: usize = 256 * 1024;
@@ -179,20 +179,37 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-// Resolve `addr` and return the first IP not blocked by `is_blocked_ip`;
-// errors NetworkAddrBlocked if all are blocked, since the returned
-// SocketAddr is a vetted IP literal (no second DNS lookup possible).
-fn resolve_allowed_addr(addr: &str) -> io::Result<std::net::SocketAddr> {
-    // Zero resolved addresses and "all resolved addresses blocked" both
-    // mean there is no safe address to connect to — same error either way.
-    addr.to_socket_addrs()?
-        .find(|sa| !is_blocked_ip(sa.ip()))
-        .ok_or_else(|| {
-            crate::error::Error::NetworkAddrBlocked {
-                addr: addr.to_string(),
-            }
-            .into()
-        })
+// Every resolved address of `addr` not blocked by `is_blocked_ip`, in order. Vetted IP
+// literals (no second DNS lookup). Zero resolved or all blocked: NetworkAddrBlocked.
+fn allowed_addrs(
+    addr: &str,
+    resolved: impl Iterator<Item = SocketAddr>,
+) -> io::Result<Vec<SocketAddr>> {
+    let allowed: Vec<SocketAddr> = resolved.filter(|sa| !is_blocked_ip(sa.ip())).collect();
+    if allowed.is_empty() {
+        return Err(crate::error::Error::NetworkAddrBlocked {
+            addr: addr.to_string(),
+        }
+        .into());
+    }
+    Ok(allowed)
+}
+
+// Bounds a connect to one address (the OS SYN timeout is 75 s or more, and Stop
+// cannot interrupt a blocking connect).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// Connect to the first reachable address (a dual-stack host with a dead v6 route
+// still reaches v4), as `TcpStream::connect(&str)` does.
+fn connect_first(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut last = io::Error::from(io::ErrorKind::AddrNotAvailable);
+    for a in addrs {
+        match TcpStream::connect_timeout(a, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 enum Mode {
@@ -201,6 +218,8 @@ enum Mode {
         header_written: bool,
         timings: Vec<crate::pes::TrackTiming>,
         padded: bool,
+        // Set once `finish` sent the clean end; otherwise drop resets the connection.
+        ended: bool,
     },
     Read {
         reader: BufReader<HaltRead>,
@@ -229,8 +248,8 @@ impl NetworkStream {
         // settings-save validation and now can't redirect us to a loopback/private/
         // link-local host (SSRF).
         let stream = if vet {
-            let vetted = resolve_allowed_addr(addr)?;
-            TcpStream::connect(vetted)?
+            let vetted = allowed_addrs(addr, addr.to_socket_addrs()?)?;
+            connect_first(&vetted)?
         } else {
             TcpStream::connect(addr)?
         };
@@ -238,6 +257,8 @@ impl NetworkStream {
         // so the final sub-MSS flush after finish() isn't held by Nagle — the 256 KB
         // BufWriter coalesces bulk writes, so this only affects the tail.
         stream.set_nodelay(true)?;
+        // A crashed or unplugged receiver fails the send instead of hanging it.
+        arm_keepalive(&stream);
         Ok(Self {
             disc_title: DiscTitle::empty(),
             mode: Mode::Write {
@@ -245,6 +266,7 @@ impl NetworkStream {
                 header_written: false,
                 timings: Vec::new(),
                 padded: false,
+                ended: false,
             },
         })
     }
@@ -367,6 +389,7 @@ impl crate::pes::Stream for NetworkStream {
                 header_written,
                 timings,
                 padded,
+                ..
             } => {
                 ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
                 frame.serialize_ext(writer, *padded)
@@ -380,6 +403,7 @@ impl crate::pes::Stream for NetworkStream {
             header_written,
             timings,
             padded,
+            ended,
         } = &mut self.mode
         {
             // Always emit the FMKV header before shutdown, even for a zero-frame stream,
@@ -388,6 +412,15 @@ impl crate::pes::Stream for NetworkStream {
             ensure_header_written(writer, header_written, &self.disc_title, timings, padded)?;
             writer.flush()?;
             writer.get_ref().shutdown(std::net::Shutdown::Write)?;
+            *ended = true;
+        }
+        Ok(())
+    }
+    // A failed or stopped title: reset instead of the clean end, so the receiver
+    // reports an error rather than a complete (truncated) title.
+    fn finish_incomplete(&mut self) -> io::Result<()> {
+        if let Mode::Write { writer, .. } = &self.mode {
+            reset_on_close(writer.get_ref());
         }
         Ok(())
     }
@@ -437,6 +470,25 @@ pub(crate) fn set_timing(
     }
     timings[track] = timing;
     Ok(())
+}
+
+// Make the socket's close an RST, not a FIN: the FMKV wire has no end marker, so
+// a FIN reads as a complete title. Nonblocking so the BufWriter's drop flush
+// cannot hang on a stalled receiver. Best effort: a failure leaves a FIN.
+fn reset_on_close(stream: &TcpStream) {
+    let _ = socket2::SockRef::from(stream).set_linger(Some(std::time::Duration::ZERO));
+    let _ = stream.set_nonblocking(true);
+}
+
+// A sender dropped without `finish` (error, panic, stop) must not end cleanly.
+impl Drop for NetworkStream {
+    fn drop(&mut self) {
+        if let Mode::Write { writer, ended, .. } = &self.mode
+            && !*ended
+        {
+            reset_on_close(writer.get_ref());
+        }
+    }
 }
 
 // NetworkStream is PES-only — no IOStream/Read/Write byte interface.
@@ -620,6 +672,62 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
+    // The SSRF filter keeps every allowed address in order (not just the first) and
+    // refuses an all-blocked or empty resolution.
+    #[test]
+    fn allowed_addrs_keeps_every_public_address_and_refuses_none() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let mixed = [
+            a("127.0.0.1:9"),
+            a("[2001:db8::1]:9"),
+            a("224.0.0.1:9"),
+            a("8.8.8.8:9"),
+        ];
+        let got = allowed_addrs("h:9", mixed.into_iter()).unwrap();
+        assert_eq!(got, vec![a("[2001:db8::1]:9"), a("8.8.8.8:9")]);
+        for list in [vec![a("127.0.0.1:9"), a("[::1]:9")], vec![]] {
+            let err = allowed_addrs("h:9", list.into_iter()).expect_err("no safe address");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some(crate::error::E_NETWORK_ADDR_BLOCKED)
+            );
+        }
+    }
+
+    // Frame track ids are a u8: a header declaring more than 256 streams is refused
+    // (E9008) before any per-stream state is built from it.
+    #[test]
+    fn a_header_with_more_streams_than_track_ids_is_refused() {
+        let mut title = sample_title();
+        let audio = title.streams[1].clone();
+        for n in [256usize, 257] {
+            title.streams.resize(n, audio.clone());
+            let mut wire = Vec::new();
+            meta::write_header(&mut wire, &meta::M2tsMeta::from_title(&title)).unwrap();
+            let res = meta::read_header(&mut wire.as_slice());
+            match n {
+                256 => assert_eq!(res.unwrap().unwrap().streams.len(), 256),
+                _ => assert_eq!(
+                    crate::error::error_code(&res.expect_err("too many streams")),
+                    Some(crate::error::E_NO_METADATA)
+                ),
+            }
+        }
+    }
+
+    // A dead first address falls through to the next one.
+    #[test]
+    fn connect_first_falls_through_a_dead_address() {
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let live = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = connect_first(&[dead, live.local_addr().unwrap()]).expect("reaches live");
+        assert_eq!(stream.peer_addr().unwrap(), live.local_addr().unwrap());
+        assert!(connect_first(&[dead]).is_err());
+    }
+
     fn sample_title() -> DiscTitle {
         DiscTitle {
             playlist: "NetworkTest".into(),
@@ -705,6 +813,87 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].track, 0);
         assert_eq!(frames[0].pts, 90000);
+    }
+
+    // Accept one sender and read to the end; returns the frame count and the
+    // terminal read result (Ok(None) = a clean end, Err = a failed sender).
+    type ReadEnd = (usize, io::Result<Option<crate::pes::PesFrame>>);
+
+    fn spawn_ending_reader() -> (std::net::SocketAddr, std::thread::JoinHandle<ReadEnd>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut ns = NetworkStream::accept_from(listener).unwrap();
+            let mut n = 0;
+            loop {
+                match crate::pes::Stream::read(&mut ns) {
+                    Ok(Some(_)) => n += 1,
+                    end => return (n, end),
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    fn one_frame() -> crate::pes::PesFrame {
+        crate::pes::PesFrame {
+            discard_padding_ns: 0,
+            coding: None,
+            source: None,
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![0x47; 192],
+            duration_ns: None,
+        }
+    }
+
+    // A sender that fails mid-title (never finished, or finished incomplete) must
+    // reach the receiver as an error, never as the clean end of a short title.
+    #[test]
+    fn a_sender_that_fails_mid_title_is_an_error_at_the_receiver() {
+        use crate::pes::Stream as _;
+        for incomplete in [false, true] {
+            let (addr, handle) = spawn_ending_reader();
+            let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+                .unwrap()
+                .meta(&sample_title());
+            writer.write(&one_frame()).unwrap();
+            if incomplete {
+                writer.finish_incomplete().unwrap();
+            }
+            drop(writer);
+            let (_, end) = handle.join().unwrap();
+            assert!(end.is_err(), "incomplete={incomplete}: got {end:?}");
+        }
+        // A finished sender still ends cleanly.
+        let (addr, handle) = spawn_ending_reader();
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&sample_title());
+        writer.write(&one_frame()).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        let (n, end) = handle.join().unwrap();
+        assert!(matches!(end, Ok(None)), "got {end:?}");
+        assert_eq!(n, 1);
+    }
+
+    // A connection cut inside a frame (even with a clean FIN) is an error.
+    #[test]
+    fn a_connection_cut_mid_frame_is_an_error_at_the_receiver() {
+        let (addr, handle) = spawn_ending_reader();
+        let mut raw = TcpStream::connect(addr).unwrap();
+        let m = meta::M2tsMeta::from_title(&sample_title());
+        meta::write_header(&mut raw, &m).unwrap();
+        let mut frame = Vec::new();
+        one_frame().serialize(&mut frame).unwrap();
+        raw.write_all(&frame).unwrap();
+        raw.write_all(&frame[..frame.len() / 2]).unwrap();
+        raw.shutdown(std::net::Shutdown::Write).unwrap();
+        let (n, end) = handle.join().unwrap();
+        assert_eq!(n, 1, "the whole frame arrives");
+        assert!(end.is_err(), "the cut frame must fail, got {end:?}");
     }
 
     #[test]
@@ -943,7 +1132,7 @@ mod tests {
             let r = NetworkStream::accept_from_with_halt(listener, Some(h)).map(|_| ());
             let _ = tx.send(r);
         });
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // No sender ever connects: the accept observes the cancel wherever it lands.
         halt.cancel();
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -960,9 +1149,11 @@ mod tests {
         let halt = crate::halt::Halt::new();
         let h = halt.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut ns = NetworkStream::accept_from_with_halt(listener, Some(h)).unwrap();
-            let _ = tx.send(pes::Stream::read(&mut ns).map(|_| ()));
+            let r = NetworkStream::accept_from_with_halt(listener, Some(h));
+            let _ = ready_tx.send(());
+            let _ = tx.send(r.and_then(|mut ns| pes::Stream::read(&mut ns).map(|_| ())));
         });
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
@@ -977,7 +1168,10 @@ mod tests {
             ensure_header_written(w, header_written, &sample_title(), &[], padded).unwrap();
             w.flush().unwrap();
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Handshake, not a sleep: cancel once the header is in and the frame read begins.
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the receiver accepted");
         halt.cancel();
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(5))

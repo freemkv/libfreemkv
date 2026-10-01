@@ -162,6 +162,22 @@ impl DiscSession {
         Self::bring_up(drive, spec, Some(halt.clone()))
     }
 
+    /// A session over a drive the caller already opened, with no bring-up and no scan:
+    /// for a follow-up such as an on-demand eject that must end through [`Self::finish`]
+    /// on this one handle rather than a second open (stop design §2.5).
+    pub fn from_drive(drive: Drive) -> DiscSession {
+        let device = drive.device_path().to_string();
+        DiscSession {
+            drive: Some(drive),
+            device,
+            spec: KeySpec::default(),
+            disc: None,
+            reader: None,
+            halt: None,
+            progress: None,
+        }
+    }
+
     // Test-only: give a `from_parts_for_test` session the op token `open_with` would.
     #[cfg(test)]
     pub(crate) fn set_halt_for_test(&mut self, halt: &Halt) {
@@ -431,6 +447,16 @@ impl DiscSession {
         }
     }
 
+    /// Borrow the session's sector source (the staged reader, else the drive) for a
+    /// read that must leave the handle in the session, so it can still [`Self::finish`].
+    pub fn source_mut(&mut self) -> Option<&mut dyn SectorSource> {
+        match (self.reader.as_mut(), self.drive.as_mut()) {
+            (Some(r), _) => Some(r.as_mut()),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
+        }
+    }
+
     /// Consume the session, returning the sector source staged for a later mux
     /// (steps 3–4). `None` until that path populates it.
     pub fn into_reader(self) -> Option<Box<dyn SectorSource>> {
@@ -446,6 +472,11 @@ impl DiscSession {
     /// boundary-audit contract).
     pub fn take_reader(&mut self) -> Option<Box<dyn SectorSource>> {
         self.reader.take()
+    }
+
+    // The staged sector source, still in place (checks that must not consume it).
+    pub(crate) fn staged_reader(&self) -> Option<&dyn SectorSource> {
+        self.reader.as_deref()
     }
 
     // Test-only: build a session over an injected reader + already-scanned disc without opening

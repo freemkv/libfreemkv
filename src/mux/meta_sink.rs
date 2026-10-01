@@ -28,6 +28,21 @@ fn vtt_time(secs: f64) -> String {
     )
 }
 
+/// One-line WebVTT cue text: `&`, `<`, `>` escaped (so no `-->`), line breaks collapsed.
+fn vtt_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\r' | '\n' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// WebVTT chapter cues (`.vtt`). Each chapter spans until the next one starts
 /// (the last runs to its own start — length is unknown without the title tail).
 fn chapters_vtt(chapters: &[Chapter]) -> String {
@@ -48,7 +63,7 @@ fn chapters_vtt(chapters: &[Chapter]) -> String {
         let name = if c.name.is_empty() {
             (i + 1).to_string()
         } else {
-            c.name.clone()
+            vtt_text(&c.name)
         };
         s.push_str(&format!(
             "{}\n{} --> {}\n{}\n\n",
@@ -158,7 +173,7 @@ fn sample_rates(rate: crate::disc::SampleRate) -> Vec<u32> {
 
 /// Compact id for an audio stream's editorial purpose (no localized prose —
 /// the app maps it to display text). Mirrors the `Codec::id()` convention.
-fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
+pub(crate) fn purpose_id(p: crate::disc::LabelPurpose) -> &'static str {
     use crate::disc::LabelPurpose::*;
     match p {
         Normal => "normal",
@@ -303,6 +318,50 @@ mod tests {
                 name: "2".into(),
             },
         ]
+    }
+
+    fn cue_times(chapters: &[(f64, &str)]) -> Vec<String> {
+        let chapters: Vec<_> = chapters
+            .iter()
+            .map(|&(t, n)| Chapter {
+                time_secs: t,
+                name: n.into(),
+            })
+            .collect();
+        chapters_vtt(&chapters)
+            .lines()
+            .filter(|l| l.contains(" --> "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_vtt_cue_always_ends_after_it_starts() {
+        assert_eq!(
+            cue_times(&[(10.0, "1"), (10.0, "2")]),
+            [
+                "00:00:10.000 --> 00:00:11.000",
+                "00:00:10.000 --> 00:00:11.000"
+            ]
+        );
+        assert_eq!(
+            cue_times(&[(12.0, "1"), (5.0, "2"), (20.0, "3")]),
+            [
+                "00:00:12.000 --> 00:00:13.000",
+                "00:00:05.000 --> 00:00:20.000",
+                "00:00:20.000 --> 00:00:21.000"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vtt_chapter_name_cannot_forge_a_cue() {
+        let vtt = chapters_vtt(&[Chapter {
+            time_secs: 0.0,
+            name: "a & <b>\n\n9\n00:00:01.000 --> 00:00:02.000\nforged".into(),
+        }]);
+        assert_eq!(vtt.matches(" --> ").count(), 1, "{vtt}");
+        assert!(vtt.contains("a &amp; &lt;b&gt;"), "{vtt}");
     }
 
     #[test]

@@ -392,6 +392,21 @@ impl<W: Write + Send> MpgSink<W> {
         let Payload::Lpcm { channels, rate, .. } = self.outs[out].spec.payload else {
             return Vec::new();
         };
+        // Sink units are 24-bit; a 16-bit source's frames are widened (low byte 0), which
+        // `dvd_bits_needed` packs back to 16-bit.
+        let cp = self.title.codec_privates.get(self.outs[out].track);
+        let wide;
+        let data = if crate::mux::codec::lpcm::output_depth(cp.and_then(|c| c.as_deref())) == 16 {
+            wide = data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|w| [w[0], w[1], 0])
+                .collect::<Vec<u8>>();
+            &wide
+        } else {
+            data
+        };
         let st = &mut self.lpcm[out];
         let frame = channels * 3;
         if !data.is_empty() {

@@ -112,9 +112,7 @@ impl PrefetchedSectorSource {
         // never advances). All production callers pass nonzero; a 0 here is
         // a caller bug, so reject rather than spin a thread with no progress.
         if batch_sectors == 0 {
-            return Err(crate::error::Error::IoError {
-                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
-            });
+            return Err(crate::error::Error::MuxBatchSectorsZero);
         }
         // A zero alignment is worse: the producer hits `remaining % unit_align`
         // and panics divide-by-zero, surfacing as a misleading DemuxThreadPanicked
@@ -812,10 +810,7 @@ mod tests {
     fn zero_batch_rejected() {
         let _serial = serial();
         let res = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 0, None);
-        let Err(crate::error::Error::IoError { source }) = res else {
-            panic!("zero batch_sectors must be rejected with InvalidInput");
-        };
-        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(res.err().map(|e| e.code()), Some(9085));
     }
 
     // A batch below one unit is clamped up to a unit, never splitting an AACS unit.

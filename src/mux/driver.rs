@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::decrypt::DecryptKeys;
@@ -26,18 +26,27 @@ use super::resolve::{
 };
 use super::videomap::{Medium, SourceInfo};
 
-// The source medium a parsed input URL denotes, used only for provenance. Non-legal-input URLs
-// never reach a sink, so their arm is immaterial — falls to the `File` default.
+// The source medium a parsed input URL denotes, used only for provenance. Exhaustive, so a
+// new scheme must be placed; sink-only schemes never reach here and take the `File` default.
 fn url_medium(parsed: &StreamUrl) -> Medium {
     match parsed {
         StreamUrl::Disc { .. } => Medium::Disc,
-        StreamUrl::Iso { .. } => Medium::Iso,
+        // `dir://` is an image-level source: a UDF volume synthesized over the folder.
+        StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => Medium::Iso,
         StreamUrl::Mkv { .. }
         | StreamUrl::M2ts { .. }
         | StreamUrl::Mp4 { .. }
         | StreamUrl::Mpg { .. } => Medium::File,
         StreamUrl::Network { .. } | StreamUrl::Stdio => Medium::Stream,
-        _ => Medium::File,
+        StreamUrl::Null
+        | StreamUrl::Demux { .. }
+        | StreamUrl::Video { .. }
+        | StreamUrl::Audio { .. }
+        | StreamUrl::Sub { .. }
+        | StreamUrl::Fvi { .. }
+        | StreamUrl::Chapters { .. }
+        | StreamUrl::Json { .. }
+        | StreamUrl::Unknown { .. } => Medium::File,
     }
 }
 
@@ -510,9 +519,13 @@ fn mux_keyed(
                     .unwrap_or_else(|| disc.volume_id.clone());
                 (title, disc.content_format, playlist, source)
             };
-            let reader = session.take_reader().ok_or_else(|| Error::DeviceNotReady {
-                path: session.device_path().to_string(),
-            })?;
+            // Refuse the selection / the set's gate BEFORE taking the reader, so a
+            // refused mux leaves the session retryable (as mux_unkeyed does).
+            let path = session.device_path().to_string();
+            let not_ready = || Error::DeviceNotReady { path: path.clone() };
+            let staged = session.staged_reader().ok_or_else(not_ready)?;
+            let title = live_keyed_title(staged, title, set, opts)?;
+            let reader = session.take_reader().ok_or_else(not_ready)?;
             let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
             (stream, Some(playlist), source)
         }
@@ -526,6 +539,7 @@ fn mux_keyed(
                 playlist: title.playlist.clone(),
                 ..SourceInfo::default()
             };
+            let title = live_keyed_title(&*reader, title, set, opts)?;
             let stream = live_keyed(reader, title, format, set, opts, halt, &events)?;
             (stream, None, source)
         }
@@ -545,16 +559,13 @@ fn mux_keyed(
     )
 }
 
-// The inline live-drive `DiscStream` over the set: its keys, map and on-arrival proof.
-fn live_keyed(
-    reader: Box<dyn SectorSource>,
+// The live title after the selection, once the set's gate admits it over `reader`.
+fn live_keyed_title(
+    reader: &dyn SectorSource,
     mut title: DiscTitle,
-    format: crate::disc::ContentFormat,
     set: &crate::keys::ResolvedKeySet,
     opts: &MuxOptions,
-    halt: &Halt,
-    events: &std::sync::Arc<dyn MuxEvents>,
-) -> std::io::Result<Box<dyn Stream>> {
+) -> std::io::Result<DiscTitle> {
     opts.selection
         .apply(&mut title)
         .map_err(std::io::Error::from)?;
@@ -564,6 +575,20 @@ fn live_keyed(
         .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
         .collect();
     set.gate(reader.random_access(), Some(&ranges), false)?;
+    Ok(title)
+}
+
+// The inline live-drive `DiscStream` over the set (`title` from `live_keyed_title`): its
+// keys, map and on-arrival proof.
+fn live_keyed(
+    reader: Box<dyn SectorSource>,
+    title: DiscTitle,
+    format: crate::disc::ContentFormat,
+    set: &crate::keys::ResolvedKeySet,
+    opts: &MuxOptions,
+    halt: &Halt,
+    events: &std::sync::Arc<dyn MuxEvents>,
+) -> std::io::Result<Box<dyn Stream>> {
     let stream = crate::mux::DiscStream::new(
         reader,
         title,
@@ -824,7 +849,7 @@ fn drive_mux(
         progress: &flush,
         halt,
     };
-    let mut output_stream = output_with(dest_url, &out_title, source, Some(out_flush))?;
+    let mut output_stream = open_output(dest_url, &out_title, source, out_flush)?;
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
@@ -858,10 +883,12 @@ fn drive_mux(
     // overlaps the next `stream.read()`. `bytes` mirrors the consumer's running
     // written-byte count out to the driving thread for `on_write_progress`.
     let bytes = Arc::new(AtomicU64::new(0));
+    let read_failed = Arc::new(AtomicBool::new(false));
     let sink = WriteSink {
         output: output_stream,
         bytes: bytes.clone(),
         late_configs: late_configs.clone(),
+        read_failed: read_failed.clone(),
     };
     let consumer_progress = flush.progress().clone();
     let pipe = Pipeline::spawn_named_with_progress(
@@ -926,6 +953,7 @@ fn drive_mux(
                     // Drain + join the consumer, then report the ROOT cause: a
                     // write failure (e.g. volume full) precedes and explains the
                     // read error, so prefer it — except Halt/join-timeout, not root causes.
+                    read_failed.store(true, Ordering::Relaxed);
                     match pipe.finish_with_halt(Some(halt)) {
                         Err(w @ (Error::Halted | Error::PipelineJoinTimeout)) => {
                             tracing::debug!(
@@ -1049,6 +1077,20 @@ fn drops_mp2_extensions(dest_url: &str) -> bool {
     )
 }
 
+// The sink for `dest_url`; a test may substitute its own (thread-local seam).
+fn open_output(
+    dest_url: &str,
+    title: &DiscTitle,
+    source: Option<&SourceInfo>,
+    flush: super::resolve::OutputFlush<'_>,
+) -> std::io::Result<Box<dyn Stream>> {
+    #[cfg(test)]
+    if let Some(sink) = tests::TEST_SINK.with(|s| s.borrow_mut().take()) {
+        return Ok(sink);
+    }
+    output_with(dest_url, title, source, Some(flush))
+}
+
 // What the write consumer hands back once the container is finalised.
 struct SinkClose {
     bytes: u64,
@@ -1062,9 +1104,25 @@ struct WriteSink {
     output: CountingStream,
     bytes: Arc<AtomicU64>,
     late_configs: LateConfigs,
+    // Set by the driver when the title's read failed: the output is incomplete.
+    read_failed: Arc<AtomicBool>,
 }
 
 impl WriteSink {
+    fn end(mut self, complete: bool) -> Result<SinkClose, Error> {
+        self.apply_late_configs()?;
+        match complete {
+            true => self.output.finish(),
+            false => self.output.finish_incomplete(),
+        }
+        .map_err(Error::from)?;
+        // Sample AFTER finish(): the mp4 sink decides its drops there.
+        Ok(SinkClose {
+            bytes: self.output.bytes_written(),
+            undelivered: self.output.undelivered_streams(),
+        })
+    }
+
     fn apply_late_configs(&mut self) -> Result<(), Error> {
         let late = std::mem::take(&mut *lock_late(&self.late_configs));
         for (track, cp) in late {
@@ -1092,14 +1150,14 @@ impl Sink<PesFrame> for WriteSink {
         Ok(Flow::Continue)
     }
 
-    fn close(mut self) -> Result<SinkClose, Error> {
-        self.apply_late_configs()?;
-        self.output.finish().map_err(Error::from)?;
-        // Sample AFTER finish(): the mp4 sink decides its drops there.
-        Ok(SinkClose {
-            bytes: self.output.bytes_written(),
-            undelivered: self.output.undelivered_streams(),
-        })
+    fn close(self) -> Result<SinkClose, Error> {
+        let complete = !self.read_failed.load(Ordering::Relaxed);
+        self.end(complete)
+    }
+
+    // A stopped title is incomplete too: a wire sink must not end it cleanly.
+    fn close_stopped(self) -> Result<SinkClose, Error> {
+        self.end(false)
     }
 }
 
@@ -1107,7 +1165,109 @@ impl Sink<PesFrame> for WriteSink {
 mod tests {
     use super::*;
     use crate::disc::DiscTitle;
-    use std::sync::atomic::AtomicBool;
+
+    thread_local! {
+        // A sink `drive_mux` opens instead of its URL's, once (see `open_output`).
+        pub(super) static TEST_SINK: std::cell::RefCell<Option<Box<dyn Stream>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // A sink that logs how it ended ("finish" / "finish_incomplete") and can fail
+    // its `fail_at`-th write with E9000.
+    struct EndSpy {
+        info: DiscTitle,
+        writes: usize,
+        fail_at: Option<usize>,
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Stream for EndSpy {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            Ok(None)
+        }
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            self.writes += 1;
+            if self.fail_at.is_some_and(|n| self.writes >= n) {
+                return Err(Error::StreamReadOnly.into());
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            self.log.lock().unwrap().push("finish");
+            Ok(())
+        }
+        fn finish_incomplete(&mut self) -> std::io::Result<()> {
+            self.log.lock().unwrap().push("finish_incomplete");
+            Ok(())
+        }
+        fn info(&self) -> &DiscTitle {
+            &self.info
+        }
+    }
+
+    // Run `stream` into an `EndSpy`; returns the result and the sink's end log.
+    fn run_into_spy(
+        stream: FakeStream,
+        halt: &Halt,
+        fail_at: Option<usize>,
+    ) -> (std::io::Result<MuxOutcome>, Vec<&'static str>) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spy = EndSpy {
+            info: stream.info.clone(),
+            writes: 0,
+            fail_at,
+            log: log.clone(),
+        };
+        TEST_SINK.with(|s| *s.borrow_mut() = Some(Box::new(spy)));
+        let res = drive_mux(Box::new(stream), "null://", halt, &NoopEvents, None, None);
+        TEST_SINK.with(|s| s.borrow_mut().take());
+        let log = log.lock().unwrap().clone();
+        (res, log)
+    }
+
+    // A read failure mid-title is the reported error; the consumer is joined and
+    // ends the output as incomplete (a network receiver sees a failure).
+    #[test]
+    fn a_read_failure_mid_title_is_the_error_and_ends_the_output_incomplete() {
+        let mut fs = FakeStream::new(1).with_frames(10);
+        fs.fail_read_at = Some(4);
+        let (res, log) = run_into_spy(fs, &Halt::new(), None);
+        let err = res.expect_err("a read failure is an error");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DISC_READ)
+        );
+        assert_eq!(log, vec!["finish_incomplete"], "joined, ended incomplete");
+    }
+
+    // The sink failed first: its write error is the root cause, not the later read error.
+    #[test]
+    fn a_write_failure_is_reported_over_the_read_failure_it_precedes() {
+        let mut fs = FakeStream::new(1).with_frames(10);
+        fs.fail_read_at = Some(6);
+        let (res, log) = run_into_spy(fs, &Halt::new(), Some(2));
+        let err = res.expect_err("a write failure is an error");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_STREAM_READ_ONLY),
+            "got {err}"
+        );
+        assert!(log.is_empty(), "a failed sink is never finalised: {log:?}");
+    }
+
+    // A stop ends the output incomplete; a clean drain finishes it.
+    #[test]
+    fn only_a_clean_drain_finishes_the_output() {
+        let halt = Halt::new();
+        let fs = FakeStream::new(1).with_frames(10).cancels(halt.clone(), 3);
+        let (res, log) = run_into_spy(fs, &halt, None);
+        assert!(!res.expect("a stop is not an error").completed);
+        assert_eq!(log, vec!["finish_incomplete"]);
+
+        let (res, log) = run_into_spy(FakeStream::new(1).with_frames(10), &Halt::new(), None);
+        assert!(res.expect("clean drain").completed);
+        assert_eq!(log, vec!["finish"]);
+    }
 
     /// A synthetic [`Stream`] the tests fully control: a queue of frames, a
     /// configurable `headers_ready` behaviour, and an optional halt it cancels
@@ -1130,6 +1290,8 @@ mod tests {
         /// value — simulating a halt landing DURING a blocking `fill_extents` read
         /// (the common operator-stop case).
         halt_err_at_read: Option<usize>,
+        /// If set, `read()` fails with a disc read error (not a halt) at this read.
+        fail_read_at: Option<usize>,
         /// If set, `headers_ready` also flips once `read()` has returned `None`.
         ready_on_eof: bool,
         eof_seen: bool,
@@ -1163,6 +1325,7 @@ mod tests {
                 cancel_halt: None,
                 read_observer: None,
                 halt_err_at_read: None,
+                fail_read_at: None,
                 ready_on_eof: false,
                 eof_seen: false,
             }
@@ -1210,6 +1373,14 @@ mod tests {
                 && self.reads >= after
             {
                 return Err(crate::error::Error::Halted.into());
+            }
+            if self.fail_read_at.is_some_and(|at| self.reads >= at) {
+                return Err(crate::error::Error::DiscRead {
+                    sector: 0,
+                    status: Some(0x02),
+                    sense: None,
+                }
+                .into());
             }
             let f = self.frames.pop_front();
             self.eof_seen |= f.is_none();
@@ -1413,6 +1584,8 @@ mod tests {
         assert_eq!(url_medium(&parse_url("mp4://m.mp4")), Medium::File);
         assert_eq!(url_medium(&parse_url("network://h:9000")), Medium::Stream);
         assert_eq!(url_medium(&parse_url("stdio://")), Medium::Stream);
+        // A disc folder is an image-level source (a synthesized UDF volume).
+        assert_eq!(url_medium(&parse_url("dir:///m/BD")), Medium::Iso);
     }
 
     // ── chapters:// / json:// short-circuit runs even when headers never
@@ -1868,11 +2041,11 @@ mod tests {
             Arc::new(NoopEvents),
         )
         .expect_err("a missing staged reader must be a clean error, not a panic");
-        // The device-name-carrying DeviceNotReady (code E4xxx) round-trips through
-        // io::Error; assert it is NOT a decrypt/other-shaped failure.
-        assert!(
-            err.to_string().starts_with('E'),
-            "expected a typed libfreemkv error (E<code>…), got: {err}"
+        // The device-name-carrying DeviceNotReady round-trips through io::Error.
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DEVICE_NOT_READY),
+            "got {err}"
         );
     }
 
@@ -2283,7 +2456,7 @@ mod tests {
         use crate::disc::{AudioChannels, SampleRate};
         let dir = tempfile::tempdir().unwrap();
         let url = format!("mkv://{}", dir.path().join("o.mkv").display());
-        let layout = Some(b"BDLP\xB4".to_vec());
+        let layout = Some(b"BDLP\xB4\x18".to_vec());
         let src = LpcmSource::new(AudioChannels::Surround51, SampleRate::S48, layout);
         let spy = TitleSpy::default();
         run(src, &url, &spy);
@@ -2468,6 +2641,7 @@ mod tests {
             })),
             bytes: Arc::new(AtomicU64::new(0)),
             late_configs: LateConfigs::default(),
+            read_failed: Arc::default(),
         };
         let SinkClose { bytes, undelivered } = sink.close().expect("close succeeds");
         assert_eq!(bytes, 0);
@@ -2486,12 +2660,14 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         const FRAME: usize = 64 * 1024 * 1024; // 64 MiB per frame
         let cap_frames = HEADER_BUFFER_CAP_BYTES / FRAME; // 8 frames == cap
-        const MANY: usize = 200; // vastly more than the cap needs
+        // A few past the cap: enough to prove the cap stops the pump, without
+        // allocating (commit-charged on Windows) hundreds of 64 MiB frames.
+        let many = cap_frames + 4;
 
         let reads_seen = Arc::new(AtomicUsize::new(0));
         let mut fs = FakeStream::new(1).never_ready();
         fs.read_observer = Some(reads_seen.clone());
-        for i in 0..MANY {
+        for i in 0..many {
             fs.frames.push_back(PesFrame {
                 discard_padding_ns: 0,
                 track: 0,
@@ -2524,7 +2700,7 @@ mod tests {
         let reads = reads_seen.load(Ordering::SeqCst);
         assert!(
             reads <= cap_frames + 1,
-            "must fail after ~{cap_frames} frames (cap), not drain all {MANY} (read {reads})"
+            "must fail after ~{cap_frames} frames (cap), not drain all {many} (read {reads})"
         );
     }
 
@@ -2924,6 +3100,40 @@ mod tests {
         assert!(out.completed && out.bytes_written > 0);
     }
 
+    /// A refused selection leaves the session's reader staged: a retry on the same
+    /// session muxes instead of failing DeviceNotReady.
+    #[test]
+    fn mux_with_keys_session_keeps_its_reader_when_the_selection_is_refused() {
+        let key = [0x5A; 16];
+        let (reader, title, _) = keyed_live(key);
+        let mut disc = aacs_session_disc(title);
+        disc.capacity_sectors = 16;
+        let set = crate::keys::ResolvedKeySet::keyed_for_test(&disc, key, &[(0, 3)]);
+        let mut session = DiscSession::from_parts_for_test(Some(disc), Some(reader));
+        let mut bad = keyed_opts();
+        bad.selection.audio = crate::mux::select::PidFilter::Only(vec![0x0FFF]);
+        let run = |session: &mut DiscSession, opts: &MuxOptions| {
+            mux_with_keys(
+                MuxSource::Session {
+                    session,
+                    title_index: 0,
+                },
+                Some(&set),
+                "null://",
+                opts,
+                &Halt::new(),
+                Arc::new(NoopEvents),
+            )
+        };
+        let err = run(&mut session, &bad).expect_err("unknown PID is refused");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_SELECTION_PID_UNKNOWN)
+        );
+        let out = run(&mut session, &keyed_opts()).expect("the retry still has its reader");
+        assert!(out.completed);
+    }
+
     /// A key set for another disc is a typed E7013 on a session, never a debug-build panic.
     #[test]
     fn mux_with_keys_session_wrong_disc_set_is_e7013() {
@@ -2995,9 +3205,12 @@ mod tests {
             &Halt::new(),
             Arc::new(NoopEvents),
         );
-        assert!(
-            rescanned.is_err(),
-            "a URL source scans the image, which has no filesystem"
+        // The scan reads the UDF anchor (LBA 256) past this 16-sector image's end.
+        let err = rescanned.expect_err("a URL source scans the image, which has no filesystem");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_IMAGE_ENDS_BEFORE_READ),
+            "got {err}"
         );
     }
 
@@ -3371,6 +3584,230 @@ mod tests {
                 "phase {phase}: blanked units are counted"
             );
             assert_eq!(live.lost_bytes, iso.lost_bytes, "phase {phase}");
+        }
+    }
+
+    // Clear BD-TS audio: `units` aligned units, each 32 one-packet audio PES on PID 0x1100.
+    fn clear_audio_image(units: usize) -> Vec<u8> {
+        let pkt = bdts_data_packet(0x1100, true, &audio_pes(&PLAIN_ES));
+        pkt.repeat(units * 32)
+    }
+
+    // Serves an in-memory image; any read covering `bad` fails as a disc read error.
+    struct BadSectorImage {
+        data: Vec<u8>,
+        bad: Option<u32>,
+    }
+    impl SectorSource for BadSectorImage {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            if self
+                .bad
+                .is_some_and(|b| (lba..lba + count as u32).contains(&b))
+            {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(0x02),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            let start = lba as usize * 2048;
+            for (i, b) in buf[..bytes].iter_mut().enumerate() {
+                *b = self.data.get(start + i).copied().unwrap_or(0);
+            }
+            Ok(bytes)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            (self.data.len() / 2048) as u32
+        }
+    }
+
+    // A two-audio-stream (0x1100, 0x1101) title over `units` clear units.
+    fn clear_title(units: usize) -> DiscTitle {
+        let mut title = aac_audio_title(0x1100);
+        title.streams.extend(aac_audio_title(0x1101).streams);
+        title.extents = vec![crate::disc::Extent {
+            start_lba: 0,
+            sector_count: units as u32 * 3,
+        }];
+        title
+    }
+
+    fn clear_live(units: usize, bad: Option<u32>) -> MuxSource<'static> {
+        MuxSource::Live {
+            reader: Box::new(BadSectorImage {
+                data: clear_audio_image(units),
+                bad,
+            }),
+            title: clear_title(units),
+            format: crate::disc::ContentFormat::BdTs,
+        }
+    }
+
+    // `raw` routes a clear Live source through mux_unkeyed; otherwise mux_keyed runs it
+    // over the keyless set.
+    fn clear_opts(raw: bool) -> MuxOptions {
+        MuxOptions {
+            raw,
+            ..keyed_opts()
+        }
+    }
+
+    // Stop pressed while the sink is wedged in a write: the join gives up after the
+    // grace and the run is reported incomplete (finalize_failed), not a hard error.
+    #[test]
+    fn a_wedged_sink_at_stop_forces_an_incomplete_outcome() {
+        struct WedgedFinish {
+            info: DiscTitle,
+            halt: Halt,
+        }
+        impl Stream for WedgedFinish {
+            fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+                Ok(None)
+            }
+            fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+                self.halt.cancel();
+                std::thread::sleep(Duration::from_secs(9));
+                Ok(())
+            }
+            fn finish(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn info(&self) -> &DiscTitle {
+                &self.info
+            }
+        }
+        let fs = FakeStream::new(1).with_frames(5);
+        let halt = Halt::new();
+        let sink = WedgedFinish {
+            info: fs.info.clone(),
+            halt: halt.clone(),
+        };
+        TEST_SINK.with(|s| *s.borrow_mut() = Some(Box::new(sink)));
+        let t = std::time::Instant::now();
+        let out = drive_mux(Box::new(fs), "null://", &halt, &NoopEvents, None, None)
+            .expect("a wedged finalise is an incomplete run, not an error");
+        TEST_SINK.with(|s| s.borrow_mut().take());
+        assert!(!out.completed && out.output_opened);
+        assert!(t.elapsed() < Duration::from_secs(8), "bounded by the grace");
+    }
+
+    // skip_errors reaches the live DiscStream on every arm that builds one.
+    #[test]
+    fn skip_errors_reaches_every_live_arm() {
+        let session = |bad| {
+            let mut disc = aacs_session_disc(clear_title(2));
+            disc.aacs = None;
+            disc.encrypted = false;
+            let reader = BadSectorImage {
+                data: clear_audio_image(2),
+                bad,
+            };
+            DiscSession::from_parts_for_test(Some(disc), Some(Box::new(reader)))
+        };
+        for arm in ["live-unkeyed", "live-keyed", "session"] {
+            for skip in [true, false] {
+                let mut s = session(Some(4));
+                let (src, raw) = match arm {
+                    "live-unkeyed" => (clear_live(2, Some(4)), true),
+                    "live-keyed" => (clear_live(2, Some(4)), false),
+                    _ => (
+                        MuxSource::Session {
+                            session: &mut s,
+                            title_index: 0,
+                        },
+                        false,
+                    ),
+                };
+                let opts = MuxOptions {
+                    skip_errors: skip,
+                    ..clear_opts(raw)
+                };
+                let res = mux_with_keys(
+                    src,
+                    None,
+                    "null://",
+                    &opts,
+                    &Halt::new(),
+                    Arc::new(NoopEvents),
+                );
+                match skip {
+                    true => {
+                        let out = res.expect("the bad sector is skipped");
+                        assert!(out.completed && out.errors > 0, "{arm}");
+                    }
+                    false => assert_eq!(
+                        crate::error::error_code(&res.expect_err("bad sector")),
+                        Some(crate::error::E_DISC_READ),
+                        "{arm}"
+                    ),
+                }
+            }
+        }
+    }
+
+    // The selection prunes the opened title on every MuxSource arm.
+    #[test]
+    fn the_selection_prunes_every_arm() {
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("clip.iso");
+        std::fs::write(&iso, clear_audio_image(2)).unwrap();
+        let mut disc = aacs_session_disc(clear_title(2));
+        disc.aacs = None;
+        disc.encrypted = false;
+        let mut session = DiscSession::from_parts_for_test(
+            Some(disc),
+            Some(Box::new(BadSectorImage {
+                data: clear_audio_image(2),
+                bad: None,
+            })),
+        );
+        let sel = crate::StreamSelection {
+            audio: crate::mux::select::PidFilter::Only(vec![0x1100]),
+            ..Default::default()
+        };
+        for arm in [
+            "live-unkeyed",
+            "live-keyed",
+            "iso-unkeyed",
+            "iso-keyed",
+            "session",
+        ] {
+            let (src, raw) = match arm {
+                "live-unkeyed" => (clear_live(2, None), true),
+                "live-keyed" => (clear_live(2, None), false),
+                "session" => (
+                    MuxSource::Session {
+                        session: &mut session,
+                        title_index: 0,
+                    },
+                    false,
+                ),
+                _ => (
+                    MuxSource::Iso {
+                        path: &iso,
+                        title: clear_title(2),
+                        format: crate::disc::ContentFormat::BdTs,
+                    },
+                    arm == "iso-unkeyed",
+                ),
+            };
+            let opts = MuxOptions {
+                selection: sel.clone(),
+                ..clear_opts(raw)
+            };
+            let spy = Arc::new(TitleSpy(std::sync::Mutex::new(None)));
+            mux_with_keys(src, None, "null://", &opts, &Halt::new(), spy.clone())
+                .unwrap_or_else(|e| panic!("{arm}: {e}"));
+            let opened = spy.0.lock().unwrap().take().expect("opened");
+            assert_eq!(opened.streams.len(), 1, "{arm}");
         }
     }
 }

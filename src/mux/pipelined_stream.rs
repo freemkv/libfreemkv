@@ -35,6 +35,8 @@ pub struct PipelinedPesStream {
 
     pending_frames: std::collections::VecDeque<PesFrame>,
     eof: bool,
+    // The terminal read error (kind, rendered code), repeated by every later read.
+    failed: Option<(io::ErrorKind, String)>,
     /// Cached `FREEMKV_SKIP_PARSE` profiling flag. Read once in `new()`
     /// — the env var cannot change for the life of the stream, and
     /// `std::env::var_os` takes a process-wide lock, so the per-batch /
@@ -47,6 +49,7 @@ pub struct PipelinedPesStream {
     /// Packets of MPEG-2 audio extension streams (`0xD0|n`) with no declared extension track,
     /// reported once at EOF (see `ps::warn_undeclared_extensions`).
     mpeg_extension_packets: [u64; 8],
+    dropped_ps: super::ps::DroppedPs,
     /// Per-track (by stream index) B1 drop-to-keyframe gate. After a TS gap on a
     /// video track, drop inter-coded frames until the next IRAP so the muxed
     /// stream stays decode-clean across an upstream concealed loss (P3/B1).
@@ -126,9 +129,11 @@ impl PipelinedPesStream {
             demux_thread,
             pending_frames: std::collections::VecDeque::new(),
             eof: false,
+            failed: None,
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
+            dropped_ps: Default::default(),
             resync,
             is_video,
             au_asm,
@@ -274,14 +279,8 @@ impl PipelinedPesStream {
                     // Expected DVD navigation packet (PCI/DSI) — tally, no WARN.
                     self.dropped_nav_packets += 1;
                 } else {
-                    // Unexpected unmappable stream_id — a possibly-dropped real
-                    // stream. Keep the individual WARN: its repetition is signal.
-                    tracing::warn!(
-                        target: "mux",
-                        "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                        ps.stream_id,
-                        ps.sub_stream_id,
-                    );
+                    // Unexpected unmappable stream_id: warned once, then counted.
+                    self.dropped_ps.drop_packet(&ps, None);
                 }
                 continue;
             };
@@ -292,13 +291,7 @@ impl PipelinedPesStream {
                     self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
                     continue;
                 }
-                tracing::warn!(
-                    target: "mux",
-                    "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
-                    pid,
-                    ps.stream_id,
-                    ps.sub_stream_id,
-                );
+                self.dropped_ps.drop_packet(&ps, Some(pid));
                 continue;
             };
             // Carry the PS demuxer's byte-exact source stamp through to the codec parser
@@ -376,6 +369,7 @@ impl PipelinedPesStream {
                         );
                     }
                     super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
+                    self.dropped_ps.report();
                     // Drain any AU a parser buffered past the last PES (DTS-HD tail, MPEG-2
                     // final GOP), routing through the SAME B1 gate — flush frames carry their
                     // own `discontinuity`, so a trailing dangling-ref frame must not bypass it.
@@ -449,11 +443,14 @@ impl PipelinedPesStream {
 
 impl Stream for PipelinedPesStream {
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
+        if let Some((kind, code)) = &self.failed {
+            return Err(io::Error::new(*kind, code.clone()));
+        }
         let read = self.read_frame();
         match &read {
             Ok(Some(frame)) => self.header_gate.observe(frame),
             Ok(None) => self.header_gate.expire(),
-            Err(_) => {}
+            Err(e) => self.failed = Some((e.kind(), e.to_string())),
         }
         read
     }
@@ -471,12 +468,15 @@ impl Stream for PipelinedPesStream {
     }
 
     fn errors(&self) -> u64 {
-        self.blanked.load(std::sync::atomic::Ordering::Relaxed)
+        // Blanked units plus frames the B1 gates dropped, as `DiscStream::errors` counts.
+        let dropped: u64 = self.resync.iter().map(|g| g.dropped_total()).sum();
+        self.blanked.load(std::sync::atomic::Ordering::Relaxed) + dropped
     }
 
     fn lost_bytes(&self) -> u64 {
         // Each blanked unit is one whole aligned unit of zeros (KS-2: 6144 bytes).
-        self.errors() * crate::aacs::content::ALIGNED_UNIT_LEN as u64
+        let blanked = self.blanked.load(std::sync::atomic::Ordering::Relaxed);
+        blanked * crate::aacs::content::ALIGNED_UNIT_LEN as u64
     }
 
     fn config_changes(&self) -> Vec<(usize, u64)> {
@@ -616,13 +616,17 @@ mod tests {
         let halt = crate::halt::Halt::new();
         let mut stream = stream.with_halt(Some(halt.clone()));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let _ = started_tx.send(());
             let _ = done_tx.send(stream.read().map(|f| f.is_some()));
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Cancel after the reader thread starts; a cancel that lands before it
+        // blocks must still end the read, so the order cannot flake.
+        started_rx.recv().unwrap();
         halt.cancel();
         let r = done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(10))
             .expect("a cancel must unblock the reader within a slice");
         let err = r.expect_err("a stop is not a frame or EOF");
         assert!(crate::error::is_halt(&err), "{err}");
@@ -709,6 +713,28 @@ mod tests {
         .unwrap();
         let err = stream.read().expect_err("Err batch must propagate");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    // The worker exits after a terminal error; a later read repeats that error, not
+    // a misleading "demux thread panicked".
+    #[test]
+    fn a_read_after_a_terminal_error_repeats_it() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        let disc_read = crate::error::Error::DiscRead {
+            sector: 7,
+            status: Some(0x02),
+            sense: None,
+        };
+        tx.send(DemuxBatch::Err(disc_read.into())).unwrap();
+        drop(tx);
+        for _ in 0..2 {
+            let err = stream.read().expect_err("terminal error");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some(crate::error::E_DISC_READ),
+                "got {err}"
+            );
+        }
     }
 
     /// consume_ts must route a PES to the track mapped to its PID and emit
@@ -1052,6 +1078,55 @@ mod tests {
         let f = stream.read().unwrap().expect("routed MP2 frame");
         assert_eq!((f.track, f.data), (2, vec![0x56]));
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
+    }
+
+    // Frames the B1 gates dropped count as errors (as on the live DiscStream), but
+    // are not lost read bytes: lost_bytes stays the blanked-unit total.
+    #[test]
+    fn errors_include_frames_the_resync_gate_dropped() {
+        use crate::pes::Stream as _;
+        let (mut stream, _tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+        stream.resync.push(super::super::resync::ResyncGate::new());
+        let gate = stream.resync.last_mut().unwrap();
+        assert!(!gate.admit(true, true, false));
+        assert!(!gate.admit(true, false, false));
+        assert!(gate.admit(true, false, true));
+        assert_eq!(stream.errors(), 2, "dropped frames survive the resync");
+        assert_eq!(stream.lost_bytes(), 0, "no read bytes were lost");
+    }
+
+    // PS packets with no track (a deselected / undeclared stream, or no DVD PID) warn
+    // once per stream id, not once per packet; the per-id tally goes out at EOF.
+    #[test]
+    fn dropped_ps_packets_warn_once_per_stream() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+        let pkt = |stream_id, sub_stream_id| PsPacket {
+            source: None,
+            stream_id,
+            sub_stream_id,
+            pts: None,
+            dts: None,
+            data: vec![0x0B, 0x77],
+        };
+        let mut batch = Vec::new();
+        for _ in 0..40 {
+            batch.push(pkt(0xBD, Some(0x81))); // unmapped PID 0xBD81
+            batch.push(pkt(0xBD, Some(0x82))); // unmapped PID 0xBD82
+            batch.push(pkt(0xC8, None)); // no DVD PID
+        }
+        tx.send(DemuxBatch::Ps(batch)).unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let (_, ev) = crate::testlog::capture(|| while stream.read().unwrap().is_some() {});
+        let warns = ev
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .count();
+        assert_eq!(warns, 3, "one WARN per dropped stream id, got {warns}");
+        let tally = ev
+            .iter()
+            .filter(|e| e.message().contains("packets=40"))
+            .count();
+        assert_eq!(tally, 3, "each stream's drop count is reported at EOF");
     }
 
     // Design §2.3 "Reader side (L3)" (MPG2-7): one AUD per field splits a PAFF field pair

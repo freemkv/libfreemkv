@@ -521,7 +521,7 @@ fn es_bytes_and_pts_round_trip_exactly() {
             .iter()
             .flat_map(|f| f.1.iter().copied())
             .collect();
-        assert_eq!(ir, want, "LPCM {sub:#x} round trip");
+        assert_eq!(ir, native_depth(want), "LPCM {sub:#x} round trip");
     }
 }
 
@@ -1245,6 +1245,18 @@ fn read_all(path: &std::path::Path) -> std::io::Result<(DiscTitle, Vec<PesFrame>
     Ok((input.info().clone(), frames))
 }
 
+// 24-bit IR of a 16-bit source reads back at its native 16-bit depth.
+fn native_depth(ir: Vec<u8>) -> Vec<u8> {
+    if crate::mux::codec::lpcm::dvd_bits_needed(&ir) != 16 {
+        return ir;
+    }
+    ir.as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|s| [s[0], s[1]])
+        .collect()
+}
+
 fn by_track(frames: &[PesFrame]) -> BTreeMap<usize, Vec<&PesFrame>> {
     let mut m: BTreeMap<usize, Vec<&PesFrame>> = BTreeMap::new();
     for f in frames {
@@ -1267,7 +1279,7 @@ fn tracks_match(
         if lpcm.contains(t) {
             let a: Vec<u8> = g.iter().flat_map(|f| f.data.iter().copied()).collect();
             let b: Vec<u8> = want.iter().flat_map(|f| f.1.iter().copied()).collect();
-            assert_eq!(a, b, "LPCM track {t}");
+            assert_eq!(a, native_depth(b), "LPCM track {t}");
             continue;
         }
         let mut w: Vec<&(i64, Vec<u8>)> = want.iter().collect();
@@ -2221,4 +2233,18 @@ fn scanned_sd_video_keeps_its_signalled_colour() {
         DiscStream::Video(v) => assert_eq!(v.color_space, ColorSpace::Bt709),
         _ => unreachable!(),
     }
+}
+
+// A 16-bit source's native 16-bit frames pack back to a 16-bit DVD quantization.
+#[test]
+fn native_16_bit_lpcm_frames_pack_as_16_bit() {
+    let mut fx = fixture(&Opts::default());
+    fx.title.codec_privates[5] = Some(b"DVLP\x10".to_vec());
+    let sink = MpgSink::create(Vec::new(), &fx.title).unwrap();
+    let mut sink = sink;
+    let out = sink.route[5].unwrap();
+    // 4 stereo 16-bit frames read as 6 only if (wrongly) treated as 24-bit.
+    let aus = sink.lpcm_aus(out, 0, &[0x12, 0x34, 0x56, 0x78].repeat(4), true);
+    assert_eq!(aus.len(), 1);
+    assert_eq!((aus[0].lpcm_bits, aus[0].data.len()), (16, 16));
 }

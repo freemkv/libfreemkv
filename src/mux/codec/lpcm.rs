@@ -2,15 +2,12 @@
 //!
 //! Both origins carry a per-PES audio header this parser consumes: 4 bytes on BD-TS,
 //! 3 on DVD-PS (`PsDemuxer` strips only the sub_id/frames/pointer bytes). Output is
-//! always interleaved 24-bit big-endian PCM ([`OUTPUT_BIT_DEPTH`](crate::mux::codec::lpcm::OUTPUT_BIT_DEPTH)) in
-//! WAVE_FORMAT_EXTENSIBLE channel order, so "A_PCM/INT/BIG" gets a fixed BitDepth that
-//! survives every hop. Layouts follow ffmpeg pcm-bluray.c (pad channel, LFE/surround
+//! interleaved big-endian PCM in WAVE_FORMAT_EXTENSIBLE channel order at the source
+//! depth: 16-bit stays 16-bit, 20- and 24-bit sources output 24-bit. The depth rides
+//! in `codec_private` ([`output_depth`]) so "A_PCM/INT/BIG" BitDepth matches. Layouts follow ffmpeg pcm-bluray.c (pad channel, LFE/surround
 //! remap) and pcm-dvd.c (20/24-bit sample groups and blocks).
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
-
-/// Bit depth of every sample this parser emits (16-bit sources are widened losslessly).
-pub const OUTPUT_BIT_DEPTH: u8 = 24;
 
 /// BD LPCM header: payload_size(2), channel_assignment|rate, bits|start_flag.
 const BD_LPCM_HEADER_SIZE: usize = 4;
@@ -79,10 +76,10 @@ impl Format {
     fn bd(h: &[u8]) -> Option<Self> {
         let (channels, map) = bd_layout(h[2] >> 4)?;
         let rate = bd_rate(h[2] & 0x0F)?;
-        // 20-bit (code 2) has no verified packing; ffmpeg rejects it, so do we.
+        // 20-bit (code 2) sits in a 24-bit container, as 1.7.7 passed it: output 24-bit.
         let bytes = match h[3] >> 6 {
             1 => 2,
-            3 => 3,
+            2 | 3 => 3,
             _ => return None,
         };
         Some(Format::Bd {
@@ -136,7 +133,16 @@ impl Format {
         }
     }
 
-    /// Convert one whole unit to 24-bit output PCM.
+    /// Bytes per output sample: 2 for 16-bit sources, else 3 (20-bit pads to 24).
+    fn out_bytes(self) -> usize {
+        match self {
+            Format::Bd { bytes, .. } => bytes,
+            Format::Dvd { bits: 16, .. } => 2,
+            Format::Dvd { .. } => 3,
+        }
+    }
+
+    /// Convert one whole unit to output PCM.
     fn convert(self, u: &[u8], out: &mut Vec<u8>) {
         match self {
             Format::Bd {
@@ -146,17 +152,13 @@ impl Format {
                 ..
             } => {
                 let base = out.len();
-                out.resize(base + channels * 3, 0);
+                out.resize(base + channels * bytes, 0);
                 for (src, &dst) in map.iter().enumerate() {
-                    let (s, d) = (src * bytes, base + dst * 3);
+                    let (s, d) = (src * bytes, base + dst * bytes);
                     out[d..d + bytes].copy_from_slice(&u[s..s + bytes]);
                 }
             }
-            Format::Dvd { bits: 16, .. } => {
-                for w in u.as_chunks::<2>().0 {
-                    out.extend_from_slice(&[w[0], w[1], 0]);
-                }
-            }
+            Format::Dvd { bits: 16, .. } => out.extend_from_slice(u),
             Format::Dvd { channels, bits, .. } => {
                 let (_, g, _) = dvd_block(channels);
                 let size = g * 2 + if bits == 24 { g } else { g / 2 };
@@ -199,6 +201,8 @@ pub struct LpcmParser {
     /// Last BD header byte 2 (channel_assignment|rate), reported as codec_private so
     /// an M2TS re-mux keeps the exact layout (e.g. 2/2 vs 3/1).
     bd_layout_byte: Option<u8>,
+    /// Output sample depth of the first packet (16 or 24), reported as codec_private.
+    depth: Option<u8>,
     /// Packets refused for a reserved header code (counted, never poisoning).
     tally: super::dropgate::DropTally,
 }
@@ -218,6 +222,7 @@ impl LpcmParser {
             anchor_ns: 0,
             samples_since_anchor: 0,
             bd_layout_byte: None,
+            depth: None,
             tally: super::dropgate::DropTally::new("lpcm"),
         }
     }
@@ -272,6 +277,8 @@ impl CodecParser for LpcmParser {
         if self.bd {
             self.bd_layout_byte = Some(pes.data[2]);
         }
+        let ob = format.out_bytes();
+        self.depth.get_or_insert(ob as u8 * 8);
         let predicted = self.predicted_pts();
         if Some(format) != self.format || pes.discontinuity {
             self.carry.clear();
@@ -295,7 +302,7 @@ impl CodecParser for LpcmParser {
 
         self.carry.extend_from_slice(&pes.data[hdr..]);
         let whole = self.carry.len() - self.carry.len() % unit;
-        let mut data = Vec::with_capacity(whole / unit * unit_frames * channels * 3);
+        let mut data = Vec::with_capacity(whole / unit * unit_frames * channels * ob);
         for u in self.carry[..whole].chunks_exact(unit) {
             format.convert(u, &mut data);
         }
@@ -305,7 +312,7 @@ impl CodecParser for LpcmParser {
         if self.bd {
             self.carry.clear();
         }
-        self.samples_since_anchor = (data.len() / (channels * 3)) as u64;
+        self.samples_since_anchor = (data.len() / (channels * ob)) as u64;
         if data.is_empty() {
             return Vec::new();
         }
@@ -321,7 +328,11 @@ impl CodecParser for LpcmParser {
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
-        self.bd_layout_byte.map(tagged_layout)
+        let depth = self.depth?;
+        Some(match self.bd_layout_byte {
+            Some(b) => tagged_layout(b, depth),
+            None => [DVD_TAG.as_slice(), &[depth]].concat(),
+        })
     }
 }
 
@@ -330,17 +341,33 @@ impl CodecParser for LpcmParser {
 /// untagged value falls back to the count-default layout.
 const LAYOUT_TAG: &[u8; 4] = b"BDLP";
 
-/// Tagged codec_private for BD layout byte `b`.
-pub(crate) fn tagged_layout(b: u8) -> Vec<u8> {
-    [LAYOUT_TAG.as_slice(), &[b]].concat()
+/// Tag of a DVD LPCM codec_private (depth only; DVD has no layout byte).
+const DVD_TAG: &[u8; 4] = b"DVLP";
+
+/// Tagged codec_private for BD layout byte `b` at output `depth` (16 or 24).
+pub(crate) fn tagged_layout(b: u8, depth: u8) -> Vec<u8> {
+    [LAYOUT_TAG.as_slice(), &[b, depth]].concat()
 }
 
 /// The BD layout byte (channel_assignment|rate) from a tagged LPCM codec_private.
 pub(crate) fn layout_byte(cp: &[u8]) -> Option<u8> {
     match cp.strip_prefix(LAYOUT_TAG.as_slice()) {
-        Some(&[b]) => Some(b),
+        Some(&[b, _]) => Some(b),
         _ => None,
     }
+}
+
+/// Output sample depth (16 or 24) a track's codec_private declares; 24 when it
+/// declares none (e.g. PCM read from Matroska, which is always widened to 24-bit).
+pub(crate) fn output_depth(cp: Option<&[u8]>) -> u8 {
+    let d = cp.and_then(|c| match c.strip_prefix(LAYOUT_TAG.as_slice()) {
+        Some(&[_, d]) => Some(d),
+        _ => match c.strip_prefix(DVD_TAG.as_slice()) {
+            Some(&[d]) => Some(d),
+            _ => None,
+        },
+    });
+    if d == Some(16) { 16 } else { 24 }
 }
 
 /// Correct each BD LPCM track's channels/rate (and a default label) from its parser
@@ -373,15 +400,21 @@ pub(crate) fn correct_title_layout(title: &mut crate::disc::DiscTitle) {
     }
 }
 
-/// BD LPCM header bytes 2-3 for re-muxing parser output (24-bit) to M2TS, or `None`
+/// BD LPCM header bytes 2-3 for re-muxing parser output at `depth` to M2TS, or `None`
 /// when BD LPCM can't carry it. Reuses the source layout byte (the parser's
 /// codec_private) when it agrees; else the ffmpeg pcm-blurayenc.c default for the count.
-pub(crate) fn bd_header(channels: u8, rate_hz: u32, source: Option<u8>) -> Option<[u8; 2]> {
+pub(crate) fn bd_header(
+    channels: u8,
+    rate_hz: u32,
+    source: Option<u8>,
+    depth: u8,
+) -> Option<[u8; 2]> {
+    let bits = if depth == 16 { 1 << 6 } else { 3 << 6 };
     if let Some(b) = source
         && bd_layout(b >> 4).map(|(c, _)| c) == Some(usize::from(channels))
         && bd_rate(b & 0x0F) == Some(rate_hz)
     {
-        return Some([b, 3 << 6]);
+        return Some([b, bits]);
     }
     let assign = match channels {
         1 => 1,
@@ -400,10 +433,10 @@ pub(crate) fn bd_header(channels: u8, rate_hz: u32, source: Option<u8>) -> Optio
         192_000 => 5,
         _ => return None,
     };
-    Some([(assign << 4) | rate, 3 << 6])
+    Some([(assign << 4) | rate, bits])
 }
 
-/// Re-pack 24-bit WAVE-order PCM as BD LPCM PES payloads (header + BD order + pad
+/// Re-pack WAVE-order PCM (depth from `header`) as BD LPCM PES payloads (header + BD order + pad
 /// channel) of 5 ms each (rate/200 samples), as BD authoring does. Returns
 /// `(ns offset of the payload, payload)`; a trailing partial frame is dropped.
 pub(crate) fn bd_payloads(pcm: &[u8], header: [u8; 2]) -> Vec<(i64, Vec<u8>)> {
@@ -412,11 +445,12 @@ pub(crate) fn bd_payloads(pcm: &[u8], header: [u8; 2]) -> Vec<(i64, Vec<u8>)> {
     else {
         return Vec::new();
     };
-    let coded = (channels + (channels & 1)) * 3;
+    let w = if header[1] >> 6 == 1 { 2 } else { 3 };
+    let coded = (channels + (channels & 1)) * w;
     let per_pes = rate as usize / 200;
     let mut out = Vec::new();
-    for (n, chunk) in pcm.chunks(per_pes * channels * 3).enumerate() {
-        let frames = chunk.len() / (channels * 3);
+    for (n, chunk) in pcm.chunks(per_pes * channels * w).enumerate() {
+        let frames = chunk.len() / (channels * w);
         if frames == 0 {
             continue;
         }
@@ -424,11 +458,11 @@ pub(crate) fn bd_payloads(pcm: &[u8], header: [u8; 2]) -> Vec<(i64, Vec<u8>)> {
         let mut p = Vec::with_capacity(BD_LPCM_HEADER_SIZE + frames * coded);
         p.extend_from_slice(&size.to_be_bytes());
         p.extend_from_slice(&header);
-        for f in chunk.chunks_exact(channels * 3) {
+        for f in chunk.chunks_exact(channels * w) {
             let base = p.len();
             p.resize(base + coded, 0);
             for (src, &dst) in map.iter().enumerate() {
-                p[base + src * 3..base + src * 3 + 3].copy_from_slice(&f[dst * 3..dst * 3 + 3]);
+                p[base + src * w..base + src * w + w].copy_from_slice(&f[dst * w..dst * w + w]);
             }
         }
         out.push((samples_to_ns((n * per_pes) as u64, rate), p));
@@ -540,11 +574,6 @@ mod tests {
         v
     }
 
-    /// 16-bit BE samples widened to the parser's 24-bit output.
-    fn w24(s16: &[u8]) -> Vec<u8> {
-        s16.chunks(2).flat_map(|c| [c[0], c[1], 0]).collect()
-    }
-
     /// One 16-bit sample per channel, each channel's bytes = its index.
     fn frame16(order: &[u8]) -> Vec<u8> {
         order.iter().flat_map(|&c| [c, c]).collect()
@@ -563,14 +592,23 @@ mod tests {
     }
 
     #[test]
-    fn bd_stereo_16bit_strips_header_and_widens_to_24() {
+    fn bd_stereo_16bit_keeps_16bit() {
         let mut p = LpcmParser::new();
         let pcm = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x01, 0x02];
         let f = p.parse(&make_pes(bd(3, 1, &pcm), Some(90_000)));
         assert_eq!(f.len(), 1);
-        assert_eq!(f[0].data, w24(&pcm));
+        assert_eq!(f[0].data, &pcm);
         assert_eq!(f[0].pts_ns, 1_000_000_000);
         assert!(f[0].keyframe);
+    }
+
+    #[test]
+    fn bd_20bit_keeps_its_packet_as_24bit() {
+        let mut p = LpcmParser::new();
+        let pcm = [1, 2, 0x30, 4, 5, 0x60];
+        let f = p.parse(&make_pes(bd(3, 2, &pcm), Some(0)));
+        assert_eq!(f[0].data, pcm);
+        assert_eq!(output_depth(p.codec_private().as_deref()), 24);
     }
 
     #[test]
@@ -588,7 +626,7 @@ mod tests {
             bd(1, 1, &[0x11, 0x12, 0, 0, 0x21, 0x22, 0, 0]),
             Some(0),
         ));
-        assert_eq!(f[0].data, w24(&[0x11, 0x12, 0x21, 0x22]));
+        assert_eq!(f[0].data, &[0x11, 0x12, 0x21, 0x22]);
     }
 
     #[test]
@@ -605,7 +643,7 @@ mod tests {
         // BD L R C Ls Rs LFE -> L R C LFE Ls Rs (ffmpeg 5POINT1 mapping).
         let mut p = LpcmParser::new();
         let f = p.parse(&make_pes(bd(9, 1, &frame16(&[0, 1, 2, 3, 4, 5])), Some(0)));
-        assert_eq!(f[0].data, w24(&frame16(&[0, 1, 2, 5, 3, 4])));
+        assert_eq!(f[0].data, frame16(&[0, 1, 2, 5, 3, 4]));
     }
 
     #[test]
@@ -616,7 +654,7 @@ mod tests {
             bd(11, 1, &frame16(&[0, 1, 2, 3, 4, 5, 6, 7])),
             Some(0),
         ));
-        assert_eq!(f[0].data, w24(&frame16(&[0, 1, 2, 7, 4, 5, 3, 6])));
+        assert_eq!(f[0].data, frame16(&[0, 1, 2, 7, 4, 5, 3, 6]));
     }
 
     #[test]
@@ -639,7 +677,7 @@ mod tests {
             bd(10, 1, &frame16(&[0, 1, 2, 3, 4, 5, 6, 7])),
             Some(0),
         ));
-        assert_eq!(f[0].data, w24(&frame16(&[0, 1, 2, 4, 5, 3, 6])));
+        assert_eq!(f[0].data, frame16(&[0, 1, 2, 4, 5, 3, 6]));
     }
 
     #[test]
@@ -665,11 +703,6 @@ mod tests {
         assert!(
             p.parse(&make_pes(bd(3, 0, &pcm), Some(0))).is_empty(),
             "depth 0"
-        );
-        let six = [0u8; 6];
-        assert!(
-            p.parse(&make_pes(bd(3, 2, &six), Some(0))).is_empty(),
-            "BD 20-bit"
         );
         let mut bad_rate = bd(3, 1, &pcm);
         bad_rate[2] = 0x32;
@@ -720,7 +753,7 @@ mod tests {
         let mut p = LpcmParser::new_dvd();
         let pcm = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x01, 0x02];
         let f = p.parse(&make_pes(dvd(0x01, &pcm), Some(90_000)));
-        assert_eq!(f[0].data, w24(&pcm));
+        assert_eq!(f[0].data, &pcm);
         assert_eq!(f[0].pts_ns, 1_000_000_000);
     }
 
@@ -874,7 +907,7 @@ mod tests {
         let mut p = seed();
         let mut gap = make_pes(dvd(0x01, &next), Some(90_000));
         gap.discontinuity = true;
-        assert_eq!(all(&p.parse(&gap)), w24(&next), "gap drops the carry");
+        assert_eq!(all(&p.parse(&gap)), &next, "gap drops the carry");
 
         // Format change (16-bit -> 24-bit stereo): one 12-byte block is 2 sample frames.
         let block = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
@@ -892,10 +925,10 @@ mod tests {
     fn bd_trailing_partial_sample_is_not_carried_into_the_next_pes() {
         let mut p = LpcmParser::new();
         let first = p.parse(&make_pes(bd(3, 1, &[9, 9, 9, 9, 0xEE, 0xEE]), Some(0)));
-        assert_eq!(all(&first), w24(&[9, 9, 9, 9]), "the whole sample only");
+        assert_eq!(all(&first), &[9, 9, 9, 9], "the whole sample only");
         let next = [1u8, 2, 3, 4];
         let got = p.parse(&make_pes(bd(3, 1, &next), Some(90_000)));
-        assert_eq!(all(&got), w24(&next), "the discarded tail does not lead it");
+        assert_eq!(all(&got), &next, "the discarded tail does not lead it");
     }
 
     #[test]
@@ -915,12 +948,12 @@ mod tests {
 
     #[test]
     fn bd_payloads_split_to_fit_payload_size_and_round_trip() {
-        let h = bd_header(8, 48_000, None).unwrap();
+        let h = bd_header(8, 48_000, None, 24).unwrap();
         assert!(
-            bd_header(2, 44_100, None).is_none(),
+            bd_header(2, 44_100, None, 24).is_none(),
             "BD LPCM has no 44.1 kHz"
         );
-        assert!(bd_header(0, 48_000, None).is_none());
+        assert!(bd_header(0, 48_000, None, 24).is_none());
         let pcm: Vec<u8> = (0..3000 * 8 * 3).map(|i| (i % 253) as u8).collect();
         let parts = bd_payloads(&pcm, h);
         assert_eq!(parts.len(), 13, "12 x 240 + 120 samples");
@@ -936,7 +969,7 @@ mod tests {
     #[test]
     fn bd_payloads_are_5ms_pes_like_ffmpeg_blurayenc() {
         // 20000 stereo samples @ 48 kHz -> 83 full 240-sample PES + one of 80.
-        let h = bd_header(2, 48_000, None).unwrap();
+        let h = bd_header(2, 48_000, None, 24).unwrap();
         let parts = bd_payloads(&vec![0u8; 20_000 * 2 * 3], h);
         assert_eq!(parts.len(), 84);
         assert!(parts[..83].iter().all(|(_, p)| p.len() == 4 + 240 * 6));
@@ -952,7 +985,7 @@ mod tests {
         let cp = p.codec_private().unwrap();
         assert_eq!(
             cp,
-            b"BDLP\x71".to_vec(),
+            b"BDLP\x71\x10".to_vec(),
             "tagged so foreign CodecPrivate never matches"
         );
         assert_eq!(layout_byte(&cp), Some(0x71));
@@ -962,6 +995,46 @@ mod tests {
             "untagged (foreign MKV) byte ignored"
         );
         assert_eq!(LpcmParser::new_dvd().codec_private(), None);
+    }
+
+    #[test]
+    fn output_depth_follows_the_source_for_bd_and_dvd() {
+        let depth = |p: &mut LpcmParser, pes: Vec<u8>| {
+            let f = p.parse(&make_pes(pes, Some(0)));
+            (f[0].data.len(), output_depth(p.codec_private().as_deref()))
+        };
+        let (mut b, mut d) = (LpcmParser::new(), LpcmParser::new_dvd());
+        assert_eq!(depth(&mut b, bd(3, 1, &[0; 4])), (4, 16));
+        assert_eq!(depth(&mut LpcmParser::new(), bd(3, 3, &[0; 6])), (6, 24));
+        assert_eq!(depth(&mut d, dvd(0x01, &[0; 4])), (4, 16));
+        // 20-bit and 24-bit DVD sources both output 24-bit.
+        assert_eq!(
+            depth(&mut LpcmParser::new_dvd(), dvd(0x41, &[0; 10])),
+            (12, 24)
+        );
+        assert_eq!(
+            depth(&mut LpcmParser::new_dvd(), dvd(0x81, &[0; 12])),
+            (12, 24)
+        );
+        assert_eq!(
+            output_depth(None),
+            24,
+            "no tag: Matroska-read PCM is 24-bit"
+        );
+        assert_eq!(output_depth(Some(b"BDLP\x71\x10")), 16);
+    }
+
+    #[test]
+    fn bd_16bit_repack_round_trips_at_16_bit() {
+        let h = bd_header(6, 48_000, None, 16).unwrap();
+        assert_eq!(h[1] >> 6, 1, "16-bit quantization code");
+        let pcm: Vec<u8> = (0..500 * 6 * 2).map(|i| (i % 251) as u8).collect();
+        let mut p = LpcmParser::new();
+        let got: Vec<u8> = bd_payloads(&pcm, h)
+            .into_iter()
+            .flat_map(|(_, d)| all(&p.parse(&make_pes(d, Some(0)))))
+            .collect();
+        assert_eq!(got, pcm);
     }
 
     #[test]
@@ -1004,7 +1077,16 @@ mod tests {
                 let mut p = LpcmParser::new_dvd();
                 let f = p.parse(&make_pes(es, Some(0)));
                 assert_eq!(f.len(), 1, "{channels} ch {bits} bit");
-                assert_eq!(f[0].data, ir, "{channels} ch {bits} bit round trip");
+                let want = if bits == 16 {
+                    ir.as_chunks::<3>()
+                        .0
+                        .iter()
+                        .flat_map(|s| [s[0], s[1]])
+                        .collect()
+                } else {
+                    ir
+                };
+                assert_eq!(f[0].data, want, "{channels} ch {bits} bit round trip");
             }
         }
     }

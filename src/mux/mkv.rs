@@ -499,12 +499,9 @@ impl MkvTrack {
             field_duration_ns: 0,
             sample_rate: sr,
             channels: ch,
-            // Matroska requires BitDepth for `A_PCM/INT/*`; `LpcmParser` always emits 24-bit.
-            bit_depth: if a.codec == Codec::Lpcm {
-                super::codec::lpcm::OUTPUT_BIT_DEPTH
-            } else {
-                0
-            },
+            // Matroska requires BitDepth for `A_PCM/INT/*`. 24 unless the parser's
+            // codec_private says the source was 16-bit (set by `MkvStream`).
+            bit_depth: if a.codec == Codec::Lpcm { 24 } else { 0 },
             dv_config: None,
             hdr10: None,
             mvc_params: None,
@@ -733,16 +730,20 @@ struct PgsForcedFixup {
     tracker: super::codec::pgs::ForcedTracker,
 }
 
+// Bytes of a FieldOrder element with a 1-byte value (ID 0x9D, size, value).
+const FIELD_ORDER_LEN: usize = 3;
+
 // Deferred FlagInterlaced correction state for one video track: every
 // picture's `progressive()` verdict is tallied and the header byte is
 // corrected to the majority at `finish()`.
 struct FlagInterlacedFixup {
     /// Absolute file offset of the 1-byte `FlagInterlaced` value in the Tracks element.
     value_offset: u64,
-    /// `(offset, len)` of the `FieldOrder` element, present only when one was
-    /// written up-front (interlaced provisional with a determined order). On a
-    /// demotion to progressive it is overwritten with a Void of identical length.
+    /// `(offset, len)` of the `FieldOrder` element, or of a same-size Void reserved for it
+    /// when no order was known up-front. Void'd on a demotion; filled on a promotion.
     field_order_span: Option<(u64, u64)>,
+    /// A FieldOrder (not the reserve) was written up-front.
+    field_order_written: bool,
     /// The value written up-front (`true` = interlaced), so `finish()` rewrites
     /// only when the majority actually disagrees.
     initial_interlaced: bool,
@@ -750,6 +751,9 @@ struct FlagInterlacedFixup {
     /// with no scan signal (e.g. H.264/HEVC `CodingTypeOnly`) count toward neither.
     progressive_pics: u64,
     interlaced_pics: u64,
+    /// Interlaced pictures by measured field order.
+    tff_pics: u64,
+    bff_pics: u64,
 }
 
 /// One `finish()`-time FlagInterlaced correction, resolved from the whole-stream
@@ -761,6 +765,10 @@ struct InterlacedRewrite {
     final_interlaced: bool,
     /// `(offset, len)` of the up-front FieldOrder element, Void'd on a demotion.
     field_order_span: Option<(u64, u64)>,
+    /// Majority field order to write into the reserved span (interlaced, none up-front).
+    field_order: Option<u8>,
+    /// FlagInterlaced differs from the value written up-front.
+    changed: bool,
 }
 
 // TimestampScale: nanoseconds per Matroska timestamp tick. 0.1 ms (100_000 ns) avoids
@@ -1108,24 +1116,30 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 } else {
                     ebml::INTERLACED_PROGRESSIVE as u8
                 }])?;
-                let field_order_span =
-                    if track.interlaced && track.field_order != ebml::FIELD_ORDER_UNDETERMINED {
-                        // `track.field_order` was set correctly before construction (the mux
-                        // stream reads the first coded picture's measured field order).
-                        let start = writer.stream_position()?;
-                        ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
-                        Some((start, writer.stream_position()? - start))
-                    } else {
-                        None
-                    };
+                let field_order_written =
+                    track.interlaced && track.field_order != ebml::FIELD_ORDER_UNDETERMINED;
+                let start = writer.stream_position()?;
+                if field_order_written {
+                    // `track.field_order` was set correctly before construction (the mux
+                    // stream reads the first coded picture's measured field order).
+                    ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
+                } else if track.codec_id == ebml::CODEC_MPEG2 {
+                    // Only MPEG-2 pictures measure a field order: reserve its size for finish().
+                    writer.write_all(&ebml::void_element(FIELD_ORDER_LEN)?)?;
+                }
+                let end = writer.stream_position()?;
+                let field_order_span = (end > start).then_some((start, end - start));
                 flag_interlaced_fixups.insert(
                     i,
                     FlagInterlacedFixup {
                         value_offset: flag_offset,
                         field_order_span,
+                        field_order_written,
                         initial_interlaced: track.interlaced,
                         progressive_pics: 0,
                         interlaced_pics: 0,
+                        tff_pics: 0,
+                        bff_pics: 0,
                     },
                 );
                 if track.display_width > 0 && track.display_height > 0 {
@@ -1430,7 +1444,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_ns: Option<u64>,
         block_additional: Option<&[u8]>,
         src_byte: Option<u64>,
-        scan_progressive: Option<bool>,
+        scan: Option<super::codec::FieldOrder>,
     ) -> io::Result<()> {
         self.write_frame_at_with_padding(
             track_idx,
@@ -1440,7 +1454,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             duration_ns,
             block_additional,
             src_byte,
-            scan_progressive,
+            scan,
             0,
         )
     }
@@ -1455,7 +1469,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_ns: Option<u64>,
         block_additional: Option<&[u8]>,
         src_byte: Option<u64>,
-        scan_progressive: Option<bool>,
+        scan: Option<super::codec::FieldOrder>,
         discard_padding_ns: i64,
     ) -> io::Result<()> {
         // --log-level 3: capture the first ~100 coded frames per track to the side file
@@ -1498,13 +1512,20 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Tally this KEPT picture's measured scan type for the whole-stream
         // FlagInterlaced majority (dropped-by-mark frames must not count). A
         // picture with no scan signal (`None`) counts toward neither.
-        if let Some(prog) = scan_progressive
+        if let Some(scan) = scan
             && let Some(fixup) = self.flag_interlaced_fixups.get_mut(&track_idx)
         {
-            if prog {
-                fixup.progressive_pics += 1;
-            } else {
-                fixup.interlaced_pics += 1;
+            use super::codec::FieldOrder;
+            match scan {
+                FieldOrder::Progressive => fixup.progressive_pics += 1,
+                FieldOrder::Tff => {
+                    fixup.interlaced_pics += 1;
+                    fixup.tff_pics += 1;
+                }
+                FieldOrder::Bff => {
+                    fixup.interlaced_pics += 1;
+                    fixup.bff_pics += 1;
+                }
             }
         }
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
@@ -1560,7 +1581,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
                 return Ok(());
             }
-            self.start_cluster(pts_ticks)?;
+            // The first keyframe sits `origin_lead_ticks` after the earliest sample: open
+            // its cluster as early as a block offset allows, so the earlier samples
+            // replayed after it land in the same cluster and clusters stay ascending.
+            let open_ts = if self.last_pts_ticks.is_empty() {
+                (pts_ticks - MAX_BLOCK_REL).clamp(0, pts_ticks)
+            } else {
+                pts_ticks
+            };
+            self.start_cluster(open_ts)?;
             self.cues.push(CuePoint {
                 timestamp_ticks: pts_ticks,
                 track: track_idx + 1,
@@ -1936,13 +1965,23 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 // Interlaced only on a strict majority — a tie stays progressive so
                 // a mostly-progressive title is not needlessly deinterlaced.
                 let final_interlaced = f.interlaced_pics > f.progressive_pics;
-                if final_interlaced == f.initial_interlaced {
+                // Interlaced with no order written up-front: fill the reserve (strict majority).
+                let field_order = (final_interlaced && !f.field_order_written)
+                    .then(|| match f.tff_pics.cmp(&f.bff_pics) {
+                        std::cmp::Ordering::Greater => Some(ebml::FIELD_ORDER_TFF),
+                        std::cmp::Ordering::Less => Some(ebml::FIELD_ORDER_BFF),
+                        std::cmp::Ordering::Equal => None,
+                    })
+                    .flatten();
+                if final_interlaced == f.initial_interlaced && field_order.is_none() {
                     return None; // the first picture already matched the majority
                 }
                 Some(InterlacedRewrite {
                     value_offset: f.value_offset,
                     final_interlaced,
                     field_order_span: f.field_order_span,
+                    field_order,
+                    changed: final_interlaced != f.initial_interlaced,
                 })
             })
             .collect();
@@ -1954,6 +1993,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::INTERLACED_PROGRESSIVE
             } as u8;
             interlaced_patches.push((rw.value_offset, vec![value]));
+            if let (Some(order), Some((fo_off, fo_len))) = (rw.field_order, rw.field_order_span) {
+                let mut el = Vec::new();
+                ebml::write_uint(&mut el, ebml::FIELD_ORDER, u64::from(order))?;
+                if el.len() as u64 == fo_len {
+                    interlaced_patches.push((fo_off, el));
+                }
+            }
             // Demotion to progressive: the up-front FieldOrder element is now
             // contradictory — overwrite it with a same-length Void so no later
             // element shifts.
@@ -1962,11 +2008,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
             {
                 interlaced_patches.push((fo_off, ebml::void_element(fo_len as usize)?));
             }
-            tracing::warn!(
-                target: "mux",
-                interlaced = rw.final_interlaced,
-                "FlagInterlaced corrected from the whole-stream scan majority; the first coded picture did not represent the title"
-            );
+            if rw.changed {
+                tracing::warn!(
+                    target: "mux",
+                    interlaced = rw.final_interlaced,
+                    "FlagInterlaced corrected from the whole-stream scan majority; the first coded picture did not represent the title"
+                );
+            }
         }
         self.patch_bytes(&interlaced_patches)?;
 
@@ -2693,7 +2741,7 @@ mod tests {
 
     #[test]
     fn lpcm_track_writes_bitdepth_24() {
-        // `LpcmParser` always emits 24-bit BE PCM; without BitDepth players assume
+        // 24-bit BE PCM is the default depth; without BitDepth players assume
         // 16-bit and decode noise. Check the element is actually written.
         let track = MkvTrack::audio(&audio_stream(Codec::Lpcm));
         assert_eq!(track.bit_depth, 24);
@@ -2895,7 +2943,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(true),
+                Some(crate::mux::codec::FieldOrder::Progressive),
             )
             .unwrap();
         for (i, pts) in [40_000_000i64, 80_000_000, 120_000_000].iter().enumerate() {
@@ -2908,7 +2956,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some(false),
+                    Some(crate::mux::codec::FieldOrder::Tff),
                 )
                 .unwrap();
         }

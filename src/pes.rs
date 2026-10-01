@@ -256,6 +256,13 @@ pub trait Stream: Send {
     /// for read-only streams (no-op).
     fn finish(&mut self) -> std::io::Result<()>;
 
+    /// End a stream whose producer failed or was stopped before the end of the
+    /// title. Default: [`finish`](Self::finish) (a file keeps its partial output);
+    /// a wire sink overrides it so its receiver sees a failure, not a clean end.
+    fn finish_incomplete(&mut self) -> std::io::Result<()> {
+        self.finish()
+    }
+
     /// Stream metadata. Stable across reads — implementors must return a
     /// consistent reference for the lifetime of the stream.
     fn info(&self) -> &crate::disc::DiscTitle;
@@ -376,6 +383,10 @@ impl Stream for CountingStream {
 
     fn finish(&mut self) -> std::io::Result<()> {
         self.inner.finish()
+    }
+
+    fn finish_incomplete(&mut self) -> std::io::Result<()> {
+        self.inner.finish_incomplete()
     }
 
     fn info(&self) -> &crate::disc::DiscTitle {

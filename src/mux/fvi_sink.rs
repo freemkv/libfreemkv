@@ -110,8 +110,8 @@ pub struct FviSink {
     /// Index of the title's primary video track — only frames on this track are
     /// indexed; audio / subtitle / secondary-video frames are ignored.
     video_track: Option<usize>,
-    /// The sink owns the destination file.
-    w: BufWriter<File>,
+    /// The sink owns the destination (a file outside tests).
+    w: BufWriter<Box<dyn Write + Send>>,
     /// The header row, written lazily on the first `write`/`finish` so an
     /// empty / audio-only title still emits a valid single-line file.
     header: MapHeader,
@@ -132,22 +132,25 @@ impl FviSink {
     /// are then omitted from the header rather than guessed.
     pub fn create(path: &Path, title: &DiscTitle, source: SourceInfo) -> io::Result<Self> {
         let file = File::create(path)?;
+        Ok(Self::with_writer(Box::new(file), title, source))
+    }
 
+    fn with_writer(w: Box<dyn Write + Send>, title: &DiscTitle, source: SourceInfo) -> Self {
         let video_track = title
             .streams
             .iter()
             .position(|s| matches!(s, DiscStream::Video(_)));
         let header = MapHeader::from_title(title, source);
 
-        Ok(Self {
+        Self {
             title: title.clone(),
             video_track,
-            w: BufWriter::new(file),
+            w: BufWriter::new(w),
             header,
             next_n: 0,
             header_written: false,
             finished: false,
-        })
+        }
     }
 
     /// Write the header row once, lazily.
@@ -191,12 +194,13 @@ impl Stream for FviSink {
         if self.finished {
             return Ok(());
         }
-        self.finished = true;
         // Emit the header even for a title that produced no records, so the
         // output is always a valid (if record-less) `.fvi` file. JSON Lines has
-        // no footer.
+        // no footer. Finished only once flushed, so a failed flush is not retried as Ok.
         self.ensure_header()?;
-        self.w.flush()
+        self.w.flush()?;
+        self.finished = true;
+        Ok(())
     }
 
     fn info(&self) -> &DiscTitle {
@@ -286,6 +290,57 @@ mod tests {
             source,
             coding,
         }
+    }
+
+    // Writer whose writes fail while `fail` is set.
+    struct Flaky(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Write for Flaky {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(io::ErrorKind::Other.into());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_finish_is_not_reported_ok_on_retry() {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let w = Box::new(Flaky(fail.clone()));
+        let mut sink = FviSink::with_writer(w, &mpeg2_title(), SourceInfo::default());
+        assert!(sink.finish().is_err());
+        assert!(
+            sink.finish().is_err(),
+            "second finish must not claim success"
+        );
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(sink.finish().is_ok(), "a retry that flushes succeeds");
+    }
+
+    #[test]
+    fn record_numbers_stay_contiguous_across_interleaved_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.fvi");
+        let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
+        sink.write(&vframe(0, Some(i_pic()), None)).unwrap();
+        sink.write(&vframe(1, None, None)).unwrap();
+        sink.write(&vframe(0, Some(i_pic()), None)).unwrap();
+        sink.finish().unwrap();
+        let n: Vec<u64> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["n"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(n, [0, 1]);
     }
 
     #[test]

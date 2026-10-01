@@ -99,6 +99,50 @@ pub fn dvd_mpeg_audio_extension_base(ext_pid: u16) -> Option<u16> {
     dvd_mpeg_audio_extension_pid(id).map(|_| ext_pid & !0x0010)
 }
 
+/// PS packets dropped for want of a track, per `(stream_id, sub_stream_id)`. A deselected
+/// or undeclared DVD stream drops every packet, so each id warns once at first sight and
+/// its count is reported at end of stream.
+#[derive(Debug, Default)]
+pub(crate) struct DroppedPs {
+    seen: Vec<((u8, Option<u8>), u64)>,
+}
+
+impl DroppedPs {
+    /// Count one dropped packet; `pid` is its DVD PID (`None`: no DVD mapping at all).
+    pub(crate) fn drop_packet(&mut self, ps: &PsPacket, pid: Option<u16>) {
+        let key = (ps.stream_id, ps.sub_stream_id);
+        if let Some((_, n)) = self.seen.iter_mut().find(|(k, _)| *k == key) {
+            *n += 1;
+            return;
+        }
+        self.seen.push((key, 1));
+        match pid {
+            Some(pid) => tracing::warn!(
+                target: "mux",
+                "dropping PS packets for unmapped PID {pid:#06x} (stream_id={:#04x}, sub_stream_id={:?}); counted until EOF",
+                ps.stream_id,
+                ps.sub_stream_id,
+            ),
+            None => tracing::warn!(
+                target: "mux",
+                "dropping unmappable PS packets (stream_id={:#04x}, sub_stream_id={:?}); counted until EOF",
+                ps.stream_id,
+                ps.sub_stream_id,
+            ),
+        }
+    }
+
+    /// The per-id drop counts, once at end of stream.
+    pub(crate) fn report(&self) {
+        for ((stream_id, sub_stream_id), n) in &self.seen {
+            tracing::debug!(
+                target: "mux",
+                "dropped PS stream_id={stream_id:#04x} sub_stream_id={sub_stream_id:?} packets={n}",
+            );
+        }
+    }
+}
+
 /// Reports, once at end of stream, MPEG-2 audio extension packets (`0xD0|n`, index `n`) that
 /// had no declared extension track (the IFO did not say coding mode 3) and were left out.
 pub(crate) fn warn_undeclared_extensions(packets: &[u64; 8]) {

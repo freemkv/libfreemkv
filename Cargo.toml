@@ -44,6 +44,7 @@ rip = [
     "dep:aes",
     "dep:freemkv-unlock",
     "dep:zip",
+    "dep:flate2",
     "dep:base64",
     "dep:roxmltree",
     "dep:crossbeam-channel",
@@ -63,12 +64,13 @@ sha1 = { version = "0.11", optional = true }
 # SHA-256 for the key-set fingerprints (VID and legacy key identity, keys-upfront §4.1, J18).
 sha2 = { version = "0.11", optional = true }
 aes = { version = "0.9", optional = true }
-# Interim path dep for local cross-repo dev; `release-orchestrate.yml` re-pins
-# this to `{ git = ".../freemkv-unlock", tag = "vX.Y.Z" }` in the tagged commit
-# (so the released tag resolves freemkv-unlock from git, not a sibling path) and
-# restores the path dep on the branch tip.
-freemkv-unlock = { path = "../freemkv-unlock", optional = true }
+# Resolved by the git-tag [patch.crates-io] below (re-pinned by
+# release-orchestrate.yml); local dev patches it to ../freemkv-unlock.
+freemkv-unlock = { version = "1.7", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
+# zlib for Matroska ContentCompression (mkvmerge compresses S_VOBSUB by default); the
+# same backend `zip` already pulls in.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 base64 = { version = "0.23", optional = true }
 # Safe TCP keepalive setup for `network://` receive (dead-peer detection);
 # `all` provides TcpKeepalive::with_retries.
@@ -81,7 +83,7 @@ rustix = { version = "1", default-features = false, features = ["std", "event"],
 # — untrusted disc bytes — into authoritative titles/clips/chapters. A real
 # parser, not a hand-rolled scanner: the XPL is genuine XML (comments, varied
 # attribute order, self-closing tags).
-roxmltree = { version = "0.20", optional = true }
+roxmltree = { version = "0.21", optional = true }
 # Trace-level instrumentation for the read/transport path (SgIoTransport::execute
 # and friends). Part of the `scsi` feature — the transport layer traces here.
 # Debug/trace logging is the permitted string output. Consumers (autorip) wire a
@@ -141,6 +143,10 @@ loom = "0.7"
 name = "sgio_read"
 harness = false
 
+# freemkv-unlock is off crates.io: resolve it from its GIT TAG. Consumers carry
+# the same patch; a gitignored .cargo/config.toml overrides it to a local path.
+[patch.crates-io]
+freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.7.7" }
 
 [lints.rust]
 # `loom` is set by RUSTFLAGS for the model checker above, never by a feature.

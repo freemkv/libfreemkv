@@ -160,6 +160,7 @@ pub struct DiscStream {
     /// Packets of MPEG-2 audio extension streams (`0xD0|n`) with no declared extension track,
     /// reported once at EOF (see `ps::warn_undeclared_extensions`).
     mpeg_extension_packets: [u64; 8],
+    dropped_ps: super::ps::DroppedPs,
 
     // Cumulative bytes successfully read from the source. Drives
     // EventKind::BytesRead emission and autorip's per-device progress.
@@ -224,6 +225,11 @@ impl DiscStream {
         raw: bool,
         halt: Option<Halt>,
     ) -> std::io::Result<Self> {
+        // A zero batch reads 0 sectors and never advances (endless loop until
+        // Stop); `MuxOptions::default()` carries 0. Same refusal as the highway.
+        if batch_sectors == 0 {
+            return Err(crate::error::Error::MuxBatchSectorsZero.into());
+        }
         let mut title = title;
         let extents = title.extents.clone();
 
@@ -324,6 +330,7 @@ impl DiscStream {
             eof: false,
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
+            dropped_ps: Default::default(),
             bytes_read_total: 0,
             bytes_total_extents,
             ts_demuxer,
@@ -388,6 +395,11 @@ impl DiscStream {
             .as_ref()
             .map(|h| h.is_cancelled())
             .unwrap_or(false)
+    }
+
+    // A failed read that Stop caused: the reader reports Halted, or our token fired.
+    fn stopped(&self, e: &crate::error::Error) -> bool {
+        matches!(e, crate::error::Error::Halted) || self.is_halted()
     }
 
     fn emit(&self, kind: EventKind) {
@@ -508,6 +520,13 @@ impl DiscStream {
             {
                 return Err(res.unwrap_err().into());
             }
+            // A read failed by Stop (cancelled drive, or a stop mid bad zone) is
+            // not bad media: never shrink, recover or skip it.
+            if let Err(e) = res.as_ref()
+                && self.stopped(e)
+            {
+                return Err(crate::error::Error::Halted.into());
+            }
 
             if let Ok(&got) = res.as_ref() {
                 // read_sectors returns bytes written into buf. All in-tree
@@ -569,6 +588,11 @@ impl DiscStream {
                     && is_key_stop(e)
                 {
                     return Err(rec.unwrap_err().into());
+                }
+                if let Err(e) = rec.as_ref()
+                    && self.stopped(e)
+                {
+                    return Err(crate::error::Error::Halted.into());
                 }
                 if let Ok(&got) = rec.as_ref() {
                     debug_assert!(got <= bytes, "recovery read over-reported byte count");
@@ -749,12 +773,7 @@ impl DiscStream {
             if ps.is_nav() {
                 self.dropped_nav_packets += 1;
             } else {
-                tracing::warn!(
-                    target: "mux",
-                    "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                    ps.stream_id,
-                    ps.sub_stream_id,
-                );
+                self.dropped_ps.drop_packet(&ps, None);
             }
             return;
         };
@@ -764,13 +783,7 @@ impl DiscStream {
                 self.mpeg_extension_packets[(base & 0x07) as usize] += 1;
                 return;
             }
-            tracing::warn!(
-                target: "mux",
-                "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
-                pid,
-                ps.stream_id,
-                ps.sub_stream_id,
-            );
+            self.dropped_ps.drop_packet(&ps, Some(pid));
             return;
         };
         let (pts, dts, src) = (
@@ -871,6 +884,7 @@ impl DiscStream {
                     self.route_ps_packet(ps);
                 }
                 super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
+                self.dropped_ps.report();
                 // Drain any access unit a codec parser buffered past the last
                 // PES (DTS-HD's final core+extension unit, assembled across
                 // PES boundaries).
@@ -1269,6 +1283,28 @@ mod tests {
         }
     }
 
+    // MuxOptions::default() carries batch_sectors 0: a zero batch reads 0 sectors
+    // and never advances, so it must be refused up front, not spin until Stop.
+    #[test]
+    fn zero_batch_is_rejected_not_an_endless_zero_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("t.iso");
+        std::fs::write(&iso, vec![0u8; 4 * 2048]).unwrap();
+        let src = crate::io::file_sector_source::FileSectorSource::open(&iso).unwrap();
+        let res = DiscStream::new(
+            Box::new(src),
+            synthetic_title(4),
+            crate::decrypt::DecryptKeys::None,
+            0,
+            ContentFormat::BdTs,
+            false,
+            None,
+        );
+        let err = res.err().expect("batch_sectors 0 must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(crate::error::error_code(&err), Some(9085));
+    }
+
     // A truncated ISO is not a bad sector: even with skip_errors the missing tail
     // must abort with the image error, not be zero-filled and reported as success.
     #[test]
@@ -1481,6 +1517,114 @@ mod tests {
             stream.is_halted(),
             "with_halt token cancellation must be observed by is_halted()"
         );
+    }
+
+    // Every read fails; the `stop_at`-th read cancels `halt` (Stop pressed inside a
+    // bad zone) and fails with `Halted` (a cancelled drive) or a media error.
+    struct StopInBadZoneReader {
+        halt: Halt,
+        stop_at: usize,
+        reader_halted: bool,
+        log: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl crate::sector::SectorSource for StopInBadZoneReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let mut log = self.log.lock().unwrap();
+            log.push(recovery);
+            if log.len() >= self.stop_at {
+                self.halt.cancel();
+                if self.reader_halted {
+                    return Err(crate::error::Error::Halted);
+                }
+            }
+            Err(crate::error::Error::DiscRead {
+                sector: lba as u64,
+                status: Some(0x02),
+                sense: None,
+            })
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            64
+        }
+    }
+
+    fn stop_in_bad_zone(
+        batch: u16,
+        stop_at: usize,
+        reader_halted: bool,
+        share_halt: bool,
+        skip_errors: bool,
+    ) -> (io::Result<bool>, DiscStream, Vec<bool>) {
+        let halt = Halt::new();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = StopInBadZoneReader {
+            halt: halt.clone(),
+            stop_at,
+            reader_halted,
+            log: log.clone(),
+        };
+        let mut s = DiscStream::new(
+            Box::new(reader),
+            synthetic_title(64),
+            crate::decrypt::DecryptKeys::None,
+            batch,
+            ContentFormat::BdTs,
+            false,
+            None,
+        )
+        .unwrap();
+        if share_halt {
+            s = s.with_halt(halt.clone());
+        }
+        s.skip_errors = skip_errors;
+        if stop_at == 0 {
+            halt.cancel();
+        }
+        let res = s.fill_extents();
+        let log = log.lock().unwrap().clone();
+        (res, s, log)
+    }
+
+    // A drive cancelled by Stop fails its read with Halted: that is a stop, not a
+    // bad sector — no 60s recovery read, no skip accounting, no DiscRead.
+    #[test]
+    fn a_halted_read_at_the_bottomed_out_unit_is_a_stop_not_a_bad_sector() {
+        for share_halt in [true, false] {
+            for skip_errors in [true, false] {
+                let (res, s, log) = stop_in_bad_zone(1, 1, true, share_halt, skip_errors);
+                let err = res.expect_err("a halted read must not fill");
+                assert!(
+                    crate::error::is_halt(&err),
+                    "share={share_halt} skip={skip_errors}: got {err}"
+                );
+                assert_eq!(log, vec![false], "no recovery read after a halted read");
+                assert_eq!((s.errors, s.lost_bytes), (0, 0), "no bogus skip");
+            }
+        }
+    }
+
+    // Stop pressed while the read stalls in a failing region returns Halted at once,
+    // never walking the shrink/recovery ladder first.
+    #[test]
+    fn stop_in_a_failing_region_returns_halted_without_more_reads() {
+        let (res, s, log) = stop_in_bad_zone(32, 0, false, true, true);
+        assert!(crate::error::is_halt(&res.expect_err("halted before read")));
+        assert!(log.is_empty(), "no read once already halted: {log:?}");
+        assert_eq!(s.errors, 0);
+
+        let (res, s, log) = stop_in_bad_zone(32, 2, false, true, true);
+        let err = res.expect_err("a stop mid bad zone must not fill");
+        assert!(crate::error::is_halt(&err), "got {err}");
+        assert_eq!(log, vec![false, false], "no read after the stop");
+        assert_eq!((s.errors, s.lost_bytes), (0, 0), "no bogus skip");
     }
 
     /// A key map on the inline live-drive path applies the same FMTS read plan
@@ -2010,6 +2154,7 @@ mod tests {
 
         // Drive the whole title. Bounded so a regression cannot hang the suite.
         let mut completed_clean = false;
+        let mut failure = None;
         for _ in 0..(COUNT as usize * 4) {
             match stream.fill_extents() {
                 Ok(true) => continue,
@@ -2017,9 +2162,17 @@ mod tests {
                     completed_clean = true;
                     break;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    failure = crate::error::error_code(&e);
+                    break;
+                }
             }
         }
+        assert_eq!(
+            failure,
+            Some(crate::error::E_SOURCE_TERMINATED),
+            "a dead producer aborts with SourceTerminated, not another error"
+        );
         assert!(
             !completed_clean,
             "the producer died at sector 4, so sectors 4..{COUNT} were never \
@@ -2910,6 +3063,124 @@ mod tests {
             t
         }
 
+        // One frame per PES; a keyframe iff the ES starts with `K`. Carries the PES's
+        // discontinuity so the live stream's B1 gate is driven end to end.
+        struct KeyframeParser;
+        impl crate::mux::codec::CodecParser for KeyframeParser {
+            fn parse(&mut self, pes: &PesPacket) -> Vec<crate::mux::codec::Frame> {
+                vec![crate::mux::codec::Frame {
+                    coding: None,
+                    source: None,
+                    pts_ns: pes.pts.unwrap_or(0),
+                    keyframe: pes.data.first() == Some(&b'K'),
+                    discontinuity: pes.discontinuity,
+                    data: pes.data.clone(),
+                    duration_ns: None,
+                }]
+            }
+            fn flush(&mut self) -> Vec<crate::mux::codec::Frame> {
+                Vec::new()
+            }
+            fn codec_private(&self) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        // A 192-byte BD-TS packet on `pid` with continuity counter `cc`, carrying one
+        // complete video PES (no PTS) whose ES is `es`; padded with stuffing.
+        fn ts_video_packet(pid: u16, cc: u8, es: &[u8]) -> Vec<u8> {
+            let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+            pes.extend_from_slice(es);
+            let mut pkt = vec![0u8; 192];
+            pkt[4] = 0x47;
+            pkt[5] = 0x40 | ((pid >> 8) as u8 & 0x1F);
+            pkt[6] = pid as u8;
+            let pad = 184 - pes.len();
+            pkt[7] = 0x30 | (cc & 0x0F); // adaptation field + payload
+            pkt[8] = (pad - 1) as u8;
+            if pad > 1 {
+                pkt[9] = 0x00;
+                pkt[10..8 + pad].fill(0xFF);
+            }
+            pkt[8 + pad..].copy_from_slice(&pes);
+            pkt
+        }
+
+        // The live stream runs the same B1 gate as the highway: after a TS continuity
+        // gap on a video track, inter frames are dropped until the next keyframe.
+        #[test]
+        fn live_ts_video_drops_to_keyframe_after_a_continuity_gap() {
+            use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+            let pid = 0x1011;
+            // CC 0,1 then a lost packet (2), then 3,4,5,6.
+            let es: [(&[u8], u8); 6] = [
+                (b"K0", 0),
+                (b"P1", 1),
+                (b"P2", 3),
+                (b"P3", 4),
+                (b"K4", 5),
+                (b"P5", 6),
+            ];
+            let mut image: Vec<u8> = es
+                .iter()
+                .flat_map(|(e, cc)| ts_video_packet(pid, *cc, e))
+                .collect();
+            let null = {
+                let mut p = vec![0u8; 192];
+                p[4] = 0x47;
+                p[5] = 0x1F;
+                p[6] = 0xFF;
+                p[7] = 0x10;
+                p
+            };
+            while image.len() < 6144 {
+                image.extend_from_slice(&null);
+            }
+            let mut title = synthetic_title(3);
+            title.streams = vec![crate::disc::Stream::Video(VideoStream {
+                pid,
+                codec: Codec::Hevc,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })];
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(image)),
+                title,
+                crate::decrypt::DecryptKeys::None,
+                3,
+                ContentFormat::BdTs,
+                false,
+                None,
+            )
+            .unwrap();
+            s.parsers = vec![(pid, Box::new(KeyframeParser))];
+            let mut emitted = Vec::new();
+            while let Some(f) = s.read().unwrap() {
+                emitted.push(f.data);
+            }
+            assert_eq!(
+                emitted,
+                vec![
+                    b"K0".to_vec(),
+                    b"P1".to_vec(),
+                    b"K4".to_vec(),
+                    b"P5".to_vec()
+                ],
+                "post-gap inter frames dropped, the stream resumes at the keyframe"
+            );
+            assert_eq!(
+                PesStream::errors(&s),
+                2,
+                "the two dropped frames are counted"
+            );
+        }
+
         /// The PS path (`ps_demuxer` + `Mpeg2Parser`) must forward `ps.source`
         /// onto the `PesPacket` so demuxed frames carry byte provenance — the
         /// second half of commit a0d4dd3 (the first half is the TS path above).
@@ -2974,6 +3245,42 @@ mod tests {
             // Reported once, with the count, after the whole read (not per packet).
             assert_eq!(warns.len(), 1, "{warns:?}");
             assert!(warns[0].contains("stream_id=0xd2 packets=3"), "{warns:?}");
+        }
+
+        /// Packets of an undeclared (or deselected) PS stream warn once, not per packet.
+        #[test]
+        fn ps_stream_warns_once_per_dropped_stream() {
+            use crate::pes::Stream;
+
+            let mut sector = ps_pack_header();
+            for _ in 0..30 {
+                // private_stream_1, no PTS, sub-stream 0x81 (AC-3 #2): no track declared.
+                sector.extend_from_slice(&[0x00, 0x00, 0x01, 0xBD, 0x00, 0x07, 0x81, 0x00, 0x00]);
+                sector.extend_from_slice(&[0x81, 0x01, 0x00, 0x01]);
+            }
+            sector.extend_from_slice(&ps_video_pes(&ps_gop_es(), 0));
+            sector.resize(2048, 0xFF);
+            let mut s = DiscStream::new(
+                Box::new(ImageReader(sector)),
+                mpeg2_video_title(1),
+                crate::decrypt::DecryptKeys::None,
+                8,
+                ContentFormat::MpegPs,
+                false,
+                None,
+            )
+            .unwrap();
+            let ((), ev) = crate::testlog::capture(|| while s.read().unwrap().is_some() {});
+            let warns: Vec<&str> = ev
+                .iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .map(|e| e.message())
+                .collect();
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert!(
+                ev.iter().any(|e| e.message().contains("packets=30")),
+                "the drop count is reported at EOF"
+            );
         }
 
         /// A PS video stream of `codec` whose AUs span two PES fragments must reach EOF
