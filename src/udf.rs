@@ -139,7 +139,8 @@ pub(crate) struct AbsExtent {
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
-    /// LBA within the metadata partition (add metadata_start for absolute)
+    /// Block within the metadata partition. Not `metadata_start() + meta_lba` when the
+    /// Metadata File is fragmented: later extents live elsewhere on disc.
     pub meta_lba: u32,
     /// File size in bytes (from ICB info_length)
     pub size: u64,
@@ -320,9 +321,15 @@ impl UdfFs {
         }
 
         // Trim to the real file size, or to the requested prefix — whichever is
-        // smaller. If extents under-covered the file (e.g. sparse), leave what
-        // we have rather than over-reporting.
+        // smaller. Extents covering less than that mean a damaged File Entry.
         let trim_to = (entry.size as usize).min(limit);
+        if data.len() < trim_to {
+            return Err(Error::DiscRead {
+                sector: self.partition_start as u64,
+                status: None,
+                sense: None,
+            });
+        }
         if data.len() > trim_to {
             data.truncate(trim_to);
         }
@@ -397,7 +404,7 @@ impl UdfFs {
             if !seen.insert(e.meta_lba) {
                 continue;
             }
-            match self.extents_abs_at(reader, e.meta_lba) {
+            match self.data_extents_abs(reader, e) {
                 Ok(exts) => ranges.extend(
                     exts.iter()
                         .filter(|x| x.recorded && x.len > 0)
@@ -412,6 +419,27 @@ impl UdfFs {
         }
         ranges.sort_by_key(|r| r.0);
         Ok(merge_ranges(&ranges))
+    }
+
+    // A directory's FID data is metadata-partition-relative, a file's physical-partition-relative.
+    fn data_extents_abs(
+        &self,
+        reader: &mut dyn SectorSource,
+        e: &DirEntry,
+    ) -> Result<Vec<AbsExtent>> {
+        if !e.is_dir {
+            return self.extents_abs_at(reader, e.meta_lba);
+        }
+        self.read_icb_extents(reader, e.meta_lba)?
+            .into_iter()
+            .map(|x| {
+                Ok(AbsExtent {
+                    lba: self.meta_to_abs(x.lba)?,
+                    len: x.len,
+                    recorded: x.recorded,
+                })
+            })
+            .collect()
     }
 
     fn collect_file_ranges(
@@ -1534,22 +1562,31 @@ fn read_file_size(reader: &mut dyn SectorSource, meta: &MetaMap, meta_lba: u32) 
 }
 
 // Decode an OSTA CS0 string: first byte is a compression ID (8 = one byte per code point,
-// i.e. Latin-1; 16 = UTF-16BE). NULs are dropped.
+// i.e. Latin-1; 16 = UTF-16BE, surrogate pairs combined). Control characters (NUL included)
+// are dropped and '/' becomes '_'.
 fn decode_cs0(data: &[u8]) -> String {
     let Some((&comp, rest)) = data.split_first() else {
         return String::new();
     };
     let s: String = match comp {
-        16 => rest
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .filter_map(|&c| char::from_u32(u16::from_be_bytes(c) as u32))
-            .collect(),
+        16 => char::decode_utf16(
+            rest.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_be_bytes(c)),
+        )
+        .filter_map(|c| c.ok())
+        .collect(),
         8 => rest.iter().map(|&b| b as char).collect(),
         _ => String::from_utf8_lossy(rest).into_owned(),
     };
-    s.replace('\0', "").trim().to_string()
+    // Names reach error text and logs: no control characters, and '/' would split a path.
+    s.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == '/' { '_' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 // Parse a UDF filename (an OSTA CS0 string).
@@ -1576,7 +1613,8 @@ fn compact_ranges(ranges: &mut Vec<(u32, u32)>, meta_start: u32) -> Result<()> {
 }
 
 /// Merge overlapping or adjacent (start, count) ranges. Caller sorts by start
-/// first. Shared range utility — also used to build the disc's encrypted-content
+/// first; zero-length ranges are kept (unlike `whole_disc::merge_ranges`, which sorts and
+/// drops them). Shared range utility — also used to build the disc's encrypted-content
 /// extent map (see `Disc::encrypted_content_ranges`).
 pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     let mut result: Vec<(u32, u32)> = Vec::new();
@@ -6565,6 +6603,57 @@ mod audit_tests {
             data_reads <= (MAX_TOTAL_DIR_SECTORS + MAX_DIR_BYTES / 2048) as usize,
             "sectors read must stay near the cap: {data_reads}"
         );
+    }
+
+    #[test]
+    fn utf16_cs0_combines_surrogate_pairs() {
+        // U+1F600 is D83D DE00.
+        assert_eq!(
+            parse_udf_name(&[16, 0, b'A', 0xD8, 0x3D, 0xDE, 0x00]),
+            "A\u{1F600}"
+        );
+    }
+
+    #[test]
+    fn cs0_names_carry_no_control_characters_or_slashes() {
+        assert_eq!(
+            parse_udf_name(&[8, b'a', 0x1B, b'[', b'2', b'J', b'/', b'b']),
+            "a[2J_b"
+        );
+    }
+
+    #[test]
+    fn read_file_fails_when_extents_cover_less_than_the_declared_size() {
+        let mut r = GenReader::new(0);
+        let mut icb = efe(8);
+        put_ad(&mut icb, 0, 2048, 10);
+        r.over.insert(5, icb);
+        let mut f = file("F", 5);
+        f.size = 8192;
+        let fs = fs_of(0, 1, vec![f]);
+        assert!(matches!(
+            fs.read_file(&mut r, "/F"),
+            Err(Error::DiscRead { .. })
+        ));
+    }
+
+    #[test]
+    fn non_stream_ranges_map_directory_data_through_the_metadata_partition() {
+        let mut r = GenReader::new(0);
+        let mut icb = efe(8);
+        put_ad(&mut icb, 0, 2048, 3);
+        r.over.insert(105, icb);
+        let mut dir = file("D", 5);
+        dir.is_dir = true;
+        let mut fs = fs_of(100, 1, vec![dir]);
+        fs.partition_start = 5000;
+        let ranges = fs.non_stream_ranges(&mut r).expect("ranges");
+        let covers = |lba: u32| ranges.iter().any(|&(s, n)| (s..s + n).contains(&lba));
+        assert!(
+            covers(103),
+            "directory data sits at metadata block 3: {ranges:?}"
+        );
+        assert!(!covers(5003), "not at partition_start + 3: {ranges:?}");
     }
 
     #[test]
