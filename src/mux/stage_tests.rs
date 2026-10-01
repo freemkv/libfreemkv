@@ -244,6 +244,9 @@ fn a_loose_clip_finds_its_disc_folder_by_walking_up() {
     let stream = root.join("BDMV/STREAM");
     std::fs::create_dir_all(&stream).unwrap();
     let clip = stream.join("00001.m2ts");
+    std::fs::write(&clip, b"").unwrap();
+    std::fs::write(root.join("00001.m2ts"), b"").unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
     assert_eq!(
         disc_root_of(&clip),
         None,

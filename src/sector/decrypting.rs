@@ -9,7 +9,7 @@
 //! plaintext; `DecryptKeys::None` discs pass through unconditionally.
 
 use crate::decrypt::{DecryptKeys, decrypt_sectors, decrypt_sectors_in_content};
-use crate::error::Result;
+use crate::error::{E_CSS_KEY_MISSING, Result};
 use std::sync::Arc;
 
 use super::SectorSource;
@@ -59,6 +59,8 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     stale_cpi: bool,
     /// A PS the crack left keyless: a scrambled pack read later is refused (E7023).
     watch_css: bool,
+    /// The crack's verdict was scrambled-but-uncrackable: every read refuses (E7023).
+    refused: bool,
 }
 
 /// What the content-detected stage may do with what it finds (from `InputOptions`).
@@ -113,6 +115,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             packs: crate::css::Packs::DvdVideo,
             stale_cpi: false,
             watch_css: false,
+            refused: false,
         }
     }
 
@@ -127,7 +130,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
 
     // Reach the verdict and install what it needs. On `Err` the stage stays undecided.
     fn resolve_detect(&mut self) -> Result<()> {
-        use super::stage::{HEAD_SECTORS, Kind, classify};
+        use super::stage::{HEAD_SECTORS, Kind, classify_sectors};
         let Some(opts) = self.detect.as_deref() else {
             return Ok(());
         };
@@ -139,7 +142,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             n => self.inner.read_sectors(0, n as u16, &mut head, false)?,
         };
         head.truncate(got);
-        match classify(&head) {
+        match classify_sectors(&head) {
             Kind::Ps { mpeg2 } if !opts.raw => {
                 self.packs = crate::css::Packs::ProgramStream;
                 // B2: an 11172-1 stream cannot be CSS; it is never cracked.
@@ -150,14 +153,23 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                     }];
                     let packs = crate::css::Packs::ProgramStream;
                     let halt = opts.halt.as_ref();
-                    self.keys = crate::css::crack_title_key(
+                    let cracked = crate::css::crack_title_key(
                         &mut self.inner,
                         &whole,
                         CRACK_BATCH,
                         halt,
                         packs,
-                    )
-                    .map_err(crate::error::Error::from)?;
+                    );
+                    self.keys = match cracked {
+                        Ok(keys) => keys,
+                        // A verdict, not a fault: kept, so a retry does not scan again (D3).
+                        Err(e) if crate::error::error_code(&e) == Some(E_CSS_KEY_MISSING) => {
+                            self.detect = None;
+                            self.refused = true;
+                            return Err(crate::error::Error::CssKeyMissing);
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                 }
                 self.watch_css = !self.keys.is_encrypted();
             }
@@ -313,6 +325,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
+        if self.refused {
+            return Err(crate::error::Error::CssKeyMissing);
+        }
         if self.detect.is_some() {
             self.resolve_detect()?;
         }
@@ -382,16 +397,25 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
     }
 }
 
+// Every packet of the unit synced, padding aside: not the 4-packet key-proof floor of `is_clean`,
+// which ciphertext passes ~7e-6 of the time. Ciphertext passes this ~256^-31.
+fn wholly_clear_ts(unit: &[u8]) -> bool {
+    unit.as_chunks::<{ crate::consts::BD_SOURCE_PACKET_BYTES }>()
+        .0
+        .iter()
+        .all(|p| p[4] == 0x47 || p[4..].iter().all(|&b| b == 0))
+}
+
 impl<S: SectorSource> DecryptingSectorSource<S> {
     // The content-detected stage's per-read rules, before any key sees the bytes: a stale CPI
-    // flag on clean TS is cleared (KS-5: "00₂ if the data is not encrypted"), and a keyless
-    // PS refuses a scrambled pack rather than pass ciphertext as clear.
+    // flag on wholly clear TS is cleared (KS-5: "00₂ if the data is not encrypted"), and a
+    // keyless PS refuses a scrambled pack rather than pass ciphertext as clear.
     fn judge_detected(&self, buf: &mut [u8]) -> Result<()> {
-        use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, is_clean};
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted};
         if self.stale_cpi {
             let ts = crate::disc::ContentFormat::BdTs;
             for unit in buf.as_chunks_mut::<ALIGNED_UNIT_LEN>().0 {
-                if aacs_unit_encrypted(unit, ts) && is_clean(unit, ts) {
+                if aacs_unit_encrypted(unit, ts) && wholly_clear_ts(unit) {
                     crate::aacs::content::clear_copy_permission_indicator(unit, ts);
                 }
             }
@@ -469,6 +493,35 @@ mod tests {
             Self::fill(lba, count, buf);
             Ok(count as usize * 2048)
         }
+    }
+
+    // Stale CPI is cleared only on wholly clear TS: ciphertext that keeps a few syncs (the
+    // `is_clean` proof floor) stays flagged for the key to open.
+    #[test]
+    fn stale_cpi_needs_every_packet_synced() {
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        let mut unit: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+            .map(|i| (i * 13 + 5) as u8 | 1)
+            .collect();
+        for p in unit.chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES) {
+            p[0] |= 0xC0;
+            p[4] = 0x47;
+        }
+        assert!(wholly_clear_ts(&unit));
+        for p in unit
+            .chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES)
+            .skip(5)
+        {
+            p[4] = 0x9D;
+        }
+        assert!(crate::aacs::content::is_clean(
+            &unit,
+            crate::disc::ContentFormat::BdTs
+        ));
+        assert!(
+            !wholly_clear_ts(&unit),
+            "four synced packets are not clear TS"
+        );
     }
 
     // A DecryptingSectorSource must relay its inner source's unmapped list.

@@ -37,6 +37,10 @@ pub(crate) enum Kind {
 /// The stream kind `head` (the stream's first bytes) shows. A PS opens with a pack, as every
 /// DVD-Video VOB does; BD-TS needs the seed sync of every head unit plus clean TS or a CPI flag.
 pub(crate) fn classify(head: &[u8]) -> Kind {
+    // freemkv's own m2ts/network/stdio output: clear, and its header is off the unit grid.
+    if head.starts_with(b"FMKV") {
+        return Kind::Opaque;
+    }
     if head.len() >= 5 && head[..4] == PACK_START {
         return Kind::Ps {
             mpeg2: head[4] >> 6 == 0b01,
@@ -49,21 +53,38 @@ pub(crate) fn classify(head: &[u8]) -> Kind {
     }
 }
 
+/// [`classify`] for a sector source (a file): a VOB whose first sectors are damaged or blank
+/// is still a PS by its first sector-aligned pack.
+pub(crate) fn classify_sectors(head: &[u8]) -> Kind {
+    match classify(head) {
+        Kind::Opaque => head
+            .chunks(SECTOR_BYTES)
+            .find(|s| s.len() >= 5 && s[..4] == PACK_START)
+            .map_or(Kind::Opaque, |p| Kind::Ps {
+                mpeg2: p[4] >> 6 == 0b01,
+            }),
+        kind => kind,
+    }
+}
+
 // KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport packet";
 // KS-4: a unit's 16-byte seed is clear, so its sync survives encryption.
+// A damaged (zeroed or garbled) unit in the head must not hide the rest: at least half of the
+// non-blank head units, and two when there are two, must show the source-packet shape.
 fn is_bd_ts(head: &[u8]) -> bool {
     const PKT: usize = BD_SOURCE_PACKET_BYTES;
-    if head.len() < PKT || head[4] != 0x47 {
-        return false;
-    }
     let units = head.as_chunks::<ALIGNED_UNIT_LEN>().0;
     let units = &units[..units.len().min(TS_UNITS)];
     if units.is_empty() {
-        return head.as_chunks::<PKT>().0.iter().all(|p| p[4] == 0x47);
+        let pkts = head.as_chunks::<PKT>().0;
+        return !pkts.is_empty() && pkts.iter().all(|p| p[4] == 0x47);
     }
-    units
+    let live = units.iter().filter(|u| u.iter().any(|&b| b != 0)).count();
+    let shaped = units
         .iter()
-        .all(|u| u[4] == 0x47 && (is_clean(u, ContentFormat::BdTs) || u[0] & 0xC0 != 0))
+        .filter(|u| u[4] == 0x47 && (is_clean(*u, ContentFormat::BdTs) || u[0] & 0xC0 != 0))
+        .count();
+    shaped >= live.clamp(1, 2) && shaped * 2 >= live
 }
 
 // Up to `max` bytes from the start of `r`, fewer only at EOF.
@@ -167,7 +188,13 @@ impl<R: Read + Seek> Stage<R> {
 impl<R: Read> Read for Stage<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.kind.is_none() {
-            self.head = read_head(&mut self.inner, STREAM_HEAD)?;
+            // Five bytes rule a stream out (no pack start, no TS sync at byte 4), so an FMKV
+            // header is parsed as soon as it arrives; only a candidate waits for a whole unit.
+            self.head = read_head(&mut self.inner, 5)?;
+            if self.head.len() == 5 && (self.head[..4] == PACK_START || self.head[4] == 0x47) {
+                let rest = read_head(&mut self.inner, STREAM_HEAD - 5)?;
+                self.head.extend(rest);
+            }
             self.kind = Some(classify(&self.head));
         }
         let n = if self.served < self.head.len() {
@@ -234,7 +261,7 @@ impl<S: SectorSource> Read for SectorBytes<S> {
             let left = self.src.capacity_sectors().saturating_sub(lba);
             let count = left.min(u32::from(REFILL_SECTORS)) as u16;
             if count == 0 {
-                return Ok(0);
+                return Err(io::ErrorKind::UnexpectedEof.into());
             }
             self.buf.resize(count as usize * SECTOR_BYTES, 0);
             let n = self
@@ -244,7 +271,7 @@ impl<S: SectorSource> Read for SectorBytes<S> {
             self.buf.truncate(n.min(self.buf.len()));
             self.buf_start = lba as u64 * SECTOR_BYTES as u64;
             if self.pos >= self.buf_start + self.buf.len() as u64 {
-                return Ok(0);
+                return Err(io::ErrorKind::UnexpectedEof.into());
             }
         }
         let at = (self.pos - self.buf_start) as usize;
@@ -466,6 +493,47 @@ mod tests {
             assert_eq!(Packs::DvdVideo.scrambled_at(&p), Some(0x14), "{name}");
             assert_ne!(Packs::ProgramStream.scrambled_at(&p), Some(0x14), "{name}");
         }
+    }
+
+    // A VOB with a blank or damaged first sector is still a PS to a file stage, and one
+    // damaged unit at a clip's start does not hide its source packets.
+    #[test]
+    fn damage_at_the_head_does_not_hide_the_stream() {
+        let mut vob = vec![0u8; SECTOR_BYTES];
+        vob.extend(dvd_pack(0xE0, 1));
+        assert_eq!(
+            classify(&vob),
+            Kind::Opaque,
+            "a byte stream needs a pack at 0"
+        );
+        assert_eq!(classify_sectors(&vob), Kind::Ps { mpeg2: true });
+        let mut clip = vec![0u8; ALIGNED_UNIT_LEN];
+        clip.extend((0..3).flat_map(|_| ts_unit(true)));
+        assert_eq!(classify(&clip), Kind::BdTs, "a zeroed first unit");
+        let mut garbled = noise(ALIGNED_UNIT_LEN);
+        garbled.extend((0..3).flat_map(|_| ts_unit(false)));
+        assert_eq!(classify(&garbled), Kind::BdTs, "a garbled first unit");
+    }
+
+    // An FMKV stream is decided from five bytes: its header is parsed with no more data.
+    #[test]
+    fn a_stream_header_is_not_held_for_a_whole_unit() {
+        struct Trickle(Vec<u8>, usize);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                assert!(self.1 < self.0.len(), "the stage read past the sent header");
+                let n = buf.len().min(self.0.len() - self.1);
+                buf[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+                self.1 += n;
+                Ok(n)
+            }
+        }
+        let header = b"FMKV\0\x01\0\0header".to_vec();
+        let mut stage = Stage::lazy(Trickle(header.clone(), 0), false);
+        let mut got = vec![0u8; header.len()];
+        stage.read_exact(&mut got).unwrap();
+        assert_eq!(got, header);
+        assert_eq!(stage.kind(), Some(Kind::Opaque));
     }
 
     #[test]

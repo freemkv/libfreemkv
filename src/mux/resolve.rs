@@ -328,21 +328,19 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// The AACS disc folder a loose stream file sits in, found only by walking up from `file`:
-/// `<root>/BDMV/STREAM/*.m2ts` or `<root>/HVDVD_TS/*.evo`, with `<root>/AACS`. Open `<root>`
-/// as `dir://`, resolve its keys, and pass them in [`InputOptions::keys`]. `None`: no disc
-/// structure, so an encrypted file refuses (E7022). A `.vob` needs none: CSS self-cracks.
+/// The AACS disc folder a loose Blu-ray clip sits in, found only by walking up from `file`:
+/// `<root>/BDMV/STREAM/x.m2ts` (or `STREAM/SSIF/x.ssif`) with `<root>/AACS`. Open `<root>` as
+/// `dir://`, resolve its keys, and pass them in [`InputOptions::keys`]. `None`: no disc
+/// structure, so an encrypted clip refuses (E7022). A `.vob` needs none: CSS self-cracks.
 pub fn disc_root_of(file: &Path) -> Option<PathBuf> {
+    let file = std::fs::canonicalize(file).ok()?;
     let up = |p: &Path, name: &str| {
         let parent = p.parent()?;
         let dir = parent.file_name()?.to_str()?;
         dir.eq_ignore_ascii_case(name).then(|| parent.to_path_buf())
     };
-    let content = match up(file, "STREAM") {
-        Some(stream) => up(&stream, "BDMV")?,
-        None => up(file, "HVDVD_TS")?,
-    };
-    let root = content.parent()?.to_path_buf();
+    let stream = up(&file, "STREAM").or_else(|| up(&up(&file, "SSIF")?, "STREAM"))?;
+    let root = up(&stream, "BDMV")?.parent()?.to_path_buf();
     let aacs = std::fs::read_dir(&root).ok()?.flatten().any(|e| {
         e.file_name()
             .to_str()
@@ -1098,7 +1096,12 @@ fn build_ps_pipeline(
     // `--raw` still scans a descrambled head where a crack reaches one; the mux stays raw.
     let head = if opts.raw {
         match read_head(&mut open(false)?, n, PS_MUX_BATCH_SECTORS) {
-            Err(e) if crate::error::error_code(&e) == Some(crate::error::E_CSS_KEY_MISSING) => {
+            Err(e)
+                if matches!(
+                    crate::error::error_code(&e),
+                    Some(crate::error::E_CSS_KEY_MISSING | crate::error::E_NO_DISC_KEY)
+                ) =>
+            {
                 read_head(&mut stage, n, PS_MUX_BATCH_SECTORS)?
             }
             head => head?,

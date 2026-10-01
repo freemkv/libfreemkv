@@ -37,7 +37,10 @@ impl StdioStream {
 
     // `input` whose decryption stage passes ciphertext when `raw`.
     pub(crate) fn input_staged(raw: bool) -> Self {
-        Self::from_reader(Box::new(crate::sector::stage::Stage::lazy(io::stdin(), raw)))
+        Self::from_reader(Box::new(crate::sector::stage::Stage::lazy(
+            io::stdin(),
+            raw,
+        )))
     }
 
     fn from_reader(reader: Box<dyn Read + Send + Sync>) -> Self {

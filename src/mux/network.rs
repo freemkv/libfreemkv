@@ -223,7 +223,7 @@ enum Mode {
         ended: bool,
     },
     Read {
-        reader: BufReader<Stage<HaltRead>>,
+        reader: Box<BufReader<Stage<HaltRead>>>,
         meta: meta::M2tsMeta,
     },
 }
@@ -359,7 +359,10 @@ impl NetworkStream {
 
         Ok(Self {
             disc_title: meta.to_title(),
-            mode: Mode::Read { reader, meta },
+            mode: Mode::Read {
+                reader: Box::new(reader),
+                meta,
+            },
         })
     }
 }

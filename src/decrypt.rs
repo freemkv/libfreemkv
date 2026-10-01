@@ -2418,4 +2418,24 @@ mod spec_guards {
         decrypt_sectors_mapped(&mut kept, &keys, 0, &map).expect("a verified unit decrypts");
         check("kept Verify", &kept, plain);
     }
+    // A flagged partial unit is blanked only when it ends the source (a truncated copy); a
+    // partial read mid-content is left for the decrypt to refuse.
+    #[test]
+    fn a_flagged_partial_unit_is_blanked_only_at_the_end() {
+        use crate::disc::ContentFormat;
+        let mut tail = vec![0x5Au8; 4096];
+        tail[0] |= 0xC0;
+        tail[4] = 0x47;
+        let mut mid = tail.clone();
+        assert_eq!(
+            blank_damaged_units(&mut mid, 0, ContentFormat::BdTs, &|_| true, false),
+            0
+        );
+        assert_eq!(mid, tail);
+        assert_eq!(
+            blank_damaged_units(&mut tail, 0, ContentFormat::BdTs, &|_| true, true),
+            1
+        );
+        assert!(tail.iter().all(|&b| b == 0));
+    }
 }
