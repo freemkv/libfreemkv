@@ -105,7 +105,7 @@ pub mod coding_type {
 /// 13818-1 Table 2-22). Shared by the program-stream demuxer and the TS/M2TS
 /// muxers, so defined here once. Each is `u8` (matches the byte on the wire).
 pub mod pes_stream_id {
-    /// Video stream (`110x xxxx`; freemkv emits the base id `0xE0`).
+    /// Video stream (`1110 xxxx`; freemkv emits the base id `0xE0`).
     pub const VIDEO: u8 = 0xE0;
     /// MPEG audio stream (`110x xxxx`; 11172-3/13818-3/13818-7, freemkv emits `0xC0`).
     pub const MPEG_AUDIO: u8 = 0xC0;
@@ -122,7 +122,7 @@ pub mod pes_stream_id {
     /// private_stream_2 — DVD navigation (PCI/DSI); carries no muxable ES.
     pub const PRIVATE_STREAM_2: u8 = 0xBF;
 
-    /// Highest video stream_id — the `110x xxxx` video range tops out at 0xEF.
+    /// Highest video stream_id — the `1110 xxxx` video range tops out at 0xEF.
     pub const VIDEO_MAX: u8 = 0xEF;
 
     /// Inclusive range of every PES `stream_id` that carries demuxable payload:
