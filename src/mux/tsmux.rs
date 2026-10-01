@@ -107,8 +107,8 @@ pub struct TsMuxer<W: Write> {
     /// the borrow of the converted bytes does not conflict with the `&mut self`
     /// the writer needs.
     annex_b: Vec<u8>,
-    /// Per-track arrival-time copy of `params_written` for the pre-keyframe drop guard,
-    /// which runs before the start-up hold (design §2.3 tick-domain rule 1).
+    /// Per-track: a video frame has arrived past the pre-keyframe drop guard, which runs
+    /// before the start-up hold (design §2.3 tick-domain rule 1).
     arrival_armed: Vec<bool>,
     /// Per video track: the online DTS deriver, built at its first frame.
     dts: Vec<Option<DtsDeriver>>,
@@ -506,8 +506,8 @@ impl<W: Write> TsMuxer<W> {
         self.write_psi_if_due(pts_90k)?;
 
         // NAL video (HEVC/H.264): convert length-prefixed NALUs to Annex B and prepend
-        // codec_private params on the first keyframe only (arm `params_written` even if
-        // data is empty, else later non-key frames fail the drop guard). Others pass through.
+        // codec_private params on the first keyframe only (`params_written` latches even if
+        // data is empty, so no later keyframe re-prepends them). Others pass through.
         let mut annex_b = std::mem::take(&mut self.annex_b);
         let convert = is_video && self.is_nal_video(track);
         if convert {
@@ -715,8 +715,8 @@ impl<W: Write> TsMuxer<W> {
         c
     }
 
-    /// Flush the underlying writer. BD-TS needs no stream trailer, so this
-    /// only drains buffering; the muxer remains usable afterwards.
+    /// End the stream: resolve the DTS start-up windows, drain the hold and flush the
+    /// writer. BD-TS needs no stream trailer. Call once, after the last frame.
     ///
     /// Returns [`Error::MuxEmpty`](crate::error::Error::MuxEmpty) when not a
     /// single frame was emitted: an `m2ts://` sink that wrote only the FMKV
@@ -1047,10 +1047,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_data_keyframe_arms_params_so_later_frames_survive() {
-        // An empty-data keyframe must still arm params_written; otherwise
-        // every subsequent non-key frame would be dropped by the
-        // pre-keyframe guard and the track would emit no real frames.
+    fn empty_data_keyframe_arms_the_guard_so_later_frames_survive() {
+        // An empty-data keyframe must still arm the pre-keyframe guard; otherwise
+        // every subsequent non-key frame would be dropped and the track would
+        // emit no real frames.
         let mut sink: Vec<u8> = Vec::new();
         {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
@@ -1350,11 +1350,11 @@ mod tests {
         );
     }
 
-    // A non-NAL video track must still arm `params_written`, or every later
-    // non-keyframe fails the drop guard and silently vanishes — same class of
-    // bug `empty_data_keyframe_arms_params_so_later_frames_survive` guards.
+    // A non-NAL video keyframe must still arm the pre-keyframe guard, or every later
+    // non-keyframe silently vanishes — same class of bug
+    // `empty_data_keyframe_arms_the_guard_so_later_frames_survive` guards.
     #[test]
-    fn non_nal_video_keyframe_arms_params_so_later_frames_survive() {
+    fn non_nal_video_keyframe_arms_the_guard_so_later_frames_survive() {
         let key: Vec<u8> = vec![0x00, 0x00, 0x01, 0xB3, 0xAA, 0xBB];
         let non_key: Vec<u8> = vec![0x00, 0x00, 0x01, 0xB6, 0xCC, 0xDD];
 
@@ -1436,6 +1436,33 @@ mod tests {
         }
         let pats = parse_bd_ts(&sink).iter().filter(|p| p.pid == 0).count();
         assert_eq!(pats, 13);
+    }
+
+    // The PES stream_id follows the declared stream_type: the MPEG audio types (13818-1
+    // Table 2-22) take an audio id, everything else private_stream_1.
+    #[test]
+    fn mpeg_audio_stream_types_get_an_audio_stream_id() {
+        let types = [0x03u8, 0x04, 0x0F, 0x81, 0x06];
+        let pids: Vec<u16> = (0..types.len() as u16).map(|k| AUDIO_PID + k).collect();
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &pids);
+            mux.set_program(types.to_vec()).unwrap();
+            for t in 0..types.len() {
+                mux.write_frame(t, 0, true, &[0xFF, 0xF1, 0x4C, 0x80]).unwrap();
+            }
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let ids: Vec<u8> = pids
+            .iter()
+            .map(|&pid| {
+                let first = packets.iter().find(|p| p.pid == pid && p.pusi).unwrap();
+                assert_eq!(first.payload[..3], [0, 0, 1]);
+                first.payload[3]
+            })
+            .collect();
+        assert_eq!(ids, [0xC0, 0xC0, 0xC0, 0xBD, 0xBD]);
     }
 
     // A PES header's 33-bit PTS and DTS (DTS = PTS when absent), 90 kHz.

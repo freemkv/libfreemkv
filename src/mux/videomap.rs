@@ -404,6 +404,27 @@ mod tests {
         t
     }
 
+    // An explicit aspect wins; SD without one is unknown; HD falls back to the coded size.
+    #[test]
+    fn display_aspect_ratio_falls_back_by_resolution() {
+        let t = video_title(
+            Codec::Hevc,
+            Resolution::R1080p,
+            FrameRate::F24,
+            ColorSpace::Bt709,
+        );
+        let DiscStream::Video(mut v) = t.streams[0].clone() else {
+            unreachable!()
+        };
+        assert_eq!(display_aspect_ratio(&v, 1920, 1080), (1920, 1080));
+        assert_eq!(display_aspect_ratio(&v, 0, 0), (0, 1));
+        v.display_aspect = Some((16, 9));
+        assert_eq!(display_aspect_ratio(&v, 1920, 1080), (16, 9));
+        v.display_aspect = None;
+        v.resolution = Resolution::R576i;
+        assert_eq!(display_aspect_ratio(&v, 720, 576), (0, 1));
+    }
+
     fn src(medium: Medium, path: &str, title: usize) -> SourceInfo {
         SourceInfo {
             medium,

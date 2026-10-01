@@ -41,7 +41,8 @@ pub struct PsPacket {
     /// PES stream ID (0xE0 for video, 0xC0 for audio, 0xBD for private, etc.).
     pub stream_id: u8,
     /// Sub-stream ID for private stream 1 (AC3: 0x80-0x87, DTS: 0x88-0x8F,
-    /// LPCM: 0xA0-0xA7, subtitles: 0x20-0x3F).
+    /// LPCM: 0xA0-0xA7, E-AC-3: 0xC0-0xCF, subtitles: 0x20-0x3F); for extended stream
+    /// id 0xFD, the PES `stream_id_extension`.
     pub sub_stream_id: Option<u8>,
     /// Presentation timestamp in 90kHz ticks.
     pub pts: Option<u64>,
