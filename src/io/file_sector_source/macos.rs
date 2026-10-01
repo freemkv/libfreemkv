@@ -34,6 +34,7 @@ pub(crate) fn prefetch(file: &File, offset: u64, len: u64) {
         ra_count: bytes as libc::c_int,
     };
     // Best-effort — kernel hint only.
+    // SAFETY: `file` is a live borrowed fd and `ra` a live stack radvisory for the call.
     unsafe {
         libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &mut ra);
     }

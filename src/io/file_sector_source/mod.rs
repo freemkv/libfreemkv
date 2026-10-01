@@ -36,8 +36,8 @@ use crate::sector::SectorSource;
 
 use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 
-// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop; mirrors WRITEBACK_CHUNK_BYTES. 32
-// MiB is empirically tuned (7200rpm HDD/SATA).
+// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop; mirrors WRITEBACK_CHUNK_BYTES_DEFAULT.
+// 32 MiB is empirically tuned (7200rpm HDD/SATA).
 const READ_DROP_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
 
 // Max MiB from FREEMKV_READ_DROP_CHUNK_MIB: 64 GiB, and small enough n*1024*1024 can't overflow
@@ -660,5 +660,53 @@ mod tests {
             "the synthetic pad is zeros"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // A padded read of one sector from a longer file takes only that sector, and an lba past
+    // the file's end reads as zeros.
+    #[test]
+    fn open_padded_clamps_each_read_to_its_own_sectors() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("p.bin");
+        std::fs::write(&path, vec![7u8; 3 * 2048 + 100]).unwrap();
+        let mut s = FileSectorSource::open_padded(&path).unwrap();
+        let mut buf = vec![0xAAu8; 2048];
+        assert_eq!(s.read_sectors(1, 1, &mut buf, false).unwrap(), 2048);
+        assert!(buf.iter().all(|&b| b == 7));
+        assert_eq!(s.read_sectors(9, 1, &mut buf, false).unwrap(), 2048);
+        assert!(buf.iter().all(|&b| b == 0), "past EOF is the synthetic pad");
+    }
+
+    // The 32-bit LBA ceiling: u32::MAX sectors opens, one more is IsoTooLarge, for both
+    // open paths. Sparse files; skipped where the filesystem refuses the length.
+    #[test]
+    fn open_refuses_a_file_past_the_lba_space() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("huge.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        let max = u32::MAX as u64 * SECTOR_BYTES_U64;
+        if f.set_len(max).is_err() {
+            return;
+        }
+        assert_eq!(
+            FileSectorSource::open(&path).unwrap().capacity_sectors(),
+            u32::MAX
+        );
+        assert_eq!(
+            FileSectorSource::open_padded(&path)
+                .unwrap()
+                .capacity_sectors(),
+            u32::MAX
+        );
+        f.set_len(max + SECTOR_BYTES_U64).unwrap();
+        assert!(matches!(
+            FileSectorSource::open(&path),
+            Err(Error::IsoTooLarge { .. })
+        ));
+        f.set_len(max + 1).unwrap();
+        assert!(matches!(
+            FileSectorSource::open_padded(&path),
+            Err(Error::IsoTooLarge { .. })
+        ));
     }
 }

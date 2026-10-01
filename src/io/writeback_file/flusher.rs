@@ -1,6 +1,6 @@
 //! The in-write flusher (stop design §2.10 items 1–4): one worker per file makes written
-//! bytes durable in chunks of `C` while the writer runs. `C` halves (to a floor) when one
-//! chunk flush is slow; the writer waits, halt-aware, while more than `2 × C` is unflushed;
+//! bytes durable in chunks of `C` while the writer runs. `C` starts at a floor, halves when one
+//! chunk flush is slow and doubles (to a ceiling) when one is fast; the writer waits, halt-aware, while more than `2 × C` is unflushed;
 //! a flusher with no progress for the stall window latches `SyncTimeout` (sticky).
 
 use std::fs::File;
@@ -328,5 +328,51 @@ mod tests {
         f.lock().requested = 0;
         writer.join().unwrap().unwrap();
         assert!(f.error().is_none());
+    }
+
+    struct FailingChunk;
+    impl FlushOps for FailingChunk {
+        fn chunk(&self, _: &File) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(28))
+        }
+        fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
+            None
+        }
+        fn finish(&self, _: &File) -> io::Result<()> {
+            Ok(())
+        }
+        fn sample(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    // A failed chunk flush latches its own errno: the waiter gets the real error at once,
+    // not `SyncTimeout` after the stall window, and it stays latched.
+    #[test]
+    fn a_chunk_error_is_latched_and_reported_as_itself() {
+        let file = tempfile::tempfile().unwrap();
+        let timing = FlushTiming {
+            stall: Duration::from_millis(400),
+            slow_chunk: Duration::from_secs(10),
+            chunk_min: 100,
+            chunk_max: 100,
+            sample_every: Duration::from_millis(50),
+        };
+        let f = Flusher::spawn(
+            &file,
+            Arc::new(FailingChunk),
+            timing,
+            FlushProgress::default(),
+            0,
+        )
+        .unwrap();
+        let start = Instant::now();
+        let e = f.drain(100, None, None).expect_err("the chunk failed");
+        assert_eq!(e.raw_os_error(), Some(28), "{e}");
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "waited a stall"
+        );
+        assert_eq!(f.error().and_then(|e| e.raw_os_error()), Some(28));
     }
 }
