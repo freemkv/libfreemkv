@@ -111,6 +111,9 @@ pub struct MpgSink<W: Write + Send> {
     writer: Option<W>,
     mux: Option<Mux<W>>,
     excluded: super::ps::UnstoredExtensions,
+    /// Clip-join PTS correction shared with the MKV muxer and the other sinks: a
+    /// multi-clip playlist's source PTS resets or jumps at each join.
+    timeline: crate::mux::timeline::TimelineContinuity,
     origin_saturated: u64,
     frames: u64,
     finished: bool,
@@ -318,6 +321,10 @@ impl<W: Write + Send> MpgSink<W> {
             writer: Some(writer),
             mux: None,
             excluded,
+            timeline: crate::mux::timeline::TimelineContinuity::with_clips(
+                &title.clips,
+                title.content_format,
+            ),
             origin_saturated: 0,
             frames: 0,
             finished: false,
@@ -667,11 +674,21 @@ impl<W: Write + Send> PesSink for MpgSink<W> {
             return Ok(());
         }
         let is_video = out == self.video_out;
+        // Onto the continuous timeline first; `None` is material outside the clip marks.
+        let Some(pts_ns) = self.timeline.map(
+            frame.pts,
+            is_video,
+            frame.track,
+            is_video,
+            frame.source.map(|s| s.byte),
+        ) else {
+            return Ok(());
+        };
         // Drop video before the first keyframe: nothing decodes without it (tsmux's guard).
         if is_video && !frame.keyframe && !self.armed {
             return Ok(());
         }
-        let rel = self.rel(frame.pts);
+        let rel = self.rel(pts_ns);
         self.span = Some(
             self.span
                 .map_or((rel, rel), |(lo, hi)| (lo.min(rel), hi.max(rel))),
@@ -759,6 +776,24 @@ impl<W: Write + Send> MpgSink<W> {
             }
         }
         // Design §2.3 EOF: a short input is written, not failed; zero frames is MuxEmpty.
+        let seam_dropped = self.timeline.dropped_total();
+        if self.frames == 0 && seam_dropped > 0 {
+            return Err(crate::error::Error::SinkWroteNothing.into());
+        }
+        if seam_dropped > self.frames {
+            return Err(crate::error::Error::SeamPlanDroppedMost {
+                dropped: seam_dropped,
+                written: self.frames,
+            }
+            .into());
+        }
+        if seam_dropped > 0 {
+            tracing::info!(
+                target: "mux",
+                dropped = seam_dropped,
+                "frames outside the playlist's clip marks were dropped at clip joins"
+            );
+        }
         if self.frames == 0 {
             return Err(crate::error::Error::MuxEmpty.into());
         }

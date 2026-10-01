@@ -2269,3 +2269,31 @@ fn native_16_bit_lpcm_frames_pack_as_16_bit() {
     assert_eq!(aus.len(), 1);
     assert_eq!((aus[0].lpcm_bits, aus[0].data.len()), (16, 16));
 }
+
+// A multi-clip playlist's source PTS restarts at a join: the sink must place the next clip
+// after the first (the timeline corrector the MKV muxer uses), never on top of it.
+#[test]
+fn a_clip_join_pts_reset_continues_the_timeline() {
+    let fx = fixture(&Opts {
+        lpcm: false,
+        ..Opts::default()
+    });
+    let mut sink = MpgSink::create(Vec::new(), &fx.title).expect("create");
+    for _clip in 0..2 {
+        for f in &fx.frames {
+            sink.write(f).expect("write");
+        }
+    }
+    sink.finish().expect("finish");
+    let out = sink.mux.take().expect("mux").into_writer();
+    let parsed = replay::parse(&out).expect("parses");
+    let pts: Vec<u64> = parsed
+        .pes
+        .iter()
+        .filter(|x| x.key == (0xE0, None))
+        .filter_map(|x| x.pts)
+        .collect();
+    let span = pts.iter().max().unwrap() - pts.iter().min().unwrap();
+    // Two 6 s clips: the output spans ~12 s, not one clip's 6 s.
+    assert!(span >= 11 * 90_000, "span {span} ticks");
+}
