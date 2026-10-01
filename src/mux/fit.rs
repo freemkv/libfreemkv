@@ -96,6 +96,12 @@ pub fn fit_report(dest: &StreamUrl, title: &DiscTitle) -> FitReport {
             continue;
         }
         let refused = match (dest, s) {
+            (StreamUrl::M2ts { .. }, Stream::Audio(a)) if a.codec == Codec::Aac => {
+                let cp = title.codec_privates.get(i).and_then(|c| c.as_deref());
+                super::m2ts::aac_adts_template(cp)
+                    .is_none()
+                    .then_some(SkipReason::UnmappableAudio)
+            }
             (StreamUrl::M2ts { .. }, Stream::Audio(a)) if a.codec == Codec::Lpcm => {
                 let cp = title.codec_privates.get(i).and_then(|c| c.as_deref());
                 super::m2ts::lpcm_bd_header(a, cp)
@@ -266,6 +272,30 @@ mod tests {
         let r = fit_report(&parse_url("m2ts:///o/x.m2ts"), &t);
         assert_eq!(r.included, vec![0, 2]);
         assert_eq!(r.skipped, vec![(1, SkipReason::UnmappableAudio)]);
+    }
+
+    // AAC needs an ADTS-signallable ASC to be re-framed for the TS (HE-AAC signals its core).
+    #[test]
+    fn m2ts_plans_out_aac_adts_cannot_signal() {
+        let mut t = title(vec![
+            video(Codec::H264),
+            audio(0x1100, Codec::Aac, SampleRate::S48, ""),
+            audio(0x1101, Codec::Aac, SampleRate::S48, ""),
+            audio(0x1102, Codec::Aac, SampleRate::S48, ""),
+            audio(0x1103, Codec::Aac, SampleRate::S48, ""),
+        ]);
+        // LC, HE-AAC, no ASC, and LC with 960-sample frames (frameLengthFlag).
+        t.codec_privates = vec![
+            None,
+            Some(vec![0x11, 0x90]),
+            Some(vec![0x2B, 0x92, 0x08]),
+            None,
+            Some(vec![0x11, 0x94]),
+        ];
+        let r = fit_report(&parse_url("m2ts:///o/x.m2ts"), &t);
+        assert_eq!(r.included, vec![0, 1, 2]);
+        let skip = SkipReason::UnmappableAudio;
+        assert_eq!(r.skipped, vec![(3, skip), (4, skip)]);
     }
 
     // A class sink writes only its class by the user's choice: the rest is not a loss,

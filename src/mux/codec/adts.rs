@@ -80,6 +80,50 @@ fn adts_frame_ns(d: &[u8]) -> Option<u64> {
     Some(1024 * (u64::from(d[6] & 3) + 1) * 1_000_000_000 / u64::from(rate))
 }
 
+/// The ADTS header (MPEG-4 ID, no CRC, one raw_data_block, frame_length 0) for the access
+/// units an AudioSpecificConfig describes (14496-3 §1.6.2.1); `None` when ADTS cannot signal
+/// it: no 2-bit profile, an explicit rate, an in-band PCE layout or 960-sample frames
+/// (GASpecificConfig frameLengthFlag). SBR/PS signal the core.
+pub(crate) fn adts_template(asc: &[u8]) -> Option<[u8; ADTS_HEADER_BYTES]> {
+    let (b0, b1) = (*asc.first()?, *asc.get(1)?);
+    let rate = ((b0 & 7) << 1) | (b1 >> 7);
+    let channels = (b1 >> 3) & 0x0F;
+    let (object, frame_960) = match b0 >> 3 {
+        // extensionSamplingFrequencyIndex (4 bits), then the core audioObjectType.
+        5 | 29 => {
+            let b2 = *asc.get(2)?;
+            let ext = ((b1 & 7) << 1) | (b2 >> 7);
+            (ext != 0x0F).then_some(((b2 >> 2) & 0x1F, b2 & 0x02 != 0))?
+        }
+        o => (o, b1 & 0x04 != 0),
+    };
+    if frame_960 || !(1..=4).contains(&object) || rate > 0x0B || !(1..=7).contains(&channels) {
+        return None;
+    }
+    Some([
+        0xFF,
+        0xF1,
+        ((object - 1) << 6) | (rate << 2) | (channels >> 2),
+        (channels & 3) << 6,
+        0,
+        0x1F,
+        0xFC,
+    ])
+}
+
+/// `raw` as one ADTS frame under `template`; `None` past the 13-bit frame_length.
+pub(crate) fn adts_frame(template: [u8; ADTS_HEADER_BYTES], raw: &[u8]) -> Option<Vec<u8>> {
+    let len = ADTS_HEADER_BYTES + raw.len();
+    if len >= 1 << 13 {
+        return None;
+    }
+    let mut h = template;
+    h[3] |= (len >> 11) as u8;
+    h[4] = (len >> 3) as u8;
+    h[5] |= ((len & 7) << 5) as u8;
+    Some([&h[..], raw].concat())
+}
+
 pub struct AdtsParser {
     frames: AudioFrames,
     config: Option<Vec<u8>>,

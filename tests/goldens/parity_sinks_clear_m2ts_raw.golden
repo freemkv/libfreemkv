@@ -1,7 +1,7 @@
 mkv outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
 mkv out o.mkv = 58232 bytes sha256:b25ee88e8f6935e99acf42fd476cc71d
 m2ts outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
-m2ts out o.m2ts = 72000 bytes sha256:8d35b364a8644a961287daf4b63b7c44
+m2ts out o.m2ts = 76992 bytes sha256:6e0f6ee78432105851d67671fe9657e2
 demux outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
 demux out o/title t00 MPEG2.m2v = 27880 bytes sha256:be8990c82ea9024deb38cdfb174bea80
 demux out o/title t01 und AC3 DELAY 0ms.ac3 = 13312 bytes sha256:904e9e35a2990b1001d2d99baeb1a633

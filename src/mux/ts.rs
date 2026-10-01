@@ -706,10 +706,17 @@ fn ts_payload_base(pkt: &[u8]) -> Option<usize> {
     }
 }
 
-// Per PID, the MPEG audio layer (1-3) from the frame header at the start of its first PES
-// in `data` (`None` when that PES has no such header), found in one walk over `data`.
-fn mpeg_audio_layers(data: &[u8]) -> std::collections::HashMap<u16, Option<u8>> {
-    let mut layers = std::collections::HashMap::new();
+// The audio sync at the head of a PES's ES: ADTS (13818-7 layer '00') or MPEG audio Layer 1-3.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AudioSync {
+    Adts,
+    Layer(u8),
+}
+
+// Per PID, the stream_id and audio sync opening its first PES in `data` (`None` when that
+// PES has no PES/sync header), found in one walk over `data`.
+fn first_pes_heads(data: &[u8]) -> std::collections::HashMap<u16, Option<(u8, Option<AudioSync>)>> {
+    let mut heads = std::collections::HashMap::new();
     let mut offset = 0;
     while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
         if !is_resync_point(data, offset) {
@@ -719,30 +726,33 @@ fn mpeg_audio_layers(data: &[u8]) -> std::collections::HashMap<u16, Option<u8>> 
         let pkt = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
         let pkt_pid = (((pkt[5] & 0x1F) as u16) << 8) | pkt[6] as u16;
         if pkt[5] & 0x40 != 0 {
-            layers
-                .entry(pkt_pid)
-                .or_insert_with(|| first_pes_layer(pkt));
+            heads.entry(pkt_pid).or_insert_with(|| first_pes_head(pkt));
         }
         offset += BD_SOURCE_PACKET_BYTES;
     }
-    layers
+    heads
 }
 
-// MPEG audio layer of the frame header opening the PES that starts in `pkt`.
-fn first_pes_layer(pkt: &[u8]) -> Option<u8> {
+// stream_id and audio sync of the PES that starts in `pkt`.
+fn first_pes_head(pkt: &[u8]) -> Option<(u8, Option<AudioSync>)> {
     let pes = &pkt[ts_payload_base(pkt)?..];
     if pes.get(..3)? != [0, 0, 1] {
         return None;
     }
-    let es = pes.get(9 + *pes.get(8)? as usize..)?;
-    let (b0, b1) = (*es.first()?, *es.get(1)?);
-    if b0 != 0xFF || b1 & 0xE0 != 0xE0 {
-        return None;
-    }
-    match (b1 >> 1) & 0x03 {
-        0 => None,
-        l => Some(4 - l),
-    }
+    let id = *pes.get(3)?;
+    let es = pes.get(9 + *pes.get(8)? as usize..);
+    let sync = es.and_then(|es| {
+        let (b0, b1) = (*es.first()?, *es.get(1)?);
+        if b0 != 0xFF || b1 & 0xE0 != 0xE0 {
+            return None;
+        }
+        match (b1 >> 1) & 0x03 {
+            0 if b1 & 0xF0 == 0xF0 => Some(AudioSync::Adts),
+            0 => None,
+            l => Some(AudioSync::Layer(4 - l)),
+        }
+    });
+    Some((id, sync))
 }
 
 // Reassemble a single PSI section (PAT/PMT) for `target_pid`/`table_id` across TS-packet
@@ -909,7 +919,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
         let prog_info_len =
             ((((pmt[10] & 0x0F) as usize) << 8) | pmt[11] as usize).min(end.saturating_sub(12));
         let mut pos = 12 + prog_info_len;
-        let mut layers = None;
+        let mut heads = None;
 
         while pos + 5 <= end {
             let stream_type = pmt[pos];
@@ -918,17 +928,25 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
 
             // PMTs may also carry ISO/IEC 13818-1 audio stream types that are
             // absent from Blu-ray's STN table. Keep that distinction local to TS.
+            let mut head = || {
+                heads
+                    .get_or_insert_with(|| first_pes_heads(data))
+                    .get(&es_pid)
+                    .copied()
+                    .flatten()
+            };
             let codec = match stream_type {
                 // MPEG-1/2 audio covers Layers I-III; only the ES says which.
-                0x03 | 0x04
-                    if layers
-                        .get_or_insert_with(|| mpeg_audio_layers(data))
-                        .get(&es_pid)
-                        == Some(&Some(3)) =>
-                {
-                    Codec::Mp3
-                }
+                0x03 | 0x04 if head().and_then(|h| h.1) == Some(AudioSync::Layer(3)) => Codec::Mp3,
                 0x03 | 0x04 => Codec::Mp2,
+                // PES private data (FFmpeg's m2ts mode): an MPEG-audio stream_id plus the ES
+                // sync names AAC/MP2/MP3 (13818-1 Table 2-22); anything else stays unknown.
+                0x06 => match head() {
+                    Some((0xC0..=0xDF, Some(AudioSync::Adts))) => Codec::Aac,
+                    Some((0xC0..=0xDF, Some(AudioSync::Layer(3)))) => Codec::Mp3,
+                    Some((0xC0..=0xDF, Some(AudioSync::Layer(_)))) => Codec::Mp2,
+                    _ => Codec::Unknown(stream_type),
+                },
                 0x0f => Codec::Aac,
                 0x87 => Codec::Ac3Plus,
                 _ => Codec::from_coding_type(stream_type),
@@ -1783,6 +1801,32 @@ mod tests {
                 matches!(&streams[1], Stream::Audio(a) if a.codec == expected),
                 "{expected:?}"
             );
+        }
+    }
+
+    // FFmpeg's m2ts mode declares AAC/MP2/MP3 as PES private data (0x06); the
+    // MPEG-audio stream_id and the ES sync name the codec.
+    #[test]
+    fn scan_streams_types_private_data_audio_from_its_es() {
+        use crate::disc::{Codec, Stream};
+        for (id, header, expected) in [
+            (0xC0, [0xFF, 0xF1], Some(Codec::Aac)),
+            (0xC1, [0xFF, 0xFB], Some(Codec::Mp3)),
+            (0xC2, [0xFF, 0xFD], Some(Codec::Mp2)),
+            (0xBD, [0xFF, 0xFD], None),
+        ] {
+            let mut pes = vec![0x00, 0x00, 0x01, id, 0x00, 0x00, 0x80, 0x00, 0x00];
+            pes.extend_from_slice(&header);
+            pes.extend_from_slice(&[0x50, 0x80]);
+            let mut data = pat_packet(0x100);
+            data.extend(pmt_packet(0x100, &[(0x1b, 0x1011), (0x06, 0x1100)]));
+            data.extend(es_packet_exact(0x1100, true, &pes));
+            let streams = scan_streams(&data).unwrap();
+            let got = streams.iter().find_map(|s| match s {
+                Stream::Audio(a) => Some(a.codec),
+                _ => None,
+            });
+            assert_eq!(got, expected, "stream_id {id:#x}");
         }
     }
 

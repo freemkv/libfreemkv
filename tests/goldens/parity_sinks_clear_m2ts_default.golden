@@ -5,7 +5,7 @@ mp4 out o.mp4 = 0 bytes sha256:e3b0c44298fc1c149afbf4c8996fb924
 mpg outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
 mpg out o.mpg = 206852 bytes sha256:1fb67e840822afec9eab312490f39458
 m2ts outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
-m2ts out o.m2ts = 72000 bytes sha256:8d35b364a8644a961287daf4b63b7c44
+m2ts out o.m2ts = 76992 bytes sha256:6e0f6ee78432105851d67671fe9657e2
 fvi outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
 fvi out o.fvi = 6010 bytes sha256:b2c2689eb46dbb88df82ed4036805429
 json outcome = completed=true opened=true bytes=0 errors=0 lost=0 streams=3 undelivered=[]

@@ -11,4 +11,4 @@ scrambled-as-mkv refused = E7023
 mkv outcome = completed=true opened=true bytes=109646 errors=0 lost=0 streams=3 undelivered=[]
 mkv out o.mkv = 116792 bytes sha256:a78c043cac5f3aea36f7b6471d335077
 m2ts outcome = completed=true opened=true bytes=109646 errors=0 lost=0 streams=3 undelivered=[]
-m2ts out o.m2ts = 145536 bytes sha256:13025d0f2b83fdc13bc5403c583ec356
+m2ts out o.m2ts = 156288 bytes sha256:4e12abc7b8ec0ac09abb4ffb9e74d700

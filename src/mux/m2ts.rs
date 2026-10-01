@@ -20,6 +20,58 @@ pub(crate) fn lpcm_bd_header(a: &crate::disc::AudioStream, cp: Option<&[u8]>) ->
     super::codec::lpcm::bd_header(a.channels.count(), a.sample_rate.hz() as u32, src, depth)
 }
 
+/// The ADTS header an `m2ts://` sink re-frames an AAC track with, or `None` when its
+/// AudioSpecificConfig is missing or not signallable in ADTS and `create` leaves it out.
+pub(crate) fn aac_adts_template(cp: Option<&[u8]>) -> Option<[u8; 7]> {
+    cp.and_then(super::codec::adts::adts_template)
+}
+
+// PMT stream_type (13818-1 Table 2-34; BD-ROM HDMV types under the HDMV registration);
+// codecs with no TS mapping are PES private data (0x06).
+fn stream_type(s: &DiscStream) -> u8 {
+    use crate::disc::Codec as C;
+    match s {
+        DiscStream::Video(v) => match v.codec {
+            C::H264 if v.is_mvc_dependent() => 0x20,
+            C::H264 => 0x1B,
+            C::Hevc => 0x24,
+            C::Vc1 => 0xEA,
+            C::Mpeg2 => 0x02,
+            C::Mpeg1 => 0x01,
+            _ => 0x06,
+        },
+        DiscStream::Audio(a) => match a.codec {
+            C::Lpcm => 0x80,
+            C::Ac3 => 0x81,
+            C::Dts => 0x82,
+            C::TrueHd => 0x83,
+            C::Ac3Plus if a.secondary => 0xA1,
+            C::Ac3Plus => 0x84,
+            C::DtsHdHr if a.secondary => 0xA2,
+            C::DtsHdHr => 0x85,
+            C::DtsHdMa => 0x86,
+            C::Aac => 0x0F,
+            // As FFmpeg declares MPEG audio; its readers take 0x03 for either part.
+            C::Mp2 | C::Mp3 => 0x03,
+            _ => 0x06,
+        },
+        DiscStream::Subtitle(t) => match t.codec {
+            C::Pgs => 0x90,
+            _ => 0x06,
+        },
+    }
+}
+
+/// How the sink re-frames a track's IR frames for BD-TS.
+#[derive(Clone, Copy)]
+enum Repack {
+    Verbatim,
+    /// IR PCM → BD LPCM under this header.
+    Lpcm([u8; 2]),
+    /// Raw AAC access units → ADTS under this header.
+    Adts([u8; 7]),
+}
+
 fn stream_pid(s: &DiscStream) -> u16 {
     match s {
         DiscStream::Video(v) => v.pid,
@@ -32,7 +84,9 @@ fn stream_pid(s: &DiscStream) -> u16 {
 // nothing else may; DVD ids (0xE0, 0xBD80) and the null PID are not carriable at all.
 fn pid_fits(s: &DiscStream, pid: u16) -> bool {
     let video = matches!(s, DiscStream::Video(_));
-    video == super::tsmux::is_video_pid(pid) && (0x0010..=0x1FFE).contains(&pid)
+    video == super::tsmux::is_video_pid(pid)
+        && (0x0010..=0x1FFE).contains(&pid)
+        && pid != super::tsmux::PMT_PID
 }
 
 // Lowest free carriable PID for `s`, searched from its BD base.
@@ -52,10 +106,9 @@ fn free_pid(s: &DiscStream, used: &[bool]) -> Option<u16> {
 pub struct M2tsStream {
     disc_title: DiscTitle,
     muxer: super::tsmux::TsMuxer<Box<dyn Write + Send>>,
-    /// Per input track: output track index (None = dropped at create) and, for LPCM,
-    /// the BD LPCM header to re-pack parser PCM with.
-    route: Vec<Option<(usize, Option<[u8; 2]>)>>,
-    /// MPEG-2 multichannel extension tracks: no descriptor carrier (tsmux writes no PMT).
+    /// Per input track: output track index (None = dropped at create) and its re-framing.
+    route: Vec<Option<(usize, Repack)>>,
+    /// MPEG-2 multichannel extension tracks: no PMT descriptor binds them to their base.
     excluded: super::ps::UnstoredExtensions,
 }
 
@@ -94,7 +147,19 @@ impl M2tsStream {
                 route.push(None);
                 continue;
             }
-            let lpcm = match s {
+            let repack = match s {
+                DiscStream::Audio(a) if a.codec == crate::disc::Codec::Aac => {
+                    let Some(h) = aac_adts_template(cp.as_deref()) else {
+                        tracing::warn!(
+                            target: "mux",
+                            track = i,
+                            "AAC config not representable as ADTS; track omitted from M2TS"
+                        );
+                        route.push(None);
+                        continue;
+                    };
+                    Repack::Adts(h)
+                }
                 DiscStream::Audio(a) if a.codec == crate::disc::Codec::Lpcm => {
                     let h = lpcm_bd_header(a, cp.as_deref());
                     if h.is_none() {
@@ -109,9 +174,9 @@ impl M2tsStream {
                     // Advertise the layout actually packed, not a rejected source byte.
                     let depth = super::codec::lpcm::output_depth(cp.as_deref());
                     cp = h.map(|h| super::codec::lpcm::tagged_layout(h[0], depth));
-                    h
+                    h.map_or(Repack::Verbatim, Repack::Lpcm)
                 }
-                _ => None,
+                _ => Repack::Verbatim,
             };
             let mut s = s.clone();
             if !keep[i] {
@@ -127,7 +192,7 @@ impl M2tsStream {
                     DiscStream::Subtitle(t) => t.pid = pid,
                 }
             }
-            route.push(Some((out.streams.len(), lpcm)));
+            route.push(Some((out.streams.len(), repack)));
             out.streams.push(s);
             out.codec_privates.push(cp);
         }
@@ -139,6 +204,7 @@ impl M2tsStream {
         let pids: Vec<u16> = out.streams.iter().map(stream_pid).collect();
         let boxed: Box<dyn Write + Send> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
+        muxer.set_program(out.streams.iter().map(stream_type).collect())?;
         // Declaring the codec decides both ES framing (HEVC/H.264 are length-
         // prefixed → need Annex-B conversion; MPEG-2/VC-1 are already start-code
         // ES) and which param-set parser applies (avcC vs hvcC) — kept as one fact.
@@ -189,7 +255,7 @@ impl crate::pes::Stream for M2tsStream {
             // Dropped at create (already warned): nothing to write.
             Some(None) => Ok(()),
             // Parser output is plain PCM (16 or 24-bit); BD-TS needs the BD LPCM framing back.
-            Some(Some((track, Some(header)))) => {
+            Some(Some((track, Repack::Lpcm(header)))) => {
                 for (offset_ns, payload) in super::codec::lpcm::bd_payloads(&frame.data, header) {
                     self.muxer.write_frame(
                         track,
@@ -200,7 +266,15 @@ impl crate::pes::Stream for M2tsStream {
                 }
                 Ok(())
             }
-            Some(Some((track, None))) => {
+            Some(Some((track, Repack::Adts(header)))) => {
+                let Some(adts) = super::codec::adts::adts_frame(header, &frame.data) else {
+                    tracing::warn!(target: "mux", track, len = frame.data.len(), "AAC access unit too long for ADTS; dropped");
+                    return Ok(());
+                };
+                self.muxer
+                    .write_frame(track, frame.pts, frame.keyframe, &adts)
+            }
+            Some(Some((track, Repack::Verbatim))) => {
                 self.muxer
                     .write_frame(track, frame.pts, frame.keyframe, &frame.data)
             }
@@ -221,7 +295,7 @@ impl crate::pes::Stream for M2tsStream {
     }
 
     fn undelivered_streams(&self) -> Vec<usize> {
-        // LPCM BD LPCM can't carry (known from create), and MPEG-2 extension tracks whose
+        // LPCM/AAC BD-TS can't carry (known from create), and MPEG-2 extension tracks whose
         // packets arrived.
         let mut out: Vec<usize> = (0..self.route.len())
             .filter(|&i| self.route[i].is_none() && !self.excluded.contains(i))
@@ -1003,6 +1077,79 @@ mod tests {
         }
         assert_eq!(got(0x1101), Some(audio));
         assert_eq!(got(0x1200), Some(sub));
+    }
+
+    fn audio(pid: u16, codec: Codec) -> DiscStream {
+        let DiscStream::Audio(a) = ac3_audio(pid) else {
+            unreachable!()
+        };
+        DiscStream::Audio(crate::disc::AudioStream { codec, ..a })
+    }
+
+    // ffmpeg names streams only from a PMT: every track is declared under the program's
+    // HDMV registration with its stream_type (BD LPCM 0x80, AAC 0x0F, MPEG audio 0x03).
+    #[test]
+    fn every_track_is_declared_in_a_crc_valid_hdmv_pmt() {
+        let mut title = make_title();
+        title.streams.push(audio(0x1100, Codec::Lpcm));
+        title.streams.push(audio(0x1101, Codec::Aac));
+        title.streams.push(audio(0x1102, Codec::Mp3));
+        let cp0 = title.codec_privates[0].clone();
+        title.codec_privates = vec![
+            cp0,
+            Some(b"BDLP\x31\x10".to_vec()),
+            Some(vec![0x11, 0x90]),
+            None,
+        ];
+        let mp3 = [0xFF, 0xFB, 0x90, 0x64, 0, 0, 0, 0].to_vec();
+        let data = [
+            fake_idr_pes_data(),
+            vec![0; 960 * 4],
+            vec![0x21, 0x10, 0x04],
+            mp3,
+        ];
+        let (pids, ts) = mux_one_frame_each(&title, &data);
+        let streams = crate::mux::ts::scan_streams(&ts).expect("PAT/PMT present");
+        let got: Vec<(u16, Codec)> = streams
+            .iter()
+            .map(|s| match s {
+                DiscStream::Video(v) => (v.pid, v.codec),
+                DiscStream::Audio(a) => (a.pid, a.codec),
+                DiscStream::Subtitle(t) => (t.pid, t.codec),
+            })
+            .collect();
+        let want = [Codec::Hevc, Codec::Lpcm, Codec::Aac, Codec::Mp3];
+        assert_eq!(got, pids.iter().copied().zip(want).collect::<Vec<_>>());
+        assert!(
+            ts.windows(6)
+                .any(|w| w == [0x05, 0x04, b'H', b'D', b'M', b'V']),
+            "HDMV registration descriptor"
+        );
+    }
+
+    // ISO/IEC 13818-7 AAC in a TS is ADTS: the raw access units are re-framed from the ASC.
+    #[test]
+    fn aac_is_reframed_as_adts_from_its_audio_specific_config() {
+        let mut title = make_title();
+        title.streams = vec![audio(0x1100, Codec::Aac)];
+        // AAC-LC (2), 48 kHz (index 3), stereo.
+        title.codec_privates = vec![Some(vec![0x11, 0x90])];
+        let raw = vec![0x21, 0x10, 0x04, 0x60, 0x8C];
+        let (pids, ts) = mux_one_frame_each(&title, std::slice::from_ref(&raw));
+        let mut demux = crate::mux::ts::TsDemuxer::new(&pids);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        let len = 7 + raw.len();
+        let adts = [
+            0xFF,
+            0xF1,
+            0x4C,
+            0x80,
+            (len >> 3) as u8,
+            ((len & 7) << 5) as u8 | 0x1F,
+            0xFC,
+        ];
+        assert_eq!(pes[0].data, [&adts[..], &raw].concat());
     }
 
     #[test]

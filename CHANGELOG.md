@@ -90,6 +90,8 @@
 - UDF stale cache window after a failed read; Stop is honoured in image scan, the FE re-read pause and READ CAPACITY retries; a `/dev/null` mapfile uses a private per-process temp dir; `extract` sanitises reserved file names and checks extent LBA arithmetic.
 - `GET CONFIGURATION` honours Data/Additional Length and feature code; MODE SELECT list length is MDL+2; Windows SPTI timeout/alignment/bounce-buffer fixes; macOS DiskArbitration claim leak.
 - Labels: Paramount "feature" matching, Criterion duplicate mappings, B/T language match, bdmt setNumber. Diagnostic opening capture no longer aliases track index 256 and above.
+- `m2ts://` output now carries a PAT and an HDMV-registered PMT (PID 0x0100, repeated every 100 ms) declaring each track's stream_type, so FFmpeg and players identify every track: BD LPCM (0x80) decodes as `pcm_bluray` at the source depth instead of "unknown"/`mp3`. AAC is re-framed as ADTS from its AudioSpecificConfig (stream_type 0x0F; a config ADTS cannot signal is dropped and reported), MP2/MP3 are 0x03, and both use the MPEG-audio PES stream_id 0xC0.
+- Loose `m2ts://` input keeps AAC, MP2 and MP3 that FFmpeg's m2ts mode declares as PES private data (stream_type 0x06): an MPEG-audio stream_id plus the ES sync names the codec. `mp4://` carries AAC, MP2 and MP3 (`mp4a` + `esds`) instead of skipping them.
 
 ## [1.7.7] — 2026-09-26
 

@@ -41,6 +41,18 @@ const ORIGIN_HEADROOM_TICKS: i64 = 90_000;
 const HOLD_CAP_TICKS: u64 = 90_000;
 const HOLD_CAP_BYTES: usize = 64 * 1024 * 1024;
 
+/// PID of the program_map_section (BD-ROM convention); no stream may use it.
+pub(crate) const PMT_PID: u16 = 0x0100;
+// PAT/PMT repeat every 100 ms of PTS progress (the ETSI TR 101 290 PSI interval); a PTS
+// this far below the highest seen is a discontinuity and restarts the clock.
+const PSI_INTERVAL_TICKS: u64 = 9_000;
+const PSI_RESET_TICKS: u64 = 10 * 90_000;
+// HDMV registration_descriptor (13818-1 §2.6.8): the program's 0x80-0xFF stream_types are
+// BD-ROM's, e.g. 0x80 = BD LPCM.
+const HDMV_REGISTRATION: [u8; 6] = [0x05, 0x04, b'H', b'D', b'M', b'V'];
+// ES_info loop entries fit one 1024-byte section: 1021 - 13 fixed - 6 descriptor bytes.
+const MAX_PMT_ENTRIES: usize = (1021 - 13 - HDMV_REGISTRATION.len()) / 5;
+
 /// A frame held, in arrival order, while a video track's start-up window is open.
 struct Held {
     track: usize,
@@ -100,6 +112,13 @@ pub struct TsMuxer<W: Write> {
     hold_span: Option<(u64, u64)>,
     /// Warn once at `finish` when a DTS anomaly was counted.
     warned: bool,
+    /// Per-track PMT stream_type; `None` writes no PAT/PMT.
+    stream_types: Option<Vec<u8>>,
+    /// Continuity counters of the PAT and PMT PIDs.
+    psi_cc: [u8; 2],
+    /// (PTS of the last PAT/PMT, highest PTS since): decode-order PTS jitter and
+    /// interleaved tracks do not re-send them.
+    last_psi: Option<(u64, u64)>,
 }
 
 impl<W: Write> TsMuxer<W> {
@@ -122,7 +141,100 @@ impl<W: Write> TsMuxer<W> {
             hold_bytes: 0,
             hold_span: None,
             warned: false,
+            stream_types: None,
+            psi_cc: [0; 2],
+            last_psi: None,
         }
+    }
+
+    /// Declare each track's PMT stream_type: the output then carries a PAT and an HDMV
+    /// PMT (PID [`PMT_PID`]) before the first PES and every 100 ms of PTS after it.
+    pub(crate) fn set_program(&mut self, stream_types: Vec<u8>) -> io::Result<()> {
+        if stream_types.len() != self.pids.len() {
+            return Err(crate::error::Error::MuxTrackRange {
+                track: stream_types.len(),
+                tracks: self.pids.len(),
+            }
+            .into());
+        }
+        self.stream_types = Some(stream_types);
+        Ok(())
+    }
+
+    // PES stream_id: video, MPEG audio for 11172-3/13818-3/13818-7 stream_types
+    // (13818-1 Table 2-22), else private_stream_1 as BD-ROM uses.
+    fn stream_id(&self, track: usize) -> u8 {
+        use crate::consts::pes_stream_id;
+        if is_video_pid(self.pids[track]) {
+            return pes_stream_id::VIDEO;
+        }
+        match self.stream_types.as_ref().map(|t| t[track]) {
+            Some(0x03 | 0x04 | 0x0F) => pes_stream_id::MPEG_AUDIO,
+            _ => pes_stream_id::PRIVATE_STREAM_1,
+        }
+    }
+
+    // PAT and PMT, when declared and due at `pts`.
+    fn write_psi_if_due(&mut self, pts: u64) -> io::Result<()> {
+        let Some(types) = &self.stream_types else {
+            return Ok(());
+        };
+        if let Some((sent, hi)) = &mut self.last_psi {
+            *hi = (*hi).max(pts);
+            if pts < *sent + PSI_INTERVAL_TICKS && pts + PSI_RESET_TICKS >= *hi {
+                return Ok(());
+            }
+        }
+        if types.len() > MAX_PMT_ENTRIES && self.last_psi.is_none() {
+            tracing::warn!(target: "mux", tracks = types.len(), "bd-ts: PMT lists the first {MAX_PMT_ENTRIES} tracks only");
+        }
+        self.last_psi = Some((pts, pts));
+        let pcr_pid = self
+            .pids
+            .iter()
+            .copied()
+            .find(|&p| is_video_pid(p))
+            .or(self.pids.first().copied())
+            .unwrap_or(0x1FFF);
+        let mut pat = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01];
+        pat.extend_from_slice(&(0xE000 | PMT_PID).to_be_bytes());
+        let pat = psi_section(0x00, &pat);
+        let mut pmt = vec![0x00, 0x01, 0xC1, 0x00, 0x00];
+        pmt.extend_from_slice(&(0xE000 | pcr_pid).to_be_bytes());
+        pmt.extend_from_slice(&(0xF000 | HDMV_REGISTRATION.len() as u16).to_be_bytes());
+        pmt.extend_from_slice(&HDMV_REGISTRATION);
+        for (&t, &pid) in types.iter().zip(&self.pids).take(MAX_PMT_ENTRIES) {
+            pmt.push(t);
+            pmt.extend_from_slice(&(0xE000 | pid).to_be_bytes());
+            pmt.extend_from_slice(&[0xF0, 0x00]);
+        }
+        let pmt = psi_section(0x02, &pmt);
+        self.write_psi(0, 0, &pat)?;
+        self.write_psi(1, PMT_PID, &pmt)
+    }
+
+    // One PSI section as TS packets: pointer_field 0, then the section, 0xFF-stuffed.
+    fn write_psi(&mut self, slot: usize, pid: u16, section: &[u8]) -> io::Result<()> {
+        let payload = [&[0u8][..], section].concat();
+        for (i, chunk) in payload.chunks(TS_PAYLOAD_BYTES).enumerate() {
+            let cc = self.psi_cc[slot];
+            self.psi_cc[slot] = (cc + 1) & 0x0F;
+            let pusi = if i == 0 { 0x40 } else { 0 };
+            let mut pkt = [0xFFu8; 192];
+            pkt[..8].copy_from_slice(&[
+                0,
+                0,
+                0,
+                0,
+                SYNC_BYTE,
+                pusi | (pid >> 8) as u8,
+                pid as u8,
+                0x10 | cc,
+            ]);
+            pkt[8..8 + chunk.len()].copy_from_slice(chunk);
+            self.writer.write_all(&pkt)?;
+        }
+        Ok(())
     }
 
     /// Mark `track` as the MVC dependent view of `base` (design §2.3). Its own deriver
@@ -312,6 +424,7 @@ impl<W: Write> TsMuxer<W> {
         let pid = self.pids[track];
         let is_video = is_video_pid(pid);
         let dts_90k = if is_video { self.next_dts(track) } else { None };
+        self.write_psi_if_due(pts_90k)?;
 
         // NAL video (HEVC/H.264): convert length-prefixed NALUs to Annex B and prepend
         // codec_private params on the first keyframe only (arm `params_written` even if
@@ -413,7 +526,7 @@ impl<W: Write> TsMuxer<W> {
         es_data: &[u8],
     ) -> io::Result<()> {
         let pid = self.pids[track];
-        let pes_header = build_pes_header(pid, times, es_data.len());
+        let pes_header = build_pes_header(self.stream_id(track), times, es_data.len());
 
         // Logical PES packet = header bytes followed by es_data. It is
         // indexed (and written) in place, without materializing the
@@ -584,15 +697,19 @@ fn push_timestamp(header: &mut Vec<u8>, prefix: u8, ts: u64) {
     header.push(0x01 | (((ts << 1) & 0xFE) as u8));
 }
 
+// A long-form PSI section: table_id, section_length, `body` (from the 16-bit id on), CRC_32.
+fn psi_section(table_id: u8, body: &[u8]) -> Vec<u8> {
+    let len = (body.len() + 4) as u16;
+    let mut s = vec![table_id, 0xB0 | (len >> 8) as u8, len as u8];
+    s.extend_from_slice(body);
+    let crc = super::mpg::pack::crc32(&s);
+    s.extend_from_slice(&crc.to_be_bytes());
+    s
+}
+
 // Build a PES packet header for a BD stream.
-fn build_pes_header(pid: u16, times: PesTimes, data_len: usize) -> Vec<u8> {
+fn build_pes_header(stream_id: u8, times: PesTimes, data_len: usize) -> Vec<u8> {
     use crate::consts::pes_stream_id;
-    // Determine stream_id from PID range
-    let stream_id: u8 = if is_video_pid(pid) {
-        pes_stream_id::VIDEO
-    } else {
-        pes_stream_id::PRIVATE_STREAM_1 // audio, PGS subtitle, or default
-    };
     // PES_header_data_length: 5 PTS bytes, plus 5 DTS bytes when present.
     let header_data_len: usize = match times {
         PesTimes::None => 0,
@@ -1206,6 +1323,31 @@ mod tests {
             assert_eq!(chunk.len(), BD_SOURCE_PACKET_BYTES);
             assert_eq!(chunk[4], SYNC_BYTE, "TS sync byte at offset 4");
         }
+    }
+
+    // PSI repeats per 100 ms of PTS progress, not per frame whose PTS strays from the last
+    // PSI (interleaved tracks, decode-order jitter); a large backward jump re-sends at once.
+    #[test]
+    fn pat_repeats_per_100ms_of_pts_progress() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID, AUDIO_PID + 1]);
+            mux.set_program(vec![0x81, 0x81]).unwrap();
+            // Two tracks 500 ms apart, 10 ms frames: PSI at 0 and 0.5..=1.4 s, not ~200.
+            for n in 0..100i64 {
+                mux.write_frame(0, n * 10_000_000, true, &[0x0B, 0x77])
+                    .unwrap();
+                mux.write_frame(1, 500_000_000 + n * 10_000_000, true, &[0x0B, 0x77])
+                    .unwrap();
+            }
+            // 20 s is progress; back to 1.5 s is a discontinuity (> 10 s below the high).
+            for pts in [20_000_000_000, 1_500_000_000] {
+                mux.write_frame(0, pts, true, &[0x0B, 0x77]).unwrap();
+            }
+            mux.finish().unwrap();
+        }
+        let pats = parse_bd_ts(&sink).iter().filter(|p| p.pid == 0).count();
+        assert_eq!(pats, 13);
     }
 
     #[test]
