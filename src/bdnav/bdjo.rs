@@ -398,6 +398,20 @@ mod tests {
     }
 
     #[test]
+    fn app_strings_drop_trailing_nul_padding() {
+        let bytes = build_bdjo(&[AppSpec {
+            control_code: 1,
+            base_dir: "0000\0",
+            classpath_extension: "",
+            initial_class: "a.B\0\0",
+        }]);
+        let apps = parse(&bytes).expect("parses");
+        assert_eq!(apps[0].base_directory, "0000");
+        assert_eq!(apps[0].initial_class, "a.B");
+        assert_eq!(apps[0].jar_ids(), vec!["0000"]);
+    }
+
+    #[test]
     fn parses_autostart_app_fqcn_and_jar_ids() {
         let bytes = build_bdjo(&[AppSpec {
             control_code: 1,
