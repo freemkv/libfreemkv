@@ -3193,12 +3193,12 @@ pub(crate) fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf
 impl Disc {
     /// Path to the mapfile for a given output path.
     ///
-    /// For `/dev/null` output, returns `{dir}/{volume_id_or_title}.mapfile`
+    /// For the null device ([`crate::io::null_device`]), returns `{dir}/{volume_id_or_title}.mapfile`
     /// where `{dir}` is a directory this process created under the temp dir
     /// (owner-only on Unix, unpredictable name, stable for the process). For
     /// regular files, returns `{path}.mapfile`.
     pub fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
-        if path.as_os_str() == "/dev/null" {
+        if crate::io::is_null_device(path) {
             let name: String = self
                 .meta_title
                 .as_deref()

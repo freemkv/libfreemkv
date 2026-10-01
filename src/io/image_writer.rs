@@ -11,9 +11,8 @@ use crate::consts::SECTOR_BYTES;
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::event::Event;
+use crate::io::block_sink::{BlockSink, Finish, IsoSink};
 use crate::sector::SectorSource;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// Sectors per read/write batch. 4 MiB — large enough that per-call overhead
@@ -58,9 +57,12 @@ fn write_image_with(
     if total_sectors == 0 {
         return Err(Error::EmptyImage);
     }
-
-    let file = File::create(dest).map_err(|source| Error::IoError { source })?;
-    let r = copy_out(reader, file, dest, total_sectors, ctx, sync_dir);
+    let sink = IsoSink::create(dest)?;
+    #[cfg(test)]
+    let sink = sink.with_dir_sync(sync_dir);
+    #[cfg(not(test))]
+    let _ = sync_dir;
+    let r = copy_out(reader, Box::new(sink), total_sectors, ctx);
     // A failed copy leaves no truncated image at the final name; a halt keeps its partial.
     if matches!(&r, Err(e) if !matches!(e, Error::Halted)) {
         let _ = std::fs::remove_file(dest);
@@ -68,39 +70,46 @@ fn write_image_with(
     r
 }
 
+// Sectors `0..total_sectors` of `reader`, in order, into `sink`.
 fn copy_out(
     reader: &mut dyn SectorSource,
-    file: File,
-    dest: &Path,
+    mut sink: Box<dyn BlockSink>,
     total_sectors: u32,
     ctx: &Ctx,
-    sync_dir: fn(&Path) -> std::io::Result<()>,
 ) -> Result<u64> {
     let total = u64::from(total_sectors) * SECTOR_BYTES as u64;
-    let mut out = BufWriter::with_capacity(BATCH_SECTORS as usize * SECTOR_BYTES, file);
-
     let mut buf = vec![0u8; BATCH_SECTORS as usize * SECTOR_BYTES];
     let mut written: u64 = 0;
     let mut lba: u32 = 0;
 
     while lba < total_sectors {
         if ctx.halt.is_cancelled() {
+            let _ = sink.finish(Finish::Incomplete);
             return Err(Error::Halted);
         }
         let count = BATCH_SECTORS.min(total_sectors - lba);
         let want = count as usize * SECTOR_BYTES;
         // `recovery = false`: a file-backed source ignores the flag, and a
         // retry loop over a local file would only re-read the same bytes.
-        let got = reader.read_sectors(lba, count as u16, &mut buf[..want], false)?;
+        let got = match reader.read_sectors(lba, count as u16, &mut buf[..want], false) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = sink.finish(Finish::Incomplete);
+                return Err(e);
+            }
+        };
         if got != want {
+            let _ = sink.finish(Finish::Incomplete);
             return Err(Error::ShortImageRead {
                 lba,
                 expected: want as u32,
                 got: got as u32,
             });
         }
-        out.write_all(&buf[..want])
-            .map_err(|source| Error::IoError { source })?;
+        if let Err(e) = sink.write_at(u64::from(lba), &buf[..want]) {
+            let _ = sink.finish(Finish::Incomplete);
+            return Err(e);
+        }
         written += want as u64;
         lba += count;
         ctx.emit(Event::BytesWritten {
@@ -108,22 +117,7 @@ fn copy_out(
             total,
         });
     }
-
-    // flush() only pushes bytes into the kernel via write(2), no durability promise —
-    // a crash or yanked volume could leave a truncated file reported as complete.
-    // `into_inner` (not `flush`) also surfaces buffered-write errors, not silently drop them.
-    let file = out.into_inner().map_err(|e| Error::IoError {
-        source: e.into_error(),
-    })?;
-    file.sync_all()
-        .map_err(|source| Error::IoError { source })?;
-    // The file was just created: its directory entry needs its own fsync.
-    let dir = match dest.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    sync_dir(dir).map_err(|source| Error::IoError { source })?;
-    Ok(written)
+    sink.finish(Finish::Complete)
 }
 
 #[cfg(test)]

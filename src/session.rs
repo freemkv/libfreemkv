@@ -538,7 +538,7 @@ const AACS_PROBE_UNITS: usize = 8;
 /// content is sampled and judged by `aacs_unit_needs_decrypt`:
 ///
 /// * none need decryption → `encrypted` is forced false, reason logged.
-/// * any unit does → [`Error::DirImageEncrypted`] (`dir://` doesn't support it).
+/// * any unit does → the folder keeps its AACS verdict and is keyed like an image.
 pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
     crate::mux::source::probe_image(path, true, &opts)
 }
@@ -555,7 +555,10 @@ pub(crate) fn apply_folder_encryption_verdict(
     // Only the AACS-by-tree-shape verdict is re-judged here.
     if disc.encrypted && disc.css.is_none() && disc.css_error.is_none() {
         match probe_folder_encryption(reader, disc)? {
-            true => return Err(Error::DirImageEncrypted),
+            // Encrypted content: the folder keeps its AACS verdict and is keyed and
+            // decrypted like an image of the same disc (every input passes the one
+            // decryption stage).
+            true => {}
             false => {
                 tracing::warn!(
                     target: "freemkv::scan",

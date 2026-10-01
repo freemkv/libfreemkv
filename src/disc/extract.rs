@@ -215,8 +215,11 @@ impl Disc {
         // can report the good/unreadable split instead of pinning unreadable at 0.
         let mut done_unreadable: u64 = 0;
 
-        // CSS per-VTS key cache; only consulted for CSS discs.
-        let is_css = matches!(base_keys, DecryptKeys::Css { .. });
+        // CSS per-VTS key cache, consulted for every DVD-Video layout: a scrambled VTS is
+        // found from its content and cracked, a clear one passes. A live drive scan never
+        // records a disc-wide CSS key (BUG-1), so the scan's verdict cannot gate this.
+        let is_css = matches!(base_keys, DecryptKeys::Css { .. })
+            || (self.format == crate::disc::DiscFormat::Dvd && self.aacs.is_none());
         let mut vts_keys: std::collections::HashMap<String, DecryptKeys> =
             std::collections::HashMap::new();
 
@@ -1677,6 +1680,58 @@ mod tests {
         expect[0x14] = 0x80;
         assert_eq!(got, expect, "VOB descrambled to plaintext");
         assert!(res.complete);
+    }
+
+    /// BUG-1: a live DVD scan records no disc-wide CSS key (`disc.css` is `None`), yet its
+    /// scrambled title VOB is still found from content, cracked and descrambled.
+    #[test]
+    fn a_live_dvd_with_no_scanned_css_key_still_descrambles() {
+        let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let mut plain = vec![0u8; 2048];
+        plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        plain[4] = 0x44;
+        plain[0x14] = 0x10;
+        crate::css::dvd_pack_header(&mut plain, 0xE0);
+        let pat: Vec<u8> = (0..8)
+            .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
+            .collect();
+        for (i, b) in plain.iter_mut().enumerate().skip(0x59) {
+            *b = pat[i % 8];
+        }
+        plain[0x54..0x59].copy_from_slice(&seed);
+        let mut scrambled = plain.clone();
+        lfsr::scramble_sector(&title_key, &mut scrambled);
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: vec![file("VTS_01_1.VOB", 30, 5000, scrambled, false)],
+                subdirs: vec![],
+            }],
+        };
+        let mut disc = build_disc(root);
+        let out = TmpDir::new("css_live");
+        let mut d = clear_disc();
+        d.format = crate::disc::DiscFormat::Dvd;
+        d.content_format = crate::disc::ContentFormat::MpegPs;
+        assert!(d.css.is_none(), "a live scan's verdict: no disc-wide key");
+        d.extract_tree(
+            &mut disc,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .expect("extract");
+        let got = read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB").expect("vob");
+        let mut expect = plain.clone();
+        expect[0x14] = 0x80;
+        assert_eq!(got, expect, "the scrambled VOB is written descrambled");
     }
 
     /// A bad sector inside a file becomes a recorded zero-filled hole; the run

@@ -675,19 +675,18 @@ fn an_aacs_directory_over_clear_content_is_treated_as_decrypted() {
     assert!(disc.aacs_error.is_none(), "and no key is demanded");
 }
 
-/// The other verdict: a folder whose content units really are flagged and
-/// scrambled is a raw encrypted copy, which `dir://` does not support. It must
-/// be a typed error, not a rip that emits garbage.
+/// The other verdict: a folder whose content units really are flagged and scrambled is
+/// a raw encrypted copy. It keeps its AACS verdict, so it is keyed and decrypted like an
+/// image of the same disc (every input passes the one decryption stage).
 #[test]
-fn an_aacs_folder_with_scrambled_content_is_rejected() {
+fn an_aacs_folder_with_scrambled_content_scans_encrypted() {
     let s = playable_bdmv("aacsenc", true);
     s.file("AACS/Unit_Key_RO.inf", &[0u8; 64]);
     s.file("AACS/MKB_RO.inf", &[0u8; 64]);
-    let err = match crate::session::scan_dir(s.path(), crate::disc::ScanOptions::default()) {
-        Ok(_) => panic!("a scrambled folder must not scan clean"),
-        Err(e) => e,
-    };
-    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_ENCRYPTED);
+    let (disc, _reader) =
+        crate::session::scan_dir(s.path(), crate::disc::ScanOptions::default()).unwrap();
+    assert!(disc.encrypted, "scrambled content keeps the AACS verdict");
+    assert!(disc.aacs.is_some());
 }
 
 // ── The OTHER door: `dir://` through the PES input path ─────────────────────
@@ -759,10 +758,10 @@ fn a_dir_url_mux_reports_read_progress_to_the_ctx() {
     );
 }
 
-// The other verdict, same door: a truly scrambled folder is refused with the TYPED code, not
-// muxed into garbage. Load-bearing half.
+// The other verdict, same door: a truly scrambled folder with no key is refused before any
+// output with the standard no-key code (E7022), never muxed as ciphertext.
 #[test]
-fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
+fn a_scrambled_folder_with_no_key_is_refused_through_the_dir_url_door() {
     let s = playable_bdmv("dirdoorenc", true);
     s.file("AACS/Unit_Key_RO.inf", &[0u8; 64]);
     s.file("AACS/MKB_RO.inf", &[0u8; 64]);
@@ -778,8 +777,8 @@ fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
     };
     assert_eq!(
         crate::error::error_code(&err),
-        Some(crate::error::E_DIR_IMAGE_ENCRYPTED),
-        "expected the typed dir-source-encrypted code, got: {err}"
+        Some(crate::error::E_NO_DISC_KEY),
+        "expected the no-key code, got: {err}"
     );
 }
 
