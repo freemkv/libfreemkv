@@ -384,7 +384,7 @@ fn no_thread_sleep_on_op_paths() {
     ];
     const ALLOW: &[Allow] = &[
         (
-            "src/disc/extract.rs",
+            "src/io/tree_sink.rs",
             "probe_case_insensitive",
             "20 ms filesystem remove retry; no drive wait, no token in reach",
         ),
@@ -541,16 +541,16 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         r#"allow(clippy::too_many_arguments)"#,
         1,
     ),
-    (
-        "src/disc/extract.rs",
-        r#"allow(clippy::unnecessary_cast,clippy::useless_conversion)"#,
-        1,
-    ),
     ("src/drive/linux.rs", r#"allow(dead_code)"#, 1),
     ("src/drive/mod.rs", r#"allow(dead_code)"#, 1),
     (
         "src/drive/mod.rs",
         r#"cfg_attr(not(target_os="linux"),allow(unused_variables))"#,
+        1,
+    ),
+    (
+        "src/io/tree_sink.rs",
+        r#"allow(clippy::unnecessary_cast,clippy::useless_conversion)"#,
         1,
     ),
     (

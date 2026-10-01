@@ -24,9 +24,14 @@ pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 pub(crate) fn reserve_recovery_slot(counter: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
     use std::sync::atomic::Ordering::{AcqRel, Acquire};
     // CAS loop: a refused reserver never bumps the counter, so it can't starve a fitting one.
-    counter
-        .fetch_update(AcqRel, Acquire, |n| (n < max).then_some(n + 1))
-        .is_ok()
+    let mut n = counter.load(Acquire);
+    while n < max {
+        match counter.compare_exchange_weak(n, n + 1, AcqRel, Acquire) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
 }
 
 /// Give back a slot taken by [`reserve_recovery_slot`].
