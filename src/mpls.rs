@@ -30,8 +30,8 @@ pub(crate) struct PlaylistMark {
     /// Chapter filters should test `== 1`, not `<= 1`.
     pub mark_type: u8,
     /// Which play item this mark belongs to. Carries the per-PlayItem
-    /// timebase needed to place a mark in a multi-PlayItem playlist;
-    /// the chapter builder does not consume it yet.
+    /// timebase needed to place a mark in a multi-PlayItem playlist; the
+    /// chapter builder resolves each mark against that PlayItem.
     pub play_item_ref: u16,
     /// Timestamp in 45kHz PTS ticks
     pub timestamp: u32,
@@ -141,6 +141,12 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 
         let item = &pl[pos + 2..pos + 2 + item_length];
         if item.len() < 20 {
+            tracing::warn!(
+                target: "freemkv::mpls",
+                item_idx,
+                item_length,
+                "play item too short to read; it is dropped from the playlist"
+            );
             pos += 2 + item_length;
             continue;
         }
@@ -184,6 +190,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     streams.push(entry);
                     spos = next;
                 } else {
+                    stn_entry_unreadable("primary video");
                     break;
                 }
             }
@@ -193,6 +200,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     streams.push(entry);
                     spos = next;
                 } else {
+                    stn_entry_unreadable("primary audio");
                     break;
                 }
             }
@@ -206,6 +214,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     streams.push(entry);
                     spos = next;
                 } else {
+                    stn_entry_unreadable("PG subtitle");
                     break;
                 }
             }
@@ -214,6 +223,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                 if let Some((_, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_IG) {
                     spos = next;
                 } else {
+                    stn_entry_unreadable("IG");
                     break;
                 }
             }
@@ -233,6 +243,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                         spos = next;
                     }
                 } else {
+                    stn_entry_unreadable("secondary audio");
                     break;
                 }
             }
@@ -260,6 +271,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                         spos = next;
                     }
                 } else {
+                    stn_entry_unreadable("secondary video");
                     break;
                 }
             }
@@ -273,6 +285,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     streams.push(entry);
                     spos = next;
                 } else {
+                    stn_entry_unreadable("Dolby Vision enhancement layer");
                     break;
                 }
             }
@@ -336,6 +349,15 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     })
 }
 
+// An unreadable stream entry ends its STN category and every one after it.
+fn stn_entry_unreadable(kind: &str) {
+    tracing::warn!(
+        target: "freemkv::mpls",
+        kind,
+        "unreadable STN stream entry; this and the later stream entries are dropped"
+    );
+}
+
 impl Playlist {
     /// Total play-item running time in 45 kHz ticks (out_time - in_time, summed).
     pub fn duration_ticks(&self) -> u64 {
@@ -380,7 +402,7 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
 
     // PID location depends on stream-entry type (BD spec stream_entry()): type 1
     // (PlayItem's Clip) → +2; type 2 (SubPath SubClip) → +4; type 3/4 (SubPath
-    // clip / DV enhancement layer) → +3. Previously only type 1 was handled.
+    // clip / DV enhancement layer) → +3.
     let pid_off = match item[pos + 1] {
         STREAM_ENTRY_PLAYITEM_CLIP => 2,
         STREAM_ENTRY_SUBPATH_SUBCLIP => 4,
