@@ -6605,6 +6605,88 @@ mod audit_tests {
         );
     }
 
+    // Marks sector data by which entry point served it; forwards the trait's extras.
+    struct Probe {
+        unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
+    }
+
+    impl SectorSource for Probe {
+        fn read_sectors(&mut self, _: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            buf[..count as usize * 2048].fill(0x11);
+            Ok(count as usize * 2048)
+        }
+        fn read_sectors_fua(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+            fua: bool,
+        ) -> Result<usize> {
+            if fua {
+                buf[..count as usize * 2048].fill(0x22);
+                return Ok(count as usize * 2048);
+            }
+            self.read_sectors(lba, count, buf, recovery)
+        }
+        fn unmapped_stream_files(&self) -> &[crate::sector::bus_removal::UnmappedStreamFile] {
+            &self.unmapped
+        }
+        fn random_access(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn buffered_reader_sends_a_fua_read_to_the_medium_and_forwards_the_source_traits() {
+        let mut inner = Probe {
+            unmapped: vec![crate::sector::bus_removal::UnmappedStreamFile::new(
+                "/BDMV/STREAM/00001.m2ts".into(),
+                7,
+                &Error::Halted,
+            )],
+        };
+        let mut br = BufferedSectorReader::new(&mut inner, 8);
+        let mut buf = [0u8; 2048];
+        br.read_sectors(100, 1, &mut buf, true).unwrap();
+        assert_eq!(buf[0], 0x11);
+        br.read_sectors_fua(100, 1, &mut buf, true, true).unwrap();
+        assert_eq!(
+            buf[0], 0x22,
+            "a FUA read must not be answered from the cache"
+        );
+        assert!(!br.random_access());
+        assert_eq!(br.unmapped_stream_files().len(), 1);
+    }
+
+    #[test]
+    fn non_stream_ranges_cover_structures_and_non_stream_data_only() {
+        let mut r = GenReader::new(0);
+        let mut a = efe(16);
+        put_ad(&mut a, 0, 2048, 20);
+        put_ad(&mut a, 1, 2048 | (1 << 30), 700);
+        r.over.insert(300, a);
+        let mut s = efe(8);
+        put_ad(&mut s, 0, 10 * 2048, 9000);
+        r.over.insert(103, s);
+        let dir = |name: &str, meta_lba, entries| DirEntry {
+            name: name.into(),
+            is_dir: true,
+            meta_lba,
+            size: 0,
+            entries,
+        };
+        let stream = dir("STREAM", 2, vec![file("00000.m2ts", 3)]);
+        let bdmv = dir("BDMV", 1, vec![stream, file("a.bin", 4)]);
+        let mut fs = fs_of(100, 8, vec![bdmv]);
+        fs.meta = MetaMap(vec![(100, 4), (300, 4)]);
+        fs.partition_start = 50;
+        assert_eq!(
+            fs.non_stream_ranges(&mut r).expect("ranges"),
+            vec![(0, 50), (70, 1), (100, 8), (300, 4)]
+        );
+    }
+
     #[test]
     fn utf16_cs0_combines_surrogate_pairs() {
         // U+1F600 is D83D DE00.
