@@ -410,6 +410,40 @@ fn live_unreadable_uk_ro_is_recorded_scan_continues() {
 }
 
 #[test]
+fn live_unreadable_mkb_is_not_fatal() {
+    let mut rig = Rig::new(bd_disc(Some(false)), |t| {
+        t.fail_read = Some(Box::new(|lba, n, _| {
+            (lba..lba + n as u32)
+                .contains(&MKB_LBA)
+                .then(|| check(3, 0x11, 0, 0x28))
+        }));
+    });
+    let d =
+        Disc::scan(&mut rig.drive, &with_hc()).expect("a medium error in the MKB: scan goes on");
+    assert!(!d.titles.is_empty());
+}
+
+#[test]
+fn live_unreadable_cert_is_logged_and_not_fatal() {
+    let mut rig = Rig::new(bd_disc(Some(false)), |t| {
+        t.fail_read = Some(Box::new(|lba, n, _| {
+            (lba..lba + n as u32)
+                .contains(&CERT_LBA)
+                .then(|| check(3, 0x11, 0, 0x28))
+        }));
+    });
+    let (r, ev) = crate::testlog::capture(|| Disc::scan(&mut rig.drive, &with_hc()));
+    let d = r.expect("a medium error in the cert: scan goes on");
+    assert!(!d.titles.is_empty());
+    assert!(
+        aacs_warns(&ev)
+            .iter()
+            .any(|e| e.field("phase") == Some("aacs_capture")),
+        "the cert read failure must be visible: {ev:?}"
+    );
+}
+
+#[test]
 fn failed_handshake_cannot_poison_uk_ro_read() {
     let mut rig = Rig::new(bd_disc(Some(false)), |t| {
         t.fail_read = Some(Box::new(|lba, n, hist| {

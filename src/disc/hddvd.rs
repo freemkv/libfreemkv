@@ -361,6 +361,7 @@ const MAX_XPL_TITLES: usize = 512;
 // disc-supplied XML.
 const MAX_XPL_BYTES: usize = 1024 * 1024;
 
+// Max `.evo` clips resolved per scan (each costs an ICB read and a probe).
 const MAX_HDDVD_CLIPS: usize = 512;
 
 const MAX_XPL_CLIPS_PER_TITLE: usize = 256;
@@ -2604,6 +2605,134 @@ mod tests {
             Some(disc_read_err().code().to_string().as_str()),
             "{line:?}"
         );
+    }
+
+    // A Stop is never a probe failure: it surfaces, whether the drive reports it or the
+    // token is already raised.
+    #[test]
+    fn probe_evo_streams_surfaces_a_stop() {
+        let ext = Extent {
+            start_lba: 777,
+            sector_count: 4,
+        };
+        let mut halted = FailReader(|| crate::error::Error::Halted);
+        assert!(matches!(
+            probe_evo_streams(&mut halted, std::slice::from_ref(&ext), None),
+            Err(crate::error::Error::Halted)
+        ));
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let mut counter = ProbeCounter::new(MemDisc::new(), vec![777]);
+        assert!(matches!(
+            probe_evo_streams(&mut counter, std::slice::from_ref(&ext), Some(&halt)),
+            Err(crate::error::Error::Halted)
+        ));
+        assert_eq!(counter.sectors_read, 0, "a raised token reads nothing");
+    }
+
+    // A cancelled probe is not memoised as "no streams": the next title sharing the
+    // extents probes again.
+    #[test]
+    fn probe_cache_does_not_memoise_a_stop() {
+        let ext = [Extent {
+            start_lba: 777,
+            sector_count: 4,
+        }];
+        let mut cache = EvoProbeCache::default();
+        let mut halted = FailReader(|| crate::error::Error::Halted);
+        assert!(matches!(
+            cache.streams(&mut halted, &ext, None),
+            Err(crate::error::Error::Halted)
+        ));
+        let mut counter = ProbeCounter::new(MemDisc::new(), vec![777]);
+        cache.streams(&mut counter, &ext, None).expect("probe");
+        assert_eq!(counter.hits[0], 1, "the extents are probed again");
+    }
+
+    // A Stop while resolving a clip's extents ends the scan; it is not "clip unreadable".
+    #[test]
+    fn scan_hddvd_titles_surfaces_a_stop_resolving_extents() {
+        struct HaltAt(MemDisc, u32);
+        impl SectorSource for HaltAt {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> crate::error::Result<usize> {
+                if lba == self.1 {
+                    return Err(crate::error::Error::Halted);
+                }
+                self.0.read_sectors(lba, count, buf, recovery)
+            }
+        }
+        let mut disc = MemDisc::new();
+        let udf = make_hddvd_fs_with_evo(&mut disc, &synthetic_evo());
+        let mut reader = HaltAt(disc, PART_START + 100); // FEATURE.EVO's ICB
+        let res = Disc::scan_hddvd_titles(&mut reader, &udf, None);
+        assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
+
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let mut counter = ProbeCounter::new(reader.0, vec![]);
+        let res = Disc::scan_hddvd_titles(&mut counter, &udf, Some(&halt));
+        assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
+        assert_eq!(counter.sectors_read, 0, "a raised token reads nothing");
+    }
+
+    // A title whose end precedes its begin never reports a negative duration.
+    #[test]
+    fn compose_xpl_titles_clamps_a_reversed_clip_duration_and_names_by_number() {
+        let clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = [(
+            "a.evo".to_string(),
+            (
+                "A.EVO".to_string(),
+                1000u64,
+                vec![Extent {
+                    start_lba: 1,
+                    sector_count: 1,
+                }],
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let xpl_titles = vec![XplTitle {
+            number: 7,
+            name: String::new(),
+            duration_secs: 10.0,
+            clips: vec![XplClip {
+                evo: "a.evo".to_string(),
+                begin_secs: 9.0,
+                end_secs: 5.0,
+            }],
+            chapters: vec![],
+        }];
+        let mut disc = MemDisc::new();
+        let titles = compose_xpl_titles(
+            &mut disc,
+            &xpl_titles,
+            &clip_extents,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("compose");
+        assert_eq!(titles[0].clips[0].duration_secs, 0.0);
+        assert_eq!(
+            titles[0].playlist, "TITLE_7",
+            "an unnamed title is named by number"
+        );
+    }
+
+    // A title with no displayName is named by its id attribute.
+    #[test]
+    fn parse_xpl_titles_falls_back_to_the_id_attribute_for_the_name() {
+        let xpl = r#"<Playlist><TitleSet timeBase="60fps">
+            <Title titleNumber="3" titleDuration="00:00:10:00" id="Bonus3">
+              <PrimaryAudioVideoClip titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:10:00" src="file:///x/B.MAP"/>
+            </Title></TitleSet></Playlist>"#;
+        let titles = parse_xpl_titles(xpl.as_bytes());
+        assert_eq!(titles[0].name, "Bonus3");
     }
 
     // ── read_adv_obj_xpl: prefix AND suffix are both required ──────────────

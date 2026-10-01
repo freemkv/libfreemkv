@@ -354,5 +354,6 @@ mod tests {
             panic!("audio")
         };
         assert_eq!(a.pid, 0xBD81);
+        assert_eq!(a.channels, AudioChannels::Surround51);
     }
 }
