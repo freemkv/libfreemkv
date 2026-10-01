@@ -7,13 +7,19 @@
 //! container through untouched and refuses encrypted content it cannot decrypt. The verdict
 //! comes from the bytes alone ([`classify`]), never from the URL scheme.
 
-use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, is_clean};
+use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_seed_encrypted, is_clean};
 use crate::consts::{BD_SOURCE_PACKET_BYTES, SECTOR_BYTES};
-use crate::css::{PACK_START, Packs};
+use crate::css::{PACK_START, scrambled_at};
 use crate::disc::ContentFormat;
 use crate::error::Error;
 use crate::sector::SectorSource;
 use std::io::{self, Read, Seek, SeekFrom};
+
+#[cfg(test)]
+thread_local! {
+    /// Stages built on this thread (test-only: every `input()` arm must build one).
+    pub(crate) static STAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Sectors a sector source's verdict is read from.
 pub(crate) const HEAD_SECTORS: u32 = 32;
@@ -41,10 +47,8 @@ pub(crate) fn classify(head: &[u8]) -> Kind {
     if head.starts_with(b"FMKV") {
         return Kind::Opaque;
     }
-    if head.len() >= 5 && head[..4] == PACK_START {
-        return Kind::Ps {
-            mpeg2: head[4] >> 6 == 0b01,
-        };
+    if let Some(ps) = pack_at(head) {
+        return ps;
     }
     if is_bd_ts(head) {
         Kind::BdTs
@@ -59,12 +63,25 @@ pub(crate) fn classify_sectors(head: &[u8]) -> Kind {
     match classify(head) {
         Kind::Opaque if !head.starts_with(b"FMKV") => head
             .chunks(SECTOR_BYTES)
-            .find(|s| s.len() >= 5 && s[..4] == PACK_START)
-            .map_or(Kind::Opaque, |p| Kind::Ps {
-                mpeg2: p[4] >> 6 == 0b01,
-            }),
+            .find_map(pack_at)
+            .unwrap_or(Kind::Opaque),
         kind => kind,
     }
+}
+
+// A pack header opening `s`: 13818-1 ('01', a start code past its stuffing) or 11172-1
+// ('0010', a start code at byte 12). An MP4 box 0x1BA bytes long is neither.
+fn pack_at(s: &[u8]) -> Option<Kind> {
+    if s.get(..4)? != PACK_START {
+        return None;
+    }
+    let mpeg2 = s.get(4)? >> 6 == 0b01;
+    let at = match mpeg2 {
+        true => 0x0E + usize::from(s.get(0x0D)? & 0x07),
+        false if s[4] >> 4 == 0b0010 => 12,
+        false => return None,
+    };
+    (s.get(at..at + 3)? == [0, 0, 1]).then_some(Kind::Ps { mpeg2 })
 }
 
 // KS-2: a source packet is "the TP_extra_header (4 bytes) and an MPEG Transport packet"; KS-4:
@@ -86,10 +103,34 @@ fn is_bd_ts(head: &[u8]) -> bool {
     shaped >= live.clamp(1, 2) && shaped * 2 >= live
 }
 
+// Clear TS: the seed's packet synced and half the other non-padding packets (16 of a whole
+// unit's 31), not the 4-packet key-proof floor of `is_clean` (ciphertext passes ~7e-6). Damage
+// to a few packets must not make a clear unit look encrypted; ciphertext passes this ~1e-30.
+pub(crate) fn clear_ts(chunk: &[u8]) -> bool {
+    let pkts = chunk.as_chunks::<BD_SOURCE_PACKET_BYTES>().0;
+    let Some((seed, rest)) = pkts.split_first() else {
+        return false;
+    };
+    let content = rest.iter().filter(|p| p[4..].iter().any(|&b| b != 0));
+    let (n, synced) = content.fold((0, 0), |(n, s), p| (n + 1, s + usize::from(p[4] == 0x47)));
+    seed[4] == 0x47 && synced * 2 >= n
+}
+
+// A BD-TS unit only a key opens: CPI-flagged and not clear TS.
+fn needs_key(unit: &[u8]) -> bool {
+    aacs_unit_seed_encrypted(unit, ContentFormat::BdTs) && !clear_ts(unit)
+}
+
+// `head` filled up to `max` bytes from `r`, fewer only at EOF; bytes read before an error stay.
+fn fill_head(r: &mut impl Read, head: &mut Vec<u8>, max: usize) -> io::Result<()> {
+    let want = max.saturating_sub(head.len()) as u64;
+    r.by_ref().take(want).read_to_end(head).map(|_| ())
+}
+
 // Up to `max` bytes from the start of `r`, fewer only at EOF.
 fn read_head(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     let mut head = Vec::with_capacity(max);
-    r.by_ref().take(max as u64).read_to_end(&mut head)?;
+    fill_head(r, &mut head, max)?;
     Ok(head)
 }
 
@@ -111,6 +152,8 @@ pub(crate) struct Stage<R> {
 impl<R: Read> Stage<R> {
     /// A stream (`network://`, `stdio://`): the verdict is read on the first read.
     pub(crate) fn lazy(inner: R, raw: bool) -> Self {
+        #[cfg(test)]
+        STAGES.with(|n| n.set(n.get() + 1));
         Self {
             inner,
             raw,
@@ -155,13 +198,10 @@ impl<R: Read> Stage<R> {
             bytes = &bytes[take..];
             if self.carry.len() == block {
                 let refuse = match self.kind {
-                    Some(Kind::BdTs) => aacs_unit_needs_decrypt(&self.carry, ContentFormat::BdTs)
-                        .then(|| Error::NoDiscKey {
-                            disc_hash: String::new(),
-                        }),
-                    _ => Packs::ProgramStream
-                        .scrambled_at(&self.carry)
-                        .map(|_| Error::CssKeyMissing),
+                    Some(Kind::BdTs) => needs_key(&self.carry).then(|| Error::NoDiscKey {
+                        disc_hash: String::new(),
+                    }),
+                    _ => scrambled_at(&self.carry).map(|_| Error::CssKeyMissing),
                 };
                 self.carry.clear();
                 if let Some(e) = refuse {
@@ -189,10 +229,9 @@ impl<R: Read> Read for Stage<R> {
         if self.kind.is_none() {
             // Five bytes rule a stream out (no pack start, no TS sync at byte 4), so an FMKV
             // header is parsed as soon as it arrives; only a candidate waits for a whole unit.
-            self.head = read_head(&mut self.inner, 5)?;
-            if self.head.len() == 5 && (self.head[..4] == PACK_START || self.head[4] == 0x47) {
-                let rest = read_head(&mut self.inner, STREAM_HEAD - 5)?;
-                self.head.extend(rest);
+            fill_head(&mut self.inner, &mut self.head, 5)?;
+            if self.head.len() >= 5 && (self.head[..4] == PACK_START || self.head[4] == 0x47) {
+                fill_head(&mut self.inner, &mut self.head, STREAM_HEAD)?;
             }
             self.kind = Some(classify(&self.head));
         }
@@ -263,10 +302,14 @@ impl<S: SectorSource> Read for SectorBytes<S> {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
             self.buf.resize(count as usize * SECTOR_BYTES, 0);
-            let n = self
-                .src
-                .read_sectors(lba, count, &mut self.buf, true)
-                .map_err(io::Error::from)?;
+            let n = match self.src.read_sectors(lba, count, &mut self.buf, true) {
+                Ok(n) => n,
+                // A refused read must not leave its raw bytes to serve a retry.
+                Err(e) => {
+                    self.buf.clear();
+                    return Err(e.into());
+                }
+            };
             self.buf.truncate(n.min(self.buf.len()));
             self.buf_start = lba as u64 * SECTOR_BYTES as u64;
             if self.pos >= self.buf_start + self.buf.len() as u64 {
@@ -362,7 +405,13 @@ mod tests {
         );
         let mut mpeg1 = dvd_pack(0xE0, 0);
         mpeg1[4] = 0x21;
+        mpeg1[12..15].copy_from_slice(&[0, 0, 1]);
         assert_eq!(classify(&mpeg1), Kind::Ps { mpeg2: false });
+        // Review: an MP4 whose first box is 0x1BA bytes opens `00 00 01 BA 'f'`.
+        let mut mp4 = vec![0, 0, 1, 0xBA];
+        mp4.extend(b"ftypisom");
+        mp4.extend(noise(FILE_HEAD));
+        assert_eq!(classify(&mp4), Kind::Opaque);
         let clear: Vec<u8> = (0..4).flat_map(|_| ts_unit(false)).collect();
         assert_eq!(classify(&clear), Kind::BdTs);
         let mut enc = ts_unit(true);
@@ -448,35 +497,22 @@ mod tests {
         );
     }
 
-    // X-3: on DVD-Video-conformant packs (stuffing 0, a PES at 0x0E with MPEG-2 flags) the two
-    // layouts agree for every stream id a DVD carries and every scramble value; neither reads
-    // an IFO or UDF sector (no pack start) as scrambled, the guard for the 38→10-titles misread.
+    // X-3: ONE pack test for disc and file: every DVD-Video stream id and scramble value; an
+    // IFO/UDF sector (the 38→10-titles guard) or a pack whose 0x14 only looks flagged (stuffed,
+    // map-first, MPEG-1 PES) is never scrambled, so the disc path leaves it untouched too.
     #[test]
-    fn the_two_pack_layouts_agree_on_dvd_video_packs() {
+    fn one_pack_test_serves_disc_and_file() {
         for id in [0xBDu8, 0xBE, 0xBF, 0xC0, 0xC7, 0xE0] {
             for scramble in 0..4u8 {
-                let p = dvd_pack(id, scramble);
-                assert_eq!(
-                    Packs::DvdVideo.scrambled_at(&p),
-                    Packs::ProgramStream.scrambled_at(&p),
-                    "id {id:#x} scramble {scramble}"
-                );
+                let want = (scramble != 0 && !matches!(id, 0xBE | 0xBF)).then_some(0x14);
+                let got = scrambled_at(&dvd_pack(id, scramble));
+                assert_eq!(got, want, "id {id:#x} scramble {scramble}");
             }
         }
         let mut ifo = b"DVDVIDEO-VTS".to_vec();
         ifo.resize(SECTOR_BYTES, 0x30);
         let mut udf = vec![0u8; SECTOR_BYTES];
         udf[..6].copy_from_slice(&[0x02, 0x00, 0x02, 0x00, 0x30, 0x30]);
-        for s in [ifo, udf, vec![0x30; SECTOR_BYTES]] {
-            assert_eq!(Packs::DvdVideo.scrambled_at(&s), None);
-            assert_eq!(Packs::ProgramStream.scrambled_at(&s), None);
-        }
-    }
-
-    // The documented divergences: the disc layout (libdvdcss parity) reads 0x14 whatever the
-    // pack holds; a content-detected stream judges the PES the pack's stuffing points at.
-    #[test]
-    fn the_pack_layouts_diverge_only_off_dvd_video() {
         let mut stuffed = dvd_pack(0xE0, 0);
         stuffed[0x0D] = 0xF8 | 1;
         stuffed[0x14] = 0x30;
@@ -484,13 +520,18 @@ mod tests {
         map_first[0x14] = 0xB0;
         let mut mpeg1_pes = dvd_pack(0xE0, 0);
         mpeg1_pes[0x14] = 0xFF;
-        for (name, p) in [
-            ("stuffed", stuffed),
-            ("map", map_first),
-            ("mpeg1", mpeg1_pes),
+        for s in [
+            ifo,
+            udf,
+            vec![0x30; SECTOR_BYTES],
+            stuffed,
+            map_first,
+            mpeg1_pes,
         ] {
-            assert_eq!(Packs::DvdVideo.scrambled_at(&p), Some(0x14), "{name}");
-            assert_ne!(Packs::ProgramStream.scrambled_at(&p), Some(0x14), "{name}");
+            assert_eq!(scrambled_at(&s), None);
+            let mut region = s.clone();
+            crate::css::descramble_region(&mut region, &mut [0x42; 5]).unwrap();
+            assert_eq!(region, s, "the disc path's descramble leaves it untouched");
         }
     }
 
@@ -533,6 +574,82 @@ mod tests {
         stage.read_exact(&mut got).unwrap();
         assert_eq!(got, header);
         assert_eq!(stage.kind(), Some(Kind::Opaque));
+    }
+
+    // Review: head bytes read before a transient error are kept for the retry.
+    #[test]
+    fn a_head_read_error_keeps_what_was_read() {
+        struct Flaky(Vec<u8>, usize, bool);
+        impl Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.1 == 5 && !self.2 {
+                    self.2 = true;
+                    return Err(io::ErrorKind::ConnectionReset.into());
+                }
+                let n = buf.len().min(self.0.len() - self.1);
+                buf[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+                self.1 += n;
+                Ok(n)
+            }
+        }
+        let unit = ts_unit(false);
+        let mut stage = Stage::lazy(Flaky(unit.clone(), 0, false), false);
+        let mut out = Vec::new();
+        assert!(stage.read_to_end(&mut out).is_err());
+        stage.read_to_end(&mut out).unwrap();
+        assert_eq!(out, unit);
+    }
+
+    // Review: a refused read leaves none of its raw bytes for a retry to serve.
+    #[test]
+    fn a_refused_read_is_refused_again() {
+        struct Refuses;
+        impl SectorSource for Refuses {
+            fn capacity_sectors(&self) -> u32 {
+                4
+            }
+            fn read_sectors(
+                &mut self,
+                _: u32,
+                _: u16,
+                buf: &mut [u8],
+                _: bool,
+            ) -> crate::error::Result<usize> {
+                buf.fill(0xEE);
+                Err(Error::CssKeyMissing)
+            }
+        }
+        let mut bytes = SectorBytes::new(Refuses, 4 * SECTOR_BYTES as u64);
+        let mut out = [0u8; 100];
+        assert!(bytes.read(&mut out).is_err());
+        assert!(
+            bytes.read(&mut out).is_err(),
+            "never the refused read's bytes"
+        );
+    }
+
+    // N9: a source that ends early is an error, never a silent end of stream.
+    #[test]
+    fn a_source_ending_early_is_unexpected_eof() {
+        struct Empty;
+        impl SectorSource for Empty {
+            fn capacity_sectors(&self) -> u32 {
+                4
+            }
+            fn read_sectors(
+                &mut self,
+                _: u32,
+                _: u16,
+                _: &mut [u8],
+                _: bool,
+            ) -> crate::error::Result<usize> {
+                Ok(0)
+            }
+        }
+        let e = SectorBytes::new(Empty, 4 * SECTOR_BYTES as u64)
+            .read(&mut [0u8; 100])
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

@@ -135,29 +135,7 @@ pub fn crack_key_outcome(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> CrackOutcome {
-    crack_key_scan_with(reader, extents, batch_sectors, halt, Packs::DvdVideo)
-}
-
-/// Where a scrambled pack's PES flags sit, by what the pack stream is known to be. The two
-/// verdicts cannot be one predicate: they disagree on a stuffed pack, a map-first pack and an
-/// MPEG-1-style PES, which the disc path descrambles (libdvdcss parity) and a file must not.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Packs {
-    /// DVD-Video proven by the disc scan: flags at 0x14 ([`is_scrambled_pack`]).
-    DvdVideo,
-    /// A pack stream known only from its content: flags where the pack's stuffing puts them,
-    /// judged on a well-formed PES header ([`ps_scrambled_at`]).
-    ProgramStream,
-}
-
-impl Packs {
-    /// The offset of a scrambled pack's flags byte, else `None`.
-    pub(crate) fn scrambled_at(self, sector: &[u8]) -> Option<usize> {
-        match self {
-            Packs::DvdVideo => is_scrambled_pack(sector).then_some(0x14),
-            Packs::ProgramStream => ps_scrambled_at(sector),
-        }
-    }
+    crack_key_scan(reader, extents, batch_sectors, halt)
 }
 
 // A DVD title's key when the caller supplied none: [`crack_title_key`] over its extents. A
@@ -181,7 +159,7 @@ pub(crate) fn resolve_dvd_title_key(
     if matches!(keys, crate::decrypt::DecryptKeys::None)
         && format == crate::disc::ContentFormat::MpegPs
     {
-        *keys = crack_title_key(reader, extents, batch_sectors, halt, Packs::DvdVideo)?;
+        *keys = crack_title_key(reader, extents, batch_sectors, halt)?;
     }
     Ok(())
 }
@@ -193,9 +171,8 @@ pub(crate) fn crack_title_key(
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
-    packs: Packs,
 ) -> std::io::Result<crate::decrypt::DecryptKeys> {
-    match crack_key_scan_with(reader, extents, batch_sectors, halt, packs) {
+    match crack_key_scan(reader, extents, batch_sectors, halt) {
         CrackOutcome::Cracked(state) => Ok(crate::decrypt::DecryptKeys::Css {
             title_key: state.title_key,
         }),
@@ -208,9 +185,9 @@ pub(crate) fn crack_title_key(
 }
 
 /// Where a 13818-1 pack's first PES header flags byte sits, `Some` only when that PES is
-/// scrambled: the [`Packs::ProgramStream`] test (m1, B-1). Leading packets with no PES header (a
+/// scrambled: the ONE CSS pack test, disc and file alike. Leading packets with no PES header (a
 /// system header, a map, padding) are walked by their length; only the first PES is judged.
-pub(crate) fn ps_scrambled_at(sector: &[u8]) -> Option<usize> {
+pub(crate) fn scrambled_at(sector: &[u8]) -> Option<usize> {
     if sector.len() < 2048 || sector[..4] != PACK_START || sector[4] >> 6 != 0b01 {
         return None;
     }
@@ -257,13 +234,12 @@ thread_local! {
     pub(crate) static CRACK_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// The crack scan, judging each sector as `packs` says.
-fn crack_key_scan_with(
+// The crack scan over `extents`, judging each sector with [`scrambled_at`].
+fn crack_key_scan(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
-    packs: Packs,
 ) -> CrackOutcome {
     #[cfg(test)]
     CRACK_SCANS.with(|n| n.set(n.get() + 1));
@@ -347,9 +323,9 @@ fn crack_key_scan_with(
                         // HARDENED pack-gated check: a clear stub sector with
                         // stray bits at 0x14 must NOT count as scramble evidence,
                         // or an unencrypted title falsely reports E7023.
-                        if let Some(at) = packs.scrambled_at(sect) {
+                        if let Some(at) = scrambled_at(sect) {
                             saw_scrambled = true;
-                            // A stuffed pack's flags may sit past 0x14 (m1); DvdVideo's never do.
+                            // A stuffed pack's flags sit past 0x14 (m1); a DVD-Video pack's never do.
                             let key = if at == 0x14 {
                                 keyless::crack_title_key(sect)
                             } else {
@@ -405,15 +381,14 @@ fn crack_key_scan_with(
 
 /// Descramble a single CSS-encrypted sector in place.
 ///
-/// A no-op unless the sector is a scrambled MPEG-2 PS PACK: the pack start code is checked, not
-/// just the byte 0x14 flag bits, since 0x14 alone is unreliable outside a pack (see
-/// [`is_scrambled_pack`]). Making the guard part of the function, rather than something each
-/// caller must remember, is what keeps the safe path the easy one.
+/// A no-op unless the sector is a scrambled MPEG-2 PS PACK ([`is_scrambled_pack`]): byte 0x14
+/// alone is unreliable outside a pack. Making the guard part of the function, rather than
+/// something each caller must remember, is what keeps the safe path the easy one.
 pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
-    if !is_scrambled_pack(sector) {
+    let Some(at) = scrambled_at(sector) else {
         return;
-    }
-    lfsr::descramble_sector(&state.title_key, sector);
+    };
+    with_flags_at_0x14(sector, at, |s| lfsr::descramble_sector(&state.title_key, s));
 }
 
 // How many mismatches a failed re-crack's "false positive" verdict covers before the next retry —
@@ -429,27 +404,14 @@ const RECRACK_RETRY_EVERY: u32 = 16;
 /// Never returns `Err` and always returns `Ok(0)` (CSS drops no sectors); `Result` only
 /// matches the decrypt seam this is dispatched from (see [`crate::decrypt::decrypt_sectors`]).
 pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::error::Result<usize> {
-    // `is_scrambled_pack`, NOT the looser `is_scrambled`: this sees arbitrary
-    // regions (IFO/UDF/ISO 9660) where raw byte 0x14 isn't a reliable flag.
-    // Measured: an IFO misread this way was destroyed, dropping titles 38→10.
-    descramble_packs(buf, title_key, Packs::DvdVideo)
-}
-
-/// [`descramble_region`] judging each pack, and clearing its flags, as `packs` says (m2).
-pub(crate) fn descramble_packs(
-    buf: &mut [u8],
-    title_key: &mut [u8; 5],
-    packs: Packs,
-) -> crate::error::Result<usize> {
     // Consecutive crib mismatches since the last re-crack attempt (0 = none
     // pending). Reset by a validated cache hit; a fresh run always attempts
     // on its first mismatch, then at most once every RECRACK_RETRY_EVERY.
     let mut mismatches_since_attempt: u32 = 0;
+    // The pack test, NOT raw byte 0x14: this sees arbitrary regions (IFO/UDF/ISO 9660).
+    // Measured: an IFO misread by 0x14 alone was destroyed, dropping titles 38→10.
     for chunk in buf.chunks_mut(2048) {
-        let Some(at) = (chunk.len() >= 2048)
-            .then(|| packs.scrambled_at(chunk))
-            .flatten()
-        else {
+        let Some(at) = (chunk.len() >= 2048).then(|| scrambled_at(chunk)).flatten() else {
             continue;
         };
         with_flags_at_0x14(chunk, at, |chunk| {
@@ -523,25 +485,25 @@ pub fn has_scramble_flag_bits(sector: &[u8]) -> bool {
 /// untouched, so this signature survives scrambling.
 pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
 
-/// Check if a sector is a CSS-scrambled DVD **video pack** — the HARDENED gate the
-/// crack scan's `saw_scrambled` flag and [`descramble_sector`]/[`descramble_region`] share.
-///
-/// Requires BOTH the MPEG-PS pack-start code AND the 0x14 scramble bits
-/// ([`has_scramble_flag_bits`] alone is not enough), and excludes structural/nav `stream_id`s
-/// at 0x11 (`0xBB`/`0xBE`/`0xBF`) that CSS never scrambles so a decrypted HD-DVD's RDI nav
-/// packs can't falsely trip it. An 11172-1 pack cannot be CSS; pack stuffing is not checked
-/// here (libdvdcss reads 0x14 regardless), only by the `mpg://` file scan.
+/// Check if a sector is a CSS-scrambled pack: a 13818-1 pack whose first PES header (past any
+/// pack stuffing and packets with no PES header: system header, map, padding, nav) is MPEG-2
+/// and carries scramble bits. The one test the crack scan and every descramble share, disc and
+/// file alike. An IFO/UDF sector, an 11172-1 pack and an MPEG-1 PES are never scrambled.
 pub fn is_scrambled_pack(sector: &[u8]) -> bool {
-    use crate::consts::pes_stream_id::{PADDING_STREAM, PRIVATE_STREAM_2, SYSTEM_HEADER};
-    // B2: a 13818-1 pack ('01'); an 11172-1 pack's 0x11/0x14 are a packet length and PTS.
-    sector.len() >= 2048
-        && sector[0x00..0x04] == PACK_START
-        && sector[0x04] >> 6 == 0b01
-        && !matches!(
-            sector[0x11],
-            SYSTEM_HEADER | PADDING_STREAM | PRIVATE_STREAM_2
-        )
-        && (sector[0x14] >> 4) & 0x03 != 0
+    scrambled_at(sector).is_some()
+}
+
+/// Test fixture: the DVD-Video pack layout every real VOB sector has (13818-1 pack header, no
+/// stuffing, a `stream_id` PES at 0x0E with MPEG-2 flags at 0x14), keeping its scramble bits.
+#[cfg(test)]
+pub(crate) fn dvd_pack_header(sector: &mut [u8], stream_id: u8) {
+    sector[..4].copy_from_slice(&PACK_START);
+    sector[4] = 0x44;
+    sector[0x0D] = 0xF8;
+    sector[0x0E..0x11].copy_from_slice(&[0, 0, 1]);
+    sector[0x11] = stream_id;
+    sector[0x12..0x14].copy_from_slice(&0x07ECu16.to_be_bytes());
+    sector[0x14] = 0x80 | (sector[0x14] & 0x30);
 }
 
 #[cfg(test)]
@@ -613,10 +575,8 @@ mod tests {
     /// so `descramble_region` actually enters the mismatch branch.
     fn false_positive_scrambled_pack() -> [u8; 2048] {
         let mut sector = [0u8; 2048];
-        sector[0x00..0x04].copy_from_slice(&PACK_START);
-        sector[4] = 0x44; // '01': a 13818-1 pack
-        sector[0x11] = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
         sector[0x14] = 0x30;
+        dvd_pack_header(&mut sector, crate::consts::pes_stream_id::PRIVATE_STREAM_1);
         for (i, b) in sector.iter_mut().enumerate().take(0x80).skip(0x20) {
             *b = (i % 4) as u8;
         }
@@ -740,7 +700,7 @@ mod tests {
         let pack = false_positive_scrambled_pack();
         for len in [0, 1, 0x14, 0x15, 1024, 2047] {
             assert!(!is_scrambled_pack(&pack[..len]), "len {len}");
-            assert!(ps_scrambled_at(&pack[..len]).is_none(), "len {len}");
+            assert!(scrambled_at(&pack[..len]).is_none(), "len {len}");
         }
     }
 
@@ -761,7 +721,6 @@ mod tests {
         let mut short = pack[..1500].to_vec();
         let before = short.clone();
         descramble_region(&mut short, &mut key).expect("never fails");
-        let _ = descramble_packs(&mut short, &mut key, Packs::ProgramStream);
         assert_eq!(short, before);
     }
 
@@ -832,7 +791,7 @@ mod tests {
             s[at + 4..at + 6].copy_from_slice(&0x07EBu16.to_be_bytes());
             s[at + 6] = 0x81;
             assert!(
-                ps_scrambled_at(&s).is_none(),
+                scrambled_at(&s).is_none(),
                 "pack_stuffing_length {stuffing}"
             );
         }
@@ -859,36 +818,41 @@ mod tests {
         // A PSM whose byte at 0x14 (current_next_indicator, version) reads as "scrambled".
         let psm = [0, 0, 1, 0xBC, 0, 10, 0xE0, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
         let (_, clear) = pack_after(&psm, 0x81);
-        assert_eq!(ps_scrambled_at(&clear), None, "clear");
+        assert_eq!(scrambled_at(&clear), None, "clear");
         let (at, scrambled) = pack_after(&psm, 0x91);
-        assert_eq!(ps_scrambled_at(&scrambled), Some(at), "scrambled");
+        assert_eq!(scrambled_at(&scrambled), Some(at), "scrambled");
         // Every stream_id with no PES header (MS-31), and the system header, is walked past.
         for id in [0xBB, 0xBC, 0xBE, 0xBF, 0xF0, 0xF1, 0xF2, 0xF8, 0xFF] {
             let lead = [0, 0, 1, id, 0, 4, 0xB0, 0xB0, 0xB0, 0xB0];
-            assert_eq!(ps_scrambled_at(&pack_after(&lead, 0x81).1), None, "{id:#x}");
+            assert_eq!(scrambled_at(&pack_after(&lead, 0x81).1), None, "{id:#x}");
         }
     }
 
-    // D3: on the disc/ISO path a scrambled 13818-1 pack is detected and descrambled whatever
-    // its pack_stuffing_length (libdvdcss reads 0x14 regardless); only mpg:// files are strict.
+    // One pack test on every path: a stuffed 13818-1 pack (DVD-Video never stuffs) is judged
+    // by the PES its stuffing points at, and descrambled with that PES's own flags.
     #[test]
-    fn a_stuffed_scrambled_pack_is_still_descrambled_on_the_disc_path() {
-        let mut pack = vec![0u8; 2048];
-        for (i, b) in pack.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(29).wrapping_add(3);
-        }
-        pack[0x00..0x04].copy_from_slice(&PACK_START);
-        pack[4] = 0x44; // '01': a 13818-1 pack
+    fn a_stuffed_scrambled_pack_is_descrambled_by_its_own_flags() {
+        let mut pack: Vec<u8> = (0..2048u32)
+            .map(|i| (i as u8).wrapping_mul(29).wrapping_add(3))
+            .collect();
+        dvd_pack_header(&mut pack, 0xE0);
         pack[0x0D] = 0xF8 | 1; // pack_stuffing_length 1
-        pack[0x14] = 0x30;
-        assert!(is_scrambled_pack(&pack), "stuffed but scrambled");
+        pack[0x0E] = 0xFF;
+        pack[0x0F..0x13].copy_from_slice(&[0, 0, 1, 0xE0]);
+        pack[0x13..0x15].copy_from_slice(&0x07EBu16.to_be_bytes());
+        pack[0x15] = 0xB0;
+        assert_eq!(scrambled_at(&pack), Some(0x15));
         let before = pack.clone();
-        let mut key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
-        descramble_region(&mut pack, &mut key).expect("region descramble");
+        descramble_region(&mut pack, &mut [0x42, 0x13, 0x37, 0xBE, 0xEF]).unwrap();
         assert_ne!(
             pack[0x80..],
             before[0x80..],
             "descrambled, not passed through"
+        );
+        assert_eq!(
+            (pack[0x14], pack[0x15]),
+            (before[0x14], 0x80),
+            "its own flags cleared"
         );
     }
 
@@ -915,43 +879,29 @@ mod tests {
             "a wrong pack-start byte must not qualify"
         );
         // The real signature flips it to a scrambled pack.
-        s[0x00..0x04].copy_from_slice(&PACK_START);
-        s[4] = 0x44; // '01': a 13818-1 pack
+        dvd_pack_header(&mut s, 0xE0);
         assert!(
             is_scrambled_pack(&s),
             "valid pack-start + 0x14 bits → scrambled pack"
         );
     }
 
-    // Detection fix: `is_scrambled_pack` must EXCLUDE structural/nav stream_ids
-    // (0xBB/0xBE/0xBF) at 0x11, the exact decrypted-HD-DVD defect (an `.evo` RDI pack is 0xBF).
+    // Detection fix: a pack led by a system header, padding or nav packet (an `.evo` RDI pack
+    // is 0xBF) is not scramble evidence, whatever its 0x14 holds; an ES pack still is.
     #[test]
     fn is_scrambled_pack_excludes_nav_and_structural_stream_ids() {
         use crate::consts::pes_stream_id::{
             PADDING_STREAM, PRIVATE_STREAM_1, PRIVATE_STREAM_2, SYSTEM_HEADER, VIDEO, VIDEO_MAX,
         };
-        // A pack-start pack with 0x14 scramble bits set, varying only 0x11.
         let mut s = vec![0u8; 2048];
-        s[0x00..0x04].copy_from_slice(&PACK_START);
-        s[4] = 0x44; // '01': a 13818-1 pack
         s[0x14] = 0x30;
         for excluded in [SYSTEM_HEADER, PADDING_STREAM, PRIVATE_STREAM_2] {
-            s[0x11] = excluded;
-            assert!(
-                !is_scrambled_pack(&s),
-                "stream_id {excluded:#04x} is a structural/nav pack CSS never scrambles — \
-                 it must NOT count as scramble evidence (else a decrypted HD-DVD RDI pack → E7023)"
-            );
+            dvd_pack_header(&mut s, excluded);
+            assert!(!is_scrambled_pack(&s), "stream_id {excluded:#04x}");
         }
-        // A genuinely scramblable elementary-stream pack must STILL register —
-        // proving the exclusion did not weaken real-DVD CSS detection.
         for scramblable in [VIDEO, VIDEO_MAX, PRIVATE_STREAM_1, 0xE2] {
-            s[0x11] = scramblable;
-            assert!(
-                is_scrambled_pack(&s),
-                "stream_id {scramblable:#04x} is a scramblable ES pack — a real CSS DVD's \
-                 scrambled sector must still be counted, never passed through as plaintext"
-            );
+            dvd_pack_header(&mut s, scramblable);
+            assert!(is_scrambled_pack(&s), "stream_id {scramblable:#04x}");
         }
     }
 
@@ -991,7 +941,7 @@ mod tests {
                 locked: Vec::new(),
                 crackable: None,
                 short_read: None,
-                stream_id: 0x00,
+                stream_id: 0xE0,
             }
         }
     }
@@ -1003,9 +953,8 @@ mod tests {
         const RUN_START: usize = 0x59;
         const SEED_OFFSET: usize = 0x54;
         let mut plaintext = vec![0u8; 2048];
-        plaintext[0x00..0x04].copy_from_slice(&PACK_START); // valid DVD pack header
-        plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
+        dvd_pack_header(&mut plaintext, 0xE0);
         let pat: Vec<u8> = (0..period)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
             .collect();
@@ -1063,13 +1012,10 @@ mod tests {
                         buf[base..base + 2048].copy_from_slice(sector);
                     }
                     _ => {
-                        // `is_scrambled_pack` requires the MPEG-PS pack-start code
-                        // before trusting 0x14; `stream_id` defaults to 0x00
-                        // (scramblable) vs. an RDI nav pack's excluded 0xBF.
-                        buf[base..base + 4].copy_from_slice(&PACK_START);
-                        buf[base + 4] = 0x44; // '01': a 13818-1 pack
-                        buf[base + 0x11] = self.stream_id;
+                        // A DVD-Video pack; `stream_id` defaults to video (scramblable)
+                        // vs. an RDI nav pack's 0xBF, which CSS never scrambles.
                         buf[base + 0x14] = self.flag_byte;
+                        dvd_pack_header(&mut buf[base..base + 2048], self.stream_id);
                     }
                 }
             }
@@ -1264,10 +1210,8 @@ mod tests {
         for (i, b) in pack.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(29).wrapping_add(3);
         }
-        pack[0x00..0x04].copy_from_slice(&PACK_START);
-        pack[4] = 0x44; // '01': a 13818-1 pack
-        pack[0x0D] = 0xF8; // pack_stuffing_length 0
         pack[0x14] = 0x30;
+        dvd_pack_header(&mut pack, 0xE0);
         assert!(is_scrambled_pack(&pack));
 
         let scrambled = pack.clone();

@@ -1910,6 +1910,7 @@ mod tests {
         sec[4] = 0x44; // '01': a 13818-1 pack
         sec[0x0D] = 0xF8; // pack_stuffing_length 0
         sec[0x14] = 0x10; // scramble flag
+        crate::css::dvd_pack_header(&mut sec, 0xE0);
         for (i, b) in sec.iter_mut().enumerate().skip(0x80) {
             *b = (i as u8) ^ 0x3C;
         }

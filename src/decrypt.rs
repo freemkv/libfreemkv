@@ -422,8 +422,7 @@ pub(crate) fn decrypt_sectors_mapped_in_content(
         // CSS re-cracks into its title key, so it needs its own mutable copy.
         _ => {
             let mut keys = keys.clone();
-            let packs = css::Packs::DvdVideo;
-            decrypt_span(buf, &mut keys, base_lba, Some(map), content, packs).map(|_| 0)
+            decrypt_span(buf, &mut keys, base_lba, Some(map), content).map(|_| 0)
         }
     }
 }
@@ -722,16 +721,7 @@ pub fn decrypt_sectors(
     unit_key_idx: usize,
 ) -> Result<usize, crate::error::Error> {
     let _ = unit_key_idx;
-    decrypt_span(buf, keys, 0, None, None, css::Packs::DvdVideo)
-}
-
-/// [`decrypt_sectors`] judging CSS packs as `packs` says (the content-detected stage).
-pub(crate) fn decrypt_sectors_packs(
-    buf: &mut [u8],
-    keys: &mut DecryptKeys,
-    packs: css::Packs,
-) -> Result<usize, crate::error::Error> {
-    decrypt_span(buf, keys, 0, None, None, packs)
+    decrypt_span(buf, keys, 0, None, None)
 }
 
 /// Legacy alias of [`decrypt_sectors`]. Under the keymap-only model AACS decrypts
@@ -750,8 +740,7 @@ pub fn decrypt_sectors_in_content(
     content_ranges: &[(u32, u32)],
 ) -> Result<usize, crate::error::Error> {
     let _ = unit_key_idx;
-    let packs = css::Packs::DvdVideo;
-    decrypt_span(buf, keys, base_lba, None, Some(content_ranges), packs)
+    decrypt_span(buf, keys, base_lba, None, Some(content_ranges))
 }
 
 // THE decrypt orchestrator: every path into this crate's decryption goes through here. Resolve
@@ -762,7 +751,6 @@ fn decrypt_span(
     base_lba: u32,
     map: Option<&AacsKeyMap>,
     content: Option<&[(u32, u32)]>,
-    packs: css::Packs,
 ) -> Result<usize, crate::error::Error> {
     let dropped: usize = match keys {
         DecryptKeys::None => 0,
@@ -782,7 +770,7 @@ fn decrypt_span(
             // CSS SELF-recovers: the title key changes per VOB region and is re-cracked
             // constantly, but always FROM THE DATA ITSELF (see `css::descramble_region`),
             // so it needs none of the external-input recovery seam AACS key-fetch uses.
-            css::descramble_packs(buf, title_key, packs)?
+            css::descramble_region(buf, title_key)?
         }
     };
     Ok(dropped)
@@ -899,6 +887,7 @@ mod tests {
         plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
         plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // CSS scramble flag (DVD-Video sector header)
+        crate::css::dvd_pack_header(&mut plaintext, 0xE0);
         let pat: Vec<u8> = (0..PERIOD)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
             .collect();
@@ -966,6 +955,7 @@ mod tests {
         plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
         plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
+        crate::css::dvd_pack_header(&mut plaintext, 0xE0);
         let pat: Vec<u8> = (0..PERIOD)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
             .collect();
@@ -1110,6 +1100,7 @@ mod tests {
         sector[4] = 0x44; // '01': a 13818-1 pack
         sector[0x0D] = 0xF8; // pack_stuffing_length 0
         sector[0x14] = 0x30; // scramble flag (bits 4-5)
+        crate::css::dvd_pack_header(&mut sector, 0xE0);
         sector[0x54..0x59].copy_from_slice(seed);
         let plaintext = sector.clone();
         css::lfsr::scramble_sector(title_key, &mut sector);
@@ -1178,6 +1169,7 @@ mod tests {
         plaintext[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
+        crate::css::dvd_pack_header(&mut plaintext, 0xE0);
         // Periodic run from 0x59 (just above the seed) through 0x80 and on into
         // the encrypted region; phase anchored to offset 0 so it is continuous
         // across the 0x80 boundary.
@@ -1669,30 +1661,16 @@ mod tests {
             format: ContentFormat::BdTs,
         };
         let mut buf = vec![0u8; ul];
-        let aacs_no_map = decrypt_span(
-            &mut buf,
-            &mut aacs_keys,
-            0,
-            None,
-            None,
-            css::Packs::DvdVideo,
-        )
-        .expect_err("an AACS reader with no key map cannot prove any key");
+        let aacs_no_map = decrypt_span(&mut buf, &mut aacs_keys, 0, None, None)
+            .expect_err("an AACS reader with no key map cannot prove any key");
 
         // AACS, encrypted, mapped but the unit falls outside every range.
         let mut orphan = clear_ts_unit();
         aacs_encrypt_unit_for_test(&mut orphan, &[0xCCu8; 16]);
         let mut buf = orphan.to_vec();
         let empty = AacsKeyMap::from_ranges(vec![]);
-        let aacs_unmapped = decrypt_span(
-            &mut buf,
-            &mut aacs_keys,
-            0,
-            Some(&empty),
-            None,
-            css::Packs::DvdVideo,
-        )
-        .expect_err("an encrypted unit no range covers cannot be keyed");
+        let aacs_unmapped = decrypt_span(&mut buf, &mut aacs_keys, 0, Some(&empty), None)
+            .expect_err("an encrypted unit no range covers cannot be keyed");
 
         let want = crate::error::Error::DecryptFailed.code();
         for (what, e) in [
@@ -1712,15 +1690,7 @@ mod tests {
         let mut none_keys = DecryptKeys::None;
         let mut buf = vec![0u8; 2048];
         assert!(
-            decrypt_span(
-                &mut buf,
-                &mut none_keys,
-                0,
-                None,
-                None,
-                css::Packs::DvdVideo
-            )
-            .is_ok(),
+            decrypt_span(&mut buf, &mut none_keys, 0, None, None).is_ok(),
             "clear media has no key to prove and must pass through"
         );
     }

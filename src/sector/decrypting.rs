@@ -53,8 +53,6 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     blanked: BlankTally,
     /// Content-detected stage: `Some` until the first read reaches the verdict.
     detect: Option<Box<StageOptions>>,
-    /// Where CSS pack flags are judged: DVD-Video (disc-keyed) or from each pack's stuffing.
-    packs: crate::css::Packs,
     /// Loose BD-TS: a CPI-flagged unit that is clean TS is clear (its flag is stale).
     stale_cpi: bool,
     /// A PS the crack left keyless: a scrambled pack read later is refused (E7023).
@@ -112,7 +110,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             arrival: None,
             blanked: BlankTally(Arc::default()),
             detect: None,
-            packs: crate::css::Packs::DvdVideo,
             stale_cpi: false,
             watch_css: false,
             refused: false,
@@ -123,6 +120,8 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// classifies the head and resolves once (D3). A PS is cracked, a BD-TS read through
     /// [`ResolvedKeySet::loose_file`](crate::keys::ResolvedKeySet::loose_file), else clear.
     pub(crate) fn detecting(inner: S, opts: StageOptions) -> Self {
+        #[cfg(test)]
+        super::stage::STAGES.with(|n| n.set(n.get() + 1));
         let mut s = Self::new(inner, DecryptKeys::None);
         s.detect = Some(Box::new(opts));
         s
@@ -130,36 +129,23 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
 
     // Reach the verdict and install what it needs. On `Err` the stage stays undecided.
     fn resolve_detect(&mut self) -> Result<()> {
-        use super::stage::{HEAD_SECTORS, Kind, classify_sectors};
+        use super::stage::{Kind, classify_sectors};
         let Some(opts) = self.detect.as_deref() else {
             return Ok(());
         };
         let cap = self.inner.capacity_sectors();
-        let n = cap.min(HEAD_SECTORS);
-        let mut head = vec![0u8; n as usize * crate::consts::SECTOR_BYTES];
-        let got = match n {
-            0 => 0,
-            n => self.inner.read_sectors(0, n as u16, &mut head, false)?,
-        };
-        head.truncate(got);
+        let head = detect_head(&mut self.inner, cap)?;
         match classify_sectors(&head) {
             Kind::Ps { mpeg2 } if !opts.raw => {
-                self.packs = crate::css::Packs::ProgramStream;
                 // B2: an 11172-1 stream cannot be CSS; it is never cracked.
                 if mpeg2 {
                     let whole = [crate::disc::Extent {
                         start_lba: 0,
                         sector_count: cap,
                     }];
-                    let packs = crate::css::Packs::ProgramStream;
                     let halt = opts.halt.as_ref();
-                    let cracked = crate::css::crack_title_key(
-                        &mut self.inner,
-                        &whole,
-                        CRACK_BATCH,
-                        halt,
-                        packs,
-                    );
+                    let cracked =
+                        crate::css::crack_title_key(&mut self.inner, &whole, CRACK_BATCH, halt);
                     self.keys = match cracked {
                         Ok(keys) => keys,
                         // A verdict, not a fault: kept, so a retry does not scan again (D3).
@@ -181,7 +167,8 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                 self.unit_base = Some(0);
                 self.stale_cpi = true;
             }
-            _ => {}
+            // Nothing seen that a key opens, yet a scrambled pack later is still refused.
+            _ => self.watch_css = !opts.raw,
         }
         self.detect = None;
         Ok(())
@@ -278,15 +265,11 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         keys: &mut DecryptKeys,
         lba: u32,
         content: Option<&[(u32, u32)]>,
-        packs: crate::css::Packs,
     ) -> Result<usize> {
         // The `unit_key_idx` arg on `decrypt_sectors[_in_content]` is a legacy
         // inert param (AACS is map-only; CSS/None ignore it) — pass 0.
         match content {
             Some(ranges) => decrypt_sectors_in_content(buf, keys, 0, lba, ranges),
-            None if packs != crate::css::Packs::DvdVideo => {
-                crate::decrypt::decrypt_sectors_packs(buf, keys, packs)
-            }
             None => decrypt_sectors(buf, keys, 0),
         }
     }
@@ -384,7 +367,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // No map installed: `decrypt_buf` does CSS self-descramble / clear pass-through
         // (units outside the content extents pass through untouched). A can't-decrypt
         // (misalignment, or mapless AACS here — a bug) fails loud; broken TS is the muxer's concern.
-        Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref, self.packs)?;
+        Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref)?;
         Ok(n)
     }
 
@@ -397,19 +380,44 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
     }
 }
 
-// Clear TS: the seed's packet synced and 3/4 of the other non-padding packets (24 of a whole
-// unit's 31), not the 4-packet key-proof floor of `is_clean` (ciphertext passes ~7e-6). Damage
-// to a few packets must not make a clear unit look encrypted; ciphertext passes this ~1e-51.
-fn clear_ts(chunk: &[u8]) -> bool {
-    let pkts = chunk
-        .as_chunks::<{ crate::consts::BD_SOURCE_PACKET_BYTES }>()
-        .0;
-    let Some((seed, rest)) = pkts.split_first() else {
-        return false;
+// The verdict's head: `HEAD_SECTORS` from the first written sector on the AACS unit grid, so
+// a zero-filled bad-read start hides nothing. Blank sectors are skipped up to the crack budget.
+fn detect_head(inner: &mut impl SectorSource, cap: u32) -> Result<Vec<u8>> {
+    use super::stage::HEAD_SECTORS;
+    const BLANK_BUDGET: u32 = 50_000;
+    const UNIT: u32 = crate::aacs::content::ALIGNED_UNIT_SECTORS;
+    let mut at = 0;
+    loop {
+        let head = read_head_at(inner, at, cap)?;
+        let blank = head
+            .chunks(crate::consts::SECTOR_BYTES)
+            .take_while(|s| s.iter().all(|&b| b == 0))
+            .count() as u32;
+        let full = HEAD_SECTORS as usize * crate::consts::SECTOR_BYTES;
+        if (blank as usize) * crate::consts::SECTOR_BYTES < head.len() {
+            let start = (at + blank) / UNIT * UNIT;
+            return match start == at {
+                true => Ok(head),
+                false => read_head_at(inner, start, cap),
+            };
+        }
+        if head.len() < full || at + HEAD_SECTORS >= BLANK_BUDGET {
+            return Ok(head);
+        }
+        at += HEAD_SECTORS;
+    }
+}
+
+// Up to `HEAD_SECTORS` sectors at `lba`, fewer at the end of the source.
+fn read_head_at(inner: &mut impl SectorSource, lba: u32, cap: u32) -> Result<Vec<u8>> {
+    let n = cap.saturating_sub(lba).min(super::stage::HEAD_SECTORS);
+    let mut head = vec![0u8; n as usize * crate::consts::SECTOR_BYTES];
+    let got = match n {
+        0 => 0,
+        n => inner.read_sectors(lba, n as u16, &mut head, false)?,
     };
-    let content = rest.iter().filter(|p| p[4..].iter().any(|&b| b != 0));
-    let (n, synced) = content.fold((0, 0), |(n, s), p| (n + 1, s + usize::from(p[4] == 0x47)));
-    seed[4] == 0x47 && synced * 4 >= n * 3
+    head.truncate(got);
+    Ok(head)
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
@@ -421,7 +429,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         if self.stale_cpi {
             let ts = crate::disc::ContentFormat::BdTs;
             for unit in buf.chunks_mut(ALIGNED_UNIT_LEN) {
-                if aacs_unit_seed_encrypted(unit, ts) && clear_ts(unit) {
+                if aacs_unit_seed_encrypted(unit, ts) && super::stage::clear_ts(unit) {
                     for p in unit.chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES) {
                         p[0] &= 0x3F;
                     }
@@ -431,7 +439,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         if self.watch_css
             && buf
                 .chunks(crate::consts::SECTOR_BYTES)
-                .any(|c| self.packs.scrambled_at(c).is_some())
+                .any(|c| crate::css::scrambled_at(c).is_some())
         {
             return Err(crate::error::Error::CssKeyMissing);
         }
@@ -503,11 +511,38 @@ mod tests {
         }
     }
 
-    // Stale CPI is cleared only on clear TS: ciphertext that keeps a few syncs (the `is_clean`
-    // proof floor) stays flagged, while one damaged packet does not hide a clear unit.
+    // N8: an uncrackable scrambled stream's E7023 is a verdict: a retry refuses again without
+    // a second crack scan (D3).
     #[test]
-    fn stale_cpi_needs_nearly_every_packet_synced() {
+    fn a_css_refusal_is_kept_for_the_retry() {
+        let mut pack: Vec<u8> = (0..2048u32)
+            .map(|i| (i as u8).wrapping_mul(7) ^ 0x3C)
+            .collect();
+        pack[0x14] = 0x10;
+        crate::css::dvd_pack_header(&mut pack, 0xE0);
+        crate::css::lfsr::scramble_sector(&[0x11, 0x22, 0x33, 0x44, 0x55], &mut pack);
+        let src = crate::test_util::MemSource::new(pack.repeat(4));
+        let opts = StageOptions {
+            raw: false,
+            keys: None,
+            halt: None,
+        };
+        let mut stage = DecryptingSectorSource::detecting(src, opts);
+        let scans = crate::css::CRACK_SCANS.with(|n| n.get());
+        let mut buf = vec![0u8; 2048];
+        for _ in 0..2 {
+            let e = stage.read_sectors(0, 1, &mut buf, false).unwrap_err();
+            assert_eq!(e.code(), crate::error::E_CSS_KEY_MISSING);
+        }
+        assert_eq!(crate::css::CRACK_SCANS.with(|n| n.get()), scans + 1);
+    }
+
+    // Stale CPI is cleared only on clear TS: ciphertext that keeps a few syncs (the `is_clean`
+    // proof floor) stays flagged, while damaged packets do not hide a clear unit.
+    #[test]
+    fn stale_cpi_needs_half_the_packets_synced() {
         use crate::aacs::content::ALIGNED_UNIT_LEN;
+        use crate::sector::stage::clear_ts;
         let pkt = crate::consts::BD_SOURCE_PACKET_BYTES;
         let mut unit: Vec<u8> = (0..ALIGNED_UNIT_LEN)
             .map(|i| (i * 13 + 5) as u8 | 1)
@@ -517,12 +552,14 @@ mod tests {
             p[4] = 0x47;
         }
         assert!(clear_ts(&unit));
-        unit[3 * pkt + 4] = 0x9D;
-        assert!(clear_ts(&unit), "one damaged packet");
         assert!(clear_ts(&unit[..20 * pkt]), "a clear partial tail");
-        unit[3 * pkt + 4] = 0x47;
-        for p in unit.chunks_mut(pkt).skip(5) {
+        // Review #2: ten damaged packets of 31 leave a clear unit clear.
+        for p in unit.chunks_mut(pkt).skip(1).take(10) {
             p[4] = 0x9D;
+        }
+        assert!(clear_ts(&unit), "ten damaged packets");
+        for (i, p) in unit.chunks_mut(pkt).enumerate().skip(1) {
+            p[4] = if i < 5 { 0x47 } else { 0x9D };
         }
         assert!(crate::aacs::content::is_clean(
             &unit,
@@ -600,11 +637,9 @@ mod tests {
             for (i, b) in buf.iter_mut().enumerate() {
                 *b = (i as u8).wrapping_mul(29).wrapping_add(3);
             }
-            // A real MPEG-2 pack header, or `is_scrambled_pack` skips the sector.
-            buf[..4].copy_from_slice(&[0, 0, 1, 0xBA]);
-            buf[4] = 0x44;
-            buf[0x11] = 0xE0;
+            // A real DVD-Video pack header, or `is_scrambled_pack` skips the sector.
             buf[0x14] = 0x30; // scramble-control bits set → flags == 0x03
+            crate::css::dvd_pack_header(buf, 0xE0);
         }
     }
     impl SectorSource for ShortReportSource {
@@ -906,6 +941,7 @@ mod tests {
         template[4] = 0x44; // '01': a 13818-1 pack
         template[0x0D] = 0xF8; // pack_stuffing_length 0
         template[0x14] = 0x30; // scramble bits (4-5) set → flags == 0x03
+        crate::css::dvd_pack_header(&mut template, 0xE0);
         let pristine = template;
 
         // Start with None → pass-through (no descramble, flags stay set).

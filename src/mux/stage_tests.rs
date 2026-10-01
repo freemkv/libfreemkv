@@ -130,11 +130,17 @@ fn an_aacs_m2ts_is_decrypted_with_the_held_keys() {
     assert_eq!(blanked, 0);
 }
 
+// The refusal comes from `input()` itself: the stream never opens, so no frame exists.
 #[test]
 fn an_aacs_m2ts_with_no_keys_is_refused_before_any_frame() {
-    let enc = flagged(&clear_clip(), Some(&KEY));
-    let e = read("m2ts", &enc, &Default::default()).unwrap_err();
-    assert_eq!(error_code(&e), Some(E_NO_DISC_KEY));
+    let p = path("nokeys");
+    std::fs::write(&p, flagged(&clear_clip(), Some(&KEY))).unwrap();
+    let opened = input(&format!("m2ts://{}", p.display()), &Default::default());
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(
+        opened.err().and_then(|e| error_code(&e)),
+        Some(E_NO_DISC_KEY)
+    );
 }
 
 #[test]
@@ -169,6 +175,50 @@ fn a_clear_m2ts_with_stale_cpi_needs_no_key() {
         .expect("clear content opens without keys");
     assert_eq!(data(&frames), clear);
     assert_eq!(blanked, 0);
+}
+
+// Review: a damaged unit (10 of 31 packets off sync) in a stale-CPI clear clip is not
+// mistaken for ciphertext: the clip opens with or without keys.
+#[test]
+fn a_damaged_unit_in_a_stale_cpi_clip_is_not_a_key_refusal() {
+    let mut clip = flagged(&clear_clip(), None);
+    let unit = &mut clip[3 * ALIGNED_UNIT_LEN..4 * ALIGNED_UNIT_LEN];
+    for p in unit.chunks_mut(PKT).skip(1).take(10) {
+        p[4] = 0x9D;
+    }
+    for opts in [Default::default(), keyed()] {
+        let (frames, blanked) = read("m2ts", &clip, &opts).expect("opens");
+        assert!(
+            frames.len() > 100 && blanked == 0,
+            "{} {blanked}",
+            frames.len()
+        );
+    }
+}
+
+// Review: an encrypted clip behind a zero-filled start (11 blank units, past the 32-sector
+// head) is judged by its first written unit: decrypted with the held keys, refused without.
+#[test]
+fn a_blank_head_does_not_hide_an_aacs_clip() {
+    let clear = data(&read("m2ts", &clear_clip(), &Default::default()).unwrap().0);
+    let enc = [
+        vec![0; 11 * ALIGNED_UNIT_LEN],
+        flagged(&clear_clip(), Some(&KEY)),
+    ]
+    .concat();
+    let (frames, _) = read("m2ts", &enc, &keyed()).expect("decrypts");
+    assert_eq!(data(&frames), clear);
+    let e = read("m2ts", &enc, &Default::default()).unwrap_err();
+    assert_eq!(error_code(&e), Some(E_NO_DISC_KEY));
+}
+
+// Review: a blank run inside the 32-sector head (28 sectors) does not hide the clip either.
+#[test]
+fn a_short_blank_run_does_not_hide_an_aacs_clip() {
+    let mut enc = flagged(&clear_clip().repeat(3), Some(&KEY));
+    enc[..28 * 2048].fill(0);
+    let e = read("m2ts", &enc, &Default::default()).unwrap_err();
+    assert_eq!(error_code(&e), Some(E_NO_DISC_KEY));
 }
 
 // A truncated copy: the encrypted partial unit at the end cannot be opened as a unit, so it
@@ -235,6 +285,33 @@ fn every_file_scheme_passes_the_stage() {
     }
 }
 
+// §8.5: every file arm builds the stage around its source, whatever the bytes turn out to be.
+#[test]
+fn every_file_arm_builds_the_stage() {
+    for scheme in ["mpg", "m2ts", "mkv", "mp4"] {
+        let before = crate::sector::stage::STAGES.with(|n| n.get());
+        let _ = read(
+            scheme,
+            &vec![0x5A; 4 * ALIGNED_UNIT_LEN],
+            &Default::default(),
+        );
+        let built = crate::sector::stage::STAGES.with(|n| n.get()) - before;
+        assert!(built >= 1, "{scheme}");
+    }
+}
+
+// S7: `--raw` mpg:// reads its head through a non-raw stage only where that stage can; an
+// AACS clip under the mpg scheme refuses there (E7022) and the raw head is used instead.
+#[test]
+fn a_raw_mpg_head_scan_falls_back_on_a_key_refusal() {
+    let opts = InputOptions {
+        raw: true,
+        ..Default::default()
+    };
+    let e = read("mpg", &flagged(&clear_clip(), Some(&KEY)), &opts).err();
+    assert_eq!(e.and_then(|e| error_code(&e)), Some(E_NO_STREAMS));
+}
+
 // A loose file's keys are found only by walking up to its disc folder (never a sidecar).
 #[test]
 fn a_loose_clip_finds_its_disc_folder_by_walking_up() {
@@ -258,6 +335,13 @@ fn a_loose_clip_finds_its_disc_folder_by_walking_up() {
         disc_root_of(&root.join("00001.m2ts")),
         None,
         "not under BDMV/STREAM"
+    );
+    // N11: a 3D clip's interleaved file sits one level deeper.
+    std::fs::create_dir_all(stream.join("SSIF")).unwrap();
+    std::fs::write(stream.join("SSIF/00001.ssif"), b"").unwrap();
+    assert_eq!(
+        disc_root_of(&stream.join("SSIF/00001.ssif")),
+        Some(root.clone())
     );
     let _ = std::fs::remove_dir_all(&root);
 }

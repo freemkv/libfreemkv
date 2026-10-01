@@ -354,10 +354,10 @@ fn raw_whole_disc_reader_passes_every_sector_through() {
     let uk_ro = unit_key_ro(crate::aacs::mkb::AacsVersion::V10, &[[0xEE; 16]], &[1]);
     let files = [BdFile::new("BDMV/STREAM/00001.m2ts", 30, Some([0x11; 16]))];
     let mut image = encrypted_bd_image(&files, &uk_ro).image;
-    // A CSS-scrambled MPEG-2 pack (bits 4-5 of byte 0x14 set) in sector 1.
-    image[2048..2052].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
-    image[2048 + 4] = 0x44;
+    // A CSS-scrambled DVD-Video pack (bits 4-5 of byte 0x14 set) in sector 1.
     image[2048 + 0x14] |= 0x30;
+    crate::css::dvd_pack_header(&mut image[2048..4096], 0xE0);
+    assert!(crate::css::is_scrambled_pack(&image[2048..4096]));
     let sectors = (image.len() / 2048) as u32;
     let mut r = raw_whole_disc_reader(MemSource::new(image.clone()));
     let mut buf = vec![0u8; image.len()];

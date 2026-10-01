@@ -28,13 +28,14 @@ fn css_decrypt_of_an_uncrackable_sector_still_descrambles() {
     // is not a rip failure — `attack_crib` is a heuristic, so this mismatch just
     // means the cached key stands (CSS recoverability varies per sector, unlike AACS).
     let mut sector = vec![0xFFu8; 2048];
-    // Scrambled DVD sectors are MPEG-2 PS packs. The descramble policy requires
-    // the pack start code as well as the flag bits, because byte 0x14 means
-    // something else entirely in an IFO, UDF or ISO 9660 sector.
+    // Scrambled DVD sectors are DVD-Video packs: the scramble bits are judged in the first
+    // PES header's MPEG-2 flags byte (0x14), because byte 0x14 means something else
+    // entirely in an IFO, UDF or ISO 9660 sector.
     sector[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
     sector[4] = 0x44; // '01': a 13818-1 pack
     sector[0x0D] = 0xF8; // pack_stuffing_length 0
-    sector[0x14] |= 0x30; // CSS scramble flag, bits 4-5
+    sector[0x0E..0x12].copy_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+    sector[0x14] = 0xB0; // MPEG-2 flags, CSS scramble bits 4-5
 
     let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];
     let mut keys = DecryptKeys::Css { title_key };

@@ -1766,6 +1766,21 @@ fn stuffed_scrambled_packs_are_never_muxed_as_ciphertext() {
     }
 }
 
+// Review: a VOB whose first 33 sectors are zero-filled (a bad-read start) is cracked from its
+// first written pack; behind a head of non-pack bytes its scrambled packs are refused (E7023).
+// Never muxed as ciphertext.
+#[test]
+fn a_blank_or_garbled_head_does_not_hide_scrambled_packs() {
+    let (mut body, es) = clear_ps(false, 0);
+    scramble_video_packs(&mut body);
+    let blank = [vec![0; 33 * pack::PACK_BYTES], body.clone()].concat();
+    let got = read_video(&blank, "blank-head").map(|v| first_diff(&v, &es));
+    assert_eq!(got, Ok(None), "descrambled");
+    let garbled = [vec![0x30; 33 * pack::PACK_BYTES], body].concat();
+    let got = read_video(&garbled, "garbled-head").map(|v| v.len());
+    assert_eq!(got, Err(Some(crate::error::E_CSS_KEY_MISSING)));
+}
+
 // m1: scrambling first met past the crack's 50 000-sector budget is refused with E7023 when
 // it is read, never muxed as ciphertext.
 #[test]
