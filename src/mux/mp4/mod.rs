@@ -402,8 +402,9 @@ impl<W: Write + Seek> Mp4Sink<W> {
         let movie_ts = MOVIE_TIMESCALE;
         let mut movie_dur = 0u64;
         let mut traks: Vec<Vec<u8>> = Vec::new();
-        for t in &self.tracks {
-            let (trak, secs) = build_trak(t);
+        let delays = start_delays_ns(&self.tracks);
+        for (t, &delay) in self.tracks.iter().zip(&delays) {
+            let (trak, secs) = build_trak_at(t, delay);
             traks.push(trak);
             movie_dur = movie_dur.max((secs * movie_ts as f64) as u64);
         }
@@ -457,6 +458,13 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
             )
         {
             self.tracks[slot].audio_entry = Some(entry);
+        }
+        // Nothing decodes before the first video keyframe: it is not stored.
+        if self.tracks[slot].media == Media::Video
+            && !frame.keyframe
+            && self.tracks[slot].samples.is_empty()
+        {
+            return Ok(());
         }
         let pts_ns = frame.pts;
         let offset = self.mdat_start + 16 + self.mdat_payload;
@@ -560,14 +568,45 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
 // ── per-track box assembly ───────────────────────────────────────────────────
 
 /// Build a track's `trak` box and return `(bytes, duration_seconds)`.
-fn build_trak(t: &Track) -> (Vec<u8>, f64) {
+/// Per-track start delay: how far each track's first sample lies after the earliest
+/// sample of all tracks (the shared t=0).
+fn start_delays_ns(tracks: &[Track]) -> Vec<i64> {
+    let first = |t: &Track| t.samples.iter().map(|s| s.pts_ns).min();
+    let origin = tracks.iter().filter_map(first).min().unwrap_or(0);
+    tracks
+        .iter()
+        .map(|t| first(t).map_or(0, |f| f - origin))
+        .collect()
+}
+
+/// `edts` with an empty edit of `delay_ns` followed by the whole media; empty when no delay.
+fn build_edts(delay_ns: i64, media_secs: f64) -> Vec<u8> {
+    if delay_ns <= 0 {
+        return Vec::new();
+    }
+    let ticks = |ns: f64| (ns * MOVIE_TIMESCALE as f64 / NS as f64) as u64;
+    let mut body = Vec::new();
+    body.extend_from_slice(&2u32.to_be_bytes());
+    for (dur, media_time) in [
+        (ticks(delay_ns as f64), -1i64),
+        ((media_secs * MOVIE_TIMESCALE as f64) as u64, 0),
+    ] {
+        body.extend_from_slice(&dur.to_be_bytes());
+        body.extend_from_slice(&media_time.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes()); // media_rate_integer
+        body.extend_from_slice(&0u16.to_be_bytes()); // media_rate_fraction
+    }
+    bx(b"edts", &fullbox(b"elst", 1, 0, &body))
+}
+
+fn build_trak_at(t: &Track, delay_ns: i64) -> (Vec<u8>, f64) {
     match t.media {
-        Media::Video => build_video_trak_full(t),
-        Media::Audio => build_audio_trak_full(t),
+        Media::Video => build_video_trak_full(t, delay_ns),
+        Media::Audio => build_audio_trak_full(t, delay_ns),
     }
 }
 
-fn build_video_trak_full(t: &Track) -> (Vec<u8>, f64) {
+fn build_video_trak_full(t: &Track, delay_ns: i64) -> (Vec<u8>, f64) {
     let timing = VideoTiming::derive(&t.samples);
     let media_dur = timing.total_duration();
     let secs = media_dur as f64 / timing.timescale as f64;
@@ -584,14 +623,18 @@ fn build_video_trak_full(t: &Track) -> (Vec<u8>, f64) {
         minf,
     );
     // tkhd.duration is in the MOVIE timescale, not `timing.timescale`.
-    let tkhd_dur = (secs * MOVIE_TIMESCALE as f64) as u64;
+    let tkhd_dur = ((secs + delay_ns.max(0) as f64 / NS as f64) * MOVIE_TIMESCALE as f64) as u64;
     let tkhd = build_tkhd(t.track_id, t.width, t.height, tkhd_dur, false);
     let mut body = tkhd;
+    body.extend_from_slice(&build_edts(delay_ns, secs));
     body.extend_from_slice(&mdia);
-    (bx(b"trak", &body), secs)
+    (
+        bx(b"trak", &body),
+        secs + delay_ns.max(0) as f64 / NS as f64,
+    )
 }
 
-fn build_audio_trak_full(t: &Track) -> (Vec<u8>, f64) {
+fn build_audio_trak_full(t: &Track, delay_ns: i64) -> (Vec<u8>, f64) {
     let ts = t.audio_timescale.max(1);
     let durs = audio_sample_durations(&t.samples, ts);
     let media_dur: u64 = durs.iter().map(|&d| d as u64).sum();
@@ -604,11 +647,15 @@ fn build_audio_trak_full(t: &Track) -> (Vec<u8>, f64) {
     let minf = build_minf(audio_smhd(), stbl);
     let mdia = build_mdia(t.language, ts, media_dur, b"soun", "SoundHandler", minf);
     // tkhd.duration is in the MOVIE timescale, not the audio media timescale.
-    let tkhd_dur = (secs * MOVIE_TIMESCALE as f64) as u64;
+    let tkhd_dur = ((secs + delay_ns.max(0) as f64 / NS as f64) * MOVIE_TIMESCALE as f64) as u64;
     let tkhd = build_tkhd(t.track_id, 0, 0, tkhd_dur, true);
     let mut body = tkhd;
+    body.extend_from_slice(&build_edts(delay_ns, secs));
     body.extend_from_slice(&mdia);
-    (bx(b"trak", &body), secs)
+    (
+        bx(b"trak", &body),
+        secs + delay_ns.max(0) as f64 / NS as f64,
+    )
 }
 
 // ── timing ───────────────────────────────────────────────────────────────────
@@ -1876,7 +1923,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let (vtrak, vsecs) = build_trak(&video);
+        let (vtrak, vsecs) = build_trak_at(&video, 0);
         assert_eq!(vsecs, 0.16);
         assert_eq!(
             tkhd_duration(&vtrak),
@@ -1914,7 +1961,7 @@ mod tests {
                 },
             ],
         };
-        let (atrak, asecs) = build_trak(&audio);
+        let (atrak, asecs) = build_trak_at(&audio, 0);
         assert_eq!(
             asecs,
             3072.0 / 48_000.0,
@@ -1925,6 +1972,63 @@ mod tests {
             5_760,
             "audio tkhd.duration must be secs * MOVIE_TIMESCALE"
         );
+    }
+
+    // The earliest sample across tracks is t=0; a track that starts later keeps its offset
+    // through an empty edit, and video before its first keyframe is not stored.
+    #[test]
+    fn a_later_starting_track_keeps_its_offset_through_an_empty_edit() {
+        let mk = |media, id, first_ns: i64| Track {
+            media,
+            track_id: id,
+            stream_idx: 0,
+            codec: Codec::Hevc,
+            codec_private: vec![1],
+            width: 16,
+            height: 16,
+            colr: None,
+            language: [0x55, 0xC4],
+            audio_entry: Some(vec![0x0B, 0x77]),
+            audio_timescale: 48_000,
+            samples: (0..2)
+                .map(|i| Sample {
+                    offset: 0,
+                    size: 1,
+                    pts_ns: first_ns + i * 40_000_000,
+                    keyframe: i == 0,
+                })
+                .collect(),
+        };
+        let tracks = [mk(Media::Video, 1, 40_000_000), mk(Media::Audio, 2, 0)];
+        let delays = start_delays_ns(&tracks);
+        assert_eq!(delays, vec![40_000_000, 0]);
+        let elst = |t: &Track, d| {
+            let (trak, _) = build_trak_at(t, d);
+            let edts = find_child(&trak[8..], b"edts")?;
+            let e = find_child(edts, b"elst")?;
+            Some(e.to_vec())
+        };
+        let e = elst(&tracks[0], delays[0]).expect("video track carries an edit list");
+        // version 1: entry_count, then (segment_duration u64, media_time i64, rate)
+        assert_eq!(u32::from_be_bytes(e[4..8].try_into().unwrap()), 2);
+        assert_eq!(u64::from_be_bytes(e[8..16].try_into().unwrap()), 3_600);
+        assert_eq!(i64::from_be_bytes(e[16..24].try_into().unwrap()), -1);
+        assert_eq!(i64::from_be_bytes(e[36..44].try_into().unwrap()), 0);
+        assert!(
+            elst(&tracks[1], delays[1]).is_none(),
+            "the earliest track needs no edit"
+        );
+    }
+
+    #[test]
+    fn video_before_its_first_keyframe_is_not_stored() {
+        let t = title(vec![hevc_video()], vec![Some(vec![1, 2, 3, 4])]);
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        s.write(&frame(0, 0, false, vec![1; 8])).unwrap();
+        s.write(&frame(0, 40_000_000, true, vec![2; 8])).unwrap();
+        s.write(&frame(0, 80_000_000, false, vec![3; 8])).unwrap();
+        assert_eq!(s.tracks[0].samples.len(), 2);
+        assert_eq!(s.tracks[0].samples[0].pts_ns, 40_000_000);
     }
 
     // audio_sample_durations' per-sample ticks are ns*ts/NS; inter-sample delta is

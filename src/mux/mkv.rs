@@ -1584,7 +1584,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
                 return Ok(());
             }
-            self.start_cluster(pts_ticks)?;
+            // The first keyframe sits `origin_lead_ticks` after the earliest sample: open
+            // its cluster as early as a block offset allows, so the earlier samples
+            // replayed after it land in the same cluster and clusters stay ascending.
+            let open_ts = if self.last_pts_ticks.is_empty() {
+                (pts_ticks - MAX_BLOCK_REL).clamp(0, pts_ticks)
+            } else {
+                pts_ticks
+            };
+            self.start_cluster(open_ts)?;
             self.cues.push(CuePoint {
                 timestamp_ticks: pts_ticks,
                 track: track_idx + 1,

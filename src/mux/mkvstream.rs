@@ -387,39 +387,26 @@ struct PendingMux {
     /// only frame count. Maintained on push; `buffered` is drained exactly once,
     /// at activation, after which neither field is consulted again.
     buffered_bytes: usize,
-    /// How far before the first IDR the timeline origin sits (mkvmerge-style).
+    /// How far before the first IDR the timeline origin (the earliest sample) sits.
     origin_lead_ns: i64,
-    /// Audio/video frames dropped for lying before the reachable origin.
+    /// Frames dropped for lying before the Blu-ray clip IN.
     dropped_pre_origin: u64,
 }
 
-// Furthest an origin may precede the first IDR: its cluster opens at the IDR,
-// and a block's signed 16-bit relative timestamp reaches ~3.27 s back.
-const MAX_ORIGIN_LEAD_NS: i64 = 3_000_000_000;
-
 impl PendingMux {
-    // Origin = earliest buffered audio/video frame at or after `in_ns` (Blu-ray
-    // clip IN), within MAX_ORIGIN_LEAD_NS of the IDR. Audio/video before it are
-    // dropped (counted); subtitles are kept and clamp to the origin.
+    // Origin = earliest buffered frame of any selected track (and the IDR). Only for
+    // Blu-ray, frames before the clip IN (`in_ns`) are outside the play item: they
+    // are dropped (counted) and do not seed the origin.
     fn set_origin(&mut self, idr_pts: i64, in_ns: Option<i64>) {
-        let floor = idr_pts.saturating_sub(MAX_ORIGIN_LEAD_NS);
-        let is_av = |tracks: &[MkvTrack], t: usize| {
-            tracks
-                .get(t)
-                .is_some_and(|t| t.track_type != ebml::TRACK_TYPE_SUBTITLE)
-        };
         let origin = self
             .buffered
             .iter()
-            .filter(|(f, _)| is_av(&self.tracks, f.track))
             .map(|(f, _)| f.pts)
-            .filter(|&pts| pts >= floor && in_ns.is_none_or(|i| pts >= i))
+            .filter(|&pts| in_ns.is_none_or(|i| pts >= i))
             .fold(idr_pts, i64::min);
         self.origin_lead_ns = idr_pts - origin;
-        let tracks = &self.tracks;
         let before = self.buffered.len();
-        self.buffered
-            .retain(|(f, _)| !is_av(tracks, f.track) || f.pts >= origin);
+        self.buffered.retain(|(f, _)| f.pts >= origin);
         self.dropped_pre_origin = (before - self.buffered.len()) as u64;
     }
 }
@@ -6609,7 +6596,7 @@ mod tests {
 
     // mkvmerge-style origin: the earliest audio/video frame, not the first IDR.
     // Audio 40 ms before the IDR keeps its spacing; an earlier subtitle cue is
-    // kept (clamped to the origin), never dropped.
+    // kept and sets the origin: every offset is exact against it.
     #[test]
     fn frames_before_the_first_idr_are_kept_relative_to_the_earliest() {
         let out = SharedOut::new();
@@ -6629,9 +6616,9 @@ mod tests {
             .unwrap();
         s.finish().unwrap();
         let back = drain(&mut MkvStream::open(Cursor::new(out.bytes())).unwrap());
-        assert_eq!(pts_of(&back, 0), vec![40_000_000]);
-        assert_eq!(pts_of(&back, 1), vec![0, 72_000_000]);
-        assert_eq!(pts_of(&back, 2), vec![0], "the early cue is kept, clamped");
+        assert_eq!(pts_of(&back, 0), vec![60_000_000]);
+        assert_eq!(pts_of(&back, 1), vec![20_000_000, 92_000_000]);
+        assert_eq!(pts_of(&back, 2), vec![0], "the earliest sample is t=0");
     }
 
     // DVD/HD-DVD clip marks run on another clock: the origin ignores them, and no
@@ -6686,9 +6673,10 @@ mod tests {
         assert_eq!(pts_of(&back, 0), vec![100_000_000]);
     }
 
-    // Audio further before the IDR than a block can reach from its cluster is dropped.
+    // Audio further before the IDR than one block reaches is still kept at its
+    // true offset, and cluster timestamps stay ascending.
     #[test]
-    fn audio_far_before_the_first_idr_is_dropped_not_squashed() {
+    fn audio_far_before_the_first_idr_is_kept_at_its_true_offset() {
         let out = SharedOut::new();
         let mut s = MkvStream::create(Box::new(out.clone()), &three_track_title(), None).unwrap();
         s.write(&av_frame(1, 0, true, vec![0xA0; 8])).unwrap();
@@ -6697,9 +6685,23 @@ mod tests {
         s.write(&av_frame(0, 5_000_000_000, true, vec![0x11; 16]))
             .unwrap();
         s.finish().unwrap();
-        let back = drain(&mut MkvStream::open(Cursor::new(out.bytes())).unwrap());
-        assert_eq!(pts_of(&back, 1), vec![0]);
-        assert_eq!(pts_of(&back, 0), vec![1_000_000_000]);
+        let bytes = out.bytes();
+        let back = drain(&mut MkvStream::open(Cursor::new(bytes.clone())).unwrap());
+        assert_eq!(pts_of(&back, 1), vec![0, 4_000_000_000]);
+        assert_eq!(pts_of(&back, 0), vec![5_000_000_000]);
+        // Cluster = ID(4) + 8-byte size, then Timestamp: E7, size byte, value.
+        let mut last = 0u64;
+        for i in
+            (0..bytes.len() - 16).filter(|&i| bytes[i..].starts_with(&[0x1F, 0x43, 0xB6, 0x75]))
+        {
+            assert_eq!(bytes[i + 12], 0xE7);
+            let n = (bytes[i + 13] & 0x0F) as usize;
+            let ts = bytes[i + 14..i + 14 + n]
+                .iter()
+                .fold(0u64, |a, &b| (a << 8) | b as u64);
+            assert!(ts >= last, "clusters must ascend");
+            last = ts;
+        }
     }
 
     struct FailingWriter;
