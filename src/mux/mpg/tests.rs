@@ -2448,3 +2448,78 @@ fn a_partial_lpcm_unit_at_eof_is_padded_not_lost() {
     }
     assert!(got >= want, "{got} bytes out of {want} in");
 }
+
+// Without a map the tracks sort video, MPEG audio, private audio by sub-stream, then
+// subpictures, whatever the order the packets arrive in; 0x80-0x87 is AC-3, 0x88-0x8F DTS.
+#[test]
+fn an_unmapped_scan_orders_tracks_and_labels_private_audio() {
+    let private = |sub: u8| {
+        let mut d = vec![sub, 1, 0, 1];
+        d.resize(16, 0);
+        (0xBD, d)
+    };
+    let ps = scan_pack(
+        &[
+            private(0x20),
+            private(0x88),
+            private(0x80),
+            (0xC0, vec![0xFF, 0xFD, 0xC4, 0x00, 0, 0]),
+            (0xE0, scan_video()),
+        ],
+        None,
+    );
+    let s = scan::scan_streams(&ps).unwrap();
+    let got: Vec<String> = s
+        .iter()
+        .map(|x| match x {
+            DiscStream::Video(_) => "video".into(),
+            DiscStream::Audio(a) => format!("{:?}:{:#x}", a.codec, a.pid),
+            DiscStream::Subtitle(t) => format!("{:?}", t.codec),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        ["video", "Mp2:0xc0", "Ac3:0xbd80", "Dts:0xbd88", "DvdSub"]
+    );
+}
+
+// An extension whose map pairs it with a base other than 0xC0|n is left out, and so is one
+// whose base is itself an extension.
+#[test]
+fn a_map_pairing_an_extension_with_the_wrong_base_drops_it() {
+    let entry = |stream_type, stream_id, descriptors| pack::PsmEntry {
+        stream_type,
+        stream_id,
+        descriptors,
+    };
+    let e = [
+        entry(0x02, 0xE0, vec![]),
+        entry(0x04, 0xC0, pack::hierarchy_descriptor(pack::HIERARCHY_BASE, 0, 0).to_vec()),
+        entry(0x04, 0xC1, pack::hierarchy_descriptor(pack::HIERARCHY_BASE, 2, 0).to_vec()),
+        // 0xD1 embeds layer 0 (base 0xC0), but the IR pairs 0xD1 only with 0xC1.
+        entry(
+            0x04,
+            0xD1,
+            pack::hierarchy_descriptor(pack::HIERARCHY_EXTENSION, 3, 0).to_vec(),
+        ),
+    ];
+    let m = pack::psm(&[], &e).unwrap();
+    let ps = scan_pack(
+        &[
+            (0xE0, scan_video()),
+            (0xC0, vec![0xFF, 0xFD, 0xC4, 0x00, 0, 0]),
+            (0xC1, vec![0xFF, 0xFD, 0xC4, 0x00, 0, 0]),
+            (0xD1, vec![0x7F, 0xF1, 0x23, 0x45]),
+        ],
+        Some(&m),
+    );
+    let s = scan::scan_streams(&ps).unwrap();
+    let pids: Vec<u16> = s
+        .iter()
+        .filter_map(|x| match x {
+            DiscStream::Audio(a) => Some(a.pid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pids, vec![0xC0, 0xC1]);
+}
