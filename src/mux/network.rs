@@ -122,7 +122,7 @@ impl Read for HaltRead {
 
 // True if `ip` can never be a `network://` peer (unspecified, multicast, broadcast,
 // 0.0.0.0/8, Class E). Loopback, private, link-local and ULA are valid LAN targets.
-pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_unspecified()
