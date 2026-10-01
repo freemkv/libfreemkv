@@ -396,8 +396,10 @@ impl EsWriter for PgsSupWriter {
         let pts90 = ns_to_90k(pts_ns);
         let is_pcs = f.data.first() == Some(&SEG_PCS) && f.data.len() > 13;
         let mut written = 0;
+        // An authored clear states the real end, even past a duration the parser capped.
+        let is_clear = is_pcs && f.data[13] == 0;
         if let Some((end, width, height)) = self.pending_clear {
-            if end < pts_ns || (end == pts_ns && !is_pcs) {
+            if (end < pts_ns && !is_clear) || (end == pts_ns && !is_pcs) {
                 let clear = Self::synthetic_clear_display_set(width, height);
                 let pts = ns_to_90k(end);
                 written += Self::emit_segments(&clear, pts, pts, w)?.0;
@@ -611,7 +613,7 @@ pub(crate) fn chapters_ogm(chapters: &[Chapter]) -> String {
         let name = if c.name.is_empty() {
             n.to_string()
         } else {
-            c.name.clone()
+            escape_controls(&c.name, &[])
         };
         s.push_str(&format!("CHAPTER{n:02}={h:02}:{m:02}:{sec:02}.{ms:03}\n"));
         s.push_str(&format!("CHAPTER{n:02}NAME={name}\n"));
@@ -620,9 +622,26 @@ pub(crate) fn chapters_ogm(chapters: &[Chapter]) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
+    // XML 1.0 forbids C0 controls other than tab / LF / CR.
+    escape_controls(s, &['\t', '\n', '\r'])
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+// Disc-derived text in a line-oriented or XML file: control chars (and U+FFFE / U+FFFF)
+// outside `allow` are written in their `escape_debug()` form, as `Error::DirNameCollision`
+// does, instead of raw.
+fn escape_controls(s: &str, allow: &[char]) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if (c.is_control() && !allow.contains(&c)) || matches!(c, '\u{FFFE}' | '\u{FFFF}') {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // Replace path-hostile characters (control chars incl. NUL) in a filename component;
@@ -1519,6 +1538,84 @@ mod tests {
                 ]
             );
         }
+    }
+
+    // The parser caps a display at 30 s; an authored clear later than that is the real end.
+    #[test]
+    fn pgs_sup_authored_clear_beyond_a_capped_duration_is_not_preempted() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        for frame in [
+            sup_frame(0, Some(30_000_000_000), true),
+            sup_frame(40_000_000_000, Some(0), false),
+        ] {
+            writer.write_frame(&mut bytes, &frame, frame.pts).unwrap();
+        }
+        writer.finish(&mut bytes).unwrap();
+        assert_eq!(sup_compositions(&bytes), [(0, 1), (3_600_000, 0)]);
+    }
+
+    // A continuation segment stamped exactly at the wipe time follows the clear, not precedes it.
+    #[test]
+    fn pgs_sup_clear_precedes_a_non_pcs_frame_at_the_wipe_time() {
+        let mut writer = PgsSupWriter::default();
+        let mut bytes = Vec::new();
+        let display = sup_frame(0, Some(2_000_000_000), true);
+        writer.write_frame(&mut bytes, &display, 0).unwrap();
+        let mut end = sup_frame(2_000_000_000, None, false);
+        end.data = vec![SEG_END, 0, 0];
+        writer.write_frame(&mut bytes, &end, end.pts).unwrap();
+        writer.finish(&mut bytes).unwrap();
+        let mut types = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let size = usize::from(u16::from_be_bytes([
+                bytes[pos + SUP_HEADER_LEN + 1],
+                bytes[pos + SUP_HEADER_LEN + 2],
+            ]));
+            types.push(bytes[pos + SUP_HEADER_LEN]);
+            pos += SUP_HEADER_LEN + PGS_SEG_HEADER_LEN + size;
+        }
+        // display PCS + END, clear PCS + END, then the continuation END.
+        assert_eq!(types, [SEG_PCS, SEG_END, SEG_PCS, SEG_END, SEG_END]);
+    }
+
+    // sub:// / demux:// finish() must flush the writer so the last subtitle is cleared.
+    #[test]
+    fn sink_finish_writes_the_last_pgs_subtitles_synthetic_clear() {
+        let dir = tempdir();
+        let title = title_with(vec![subtitle_stream(Codec::Pgs, "eng")], vec![None]);
+        let opts = DemuxOptions {
+            base: "Sub".to_string(),
+            export_chapters: false,
+            ..Default::default()
+        };
+        let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
+        sink.write(&sup_frame(0, Some(2_000_000_000), true))
+            .unwrap();
+        sink.finish().unwrap();
+        let sup = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "sup"))
+            .expect("a .sup file");
+        let bytes = std::fs::read(&sup).unwrap();
+        assert_eq!(sup_compositions(&bytes), [(0, 1), (180_000, 0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Hostile chapter names must not forge OGM lines or make the XML ill-formed.
+    #[test]
+    fn chapter_names_with_control_chars_are_neutralised() {
+        let chaps = vec![Chapter {
+            time_secs: 0.0,
+            name: "x\nCHAPTER99=00:00:00.000\u{1}y".to_string(),
+        }];
+        let ogm = chapters_ogm(&chaps);
+        assert_eq!(ogm.lines().count(), 2, "{ogm:?}");
+        assert!(!ogm.lines().any(|l| l.starts_with("CHAPTER99")));
+        let xml = chapters_xml(&chaps);
+        assert!(!xml.contains('\u{1}'), "{xml:?}");
     }
 
     #[test]
