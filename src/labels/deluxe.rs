@@ -32,12 +32,19 @@ pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
+    // One inflate budget for every sweep over every jar this parse opens.
+    parse_with_budget(reader, udf, jar::PARSE_INFLATE_BUDGET)
+}
+
+fn parse_with_budget(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    mut budget: u64,
+) -> Option<ParseResult> {
     // Per-studio dispatch signal: Deluxe authored the framework for several
     // studios, each shipping `/BDMV/JAR/<n>/config.xml` naming the studio.
     // Matching below is studio-agnostic, so this is informational only (logged).
     let studio = detect_studio(reader, udf);
-    // One inflate budget for every sweep over every jar this parse opens.
-    let mut budget = jar::PARSE_INFLATE_BUDGET;
 
     jar::for_each_jar(reader, udf, |entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/bydeluxe/") {
@@ -364,10 +371,11 @@ fn identify_master_enums(
         let matches_fp = FINGERPRINTS.iter().any(|fp| fp_matches(fp, &ldcs));
         if pool.insert(key, ldcs) {
             if matches_fp && !pool.insert_fields(key, clinit_enum_field_names(class)) {
-                tracing::debug!(
+                tracing::warn!(
                     class = ?key,
                     bytes = pool.bytes,
-                    "deluxe: candidate pool cap hit, enum field names dropped"
+                    "deluxe: candidate pool cap hit, enum field names dropped; \
+                     getstatic references to this enum may not resolve"
                 );
             }
         } else {
@@ -671,7 +679,7 @@ pub(crate) struct Decoded {
     pub drift: usize,
 }
 
-/// Phase D entry point: find the binding class in `archive` and run the
+/// Phase D entry point: fetch the named binding class from `archive` and run the
 /// bytecode walker against its `<clinit>`.
 fn decode_binding(
     archive: &mut jar::Jar,
@@ -679,14 +687,9 @@ fn decode_binding(
     master: &MasterEnumTable,
     budget: &mut u64,
 ) -> Decoded {
-    let target_name = binding_class_name.to_string();
-    // Short-circuit on the name match: the sweep stops iterating (and
-    // decompressing/parsing remaining .class entries) once the closure
-    // returns Some, instead of walking the whole jar past the target.
-    jar::try_each_class_budgeted(archive, budget, |class_name, class| {
-        if class_name != target_name {
-            return None;
-        }
+    // Fetched by entry name: the classes ahead of it in the jar are not inflated or
+    // parsed, so they do not spend the shared budget.
+    jar::try_class_budgeted(archive, binding_class_name, budget, |class| {
         Some(decode_binding_class(class, master))
     })
     .unwrap_or_default()
@@ -1224,7 +1227,7 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
         let codec_hint = coding_type
             .as_deref()
             .map(coding_type_to_codec_hint)
-            .map(str::to_string)
+            .map(neutralise)
             .unwrap_or_default();
 
         // Neither `+= 1` nor `saturating_add` is correct: saturation caused a
@@ -1254,7 +1257,7 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
 
         // Resolve language ordinal → enum value string via master
         // table; then route through vocab::lang for ISO code + variant.
-        let lang_value = master.value("Language", lang_ord).unwrap_or("").to_string();
+        let lang_value = neutralise(master.value("Language", lang_ord).unwrap_or(""));
         let (language, variant) = match vocab::lang(&lang_value) {
             Some(li) => (li.code.to_string(), li.variant.to_string()),
             None if !lang_value.is_empty() => (lang_value.clone(), String::new()),
@@ -1295,6 +1298,16 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
     }
 
     out
+}
+
+// Disc-authored text reaches the label list and from there track names and CLI output:
+// control characters are escaped, everything else is kept as authored.
+fn neutralise(s: &str) -> String {
+    if s.chars().any(char::is_control) {
+        s.escape_debug().to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 // Which stream list each binding type enumerates, learned from the constructions that DID
@@ -2034,6 +2047,31 @@ mod tests {
     }
 
     // ── Phase D: decode_binding (Jar-level short-circuit wrapper) ───────────
+
+    // Classes ahead of the binding class in the jar are not inflated, so they cannot
+    // spend the budget the walk needs for the binding class itself.
+    #[test]
+    fn decode_binding_does_not_charge_classes_ahead_of_the_target() {
+        let target = class_with_simple_construction("Ignored");
+        let need = target.len() as u64;
+        let decoy = class_with_getstatic_refs("Ignored2", "LanguageEnum", 40);
+        assert!(decoy.len() as u64 > need);
+        let zip = build_zip(&[
+            ("com/bydeluxe/Decoy.class", decoy),
+            ("com/bydeluxe/Target.class", target),
+        ]);
+        let mut archive = open_jar(zip);
+        let mut budget = need;
+        let ctors = decode_binding(
+            &mut archive,
+            "com/bydeluxe/Target.class",
+            &lang_enum_master(),
+            &mut budget,
+        )
+        .constructions;
+        assert_eq!(ctors.len(), 1);
+        assert_eq!(budget, 0);
+    }
 
     #[test]
     fn decode_binding_finds_named_class_and_stops_at_first_match() {
@@ -3118,6 +3156,13 @@ mod tests {
     // Two-class Deluxe jar on a disc: a 70-value Language enum and a binding class
     // of four `new Slot(Lang.English)`, each preceded by `extra` bytecode.
     fn deluxe_disc(extra: &[u8]) -> (crate::udf::fixture::MemDisc, crate::udf::UdfFs) {
+        deluxe_disc_with(&[(extra, 4)])
+    }
+
+    // As `deluxe_disc`, over one binding class per `(extra bytecode, binding count)`.
+    fn deluxe_disc_with(
+        binds: &[(&[u8], usize)],
+    ) -> (crate::udf::fixture::MemDisc, crate::udf::UdfFs) {
         use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
         let mut values = vec!["English", "French", "Spanish", "Dutch"];
         let rest: Vec<String> = (4..70).map(|i| format!("L{i}")).collect();
@@ -3155,28 +3200,38 @@ mod tests {
             CpInfo::Utf8("com/bydeluxe/Bind".into()),
             CpInfo::Class { name_index: 16 },
         ];
-        let mut code = Vec::new();
-        for _ in 0..4 {
-            code.extend([NEW, 0, 11, DUP]);
-            code.extend_from_slice(extra);
-            code.extend([GETSTATIC, 0, 9, INVOKESPECIAL, 0, 15, POP]);
+        let bind_class = |extra: &[u8], count: usize| {
+            let mut code = Vec::new();
+            for _ in 0..count {
+                code.extend([NEW, 0, 11, DUP]);
+                code.extend_from_slice(extra);
+                code.extend([GETSTATIC, 0, 9, INVOKESPECIAL, 0, 15, POP]);
+            }
+            code.push(RETURN);
+            encode_class(
+                &cp,
+                17,
+                &[MethodSpec {
+                    name_index: 1,
+                    descriptor_index: 2,
+                    code_attr_name_index: 3,
+                    max_stack: 4,
+                    code,
+                }],
+            )
+        };
+        let mut entries = vec![("com/bydeluxe/Lang.class".to_string(), lang)];
+        for (i, (extra, count)) in binds.iter().enumerate() {
+            entries.push((
+                format!("com/bydeluxe/Bind{i}.class"),
+                bind_class(extra, *count),
+            ));
         }
-        code.push(RETURN);
-        let bind = encode_class(
-            &cp,
-            17,
-            &[MethodSpec {
-                name_index: 1,
-                descriptor_index: 2,
-                code_attr_name_index: 3,
-                max_stack: 4,
-                code,
-            }],
-        );
-        let jar = build_zip(&[
-            ("com/bydeluxe/Lang.class", lang),
-            ("com/bydeluxe/Bind.class", bind),
-        ]);
+        let entries: Vec<(&str, Vec<u8>)> = entries
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.clone()))
+            .collect();
+        let jar = build_zip(&entries);
         let dir = |name: &str, icb, files, subdirs| DirSpec {
             name: name.to_string(),
             icb_lba: icb,
@@ -3213,6 +3268,122 @@ mod tests {
         let (mut disc, udf) = deluxe_disc(&[0xA8, 0, 3]);
         let r = parse(&mut disc, &udf).expect("deluxe labels");
         assert_eq!(r.confidence, super::super::Confidence::Low);
+    }
+
+    // The inflate budget decides confidence: the smallest budget that still completes
+    // the parse spends it to zero, so the result is not High; one more byte is.
+    #[test]
+    fn a_spent_inflate_budget_is_not_high_confidence() {
+        let (mut disc, udf) = deluxe_disc(&[]);
+        let (mut lo, mut hi) = (0u64, 1u64 << 20);
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if parse_with_budget(&mut disc, &udf, mid).is_some() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let tight = parse_with_budget(&mut disc, &udf, hi).expect("completes at the minimum");
+        assert_eq!(tight.confidence, super::super::Confidence::Low);
+        let roomy = parse_with_budget(&mut disc, &udf, hi + 1).expect("completes");
+        assert_eq!(roomy.confidence, super::super::Confidence::High);
+    }
+
+    // Drift in any binding class downgrades the union, whichever class carries it.
+    #[test]
+    fn drift_in_any_binding_class_is_not_high_confidence() {
+        let drifty: &[u8] = &[0xA8, 0, 3];
+        for binds in [[(&[][..], 4), (drifty, 4)], [(drifty, 4), (&[][..], 4)]] {
+            let (mut disc, udf) = deluxe_disc_with(&binds);
+            let r = parse(&mut disc, &udf).expect("deluxe labels");
+            assert_eq!(r.confidence, super::super::Confidence::Low);
+        }
+    }
+
+    // The union across binding classes is bounded by the same cap as each walk.
+    #[test]
+    fn constructions_across_binding_classes_are_capped() {
+        let half = MAX_CONSTRUCTIONS / 2 + 100;
+        let (mut disc, udf) = deluxe_disc_with(&[(&[], half), (&[], half)]);
+        let r = parse(&mut disc, &udf).expect("deluxe labels");
+        assert_eq!(r.labels.len(), MAX_CONSTRUCTIONS);
+    }
+
+    // A control character in a CodingType name or language value never reaches the
+    // label text raw.
+    #[test]
+    fn disc_authored_control_characters_are_escaped_in_labels() {
+        let master = MasterEnumTable::from(&[(
+            "Language",
+            MasterEnum {
+                class_name: "LanguageEnum".into(),
+                values: vec!["Xx\x1b[31mYy".into()],
+                fields: Vec::new(),
+            },
+        )]);
+        let constructions = vec![Construction {
+            binding_type: "ng".into(),
+            args: vec![
+                StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal: 0,
+                },
+                StackVal::CodingType("\x1b]0;pwn\x07ATMOS_AUDIO".into()),
+            ],
+        }];
+        let out = interpret_streams(&constructions, &master);
+        assert_eq!(out.len(), 1);
+        for text in [&out[0].codec_hint, &out[0].language, &out[0].name] {
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+        }
+        assert!(out[0].codec_hint.contains("ATMOS_AUDIO"));
+    }
+
+    // An "English SDH" Language value carries the qualifier the Purpose enum left unset.
+    #[test]
+    fn language_value_supplies_the_qualifier_when_purpose_does_not() {
+        let master = MasterEnumTable::from(&[(
+            "Language",
+            MasterEnum {
+                class_name: "LanguageEnum".into(),
+                values: vec!["English SDH".into(), "English RNIB".into()],
+                fields: Vec::new(),
+            },
+        )]);
+        let slot = |ord: u16| Construction {
+            binding_type: "SubtitleSlot".into(),
+            args: vec![StackVal::EnumRef {
+                kind: "Language",
+                ordinal: ord,
+            }],
+        };
+        let out = interpret_streams(&[slot(0), slot(1)], &master);
+        assert_eq!(out[0].qualifier, LabelQualifier::Sdh);
+        assert_eq!(out[1].qualifier, LabelQualifier::DescriptiveService);
+    }
+
+    // The documented Purpose ordinal mapping, every row: purpose and qualifier.
+    #[test]
+    fn deluxe_purpose_every_ordinal_maps_as_documented() {
+        use LabelPurpose::*;
+        for (ord, want) in [
+            (0, Normal),
+            (1, Commentary),
+            (2, Normal),
+            (3, Normal),
+            (4, Descriptive),
+            (5, Score),
+            (6, Normal),
+            (7, Descriptive),
+            (8, Normal),
+        ] {
+            assert_eq!(
+                deluxe_purpose_to_label(ord),
+                (want, LabelQualifier::None),
+                "ordinal {ord}"
+            );
+        }
     }
 
     // ── interpret_streams + deluxe_purpose_to_label tests ───────────────────

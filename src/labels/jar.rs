@@ -383,6 +383,23 @@ where
     })
 }
 
+/// Parse the one `.class` entry named `entry_name` (its full jar path) and call `f` on it.
+/// Every other entry is skipped by name, so it is neither inflated nor charged to `budget`.
+pub fn try_class_budgeted<Z: Read + Seek, R, F>(
+    archive: &mut ZipArchive<Z>,
+    entry_name: &str,
+    budget: &mut u64,
+    mut f: F,
+) -> Option<R>
+where
+    F: FnMut(&ClassFile) -> Option<R>,
+{
+    let is_target = |n: &str| n == entry_name;
+    try_each_entry(archive, is_target, MAX_CLASS_BYTES, budget, |_, bytes| {
+        f(&ClassFile::parse(bytes).ok()?)
+    })
+}
+
 /// [`try_each_class_budgeted`] visiting every class (no short-circuit).
 pub fn for_each_class_budgeted<Z: Read + Seek, F>(
     archive: &mut ZipArchive<Z>,
