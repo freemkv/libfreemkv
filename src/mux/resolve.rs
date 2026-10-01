@@ -430,10 +430,10 @@ fn open_container(
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
             let len = std::fs::metadata(path)?.len();
-            let stage = crate::sector::DecryptingSectorSource::detecting(
+            let stage = crate::sector::DecryptingSectorSource::new(
                 Box::new(crate::io::file_sector_source::FileSectorSource::open_padded(path)?)
                     as Box<dyn SectorSource>,
-                stage_options(opts, ctx, opts.raw),
+                crate::sector::Keying::detect(stage_options(opts, ctx, opts.raw)),
             );
             let blanked = stage.blanked_counter();
             let reader = crate::sector::stage::SectorBytes::new(stage, len);
@@ -1099,9 +1099,9 @@ fn build_ps_pipeline(
     const HEAD_SECTORS: u32 = 2048; // 4 MiB
     let open = |raw: bool| -> io::Result<_> {
         let file = crate::io::file_sector_source::FileSectorSource::open_padded(path)?;
-        Ok(crate::sector::DecryptingSectorSource::detecting(
+        Ok(crate::sector::DecryptingSectorSource::new(
             Box::new(file) as Box<dyn SectorSource>,
-            stage_options(opts, ctx, raw),
+            crate::sector::Keying::detect(stage_options(opts, ctx, raw)),
         ))
     };
     let mut stage = open(opts.raw)?;

@@ -2,7 +2,7 @@
 //! transitional: the pipeline's chunk stream replaces the sector/byte split).
 //!
 //! Every `input()` source passes the stage. A sector source (`mpg://`, `m2ts://`) is wrapped
-//! by [`DecryptingSectorSource::detecting`](super::DecryptingSectorSource::detecting); a byte
+//! by the content-detected [`DecryptingSectorSource`](super::DecryptingSectorSource); a byte
 //! reader (`mkv://`, `mp4://`, `network://`, `stdio://`) by [`Stage`], which hands a clear
 //! container through untouched and refuses encrypted content it cannot decrypt. The verdict
 //! comes from the bytes alone ([`classify`]), never from the URL scheme.

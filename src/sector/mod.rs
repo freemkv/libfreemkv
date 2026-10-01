@@ -191,7 +191,7 @@ impl SectorSource for &mut (dyn SectorSource + '_) {
 }
 
 pub use crate::io::file_sector_source::FileSectorSource;
-pub use decrypting::DecryptingSectorSource;
+pub use decrypting::{DecryptingSectorSource, Keying};
 pub use prefetched::PrefetchedSectorSource;
 
 #[cfg(test)]

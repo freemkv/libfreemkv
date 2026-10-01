@@ -55,7 +55,7 @@ pub(crate) fn test_keyed_source<S: SectorSource>(
     src: DecryptingSectorSource<S>,
     map: Arc<AacsKeyMap>,
 ) -> DecryptingSectorSource<S> {
-    src.with_key_map(map)
+    src.keyed_for_test(map)
 }
 
 /// What a rip decrypts, and so what `acquire` must key (KU §2.5).
@@ -587,8 +587,9 @@ impl KeyRing {
     ) -> Result<DecryptingSectorSource<S>> {
         let i = &self.0;
         self.gate(inner.random_access(), extents, allow_pending)?;
-        let mut dec =
-            DecryptingSectorSource::new(inner, self.decrypt_keys()).with_key_map(self.key_map());
+        let keying =
+            crate::sector::Keying::ring(self.decrypt_keys(), self.key_map(), self.arrival(stop));
+        let mut dec = DecryptingSectorSource::new(inner, keying);
         if self.forensic_pending() && self.touches_clip(extents) {
             // Pending segments stay ciphertext (never a stop, KU §2.4): outside content.
             let spans: Vec<(u32, u32)> = i.spans.iter().map(|&(s, n, _)| (s, n)).collect();
@@ -597,9 +598,6 @@ impl KeyRing {
                 .map(|(s, e)| (s, e - s))
                 .collect();
             dec = dec.with_content_ranges(Arc::from(crate::whole_disc::merge_ranges(content)));
-        }
-        if let Some(a) = self.arrival(stop) {
-            dec = dec.with_arrival(a);
         }
         Ok(dec)
     }
