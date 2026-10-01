@@ -14,7 +14,7 @@
 //! (E9073) only after 30 s in which neither the `.partial` nor a watched file changed.
 
 use crate::error::{Error, Result};
-use crate::halt::{Halt, Progress, Stall, StallTimer, WAIT_SLICE};
+use crate::halt::{Halt, Liveness, Stall, StallTimer, WAIT_SLICE};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -144,7 +144,7 @@ type Ids<'a> = dyn Fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64,
 struct LockWait {
     watched: Vec<PathBuf>,
     seen: Vec<Option<(u64, Option<SystemTime>)>>,
-    progress: Progress,
+    progress: Liveness,
     timer: StallTimer,
 }
 
@@ -153,7 +153,7 @@ impl LockWait {
         let mut watched = vec![with_suffix(final_path, ".partial")];
         watched.extend(watch.iter().map(|p| p.to_path_buf()));
         let seen = signatures(&watched);
-        let progress = Progress::new();
+        let progress = Liveness::new();
         let timer = StallTimer::new(window, &progress);
         LockWait {
             watched,

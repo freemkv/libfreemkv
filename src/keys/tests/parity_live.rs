@@ -6,8 +6,9 @@ use super::*;
 use crate::dirimage::tests::{minimal_clpi, one_item_mpls};
 use crate::disc::ScanOptions;
 use crate::drive::Drive;
-use crate::mux::driver::{MuxOptions, MuxSource, NoopEvents, mux_with_keys};
+use crate::mux::driver::{MuxOptions, mux_with_keys};
 use crate::mux::parity_tests::{golden, record_run, record_tree};
+use crate::mux::source::Source;
 use crate::session::{DiscSession, KeySpec};
 use crate::test_util::{FakeMode, FakeTransport, Golden, synthetic_bd_clip};
 
@@ -72,22 +73,18 @@ fn mux(
     g: &mut Golden,
     tag: &str,
     s: &mut DiscSession,
-    set: Option<&ResolvedKeySet>,
+    set: Option<&KeyRing>,
     opts: &MuxOptions,
     halt: &Halt,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let dest = format!("mkv://{}", dir.path().join("o.mkv").display());
     let r = mux_with_keys(
-        MuxSource::Session {
-            session: s,
-            title_index: 0,
-        },
+        Source::from_session(s),
         set,
         &dest,
         opts,
-        halt,
-        Arc::new(NoopEvents),
+        &crate::ctx::Ctx::new(halt.clone()),
     );
     record_run(g, tag, &r);
     record_tree(g, tag, dir.path());
@@ -101,11 +98,16 @@ fn opts(skip: bool) -> MuxOptions {
     }
 }
 
-fn keys(s: &mut DiscSession, kdb: &[[u8; 16]]) -> crate::error::Result<ResolvedKeySet> {
+fn keys(s: &mut DiscSession, kdb: &[[u8; 16]]) -> crate::error::Result<KeyRing> {
     let calls = Calls::default();
     let f = factory(&[Spec::keydb(kdb, &calls)]);
-    s.resolve_key_set(KeyScope::Titles(vec![0]), &f, ResolveKeysOptions::default())
-        .map(|r| r.keys)
+    s.acquire_keys(
+        KeyScope::Titles(vec![0]),
+        &f,
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
+    )
+    .map(|r| r.keys)
 }
 
 #[test]
@@ -165,12 +167,13 @@ fn parity_live_bd_lazy_piece() {
     let disc = session(t2.with_image(img.image.clone()), &halt, &clip)
         .take_disc()
         .unwrap();
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &disc,
         &mut dead.clone(),
         KeyScope::Titles(vec![0]),
         &f,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap()
     .keys;
@@ -226,18 +229,14 @@ fn parity_live_bd_stop_mid_read() {
     armed.store(true, std::sync::atomic::Ordering::Relaxed);
     let dir = tempfile::tempdir().unwrap();
     let r = mux_with_keys(
-        MuxSource::Session {
-            session: &mut s,
-            title_index: 0,
-        },
+        Source::from_session(&mut s),
         Some(&set),
         &format!("mkv://{}", dir.path().join("o.mkv").display()),
         &MuxOptions {
             batch_sectors: 2,
             ..Default::default()
         },
-        &halt,
-        Arc::new(NoopEvents),
+        &crate::ctx::Ctx::new(halt.clone()),
     );
     let o = r.as_ref().map(|o| (o.completed, o.errors, o.lost_bytes));
     g.kv("stop", format_args!("{o:?}"));

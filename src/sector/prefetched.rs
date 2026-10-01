@@ -7,18 +7,12 @@
 //! sending batches into a bounded channel; sender drop reads as end-of-stream. `read_sectors`
 //! ignores its `lba`/`count` args.
 
+use crate::ctx::Ctx;
 use crate::error::Result;
-use crate::event::{Event, EventKind};
 use crate::halt::{DriveHolder, Halt, Recv, SendOutcome};
 use crate::sector::SectorSource;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::time::Duration;
-
-/// Producer-thread event callback. Fires `BytesRead` after every
-/// successful batch read so the consumer side can update a UI
-/// progress indicator without polling. `Send + 'static` because the
-/// callback runs on the producer thread.
-pub type EventFn = Box<dyn Fn(Event) + Send + 'static>;
 
 const PREFETCH_CHANNEL_DEPTH: usize = 2;
 
@@ -43,8 +37,8 @@ pub struct PrefetchedSectorSource {
     /// cross-thread alloc/free was the dominant cost in the demux
     /// thread before this).
     recycle_tx: Sender<Vec<u8>>,
-    /// The producer, a Drive holder (§2.5): joined on drop.
-    producer: Option<DriveHolder<()>>,
+    /// The producer (a Drive holder for a disc or image, §2.5): joined on drop.
+    producer: Option<Producer>,
     /// Total sector count across all extents, computed once at
     /// construction (the sum of each extent's `sector_count`) and
     /// returned by [`capacity_sectors`]. Never updated by reads.
@@ -60,7 +54,31 @@ pub struct PrefetchedSectorSource {
     /// The reader's unmapped stream files, snapshotted before it moved to the producer.
     unmapped: Vec<crate::sector::bus_removal::UnmappedStreamFile>,
     /// The op's token: once cancelled, the closed channel is a stop, not EOF (L096).
-    halt: Option<Halt>,
+    halt: Halt,
+}
+
+// The producer thread: a Drive holder (§2.5) for a disc or image read, a plain thread for a
+// file's byte view (`m2ts://`), which holds no Drive.
+enum Producer {
+    Drive(DriveHolder<()>),
+    File(std::thread::JoinHandle<()>),
+}
+
+impl Producer {
+    fn join(self) {
+        match self {
+            Producer::Drive(h) => drop(h.join()),
+            Producer::File(h) => drop(h.join()),
+        }
+    }
+}
+
+/// A file's byte view through the Read stage (`m2ts://`): `prefix` (the bytes already read
+/// past the head scan) goes out first, then the chunks, ending after `len` chunk bytes (the
+/// file's real length, short of its zero-padded last sector).
+pub(crate) struct ByteView {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) len: u64,
 }
 
 // Hand `item` to the consumer, waiting on a full channel; `false` once the consumer is
@@ -81,65 +99,93 @@ impl PrefetchedSectorSource {
     /// else [`Error::ExtentNotUnitAligned`] surfaces through the channel.
     ///
     /// [`Error::ExtentNotUnitAligned`]: crate::error::Error::ExtentNotUnitAligned
+    ///
+    /// `ctx.halt` stops the producer; a `BytesRead` event goes to `ctx.events` after every
+    /// batch, from the producer thread.
     pub fn new<S>(
         reader: S,
         extents: Vec<crate::disc::Extent>,
         batch_sectors: u16,
-        halt: Option<Halt>,
+        ctx: &Ctx,
     ) -> Result<Self>
     where
         S: SectorSource + Send + 'static,
     {
-        Self::new_with_events(reader, extents, batch_sectors, SECTOR_ALIGNMENT, halt, None)
+        Self::with_alignment(reader, extents, batch_sectors, SECTOR_ALIGNMENT, ctx)
     }
 
-    /// Same as [`Self::new`] but with a callback fired from the producer
-    /// thread after each successful batch — used by autorip's mux
-    /// path to surface `BytesRead` progress to the UI without the
-    /// consumer thread having to poll.
-    pub fn new_with_events<S>(
-        mut reader: S,
+    /// [`Self::new`] reading in whole `unit_align`-sector units (1 for CSS/clear).
+    pub(crate) fn with_alignment<S>(
+        reader: S,
         extents: Vec<crate::disc::Extent>,
         batch_sectors: u16,
         unit_align: u16,
-        halt: Option<Halt>,
-        event_fn: Option<EventFn>,
+        ctx: &Ctx,
     ) -> Result<Self>
     where
         S: SectorSource + Send + 'static,
     {
-        // A zero batch loops forever (sectors = remaining.min(0) = 0, offset
-        // never advances). All production callers pass nonzero; a 0 here is
-        // a caller bug, so reject rather than spin a thread with no progress.
-        if batch_sectors == 0 {
-            return Err(crate::error::Error::MuxBatchSectorsZero);
-        }
-        // A zero alignment is worse: the producer hits `remaining % unit_align`
-        // and panics divide-by-zero, surfacing as a misleading DemuxThreadPanicked
-        // from a constructor that returned `Ok`. Reject it here too.
-        if unit_align == 0 {
-            return Err(crate::error::Error::IoError {
-                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
-            });
-        }
-        // Accumulate in u64 then clamp: extents come from untrusted nav/MPLS/UDF
-        // data, so a naive u32 sum could panic/wrap. Only affects the advisory
-        // capacity_sectors figure; the producer walks each extent independently.
-        let total_sectors: u32 = extents
-            .iter()
-            .map(|e| e.sector_count as u64)
-            .sum::<u64>()
-            .min(u32::MAX as u64) as u32;
-        let bytes_total_extents: u64 = extents
-            .iter()
-            .map(|e| e.sector_count as u64 * crate::consts::SECTOR_BYTES_U64)
-            .sum();
+        let policy = crate::sector::read_stage::ReadPolicy::Image {
+            batch: batch_sectors,
+        };
+        Self::with_policy(reader, extents, policy, unit_align, ctx).map(|(s, _)| s)
+    }
+
+    /// The producer running the Read stage over `extents` under `policy` (an image's fixed
+    /// batches, or a live drive's adaptive, recovering reads), in `unit_align`-sector
+    /// units. Also returns the read loss the stage counts.
+    pub(crate) fn with_policy<S>(
+        reader: S,
+        extents: Vec<crate::disc::Extent>,
+        policy: crate::sector::read_stage::ReadPolicy,
+        unit_align: u16,
+        ctx: &Ctx,
+    ) -> Result<(Self, std::sync::Arc<crate::sector::read_stage::ReadLoss>)>
+    where
+        S: SectorSource + Send + 'static,
+    {
+        Self::spawn(reader, extents, policy, unit_align, ctx, None)
+    }
+
+    /// The producer over a file's byte view (`m2ts://`): the same Read stage under `policy`
+    /// in single-sector units, its chunks preceded by `view.prefix` and clipped to `view.len`.
+    pub(crate) fn file_bytes<S>(
+        reader: S,
+        extents: Vec<crate::disc::Extent>,
+        policy: crate::sector::read_stage::ReadPolicy,
+        ctx: &Ctx,
+        view: ByteView,
+    ) -> Result<(Self, std::sync::Arc<crate::sector::read_stage::ReadLoss>)>
+    where
+        S: SectorSource + Send + 'static,
+    {
+        Self::spawn(reader, extents, policy, 1, ctx, Some(view))
+    }
+
+    fn spawn<S>(
+        mut reader: S,
+        extents: Vec<crate::disc::Extent>,
+        policy: crate::sector::read_stage::ReadPolicy,
+        unit_align: u16,
+        ctx: &Ctx,
+        view: Option<ByteView>,
+    ) -> Result<(Self, std::sync::Arc<crate::sector::read_stage::ReadLoss>)>
+    where
+        S: SectorSource + Send + 'static,
+    {
+        let mut walk =
+            crate::sector::read_stage::ExtentWalk::new(extents, policy, unit_align, ctx)?;
+        let loss = walk.loss();
+        let total_sectors = walk.total_sectors();
+        let batch_sectors = match policy {
+            crate::sector::read_stage::ReadPolicy::Image { batch }
+            | crate::sector::read_stage::ReadPolicy::Live { batch, .. } => batch,
+        };
         let unmapped = reader.unmapped_stream_files().to_vec();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
         let batch_bytes = batch_sectors as usize * crate::consts::SECTOR_BYTES;
-        // A never-cancelled stand-in keeps one halt-aware code path without a token.
-        let wait = halt.clone().unwrap_or_default();
+        let wait = ctx.halt.clone();
 
         // Seed the recycle pool so the producer has a buffer on the first
         // iteration; otherwise the first recycle_rx.recv() blocks forever.
@@ -149,50 +195,27 @@ impl PrefetchedSectorSource {
 
         #[cfg(test)]
         assert!(
-            crate::halt::DRIVE_HOLDER_TEST_LOCK.try_lock().is_err(),
+            view.is_some() || crate::halt::DRIVE_HOLDER_TEST_LOCK.try_lock().is_err(),
             "a test that spawns a prefetcher (a Drive holder) must hold DRIVE_HOLDER_TEST_LOCK"
         );
-        let producer = crate::halt::spawn_drive_holder("prefetch", move || {
-            // catch_unwind so a panic (decrypt source, read path, event_fn) isn't
+        let file_view = view.is_some();
+        let body = move || {
+            // A byte view: what is still to go out after the prefix.
+            let (prefix, mut left) = match view {
+                Some(v) => (v.prefix, Some(v.len)),
+                None => (Vec::new(), None),
+            };
+            // catch_unwind so a panic (decrypt source, read path, events) isn't
             // mistaken for clean EOF: a dropped `tx` alone would finalize a
             // TRUNCATED mux as success. Locals are thread-local, so this is sound.
             let body = std::panic::AssertUnwindSafe(|| {
-                let mut ext_idx = 0usize;
-                let mut offset: u32 = 0;
-                let mut bytes_read_total: u64 = 0;
-                while ext_idx < extents.len() {
+                if !prefix.is_empty() && !send_or_stop(&wait, &tx, Ok(prefix)) {
+                    return;
+                }
+                loop {
                     if wait.is_cancelled() {
                         return;
                     }
-                    let extent = &extents[ext_idx];
-                    // AACS aligned units anchor at THIS extent's start LBA, so gate
-                    // relative to it, not absolute disc LBA 0. No-op for
-                    // non-decrypting / CSS / None sources.
-                    reader.set_unit_base(extent.start_lba);
-                    let remaining = extent.sector_count.saturating_sub(offset);
-                    if remaining == 0 {
-                        ext_idx += 1;
-                        offset = 0;
-                        continue;
-                    }
-                    // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt processes only
-                    // full units, so a tail below one unit can't decrypt — error, don't emit
-                    // encrypted bytes. (`remaining > 0` above, so `< align` IS the short tail; `!is_multiple_of` was redundant.)
-                    if remaining < unit_align as u32 {
-                        let e = crate::error::Error::ExtentNotUnitAligned.into();
-                        send_or_stop(&wait, &tx, Err(e));
-                        return;
-                    }
-                    let mut sectors = remaining.min(batch_sectors as u32) as u16;
-                    // Trim to a whole number of units. A trim to 0 here means the
-                    // batch window landed on a sub-unit boundary (not the
-                    // trailing-tail case, rejected above); clamp to one unit.
-                    if sectors >= unit_align {
-                        sectors -= sectors % unit_align;
-                    } else {
-                        sectors = unit_align;
-                    }
-                    let bytes = sectors as usize * crate::consts::SECTOR_BYTES;
                     // Halt-aware: a cancel does not disconnect the channel, so a
                     // plain recv() would never re-reach the check. Disconnected =
                     // the consumer dropped both channels.
@@ -200,55 +223,29 @@ impl PrefetchedSectorSource {
                     else {
                         return;
                     };
-                    // Sound resize (was `unsafe set_len` guarded only by capacity):
-                    // public `into_channels` lets a caller recycle a cap-only Vec, so
-                    // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
-                    buf.resize(bytes, 0);
-                    // `start_lba + offset` derives from untrusted extent
-                    // data — saturate rather than wrap/panic on a
-                    // hostile start_lba near u32::MAX.
-                    let lba = extent.start_lba.saturating_add(offset);
-                    match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
-                        Ok(n) => {
-                            // A short read must not desync the stream: advance by
-                            // sectors actually read, and reject a non-whole-sector
-                            // count (belt-and-braces; FileSectorSource read_exact's).
-                            if n % crate::consts::SECTOR_BYTES != 0 {
-                                let e = crate::error::Error::ExtentNotUnitAligned.into();
-                                send_or_stop(&wait, &tx, Err(e));
-                                return;
+                    match walk.next(&mut reader, &mut buf) {
+                        Ok(true) => {
+                            // A byte view ends at the file's real length.
+                            let last = left.is_some_and(|l| buf.len() as u64 >= l);
+                            if let Some(l) = left.as_mut() {
+                                buf.truncate((*l).min(buf.len() as u64) as usize);
+                                *l -= buf.len() as u64;
                             }
-                            let sectors_read = (n / crate::consts::SECTOR_BYTES) as u32;
-                            // A zero-byte read isn't EOF (extents still have
-                            // `remaining`) and would spin forever; send a terminal
-                            // sentinel instead of a clean EOF that reports success.
-                            if sectors_read == 0 {
-                                let e = crate::error::Error::SourceTerminated.into();
-                                send_or_stop(&wait, &tx, Err(e));
-                                return;
-                            }
-                            buf.truncate(n);
-                            bytes_read_total = bytes_read_total.saturating_add(n as u64);
-                            if let Some(ref f) = event_fn {
-                                f(Event {
-                                    kind: EventKind::BytesRead {
-                                        bytes: bytes_read_total,
-                                        total: bytes_total_extents,
-                                    },
-                                });
-                            }
-                            if !send_or_stop(&wait, &tx, Ok(buf)) {
+                            if !buf.is_empty() && !send_or_stop(&wait, &tx, Ok(buf)) {
                                 return; // consumer dropped, or stopped
                             }
-                            offset = offset.saturating_add(sectors_read);
+                            if last {
+                                return;
+                            }
                         }
+                        // Drop tx — the consumer sees RecvError → EOF.
+                        Ok(false) => return,
                         Err(e) => {
                             send_or_stop(&wait, &tx, Err(e.into()));
                             return;
                         }
                     }
                 }
-                // Drop tx implicitly — consumer sees RecvError → EOF.
             });
             if std::panic::catch_unwind(body).is_err() {
                 // Panicked mid-stream — surface a typed error so the demux
@@ -257,18 +254,28 @@ impl PrefetchedSectorSource {
                 let e = crate::error::Error::DemuxThreadPanicked.into();
                 send_or_stop(&wait, &tx, Err(e));
             }
-        })
+        };
+        let producer = match file_view {
+            false => crate::halt::spawn_drive_holder("prefetch", body).map(Producer::Drive),
+            true => std::thread::Builder::new()
+                .name("freemkv-prefetch".into())
+                .spawn(body)
+                .map(Producer::File),
+        }
         .map_err(|e| crate::error::Error::IoError { source: e })?;
 
-        Ok(Self {
-            rx,
-            recycle_tx,
-            producer: Some(producer),
-            total_sectors,
-            producer_failed: false,
-            unmapped,
-            halt,
-        })
+        Ok((
+            Self {
+                rx,
+                recycle_tx,
+                producer: Some(producer),
+                total_sectors,
+                producer_failed: false,
+                unmapped,
+                halt: ctx.halt.clone(),
+            },
+            loss,
+        ))
     }
 
     /// Peel off the receivers for zero-copy pipeline mode: the caller pulls buffers from `rx`
@@ -295,7 +302,7 @@ impl PrefetchedSectorSource {
 /// producer thread join handle so dropping the shell joins the
 /// producer, even though the channels have been peeled off.
 pub struct PrefetchShell {
-    producer: Option<DriveHolder<()>>,
+    producer: Option<Producer>,
 }
 
 // Every test that spawns a producer holds this (the halt module's Drive-holder test lock).
@@ -309,7 +316,7 @@ pub(crate) fn holder_test_lock() -> std::sync::MutexGuard<'static, ()> {
 impl Drop for PrefetchShell {
     fn drop(&mut self) {
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            h.join();
         }
     }
 }
@@ -329,7 +336,7 @@ impl Drop for PrefetchedSectorSource {
         // joining gives a deterministic shutdown — no detached thread can outlive
         // the source.
         if let Some(h) = self.producer.take() {
-            let _ = h.join();
+            h.join();
         }
     }
 }
@@ -392,9 +399,7 @@ impl SectorSource for PrefetchedSectorSource {
             }
             // Channel closed. A stop first (L096, LP17): a halted producer returns
             // silently, and `Ok(0)` would read as a short, complete source.
-            Err(_) if self.halt.as_ref().is_some_and(Halt::is_cancelled) => {
-                Err(crate::error::Error::Halted)
-            }
+            Err(_) if self.halt.is_cancelled() => Err(crate::error::Error::Halted),
             // Clean EOF only if the producer never signalled a failure — else `Ok(0)`
             // lets fill_extents zero-fill a dead source's rest as "complete".
             Err(_) if self.producer_failed => Err(crate::error::Error::SourceTerminated),
@@ -408,6 +413,7 @@ mod tests {
     use super::*;
     use crate::disc::Extent;
     use crate::error::Result;
+    use crate::event::Event;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -556,7 +562,8 @@ mod tests {
             start_lba: 0,
             sector_count: 3,
         }];
-        let s = PrefetchedSectorSource::new(Reports(vec![m2ts1()]), ext, 3, None).unwrap();
+        let s =
+            PrefetchedSectorSource::new(Reports(vec![m2ts1()]), ext, 3, &Ctx::default()).unwrap();
         assert_eq!(unmapped_paths(&s), ["/BDMV/STREAM/00001.m2ts"]);
     }
 
@@ -575,7 +582,7 @@ mod tests {
                 PatternSource { capacity: 9999 },
                 extents,
                 3,
-                Some(halt.clone()),
+                &Ctx::new(halt.clone()),
             )
             .expect("spawn");
             // Drop without draining a single batch — the old Drop deadlocked here.
@@ -590,8 +597,9 @@ mod tests {
     fn into_channels_drop_releases_producer() {
         let _serial = serial();
         within(10, || {
-            let src = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, None)
-                .expect("spawn");
+            let src =
+                PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, &Ctx::default())
+                    .expect("spawn");
             let (rx, recycle_tx, shell) = src.into_channels();
             // Consumer goes away early (halt / abort analogue): drop both
             // channel endpoints without draining to EOF.
@@ -610,8 +618,9 @@ mod tests {
         let _serial = serial();
         let before = crate::halt::live_drive_holders();
         within(10, || {
-            let src = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, None)
-                .expect("spawn");
+            let src =
+                PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, &Ctx::default())
+                    .expect("spawn");
             let (rx, recycle_tx, shell) = src.into_channels();
             drop(rx);
             drop(recycle_tx);
@@ -637,7 +646,7 @@ mod tests {
                 sector_count: count,
             }];
             let src = PatternSource { capacity: 1000 };
-            let pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let pf = PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             let (rx, recycle_tx, shell) = pf.into_channels();
             let mut got = Vec::new();
             while let Ok(batch) = rx.recv() {
@@ -668,9 +677,13 @@ mod tests {
         let _serial = serial();
         within(10, || {
             let halt = Halt::new();
-            let src =
-                PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
-                    .expect("spawn");
+            let src = PrefetchedSectorSource::new(
+                EndlessZeroSource,
+                big_extent(),
+                3,
+                &Ctx::new(halt.clone()),
+            )
+            .expect("spawn");
             let (rx, recycle_tx, shell) = src.into_channels();
             // Drain the forward channel so the producer's sends always
             // make progress and it can reach the halt check at the loop
@@ -714,9 +727,13 @@ mod tests {
         let _serial = serial();
         let before = crate::halt::live_drive_holders();
         let halt = Halt::new();
-        let pf =
-            PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
-                .expect("spawn");
+        let pf = PrefetchedSectorSource::new(
+            EndlessZeroSource,
+            big_extent(),
+            3,
+            &Ctx::new(halt.clone()),
+        )
+        .expect("spawn");
         assert_eq!(
             crate::halt::live_drive_holders(),
             before + 1,
@@ -744,17 +761,25 @@ mod tests {
     fn sector_prefetcher_drop_after_cancel_returns() {
         let _serial = serial();
         let halt = Halt::new();
-        let pf =
-            PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
-                .expect("spawn");
+        let pf = PrefetchedSectorSource::new(
+            EndlessZeroSource,
+            big_extent(),
+            3,
+            &Ctx::new(halt.clone()),
+        )
+        .expect("spawn");
         std::thread::sleep(Duration::from_millis(50));
         halt.cancel();
         within(1, move || drop(pf));
 
         let halt = Halt::new();
-        let pf =
-            PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
-                .expect("spawn");
+        let pf = PrefetchedSectorSource::new(
+            EndlessZeroSource,
+            big_extent(),
+            3,
+            &Ctx::new(halt.clone()),
+        )
+        .expect("spawn");
         let (rx, recycle_tx, shell) = pf.into_channels();
         std::thread::sleep(Duration::from_millis(50));
         halt.cancel();
@@ -770,9 +795,13 @@ mod tests {
         let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let halt = Halt::new();
-            let mut pf =
-                PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 3, Some(halt.clone()))
-                    .expect("spawn");
+            let mut pf = PrefetchedSectorSource::new(
+                EndlessZeroSource,
+                big_extent(),
+                3,
+                &Ctx::new(halt.clone()),
+            )
+            .expect("spawn");
             let mut buf = vec![0u8; 3 * 2048];
             assert_eq!(pf.read_sectors(0, 3, &mut buf, false).unwrap(), 3 * 2048);
             halt.cancel();
@@ -797,8 +826,8 @@ mod tests {
                 sector_count: 6,
             }];
             let halt = Halt::new();
-            let mut pf =
-                PrefetchedSectorSource::new(EndlessZeroSource, ext, 3, Some(halt)).expect("spawn");
+            let mut pf = PrefetchedSectorSource::new(EndlessZeroSource, ext, 3, &Ctx::new(halt))
+                .expect("spawn");
             let (_, last) = drain_direct(&mut pf, 3, 8);
             assert_eq!(last.unwrap(), 0);
         });
@@ -809,7 +838,7 @@ mod tests {
     #[test]
     fn zero_batch_rejected() {
         let _serial = serial();
-        let res = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 0, None);
+        let res = PrefetchedSectorSource::new(EndlessZeroSource, big_extent(), 0, &Ctx::default());
         assert_eq!(res.err().map(|e| e.code()), Some(9085));
     }
 
@@ -823,9 +852,13 @@ mod tests {
                     start_lba: 0,
                     sector_count: 6,
                 }];
-                let mut pf =
-                    PrefetchedSectorSource::new(PatternSource { capacity: 6 }, ext, batch, None)
-                        .expect("spawn");
+                let mut pf = PrefetchedSectorSource::new(
+                    PatternSource { capacity: 6 },
+                    ext,
+                    batch,
+                    &Ctx::default(),
+                )
+                .expect("spawn");
                 let mut buf = vec![0u8; 3 * 2048];
                 for _ in 0..2 {
                     let n = pf.read_sectors(0, 3, &mut buf, false).unwrap();
@@ -845,7 +878,8 @@ mod tests {
             start_lba: 0,
             sector_count: 6,
         }];
-        let mut pf = PrefetchedSectorSource::new(EndlessZeroSource, ext, 3, None).unwrap();
+        let mut pf =
+            PrefetchedSectorSource::new(EndlessZeroSource, ext, 3, &Ctx::default()).unwrap();
         assert!(!pf.random_access());
         let by_ref: &mut dyn SectorSource = &mut pf;
         assert!(!SectorSource::random_access(&by_ref));
@@ -856,13 +890,12 @@ mod tests {
     #[test]
     fn zero_unit_align_rejected() {
         let _serial = serial();
-        let res = PrefetchedSectorSource::new_with_events(
+        let res = PrefetchedSectorSource::with_alignment(
             EndlessZeroSource,
             big_extent(),
             4096,
             0,
-            None,
-            None,
+            &Ctx::default(),
         );
         let Err(crate::error::Error::IoError { source }) = res else {
             panic!("zero unit_align must be rejected with InvalidInput");
@@ -884,7 +917,8 @@ mod tests {
                 sector_count: 24,
             }];
             let src = PatternSource { capacity: 24 };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
 
             let mut buf = vec![0u8; 3 * 2048];
             let mut total = 0usize;
@@ -899,11 +933,11 @@ mod tests {
         });
     }
 
-    // The producer-thread `event_fn` must fire a `BytesRead` event per batch, cumulative and
+    // The producer thread must emit a `BytesRead` event per batch, cumulative and
     // non-decreasing, reaching the full extent size at EOF — the contract autorip's progress
     // bar + stall watchdog depend on.
     #[test]
-    fn event_fn_fires_bytes_read_per_batch() {
+    fn producer_emits_bytes_read_per_batch() {
         let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // Two 12-sector extents = 8 aligned units; batch of 3 gives 8 batches.
@@ -921,21 +955,13 @@ mod tests {
 
             let seen = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
             let seen_cb = seen.clone();
-            let event_fn: EventFn = Box::new(move |ev: Event| {
-                if let EventKind::BytesRead { bytes, total } = ev.kind {
+            let ctx = Ctx::default().with_events(Arc::new(move |ev: &Event<'_>| {
+                if let Event::BytesRead { bytes, total } = *ev {
                     seen_cb.lock().unwrap().push((bytes, total));
                 }
-            });
+            }));
 
-            let mut pf = PrefetchedSectorSource::new_with_events(
-                src,
-                extents,
-                3,
-                SECTOR_ALIGNMENT,
-                None,
-                Some(event_fn),
-            )
-            .expect("spawn");
+            let mut pf = PrefetchedSectorSource::new(src, extents, 3, &ctx).expect("spawn");
 
             let mut buf = vec![0u8; 3 * 2048];
             let mut total = 0usize;
@@ -968,7 +994,8 @@ mod tests {
                 sector_count: 8,
             }];
             let src = PatternSource { capacity: 200 };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
 
             let mut buf = vec![0u8; 3 * 2048];
             // First two reads: the 6 unit-aligned sectors come through
@@ -1007,7 +1034,8 @@ mod tests {
                 capacity: 9,
                 first: true,
             };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 9, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 9, &Ctx::default()).expect("spawn");
 
             let mut buf = vec![0u8; 9 * 2048];
             let mut total = 0usize;
@@ -1147,7 +1175,7 @@ mod tests {
                 },
             ];
             let src = PatternSource { capacity: 9999 };
-            let pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let pf = PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             // 9 + 6 + 3 = 18, independent of inner source capacity.
             assert_eq!(pf.capacity_sectors(), 18);
             // Release without draining via the production zero-copy path: peel
@@ -1180,8 +1208,8 @@ mod tests {
             // batch=3 so the producer makes forward progress on the
             // EndlessZeroSource; we only care about the construction-time
             // capacity computation here, then we drop to join.
-            let pf =
-                PrefetchedSectorSource::new(EndlessZeroSource, extents, 3, None).expect("spawn");
+            let pf = PrefetchedSectorSource::new(EndlessZeroSource, extents, 3, &Ctx::default())
+                .expect("spawn");
             assert_eq!(
                 pf.capacity_sectors(),
                 u32::MAX,
@@ -1219,7 +1247,8 @@ mod tests {
                 capacity: 99999,
                 calls: calls.clone(),
             };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             let (got, last) = drain_direct(&mut pf, 3, 16);
             assert_eq!(last.unwrap(), 0, "should reach EOF");
             assert_eq!(got.len(), (6 + 3) * 2048);
@@ -1253,7 +1282,8 @@ mod tests {
             };
             // batch=5: each read must be trimmed to 3 (one unit), so
             // 9 sectors take three reads of 3, never a 5/4-sector read.
-            let mut pf = PrefetchedSectorSource::new(src, extents, 5, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 5, &Ctx::default()).expect("spawn");
             let (got, last) = drain_direct(&mut pf, 5, 16);
             assert_eq!(last.unwrap(), 0);
             assert_eq!(got.len(), 9 * 2048);
@@ -1283,7 +1313,8 @@ mod tests {
                 sector_count: 12,
             }];
             let src = PatternSource { capacity: 100 };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 6, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 6, &Ctx::default()).expect("spawn");
             let (got, last) = drain_direct(&mut pf, 6, 16);
             assert_eq!(
                 last.unwrap(),
@@ -1304,7 +1335,8 @@ mod tests {
                 start_lba: 0,
                 sector_count: 3,
             }];
-            let mut pf = PrefetchedSectorSource::new(ErrorSource, extents, 3, None).expect("spawn");
+            let mut pf = PrefetchedSectorSource::new(ErrorSource, extents, 3, &Ctx::default())
+                .expect("spawn");
             let mut buf = vec![0u8; 3 * 2048];
             let r = pf.read_sectors(0, 3, &mut buf, false);
             let err = r.expect_err("reader error must surface as Err, not EOF");
@@ -1344,8 +1376,8 @@ mod tests {
                 start_lba: 0,
                 sector_count: 9,
             }];
-            let mut pf =
-                PrefetchedSectorSource::new(QuitsEarlySource, extents, 3, None).expect("spawn");
+            let mut pf = PrefetchedSectorSource::new(QuitsEarlySource, extents, 3, &Ctx::default())
+                .expect("spawn");
             let mut buf = vec![0u8; 3 * 2048];
             let mut last = pf.read_sectors(0, 3, &mut buf, false);
             // Whatever the first answer, no call may ever settle on a clean
@@ -1383,7 +1415,8 @@ mod tests {
                 sector_count: 9,
             }];
             let mut pf =
-                PrefetchedSectorSource::new(PartialSectorSource, extents, 3, None).expect("spawn");
+                PrefetchedSectorSource::new(PartialSectorSource, extents, 3, &Ctx::default())
+                    .expect("spawn");
             let mut buf = vec![0u8; 3 * 2048];
             let r = pf.read_sectors(0, 3, &mut buf, false);
             let err = r.expect_err("split-sector read must be rejected");
@@ -1409,7 +1442,8 @@ mod tests {
             }];
             let src = PatternSource { capacity: 6 };
             // batch=3 → producer fills 3 sectors (6144 bytes) per batch.
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             // Caller buffer holds only 1 sector — far too small.
             let mut tiny = vec![0u8; 2048];
             let r = pf.read_sectors(0, 1, &mut tiny, false);
@@ -1436,7 +1470,8 @@ mod tests {
             let src = PatternSource { capacity: 30 };
             // batch=3 → producer fills 3 sectors (6144 bytes) per batch.
             // Pool depth is PREFETCH_CHANNEL_DEPTH+1 = 3.
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             // Caller buffer holds only 1 sector — far too small for a 3-sector batch.
             let mut tiny = vec![0u8; 2048];
 
@@ -1467,7 +1502,8 @@ mod tests {
                 sector_count: count,
             }];
             let src = PatternSource { capacity: 1000 };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             let (got, last) = drain_direct(&mut pf, 3, 16);
             assert_eq!(last.unwrap(), 0);
             assert_eq!(got.len(), (count as usize) * 2048);
@@ -1491,8 +1527,8 @@ mod tests {
     fn empty_extents_eof_immediately() {
         let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
-            let pf =
-                PrefetchedSectorSource::new(EndlessZeroSource, Vec::new(), 3, None).expect("spawn");
+            let pf = PrefetchedSectorSource::new(EndlessZeroSource, Vec::new(), 3, &Ctx::default())
+                .expect("spawn");
             assert_eq!(pf.capacity_sectors(), 0);
             let mut pf = pf;
             let mut buf = vec![0u8; 3 * 2048];
@@ -1527,7 +1563,8 @@ mod tests {
                 capacity: 9999,
                 calls: calls.clone(),
             };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             let (got, last) = drain_direct(&mut pf, 3, 16);
             assert_eq!(last.unwrap(), 0);
             assert_eq!(got.len(), 6 * 2048, "two non-empty extents = 6 sectors");
@@ -1555,7 +1592,8 @@ mod tests {
             }];
             let src = PatternSource { capacity: 100 };
             // batch=9 (>4) so the first iter requests 4, trims to 3.
-            let mut pf = PrefetchedSectorSource::new(src, extents, 9, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 9, &Ctx::default()).expect("spawn");
             let mut buf = vec![0u8; 9 * 2048];
             let n0 = pf.read_sectors(0, 9, &mut buf, false).unwrap();
             assert_eq!(n0, 3 * 2048, "first batch must be exactly one unit");
@@ -1582,7 +1620,8 @@ mod tests {
                 })
                 .collect();
             let src = PatternSource { capacity: 999999 };
-            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let mut pf =
+                PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
             let (got, last) = drain_direct(&mut pf, 3, 64);
             assert_eq!(last.unwrap(), 0);
             assert_eq!(got.len(), 30 * 2048, "all 10 extents must be drained");
@@ -1622,8 +1661,13 @@ mod tests {
             start_lba: 100,
             sector_count: 9,
         }];
-        let mut pf = PrefetchedSectorSource::new(FailingSource { status, sense }, extents, 3, None)
-            .expect("spawn");
+        let mut pf = PrefetchedSectorSource::new(
+            FailingSource { status, sense },
+            extents,
+            3,
+            &Ctx::default(),
+        )
+        .expect("spawn");
         let mut buf = vec![0u8; 3 * 2048];
         pf.read_sectors(100, 3, &mut buf, false)
             .expect_err("the producer's read failure must surface")

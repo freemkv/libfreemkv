@@ -686,7 +686,7 @@ fn scsi_sense_keeps_three_fields() {
 /// one is in flight.
 #[test]
 fn attached_progress_bumps_per_cdb_and_is_busy_in_flight() {
-    let p = crate::halt::Progress::new();
+    let p = crate::halt::Liveness::new();
     let p2 = p.clone();
     let t = Script::new(move |_, d| {
         assert!(p2.is_busy(), "busy mid-CDB");

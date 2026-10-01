@@ -1,5 +1,5 @@
 //! `mpg://`: an ISO/IEC 13818-1 program stream written from the PES IR (mpg-output-design
-//! v5 §2, L2), one more `pes::Stream` sink.
+//! v5 §2, L2), one more `PesSink`.
 //!
 //! The pack layer is regenerated: packs, SCR, mux rate, system header, PSM, PES headers
 //! and DTS. ES bytes are kept (DVD LPCM is re-packed losslessly, G8); PTS is kept exactly,
@@ -24,7 +24,7 @@ use pstd::{Au, BufferSpec, Mux, Payload, PstdCounters, StreamSpec};
 use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
 use crate::mux::codec::ns_to_ticks;
 use crate::mux::decode_ts::{DtsCounters, DtsDeriver};
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSink};
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
@@ -653,11 +653,7 @@ impl<W: Write + Send> MpgSink<W> {
     }
 }
 
-impl<W: Write + Send> Stream for MpgSink<W> {
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
-
+impl<W: Write + Send> PesSink for MpgSink<W> {
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
         if self.finished {
             return Err(crate::error::Error::StreamClosed.into());

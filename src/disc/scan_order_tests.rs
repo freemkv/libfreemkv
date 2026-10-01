@@ -971,8 +971,8 @@ fn scan_with_final_check() {
     assert_eq!(fake.log().len(), last);
 }
 
-// A key source that records whether the drive's Progress was busy while it ran.
-struct BusyProbe(crate::halt::Progress, Arc<Mutex<Vec<bool>>>);
+// A key source that records whether the drive's Liveness was busy while it ran.
+struct BusyProbe(crate::halt::Liveness, Arc<Mutex<Vec<bool>>>);
 impl crate::KeySource for BusyProbe {
     fn get_unit_keys(
         &self,
@@ -986,11 +986,11 @@ impl crate::KeySource for BusyProbe {
     }
 }
 
-/// ST4-2: `bus_step_guard` holds `busy()` on the Drive-attached `Progress` for the
+/// ST4-2: `bus_step_guard` holds `busy()` on the Drive-attached `Liveness` for the
 /// whole bus step, so the first keydb parse (in `host_certs`) is never idle time.
 #[test]
 fn bus_step_guard_holds_busy_across_host_certs() {
-    let p = crate::halt::Progress::new();
+    let p = crate::halt::Liveness::new();
     let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
     let mut rig = Rig::new(bd_disc(Some(true)), |_| {});
     rig.drive.attach_progress(&p);
@@ -1036,10 +1036,11 @@ fn cancelled_scan_then_resolve_returns_halted_and_builds_no_set() {
     assert!(matches!(r, Err(Error::Halted)), "{r:?}");
     assert!(s.disc().is_none(), "a stopped scan stores no Disc");
     let sources: crate::session::KeySourceFactory = Arc::new(Vec::new);
-    let r = s.resolve_key_set(
+    let r = s.acquire_keys(
         crate::keys::KeyScope::WholeDisc,
         &sources,
         Default::default(),
+        &crate::ctx::Ctx::default(),
     );
     assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
     let reads = fake.count(is_read10);

@@ -10,9 +10,9 @@
 use crate::disc::{Disc, DiscId, DriveCredentials, ScanOptions};
 use crate::drive::{Drive, find_drive};
 use crate::error::{Error, Result};
-use crate::halt::{Halt, Progress};
+use crate::halt::{Halt, Liveness};
 use crate::keysource::KeySource;
-use crate::sector::{FileSectorSource, SectorSource};
+use crate::sector::SectorSource;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,11 +20,11 @@ use std::sync::Arc;
 ///
 /// libfreemkv builds no key sources itself (the `freemkv_keysources` crate that
 /// implements [`KeySource`] depends on libfreemkv, not the other way round), so
-/// the consumer hands in a way to build its sources. [`ResolvedKeySet::resolve`]
+/// the consumer hands in a way to build its sources. [`KeyRing::resolve`]
 /// calls it once and keeps nothing; it stays `Send + Sync` without requiring
 /// `KeySource: Send`.
 ///
-/// [`ResolvedKeySet::resolve`]: crate::keys::ResolvedKeySet::resolve
+/// [`KeyRing::resolve`]: crate::keys::KeyRing::acquire
 pub type KeySourceFactory = Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>;
 
 /// Which optical device a [`DiscSession`] should open.
@@ -77,7 +77,7 @@ pub struct KeySpec {
 ///
 /// Owns the [`Drive`] by value. Consumers that still need the raw drive (e.g.
 /// to sample ciphertext for key validation, or to move it into a
-/// `DiscStream`) reach it via [`Self::into_drive`]; the
+/// live mux) reach it via [`Self::into_drive`]; the
 /// scanned [`Disc`] comes out via [`Self::disc`] / [`Self::take_disc`].
 pub struct DiscSession {
     /// The opened drive. `Some` from [`Self::open`] until
@@ -99,7 +99,7 @@ pub struct DiscSession {
     halt: Option<Halt>,
     /// The op's progress from [`Self::attach_progress`] (T29): the drive's CDBs and each
     /// key-source call report to it.
-    progress: Option<Progress>,
+    progress: Option<Liveness>,
 }
 
 // Overlay the session's key material onto `opts` without clobbering what the
@@ -147,7 +147,7 @@ impl DiscSession {
     /// [`Self::open`] under the caller's op token (stop design §2.2): the drive checks
     /// `halt` on every CDB, a Stop during the bring-up ends it `Halted` (the handle is
     /// closed), and the session keeps the token for [`Self::scan_with`] and
-    /// [`Self::resolve_key_set`].
+    /// [`Self::acquire_keys`].
     pub fn open_with(target: DeviceTarget, spec: KeySpec, halt: &Halt) -> Result<DiscSession> {
         let drive = match target {
             DeviceTarget::Path(ref path) => Drive::open_with(path, halt)?,
@@ -233,8 +233,8 @@ impl DiscSession {
     }
 
     /// Report the op's forward progress to `p` (T29): every drive CDB (as
-    /// [`Drive::attach_progress`]) and every key-source call in [`Self::resolve_key_set`].
-    pub fn attach_progress(&mut self, p: &Progress) {
+    /// [`Drive::attach_progress`]) and every key-source call in [`Self::acquire_keys`].
+    pub fn attach_progress(&mut self, p: &Liveness) {
         if let Some(drive) = self.drive.as_mut() {
             drive.attach_progress(p);
         }
@@ -338,36 +338,37 @@ impl DiscSession {
         }
     }
 
-    /// Resolve the rip's key set for `scope` up front (KU §3.1): one
-    /// [`ResolvedKeySet::resolve`](crate::keys::ResolvedKeySet::resolve) through the
-    /// session's staged reader, else its drive. The session keeps nothing: the set is the
+    /// Acquire the rip's key ring for `scope` up front (KU §3.1): one
+    /// [`KeyRing::acquire_for_disc`](crate::keys::KeyRing::acquire_for_disc) through the
+    /// session's staged reader, else its drive. The session keeps nothing: the ring is the
     /// caller's, and no source is retained. Requires [`Self::scan`] to have run.
-    pub fn resolve_key_set(
+    pub fn acquire_keys(
         &mut self,
         scope: crate::keys::KeyScope,
         sources: &KeySourceFactory,
-        opts: crate::keys::ResolveKeysOptions,
+        opts: crate::keys::AcquireOptions,
+        ctx: &crate::ctx::Ctx,
     ) -> Result<crate::keys::KeyResolution> {
-        // Under `open_with` the session's op token governs the resolve too (§2.12).
+        // Under `open_with` the session's op token governs the acquire too (§2.12).
         let (op, progress) = (self.halt.clone(), self.progress.clone());
-        if let Some(h) = &op {
-            h.check()?;
-        }
-        let mut opts = opts;
-        if let Some(h) = &op {
-            // As `Drive::alias` (§2.2): the session's op token wins over the caller's.
-            if opts
-                .halt
-                .is_some_and(|c| !Arc::ptr_eq(c.as_arc(), h.as_arc()))
-            {
-                tracing::warn!(
-                    target: "freemkv::session",
-                    phase = "halt_alias",
-                    "ResolveKeysOptions.halt differs from the session's op token; the session token wins"
-                );
+        let ctx = match op {
+            Some(h) => {
+                h.check()?;
+                if !Arc::ptr_eq(ctx.halt.as_arc(), h.as_arc()) {
+                    // As `Drive::alias` (§2.2): the session's op token wins over the caller's.
+                    tracing::warn!(
+                        target: "freemkv::session",
+                        phase = "halt_alias",
+                        "the run context's halt differs from the session's op token; the session token wins"
+                    );
+                }
+                crate::ctx::Ctx {
+                    halt: h,
+                    ..ctx.clone()
+                }
             }
-            opts.halt = Some(h);
-        }
+            None => ctx.clone(),
+        };
         let Some(disc) = self.disc.as_ref() else {
             return Err(Error::DeviceNotReady {
                 path: self.device.clone(),
@@ -382,12 +383,9 @@ impl DiscSession {
                 });
             }
         };
-        match &progress {
-            Some(p) => crate::keys::ResolvedKeySet::resolve_with_progress(
-                disc, reader, scope, sources, opts, p,
-            ),
-            None => crate::keys::ResolvedKeySet::resolve(disc, reader, scope, sources, opts),
-        }
+        let mut opts = opts;
+        opts.liveness = opts.liveness.or(progress.as_ref());
+        crate::keys::KeyRing::acquire_for_disc(disc, reader, scope, sources, opts, &ctx)
     }
 
     /// The scanned disc, if [`Self::scan`] has run.
@@ -422,8 +420,8 @@ impl DiscSession {
         }
     }
 
-    /// Consume the session, returning the owned drive (e.g. to move into a
-    /// `DiscStream` for a live-drive mux).
+    /// Consume the session, returning the owned drive (e.g. to move into
+    /// the Read stage for a live-drive mux).
     ///
     /// # Errors
     ///
@@ -437,7 +435,7 @@ impl DiscSession {
 
     /// Stage the owned drive as the session's boxed sector source so a live
     /// single-pass mux can drive it through
-    /// [`MuxSource::Session`](crate::mux::MuxSource::Session). Moves the `Drive`
+    /// [`Source::from_session`](crate::mux::Source::from_session). Moves the `Drive`
     /// (itself a [`SectorSource`]) into the `reader` slot; the cached
     /// [`Self::device_path`] keeps the device name available afterward. A no-op
     /// if the drive was already staged or moved out.
@@ -465,7 +463,7 @@ impl DiscSession {
 
     /// Take the staged sector source out of the session by mutable borrow,
     /// leaving `None` behind. Used by [`crate::mux::mux_with_keys`]'s
-    /// [`MuxSource::Session`](crate::mux::MuxSource::Session) arm, which drives
+    /// [`Source::from_session`](crate::mux::Source::from_session) arm, which drives
     /// the mux from `&mut DiscSession` and so cannot consume the whole session.
     /// A second call (or a call before the reader is staged) returns `None`, and
     /// the driver maps that to a clean error rather than a panic (see Q2 of the
@@ -519,15 +517,12 @@ impl DiscSession {
 /// [`Disc`] together with a reusable [`SectorSource`] over the same file.
 ///
 /// This is the file-backed counterpart to [`DiscSession::scan`]: it opens a
-/// [`FileSectorSource`], reads its capacity, and runs [`Disc::scan_image`].
+/// [`crate::sector::FileSectorSource`], reads its capacity, and runs [`Disc::scan_image`].
 /// No SCSI, no handshake, no key resolution beyond what `opts` already
 /// carries. The returned reader is a fresh handle at the start of the image,
 /// reusable by callers that need to sample ciphertext or feed a mux.
 pub fn scan_iso(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
-    let mut reader = FileSectorSource::open(path)?;
-    let capacity = reader.capacity_sectors();
-    let disc = Disc::scan_image(&mut reader, capacity, &opts)?;
-    Ok((disc, Box::new(reader)))
+    crate::mux::source::probe_image(path, false, &opts)
 }
 
 // Sampled 6144-byte aligned units when judging whether a folder with `AACS/`
@@ -543,14 +538,9 @@ const AACS_PROBE_UNITS: usize = 8;
 /// content is sampled and judged by `aacs_unit_needs_decrypt`:
 ///
 /// * none need decryption → `encrypted` is forced false, reason logged.
-/// * any unit does → [`Error::DirImageEncrypted`] (`dir://` doesn't support it).
+/// * any unit does → the folder keeps its AACS verdict and is keyed like an image.
 pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
-    let mut reader = crate::dirimage::DirImage::open(path)?;
-    let capacity = reader.capacity_sectors();
-    let mut disc = Disc::scan_image(&mut reader, capacity, &opts)?;
-
-    apply_folder_encryption_verdict(&mut reader, &mut disc)?;
-    Ok((disc, Box::new(reader)))
+    crate::mux::source::probe_image(path, true, &opts)
 }
 
 // Re-judge a FOLDER's encryption verdict from its CONTENT (tree shape alone can be wrong for an
@@ -565,7 +555,10 @@ pub(crate) fn apply_folder_encryption_verdict(
     // Only the AACS-by-tree-shape verdict is re-judged here.
     if disc.encrypted && disc.css.is_none() && disc.css_error.is_none() {
         match probe_folder_encryption(reader, disc)? {
-            true => return Err(Error::DirImageEncrypted),
+            // Encrypted content: the folder keeps its AACS verdict and is keyed and
+            // decrypted like an image of the same disc (every input passes the one
+            // decryption stage).
+            true => {}
             false => {
                 tracing::warn!(
                     target: "freemkv::scan",

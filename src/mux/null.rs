@@ -16,19 +16,15 @@ impl NullStream {
     }
 }
 
-impl crate::pes::Stream for NullStream {
-    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
-        // Write-only sink: per the Stream trait contract, read() on a
-        // write-opened stream returns StreamWriteOnly. Returning Ok(None)
-        // would be misread as a legitimate empty stream.
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
+impl crate::pes::PesSink for NullStream {
     fn write(&mut self, _: &crate::pes::PesFrame) -> io::Result<()> {
         Ok(())
     }
+
     fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
+
     fn info(&self) -> &DiscTitle {
         &self.disc_title
     }
@@ -37,13 +33,13 @@ impl crate::pes::Stream for NullStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pes::Stream;
+    use crate::pes::PesSink;
 
     /// Verify NullStream routes through the `Stream` trait object cleanly.
     #[test]
     fn stream_via_dyn_object_writes_and_finishes() {
         let title = DiscTitle::empty();
-        let mut sink: Box<dyn Stream> = Box::new(NullStream::new(&title));
+        let mut sink: Box<dyn PesSink> = Box::new(NullStream::new(&title));
 
         let frame = crate::pes::PesFrame {
             discard_padding_ns: 0,
@@ -58,16 +54,6 @@ mod tests {
         sink.write(&frame).unwrap();
         let _ = sink.info();
         sink.finish().unwrap();
-    }
-
-    /// read() on the write-only NullStream must return StreamWriteOnly,
-    /// not Ok(None) (which a caller would misread as an empty stream).
-    #[test]
-    fn read_returns_write_only_error() {
-        let title = DiscTitle::empty();
-        let mut sink = NullStream::new(&title);
-        let err = Stream::read(&mut sink).expect_err("read on a sink must error");
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     /// finish() must be idempotent and safe to call repeatedly — a benchmark

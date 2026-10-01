@@ -127,7 +127,7 @@ impl WritebackFile {
     }
 
     /// Share `flush`'s counters (§2.10 item 3): give it the pipeline consumer's
-    /// [`Progress`](crate::halt::Progress) so a flushing `close()` counts as progress.
+    /// [`Progress`](crate::halt::Liveness) so a flushing `close()` counts as progress.
     /// Call before the first write.
     pub fn set_flush_progress(&mut self, flush: FlushProgress) {
         flush.note_total(self.flush.bytes_total());
@@ -370,17 +370,6 @@ impl Seek for WritebackFile {
     }
 }
 
-impl super::sink::SequentialSink for WritebackFile {
-    // Same work as sync_all(); implemented explicitly (no blanket impl) so
-    // a `dyn SequentialSink`/`dyn RandomAccessSink` finish() finalises +
-    // fsyncs instead of hitting a no-op default.
-    fn finish(&mut self) -> io::Result<()> {
-        self.sync_all()
-    }
-}
-
-impl super::sink::RandomAccessSink for WritebackFile {}
-
 impl Drop for WritebackFile {
     fn drop(&mut self) {
         // Run the pipeline's tail finalize (WAIT_AFTER + DONTNEED); otherwise a drop
@@ -474,59 +463,6 @@ mod tests {
         w.sync_all().unwrap();
         drop(w);
         assert_eq!(read_back(&p), b"onetwothree");
-    }
-
-    // finish() through a `dyn RandomAccessSink` must dispatch to
-    // WritebackFile's override (finalize + durable_sync), not a no-op.
-    #[test]
-    fn finish_through_trait_object_persists() {
-        use crate::io::sink::RandomAccessSink;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("finish-dyn.bin");
-        let w = WritebackFile::create(&p).unwrap();
-        let mut boxed: Box<dyn RandomAccessSink> = Box::new(w);
-        boxed.write_all(b"durable-tail").unwrap();
-        boxed.finish().unwrap();
-        assert_eq!(read_back(&p), b"durable-tail");
-    }
-
-    // The page cache serves the bytes back whether or not a durable sync ran, so count the
-    // final flush: `finish()` on a boxed sink must reach it (the trait default does not).
-    #[test]
-    fn finish_through_trait_object_runs_the_durable_sync() {
-        use crate::io::sink::RandomAccessSink;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        #[derive(Default)]
-        struct CountFinish(AtomicUsize);
-        impl FlushOps for CountFinish {
-            fn chunk(&self, _: &File) -> io::Result<()> {
-                Ok(())
-            }
-            fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
-                None
-            }
-            fn finish(&self, _: &File) -> io::Result<()> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-            fn sample(&self) -> Option<u64> {
-                None
-            }
-        }
-        let ops = Arc::new(CountFinish::default());
-        let w = WritebackFile::with_flush_ops(
-            tempfile::tempfile().unwrap(),
-            ops.clone(),
-            FlushTiming::default(),
-        )
-        .unwrap();
-        let mut boxed: Box<dyn RandomAccessSink> = Box::new(w);
-        boxed.write_all(b"durable-tail").unwrap();
-        boxed.finish().unwrap();
-        assert!(
-            ops.0.load(Ordering::SeqCst) > 0,
-            "finish() skipped the final flush"
-        );
     }
 
     // A writeback error the pipeline latched (Linux: a failed WAIT_AFTER already

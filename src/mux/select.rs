@@ -50,35 +50,7 @@ impl StreamSelection {
         if self.is_all() {
             return Ok(());
         }
-
-        // Validate every listed PID before mutating (unknown PID → no partial prune),
-        // PER CLASS: scanning both classes let a PID in the WRONG filter pass, then
-        // `keeps` matched it only against its own class, silently dropping the track.
-        let check = |filter: &PidFilter, is_class: fn(&Stream) -> bool| -> Result<()> {
-            if let PidFilter::Only(pids) = filter {
-                for &pid in pids {
-                    let present = title
-                        .streams
-                        .iter()
-                        .any(|s| is_class(s) && stream_pid(s) == Some(pid));
-                    if !present {
-                        return Err(Error::SelectionPidUnknown { pid });
-                    }
-                }
-            }
-            Ok(())
-        };
-        check(&self.audio, |s| matches!(s, Stream::Audio(_)))?;
-        check(&self.subtitle, |s| matches!(s, Stream::Subtitle(_)))?;
-
-        let effective = self.with_mp2_extension_bases(title);
-        // Retain by index so we can prune the parallel codec_privates in lockstep.
-        let keep: Vec<bool> = title
-            .streams
-            .iter()
-            .map(|s| effective.keeps(s))
-            .collect::<Vec<_>>();
-
+        let keep = self.keeps_by_index(title)?;
         let mut i = 0;
         title.streams.retain(|_| {
             let k = keep[i];
@@ -105,6 +77,37 @@ impl StreamSelection {
             k
         });
         Ok(())
+    }
+
+    /// Whether each of `title.streams` is kept, by index; the same validation as
+    /// [`apply`](Self::apply) ([`Error::SelectionPidUnknown`] for a PID the title lacks).
+    pub(crate) fn keeps_by_index(&self, title: &DiscTitle) -> Result<Vec<bool>> {
+        if self.is_all() {
+            return Ok(vec![true; title.streams.len()]);
+        }
+
+        // Validate every listed PID before mutating (unknown PID → no partial prune),
+        // PER CLASS: scanning both classes let a PID in the WRONG filter pass, then
+        // `keeps` matched it only against its own class, silently dropping the track.
+        let check = |filter: &PidFilter, is_class: fn(&Stream) -> bool| -> Result<()> {
+            if let PidFilter::Only(pids) = filter {
+                for &pid in pids {
+                    let present = title
+                        .streams
+                        .iter()
+                        .any(|s| is_class(s) && stream_pid(s) == Some(pid));
+                    if !present {
+                        return Err(Error::SelectionPidUnknown { pid });
+                    }
+                }
+            }
+            Ok(())
+        };
+        check(&self.audio, |s| matches!(s, Stream::Audio(_)))?;
+        check(&self.subtitle, |s| matches!(s, Stream::Subtitle(_)))?;
+
+        let effective = self.with_mp2_extension_bases(title);
+        Ok(title.streams.iter().map(|s| effective.keeps(s)).collect())
     }
 
     // An extension PID listed without its base pulls the base in (13818-3 2nd ed. §2.5.2.13:

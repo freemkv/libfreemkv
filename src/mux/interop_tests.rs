@@ -2,12 +2,10 @@
 //! QA explicitly runs ignored `ffmpeg_` tests with software codecs installed.
 //! Fixtures are generated locally and never downloaded from a media corpus.
 
-use super::driver::{MuxOptions, MuxSource, NoopEvents, mux_with_keys};
-use crate::halt::Halt;
+use super::driver::MuxOptions;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Arc;
 
 pub(crate) struct FixtureDir {
     path: PathBuf,
@@ -192,16 +190,12 @@ fn generate_with(
 fn remux(source: &Path, output: &Path, transport: bool) {
     let scheme = if transport { "m2ts" } else { "mkv" };
     let url = format!("{scheme}://{}", source.display());
-    let result = mux_with_keys(
-        MuxSource::Url {
-            url: &url,
-            opts: Default::default(),
-        },
+    let result = crate::mux::mux_url(
+        &url,
         None,
         &format!("mkv://{}", output.display()),
         &MuxOptions::default(),
-        &Halt::new(),
-        Arc::new(NoopEvents),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap();
     assert!(result.completed && result.output_opened && result.bytes_written > 0);

@@ -47,10 +47,12 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// is a bug and fails loud on the first unit (AACS decrypts only via the map).
     key_map: Option<Arc<crate::decrypt::AacsKeyMap>>,
     /// The key set's on-arrival proof for pieces `resolve` could not prove up front
-    /// (KU §2.4). `None` for every reader not built by a `ResolvedKeySet`.
+    /// (KU §2.4). `None` for every reader not built by a `KeyRing`.
     arrival: Option<Box<crate::keys::Arrival>>,
     /// Damaged AACS units blanked so far (see [`blanked_units`](Self::blanked_units)).
     blanked: BlankTally,
+    /// The run that also hears of each blanked unit (`UnitBlanked`, `Stats`).
+    ctx: Option<crate::ctx::Ctx>,
     /// Content-detected stage: `Some` until the first read reaches the verdict.
     detect: Option<Box<StageOptions>>,
     /// Loose BD-TS: a CPI-flagged unit that is clean TS is clear (its flag is stale).
@@ -67,8 +69,9 @@ pub(crate) struct StageOptions {
     /// Pass ciphertext through: never crack, decrypt or refuse.
     pub(crate) raw: bool,
     /// Held AACS keys for a loose BD-TS file.
-    pub(crate) keys: Option<crate::keys::ResolvedKeySet>,
-    pub(crate) halt: Option<crate::halt::Halt>,
+    pub(crate) keys: Option<crate::keys::KeyRing>,
+    /// The run: its halt ends the crack scan, its stats count blanked units.
+    pub(crate) ctx: crate::ctx::Ctx,
 }
 
 // Sectors per CSS crack-scan read (the mpg:// batch).
@@ -96,35 +99,94 @@ fn span_touches_content(content: Option<&[(u32, u32)]>, lba: u32, count: u16) ->
     content.is_none_or(|r| crate::decrypt::span_in_content_ranges(lba, count as u32, r))
 }
 
+/// What a [`DecryptingSectorSource`] decrypts with: the one input of its one constructor.
+///
+/// Built from [`DecryptKeys`] (CSS title keys, or none: clear or raw), from a
+/// [`KeyRing`](crate::keys::KeyRing)'s view (its per-unit map and on-arrival proof), or as
+/// the content-detected stage that reaches its verdict on the first read.
+pub struct Keying(KeyingKind);
+
+enum KeyingKind {
+    Keys(DecryptKeys),
+    Ring {
+        keys: DecryptKeys,
+        map: Arc<crate::decrypt::AacsKeyMap>,
+        arrival: Option<crate::keys::Arrival>,
+    },
+    Detect(Box<StageOptions>),
+}
+
+impl From<DecryptKeys> for Keying {
+    fn from(keys: DecryptKeys) -> Self {
+        Keying(KeyingKind::Keys(keys))
+    }
+}
+
+impl Keying {
+    /// A key ring's view: `keys` decrypts each unit with its `map` key, and `arrival`
+    /// proves the units of pieces the ring could not prove up front (KU §2.4).
+    pub(crate) fn ring(
+        keys: DecryptKeys,
+        map: Arc<crate::decrypt::AacsKeyMap>,
+        arrival: Option<crate::keys::Arrival>,
+    ) -> Self {
+        Keying(KeyingKind::Ring { keys, map, arrival })
+    }
+
+    /// The content-detected stage (every input but a disc, image or folder): the first read
+    /// classifies the head and resolves once (D3). A PS is cracked, a BD-TS read through
+    /// [`KeyRing::loose_file`](crate::keys::KeyRing::loose_file), else clear.
+    pub(crate) fn detect(opts: StageOptions) -> Self {
+        Keying(KeyingKind::Detect(Box::new(opts)))
+    }
+}
+
 impl<S: SectorSource> DecryptingSectorSource<S> {
-    /// Wrap `inner` with the given keys. AACS decrypts only through a key map, which
-    /// only a [`ResolvedKeySet`](crate::keys::ResolvedKeySet) reader installs; an AACS
-    /// source built here fails loud on its first encrypted unit.
-    pub fn new(inner: S, keys: DecryptKeys) -> Self {
-        Self {
+    /// Wrap `inner` as the decryption stage `keying` describes. AACS decrypts only through a
+    /// key ring's map; an AACS source built from bare [`DecryptKeys`] fails loud on its
+    /// first encrypted unit.
+    pub fn new(inner: S, keying: impl Into<Keying>) -> Self {
+        let mut s = Self {
             inner,
-            keys,
+            keys: DecryptKeys::None,
             unit_base: None,
             content_ranges: None,
             key_map: None,
             arrival: None,
             blanked: BlankTally(Arc::default()),
+            ctx: None,
             detect: None,
             stale_cpi: false,
             watch_css: false,
             refused: false,
+        };
+        match keying.into().0 {
+            KeyingKind::Keys(keys) => s.keys = keys,
+            KeyingKind::Ring { keys, map, arrival } => {
+                s.keys = keys;
+                s.key_map = Some(map);
+                s.arrival = arrival.map(Box::new);
+            }
+            KeyingKind::Detect(opts) => {
+                #[cfg(test)]
+                super::stage::STAGES.with(|n| n.set(n.get() + 1));
+                s.observe(&opts.ctx);
+                s.detect = Some(opts);
+            }
         }
+        s
     }
 
-    /// The content-detected stage (every input but a disc, image or folder): the first read
-    /// classifies the head and resolves once (D3). A PS is cracked, a BD-TS read through
-    /// [`ResolvedKeySet::loose_file`](crate::keys::ResolvedKeySet::loose_file), else clear.
-    pub(crate) fn detecting(inner: S, opts: StageOptions) -> Self {
-        #[cfg(test)]
-        super::stage::STAGES.with(|n| n.set(n.get() + 1));
-        let mut s = Self::new(inner, DecryptKeys::None);
-        s.detect = Some(Box::new(opts));
-        s
+    // A test's own map on an already-built reader (the tests outside `keys`).
+    #[cfg(test)]
+    pub(crate) fn keyed_for_test(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
+        self.key_map = Some(map);
+        self
+    }
+
+    /// Report each blanked unit to `ctx` too: an `UnitBlanked` event and its loss counter.
+    pub(crate) fn observe(&mut self, ctx: &crate::ctx::Ctx) {
+        self.ctx = Some(ctx.clone());
     }
 
     // Reach the verdict and install what it needs. On `Err` the stage stays undecided.
@@ -143,7 +205,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                         start_lba: 0,
                         sector_count: cap,
                     }];
-                    let halt = opts.halt.as_ref();
+                    let halt = Some(&opts.ctx.halt);
                     let cracked =
                         crate::css::crack_title_key(&mut self.inner, &whole, CRACK_BATCH, halt);
                     self.keys = match cracked {
@@ -160,7 +222,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                 self.watch_css = !self.keys.is_encrypted();
             }
             Kind::BdTs if !opts.raw => {
-                let set = crate::keys::ResolvedKeySet::loose_file(opts.keys.as_ref(), cap);
+                let set = crate::keys::KeyRing::loose_file(opts.keys.as_ref(), cap);
                 self.keys = set.decrypt_keys();
                 self.key_map = Some(set.key_map());
                 self.arrival = set.arrival(set.title_stop()).map(Box::new);
@@ -172,35 +234,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         }
         self.detect = None;
         Ok(())
-    }
-
-    /// Install the key set's on-arrival proof (KU §2.4): an encrypted unit of a piece
-    /// `resolve` left unproven is decrypted with a held key proven on it here.
-    pub(crate) fn with_arrival(mut self, arrival: crate::keys::Arrival) -> Self {
-        self.arrival = Some(Box::new(arrival));
-        self
-    }
-
-    /// `&mut` counterpart of [`with_arrival`](Self::with_arrival).
-    pub(crate) fn set_arrival(&mut self, arrival: crate::keys::Arrival) {
-        self.arrival = Some(Box::new(arrival));
-    }
-
-    /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap): the caller
-    /// resolved one key per CPS unit / segment up front, so every aligned unit is
-    /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check.
-    /// AACS-only; a CSS / clear disc ignores it.
-    pub(crate) fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
-        self.key_map = Some(map);
-        self
-    }
-
-    /// `&mut` counterpart of [`with_key_map`](Self::with_key_map): install the
-    /// proactive map on an already-constructed source (the inline live-drive
-    /// [`DiscStream`](crate::mux::DiscStream) builds the decorator first, then
-    /// installs the map via its own `with_key_map`).
-    pub(crate) fn set_key_map(&mut self, map: Arc<crate::decrypt::AacsKeyMap>) {
-        self.key_map = Some(map);
     }
 
     /// Restrict decrypt to every stream file's extents (e.g.
@@ -346,7 +379,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             (self.arrival.as_deref(), &self.keys)
         {
             let blanked = arrival.process(&mut self.inner, lba, &mut buf[..n], unit_keys)?;
-            self.count_blanked(blanked);
+            self.count_blanked(lba, blanked);
         }
 
         // Proactive map path (storm-free mux): keys were resolved per unit up front,
@@ -360,7 +393,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                 &map,
                 content_ref,
             )?;
-            self.count_blanked(blanked);
+            self.count_blanked(lba, blanked);
             return Ok(n);
         }
 
@@ -462,13 +495,20 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         let end = lba as u64 + buf.len().div_ceil(crate::consts::SECTOR_BYTES) as u64;
         let at_end = cap != 0 && end >= cap as u64;
         let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered, at_end);
-        self.count_blanked(n);
+        self.count_blanked(lba, n);
     }
 
-    fn count_blanked(&self, n: usize) {
+    fn count_blanked(&self, lba: u32, n: usize) {
         self.blanked
             .0
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if let (Some(ctx), 1..) = (&self.ctx, n) {
+            ctx.stats.add_blanked(n as u64);
+            ctx.emit(crate::event::Event::UnitBlanked {
+                lba: u64::from(lba),
+                units: n as u64,
+            });
+        }
     }
 }
 
@@ -525,9 +565,9 @@ mod tests {
         let opts = StageOptions {
             raw: false,
             keys: None,
-            halt: None,
+            ctx: Default::default(),
         };
-        let mut stage = DecryptingSectorSource::detecting(src, opts);
+        let mut stage = DecryptingSectorSource::new(src, Keying::detect(opts));
         let scans = crate::css::CRACK_SCANS.with(|n| n.get());
         let mut buf = vec![0u8; 2048];
         for _ in 0..2 {
@@ -837,7 +877,9 @@ mod tests {
         let inner = ArgRecorder {
             calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let pf = crate::sector::PrefetchedSectorSource::new(inner, ext, 3, None).unwrap();
+        let pf =
+            crate::sector::PrefetchedSectorSource::new(inner, ext, 3, &crate::ctx::Ctx::default())
+                .unwrap();
         let d = DecryptingSectorSource::new(pf, DecryptKeys::None);
         assert!(!d.random_access());
         let d = DecryptingSectorSource::new(FuaProbe { fua: vec![] }, DecryptKeys::None);
@@ -1068,7 +1110,7 @@ mod tests {
             u32::MAX,
             0,
         )]));
-        let mut dec = DecryptingSectorSource::new(src, keys).with_key_map(map);
+        let mut dec = DecryptingSectorSource::new(src, Keying::ring(keys, map, None));
         dec.set_unit_base(0);
         let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let n = dec.read_sectors(0, 3, &mut buf, false).unwrap();
@@ -1095,7 +1137,7 @@ mod tests {
             unit_keys: vec![(0, key)],
             format: crate::disc::ContentFormat::BdTs,
         };
-        let mut dec = DecryptingSectorSource::new(src, keys); // no with_key_map
+        let mut dec = DecryptingSectorSource::new(src, keys); // no key map
         dec.set_unit_base(0);
         let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let err = dec
@@ -1124,8 +1166,7 @@ mod tests {
         )]));
         // Content covers a DIFFERENT extent (LBA 300..303); LBA 0 is outside it.
         let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(300u32, 3u32)].into_boxed_slice());
-        let mut dec = DecryptingSectorSource::new(src, keys)
-            .with_key_map(map)
+        let mut dec = DecryptingSectorSource::new(src, Keying::ring(keys, map, None))
             .with_content_ranges(ranges);
         let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let n = dec.read_sectors(0, 3, &mut buf, false).unwrap();
@@ -1148,8 +1189,7 @@ mod tests {
         };
         let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(300, 303, 0)]));
         let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(300u32, 3u32)].into_boxed_slice());
-        let mut dec = DecryptingSectorSource::new(src, keys)
-            .with_key_map(map)
+        let mut dec = DecryptingSectorSource::new(src, Keying::ring(keys, map, None))
             .with_content_ranges(ranges);
         let mut buf = vec![0u8; 2048];
         // LBA 1 is misaligned AND outside content → passes through, no DecryptFailed.
@@ -1188,8 +1228,10 @@ mod tests {
             u32::MAX,
             0,
         )]));
-        let mut dec =
-            DecryptingSectorSource::new(CountingSource(reads.clone()), keys).with_key_map(map);
+        let mut dec = DecryptingSectorSource::new(
+            CountingSource(reads.clone()),
+            Keying::ring(keys, map, None),
+        );
         dec.set_unit_base(0);
         let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let err = dec
@@ -1242,8 +1284,7 @@ mod tests {
             FILE_LBA + 6,
             0,
         )]));
-        DecryptingSectorSource::new(MisalignedFile(data), keys)
-            .with_key_map(map)
+        DecryptingSectorSource::new(MisalignedFile(data), Keying::ring(keys, map, None))
             .with_content_ranges(Arc::from(vec![(FILE_LBA, 6u32)]))
     }
 
@@ -1315,7 +1356,8 @@ mod tests {
         let map = Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
             FILE_LBA, end, 0,
         )]));
-        let mut dec = DecryptingSectorSource::new(MisalignedFile(data), keys).with_key_map(map);
+        let mut dec =
+            DecryptingSectorSource::new(MisalignedFile(data), Keying::ring(keys, map, None));
         dec.set_unit_base(FILE_LBA);
         dec
     }
@@ -1432,8 +1474,10 @@ mod tests {
             0,
             crate::decrypt::Phase::Even,
         )]);
-        let mut dec =
-            DecryptingSectorSource::new(MisalignedFile(data), keys).with_key_map(Arc::new(map));
+        let mut dec = DecryptingSectorSource::new(
+            MisalignedFile(data),
+            Keying::ring(keys, Arc::new(map), None),
+        );
         dec.set_unit_base(FILE_LBA);
         dec
     }

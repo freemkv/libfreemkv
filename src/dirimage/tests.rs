@@ -13,7 +13,7 @@ use crate::udf;
 use std::io::Write;
 
 /// A scratch directory that removes itself.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
@@ -34,7 +34,7 @@ impl Scratch {
         ));
         p
     }
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
     fn file(&self, rel: &str, bytes: &[u8]) {
@@ -623,7 +623,7 @@ pub(crate) fn minimal_clpi(source_packets: u32) -> Vec<u8> {
 
 // A BD folder that enumerates a title, so the AACS content probe has an extent to sample;
 // `scrambled` sets the CPI bits and withholds TS sync.
-fn playable_bdmv(tag: &str, scrambled: bool) -> Scratch {
+pub(crate) fn playable_bdmv(tag: &str, scrambled: bool) -> Scratch {
     let s = Scratch::new(tag);
     let packets = 4096u32;
     let mut m2ts = vec![0x5Au8; packets as usize * 192];
@@ -675,19 +675,18 @@ fn an_aacs_directory_over_clear_content_is_treated_as_decrypted() {
     assert!(disc.aacs_error.is_none(), "and no key is demanded");
 }
 
-/// The other verdict: a folder whose content units really are flagged and
-/// scrambled is a raw encrypted copy, which `dir://` does not support. It must
-/// be a typed error, not a rip that emits garbage.
+/// The other verdict: a folder whose content units really are flagged and scrambled is
+/// a raw encrypted copy. It keeps its AACS verdict, so it is keyed and decrypted like an
+/// image of the same disc (every input passes the one decryption stage).
 #[test]
-fn an_aacs_folder_with_scrambled_content_is_rejected() {
+fn an_aacs_folder_with_scrambled_content_scans_encrypted() {
     let s = playable_bdmv("aacsenc", true);
     s.file("AACS/Unit_Key_RO.inf", &[0u8; 64]);
     s.file("AACS/MKB_RO.inf", &[0u8; 64]);
-    let err = match crate::session::scan_dir(s.path(), crate::disc::ScanOptions::default()) {
-        Ok(_) => panic!("a scrambled folder must not scan clean"),
-        Err(e) => e,
-    };
-    assert_eq!(err.code(), crate::error::E_DIR_IMAGE_ENCRYPTED);
+    let (disc, _reader) =
+        crate::session::scan_dir(s.path(), crate::disc::ScanOptions::default()).unwrap();
+    assert!(disc.encrypted, "scrambled content keeps the AACS verdict");
+    assert!(disc.aacs.is_some());
 }
 
 // ── The OTHER door: `dir://` through the PES input path ─────────────────────
@@ -722,8 +721,12 @@ fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
 
     // Door 2 — the PES input path the CLI actually rips through.
     let url = format!("dir://{}", s.path().display());
-    let stream = crate::input(&url, &crate::InputOptions::default())
-        .expect("dir:// input must open a clear folder, exactly as scan_dir does");
+    let stream = crate::input(
+        &url,
+        &crate::InputOptions::default(),
+        &crate::ctx::Ctx::default(),
+    )
+    .expect("dir:// input must open a clear folder, exactly as scan_dir does");
     assert_eq!(
         stream.info().extents,
         scanned_extents,
@@ -732,23 +735,50 @@ fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
     drop(stream);
 }
 
-// The other verdict, same door: a truly scrambled folder is refused with the TYPED code, not
-// muxed into garbage. Load-bearing half.
+// HP3: the `Url` arm reports read progress like every other arm (it used to pass no events).
 #[test]
-fn a_scrambled_folder_is_refused_through_the_dir_url_door_too() {
+fn a_dir_url_mux_reports_read_progress_to_the_ctx() {
+    let _serial = crate::sector::prefetched::holder_test_lock();
+    let s = playable_bdmv("direvents", false);
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen = read.clone();
+    let ctx =
+        crate::Ctx::default().with_events(std::sync::Arc::new(move |e: &crate::Event<'_>| {
+            if let crate::Event::BytesRead { bytes, .. } = *e {
+                seen.store(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    let url = format!("dir://{}", s.path().display());
+    // The fixture's TS carries no PES, so the drain refuses as NoStreams after reading it all.
+    let _ = crate::mux_url(&url, None, "null://", &crate::MuxOptions::default(), &ctx);
+    assert_eq!(
+        read.load(std::sync::atomic::Ordering::Relaxed),
+        4096 * 192,
+        "every byte of the title's extent was reported read"
+    );
+}
+
+// The other verdict, same door: a truly scrambled folder with no key is refused before any
+// output with the standard no-key code (E7022), never muxed as ciphertext.
+#[test]
+fn a_scrambled_folder_with_no_key_is_refused_through_the_dir_url_door() {
     let s = playable_bdmv("dirdoorenc", true);
     s.file("AACS/Unit_Key_RO.inf", &[0u8; 64]);
     s.file("AACS/MKB_RO.inf", &[0u8; 64]);
 
     let url = format!("dir://{}", s.path().display());
-    let err = match crate::input(&url, &crate::InputOptions::default()) {
+    let err = match crate::input(
+        &url,
+        &crate::InputOptions::default(),
+        &crate::ctx::Ctx::default(),
+    ) {
         Ok(_) => panic!("a scrambled folder must not open as a PES source"),
         Err(e) => e,
     };
     assert_eq!(
         crate::error::error_code(&err),
-        Some(crate::error::E_DIR_IMAGE_ENCRYPTED),
-        "expected the typed dir-source-encrypted code, got: {err}"
+        Some(crate::error::E_NO_DISC_KEY),
+        "expected the no-key code, got: {err}"
     );
 }
 

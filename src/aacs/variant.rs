@@ -119,36 +119,6 @@ fn records_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
     Some(out)
 }
 
-/// Try each device key in turn (walk -> Kp -> Km) and return the first Media Key that
-/// verifies. On a variant MKB the walk cannot verify a Kp, so a covering-but-wrong key
-/// must not stop the search. Errs with the first correction/structural error, else the last
-/// plain miss, or `ProcessingKeyUnavailable`.
-pub(crate) fn derive_media_key_from_device_keys(
-    records: &[MkbRecord],
-    device_keys: &[DeviceKey],
-) -> Result<[u8; 16], MediaKeyVariantError> {
-    let mut last = MediaKeyVariantError::ProcessingKeyUnavailable;
-    let mut notable: Option<MediaKeyVariantError> = None;
-    for dk in device_keys {
-        let Some(pkm) = walk_processing_key(records, std::slice::from_ref(dk)) else {
-            continue;
-        };
-        match derive_media_key_variant(records, &pkm.kp) {
-            Ok(km) => return Ok(km),
-            Err(
-                e @ (MediaKeyVariantError::SoftCorrectionRequired
-                | MediaKeyVariantError::OnlineChallengeRequired
-                | MediaKeyVariantError::MkbIncomplete
-                | MediaKeyVariantError::VariantsTableUnavailable),
-            ) => {
-                notable.get_or_insert(e);
-            }
-            Err(e) => last = e,
-        }
-    }
-    Err(notable.unwrap_or(last))
-}
-
 /// Walk an MKB and return the first `(Kp, uv, cvalue)` that
 /// `device_keys` covers. Returns `None` if no DK walks any uv.
 ///
@@ -1694,7 +1664,6 @@ mod tests {
 
     /// A two-slot variant MKB whose SECOND slot is opened by a device key.
     struct PlantedWalk {
-        mkb: Vec<u8>,
         records: Vec<MkbRecord>,
         /// The device key that covers slot 1 with zero descent.
         dk: DeviceKey,
@@ -1802,7 +1771,6 @@ mod tests {
 
         PlantedWalk {
             records: walk_mkb(&mkb),
-            mkb,
             dk: DeviceKey {
                 key: dkey,
                 node: NODE,
@@ -1859,62 +1827,6 @@ mod tests {
             Ok(p.km),
             "the walked Processing Key must derive the planted Media Key"
         );
-    }
-
-    /// A covering-but-wrong device key ahead of the right one must not hide the Media Key.
-    #[test]
-    fn device_key_search_continues_past_a_covering_wrong_key() {
-        let p = plant_walk_variant_mkb();
-        let mut wrong = p.dk.clone();
-        wrong.key[0] ^= 0xFF;
-        assert!(walk_processing_key(&p.records, std::slice::from_ref(&wrong)).is_some());
-        assert_eq!(
-            derive_media_key_from_device_keys(&p.records, &[wrong.clone(), p.dk.clone()]),
-            Ok(p.km)
-        );
-        assert!(derive_media_key_from_device_keys(&p.records, &[wrong]).is_err());
-        assert_eq!(
-            derive_media_key_from_device_keys(&p.records, &[]),
-            Err(MediaKeyVariantError::ProcessingKeyUnavailable)
-        );
-    }
-
-    /// The resolver must keep searching past a covering-but-wrong key that sorts first.
-    #[test]
-    fn resolve_keys_v21_finds_the_right_key_behind_a_covering_wrong_one() {
-        use crate::aacs::provider::{KeyProvider, SuppliedKey};
-        use crate::aacs::resolve::{ResolveContext, resolve_keys_v21};
-
-        let p = plant_walk_variant_mkb();
-        let mut wrong = p.dk.clone();
-        wrong.key[0] = 0x00;
-        // `Providers::device_keys` sorts by key bytes: the wrong key must come first.
-        assert!(wrong.key < p.dk.key, "fixture: wrong key sorts first");
-        assert!(walk_processing_key(&p.records, std::slice::from_ref(&wrong)).is_some());
-
-        let mut uk_ro = vec![0u8; 256];
-        uk_ro[3] = 0x60;
-        uk_ro[16] = 1;
-        uk_ro[17] = 1;
-        uk_ro[0x60 + 1] = 1;
-        let keys = SuppliedKey {
-            device_keys: vec![p.dk.clone(), wrong],
-            processing_keys: Vec::new(),
-            media_keys: Vec::new(),
-            disc_entry: None,
-        };
-        let providers: &[&dyn KeyProvider] = &[&keys];
-        let vid = [0x22u8; 16];
-        let r = resolve_keys_v21(&ResolveContext {
-            unit_key_ro: &uk_ro,
-            content_cert: None,
-            volume_id: &vid,
-            providers,
-            mkb: Some(&p.mkb),
-        })
-        .expect("the right key behind a covering wrong one must resolve");
-        assert_eq!(r.key_source, 1);
-        assert_eq!(r.vuk, Some(crate::aacs::derive::derive_vuk(&p.km, &vid)));
     }
 
     /// The `[C]` §3.2.4 subset-difference gate must reject a device key on

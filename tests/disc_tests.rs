@@ -412,7 +412,7 @@ fn first_batch_sectors(sector_count: u32, batch_sectors: u16) -> usize {
             sector_count,
         }],
         batch_sectors,
-        None,
+        &libfreemkv::Ctx::default(),
     )
     .expect("prefetch producer spawns");
     let mut buf = vec![0u8; batch_sectors as usize * SECTOR_SIZE];
@@ -519,7 +519,7 @@ fn batch_count_zero_remaining() {
             sector_count: 0,
         }],
         60,
-        None,
+        &libfreemkv::Ctx::default(),
     )
     .expect("prefetch producer spawns");
     let mut buf = vec![0u8; 60 * SECTOR_SIZE];

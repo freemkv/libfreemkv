@@ -1,9 +1,6 @@
-//! Stream-based I/O pipeline. Two muxer families live here:
-//!
-//! 1. **Bidirectional PES streams** (`disc`, `mkv`, `m2ts`, `network`, `stdio`, `null`) implement the [`crate::pes::Stream`] interface: read a format → PES frames, or write PES frames → a format.
-//! 2. **Write-only sequential-sink muxers** (`fmp4`, `hevc`, `m2ts_mux`) consume PES frames and write a container to a `SequentialSink`; they do not implement the read loop below.
-//!
-//! The bidirectional family is driven like this:
+//! The PES half of the pipeline: inputs implement [`crate::pes::PesSource`] (read a format →
+//! PES frames), outputs [`crate::pes::PesSink`] (write PES frames → a format). Every input
+//! scheme opens through [`open_source`] / [`input`], every output through [`output`].
 //!
 //! ```text
 //! let mut input = input("iso://Disc.iso", &opts)?;
@@ -15,14 +12,15 @@
 //! output.finish()?;
 //! ```
 //!
-//! For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy` instead.
+//! A whole-disc copy (`iso://`, `dir://`) is a block chain: see [`crate::io::open_block_sink`].
 
 // Public modules — types here are intentionally part of the consumable API.
-pub mod disc;
 pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
 pub mod select;
+mod selected;
+pub mod source;
 
 // Internal-only modules (referenced only via `crate::mux::…`; not public API).
 // `#[allow(dead_code)]`: narrowing `pub`→`pub(crate)` surfaces helpers only
@@ -50,16 +48,8 @@ pub(crate) mod m2ts;
 pub mod meta;
 pub(crate) mod meta_sink;
 
-// ── Sequential-sink muxers ── write-only PES → `SequentialSink`. `pub(crate)`+
-// `allow(dead_code)`: `fmp4` is a STUB (pub would lock a half-built type into
-// v1.0); `m2ts_mux`/`hevc` are sink-split scaffolding (production: `tsmux`/`mkv`).
 pub(crate) mod fit;
-#[allow(dead_code)]
-pub(crate) mod fmp4;
-#[allow(dead_code)]
 pub(crate) mod hevc;
-#[allow(dead_code)]
-pub(crate) mod m2ts_mux;
 pub(crate) mod mkv;
 pub(crate) mod mkvstream;
 pub(crate) mod mp4;
@@ -83,14 +73,14 @@ pub(crate) mod videomap;
 // `demux://`/`fvi://` sinks are built internally by `output()`; not public API.
 // The provenance types ARE public: `output()` takes a `SourceInfo` so an `fvi://`
 // destination records the INPUT it was built from (§6.2), not the file written.
-pub use disc::DiscStream;
-pub use driver::{MuxEvents, MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
+pub use driver::{MuxOptions, MuxOutcome, mux_url, mux_with_keys};
 pub use fit::{FitReport, SkipReason, fit_report};
 pub use m2ts::M2tsStream;
 pub use mkvstream::{
     MkvProbe, MkvProbeTrack, MkvStream, MkvTrackKind, parse_freemkv_version, probe_mkv,
     probe_mkv_with_cues,
 };
+pub use source::{ScannedTitle, Source, open_source};
 pub use videomap::{Medium, SourceInfo};
 // `Mp4Sink` is public so a caller driving the sink can ask `final_report()` what
 // the finished file contains — the pre-mux `mp4_fit_report` is only a prediction,
@@ -100,7 +90,7 @@ pub use mpg::MpgSink;
 pub use network::{NetworkStream, is_blocked_ip};
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
-pub use resolve::{InputOptions, StreamUrl, disc_root_of, input, output, parse_url};
+pub use resolve::{InputOptions, SinkCaps, StreamUrl, disc_root_of, input, output, parse_url};
 pub use stdio::StdioStream;
 
 use std::io::{Seek, Write};

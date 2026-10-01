@@ -5,7 +5,7 @@
 //! halt-aware primitive ([`Halt::wait`], [`Halt::recv_timeout`], [`Halt::send_timeout`],
 //! [`join_within`]) that re-checks the token at least every [`WAIT_SLICE`].
 //!
-//! Timeouts are stall-only (HR1): [`StallTimer`] fires only when a [`Progress`]
+//! Timeouts are stall-only (HR1): [`StallTimer`] fires only when a [`Liveness`]
 //! counter has not moved for its window, never on total elapsed time. Every
 //! duration is a parameter at its use site, so tests run in milliseconds.
 
@@ -338,10 +338,10 @@ impl<T> TimedSend for crossbeam_channel::Sender<T> {
 /// advanced, an item applied, or a response received. Cheap to clone; clones share
 /// the count. [`busy`](Self::busy) only marks in-flight work: it never bumps.
 #[derive(Clone, Debug, Default)]
-pub struct Progress(Arc<ProgressInner>);
+pub struct Liveness(Arc<LivenessInner>);
 
 #[derive(Debug, Default)]
-struct ProgressInner {
+struct LivenessInner {
     count: AtomicU64,
     // Live `BusyGuard`s, and every guard start or end (so a poll sees a span that
     // began and ended between two polls).
@@ -349,7 +349,7 @@ struct ProgressInner {
     busy_epoch: AtomicU64,
 }
 
-impl Progress {
+impl Liveness {
     pub fn new() -> Self {
         Self::default()
     }
@@ -387,10 +387,10 @@ impl Progress {
     }
 }
 
-/// Holds a [`Progress`] busy until dropped.
+/// Holds a [`Liveness`] busy until dropped.
 #[must_use = "the span is busy only while the guard lives"]
 #[derive(Debug)]
-pub struct BusyGuard(Progress);
+pub struct BusyGuard(Liveness);
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
@@ -410,10 +410,10 @@ pub enum Stall {
     Expired,
 }
 
-/// The HR1 primitive: fires only when a [`Progress`] has not moved for `window`.
+/// The HR1 primitive: fires only when a [`Liveness`] has not moved for `window`.
 ///
 /// A plain timer ([`new`](Self::new)) counts all time without progress and ignores
-/// [`Progress::busy`]; every HR1 failure timer is plain. [`idle_only`](Self::idle_only)
+/// [`Liveness::busy`]; every HR1 failure timer is plain. [`idle_only`](Self::idle_only)
 /// is the opt-in T29 mode: time is not counted while the progress is busy.
 #[derive(Debug)]
 pub struct StallTimer {
@@ -434,7 +434,7 @@ struct IdleClock {
 
 impl StallTimer {
     /// A plain stall timer: every HR1 failure timer is one of these.
-    pub fn new(window: Duration, p: &Progress) -> Self {
+    pub fn new(window: Duration, p: &Liveness) -> Self {
         Self {
             window,
             last: p.get(),
@@ -443,9 +443,9 @@ impl StallTimer {
         }
     }
 
-    /// Opt-in (v5.5, ST3-5): paused while `p` is [`busy`](Progress::busy). The T29
+    /// Opt-in (v5.5, ST3-5): paused while `p` is [`busy`](Liveness::busy). The T29
     /// launch probe is its only user.
-    pub fn idle_only(window: Duration, p: &Progress) -> Self {
+    pub fn idle_only(window: Duration, p: &Liveness) -> Self {
         let mut t = Self::new(window, p);
         t.idle = Some(IdleClock {
             idle: Duration::ZERO,
@@ -456,7 +456,7 @@ impl StallTimer {
     }
 
     /// Sample `p`. Any movement re-arms the whole window.
-    pub fn poll(&mut self, p: &Progress) -> Stall {
+    pub fn poll(&mut self, p: &Liveness) -> Stall {
         let now = Instant::now();
         let count = p.get();
         if count != self.last {

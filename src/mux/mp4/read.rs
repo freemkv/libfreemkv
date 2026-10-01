@@ -14,7 +14,7 @@ use crate::disc::{
     Resolution, SampleRate, Stream as DiscStream, VideoStream,
 };
 use crate::labels::LabelPurpose;
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSource};
 use std::io::{self, Read, Seek, SeekFrom};
 
 const NS: i128 = 1_000_000_000;
@@ -328,7 +328,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
     }
 }
 
-impl<R: Read + Seek + Send> Stream for Mp4Reader<R> {
+impl<R: Read + Seek + Send> PesSource for Mp4Reader<R> {
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
         let Some(s) = self.samples.get(self.cursor) else {
             return Ok(None);
@@ -354,14 +354,6 @@ impl<R: Read + Seek + Send> Stream for Mp4Reader<R> {
             source: None,
             coding: None,
         }))
-    }
-
-    fn write(&mut self, _frame: &PesFrame) -> io::Result<()> {
-        Err(crate::error::Error::StreamReadOnly.into())
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        Ok(())
     }
 
     fn info(&self) -> &DiscTitle {
@@ -1216,6 +1208,7 @@ fn parse_stss(b: &[u8]) -> std::collections::HashSet<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pes::PesSink as _;
 
     // `Read + Seek` backed by a small crafted prefix + endless zeros, reporting `len` bytes on
     // `seek(End)` — exercises MAX_ALLOC_BYTES-scale reads without a real multi-GiB source
@@ -1363,7 +1356,7 @@ mod tests {
             Codec, DiscTitle, FrameRate, HdrFormat, Resolution, Stream as DiscStreamE, VideoStream,
         };
         use crate::mux::mp4::Mp4Sink;
-        use crate::pes::{PesFrame, Stream as _};
+        use crate::pes::PesFrame;
         use std::io::Cursor;
 
         // The MP4 writer requires a primary video track, so build an HEVC one.
@@ -1415,7 +1408,6 @@ mod tests {
     #[test]
     fn stream_read_allows_a_sample_of_exactly_max_alloc_bytes() {
         use crate::disc::DiscTitle;
-        use crate::pes::Stream as _;
 
         let mut rd = Mp4Reader {
             file: FakeBigReader {
@@ -1447,7 +1439,6 @@ mod tests {
     #[test]
     fn stream_read_rejects_a_sample_one_byte_over_max_alloc_bytes() {
         use crate::disc::DiscTitle;
-        use crate::pes::Stream as _;
 
         let mut rd = Mp4Reader {
             file: FakeBigReader {
@@ -1476,38 +1467,6 @@ mod tests {
         );
     }
 
-    /// `Mp4Reader` is a read-only source — `mp4://` is never a mux destination
-    /// — so `write` must always fail, never silently succeed and drop the
-    /// frame on the floor.
-    #[test]
-    fn stream_write_is_always_rejected() {
-        use crate::disc::DiscTitle;
-        use crate::pes::Stream as _;
-        use std::io::Cursor;
-
-        let mut rd = Mp4Reader {
-            file: Cursor::new(Vec::<u8>::new()),
-            file_len: 0,
-            title: DiscTitle::empty(),
-            samples: Vec::new(),
-            cursor: 0,
-        };
-        let frame = PesFrame {
-            discard_padding_ns: 0,
-            track: 0,
-            pts: 0,
-            keyframe: true,
-            data: vec![1, 2, 3],
-            duration_ns: None,
-            source: None,
-            coding: None,
-        };
-        assert!(
-            rd.write(&frame).is_err(),
-            "Mp4Reader::write must always return an error"
-        );
-    }
-
     #[test]
     // Underscores mark BITFIELD boundaries in the bitstream header being built
     // (e.g. 5-bit then 3-bit field), not thousands-style digit groups.
@@ -1520,7 +1479,7 @@ mod tests {
             SampleRate, Stream as DiscStreamE, VideoStream,
         };
         use crate::mux::mp4::Mp4Sink;
-        use crate::pes::{PesFrame, Stream as _};
+        use crate::pes::PesFrame;
         use std::io::Cursor;
 
         let mut t = DiscTitle::empty();
@@ -1625,7 +1584,9 @@ mod tests {
         // `mp4://` reads the same file through the decryption stage: a clear container
         // (Opaque) is handed through untouched, seeks included.
         let url = format!("mp4://{}", path.display());
-        let mut staged = crate::mux::resolve::input(&url, &Default::default()).unwrap();
+        let mut staged =
+            crate::mux::resolve::input(&url, &Default::default(), &crate::ctx::Ctx::default())
+                .unwrap();
         let mut again = Vec::new();
         while let Some(f) = staged.read().unwrap() {
             again.push((f.track, f.data.len(), f.keyframe, f.data));
@@ -1709,7 +1670,7 @@ mod tests {
             Codec, DiscTitle, FrameRate, HdrFormat, Resolution, Stream as DiscStreamE, VideoStream,
         };
         use crate::mux::mp4::Mp4Sink;
-        use crate::pes::{PesFrame, Stream as _};
+        use crate::pes::PesFrame;
         use std::io::Cursor;
 
         const FRAME_NS: i64 = 40_000_000; // 25 fps, exact
@@ -1796,7 +1757,7 @@ mod tests {
             Codec, DiscTitle, FrameRate, HdrFormat, Resolution, Stream as DiscStreamE, VideoStream,
         };
         use crate::mux::mp4::Mp4Sink;
-        use crate::pes::{PesFrame, Stream as _};
+        use crate::pes::PesFrame;
         use std::io::Cursor;
 
         const FRAME_NS: i64 = 40_000_000; // 25 fps, exact
@@ -1883,7 +1844,7 @@ mod tests {
             Resolution, SampleRate, Stream as DiscStreamE, VideoStream,
         };
         use crate::mux::mp4::Mp4Sink;
-        use crate::pes::{PesFrame, Stream as _};
+        use crate::pes::PesFrame;
         use std::io::Cursor;
 
         let mut t = DiscTitle::empty();
@@ -2610,7 +2571,7 @@ mod tests {
     fn a_96k_dts_hd_track_round_trips_its_rate() {
         use crate::disc::{AudioChannels, AudioStream, Codec, DiscTitle, LabelPurpose};
         use crate::mux::mp4::Mp4Sink;
-        use crate::pes::{PesFrame, Stream as _};
+        use crate::pes::PesFrame;
         use std::io::Cursor;
 
         let mut t = DiscTitle::empty();

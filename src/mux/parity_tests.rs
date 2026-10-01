@@ -2,16 +2,14 @@
 //! every sink driven through `mux_with_keys`, over the synthetic BD clip. Pinned as output
 //! hashes, loss counters and refusal codes (see [`Golden`]); cells are `parity_*`.
 
-use super::driver::{MuxOptions, MuxOutcome, MuxSource, NoopEvents, mux_with_keys};
+use super::driver::{MuxOptions, MuxOutcome};
 use super::resolve::{InputOptions, input};
 use super::select::{PidFilter, StreamSelection};
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::consts::BD_SOURCE_PACKET_BYTES as PKT;
-use crate::halt::Halt;
-use crate::keys::ResolvedKeySet;
+use crate::keys::KeyRing;
 use crate::test_util::{CLIP_AUDIO_PIDS, Golden, synthetic_bd_clip};
 use std::path::Path;
-use std::sync::Arc;
 
 // A synthetic test key, not key material from any disc.
 const KEY: [u8; 16] = [0x5A; 16];
@@ -121,16 +119,18 @@ fn sinks(
             "null" => "null://".to_string(),
             s => format!("{s}://{}", out.join(dest_name(s)).display()),
         };
-        let r = mux_with_keys(
-            MuxSource::Url {
-                url: &url,
-                opts: iopts.clone(),
-            },
-            None,
+        let m = MuxOptions {
+            title_index: iopts.title_index.unwrap_or(0),
+            raw: iopts.raw,
+            selection: iopts.selection.clone(),
+            ..mopts.clone()
+        };
+        let r = crate::mux::mux_url(
+            &url,
+            iopts.keys.as_ref(),
             &dest,
-            mopts,
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &m,
+            &crate::ctx::Ctx::default(),
         );
         record_run(g, sink, &r);
         record_tree(g, sink, &out);
@@ -215,16 +215,12 @@ fn parity_sinks_from_mkv_mpg_and_fmkv_sources() {
     std::fs::write(&src, &clip).unwrap();
     for (scheme, name) in [("mkv", "a.mkv"), ("mpg", "a.mpg"), ("m2ts", "a.fmkv.m2ts")] {
         let p = dir.path().join(name);
-        mux_with_keys(
-            MuxSource::Url {
-                url: &format!("m2ts://{}", src.display()),
-                opts: Default::default(),
-            },
+        crate::mux::mux_url(
+            &format!("m2ts://{}", src.display()),
             None,
             &format!("{scheme}://{}", p.display()),
             &MuxOptions::default(),
-            &Halt::new(),
-            Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
         .unwrap();
         let bytes = std::fs::read(&p).unwrap();
@@ -237,7 +233,12 @@ fn parity_sinks_from_mkv_mpg_and_fmkv_sources() {
             &Default::default(),
         );
         let tag = format!("{scheme}-src");
-        let mut s = input(&format!("{scheme}://{}", p.display()), &Default::default()).unwrap();
+        let mut s = input(
+            &format!("{scheme}://{}", p.display()),
+            &Default::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .unwrap();
         record_frames(&mut g, &tag, s.as_mut());
     }
     g.check();
@@ -245,7 +246,7 @@ fn parity_sinks_from_mkv_mpg_and_fmkv_sources() {
 
 // The frames a source yields (count, a digest over track/pts/keyframe/data), its stream
 // list, and the stream's loss counters; or the code that refused it first.
-fn record_frames(g: &mut Golden, tag: &str, s: &mut dyn crate::pes::Stream) {
+fn record_frames(g: &mut Golden, tag: &str, s: &mut dyn crate::pes::PesSource) {
     let streams: Vec<String> = s
         .info()
         .streams
@@ -293,7 +294,11 @@ fn record_source(g: &mut Golden, tag: &str, scheme: &str, bytes: &[u8], opts: &I
     // Keep the temp file until the stream is drained (the sector pipeline reads lazily).
     let p = std::env::temp_dir().join(format!("fmkv-parity-{tag}-{}", std::process::id()));
     std::fs::write(&p, bytes).unwrap();
-    let r = input(&format!("{scheme}://{}", p.display()), opts);
+    let r = input(
+        &format!("{scheme}://{}", p.display()),
+        opts,
+        &crate::ctx::Ctx::default(),
+    );
     match r {
         Ok(mut s) => {
             let mut digest = Vec::new();
@@ -329,7 +334,7 @@ fn record_source(g: &mut Golden, tag: &str, scheme: &str, bytes: &[u8], opts: &I
 
 fn keyed(keys: &[[u8; 16]]) -> InputOptions {
     InputOptions {
-        keys: Some(ResolvedKeySet::held_for_test(keys)),
+        keys: Some(KeyRing::held_for_test(keys)),
         ..Default::default()
     }
 }
@@ -391,16 +396,12 @@ pub(crate) fn clear_mpg() -> Vec<u8> {
     let src = dir.path().join("c.m2ts");
     std::fs::write(&src, &clip).unwrap();
     let dst = dir.path().join("c.mpg");
-    mux_with_keys(
-        MuxSource::Url {
-            url: &format!("m2ts://{}", src.display()),
-            opts: Default::default(),
-        },
+    crate::mux::mux_url(
+        &format!("m2ts://{}", src.display()),
         None,
         &format!("mpg://{}", dst.display()),
         &MuxOptions::default(),
-        &Halt::new(),
-        Arc::new(NoopEvents),
+        &crate::ctx::Ctx::default(),
     )
     .unwrap();
     std::fs::read(&dst).unwrap()

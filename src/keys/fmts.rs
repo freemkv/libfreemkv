@@ -9,7 +9,6 @@ use crate::disc::{ContentFormat, Extent};
 use crate::error::{Error, Result};
 use crate::halt::Halt;
 use crate::sector::SectorSource;
-use crate::whole_disc::UNIT;
 use std::collections::HashMap;
 use std::io;
 
@@ -107,11 +106,8 @@ fn read_unit(
 ) -> Option<Vec<u8>> {
     let byte = seg.start_spn as u64 * SPN_BYTES + index as u64 * ALIGNED_UNIT_LEN as u64;
     let lba = clip_byte_to_lba(clip, byte)?;
-    let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
-    match reader.read_sectors(lba, UNIT as u16, &mut unit, false) {
-        Ok(n) if n == ALIGNED_UNIT_LEN => Some(unit),
-        _ => None,
-    }
+    // Any failed read is a fault here, a Stop included: the anchor goes Pending.
+    super::evidence::read_unit(reader, lba).ok().flatten()
 }
 
 /// Sends one anchor batch to the sources: `Ok(None)` for an empty answer.

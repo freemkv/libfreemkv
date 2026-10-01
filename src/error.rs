@@ -171,7 +171,6 @@ pub const E_PES_FRAME_TOO_LARGE: u16 = 9005;
 pub const E_PES_INVALID_MAGIC: u16 = 9006;
 pub const E_ISO_TOO_LARGE: u16 = 9007;
 pub const E_NO_METADATA: u16 = 9008;
-pub const E_DISC_URL_NOT_DIRECT: u16 = 9009;
 /// `--raw` given with a `dir://` destination (raw + decrypted-tree is
 /// a contradiction; raw bytes go to `iso://`).
 pub const E_DIR_RAW_REJECTED: u16 = 9019;
@@ -211,10 +210,6 @@ pub const E_DIR_IMAGE_SSIF_UNSUPPORTED: u16 = 9061;
 /// the end of the file that must precede it. Carries the offending file's disc
 /// path. Also raised for an IFO too short to resolve its placement offsets.
 pub const E_DIR_IMAGE_PLACEMENT: u16 = 9062;
-/// A `dir://` SOURCE folder still carries live AACS-encrypted content: it has
-/// an `AACS/` directory AND the sampled content units are genuinely scrambled.
-/// `dir://` sources are decrypted-folder only.
-pub const E_DIR_IMAGE_ENCRYPTED: u16 = 9063;
 /// A `dir://` SOURCE folder holds no disc structure the image synthesizer
 /// understands (no `BDMV/`, no `VIDEO_TS/`).
 pub const E_DIR_IMAGE_UNSUPPORTED_TREE: u16 = 9064;
@@ -327,8 +322,6 @@ pub const E_REMUX_STAGING_INVALID: u16 = 9079;
 pub const E_STAGED_COPY_SIZE_MISMATCH: u16 = 9080;
 /// A remux worker thread (`op`: "copy", "verify") was lost before it reported.
 pub const E_WORKER_LOST: u16 = 9081;
-/// A multipass rip was asked to decrypt: multipass recovers a raw whole-disc image.
-pub const E_MULTIPASS_REQUIRES_RAW: u16 = 9082;
 /// A requested audio/subtitle language tag resolves to no known language.
 pub const E_STREAM_LANGUAGE_UNKNOWN: u16 = 9083;
 /// A remux target already exists and replacing it was not requested.
@@ -778,10 +771,6 @@ pub enum Error {
         path: String,
     },
     NoMetadata,
-    /// `disc://` URLs aren't openable through `input()` — callers must use
-    /// `Drive::open() + Disc::scan() + DiscStream::new()` directly. This
-    /// is a structural API constraint, not a parse failure.
-    DiscUrlNotDirect,
     /// A non-empty `HEVCDecoderConfigurationRecord` (hvcC) was supplied to
     /// a muxer but failed to parse into any VPS/SPS/PPS NAL — emitting the
     /// stream without parameter sets would yield an undecodable result.
@@ -893,8 +882,6 @@ pub enum Error {
     DirImagePlacement {
         path: String,
     },
-    /// A `dir://` SOURCE folder still carries live AACS-encrypted content.
-    DirImageEncrypted,
     /// A `dir://` SOURCE folder holds no recognized disc structure.
     DirImageUnsupportedTree,
     /// A file in a `dir://` SOURCE folder changed between plan and read.
@@ -974,8 +961,6 @@ pub enum Error {
     WorkerLost {
         op: &'static str,
     },
-    /// See [`E_MULTIPASS_REQUIRES_RAW`].
-    MultipassRequiresRaw,
     /// `tag` is the caller's unresolvable language tag, verbatim.
     StreamLanguageUnknown {
         tag: String,
@@ -1121,7 +1106,6 @@ impl Error {
             Error::PesTrackTooLarge { .. } => E_PES_TRACK_TOO_LARGE,
             Error::IsoTooLarge { .. } => E_ISO_TOO_LARGE,
             Error::NoMetadata => E_NO_METADATA,
-            Error::DiscUrlNotDirect => E_DISC_URL_NOT_DIRECT,
             Error::HevcParamParse => E_HEVC_PARAM_PARSE,
             Error::MuxTrackRange { .. } => E_MUX_TRACK_RANGE,
             Error::Fmp4Unimplemented => E_FMP4_UNIMPLEMENTED,
@@ -1144,7 +1128,6 @@ impl Error {
             Error::DirWriteFailed { .. } => E_DIR_WRITE_FAILED,
             Error::DirImageSsifUnsupported => E_DIR_IMAGE_SSIF_UNSUPPORTED,
             Error::DirImagePlacement { .. } => E_DIR_IMAGE_PLACEMENT,
-            Error::DirImageEncrypted => E_DIR_IMAGE_ENCRYPTED,
             Error::DirImageUnsupportedTree => E_DIR_IMAGE_UNSUPPORTED_TREE,
             Error::DirNameTooLong { .. } => E_DIR_NAME_TOO_LONG,
             Error::DirImageFanout { .. } => E_DIR_IMAGE_FANOUT,
@@ -1162,7 +1145,6 @@ impl Error {
             Error::RemuxStagingInvalid => E_REMUX_STAGING_INVALID,
             Error::StagedCopySizeMismatch { .. } => E_STAGED_COPY_SIZE_MISMATCH,
             Error::WorkerLost { .. } => E_WORKER_LOST,
-            Error::MultipassRequiresRaw => E_MULTIPASS_REQUIRES_RAW,
             Error::StreamLanguageUnknown { .. } => E_STREAM_LANGUAGE_UNKNOWN,
             Error::RemuxTargetExists { .. } => E_REMUX_TARGET_EXISTS,
             Error::MuxBatchSectorsZero => E_MUX_BATCH_SECTORS_ZERO,
@@ -1426,9 +1408,6 @@ impl From<Error> for std::io::Error {
             8000..=8999 => std::io::ErrorKind::Other,
             9000..=9001 => std::io::ErrorKind::Unsupported,
             9002..=9008 => std::io::ErrorKind::InvalidInput,
-            // 9009 DiscUrlNotDirect: structurally unsupported entry point,
-            // not a parse failure — caller used the wrong API.
-            9009 => std::io::ErrorKind::Unsupported,
             // 9010 HevcParamParse: malformed hvcC payload.
             9010 => std::io::ErrorKind::InvalidData,
             // 9011 MuxTrackRange: caller passed a bad track index.
@@ -1497,7 +1476,6 @@ impl From<Error> for std::io::Error {
             // tree, too large, name too long, fan-out overflow) — input properties.
             E_DIR_IMAGE_SSIF_UNSUPPORTED
             | E_DIR_IMAGE_PLACEMENT
-            | E_DIR_IMAGE_ENCRYPTED
             | E_DIR_IMAGE_UNSUPPORTED_TREE
             | E_DIR_IMAGE_TOO_LARGE
             | E_DIR_NAME_TOO_LONG
@@ -1509,10 +1487,9 @@ impl From<Error> for std::io::Error {
             E_TIMED_OUT => std::io::ErrorKind::TimedOut,
             // Remux/engine codes keep the kinds their io::Error texts carried.
             E_REMUX_VERIFY_FAILED | E_STAGED_COPY_SIZE_MISMATCH => std::io::ErrorKind::InvalidData,
-            E_REMUX_STAGING_INVALID
-            | E_MULTIPASS_REQUIRES_RAW
-            | E_STREAM_LANGUAGE_UNKNOWN
-            | E_MUX_BATCH_SECTORS_ZERO => std::io::ErrorKind::InvalidInput,
+            E_REMUX_STAGING_INVALID | E_STREAM_LANGUAGE_UNKNOWN | E_MUX_BATCH_SECTORS_ZERO => {
+                std::io::ErrorKind::InvalidInput
+            }
             E_REMUX_TARGET_EXISTS => std::io::ErrorKind::AlreadyExists,
             _ => std::io::ErrorKind::Other,
         };
@@ -1830,7 +1807,6 @@ mod tests {
             }
             .code(),
             Error::MapfileInvalid { kind: "hex" }.code(),
-            Error::DiscUrlNotDirect.code(),
             Error::ExtentNotUnitAligned.code(),
             Error::M2tsPacketMalformed.code(),
             Error::DiscCapacityMalformed.code(),
@@ -1847,7 +1823,6 @@ mod tests {
             Error::DirWriteFailed { errno: Some(28) }.code(),
             Error::DirImageSsifUnsupported.code(),
             Error::DirImagePlacement { path: "x".into() }.code(),
-            Error::DirImageEncrypted.code(),
             Error::DirImageUnsupportedTree.code(),
             Error::DirImageFileChanged { path: "x".into() }.code(),
             Error::DirImageTooLarge.code(),
@@ -1893,7 +1868,6 @@ mod tests {
             Error::RemuxStagingInvalid.code(),
             Error::StagedCopySizeMismatch { have: 0, want: 1 }.code(),
             Error::WorkerLost { op: "copy" }.code(),
-            Error::MultipassRequiresRaw.code(),
             Error::StreamLanguageUnknown { tag: "x".into() }.code(),
             Error::RemuxTargetExists { path: "x".into() }.code(),
         ];
@@ -1954,7 +1928,6 @@ mod tests {
                 },
                 E_IMAGE_ENDS_BEFORE_READ,
             ),
-            (Error::DiscUrlNotDirect, E_DISC_URL_NOT_DIRECT),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             // Both CSS no-key verdicts: numeric-only Display, no English.
             (Error::CssKeyMissing, E_CSS_KEY_MISSING),
@@ -2105,8 +2078,6 @@ mod tests {
             mapped(Error::MapfileInvalid { kind: "hex" }),
             ErrorKind::InvalidData
         );
-        // 9009 special-cased to Unsupported
-        assert_eq!(mapped(Error::DiscUrlNotDirect), ErrorKind::Unsupported);
         // 9021 special-cased to InvalidData
         assert_eq!(mapped(Error::M2tsPacketMalformed), ErrorKind::InvalidData);
         // 9047 DiscCapacityMalformed → InvalidData
@@ -2321,7 +2292,6 @@ mod tests {
             (Error::StreamWriteOnly, E_STREAM_WRITE_ONLY),
             (Error::PesInvalidMagic, E_PES_INVALID_MAGIC),
             (Error::NoMetadata, E_NO_METADATA),
-            (Error::DiscUrlNotDirect, E_DISC_URL_NOT_DIRECT),
             (Error::HevcParamParse, E_HEVC_PARAM_PARSE),
             (Error::Fmp4Unimplemented, E_FMP4_UNIMPLEMENTED),
             (Error::DemuxThreadPanicked, E_DEMUX_THREAD_PANICKED),
@@ -2542,12 +2512,6 @@ mod tests {
                 9081,
                 "E9081: verify",
                 ErrorKind::Other,
-            ),
-            (
-                Error::MultipassRequiresRaw,
-                9082,
-                "E9082",
-                ErrorKind::InvalidInput,
             ),
             (
                 Error::StreamLanguageUnknown {

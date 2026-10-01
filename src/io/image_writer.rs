@@ -8,11 +8,11 @@
 //! is for everything else.
 
 use crate::consts::SECTOR_BYTES;
+use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::halt::Halt;
+use crate::event::Event;
+use crate::io::block_sink::{BlockSink, Finish, IsoSink};
 use crate::sector::SectorSource;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// Sectors per read/write batch. 4 MiB — large enough that per-call overhead
@@ -24,8 +24,8 @@ const BATCH_SECTORS: u32 = 2048;
 ///
 /// Reads 2048-sector batches from LBA 0 in order; decrypts nothing. Batches are not whole
 /// 3-sector AACS units: wrap an AACS decrypting source to read on the unit grid, or it fails
-/// the first misaligned batch ([`Error::DecryptFailed`]). `on_progress` gets cumulative bytes
-/// per batch (must not block); `halt` keeps the partial file, any other failure removes it.
+/// the first misaligned batch ([`Error::DecryptFailed`]). Each batch emits a cumulative
+/// `BytesWritten`; a Stop keeps the partial file, any other failure removes it.
 ///
 /// # Errors
 ///
@@ -35,15 +35,13 @@ pub fn write_image(
     reader: &mut dyn SectorSource,
     dest: &Path,
     total_sectors: u32,
-    halt: &Halt,
-    on_progress: impl FnMut(u64),
+    ctx: &Ctx,
 ) -> Result<u64> {
     write_image_with(
         reader,
         dest,
         total_sectors,
-        halt,
-        on_progress,
+        ctx,
         crate::io::fsync::dir_checked,
     )
 }
@@ -53,24 +51,18 @@ fn write_image_with(
     reader: &mut dyn SectorSource,
     dest: &Path,
     total_sectors: u32,
-    halt: &Halt,
-    mut on_progress: impl FnMut(u64),
+    ctx: &Ctx,
     sync_dir: fn(&Path) -> std::io::Result<()>,
 ) -> Result<u64> {
     if total_sectors == 0 {
         return Err(Error::EmptyImage);
     }
-
-    let file = File::create(dest).map_err(|source| Error::IoError { source })?;
-    let r = copy_out(
-        reader,
-        file,
-        dest,
-        total_sectors,
-        halt,
-        &mut on_progress,
-        sync_dir,
-    );
+    let sink = IsoSink::create(dest)?;
+    #[cfg(test)]
+    let sink = sink.with_dir_sync(sync_dir);
+    #[cfg(not(test))]
+    let _ = sync_dir;
+    let r = copy_out(reader, Box::new(sink), total_sectors, ctx);
     // A failed copy leaves no truncated image at the final name; a halt keeps its partial.
     if matches!(&r, Err(e) if !matches!(e, Error::Halted)) {
         let _ = std::fs::remove_file(dest);
@@ -78,59 +70,54 @@ fn write_image_with(
     r
 }
 
+// Sectors `0..total_sectors` of `reader`, in order, into `sink`.
 fn copy_out(
     reader: &mut dyn SectorSource,
-    file: File,
-    dest: &Path,
+    mut sink: Box<dyn BlockSink>,
     total_sectors: u32,
-    halt: &Halt,
-    on_progress: &mut impl FnMut(u64),
-    sync_dir: fn(&Path) -> std::io::Result<()>,
+    ctx: &Ctx,
 ) -> Result<u64> {
-    let mut out = BufWriter::with_capacity(BATCH_SECTORS as usize * SECTOR_BYTES, file);
-
+    let total = u64::from(total_sectors) * SECTOR_BYTES as u64;
     let mut buf = vec![0u8; BATCH_SECTORS as usize * SECTOR_BYTES];
     let mut written: u64 = 0;
     let mut lba: u32 = 0;
 
     while lba < total_sectors {
-        if halt.is_cancelled() {
+        if ctx.halt.is_cancelled() {
+            let _ = sink.finish(Finish::Incomplete);
             return Err(Error::Halted);
         }
         let count = BATCH_SECTORS.min(total_sectors - lba);
         let want = count as usize * SECTOR_BYTES;
         // `recovery = false`: a file-backed source ignores the flag, and a
         // retry loop over a local file would only re-read the same bytes.
-        let got = reader.read_sectors(lba, count as u16, &mut buf[..want], false)?;
+        let got = match reader.read_sectors(lba, count as u16, &mut buf[..want], false) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = sink.finish(Finish::Incomplete);
+                return Err(e);
+            }
+        };
         if got != want {
+            let _ = sink.finish(Finish::Incomplete);
             return Err(Error::ShortImageRead {
                 lba,
                 expected: want as u32,
                 got: got as u32,
             });
         }
-        out.write_all(&buf[..want])
-            .map_err(|source| Error::IoError { source })?;
+        if let Err(e) = sink.write_at(u64::from(lba), &buf[..want]) {
+            let _ = sink.finish(Finish::Incomplete);
+            return Err(e);
+        }
         written += want as u64;
         lba += count;
-        on_progress(written);
+        ctx.emit(Event::BytesWritten {
+            bytes: written,
+            total,
+        });
     }
-
-    // flush() only pushes bytes into the kernel via write(2), no durability promise —
-    // a crash or yanked volume could leave a truncated file reported as complete.
-    // `into_inner` (not `flush`) also surfaces buffered-write errors, not silently drop them.
-    let file = out.into_inner().map_err(|e| Error::IoError {
-        source: e.into_error(),
-    })?;
-    file.sync_all()
-        .map_err(|source| Error::IoError { source })?;
-    // The file was just created: its directory entry needs its own fsync.
-    let dir = match dest.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    sync_dir(dir).map_err(|source| Error::IoError { source })?;
-    Ok(written)
+    sink.finish(Finish::Complete)
 }
 
 #[cfg(test)]
@@ -227,7 +214,7 @@ mod tests {
             .with_content_ranges(Arc::from(vec![(3000u32, 30u32)]));
         dec.set_unit_base(0); // file grid (3000 % 3 == 0): fails loud past the no-base gate
         let dest = tmp("aacs-batch");
-        let r = write_image(&mut dec, &dest, 3100, &Halt::new(), |_| {});
+        let r = write_image(&mut dec, &dest, 3100, &Ctx::default());
         let _ = std::fs::remove_file(&dest);
         let e = r.expect_err("batch 2048 is off the unit grid and touches content");
         assert_eq!(e.code(), Error::DecryptFailed.code());
@@ -248,7 +235,7 @@ mod tests {
             sectors: 4096,
             short_after: Some(2048),
         };
-        let r = write_image(&mut src, &dest, 4096, &Halt::new(), |_| {});
+        let r = write_image(&mut src, &dest, 4096, &Ctx::default());
         assert!(matches!(r, Err(Error::ShortImageRead { .. })), "{r:?}");
         assert!(!dest.exists(), "truncated image left at the final name");
     }
@@ -265,8 +252,7 @@ mod tests {
             &mut src,
             &td.path().join("x.iso"),
             4,
-            &Halt::new(),
-            |_| {},
+            &Ctx::default(),
             |_| Err(std::io::Error::from(std::io::ErrorKind::Other)),
         );
         assert!(matches!(res, Err(Error::IoError { .. })), "{res:?}");
@@ -281,7 +267,7 @@ mod tests {
             sectors: 5000,
             short_after: None,
         };
-        let n = write_image(&mut src, &dest, 5000, &Halt::new(), |_| {}).expect("write");
+        let n = write_image(&mut src, &dest, 5000, &Ctx::default()).expect("write");
         assert_eq!(n, 5000 * SECTOR_BYTES as u64);
 
         let data = std::fs::read(&dest).expect("read back");
@@ -313,7 +299,7 @@ mod tests {
             sectors: 2049,
             short_after: None,
         };
-        let n = write_image(&mut src, &dest, 2049, &Halt::new(), |_| {}).expect("write");
+        let n = write_image(&mut src, &dest, 2049, &Ctx::default()).expect("write");
         assert_eq!(n, 2049 * SECTOR_BYTES as u64);
         assert_eq!(
             std::fs::metadata(&dest).expect("stat").len(),
@@ -331,7 +317,7 @@ mod tests {
             sectors: 4096,
             short_after: Some(2048),
         };
-        let err = write_image(&mut src, &dest, 4096, &Halt::new(), |_| {}).expect_err("must fail");
+        let err = write_image(&mut src, &dest, 4096, &Ctx::default()).expect_err("must fail");
         assert!(
             matches!(err, Error::ShortImageRead { lba: 2048, .. }),
             "got {err:?}"
@@ -348,9 +334,10 @@ mod tests {
             sectors: 100_000,
             short_after: None,
         };
-        let halt = Halt::new();
+        let halt = crate::halt::Halt::new();
         halt.cancel();
-        let err = write_image(&mut src, &dest, 100_000, &halt, |_| {}).expect_err("must halt");
+        let err =
+            write_image(&mut src, &dest, 100_000, &Ctx::new(halt.clone())).expect_err("must halt");
         assert!(matches!(err, Error::Halted), "got {err:?}");
         let _ = std::fs::remove_file(&dest);
     }
@@ -365,13 +352,21 @@ mod tests {
             sectors: 5000,
             short_after: None,
         };
-        let mut seen: Vec<u64> = Vec::new();
-        let n = write_image(&mut src, &dest, 5000, &Halt::new(), |b| seen.push(b)).expect("write");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let rec = seen.clone();
+        let ctx = Ctx::default().with_events(std::sync::Arc::new(move |e: &Event<'_>| {
+            if let Event::BytesWritten { bytes, total } = *e {
+                assert_eq!(total, 5000 * SECTOR_BYTES as u64);
+                rec.lock().unwrap().push(bytes);
+            }
+        }));
+        let n = write_image(&mut src, &dest, 5000, &ctx).expect("write");
+        let seen = seen.lock().unwrap().clone();
         assert!(
             seen.windows(2).all(|w| w[1] > w[0]),
             "not monotonic: {seen:?}"
         );
-        assert_eq!(*seen.last().expect("at least one callback"), n);
+        assert_eq!(*seen.last().expect("at least one event"), n);
         let _ = std::fs::remove_file(&dest);
     }
 
@@ -384,7 +379,7 @@ mod tests {
             sectors: 0,
             short_after: None,
         };
-        let err = write_image(&mut src, &dest, 0, &Halt::new(), |_| {}).expect_err("must fail");
+        let err = write_image(&mut src, &dest, 0, &Ctx::default()).expect_err("must fail");
         assert!(matches!(err, Error::EmptyImage), "got {err:?}");
         // The destination must not have been created — a failed run leaves no
         // stub for a later run to mistake for output.

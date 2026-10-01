@@ -4,17 +4,15 @@
 //! sequential writes. `FileSectorSource` is the read-side dual,
 //! implementing [`crate::sector::SectorSource`] for ISO reads.
 //! `Pipeline` + `Sink` overlaps reads with writes via a bounded
-//! channel + consumer thread. `byte_prefetcher` is the read-ahead
-//! producer feeding the mux pipeline for `io::Read`-backed sources.
+//! channel + consumer thread.
 
 pub mod artifact_lock;
+pub mod block_sink;
 pub(crate) mod bounded;
-pub mod byte_prefetcher;
 pub mod file_sector_source;
 mod flush;
 pub mod fsync;
 pub mod image_writer;
-pub mod sink;
 mod writeback;
 mod writeback_file;
 
@@ -22,9 +20,14 @@ mod writeback_file;
 pub(crate) mod platform_macos;
 
 pub mod pipeline;
+pub mod tree_sink;
 
 pub use artifact_lock::ArtifactLock;
+pub use block_sink::{
+    BlockSink, IsoSink, NullBlockSink, is_null_device, null_device, open_block_sink,
+};
 pub use flush::{FlushProgress, durable_sync_file};
+pub use tree_sink::{TreeSink, open_tree_sink};
 pub use writeback_file::WritebackFile;
 
 pub use pipeline::{

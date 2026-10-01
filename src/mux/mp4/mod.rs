@@ -9,7 +9,7 @@
 //! can't carry are **excluded, never silently dropped** — [`fit_report`] says why.
 
 use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSink};
 use std::io::{self, Seek, SeekFrom, Write};
 
 mod audio;
@@ -435,11 +435,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
     }
 }
 
-impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
-
+impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
         if self.finished {
             return Err(crate::error::Error::StreamClosed.into());
@@ -2290,22 +2286,6 @@ mod tests {
     }
 
     // ── Stream::read is write-only ──────────────────────────────────────────
-
-    #[test]
-    fn mp4_sink_read_is_unsupported() {
-        let t = title(
-            vec![hevc_video(), audio(Codec::Ac3, "eng")],
-            vec![Some(vec![1, 2, 3]), None],
-        );
-        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
-        let err = s.read().unwrap_err();
-        assert!(
-            err.to_string()
-                .starts_with(&format!("E{}", crate::error::E_STREAM_WRITE_ONLY)),
-            "an Mp4Sink is write-only; read() must report that, not silently return Ok(None); \
-             got {err}"
-        );
-    }
 
     #[test]
     fn write_after_finish_is_rejected() {

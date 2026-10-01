@@ -4,7 +4,7 @@
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
 use crate::consts::BD_SOURCE_PACKET_BYTES as PKT;
 use crate::error::{E_CSS_KEY_MISSING, E_MP4_INVALID, E_NO_DISC_KEY, E_NO_STREAMS, error_code};
-use crate::keys::ResolvedKeySet;
+use crate::keys::KeyRing;
 use crate::mux::resolve::{InputOptions, input};
 use crate::pes::PesFrame;
 
@@ -90,7 +90,11 @@ fn read(scheme: &str, bytes: &[u8], opts: &InputOptions) -> std::io::Result<(Vec
     let p = path(scheme);
     std::fs::write(&p, bytes).unwrap();
     let got = (|| {
-        let mut s = input(&format!("{scheme}://{}", p.display()), opts)?;
+        let mut s = input(
+            &format!("{scheme}://{}", p.display()),
+            opts,
+            &crate::ctx::Ctx::default(),
+        )?;
         let mut frames = Vec::new();
         while let Some(f) = s.read()? {
             frames.push(f);
@@ -103,7 +107,7 @@ fn read(scheme: &str, bytes: &[u8], opts: &InputOptions) -> std::io::Result<(Vec
 
 fn keyed() -> InputOptions {
     InputOptions {
-        keys: Some(ResolvedKeySet::held_for_test(&[[0x11; 16], KEY])),
+        keys: Some(KeyRing::held_for_test(&[[0x11; 16], KEY])),
         ..Default::default()
     }
 }
@@ -135,7 +139,11 @@ fn an_aacs_m2ts_is_decrypted_with_the_held_keys() {
 fn an_aacs_m2ts_with_no_keys_is_refused_before_any_frame() {
     let p = path("nokeys");
     std::fs::write(&p, flagged(&clear_clip(), Some(&KEY))).unwrap();
-    let opened = input(&format!("m2ts://{}", p.display()), &Default::default());
+    let opened = input(
+        &format!("m2ts://{}", p.display()),
+        &Default::default(),
+        &crate::ctx::Ctx::default(),
+    );
     let _ = std::fs::remove_file(&p);
     assert_eq!(
         opened.err().and_then(|e| error_code(&e)),
@@ -147,7 +155,7 @@ fn an_aacs_m2ts_with_no_keys_is_refused_before_any_frame() {
 fn an_aacs_m2ts_no_held_key_opens_is_refused() {
     let enc = flagged(&clear_clip(), Some(&KEY));
     let opts = InputOptions {
-        keys: Some(ResolvedKeySet::held_for_test(&[[0x22; 16]])),
+        keys: Some(KeyRing::held_for_test(&[[0x22; 16]])),
         ..Default::default()
     };
     let e = read("m2ts", &enc, &opts).unwrap_err();

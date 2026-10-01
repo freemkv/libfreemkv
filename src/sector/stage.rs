@@ -2,7 +2,7 @@
 //! transitional: the pipeline's chunk stream replaces the sector/byte split).
 //!
 //! Every `input()` source passes the stage. A sector source (`mpg://`, `m2ts://`) is wrapped
-//! by [`DecryptingSectorSource::detecting`](super::DecryptingSectorSource::detecting); a byte
+//! by the content-detected [`DecryptingSectorSource`](super::DecryptingSectorSource); a byte
 //! reader (`mkv://`, `mp4://`, `network://`, `stdio://`) by [`Stage`], which hands a clear
 //! container through untouched and refuses encrypted content it cannot decrypt. The verdict
 //! comes from the bytes alone ([`classify`]), never from the URL scheme.
@@ -284,6 +284,23 @@ impl<S: SectorSource> SectorBytes<S> {
             buf: Vec::new(),
             buf_start: 0,
         }
+    }
+}
+
+impl<S: SectorSource> SectorBytes<S> {
+    /// The stage back, after a head read: the bytes it holds past the read position (up to
+    /// the real length) and the sector its next refill would read.
+    pub(crate) fn into_rest(self) -> (S, Vec<u8>, u32) {
+        let buf_end = self.buf_start + self.buf.len() as u64;
+        let held = self.pos.clamp(self.buf_start, buf_end)..buf_end.min(self.len);
+        let rest = match held.start < held.end {
+            true => self.buf
+                [(held.start - self.buf_start) as usize..(held.end - self.buf_start) as usize]
+                .to_vec(),
+            false => Vec::new(),
+        };
+        let next = (buf_end / SECTOR_BYTES as u64) as u32;
+        (self.src, rest, next)
     }
 }
 

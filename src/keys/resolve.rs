@@ -1,19 +1,19 @@
-//! [`ResolvedKeySet::resolve`] (KU §2.3): pieces, probes, sources, verdicts.
+//! [`KeyRing::acquire`] (KU §2.3): pieces, probes, sources, verdicts, over [`KeyEvidence`].
 
+use super::evidence::{Detector, KeyEvidence, Piece, Sample, Sampler, sorted_ranges};
 use super::{
-    ArrivalPiece, ForensicState, Inner, KeyResolution, KeyScope, ProofCache, ResolveKeysOptions,
-    ResolvedKeySet, overlaps,
+    AcquireOptions, ArrivalPiece, ForensicState, Inner, KeyResolution, KeyRing, KeyScope,
+    ProofCache, overlaps,
 };
-use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted, decrypt_unit, is_clean};
+use crate::aacs::content::{decrypt_unit, is_clean};
 use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace};
+use crate::ctx::Ctx;
 use crate::decrypt::{AacsKeyMap, Phase};
-use crate::disc::{ContentFormat, Disc, DiscFormat, Extent};
+use crate::disc::{ContentFormat, Extent};
 use crate::error::{Error, Result};
-use crate::halt::{Halt, Progress};
+use crate::halt::{Halt, Liveness};
 use crate::keysource::{DiscInputs, DiscInputsCtx, KeySource, MIN_SAMPLE_UNITS};
-use crate::sector::SectorSource;
 use crate::session::KeySourceFactory;
-use crate::whole_disc::{UNIT, UnitSpan, probe_units, subtract_ranges, unit_head};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,7 +35,7 @@ const MAX_POOL_KEYS: usize = 256;
 pub(crate) trait Clock {
     fn now(&self) -> Duration;
     /// Wait `d`, returning `Err(Halted)` as soon as `halt` is cancelled.
-    fn sleep(&self, d: Duration, halt: Option<&Halt>) -> Result<()>;
+    fn sleep(&self, d: Duration, halt: &Halt) -> Result<()>;
 }
 
 /// The wall clock; waits are halt-aware ([`Halt::wait`]).
@@ -51,14 +51,8 @@ impl Clock for RealClock {
     fn now(&self) -> Duration {
         self.0.elapsed()
     }
-    fn sleep(&self, d: Duration, halt: Option<&Halt>) -> Result<()> {
-        match halt {
-            Some(h) => h.wait(d),
-            None => {
-                std::thread::sleep(d);
-                Ok(())
-            }
-        }
+    fn sleep(&self, d: Duration, halt: &Halt) -> Result<()> {
+        halt.wait(d)
     }
 }
 
@@ -72,37 +66,32 @@ enum Verdict {
     Ask,
 }
 
-// One Clip AV stream file (or an uncovered title extent) in scope, with its probes.
-struct Piece {
-    spans: Vec<UnitSpan>,
-    titles: Vec<usize>,
-    rank: u64,
+// One piece in scope with its probes.
+struct Probed {
+    piece: Piece,
     units: u64,
     enc: Vec<Vec<u8>>,
     faults: usize,
     verdict: Verdict,
 }
 
-impl Piece {
+impl Probed {
+    fn new(piece: Piece) -> Self {
+        Probed {
+            piece,
+            units: 0,
+            enc: Vec::new(),
+            faults: 0,
+            verdict: Verdict::Ask,
+        }
+    }
+
     fn id(&self) -> u32 {
-        self.spans[0].0
+        self.piece.id()
     }
 
     fn ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.spans.iter().map(|&(s, n, _)| (s, s.saturating_add(n)))
-    }
-
-    // Unit heads on the piece's grid, as (first head, unit count) per span. A unit that
-    // would cross its span's end is not a unit of the piece (KS-7, Informative).
-    fn grid(&self) -> Vec<(u64, u64)> {
-        self.spans
-            .iter()
-            .map(|&(s, n, anchor)| {
-                let head = unit_head(s, anchor);
-                let end = s as u64 + n as u64;
-                (head, end.saturating_sub(head) / UNIT)
-            })
-            .collect()
+        self.piece.ranges()
     }
 }
 
@@ -117,9 +106,9 @@ enum Asked {
 
 // The state of one `resolve` run.
 struct Run<'a> {
-    halt: Option<&'a Halt>,
+    halt: &'a Halt,
     // The op's progress: busy around each source call (stop design §2.1 item 2).
-    progress: Option<&'a Progress>,
+    progress: Option<&'a Liveness>,
     clock: &'a dyn Clock,
     format: ContentFormat,
     sources: Vec<Box<dyn KeySource>>,
@@ -138,10 +127,7 @@ struct Run<'a> {
 
 impl Run<'_> {
     fn check_halt(&self) -> Result<()> {
-        match self.halt {
-            Some(h) => h.check(),
-            None => Ok(()),
-        }
+        self.halt.check()
     }
 
     // Add keys to the pool (deduplicated): the pool only grows during `resolve`.
@@ -173,7 +159,7 @@ impl Run<'_> {
         self.requests += 1;
         let mut inputs = self.inputs.clone();
         inputs.samples = samples.to_vec();
-        let ctx = DiscInputsCtx::new(&inputs).with_stop(self.halt, self.progress);
+        let ctx = DiscInputsCtx::new(&inputs).with_stop(Some(self.halt), self.progress);
         let start = self.clock.now();
         let mut wait = RETRY_FIRST;
         let mut attempted = false;
@@ -189,7 +175,7 @@ impl Run<'_> {
             let who = src.label().to_string();
             // Stop §2.1 item 2 (ST4-2): a source call (a keydb parse, a key-service call)
             // moves no CDB, so it is busy for the idle-only T29 probe.
-            let busy = self.progress.map(Progress::busy);
+            let busy = self.progress.map(Liveness::busy);
             let answer = if forensic {
                 src.get_fmts_indexes(&ctx).map(|k| (k, None))
             } else {
@@ -286,7 +272,7 @@ impl Run<'_> {
 
     // KU §2.3 step 9, rules 1 and 3–5, against the current pool. `Ask` means rule 2 applies:
     // an `Enc` probe no held key opens.
-    fn judge(&self, p: &Piece) -> Verdict {
+    fn judge(&self, p: &Probed) -> Verdict {
         if p.units == 0 {
             return Verdict::Clear;
         }
@@ -316,113 +302,10 @@ impl Run<'_> {
     }
 }
 
-fn sorted_ranges(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
-    v.sort_unstable();
-    let mut out: Vec<(u32, u32)> = Vec::with_capacity(v.len());
-    for (s, e) in v {
-        match out.last_mut() {
-            Some(last) if s <= last.1 => last.1 = last.1.max(e),
-            _ => out.push((s, e)),
-        }
-    }
-    out
-}
-
-// The pieces of `scope`: each content file the scope touches (on its own unit grid, KS-1),
-// minus sectors an earlier file claimed (an SSIF re-lists m2ts sectors), then title extents
-// no file covers (anchored at the extent start).
-fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) -> Vec<Piece> {
-    let title_ranges: Vec<(usize, u32, u32)> = sel
-        .iter()
-        .flat_map(|&t| {
-            disc.titles[t]
-                .extents
-                .iter()
-                .filter(|e| e.sector_count > 0)
-                .map(move |e| (t, e.start_lba, e.start_lba.saturating_add(e.sector_count)))
-        })
-        .collect();
-    let touches = |ranges: &[(u32, u32)]| -> Vec<usize> {
-        let mut t: Vec<usize> = title_ranges
-            .iter()
-            .filter(|&&(_, s, e)| overlaps(ranges, s, e))
-            .map(|&(t, _, _)| t)
-            .collect();
-        t.sort_unstable();
-        t.dedup();
-        t
-    };
-    let mut claimed: Vec<(u32, u32)> = Vec::new();
-    let mut out = Vec::new();
-    let push = |spans: Vec<UnitSpan>, out: &mut Vec<Piece>| {
-        let ranges: Vec<(u32, u32)> = spans
-            .iter()
-            .map(|&(s, n, _)| (s, s.saturating_add(n)))
-            .collect();
-        let titles = touches(&ranges);
-        let rank = titles
-            .iter()
-            .map(|&t| disc.titles[t].size_bytes)
-            .max()
-            .unwrap_or(0);
-        out.push(Piece {
-            spans,
-            titles,
-            rank,
-            units: 0,
-            enc: Vec::new(),
-            faults: 0,
-            verdict: Verdict::Ask,
-        });
-    };
-    for file in files {
-        let ends: Vec<(u32, u32)> = file
-            .iter()
-            .map(|&(s, n)| (s, s.saturating_add(n)))
-            .collect();
-        if !whole && touches(&ends).is_empty() {
-            continue;
-        }
-        let mut spans = Vec::new();
-        let mut off = 0u64;
-        for &(lba, n) in file {
-            let anchor = (lba as u64).saturating_sub(off % UNIT);
-            for (s, e) in subtract_ranges(&[(lba, n)], &claimed) {
-                spans.push((s, e - s, anchor));
-            }
-            off += n as u64;
-        }
-        claimed = sorted_ranges(claimed.into_iter().chain(ends).collect());
-        if !spans.is_empty() {
-            push(spans, &mut out);
-        }
-    }
-    for &(_, s, e) in &title_ranges {
-        let left = subtract_ranges(&[(s, e - s)], &claimed);
-        if left.is_empty() {
-            continue;
-        }
-        let spans = left.iter().map(|&(a, b)| (a, b - a, s as u64)).collect();
-        claimed = sorted_ranges(claimed.into_iter().chain(left).collect());
-        push(spans, &mut out);
-    }
-    out.sort_by_key(|p| p.id());
-    out
-}
-
-// A loose clip file's one piece, in the shape `pieces` builds for a disc: every aligned unit
-// of the file (KS-1) on its own grid from byte 0, title 0, proven on arrival.
-pub(crate) fn loose_file_piece(capacity: u32) -> super::ArrivalPiece {
-    let p = Piece {
-        spans: vec![(0, capacity, 0)],
-        titles: vec![0],
-        rank: 0,
-        units: 0,
-        enc: Vec::new(),
-        faults: 0,
-        verdict: Verdict::Lazy(None),
-    };
-    super::ArrivalPiece {
+// A loose clip file's one piece, proven on arrival.
+pub(crate) fn loose_file_piece(capacity: u32) -> ArrivalPiece {
+    let p = Piece::loose_file(capacity);
+    ArrivalPiece {
         id: p.id(),
         spans: p.spans,
         candidate: None,
@@ -432,152 +315,98 @@ pub(crate) fn loose_file_piece(capacity: u32) -> super::ArrivalPiece {
 
 // Each whole-disc piece's unit spans, for the unit-grid guards in `whole_disc_tests`.
 #[cfg(test)]
-pub(crate) fn whole_disc_pieces(disc: &Disc, files: &[Vec<(u32, u32)>]) -> Vec<Vec<UnitSpan>> {
+pub(crate) fn whole_disc_pieces(
+    disc: &crate::disc::Disc,
+    files: &[Vec<(u32, u32)>],
+) -> Vec<Vec<crate::whole_disc::UnitSpan>> {
     let sel: Vec<usize> = (0..disc.titles.len()).collect();
-    pieces(disc, files, &sel, true)
+    super::evidence::pieces(disc, files, &sel, true)
         .into_iter()
         .map(|p| p.spans)
         .collect()
 }
 
-fn in_segment(segments: &[(u32, u32)], lba: u32) -> bool {
-    let i = segments.partition_point(|s| s.0 <= lba);
-    i > 0 && lba < segments[i - 1].1
-}
-
 // KU §2.3 step 7: up to 32 units per piece on its grid, each `Enc`, `Clr` or `Fault`.
 // FMTS segment units are not base probes (KU §2.3 step 6).
 fn probe(
-    reader: &mut dyn SectorSource,
-    p: &mut Piece,
+    sampler: &mut Sampler,
+    p: &mut Probed,
     segments: &[(u32, u32)],
     format: ContentFormat,
-    halt: Option<&Halt>,
+    halt: &Halt,
 ) -> Result<()> {
-    let grid = p.grid();
-    p.units = grid.iter().map(|g| g.1).sum();
-    let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
-    for idx in probe_units(p.units) {
-        if halt.is_some_and(|h| h.is_cancelled()) {
-            return Err(Error::Halted);
-        }
-        let mut k = idx;
-        let Some(&(head, _)) = grid.iter().find(|g| {
-            let hit = k < g.1;
-            if !hit {
-                k -= g.1;
-            }
-            hit
-        }) else {
-            continue;
-        };
-        let Ok(lba) = u32::try_from(head + k * UNIT) else {
-            continue;
-        };
-        if in_segment(segments, lba) {
-            continue;
-        }
-        match reader.read_sectors(lba, UNIT as u16, &mut buf, false) {
-            Ok(n) if n == buf.len() => {
-                if aacs_unit_encrypted(&buf, format) {
-                    p.enc.push(buf.clone());
-                }
-            }
-            // A gone source or a Stop is not a soft fault: report it, not a missing key.
-            Err(e) if fatal_read(&e) => return Err(e),
-            _ => p.faults += 1,
+    let (units, samples) = sampler.probe(&p.piece, segments, format, halt)?;
+    p.units = units;
+    for s in samples {
+        match s {
+            Sample::Enc(u) => p.enc.push(u),
+            Sample::Clear => {}
+            Sample::Fault => p.faults += 1,
         }
     }
     Ok(())
 }
 
-fn fatal_read(e: &Error) -> bool {
-    matches!(e, Error::Halted)
-        || e.is_source_terminated()
-        || (e.is_scsi_transport_failure() && !matches!(e, Error::IoError { .. }))
-}
-
-fn missing_error(scope: &KeyScope, disc: &Disc) -> Error {
+fn missing_error(scope: &KeyScope, disc_hash: &str) -> Error {
     match scope {
         KeyScope::WholeDisc => Error::WholeDiscKeyMissing,
         _ => Error::NoDiscKey {
-            disc_hash: disc.aacs_disc_hash(),
+            disc_hash: crate::hex::strip_hex_prefix(disc_hash).to_string(),
         },
     }
 }
 
-/// The body of [`ResolvedKeySet::resolve`] with an injected clock.
-pub(crate) fn resolve(
-    disc: &Disc,
-    reader: &mut dyn SectorSource,
-    scope: KeyScope,
+/// The body of [`KeyRing::acquire`] with an injected clock.
+pub(crate) fn acquire(
+    ev: &KeyEvidence,
+    sampler: &mut Sampler,
     sources: &KeySourceFactory,
-    opts: ResolveKeysOptions,
+    opts: AcquireOptions,
+    ctx: &Ctx,
     clock: &dyn Clock,
 ) -> Result<KeyResolution> {
-    resolve_observed(disc, reader, scope, sources, opts, clock, None)
-}
-
-/// [`resolve`] reporting to the op's `progress` (stop design §2.1, T29).
-pub(crate) fn resolve_observed(
-    disc: &Disc,
-    reader: &mut dyn SectorSource,
-    scope: KeyScope,
-    sources: &KeySourceFactory,
-    opts: ResolveKeysOptions,
-    clock: &dyn Clock,
-    progress: Option<&Progress>,
-) -> Result<KeyResolution> {
-    let halt = opts.halt;
-    if let Some(h) = halt {
-        h.check()?;
-    }
+    let halt = &ctx.halt;
+    halt.check()?;
     // Step 1: not AACS, or nothing decrypted: no source call.
-    let (Some(aacs), false) = (disc.aacs.as_ref(), scope == KeyScope::None) else {
+    let (Some(aacs), false) = (ev.aacs.as_ref(), ev.scope == KeyScope::None) else {
         return Ok(KeyResolution {
-            keys: ResolvedKeySet::none(),
+            keys: KeyRing::none(),
             trace: ResolutionTrace::new(),
         });
     };
-    let sel: Vec<usize> = match &scope {
-        KeyScope::Titles(v) => {
-            if let Some(&bad) = v.iter().find(|&&t| t >= disc.titles.len()) {
-                return Err(Error::DiscTitleRange {
-                    index: bad,
-                    count: disc.titles.len(),
-                });
-            }
-            v.clone()
-        }
-        _ => (0..disc.titles.len()).collect(),
-    };
     // Step 3: KS-14 [BD] §3.9.3 "Num_of_CPS_Unit field (16 bits) indicates the number of CPS
     // Units on the disc" — the declared count; `None` (unparseable) fails closed.
-    let n_decl = disc.declared_cps_units();
-    let seed = opts.seed.filter(|s| s.is_aacs() && s.is_for(disc));
+    let n_decl = aacs.n_declared;
+    // KA9: evidence with no captured hash is still looked up by its title-key file.
+    let disc_hash = if ev.media.disc_hash.is_empty() && !aacs.unit_key_ro.is_empty() {
+        crate::aacs::inf::disc_hash_hex(&crate::aacs::inf::disc_hash(&aacs.unit_key_ro))
+    } else {
+        ev.media.disc_hash.clone()
+    };
+    let media = super::MediaId {
+        disc_hash: disc_hash.clone(),
+        ..ev.media.clone()
+    };
+    let seed = opts.seed.filter(|s| s.is_aacs() && s.is_for(&media));
     // Step 4: the VID, in memory only.
-    let vid = Some(aacs.volume_id)
-        .filter(|v| *v != [0u8; 16])
-        .or(opts.vid)
-        .or(seed.and_then(|s| s.0.vid));
-    let mut inputs = disc.inputs().unwrap_or_else(|| DiscInputs {
-        disc_hash: aacs.disc_hash.clone(),
-        volume_id: [0u8; 16],
+    let vid = aacs.vid.or(opts.vid).or(seed.and_then(|s| s.0.vid));
+    let inputs = DiscInputs {
+        disc_hash: disc_hash.clone(),
+        volume_id: vid.unwrap_or([0u8; 16]),
         version: aacs.version,
-        mkb: Vec::new(),
-        unit_key_ro: Vec::new(),
+        mkb: aacs.mkb.clone(),
+        unit_key_ro: aacs.unit_key_ro.clone(),
         samples: Vec::new(),
-        volume_label: None,
-    });
-    inputs.volume_id = vid.unwrap_or([0u8; 16]);
+        volume_label: aacs.volume_label.clone(),
+    };
     let built = sources();
     let n_src = built.len();
     let vid_consumer = built.iter().any(|s| s.uses_vid());
     let mut run = Run {
         halt,
-        progress,
+        progress: opts.liveness,
         clock,
-        format: disc.content_format,
+        format: ev.container,
         sources: built,
         dead: vec![false; n_src],
         inputs,
@@ -591,12 +420,11 @@ pub(crate) fn resolve_observed(
     if let Some(s) = seed {
         run.add_keys(&s.0.pool, "seed");
     }
-    let result = if disc.format == DiscFormat::HdDvd {
-        resolve_hddvd(disc, reader, &scope, &sel, n_decl, &mut run)
-    } else {
-        resolve_bd(disc, reader, &scope, &sel, n_decl, seed, &mut run)
+    let result = match ev.detector {
+        Detector::Unverified => resolve_hddvd(ev, sampler, &disc_hash, n_decl, &mut run),
+        Detector::Verified => resolve_bd(ev, sampler, &disc_hash, n_decl, seed, &mut run),
     };
-    // Every source is dropped here: nothing can ask after `resolve` (LK7).
+    // Every source is dropped here: nothing can ask after `acquire` (LK7).
     let trace = std::mem::take(&mut run.trace);
     drop(run.sources);
     if let Some(out) = opts.trace {
@@ -611,17 +439,15 @@ pub(crate) fn resolve_observed(
     }
     // The final check (Stop §6 ST-L3): a Stop during the last source call ends `Halted`,
     // never a refusal or a set.
-    if let Some(h) = halt {
-        h.check()?;
-    }
+    halt.check()?;
     let mut inner = result?;
-    inner.disc_hash = aacs.disc_hash.clone();
-    inner.capacity = disc.capacity_sectors;
-    inner.format = disc.format;
-    inner.content_format = disc.content_format;
+    inner.disc_hash = disc_hash;
+    inner.capacity = media.capacity;
+    inner.format = media.format;
+    inner.content_format = ev.container;
     inner.vid = vid;
     inner.n_decl = n_decl;
-    inner.scope = scope;
+    inner.scope = ev.scope.clone();
     inner.requests = run.requests;
     tracing::info!(
         target: "freemkv::keys",
@@ -634,7 +460,7 @@ pub(crate) fn resolve_observed(
         "keys: resolved up front"
     );
     Ok(KeyResolution {
-        keys: ResolvedKeySet(Arc::new(inner)),
+        keys: KeyRing(Arc::new(inner)),
         trace,
     })
 }
@@ -651,30 +477,20 @@ fn aacs_inner(run: &Run) -> Inner {
 // KU §2.6: HD DVD is best effort. Not probed (its encrypted flag is unverified, KS-27):
 // a single declared key is applied to every piece; several, or none parseable, refuse.
 fn resolve_hddvd(
-    disc: &Disc,
-    reader: &mut dyn SectorSource,
-    scope: &KeyScope,
-    sel: &[usize],
+    ev: &KeyEvidence,
+    sampler: &mut Sampler,
+    disc_hash: &str,
     n_decl: Option<usize>,
     run: &mut Run,
 ) -> Result<Inner> {
     if n_decl != Some(1) {
         tracing::error!(target: "freemkv::keys", declared = ?n_decl, "multi-key HD DVD cannot be matched reliably");
         return Err(Error::NoDiscKey {
-            disc_hash: disc.aacs_disc_hash(),
+            disc_hash: crate::hex::strip_hex_prefix(disc_hash).to_string(),
         });
     }
-    let files = match crate::whole_disc::content_files(reader) {
-        Ok(f) => f,
-        Err(e) if *scope == KeyScope::WholeDisc => return Err(e),
-        Err(e) => {
-            tracing::warn!(target: "freemkv::keys", error = %e, "no HD DVD file list: keying title extents");
-            Vec::new()
-        }
-    };
-    let ps = pieces(disc, &files, sel, *scope == KeyScope::WholeDisc);
     if run.pool.is_empty() {
-        let samples = disc.content_samples(reader, MIN_SAMPLE_UNITS);
+        let samples = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS);
         for i in 0..run.sources.len() {
             if let Asked::Keys(k) = run.ask(i, &samples, false)? {
                 let who = run.sources[i].label();
@@ -684,17 +500,17 @@ fn resolve_hddvd(
         }
         if run.pool.is_empty() {
             let failure = run.first_failure.take();
-            return Err(failure.unwrap_or_else(|| missing_error(scope, disc)));
+            return Err(failure.unwrap_or_else(|| missing_error(&ev.scope, disc_hash)));
         }
     }
     let mut inner = aacs_inner(run);
-    inner.no_stream_files = files.is_empty();
+    inner.no_stream_files = ev.no_stream_files;
     inner.best_effort = true;
     inner.origin = run.origin.first().copied();
     inner.proven = vec![0];
-    inner.keyed = ps.len();
+    inner.keyed = ev.pieces.len();
     let mut ranges = Vec::new();
-    for p in &ps {
+    for p in &ev.pieces {
         ranges.extend(p.ranges().map(|(s, e)| (s, e, 0usize)));
         inner.spans.extend(p.spans.iter().copied());
     }
@@ -704,44 +520,20 @@ fn resolve_hddvd(
 
 // KU §2.3 steps 5–14 for BD/UHD content.
 fn resolve_bd(
-    disc: &Disc,
-    reader: &mut dyn SectorSource,
-    scope: &KeyScope,
-    sel: &[usize],
+    ev: &KeyEvidence,
+    sampler: &mut Sampler,
+    disc_hash: &str,
     n_decl: Option<usize>,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     run: &mut Run,
 ) -> Result<Inner> {
-    let format = disc.content_format;
-    // Step 5: pieces. An unreadable filesystem fails a whole-disc copy (it would otherwise
-    // ship ciphertext); a title rip keys its title extents instead.
-    let fs = match crate::udf::read_filesystem(reader) {
-        Ok(fs) => Some(fs),
-        Err(e) if *scope == KeyScope::WholeDisc => return Err(e),
-        Err(e) => {
-            tracing::warn!(target: "freemkv::keys", error = %e, "no filesystem: keying title extents");
-            None
-        }
-    };
-    let files = match &fs {
-        Some(fs) => match crate::whole_disc::content_files_in(fs, reader) {
-            Ok(f) => f,
-            Err(e) if *scope == KeyScope::WholeDisc => return Err(e),
-            Err(e) => {
-                tracing::warn!(target: "freemkv::keys", error = %e, "no file list: keying title extents");
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
-    let mut ps = pieces(disc, &files, sel, *scope == KeyScope::WholeDisc);
+    let format = ev.container;
+    let scope = &ev.scope;
+    // Step 5: the evidence's pieces.
+    let mut ps: Vec<Probed> = ev.pieces.iter().cloned().map(Probed::new).collect();
     // Step 6: FMTS, when the forensic clip is in scope.
-    let layout = match &fs {
-        Some(fs) => super::fmts::layout(fs, reader)?,
-        None => None,
-    };
+    let layout = ev.fmts.as_ref();
     let clip: Vec<(u32, u32)> = layout
-        .as_ref()
         .map(|l| {
             l.clip
                 .iter()
@@ -754,19 +546,18 @@ fn resolve_bd(
             .any(|p| p.ranges().any(|(s, e)| overlaps(&clip, s, e)))
     });
     let segments: Vec<(u32, u32)> = layout
-        .as_ref()
         .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
         .unwrap_or_default();
     // Step 7: probes.
     for p in &mut ps {
-        probe(reader, p, &segments, format, run.halt)?;
+        probe(sampler, p, &segments, format, run.halt)?;
     }
     // Step 8: sample-independent sources, once, with the main title's samples.
     let needs_keys = ps
         .iter()
         .any(|p| p.units > 0 && (!p.enc.is_empty() || p.faults > 0));
     if needs_keys {
-        let main = disc.main_title().map(|t| {
+        let main = ev.main.as_ref().map(|t| {
             t.extents
                 .iter()
                 .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
@@ -797,7 +588,7 @@ fn resolve_bd(
     let mut order: Vec<usize> = (0..ps.len())
         .filter(|&i| ps[i].verdict == Verdict::Ask)
         .collect();
-    order.sort_by_key(|&i| (std::cmp::Reverse(ps[i].rank), ps[i].id()));
+    order.sort_by_key(|&i| (std::cmp::Reverse(ps[i].piece.rank), ps[i].id()));
     // Step 11: sample-dependent requests ≤ n_decl (or the number of pieces).
     let mut budget = n_decl.unwrap_or(ps.len());
     for &i in &order {
@@ -853,32 +644,32 @@ fn resolve_bd(
     if let Some(i) = ps.iter().position(|p| p.verdict == Verdict::Missing) {
         let lba = ps[i].id();
         let failure = run.first_failure.take();
-        let err = failure.unwrap_or_else(|| missing_error(scope, disc));
+        let err = failure.unwrap_or_else(|| missing_error(scope, disc_hash));
         tracing::error!(target: "freemkv::keys", lba, code = err.code(), "a stream file in scope has no key; refusing before any output");
         return Err(err);
     }
     // KU §2.7: an empty pool on an encrypted scope is today's keyless case.
     if run.pool.is_empty() && ps.iter().any(|p| matches!(p.verdict, Verdict::Lazy(_))) {
         let failure = run.first_failure.take();
-        return Err(failure.unwrap_or_else(|| missing_error(scope, disc)));
+        return Err(failure.unwrap_or_else(|| missing_error(scope, disc_hash)));
     }
     let mut inner = aacs_inner(run);
-    inner.no_stream_files = files.is_empty();
+    inner.no_stream_files = ev.no_stream_files;
     // Step 6 (continued): forensic keys, reused from the seed or anchored once.
-    let forensic = match &layout {
+    let forensic = match layout {
         None => None,
-        Some(l) => Some(resolve_forensic(reader, l, seed, run, format)?),
+        Some(l) => Some(resolve_forensic(sampler, l, seed, run, format)?),
     };
-    build(&mut inner, &ps, layout.as_ref(), forensic, run, clip);
+    build(&mut inner, &ps, layout, forensic, run, clip);
     Ok(inner)
 }
 
 // Step 9.2: this piece's unopened `Enc` units first, topped up from other unopened pieces
 // of the same playlist, never across playlists (SG23).
-fn borrow_samples(run: &Run, ps: &[Piece], i: usize) -> Vec<Vec<u8>> {
+fn borrow_samples(run: &Run, ps: &[Probed], i: usize) -> Vec<Vec<u8>> {
     // KS-10 [BD] §3.9.2: "All AV stream files that are referred to by one Title are included
     // in the same CPS Unit" — so only pieces sharing a title may lend units.
-    let unopened = |p: &Piece| -> Vec<Vec<u8>> {
+    let unopened = |p: &Probed| -> Vec<Vec<u8>> {
         p.enc
             .iter()
             .filter(|u| !(0..run.pool.len()).any(|s| run.opens(u, s)))
@@ -890,7 +681,13 @@ fn borrow_samples(run: &Run, ps: &[Piece], i: usize) -> Vec<Vec<u8>> {
         if out.len() >= SAMPLE_CAP {
             break;
         }
-        if j == i || q.verdict != Verdict::Ask || !q.titles.iter().any(|t| ps[i].titles.contains(t))
+        if j == i
+            || q.verdict != Verdict::Ask
+            || !q
+                .piece
+                .titles
+                .iter()
+                .any(|t| ps[i].piece.titles.contains(t))
         {
             continue;
         }
@@ -901,7 +698,7 @@ fn borrow_samples(run: &Run, ps: &[Piece], i: usize) -> Vec<Vec<u8>> {
 }
 
 // Step 10: the `n_decl == 1` rule.
-fn apply_single_unit_rule(run: &Run, ps: &mut [Piece], n_decl: Option<usize>) -> Result<()> {
+fn apply_single_unit_rule(run: &Run, ps: &mut [Probed], n_decl: Option<usize>) -> Result<()> {
     // KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number of CPS Units
     // on the disc" — with one declared, a key proven on one piece keys them all.
     if n_decl != Some(1) {
@@ -949,9 +746,9 @@ enum Forensic {
 }
 
 fn resolve_forensic(
-    reader: &mut dyn SectorSource,
+    sampler: &mut Sampler,
     layout: &super::fmts::Layout,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     run: &mut Run,
     format: ContentFormat,
 ) -> Result<Forensic> {
@@ -974,7 +771,7 @@ fn resolve_forensic(
         }
         Ok(None)
     };
-    let keys = match super::fmts::anchor(reader, layout, halt, &mut ask)? {
+    let keys = match super::fmts::anchor(sampler.source(), layout, Some(halt), &mut ask)? {
         super::fmts::Anchor::Keys(k) => k,
         super::fmts::Anchor::Pending => {
             tracing::warn!(target: "freemkv::keys", "fmts: every index-1 anchor read faulted: forensic keys pending");
@@ -993,7 +790,7 @@ fn resolve_forensic(
     {
         return Err(Error::FmtsKeyMissing);
     }
-    match super::fmts::phases(reader, layout, &keys, format, halt)? {
+    match super::fmts::phases(sampler.source(), layout, &keys, format, Some(halt))? {
         Some(p) => Ok(Forensic::Resolved(keys, p)),
         None => Err(Error::FmtsKeyMissing),
     }
@@ -1002,7 +799,7 @@ fn resolve_forensic(
 // Step 14: maps from Keyed pieces (and the forensic ranges); arrival pieces for the rest.
 fn build(
     inner: &mut Inner,
-    ps: &[Piece],
+    ps: &[Probed],
     layout: Option<&super::fmts::Layout>,
     forensic: Option<Forensic>,
     run: &Run,
@@ -1032,7 +829,7 @@ fn build(
     }
     let mut proven = Vec::new();
     for p in ps {
-        inner.spans.extend(p.spans.iter().copied());
+        inner.spans.extend(p.piece.spans.iter().copied());
         match p.verdict {
             Verdict::Keyed(slot) => {
                 inner.keyed += 1;
@@ -1062,7 +859,7 @@ fn build(
                 }
                 inner.arrival.push(ArrivalPiece {
                     id: p.id(),
-                    spans: p.spans.clone(),
+                    spans: p.piece.spans.clone(),
                     candidate: match p.verdict {
                         Verdict::Lazy(c) => c,
                         _ => None,

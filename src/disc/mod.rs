@@ -715,11 +715,8 @@ fn bus_map(files: StreamFiles, titles: &[DiscTitle]) -> crate::sector::bus_remov
 
 // Corrects a title's TrueHD channels/sample-rate/Atmos by probing the first decrypted major
 // sync (`reader` must yield DECRYPTED sectors: mux time, not scan).
+#[cfg(test)]
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
-    use crate::mux::codec::truehd::{
-        truehd_channels, truehd_lfe, truehd_sample_rate_hz, truehd_sync_info_from_stream,
-    };
-
     let pids: Vec<u16> = title
         .streams
         .iter()
@@ -770,50 +767,61 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
         let Some(payload) = payloads.get(&a.pid) else {
             continue;
         };
-        // One major-sync read yields channels, sample rate and the Atmos signal.
-        let Some(info) = truehd_sync_info_from_stream(payload) else {
-            continue;
+        correct_truehd_stream(a, payload);
+    }
+}
+
+/// Correct one TrueHD track from its stream bytes (the playlist understates 7.1/Atmos as
+/// 5.1): channels, sample rate and label from the first major sync in `payload`. Returns
+/// `false` when `payload` holds no major sync yet.
+pub(crate) fn correct_truehd_stream(a: &mut AudioStream, payload: &[u8]) -> bool {
+    use crate::mux::codec::truehd::{
+        truehd_channels, truehd_lfe, truehd_sample_rate_hz, truehd_sync_info_from_stream,
+    };
+    // One major-sync read yields channels, sample rate and the Atmos signal.
+    let Some(info) = truehd_sync_info_from_stream(payload) else {
+        return false;
+    };
+
+    // Whether the label is still the plain descriptor (no richer editorial
+    // label). Captured against the CURRENT channels before any correction so
+    // a label promotion only happens when nothing editorial is present.
+    let was_basic =
+        a.label == crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
+
+    // (1) Channels — only when the major sync resolves a different layout.
+    if let Some(count) = truehd_channels(info.format_info) {
+        let lfe = truehd_lfe(info.format_info);
+        let new_ch = match AudioChannels::from_layout(count.saturating_sub(lfe), lfe) {
+            AudioChannels::Unknown => AudioChannels::from_count(count),
+            named => named,
         };
-
-        // Whether the label is still the plain descriptor (no richer editorial
-        // label). Captured against the CURRENT channels before any correction so
-        // a label promotion only happens when nothing editorial is present.
-        let was_basic =
-            a.label == crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
-
-        // (1) Channels — only when the major sync resolves a different layout.
-        if let Some(count) = truehd_channels(info.format_info) {
-            let lfe = truehd_lfe(info.format_info);
-            let new_ch = match AudioChannels::from_layout(count.saturating_sub(lfe), lfe) {
-                AudioChannels::Unknown => AudioChannels::from_count(count),
-                named => named,
-            };
-            if new_ch != AudioChannels::Unknown && new_ch != a.channels {
-                a.channels = new_ch;
-            }
-        }
-
-        // (2) Sample rate — whitelisted rates only; an unknown nibble or a rate
-        // that maps to no enum variant leaves the container value untouched
-        // (never write a wrong SamplingFrequency).
-        if let Some(hz) = truehd_sample_rate_hz(info.format_info) {
-            let new_sr = SampleRate::from_hz(hz);
-            if new_sr != SampleRate::Unknown && new_sr != a.sample_rate {
-                a.sample_rate = new_sr;
-            }
-        }
-
-        // (3) Label — refresh to the corrected channels; promote to the Atmos
-        // form only when the stream carried the basic descriptor (no editorial
-        // Atmos already) AND a 4th substream was positively detected.
-        if was_basic {
-            a.label = if info.is_atmos == Some(true) {
-                crate::labels::generate_audio_label_atmos(&a.codec, &a.channels, a.secondary)
-            } else {
-                crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary)
-            };
+        if new_ch != AudioChannels::Unknown && new_ch != a.channels {
+            a.channels = new_ch;
         }
     }
+
+    // (2) Sample rate — whitelisted rates only; an unknown nibble or a rate
+    // that maps to no enum variant leaves the container value untouched
+    // (never write a wrong SamplingFrequency).
+    if let Some(hz) = truehd_sample_rate_hz(info.format_info) {
+        let new_sr = SampleRate::from_hz(hz);
+        if new_sr != SampleRate::Unknown && new_sr != a.sample_rate {
+            a.sample_rate = new_sr;
+        }
+    }
+
+    // (3) Label — refresh to the corrected channels; promote to the Atmos
+    // form only when the stream carried the basic descriptor (no editorial
+    // Atmos already) AND a 4th substream was positively detected.
+    if was_basic {
+        a.label = if info.is_atmos == Some(true) {
+            crate::labels::generate_audio_label_atmos(&a.codec, &a.channels, a.secondary)
+        } else {
+            crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary)
+        };
+    }
+    true
 }
 
 /// Calculate how many bytes of bad/unreadable data fall within a title's extents.
@@ -1670,31 +1678,6 @@ impl std::fmt::Debug for AacsState {
     }
 }
 
-/// How AACS keys were resolved. Variants are ordered root-of-trust →
-/// per-disc-leaf, matching the resolver's path-try order: the resolver
-/// attempts derivation from the strongest input it has first and falls
-/// back toward pre-computed per-disc material.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum KeyOrigin {
-    /// MKB + device keys → subset-difference tree → VUK
-    DeviceKey,
-    /// MKB + processing keys → media key → VUK
-    ProcessingKey,
-    /// Media key + Volume ID from KEYDB → derived VUK
-    KeyDbDerived,
-    /// VUK found directly in KEYDB by disc hash
-    KeyDb,
-    /// Pre-decrypted unit keys taken directly from KEYDB by disc hash.
-    /// No VUK present in the entry — `AacsState::vuk` is `None`.
-    KeyDbUnitKeys,
-    /// Unit key supplied directly by the caller (the external Unit Key path).
-    /// No keydb, no derivation — `AacsState::vuk` is `None`.
-    ExternalUk,
-}
-
-// No `KeyOrigin::name()`: the library holds ZERO user-facing English. Callers
-// map variants to display text (see freemkv's `disc_info::key_origin_label`).
-
 // ─── Disc scanning ──────────────────────────────────────────────────────────
 
 /// AACS host credentials for the live-drive authenticated handshake.
@@ -1714,7 +1697,7 @@ pub struct DriveCredentials {
 /// Options for disc scanning.
 ///
 /// libfreemkv is lookup-free — it resolves no keys. The caller resolves a key
-/// out-of-band through [`ResolvedKeySet::resolve`](crate::keys::ResolvedKeySet::resolve). The
+/// out-of-band through [`KeyRing::acquire`](crate::keys::KeyRing::acquire). The
 /// only scan input is the optional drive credentials for the live-drive
 /// authenticated handshake.
 #[derive(Default)]
@@ -1735,7 +1718,7 @@ pub struct ScanOptions {
     /// certs into `credentials` may leave it empty too. The library still
     /// resolves NO keys from these at scan time; they are consulted only for
     /// their host certs here (key *resolution* stays out-of-band via
-    /// `ResolvedKeySet::resolve`).
+    /// `KeyRing::resolve`).
     pub key_sources: Vec<Box<dyn crate::KeySource>>,
     /// Optional cooperative-cancellation token. When set, long scan-time
     /// loops (notably the CSS known-plaintext crack, which can scan up to
@@ -2303,7 +2286,7 @@ impl Disc {
     /// Read a disc's AACS key-input files from an ISO image: returns
     /// `(Unit_Key_RO.inf, MKB, aacs_major_version)`. For callers that resolve a
     /// Unit Key out-of-band: the key reaches a read only through
-    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet). libfreemkv never makes a network call.
+    /// [`KeyRing`](crate::keys::KeyRing). libfreemkv never makes a network call.
     pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>, u8)> {
         // Preserve the underlying open error (E5000) instead of collapsing
         // ENOENT/EPERM into `Error::AacsNoKeys` (E7000): a missing ISO is an
@@ -2419,7 +2402,7 @@ impl Disc {
     /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. The
     /// out-of-band Unit Key path fetches the disc's key files from the drive,
     /// resolves a key from them however it likes, through
-    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet). These files are plaintext UDF metadata — no
+    /// [`KeyRing`](crate::keys::KeyRing). These files are plaintext UDF metadata — no
     /// AACS handshake or keys are required to read them.
     pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>, u8)> {
         // No READ CAPACITY: the key files do not need the disc size.
@@ -2458,7 +2441,7 @@ impl Disc {
         tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
         let encrypted = aacs.is_some();
         // Lookup-free: the state carries the disc's AACS inputs but no key; the caller
-        // resolves one into a `ResolvedKeySet`.
+        // resolves one into a `KeyRing`.
         let (aacs, aacs_error) = match aacs {
             Some((cap, bus)) => encrypt::resolve_aacs(cap, &bus),
             None => (None, None),
@@ -2901,58 +2884,6 @@ impl Disc {
     }
 }
 
-/// A decryption key handed to libfreemkv by the caller. libfreemkv is
-/// **lookup-free**: it never reads a keydb, talks to a key server, or
-/// searches paths — the application resolves a key however it likes and
-/// hands it in here; libfreemkv derives any remaining AACS-chain steps from
-/// disc-read inputs (MKB / VID / `Unit_Key_RO.inf`). `#[non_exhaustive]`:
-/// AACS is a derivation chain (`DK →(MKB)→ MK →(VID)→ VK →(Unit_Key_RO)→
-/// UK`); each variant enters at one level, and the library
-/// derives down from it — new levels can be added without breaking callers.
-#[derive(Clone)]
-#[non_exhaustive]
-pub enum Key {
-    /// Device key(s) (AACS DK, positioned). libfreemkv walks the MKB
-    /// (subset-difference tree) to find the one that applies → media key →
-    /// VUK → unit keys. A source hands in its FULL device-key set, because
-    /// choosing which one applies *is* the MKB walk (derivation), and all
-    /// derivation lives here — never in a source.
-    Device(Vec<crate::aacs::types::DeviceKey>),
-    /// Processing key(s) (AACS PK). libfreemkv applies each against the MKB
-    /// → media key → VUK → unit keys.
-    Processing(Vec<[u8; 16]>),
-    /// Media key candidate(s) (Km). A source hands its full pool because an MK
-    /// is MKB-scoped (shared across a pressing/MKB family) — picking the one
-    /// that applies is `km_verifies` against this disc's MKB, which is
-    /// derivation, so it lives here. libfreemkv verifies, then derives the VUK
-    /// via the Volume ID and the per-CPS-unit keys.
-    Media(Vec<[u8; 16]>),
-    /// Volume Unique Key (VK / VUK). libfreemkv decrypts `Unit_Key_RO.inf`
-    /// into the per-CPS-unit keys. NOT terminal — the chain continues to the
-    /// unit keys.
-    Volume([u8; 16]),
-    /// Final per-CPS-unit AACS keys (`(cps_unit, 16-byte key)`). A key source
-    /// (keydb / key server) resolved these, or they were cached in the mapfile
-    /// at sweep; libfreemkv decrypts directly with no further derivation. This
-    /// is the terminal level every other variant derives down into.
-    Unit(Vec<(u32, [u8; 16])>),
-}
-
-// Redacting `Debug`: `Key` is a key-transport type;
-// every variant carries raw key material. Print only variant name and count —
-// never bytes. Guarded by `aacs_state_and_key_debug_are_redacted`.
-impl std::fmt::Debug for Key {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Key::Device(v) => write!(f, "Key::Device(<{} redacted>)", v.len()),
-            Key::Processing(v) => write!(f, "Key::Processing(<{} redacted>)", v.len()),
-            Key::Media(v) => write!(f, "Key::Media(<{} redacted>)", v.len()),
-            Key::Volume(_) => f.write_str("Key::Volume(<redacted>)"),
-            Key::Unit(v) => write!(f, "Key::Unit(<{} redacted>)", v.len()),
-        }
-    }
-}
-
 // Read-ahead confined to one file's recorded extents: a single-sector read inside an
 // extent fetches up to a batch of THAT extent only (never adjacent essence). Other
 // single reads (the ICB) are memoised; the caller's `recovery` flag is forwarded.
@@ -3078,7 +3009,7 @@ fn is_plain_file_name(name: &str) -> bool {
     }
     // Matched on the stem with trailing spaces ignored.
     let stem = name.split('.').next().unwrap_or(name);
-    !extract::is_windows_reserved(stem)
+    !crate::io::tree_sink::is_windows_reserved(stem)
 }
 
 impl Disc {
@@ -3098,7 +3029,7 @@ impl Disc {
     }
 
     /// The disc's own decryption keys: CSS, or `None`. AACS keys come only from a
-    /// [`ResolvedKeySet`](crate::keys::ResolvedKeySet) (KU §2.2), so an AACS disc is `None`.
+    /// [`KeyRing`](crate::keys::KeyRing) (KU §2.2), so an AACS disc is `None`.
     pub(crate) fn decrypt_keys(&self) -> crate::decrypt::DecryptKeys {
         if self.aacs.is_some() {
             crate::decrypt::DecryptKeys::None
@@ -3262,12 +3193,12 @@ pub(crate) fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf
 impl Disc {
     /// Path to the mapfile for a given output path.
     ///
-    /// For `/dev/null` output, returns `{dir}/{volume_id_or_title}.mapfile`
+    /// For the null device ([`crate::io::null_device`]), returns `{dir}/{volume_id_or_title}.mapfile`
     /// where `{dir}` is a directory this process created under the temp dir
     /// (owner-only on Unix, unpredictable name, stable for the process). For
     /// regular files, returns `{path}.mapfile`.
     pub fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
-        if path.as_os_str() == "/dev/null" {
+        if crate::io::is_null_device(path) {
             let name: String = self
                 .meta_title
                 .as_deref()
@@ -4194,23 +4125,6 @@ mod tests {
         let d = format!("{st:?}");
         assert!(!d.contains("213"), "AacsState leaked key bytes: {d}");
         assert!(d.contains("redacted"), "AacsState missing marker: {d}");
-
-        for k in [
-            Key::Device(vec![crate::aacs::types::DeviceKey {
-                key: [0xD5; 16],
-                node: 0,
-                uv: 0,
-                u_mask_shift: 0,
-            }]),
-            Key::Unit(vec![(1, [0xD5; 16])]),
-            Key::Volume([0xD5; 16]),
-            Key::Processing(vec![[0xD5; 16]]),
-            Key::Media(vec![[0xD5; 16]]),
-        ] {
-            let d = format!("{k:?}");
-            assert!(!d.contains("213"), "Key leaked bytes: {d}");
-            assert!(d.contains("redacted"), "Key missing marker: {d}");
-        }
     }
 
     // ── encrypted-content map (`merged_extents` core) ────────────────────────
@@ -6430,35 +6344,6 @@ mod tests {
     // AacsVidUnavailable, and the gate surfaces E7017, not the generic E7022.
     #[test]
     fn disc_gate_aacs_vid_unavailable_vs_no_key() {
-        let supplied = crate::aacs::provider::SuppliedKey {
-            device_keys: vec![crate::aacs::types::DeviceKey {
-                key: [0x11; 16],
-                node: 1,
-                uv: 1,
-                u_mask_shift: 0,
-            }],
-            processing_keys: Vec::new(),
-            media_keys: Vec::new(),
-            disc_entry: None,
-        };
-        let provider_refs: [&dyn crate::aacs::provider::KeyProvider; 1] = [&supplied];
-        // A parseable Unit_Key_RO.inf (uk_pos=32, zero unit keys), so resolution
-        // fails for lack of a VID, not because the .inf failed to parse.
-        let mut uk_ro = vec![0u8; 40];
-        uk_ro[0..4].copy_from_slice(&32u32.to_be_bytes());
-        let ctx = crate::aacs::resolve::ResolveContext {
-            unit_key_ro: &uk_ro,
-            content_cert: None,
-            volume_id: &[0u8; 16],
-            providers: &provider_refs,
-            mkb: None,
-        };
-        assert_eq!(
-            crate::aacs::resolve::resolve_keys_with_reason(&ctx, 2).err(),
-            Some(crate::aacs::resolve::ResolveFailure::VidUnavailable),
-            "device keys + zero VID must classify as VidUnavailable"
-        );
-
         let mut disc = make_test_disc(1000, "UHD");
         disc.encrypted = true;
         disc.aacs = Some(aacs_empty());
@@ -8659,7 +8544,12 @@ mod tests {
         let (mut d, disc) = live_bus_scan(mem, Some(rdk)).expect("scan");
         let dest = tempfile::tempdir().unwrap();
         let res = disc
-            .extract_tree(&mut d, dest.path(), &ExtractOptions::default())
+            .extract_tree(
+                &mut d,
+                dest.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
             .expect(SPEC_BD_3_7_NOTE);
         let stream = dest.path().join("BDMV/STREAM");
         assert_eq!(

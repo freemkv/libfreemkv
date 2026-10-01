@@ -1,11 +1,11 @@
 //! `PipelinedPesStream` — the read-side of the freemkv mux highway.
 //!
 //! Given a [`crate::mux::demux_thread::DemuxThread`] and a set of codec
-//! parsers, this struct implements [`crate::pes::Stream`] by running codec
+//! parsers, this struct implements [`crate::pes::PesSource`] by running codec
 //! parse on the caller's thread and emitting `PesFrame`s one at a time.
 //!
 //! ```text
-//! Thread A: read + decrypt   (PrefetchedSectorSource / BytePrefetcher)
+//! Thread A: read + decrypt   (PrefetchedSectorSource)
 //! Thread B: M2TS demux       (DemuxThread)
 //! Thread C: codec parse      (this struct, on the caller's thread)
 //! ```
@@ -14,7 +14,7 @@ use super::codec::CodecParser;
 use super::demux_thread::{DemuxBatch, DemuxThread};
 use super::ts::PesPacket;
 use crate::disc::DiscTitle;
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSource};
 use crossbeam_channel::Receiver;
 use std::io;
 
@@ -37,10 +37,7 @@ pub struct PipelinedPesStream {
     eof: bool,
     // The terminal read error (kind, rendered code), repeated by every later read.
     failed: Option<(io::ErrorKind, String)>,
-    /// Cached `FREEMKV_SKIP_PARSE` profiling flag. Read once in `new()`
-    /// — the env var cannot change for the life of the stream, and
-    /// `std::env::var_os` takes a process-wide lock, so the per-batch /
-    /// per-poll reads it replaces were needless hot-path overhead.
+    /// `ctx.diag.skip_parse`: bypass the codec parsers (profiling).
     skip_parse: bool,
     /// Count of dropped DVD navigation packets (private_stream_2, 0xBF). These
     /// are expected on every disc; instead of a per-packet WARN they're tallied
@@ -77,6 +74,8 @@ pub struct PipelinedPesStream {
     video_stream_id: Option<u8>,
     /// Packets of a video `stream_id` other than `video_stream_id`, dropped.
     other_video_packets: u64,
+    /// Read errors the Read stage skipped past (zero-filled), when it skips.
+    read_loss: Option<std::sync::Arc<crate::sector::read_stage::ReadLoss>>,
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
@@ -130,7 +129,7 @@ impl PipelinedPesStream {
             pending_frames: std::collections::VecDeque::new(),
             eof: false,
             failed: None,
-            skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
+            skip_parse: false,
             dropped_nav_packets: 0,
             mpeg_extension_packets: [0; 8],
             dropped_ps: Default::default(),
@@ -141,6 +140,7 @@ impl PipelinedPesStream {
             header_gate: super::header_gate::HeaderGate::default(),
             halt: crate::halt::Halt::new(),
             blanked: std::sync::Arc::default(),
+            read_loss: None,
             video_stream_id: None,
             other_video_packets: 0,
         }
@@ -161,9 +161,23 @@ impl PipelinedPesStream {
         self
     }
 
-    // The op's stop token: a cancel ends a blocked `read` with `Halted` (LP11).
-    pub(crate) fn with_halt(mut self, halt: Option<crate::halt::Halt>) -> Self {
-        self.halt = halt.unwrap_or_default();
+    // The read loss the Read stage counts (a live drive's skipped units).
+    pub(crate) fn with_read_loss(
+        mut self,
+        loss: std::sync::Arc<crate::sector::read_stage::ReadLoss>,
+    ) -> Self {
+        self.read_loss = Some(loss);
+        self
+    }
+
+    // The run: its halt ends a blocked `read` with `Halted` (LP11), its stats count
+    // resync drops, its diagnostics apply.
+    pub(crate) fn with_ctx(mut self, ctx: &crate::ctx::Ctx) -> Self {
+        self.halt = ctx.halt.clone();
+        self.skip_parse = ctx.diag.skip_parse;
+        for gate in &mut self.resync {
+            *gate = super::resync::ResyncGate::counted(ctx.stats.clone());
+        }
         self
     }
 
@@ -441,7 +455,7 @@ impl PipelinedPesStream {
     }
 }
 
-impl Stream for PipelinedPesStream {
+impl PesSource for PipelinedPesStream {
     fn read(&mut self) -> io::Result<Option<PesFrame>> {
         if let Some((kind, code)) = &self.failed {
             return Err(io::Error::new(*kind, code.clone()));
@@ -455,28 +469,23 @@ impl Stream for PipelinedPesStream {
         read
     }
 
-    fn write(&mut self, _: &PesFrame) -> io::Result<()> {
-        Err(crate::error::Error::StreamReadOnly.into())
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
     fn info(&self) -> &DiscTitle {
         &self.title
     }
 
     fn errors(&self) -> u64 {
-        // Blanked units plus frames the B1 gates dropped, as `DiscStream::errors` counts.
+        // Read errors skipped past, blanked units, and frames the B1 gates dropped.
         let dropped: u64 = self.resync.iter().map(|g| g.dropped_total()).sum();
-        self.blanked.load(std::sync::atomic::Ordering::Relaxed) + dropped
+        let skips = self.read_loss.as_ref().map_or(0, |l| l.skips());
+        skips + self.blanked.load(std::sync::atomic::Ordering::Relaxed) + dropped
     }
 
     fn lost_bytes(&self) -> u64 {
-        // Each blanked unit is one whole aligned unit of zeros (KS-2: 6144 bytes).
+        // Zero-filled read errors, plus each blanked unit: one whole aligned unit of zeros
+        // (KS-2: 6144 bytes).
         let blanked = self.blanked.load(std::sync::atomic::Ordering::Relaxed);
-        blanked * crate::aacs::content::ALIGNED_UNIT_LEN as u64
+        let skipped = self.read_loss.as_ref().map_or(0, |l| l.bytes());
+        skipped + blanked * crate::aacs::content::ALIGNED_UNIT_LEN as u64
     }
 
     fn config_changes(&self) -> Vec<(usize, u64)> {
@@ -492,7 +501,7 @@ impl Stream for PipelinedPesStream {
 
     fn headers_ready(&self) -> bool {
         // Match DiscStream semantics: video tracks need codec_private before the
-        // consumer can write the container header. FREEMKV_SKIP_PARSE forces ready
+        // consumer can write the container header. `Diag::skip_parse` forces ready
         // (no parser populates codec_private in that mode).
         if self.skip_parse {
             return true;
@@ -514,10 +523,6 @@ impl Stream for PipelinedPesStream {
             // FLAC/Opus ES carry no init data: keep what the source header supplied.
             .or_else(|| self.title.codec_privates.get(track).cloned().flatten())
     }
-
-    // `lost_bytes` uses the trait default (0): the file-backed highway has no
-    // read-error zero-fill term (resolve/mapfile tracks physical read loss
-    // separately) and the decrypt path no longer reports a decrypt-loss term.
 }
 
 #[cfg(test)]
@@ -539,8 +544,15 @@ mod tests {
         let (_pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(1);
         let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(2);
         // No TS/PS demuxer; the worker just drains (nothing) and exits Eof.
-        let (dt, _own_rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), None, None, None).expect("spawn");
+        let (dt, _own_rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rec_tx,
+            (),
+            &crate::ctx::Ctx::default(),
+            None,
+            None,
+        )
+        .expect("spawn");
         dt
     }
 
@@ -614,7 +626,7 @@ mod tests {
     fn pipelined_stream_cancel_unblocks_reader() {
         let (stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         let halt = crate::halt::Halt::new();
-        let mut stream = stream.with_halt(Some(halt.clone()));
+        let mut stream = stream.with_ctx(&crate::ctx::Ctx::new(halt.clone()));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -641,11 +653,17 @@ mod tests {
         let halt = crate::halt::Halt::new();
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(8);
-        let (dt, rx) =
-            DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), Some(halt.clone()), None, None)
-                .expect("spawn");
+        let (dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rec_tx,
+            (),
+            &crate::ctx::Ctx::new(halt.clone()),
+            None,
+            None,
+        )
+        .expect("spawn");
         let mut stream = PipelinedPesStream::new(dt, rx, DiscTitle::empty(), vec![], vec![])
-            .with_halt(Some(halt.clone()));
+            .with_ctx(&crate::ctx::Ctx::new(halt.clone()));
         pf_tx.send(Ok(vec![0u8; 188])).unwrap();
         halt.cancel();
         // The halted prefetcher closes its channel.
@@ -666,7 +684,7 @@ mod tests {
 
         let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         let halt = crate::halt::Halt::new();
-        stream = stream.with_halt(Some(halt.clone()));
+        stream = stream.with_ctx(&crate::ctx::Ctx::new(halt.clone()));
         halt.cancel();
         tx.send(DemuxBatch::Eof).unwrap();
         let e = stream.read().expect_err("an Eof after a Stop is not clean");
@@ -1084,7 +1102,7 @@ mod tests {
     // are not lost read bytes: lost_bytes stays the blanked-unit total.
     #[test]
     fn errors_include_frames_the_resync_gate_dropped() {
-        use crate::pes::Stream as _;
+        use crate::pes::PesSource as _;
         let (mut stream, _tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
         stream.resync.push(super::super::resync::ResyncGate::new());
         let gate = stream.resync.last_mut().unwrap();
@@ -1343,25 +1361,6 @@ mod tests {
         assert_eq!(f.data, vec![0x55], "did not stop on the empty first batch");
     }
 
-    /// write() on the read-only pipeline must return StreamReadOnly
-    /// (E9000 → Unsupported) — the highway is input-only.
-    #[test]
-    fn write_is_read_only_error() {
-        let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
-        let frame = PesFrame {
-            discard_padding_ns: 0,
-            coding: None,
-            source: None,
-            track: 0,
-            pts: 0,
-            keyframe: false,
-            data: vec![1],
-            duration_ns: None,
-        };
-        let err = stream.write(&frame).expect_err("write must error");
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    }
-
     fn video_title(secondary: bool) -> DiscTitle {
         let mut t = DiscTitle::empty();
         t.streams.push(crate::disc::Stream::Video(VideoStream {
@@ -1489,14 +1488,6 @@ mod tests {
         }));
         let (stream, _tx) = make_stream(title, vec![], vec![]);
         assert!(stream.headers_ready(), "no video → always ready");
-    }
-
-    /// finish() on the read-only pipeline is a no-op that returns Ok — the
-    /// consumer drives termination via read() returning None.
-    #[test]
-    fn finish_is_ok_noop() {
-        let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
-        assert!(stream.finish().is_ok());
     }
 
     // --- AAC AudioSpecificConfig must exist before headers are finalised ---

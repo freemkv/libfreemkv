@@ -1237,7 +1237,8 @@ fn read_all(path: &std::path::Path) -> std::io::Result<(DiscTitle, Vec<PesFrame>
     // The sector pipeline spawns a prefetcher (a Drive holder).
     let _g = crate::sector::prefetched::holder_test_lock();
     let url = format!("mpg://{}", path.display());
-    let mut input = crate::mux::resolve::input(&url, &Default::default())?;
+    let mut input =
+        crate::mux::resolve::input(&url, &Default::default(), &crate::ctx::Ctx::default())?;
     let mut frames = Vec::new();
     while let Some(f) = input.read()? {
         frames.push(f);
@@ -1462,16 +1463,21 @@ fn the_crack_honours_halt_and_runs_under_raw() {
     let _g = crate::sector::prefetched::holder_test_lock();
     let halt = crate::halt::Halt::new();
     halt.cancel();
-    let e = crate::mux::resolve::input_with_halt(&url, &Default::default(), Some(&halt))
-        .err()
-        .expect("a stopped crack is Halted");
+    let e = crate::mux::resolve::input(
+        &url,
+        &Default::default(),
+        &crate::ctx::Ctx::new(halt.clone()),
+    )
+    .err()
+    .expect("a stopped crack is Halted");
     assert_eq!(crate::error::error_code(&e), Some(crate::error::E_HALTED));
     let raw = crate::mux::resolve::InputOptions {
         raw: true,
         ..Default::default()
     };
     let lead_url = format!("mpg://{}", lead_path.display());
-    let input = crate::mux::resolve::input(&lead_url, &raw).expect("raw input");
+    let input = crate::mux::resolve::input(&lead_url, &raw, &crate::ctx::Ctx::default())
+        .expect("raw input");
     assert!(
         matches!(&input.info().streams[0], DiscStream::Video(v) if v.resolution == Resolution::R1080p),
         "the head scan read the descrambled sequence header: {:?}",
@@ -2053,7 +2059,7 @@ fn a_map_with_a_bad_crc_is_ignored() {
 // offset); the extension is the mkv sink's to exclude (M1, J23).
 #[test]
 fn an_mpg_source_remuxes_to_mkv() {
-    use crate::mux::driver::{MuxOptions, MuxSource, NoopEvents, mux_with_keys};
+    use crate::mux::driver::MuxOptions;
     let fx = fixture(&Opts {
         spu_tracks: 0,
         ..Opts::default()
@@ -2068,19 +2074,16 @@ fn an_mpg_source_remuxes_to_mkv() {
         batch_sectors: 8192,
         raw: false,
         selection: Default::default(),
+        title_index: 0,
     };
     let out = {
         let _g = crate::sector::prefetched::holder_test_lock();
-        mux_with_keys(
-            MuxSource::Url {
-                url: &url,
-                opts: Default::default(),
-            },
+        crate::mux::mux_url(
+            &url,
             None,
             &format!("mkv://{}", mkv.display()),
             &opts,
-            &crate::halt::Halt::new(),
-            std::sync::Arc::new(NoopEvents),
+            &crate::ctx::Ctx::default(),
         )
         .unwrap()
     };
@@ -2090,9 +2093,12 @@ fn an_mpg_source_remuxes_to_mkv() {
         vec![2],
         "the extension, once seen (J23)"
     );
-    let mut input =
-        crate::mux::resolve::input(&format!("mkv://{}", mkv.display()), &Default::default())
-            .unwrap();
+    let mut input = crate::mux::resolve::input(
+        &format!("mkv://{}", mkv.display()),
+        &Default::default(),
+        &crate::ctx::Ctx::default(),
+    )
+    .unwrap();
     let mut from_mkv = Vec::new();
     while let Some(f) = input.read().unwrap() {
         from_mkv.push(f);

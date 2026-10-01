@@ -77,7 +77,7 @@ fn wait_until(flag: &AtomicBool) {
 // `close()` runs a script: sleep `stall` without progress, then `steps` sleeps of
 // `step`, bumping the shared progress after each. `in_close` flags the entry.
 struct ScriptedClose {
-    progress: Progress,
+    progress: Liveness,
     in_close: Arc<AtomicBool>,
     stall: Duration,
     step: Duration,
@@ -101,7 +101,7 @@ impl Sink<u64> for ScriptedClose {
 }
 
 fn scripted(stall: Duration, steps: u32) -> (Pipeline<u64, u32>, Arc<AtomicBool>) {
-    let progress = Progress::new();
+    let progress = Liveness::new();
     let in_close = Arc::new(AtomicBool::new(false));
     let sink = ScriptedClose {
         progress: progress.clone(),
@@ -331,7 +331,7 @@ struct PartialFile {
     file: std::fs::File,
     partial: std::path::PathBuf,
     out: std::path::PathBuf,
-    progress: Progress,
+    progress: Liveness,
     step: Duration,
     steps: u32,
     done: Arc<AtomicBool>,
@@ -381,7 +381,7 @@ fn partial_run(steps: u32) -> PartialRun {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("Movie.mkv");
     let partial = dir.path().join("Movie.mkv.partial");
-    let progress = Progress::new();
+    let progress = Liveness::new();
     let done = Arc::new(AtomicBool::new(false));
     let sink = PartialFile {
         file: std::fs::File::create(&partial).unwrap(),
@@ -487,7 +487,7 @@ fn halted_running_consumer_output_stays_partial() {
             file: std::fs::File::create(&partial).unwrap(),
             partial: partial.clone(),
             out: out.clone(),
-            progress: Progress::new(),
+            progress: Liveness::new(),
             step: Duration::ZERO,
             steps: 0,
             done: Arc::default(),

@@ -17,15 +17,16 @@
 //! }
 //! ```
 //!
-//! Muxing runs through the PES pipeline. `input()` rejects live `disc://`
-//! URLs with [`Error::DiscUrlNotDirect`] (use `Drive` + `Disc::scan` +
-//! `DiscStream::new` instead); file-backed sources (`iso://`, `m2ts://`) open
-//! directly:
+//! Muxing runs through the PES pipeline. `input()` opens every input URL, a live
+//! `disc://` drive included, and file-backed sources (`iso://`, `m2ts://`) the same
+//! way:
 //!
 //! ```no_run
 //! # fn run() -> std::io::Result<()> {
 //! let opts = libfreemkv::InputOptions::default();
-//! let mut input = libfreemkv::input("iso://disc.iso", &opts)?;
+//! // One run context: its halt stops every stage, its events hear the progress.
+//! let ctx = libfreemkv::Ctx::default();
+//! let mut input = libfreemkv::input("iso://disc.iso", &opts, &ctx)?;
 //! let title = input.info().clone();
 //! let mut output = libfreemkv::output("mkv://Movie.mkv", &title, None)?;
 //! // Propagate read errors instead of silently stopping on the first one.
@@ -75,6 +76,8 @@ pub(crate) mod clpi;
 pub mod consts;
 #[cfg(feature = "rip")]
 pub mod css;
+#[cfg(feature = "rip")]
+pub mod ctx;
 #[cfg(feature = "rip")]
 pub mod decrypt;
 #[cfg(feature = "rip")]
@@ -178,15 +181,17 @@ pub use io::WritebackFile;
 #[cfg(feature = "rip")]
 pub use io::image_writer::write_image;
 
-// ─── Drive events (low-level callbacks) ─────────────────────────────────────
+// ─── Run context: halt, events, loss counters (pipeline design §2.5) ────────
 #[cfg(feature = "rip")]
-pub use event::{BatchSizeReason, Event, EventKind};
+pub use ctx::{Ctx, Diag, LossReport, Stats};
+#[cfg(feature = "rip")]
+pub use event::{BatchSizeReason, Event, Events, NoEvents};
 #[cfg(feature = "rip")]
 pub use identity::DriveId;
 
 // ─── Unlock seam: drive/disc unlocking (firmware, AACS cert, CSS bus-auth) lives entirely in `freemkv-unlock`; consumed via `unlock_bridge`, exposes nothing. ───
 
-// ─── Decryption (AACS/CSS): AACS keys come only from `keys::ResolvedKeySet` (KU §2.2); `decrypt_sectors()` is for raw sector buffers (ISO patching). ───
+// ─── Decryption (AACS/CSS): AACS keys come only from `keys::KeyRing` (KU §2.2); `decrypt_sectors()` is for raw sector buffers (ISO patching). ───
 #[cfg(feature = "rip")]
 pub use decrypt::{decrypt_sectors, decrypt_threads, set_decrypt_threads};
 
@@ -194,27 +199,27 @@ pub use decrypt::{decrypt_sectors, decrypt_threads, set_decrypt_threads};
 // `Disc::scan()` fully populates `Disc`; `Disc::identify()` is a UDF-only fast path
 // for name/format display. Codec enums are canonical; never compare display strings.
 #[cfg(feature = "rip")]
+pub use aacs::trace::KeyOrigin;
+#[cfg(feature = "rip")]
 pub use dirimage::DirImage;
 #[cfg(feature = "rip")]
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
     DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
-    FileResult, FrameRate, HdrFormat, Key, KeyOrigin, LabelPurpose, LabelQualifier, Resolution,
-    SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
+    FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, Resolution, SampleRate,
+    ScanOptions, Stream, SubtitleStream, VideoStream,
 };
 #[cfg(feature = "rip")]
 pub use keysource::{DiscInputs, KeySource, read_encrypted_units};
 
 // ─── Streams ────────────────────────────────────────────────────────────────
-// All types implement `pes::Stream` (re-exported `PesStream` to avoid colliding
-// with `disc::Stream`). Prefer `input()`/`output()` URL resolvers over direct construction.
+// Inputs implement `PesSource`, outputs `PesSink`. Prefer `input()`/`output()` URL
+// resolvers over direct construction.
 #[cfg(feature = "rip")]
 pub use pes::PesFrame;
 #[cfg(feature = "rip")]
-pub use pes::Stream as PesStream;
+pub use pes::{PesSink, PesSource};
 
-#[cfg(feature = "rip")]
-pub use mux::DiscStream;
 #[cfg(feature = "rip")]
 pub use mux::M2tsStream;
 #[cfg(feature = "rip")]
@@ -230,7 +235,7 @@ pub use mux::WriteSeek;
 #[cfg(feature = "rip")]
 pub use mux::{FitReport, SkipReason, fit_report};
 #[cfg(feature = "rip")]
-pub use mux::{InputOptions, StreamUrl, disc_root_of, input, output, parse_url};
+pub use mux::{InputOptions, SinkCaps, StreamUrl, disc_root_of, input, output, parse_url};
 #[cfg(feature = "rip")]
 pub use mux::{Medium, SourceInfo};
 #[cfg(feature = "rip")]
@@ -246,7 +251,7 @@ pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
 #[cfg(feature = "rip")]
 pub use mux::select::{PidFilter, StreamSelection};
 #[cfg(feature = "rip")]
-pub use mux::{MuxEvents, MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
+pub use mux::{MuxOptions, MuxOutcome, ScannedTitle, Source, mux_url, mux_with_keys, open_source};
 pub use scsi::{
     DiscPresence, DriveInfo, ScsiSense, ScsiTransport, SenseFamily, disc_presence, drive_has_disc,
     list_drives,

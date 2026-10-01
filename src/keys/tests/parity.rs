@@ -4,9 +4,10 @@
 //! see [`Golden`](crate::test_util::Golden) for the re-bless command.
 
 use super::*;
-use crate::mux::driver::{MuxOptions, MuxSource, NoopEvents, mux_with_keys};
+use crate::mux::driver::{MuxOptions, mux_with_keys};
 use crate::mux::parity_tests::{golden, record_run, record_tree};
 use crate::mux::select::{PidFilter, StreamSelection};
+use crate::mux::source::{ScannedTitle, Source};
 use crate::test_util::{CLIP_AUDIO_PIDS, Golden, synthetic_bd_clip};
 
 fn refused<T>(g: &mut Golden, key: &str, r: &Result<T>) -> bool {
@@ -48,7 +49,7 @@ fn copy_image(g: &mut Golden, tag: &str, fx: &Fx, reader: &mut dyn SectorSource)
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.iso");
     let cap = fx.disc.capacity_sectors;
-    let r = crate::io::image_writer::write_image(reader, &dest, cap, &Halt::new(), |_| {});
+    let r = crate::io::image_writer::write_image(reader, &dest, cap, &crate::ctx::Ctx::default());
     match r {
         Ok(n) => {
             g.kv(&format!("{tag} written"), n);
@@ -60,14 +61,17 @@ fn copy_image(g: &mut Golden, tag: &str, fx: &Fx, reader: &mut dyn SectorSource)
     }
 }
 
-fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&ResolvedKeySet>, src: Faulty) {
+fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&KeyRing>, src: Faulty) {
     let dest = tempfile::tempdir().unwrap();
     let opts = crate::disc::ExtractOptions {
         keys,
         ..Default::default()
     };
     let mut src = src;
-    match fx.disc.extract_tree(&mut src, dest.path(), &opts) {
+    match fx
+        .disc
+        .extract_tree(&mut src, dest.path(), &opts, &crate::ctx::Ctx::default())
+    {
         Ok(r) => {
             g.kv(
                 &format!("{tag} result"),
@@ -96,7 +100,7 @@ fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&ResolvedKeySet>, sr
     }
 }
 
-fn mux_cells(g: &mut Golden, fx: &Fx, set: Option<&ResolvedKeySet>, dead: Option<(u32, u32)>) {
+fn mux_cells(g: &mut Golden, fx: &Fx, set: Option<&KeyRing>, dead: Option<(u32, u32)>) {
     let _serial = crate::sector::prefetched::holder_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let iso = write_iso(fx, dir.path());
@@ -136,19 +140,11 @@ fn mux_cells(g: &mut Golden, fx: &Fx, set: Option<&ResolvedKeySet>, dead: Option
             if let Some((a, b)) = dead {
                 src.kill(a, b);
             }
-            MuxSource::Live {
-                reader: Box::new(src),
-                title: title.clone(),
-                format,
-            }
+            Source::from_reader(Box::new(src), ScannedTitle::new(title.clone(), format))
         } else {
-            MuxSource::Iso {
-                path: &iso,
-                title: title.clone(),
-                format,
-            }
+            Source::from_image(&iso, ScannedTitle::new(title.clone(), format))
         };
-        let r = mux_with_keys(source, set, &dest, opts, &Halt::new(), Arc::new(NoopEvents));
+        let r = mux_with_keys(source, set, &dest, opts, &crate::ctx::Ctx::default());
         record_run(g, tag, &r);
         record_tree(g, tag, &out);
     };
@@ -182,7 +178,7 @@ fn image_cell(name: &str, fx: &Fx, pool: &[[u8; 16]], dead: Option<(u32, u32)>) 
         &mut fx.source(),
         KeyScope::WholeDisc,
         &specs,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     );
     if !refused(&mut g, "resolve-whole", &whole) {
@@ -207,7 +203,7 @@ fn image_cell(name: &str, fx: &Fx, pool: &[[u8; 16]], dead: Option<(u32, u32)>) 
         &mut fx.source(),
         KeyScope::Titles(vec![0]),
         &specs,
-        ResolveKeysOptions::default(),
+        AcquireOptions::default(),
         &FakeClock::default(),
     );
     if !refused(&mut g, "resolve-title", &titles) {
@@ -438,7 +434,12 @@ fn parity_bug1_live_dvd_folder_is_descrambled() {
     let dest = tempfile::tempdir().unwrap();
     let mut src = fx.source();
     fx.disc
-        .extract_tree(&mut src, dest.path(), &Default::default())
+        .extract_tree(
+            &mut src,
+            dest.path(),
+            &Default::default(),
+            &crate::ctx::Ctx::default(),
+        )
         .unwrap();
     for vts in ["VTS_01_1.VOB", "VTS_02_1.VOB"] {
         let got = std::fs::read(dest.path().join("VIDEO_TS").join(vts)).unwrap();

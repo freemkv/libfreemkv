@@ -7,7 +7,7 @@
 //! ISO/disc scan that builds the title is all they need.
 
 use crate::disc::{Chapter, DiscTitle, TitleProfile};
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSink};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -103,16 +103,15 @@ impl ChaptersSink {
     }
 }
 
-impl Stream for ChaptersSink {
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
+impl PesSink for ChaptersSink {
     fn write(&mut self, _frame: &PesFrame) -> io::Result<()> {
         Ok(()) // whole file written at create()
     }
+
     fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
+
     fn info(&self) -> &DiscTitle {
         &self.title
     }
@@ -287,16 +286,15 @@ impl JsonSink {
     }
 }
 
-impl Stream for JsonSink {
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
-        Err(crate::error::Error::StreamWriteOnly.into())
-    }
+impl PesSink for JsonSink {
     fn write(&mut self, _frame: &PesFrame) -> io::Result<()> {
         Ok(())
     }
+
     fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
+
     fn info(&self) -> &DiscTitle {
         &self.title
     }
@@ -545,50 +543,6 @@ mod tests {
         let s = &v["subtitles"][0];
         assert_eq!(s["pid"], 0x1200);
         assert_eq!(s["descriptive_service"], true);
-    }
-
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("fmkv_meta_sink_{}_{n}_{name}", std::process::id()))
-    }
-
-    fn sink_title() -> crate::disc::DiscTitle {
-        let mut t = crate::disc::DiscTitle::empty();
-        t.playlist = "MAIN".into();
-        t.chapters = chaps();
-        t
-    }
-
-    // Write-only sinks must refuse read() with E_STREAM_WRITE_ONLY, not Ok(None).
-    #[test]
-    fn metadata_sinks_refuse_to_be_read_from() {
-        let code = format!("E{}", crate::error::Error::StreamWriteOnly.code());
-
-        let cpath = temp_path("chapters.xml");
-        let mut c = ChaptersSink::create(&cpath, &sink_title()).unwrap();
-        let err = c
-            .read()
-            .expect_err("chapters:// is write-only; read must not report a clean EOF");
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(
-            err.to_string().contains(&code),
-            "expected {code}, got {err}"
-        );
-        let _ = std::fs::remove_file(&cpath);
-
-        let jpath = temp_path("meta.json");
-        let mut j = JsonSink::create(&jpath, &sink_title()).unwrap();
-        let err = j
-            .read()
-            .expect_err("json:// is write-only; read must not report a clean EOF");
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(
-            err.to_string().contains(&code),
-            "expected {code}, got {err}"
-        );
-        let _ = std::fs::remove_file(&jpath);
     }
 
     // A document missing the per-kind arrays must not panic the enrichment.

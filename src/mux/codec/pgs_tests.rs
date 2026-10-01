@@ -6,7 +6,7 @@ use super::*;
 use crate::disc::{Codec, SubtitleStream};
 use crate::mux::mkv::{MkvMuxer, MkvTrack};
 use crate::mux::mkvstream::MkvStream;
-use crate::pes::{PesFrame, SourcePos, Stream};
+use crate::pes::{PesFrame, PesSource, SourcePos};
 use std::io::Cursor;
 use std::path::Path;
 use std::process::Command;

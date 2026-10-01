@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 
 use super::bounded::{BoundedError, bounded_syscall_stall};
 use crate::error::Error;
-use crate::halt::{Halt, Progress, StallTimer};
+use crate::halt::{Halt, Liveness, StallTimer};
 
 /// T12's window: this long with no flush progress is `SyncTimeout` (E9056).
 pub(crate) const FLUSH_STALL: Duration = Duration::from_secs(60);
 
-/// A shared view of a file's durable-flush progress: the [`Progress`] every accepted
+/// A shared view of a file's durable-flush progress: the [`Liveness`] every accepted
 /// write and completed flush bumps, the bytes made durable, and the file length.
 /// Clones share the counters; hand one to [`WritebackFile::set_flush_progress`] and
 /// read it from another thread.
@@ -26,14 +26,14 @@ pub(crate) const FLUSH_STALL: Duration = Duration::from_secs(60);
 /// [`WritebackFile::set_flush_progress`]: crate::io::WritebackFile::set_flush_progress
 #[derive(Clone, Debug, Default)]
 pub struct FlushProgress {
-    progress: Progress,
+    progress: Liveness,
     durable: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
 }
 
 impl FlushProgress {
     /// Counters that bump `progress` (share it with the pipeline consumer, §2.10 item 3).
-    pub fn new(progress: Progress) -> Self {
+    pub fn new(progress: Liveness) -> Self {
         Self {
             progress,
             ..Self::default()
@@ -41,7 +41,7 @@ impl FlushProgress {
     }
 
     /// The forward-progress counter.
-    pub fn progress(&self) -> &Progress {
+    pub fn progress(&self) -> &Liveness {
         &self.progress
     }
 
@@ -173,7 +173,7 @@ pub(crate) fn durable_sync_file_with(
     let len = file.metadata()?.len();
     // An owned clone per worker call: a leaked worker keeps a valid fd, never a reused number.
     let file = Arc::new(file.try_clone()?);
-    let progress = Progress::new();
+    let progress = Liveness::new();
     let mut timer = StallTimer::new(timing.stall, &progress);
     let mut sampler = Sampler::new(timing.sample_every, timing.stall);
     let mut done = 0u64;

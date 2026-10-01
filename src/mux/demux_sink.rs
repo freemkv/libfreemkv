@@ -2,7 +2,7 @@
 //! stream file (per-codec ES, PGS `.sup`, VobSub `.idx`/`.sub`, LPCM raw PCM),
 //! plus a chapters file and per-audio-track delay metadata.
 //!
-//! This is a write-only [`crate::pes::Stream`] that routes each frame's payload to the file for
+//! This is a write-only [`crate::pes::PesSink`] that routes each frame's payload to the file for
 //! `frame.track`, post-processing where the codec's internal `Frame` form differs from the
 //! on-disk ES form (HEVC/H.264 Annex-B, PGS `.sup`, VobSub `.idx`).
 
@@ -11,7 +11,7 @@ use crate::mux::hevc::{
     append_length_prefixed_as_annex_b_sized, avcc_to_annex_b, hvcc_to_annex_b, nal_length_size,
 };
 use crate::mux::timeline::TimelineContinuity;
-use crate::pes::{PesFrame, Stream};
+use crate::pes::{PesFrame, PesSink};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -863,14 +863,9 @@ impl DemuxSink {
     }
 }
 
-impl Stream for DemuxSink {
+impl PesSink for DemuxSink {
     fn undelivered_streams(&self) -> Vec<usize> {
         self.excluded.seen()
-    }
-
-    fn read(&mut self) -> io::Result<Option<PesFrame>> {
-        // Write-only sink, per the Stream trait contract.
-        Err(crate::error::Error::StreamWriteOnly.into())
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
@@ -1974,10 +1969,10 @@ mod tests {
                 data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, i as u8],
                 duration_ns: None,
             };
-            let _ = Stream::write(&mut sink, &f);
+            let _ = PesSink::write(&mut sink, &f);
         }
 
-        let err = Stream::finish(&mut sink).expect_err("an emptied export must fail");
+        let err = PesSink::finish(&mut sink).expect_err("an emptied export must fail");
         assert_eq!(
             crate::error::error_code(&err),
             Some(crate::error::E_SINK_WROTE_NOTHING),
@@ -2026,7 +2021,7 @@ mod tests {
                 data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, i as u8],
                 duration_ns: None,
             };
-            let _ = Stream::write(&mut sink, &f);
+            let _ = PesSink::write(&mut sink, &f);
         }
         // … and one frame inside the first clip (150 s, in ns) that DOES persist,
         // so frames_mapped > 0 while seam_dropped (2) still exceeds it (1).
@@ -2040,9 +2035,9 @@ mod tests {
             data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x42],
             duration_ns: None,
         };
-        Stream::write(&mut sink, &inside).unwrap();
+        PesSink::write(&mut sink, &inside).unwrap();
 
-        let err = Stream::finish(&mut sink).expect_err("a mostly-emptied export must fail");
+        let err = PesSink::finish(&mut sink).expect_err("a mostly-emptied export must fail");
         assert_eq!(
             crate::error::error_code(&err),
             Some(crate::error::E_SEAM_PLAN_DROPPED_MOST),
@@ -2108,10 +2103,10 @@ mod tests {
                 data: vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, i as u8],
                 duration_ns: None,
             };
-            let _ = Stream::write(&mut sink, &f);
+            let _ = PesSink::write(&mut sink, &f);
         }
         // One AUDIO frame inside the first clip (150 s): placed and persisted.
-        Stream::write(
+        PesSink::write(
             &mut sink,
             &PesFrame {
                 discard_padding_ns: 0,
@@ -2127,7 +2122,7 @@ mod tests {
         .unwrap();
 
         // Gate must PASS: the only drops were on the filtered-out video track.
-        Stream::finish(&mut sink)
+        PesSink::finish(&mut sink)
             .expect("a filtered export must not fail on drops it never persisted");
         // And the audio file was actually written with its payload.
         let wrote_audio = std::fs::read_dir(&dir)
@@ -2183,26 +2178,16 @@ mod tests {
             duration_ns: None,
         };
         for s in [150i64, 151, 152] {
-            let _ = Stream::write(&mut sink, &frame(0, s * 1_000_000_000));
+            let _ = PesSink::write(&mut sink, &frame(0, s * 1_000_000_000));
         }
         for s in [0i64, 1] {
-            let _ = Stream::write(&mut sink, &frame(1, s * 1_000_000_000));
+            let _ = PesSink::write(&mut sink, &frame(1, s * 1_000_000_000));
         }
-        let err = Stream::finish(&mut sink).expect_err("no audio was written");
+        let err = PesSink::finish(&mut sink).expect_err("no audio was written");
         assert_eq!(
             crate::error::error_code(&err),
             Some(crate::error::E_SINK_WROTE_NOTHING)
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sink_read_returns_write_only() {
-        let dir = tempdir();
-        let title = title_with(vec![video_stream(Codec::Mpeg2)], vec![None]);
-        let mut sink = DemuxSink::create(&dir, &title, &DemuxOptions::default()).unwrap();
-        let err = Stream::read(&mut sink).expect_err("sink read must error");
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

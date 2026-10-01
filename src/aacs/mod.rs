@@ -1,8 +1,5 @@
-//! AACS decryption — Volume Unique Key lookup and title key derivation.
-//!
-//! Two paths: VUK lookup (disc_hash → KEYDB.cfg → VUK, fast, common) or a full
-//! handshake (device_keys + MKB → Media Key → + Volume ID → VUK, fallback).
-//! The VUK decrypts title keys from AACS/Unit_Key_RO.inf; title keys decrypt
+//! AACS primitives: MKB, title-key file, derivation, unit crypto and the resolution trace.
+//! Keys are acquired only through [`crate::keys::KeyRing::acquire`]; title keys decrypt
 //! m2ts stream content (AES-128-CBC).
 
 pub mod content;
@@ -14,8 +11,6 @@ pub mod host_certs;
 pub mod index_select;
 pub mod inf;
 pub mod mkb;
-pub mod provider;
-pub mod resolve;
 pub mod segment;
 // No production caller; not the live FMTS path.
 #[doc(hidden)]

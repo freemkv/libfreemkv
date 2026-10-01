@@ -384,7 +384,7 @@ fn no_thread_sleep_on_op_paths() {
     ];
     const ALLOW: &[Allow] = &[
         (
-            "src/disc/extract.rs",
+            "src/io/tree_sink.rs",
             "probe_case_insensitive",
             "20 ms filesystem remove retry; no drive wait, no token in reach",
         ),
@@ -536,15 +536,9 @@ fn no_is_finished_spins_outside_halt() {
 // The `#[allow]` / `#[expect]` sites present when ST-X2 landed, per (file, attribute):
 // each is a §5.8 violation awaiting a per-site fix. The list only shrinks.
 const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
-    ("src/aacs/provider.rs", r#"allow(dead_code)"#, 1),
     (
         "src/disc/extract.rs",
         r#"allow(clippy::too_many_arguments)"#,
-        1,
-    ),
-    (
-        "src/disc/extract.rs",
-        r#"allow(clippy::unnecessary_cast,clippy::useless_conversion)"#,
         1,
     ),
     ("src/drive/linux.rs", r#"allow(dead_code)"#, 1),
@@ -552,6 +546,11 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     (
         "src/drive/mod.rs",
         r#"cfg_attr(not(target_os="linux"),allow(unused_variables))"#,
+        1,
+    ),
+    (
+        "src/io/tree_sink.rs",
+        r#"allow(clippy::unnecessary_cast,clippy::useless_conversion)"#,
         1,
     ),
     (
@@ -592,11 +591,8 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     ("src/mpls.rs", r#"allow(dead_code)"#, 2),
     ("src/mux/demux_sink.rs", r#"allow(dead_code)"#, 2),
     ("src/mux/demux_thread.rs", r#"allow(dead_code)"#, 1),
-    ("src/mux/fmp4/mod.rs", r#"allow(dead_code)"#, 1),
-    ("src/mux/hevc/mod.rs", r#"allow(dead_code)"#, 1),
-    ("src/mux/m2ts_mux/mod.rs", r#"allow(dead_code)"#, 1),
     ("src/mux/mkv.rs", r#"allow(clippy::too_many_arguments)"#, 3),
-    ("src/mux/mod.rs", r#"allow(dead_code)"#, 6),
+    ("src/mux/mod.rs", r#"allow(dead_code)"#, 3),
     ("src/mux/pipelined_stream.rs", r#"allow(dead_code)"#, 1),
     (
         "src/mux/resolve.rs",

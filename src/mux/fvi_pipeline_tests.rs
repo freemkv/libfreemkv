@@ -12,7 +12,7 @@ use crate::disc::{
     VideoStream,
 };
 use crate::mux::resolve::build_iso_pipeline;
-use crate::pes::Stream as PesStream;
+use crate::pes::PesSource;
 use crate::{Medium, SectorSource, SourceInfo, output};
 use std::path::PathBuf;
 
@@ -179,8 +179,7 @@ fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
         3, // 3-sector (one AACS unit) batches → one source stamp per GOP region
         ContentFormat::MpegPs,
         false,
-        None,
-        None,
+        &crate::ctx::Ctx::default(),
     )
     .expect("pipeline builds");
 
