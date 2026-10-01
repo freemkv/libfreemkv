@@ -2297,3 +2297,154 @@ fn a_clip_join_pts_reset_continues_the_timeline() {
     // Two 6 s clips: the output spans ~12 s, not one clip's 6 s.
     assert!(span >= 11 * 90_000, "span {span} ticks");
 }
+
+// A track first seen after the origin window with a timestamp below the origin is clamped
+// to 0 and counted, never wrapped through a negative-to-unsigned cast.
+#[test]
+fn a_timestamp_below_the_origin_is_clamped_and_counted() {
+    let fx = fixture(&Opts {
+        lpcm: false,
+        spu_tracks: 0,
+        ..Opts::default()
+    });
+    let mut sink = MpgSink::create(Vec::new(), &fx.title).unwrap();
+    let mut f = PesFrame {
+        track: 1,
+        pts: VIDEO_START_NS,
+        keyframe: true,
+        data: vec![0x55; 1 << 20],
+        duration_ns: None,
+        discard_padding_ns: 0,
+        source: None,
+        coding: None,
+    };
+    for _ in 0..(HOLD_CAP_BYTES >> 20) + 2 {
+        sink.write(&f).unwrap();
+    }
+    assert_eq!(sink.counters().origin_saturated, 0);
+    f.pts = VIDEO_START_NS - 3_000 * MS;
+    f.data = vec![0x55; 64];
+    sink.write(&f).unwrap();
+    assert_eq!(sink.counters().origin_saturated, 1);
+    sink.finish().unwrap();
+    let out = sink.mux.take().unwrap().into_writer();
+    let parsed = replay::parse(&out).unwrap();
+    assert!(
+        parsed.pes.iter().any(|x| x.key.0 == 0xC0 && x.pts == Some(0)),
+        "the clamped AU is stamped 0"
+    );
+}
+
+// MS-5/MS-6: the system header's audio and video bounds count the carried streams, and the
+// video buffer bound is vbv_buffer_size + 8 KiB in 1024-byte units.
+#[test]
+fn the_system_header_states_the_bounds() {
+    let r = run(&fixture(&Opts::default()));
+    let sh = &r.parsed.system_headers[0].1;
+    // Six audio streams (MP2 base and extension, AC-3, DTS, two LPCM); subpictures are not audio.
+    assert_eq!(sh[9] >> 2, 6, "audio_bound");
+    assert_eq!(sh[10] & 0x1F, 1, "video_bound");
+    let video = sh[12..].chunks(3).find(|e| e[0] == 0xE0).unwrap();
+    let size = u16::from(video[1] & 0x1F) << 8 | u16::from(video[2]);
+    assert_eq!(video[1] & 0x20, 0x20, "scale 1024");
+    assert_eq!(u64::from(size), (112 * 2048 + 8192) / 1024);
+}
+
+// The sequence_extension's vbv_buffer_size_extension carries the high bits of the buffer size.
+#[test]
+fn vbv_extension_bits_extend_the_size() {
+    let mut h = seq_header(720, 576, 3, 112, false);
+    let e = h.windows(4).position(|w| w == [0, 0, 1, 0xB5]).unwrap() + 4;
+    h[e + 4] = 2;
+    assert_eq!(vbv_bytes(&h), Some(((2u64 << 10) | 112) * 2048));
+}
+
+// MPG's first pack rate is R0: SD pictures at the SD base rate, HD at the HD one.
+#[test]
+fn the_base_rate_follows_the_picture_height() {
+    let first_rate = |res| {
+        let mut fx = fixture(&Opts {
+            secs: 2,
+            ..Opts::default()
+        });
+        if let DiscStream::Video(v) = &mut fx.title.streams[0] {
+            v.resolution = res;
+        }
+        run(&fx).parsed.packs[0].rate
+    };
+    assert_eq!(first_rate(Resolution::R576i), R0_SD);
+    assert_eq!(first_rate(Resolution::R1080i), R0_HD);
+}
+
+// MS-22: a base layer is 11172 audio (0x03) when its header says MPEG-1, 13818-3 (0x04) when
+// the ID bit marks a low-sampling-frequency stream.
+#[test]
+fn the_mp2_stream_type_follows_the_header_id_bit() {
+    let stream_type = |id_byte: u8| {
+        let mut fx = fixture(&Opts {
+            lpcm: false,
+            spu_tracks: 0,
+            secs: 2,
+            ..Opts::default()
+        });
+        fx.title.streams.truncate(2);
+        for f in fx.frames.iter_mut().filter(|f| f.track == 1) {
+            f.data[1] = id_byte;
+        }
+        fx.frames.retain(|f| f.track <= 1);
+        let r = run(&fx);
+        let m = &r.parsed.psms[0].1;
+        let info = usize::from(u16::from_be_bytes([m[8], m[9]]));
+        let es = &m[12 + info..m.len() - 4];
+        let n = usize::from(u16::from_be_bytes([es[2], es[3]]));
+        let audio = &es[4 + n..];
+        assert_eq!(audio[1], 0xC0);
+        audio[0]
+    };
+    assert_eq!(stream_type(0xFD), 0x03);
+    assert_eq!(stream_type(0xF5), 0x04);
+}
+
+// EOF pads the last partial LPCM packing unit with silence rather than dropping its samples.
+#[test]
+fn a_partial_lpcm_unit_at_eof_is_padded_not_lost() {
+    let mut fx = fixture(&Opts {
+        secs: 2,
+        ..Opts::default()
+    });
+    let last = fx.frames.iter().filter(|f| f.track == 6).last().unwrap();
+    // Three stereo 24-bit sample frames: under any packing unit.
+    let tail = PesFrame {
+        pts: last.pts + 10 * MS,
+        data: vec![0x21; 3 * 6],
+        ..last.clone()
+    };
+    fx.frames.push(tail);
+    let r = run(&fx);
+    let want: usize = fx
+        .frames
+        .iter()
+        .filter(|f| f.track == 6)
+        .map(|f| f.data.len())
+        .sum();
+    let mut parser = crate::mux::codec::lpcm::LpcmParser::new_dvd();
+    let mut got = 0;
+    for x in r.parsed.pes.iter().filter(|x| x.key == (0xBD, Some(0xA1))) {
+        let mut data = x.sub_hdr[4..7].to_vec();
+        data.extend_from_slice(&x.es);
+        let pes = crate::mux::ts::PesPacket {
+            source: None,
+            pid: 0,
+            pts: x.pts.map(|p| p as i64),
+            dts: None,
+            data,
+            discontinuity: false,
+        };
+        got += parser
+            .parse(&pes)
+            .iter()
+            .map(|f| f.data.len())
+            .sum::<usize>();
+    }
+    assert!(got >= want, "{got} bytes out of {want} in");
+}

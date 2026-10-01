@@ -295,6 +295,7 @@ impl<W: Write + Send> MpgSink<W> {
             .codec_privates
             .get(video_track)
             .and_then(|c| c.as_deref());
+        let video_out = route[video_track].ok_or(crate::error::Error::MpgNoVideoTrack)?;
         let mut excluded = super::ps::UnstoredExtensions::new(title, "MPG");
         excluded.retain(|i| route[i].is_none());
         Ok(Self {
@@ -308,7 +309,7 @@ impl<W: Write + Send> MpgSink<W> {
             route,
             outs,
             buffers,
-            video_out: 0,
+            video_out,
             deriver: DtsDeriver::for_codec(codec, cp),
             anchor: None,
             armed: false,
@@ -511,7 +512,9 @@ impl<W: Write + Send> MpgSink<W> {
         Ok(())
     }
 
-    // The system header and program stream map of the first pack (MS-21 §2.7.8).
+    // The system header and program stream map of the first pack (MS-21 §2.7.8). Side
+    // effects: unseen extensions are unrouted and the video buffer is sized, so it runs once,
+    // before `Mux::new` clones `self.buffers`.
     fn first_pack_prefix(&mut self) -> Vec<u8> {
         // J23: an extension with no packets in the origin window is not described; its
         // packets, should they come later, are left out and reported like an orphan's.
@@ -798,6 +801,11 @@ impl<W: Write + Send> MpgSink<W> {
             return Err(crate::error::Error::MuxEmpty.into());
         }
         self.maybe_set_origin(true)?;
+        let Some(m) = self.mux.as_mut() else {
+            return Err(crate::error::Error::MuxEmpty.into());
+        };
+        let finished = m.finish();
+        // After the final drain, so EOF-time padding and forced passes are counted.
         let c = self.counters();
         if c != MpgCounters::default() {
             tracing::warn!(
@@ -807,14 +815,13 @@ impl<W: Write + Send> MpgSink<W> {
                 pstd_late_aus = c.pstd.late_aus,
                 pts_gap_over_0_7s = c.pstd.pts_gaps,
                 interleave_cap = c.pstd.interleave_cap,
+                padding_packs = c.pstd.padding_packs,
+                forced_eof = c.pstd.forced_eof,
                 rebased_gaps = c.pstd.rebased_gaps,
                 origin_saturated = c.origin_saturated,
                 "mpg: program stream needed corrections (counted, not refused)"
             );
         }
-        match self.mux.as_mut() {
-            Some(m) => m.finish(),
-            None => Err(crate::error::Error::MuxEmpty.into()),
-        }
+        finished
     }
 }
