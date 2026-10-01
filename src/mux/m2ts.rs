@@ -87,6 +87,7 @@ fn pid_fits(s: &DiscStream, pid: u16) -> bool {
     video == super::tsmux::is_video_pid(pid)
         && (0x0010..=0x1FFE).contains(&pid)
         && pid != super::tsmux::PMT_PID
+        && pid != super::tsmux::PCR_PID
 }
 
 // Lowest free carriable PID for `s`, searched from its BD base.
@@ -267,7 +268,8 @@ impl crate::pes::Stream for M2tsStream {
                 Ok(())
             }
             Some(Some((track, Repack::Adts(header)))) => {
-                let Some(adts) = super::codec::adts::adts_frame(header, &frame.data) else {
+                let blocks = super::codec::adts::raw_data_blocks(header, frame.duration_ns);
+                let Some(adts) = super::codec::adts::adts_frame(header, &frame.data, blocks) else {
                     tracing::warn!(target: "mux", track, len = frame.data.len(), "AAC access unit too long for ADTS; dropped");
                     return Ok(());
                 };
@@ -1150,6 +1152,32 @@ mod tests {
             0xFC,
         ];
         assert_eq!(pes[0].data, [&adts[..], &raw].concat());
+    }
+
+    // An ADTS source frame of two raw_data_blocks (2048 samples) keeps both: the header
+    // says number_of_raw_data_blocks_in_frame 1 (13818-7 §8.1.1.2), so none is skipped.
+    #[test]
+    fn a_multi_block_aac_frame_declares_every_raw_data_block() {
+        let mut title = make_title();
+        title.streams = vec![audio(0x1100, Codec::Aac)];
+        title.codec_privates = vec![Some(vec![0x11, 0x90])];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        let mut two = frame(0, 0, true, vec![0x21, 0x10, 0x04, 0x60, 0x8C, 0x21, 0x10]);
+        two.duration_ns = Some(2048 * 1_000_000_000 / 48_000);
+        stream.write(&two).unwrap();
+        stream.finish().unwrap();
+        drop(stream);
+        let (meta, ts) = ts_after_header(&shared.lock().unwrap());
+        let pid = match &meta.to_title().streams[0] {
+            DiscStream::Audio(a) => a.pid,
+            _ => unreachable!(),
+        };
+        let mut demux = crate::mux::ts::TsDemuxer::new(&[pid]);
+        let mut pes = demux.feed(&ts);
+        pes.extend(demux.flush());
+        assert_eq!(pes[0].data[6] & 3, 1, "two raw_data_blocks");
+        assert_eq!(&pes[0].data[7..], &two.data[..]);
     }
 
     #[test]

@@ -43,6 +43,15 @@ const HOLD_CAP_BYTES: usize = 64 * 1024 * 1024;
 
 /// PID of the program_map_section (BD-ROM convention); no stream may use it.
 pub(crate) const PMT_PID: u16 = 0x0100;
+/// PID of the adaptation-field-only PCR packets (BD-ROM convention); no stream may use it.
+pub(crate) const PCR_PID: u16 = 0x1001;
+// System clock (27 MHz) of a declared program: a frame's packets arrive this far before its
+// DTS, the T-STD delay cap (13818-1 §2.4.2.6), at most at 128 Mb/s (the UHD BD TS rate).
+const STC_LEAD: u64 = 27_000_000;
+const PACKET_STC: u64 = 188 * 8 * 27_000_000 / 128_000_000;
+// PCR at most 100 ms apart (BD-ROM, 13818-1 §2.7.2); a timeline jump past 10 s restarts it.
+const PCR_INTERVAL: u64 = 2_700_000;
+const STC_RESET: u64 = 10 * 27_000_000;
 // PAT/PMT repeat every 100 ms of PTS progress (the ETSI TR 101 290 PSI interval); a PTS
 // this far below the highest seen is a discontinuity and restarts the clock.
 const PSI_INTERVAL_TICKS: u64 = 9_000;
@@ -119,6 +128,14 @@ pub struct TsMuxer<W: Write> {
     /// (PTS of the last PAT/PMT, highest PTS since): decode-order PTS jitter and
     /// interleaved tracks do not re-send them.
     last_psi: Option<(u64, u64)>,
+    /// Arrival time of the next packet on the 27 MHz system clock; `None` before a
+    /// declared program's first frame.
+    stc: Option<u64>,
+    /// The last PCR written, and whether the next one flags a discontinuity.
+    last_pcr: Option<u64>,
+    pcr_discontinuity: bool,
+    /// Frames whose packets arrived after their DTS (input interleave beyond `STC_LEAD`).
+    late_frames: u64,
 }
 
 impl<W: Write> TsMuxer<W> {
@@ -144,6 +161,10 @@ impl<W: Write> TsMuxer<W> {
             stream_types: None,
             psi_cc: [0; 2],
             last_psi: None,
+            stc: None,
+            last_pcr: None,
+            pcr_discontinuity: false,
+            late_frames: 0,
         }
     }
 
@@ -189,18 +210,11 @@ impl<W: Write> TsMuxer<W> {
             tracing::warn!(target: "mux", tracks = types.len(), "bd-ts: PMT lists the first {MAX_PMT_ENTRIES} tracks only");
         }
         self.last_psi = Some((pts, pts));
-        let pcr_pid = self
-            .pids
-            .iter()
-            .copied()
-            .find(|&p| is_video_pid(p))
-            .or(self.pids.first().copied())
-            .unwrap_or(0x1FFF);
         let mut pat = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01];
         pat.extend_from_slice(&(0xE000 | PMT_PID).to_be_bytes());
         let pat = psi_section(0x00, &pat);
         let mut pmt = vec![0x00, 0x01, 0xC1, 0x00, 0x00];
-        pmt.extend_from_slice(&(0xE000 | pcr_pid).to_be_bytes());
+        pmt.extend_from_slice(&(0xE000 | PCR_PID).to_be_bytes());
         pmt.extend_from_slice(&(0xF000 | HDMV_REGISTRATION.len() as u16).to_be_bytes());
         pmt.extend_from_slice(&HDMV_REGISTRATION);
         for (&t, &pid) in types.iter().zip(&self.pids).take(MAX_PMT_ENTRIES) {
@@ -221,19 +235,82 @@ impl<W: Write> TsMuxer<W> {
             self.psi_cc[slot] = (cc + 1) & 0x0F;
             let pusi = if i == 0 { 0x40 } else { 0 };
             let mut pkt = [0xFFu8; 192];
-            pkt[..8].copy_from_slice(&[
-                0,
-                0,
-                0,
-                0,
-                SYNC_BYTE,
-                pusi | (pid >> 8) as u8,
-                pid as u8,
-                0x10 | cc,
-            ]);
+            pkt[..4].copy_from_slice(&self.arrival()?);
+            pkt[4..8].copy_from_slice(&[SYNC_BYTE, pusi | (pid >> 8) as u8, pid as u8, 0x10 | cc]);
             pkt[8..8 + chunk.len()].copy_from_slice(chunk);
             self.writer.write_all(&pkt)?;
         }
+        Ok(())
+    }
+
+    // Set the system clock for a frame decoded at `dts` (90 kHz): STC_LEAD before it, never
+    // backwards; a jump past STC_RESET either way restarts it.
+    fn clock_frame(&mut self, dts: u64) {
+        if self.stream_types.is_none() {
+            return;
+        }
+        let (dts, target) = (dts * 300, (dts * 300).saturating_sub(STC_LEAD));
+        let stc = match self.stc {
+            Some(stc) if target <= stc + STC_RESET && stc <= target + STC_RESET => {
+                self.late_frames += u64::from(dts < stc);
+                stc.max(target)
+            }
+            Some(_) => {
+                self.pcr_discontinuity = true;
+                self.last_pcr = None;
+                target
+            }
+            None => target,
+        };
+        self.stc = Some(stc);
+    }
+
+    // TP_extra_header of the next packet: its arrival_time_stamp (low 30 bits of the system
+    // clock), after any PCR packet due by then. All zero without a declared program.
+    fn arrival(&mut self) -> io::Result<[u8; 4]> {
+        let Some(mut t) = self.stc else {
+            return Ok([0; 4]);
+        };
+        loop {
+            let at = match self.last_pcr {
+                Some(p) if t < p + PCR_INTERVAL => break,
+                Some(p) => t.min(p + PCR_INTERVAL),
+                None => t,
+            };
+            self.write_pcr(at)?;
+            if at == t {
+                t += PACKET_STC;
+            }
+        }
+        self.stc = Some(t + PACKET_STC);
+        Ok(((t & 0x3FFF_FFFF) as u32).to_be_bytes())
+    }
+
+    // An adaptation-field-only packet on PCR_PID carrying PCR `at` (13818-1 §2.4.3.4); its
+    // continuity_counter does not advance (no payload).
+    fn write_pcr(&mut self, at: u64) -> io::Result<()> {
+        let base = (at / 300) & 0x1_FFFF_FFFF;
+        let ext = at % 300;
+        let flags = 0x10 | if self.pcr_discontinuity { 0x80 } else { 0 };
+        let mut pkt = [0xFFu8; 192];
+        pkt[..4].copy_from_slice(&((at & 0x3FFF_FFFF) as u32).to_be_bytes());
+        pkt[4..14].copy_from_slice(&[
+            SYNC_BYTE,
+            (PCR_PID >> 8) as u8,
+            PCR_PID as u8,
+            0x20,
+            183,
+            flags,
+            (base >> 25) as u8,
+            (base >> 17) as u8,
+            (base >> 9) as u8,
+            (base >> 1) as u8,
+        ]);
+        pkt[14] = ((base & 1) as u8) << 7 | 0x7E | (ext >> 8) as u8;
+        pkt[15] = ext as u8;
+        self.writer.write_all(&pkt)?;
+        self.last_pcr = Some(at);
+        self.pcr_discontinuity = false;
         Ok(())
     }
 
@@ -424,6 +501,7 @@ impl<W: Write> TsMuxer<W> {
         let pid = self.pids[track];
         let is_video = is_video_pid(pid);
         let dts_90k = if is_video { self.next_dts(track) } else { None };
+        self.clock_frame(dts_90k.unwrap_or(pts_90k));
         self.write_psi_if_due(pts_90k)?;
 
         // NAL video (HEVC/H.264): convert length-prefixed NALUs to Annex B and prepend
@@ -556,8 +634,7 @@ impl<W: Write> TsMuxer<W> {
                 (TS_PAYLOAD_BYTES - remaining, remaining)
             };
 
-            // TP_extra_header (4 bytes — arrival time, set to 0)
-            let tp_extra = [0u8; 4];
+            let tp_extra = self.arrival()?;
 
             // TS header (4 bytes)
             let cc = self.continuity[track];
@@ -661,6 +738,13 @@ impl<W: Write> TsMuxer<W> {
                 dts_hold_overflow = c.hold_overflow,
                 "bd-ts: video DTS needed correction (PTS-only or guarded AUs)"
             );
+        }
+        if self.late_frames > 0 {
+            tracing::warn!(
+                late_frames = self.late_frames,
+                "bd-ts: frames arrive after their DTS (source interleave over 1 s)"
+            );
+            self.late_frames = 0;
         }
         if self.frame_count == 0 {
             return Err(crate::error::Error::MuxEmpty.into());
@@ -774,6 +858,8 @@ mod tests {
 
     /// Parsed BD-TS packet (192 bytes total: 4 TP_extra + 4 TS header + 184 body).
     struct TsPacket {
+        /// TP_extra_header arrival_time_stamp (low 30 bits).
+        ats: u32,
         pid: u16,
         pusi: bool,
         #[allow(dead_code)]
@@ -816,6 +902,7 @@ mod tests {
             };
 
             out.push(TsPacket {
+                ats: u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) & 0x3FFF_FFFF,
                 pid,
                 pusi,
                 cc,
@@ -1348,6 +1435,117 @@ mod tests {
         }
         let pats = parse_bd_ts(&sink).iter().filter(|p| p.pid == 0).count();
         assert_eq!(pats, 13);
+    }
+
+    // A PES header's 33-bit PTS and DTS (DTS = PTS when absent), 90 kHz.
+    fn pes_pts_dts(payload: &[u8]) -> (u64, u64) {
+        let ts = |b: &[u8]| {
+            (u64::from(b[0] >> 1 & 7) << 30)
+                | (u64::from(b[1]) << 22)
+                | (u64::from(b[2] >> 1) << 15)
+                | (u64::from(b[3]) << 7)
+                | u64::from(b[4] >> 1)
+        };
+        let pts = ts(&payload[9..14]);
+        let dts = if payload[7] & 0x40 != 0 {
+            ts(&payload[14..19])
+        } else {
+            pts
+        };
+        (pts, dts)
+    }
+
+    // The PCR of an adaptation field (13818-1 §2.4.3.5): base * 300 + extension, 27 MHz.
+    fn af_pcr(af: &[u8]) -> Option<u64> {
+        (af.len() >= 7 && af[0] & 0x10 != 0).then(|| {
+            let base = (u64::from(u32::from_be_bytes([af[1], af[2], af[3], af[4]])) << 1)
+                | u64::from(af[5] >> 7);
+            base * 300 + (u64::from(af[5] & 1) << 8 | u64::from(af[6]))
+        })
+    }
+
+    // 13818-1 §2.4.3.5 / BD-ROM: a PCR on the PMT's PCR_PID at most 100 ms apart, before
+    // the first PES; arrival stamps on the same 27 MHz clock, never past a PES's DTS nor
+    // more than the 1 s T-STD delay (§2.4.2.6) ahead of it.
+    #[test]
+    fn pcr_paces_arrival_at_most_100ms_apart_and_never_past_a_dts() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.set_program(vec![0x24, 0x81]).unwrap();
+            // 25 fps video + audio; frame 10 is a 2 MB keyframe (> 100 ms of packets),
+            // then a 400 ms gap from frame 30.
+            for i in 0..40i64 {
+                let pts = i * 40_000_000 + if i >= 30 { 400_000_000 } else { 0 };
+                let size = if i == 10 { 2_000_000 } else { 3_000 };
+                let nal = fake_hevc_nal(if i % 10 == 0 { 19 } else { 1 }, size);
+                mux.write_frame(0, pts, i % 10 == 0, &nal).unwrap();
+                mux.write_frame(1, pts + 5_000_000, true, &[0x0B, 0x77, 0, 0])
+                    .unwrap();
+            }
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let pmt = packets.iter().find(|p| p.pid == PMT_PID).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([pmt.payload[9], pmt.payload[10]]) & 0x1FFF,
+            PCR_PID
+        );
+        let (mut last_ats, mut last_pcr, mut pes) = (0, None::<u64>, 0);
+        for p in &packets {
+            assert!(p.ats >= last_ats, "arrival stamps are monotonic");
+            last_ats = p.ats;
+            if p.pid == PCR_PID {
+                let pcr = af_pcr(p.af.as_deref().unwrap()).unwrap();
+                assert_eq!(pcr as u32 & 0x3FFF_FFFF, p.ats, "ATS on the PCR clock");
+                if let Some(last) = last_pcr {
+                    assert!(pcr > last && pcr - last <= 2_700_000, "PCR {last} -> {pcr}");
+                }
+                last_pcr = Some(pcr);
+            } else if p.pusi && p.pid != PMT_PID && p.pid != 0 {
+                assert!(last_pcr.is_some(), "a PCR precedes the first PES");
+                let dts = pes_pts_dts(&p.payload).1 * 300;
+                let ats = u64::from(p.ats);
+                assert!(
+                    ats <= dts && dts - ats <= 27_000_000,
+                    "ATS {ats} vs DTS {dts}"
+                );
+                pes += 1;
+            }
+        }
+        assert_eq!(pes, 80);
+    }
+
+    // A timeline jump back past the reset window restarts the clock, flagged by the
+    // discontinuity_indicator (13818-1 §2.4.3.5), instead of stamping every later PES late.
+    #[test]
+    fn a_backward_timeline_jump_restarts_the_pcr_with_a_discontinuity() {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.set_program(vec![0x81]).unwrap();
+            for pts in [
+                0,
+                5_000_000_000,
+                10_000_000_000,
+                15_000_000_000,
+                1_000_000_000,
+            ] {
+                mux.write_frame(0, pts, true, &[0x0B, 0x77]).unwrap();
+            }
+            mux.finish().unwrap();
+        }
+        let pcrs: Vec<(u64, bool)> = parse_bd_ts(&sink)
+            .iter()
+            .filter(|p| p.pid == PCR_PID)
+            .map(|p| {
+                let af = p.af.as_deref().unwrap();
+                (af_pcr(af).unwrap(), af[0] & 0x80 != 0)
+            })
+            .collect();
+        let (last, flagged) = pcrs[pcrs.len() - 1];
+        assert!(flagged && last < pcrs[pcrs.len() - 2].0, "{pcrs:?}");
+        assert!(pcrs[..pcrs.len() - 1].iter().all(|&(_, d)| !d));
     }
 
     #[test]

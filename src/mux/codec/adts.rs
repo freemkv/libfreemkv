@@ -111,13 +111,35 @@ pub(crate) fn adts_template(asc: &[u8]) -> Option<[u8; ADTS_HEADER_BYTES]> {
     ])
 }
 
-/// `raw` as one ADTS frame under `template`; `None` past the 13-bit frame_length.
-pub(crate) fn adts_frame(template: [u8; ADTS_HEADER_BYTES], raw: &[u8]) -> Option<Vec<u8>> {
+/// raw_data_block()s in an access unit lasting `duration_ns` at `template`'s rate: an
+/// ADTS source frame keeps all of its 1..=4 blocks. 1 unless the duration is within a
+/// sample of a whole number of 1024-sample blocks.
+pub(crate) fn raw_data_blocks(template: [u8; ADTS_HEADER_BYTES], duration_ns: Option<u64>) -> u8 {
+    let rate = u64::from(ADTS_SAMPLE_RATE_VALID[usize::from((template[2] >> 2) & 15)]);
+    let Some(scaled) = duration_ns.and_then(|d| d.checked_mul(rate)) else {
+        return 1;
+    };
+    let n = scaled.saturating_add(512_000_000_000) / 1_024_000_000_000;
+    if (1..=4).contains(&n) && scaled.abs_diff(n * 1_024_000_000_000) <= 1_000_000_000 {
+        n as u8
+    } else {
+        1
+    }
+}
+
+/// `raw` (`blocks` raw_data_block()s) as one ADTS frame under `template`; `None` past the
+/// 13-bit frame_length.
+pub(crate) fn adts_frame(
+    template: [u8; ADTS_HEADER_BYTES],
+    raw: &[u8],
+    blocks: u8,
+) -> Option<Vec<u8>> {
     let len = ADTS_HEADER_BYTES + raw.len();
-    if len >= 1 << 13 {
+    if len >= 1 << 13 || !(1..=4).contains(&blocks) {
         return None;
     }
     let mut h = template;
+    h[6] |= blocks - 1;
     h[3] |= (len >> 11) as u8;
     h[4] = (len >> 3) as u8;
     h[5] |= ((len & 7) << 5) as u8;
@@ -401,6 +423,18 @@ mod tests {
         p.parse(&pes);
         p.flush();
         assert_eq!(p.config_changes(), 0);
+    }
+
+    // The block count comes only from a duration of whole 1024-sample blocks.
+    #[test]
+    fn raw_data_blocks_trusts_only_whole_block_durations() {
+        let t = adts_template(&[0x11, 0x90]).unwrap();
+        let ns = |samples: u64| Some(samples * 1_000_000_000 / 48_000);
+        assert_eq!(raw_data_blocks(t, ns(2048)), 2);
+        assert_eq!(raw_data_blocks(t, ns(4096)), 4);
+        for d in [None, ns(1536), ns(5120), Some(u64::MAX)] {
+            assert_eq!(raw_data_blocks(t, d), 1, "{d:?}");
+        }
     }
 
     #[test]

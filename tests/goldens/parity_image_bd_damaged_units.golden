@@ -16,7 +16,7 @@ title-read blanked = 3
 iso-mkv outcome = completed=true opened=true bytes=37424 errors=8 lost=18432 streams=3 undelivered=[]
 iso-mkv out o.mkv = 39926 bytes sha256:339adfed83a9095dc0b4eea03ec907c8
 iso-m2ts outcome = completed=true opened=true bytes=37424 errors=8 lost=18432 streams=3 undelivered=[]
-iso-m2ts out o.m2ts = 51456 bytes sha256:d5442807a42b63158522858ce292fb49
+iso-m2ts out o.m2ts = 52992 bytes sha256:eab70dc59a7d7bda01b3368baf5c8cc0
 iso-null outcome = completed=true opened=true bytes=37424 errors=8 lost=18432 streams=3 undelivered=[]
 iso-mkv-raw refused = E6008
 iso-mkv-selection outcome = completed=true opened=true bytes=29232 errors=8 lost=18432 streams=2 undelivered=[]
