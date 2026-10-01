@@ -705,6 +705,107 @@ fn durable_sync_file_stall_and_stop() {
     assert!(t.elapsed() < SLACK, "{:?}", t.elapsed());
 }
 
+// A flush whose primitives fail or whose counter jumps by `step` per sample.
+struct ScriptedOps {
+    range_err: bool,
+    finish_err: bool,
+    finish_sleep: Duration,
+    step: AtomicU64,
+}
+
+impl ScriptedOps {
+    fn new() -> Self {
+        Self {
+            range_err: false,
+            finish_err: false,
+            finish_sleep: Duration::ZERO,
+            step: AtomicU64::new(0),
+        }
+    }
+}
+
+impl FlushOps for ScriptedOps {
+    fn chunk(&self, _: &File) -> io::Result<()> {
+        Ok(())
+    }
+    fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
+        self.range_err.then(|| Err(io::Error::from_raw_os_error(5)))
+    }
+    fn finish(&self, _: &File) -> io::Result<()> {
+        std::thread::sleep(self.finish_sleep);
+        if self.finish_err {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        Ok(())
+    }
+    fn sample(&self) -> Option<u64> {
+        (self.step.load(Ordering::SeqCst) > 0)
+            .then(|| self.step.fetch_add(1 << 40, Ordering::SeqCst))
+    }
+}
+
+/// A failed range sync or final flush is the call's error, never a quiet success.
+#[test]
+fn durable_sync_file_surfaces_range_and_finish_errors() {
+    let (_d, f) = sized_file(8 * K);
+    let t = durable_timing(Duration::from_secs(30));
+    let range = ScriptedOps {
+        range_err: true,
+        ..ScriptedOps::new()
+    };
+    let e = durable_sync_file_with(&f, None, |_, _| {}, Arc::new(range), t)
+        .expect_err("a failed range sync fails");
+    assert_eq!(e.raw_os_error(), Some(5), "{e}");
+    let finish = ScriptedOps {
+        finish_err: true,
+        ..ScriptedOps::new()
+    };
+    let e = durable_sync_file_with(&f, None, |_, _| {}, Arc::new(finish), t)
+        .expect_err("a failed final flush fails");
+    assert_eq!(e.raw_os_error(), Some(5), "{e}");
+}
+
+/// A sampled counter past the file length (other writers on the mount) never reports over
+/// 100% and still ends with the final `(len, len)` report.
+#[test]
+fn durable_sync_file_clamps_sampled_progress_below_the_length() {
+    let ops = ScriptedOps {
+        finish_sleep: W * 3,
+        step: AtomicU64::new(1),
+        ..ScriptedOps::new()
+    };
+    let (_d, f) = sized_file(8 * K);
+    let mut seen = Vec::new();
+    durable_sync_file_with(
+        &f,
+        None,
+        |d, n| seen.push((d, n)),
+        Arc::new(ops),
+        durable_timing(W),
+    )
+    .unwrap();
+    assert!(seen.len() >= 2, "sampled while blocked: {seen:?}");
+    assert!(seen.iter().all(|(d, n)| d <= n), "over 100%: {seen:?}");
+    assert_eq!(seen.last(), Some(&(8 * K, 8 * K)));
+}
+
+/// An empty file still gets its one completion report.
+#[test]
+fn durable_sync_file_reports_an_empty_file_once() {
+    let (_d, f) = sized_file(0);
+    let mut seen = Vec::new();
+    let t = durable_timing(W);
+    durable_sync_file_with(
+        &f,
+        None,
+        |d, n| seen.push((d, n)),
+        Arc::new(ScriptedOps::new()),
+        t,
+    )
+    .unwrap();
+    assert_eq!(seen, [(0, 0)]);
+}
+
 const MOUNTSTATS: &str = "\
 device rootfs mounted on / with fstype rootfs
 device nas:/export mounted on /mnt/nas with fstype nfs4 statvers=1.1

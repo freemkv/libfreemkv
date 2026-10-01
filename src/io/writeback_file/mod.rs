@@ -695,6 +695,54 @@ mod tests {
         assert!(w.hinted, "reservation released before a successful sync");
     }
 
+    // Rebinding the flush counters carries the length so far, makes the new counters the
+    // file's own, and moves a running flusher's durable credit onto them.
+    #[test]
+    fn set_flush_progress_rebinds_every_holder() {
+        struct OkOps;
+        impl FlushOps for OkOps {
+            fn chunk(&self, _: &File) -> io::Result<()> {
+                Ok(())
+            }
+            fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
+                None
+            }
+            fn finish(&self, _: &File) -> io::Result<()> {
+                Ok(())
+            }
+            fn sample(&self) -> Option<u64> {
+                None
+            }
+        }
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"12345").unwrap();
+        let timing = FlushTiming {
+            chunk_min: 100,
+            chunk_max: 100,
+            ..FlushTiming::default()
+        };
+        let mut w = WritebackFile::with_flush_ops(file, Arc::new(OkOps), timing).unwrap();
+        w.write_all(&[0u8; 100]).unwrap();
+        let fresh = FlushProgress::default();
+        w.set_flush_progress(fresh.clone());
+        assert_eq!(
+            fresh.bytes_total(),
+            105,
+            "the length so far is carried over"
+        );
+        w.write_all(&[0u8; 300]).unwrap();
+        assert_eq!(w.flush_progress().bytes_total(), 405);
+        assert_eq!(fresh.bytes_total(), 405, "writes count on the new counters");
+        let start = std::time::Instant::now();
+        while fresh.bytes_durable() == 0 && start.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            fresh.bytes_durable() > 0,
+            "the flusher credits the new counters"
+        );
+    }
+
     // `sync_all` is idempotent: calling it twice, then Drop (also
     // finalizes), must not corrupt data or panic.
     #[test]

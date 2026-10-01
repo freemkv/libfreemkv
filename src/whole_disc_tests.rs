@@ -173,6 +173,16 @@ fn unit_aligned_widens_reads_onto_each_files_grid() {
     assert_eq!(r.inner.reads, vec![(305, 3)]);
 }
 
+// A partial last unit is read to the span's end, never onto the sectors beyond it.
+#[test]
+fn unit_aligned_does_not_widen_a_read_past_the_span_end() {
+    let mut r = reader(vec![(100, 4, 100)]);
+    let mut buf = vec![0u8; 2048];
+    r.read_sectors(103, 1, &mut buf, false).unwrap();
+    assert_eq!(r.inner.reads, vec![(103, 1)]);
+    assert_eq!(buf[0], 103);
+}
+
 #[test]
 fn unit_aligned_propagates_inner_read_errors_on_both_paths() {
     let mut r = reader(vec![(100, 30, 100)]);
@@ -208,6 +218,9 @@ fn unit_block_end_pulls_back_to_the_straddling_units_head() {
     assert_eq!(r.unit_block_end(90, 103), 103);
     assert_eq!(r.unit_block_end(103, 104), 104);
     assert_eq!(r.unit_block_end(0, 50), 50);
+    // The straddled unit's head lies before the span: no pull-back into the previous region.
+    let r = reader(vec![(300, 9, 299)]);
+    assert_eq!(r.unit_block_end(250, 300), 300);
 }
 
 // Spec guards (keys-upfront-design §7.8) on the per-file unit grid.
@@ -336,6 +349,33 @@ mod spec_guards {
             "no piece of its own: not re-keyed, not re-probed"
         );
     }
+}
+
+// The inner source's access pattern and speed control reach the mux/driver through the wrapper.
+#[test]
+fn unit_aligned_forwards_random_access_and_speed() {
+    #[derive(Default)]
+    struct Sequential {
+        speed: Option<u16>,
+    }
+    impl SectorSource for Sequential {
+        fn capacity_sectors(&self) -> u32 {
+            0
+        }
+        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+            Ok(0)
+        }
+        fn random_access(&self) -> bool {
+            false
+        }
+        fn set_speed(&mut self, kbs: u16) {
+            self.speed = Some(kbs);
+        }
+    }
+    let mut r = UnitAligned::new(Sequential::default(), Vec::new());
+    assert!(!r.random_access());
+    r.set_speed(1234);
+    assert_eq!(r.inner.speed, Some(1234));
 }
 
 // UnitAligned wraps the decrypting reader for whole-disc/image copies; it must
