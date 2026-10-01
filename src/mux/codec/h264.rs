@@ -1750,6 +1750,98 @@ mod tests {
         types
     }
 
+    // The parameter sets a later bare keyframe re-asserts are the ACTIVE ones, not the first-seen
+    // avcC copy: a player re-applies avcC at every keyframe, so reverting would undo the change.
+    #[test]
+    fn a_bare_keyframe_reasserts_the_active_param_sets_not_the_avcc_copy() {
+        let nals = |fd: &[u8]| -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut off = 0;
+            while off + 4 <= fd.len() {
+                let len =
+                    u32::from_be_bytes([fd[off], fd[off + 1], fd[off + 2], fd[off + 3]]) as usize;
+                out.push(fd[off + 4..off + 4 + len].to_vec());
+                off += 4 + len;
+            }
+            out
+        };
+        let au = |sps: Option<u8>, pps: Option<u8>, slice: &[u8]| {
+            let mut d = Vec::new();
+            if let Some(b) = sps {
+                d.extend_from_slice(&[0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, b]);
+            }
+            if let Some(b) = pps {
+                d.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, b]);
+            }
+            d.extend_from_slice(&[0x00, 0x00, 0x01]);
+            d.extend_from_slice(slice);
+            d
+        };
+        let mut parser = H264Parser::new();
+        parser.parse(&make_pes(
+            au(Some(0xAA), Some(0x11), &[0x65, 0x10]),
+            Some(0),
+        ));
+        // Mid-title redefinition of both sets, on a non-keyframe access unit.
+        let f = parser.parse(&make_pes(
+            au(Some(0xBB), Some(0x22), &[0x41, 0x9A]),
+            Some(3000),
+        ));
+        assert_eq!(frame_nal_types(&f[0].data), vec![7, 8, 1]);
+        // A bare IDR: SPS then PPS, both the redefined bodies.
+        let f = parser.parse(&make_pes(au(None, None, &[0x65, 0x10]), Some(6000)));
+        let n = nals(&f[0].data);
+        assert_eq!(frame_nal_types(&f[0].data), vec![7, 8, 5]);
+        assert_eq!(n[0].last(), Some(&0xBB), "active SPS, not the avcC copy");
+        assert_eq!(n[1].last(), Some(&0x22), "active PPS, not the avcC copy");
+    }
+
+    #[test]
+    fn slice_types_map_to_coding_types() {
+        use CodingType::{B, I, P};
+        let expect = [P, B, I, P, I, P, B, I, P, I];
+        for (st, want) in expect.into_iter().enumerate() {
+            assert_eq!(h264_slice_coding_type(st as u32), Some(want), "{st}");
+        }
+        assert_eq!(h264_slice_coding_type(10), None);
+        assert_eq!(h264_slice_coding_type(u32::MAX), None);
+    }
+
+    #[test]
+    fn avcc_oversized_pps_returns_none() {
+        let mut data = vec![0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0xAA];
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x68]);
+        data.extend_from_slice(&vec![0x11u8; 70_000]);
+        let mut parser = H264Parser::new();
+        parser.parse(&make_pes(data, Some(0)));
+        assert!(
+            parser.codec_private().is_none(),
+            "oversized PPS must not produce a truncated avcC"
+        );
+    }
+
+    // ISO 14496-15 §5.3.3.1.2: every profile whose SPS carries chroma_format_idc and bit depths
+    // gets the 4 avcC extension bytes; Baseline/Main/Extended must not.
+    #[test]
+    fn avcc_extension_bytes_follow_exactly_the_chroma_carrying_profiles() {
+        for profile in [
+            100u8, 110, 122, 144, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+        ] {
+            let sps = build_high_profile_sps(profile, 1, 0, 0);
+            let mut parser = H264Parser::new();
+            feed_sps_pps(&mut parser, &sps);
+            let cp = parser.codec_private().expect("avcC");
+            assert_eq!(cp.len(), sps.len() + 14 + 4, "profile {profile}");
+        }
+        for profile in [66u8, 77, 88] {
+            let sps = build_high_profile_sps(profile, 1, 0, 0);
+            let mut parser = H264Parser::new();
+            feed_sps_pps(&mut parser, &sps);
+            let cp = parser.codec_private().expect("avcC");
+            assert_eq!(cp.len(), sps.len() + 14, "profile {profile}");
+        }
+    }
+
     // An IDR whose SPS changed but whose PPS did not: the re-asserted PPS must follow
     // the new SPS (§7.3.2.2: a PPS is parsed against its SPS).
     #[test]

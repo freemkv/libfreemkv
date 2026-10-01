@@ -33,13 +33,12 @@ const PICTURE_TYPE_I: u8 = 1;
 #[cfg(test)]
 const MAX_AU_BUFFER: usize = 8 * 1024 * 1024;
 
-/// Cap on frames held awaiting the first PES PTS anchor. A DVD stamps a PTS in
-/// the first VOBU (~0.5 s ≈ 15 frames); this leaves generous slack. If no PTS
-/// ever arrives within the cap, buffered frames are released on a 0 base.
+/// Cap on frames buffered in one GOP. A DVD GOP is ~15 frames; a run reaching the
+/// cap is force-flushed as its own GOP, and each split re-locks its origin and
+/// display-order PTS from the frames it holds.
 const MAX_PENDING_FRAMES: usize = 600;
 
-// Byte cap on frames held awaiting the first PES PTS anchor; mirrors the AC-3/DTS/PGS byte
-// caps.
+// Byte cap on one buffered GOP; mirrors the AC-3/DTS/PGS byte caps.
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 /// Frame rate table (index from sequence header frame_rate_code).
@@ -451,7 +450,7 @@ fn picture_coding_flags(au: &[u8]) -> (bool, bool, bool, bool) {
 /// codec-agnostic [`CodingType`]: 1 → I, 3 → B, else (2 = P, 4 = D) → P.
 fn coding_type_from_raw(raw: u8) -> CodingType {
     match raw {
-        1 => CodingType::I,
+        PICTURE_TYPE_I => CodingType::I,
         3 => CodingType::B,
         _ => CodingType::P,
     }
@@ -539,6 +538,55 @@ mod tests {
         for f in &frames {
             assert_eq!(f.coding.unwrap().field_order(), Some(FieldOrder::Tff));
         }
+    }
+
+    #[test]
+    fn a_second_top_field_starts_a_new_pair_instead_of_partnering_the_first() {
+        use crate::mux::codec::coding::FieldOrder;
+        let mut p = Mpeg2Parser::new();
+        let mut frames = Vec::new();
+        // top, top, bottom: the bottom field pairs with the SECOND top field.
+        for (i, (ct, e2)) in [(1u8, 0x01u8), (2, 0x01), (2, 0x02)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut au = Vec::new();
+            if i == 0 {
+                au.extend_from_slice(&make_seq_header(720, 576, 3, 3));
+            }
+            au.extend_from_slice(&make_picture_header(ct));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            frames.extend(p.parse(&make_pes(au, None)));
+        }
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 3);
+        for f in &frames {
+            assert_eq!(f.coding.unwrap().field_order(), Some(FieldOrder::Tff));
+        }
+    }
+
+    #[test]
+    fn a_pts_jump_in_a_later_gop_relocks_the_timeline_origin() {
+        // 25 fps = 40 ms. GOP 1 anchors at 0; GOP 2 carries a PES PTS of 10 s
+        // (a clip boundary), so its frames follow it, not GOP 1's extrapolation.
+        let mut p = Mpeg2Parser::new();
+        let mut g1 = make_seq_header(720, 480, 3, 3);
+        g1.extend_from_slice(&gop());
+        g1.extend_from_slice(&make_picture_header_tr(1, 0));
+        g1.extend_from_slice(&[0xAA; 10]);
+        g1.extend_from_slice(&make_picture_header_tr(2, 1));
+        g1.extend_from_slice(&[0xBB; 10]);
+        let mut frames = p.parse(&make_pes(g1, Some(0)));
+        let mut g2 = gop();
+        g2.extend_from_slice(&make_picture_header_tr(1, 0));
+        g2.extend_from_slice(&[0xCC; 10]);
+        frames.extend(p.parse(&make_pes(g2, Some(10 * 90_000))));
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[1].pts_ns, 40_000_000);
+        assert_eq!(frames[2].pts_ns, 10_000_000_000);
     }
 
     #[test]
