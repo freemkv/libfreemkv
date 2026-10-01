@@ -179,6 +179,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
             // this track's sample count (indices past it are never read).
             let sizes = find_box(stbl, b"stsz")
                 .map(|b| parse_stsz(b, sample_budget))
+                .or_else(|| find_box(stbl, b"stz2").map(|b| parse_stz2(b, sample_budget)))
                 .unwrap_or_default();
             let n = sizes.len();
             if n == 0 {
@@ -820,7 +821,7 @@ fn audio_rate(entry: u32, timescale: u32, dts_hd: Option<bool>) -> u32 {
             !known(entry)
                 && timescale > 0xFFFF
                 && known(timescale)
-                && timescale.is_multiple_of(entry)
+                && (timescale.is_multiple_of(entry) || entry == timescale & 0xFFFF)
         }
     };
     if wider { timescale } else { entry }
@@ -1035,6 +1036,35 @@ fn parse_stsz(b: &[u8], max: usize) -> Vec<u32> {
             break;
         }
         out.push(be32(b, o));
+    }
+    out
+}
+
+/// stz2 (compact sample sizes, field size 4 / 8 / 16 bits) → per-sample sizes.
+fn parse_stz2(b: &[u8], max: usize) -> Vec<u32> {
+    if b.len() < 12 {
+        return Vec::new();
+    }
+    let field_size = b[7] as usize;
+    if !matches!(field_size, 4 | 8 | 16) {
+        return Vec::new();
+    }
+    let count = (be32(b, 8) as usize).min(max);
+    let body = &b[12..];
+    // `count` entries of `field_size` bits can't exceed the box body.
+    let mut out = Vec::with_capacity(count.min(body.len() * 8 / field_size));
+    for i in 0..count {
+        let size = match field_size {
+            4 => body
+                .get(i / 2)
+                .map(|&v| u32::from(if i % 2 == 0 { v >> 4 } else { v & 0xF })),
+            8 => body.get(i).map(|&v| u32::from(v)),
+            _ => body
+                .get(i * 2..i * 2 + 2)
+                .map(|v| u32::from(u16::from_be_bytes([v[0], v[1]]))),
+        };
+        let Some(size) = size else { break };
+        out.push(size);
     }
     out
 }
@@ -3039,6 +3069,14 @@ mod tests {
             p.extend_from_slice(&3u32.to_be_bytes()); // count = 3 (samples exist)
             mp4_box(b"stsz", &p)
         };
+        // Compact form of the same three 10-byte samples (omit == "stz2" swaps it in).
+        let stz2 = {
+            let mut p = vec![0u8; 4]; // version+flags
+            p.extend_from_slice(&[0, 0, 0, 8]); // reserved, field_size = 8
+            p.extend_from_slice(&3u32.to_be_bytes()); // count
+            p.extend_from_slice(&[10, 10, 10]);
+            mp4_box(b"stz2", &p)
+        };
         let stco = {
             let mut p = Vec::new();
             p.extend_from_slice(&[0, 0, 0, 0]);
@@ -3068,8 +3106,11 @@ mod tests {
         };
         let mut stbl = Vec::new();
         stbl.extend_from_slice(&stsd);
-        if omit != b"stsz" {
+        if omit != b"stsz" && omit != b"stz2" {
             stbl.extend_from_slice(&stsz);
+        }
+        if omit == b"stz2" {
+            stbl.extend_from_slice(&stz2);
         }
         if omit != b"stco" {
             stbl.extend_from_slice(&stco);
@@ -3086,6 +3127,62 @@ mod tests {
         mdia.extend_from_slice(&hdlr);
         mdia.extend_from_slice(&minf);
         mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+    }
+
+    // Samples come out in global decode order, interleaved across tracks.
+    #[test]
+    fn samples_from_two_tracks_are_interleaved_by_decode_time() {
+        use std::io::Cursor;
+        let mut body = audio_trak_missing(b"____");
+        body.extend(audio_trak_missing(b"____"));
+        let rd =
+            Mp4Reader::from_reader(Cursor::new(mp4_box(b"moov", &body)), "two".into()).unwrap();
+        let order: Vec<usize> = rd.samples.iter().map(|s| s.track).collect();
+        assert_eq!(order, vec![0, 1, 0, 1, 0, 1]);
+    }
+
+    // The title duration is the longest track, whatever order the tracks come in.
+    #[test]
+    fn title_duration_is_the_longest_track() {
+        use std::io::Cursor;
+        let mut body = audio_trak(1_000); // 1 s
+        body.extend(audio_trak(48_000)); // ~21 ms
+        let rd =
+            Mp4Reader::from_reader(Cursor::new(mp4_box(b"moov", &body)), "dur".into()).unwrap();
+        assert!((rd.info().duration_secs - 1.0).abs() < 1e-9);
+    }
+
+    // A 16.16 samplerate whose integer part was truncated to u16 resolves to the mdhd rate.
+    #[test]
+    fn audio_rate_recovers_a_u16_truncated_entry_rate() {
+        assert_eq!(audio_rate(96_000 & 0xFFFF, 96_000, None), 96_000);
+        assert_eq!(audio_rate(48_000, 48_000, None), 48_000);
+        assert_eq!(audio_rate(44_100, 96_000, None), 44_100);
+    }
+
+    // A compact `stz2` size table carries the track's samples like `stsz` does.
+    #[test]
+    fn stz2_sizes_populate_the_track_samples() {
+        use std::io::Cursor;
+        let moov = mp4_box(b"moov", &audio_trak_missing(b"stz2"));
+        let rd = Mp4Reader::from_reader(Cursor::new(moov), "stz2".into()).unwrap();
+        assert_eq!(rd.samples.len(), 3);
+        assert_eq!(rd.samples[0].size, 10);
+    }
+
+    #[test]
+    fn parse_stz2_decodes_each_field_size() {
+        let hdr = |fs: u8, n: u32| {
+            let mut b = vec![0, 0, 0, 0, 0, 0, 0, fs];
+            b.extend_from_slice(&n.to_be_bytes());
+            b
+        };
+        let with = |fs, n, body: &[u8]| [hdr(fs, n), body.to_vec()].concat();
+        assert_eq!(parse_stz2(&with(4, 3, &[0x12, 0x30]), 99), vec![1, 2, 3]);
+        assert_eq!(parse_stz2(&with(8, 2, &[7, 9]), 99), vec![7, 9]);
+        assert_eq!(parse_stz2(&with(16, 1, &[1, 2]), 99), vec![0x0102]);
+        assert!(parse_stz2(&with(12, 1, &[1, 2]), 99).is_empty());
+        assert_eq!(parse_stz2(&with(8, 5, &[7, 9]), 99), vec![7, 9]);
     }
 
     // A track with samples (`stsz`) but no chunk-offset table (`stco`/`co64`) must be DROPPED,
