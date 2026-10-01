@@ -551,6 +551,11 @@ mod tests {
 
     // A playlist: one play item of `secs` seconds with `n_audio` audio streams.
     fn build_mpls(secs: u32, n_audio: u8) -> Vec<u8> {
+        build_mpls_pg(secs, n_audio, 0)
+    }
+
+    // As `build_mpls`, plus `n_pg` PG subtitle streams after the audio.
+    fn build_mpls_pg(secs: u32, n_audio: u8, n_pg: u8) -> Vec<u8> {
         let playlist_start: u32 = 40;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"MPLS0200");
@@ -582,10 +587,16 @@ mod tests {
         item.extend_from_slice(&[0u8; 2]); // reserved
         item.push(0); // n_video
         item.push(n_audio); // n_audio
-        item.extend_from_slice(&[0u8; 6]); // pg/ig/sec.../dv counts
+        item.push(n_pg); // n_pg
+        item.extend_from_slice(&[0u8; 5]); // ig/sec.../dv counts
         item.extend_from_slice(&[0u8; 4]); // reserved
         for i in 0..n_audio {
             item.extend_from_slice(&audio_stream_entry(0x1100 + i as u16));
+        }
+        for i in 0..n_pg {
+            item.extend_from_slice(&[3, 0x01]);
+            item.extend_from_slice(&(0x1200 + i as u16).to_be_bytes());
+            item.extend_from_slice(&[4, 0x90, b'e', b'n', b'g']);
         }
         let stn_len = (item.len() - stn_start - 2) as u16;
         item[stn_start..stn_start + 2].copy_from_slice(&stn_len.to_be_bytes());
@@ -949,6 +960,83 @@ mod tests {
         assert_eq!(resolve(&mut disc, &udf, &[]), None);
     }
 
+    // Only AUTOSTART apps' jars are Tier-2 targets: a PRESENT-only decoy app's jar,
+    // naming a longer playlist, must not join the candidate set.
+    #[test]
+    fn tier2_ignores_non_autostart_apps() {
+        let auto_jar = build_jar(&[("com/studio/MainXlet.class", build_class(&["00800.mpls"]))]);
+        let decoy_jar = build_jar(&[("com/studio/Decoy.class", build_class(&["00801.mpls"]))]);
+        let (mut disc, udf) = build_disc(
+            vec![
+                ("00800.mpls", build_mpls(7000, 6)),
+                ("00801.mpls", build_mpls(9000, 6)),
+            ],
+            vec![("00000.jar", auto_jar), ("00009.jar", decoy_jar)],
+            vec![("00000.bdjo", bdjo_with_apps(&[(1, "00000"), (2, "00009")]))],
+        );
+        let hint = resolve(&mut disc, &udf, &[]).expect("Tier-2 hint");
+        assert_eq!(hint.playlist_id, Some(800));
+    }
+
+    // A manifest over MAX_MANIFEST_BYTES is skipped, so Tier 2 decides.
+    #[test]
+    fn oversized_manifest_is_not_a_tier1_hint() {
+        let mut props = b"feature.playlist.id=00800\n".to_vec();
+        props.resize(MAX_MANIFEST_BYTES + 16, b' ');
+        let jar = build_jar(&[
+            ("app.properties", props),
+            ("com/studio/MainXlet.class", build_class(&["00801.mpls"])),
+        ]);
+        let (mut disc, udf) = build_disc(
+            vec![
+                ("00800.mpls", build_mpls(7000, 6)),
+                ("00801.mpls", build_mpls(9000, 6)),
+            ],
+            vec![("00000.jar", jar)],
+            vec![],
+        );
+        let hint = resolve(&mut disc, &udf, &[]).expect("Tier-2 hint");
+        assert_eq!(hint.playlist_id, Some(801));
+    }
+
+    #[test]
+    fn props_hint_ignores_comment_lines() {
+        for text in [
+            "# feature.playlist.id=00800\n",
+            "! feature.playlist.id=00800\n",
+        ] {
+            assert_eq!(props_hint(text, &|_| true), None, "{text}");
+        }
+    }
+
+    // Only primary audio counts toward the multi-audio gate, not PG subtitles.
+    #[test]
+    fn mpls_stats_counts_only_audio_streams() {
+        let (mut disc, udf) = build_disc(
+            vec![("00800.mpls", build_mpls_pg(7000, 1, 3))],
+            vec![],
+            vec![],
+        );
+        assert_eq!(mpls_stats(&mut disc, &udf, 800), Some((7000, 1)));
+    }
+
+    // Only `NNNNN.mpls` names (five digits) are playlists.
+    #[test]
+    fn real_playlist_ids_requires_five_digit_stems() {
+        let m = || build_mpls(60, 1);
+        let (_disc, udf) = build_disc(
+            vec![
+                ("800.mpls", m()),
+                ("0800a.mpls", m()),
+                ("+0800.mpls", m()),
+                ("00801.mpls", m()),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(real_playlist_ids(&udf), HashSet::from([801]));
+    }
+
     // A sector source that records every LBA it is asked for.
     struct Counting<'a>(&'a mut MemDisc, Vec<u32>);
     impl SectorSource for Counting<'_> {
@@ -1095,6 +1183,11 @@ mod tests {
 
     // Build a minimal single-app BDJO whose AUTOSTART app has the given base_dir.
     fn bdjo_with_autostart(base_dir: &str) -> Vec<u8> {
+        bdjo_with_apps(&[(1, base_dir)])
+    }
+
+    // Build a BDJO with one app per `(control_code, base_dir)`; control code 1 is AUTOSTART.
+    fn bdjo_with_apps(apps: &[(u8, &str)]) -> Vec<u8> {
         fn app_string(buf: &mut Vec<u8>, s: &str) {
             buf.push(s.len() as u8);
             buf.extend_from_slice(s.as_bytes());
@@ -1115,26 +1208,28 @@ mod tests {
         b.extend_from_slice(&[0u8; 4]); // AccessiblePlaylists length
         b.extend_from_slice(&[0u8; 4]); // num_pl(11)+flags(2)+pad(19) = 0
         b.extend_from_slice(&[0u8; 4]); // AMT length
-        b.push(1); // num_app
+        b.push(apps.len() as u8); // num_app
         b.push(0); // padding
-        // App record
-        b.push(1); // control_code = AUTOSTART
-        b.push(0); // type(4)+reserved(4)
-        b.extend_from_slice(&[0u8; 4]); // org_id
-        b.extend_from_slice(&[0u8; 2]); // app_id
-        b.extend_from_slice(&[0u8; 10]); // descriptor tag+length
-        b.push(0); // num_profile(4)+pad
-        b.push(0);
-        b.push(0); // priority
-        b.push(0); // binding/visibility/reserved
-        b.extend_from_slice(&[0u8; 2]); // app_name data_length = 0
-        app_string(&mut b, ""); // icon_locator
-        b.extend_from_slice(&[0u8; 2]); // icon_flags
-        app_string(&mut b, base_dir); // base_dir
-        app_string(&mut b, ""); // classpath_extension
-        app_string(&mut b, "com.studio.MainXlet"); // initial_class
-        b.push(0); // params data_length = 0
-        b.push(0); // word-align pad
+        for &(control_code, base_dir) in apps {
+            // App record
+            b.push(control_code);
+            b.push(0); // type(4)+reserved(4)
+            b.extend_from_slice(&[0u8; 4]); // org_id
+            b.extend_from_slice(&[0u8; 2]); // app_id
+            b.extend_from_slice(&[0u8; 10]); // descriptor tag+length
+            b.push(0); // num_profile(4)+pad
+            b.push(0);
+            b.push(0); // priority
+            b.push(0); // binding/visibility/reserved
+            b.extend_from_slice(&[0u8; 2]); // app_name data_length = 0
+            app_string(&mut b, ""); // icon_locator
+            b.extend_from_slice(&[0u8; 2]); // icon_flags
+            app_string(&mut b, base_dir); // base_dir
+            app_string(&mut b, ""); // classpath_extension
+            app_string(&mut b, "com.studio.MainXlet"); // initial_class
+            b.push(0); // params data_length = 0
+            b.push(0); // word-align pad
+        }
         b
     }
 }

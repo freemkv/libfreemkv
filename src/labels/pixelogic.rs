@@ -1186,4 +1186,53 @@ mod tests {
         assert!(!is_stream_token("Video Stream 1"));
         assert!(!is_stream_token("entry-markEa9"));
     }
+
+    // A notice-clip name (`deu_Warning`) has the token shape: it is recorded as an
+    // uncatalogued component, yields no label, and still occupies its stream slot.
+    #[test]
+    fn notice_clip_token_is_recorded_unlabelled_and_takes_a_slot() {
+        let mut acc = UnknownParts::default();
+        assert!(parse_token_inner("deu_Warning", Some(&mut acc)).is_none());
+        assert_eq!(acc.seen.iter().collect::<Vec<_>>(), ["WARNING"]);
+
+        let mut acc = UnknownParts::default();
+        let labels = assign_labels(
+            &strs(&["FPL_Main", "Audio Stream 1", "deu_Warning", "eng_MLP_"]),
+            &mut acc,
+        );
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].stream_number, 3);
+        assert_eq!(acc.total, 1);
+    }
+
+    // Lay `bluray_project.bin` into /BDMV/JAR/00000 and run the real `parse`.
+    fn parse_blob(blob: &[u8]) -> Option<ParseResult> {
+        use crate::udf::fixture::*;
+        let dir = |name: &str, icb, data, files, subdirs| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: data,
+            files,
+            subdirs,
+        };
+        let file = file_with("bluray_project.bin", 100, 2000, blob.to_vec(), true);
+        let sub = dir("00000", 54, 55, vec![file], vec![]);
+        let jar = dir("JAR", 52, 53, vec![], vec![sub]);
+        let bdmv = dir("BDMV", 12, 13, vec![], vec![jar]);
+        let root = dir("", 10, 11, vec![], vec![bdmv]);
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        parse(&mut disc, &udf)
+    }
+
+    // Confidence is High only when every token component was catalogued.
+    #[test]
+    fn parse_confidence_reflects_uncatalogued_components() {
+        let known = parse_blob(b"FPL_Main\0Audio Stream 1\0eng_MLP_\0").expect("labels");
+        assert_eq!(known.confidence, Confidence::High);
+        let unknown = parse_blob(b"FPL_Main\0Audio Stream 1\0eng_MLP_NEWFLAG_\0").expect("labels");
+        assert_eq!(unknown.confidence, Confidence::Medium);
+    }
 }

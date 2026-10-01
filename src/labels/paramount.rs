@@ -342,6 +342,60 @@ fn pick<'a>(cands: &[Candidate<'a>], key: Key, require_audio: bool) -> Option<&'
 mod tests {
     use super::*;
 
+    fn hint_id(doc: &str) -> Option<u16> {
+        feature_hint(doc).and_then(|h| h.playlist_id)
+    }
+
+    // Tier 1 ranks exact `Feature` names by duration, not document order.
+    #[test]
+    fn exact_feature_tier_prefers_the_longest_duration() {
+        let doc = r#"
+            <playlist name="Feature" id="00001" duration="600" aud="eng"/>
+            <playlist name="Feature" id="00002" duration="7000" aud="eng"/>
+        "#;
+        assert_eq!(hint_id(doc), Some(2));
+    }
+
+    // A zero-audio exact `Feature` still wins over an audio-bearing extra: its id feeds the hint.
+    #[test]
+    fn zero_audio_exact_feature_is_still_selected() {
+        let doc = r#"
+            <playlist name="Feature" id="00800"/>
+            <playlist name="Bonus" id="00900" aud="eng,fra"/>
+        "#;
+        assert_eq!(hint_id(doc), Some(800));
+    }
+
+    // With equal audio counts, tier 3 breaks the tie by the longer duration.
+    #[test]
+    fn most_audio_tier_breaks_a_tie_by_longer_duration() {
+        let doc = r#"
+            <playlist name="Menu" id="00001" duration="600" aud="eng,fra"/>
+            <playlist name="Other" id="00002" duration="7000" aud="eng,fra"/>
+        "#;
+        assert_eq!(hint_id(doc), Some(2));
+    }
+
+    // Exactly the minimum feature length is a feature; one second less is a decoy.
+    #[test]
+    fn minimum_feature_length_is_inclusive() {
+        let doc = |secs: u64| format!(r#"<playlist name="Feature" id="00800" duration="{secs}"/>"#);
+        assert_eq!(hint_id(&doc(60)), Some(800));
+        assert_eq!(hint_id(&doc(59)), None);
+    }
+
+    // Every duration attribute spelling arms the sub-minute decoy guard.
+    #[test]
+    fn every_duration_attribute_spelling_is_honoured() {
+        for key in ["duration", "durs", "dur", "runtime", "length", "len"] {
+            let doc = format!(
+                r#"<playlist name="Feature" id="00001" {key}="10"/>
+                   <playlist name="Feature" id="00800" {key}="7000"/>"#
+            );
+            assert_eq!(hint_id(&doc), Some(800), "{key}");
+        }
+    }
+
     // Immunity pin, section-boundary half.
     #[test]
     fn a_playlists_stream_list_cannot_run_into_the_next_playlist() {

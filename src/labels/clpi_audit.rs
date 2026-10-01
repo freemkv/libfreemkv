@@ -660,4 +660,73 @@ mod tests {
         );
         assert_eq!(a.class_counts(), (1, 0, 1, 0), "{:?}", a.rows);
     }
+
+    // Audit one clip `00001` (CLPI `clpi`) against one playlist (`mpls`).
+    fn audit_one(clpi: Vec<u8>, mpls: Vec<u8>) -> ClpiVsMplsAudit {
+        use crate::udf::fixture::*;
+        let dir = |name: &str, icb: u32, files| DirSpec {
+            name: name.to_string(),
+            icb_lba: icb,
+            dir_data_lba: icb + 1,
+            files,
+            subdirs: vec![],
+        };
+        let clipinf = dir(
+            "CLIPINF",
+            24,
+            vec![file_with("00001.clpi", 26, 8000, clpi, false)],
+        );
+        let playlist = dir(
+            "PLAYLIST",
+            30,
+            vec![file_with("00800.mpls", 32, 8200, mpls, false)],
+        );
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![clipinf, playlist],
+            }],
+        };
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        audit(&mut disc, &udf)
+    }
+
+    // A PID the playlist names but the CLPI lacks is a real MplsOnly row.
+    #[test]
+    fn playlist_pid_missing_from_clpi_is_mpls_only() {
+        use crate::consts::coding_type as c;
+        let build_clpi = super::super::clpi_orphan_tests::build_clpi;
+        let a = audit_one(
+            build_clpi(&[(0x1200, c::PG, "eng")]),
+            build_mpls(b"00001", 0x1100, c::TRUEHD, b"eng"),
+        );
+        assert_eq!(a.class_counts(), (1, 1, 0, 0), "{:?}", a.rows);
+    }
+
+    // PID 0 never makes a row, and a repeated PID in one clip keeps the first entry.
+    #[test]
+    fn pid_zero_is_skipped_and_first_duplicate_pid_wins() {
+        use crate::consts::coding_type as c;
+        let build_clpi = super::super::clpi_orphan_tests::build_clpi;
+        let a = audit_one(
+            build_clpi(&[
+                (0, c::AC3, "eng"),
+                (0x1100, c::TRUEHD, "eng"),
+                (0x1100, c::AC3, "fra"),
+            ]),
+            build_mpls(b"00001", 0x1100, c::TRUEHD, b"eng"),
+        );
+        assert_eq!(a.rows.len(), 1, "{:?}", a.rows);
+        assert_eq!(a.class_counts(), (0, 0, 1, 0), "{:?}", a.rows);
+    }
 }

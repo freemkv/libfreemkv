@@ -1146,6 +1146,24 @@ mod tests {
     }
 
     #[test]
+    fn modified_utf8_unpaired_surrogates_degrade_without_panicking() {
+        // high + high: each is lone.
+        assert_eq!(
+            decode_modified_utf8(&[0xED, 0xA0, 0xBD, 0xED, 0xA0, 0xBD]).unwrap(),
+            "\u{FFFD}\u{FFFD}"
+        );
+        // high + ASCII, and a lone low surrogate.
+        assert_eq!(
+            decode_modified_utf8(&[0xED, 0xA0, 0xBD, b'a']).unwrap(),
+            "\u{FFFD}a"
+        );
+        assert_eq!(
+            decode_modified_utf8(&[0xED, 0xB8, 0x80]).unwrap(),
+            "\u{FFFD}"
+        );
+    }
+
+    #[test]
     fn modified_utf8_two_byte() {
         // U+00E9 'é' in the standard 2-byte modified-UTF-8 encoding
         // (0xC3 0xA9), exercising the decoder's 2-byte branch.
