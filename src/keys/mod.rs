@@ -240,8 +240,6 @@ pub(crate) struct Inner {
     pub(crate) spans: Vec<UnitSpan>,
     // `resolve` found no stream file (no `/BDMV/STREAM` or `/HVDVD_TS`, or an empty one).
     pub(crate) no_stream_files: bool,
-    // A Lazy piece has intact encrypted probes and no held key opens any (KU §2.3 step 9.2).
-    pub(crate) lazy_unopened: bool,
     pub(crate) arrival: Vec<ArrivalPiece>,
     pub(crate) lazy: Vec<(u32, u32)>,
     pub(crate) proven: Vec<usize>,
@@ -273,7 +271,6 @@ impl Inner {
             map: Arc::new(AacsKeyMap::from_ranges(Vec::new())),
             spans: Vec::new(),
             no_stream_files: false,
-            lazy_unopened: false,
             arrival: Vec::new(),
             lazy: Vec::new(),
             proven: Vec::new(),
@@ -737,7 +734,7 @@ impl ResolvedKeySet {
 
     /// The whole-disc decrypting reader for a decrypted image or folder copy over the raw,
     /// random-access `inner`, on each stream file's own unit grid. A readable unit no held
-    /// key opens stops with E7032. E7013 if the set is not for `disc`, does not cover the
+    /// key opens is blanked and counted. E7013 if the set is not for `disc`, does not cover the
     /// whole disc, or `inner` cannot seek; E7026 if forensic keys are Pending.
     pub fn whole_disc_reader<S: SectorSource>(
         &self,
@@ -773,11 +770,6 @@ impl ResolvedKeySet {
                 _ => "/BDMV/STREAM",
             };
             return Err(Error::UdfNotFound { path: path.into() });
-        }
-        if self.0.lazy_unopened {
-            // KU §2.1 (6) "Refuse first": a sweep reads that unit, and no held key opens it.
-            tracing::error!(target: "freemkv::keys", code = crate::error::E_WHOLE_DISC_KEY_MISSING, "a stream file holds a unit no held key opens: refusing the sweep before any output");
-            return Err(Error::WholeDiscKeyMissing);
         }
         let mut dec = self.decrypting(inner, None, StopKind::Image, false)?;
         content.extend(self.0.spans.iter().map(|&(s, n, _)| (s, n)));

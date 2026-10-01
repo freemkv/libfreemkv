@@ -282,6 +282,10 @@ impl Disc {
                     push_extents(file_exts, &mut extents, &mut feed_pos);
                     if feed_pos > span_start {
                         spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
+                        // A damaged CLPI reports no packet count: size the clip by its extents.
+                        if pkt_count == 0 {
+                            total_size += feed_pos - span_start;
+                        }
                     }
                 }
             }
@@ -1099,6 +1103,27 @@ mod tests {
         assert_eq!(t.clips.len(), 2, "each PlayItem still gets a Clip entry");
         assert_eq!(t.clips[0].clip_id, "00001");
         assert_eq!(t.clips[1].clip_id, "00001");
+    }
+
+    // A CLPI with no packet count (cut short) still sizes the clip, from its extents.
+    #[test]
+    fn parse_playlist_unknown_clpi_count_sizes_from_extents() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 1000, 0, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        assert_eq!(t.size_bytes, 1000 * 2048);
     }
 
     /// Distinct clips each contribute their own extent and bytes, in

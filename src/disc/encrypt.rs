@@ -159,12 +159,11 @@ pub(super) struct AacsCapture {
 pub(super) enum CaptureFrom {
     /// Image or folder: the key-file error is recorded as read (E7000/E6000).
     Image,
-    /// Live drive: E7031, fatal unless `raw_copy` (then recorded, keys refused).
-    Live { raw_copy: bool },
+    /// Live drive: E7031 is recorded, warned and the scan goes on (keys refused).
+    Live,
 }
 
-// Reads the AACS key files (plain READs, no AACS command). `Err` for a Stop, and for a
-// live key-file failure without `raw_copy`, returned before any other read.
+// Reads the AACS key files (plain READs, no AACS command). `Err` only for a Stop.
 pub(super) fn capture(
     reader: &mut dyn SectorSource,
     udf_fs: &udf::UdfFs,
@@ -177,11 +176,13 @@ pub(super) fn capture(
     });
     match (&uk_ro, from) {
         (Err(Error::Halted), _) => return Err(Error::Halted),
-        (Err(e), CaptureFrom::Live { raw_copy }) => {
-            tracing::debug!(target: "freemkv::scan", phase = "aacs_capture", error_code = e.code(), raw_copy);
-            if !raw_copy {
-                return Err(Error::AacsKeyFileUnreadable);
-            }
+        (Err(e), CaptureFrom::Live) => {
+            tracing::warn!(
+                target: "freemkv::scan",
+                phase = "aacs_capture",
+                error_code = e.code(),
+                "Unit_Key_RO.inf unreadable; scanning on, titles needing keys will not be keyed."
+            );
             uk_ro = Err(Error::AacsKeyFileUnreadable);
         }
         _ => {}
@@ -739,7 +740,7 @@ mod tests {
     fn from_for(bus: &BusOutcome) -> CaptureFrom {
         match bus {
             BusOutcome::FileOrIso => CaptureFrom::Image,
-            _ => CaptureFrom::Live { raw_copy: false },
+            _ => CaptureFrom::Live,
         }
     }
 

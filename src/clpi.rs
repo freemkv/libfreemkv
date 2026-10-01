@@ -34,14 +34,11 @@ pub(crate) struct ClpiStream {
     pub language: String,
 }
 
-/// Parse a CLPI file from raw bytes.
+/// Parse a CLPI file from raw bytes. A file too short to hold the packet count still
+/// parses (count 0); only a bad magic or a head under 16 bytes errors.
 pub fn parse(data: &[u8]) -> Result<ClipInfo> {
-    // 60 bytes: the ClipInfo section through source_packet_count at [56..60].
-    if data.len() < 60 {
-        return Err(Error::ClpiParse);
-    }
-
-    if &data[0..4] != b"HDMV" {
+    // 16 bytes reach the section offsets; below that, nothing usable.
+    if data.len() < 16 || &data[0..4] != b"HDMV" {
         return Err(Error::ClpiParse);
     }
 
@@ -50,7 +47,10 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
 
     // ClipInfo section at offset 40
     // source_packet_count at offset 40 + 4(len) + 2(reserved) + 1(stream_type) + 1(app_type) + 4(reserved) + 4(ts_rate)
-    let source_packet_count = u32::from_be_bytes([data[56], data[57], data[58], data[59]]);
+    // A file cut before [56..60] keeps its streams and reports 0 (unknown) packets.
+    let source_packet_count = data
+        .get(56..60)
+        .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
 
     // Parse ProgramInfo (per-stream language + codec), best-effort: malformed
     // program_info doesn't fail the parse, just yields an empty streams list.
@@ -168,17 +168,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_truncated_clipinfo_no_panic() {
-        // 57/58/59-byte CLPI with valid magic: passes the data.len() < 40
-        // guard but data[56..60] needs 60 bytes. Must error, not panic.
-        for len in 40..60usize {
-            let mut data = vec![0u8; len];
-            data[0..4].copy_from_slice(b"HDMV");
-            if len >= 8 {
-                data[4..8].copy_from_slice(b"0200");
-            }
-            assert!(parse(&data).is_err(), "len {len} lacks source_packet_count");
+    fn parse_truncated_clipinfo_parses_with_unknown_count() {
+        let full = build_clpi(1000, None);
+        for len in 16..60usize {
+            let c = parse(&full[..len]).unwrap_or_else(|e| panic!("len {len}: {e:?}"));
+            assert_eq!(c.source_packet_count, 0, "len {len}");
         }
+        assert_eq!(parse(&full[..60]).expect("60").source_packet_count, 1000);
     }
 
     #[test]
@@ -259,11 +255,10 @@ mod tests {
         assert!(parse(&data).is_err());
     }
 
-    /// Input shorter than the 60-byte ClipInfo head is rejected before any
-    /// field read (`data.len() < 60` guard).
+    /// Input shorter than the 16-byte header is rejected before any field read.
     #[test]
-    fn under_40_bytes_rejected() {
-        assert!(parse(&[0u8; 39]).is_err());
+    fn under_16_bytes_rejected() {
+        assert!(parse(&[0u8; 15]).is_err());
         assert!(parse(b"HDMV0200").is_err());
         assert!(parse(&[]).is_err());
     }

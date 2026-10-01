@@ -93,7 +93,8 @@ pub struct StreamEntry {
 /// Parse an MPLS file from raw bytes.
 ///
 /// `data` is the raw contents of a `BDMV/PLAYLIST/*.mpls` file. Returns
-/// [`Error::MplsParse`] on malformed or truncated input.
+/// [`Error::MplsParse`] on a malformed header, or when truncation leaves no play item;
+/// a truncated item list keeps the items before the damage (warned).
 ///
 /// Note: [`Playlist::streams`] is extracted ONLY from the first play
 /// item's STN table. Multi-item playlists whose later items carry a
@@ -124,14 +125,18 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     let mut play_items = Vec::with_capacity(num_play_items.min(256));
     let mut streams = Vec::new();
     let mut pos = 10;
+    let mut truncated = false;
 
     for item_idx in 0..num_play_items {
+        // A truncated item ends the list; the items parsed so far are kept.
         if pos + 2 > pl.len() {
-            return Err(Error::MplsParse);
+            truncated = true;
+            break;
         }
         let item_length = u16::from_be_bytes([pl[pos], pl[pos + 1]]) as usize;
         if pos + 2 + item_length > pl.len() {
-            return Err(Error::MplsParse);
+            truncated = true;
+            break;
         }
 
         let item = &pl[pos + 2..pos + 2 + item_length];
@@ -281,6 +286,18 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         });
 
         pos += 2 + item_length;
+    }
+
+    if truncated {
+        if play_items.is_empty() {
+            return Err(Error::MplsParse);
+        }
+        tracing::warn!(
+            target: "freemkv::mpls",
+            kept = play_items.len(),
+            declared = num_play_items,
+            "truncated playlist: keeping the play items parsed so far"
+        );
     }
 
     // Parse PlayListMark section
@@ -833,6 +850,26 @@ mod tests {
         assert!(parse(&[0u8; 10]).is_err());
         assert!(parse(b"MPLS0200").is_err());
         assert!(parse(&[0u8; 39]).is_err());
+    }
+
+    #[test]
+    fn parse_truncated_play_item_keeps_the_items_before_it() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let data = build_mpls(
+            &[
+                (b"00001", 1, 90000, 4500000),
+                (b"00002", 5, 4500000, 9000000),
+            ],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        let ps = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let first = u16::from_be_bytes([data[ps + 10], data[ps + 11]]) as usize;
+        // Cut inside the second item: one whole item survives.
+        let cut = &data[..ps + 10 + 2 + first + 10];
+        let playlist = parse(cut).expect("damage must not drop the parsed items");
+        assert_eq!(playlist.play_items.len(), 1);
+        assert_eq!(playlist.play_items[0].clip_id, "00001");
     }
 
     #[test]
@@ -1819,14 +1856,14 @@ mod tests {
     }
 
     #[test]
-    fn truncated_play_item_is_an_error() {
+    fn truncated_play_item_errors_only_when_nothing_is_left() {
         let full = build_mpls_raw_items(&[play_item_20(b"00001", 1, 0, 9000)]);
         // Cut into the item body: declared item_length runs past EOF.
         assert!(parse(&full[..full.len() - 3]).is_err());
         // num_play_items overshoots the items actually present.
         let mut over = full.clone();
         over[46..48].copy_from_slice(&2u16.to_be_bytes());
-        assert!(parse(&over).is_err());
+        assert_eq!(parse(&over).expect("kept").play_items.len(), 1);
     }
 
     #[test]

@@ -1388,15 +1388,11 @@ fn read_directory(
         }
         if fid_tag != 257 {
             tracing::warn!(target: "freemkv::udf", fid_tag, icb_abs, "corrupt directory: bad FID tag");
+            // A subdirectory lists empty; the root keeps what parsed before the damage.
             if depth > 0 {
                 entries.clear();
-                break;
             }
-            return Err(Error::DiscRead {
-                sector: icb_abs as u64,
-                status: None,
-                sense: None,
-            });
+            break;
         }
 
         let file_chars = dir_data[pos + 18];
@@ -1426,13 +1422,8 @@ fn read_directory(
                 tracing::warn!(target: "freemkv::udf", icb_abs, "corrupt directory: name overruns FID data");
                 if depth > 0 {
                     entries.clear();
-                    break;
                 }
-                return Err(Error::DiscRead {
-                    sector: icb_abs as u64,
-                    status: None,
-                    sense: None,
-                });
+                break;
             }
             let entry_name = parse_udf_name(&dir_data[name_start..name_end]);
 
@@ -5070,7 +5061,7 @@ mod tests {
     }
 
     #[test]
-    fn read_directory_rejects_a_descriptor_whose_tag_is_not_a_fid() {
+    fn read_directory_stops_at_a_descriptor_whose_tag_is_not_a_fid() {
         // ECMA-167 3/7.2.1: the tag identifier is a 16-bit LE field (257 = FID). A single-byte
         // compare would accept 0x0201 (513) as 257 (same low byte); it must be an error.
         let mut fids = Vec::new();
@@ -5092,7 +5083,7 @@ mod tests {
         reader.put(60, dir);
         reader.put(7, build_efe_icb(1, 2048, 0));
 
-        let err = read_directory(
+        let dir = read_directory(
             &mut reader,
             &mut 0,
             &MetaMap::contiguous(0),
@@ -5102,8 +5093,14 @@ mod tests {
             &mut 0,
             &mut HashSet::new(),
         )
-        .expect_err("a non-FID descriptor inside the declared length is corruption");
-        assert!(matches!(err, Error::DiscRead { .. }), "{err:?}");
+        .expect("damage stops the listing, never fails it");
+        assert_eq!(
+            dir.entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["REAL.MPLS"]
+        );
     }
 
     #[test]
@@ -5140,7 +5137,7 @@ mod tests {
     }
 
     #[test]
-    fn read_directory_errors_instead_of_panicking_when_a_name_runs_past_the_buffer() {
+    fn read_directory_stops_instead_of_panicking_when_a_name_runs_past_the_buffer() {
         // L_IU (ECMA-167 4/14.4.7) is disc-controlled, so a malformed FID can
         // place the name tens of KB past the buffer end. The scan must error;
         // slicing there would panic out of the public API on a damaged disc.
@@ -5160,7 +5157,7 @@ mod tests {
         reader.put(60, dir);
         reader.put(7, build_efe_icb(5, 2048, 0));
 
-        let err = read_directory(
+        let dir = read_directory(
             &mut reader,
             &mut 0,
             &MetaMap::contiguous(0),
@@ -5170,8 +5167,14 @@ mod tests {
             &mut 0,
             &mut HashSet::new(),
         )
-        .expect_err("an out-of-range File Identifier is corruption, not a short listing");
-        assert!(matches!(err, Error::DiscRead { .. }), "{err:?}");
+        .expect("damage stops the listing, never fails it");
+        assert_eq!(
+            dir.entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["OK.MPLS"]
+        );
     }
 
     #[test]

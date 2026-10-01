@@ -674,7 +674,7 @@ pub enum Error {
     /// scans, where no bus-key handshake runs.
     AacsBusKeyUnavailable,
     /// A live AACS disc's `Unit_Key_RO.inf` is missing or unreadable (both copies).
-    /// `Disc::scan` returns it; a `raw_copy` scan records it and refuses every key.
+    /// Recorded in `Disc::aacs_error` (the scan goes on); every key is refused.
     AacsKeyFileUnreadable,
     /// A decrypted whole-disc image would keep encrypted pieces: a stream file
     /// no title plays is encrypted and no held key opens it. See

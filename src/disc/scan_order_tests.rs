@@ -359,7 +359,7 @@ fn unencrypted_bd_issues_no_aacs_scsi() {
 }
 
 #[test]
-fn live_unreadable_uk_ro_fails_scan_before_any_aacs_scsi() {
+fn live_unreadable_uk_ro_is_recorded_scan_continues() {
     for bee in [true, false] {
         // Both copies absent: the file is simply not on the disc.
         let mut mem = bd_disc(Some(bee));
@@ -377,13 +377,16 @@ fn live_unreadable_uk_ro_fails_scan_before_any_aacs_scsi() {
             },
         );
         let mut rig = Rig::new(mem, |_| {});
-        let r = Disc::scan(&mut rig.drive, &with_hc());
+        let d = Disc::scan(&mut rig.drive, &with_hc()).expect("absent: scan goes on");
+        assert!(
+            d.aacs.is_none() && !d.titles.is_empty(),
+            "absent, bee={bee}"
+        );
         assert_eq!(
-            r.err().map(|e| e.code()),
+            d.aacs_error.as_ref().map(|e| e.code()),
             Some(KEY_FILE_CODE),
             "absent, bee={bee}"
         );
-        assert_eq!(rig.count(is_aacs_cdb), 0, "absent, bee={bee}");
 
         // Present but unreadable.
         let mut rig = Rig::new(bd_disc(Some(bee)), |t| {
@@ -393,32 +396,17 @@ fn live_unreadable_uk_ro_fails_scan_before_any_aacs_scsi() {
                     .then(|| check(3, 0x11, 0, 0x28))
             }));
         });
-        let r = Disc::scan(&mut rig.drive, &with_hc());
+        let d = Disc::scan(&mut rig.drive, &with_hc()).expect("read error: scan goes on");
+        assert!(
+            d.aacs.is_none() && !d.titles.is_empty(),
+            "read error, bee={bee}"
+        );
         assert_eq!(
-            r.err().map(|e| e.code()),
+            d.aacs_error.as_ref().map(|e| e.code()),
             Some(KEY_FILE_CODE),
             "read error, bee={bee}"
         );
-        assert_eq!(rig.count(is_aacs_cdb), 0, "read error, bee={bee}");
     }
-}
-
-#[test]
-fn raw_copy_scan_records_unreadable_uk_ro() {
-    let mut rig = Rig::new(bd_disc(Some(false)), |t| {
-        t.fail_read = Some(Box::new(|lba, n, _| {
-            (lba..lba + n as u32)
-                .contains(&UK_LBA)
-                .then(|| check(3, 0x11, 0, 0x28))
-        }));
-    });
-    let opts = ScanOptions {
-        raw_copy: true,
-        ..with_hc()
-    };
-    let d = Disc::scan(&mut rig.drive, &opts).expect("raw copy scans on");
-    assert!(d.aacs.is_none() && !d.titles.is_empty());
-    assert_eq!(d.aacs_error.as_ref().map(|e| e.code()), Some(KEY_FILE_CODE));
 }
 
 #[test]
@@ -750,11 +738,7 @@ impl crate::sector::SectorSource for HaltAt {
 fn capture_propagates_a_stop_from_every_key_file_read() {
     use super::encrypt::{CaptureFrom, capture};
     for lba in [UK_LBA, CERT_LBA, MKB_LBA] {
-        for from in [
-            CaptureFrom::Image,
-            CaptureFrom::Live { raw_copy: true },
-            CaptureFrom::Live { raw_copy: false },
-        ] {
+        for from in [CaptureFrom::Image, CaptureFrom::Live] {
             let mut src = HaltAt {
                 mem: bd_disc(Some(true)),
                 lba,
