@@ -4,7 +4,7 @@
 //! 3 on DVD-PS (`PsDemuxer` strips only the sub_id/frames/pointer bytes). Output is
 //! interleaved big-endian PCM in WAVE_FORMAT_EXTENSIBLE channel order at the source
 //! depth: 16-bit stays 16-bit, 20- and 24-bit sources output 24-bit. The depth rides
-//! in `codec_private` ([`output_depth`]) so "A_PCM/INT/BIG" BitDepth matches. Layouts follow ffmpeg pcm-bluray.c (pad channel, LFE/surround
+//! in `codec_private` (`output_depth`) so "A_PCM/INT/BIG" BitDepth matches. Layouts follow ffmpeg pcm-bluray.c (pad channel, LFE/surround
 //! remap) and pcm-dvd.c (20/24-bit sample groups and blocks).
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
