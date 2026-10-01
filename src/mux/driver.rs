@@ -130,15 +130,13 @@ impl MuxOutcome {
     }
 }
 
-/// Run the decrypt + mux pipeline end-to-end over `source` with the rip's up-front key set
-/// (KU §3.1): every AACS read goes through the set's readers (its map, and the on-arrival
-/// proof for pieces it left unproven), with no key lookup. `keys == None`, a non-AACS set, or
-/// `opts.raw`: no AACS decryption (CSS and clear discs decrypt as before; a BD-TS disc with
-/// no set refuses its first flagged unit, E7022). E7013 when the set is not for the disc or
-/// does not cover the title; E7026 when the title needs forensic keys that are Pending.
+/// Mux `source` with the rip's up-front key set (KU §3.1): AACS reads go through the set's
+/// map and on-arrival proof, with no key lookup. With no AACS set (or `opts.raw`) CSS and
+/// clear content decrypt as before and a BD-TS disc refuses its first flagged unit (E7022).
+/// E7013 when the set is not for the disc or title; E7026 for Pending forensic keys.
 /// Unresolved codec headers are [`Error::MkvInvalid`], a zero-output drain
-/// [`Error::NoStreams`]. Every stage runs under `ctx`; a Stop of its halt, during the open
-/// or the pump alike, yields `completed = false, halted = true`, not an error.
+/// [`Error::NoStreams`]. A Stop of `ctx.halt`, during the open or the pump alike, yields
+/// `completed = false, halted = true`, not an error.
 pub fn mux_with_keys(
     source: Source,
     keys: Option<&crate::keys::KeyRing>,
@@ -526,9 +524,8 @@ fn drive_mux(
     let mut buffered_bytes: usize = 0;
 
     // ── Metadata sinks (`needs_frames = false`) — BEFORE the header pump/gate ──
-    // These sinks write their whole file at `output()` time and consume no PES
-    // frames — running the header gate first could false-fail a metadata export. The
-    // title's TrueHD labels are still completed from the stream first.
+    // They write their whole file at `output()` and take no frames, so the header gate
+    // could false-fail them; the title's TrueHD labels are still completed first.
     if !caps.needs_frames {
         let done = complete_truehd(
             &mut *stream,
@@ -900,10 +897,9 @@ const TRUEHD_PROBE_BYTES: usize = 8 * 1024 * 1024;
 // Bytes of one TrueHD track kept for the major-sync parse.
 const TRUEHD_PROBE_TRACK_BYTES: usize = 1024 * 1024;
 
-// Header completion (BUG-6): a playlist labels a 7.1/Atmos TrueHD track 5.1, so read on
-// (into `buffered`) until each TrueHD track in `streams` shows its first major sync, or
-// for at most `TRUEHD_PROBE_BYTES`, and label the track from it. Every source passes here.
-// `Ok(false)` when a Stop ended the read.
+// Header completion (BUG-6): a playlist labels a 7.1/Atmos TrueHD track 5.1, so read on into
+// `buffered` until each TrueHD track shows a major sync (at most `TRUEHD_PROBE_BYTES`) and
+// label it from that. `Ok(false)` when a Stop ended the read.
 fn complete_truehd(
     stream: &mut dyn PesSource,
     buffered: &mut Vec<PesFrame>,
