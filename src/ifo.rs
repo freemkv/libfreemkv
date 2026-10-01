@@ -519,7 +519,8 @@ pub(crate) fn parse_tt_srpt(
 
 // ── VTS parser ──────────────────────────────────────────────────────────────
 
-/// Parse VTS_XX_0.IFO for one title set, falling back to its VTS_XX_0.BUP copy.
+/// Parse VTS_XX_0.IFO for one title set, falling back to its VTS_XX_0.BUP copy when the
+/// IFO fails or keeps fewer titles than `titles_info` declares.
 ///
 /// `titles_info` is a list of (chapter_count, vts_title_number) from TT_SRPT.
 fn parse_vts(
@@ -529,19 +530,30 @@ fn parse_vts(
     titles_info: &[(u16, u8)],
 ) -> Result<DvdTitleSet> {
     let path = format!("/VIDEO_TS/VTS_{vts_number:02}_0.IFO");
-    let err = match parse_vts_file(reader, udf, &path, &path, vts_number, titles_info) {
-        Ok(ts) => return Ok(ts),
+    let mut partial = None;
+    let mut err = None;
+    match parse_vts_file(reader, udf, &path, &path, vts_number, titles_info) {
+        Ok(ts) if ts.titles.len() >= titles_info.len() => return Ok(ts),
+        Ok(ts) => partial = Some(ts),
         Err(Error::Halted) => return Err(Error::Halted),
-        Err(e) => e,
-    };
+        Err(e) => err = Some(e),
+    }
     let bup = format!("/VIDEO_TS/VTS_{vts_number:02}_0.BUP");
     match parse_vts_file(reader, udf, &bup, &path, vts_number, titles_info) {
-        Ok(ts) => {
-            tracing::warn!(target: "freemkv::scan", vts = vts_number, code = err.code(), "VTS IFO bad; using BUP");
+        Ok(ts)
+            if partial
+                .as_ref()
+                .is_none_or(|p| ts.titles.len() > p.titles.len()) =>
+        {
+            tracing::warn!(target: "freemkv::scan", vts = vts_number, "VTS IFO bad; using BUP");
             Ok(ts)
         }
         Err(Error::Halted) => Err(Error::Halted),
-        Err(_) => Err(err),
+        _ => match (partial, err) {
+            (Some(ts), _) => Ok(ts),
+            (None, Some(e)) => Err(e),
+            (None, None) => Err(Error::IfoParse),
+        },
     }
 }
 
@@ -1030,7 +1042,8 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
             let cell_base = pgc_offset + cell_playback_offset;
             for i in 0..num_cells {
                 let co = cell_base + i * 24;
-                if co + 8 > data.len() {
+                // Same bound as the cell loop above: a cell that is not kept adds nothing.
+                if co + 24 > data.len() {
                     cell_frames.push((0, 0.0));
                     continue;
                 }
@@ -2448,6 +2461,25 @@ mod tests {
         assert_eq!(title.chapter_times, vec![0.0, 10.01]);
     }
 
+    // A cell cut off mid-record is not in `cells`, so it adds no time to a chapter mark.
+    #[test]
+    fn pgc_chapter_times_ignore_a_cell_cut_off_mid_record() {
+        let mut pgc = build_pgc(
+            bcd_secs(59),
+            &[
+                (0x00, bcd_secs(10), 0, 9),
+                (0x00, bcd_secs(20), 10, 19),
+                (0x00, bcd_secs(31), 20, 29),
+            ],
+            &[1, 3],
+            None,
+        );
+        pgc.truncate(0xEA + 2 + 24 + 12);
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert_eq!(title.cells.len(), 1);
+        assert_eq!(title.chapter_times, vec![0.0, 10.01]);
+    }
+
     // A program map running past the end of the data must stop at the buffer
     // end. Fixture map begins at PGC+0xEA, buffer holds 50 bytes from there,
     // so a declared 255 programs must yield exactly 50 chapter times.
@@ -2752,6 +2784,34 @@ mod tests {
         d
     }
 
+    // The title number and its entry offset are both bounded by the table: bytes beyond
+    // it are never read as a PGCN. The table sits at byte 8 (offset 0 means absent).
+    #[test]
+    fn ptt_srpt_pgc_index_stays_inside_the_table() {
+        let put =
+            |d: &mut Vec<u8>, at: usize, v: &[u8]| d[8 + at..8 + at + v.len()].copy_from_slice(v);
+        let mut d = vec![0u8; 8 + 24];
+        put(&mut d, 0, &1u16.to_be_bytes());
+        put(&mut d, 4, &23u32.to_be_bytes());
+        put(&mut d, 8, &16u32.to_be_bytes());
+        put(&mut d, 12, &20u32.to_be_bytes());
+        put(&mut d, 16, &3u16.to_be_bytes());
+        put(&mut d, 20, &9u16.to_be_bytes());
+        assert_eq!(ptt_srpt_pgc_index(&d, 8, 1), Some(2));
+        assert_eq!(
+            ptt_srpt_pgc_index(&d, 8, 2),
+            None,
+            "title 2 is past the count"
+        );
+        // The declared table ends before the entry.
+        put(&mut d, 4, &15u32.to_be_bytes());
+        assert_eq!(
+            ptt_srpt_pgc_index(&d, 8, 1),
+            None,
+            "entry outside the table"
+        );
+    }
+
     #[test]
     fn ptt_srpt_counts_the_pgcs_a_title_spans() {
         // Title 1: one PTT per PGC (1, 2, 3); title 2: two PTTs in PGC 4.
@@ -2957,6 +3017,71 @@ mod tests {
             .unwrap();
         assert_eq!(ts.vob_start_sector, lba + 7);
         assert_eq!(ts.titles[0].duration_secs, 22.022, "TTN 1 -> PGC 2 via PTT");
+    }
+
+    fn bup_fixture() -> (Vec<u8>, Vec<u8>) {
+        let two = vec![
+            build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None),
+            build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None),
+        ];
+        let good = build_vts_ifo(0, 0, &two, None);
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        (bad, good)
+    }
+
+    /// A bad IFO falls back to the BUP, but the title VOBS stay anchored on the IFO's LBA.
+    #[test]
+    fn parse_vts_falls_back_to_the_bup_and_anchors_on_the_ifo() {
+        let (bad, good) = bup_fixture();
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", bad), ("VTS_01_0.BUP", good)]);
+        let ts = parse_vts(&mut disc, &udf, 1, &[(1, 1), (1, 2)]).expect("BUP used");
+        assert_eq!(ts.titles.len(), 2);
+        let lba = udf
+            .file_start_lba(&mut disc, "/VIDEO_TS/VTS_01_0.IFO")
+            .unwrap();
+        assert_eq!(ts.vob_start_sector, lba + 7);
+    }
+
+    /// An IFO that parses but drops a damaged PGC defers to a BUP that keeps it.
+    #[test]
+    fn parse_vts_prefers_a_bup_that_keeps_more_titles() {
+        let (_, good) = bup_fixture();
+        let mut damaged = good.clone();
+        // Second PGC entry's offset: point it past the end of the table.
+        damaged[2 * 2048 + 8 + 8 + 4..2 * 2048 + 8 + 8 + 8]
+            .copy_from_slice(&0x00ff_ffffu32.to_be_bytes());
+        let (mut disc, udf) = video_ts_disc(vec![
+            ("VTS_01_0.IFO", damaged.clone()),
+            ("VTS_01_0.BUP", good),
+        ]);
+        let ts = parse_vts(&mut disc, &udf, 1, &[(1, 1), (1, 2)]).expect("vts");
+        assert_eq!(ts.titles.len(), 2, "BUP kept both titles");
+        // With no usable BUP the IFO's partial result stands.
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", damaged)]);
+        let ts = parse_vts(&mut disc, &udf, 1, &[(1, 1), (1, 2)]).expect("vts");
+        assert_eq!(ts.titles.len(), 1);
+    }
+
+    /// A stop during the BUP attempt is a stop, not a reason to report the IFO's error.
+    #[test]
+    fn parse_vts_propagates_a_halt_during_the_bup_attempt() {
+        struct HaltAt(MemDisc, u32);
+        impl SectorSource for HaltAt {
+            fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+                if lba == self.1 {
+                    return Err(Error::Halted);
+                }
+                self.0.read_sectors(lba, n, buf, r)
+            }
+        }
+        let (bad, good) = bup_fixture();
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", bad), ("VTS_01_0.BUP", good)]);
+        let bup_lba = udf
+            .file_start_lba(&mut disc, "/VIDEO_TS/VTS_01_0.BUP")
+            .unwrap();
+        let r = parse_vts(&mut HaltAt(disc, bup_lba), &udf, 1, &[(1, 1)]);
+        assert!(matches!(r, Err(Error::Halted)), "{r:?}");
     }
 
     #[test]
