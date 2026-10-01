@@ -2750,6 +2750,8 @@ fn a_source_halted_mid_request_keeps_the_asked_step() {
     );
 }
 
+mod parity;
+mod parity_live;
 mod stop_tests;
 
 /// LK21 (K-13), per spec — KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not

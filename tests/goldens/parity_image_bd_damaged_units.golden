@@ -1,0 +1,26 @@
+resolve-whole status = KeySetStatus { proven: 2, declared: Some(2), keyed: 2, clear: 0, lazy: 0, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }
+copy written = 8466432
+copy image = 8466432 bytes sha256:c6d26898508714516541998bf8f33456
+copy blanked = 3
+extract result = good=55296 unreadable=18432 complete=false halted=false files=[("BDMV/STREAM/00001.m2ts", 36864, 0, true), ("BDMV/STREAM/00002.m2ts", 18432, 18432, true)]
+extract out BDMV/STREAM/00001.m2ts = 36864 bytes sha256:368a55d7eca3e25f6af377a6f1aec041
+extract out BDMV/STREAM/00002.m2ts = 36864 bytes sha256:1cee23a03e507c9e5103d108ada392ce
+copy-raw written = 8466432
+copy-raw image = 8466432 bytes sha256:d1ca43ed54cc80c47ce57969c335e303
+extract-raw result = good=73728 unreadable=0 complete=true halted=false files=[("BDMV/STREAM/00001.m2ts", 36864, 0, true), ("BDMV/STREAM/00002.m2ts", 36864, 0, true)]
+extract-raw out BDMV/STREAM/00001.m2ts = 36864 bytes sha256:375559f987f4f85e585d39abe6eb12fa
+extract-raw out BDMV/STREAM/00002.m2ts = 36864 bytes sha256:13f1bdfc43aac09ff1c4a0359cd3ccb6
+resolve-title status = KeySetStatus { proven: 2, declared: Some(2), keyed: 2, clear: 0, lazy: 0, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }
+title-read = 73728 bytes sha256:5097bdccd3a8ecd9c3cda375a2153ba6
+title-read blanked = 3
+iso-mkv outcome = completed=true opened=true bytes=37424 errors=8 lost=18432 streams=3 undelivered=[]
+iso-mkv out o.mkv = 39926 bytes sha256:339adfed83a9095dc0b4eea03ec907c8
+iso-m2ts outcome = completed=true opened=true bytes=37424 errors=8 lost=18432 streams=3 undelivered=[]
+iso-m2ts out o.m2ts = 48768 bytes sha256:1f0036f74b8470e2b0082f47832e3a0c
+iso-null outcome = completed=true opened=true bytes=37424 errors=8 lost=18432 streams=3 undelivered=[]
+iso-mkv-raw refused = E6008
+iso-mkv-selection outcome = completed=true opened=true bytes=29232 errors=8 lost=18432 streams=2 undelivered=[]
+iso-mkv-selection out o.mkv = 30979 bytes sha256:ce3203996e6720690f5de3d739a9ebc6
+live-mkv outcome = completed=true opened=true bytes=37424 errors=8 lost=18432 streams=3 undelivered=[]
+live-mkv out o.mkv = 39926 bytes sha256:339adfed83a9095dc0b4eea03ec907c8
+live-mkv-raw refused = E6008

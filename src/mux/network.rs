@@ -1319,4 +1319,75 @@ mod tests {
         assert_eq!(back.track_timing(0), timing);
         assert_eq!(back.read().unwrap().unwrap().discard_padding_ns, -2_500_000);
     }
+    // Parity golden: the FMKV wire bytes a sender emits for the synthetic clip, and the
+    // frames a receiver reads back (public `connect` refuses loopback, so this seam).
+    #[test]
+    fn parity_network_fmkv_wire() {
+        use crate::pes::Stream as _;
+        use std::io::Read as _;
+        let clip = crate::test_util::synthetic_bd_clip(6);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.m2ts");
+        std::fs::write(&path, &clip).unwrap();
+        let mut src =
+            crate::mux::resolve::input(&format!("m2ts://{}", path.display()), &Default::default())
+                .unwrap();
+        let title = src.info().clone();
+        let mut frames = Vec::new();
+        while let Some(f) = src.read().unwrap() {
+            frames.push(f);
+        }
+        let mut g =
+            crate::test_util::Golden::new(env!("CARGO_MANIFEST_DIR"), "parity_network_fmkv_wire");
+
+        // Sender -> a raw socket: the wire bytes.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let raw = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            listener
+                .accept()
+                .unwrap()
+                .0
+                .read_to_end(&mut bytes)
+                .unwrap();
+            bytes
+        });
+        let mut w = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&title);
+        for f in &frames {
+            w.write(f).unwrap();
+        }
+        w.finish().unwrap();
+        drop(w);
+        g.bytes("wire", &raw.join().unwrap());
+
+        // Sender -> NetworkStream receiver: the frames round-trip.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rx = std::thread::spawn(move || {
+            let mut ns = NetworkStream::accept_from(listener).unwrap();
+            let mut got = Vec::new();
+            while let Some(f) = ns.read().unwrap() {
+                got.push((f.track, f.pts, f.keyframe, f.data));
+            }
+            got
+        });
+        let mut w = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&title);
+        for f in &frames {
+            w.write(f).unwrap();
+        }
+        w.finish().unwrap();
+        let got = rx.join().unwrap();
+        let sent: Vec<_> = frames
+            .iter()
+            .map(|f| (f.track, f.pts, f.keyframe, f.data.clone()))
+            .collect();
+        g.kv("frames", got.len());
+        g.kv("round-trip identical", got == sent);
+        g.check();
+    }
 }

@@ -121,6 +121,8 @@ mod fvi_pipeline_tests;
 #[cfg(test)]
 pub(crate) mod interop_tests;
 #[cfg(test)]
+pub(crate) mod parity_tests;
+#[cfg(test)]
 mod stage_tests;
 
 #[cfg(test)]
