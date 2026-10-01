@@ -741,6 +741,9 @@ fn read_tries<S: SectorSource>(
             Err(Error::Halted) => return Err(Error::Halted),
             // The key set's loud stop (KU §2.4): never a hole, the run stops `.partial`.
             Err(e @ (Error::WholeDiscKeyMissing | Error::NoDiscKey { .. })) => return Err(e),
+            // A dead bus or gone source is not a hole: zero-filling the rest of the tree
+            // would finalize every remaining file as complete (the Read stage's rule too).
+            Err(e) if e.is_scsi_transport_failure() || e.is_source_terminated() => return Err(e),
             Err(Error::DecryptFailed) => return Ok(Tried::Undecryptable),
             Err(_) if last => return Ok(Tried::Media),
             Err(_) => {}
@@ -2761,6 +2764,53 @@ mod tests {
             "must stay .partial"
         );
         assert!(read_out(out.path(), "a.m2ts.partial").is_some());
+    }
+
+    // A dead bus is not a hole: the file must stay `.partial` and the error surface,
+    // not be zero-filled and finalized as complete.
+    #[test]
+    fn a_transport_failure_stops_the_file_instead_of_zero_filling() {
+        struct DeadBus;
+        impl SectorSource for DeadBus {
+            fn read_sectors(&mut self, lba: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+                Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                    sense: None,
+                })
+            }
+        }
+        let len = 4 * SECTOR_BYTES as u32;
+        let pf = PlannedFile {
+            host_rel: PathBuf::from("a.m2ts"),
+            disc_name: "a.m2ts".into(),
+            size: len as u64,
+            inline: None,
+            extents: vec![crate::udf::AbsExtent {
+                lba: 100,
+                len,
+                recorded: true,
+            }],
+            unmapped: false,
+        };
+        let out = TmpDir::new("dead_bus");
+        std::fs::create_dir_all(out.path()).unwrap();
+        let mut dec = DecryptingSectorSource::new(DeadBus, DecryptKeys::None);
+        let (mut done, mut bad) = (0u64, 0u64);
+        let r = extract_one_file(
+            &mut dec,
+            &TreeSink::create(out.path(), true).unwrap(),
+            &pf,
+            len as u64,
+            &mut done,
+            &mut bad,
+            &crate::ctx::Ctx::default(),
+        );
+        assert!(r.is_err_and(|e| e.is_scsi_transport_failure()));
+        assert!(
+            read_out(out.path(), "a.m2ts").is_none(),
+            "must stay .partial"
+        );
     }
 
     // A crafted extent near the top of the LBA space must not overflow: a batch

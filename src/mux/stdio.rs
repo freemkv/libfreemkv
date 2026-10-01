@@ -136,6 +136,12 @@ impl StdioStream {
     pub fn info(&self) -> &crate::disc::DiscTitle {
         &self.disc_title
     }
+
+    // Read the FMKV header now, so `info()` is the stream's title before the first frame
+    // (a stream selection is resolved against it at open).
+    pub(crate) fn prime(&mut self) -> io::Result<()> {
+        self.ensure_header_read()
+    }
 }
 
 impl crate::pes::PesSource for StdioStream {
@@ -384,6 +390,27 @@ mod tests {
         assert_eq!(r.codec_private(0), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         assert_eq!(r.track_timing(0), timing);
         assert!(r.read().unwrap().is_none());
+    }
+
+    // prime() reads the header up front: info() is the stream's title before any frame,
+    // and the first read still returns the first frame.
+    #[test]
+    fn prime_reads_the_header_before_the_first_frame() {
+        let out = Shared::default();
+        let mut w = StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+        w.write(&frame(&[1, 2, 3])).unwrap();
+        w.finish().unwrap();
+
+        let mut r = reader(out.0.lock().unwrap().clone());
+        assert_eq!(r.info().streams.len(), 0);
+        r.prime().unwrap();
+        assert_eq!(r.info().playlist, "StdioTitle");
+        assert_eq!(
+            r.info().streams.len(),
+            title_with_codec_privates().streams.len()
+        );
+        let f = r.read().unwrap().unwrap();
+        assert_eq!(f.data, vec![1, 2, 3]);
     }
 
     // A zero-byte stdin is a clean headerless end, and never header-ready.

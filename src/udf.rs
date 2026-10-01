@@ -403,8 +403,10 @@ impl UdfFs {
                         .filter(|x| x.recorded && x.len > 0)
                         .map(|x| (x.lba, (x.len as u64).div_ceil(SECTOR_BYTES_U64) as u32)),
                 ),
-                Err(Error::Halted) => return Err(Error::Halted),
-                Err(_) => {} // embedded data, or unreadable: nothing to stage
+                // Embedded data lives in the File Entry already staged above.
+                Err(Error::UdfEmbeddedData) => {}
+                // An unread File Entry would stage a tree missing that file's data.
+                Err(e) => return Err(e),
             }
             compact_ranges(&mut ranges, self.meta.start())?;
         }
@@ -6359,6 +6361,39 @@ mod audit_tests {
         let mut r = GenReader::new(3);
         fs.non_stream_ranges(&mut r).expect("ranges");
         assert_eq!(r.reads[&5], 1, "shared ICB read once (non_stream_ranges)");
+    }
+
+    // A File Entry that fails to read must fail the staging plan (else the staged image
+    // silently lacks that file's data); an embedded-data entry is skipped, its data
+    // already being in the staged File Entry.
+    #[test]
+    fn non_stream_ranges_fail_on_an_unread_entry_but_skip_embedded_data() {
+        struct FailAt(GenReader, u32);
+        impl SectorSource for FailAt {
+            fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+                if lba == self.1 {
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                self.0.read_sectors(lba, n, buf, r)
+            }
+        }
+        let fs = fs_of(0, 1, vec![file("A", 5), file("B", 6)]);
+        let err = fs.non_stream_ranges(&mut FailAt(GenReader::new(1), 6));
+        assert!(
+            matches!(err, Err(Error::DiscRead { sector: 6, .. })),
+            "{err:?}"
+        );
+
+        let mut r = GenReader::new(1);
+        let mut embedded = efe(0);
+        embedded[34..36].copy_from_slice(&3u16.to_le_bytes());
+        r.over.insert(6, embedded);
+        fs.non_stream_ranges(&mut r)
+            .expect("embedded data is not an error");
     }
 
     #[test]

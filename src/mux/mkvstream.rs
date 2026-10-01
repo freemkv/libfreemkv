@@ -2765,11 +2765,17 @@ fn parse_block_counted(
     let frames = parse_block_raw(block, cluster_ts_ticks, ts_scale_ns, tracks, duration_ns)?;
     let mut kept = Vec::with_capacity(frames.len());
     let mut lost = Vec::new();
+    // One decoded-size budget for the whole block: a laced block's frames share it, so
+    // 256 frames each inflating to the cap cannot hold 256x the cap at once.
+    let mut budget = MAX_BLOCK_SIZE as usize;
     for mut f in frames {
         if let Some(steps) = tracks.decode.get(f.track).filter(|s| !s.is_empty()) {
             let len = f.data.len() as u64;
-            match decode_content(steps, std::mem::take(&mut f.data), MAX_BLOCK_SIZE as usize) {
-                Ok(d) => f.data = d,
+            match decode_content(steps, std::mem::take(&mut f.data), budget) {
+                Ok(d) => {
+                    budget -= d.len();
+                    f.data = d;
+                }
                 Err(_) => {
                     lost.push(len);
                     continue;
@@ -7889,6 +7895,26 @@ mod readback_tests {
         assert_eq!(frames[0].data, good);
         assert_eq!(s.errors(), 1);
         assert_eq!(s.lost_bytes(), 5);
+    }
+
+    // The decode cap is one budget per block: two laced frames that each fit the cap
+    // alone cannot both inflate (a 256-frame block would otherwise hold 256x the cap).
+    #[test]
+    fn laced_zlib_frames_share_one_block_budget() {
+        let frame = zlib(&vec![0u8; MAX_BLOCK_SIZE as usize * 5 / 8]);
+        // Fixed-size lacing (flags 0x04): count-1, then equal-size frames.
+        let mut block = vec![0x81, 0x00, 0x00, 0x84, 0x01];
+        block.extend_from_slice(&frame);
+        block.extend_from_slice(&frame);
+        let enc = encodings(&compression(None, &[]));
+        let bytes = mkv(
+            &[entry(1, 17, ebml::CODEC_VOBSUB, &enc)],
+            &cluster_of(&[&block]),
+        );
+        let mut s = open(bytes);
+        let frames = drain_all(&mut s);
+        assert_eq!(frames.len(), 1, "the second frame is past the block budget");
+        assert_eq!(s.errors(), 1);
     }
 
     #[test]

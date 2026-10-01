@@ -455,7 +455,14 @@ fn open_container(
                 opts.raw,
             )?))
         }
-        StreamUrl::Stdio => Ok(Box::new(StdioStream::input_staged(opts.raw))),
+        StreamUrl::Stdio => {
+            let mut stdio = StdioStream::input_staged(opts.raw);
+            // A selection is resolved against the title at open: read the header first.
+            if !opts.selection.is_all() {
+                stdio.prime()?;
+            }
+            Ok(Box::new(stdio))
+        }
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
         // `mp4://` flows to every sink (mkv://, audio://, json://, …).

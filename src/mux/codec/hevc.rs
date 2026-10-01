@@ -446,11 +446,8 @@ impl CodecParser for HevcParser {
         let mut bla_au = false;
         // Picture coding type, MEASURED from the first coded slice's header.
         let mut coding_type: Option<CodingType> = None;
-        // Track whether THIS access unit already carried each param-set type
-        // in-band (a redefinition vs codecPrivate). Used after the scan to
-        // re-assert the active set at a keyframe the source left bare.
-        // Redefinitions are held aside so they lead the AU in VPS, SPS, PPS order: a
-        // re-asserted PPS ahead of a redefined SPS is dropped by the decoder.
+        // This AU's in-band redefinitions, held aside to lead the AU in VPS, SPS, PPS
+        // order: a re-asserted PPS ahead of a redefined SPS is dropped by the decoder.
         let mut inband_vps = Vec::new();
         let mut inband_sps = Vec::new();
         let mut inband_pps = Vec::new();
@@ -581,8 +578,7 @@ impl CodecParser for HevcParser {
 
         // A player re-applies hvcC param sets at every keyframe; if the active
         // set was redefined mid-title and the source stopped repeating it, the
-        // reversion desyncs CABAC. Re-assert in-band at every keyframe (self-heals).
-        // A type this AU redefined goes in-band in its place instead.
+        // reversion desyncs CABAC. Re-assert at every keyframe; a redefined type goes instead.
         {
             let mut prefix = Vec::with_capacity(PARAM_REASSERT_HEADROOM);
             for (inband, cur) in [

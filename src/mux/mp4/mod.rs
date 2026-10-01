@@ -272,6 +272,13 @@ pub struct Mp4Sink<W: Write + Seek> {
     dropped: Vec<(usize, Mp4SkipReason)>,
     /// MPEG-2 multichannel extension tracks (no MP4 mapping), reported once packets arrive.
     excluded: super::ps::UnstoredExtensions,
+    /// Clip-join PTS correction, shared with the MKV muxer and the demux sink: a
+    /// multi-clip playlist's source PTS resets or jumps at each join.
+    timeline: crate::mux::timeline::TimelineContinuity,
+    /// The video stream that drives the timeline's epochs.
+    ref_video: Option<usize>,
+    /// Frames the timeline placed (the denominator for its drop count).
+    frames_mapped: u64,
 }
 
 impl<W: Write + Seek> Mp4Sink<W> {
@@ -371,6 +378,10 @@ impl<W: Write + Seek> Mp4Sink<W> {
         writer.write_all(b"mdat")?;
         writer.write_all(&0u64.to_be_bytes())?;
 
+        let ref_video = tracks
+            .iter()
+            .find(|t| t.media == Media::Video)
+            .map(|t| t.stream_idx);
         Ok(Self {
             writer,
             title: title.clone(),
@@ -383,6 +394,12 @@ impl<W: Write + Seek> Mp4Sink<W> {
             finished: false,
             plan: report,
             excluded: super::ps::UnstoredExtensions::new(title, "MP4"),
+            timeline: crate::mux::timeline::TimelineContinuity::with_clips(
+                &title.clips,
+                title.content_format,
+            ),
+            ref_video,
+            frames_mapped: 0,
             dropped: Vec::new(),
         })
     }
@@ -472,6 +489,18 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
             }
             self.tracks[slot].audio_entry = Some(entry);
         }
+        // Onto the continuous timeline first; `None` is material outside the clip marks.
+        let is_video = self.tracks[slot].media == Media::Video;
+        let Some(pts_ns) = self.timeline.map(
+            frame.pts,
+            Some(frame.track) == self.ref_video,
+            frame.track,
+            is_video,
+            frame.source.map(|s| s.byte),
+        ) else {
+            return Ok(());
+        };
+        self.frames_mapped += 1;
         // Nothing decodes before the first video keyframe: it is not stored.
         if self.tracks[slot].media == Media::Video
             && !frame.keyframe
@@ -479,7 +508,6 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
         {
             return Ok(());
         }
-        let pts_ns = frame.pts;
         let offset = self.mdat_start + 16 + self.mdat_payload;
         self.writer.write_all(&frame.data)?;
         self.mdat_payload += frame.data.len() as u64;
@@ -497,6 +525,26 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
             return Ok(());
         }
         self.finished = true;
+        // As the MKV muxer and demux sink: a seam plan that dropped everything, or most
+        // of the title, is a failed mux, not a short file at exit 0.
+        let seam_dropped = self.timeline.dropped_total();
+        if self.frames_mapped == 0 && seam_dropped > 0 {
+            return Err(crate::error::Error::SinkWroteNothing.into());
+        }
+        if seam_dropped > self.frames_mapped {
+            return Err(crate::error::Error::SeamPlanDroppedMost {
+                dropped: seam_dropped,
+                written: self.frames_mapped,
+            }
+            .into());
+        }
+        if seam_dropped > 0 {
+            tracing::info!(
+                target: "mux",
+                dropped = seam_dropped,
+                "frames outside the playlist's clip marks were dropped at clip joins"
+            );
+        }
         // Every drop below is recorded in `self.dropped` so `final_report()` cannot
         // keep claiming a track the file doesn't have; a `tracing::warn` alone left
         // the crate's own public report lying about the output.
@@ -1360,6 +1408,28 @@ mod tests {
         assert_eq!(
             s.final_report().skipped,
             vec![(1, Mp4SkipReason::Mp2Extension)]
+        );
+    }
+
+    // A multi-clip playlist's source PTS restarts at a join: the sink must place the next
+    // clip after the first (the timeline corrector the MKV muxer uses), never on top of it.
+    #[test]
+    fn a_clip_join_pts_reset_continues_the_timeline() {
+        let t = title(vec![hevc_video()], vec![Some(vec![1, 2, 3, 4])]);
+        let mut s = Mp4Sink::create(std::io::Cursor::new(Vec::new()), &t).unwrap();
+        for _clip in 0..2 {
+            for i in 0..150i64 {
+                let key = i % 25 == 0;
+                s.write(&frame(0, i * 40_000_000, key, vec![0xAB; 64]))
+                    .unwrap();
+            }
+        }
+        let pts: Vec<i64> = s.tracks[0].samples.iter().map(|x| x.pts_ns).collect();
+        assert_eq!(pts.len(), 300);
+        assert!(
+            pts.windows(2).all(|w| w[1] > w[0]),
+            "clip 2 must follow clip 1: {:?}",
+            &pts[148..152]
         );
     }
 
