@@ -9,6 +9,7 @@
 //! - [`CountingSource`]: a [`SectorSource`] wrapper that logs every read.
 //! - [`decrypt_unit`]: the aligned-unit decrypt, for tests that check ciphertext.
 //! - [`damage_unit_seed`]: an aligned unit whose first sector read back as garbage.
+//! - [`synthetic_bd_clip`]: a muxable clear BD-TS clip (MPEG-2 + two AC-3) for goldens.
 //! - [`FakeTransport`]: a scripted drive with a state model for Stop tests (stop §5.0).
 
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
@@ -129,6 +130,7 @@ pub struct BdFile {
     pub path: String,
     pub sectors: u32,
     pub key: Option<[u8; 16]>,
+    clip: Option<Arc<Vec<u8>>>,
 }
 
 impl BdFile {
@@ -137,7 +139,17 @@ impl BdFile {
             path: path.into(),
             sectors,
             key,
+            clip: None,
         }
+    }
+
+    /// The file holds `clip` (whole aligned units of clear BD-TS, e.g.
+    /// [`synthetic_bd_clip`]) instead of the varied junk payload; its length sets the file's
+    /// sector count.
+    pub fn with_clip(mut self, clip: Vec<u8>) -> Self {
+        self.sectors = (clip.len() / SECTOR_BYTES) as u32;
+        self.clip = Some(Arc::new(clip));
+        self
     }
 }
 
@@ -201,7 +213,8 @@ impl SectorSource for MemSource {
 /// (KS-3, KS-4). Panics on a fixture error; test use only.
 pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
     let dir = FixtureDir(fixture_dir());
-    let root = dir.0.clone();
+    // The UDF volume id is the root folder's name: fixed, so the image is byte-stable.
+    let root = dir.0.join("FIXTURE_DISC");
     write(&root.join("AACS/Unit_Key_RO.inf"), uk_ro);
     let unit_sectors = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
     for f in files {
@@ -236,7 +249,10 @@ pub fn encrypted_bd_image(files: &[BdFile], uk_ro: &[u8]) -> EncryptedBdImage {
         debug_assert_eq!(sectors % unit_sectors, 0, "{}: whole aligned units", f.path);
         for u in 0..sectors / unit_sectors {
             let lba = start + u * unit_sectors;
-            let mut unit = content_unit(lba, f.key.is_some());
+            let mut unit = match &f.clip {
+                Some(clip) => clip_unit(clip, (lba - start) / unit_sectors, f.key.is_some()),
+                None => content_unit(lba, f.key.is_some()),
+            };
             let at = lba as usize * SECTOR_BYTES;
             plain[at..at + ALIGNED_UNIT_LEN].copy_from_slice(&unit);
             if let Some(key) = &f.key {
@@ -263,6 +279,17 @@ fn content_unit(lba: u32, encrypted: bool) -> Vec<u8> {
         p[4] = 0x47;
     }
     u
+}
+
+// Aligned unit `u` of a clip, CPI-flagged when the file is keyed (KS-5).
+fn clip_unit(clip: &[u8], u: u32, encrypted: bool) -> Vec<u8> {
+    let at = u as usize * ALIGNED_UNIT_LEN;
+    let mut unit = clip[at..at + ALIGNED_UNIT_LEN].to_vec();
+    if encrypted {
+        unit.chunks_mut(BD_SOURCE_PACKET_BYTES)
+            .for_each(|p| p[0] |= 0xC0);
+    }
+    unit
 }
 
 // Removes its directory on drop, so a panicking fixture build doesn't leak it.
@@ -395,6 +422,14 @@ pub fn damage_unit_seed(unit: &mut [u8]) {
     unit[0] |= 0xC0;
     unit[4] = 0x00;
 }
+
+#[path = "test_util_golden.rs"]
+mod golden;
+pub use golden::{BLESS_ENV, Golden};
+
+#[path = "test_util_media.rs"]
+mod media;
+pub use media::{CLIP_AUDIO_PIDS, CLIP_VIDEO_PID, synthetic_bd_clip};
 
 #[path = "test_util_fake.rs"]
 mod fake;

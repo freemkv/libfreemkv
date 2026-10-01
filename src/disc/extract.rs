@@ -1630,6 +1630,7 @@ mod tests {
         plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         plain[4] = 0x44; // '01': a 13818-1 pack
         plain[0x14] = 0x10; // scramble flag
+        crate::css::dvd_pack_header(&mut plain, 0xE0);
         let pat: Vec<u8> = (0..8)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
             .collect();
@@ -1670,7 +1671,7 @@ mod tests {
         // Descrambled output matches the plaintext, with the scramble flag
         // cleared by the descrambler.
         let mut expect = plain.clone();
-        expect[0x14] = 0x00;
+        expect[0x14] = 0x80;
         assert_eq!(got, expect, "VOB descrambled to plaintext");
         assert!(res.complete);
     }
@@ -2213,6 +2214,7 @@ mod tests {
             plain[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
             plain[4] = 0x44; // '01': a 13818-1 pack
             plain[0x14] = 0x10; // scramble flag
+            crate::css::dvd_pack_header(&mut plain, 0xE0);
             let pat: Vec<u8> = (0..8)
                 .map(|k| (0xA0u8.wrapping_add(k as u8) ^ marker) ^ 0x5A)
                 .collect();
@@ -2263,9 +2265,9 @@ mod tests {
         let got_1 = read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB").expect("vts01 vob");
         let got_2 = read_out(out.path(), "VIDEO_TS/VTS_02_1.VOB").expect("vts02 vob");
         let mut expect_1 = plain_1.clone();
-        expect_1[0x14] = 0x00;
+        expect_1[0x14] = 0x80;
         let mut expect_2 = plain_2.clone();
-        expect_2[0x14] = 0x00;
+        expect_2[0x14] = 0x80;
         assert_eq!(
             got_1, expect_1,
             "VTS_01 must descramble under its OWN cracked key, not VTS_02's"
@@ -2288,6 +2290,7 @@ mod tests {
             plain[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
             plain[4] = 0x44; // '01': a 13818-1 pack
             plain[0x14] = 0x10;
+            crate::css::dvd_pack_header(&mut plain, 0xE0);
             let pat: Vec<u8> = (0..8)
                 .map(|k| (0xA0u8.wrapping_add(k as u8) ^ 0x01) ^ 0x5A)
                 .collect();
@@ -2306,6 +2309,7 @@ mod tests {
             sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
             sect[4] = 0x44; // '01': a 13818-1 pack
             sect[0x14] = 0x10;
+            crate::css::dvd_pack_header(&mut sect, 0xE0);
             for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
                 // Non-repeating, so no run of any period survives to 0x80.
                 *b = (i as u8).wrapping_mul(37).wrapping_add(11);
@@ -3000,6 +3004,7 @@ mod tests {
         sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         sect[4] = 0x44; // '01': a 13818-1 pack
         sect[0x14] = 0x10;
+        crate::css::dvd_pack_header(&mut sect, 0xE0);
         for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);
         }
@@ -3099,6 +3104,7 @@ mod tests {
         sect[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         sect[4] = 0x44; // '01': a 13818-1 pack
         sect[0x14] = 0x10;
+        crate::css::dvd_pack_header(&mut sect, 0xE0);
         for (i, b) in sect.iter_mut().enumerate().skip(0x59) {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);
         }

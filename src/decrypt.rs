@@ -644,15 +644,16 @@ const WRONG_KEY_FAILURES: usize = 2;
 /// Blank the damaged BD-TS units of `buf` (read at `base_lba` on the caller's unit grid):
 /// zero-fill them, like a sweep's unread sector, and return how many. Damaged: no TS sync at
 /// byte 4, flagged (CPI) or not; unflagged only when not clean TS either (a zeroed head over
-/// clear TS is a sweep hole). No key opens them: read damage, never a key verdict or E7013,
-/// alone, clustered, or off the grid (1.7.7 muxed through all three). Only units `covered`
-/// (keyed or proven on arrival) are judged. A flagged garbage seed that keeps 0x47 at byte 4
-/// (~1 in 256) is not caught here: it decrypts as garbage, or on arrival reads as unopened.
+/// clear TS is a sweep hole), or a flagged partial unit ending the source (`tail_at_end`).
+/// No key opens them: read damage, never a key verdict or E7013, alone, clustered, or off the
+/// grid (1.7.7 muxed through all three). Only units `covered` (keyed or proven on arrival) are
+/// judged. A flagged garbage seed keeping 0x47 at byte 4 (~1 in 256) is not caught here.
 pub(crate) fn blank_damaged_units(
     buf: &mut [u8],
     base_lba: u32,
     format: crate::disc::ContentFormat,
     covered: &dyn Fn(u32) -> bool,
+    tail_at_end: bool,
 ) -> usize {
     if format != crate::disc::ContentFormat::BdTs {
         return 0;
@@ -678,10 +679,23 @@ pub(crate) fn blank_damaged_units(
             damaged.push(i);
         }
     }
+    // A truncated copy's flagged last partial unit cannot be opened as a unit (KS-3); a partial
+    // read mid-content is a caller bug, left for the decrypt to refuse.
+    let whole = buf.len() / unit_len;
+    let tail = &buf[whole * unit_len..];
+    let at = base_lba.saturating_add(whole as u32 * aacs::content::ALIGNED_UNIT_SECTORS);
+    if tail_at_end
+        && !tail.is_empty()
+        && covered(at)
+        && aacs::content::aacs_unit_seed_encrypted(tail, format)
+    {
+        damaged.push(whole);
+    }
     // KS-3 [BD] §3.10.1: "A new CBC cipher chain is started for each Aligned Unit", so the
     // loss is this unit alone.
     for &i in &damaged {
-        buf[i * unit_len..(i + 1) * unit_len].fill(0);
+        let end = ((i + 1) * unit_len).min(buf.len());
+        buf[i * unit_len..end].fill(0);
     }
     if let Some(&first) = damaged.first() {
         tracing::warn!(
@@ -873,6 +887,7 @@ mod tests {
         plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
         plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // CSS scramble flag (DVD-Video sector header)
+        crate::css::dvd_pack_header(&mut plaintext, 0xE0);
         let pat: Vec<u8> = (0..PERIOD)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
             .collect();
@@ -940,6 +955,7 @@ mod tests {
         plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
         plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
+        crate::css::dvd_pack_header(&mut plaintext, 0xE0);
         let pat: Vec<u8> = (0..PERIOD)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
             .collect();
@@ -1084,6 +1100,7 @@ mod tests {
         sector[4] = 0x44; // '01': a 13818-1 pack
         sector[0x0D] = 0xF8; // pack_stuffing_length 0
         sector[0x14] = 0x30; // scramble flag (bits 4-5)
+        crate::css::dvd_pack_header(&mut sector, 0xE0);
         sector[0x54..0x59].copy_from_slice(seed);
         let plaintext = sector.clone();
         css::lfsr::scramble_sector(title_key, &mut sector);
@@ -1152,6 +1169,7 @@ mod tests {
         plaintext[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         plaintext[4] = 0x44; // '01': a 13818-1 pack
         plaintext[0x14] = 0x10; // scramble flag
+        crate::css::dvd_pack_header(&mut plaintext, 0xE0);
         // Periodic run from 0x59 (just above the seed) through 0x80 and on into
         // the encrypted region; phase anchored to offset 0 so it is continuous
         // across the 0x80 boundary.
@@ -2071,7 +2089,7 @@ mod tests {
         crate::test_util::damage_unit_seed(&mut garbage);
         garbage[0] &= 0x3F;
         let mut buf = [garbage, clear_ts_unit(), vec![0u8; ul]].concat();
-        let n = blank_damaged_units(&mut buf, 0, ContentFormat::BdTs, &|_| true);
+        let n = blank_damaged_units(&mut buf, 0, ContentFormat::BdTs, &|_| true, false);
         assert_eq!(n, 1);
         assert!(buf[..ul].iter().all(|&b| b == 0));
         assert_eq!(&buf[ul..2 * ul], &clear_ts_unit()[..]);
@@ -2369,5 +2387,25 @@ mod spec_guards {
         let map = AacsKeyMap::from_ranges_phased(vec![(0, 3, 0, Phase::Verify)]);
         decrypt_sectors_mapped(&mut kept, &keys, 0, &map).expect("a verified unit decrypts");
         check("kept Verify", &kept, plain);
+    }
+    // A flagged partial unit is blanked only when it ends the source (a truncated copy); a
+    // partial read mid-content is left for the decrypt to refuse.
+    #[test]
+    fn a_flagged_partial_unit_is_blanked_only_at_the_end() {
+        use crate::disc::ContentFormat;
+        let mut tail = vec![0x5Au8; 4096];
+        tail[0] |= 0xC0;
+        tail[4] = 0x47;
+        let mut mid = tail.clone();
+        assert_eq!(
+            blank_damaged_units(&mut mid, 0, ContentFormat::BdTs, &|_| true, false),
+            0
+        );
+        assert_eq!(mid, tail);
+        assert_eq!(
+            blank_damaged_units(&mut tail, 0, ContentFormat::BdTs, &|_| true, true),
+            1
+        );
+        assert!(tail.iter().all(|&b| b == 0));
     }
 }

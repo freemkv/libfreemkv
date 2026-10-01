@@ -97,10 +97,10 @@ pub use videomap::{Medium, SourceInfo};
 // and two of its inclusions can still be dropped at `finish()`.
 pub use mp4::{Mp4FitReport, Mp4Sink, Mp4SkipReason, fit_report as mp4_fit_report};
 pub use mpg::MpgSink;
-pub use network::NetworkStream;
+pub use network::{NetworkStream, is_blocked_ip};
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
-pub use resolve::{InputOptions, StreamUrl, input, output, parse_url};
+pub use resolve::{InputOptions, StreamUrl, disc_root_of, input, output, parse_url};
 pub use stdio::StdioStream;
 
 use std::io::{Seek, Write};
@@ -120,6 +120,10 @@ impl<T: Write + Seek> WriteSeek for T {}
 mod fvi_pipeline_tests;
 #[cfg(test)]
 pub(crate) mod interop_tests;
+#[cfg(test)]
+pub(crate) mod parity_tests;
+#[cfg(test)]
+mod stage_tests;
 
 #[cfg(test)]
 mod tests {

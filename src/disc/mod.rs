@@ -1749,10 +1749,8 @@ pub struct ScanOptions {
     /// scanned title (e.g. `freemkv info`) opt in. The rip path leaves it off:
     /// the muxer detects forced during muxing without a second read.
     pub probe_forced_subtitles: bool,
-    /// The caller copies sectors raw and never decrypts or accepts keys (a raw
-    /// disc→ISO copy). A live AACS disc whose `Unit_Key_RO.inf` is unreadable then
-    /// still scans, with [`Error::AacsKeyFileUnreadable`] recorded and every key refused;
-    /// otherwise `Disc::scan` returns that error.
+    /// The caller copies sectors raw (a raw disc→ISO copy). No effect on the scan since
+    /// an unreadable `Unit_Key_RO.inf` never fails it; kept for source compatibility.
     pub raw_copy: bool,
 }
 
@@ -1933,9 +1931,9 @@ impl Disc {
     /// capacity + UDF, (3) the AACS files (`Unit_Key_RO.inf`, content cert, MKB) with
     /// plain READs, (4) the AACS handshake if AACS, (5) titles + labels.
     ///
-    /// A live AACS disc whose `Unit_Key_RO.inf` cannot be read fails with
-    /// [`Error::AacsKeyFileUnreadable`] before any AACS command (see
-    /// [`ScanOptions::raw_copy`]). A dead bus during a handshake aborts the scan.
+    /// A live AACS disc whose `Unit_Key_RO.inf` cannot be read is warned and scanned on,
+    /// with [`Error::AacsKeyFileUnreadable`] recorded and every key refused. A dead bus
+    /// during a handshake aborts the scan.
     /// `opts.halt` is the scan's op token unless the drive has one attached (§2.2).
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         let mut session = session.alias(opts.halt.as_ref());
@@ -1969,9 +1967,7 @@ impl Disc {
             let from = if dvd {
                 encrypt::CaptureFrom::Image
             } else {
-                encrypt::CaptureFrom::Live {
-                    raw_copy: opts.raw_copy,
-                }
+                encrypt::CaptureFrom::Live
             };
             let cap = encrypt::capture(&mut buffered, &udf_fs, from)?;
             let bus = if !dvd {
@@ -6560,6 +6556,7 @@ mod tests {
         sec[0x00..0x04].copy_from_slice(&crate::css::PACK_START);
         sec[4] = 0x44; // '01': a 13818-1 pack
         sec[0x14] = 0x10; // scramble flag
+        crate::css::dvd_pack_header(&mut sec, 0xE0);
         for (i, b) in sec.iter_mut().enumerate().skip(RUN_START) {
             *b = (0xA0u8.wrapping_add((i % PERIOD) as u8)) ^ 0x5A;
         }
@@ -8397,7 +8394,7 @@ mod tests {
         udf: &udf::UdfFs,
         rdk: Option<[u8; 16]>,
     ) -> Option<[u8; 16]> {
-        let from = encrypt::CaptureFrom::Live { raw_copy: true };
+        let from = encrypt::CaptureFrom::Live;
         let cap = encrypt::capture(mem, udf, from).expect("capture");
         let bus = encrypt::BusOutcome::Handshake(encrypt::HandshakeResult {
             volume_id: [0x11; 16],
@@ -8507,7 +8504,7 @@ mod tests {
             let (mem, _) = bus_fixture_with(Some(cert), wire.clone());
             let mut d = Drive::from_transport_for_test(Box::new(MemTransport(mem)));
             let (capacity, mut buffered, udf) = Disc::read_udf(&mut d).expect("udf");
-            let from = encrypt::CaptureFrom::Live { raw_copy: true };
+            let from = encrypt::CaptureFrom::Live;
             let cap = encrypt::capture(&mut buffered, &udf, from).expect("capture");
             let bus = encrypt::BusOutcome::Handshake(handshake());
             Disc::live_finish(
@@ -8540,11 +8537,7 @@ mod tests {
     ) -> Result<(Drive, Disc)> {
         let mut d = Drive::from_transport_for_test(Box::new(MemTransport(mem)));
         let (capacity, mut buffered, udf) = Disc::read_udf(&mut d)?;
-        let cap = encrypt::capture(
-            &mut buffered,
-            &udf,
-            encrypt::CaptureFrom::Live { raw_copy: true },
-        )?;
+        let cap = encrypt::capture(&mut buffered, &udf, encrypt::CaptureFrom::Live)?;
         let bus = encrypt::BusOutcome::Handshake(encrypt::HandshakeResult {
             volume_id: [0x11; 16],
             read_data_key: rdk,

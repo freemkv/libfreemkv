@@ -1,0 +1,25 @@
+resolve-whole status = KeySetStatus { proven: 1, declared: Some(1), keyed: 1, clear: 0, lazy: 0, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }
+copy failed = E6000
+copy blanked = 0
+extract result = good=18432 unreadable=18432 complete=false halted=false files=[("BDMV/STREAM/00001.m2ts", 18432, 18432, true)]
+extract out BDMV/STREAM/00001.m2ts = 36864 bytes sha256:44fee6c3dc35a6f2a58b400893c22b7a
+copy-raw failed = E6000
+extract-raw result = good=18432 unreadable=18432 complete=false halted=false files=[("BDMV/STREAM/00001.m2ts", 18432, 18432, true)]
+extract-raw out BDMV/STREAM/00001.m2ts = 36864 bytes sha256:48e61cd82e2557534766b163f852bd66
+resolve-title status = KeySetStatus { proven: 1, declared: Some(1), keyed: 1, clear: 0, lazy: 0, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }
+title-read = 0 bytes sha256:e3b0c44298fc1c149afbf4c8996fb924
+title-read blanked = 0
+title-read failed = E6000
+iso-mkv outcome = completed=true opened=true bytes=26416 errors=0 lost=0 streams=3 undelivered=[]
+iso-mkv out o.mkv = 28578 bytes sha256:51db71260cb190c5bafb17544c8976ab
+iso-m2ts outcome = completed=true opened=true bytes=26416 errors=0 lost=0 streams=3 undelivered=[]
+iso-m2ts out o.m2ts = 39360 bytes sha256:bf6571efb2ada7dc353acd6fb1dca21e
+iso-null outcome = completed=true opened=true bytes=26416 errors=0 lost=0 streams=3 undelivered=[]
+iso-mkv-raw refused = E6008
+iso-mkv-selection outcome = completed=true opened=true bytes=20016 errors=0 lost=0 streams=2 undelivered=[]
+iso-mkv-selection out o.mkv = 21563 bytes sha256:cda2cf35944d0511ffd8de92d4a542fd
+live-mkv refused = E6008
+live-mkv out o.mkv = 493 bytes sha256:454f3eb165010aa1646faed1279583cf
+live-mkv-raw refused = E6000
+live-mkv-skip outcome = completed=true opened=true bytes=17910 errors=7 lost=6144 streams=3 undelivered=[]
+live-mkv-skip out o.mkv = 19715 bytes sha256:732a5c67d1f32079e51a58cd87e8d82e

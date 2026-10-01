@@ -1,0 +1,25 @@
+mkv outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+mkv out o.mkv = 58232 bytes sha256:b25ee88e8f6935e99acf42fd476cc71d
+mp4 refused = E9048
+mp4 out o.mp4 = 0 bytes sha256:e3b0c44298fc1c149afbf4c8996fb924
+mpg outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+mpg out o.mpg = 206852 bytes sha256:1fb67e840822afec9eab312490f39458
+m2ts outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+m2ts out o.m2ts = 80256 bytes sha256:ab5d202fdf7ea5d2e5be98f01840be21
+fvi outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+fvi out o.fvi = 6010 bytes sha256:b2c2689eb46dbb88df82ed4036805429
+json outcome = completed=true opened=true bytes=0 errors=0 lost=0 streams=3 undelivered=[]
+json out o.json = 1263 bytes sha256:040a1c5961ab0286333076150fbab37e
+chapters outcome = completed=true opened=true bytes=0 errors=0 lost=0 streams=3 undelivered=[]
+chapters out o.xml = 147 bytes sha256:1a73b20654e6b734d7388c10049455fb
+demux outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+demux out o/title t00 MPEG2.m2v = 27880 bytes sha256:be8990c82ea9024deb38cdfb174bea80
+demux out o/title t01 und AC3 DELAY 0ms.ac3 = 13312 bytes sha256:904e9e35a2990b1001d2d99baeb1a633
+demux out o/title t02 und AC3 DELAY 0ms.ac3 = 13312 bytes sha256:48694b3013866911b7e0f20507ebb311
+video outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+video out o/title t00 MPEG2.m2v = 27880 bytes sha256:be8990c82ea9024deb38cdfb174bea80
+audio outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+audio out o/title t01 und AC3 DELAY 0ms.ac3 = 13312 bytes sha256:904e9e35a2990b1001d2d99baeb1a633
+audio out o/title t02 und AC3 DELAY 0ms.ac3 = 13312 bytes sha256:48694b3013866911b7e0f20507ebb311
+sub outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+null outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]

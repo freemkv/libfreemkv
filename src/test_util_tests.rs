@@ -159,11 +159,7 @@ fn decrypt_unit_inverts_encrypt_unit() {
 
 #[test]
 fn fixture_dir_removed_when_build_panics() {
-    let bad = [BdFile {
-        path: "AACS/Unit_Key_RO.inf/x".into(),
-        sectors: 3,
-        key: None,
-    }];
+    let bad = [BdFile::new("AACS/Unit_Key_RO.inf/x", 3, None)];
     let r = std::panic::catch_unwind(|| encrypted_bd_image(&bad, &[0u8; 4]));
     assert!(r.is_err());
     let dir = crate::test_util::LAST_FIXTURE_DIR

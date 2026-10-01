@@ -390,7 +390,7 @@ fn no_thread_sleep_on_op_paths() {
         ),
         (
             "src/mux/network.rs",
-            "accept_from_with_halt",
+            "accept_staged",
             "halt-checked accept poll; open item: convert to Halt::wait",
         ),
     ];

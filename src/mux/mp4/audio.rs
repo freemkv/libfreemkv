@@ -2,8 +2,9 @@
 //!
 //! Covers codecs that map cleanly into MP4: **AC-3** (`ac-3` + `dac3`),
 //! **E-AC-3 / Dolby Digital Plus** (`ec-3` + `dec3`, incl. Atmos-in-DD+ JOC),
-//! and **DTS / DTS-HD** (`dtsc`/`dtsh` + `ddts`, core described, whole access
-//! units passed through so an HD decoder finds the extension). Config boxes
+//! **DTS / DTS-HD** (`dtsc`/`dtsh` + `ddts`, core described, whole access
+//! units passed through so an HD decoder finds the extension), and AAC / MPEG-1/2
+//! audio (`mp4a` + `esds`). Config boxes
 //! are derived from the first audio frame's bitstream (ISO/IEC 14496-12
 //! amendments; ETSI TS 102 366 / 102 114). Codecs with no clean MP4 mapping
 //! (TrueHD, LPCM, bitmap subtitles) are excluded by the fit oracle.
@@ -483,12 +484,80 @@ pub(super) fn dolby_sample_entry(
     }
 }
 
+/// (channels, rate) of an AudioSpecificConfig the `esds` can carry: a table rate and
+/// channel configuration, no escaped object type, short enough for one-byte sizes.
+pub(super) fn aac_config(asc: &[u8]) -> Option<(u16, u32)> {
+    const RATES: [u32; 12] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000,
+    ];
+    let (b0, b1) = (*asc.first()?, *asc.get(1)?);
+    if b0 >> 3 == 31 || asc.len() > 100 {
+        return None;
+    }
+    let rate = *RATES.get(usize::from(((b0 & 7) << 1) | (b1 >> 7)))?;
+    let channels = match (b1 >> 3) & 0x0F {
+        c @ 1..=6 => u16::from(c),
+        7 => 8,
+        _ => return None,
+    };
+    Some((channels, rate))
+}
+
+// One MPEG-4 descriptor (14496-1 §7.2.2.1): tag, one-byte size (every body here is < 128).
+fn descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
+    [&[tag, body.len() as u8][..], body].concat()
+}
+
+/// The `mp4a` + `esds` AudioSampleEntry (14496-14 §5.6) for AAC (from its ASC) or MPEG-1/2
+/// audio (from the first frame header), or `None` if neither describes the track.
+pub(super) fn mpeg_sample_entry(codec: Codec, first_frame: &[u8], asc: &[u8]) -> Option<Vec<u8>> {
+    // (objectTypeIndication, channels, rate, DecoderSpecificInfo)
+    let (oti, channels, rate, dsi) = match codec {
+        Codec::Aac => {
+            let (channels, rate) = aac_config(asc)?;
+            (0x40, channels, rate, descriptor(0x05, asc))
+        }
+        Codec::Mp2 | Codec::Mp3 => {
+            let h = first_frame.get(..4)?;
+            if h[0] != 0xFF || h[1] & 0xE0 != 0xE0 || h[1] & 0x06 == 0 {
+                return None;
+            }
+            let base = [44_100, 48_000, 32_000].get(usize::from((h[2] >> 2) & 3))?;
+            // version '11' MPEG-1 (11172-3), '10' MPEG-2 half rates, '00' MPEG-2.5 quarter.
+            let (oti, rate) = match (h[1] >> 3) & 3 {
+                3 => (0x6B, *base),
+                2 => (0x69, base / 2),
+                0 => (0x69, base / 4),
+                _ => return None,
+            };
+            (oti, if h[3] >> 6 == 3 { 1 } else { 2 }, rate, Vec::new())
+        }
+        _ => return None,
+    };
+    // streamType 5 (audio) << 2 | reserved 1; bufferSizeDB, max/avg bitrate unknown (0).
+    let mut config = vec![oti, 0x15];
+    config.extend_from_slice(&[0; 11]);
+    config.extend_from_slice(&dsi);
+    let mut es = vec![0, 0, 0];
+    es.extend(descriptor(0x04, &config));
+    es.extend(descriptor(0x06, &[0x02]));
+    let esds = bx(b"esds", &[&[0u8; 4][..], &descriptor(0x03, &es)].concat());
+    Some(audio_sample_entry(b"mp4a", channels, rate, &esds))
+}
+
 /// Fit oracle for an audio codec: does `mp4://` currently carry it?
-// TrueHD, LPCM, AAC are not yet mapped; skipped with a loud report, not silently dropped.
+// TrueHD and LPCM are not mapped; skipped with a loud report, not silently dropped.
 pub(super) fn audio_fits(codec: Codec) -> bool {
     matches!(
         codec,
-        Codec::Ac3 | Codec::Ac3Plus | Codec::Dts | Codec::DtsHdMa | Codec::DtsHdHr
+        Codec::Ac3
+            | Codec::Ac3Plus
+            | Codec::Dts
+            | Codec::DtsHdMa
+            | Codec::DtsHdHr
+            | Codec::Aac
+            | Codec::Mp2
+            | Codec::Mp3
     )
 }
 
@@ -648,6 +717,60 @@ mod tests {
         // channelcount at entry-body offset 16 (after 6 reserved + 2 dri + 8 reserved).
         let ch = u16::from_be_bytes([e[8 + 16], e[8 + 17]]);
         assert_eq!(ch, 6);
+    }
+
+    // MPEG-4 audio and MPEG-1/2 audio are `mp4a` + `esds` (14496-14 §5.6, OTI 0x40/0x6B/0x69).
+    #[test]
+    fn aac_and_mpeg_audio_get_mp4a_esds_entries() {
+        for c in [Codec::Aac, Codec::Mp2, Codec::Mp3] {
+            assert!(audio_fits(c), "{c:?}");
+        }
+        let esds = |e: &[u8]| {
+            e.windows(4)
+                .position(|w| w == b"esds")
+                .map(|i| e[i + 4..].to_vec())
+        };
+        // AAC-LC 48 kHz stereo: channels/rate from the ASC, which is the DecoderSpecificInfo.
+        let e = mpeg_sample_entry(Codec::Aac, &[0x21], &[0x11, 0x90]).unwrap();
+        assert_eq!(&e[4..8], b"mp4a");
+        assert_eq!(u16::from_be_bytes([e[24], e[25]]), 2);
+        assert_eq!(
+            u32::from_be_bytes([e[32], e[33], e[34], e[35]]) >> 16,
+            48_000
+        );
+        let d = esds(&e).unwrap();
+        assert_eq!(
+            d[4..9],
+            [0x03, 0x19, 0x00, 0x00, 0x00],
+            "ES_Descriptor, ES_ID 0"
+        );
+        assert_eq!(d[9..12], [0x04, 0x11, 0x40], "DecoderConfig, OTI 0x40");
+        assert_eq!(d[12], 0x15, "audio stream");
+        assert_eq!(
+            d[24..28],
+            [0x05, 0x02, 0x11, 0x90],
+            "ASC as DecoderSpecificInfo"
+        );
+        assert_eq!(d[28..], [0x06, 0x01, 0x02], "SLConfig predefined 2");
+        // MPEG-1 Layer III 44.1 kHz mono → 0x6B; MPEG-2 Layer II 24 kHz stereo → 0x69.
+        let e = mpeg_sample_entry(Codec::Mp3, &[0xFF, 0xFB, 0x90, 0xC4], &[]).unwrap();
+        assert_eq!(u16::from_be_bytes([e[24], e[25]]), 1);
+        assert_eq!(
+            u32::from_be_bytes([e[32], e[33], e[34], e[35]]) >> 16,
+            44_100
+        );
+        assert_eq!(esds(&e).unwrap()[11], 0x6B);
+        let e = mpeg_sample_entry(Codec::Mp2, &[0xFF, 0xF5, 0x84, 0x04], &[]).unwrap();
+        assert_eq!(
+            u32::from_be_bytes([e[32], e[33], e[34], e[35]]) >> 16,
+            24_000
+        );
+        assert_eq!(esds(&e).unwrap()[11], 0x69);
+        assert!(
+            mpeg_sample_entry(Codec::Aac, &[0x21], &[]).is_none(),
+            "no ASC"
+        );
+        assert!(mpeg_sample_entry(Codec::Mp3, &[0x0B, 0x77, 0, 0], &[]).is_none());
     }
 
     #[test]

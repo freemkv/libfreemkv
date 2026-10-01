@@ -1,0 +1,8 @@
+scan = titles=1
+keys = KeySetStatus { proven: 1, declared: Some(1), keyed: 1, clear: 0, lazy: 0, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }
+keyed outcome = completed=true opened=true bytes=26416 errors=0 lost=0 streams=3 undelivered=[]
+keyed out o.mkv = 28567 bytes sha256:bf1a6347d627e65f7580b67322dee4d5
+keyless refused = E7022
+keyed-again outcome = completed=true opened=true bytes=26416 errors=0 lost=0 streams=3 undelivered=[]
+keyed-again out o.mkv = 28567 bytes sha256:bf1a6347d627e65f7580b67322dee4d5
+raw refused = E6008

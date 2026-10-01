@@ -5,9 +5,10 @@
 //! backward and one forward side read (`recovery = false`, never retried, failures swallowed).
 //! A held key opening the unit and a partner is `Proven`; else `Provisional` until another
 //! readable unit confirms it. A unit the key does not open is damage, blanked and counted,
-//! when a held key opens a partner or no partner is readable; it stops E7022 / E7032 when
+//! when a held key opens a partner or no partner is readable; it stops E7022 when
 //! another held key opens it, when partners are readable and none opens, or when a second
 //! partnerless unit (another LBA) opens under no key before any proof; never in a clear piece.
+//! An image or folder (`StopKind::Image`) never stops: those units are blanked and counted.
 
 use super::{Proof, ProofCache, ResolvedKeySet, StopKind};
 use crate::aacs::content::{
@@ -98,6 +99,15 @@ impl Arrival {
             && !self.in_segment(lba)
             && aacs_unit_encrypted(unit, self.format)
             && aacs_unit_on_grid(unit, self.format)
+    }
+
+    // An unopenable unit stops a title rip (E7022); in an image it is blanked and counted.
+    fn refuse(&self, lba: u32, why: &'static str) -> Result<()> {
+        if matches!(self.stop, StopKind::Image) {
+            tracing::warn!(target: "freemkv::keys", lba, why, "no held key opens the unit: blanking it in the image");
+            return Ok(());
+        }
+        Err(self.stop(lba, why))
     }
 
     fn stop(&self, lba: u32, why: &'static str) -> Error {
@@ -205,11 +215,11 @@ impl Arrival {
         let unit = &buf[u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN];
         let opens = |p: &[u8], s: usize| self.opens(p, &unit_keys[s].1);
         if self.held(candidate).any(|s| opens(unit, s)) {
-            return Err(self.stop(at, "another held key opens the unit"));
+            return self.refuse(at, "another held key opens the unit");
         }
         // No key held for a piece not resolved clear (a mux given no set): nothing to prove.
         if self.base == 0 && !self.pieces[span.3].2 {
-            return Err(self.stop(at, "no key held"));
+            return self.refuse(at, "no key held");
         }
         // A clear piece has no partners and no key to be wrong: a flagged unit is damage.
         if self.pieces[span.3].2 {
@@ -225,12 +235,12 @@ impl Arrival {
             return Ok(());
         }
         if !batch.is_empty() || !side.is_empty() {
-            return Err(self.stop(at, "no held key opens the unit or a partner"));
+            return self.refuse(at, "no held key opens the unit or a partner");
         }
         let mut strikes = self.strikes.lock().unwrap_or_else(|e| e.into_inner());
         match strikes.get_mut(span.3) {
             Some(Some(prev)) if *prev != at => {
-                Err(self.stop(at, "a second partnerless unit no held key opens"))
+                self.refuse(at, "a second partnerless unit no held key opens")
             }
             Some(slot) => {
                 *slot = Some(at);

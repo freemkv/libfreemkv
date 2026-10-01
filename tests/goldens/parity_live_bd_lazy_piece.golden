@@ -1,0 +1,3 @@
+keys = KeySetStatus { proven: 0, declared: Some(1), keyed: 0, clear: 0, lazy: 1, forensic: None, origin: None, best_effort: false, requests: 1 }
+lazy outcome = completed=true opened=true bytes=26416 errors=0 lost=0 streams=3 undelivered=[]
+lazy out o.mkv = 28567 bytes sha256:bf1a6347d627e65f7580b67322dee4d5

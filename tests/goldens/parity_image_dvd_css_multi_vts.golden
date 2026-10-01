@@ -1,0 +1,3 @@
+extract result = good=860160 unreadable=0 complete=true halted=false files=[("VIDEO_TS/VTS_01_1.VOB", 430080, 0, true), ("VIDEO_TS/VTS_02_1.VOB", 430080, 0, true)]
+extract out VIDEO_TS/VTS_01_1.VOB = 430080 bytes sha256:4f62f2019c87c5183c7015aeebdbf241
+extract out VIDEO_TS/VTS_02_1.VOB = 430080 bytes sha256:4f62f2019c87c5183c7015aeebdbf241

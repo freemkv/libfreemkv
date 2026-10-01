@@ -123,8 +123,8 @@ struct Track {
     /// in [`Mp4Sink::final_report`].
     stream_idx: usize,
     codec: Codec,
-    /// Video: `hvcC`/`avcC`. Audio: unused (the sample entry is built from the
-    /// first frame's bitstream and cached in `audio_entry`).
+    /// Video: `hvcC`/`avcC`. Audio: AAC's ASC; other entries come from the first
+    /// frame's bitstream (cached in `audio_entry`).
     codec_private: Vec<u8>,
     width: u32,
     height: u32,
@@ -190,7 +190,7 @@ pub struct Mp4FitReport {
 
 /// Compute the fit plan without opening a file. Video: the first primary
 /// HEVC/H.264 track. Audio: every track `audio::audio_fits` carries — the Dolby
-/// family (AC-3 / E-AC-3) and DTS (core / DTS-HD HRA / DTS-HD MA). Everything
+/// family (AC-3 / E-AC-3), DTS (core / DTS-HD HRA / DTS-HD MA), AAC and MPEG audio. Everything
 /// else is skipped with a reason, except a DVD MPEG-2 multichannel extension track, which
 /// only [`Mp4Sink::final_report`] lists, and only once its packets arrived.
 pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
@@ -217,7 +217,9 @@ pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
             // (Mp2Extension, post-mux) once its packets actually arrive.
             DiscStream::Audio(a) if a.is_mp2_extension() => {}
             DiscStream::Audio(a) => {
-                if audio::audio_fits(a.codec) {
+                let cp = title.codec_privates.get(i).and_then(|c| c.as_deref());
+                let described = a.codec != Codec::Aac || cp.and_then(audio::aac_config).is_some();
+                if audio::audio_fits(a.codec) && described {
                     included.push(i);
                 } else {
                     skipped.push((i, Mp4SkipReason::UnmappableAudio));
@@ -330,7 +332,13 @@ impl<W: Write + Seek> Mp4Sink<W> {
                         track_id,
                         stream_idx: i,
                         codec: a.codec,
-                        codec_private: Vec::new(),
+                        // AAC's AudioSpecificConfig; the other codecs describe in-band.
+                        codec_private: title
+                            .codec_privates
+                            .get(i)
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_default(),
                         width: 0,
                         height: 0,
                         colr: None,
@@ -456,7 +464,16 @@ impl<W: Write + Seek + Send> Stream for Mp4Sink<W> {
                 &frame.data,
                 self.tracks[slot].audio_timescale,
             )
+            .or_else(|| {
+                let t = &self.tracks[slot];
+                audio::mpeg_sample_entry(t.codec, &frame.data, &t.codec_private)
+            })
         {
+            // A rate the title could not name (e.g. 22.05 kHz MP3) comes from the entry.
+            if self.tracks[slot].audio_timescale == 0 {
+                self.tracks[slot].audio_timescale =
+                    u32::from_be_bytes([entry[32], entry[33], entry[34], entry[35]]) >> 16;
+            }
             self.tracks[slot].audio_entry = Some(entry);
         }
         // Nothing decodes before the first video keyframe: it is not stored.
@@ -1136,6 +1153,32 @@ mod tests {
         t.streams = streams;
         t.codec_privates = cps;
         t
+    }
+
+    // An AAC track the esds cannot describe (no ASC, PCE layout) is planned out, not
+    // promised and then dropped at finish().
+    #[test]
+    fn fit_report_includes_aac_only_with_a_describable_config() {
+        let t = title(
+            vec![
+                hevc_video(),
+                audio(Codec::Aac, "eng"),
+                audio(Codec::Aac, "eng"),
+                audio(Codec::Aac, "eng"),
+                audio(Codec::Mp3, "eng"),
+            ],
+            vec![
+                Some(vec![1, 2, 3]),
+                Some(vec![0x11, 0x90]),
+                None,
+                Some(vec![0x11, 0x80]),
+                None,
+            ],
+        );
+        let r = fit_report(&t);
+        assert_eq!(r.included, vec![0, 1, 4]);
+        let skip = Mp4SkipReason::UnmappableAudio;
+        assert_eq!(r.skipped, vec![(2, skip), (3, skip)]);
     }
 
     #[test]

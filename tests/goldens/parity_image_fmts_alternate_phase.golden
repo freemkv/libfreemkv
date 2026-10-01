@@ -1,0 +1,6 @@
+phase0 status = KeySetStatus { proven: 2, declared: Some(2), keyed: 2, clear: 0, lazy: 0, forensic: Resolved, origin: Some("online"), best_effort: false, requests: 2 }
+phase0 forensic-clip = 98304 bytes sha256:2f40ac12464652e99ffb371dc0ed2af6
+phase0 copy = refused E7013
+phase1 status = KeySetStatus { proven: 2, declared: Some(2), keyed: 2, clear: 0, lazy: 0, forensic: Resolved, origin: Some("online"), best_effort: false, requests: 3 }
+phase1 forensic-clip = 98304 bytes sha256:5026938565e0cc00c6399f36f8fc1fa2
+phase1 copy = refused E7013

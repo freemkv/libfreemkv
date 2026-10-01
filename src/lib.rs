@@ -230,7 +230,7 @@ pub use mux::WriteSeek;
 #[cfg(feature = "rip")]
 pub use mux::{FitReport, SkipReason, fit_report};
 #[cfg(feature = "rip")]
-pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
+pub use mux::{InputOptions, StreamUrl, disc_root_of, input, output, parse_url};
 #[cfg(feature = "rip")]
 pub use mux::{Medium, SourceInfo};
 #[cfg(feature = "rip")]

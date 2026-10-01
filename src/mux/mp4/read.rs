@@ -15,9 +15,7 @@ use crate::disc::{
 };
 use crate::labels::LabelPurpose;
 use crate::pes::{PesFrame, Stream};
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
 
 const NS: i128 = 1_000_000_000;
 
@@ -59,18 +57,6 @@ pub struct Mp4Reader<R: Read + Seek> {
     title: DiscTitle,
     samples: Vec<SampleRef>,
     cursor: usize,
-}
-
-impl Mp4Reader<File> {
-    /// Open and index an MP4 file by path.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mp4")
-            .to_string();
-        Self::from_reader(File::open(path)?, name)
-    }
 }
 
 impl<R: Read + Seek> Mp4Reader<R> {
@@ -1605,6 +1591,8 @@ mod tests {
             sink.finish().unwrap();
         }
 
+        let path = std::env::temp_dir().join(format!("fmkv-mp4-rt-{}.mp4", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
         let mut rd = Mp4Reader::from_reader(Cursor::new(buf), "rt".into()).unwrap();
         // Two streams: HEVC video + AC-3 audio, and the hvcC round-trips.
         assert_eq!(rd.info().streams.len(), 2);
@@ -1633,6 +1621,17 @@ mod tests {
         assert_eq!(vids[1].1, 350, "second video sample size");
         assert!(vids[0].2, "first video frame is a keyframe");
         assert_eq!(auds[0].1, ac3.len());
+
+        // `mp4://` reads the same file through the decryption stage: a clear container
+        // (Opaque) is handed through untouched, seeks included.
+        let url = format!("mp4://{}", path.display());
+        let mut staged = crate::mux::resolve::input(&url, &Default::default()).unwrap();
+        let mut again = Vec::new();
+        while let Some(f) = staged.read().unwrap() {
+            again.push((f.track, f.data.len(), f.keyframe, f.data));
+        }
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(again, got);
     }
 
     // `stts` run-length expansion (ISO/IEC 14496-12 §8.6.1.2) must expand `(sample_count,

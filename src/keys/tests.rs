@@ -1079,16 +1079,16 @@ fn on_arrival_proof() {
     );
     assert_eq!(set.proof_cache().get(b), Some(Proof::Proven(1)));
 
-    // (b) no pool key opens it → E7022 (title) / E7032 (image); nothing asked.
+    // (b) no pool key opens it → E7022 (title) / blanked and counted (image); nothing asked.
     let (fx, set, src) = lazy_b(&[K1]);
     let mut r = set.title_reader(&fx.disc, 0, src.clone()).unwrap();
     assert_eq!(code(read(&mut r, &fx, 1, 0, 4)), E7022);
     let mut w = set.whole_disc_reader(&fx.disc, src, None).unwrap();
     let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
-    assert_eq!(
-        code(w.read_sectors(fx.unit(1, 0), 3, &mut buf, true)),
-        E7032
-    );
+    w.read_sectors(fx.unit(1, 0), 3, &mut buf, true)
+        .expect("an image blanks the unit, never stops");
+    assert!(buf.iter().all(|&b| b == 0));
+    assert_eq!(w.blanked_units(), 1);
 
     // (c) the piece's LAST unit: no forward units; the backward side read finds a partner.
     let (fx, set, src) = lazy_b(&[K1, K2]);
@@ -1785,22 +1785,27 @@ fn on_arrival_proof_skips_forensic_segment_units() {
 
 // ── §3.1 surfaces: extract, input, mux, session ─────────────────────────────
 
-/// LK11 (K-2). KS-1 [BD] §3.10.1: "encryption is applied to every Aligned Unit in the
-/// file"; KS-10. A decrypted folder never keys a file with a key that does not open it:
-/// `resolve(WholeDisc)` refuses up front (E7032), and a file left Lazy whose readable unit
-/// no held key opens stops the extract (E7032), never written.
+/// Nothing usable remains: a whole-disc copy where no stream file opens under any held key
+/// still refuses E7032 before any output.
 #[test]
-fn extract_tree_refuses_a_file_no_key_opens() {
+fn whole_disc_refuses_when_no_file_opens() {
     let fx = two_units();
     let calls = Calls::default();
-    assert_eq!(
-        code(resolve(
-            &fx,
-            KeyScope::WholeDisc,
-            &[Spec::keydb(&[K1], &calls)]
-        )),
-        E7032
-    );
+    let r = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K3], &calls)]);
+    assert_eq!(code(r), E7032);
+}
+
+/// LK11 (K-2). KS-1 [BD] §3.10.1: "encryption is applied to every Aligned Unit in the
+/// file"; KS-10. A decrypted folder never keys a file with a key that does not open it:
+/// `resolve(WholeDisc)` leaves it Lazy and its units are blanked and counted, never E7032.
+#[test]
+fn extract_tree_blanks_a_file_no_key_opens() {
+    let fx = two_units();
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)])
+        .expect("one keyed file keeps the copy usable");
+    assert_eq!(set.status().keyed, 1);
+    assert_eq!(set.lazy().len(), 1);
 
     let (fx, set, mut src) = lazy_b(&[K1]);
     let dest = tempfile::tempdir().unwrap();
@@ -1808,12 +1813,10 @@ fn extract_tree_refuses_a_file_no_key_opens() {
         keys: Some(&set),
         ..Default::default()
     };
-    let r = fx.disc.extract_tree(&mut src, dest.path(), &opts);
-    assert_eq!(code(r), E7032);
-    assert!(
-        !dest.path().join("BDMV/STREAM/00002.m2ts").exists(),
-        "B is never written"
-    );
+    let res = fx.disc.extract_tree(&mut src, dest.path(), &opts).unwrap();
+    let got = std::fs::read(dest.path().join("BDMV/STREAM/00002.m2ts")).unwrap();
+    assert!(got.iter().all(|&b| b == 0), "B is blanked, not ciphertext");
+    assert!(!res.complete, "blanked units are not good bytes");
 
     let (fx, set, mut src) = lazy_b(&[K1, K2]);
     let dest = tempfile::tempdir().unwrap();
@@ -1979,7 +1982,7 @@ fn session_resolves_a_key_set_through_its_reader() {
 }
 
 /// KU §2.5: a title scope — even every title (`-t all`) — covers only the files its titles
-/// play. A file no title plays is a whole-disc concern (E7032 there), never a title refusal.
+/// play. A file no title plays is a whole-disc concern (blanked there), never a title refusal.
 #[test]
 fn titles_scope_never_keys_a_file_no_title_plays() {
     let fx = fixture(
@@ -1995,7 +1998,10 @@ fn titles_scope_never_keys_a_file_no_title_plays() {
     let keydb = [Spec::keydb(&[K1, K2], &calls)];
     let set = resolve(&fx, KeyScope::Titles(vec![0, 1]), &keydb).unwrap();
     assert_eq!(set.status().keyed, 2);
-    assert_eq!(code(resolve(&fx, KeyScope::WholeDisc, &keydb)), E7032);
+    // The file no title plays is a whole-disc concern: kept lazy there, blanked on read.
+    let whole = resolve(&fx, KeyScope::WholeDisc, &keydb).expect("damage, not E7032");
+    assert_eq!(whole.status().keyed, 2);
+    assert_eq!(whole.lazy().len(), 1);
 }
 
 /// KS-25, KS-26 (evidence). A forensic segment whose index has no held key refuses (E7026):
@@ -2744,6 +2750,8 @@ fn a_source_halted_mid_request_keeps_the_asked_step() {
     );
 }
 
+mod parity;
+mod parity_live;
 mod stop_tests;
 
 /// LK21 (K-13), per spec — KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not
@@ -2829,10 +2837,10 @@ fn whole_disc_reader_refuses_titles_without_a_stream_folder() {
 }
 
 /// KU §2.1 (6) "Refuse first": a whole-disc sweep reads every unit, so a Lazy piece
-/// holding a readable encrypted probe no held key opens is refused E7032 by the reader,
-/// before any output (engine `a_multi_cps_sweep_refuses_a_first_unit_no_key_opens_*`).
+/// holding a readable encrypted probe no held key opens is blanked and counted by the
+/// reader (E7013 option A policy), never refused E7032.
 #[test]
-fn whole_disc_reader_refuses_a_lazy_piece_no_held_key_opens() {
+fn whole_disc_reader_blanks_a_lazy_piece_no_held_key_opens() {
     let mut fx = fixture(&[stream(1, 10, Some(K1)), stream(2, 10, None)], 2, &[&[0]]);
     let at = fx.unit(1, 0) as usize * 2048;
     // An intact unit: TS sync at byte 4 of each packet, so its seed is not damage (KS-4).
@@ -2848,18 +2856,18 @@ fn whole_disc_reader_refuses_a_lazy_piece_no_held_key_opens() {
         &[(b, b + n)],
         "one unopened unit: Lazy (step 9.2)"
     );
-    assert_eq!(
-        code(
-            set.whole_disc_reader(&fx.disc, fx.source(), None)
-                .map(|_| ())
-        ),
-        E7032
-    );
+    let mut w = set
+        .whole_disc_reader(&fx.disc, fx.source(), None)
+        .expect("a piece no key opens is blanked, not refused");
+    let mut buf = vec![0xAAu8; ALIGNED_UNIT_LEN];
+    w.read_sectors(fx.unit(1, 0), 3, &mut buf, true).unwrap();
+    assert!(buf.iter().all(|&b| b == 0));
+    assert_eq!(w.blanked_units(), 1);
     // A title rip that never reads B is unaffected.
     assert!(set.title_reader(&fx.disc, 0, fx.source()).is_ok());
 }
 
-/// E7013 option A with the E7032 refusal above: a probe whose seed is damaged (no TS sync,
+/// E7013 option A, like the blanking above: a probe whose seed is damaged (no TS sync,
 /// KS-4 [BD] §3.10.1 "The first 16 bytes of each Aligned Unit is used as the seed") opens
 /// under no key and is blanked on read, never a stop, so it refuses no sweep up front.
 #[test]

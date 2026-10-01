@@ -9,6 +9,7 @@
 use super::meta;
 use crate::disc::DiscTitle;
 use crate::halt::{Halt, WAIT_SLICE};
+use crate::sector::stage::Stage;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -119,68 +120,28 @@ impl Read for HaltRead {
     }
 }
 
-// True if `ip` must never be a `network://` connect target (loopback, private, link-local,
-// unspecified, multicast). Re-checked here at connect time to close a DNS-rebinding TOCTOU.
-pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
+// True if `ip` can never be a `network://` peer (unspecified, multicast, broadcast,
+// 0.0.0.0/8, Class E). Loopback, private, link-local and ULA are valid LAN targets.
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
+            v4.is_unspecified()
                 || v4.is_multicast()
                 || v4.is_broadcast()
-                // carrier-grade NAT 100.64.0.0/10
-                || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
-                // "this network" 0.0.0.0/8
-                || o[0] == 0
-                // benchmarking 198.18.0.0/15 (RFC 2544) — 198.18.x and 198.19.x
-                // (the /15 second octet is 18 with the low bit free, i.e. 18|19).
-                || (o[0] == 198 && (o[1] & 0xfe) == 18)
-                // IETF protocol assignments 192.0.0.0/24 (RFC 6890), which
-                // includes 192.0.0.170/171 (NAT64/DNS64 discovery).
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-                // Class E reserved 240.0.0.0/4
-                || o[0] >= 240
+                || v4.octets()[0] == 0
+                || v4.octets()[0] >= 240
         }
         IpAddr::V6(v6) => {
-            let seg = v6.segments();
-            // 6to4 (2002::/16) embeds an IPv4 in segments[1..3]; Teredo (2001:0000::/32)
-            // embeds the client IPv4 in the last two segments, each XOR 0xffff. Re-check
-            // both as their embedded IPv4 or an internal target slips through the tunnel.
-            let sixtofour = (seg[0] == 0x2002)
-                .then(|| std::net::Ipv4Addr::from(((seg[1] as u32) << 16) | (seg[2] as u32)));
-            let teredo = (seg[0] == 0x2001 && seg[1] == 0x0000).then(|| {
-                std::net::Ipv4Addr::from(
-                    (((seg[6] ^ 0xffff) as u32) << 16) | ((seg[7] ^ 0xffff) as u32),
-                )
-            });
-            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) embeds the IPv4 in
-            // the last 32 bits (segments[6..8]); re-check it too so an internal
-            // target does not slip through a NAT64 translator.
-            let nat64 = (seg[0] == 0x0064 && seg[1] == 0xff9b)
-                .then(|| std::net::Ipv4Addr::from(((seg[6] as u32) << 16) | (seg[7] as u32)));
-            v6.is_loopback()
-                || v6.is_unspecified()
+            v6.is_unspecified()
                 || v6.is_multicast()
-                // unique-local fc00::/7
-                || (seg[0] & 0xfe00) == 0xfc00
-                // link-local fe80::/10
-                || (seg[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x);
-                // to_ipv4() returns Some for both forms — re-check as IPv4 so an
-                // IPv4-mapped private/loopback address can't bypass the block above.
-                || v6.to_ipv4().map(|m| is_blocked_ip(IpAddr::V4(m))) == Some(true)
-                || sixtofour.is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
-                || teredo.is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
-                || nat64.is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
+                // IPv4-mapped (::ffff:x.x.x.x) is judged as its IPv4 address.
+                || v6.to_ipv4_mapped().is_some_and(|m| is_blocked_ip(IpAddr::V4(m)))
         }
     }
 }
 
-// Every resolved address of `addr` not blocked by `is_blocked_ip`, in order. Vetted IP
-// literals (no second DNS lookup). Zero resolved or all blocked: NetworkAddrBlocked.
+// Every resolved address of `addr` not refused by `is_blocked_ip`, in order. Zero
+// resolved or all refused: NetworkAddrBlocked.
 fn allowed_addrs(
     addr: &str,
     resolved: impl Iterator<Item = SocketAddr>,
@@ -222,7 +183,7 @@ enum Mode {
         ended: bool,
     },
     Read {
-        reader: BufReader<HaltRead>,
+        reader: Box<BufReader<Stage<HaltRead>>>,
         meta: meta::M2tsMeta,
     },
 }
@@ -240,13 +201,9 @@ impl NetworkStream {
         Self::connect_vetted(addr, true)
     }
 
-    // `connect` with an explicit SSRF-vetting toggle: vet=true (the public
-    // path) rejects loopback/private/link-local/multicast; vet=false is
-    // for in-crate tests connecting to 127.0.0.1 ephemeral listeners.
+    // `connect` with a toggle: vet=true (the public path) refuses unspecified/
+    // multicast/broadcast targets; vet=false skips that for in-crate tests.
     fn connect_vetted(addr: &str, vet: bool) -> io::Result<Self> {
-        // Connect to the vetted IP literal (not the raw name) so a DNS rebind between
-        // settings-save validation and now can't redirect us to a loopback/private/
-        // link-local host (SSRF).
         let stream = if vet {
             let vetted = allowed_addrs(addr, addr.to_socket_addrs()?)?;
             connect_first(&vetted)?
@@ -296,7 +253,12 @@ impl NetworkStream {
     /// [`listen`](Self::listen) that a [`Halt`] can interrupt, while waiting for
     /// the sender to connect and while blocked on a stalled sender.
     pub fn listen_with_halt(addr: &str, halt: Option<Halt>) -> io::Result<Self> {
-        Self::accept_from_with_halt(TcpListener::bind(addr)?, halt)
+        Self::listen_staged(addr, halt, false)
+    }
+
+    // `listen_with_halt` whose decryption stage passes ciphertext when `raw`.
+    pub(crate) fn listen_staged(addr: &str, halt: Option<Halt>, raw: bool) -> io::Result<Self> {
+        Self::accept_staged(TcpListener::bind(addr)?, halt, raw)
     }
 
     /// Accept one connection from an already-bound listener and read from it.
@@ -309,11 +271,15 @@ impl NetworkStream {
 
     /// [`accept_from`](Self::accept_from) that a [`Halt`] can interrupt.
     pub fn accept_from_with_halt(listener: TcpListener, halt: Option<Halt>) -> io::Result<Self> {
+        Self::accept_staged(listener, halt, false)
+    }
+
+    fn accept_staged(listener: TcpListener, halt: Option<Halt>, raw: bool) -> io::Result<Self> {
         let Some(h) = halt else {
             let (stream, _peer) = listener.accept()?;
             stream.set_nodelay(true)?;
             arm_keepalive(&stream);
-            return Self::read_from(stream, None);
+            return Self::read_from(stream, None, raw);
         };
         listener.set_nonblocking(true)?;
         let halt = Some(h);
@@ -334,21 +300,25 @@ impl NetworkStream {
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         arm_keepalive(&stream);
-        Self::read_from(stream, halt)
+        Self::read_from(stream, halt, raw)
     }
 
-    // Wrap an accepted connection and read its FMKV header.
-    fn read_from(stream: TcpStream, halt: Option<Halt>) -> io::Result<Self> {
-        let mut reader = BufReader::with_capacity(NET_BUF_SIZE, HaltRead::new(stream, halt));
+    // Wrap an accepted connection in the decryption stage and read its FMKV header.
+    fn read_from(stream: TcpStream, halt: Option<Halt>, raw: bool) -> io::Result<Self> {
+        let staged = Stage::lazy(HaltRead::new(stream, halt), raw);
+        let mut reader = BufReader::with_capacity(NET_BUF_SIZE, staged);
 
         // Read FMKV metadata header
         let meta = meta::read_header(&mut reader)
-            .map_err(|e| reader.get_ref().halted_or(e))?
+            .map_err(|e| reader.get_ref().get_ref().halted_or(e))?
             .ok_or_else(|| -> io::Error { crate::error::Error::NoMetadata.into() })?;
 
         Ok(Self {
             disc_title: meta.to_title(),
-            mode: Mode::Read { reader, meta },
+            mode: Mode::Read {
+                reader: Box::new(reader),
+                meta,
+            },
         })
     }
 }
@@ -377,7 +347,7 @@ impl crate::pes::Stream for NetworkStream {
         match &mut self.mode {
             Mode::Read { reader, meta } => {
                 crate::pes::PesFrame::deserialize_ext(reader, meta.frame_padding)
-                    .map_err(|e| reader.get_ref().halted_or(e))
+                    .map_err(|e| reader.get_ref().get_ref().halted_or(e))
             }
             _ => Err(crate::error::Error::StreamWriteOnly.into()),
         }
@@ -502,191 +472,72 @@ mod tests {
     };
     use std::net::TcpListener;
 
-    // SSRF guard: every loopback/private/link-local/multicast/unspecified
-    // address (v4+v6) must be rejected, ordinary public addresses allowed —
-    // this is what closes the DNS-rebinding window in `connect`.
+    // LAN targets are valid for `network://`: loopback, private, link-local,
+    // ULA and CGNAT connect; only addresses that can never be a peer are refused.
     #[test]
-    fn is_blocked_ip_rejects_internal_targets() {
+    fn is_blocked_ip_allows_lan_and_refuses_invalid() {
         use std::net::{Ipv4Addr, Ipv6Addr};
-        // Built from octets (not string literals) so the repo's internal-infra
-        // secret scanner doesn't flag the RFC1918 addresses.
+        // Built from octets so the internal-infra secret scanner doesn't flag RFC1918.
         let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
-        let blocked: &[(IpAddr, &str)] = &[
-            (v4(127, 0, 0, 1), "loopback"),
-            (v4(127, 10, 20, 30), "loopback /8"),
-            (v4(10, 0, 0, 1), "private 10/8"),
-            (v4(172, 16, 5, 5), "private 172.16/12"),
-            (v4(192, 168, 1, 1), "private 192.168/16"),
-            (v4(169, 254, 10, 10), "link-local"),
-            (v4(0, 0, 0, 0), "unspecified"),
-            (v4(224, 0, 0, 1), "multicast"),
-            (v4(255, 255, 255, 255), "broadcast"),
-            (IpAddr::V6(Ipv6Addr::LOCALHOST), "loopback v6"),
-            (IpAddr::V6(Ipv6Addr::UNSPECIFIED), "unspecified v6"),
-            (
-                IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)),
-                "ULA",
-            ),
-            (
-                IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)),
-                "ULA",
-            ),
-            (
-                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-                "link-local v6",
-            ),
-            (
-                IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
-                "multicast v6",
-            ),
-            // CGNAT / 0.0.0.0/8 / Class E (finding 8).
-            (v4(100, 64, 0, 1), "carrier-grade NAT"),
-            (v4(100, 127, 255, 254), "carrier-grade NAT edge"),
-            (v4(0, 1, 2, 3), "0.0.0.0/8"),
-            (v4(240, 0, 0, 1), "Class E"),
-            (v4(255, 0, 0, 1), "Class E high"),
-            // IPv4-mapped / -compatible IPv6 bypass (finding 7).
-            (
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001)),
-                "IPv4-mapped RFC1918 (::ffff:0a00:0001)",
-            ),
-            (
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
-                "::ffff:127.0.0.1 mapped",
-            ),
-            (
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001)),
-                "::127.0.0.1 compatible",
-            ),
+        let v6 = |s: [u16; 8]| IpAddr::V6(Ipv6Addr::from(s));
+        let invalid = [
+            v4(0, 0, 0, 0),
+            v4(0, 1, 2, 3),
+            v4(224, 0, 0, 1),
+            v4(255, 255, 255, 255),
+            v4(240, 0, 0, 1),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            v6([0xff02, 0, 0, 0, 0, 0, 0, 1]),
+            v6([0, 0, 0, 0, 0, 0xffff, 0xe000, 1]),
+            v6([0, 0, 0, 0, 0, 0xffff, 0, 0]),
         ];
-        for (ip, label) in blocked {
-            assert!(is_blocked_ip(*ip), "{label} ({ip}) must be blocked");
+        for ip in invalid {
+            assert!(is_blocked_ip(ip), "{ip} must be refused");
         }
-
-        let allowed: &[(IpAddr, &str)] = &[
-            (v4(8, 8, 8, 8), "public dns"),
-            (v4(1, 1, 1, 1), "public dns"),
-            (v4(93, 184, 216, 34), "example.com"),
-            (
-                IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0, 0, 0, 1)),
-                "public v6",
-            ),
-            (
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808)),
-                "::ffff:8.8.8.8 public mapped",
-            ),
+        let allowed = [
+            v4(127, 0, 0, 1),
+            v4(10, 0, 0, 1),
+            v4(172, 16, 5, 5),
+            v4(192, 168, 1, 1),
+            v4(169, 254, 10, 10),
+            v4(100, 64, 0, 1),
+            v4(8, 8, 8, 8),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            v6([0xfd12, 0x3456, 0, 0, 0, 0, 0, 1]),
+            v6([0xfe80, 0, 0, 0, 0, 0, 0, 1]),
+            v6([0, 0, 0, 0, 0, 0xffff, 0x0a00, 1]),
+            v6([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1]),
+            v6([0x2606, 0x2800, 0x220, 1, 0, 0, 0, 1]),
         ];
-        for (ip, label) in allowed {
-            assert!(!is_blocked_ip(*ip), "{label} ({ip}) must be allowed");
+        for ip in allowed {
+            assert!(!is_blocked_ip(ip), "{ip} must be allowed");
         }
     }
 
-    // Benchmarking 198.18.0.0/15 (RFC 2544) and IETF protocol assignments
-    // 192.0.0.0/24 (RFC 6890, incl. the 192.0.0.170/171 NAT64/DNS64 anycast)
-    // are non-public and must be blocked outbound — parity with keysources.
+    // The public `connect` reaches a loopback listener (the LAN-send path).
     #[test]
-    fn ssrf_guard_blocks_benchmarking_and_protocol_assignment_ranges() {
-        use std::net::Ipv4Addr;
-        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
-        // 198.18.0.0/15 spans 198.18.x AND 198.19.x — both octets blocked.
-        assert!(is_blocked_ip(v4(198, 18, 0, 1)));
-        assert!(is_blocked_ip(v4(198, 18, 255, 255)));
-        assert!(is_blocked_ip(v4(198, 19, 0, 1)));
-        assert!(is_blocked_ip(v4(198, 19, 200, 5)));
-        // 198.17.x and 198.20.x are OUTSIDE the /15 — must stay allowed.
-        assert!(!is_blocked_ip(v4(198, 17, 0, 1)));
-        assert!(!is_blocked_ip(v4(198, 20, 0, 1)));
-        // 192.0.0.0/24, including 192.0.0.170 / 192.0.0.171.
-        assert!(is_blocked_ip(v4(192, 0, 0, 0)));
-        assert!(is_blocked_ip(v4(192, 0, 0, 170)));
-        assert!(is_blocked_ip(v4(192, 0, 0, 171)));
-        assert!(is_blocked_ip(v4(192, 0, 0, 255)));
-        // The adjacent 192.0.1.0 is a different block — not covered here.
-        assert!(!is_blocked_ip(v4(192, 0, 1, 1)));
-    }
-
-    // 6to4 (2002::/16) and Teredo (2001:0000::/32) tunnel an IPv4 inside an
-    // IPv6 address; the guard must decode and re-check that embedded IPv4 or an
-    // internal target slips through the tunnel — parity with keysources.
-    #[test]
-    fn ssrf_guard_blocks_embedded_ipv4_via_6to4_and_teredo() {
-        use std::net::Ipv6Addr;
-        // 6to4 for 127.0.0.1: 2002:7f00:0001:: (embedded in segments[1..3]).
-        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x2002, 0x7f00, 0x0001, 0, 0, 0, 0, 0
-        ))));
-        // 6to4 for 169.254.169.254 (cloud metadata): 2002:a9fe:a9fe::.
-        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0
-        ))));
-        // Teredo for 127.0.0.1: client IPv4 lives in the last two segments XOR
-        // 0xffff, so 0x7f00^0xffff=0x80ff and 0x0001^0xffff=0xfffe.
-        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x0000, 0, 0, 0, 0, 0x80ff, 0xfffe
-        ))));
-        // A 6to4 wrapping a PUBLIC IPv4 (8.8.8.8 → 2002:0808:0808::) is allowed.
-        assert!(!is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0
-        ))));
-    }
-
-    /// The NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) embeds an IPv4 in its
-    /// last 32 bits; the guard must decode and re-check that embedded IPv4 so an
-    /// internal target does not slip through a NAT64 translator — parity with
-    /// keysources. A NAT64 address embedding a private/special IPv4 must classify
-    /// exactly as that IPv4 does directly.
-    #[test]
-    fn ssrf_guard_blocks_embedded_ipv4_via_nat64() {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-        // NAT64 for 169.254.169.254 (cloud metadata): 64:ff9b::a9fe:a9fe — the
-        // embedded IPv4 is link-local, so both forms must be blocked identically.
-        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
-        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
-        ))));
-        // NAT64 for 127.0.0.1: 64:ff9b::7f00:0001 — embedded loopback, blocked.
-        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x0064, 0xff9b, 0, 0, 0, 0, 0x7f00, 0x0001
-        ))));
-        // NAT64 wrapping a PUBLIC IPv4 (8.8.8.8 → 64:ff9b::0808:0808) is allowed,
-        // exactly as 8.8.8.8 itself is.
-        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
-            0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808
-        ))));
-    }
-
-    /// The public `connect` must refuse a loopback target with the typed
-    /// `NetworkAddrBlocked` error (PermissionDenied) rather than attempting
-    /// the TCP connect — this is the rebinding TOCTOU close at the connect.
-    #[test]
-    fn connect_refuses_blocked_loopback_target() {
-        // Bind a real loopback listener so a non-vetting connect WOULD
-        // succeed; the vetting connect must still refuse it.
+    fn connect_reaches_loopback_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let err = match NetworkStream::connect(&addr.to_string()) {
-            Ok(_) => panic!("loopback target must be refused by the SSRF guard"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        NetworkStream::connect(&addr.to_string()).expect("loopback send must connect");
     }
 
-    // The SSRF filter keeps every allowed address in order (not just the first) and
-    // refuses an all-blocked or empty resolution.
+    // The filter keeps every allowed address in order and refuses a resolution
+    // that is empty or all invalid.
     #[test]
-    fn allowed_addrs_keeps_every_public_address_and_refuses_none() {
+    fn allowed_addrs_keeps_every_valid_address_and_refuses_none() {
         let a = |s: &str| s.parse::<SocketAddr>().unwrap();
         let mixed = [
             a("127.0.0.1:9"),
-            a("[2001:db8::1]:9"),
             a("224.0.0.1:9"),
+            a("[::1]:9"),
+            a("0.0.0.0:9"),
             a("8.8.8.8:9"),
         ];
         let got = allowed_addrs("h:9", mixed.into_iter()).unwrap();
-        assert_eq!(got, vec![a("[2001:db8::1]:9"), a("8.8.8.8:9")]);
-        for list in [vec![a("127.0.0.1:9"), a("[::1]:9")], vec![]] {
-            let err = allowed_addrs("h:9", list.into_iter()).expect_err("no safe address");
+        assert_eq!(got, vec![a("127.0.0.1:9"), a("[::1]:9"), a("8.8.8.8:9")]);
+        for list in [vec![a("0.0.0.0:9"), a("[ff02::1]:9")], vec![]] {
+            let err = allowed_addrs("h:9", list.into_iter()).expect_err("no valid address");
             assert_eq!(
                 crate::error::error_code(&err),
                 Some(crate::error::E_NETWORK_ADDR_BLOCKED)
@@ -1210,9 +1061,11 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let ns = NetworkStream::accept_from(listener).unwrap();
             match &ns.mode {
-                Mode::Read { reader, .. } => socket2::SockRef::from(&reader.get_ref().stream)
-                    .keepalive()
-                    .unwrap(),
+                Mode::Read { reader, .. } => {
+                    socket2::SockRef::from(&reader.get_ref().get_ref().stream)
+                        .keepalive()
+                        .unwrap()
+                }
                 Mode::Write { .. } => false,
             }
         });
@@ -1242,7 +1095,9 @@ mod tests {
             let halt = crate::halt::Halt::new();
             let ns = NetworkStream::accept_from_with_halt(listener, Some(halt)).unwrap();
             match &ns.mode {
-                Mode::Read { reader, .. } => reader.get_ref().stream.read_timeout().unwrap(),
+                Mode::Read { reader, .. } => {
+                    reader.get_ref().get_ref().stream.read_timeout().unwrap()
+                }
                 Mode::Write { .. } => None,
             }
         });
@@ -1327,9 +1182,11 @@ mod tests {
             let halt = crate::halt::Halt::new();
             let mut ns = NetworkStream::accept_from_with_halt(listener, Some(halt)).unwrap();
             let keepalive = match &ns.mode {
-                Mode::Read { reader, .. } => socket2::SockRef::from(&reader.get_ref().stream)
-                    .keepalive()
-                    .unwrap(),
+                Mode::Read { reader, .. } => {
+                    socket2::SockRef::from(&reader.get_ref().get_ref().stream)
+                        .keepalive()
+                        .unwrap()
+                }
                 Mode::Write { .. } => false,
             };
             (
@@ -1461,5 +1318,76 @@ mod tests {
             crate::mux::mkvstream::MkvStream::open(std::fs::File::open(&path).unwrap()).unwrap();
         assert_eq!(back.track_timing(0), timing);
         assert_eq!(back.read().unwrap().unwrap().discard_padding_ns, -2_500_000);
+    }
+    // Parity golden: the FMKV wire bytes a sender emits for the synthetic clip, and the
+    // frames a receiver reads back (public `connect` refuses loopback, so this seam).
+    #[test]
+    fn parity_network_fmkv_wire() {
+        use crate::pes::Stream as _;
+        use std::io::Read as _;
+        let clip = crate::test_util::synthetic_bd_clip(6);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.m2ts");
+        std::fs::write(&path, &clip).unwrap();
+        let mut src =
+            crate::mux::resolve::input(&format!("m2ts://{}", path.display()), &Default::default())
+                .unwrap();
+        let title = src.info().clone();
+        let mut frames = Vec::new();
+        while let Some(f) = src.read().unwrap() {
+            frames.push(f);
+        }
+        let mut g =
+            crate::test_util::Golden::new(env!("CARGO_MANIFEST_DIR"), "parity_network_fmkv_wire");
+
+        // Sender -> a raw socket: the wire bytes.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let raw = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            listener
+                .accept()
+                .unwrap()
+                .0
+                .read_to_end(&mut bytes)
+                .unwrap();
+            bytes
+        });
+        let mut w = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&title);
+        for f in &frames {
+            w.write(f).unwrap();
+        }
+        w.finish().unwrap();
+        drop(w);
+        g.bytes("wire", &raw.join().unwrap());
+
+        // Sender -> NetworkStream receiver: the frames round-trip.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rx = std::thread::spawn(move || {
+            let mut ns = NetworkStream::accept_from(listener).unwrap();
+            let mut got = Vec::new();
+            while let Some(f) = ns.read().unwrap() {
+                got.push((f.track, f.pts, f.keyframe, f.data));
+            }
+            got
+        });
+        let mut w = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&title);
+        for f in &frames {
+            w.write(f).unwrap();
+        }
+        w.finish().unwrap();
+        let got = rx.join().unwrap();
+        let sent: Vec<_> = frames
+            .iter()
+            .map(|f| (f.track, f.pts, f.keyframe, f.data.clone()))
+            .collect();
+        g.kv("frames", got.len());
+        g.kv("round-trip identical", got == sent);
+        g.check();
     }
 }

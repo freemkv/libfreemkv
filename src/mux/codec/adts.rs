@@ -80,6 +80,72 @@ fn adts_frame_ns(d: &[u8]) -> Option<u64> {
     Some(1024 * (u64::from(d[6] & 3) + 1) * 1_000_000_000 / u64::from(rate))
 }
 
+/// The ADTS header (MPEG-4 ID, no CRC, one raw_data_block, frame_length 0) for the access
+/// units an AudioSpecificConfig describes (14496-3 §1.6.2.1); `None` when ADTS cannot signal
+/// it: no 2-bit profile, an explicit rate, an in-band PCE layout or 960-sample frames
+/// (GASpecificConfig frameLengthFlag). SBR/PS signal the core.
+pub(crate) fn adts_template(asc: &[u8]) -> Option<[u8; ADTS_HEADER_BYTES]> {
+    let (b0, b1) = (*asc.first()?, *asc.get(1)?);
+    let rate = ((b0 & 7) << 1) | (b1 >> 7);
+    let channels = (b1 >> 3) & 0x0F;
+    let (object, frame_960) = match b0 >> 3 {
+        // extensionSamplingFrequencyIndex (4 bits), then the core audioObjectType.
+        5 | 29 => {
+            let b2 = *asc.get(2)?;
+            let ext = ((b1 & 7) << 1) | (b2 >> 7);
+            (ext != 0x0F).then_some(((b2 >> 2) & 0x1F, b2 & 0x02 != 0))?
+        }
+        o => (o, b1 & 0x04 != 0),
+    };
+    if frame_960 || !(1..=4).contains(&object) || rate > 0x0B || !(1..=7).contains(&channels) {
+        return None;
+    }
+    Some([
+        0xFF,
+        0xF1,
+        ((object - 1) << 6) | (rate << 2) | (channels >> 2),
+        (channels & 3) << 6,
+        0,
+        0x1F,
+        0xFC,
+    ])
+}
+
+/// raw_data_block()s in an access unit lasting `duration_ns` at `template`'s rate: an
+/// ADTS source frame keeps all of its 1..=4 blocks. 1 unless the duration is within a
+/// sample of a whole number of 1024-sample blocks.
+pub(crate) fn raw_data_blocks(template: [u8; ADTS_HEADER_BYTES], duration_ns: Option<u64>) -> u8 {
+    let rate = u64::from(ADTS_SAMPLE_RATE_VALID[usize::from((template[2] >> 2) & 15)]);
+    let Some(scaled) = duration_ns.and_then(|d| d.checked_mul(rate)) else {
+        return 1;
+    };
+    let n = scaled.saturating_add(512_000_000_000) / 1_024_000_000_000;
+    if (1..=4).contains(&n) && scaled.abs_diff(n * 1_024_000_000_000) <= 1_000_000_000 {
+        n as u8
+    } else {
+        1
+    }
+}
+
+/// `raw` (`blocks` raw_data_block()s) as one ADTS frame under `template`; `None` past the
+/// 13-bit frame_length.
+pub(crate) fn adts_frame(
+    template: [u8; ADTS_HEADER_BYTES],
+    raw: &[u8],
+    blocks: u8,
+) -> Option<Vec<u8>> {
+    let len = ADTS_HEADER_BYTES + raw.len();
+    if len >= 1 << 13 || !(1..=4).contains(&blocks) {
+        return None;
+    }
+    let mut h = template;
+    h[6] |= blocks - 1;
+    h[3] |= (len >> 11) as u8;
+    h[4] = (len >> 3) as u8;
+    h[5] |= ((len & 7) << 5) as u8;
+    Some([&h[..], raw].concat())
+}
+
 pub struct AdtsParser {
     frames: AudioFrames,
     config: Option<Vec<u8>>,
@@ -357,6 +423,18 @@ mod tests {
         p.parse(&pes);
         p.flush();
         assert_eq!(p.config_changes(), 0);
+    }
+
+    // The block count comes only from a duration of whole 1024-sample blocks.
+    #[test]
+    fn raw_data_blocks_trusts_only_whole_block_durations() {
+        let t = adts_template(&[0x11, 0x90]).unwrap();
+        let ns = |samples: u64| Some(samples * 1_000_000_000 / 48_000);
+        assert_eq!(raw_data_blocks(t, ns(2048)), 2);
+        assert_eq!(raw_data_blocks(t, ns(4096)), 4);
+        for d in [None, ns(1536), ns(5120), Some(u64::MAX)] {
+            assert_eq!(raw_data_blocks(t, d), 1, "{d:?}");
+        }
     }
 
     #[test]

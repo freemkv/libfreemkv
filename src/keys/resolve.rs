@@ -410,6 +410,26 @@ fn pieces(disc: &Disc, files: &[Vec<(u32, u32)>], sel: &[usize], whole: bool) ->
     out
 }
 
+// A loose clip file's one piece, in the shape `pieces` builds for a disc: every aligned unit
+// of the file (KS-1) on its own grid from byte 0, title 0, proven on arrival.
+pub(crate) fn loose_file_piece(capacity: u32) -> super::ArrivalPiece {
+    let p = Piece {
+        spans: vec![(0, capacity, 0)],
+        titles: vec![0],
+        rank: 0,
+        units: 0,
+        enc: Vec::new(),
+        faults: 0,
+        verdict: Verdict::Lazy(None),
+    };
+    super::ArrivalPiece {
+        id: p.id(),
+        spans: p.spans,
+        candidate: None,
+        clear: false,
+    }
+}
+
 // Each whole-disc piece's unit spans, for the unit-grid guards in `whole_disc_tests`.
 #[cfg(test)]
 pub(crate) fn whole_disc_pieces(disc: &Disc, files: &[Vec<(u32, u32)>]) -> Vec<Vec<UnitSpan>> {
@@ -818,6 +838,18 @@ fn resolve_bd(
         };
     }
     apply_single_unit_rule(run, &mut ps, n_decl)?;
+    // A whole-disc copy blanks a piece no held key opens (counted on arrival) while any
+    // other piece is usable; a source fault, an empty pool or no usable piece still refuses.
+    if *scope == KeyScope::WholeDisc
+        && !run.pool.is_empty()
+        && run.first_failure.is_none()
+        && ps.iter().any(|p| p.verdict != Verdict::Missing)
+    {
+        for p in ps.iter_mut().filter(|p| p.verdict == Verdict::Missing) {
+            tracing::warn!(target: "freemkv::keys", lba = p.id(), "no held key opens this stream file: it will be blanked in the image");
+            p.verdict = Verdict::Lazy(None);
+        }
+    }
     if let Some(i) = ps.iter().position(|p| p.verdict == Verdict::Missing) {
         let lba = ps[i].id();
         let failure = run.first_failure.take();
@@ -832,16 +864,6 @@ fn resolve_bd(
     }
     let mut inner = aacs_inner(run);
     inner.no_stream_files = files.is_empty();
-    // Refused up front only if no probe of the piece opens: arrival blanks a unit whose batch
-    // partner opens (damage), and a damaged seed opens under no key (E7013 option A).
-    inner.lazy_unopened = ps.iter().any(|p| {
-        let opened = |u: &Vec<u8>| (0..run.pool.len()).any(|s| run.opens(u, s));
-        matches!(p.verdict, Verdict::Lazy(_))
-            && !p.enc.iter().any(opened)
-            && p.enc
-                .iter()
-                .any(|u| crate::aacs::content::aacs_unit_on_grid(u, format))
-    });
     // Step 6 (continued): forensic keys, reused from the seed or anchored once.
     let forensic = match &layout {
         None => None,

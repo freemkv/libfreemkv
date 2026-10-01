@@ -1,0 +1,18 @@
+mkv outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+mkv out o.mkv = 58232 bytes sha256:b25ee88e8f6935e99acf42fd476cc71d
+mkv-src streams = v:Mpeg2:0x1011,a:Ac3:0x1100,a:Ac3:0x1101
+mkv-src frames = 144
+mkv-src frame-digest = 56952 bytes sha256:31b7c2bd3b6567b7ae3e221c83700597
+mkv-src errors = 0 lost=0
+mkv outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+mkv out o.mkv = 58240 bytes sha256:45714c430679de5252267609a053a2f5
+mpg-src streams = v:Mpeg2:0xe0,a:Ac3:0xbd80,a:Ac3:0xbd81
+mpg-src frames = 144
+mpg-src frame-digest = 56952 bytes sha256:f0fec739fcfd4189d7be047dde0e4fb5
+mpg-src errors = 0 lost=0
+mkv outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
+mkv out o.mkv = 58232 bytes sha256:c51c6c8c17bd803887d5024a37952ba2
+m2ts-src streams = v:Mpeg2:0x1011,a:Ac3:0x1100,a:Ac3:0x1101
+m2ts-src frames = 144
+m2ts-src frame-digest = 56952 bytes sha256:885d82d30957a6d1bb04f301c4b3e1f4
+m2ts-src errors = 0 lost=0
