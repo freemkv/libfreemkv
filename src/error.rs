@@ -240,9 +240,8 @@ pub const E_STREAM_CLOSED: u16 = 9071;
 /// Per-track metadata was set after the stream header was already written.
 pub const E_STREAM_HEADER_WRITTEN: u16 = 9072;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
-/// A `network://` output target resolved to no address that is safe to
-/// connect to (every resolved IP was loopback / private / link-local /
-/// multicast / unspecified). Closes the DNS-rebinding SSRF window.
+/// A `network://` output target resolved to no connectable address (every
+/// resolved IP was unspecified / multicast / broadcast / reserved).
 pub const E_NETWORK_ADDR_BLOCKED: u16 = 9022;
 /// A muxer's `finish()` was called after zero frames were emitted — the
 /// output would be a header-only container with no media. Surfaced so a
@@ -730,9 +729,8 @@ pub enum Error {
         addr: String,
     },
     /// A `network://` output host resolved to no connectable address —
-    /// every resolved IP was loopback / private / link-local / multicast /
-    /// unspecified. Carries the offending `host:port`. Re-checked at
-    /// connect time to close the DNS-rebinding TOCTOU.
+    /// every resolved IP was unspecified / multicast / broadcast / reserved.
+    /// Carries the offending `host:port`.
     NetworkAddrBlocked {
         addr: String,
     },
@@ -1448,7 +1446,7 @@ impl From<Error> for std::io::Error {
             // a non-188-byte packet — treat as invalid data.
             9021 => std::io::ErrorKind::InvalidData,
             // 9022 NetworkAddrBlocked: the output host resolved only to
-            // blocked (loopback/private/link-local) addresses — refuse.
+            // invalid (unspecified/multicast/broadcast/reserved) addresses.
             E_NETWORK_ADDR_BLOCKED => std::io::ErrorKind::PermissionDenied,
             // 9023 MuxEmpty: finish() reached with zero frames — the output
             // would be a header-only container. Treat as invalid output.

@@ -750,9 +750,8 @@ pub(crate) fn output_with(
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }
         StreamUrl::Network { ref addr } => {
-            // `NetworkStream::connect` re-resolves the host and refuses
-            // loopback/private/link-local/multicast — the SSRF/rebinding
-            // guard, not in `validate_network_addr` (shared with listen).
+            // `NetworkStream::connect` refuses only unspecified/multicast/
+            // broadcast targets; LAN and loopback hosts are allowed.
             validate_network_addr(addr)?;
             Ok(Box::new(NetworkStream::connect(addr)?.meta(title)))
         }
