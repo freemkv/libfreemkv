@@ -228,7 +228,7 @@ impl DiscStream {
         // A zero batch reads 0 sectors and never advances (endless loop until
         // Stop); `MuxOptions::default()` carries 0. Same refusal as the highway.
         if batch_sectors == 0 {
-            return Err(io::ErrorKind::InvalidInput.into());
+            return Err(crate::error::Error::MuxBatchSectorsZero.into());
         }
         let mut title = title;
         let extents = title.extents.clone();
@@ -1302,6 +1302,7 @@ mod tests {
         );
         let err = res.err().expect("batch_sectors 0 must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(crate::error::error_code(&err), Some(9085));
     }
 
     // A truncated ISO is not a bad sector: even with skip_errors the missing tail

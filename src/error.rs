@@ -334,6 +334,8 @@ pub const E_MULTIPASS_REQUIRES_RAW: u16 = 9082;
 pub const E_STREAM_LANGUAGE_UNKNOWN: u16 = 9083;
 /// A remux target already exists and replacing it was not requested.
 pub const E_REMUX_TARGET_EXISTS: u16 = 9084;
+/// A mux was opened with a zero read batch (`MuxOptions::default()`), which reads nothing.
+pub const E_MUX_BATCH_SECTORS_ZERO: u16 = 9085;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -980,6 +982,8 @@ pub enum Error {
     StreamLanguageUnknown {
         tag: String,
     },
+    /// See [`E_MUX_BATCH_SECTORS_ZERO`].
+    MuxBatchSectorsZero,
     /// See [`E_REMUX_TARGET_EXISTS`].
     RemuxTargetExists {
         path: String,
@@ -1163,6 +1167,7 @@ impl Error {
             Error::MultipassRequiresRaw => E_MULTIPASS_REQUIRES_RAW,
             Error::StreamLanguageUnknown { .. } => E_STREAM_LANGUAGE_UNKNOWN,
             Error::RemuxTargetExists { .. } => E_REMUX_TARGET_EXISTS,
+            Error::MuxBatchSectorsZero => E_MUX_BATCH_SECTORS_ZERO,
         }
     }
 }
@@ -1506,9 +1511,10 @@ impl From<Error> for std::io::Error {
             E_TIMED_OUT => std::io::ErrorKind::TimedOut,
             // Remux/engine codes keep the kinds their io::Error texts carried.
             E_REMUX_VERIFY_FAILED | E_STAGED_COPY_SIZE_MISMATCH => std::io::ErrorKind::InvalidData,
-            E_REMUX_STAGING_INVALID | E_MULTIPASS_REQUIRES_RAW | E_STREAM_LANGUAGE_UNKNOWN => {
-                std::io::ErrorKind::InvalidInput
-            }
+            E_REMUX_STAGING_INVALID
+            | E_MULTIPASS_REQUIRES_RAW
+            | E_STREAM_LANGUAGE_UNKNOWN
+            | E_MUX_BATCH_SECTORS_ZERO => std::io::ErrorKind::InvalidInput,
             E_REMUX_TARGET_EXISTS => std::io::ErrorKind::AlreadyExists,
             _ => std::io::ErrorKind::Other,
         };
@@ -2560,6 +2566,12 @@ mod tests {
                 9084,
                 "E9084: /m/a.mkv",
                 ErrorKind::AlreadyExists,
+            ),
+            (
+                Error::MuxBatchSectorsZero,
+                9085,
+                "E9085",
+                ErrorKind::InvalidInput,
             ),
         ];
         for (e, code, shown, kind) in cases {

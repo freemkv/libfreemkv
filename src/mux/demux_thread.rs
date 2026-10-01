@@ -605,7 +605,12 @@ mod tests {
             pf_tx.send(Ok(chunk)).unwrap();
         }
         drop(pf_tx);
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait (polling, no fixed sleep) until the worker has filled its output.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !rx.is_full() {
+            assert!(std::time::Instant::now() < deadline, "channel never filled");
+            std::thread::yield_now();
+        }
         let stream = super::super::pipelined_stream::PipelinedPesStream::new(
             dt,
             rx,

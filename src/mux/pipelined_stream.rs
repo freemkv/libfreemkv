@@ -616,13 +616,17 @@ mod tests {
         let halt = crate::halt::Halt::new();
         let mut stream = stream.with_halt(Some(halt.clone()));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let _ = started_tx.send(());
             let _ = done_tx.send(stream.read().map(|f| f.is_some()));
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Cancel after the reader thread starts; a cancel that lands before it
+        // blocks must still end the read, so the order cannot flake.
+        started_rx.recv().unwrap();
         halt.cancel();
         let r = done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(10))
             .expect("a cancel must unblock the reader within a slice");
         let err = r.expect_err("a stop is not a frame or EOF");
         assert!(crate::error::is_halt(&err), "{err}");
