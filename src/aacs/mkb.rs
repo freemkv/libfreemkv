@@ -116,6 +116,7 @@ pub enum AacsVersion {
 /// the V10-vs-else stride choice it drives — lives in exactly one place.
 pub const AACS_MAJOR_BD: u8 = 1;
 
+/// AACS major version 2 (UHD-BD, 2.0 / 2.1): see [`AACS_MAJOR_BD`].
 pub const AACS_MAJOR_UHD: u8 = 2;
 
 impl AacsVersion {

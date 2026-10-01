@@ -152,6 +152,25 @@ mod tests {
         assert_eq!(ALIGNED_UNIT_LEN, 3 * 2048);
     }
 
+    // Any error but UdfNotFound / DiscRead is a hard failure: a good DUPLICATE copy must not
+    // mask it.
+    #[test]
+    fn read_first_propagates_a_hard_error_without_trying_the_duplicate() {
+        use crate::error::Error;
+        let candidates = ["/AACS/Unit_Key_RO.inf", "/AACS/DUPLICATE/Unit_Key_RO.inf"];
+        let mut tried = Vec::new();
+        let out = super::read_first(&candidates, |p| {
+            tried.push(p.to_string());
+            if p == "/AACS/DUPLICATE/Unit_Key_RO.inf" {
+                Ok(vec![0xAA])
+            } else {
+                Err(Error::DecryptFailed)
+            }
+        });
+        assert!(matches!(out, Err(Error::DecryptFailed)));
+        assert_eq!(tried, vec!["/AACS/Unit_Key_RO.inf".to_string()]);
+    }
+
     // AACS `/AACS/DUPLICATE/` redundancy: a `DiscRead` on the primary managed
     // file must fall through to the backup copy, not abort the whole read.
     #[test]

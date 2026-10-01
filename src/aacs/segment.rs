@@ -303,6 +303,48 @@ mod tests {
     }
 
     #[test]
+    fn fmts_key_ranges_skips_a_segment_straddling_non_adjacent_extents() {
+        use crate::disc::Extent;
+        // Clip bytes [0, 20480) at LBA 100.., [20480, 40960) at LBA 500.. (or reversed).
+        // Packets 104..=109 span bytes 19968..21119, crossing the extent boundary.
+        let segs = vec![Segment {
+            index: 5,
+            start_spn: 104,
+            end_spn: 109,
+        }];
+        for (first, second) in [(100, 500), (500, 100)] {
+            let extents = vec![
+                Extent {
+                    start_lba: first,
+                    sector_count: 10,
+                },
+                Extent {
+                    start_lba: second,
+                    sector_count: 10,
+                },
+            ];
+            let ranges = fmts_key_ranges(&segs, &extents, &|v| v as usize);
+            assert!(ranges.is_empty(), "{first}/{second}: {ranges:?}");
+        }
+    }
+
+    #[test]
+    fn segment_edges_are_inclusive() {
+        let seg = Segment {
+            index: 1,
+            start_spn: 100,
+            end_spn: 200,
+        };
+        assert!(seg.contains_spn(100) && seg.contains_spn(200));
+        assert!(!seg.contains_spn(99) && !seg.contains_spn(201));
+        // A unit touching exactly one edge packet overlaps.
+        assert!(seg.overlaps_spn(69, 100));
+        assert!(seg.overlaps_spn(200, 231));
+        assert!(!seg.overlaps_spn(68, 99));
+        assert!(!seg.overlaps_spn(201, 232));
+    }
+
+    #[test]
     fn clip_byte_to_lba_walks_extents() {
         use crate::disc::Extent;
         let extents = vec![

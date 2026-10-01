@@ -19,7 +19,7 @@ use super::crypto::{aes_ecb_decrypt, aes_g};
 use super::mkb::*;
 use super::types::DeviceKey;
 
-// ── Public constants ──────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────
 
 /// Zero placeholder KCD, NOT real key material — PER-LICENSEE.
 const KEY_CORRECTION_DATA: [u8; 16] = [0u8; 16];
@@ -419,7 +419,9 @@ fn km_from_slot_inputs(
 /// without its slot) against every slot and returns the Km for the slot whose full chain passes
 /// the Verify-Media-Key record, so an unverified key is never returned. VID-free — derive the
 /// VUK via [`super::derive::derive_vuk`]; `Kp` comes from [`walk_processing_key`]. Errors:
-/// `NotVariantMkb`/`MkbIncomplete`/ `ProcessingKeyUnavailable`
+/// `NotVariantMkb`, `MkbIncomplete` (also a slot's short tables), `ProcessingKeyUnavailable`
+/// (no slot verified), or, when a slot needs it, `SoftCorrectionRequired` /
+/// `OnlineChallengeRequired` / `VariantsTableUnavailable`.
 pub fn derive_media_key_variant(
     mkb_records: &[MkbRecord],
     pk: &[u8; 16],
@@ -759,7 +761,7 @@ mod tests {
     fn mkb_records_matches_walk_mkb_framing() {
         // The lazy `mkb_records` iterator and the owning `walk_mkb` must agree on
         // (offset, type, len) for every record — they share the one framing
-        // walker, and every aacs::resolve/derive MKB walk now relies on this equivalence.
+        // walker, and the derive MKB walks rely on this equivalence.
         let mut mkb = vec![0x10, 0x00, 0x00, 0x06, 0xAA, 0xBB];
         mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 1, 2, 3, 4]);
         mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0xFF]); // terminator + trailing
@@ -940,6 +942,16 @@ mod tests {
             walk_processing_key(&recs, &[dk]).is_none(),
             "out-of-range shift must be skipped, yielding no match"
         );
+    }
+
+    #[test]
+    fn walk_processing_key_rejects_a_device_key_shift_of_32_or_more() {
+        // dk.u_mask_shift = 3 + 32 would wrap to the slot's shift 3 under wrapping_shl and
+        // match; a keydb byte out of u32-shift range must match nothing.
+        let (recs, mut dk, _, _) = synthetic_variant_setup(0x00);
+        assert!(walk_processing_key(&recs, &[dk.clone()]).is_some());
+        dk.u_mask_shift = 3 + 32;
+        assert!(walk_processing_key(&recs, &[dk]).is_none());
     }
 
     #[test]

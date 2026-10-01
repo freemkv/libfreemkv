@@ -1451,6 +1451,26 @@ mod tests {
         }
     }
 
+    // The CPI clear is BD-TS only: an HD DVD program-stream unit has no TP_extra_header and
+    // its byte 0 of each 192-byte stride is payload.
+    #[test]
+    fn clear_copy_permission_indicator_masks_bdts_and_leaves_mpegps_alone() {
+        let before = vec![0xFFu8; ALIGNED_UNIT_LEN];
+        let mut ps = before.clone();
+        clear_copy_permission_indicator(&mut ps, crate::disc::ContentFormat::MpegPs);
+        assert_eq!(ps, before);
+        let mut ts = before.clone();
+        clear_copy_permission_indicator(&mut ts, crate::disc::ContentFormat::BdTs);
+        for (i, b) in ts.iter().enumerate() {
+            let want = if i % BD_SOURCE_PACKET_BYTES == 0 {
+                0x3F
+            } else {
+                0xFF
+            };
+            assert_eq!(*b, want, "byte {i}");
+        }
+    }
+
     // ── is_clean / ts_sync_count edge cases ────────────────────────────────
 
     #[test]
