@@ -978,6 +978,52 @@ fn hddvd_single_key_best_effort_multi_key_refuses() {
     }
 }
 
+/// An HD DVD set's unit spans stay in LBA order across fragmented and interleaved pieces:
+/// `span_at` bisects them.
+#[test]
+fn hddvd_set_spans_are_sorted_across_pieces() {
+    use crate::keys::evidence::Piece;
+    let files = [
+        BdFile::new("HVDVD_TS/FEATURE.EVO", 30, Some(K1)),
+        BdFile::new("BDMV/index.bdmv", 1, None),
+    ];
+    let uk_ro = unit_key_ro(AacsVersion::V10, &[[0xEE; 16]], &[1]);
+    let img = encrypted_bd_image(&files, &uk_ro);
+    let disc = disc_over(&img, &uk_ro, &[&[0]], DiscFormat::HdDvd);
+    let fx = Fx { img, disc };
+    let calls = Calls::default();
+    let f = factory(&[Spec::keydb(&[K1], &calls)]);
+    let ctx = crate::ctx::Ctx::new(Halt::new());
+    let mut reader = fx.source();
+    let mut ev =
+        KeyEvidence::from_disc(&fx.disc, &mut reader, KeyScope::Titles(vec![0]), &ctx).unwrap();
+    // Piece A is fragmented (descending extents); piece B sits between A's extents.
+    ev.pieces = vec![
+        Piece {
+            spans: vec![(5000, 30, 5000), (1000, 30, 5030)],
+            titles: vec![0],
+            rank: 1,
+        },
+        Piece {
+            spans: vec![(3000, 30, 3000)],
+            titles: vec![0],
+            rank: 1,
+        },
+    ];
+    let set = super::resolve::acquire(
+        &ev,
+        &mut Sampler::new(&mut reader),
+        &f,
+        AcquireOptions::default(),
+        &ctx,
+        &FakeClock::default(),
+    )
+    .unwrap()
+    .keys;
+    let starts: Vec<u32> = set.0.spans.iter().map(|s| s.0).collect();
+    assert_eq!(starts, [1000, 3000, 5000]);
+}
+
 /// LK17. A set is bound to its disc (hash, capacity, format, VID fingerprint), and its
 /// `Debug` shows no key or VID bytes.
 #[test]
@@ -2358,6 +2404,17 @@ fn keyless_session_set_is_bound_to_its_disc() {
     assert!(KeyRing::keyless_for_disc(&fx.disc, 9).is_none());
     let bare = KeyRing::keyless_for(&fx.disc.titles[0], ContentFormat::BdTs);
     assert!(!bare.is_for(&fx.disc.media_id()), "no identity, no bypass");
+}
+
+/// A capture whose AACS `disc_hash` is empty is identified by its title-key file: the keyless
+/// set still fits that disc.
+#[test]
+fn keyless_session_set_fits_a_disc_without_a_captured_hash() {
+    let mut fx = two_units();
+    fx.disc.aacs.as_mut().unwrap().disc_hash = String::new();
+    assert!(!fx.disc.aacs.as_ref().unwrap().uk_ro.is_empty());
+    let set = KeyRing::keyless_for_disc(&fx.disc, 0).expect("title 0");
+    assert!(set.is_for(&fx.disc.media_id()));
 }
 
 /// J22 with J21 parity (review r4). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits)

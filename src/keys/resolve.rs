@@ -514,6 +514,8 @@ fn resolve_hddvd(
         ranges.extend(p.ranges().map(|(s, e)| (s, e, 0usize)));
         inner.spans.extend(p.spans.iter().copied());
     }
+    // `span_at` bisects: a fragmented file or interleaved pieces arrive out of LBA order.
+    inner.spans.sort_unstable_by_key(|s| s.0);
     inner.map = Arc::new(AacsKeyMap::from_ranges(ranges));
     Ok(inner)
 }

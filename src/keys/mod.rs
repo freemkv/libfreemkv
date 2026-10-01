@@ -648,11 +648,9 @@ impl KeyRing {
     pub(crate) fn keyless_for_disc(disc: &Disc, idx: usize) -> Option<Self> {
         let title = disc.titles.get(idx)?;
         let mut i = Self::keyless_inner(title, disc.content_format);
-        i.disc_hash = disc
-            .aacs
-            .as_ref()
-            .map(|a| a.disc_hash.clone())
-            .unwrap_or_default();
+        // The same identity `is_for` compares: a capture without a hash is named by its
+        // title-key file.
+        i.disc_hash = disc.media_id().disc_hash;
         i.format = disc.format;
         i.capacity = disc.capacity_sectors;
         Some(Self(Arc::new(i)))

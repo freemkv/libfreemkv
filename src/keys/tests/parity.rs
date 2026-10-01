@@ -425,10 +425,8 @@ fn parity_image_dvd_css_multi_vts() {
 }
 
 // BUG-1 (pipeline design §1.4): a live-scanned DVD has no `disc.css`, so the folder must
-// still come out descrambled. Red today (the VOBs are written scrambled); ignored until the
-// decrypt stage detects CSS by content (slice 3b).
+// still come out descrambled, each VTS under its own cracked key.
 #[test]
-#[ignore = "BUG-1: live DVD -> dir never engages CSS (fixed in slice 3b)"]
 fn parity_bug1_live_dvd_folder_is_descrambled() {
     let (fx, clear, _) = dvd_fx(true);
     let dest = tempfile::tempdir().unwrap();
