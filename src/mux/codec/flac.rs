@@ -252,6 +252,33 @@ mod tests {
         assert_eq!(p.dropped_frames(), before + 1);
     }
 
+    // The blocking-strategy bit (0xFFF9 = variable blocksize) is masked off the sync test.
+    #[test]
+    fn variable_blocksize_frames_are_validated_too() {
+        let mut p = FlacParser::new();
+        let mut good = make_flac_frame(100);
+        good[1] = 0xF9;
+        let n = good.len();
+        let c = crc16_ansi(&good[..n - 2]);
+        good[n - 2] = (c >> 8) as u8;
+        good[n - 1] = c as u8;
+        assert_eq!(p.parse(&make_pes(good.clone(), Some(0))).len(), 1);
+        let mut bad = good;
+        bad[20] ^= 0xFF;
+        assert!(p.parse(&make_pes(bad, Some(90_000))).is_empty());
+        assert_eq!(p.dropped_frames(), 1);
+    }
+
+    #[test]
+    fn a_set_reserved_bit_is_not_a_flac_sync() {
+        let mut p = FlacParser::new();
+        let mut f = make_flac_frame(100);
+        f[1] = 0xFA; // the mandatory-0 reserved bit set
+        f[20] ^= 0xFF;
+        assert_eq!(p.parse(&make_pes(f, Some(0))).len(), 1, "passed through");
+        assert_eq!(p.dropped_frames(), 0);
+    }
+
     #[test]
     fn non_flac_packet_passes_through() {
         // A packet without the FLAC sync isn't a frame we can validate — never

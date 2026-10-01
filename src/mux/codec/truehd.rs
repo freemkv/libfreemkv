@@ -36,9 +36,9 @@ const AU_DURATION_NS: i64 = 833_333;
 // kHz constant would run ~8.95% fast on these (rare) streams.
 const AU_DURATION_NS_441: i64 = 907_029;
 
-// Hard cap on the reassembly buffer: a valid AU is well under 32 KiB, so
-// past this the stream is malformed — drop and resync. Parity with the
-// AC-3/DTS/PGS caps.
+// Backstop on the reassembly buffer, parity with the AC-3/DTS/PGS caps. The parse loop
+// already drains every complete AU, so the residue never exceeds one AU (8190 bytes) and
+// this does not fire today; it bounds memory if that loop changes.
 const MAX_TRUEHD_BUF: usize = 256 * 1024;
 
 pub struct TrueHdParser {
@@ -1495,6 +1495,8 @@ mod tests {
         assert_eq!(truehd_lfe(0x4B), 0, "7.0 has no LFE");
         assert_eq!(truehd_lfe(0xF << 15), 1, "6ch LFE bit when 8ch is empty");
         assert_eq!(truehd_lfe(0x03 | (0xF << 15)), 0, "8ch wins over 6ch");
+        assert_eq!(truehd_lfe(0x1B << 15), 0, "6ch mask with every bit but LFE");
+        assert_eq!(truehd_lfe(0x04 << 15), 1, "6ch LFE bit alone");
         assert_eq!(truehd_lfe(0), 0);
     }
 

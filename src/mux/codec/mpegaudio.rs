@@ -421,6 +421,31 @@ mod tests {
         }
     }
 
+    // A learned free-format size excludes padding: a padded frame (padding bit set) is one slot
+    // longer, so the next header is looked for one byte later.
+    #[test]
+    fn free_format_frames_with_alternating_padding_keep_their_exact_bytes() {
+        let plain = free_frame();
+        let mut padded = free_frame();
+        padded[2] |= 0x02; // padding bit
+        padded.push(0xAA); // Layer III padding is one slot
+        let (plain, padded) = (plain.as_slice(), padded.as_slice());
+        // Starting on a padded frame learns the size from a padded spacing.
+        for frames in [
+            [plain, padded, plain, padded, plain, padded],
+            [padded, plain, padded, plain, padded, plain],
+        ] {
+            let mut p = MpegAudioParser::new();
+            let mut f = p.parse(&make_pes(frames.concat(), Some(0)));
+            f.extend(p.flush());
+            assert_eq!(f.len(), 6);
+            for (got, want) in f.iter().zip(frames) {
+                assert_eq!(got.data, want);
+            }
+            assert_eq!(p.dropped_frames(), 0);
+        }
+    }
+
     #[test]
     fn free_format_frame_split_across_pes_reassembles() {
         let data = free_frame().repeat(2);

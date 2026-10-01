@@ -22,6 +22,8 @@ use super::{Frame, PesPacket};
 
 // Most bytes held after a lock while waiting for the next timestamp (see place_lock).
 const MAX_HOLD: usize = 64 * 1024;
+// Most bytes buffered across packets before the stream is judged corrupt and the packet dropped.
+const MAX_BUFFERED: usize = 1024 * 1024;
 
 pub(super) struct Header {
     pub bytes: usize,
@@ -182,7 +184,7 @@ impl AudioFrames {
         self.framed = true;
         // Audio PES packets are small. Refuse pathological accumulation before
         // copying; a corrupt size must not grow memory without bound.
-        if self.buf.len().saturating_add(pes.data.len()) > 1024 * 1024 {
+        if self.buf.len().saturating_add(pes.data.len()) > MAX_BUFFERED {
             self.buf.clear();
             self.tally.record_drop(
                 facts.presentation_ns().unwrap_or(self.next_pts),

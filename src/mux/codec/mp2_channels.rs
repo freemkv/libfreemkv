@@ -541,7 +541,7 @@ struct Composite {
 
 /// What one stored frame says about its channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Frame {
+pub(crate) enum ChannelFrame {
     /// No valid 11172-3 header: not a frame this module can judge.
     NoHeader,
     /// A clean base frame whose multichannel extension verified (§2.5.3.1).
@@ -553,22 +553,22 @@ pub(crate) enum Frame {
 }
 
 /// Judges one stored frame against 11172-3 and 13818-3.
-pub(crate) fn inspect(frame: &[u8]) -> Frame {
+pub(crate) fn inspect(frame: &[u8]) -> ChannelFrame {
     inspect_within(frame, frame.len() * 8)
 }
 
 // As `inspect`, reading no further than bit `end` (tests cut at exact field bits).
-fn inspect_within(frame: &[u8], end: usize) -> Frame {
+fn inspect_within(frame: &[u8], end: usize) -> ChannelFrame {
     let Some(h) = Header::parse(frame) else {
-        return Frame::NoHeader;
+        return ChannelFrame::NoHeader;
     };
     let nch = h.nch();
     let base = match walk_base(frame, &h, end) {
         Ok(base) => base,
         Err(why @ (Fallback::FrameCrc | Fallback::Truncated(_))) => {
-            return Frame::Damaged { nch, why };
+            return ChannelFrame::Damaged { nch, why };
         }
-        Err(why) => return Frame::Base { nch, why },
+        Err(why) => return ChannelFrame::Base { nch, why },
     };
     // The frame's own length bounds mc_extension_data_part1 (11172-3 §2.4.3.1 slots).
     let frame_end = h
@@ -576,8 +576,8 @@ fn inspect_within(frame: &[u8], end: usize) -> Frame {
         .map_or(end, |n| (n * 8).min(end))
         .min(frame.len() * 8);
     match mc_extension(frame, &h, &base, frame_end) {
-        Ok(mc) => Frame::Multichannel { nch, mc },
-        Err(why) => Frame::Base { nch, why },
+        Ok(mc) => ChannelFrame::Multichannel { nch, mc },
+        Err(why) => ChannelFrame::Base { nch, why },
     }
 }
 
@@ -737,7 +737,7 @@ impl ChannelTracker {
         }
         self.frames += 1;
         match inspect(frame) {
-            Frame::Multichannel { nch, mc } => {
+            ChannelFrame::Multichannel { nch, mc } => {
                 self.base = Some(nch);
                 // §2.5.2.13: "'1' extension bit stream present" - the rest is not in the track.
                 let count = if mc.ext_bit_stream_present {
@@ -757,18 +757,18 @@ impl ChannelTracker {
                 }
             }
             // A clean frame without a verified mc_header (§2.5.3.1) breaks the run.
-            Frame::Base { nch, why } => {
+            ChannelFrame::Base { nch, why } => {
                 self.base = Some(nch);
                 self.last = Some(why);
                 self.run = None;
             }
             // A failed frame CRC covers the header too, so its nch is not trusted; like a
             // header-less frame it breaks the run, which must be consecutive.
-            Frame::Damaged { why, .. } => {
+            ChannelFrame::Damaged { why, .. } => {
                 self.last = Some(why);
                 self.run = None;
             }
-            Frame::NoHeader => self.run = None,
+            ChannelFrame::NoHeader => self.run = None,
         }
         if self.frames >= MAX_FRAMES && self.run.is_none() {
             self.settled = true;

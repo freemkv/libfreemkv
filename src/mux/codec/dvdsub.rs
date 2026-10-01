@@ -45,7 +45,15 @@ impl DvdSubParser {
         // `complete` is only true when `self.pending` was `Some` above, but
         // borrow through `?` rather than a prod `unwrap()` on a fact the
         // compiler can't see across the two lines.
-        let (facts, _, data) = self.pending.take()?;
+        let (facts, size, data) = self.pending.take()?;
+        if data.len() < size {
+            tracing::warn!(
+                target: "mux",
+                have = data.len(),
+                declared = size,
+                "dvdsub: emitting a truncated subpicture unit"
+            );
+        }
         // Guaranteed Some: `pending` is only ever created from a PES with
         // `pts.is_some()` (L054 dropped the no-PTS orphan path), so this
         // never takes the fallback; kept as unwrap_or, never a prod unwrap.
@@ -165,7 +173,6 @@ impl CodecParser for DvdSubParser {
 
 // ── YCbCr → RGB conversion and palette formatting ─────────────────────────
 
-// Byte-2-as-Cb is invisible on achromatic (Cb=Cr=128) palette entries.
 /// Convert a single YCbCr color to RGB, clamping to [0, 255].
 ///
 /// Input: `[padding, Y, Cr, Cb]` (as stored in DVD IFO PGC data). Note the
@@ -174,15 +181,17 @@ impl CodecParser for DvdSubParser {
 ///
 /// Returns `[R, G, B]`.
 ///
-/// Uses full-range (JFIF) BT.601 coefficients, matching the VobSub `.idx` on-disk convention.
+/// The DVD CLUT is studio-range (Y 16..=235, chroma 16..=240), so this applies
+/// the limited-range BT.601 expansion: Y=16 maps to black, Y=235 to white. The
+/// result is the full-range RGB a VobSub `.idx` palette carries.
 pub fn ycbcr_to_rgb(color: &[u8; 4]) -> [u8; 3] {
-    let y = color[1] as f64;
-    let cr = color[2] as f64;
-    let cb = color[3] as f64;
+    let y = 1.164 * (color[1] as f64 - 16.0);
+    let cr = color[2] as f64 - 128.0;
+    let cb = color[3] as f64 - 128.0;
 
-    let r = y + 1.402 * (cr - 128.0);
-    let g = y - 0.344 * (cb - 128.0) - 0.714 * (cr - 128.0);
-    let b = y + 1.772 * (cb - 128.0);
+    let r = y + 1.596 * cr;
+    let g = y - 0.392 * cb - 0.813 * cr;
+    let b = y + 2.017 * cb;
 
     [clamp_u8(r), clamp_u8(g), clamp_u8(b)]
 }
@@ -424,22 +433,16 @@ mod tests {
 
     #[test]
     fn ycbcr_to_rgb_white() {
-        // White in YCbCr: Y=235, Cb=128, Cr=128 → R=235, G=235, B=235
+        // Studio-range white: Y=235 at neutral chroma expands to full white.
         let color = [0x00, 235, 128, 128];
-        let [r, g, b] = ycbcr_to_rgb(&color);
-        assert_eq!(r, 235);
-        assert_eq!(g, 235);
-        assert_eq!(b, 235);
+        assert_eq!(ycbcr_to_rgb(&color), [255, 255, 255]);
     }
 
     #[test]
     fn ycbcr_to_rgb_black() {
-        // Black: Y=16, Cb=128, Cr=128 → R=16, G=16, B=16
+        // Studio-range black: Y=16 at neutral chroma is true black.
         let color = [0x00, 16, 128, 128];
-        let [r, g, b] = ycbcr_to_rgb(&color);
-        assert_eq!(r, 16);
-        assert_eq!(g, 16);
-        assert_eq!(b, 16);
+        assert_eq!(ycbcr_to_rgb(&color), [0, 0, 0]);
     }
 
     #[test]
@@ -465,9 +468,6 @@ mod tests {
         // Approximate red: Y=82, Cr=240, Cb=90 — on disc as [pad, Y, Cr, Cb].
         let color = [0x00, 82, 240, 90];
         let [r, g, b] = ycbcr_to_rgb(&color);
-        // R = 82 + 1.402*(240-128) = 82 + 156.9 ≈ 239
-        // G = 82 - 0.344*(90-128) - 0.714*(240-128) = 82 + 13.1 - 79.97 ≈ 15
-        // B = 82 + 1.772*(90-128) = 82 - 67.3 ≈ 15
         assert!(r > 200, "R should be high for red, got {}", r);
         assert!(g < 30, "G should be low for red, got {}", g);
         assert!(b < 30, "B should be low for red, got {}", b);
@@ -486,7 +486,7 @@ mod tests {
             "on-disc red [0,Y=76,Cr=255,Cb=85] must render red-dominant, \
              got R={r} G={g} B={b} (R and B swapped => byte 2/3 are transposed)"
         );
-        assert_eq!([r, g, b], [254, 0, 0], "exact full-range BT.601 red");
+        assert_eq!([r, g, b], [255, 0, 0], "exact studio-range BT.601 red");
 
         // And the converse: a saturated BLUE on-disc entry (Y=29, Cr=107, Cb=255)
         // must not come out red.
@@ -545,8 +545,8 @@ mod tests {
 
     #[test]
     fn format_palette_hex_format() {
-        // Y=128, Cb=128, Cr=128 → R=128, G=128, B=128 → "808080"
-        let palette = vec![[0x00, 128, 128, 128]];
+        // Y=126 at neutral chroma → R=G=B=128 → "808080"
+        let palette = vec![[0x00, 126, 128, 128]];
         let result = format_palette(&palette, 0, 0);
         let text = String::from_utf8(result).unwrap();
         assert_eq!(text, "palette: 808080\n");
@@ -556,7 +556,7 @@ mod tests {
     fn format_palette_emits_size_line_before_palette() {
         // With non-zero dimensions the `.idx` `size:` line is prepended ahead of
         // the palette so players place/scale the VobSub bitmap (PAL 720x576).
-        let palette = vec![[0x00, 128, 128, 128]];
+        let palette = vec![[0x00, 126, 128, 128]];
         let result = format_palette(&palette, 720, 576);
         let text = String::from_utf8(result).unwrap();
         assert_eq!(
@@ -569,7 +569,7 @@ mod tests {
     fn format_palette_omits_size_line_when_dimensions_unknown() {
         // 0 width/height (unknown resolution) omits the size line rather than
         // emitting a 0x0 frame; the palette line is still present.
-        let palette = vec![[0x00, 128, 128, 128]];
+        let palette = vec![[0x00, 126, 128, 128]];
         let result = format_palette(&palette, 0, 576);
         let text = String::from_utf8(result).unwrap();
         assert_eq!(text, "palette: 808080\n", "no size line when a dim is 0");
@@ -717,10 +717,19 @@ mod tests {
 
     #[test]
     fn ycbcr_blue_channel_clamps_high() {
-        // B = Y + 1.772*(Cb-128). Y=128, Cb=255 → 128 + 1.772*127 ≈ 353 → clamp 255.
+        // B = 1.164*(Y-16) + 2.017*(Cb-128) ≈ 130 + 256 → clamp 255.
         // Cb is byte 3 in the on-disc [pad, Y, Cr, Cb] layout.
         let [_r, _g, b] = ycbcr_to_rgb(&[0x00, 128, 128, 255]);
         assert_eq!(b, 255, "blue clamps at 255");
+    }
+
+    #[test]
+    fn ycbcr_to_rgb_green_uses_both_chroma_terms() {
+        // Y=128, Cr=100, Cb=90: G = 1.164*112 - 0.392*(-38) - 0.813*(-28) = 167.9.
+        assert_eq!(ycbcr_to_rgb(&[0x00, 128, 100, 90])[1], 168);
+        // Each chroma term alone: Cr moves G by -0.813/step, Cb by -0.392/step.
+        assert_eq!(ycbcr_to_rgb(&[0x00, 128, 100, 128])[1], 153);
+        assert_eq!(ycbcr_to_rgb(&[0x00, 128, 128, 90])[1], 145);
     }
 
     #[test]
@@ -733,9 +742,9 @@ mod tests {
     #[test]
     fn format_palette_pads_each_channel_to_two_hex_digits() {
         // Each RGB channel is formatted as exactly 2 hex digits (zero-padded).
-        // Y=16,neutral → 0x10 → "101010" (each channel two digits).
-        let result = format_palette(&[[0x00, 16, 128, 128]], 0, 0);
-        assert_eq!(String::from_utf8(result).unwrap(), "palette: 101010\n");
+        // Y=20,neutral → 5 → "050505" (each channel two digits).
+        let result = format_palette(&[[0x00, 20, 128, 128]], 0, 0);
+        assert_eq!(String::from_utf8(result).unwrap(), "palette: 050505\n");
     }
 
     // Text guard in codec/mod.rs can't see `source: facts.source` with no
