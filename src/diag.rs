@@ -774,6 +774,9 @@ mod tests {
         assert_eq!(tv_system_str(FrameRate::F25), "PAL");
         assert_eq!(fps_str(FrameRate::F29_97), "29.97");
         assert_eq!(tv_system_str(FrameRate::F29_97), "NTSC");
+        assert_eq!(tv_system_str(FrameRate::F50), "PAL");
+        assert_eq!(tv_system_str(FrameRate::F23_976), "NTSC");
+        assert_eq!(tv_system_str(FrameRate::F59_94), "NTSC");
     }
 
     #[test]
@@ -893,5 +896,10 @@ mod tests {
         assert!(row.contains("block_mode=2"), "{row}");
         assert!(row.contains("block_type=1"), "{row}");
         assert!(row.contains("DROP(leading-secondary-block-piece)"), "{row}");
+
+        // The same secondary piece past the leading run is kept, as feature body.
+        let row = dvd_cell_row(3, &sec, false);
+        assert!(row.contains("keep(feature-body)"), "{row}");
+        assert!(!row.contains("keep(plain-feature)"), "{row}");
     }
 }

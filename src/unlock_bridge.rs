@@ -353,6 +353,41 @@ mod tests {
         assert!(fu::scsi::ScsiSense::from_buf(&sense).is_illegal_request());
     }
 
+    /// A `DiscRead` carrying a real status + sense is a drive answer like any CHECK CONDITION:
+    /// it must not collapse to a dead bus.
+    #[test]
+    fn disc_read_preserves_status_and_sense() {
+        let err = adapt(|| crate::error::Error::DiscRead {
+            sector: 7,
+            status: Some(0x02),
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: 0x05,
+                asc: 0x24,
+                ascq: 0x00,
+            }),
+        });
+        assert_eq!(err.status, 0x02);
+        let sense = err.sense.expect("sense preserved");
+        assert!(fu::scsi::ScsiSense::from_buf(&sense).is_illegal_request());
+    }
+
+    /// Each host-cert field lands in its own slot: v1 and v2 material never swap.
+    #[test]
+    fn host_certs_map_field_for_field() {
+        let cert = crate::aacs::types::HostCert {
+            private_key: [1; 20],
+            certificate: vec![2; 92],
+            private_key_v2: Some([3; 32]),
+            certificate_v2: Some(vec![4; 8]),
+        };
+        let mapped = map_host_certs(std::slice::from_ref(&cert));
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].private_key, [1; 20]);
+        assert_eq!(mapped[0].certificate, vec![2; 92]);
+        assert_eq!(mapped[0].private_key_v2, Some([3; 32]));
+        assert_eq!(mapped[0].certificate_v2, Some(vec![4; 8]));
+    }
+
     /// A drive-tagged transport fault (status 0xFF) crosses unchanged.
     #[test]
     fn scsi_transport_fault_maps_unchanged() {

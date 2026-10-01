@@ -276,8 +276,7 @@ impl DiscSession {
                 return Err(e);
             }
         };
-        self.disc = Some(disc);
-        Ok(self.disc.as_ref().expect("disc just stored"))
+        Ok(&*self.disc.insert(disc))
     }
 
     /// [`Self::scan`] under the session's op token (stop design §2.2, §6 ST-L3): the
@@ -306,8 +305,7 @@ impl DiscSession {
                 return Err(e);
             }
         };
-        self.disc = Some(disc);
-        Ok(self.disc.as_ref().expect("disc just stored"))
+        Ok(&*self.disc.insert(disc))
     }
 
     /// End the session on the handle it holds (stop design §2.5), never re-opening the
