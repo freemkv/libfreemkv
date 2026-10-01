@@ -345,7 +345,7 @@ fn run_first_play(cmds: &[[u8; 8]]) -> Option<u8> {
             } => {
                 if tainted {
                     vm.taint_gprm(reg);
-                    if op == 2 {
+                    if op == SET_SWAP {
                         vm.taint_gprm(src); // swap also writes its source
                     }
                 } else {
@@ -607,6 +607,49 @@ mod tests {
             &[h("7101000000010000"), h("3002000000020000")],
             1,
             &[(2, 1), (3, 1)],
+        );
+        assert_eq!(resolve_from_vmg(&vmgi), None);
+    }
+
+    // SetGPRMMD counter mode makes a GPRM time-dependent: a compare on it must abstain,
+    // including when the mode was set by a line whose own predicate was false.
+    #[test]
+    fn counter_mode_gprm_makes_a_later_compare_abstain() {
+        // 53 .. imm 5, b5 = 0x83: counter bit + g3. Then `if g3 == g3 -> JumpTT 1`.
+        let cmp = h("3022000000010303");
+        for set in ["5300000500830000", "5330000500830000"] {
+            let vmgi = build_vmgi(&[h(set), cmp], 1, &[(2, 1)]);
+            assert_eq!(resolve_from_vmg(&vmgi), None, "{set}");
+        }
+        // Counter bit clear: the compare is decidable.
+        let vmgi = build_vmgi(&[h("5300000500030000"), cmp], 1, &[(2, 1)]);
+        assert!(resolve_from_vmg(&vmgi).is_some());
+    }
+
+    // SetGPRMMD stores like a mov: the immediate (bytes 2-3) and source register (byte 3)
+    // land in the register named by byte 5.
+    #[test]
+    fn setgprmmd_stores_its_immediate_and_source_register() {
+        // g1 = 9; SetGPRMMD g2 = imm 9 / g2 = g1; then `if g2 == g1 -> JumpTT 1`.
+        let jump = h("3022000000010201");
+        for md in ["5300000900020000", "4300000100020000"] {
+            let vmgi = build_vmgi(&[h("7100000100090000"), h(md), jump], 1, &[(2, 1)]);
+            assert!(resolve_from_vmg(&vmgi).is_some(), "{md}");
+        }
+    }
+
+    // A random value is never decidable, and a swap under an undecidable guard leaves
+    // its source register unknown too.
+    #[test]
+    fn rnd_and_guarded_swap_taint_their_registers() {
+        let mut vm = Vm::new();
+        vm.set(0, SET_RND, true, 1, 0);
+        assert!(vm.reg_tainted(0));
+        // line 0: swap g0,g1 guarded by an SPRM compare; line 1: `if g1 == g1 -> JumpTT 1`.
+        let vmgi = build_vmgi(
+            &[h("6220800000010000"), h("3022000000010101")],
+            1,
+            &[(2, 1)],
         );
         assert_eq!(resolve_from_vmg(&vmgi), None);
     }
