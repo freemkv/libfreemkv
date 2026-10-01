@@ -57,7 +57,7 @@ pub(crate) fn classify(head: &[u8]) -> Kind {
 /// is still a PS by its first sector-aligned pack.
 pub(crate) fn classify_sectors(head: &[u8]) -> Kind {
     match classify(head) {
-        Kind::Opaque => head
+        Kind::Opaque if !head.starts_with(b"FMKV") => head
             .chunks(SECTOR_BYTES)
             .find(|s| s.len() >= 5 && s[..4] == PACK_START)
             .map_or(Kind::Opaque, |p| Kind::Ps {
@@ -67,10 +67,9 @@ pub(crate) fn classify_sectors(head: &[u8]) -> Kind {
     }
 }
 
-// KS-2: each source packet is "the TP_extra_header (4 bytes) and an MPEG Transport packet";
-// KS-4: a unit's 16-byte seed is clear, so its sync survives encryption.
-// A damaged (zeroed or garbled) unit in the head must not hide the rest: at least half of the
-// non-blank head units, and two when there are two, must show the source-packet shape.
+// KS-2: a source packet is "the TP_extra_header (4 bytes) and an MPEG Transport packet"; KS-4:
+// a unit's clear seed keeps its sync. A damaged head unit must not hide the rest: half the
+// non-blank head units, and two when there are two, must show that shape.
 fn is_bd_ts(head: &[u8]) -> bool {
     const PKT: usize = BD_SOURCE_PACKET_BYTES;
     let units = head.as_chunks::<ALIGNED_UNIT_LEN>().0;

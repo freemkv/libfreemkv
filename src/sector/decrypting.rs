@@ -397,26 +397,34 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
     }
 }
 
-// Every packet of the unit synced, padding aside: not the 4-packet key-proof floor of `is_clean`,
-// which ciphertext passes ~7e-6 of the time. Ciphertext passes this ~256^-31.
-fn wholly_clear_ts(unit: &[u8]) -> bool {
-    unit.as_chunks::<{ crate::consts::BD_SOURCE_PACKET_BYTES }>()
-        .0
-        .iter()
-        .all(|p| p[4] == 0x47 || p[4..].iter().all(|&b| b == 0))
+// Clear TS: the seed's packet synced and 3/4 of the other non-padding packets (24 of a whole
+// unit's 31), not the 4-packet key-proof floor of `is_clean` (ciphertext passes ~7e-6). Damage
+// to a few packets must not make a clear unit look encrypted; ciphertext passes this ~1e-51.
+fn clear_ts(chunk: &[u8]) -> bool {
+    let pkts = chunk
+        .as_chunks::<{ crate::consts::BD_SOURCE_PACKET_BYTES }>()
+        .0;
+    let Some((seed, rest)) = pkts.split_first() else {
+        return false;
+    };
+    let content = rest.iter().filter(|p| p[4..].iter().any(|&b| b != 0));
+    let (n, synced) = content.fold((0, 0), |(n, s), p| (n + 1, s + usize::from(p[4] == 0x47)));
+    seed[4] == 0x47 && synced * 4 >= n * 3
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
     // The content-detected stage's per-read rules, before any key sees the bytes: a stale CPI
-    // flag on wholly clear TS is cleared (KS-5: "00₂ if the data is not encrypted"), and a
+    // flag on clear TS is cleared (KS-5: "00₂ if the data is not encrypted"), and a
     // keyless PS refuses a scrambled pack rather than pass ciphertext as clear.
     fn judge_detected(&self, buf: &mut [u8]) -> Result<()> {
-        use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_encrypted};
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_seed_encrypted};
         if self.stale_cpi {
             let ts = crate::disc::ContentFormat::BdTs;
-            for unit in buf.as_chunks_mut::<ALIGNED_UNIT_LEN>().0 {
-                if aacs_unit_encrypted(unit, ts) && wholly_clear_ts(unit) {
-                    crate::aacs::content::clear_copy_permission_indicator(unit, ts);
+            for unit in buf.chunks_mut(ALIGNED_UNIT_LEN) {
+                if aacs_unit_seed_encrypted(unit, ts) && clear_ts(unit) {
+                    for p in unit.chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES) {
+                        p[0] &= 0x3F;
+                    }
                 }
             }
         }
@@ -495,33 +503,32 @@ mod tests {
         }
     }
 
-    // Stale CPI is cleared only on wholly clear TS: ciphertext that keeps a few syncs (the
-    // `is_clean` proof floor) stays flagged for the key to open.
+    // Stale CPI is cleared only on clear TS: ciphertext that keeps a few syncs (the `is_clean`
+    // proof floor) stays flagged, while one damaged packet does not hide a clear unit.
     #[test]
-    fn stale_cpi_needs_every_packet_synced() {
+    fn stale_cpi_needs_nearly_every_packet_synced() {
         use crate::aacs::content::ALIGNED_UNIT_LEN;
+        let pkt = crate::consts::BD_SOURCE_PACKET_BYTES;
         let mut unit: Vec<u8> = (0..ALIGNED_UNIT_LEN)
             .map(|i| (i * 13 + 5) as u8 | 1)
             .collect();
-        for p in unit.chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES) {
+        for p in unit.chunks_mut(pkt) {
             p[0] |= 0xC0;
             p[4] = 0x47;
         }
-        assert!(wholly_clear_ts(&unit));
-        for p in unit
-            .chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES)
-            .skip(5)
-        {
+        assert!(clear_ts(&unit));
+        unit[3 * pkt + 4] = 0x9D;
+        assert!(clear_ts(&unit), "one damaged packet");
+        assert!(clear_ts(&unit[..20 * pkt]), "a clear partial tail");
+        unit[3 * pkt + 4] = 0x47;
+        for p in unit.chunks_mut(pkt).skip(5) {
             p[4] = 0x9D;
         }
         assert!(crate::aacs::content::is_clean(
             &unit,
             crate::disc::ContentFormat::BdTs
         ));
-        assert!(
-            !wholly_clear_ts(&unit),
-            "four synced packets are not clear TS"
-        );
+        assert!(!clear_ts(&unit), "four synced packets are not clear TS");
     }
 
     // A DecryptingSectorSource must relay its inner source's unmapped list.
