@@ -492,7 +492,7 @@ impl Drive {
         buf: &mut [u8],
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
-        crate::halt::diag::assert_may_block("Drive::exec", Duration::MAX);
+        crate::halt::diag::assert_may_block("Drive::exec_uncancellable", Duration::MAX);
         self.dispatch(cdb, dir, buf, timeout_ms)
     }
 
@@ -507,7 +507,7 @@ impl Drive {
         timeout_ms: u32,
         ctx: CleanupCtx,
     ) -> Result<crate::scsi::ScsiResult> {
-        crate::halt::diag::assert_may_block("Drive::exec", Duration::MAX);
+        crate::halt::diag::assert_may_block("Drive::exec_cleanup", Duration::MAX);
         if self.is_halted() && !allow::allowed_after_cancel(cdb, self.ledger(), ctx) {
             return Err(Error::Halted);
         }
@@ -849,9 +849,10 @@ impl Drive {
         }
     }
 
-    /// True when the mounted disc is a DVD (profile family `0x0010..=0x001F`).
+    /// True when the mounted disc is a DVD (profile family `0x0010..=0x001F`,
+    /// plus DVD+RW DL `0x002A` and DVD+R DL `0x002B`).
     pub(crate) fn disc_is_dvd(&mut self) -> bool {
-        matches!(self.current_profile(), Some(p) if (0x0010..=0x001F).contains(&p))
+        matches!(self.current_profile(), Some(p) if (0x0010..=0x001F).contains(&p) || p == 0x002A || p == 0x002B)
     }
 
     /// Initialize drive — drive-prep unlock + init.
@@ -2282,7 +2283,8 @@ mod command_tests {
         ));
     }
 
-    // disc_is_dvd() must match ONLY the DVD profile family (0x0010..=0x001F).
+    // disc_is_dvd() must match ONLY the DVD profile family (0x0010..=0x001F plus
+    // the DVD+ DL profiles 0x002A / 0x002B).
     #[test]
     fn disc_is_dvd_matches_only_dvd_profile_family() {
         let probe = |profile: u16| {
@@ -2294,7 +2296,9 @@ mod command_tests {
         // DVD family → DVD (skip drive unlock, run stock for CSS).
         assert!(probe(0x0010), "DVD-ROM");
         assert!(probe(0x0011), "DVD-R");
-        assert!(probe(0x001B), "DVD+R DL");
+        assert!(probe(0x001B), "DVD+R");
+        assert!(probe(0x002A), "DVD+RW DL");
+        assert!(probe(0x002B), "DVD+R DL");
         // BD/UHD family → NOT DVD (must keep today's unlock path).
         assert!(!probe(0x0040), "BD-ROM (UHD) must NOT be classed as DVD");
         assert!(!probe(0x0041), "BD-R");
@@ -3873,6 +3877,38 @@ mod command_tests {
             "the pause must be halt-aware, not a blind {SPIN_DOWN_IDLE_SECS}s \
              thread::sleep; took {:?}",
             t0.elapsed()
+        );
+    }
+
+    // A Stop that lands DURING the spin-up settle (the second pause) must wake it too.
+    #[test]
+    fn spin_cycle_wakes_from_its_spin_up_settle_when_stopped() {
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(0));
+        let flag = d.halt_flag();
+        let stopper = std::thread::spawn(move || {
+            // Wait for the START (spin-up) CDB, then stop inside the settle pause.
+            while cdb.lock().unwrap().get(4) != Some(&0x01) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let t0 = std::time::Instant::now();
+        let r = d.spin_cycle();
+        let took = t0.elapsed();
+        stopper.join().expect("stopper thread");
+        assert!(
+            matches!(r, Err(Error::Halted)),
+            "a Stop during the spin-up settle must surface as Halted: {r:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(SPIN_DOWN_IDLE_SECS + 3),
+            "the settle must be halt-aware, not a blind {SPIN_UP_SETTLE_SECS}s \
+             thread::sleep; took {took:?}"
         );
     }
 

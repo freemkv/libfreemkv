@@ -1192,6 +1192,11 @@ mod transport_helper_tests {
         let v = get_config_010c(&mut t).unwrap();
         assert_eq!(v.len(), 28, "header + full 010Ch descriptor");
         assert_eq!(&v[12..24], b"202101311259", "date through the minute");
+        // MMC-6 §6.6: RT=10b (one feature), Starting Feature 010Ch, Allocation Length 28.
+        assert_eq!(
+            t.0,
+            [SCSI_GET_CONFIGURATION, 0x02, 0x01, 0x0C, 0, 0, 0, 0, 28, 0]
+        );
     }
 }
 

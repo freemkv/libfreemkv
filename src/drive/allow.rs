@@ -117,6 +117,9 @@ mod tests {
         assert!(allowed_after_cancel(&EJECT, none, FinishEject));
         assert!(!allowed_after_cancel(&EJECT, locked, Plain));
         assert!(!allowed_after_cancel(&START, none, FinishEject), "LoEj=0");
+        // LoEj=1 with Start=1 loads the tray: not an eject.
+        let load = [0x1B, 0, 0, 0, 0x03, 0];
+        assert!(!allowed_after_cancel(&load, none, FinishEject), "Start=1");
         // Row 3: 0x3F iff that AGID's bit is set.
         assert!(allowed_after_cancel(&release(2), agid2, Plain));
         assert!(!allowed_after_cancel(&release(1), agid2, Plain));

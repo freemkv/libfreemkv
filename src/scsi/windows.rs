@@ -254,8 +254,8 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     drives
 }
 
-/// TEST UNIT READY probe on Windows. No in-library recovery — see the
-/// Linux `disc_presence` doc block for the rationale.
+/// TEST UNIT READY probe on Windows. No in-library recovery: the answer is
+/// classified by [`super::tur_disc_presence`].
 pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
     let mut transport = SptiTransport::open(path)?;
     let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
