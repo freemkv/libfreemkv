@@ -4,9 +4,10 @@
 //! see [`Golden`](crate::test_util::Golden) for the re-bless command.
 
 use super::*;
-use crate::mux::driver::{MuxOptions, MuxSource, mux_with_keys};
+use crate::mux::driver::{MuxOptions, mux_with_keys};
 use crate::mux::parity_tests::{golden, record_run, record_tree};
 use crate::mux::select::{PidFilter, StreamSelection};
+use crate::mux::source::{ScannedTitle, Source};
 use crate::test_util::{CLIP_AUDIO_PIDS, Golden, synthetic_bd_clip};
 
 fn refused<T>(g: &mut Golden, key: &str, r: &Result<T>) -> bool {
@@ -139,17 +140,9 @@ fn mux_cells(g: &mut Golden, fx: &Fx, set: Option<&KeyRing>, dead: Option<(u32, 
             if let Some((a, b)) = dead {
                 src.kill(a, b);
             }
-            MuxSource::Live {
-                reader: Box::new(src),
-                title: title.clone(),
-                format,
-            }
+            Source::from_reader(Box::new(src), ScannedTitle::new(title.clone(), format))
         } else {
-            MuxSource::Iso {
-                path: &iso,
-                title: title.clone(),
-                format,
-            }
+            Source::from_image(&iso, ScannedTitle::new(title.clone(), format))
         };
         let r = mux_with_keys(source, set, &dest, opts, &crate::ctx::Ctx::default());
         record_run(g, tag, &r);

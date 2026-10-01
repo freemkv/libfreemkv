@@ -2,7 +2,7 @@
 //! every sink driven through `mux_with_keys`, over the synthetic BD clip. Pinned as output
 //! hashes, loss counters and refusal codes (see [`Golden`]); cells are `parity_*`.
 
-use super::driver::{MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
+use super::driver::{MuxOptions, MuxOutcome};
 use super::resolve::{InputOptions, input};
 use super::select::{PidFilter, StreamSelection};
 use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
@@ -119,14 +119,17 @@ fn sinks(
             "null" => "null://".to_string(),
             s => format!("{s}://{}", out.join(dest_name(s)).display()),
         };
-        let r = mux_with_keys(
-            MuxSource::Url {
-                url: &url,
-                opts: iopts.clone(),
-            },
-            None,
+        let m = MuxOptions {
+            title_index: iopts.title_index.unwrap_or(0),
+            raw: iopts.raw,
+            selection: iopts.selection.clone(),
+            ..mopts.clone()
+        };
+        let r = crate::mux::mux_url(
+            &url,
+            iopts.keys.as_ref(),
             &dest,
-            mopts,
+            &m,
             &crate::ctx::Ctx::default(),
         );
         record_run(g, sink, &r);
@@ -212,11 +215,8 @@ fn parity_sinks_from_mkv_mpg_and_fmkv_sources() {
     std::fs::write(&src, &clip).unwrap();
     for (scheme, name) in [("mkv", "a.mkv"), ("mpg", "a.mpg"), ("m2ts", "a.fmkv.m2ts")] {
         let p = dir.path().join(name);
-        mux_with_keys(
-            MuxSource::Url {
-                url: &format!("m2ts://{}", src.display()),
-                opts: Default::default(),
-            },
+        crate::mux::mux_url(
+            &format!("m2ts://{}", src.display()),
             None,
             &format!("{scheme}://{}", p.display()),
             &MuxOptions::default(),
@@ -396,11 +396,8 @@ pub(crate) fn clear_mpg() -> Vec<u8> {
     let src = dir.path().join("c.m2ts");
     std::fs::write(&src, &clip).unwrap();
     let dst = dir.path().join("c.mpg");
-    mux_with_keys(
-        MuxSource::Url {
-            url: &format!("m2ts://{}", src.display()),
-            opts: Default::default(),
-        },
+    crate::mux::mux_url(
+        &format!("m2ts://{}", src.display()),
         None,
         &format!("mpg://{}", dst.display()),
         &MuxOptions::default(),

@@ -750,12 +750,8 @@ fn a_dir_url_mux_reports_read_progress_to_the_ctx() {
             }
         }));
     let url = format!("dir://{}", s.path().display());
-    let src = crate::MuxSource::Url {
-        url: &url,
-        opts: crate::InputOptions::default(),
-    };
     // The fixture's TS carries no PES, so the drain refuses as NoStreams after reading it all.
-    let _ = crate::mux_with_keys(src, None, "null://", &crate::MuxOptions::default(), &ctx);
+    let _ = crate::mux_url(&url, None, "null://", &crate::MuxOptions::default(), &ctx);
     assert_eq!(
         read.load(std::sync::atomic::Ordering::Relaxed),
         4096 * 192,

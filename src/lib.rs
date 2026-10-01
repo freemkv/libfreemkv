@@ -254,7 +254,7 @@ pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
 #[cfg(feature = "rip")]
 pub use mux::select::{PidFilter, StreamSelection};
 #[cfg(feature = "rip")]
-pub use mux::{MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
+pub use mux::{MuxOptions, MuxOutcome, ScannedTitle, Source, mux_url, mux_with_keys, open_source};
 pub use scsi::{
     DiscPresence, DriveInfo, ScsiSense, ScsiTransport, SenseFamily, disc_presence, drive_has_disc,
     list_drives,

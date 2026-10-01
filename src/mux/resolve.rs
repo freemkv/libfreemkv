@@ -2,12 +2,8 @@
 //!
 //! Format: `scheme://path`.
 //!
-//! For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy` instead.
-//!
-//! Note: `disc://` cannot be opened through [`input`]; it returns
-//! [`crate::error::Error::DiscUrlNotDirect`]. Live-disc input must go
-//! through `Drive::open()` + `Disc::scan()` + `DiscStream::new()`, not
-//! the URL resolver.
+//! Every input scheme, `disc://` included, opens through [`super::source::open_source`];
+//! [`input`] is that plus the PES stream of one title.
 
 use super::network::NetworkStream;
 use super::null::NullStream;
@@ -381,60 +377,50 @@ impl std::fmt::Debug for InputOptions {
     }
 }
 
-/// Open a PES input stream (produces PES frames) for the run `ctx`. Its halt reaches the
-/// image/PS/TS pipelines' scan, crack, reads and demux and the network receive (`stdio://`,
-/// `mkv://`, `mp4://` read inline); image and PS reads report `BytesRead`; stats count loss.
+/// Open a PES input stream (produces PES frames) for the run `ctx`: [`open_source`] then the
+/// PES stream of `opts.title_index`. Every input scheme opens here, `disc://` included (the
+/// drive is brought up and scanned with default [`crate::disc::ScanOptions`]). Its halt
+/// reaches the scan, crack, reads and demux and the network receive (`stdio://`, `mkv://`,
+/// `mp4://` read inline); image and PS reads report `BytesRead`; stats count loss.
+///
+/// [`open_source`]: super::source::open_source
 pub fn input(
+    url: &str,
+    opts: &InputOptions,
+    ctx: &crate::ctx::Ctx,
+) -> io::Result<Box<dyn crate::pes::Stream>> {
+    let source = super::source::open_source(url, crate::disc::ScanOptions::default(), ctx)?;
+    let mux = super::driver::MuxOptions {
+        raw: opts.raw,
+        selection: opts.selection.clone(),
+        title_index: opts.title_index.unwrap_or(0),
+        ..Default::default()
+    };
+    super::driver::open_pes(source, opts.keys.as_ref(), &mux, ctx)
+}
+
+// A probed image's reader opened again, for the TrueHD header probe.
+pub(crate) fn reopen_image(path: &Path, folder: bool) -> io::Result<Box<dyn SectorSource>> {
+    Ok(if folder {
+        Box::new(crate::dirimage::DirImage::open(path)?)
+    } else {
+        Box::new(crate::io::file_sector_source::FileSectorSource::open(path)?)
+    })
+}
+
+pub(crate) fn validate_path(path: &Path, scheme: &str) -> crate::error::Result<()> {
+    validate_file_path(path, scheme).map_err(crate::error::Error::from)
+}
+
+// The container and stream inputs (`m2ts://`, `mkv://`, `mp4://`, `mpg://`, `network://`,
+// `stdio://`), each through the one decryption stage.
+pub(crate) fn open_stream_url(
     url: &str,
     opts: &InputOptions,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
-        StreamUrl::Disc { .. } => {
-            // Disc sources require live SCSI state — caller must use
-            // `Drive::open() + Disc::scan() + DiscStream::new()` directly.
-            // Typed error only; the CLI/UI explains the entry point.
-            Err(crate::error::Error::DiscUrlNotDirect.into())
-        }
-        StreamUrl::Iso { ref path } => {
-            validate_file_path(path, "iso")?;
-            // Sole file-backed sector source: carries the platform SEQUENTIAL
-            // fadvise hint (widens kernel readahead) plus periodic DONTNEED
-            // eviction bounding memory pressure during same-disk mux output.
-            let reader = crate::io::file_sector_source::FileSectorSource::open(path)?;
-            let probe_path = path.clone();
-            let stream = image_input(
-                reader,
-                opts,
-                move || {
-                    crate::io::file_sector_source::FileSectorSource::open(&probe_path)
-                        .map_err(|e| -> io::Error { e.into() })
-                },
-                false,
-                ctx,
-            )?;
-            Ok(Box::new(stream))
-        }
-        // `dir://` as a SOURCE: an extracted disc folder presented as a
-        // synthetic UDF image (`crate::dirimage`), reaching the exact same
-        // body as `iso://` since `DirImage` is just another `SectorSource`.
-        StreamUrl::Dir { ref path } => {
-            validate_file_path(path, "dir")?;
-            let reader = crate::dirimage::DirImage::open(path)?;
-            let probe_path = path.clone();
-            let stream = image_input(
-                reader,
-                opts,
-                move || {
-                    crate::dirimage::DirImage::open(&probe_path)
-                        .map_err(|e| -> io::Error { e.into() })
-                },
-                true,
-                ctx,
-            )?;
-            Ok(Box::new(stream))
-        }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
             let len = std::fs::metadata(path)?.len();
@@ -489,41 +475,31 @@ pub fn input(
         | StreamUrl::Json { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         // `fvi://` is an output-only sink (per-picture video index); never a source.
         StreamUrl::Fvi { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
+        StreamUrl::Disc { .. } | StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => {
+            Err(crate::error::Error::StreamUrlInvalid {
+                url: url.to_string(),
+            }
+            .into())
+        }
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
     }
 }
 
-// Shared body of every IMAGE-level PES source (`iso://`/`dir://`).
-fn image_input<S, F>(
-    mut reader: S,
+// Shared body of every IMAGE-level PES source (`iso://`/`dir://`) over the probe's reader
+// and layout (`open_source` scanned it, and judged a folder's AACS verdict from content).
+pub(crate) fn image_input_scanned<S, F>(
+    reader: S,
+    mut disc: crate::disc::Disc,
     opts: &InputOptions,
     reopen: F,
-    // A FOLDER's `encrypted` flag comes from tree shape and can be wrong; an
-    // image's cannot. See `session::apply_folder_encryption_verdict`.
-    is_folder: bool,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
     F: FnOnce() -> io::Result<S>,
 {
-    let capacity = reader.capacity_sectors();
-    // BUG-4: the scan and every pipeline stage below observe the run's halt.
-    let scan = crate::disc::ScanOptions {
-        halt: Some(ctx.halt.clone()),
-        ..Default::default()
-    };
-    let mut disc = crate::disc::Disc::scan_image(&mut reader, capacity, &scan)
-        .map_err(|e| -> io::Error { e.into() })?;
-    // Without this a folder reached here with a tree-shape verdict while
-    // `session::scan_dir` reached the opposite one from its CONTENT, so the
-    // same folder ripped through one door and failed through the other.
-    if is_folder {
-        crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)
-            .map_err(|e| -> io::Error { e.into() })?;
-    }
     if let Some(set) = opts.keys.as_ref().filter(|s| s.is_aacs() && !opts.raw) {
         return keyed_image_input(reader, disc, opts, set, reopen, ctx);
     }
@@ -1438,12 +1414,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The resolver doc table marks disc:// as input-only via the
-    /// `Drive::open` path — input("disc://") must surface DiscUrlNotDirect
-    /// (E9009 → Unsupported), never attempt to open a stream.
+    /// `disc://` is an ordinary input: `input()` opens the named drive (a missing device
+    /// fails as the drive open does), never refusing the scheme.
     #[test]
-    fn input_disc_url_is_not_direct() {
-        assert_eq!(input_err_kind("disc://"), std::io::ErrorKind::Unsupported);
+    fn input_disc_url_opens_the_drive() {
+        let err = super::input(
+            "disc:///nonexistent/freemkv-test-drive",
+            &super::InputOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .err()
+        .expect("no such drive");
+        assert_ne!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DISC_URL_NOT_DIRECT),
+            "got {err}"
+        );
     }
 
     /// null:// is write-only per the table — input() must reject it with
@@ -1926,7 +1912,31 @@ mod tests {
 
 #[cfg(test)]
 mod stop_tests {
-    use super::{InputOptions, image_input};
+    use super::{InputOptions, PipelinedPesStream, image_input_scanned};
+
+    // `open_source`'s image probe, then the image stream, over a test reader.
+    fn image_input<S, F>(
+        mut reader: S,
+        opts: &InputOptions,
+        reopen: F,
+        folder: bool,
+        ctx: &crate::ctx::Ctx,
+    ) -> std::io::Result<PipelinedPesStream>
+    where
+        S: SectorSource + Send + 'static,
+        F: FnOnce() -> std::io::Result<S>,
+    {
+        let cap = reader.capacity_sectors();
+        let scan = crate::disc::ScanOptions {
+            halt: Some(ctx.halt.clone()),
+            ..Default::default()
+        };
+        let mut disc = crate::disc::Disc::scan_image(&mut reader, cap, &scan)?;
+        if folder {
+            crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)?;
+        }
+        image_input_scanned(reader, disc, opts, reopen, ctx)
+    }
     use crate::pes::Stream as _;
     use crate::sector::SectorSource;
     use std::sync::mpsc;

@@ -1904,11 +1904,10 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
             measured_cicp: None,
         }));
     let r = crate::mux::mux_with_keys(
-        crate::mux::MuxSource::Live {
-            reader: Box::new(src.clone()),
-            title,
-            format: ContentFormat::BdTs,
-        },
+        crate::mux::Source::from_reader(
+            Box::new(src.clone()),
+            crate::mux::ScannedTitle::new(title, ContentFormat::BdTs),
+        ),
         Some(&set),
         "null://",
         &crate::mux::MuxOptions {

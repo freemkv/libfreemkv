@@ -23,6 +23,7 @@ pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
 pub mod select;
+pub mod source;
 
 // Internal-only modules (referenced only via `crate::mux::…`; not public API).
 // `#[allow(dead_code)]`: narrowing `pub`→`pub(crate)` surfaces helpers only
@@ -84,13 +85,14 @@ pub(crate) mod videomap;
 // The provenance types ARE public: `output()` takes a `SourceInfo` so an `fvi://`
 // destination records the INPUT it was built from (§6.2), not the file written.
 pub use disc::DiscStream;
-pub use driver::{MuxOptions, MuxOutcome, MuxSource, mux_with_keys};
+pub use driver::{MuxOptions, MuxOutcome, mux_url, mux_with_keys};
 pub use fit::{FitReport, SkipReason, fit_report};
 pub use m2ts::M2tsStream;
 pub use mkvstream::{
     MkvProbe, MkvProbeTrack, MkvStream, MkvTrackKind, parse_freemkv_version, probe_mkv,
     probe_mkv_with_cues,
 };
+pub use source::{ScannedTitle, Source, open_source};
 pub use videomap::{Medium, SourceInfo};
 // `Mp4Sink` is public so a caller driving the sink can ask `final_report()` what
 // the finished file contains — the pre-mux `mp4_fit_report` is only a prediction,

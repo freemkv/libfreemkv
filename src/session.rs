@@ -12,7 +12,7 @@ use crate::drive::{Drive, find_drive};
 use crate::error::{Error, Result};
 use crate::halt::{Halt, Liveness};
 use crate::keysource::KeySource;
-use crate::sector::{FileSectorSource, SectorSource};
+use crate::sector::SectorSource;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -522,10 +522,7 @@ impl DiscSession {
 /// carries. The returned reader is a fresh handle at the start of the image,
 /// reusable by callers that need to sample ciphertext or feed a mux.
 pub fn scan_iso(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
-    let mut reader = FileSectorSource::open(path)?;
-    let capacity = reader.capacity_sectors();
-    let disc = Disc::scan_image(&mut reader, capacity, &opts)?;
-    Ok((disc, Box::new(reader)))
+    crate::mux::source::probe_image(path, false, &opts)
 }
 
 // Sampled 6144-byte aligned units when judging whether a folder with `AACS/`
@@ -543,12 +540,7 @@ const AACS_PROBE_UNITS: usize = 8;
 /// * none need decryption → `encrypted` is forced false, reason logged.
 /// * any unit does → [`Error::DirImageEncrypted`] (`dir://` doesn't support it).
 pub fn scan_dir(path: &Path, opts: ScanOptions) -> Result<(Disc, Box<dyn SectorSource>)> {
-    let mut reader = crate::dirimage::DirImage::open(path)?;
-    let capacity = reader.capacity_sectors();
-    let mut disc = Disc::scan_image(&mut reader, capacity, &opts)?;
-
-    apply_folder_encryption_verdict(&mut reader, &mut disc)?;
-    Ok((disc, Box::new(reader)))
+    crate::mux::source::probe_image(path, true, &opts)
 }
 
 // Re-judge a FOLDER's encryption verdict from its CONTENT (tree shape alone can be wrong for an

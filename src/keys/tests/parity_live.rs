@@ -6,8 +6,9 @@ use super::*;
 use crate::dirimage::tests::{minimal_clpi, one_item_mpls};
 use crate::disc::ScanOptions;
 use crate::drive::Drive;
-use crate::mux::driver::{MuxOptions, MuxSource, mux_with_keys};
+use crate::mux::driver::{MuxOptions, mux_with_keys};
 use crate::mux::parity_tests::{golden, record_run, record_tree};
+use crate::mux::source::Source;
 use crate::session::{DiscSession, KeySpec};
 use crate::test_util::{FakeMode, FakeTransport, Golden, synthetic_bd_clip};
 
@@ -79,10 +80,7 @@ fn mux(
     let dir = tempfile::tempdir().unwrap();
     let dest = format!("mkv://{}", dir.path().join("o.mkv").display());
     let r = mux_with_keys(
-        MuxSource::Session {
-            session: s,
-            title_index: 0,
-        },
+        Source::from_session(s),
         set,
         &dest,
         opts,
@@ -231,10 +229,7 @@ fn parity_live_bd_stop_mid_read() {
     armed.store(true, std::sync::atomic::Ordering::Relaxed);
     let dir = tempfile::tempdir().unwrap();
     let r = mux_with_keys(
-        MuxSource::Session {
-            session: &mut s,
-            title_index: 0,
-        },
+        Source::from_session(&mut s),
         Some(&set),
         &format!("mkv://{}", dir.path().join("o.mkv").display()),
         &MuxOptions {
