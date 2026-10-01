@@ -217,7 +217,9 @@ const VTKF_AV_FLG: u8 = 0x80;
 /// An absent slot is SKIPPED (not a terminator): the 1-based slot index IS
 /// the CPS unit number, so `title_cps_unit` is left empty (playlist-owned).
 pub fn parse_vtkf(data: &[u8]) -> Option<UnitKeyFile> {
-    if data.len() < VTKF_HEADER_LEN || &data[..12] != VTKF_MAGIC {
+    // A file cut inside the entry table would silently lose its later slots' keys.
+    if data.len() < VTKF_HEADER_LEN + VTKF_MAX_ENTRIES * VTKF_ENTRY_LEN || &data[..12] != VTKF_MAGIC
+    {
         return None;
     }
     // SHA1 of the WHOLE file — the KEYDB lookup key. BackupHDDVD-family key
@@ -228,9 +230,6 @@ pub fn parse_vtkf(data: &[u8]) -> Option<UnitKeyFile> {
     let mut encrypted_keys = Vec::new();
     for n in 0..VTKF_MAX_ENTRIES {
         let pos = VTKF_HEADER_LEN + n * VTKF_ENTRY_LEN;
-        if pos + VTKF_ENTRY_LEN > data.len() {
-            break;
-        }
         // AV_FLG clear = empty slot: skip it, but keep the slot index as the CPS
         // number (do NOT break — a gap must not renumber the keys that follow).
         if data[pos] & VTKF_AV_FLG == 0 {
@@ -304,6 +303,10 @@ fn read_mkb_pack(
     // Transport errors propagate: swallowing one would return a truncated MKB as Ok.
     let r = session.execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)?;
 
+    // A GOOD status with no header transferred is a drive fault, not an empty MKB.
+    if r.bytes_transferred < 4 {
+        return Err(crate::error::Error::AacsKeyRead);
+    }
     let data_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
     let num_packs = buf[3] as usize;
     if data_len < 2 {
@@ -318,12 +321,17 @@ fn read_mkb_pack(
 
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
 /// Returns the concatenated MKB data from all packs. A short or over-long pack is a
-/// drive fault (`AacsKeyRead`), never a holed MKB; a header-only pack in a multi-pack MKB is `AacsKeyRead`; a single header-only pack is an empty MKB.
+/// drive fault (`AacsKeyRead`), never a holed MKB; a header-only pack in a multi-pack MKB is
+/// `AacsKeyRead`; a single header-only pack is an empty MKB.
 pub fn read_mkb_from_drive(
     session: &mut dyn crate::scsi::ScsiTransport,
 ) -> crate::error::Result<Vec<u8>> {
     let (num_packs, first) = read_mkb_pack(session, 0)?;
     let Some(mut mkb) = first else {
+        // A declared multi-pack MKB whose first pack carries no data is a hole.
+        if num_packs > 1 {
+            return Err(crate::error::Error::AacsKeyRead);
+        }
         return Ok(Vec::new());
     };
     // A header-only pack in a multi-pack MKB is a hole, not an empty MKB.
@@ -453,6 +461,13 @@ mod vtkf_tests {
             "entry 64 at 0x{:x}",
             VTKF_HEADER_LEN + 63 * VTKF_ENTRY_LEN
         );
+    }
+
+    #[test]
+    fn parse_vtkf_rejects_a_file_cut_inside_the_entry_table() {
+        let full = synth_vtkf(&[[0x11u8; 16], [0x22u8; 16]]);
+        let cut = VTKF_HEADER_LEN + 10 * VTKF_ENTRY_LEN;
+        assert!(parse_vtkf(&full[..cut]).is_none());
     }
 
     #[test]
@@ -843,6 +858,42 @@ mod read_mkb_tests {
         );
     }
 
+    /// A header the drive never transferred, or a zero-length first pack of a multi-pack MKB,
+    /// is a drive fault: `AacsKeyRead`, not an empty MKB.
+    #[test]
+    fn read_mkb_from_drive_untransferred_header_and_holed_first_pack_fail() {
+        struct Scripted {
+            xfer: usize,
+            num_packs: u8,
+        }
+        impl ScsiTransport for Scripted {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _direction: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::error::Result<ScsiResult> {
+                data[0..2].copy_from_slice(&0u16.to_be_bytes());
+                data[3] = self.num_packs;
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: self.xfer,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        for (xfer, num_packs) in [(0, 0), (4, 2)] {
+            assert!(
+                matches!(
+                    read_mkb_from_drive(&mut Scripted { xfer, num_packs }),
+                    Err(crate::error::Error::AacsKeyRead)
+                ),
+                "xfer {xfer}, packs {num_packs}"
+            );
+        }
+    }
+
     /// A transport failure on the FIRST pack must propagate as an error — the
     /// MKB is the root of the whole AACS ladder, so an unreadable one cannot be
     /// downgraded to "an MKB with no records".
@@ -967,6 +1018,28 @@ mod unit_key_ro_tests {
         assert!(
             parse_unit_key_ro(&data, AacsVersion::V10).is_none(),
             "a key-storage offset past the buffer must not be indexed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod content_cert_tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_cert_reads_cc_id_from_bytes_14_to_20() {
+        let mut data = vec![0u8; 20];
+        data[1] = 0x80;
+        for (i, b) in data[14..20].iter_mut().enumerate() {
+            *b = 0xA0 + i as u8;
+        }
+        data[13] = 0xEE;
+        let cert = parse_content_cert(&data).expect("20-byte cert parses");
+        assert_eq!(cert.cc_id, [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5]);
+        assert!(cert.bus_encryption);
+        assert!(
+            parse_content_cert(&data[..19]).is_none(),
+            "19 bytes is short"
         );
     }
 }
