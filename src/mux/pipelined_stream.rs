@@ -1,7 +1,7 @@
 //! `PipelinedPesStream` — the read-side of the freemkv mux highway.
 //!
 //! Given a [`crate::mux::demux_thread::DemuxThread`] and a set of codec
-//! parsers, this struct implements [`crate::pes::Stream`] by running codec
+//! parsers, this struct implements [`crate::pes::PesSource`] by running codec
 //! parse on the caller's thread and emitting `PesFrame`s one at a time.
 //!
 //! ```text

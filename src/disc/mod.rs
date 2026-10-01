@@ -1697,7 +1697,7 @@ pub struct DriveCredentials {
 /// Options for disc scanning.
 ///
 /// libfreemkv is lookup-free — it resolves no keys. The caller resolves a key
-/// out-of-band through [`KeyRing::resolve`](crate::keys::KeyRing::resolve). The
+/// out-of-band through [`KeyRing::acquire`](crate::keys::KeyRing::acquire). The
 /// only scan input is the optional drive credentials for the live-drive
 /// authenticated handshake.
 #[derive(Default)]

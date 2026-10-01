@@ -1,6 +1,6 @@
 //! `fvi://` sink — freemkv's own native video-index output.
 //!
-//! A write-only [`crate::pes::Stream`] that emits one machine-readable
+//! A [`crate::pes::PesSink`] that emits one machine-readable
 //! *video-index* record per coded picture of the title's primary video
 //! track, instead of muxing frames into a container.
 //!

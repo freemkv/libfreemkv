@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// calls it once and keeps nothing; it stays `Send + Sync` without requiring
 /// `KeySource: Send`.
 ///
-/// [`KeyRing::resolve`]: crate::keys::KeyRing::resolve
+/// [`KeyRing::resolve`]: crate::keys::KeyRing::acquire
 pub type KeySourceFactory = Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>;
 
 /// Which optical device a [`DiscSession`] should open.
@@ -147,7 +147,7 @@ impl DiscSession {
     /// [`Self::open`] under the caller's op token (stop design §2.2): the drive checks
     /// `halt` on every CDB, a Stop during the bring-up ends it `Halted` (the handle is
     /// closed), and the session keeps the token for [`Self::scan_with`] and
-    /// [`Self::resolve_key_set`].
+    /// [`Self::acquire_keys`].
     pub fn open_with(target: DeviceTarget, spec: KeySpec, halt: &Halt) -> Result<DiscSession> {
         let drive = match target {
             DeviceTarget::Path(ref path) => Drive::open_with(path, halt)?,
@@ -233,7 +233,7 @@ impl DiscSession {
     }
 
     /// Report the op's forward progress to `p` (T29): every drive CDB (as
-    /// [`Drive::attach_progress`]) and every key-source call in [`Self::resolve_key_set`].
+    /// [`Drive::attach_progress`]) and every key-source call in [`Self::acquire_keys`].
     pub fn attach_progress(&mut self, p: &Liveness) {
         if let Some(drive) = self.drive.as_mut() {
             drive.attach_progress(p);
@@ -435,7 +435,7 @@ impl DiscSession {
 
     /// Stage the owned drive as the session's boxed sector source so a live
     /// single-pass mux can drive it through
-    /// [`MuxSource::Session`](crate::mux::MuxSource::Session). Moves the `Drive`
+    /// [`Source::from_session`](crate::mux::Source::from_session). Moves the `Drive`
     /// (itself a [`SectorSource`]) into the `reader` slot; the cached
     /// [`Self::device_path`] keeps the device name available afterward. A no-op
     /// if the drive was already staged or moved out.
@@ -463,7 +463,7 @@ impl DiscSession {
 
     /// Take the staged sector source out of the session by mutable borrow,
     /// leaving `None` behind. Used by [`crate::mux::mux_with_keys`]'s
-    /// [`MuxSource::Session`](crate::mux::MuxSource::Session) arm, which drives
+    /// [`Source::from_session`](crate::mux::Source::from_session) arm, which drives
     /// the mux from `&mut DiscSession` and so cannot consume the whole session.
     /// A second call (or a call before the reader is staged) returns `None`, and
     /// the driver maps that to a clean error rather than a panic (see Q2 of the
@@ -517,7 +517,7 @@ impl DiscSession {
 /// [`Disc`] together with a reusable [`SectorSource`] over the same file.
 ///
 /// This is the file-backed counterpart to [`DiscSession::scan`]: it opens a
-/// [`FileSectorSource`], reads its capacity, and runs [`Disc::scan_image`].
+/// [`crate::sector::FileSectorSource`], reads its capacity, and runs [`Disc::scan_image`].
 /// No SCSI, no handshake, no key resolution beyond what `opts` already
 /// carries. The returned reader is a fresh handle at the start of the image,
 /// reusable by callers that need to sample ciphertext or feed a mux.

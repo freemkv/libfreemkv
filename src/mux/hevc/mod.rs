@@ -1,107 +1,9 @@
-//! HEVC (H.265) elementary stream muxer — Annex B byte stream.
-//!
-//! Consumes [`PesFrame`](crate::pes::PesFrame)s for a single video track and writes them as a
-//! raw `.hevc` / `.h265` Annex B byte stream with no container framing.
-//!
-//! Sequential-only — no Cues, no backpatch. Target sink is any
-//! [`SequentialSink`](crate::io::sink::SequentialSink): file, socket,
-//! pipe, anything `Write + Send`.
-
-use std::io::{self, Write};
+//! H.264 / HEVC parameter-set helpers: decoder configuration records (`avcC` / `hvcC`) and
+//! length-prefixed NAL units as an Annex B byte stream, for the elementary-stream sinks and
+//! the TS muxer.
 
 /// Annex B 4-byte start code.
 pub(crate) const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
-
-/// HEVC NAL unit type bits live in `(byte0 >> 1) & 0x3F` in Annex B.
-/// We don't filter NAL types here — the muxer is format-only — but we
-/// keep the constant as documentation of the field layout.
-#[allow(dead_code)]
-const HEVC_NAL_TYPE_MASK: u8 = 0x3F;
-
-/// Streaming HEVC Annex B muxer.
-///
-/// One instance per output stream. Tracks whether parameter sets have
-/// already been emitted so they're written exactly once at the head of
-/// the stream, per the Annex B convention of ITU-T H.265 / ISO/IEC
-/// 23008-2 (parameter sets precede the coded slices they govern).
-pub struct HevcMux<W: Write> {
-    writer: W,
-    /// `HEVCDecoderConfigurationRecord` payload (hvcC). Parsed lazily
-    /// on the first `write_frame` so callers can set it after
-    /// construction but before the first frame.
-    codec_private: Option<Vec<u8>>,
-    /// Set once VPS/SPS/PPS have been written to the stream. Subsequent
-    /// frames write only their own NAL units.
-    params_written: bool,
-}
-
-impl<W: Write> HevcMux<W> {
-    /// Construct over `writer`. The muxer does not impose any extra
-    /// buffering of its own — the sink owns its write buffering policy
-    /// (see [`LocalFileSink`](crate::io::sink::LocalFileSink) and
-    /// [`SocketSink`](crate::io::sink::SocketSink)).
-    pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            codec_private: None,
-            params_written: false,
-        }
-    }
-
-    /// Provide the `HEVCDecoderConfigurationRecord` (hvcC) so the muxer
-    /// can prepend VPS/SPS/PPS Annex B NALs at stream start. Optional —
-    /// if the PES frames already carry inline parameter sets (some
-    /// upstream demuxers do this), skipping this call is fine.
-    pub fn set_codec_private(&mut self, data: Vec<u8>) {
-        self.codec_private = Some(data);
-    }
-
-    /// Write one PES frame (= one access unit) as Annex B NAL units.
-    ///
-    /// Input may be either length-prefixed (`[u32-BE len][NAL bytes]` repeated, the form
-    /// libfreemkv's HEVC parser emits) — converted to Annex B — or already Annex B (a buffer
-    /// beginning with a start code), passed through unchanged.
-    ///
-    /// `_pts_ns` is accepted for symmetry with other muxers but ignored
-    /// — Annex B has no timing layer.
-    pub fn write_frame(&mut self, _pts_ns: i64, data: &[u8]) -> io::Result<()> {
-        if !self.params_written {
-            // Mark written *before* the write: on a write error, a later
-            // re-entry must not re-emit VPS/SPS/PPS on top of bytes the sink
-            // already received. Callers discard the mux on any write error.
-            self.params_written = true;
-            if let Some(cp) = &self.codec_private {
-                match hvcc_to_annex_b(cp) {
-                    Some(params) => self.writer.write_all(&params)?,
-                    // A non-empty hvcC yielding no NAL is a caller contract
-                    // violation: emitting without VPS/SPS/PPS is undecodable.
-                    None if !cp.is_empty() => {
-                        return Err(crate::error::Error::HevcParamParse.into());
-                    }
-                    None => {}
-                }
-            }
-        }
-        // The hvcC declares the NAL length-prefix width (ISO/IEC 14496-15
-        // §8.3.3.1.2 `lengthSizeMinusOne + 1`). Assuming 4 for a source that
-        // declares 1 or 2 emits the raw prefixed bytes with no start codes.
-        let length_size = nal_length_size(crate::disc::Codec::Hevc, self.codec_private.as_deref());
-        let annex_b = if starts_with_start_code(data) {
-            data.to_vec()
-        } else {
-            let mut out = Vec::with_capacity(data.len() + (data.len() / 32));
-            append_length_prefixed_as_annex_b_sized(&mut out, data, length_size);
-            out
-        };
-        self.writer.write_all(&annex_b)
-    }
-
-    /// Flush the underlying writer. No trailer NAL is needed — an Annex
-    /// B stream ends whenever the file/socket ends.
-    pub fn finish(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
 
 // Convert a HEVCDecoderConfigurationRecord (hvcC) into Annex B NAL units. Single source of
 // truth for hvcC -> Annex B across all muxers (HEVC ES, BD-TS, standard MPEG-TS) — do not
@@ -164,6 +66,7 @@ fn hvcc_parse(hvcc: &[u8]) -> (Option<Vec<u8>>, bool) {
 // Convert length-prefixed NALs ([u32-BE len][NAL] repeated) to Annex B; already-Annex-B input
 // passes through unchanged. Truncation policy (shared across muxers): drop truncated trailing
 // NAL.
+#[cfg(test)]
 pub(crate) fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
     // Probe for a leading Annex B start code before attempting to parse
     // length prefixes: `00 00 00 01` would otherwise parse as length 1.
@@ -197,6 +100,7 @@ pub(crate) fn nal_length_size(codec: crate::disc::Codec, record: Option<&[u8]>) 
 // Annex B form of length-prefixed `data`, written into caller-owned `out` to avoid an
 // allocation on hot per-frame paths. Non-length-prefixed input is appended unchanged (assumed
 // already Annex B).
+#[cfg(test)]
 pub(crate) fn append_length_prefixed_as_annex_b(out: &mut Vec<u8>, data: &[u8]) {
     append_length_prefixed_as_annex_b_sized(out, data, DEFAULT_NAL_LENGTH_SIZE);
 }
@@ -252,6 +156,7 @@ pub(crate) fn append_length_prefixed_as_annex_b_sized(
 
 /// Whether `data` begins with a 4-byte (`00 00 00 01`) or 3-byte
 /// (`00 00 01`) Annex B start code.
+#[cfg(test)]
 fn starts_with_start_code(data: &[u8]) -> bool {
     data.starts_with(&START_CODE) || data.starts_with(&[0x00, 0x00, 0x01])
 }
@@ -435,17 +340,6 @@ mod tests {
         let annex_b = hvcc_to_annex_b(&hvcc).expect("one valid NAL");
         let want = [0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01];
         assert_eq!(&annex_b[..], &want[..]);
-    }
-
-    #[test]
-    fn write_frame_errors_on_unparseable_non_empty_hvcc() {
-        // A non-empty hvcC that yields no NAL must surface an error
-        // instead of silently producing a parameter-set-less stream.
-        let mut sink: Vec<u8> = Vec::new();
-        let mut mux = HevcMux::new(&mut sink);
-        mux.set_codec_private(vec![0xDE, 0xAD]); // too short to be valid hvcC
-        let err = mux.write_frame(0, &[]).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -742,151 +636,6 @@ mod tests {
         assert!(!starts_with_start_code(&[0x00, 0x00, 0x02, 0x42]));
         assert!(!starts_with_start_code(&[0x42, 0x00, 0x00, 0x01]));
         assert!(!starts_with_start_code(&[]));
-    }
-
-    // --- HevcMux: params-once + error semantics ---
-
-    #[test]
-    fn mux_empty_codec_private_emits_no_params() {
-        // An EMPTY (not absent) hvcC: hvcc_to_annex_b returns None, but cp is
-        // empty so it's NOT a contract violation → no error, just no params.
-        let mut sink: Vec<u8> = Vec::new();
-        let mut mux = HevcMux::new(&mut sink);
-        mux.set_codec_private(Vec::new());
-        let mut frame = 2u32.to_be_bytes().to_vec();
-        frame.extend_from_slice(&[0xAA, 0xBB]);
-        mux.write_frame(0, &frame).unwrap();
-        mux.finish().unwrap();
-        // Only the frame NAL, no parameter sets.
-        let mut want = START_CODE.to_vec();
-        want.extend_from_slice(&[0xAA, 0xBB]);
-        assert_eq!(sink, want);
-    }
-
-    #[test]
-    fn mux_no_codec_private_writes_frames_only() {
-        // No hvcC set at all: frames pass through, no params, no error.
-        let mut sink: Vec<u8> = Vec::new();
-        let mut mux = HevcMux::new(&mut sink);
-        let mut frame = 2u32.to_be_bytes().to_vec();
-        frame.extend_from_slice(&[0xAA, 0xBB]);
-        mux.write_frame(0, &frame).unwrap();
-        let mut want = START_CODE.to_vec();
-        want.extend_from_slice(&[0xAA, 0xBB]);
-        assert_eq!(sink, want);
-    }
-
-    #[test]
-    fn mux_params_not_re_emitted_after_unparseable_error() {
-        // params_written is set BEFORE the write, so after an error on the first
-        // frame, a retry must NOT re-emit params (the comment's invariant).
-        let mut sink: Vec<u8> = Vec::new();
-        let mut mux = HevcMux::new(&mut sink);
-        mux.set_codec_private(vec![0xDE, 0xAD]); // unparseable, non-empty → error
-        assert!(mux.write_frame(0, &[]).is_err(), "first frame errors");
-        // A second frame must not retry the (already-marked) params.
-        let mut frame = 2u32.to_be_bytes().to_vec();
-        frame.extend_from_slice(&[0xAA, 0xBB]);
-        mux.write_frame(0, &frame).unwrap();
-        // Sink holds only the frame NAL — no parameter bytes, no duplication.
-        let mut want = START_CODE.to_vec();
-        want.extend_from_slice(&[0xAA, 0xBB]);
-        assert_eq!(sink, want, "params not re-emitted after the error");
-    }
-
-    #[test]
-    fn mux_annex_b_frame_passes_through() {
-        // A frame already in Annex B (leading start code) is written verbatim,
-        // not re-framed as length-prefixed.
-        let mut sink: Vec<u8> = Vec::new();
-        let mut mux = HevcMux::new(&mut sink);
-        let frame = [0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xDE];
-        mux.write_frame(0, &frame).unwrap();
-        assert_eq!(sink, frame);
-    }
-
-    #[test]
-    fn mux_writes_params_then_frames() {
-        // Build hvcC with one SPS to verify params-once semantics.
-        let mut hvcc = vec![0u8; 22];
-        hvcc.push(1);
-        hvcc.push(33);
-        hvcc.extend_from_slice(&1u16.to_be_bytes());
-        hvcc.extend_from_slice(&3u16.to_be_bytes());
-        hvcc.extend_from_slice(&[0x42, 0x01, 0x01]);
-
-        let mut frame_data = Vec::new();
-        frame_data.extend_from_slice(&2u32.to_be_bytes());
-        frame_data.extend_from_slice(&[0xAA, 0xBB]);
-
-        let mut sink: Vec<u8> = Vec::new();
-        let mut mux = HevcMux::new(&mut sink);
-        mux.set_codec_private(hvcc);
-        mux.write_frame(0, &frame_data).unwrap();
-        // Second frame — no SPS re-emission.
-        mux.write_frame(40_000_000, &frame_data).unwrap();
-        mux.finish().unwrap();
-
-        // SPS NAL (7 bytes) + 2× frame NAL (6 bytes) = 19 bytes.
-        assert_eq!(sink.len(), 7 + 6 + 6);
-        // Start codes at offsets 0 (SPS), 7 (frame1), 13 (frame2).
-        assert_eq!(&sink[0..4], &START_CODE);
-        assert_eq!(&sink[7..11], &START_CODE);
-        assert_eq!(&sink[13..17], &START_CODE);
-        assert_eq!(sink[4], 0x42);
-        assert_eq!(sink[11], 0xAA);
-        assert_eq!(sink[17], 0xAA);
-    }
-
-    // A sink that records only what actually reaches it, so "was flush called"
-    // is MEASURED rather than assumed. Its own `flush` is a no-op — the
-    // intermediate `BufWriter` must be told to hand its bytes over.
-    #[derive(Clone, Default)]
-    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl SharedSink {
-        fn bytes(&self) -> Vec<u8> {
-            self.0.lock().unwrap().clone()
-        }
-    }
-
-    impl Write for SharedSink {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    // `finish()` is the ONLY thing that pushes a buffered sink's tail to the
-    // file: a `finish` that skipped the flush truncates every `.hevc` output
-    // by up to a whole sink buffer, producing a file with a missing last GOP.
-    #[test]
-    fn finish_flushes_the_buffered_sink_or_the_stream_tail_is_lost() {
-        let sink = SharedSink::default();
-        let mut mux = HevcMux::new(io::BufWriter::new(sink.clone()));
-        // One length-prefixed NAL: [len:u32-BE][NAL bytes] → Annex B.
-        let nal = [0x26u8, 0x01, 0xAA, 0xBB]; // (0x26 >> 1) = 19 = IDR_W_RADL
-        let mut frame = (nal.len() as u32).to_be_bytes().to_vec();
-        frame.extend_from_slice(&nal);
-        mux.write_frame(0, &frame).unwrap();
-
-        assert!(
-            sink.bytes().is_empty(),
-            "the fixture must actually buffer, or this test proves nothing"
-        );
-
-        mux.finish().unwrap();
-
-        let out = sink.bytes();
-        let mut expected = START_CODE.to_vec();
-        expected.extend_from_slice(&nal);
-        assert_eq!(
-            out, expected,
-            "finish must deliver the whole Annex B stream to the sink"
-        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! `mpg://`: an ISO/IEC 13818-1 program stream written from the PES IR (mpg-output-design
-//! v5 §2, L2), one more `pes::Stream` sink.
+//! v5 §2, L2), one more `PesSink`.
 //!
 //! The pack layer is regenerated: packs, SCR, mux rate, system header, PSM, PES headers
 //! and DTS. ES bytes are kept (DVD LPCM is re-packed losslessly, G8); PTS is kept exactly,

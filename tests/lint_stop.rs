@@ -591,11 +591,8 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
     ("src/mpls.rs", r#"allow(dead_code)"#, 2),
     ("src/mux/demux_sink.rs", r#"allow(dead_code)"#, 2),
     ("src/mux/demux_thread.rs", r#"allow(dead_code)"#, 1),
-    ("src/mux/fmp4/mod.rs", r#"allow(dead_code)"#, 1),
-    ("src/mux/hevc/mod.rs", r#"allow(dead_code)"#, 1),
-    ("src/mux/m2ts_mux/mod.rs", r#"allow(dead_code)"#, 1),
     ("src/mux/mkv.rs", r#"allow(clippy::too_many_arguments)"#, 3),
-    ("src/mux/mod.rs", r#"allow(dead_code)"#, 6),
+    ("src/mux/mod.rs", r#"allow(dead_code)"#, 3),
     ("src/mux/pipelined_stream.rs", r#"allow(dead_code)"#, 1),
     (
         "src/mux/resolve.rs",

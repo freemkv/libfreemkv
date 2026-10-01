@@ -32,6 +32,7 @@ pub(crate) fn is_video_pid(pid: u16) -> bool {
 
 // Headroom below the first frame's PTS for frames presented before it but emitted
 // after it. ISO/IEC 13818-1 §2.4.2.6 caps T-STD buffer delay at 1 s.
+#[cfg(test)]
 pub(crate) const ORIGIN_HEADROOM_NS: i64 = 1_000_000_000;
 // The same headroom in 90 kHz ticks: 1 s is exactly 90 000 ticks.
 const ORIGIN_HEADROOM_TICKS: i64 = 90_000;
@@ -88,7 +89,7 @@ pub struct TsMuxer<W: Write> {
     video_codec: Vec<Codec>,
     /// Global PTS origin in integer 90 kHz ticks, seeded by the FIRST frame of any
     /// kind (video or audio) so a single fixed origin rebases every frame and the
-    /// audio/video offset is preserved. It lies [`ORIGIN_HEADROOM_NS`] (90 000 ticks)
+    /// audio/video offset is preserved. It lies `ORIGIN_HEADROOM_TICKS` (1 s, 90 000 ticks)
     /// before the seeding frame's tick; only a frame earlier than that saturates to 0.
     origin_ticks: Option<i64>,
     /// Count of PES frames actually emitted (a frame dropped as non-key

@@ -1,9 +1,6 @@
-//! Stream-based I/O pipeline. Two muxer families live here:
-//!
-//! 1. **Bidirectional PES streams** (`disc`, `mkv`, `m2ts`, `network`, `stdio`, `null`) implement the [`crate::pes::Stream`] interface: read a format → PES frames, or write PES frames → a format.
-//! 2. **Write-only sequential-sink muxers** (`fmp4`, `hevc`, `m2ts_mux`) consume PES frames and write a container to a `SequentialSink`; they do not implement the read loop below.
-//!
-//! The bidirectional family is driven like this:
+//! The PES half of the pipeline: inputs implement [`crate::pes::PesSource`] (read a format →
+//! PES frames), outputs [`crate::pes::PesSink`] (write PES frames → a format). Every input
+//! scheme opens through [`open_source`] / [`input`], every output through [`output`].
 //!
 //! ```text
 //! let mut input = input("iso://Disc.iso", &opts)?;
@@ -15,7 +12,7 @@
 //! output.finish()?;
 //! ```
 //!
-//! For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy` instead.
+//! A whole-disc copy (`iso://`, `dir://`) is a block chain: see [`crate::io::open_block_sink`].
 
 // Public modules — types here are intentionally part of the consumable API.
 pub mod driver;
@@ -51,16 +48,8 @@ pub(crate) mod m2ts;
 pub mod meta;
 pub(crate) mod meta_sink;
 
-// ── Sequential-sink muxers ── write-only PES → `SequentialSink`. `pub(crate)`+
-// `allow(dead_code)`: `fmp4` is a STUB (pub would lock a half-built type into
-// v1.0); `m2ts_mux`/`hevc` are sink-split scaffolding (production: `tsmux`/`mkv`).
 pub(crate) mod fit;
-#[allow(dead_code)]
-pub(crate) mod fmp4;
-#[allow(dead_code)]
 pub(crate) mod hevc;
-#[allow(dead_code)]
-pub(crate) mod m2ts_mux;
 pub(crate) mod mkv;
 pub(crate) mod mkvstream;
 pub(crate) mod mp4;

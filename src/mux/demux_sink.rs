@@ -2,7 +2,7 @@
 //! stream file (per-codec ES, PGS `.sup`, VobSub `.idx`/`.sub`, LPCM raw PCM),
 //! plus a chapters file and per-audio-track delay metadata.
 //!
-//! This is a write-only [`crate::pes::Stream`] that routes each frame's payload to the file for
+//! This is a write-only [`crate::pes::PesSink`] that routes each frame's payload to the file for
 //! `frame.track`, post-processing where the codec's internal `Frame` form differs from the
 //! on-disk ES form (HEVC/H.264 Annex-B, PGS `.sup`, VobSub `.idx`).
 

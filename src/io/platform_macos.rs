@@ -3,8 +3,7 @@
 //! The `libc` crate doesn't expose these symbols across all macOS SDK versions, so we define
 //! them locally with values from `/usr/include/sys/fcntl.h`.
 //!
-//! [`crate::io::writeback_file`] and `crate::io::sink::preallocate`
-//! both depend on these constants and the `fstore_t` layout.
+//! [`crate::io::writeback_file`] depends on these constants and the `fstore_t` layout.
 
 /// `fcntl(F_PREALLOCATE)` command number from `sys/fcntl.h`.
 pub(crate) const F_PREALLOCATE: libc::c_int = 42;

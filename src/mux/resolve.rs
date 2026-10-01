@@ -759,11 +759,11 @@ pub(crate) fn output_with(
         StreamUrl::Stdio => Ok(Box::new(StdioStream::output(title))),
         StreamUrl::Null => Ok(Box::new(NullStream::new(title))),
         StreamUrl::Disc { .. } => Err(crate::error::Error::StreamReadOnly.into()),
-        StreamUrl::Iso { .. } => Err(crate::error::Error::StreamReadOnly.into()),
-        // `dir://` is NOT a PES sink — it writes raw decrypted files, not
-        // muxed frames. A stray `dir://` here fails loudly, like `iso://`.
-        // The CLI routes a `dir://` dest to `Disc::extract_tree` first.
-        StreamUrl::Dir { .. } => Err(crate::error::Error::StreamReadOnly.into()),
+        // `iso://` and `dir://` are block outputs, not PES sinks: a whole-disc copy writes
+        // them (`crate::io::open_block_sink`, `Disc::extract_tree`).
+        StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => {
+            Err(crate::error::Error::StreamReadOnly.into())
+        }
         // `demux://` with default options. The CLI constructs `DemuxSink`
         // directly (with parsed flags) before reaching here; this arm
         // covers the bare `output()` call with the default option set.
@@ -1019,8 +1019,8 @@ fn iso_pipeline_tail(
     // undetectable by the tile check. Fall back to timestamps if mismatched.
     let feed_matches_spans = extents == full_extents;
     // The mux does not tally decrypt-quality misses (`lost_bytes()` is read-loss
-    // only); a missing key is an up-front resolve failure. Wrong-substream fix
-    // below: re-route declared AC-3 audio onto correct `0x8x` sub-streams.
+    // only); a missing key is an up-front resolve failure. The DVD AC-3 probe below is
+    // diagnostics only (routing is the scanner's PGC AST_CTL map).
     let mut title = title;
     if !feed_matches_spans {
         tracing::info!(
@@ -1477,11 +1477,7 @@ mod tests {
         )
         .err()
         .expect("no such drive");
-        assert_ne!(
-            crate::error::error_code(&err),
-            Some(crate::error::E_DISC_URL_NOT_DIRECT),
-            "got {err}"
-        );
+        assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "got {err}");
     }
 
     /// null:// is write-only per the table — input() must reject it with
