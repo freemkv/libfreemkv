@@ -1660,6 +1660,8 @@ mod tests {
     // same outcome as one in the pump: `completed = false, halted = true`, never an error.
     #[test]
     fn a_stop_during_the_open_is_a_halted_outcome_not_an_error() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let ctx = Ctx::default();
         ctx.halt.cancel();
         let title = DiscTitle {
@@ -2008,6 +2010,8 @@ mod tests {
     // `ok_or_else(|| Error::DeviceNotReady …)` against `.unwrap()` regression.
     #[test]
     fn mux_session_missing_reader_is_clean_error_not_panic() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         use crate::disc::Extent;
         use crate::session::DiscSession;
 
@@ -2075,6 +2079,8 @@ mod tests {
     // on the out-of-range `titles.get(idx)`.
     #[test]
     fn mux_session_out_of_range_title_is_clean_error_not_panic() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         use crate::disc::Extent;
         use crate::session::DiscSession;
 
@@ -3116,6 +3122,8 @@ mod tests {
     /// resolution in the driver.
     #[test]
     fn mux_with_keys_live_decrypts_through_the_set() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let (reader, title, set) = keyed_live([0x5A; 16]);
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("live.mkv");
@@ -3140,6 +3148,8 @@ mod tests {
     /// `MuxSource::Session` decrypts with the set: the disc holds no key.
     #[test]
     fn mux_with_keys_session_uses_the_set() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let key = [0x5A; 16];
         let (reader, title, _) = keyed_live(key);
         let mut disc = aacs_session_disc(title);
@@ -3161,6 +3171,8 @@ mod tests {
     /// session muxes instead of failing DeviceNotReady.
     #[test]
     fn mux_with_keys_session_keeps_its_reader_when_the_selection_is_refused() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let key = [0x5A; 16];
         let (reader, title, _) = keyed_live(key);
         let mut disc = aacs_session_disc(title);
@@ -3190,6 +3202,8 @@ mod tests {
     /// A key set for another disc is a typed E7013 on a session, never a debug-build panic.
     #[test]
     fn mux_with_keys_session_wrong_disc_set_is_e7013() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let key = [0x5A; 16];
         let (reader, title, _) = keyed_live(key);
         let mut other = aacs_session_disc(title.clone());
@@ -3744,6 +3758,8 @@ mod tests {
     // skip_errors reaches the live Read stage on every arm that builds one.
     #[test]
     fn skip_errors_reaches_every_live_arm() {
+        // A live mux spawns the prefetch producer, a Drive holder.
+        let _serial = crate::sector::prefetched::holder_test_lock();
         let session = |bad| {
             let mut disc = aacs_session_disc(clear_title(2));
             disc.aacs = None;

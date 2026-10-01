@@ -213,14 +213,13 @@ pub use disc::{
 pub use keysource::{DiscInputs, KeySource, read_encrypted_units};
 
 // ─── Streams ────────────────────────────────────────────────────────────────
-// All types implement `pes::Stream` (re-exported `PesStream` to avoid colliding
-// with `disc::Stream`). Prefer `input()`/`output()` URL resolvers over direct construction.
+// Inputs implement `PesSource`, outputs `PesSink`. Prefer `input()`/`output()` URL
+// resolvers over direct construction.
 #[cfg(feature = "rip")]
 pub use pes::PesFrame;
 #[cfg(feature = "rip")]
 pub use pes::{PesSink, PesSource};
 
-#[cfg(feature = "rip")]
 #[cfg(feature = "rip")]
 pub use mux::M2tsStream;
 #[cfg(feature = "rip")]
