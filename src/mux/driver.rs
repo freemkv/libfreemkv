@@ -65,7 +65,7 @@ pub(crate) const HEADER_BUFFER_CAP_BYTES: usize = 512 * 1024 * 1024;
 #[derive(Default, Clone)]
 pub struct MuxOptions {
     /// Skip past read errors (zero-fill + continue) on the live-drive path
-    /// instead of aborting. Wired onto `DiscStream::skip_errors`.
+    /// instead of aborting. Applied by the live drive's Read policy.
     pub skip_errors: bool,
     /// Read batch size in logical (2048-byte) sectors.
     pub batch_sectors: u16,
@@ -359,8 +359,8 @@ fn session_pes(
     }
 }
 
-// The inline live-drive `DiscStream` with no AACS set: `keys` (CSS cracks per title when
-// `None` on a DVD), or ciphertext under `opts.raw`.
+// A live drive's title with no AACS set: `keys` (CSS cracks per title when `None` on a
+// DVD), or ciphertext under `opts.raw`, read under the drive's Read policy.
 fn live_unkeyed(
     reader: Box<dyn SectorSource>,
     title: DiscTitle,
@@ -369,20 +369,24 @@ fn live_unkeyed(
     opts: &MuxOptions,
     ctx: &Ctx,
 ) -> std::io::Result<Box<dyn PesSource>> {
-    let mut stream = crate::mux::DiscStream::new(
+    let keys = if opts.raw { DecryptKeys::None } else { keys };
+    Ok(Box::new(super::resolve::build_sector_pipeline(
         reader,
         title,
         keys,
-        opts.batch_sectors,
+        live_policy(opts),
         format,
         opts.raw,
         ctx,
-    )?;
-    if opts.raw {
-        stream.set_raw();
+    )?))
+}
+
+// A live drive's Read policy: adaptive batches from `opts.batch_sectors`, then skip or fail.
+fn live_policy(opts: &MuxOptions) -> crate::sector::read_stage::ReadPolicy {
+    crate::sector::read_stage::ReadPolicy::Live {
+        batch: opts.batch_sectors,
+        skip_errors: opts.skip_errors,
     }
-    stream.skip_errors = opts.skip_errors;
-    Ok(Box::new(stream))
 }
 
 // The live title after the selection, once the set's gate admits it over `reader`.
@@ -404,35 +408,27 @@ fn live_keyed_title(
     Ok(title)
 }
 
-// The inline live-drive `DiscStream` over the set (`title` from `live_keyed_title`): its
-// keys, map and on-arrival proof.
+// A live drive's title over the set (`title` from `live_keyed_title`): its keys, map and
+// on-arrival proof, read under the drive's Read policy.
 fn live_keyed(
     reader: Box<dyn SectorSource>,
     title: DiscTitle,
-    format: crate::disc::ContentFormat,
+    _format: crate::disc::ContentFormat,
     set: &crate::keys::KeyRing,
     opts: &MuxOptions,
     ctx: &Ctx,
 ) -> std::io::Result<Box<dyn PesSource>> {
-    let stream = crate::mux::DiscStream::new(
+    Ok(Box::new(super::resolve::build_keyed_pipeline(
         reader,
         title,
-        set.decrypt_keys(),
-        opts.batch_sectors,
-        format,
-        false,
+        set,
+        live_policy(opts),
         ctx,
-    )?;
-    let mut stream = crate::keys::install_key_map(stream, set.key_map());
-    if let Some(a) = set.arrival(set.title_stop()) {
-        stream = stream.with_arrival(a);
-    }
-    stream.skip_errors = opts.skip_errors;
-    Ok(Box::new(stream))
+    )?))
 }
 
 // Decrypt keys for the live `Session` mux of `disc`. A DVD is handed `DecryptKeys::None` so
-// `DiscStream::new` cracks the CORRECT per-title CSS key rather than the whole-disc
+// the title's pipeline cracks the CORRECT per-title CSS key rather than the whole-disc
 // (largest-title) VTS key.
 fn session_mux_keys(disc: &crate::disc::Disc) -> DecryptKeys {
     if matches!(disc.format, crate::disc::DiscFormat::Dvd) {
@@ -1950,7 +1946,7 @@ mod tests {
             let bytes = count as usize * 2048;
             buf[..bytes].fill(0);
             // The content unit lives at LBA 0..3; serve it whenever a read starts
-            // there (the inline `DiscStream` reads the [0,3) extent as one batch).
+            // there (the live Read stage reads the [0,3) extent as one batch).
             if lba == 0 && bytes >= self.unit.len() {
                 buf[..self.unit.len()].copy_from_slice(&self.unit);
             }
@@ -2499,7 +2495,7 @@ mod tests {
     }
 
     /// BD source whose LPCM layout byte exists only once the first PES has been
-    /// parsed, gated by the real `HeaderGate` (as DiscStream/PipelinedPesStream are).
+    /// parsed, gated by the real `HeaderGate` (as PipelinedPesStream is).
     struct GatedLpcm {
         info: DiscTitle,
         parser: crate::mux::codec::lpcm::LpcmParser,
@@ -2797,7 +2793,7 @@ mod tests {
     }
 
     // ── Regression C: Session key selection special-cases DVD ───────────────
-    // A DVD must get `None` (so DiscStream cracks the correct per-title/VTS
+    // A DVD must get `None` (so the pipeline cracks the correct per-title/VTS
     // CSS key); a non-DVD passes `decrypt_keys()` through unconditionally.
     fn disc_with_css(format: crate::disc::DiscFormat) -> crate::disc::Disc {
         crate::disc::Disc {
@@ -2832,7 +2828,7 @@ mod tests {
         );
         assert!(
             matches!(session_mux_keys(&dvd), DecryptKeys::None),
-            "a DVD must be handed None so DiscStream cracks the per-title key"
+            "a DVD must be handed None so the pipeline cracks the per-title key"
         );
     }
 
@@ -3745,7 +3741,7 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(8), "bounded by the grace");
     }
 
-    // skip_errors reaches the live DiscStream on every arm that builds one.
+    // skip_errors reaches the live Read stage on every arm that builds one.
     #[test]
     fn skip_errors_reaches_every_live_arm() {
         let session = |bad| {

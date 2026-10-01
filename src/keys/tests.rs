@@ -2075,21 +2075,19 @@ fn live_stream_stops_on_an_unkeyed_piece_without_recovery() {
         let (fx, set, src) = lazy_b(&[K1]);
         let recovery = Arc::new(Mutex::new(0u32));
         let reader = RecoveryCount(src, recovery.clone());
-        let mut stream = super::install_key_map(
-            crate::mux::DiscStream::new(
-                Box::new(reader),
-                fx.disc.titles[0].clone(),
-                set.decrypt_keys(),
-                30,
-                ContentFormat::BdTs,
-                false,
-                &crate::ctx::Ctx::default(),
-            )
-            .unwrap(),
-            set.key_map(),
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let policy = crate::sector::read_stage::ReadPolicy::Live {
+            batch: 30,
+            skip_errors: skip,
+        };
+        let mut stream = crate::mux::resolve::build_keyed_pipeline(
+            reader,
+            fx.disc.titles[0].clone(),
+            &set,
+            policy,
+            &crate::ctx::Ctx::default(),
         )
-        .with_arrival(set.arrival(set.title_stop()).expect("B is Lazy"));
-        stream.skip_errors = skip;
+        .unwrap();
         let got = loop {
             match stream.read() {
                 Ok(Some(_)) => continue,
@@ -2256,21 +2254,19 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
     let set = KeyRing::keyless_for(&title, ContentFormat::BdTs);
     for skip in [false, true] {
         let recovery = Arc::new(Mutex::new(0u32));
-        let mut stream = super::install_key_map(
-            crate::mux::DiscStream::new(
-                Box::new(RecoveryCount(fx.source(), recovery.clone())),
-                title.clone(),
-                set.decrypt_keys(),
-                3,
-                ContentFormat::BdTs,
-                false,
-                &crate::ctx::Ctx::default(),
-            )
-            .unwrap(),
-            set.key_map(),
+        let _serial = crate::sector::prefetched::holder_test_lock();
+        let policy = crate::sector::read_stage::ReadPolicy::Live {
+            batch: 3,
+            skip_errors: skip,
+        };
+        let mut stream = crate::mux::resolve::build_keyed_pipeline(
+            RecoveryCount(fx.source(), recovery.clone()),
+            title.clone(),
+            &set,
+            policy,
+            &crate::ctx::Ctx::default(),
         )
-        .with_arrival(set.arrival(set.title_stop()).expect("every extent is lazy"));
-        stream.skip_errors = skip;
+        .unwrap();
         // Start past the inner extent: its first read is unit 4 of the outer one.
         let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
         let mut r = set

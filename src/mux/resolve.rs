@@ -875,14 +875,33 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
 /// reads; `raw` skips the per-title CSS crack. Every stage runs under `ctx`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
-    mut reader: S,
+    reader: S,
     title: DiscTitle,
-    mut keys: crate::decrypt::DecryptKeys,
+    keys: crate::decrypt::DecryptKeys,
     batch_sectors: u16,
     format: ContentFormat,
     raw: bool,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
+    let policy = crate::sector::read_stage::ReadPolicy::Image {
+        batch: batch_sectors,
+    };
+    build_sector_pipeline(reader, title, keys, policy, format, raw, ctx)
+}
+
+/// A sector source's title mux with no AACS key set, under the Read stage's `policy`
+/// (an image's fixed batches, or a live drive's adaptive, recovering reads): the title's
+/// CSS key cracked (unless `raw`), then decrypt → prefetch → demux → parse.
+pub(crate) fn build_sector_pipeline<S: SectorSource + Send + 'static>(
+    mut reader: S,
+    title: DiscTitle,
+    mut keys: crate::decrypt::DecryptKeys,
+    policy: crate::sector::read_stage::ReadPolicy,
+    format: ContentFormat,
+    raw: bool,
+    ctx: &crate::ctx::Ctx,
+) -> io::Result<PipelinedPesStream> {
+    let batch_sectors = policy.batch();
     let extents = title.extents.clone();
     // CSS (DVD) key resolution — shared per-title step. A `None`/MPEG-PS
     // title cracks its own key; `raw` skips it. A Stop interrupts the crack scan.
@@ -908,7 +927,7 @@ pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     let plan = IsoPlan {
         extents,
         full_extents,
-        batch_sectors,
+        policy,
         unit_align,
         format,
     };
@@ -920,7 +939,7 @@ pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
 struct IsoPlan {
     extents: Vec<crate::disc::Extent>,
     full_extents: Vec<crate::disc::Extent>,
-    batch_sectors: u16,
+    policy: crate::sector::read_stage::ReadPolicy,
     unit_align: u16,
     format: ContentFormat,
 }
@@ -943,6 +962,21 @@ pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
         tracing::error!(target: "freemkv::keys", "key set does not cover this image title");
         return Err(crate::error::Error::DecryptFailed.into());
     }
+    let policy = crate::sector::read_stage::ReadPolicy::Image {
+        batch: batch_sectors,
+    };
+    build_keyed_pipeline(reader, title, set, policy, ctx)
+}
+
+/// A sector source's title mux over a key set (its map and on-arrival proof, KU §3.1),
+/// under the Read stage's `policy`. The caller checked the set is for this source.
+pub(crate) fn build_keyed_pipeline<S: SectorSource + Send + 'static>(
+    reader: S,
+    title: DiscTitle,
+    set: &crate::keys::KeyRing,
+    policy: crate::sector::read_stage::ReadPolicy,
+    ctx: &crate::ctx::Ctx,
+) -> io::Result<PipelinedPesStream> {
     let full_extents = title.extents.clone();
     let ranges: Vec<(u32, u32)> = full_extents
         .iter()
@@ -959,7 +993,7 @@ pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
     let plan = IsoPlan {
         extents: set.key_map().read_plan(&full_extents, 3),
         full_extents,
-        batch_sectors,
+        policy,
         unit_align: 3,
         format: set.content_format(),
     };
@@ -976,7 +1010,7 @@ fn iso_pipeline_tail(
     let IsoPlan {
         extents,
         full_extents,
-        batch_sectors,
+        policy,
         unit_align,
         format,
     } = plan;
@@ -1004,12 +1038,8 @@ fn iso_pipeline_tail(
     decrypting.observe(ctx);
     let blanked = decrypting.blanked_counter();
 
-    let prefetched = crate::sector::PrefetchedSectorSource::with_alignment(
-        decrypting,
-        extents,
-        batch_sectors,
-        unit_align,
-        ctx,
+    let (prefetched, read_loss) = crate::sector::PrefetchedSectorSource::with_policy(
+        decrypting, extents, policy, unit_align, ctx,
     )
     .map_err(|e| -> io::Error { e.into() })?;
     let (rx, recycle_tx, shell) = prefetched.into_channels();
@@ -1021,7 +1051,8 @@ fn iso_pipeline_tail(
     Ok(
         PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
             .with_ctx(ctx)
-            .with_blanked(blanked),
+            .with_blanked(blanked)
+            .with_read_loss(read_loss),
     )
 }
 
@@ -1120,7 +1151,9 @@ fn build_ps_pipeline(
     let plan = IsoPlan {
         extents: vec![extent],
         full_extents: vec![extent],
-        batch_sectors: PS_MUX_BATCH_SECTORS,
+        policy: crate::sector::read_stage::ReadPolicy::Image {
+            batch: PS_MUX_BATCH_SECTORS,
+        },
         unit_align: 1,
         format: ContentFormat::MpegPs,
     };

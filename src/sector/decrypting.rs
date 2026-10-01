@@ -191,11 +191,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         self
     }
 
-    /// `&mut` counterpart of [`with_arrival`](Self::with_arrival).
-    pub(crate) fn set_arrival(&mut self, arrival: crate::keys::Arrival) {
-        self.arrival = Some(Box::new(arrival));
-    }
-
     /// Install a proactive [`AacsKeyMap`](crate::decrypt::AacsKeyMap): the caller
     /// resolved one key per CPS unit / segment up front, so every aligned unit is
     /// decrypted with its MAPPED key and trusted — no per-unit `is_clean` check.
@@ -203,14 +198,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     pub(crate) fn with_key_map(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
         self.key_map = Some(map);
         self
-    }
-
-    /// `&mut` counterpart of [`with_key_map`](Self::with_key_map): install the
-    /// proactive map on an already-constructed source (the inline live-drive
-    /// [`DiscStream`](crate::mux::DiscStream) builds the decorator first, then
-    /// installs the map via its own `with_key_map`).
-    pub(crate) fn set_key_map(&mut self, map: Arc<crate::decrypt::AacsKeyMap>) {
-        self.key_map = Some(map);
     }
 
     /// Restrict decrypt to every stream file's extents (e.g.

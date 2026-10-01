@@ -74,6 +74,8 @@ pub struct PipelinedPesStream {
     video_stream_id: Option<u8>,
     /// Packets of a video `stream_id` other than `video_stream_id`, dropped.
     other_video_packets: u64,
+    /// Read errors the Read stage skipped past (zero-filled), when it skips.
+    read_loss: Option<std::sync::Arc<crate::sector::read_stage::ReadLoss>>,
 }
 
 /// The `Codec` of a stream, for configuring its [`AuAssembler`](crate::mux::au_assembly::AuAssembler).
@@ -138,6 +140,7 @@ impl PipelinedPesStream {
             header_gate: super::header_gate::HeaderGate::default(),
             halt: crate::halt::Halt::new(),
             blanked: std::sync::Arc::default(),
+            read_loss: None,
             video_stream_id: None,
             other_video_packets: 0,
         }
@@ -155,6 +158,15 @@ impl PipelinedPesStream {
         blanked: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         self.blanked = blanked;
+        self
+    }
+
+    // The read loss the Read stage counts (a live drive's skipped units).
+    pub(crate) fn with_read_loss(
+        mut self,
+        loss: std::sync::Arc<crate::sector::read_stage::ReadLoss>,
+    ) -> Self {
+        self.read_loss = Some(loss);
         self
     }
 
@@ -462,15 +474,18 @@ impl PesSource for PipelinedPesStream {
     }
 
     fn errors(&self) -> u64 {
-        // Blanked units plus frames the B1 gates dropped, as `DiscStream::errors` counts.
+        // Read errors skipped past, blanked units, and frames the B1 gates dropped.
         let dropped: u64 = self.resync.iter().map(|g| g.dropped_total()).sum();
-        self.blanked.load(std::sync::atomic::Ordering::Relaxed) + dropped
+        let skips = self.read_loss.as_ref().map_or(0, |l| l.skips());
+        skips + self.blanked.load(std::sync::atomic::Ordering::Relaxed) + dropped
     }
 
     fn lost_bytes(&self) -> u64 {
-        // Each blanked unit is one whole aligned unit of zeros (KS-2: 6144 bytes).
+        // Zero-filled read errors, plus each blanked unit: one whole aligned unit of zeros
+        // (KS-2: 6144 bytes).
         let blanked = self.blanked.load(std::sync::atomic::Ordering::Relaxed);
-        blanked * crate::aacs::content::ALIGNED_UNIT_LEN as u64
+        let skipped = self.read_loss.as_ref().map_or(0, |l| l.bytes());
+        skipped + blanked * crate::aacs::content::ALIGNED_UNIT_LEN as u64
     }
 
     fn config_changes(&self) -> Vec<(usize, u64)> {

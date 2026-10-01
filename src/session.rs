@@ -77,7 +77,7 @@ pub struct KeySpec {
 ///
 /// Owns the [`Drive`] by value. Consumers that still need the raw drive (e.g.
 /// to sample ciphertext for key validation, or to move it into a
-/// `DiscStream`) reach it via [`Self::into_drive`]; the
+/// live mux) reach it via [`Self::into_drive`]; the
 /// scanned [`Disc`] comes out via [`Self::disc`] / [`Self::take_disc`].
 pub struct DiscSession {
     /// The opened drive. `Some` from [`Self::open`] until
@@ -420,8 +420,8 @@ impl DiscSession {
         }
     }
 
-    /// Consume the session, returning the owned drive (e.g. to move into a
-    /// `DiscStream` for a live-drive mux).
+    /// Consume the session, returning the owned drive (e.g. to move into
+    /// the Read stage for a live-drive mux).
     ///
     /// # Errors
     ///

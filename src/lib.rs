@@ -17,10 +17,9 @@
 //! }
 //! ```
 //!
-//! Muxing runs through the PES pipeline. `input()` rejects live `disc://`
-//! URLs with [`Error::DiscUrlNotDirect`] (use `Drive` + `Disc::scan` +
-//! `DiscStream::new` instead); file-backed sources (`iso://`, `m2ts://`) open
-//! directly:
+//! Muxing runs through the PES pipeline. `input()` opens every input URL, a live
+//! `disc://` drive included, and file-backed sources (`iso://`, `m2ts://`) the same
+//! way:
 //!
 //! ```no_run
 //! # fn run() -> std::io::Result<()> {
@@ -222,7 +221,6 @@ pub use pes::PesFrame;
 pub use pes::{PesSink, PesSource};
 
 #[cfg(feature = "rip")]
-pub use mux::DiscStream;
 #[cfg(feature = "rip")]
 pub use mux::M2tsStream;
 #[cfg(feature = "rip")]

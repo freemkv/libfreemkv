@@ -41,16 +41,6 @@ use crate::whole_disc::{UnitSpan, WholeDiscReader};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-// A title's `DiscStream` read through `map`: the read plan, then each unit's mapped key.
-pub(crate) fn install_key_map(
-    mut stream: crate::mux::DiscStream,
-    map: Arc<AacsKeyMap>,
-) -> crate::mux::DiscStream {
-    stream.plan_reads(&map);
-    stream.reader_mut().set_key_map(map);
-    stream
-}
-
 // A test's own phased map; map construction stays in `keys` (KU §2.2).
 #[cfg(test)]
 pub(crate) fn test_key_map(

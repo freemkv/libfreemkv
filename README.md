@@ -87,15 +87,15 @@ cannot call into it; front-ends get recovery from the engine directly.
 
 | Stream | Input | Output | Transport |
 |--------|-------|--------|-----------|
-| DiscStream | Yes | -- | Optical drive via SCSI |
-| IsoStream | Yes | -- | Blu-ray ISO image file (read via stream pipeline; written by `freemkv_engine::recovery`) |
+| `disc://` | Yes | -- | Optical drive via SCSI (live Read policy: adaptive batches, recovery read, skip or fail) |
+| `iso://` / `dir://` | Yes | -- | Disc image file or folder (image Read policy; written by `freemkv_engine::recovery`) |
 | MkvStream | Yes | Yes | Matroska container |
 | M2tsStream | Yes | Yes | BD transport stream with FMKV metadata header |
 | NetworkStream | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |
 | StdioStream | Yes (stdin) | Yes (stdout) | Raw byte pipe |
 | NullStream | -- | Yes | Discard sink (byte counter for benchmarks) |
 
-Streams implement a single unified `pes::Stream` trait (re-exported as `PesStream`) exposing `read()` and `write()` on one type. `input()` / `output()` resolve URL strings to PES stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
+Inputs implement `PesSource` (`read()`) and outputs `PesSink` (`write()`); a format that is both implements both. `open_source()` / `input()` open every input URL (`disc://` included) and `output()` every output URL. All URLs use the `scheme://path` format — bare paths are rejected.
 
 ### Keys
 
@@ -120,10 +120,12 @@ Disc                   — scan titles, streams, AACS/CSS state
   ├── AACS             — key resolution + content decryption
   └── CSS              — DVD CSS (bus auth → player-key disc crack → known-plaintext title-key attack)
 
-Streams                — unified PES pipeline
-  ├── PesStream        — pes::Stream: one trait, read()/write() PES frames
-  ├── DiscStream       — sectors → decrypt → TS demux → PES
-  ├── IsoStream        — ISO file → decrypt → TS demux → PES
+Streams                — one PES pipeline
+  ├── Source           — open_source(url): drive, image, folder, file, socket, pipe
+  ├── Read stage       — extents → chunks under the source's ReadPolicy (live | image)
+  ├── Decrypt stage    — AACS / CSS, content-detected, damage blanked and counted
+  ├── Demux            — TS / PS → PES (one demux for every sector source)
+  ├── PesSource/PesSink — read()/write() PES frames
   ├── MkvStream        — MKV mux/demux
   ├── M2tsStream       — BD transport stream
   ├── NetworkStream    — TCP with FMKV metadata header

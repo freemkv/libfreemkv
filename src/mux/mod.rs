@@ -18,7 +18,6 @@
 //! For disc→ISO (raw sector copy), use `freemkv_engine::recovery::copy` instead.
 
 // Public modules — types here are intentionally part of the consumable API.
-pub mod disc;
 pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
@@ -85,7 +84,6 @@ pub(crate) mod videomap;
 // `demux://`/`fvi://` sinks are built internally by `output()`; not public API.
 // The provenance types ARE public: `output()` takes a `SourceInfo` so an `fvi://`
 // destination records the INPUT it was built from (§6.2), not the file written.
-pub use disc::DiscStream;
 pub use driver::{MuxOptions, MuxOutcome, mux_url, mux_with_keys};
 pub use fit::{FitReport, SkipReason, fit_report};
 pub use m2ts::M2tsStream;

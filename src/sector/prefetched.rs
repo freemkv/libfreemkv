@@ -9,7 +9,6 @@
 
 use crate::ctx::Ctx;
 use crate::error::Result;
-use crate::event::Event;
 use crate::halt::{DriveHolder, Halt, Recv, SendOutcome};
 use crate::sector::SectorSource;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -93,7 +92,7 @@ impl PrefetchedSectorSource {
 
     /// [`Self::new`] reading in whole `unit_align`-sector units (1 for CSS/clear).
     pub(crate) fn with_alignment<S>(
-        mut reader: S,
+        reader: S,
         extents: Vec<crate::disc::Extent>,
         batch_sectors: u16,
         unit_align: u16,
@@ -102,38 +101,38 @@ impl PrefetchedSectorSource {
     where
         S: SectorSource + Send + 'static,
     {
-        // A zero batch loops forever (sectors = remaining.min(0) = 0, offset
-        // never advances). All production callers pass nonzero; a 0 here is
-        // a caller bug, so reject rather than spin a thread with no progress.
-        if batch_sectors == 0 {
-            return Err(crate::error::Error::MuxBatchSectorsZero);
-        }
-        // A zero alignment is worse: the producer hits `remaining % unit_align`
-        // and panics divide-by-zero, surfacing as a misleading DemuxThreadPanicked
-        // from a constructor that returned `Ok`. Reject it here too.
-        if unit_align == 0 {
-            return Err(crate::error::Error::IoError {
-                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
-            });
-        }
-        // Accumulate in u64 then clamp: extents come from untrusted nav/MPLS/UDF
-        // data, so a naive u32 sum could panic/wrap. Only affects the advisory
-        // capacity_sectors figure; the producer walks each extent independently.
-        let total_sectors: u32 = extents
-            .iter()
-            .map(|e| e.sector_count as u64)
-            .sum::<u64>()
-            .min(u32::MAX as u64) as u32;
-        let bytes_total_extents: u64 = extents
-            .iter()
-            .map(|e| e.sector_count as u64 * crate::consts::SECTOR_BYTES_U64)
-            .sum();
+        let policy = crate::sector::read_stage::ReadPolicy::Image {
+            batch: batch_sectors,
+        };
+        Self::with_policy(reader, extents, policy, unit_align, ctx).map(|(s, _)| s)
+    }
+
+    /// The producer running the Read stage over `extents` under `policy` (an image's fixed
+    /// batches, or a live drive's adaptive, recovering reads), in `unit_align`-sector
+    /// units. Also returns the read loss the stage counts.
+    pub(crate) fn with_policy<S>(
+        mut reader: S,
+        extents: Vec<crate::disc::Extent>,
+        policy: crate::sector::read_stage::ReadPolicy,
+        unit_align: u16,
+        ctx: &Ctx,
+    ) -> Result<(Self, std::sync::Arc<crate::sector::read_stage::ReadLoss>)>
+    where
+        S: SectorSource + Send + 'static,
+    {
+        let mut walk =
+            crate::sector::read_stage::ExtentWalk::new(extents, policy, unit_align, ctx)?;
+        let loss = walk.loss();
+        let total_sectors = walk.total_sectors();
+        let batch_sectors = match policy {
+            crate::sector::read_stage::ReadPolicy::Image { batch }
+            | crate::sector::read_stage::ReadPolicy::Live { batch, .. } => batch,
+        };
         let unmapped = reader.unmapped_stream_files().to_vec();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
         let batch_bytes = batch_sectors as usize * crate::consts::SECTOR_BYTES;
         let wait = ctx.halt.clone();
-        let events = ctx.clone();
 
         // Seed the recycle pool so the producer has a buffer on the first
         // iteration; otherwise the first recycle_rx.recv() blocks forever.
@@ -151,42 +150,10 @@ impl PrefetchedSectorSource {
             // mistaken for clean EOF: a dropped `tx` alone would finalize a
             // TRUNCATED mux as success. Locals are thread-local, so this is sound.
             let body = std::panic::AssertUnwindSafe(|| {
-                let mut ext_idx = 0usize;
-                let mut offset: u32 = 0;
-                let mut bytes_read_total: u64 = 0;
-                while ext_idx < extents.len() {
+                loop {
                     if wait.is_cancelled() {
                         return;
                     }
-                    let extent = &extents[ext_idx];
-                    // AACS aligned units anchor at THIS extent's start LBA, so gate
-                    // relative to it, not absolute disc LBA 0. No-op for
-                    // non-decrypting / CSS / None sources.
-                    reader.set_unit_base(extent.start_lba);
-                    let remaining = extent.sector_count.saturating_sub(offset);
-                    if remaining == 0 {
-                        ext_idx += 1;
-                        offset = 0;
-                        continue;
-                    }
-                    // AACS units are SECTOR_ALIGNMENT (3) sectors; decrypt processes only
-                    // full units, so a tail below one unit can't decrypt — error, don't emit
-                    // encrypted bytes. (`remaining > 0` above, so `< align` IS the short tail; `!is_multiple_of` was redundant.)
-                    if remaining < unit_align as u32 {
-                        let e = crate::error::Error::ExtentNotUnitAligned.into();
-                        send_or_stop(&wait, &tx, Err(e));
-                        return;
-                    }
-                    let mut sectors = remaining.min(batch_sectors as u32) as u16;
-                    // Trim to a whole number of units. A trim to 0 here means the
-                    // batch window landed on a sub-unit boundary (not the
-                    // trailing-tail case, rejected above); clamp to one unit.
-                    if sectors >= unit_align {
-                        sectors -= sectors % unit_align;
-                    } else {
-                        sectors = unit_align;
-                    }
-                    let bytes = sectors as usize * crate::consts::SECTOR_BYTES;
                     // Halt-aware: a cancel does not disconnect the channel, so a
                     // plain recv() would never re-reach the check. Disconnected =
                     // the consumer dropped both channels.
@@ -194,51 +161,20 @@ impl PrefetchedSectorSource {
                     else {
                         return;
                     };
-                    // Sound resize (was `unsafe set_len` guarded only by capacity):
-                    // public `into_channels` lets a caller recycle a cap-only Vec, so
-                    // set_len could expose uninit memory (UB) — GHSA-j8ww-f5fg-9pmh.
-                    buf.resize(bytes, 0);
-                    // `start_lba + offset` derives from untrusted extent
-                    // data — saturate rather than wrap/panic on a
-                    // hostile start_lba near u32::MAX.
-                    let lba = extent.start_lba.saturating_add(offset);
-                    match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
-                        Ok(n) => {
-                            // A short read must not desync the stream: advance by
-                            // sectors actually read, and reject a non-whole-sector
-                            // count (belt-and-braces; FileSectorSource read_exact's).
-                            if n % crate::consts::SECTOR_BYTES != 0 {
-                                let e = crate::error::Error::ExtentNotUnitAligned.into();
-                                send_or_stop(&wait, &tx, Err(e));
-                                return;
-                            }
-                            let sectors_read = (n / crate::consts::SECTOR_BYTES) as u32;
-                            // A zero-byte read isn't EOF (extents still have
-                            // `remaining`) and would spin forever; send a terminal
-                            // sentinel instead of a clean EOF that reports success.
-                            if sectors_read == 0 {
-                                let e = crate::error::Error::SourceTerminated.into();
-                                send_or_stop(&wait, &tx, Err(e));
-                                return;
-                            }
-                            buf.truncate(n);
-                            bytes_read_total = bytes_read_total.saturating_add(n as u64);
-                            events.emit(Event::BytesRead {
-                                bytes: bytes_read_total,
-                                total: bytes_total_extents,
-                            });
+                    match walk.next(&mut reader, &mut buf) {
+                        Ok(true) => {
                             if !send_or_stop(&wait, &tx, Ok(buf)) {
                                 return; // consumer dropped, or stopped
                             }
-                            offset = offset.saturating_add(sectors_read);
                         }
+                        // Drop tx — the consumer sees RecvError → EOF.
+                        Ok(false) => return,
                         Err(e) => {
                             send_or_stop(&wait, &tx, Err(e.into()));
                             return;
                         }
                     }
                 }
-                // Drop tx implicitly — consumer sees RecvError → EOF.
             });
             if std::panic::catch_unwind(body).is_err() {
                 // Panicked mid-stream — surface a typed error so the demux
@@ -250,15 +186,18 @@ impl PrefetchedSectorSource {
         })
         .map_err(|e| crate::error::Error::IoError { source: e })?;
 
-        Ok(Self {
-            rx,
-            recycle_tx,
-            producer: Some(producer),
-            total_sectors,
-            producer_failed: false,
-            unmapped,
-            halt: ctx.halt.clone(),
-        })
+        Ok((
+            Self {
+                rx,
+                recycle_tx,
+                producer: Some(producer),
+                total_sectors,
+                producer_failed: false,
+                unmapped,
+                halt: ctx.halt.clone(),
+            },
+            loss,
+        ))
     }
 
     /// Peel off the receivers for zero-copy pipeline mode: the caller pulls buffers from `rx`
@@ -396,6 +335,7 @@ mod tests {
     use super::*;
     use crate::disc::Extent;
     use crate::error::Result;
+    use crate::event::Event;
     use std::sync::mpsc;
     use std::time::Duration;
 

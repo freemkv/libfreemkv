@@ -11,6 +11,7 @@
 pub mod bus_removal;
 pub mod decrypting;
 pub mod prefetched;
+pub mod read_stage;
 pub(crate) mod stage;
 
 use crate::error::Result;
