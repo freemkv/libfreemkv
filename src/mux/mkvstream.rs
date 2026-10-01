@@ -7598,6 +7598,27 @@ mod readback_tests {
         v
     }
 
+    // EditionFlagDefault is the two-byte ID 0x45DB mkvmerge writes; the default edition wins.
+    #[test]
+    fn the_default_edition_is_read_by_its_registered_id() {
+        let atom = |name: &str| {
+            let mut a = Vec::new();
+            ebml::write_uint(&mut a, ebml::CHAPTER_TIME_START, 0).unwrap();
+            let mut d = Vec::new();
+            ebml::write_string(&mut d, ebml::CHAP_STRING, name).unwrap();
+            a.extend(el(ebml::CHAPTER_DISPLAY, &d));
+            el(ebml::CHAPTER_ATOM, &a)
+        };
+        let first = el(ebml::EDITION_ENTRY, &atom("first"));
+        let mut second = vec![0x45, 0xDB, 0x81, 0x01];
+        second.extend(atom("second"));
+        let mut body = first;
+        body.extend(el(ebml::EDITION_ENTRY, &second));
+        let chapters = parse_chapters(&body).unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].name, "second");
+    }
+
     fn encoding(order: u64, algo: u64, settings: &[u8]) -> Vec<u8> {
         let mut comp = Vec::new();
         ebml::write_uint(&mut comp, CONTENT_COMP_ALGO, algo).unwrap();

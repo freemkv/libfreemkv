@@ -352,6 +352,69 @@ fn h264_paff_pairs_come_from_the_slice_header() {
 }
 
 #[test]
+fn start_up_spacing_is_floored_at_two_field_periods() {
+    // PAFF at R = 1 with no stated frame rate: T is the smallest first-field gap (1500),
+    // below 2 x the 1800-tick field delta, so the floor keeps the second field's start-up
+    // DTS below the next unit's.
+    let sps = H264Sps {
+        frame_mbs_only: false,
+        height_map_units: 34,
+        vui: Some(H264Vui {
+            restriction: Some((1, 2)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (gap, field) = (1_500, 1_800);
+    let mut frames = Vec::new();
+    for u in 0..4i64 {
+        for bottom in [false, true] {
+            let mut es = if u == 0 && !bottom {
+                length_prefixed(&[sps.nal()])
+            } else {
+                Vec::new()
+            };
+            let slice = h264_slice(&sps, u == 0 && !bottom, 0, u as u32, Some(bottom));
+            es.extend(length_prefixed(&[slice]));
+            frames.push((B + u * gap + bottom as i64 * field, es));
+        }
+    }
+    // The start-up window: first field, its second field, and the next unit.
+    frames.truncate(3);
+    let mut d = DtsDeriver::for_codec(Codec::H264, None);
+    let dts = run(&mut d, &frames);
+    assert_eq!(dts[0], Some(B - 2 * field));
+    assert_eq!(d.counters(), DtsCounters::default(), "no order violation");
+    assert_conformant(&frames, &dts);
+}
+
+#[test]
+fn reorder_depth_is_clamped_and_the_order_statistic_window_is_exact_at_the_clamp() {
+    // A corrupt SPS claiming 200 reordered frames is held to MAX_REORDER.
+    let sps = sps_timed(200);
+    let d = DtsDeriver::for_codec(Codec::H264, Some(&avcc(&sps.nal())));
+    assert_eq!(d.params().0, MAX_REORDER);
+
+    // In-order delivery at R = 16 over more than KEEP units: DTS_k is the PTS of unit k - 16.
+    let sps = sps_timed(MAX_REORDER as u32);
+    let mut d = DtsDeriver::for_codec(Codec::H264, Some(&avcc(&sps.nal())));
+    let n = 3 * KEEP as i64;
+    let frames: Vec<_> = (0..n)
+        .map(|k| (B + k * F, h264_frame(&sps, k == 0, k as u32)))
+        .collect();
+    let dts = run(&mut d, &frames);
+    let want: Vec<_> = (0..n)
+        .map(|k| Some(B + (k - MAX_REORDER as i64) * F))
+        .collect();
+    assert_eq!(dts, want);
+    assert_eq!(
+        d.core.top.len(),
+        KEEP,
+        "only KEEP unit PTS values are retained"
+    );
+}
+
+#[test]
 fn h264_field_coded_r_upgrade_allots_one_slot_per_field() {
     // 25 fps PAFF: clip 1 R = 0 (I/P), clip 2 IDR activates R = 2 (B-pyramid). The
     // re-start places 4 field slots in (DTS_last, S_new[0]); no guard firing.

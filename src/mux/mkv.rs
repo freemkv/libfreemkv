@@ -2061,7 +2061,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     None => return Err(crate::error::Error::MkvUnencodable.into()),
                 },
                 ebml::CUES => cues_offset,
-                _ => 0,
+                // The SeekHead reserves only the targets above.
+                _ => return Err(crate::error::Error::MkvUnencodable.into()),
             };
             self.writer
                 .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
@@ -2973,6 +2974,47 @@ mod tests {
             ebml::INTERLACED_INTERLACED as u8,
             "the up-front progressive flag must be patched to interlaced by the majority"
         );
+    }
+
+    // A progressive leader on an interlaced MPEG-2 title leaves the reserved FieldOrder to be
+    // filled from the majority field order: TFF and BFF titles must not swap.
+    #[test]
+    fn reserved_field_order_follows_the_measured_majority() {
+        use crate::mux::codec::FieldOrder;
+        use std::sync::{Arc, Mutex};
+        for (scan, want) in [
+            (FieldOrder::Tff, ebml::FIELD_ORDER_TFF),
+            (FieldOrder::Bff, ebml::FIELD_ORDER_BFF),
+        ] {
+            let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+            let mut track = make_video_track();
+            track.codec_id = ebml::CODEC_MPEG2;
+            let mut muxer =
+                MkvMuxer::new(SharedWriter(shared.clone()), &[track], None, 0.0, &[]).unwrap();
+            let scans = [FieldOrder::Progressive, scan, scan, scan];
+            for (i, scan) in scans.into_iter().enumerate() {
+                let pts = i as i64 * 40_000_000;
+                muxer
+                    .write_frame_at(
+                        0,
+                        pts,
+                        i == 0,
+                        &[1, 2, i as u8],
+                        None,
+                        None,
+                        None,
+                        Some(scan),
+                    )
+                    .unwrap();
+            }
+            muxer.finish().unwrap();
+            let data = shared.lock().unwrap().clone().into_inner();
+            let at = data
+                .windows(2)
+                .position(|w| w == [ebml::FIELD_ORDER as u8, 0x81])
+                .expect("FieldOrder element present");
+            assert_eq!(data[at + 2], want as u8);
+        }
     }
 
     #[test]
@@ -5528,6 +5570,27 @@ mod tests {
         assert_eq!(groups[0].duration, 29_127, "SPU stop time, not a 1 s guess");
     }
 
+    // The stop time is found past every command that precedes it in the first DCSQ.
+    #[test]
+    fn vobsub_stop_is_found_after_commands_with_arguments() {
+        let mut track = make_subtitle_track();
+        track.codec_id = ebml::CODEC_VOBSUB;
+        let mut spu = vec![0, 0, 0, 6, 0xAB, 0xCD];
+        // delay 0x0100, next = itself; STA_DSP, SET_COLOR, SET_CONTR, SET_DAREA, SET_DSPXA, STP_DSP.
+        spu.extend_from_slice(&[0x01, 0x00, 0, 6, 0x01]);
+        spu.extend_from_slice(&[0x03, 0x11, 0x22, 0x04, 0x33, 0x44]);
+        spu.extend_from_slice(&[0x05, 1, 2, 3, 4, 5, 6, 0x06, 1, 2, 3, 4, 0x02, 0xFF]);
+        let len = spu.len() as u16;
+        spu[..2].copy_from_slice(&len.to_be_bytes());
+        let data = mux_with_durations(&[track], &[(0, 0, true, spu, None)]);
+        let groups = all_block_groups(&data);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].duration, 29_127,
+            "the real stop, not the 10 s cap"
+        );
+    }
+
     // A VobSub SPU with no stop command ends at the next SPU on its track, else
     // after a 10 s cap.
     #[test]
@@ -5557,10 +5620,9 @@ mod tests {
         );
         let groups = all_block_groups(&data);
         assert_eq!(groups.len(), 1);
-        assert!(
-            groups[0].duration > 10_000,
-            "a self-terminating cue must not be hidden after 1 s (got {} ticks)",
-            groups[0].duration
+        assert_eq!(
+            groups[0].duration, 300_000,
+            "a self-terminating cue lasts the 30 s fallback, not 1 s"
         );
     }
 
@@ -5701,6 +5763,41 @@ mod tests {
             "SamplingFrequency present"
         );
         assert!(find_id(&data, ebml::CHANNELS).is_some(), "Channels present");
+    }
+
+    // A late AAC CodecPrivate fills the 16-byte reserve exactly, whatever its length: the
+    // TrackEntry still parses and the bytes after it are untouched.
+    #[test]
+    fn late_aac_codec_private_fills_the_reserve_exactly() {
+        for len in [2usize, 11, 12, 13] {
+            let mut aac = make_audio_track();
+            aac.codec_id = ebml::CODEC_AAC;
+            let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[aac], None, 0.0, &[]).unwrap();
+            let cp: Vec<u8> = (1..=len as u8).collect();
+            assert!(muxer.set_codec_private(0, &cp).unwrap(), "len {len}");
+            let data = muxer.writer.into_inner();
+            let (te_start, te_size) = first_track_entry(&data);
+            let children = master_children(&data, te_start, te_size);
+            let (_, off, size) = *children
+                .iter()
+                .find(|(id, _, _)| *id == ebml::CODEC_PRIVATE)
+                .expect("CodecPrivate present");
+            assert_eq!(&data[off..off + size as usize], &cp[..], "len {len}");
+            let end = children.iter().map(|&(_, o, s)| o + s as usize).max();
+            assert_eq!(
+                end,
+                Some(te_start + te_size),
+                "len {len}: children fill the entry"
+            );
+            assert!(children.iter().any(|(id, _, _)| *id == ebml::AUDIO));
+        }
+        let mut aac = make_audio_track();
+        aac.codec_id = ebml::CODEC_AAC;
+        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[aac], None, 0.0, &[]).unwrap();
+        assert!(
+            !muxer.set_codec_private(0, &[0u8; 14]).unwrap(),
+            "does not fit"
+        );
     }
 
     #[test]
