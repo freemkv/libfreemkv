@@ -60,6 +60,9 @@ pub struct DvdTitle {
     /// resolution joins on the REAL title number rather than the position in the
     /// titles vec, which desyncs when a sibling PGC is dropped as unparseable.
     pub vts_title_num: u8,
+    /// Distinct PGCs this title's part-of-title entries point at. Only the first is read,
+    /// so a title with more is missing the rest.
+    pub pgcs: usize,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -904,15 +907,8 @@ pub(crate) fn parse_pgcit(
             continue;
         }
 
+        // Warned once per disc by the DVD scan, which sees every title set.
         let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
-        if pgcs > 1 {
-            tracing::warn!(
-                target: "freemkv::scan",
-                vts_title_num,
-                pgcs,
-                "title spans several PGCs; only its first PGC is read, the rest of the title is missing"
-            );
-        }
 
         let entry_offset = entries_start + pgc_index * 8;
         if entry_offset + 8 > data.len() {
@@ -938,6 +934,7 @@ pub(crate) fn parse_pgcit(
                 // Stamp the REAL title number so downstream nav joins survive a
                 // dropped sibling PGC (position in `titles` is not vts_title_num).
                 title.vts_title_num = vts_title_num;
+                title.pgcs = pgcs;
                 titles.push(title);
             }
             Err(e) => {
@@ -1118,6 +1115,7 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         spst_ctl,
         // Set by the caller (parse_pgcit) which knows the TT_SRPT title number.
         vts_title_num: 0,
+        pgcs: 0,
     })
 }
 
@@ -2071,6 +2069,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 3);
@@ -2095,6 +2094,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 2);
         let fc = t.feature_cells();
@@ -2115,6 +2115,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 2);
@@ -2132,6 +2133,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert!(t.feature_cells().is_empty());

@@ -256,7 +256,48 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
+        warn_multi_pgc_titles(&vmg_bytes, &dvd_info);
         Ok((titles, nav_feature))
+    }
+}
+
+// One warning per disc per process for titles split across PGCs (only the first is read):
+// a rip scans its disc more than once, and each scan would repeat it. Later scans log at
+// debug. The disc is told apart by its VIDEO_TS.IFO.
+fn warn_multi_pgc_titles(vmg: &[u8], info: &ifo::DvdInfo) {
+    use std::hash::{Hash, Hasher};
+    static WARNED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let split: Vec<String> = info
+        .title_sets
+        .iter()
+        .flat_map(|ts| {
+            ts.titles.iter().filter(|t| t.pgcs > 1).map(move |t| {
+                format!(
+                    "VTS {} title {} ({} PGCs)",
+                    ts.vts_number, t.vts_title_num, t.pgcs
+                )
+            })
+        })
+        .collect();
+    if split.is_empty() {
+        return;
+    }
+    let mut h = std::hash::DefaultHasher::new();
+    vmg.hash(&mut h);
+    let key = h.finish();
+    let first = {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        let first = !warned.contains(&key);
+        if first {
+            warned.push(key);
+        }
+        first
+    };
+    let titles = split.join(", ");
+    if first {
+        tracing::warn!(target: "freemkv::scan", titles = %titles, "titles span several PGCs; only the first PGC of each is read, the rest of those titles is missing");
+    } else {
+        tracing::debug!(target: "freemkv::scan", titles = %titles, "titles span several PGCs; only the first PGC of each is read");
     }
 }
 
@@ -2183,5 +2224,66 @@ mod tests {
     #[test]
     fn scan_dvd_titles_bad_ifo_and_bup_is_empty() {
         assert_eq!(scan_ifo_bup(false, false).expect("no error").len(), 0);
+    }
+
+    fn title(vts_title_num: u8, pgcs: usize) -> ifo::DvdTitle {
+        ifo::DvdTitle {
+            chapters: 1,
+            duration_secs: 1.0,
+            cells: Vec::new(),
+            chapter_times: Vec::new(),
+            palette: None,
+            ast_ctl: [0; 8],
+            spst_ctl: [0; 32],
+            vts_title_num,
+            pgcs,
+        }
+    }
+
+    // A rip scans its disc more than once: the split-title warning is one line per disc,
+    // naming every split title, and a rescan of the same disc logs it at debug only.
+    #[test]
+    fn multi_pgc_titles_warn_once_per_disc() {
+        let set = |n: u8, titles: Vec<ifo::DvdTitle>| ifo::DvdTitleSet {
+            vts_number: n,
+            vob_start_sector: 0,
+            video: ifo::DvdVideoAttr {
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R480i,
+                aspect: ifo::DvdAspect::R16x9,
+                standard: ifo::TvSystem::Ntsc,
+            },
+            audio_streams: Vec::new(),
+            subtitle_streams: Vec::new(),
+            titles,
+        };
+        let info = ifo::DvdInfo {
+            title_sets: vec![
+                set(3, vec![title(1, 8)]),
+                set(4, vec![title(1, 5), title(2, 1)]),
+                set(11, vec![title(1, 1)]),
+            ],
+        };
+        let vmg = b"multi_pgc_titles_warn_once_per_disc".to_vec();
+        let ((), ev) = crate::testlog::capture(|| {
+            warn_multi_pgc_titles(&vmg, &info);
+            warn_multi_pgc_titles(&vmg, &info);
+            warn_multi_pgc_titles(&vmg, &info);
+        });
+        let warns: Vec<_> = ev
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(warns.len(), 1, "{ev:?}");
+        assert_eq!(
+            warns[0].field("titles"),
+            Some("VTS 3 title 1 (8 PGCs), VTS 4 title 1 (5 PGCs)")
+        );
+        // A disc with no split title logs nothing.
+        let clear = ifo::DvdInfo {
+            title_sets: vec![set(1, vec![title(1, 1)])],
+        };
+        let ((), ev) = crate::testlog::capture(|| warn_multi_pgc_titles(b"no split", &clear));
+        assert!(ev.is_empty(), "{ev:?}");
     }
 }
