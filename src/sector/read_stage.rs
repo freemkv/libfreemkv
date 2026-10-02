@@ -27,8 +27,8 @@ const SECTOR: usize = crate::consts::SECTOR_BYTES;
 /// How the Read stage reads a source (the transport's policy, X-1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadPolicy {
-    /// An image or file: `batch`-sector reads; any read error ends the run, and an extent
-    /// tail shorter than one decrypt unit is refused.
+    /// An image or file: `batch`-sector reads in whole decrypt units (an extent tail shorter
+    /// than one unit is one read); any read error ends the run.
     Image { batch: u16 },
     /// A live drive: adaptive batches from `batch` down, one ECC recovery read for a unit
     /// that still fails, then a zero-filled, counted unit (`skip_errors`) or a `DiscRead`.
@@ -273,14 +273,13 @@ impl ExtentWalk {
     ) -> Result<bool> {
         self.ctx.halt.check()?;
         let align = self.unit_align;
-        // Decrypt processes only full units, so a tail below one unit can't decrypt:
-        // refuse it rather than emit encrypted bytes.
-        if remaining < align {
-            return Err(Error::ExtentNotUnitAligned);
-        }
         let mut sectors = remaining.min(batch as u32);
-        // Trim to whole units; a window landing on a sub-unit boundary reads one unit.
-        sectors = if sectors >= align {
+        // Trim to whole units; a window landing on a sub-unit boundary reads one unit. An
+        // extent tail below one unit is read as is: the decrypt stage passes it when clear
+        // and refuses it when it is the head of an encrypted unit.
+        sectors = if remaining < align {
+            remaining
+        } else if sectors >= align {
             sectors - sectors % align
         } else {
             align
