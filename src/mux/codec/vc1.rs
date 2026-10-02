@@ -7,6 +7,7 @@
 //! (0x0F) in the PES, per the BD VC-1 convention (see `parse`).
 
 use super::coding::{CodingType, PictureInfo};
+use super::decodable::{Decodable, Need};
 use super::startcode::{BitReader, find_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -74,6 +75,47 @@ fn vc1_frame_coding_type(frame_rbsp: &[u8], seq_header: Option<&[u8]>) -> Option
     vc1_progressive_ptype(&mut BitReader::new(frame_rbsp))
 }
 
+/// What an advanced-profile picture predicts from, for decodability: the PTYPE VLC, or for an
+/// interlaced sequence FCM then PTYPE or a field pair's FPTYPE (SMPTE 421M §7.1.1.4; FCM and
+/// FPTYPE as ffmpeg `vc1.c` reads them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vc1Pic {
+    /// I, or an I/I or I/P field pair.
+    Intra,
+    /// P, skipped, or a P/I or P/P field pair.
+    Predicted,
+    /// B, or a field pair holding a B field.
+    Bi,
+    /// BI (intra, never a reference), or a BI/BI field pair.
+    IntraB,
+}
+
+fn vc1_picture(frame_rbsp: &[u8], seq_header: Option<&[u8]>) -> Option<Vc1Pic> {
+    let interlace = parse_vc1_interlace(seq_header?)?;
+    let mut br = BitReader::new(frame_rbsp);
+    // FCM: 0 progressive, 10 frame-interlace, 11 field-interlace.
+    if interlace && br.read_bit()? == 1 && br.read_bit()? == 1 {
+        // FPTYPE: bit 2 = B/BI pair, bit 1 = first field P (or BI), bit 0 = second field.
+        return Some(match br.read_bits(3)? {
+            0 | 1 => Vc1Pic::Intra,
+            2 | 3 => Vc1Pic::Predicted,
+            7 => Vc1Pic::IntraB,
+            _ => Vc1Pic::Bi,
+        });
+    }
+    // PTYPE: 0 P, 10 B, 110 I, 1110 BI, 1111 skipped (P).
+    let mut ones = 0;
+    while ones < 4 && br.read_bit()? == 1 {
+        ones += 1;
+    }
+    Some(match ones {
+        1 => Vc1Pic::Bi,
+        2 => Vc1Pic::Intra,
+        3 => Vc1Pic::IntraB,
+        _ => Vc1Pic::Predicted,
+    })
+}
+
 pub struct Vc1Parser {
     // First-seen seq_header + entry_point seed MKV codecPrivate. A redefined
     // body must be emitted IN-BAND at each occurrence, and at every keyframe
@@ -91,6 +133,12 @@ pub struct Vc1Parser {
     /// (HD-DVD EVO) path where the source stamps a PTS once per GOP. `None` on
     /// the BD/UHD transport path, which carries a per-frame PTS.
     reorder: Option<super::reorder::SparsePtsReorder>,
+    /// Which pictures decode from the pictures this output holds.
+    decodable: Decodable,
+    /// What each frame held by `reorder` needs, in decode order.
+    needs: std::collections::VecDeque<Need>,
+    /// Whether an anchor followed the last entry-point picture: a B before one is leading.
+    anchor_since_entry: bool,
 }
 
 impl Default for Vc1Parser {
@@ -109,6 +157,9 @@ impl Vc1Parser {
             width: 1920,
             height: 1080,
             reorder: None,
+            decodable: Decodable::new(true),
+            needs: std::collections::VecDeque::new(),
+            anchor_since_entry: false,
         }
     }
 
@@ -117,17 +168,45 @@ impl Vc1Parser {
     pub(crate) fn with_ps_reorder(mut self, enabled: bool) -> Self {
         if enabled {
             self.reorder = Some(super::reorder::SparsePtsReorder::new());
+            // Reconstructed PTS are approximate: only a step past the leading window is a join.
+            self.decodable = Decodable::new(false);
         }
         self
     }
 
-    /// Route a finished frame through the PTS reorderer when enabled, else emit
-    /// it directly (unchanged transport-stream behaviour).
-    fn finish(&mut self, explicit: Option<i64>, frame: Frame) -> Vec<Frame> {
+    /// Route a finished frame through the PTS reorderer when enabled, then keep it
+    /// only if it decodes from what this output holds.
+    fn finish(
+        &mut self,
+        explicit: Option<i64>,
+        dts: Option<i64>,
+        frame: Frame,
+        need: Need,
+    ) -> Vec<Frame> {
         match self.reorder.as_mut() {
-            Some(r) => r.push(explicit, frame),
-            None => vec![frame],
+            Some(r) => {
+                self.needs.push_back(need);
+                let out = r.push(explicit, frame);
+                self.decide(out)
+            }
+            None => self
+                .decodable
+                .admit(frame, need, explicit, dts)
+                .into_iter()
+                .collect(),
         }
+    }
+
+    // Decide frames the reorderer released (decode order, display PTS assigned).
+    fn decide(&mut self, frames: Vec<Frame>) -> Vec<Frame> {
+        frames
+            .into_iter()
+            .filter_map(|f| {
+                let need = self.needs.pop_front().unwrap_or(Need::Nothing);
+                let pts = Some(f.pts_ns);
+                self.decodable.admit(f, need, pts, None)
+            })
+            .collect()
     }
 }
 
@@ -163,9 +242,12 @@ impl CodecParser for Vc1Parser {
         // DTS presents B-frames in decode order (judder, broken seeking).
         // Fall back to DTS only if PTS is absent.
         let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
+        let dts = pes.pts.and(pes.dts).map(pts_to_ns);
         let ts_ns = explicit_pts.unwrap_or(0);
         let mut has_seq_header = false;
         let mut has_entry_point = false;
+        // BROKEN_LINK and CLOSED_ENTRY: the entry-point header's first two bits (§6.2.1).
+        let mut entry_flags: Option<(bool, bool)> = None;
         let mut frame_start: Option<usize> = None;
         // Track whether this AU carried a redefined (in-band) copy of each
         // header type, in separate temporaries so the keyframe prefix can be
@@ -200,6 +282,8 @@ impl CodecParser for Vc1Parser {
                 }
                 SC_ENTRY_POINT => {
                     let end = find_start_code(data, pos + 4).unwrap_or(data.len());
+                    let b = data.get(pos + 4).copied().unwrap_or(0);
+                    entry_flags = Some((b & 0x80 != 0, b & 0x40 != 0));
                     if let Some(v) = handle_header(
                         &mut self.entry_point,
                         &mut self.cur_entry_point,
@@ -285,6 +369,30 @@ impl CodecParser for Vc1Parser {
             vc1_frame_coding_type(data.get(fs + 4..)?, self.cur_seq_header.as_deref())
         });
 
+        // An entry-point picture opens a segment; a B before the segment's next anchor is
+        // leading (with CLOSED_ENTRY 0 it may predict from the anchor before the entry point).
+        let picture = frame_start
+            .and_then(|fs| vc1_picture(data.get(fs + 4..)?, self.cur_seq_header.as_deref()));
+        let need = match picture {
+            None => Need::Nothing,
+            Some(_) if keyframe || entry_flags.is_some() => {
+                self.anchor_since_entry = false;
+                let (broken, closed) = entry_flags.unwrap_or((false, false));
+                Need::Rap { closed, broken }
+            }
+            Some(Vc1Pic::Intra) => {
+                self.anchor_since_entry = true;
+                Need::Intra
+            }
+            Some(Vc1Pic::Predicted) => {
+                self.anchor_since_entry = true;
+                Need::Anchor
+            }
+            Some(Vc1Pic::Bi) if self.anchor_since_entry => Need::Trailing,
+            Some(Vc1Pic::Bi) => Need::Leading,
+            Some(Vc1Pic::IntraB) => Need::Nothing,
+        };
+
         let frame = Frame {
             // Coding-type only: VC-1 field order is not decoded here, so
             // field_order() stays None — honestly absent, never guessed.
@@ -298,12 +406,15 @@ impl CodecParser for Vc1Parser {
             data: frame_data,
             duration_ns: None,
         };
-        self.finish(explicit_pts, frame)
+        self.finish(explicit_pts, dts, frame, need)
     }
 
     fn flush(&mut self) -> Vec<Frame> {
         match self.reorder.as_mut() {
-            Some(r) => r.flush(),
+            Some(r) => {
+                let out = r.flush();
+                self.decide(out)
+            }
             None => Vec::new(),
         }
     }
@@ -586,12 +697,44 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: an open entry point (CLOSED_ENTRY=0) at the stream start emits its leading B-pictures, whose forward reference precedes the title"]
     fn an_open_entry_point_at_the_stream_start_drops_its_leading_b_pictures() {
         assert_eq!(
             coding_types(entry_gop(false, false)),
             [CodingType::I, CodingType::P]
         );
+    }
+
+    #[test]
+    fn interlaced_pictures_are_judged_from_fcm_and_fptype() {
+        // INTERLACE = 1. FCM '11' + FPTYPE: '000' I/I, '011' P/P, '100' B/B, '111' BI/BI;
+        // FCM '10' (frame interlace) + PTYPE '110' I; FCM '0' + PTYPE '10' B.
+        let seq_int = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0x40];
+        let pic = |b: u8| vc1_picture(&[b], Some(&seq_int));
+        assert_eq!(pic(0b1100_0000), Some(Vc1Pic::Intra));
+        assert_eq!(pic(0b1101_1000), Some(Vc1Pic::Predicted));
+        assert_eq!(pic(0b1110_0000), Some(Vc1Pic::Bi));
+        assert_eq!(pic(0b1111_1000), Some(Vc1Pic::IntraB));
+        assert_eq!(pic(0b1011_0000), Some(Vc1Pic::Intra));
+        assert_eq!(pic(0b0100_0000), Some(Vc1Pic::Bi));
+    }
+
+    #[test]
+    fn an_interlaced_open_entry_point_at_the_stream_start_drops_its_leading_b_field_pairs() {
+        let seq = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0x40];
+        let ep = [0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x00, 0x00];
+        let pic = |b: u8| vec![0x00, 0x00, 0x01, SC_FRAME, b];
+        let aus = [
+            [&seq[..], &ep[..], &pic(0b1100_1000)].concat(), // I/P field pair
+            pic(0b1110_0000),                                // B/B, leading
+            pic(0b1101_1000),                                // P/P
+            pic(0b1110_0000),                                // B/B, trailing
+        ];
+        let mut p = Vc1Parser::new();
+        let n: Vec<usize> = aus
+            .into_iter()
+            .map(|au| p.parse(&make_pes(au, Some(0))).len())
+            .collect();
+        assert_eq!(n, [1, 0, 1, 1]);
     }
 
     #[test]
@@ -603,7 +746,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: BROKEN_LINK mid-stream is not read; the Bs it marks undecodable are emitted"]
     fn a_broken_link_drops_the_leading_b_pictures_mid_stream() {
         let mut aus = entry_gop(false, true);
         aus.extend(entry_gop(true, false));
@@ -621,7 +763,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: after a gap the ResyncGate resumes on an open entry point and passes its leading B-pictures, whose forward reference the gate dropped"]
     fn a_gap_resync_onto_an_open_entry_point_emits_no_leading_b_pictures() {
         let mut aus = entry_gop(false, true);
         aus.extend(entry_gop(false, false));

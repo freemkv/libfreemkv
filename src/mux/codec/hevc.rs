@@ -5,6 +5,7 @@
 //! Each PES packet = one access unit = one frame.
 
 use super::coding::{CodingType, PictureInfo};
+use super::decodable::{Decodable, Need};
 use super::startcode::{BitReader, find_start_code, skip_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -26,6 +27,15 @@ const SEI_CONTENT_LIGHT_LEVEL_INFO: u32 = 144;
 // Dolby Vision RPU NALs (type 62) pass through: only VPS/SPS/PPS/AUD are filtered.
 // IRAP types (keyframes): BLA, IDR, CRA
 const NAL_BLA_W_LP: u8 = 16;
+const NAL_BLA_N_LP: u8 = 18;
+const NAL_IDR_W_RADL: u8 = 19;
+const NAL_IDR_N_LP: u8 = 20;
+// Leading pictures (H.265 Table 7-1): RADL decode from their IRAP alone, RASL also
+// reference pictures before it.
+const NAL_RADL_N: u8 = 6;
+const NAL_RADL_R: u8 = 7;
+const NAL_RASL_N: u8 = 8;
+const NAL_RASL_R: u8 = 9;
 const NAL_RSV_IRAP_VCL23: u8 = 23;
 // CRA_NUT (Clean Random Access). A CRA at a splice carries RASL pictures
 // referencing frames before the splice, gone after concatenation ("Could not
@@ -115,17 +125,14 @@ pub struct HevcParser {
     /// ids are 0..=63 (H.265 §7.4.3.3); an out-of-range id is ignored.
     pps_num_extra: [Option<u32>; HEVC_MAX_PPS_COUNT],
     // Splice-aware CRA→BLA rewrite for a non-seamless BD clip boundary (first
-    // CRA_NUT -> BLA_W_LP so NoRaslOutput discards dangling RASL). Armed by PTS-backstep
-    // auto-detect in `parse`, or by the public `mark_clip_boundary` hook (no in-tree caller).
+    // CRA_NUT -> BLA_W_LP so NoRaslOutput discards dangling RASL). Armed by the public
+    // `mark_clip_boundary` hook (no in-tree caller); a CRA at a detected join is rewritten too.
     pending_clip_boundary: bool,
-    // Highest PES PTS seen, on a monotonic 64-bit timeline (33-bit PTS unwrapped
-    // across 2^33 wraps — see `pts_wrap_offset`). Auto-detects a non-seamless clip
-    // boundary when the caller never plumbs one in (see `BACKSTEP_TICKS`).
-    high_pts: Option<i64>,
-    // Accumulated 2^33-tick offset unwrapping raw PES PTS onto the monotonic
-    // `high_pts` timeline. Without it, a 33-bit PTS wrap (~26.5h) looks like a
-    // backward clip reset and false-arms the CRA→BLA rewrite, corrupting valid RASL.
-    pts_wrap_offset: i64,
+    /// Which pictures decode from the pictures this output holds; also detects a join (the
+    /// PTS timeline moves at an IRAP).
+    decodable: Decodable,
+    /// What each frame held by `reorder` needs, in decode order.
+    needs: std::collections::VecDeque<Need>,
     // HDR10 static metadata from prefix/suffix SEI: mastering display (137) and
     // content light level (144), captured independently and sticky (first wins).
     // `hdr10()` combines both only when present; SDR streams stay `None`, never fabricated.
@@ -158,18 +165,6 @@ struct ContentLightLevel {
     max_pic_average_light_level: u16,
 }
 
-// A backward PES-PTS step over this (90kHz ticks) marks a non-seamless BD clip
-// boundary: each .m2ts clip has its own PTS base, resetting far more than any
-// B-frame reorder window. Mirrors `DISCONTINUITY_BACKSTEP_NS` in `mux/timeline.rs`.
-const BACKSTEP_TICKS: i64 = 270_000;
-
-// Enforced, not just described: 90kHz ticks -> ns is × 100_000 / 9, so this must
-// equal `DISCONTINUITY_BACKSTEP_NS` exactly. Changing either constant alone fails the build.
-const _: () = assert!(
-    BACKSTEP_TICKS * 100_000 / 9 == crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS,
-    "HEVC BACKSTEP_TICKS must mirror mux::timeline::DISCONTINUITY_BACKSTEP_NS"
-);
-
 // Bytes reserved at the front of every assembled access unit so the keyframe
 // param-set re-assert (VPS+SPS+PPS, typically well under 1 KiB on BD/UHD
 // streams) can splice in without reallocating. Oversized sets just reallocate once.
@@ -193,11 +188,6 @@ thread_local! {
     static GUARD_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// 33-bit 90kHz PTS wraps at 2^33 ticks (~26.5h). A backward step of ~2^33 is a
-// wraparound (unwrap, add 2^33) not a clip reset (arbitrary sub-2^33 backward
-// step); accepting steps within `PTS_WRAP_PERIOD`/2 of a full period separates the two cases.
-const PTS_WRAP_PERIOD: i64 = 1 << 33;
-
 impl Default for HevcParser {
     fn default() -> Self {
         Self::new()
@@ -216,8 +206,8 @@ impl HevcParser {
             cur_pps: None,
             pps_num_extra: [None; HEVC_MAX_PPS_COUNT],
             pending_clip_boundary: false,
-            high_pts: None,
-            pts_wrap_offset: 0,
+            decodable: Decodable::new(true),
+            needs: std::collections::VecDeque::new(),
             sei_mastering: None,
             sei_content_light: None,
             reorder: None,
@@ -229,17 +219,45 @@ impl HevcParser {
     pub(crate) fn with_ps_reorder(mut self, enabled: bool) -> Self {
         if enabled {
             self.reorder = Some(super::reorder::SparsePtsReorder::new());
+            // Reconstructed PTS are approximate: only a step past the leading window is a join.
+            self.decodable = Decodable::new(false);
         }
         self
     }
 
-    /// Route a finished frame through the PTS reorderer when enabled, else emit
-    /// it directly (unchanged transport-stream behaviour).
-    fn finish(&mut self, explicit: Option<i64>, frame: Frame) -> Vec<Frame> {
+    /// Route a finished frame through the PTS reorderer when enabled, then keep it
+    /// only if it decodes from what this output holds.
+    fn finish(
+        &mut self,
+        explicit: Option<i64>,
+        dts: Option<i64>,
+        frame: Frame,
+        need: Need,
+    ) -> Vec<Frame> {
         match self.reorder.as_mut() {
-            Some(r) => r.push(explicit, frame),
-            None => vec![frame],
+            Some(r) => {
+                self.needs.push_back(need);
+                let out = r.push(explicit, frame);
+                self.decide(out)
+            }
+            None => self
+                .decodable
+                .admit(frame, need, explicit, dts)
+                .into_iter()
+                .collect(),
         }
+    }
+
+    // Decide frames the reorderer released (decode order, display PTS assigned).
+    fn decide(&mut self, frames: Vec<Frame>) -> Vec<Frame> {
+        frames
+            .into_iter()
+            .filter_map(|f| {
+                let need = self.needs.pop_front().unwrap_or(Need::Nothing);
+                let pts = Some(f.pts_ns);
+                self.decodable.admit(f, need, pts, None)
+            })
+            .collect()
     }
 
     // Combines mastering-display + content-light SEI into Hdr10Metadata, or `None` until BOTH
@@ -304,12 +322,12 @@ impl HevcParser {
     }
 
     /// Mark that the NEXT IRAP this parser sees begins a NON-SEAMLESS BD clip
-    /// join (MPLS `connection_condition` 0x05 or 0x06). The first CRA at/after
-    /// this point is rewritten CRA_NUT (21) → BLA_W_LP (16) so a linear decoder
-    /// sets NoRaslOutput and discards the now-dangling RASL leading pictures.
+    /// join (MPLS `connection_condition` 0x01 on a PlayItem after the first). The first
+    /// CRA at/after this point is rewritten CRA_NUT (21) → BLA_W_LP (16) so a linear
+    /// decoder sets NoRaslOutput, and its RASL leading pictures are dropped.
     ///
-    /// MUST be called ONLY for connection_condition 0x05/0x06 — never for 0x01 (seamless/first
-    /// item) or within a single-clip title.
+    /// MUST NOT be called for connection_condition 0x05/0x06 (seamless), for the first
+    /// PlayItem, or within a single-clip title.
     pub fn mark_clip_boundary(&mut self) {
         self.pending_clip_boundary = true;
     }
@@ -414,34 +432,17 @@ impl CodecParser for HevcParser {
         // player reorders). Use PTS not DTS: DTS presents B-frames in decode
         // order (visible judder) and breaks PTS-based seeking; fall back only if absent.
         let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
+        let dts = pes.pts.and(pes.dts).map(pts_to_ns);
         let pts_ns = explicit_pts.unwrap_or(0);
 
-        // Auto-detect a non-seamless clip boundary: mpls connection_condition
-        // isn't plumbed through the (threaded) mux pipeline, so a PTS backstep
-        // beyond `BACKSTEP_TICKS` on the unwrapped/high-water timeline arms the rewrite.
-        if let Some(raw_pts) = pes.pts {
-            // Unwrap onto the monotonic timeline: if the offset-adjusted value
-            // dropped ~2^33 below the high-water, the counter wrapped — add
-            // another period and re-check, rather than treat it as a clip reset.
-            let mut unwrapped = raw_pts + self.pts_wrap_offset;
-            if let Some(high) = self.high_pts
-                && high - unwrapped > PTS_WRAP_PERIOD / 2
-            {
-                self.pts_wrap_offset += PTS_WRAP_PERIOD;
-                unwrapped += PTS_WRAP_PERIOD;
-            }
-            match self.high_pts {
-                Some(high) if unwrapped < high - BACKSTEP_TICKS => {
-                    self.pending_clip_boundary = true;
-                    self.high_pts = Some(unwrapped);
-                }
-                Some(high) => self.high_pts = Some(high.max(unwrapped)),
-                None => self.high_pts = Some(unwrapped),
-            }
-        }
+        // A join (mpls connection_condition isn't plumbed through the mux pipeline): an
+        // IRAP whose PTS does not continue the timeline. Its RASL reference another clip.
+        let joined = self.decodable.joined(explicit_pts, dts);
 
         let data = &pes.data;
         let mut keyframe = false;
+        // NAL type of the AU's IRAP slice, else its first coded slice: what it needs to decode.
+        let mut vcl_type: Option<u8> = None;
         // Set once the first CRA of a non-seamless join is seen in this AU.
         let mut bla_au = false;
         // Picture coding type, MEASURED from the first coded slice's header.
@@ -479,6 +480,9 @@ impl CodecParser for HevcParser {
                     // Measure coding type from the first coded slice (VCL NAL
                     // 0..=31), only once the active PPS is known so the bit
                     // offset to `slice_type` is exact; else decline (`None`), never guess.
+                    if nal_type <= NAL_VCL_MAX && !keyframe {
+                        vcl_type.get_or_insert(nal_type);
+                    }
                     if coding_type.is_none() && nal_type <= NAL_VCL_MAX {
                         // Resolve num_extra from the PPS the slice REFERENCES (by
                         // its slice_pic_parameter_set_id), not the last-active PPS.
@@ -531,10 +535,11 @@ impl CodecParser for HevcParser {
                         NAL_AUD => {}
                         t if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&t) => {
                             keyframe = true;
-                            // Splice-aware CRA→BLA: the first CRA_NUT after a
-                            // non-seamless boundary becomes BLA_W_LP so NoRaslOutput
-                            // drops RASL. Any IRAP clears the flag; only CRA is rewritten.
-                            if self.pending_clip_boundary && t == NAL_CRA_NUT {
+                            vcl_type = Some(t);
+                            // Splice-aware CRA→BLA: a CRA at a join or a marked boundary
+                            // becomes BLA_W_LP so NoRaslOutput drops RASL. Any IRAP clears
+                            // the mark; only CRA is rewritten.
+                            if (self.pending_clip_boundary || joined) && t == NAL_CRA_NUT {
                                 bla_au = true;
                             }
                             self.pending_clip_boundary = false;
@@ -630,6 +635,27 @@ impl CodecParser for HevcParser {
             return Vec::new();
         }
 
+        // RASL reference pictures before their IRAP (dropped unless the output holds them;
+        // always after a BLA); RADL only their IRAP.
+        let need = match vcl_type {
+            None => Need::Nothing,
+            Some(NAL_BLA_W_LP..=NAL_BLA_N_LP) => Need::Rap {
+                closed: false,
+                broken: true,
+            },
+            Some(NAL_IDR_W_RADL | NAL_IDR_N_LP) => Need::Rap {
+                closed: true,
+                broken: false,
+            },
+            Some(NAL_CRA_NUT..=NAL_RSV_IRAP_VCL23) => Need::Rap {
+                closed: false,
+                broken: bla_au,
+            },
+            Some(NAL_RADL_N | NAL_RADL_R) => Need::Nothing,
+            Some(NAL_RASL_N | NAL_RASL_R) => Need::Leading,
+            Some(_) => Need::Anchor,
+        };
+
         // HDR10 static metadata is stamped onto every frame's PictureInfo once
         // both SEI messages are seen, riding the deferred-muxer path (reads it
         // from the first coded picture before the track header). `None` for SDR tracks.
@@ -650,12 +676,15 @@ impl CodecParser for HevcParser {
             data: frame_data,
             duration_ns: None,
         };
-        self.finish(explicit_pts, frame)
+        self.finish(explicit_pts, dts, frame, need)
     }
 
     fn flush(&mut self) -> Vec<Frame> {
         match self.reorder.as_mut() {
-            Some(r) => r.flush(),
+            Some(r) => {
+                let out = r.flush();
+                self.decide(out)
+            }
             None => Vec::new(),
         }
     }
@@ -1636,7 +1665,7 @@ mod tests {
         };
         let mut data = nal(NAL_PPS, pps_body(3));
         data.extend_from_slice(&nal(1, slice_body));
-        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        let frames = primed().parse(&make_pes(data, Some(0)));
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].coding.expect("PictureInfo").coding_type(),
@@ -1649,7 +1678,7 @@ mod tests {
         // decides the offset.
         let mut data0 = nal(NAL_PPS, pps_body(0));
         data0.extend_from_slice(&nal(1, slice_body));
-        let frames0 = HevcParser::new().parse(&make_pes(data0, Some(0)));
+        let frames0 = primed().parse(&make_pes(data0, Some(0)));
         assert_eq!(
             frames0[0].coding.expect("PictureInfo").coding_type(),
             CodingType::B,
@@ -1693,7 +1722,7 @@ mod tests {
         data.extend_from_slice(&nal_bytes(NAL_PPS, &pps1));
         data.extend_from_slice(&nal_bytes(1, &[slice]));
 
-        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        let frames = primed().parse(&make_pes(data, Some(0)));
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].coding.expect("PictureInfo").coding_type(),
@@ -1715,7 +1744,7 @@ mod tests {
         let slice64 = [0b1000_0001, 0b0000_0101, 0b1100_0000];
         let mut data = nal_bytes(NAL_PPS, &pps64);
         data.extend_from_slice(&nal_bytes(1, &slice64));
-        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        let frames = primed().parse(&make_pes(data, Some(0)));
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].coding.map(|c| c.coding_type()),
@@ -1730,11 +1759,19 @@ mod tests {
         assert_eq!(hevc_pps_id(&[0x44, 0x01, pps63[0], pps63[1]]), Some(63));
         let mut data = nal_bytes(NAL_PPS, &pps63);
         data.extend_from_slice(&nal_bytes(1, &slice63));
-        let frames = HevcParser::new().parse(&make_pes(data, Some(0)));
+        let frames = primed().parse(&make_pes(data, Some(0)));
         assert_eq!(
             frames[0].coding.map(|c| c.coding_type()),
             Some(CodingType::I)
         );
+    }
+
+    /// A parser that has emitted an IDR at PTS 0, so an inter picture after it decodes.
+    fn primed() -> HevcParser {
+        let mut p = HevcParser::new();
+        let idr = p.parse(&make_pes(nal_bytes(19, &[0x80]), Some(0)));
+        assert!(idr[0].keyframe);
+        p
     }
 
     /// Build an Annex-B NAL (start code + 2-byte header + body bytes).
@@ -1759,7 +1796,7 @@ mod tests {
         };
         let src = crate::pes::SourcePos::at_byte(16384);
         let run = |slice_body: u8| {
-            let mut p = HevcParser::new();
+            let mut p = primed();
             let mut data = nal(NAL_PPS, 0xC0); // active PPS first (sets num_extra)
             data.extend_from_slice(&nal(1, slice_body)); // then the coded slice
             let mut pe = make_pes(data, Some(0));
@@ -1793,7 +1830,7 @@ mod tests {
 
         // No PPS seen → num_extra is unknown, so slice_type is NOT guessed; the
         // coding stays None (honestly absent) rather than risk a wrong offset.
-        let mut p = HevcParser::new();
+        let mut p = primed();
         let bare = p.parse(&make_pes(nal(1, 0xD8), Some(0)));
         assert!(
             bare[0].coding.is_none(),
@@ -2368,12 +2405,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: a non-seamless join whose PTS jumps FORWARD is not detected, so its CRA stays CRA and its RASL decode against the previous clip"]
     fn a_forward_pts_join_onto_a_cra_does_not_hand_its_rasl_to_the_decoder() {
-        // Clip 1: CRA + trailing pictures at ~0 s. Clip 2 starts 100 s later in
-        // the source clock (e.g. a PlayItem that skips part of a clip, or a clip
-        // whose STC runs ahead) with a CRA whose RASL reference a picture of
-        // the skipped material.
+        // Clip 1: CRA + trailing pictures at ~0 s. Clip 2 starts 100 s later in the
+        // source clock (a PlayItem that skips part of a clip, or an STC running ahead)
+        // with a CRA whose RASL reference a picture of the skipped material.
         let mut p = HevcParser::new();
         let mut frames = Vec::new();
         frames.extend(p.parse(&make_pes(cra_au(&[0x01]), Some(0))));
@@ -2407,7 +2442,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: after a gap the ResyncGate resumes on a CRA and passes its RASL, whose reference the gate dropped"]
     fn a_gap_resync_onto_a_cra_does_not_hand_its_rasl_to_the_decoder() {
         // IDR, a TRAIL_R that follows lost data, then a CRA (same clock) whose RASL
         // reference the dropped TRAIL_R. The CRA is not first in the bitstream, so
@@ -2435,13 +2469,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: pictures before the stream's first IRAP are emitted with no reference"]
     fn pictures_before_the_first_irap_are_dropped() {
         let mut p = HevcParser::new();
         let mut frames = Vec::new();
         frames.extend(p.parse(&make_pes(nal_bytes(1, &[0xD0]), Some(0))));
         frames.extend(p.parse(&make_pes(cra_au(&[0x01]), Some(3750))));
         assert!(frames[0].keyframe, "the first emitted picture is the IRAP");
+    }
+
+    #[test]
+    fn a_cra_at_the_stream_start_drops_its_rasl_and_keeps_its_radl() {
+        // A conforming decoder discards these RASL itself; some hardware decoders do not.
+        let mut p = HevcParser::new();
+        let pes = [
+            make_pes(cra_au(&[0x01]), Some(3 * 3750)),
+            make_pes(nal_bytes(9, &[0xE0]), Some(0)),
+            make_pes(nal_bytes(8, &[0xE0]), Some(3750)),
+            make_pes(nal_bytes(7, &[0xE0]), Some(2 * 3750)),
+            make_pes(nal_bytes(1, &[0xD0]), Some(4 * 3750)),
+        ];
+        let types: Vec<u8> = pes
+            .iter()
+            .flat_map(|x| p.parse(x))
+            .map(|f| nal_type_of(&nals_of(&f.data)[0]))
+            .collect();
+        assert_eq!(types, [NAL_CRA_NUT, 7, 1]);
     }
 
     /// Test 2: a CRA with NO boundary marker is left unchanged (CRA stays CRA).
@@ -2462,21 +2514,20 @@ mod tests {
     #[test]
     fn cra_at_auto_detected_pts_backstep_rewritten_to_bla() {
         let mut parser = HevcParser::new();
-        // Clip 1: a CRA then a few trailing frames advancing the PTS watermark.
-        // PTS in 90 kHz ticks: 0, then ~1 h into the clip.
-        let one_hour = 90_000i64 * 3600;
-        parser.parse(&make_pes(cra_au(&[0x01]), Some(0)));
-        parser.parse(&make_pes(cra_au(&[0x02]), Some(one_hour)));
-        // In-clip B-frame dip: PTS steps back a few frames (< BACKSTEP_TICKS).
-        // Must NOT be mistaken for a clip boundary — this CRA stays CRA.
-        let dip = parser.parse(&make_pes(cra_au(&[0x03]), Some(one_hour - 3 * 3750)));
+        // Clip 1, ~1 h in: a CRA, then a picture decoded ahead and a B-frame dip (PTS
+        // stepping back below it) — reorder, not a boundary — then the next CRA continuing.
+        let t = 90_000i64 * 3600;
+        parser.parse(&make_pes(cra_au(&[0x01]), Some(t)));
+        parser.parse(&make_pes(nal_bytes(1, &[0xD0]), Some(t + 2 * 3750)));
+        parser.parse(&make_pes(nal_bytes(1, &[0xC0]), Some(t + 3750)));
+        let next = parser.parse(&make_pes(cra_au(&[0x03]), Some(t + 4 * 3750)));
         assert_eq!(
-            nal_type_of(&nals_of(&dip[0].data)[0]),
+            nal_type_of(&nals_of(&next[0].data)[0]),
             NAL_CRA_NUT,
-            "a sub-threshold B-frame PTS dip must not trigger the rewrite"
+            "a B-frame PTS dip must not trigger the rewrite"
         );
         // Clip 2 splice: PES PTS resets to a new clip base far below the
-        // watermark (> BACKSTEP_TICKS backward). The opening CRA is rewritten.
+        // watermark. The opening CRA is rewritten.
         let splice = parser.parse(&make_pes(cra_au(&[0x04]), Some(0)));
         assert_eq!(
             nal_type_of(&nals_of(&splice[0].data)[0]),
@@ -2484,7 +2535,7 @@ mod tests {
             "the splice CRA after a backward PTS reset must become BLA_W_LP"
         );
         // One-shot: the NEXT clip-2 CRA (PTS advancing again) stays CRA.
-        let next = parser.parse(&make_pes(cra_au(&[0x05]), Some(90_000)));
+        let next = parser.parse(&make_pes(cra_au(&[0x05]), Some(3750)));
         assert_eq!(
             nal_type_of(&nals_of(&next[0].data)[0]),
             NAL_CRA_NUT,
@@ -2499,13 +2550,13 @@ mod tests {
         let mut parser = HevcParser::new();
         let period = 1i64 << 33;
         // Single clip, PTS climbing toward the 33-bit wrap. Start just below 2^33.
-        let near_wrap = period - 90_000; // ~1 s before the wrap point
+        let near_wrap = period - 2 * 3750; // two frames before the wrap point
         parser.parse(&make_pes(cra_au(&[0x01]), Some(near_wrap)));
         parser.parse(&make_pes(cra_au(&[0x02]), Some(near_wrap + 3750)));
         // The counter wraps: raw PTS resets to a small value, but this is the
         // SAME continuous clip, one frame later. A naive raw comparison sees a
         // ~2^33 backward step and false-arms the boundary.
-        let wrapped = parser.parse(&make_pes(cra_au(&[0x03]), Some(7500)));
+        let wrapped = parser.parse(&make_pes(cra_au(&[0x03]), Some(0)));
         assert_eq!(
             nal_type_of(&nals_of(&wrapped[0].data)[0]),
             NAL_CRA_NUT,
@@ -2513,7 +2564,7 @@ mod tests {
         );
         // Continue past the wrap: PTS keeps climbing from the new low base; still
         // one continuous clip, the CRA after must remain CRA.
-        let after = parser.parse(&make_pes(cra_au(&[0x04]), Some(11250)));
+        let after = parser.parse(&make_pes(cra_au(&[0x04]), Some(3750)));
         assert_eq!(
             nal_type_of(&nals_of(&after[0].data)[0]),
             NAL_CRA_NUT,
@@ -2677,7 +2728,7 @@ mod tests {
 
     #[test]
     fn parse_trailing_not_keyframe() {
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
 
         // TRAIL_R = type 1
         let mut data = Vec::new();
@@ -2697,7 +2748,7 @@ mod tests {
 
     #[test]
     fn parse_tsa_not_keyframe() {
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
 
         // TSA_N = type 2
         let mut data = Vec::new();
@@ -2804,7 +2855,7 @@ mod tests {
     // it.
     #[test]
     fn redefined_pps_emitted_inline() {
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
         let pps = |body: u8| {
             let mut v = vec![0x00, 0x00, 0x01];
             v.extend_from_slice(&hevc_nal_header(34)); // PPS
@@ -2875,7 +2926,7 @@ mod tests {
         // `00 00 01 00 00 01 <real NAL>`: two adjacent start codes leave the
         // in-between NAL empty after the trailing-zero strip. It must be skipped,
         // not written as a bare 0x00000000 length prefix (malformed to a decoder).
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x01]); // start code, empty NAL
         data.extend_from_slice(&[0x00, 0x00, 0x01]); // next start code
@@ -2921,7 +2972,7 @@ mod tests {
 
     #[test]
     fn pts_conversion() {
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
 
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -2940,7 +2991,7 @@ mod tests {
 
     #[test]
     fn pts_preferred_over_dts() {
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
 
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -3899,7 +3950,7 @@ mod tests {
     #[test]
     fn type_15_just_below_irap_not_keyframe() {
         // Type 15 (RASL_R) is one below the IRAP range and must NOT be a keyframe.
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
         let mut data = vec![0x00, 0x00, 0x01];
         data.extend_from_slice(&hevc_nal_header(15));
         data.extend_from_slice(&[0x10, 0x20]);
@@ -3911,7 +3962,7 @@ mod tests {
     #[test]
     fn type_24_just_above_irap_not_keyframe() {
         // Type 24 (RSV_VCL24) is one above the IRAP range (..=23) → not keyframe.
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
         let mut data = vec![0x00, 0x00, 0x01];
         data.extend_from_slice(&hevc_nal_header(24));
         data.extend_from_slice(&[0x10, 0x20]);
@@ -3937,7 +3988,7 @@ mod tests {
 
     #[test]
     fn hevc_dts_fallback_when_pts_absent() {
-        let mut parser = HevcParser::new();
+        let mut parser = primed();
         let pes = PesPacket {
             source: None,
             pid: 0x1011,

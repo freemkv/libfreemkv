@@ -115,6 +115,8 @@ pub struct Mpeg2Parser {
     last_kept: bool,
     /// A dropped picture's discontinuity flag, carried to the next emitted frame.
     carry_discontinuity: bool,
+    /// A discontinuity was seen; `refs` resets at the I-picture the `ResyncGate` resumes on.
+    gap: bool,
 }
 
 /// GOP header flags (ISO/IEC 13818-2 §6.3.8).
@@ -168,6 +170,7 @@ impl Mpeg2Parser {
             gop_anchor_tr: None,
             last_kept: false,
             carry_discontinuity: false,
+            gap: false,
         }
     }
 
@@ -380,6 +383,12 @@ impl Mpeg2Parser {
                 if g.broken_link {
                     self.refs = 0;
                 }
+            }
+            // After a gap the gate drops (and counts) up to the next I, which holds none before it.
+            self.gap |= bp.frame.discontinuity;
+            if self.gap && bp.frame.keyframe {
+                self.gap = false;
+                self.refs = 0;
             }
             if bp.second_field {
                 keep.push(self.last_kept);
@@ -1056,7 +1065,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: after a gap the ResyncGate resumes on an open GOP's I-picture and passes its leading B-pictures, whose forward reference the gate dropped"]
     fn a_gap_resync_onto_an_open_gop_emits_no_leading_b_pictures() {
         // GOP 1 (closed) loses data before P5: P5 and the Bs after it reference
         // the lost picture. GOP 2 is open and PTS-continuous (no join): its leading

@@ -3118,6 +3118,24 @@ mod tests {
         assert!(m.flush().iter().all(|(_, add)| add.is_none()));
     }
 
+    // The base parser drops a leading picture it cannot decode; the dependent access unit
+    // of that PTS pairs with no base and is never written.
+    #[test]
+    fn mvc_merge_drops_the_dependent_of_a_dropped_base() {
+        let mut m = empty_merge();
+        assert!(
+            m.ingest(&mvc_frame(2, 1, false, lp(&[&DEP_SLICE])))
+                .is_empty()
+        );
+        let dep = lp(&[&DEP_SLICE, &DEP_PPS]);
+        assert!(m.ingest(&mvc_frame(2, 3, false, dep.clone())).is_empty());
+        let e = m.ingest(&mvc_frame(0, 3, true, vec![0x65, 1]));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].1.as_deref(), Some(dep.as_slice()));
+        assert!(m.flush().is_empty());
+        assert_eq!(m.orphan_deps, 1);
+    }
+
     #[test]
     fn mvc_merge_dep_overflow_drops_old_keeps_newest() {
         let mut m = empty_merge();
