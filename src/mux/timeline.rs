@@ -3,7 +3,7 @@
 //! A BD/UHD title's clips are read as one concatenated sector stream, so the source PES PTS
 //! does not run continuously across a clip join. [`SeamPlan`] places frames exactly from the
 //! playlist's marks when present; [`TimelineContinuity::adjust`] infers seams from PTS jumps
-//! otherwise, and [`TimelineContinuity::map`] picks between them so every muxer/sink shares one
+//! otherwise, and [`TimelineContinuity::map_picture`] picks between them so every muxer/sink shares one
 //! correction path.
 
 // A backward PTS step larger than this is a clip-boundary discontinuity (source PES PTS reset),
