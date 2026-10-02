@@ -226,6 +226,12 @@ impl PictureInfo {
         }
     }
 
+    /// Whether a later picture may predict from this one. An MPEG-2 B-picture never is a
+    /// reference; other codecs' B-pictures may be (H.264/HEVC), or are not decoded that far.
+    pub(crate) fn may_be_referenced(&self) -> bool {
+        !(self.coding_type == CodingType::B && matches!(self.detail, CodingDetail::Mpeg2(_)))
+    }
+
     /// I-picture ⇒ cue/keyframe point. Convenience over `coding_type()`.
     pub fn keyframe(&self) -> bool {
         self.coding_type == CodingType::I

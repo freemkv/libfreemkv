@@ -274,12 +274,16 @@ impl crate::pes::PesSink for M2tsStream {
                 self.disc_title.streams.get(frame.track),
                 Some(DiscStream::Video(_))
             );
-            let Some(mapped) = self.timeline.map(
+            let Some(mapped) = self.timeline.map_picture(
                 frame.pts,
                 Some(frame.track) == self.ref_video,
                 frame.track,
                 is_video,
                 frame.source.map(|s| s.byte),
+                is_video.then_some(crate::mux::timeline::SeamPic {
+                    keyframe: frame.keyframe,
+                    coding: frame.coding,
+                }),
             ) else {
                 return Ok(());
             };

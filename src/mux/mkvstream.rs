@@ -583,8 +583,8 @@ fn emit_to_muxer(
         additional,
         // Provenance: which clip this frame came from is a lookup, not a guess.
         frame.source.map(|s| s.byte),
-        // This picture's measured scan type, tallied for the FlagInterlaced majority.
-        frame.coding.as_ref().and_then(|c| c.field_order()),
+        // This picture's measured coding: its scan type and what the seam plan may trim.
+        frame.coding,
         frame.discard_padding_ns,
     )
 }
@@ -821,7 +821,7 @@ impl MkvStream {
                 f.duration_ns,
                 additional.as_deref(),
                 f.source.map(|s| s.byte),
-                f.coding.as_ref().and_then(|c| c.field_order()),
+                f.coding,
                 f.discard_padding_ns,
             );
             // A track-range reject writes nothing and is not fatal (see
