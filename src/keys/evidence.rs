@@ -55,8 +55,22 @@ impl Disc {
 pub enum Detector {
     /// BD/UHD CPI flags: keys are proven on ciphertext.
     Verified,
-    /// HD DVD: the test is unverified, so a single declared key is applied without proof.
+    /// HD DVD: the flag is unverified, so a unit reads clear only when it is also whole
+    /// content; encrypted content gets a single declared key applied without proof.
     Unverified,
+}
+
+impl Detector {
+    // The format's own test of one aligned unit, feeding the one encryption decision
+    // (`resolve::acquire`). Verified: the CPI flag. Unverified: encrypted unless the unit is
+    // unflagged and structurally whole content (an AACS unit's ciphertext is not).
+    pub(crate) fn unit_encrypted(self, unit: &[u8], format: ContentFormat) -> bool {
+        use crate::aacs::content::{aacs_unit_encrypted, is_clean};
+        match self {
+            Detector::Verified => aacs_unit_encrypted(unit, format),
+            Detector::Unverified => aacs_unit_encrypted(unit, format) || !is_clean(unit, format),
+        }
+    }
 }
 
 /// One unit of key proof (design §2.2): a stream file, a title extent no file covers, or a
@@ -393,12 +407,14 @@ impl<'a> Sampler<'a> {
         read_unit(self.reader, lba)
     }
 
-    // Up to 32 units on `p`'s grid (KU §2.3 step 7), skipping FMTS segment units.
+    // Up to 32 units on `p`'s grid (KU §2.3 step 7), skipping FMTS segment units, each
+    // judged by `detector`.
     pub(crate) fn probe(
         &mut self,
         p: &Piece,
         segments: &[(u32, u32)],
         format: ContentFormat,
+        detector: Detector,
         halt: &Halt,
     ) -> Result<(u64, Vec<Sample>)> {
         let (units, lbas) = probe_lbas(p, segments);
@@ -406,33 +422,12 @@ impl<'a> Sampler<'a> {
         for lba in lbas {
             halt.check()?;
             out.push(match self.unit(lba)? {
-                Some(u) if crate::aacs::content::aacs_unit_encrypted(&u, format) => Sample::Enc(u),
+                Some(u) if detector.unit_encrypted(&u, format) => Sample::Enc(u),
                 Some(_) => Sample::Clear,
                 None => Sample::Fault,
             });
         }
         Ok((units, out))
-    }
-
-    // Whether `p` is MPEG-PS content already in the clear: every unit `probe` would sample is
-    // readable, unflagged and structurally whole packs (the ciphertext of an AACS unit is not).
-    // `false` when no unit was sampled.
-    pub(crate) fn ps_in_clear(&mut self, p: &Piece, halt: &Halt) -> Result<bool> {
-        use crate::aacs::content::{aacs_unit_encrypted, is_clean};
-        let (_, lbas) = probe_lbas(p, &[]);
-        if lbas.is_empty() {
-            return Ok(false);
-        }
-        for lba in lbas {
-            halt.check()?;
-            match self.unit(lba)? {
-                Some(u)
-                    if !aacs_unit_encrypted(&u, ContentFormat::MpegPs)
-                        && is_clean(&u, ContentFormat::MpegPs) => {}
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
     }
 
     // Up to `n` encrypted units spread over the main feature.

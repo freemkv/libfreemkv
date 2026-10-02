@@ -110,6 +110,28 @@ fn read_unit(
     super::evidence::read_unit(reader, lba).ok().flatten()
 }
 
+/// Whether the forensic segments read in the clear: the first unit of each of up to
+/// [`MAX_ANCHOR_ATTEMPTS`] segments is readable and unflagged. `false` when a segment has no
+/// sector range or no unit was read.
+pub(crate) fn segments_clear(
+    reader: &mut dyn SectorSource,
+    layout: &Layout,
+    format: ContentFormat,
+    halt: &Halt,
+) -> Result<bool> {
+    if layout.unresolved || layout.segments.is_empty() {
+        return Ok(false);
+    }
+    for seg in layout.segments.iter().take(MAX_ANCHOR_ATTEMPTS) {
+        halt.check()?;
+        match read_unit(reader, &layout.clip, seg, 0) {
+            Some(u) if !crate::aacs::content::aacs_unit_encrypted(&u, format) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// Sends one anchor batch to the sources: `Ok(None)` for an empty answer.
 pub(crate) type AskFn<'a> = dyn FnMut(&[Vec<u8>]) -> Result<Option<Vec<[u8; 16]>>> + 'a;
 

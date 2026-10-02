@@ -331,10 +331,10 @@ fn sha256(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
 }
 
 impl KeyRing {
-    /// Acquire the keys `ev.scope()` needs, once, before any output (KU §2.3). The only
-    /// code in the product that asks a [`crate::KeySource`] for keys; `sources` is called
-    /// once and every source it builds is dropped before this returns (LK7). `sampler`
-    /// reads the evidence's pieces from the same raw source; `ctx.halt` stops it.
+    /// Acquire the keys `ev.scope()` needs, once, before any output (KU §2.3): the only code
+    /// that asks a [`crate::KeySource`]; every source `sources` builds is dropped before this
+    /// returns (LK7). `sampler` reads the pieces from the same raw source. Content the
+    /// format's own detector reads in the clear asks no source, whatever key files it declares.
     ///
     /// `Err` refuses the rip before any output: E7022 (a title piece is Missing), E7032 (an
     /// image or folder piece is Missing), E7013 (a single declared key opens none of the
