@@ -224,10 +224,8 @@ impl KeyEvidence {
         });
         let whole = ev.scope == KeyScope::WholeDisc;
         if ev.detector == Detector::Unverified {
-            // Acquisition refuses a multi-key HD DVD before it lists any file.
-            if n_declared != Some(1) {
-                return Ok(ev);
-            }
+            // Listed whatever the declared count: acquisition judges a copy in the clear from
+            // its pieces before it refuses a multi-key HD DVD.
             let files = match crate::whole_disc::content_files(reader) {
                 Ok(f) => f,
                 Err(e) if whole => return Err(e),
@@ -403,27 +401,10 @@ impl<'a> Sampler<'a> {
         format: ContentFormat,
         halt: &Halt,
     ) -> Result<(u64, Vec<Sample>)> {
-        let grid = p.grid();
-        let units: u64 = grid.iter().map(|g| g.1).sum();
+        let (units, lbas) = probe_lbas(p, segments);
         let mut out = Vec::new();
-        for idx in probe_units(units) {
+        for lba in lbas {
             halt.check()?;
-            let mut k = idx;
-            let Some(&(head, _)) = grid.iter().find(|g| {
-                let hit = k < g.1;
-                if !hit {
-                    k -= g.1;
-                }
-                hit
-            }) else {
-                continue;
-            };
-            let Ok(lba) = u32::try_from(head + k * UNIT) else {
-                continue;
-            };
-            if in_segment(segments, lba) {
-                continue;
-            }
             out.push(match self.unit(lba)? {
                 Some(u) if crate::aacs::content::aacs_unit_encrypted(&u, format) => Sample::Enc(u),
                 Some(_) => Sample::Clear,
@@ -433,11 +414,59 @@ impl<'a> Sampler<'a> {
         Ok((units, out))
     }
 
+    // Whether `p` is MPEG-PS content already in the clear: every unit `probe` would sample is
+    // readable, unflagged and structurally whole packs (the ciphertext of an AACS unit is not).
+    // `false` when no unit was sampled.
+    pub(crate) fn ps_in_clear(&mut self, p: &Piece, halt: &Halt) -> Result<bool> {
+        use crate::aacs::content::{aacs_unit_encrypted, is_clean};
+        let (_, lbas) = probe_lbas(p, &[]);
+        if lbas.is_empty() {
+            return Ok(false);
+        }
+        for lba in lbas {
+            halt.check()?;
+            match self.unit(lba)? {
+                Some(u)
+                    if !aacs_unit_encrypted(&u, ContentFormat::MpegPs)
+                        && is_clean(&u, ContentFormat::MpegPs) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     // Up to `n` encrypted units spread over the main feature.
     pub(crate) fn main_samples(&mut self, main: Option<&MainTitle>, n: usize) -> Vec<Vec<u8>> {
         main.map(|m| crate::keysource::encrypted_units_in(self.reader, &m.extents, m.format, n))
             .unwrap_or_default()
     }
+}
+
+// The units `probe` samples on `p`'s grid: (the grid's unit count, their LBAs), FMTS
+// segment units skipped.
+fn probe_lbas(p: &Piece, segments: &[(u32, u32)]) -> (u64, Vec<u32>) {
+    let grid = p.grid();
+    let units: u64 = grid.iter().map(|g| g.1).sum();
+    let mut out = Vec::new();
+    for idx in probe_units(units) {
+        let mut k = idx;
+        let Some(&(head, _)) = grid.iter().find(|g| {
+            let hit = k < g.1;
+            if !hit {
+                k -= g.1;
+            }
+            hit
+        }) else {
+            continue;
+        };
+        let Ok(lba) = u32::try_from(head + k * UNIT) else {
+            continue;
+        };
+        if !in_segment(segments, lba) {
+            out.push(lba);
+        }
+    }
+    (units, out)
 }
 
 pub(crate) fn read_unit(reader: &mut dyn SectorSource, lba: u32) -> Result<Option<Vec<u8>>> {

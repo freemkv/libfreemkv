@@ -978,6 +978,42 @@ fn hddvd_single_key_best_effort_multi_key_refuses() {
     }
 }
 
+/// An HD DVD copy already in the clear (whole MPEG-PS packs, no scrambling flag) that kept its
+/// AACS directory needs no key, however many keys its title-key file declares: the set is
+/// clear, no source is asked, nothing is best effort.
+#[test]
+fn hddvd_in_the_clear_needs_no_key_whatever_it_declares() {
+    let mut clip = vec![0u8; 30 * 2048];
+    for (i, sector) in clip.chunks_mut(2048).enumerate() {
+        for (j, b) in sector.iter_mut().enumerate() {
+            *b = ((i * 31 + j) % 251) as u8 | 1;
+        }
+        sector[..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sector[20] &= !0x30;
+    }
+    let files = [
+        BdFile::new("HVDVD_TS/FEATURE.EVO", 30, None).with_clip(clip),
+        BdFile::new("BDMV/index.bdmv", 1, None),
+    ];
+    for declared in [1, 64] {
+        let uk_ro = unit_key_ro(AacsVersion::V10, &vec![[0xEE; 16]; declared], &[1]);
+        let img = encrypted_bd_image(&files, &uk_ro);
+        let disc = disc_over(&img, &uk_ro, &[&[0]], DiscFormat::HdDvd);
+        let fx = Fx { img, disc };
+        let calls = Calls::default();
+        let set = resolve(&fx, KeyScope::Titles(vec![0]), &[Spec::keydb(&[], &calls)])
+            .unwrap_or_else(|e| panic!("{declared} declared: a clear HD DVD refused: {e}"));
+        let s = set.status();
+        assert_eq!(
+            (s.keyed, s.clear, s.best_effort),
+            (0, 1, false),
+            "{declared} declared"
+        );
+        assert_eq!(calls.len(), 0, "no source is asked for a clear disc");
+        assert!(set.is_aacs(), "the set still answers for the AACS disc");
+    }
+}
+
 /// An HD DVD set's unit spans stay in LBA order across fragmented and interleaved pieces:
 /// `span_at` bisects them.
 #[test]

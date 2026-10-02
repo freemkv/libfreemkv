@@ -483,6 +483,32 @@ fn resolve_hddvd(
     n_decl: Option<usize>,
     run: &mut Run,
 ) -> Result<Inner> {
+    // A copy already in the clear (it kept its AACS directory) needs no key, whatever the
+    // title-key file declares: every piece is clear.
+    if !ev.pieces.is_empty() {
+        let mut clear = true;
+        for p in &ev.pieces {
+            if !sampler.ps_in_clear(p, run.halt)? {
+                clear = false;
+                break;
+            }
+        }
+        if clear {
+            let ps: Vec<Probed> = ev
+                .pieces
+                .iter()
+                .cloned()
+                .map(|p| Probed {
+                    verdict: Verdict::Clear,
+                    ..Probed::new(p)
+                })
+                .collect();
+            let mut inner = aacs_inner(run);
+            inner.no_stream_files = ev.no_stream_files;
+            build(&mut inner, &ps, None, None, run, Vec::new());
+            return Ok(inner);
+        }
+    }
     if n_decl != Some(1) {
         tracing::error!(target: "freemkv::keys", declared = ?n_decl, "multi-key HD DVD cannot be matched reliably");
         return Err(Error::NoDiscKey {
