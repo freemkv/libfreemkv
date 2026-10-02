@@ -3546,6 +3546,122 @@ mod tests {
         );
     }
 
+    // A one-title DVD image whose one VOB sector is `sector`.
+    fn dvd_image_with(sector: &[u8]) -> crate::udf::fixture::MemDisc {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, dvd_vmg_bytes(), true),
+                    file_with("VTS_01_0.IFO", 62, 6000, dvd_vts_bytes(1000, 10, 10), true),
+                ],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        disc.put_bytes(9010, sector);
+        disc
+    }
+
+    // A key source that counts the times it is asked and holds no key.
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::keysource::KeySource for Counting {
+        fn get_unit_keys(
+            &self,
+            _: &dyn crate::keysource::ResolveCtx,
+        ) -> Result<Vec<crate::aacs::types::UnitKey>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    // `img` scanned, its main title's keys acquired over `asked`, and the decrypt gate.
+    fn dvd_decision(
+        img: &mut crate::udf::fixture::MemDisc,
+        asked: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Disc, Result<()>) {
+        use crate::keys::{AcquireOptions, KeyRing, KeyScope, check_decryptable};
+        let disc = Disc::scan_image(img, 500_000, &ScanOptions::default()).unwrap();
+        let a = asked.clone();
+        let sources: crate::session::KeySourceFactory = std::sync::Arc::new(move || {
+            vec![Box::new(Counting(a.clone())) as Box<dyn crate::keysource::KeySource>]
+        });
+        let ctx = crate::ctx::Ctx::new(crate::halt::Halt::new());
+        let scope = KeyScope::Titles(vec![0]);
+        let ring = KeyRing::acquire_for_disc(
+            &disc,
+            img,
+            scope.clone(),
+            &sources,
+            AcquireOptions::default(),
+            &ctx,
+        )
+        .unwrap()
+        .keys;
+        let gate = check_decryptable(&disc, false, Some(&ring), &scope);
+        (disc, gate)
+    }
+
+    /// DVD takes the one encryption decision on CSS's own scramble flag: clear content passes
+    /// with no key source asked and nothing to descramble; scrambled content with no key
+    /// recovered refuses with E7027; a recovered key descrambles.
+    #[test]
+    fn dvd_takes_the_one_encryption_decision() {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+
+        let mut clear = [0u8; 2048];
+        crate::css::dvd_pack_header(&mut clear, 0xE0);
+        for (i, b) in clear.iter_mut().enumerate().skip(0x80) {
+            *b = (i % 251) as u8;
+        }
+        assert!(
+            crate::css::scrambled_at(&clear).is_none(),
+            "fixture is clear"
+        );
+        let (disc, gate) = dvd_decision(&mut dvd_image_with(&clear), &asked);
+        assert!(disc.css.is_none() && disc.css_error.is_none() && !disc.encrypted);
+        assert!(gate.is_ok(), "{gate:?}");
+
+        let mut locked = clear;
+        locked[0x14] |= 0x10;
+        crate::css::lfsr::scramble_sector(&title_key, &mut locked);
+        let (disc, gate) = dvd_decision(&mut dvd_image_with(&locked), &asked);
+        assert!(disc.encrypted && disc.css.is_none());
+        assert!(matches!(gate, Err(Error::CssNoDiscKey)), "{gate:?}");
+
+        let crackable = crackable_css_sector(&title_key);
+        let (disc, gate) = dvd_decision(&mut dvd_image_with(&crackable), &asked);
+        assert!(gate.is_ok(), "{gate:?}");
+        let state = disc.css.expect("the key is recovered");
+        let mut plain = crackable;
+        crate::css::descramble_sector(&state, &mut plain);
+        let mut want = crackable;
+        crate::css::lfsr::descramble_sector(&title_key, &mut want);
+        assert_eq!(
+            plain[0x80..],
+            want[0x80..],
+            "descrambled under the disc's key"
+        );
+        assert_ne!(plain[0x80..], crackable[0x80..]);
+
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "CSS asks no AACS key source"
+        );
+    }
+
     // An operator Stop during scan_image's CSS crack must end the scan as Halted —
     // the token in `opts.halt` has to reach the crack, not a hardcoded `None`.
     #[test]
