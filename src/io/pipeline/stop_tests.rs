@@ -155,23 +155,23 @@ fn closing_before_cancel_is_done() {
     );
 }
 
-/// LP4a (T7, stall pair a): one item applied per 0.5 × window for 4 windows is
+/// LP4a (T7, stall pair a): one item applied per 0.25 × window for 4 windows is
 /// progress, so the join waits and returns `Ok` — 600 s is a stall window, not a total.
 #[test]
 fn join_rearms_on_consumer_progress() {
     let count = Arc::new(AtomicUsize::new(0));
     let sink = SlowSinkFor {
-        delay: WINDOW / 2,
+        delay: WINDOW / 4,
         count: count.clone(),
     };
     let pipe = Pipeline::spawn(16, sink).unwrap();
-    for _ in 0..8 {
+    for _ in 0..16 {
         pipe.send(()).unwrap();
     }
     let t = Instant::now();
     let r = pipe.finish_with_halt_timing(None, timing());
     assert!(
-        matches!(r, Ok(8)),
+        matches!(r, Ok(16)),
         "a progressing consumer is not a stall: {r:?}"
     );
     assert!(
