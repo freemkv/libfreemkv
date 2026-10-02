@@ -96,6 +96,7 @@
 
 ### Fixed
 
+- `m2ts://` output of a multi-clip title rides the clip-join timeline like the MKV, MP4 and MPG sinks: the PTS no longer restarts at each join, and reordered video keeps its DTS after the first join instead of falling back to PTS only.
 - An image title whose extent ends off the 3-sector AACS unit grid (an HD DVD `.EVO`) no longer fails E9030 at that extent's end: the sub-unit tail is read, passed when clear and refused (E7013) when it is part of an encrypted unit.
 - Every AACS format takes one encryption decision in `KeyRing::acquire`: content its own detector reads in the clear needs no key and asks no source, whatever key files the disc declares (an HD DVD copy in the clear declaring several keys, and an FMTS disc whose forensic segments are also clear, no longer ask for or refuse on keys); encrypted content is keyed by the format's rules and refused (E7022 / E7032) when no source has the key.
 - A zero read batch (`MuxOptions::default()` carries `batch_sectors` 0) is refused with `Error::MuxBatchSectorsZero` (E9085) on every path (live, session, ISO, URL) instead of spinning until Stop.
