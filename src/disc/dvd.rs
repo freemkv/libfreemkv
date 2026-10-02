@@ -91,7 +91,7 @@ impl Disc {
                 // TODO(spec): measured colour/TFF await a CodecParser->title channel.
                 measured_cicp: None,
             });
-            // TODO(spec): DefaultDuration/cadence deferred.
+            // The frame rate is the standard's; an MKV corrects it from the measured cadence.
 
             for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
