@@ -528,14 +528,18 @@ fn wait_ready_gives_up_after_60s_without_progress() {
 /// (The stricter reading of "the answer changes", §2.11; the user may overrule it.)
 #[test]
 fn wait_ready_new_answer_is_progress_flapping_is_not() {
-    let window = Duration::from_secs(1);
+    let window = Duration::from_secs(2);
     let fresh = [0x00u8, 0x01, 0x04, 0x07, 0x08, 0x09, 0x0A, 0x11, 0x22];
-    // A new answer every 25 polls (each at least `timing().poll` apart): 8 answers
-    // outlast the window, and each lands well inside it.
-    let mut n = 0usize;
+    // A new answer a quarter-window of wall time after the last one: 8 answers outlast
+    // the window, and each lands a window-minus-quarter before it would expire, however
+    // late a slow runner wakes the polls.
+    let mut step = 0usize;
+    let mut last = Instant::now();
     let t = Script::new(move |_, d| {
-        let step = n / 25;
-        n += 1;
+        if last.elapsed() >= window / 4 {
+            step += 1;
+            last = Instant::now();
+        }
         match fresh.get(step) {
             Some(&q) if step < 8 => Err(not_ready(0x04, q)),
             _ => good(d),
