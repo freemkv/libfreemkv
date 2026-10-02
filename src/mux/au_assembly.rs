@@ -129,10 +129,13 @@ enum Mode {
 }
 
 /// A timing/source mark taken at the absolute stream offset of a fragment that
-/// carried it, so it survives `buf.drain(..)` and can be attributed to the AU
-/// whose byte range contains it.
+/// carried it, so it survives `buf.drain(..)`. Its source goes to the AU whose
+/// byte range contains `off`; its PTS/DTS to the first AU that commences within
+/// `[off, end)` (ISO/IEC 13818-1 §2.4.3.7), else to the AU containing `off`.
 struct Mark {
     off: u64,
+    /// Absolute offset one past the fragment's last byte.
+    end: u64,
     pts: Option<i64>,
     dts: Option<i64>,
     source: Option<SourcePos>,
@@ -276,6 +279,7 @@ impl AuAssembler {
         if pts.is_some() || dts.is_some() || source.is_some() {
             self.marks.push_back(Mark {
                 off,
+                end: off + data.len() as u64,
                 pts,
                 dts,
                 source,
@@ -355,10 +359,15 @@ impl AuAssembler {
             // PTS, so reading only the front mark would drop a field.
             let (mut pts, mut dts, mut source) = (None, None, None);
             while self.marks.front().is_some_and(|m| m.off < end_abs) {
+                let m = self.marks.front_mut().unwrap();
+                source = source.or(m.source.take());
+                // A fragment opened inside this AU that runs past it times the next AU.
+                if m.off > self.base && m.end > end_abs {
+                    break;
+                }
                 let m = self.marks.pop_front().unwrap();
                 pts = pts.or(m.pts);
                 dts = dts.or(m.dts);
-                source = source.or(m.source);
             }
             // A backstop discard is a gap in its own right, independent of any
             // upstream signal: bytes were thrown away, so this AU does not
@@ -489,10 +498,10 @@ impl AuAssembler {
         None
     }
 
-    // Retire every mark before `off`: the STREAM-START case, where bytes ahead of the first AU
-    // boundary predate sync and have no prior AU to be discontinuous from.
+    // Retire every mark ending at or before `off`: the STREAM-START case, where bytes ahead of
+    // the first AU boundary predate sync. A fragment running past `off` still times that AU.
     fn drop_marks_before(&mut self, off: u64) {
-        while self.marks.front().is_some_and(|m| m.off < off) {
+        while self.marks.front().is_some_and(|m| m.end <= off) {
             self.marks.pop_front();
         }
         while self.disc_marks.front().is_some_and(|&o| o < off) {
@@ -790,6 +799,41 @@ mod tests {
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data, pic2, "second picture is its own AU");
         assert_eq!(tail[0].pts, Some(9376));
+    }
+
+    #[test]
+    fn a_pts_fragment_opened_inside_a_picture_times_the_picture_commencing_in_it() {
+        // Pictures packed back to back: each PES opens 5 bytes into the previous
+        // picture and its PTS is the next picture's. Read as the previous one's, every
+        // later picture took its successor's PTS.
+        let pics: Vec<Vec<u8>> = (0..3u8).map(|i| bdu(MP2_PICTURE, 0x10 + i, 20)).collect();
+        let stream = pics.concat();
+        let mut a = AuAssembler::mpeg2();
+        let mut out = a.push(&stream[..5], Some(100), None, None, false);
+        out.extend(a.push(&stream[5..29], Some(200), None, None, false));
+        out.extend(a.push(&stream[29..53], Some(300), None, None, false));
+        out.extend(a.push(&stream[53..], None, None, None, false));
+        out.extend(a.flush());
+        let pts: Vec<_> = out.iter().map(|au| au.pts).collect();
+        assert_eq!(pts, [Some(100), Some(200), Some(300)]);
+        assert_eq!(
+            out.iter().map(|au| au.data.clone()).collect::<Vec<_>>(),
+            pics
+        );
+    }
+
+    #[test]
+    fn a_pre_sync_fragment_times_the_first_access_unit_commencing_in_it() {
+        let mut a = AuAssembler::mpeg2();
+        let mut frag = vec![0xFF; 6];
+        frag.extend(bdu(MP2_PICTURE, 0x11, 10));
+        let mut out = a.push(&frag, Some(700), None, None, false);
+        out.extend(a.push(&bdu(MP2_PICTURE, 0x22, 10), Some(800), None, None, false));
+        out.extend(a.flush());
+        assert_eq!(
+            out.iter().map(|au| au.pts).collect::<Vec<_>>(),
+            [Some(700), Some(800)]
+        );
     }
 
     #[test]

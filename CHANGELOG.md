@@ -98,6 +98,7 @@
 
 ### Fixed
 
+- A program-stream PES that opens inside one picture times the next picture commencing in it (ISO/IEC 13818-1 §2.4.3.7), not the one it opens in. An MPEG-PS packing pictures back to back (ffmpeg's) gave each picture its successor's PTS, so MPEG-2 GOPs re-locked a frame off and an open GOP's leading B-pictures were dropped as after a join. DVD and HD DVD titles, which open a PES at each timed picture, are unchanged.
 - `m2ts://` output of a multi-clip title rides the clip-join timeline like the MKV, MP4 and MPG sinks: the PTS no longer restarts at each join, and reordered video keeps its DTS after the first join instead of falling back to PTS only.
 - An image title whose extent ends off the 3-sector AACS unit grid (an HD DVD `.EVO`) no longer fails E9030 at that extent's end: the sub-unit tail is read, passed when clear and refused (E7013) when it is part of an encrypted unit.
 - Every AACS format takes one encryption decision in `KeyRing::acquire`: content its own detector reads in the clear needs no key and asks no source, whatever key files the disc declares (an HD DVD copy in the clear declaring several keys, and an FMTS disc whose forensic segments are also clear, no longer ask for or refuse on keys); encrypted content is keyed by the format's rules and refused (E7022 / E7032) when no source has the key.

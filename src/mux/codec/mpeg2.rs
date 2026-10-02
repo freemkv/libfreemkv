@@ -1028,6 +1028,45 @@ mod tests {
     }
 
     #[test]
+    fn pes_opened_mid_picture_is_not_a_join() {
+        // A muxer packing pictures back to back (ffmpeg's MPEG-PS) opens each PES
+        // inside the previous picture, timed for the picture commencing in it. Read as
+        // the previous picture's PTS, the open GOP's origin moved a frame: a false join.
+        let mut pics = vec![
+            pic_pes(seq_gop(true, false), 1, 0, None),
+            pic_pes(Vec::new(), 2, 3, None),
+            pic_pes(Vec::new(), 3, 1, None),
+            pic_pes(Vec::new(), 3, 2, None),
+        ];
+        pics.extend(gop_ibbp(gop_flags(false, false), None));
+        // Display slot of each picture, in decode order.
+        let slots: Vec<i64> = [0, 3, 1, 2, 6, 4, 5, 9, 7, 8]
+            .iter()
+            .map(|&s| 90_000 + s * 3_600)
+            .collect();
+        let starts: Vec<usize> = pics
+            .iter()
+            .scan(0, |at, p| Some(std::mem::replace(at, *at + p.data.len())))
+            .collect();
+        let es: Vec<u8> = pics.into_iter().flat_map(|p| p.data).collect();
+        // PES j opens 5 bytes into picture j - 1, so picture j commences inside it.
+        let mut cuts: Vec<usize> = std::iter::once(0)
+            .chain(starts.iter().map(|s| s + 5))
+            .collect();
+        cuts.push(es.len());
+        let pes = cuts
+            .windows(2)
+            .enumerate()
+            .map(|(j, w)| make_pes(es[w[0]..w[1]].to_vec(), slots.get(j).copied()));
+        let f = run(pes);
+        assert_eq!(
+            pts_ms(&f),
+            slots.iter().map(|s| s / 90).collect::<Vec<_>>(),
+            "every picture kept, each in its display slot"
+        );
+    }
+
+    #[test]
     fn a_dropped_picture_passes_its_discontinuity_to_the_next_emitted_frame() {
         let mut pes = gop_ibbp(seq_gop(false, false), Some(90_000));
         pes[1].discontinuity = true;
