@@ -1,4 +1,4 @@
-strict refused = E6008
+strict refused = E6000
 strict out o.mkv = 489 bytes sha256:8628b7bc94f1815e2948a4ce9f32c10f
 skip outcome = completed=true opened=true bytes=17910 errors=7 lost=6144 streams=3 undelivered=[]
 skip out o.mkv = 19705 bytes sha256:e8bf5f82342443c240a95385c881d3e2

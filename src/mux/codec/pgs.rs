@@ -333,6 +333,7 @@ impl CodecParser for PgsParser {
         // let it fall to the non-PCS arm (would pollute the pending set): close
         // any pending set with a fallback and drop the header to resync on next PCS.
         if is_pcs && pes.data.len() <= PCS_NUM_OBJECTS_OFFSET {
+            self.skip_to_pcs = true;
             return self.emit_pending(None).into_iter().collect();
         }
 
@@ -350,6 +351,17 @@ impl CodecParser for PgsParser {
             Some(_) => match pts {
                 Some(start) => {
                     self.skip_to_pcs = false;
+                    // A gap before this PCS cut the held set off from its END;
+                    // closing it would emit a malformed display set.
+                    if pes.discontinuity
+                        && !self
+                            .pending
+                            .as_ref()
+                            .is_some_and(|(_, d)| Self::ends_with_end(d))
+                    {
+                        self.pending = None;
+                    }
+                    self.clear_scan_offset = 0;
                     out.extend(self.emit_pending(Some(start)));
                     // The set's facts are THIS packet's — the one that opened
                     // it. `start` is that packet's PTS by construction.
@@ -359,6 +371,7 @@ impl CodecParser for PgsParser {
                 // store it with a 0 sentinel (wrong start, absurd duration).
                 // Flush any prior pending with a fallback and skip this one.
                 None => {
+                    self.skip_to_pcs = true;
                     out.extend(self.emit_pending(None));
                 }
             },
@@ -377,6 +390,7 @@ impl CodecParser for PgsParser {
                         out.extend(self.emit_pending(None));
                     }
                     self.pending = None;
+                    self.clear_scan_offset = 0;
                     self.skip_to_pcs = true;
                 }
                 if self.skip_to_pcs {
@@ -632,6 +646,66 @@ mod tests {
                 .is_empty()
         );
         assert!(parser.flush().is_empty());
+    }
+
+    #[test]
+    fn pcs_after_gap_drops_an_incomplete_pending_set() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let mut next = make_pes(pcs_bytes(1), Some(180000));
+        next.discontinuity = true;
+        assert!(
+            parser.parse(&next).is_empty(),
+            "a set cut off before its END is not emitted"
+        );
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1, "the post-gap PCS opens a fresh set");
+        assert_eq!(tail[0].pts_ns, 2_000_000_000);
+    }
+
+    #[test]
+    fn pcs_after_gap_emits_a_complete_pending_set() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let _ = parser.parse(&make_pes(vec![0x80, 0x00, 0x00], Some(90000)));
+        let mut next = make_pes(pcs_bytes(1), Some(180000));
+        next.discontinuity = true;
+        let out = parser.parse(&next);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].duration_ns, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn segments_after_a_dropped_pcs_are_skipped_until_the_next_pcs() {
+        let mut short_pcs = pcs_bytes(1);
+        short_pcs.truncate(PCS_NUM_OBJECTS_OFFSET);
+        for (dropped, pts) in [(short_pcs, Some(90000)), (pcs_bytes(1), None)] {
+            let mut parser = PgsParser::new();
+            assert!(parser.parse(&make_pes(dropped, pts)).is_empty());
+            for seg in [
+                vec![0x17, 0x00, 0x00],
+                vec![0x15, 0x00, 0x02, 0xAA, 0xBB],
+                vec![0x80, 0x00, 0x00],
+            ] {
+                assert!(
+                    parser.parse(&make_pes(seg, Some(90000))).is_empty(),
+                    "orphan segments of a lost PCS are not emitted"
+                );
+            }
+            let _ = parser.parse(&make_pes(pcs_bytes(1), Some(180000)));
+            assert_eq!(parser.flush().len(), 1, "the next PCS resyncs");
+        }
+    }
+
+    #[test]
+    fn a_gap_resets_the_clear_scan_offset() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(0), Some(90000)));
+        assert_ne!(parser.clear_scan_offset, 0, "the clear PCS was walked");
+        let mut gap = make_pes(vec![0x17, 0x00, 0x00], None);
+        gap.discontinuity = true;
+        let _ = parser.parse(&gap);
+        assert_eq!(parser.clear_scan_offset, 0);
     }
 
     #[test]
@@ -974,6 +1048,18 @@ mod tests {
                 "{displays} unflagged display sets on a flagless disc prove nothing"
             );
         }
+    }
+
+    // The share test multiplies a disc-derived count; it must not wrap at the top of u32.
+    #[test]
+    fn the_share_test_does_not_overflow_on_huge_counts() {
+        assert!(demotable(facts(u32::MAX, 1), true, u32::MAX));
+        assert!(demotable(facts(u32::MAX / 2, 1), true, u32::MAX));
+        assert!(!demotable(
+            facts(DEMOTE_MIN_DISPLAY_SETS, 1),
+            true,
+            u32::MAX
+        ));
     }
 
     // A track that mixes forced and non-forced sets needs no sibling corroboration: the flag is

@@ -16,10 +16,10 @@ const ADTS_SAMPLE_RATE_VALID: [u32; 16] = [
     0,
 ];
 
-/// ADTS header verdict for the packet head.
-// Length of the fixed ADTS header without CRC.
+/// Length of the fixed ADTS header without CRC.
 const ADTS_HEADER_BYTES: usize = 7;
 
+/// ADTS header verdict for the packet head.
 enum AdtsVerdict {
     /// No 12-bit ADTS sync at the head — not an ADTS frame we can validate.
     NoSync,
@@ -472,6 +472,119 @@ mod tests {
         // 2-byte AudioSpecificConfig, then the PCE re-aligned to the ASC start.
         assert_eq!(&asc[..2], &[0x12, 0x00]);
         assert_eq!(&asc[2..], &[0x05, 0x04, 0x00, 0x00, 0x20, 0x00]);
+    }
+
+    fn bits_to_bytes(bits: &str) -> Vec<u8> {
+        let bits: String = bits.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(bits.len() % 8, 0, "byte-aligned");
+        (0..bits.len() / 8)
+            .map(|i| u8::from_str_radix(&bits[i * 8..i * 8 + 8], 2).unwrap())
+            .collect()
+    }
+
+    fn pad8(bits: &str) -> String {
+        let bits: String = bits.chars().filter(|c| !c.is_whitespace()).collect();
+        let pad = (8 - bits.len() % 8) % 8;
+        bits + &"0".repeat(pad)
+    }
+
+    // An ADTS frame with channel_configuration 0 whose payload is `block`.
+    fn config0_frame(block: &[u8]) -> Vec<u8> {
+        let mut f = adts_frame(0);
+        f.extend_from_slice(block);
+        let total = f.len() as u32;
+        f[2] &= !1;
+        f[3] = (f[3] & 0x3C) | ((total >> 11) & 3) as u8;
+        f[4] = (total >> 3) as u8;
+        f[5] = (((total & 7) << 5) as u8) | 0x1F;
+        f
+    }
+
+    // 5.1: 2 front, 1 back, 1 LFE, all three mixdown fields, a 3-byte comment.
+    const PCE_51_FIELDS: &str = "0000 01 0011 0010 0000 0001 01 000 0000 \
+                                 1 0001 1 0010 1 101 \
+                                 01000 10000 10001 0000";
+    const PCE_51_COMMENT: &str = "00000011 10101010 01010101 11110000";
+
+    fn pce_51_block() -> Vec<u8> {
+        bits_to_bytes(&(pad8(&format!("101{PCE_51_FIELDS}")) + &PCE_51_COMMENT.replace(' ', "")))
+    }
+
+    #[test]
+    fn adts_pce_repacks_every_field_to_the_asc_start() {
+        let expect = bits_to_bytes(&(pad8(PCE_51_FIELDS) + &PCE_51_COMMENT.replace(' ', "")));
+        assert_eq!(adts_pce(&pce_51_block()).unwrap(), expect);
+    }
+
+    #[test]
+    fn adts_pce_without_mixdown_fields_and_with_assoc_and_cc_elements() {
+        // 1 front, 1 assoc data, 2 coupling channels: 5*(1+2) + 4*1 element bits.
+        let fields = "0000 01 0100 0001 0000 0000 00 001 0010 0 0 0 \
+                      10000 \
+                      0000 \
+                      00001 10001";
+        let block = bits_to_bytes(&(pad8(&format!("101{fields}")) + "00000000"));
+        let expect = bits_to_bytes(&(pad8(fields) + "00000000"));
+        assert_eq!(adts_pce(&block).unwrap(), expect);
+    }
+
+    #[test]
+    fn adts_pce_truncated_comment_or_wrong_id_is_none() {
+        let block = pce_51_block();
+        assert_eq!(adts_pce(&block[..block.len() - 1]), None);
+        let mut not_pce = block;
+        not_pce[0] ^= 0x80;
+        assert_eq!(adts_pce(&not_pce), None);
+    }
+
+    #[test]
+    fn channel_config_0_asc_follows_the_pce_through_truncation_upgrade_and_change() {
+        let (mut config, mut changes) = (None, 0);
+        let block = pce_51_block();
+        // A PCE cut off by the frame end leaves the 2-byte ASC.
+        let cut = config0_frame(&block[..4]);
+        adts_header(&cut, &mut config, &mut changes, 0).unwrap();
+        assert_eq!(config.as_deref().map(<[u8]>::len), Some(2));
+        // The first frame that carries the whole PCE upgrades it; not a change.
+        let full = config0_frame(&block);
+        adts_header(&full, &mut config, &mut changes, 0).unwrap();
+        let asc = config.clone().unwrap();
+        assert_eq!(&asc[2..], adts_pce(&block).unwrap());
+        assert_eq!(changes, 0);
+        // A different layout is counted and the first config is kept.
+        let mut other = block;
+        other[1] ^= 0x10;
+        adts_header(&config0_frame(&other), &mut config, &mut changes, 0).unwrap();
+        assert_eq!(changes, 1);
+        assert_eq!(config, Some(asc));
+    }
+
+    #[test]
+    fn adts_template_encodes_the_channel_configuration_across_both_header_bytes() {
+        // AAC-LC, 48 kHz: ASC byte 0 = 0x11, byte 1 = (rate low bit << 7) | (channels << 3).
+        for channels in 1u8..=7 {
+            let t = adts_template(&[0x11, 0x80 | (channels << 3)]).unwrap();
+            assert_eq!(
+                t[2],
+                0x40 | (3 << 2) | (channels >> 2),
+                "channels {channels}"
+            );
+            assert_eq!(t[3], (channels & 3) << 6, "channels {channels}");
+        }
+        assert_eq!(adts_template(&[0x11, 0x80]), None, "0 needs an in-band PCE");
+        assert_eq!(adts_template(&[0x11, 0x80 | (8 << 3)]), None);
+    }
+
+    #[test]
+    fn adts_frame_length_field_holds_13_bits_and_blocks_are_1_to_4() {
+        let t = adts_template(&[0x11, 0x90]).unwrap();
+        let max = super::adts_frame(t, &vec![0u8; (1 << 13) - 1 - 7], 1).unwrap();
+        assert_eq!(max.len(), (1 << 13) - 1);
+        assert_eq!(adts_frame_len(&max), Some((1 << 13) - 1));
+        assert_eq!(super::adts_frame(t, &vec![0u8; (1 << 13) - 7], 1), None);
+        assert_eq!(super::adts_frame(t, &[0; 4], 0), None);
+        assert_eq!(super::adts_frame(t, &[0; 4], 5), None);
+        assert_eq!(super::adts_frame(t, &[0; 4], 4).unwrap()[6] & 3, 3);
     }
 
     #[test]

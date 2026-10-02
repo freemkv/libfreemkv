@@ -156,6 +156,62 @@ mod tests {
         assert!(s.read().unwrap().is_none());
     }
 
+    struct Rich(Frames);
+
+    impl PesSource for Rich {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            self.0.read()
+        }
+        fn info(&self) -> &DiscTitle {
+            self.0.info()
+        }
+        fn track_timing(&self, track: usize) -> TrackTiming {
+            TrackTiming {
+                codec_delay_ns: track as u64 * 10,
+                seek_preroll_ns: 0,
+            }
+        }
+        fn headers_ready(&self) -> bool {
+            false
+        }
+        fn config_changes(&self) -> Vec<(usize, u64)> {
+            vec![(1, 4), (2, 7)]
+        }
+        fn errors(&self) -> u64 {
+            5
+        }
+        fn lost_bytes(&self) -> u64 {
+            9
+        }
+    }
+
+    // Per-track answers are asked of the inner source by its own index and come back under the
+    // kept numbering; the source-wide counters and readiness pass straight through.
+    #[test]
+    fn inner_answers_are_translated_and_counters_pass_through() {
+        let mut title = DiscTitle::empty();
+        title.streams = vec![audio(1), audio(2), audio(3)];
+        let src = Rich(Frames(title, Default::default()));
+        let sel = StreamSelection {
+            audio: PidFilter::Only(vec![3]),
+            subtitle: PidFilter::All,
+        };
+        let s = SelectedSource::wrap(Box::new(src), &sel).unwrap();
+        assert_eq!(
+            s.track_timing(0).codec_delay_ns,
+            20,
+            "inner track 2's timing"
+        );
+        assert_eq!(s.track_timing(1), TrackTiming::default());
+        assert_eq!(
+            s.config_changes(),
+            vec![(0, 7)],
+            "renumbered, unkept dropped"
+        );
+        assert_eq!((s.errors(), s.lost_bytes()), (5, 9));
+        assert!(!s.headers_ready());
+    }
+
     // An unknown PID refuses at open, as on a disc title.
     #[test]
     fn an_unknown_pid_refuses() {

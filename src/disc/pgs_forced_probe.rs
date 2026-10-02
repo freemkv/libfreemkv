@@ -896,6 +896,19 @@ mod tests {
         let es_off = p + 14; // ES data follows the 14-byte PES header
         let n = es.len().min(192 - es_off);
         pkt[es_off..es_off + n].copy_from_slice(&es[..n]);
+        // Stuff through the adaptation field so the PES ends exactly at its last
+        // ES byte rather than carrying zero padding after it.
+        let len = es_off + n - p;
+        if len < 184 {
+            let start = 192 - len;
+            pkt.copy_within(p..p + len, start);
+            pkt[7] |= 0x20;
+            pkt[8] = (start - 9) as u8;
+            if start > 9 {
+                pkt[9] = 0;
+                pkt[10..start].fill(0xFF);
+            }
+        }
         pkt
     }
 
@@ -1675,7 +1688,12 @@ mod tests {
                     // Slot per track so two tracks sharing a sector do not
                     // overwrite each other; both stay on the 192-byte grid.
                     let off = (at - u64::from(lba)) as usize * SECTOR_BYTES + idx * 192;
-                    let pkt = bd_pes_packet(t.pid, (i % 16) as u8, &pcs_display(t.forced));
+                    // PCS + END: a display set cut off before its END is not
+                    // emitted when a stream gap follows it.
+                    let mut set = pcs_display(t.forced);
+                    set[2] = (set.len() - 3) as u8;
+                    set.extend_from_slice(&[0x80, 0, 0]);
+                    let pkt = bd_pes_packet(t.pid, (i % 16) as u8, &set);
                     if off + pkt.len() <= want {
                         buf[off..off + pkt.len()].copy_from_slice(&pkt);
                     }
@@ -2276,6 +2294,44 @@ mod tests {
             !forced_flag(&title, pid),
             "a single display set out of a sampled feature is not evidence that \
              EVERY display set on the track is forced"
+        );
+    }
+
+    // A window that runs past the top of the 32-bit LBA space is skipped, never wrapped
+    // onto an unrelated low region.
+    #[test]
+    fn a_window_past_the_top_of_the_lba_space_is_not_wrapped() {
+        struct LbaLog(Vec<u32>);
+        impl SectorSource for LbaLog {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                _count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> crate::error::Result<usize> {
+                self.0.push(lba);
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+        let start = u32::MAX - 10;
+        let mut title = pgs_title(0x1200, false);
+        title.extents = vec![Extent {
+            start_lba: start,
+            sector_count: 2_000_000,
+        }];
+        let mut reader = LbaLog(Vec::new());
+        probe_and_set_forced(&mut reader, &mut title, &mut ForcedProbeCache::new(), None);
+        assert!(
+            reader.0.iter().all(|&l| l >= start),
+            "read below the extent: {:?}",
+            reader
+                .0
+                .iter()
+                .filter(|&&l| l < start)
+                .take(3)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -486,6 +486,63 @@ mod tests {
         assert!(raw_during.iter().filter(|f| f.pts_ns == 0).count() >= 4);
     }
 
+    // The PES PTS anchors the reconstructed display timeline: with anchors 5 frames apart the
+    // frame duration calibrates to a fifth of the spacing, and each GOP's frames follow.
+    #[test]
+    fn vc1_ps_reorder_stamps_display_order_pts_from_the_pes_anchors() {
+        let seq = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0];
+        let pic = |ptype: u8| vec![0x00, 0x00, 0x01, SC_FRAME, ptype];
+        let mut p = Vc1Parser::new().with_ps_reorder(true);
+        let mut frames = Vec::new();
+        for anchor in [0i64, 18_750] {
+            for (k, ptype) in [0xC0u8, 0x00, 0x80, 0x00, 0x80].into_iter().enumerate() {
+                let data = if k == 0 {
+                    [&seq[..], &pic(ptype)].concat()
+                } else {
+                    pic(ptype)
+                };
+                frames.extend(p.parse(&make_pes(data, (k == 0).then_some(anchor))));
+            }
+        }
+        frames.extend(p.flush());
+        let d = 208_333_333 / 5;
+        let gop = |origin: i64| [0, 2, 1, 4, 3].map(|i| origin + i * d);
+        let want: Vec<i64> = gop(0).into_iter().chain(gop(208_333_333)).collect();
+        let got: Vec<i64> = frames.iter().map(|f| f.pts_ns).collect();
+        assert_eq!(got, want);
+    }
+
+    // An advanced-profile sequence header may carry `00 00 03` emulation prevention; the
+    // resolution and INTERLACE bit are read from the de-escaped bytes.
+    #[test]
+    fn sequence_header_fields_are_read_through_emulation_prevention() {
+        // De-escaped: PROFILE 3 byte, 00, then W-1 = 0 (12 bits), H-1 = 31 (12 bits),
+        // then INTERLACE set at bit 41. Bytes 1..=3 are 00 00 00, so an encoder escapes them.
+        let sh = [
+            0x00,
+            0x00,
+            0x01,
+            SC_SEQUENCE_HEADER,
+            0xC0,
+            0x00,
+            0x00,
+            0x03,
+            0x00,
+            0x1F,
+            0x40,
+        ];
+        assert_eq!(parse_vc1_resolution(&sh), Some((2, 64)));
+        assert_eq!(parse_vc1_interlace(&sh), Some(true));
+    }
+
+    #[test]
+    fn a_pes_ending_in_a_bare_start_code_prefix_passes_through_without_panicking() {
+        let data = vec![0xAA, 0x00, 0x00, 0x01];
+        let f = Vc1Parser::new().parse(&make_pes(data.clone(), Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, data);
+    }
+
     /// Build a VC-1 PES with sequence header + entry point + frame start code.
     fn build_vc1_iframe_pes() -> Vec<u8> {
         let mut data = Vec::new();

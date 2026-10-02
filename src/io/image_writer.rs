@@ -339,6 +339,7 @@ mod tests {
         let err =
             write_image(&mut src, &dest, 100_000, &Ctx::new(halt.clone())).expect_err("must halt");
         assert!(matches!(err, Error::Halted), "got {err:?}");
+        assert!(dest.exists(), "a halt must keep the partial image");
         let _ = std::fs::remove_file(&dest);
     }
 

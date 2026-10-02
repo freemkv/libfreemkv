@@ -66,7 +66,7 @@ impl std::fmt::Debug for CssState {
 /// Recover the CSS title key with no keys, by scanning scrambled sectors and
 /// running the known-plaintext attack (see the [`keyless`] module).
 ///
-/// Scans up to 50000 sectors across `extents` and returns the first sector
+/// Scans a bounded sector budget across `extents` and returns the first sector
 /// that yields a key — no player keys, no disc-key crack. Works on a live
 /// drive and on disc images alike.
 ///
@@ -269,6 +269,8 @@ fn crack_key_scan(
     let mut consecutive_locked = 0u32;
     // Sectors actually inspected: zero means no verdict (never Unencrypted).
     let mut inspected = 0u32;
+    // Sectors lost to non-locked read failures: more lost than inspected is no clear verdict.
+    let mut failed = 0u32;
     let mut first_err: Option<crate::error::Error> = None;
 
     'outer: for (extent_idx, ext) in extents.iter().enumerate() {
@@ -359,6 +361,7 @@ fn crack_key_scan(
                         }
                     } else {
                         consecutive_locked = 0;
+                        failed += n;
                         first_err.get_or_insert(e);
                     }
                 }
@@ -367,12 +370,12 @@ fn crack_key_scan(
         }
     }
 
-    // ENCRYPTED-but-uncracked if a scrambled sector was seen or reads were
-    // CSS-locked. Nothing inspected is no verdict: fail closed with the read error
-    // (else as uncracked). Only a scan that READ sectors and saw no scramble is clear.
+    // ENCRYPTED-but-uncracked if a scrambled sector was seen or reads were CSS-locked. Nothing
+    // inspected, or more unreadable than inspected, is no verdict: fail closed with the read
+    // error (else as uncracked).
     if saw_scrambled || saw_locked {
         CrackOutcome::ScrambledUncracked
-    } else if inspected == 0 && tried > 0 {
+    } else if tried > 0 && (inspected == 0 || failed > inspected) {
         first_err.map_or(CrackOutcome::ScrambledUncracked, CrackOutcome::Unreadable)
     } else {
         CrackOutcome::Unencrypted
@@ -1858,5 +1861,32 @@ mod tests {
             sector_count: 8,
         }];
         let _ = crack_key_outcome(&mut AlwaysFails, &ext, 1, None);
+    }
+
+    // A first batch with no scrambled PES, then a scrambled region that will not read: the
+    // unreadable sectors outnumber the inspected ones, so the scan must not call it clear.
+    #[test]
+    fn a_clear_head_then_unreadable_tail_is_not_unencrypted() {
+        struct ClearThenDamaged;
+        impl SectorSource for ClearThenDamaged {
+            fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+                if lba >= 2 {
+                    return Err(Error::DiscRead {
+                        sector: lba as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+                let n = c as usize * 2048;
+                b[..n].fill(0);
+                Ok(n)
+            }
+        }
+        let ext = [Extent {
+            start_lba: 0,
+            sector_count: 200,
+        }];
+        let out = crack_key_outcome(&mut ClearThenDamaged, &ext, 2, None);
+        assert!(matches!(out, CrackOutcome::Unreadable(_)), "got {out:?}");
     }
 }

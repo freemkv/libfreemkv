@@ -333,9 +333,10 @@ fn probe(
     p: &mut Probed,
     segments: &[(u32, u32)],
     format: ContentFormat,
+    detector: Detector,
     halt: &Halt,
 ) -> Result<()> {
-    let (units, samples) = sampler.probe(&p.piece, segments, format, halt)?;
+    let (units, samples) = sampler.probe(&p.piece, segments, format, detector, halt)?;
     p.units = units;
     for s in samples {
         match s {
@@ -420,10 +421,7 @@ pub(crate) fn acquire(
     if let Some(s) = seed {
         run.add_keys(&s.0.pool, "seed");
     }
-    let result = match ev.detector {
-        Detector::Unverified => resolve_hddvd(ev, sampler, &disc_hash, n_decl, &mut run),
-        Detector::Verified => resolve_bd(ev, sampler, &disc_hash, n_decl, seed, &mut run),
-    };
+    let result = decide(ev, sampler, &disc_hash, n_decl, seed, &mut run);
     // Every source is dropped here: nothing can ask after `acquire` (LK7).
     let trace = std::mem::take(&mut run.trace);
     drop(run.sources);
@@ -474,8 +472,95 @@ fn aacs_inner(run: &Run) -> Inner {
     inner
 }
 
-// KU §2.6: HD DVD is best effort. Not probed (its encrypted flag is unverified, KS-27):
-// a single declared key is applied to every piece; several, or none parseable, refuse.
+// The pieces in scope with their probes, and the forensic layout when its clip is in scope.
+struct Scoped<'e> {
+    ps: Vec<Probed>,
+    layout: Option<&'e super::fmts::Layout>,
+    clip: Vec<(u32, u32)>,
+}
+
+// KU §2.3 steps 5–7, every AACS format: the evidence's pieces, the forensic layout when its
+// clip is in scope, and each piece probed by the format's own detector.
+fn probe_scope<'e>(ev: &'e KeyEvidence, sampler: &mut Sampler, halt: &Halt) -> Result<Scoped<'e>> {
+    let mut ps: Vec<Probed> = ev.pieces.iter().cloned().map(Probed::new).collect();
+    let layout = ev.fmts.as_ref();
+    let clip: Vec<(u32, u32)> = layout
+        .map(|l| {
+            l.clip
+                .iter()
+                .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let layout = layout.filter(|_| {
+        ps.iter()
+            .any(|p| p.ranges().any(|(s, e)| overlaps(&clip, s, e)))
+    });
+    let segments: Vec<(u32, u32)> = layout
+        .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
+        .unwrap_or_default();
+    for p in &mut ps {
+        probe(sampler, p, &segments, ev.container, ev.detector, halt)?;
+    }
+    Ok(Scoped { ps, layout, clip })
+}
+
+// The one encryption decision, every AACS format and source (CSS makes it on its scramble
+// flag): content read in the clear asks no source, whatever key files the disc declares;
+// encrypted content is keyed by the format's rules, refused when no key is found.
+fn decide(
+    ev: &KeyEvidence,
+    sampler: &mut Sampler,
+    disc_hash: &str,
+    n_decl: Option<usize>,
+    seed: Option<&KeyRing>,
+    run: &mut Run,
+) -> Result<Inner> {
+    let scoped = probe_scope(ev, sampler, run.halt)?;
+    if in_clear(&scoped, sampler, ev.container, run.halt)? {
+        tracing::info!(target: "freemkv::keys", pieces = scoped.ps.len(), "content in the clear: no key source asked");
+        let ps: Vec<Probed> = scoped
+            .ps
+            .into_iter()
+            .map(|p| Probed {
+                verdict: Verdict::Clear,
+                ..p
+            })
+            .collect();
+        let mut inner = aacs_inner(run);
+        inner.no_stream_files = ev.no_stream_files;
+        build(&mut inner, &ps, None, None, run, Vec::new());
+        return Ok(inner);
+    }
+    match ev.detector {
+        Detector::Unverified => resolve_hddvd(ev, sampler, disc_hash, n_decl, run),
+        Detector::Verified => resolve_bd(ev, scoped, sampler, disc_hash, n_decl, seed, run),
+    }
+}
+
+// Whether every piece's probes read clear (a piece with no whole unit holds no AACS unit)
+// and so do the forensic segments in scope.
+fn in_clear(
+    scoped: &Scoped,
+    sampler: &mut Sampler,
+    format: ContentFormat,
+    halt: &Halt,
+) -> Result<bool> {
+    let pieces_clear = scoped
+        .ps
+        .iter()
+        .all(|p| p.units == 0 || (p.enc.is_empty() && p.faults == 0));
+    if !pieces_clear {
+        return Ok(false);
+    }
+    match scoped.layout {
+        None => Ok(true),
+        Some(l) => super::fmts::segments_clear(sampler.source(), l, format, halt),
+    }
+}
+
+// KU §2.6: HD DVD with encrypted content is best effort (its encrypted flag is unverified,
+// KS-27): a single declared key is applied to every piece; several, or none parseable, refuse.
 fn resolve_hddvd(
     ev: &KeyEvidence,
     sampler: &mut Sampler,
@@ -514,13 +599,16 @@ fn resolve_hddvd(
         ranges.extend(p.ranges().map(|(s, e)| (s, e, 0usize)));
         inner.spans.extend(p.spans.iter().copied());
     }
+    // `span_at` bisects: a fragmented file or interleaved pieces arrive out of LBA order.
+    inner.spans.sort_unstable_by_key(|s| s.0);
     inner.map = Arc::new(AacsKeyMap::from_ranges(ranges));
     Ok(inner)
 }
 
-// KU §2.3 steps 5–14 for BD/UHD content.
+// KU §2.3 steps 8–14 for BD/UHD content not in the clear, over `probe_scope`'s probes.
 fn resolve_bd(
     ev: &KeyEvidence,
+    scoped: Scoped,
     sampler: &mut Sampler,
     disc_hash: &str,
     n_decl: Option<usize>,
@@ -529,29 +617,11 @@ fn resolve_bd(
 ) -> Result<Inner> {
     let format = ev.container;
     let scope = &ev.scope;
-    // Step 5: the evidence's pieces.
-    let mut ps: Vec<Probed> = ev.pieces.iter().cloned().map(Probed::new).collect();
-    // Step 6: FMTS, when the forensic clip is in scope.
-    let layout = ev.fmts.as_ref();
-    let clip: Vec<(u32, u32)> = layout
-        .map(|l| {
-            l.clip
-                .iter()
-                .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let layout = layout.filter(|_| {
-        ps.iter()
-            .any(|p| p.ranges().any(|(s, e)| overlaps(&clip, s, e)))
-    });
-    let segments: Vec<(u32, u32)> = layout
-        .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
-        .unwrap_or_default();
-    // Step 7: probes.
-    for p in &mut ps {
-        probe(sampler, p, &segments, format, run.halt)?;
-    }
+    let Scoped {
+        mut ps,
+        layout,
+        clip,
+    } = scoped;
     // Step 8: sample-independent sources, once, with the main title's samples.
     let needs_keys = ps
         .iter()

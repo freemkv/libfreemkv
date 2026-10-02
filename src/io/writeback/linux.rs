@@ -351,11 +351,10 @@ impl WritebackPipeline {
         }
     }
 
-    /// Caller is about to seek away from the current write region.
-    /// Drain any in-flight chunk and reset tracking.
-    // MKV seeks every cluster, so never wait here: kick the tail and let the
-    // pending chunk wait at the next boundary. An un-waited range keeps its error
-    // for the final fsync.
+    /// Caller is about to seek away from the current write region. Kicks off
+    /// the tail and resets tracking; never waits (MKV seeks every cluster), so
+    /// the pending chunk is waited at the next boundary or `finalize`, and an
+    /// un-waited range keeps its error for the final fsync.
     pub(crate) fn handle_seek(&mut self, new_pos: u64) {
         let tail_len = self.pos.saturating_sub(self.last_flush_pos);
         if tail_len > 0 && self.waitable {
@@ -743,6 +742,50 @@ mod tests {
         assert!(p.pending.is_none());
         p.finalize();
         assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EIO));
+    }
+
+    static ERRNO_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn eio_then_erofs_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        match ERRNO_WAITS.fetch_add(1, Ordering::SeqCst) {
+            0 => libc::EIO,
+            _ => libc::EROFS,
+        }
+    }
+
+    // The first data-loss errno is the cause; a later one never replaces it.
+    #[test]
+    fn the_first_latched_errno_is_kept() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        p.wait_op = eio_then_erofs_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        p.note_progress(2 * CHUNK_BYTES_MIN);
+        p.note_progress(3 * CHUNK_BYTES_MIN);
+        p.finalize();
+        assert!(ERRNO_WAITS.load(Ordering::SeqCst) >= 2, "a second wait ran");
+        assert_eq!(p.error().and_then(|e| e.raw_os_error()), Some(libc::EIO));
+    }
+
+    fn ok_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
+        0
+    }
+
+    // Each completed WAIT_AFTER credits exactly the waited chunk's length as durable, at a
+    // boundary and at finalize.
+    #[test]
+    fn completed_waits_credit_the_waited_length() {
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        let flush = crate::io::flush::FlushProgress::default();
+        flush.note_total(10 * CHUNK_BYTES_MIN);
+        p.set_flush_progress(flush.clone());
+        p.wait_op = ok_wait;
+        p.note_progress(CHUNK_BYTES_MIN);
+        assert_eq!(flush.bytes_durable(), 0, "nothing waited yet");
+        // A second chunk twice as long: the wait on the first credits only its length.
+        p.note_progress(3 * CHUNK_BYTES_MIN);
+        assert_eq!(flush.bytes_durable(), CHUNK_BYTES_MIN);
+        p.finalize();
+        assert_eq!(flush.bytes_durable(), 3 * CHUNK_BYTES_MIN);
     }
 
     // Only data-loss errnos latch: ESPIPE/EINVAL mean the call was unsupported.

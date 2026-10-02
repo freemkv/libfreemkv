@@ -337,6 +337,22 @@ mod tests {
         assert!(!decode(&h("7101000000010011")).link, "sub-op 0x11 is not");
     }
 
+    // Every link code from LinkPGCN through LinkCN leaves the pre list; neighbours do not.
+    #[test]
+    fn set_link_flag_covers_linkpgcn_through_linkcn() {
+        for (cmd, link) in [
+            (3, false),
+            (4, true),
+            (5, true),
+            (6, true),
+            (7, true),
+            (8, false),
+        ] {
+            let c = decode(&h(&format!("710{cmd:x}000000000001")));
+            assert_eq!(c.link, link, "cmd {cmd}");
+        }
+    }
+
     // Special sub-command 3 (SetTmpPML) sets SPRM13 then gotos byte7 when cond holds.
     #[test]
     fn set_tmp_pml_decodes_as_goto() {

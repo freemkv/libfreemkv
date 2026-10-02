@@ -177,10 +177,7 @@ impl PrefetchedSectorSource {
             crate::sector::read_stage::ExtentWalk::new(extents, policy, unit_align, ctx)?;
         let loss = walk.loss();
         let total_sectors = walk.total_sectors();
-        let batch_sectors = match policy {
-            crate::sector::read_stage::ReadPolicy::Image { batch }
-            | crate::sector::read_stage::ReadPolicy::Live { batch, .. } => batch,
-        };
+        let batch_sectors = policy.batch();
         let unmapped = reader.unmapped_stream_files().to_vec();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
@@ -1347,6 +1344,86 @@ mod tests {
                 "underlying ErrorKind must survive the channel round-trip"
             );
         });
+    }
+
+    // After the producer reports an error, the closed channel that follows is a dead source,
+    // never a clean end of stream.
+    #[test]
+    fn a_producer_error_latches_the_source_as_terminated() {
+        let _serial = serial();
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 3,
+            }];
+            let mut pf = PrefetchedSectorSource::new(ErrorSource, extents, 3, &Ctx::default())
+                .expect("spawn");
+            let mut buf = vec![0u8; 3 * 2048];
+            pf.read_sectors(0, 3, &mut buf, false)
+                .expect_err("the reader's error");
+            let again = pf.read_sectors(0, 3, &mut buf, false);
+            assert!(
+                matches!(&again, Err(e) if e.is_source_terminated()),
+                "second read after a producer error: {again:?}"
+            );
+        });
+    }
+
+    // A reader that panics is an error to the consumer, not a dropped channel read as EOF.
+    #[test]
+    fn a_panicking_reader_is_an_error_not_eof() {
+        struct Panics;
+        impl SectorSource for Panics {
+            fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+                panic!("reader panic (expected by the test)");
+            }
+            fn capacity_sectors(&self) -> u32 {
+                3
+            }
+        }
+        let _serial = serial();
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 3,
+            }];
+            let mut pf =
+                PrefetchedSectorSource::new(Panics, extents, 3, &Ctx::default()).expect("spawn");
+            let mut buf = vec![0u8; 3 * 2048];
+            let r = pf.read_sectors(0, 3, &mut buf, false);
+            assert!(
+                matches!(r, Err(crate::error::Error::DemuxThreadPanicked)),
+                "{r:?}"
+            );
+        });
+    }
+
+    // A byte view ends at the file's real length: the zero-padded tail of the last sector
+    // is cut, and nothing past it is read.
+    #[test]
+    fn a_byte_view_is_clipped_to_the_real_length() {
+        for len in [3 * 2048 + 700u64, 4 * 2048, 1000] {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 8,
+            }];
+            let policy = crate::sector::read_stage::ReadPolicy::Image { batch: 2 };
+            let view = ByteView {
+                prefix: Vec::new(),
+                len,
+            };
+            let (mut pf, _loss) = PrefetchedSectorSource::file_bytes(
+                PatternSource { capacity: 16 },
+                extents,
+                policy,
+                &Ctx::default(),
+                view,
+            )
+            .expect("spawn");
+            let (got, last) = drain_direct(&mut pf, 2, 16);
+            assert!(matches!(last, Ok(0)), "{last:?}");
+            assert_eq!(got.len() as u64, len, "len {len}");
+        }
     }
 
     // An inner source that answers a mid-extent read with `Ok(0)` has quit early: the producer

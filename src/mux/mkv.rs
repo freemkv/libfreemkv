@@ -688,6 +688,51 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// Per track: file offset of a Void reserved for a CodecPrivate that was not
     /// known at header time (AAC), filled by [`Self::set_codec_private`].
     codec_private_reserves: std::collections::HashMap<usize, u64>,
+    /// Per MPEG-2 video track: the DefaultDuration measured from the kept frames.
+    frame_rate_fixups: std::collections::HashMap<usize, FrameRateFixup>,
+}
+
+// Deferred DefaultDuration correction for an MPEG-2 video track: the header holds the
+// sequence rate (29.97 for NTSC), but soft-telecined film is 23.976 coded frames a second.
+// `finish()` rewrites it when the kept frames' PTS span measures another standard rate.
+struct FrameRateFixup {
+    /// Absolute file offset of the DefaultDuration value, and its byte length.
+    value_offset: u64,
+    value_len: usize,
+    /// The value written up-front, in ns.
+    initial_ns: u64,
+    frames: u64,
+    min_pts_ns: i64,
+    max_pts_ns: i64,
+}
+
+// Fewest kept frames whose PTS span is taken as a measured frame period.
+const FRAME_RATE_MIN_FRAMES: u64 = 120;
+
+// The standard frame period (ns) within 0.5% of `measured`, if any.
+fn standard_frame_period_ns(measured: f64) -> Option<u64> {
+    use crate::disc::FrameRate;
+    [
+        FrameRate::F23_976,
+        FrameRate::F24,
+        FrameRate::F25,
+        FrameRate::F29_97,
+        FrameRate::F30,
+        FrameRate::F50,
+        FrameRate::F59_94,
+        FrameRate::F60,
+    ]
+    .iter()
+    .map(|r| {
+        let (num, den) = r.as_fraction();
+        (1_000_000_000u64 * den as u64) / num as u64
+    })
+    .find(|&ns| (measured - ns as f64).abs() <= ns as f64 * 0.005)
+}
+
+// Bytes of the shortest big-endian encoding `ebml::write_uint` gives `v`.
+fn uint_len(v: u64) -> usize {
+    (8 - (v.leading_zeros() / 8) as usize).max(1)
 }
 
 // Bytes reserved for a late AAC CodecPrivate: ID (2) + size (1-2) + an ASC of
@@ -991,6 +1036,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             std::collections::HashMap::new();
         let mut flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup> =
             std::collections::HashMap::new();
+        let mut frame_rate_fixups: std::collections::HashMap<usize, FrameRateFixup> =
+            std::collections::HashMap::new();
         // Per track: whether it emitted a conforming `mvcC` BlockAdditionMapping.
         // Filled below from the SAME built record that drives the CodecPrivate
         // mvcC extension, so the three MVC signals never diverge.
@@ -1084,6 +1131,21 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     ebml::DEFAULT_DURATION,
                     track.default_duration_ns,
                 )?;
+                if track.track_type == ebml::TRACK_TYPE_VIDEO && track.codec_id == ebml::CODEC_MPEG2
+                {
+                    let value_len = uint_len(track.default_duration_ns);
+                    frame_rate_fixups.insert(
+                        i,
+                        FrameRateFixup {
+                            value_offset: writer.stream_position()? - value_len as u64,
+                            value_len,
+                            initial_ns: track.default_duration_ns,
+                            frames: 0,
+                            min_pts_ns: i64::MAX,
+                            max_pts_ns: i64::MIN,
+                        },
+                    );
+                }
             }
 
             // DefaultDecodedFieldDuration: production video always passes 0 here
@@ -1329,6 +1391,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             flag_interlaced_fixups,
             opening_capture: None,
             codec_private_reserves,
+            frame_rate_fixups,
         })
     }
 
@@ -1527,6 +1590,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     fixup.bff_pics += 1;
                 }
             }
+        }
+        if let Some(f) = self.frame_rate_fixups.get_mut(&track_idx) {
+            f.frames += 1;
+            f.min_pts_ns = f.min_pts_ns.min(pts_ns);
+            f.max_pts_ns = f.max_pts_ns.max(pts_ns);
         }
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
 
@@ -1951,6 +2019,20 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 .collect::<Vec<_>>(),
         )?;
 
+        // Correct an MPEG-2 track's DefaultDuration from its measured frame period.
+        let rate_patches: Vec<(u64, Vec<u8>)> = self
+            .frame_rate_fixups
+            .values()
+            .filter(|f| f.frames >= FRAME_RATE_MIN_FRAMES)
+            .filter_map(|f| {
+                let measured = (f.max_pts_ns - f.min_pts_ns) as f64 / (f.frames - 1) as f64;
+                let ns = standard_frame_period_ns(measured)?;
+                (ns != f.initial_ns && uint_len(ns) == f.value_len)
+                    .then(|| (f.value_offset, ns.to_be_bytes()[8 - f.value_len..].to_vec()))
+            })
+            .collect();
+        self.patch_bytes(&rate_patches)?;
+
         // Correct FlagInterlaced from the WHOLE-stream scan majority: the header
         // value came from only the FIRST coded picture. Rewrite the byte to the
         // dominant scan; on a demotion to progressive, Void the stale FieldOrder.
@@ -2061,7 +2143,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     None => return Err(crate::error::Error::MkvUnencodable.into()),
                 },
                 ebml::CUES => cues_offset,
-                _ => 0,
+                // The SeekHead reserves only the targets above.
+                _ => return Err(crate::error::Error::MkvUnencodable.into()),
             };
             self.writer
                 .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
@@ -2973,6 +3056,87 @@ mod tests {
             ebml::INTERLACED_INTERLACED as u8,
             "the up-front progressive flag must be patched to interlaced by the majority"
         );
+    }
+
+    // An NTSC MPEG-2 track declares 29.97 up-front; soft-telecined film (3:2 pulldown: frames
+    // 3 and 2 fields long) measures 23.976 coded frames a second, and DefaultDuration is
+    // rewritten to agree with the frame count. Real 29.97 video keeps its value.
+    #[test]
+    fn mpeg2_default_duration_follows_the_measured_frame_period() {
+        use std::sync::{Arc, Mutex};
+        let field = 1_001_000_000_000i64 / 60_000;
+        for (pulldown, want) in [(true, 41_708_333u64), (false, 33_366_666)] {
+            let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+            let mut track = make_video_track();
+            track.codec_id = ebml::CODEC_MPEG2;
+            track.codec_private = None;
+            track.default_duration_ns = 33_366_666;
+            let mut muxer =
+                MkvMuxer::new(SharedWriter(shared.clone()), &[track], None, 0.0, &[]).unwrap();
+            let mut pts = 0i64;
+            for i in 0..240u32 {
+                muxer
+                    .write_frame_at(
+                        0,
+                        pts,
+                        i % 12 == 0,
+                        &[0x01, i as u8],
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let fields = if pulldown && i % 2 == 0 { 3 } else { 2 };
+                pts += field * fields;
+            }
+            muxer.finish().unwrap();
+            let data = shared.lock().unwrap().clone().into_inner();
+            let body = track_entry_child_body(&data, ebml::DEFAULT_DURATION).unwrap();
+            let got = body.iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+            assert_eq!(got, want, "pulldown {pulldown}");
+        }
+    }
+
+    // A progressive leader on an interlaced MPEG-2 title leaves the reserved FieldOrder to be
+    // filled from the majority field order: TFF and BFF titles must not swap.
+    #[test]
+    fn reserved_field_order_follows_the_measured_majority() {
+        use crate::mux::codec::FieldOrder;
+        use std::sync::{Arc, Mutex};
+        for (scan, want) in [
+            (FieldOrder::Tff, ebml::FIELD_ORDER_TFF),
+            (FieldOrder::Bff, ebml::FIELD_ORDER_BFF),
+        ] {
+            let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+            let mut track = make_video_track();
+            track.codec_id = ebml::CODEC_MPEG2;
+            let mut muxer =
+                MkvMuxer::new(SharedWriter(shared.clone()), &[track], None, 0.0, &[]).unwrap();
+            let scans = [FieldOrder::Progressive, scan, scan, scan];
+            for (i, scan) in scans.into_iter().enumerate() {
+                let pts = i as i64 * 40_000_000;
+                muxer
+                    .write_frame_at(
+                        0,
+                        pts,
+                        i == 0,
+                        &[1, 2, i as u8],
+                        None,
+                        None,
+                        None,
+                        Some(scan),
+                    )
+                    .unwrap();
+            }
+            muxer.finish().unwrap();
+            let data = shared.lock().unwrap().clone().into_inner();
+            let at = data
+                .windows(2)
+                .position(|w| w == [ebml::FIELD_ORDER as u8, 0x81])
+                .expect("FieldOrder element present");
+            assert_eq!(data[at + 2], want);
+        }
     }
 
     #[test]
@@ -5528,6 +5692,27 @@ mod tests {
         assert_eq!(groups[0].duration, 29_127, "SPU stop time, not a 1 s guess");
     }
 
+    // The stop time is found past every command that precedes it in the first DCSQ.
+    #[test]
+    fn vobsub_stop_is_found_after_commands_with_arguments() {
+        let mut track = make_subtitle_track();
+        track.codec_id = ebml::CODEC_VOBSUB;
+        let mut spu = vec![0, 0, 0, 6, 0xAB, 0xCD];
+        // delay 0x0100, next = itself; STA_DSP, SET_COLOR, SET_CONTR, SET_DAREA, SET_DSPXA, STP_DSP.
+        spu.extend_from_slice(&[0x01, 0x00, 0, 6, 0x01]);
+        spu.extend_from_slice(&[0x03, 0x11, 0x22, 0x04, 0x33, 0x44]);
+        spu.extend_from_slice(&[0x05, 1, 2, 3, 4, 5, 6, 0x06, 1, 2, 3, 4, 0x02, 0xFF]);
+        let len = spu.len() as u16;
+        spu[..2].copy_from_slice(&len.to_be_bytes());
+        let data = mux_with_durations(&[track], &[(0, 0, true, spu, None)]);
+        let groups = all_block_groups(&data);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].duration, 29_127,
+            "the real stop, not the 10 s cap"
+        );
+    }
+
     // A VobSub SPU with no stop command ends at the next SPU on its track, else
     // after a 10 s cap.
     #[test]
@@ -5557,10 +5742,9 @@ mod tests {
         );
         let groups = all_block_groups(&data);
         assert_eq!(groups.len(), 1);
-        assert!(
-            groups[0].duration > 10_000,
-            "a self-terminating cue must not be hidden after 1 s (got {} ticks)",
-            groups[0].duration
+        assert_eq!(
+            groups[0].duration, 300_000,
+            "a self-terminating cue lasts the 30 s fallback, not 1 s"
         );
     }
 
@@ -5701,6 +5885,41 @@ mod tests {
             "SamplingFrequency present"
         );
         assert!(find_id(&data, ebml::CHANNELS).is_some(), "Channels present");
+    }
+
+    // A late AAC CodecPrivate fills the 16-byte reserve exactly, whatever its length: the
+    // TrackEntry still parses and the bytes after it are untouched.
+    #[test]
+    fn late_aac_codec_private_fills_the_reserve_exactly() {
+        for len in [2usize, 11, 12, 13] {
+            let mut aac = make_audio_track();
+            aac.codec_id = ebml::CODEC_AAC;
+            let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[aac], None, 0.0, &[]).unwrap();
+            let cp: Vec<u8> = (1..=len as u8).collect();
+            assert!(muxer.set_codec_private(0, &cp).unwrap(), "len {len}");
+            let data = muxer.writer.into_inner();
+            let (te_start, te_size) = first_track_entry(&data);
+            let children = master_children(&data, te_start, te_size);
+            let (_, off, size) = *children
+                .iter()
+                .find(|(id, _, _)| *id == ebml::CODEC_PRIVATE)
+                .expect("CodecPrivate present");
+            assert_eq!(&data[off..off + size as usize], &cp[..], "len {len}");
+            let end = children.iter().map(|&(_, o, s)| o + s as usize).max();
+            assert_eq!(
+                end,
+                Some(te_start + te_size),
+                "len {len}: children fill the entry"
+            );
+            assert!(children.iter().any(|(id, _, _)| *id == ebml::AUDIO));
+        }
+        let mut aac = make_audio_track();
+        aac.codec_id = ebml::CODEC_AAC;
+        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[aac], None, 0.0, &[]).unwrap();
+        assert!(
+            !muxer.set_codec_private(0, &[0u8; 14]).unwrap(),
+            "does not fit"
+        );
     }
 
     #[test]

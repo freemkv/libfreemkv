@@ -110,6 +110,28 @@ fn read_unit(
     super::evidence::read_unit(reader, lba).ok().flatten()
 }
 
+/// Whether the forensic segments read in the clear: the first unit of each of up to
+/// [`MAX_ANCHOR_ATTEMPTS`] segments is readable and unflagged. `false` when a segment has no
+/// sector range or no unit was read.
+pub(crate) fn segments_clear(
+    reader: &mut dyn SectorSource,
+    layout: &Layout,
+    format: ContentFormat,
+    halt: &Halt,
+) -> Result<bool> {
+    if layout.unresolved || layout.segments.is_empty() {
+        return Ok(false);
+    }
+    for seg in layout.segments.iter().take(MAX_ANCHOR_ATTEMPTS) {
+        halt.check()?;
+        match read_unit(reader, &layout.clip, seg, 0) {
+            Some(u) if !crate::aacs::content::aacs_unit_encrypted(&u, format) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// Sends one anchor batch to the sources: `Ok(None)` for an empty answer.
 pub(crate) type AskFn<'a> = dyn FnMut(&[Vec<u8>]) -> Result<Option<Vec<[u8; 16]>>> + 'a;
 
@@ -314,8 +336,7 @@ pub(crate) fn forensic_clip_extents(
 }
 
 // Keep only forensic segments addressable within the FORENSIC CLIP's extents; stale/foreign
-// records past the clip's end are dropped. Extracted from resolve_fmts_key_map for direct
-// testing.
+// records past the clip's end are dropped. Split out of `layout` for direct testing.
 pub(crate) fn filter_addressable_segments(
     segments: Vec<crate::aacs::segment::Segment>,
     extents: &[crate::disc::Extent],
@@ -323,7 +344,8 @@ pub(crate) fn filter_addressable_segments(
     segments
         .into_iter()
         .filter(|s| {
-            crate::aacs::segment::clip_byte_to_lba(extents, s.start_spn as u64 * 192).is_some()
+            crate::aacs::segment::clip_byte_to_lba(extents, s.start_spn as u64 * SPN_BYTES)
+                .is_some()
         })
         .collect()
 }
@@ -569,7 +591,7 @@ mod probe_tests {
 mod fmts_helper_tests {
     use super::*;
 
-    // ── resolve_fmts_key_map decision helpers (behaviors flagged by audit) ──
+    // ── layout decision helpers (behaviors flagged by audit) ──
 
     // BEHAVIOR 1 — segment filter: a segment mapping inside the title's extents is kept,
     // past-clip dropped, all-outside -> empty.
@@ -595,7 +617,7 @@ mod fmts_helper_tests {
         };
         let kept = super::filter_addressable_segments(vec![inside, outside], &extents);
         assert_eq!(kept, vec![inside], "only the in-title segment survives");
-        // All-outside → empty; `resolve_fmts_key_map` maps this to Ok(None).
+        // All-outside → empty; `layout` maps this to Ok(None).
         assert!(
             super::filter_addressable_segments(vec![outside], &extents).is_empty(),
             "no addressable segment → empty (→ resolver Ok(None))"

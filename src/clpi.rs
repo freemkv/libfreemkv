@@ -293,6 +293,20 @@ mod tests {
         assert_eq!(clip.streams[0].language, "eng");
     }
 
+    /// An audio or TextST sci shorter than 5 bytes has no language field: the stream is
+    /// kept, the language stays empty, and nothing indexes past the sci.
+    #[test]
+    fn program_info_short_audio_and_textst_sci_keep_the_stream_without_a_language() {
+        let pi = build_program_info(&[
+            (0x1100, vec![0x83u8, 0x61, b'e', b'n']),
+            (0x1200, vec![0x92u8, 0x01, b'e', b'n']),
+        ]);
+        let data = build_clpi_with_proginfo(100, &pi, None);
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.streams.len(), 2);
+        assert!(clip.streams.iter().all(|s| s.language.is_empty()));
+    }
+
     /// ProgramInfo PG (0x90)/IG (0x91): layout is coding_type(1)+lang(3),
     /// so language is at sci[1..4] (NOT sci[2..5] like audio). Verify the
     /// PG arm reads from the right offset.

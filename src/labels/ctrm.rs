@@ -226,10 +226,130 @@ fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
     labels
 }
 
-// NOTE: `parse_menu_base` / `parse_menu_base_text` structurally belong above this
-// module but are left below (lint allowed) — a ~120-line move is safer as its
-// own focused change.
-#[allow(clippy::items_after_test_module)]
+// ── menu_base.prop parser ──────────────────────────────────────────────────
+
+fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+    let data = super::read_jar_file(reader, udf, "menu_base.prop")?;
+    let text = std::str::from_utf8(&data).ok()?;
+    let labels = parse_menu_base_text(text);
+    if labels.is_empty() {
+        return None;
+    }
+    Some(labels)
+}
+
+// Parses menu_base.prop body into labels. Split from parse_menu_base
+// (I/O + UTF-8 decode only) so tests exercise real parsing logic.
+// Returns labels sorted by (type, number).
+fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
+    // Parse key=value, group by prefix
+    // BTreeMap: deterministic prefix order so equal (type, number) ties sort stably.
+    let mut entries: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let eq_pos = match line.find('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        let full_key = line[..eq_pos].trim();
+        let value = line[eq_pos + 1..].trim_start();
+
+        if let Some(dot_pos) = full_key.rfind('.') {
+            let prefix = full_key[..dot_pos].to_string();
+            let key = full_key[dot_pos + 1..].to_string();
+            if !entries.contains_key(&prefix) && entries.len() >= MAX_CTRM_LABELS {
+                continue;
+            }
+            let props = entries.entry(prefix).or_default();
+            if props.len() < MAX_PROPS_PER_PREFIX || props.contains_key(&key) {
+                props.insert(key, value.to_string());
+            }
+        }
+    }
+
+    let mut labels = Vec::new();
+
+    for (prefix, props) in &entries {
+        // Audio: has "streamNumber" or "audioStream" and audio-related class
+        let is_audio = props
+            .get("class")
+            .is_some_and(|c| c.contains("AudioButton"))
+            || prefix.starts_with("audio_");
+        let is_subtitle = props
+            .get("class")
+            .is_some_and(|c| c.contains("SubtitleButton"))
+            || prefix.starts_with("subtitle_");
+
+        let stream_num_str = props
+            .get("streamNumber")
+            .or_else(|| props.get("audioStream"))
+            .or_else(|| props.get("subtitleStream"));
+
+        let stream_num: u16 = match stream_num_str.and_then(|s| s.parse().ok()) {
+            Some(n) if n > 0 => n,
+            _ => continue,
+        };
+
+        if !is_audio && !is_subtitle {
+            continue;
+        }
+
+        // Resolve the stream type FIRST: when an entry trips both flags
+        // (e.g. an `audio_` prefix with a class containing
+        // "SubtitleButton"), audio wins the type.
+        let stream_type = if is_audio {
+            StreamLabelType::Audio
+        } else {
+            StreamLabelType::Subtitle
+        };
+
+        let name = props.get("name").cloned().unwrap_or_default();
+
+        // Ask vocab first (word-boundary matched, avoiding the "Commenter"
+        // false positive of the old `name.contains("comment")`), then fall
+        // back to the structural prefix check (`audio_commentary.foo`-style).
+        let purpose = match vocab::purpose(&name) {
+            LabelPurpose::Normal if prefix_is_commentary(prefix) => LabelPurpose::Commentary,
+            p => p,
+        };
+
+        // Qualifier (SDH/Forced) is a subtitle-only concept. Gate on the
+        // RESOLVED type, not the raw is_subtitle flag, so an entry that
+        // resolved to Audio never carries a subtitle qualifier.
+        let qualifier = if stream_type == StreamLabelType::Subtitle {
+            vocab::qualifier(&name)
+        } else {
+            LabelQualifier::None
+        };
+
+        // Try to extract language from audioLanguage/subtitleLanguage prop
+        let language = props
+            .get("audioLanguage")
+            .or_else(|| props.get("subtitleLanguage"))
+            .cloned()
+            .unwrap_or_default();
+
+        labels.push(StreamLabel {
+            stream_id: None,
+            stream_number: stream_num,
+            stream_type,
+            language,
+            name,
+            purpose,
+            qualifier,
+            codec_hint: String::new(),
+            variant: String::new(),
+        });
+    }
+
+    labels.sort_by_key(|l| (l.stream_type as u8, l.stream_number));
+    labels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +392,55 @@ mod tests {
         }
         assert!(parse_menu_base_text(&mb).len() <= MAX_CTRM_LABELS);
         assert_eq!(parse_language_streams_text(&ls).len(), MAX_CTRM_LABELS);
+    }
+
+    #[test]
+    fn menu_base_sorts_by_type_then_number_across_prefixes() {
+        let labels = parse_props(
+            "a_sub.class=SubtitleButton\na_sub.streamNumber=1\n\
+             b_aud.class=AudioButton\nb_aud.streamNumber=1\n\
+             c_aud.class=AudioButton\nc_aud.streamNumber=2\n\
+             d_aud.class=AudioButton\nd_aud.streamNumber=1\nd_aud.name=Low\n",
+        );
+        let key: Vec<(StreamLabelType, u16)> = labels
+            .iter()
+            .map(|l| (l.stream_type, l.stream_number))
+            .collect();
+        assert_eq!(
+            key,
+            vec![
+                (StreamLabelType::Audio, 1),
+                (StreamLabelType::Audio, 1),
+                (StreamLabelType::Audio, 2),
+                (StreamLabelType::Subtitle, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_base_caps_properties_per_prefix() {
+        let mut text = String::from("audio_1.streamNumber=1\n");
+        for i in 0..(MAX_PROPS_PER_PREFIX + 50) {
+            text.push_str(&format!("audio_1.junk{i}=x\n"));
+        }
+        // Past the cap: a new key is dropped, an already-retained key is still updated.
+        text.push_str("audio_1.late=x\naudio_1.name=Late\naudio_1.streamNumber=2\n");
+        let labels = parse_props(&text);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].stream_number, 2);
+        assert_eq!(labels[0].name, "");
+    }
+
+    #[test]
+    fn menu_base_accepts_alternate_stream_and_language_keys() {
+        let labels = parse_props(
+            "audio_1.audioStream=4\n\
+             subtitle_1.subtitleStream=5\nsubtitle_1.subtitleLanguage=fra\n",
+        );
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].stream_number, 4);
+        assert_eq!(labels[1].stream_number, 5);
+        assert_eq!(labels[1].language, "fra");
     }
 
     #[test]
@@ -809,128 +978,4 @@ mod tests {
         assert!(prefix_is_commentary("audio_comm"));
         assert!(prefix_is_commentary("comm_track_1"));
     }
-}
-
-// ── menu_base.prop parser ──────────────────────────────────────────────────
-
-fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
-    let data = super::read_jar_file(reader, udf, "menu_base.prop")?;
-    let text = std::str::from_utf8(&data).ok()?;
-    let labels = parse_menu_base_text(text);
-    if labels.is_empty() {
-        return None;
-    }
-    Some(labels)
-}
-
-// Parses menu_base.prop body into labels. Split from parse_menu_base
-// (I/O + UTF-8 decode only) so tests exercise real parsing logic.
-// Returns labels sorted by (type, number).
-fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
-    // Parse key=value, group by prefix
-    // BTreeMap: deterministic prefix order so equal (type, number) ties sort stably.
-    let mut entries: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let eq_pos = match line.find('=') {
-            Some(p) => p,
-            None => continue,
-        };
-        let full_key = line[..eq_pos].trim();
-        let value = line[eq_pos + 1..].trim_start();
-
-        if let Some(dot_pos) = full_key.rfind('.') {
-            let prefix = full_key[..dot_pos].to_string();
-            let key = full_key[dot_pos + 1..].to_string();
-            if !entries.contains_key(&prefix) && entries.len() >= MAX_CTRM_LABELS {
-                continue;
-            }
-            let props = entries.entry(prefix).or_default();
-            if props.len() < MAX_PROPS_PER_PREFIX || props.contains_key(&key) {
-                props.insert(key, value.to_string());
-            }
-        }
-    }
-
-    let mut labels = Vec::new();
-
-    for (prefix, props) in &entries {
-        // Audio: has "streamNumber" or "audioStream" and audio-related class
-        let is_audio = props
-            .get("class")
-            .is_some_and(|c| c.contains("AudioButton"))
-            || prefix.starts_with("audio_");
-        let is_subtitle = props
-            .get("class")
-            .is_some_and(|c| c.contains("SubtitleButton"))
-            || prefix.starts_with("subtitle_");
-
-        let stream_num_str = props
-            .get("streamNumber")
-            .or_else(|| props.get("audioStream"))
-            .or_else(|| props.get("subtitleStream"));
-
-        let stream_num: u16 = match stream_num_str.and_then(|s| s.parse().ok()) {
-            Some(n) if n > 0 => n,
-            _ => continue,
-        };
-
-        if !is_audio && !is_subtitle {
-            continue;
-        }
-
-        // Resolve the stream type FIRST: when an entry trips both flags
-        // (e.g. an `audio_` prefix with a class containing
-        // "SubtitleButton"), audio wins the type.
-        let stream_type = if is_audio {
-            StreamLabelType::Audio
-        } else {
-            StreamLabelType::Subtitle
-        };
-
-        let name = props.get("name").cloned().unwrap_or_default();
-
-        // Ask vocab first (word-boundary matched, avoiding the "Commenter"
-        // false positive of the old `name.contains("comment")`), then fall
-        // back to the structural prefix check (`audio_commentary.foo`-style).
-        let purpose = match vocab::purpose(&name) {
-            LabelPurpose::Normal if prefix_is_commentary(prefix) => LabelPurpose::Commentary,
-            p => p,
-        };
-
-        // Qualifier (SDH/Forced) is a subtitle-only concept. Gate on the
-        // RESOLVED type, not the raw is_subtitle flag, so an entry that
-        // resolved to Audio never carries a subtitle qualifier.
-        let qualifier = if stream_type == StreamLabelType::Subtitle {
-            vocab::qualifier(&name)
-        } else {
-            LabelQualifier::None
-        };
-
-        // Try to extract language from audioLanguage/subtitleLanguage prop
-        let language = props
-            .get("audioLanguage")
-            .or_else(|| props.get("subtitleLanguage"))
-            .cloned()
-            .unwrap_or_default();
-
-        labels.push(StreamLabel {
-            stream_id: None,
-            stream_number: stream_num,
-            stream_type,
-            language,
-            name,
-            purpose,
-            qualifier,
-            codec_hint: String::new(),
-            variant: String::new(),
-        });
-    }
-
-    labels.sort_by_key(|l| (l.stream_type as u8, l.stream_number));
-    labels
 }

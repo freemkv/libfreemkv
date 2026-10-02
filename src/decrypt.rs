@@ -386,11 +386,9 @@ impl AacsKeyMap {
     }
 }
 
-/// Decrypt `buf` with a resolved AACS key map. Thin wrapper over
-/// [`decrypt_span`] — the map is the AACS scheme's input, not a second
-/// orchestrator.
-// Content-less convenience form used only by tests (production reads always go
-// through `decrypt_sectors_mapped_in_content`, which honours the content extents).
+// Decrypt `buf` with a resolved AACS key map: the content-less convenience form of
+// `decrypt_sectors_mapped_in_content`, used only by tests (production reads always go
+// through that one, which honours the content extents).
 #[cfg(test)]
 pub(crate) fn decrypt_sectors_mapped(
     buf: &mut [u8],
@@ -2076,6 +2074,76 @@ mod tests {
         assert_eq!(blanked, 2);
         assert!(buf[..ul].iter().all(|&b| b == 0));
         assert!(buf[2 * ul..3 * ul].iter().all(|&b| b == 0));
+    }
+
+    /// Two damaged forensic units beside verifying ones are damage: blanked and counted. Only
+    /// a key with NO verifying unit is a wrong key.
+    #[test]
+    fn mapped_phase_two_damaged_units_beside_verified_ones_are_blanked() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let key = [0xAAu8; 16];
+        // Even-phase units sit at even indices 0, 2, 4, 6; the odd ones are left alone.
+        let mut buf = vec![0u8; 7 * ul];
+        for i in 0..7 {
+            let mut u = clear_ts_unit();
+            if i % 2 == 0 {
+                aacs_encrypt_unit_for_test(&mut u, &key);
+                if i < 4 {
+                    crate::test_util::damage_unit_seed(&mut u);
+                    u[4] = 0x47;
+                }
+            }
+            buf[i * ul..(i + 1) * ul].copy_from_slice(&u);
+        }
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 7 * usz, 0, Phase::Even)]);
+        let blanked = decrypt_sectors_mapped_in_content(&mut buf, &keys, 0, &map, None)
+            .expect("damage beside verified units is not E7013");
+        assert_eq!(blanked, 2);
+    }
+
+    /// One failing forensic unit that ANOTHER held key opens is a wrong key assignment, not
+    /// damage: E7013 even though it is the read's only failure.
+    #[test]
+    fn mapped_phase_a_unit_another_key_opens_is_a_wrong_key_not_damage() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        let usz = (ul / 2048) as u32;
+        let (key_a, key_b) = ([0xAAu8; 16], [0xBBu8; 16]);
+        let mut buf = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut buf, &key_b);
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key_a), (1, key_b)],
+            format: ContentFormat::BdTs,
+        };
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, usz, 0, Phase::Even)]);
+        assert!(matches!(
+            decrypt_sectors_mapped_in_content(&mut buf, &keys, 0, &map, None),
+            Err(crate::error::Error::DecryptFailed)
+        ));
+    }
+
+    /// HD DVD (`MpegPs`) units carry no TS sync at byte 4: none is damage, none is touched.
+    #[test]
+    fn blank_damaged_units_leaves_mpegps_untouched() {
+        use crate::disc::ContentFormat;
+        let ul = aacs::content::ALIGNED_UNIT_LEN;
+        // Unflagged, no sync at byte 4, not clean PS: damage if judged as BD-TS.
+        let mut buf: Vec<u8> = (0..2 * ul + 100)
+            .map(|i| (i as u8).wrapping_mul(31) | 1)
+            .collect();
+        for u in 0..2 {
+            buf[u * ul + 20] = 0;
+        }
+        let before = buf.clone();
+        let n = blank_damaged_units(&mut buf, 0, ContentFormat::MpegPs, &|_| true, true);
+        assert_eq!(n, 0);
+        assert_eq!(buf, before);
     }
 
     /// Option A (E7013): a garbage seed with its CPI bits clear lost the TS sync every BD-TS

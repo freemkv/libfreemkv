@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const K_SENSE_DATA_SIZE: usize = 32;
 
-/// Max CDB length the SCSI commands this library issues ever use; also
-/// the clamp Linux applies. Used to bound the `cdb_len` passed to the
-/// shim so a pathological >255-byte slice can't wrap a `u8`.
+/// Max CDB length the SCSI commands this library issues ever use. An
+/// over-length CDB is rejected (never clamped) before the `cdb_len` reaches
+/// the shim, so a pathological >255-byte slice can't wrap a `u8`.
 const K_MAX_CDB_SIZE: usize = 16;
 
 // The C shim uses a single global IOKit handle, so only one MacScsiTransport may exist at a
@@ -490,6 +490,28 @@ mod tests {
                 assert_eq!(max, K_MAX_CDB_SIZE);
             }
             other => panic!("expected InvalidCdbLength, got {other:?}"),
+        }
+    }
+
+    /// `execute` itself rejects an over-length CDB; the fake device would accept
+    /// it if the guard were bypassed and the length truncated.
+    #[test]
+    fn execute_rejects_an_oversized_cdb_before_the_shim() {
+        let _globals = FakeDeviceGuard(shim_globals());
+        assert!(
+            !OPEN.swap(true, Ordering::Acquire),
+            "OPEN held outside SHIM_GLOBALS"
+        );
+        assert_eq!(unsafe { shim_selftest_install_fake_device() }, 0);
+        let mut transport = MacScsiTransport {
+            last_progress: None,
+        };
+        for len in [K_MAX_CDB_SIZE + 1, 256 + 6] {
+            let r = transport.execute(&vec![0u8; len], DataDirection::None, &mut [], 1_000);
+            assert!(
+                matches!(r, Err(Error::InvalidCdbLength { .. })),
+                "{len}-byte CDB: {r:?}"
+            );
         }
     }
 

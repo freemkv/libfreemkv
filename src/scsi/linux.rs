@@ -145,9 +145,9 @@ impl SgIoTransport {
         fd
     }
 
-    // Map errno from a failed open(): permission-denied -> DevicePermission,
-    // else DeviceNotFound. Path carried in the error; no English text (app
-    // layer localizes).
+    // Map errno from a failed open(): EACCES -> DevicePermission, ENOENT/ENXIO/
+    // ENODEV -> DeviceNotFound, else (EMFILE, EIO, EBUSY) IoError, so the real
+    // cause is not reported as an unplug. No English text (app layer localizes).
     fn open_error<T>(device: &Path) -> Result<T> {
         Err(Self::map_open_error(
             &std::io::Error::last_os_error(),
@@ -160,9 +160,18 @@ impl SgIoTransport {
             Error::DevicePermission {
                 path: device.display().to_string(),
             }
-        } else {
+        } else if err.kind() == std::io::ErrorKind::NotFound
+            || matches!(err.raw_os_error(), Some(libc::ENXIO | libc::ENODEV))
+        {
             Error::DeviceNotFound {
                 path: device.display().to_string(),
+            }
+        } else {
+            Error::IoError {
+                source: match err.raw_os_error() {
+                    Some(code) => std::io::Error::from_raw_os_error(code),
+                    None => std::io::Error::new(err.kind(), err.to_string()),
+                },
             }
         }
     }
@@ -208,7 +217,7 @@ impl SgIoTransport {
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: hdr.status,
-                sense: Some(super::parse_sense(&sense, hdr.sb_len_wr)),
+                sense: super::sense_for_status(hdr.status, &sense, hdr.sb_len_wr),
             });
         }
         Ok(())
@@ -301,11 +310,11 @@ impl Drop for SgIoTransport {
 }
 
 impl ScsiTransport for SgIoTransport {
-    // Execute via one synchronous SG_IO ioctl; errors map to IoError/ScsiError.
     fn last_sense_progress(&self) -> Option<u16> {
         self.last_progress
     }
 
+    // Execute via one synchronous SG_IO ioctl; errors map to IoError/ScsiError.
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -666,8 +675,6 @@ pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
     r
 }
 
-// After a transport failure the fd is reopened in the background and the next
-// execute() adopts it. Needs a real device: FREEMKV_TEST_SG_DEVICE (default sg2).
 /// Open a block device read-only (no O_DIRECT). Negative on failure.
 pub(crate) fn open_block_ro(path: &str) -> i32 {
     let mut bytes = path.as_bytes().to_vec();
@@ -701,6 +708,8 @@ mod recovery_device_tests {
     use super::*;
     use std::time::Duration;
 
+    // After a transport failure the fd is reopened in the background and the next
+    // execute() adopts it. Needs a real device: FREEMKV_TEST_SG_DEVICE (default sg2).
     #[test]
     #[ignore]
     fn timeout_does_not_kill_transport() {
@@ -741,6 +750,22 @@ mod recovery_device_tests {
 }
 
 // ── CDB guard wiring ───────────────────────────────────────────────────────
+#[cfg(test)]
+mod open_error_tests {
+    use super::*;
+
+    #[test]
+    fn open_errno_maps_to_its_real_cause() {
+        let p = Path::new("/dev/sg9");
+        let map = |code| SgIoTransport::map_open_error(&std::io::Error::from_raw_os_error(code), p);
+        assert!(matches!(map(libc::EACCES), Error::DevicePermission { .. }));
+        assert!(matches!(map(libc::ENOENT), Error::DeviceNotFound { .. }));
+        assert!(matches!(map(libc::ENODEV), Error::DeviceNotFound { .. }));
+        assert!(matches!(map(libc::EMFILE), Error::IoError { .. }));
+        assert!(matches!(map(libc::EBUSY), Error::IoError { .. }));
+    }
+}
+
 #[cfg(test)]
 mod raw_command_cdb_guard_tests {
     use super::*;

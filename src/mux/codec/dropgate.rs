@@ -169,6 +169,15 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_duration_is_counted_as_zero_lost_time() {
+        let mut t = DropTally::new("test");
+        t.record_drop(0, -5_000, 512, "bad");
+        t.record_collateral_drop(0, -1, 512, "resync-forward");
+        assert_eq!(t.dropped_frames(), 2);
+        assert_eq!(t.dropped_duration_ns(), 0);
+    }
+
+    #[test]
     fn poisons_after_min_aus_over_half_dropped() {
         let mut t = DropTally::new("test");
         // 199 AUs, all dropped: below the min-AU gate, must NOT poison yet.

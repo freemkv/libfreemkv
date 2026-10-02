@@ -193,7 +193,16 @@ pub(super) fn capture(
     ) {
         Ok(raw) => Some(raw),
         Err(Error::Halted) => return Err(Error::Halted),
-        Err(_) => None,
+        Err(Error::AacsNoKeys) => None,
+        Err(e) => {
+            tracing::warn!(
+                target: "freemkv::scan",
+                phase = "aacs_capture",
+                error_code = e.code(),
+                "content certificate unreadable; assuming the V20/UHD Unit_Key_RO stride"
+            );
+            None
+        }
     };
     let cc = cc_raw.as_deref().and_then(aacs::inf::parse_content_cert);
     // No-cert default = UHD (V20 stride), matching `read_aacs_version`.

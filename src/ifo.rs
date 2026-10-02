@@ -60,6 +60,9 @@ pub struct DvdTitle {
     /// resolution joins on the REAL title number rather than the position in the
     /// titles vec, which desyncs when a sibling PGC is dropped as unparseable.
     pub vts_title_num: u8,
+    /// Distinct PGCs this title's part-of-title entries point at. Only the first is read,
+    /// so a title with more is missing the rest.
+    pub pgcs: usize,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -519,7 +522,8 @@ pub(crate) fn parse_tt_srpt(
 
 // ── VTS parser ──────────────────────────────────────────────────────────────
 
-/// Parse VTS_XX_0.IFO for one title set, falling back to its VTS_XX_0.BUP copy.
+/// Parse VTS_XX_0.IFO for one title set, falling back to its VTS_XX_0.BUP copy when the
+/// IFO fails or keeps fewer titles than `titles_info` declares.
 ///
 /// `titles_info` is a list of (chapter_count, vts_title_number) from TT_SRPT.
 fn parse_vts(
@@ -529,19 +533,30 @@ fn parse_vts(
     titles_info: &[(u16, u8)],
 ) -> Result<DvdTitleSet> {
     let path = format!("/VIDEO_TS/VTS_{vts_number:02}_0.IFO");
-    let err = match parse_vts_file(reader, udf, &path, &path, vts_number, titles_info) {
-        Ok(ts) => return Ok(ts),
+    let mut partial = None;
+    let mut err = None;
+    match parse_vts_file(reader, udf, &path, &path, vts_number, titles_info) {
+        Ok(ts) if ts.titles.len() >= titles_info.len() => return Ok(ts),
+        Ok(ts) => partial = Some(ts),
         Err(Error::Halted) => return Err(Error::Halted),
-        Err(e) => e,
-    };
+        Err(e) => err = Some(e),
+    }
     let bup = format!("/VIDEO_TS/VTS_{vts_number:02}_0.BUP");
     match parse_vts_file(reader, udf, &bup, &path, vts_number, titles_info) {
-        Ok(ts) => {
-            tracing::warn!(target: "freemkv::scan", vts = vts_number, code = err.code(), "VTS IFO bad; using BUP");
+        Ok(ts)
+            if partial
+                .as_ref()
+                .is_none_or(|p| ts.titles.len() > p.titles.len()) =>
+        {
+            tracing::warn!(target: "freemkv::scan", vts = vts_number, "VTS IFO bad; using BUP");
             Ok(ts)
         }
         Err(Error::Halted) => Err(Error::Halted),
-        Err(_) => Err(err),
+        _ => match (partial, err) {
+            (Some(ts), _) => Ok(ts),
+            (None, Some(e)) => Err(e),
+            (None, None) => Err(Error::IfoParse),
+        },
     }
 }
 
@@ -815,6 +830,43 @@ fn ptt_srpt_pgc_index(data: &[u8], ptt_offset: usize, ttn: u8) -> Option<usize> 
     pgcn.checked_sub(1)
 }
 
+// Distinct PGCs title `ttn`'s part-of-title entries point at. A title split across
+// PGCs (one per chapter) is read from its first PGC only; the caller warns on > 1.
+fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
+    let entries = || -> Option<Vec<u16>> {
+        let count = be_u16(data, ptt_offset).ok()? as usize;
+        let last_byte = be_u32(data, ptt_offset + 4).ok()? as usize;
+        if ttn as usize > count {
+            return None;
+        }
+        let at = |t: usize| {
+            be_u32(data, ptt_offset + 8 + (t - 1) * 4)
+                .ok()
+                .map(|r| r as usize)
+        };
+        let start = at(ttn as usize)?;
+        let end = if (ttn as usize) < count {
+            at(ttn as usize + 1)?
+        } else {
+            last_byte.checked_add(1)?
+        };
+        let mut pgcns = Vec::new();
+        let mut rel = start;
+        while rel.checked_add(4)? <= end {
+            pgcns.push(be_u16(data, ptt_offset.checked_add(rel)?).ok()?);
+            rel += 4;
+        }
+        Some(pgcns)
+    };
+    if ptt_offset == 0 || ttn == 0 {
+        return 0;
+    }
+    let mut pgcns = entries().unwrap_or_default();
+    pgcns.sort_unstable();
+    pgcns.dedup();
+    pgcns.len()
+}
+
 /// Parse VTS_PGCIT (Program Chain Information Table) to extract titles.
 /// `ptt_offset` is the VTS_PTT_SRPT byte offset (0 = absent).
 pub(crate) fn parse_pgcit(
@@ -855,6 +907,9 @@ pub(crate) fn parse_pgcit(
             continue;
         }
 
+        // Warned once per disc by the DVD scan, which sees every title set.
+        let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
+
         let entry_offset = entries_start + pgc_index * 8;
         if entry_offset + 8 > data.len() {
             skipped += 1;
@@ -879,6 +934,7 @@ pub(crate) fn parse_pgcit(
                 // Stamp the REAL title number so downstream nav joins survive a
                 // dropped sibling PGC (position in `titles` is not vts_title_num).
                 title.vts_title_num = vts_title_num;
+                title.pgcs = pgcs;
                 titles.push(title);
             }
             Err(e) => {
@@ -983,7 +1039,8 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
             let cell_base = pgc_offset + cell_playback_offset;
             for i in 0..num_cells {
                 let co = cell_base + i * 24;
-                if co + 8 > data.len() {
+                // Same bound as the cell loop above: a cell that is not kept adds nothing.
+                if co + 24 > data.len() {
                     cell_frames.push((0, 0.0));
                     continue;
                 }
@@ -1058,6 +1115,7 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         spst_ctl,
         // Set by the caller (parse_pgcit) which knows the TT_SRPT title number.
         vts_title_num: 0,
+        pgcs: 0,
     })
 }
 
@@ -2011,6 +2069,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 3);
@@ -2035,6 +2094,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 2);
         let fc = t.feature_cells();
@@ -2055,6 +2115,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 2);
@@ -2072,6 +2133,7 @@ mod tests {
             ast_ctl: [0; 8],
             spst_ctl: [0; 32],
             vts_title_num: 0,
+            pgcs: 1,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert!(t.feature_cells().is_empty());
@@ -2401,6 +2463,25 @@ mod tests {
         assert_eq!(title.chapter_times, vec![0.0, 10.01]);
     }
 
+    // A cell cut off mid-record is not in `cells`, so it adds no time to a chapter mark.
+    #[test]
+    fn pgc_chapter_times_ignore_a_cell_cut_off_mid_record() {
+        let mut pgc = build_pgc(
+            bcd_secs(59),
+            &[
+                (0x00, bcd_secs(10), 0, 9),
+                (0x00, bcd_secs(20), 10, 19),
+                (0x00, bcd_secs(31), 20, 29),
+            ],
+            &[1, 3],
+            None,
+        );
+        pgc.truncate(0xEA + 2 + 24 + 12);
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert_eq!(title.cells.len(), 1);
+        assert_eq!(title.chapter_times, vec![0.0, 10.01]);
+    }
+
     // A program map running past the end of the data must stop at the buffer
     // end. Fixture map begins at PGC+0xEA, buffer holds 50 bytes from there,
     // so a declared 255 programs must yield exactly 50 chapter times.
@@ -2705,6 +2786,56 @@ mod tests {
         d
     }
 
+    // The title number and its entry offset are both bounded by the table: bytes beyond
+    // it are never read as a PGCN. The table sits at byte 8 (offset 0 means absent).
+    #[test]
+    fn ptt_srpt_pgc_index_stays_inside_the_table() {
+        let put =
+            |d: &mut Vec<u8>, at: usize, v: &[u8]| d[8 + at..8 + at + v.len()].copy_from_slice(v);
+        let mut d = vec![0u8; 8 + 24];
+        put(&mut d, 0, &1u16.to_be_bytes());
+        put(&mut d, 4, &23u32.to_be_bytes());
+        put(&mut d, 8, &16u32.to_be_bytes());
+        put(&mut d, 12, &20u32.to_be_bytes());
+        put(&mut d, 16, &3u16.to_be_bytes());
+        put(&mut d, 20, &9u16.to_be_bytes());
+        assert_eq!(ptt_srpt_pgc_index(&d, 8, 1), Some(2));
+        assert_eq!(
+            ptt_srpt_pgc_index(&d, 8, 2),
+            None,
+            "title 2 is past the count"
+        );
+        // The declared table ends before the entry.
+        put(&mut d, 4, &15u32.to_be_bytes());
+        assert_eq!(
+            ptt_srpt_pgc_index(&d, 8, 1),
+            None,
+            "entry outside the table"
+        );
+    }
+
+    #[test]
+    fn ptt_srpt_counts_the_pgcs_a_title_spans() {
+        // Title 1: one PTT per PGC (1, 2, 3); title 2: two PTTs in PGC 4.
+        let entries: [(u16, u16); 5] = [(1, 1), (2, 1), (3, 1), (4, 1), (4, 2)];
+        let total = 8 + 2 * 4 + entries.len() * 4;
+        let mut d = vec![0u8; total];
+        d[0..2].copy_from_slice(&2u16.to_be_bytes());
+        d[4..8].copy_from_slice(&((total - 1) as u32).to_be_bytes());
+        d[8..12].copy_from_slice(&16u32.to_be_bytes());
+        d[12..16].copy_from_slice(&28u32.to_be_bytes());
+        for (i, (pgcn, pgn)) in entries.iter().enumerate() {
+            d[16 + i * 4..18 + i * 4].copy_from_slice(&pgcn.to_be_bytes());
+            d[18 + i * 4..20 + i * 4].copy_from_slice(&pgn.to_be_bytes());
+        }
+        assert_eq!(ptt_srpt_pgc_count(&d, 0, 1), 0);
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&d);
+        assert_eq!(ptt_srpt_pgc_count(&buf, 4, 1), 3);
+        assert_eq!(ptt_srpt_pgc_count(&buf, 4, 2), 1);
+        assert_eq!(ptt_srpt_pgc_count(&buf, 4, 3), 0);
+    }
+
     /// TTN -> PGC goes through VTS_PTT_SRPT, not "TTN N is PGCIT entry N"; the PGCIT
     /// sits at a NON-ZERO offset so the pgcit base term is exercised, and the real TTN
     /// is stamped on each title (disc/dvd.rs joins on it).
@@ -2888,6 +3019,71 @@ mod tests {
             .unwrap();
         assert_eq!(ts.vob_start_sector, lba + 7);
         assert_eq!(ts.titles[0].duration_secs, 22.022, "TTN 1 -> PGC 2 via PTT");
+    }
+
+    fn bup_fixture() -> (Vec<u8>, Vec<u8>) {
+        let two = vec![
+            build_pgc(bcd_secs(11), &[(0x00, bcd_secs(11), 0, 9)], &[], None),
+            build_pgc(bcd_secs(22), &[(0x00, bcd_secs(22), 50, 59)], &[], None),
+        ];
+        let good = build_vts_ifo(0, 0, &two, None);
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        (bad, good)
+    }
+
+    /// A bad IFO falls back to the BUP, but the title VOBS stay anchored on the IFO's LBA.
+    #[test]
+    fn parse_vts_falls_back_to_the_bup_and_anchors_on_the_ifo() {
+        let (bad, good) = bup_fixture();
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", bad), ("VTS_01_0.BUP", good)]);
+        let ts = parse_vts(&mut disc, &udf, 1, &[(1, 1), (1, 2)]).expect("BUP used");
+        assert_eq!(ts.titles.len(), 2);
+        let lba = udf
+            .file_start_lba(&mut disc, "/VIDEO_TS/VTS_01_0.IFO")
+            .unwrap();
+        assert_eq!(ts.vob_start_sector, lba + 7);
+    }
+
+    /// An IFO that parses but drops a damaged PGC defers to a BUP that keeps it.
+    #[test]
+    fn parse_vts_prefers_a_bup_that_keeps_more_titles() {
+        let (_, good) = bup_fixture();
+        let mut damaged = good.clone();
+        // Second PGC entry's offset: point it past the end of the table.
+        damaged[2 * 2048 + 8 + 8 + 4..2 * 2048 + 8 + 8 + 8]
+            .copy_from_slice(&0x00ff_ffffu32.to_be_bytes());
+        let (mut disc, udf) = video_ts_disc(vec![
+            ("VTS_01_0.IFO", damaged.clone()),
+            ("VTS_01_0.BUP", good),
+        ]);
+        let ts = parse_vts(&mut disc, &udf, 1, &[(1, 1), (1, 2)]).expect("vts");
+        assert_eq!(ts.titles.len(), 2, "BUP kept both titles");
+        // With no usable BUP the IFO's partial result stands.
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", damaged)]);
+        let ts = parse_vts(&mut disc, &udf, 1, &[(1, 1), (1, 2)]).expect("vts");
+        assert_eq!(ts.titles.len(), 1);
+    }
+
+    /// A stop during the BUP attempt is a stop, not a reason to report the IFO's error.
+    #[test]
+    fn parse_vts_propagates_a_halt_during_the_bup_attempt() {
+        struct HaltAt(MemDisc, u32);
+        impl SectorSource for HaltAt {
+            fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+                if lba == self.1 {
+                    return Err(Error::Halted);
+                }
+                self.0.read_sectors(lba, n, buf, r)
+            }
+        }
+        let (bad, good) = bup_fixture();
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", bad), ("VTS_01_0.BUP", good)]);
+        let bup_lba = udf
+            .file_start_lba(&mut disc, "/VIDEO_TS/VTS_01_0.BUP")
+            .unwrap();
+        let r = parse_vts(&mut HaltAt(disc, bup_lba), &udf, 1, &[(1, 1)]);
+        assert!(matches!(r, Err(Error::Halted)), "{r:?}");
     }
 
     #[test]

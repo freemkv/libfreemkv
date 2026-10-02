@@ -32,7 +32,8 @@ pub(crate) fn new_cipher_for(key: &[u8; 16]) -> Aes128 {
 }
 
 /// Build an AES-128 key schedule. The single construction site for the CBC
-/// helpers, so `KEY_EXPANSIONS` can count them under test.
+/// helpers, so `KEY_EXPANSIONS` can count them under test; the single-block ECB
+/// helpers build their own and are not counted.
 fn new_cipher(key: &[u8; 16]) -> Aes128 {
     #[cfg(test)]
     KEY_EXPANSIONS.with(|c| c.set(c.get() + 1));

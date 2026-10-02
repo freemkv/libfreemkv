@@ -196,7 +196,10 @@ impl<'a> DiscInputsCtx<'a> {
         } else {
             parse_title_keys(&inputs.unit_key_ro, AacsVersion::from_major(inputs.version))
                 .map(|f| f.encrypted_keys.into_iter().map(|(_, k)| k).collect())
-                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    tracing::warn!("unit key file unparseable; no encrypted title keys");
+                    Vec::new()
+                })
         };
         Self {
             inner: inputs,
@@ -317,7 +320,7 @@ pub trait KeySource {
     /// `i + 1`). The source hands back the COMPLETE set it holds; the caller
     /// trusts any non-empty result as all of them and never assumes a fixed count.
     /// Defaults to empty: a source with no forensic material (a plain keydb, the
-    /// mapfile) opts out, and only an FMTS disc's mux ever calls this.
+    /// mapfile) opts out, and only an FMTS disc's key acquisition ever calls this.
     fn get_fmts_indexes(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         Ok(Vec::new())
     }
@@ -428,6 +431,8 @@ pub(crate) fn encrypted_units_in(
                 Ok(_) => {}
                 // A Stop ends sampling: every remaining probe would only re-hit the drive.
                 Err(crate::error::Error::Halted) => return out,
+                // A dead bus or gone source is not a bad probe: stop rather than skip on.
+                Err(e) if e.is_scsi_transport_failure() || e.is_source_terminated() => return out,
                 Err(_) => continue,
             }
             for i in 0..units_this as usize {
@@ -508,6 +513,22 @@ mod tests {
         let s = MinimalSource;
         assert!(s.host_certs(None).is_empty());
         assert!(s.host_certs(Some(68)).is_empty());
+    }
+
+    /// The trait defaults are the contract external sources rely on (retry, per-piece asking,
+    /// VID use); a flipped default changes every foreign source's behaviour.
+    #[test]
+    fn key_source_defaults_are_conservative() {
+        struct MinimalSource;
+        impl KeySource for MinimalSource {
+            fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                Ok(Vec::new())
+            }
+        }
+        let s = MinimalSource;
+        assert!(!s.last_failure_was_transport());
+        assert!(s.answer_depends_on_samples());
+        assert!(!s.uses_vid());
     }
 
     /// DiscInputsCtx maps DiscInputs faithfully: zero VID → None, non-zero VID →
@@ -1101,5 +1122,65 @@ mod tests {
         lbas.dedup();
         assert_eq!(lbas.len(), n, "no unit may be sampled twice");
         assert!(n as u32 <= units);
+    }
+
+    fn sampling_extent(sectors: u32) -> Vec<crate::disc::Extent> {
+        vec![crate::disc::Extent {
+            start_lba: 500,
+            sector_count: sectors,
+        }]
+    }
+
+    /// A gone source ends sampling at the first failed probe: later probes would only hit the
+    /// dead device, and the empty result must not be mistaken for a clear title by more reads.
+    #[test]
+    fn encrypted_units_in_stops_at_a_gone_source() {
+        use crate::aacs::content::ALIGNED_UNIT_SECTORS;
+        struct Gone(u32);
+        impl crate::sector::SectorSource for Gone {
+            fn read_sectors(
+                &mut self,
+                _l: u32,
+                _c: u16,
+                _b: &mut [u8],
+                _r: bool,
+            ) -> crate::error::Result<usize> {
+                self.0 += 1;
+                Err(crate::error::Error::SourceTerminated)
+            }
+        }
+        let mut src = Gone(0);
+        let ext = sampling_extent(400 * ALIGNED_UNIT_SECTORS);
+        let out = encrypted_units_in(&mut src, &ext, crate::disc::ContentFormat::BdTs, 8);
+        assert!(out.is_empty());
+        assert_eq!(src.0, 1, "no probe after the source is gone");
+    }
+
+    /// An HD DVD title is classified by the PS scrambling bits, not the BD CPI byte.
+    #[test]
+    fn encrypted_units_in_uses_the_title_format() {
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS};
+        struct Fill;
+        impl crate::sector::SectorSource for Fill {
+            fn read_sectors(
+                &mut self,
+                _l: u32,
+                c: u16,
+                b: &mut [u8],
+                _r: bool,
+            ) -> crate::error::Result<usize> {
+                let n = c as usize * 2048;
+                for unit in b[..n].chunks_mut(ALIGNED_UNIT_LEN) {
+                    unit.fill(0);
+                    unit[0] = 0xC0; // BD CPI set, PS bits clear
+                }
+                Ok(n)
+            }
+        }
+        let ext = sampling_extent(400 * ALIGNED_UNIT_SECTORS);
+        let ps = encrypted_units_in(&mut Fill, &ext, crate::disc::ContentFormat::MpegPs, 8);
+        assert!(ps.is_empty(), "a BD CPI byte is not a PS scramble flag");
+        let ts = encrypted_units_in(&mut Fill, &ext, crate::disc::ContentFormat::BdTs, 8);
+        assert_eq!(ts.len(), 8);
     }
 }

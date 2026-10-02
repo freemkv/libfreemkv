@@ -978,6 +978,88 @@ fn hddvd_single_key_best_effort_multi_key_refuses() {
     }
 }
 
+/// An HD DVD copy already in the clear (whole MPEG-PS packs, no scrambling flag) that kept its
+/// AACS directory needs no key, however many keys its title-key file declares: the set is
+/// clear, no source is asked, nothing is best effort.
+#[test]
+fn hddvd_in_the_clear_needs_no_key_whatever_it_declares() {
+    let mut clip = vec![0u8; 30 * 2048];
+    for (i, sector) in clip.chunks_mut(2048).enumerate() {
+        for (j, b) in sector.iter_mut().enumerate() {
+            *b = ((i * 31 + j) % 251) as u8 | 1;
+        }
+        sector[..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sector[20] &= !0x30;
+    }
+    let files = [
+        BdFile::new("HVDVD_TS/FEATURE.EVO", 30, None).with_clip(clip),
+        BdFile::new("BDMV/index.bdmv", 1, None),
+    ];
+    for declared in [1, 64] {
+        let uk_ro = unit_key_ro(AacsVersion::V10, &vec![[0xEE; 16]; declared], &[1]);
+        let img = encrypted_bd_image(&files, &uk_ro);
+        let disc = disc_over(&img, &uk_ro, &[&[0]], DiscFormat::HdDvd);
+        let fx = Fx { img, disc };
+        let calls = Calls::default();
+        let set = resolve(&fx, KeyScope::Titles(vec![0]), &[Spec::keydb(&[], &calls)])
+            .unwrap_or_else(|e| panic!("{declared} declared: a clear HD DVD refused: {e}"));
+        let s = set.status();
+        assert_eq!(
+            (s.keyed, s.clear, s.best_effort),
+            (0, 1, false),
+            "{declared} declared"
+        );
+        assert_eq!(calls.len(), 0, "no source is asked for a clear disc");
+        assert!(set.is_aacs(), "the set still answers for the AACS disc");
+    }
+}
+
+/// An HD DVD set's unit spans stay in LBA order across fragmented and interleaved pieces:
+/// `span_at` bisects them.
+#[test]
+fn hddvd_set_spans_are_sorted_across_pieces() {
+    use crate::keys::evidence::Piece;
+    let files = [
+        BdFile::new("HVDVD_TS/FEATURE.EVO", 30, Some(K1)),
+        BdFile::new("BDMV/index.bdmv", 1, None),
+    ];
+    let uk_ro = unit_key_ro(AacsVersion::V10, &[[0xEE; 16]], &[1]);
+    let img = encrypted_bd_image(&files, &uk_ro);
+    let disc = disc_over(&img, &uk_ro, &[&[0]], DiscFormat::HdDvd);
+    let fx = Fx { img, disc };
+    let calls = Calls::default();
+    let f = factory(&[Spec::keydb(&[K1], &calls)]);
+    let ctx = crate::ctx::Ctx::new(Halt::new());
+    let mut reader = fx.source();
+    let mut ev =
+        KeyEvidence::from_disc(&fx.disc, &mut reader, KeyScope::Titles(vec![0]), &ctx).unwrap();
+    // Piece A is fragmented (descending extents); piece B sits between A's extents.
+    ev.pieces = vec![
+        Piece {
+            spans: vec![(5000, 30, 5000), (1000, 30, 5030)],
+            titles: vec![0],
+            rank: 1,
+        },
+        Piece {
+            spans: vec![(3000, 30, 3000)],
+            titles: vec![0],
+            rank: 1,
+        },
+    ];
+    let set = super::resolve::acquire(
+        &ev,
+        &mut Sampler::new(&mut reader),
+        &f,
+        AcquireOptions::default(),
+        &ctx,
+        &FakeClock::default(),
+    )
+    .unwrap()
+    .keys;
+    let starts: Vec<u32> = set.0.spans.iter().map(|s| s.0).collect();
+    assert_eq!(starts, [1000, 3000, 5000]);
+}
+
 /// LK17. A set is bound to its disc (hash, capacity, format, VID fingerprint), and its
 /// `Debug` shows no key or VID bytes.
 #[test]
@@ -2360,6 +2442,17 @@ fn keyless_session_set_is_bound_to_its_disc() {
     assert!(!bare.is_for(&fx.disc.media_id()), "no identity, no bypass");
 }
 
+/// A capture whose AACS `disc_hash` is empty is identified by its title-key file: the keyless
+/// set still fits that disc.
+#[test]
+fn keyless_session_set_fits_a_disc_without_a_captured_hash() {
+    let mut fx = two_units();
+    fx.disc.aacs.as_mut().unwrap().disc_hash = String::new();
+    assert!(!fx.disc.aacs.as_ref().unwrap().uk_ro.is_empty());
+    let set = KeyRing::keyless_for_disc(&fx.disc, 0).expect("title 0");
+    assert!(set.is_for(&fx.disc.media_id()));
+}
+
 /// J22 with J21 parity (review r4). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits)
 /// indicates the number of CPS Units on the disc". Step 10 keys on no less evidence than step
 /// 9: one opened probe of a piece longer than one unit is not proof, so the piece stays Lazy
@@ -3066,4 +3159,210 @@ fn evidence_without_a_hash_is_looked_up_by_its_title_key_file() {
         "the disc derives it too"
     );
     assert!(ring.is_for(&fx.disc.media_id()));
+}
+
+// ── One encryption decision, every AACS format ──────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+enum Media {
+    Bd,
+    Uhd,
+    HdDvd,
+}
+
+const MEDIA: [Media; 3] = [Media::Bd, Media::Uhd, Media::HdDvd];
+
+// Units in the one stream file of a `media_fx` disc.
+const MEDIA_UNITS: u32 = 10;
+
+// Whole MPEG-PS packs (pack start in every sector, no scrambling flag): an HD DVD feature in
+// the clear.
+fn ps_clip(sectors: usize) -> Vec<u8> {
+    let mut clip = vec![0u8; sectors * 2048];
+    for (i, sector) in clip.chunks_mut(2048).enumerate() {
+        for (j, b) in sector.iter_mut().enumerate() {
+            *b = ((i * 31 + j) % 251) as u8 | 1;
+        }
+        sector[..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sector[20] &= !0x30;
+    }
+    clip
+}
+
+// Encrypt every unit of file `f` (MPEG-PS) under `key`, its plain copy kept. A plaintext
+// header byte is varied until the ciphertext carries the PES scrambling flag the reader
+// gates on (that flag lies past the unit's clear seed).
+fn encrypt_ps(img: &mut EncryptedBdImage, f: usize, key: &[u8; 16]) {
+    let (start, sectors) = img.files[f];
+    for u in 0..sectors / 3 {
+        let at = (start + u * 3) as usize * 2048;
+        let mut plain = img.plain[at..at + ALIGNED_UNIT_LEN].to_vec();
+        let ct = (0..=255u8)
+            .find_map(|t| {
+                plain[24] = t;
+                let mut ct = plain.clone();
+                assert!(encrypt_unit(&mut ct, key));
+                (ct[20] & 0x30 != 0).then_some(ct)
+            })
+            .expect("a flagged ciphertext");
+        img.plain[at..at + ALIGNED_UNIT_LEN].copy_from_slice(&plain);
+        img.image[at..at + ALIGNED_UNIT_LEN].copy_from_slice(&ct);
+    }
+}
+
+// A one-title `media` disc whose one stream file holds `MEDIA_UNITS` units, in the clear or
+// encrypted under `key`, with a title-key file declaring `declared` keys.
+fn media_fx(media: Media, key: Option<[u8; 16]>, declared: usize) -> Fx {
+    let version = match media {
+        Media::Uhd => AacsVersion::V20,
+        _ => AacsVersion::V10,
+    };
+    let uk_ro = unit_key_ro(version, &vec![[0xEE; 16]; declared], &[1]);
+    let (img, format) = match media {
+        Media::Bd | Media::Uhd => {
+            let img = encrypted_bd_image(&[stream(0, MEDIA_UNITS, key)], &uk_ro);
+            let format = match media {
+                Media::Uhd => DiscFormat::Uhd,
+                _ => DiscFormat::BluRay,
+            };
+            (img, format)
+        }
+        Media::HdDvd => {
+            let files = [
+                BdFile::new("HVDVD_TS/FEATURE.EVO", MEDIA_UNITS * 3, None)
+                    .with_clip(ps_clip(MEDIA_UNITS as usize * 3)),
+                BdFile::new("BDMV/index.bdmv", 1, None),
+            ];
+            let mut img = encrypted_bd_image(&files, &uk_ro);
+            if let Some(k) = &key {
+                encrypt_ps(&mut img, 0, k);
+            }
+            (img, DiscFormat::HdDvd)
+        }
+    };
+    let mut disc = disc_over(&img, &uk_ro, &[&[0]], format);
+    if let (Media::Uhd, Some(a)) = (media, disc.aacs.as_mut()) {
+        a.version = 2;
+    }
+    Fx { img, disc }
+}
+
+/// Every AACS format (BD, UHD, HD DVD) in the clear proceeds with no key source asked,
+/// whatever its title-key file declares, for a title rip and a whole-disc copy alike, and
+/// reads back as it is.
+#[test]
+fn every_format_in_the_clear_asks_no_source_whatever_it_declares() {
+    for media in MEDIA {
+        for declared in [1, 3] {
+            for scope in [KeyScope::Titles(vec![0]), KeyScope::WholeDisc] {
+                let fx = media_fx(media, None, declared);
+                let calls = Calls::default();
+                let specs = [Spec::keydb(&[K1], &calls), Spec::online(&[K1], &calls)];
+                let set = resolve(&fx, scope.clone(), &specs).unwrap_or_else(|e| {
+                    panic!("{media:?} {declared} declared {scope:?}: clear content refused: {e}")
+                });
+                assert_eq!(calls.len(), 0, "{media:?} {scope:?}: a source was asked");
+                let s = set.status();
+                assert_eq!(
+                    (s.keyed, s.lazy, s.best_effort),
+                    (0, 0, false),
+                    "{media:?} {scope:?}"
+                );
+                assert!(s.clear >= 1, "{media:?} {scope:?}");
+                let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
+                assert_eq!(
+                    read(&mut r, &fx, 0, 0, MEDIA_UNITS).unwrap(),
+                    fx.plain(fx.file(0).0, MEDIA_UNITS),
+                    "{media:?} {scope:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Every AACS format with encrypted content asks the configured sources and, when none has
+/// the key, refuses before any output: E7022 for a title rip, E7032 for a whole-disc copy.
+#[test]
+fn every_format_encrypted_with_no_key_refuses_typed() {
+    for media in MEDIA {
+        for (scope, want) in [
+            (KeyScope::Titles(vec![0]), E7022),
+            (KeyScope::WholeDisc, E7032),
+        ] {
+            let fx = media_fx(media, Some(K1), 1);
+            let calls = Calls::default();
+            let r = resolve(&fx, scope.clone(), &[Spec::keydb(&[], &calls)]);
+            assert_eq!(code(r), want, "{media:?} {scope:?}");
+            assert_eq!(calls.len(), 1, "{media:?} {scope:?}: the source is asked");
+        }
+    }
+}
+
+/// Every AACS format with encrypted content and a source holding its key decrypts it.
+#[test]
+fn every_format_encrypted_with_a_key_decrypts() {
+    for media in MEDIA {
+        let fx = media_fx(media, Some(K1), 1);
+        assert_ne!(
+            fx.raw(fx.file(0).0, 1),
+            fx.img.plain[fx.file(0).0 as usize * 2048..][..ALIGNED_UNIT_LEN],
+            "{media:?}: the fixture is encrypted"
+        );
+        let calls = Calls::default();
+        let set = resolve(
+            &fx,
+            KeyScope::Titles(vec![0]),
+            &[Spec::keydb(&[K1], &calls)],
+        )
+        .unwrap_or_else(|e| panic!("{media:?}: refused with its key held: {e}"));
+        assert_eq!(calls.len(), 1, "{media:?}");
+        assert_eq!(set.status().keyed, 1, "{media:?}");
+        let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
+        assert_eq!(
+            read(&mut r, &fx, 0, 0, MEDIA_UNITS).unwrap(),
+            fx.plain(fx.file(0).0, MEDIA_UNITS),
+            "{media:?}: decrypted"
+        );
+    }
+}
+
+/// An FMTS disc takes the same decision: base content and forensic segments in the clear ask
+/// no source, forensic keys included; encrypted segments under clear base content are keyed.
+#[test]
+fn fmts_in_the_clear_asks_no_source_encrypted_segments_are_keyed() {
+    let mut fx = fmts_fixture();
+    for f in [0, 1] {
+        let (start, n) = fx.file(f);
+        let span = start as usize * 2048..(start + n) as usize * 2048;
+        let clear = masked(&fx.img.plain[span.clone()]);
+        fx.img.image[span.clone()].copy_from_slice(&clear);
+        fx.img.plain[span].copy_from_slice(&clear);
+    }
+    let calls = Calls::default();
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0, 1, 2]),
+        &[Spec::keydb(&[K1, K2], &calls), fmts_online(&calls)],
+    )
+    .unwrap();
+    assert_eq!(calls.len(), 0, "no source, forensic included");
+    assert_eq!(set.status().forensic, ForensicState::None);
+
+    for (a, b, key) in [(0, 16, F1), (20, 36, F2)] {
+        for u in a..b {
+            fx.reencrypt(1, u, if (u - a) % 2 == 0 { &key } else { &ALT });
+        }
+    }
+    let calls = Calls::default();
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0, 1, 2]),
+        &[Spec::keydb(&[], &calls), fmts_online(&calls)],
+    )
+    .unwrap();
+    assert!(
+        calls.of("online").iter().any(|c| c.forensic),
+        "encrypted segments ask for the forensic set"
+    );
+    assert_eq!(set.status().forensic, ForensicState::Resolved);
 }

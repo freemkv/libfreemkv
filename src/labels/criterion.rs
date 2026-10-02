@@ -407,6 +407,24 @@ mod tests {
         assert_eq!(by_lang, [("eng", 2), ("fra", 1)]);
     }
 
+    // Two streams claiming the same number: the second is dropped, not emitted with the
+    // NO_STN_SLOT sentinel.
+    #[test]
+    fn parse_drops_a_stream_with_a_contradictory_number_claim() {
+        let sp = "<AudioStreamInfos><ID>a0</ID><LangInfoID>ENG</LangInfoID></AudioStreamInfos>\
+                  <AudioStreamInfos><ID>a1</ID><LangInfoID>FRA</LangInfoID></AudioStreamInfos>";
+        let pc = "<AudioStreams><StreamID>2</StreamID><StreamInfo_ID>a0</StreamInfo_ID></AudioStreams>\
+                  <AudioStreams><StreamID>2</StreamID><StreamInfo_ID>a1</StreamInfo_ID></AudioStreams>";
+        let (mut disc, udf) = jar_disc(&[("streamproperties.xml", sp), ("playbackconfig.xml", pc)]);
+        let got = parse(&mut disc, &udf).expect("labels");
+        let kept: Vec<(&str, u16)> = got
+            .labels
+            .iter()
+            .map(|l| (l.language.as_str(), l.stream_number))
+            .collect();
+        assert_eq!(kept, [("eng", 2)]);
+    }
+
     // ── Additional hardening tests ─────────────────────────────────────────
 
     /// Spec: audio and subtitle counters are INDEPENDENT — audio fallback counter

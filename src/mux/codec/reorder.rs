@@ -357,6 +357,27 @@ mod tests {
         assert_eq!(&got[..4], &[0, dur, 2 * dur, 3 * dur]);
     }
 
+    // The slots between two anchors exclude the held GOP's frames displayed before its own anchor.
+    #[test]
+    fn calibration_discounts_the_held_gops_leading_display_offset() {
+        use CodingType::*;
+        let dur = 40_000_000i64;
+        let mut r = SparsePtsReorder::new();
+        let mut got: Vec<i64> = Vec::new();
+        // Open first GOP, decode I B B P: the I displays third (slot 2), the P fourth.
+        for (k, ct) in [I, B, B, P].into_iter().enumerate() {
+            let p = (k == 0).then_some(2 * dur);
+            got.extend(r.push(p, frame(ct, k == 0)).iter().map(|f| f.pts_ns));
+        }
+        // The next GOP's I is anchored two slots after the first anchor.
+        for (k, ct) in [I, P].into_iter().enumerate() {
+            let p = (k == 0).then_some(4 * dur);
+            got.extend(r.push(p, frame(ct, k == 0)).iter().map(|f| f.pts_ns));
+        }
+        got.extend(r.flush().iter().map(|f| f.pts_ns));
+        assert_eq!(&got[..4], &[2 * dur, 0, dur, 3 * dur]);
+    }
+
     #[test]
     fn no_pts_collisions_within_a_gop() {
         use CodingType::*;

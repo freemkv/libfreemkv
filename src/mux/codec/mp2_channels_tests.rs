@@ -383,7 +383,7 @@ fn mc(centre: u8, surround: u8, lfe: bool) -> Mc {
 
 fn multichannel(f: &[u8]) -> Option<McHeader> {
     match inspect(f) {
-        Frame::Multichannel { mc, .. } => Some(mc),
+        ChannelFrame::Multichannel { mc, .. } => Some(mc),
         _ => None,
     }
 }
@@ -730,7 +730,7 @@ fn ffmpeg_encoded_frames_walk_to_the_end_of_every_frame() {
                 f.len() * 8 - base.mc_start
             );
             // §2.5.3.1: no valid mc_crc_check in MPEG-1 frames, so no multichannel.
-            assert!(matches!(inspect(f), Frame::Base { nch: c, .. } if c == nch));
+            assert!(matches!(inspect(f), ChannelFrame::Base { nch: c, .. } if c == nch));
             n += 1;
         }
     }
@@ -753,7 +753,10 @@ fn frame_crc_is_checked_when_protection_bit_is_zero() {
     };
     // §2.4.3.1: header bits "starting with bit_rate_index and ending with emphasis" plus the
     // Table 3-B.5 audio_data bits (allocation and scfsi for Layer II).
-    assert!(matches!(inspect(&frame(crc)), Frame::Base { nch: 2, .. }));
+    assert!(matches!(
+        inspect(&frame(crc)),
+        ChannelFrame::Base { nch: 2, .. }
+    ));
     let bad = Spec {
         bad_frame_crc: true,
         ..crc
@@ -761,7 +764,7 @@ fn frame_crc_is_checked_when_protection_bit_is_zero() {
     // "If the words are not identical, a transmission error has occured in the protected field".
     assert_eq!(
         inspect(&frame(bad)),
-        Frame::Damaged {
+        ChannelFrame::Damaged {
             nch: 2,
             why: Fallback::FrameCrc
         }
@@ -770,7 +773,7 @@ fn frame_crc_is_checked_when_protection_bit_is_zero() {
     flipped[3] ^= 0x01; // emphasis bit: inside the protected header bits
     assert_eq!(
         inspect(&flipped),
-        Frame::Damaged {
+        ChannelFrame::Damaged {
             nch: 2,
             why: Fallback::FrameCrc
         }
@@ -792,7 +795,7 @@ fn multichannel_needs_a_valid_mc_crc_check() {
     };
     assert_eq!(
         inspect(&frame(bad)),
-        Frame::Base {
+        ChannelFrame::Base {
             nch: 2,
             why: Fallback::McCrc
         }
@@ -877,7 +880,7 @@ fn centre_10_is_not_defined_and_falls_back() {
     // §2.5.2.13 centre: "'10' not defined".
     assert_eq!(
         inspect(&f),
-        Frame::Base {
+        ChannelFrame::Base {
             nch: 2,
             why: Fallback::UndefinedCentre
         }
@@ -929,7 +932,7 @@ fn ext_one_mc_data_beyond_the_base_part_cannot_be_verified() {
     let f = frame(with_mc(STEREO_256, huge));
     assert!(matches!(
         inspect(&f),
-        Frame::Base {
+        ChannelFrame::Base {
             why: Fallback::Truncated(_),
             ..
         }
@@ -1198,7 +1201,7 @@ fn unsupported_frames_give_the_header_count() {
         ),
     ];
     for (s, why) in cases {
-        assert_eq!(inspect(&frame(s)), Frame::Base { nch: 2, why });
+        assert_eq!(inspect(&frame(s)), ChannelFrame::Base { nch: 2, why });
     }
 }
 
@@ -1256,13 +1259,13 @@ fn truncation_at_each_field_boundary_names_the_field() {
             f => f,
         });
         let want = if base_field {
-            Frame::Damaged { nch: 2, why }
+            ChannelFrame::Damaged { nch: 2, why }
         } else {
-            Frame::Base { nch: 2, why }
+            ChannelFrame::Base { nch: 2, why }
         };
         assert_eq!(got, want, "{field}");
     }
-    assert_eq!(inspect(&f[..3]), Frame::NoHeader);
+    assert_eq!(inspect(&f[..3]), ChannelFrame::NoHeader);
 }
 
 /// Opus defect 1: a failed first frame must not lock in the base count.

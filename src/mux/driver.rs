@@ -164,12 +164,17 @@ pub fn mux_url(
 ) -> std::io::Result<MuxOutcome> {
     let source = match super::source::open_source(url, crate::disc::ScanOptions::default(), ctx) {
         Ok(s) => s,
-        Err(Error::Halted) if ctx.halt.is_cancelled() => {
-            return Ok(MuxOutcome::stopped_before_output(0, 0));
-        }
-        Err(e) => return Err(e.into()),
+        Err(e) => return open_failed(e, ctx),
     };
     mux_with_keys(source, keys, dest_url, opts, ctx)
+}
+
+// A failed open: the stopped outcome when it is a Stop, the error otherwise.
+fn open_failed(e: Error, ctx: &Ctx) -> std::io::Result<MuxOutcome> {
+    match e {
+        Error::Halted if ctx.halt.is_cancelled() => Ok(MuxOutcome::stopped_before_output(0, 0)),
+        e => Err(e.into()),
+    }
 }
 
 // `mux_with_keys` before its one halt rule.
@@ -251,7 +256,7 @@ pub(crate) fn open_pes(
             match set.or(keyless.as_ref()) {
                 Some(set) => {
                     let title = live_keyed_title(&*reader, title, set, opts)?;
-                    live_keyed(reader, title, format, set, opts, ctx)
+                    live_keyed(reader, title, set, opts, ctx)
                 }
                 None => {
                     let mut title = title;
@@ -344,7 +349,7 @@ fn session_pes(
             let staged = session.staged_reader().ok_or_else(not_ready)?;
             let title = live_keyed_title(staged, title, set, opts)?;
             let reader = session.take_reader().ok_or_else(not_ready)?;
-            live_keyed(reader, title, format, set, opts, ctx)
+            live_keyed(reader, title, set, opts, ctx)
         }
         None => {
             let mut title = title;
@@ -411,7 +416,6 @@ fn live_keyed_title(
 fn live_keyed(
     reader: Box<dyn SectorSource>,
     title: DiscTitle,
-    _format: crate::disc::ContentFormat,
     set: &crate::keys::KeyRing,
     opts: &MuxOptions,
     ctx: &Ctx,
@@ -998,6 +1002,19 @@ impl WriteSink {
         })
     }
 
+    // End an output that `cause` cut short. The cause is the title's verdict: ending the
+    // output can fail (an mkv with no frames is `MkvInvalid`), which is logged, never returned.
+    fn end_cut_short(self, cause: &str) -> Result<SinkClose, Error> {
+        let bytes = self.bytes.clone();
+        self.end(false).or_else(|e| {
+            tracing::warn!(target: "mux", error = %e, "ending the output {cause} cut short failed");
+            Ok(SinkClose {
+                bytes: bytes.load(Ordering::Relaxed),
+                undelivered: Vec::new(),
+            })
+        })
+    }
+
     fn apply_late_configs(&mut self) -> Result<(), Error> {
         let late = std::mem::take(&mut *lock_late(&self.late_configs));
         for (track, cp) in late {
@@ -1026,13 +1043,15 @@ impl Sink<PesFrame> for WriteSink {
     }
 
     fn close(self) -> Result<SinkClose, Error> {
-        let complete = !self.read_failed.load(Ordering::Relaxed);
-        self.end(complete)
+        match self.read_failed.load(Ordering::Relaxed) {
+            true => self.end_cut_short("a read failure"),
+            false => self.end(true),
+        }
     }
 
     // A stopped title is incomplete too: a wire sink must not end it cleanly.
     fn close_stopped(self) -> Result<SinkClose, Error> {
-        self.end(false)
+        self.end_cut_short("a stop")
     }
 }
 
@@ -1144,6 +1163,38 @@ mod tests {
             "got {err}"
         );
         assert!(log.is_empty(), "a failed sink is never finalised: {log:?}");
+    }
+
+    // A strict read failure before any frame lands: the mkv's zero-frame `MkvInvalid` on
+    // ending the output is a skippable stub code and must not replace the read error.
+    #[test]
+    fn a_read_failure_before_any_frame_is_not_a_skippable_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("mkv://{}", dir.path().join("o.mkv").display());
+        let mut fs = FakeStream::new(1).with_frames(10);
+        fs.fail_read_at = Some(0);
+        let ctx = crate::ctx::Ctx::new(Halt::new());
+        let err = drive_mux(Box::new(fs), &url, &ctx, None, None).expect_err("a read failure");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DISC_READ),
+            "got {err}"
+        );
+        assert!(!crate::error::is_skippable_title_stub(&err));
+    }
+
+    // A Stop after the mkv output opens but before any frame reaches it: a halted outcome,
+    // never the zero-frame `MkvInvalid` from ending the empty output.
+    #[test]
+    fn a_stop_before_any_frame_reaches_an_open_mkv_is_halted_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("mkv://{}", dir.path().join("o.mkv").display());
+        let halt = Halt::new();
+        let fs = FakeStream::new(1).with_frames(10).cancels(halt.clone(), 0);
+        let ctx = crate::ctx::Ctx::new(halt.clone());
+        let o = drive_mux(Box::new(fs), &url, &ctx, None, None).expect("a stop is not an error");
+        assert!(o.output_opened && !o.completed && o.halted, "{o:?}");
+        assert_eq!(o.bytes_written, 0);
     }
 
     // A stop ends the output incomplete; a clean drain finishes it.
@@ -1399,6 +1450,72 @@ mod tests {
                 "{dest}"
             );
         }
+    }
+
+    // A never-syncing TrueHD title with `n` non-sync frames of `size` bytes each.
+    fn unsynced_truehd_stream(n: usize, size: usize) -> FakeStream {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        let mut s = FakeStream::new(0);
+        s.info.streams = vec![Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::TrueHd,
+            channels: AudioChannels::Surround51,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        })];
+        for pts in 0..n as i64 {
+            s.frames.push_back(PesFrame {
+                discard_padding_ns: 0,
+                track: 0,
+                pts,
+                keyframe: true,
+                data: vec![0u8; size],
+                duration_ns: None,
+                source: None,
+                coding: None,
+            });
+        }
+        s
+    }
+
+    // A Stop during the TrueHD probe ends the mux before any output opens, for both a
+    // frame sink and a metadata sink, whether it shows as a cancelled halt or Err(Halted).
+    #[test]
+    fn a_stop_during_the_truehd_probe_stops_before_the_output_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = format!("json://{}", dir.path().join("t.json").display());
+        for dest in ["null://", json.as_str()] {
+            let halt = Halt::new();
+            let s = unsynced_truehd_stream(5, 64).cancels(halt.clone(), 1);
+            let out = drive_mux(Box::new(s), dest, &Ctx::new(halt), None, None).unwrap();
+            assert!(out.halted && !out.completed && !out.output_opened, "{dest}");
+
+            let s = unsynced_truehd_stream(5, 64).halt_errs_at(1);
+            let out = drive_mux(Box::new(s), dest, &Ctx::default(), None, None).unwrap();
+            assert!(!out.completed && !out.output_opened, "{dest} Err(Halted)");
+        }
+    }
+
+    // The probe reads at most TRUEHD_PROBE_BYTES before the output opens; a title that never
+    // syncs is not buffered whole.
+    #[test]
+    fn the_truehd_probe_is_byte_capped() {
+        let mut s = unsynced_truehd_stream(20, 1 << 20);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        s.read_observer = Some(reads.clone());
+        let at_open = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (seen, counter) = (at_open.clone(), reads.clone());
+        let ctx = Ctx::default().with_events(Arc::new(move |e: &Event<'_>| {
+            if let Event::OutputOpened { .. } = e {
+                seen.store(counter.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        }));
+        drive_mux(Box::new(s), "null://", &ctx, None, None).unwrap();
+        let n = at_open.load(Ordering::SeqCst);
+        assert!(n <= 10, "{n} MiB frames read before the output opened");
     }
 
     fn mp2_ext_title() -> DiscTitle {
@@ -1680,6 +1797,22 @@ mod tests {
         assert!(out.halted && !out.completed && !out.output_opened);
     }
 
+    // A Stop landing in `open_source` (the scan / bring-up) is the documented stopped
+    // outcome from `mux_url`, not an `E_HALTED` error; any other open failure stays an error.
+    #[test]
+    fn a_stop_during_mux_urls_open_is_a_halted_outcome() {
+        let ctx = Ctx::default();
+        ctx.halt.cancel();
+        let out = open_failed(Error::Halted, &ctx).expect("a Stop is not an error");
+        assert!(out.halted && !out.completed && !out.output_opened);
+        assert!(open_failed(Error::NoStreams, &ctx).is_err());
+        let live = Ctx::default();
+        assert!(
+            open_failed(Error::Halted, &live).is_err(),
+            "Err(Halted) with no Stop requested is not a stopped outcome"
+        );
+    }
+
     // ── halt mid-pump stops cleanly with completed=false, no panic. ──
     #[test]
     fn halt_mid_pump_stops_cleanly() {
@@ -1700,6 +1833,10 @@ mod tests {
         .expect("halt is a clean stop, not an error");
         assert!(!out.completed, "an interrupted mux is not complete");
         assert!(out.output_opened, "the sink was opened before the halt");
+        assert!(
+            out.halted,
+            "a Stop is reported as halted so callers map it to Cancelled"
+        );
     }
 
     // A halt that ends the stream as Ok(None) can also release the header gate
@@ -1740,6 +1877,7 @@ mod tests {
             None,
         )
         .expect("a halt mid frame-read is a clean stop, not an Err");
+        assert!(!out.halted, "halt was never cancelled: not a Stop");
         assert!(!out.completed, "interrupted mux is not complete");
         assert!(out.output_opened, "sink opened before the mid-read halt");
     }

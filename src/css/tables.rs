@@ -171,6 +171,20 @@ mod tests {
         assert_eq!(TAB1[0x33], 0x00, "TAB1[0x33] is the published 0x00");
     }
 
+    // FNV-1a over a whole table: a swapped pair keeps a permutation and the anchors, so only
+    // a full-content pin catches a mistyped or regenerated table.
+    fn fnv1a(table: &[u8]) -> u64 {
+        table.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn tab1_and_tab2_contents_are_pinned() {
+        assert_eq!(fnv1a(&TAB1), 0xcdb8_7228_1c08_c265, "TAB1 content changed");
+        assert_eq!(fnv1a(&TAB2), 0x79e0_69d7_0f3d_2f25, "TAB2 content changed");
+    }
+
     // TAB2 is a permutation of 0..256 (LFSR1 high-byte feedback substitution); a non-bijective
     // table would bias the LFSR1 keystream.
     #[test]

@@ -208,15 +208,11 @@ static int conforms_to_any(io_object_t obj, const char *const *classes) {
     return 0;
 }
 
-// IOMainPort is macOS 12+; IOMasterPort is its deprecated pre-12 name.
+// The default IOKit port is MACH_PORT_NULL (kIOMainPortDefault), on every macOS: no
+// IOMainPort/IOMasterPort call, so no availability check the Rust link cannot resolve.
 static kern_return_t shim_main_port(mach_port_t *mp) {
-    if (__builtin_available(macOS 12.0, *)) {
-        return IOMainPort(0, mp);
-    }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return IOMasterPort(0, mp);
-#pragma clang diagnostic pop
+    *mp = MACH_PORT_NULL;
+    return kIOReturnSuccess;
 }
 
 // Visitor result: 0 = continue (svc released), 1 = stop and return svc

@@ -18,7 +18,7 @@ iso-null outcome = completed=true opened=true bytes=26416 errors=0 lost=0 stream
 iso-mkv-raw refused = E6008
 iso-mkv-selection outcome = completed=true opened=true bytes=20016 errors=0 lost=0 streams=2 undelivered=[]
 iso-mkv-selection out o.mkv = 21563 bytes sha256:cda2cf35944d0511ffd8de92d4a542fd
-live-mkv refused = E6008
+live-mkv refused = E6000
 live-mkv out o.mkv = 493 bytes sha256:454f3eb165010aa1646faed1279583cf
 live-mkv-raw refused = E6000
 live-mkv-skip outcome = completed=true opened=true bytes=17910 errors=7 lost=6144 streams=3 undelivered=[]

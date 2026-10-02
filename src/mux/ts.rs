@@ -169,13 +169,7 @@ impl PesAssembler {
                     bytes = self.buffer.len(),
                     "PES buffer cap exceeded; dropping partial PES and resyncing on next PUSI",
                 );
-                self.buffer.clear();
-                self.active = false;
-                self.header_remaining = 0;
-                // A dropped partial PES is a gap in the elementary stream — flag
-                // it so the NEXT completed PES carries a discontinuity, matching
-                // every other partial-drop path in this file (`drop_partial`).
-                self.pending_discontinuity = true;
+                self.drop_partial();
                 return;
             }
             // Grow by doubling but never past `cap`, so the allocation honours the share too.
@@ -1253,6 +1247,66 @@ mod tests {
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(out[0].data.starts_with(b"AAAA") && out[0].data.ends_with(&[b'a'; 184]));
         assert!(out[1].data.starts_with(b"BBBB") && out[1].data.ends_with(&[b'b'; 184]));
+    }
+
+    // A packet repeating the previous CC with other data means a whole CC cycle (16
+    // packets) was lost: a continuation drops the open PES, a PUSI flags the new one.
+    #[test]
+    fn same_cc_with_other_data_is_a_gap() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        out.extend(demux.feed(&ts_payload_packet(pid, false, 0, b"XXXX")));
+        out.extend(demux.feed(&ts_payload_packet(pid, true, 1, &pes_start(b"CCCC"))));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "A is dropped, not spliced with X: {out:?}");
+        assert!(out[0].data.starts_with(b"CCCC") && out[0].discontinuity);
+
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 3, &pes_start(b"AAAA")));
+        out.extend(demux.feed(&ts_payload_packet(pid, true, 3, &pes_start(b"BBBB"))));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(!out[0].discontinuity);
+        assert!(out[1].discontinuity, "the lost cycle flags the new PES");
+    }
+
+    // A header-only PES holds no ES bytes: no empty packet reaches the codec parsers.
+    #[test]
+    fn a_header_only_pes_is_not_emitted() {
+        let pid = 0x1011;
+        let exact = |pusi: bool, cc: u8, es: &[u8]| {
+            let mut p = es_packet_exact(pid, pusi, &pes_start(es));
+            p[7] |= cc;
+            p
+        };
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = demux.feed(&exact(true, 0, &[]));
+        out.extend(demux.feed(&exact(true, 1, b"BBBB")));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].data, b"BBBB");
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = demux.feed(&exact(true, 0, &[]));
+        out.extend(demux.flush());
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    // A zero-filled gap that ends mid-packet leaves its partial tail in the remainder, so the
+    // next feed completes it and the packet after the gap stays on the grid.
+    #[test]
+    fn a_gap_ending_mid_packet_keeps_the_next_feed_aligned() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut first = ts_payload_packet(pid, true, 0, &pes_start(b"AAAA"));
+        first.extend(vec![0u8; 3 * BD_SOURCE_PACKET_BYTES + 50]);
+        let mut second = vec![0u8; BD_SOURCE_PACKET_BYTES - 50];
+        second.extend(ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")));
+        let mut out = demux.feed(&first);
+        out.extend(demux.feed(&second));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[1].data.starts_with(b"BBBB"));
     }
 
     // A PUSI whose payload is not a PES start leaves no PES open: the continuations after it
@@ -2670,6 +2724,34 @@ mod tests {
             })
             .expect("video present");
         assert_eq!(v.resolution, Resolution::R1080i, "MPEG-2 defaults to 1080i");
+    }
+
+    // Program-level descriptors (a non-zero program_info_length) are skipped, not read as ES
+    // entries.
+    #[test]
+    fn scan_streams_skips_program_descriptors() {
+        let pmt_pid = 0x0100u16;
+        let mut data = pat_packet(pmt_pid);
+        let mut body = [0xFFu8; 184];
+        body[0] = 0x00;
+        let s = 1;
+        body[s] = 0x02;
+        // 9 fixed + 6 descriptor + 5 ES entry + 4 CRC.
+        let section_length: usize = 9 + 6 + 5 + 4;
+        body[s + 1] = 0xB0;
+        body[s + 2] = section_length as u8;
+        body[s + 3..s + 12].copy_from_slice(&[0, 1, 0xC1, 0, 0, 0xE0, 0, 0xF0, 6]);
+        // HDMV registration descriptor.
+        body[s + 12..s + 18].copy_from_slice(&[0x05, 0x04, b'H', b'D', b'M', b'V']);
+        let p = s + 18;
+        body[p..p + 5].copy_from_slice(&[0x1B, 0xE0 | 0x10, 0x11, 0xF0, 0x00]);
+        data.extend(bdts_packet(body, pmt_pid, true));
+        data.extend(pat_packet(pmt_pid));
+        let streams = scan_streams(&data).expect("the PMT parses");
+        assert!(
+            matches!(&streams[..], [crate::disc::Stream::Video(v)] if v.pid == 0x1011 && v.codec == crate::disc::Codec::H264),
+            "{streams:?}"
+        );
     }
 
     #[test]

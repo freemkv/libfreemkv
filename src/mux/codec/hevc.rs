@@ -115,8 +115,8 @@ pub struct HevcParser {
     /// ids are 0..=63 (H.265 §7.4.3.3); an out-of-range id is ignored.
     pps_num_extra: [Option<u32>; HEVC_MAX_PPS_COUNT],
     // Splice-aware CRA→BLA rewrite for a non-seamless BD clip boundary (first
-    // CRA_NUT -> BLA_W_LP so NoRaslOutput discards dangling RASL). Armed by
-    // `mark_clip_boundary` AND PTS-backstep auto-detect in `parse` — not dead code.
+    // CRA_NUT -> BLA_W_LP so NoRaslOutput discards dangling RASL). Armed by PTS-backstep
+    // auto-detect in `parse`, or by the public `mark_clip_boundary` hook (no in-tree caller).
     pending_clip_boundary: bool,
     // Highest PES PTS seen, on a monotonic 64-bit timeline (33-bit PTS unwrapped
     // across 2^33 wraps — see `pts_wrap_offset`). Auto-detects a non-seamless clip
@@ -446,12 +446,11 @@ impl CodecParser for HevcParser {
         let mut bla_au = false;
         // Picture coding type, MEASURED from the first coded slice's header.
         let mut coding_type: Option<CodingType> = None;
-        // Track whether THIS access unit already carried each param-set type
-        // in-band (a redefinition vs codecPrivate). Used after the scan to
-        // re-assert the active set at a keyframe the source left bare.
-        let mut emitted_vps = false;
-        let mut emitted_sps = false;
-        let mut emitted_pps = false;
+        // This AU's in-band redefinitions, held aside to lead the AU in VPS, SPS, PPS
+        // order: a re-asserted PPS ahead of a redefined SPS is dropped by the decoder.
+        let mut inband_vps = Vec::new();
+        let mut inband_sps = Vec::new();
+        let mut inband_pps = Vec::new();
         // Pre-sized to input length plus PARAM_REASSERT_HEADROOM: UHD frames are
         // 150-300 KB and an unsized Vec otherwise reallocs 5-7x per frame; the
         // headroom also lets the keyframe param-set re-assert splice in without reallocating.
@@ -493,20 +492,20 @@ impl CodecParser for HevcParser {
 
                     match nal_type {
                         NAL_VPS => {
-                            emitted_vps |= handle_param_set(
+                            handle_param_set(
                                 &mut self.vps,
                                 &mut self.cur_vps,
                                 &data[nal_start..end],
-                                &mut frame_data,
-                            )
+                                &mut inband_vps,
+                            );
                         }
                         NAL_SPS => {
-                            emitted_sps |= handle_param_set(
+                            handle_param_set(
                                 &mut self.sps,
                                 &mut self.cur_sps,
                                 &data[nal_start..end],
-                                &mut frame_data,
-                            )
+                                &mut inband_sps,
+                            );
                         }
                         NAL_PPS => {
                             // Store the PPS under its own id so a later slice's
@@ -519,12 +518,12 @@ impl CodecParser for HevcParser {
                             {
                                 *slot = hevc_num_extra_slice_header_bits(pps);
                             }
-                            emitted_pps |= handle_param_set(
+                            handle_param_set(
                                 &mut self.pps,
                                 &mut self.cur_pps,
                                 &data[nal_start..end],
-                                &mut frame_data,
-                            )
+                                &mut inband_pps,
+                            );
                         }
                         // Drop Access Unit Delimiters: Matroska HEVC frame data
                         // omits AUDs (the container delimits access units), so
@@ -569,18 +568,30 @@ impl CodecParser for HevcParser {
             }
         }
 
-        if frame_data.is_empty() {
+        if frame_data.is_empty()
+            && inband_vps.is_empty()
+            && inband_sps.is_empty()
+            && inband_pps.is_empty()
+        {
             return Vec::new();
         }
 
         // A player re-applies hvcC param sets at every keyframe; if the active
         // set was redefined mid-title and the source stopped repeating it, the
-        // reversion desyncs CABAC. Re-assert in-band at every keyframe (self-heals).
-        if keyframe {
+        // reversion desyncs CABAC. Re-assert at every keyframe; a redefined type goes instead.
+        {
             let mut prefix = Vec::with_capacity(PARAM_REASSERT_HEADROOM);
-            reassert_active(&mut prefix, &self.cur_vps, emitted_vps);
-            reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
-            reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
+            for (inband, cur) in [
+                (&inband_vps, &self.cur_vps),
+                (&inband_sps, &self.cur_sps),
+                (&inband_pps, &self.cur_pps),
+            ] {
+                if !inband.is_empty() {
+                    prefix.extend_from_slice(inband);
+                } else if keyframe {
+                    reassert_active(&mut prefix, cur, false);
+                }
+            }
             if !prefix.is_empty() {
                 // Splice prefix into frame_data in place via PARAM_REASSERT_HEADROOM,
                 // avoiding the extra whole-frame alloc+copy per keyframe the old
@@ -696,14 +707,20 @@ impl CodecParser for HevcParser {
         // chromaFormat / bit depths — parse real values from the SPS RBSP; a
         // hardcoded 8-bit 4:2:0 is wrong for 10-bit Main 10 UHD (nearly all UHD
         // content). Fall back to it only if the SPS can't be parsed.
-        let chroma = parse_sps_chroma(sps).unwrap_or(SpsChroma {
-            chroma_format_idc: 1,
-            bit_depth_luma_minus8: 0,
-            bit_depth_chroma_minus8: 0,
-            max_sub_layers_minus1: 0,
-            temporal_id_nesting_flag: 0,
-            max_num_reorder_pics: None,
-            picture_period_ticks: None,
+        let chroma = parse_sps_chroma(sps).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "freemkv::mux::hevc",
+                "HEVC SPS unparseable; hvcC declares 8-bit 4:2:0"
+            );
+            SpsChroma {
+                chroma_format_idc: 1,
+                bit_depth_luma_minus8: 0,
+                bit_depth_chroma_minus8: 0,
+                max_sub_layers_minus1: 0,
+                temporal_id_nesting_flag: 0,
+                max_num_reorder_pics: None,
+                picture_period_ticks: None,
+            }
         });
         // chromaFormat (6 reserved bits set + 2-bit chroma_format_idc)
         record.push(0xFC | (chroma.chroma_format_idc & 0x03));
@@ -771,6 +788,7 @@ struct SpsChroma {
 
 /// Reorder depth R of an HEVC SPS NAL (2-byte header included):
 /// `sps_max_num_reorder_pics[sps_max_sub_layers_minus1]` (H.265 §7.3.2.2 \[I\]).
+#[cfg(test)]
 pub(crate) fn parse_sps_reorder(sps: &[u8]) -> Option<u32> {
     parse_sps_chroma(sps)?.max_num_reorder_pics
 }
@@ -2657,6 +2675,39 @@ mod tests {
 
     // --- parameter-set redefinition (mid-title redefinition bug) ---
 
+    // An IRAP whose SPS changed but whose PPS did not: the re-asserted PPS must follow
+    // the new SPS, or the decoder parses it against the old one and drops it.
+    #[test]
+    fn reasserted_pps_follows_a_redefined_sps() {
+        let mut parser = HevcParser::new();
+        let nal = |t: u8, body: u8| {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.extend_from_slice(&[body, body]);
+            v
+        };
+        let au = |sps: u8| {
+            let mut d = nal(32, 0x11); // VPS
+            d.extend(nal(33, sps)); // SPS
+            d.extend(nal(34, 0x33)); // PPS
+            d.extend(nal(19, 0x44)); // IDR_W_RADL
+            d
+        };
+        let types = |fd: &[u8]| {
+            let (mut t, mut o) = (Vec::new(), 0usize);
+            while o + 4 <= fd.len() {
+                let len = u32::from_be_bytes([fd[o], fd[o + 1], fd[o + 2], fd[o + 3]]) as usize;
+                o += 4;
+                t.push((fd[o] >> 1) & 0x3F);
+                o += len;
+            }
+            t
+        };
+        parser.parse(&make_pes(au(0x22), Some(0)));
+        let f = parser.parse(&make_pes(au(0x23), Some(1)));
+        assert_eq!(types(&f[0].data), vec![32, 33, 34, 19]);
+    }
+
     // A parameter set REDEFINED mid-stream must be emitted INLINE so the decoder re-activates
     // it.
     #[test]
@@ -3241,6 +3292,193 @@ mod tests {
         assert_eq!(cp[16], 0xFC | 1);
         assert_eq!(cp[17], 0xF8 | 2);
         assert_eq!(cp[18], 0xF8 | 2);
+    }
+
+    // PTL and the SPS fields are read off the emulation-prevention-STRIPPED RBSP; a real
+    // UHD SPS carries `00 00 03` inside general_constraint_indicator_flags.
+    #[test]
+    fn hvcc_reads_ptl_and_chroma_through_emulation_prevention_in_the_ptl() {
+        let sps = make_sps_with_chroma(1, 2, 2);
+        let mut rbsp = sps[2..].to_vec();
+        rbsp[1] = 0x21; // profile
+        rbsp[2] = 0x60; // compatibility flags 0x60000000
+        rbsp[6] = 0x90; // constraint flags 0x900000000000
+        rbsp[12] = 0x7B; // level_idc
+        let escaped = emulation_prevent(&rbsp);
+        assert!(escaped.len() > rbsp.len(), "the zero runs were escaped");
+        let mut stored = sps[..2].to_vec();
+        stored.extend_from_slice(&escaped);
+
+        assert_eq!(parse_sps_chroma(&stored).unwrap().chroma_format_idc, 1);
+        let cp = codec_private_from_sps(&stored);
+        assert_eq!(cp[1], 0x21);
+        assert_eq!(&cp[2..6], &[0x60, 0, 0, 0]);
+        assert_eq!(&cp[6..12], &[0x90, 0, 0, 0, 0, 0]);
+        assert_eq!(cp[12], 0x7B);
+        assert_eq!(cp[16], 0xFC | 1);
+        assert_eq!(cp[17], 0xF8 | 2);
+        assert_eq!(cp[18], 0xF8 | 2);
+    }
+
+    // The gap flag on a PES must reach the frame (both emit paths), or the resync gate never
+    // arms for HEVC.
+    #[test]
+    fn pes_discontinuity_propagates_to_frame() {
+        for reorder in [false, true] {
+            for flag in [true, false] {
+                let mut pes = make_pes(cra_au(&[0x10]), Some(0));
+                pes.discontinuity = flag;
+                let mut parser = HevcParser::new().with_ps_reorder(reorder);
+                let mut frames = parser.parse(&pes);
+                frames.extend(parser.flush());
+                assert_eq!(frames.len(), 1, "reorder {reorder}");
+                assert_eq!(frames[0].discontinuity, flag, "reorder {reorder}");
+            }
+        }
+    }
+
+    // Other SEI messages sharing the NAL (or an HDR10 message already captured) are skipped by
+    // their declared size, so the wanted message behind them is still found.
+    #[test]
+    fn hdr10_sei_is_found_behind_other_and_already_captured_messages() {
+        let idr = nal_bytes(19, &[0xEC]);
+        let pps = nal_bytes(NAL_PPS, &[0xC0]);
+        let mastering = |max_lum| {
+            sei_message(
+                SEI_MASTERING_DISPLAY_COLOUR_VOLUME,
+                &mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, max_lum, 10),
+            )
+        };
+        let cll = sei_message(SEI_CONTENT_LIGHT_LEVEL_INFO, &cll_payload(1000, 400));
+        let other = |n: usize| sei_message(1, &vec![0x5A; n]);
+
+        let mut one_nal = HevcParser::new();
+        let mut au = pps.clone();
+        au.extend_from_slice(&sei_nal(&[
+            other(5),
+            mastering(10_000_000),
+            other(3),
+            cll.clone(),
+        ]));
+        au.extend_from_slice(&idr);
+        one_nal.parse(&make_pes(au, Some(0)));
+        assert_eq!(
+            one_nal
+                .sei_mastering
+                .map(|m| m.max_display_mastering_luminance),
+            Some(10_000_000)
+        );
+        assert!(one_nal.sei_content_light.is_some());
+
+        let mut later = HevcParser::new();
+        let mut first = pps.clone();
+        first.extend_from_slice(&sei_nal(&[mastering(10_000_000)]));
+        first.extend_from_slice(&idr);
+        later.parse(&make_pes(first, Some(0)));
+        assert!(later.sei_content_light.is_none());
+        let mut second = pps.clone();
+        second.extend_from_slice(&sei_nal(&[mastering(1), other(4), cll.clone()]));
+        second.extend_from_slice(&idr);
+        later.parse(&make_pes(second, Some(3750)));
+        assert_eq!(
+            later
+                .sei_mastering
+                .map(|m| m.max_display_mastering_luminance),
+            Some(10_000_000),
+            "the repeat is skipped, not adopted"
+        );
+        assert!(
+            later.sei_content_light.is_some(),
+            "content light behind a skipped repeat"
+        );
+    }
+
+    #[test]
+    fn hdr10_sei_in_a_suffix_nal_is_captured() {
+        let mut sei = sei_nal(&[sei_message(
+            SEI_CONTENT_LIGHT_LEVEL_INFO,
+            &cll_payload(1000, 400),
+        )]);
+        sei[3] = NAL_SEI_SUFFIX << 1;
+        let mut au = nal_bytes(NAL_PPS, &[0xC0]);
+        au.extend_from_slice(&nal_bytes(19, &[0xEC]));
+        au.extend_from_slice(&sei);
+        let mut parser = HevcParser::new();
+        parser.parse(&make_pes(au, Some(0)));
+        assert!(parser.sei_content_light.is_some());
+    }
+
+    // Only the first slice segment of a picture carries the slice_type this reads; a later
+    // segment's bits would otherwise be taken for one.
+    #[test]
+    fn a_non_first_slice_segment_reports_no_coding_type() {
+        for nal_type in [1u8, 19] {
+            let nal = nal_bytes(nal_type, &[0x6C, 0x00]);
+            // 0x6C = first_slice_segment_in_pic_flag 0, then bits that would decode as an
+            // I slice (no_output_of_prior_pics 1, pps id 0, slice_type 2) if the flag were ignored.
+            assert_eq!(
+                hevc_first_slice_coding_type(&nal[3..], nal_type, |_| Some(0)),
+                None,
+                "NAL {nal_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn hvcc_oversized_vps_or_pps_returns_none() {
+        for oversized in [32u8, 34] {
+            let mut data = Vec::new();
+            for t in [32u8, 33, 34] {
+                data.extend_from_slice(&[0x00, 0x00, 0x01]);
+                data.extend_from_slice(&hevc_nal_header(t));
+                let n = if t == oversized { 70_000 } else { 2 };
+                data.extend_from_slice(&vec![0x11u8; n]);
+            }
+            let mut parser = HevcParser::new();
+            parser.parse(&make_pes(data, Some(0)));
+            assert!(
+                parser.codec_private().is_none(),
+                "oversized NAL type {oversized} must not produce a truncated hvcC"
+            );
+        }
+    }
+
+    // A bare IRAP re-asserts the ACTIVE parameter sets, not the first-seen hvcC copy: a player
+    // re-applies hvcC at every keyframe, so reverting would undo a mid-title redefinition.
+    #[test]
+    fn a_bare_keyframe_reasserts_the_active_param_sets_not_the_hvcc_copy() {
+        let au = |sets: Option<u8>, slice: Vec<u8>| {
+            let mut d = Vec::new();
+            if let Some(b) = sets {
+                d.extend_from_slice(&nal_bytes(32, &[0xA0, b]));
+                d.extend_from_slice(&nal_bytes(33, &[0xB0, b]));
+                d.extend_from_slice(&nal_bytes(NAL_PPS, &[0xC0 | b]));
+            }
+            d.extend_from_slice(&slice);
+            d
+        };
+        let bodies = |fd: &[u8]| -> Vec<(u8, u8)> {
+            let mut out = Vec::new();
+            let mut off = 0;
+            while off + 4 <= fd.len() {
+                let len =
+                    u32::from_be_bytes([fd[off], fd[off + 1], fd[off + 2], fd[off + 3]]) as usize;
+                out.push(((fd[off + 4] >> 1) & 0x3F, fd[off + 4 + len - 1]));
+                off += 4 + len;
+            }
+            out
+        };
+        let mut parser = HevcParser::new();
+        parser.parse(&make_pes(au(Some(1), nal_bytes(19, &[0xEC])), Some(0)));
+        // Redefinition of all three sets on a non-keyframe access unit.
+        let f = parser.parse(&make_pes(au(Some(2), nal_bytes(1, &[0xD0])), Some(3000)));
+        assert_eq!(bodies(&f[0].data).len(), 4);
+        let f = parser.parse(&make_pes(au(None, nal_bytes(19, &[0xEC])), Some(6000)));
+        assert_eq!(
+            bodies(&f[0].data),
+            vec![(32, 2), (33, 2), (34, 0xC2), (19, 0xEC)],
+            "VPS, SPS, PPS are the redefined ones, in hierarchy order"
+        );
     }
 
     // --- BitReader unit tests (exp-Golomb + bit reads) ---

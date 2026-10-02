@@ -496,6 +496,26 @@ mod tests {
         assert_eq!(dvd.video[0].codec, "mpeg2");
     }
 
+    // Forced is the probe/STN flag OR the label qualifier: either alone is enough.
+    #[test]
+    fn subtitle_forced_is_the_flag_or_the_qualifier() {
+        for (flag, qualifier, want) in [
+            (false, LabelQualifier::None, false),
+            (true, LabelQualifier::None, true),
+            (false, LabelQualifier::Forced, true),
+            (true, LabelQualifier::Forced, true),
+        ] {
+            let Stream::Subtitle(s) = subtitle("eng", flag, qualifier) else {
+                unreachable!()
+            };
+            assert_eq!(
+                SubtitleTrack::from_stream(&s).forced,
+                want,
+                "{flag} {qualifier:?}"
+            );
+        }
+    }
+
     #[test]
     fn from_disc_hoists_main_and_is_main() {
         let mut disc = test_disc();

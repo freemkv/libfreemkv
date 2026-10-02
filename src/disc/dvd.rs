@@ -91,7 +91,7 @@ impl Disc {
                 // TODO(spec): measured colour/TFF await a CodecParser->title channel.
                 measured_cicp: None,
             });
-            // TODO(spec): DefaultDuration/cadence deferred.
+            // The frame rate is the standard's; an MKV corrects it from the measured cadence.
 
             for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
@@ -256,7 +256,48 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
+        warn_multi_pgc_titles(&vmg_bytes, &dvd_info);
         Ok((titles, nav_feature))
+    }
+}
+
+// One warning per disc per process for titles split across PGCs (only the first is read):
+// a rip scans its disc more than once, and each scan would repeat it. Later scans log at
+// debug. The disc is told apart by its VIDEO_TS.IFO.
+fn warn_multi_pgc_titles(vmg: &[u8], info: &ifo::DvdInfo) {
+    use std::hash::{Hash, Hasher};
+    static WARNED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let split: Vec<String> = info
+        .title_sets
+        .iter()
+        .flat_map(|ts| {
+            ts.titles.iter().filter(|t| t.pgcs > 1).map(move |t| {
+                format!(
+                    "VTS {} title {} ({} PGCs)",
+                    ts.vts_number, t.vts_title_num, t.pgcs
+                )
+            })
+        })
+        .collect();
+    if split.is_empty() {
+        return;
+    }
+    let mut h = std::hash::DefaultHasher::new();
+    vmg.hash(&mut h);
+    let key = h.finish();
+    let first = {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        let first = !warned.contains(&key);
+        if first {
+            warned.push(key);
+        }
+        first
+    };
+    let titles = split.join(", ");
+    if first {
+        tracing::warn!(target: "freemkv::scan", titles = %titles, "titles span several PGCs; only the first PGC of each is read, the rest of those titles is missing");
+    } else {
+        tracing::debug!(target: "freemkv::scan", titles = %titles, "titles span several PGCs; only the first PGC of each is read");
     }
 }
 
@@ -1658,6 +1699,11 @@ mod tests {
             sub.codec_data.is_some(),
             "non-zero palette must yield codec_data"
         );
+        let idx = String::from_utf8(sub.codec_data.clone().expect("codec_data")).expect("utf8");
+        assert!(
+            idx.starts_with("size: 720x480\npalette: "),
+            "the .idx carries the NTSC coded frame size, then the palette: {idx:?}"
+        );
     }
 
     /// Multiple titles in one VTS each become their own DiscTitle with a
@@ -1772,6 +1818,109 @@ mod tests {
         // The promotion mapped that target to the second scanned title.
         assert_eq!(nav_feature, Some(2));
         assert_eq!(titles[1].playlist_id, 2);
+    }
+
+    // The nav target joins on the VTS number AND the in-set title number: VTS 2 also has an
+    // in-set title 1, which must not take the promotion from VTS 1's.
+    #[test]
+    fn scan_dvd_titles_nav_target_is_matched_by_vts_number() {
+        let mut disc = MemDisc::new();
+        let mut vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+        stamp_first_play_jumptt(&mut vmg, 1);
+        let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+        let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts1,
+                },
+                FileSpec {
+                    name: "VTS_02_0.IFO".into(),
+                    icb_lba: 64,
+                    data_lba: 7000,
+                    contents: vts2,
+                },
+            ],
+        );
+        let (titles, nav_feature) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        assert_eq!(titles.len(), 2);
+        assert_eq!(nav_feature, Some(1));
+    }
+
+    fn one_title_dvd(disc: &mut MemDisc) -> udf::UdfFs {
+        build_video_ts_fs(
+            disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: build_vmg(&[(1, 1, 1)]),
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: build_vts(0, 0x00, &[], &[], &[(0, 9)], false),
+                },
+            ],
+        )
+    }
+
+    // A Stop raised before the scan, or during its last reads, is `Halted`, never a list.
+    #[test]
+    fn scan_dvd_titles_honours_the_halt_token() {
+        struct CancellingReader<'a> {
+            inner: &'a mut MemDisc,
+            halt: crate::halt::Halt,
+            reads: u32,
+        }
+        impl SectorSource for CancellingReader<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> crate::error::Result<usize> {
+                self.reads += 1;
+                if lba >= PART_START + 6000 {
+                    self.halt.cancel();
+                }
+                self.inner.read_sectors(lba, count, buf, recovery)
+            }
+        }
+        let mut disc = MemDisc::new();
+        let udf = one_title_dvd(&mut disc);
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let mut reader = CancellingReader {
+            inner: &mut disc,
+            halt: halt.clone(),
+            reads: 0,
+        };
+        let res = Disc::scan_dvd_titles(&mut reader, &udf, Some(&halt));
+        assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
+        assert_eq!(reader.reads, 0, "a cancelled scan reads nothing");
+
+        let halt = crate::halt::Halt::new();
+        let mut reader = CancellingReader {
+            inner: &mut disc,
+            halt: halt.clone(),
+            reads: 0,
+        };
+        let res = Disc::scan_dvd_titles(&mut reader, &udf, Some(&halt));
+        assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
     }
 
     /// chapter_times from the IFO become Chapter entries with ordinal
@@ -2075,5 +2224,66 @@ mod tests {
     #[test]
     fn scan_dvd_titles_bad_ifo_and_bup_is_empty() {
         assert_eq!(scan_ifo_bup(false, false).expect("no error").len(), 0);
+    }
+
+    fn title(vts_title_num: u8, pgcs: usize) -> ifo::DvdTitle {
+        ifo::DvdTitle {
+            chapters: 1,
+            duration_secs: 1.0,
+            cells: Vec::new(),
+            chapter_times: Vec::new(),
+            palette: None,
+            ast_ctl: [0; 8],
+            spst_ctl: [0; 32],
+            vts_title_num,
+            pgcs,
+        }
+    }
+
+    // A rip scans its disc more than once: the split-title warning is one line per disc,
+    // naming every split title, and a rescan of the same disc logs it at debug only.
+    #[test]
+    fn multi_pgc_titles_warn_once_per_disc() {
+        let set = |n: u8, titles: Vec<ifo::DvdTitle>| ifo::DvdTitleSet {
+            vts_number: n,
+            vob_start_sector: 0,
+            video: ifo::DvdVideoAttr {
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R480i,
+                aspect: ifo::DvdAspect::R16x9,
+                standard: ifo::TvSystem::Ntsc,
+            },
+            audio_streams: Vec::new(),
+            subtitle_streams: Vec::new(),
+            titles,
+        };
+        let info = ifo::DvdInfo {
+            title_sets: vec![
+                set(3, vec![title(1, 8)]),
+                set(4, vec![title(1, 5), title(2, 1)]),
+                set(11, vec![title(1, 1)]),
+            ],
+        };
+        let vmg = b"multi_pgc_titles_warn_once_per_disc".to_vec();
+        let ((), ev) = crate::testlog::capture(|| {
+            warn_multi_pgc_titles(&vmg, &info);
+            warn_multi_pgc_titles(&vmg, &info);
+            warn_multi_pgc_titles(&vmg, &info);
+        });
+        let warns: Vec<_> = ev
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(warns.len(), 1, "{ev:?}");
+        assert_eq!(
+            warns[0].field("titles"),
+            Some("VTS 3 title 1 (8 PGCs), VTS 4 title 1 (5 PGCs)")
+        );
+        // A disc with no split title logs nothing.
+        let clear = ifo::DvdInfo {
+            title_sets: vec![set(1, vec![title(1, 1)])],
+        };
+        let ((), ev) = crate::testlog::capture(|| warn_multi_pgc_titles(b"no split", &clear));
+        assert!(ev.is_empty(), "{ev:?}");
     }
 }

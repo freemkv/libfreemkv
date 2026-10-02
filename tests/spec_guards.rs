@@ -264,6 +264,26 @@ fn v20_stride_64_evidence() {
     );
 }
 
+/// KS-27: HD DVD `.evo` units carry the flag in PES_scrambling_control (bits 5-4 of byte
+/// 20). Literal offsets here, so a drifted constant in the library fails this guard.
+#[test]
+fn hddvd_flag_is_bits_5_4_of_byte_20() {
+    let unit_with = |at: usize, b: u8| {
+        let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+        u[at] = b;
+        aacs_unit_encrypted(&u, ContentFormat::MpegPs)
+    };
+    for b in [0x10, 0x20, 0x30, 0xFF] {
+        assert!(unit_with(20, b), "byte 20 = {b:#04x}");
+    }
+    for b in [0x00, 0x0F, 0x40, 0x80, 0xC0] {
+        assert!(!unit_with(20, b), "byte 20 = {b:#04x}");
+    }
+    for at in [0, 19, 21] {
+        assert!(!unit_with(at, 0x30), "byte {at}");
+    }
+}
+
 /// per evidence (no public spec); do not change without evidence proving otherwise —
 /// KS-27: the HD DVD book was "removed from this AACS website due to inactivity".
 #[test]

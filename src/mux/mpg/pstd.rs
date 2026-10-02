@@ -324,17 +324,7 @@ impl<W: Write> Mux<W> {
     fn commencement(s: &Stream, k: usize) -> Option<usize> {
         let head = s.queue.front()?;
         let q = s.queue.get(k)?;
-        let before: usize = if k == 0 {
-            0
-        } else {
-            head.au.data.len() - head.sent
-                + s.queue
-                    .iter()
-                    .skip(1)
-                    .take(k - 1)
-                    .map(|q| q.au.data.len())
-                    .sum::<usize>()
-        };
+        let before = if k == 0 { 0 } else { Self::first_byte(s, k)? };
         let own = if k == 0 {
             q.au.mark.checked_sub(head.sent)?
         } else {
@@ -1027,6 +1017,86 @@ mod tests {
         clean.push(0, au(9_000, 100, 0));
         clean.finish().unwrap();
         assert_eq!(clean.counters().forced_eof, 0);
+    }
+
+    // What no pack can ever take, even with the waits lifted, is an error at EOF, never a
+    // silent Ok with the AUs dropped: an LPCM AU shorter than one packing unit.
+    #[test]
+    fn eof_with_untakeable_aus_is_an_error() {
+        let spec = StreamSpec {
+            stream_id: pack::PRIVATE_STREAM_1,
+            payload: Payload::Lpcm {
+                sub_id: 0xA0,
+                channels: 2,
+                rate: 48_000,
+            },
+            buffer: 0,
+            sparse: false,
+            av: true,
+        };
+        let buf = BufferSpec {
+            stream_id: pack::PRIVATE_STREAM_1,
+            scale_1024: true,
+            size: 232,
+        };
+        let mut m = Mux::new(Vec::new(), vec![spec], vec![buf], Vec::new(), 25_200);
+        m.push(
+            0,
+            Au {
+                lpcm_bits: 16,
+                ..au(9_000, 3, 0)
+            },
+        );
+        let e = m.finish().expect_err("an AU that cannot be packetized");
+        assert!(
+            e.to_string()
+                .contains(&crate::error::Error::MpgUnpacketized.to_string()),
+            "{e}"
+        );
+    }
+
+    // A declared audio track that never delivers is passed once the others lead it by the
+    // interleave cap, counted; before the cap the clock waits for it.
+    #[test]
+    fn a_silent_audio_track_is_passed_at_the_interleave_cap() {
+        let video = StreamSpec {
+            stream_id: 0xE0,
+            payload: Payload::Plain,
+            buffer: 0,
+            sparse: false,
+            av: true,
+        };
+        let audio = StreamSpec {
+            stream_id: 0xC0,
+            buffer: 1,
+            ..video.clone()
+        };
+        let bufs = vec![
+            BufferSpec {
+                stream_id: 0xE0,
+                scale_1024: true,
+                size: 232,
+            },
+            BufferSpec {
+                stream_id: 0xC0,
+                scale_1024: false,
+                size: 128,
+            },
+        ];
+        let mut m = Mux::new(Vec::new(), vec![video, audio], bufs, Vec::new(), 25_200);
+        m.push(0, au(90_000, 100, 0));
+        for k in 1..=7u64 {
+            m.push(0, au(90_000 + k * 90_000, 100, 0));
+            m.pump(false).unwrap();
+        }
+        assert_eq!(m.counters().interleave_cap, 0, "7 s: still waiting");
+        assert!(m.writer.is_empty(), "nothing is written while audio lags");
+        for k in 8..=12u64 {
+            m.push(0, au(90_000 + k * 90_000, 100, 0));
+            m.pump(false).unwrap();
+        }
+        assert_eq!(m.counters().interleave_cap, 1);
+        assert!(!m.writer.is_empty());
     }
 
     // B1: at EOF nothing is left behind. A zero-length AU used to wedge its stream and

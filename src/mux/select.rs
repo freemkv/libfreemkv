@@ -475,4 +475,40 @@ mod tests {
             "the added base is logged"
         );
     }
+
+    // The pairing is per index: extension 0xD1 belongs to base 0xC1, never to 0xC0.
+    #[test]
+    fn an_mp2_extension_pairs_with_the_base_of_its_own_index() {
+        let mp2 = |pid: u16, label: &str| {
+            Stream::Audio(AudioStream {
+                pid,
+                codec: Codec::Mp2,
+                channels: AudioChannels::Stereo,
+                language: "eng".into(),
+                sample_rate: SampleRate::S48,
+                secondary: false,
+                purpose: LabelPurpose::Normal,
+                label: label.into(),
+            })
+        };
+        let keep = |audio: Vec<u16>| {
+            let mut t = DiscTitle::empty();
+            t.streams = vec![
+                video(0x00E0),
+                mp2(0x00C0, ""),
+                mp2(0x00C1, ""),
+                mp2(0x00D1, crate::disc::MP2_EXTENSION_LABEL),
+            ];
+            StreamSelection {
+                audio: PidFilter::Only(audio),
+                subtitle: PidFilter::All,
+            }
+            .apply(&mut t)
+            .unwrap();
+            pids(&t)
+        };
+        assert_eq!(keep(vec![0x00C1]), vec![0x00E0, 0x00C1, 0x00D1]);
+        assert_eq!(keep(vec![0x00C0]), vec![0x00E0, 0x00C0]);
+        assert_eq!(keep(vec![0x00D1]), vec![0x00E0, 0x00C1, 0x00D1]);
+    }
 }

@@ -363,6 +363,40 @@ mod tests {
     }
 
     #[test]
+    fn vtt_times_carry_hours_minutes_and_seconds() {
+        assert_eq!(vtt_time(3725.5), "01:02:05.500");
+        assert_eq!(vtt_time(36_000.0), "10:00:00.000");
+    }
+
+    // json:// marks the MVC dependent view and only that.
+    #[test]
+    fn json_marks_the_mvc_dependent_view() {
+        use crate::disc::{
+            Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat, MVC_DEPENDENT_LABEL, Resolution,
+            Stream as DiscStream, VideoStream,
+        };
+        let video = |label: &str| {
+            DiscStream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::H264,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F23_976,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                display_aspect: None,
+                secondary: false,
+                label: label.into(),
+                measured_cicp: None,
+            })
+        };
+        let mut t = DiscTitle::empty();
+        t.streams = vec![video(""), video(MVC_DEPENDENT_LABEL)];
+        let v = title_json(&t);
+        assert_eq!(v["video"][0]["mvc"], false);
+        assert_eq!(v["video"][1]["mvc"], true);
+    }
+
+    #[test]
     fn chapters_format_selected_by_extension() {
         let xml = chapters_content(&chaps(), Some("xml"));
         assert!(xml.contains("<Chapters>"), "xml chosen for .xml");

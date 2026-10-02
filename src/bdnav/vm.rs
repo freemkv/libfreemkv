@@ -226,7 +226,7 @@ fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Opti
             // CMP — skip the next command when the compare is false.
             1 => {
                 let truth = match c.cmp_opt {
-                    0x01 => (src & !dst) == 0, // BC: every src bit set in dst
+                    0x01 => (dst & !src) == 0, // BC: every dst bit set in src (hdmv_vm.c)
                     0x02 => dst == src,
                     0x03 => dst != src,
                     0x04 => dst >= src,
@@ -523,6 +523,42 @@ mod tests {
     }
 
     #[test]
+    fn goto_lands_on_its_target_and_break_terminates() {
+        // op_cnt=1, grp=BRANCH(0), sub_grp=GOTO(0), imm dst; branch_opt GOTO(1) / BREAK(2).
+        let goto = |line: u32| cmd(1 << 5, 0x81, 0, 0, line, 0);
+        let brk = cmd(1 << 5, 0x82, 0, 0, 0, 0);
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        // GOTO line 2 jumps over the logo PlayPL 99 (a candidate) to the feature PlayPL 1.
+        let d = build(&[&[goto(2), play_pl(99), play_pl(1)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        assert_eq!(resolve(&index, &mobjs, &|_| true), Some(1));
+        let d = build(&[&[brk, play_pl(1)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+    }
+
+    #[test]
+    fn only_the_play_pl_family_emits_a_playlist() {
+        // sub_grp=PLAY(2); branch_opt 3 is Terminate/Link, which never plays dst.
+        let d = build(&[&[cmd((1 << 5) | 2, 0x83, 0, 0, 11, 0)]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        assert_eq!(resolve(&index, &mobjs, &|_| true), None);
+    }
+
+    #[test]
+    fn setsystem_does_not_execute_as_a_gpr_set() {
+        // grp=SET(2), sub_grp=SETSYSTEM(1), set_opt=MOVE(1): must not write GPR5.
+        let setsys = cmd((2 << 5) | (2 << 3) | 1, 0x40, 0, 0x01, 5, 77);
+        let d = build(&[&[setsys]]);
+        let mobjs = mobj::parse(&d).unwrap();
+        let index = idx(PlaybackObj::Hdmv { id_ref: 0 }, vec![]);
+        let mut vm = Vm::new(&mobjs, &index);
+        assert_eq!(run(&mut vm, 0, &|_| false), None);
+        assert_eq!(vm.gpr[5], 0);
+    }
+
+    #[test]
     fn swap_immediate_operand_is_not_written_back() {
         // SWAP dst=GPR0 with src=IMMEDIATE 5 (imm_op1=0, imm_op2=1) must refuse
         // writing to the aliased register: GPR[5] stays 77, only GPR0 gets 5.
@@ -625,12 +661,13 @@ mod tests {
         }
     }
 
-    // libbluray INSN_BC: true iff every bit of src is set in dst (src & ~dst == 0).
+    // libbluray INSN_BC skips the next command when `dst & ~src` is non-zero:
+    // true iff every bit of dst is set in src.
     #[test]
-    fn cmp_bc_tests_src_bits_within_dst() {
-        assert!(cmp_picks_true(0x01, 0b1110, 0b0110));
-        assert!(!cmp_picks_true(0x01, 0b0100, 0b0110));
-        assert!(!cmp_picks_true(0x01, 0b0110, 0b1110));
+    fn cmp_bc_tests_dst_bits_within_src() {
+        assert!(!cmp_picks_true(0x01, 0b1110, 0b0110));
+        assert!(cmp_picks_true(0x01, 0b0100, 0b0110));
+        assert!(cmp_picks_true(0x01, 0b0110, 0b1110));
     }
 
     #[test]

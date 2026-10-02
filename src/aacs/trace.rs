@@ -146,7 +146,7 @@ pub enum KeyOutcome {
 
 /// Where an acquired key came from, for the ring's trace and the engine's key status.
 /// Variants are ordered root-of-trust → per-disc leaf.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOrigin {
     /// MKB + device keys → subset-difference tree → VUK
     DeviceKey,
@@ -197,6 +197,8 @@ mod tests {
         // `who` is the source's name carried verbatim.
         assert_eq!(t.keys[0].who, "keydb");
         assert_eq!(t.unlock[0].who, "AACS cert");
+        // Apps match on this id.
+        assert_eq!(BUS_BLOCKED, "bus_blocked");
         // Default / new is empty.
         assert_eq!(ResolutionTrace::new(), ResolutionTrace::default());
         assert!(ResolutionTrace::new().unlock.is_empty());

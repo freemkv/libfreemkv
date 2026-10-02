@@ -55,8 +55,22 @@ impl Disc {
 pub enum Detector {
     /// BD/UHD CPI flags: keys are proven on ciphertext.
     Verified,
-    /// HD DVD: the test is unverified, so a single declared key is applied without proof.
+    /// HD DVD: the flag is unverified, so a unit reads clear only when it is also whole
+    /// content; encrypted content gets a single declared key applied without proof.
     Unverified,
+}
+
+impl Detector {
+    // The format's own test of one aligned unit, feeding the one encryption decision
+    // (`resolve::acquire`). Verified: the CPI flag. Unverified: encrypted unless the unit is
+    // unflagged and structurally whole content (an AACS unit's ciphertext is not).
+    pub(crate) fn unit_encrypted(self, unit: &[u8], format: ContentFormat) -> bool {
+        use crate::aacs::content::{aacs_unit_encrypted, is_clean};
+        match self {
+            Detector::Verified => aacs_unit_encrypted(unit, format),
+            Detector::Unverified => aacs_unit_encrypted(unit, format) || !is_clean(unit, format),
+        }
+    }
 }
 
 /// One unit of key proof (design §2.2): a stream file, a title extent no file covers, or a
@@ -224,10 +238,8 @@ impl KeyEvidence {
         });
         let whole = ev.scope == KeyScope::WholeDisc;
         if ev.detector == Detector::Unverified {
-            // Acquisition refuses a multi-key HD DVD before it lists any file.
-            if n_declared != Some(1) {
-                return Ok(ev);
-            }
+            // Listed whatever the declared count: acquisition judges a copy in the clear from
+            // its pieces before it refuses a multi-key HD DVD.
             let files = match crate::whole_disc::content_files(reader) {
                 Ok(f) => f,
                 Err(e) if whole => return Err(e),
@@ -395,37 +407,22 @@ impl<'a> Sampler<'a> {
         read_unit(self.reader, lba)
     }
 
-    // Up to 32 units on `p`'s grid (KU §2.3 step 7), skipping FMTS segment units.
+    // Up to 32 units on `p`'s grid (KU §2.3 step 7), skipping FMTS segment units, each
+    // judged by `detector`.
     pub(crate) fn probe(
         &mut self,
         p: &Piece,
         segments: &[(u32, u32)],
         format: ContentFormat,
+        detector: Detector,
         halt: &Halt,
     ) -> Result<(u64, Vec<Sample>)> {
-        let grid = p.grid();
-        let units: u64 = grid.iter().map(|g| g.1).sum();
+        let (units, lbas) = probe_lbas(p, segments);
         let mut out = Vec::new();
-        for idx in probe_units(units) {
+        for lba in lbas {
             halt.check()?;
-            let mut k = idx;
-            let Some(&(head, _)) = grid.iter().find(|g| {
-                let hit = k < g.1;
-                if !hit {
-                    k -= g.1;
-                }
-                hit
-            }) else {
-                continue;
-            };
-            let Ok(lba) = u32::try_from(head + k * UNIT) else {
-                continue;
-            };
-            if in_segment(segments, lba) {
-                continue;
-            }
             out.push(match self.unit(lba)? {
-                Some(u) if crate::aacs::content::aacs_unit_encrypted(&u, format) => Sample::Enc(u),
+                Some(u) if detector.unit_encrypted(&u, format) => Sample::Enc(u),
                 Some(_) => Sample::Clear,
                 None => Sample::Fault,
             });
@@ -438,6 +435,33 @@ impl<'a> Sampler<'a> {
         main.map(|m| crate::keysource::encrypted_units_in(self.reader, &m.extents, m.format, n))
             .unwrap_or_default()
     }
+}
+
+// The units `probe` samples on `p`'s grid: (the grid's unit count, their LBAs), FMTS
+// segment units skipped.
+fn probe_lbas(p: &Piece, segments: &[(u32, u32)]) -> (u64, Vec<u32>) {
+    let grid = p.grid();
+    let units: u64 = grid.iter().map(|g| g.1).sum();
+    let mut out = Vec::new();
+    for idx in probe_units(units) {
+        let mut k = idx;
+        let Some(&(head, _)) = grid.iter().find(|g| {
+            let hit = k < g.1;
+            if !hit {
+                k -= g.1;
+            }
+            hit
+        }) else {
+            continue;
+        };
+        let Ok(lba) = u32::try_from(head + k * UNIT) else {
+            continue;
+        };
+        if !in_segment(segments, lba) {
+            out.push(lba);
+        }
+    }
+    (units, out)
 }
 
 pub(crate) fn read_unit(reader: &mut dyn SectorSource, lba: u32) -> Result<Option<Vec<u8>>> {

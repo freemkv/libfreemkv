@@ -222,7 +222,7 @@ pub(super) fn dec3_box(c: &DolbyConfig) -> Vec<u8> {
     bx(b"dec3", &[b[3], b[4], b[5], b[6], b[7]])
 }
 
-/// Build an audio sample entry (`ac-3` / `ec-3` / `dtsc` / `dtsh`) with the
+/// Build an audio sample entry (`ac-3` / `ec-3` / `dtsc` / `dtsh` / `mp4a`) with the
 /// given config box. `AudioSampleEntry` per ISO/IEC 14496-12 §12.2.3.
 pub(super) fn audio_sample_entry(
     fourcc: &[u8; 4],
@@ -244,6 +244,12 @@ pub(super) fn audio_sample_entry(
     e.extend_from_slice(&(sample_rate.min(0xFFFF) << 16).to_be_bytes());
     e.extend_from_slice(config);
     bx(fourcc, &e)
+}
+
+/// The integer sample rate `audio_sample_entry` wrote into `entry`, if it is long enough.
+pub(super) fn entry_sample_rate(entry: &[u8]) -> Option<u32> {
+    let rate = entry.get(32..36)?;
+    Some(u32::from_be_bytes([rate[0], rate[1], rate[2], rate[3]]) >> 16)
 }
 
 // ── DTS (dtsc/dtsh + ddts) ───────────────────────────────────────────────────
@@ -485,7 +491,8 @@ pub(super) fn dolby_sample_entry(
 }
 
 /// (channels, rate) of an AudioSpecificConfig the `esds` can carry: a table rate and
-/// channel configuration, no escaped object type, short enough for one-byte sizes.
+/// channel configuration, no escaped object type, short enough for one-byte sizes
+/// (the 100-byte cap keeps every enclosing descriptor body under 128).
 pub(super) fn aac_config(asc: &[u8]) -> Option<(u16, u32)> {
     const RATES: [u32; 12] = [
         96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000,
@@ -583,6 +590,40 @@ mod tests {
         f.push(0b111_00_00_1);
         f.push(0x00);
         f
+    }
+
+    #[test]
+    fn aac_config_maps_channel_configurations() {
+        // AAC-LC, 44.1 kHz; the channel configuration sits in bits 6..3 of byte 1.
+        let cfg = |c: u8| aac_config(&[0x12, c << 3]);
+        assert_eq!(cfg(1), Some((1, 44_100)));
+        assert_eq!(cfg(6), Some((6, 44_100)));
+        assert_eq!(cfg(7), Some((8, 44_100)), "config 7 is 7.1");
+        assert_eq!(cfg(0), None, "PCE layout is not describable");
+        assert_eq!(cfg(8), None, "reserved");
+    }
+
+    #[test]
+    fn aac_config_refuses_escaped_object_types_and_oversized_configs() {
+        assert_eq!(aac_config(&[0xF8, 0x08]), None);
+        let mut asc = vec![0x12, 0x10];
+        asc.resize(100, 0);
+        assert!(aac_config(&asc).is_some());
+        asc.push(0);
+        assert_eq!(aac_config(&asc), None);
+    }
+
+    #[test]
+    fn mpeg_audio_rate_follows_the_version_bits() {
+        let rate = |h1: u8| {
+            mpeg_sample_entry(Codec::Mp3, &[0xFF, h1, 0x00, 0xC0], &[])
+                .and_then(|e| entry_sample_rate(&e))
+        };
+        assert_eq!(rate(0xFB), Some(44_100), "MPEG-1");
+        assert_eq!(rate(0xF3), Some(22_050), "MPEG-2");
+        assert_eq!(rate(0xE3), Some(11_025), "MPEG-2.5");
+        assert_eq!(rate(0xF1), None, "reserved layer");
+        assert_eq!(rate(0xEB), None, "reserved version");
     }
 
     #[test]

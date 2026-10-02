@@ -386,8 +386,8 @@ pub(crate) fn resolve_dk_node(
 }
 
 /// Public, side-effect-free accessors over the MKB record helpers, exposed so
-/// independent reproduction harnesses (e.g. `examples/prove_hkd_aacs.rs`) can
-/// exercise the exact same parser + verify primitives the production walk uses.
+/// independent reproduction harnesses can exercise the exact same parser + verify
+/// primitives the production walk uses.
 /// These are thin wrappers — no new logic.
 #[doc(hidden)]
 pub mod probe {
@@ -452,7 +452,7 @@ pub fn decrypt_unit_key(vuk: &[u8; 16], encrypted_uk: &[u8; 16]) -> [u8; 16] {
 
 // Decrypt every encrypted unit key in a parsed Unit_Key_RO.inf with a VUK,
 // paired with its declared CPS-unit number. The single VUK->unit-keys step
-// both resolvers and resolve_candidate call, so the map cannot drift.
+// `resolve_candidate` calls.
 pub(crate) fn derive_unit_keys(uk_file: &UnitKeyFile, vuk: &[u8; 16]) -> Vec<(u32, [u8; 16])> {
     uk_file
         .encrypted_keys
@@ -524,7 +524,7 @@ pub fn resolve_candidate(
 ) -> Option<ResolvedChain> {
     // Boil a VUK → all unit keys, each paired with its declared CPS-unit number.
     // Derive the stride version from the disc's own MKB, then defer to the shared
-    // `derive_unit_keys` (the one place both resolvers and this path decrypt).
+    // `derive_unit_keys` (the one place a VUK unwraps the unit keys).
     let boil = |vuk: Vuk| -> Option<Vec<(u32, [u8; 16])>> {
         let version = mkb_type(mkb)
             .map(|t| t.generation())
@@ -733,6 +733,31 @@ mod resolve_candidate_tests {
         let uk = UnitKey::new(1, [0x9u8; 16]);
         let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &inf, None).expect("terminal");
         assert_eq!(r.unit_keys, vec![(2, uk.key)]);
+    }
+
+    /// The declared number comes from the file's own numbering (an HD DVD VTKF with a gap), and
+    /// falls back to the position when the file does not parse or lacks that slot.
+    #[test]
+    fn resolve_candidate_uk_declared_number_follows_the_file_with_positional_fallback() {
+        let mut vtkf = vec![0u8; 0x80 + 64 * 0x24];
+        vtkf[..12].copy_from_slice(b"DVD_HD_V_TKF");
+        // Slots 2 and 5 (1-based) are present; slot 1 is a gap.
+        for slot in [1usize, 4] {
+            vtkf[0x80 + slot * 0x24] = 0x80;
+        }
+        let at = |idx: u32| {
+            let uk = UnitKey::new(idx, [0x9u8; 16]);
+            resolve_candidate(&KeyCandidate::Uk(uk), &[], &vtkf, None)
+                .expect("terminal")
+                .unit_keys[0]
+                .0
+        };
+        assert_eq!(at(0), 2);
+        assert_eq!(at(1), 5, "the file's number, not idx + 1");
+        assert_eq!(at(7), 7, "no such slot: the position");
+        let uk = UnitKey::new(3, [0x9u8; 16]);
+        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[0u8; 4], None).unwrap();
+        assert_eq!(r.unit_keys[0].0, 3, "unparseable file: the position");
     }
 
     /// MK/PK/DK paths derive the VUK from a VID; without one, derivation stops.

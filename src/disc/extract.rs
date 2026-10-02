@@ -102,8 +102,8 @@ struct PlannedFile {
     /// ECMA-167 4/14.14.1.1 type-1 extent is allocated but not recorded: it
     /// occupies the file's byte space and its contents are zeros).
     extents: Vec<crate::udf::AbsExtent>,
-    /// A bus-encrypted stream file the reader's bus map could not locate: it
-    /// cannot be de-bussed, so it is never read or written, only counted lost.
+    /// A file whose data cannot be located (an unreadable File Entry, or a bus-encrypted
+    /// stream file the reader's bus map could not map): never read or written, only counted lost.
     unmapped: bool,
 }
 
@@ -441,26 +441,58 @@ fn plan_tree(
                 unmapped: true,
             });
         } else {
-            let inline = fs.inline_data_at(reader, entry.meta_lba)?;
-            let extents = if inline.is_some() {
-                Vec::new()
-            } else {
-                fs.extents_abs_at(reader, entry.meta_lba)?
-            };
-            files.push(PlannedFile {
-                host_rel: child_rel,
-                disc_name: entry.name.clone(),
-                size: entry.size,
-                inline,
-                extents,
-                unmapped: false,
-            });
+            let located = fs
+                .inline_data_at(reader, entry.meta_lba)
+                .and_then(|inline| {
+                    let extents = if inline.is_some() {
+                        Vec::new()
+                    } else {
+                        fs.extents_abs_at(reader, entry.meta_lba)?
+                    };
+                    Ok((inline, extents))
+                });
+            match located {
+                Ok((inline, extents)) => files.push(PlannedFile {
+                    host_rel: child_rel,
+                    disc_name: entry.name.clone(),
+                    size: entry.size,
+                    inline,
+                    extents,
+                    unmapped: false,
+                }),
+                // A Stop, a dead bus or a gone source ends the run; it is not a damaged entry.
+                Err(e)
+                    if matches!(e, Error::Halted)
+                        || e.is_scsi_transport_failure()
+                        || e.is_source_terminated() =>
+                {
+                    return Err(e);
+                }
+                // A damaged File Entry loses that one file, not the tree around it.
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::extract",
+                        file = %child_rel.display(),
+                        code = e.code(),
+                        "file entry unreadable; file lost whole"
+                    );
+                    files.push(PlannedFile {
+                        host_rel: child_rel,
+                        disc_name: entry.name.clone(),
+                        size: entry.size,
+                        inline: None,
+                        extents: Vec::new(),
+                        unmapped: true,
+                    });
+                }
+            }
         }
     }
     Ok(())
 }
 
-// Accounts an unmapped stream file as lost whole: nothing is written for it on the host.
+// Accounts a file with no locatable data (an unreadable File Entry, or a bus-encrypted stream
+// file that cannot be mapped to de-bus) as lost whole: nothing is written for it on the host.
 fn unmapped_file(
     pf: &PlannedFile,
     total_bytes: u64,
@@ -471,7 +503,7 @@ fn unmapped_file(
     tracing::warn!(
         target: "freemkv::extract",
         file = %pf.host_rel.display(),
-        "bus-encrypted stream file cannot be located to de-bus; not extracted"
+        "file cannot be located on the disc; not extracted"
     );
     *done_bytes = done_bytes.saturating_add(pf.size);
     *done_unreadable = done_unreadable.saturating_add(pf.size);
@@ -741,6 +773,9 @@ fn read_tries<S: SectorSource>(
             Err(Error::Halted) => return Err(Error::Halted),
             // The key set's loud stop (KU §2.4): never a hole, the run stops `.partial`.
             Err(e @ (Error::WholeDiscKeyMissing | Error::NoDiscKey { .. })) => return Err(e),
+            // A dead bus or gone source is not a hole: zero-filling the rest of the tree
+            // would finalize every remaining file as complete (the Read stage's rule too).
+            Err(e) if e.is_scsi_transport_failure() || e.is_source_terminated() => return Err(e),
             Err(Error::DecryptFailed) => return Ok(Tried::Undecryptable),
             Err(_) if last => return Ok(Tried::Media),
             Err(_) => {}
@@ -2512,6 +2547,184 @@ mod tests {
         assert!(!res.complete && !res.halted);
     }
 
+    // A reader that serves one sector once (the tree listing reads each File Entry for its
+    // size), then fails it with `status`.
+    struct FailAt(MemDisc, u32, Option<u8>, u32);
+    impl SectorSource for FailAt {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            if lba == self.1 {
+                self.3 += 1;
+            }
+            if lba == self.1 && self.3 > 1 {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: self.2,
+                    sense: None,
+                });
+            }
+            self.0.read_sectors(lba, n, buf, r)
+        }
+    }
+
+    fn two_clip_disc() -> MemDisc {
+        two_clip_disc_with_first_unmapped().0
+    }
+
+    // One damaged File Entry loses that file only; the rest of the tree extracts.
+    #[test]
+    fn an_unreadable_file_entry_loses_that_file_not_the_tree() {
+        let mut disc = FailAt(two_clip_disc(), PART_START + 24, Some(0x02), 0);
+        let out = TmpDir::new("bad_fe");
+        let res = clear_disc()
+            .extract_tree(
+                &mut disc,
+                out.path(),
+                &ExtractOptions::default(),
+                &crate::ctx::Ctx::default(),
+            )
+            .expect("extract");
+        assert_eq!(
+            read_out(out.path(), "BDMV/STREAM/00002.m2ts"),
+            Some(vec![0x22; 3 * 2048])
+        );
+        assert!(read_out(out.path(), "BDMV/STREAM/00001.m2ts").is_none());
+        assert_eq!(res.bytes_unreadable, 3 * 2048);
+        assert!(!res.complete && !res.halted);
+    }
+
+    // A dead bus while locating a file is not a damaged entry: the run fails.
+    #[test]
+    fn a_transport_failure_locating_a_file_entry_fails_the_run() {
+        let status = Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE);
+        let mut disc = FailAt(two_clip_disc(), PART_START + 24, status, 0);
+        let out = TmpDir::new("dead_bus_fe");
+        let r = clear_disc().extract_tree(
+            &mut disc,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        );
+        assert!(r.is_err_and(|e| e.is_scsi_transport_failure()));
+    }
+
+    // A holed file feeds the run's loss counters and the live progress split: the
+    // unreadable bytes are not counted as good.
+    #[test]
+    fn a_hole_reaches_the_loss_stats_and_the_progress_split() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64)));
+        let tap = seen.clone();
+        let ctx = crate::ctx::Ctx::new(crate::halt::Halt::new()).with_events(std::sync::Arc::new(
+            move |e: &crate::event::Event<'_>| {
+                if let crate::event::Event::Pass(p) = e {
+                    *tap.lock().unwrap() = (p.bytes_good_total, p.bytes_unreadable_total);
+                }
+            },
+        ));
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![
+                        file("00001.m2ts", 24, 5000, vec![0x11; 3 * 2048], true),
+                        file("00002.m2ts", 25, 6000, vec![0x22; 6 * 2048], true),
+                    ],
+                    subdirs: vec![],
+                }],
+            }],
+        };
+        let mut disc = build_disc(root);
+        for i in 0..3u32 {
+            disc.bad.insert(PART_START + 5000 + i); // the first clip's whole extent
+        }
+        let out = TmpDir::new("hole_stats");
+        clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default(), &ctx)
+            .expect("extract");
+        let loss = ctx.stats.snapshot();
+        assert_eq!(loss.bytes_lost, 3 * 2048);
+        assert!(loss.read_skips >= 1);
+        assert_eq!(*seen.lock().unwrap(), (6 * 2048, 3 * 2048));
+    }
+
+    // A damaged AACS unit the reader blanks is unreadable bytes, not good ones.
+    #[test]
+    fn a_blanked_aacs_unit_is_counted_unreadable() {
+        const DATA: u32 = 5000;
+        let key = [0u8; 16];
+        let mut content = encrypt_aacs_unit(&key, 0xA1);
+        let mut damaged = vec![0x55u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        damaged[0] |= 0xC0; // flagged encrypted, but no key opens it
+        content.extend_from_slice(&damaged);
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![file("00001.m2ts", 24, DATA, content, true)],
+                    subdirs: vec![],
+                }],
+            }],
+        };
+        let mut disc = build_disc(root);
+        let d = aacs_disc();
+        let a = PART_START + DATA;
+        let set = crate::keys::KeyRing::keyed_for_test(&d, key, &[(a, a + 6)]);
+        let opts = ExtractOptions {
+            keys: Some(&set),
+            ..Default::default()
+        };
+        let out = TmpDir::new("blanked_unit");
+        let res = d
+            .extract_tree(&mut disc, out.path(), &opts, &crate::ctx::Ctx::default())
+            .expect("extract");
+        let unit = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
+        assert_eq!(res.bytes_unreadable, unit);
+        assert_eq!(res.files[0].bytes_good, unit);
+        assert!(!res.complete);
+    }
+
+    // The key set's loud stop is never a hole: the run ends with it.
+    #[test]
+    fn a_missing_disc_key_stops_the_run_instead_of_holing_the_unit() {
+        struct KeyMissingAt(MemDisc, u32);
+        impl SectorSource for KeyMissingAt {
+            fn read_sectors(&mut self, lba: u32, n: u16, b: &mut [u8], r: bool) -> Result<usize> {
+                if lba == self.1 {
+                    return Err(Error::WholeDiscKeyMissing);
+                }
+                self.0.read_sectors(lba, n, b, r)
+            }
+        }
+        let mut disc = KeyMissingAt(two_clip_disc(), PART_START + 5000);
+        let out = TmpDir::new("key_missing");
+        let r = clear_disc().extract_tree(
+            &mut disc,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        );
+        assert!(matches!(r, Err(Error::WholeDiscKeyMissing)), "{r:?}");
+    }
+
     // A Stop at the lost file's report ends the run there, like any other file.
     #[test]
     fn progress_stop_on_an_unmapped_stream_file_halts_the_run() {
@@ -2761,6 +2974,53 @@ mod tests {
             "must stay .partial"
         );
         assert!(read_out(out.path(), "a.m2ts.partial").is_some());
+    }
+
+    // A dead bus is not a hole: the file must stay `.partial` and the error surface,
+    // not be zero-filled and finalized as complete.
+    #[test]
+    fn a_transport_failure_stops_the_file_instead_of_zero_filling() {
+        struct DeadBus;
+        impl SectorSource for DeadBus {
+            fn read_sectors(&mut self, lba: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+                Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                    sense: None,
+                })
+            }
+        }
+        let len = 4 * SECTOR_BYTES as u32;
+        let pf = PlannedFile {
+            host_rel: PathBuf::from("a.m2ts"),
+            disc_name: "a.m2ts".into(),
+            size: len as u64,
+            inline: None,
+            extents: vec![crate::udf::AbsExtent {
+                lba: 100,
+                len,
+                recorded: true,
+            }],
+            unmapped: false,
+        };
+        let out = TmpDir::new("dead_bus");
+        std::fs::create_dir_all(out.path()).unwrap();
+        let mut dec = DecryptingSectorSource::new(DeadBus, DecryptKeys::None);
+        let (mut done, mut bad) = (0u64, 0u64);
+        let r = extract_one_file(
+            &mut dec,
+            &TreeSink::create(out.path(), true).unwrap(),
+            &pf,
+            len as u64,
+            &mut done,
+            &mut bad,
+            &crate::ctx::Ctx::default(),
+        );
+        assert!(r.is_err_and(|e| e.is_scsi_transport_failure()));
+        assert!(
+            read_out(out.path(), "a.m2ts").is_none(),
+            "must stay .partial"
+        );
     }
 
     // A crafted extent near the top of the LBA space must not overflow: a batch
