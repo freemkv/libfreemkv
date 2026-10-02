@@ -438,26 +438,28 @@ fn wait_ready_stop_during_poll_and_start_unit() {
     }
 }
 
-/// LD11a (GUARD, T5): transport failures broken by a drive answer every 0.5 × the
-/// dead-bus budget, for 4 budgets, never count as a dead bus.
+/// LD11a (GUARD, T5): transport failures broken by a drive answer every few polls,
+/// for more than the dead-bus budget, never count as a dead bus.
 #[test]
 fn dead_bus_budget_resets_on_any_answer() {
-    let budget = MS(100);
-    let t0 = Instant::now();
-    let mut last = Instant::now();
+    let budget = Duration::from_secs(1);
+    // Polls are at least 10 ms apart, so 150 polls outlast the budget.
+    let mut n = 0u32;
     let t = Script::new(move |_, d| {
-        if t0.elapsed() >= budget * 4 {
+        n += 1;
+        if n >= 150 {
             return good(d);
         }
-        if last.elapsed() >= budget / 2 {
-            last = Instant::now();
+        if n.is_multiple_of(5) {
             return Err(not_ready(0x04, 0x01));
         }
         Err(fault())
     });
     let mut d = Drive::from_transport(Box::new(t));
+    let t0 = Instant::now();
     let r = d.wait_ready_with(timing(Duration::from_secs(60), budget));
     assert!(r.is_ok(), "{r:?}");
+    assert!(t0.elapsed() > budget, "the run outlasted the budget");
 }
 
 /// LD11b / G5 (GUARD): an unbroken run of transport failures for the budget is a
@@ -475,29 +477,29 @@ fn dead_bus_unbroken_run_fails() {
     assert!(t0.elapsed() < Duration::from_secs(1));
 }
 
-/// LD12a: 04/01 with a progress indication rising every 0.5 × window for 4 windows,
+/// LD12a: 04/01 with a progress indication rising every 0.25 × window for 3 windows,
 /// then ready → `Ok`. Corroborated by SS-1: the field is "a percent complete indication".
 #[test]
 fn wait_ready_rides_out_progressing_spin_up() {
-    let window = MS(200);
+    let window = Duration::from_secs(1);
     let t0 = Instant::now();
-    let (t, cell) = Script::with_progress(move |_, d| {
-        if t0.elapsed() >= window * 4 {
-            return good(d);
-        }
-        Err(not_ready(0x04, 0x01))
-    });
-    let t0b = Instant::now();
-    let mover = std::thread::spawn(move || {
-        while t0b.elapsed() < window * 4 {
-            let step = (t0b.elapsed().as_millis() / (window.as_millis() / 2)) as u16;
-            *cell.lock().unwrap() = Some(1000 * (step + 1));
-            std::thread::sleep(MS(5));
-        }
-    });
+    let cell: Arc<Mutex<Option<u16>>> = Arc::default();
+    let c2 = cell.clone();
+    let t = Script(
+        Box::new(move |_, d| {
+            let at = t0.elapsed();
+            if at >= window * 3 {
+                return good(d);
+            }
+            let step = (at.as_millis() / (window.as_millis() / 4)) as u16;
+            *c2.lock().unwrap() = Some(1000 * (step + 1));
+            Err(not_ready(0x04, 0x01))
+        }),
+        None,
+        cell,
+    );
     let mut d = Drive::from_transport(Box::new(t));
     let r = d.wait_ready_with(timing(window, MS(5_000)));
-    mover.join().unwrap();
     assert!(r.is_ok(), "a progressing spin-up is not a stall: {r:?}");
     assert!(t0.elapsed() >= window * 2, "ran past two windows");
 }
@@ -526,19 +528,24 @@ fn wait_ready_gives_up_after_60s_without_progress() {
 /// (The stricter reading of "the answer changes", §2.11; the user may overrule it.)
 #[test]
 fn wait_ready_new_answer_is_progress_flapping_is_not() {
-    let window = MS(200);
-    let t0 = Instant::now();
+    let window = Duration::from_secs(1);
     let fresh = [0x00u8, 0x01, 0x04, 0x07, 0x08, 0x09, 0x0A, 0x11, 0x22];
+    // A new answer every 25 polls (each at least `timing().poll` apart): 8 answers
+    // outlast the window, and each lands well inside it.
+    let mut n = 0usize;
     let t = Script::new(move |_, d| {
-        let step = (t0.elapsed().as_millis() / (window.as_millis() / 2)) as usize;
+        let step = n / 25;
+        n += 1;
         match fresh.get(step) {
             Some(&q) if step < 8 => Err(not_ready(0x04, q)),
             _ => good(d),
         }
     });
     let mut d = Drive::from_transport(Box::new(t));
+    let t0 = Instant::now();
     let r = d.wait_ready_with(timing(window, MS(5_000)));
     assert!(r.is_ok(), "new answers re-arm the window: {r:?}");
+    assert!(t0.elapsed() > window, "the run outlasted one window");
 
     let mut n = 0u32;
     let t = Script::new(move |_, _| {
@@ -552,17 +559,21 @@ fn wait_ready_new_answer_is_progress_flapping_is_not() {
     let t0 = Instant::now();
     let r = d.wait_ready_with(timing(window, MS(5_000)));
     assert!(matches!(r, Err(Error::DeviceNotReady { .. })), "{r:?}");
-    assert!(t0.elapsed() < window + Duration::from_secs(1));
+    assert!(t0.elapsed() < window + Duration::from_secs(5));
 }
 
-/// LD12d (GUARD): a Stop at 0.75 × window, and mid-progress, ends the wait at once.
+/// LD12d (GUARD): a Stop mid-wait, with and without progress, ends the wait at once.
+/// The Stop lands after a few polls, long before the window could expire.
 #[test]
 fn wait_ready_stop_always_interrupts() {
-    let window = MS(400);
+    let window = Duration::from_secs(60);
     for progressing in [false, true] {
         let h = Halt::new();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p2 = polls.clone();
         let mut q = 0u8;
         let t = Script::new(move |_, _| {
+            p2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if progressing {
                 q = q.wrapping_add(1) % 0x30;
             }
@@ -571,14 +582,18 @@ fn wait_ready_stop_always_interrupts() {
         let mut d = Drive::from_transport_with(Box::new(t), &h);
         let h2 = h.clone();
         let stopper = std::thread::spawn(move || {
-            std::thread::sleep(window * 3 / 4);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while polls.load(std::sync::atomic::Ordering::SeqCst) < 5 {
+                assert!(Instant::now() < deadline, "the wait never polled");
+                std::thread::sleep(MS(1));
+            }
             h2.cancel();
             Instant::now()
         });
         let r = d.wait_ready_with(timing(window, MS(5_000)));
         let at = stopper.join().unwrap();
         assert!(matches!(r, Err(Error::Halted)), "{r:?}");
-        assert!(at.elapsed() < Duration::from_secs(1));
+        assert!(at.elapsed() < Duration::from_secs(5));
     }
 }
 

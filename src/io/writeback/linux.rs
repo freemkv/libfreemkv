@@ -877,7 +877,7 @@ mod tests {
     }
 
     fn slow_wait(_fd: RawFd, _off: u64, _len: u64) -> i32 {
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_secs(2));
         0
     }
 

@@ -686,15 +686,24 @@ mod tests {
         assert_eq!(frames[0].pts, 90000);
     }
 
-    // Accept one sender and read to the end; returns the frame count and the
-    // terminal read result (Ok(None) = a clean end, Err = a failed sender).
+    // Accept one sender and read to the end: the frame count and the terminal read
+    // (Ok(None) = a clean end, Err = a failed sender). It signals once the header is
+    // read; a reset before that fails the accept (macOS: EINVAL on a reset socket).
     type ReadEnd = (usize, io::Result<Option<crate::pes::PesFrame>>);
+    type Reader = (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<ReadEnd>,
+        std::sync::mpsc::Receiver<()>,
+    );
 
-    fn spawn_ending_reader() -> (std::net::SocketAddr, std::thread::JoinHandle<ReadEnd>) {
+    fn spawn_ending_reader() -> Reader {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let mut ns = NetworkStream::accept_from(listener).unwrap();
+            let ns = NetworkStream::accept_from(listener);
+            let _ = accepted_tx.send(());
+            let mut ns = ns.unwrap();
             let mut n = 0;
             loop {
                 match crate::pes::PesSource::read(&mut ns) {
@@ -703,7 +712,17 @@ mod tests {
                 }
             }
         });
-        (addr, handle)
+        (addr, handle, accepted)
+    }
+
+    // Send the header and what is written so far, and wait until the receiver has accepted.
+    fn flush_to_accepted(writer: &mut NetworkStream, accepted: &std::sync::mpsc::Receiver<()>) {
+        if let Mode::Write { writer: w, .. } = &mut writer.mode {
+            w.flush().unwrap();
+        }
+        accepted
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the receiver accepted");
     }
 
     fn one_frame() -> crate::pes::PesFrame {
@@ -725,11 +744,12 @@ mod tests {
     fn a_sender_that_fails_mid_title_is_an_error_at_the_receiver() {
         use crate::pes::PesSink as _;
         for incomplete in [false, true] {
-            let (addr, handle) = spawn_ending_reader();
+            let (addr, handle, accepted) = spawn_ending_reader();
             let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
                 .unwrap()
                 .meta(&sample_title());
             writer.write(&one_frame()).unwrap();
+            flush_to_accepted(&mut writer, &accepted);
             if incomplete {
                 writer.finish_incomplete().unwrap();
             }
@@ -738,7 +758,7 @@ mod tests {
             assert!(end.is_err(), "incomplete={incomplete}: got {end:?}");
         }
         // A finished sender still ends cleanly.
-        let (addr, handle) = spawn_ending_reader();
+        let (addr, handle, _) = spawn_ending_reader();
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&sample_title());
@@ -755,11 +775,12 @@ mod tests {
     #[test]
     fn finish_incomplete_resets_the_connection_at_once() {
         use crate::pes::PesSink as _;
-        let (addr, handle) = spawn_ending_reader();
+        let (addr, handle, accepted) = spawn_ending_reader();
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&sample_title());
         writer.write(&one_frame()).unwrap();
+        flush_to_accepted(&mut writer, &accepted);
         let linger = |w: &NetworkStream| match &w.mode {
             Mode::Write { writer, .. } => {
                 socket2::SockRef::from(writer.get_ref()).linger().unwrap()
@@ -787,7 +808,7 @@ mod tests {
         assert_eq!(timings, vec![Default::default(), timing]);
         assert!(set_timing(&mut timings, 2, timing, 2).is_err());
 
-        let (addr, handle) = spawn_ending_reader();
+        let (addr, handle, _) = spawn_ending_reader();
         let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
             .unwrap()
             .meta(&sample_title());
@@ -806,7 +827,7 @@ mod tests {
     // A connection cut inside a frame (even with a clean FIN) is an error.
     #[test]
     fn a_connection_cut_mid_frame_is_an_error_at_the_receiver() {
-        let (addr, handle) = spawn_ending_reader();
+        let (addr, handle, _) = spawn_ending_reader();
         let mut raw = TcpStream::connect(addr).unwrap();
         let m = meta::M2tsMeta::from_title(&sample_title());
         meta::write_header(&mut raw, &m).unwrap();

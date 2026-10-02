@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
-const WINDOW: Duration = Duration::from_millis(200);
-const SLACK: Duration = Duration::from_secs(1);
+// A 1 s window and 2 s upper bounds keep a 200 ms sleep overshoot inside them.
+const WINDOW: Duration = Duration::from_secs(1);
+const SLACK: Duration = Duration::from_secs(2);
 
 fn artifact() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -37,8 +38,8 @@ fn sidecar_is_named_after_the_final_artifact() {
     );
 }
 
-/// LP14a (T10, stall pair a): the holder appends to the `.partial` every 0.5 × window
-/// for 4 windows, then releases: the waiter is never timed out and takes the lock.
+/// LP14a (T10, stall pair a): the holder appends to the `.partial` every 0.2 × window
+/// for over 3 windows, then releases: the waiter is never timed out and takes the lock.
 #[test]
 fn artifact_lock_waits_while_holder_progresses() {
     let (_dir, out) = artifact();
@@ -46,8 +47,8 @@ fn artifact_lock_waits_while_holder_progresses() {
     let partial = with_suffix(&out, ".partial");
     let writer = thread::spawn(move || {
         let mut f = File::create(&partial).unwrap();
-        for _ in 0..8 {
-            thread::sleep(WINDOW / 2);
+        for _ in 0..16 {
+            thread::sleep(WINDOW / 5);
             f.write_all(b"sector").unwrap();
         }
         drop(holder);
@@ -155,8 +156,8 @@ fn artifact_lock_watches_extra_paths() {
     let holder = take(&out, WINDOW).expect("first taker");
     let m2 = mapfile.clone();
     let writer = thread::spawn(move || {
-        for i in 0..8u8 {
-            thread::sleep(WINDOW / 2);
+        for i in 0..16u8 {
+            thread::sleep(WINDOW / 5);
             std::fs::write(&m2, vec![i; usize::from(i) + 1]).unwrap();
         }
         drop(holder);

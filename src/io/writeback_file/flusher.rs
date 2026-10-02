@@ -276,7 +276,7 @@ mod tests {
     fn wait_room_requests_unrequested_bytes() {
         let file = tempfile::tempfile().unwrap();
         let timing = FlushTiming {
-            stall: Duration::from_millis(400),
+            stall: Duration::from_secs(5),
             slow_chunk: Duration::from_secs(10),
             chunk_min: 100,
             chunk_max: 100,
@@ -300,7 +300,7 @@ mod tests {
     fn wait_room_requests_bytes_unrequested_while_blocked() {
         let file = tempfile::tempfile().unwrap();
         let timing = FlushTiming {
-            stall: Duration::from_millis(400),
+            stall: Duration::from_secs(5),
             slow_chunk: Duration::from_secs(10),
             chunk_min: 100,
             chunk_max: 100,
@@ -352,7 +352,7 @@ mod tests {
     fn a_chunk_error_is_latched_and_reported_as_itself() {
         let file = tempfile::tempfile().unwrap();
         let timing = FlushTiming {
-            stall: Duration::from_millis(400),
+            stall: Duration::from_secs(5),
             slow_chunk: Duration::from_secs(10),
             chunk_min: 100,
             chunk_max: 100,
@@ -370,7 +370,7 @@ mod tests {
         let e = f.drain(100, None, None).expect_err("the chunk failed");
         assert_eq!(e.raw_os_error(), Some(28), "{e}");
         assert!(
-            start.elapsed() < Duration::from_millis(300),
+            start.elapsed() < Duration::from_millis(2500),
             "waited a stall"
         );
         assert_eq!(f.error().and_then(|e| e.raw_os_error()), Some(28));

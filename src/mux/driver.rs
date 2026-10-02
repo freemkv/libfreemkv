@@ -3175,7 +3175,8 @@ mod tests {
         }
     }
 
-    fn finish_flushing(steps: u64, gap: Duration, tail: Duration) -> Vec<(u64, u64)> {
+    // The forwarded `BytesDurable` calls, and how long the finish took.
+    fn finish_flushing(steps: u64, gap: Duration, tail: Duration) -> (Vec<(u64, u64)>, Duration) {
         let flush = FlushProgress::new(crate::halt::Liveness::new());
         let sink = FlushingClose {
             flush: flush.clone(),
@@ -3187,18 +3188,21 @@ mod tests {
         let pipe = Pipeline::spawn_named_with_progress("t-flush", 4, sink, progress).unwrap();
         let spy = Arc::new(FlushSpy::default());
         let ctx = crate::ctx::Ctx::default().with_events(spy.clone());
+        let t = std::time::Instant::now();
         finish_pumped(pipe, &Halt::new(), false, &flush, &ctx).unwrap();
+        let took = t.elapsed();
         drop(ctx);
         let spy = Arc::try_unwrap(spy).ok().expect("the only handle");
-        spy.0.into_inner().unwrap()
+        (spy.0.into_inner().unwrap(), took)
     }
 
     /// LP20 (§4.5): while the driver waits on a closing consumer, each increase of the
     /// flusher's bytes produces one `BytesDurable`, and none while it is static.
     #[test]
     fn finish_with_halt_forwards_flush_progress() {
-        let calls = finish_flushing(4, Duration::from_millis(300), Duration::from_millis(600));
-        let want: Vec<(u64, u64)> = (1..=4).map(|i| (i * 1000, 4000)).collect();
+        // Each gap is 4× the rate limit, so no increase is coalesced into its neighbour.
+        let (calls, _) = finish_flushing(3, FLUSH_PROGRESS_EVERY * 4, Duration::from_millis(600));
+        let want: Vec<(u64, u64)> = (1..=3).map(|i| (i * 1000, 3000)).collect();
         assert_eq!(
             calls, want,
             "one call per increase, none during the idle tail"
@@ -3209,8 +3213,14 @@ mod tests {
     /// and the last value still arrives.
     #[test]
     fn flush_progress_is_rate_limited_to_4hz() {
-        let calls = finish_flushing(20, Duration::from_millis(5), Duration::from_millis(600));
-        assert!(!calls.is_empty() && calls.len() <= 3, "{calls:?}");
+        let (calls, took) =
+            finish_flushing(20, Duration::from_millis(5), Duration::from_millis(600));
+        // One call at the start of each rate-limit period, plus the final value.
+        let periods = (took.as_millis() / FLUSH_PROGRESS_EVERY.as_millis()) as usize;
+        assert!(
+            !calls.is_empty() && calls.len() <= periods + 2 && calls.len() < 20,
+            "{calls:?} in {took:?}"
+        );
         assert_eq!(calls.last(), Some(&(20_000, 20_000)));
     }
 

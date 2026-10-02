@@ -1696,25 +1696,22 @@ mod tests {
         }
         assert!(in_close.load(Ordering::SeqCst), "consumer reached close()");
 
-        // Finish the close only AFTER the first grace window has expired, so the
-        // caller genuinely reaches the abandon decision with a close in flight.
-        let rel = release.clone();
-        thread::spawn(move || {
-            // Release inside the second grace window. Old 600ms/300ms-grace intervals
-            // left no margin and flaked on loaded runners; scaled up so windows end
-            // at ~1.0-1.25s and ~2.0-2.25s, releasing at 1.6s for ~350ms slack.
-            thread::sleep(Duration::from_millis(1600));
-            rel.store(true, Ordering::SeqCst);
-        });
-
+        // The caller's own poll releases the close 0.3 grace into the second window: after
+        // the abandon decision, well before the CLOSING grace ends, on no other thread.
         let grace = Duration::from_secs(1);
+        let started = Instant::now();
+        let rel = release.clone();
         let res = finish_with_grace(
             handle,
             &state,
             &Liveness::new(),
             grace,
             Error::Halted,
-            &mut || {},
+            &mut || {
+                if started.elapsed() >= grace * 13 / 10 {
+                    rel.store(true, Ordering::SeqCst);
+                }
+            },
         );
         assert!(
             matches!(res, Ok(42)),
