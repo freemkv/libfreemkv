@@ -558,6 +558,100 @@ mod tests {
         data
     }
 
+    // --- Pictures a decoder cannot reconstruct from the stream's own data ---
+
+    /// A progressive advanced-profile entry-point I-picture AU (sequence header,
+    /// entry-point header with the given BROKEN_LINK / CLOSED_ENTRY, frame)
+    /// followed, in decode order, by B B P (SMPTE 421M §6.2.1: with CLOSED_ENTRY
+    /// 0 the Bs after the entry-point I may predict from the anchor before it).
+    fn entry_gop(broken_link: bool, closed_entry: bool) -> Vec<Vec<u8>> {
+        let seq = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0];
+        let ep0 = (u8::from(broken_link) << 7) | (u8::from(closed_entry) << 6);
+        let ep = [0x00, 0x00, 0x01, SC_ENTRY_POINT, ep0, 0x00];
+        let pic = |ptype: u8| vec![0x00, 0x00, 0x01, SC_FRAME, ptype];
+        vec![
+            [&seq[..], &ep[..], &pic(0xC0)].concat(),
+            pic(0x80),
+            pic(0x80),
+            pic(0x00),
+        ]
+    }
+
+    fn coding_types(aus: Vec<Vec<u8>>) -> Vec<CodingType> {
+        let mut p = Vc1Parser::new();
+        aus.into_iter()
+            .flat_map(|au| p.parse(&make_pes(au, Some(0))))
+            .map(|f| f.coding.unwrap().coding_type())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "defect: an open entry point (CLOSED_ENTRY=0) at the stream start emits its leading B-pictures, whose forward reference precedes the title"]
+    fn an_open_entry_point_at_the_stream_start_drops_its_leading_b_pictures() {
+        assert_eq!(
+            coding_types(entry_gop(false, false)),
+            [CodingType::I, CodingType::P]
+        );
+    }
+
+    #[test]
+    fn a_closed_entry_point_at_the_stream_start_keeps_every_picture() {
+        assert_eq!(
+            coding_types(entry_gop(false, true)),
+            [CodingType::I, CodingType::B, CodingType::B, CodingType::P]
+        );
+    }
+
+    #[test]
+    #[ignore = "defect: BROKEN_LINK mid-stream is not read; the Bs it marks undecodable are emitted"]
+    fn a_broken_link_drops_the_leading_b_pictures_mid_stream() {
+        let mut aus = entry_gop(false, true);
+        aus.extend(entry_gop(true, false));
+        assert_eq!(
+            coding_types(aus),
+            [
+                CodingType::I,
+                CodingType::B,
+                CodingType::B,
+                CodingType::P,
+                CodingType::I,
+                CodingType::P
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "defect: after a gap the ResyncGate resumes on an open entry point and passes its leading B-pictures, whose forward reference the gate dropped"]
+    fn a_gap_resync_onto_an_open_entry_point_emits_no_leading_b_pictures() {
+        let mut aus = entry_gop(false, true);
+        aus.extend(entry_gop(false, false));
+        let mut p = Vc1Parser::new();
+        let mut gate = crate::mux::resync::ResyncGate::new();
+        let types: Vec<CodingType> = aus
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, au)| {
+                let mut pes = make_pes(au, Some(0));
+                // The first entry segment's P follows lost data.
+                pes.discontinuity = i == 3;
+                p.parse(&pes)
+            })
+            .filter(|f| gate.admit(true, f.discontinuity, f.keyframe))
+            .map(|f| f.coding.unwrap().coding_type())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                CodingType::I,
+                CodingType::B,
+                CodingType::B,
+                CodingType::I,
+                CodingType::P
+            ],
+            "the second entry's Bs reference the P the gate dropped"
+        );
+    }
+
     // --- sequence header detection ---
 
     #[test]

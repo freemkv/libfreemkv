@@ -1055,6 +1055,41 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "defect: after a gap the ResyncGate resumes on an open GOP's I-picture and passes its leading B-pictures, whose forward reference the gate dropped"]
+    fn a_gap_resync_onto_an_open_gop_emits_no_leading_b_pictures() {
+        // GOP 1 (closed) loses data before P5: P5 and the Bs after it reference
+        // the lost picture. GOP 2 is open and PTS-continuous (no join): its leading
+        // B0/B1 reference GOP 1's P5, which the gate dropped.
+        let mut pes = gop_ibbp(seq_gop(true, false), Some(90_000));
+        pes[3].discontinuity = true;
+        pes.extend(gop_ibbp(gop_flags(false, false), None));
+        let mut gate = crate::mux::resync::ResyncGate::new();
+        let out: Vec<Frame> = run(pes)
+            .into_iter()
+            .filter(|f| gate.admit(true, f.discontinuity, f.keyframe))
+            .collect();
+        let types: Vec<_> = out
+            .iter()
+            .map(|f| f.coding.unwrap().coding_type())
+            .collect();
+        // GOP 1: I2 B0 B1 kept; P5 B3 B4 dropped. GOP 2: I2 kept, B0 B1 lack P5
+        // (dropped), P5 B3 B4 decode from GOP 2's own anchors.
+        assert_eq!(
+            types,
+            [
+                CodingType::I,
+                CodingType::B,
+                CodingType::B,
+                CodingType::I,
+                CodingType::P,
+                CodingType::B,
+                CodingType::B,
+            ],
+            "no emitted picture may reference one the gate dropped"
+        );
+    }
+
     // --- Sequence header parsing ---
 
     #[test]

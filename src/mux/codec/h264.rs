@@ -908,6 +908,106 @@ mod tests {
         );
     }
 
+    // --- Pictures a decoder cannot reconstruct from the stream's own data ---
+
+    /// One non-IDR picture AU: `hdr` = NAL header byte, `body` = slice-header byte
+    /// (0x88 I, 0x98 P, 0x9C B), at `frame` 24 fps frame periods (90 kHz).
+    fn pic_au(hdr: u8, body: u8, frame: i64) -> PesPacket {
+        make_pes(vec![0x00, 0x00, 0x01, hdr, body, 0x00], Some(frame * 3750))
+    }
+
+    /// An open GOP in decode order `I3 B1 B2 P6 B4 B5` (display frame numbers),
+    /// offset by `base` frames. B1/B2 precede the I in display order: leading
+    /// pictures predicted from the anchor BEFORE this GOP.
+    fn open_gop(base: i64) -> Vec<PesPacket> {
+        vec![
+            pic_au(0x61, 0x88, base + 3),
+            pic_au(0x01, 0x9C, base + 1),
+            pic_au(0x01, 0x9C, base + 2),
+            pic_au(0x41, 0x98, base + 6),
+            pic_au(0x01, 0x9C, base + 4),
+            pic_au(0x01, 0x9C, base + 5),
+        ]
+    }
+
+    /// Emitted frames' display frame numbers.
+    fn frame_nos(frames: &[Frame]) -> Vec<i64> {
+        frames
+            .iter()
+            .map(|f| (f.pts_ns * 24 + 500_000_000) / 1_000_000_000)
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "defect: an open GOP at the stream start emits its leading B-pictures, whose forward reference precedes the title"]
+    fn an_open_gop_at_the_stream_start_drops_its_leading_b_pictures() {
+        let mut p = H264Parser::new();
+        let f: Vec<Frame> = open_gop(0).iter().flat_map(|x| p.parse(x)).collect();
+        assert_eq!(
+            frame_nos(&f),
+            [3, 6, 4, 5],
+            "B1/B2 reference a picture the output does not hold"
+        );
+    }
+
+    #[test]
+    #[ignore = "defect: a join onto an open GOP emits its leading B-pictures, predicted from the previous clip's anchor"]
+    fn a_join_onto_an_open_gop_drops_its_leading_b_pictures() {
+        // Clip 1 ends on a complete open GOP; clip 2's PTS restarts far away, so
+        // its leading B1/B2 reference a picture of the clip the playlist skipped.
+        let mut p = H264Parser::new();
+        let mut pes = vec![make_pes(vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00], Some(0))];
+        pes.extend(open_gop(0).into_iter().skip(3));
+        pes.extend(open_gop(10_000));
+        let f: Vec<Frame> = pes.iter().flat_map(|x| p.parse(x)).collect();
+        assert_eq!(
+            frame_nos(&f)[4..],
+            [10_003, 10_006, 10_004, 10_005],
+            "clip 2's leading Bs reference clip 1's tail, not their own source"
+        );
+    }
+
+    #[test]
+    #[ignore = "defect: inter pictures before the stream's first random-access picture are emitted"]
+    fn pictures_before_the_first_random_access_picture_are_dropped() {
+        let mut p = H264Parser::new();
+        let mut pes = vec![pic_au(0x41, 0x98, 0), pic_au(0x01, 0x9C, 1)];
+        pes.push(make_pes(
+            vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00],
+            Some(2 * 3750),
+        ));
+        let f: Vec<Frame> = pes.iter().flat_map(|x| p.parse(x)).collect();
+        assert!(f[0].keyframe, "the first emitted picture is the IDR");
+    }
+
+    #[test]
+    #[ignore = "defect: after a gap the ResyncGate resumes on an open-GOP I-picture and passes its leading B-pictures, whose forward reference the gate dropped"]
+    fn a_gap_resync_onto_an_open_gop_emits_no_leading_b_pictures() {
+        // IDR, then a P that follows lost data (and the B predicted from it), then
+        // an open GOP continuing the same clock: its B1/B2 reference the dropped P.
+        let mut p = H264Parser::new();
+        let mut pes = vec![make_pes(
+            vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00],
+            Some(7 * 3750),
+        )];
+        let mut lost = pic_au(0x41, 0x98, 9);
+        lost.discontinuity = true;
+        pes.push(lost);
+        pes.push(pic_au(0x01, 0x9C, 8));
+        pes.extend(open_gop(10));
+        let mut gate = crate::mux::resync::ResyncGate::new();
+        let f: Vec<Frame> = pes
+            .iter()
+            .flat_map(|x| p.parse(x))
+            .filter(|f| gate.admit(true, f.discontinuity, f.keyframe))
+            .collect();
+        assert_eq!(
+            frame_nos(&f),
+            [7, 13, 16, 14, 15],
+            "B1/B2 reference the P the gate dropped"
+        );
+    }
+
     // The escaped slice header must be unescaped at the parse call site: a second slice with
     // first_mb_in_slice=65535 (00 00 03 escape) is intra only when read unescaped.
     #[test]

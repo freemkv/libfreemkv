@@ -955,6 +955,32 @@ mod tests {
         );
     }
 
+    // A PlayItem's IN mark need not sit on a GOP's I-picture: a player decodes from the
+    // preceding entry point and suppresses display until IN. The plan trims by each frame's
+    // own PTS, in decode order, so it drops the I and keeps the pictures predicted from it.
+    #[test]
+    #[ignore = "defect: the seam plan drops a reference picture outside a clip's marks while keeping the pictures predicted from it"]
+    fn the_in_mark_never_keeps_a_picture_whose_reference_it_dropped() {
+        const F: i64 = 41_708_333; // one 23.976 fps frame (ns)
+        let clips = vec![crate::disc::Clip {
+            feed_span: Some((0, 1_000_000)),
+            clip_id: "00001".into(),
+            in_time: 45_000, // IN = 1 s, mid-GOP
+            out_time: 450_000,
+            duration_secs: 9.0,
+            source_packets: 0,
+        }];
+        let mut plan = SeamPlan::from_clips(&clips).expect("one clip");
+        // Decode order: I (display 0.958 s, before IN), then P predicted from it
+        // (display 1.083 s, after IN).
+        let i_kept = plan.place(S - F, 0, true, Some(0)).is_some();
+        let p_kept = plan.place(S + 2 * F, 0, true, Some(100)).is_some();
+        assert!(
+            i_kept || !p_kept,
+            "the P is kept but its reference I was dropped (i_kept={i_kept}, p_kept={p_kept})"
+        );
+    }
+
     #[test]
     fn a_repeated_clip_shares_one_span_and_is_still_trusted() {
         let mut clips = clips_with_spans();

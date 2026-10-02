@@ -2352,6 +2352,98 @@ mod tests {
         );
     }
 
+    /// Whether `frames` hand a decoder a RASL picture it must decode: one that
+    /// follows a CRA (not a BLA, whose RASL a decoder discards) in decode order.
+    fn emits_decodable_rasl_after_cra(frames: &[Frame]) -> bool {
+        let mut last_irap = None;
+        for f in frames {
+            let t = nal_type_of(&nals_of(&f.data)[0]);
+            match t {
+                16..=21 => last_irap = Some(t),
+                8 | 9 if last_irap == Some(NAL_CRA_NUT) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    #[test]
+    #[ignore = "defect: a non-seamless join whose PTS jumps FORWARD is not detected, so its CRA stays CRA and its RASL decode against the previous clip"]
+    fn a_forward_pts_join_onto_a_cra_does_not_hand_its_rasl_to_the_decoder() {
+        // Clip 1: CRA + trailing pictures at ~0 s. Clip 2 starts 100 s later in
+        // the source clock (e.g. a PlayItem that skips part of a clip, or a clip
+        // whose STC runs ahead) with a CRA whose RASL reference a picture of
+        // the skipped material.
+        let mut p = HevcParser::new();
+        let mut frames = Vec::new();
+        frames.extend(p.parse(&make_pes(cra_au(&[0x01]), Some(0))));
+        frames.extend(p.parse(&make_pes(nal_bytes(1, &[0xD0]), Some(3750))));
+        frames.extend(p.parse(&make_pes(nal_bytes(1, &[0xD0]), Some(7500))));
+        let t = 100 * 90_000;
+        let clip2 = frames.len();
+        frames.extend(p.parse(&make_pes(cra_au(&[0x02]), Some(t))));
+        frames.extend(p.parse(&make_pes(nal_bytes(9, &[0xE0]), Some(t - 7500))));
+        frames.extend(p.parse(&make_pes(nal_bytes(8, &[0xE0]), Some(t - 3750))));
+        assert!(
+            !emits_decodable_rasl_after_cra(&frames[clip2..]),
+            "clip 2's RASL reference a picture this output does not hold"
+        );
+    }
+
+    #[test]
+    fn rasl_after_a_seamless_join_cra_stay_decodable() {
+        // Characterises the seamless case: PTS continuous across the join, so the
+        // RASL reference the previous clip's tail, which the output holds.
+        let mut p = HevcParser::new();
+        let mut frames = Vec::new();
+        frames.extend(p.parse(&make_pes(cra_au(&[0x01]), Some(0))));
+        frames.extend(p.parse(&make_pes(nal_bytes(1, &[0xD0]), Some(3750))));
+        frames.extend(p.parse(&make_pes(cra_au(&[0x02]), Some(4 * 3750))));
+        frames.extend(p.parse(&make_pes(nal_bytes(9, &[0xE0]), Some(2 * 3750))));
+        assert!(
+            emits_decodable_rasl_after_cra(&frames),
+            "a seamless join keeps its CRA and RASL"
+        );
+    }
+
+    #[test]
+    #[ignore = "defect: after a gap the ResyncGate resumes on a CRA and passes its RASL, whose reference the gate dropped"]
+    fn a_gap_resync_onto_a_cra_does_not_hand_its_rasl_to_the_decoder() {
+        // IDR, a TRAIL_R that follows lost data, then a CRA (same clock) whose RASL
+        // reference the dropped TRAIL_R. The CRA is not first in the bitstream, so
+        // a decoder decodes the RASL.
+        let mut p = HevcParser::new();
+        let mut lost = make_pes(nal_bytes(1, &[0xD0]), Some(3750));
+        lost.discontinuity = true;
+        let pes = [
+            make_pes(nal_bytes(19, &[0x80]), Some(0)),
+            lost,
+            make_pes(cra_au(&[0x02]), Some(4 * 3750)),
+            make_pes(nal_bytes(9, &[0xE0]), Some(2 * 3750)),
+            make_pes(nal_bytes(8, &[0xE0]), Some(3 * 3750)),
+        ];
+        let mut gate = crate::mux::resync::ResyncGate::new();
+        let frames: Vec<Frame> = pes
+            .iter()
+            .flat_map(|x| p.parse(x))
+            .filter(|f| gate.admit(true, f.discontinuity, f.keyframe))
+            .collect();
+        assert!(
+            !emits_decodable_rasl_after_cra(&frames),
+            "the RASL reference the picture the gate dropped"
+        );
+    }
+
+    #[test]
+    #[ignore = "defect: pictures before the stream's first IRAP are emitted with no reference"]
+    fn pictures_before_the_first_irap_are_dropped() {
+        let mut p = HevcParser::new();
+        let mut frames = Vec::new();
+        frames.extend(p.parse(&make_pes(nal_bytes(1, &[0xD0]), Some(0))));
+        frames.extend(p.parse(&make_pes(cra_au(&[0x01]), Some(3750))));
+        assert!(frames[0].keyframe, "the first emitted picture is the IRAP");
+    }
+
     /// Test 2: a CRA with NO boundary marker is left unchanged (CRA stays CRA).
     #[test]
     fn cra_without_boundary_unchanged() {
