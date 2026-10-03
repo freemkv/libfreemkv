@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn pes_opened_mid_picture_is_not_a_join() {
-        // A muxer packing pictures back to back (ffmpeg's MPEG-PS) opens each PES
+        // A muxer packing pictures back to back opens each PES
         // inside the previous picture, timed for the picture commencing in it. Read as
         // the previous picture's PTS, the open GOP's origin moved a frame: a false join.
         let mut pics = vec![
