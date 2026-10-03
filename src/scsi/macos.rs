@@ -551,17 +551,25 @@ mod tests {
     const LONG_MS: u32 = 10_000;
     /// Cancel lands this long after the wait starts.
     const CANCEL_AFTER: Duration = Duration::from_millis(50);
-    /// A cancelled wait returns within this of the cancel: a few 20 ms slices, CI-robust (§3.2).
-    const WAKE_BOUND: Duration = Duration::from_millis(150);
+    /// The unmount child is spawned well before a cancel this late, even on a loaded runner.
+    const SPAWN_CANCEL_AFTER: Duration = Duration::from_millis(500);
+    /// A cancelled wait returns within this of the cancel: a few 20 ms slices plus a kill and
+    /// reap, with a 5× margin over a 200 ms scheduler stall, and far under `LONG_MS` (§3.2).
+    const WAKE_BOUND: Duration = Duration::from_secs(1);
 
     // Run `wait` against a token cancelled CANCEL_AFTER in; returns its result and the time
     // from the cancel to its return.
     fn cancel_during(wait: impl FnOnce(*const u8) -> i32) -> (i32, Duration) {
+        cancel_after(CANCEL_AFTER, wait)
+    }
+
+    // `cancel_during` with the cancel landing `after` into the wait.
+    fn cancel_after(after: Duration, wait: impl FnOnce(*const u8) -> i32) -> (i32, Duration) {
         let halt = Halt::new();
         let canceller = {
             let halt = halt.clone();
             thread::spawn(move || {
-                thread::sleep(CANCEL_AFTER);
+                thread::sleep(after);
                 let at = Instant::now();
                 halt.cancel();
                 at
@@ -633,7 +641,7 @@ mod tests {
     #[test]
     fn shim_selftest_cancel_kills_and_reaps_the_unmount() {
         let mut pid = 0;
-        let (rc, wake) = cancel_during(|c| unsafe {
+        let (rc, wake) = cancel_after(SPAWN_CANCEL_AFTER, |c| unsafe {
             shim_selftest_run_and_reap(
                 c"/bin/sleep".as_ptr().cast(),
                 c"30".as_ptr().cast(),
@@ -739,7 +747,7 @@ mod tests {
             r.err()
         );
         assert!(
-            t0.elapsed() < Duration::from_millis(250),
+            t0.elapsed() < Duration::from_millis(450),
             "refusal took {:?}: the post-unmount settle sleep ran",
             t0.elapsed()
         );

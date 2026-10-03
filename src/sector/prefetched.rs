@@ -95,8 +95,8 @@ impl PrefetchedSectorSource {
     /// composed read+decrypt stack — every byte the producer emits is
     /// what the consumer's demux will feed to its codec parsers.
     ///
-    /// Precondition: each extent's `sector_count` should be a multiple of [`SECTOR_ALIGNMENT`],
-    /// else [`Error::ExtentNotUnitAligned`] surfaces through the channel.
+    /// Reads come in whole units; a shorter extent tail is one read the decrypt stage judges.
+    /// A non-whole-sector read surfaces [`Error::ExtentNotUnitAligned`] through the channel.
     ///
     /// [`Error::ExtentNotUnitAligned`]: crate::error::Error::ExtentNotUnitAligned
     ///
@@ -978,11 +978,11 @@ mod tests {
         });
     }
 
-    // An extent whose sector_count is not a multiple of 3 must not emit a
-    // still-encrypted sub-unit tail: the producer delivers the readable
-    // full units, then surfaces a typed error on the tail.
+    // An extent whose sector_count is not a multiple of 3 delivers its whole units, then
+    // its sub-unit tail as one short batch, then EOF. Judging the tail (clear passes, an
+    // encrypted fragment is refused) is the decrypt stage's job, not the reader's.
     #[test]
-    fn non_multiple_of_three_extent_errors_on_tail() {
+    fn non_multiple_of_three_extent_reads_its_tail() {
         let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             // 8 sectors = 2 full units (6 sectors) + 2 leftover.
@@ -993,23 +993,15 @@ mod tests {
             let src = PatternSource { capacity: 200 };
             let mut pf =
                 PrefetchedSectorSource::new(src, extents, 3, &Ctx::default()).expect("spawn");
-
             let mut buf = vec![0u8; 3 * 2048];
-            // First two reads: the 6 unit-aligned sectors come through
-            // as full 3-sector (6144-byte) batches.
             let n0 = pf.read_sectors(0, 3, &mut buf, false).unwrap();
             assert_eq!(n0, 3 * 2048);
             let n1 = pf.read_sectors(0, 3, &mut buf, false).unwrap();
             assert_eq!(n1, 3 * 2048);
-            // Third read hits the 2-sector tail: it must be an error,
-            // never a 4096-byte (sub-unit) batch that decrypt would
-            // leave encrypted.
-            let err = pf.read_sectors(0, 3, &mut buf, false);
-            assert!(
-                err.is_err(),
-                "non-unit-aligned tail must error, got Ok({:?})",
-                err
-            );
+            let n2 = pf.read_sectors(0, 3, &mut buf, false).unwrap();
+            assert_eq!(n2, 2 * 2048, "the 2-sector tail is one batch");
+            assert_eq!(buf[0], 106, "the tail starts at lba 106");
+            assert_eq!(pf.read_sectors(0, 3, &mut buf, false).unwrap(), 0, "EOF");
         });
     }
 
@@ -1299,7 +1291,7 @@ mod tests {
 
     // An extent whose sector_count IS a multiple of 3 must deliver exactly
     // that many sectors and then cleanly EOF (no error on the final
-    // aligned batch); the trailing-tail guard only fires on sub-unit leftovers.
+    // aligned batch).
     #[test]
     fn unit_aligned_extent_delivers_all_and_eofs() {
         let _serial = serial();
@@ -1656,11 +1648,11 @@ mod tests {
         });
     }
 
-    // A 4-sector extent (one full unit + a 1-sector tail) must deliver the
-    // 3-sector unit then error on the 1-sector remainder — exercising the
-    // trim-within-batch path, distinct control flow from the 8-sector case.
+    // A 4-sector extent (one full unit + a 1-sector tail) delivers the 3-sector unit,
+    // then the 1-sector tail, then EOF: the trim-within-batch path, distinct control flow
+    // from the 8-sector case.
     #[test]
-    fn four_sector_extent_errors_on_one_sector_tail() {
+    fn four_sector_extent_reads_its_one_sector_tail() {
         let _serial = serial();
         with_watchdog(Duration::from_secs(10), || {
             let extents = vec![Extent {
@@ -1671,13 +1663,9 @@ mod tests {
             // batch=9 (>4) so the first iter requests 4, trims to 3.
             let mut pf =
                 PrefetchedSectorSource::new(src, extents, 9, &Ctx::default()).expect("spawn");
-            let mut buf = vec![0u8; 9 * 2048];
-            let n0 = pf.read_sectors(0, 9, &mut buf, false).unwrap();
-            assert_eq!(n0, 3 * 2048, "first batch must be exactly one unit");
-            let r = pf.read_sectors(0, 9, &mut buf, false);
-            let err = r.expect_err("1-sector tail must error");
-            let io: std::io::Error = err.into();
-            assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+            let (got, last) = drain_direct(&mut pf, 9, 8);
+            assert_eq!(last.unwrap(), 0, "EOF after the tail");
+            assert_eq!(got.len(), 4 * 2048, "every sector of the extent");
         });
     }
 

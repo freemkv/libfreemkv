@@ -6,6 +6,7 @@
 //! Each PES packet = one access unit = one frame.
 
 use super::coding::{CodingType, PictureInfo};
+use super::decodable::{Decodable, Need};
 use super::startcode::{BitReader, find_start_code, skip_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -54,6 +55,11 @@ pub struct H264Parser {
     /// dependent access unit suitable for a Matroska `BlockAdditional`. The base
     /// view's avcC/param-set stripping is unchanged (separate parser instance).
     mvc_passthrough: bool,
+    /// Which pictures decode from the pictures this output holds (not the MVC dependent
+    /// view, whose access units follow their base picture's fate).
+    decodable: Decodable,
+    /// What each frame held by `reorder` needs, in decode order.
+    needs: std::collections::VecDeque<Need>,
 }
 
 impl Default for H264Parser {
@@ -72,6 +78,8 @@ impl H264Parser {
             cur_pps: None,
             reorder: None,
             mvc_passthrough: false,
+            decodable: Decodable::new(false),
+            needs: std::collections::VecDeque::new(),
         }
     }
 
@@ -80,6 +88,8 @@ impl H264Parser {
     pub(crate) fn with_ps_reorder(mut self, enabled: bool) -> Self {
         if enabled {
             self.reorder = Some(super::reorder::SparsePtsReorder::new());
+            // Reconstructed PTS are approximate: only a step past the leading window is a join.
+            self.decodable = Decodable::new(false);
         }
         self
     }
@@ -91,13 +101,39 @@ impl H264Parser {
         self
     }
 
-    /// Route a finished frame through the PTS reorderer when enabled, else emit
-    /// it directly (unchanged transport-stream behaviour).
-    fn finish(&mut self, explicit: Option<i64>, frame: Frame) -> Vec<Frame> {
+    /// Route a finished frame through the PTS reorderer when enabled, then keep it
+    /// only if it decodes from what this output holds.
+    fn finish(
+        &mut self,
+        explicit: Option<i64>,
+        dts: Option<i64>,
+        frame: Frame,
+        need: Need,
+    ) -> Vec<Frame> {
         match self.reorder.as_mut() {
-            Some(r) => r.push(explicit, frame),
-            None => vec![frame],
+            Some(r) => {
+                self.needs.push_back(need);
+                let out = r.push(explicit, frame);
+                self.decide(out)
+            }
+            None => self
+                .decodable
+                .admit(frame, need, explicit, dts)
+                .into_iter()
+                .collect(),
         }
+    }
+
+    // Decide frames the reorderer released (decode order, display PTS assigned).
+    fn decide(&mut self, frames: Vec<Frame>) -> Vec<Frame> {
+        frames
+            .into_iter()
+            .filter_map(|f| {
+                let need = self.needs.pop_front().unwrap_or(Need::Nothing);
+                let pts = Some(f.pts_ns);
+                self.decodable.admit(f, need, pts, None)
+            })
+            .collect()
     }
 }
 
@@ -198,6 +234,7 @@ impl CodecParser for H264Parser {
         // player reorders). Use PTS not DTS: DTS presents B-frames in decode
         // order (visible judder) and breaks PTS-based seeking; fall back only if absent.
         let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
+        let dts = pes.pts.and(pes.dts).map(pts_to_ns);
         let pts_ns = explicit_pts.unwrap_or(0);
 
         // Single pass: detect IDR keyframes, seed/strip param sets, and convert
@@ -285,9 +322,20 @@ impl CodecParser for H264Parser {
         // Open-GOP anchor heuristic (recovery_point SEI §D.2.8 is authoritative, not read):
         // promote when every slice of the first picture is intra, a following P field
         // allowed, base view only. Else the resync gate can drop frames to EOF.
+        let idr = keyframe;
         if saw_vcl && all_vcl_intra && !mvc {
             keyframe = true;
         }
+        // A B displayed before its random-access picture is a leading picture; an IDR has none.
+        let need = match coding_type {
+            _ if mvc || !saw_vcl => Need::Nothing,
+            _ if keyframe => Need::Rap {
+                closed: idr,
+                broken: false,
+            },
+            Some(CodingType::B) => Need::ByPts,
+            _ => Need::Anchor,
+        };
 
         // Every keyframe is self-contained: re-assert active SPS/PPS in-band so a
         // decoder that dropped the set recovers, and a stale avcC re-apply can't
@@ -329,12 +377,15 @@ impl CodecParser for H264Parser {
             data: frame_data,
             duration_ns: None,
         };
-        self.finish(explicit_pts, frame)
+        self.finish(explicit_pts, dts, frame, need)
     }
 
     fn flush(&mut self) -> Vec<Frame> {
         match self.reorder.as_mut() {
-            Some(r) => r.flush(),
+            Some(r) => {
+                let out = r.flush();
+                self.decide(out)
+            }
             None => Vec::new(),
         }
     }
@@ -908,6 +959,192 @@ mod tests {
         );
     }
 
+    /// A parser that has emitted an IDR at PTS 0, so an inter picture after it decodes.
+    fn primed() -> H264Parser {
+        let mut p = H264Parser::new();
+        let idr = p.parse(&make_pes(vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00], Some(0)));
+        assert!(idr[0].keyframe);
+        p
+    }
+
+    // --- Pictures a decoder cannot reconstruct from the stream's own data ---
+
+    /// One non-IDR picture AU: `hdr` = NAL header byte, `body` = slice-header byte
+    /// (0x88 I, 0x98 P, 0x9C B), at `frame` 24 fps frame periods (90 kHz).
+    fn pic_au(hdr: u8, body: u8, frame: i64) -> PesPacket {
+        make_pes(vec![0x00, 0x00, 0x01, hdr, body, 0x00], Some(frame * 3750))
+    }
+
+    /// An open GOP in decode order `I3 B1 B2 P6 B4 B5` (display frame numbers),
+    /// offset by `base` frames. B1/B2 precede the I in display order: leading
+    /// pictures predicted from the anchor BEFORE this GOP.
+    fn open_gop(base: i64) -> Vec<PesPacket> {
+        vec![
+            pic_au(0x61, 0x88, base + 3),
+            pic_au(0x01, 0x9C, base + 1),
+            pic_au(0x01, 0x9C, base + 2),
+            pic_au(0x41, 0x98, base + 6),
+            pic_au(0x01, 0x9C, base + 4),
+            pic_au(0x01, 0x9C, base + 5),
+        ]
+    }
+
+    /// Emitted frames' display frame numbers.
+    fn frame_nos(frames: &[Frame]) -> Vec<i64> {
+        frames
+            .iter()
+            .map(|f| (f.pts_ns * 24 + 500_000_000) / 1_000_000_000)
+            .collect()
+    }
+
+    #[test]
+    fn an_open_gop_at_the_stream_start_drops_its_leading_b_pictures() {
+        let mut p = H264Parser::new();
+        let f: Vec<Frame> = open_gop(0).iter().flat_map(|x| p.parse(x)).collect();
+        assert_eq!(
+            frame_nos(&f),
+            [3, 6, 4, 5],
+            "B1/B2 reference a picture the output does not hold"
+        );
+    }
+
+    #[test]
+    fn a_join_onto_an_open_gop_drops_its_leading_b_pictures() {
+        // Clip 1 ends on a complete open GOP; clip 2's PTS restarts far away, so
+        // its leading B1/B2 reference a picture of the clip the playlist skipped.
+        let mut p = H264Parser::new();
+        let mut pes = vec![make_pes(vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00], Some(0))];
+        pes.extend(open_gop(0).into_iter().skip(3));
+        pes.extend(open_gop(10_000));
+        let f: Vec<Frame> = pes.iter().flat_map(|x| p.parse(x)).collect();
+        assert_eq!(
+            frame_nos(&f)[4..],
+            [10_003, 10_006, 10_004, 10_005],
+            "clip 2's leading Bs reference clip 1's tail, not their own source"
+        );
+    }
+
+    #[test]
+    fn pictures_before_the_first_random_access_picture_are_dropped() {
+        let mut p = H264Parser::new();
+        let mut pes = vec![pic_au(0x41, 0x98, 0), pic_au(0x01, 0x9C, 1)];
+        pes.push(make_pes(
+            vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00],
+            Some(2 * 3750),
+        ));
+        let f: Vec<Frame> = pes.iter().flat_map(|x| p.parse(x)).collect();
+        assert!(f[0].keyframe, "the first emitted picture is the IDR");
+    }
+
+    #[test]
+    fn a_gap_resync_onto_an_open_gop_emits_no_leading_b_pictures() {
+        // IDR, then a P that follows lost data (and the B predicted from it), then
+        // an open GOP continuing the same clock: its B1/B2 reference the dropped P.
+        let mut p = H264Parser::new();
+        let mut pes = vec![make_pes(
+            vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00],
+            Some(7 * 3750),
+        )];
+        let mut lost = pic_au(0x41, 0x98, 9);
+        lost.discontinuity = true;
+        pes.push(lost);
+        pes.push(pic_au(0x01, 0x9C, 8));
+        pes.extend(open_gop(10));
+        let mut gate = crate::mux::resync::ResyncGate::new();
+        let f: Vec<Frame> = pes
+            .iter()
+            .flat_map(|x| p.parse(x))
+            .filter(|f| gate.admit(true, f.discontinuity, f.keyframe))
+            .collect();
+        assert_eq!(
+            frame_nos(&f),
+            [7, 13, 16, 14, 15],
+            "B1/B2 reference the P the gate dropped"
+        );
+    }
+
+    #[test]
+    fn a_gap_leaves_its_loss_to_the_gate() {
+        // The P after the gap and the B predicted from it decode from the stream's own
+        // anchors, so the parser passes them: the gate drops and counts them as loss.
+        let mut p = H264Parser::new();
+        let mut lost = pic_au(0x41, 0x98, 9);
+        lost.discontinuity = true;
+        let pes = [
+            make_pes(vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00], Some(7 * 3750)),
+            lost,
+            pic_au(0x01, 0x9C, 8),
+        ];
+        let f: Vec<Frame> = pes.iter().flat_map(|x| p.parse(x)).collect();
+        assert_eq!(frame_nos(&f), [7, 9, 8]);
+        let mut gate = crate::mux::resync::ResyncGate::new();
+        for x in &f {
+            gate.admit(true, x.discontinuity, x.keyframe);
+        }
+        assert_eq!(gate.dropped_total(), 2);
+    }
+
+    #[test]
+    fn a_continuous_open_gop_keeps_its_leading_b_pictures() {
+        // The leading B7/B8 predict from P6, which the output holds.
+        let mut p = H264Parser::new();
+        let mut pes = vec![make_pes(vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00], Some(0))];
+        pes.extend(open_gop(0).into_iter().skip(3));
+        pes.extend(open_gop(6));
+        let f: Vec<Frame> = pes.iter().flat_map(|x| p.parse(x)).collect();
+        assert_eq!(frame_nos(&f), [0, 6, 4, 5, 9, 7, 8, 12, 10, 11]);
+    }
+
+    /// `pic_au` carrying a DTS (`dts` frames) when it differs from its PTS.
+    fn pic_au_dts(hdr: u8, body: u8, frame: i64, dts: i64) -> PesPacket {
+        let mut p = pic_au(hdr, body, frame);
+        p.dts = (dts != frame).then_some(dts * 3750);
+        p
+    }
+
+    // Decode order IDR P B B, then an open GOP I B B P whose I decodes `skip` frames late.
+    fn decode_clock_run(skip: i64) -> Vec<i64> {
+        let s = skip;
+        let pes = [
+            pic_au_dts(0x65, 0x88, 1, 0),
+            pic_au_dts(0x41, 0x98, 4, 1),
+            pic_au_dts(0x01, 0x9C, 2, 2),
+            pic_au_dts(0x01, 0x9C, 3, 3),
+            pic_au_dts(0x61, 0x88, 7 + s, 4 + s),
+            pic_au_dts(0x01, 0x9C, 5 + s, 5 + s),
+            pic_au_dts(0x01, 0x9C, 6 + s, 6 + s),
+            pic_au_dts(0x41, 0x98, 10 + s, 7 + s),
+        ];
+        let mut p = H264Parser::new();
+        frame_nos(&pes.iter().flat_map(|x| p.parse(x)).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_decode_clock_tells_a_join_of_a_frame_or_two() {
+        assert_eq!(decode_clock_run(0), [1, 4, 2, 3, 7, 5, 6, 10]);
+        // Within the PTS-only window, but the decode clock skipped: another clip.
+        assert_eq!(decode_clock_run(2), [1, 4, 2, 3, 9, 12]);
+    }
+
+    #[test]
+    fn a_closed_gop_title_keeps_every_picture() {
+        let idr =
+            |frame: i64| make_pes(vec![0x00, 0x00, 0x01, 0x65, 0x88, 0x00], Some(frame * 3750));
+        let pes = [
+            idr(0),
+            pic_au(0x41, 0x98, 3),
+            pic_au(0x01, 0x9C, 1),
+            pic_au(0x01, 0x9C, 2),
+            idr(4),
+            pic_au(0x41, 0x98, 7),
+            pic_au(0x01, 0x9C, 5),
+            pic_au(0x01, 0x9C, 6),
+        ];
+        let mut p = H264Parser::new();
+        let f: Vec<Frame> = pes.iter().flat_map(|x| p.parse(x)).collect();
+        assert_eq!(frame_nos(&f), [0, 3, 1, 2, 4, 7, 5, 6]);
+    }
+
     // The escaped slice header must be unescaped at the parse call site: a second slice with
     // first_mb_in_slice=65535 (00 00 03 escape) is intra only when read unescaped.
     #[test]
@@ -945,7 +1182,7 @@ mod tests {
         // Same NAL type 1, but slice_type = 0 (P): ue "1", so with first_mb = 0
         // the byte is "1" + "1" padded = 0b1100_0000 = 0xC0.
         let au = vec![0x00, 0x00, 0x01, 0x61, 0xC0, 0x00];
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let frames = parser.parse(&make_pes(au, Some(0)));
         assert_eq!(frames.len(), 1);
         assert_eq!(
@@ -971,7 +1208,7 @@ mod tests {
             0x00, 0x00, 0x01, 0x61, 0x58, // P slice, first_mb 1 (same picture)
             0x00,
         ];
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let frames = parser.parse(&make_pes(au, Some(0)));
         assert_eq!(frames.len(), 1, "one PES access unit → one frame");
         assert_eq!(
@@ -1363,7 +1600,7 @@ mod tests {
         // 0x88='1 0001000'->I (7); 0x98='1 00110..'->P (5); 0x9C='1 00111..'->B (6).
         let src = crate::pes::SourcePos::at_byte(8192);
         let parse = |nal_type: u8, body: u8| {
-            let mut p = H264Parser::new();
+            let mut p = primed();
             let mut pe = make_pes(h264_nal(nal_type, &[body]), Some(0));
             pe.source = Some(src);
             p.parse(&pe)
@@ -1573,7 +1810,7 @@ mod tests {
 
     #[test]
     fn parse_non_idr() {
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
 
         // PES with non-IDR slice (type 1 = 0x61 or 0x41)
         let mut data = Vec::new();
@@ -1592,7 +1829,7 @@ mod tests {
 
     #[test]
     fn length_prefix_conversion() {
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
 
         // PES with a single non-IDR NAL
         let nal_payload = [0x41, 0xAA, 0xBB, 0xCC, 0xDD]; // type 1, 5 bytes
@@ -1683,7 +1920,7 @@ mod tests {
 
     #[test]
     fn pts_conversion() {
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
 
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -1711,7 +1948,7 @@ mod tests {
 
     #[test]
     fn pts_preferred_over_dts() {
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
 
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -1952,7 +2189,7 @@ mod tests {
         // One real NAL at the end so the iterator yields something.
         data.extend_from_slice(&[0x41, 0xAA, 0xBB]);
 
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let frames = parser.parse(&make_pes(data, Some(0)));
         // Exactly one populated frame; the empty NALs are skipped without
         // overflowing.
@@ -2068,7 +2305,7 @@ mod tests {
     fn four_byte_start_code_parsed() {
         // A 4-byte start code (00 00 00 01) must be skipped correctly so the NAL
         // body begins at the right offset (skip_start_code returns pos+4).
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let data = vec![0x00, 0x00, 0x00, 0x01, 0x41, 0xAA, 0xBB];
         let f = parser.parse(&make_pes(data, Some(0)));
         assert_eq!(f.len(), 1);
@@ -2083,7 +2320,7 @@ mod tests {
         // The byte(s) before a following 4-byte start code (00 00 00 01) are
         // leading zeros of that start code, not RBSP, and must be stripped from
         // the current NAL — NAL 1 must not absorb the extra 00.
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let mut data = vec![0x00, 0x00, 0x01, 0x41, 0xAA]; // NAL1 = 0x41 0xAA
         data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x41, 0xBB]); // 4-byte SC
         let f = parser.parse(&make_pes(data, Some(0)));
@@ -2098,7 +2335,7 @@ mod tests {
     #[test]
     fn aud_dropped_but_following_slice_kept() {
         // AUD (type 9) is dropped from frame data; a following slice survives.
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let mut data = vec![0x00, 0x00, 0x01, 0x09, 0xF0]; // AUD
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0x41, 0xAA, 0xBB]); // slice
         let f = parser.parse(&make_pes(data, Some(0)));
@@ -2126,7 +2363,7 @@ mod tests {
     #[test]
     fn dts_fallback_when_pts_absent() {
         // PTS absent → DTS is used (or().map). pts.or(dts) per the comment.
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let pes = PesPacket {
             source: None,
             pid: 0x1011,
@@ -2142,7 +2379,7 @@ mod tests {
 
     #[test]
     fn no_pts_no_dts_defaults_zero() {
-        let mut parser = H264Parser::new();
+        let mut parser = primed();
         let pes = PesPacket {
             source: None,
             pid: 0x1011,

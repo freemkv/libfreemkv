@@ -3,7 +3,7 @@
 //! A BD/UHD title's clips are read as one concatenated sector stream, so the source PES PTS
 //! does not run continuously across a clip join. [`SeamPlan`] places frames exactly from the
 //! playlist's marks when present; [`TimelineContinuity::adjust`] infers seams from PTS jumps
-//! otherwise, and [`TimelineContinuity::map`] picks between them so every muxer/sink shares one
+//! otherwise, and [`TimelineContinuity::map_picture`] picks between them so every muxer/sink shares one
 //! correction path.
 
 // A backward PTS step larger than this is a clip-boundary discontinuity (source PES PTS reset),
@@ -47,8 +47,8 @@ pub(crate) struct SeamPlan {
     // be trusted to identify a clip. If not, provenance is disabled.
     spans_trusted: bool,
     clips: Vec<SeamClip>,
-    // Frames dropped (per track) for falling outside every clip's marks. Counted so an
-    // unexpected volume is visible instead of silent.
+    // Frames dropped (per track) for falling outside every clip's marks, or for predicting
+    // from a picture that did. Counted so an unexpected volume is visible instead of silent.
     dropped: Vec<u64>,
     // Per-track position: (clip index, last raw PTS seen). Each track crosses a join on its OWN
     // frame, since overlap tails arrive after the next clip's video.
@@ -68,6 +68,48 @@ struct TrackPos {
     /// silently losing content or rewinding, so the invariant is now checked
     /// directly rather than inferred from which rule happened to fire.
     last_out_ns: Option<i64>,
+    /// What this video track's trims took from the pictures after them.
+    refs: TrimRefs,
+}
+
+/// A video picture as the seam plan sees it: enough to keep its trims decodable.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SeamPic {
+    pub(crate) keyframe: bool,
+    pub(crate) coding: Option<crate::mux::codec::PictureInfo>,
+}
+
+/// Whether a video track's kept pictures still have their references after a trim. A mark
+/// need not sit on a random-access picture: a player decodes from it and shows from the
+/// mark, but this output can only drop, so a picture predicting from a trimmed one goes too.
+#[derive(Debug, Clone, Copy, Default)]
+struct TrimRefs {
+    /// A picture later ones may reference was not kept: drop up to the next keyframe.
+    broken: bool,
+    /// The keyframe that ended a broken run (PTS): its leading pictures predict from before it.
+    resumed_at: Option<i64>,
+    /// The last keyframe's PTS: a picture displayed before it is leading, and no trailing
+    /// picture predicts from a leading one.
+    key_ns: Option<i64>,
+}
+
+impl TrimRefs {
+    // Decide a picture (decode order) the marks `placed`; true keeps it.
+    fn admit(&mut self, raw_ns: i64, placed: bool, pic: SeamPic) -> bool {
+        if pic.keyframe {
+            self.resumed_at = self.broken.then_some(raw_ns);
+            self.broken = false;
+            self.key_ns = Some(raw_ns);
+        }
+        let leading = !pic.keyframe && self.key_ns.is_some_and(|k| raw_ns < k);
+        let keep = placed && !self.broken && !(leading && self.resumed_at.is_some());
+        // Unknown coding may be a reference; an MPEG-2 B-picture never is.
+        let referenced = pic.coding.is_none_or(|c| c.may_be_referenced());
+        if !keep && !leading && referenced {
+            self.broken = true;
+        }
+        keep
+    }
 }
 
 impl SeamPlan {
@@ -224,6 +266,27 @@ impl SeamPlan {
         first
     }
 
+    /// [`Self::place`] a video picture, also dropping one that predicts from a picture
+    /// the marks dropped (see [`TrimRefs`]).
+    fn place_picture(
+        &mut self,
+        raw_ns: i64,
+        track: usize,
+        has_reorder: bool,
+        src_byte: Option<u64>,
+        pic: SeamPic,
+    ) -> Option<i64> {
+        let placed = self.place(raw_ns, track, has_reorder, src_byte);
+        let keep = self.cursors[track]
+            .refs
+            .admit(raw_ns, placed.is_some(), pic);
+        if placed.is_some() && !keep {
+            self.dropped[track] = self.dropped[track].saturating_add(1);
+            return None;
+        }
+        placed
+    }
+
     /// Place a raw PTS for `track`, advancing that track's own clip cursor.
     /// `None` means DROP: the frame lies outside every clip's marks, so the
     /// playlist does not include it.
@@ -241,6 +304,7 @@ impl SeamPlan {
                     clip: 0,
                     last_raw_ns: None,
                     last_out_ns: None,
+                    refs: TrimRefs::default(),
                 },
             );
             self.dropped.resize(track + 1, 0);
@@ -269,6 +333,7 @@ impl SeamPlan {
                 } else {
                     self.cursors[track].last_out_ns
                 },
+                refs: self.cursors[track].refs,
             };
             if !placed {
                 // Outside its own clip's marks: material the playlist excludes
@@ -372,6 +437,7 @@ impl SeamPlan {
             } else {
                 self.cursors[track].last_out_ns
             },
+            refs: self.cursors[track].refs,
         };
         if !placed {
             self.dropped[track] = self.dropped[track].saturating_add(1);
@@ -495,7 +561,8 @@ impl TimelineContinuity {
     }
 
     // Map a raw PES PTS onto the output timeline, or `None` to drop the frame (only ever
-    // happens under a SeamPlan).
+    // happens under a SeamPlan). Sinks call `map_picture`.
+    #[cfg(test)]
     pub(crate) fn map(
         &mut self,
         raw_pts_ns: i64,
@@ -507,11 +574,28 @@ impl TimelineContinuity {
         // directly; without it the mark heuristics are used instead.
         src_byte: Option<u64>,
     ) -> Option<i64> {
+        self.map_picture(raw_pts_ns, drives_epoch, track, has_reorder, src_byte, None)
+    }
+
+    // `map`, and for a video picture (`pic`) a seam plan also drops it when it predicts
+    // from a picture the marks dropped.
+    pub(crate) fn map_picture(
+        &mut self,
+        raw_pts_ns: i64,
+        drives_epoch: bool,
+        track: usize,
+        has_reorder: bool,
+        src_byte: Option<u64>,
+        pic: Option<SeamPic>,
+    ) -> Option<i64> {
         if self.seams.is_some() {
             // Take the plan out for the call so `place` can borrow `self`
             // mutably without fighting the borrow checker over the whole struct.
             let mut plan = self.seams.take().expect("checked is_some");
-            let placed = plan.place(raw_pts_ns, track, has_reorder, src_byte);
+            let placed = match pic {
+                Some(pic) => plan.place_picture(raw_pts_ns, track, has_reorder, src_byte, pic),
+                None => plan.place(raw_pts_ns, track, has_reorder, src_byte),
+            };
             self.seams = Some(plan);
             if let Some(p) = placed {
                 // Keep the frontier meaningful for anything that reads it, and
@@ -642,6 +726,7 @@ impl TimelineContinuity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mux::codec::coding::CodingType;
 
     const S: i64 = 1_000_000_000; // 1 second in ns
 
@@ -953,6 +1038,126 @@ mod tests {
             0,
             "nothing from a legitimately referenced half may be dropped"
         );
+    }
+
+    /// A coded-type-only picture: the keyframe I, else a P.
+    fn pic(keyframe: bool) -> SeamPic {
+        use crate::mux::codec::PictureInfo;
+        let ct = if keyframe {
+            CodingType::I
+        } else {
+            CodingType::P
+        };
+        SeamPic {
+            keyframe,
+            coding: Some(PictureInfo::coding_type_only(ct)),
+        }
+    }
+
+    // A PlayItem's IN mark need not sit on a GOP's I-picture: a player decodes from the
+    // preceding entry point and suppresses display until IN. The plan trims by each frame's
+    // own PTS, so a picture predicted from the I it trimmed before IN must go too.
+    #[test]
+    fn the_in_mark_never_keeps_a_picture_whose_reference_it_dropped() {
+        const F: i64 = 41_708_333; // one 23.976 fps frame (ns)
+        let clips = vec![crate::disc::Clip {
+            feed_span: Some((0, 1_000_000)),
+            clip_id: "00001".into(),
+            in_time: 45_000, // IN = 1 s, mid-GOP
+            out_time: 450_000,
+            duration_secs: 9.0,
+            source_packets: 0,
+        }];
+        let mut plan = SeamPlan::from_clips(&clips).expect("one clip");
+        // Decode order: I (display 0.958 s, before IN), then P predicted from it
+        // (display 1.083 s, after IN).
+        let i_kept = plan
+            .place_picture(S - F, 0, true, Some(0), pic(true))
+            .is_some();
+        let p_kept = plan
+            .place_picture(S + 2 * F, 0, true, Some(100), pic(false))
+            .is_some();
+        assert!(
+            i_kept || !p_kept,
+            "the P is kept but its reference I was dropped (i_kept={i_kept}, p_kept={p_kept})"
+        );
+    }
+
+    /// One clip, IN = 1 s, OUT = 10 s, and a placer of `(display ns, keyframe, coding type)`
+    /// pictures in decode order returning which were kept.
+    fn place_run(pics: &[(i64, bool, CodingType)]) -> (Vec<bool>, u64) {
+        let clips = vec![crate::disc::Clip {
+            feed_span: Some((0, 1_000_000)),
+            clip_id: "00001".into(),
+            in_time: 45_000,
+            out_time: 450_000,
+            duration_secs: 9.0,
+            source_packets: 0,
+        }];
+        let mut plan = SeamPlan::from_clips(&clips).expect("one clip");
+        let kept = pics
+            .iter()
+            .enumerate()
+            .map(|(i, &(ns, keyframe, ct))| {
+                let p = SeamPic {
+                    keyframe,
+                    coding: Some(crate::mux::codec::PictureInfo::coding_type_only(ct)),
+                };
+                plan.place_picture(ns, 0, true, Some(i as u64), p).is_some()
+            })
+            .collect();
+        (kept, plan.dropped_for(0))
+    }
+
+    const F: i64 = 41_708_333; // one 23.976 fps frame (ns)
+
+    // The OUT mark trims an anchor displayed after it, which B-pictures displayed before it
+    // were decoded after and predict from.
+    #[test]
+    fn the_out_mark_never_keeps_a_picture_whose_reference_it_dropped() {
+        use CodingType::*;
+        let out = 10 * S;
+        let (kept, dropped) = place_run(&[
+            (out - 3 * F, true, I),
+            (out + F, false, P),
+            (out - 2 * F, false, B),
+            (out - F, false, B),
+        ]);
+        assert_eq!(kept, [true, false, false, false]);
+        assert_eq!(dropped, 3);
+    }
+
+    // The common opening: IN on the I-picture, its leading B-pictures before IN. Nothing
+    // after the I predicts from them.
+    #[test]
+    fn leading_pictures_trimmed_before_the_in_mark_keep_the_rest_of_the_gop() {
+        use CodingType::*;
+        let (kept, dropped) = place_run(&[
+            (S, true, I),
+            (S - 2 * F, false, B),
+            (S - F, false, B),
+            (S + 3 * F, false, P),
+            (S + F, false, B),
+            (S + 2 * F, false, B),
+        ]);
+        assert_eq!(kept, [true, false, false, true, true, true]);
+        assert_eq!(dropped, 2);
+    }
+
+    // After a trimmed I the track resumes at the next keyframe, without that keyframe's
+    // leading pictures (they predict from the dropped P), and with its trailing ones.
+    #[test]
+    fn a_mid_gop_in_mark_resumes_at_the_next_keyframe_without_its_leading_pictures() {
+        use CodingType::*;
+        let (kept, _) = place_run(&[
+            (S - F, true, I),
+            (S + 2 * F, false, P),
+            (S + 5 * F, true, I),
+            (S + 3 * F, false, B),
+            (S + 8 * F, false, P),
+            (S + 6 * F, false, B),
+        ]);
+        assert_eq!(kept, [false, false, true, false, true, true]);
     }
 
     #[test]

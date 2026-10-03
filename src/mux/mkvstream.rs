@@ -583,8 +583,8 @@ fn emit_to_muxer(
         additional,
         // Provenance: which clip this frame came from is a lookup, not a guess.
         frame.source.map(|s| s.byte),
-        // This picture's measured scan type, tallied for the FlagInterlaced majority.
-        frame.coding.as_ref().and_then(|c| c.field_order()),
+        // This picture's measured coding: its scan type and what the seam plan may trim.
+        frame.coding,
         frame.discard_padding_ns,
     )
 }
@@ -821,7 +821,7 @@ impl MkvStream {
                 f.duration_ns,
                 additional.as_deref(),
                 f.source.map(|s| s.byte),
-                f.coding.as_ref().and_then(|c| c.field_order()),
+                f.coding,
                 f.discard_padding_ns,
             );
             // A track-range reject writes nothing and is not fatal (see
@@ -3116,6 +3116,24 @@ mod tests {
         assert_eq!(emitted, 8, "the {n} bases beyond the window flush unpaired");
         assert_eq!(m.pending_base.len(), MVC_PAIR_WINDOW, "window still held");
         assert!(m.flush().iter().all(|(_, add)| add.is_none()));
+    }
+
+    // The base parser drops a leading picture it cannot decode; the dependent access unit
+    // of that PTS pairs with no base and is never written.
+    #[test]
+    fn mvc_merge_drops_the_dependent_of_a_dropped_base() {
+        let mut m = empty_merge();
+        assert!(
+            m.ingest(&mvc_frame(2, 1, false, lp(&[&DEP_SLICE])))
+                .is_empty()
+        );
+        let dep = lp(&[&DEP_SLICE, &DEP_PPS]);
+        assert!(m.ingest(&mvc_frame(2, 3, false, dep.clone())).is_empty());
+        let e = m.ingest(&mvc_frame(0, 3, true, vec![0x65, 1]));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].1.as_deref(), Some(dep.as_slice()));
+        assert!(m.flush().is_empty());
+        assert_eq!(m.orphan_deps, 1);
     }
 
     #[test]

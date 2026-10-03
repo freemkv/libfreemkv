@@ -55,7 +55,7 @@ pub(crate) struct PlayItem {
     pub in_time: u32,
     /// Out-time in 45kHz ticks
     pub out_time: u32,
-    /// Connection condition (1=seamless, 5/6=non-seamless). Parsed for
+    /// Connection condition (1=non-seamless, 5/6=seamless). Parsed for
     /// completeness; no production reader yet.
     #[allow(dead_code)]
     pub connection_condition: u8,

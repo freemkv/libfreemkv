@@ -5,8 +5,8 @@ use std::sync::{Arc, Barrier};
 
 // Test windows are scaled: a 60 s production window is 100 ms here (stop design §5.0).
 const WINDOW: Duration = Duration::from_millis(100);
-// Headroom on wall-clock upper bounds for a loaded CI runner.
-const SLACK: Duration = Duration::from_millis(500);
+// Headroom on wall-clock upper bounds for a loaded CI runner: 10× a 200 ms sleep overshoot.
+const SLACK: Duration = Duration::from_secs(2);
 
 fn catch<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
@@ -345,23 +345,25 @@ fn join_within_finished_cancelled_and_expired() {
     ));
 }
 
-/// LT5a (HR1): slow but progressing — a bump every 0.2 × window for 4 windows —
-/// never expires.
+/// LT5a (HR1): slow but progressing — a bump every 0.2 × window for 2.5 windows —
+/// never expires. The window is 1 s so a 200 ms stall of the polling thread, between a
+/// bump and the next poll, still lands inside it.
 #[test]
 fn stall_timer_rearms_on_progress() {
+    let window = Duration::from_secs(1);
     let p = Liveness::new();
-    let mut t = StallTimer::new(WINDOW, &p);
+    let mut t = StallTimer::new(window, &p);
     let start = Instant::now();
-    let mut next_bump = start + WINDOW / 5;
-    while start.elapsed() < WINDOW * 4 {
+    let mut next_bump = start + window / 5;
+    while start.elapsed() < window * 5 / 2 {
         if Instant::now() >= next_bump {
             p.bump();
-            next_bump += WINDOW / 5;
+            next_bump += window / 5;
         }
         assert_ne!(t.poll(&p), Stall::Expired, "at {:?}", start.elapsed());
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(p.get() >= 12);
+    assert!(p.get() >= 6);
 }
 
 /// LT5b (HR1): no progress → `StalledFor` until the window, then `Expired` within

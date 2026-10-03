@@ -102,6 +102,30 @@ pub struct Mpeg2Parser {
     /// Top-parity of an unpaired first field picture; the next opposite-parity
     /// field is its second field and inherits the pair's (first field's) order.
     pending_first_field: Option<bool>,
+    /// Anchor frames (I/P) a decoder holds from this stream's emitted pictures,
+    /// saturating at 2. Zero at the stream start, at a join (the timeline origin
+    /// moves) and at a `broken_link` GOP; a picture needing more is dropped.
+    refs: u8,
+    /// `closed_gop` of the GOP being decided.
+    gop_closed: bool,
+    /// `temporal_reference` of the current GOP's first anchor; a B before it in
+    /// display order is a leading picture.
+    gop_anchor_tr: Option<u64>,
+    /// Whether the last first-field or frame picture was kept; its second field follows it.
+    last_kept: bool,
+    /// A dropped picture's discontinuity flag, carried to the next emitted frame.
+    carry_discontinuity: bool,
+    /// A discontinuity was seen; `refs` resets at the I-picture the `ResyncGate` resumes on.
+    gap: bool,
+}
+
+/// GOP header flags (ISO/IEC 13818-2 §6.3.8).
+#[derive(Clone, Copy)]
+struct GopFlags {
+    /// The GOP's leading B-pictures use backward prediction only.
+    closed: bool,
+    /// The anchor before this GOP is not the one its leading B-pictures were coded against.
+    broken_link: bool,
 }
 
 /// One coded picture buffered awaiting its GOP's completion (see `gop_buf`).
@@ -114,6 +138,10 @@ struct BufferedPicture {
     info: PictureInfo,
     /// This picture's own PES PTS (ns), if its access unit carried one.
     explicit_pts: Option<i64>,
+    /// Flags of the GOP this picture's access unit opens, if it opens one.
+    gop: Option<GopFlags>,
+    /// The second field of a field pair; decodable exactly when its first field is.
+    second_field: bool,
     /// The emitted frame (PTS + duration filled in at GOP flush).
     frame: Frame,
 }
@@ -137,6 +165,12 @@ impl Mpeg2Parser {
             emitted_fields: 0,
             origin_pts_ns: None,
             pending_first_field: None,
+            refs: 0,
+            gop_closed: false,
+            gop_anchor_tr: None,
+            last_kept: false,
+            carry_discontinuity: false,
+            gap: false,
         }
     }
 
@@ -183,8 +217,20 @@ impl Mpeg2Parser {
         }
         // A GOP header (0xB8) or a fresh sequence header (0xB3) starts a new GOP,
         // resetting temporal_reference to 0.
-        let gop_boundary = find_code(&data, 0, GOP_CODE).is_some()
-            || find_code(&data, 0, SEQ_HEADER_CODE).is_some();
+        let gop_header = find_code(&data, 0, GOP_CODE);
+        let gop_boundary = gop_header.is_some() || find_code(&data, 0, SEQ_HEADER_CODE).is_some();
+        // closed_gop and broken_link: bits 6 and 5 of the GOP header's fourth byte.
+        // A sequence header with no GOP header starts a GOP read as open.
+        let gop = gop_boundary.then(|| {
+            let b = gop_header
+                .and_then(|g| data.get(g + 7))
+                .copied()
+                .unwrap_or(0);
+            GopFlags {
+                closed: b & 0x40 != 0,
+                broken_link: b & 0x20 != 0,
+            }
+        });
         // picture_coding_type: the full 3-bit value (bits 5-3 of data[pic+5]).
         // 0 when the picture header is truncated (no coding type available).
         let raw_coding_type = if pic + 5 < end {
@@ -207,6 +253,7 @@ impl Mpeg2Parser {
         if gop_boundary {
             self.pending_first_field = None;
         }
+        let mut second_field = false;
         if frame_picture {
             self.pending_first_field = None;
         } else if let Some(first_top) = self.pending_first_field.take()
@@ -214,6 +261,7 @@ impl Mpeg2Parser {
         {
             // Second field of a pair: report the first field's order.
             tff = first_top;
+            second_field = true;
         } else {
             self.pending_first_field = Some(tff);
         }
@@ -240,6 +288,8 @@ impl Mpeg2Parser {
             tr,
             info,
             explicit_pts: au.pts,
+            gop,
+            second_field,
             frame: Frame {
                 pts_ns: 0,
                 keyframe,
@@ -273,10 +323,11 @@ impl Mpeg2Parser {
         if field_period <= 0 {
             // No sequence header / frame rate yet (malformed lead-in): emit in
             // decode order off each AU's own PES PTS, with no field timing.
-            for bp in self.gop_buf.drain(..) {
+            let keep = self.decodable(false);
+            for (bp, keep) in std::mem::take(&mut self.gop_buf).into_iter().zip(keep) {
                 let mut f = bp.frame;
                 f.pts_ns = bp.explicit_pts.unwrap_or(0);
-                out.push(f);
+                self.emit(f, keep, out);
             }
             return;
         }
@@ -292,20 +343,86 @@ impl Mpeg2Parser {
         }
         let gop_fields = running;
         let base = self.emitted_fields;
-        // (Re-)lock the timeline origin to the GOP's PES PTS.
+        // (Re-)lock the timeline origin to the GOP's PES PTS. An origin that moves
+        // by more than half a field is a join: no earlier picture is a reference.
+        let mut joined = false;
         for &i in &order {
             if let Some(p) = self.gop_buf[i].explicit_pts {
-                self.origin_pts_ns = Some(p - field_period * (base + cum_before[i]) as i64);
+                let origin = p - field_period * (base + cum_before[i]) as i64;
+                joined = self
+                    .origin_pts_ns
+                    .is_some_and(|prev| (origin - prev).abs() > field_period / 2);
+                self.origin_pts_ns = Some(origin);
                 break;
             }
         }
         let origin = self.origin_pts_ns.unwrap_or(0);
-        for (i, mut bp) in self.gop_buf.drain(..).enumerate() {
+        let keep = self.decodable(joined);
+        let gop = std::mem::take(&mut self.gop_buf);
+        for ((i, mut bp), keep) in gop.into_iter().enumerate().zip(keep) {
             bp.frame.pts_ns = origin + field_period * (base + cum_before[i]) as i64;
             bp.frame.duration_ns = Some(bp.info.nb_fields() as u64 * field_period as u64);
-            out.push(bp.frame);
+            self.emit(bp.frame, keep, out);
         }
+        // Dropped pictures keep their display slots, so every kept frame keeps its PTS.
         self.emitted_fields += gop_fields;
+    }
+
+    // Decide, in decode order, which buffered pictures decode from references this
+    // stream emitted: an I always; a P after an anchor; a B with both anchors, or
+    // with one when it is not a leading picture or its GOP is closed.
+    fn decodable(&mut self, joined: bool) -> Vec<bool> {
+        if joined {
+            self.refs = 0;
+        }
+        let mut keep = Vec::with_capacity(self.gop_buf.len());
+        for bp in &self.gop_buf {
+            if let Some(g) = bp.gop {
+                self.gop_closed = g.closed;
+                self.gop_anchor_tr = None;
+                if g.broken_link {
+                    self.refs = 0;
+                }
+            }
+            // After a gap the gate drops (and counts) up to the next I, which holds none before it.
+            self.gap |= bp.frame.discontinuity;
+            if self.gap && bp.frame.keyframe {
+                self.gap = false;
+                self.refs = 0;
+            }
+            if bp.second_field {
+                keep.push(self.last_kept);
+                continue;
+            }
+            let ok = match bp.info.coding_type() {
+                CodingType::I => true,
+                CodingType::P => self.refs >= 1,
+                CodingType::B => {
+                    let leading =
+                        !self.gop_closed && self.gop_anchor_tr.is_none_or(|anchor| bp.tr < anchor);
+                    self.refs >= if leading { 2 } else { 1 }
+                }
+            };
+            if bp.info.coding_type() != CodingType::B {
+                self.gop_anchor_tr.get_or_insert(bp.tr);
+                if ok {
+                    self.refs = (self.refs + 1).min(2);
+                }
+            }
+            self.last_kept = ok;
+            keep.push(ok);
+        }
+        keep
+    }
+
+    // Emit a kept frame; a dropped one passes its discontinuity flag on.
+    fn emit(&mut self, mut frame: Frame, keep: bool, out: &mut Vec<Frame>) {
+        if keep {
+            frame.discontinuity |= std::mem::take(&mut self.carry_discontinuity);
+            out.push(frame);
+        } else {
+            self.carry_discontinuity |= frame.discontinuity;
+        }
     }
 }
 
@@ -795,6 +912,231 @@ mod tests {
         frames
     }
 
+    /// Parse an opening I-picture, then `pes`; returns only `pes`'s frames. A
+    /// stream emits nothing before its first I-picture.
+    fn parse_after_i(parser: &mut Mpeg2Parser, pes: &PesPacket) -> Vec<Frame> {
+        let mut i = make_picture_header(PICTURE_TYPE_I);
+        i.extend_from_slice(&[0xEE; 8]);
+        let mut frames = parser.parse(&make_pes(i, None));
+        frames.extend(parse_then_flush(parser, pes));
+        assert!(frames[0].keyframe, "the opening I-picture");
+        frames.split_off(1)
+    }
+
+    // --- Pictures a decoder cannot reconstruct from the stream's own data ---
+
+    /// A GOP header with the given `closed_gop` / `broken_link` flags.
+    fn gop_flags(closed: bool, broken_link: bool) -> Vec<u8> {
+        let b7 = (u8::from(closed) << 6) | (u8::from(broken_link) << 5);
+        vec![0x00, 0x00, 0x01, GOP_CODE, 0x00, 0x00, 0x00, b7]
+    }
+
+    /// One frame picture as its own PES: `prefix` headers, a picture header,
+    /// a payload.
+    fn pic_pes(prefix: Vec<u8>, ct: u8, tr: u16, pts: Option<i64>) -> PesPacket {
+        let mut au = prefix;
+        au.extend_from_slice(&make_picture_header_tr(ct, tr));
+        au.extend_from_slice(&[0xA5; 12]);
+        make_pes(au, pts)
+    }
+
+    /// A 25 fps GOP in decode order `I2 B0 B1 P5 B3 B4`, the I at `pts` (90 kHz).
+    fn gop_ibbp(head: Vec<u8>, pts: Option<i64>) -> Vec<PesPacket> {
+        vec![
+            pic_pes(head, 1, 2, pts),
+            pic_pes(Vec::new(), 3, 0, None),
+            pic_pes(Vec::new(), 3, 1, None),
+            pic_pes(Vec::new(), 2, 5, None),
+            pic_pes(Vec::new(), 3, 3, None),
+            pic_pes(Vec::new(), 3, 4, None),
+        ]
+    }
+
+    fn run(pes: impl IntoIterator<Item = PesPacket>) -> Vec<Frame> {
+        let mut p = Mpeg2Parser::new();
+        let mut frames: Vec<Frame> = pes.into_iter().flat_map(|x| p.parse(&x)).collect();
+        frames.extend(p.flush());
+        frames
+    }
+
+    fn pts_ms(frames: &[Frame]) -> Vec<i64> {
+        frames.iter().map(|f| f.pts_ns / 1_000_000).collect()
+    }
+
+    fn seq_gop(closed: bool, broken_link: bool) -> Vec<u8> {
+        let mut h = make_seq_header(720, 576, 3, 3);
+        h.extend_from_slice(&gop_flags(closed, broken_link));
+        h
+    }
+
+    #[test]
+    fn an_open_gop_at_the_stream_start_drops_its_leading_b_pictures() {
+        // B0 and B1 reference the anchor before this GOP, which the stream does
+        // not hold. The second open GOP's leading Bs reference P5, which it does.
+        let mut pes = gop_ibbp(seq_gop(false, false), Some(90_000));
+        pes.extend(gop_ibbp(gop_flags(false, false), None));
+        let f = run(pes);
+        assert!(f[0].keyframe, "the first emitted picture is the I-picture");
+        assert_eq!(
+            pts_ms(&f),
+            vec![1000, 1120, 1040, 1080, 1240, 1160, 1200, 1360, 1280, 1320],
+            "I2 keeps its PES PTS; every kept frame keeps its display slot"
+        );
+        assert_eq!(f[0].duration_ns, Some(40_000_000));
+    }
+
+    #[test]
+    fn a_closed_gop_at_the_stream_start_keeps_every_picture() {
+        let f = run(gop_ibbp(seq_gop(true, false), Some(90_000)));
+        assert_eq!(pts_ms(&f), vec![1000, 920, 960, 1120, 1040, 1080]);
+    }
+
+    #[test]
+    fn pictures_before_the_first_i_picture_are_dropped() {
+        let pes = vec![
+            pic_pes(make_seq_header(720, 576, 3, 3), 2, 1, Some(90_000)),
+            pic_pes(Vec::new(), 3, 0, None),
+        ];
+        let mut all = pes;
+        all.extend(gop_ibbp(gop_flags(true, false), None));
+        let f = run(all);
+        assert_eq!(f.len(), 6, "only the closed GOP is emitted");
+        assert!(f[0].keyframe);
+        assert_eq!(
+            f[0].pts_ns, 1_120_000_000,
+            "the I keeps its slot after the dropped two"
+        );
+    }
+
+    #[test]
+    fn a_broken_link_drops_the_leading_b_pictures_mid_stream() {
+        let mut pes = gop_ibbp(seq_gop(true, false), Some(90_000));
+        pes.extend(gop_ibbp(gop_flags(false, true), None));
+        let f = run(pes);
+        assert_eq!(f.len(), 10);
+        assert_eq!(pts_ms(&f)[6..], [1240, 1360, 1280, 1320]);
+    }
+
+    #[test]
+    fn a_join_drops_the_leading_b_pictures_of_an_open_gop() {
+        // The second GOP's PTS does not continue the first: a different clip, so
+        // its leading Bs' forward reference is not the stream's last anchor.
+        let mut pes = gop_ibbp(seq_gop(true, false), Some(90_000));
+        pes.extend(gop_ibbp(gop_flags(false, false), Some(10 * 90_000)));
+        let f = run(pes);
+        assert_eq!(pts_ms(&f)[6..], [10_000, 10_120, 10_040, 10_080]);
+    }
+
+    #[test]
+    fn pes_opened_mid_picture_is_not_a_join() {
+        // A muxer packing pictures back to back opens each PES
+        // inside the previous picture, timed for the picture commencing in it. Read as
+        // the previous picture's PTS, the open GOP's origin moved a frame: a false join.
+        let mut pics = vec![
+            pic_pes(seq_gop(true, false), 1, 0, None),
+            pic_pes(Vec::new(), 2, 3, None),
+            pic_pes(Vec::new(), 3, 1, None),
+            pic_pes(Vec::new(), 3, 2, None),
+        ];
+        pics.extend(gop_ibbp(gop_flags(false, false), None));
+        // Display slot of each picture, in decode order.
+        let slots: Vec<i64> = [0, 3, 1, 2, 6, 4, 5, 9, 7, 8]
+            .iter()
+            .map(|&s| 90_000 + s * 3_600)
+            .collect();
+        let starts: Vec<usize> = pics
+            .iter()
+            .scan(0, |at, p| Some(std::mem::replace(at, *at + p.data.len())))
+            .collect();
+        let es: Vec<u8> = pics.into_iter().flat_map(|p| p.data).collect();
+        // PES j opens 5 bytes into picture j - 1, so picture j commences inside it.
+        let mut cuts: Vec<usize> = std::iter::once(0)
+            .chain(starts.iter().map(|s| s + 5))
+            .collect();
+        cuts.push(es.len());
+        let pes = cuts
+            .windows(2)
+            .enumerate()
+            .map(|(j, w)| make_pes(es[w[0]..w[1]].to_vec(), slots.get(j).copied()));
+        let f = run(pes);
+        assert_eq!(
+            pts_ms(&f),
+            slots.iter().map(|s| s / 90).collect::<Vec<_>>(),
+            "every picture kept, each in its display slot"
+        );
+    }
+
+    #[test]
+    fn a_dropped_picture_passes_its_discontinuity_to_the_next_emitted_frame() {
+        let mut pes = gop_ibbp(seq_gop(false, false), Some(90_000));
+        pes[1].discontinuity = true;
+        let f = run(pes);
+        assert_eq!(f.len(), 4);
+        assert!(!f[0].discontinuity, "the I precedes the dropped B");
+        assert!(f[1].discontinuity, "P5 is the next emitted frame");
+    }
+
+    #[test]
+    fn a_field_coded_open_gop_drops_both_fields_of_each_leading_b() {
+        // I/P field pair = one anchor frame, so the leading B field pairs still lack
+        // their forward reference.
+        let field = |head: Vec<u8>, ct: u8, tr: u16, e2: u8, pts: Option<i64>| {
+            let mut au = head;
+            au.extend_from_slice(&make_picture_header_tr(ct, tr));
+            let mut ext = pic_coding_ext(0, 0, 0, false);
+            ext[6] = e2;
+            au.extend_from_slice(&ext);
+            make_pes(au, pts)
+        };
+        let f = run(vec![
+            field(seq_gop(false, false), 1, 1, 0x01, Some(90_000)),
+            field(Vec::new(), 2, 1, 0x02, None),
+            field(Vec::new(), 3, 0, 0x01, None),
+            field(Vec::new(), 3, 0, 0x02, None),
+            field(Vec::new(), 2, 2, 0x01, None),
+            field(Vec::new(), 2, 2, 0x02, None),
+        ]);
+        let types: Vec<_> = f.iter().map(|x| x.coding.unwrap().coding_type()).collect();
+        assert_eq!(
+            types,
+            [CodingType::I, CodingType::P, CodingType::P, CodingType::P]
+        );
+    }
+
+    #[test]
+    fn a_gap_resync_onto_an_open_gop_emits_no_leading_b_pictures() {
+        // GOP 1 (closed) loses data before P5: P5 and the Bs after it reference
+        // the lost picture. GOP 2 is open and PTS-continuous (no join): its leading
+        // B0/B1 reference GOP 1's P5, which the gate dropped.
+        let mut pes = gop_ibbp(seq_gop(true, false), Some(90_000));
+        pes[3].discontinuity = true;
+        pes.extend(gop_ibbp(gop_flags(false, false), None));
+        let mut gate = crate::mux::resync::ResyncGate::new();
+        let out: Vec<Frame> = run(pes)
+            .into_iter()
+            .filter(|f| gate.admit(true, f.discontinuity, f.keyframe))
+            .collect();
+        let types: Vec<_> = out
+            .iter()
+            .map(|f| f.coding.unwrap().coding_type())
+            .collect();
+        // GOP 1: I2 B0 B1 kept; P5 B3 B4 dropped. GOP 2: I2 kept, B0 B1 lack P5
+        // (dropped), P5 B3 B4 decode from GOP 2's own anchors.
+        assert_eq!(
+            types,
+            [
+                CodingType::I,
+                CodingType::B,
+                CodingType::B,
+                CodingType::I,
+                CodingType::P,
+                CodingType::B,
+                CodingType::B,
+            ],
+            "no emitted picture may reference one the gate dropped"
+        );
+    }
+
     // --- Sequence header parsing ---
 
     #[test]
@@ -850,7 +1192,7 @@ mod tests {
         let mut parser = Mpeg2Parser::new();
         let mut data = make_picture_header(2); // P-frame
         data.extend_from_slice(&[0xFF; 16]);
-        let frames = parse_then_flush(&mut parser, &make_pes(data, Some(90000)));
+        let frames = parse_after_i(&mut parser, &make_pes(data, Some(90000)));
         assert_eq!(frames.len(), 1);
         assert!(!frames[0].keyframe, "P-frame should not be keyframe");
     }
@@ -860,7 +1202,7 @@ mod tests {
         let mut parser = Mpeg2Parser::new();
         let mut data = make_picture_header(3); // B-frame
         data.extend_from_slice(&[0xFF; 16]);
-        let frames = parse_then_flush(&mut parser, &make_pes(data, Some(90000)));
+        let frames = parse_after_i(&mut parser, &make_pes(data, Some(90000)));
         assert_eq!(frames.len(), 1);
         assert!(!frames[0].keyframe, "B-frame should not be keyframe");
     }
@@ -1302,7 +1644,7 @@ mod tests {
         let mut data = make_seq_header(720, 480, 3, 4);
         data.extend_from_slice(&make_picture_header(2)); // P-frame
         data.extend_from_slice(&[0xFF; 16]);
-        let frames = parse_then_flush(&mut parser, &make_pes(data, Some(0)));
+        let frames = parse_after_i(&mut parser, &make_pes(data, Some(0)));
         assert_eq!(frames.len(), 1);
         assert!(
             !frames[0].keyframe,
@@ -1588,7 +1930,7 @@ mod tests {
             let mut parser = Mpeg2Parser::new();
             let mut data = make_picture_header(ct);
             data.extend_from_slice(&[0xFF; 8]);
-            let f = parse_then_flush(&mut parser, &make_pes(data, Some(0)));
+            let f = parse_after_i(&mut parser, &make_pes(data, Some(0)));
             assert_eq!(f.len(), 1);
             assert_eq!(f[0].keyframe, is_kf, "picture_coding_type {ct}");
         }

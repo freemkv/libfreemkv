@@ -15,6 +15,8 @@ mod audio_frames;
 /// Codec-agnostic per-picture coding carrier (`PictureInfo` + accessors).
 pub mod coding;
 pub(crate) mod crc;
+/// Which pictures decode from the pictures the output holds (start, join, gap).
+pub(crate) mod decodable;
 pub(crate) mod dropgate;
 /// DTS / DTS-HD elementary-stream parser.
 pub mod dts;
@@ -455,6 +457,7 @@ mod provenance_guard {
     const NON_PARSER_MODULES: &[&str] = &[
         "coding",
         "crc",
+        "decodable",
         "dropgate",
         "mp2_channels",
         "pesbuf",

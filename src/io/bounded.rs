@@ -231,28 +231,35 @@ mod tests {
     fn bounded_syscall_halt_leaks_worker_without_blocking() {
         let halt = Halt::new();
         let h2 = halt.clone();
-        thread::spawn(move || {
+        let canceller = thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
+            let at = Instant::now();
             h2.cancel();
+            at
         });
         let alive = Arc::new(());
         let held = alive.clone();
-        let t = Instant::now();
-        let r = bounded_syscall(Some(&halt), Duration::from_secs(10), move || {
-            thread::sleep(Duration::from_millis(200));
+        let release = Arc::new(AtomicBool::new(false));
+        let rel = release.clone();
+        let r = bounded_syscall(Some(&halt), Duration::from_secs(60), move || {
+            // Blocked until the test releases it: the wait cannot end by the op returning.
+            while !rel.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
             drop(held);
             1u8
         });
+        let returned = Instant::now();
+        let cancelled_at = canceller.join().unwrap();
         assert!(matches!(r, Err(BoundedError::Halted)));
-        assert!(
-            t.elapsed() < Duration::from_millis(500),
-            "{:?}",
-            t.elapsed()
-        );
+        let woke = returned.saturating_duration_since(cancelled_at);
+        assert!(woke < Duration::from_secs(1), "{woke:?}");
+        assert!(Arc::strong_count(&alive) > 1, "the worker is still blocked");
+        release.store(true, Ordering::SeqCst);
         let t = Instant::now();
         while Arc::strong_count(&alive) > 1 {
             assert!(
-                t.elapsed() < Duration::from_secs(2),
+                t.elapsed() < Duration::from_secs(30),
                 "the leaked worker wedged"
             );
             thread::sleep(Duration::from_millis(5));
@@ -274,24 +281,25 @@ mod tests {
     /// progress is waited for; the same call with no progress times out at the window.
     #[test]
     fn stall_bound_rearms_on_progress_and_expires_without() {
-        let w = Duration::from_millis(100);
+        let w = Duration::from_secs(1);
         let p = Liveness::new();
         let mut timer = StallTimer::new(w, &p);
         let bump = p.clone();
         let r = bounded_syscall_stall(None, &p, &mut timer, &mut || bump.bump(), || {
-            thread::sleep(Duration::from_millis(400));
+            thread::sleep(Duration::from_millis(2500));
             3u8
         });
         assert!(matches!(r, Ok(3)));
         let mut timer = StallTimer::new(w, &p);
         let t = Instant::now();
         let r = bounded_syscall_stall(None, &p, &mut timer, &mut || {}, || {
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(10));
             0u8
         });
         assert!(matches!(r, Err(BoundedError::Timeout)));
+        assert!(t.elapsed() >= w, "fired before the window");
         assert!(
-            t.elapsed() < Duration::from_millis(1100),
+            t.elapsed() < w + Duration::from_secs(2),
             "{:?}",
             t.elapsed()
         );

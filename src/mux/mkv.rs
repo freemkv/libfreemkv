@@ -1509,6 +1509,20 @@ impl<W: Write + Seek> MkvMuxer<W> {
         src_byte: Option<u64>,
         scan: Option<super::codec::FieldOrder>,
     ) -> io::Result<()> {
+        use super::codec::{FieldOrder, PictureInfo, coding::CodingType, coding::Mpeg2Coding};
+        // A P frame picture carrying `scan`.
+        let coding = scan.map(|o| {
+            PictureInfo::mpeg2(
+                CodingType::P,
+                Mpeg2Coding {
+                    top_field_first: o == FieldOrder::Tff,
+                    repeat_first_field: false,
+                    progressive_frame: o == FieldOrder::Progressive,
+                    progressive_sequence: false,
+                    frame_picture: true,
+                },
+            )
+        });
         self.write_frame_at_with_padding(
             track_idx,
             pts_ns,
@@ -1517,7 +1531,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             duration_ns,
             block_additional,
             src_byte,
-            scan,
+            coding,
             0,
         )
     }
@@ -1532,9 +1546,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_ns: Option<u64>,
         block_additional: Option<&[u8]>,
         src_byte: Option<u64>,
-        scan: Option<super::codec::FieldOrder>,
+        coding: Option<super::codec::PictureInfo>,
         discard_padding_ns: i64,
     ) -> io::Result<()> {
+        // This picture's measured scan type, tallied for the FlagInterlaced majority.
+        let scan = coding.as_ref().and_then(|c| c.field_order());
         // --log-level 3: capture the first ~100 coded frames per track to the side file
         // BEFORE any timeline mangling, with the parser's own PTS, so an opening-GOP
         // issue is reconstructable offline. No-op/no alloc normally (capture = `None`).
@@ -1563,12 +1579,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Map the raw PES PTS onto the continuous timeline FIRST: source PTS jumps
         // backward at a clip boundary, so rebasing avoids non-monotonic timestamps.
         // `None` = outside clip IN/OUT marks; dropping avoids duplicate content at a join.
-        let Some(pts_ns) = self.continuity.map(
+        let Some(pts_ns) = self.continuity.map_picture(
             pts_ns,
             drives_epoch,
             track_idx,
-            self.track_is_video.get(track_idx).copied().unwrap_or(false),
+            is_video,
             src_byte,
+            is_video.then_some(super::timeline::SeamPic { keyframe, coding }),
         ) else {
             return Ok(());
         };

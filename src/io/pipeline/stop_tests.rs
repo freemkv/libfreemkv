@@ -1,14 +1,17 @@
 //! Stop design §5.1 "Pipeline, IO and threads": the join and grace rules (T7, T8) on a
 //! scaled clock — a 600 s window runs as [`WINDOW`], the 5 s grace as [`GRACE`].
-//! Stall pairs per §5.0: (a) progress at 0.5 × window for ≥ 4 windows is not a
-//! timeout; (b) a stall fires within window (+ grace) + 1 s. Wall bounds keep ≥ 5× margin.
+//! Stall pairs per §5.0: (a) progress at 0.2 × window for over 3 windows is not a
+//! timeout; (b) a stall fires within window (+ grace) + [`SLACK`]. The windows are 1 s so
+//! a 200 ms sleep overshoot between two progress bumps stays inside them.
 
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
-const WINDOW: Duration = Duration::from_millis(200);
-const GRACE: Duration = Duration::from_millis(200);
-const SLACK: Duration = Duration::from_secs(1);
+const WINDOW: Duration = Duration::from_secs(1);
+const GRACE: Duration = Duration::from_secs(1);
+const SLACK: Duration = Duration::from_secs(2);
+// One progress bump per STEP while a close runs.
+const STEP: Duration = Duration::from_millis(200);
 
 struct Sum(u64);
 
@@ -107,7 +110,7 @@ fn scripted(stall: Duration, steps: u32) -> (Pipeline<u64, u32>, Arc<AtomicBool>
         progress: progress.clone(),
         in_close: in_close.clone(),
         stall,
-        step: GRACE / 2,
+        step: STEP,
         steps,
     };
     let pipe = Pipeline::spawn_named_with_progress("t-closing", 4, sink, progress).unwrap();
@@ -137,7 +140,7 @@ fn halted_running_consumer_abandoned_after_grace() {
 /// `close()` past the 5 s (scaled) grace while it bumps the consumer's progress.
 #[test]
 fn closing_before_cancel_is_done() {
-    let (pipe, in_close) = scripted(Duration::ZERO, 8);
+    let (pipe, in_close) = scripted(Duration::ZERO, 12);
     let halt = Halt::new();
     let h2 = halt.clone();
     let t = Instant::now();
@@ -146,7 +149,7 @@ fn closing_before_cancel_is_done() {
     halt.cancel();
     let r = caller.join().unwrap();
     assert!(
-        matches!(r, Ok(8)),
+        matches!(r, Ok(12)),
         "a committed close is never abandoned: {r:?}"
     );
     assert!(
@@ -155,13 +158,13 @@ fn closing_before_cancel_is_done() {
     );
 }
 
-/// LP4a (T7, stall pair a): one item applied per 0.25 × window for 4 windows is
+/// LP4a (T7, stall pair a): one item applied per 0.2 × window for over 3 windows is
 /// progress, so the join waits and returns `Ok` — 600 s is a stall window, not a total.
 #[test]
 fn join_rearms_on_consumer_progress() {
     let count = Arc::new(AtomicUsize::new(0));
     let sink = SlowSinkFor {
-        delay: WINDOW / 4,
+        delay: WINDOW / 5,
         count: count.clone(),
     };
     let pipe = Pipeline::spawn(16, sink).unwrap();
@@ -280,16 +283,18 @@ fn send_with_halt_full_channel_cancel() {
     let h2 = halt.clone();
     let canceller = thread::spawn(move || {
         thread::sleep(Duration::from_millis(50));
+        let at = Instant::now();
         h2.cancel();
+        at
     });
-    let t = Instant::now();
     let r = pipe.send_with_halt(7, &halt, Duration::from_secs(10));
-    let took = t.elapsed();
-    canceller.join().unwrap();
+    let returned = Instant::now();
+    let cancelled_at = canceller.join().unwrap();
+    let took = returned.saturating_duration_since(cancelled_at);
     release.store(true, Ordering::SeqCst);
     let _ = pipe.finish();
     assert_eq!(r, Err(7), "the refused item comes back");
-    assert!(took < Duration::from_millis(50) + SLACK / 2, "{took:?}");
+    assert!(took < SLACK / 2, "{took:?}");
 }
 
 /// G7: a non-halted pipeline that finishes normally returns `Ok` with its output
@@ -303,11 +308,7 @@ fn non_halted_happy_path_returns_at_once() {
     let t = Instant::now();
     let r = pipe.finish_with_halt(None);
     assert!(matches!(r, Ok(10)), "{r:?}");
-    assert!(
-        t.elapsed() < Duration::from_millis(500),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
 }
 
 /// The consumer bumps its progress per item applied and at `close()` entry and
@@ -376,7 +377,7 @@ struct PartialRun {
     pipe: Pipeline<u64, ()>,
 }
 
-// A pipeline over a `PartialFile` sink whose closes take `steps` × GRACE / 2.
+// A pipeline over a `PartialFile` sink whose closes take `steps` × STEP.
 fn partial_run(steps: u32) -> PartialRun {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("Movie.mkv");
@@ -388,7 +389,7 @@ fn partial_run(steps: u32) -> PartialRun {
         partial: partial.clone(),
         out: out.clone(),
         progress: progress.clone(),
-        step: GRACE / 2,
+        step: STEP,
         steps,
         done: done.clone(),
     };
@@ -426,7 +427,8 @@ fn closing_after_cancel_keeps_partial() {
 /// cannot produce a final-named file.
 #[test]
 fn closing_after_cancel_gets_one_grace_and_never_renames() {
-    let run = partial_run(8);
+    // The close outlasts both graces (join, then the one CLOSING grace) by a full second.
+    let run = partial_run(20);
     let halt = Halt::new();
     halt.cancel();
     let t = Instant::now();

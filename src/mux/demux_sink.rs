@@ -901,12 +901,16 @@ impl PesSink for DemuxSink {
         let is_video = self.video_tracks.contains(&frame.track);
         // See `MkvMuxer::write_frame`: `None` is material outside the
         // playlist's clip marks and is dropped rather than emitted.
-        let Some(pts) = self.timeline.map(
+        let Some(pts) = self.timeline.map_picture(
             frame.pts,
             drives,
             frame.track,
             is_video,
             frame.source.map(|s| s.byte),
+            is_video.then_some(crate::mux::timeline::SeamPic {
+                keyframe: frame.keyframe,
+                coding: frame.coding,
+            }),
         ) else {
             return Ok(());
         };

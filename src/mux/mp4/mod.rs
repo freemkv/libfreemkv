@@ -490,12 +490,16 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
         }
         // Onto the continuous timeline first; `None` is material outside the clip marks.
         let is_video = self.tracks[slot].media == Media::Video;
-        let Some(pts_ns) = self.timeline.map(
+        let Some(pts_ns) = self.timeline.map_picture(
             frame.pts,
             Some(frame.track) == self.ref_video,
             frame.track,
             is_video,
             frame.source.map(|s| s.byte),
+            is_video.then_some(crate::mux::timeline::SeamPic {
+                keyframe: frame.keyframe,
+                coding: frame.coding,
+            }),
         ) else {
             return Ok(());
         };

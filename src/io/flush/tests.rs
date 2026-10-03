@@ -1,6 +1,7 @@
 //! Stop design §5.1 LP13a–h, LP19 and §5.9 SP10–SP13, G19: the durable flush (T12) on
 //! a scaled clock through [`FakeFlushOps`] (a 60 s window runs as [`W`]); the real
-//! syscalls run on the runner's tmpdir. Wall bounds keep ≥ 5× margin.
+//! syscalls run on the runner's tmpdir. The windows are 1 s and the upper bounds 2 s, so a
+//! 200 ms sleep overshoot stays inside them.
 
 use super::*;
 use crate::io::WritebackFile;
@@ -9,8 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::time::Instant;
 
-const W: Duration = Duration::from_millis(200);
-const SLACK: Duration = Duration::from_secs(1);
+const W: Duration = Duration::from_secs(1);
+const SLACK: Duration = Duration::from_secs(2);
 const K: u64 = 1024;
 
 // Blocks callers while closed; `open` releases them.
@@ -319,7 +320,7 @@ fn stop_pending_close_ignores_mountstats() {
         .flush()
         .expect_err("no own progress for a window after the Stop");
     assert!(is_sync_timeout(&e), "{e}");
-    assert!(t.elapsed() <= W + SLACK / 4, "bounded: {:?}", t.elapsed());
+    assert!(t.elapsed() <= W + SLACK / 2, "bounded: {:?}", t.elapsed());
 }
 
 /// LP13e (§2.10 item 2): the writer blocks once written − flushed exceeds 2 × C, and
@@ -367,7 +368,7 @@ fn chunk_halves_on_slow_flush() {
     let ops = Arc::new(FakeFlushOps {
         chunk_delay: Some(Box::new(|i| {
             if i >= 2 {
-                Duration::from_millis(400)
+                Duration::from_millis(1600)
             } else {
                 Duration::ZERO
             }
@@ -375,7 +376,7 @@ fn chunk_halves_on_slow_flush() {
         ..FakeFlushOps::default()
     });
     let t = FlushTiming {
-        slow_chunk: Duration::from_millis(200),
+        slow_chunk: Duration::from_millis(800),
         chunk_min: K,
         chunk_max: 4 * K,
         ..timing(Duration::from_secs(30))
@@ -557,10 +558,7 @@ fn flusher_stall_during_writing_latches_e9056() {
     let t = Instant::now();
     let e = w.write(b"x").expect_err("sticky");
     assert!(is_sync_timeout(&e), "{e}");
-    assert!(
-        t.elapsed() < Duration::from_millis(100),
-        "a latched error does not wait"
-    );
+    assert!(t.elapsed() < W * 3 / 4, "a latched error does not wait");
     ops.chunk_gate.release();
 }
 

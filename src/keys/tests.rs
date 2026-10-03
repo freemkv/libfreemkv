@@ -1014,6 +1014,83 @@ fn hddvd_in_the_clear_needs_no_key_whatever_it_declares() {
     }
 }
 
+// Drain a keyed image mux of `title` over `src`: the stream's end, or its error.
+fn drain_keyed_image<S: SectorSource + Send + 'static>(
+    src: S,
+    title: DiscTitle,
+    set: &KeyRing,
+) -> std::io::Result<()> {
+    use crate::pes::PesSource;
+    let _serial = crate::sector::prefetched::holder_test_lock();
+    let policy = crate::sector::read_stage::ReadPolicy::Image { batch: 30 };
+    let ctx = crate::ctx::Ctx::default();
+    let mut stream =
+        crate::mux::resolve::build_keyed_pipeline(src, title, set, policy, &ctx).unwrap();
+    loop {
+        match stream.read() {
+            Ok(Some(_)) => continue,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// An HD DVD `.EVO` need not end on the 3-sector unit grid: a clear title whose extent ends
+/// one sector past a whole unit reads that tail and finishes, not E9030.
+#[test]
+fn hddvd_clear_title_reads_a_sub_unit_extent_tail() {
+    let mut clip = vec![0u8; 33 * 2048];
+    for sector in clip.chunks_mut(2048) {
+        sector[..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sector[4..].fill(0x44);
+    }
+    let files = [
+        BdFile::new("HVDVD_TS/FEATURE.EVO", 33, None).with_clip(clip),
+        BdFile::new("BDMV/index.bdmv", 1, None),
+    ];
+    let uk_ro = unit_key_ro(AacsVersion::V10, &[[0xEE; 16]; 64], &[1]);
+    let img = encrypted_bd_image(&files, &uk_ro);
+    let mut disc = disc_over(&img, &uk_ro, &[&[0]], DiscFormat::HdDvd);
+    let start = img.files[0].0;
+    disc.titles[0].extents = vec![Extent {
+        start_lba: start,
+        sector_count: 31,
+    }];
+    let fx = Fx { img, disc };
+    let calls = Calls::default();
+    let set = resolve(&fx, KeyScope::Titles(vec![0]), &[Spec::keydb(&[], &calls)]).unwrap();
+    let src = CountingSource::new(MemSource::new(fx.img.image.clone()));
+    let log = src.log();
+    drain_keyed_image(src, fx.disc.titles[0].clone(), &set)
+        .unwrap_or_else(|e| panic!("a clear sub-unit tail refused: {e}"));
+    assert!(
+        log.touched(start + 30, start + 31),
+        "the tail sector is read"
+    );
+    assert!(
+        !log.touched(start + 31, start + 33),
+        "nothing past the extent"
+    );
+}
+
+/// A sub-unit extent tail that is the head of an encrypted unit cannot be decrypted: the
+/// mux refuses it (E7013) rather than pass its ciphertext on as clear.
+#[test]
+fn an_encrypted_sub_unit_extent_tail_is_refused() {
+    let mut fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
+    let calls = Calls::default();
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1], &calls)],
+    )
+    .unwrap();
+    fx.disc.titles[0].extents[0].sector_count = 29;
+    let err = drain_keyed_image(fx.source(), fx.disc.titles[0].clone(), &set)
+        .expect_err("an encrypted fragment must not pass as clear");
+    assert_eq!(crate::error_code(&err), Some(E7013), "{err}");
+}
+
 /// An HD DVD set's unit spans stay in LBA order across fragmented and interleaved pieces:
 /// `span_at` bisects them.
 #[test]

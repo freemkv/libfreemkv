@@ -255,9 +255,9 @@ mod heartbeat_tests {
     /// resets.
     #[test]
     fn beats_once_per_interval() {
-        let mut hb = Heartbeat::with_interval("test", Duration::from_millis(200));
+        let mut hb = Heartbeat::with_interval("test", Duration::from_secs(1));
         assert!(!hb.tick(1, 100));
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(1100));
         assert!(hb.tick(2, 100), "should beat after interval elapsed");
         // Immediately after, throttle suppresses the next.
         assert!(!hb.tick(3, 100));

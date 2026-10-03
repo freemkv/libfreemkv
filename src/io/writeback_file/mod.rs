@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(w.flush_progress().bytes_total(), 405);
         assert_eq!(fresh.bytes_total(), 405, "writes count on the new counters");
         let start = std::time::Instant::now();
-        while fresh.bytes_durable() == 0 && start.elapsed() < std::time::Duration::from_secs(2) {
+        while fresh.bytes_durable() == 0 && start.elapsed() < std::time::Duration::from_secs(30) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(

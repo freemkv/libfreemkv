@@ -111,6 +111,13 @@ pub struct M2tsStream {
     route: Vec<Option<(usize, Repack)>>,
     /// MPEG-2 multichannel extension tracks: no PMT descriptor binds them to their base.
     excluded: super::ps::UnstoredExtensions,
+    /// Clip-join PTS correction shared with the other sinks: a multi-clip playlist's
+    /// source PTS resets or jumps at each join, and one TS carries one timeline.
+    timeline: super::timeline::TimelineContinuity,
+    /// The input track (base-view video) that drives the timeline's epochs.
+    ref_video: Option<usize>,
+    /// Frames the timeline placed (the denominator for its drop count).
+    frames_mapped: u64,
 }
 
 impl M2tsStream {
@@ -230,11 +237,26 @@ impl M2tsStream {
                 muxer.set_codec_private(i, data.clone())?;
             }
         }
+        let ref_video = title
+            .streams
+            .iter()
+            .enumerate()
+            .find(|&(i, s)| {
+                matches!(s, DiscStream::Video(v) if !v.is_mvc_dependent())
+                    && matches!(route.get(i), Some(Some(_)))
+            })
+            .map(|(i, _)| i);
         Ok(Self {
             disc_title: title.clone(),
             muxer,
             route,
             excluded,
+            timeline: super::timeline::TimelineContinuity::with_clips(
+                &title.clips,
+                title.content_format,
+            ),
+            ref_video,
+            frames_mapped: 0,
         })
     }
 }
@@ -244,7 +266,31 @@ impl crate::pes::PesSink for M2tsStream {
         if self.excluded.drop_frame(frame.track) {
             return Ok(());
         }
-        match self.route.get(frame.track).copied() {
+        let route = self.route.get(frame.track).copied();
+        let mut pts = frame.pts;
+        if let Some(Some(_)) = route {
+            // Onto the continuous timeline first; `None` is material outside the clip marks.
+            let is_video = matches!(
+                self.disc_title.streams.get(frame.track),
+                Some(DiscStream::Video(_))
+            );
+            let Some(mapped) = self.timeline.map_picture(
+                frame.pts,
+                Some(frame.track) == self.ref_video,
+                frame.track,
+                is_video,
+                frame.source.map(|s| s.byte),
+                is_video.then_some(crate::mux::timeline::SeamPic {
+                    keyframe: frame.keyframe,
+                    coding: frame.coding,
+                }),
+            ) else {
+                return Ok(());
+            };
+            pts = mapped;
+            self.frames_mapped += 1;
+        }
+        match route {
             // Dropped at create (already warned): nothing to write.
             Some(None) => Ok(()),
             // Parser output is plain PCM (16 or 24-bit); BD-TS needs the BD LPCM framing back.
@@ -252,7 +298,7 @@ impl crate::pes::PesSink for M2tsStream {
                 for (offset_ns, payload) in super::codec::lpcm::bd_payloads(&frame.data, header) {
                     self.muxer.write_frame(
                         track,
-                        frame.pts.saturating_add(offset_ns),
+                        pts.saturating_add(offset_ns),
                         frame.keyframe,
                         &payload,
                     )?;
@@ -265,12 +311,11 @@ impl crate::pes::PesSink for M2tsStream {
                     tracing::warn!(target: "mux", track, len = frame.data.len(), "AAC access unit too long for ADTS; dropped");
                     return Ok(());
                 };
-                self.muxer
-                    .write_frame(track, frame.pts, frame.keyframe, &adts)
+                self.muxer.write_frame(track, pts, frame.keyframe, &adts)
             }
             Some(Some((track, Repack::Verbatim))) => {
                 self.muxer
-                    .write_frame(track, frame.pts, frame.keyframe, &frame.data)
+                    .write_frame(track, pts, frame.keyframe, &frame.data)
             }
             // Out of range: let the muxer report its usual error.
             None => self
@@ -280,6 +325,26 @@ impl crate::pes::PesSink for M2tsStream {
     }
 
     fn finish(&mut self) -> io::Result<()> {
+        // As the other sinks: a seam plan that dropped everything, or most of the title,
+        // is a failed mux, not a short file.
+        let seam_dropped = self.timeline.dropped_total();
+        if self.frames_mapped == 0 && seam_dropped > 0 {
+            return Err(crate::error::Error::SinkWroteNothing.into());
+        }
+        if seam_dropped > self.frames_mapped {
+            return Err(crate::error::Error::SeamPlanDroppedMost {
+                dropped: seam_dropped,
+                written: self.frames_mapped,
+            }
+            .into());
+        }
+        if seam_dropped > 0 {
+            tracing::info!(
+                target: "mux",
+                dropped = seam_dropped,
+                "frames outside the playlist's clip marks were dropped at clip joins"
+            );
+        }
         self.muxer.finish()
     }
 
@@ -892,6 +957,55 @@ mod tests {
             "2nd field: DTS_1st + ΔPTS"
         );
         assert_eq!(t[2].1, Some(t[0].0), "P3 decodes when I0 is presented");
+    }
+
+    // A multi-clip title's source PTS restarts at each join: the TS carries one continuous
+    // timeline, so the second clip follows the first and its reordered AUs keep their DTS.
+    #[test]
+    fn a_clip_join_pts_reset_continues_the_timeline_and_its_dts() {
+        use crate::mux::decode_ts::test_es as es;
+        let sps = es::sps_with_reorder(2);
+        let mut title = make_title();
+        if let DiscStream::Video(v) = &mut title.streams[0] {
+            v.codec = Codec::H264;
+        }
+        title.codec_privates = vec![Some(es::avcc(&sps.nal()))];
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
+        // Decode order I P B B, repeated: 6 s clips at 24 fps, each from 1 s.
+        let order = [0i64, 3, 1, 2];
+        for _clip in 0..2 {
+            for i in 0..144i64 {
+                let shown = (i / 4) * 4 + order[(i % 4) as usize];
+                let au = es::length_prefixed(&[es::h264_slice(&sps, i == 0, 0, i as u32, None)]);
+                let pts = 1_000_000_000 + shown * 41_666_667;
+                stream.write(&frame(0, pts, i == 0, au)).unwrap();
+            }
+        }
+        stream.finish().unwrap();
+        drop(stream);
+        let buf = shared.lock().unwrap().clone();
+        let (_, ts) = ts_after_header(&buf);
+        let t = pes_times(&ts, VIDEO_PID);
+        assert_eq!(t.len(), 288);
+        let clip1_max = t[..144].iter().map(|x| x.0).max().unwrap();
+        let clip2_min = t[144..].iter().map(|x| x.0).min().unwrap();
+        assert!(
+            clip2_min > clip1_max,
+            "clip 2 at {clip2_min} overlaps clip 1 ({clip1_max})"
+        );
+        let dts: Vec<u64> = t.iter().map(|&(p, d)| d.unwrap_or(p)).collect();
+        assert!(
+            dts.windows(2).all(|w| w[1] > w[0]),
+            "DTS strictly increase across the join: {:?}",
+            &dts[140..148]
+        );
+        let with_dts = |r: &[(u64, Option<u64>)]| r.iter().filter(|x| x.1.is_some()).count();
+        assert_eq!(
+            with_dts(&t[144..]),
+            with_dts(&t[..144]),
+            "clip 2 keeps its DTS"
+        );
     }
 
     // Design §2.3: the MVC dependent view copies its base AU's DTS.
