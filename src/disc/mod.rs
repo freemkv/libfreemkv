@@ -11,6 +11,7 @@
 mod bluray;
 mod dvd;
 pub(crate) mod dvd_audio_probe;
+pub(crate) mod dvd_forced_probe;
 mod encrypt;
 pub(crate) use encrypt::handshake_class_error;
 mod extract;
@@ -52,7 +53,9 @@ pub struct Disc {
     /// Titles in main-feature order: `titles[0]` is the selected main feature (nav or
     /// authoring pick first, else largest physical size), not necessarily the longest
     pub titles: Vec<DiscTitle>,
-    /// Disc region. Not decoded yet: scans always report [`DiscRegion::Free`].
+    /// Disc region: a DVD's VMG region mask, [`DiscRegion::Free`] for UHD (region-free by
+    /// spec), and [`DiscRegion::Unknown`] for Blu-ray and HD DVD, whose region check is
+    /// the disc's own program code rather than a static field.
     pub region: DiscRegion,
     /// AACS state -- None if disc is unencrypted or keys unavailable
     pub aacs: Option<AacsState>,
@@ -83,9 +86,20 @@ pub struct Disc {
 pub enum ContentFormat {
     /// Blu-ray BD Transport Stream (192-byte packets)
     BdTs,
-    /// MPEG-2 Program Stream — DVD (`.vob`) and HD-DVD (`.evo`). For AACS content
-    /// this selects the PS-aware encrypted-flag / structural checks.
+    /// MPEG-2 Program Stream: HD-DVD (`.evo`) and plain program-stream files. For AACS
+    /// content this selects the PS-aware encrypted-flag / structural checks.
     MpegPs,
+    /// The program stream of a DVD-Video title (`.vob`), set only by the DVD scan: the same
+    /// container as [`Self::MpegPs`], plus what is DVD's alone (CSS, DVD navigation packs,
+    /// extents that are IFO cells). No other source gets the DVD-only stages.
+    DvdPs,
+}
+
+impl ContentFormat {
+    /// Whether the sectors hold an MPEG-2 program stream (DVD or not).
+    pub fn is_program_stream(self) -> bool {
+        matches!(self, Self::MpegPs | Self::DvdPs)
+    }
 }
 
 /// Disc format.
@@ -116,8 +130,12 @@ pub enum DiscRegion {
     Free,
     /// Blu-ray regions (A/B/C or combination)
     BluRay(Vec<BdRegion>),
-    /// DVD regions (1-8 or combination)
+    /// DVD regions the disc plays in (1-8 or combination); empty when the disc's
+    /// region mask prohibits every region.
     Dvd(Vec<u8>),
+    /// Not recorded anywhere a scan can read: a Blu-ray or HD DVD enforces region in
+    /// its own navigation program (BD checks player register PSR20), not a static field.
+    Unknown,
 }
 
 /// Blu-ray region codes.
@@ -491,9 +509,9 @@ pub enum ColorSpace {
 pub struct Chapter {
     /// Chapter start time in seconds
     pub time_secs: f64,
-    /// Chapter name — a bare 1-based index ("1", "2", …). The library
-    /// emits no localized prose; consuming apps prepend any "Chapter "
-    /// prefix in the user's language.
+    /// Chapter name — the disc's own name when it carries one (DVD text
+    /// data), else a bare 1-based index ("1", "2", …). The library emits
+    /// no localized prose; apps prepend any "Chapter " prefix to ordinals.
     pub name: String,
 }
 
@@ -511,13 +529,11 @@ pub struct Extent {
     pub sector_count: u32,
 }
 
-// THE ONE definition of "structurally AACS-encrypted" — shared by the fast identify and the
-// full scan so they can't silently desync. Structural, not cryptographic; HD DVD's `X!` dir
-// is found by the same discovery the key-file reads use.
+// THE ONE definition of "structurally AACS-encrypted", shared by identify and the full scan.
+// Root `AACS/` or the HD DVD dir the key reads use; never `/BDMV/AACS`, which no key reader
+// (nor libaacs) reads and no disc has.
 pub(crate) fn aacs_dir_present(udf_fs: &crate::udf::UdfFs) -> bool {
-    udf_fs.find_dir("/AACS").is_some()
-        || udf_fs.find_dir("/BDMV/AACS").is_some()
-        || crate::aacs::find_hddvd_aacs_dir(udf_fs).is_some()
+    udf_fs.find_dir("/AACS").is_some() || crate::aacs::find_hddvd_aacs_dir(udf_fs).is_some()
 }
 
 // Title-ranking heuristic thresholds. Each gates a DISTINCT decision — several share a value
@@ -1184,10 +1200,10 @@ impl FrameRate {
             2 => FrameRate::F24,
             3 => FrameRate::F25,
             4 => FrameRate::F29_97,
-            5 => FrameRate::F30,
             6 => FrameRate::F50,
             7 => FrameRate::F59_94,
-            8 => FrameRate::F60,
+            // 5 and 8 are unassigned (libbluray, MediaInfo, tsMuxer); a UHD menu clip
+            // carries 8, which is not a statement of 60 fps.
             other => {
                 tracing::warn!(video_rate = other, "unknown MPLS video_rate byte");
                 FrameRate::Unknown
@@ -1774,7 +1790,9 @@ impl Disc {
         // (no titles needed: BD/UHD/FMTS come from the MKB generation). It no
         // longer defaults to BluRay or defers UHD/FMTS to the full scan.
         let format = Self::detect_disc_format(&mut buffered, &udf_fs, &[]);
-        let encrypted = aacs_dir_present(&udf_fs);
+        let encrypted = aacs_dir_present(&udf_fs)
+            && (format != DiscFormat::HdDvd
+                || hddvd::hddvd_content_scrambled(&mut buffered, &udf_fs) != Some(false));
         let layers = Self::layers_for(format, capacity);
 
         Ok(DiscId {
@@ -2233,32 +2251,40 @@ impl Disc {
             |p| udf_fs.read_file(reader, p),
         )?;
         let mkb = Self::read_mkb_content(reader, udf_fs)?;
-        let version = Self::read_aacs_version(reader, udf_fs);
+        let version = Self::read_aacs_version(reader, udf_fs, &mkb)?;
         Ok((inf, mkb, version))
     }
 
-    // AACS major version from the content certificate; drives the Unit_Key_RO.inf parse stride.
-    // Defaults to UHD (V20, 64-byte stride) when unreadable.
-    fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> u8 {
-        match crate::aacs::read_first(
+    // AACS major version driving the Unit_Key_RO.inf parse stride: the content certificate,
+    // then the MKB type, then index.bdmv, through the shared `resolve_aacs_version`. `Err` only
+    // for a Stop.
+    fn read_aacs_version(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        mkb: &[u8],
+    ) -> Result<u8> {
+        let cert = crate::aacs::read_first(
             &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
             |p| udf_fs.read_file(reader, p),
-        )
-        .ok()
-        .as_deref()
-        .and_then(crate::aacs::inf::parse_content_cert)
-        {
-            Some(c) => c.version.major(),
-            None => {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    phase = "scan_aacs_version",
-                    "no readable AACS content certificate; defaulting to the V20/UHD \
-                     Unit_Key_RO stride (a VUK-from-server path would otherwise mis-stride)"
-                );
-                crate::aacs::mkb::AACS_MAJOR_UHD
-            }
+        );
+        if matches!(cert, Err(Error::Halted)) {
+            return Err(Error::Halted);
         }
+        let cert_major = cert
+            .ok()
+            .as_deref()
+            .and_then(crate::aacs::inf::parse_content_cert)
+            .map(|c| c.version.major());
+        if cert_major.is_none() {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "scan_aacs_version",
+                "no readable AACS content certificate; Unit_Key_RO stride from the MKB type \
+                 or index.bdmv"
+            );
+        }
+        let index = encrypt::index_is_uhd(udf_fs, reader)?;
+        Ok(crate::aacs::mkb::resolve_aacs_version(cert_major, mkb, index).major())
     }
 
     // Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding. Reads a bounded,
@@ -2443,10 +2469,10 @@ impl Disc {
     ) -> Result<Self> {
         let scan_with_t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
-        let encrypted = aacs.is_some();
+        let mut encrypted = aacs.is_some();
         // Lookup-free: the state carries the disc's AACS inputs but no key; the caller
         // resolves one into a `KeyRing`.
-        let (aacs, aacs_error) = match aacs {
+        let (mut aacs, mut aacs_error) = match aacs {
             Some((cap, bus)) => encrypt::resolve_aacs(cap, &bus),
             None => (None, None),
         };
@@ -2455,20 +2481,30 @@ impl Disc {
         // FMTS shares the BD tree; FORMAT is a separate axis derived below). DVD
         // resolves its main feature via First-Play nav (issue #40) as `nav_feature`.
         let mut dvd_nav_feature: Option<u16> = None;
+        let mut dvd_region: Option<DiscRegion> = None;
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
             (
                 Self::scan_bluray_titles(reader, &udf_fs, halt)?,
                 ContentFormat::BdTs,
             )
         } else if udf_fs.find_dir("/HVDVD_TS").is_some() {
+            // An AACS directory over EVOs whose packs are all unscrambled is a decrypted rip.
+            if encrypted && hddvd::hddvd_content_scrambled(reader, &udf_fs) == Some(false) {
+                tracing::info!(
+                    target: "freemkv::scan",
+                    "HD DVD carries an AACS directory but its EVO packs are clear: not encrypted"
+                );
+                (encrypted, aacs, aacs_error) = (false, None, None);
+            }
             (
                 Self::scan_hddvd_titles(reader, &udf_fs, halt)?,
                 ContentFormat::MpegPs,
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
-            let (dvd_titles, nav) = Self::scan_dvd_titles(reader, &udf_fs, halt)?;
+            let (dvd_titles, nav, region) = Self::scan_dvd_titles(reader, &udf_fs, halt)?;
             dvd_nav_feature = nav;
-            (dvd_titles, ContentFormat::MpegPs)
+            dvd_region = Some(region);
+            (dvd_titles, ContentFormat::DvdPs)
         } else {
             (Vec::new(), ContentFormat::BdTs)
         };
@@ -2528,18 +2564,23 @@ impl Disc {
         // rip leaves it off since the muxer detects forced without a second read.
         if opts.probe_forced_subtitles {
             Self::probe_forced_subtitles_for_bdts_titles(reader, &mut titles, halt);
-            // The probe swallows a Stop; surface it as the live scan does.
+            Self::probe_forced_subtitles_for_dvd_titles(reader, &mut titles, halt);
+            // The probes swallow a Stop; surface it as the live scan does.
             if let Some(h) = halt {
                 h.check()?;
             }
         }
         crate::labels::fill_defaults(&mut titles);
 
-        // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD) and
-        //    layers. Region coding is not decoded yet: every disc reports Region-free.
+        // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD), layers and
+        //    region: the DVD's VMG mask, region-free UHD, otherwise not statically recorded.
         let format = Self::detect_disc_format(reader, &udf_fs, &titles);
         let layers = Self::layers_for(format, capacity);
-        let region = DiscRegion::Free;
+        let region = match (dvd_region, format) {
+            (Some(region), _) => region,
+            (None, DiscFormat::Uhd | DiscFormat::Fmts) => DiscRegion::Free,
+            (None, _) => DiscRegion::Unknown,
+        };
 
         // 6. CSS: `scan_image` cracks the title key after this returns and `scan_live` only
         // runs bus-auth. The reader-based crack is NOT run here: on a CSS disc it would
@@ -2613,6 +2654,21 @@ impl Disc {
         for title in titles.iter_mut() {
             if title.content_format == ContentFormat::BdTs {
                 pgs_forced_probe::probe_and_set_forced(reader, title, &mut cache, halt);
+            }
+        }
+    }
+
+    // Content-based forced-subtitle detection for DVD VobSub titles (FSTA_DSP), the DVD
+    // counterpart of the PGS probe above; it only adds `forced`, never clears the IFO's.
+    fn probe_forced_subtitles_for_dvd_titles(
+        reader: &mut dyn SectorSource,
+        titles: &mut [DiscTitle],
+        halt: Option<&crate::halt::Halt>,
+    ) {
+        let mut cache = dvd_forced_probe::DvdForcedProbeCache::default();
+        for title in titles.iter_mut() {
+            if title.content_format == ContentFormat::DvdPs {
+                dvd_forced_probe::probe_and_set_forced(reader, title, &mut cache, halt);
             }
         }
     }
@@ -3891,6 +3947,42 @@ mod tests {
         );
     }
 
+    // The DVD forced-subtitle probe is DVD-only: a `DvdPs` title (LBA 0) is probed, an HD DVD
+    // `MpegPs` title carrying the same VobSub stream (LBA 5000) is never read.
+    #[test]
+    fn probe_forced_subtitles_for_dvd_titles_skips_hddvd() {
+        let vobsub = |content_format, start_lba| DiscTitle {
+            content_format,
+            streams: vec![Stream::Subtitle(SubtitleStream {
+                pid: 0xBD20,
+                codec: Codec::DvdSub,
+                language: "eng".into(),
+                forced: false,
+                qualifier: LabelQualifier::None,
+                codec_data: None,
+            })],
+            extents: vec![Extent {
+                start_lba,
+                sector_count: 4,
+            }],
+            ..DiscTitle::empty()
+        };
+        let mut titles = vec![
+            vobsub(ContentFormat::DvdPs, 0),
+            vobsub(ContentFormat::MpegPs, 5000),
+        ];
+        let mut reader = ForcedProbeSpyReader {
+            lbas: std::cell::RefCell::new(Vec::new()),
+        };
+        Disc::probe_forced_subtitles_for_dvd_titles(&mut reader, &mut titles, None);
+        let lbas = reader.lbas.borrow();
+        assert!(!lbas.is_empty(), "the DVD title is probed");
+        assert!(
+            lbas.iter().all(|&l| l < 5000),
+            "HD DVD extent read: {lbas:?}"
+        );
+    }
+
     // ── scan_with's capacity_bytes feeds canonical_title_order (finding 10) ─
     // Two HD-DVD .evo clips (each its own title) with the given DECLARED byte
     // sizes; scan_with's capacity ranking depends on ICB-declared size only.
@@ -4764,13 +4856,12 @@ mod tests {
         assert!(id.encrypted, "/AACS alone must report encrypted");
     }
 
-    // A nested /BDMV/AACS alone must ALSO report encrypted == true —
-    // degrading the `||` to `&&` would report almost every retail BD as
-    // unencrypted, since real discs rarely carry both paths at once.
+    // A nested /BDMV/AACS is not an AACS marker: no key file is read from it, so
+    // calling the disc encrypted would only lead to a key lookup that cannot succeed.
     #[test]
-    fn identify_reports_encrypted_for_bdmv_aacs_dir_alone() {
+    fn identify_ignores_a_nested_bdmv_aacs_dir() {
         let id = identify_with_aacs_dirs(false, true);
-        assert!(id.encrypted, "/BDMV/AACS alone must report encrypted");
+        assert!(!id.encrypted, "/BDMV/AACS alone is not encrypted");
     }
 
     /// Neither AACS path present must report `encrypted == false`.
@@ -8853,15 +8944,20 @@ mod tests {
             (2, FrameRate::F24, (24, 1)),
             (3, FrameRate::F25, (25, 1)),
             (4, FrameRate::F29_97, (30000, 1001)),
-            (5, FrameRate::F30, (30, 1)),
             (6, FrameRate::F50, (50, 1)),
             (7, FrameRate::F59_94, (60000, 1001)),
-            (8, FrameRate::F60, (60, 1)),
         ] {
             assert_eq!(FrameRate::from_video_rate(vr), want, "video_rate {vr}");
             assert_eq!(want.as_fraction(), frac, "{want:?}");
         }
-        assert_eq!(FrameRate::from_video_rate(0), FrameRate::Unknown);
+        for unassigned in [0, 5, 8, 9, 15] {
+            assert_eq!(
+                FrameRate::from_video_rate(unassigned),
+                FrameRate::Unknown,
+                "video_rate {unassigned}"
+            );
+        }
+        assert_eq!(FrameRate::Unknown.as_fraction(), (0, 1));
         for (af, want) in [
             (1, AudioChannels::Mono),
             (3, AudioChannels::Stereo),

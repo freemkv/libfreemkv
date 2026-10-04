@@ -465,6 +465,9 @@ fn apply_aacs_map(
         // CSS descrambles via `decrypt_sectors` and `None` is already clear.
         _ => return Ok(0),
     };
+    if format == crate::disc::ContentFormat::MpegPs {
+        return decrypt_hddvd_packs(buf, keys, base_lba, map, content, None).map(|r| r.blanked);
+    }
 
     let unit_len = aacs::content::ALIGNED_UNIT_LEN;
     let unit_sectors = aacs::content::ALIGNED_UNIT_SECTORS;
@@ -635,6 +638,114 @@ fn apply_aacs_map(
     Ok(failed)
 }
 
+/// What a per-pack HD DVD decrypt of one read found.
+#[derive(Debug)]
+pub(crate) struct HdPacks {
+    /// The CPI in force after the read's last pack: the lead CPI of a read that follows it.
+    pub(crate) last_cpi: Option<aacs::hddvd::Cpi>,
+    /// Encrypted packs blanked because no NV_PCK before them gave their EVOBU's CPI.
+    pub(crate) blanked: usize,
+}
+
+/// Decrypt the HD DVD packs of `buf` (read at `base_lba`) in place, per `[HD]` §4.3.4.
+///
+/// Each NV_PCK sets the CPI for the packs after it; `lead` is the CPI in force at the first
+/// pack (from an earlier read). A pack flagged scrambled, or an HL_PCK under a valid KEY_VF, is
+/// decrypted with the Title Key its CPI's `TITLE_KEY_PTR` names (`unit_keys` numbers keys by
+/// that pointer); the map only says which sectors are keyed content. An encrypted pack with no
+/// CPI is blanked and counted. Ciphertext outside the map, under a Segment Key (KEY_VF `01`),
+/// or under a Title Key not held fails loud: shipping it would pass ciphertext as clear.
+pub(crate) fn decrypt_hddvd_packs(
+    buf: &mut [u8],
+    keys: &DecryptKeys,
+    base_lba: u32,
+    map: &AacsKeyMap,
+    content: Option<&[(u32, u32)]>,
+    lead: Option<aacs::hddvd::Cpi>,
+) -> Result<HdPacks, crate::error::Error> {
+    use aacs::hddvd::{PACK_LEN, PackKind, classify, decrypt_pack, needs_key};
+    let DecryptKeys::Aacs { unit_keys, .. } = keys else {
+        return Ok(HdPacks {
+            last_cpi: lead,
+            blanked: 0,
+        });
+    };
+    let mut cur = lead;
+    let mut jobs: Vec<Option<(&[u8; 16], aacs::hddvd::Cpi)>> = Vec::new();
+    let mut blank = Vec::new();
+    let mut refusal: Option<&'static str> = None;
+    for (i, pack) in buf.as_chunks::<PACK_LEN>().0.iter().enumerate() {
+        jobs.push(None);
+        let lba = base_lba.saturating_add(i as u32);
+        let kind = classify(pack);
+        if let PackKind::Nav(cpi) = kind {
+            cur = cpi;
+            continue;
+        }
+        if content.is_some_and(|r| !lba_in_content_ranges(lba, r)) || !needs_key(kind, cur.as_ref())
+        {
+            continue;
+        }
+        if map.entry_for(lba).is_none() {
+            refusal.get_or_insert("encrypted pack outside every keyed range");
+            continue;
+        }
+        let Some(cpi) = cur else {
+            blank.push(i);
+            continue;
+        };
+        if cpi.key_vf() != 0b10 {
+            refusal.get_or_insert("pack under a Segment Key or no valid key pointer");
+            continue;
+        }
+        match unit_keys.iter().find(|(n, _)| *n == cpi.title_key_ptr()) {
+            Some((_, kt)) => jobs[i] = Some((kt, cpi)),
+            None => {
+                refusal.get_or_insert("the pack's Title Key is not held");
+            }
+        }
+    }
+    if let Some(why) = refusal {
+        tracing::error!(target: "freemkv::decrypt", lba = base_lba, code = crate::error::E_DECRYPT_FAILED, why, "HD DVD pack cannot be decrypted");
+        return Err(crate::error::Error::DecryptFailed);
+    }
+    let run = |(i, pack): (usize, &mut [u8])| {
+        if let Some((kt, cpi)) = jobs[i] {
+            decrypt_pack(pack, kt, &cpi);
+        }
+    };
+    let pool = (decrypt_threads() > 1 && jobs.len() >= PARALLEL_MIN_UNITS * 3)
+        .then(decrypt_pool)
+        .flatten();
+    match pool {
+        Some(pool) => pool.install(|| {
+            buf.par_chunks_exact_mut(PACK_LEN).enumerate().for_each(run);
+        }),
+        None => buf
+            .as_chunks_mut::<PACK_LEN>()
+            .0
+            .iter_mut()
+            .map(|p| p.as_mut_slice())
+            .enumerate()
+            .for_each(run),
+    }
+    for &i in &blank {
+        buf[i * PACK_LEN..(i + 1) * PACK_LEN].fill(0);
+    }
+    if let Some(&first) = blank.first() {
+        tracing::warn!(
+            target: "freemkv::decrypt",
+            lba = base_lba.saturating_add(first as u32),
+            packs = blank.len(),
+            "encrypted HD DVD pack with no NV_PCK before it: blanked, the rip carries on"
+        );
+    }
+    Ok(HdPacks {
+        last_cpi: cur,
+        blanked: blank.len(),
+    })
+}
+
 /// FMTS units of one read that must fail their verify, none verifying, under one key before
 /// it is a wrong key rather than damage: a wrong key fails them all.
 const WRONG_KEY_FAILURES: usize = 2;
@@ -777,6 +888,102 @@ fn decrypt_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // HD DVD: a buffer of `n` packs, an NV_PCK (CPI naming Title Key 2) every 4th from pack
+    // `nav_at`, the rest audio packs encrypted per pack under `kt` (`[HD]` §4.3.2).
+    fn hd_buf(n: usize, nav_at: usize, kt: &[u8; 16]) -> (Vec<u8>, Vec<u8>) {
+        use crate::aacs::hddvd::encrypt_pack;
+        use crate::aacs::hddvd::tests::{audio_pack, cpi, nav_pack};
+        let c = cpi(2, 7);
+        let plain: Vec<u8> = (0..n)
+            .flat_map(|i| match i >= nav_at && (i - nav_at).is_multiple_of(4) {
+                true => nav_pack(&c),
+                false => audio_pack(i as u8 | 1),
+            })
+            .collect();
+        let mut enc = plain.clone();
+        for (i, p) in enc.chunks_mut(2048).enumerate() {
+            if !(i >= nav_at && (i - nav_at).is_multiple_of(4)) {
+                encrypt_pack(p, kt, &c);
+            }
+        }
+        (plain, enc)
+    }
+
+    fn hd_keys(keys: &[(u32, [u8; 16])]) -> DecryptKeys {
+        DecryptKeys::Aacs {
+            unit_keys: keys.to_vec(),
+            format: crate::disc::ContentFormat::MpegPs,
+        }
+    }
+
+    #[test]
+    fn hddvd_packs_decrypt_under_the_title_key_their_cpi_names() {
+        let kt = [0x61; 16];
+        let (plain, mut buf) = hd_buf(12, 0, &kt);
+        let map = AacsKeyMap::from_ranges(vec![(0, 100, 0)]);
+        let keys = hd_keys(&[(1, [0x99; 16]), (2, kt)]);
+        let r = decrypt_hddvd_packs(&mut buf, &keys, 0, &map, None, None).unwrap();
+        assert_eq!(buf, plain);
+        assert_eq!(r.blanked, 0);
+        assert_eq!(r.last_cpi.map(|c| c.title_key_ptr()), Some(2));
+    }
+
+    #[test]
+    fn hddvd_packs_before_the_first_nav_use_the_lead_cpi_or_are_blanked() {
+        use crate::aacs::hddvd::tests::cpi;
+        let kt = [0x61; 16];
+        let map = AacsKeyMap::from_ranges(vec![(0, 100, 0)]);
+        let keys = hd_keys(&[(2, kt)]);
+        let (plain, enc) = hd_buf(9, 2, &kt);
+        let mut buf = enc.clone();
+        decrypt_hddvd_packs(&mut buf, &keys, 0, &map, None, Some(cpi(2, 7))).unwrap();
+        assert_eq!(buf, plain);
+        let mut buf = enc.clone();
+        let r = decrypt_hddvd_packs(&mut buf, &keys, 0, &map, None, None).unwrap();
+        assert_eq!(r.blanked, 2);
+        assert!(buf[..2 * 2048].iter().all(|&b| b == 0));
+        assert_eq!(buf[2 * 2048..], plain[2 * 2048..]);
+    }
+
+    #[test]
+    fn hddvd_ciphertext_no_held_key_opens_fails_loud() {
+        let kt = [0x61; 16];
+        let (_, enc) = hd_buf(8, 0, &kt);
+        let map = AacsKeyMap::from_ranges(vec![(0, 100, 0)]);
+        // Title Key 2 not held.
+        let mut buf = enc.clone();
+        let r = decrypt_hddvd_packs(&mut buf, &hd_keys(&[(1, kt)]), 0, &map, None, None);
+        assert!(matches!(r, Err(crate::error::Error::DecryptFailed)));
+        // Encrypted packs outside every keyed range.
+        let mut buf = enc.clone();
+        let outside = AacsKeyMap::from_ranges(vec![(500, 600, 0)]);
+        let r = decrypt_hddvd_packs(&mut buf, &hd_keys(&[(2, kt)]), 0, &outside, None, None);
+        assert!(matches!(r, Err(crate::error::Error::DecryptFailed)));
+        // KEY_VF 01: a Segment Key, not held.
+        let mut buf = enc.clone();
+        buf[60] = 0x40;
+        let r = decrypt_hddvd_packs(&mut buf, &hd_keys(&[(2, kt)]), 0, &map, None, None);
+        assert!(matches!(r, Err(crate::error::Error::DecryptFailed)));
+    }
+
+    #[test]
+    fn hddvd_packs_outside_the_content_ranges_pass_through() {
+        let kt = [0x61; 16];
+        let (_, enc) = hd_buf(8, 0, &kt);
+        let mut buf = enc.clone();
+        let map = AacsKeyMap::from_ranges(vec![(0, 100, 0)]);
+        decrypt_hddvd_packs(
+            &mut buf,
+            &hd_keys(&[(2, kt)]),
+            0,
+            &map,
+            Some(&[(50, 10)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(buf, enc);
+    }
 
     /// Build a clear-TS region: a 0x47 sync byte at offset 4 of every 192-byte
     /// BD-TS packet (matching `ts_sync_count`'s probe stride), filler elsewhere.

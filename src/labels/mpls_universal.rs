@@ -331,6 +331,7 @@ mod tests {
             language: lang.to_string(),
             dynamic_range: 0,
             color_space: 0,
+            hdr_plus: false,
             secondary: false,
         }
     }
@@ -347,6 +348,7 @@ mod tests {
             language: lang.to_string(),
             dynamic_range: 0,
             color_space: 0,
+            hdr_plus: false,
             secondary: false,
         }
     }

@@ -894,7 +894,7 @@ impl MkvStream {
                 // Only Blu-ray marks share the PES clock (see `TimelineContinuity::with_clips`).
                 let in_ns = match self.disc_title.content_format {
                     crate::disc::ContentFormat::BdTs => self.disc_title.clips.first(),
-                    crate::disc::ContentFormat::MpegPs => None,
+                    crate::disc::ContentFormat::MpegPs | crate::disc::ContentFormat::DvdPs => None,
                 }
                 .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
                 if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
@@ -1117,7 +1117,7 @@ fn apply_coding_to_track(
     video_picture_seen: bool,
 ) {
     // HDR10 static metadata measured from the bitstream (HEVC SEI), applied for any
-    // track type once both HDR10 SEI messages were seen. `None` (SDR/no-SEI) leaves
+    // track type once the mastering-display SEI was seen. `None` (SDR/no-SEI) leaves
     // the track's `hdr10` untouched -> omitted.
     if let Some(h) = coding.and_then(|c| c.hdr10()) {
         track.hdr10 = Some(h);
@@ -3548,8 +3548,8 @@ mod tests {
             white_point_y: 16450,
             max_display_mastering_luminance: 10_000_000,
             min_display_mastering_luminance: 1,
-            max_content_light_level: 1000,
-            max_pic_average_light_level: 400,
+            max_content_light_level: Some(1000),
+            max_pic_average_light_level: Some(400),
         };
 
         // Picture carries HDR10 → plumbed onto the track.

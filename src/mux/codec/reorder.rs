@@ -6,7 +6,7 @@
 //!
 //! [`SparsePtsReorder`](crate::mux::codec::reorder::SparsePtsReorder)
 //! reconstructs a display-order PTS per frame from picture type (I/P/B) and
-//! sparse anchor PTS, applied only on the `ContentFormat::MpegPs` path.
+//! sparse anchor PTS, applied only to program-stream sources.
 
 use super::Frame;
 use super::coding::CodingType;

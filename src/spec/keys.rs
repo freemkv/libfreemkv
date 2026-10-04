@@ -2,8 +2,9 @@
 //!
 //! KS-1…KS-19 and KS-29 are the public AACS books (Final Revision 0.953, downloaded
 //! from aacsla.com); KS-20 and KS-21 are ECMA-167 3rd edition; KS-22…KS-24 are
-//! libaacs `55be92be`, corroboration only; KS-25…KS-28 are evidence for what has no
-//! public spec (AACS 2.x / UHD, FMTS, HD DVD). "PDF p." is the physical page.
+//! libaacs `55be92be`, corroboration only; KS-25…KS-28 and KS-31 are evidence for what
+//! has no public spec (AACS 2.x / UHD, FMTS, HD DVD). KS-30 is the AACS HD DVD book, Final
+//! Revision 0.952, since withdrawn from aacsla.com (KS-27). "PDF p." is the physical page.
 
 use super::{QuoteKind, SpecQuote};
 
@@ -13,6 +14,7 @@ const CM: &str = "AACS Introduction and Common Cryptographic Elements, Final Rev
 const UDF: &str = "ECMA-167, 3rd edition, June 1997";
 const LIBAACS: &str = "libaacs (VideoLAN) @55be92be, src/libaacs/aacs.c";
 const EVIDENCE: &str = "freemkv evidence (no public spec)";
+const HD: &str = "AACS HD DVD and DVD Pre-recorded Book, Final Rev 0.952";
 
 const AACS_URL: &str = "https://aacsla.com/aacs-specifications/";
 const UDF_URL: &str =
@@ -319,7 +321,7 @@ pub const KS_27_HDDVD_EVIDENCE: SpecQuote = SpecQuote {
     id: "KS-27",
     kind: QuoteKind::Evidence,
     source: EVIDENCE,
-    section: "HD DVD: AACS HD DVD book withdrawn; PES flag model UNVERIFIED",
+    section: "HD DVD: AACS HD DVD book withdrawn from aacsla.com",
     locator: "aacsla.com AACS Specifications page, “HD DVD and DVD Books”",
     url: AACS_URL,
     text: "have been removed from this AACS website due to inactivity",
@@ -345,6 +347,30 @@ pub const KS_29_VID_FROM_MEDIA: SpecQuote = SpecQuote {
     text: "The Licensed Drive reads Volume ID (Volume_ID) from the media and calculates a message \
            authentication code (Dm) from the Volume ID and the Bus Key (BK) calculated in step 26 \
            in Section 4.3.",
+};
+
+pub const KS_30_HDDVD_PACK_ENCRYPTION: SpecQuote = SpecQuote {
+    id: "KS-30",
+    kind: QuoteKind::Normative,
+    source: HD,
+    section: "§4.3.2 Pack Encryption, Table 4-7",
+    locator: "PDF p.88",
+    url: "",
+    text: "For each encrypted Pack, the first 128 bytes are called the Unencrypted Portion and the \
+           remaining 1920 bytes are called the Encrypted Portion. … Kc = AES-G (Kt, Dtk || \
+           CPIlsb_96), … When a Pack is encrypted, the 2-bit PES_scrambling_control shall be 01₂. \
+           Otherwise, the PES_scrambling_control shall be 00₂.",
+};
+
+pub const KS_31_HDDVD_CPI_EVIDENCE: SpecQuote = SpecQuote {
+    id: "KS-31",
+    kind: QuoteKind::Evidence,
+    source: EVIDENCE,
+    section: "HD DVD: CPI location in the NV_PCK GCI packet",
+    locator: "two encrypted 300 pressings, decrypted against KS-30",
+    url: "",
+    text: "the 16-byte CPI sits at offset 12 of the GCI data (after the 0x04 sub_stream_id); \
+           Dtk at pack bytes 84..88 opens 185/185 E-AC-3 packs, 83 or 85 opens 0/185",
 };
 
 /// Every `KS-n` quote, in ID order.
@@ -378,4 +404,6 @@ pub const ALL: &[&SpecQuote] = &[
     &KS_27_HDDVD_EVIDENCE,
     &KS_28_FILE_GRID_EVIDENCE,
     &KS_29_VID_FROM_MEDIA,
+    &KS_30_HDDVD_PACK_ENCRYPTION,
+    &KS_31_HDDVD_CPI_EVIDENCE,
 ];

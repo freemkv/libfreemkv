@@ -31,11 +31,11 @@ const STALL_RETRY_LIMIT: u32 = 2;
 
 // Hard ceiling on sectors read per probe call (256 MiB) — the same total the old head-first
 // design used, now SPREAD via `plan_windows` instead of spent on the title's first 27 seconds.
-const PROBE_BUDGET_SECTORS: u32 = 131_072;
+pub(super) const PROBE_BUDGET_SECTORS: u32 = 131_072;
 
 // Display sets a SAMPLED run must see on a track before "all forced" may be asserted: one hit
 // alone can wrongly promote a mostly-unflagged track.
-const PROMOTE_MIN_DISPLAY_SETS: u32 = 2;
+pub(super) const PROMOTE_MIN_DISPLAY_SETS: u32 = 2;
 
 // One sample window: ~32 MiB, a whole number of AACS aligned units (16_383 = 5461 units). Sized
 // against measured subtitle density.
@@ -59,9 +59,9 @@ const _: () = assert!(
 // `start_lba`, `len` sectors long. Both are whole AACS aligned units, so
 // every read inside stays on the unit grid the decrypting source demands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct SampleWindow {
-    offset: u32,
-    len: u32,
+pub(super) struct SampleWindow {
+    pub(super) offset: u32,
+    pub(super) len: u32,
 }
 
 /// Round DOWN to the AACS aligned-unit grid.
@@ -71,7 +71,7 @@ fn align_down(sectors: u32) -> u32 {
 
 // Where to read inside one extent, given the sector budget `share`: a pure function of
 // `(sector_count, share)` so the per-extent memo is reproducible.
-fn plan_windows(sector_count: u32, share: u32) -> Vec<SampleWindow> {
+pub(super) fn plan_windows(sector_count: u32, share: u32) -> Vec<SampleWindow> {
     if sector_count == 0 {
         return Vec::new();
     }

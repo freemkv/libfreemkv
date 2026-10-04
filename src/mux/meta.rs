@@ -230,7 +230,11 @@ impl M2tsMeta {
                 .collect(),
             content_format: match title.content_format {
                 crate::disc::ContentFormat::BdTs => String::new(),
-                crate::disc::ContentFormat::MpegPs => "mpeg_ps".into(),
+                // The DVD navigation does not survive into a transport stream: the
+                // container class is all a reader of this header can use.
+                crate::disc::ContentFormat::MpegPs | crate::disc::ContentFormat::DvdPs => {
+                    "mpeg_ps".into()
+                }
             },
             frame_padding: false,
         }

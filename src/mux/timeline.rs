@@ -525,7 +525,7 @@ impl TimelineContinuity {
         // plan from those would drop content the PTS wasn't measured against, so they keep inference.
         let seams = match content_format {
             crate::disc::ContentFormat::BdTs => SeamPlan::from_clips(clips),
-            crate::disc::ContentFormat::MpegPs => None,
+            crate::disc::ContentFormat::MpegPs | crate::disc::ContentFormat::DvdPs => None,
         };
         Self {
             epoch_offsets: Vec::new(),

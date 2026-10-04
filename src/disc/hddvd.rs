@@ -26,9 +26,9 @@ const EVO_PROBE_SECTORS: u32 = 8192;
 /// is generous while bounding probe memory.
 const EVO_ES_SAMPLE_CAP: usize = 128 * 1024;
 
-/// HD-DVD Standard Content navigation file magic (`HVDVD_TS/HVA*.VTI`). The VTI
-/// is the DVD-IFO analogue: it holds a fixed-stride clip table naming every
-/// `.evo` in authored order.
+/// HD-DVD Advanced VTS information file magic (`HVDVD_TS/HVA00001.VTI`). The VTI
+/// is the Advanced Content's DVD-IFO analogue: it holds a fixed-stride clip table
+/// naming every `.evo` in authored order.
 const HDDVD_VTI_MAGIC: &[u8] = b"ADVANCED-VTS";
 
 /// Byte stride between clip-table entries in the VTI. Each entry holds a
@@ -40,6 +40,67 @@ const VTI_CLIP_ENTRY_STRIDE: usize = 0x140;
 /// dozen entries; this bounds the scan so a crafted VTI packed with millions of
 /// `.EVO` tokens (up to the 64 MiB UDF read cap) can't burn CPU/memory.
 const MAX_VTI_HITS: usize = 8192;
+
+// Windows sampled per EVO, sectors per window, and EVOs sampled when judging whether an
+// HD DVD's content is scrambled.
+const SCRAMBLE_SAMPLE_WINDOWS: u64 = 2;
+const SCRAMBLE_SAMPLE_SECTORS: u32 = 32;
+const SCRAMBLE_SAMPLE_EVOS: usize = 3;
+
+/// Whether an HD DVD's EVOs are AACS-scrambled, judged per pack (`[HD]` §4.3.2:
+/// `PES_scrambling_control` is `01` on an encrypted pack). A rip keeps a renamed AACS
+/// directory (`ANY!`, `AAC!`) over clear EVOs, so the directory alone proves nothing.
+/// Samples windows of the largest EVOs; `None` when no window could be read.
+pub(crate) fn hddvd_content_scrambled(
+    reader: &mut dyn SectorSource,
+    udf_fs: &udf::UdfFs,
+) -> Option<bool> {
+    let dir = udf_fs.find_dir("/HVDVD_TS")?;
+    let mut evos: Vec<(&str, u64)> = dir
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(HDDVD_CLIP_EXT))
+        .map(|e| (e.name.as_str(), e.size))
+        .collect();
+    evos.sort_by_key(|e| std::cmp::Reverse(e.1));
+    let mut read_any = false;
+    for (name, _) in evos.into_iter().take(SCRAMBLE_SAMPLE_EVOS) {
+        let Ok(exts) = udf_fs.file_extents(reader, &format!("/HVDVD_TS/{name}")) else {
+            continue;
+        };
+        let total: u64 = exts.iter().map(|e| u64::from(e.1)).sum();
+        for w in 1..=SCRAMBLE_SAMPLE_WINDOWS {
+            let mut off = total * w / (SCRAMBLE_SAMPLE_WINDOWS + 1);
+            let Some(&(lba, left)) = exts.iter().find(|e| {
+                let hit = off < u64::from(e.1);
+                if !hit {
+                    off -= u64::from(e.1);
+                }
+                hit
+            }) else {
+                continue;
+            };
+            let n = (u64::from(left) - off).min(u64::from(SCRAMBLE_SAMPLE_SECTORS)) as u32;
+            let mut buf = vec![0u8; n as usize * crate::consts::SECTOR_BYTES];
+            let Ok(got) = reader.read_sectors(lba + off as u32, n as u16, &mut buf, false) else {
+                continue;
+            };
+            read_any = true;
+            let pack_scrambled = |p: &[u8; crate::consts::SECTOR_BYTES]| {
+                crate::aacs::hddvd::classify(p) == crate::aacs::hddvd::PackKind::Scrambled
+            };
+            if buf[..got.min(buf.len())]
+                .as_chunks::<{ crate::consts::SECTOR_BYTES }>()
+                .0
+                .iter()
+                .any(pack_scrambled)
+            {
+                return Some(true);
+            }
+        }
+    }
+    read_any.then_some(false)
+}
 
 // Parses the ADVANCED-VTS VTI clip-name table (authored order): collects every NUL-terminated
 // `*.EVO` name and keeps the largest group sharing one residue mod the stride (the clip table).
@@ -87,11 +148,15 @@ fn parse_vti_clip_order(vti: &[u8]) -> Vec<String> {
     best.into_iter().map(|(_, n)| n).collect()
 }
 
-// Whether a clip name begins `feature` (case-insensitive): `FEATURE_1`/`_2`
-// (layer-break split) or `feature`/`feature_Divide`, imaged as ONE title.
+// Whether a clip is a part of the split feature (case-insensitive): a name beginning `feature`
+// (`FEATURE_1`/`_2`, `feature`/`feature_Divide`) or a primary-EVOB part `PEVOB_<n>`.
 fn is_feature_clip(name: &str) -> bool {
     let base = name.rsplit_once('.').map(|(b, _)| b).unwrap_or(name);
-    base.to_ascii_lowercase().starts_with("feature")
+    let lower = base.to_ascii_lowercase();
+    lower.starts_with("feature")
+        || lower
+            .strip_prefix("pevob_")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // Sniffs a video codec from an MPEG-PS video ES sample by start code: MPEG-2 (`B3`), VC-1
@@ -244,8 +309,8 @@ fn collect_es(
 ) {
     use crate::consts::pes_stream_id::{PRIVATE_STREAM_1, VIDEO, VIDEO_MAX};
     const EXTENDED_STREAM_ID: u8 = 0xFD;
-    // VC-1 rides extended-stream-id `0xFD` ext `0x55`; other `0xFD` exts are HD audio
-    // (MLP/TrueHD, routing deferred), so only this ext is video.
+    // Main-video VC-1 rides extended-stream-id `0xFD` ext `0x55`. Ext `0x56` is the VC-1 sub
+    // video (picture-in-picture), not routed; TrueHD rides private_stream_1, never `0xFD`.
     const VC1_STREAM_ID_EXT: u8 = 0x55;
     // Whether this packet is the VC-1 video sub-stream of the 0xFD extended id.
     let is_vc1_ext =
@@ -472,10 +537,36 @@ fn xpl_depth_within_limit(text: &str) -> bool {
     true
 }
 
+// `[HD]` §4.4.2: the 283-byte header of an AACS-encapsulated Advanced Resource File, and its
+// FILE_ID. Bytes 7..11 hold the Resource Data size Nfs (Tables 4-12 to 4-14).
+const ARF_HEADER_LEN: usize = 283;
+const ARF_FILE_ID: &[u8; 4] = b"AACS";
+
+// The Resource Data of an AACS-encapsulated ARF (a genuine disc's playlist), or the bytes
+// themselves when bare (a rip strips the wrapper). Hash (`12h`), MAC (`02h`) and Non-Protected
+// (`21h`) formats carry it in the clear after the header; `None` for the encrypted ones.
+fn arf_resource(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < ARF_HEADER_LEN || !bytes.starts_with(ARF_FILE_ID) {
+        return Some(bytes);
+    }
+    match bytes[4] {
+        0x02 | 0x12 | 0x21 => {
+            let nfs = u32::from_be_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]) as usize;
+            let end = ARF_HEADER_LEN.saturating_add(nfs).min(bytes.len());
+            Some(&bytes[ARF_HEADER_LEN..end])
+        }
+        _ => None,
+    }
+}
+
 // Parses the Advanced-Content playlist into its titles, matching elements by
 // LOCAL name (default `HDDVDVideo/Playlist` namespace). Empty for a
 // non-XML/non-playlist blob or one over MAX_XPL_DEPTH (falls back to clip-name).
 fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
+    let Some(xpl) = arf_resource(xpl) else {
+        tracing::warn!(target: "freemkv::disc", "playlist is an encrypted AACS ARF: not parsed");
+        return Vec::new();
+    };
     let text = String::from_utf8_lossy(xpl);
     if !xpl_depth_within_limit(&text) {
         return Vec::new();
@@ -1112,6 +1203,10 @@ mod tests {
         assert!(is_feature_clip("feature.EVO"));
         assert!(is_feature_clip("feature_Divide.EVO"));
         // Extras are not the feature.
+        assert!(is_feature_clip("PEVOB_1.EVO"));
+        assert!(is_feature_clip("pevob_2.evo"));
+        assert!(!is_feature_clip("PEVOB_.EVO"));
+        assert!(!is_feature_clip("PEVOB_MENU.EVO"));
         assert!(!is_feature_clip("TRAILER.EVO"));
         assert!(!is_feature_clip("DLS_01.EVO"));
         assert!(!is_feature_clip("EPK.EVO"));
@@ -1929,6 +2024,33 @@ mod tests {
         assert_eq!(del.name, "Deleted Scenes - Veronica Past");
         assert_eq!(del.clips.len(), 1);
         assert_eq!(del.clips[0].evo, "del5_veronicapast.evo");
+    }
+
+    // `[HD]` §4.4.2 Table 4-13 (Encapsulation Format for Hash): "AACS", type 12h, reserved,
+    // Nfs at bytes 7..11, the 272-byte Resource File Name field, the data, a Hash Pointer.
+    fn arf(kind: u8, data: &[u8]) -> Vec<u8> {
+        let mut v = b"AACS".to_vec();
+        v.extend_from_slice(&[kind, 0, 0]);
+        v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut name = b"VPLST000.XPL.AACS".to_vec();
+        name.resize(272, 0);
+        v.extend_from_slice(&name);
+        v.extend_from_slice(data);
+        v.extend_from_slice(&1u32.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn parse_xpl_titles_reads_a_playlist_wrapped_as_an_aacs_arf() {
+        let bare = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert!(!bare.is_empty());
+        for kind in [0x12, 0x02, 0x21] {
+            let wrapped = parse_xpl_titles(&arf(kind, SYNTH_XPL.as_bytes()));
+            assert_eq!(wrapped.len(), bare.len(), "type {kind:#04x}");
+            assert_eq!(wrapped[0].duration_secs, bare[0].duration_secs);
+        }
+        // Encrypted ARFs (01h, 11h) cannot be read without the Title Key.
+        assert!(parse_xpl_titles(&arf(0x11, SYNTH_XPL.as_bytes())).is_empty());
     }
 
     #[test]

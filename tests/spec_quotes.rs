@@ -110,11 +110,11 @@ fn const_names_agree_with_ids() {
     );
 }
 
-/// `KS-1`…`KS-29` exist, in order, with no gap (KU design §3.6.1 rule 4).
+/// `KS-1`…`KS-31` exist, in order, with no gap (KU design §3.6.1 rule 4).
 #[test]
-fn keys_quotes_are_ks_1_to_29_in_order() {
+fn keys_quotes_are_ks_1_to_31_in_order() {
     let ids: Vec<&str> = spec::keys::ALL.iter().map(|q| q.id).collect();
-    let want: Vec<String> = (1..=29).map(|n| format!("KS-{n}")).collect();
+    let want: Vec<String> = (1..=31).map(|n| format!("KS-{n}")).collect();
     assert_eq!(ids, want);
 }
 

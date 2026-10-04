@@ -842,23 +842,23 @@ pub(crate) fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> Dem
         };
         pids.push(pid);
         pid_to_track.push((pid, idx));
-        let is_dvd_ps = matches!(format, ContentFormat::MpegPs);
+        let is_ps = format.is_program_stream();
         // The Blu-ray 3D MVC dependent (right-eye) view uses a param-set-
         // passthrough H.264 parser so each frame is a self-contained
         // dependent access unit for a BlockAdditional.
         let parser = match s {
             crate::disc::Stream::Video(v) if v.is_mvc_dependent() => {
-                super::codec::parser_for_mvc_dependent(codec, is_dvd_ps)
+                super::codec::parser_for_mvc_dependent(codec, is_ps)
             }
             crate::disc::Stream::Audio(a) if a.is_mp2_extension() => {
                 super::codec::parser_for_mp2_extension()
             }
-            _ => super::codec::parser_for_codec(codec, None, is_dvd_ps),
+            _ => super::codec::parser_for_codec(codec, None, is_ps),
         };
         parsers.push((pid, parser));
     }
     let (ts, ps) = match format {
-        ContentFormat::MpegPs => (None, Some(super::ps::PsDemuxer::new())),
+        ContentFormat::MpegPs | ContentFormat::DvdPs => (None, Some(super::ps::PsDemuxer::new())),
         ContentFormat::BdTs => {
             if pids.is_empty() {
                 (None, None)
@@ -1675,14 +1675,16 @@ mod tests {
         assert!(ps.is_none());
     }
 
-    /// MpegPs format must build a PsDemuxer (None(ts), Some(ps)) regardless
-    /// of PIDs — DVD program streams demux via the PS path.
+    /// Both program-stream formats (HD DVD / plain PS, and DVD) build a PsDemuxer
+    /// (None(ts), Some(ps)) regardless of PIDs: the container is the same.
     #[test]
     fn build_demux_state_mpegps_builds_ps_demuxer() {
         let t = aac_audio_title(0xBD80);
-        let (_parsers, _p2t, ts, ps) = build_demux_state(&t, ContentFormat::MpegPs);
-        assert!(ts.is_none());
-        assert!(ps.is_some(), "MpegPs → PsDemuxer");
+        for format in [ContentFormat::MpegPs, ContentFormat::DvdPs] {
+            let (_parsers, _p2t, ts, ps) = build_demux_state(&t, format);
+            assert!(ts.is_none());
+            assert!(ps.is_some(), "{format:?} → PsDemuxer");
+        }
     }
 
     /// An empty BdTs title (no streams) must NOT construct a TsDemuxer —
@@ -1976,7 +1978,7 @@ mod tests {
             title,
             DecryptKeys::None,
             8192,
-            ContentFormat::MpegPs,
+            ContentFormat::DvdPs,
             false,
             &crate::ctx::Ctx::default(),
         );

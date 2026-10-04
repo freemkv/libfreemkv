@@ -127,19 +127,36 @@ pub(crate) fn handshake_class_error(e: &Error) -> Option<Error> {
     }
 }
 
+// `Some(true)` for an `INDX0300` index.bdmv, `Some(false)` for another INDX version, `None`
+// when there is no readable index (HD DVD, damage). `Err` only for a Stop.
+pub(super) fn index_is_uhd(
+    udf_fs: &udf::UdfFs,
+    reader: &mut dyn SectorSource,
+) -> Result<Option<bool>> {
+    let index = match udf_fs.read_file_prefix(reader, "/BDMV/index.bdmv", 8) {
+        Ok(index) => index,
+        Err(Error::Halted) => return Err(Error::Halted),
+        Err(_) => return Ok(None),
+    };
+    let version = index.get(..8).and_then(|v| v.strip_prefix(b"INDX"));
+    Ok(version.map(|v| v == b"0300"))
+}
+
 // Positive UHD evidence independent of the cert: index.bdmv version "0300"
-// (BD-ROM Part 3) or an AACS2 MKB. Unknown is `false`.
-fn disc_is_uhd(udf_fs: &udf::UdfFs, reader: &mut dyn SectorSource) -> bool {
+// (BD-ROM Part 3) or an AACS2 MKB. Unknown is `false`; `Err` only for a Stop.
+fn disc_is_uhd(udf_fs: &udf::UdfFs, reader: &mut dyn SectorSource) -> Result<bool> {
     use crate::aacs::mkb::{AacsVersion, mkb_type};
-    let index = udf_fs.read_file_prefix(reader, "/BDMV/index.bdmv", 8);
-    if index.is_ok_and(|d| d.get(..8) == Some(&b"INDX0300"[..])) {
-        return true;
+    if index_is_uhd(udf_fs, reader)? == Some(true) {
+        return Ok(true);
     }
-    udf_fs
-        .read_file_prefix(reader, crate::aacs::PATH_MKB_RO, 64)
-        .ok()
-        .and_then(|m| mkb_type(&m).map(|t| t.generation()))
-        .is_some_and(|g| matches!(g, AacsVersion::V20 | AacsVersion::V21))
+    let mkb = match udf_fs.read_file_prefix(reader, crate::aacs::PATH_MKB_RO, 64) {
+        Ok(mkb) => mkb,
+        Err(Error::Halted) => return Err(Error::Halted),
+        Err(_) => return Ok(false),
+    };
+    Ok(mkb_type(&mkb)
+        .map(|t| t.generation())
+        .is_some_and(|g| matches!(g, AacsVersion::V20 | AacsVersion::V21)))
 }
 
 /// A disc's AACS files, read before any AACS command is sent to the drive.
@@ -205,15 +222,10 @@ pub(super) fn capture(
         }
     };
     let cc = cc_raw.as_deref().and_then(aacs::inf::parse_content_cert);
-    // No-cert default = UHD (V20 stride), matching `read_aacs_version`.
-    let version = cc
-        .as_ref()
-        .map(|c| c.version.major())
-        .unwrap_or(aacs::mkb::AACS_MAJOR_UHD);
     // Fail safe: an unparseable cert, or none on a live disc known to be UHD, may mean bus encryption.
     let bus_encryption = match &cc {
         Some(c) => c.bus_encryption,
-        None => cc_raw.is_some() || (live && disc_is_uhd(udf_fs, reader)),
+        None => cc_raw.is_some() || (live && disc_is_uhd(udf_fs, reader)?),
     };
     // The bounded MKB reader, not `read_file` (the ~128 MiB padded MKB would fail).
     let mkb = match Disc::read_mkb_content(reader, udf_fs) {
@@ -229,6 +241,12 @@ pub(super) fn capture(
             Vec::new()
         }
     };
+    // Stride version through the shared resolver (cert, then MKB type, then index.bdmv),
+    // the same one `read_aacs_version` uses.
+    let index = index_is_uhd(udf_fs, reader)?;
+    let version =
+        aacs::mkb::resolve_aacs_version(cc.as_ref().map(|c| c.version.major()), &mkb, index)
+            .major();
     Ok(AacsCapture {
         uk_ro,
         cert_bee: cc.map(|c| c.bus_encryption),
@@ -764,6 +782,44 @@ mod tests {
         state.ok_or_else(|| err.unwrap_or(Error::AacsNoKeys))
     }
 
+    // A Stop while reading index.bdmv (the stride's last resort, and the UHD check of a live
+    // disc with no cert) ends the capture as Halted, not as an unknown index.
+    #[test]
+    fn a_stop_reading_the_index_is_halted() {
+        struct StopAt<'a>(&'a mut MemDisc, u32);
+        impl SectorSource for StopAt<'_> {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                recovery: bool,
+            ) -> Result<usize> {
+                if lba == self.1 {
+                    return Err(Error::Halted);
+                }
+                self.0.read_sectors(lba, count, buf, recovery)
+            }
+        }
+        for from in [CaptureFrom::Image, CaptureFrom::Live] {
+            let mut disc = MemDisc::new();
+            let uk = AacsFile {
+                name: "Unit_Key_RO.inf",
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vec![0xAB; 32],
+            };
+            let udf = build_aacs_fs_with_index(&mut disc, &[uk], Some(b"INDX0300"));
+            let mut reader = StopAt(&mut disc, PART_START + 7000);
+            let cap = capture(&mut reader, &udf, from);
+            assert!(
+                matches!(cap, Err(Error::Halted)),
+                "live: {}",
+                from == CaptureFrom::Live
+            );
+        }
+    }
+
     /// Missing Unit_Key_RO.inf (and its DUPLICATE) → Error::AacsNoKeys
     /// (encrypt.rs `.map_err(|_| Error::AacsNoKeys)`). Never panics.
     #[test]
@@ -829,8 +885,24 @@ mod tests {
         assert!(st.bus_encryption, "cert bus_encryption bit must propagate");
     }
 
-    // No content cert → version defaults to UHD (major 2), matching read_aacs_version (audit
-    // #4). bus_encryption false (unreadable → off).
+    // No content cert: the stride version comes from the shared resolver, so an INDX0200
+    // index makes it a BD (major 1) rather than the UHD default.
+    #[test]
+    fn vid_only_no_cert_takes_the_version_from_index_bdmv() {
+        let mut disc = MemDisc::new();
+        let uk = [AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: vec![0xAB; 32],
+        }];
+        let udf = build_aacs_fs_with_index(&mut disc, &uk, Some(b"INDX0200"));
+        let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+        assert_eq!(st.version, aacs::mkb::AACS_MAJOR_BD);
+    }
+
+    // No content cert, MKB or index → version defaults to UHD (major 2), matching
+    // read_aacs_version (audit #4). bus_encryption false (unreadable → off).
     #[test]
     fn vid_only_no_cert_defaults_version_uhd() {
         let mut disc = MemDisc::new();

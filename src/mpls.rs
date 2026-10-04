@@ -86,6 +86,9 @@ pub struct StreamEntry {
     pub dynamic_range: u8,
     /// Color space (0=unknown, 1=BT.709, 2=BT.2020)
     pub color_space: u8,
+    /// HEVC `hdr_plus_flag`: bit 6 of the byte after `color_space` (bit 7 is
+    /// `cr_flag`), set when the stream carries HDR10+ (ST 2094-40) metadata.
+    pub hdr_plus: bool,
     /// Whether this is a secondary stream (commentary, PiP, DV EL)
     pub secondary: bool,
 }
@@ -437,6 +440,7 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
     let mut audio_rate = 0u8;
     let mut dynamic_range = 0u8;
     let mut color_space_val = 0u8;
+    let mut hdr_plus = false;
     let mut language = String::new();
 
     // `stream_type` is the STN category from the caller — always a primary category
@@ -452,6 +456,7 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
             if coding_type == c::HEVC && sa.len() > 2 {
                 dynamic_range = (sa[2] >> 4) & 0x0F;
                 color_space_val = sa[2] & 0x0F;
+                hdr_plus = sa.get(3).is_some_and(|b| b & 0x40 != 0);
             }
         }
         STREAM_CATEGORY_AUDIO => {
@@ -499,6 +504,7 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
             language,
             dynamic_range,
             color_space: color_space_val,
+            hdr_plus,
             secondary: false,
         },
         sa_end,
@@ -1288,6 +1294,27 @@ mod tests {
         assert_eq!(pl.streams[0].coding_type, 0x1B);
         assert_eq!(pl.streams[0].dynamic_range, 0); // not parsed for H264
         assert_eq!(pl.streams[0].color_space, 0);
+    }
+
+    // HEVC hdr_plus_flag is bit 6 of sa[3]; cr_flag (bit 7)
+    // alone must not read as HDR10+, and a 3-byte attribute block has no flag.
+    #[test]
+    fn hevc_hdr_plus_flag_is_bit_6_of_the_fourth_attribute_byte() {
+        let entry = |attrs: &[u8]| {
+            let mut out = vec![3u8, 0x01, 0x10, 0x11, attrs.len() as u8];
+            out.extend_from_slice(attrs);
+            let data = build_mpls(
+                &[(b"00001", 1, 0, 9000000)],
+                (1, 0, 0, 0, 0, 0, 0, 0),
+                &[out],
+            );
+            parse(&data).expect("should parse").streams[0].hdr_plus
+        };
+        assert!(entry(&[0x24, 0x81, 0x12, 0x40]));
+        assert!(!entry(&[0x24, 0x81, 0x12, 0x80]));
+        assert!(!entry(&[0x24, 0x81, 0x12, 0x00]));
+        assert!(!entry(&[0x24, 0x81, 0x12]));
+        assert!(!entry(&[0x1B, 0x61, 0x12, 0x40]), "not read for non-HEVC");
     }
 
     // Audio language is at sa[2..5] normally, EXCEPT when the audio slot

@@ -5,6 +5,8 @@
 pub mod content;
 pub mod crypto;
 pub mod derive;
+// HD DVD per-pack content encryption (`[HD]` §4.3).
+pub(crate) mod hddvd;
 pub mod host_certs;
 // No production caller; not the live FMTS path.
 #[doc(hidden)]
@@ -45,16 +47,22 @@ pub enum AacsRole {
     ContentCert,
 }
 
-// The HD DVD AACS directory in a parsed UDF tree, if present. Identified structurally (name
-// ends `!`, contains MKBROM.AACS), not by a hardcoded name.
+// The HD DVD AACS directory in a parsed UDF tree, if present: any root directory holding
+// MKBROM.AACS, whatever its name (`ANY!`, `AAC!`, plain `AACS` on "300"). A `*_BAK` mirror
+// is used only when no primary copy exists.
 pub(crate) fn find_hddvd_aacs_dir(udf: &crate::udf::UdfFs) -> Option<&crate::udf::DirEntry> {
-    udf.root.entries.iter().find(|e| {
+    let mut dirs = udf.root.entries.iter().filter(|e| {
         e.is_dir
-            && e.name.ends_with('!')
             && e.entries
                 .iter()
                 .any(|c| !c.is_dir && c.name.eq_ignore_ascii_case("MKBROM.AACS"))
-    })
+    });
+    let is_bak = |e: &crate::udf::DirEntry| e.name.to_ascii_uppercase().ends_with("_BAK");
+    let first = dirs.next()?;
+    if !is_bak(first) {
+        return Some(first);
+    }
+    dirs.find(|e| !is_bak(e)).or(Some(first))
 }
 
 // Ordered candidate paths for an AACS key role: fixed BD/UHD `/AACS/…` paths
@@ -252,6 +260,7 @@ mod tests {
             &[],
             &[],
             None,
+            super::mkb::AacsVersion::V10,
         );
     }
 
@@ -300,7 +309,7 @@ mod tests {
         lay_dir(&mut disc, &root);
         let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
 
-        // Discovered structurally (ends in '!', holds MKBROM.AACS) — the real
+        // Discovered structurally (holds MKBROM.AACS) — the real
         // AACS dir, never the `_BAK` mirror.
         let dir = super::find_hddvd_aacs_dir(&udf).expect("aacs dir");
         assert_eq!(dir.name, "AAC!");
@@ -330,8 +339,80 @@ mod tests {
         );
     }
 
-    // Both the `!`-suffix AND MKBROM.AACS presence are required (conjunction, not disjunction)
-    // — else the HD DVD path resolves key files under a dir holding none.
+    // "300" HD DVDs keep MKBROM/VTKF/CONTENT_CERT in a plain `/AACS` (mirror `AACS_BAK`):
+    // found by MKBROM.AACS, not the name, and the mirror is skipped even when listed first.
+    #[test]
+    fn a_plain_aacs_directory_holding_mkbrom_is_the_hddvd_aacs_directory() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let dir = |name: &str, lba: u32, files| DirSpec {
+            name: name.to_string(),
+            icb_lba: lba,
+            dir_data_lba: lba + 1,
+            files,
+            subdirs: vec![],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![
+                dir(
+                    "AACS_BAK",
+                    30,
+                    vec![file("MKBROM.AACS", 110, 6000, 4096, true)],
+                ),
+                dir(
+                    "AACS",
+                    20,
+                    vec![
+                        file("MKBROM.AACS", 100, 5000, 4096, true),
+                        file("CONTENT_CERT.AACS", 101, 5100, 2048, true),
+                        file("VTKF000.AACS", 102, 5200, 2048, true),
+                    ],
+                ),
+            ],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(super::find_hddvd_aacs_dir(&udf).expect("dir").name, "AACS");
+        let mkb = super::role_paths(&udf, super::AacsRole::Mkb);
+        assert_eq!(mkb.last().unwrap(), "/AACS/MKBROM.AACS");
+        let uk = super::role_paths(&udf, super::AacsRole::UnitKey);
+        assert_eq!(uk.last().unwrap(), "/AACS/VTKF000.AACS");
+    }
+
+    // A mirror alone is still used: a damaged primary must not leave the disc unkeyable.
+    #[test]
+    fn a_lone_bak_mirror_is_used_when_no_primary_exists() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "ANY!_BAK".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: vec![file("MKBROM.AACS", 100, 5000, 4096, true)],
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(
+            super::find_hddvd_aacs_dir(&udf).expect("dir").name,
+            "ANY!_BAK"
+        );
+    }
+
+    // MKBROM.AACS presence is required — else the HD DVD path resolves key files under a
+    // dir holding none.
     #[test]
     fn a_bang_suffixed_directory_without_mkbrom_is_not_the_aacs_directory() {
         use crate::udf::fixture::*;

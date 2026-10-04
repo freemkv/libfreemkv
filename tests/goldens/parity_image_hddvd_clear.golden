@@ -1,6 +1,6 @@
-resolve-whole status = KeySetStatus { proven: 1, declared: Some(1), keyed: 1, clear: 0, lazy: 0, forensic: None, origin: Some("keydb"), best_effort: true, requests: 1 }
+resolve-whole status = KeySetStatus { proven: 0, declared: Some(1), keyed: 0, clear: 1, lazy: 0, forensic: None, origin: None, best_effort: false, requests: 0 }
 copy written = 8460288
-copy image = 8460288 bytes sha256:438eaf4106ce92a5550c5fa70574a2d2
-extract result = good=61440 unreadable=6144 complete=false halted=false files=[("BDMV/index.bdmv", 0, 6144, true), ("HVDVD_TS/FEATURE.EVO", 61440, 0, true)]
-extract out BDMV/index.bdmv = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
-extract out HVDVD_TS/FEATURE.EVO = 61440 bytes sha256:9be03259626dabeb7c985b6930729f99
+copy image = 8460288 bytes sha256:9b9a739e6f30ca537420be3c2cabdcb5
+extract result = good=67584 unreadable=0 complete=true halted=false files=[("BDMV/index.bdmv", 6144, 0, true), ("HVDVD_TS/FEATURE.EVO", 61440, 0, true)]
+extract out BDMV/index.bdmv = 6144 bytes sha256:3a25ec8e4276a359fbd2da7b70b74436
+extract out HVDVD_TS/FEATURE.EVO = 61440 bytes sha256:86e86d1801294d6e82d91d2779c16cea

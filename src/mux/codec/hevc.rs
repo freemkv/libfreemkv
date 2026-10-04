@@ -135,7 +135,7 @@ pub struct HevcParser {
     needs: std::collections::VecDeque<Need>,
     // HDR10 static metadata from prefix/suffix SEI: mastering display (137) and
     // content light level (144), captured independently and sticky (first wins).
-    // `hdr10()` combines both only when present; SDR streams stay `None`, never fabricated.
+    // `hdr10()` needs the mastering SEI; content light is optional (some UHD discs omit it).
     sei_mastering: Option<MasteringDisplay>,
     sei_content_light: Option<ContentLightLevel>,
     /// Display-order PTS reconstruction, enabled only on the program-stream
@@ -260,11 +260,11 @@ impl HevcParser {
             .collect()
     }
 
-    // Combines mastering-display + content-light SEI into Hdr10Metadata, or `None` until BOTH
-    // are seen — never a half-populated (confidently-wrong) HDR10 record.
+    // Mastering-display SEI as Hdr10Metadata, with content light when that SEI was seen too.
+    // `None` until the mastering SEI arrives; a missing content-light SEI is never zero-filled.
     fn hdr10(&self) -> Option<crate::mux::codec::Hdr10Metadata> {
         let m = self.sei_mastering?;
-        let c = self.sei_content_light?;
+        let c = self.sei_content_light;
         Some(crate::mux::codec::Hdr10Metadata {
             display_primaries_x: m.display_primaries_x,
             display_primaries_y: m.display_primaries_y,
@@ -272,8 +272,8 @@ impl HevcParser {
             white_point_y: m.white_point_y,
             max_display_mastering_luminance: m.max_display_mastering_luminance,
             min_display_mastering_luminance: m.min_display_mastering_luminance,
-            max_content_light_level: c.max_content_light_level,
-            max_pic_average_light_level: c.max_pic_average_light_level,
+            max_content_light_level: c.map(|c| c.max_content_light_level),
+            max_pic_average_light_level: c.map(|c| c.max_pic_average_light_level),
         })
     }
 
@@ -657,7 +657,7 @@ impl CodecParser for HevcParser {
         };
 
         // HDR10 static metadata is stamped onto every frame's PictureInfo once
-        // both SEI messages are seen, riding the deferred-muxer path (reads it
+        // the mastering SEI is seen (at the first IRAP), riding the deferred-muxer path (reads it
         // from the first coded picture before the track header). `None` for SDR tracks.
         let hdr10 = self.hdr10();
         let frame = Frame {
@@ -1345,8 +1345,8 @@ mod tests {
         assert_eq!(h.white_point_y, wp_y);
         assert_eq!(h.max_display_mastering_luminance, max_lum);
         assert_eq!(h.min_display_mastering_luminance, min_lum);
-        assert_eq!(h.max_content_light_level, maxcll);
-        assert_eq!(h.max_pic_average_light_level, maxfall);
+        assert_eq!(h.max_content_light_level, Some(maxcll));
+        assert_eq!(h.max_pic_average_light_level, Some(maxfall));
     }
 
     // The FIRST mastering-display / content-light SEI wins; later repeats (or a corrupt splice)
@@ -1423,7 +1423,7 @@ mod tests {
             v.push(0xEC);
             v
         };
-        // Every AU carries BOTH HDR10 SEI messages, as a real HDR10 stream does.
+        // Every AU here carries both HDR10 SEI messages (discs repeat them at each IRAP).
         let au = || {
             let mut data = pps.clone();
             data.extend_from_slice(&sei_nal(&[
@@ -1483,35 +1483,50 @@ mod tests {
         assert_eq!(RBSP_COPIES.with(|c| c.get()), 0);
     }
 
-    /// Only the mastering-display SEI (no content-light SEI) → metadata is NOT
-    /// surfaced. HDR10 requires BOTH; a half-populated record is never emitted.
+    /// Mastering-display SEI without a content-light SEI (Deadpool, Sicario, Lucy, ... UHD
+    /// discs) surfaces the mastering metadata with MaxCLL/MaxFALL absent, not zero. The SEI
+    /// rides the IRAP only; the following non-IRAP pictures carry the sticky value.
     #[test]
-    fn hevc_requires_both_hdr10_sei_messages() {
-        let pps = {
-            let mut v = vec![0x00, 0x00, 0x01];
-            v.extend_from_slice(&hevc_nal_header(NAL_PPS));
-            v.push(0xC0);
-            v
-        };
-        let idr = {
-            let mut v = vec![0x00, 0x00, 0x01];
-            v.extend_from_slice(&hevc_nal_header(19));
-            v.push(0xEC); // IDR: first_slice + no_output + pps_id 0 + slice_type I
-            v
-        };
-        let mut data = pps;
-        data.extend_from_slice(&sei_nal(&[sei_message(
+    fn hevc_mastering_sei_alone_surfaces_hdr10_without_content_light() {
+        let mut irap = nal_bytes(NAL_PPS, &[0xC0]);
+        irap.extend_from_slice(&sei_nal(&[sei_message(
             SEI_MASTERING_DISPLAY_COLOUR_VOLUME,
             &mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, 9, 10),
         )]));
-        data.extend_from_slice(&idr);
+        irap.extend_from_slice(&nal_bytes(19, &[0xEC]));
+        // TRAIL_R: first_slice 1, pps_id 0, slice_type P (0xD0); no SEI on this access unit.
+        let trail = nal_bytes(1, &[0xD0]);
 
         let mut parser = HevcParser::new();
+        let mut frames = parser.parse(&make_pes(irap, Some(0)));
+        frames.extend(parser.parse(&make_pes(trail.clone(), Some(3750))));
+        frames.extend(parser.parse(&make_pes(trail, Some(7500))));
+        assert!(frames.len() >= 2, "IRAP and a trailing picture must emerge");
+        for f in &frames {
+            let h = f
+                .coding
+                .unwrap()
+                .hdr10()
+                .expect("mastering-only must surface");
+            assert_eq!(h.max_display_mastering_luminance, 9);
+            assert_eq!(h.min_display_mastering_luminance, 10);
+            assert_eq!(h.max_content_light_level, None);
+            assert_eq!(h.max_pic_average_light_level, None);
+        }
+    }
+
+    /// Content-light SEI without mastering display has no mastering record to carry it.
+    #[test]
+    fn hevc_content_light_alone_surfaces_no_hdr10() {
+        let mut data = nal_bytes(NAL_PPS, &[0xC0]);
+        data.extend_from_slice(&sei_nal(&[sei_message(
+            SEI_CONTENT_LIGHT_LEVEL_INFO,
+            &cll_payload(1000, 400),
+        )]));
+        data.extend_from_slice(&nal_bytes(19, &[0xEC]));
+        let mut parser = HevcParser::new();
         let frames = parser.parse(&make_pes(data, Some(0)));
-        assert!(
-            frames[0].coding.unwrap().hdr10().is_none(),
-            "mastering-only stream must NOT surface HDR10 (content-light absent)"
-        );
+        assert!(frames[0].coding.unwrap().hdr10().is_none());
     }
 
     /// An SDR stream with no HDR10 SEI at all leaves hdr10() None — never faked.

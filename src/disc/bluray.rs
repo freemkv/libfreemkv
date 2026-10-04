@@ -322,7 +322,9 @@ impl Disc {
                         codec,
                         resolution: Resolution::from_video_format(s.video_format),
                         frame_rate: FrameRate::from_video_rate(s.video_rate),
+                        // Dolby Vision is its own (EL) entry; HDR10+ rides the HDR10 base.
                         hdr: match s.dynamic_range {
+                            1 if s.hdr_plus => HdrFormat::Hdr10Plus,
                             1 => HdrFormat::Hdr10,
                             2 => HdrFormat::DolbyVision,
                             _ => HdrFormat::Sdr,
@@ -362,7 +364,7 @@ impl Disc {
                             Some(Stream::Audio(AudioStream {
                                 pid: s.pid,
                                 codec,
-                                channels: AudioChannels::from_audio_format(s.audio_format),
+                                channels: playlist_channels(s.audio_format, codec),
                                 language: s.language.clone(),
                                 sample_rate: SampleRate::from_audio_rate(s.audio_rate),
                                 secondary: s.stream_type == 5,
@@ -509,12 +511,11 @@ impl Disc {
                             if let Some(end) = xml[s..].find("</di:name>") {
                                 // Disc-authored text reaches terminals and file names:
                                 // control characters (decoded from `&#27;` too) are dropped.
-                                let title: String = xml_text_decode(xml[s..s + end].trim())
-                                    .chars()
-                                    .filter(|c| !c.is_control())
-                                    .collect();
-                                let title = title.trim().to_string();
-                                if !title.is_empty() && title != "Blu-ray" {
+                                let title = crate::labels::display_text(&xml_text_decode(
+                                    xml[s..s + end].trim(),
+                                ));
+                                if !title.is_empty() && !crate::labels::is_placeholder_title(&title)
+                                {
                                     return Some(title);
                                 }
                             }
@@ -589,6 +590,16 @@ fn xml_text_decode(raw: &str) -> String {
     out
 }
 
+// Playlist audio_format 6 is "multi-channel" with no count. DTS-HD and DD+ reach 7.1 and
+// nothing here re-reads their layout, so 6 stays Unknown rather than a claimed 5.1; AC-3 and
+// DTS core top out at 5.1, and TrueHD and LPCM are completed from the stream later.
+fn playlist_channels(audio_format: u8, codec: Codec) -> AudioChannels {
+    match (audio_format, codec) {
+        (6, Codec::DtsHdMa | Codec::DtsHdHr | Codec::Ac3Plus) => AudioChannels::Unknown,
+        _ => AudioChannels::from_audio_format(audio_format),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,10 +652,21 @@ mod tests {
     /// high nibble = dynamic_range, low nibble = color_space (mpls.rs only
     /// parses this byte for coding_type == HEVC and sa.len() > 2).
     fn se_video_hevc(pid: u16, dynamic_range: u8, color_space: u8) -> Vec<u8> {
+        se_video_hevc_flags(pid, dynamic_range, color_space, None)
+    }
+
+    // HEVC entry with an optional fourth attribute byte (cr_flag / hdr_plus_flag).
+    fn se_video_hevc_flags(
+        pid: u16,
+        dynamic_range: u8,
+        color_space: u8,
+        flags: Option<u8>,
+    ) -> Vec<u8> {
         let mut out = vec![3u8, 0x01];
         out.extend_from_slice(&pid.to_be_bytes());
         let hdr_byte = (dynamic_range << 4) | color_space;
-        let attrs = vec![0x24u8, 0x10, hdr_byte]; // coding_type = HEVC
+        let mut attrs = vec![0x24u8, 0x10, hdr_byte]; // coding_type = HEVC
+        attrs.extend(flags);
         out.push(attrs.len() as u8);
         out.extend_from_slice(&attrs);
         out
@@ -1589,6 +1611,49 @@ mod tests {
             .expect("video stream");
         assert_eq!(v.hdr, HdrFormat::Hdr10);
         assert_eq!(v.color_space, ColorSpace::Bt2020);
+    }
+
+    // audio_format 6 claims no count: DTS-HD / DD+ (up to 7.1) stay Unknown, not 5.1.
+    #[test]
+    fn multi_channel_audio_format_is_not_claimed_as_5_1_for_7_1_capable_codecs() {
+        for c in [Codec::DtsHdMa, Codec::DtsHdHr, Codec::Ac3Plus] {
+            assert_eq!(playlist_channels(6, c), AudioChannels::Unknown, "{c:?}");
+            assert_eq!(playlist_channels(3, c), AudioChannels::Stereo, "{c:?}");
+        }
+        for c in [Codec::Ac3, Codec::Dts, Codec::TrueHd, Codec::Lpcm] {
+            assert_eq!(playlist_channels(6, c), AudioChannels::Surround51, "{c:?}");
+        }
+    }
+
+    /// HDR10 base with hdr_plus_flag -> HDR10+; the DV enhancement-layer entry of the
+    /// same playlist (dynamic_range 2) stays Dolby Vision whatever its flag byte holds.
+    #[test]
+    fn parse_playlist_maps_hdr_plus_flag_to_hdr10_plus() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let el = se_video_hevc_flags(0x1015, 2, 2, Some(0x40));
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 0, 0, 0, 0, 0, 0, 1),
+            &[se_video_hevc_flags(0x1011, 1, 2, Some(0x40)), el],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        let hdr: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Video(v) => Some(v.hdr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hdr, vec![HdrFormat::Hdr10Plus, HdrFormat::DolbyVision]);
     }
 
     /// dynamic_range 2 -> DolbyVision, color_space 1 -> BT.709: the other

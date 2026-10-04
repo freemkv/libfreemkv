@@ -156,8 +156,9 @@ pub(crate) fn resolve_dvd_title_key(
     if raw {
         return Ok(());
     }
+    // CSS is DVD-Video's alone: an HD DVD `.evo` or a plain program stream is never cracked.
     if matches!(keys, crate::decrypt::DecryptKeys::None)
-        && format == crate::disc::ContentFormat::MpegPs
+        && format == crate::disc::ContentFormat::DvdPs
     {
         *keys = crack_title_key(reader, extents, batch_sectors, halt)?;
     }
@@ -1544,7 +1545,7 @@ mod tests {
             &extents,
             &mut keys,
             4,
-            crate::disc::ContentFormat::MpegPs,
+            crate::disc::ContentFormat::DvdPs,
             false,
             None,
         )
@@ -1574,7 +1575,7 @@ mod tests {
             &extents,
             &mut keys,
             4,
-            crate::disc::ContentFormat::MpegPs,
+            crate::disc::ContentFormat::DvdPs,
             false,
             None,
         )
@@ -1619,6 +1620,34 @@ mod tests {
             matches!(keys, crate::decrypt::DecryptKeys::None),
             "no CSS key exists on an HD-DVD; keys must stay None and the title mux clean"
         );
+        assert!(
+            src.reads.borrow().is_empty(),
+            "an HD DVD title never enters the crack"
+        );
+    }
+
+    // The same 0xBF packs on a DVD title (where the crack does run) still are not CSS.
+    #[test]
+    fn resolve_dvd_title_key_dvd_nav_packs_scan_clean() {
+        let mut src = MockSource::new(0x30);
+        src.stream_id = crate::consts::pes_stream_id::PRIVATE_STREAM_2;
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 64,
+        }];
+        let mut keys = crate::decrypt::DecryptKeys::None;
+        resolve_dvd_title_key(
+            &mut src,
+            &extents,
+            &mut keys,
+            8,
+            crate::disc::ContentFormat::DvdPs,
+            false,
+            None,
+        )
+        .expect("nav packs are never scrambled");
+        assert!(matches!(keys, crate::decrypt::DecryptKeys::None));
+        assert!(!src.reads.borrow().is_empty(), "a DVD title is scanned");
     }
 
     /// `raw` is deliberate ciphertext passthrough: even a scrambled-uncrackable
@@ -1638,7 +1667,7 @@ mod tests {
             &extents,
             &mut keys,
             4,
-            crate::disc::ContentFormat::MpegPs,
+            crate::disc::ContentFormat::DvdPs,
             true, // raw
             None,
         )
@@ -1703,7 +1732,7 @@ mod tests {
             &extents,
             &mut keys,
             4,
-            crate::disc::ContentFormat::MpegPs,
+            crate::disc::ContentFormat::DvdPs,
             false,
             None,
         )
@@ -1732,7 +1761,7 @@ mod tests {
             &extents,
             &mut keys,
             4,
-            crate::disc::ContentFormat::MpegPs,
+            crate::disc::ContentFormat::DvdPs,
             false,
             Some(&halt),
         )

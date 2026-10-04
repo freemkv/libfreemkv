@@ -34,6 +34,7 @@ use crate::udf::UdfFs;
 // disc-level metadata via `labels::DiscMetadata`. The module itself
 // stays private — analyze() drives the parse path.
 pub use bdmt::DiscMetadata;
+pub(crate) use bdmt::{display_text, is_placeholder_title};
 
 // Re-exported via crate::disc — the public API surfaces these next to
 // AudioStream/SubtitleStream so callers can map purpose/qualifier to display
@@ -840,6 +841,15 @@ fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
 fn codec_hint_adds_detail(hint: &str) -> bool {
     let h = hint.to_ascii_lowercase();
     h.contains("atmos") || h.contains("dts:x") || h.contains("dts-x") || h.contains("dtsx")
+}
+
+/// The friendly name of an audio track's codec and channels ("Dolby Digital 5.1", "DTS-HD
+/// Master Audio 7.1"), as the library names a track whose disc gives no label of its own.
+pub fn audio_codec_label(
+    codec: &crate::disc::Codec,
+    channels: &crate::disc::AudioChannels,
+) -> String {
+    generate_audio_label(codec, channels, false)
 }
 
 pub(crate) fn generate_audio_label(

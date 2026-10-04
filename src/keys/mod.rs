@@ -231,6 +231,8 @@ pub(crate) struct Inner {
     pub(crate) scope: KeyScope,
     // Base keys (pool slot = index); forensic index keys follow them in `decrypt_keys`.
     pub(crate) pool: Vec<[u8; 16]>,
+    // HD DVD: each pool key's Title Key number (`TITLE_KEY_PTR`); empty numbers slot + 1.
+    pub(crate) key_nums: Vec<u32>,
     pub(crate) fmts_keys: Vec<[u8; 16]>,
     pub(crate) fmts_phases: HashMap<u16, crate::decrypt::Phase>,
     pub(crate) map: Arc<AacsKeyMap>,
@@ -263,6 +265,7 @@ impl Inner {
             n_decl: None,
             scope: KeyScope::None,
             pool: Vec::new(),
+            key_nums: Vec::new(),
             fmts_keys: Vec::new(),
             fmts_phases: HashMap::new(),
             map: Arc::new(AacsKeyMap::from_ranges(Vec::new())),
@@ -477,7 +480,7 @@ impl KeyRing {
             .pool
             .iter()
             .enumerate()
-            .map(|(s, k)| (s as u32 + 1, *k))
+            .map(|(s, k)| (i.key_nums.get(s).copied().unwrap_or(s as u32 + 1), *k))
             .collect();
         for (j, k) in i.fmts_keys.iter().enumerate() {
             let tag = crate::keys::fmts::FMTS_POOL_TAG_BASE.saturating_add(j as u32);
@@ -690,6 +693,7 @@ impl KeyRing {
         i.capacity = capacity;
         if let Some(h) = held.filter(|h| h.is_aacs()) {
             i.pool = h.0.pool.clone();
+            i.key_nums = h.0.key_nums.clone();
             i.disc_hash = h.0.disc_hash.clone();
         }
         let piece = resolve::loose_file_piece(capacity);
