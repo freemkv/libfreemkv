@@ -1244,6 +1244,24 @@ mod position_recovery_tests {
         }
     }
 
+    // The Class II gate is what refuses the derivation: the planted MKB derives its media key
+    // as a pre-recorded block, and the same records under the Class II type derive nothing.
+    #[test]
+    fn a_class_ii_type_refuses_an_otherwise_derivable_mkb() {
+        let p = plant_mkb();
+        let pk = aesg3(&p.dkey, 1);
+        assert_eq!(
+            derive_media_key_from_pk(&p.mkb, &[pk]),
+            Some(p.mk),
+            "control"
+        );
+        let mut class2 = p.mkb.clone();
+        class2[4..8].copy_from_slice(&MKB_TYPE_10_CLASS_II.to_be_bytes());
+        assert_eq!(mkb_type(&class2), Some(MkbType::ClassII));
+        assert!(MkbTables::parse(&class2).is_none());
+        assert_eq!(derive_media_key_from_pk(&class2, &[pk]), None);
+    }
+
     /// Sanity-check the fixture itself before anything is asserted about the
     /// functions under test: an MKB the parser cannot read would make every
     /// "returns None" body look correct.

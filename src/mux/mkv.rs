@@ -7782,6 +7782,16 @@ mod tests {
         assert_eq!(MkvTrack::video(&v).dv_config, Some(want));
     }
 
+    // A primary DV track carries its own base layer: rpu=1 el=1 bl=1, compatibility id 0.
+    #[test]
+    fn dolby_vision_primary_track_dvcc_bytes() {
+        let mut v = uhd_video(HdrFormat::DolbyVision, ColorSpace::Bt2020);
+        v.frame_rate = crate::disc::FrameRate::F23_976;
+        let mut want = vec![0u8; 24];
+        want[..5].copy_from_slice(&[0x01, 0x00, 0x0E, 0x37, 0x00]);
+        assert_eq!(MkvTrack::video(&v).dv_config, Some(want));
+    }
+
     // dvcC level follows the 2160p frame rate; unknown rate keeps the 2160p24 level.
     #[test]
     fn dv_level_follows_the_frame_rate() {
