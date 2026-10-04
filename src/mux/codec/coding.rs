@@ -75,9 +75,9 @@ pub enum CodingDetail {
 
 /// HDR10 static metadata measured from a video bitstream (HEVC SEI). Carried on
 /// [`PictureInfo`] as the per-stream colour-volume signalling: it only ever
-/// reaches the muxer when BOTH SEI messages were actually present in the stream,
+/// reaches the muxer when the mastering-display SEI was present in the stream,
 /// so an SDR / no-SEI track leaves it `None` and the muxer omits the elements
-/// (never fabricated). Values are stored in raw SEI integer units, not yet
+/// (never fabricated). Content light is optional: some UHD discs omit that SEI. Values are stored in raw SEI integer units, not yet
 /// scaled to the Matroska float domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hdr10Metadata {
@@ -94,10 +94,12 @@ pub struct Hdr10Metadata {
     pub max_display_mastering_luminance: u32,
     /// `min_display_mastering_luminance` in units of 0.0001 cd/m².
     pub min_display_mastering_luminance: u32,
-    /// `max_content_light_level` (MaxCLL) in cd/m² — already an integer.
-    pub max_content_light_level: u16,
-    /// `max_pic_average_light_level` (MaxFALL) in cd/m² — already an integer.
-    pub max_pic_average_light_level: u16,
+    /// `max_content_light_level` (MaxCLL) in cd/m², or `None` when the stream
+    /// carried no content-light SEI.
+    pub max_content_light_level: Option<u16>,
+    /// `max_pic_average_light_level` (MaxFALL) in cd/m², or `None` when the
+    /// stream carried no content-light SEI.
+    pub max_pic_average_light_level: Option<u16>,
 }
 
 /// Codec-agnostic per-picture coding carrier — the single per-frame record the
@@ -141,7 +143,7 @@ impl PictureInfo {
 
     /// Attach measured HDR10 static metadata (HEVC SEI) to this picture,
     /// consuming and returning `self` for builder-style use. Only ever called
-    /// with `Some(..)` once both HDR10 SEI messages have been seen, so an SDR
+    /// with `Some(..)` once the mastering-display SEI has been seen, so an SDR
     /// track never carries fabricated colour-volume data.
     pub fn with_hdr10(mut self, hdr10: Option<Hdr10Metadata>) -> Self {
         self.hdr10 = hdr10;

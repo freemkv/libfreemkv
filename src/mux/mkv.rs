@@ -226,15 +226,16 @@ pub struct MkvTrack {
 }
 
 /// Build a DOVIDecoderConfigurationRecord (dvcC) — 24 bytes — for the Matroska
-/// BlockAdditionMapping. For disc Profile 7 dual-layer the base, enhancement,
-/// and RPU are all present (lossless FEL/MEL preserved as a second track).
-pub fn dolby_vision_config(profile: u8, level: u8, bl_compat_id: u8) -> Vec<u8> {
+/// BlockAdditionMapping, with RPU and EL present. `bl_present` is false for a track
+/// carrying only EL + RPU (the disc's dual-PID Profile 7 secondary stream, muxed as its
+/// own track beside the base layer), per Dolby's MPEG-2 TS spec §7.2.2.
+pub fn dolby_vision_config(profile: u8, level: u8, bl_present: bool, bl_compat_id: u8) -> Vec<u8> {
     let mut v = vec![0u8; 24];
     v[0] = 1; // dv_version_major
     v[1] = 0; // dv_version_minor
     // profile(7) | level(6) | rpu_present(1) | el_present(1) | bl_present(1)
     v[2] = ((profile & 0x7F) << 1) | ((level >> 5) & 0x01);
-    v[3] = ((level & 0x1F) << 3) | (1 << 2) | (1 << 1) | 1; // rpu = el = bl = 1
+    v[3] = ((level & 0x1F) << 3) | (1 << 2) | (1 << 1) | u8::from(bl_present);
     v[4] = (bl_compat_id & 0x0F) << 4;
     // v[5..24] reserved = 0
     v
@@ -315,8 +316,13 @@ fn write_hdr10<W: Write + Seek>(w: &mut W, h: &crate::mux::codec::Hdr10Metadata)
     )?;
     ebml::end_master(w, mm_pos)?;
 
-    ebml::write_uint(w, ebml::MAX_CLL, h.max_content_light_level as u64)?;
-    ebml::write_uint(w, ebml::MAX_FALL, h.max_pic_average_light_level as u64)?;
+    // Optional, independent Colour children (RFC 9559): absent SEI → element omitted.
+    if let Some(cll) = h.max_content_light_level {
+        ebml::write_uint(w, ebml::MAX_CLL, cll as u64)?;
+    }
+    if let Some(fall) = h.max_pic_average_light_level {
+        ebml::write_uint(w, ebml::MAX_FALL, fall as u64)?;
+    }
     Ok(())
 }
 
@@ -452,12 +458,17 @@ impl MkvTrack {
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
-            // The DV layer (hdr=DolbyVision) carries the dvcC so the track is
-            // recognised as Dolby Vision (disc Profile 7 dual-layer).
-            dv_config: if matches!(v.hdr, HdrFormat::DolbyVision) {
-                Some(dolby_vision_config(7, dv_level_2160p(num, den), 0))
-            } else {
-                None
+            // The DV layer (hdr=DolbyVision) carries the dvcC. A secondary DV track is the
+            // disc's EL + RPU stream beside the HDR10 base track: no BL, and the BL's
+            // compatibility id (6, UHD BD HDR10 base) as Dolby TS §7.2.2 and mkvmerge give.
+            dv_config: match (v.hdr, v.secondary) {
+                (HdrFormat::DolbyVision, true) => {
+                    Some(dolby_vision_config(7, dv_level_2160p(num, den), false, 6))
+                }
+                (HdrFormat::DolbyVision, false) => {
+                    Some(dolby_vision_config(7, dv_level_2160p(num, den), true, 0))
+                }
+                _ => None,
             },
             // HDR10 static metadata is measured from the HEVC SEI at mux time, not known
             // at construction; the mux stream sets it before the header is written
@@ -2981,7 +2992,7 @@ mod tests {
     fn dolby_vision_config_profile7() {
         // dvcC for disc Profile 7 dual-layer: version 1.0, profile 7, all of
         // bl/el/rpu present. 24 bytes.
-        let c = dolby_vision_config(7, 6, 0);
+        let c = dolby_vision_config(7, 6, true, 0);
         assert_eq!(c.len(), 24);
         assert_eq!(c[0], 1); // dv_version_major
         assert_eq!(c[1], 0); // dv_version_minor
@@ -5823,7 +5834,7 @@ mod tests {
     #[test]
     fn dolby_vision_config_packs_level_and_compat_id() {
         // profile 7, level 6 (0b00110), bl_compat_id 1.
-        let c = dolby_vision_config(7, 6, 1);
+        let c = dolby_vision_config(7, 6, true, 1);
         assert_eq!(c.len(), 24);
         // level high bit = (6 >> 5) & 1 = 0 → byte2 low bit 0; profile 7 in top.
         // byte2 = profile(7) << 1 | level_high_bit(0).
@@ -5841,7 +5852,7 @@ mod tests {
     fn dolby_vision_config_high_level_sets_byte2_low_bit() {
         // A level with bit 5 set (>= 32) must place that bit in byte2's LSB.
         // level 0x20 → (0x20 >> 5) & 1 = 1.
-        let c = dolby_vision_config(7, 0x20, 0);
+        let c = dolby_vision_config(7, 0x20, true, 0);
         assert_eq!(c[2] & 0x01, 1, "level bit 5 belongs in byte2 LSB");
         // and byte3 carries the low 5 bits (0x20 & 0x1F = 0) << 3.
         assert_eq!(c[3] >> 3, 0);
@@ -5986,8 +5997,8 @@ mod tests {
             white_point_y: 16450,
             max_display_mastering_luminance: 10_000_000, // 1000 cd/m²
             min_display_mastering_luminance: 1,          // 0.0001 cd/m²
-            max_content_light_level: 1000,
-            max_pic_average_light_level: 400,
+            max_content_light_level: Some(1000),
+            max_pic_average_light_level: Some(400),
         };
         let mut v = make_video_track();
         v.colour_matrix = 9;
@@ -6054,6 +6065,32 @@ mod tests {
         // MaxCLL / MaxFALL are cd/m² uints, verbatim.
         assert_eq!(read_uint(ebml::MAX_CLL), 1000);
         assert_eq!(read_uint(ebml::MAX_FALL), 400);
+    }
+
+    /// Mastering-display SEI without content light: MasteringMetadata is written,
+    /// MaxCLL/MaxFALL are omitted rather than written as zero.
+    #[test]
+    fn mastering_only_hdr10_omits_max_cll_and_max_fall() {
+        let mut v = make_video_track();
+        v.colour_matrix = 9;
+        v.colour_transfer = 16;
+        v.colour_primaries = 9;
+        v.hdr10 = Some(crate::mux::codec::Hdr10Metadata {
+            display_primaries_x: [8500, 6550, 35400],
+            display_primaries_y: [39850, 2300, 14600],
+            white_point_x: 15635,
+            white_point_y: 16450,
+            max_display_mastering_luminance: 10_000_000,
+            min_display_mastering_luminance: 50,
+            max_content_light_level: None,
+            max_pic_average_light_level: None,
+        });
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[v], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(find_id(&data, ebml::MASTERING_METADATA).is_some());
+        assert!(find_id(&data, ebml::LUMINANCE_MAX).is_some());
+        assert!(find_id(&data, ebml::MAX_CLL).is_none());
+        assert!(find_id(&data, ebml::MAX_FALL).is_none());
     }
 
     /// An SDR track (no measured HDR10) must NOT emit MasteringMetadata, MaxCLL,
@@ -6841,7 +6878,7 @@ mod tests {
         // A DV track (dv_config set) must emit BlockAdditionMapping (0x41E4)
         // carrying the dvcC so players recognise Dolby Vision.
         let mut dv = make_video_track();
-        dv.dv_config = Some(dolby_vision_config(7, 6, 0));
+        dv.dv_config = Some(dolby_vision_config(7, 6, true, 0));
         let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[dv], None, 0.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
         assert!(
@@ -7731,6 +7768,18 @@ mod tests {
             got.push((f.track, f.data));
         }
         assert_eq!(got, vec![(0, vec![0x10; 8]), (1, vec![0x13; 8])]);
+    }
+
+    // The disc's DV stream is the EL + RPU only, muxed beside the HDR10 base track: its
+    // dvcC says rpu=1 el=1 bl=0 with the base's compatibility id 6 (Dolby TS §7.2.2).
+    #[test]
+    fn dolby_vision_enhancement_layer_track_dvcc_bytes() {
+        let mut v = uhd_video(HdrFormat::DolbyVision, ColorSpace::Bt2020);
+        v.frame_rate = crate::disc::FrameRate::F23_976;
+        v.secondary = true;
+        let mut want = vec![0u8; 24];
+        want[..5].copy_from_slice(&[0x01, 0x00, 0x0E, 0x36, 0x60]);
+        assert_eq!(MkvTrack::video(&v).dv_config, Some(want));
     }
 
     // dvcC level follows the 2160p frame rate; unknown rate keeps the 2160p24 level.
