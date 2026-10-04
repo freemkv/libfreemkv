@@ -842,6 +842,15 @@ fn codec_hint_adds_detail(hint: &str) -> bool {
     h.contains("atmos") || h.contains("dts:x") || h.contains("dts-x") || h.contains("dtsx")
 }
 
+/// The friendly name of an audio track's codec and channels ("Dolby Digital 5.1", "DTS-HD
+/// Master Audio 7.1"), as the library names a track whose disc gives no label of its own.
+pub fn audio_codec_label(
+    codec: &crate::disc::Codec,
+    channels: &crate::disc::AudioChannels,
+) -> String {
+    generate_audio_label(codec, channels, false)
+}
+
 pub(crate) fn generate_audio_label(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,

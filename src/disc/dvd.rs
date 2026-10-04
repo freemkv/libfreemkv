@@ -16,6 +16,53 @@ fn load_vmg(
     Ok((bytes, info))
 }
 
+// Navigation pack layout: the DSI packet starts at byte 0x400 of the pack, its data after the
+// 6-byte PES header and the 0x01 substream byte; SML_PBI follows the 32-byte DSI_GI.
+const DSI_DATA: usize = 0x407;
+const DSI_ILVU_EA: usize = DSI_DATA + 32 + 2;
+const DSI_NEXT_ILVU_SA: usize = DSI_DATA + 32 + 6;
+// SML_PBI's "no next unit": 0x7FFFFFFF by the book, and discs also write 0xFFFFFFFF.
+const NO_NEXT_ILVU: u32 = 0x7FFF_FFFF;
+
+// The sector ranges an interleaved cell plays: its own interleaved units, found by following
+// each unit's navigation pack (its end, then the next unit's start). `None` when a pack does not
+// read or parse, which leaves the cell's whole range to the caller.
+fn interleaved_units(
+    reader: &mut dyn SectorSource,
+    vob_start: u32,
+    cell: &ifo::DvdCell,
+) -> Option<Vec<Extent>> {
+    let mut buf = vec![0u8; 2048];
+    let mut at = cell.first_sector;
+    let mut units = Vec::new();
+    while at <= cell.last_sector {
+        reader
+            .read_sectors(vob_start.checked_add(at)?, 1, &mut buf, false)
+            .ok()?;
+        let is_nav = buf[..4] == [0, 0, 1, 0xBA]
+            && buf[0x400..0x404] == [0, 0, 1, 0xBF]
+            && buf[0x406] == 0x01;
+        if !is_nav {
+            return None;
+        }
+        let word = |o: usize| u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let (end_rel, next_rel) = (word(DSI_ILVU_EA), word(DSI_NEXT_ILVU_SA));
+        if end_rel == 0 {
+            return None;
+        }
+        let end = at.checked_add(end_rel)?.min(cell.last_sector);
+        units.push(Extent {
+            start_lba: vob_start.checked_add(at)?,
+            sector_count: end - at + 1,
+        });
+        if next_rel >= NO_NEXT_ILVU || next_rel == 0 {
+            break;
+        }
+        at = at.checked_add(next_rel)?;
+    }
+    (!units.is_empty()).then_some(units)
+}
+
 impl Disc {
     // Scan DVD titles; a cancelled read is Err(Error::Halted), never an empty list. Also
     // returns the nav-resolved main feature, or None.
@@ -142,22 +189,43 @@ impl Disc {
                     );
                 }
 
-                // Build extents from cell sector ranges (absolute = vob_start + cell offset),
-                // starting at the resolved feature-start cell.
-                let extents: Vec<Extent> = dvd_title.cells[feature_start..]
-                    .iter()
-                    .map(|cell| {
-                        let start = ts.vob_start_sector.saturating_add(cell.first_sector);
-                        let count = cell
+                // Extents are cell ranges (vob_start + offset) from the feature-start cell. An angle
+                // block reads its first angle only; an interleaved cell reads its own unit chain,
+                // since its range also holds another program's units.
+                let mut extents: Vec<Extent> = Vec::new();
+                for cell in &dvd_title.cells[feature_start..] {
+                    let category = ifo::CellCategory::decode(cell.category);
+                    if category.is_secondary_block_piece() {
+                        continue;
+                    }
+                    let whole = Extent {
+                        start_lba: ts.vob_start_sector.saturating_add(cell.first_sector),
+                        sector_count: cell
                             .last_sector
                             .saturating_sub(cell.first_sector)
-                            .saturating_add(1);
-                        Extent {
-                            start_lba: start,
-                            sector_count: count,
+                            .saturating_add(1),
+                    };
+                    if !category.interleaved {
+                        extents.push(whole);
+                        continue;
+                    }
+                    if halt.is_some_and(|h| h.is_cancelled()) {
+                        return Err(Error::Halted);
+                    }
+                    match interleaved_units(reader, ts.vob_start_sector, cell) {
+                        Some(units) => extents.extend(units),
+                        None => {
+                            tracing::warn!(
+                                target: "freemkv::scan",
+                                vts = ts.vts_number,
+                                title = title_number,
+                                first = cell.first_sector,
+                                "dvd: interleaved cell's unit chain unreadable; reading its whole range"
+                            );
+                            extents.push(whole);
                         }
-                    })
-                    .collect();
+                    }
+                }
 
                 let size_bytes: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
@@ -217,12 +285,12 @@ impl Disc {
                 streams.extend(title_audio_streams(ts, dvd_title, title_number));
                 streams.extend(subtitle_streams);
 
-                // Chapter times are absolute from the PGC start: shift them by the dropped
-                // head's duration; marks inside the head collapse to one at 0.0.
+                // The dropped head is angle pieces, which chapter times already leave out (an
+                // angle block plays one angle); marks inside it collapse to one at 0.0.
                 let shifted: Vec<f64> = dvd_title
                     .chapter_times
                     .iter()
-                    .map(|&t| (t - dropped_secs).max(0.0))
+                    .map(|&t| t.max(0.0))
                     .collect();
                 let in_head = shifted.iter().filter(|&&t| t <= 0.0).count();
                 let skipped = in_head.saturating_sub(1);
@@ -1961,6 +2029,58 @@ mod tests {
         // first program). Name is the ordinal from chapter_name(0).
         assert_eq!(t.chapters.len(), 1);
         assert_eq!(t.chapters[0].name, chapter_name(0));
+    }
+
+    // A navigation pack at `lba` whose interleaved unit ends `end_rel` sectors on and whose
+    // next unit starts `next_rel` on.
+    fn nav_pack(disc: &mut MemDisc, lba: u32, end_rel: u32, next_rel: u32) {
+        let mut s = [0u8; 2048];
+        s[..4].copy_from_slice(&[0, 0, 1, 0xBA]);
+        s[0x400..0x404].copy_from_slice(&[0, 0, 1, 0xBF]);
+        s[0x406] = 0x01;
+        s[super::DSI_ILVU_EA..super::DSI_ILVU_EA + 4].copy_from_slice(&end_rel.to_be_bytes());
+        s[super::DSI_NEXT_ILVU_SA..super::DSI_NEXT_ILVU_SA + 4]
+            .copy_from_slice(&next_rel.to_be_bytes());
+        disc.put(lba, s);
+    }
+
+    fn icell(first: u32, last: u32) -> ifo::DvdCell {
+        ifo::DvdCell {
+            first_sector: first,
+            last_sector: last,
+            category: 0x04,
+            duration_secs: 0.0,
+        }
+    }
+
+    // An interleaved cell reads only its own units, following each unit's pack to the next;
+    // both end-of-chain spellings stop the walk.
+    #[test]
+    fn an_interleaved_cell_reads_only_its_own_units() {
+        for end_marker in [0x7FFF_FFFF, 0xFFFF_FFFF] {
+            let mut disc = MemDisc::new();
+            let vob = 1000;
+            nav_pack(&mut disc, vob + 100, 9, 30); // unit 100..=109, next at 130
+            nav_pack(&mut disc, vob + 130, 4, 20); // unit 130..=134, next at 150
+            nav_pack(&mut disc, vob + 150, 9, end_marker); // unit 150..=159, last
+            let units = super::interleaved_units(&mut disc, vob, &icell(100, 159)).unwrap();
+            let spans: Vec<(u32, u32)> = units
+                .iter()
+                .map(|e| (e.start_lba, e.sector_count))
+                .collect();
+            assert_eq!(spans, vec![(1100, 10), (1130, 5), (1150, 10)]);
+        }
+    }
+
+    // A unit that runs past the cell is cut at the cell's end; a sector that is no navigation
+    // pack leaves the caller the whole range.
+    #[test]
+    fn an_interleaved_cell_unit_walk_stays_inside_the_cell() {
+        let mut disc = MemDisc::new();
+        nav_pack(&mut disc, 100, 50, 0x7FFF_FFFF);
+        let units = super::interleaved_units(&mut disc, 0, &icell(100, 120)).unwrap();
+        assert_eq!((units[0].start_lba, units[0].sector_count), (100, 21));
+        assert!(super::interleaved_units(&mut disc, 0, &icell(500, 600)).is_none());
     }
 
     /// A chapter named in the VMG text data reaches Chapter.name in place of

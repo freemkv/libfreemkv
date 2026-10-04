@@ -1204,6 +1204,11 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
                     cell_frames.push((0, 0.0));
                     continue;
                 }
+                // An angle block plays one angle: its other angles' cells take no time.
+                if CellCategory::decode(data[co]).is_secondary_block_piece() {
+                    cell_frames.push((0, 0.0));
+                    continue;
+                }
                 let t = &data[co + 4..co + 8];
                 match bcd_to_frames(t) {
                     Some((f, r)) => {
@@ -2030,6 +2035,35 @@ mod tests {
         // Program 0 → before cell 1 → 0s.
         assert!((title.chapter_times[0] - 0.0).abs() < 0.01);
         // Program 1 → before cell 3 → dur(cell0)+dur(cell1) = 5+7 = 12s.
+        assert!(
+            (title.chapter_times[1] - 12.0).abs() < 0.01,
+            "got {}",
+            title.chapter_times[1]
+        );
+    }
+
+    // An angle block plays one angle, so its other angles' cells add no time before a chapter:
+    // cell 1 is angle 1 (first of block), cell 2 angle 2 (last of block), both 7 s.
+    #[test]
+    fn pgc_chapter_times_count_an_angle_block_once() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 2;
+        pgc[0x03] = 4;
+        let pgm_off: u16 = 0xEA;
+        pgc[0xE6..0xE8].copy_from_slice(&pgm_off.to_be_bytes());
+        let cell_off: u16 = 0xEA + 2;
+        pgc[0xE8..0xEA].copy_from_slice(&cell_off.to_be_bytes());
+        pgc.resize(cell_off as usize + 4 * 24, 0);
+        pgc[0xEA] = 1;
+        pgc[0xEB] = 4;
+        let cb = cell_off as usize;
+        pgc[cb + 6] = 0x05;
+        pgc[cb + 24] = 0x50; // first cell of an angle block
+        pgc[cb + 24 + 6] = 0x07;
+        pgc[cb + 48] = 0xD0; // last cell of the same angle block
+        pgc[cb + 48 + 6] = 0x07;
+        pgc[cb + 72 + 6] = 0x09;
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
         assert!(
             (title.chapter_times[1] - 12.0).abs() < 0.01,
             "got {}",
