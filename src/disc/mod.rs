@@ -518,10 +518,9 @@ pub struct Extent {
     pub sector_count: u32,
 }
 
-// THE ONE definition of "structurally AACS-encrypted" — shared by the fast identify and the
-// full scan so they can't silently desync. Structural, not cryptographic; HD DVD's `X!` dir
-// is found by the same discovery the key-file reads use. Only root `AACS/` counts: the key
-// readers (and libaacs) read nothing from `/BDMV/AACS`, and no disc has one.
+// THE ONE definition of "structurally AACS-encrypted", shared by identify and the full scan.
+// Root `AACS/` or the HD DVD dir the key reads use; never `/BDMV/AACS`, which no key reader
+// (nor libaacs) reads and no disc has.
 pub(crate) fn aacs_dir_present(udf_fs: &crate::udf::UdfFs) -> bool {
     udf_fs.find_dir("/AACS").is_some() || crate::aacs::find_hddvd_aacs_dir(udf_fs).is_some()
 }
@@ -2239,32 +2238,31 @@ impl Disc {
             |p| udf_fs.read_file(reader, p),
         )?;
         let mkb = Self::read_mkb_content(reader, udf_fs)?;
-        let version = Self::read_aacs_version(reader, udf_fs);
+        let version = Self::read_aacs_version(reader, udf_fs, &mkb);
         Ok((inf, mkb, version))
     }
 
-    // AACS major version from the content certificate; drives the Unit_Key_RO.inf parse stride.
-    // Defaults to UHD (V20, 64-byte stride) when unreadable.
-    fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> u8 {
-        match crate::aacs::read_first(
+    // AACS major version driving the Unit_Key_RO.inf parse stride: the content certificate,
+    // then the MKB type, then index.bdmv, through the shared `resolve_aacs_version`.
+    fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs, mkb: &[u8]) -> u8 {
+        let cert_major = crate::aacs::read_first(
             &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
             |p| udf_fs.read_file(reader, p),
         )
         .ok()
         .as_deref()
         .and_then(crate::aacs::inf::parse_content_cert)
-        {
-            Some(c) => c.version.major(),
-            None => {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    phase = "scan_aacs_version",
-                    "no readable AACS content certificate; defaulting to the V20/UHD \
-                     Unit_Key_RO stride (a VUK-from-server path would otherwise mis-stride)"
-                );
-                crate::aacs::mkb::AACS_MAJOR_UHD
-            }
+        .map(|c| c.version.major());
+        if cert_major.is_none() {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "scan_aacs_version",
+                "no readable AACS content certificate; Unit_Key_RO stride from the MKB type \
+                 or index.bdmv"
+            );
         }
+        let index = encrypt::index_is_uhd(udf_fs, reader);
+        crate::aacs::mkb::resolve_aacs_version(cert_major, mkb, index).major()
     }
 
     // Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding. Reads a bounded,

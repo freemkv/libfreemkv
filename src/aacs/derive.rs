@@ -30,8 +30,42 @@ pub(crate) struct MkbTables<'a> {
     cvalues: &'a [u8],
 }
 
+/// Why an MKB cannot be derived through at all, as opposed to no key matching it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MkbClassError {
+    /// Class II (`0x000A1003`): its Media Key Data is record `0x0c`, which the classical
+    /// PK/DK derivation (record `0x05`) does not read.
+    Unsupported(MkbType),
+}
+
+impl MkbClassError {
+    /// The stable numeric error code ([`E_MKB_CLASS_UNSUPPORTED`](crate::error::E_MKB_CLASS_UNSUPPORTED)).
+    pub fn code(&self) -> u16 {
+        crate::error::E_MKB_CLASS_UNSUPPORTED
+    }
+}
+
+/// `Err` when this MKB's class has no Media Key Data the PK/DK derivation can read, so a
+/// caller can report it instead of "no key matched". `Ok` for every other (or no) MKB.
+pub fn check_mkb_class(mkb: &[u8]) -> Result<(), MkbClassError> {
+    match mkb_type(mkb) {
+        Some(t @ MkbType::ClassII) => Err(MkbClassError::Unsupported(t)),
+        _ => Ok(()),
+    }
+}
+
 impl<'a> MkbTables<'a> {
     pub(crate) fn parse(mkb: &'a [u8]) -> Option<Self> {
+        if let Err(e) = check_mkb_class(mkb) {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "mkb_class",
+                error_code = e.code(),
+                "Class II MKB (0x000A1003) keeps its media key data in record 0x0c; PK/DK \
+                 derivation reads only 0x05 and cannot derive a media key from it"
+            );
+            return None;
+        }
         Some(Self {
             mk_dv: mkb_find_mk_dv(mkb)?,
             uvs: find_record_slice(mkb, REC_SUBSET_DIFFERENCE)?,
@@ -511,8 +545,9 @@ impl std::fmt::Debug for ResolvedChain {
 ///
 /// Runs the deterministic derivation DOWNWARD to the disc's terminal unit keys:
 /// `DK → MK → VUK → UKs`, `PK → MK → VUK → UKs`, `MK → VUK → UKs`,
-/// `VUK → UKs`, or `UK → itself`, parsing `Unit_Key_RO.inf` at the version the
-/// disc's MKB declares so a multi-CPS disc yields all its unit keys.
+/// `VUK → UKs`, or `UK → itself`, parsing `Unit_Key_RO.inf` at `version` (from
+/// [`resolve_aacs_version`](crate::aacs::mkb::resolve_aacs_version), the resolver the scan
+/// uses) so a multi-CPS disc yields all its unit keys at the right stride.
 ///
 /// PURE DERIVATION: no sampling, no validation, no position recovery. Returns `None` only when
 /// derivation itself cannot proceed.
@@ -521,14 +556,11 @@ pub fn resolve_candidate(
     mkb: &[u8],
     unit_key_ro: &[u8],
     vid: Option<Vid>,
+    version: AacsVersion,
 ) -> Option<ResolvedChain> {
-    // Boil a VUK → all unit keys, each paired with its declared CPS-unit number.
-    // Derive the stride version from the disc's own MKB, then defer to the shared
-    // `derive_unit_keys` (the one place a VUK unwraps the unit keys).
+    // Boil a VUK → all unit keys, each paired with its declared CPS-unit number, through
+    // the shared `derive_unit_keys` (the one place a VUK unwraps the unit keys).
     let boil = |vuk: Vuk| -> Option<Vec<(u32, [u8; 16])>> {
-        let version = mkb_type(mkb)
-            .map(|t| t.generation())
-            .unwrap_or(AacsVersion::V10);
         // BD/UHD Unit_Key_RO.inf or HD DVD VTKF000.AACS — dispatched by magic.
         let ukf = parse_title_keys(unit_key_ro, version)?;
         if ukf.encrypted_keys.is_empty() {
@@ -541,9 +573,6 @@ pub fn resolve_candidate(
         KeyCandidate::Uk(uk) => {
             // `uk.idx` is positional; surface the declared CPS-unit number like the other arms,
             // falling back to the position if the file does not parse or lacks that slot.
-            let version = mkb_type(mkb)
-                .map(|t| t.generation())
-                .unwrap_or(AacsVersion::V10);
             let declared = parse_title_keys(unit_key_ro, version)
                 .and_then(|f| f.encrypted_keys.get(uk.idx as usize).map(|k| k.0))
                 .unwrap_or(uk.idx);
@@ -601,6 +630,27 @@ pub fn resolve_candidate(
 mod resolve_candidate_tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
+
+    // A Class II MKB is reported as an unsupported class (typed, E7109), not as "no key
+    // matched": derivation stops before reading its tables. A pre-recorded MKB passes.
+    #[test]
+    fn a_class_ii_mkb_is_an_explicit_unsupported_class() {
+        let mkb = |t: u32| {
+            let mut m = vec![0x10, 0x00, 0x00, 0x0C];
+            m.extend_from_slice(&t.to_be_bytes());
+            m.extend_from_slice(&[0, 0, 0, 1]);
+            m
+        };
+        let class2 = mkb(MKB_TYPE_10_CLASS_II);
+        let err = check_mkb_class(&class2).expect_err("class II is unsupported");
+        assert_eq!(err, MkbClassError::Unsupported(MkbType::ClassII));
+        assert_eq!(err.code(), crate::error::E_MKB_CLASS_UNSUPPORTED);
+        assert!(MkbTables::parse(&class2).is_none());
+        assert_eq!(derive_media_key_from_pk(&class2, &[[0u8; 16]]), None);
+        assert_eq!(check_mkb_class(&mkb(MKB_TYPE_4_PRERECORDED)), Ok(()));
+        assert_eq!(check_mkb_class(&mkb(MKB_20_CATEGORY_C)), Ok(()));
+        assert_eq!(check_mkb_class(&[]), Ok(()));
+    }
 
     // km_verifies gates every candidate Media Key; mutation testing found `-> true` surviving
     // all 2,556 tests, i.e. unverified verification.
@@ -699,7 +749,8 @@ mod resolve_candidate_tests {
         let vuk = Vuk([0x33u8; 16]);
         let encs = [[0x11u8; 16], [0x22u8; 16], [0x44u8; 16]];
         let inf = synth_inf(&encs);
-        let r = resolve_candidate(&KeyCandidate::Vuk(vuk), &[], &inf, None).expect("vuk derives");
+        let r = resolve_candidate(&KeyCandidate::Vuk(vuk), &[], &inf, None, AacsVersion::V10)
+            .expect("vuk derives");
         let cps: Vec<u32> = r.unit_keys.iter().map(|(c, _)| *c).collect();
         assert_eq!(
             cps,
@@ -721,7 +772,8 @@ mod resolve_candidate_tests {
     #[test]
     fn resolve_candidate_uk_is_itself() {
         let uk = UnitKey::new(2, [0x9u8; 16]);
-        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[], None).expect("uk is terminal");
+        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[], None, AacsVersion::V10)
+            .expect("uk is terminal");
         assert_eq!(r.unit_keys, vec![(2, uk.key)]);
         assert!(r.vuk.is_none() && r.mk.is_none());
     }
@@ -731,7 +783,8 @@ mod resolve_candidate_tests {
     fn resolve_candidate_uk_reports_the_declared_cps_unit_number() {
         let inf = synth_inf(&[[0x11u8; 16], [0x22u8; 16]]);
         let uk = UnitKey::new(1, [0x9u8; 16]);
-        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &inf, None).expect("terminal");
+        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &inf, None, AacsVersion::V10)
+            .expect("terminal");
         assert_eq!(r.unit_keys, vec![(2, uk.key)]);
     }
 
@@ -747,7 +800,7 @@ mod resolve_candidate_tests {
         }
         let at = |idx: u32| {
             let uk = UnitKey::new(idx, [0x9u8; 16]);
-            resolve_candidate(&KeyCandidate::Uk(uk), &[], &vtkf, None)
+            resolve_candidate(&KeyCandidate::Uk(uk), &[], &vtkf, None, AacsVersion::V10)
                 .expect("terminal")
                 .unit_keys[0]
                 .0
@@ -756,14 +809,27 @@ mod resolve_candidate_tests {
         assert_eq!(at(1), 5, "the file's number, not idx + 1");
         assert_eq!(at(7), 7, "no such slot: the position");
         let uk = UnitKey::new(3, [0x9u8; 16]);
-        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[0u8; 4], None).unwrap();
+        let r = resolve_candidate(
+            &KeyCandidate::Uk(uk),
+            &[],
+            &[0u8; 4],
+            None,
+            AacsVersion::V10,
+        )
+        .unwrap();
         assert_eq!(r.unit_keys[0].0, 3, "unparseable file: the position");
     }
 
     /// MK/PK/DK paths derive the VUK from a VID; without one, derivation stops.
     #[test]
     fn resolve_candidate_mk_requires_vid() {
-        let r = resolve_candidate(&KeyCandidate::Mk(MediaKey([1u8; 16])), &[], &[], None);
+        let r = resolve_candidate(
+            &KeyCandidate::Mk(MediaKey([1u8; 16])),
+            &[],
+            &[],
+            None,
+            AacsVersion::V10,
+        );
         assert!(r.is_none(), "MK path returns None without a VID");
     }
 
@@ -817,8 +883,14 @@ mod resolve_candidate_tests {
         let enc = aes_ecb_encrypt(&vuk, &plain_uk);
         let inf = synth_inf(std::slice::from_ref(&enc));
 
-        let r = resolve_candidate(&KeyCandidate::Pk(ProcessingKey(pk)), &mkb, &inf, Some(vid))
-            .expect("planted PK resolves the full chain");
+        let r = resolve_candidate(
+            &KeyCandidate::Pk(ProcessingKey(pk)),
+            &mkb,
+            &inf,
+            Some(vid),
+            AacsVersion::V10,
+        )
+        .expect("planted PK resolves the full chain");
         assert_eq!(r.mk, Some(MediaKey(mk)), "PK recovers the planted MK");
         assert_eq!(r.unit_keys.len(), 1);
         assert_eq!(
@@ -982,12 +1054,11 @@ mod resolve_candidate_tests {
         assert_ne!(v10.encrypted_keys[1].1, v20.encrypted_keys[1].1);
     }
 
-    /// `resolve_candidate` derives the inf parse stride from the disc's OWN MKB
-    /// (`mkb_type(mkb).generation()`), NOT a fixed default: a V20 (Category C)
-    /// MKB boils the second unit key at the 64-byte stride, while an absent MKB
-    /// falls back to V10's 48-byte stride.
+    /// `resolve_candidate` parses the inf at the version it is given (from the shared
+    /// `resolve_aacs_version`), not at its own guess from the MKB: an unreadable MKB on a
+    /// UHD still reads the second key at +64, and a V10 cert outranks a 2.0 MKB.
     #[test]
-    fn resolve_candidate_boils_at_the_mkb_declared_stride() {
+    fn resolve_candidate_boils_at_the_resolved_version_stride() {
         // A two-key inf whose 2nd key differs by stride (see the parse test).
         let uk_pos = 0x20usize;
         let key0 = uk_pos + 48;
@@ -1011,23 +1082,26 @@ mod resolve_candidate_tests {
             Some(AacsVersion::V20),
             "fixture check: this MKB declares AACS 2.0"
         );
-        let r20 = resolve_candidate(&KeyCandidate::Vuk(vuk), &v20_mkb, &inf, None)
-            .expect("V20 MKB boils the inf");
+        let boil = |mkb: &[u8], version| {
+            resolve_candidate(&KeyCandidate::Vuk(vuk), mkb, &inf, None, version)
+                .expect("boils the inf")
+                .unit_keys[1]
+                .1
+        };
+        let at64 = decrypt_unit_key(&vuk.0, &[0x20; 16]);
+        let at48 = decrypt_unit_key(&vuk.0, &[0x10; 16]);
+        // The stride follows the version handed in, never a re-read of the MKB: a UHD whose
+        // MKB is unreadable (empty) still reads key 2 at +64 ...
+        let uhd = resolve_aacs_version(None, &[], Some(true));
+        assert_eq!(boil(&[], uhd), at64);
+        // ... and when the certificate (V10) disagrees with the MKB (2.0), the cert wins.
+        let bd = resolve_aacs_version(Some(1), &v20_mkb, Some(true));
+        assert_eq!(bd, AacsVersion::V10);
+        assert_eq!(boil(&v20_mkb, bd), at48);
         assert_eq!(
-            r20.unit_keys[1].1,
-            decrypt_unit_key(&vuk.0, &[0x20; 16]),
-            "the V20 MKB drives the 64-byte stride, reading the 2nd key at +64"
+            boil(&v20_mkb, resolve_aacs_version(None, &v20_mkb, None)),
+            at64
         );
-
-        // No MKB → mkb_type is None → the V10 48-byte fallback stride.
-        let r10 = resolve_candidate(&KeyCandidate::Vuk(vuk), &[], &inf, None)
-            .expect("absent MKB falls back to V10");
-        assert_eq!(
-            r10.unit_keys[1].1,
-            decrypt_unit_key(&vuk.0, &[0x10; 16]),
-            "an absent MKB falls back to the V10 48-byte stride, reading +48"
-        );
-        assert_ne!(r20.unit_keys[1].1, r10.unit_keys[1].1);
     }
 
     /// PIN: a `Mk` candidate is PURE DERIVATION — `resolve_candidate` does NOT
@@ -1059,8 +1133,14 @@ mod resolve_candidate_tests {
         let enc = [0x9Au8; 16];
         let inf = synth_inf(std::slice::from_ref(&enc));
 
-        let r = resolve_candidate(&KeyCandidate::Mk(wrong_mk), &mkb, &inf, Some(vid))
-            .expect("resolve_candidate boils regardless of MK-vs-MKB validity");
+        let r = resolve_candidate(
+            &KeyCandidate::Mk(wrong_mk),
+            &mkb,
+            &inf,
+            Some(vid),
+            AacsVersion::V10,
+        )
+        .expect("resolve_candidate boils regardless of MK-vs-MKB validity");
         // The chain is derived straight from the (wrong) MK, no gate applied.
         let expected_vuk = derive_vuk(&wrong_mk.0, &vid.0);
         assert_eq!(

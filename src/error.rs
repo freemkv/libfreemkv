@@ -150,6 +150,10 @@ pub const E_MKB_VARIANT_ONLINE_CHALLENGE: u16 = 7104;
 pub const E_MKB_VARIANT_TABLE_UNAVAILABLE: u16 = 7106;
 pub const E_MKB_VARIANT_VKD_RANGE: u16 = 7107;
 pub const E_MKB_VARIANT_VERIFY_FAILED: u16 = 7108;
+/// The disc's MKB is Class II (`0x000A1003`): its Media Key Data is record `0x0c`, not the
+/// classical `0x05` the PK/DK derivation reads, so no key can be derived from it
+/// (`MkbClassError`).
+pub const E_MKB_CLASS_UNSUPPORTED: u16 = 7109;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;

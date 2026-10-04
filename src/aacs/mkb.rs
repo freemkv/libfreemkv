@@ -148,6 +148,29 @@ impl AacsVersion {
     }
 }
 
+/// The AACS generation that sets the `Unit_Key_RO.inf` stride, from the strongest signal
+/// present: the content certificate's major version, then a pre-recorded MKB's type, then
+/// `index.bdmv` (`INDX0300` is UHD). With none of them, UHD's 64-byte stride. The one
+/// resolver for every path that parses the unit-key file, so they cannot disagree.
+pub fn resolve_aacs_version(
+    cert_major: Option<u8>,
+    mkb: &[u8],
+    index_is_uhd: Option<bool>,
+) -> AacsVersion {
+    if let Some(major) = cert_major {
+        return AacsVersion::from_major(major);
+    }
+    if let Some(t @ (MkbType::Prerecorded | MkbType::CategoryC20 | MkbType::CategoryC21)) =
+        mkb_type(mkb)
+    {
+        return t.generation();
+    }
+    match index_is_uhd {
+        Some(false) => AacsVersion::V10,
+        _ => AacsVersion::V20,
+    }
+}
+
 /// Find Verify Media Key Record (type 0x81 for AACS 1.0, 0x86 for AACS 2.0/2.1) in MKB.
 /// 0x81: `[C]` §3.2.5.1.4. 0x86 (AACS 2.x): `[RE]` — not in the public spec (from real 2.x MKBs).
 pub(crate) fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
@@ -187,7 +210,8 @@ pub(crate) fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
 }
 
 // Find the Media Key Data Record (cvalues table) in an MKB. `[C]` §3.2.4 / §3.2.5.1.7. 0x05 is
-// the only cvalue table (libaacs `mkb_cvalues`); 0x07 is the Subset-Difference Index.
+// the pre-recorded / Category C table (libaacs `mkb_cvalues`); a Class II MKB carries 0x0c
+// instead (see `check_mkb_class`). 0x07 is the Subset-Difference Index.
 pub(crate) fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
     find_record_body(mkb, REC_MEDIA_KEY_DATA)
 }
@@ -334,6 +358,39 @@ pub fn mkb_is_uhd(mkb: &[u8]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // One stride resolver: cert, then a pre-recorded MKB's type, then index.bdmv, then UHD.
+    // Each later signal is consulted only when every earlier one is missing.
+    #[test]
+    fn resolve_aacs_version_ranks_cert_then_mkb_then_index() {
+        let rec = |t: u32| {
+            let mut m = vec![0x10, 0x00, 0x00, 0x0C];
+            m.extend_from_slice(&t.to_be_bytes());
+            m.extend_from_slice(&[0, 0, 0, 1]);
+            m
+        };
+        let (bd, uhd21) = (rec(MKB_TYPE_4_PRERECORDED), rec(MKB_21_CATEGORY_C));
+        let class2 = rec(MKB_TYPE_10_CLASS_II);
+        use AacsVersion::*;
+        // The certificate wins over a disagreeing MKB and index.
+        assert_eq!(
+            resolve_aacs_version(Some(AACS_MAJOR_BD), &uhd21, Some(true)),
+            V10
+        );
+        assert_eq!(
+            resolve_aacs_version(Some(AACS_MAJOR_UHD), &bd, Some(false)),
+            V20
+        );
+        // No cert: the MKB type wins over a disagreeing index.
+        assert_eq!(resolve_aacs_version(None, &bd, Some(true)), V10);
+        assert_eq!(resolve_aacs_version(None, &uhd21, Some(false)), V21);
+        // No cert, no pre-recorded MKB type: index.bdmv decides.
+        assert_eq!(resolve_aacs_version(None, &[], Some(false)), V10);
+        assert_eq!(resolve_aacs_version(None, &class2, Some(false)), V10);
+        assert_eq!(resolve_aacs_version(None, &[], Some(true)), V20);
+        // Nothing at all: UHD's 64-byte stride.
+        assert_eq!(resolve_aacs_version(None, &[], None), V20);
+    }
 
     /// One MKB record: 1 type byte + big-endian 24-bit total length + body.
     fn rec(rec_type: u8, body: &[u8]) -> Vec<u8> {
