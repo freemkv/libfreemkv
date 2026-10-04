@@ -520,11 +520,10 @@ pub struct Extent {
 
 // THE ONE definition of "structurally AACS-encrypted" — shared by the fast identify and the
 // full scan so they can't silently desync. Structural, not cryptographic; HD DVD's `X!` dir
-// is found by the same discovery the key-file reads use.
+// is found by the same discovery the key-file reads use. Only root `AACS/` counts: the key
+// readers (and libaacs) read nothing from `/BDMV/AACS`, and no disc has one.
 pub(crate) fn aacs_dir_present(udf_fs: &crate::udf::UdfFs) -> bool {
-    udf_fs.find_dir("/AACS").is_some()
-        || udf_fs.find_dir("/BDMV/AACS").is_some()
-        || crate::aacs::find_hddvd_aacs_dir(udf_fs).is_some()
+    udf_fs.find_dir("/AACS").is_some() || crate::aacs::find_hddvd_aacs_dir(udf_fs).is_some()
 }
 
 // Title-ranking heuristic thresholds. Each gates a DISTINCT decision — several share a value
@@ -1191,10 +1190,10 @@ impl FrameRate {
             2 => FrameRate::F24,
             3 => FrameRate::F25,
             4 => FrameRate::F29_97,
-            5 => FrameRate::F30,
             6 => FrameRate::F50,
             7 => FrameRate::F59_94,
-            8 => FrameRate::F60,
+            // 5 and 8 are unassigned (libbluray, MediaInfo, tsMuxer); a UHD menu clip
+            // carries 8, which is not a statement of 60 fps.
             other => {
                 tracing::warn!(video_rate = other, "unknown MPLS video_rate byte");
                 FrameRate::Unknown
@@ -4793,13 +4792,12 @@ mod tests {
         assert!(id.encrypted, "/AACS alone must report encrypted");
     }
 
-    // A nested /BDMV/AACS alone must ALSO report encrypted == true —
-    // degrading the `||` to `&&` would report almost every retail BD as
-    // unencrypted, since real discs rarely carry both paths at once.
+    // A nested /BDMV/AACS is not an AACS marker: no key file is read from it, so
+    // calling the disc encrypted would only lead to a key lookup that cannot succeed.
     #[test]
-    fn identify_reports_encrypted_for_bdmv_aacs_dir_alone() {
+    fn identify_ignores_a_nested_bdmv_aacs_dir() {
         let id = identify_with_aacs_dirs(false, true);
-        assert!(id.encrypted, "/BDMV/AACS alone must report encrypted");
+        assert!(!id.encrypted, "/BDMV/AACS alone is not encrypted");
     }
 
     /// Neither AACS path present must report `encrypted == false`.
@@ -8882,15 +8880,20 @@ mod tests {
             (2, FrameRate::F24, (24, 1)),
             (3, FrameRate::F25, (25, 1)),
             (4, FrameRate::F29_97, (30000, 1001)),
-            (5, FrameRate::F30, (30, 1)),
             (6, FrameRate::F50, (50, 1)),
             (7, FrameRate::F59_94, (60000, 1001)),
-            (8, FrameRate::F60, (60, 1)),
         ] {
             assert_eq!(FrameRate::from_video_rate(vr), want, "video_rate {vr}");
             assert_eq!(want.as_fraction(), frac, "{want:?}");
         }
-        assert_eq!(FrameRate::from_video_rate(0), FrameRate::Unknown);
+        for unassigned in [0, 5, 8, 9, 15] {
+            assert_eq!(
+                FrameRate::from_video_rate(unassigned),
+                FrameRate::Unknown,
+                "video_rate {unassigned}"
+            );
+        }
+        assert_eq!(FrameRate::Unknown.as_fraction(), (0, 1));
         for (af, want) in [
             (1, AudioChannels::Mono),
             (3, AudioChannels::Stereo),

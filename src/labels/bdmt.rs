@@ -1,8 +1,8 @@
 //! BDMV disc-library metadata (`/BDMV/META/DL/bdmt_<lang>.xml`).
 //!
-//! Parses the Blu-ray disc-library metadata XML (`urn:BDA:bdmv;disclibmeta`,
-//! prefix `di:`) into title, description, and disc-set position per
-//! language. Invoked from the disc-scan path in [`labels`](super)
+//! Parses the Blu-ray disc-library metadata XML (a `urn:BDA:bdmv;disclib` root
+//! holding a `di:discinfo` element in `urn:BDA:bdmv;discinfo`) into title,
+//! description, and disc-set position per language. Invoked from the disc-scan path in [`labels`](super)
 //! ([`detect`] then [`parse`]); [`DiscMetadata`] is re-exported there.
 //! Extraction is best-effort — a malformed file yields `None`, other
 //! sibling-language files can still supply metadata.
@@ -41,7 +41,9 @@ pub struct DiscMetadata {
     /// Localized titles, keyed by 3-char ISO 639-2 lang code
     /// (e.g. "eng" → "Aurora Drift")
     pub titles: BTreeMap<String, String>,
-    /// First-line / short description, per lang
+    /// Text of `<di:description>` per lang. On real discs that element is a
+    /// container (`di:thumbnail` / `di:tableOfContents`), not text, so this is
+    /// normally empty.
     pub descriptions: BTreeMap<String, String>,
     /// Disc N of M, returned whenever both `<di:setNumber>` (or the
     /// `<di:discNumber>` fallback) and `<di:numSets>` are present and sane (including `(1, 1)` for a
@@ -231,6 +233,12 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
+/// True for the generic `Blu-ray` some discs (Warner's non-English bdmt files) put where
+/// the title belongs: not a title, so callers skip to the next candidate.
+pub(crate) fn is_placeholder_title(title: &str) -> bool {
+    title.trim().eq_ignore_ascii_case("Blu-ray")
+}
+
 /// Try title-bearing element variants in priority order. The `xml`
 /// helpers are case- and namespace-insensitive, so callers pass the
 /// bare local name (no `di:` prefix).
@@ -239,7 +247,10 @@ fn extract_title(xml_text: &str) -> Option<String> {
     // tableOfContents/titleName. xml::text trims, so an empty string here
     // means a genuinely empty element.
     for tag in ["name", "title"] {
-        if let Some(s) = xml::text(xml_text, tag).and_then(|s| field_text(&s)) {
+        if let Some(s) = xml::text(xml_text, tag)
+            .and_then(|s| field_text(&s))
+            .filter(|s| !is_placeholder_title(s))
+        {
             return Some(s);
         }
     }
@@ -247,7 +258,10 @@ fn extract_title(xml_text: &str) -> Option<String> {
     // don't accidentally pick a stray <titleName> from elsewhere.
     if let Some((s, e)) = xml::find_element(xml_text, "tableOfContents", 0) {
         let block = &xml_text[s..e];
-        if let Some(t) = xml::text(block, "titleName").and_then(|s| field_text(&s)) {
+        if let Some(t) = xml::text(block, "titleName")
+            .and_then(|s| field_text(&s))
+            .filter(|s| !is_placeholder_title(s))
+        {
             return Some(t);
         }
     }
@@ -281,7 +295,7 @@ mod tests {
 
     #[test]
     fn title_container_markup_is_not_a_title() {
-        let xml = "<discInfo><di:title><di:name/><di:numSets>1</di:numSets></di:title></discInfo>";
+        let xml = "<disclib><di:discinfo><di:title><di:name/><di:numSets>1</di:numSets></di:title></di:discinfo></disclib>";
         assert_eq!(parse_bdmt_xml(xml), None);
     }
 
@@ -337,14 +351,29 @@ mod tests {
         assert_eq!(parse_bdmt_xml(xml), None);
     }
 
+    // Warner's non-English bdmt files put "Blu-ray" in di:name; the TOC title is used
+    // instead, and a file holding only the placeholder yields no title.
+    #[test]
+    fn blu_ray_placeholder_is_not_a_title() {
+        let with_toc = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
+  <di:title><di:name>Blu-ray</di:name></di:title>
+  <di:description><di:tableOfContents><di:titleName>Inception</di:titleName></di:tableOfContents></di:description>
+</di:discinfo></disclib>"#;
+        assert_eq!(parse_bdmt_xml(with_toc).expect("toc title").0, "Inception");
+        let only = r#"<disclib><di:discinfo><di:name>BLU-RAY</di:name></di:discinfo></disclib>"#;
+        assert_eq!(parse_bdmt_xml(only), None);
+        assert!(is_placeholder_title(" Blu-ray "));
+        assert!(!is_placeholder_title("Blu-ray Extras"));
+    }
+
     #[test]
     fn extract_simple_title() {
-        // Minimal Paramount-style document: <di:name> as the title
-        // carrier inside a <discInfo> root.
+        // Minimal document: <di:name> as the title carrier inside
+        // <disclib><di:discinfo>, as every real bdmt file has it.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Aurora Drift</di:name>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (title, desc, set) = parse_bdmt_xml(xml).expect("title should parse");
         assert_eq!(title, "Aurora Drift");
         assert_eq!(desc, None);
@@ -355,10 +384,10 @@ mod tests {
     fn extract_title_element_variant() {
         // <di:title> is the alternate carrier; should be picked up
         // when <di:name> is absent.
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:title>Echo Chamber</di:title>
   <di:description>A film about machines.</di:description>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (title, desc, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Echo Chamber");
         assert_eq!(desc.as_deref(), Some("A film about machines."));
@@ -369,11 +398,11 @@ mod tests {
         // Some authoring tools nest the title under tableOfContents.
         // No <di:name> or <di:title> at top level → fall back to
         // titleName inside tableOfContents.
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:tableOfContents>
     <di:titleName>Feelings Two</di:titleName>
   </di:tableOfContents>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Feelings Two");
     }
@@ -392,43 +421,43 @@ mod tests {
     #[test]
     fn disc_set_rejects_nonsensical_pairs() {
         // n > total, zero numerator, zero denominator → all None.
-        let over = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let over = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>X</di:name>
   <di:discNumber>5</di:discNumber>
   <di:numSets>2</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         assert_eq!(parse_bdmt_xml(over).unwrap().2, None);
 
-        let zero_n = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let zero_n = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>X</di:name>
   <di:discNumber>0</di:discNumber>
   <di:numSets>5</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         assert_eq!(parse_bdmt_xml(zero_n).unwrap().2, None);
 
-        let zero_total = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let zero_total = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>X</di:name>
   <di:discNumber>1</di:discNumber>
   <di:numSets>0</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         assert_eq!(parse_bdmt_xml(zero_total).unwrap().2, None);
 
         // A valid pair still passes.
-        let ok = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let ok = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>X</di:name>
   <di:discNumber>2</di:discNumber>
   <di:numSets>3</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         assert_eq!(parse_bdmt_xml(ok).unwrap().2, Some((2, 3)));
     }
 
     #[test]
     fn extract_box_set_position() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Box Set Disc 2</di:name>
   <di:discNumber>2</di:discNumber>
   <di:numSets>5</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, Some((2, 5)));
     }
@@ -436,11 +465,11 @@ mod tests {
     #[test]
     fn extract_box_set_position_alternate_total_tag() {
         // <di:numberOfSets> is an alternate spelling we've seen.
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>X</di:name>
   <di:discNumber>3</di:discNumber>
   <di:numberOfSets>6</di:numberOfSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, Some((3, 6)));
     }
@@ -449,10 +478,10 @@ mod tests {
     fn extract_box_set_requires_both_fields() {
         // discNumber alone (no total) yields None — we don't fabricate
         // a denominator.
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>X</di:name>
   <di:discNumber>1</di:discNumber>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, None);
     }
@@ -539,13 +568,13 @@ mod tests {
         // Drive parse_bdmt_xml from two synthetic XML blobs and aggregate
         // into DiscMetadata like parse() would, exercising BTreeMap key
         // handling without needing a UdfFs.
-        let eng_xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let eng_xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Aurora Drift</di:name>
-</discInfo>"#;
-        let fra_xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+</di:discinfo></disclib>"#;
+        let fra_xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Aurora Drift (Partie Deux)</di:name>
   <di:description>Suite du film fictif.</di:description>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
 
         let mut meta = DiscMetadata::default();
         for (lang, blob) in [("eng", eng_xml), ("fra", fra_xml)] {
@@ -586,7 +615,7 @@ mod tests {
         assert!(parse_bdmt_xml(bad).is_none());
 
         // Half-open tag, no body, no close: also yields no title.
-        let truncated = "<discInfo><di:name>";
+        let truncated = "<disclib><di:discinfo><di:name>";
         assert!(parse_bdmt_xml(truncated).is_none());
     }
 
@@ -595,13 +624,13 @@ mod tests {
         // Real-world bug: <di:description> contained only <di:thumbnail/>
         // children with no prose, and the old parser surfaced the raw XML
         // fragment as the description. Now candidates starting with `<` are rejected.
-        let xml = r#"<discInfo>
+        let xml = r#"<disclib><di:discinfo>
             <di:name>Skyline Run</di:name>
             <di:description>
               <di:thumbnail href="sample_meta_sm.jpg" />
               <di:thumbnail href="sample_meta_lg.jpg" />
             </di:description>
-        </discInfo>"#;
+        </di:discinfo></disclib>"#;
         let (title, description, _) =
             parse_bdmt_xml(xml).expect("title is present so parse must succeed");
         assert_eq!(title, "Skyline Run");
@@ -615,10 +644,10 @@ mod tests {
     fn description_with_plain_text_passes_through() {
         // The legitimate case still works: a description with actual
         // prose survives the looks_like_xml filter.
-        let xml = r#"<discInfo>
+        let xml = r#"<disclib><di:discinfo>
             <di:name>Some Movie</di:name>
             <di:description>An epic tale of one man's quest for tea.</di:description>
-        </discInfo>"#;
+        </di:discinfo></disclib>"#;
         let (_, description, _) = parse_bdmt_xml(xml).expect("must parse");
         assert_eq!(
             description.as_deref(),
@@ -632,10 +661,10 @@ mod tests {
     /// A mixed-content description must be dropped, not surfaced with raw XML.
     #[test]
     fn mixed_content_description_with_embedded_tag_is_dropped() {
-        let xml = r#"<discInfo>
+        let xml = r#"<disclib><di:discinfo>
             <di:name>Skyline Run</di:name>
             <di:description>Intro prose <di:thumbnail href="x.jpg" /> more</di:description>
-        </discInfo>"#;
+        </di:discinfo></disclib>"#;
         let (title, description, _) =
             parse_bdmt_xml(xml).expect("title present so parse must succeed");
         assert_eq!(title, "Skyline Run");
@@ -649,19 +678,19 @@ mod tests {
     /// (a comparison, not a tag) is still a valid description.
     #[test]
     fn description_with_bare_less_than_is_not_treated_as_xml() {
-        let xml = r#"<discInfo>
+        let xml = r#"<disclib><di:discinfo>
             <di:name>Math Film</di:name>
             <di:description>when a < b holds</di:description>
-        </discInfo>"#;
+        </di:discinfo></disclib>"#;
         let (_, description, _) = parse_bdmt_xml(xml).expect("must parse");
         assert_eq!(description.as_deref(), Some("when a < b holds"));
     }
 
     #[test]
     fn whitespace_in_title_is_trimmed() {
-        let xml = r#"<discInfo><di:name>
+        let xml = r#"<disclib><di:discinfo><di:name>
             Aurora Drift
-        </di:name></discInfo>"#;
+        </di:name></di:discinfo></disclib>"#;
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Aurora Drift");
     }
@@ -687,10 +716,10 @@ mod tests {
     #[test]
     fn di_name_priority_over_di_title() {
         // When BOTH di:name and di:title are present, di:name wins.
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Primary Title</di:name>
   <di:title>Fallback Title</di:title>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Primary Title");
     }
@@ -701,12 +730,12 @@ mod tests {
     #[test]
     fn di_name_wins_over_table_of_contents_title_name() {
         // di:name exists — tableOfContents/titleName must NOT override it.
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Winner</di:name>
   <di:tableOfContents>
     <di:titleName>Loser</di:titleName>
   </di:tableOfContents>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Winner");
     }
@@ -716,10 +745,10 @@ mod tests {
     /// Mutation: change `<di:name></di:name>` to `<di:name>X</di:name>` → red.
     #[test]
     fn empty_di_name_falls_through_to_di_title() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name></di:name>
   <di:title>Non-Empty Title</di:title>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Non-Empty Title");
     }
@@ -728,10 +757,10 @@ mod tests {
     /// come through as Some("").
     #[test]
     fn empty_description_element_filtered_out() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Film</di:name>
   <di:description></di:description>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (_, description, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(description, None);
     }
@@ -740,11 +769,11 @@ mod tests {
     /// Mutation: change `n > total` to `n >= total` → last disc of set is None.
     #[test]
     fn disc_set_allows_last_disc_equal_total() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Film</di:name>
   <di:discNumber>3</di:discNumber>
   <di:numSets>3</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, Some((3, 3)));
     }
@@ -753,11 +782,11 @@ mod tests {
     /// Mutation: remove the `.parse::<u32>().ok()?` guard → panics or wrong value.
     #[test]
     fn disc_set_non_numeric_disc_number_yields_none() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Film</di:name>
   <di:discNumber>one</di:discNumber>
   <di:numSets>5</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, None);
     }
@@ -767,10 +796,10 @@ mod tests {
     // whitespace-only di:name would be returned as the title.
     #[test]
     fn whitespace_only_di_name_falls_through() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>   </di:name>
   <di:title>Real Title</di:title>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Real Title");
     }
@@ -790,11 +819,11 @@ mod tests {
     // reject only total == 0, not total == 1.
     #[test]
     fn disc_set_allows_single_disc_release() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+        let xml = r#"<disclib xmlns="urn:BDA:bdmv;disclib"><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">
   <di:name>Film</di:name>
   <di:discNumber>1</di:discNumber>
   <di:numSets>1</di:numSets>
-</discInfo>"#;
+</di:discinfo></disclib>"#;
         let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, Some((1, 1)));
     }

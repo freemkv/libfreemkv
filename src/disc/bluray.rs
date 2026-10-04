@@ -516,7 +516,8 @@ impl Disc {
                                     .filter(|c| !c.is_control())
                                     .collect();
                                 let title = title.trim().to_string();
-                                if !title.is_empty() && title != "Blu-ray" {
+                                if !title.is_empty() && !crate::labels::is_placeholder_title(&title)
+                                {
                                     return Some(title);
                                 }
                             }

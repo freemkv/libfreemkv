@@ -60,7 +60,7 @@ pub(crate) fn parse(d: &[u8]) -> Option<Index> {
     if d.get(0..4)? != b"INDX" {
         return None;
     }
-    // version at 4..8 ("0100"/"0200"/"0300") is not load-bearing for resolution.
+    // version at 4..8 ("0100"/"0200"/"0240"/"0300") is not load-bearing for resolution.
     let indexes_start = be_u32(d, 8)? as usize;
     // At indexes_start: u32 index_len, First-Play(12), Top-Menu(12), u16 titles.
     let mut o = indexes_start.checked_add(4)?;

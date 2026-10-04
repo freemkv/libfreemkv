@@ -547,18 +547,14 @@ fn batch_count_max_batch_sizes() {
 
 #[test]
 fn aacs_dir_alone_marks_the_disc_encrypted_and_reports_the_capture_error() {
-    // Detection is an OR over `/AACS` and `/BDMV/AACS`. This fixture carries
-    // only `/AACS` (the standard retail layout); requiring BOTH would call it
-    // clear — the worst failure, since a "clear" disc muxes ciphertext as video.
+    // A root `/AACS` (the standard retail layout) alone marks the disc encrypted;
+    // calling it clear is the worst failure, since a "clear" disc muxes ciphertext.
     let mut reader = MockSectorReader::new();
     build_udf_with_aacs_dir(&mut reader);
 
     let disc = Disc::scan_image(&mut reader, 1000, &ScanOptions::default()).unwrap();
 
-    assert!(
-        disc.encrypted,
-        "a disc carrying /AACS is encrypted even though /BDMV/AACS is absent"
-    );
+    assert!(disc.encrypted, "a disc carrying /AACS is encrypted");
     // Encrypted => scan attempts the AACS input capture. This fixture's /AACS
     // is empty, so capture fails and the failure must be PRESERVED on the disc
     // (its absence would look identical to never having attempted capture).
