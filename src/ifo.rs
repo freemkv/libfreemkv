@@ -70,6 +70,9 @@ pub struct DvdTitle {
     /// Distinct PGCs this title's part-of-title entries point at. Only the first is read,
     /// so a title with more is missing the rest.
     pub pgcs: usize,
+    /// The program (PGN) each chapter (part of title) starts at, from VTS_PTT_SRPT. `None`
+    /// when the table does not hold the title; empty when a chapter lies in another PGC.
+    pub ptt_programs: Option<Vec<u16>>,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -651,7 +654,9 @@ fn txtdt_titles(vmg: &[u8]) -> Option<Vec<Vec<Option<String>>>> {
 // One tab- or NUL-terminated name. Unknown charsets pass only plain ASCII; empty,
 // overlong or control-bearing names are `None` so the caller keeps its fallback.
 fn txtdt_name(data: &[u8], at: usize, charset: u8) -> Option<String> {
+    // Never look past the longest name: thousands of items can share one unterminated run.
     let raw = data.get(at..)?;
+    let raw = &raw[..raw.len().min(TXTDT_MAX_NAME + 1)];
     let raw = &raw[..raw
         .iter()
         .position(|&b| b == b'\t' || b == 0)
@@ -1019,38 +1024,46 @@ fn ptt_srpt_pgc_index(data: &[u8], ptt_offset: usize, ttn: u8) -> Option<usize> 
     pgcn.checked_sub(1)
 }
 
+// Title `ttn`'s part-of-title entries, (PGCN, PGN) each, in chapter order; `None` when the
+// table is absent or does not hold the title.
+fn ptt_srpt_parts(data: &[u8], ptt_offset: usize, ttn: u8) -> Option<Vec<(u16, u16)>> {
+    if ptt_offset == 0 || ttn == 0 {
+        return None;
+    }
+    let count = be_u16(data, ptt_offset).ok()? as usize;
+    let last_byte = be_u32(data, ptt_offset + 4).ok()? as usize;
+    if ttn as usize > count {
+        return None;
+    }
+    let at = |t: usize| {
+        be_u32(data, ptt_offset + 8 + (t - 1) * 4)
+            .ok()
+            .map(|r| r as usize)
+    };
+    let start = at(ttn as usize)?;
+    let end = if (ttn as usize) < count {
+        at(ttn as usize + 1)?
+    } else {
+        last_byte.checked_add(1)?
+    };
+    let mut parts = Vec::new();
+    let mut rel = start;
+    while rel.checked_add(4)? <= end {
+        let entry = ptt_offset.checked_add(rel)?;
+        parts.push((be_u16(data, entry).ok()?, be_u16(data, entry + 2).ok()?));
+        rel += 4;
+    }
+    Some(parts)
+}
+
 // Distinct PGCs title `ttn`'s part-of-title entries point at. A title split across
 // PGCs (one per chapter) is read from its first PGC only; the caller warns on > 1.
 fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
-    let entries = || -> Option<Vec<u16>> {
-        let count = be_u16(data, ptt_offset).ok()? as usize;
-        let last_byte = be_u32(data, ptt_offset + 4).ok()? as usize;
-        if ttn as usize > count {
-            return None;
-        }
-        let at = |t: usize| {
-            be_u32(data, ptt_offset + 8 + (t - 1) * 4)
-                .ok()
-                .map(|r| r as usize)
-        };
-        let start = at(ttn as usize)?;
-        let end = if (ttn as usize) < count {
-            at(ttn as usize + 1)?
-        } else {
-            last_byte.checked_add(1)?
-        };
-        let mut pgcns = Vec::new();
-        let mut rel = start;
-        while rel.checked_add(4)? <= end {
-            pgcns.push(be_u16(data, ptt_offset.checked_add(rel)?).ok()?);
-            rel += 4;
-        }
-        Some(pgcns)
-    };
-    if ptt_offset == 0 || ttn == 0 {
-        return 0;
-    }
-    let mut pgcns = entries().unwrap_or_default();
+    let mut pgcns: Vec<u16> = ptt_srpt_parts(data, ptt_offset, ttn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pgcn, _)| pgcn)
+        .collect();
     pgcns.sort_unstable();
     pgcns.dedup();
     pgcns.len()
@@ -1098,6 +1111,14 @@ pub(crate) fn parse_pgcit(
 
         // Warned once per disc by the DVD scan, which sees every title set.
         let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
+        // The program each chapter starts at, when every chapter lies in this PGC.
+        let ptt_programs = ptt_srpt_parts(data, ptt_offset, vts_title_num).map(|parts| match parts
+            .iter()
+            .all(|&(pgcn, _)| usize::from(pgcn) == pgc_index + 1)
+        {
+            true => parts.into_iter().map(|(_, pgn)| pgn).collect(),
+            false => Vec::new(),
+        });
 
         let entry_offset = entries_start + pgc_index * 8;
         if entry_offset + 8 > data.len() {
@@ -1124,6 +1145,7 @@ pub(crate) fn parse_pgcit(
                 // dropped sibling PGC (position in `titles` is not vts_title_num).
                 title.vts_title_num = vts_title_num;
                 title.pgcs = pgcs;
+                title.ptt_programs = ptt_programs;
                 titles.push(title);
             }
             Err(e) => {
@@ -1205,9 +1227,15 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         );
     }
 
-    // Recalculate duration from cell times if PGC-level time is zero.
+    // Recalculate duration from cell times if PGC-level time is zero. Like the PGC time and
+    // the chapter marks, it counts an angle block once: its other angles' cells add nothing
+    // (unless every cell is one, which `leading_secondary_cells` also keeps whole).
     let duration_secs = if duration_secs == 0.0 && !cells.is_empty() {
-        cells.iter().map(|c| c.duration_secs).sum()
+        let primary = |c: &&DvdCell| !CellCategory::decode(c.category).is_secondary_block_piece();
+        match cells.iter().any(|c| primary(&c)) {
+            true => cells.iter().filter(primary).map(|c| c.duration_secs).sum(),
+            false => cells.iter().map(|c| c.duration_secs).sum(),
+        }
     } else {
         duration_secs
     };
@@ -1310,6 +1338,7 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         // Set by the caller (parse_pgcit) which knows the TT_SRPT title number.
         vts_title_num: 0,
         pgcs: 0,
+        ptt_programs: None,
     })
 }
 
@@ -2307,6 +2336,7 @@ mod tests {
             spst_ctl: [0; 32],
             vts_title_num: 0,
             pgcs: 1,
+            ptt_programs: None,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 3);
@@ -2332,6 +2362,7 @@ mod tests {
             spst_ctl: [0; 32],
             vts_title_num: 0,
             pgcs: 1,
+            ptt_programs: None,
         };
         assert_eq!(t.feature_start_cell(), 2);
         let fc = t.feature_cells();
@@ -2353,6 +2384,7 @@ mod tests {
             spst_ctl: [0; 32],
             vts_title_num: 0,
             pgcs: 1,
+            ptt_programs: None,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert_eq!(t.feature_cells().len(), 2);
@@ -2371,6 +2403,7 @@ mod tests {
             spst_ctl: [0; 32],
             vts_title_num: 0,
             pgcs: 1,
+            ptt_programs: None,
         };
         assert_eq!(t.feature_start_cell(), 0);
         assert!(t.feature_cells().is_empty());
@@ -2977,6 +3010,35 @@ mod tests {
         );
         let map = parse_txtdt_chapter_names(&sjis, SECTOR_BYTES);
         assert_eq!(map[&(1, 1)], names(&[None, Some("ascii")]));
+    }
+
+    /// Every item of a full table pointing into one long unterminated run (the item table
+    /// itself, crafted free of TAB and NUL) costs one bounded look, not a scan to the end.
+    #[test]
+    fn txtdt_unterminated_names_are_read_bounded() {
+        let items = usize::from(u16::MAX / 2);
+        let base = TXTDT_MG_HDR + 8 + TXTDT_LU_ITEMS;
+        let mut d = vec![0xFFu8; base + 4 + items * 8 + 1024 * 1024];
+        d[..TXTDT_MG_HDR + 8].fill(0x01);
+        d[TXTDT_MG_HDR + 4..TXTDT_MG_HDR + 8]
+            .copy_from_slice(&((TXTDT_MG_HDR + 8) as u32).to_be_bytes());
+        let last = (d.len() - 1) as u32;
+        d[0x10..0x14].copy_from_slice(&last.to_be_bytes());
+        for i in 0..items {
+            let item = base + 4 + i * 8;
+            d[item] = if i == 0 { TX_TITLE } else { TX_CHAPTER };
+            d[item + 6..item + 8].copy_from_slice(&0x0404u16.to_be_bytes());
+        }
+        let vmg = with_txtdt(vmg_with_tt_srpt(1, &[(2, 1, 1)]), &d);
+        let started = std::time::Instant::now();
+        let titles = txtdt_titles(&vmg).expect("table");
+        assert_eq!(titles[0].len(), items - 1);
+        assert!(
+            titles[0].iter().all(Option::is_none),
+            "overlong names are no names"
+        );
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
     }
 
     /// No text data, bad pointers, bad lengths and truncation yield no names and
