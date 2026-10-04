@@ -182,10 +182,10 @@ fn field_text(raw: &str) -> Option<String> {
         .strip_prefix("<![CDATA[")
         .and_then(|r| r.strip_suffix("]]>"))
     {
-        Some(inner) if !inner.contains("]]>") => inner.trim().to_string(),
+        Some(inner) if !inner.contains("]]>") => display_text(inner),
         Some(_) => return None,
         None if looks_like_xml(raw) => return None,
-        None => decode_entities(raw),
+        None => display_text(&decode_entities(raw)),
     };
     if out.is_empty() || looks_like_xml(&out) {
         return None;
@@ -231,6 +231,13 @@ fn decode_entities(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Disc-authored text as shown and put in file names: control characters (an escape
+/// sequence, a raw newline) dropped, then trimmed.
+pub(crate) fn display_text(s: &str) -> String {
+    let kept: String = s.chars().filter(|c| !c.is_control()).collect();
+    kept.trim().to_string()
 }
 
 /// True for the generic `Blu-ray` some discs (Warner's non-English bdmt files) put where
@@ -320,6 +327,18 @@ mod tests {
         let (t, d, _) = parse_bdmt_xml(&xml).expect("parse");
         assert!(t.len() <= MAX_BDMT_TEXT && !t.is_empty());
         assert!(d.expect("desc").len() <= MAX_BDMT_TEXT);
+    }
+
+    // A title or description, CDATA or plain, keeps no control character (a terminal escape
+    // sequence, a raw newline), as the Blu-ray di:name path does not.
+    #[test]
+    fn disc_text_drops_control_characters() {
+        let xml = "<d><di:name><![CDATA[Movie\x1b]0;pwned\x07]]></di:name>\
+                   <di:description>Line\x1b[2Jone\ntwo</di:description></d>";
+        let (t, d, _) = parse_bdmt_xml(xml).expect("parse");
+        assert_eq!(t, "Movie]0;pwned");
+        assert_eq!(d.as_deref(), Some("Line[2Jonetwo"));
+        assert_eq!(display_text(" \x1bA\tB "), "AB");
     }
 
     #[test]

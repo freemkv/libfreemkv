@@ -34,7 +34,7 @@ use crate::udf::UdfFs;
 // disc-level metadata via `labels::DiscMetadata`. The module itself
 // stays private — analyze() drives the parse path.
 pub use bdmt::DiscMetadata;
-pub(crate) use bdmt::is_placeholder_title;
+pub(crate) use bdmt::{display_text, is_placeholder_title};
 
 // Re-exported via crate::disc — the public API surfaces these next to
 // AudioStream/SubtitleStream so callers can map purpose/qualifier to display

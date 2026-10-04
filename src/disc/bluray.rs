@@ -511,11 +511,9 @@ impl Disc {
                             if let Some(end) = xml[s..].find("</di:name>") {
                                 // Disc-authored text reaches terminals and file names:
                                 // control characters (decoded from `&#27;` too) are dropped.
-                                let title: String = xml_text_decode(xml[s..s + end].trim())
-                                    .chars()
-                                    .filter(|c| !c.is_control())
-                                    .collect();
-                                let title = title.trim().to_string();
+                                let title = crate::labels::display_text(&xml_text_decode(
+                                    xml[s..s + end].trim(),
+                                ));
                                 if !title.is_empty() && !crate::labels::is_placeholder_title(&title)
                                 {
                                     return Some(title);
