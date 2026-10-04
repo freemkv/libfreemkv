@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(pl.streams[0].color_space, 0);
     }
 
-    // HEVC hdr_plus_flag is bit 6 of sa[3] (libbluray mpls_parse.c); cr_flag (bit 7)
+    // HEVC hdr_plus_flag is bit 6 of sa[3]; cr_flag (bit 7)
     // alone must not read as HDR10+, and a 3-byte attribute block has no flag.
     #[test]
     fn hevc_hdr_plus_flag_is_bit_6_of_the_fourth_attribute_byte() {
