@@ -673,7 +673,24 @@ fn pre_ake_read_refusal_is_a_plain_scan_error() {
     assert_eq!(rig.count(|c| matches!(c[0], 0xA3 | 0xA4)), 0);
 }
 
+// 64 video packs, each flagged scrambled (`[HD]` §4.3.2) or each clear (a decrypted rip).
+fn evo(scrambled: bool) -> Vec<u8> {
+    (0..64u8)
+        .flat_map(|i| {
+            let mut p = crate::aacs::hddvd::tests::video_pack(i);
+            if scrambled {
+                p[20] |= 0x10;
+            }
+            p
+        })
+        .collect()
+}
+
 fn hddvd_disc() -> MemDisc {
+    hddvd_disc_with(true)
+}
+
+fn hddvd_disc_with(scrambled: bool) -> MemDisc {
     let root = DirSpec {
         name: String::new(),
         icb_lba: 10,
@@ -684,7 +701,7 @@ fn hddvd_disc() -> MemDisc {
                 name: "HVDVD_TS".into(),
                 icb_lba: 20,
                 dir_data_lba: 21,
-                files: vec![file("MAIN.EVO", 100, 5_000, 3_000_000, true)],
+                files: vec![file_with("MAIN.EVO", 100, 5_000, evo(scrambled), true)],
                 subdirs: vec![],
             },
             DirSpec {
@@ -736,6 +753,17 @@ fn hddvd_image_aacs_dir_is_captured() {
     let mut mem = hddvd_disc();
     let d = Disc::scan_image(&mut mem, 9_999, &ScanOptions::default()).expect("scan");
     assert!(d.encrypted && d.aacs.is_some() && d.aacs_error.is_none());
+}
+
+// A rip keeps a renamed AACS dir (`AACS!` here) over clear EVOs: encryption follows the packs'
+// scrambling flags, not the directory, for the fast identify and the full scan alike.
+#[test]
+fn hddvd_rip_with_an_aacs_dir_over_clear_packs_is_not_encrypted() {
+    let mut rig = Rig::new(hddvd_disc_with(false), |_| {});
+    assert!(!Disc::identify(&mut rig.drive).expect("identify").encrypted);
+    let mut mem = hddvd_disc_with(false);
+    let d = Disc::scan_image(&mut mem, 9_999, &ScanOptions::default()).expect("scan");
+    assert!(!d.encrypted && d.aacs.is_none() && !d.titles.is_empty());
 }
 
 #[test]

@@ -1779,7 +1779,9 @@ impl Disc {
         // (no titles needed: BD/UHD/FMTS come from the MKB generation). It no
         // longer defaults to BluRay or defers UHD/FMTS to the full scan.
         let format = Self::detect_disc_format(&mut buffered, &udf_fs, &[]);
-        let encrypted = aacs_dir_present(&udf_fs);
+        let encrypted = aacs_dir_present(&udf_fs)
+            && (format != DiscFormat::HdDvd
+                || hddvd::hddvd_content_scrambled(&mut buffered, &udf_fs) != Some(false));
         let layers = Self::layers_for(format, capacity);
 
         Ok(DiscId {
@@ -2447,10 +2449,10 @@ impl Disc {
     ) -> Result<Self> {
         let scan_with_t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
-        let encrypted = aacs.is_some();
+        let mut encrypted = aacs.is_some();
         // Lookup-free: the state carries the disc's AACS inputs but no key; the caller
         // resolves one into a `KeyRing`.
-        let (aacs, aacs_error) = match aacs {
+        let (mut aacs, mut aacs_error) = match aacs {
             Some((cap, bus)) => encrypt::resolve_aacs(cap, &bus),
             None => (None, None),
         };
@@ -2466,6 +2468,14 @@ impl Disc {
                 ContentFormat::BdTs,
             )
         } else if udf_fs.find_dir("/HVDVD_TS").is_some() {
+            // An AACS directory over EVOs whose packs are all unscrambled is a decrypted rip.
+            if encrypted && hddvd::hddvd_content_scrambled(reader, &udf_fs) == Some(false) {
+                tracing::info!(
+                    target: "freemkv::scan",
+                    "HD DVD carries an AACS directory but its EVO packs are clear: not encrypted"
+                );
+                (encrypted, aacs, aacs_error) = (false, None, None);
+            }
             (
                 Self::scan_hddvd_titles(reader, &udf_fs, halt)?,
                 ContentFormat::MpegPs,
