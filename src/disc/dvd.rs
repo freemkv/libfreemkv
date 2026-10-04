@@ -21,12 +21,12 @@ fn load_vmg(
 const DSI_DATA: usize = 0x407;
 const DSI_ILVU_EA: usize = DSI_DATA + 32 + 2;
 const DSI_NEXT_ILVU_SA: usize = DSI_DATA + 32 + 6;
-// SML_PBI's "no next unit": 0x7FFFFFFF by the book, and discs also write 0xFFFFFFFF.
+// SML_PBI's "no next unit": 0xFFFFFFFF by the book, and discs also write 0x7FFFFFFF.
 const NO_NEXT_ILVU: u32 = 0x7FFF_FFFF;
 
 // The sector ranges an interleaved cell plays: its own interleaved units, found by following
-// each unit's navigation pack (its end, then the next unit's start). `None` when a pack does not
-// read or parse, which leaves the cell's whole range to the caller.
+// each unit's navigation pack. The chain runs per VOB, past the cell, so it is clipped to the
+// cell. `None` when a pack does not read or parse, which leaves the cell's range to the caller.
 fn interleaved_units(
     reader: &mut dyn SectorSource,
     vob_start: u32,

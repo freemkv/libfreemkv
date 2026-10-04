@@ -101,7 +101,7 @@ pub struct CellCategory {
     pub block_mode: u8,
     /// bits 5-4: 0=not part of a block, 1=angle block.
     pub block_type: u8,
-    /// bit 3: seamless playback (STC continuous).
+    /// bit 3: seamless playback linked in PCI (not a statement that the STC continues).
     pub seamless_play: bool,
     /// bit 2: interleaved (multi-angle / seamless-branch interleave).
     pub interleaved: bool,
