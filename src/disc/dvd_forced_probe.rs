@@ -242,8 +242,32 @@ pub(crate) fn probe_and_set_forced(
     }
 }
 
-// Sample the extents for the tracks in `pids`: (evidence, why reading stopped, whether the read
-// was a sample rather than the whole title, sectors read).
+// The disc runs that title sectors `offset..offset + len` cover, counting along `extents` in
+// read order: (the extent's start, first LBA, sectors) each.
+fn title_runs(extents: &[Extent], offset: u32, len: u32) -> Vec<(u32, u32, u32)> {
+    let (from, to) = (u64::from(offset), u64::from(offset) + u64::from(len));
+    let mut runs = Vec::new();
+    let mut at = 0u64;
+    for ext in extents {
+        let end = at + u64::from(ext.sector_count);
+        let (lo, hi) = (from.max(at), to.min(end));
+        if lo < hi {
+            let lba = u64::from(ext.start_lba) + (lo - at);
+            if let Ok(lba) = u32::try_from(lba) {
+                runs.push((ext.start_lba, lba, (hi - lo) as u32));
+            }
+        }
+        if end >= to {
+            break;
+        }
+        at = end;
+    }
+    runs
+}
+
+// Sample the title for the tracks in `pids`: (evidence, why reading stopped, whether it was a
+// sample, sectors read). Windows span the title end to end, so thousands of small extents are
+// sampled across its length rather than read from the head until the budget runs out.
 fn read_evidence(
     reader: &mut dyn SectorSource,
     extents: &[Extent],
@@ -253,32 +277,23 @@ fn read_evidence(
     let mut evidence: HashMap<u16, SpuEvidence> =
         pids.iter().map(|&p| (p, SpuEvidence::default())).collect();
     let total: u64 = extents.iter().map(|e| u64::from(e.sector_count)).sum();
-    let share = |n: u32| -> u32 {
-        if total == 0 {
-            return 0;
-        }
-        (u64::from(PROBE_BUDGET_SECTORS) * u64::from(n) / total).min(u64::from(u32::MAX)) as u32
-    };
+    let total = u32::try_from(total).unwrap_or(u32::MAX);
     // Once every track has shown a non-forced SPU, nothing further can change a verdict.
     let settled = |ev: &HashMap<u16, SpuEvidence>| ev.values().all(|e| e.non_forced);
 
     let mut buf = vec![0u8; CHUNK_SECTORS as usize * SECTOR_BYTES];
     let mut css = Descrambler::default();
     let mut sectors_read: u32 = 0;
-    let mut sampled = false;
-    for ext in extents {
-        let plan = plan_windows(ext.sector_count, share(ext.sector_count));
-        sampled |= !matches!(plan.as_slice(), [w] if w.offset == 0 && w.len == ext.sector_count);
-        reader.set_unit_base(ext.start_lba);
-        for window in &plan {
-            // Demux and reassembly state are per window: windows are discontiguous.
-            let mut demux = PsDemuxer::new();
-            let mut spus: HashMap<u16, SpuAssembler> =
-                pids.iter().map(|&p| (p, SpuAssembler::default())).collect();
-            let Some(mut lba) = ext.start_lba.checked_add(window.offset) else {
-                continue;
-            };
-            let mut remaining = window.len;
+    let plan = plan_windows(total, PROBE_BUDGET_SECTORS);
+    let sampled = !matches!(plan.as_slice(), [w] if w.offset == 0 && w.len == total);
+    for window in &plan {
+        // Demux and reassembly state are per window: windows are discontiguous. The runs of
+        // one window are the title's contiguous playback, so they share it.
+        let mut demux = PsDemuxer::new();
+        let mut spus: HashMap<u16, SpuAssembler> =
+            pids.iter().map(|&p| (p, SpuAssembler::default())).collect();
+        for (base, mut lba, mut remaining) in title_runs(extents, window.offset, window.len) {
+            reader.set_unit_base(base);
             while remaining > 0 {
                 if halt.is_some_and(|h| h.is_cancelled()) {
                     return (evidence, StopReason::Halted, true, sectors_read);
@@ -313,12 +328,12 @@ fn read_evidence(
                 remaining = remaining.saturating_sub(got);
                 sectors_read += got;
                 if settled(&evidence) {
-                    // Extents past this one go unread: the evidence is a sample.
+                    // The rest of the title goes unread: the evidence is a sample.
                     return (evidence, StopReason::Exhausted, true, sectors_read);
                 }
             }
-            observe(demux.flush(), &mut spus, &mut evidence);
         }
+        observe(demux.flush(), &mut spus, &mut evidence);
     }
     (evidence, StopReason::Exhausted, sampled, sectors_read)
 }
@@ -516,6 +531,57 @@ mod tests {
             probed(&sectors, &[0x20, 0x21, 0x22, 0x23], None),
             vec![true, false, false, false]
         );
+    }
+
+    // A title of thousands of small extents (interleaved units) is sampled across its length
+    // within the budget, not read from its head until the budget runs out.
+    #[test]
+    fn many_small_extents_are_sampled_across_the_title() {
+        struct Spy(Vec<(u32, u16)>);
+        impl SectorSource for Spy {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> crate::error::Result<usize> {
+                self.0.push((lba, count));
+                let n = count as usize * SECTOR_BYTES;
+                buf[..n].fill(0);
+                Ok(n)
+            }
+        }
+        let extents: Vec<Extent> = (0..5000)
+            .map(|i| Extent {
+                start_lba: i * 200,
+                sector_count: 100,
+            })
+            .collect();
+        let mut reader = Spy(Vec::new());
+        let (_, _, sampled, read) = read_evidence(&mut reader, &extents, &[0x20], None);
+        assert!(sampled);
+        assert!(read <= PROBE_BUDGET_SECTORS, "read {read}");
+        let last = reader.0.iter().map(|&(lba, _)| lba).max().unwrap();
+        assert!(last >= 4000 * 200, "reads stop at LBA {last}");
+    }
+
+    // A window's title sectors map onto the extents it crosses, in read order.
+    #[test]
+    fn title_runs_cross_extent_boundaries() {
+        let extents = [
+            Extent {
+                start_lba: 10,
+                sector_count: 5,
+            },
+            Extent {
+                start_lba: 100,
+                sector_count: 5,
+            },
+        ];
+        assert_eq!(title_runs(&extents, 3, 4), vec![(10, 13, 2), (100, 100, 2)]);
+        assert_eq!(title_runs(&extents, 5, 5), vec![(100, 100, 5)]);
+        assert!(title_runs(&extents, 10, 5).is_empty());
     }
 
     #[test]
