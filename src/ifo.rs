@@ -21,6 +21,10 @@ pub struct DvdInfo {
     /// Chapter names from the VMG text data, keyed by (vts_number, vts_title_num) and
     /// indexed by 0-based chapter; `None` where the disc names no chapter.
     pub chapter_names: std::collections::BTreeMap<(u8, u8), Vec<Option<String>>>,
+    /// VMGI_MAT byte 0x23, the second byte of VMG_CATEGORY (0x22): bit n set means the disc
+    /// does NOT play in region n+1 (libdvdread ifo_print.c; mpucoder "byte1=prohibited region
+    /// mask"). 0x00 is region-free.
+    pub region_mask: u8,
 }
 
 /// One title set (VTS_XX_0.IFO).
@@ -207,6 +211,10 @@ pub struct DvdAudioAttr {
     /// Coding mode 3: mpucoder IFO "3 Mpeg-2ext"; EP0867877A2 "011b MPEG-2 with extension
     /// bitstream" (mode 2 is "MPEG-1 or MPEG-2 without extension bit stream").
     pub mpeg_ext: bool,
+    /// Code extension, byte 5 (libdvdread `audio_attr_t.code_extension`; mpucoder "5 code
+    /// extension", SPRM 17): 0 unspecified, 1 normal, 2 visually impaired, 3/4 director's
+    /// comments.
+    pub code_extension: u8,
 }
 
 /// The on-wire VobSub sub-stream id (0x20..=0x3F) of one PGC_SPST_CTL entry, or `None` when
@@ -230,11 +238,17 @@ pub(crate) fn subpicture_stream_id(ctl: u32, aspect: DvdAspect) -> Option<u8> {
 #[derive(Debug, Clone)]
 pub struct DvdSubtitleAttr {
     pub language: String,
+    /// Code extension, byte 5 (libdvdread `subp_attr_t.code_extension`; mpucoder "5 code
+    /// extension", SPRM 19): 1 normal, 2 large, 3 children, 5-7 captions, 9 forced, 13-15
+    /// director's comments.
+    pub code_extension: u8,
 }
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
 const VMG_MAGIC: &[u8; 12] = b"DVDVIDEO-VMG";
+// VMG_CATEGORY is the u32 at 0x22 (libdvdread vmgi_mat_t); its second byte is the region mask.
+const VMG_REGION_MASK_OFFSET: usize = 0x23;
 const VTS_MAGIC: &[u8; 12] = b"DVDVIDEO-VTS";
 use crate::consts::SECTOR_BYTES;
 
@@ -264,6 +278,16 @@ fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
 /// Read a single byte with bounds check.
 fn byte_at(data: &[u8], offset: usize) -> Result<u8> {
     data.get(offset).copied().ok_or(Error::IfoParse)
+}
+
+// An attribute block's code-extension byte (offset 5 in both the 8-byte audio and 6-byte
+// subpicture blocks); 0 "unspecified" when a short test buffer stops before it.
+fn code_extension_at(data: &[u8], offset: usize) -> u8 {
+    offset
+        .checked_add(5)
+        .and_then(|o| data.get(o))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Get a sub-slice with bounds check.
@@ -468,6 +492,7 @@ pub(crate) fn parse_vmg_with(
     Ok(DvdInfo {
         title_sets,
         chapter_names,
+        region_mask: vmg_data[VMG_REGION_MASK_OFFSET],
     })
 }
 
@@ -900,6 +925,7 @@ pub(crate) fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAtt
         sample_rate,
         language,
         mpeg_ext: coding_mode == 3,
+        code_extension: code_extension_at(data, offset),
     })
 }
 
@@ -938,7 +964,10 @@ fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
     let lang_bytes = sub_slice(data, offset + 2, 2)?;
     let language = dvd_lang_to_iso639_2(&parse_raw_dvd_lang_bytes(lang_bytes));
 
-    Ok(DvdSubtitleAttr { language })
+    Ok(DvdSubtitleAttr {
+        language,
+        code_extension: code_extension_at(data, offset),
+    })
 }
 
 // Decodes the raw 2-byte on-disc language code: lowercase a-z taken verbatim, all-zero means
@@ -1890,6 +1919,20 @@ mod tests {
             let attr = parse_audio_attr(&data, 0).unwrap();
             assert_eq!(attr.sample_rate, 48000, "b1={b1:#010b}");
         }
+    }
+
+    /// The code extension is byte 5 of both attribute blocks (libdvdread audio_attr_t /
+    /// subp_attr_t: lang_code, lang_extension, code_extension); byte 4 is not it.
+    #[test]
+    fn attr_code_extension_is_byte_5() {
+        let mut audio = vec![0u8; 8];
+        audio[4] = 0x7F;
+        audio[5] = 3;
+        assert_eq!(parse_audio_attr(&audio, 0).unwrap().code_extension, 3);
+        let mut sub = vec![0u8; 6];
+        sub[4] = 0x7F;
+        sub[5] = 9;
+        assert_eq!(parse_subtitle_attr(&sub, 0).unwrap().code_extension, 9);
     }
 
     /// Subtitle language is at [offset+2..+4]. Verify a valid 2-letter code
@@ -3442,6 +3485,12 @@ mod tests {
         let vmg = vmg_at_sector(3, &[(5, 1, 1), (5, 2, 1)]);
         let info = parse_vmg_with(&mut disc, &udf, Some(&vmg)).expect("vmg parses");
         assert_eq!(info.title_sets.len(), 1, "VTS 2 has no IFO: skipped");
+        assert_eq!(info.region_mask, 0, "no region bits set");
+        let mut coded = vmg.clone();
+        coded[0x22] = 0x11; // VMG_CATEGORY's first byte is not the mask
+        coded[0x23] = 0xFE;
+        let info = parse_vmg_with(&mut disc, &udf, Some(&coded)).expect("vmg parses");
+        assert_eq!(info.region_mask, 0xFE);
         assert_eq!(info.title_sets[0].vts_number, 1);
         assert_eq!(info.title_sets[0].titles[0].vts_title_num, 1);
 

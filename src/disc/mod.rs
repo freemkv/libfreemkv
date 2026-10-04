@@ -11,6 +11,7 @@
 mod bluray;
 mod dvd;
 pub(crate) mod dvd_audio_probe;
+pub(crate) mod dvd_forced_probe;
 mod encrypt;
 pub(crate) use encrypt::handshake_class_error;
 mod extract;
@@ -52,7 +53,9 @@ pub struct Disc {
     /// Titles in main-feature order: `titles[0]` is the selected main feature (nav or
     /// authoring pick first, else largest physical size), not necessarily the longest
     pub titles: Vec<DiscTitle>,
-    /// Disc region. Not decoded yet: scans always report [`DiscRegion::Free`].
+    /// Disc region: a DVD's VMG region mask, [`DiscRegion::Free`] for UHD (region-free by
+    /// spec), and [`DiscRegion::Unknown`] for Blu-ray and HD DVD, whose region check is
+    /// the disc's own program code rather than a static field.
     pub region: DiscRegion,
     /// AACS state -- None if disc is unencrypted or keys unavailable
     pub aacs: Option<AacsState>,
@@ -116,8 +119,12 @@ pub enum DiscRegion {
     Free,
     /// Blu-ray regions (A/B/C or combination)
     BluRay(Vec<BdRegion>),
-    /// DVD regions (1-8 or combination)
+    /// DVD regions the disc plays in (1-8 or combination); empty when the disc's
+    /// region mask prohibits every region.
     Dvd(Vec<u8>),
+    /// Not recorded anywhere a scan can read: a Blu-ray or HD DVD enforces region in
+    /// its own navigation program (BD checks player register PSR20), not a static field.
+    Unknown,
 }
 
 /// Blu-ray region codes.
@@ -2455,6 +2462,7 @@ impl Disc {
         // FMTS shares the BD tree; FORMAT is a separate axis derived below). DVD
         // resolves its main feature via First-Play nav (issue #40) as `nav_feature`.
         let mut dvd_nav_feature: Option<u16> = None;
+        let mut dvd_region: Option<DiscRegion> = None;
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
             (
                 Self::scan_bluray_titles(reader, &udf_fs, halt)?,
@@ -2466,8 +2474,9 @@ impl Disc {
                 ContentFormat::MpegPs,
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
-            let (dvd_titles, nav) = Self::scan_dvd_titles(reader, &udf_fs, halt)?;
+            let (dvd_titles, nav, region) = Self::scan_dvd_titles(reader, &udf_fs, halt)?;
             dvd_nav_feature = nav;
+            dvd_region = Some(region);
             (dvd_titles, ContentFormat::MpegPs)
         } else {
             (Vec::new(), ContentFormat::BdTs)
@@ -2528,18 +2537,23 @@ impl Disc {
         // rip leaves it off since the muxer detects forced without a second read.
         if opts.probe_forced_subtitles {
             Self::probe_forced_subtitles_for_bdts_titles(reader, &mut titles, halt);
-            // The probe swallows a Stop; surface it as the live scan does.
+            Self::probe_forced_subtitles_for_dvd_titles(reader, &mut titles, halt);
+            // The probes swallow a Stop; surface it as the live scan does.
             if let Some(h) = halt {
                 h.check()?;
             }
         }
         crate::labels::fill_defaults(&mut titles);
 
-        // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD) and
-        //    layers. Region coding is not decoded yet: every disc reports Region-free.
+        // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD), layers and
+        //    region: the DVD's VMG mask, region-free UHD, otherwise not statically recorded.
         let format = Self::detect_disc_format(reader, &udf_fs, &titles);
         let layers = Self::layers_for(format, capacity);
-        let region = DiscRegion::Free;
+        let region = match (dvd_region, format) {
+            (Some(region), _) => region,
+            (None, DiscFormat::Uhd | DiscFormat::Fmts) => DiscRegion::Free,
+            (None, _) => DiscRegion::Unknown,
+        };
 
         // 6. CSS: `scan_image` cracks the title key after this returns and `scan_live` only
         // runs bus-auth. The reader-based crack is NOT run here: on a CSS disc it would
@@ -2613,6 +2627,21 @@ impl Disc {
         for title in titles.iter_mut() {
             if title.content_format == ContentFormat::BdTs {
                 pgs_forced_probe::probe_and_set_forced(reader, title, &mut cache, halt);
+            }
+        }
+    }
+
+    // Content-based forced-subtitle detection for DVD VobSub titles (FSTA_DSP), the DVD
+    // counterpart of the PGS probe above; it only adds `forced`, never clears the IFO's.
+    fn probe_forced_subtitles_for_dvd_titles(
+        reader: &mut dyn SectorSource,
+        titles: &mut [DiscTitle],
+        halt: Option<&crate::halt::Halt>,
+    ) {
+        let mut cache = dvd_forced_probe::DvdForcedProbeCache::default();
+        for title in titles.iter_mut() {
+            if title.content_format == ContentFormat::MpegPs {
+                dvd_forced_probe::probe_and_set_forced(reader, title, &mut cache, halt);
             }
         }
     }

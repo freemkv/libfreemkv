@@ -65,12 +65,12 @@ fn interleaved_units(
 
 impl Disc {
     // Scan DVD titles; a cancelled read is Err(Error::Halted), never an empty list. Also
-    // returns the nav-resolved main feature, or None.
+    // returns the nav-resolved main feature (or None) and the VMG's region coding.
     pub(super) fn scan_dvd_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         halt: Option<&crate::halt::Halt>,
-    ) -> Result<(Vec<DiscTitle>, Option<u16>)> {
+    ) -> Result<(Vec<DiscTitle>, Option<u16>, DiscRegion)> {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
@@ -92,7 +92,7 @@ impl Disc {
                     if !(missing(&ifo_err) && missing(&bup_err)) {
                         tracing::warn!(target: "freemkv::scan", ifo = ifo_err.code(), bup = bup_err.code(), "dvd: VIDEO_TS.IFO and BUP unusable");
                     }
-                    return Ok((Vec::new(), None));
+                    return Ok((Vec::new(), None, DiscRegion::Unknown));
                 }
             },
         };
@@ -261,13 +261,14 @@ impl Disc {
                         continue;
                     }
                     *slot = Some(&s.language);
+                    let (forced, qualifier) = subpicture_label(s.code_extension);
                     let pid = crate::mux::ps::dvd_subtitle_pid(sub_id).unwrap_or(sub_id as u16);
                     subtitle_streams.push(Stream::Subtitle(SubtitleStream {
                         pid,
                         codec: Codec::DvdSub,
                         language: s.language.clone(),
-                        forced: false,
-                        qualifier: crate::disc::LabelQualifier::None,
+                        forced,
+                        qualifier,
                         codec_data: codec_data.clone(),
                     }));
                 }
@@ -332,7 +333,44 @@ impl Disc {
             return Err(Error::Halted);
         }
         warn_multi_pgc_titles(&vmg_bytes, &dvd_info);
-        Ok((titles, nav_feature))
+        Ok((titles, nav_feature, dvd_region(dvd_info.region_mask)))
+    }
+}
+
+/// The region a VMG region mask (VMGI_MAT 0x23) allows: bit n set means region n+1 is
+/// prohibited, so the playable regions are the clear bits. 0x00 is region-free; 0xFF
+/// leaves no region at all, an empty [`DiscRegion::Dvd`].
+pub(super) fn dvd_region(mask: u8) -> DiscRegion {
+    if mask == 0 {
+        return DiscRegion::Free;
+    }
+    DiscRegion::Dvd(
+        (0..8u8)
+            .filter(|n| mask & (1 << n) == 0)
+            .map(|n| n + 1)
+            .collect(),
+    )
+}
+
+// An audio stream's purpose from its IFO code extension (libdvdread dvd_audio_code_ext_t):
+// 2 visually impaired is descriptive audio, 3 and 4 are director's comments.
+fn audio_purpose(code_extension: u8) -> LabelPurpose {
+    match code_extension {
+        2 => LabelPurpose::Descriptive,
+        3 | 4 => LabelPurpose::Commentary,
+        _ => LabelPurpose::Normal,
+    }
+}
+
+/// A subpicture stream's `(forced, qualifier)` from its IFO code extension (libdvdread
+/// dvd_subp_code_ext_t). Captions (5-7, any size) are the closed captions BD calls SDH;
+/// 9 is forced. Large (2), children (3) and director's comments (13-15) have no slot in
+/// the subtitle label model and stay unlabelled.
+fn subpicture_label(code_extension: u8) -> (bool, LabelQualifier) {
+    match code_extension {
+        5..=7 => (false, LabelQualifier::Sdh),
+        9 => (true, LabelQualifier::Forced),
+        _ => (false, LabelQualifier::None),
     }
 }
 
@@ -418,7 +456,7 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
             language: a.language.clone(),
             sample_rate: SampleRate::from_hz(a.sample_rate),
             secondary: false,
-            purpose: crate::disc::LabelPurpose::Normal,
+            purpose: audio_purpose(a.code_extension),
             label: String::new(),
         }));
         // Coding mode 3, "MPEG-2 with extension bitstream" (EP0867877A2): its extension stream
@@ -435,7 +473,7 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
                 language: a.language.clone(),
                 sample_rate: SampleRate::from_hz(a.sample_rate),
                 secondary: false,
-                purpose: crate::disc::LabelPurpose::Normal,
+                purpose: audio_purpose(a.code_extension),
                 label: crate::disc::MP2_EXTENSION_LABEL.to_string(),
             }));
         }
@@ -1185,7 +1223,7 @@ mod tests {
             matches!(res, Err(crate::error::Error::Halted)),
             "a cancelled title-set read must surface as a cancelled scan, not \
              as a disc with fewer titles; got {:?}",
-            res.map(|(ts, _)| ts.iter().map(|t| t.playlist.clone()).collect::<Vec<_>>())
+            res.map(|(ts, _, _)| ts.iter().map(|t| t.playlist.clone()).collect::<Vec<_>>())
         );
 
         // The same cancel one level up: VIDEO_TS.IFO itself. This is the
@@ -1200,7 +1238,7 @@ mod tests {
             matches!(res, Err(crate::error::Error::Halted)),
             "a cancelled VMG read must surface as a cancelled scan, not as an \
              empty disc; got {:?}",
-            res.map(|(ts, _)| ts.len())
+            res.map(|(ts, _, _)| ts.len())
         );
     }
 
@@ -1879,7 +1917,7 @@ mod tests {
                 },
             ],
         );
-        let (titles, nav_feature) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        let (titles, nav_feature, _) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 2);
         // Sanity: the resolver reached the branch with the VTS-2 target.
         assert_eq!(
@@ -1927,7 +1965,7 @@ mod tests {
                 },
             ],
         );
-        let (titles, nav_feature) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        let (titles, nav_feature, _) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
         assert_eq!(titles.len(), 2);
         assert_eq!(nav_feature, Some(1));
     }
@@ -2423,6 +2461,7 @@ mod tests {
                 set(11, vec![title(1, 1)]),
             ],
             chapter_names: Default::default(),
+            region_mask: 0,
         };
         let vmg = b"multi_pgc_titles_warn_once_per_disc".to_vec();
         let ((), ev) = crate::testlog::capture(|| {
@@ -2443,8 +2482,123 @@ mod tests {
         let clear = ifo::DvdInfo {
             title_sets: vec![set(1, vec![title(1, 1)])],
             chapter_names: Default::default(),
+            region_mask: 0,
         };
         let ((), ev) = crate::testlog::capture(|| warn_multi_pgc_titles(b"no split", &clear));
         assert!(ev.is_empty(), "{ev:?}");
+    }
+
+    #[test]
+    fn dvd_region_decodes_the_prohibited_region_mask() {
+        assert_eq!(dvd_region(0x00), DiscRegion::Free);
+        // Only bit 0 clear: playable in region 1 alone.
+        assert_eq!(dvd_region(0xFE), DiscRegion::Dvd(vec![1]));
+        assert_eq!(dvd_region(0xFD), DiscRegion::Dvd(vec![2]));
+        assert_eq!(dvd_region(0xF2), DiscRegion::Dvd(vec![1, 3, 4]));
+        assert_eq!(dvd_region(0x01), DiscRegion::Dvd(vec![2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(dvd_region(0xFF), DiscRegion::Dvd(vec![]));
+    }
+
+    #[test]
+    fn audio_code_extension_maps_to_purpose() {
+        assert_eq!(audio_purpose(0), LabelPurpose::Normal);
+        assert_eq!(audio_purpose(1), LabelPurpose::Normal);
+        assert_eq!(audio_purpose(2), LabelPurpose::Descriptive);
+        assert_eq!(audio_purpose(3), LabelPurpose::Commentary);
+        assert_eq!(audio_purpose(4), LabelPurpose::Commentary);
+        assert_eq!(audio_purpose(5), LabelPurpose::Normal);
+    }
+
+    #[test]
+    fn subpicture_code_extension_maps_to_forced_and_qualifier() {
+        let none = (false, LabelQualifier::None);
+        let sdh = (false, LabelQualifier::Sdh);
+        for (ext, want) in [
+            (0, none),
+            (1, none),
+            (2, none),
+            (3, none),
+            (5, sdh),
+            (6, sdh),
+            (7, sdh),
+            (9, (true, LabelQualifier::Forced)),
+            (13, none),
+            (14, none),
+            (15, none),
+        ] {
+            assert_eq!(subpicture_label(ext), want, "code extension {ext}");
+        }
+    }
+
+    // Scans a one-VTS disc built from `vmg` and `vts`, keeping every result.
+    fn scan_disc(vmg: Vec<u8>, vts: Vec<u8>) -> (Vec<DiscTitle>, DiscRegion) {
+        let mut disc = MemDisc::new();
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let (titles, _, region) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+        (titles, region)
+    }
+
+    #[test]
+    fn scan_dvd_titles_reports_the_vmg_region() {
+        let vts = || build_vts(0, 0x00, &[], &[], &[(0, 9)], false);
+        assert_eq!(
+            scan_disc(build_vmg(&[(1, 1, 1)]), vts()).1,
+            DiscRegion::Free
+        );
+        let mut vmg = build_vmg(&[(1, 1, 1)]);
+        vmg[0x23] = 0xFD;
+        assert_eq!(scan_disc(vmg, vts()).1, DiscRegion::Dvd(vec![2]));
+    }
+
+    // The code extension belongs to the LOGICAL stream, so its label must follow the
+    // AST_CTL / SPST_CTL routing to whichever physical stream that logical stream plays.
+    #[test]
+    fn scan_dvd_titles_code_extension_labels_follow_the_routed_stream() {
+        let audio = [aud(AC3_6CH, b"en"), aud(AC3_6CH, b"en")];
+        let mut vts = build_vts(0, 0x00, &audio, &[*b"de", *b"de"], &[(0, 9)], false);
+        vts[0x204 + 8 + 5] = 3; // logical audio 1: director's comments
+        vts[0x256 + 6 + 5] = 9; // logical subpicture 1: forced
+        set_ast(&mut vts, &[0x8100, 0x8000]);
+        set_spst(&mut vts, &[0x8100_0000, 0x8000_0000]);
+        let (titles, _) = scan_disc(build_vmg(&[(1, 1, 1)]), vts);
+        let mut audio = Vec::new();
+        let mut subs = Vec::new();
+        for s in &titles[0].streams {
+            match s {
+                Stream::Audio(a) => audio.push((a.pid, a.purpose)),
+                Stream::Subtitle(s) => subs.push((s.pid, s.forced, s.qualifier)),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            audio,
+            vec![
+                (0xBD81, LabelPurpose::Normal),
+                (0xBD80, LabelPurpose::Commentary)
+            ]
+        );
+        assert_eq!(
+            subs,
+            vec![
+                (0x21, false, LabelQualifier::None),
+                (0x20, true, LabelQualifier::Forced)
+            ]
+        );
     }
 }
