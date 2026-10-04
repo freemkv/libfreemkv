@@ -264,43 +264,59 @@ fn v20_stride_64_evidence() {
     );
 }
 
-/// KS-27: HD DVD `.evo` units carry the flag in PES_scrambling_control (bits 5-4 of byte
-/// 20). Literal offsets here, so a drifted constant in the library fails this guard.
-#[test]
-fn hddvd_flag_is_bits_5_4_of_byte_20() {
-    let unit_with = |at: usize, b: u8| {
-        let mut u = vec![0u8; ALIGNED_UNIT_LEN];
-        u[at] = b;
-        aacs_unit_encrypted(&u, ContentFormat::MpegPs)
-    };
-    for b in [0x10, 0x20, 0x30, 0xFF] {
-        assert!(unit_with(20, b), "byte 20 = {b:#04x}");
+// An MPEG-2 pack header, then one video PES whose flags byte (`10` marker, then
+// PES_scrambling_control in bits 5-4) is `flags`; filler to 6144 bytes (3 packs).
+fn ps_unit(flags_per_pack: [u8; 3]) -> Vec<u8> {
+    let mut u = Vec::new();
+    for flags in flags_per_pack {
+        let mut p = vec![
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0, 0x04, 0, 0x04, 0x01, 0x01, 0x89, 0xC3, 0xF8,
+        ];
+        p.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0, 0x07, 0xEC, flags, 0x00, 0x00]);
+        p.resize(2048, 0x5A);
+        u.extend_from_slice(&p);
     }
-    for b in [0x00, 0x0F, 0x40, 0x80, 0xC0] {
-        assert!(!unit_with(20, b), "byte 20 = {b:#04x}");
-    }
-    for at in [0, 19, 21] {
-        assert!(!unit_with(at, 0x30), "byte {at}");
-    }
+    u
 }
 
-/// per evidence (no public spec); do not change without evidence proving otherwise —
-/// KS-27: the HD DVD book was "removed from this AACS website due to inactivity".
+/// KS-30: an encrypted HD DVD pack has PES_scrambling_control `01₂`, judged per pack in the
+/// PES header (byte 20 with no pack stuffing): a unit is encrypted when any pack is.
 #[test]
-fn hddvd_flag_offset_is_unverified() {
+fn hddvd_flag_is_pes_scrambling_control_of_every_pack() {
     assert_eq!(
-        KS_27_HDDVD_EVIDENCE.kind,
-        libfreemkv::spec::QuoteKind::Evidence
+        KS_30_HDDVD_PACK_ENCRYPTION.kind,
+        libfreemkv::spec::QuoteKind::Normative
     );
-    let src = include_str!("../src/aacs/content.rs");
-    let lines: Vec<&str> = src.lines().collect();
-    let at = lines
-        .iter()
-        .position(|l| l.starts_with("const PS_SCRAMBLE_OFF"))
-        .expect("PS_SCRAMBLE_OFF is defined in aacs/content.rs");
-    let context = lines[at.saturating_sub(3)..at].join("\n");
     assert!(
-        context.contains("UNVERIFIED"),
-        "the UNVERIFIED marker left PS_SCRAMBLE_OFF"
+        KS_30_HDDVD_PACK_ENCRYPTION
+            .text
+            .contains("the 2-bit PES_scrambling_control shall be 01₂")
+    );
+    let enc = |f: [u8; 3]| aacs_unit_encrypted(&ps_unit(f), ContentFormat::MpegPs);
+    assert!(!enc([0x80, 0x80, 0x80]), "every pack 00");
+    assert!(enc([0x90, 0x80, 0x80]), "first pack 01");
+    assert!(enc([0x80, 0x80, 0x90]), "only the last pack 01");
+    assert!(!enc([0x8F, 0x80, 0x80]), "bits outside 5-4");
+    let mut sys = ps_unit([0x80, 0x90, 0x80]);
+    sys[17] = 0xBB; // the first pack leads with a system header: its byte 20 is no flag
+    sys[20] = 0xB0;
+    sys[2048 + 20] = 0x80;
+    assert!(
+        !aacs_unit_encrypted(&sys, ContentFormat::MpegPs),
+        "a system header's byte 20"
+    );
+}
+
+/// KS-30: the boundary is the fixed 128th byte, not the end of the PES header.
+#[test]
+fn hddvd_clear_head_is_128_bytes() {
+    assert!(
+        KS_30_HDDVD_PACK_ENCRYPTION
+            .text
+            .contains("the first 128 bytes are called the Unencrypted Portion")
+    );
+    assert_eq!(
+        KS_31_HDDVD_CPI_EVIDENCE.kind,
+        libfreemkv::spec::QuoteKind::Evidence
     );
 }

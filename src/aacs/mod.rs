@@ -5,6 +5,8 @@
 pub mod content;
 pub mod crypto;
 pub mod derive;
+// HD DVD per-pack content encryption (`[HD]` §4.3).
+pub(crate) mod hddvd;
 pub mod host_certs;
 // No production caller; not the live FMTS path.
 #[doc(hidden)]

@@ -50,26 +50,21 @@ impl Disc {
     }
 }
 
-/// Whether the medium's encrypted-unit test can be trusted (design X-10).
+/// How the medium flags its encrypted content and how a key is proven (design X-10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detector {
-    /// BD/UHD CPI flags: keys are proven on ciphertext.
+    /// BD/UHD CPI flags: keys are proven on ciphertext units.
     Verified,
-    /// HD DVD: the flag is unverified, so a unit reads clear only when it is also whole
-    /// content; encrypted content gets a single declared key applied without proof.
-    Unverified,
+    /// HD DVD: each pack's `PES_scrambling_control` (`[HD]` §4.3.2). Keys are numbered by the
+    /// CPI's `TITLE_KEY_PTR` and proven on decrypted packs, per EVOBU.
+    PerPack,
 }
 
 impl Detector {
     // The format's own test of one aligned unit, feeding the one encryption decision
-    // (`resolve::acquire`). Verified: the CPI flag. Unverified: encrypted unless the unit is
-    // unflagged and structurally whole content (an AACS unit's ciphertext is not).
+    // (`resolve::acquire`): the CPI flag, or any pack flagged scrambled.
     pub(crate) fn unit_encrypted(self, unit: &[u8], format: ContentFormat) -> bool {
-        use crate::aacs::content::{aacs_unit_encrypted, is_clean};
-        match self {
-            Detector::Verified => aacs_unit_encrypted(unit, format),
-            Detector::Unverified => aacs_unit_encrypted(unit, format) || !is_clean(unit, format),
-        }
+        crate::aacs::content::aacs_unit_encrypted(unit, format)
     }
 }
 
@@ -206,7 +201,7 @@ impl KeyEvidence {
                 format: t.content_format,
             }),
             detector: match disc.format {
-                DiscFormat::HdDvd => Detector::Unverified,
+                DiscFormat::HdDvd => Detector::PerPack,
                 _ => Detector::Verified,
             },
             container: disc.content_format,
@@ -237,7 +232,7 @@ impl KeyEvidence {
             volume_label: inputs.volume_label,
         });
         let whole = ev.scope == KeyScope::WholeDisc;
-        if ev.detector == Detector::Unverified {
+        if ev.detector == Detector::PerPack {
             // Listed whatever the declared count: acquisition judges a copy in the clear from
             // its pieces before it refuses a multi-key HD DVD.
             let files = match crate::whole_disc::content_files(reader) {
@@ -473,7 +468,7 @@ pub(crate) fn read_unit(reader: &mut dyn SectorSource, lba: u32) -> Result<Optio
     }
 }
 
-fn fatal_read(e: &Error) -> bool {
+pub(crate) fn fatal_read(e: &Error) -> bool {
     matches!(e, Error::Halted)
         || e.is_source_terminated()
         || (e.is_scsi_transport_failure() && !matches!(e, Error::IoError { .. }))

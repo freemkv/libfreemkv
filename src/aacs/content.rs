@@ -42,37 +42,33 @@ const TS_SYNC: u8 = 0x47;
 
 // ── Content decryption ──────────────────────────────────────────────────────
 
-// HD-DVD `.evo` AACS-encrypted-unit flag: PES_scrambling_control at offset 20 (bits 5-4),
-// spec-derived but UNVERIFIED.
-const PS_SCRAMBLE_OFF: usize = 20;
-const PS_SCRAMBLE_MASK: u8 = 0x30;
-
 /// The AUTHORITATIVE AACS "is this aligned unit encrypted?" signal, per
 /// container: for `BdTs` the Copy Permission Indicator in the top 2 bits of
 /// byte 0 (`[BD]` §3.10.2, always clear in the unencrypted 16-byte seed —
-/// `(buf[0] & 0xC0) == 0` → clear); for `MpegPs` (HD-DVD `.evo`) the
-/// `PES_scrambling_control` flag, see [`PS_SCRAMBLE_OFF`] (UNVERIFIED against
-/// a real encrypted disc).
+/// `(buf[0] & 0xC0) == 0` → clear); for `MpegPs` (HD-DVD `.evo`) whether any
+/// pack of the slice carries `PES_scrambling_control` `01` (`[HD]` §4.3.2: HD DVD
+/// encrypts per pack, so every pack is judged, not the first).
 ///
 /// Readable WITHOUT a key. Only meaningful when `unit` is read at the correct
 /// clip-FILE-anchored boundary.
 pub fn aacs_unit_encrypted(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     use crate::disc::ContentFormat;
-    if unit.len() < ALIGNED_UNIT_LEN {
-        return false;
-    }
     match format {
-        ContentFormat::BdTs => (unit[0] & 0xC0) != 0,
-        // UNVERIFIED-HDDVD-DECRYPT (1 of 2): PES_scrambling_control location for
-        // HD-DVD `.evo` is spec-derived, never confirmed against a real encrypted
-        // disc (only decrypted rips available). Verify against a real one if ripping misbehaves.
-        ContentFormat::MpegPs => (unit[PS_SCRAMBLE_OFF] & PS_SCRAMBLE_MASK) != 0,
+        ContentFormat::BdTs => unit.len() >= ALIGNED_UNIT_LEN && (unit[0] & 0xC0) != 0,
+        ContentFormat::MpegPs => any_pack_scrambled(unit),
     }
+}
+
+// Whether any pack of `buf` (a trailing partial pack included) is flagged scrambled.
+fn any_pack_scrambled(buf: &[u8]) -> bool {
+    use super::hddvd::{PackKind, classify};
+    buf.chunks(SECTOR_BYTES)
+        .any(|p| classify(p) == PackKind::Scrambled)
 }
 
 /// The AACS encrypted flag from an aligned unit's CLEAR seed, readable even on a
 /// trailing PARTIAL unit (unlike [`aacs_unit_encrypted`], which requires a whole
-/// 6144-byte unit). The flag lives at a fixed low offset in the clear header, so a
+/// 6144-byte unit for `BdTs`). The flag lives at a fixed low offset in the clear header, so a
 /// fragment that still contains that byte can be classified. Used to catch an
 /// encrypted unit truncated across a buffer/extent boundary — a fragment we cannot
 /// CBC-decrypt and must not emit as clear. `false` for a slice too short to hold
@@ -81,9 +77,7 @@ pub fn aacs_unit_seed_encrypted(unit: &[u8], format: crate::disc::ContentFormat)
     use crate::disc::ContentFormat;
     match format {
         ContentFormat::BdTs => unit.first().is_some_and(|b| b & 0xC0 != 0),
-        ContentFormat::MpegPs => unit
-            .get(PS_SCRAMBLE_OFF)
-            .is_some_and(|b| b & PS_SCRAMBLE_MASK != 0),
+        ContentFormat::MpegPs => any_pack_scrambled(unit),
     }
 }
 
@@ -207,24 +201,14 @@ pub fn ts_packet_total(unit: &[u8]) -> usize {
     unit.len() / BD_SOURCE_PACKET_BYTES
 }
 
-// The Program-Stream arm of [`is_clean`] (HD-DVD `.evo`): every 2048-byte pack in the 6144-byte
-// unit must start with `00 00 01 BA`; UNVERIFIED against a real encrypted disc.
+// The Program-Stream arm of [`is_clean`] (HD-DVD `.evo`): no pack still flagged scrambled and
+// none failing its payload check past the clear head (`hddvd::payload_check`). The pack start
+// code proves nothing: an encrypted pack keeps it in its clear 128-byte head (`[HD]` §4.3.2).
 fn is_clean_ps(unit: &[u8]) -> bool {
-    if unit.len() < ALIGNED_UNIT_LEN {
-        return false;
-    }
-    const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
-    // Skip pack 0: its start bytes lie in the clear 16-byte seed, present for ANY
-    // key, so it proves nothing (mirrors `is_clean_ts` skipping packet 0). Packs 1
-    // and 2 (offsets 2048/4096) are in the encrypted region and discriminate the key.
-    let mut o = SECTOR_BYTES;
-    while o + 4 <= ALIGNED_UNIT_LEN {
-        if unit[o..o + 4] != PACK_START {
-            return false;
-        }
-        o += SECTOR_BYTES; // one MPEG-2 PS pack per 2048-byte sector
-    }
-    true
+    !any_pack_scrambled(unit)
+        && unit.as_chunks::<SECTOR_BYTES>().0.iter().all(|p| {
+            p[..4] == [0x00, 0x00, 0x01, 0xBA] && super::hddvd::payload_check(p) != Some(false)
+        })
 }
 
 /// Decrypt one AACS aligned unit (6144 bytes) IN PLACE — PURE crypto that
@@ -883,15 +867,12 @@ mod tests {
 
     #[test]
     fn is_clean_dispatches_by_container_format() {
+        use crate::aacs::hddvd::tests::{audio_pack, cpi, video_pack};
+        use crate::aacs::hddvd::{decrypt_pack, encrypt_pack};
         use crate::disc::ContentFormat;
-        // Clean HD-DVD `.evo` Program-Stream unit: pack_start_code `00 00 01 BA` at
-        // each 2048-byte pack boundary (0/2048/4096), validated against real retail rips.
-        // Offset 0 is the clear-seed freebie; packs at 2048/4096 are what discriminate a key.
-        let mut ps = vec![0u8; ALIGNED_UNIT_LEN];
-        for off in [0usize, 2048, 4096] {
-            ps[off..off + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
-            ps[off + 4] = 0x44; // '01': a 13818-1 pack
-        }
+        let kt = [0x24u8; 16];
+        let c = cpi(1, 9);
+        let ps: Vec<u8> = [audio_pack(1), video_pack(2), audio_pack(3)].concat();
         assert!(
             is_clean(&ps, ContentFormat::MpegPs),
             "clean PS opens for MpegPs"
@@ -901,11 +882,14 @@ mod tests {
             "PS content has no 0x47 TS syncs -> not clean as TS"
         );
 
-        // Wrong key garbles the ENCRYPTED packs (2048/4096); offset 0 stays a pack
-        // start (it is the clear seed) but that alone proves nothing -> rejected.
+        // A wrong key clears the flags but garbles bytes 128.. of every pack: rejected,
+        // though every pack still starts `00 00 01 BA` (it is in the clear head).
         let mut wrong = ps.clone();
-        wrong[2048] = 0xFF;
-        wrong[4096] = 0xFF;
+        for p in wrong.chunks_mut(SECTOR_BYTES) {
+            encrypt_pack(p, &kt, &c);
+            decrypt_pack(p, &[0x25; 16], &c);
+            assert_eq!(p[..4], [0x00, 0x00, 0x01, 0xBA]);
+        }
         assert!(
             !is_clean(&wrong, ContentFormat::MpegPs),
             "garbled encrypted packs -> wrong key rejected"
@@ -924,49 +908,48 @@ mod tests {
     }
 
     #[test]
-    fn ps_container_encrypt_detection_and_idempotency() {
+    fn ps_container_encrypt_detection_is_per_pack_and_idempotent() {
+        use crate::aacs::hddvd::tests::{audio_pack, cpi, nav_pack, video_pack};
+        use crate::aacs::hddvd::{decrypt_pack, encrypt_pack};
         use crate::disc::ContentFormat;
         let ps = ContentFormat::MpegPs;
+        let kt = [0x24u8; 16];
+        let c = cpi(1, 9);
 
-        // Base clean PS unit: pack_start_code at each 2048 boundary.
-        let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
-        for off in [0usize, 2048, 4096] {
-            clear[off..off + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
-            clear[off + 4] = 0x44; // '01': a 13818-1 pack
-        }
-        // PES scrambling_control (byte 20, bits 5-4) == 0 → not encrypted.
+        // An NV_PCK leads the unit: its byte 20 is the system header's rate_bound, so the
+        // first pack alone says "clear" while the two packs after it are encrypted.
+        let clear: Vec<u8> = [nav_pack(&c), audio_pack(1), video_pack(2)].concat();
         assert!(
             !aacs_unit_encrypted(&clear, ps),
-            "scrambling_control clear ⇒ not encrypted"
+            "no pack flagged => not encrypted"
         );
-
-        // Encrypted + still-scrambled: flag set, packs 1/2 garbled (would be
-        // ciphertext on a real disc) → is_clean_ps false → needs decrypt.
         let mut enc = clear.clone();
-        enc[PS_SCRAMBLE_OFF] |= 0x10; // PES_scrambling_control = 01
-        enc[2048] = 0xFF;
-        enc[4096] = 0xFF;
+        for p in enc.chunks_mut(SECTOR_BYTES).skip(1) {
+            encrypt_pack(p, &kt, &c);
+        }
+        assert_eq!(enc[..SECTOR_BYTES], clear[..SECTOR_BYTES]);
         assert!(
             aacs_unit_encrypted(&enc, ps),
-            "scrambling_control set ⇒ encrypted"
+            "a flagged later pack => encrypted"
         );
-        assert!(
-            aacs_unit_needs_decrypt(&enc, ps),
-            "flagged + packs not restored ⇒ needs decrypt"
-        );
+        assert!(aacs_unit_needs_decrypt(&enc, ps));
+        // Only the last pack encrypted, cut short: the fragment still reads encrypted.
+        let mut tail = clear.clone();
+        encrypt_pack(&mut tail[2 * SECTOR_BYTES..], &kt, &c);
+        assert!(aacs_unit_seed_encrypted(&tail[..2 * SECTOR_BYTES + 21], ps));
+        assert!(!aacs_unit_seed_encrypted(
+            &tail[..2 * SECTOR_BYTES + 20],
+            ps
+        ));
 
-        // Decrypted: the flag survives (it is in the preserved header) but packs
-        // are valid → needs_decrypt flips false (idempotent re-decrypt).
-        let mut dec = clear.clone();
-        dec[PS_SCRAMBLE_OFF] |= 0x10;
-        assert!(
-            aacs_unit_encrypted(&dec, ps),
-            "flag survives decryption (header preserved)"
-        );
-        assert!(
-            !aacs_unit_needs_decrypt(&dec, ps),
-            "valid packs restored ⇒ no re-decrypt (idempotent)"
-        );
+        // Decrypted: the flags are cleared and the payload checks out (idempotent).
+        let mut dec = enc.clone();
+        for p in dec.chunks_mut(SECTOR_BYTES).skip(1) {
+            decrypt_pack(p, &kt, &c);
+        }
+        assert_eq!(dec, clear);
+        assert!(!aacs_unit_encrypted(&dec, ps));
+        assert!(!aacs_unit_needs_decrypt(&dec, ps));
     }
 
     #[test]
@@ -1543,22 +1526,23 @@ mod tests {
         assert!(!aacs_unit_seed_encrypted(&[], BdTs));
     }
 
-    /// The MpegPs (HD-DVD `.evo`) side reads `PES_scrambling_control` at its own
-    /// fixed offset, and a fragment shorter than that offset must be reported
-    /// clear rather than panic.
+    /// The MpegPs (HD-DVD `.evo`) side reads `PES_scrambling_control` from the PES header,
+    /// and a fragment too short to hold it reads clear rather than panic.
     #[test]
     fn aacs_unit_seed_encrypted_reads_the_ps_scramble_flag_or_says_clear() {
+        use crate::aacs::hddvd::tests::video_pack;
         use crate::disc::ContentFormat::MpegPs;
 
-        let mut frag = vec![0u8; PS_SCRAMBLE_OFF + 1];
-        assert!(!aacs_unit_seed_encrypted(&frag, MpegPs), "flag byte zero");
-        frag[PS_SCRAMBLE_OFF] = PS_SCRAMBLE_MASK;
-        assert!(aacs_unit_seed_encrypted(&frag, MpegPs), "flag byte set");
+        let mut frag = video_pack(1)[..21].to_vec();
+        assert!(!aacs_unit_seed_encrypted(&frag, MpegPs), "flag bits zero");
+        frag[20] |= 0x10;
+        assert!(aacs_unit_seed_encrypted(&frag, MpegPs), "flag bits 01");
         // Bits outside the mask are not the scrambling control.
-        frag[PS_SCRAMBLE_OFF] = !PS_SCRAMBLE_MASK;
+        frag[20] = 0x80 | 0x0F;
         assert!(!aacs_unit_seed_encrypted(&frag, MpegPs), "outside the mask");
+        frag[20] |= 0x10;
         // A fragment that stops short of the flag byte is not classifiable.
-        assert!(!aacs_unit_seed_encrypted(&frag[..PS_SCRAMBLE_OFF], MpegPs));
+        assert!(!aacs_unit_seed_encrypted(&frag[..20], MpegPs));
     }
 
     // `aacs_unit_encrypted` requires a WHOLE 6144-byte unit: on anything shorter

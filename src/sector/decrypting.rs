@@ -61,7 +61,15 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     watch_css: bool,
     /// The crack's verdict was scrambled-but-uncrackable: every read refuses (E7023).
     refused: bool,
+    /// HD DVD: the sector after the last read and the CPI in force there, so a read that
+    /// continues it decrypts the packs before its first NV_PCK.
+    hd_cpi: Option<(u32, Option<crate::aacs::hddvd::Cpi>)>,
 }
+
+// HD DVD: how far back a read that starts mid-EVOBU looks for the NV_PCK leading it, and in
+// what steps. An EVOBU lasts at most about a second (under 2000 packs at 30 Mbit/s).
+const HD_LOOKBACK_SECTORS: u32 = 4096;
+const HD_LOOKBACK_STEP: u32 = 64;
 
 /// What the content-detected stage may do with what it finds (from `InputOptions`).
 #[derive(Clone, Default)]
@@ -159,6 +167,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             stale_cpi: false,
             watch_css: false,
             refused: false,
+            hd_cpi: None,
         };
         match keying.into().0 {
             KeyingKind::Keys(keys) => s.keys = keys,
@@ -383,6 +392,29 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // Proactive map path (storm-free mux): keys were resolved per unit up front,
         // so decrypt with the mapped key and trust it (no per-unit `is_clean`). A
         // resolver gap fails loud; bad TS and units outside content extents pass through.
+        if let Some(map) = self.key_map.clone()
+            && matches!(
+                self.keys,
+                DecryptKeys::Aacs {
+                    format: crate::disc::ContentFormat::MpegPs,
+                    ..
+                }
+            )
+        {
+            let lead = self.hd_lead_cpi(lba, &buf[..n]);
+            let run = crate::decrypt::decrypt_hddvd_packs(
+                &mut buf[..n],
+                &self.keys,
+                lba,
+                &map,
+                content_ref,
+                lead,
+            )?;
+            let sectors = (n / crate::consts::SECTOR_BYTES) as u32;
+            self.hd_cpi = Some((lba.saturating_add(sectors), run.last_cpi));
+            self.count_blanked(lba, run.blanked);
+            return Ok(n);
+        }
         if let Some(map) = self.key_map.clone() {
             let blanked = crate::decrypt::decrypt_sectors_mapped_in_content(
                 &mut buf[..n],
@@ -494,6 +526,53 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         let at_end = cap != 0 && end >= cap as u64;
         let n = crate::decrypt::blank_damaged_units(buf, lba, format, &covered, at_end);
         self.count_blanked(lba, n);
+    }
+
+    // The CPI in force at the first pack of a read at `lba`: carried from the read it continues,
+    // else from the nearest NV_PCK before it. `None` when no pack before the read's first
+    // NV_PCK needs a key, or when none is found within `HD_LOOKBACK_SECTORS`.
+    fn hd_lead_cpi(&mut self, lba: u32, buf: &[u8]) -> Option<crate::aacs::hddvd::Cpi> {
+        use crate::aacs::hddvd::{PackKind, classify};
+        use crate::consts::SECTOR_BYTES;
+        if let Some((next, cpi)) = self.hd_cpi
+            && next == lba
+        {
+            return cpi;
+        }
+        let wanted = buf
+            .as_chunks::<SECTOR_BYTES>()
+            .0
+            .iter()
+            .map(|p| classify(p))
+            .take_while(|k| !matches!(k, PackKind::Nav(_)))
+            .any(|k| matches!(k, PackKind::Scrambled | PackKind::Highlight));
+        if !wanted {
+            return None;
+        }
+        let floor = lba.saturating_sub(HD_LOOKBACK_SECTORS);
+        let mut end = lba;
+        let mut tmp = vec![0u8; HD_LOOKBACK_STEP as usize * SECTOR_BYTES];
+        while end > floor {
+            let start = end.saturating_sub(HD_LOOKBACK_STEP).max(floor);
+            let len = (end - start) as usize * SECTOR_BYTES;
+            let got = self
+                .inner
+                .read_sectors(start, (end - start) as u16, &mut tmp[..len], false)
+                .ok()?;
+            for pack in tmp[..got.min(len)]
+                .as_chunks::<SECTOR_BYTES>()
+                .0
+                .iter()
+                .rev()
+            {
+                if let PackKind::Nav(cpi) = classify(pack) {
+                    return cpi;
+                }
+            }
+            end = start;
+        }
+        tracing::warn!(target: "freemkv::decrypt", lba, "no NV_PCK found before an HD DVD read");
+        None
     }
 
     fn count_blanked(&self, lba: u32, n: usize) {

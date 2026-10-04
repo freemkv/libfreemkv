@@ -97,7 +97,8 @@ impl Probed {
 
 // What one request to one source produced.
 enum Asked {
-    Keys(Vec<[u8; 16]>),
+    /// The keys, and each one's number (CPS unit / HD DVD Title Key entry).
+    Keys(Vec<[u8; 16]>, Vec<u32>),
     Empty,
     /// The source failed; the error is the run's `first_failure` if it came first.
     Failed,
@@ -218,7 +219,10 @@ impl Run<'_> {
                     return Ok(if keys.is_empty() {
                         Asked::Empty
                     } else {
-                        Asked::Keys(keys.into_iter().map(|u| u.key).collect())
+                        Asked::Keys(
+                            keys.iter().map(|u| u.key).collect(),
+                            keys.iter().map(|u| u.idx).collect(),
+                        )
                     });
                 }
                 Err(Error::Halted) => {
@@ -533,7 +537,7 @@ fn decide(
         return Ok(inner);
     }
     match ev.detector {
-        Detector::Unverified => resolve_hddvd(ev, sampler, disc_hash, n_decl, run),
+        Detector::PerPack => resolve_hddvd(ev, sampler, disc_hash, seed, run),
         Detector::Verified => resolve_bd(ev, scoped, sampler, disc_hash, n_decl, seed, run),
     }
 }
@@ -559,40 +563,64 @@ fn in_clear(
     }
 }
 
-// KU §2.6: HD DVD with encrypted content is best effort (its encrypted flag is unverified,
-// KS-27): a single declared key is applied to every piece; several, or none parseable, refuse.
+// `[HD]` §4.3: an HD DVD EVOBU is keyed by its CPI's `TITLE_KEY_PTR`, not by a CPS-unit map,
+// so every Title Key a source gives is held under its entry number and proven on decrypted
+// packs of the main title. Unprovable (no structural test applied) is best effort.
 fn resolve_hddvd(
     ev: &KeyEvidence,
     sampler: &mut Sampler,
     disc_hash: &str,
-    n_decl: Option<usize>,
+    seed: Option<&KeyRing>,
     run: &mut Run,
 ) -> Result<Inner> {
-    if n_decl != Some(1) {
-        tracing::error!(target: "freemkv::keys", declared = ?n_decl, "multi-key HD DVD cannot be matched reliably");
-        return Err(Error::NoDiscKey {
-            disc_hash: crate::hex::strip_hex_prefix(disc_hash).to_string(),
-        });
-    }
-    if run.pool.is_empty() {
+    let mut keys: Vec<(u32, [u8; 16])> = seed
+        .map(|s| {
+            s.0.key_nums
+                .iter()
+                .copied()
+                .zip(s.0.pool.iter().copied())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut origin = (!keys.is_empty()).then_some("seed");
+    if keys.is_empty() {
         let samples = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS);
         for i in 0..run.sources.len() {
-            if let Asked::Keys(k) = run.ask(i, &samples, false)? {
-                let who = run.sources[i].label();
-                run.add_keys(&k[..1], who);
+            if let Asked::Keys(k, idx) = run.ask(i, &samples, false)? {
+                let nums = idx.iter().map(|&i| title_key_number(ev, i));
+                keys = nums.zip(k).take(MAX_POOL_KEYS).collect();
+                origin = Some(run.sources[i].label());
                 break;
             }
         }
-        if run.pool.is_empty() {
-            let failure = run.first_failure.take();
-            return Err(failure.unwrap_or_else(|| missing_error(&ev.scope, disc_hash)));
-        }
     }
+    if keys.is_empty() {
+        let failure = run.first_failure.take();
+        return Err(failure.unwrap_or_else(|| missing_error(&ev.scope, disc_hash)));
+    }
+    let proof = prove_hddvd(sampler.source(), ev.main.as_ref(), &keys, run.halt)?;
+    let proven = match proof {
+        HdProof::Wrong {
+            opened,
+            failed,
+            missing,
+        } => {
+            tracing::error!(target: "freemkv::keys", opened, failed, missing, code = crate::error::E_DECRYPT_FAILED, "the held Title Keys do not open the HD DVD's packs: wrong key");
+            return Err(Error::DecryptFailed);
+        }
+        HdProof::Proven(slots) => slots,
+        HdProof::Unproven => {
+            tracing::warn!(target: "freemkv::keys", "no decrypted HD DVD pack could be checked: keys applied unproven");
+            Vec::new()
+        }
+    };
     let mut inner = aacs_inner(run);
     inner.no_stream_files = ev.no_stream_files;
-    inner.best_effort = true;
-    inner.origin = run.origin.first().copied();
-    inner.proven = vec![0];
+    inner.best_effort = proven.is_empty();
+    inner.pool = keys.iter().map(|k| k.1).collect();
+    inner.key_nums = keys.iter().map(|k| k.0).collect();
+    inner.origin = origin;
+    inner.proven = proven;
     inner.keyed = ev.pieces.len();
     let mut ranges = Vec::new();
     for p in &ev.pieces {
@@ -603,6 +631,118 @@ fn resolve_hddvd(
     inner.spans.sort_unstable_by_key(|s| s.0);
     inner.map = Arc::new(AacsKeyMap::from_ranges(ranges));
     Ok(inner)
+}
+
+// A source's key `idx` is its position among the title-key file's present entries
+// (`UnitKey::idx`); the VTKF entry number (`TITLE_KEY_PTR`) is that entry's slot.
+fn title_key_number(ev: &KeyEvidence, idx: u32) -> u32 {
+    ev.aacs
+        .as_ref()
+        .and_then(|a| crate::aacs::inf::parse_vtkf(&a.unit_key_ro))
+        .and_then(|f| f.encrypted_keys.get(idx as usize).map(|k| k.0))
+        .unwrap_or(idx.saturating_add(1))
+}
+
+// Sectors read per HD DVD proof window, and the windows spread over the main title.
+const HD_PROOF_SECTORS: u32 = 2048;
+const HD_PROOF_WINDOWS: u64 = 3;
+
+// The verdict of decrypting sampled HD DVD packs under the held Title Keys.
+enum HdProof {
+    /// Most checked packs verified; the pool slots that opened them.
+    Proven(Vec<usize>),
+    /// No decrypted pack could be checked (no structural test applied, or nothing encrypted).
+    Unproven,
+    /// Checked packs did not verify, or named a Title Key not held.
+    Wrong {
+        opened: usize,
+        failed: usize,
+        missing: usize,
+    },
+}
+
+// Decrypt the encrypted packs of a few windows of the main title under the CPI each EVOBU's
+// NV_PCK gives (`[HD]` §4.3.4) and judge them by `hddvd::payload_check`. A wrong key leaves
+// bytes 128.. random, so a structural test passes about once in 2^16.
+fn prove_hddvd(
+    reader: &mut dyn crate::sector::SectorSource,
+    main: Option<&super::evidence::MainTitle>,
+    keys: &[(u32, [u8; 16])],
+    halt: &Halt,
+) -> Result<HdProof> {
+    use crate::aacs::hddvd::{
+        PACK_LEN, PackKind, classify, decrypt_pack, needs_key, payload_check,
+    };
+    let Some(main) = main else {
+        return Ok(HdProof::Unproven);
+    };
+    let total: u64 = main.extents.iter().map(|e| u64::from(e.sector_count)).sum();
+    let (mut opened, mut failed, mut missing) = (0usize, 0usize, 0usize);
+    let mut slots = Vec::new();
+    for w in 0..HD_PROOF_WINDOWS {
+        halt.check()?;
+        let Some((lba, left)) =
+            sector_at(&main.extents, total * (2 * w + 1) / (2 * HD_PROOF_WINDOWS))
+        else {
+            continue;
+        };
+        let n = left.min(HD_PROOF_SECTORS);
+        let mut buf = vec![0u8; n as usize * PACK_LEN];
+        let got = match reader.read_sectors(lba, n as u16, &mut buf, false) {
+            Ok(got) => got.min(buf.len()),
+            Err(e) if super::evidence::fatal_read(&e) => return Err(e),
+            Err(_) => continue,
+        };
+        let mut cpi = None;
+        for pack in buf[..got].as_chunks::<PACK_LEN>().0 {
+            let kind = classify(pack);
+            if let PackKind::Nav(c) = kind {
+                cpi = c;
+                continue;
+            }
+            let Some(c) = cpi.filter(|c| needs_key(kind, Some(c)) && c.key_vf() == 0b10) else {
+                continue;
+            };
+            let Some(slot) = keys.iter().position(|k| k.0 == c.title_key_ptr()) else {
+                missing += 1;
+                continue;
+            };
+            let mut plain = pack.to_vec();
+            decrypt_pack(&mut plain, &keys[slot].1, &c);
+            match payload_check(&plain) {
+                Some(true) => {
+                    opened += 1;
+                    if !slots.contains(&slot) {
+                        slots.push(slot);
+                    }
+                }
+                Some(false) => failed += 1,
+                None => {}
+            }
+        }
+    }
+    Ok(match (opened, failed + missing) {
+        (0, 0) => HdProof::Unproven,
+        (o, f) if o > f => HdProof::Proven(slots),
+        _ => HdProof::Wrong {
+            opened,
+            failed,
+            missing,
+        },
+    })
+}
+
+// The sector `off` sectors into `extents`, and how many sectors of its extent follow it.
+fn sector_at(extents: &[Extent], mut off: u64) -> Option<(u32, u32)> {
+    for e in extents {
+        let n = u64::from(e.sector_count);
+        if off < n {
+            let lba = u64::from(e.start_lba) + off;
+            return Some((u32::try_from(lba).ok()?, (n - off) as u32));
+        }
+        off -= n;
+    }
+    None
 }
 
 // KU §2.3 steps 8–14 for BD/UHD content not in the clear, over `probe_scope`'s probes.
@@ -645,7 +785,7 @@ fn resolve_bd(
             if run.sources[i].answer_depends_on_samples() {
                 continue;
             }
-            if let Asked::Keys(k) = run.ask(i, &samples, false)? {
+            if let Asked::Keys(k, _) = run.ask(i, &samples, false)? {
                 let who = run.sources[i].label();
                 run.add_keys(&k, who);
             }
@@ -683,7 +823,7 @@ fn resolve_bd(
         }
         budget -= 1;
         for s in dependent {
-            if let Asked::Keys(k) = run.ask(s, &samples, false)? {
+            if let Asked::Keys(k, _) = run.ask(s, &samples, false)? {
                 let who = run.sources[s].label();
                 run.add_keys(&k, who);
                 if run.judge(&ps[i]) != Verdict::Ask {
@@ -835,7 +975,7 @@ fn resolve_forensic(
     // A failed request is kept as the run's first failure, not returned per batch.
     let mut ask = |batch: &[Vec<u8>]| -> Result<Option<Vec<[u8; 16]>>> {
         for i in 0..run.sources.len() {
-            if let Asked::Keys(k) = run.ask(i, batch, true)? {
+            if let Asked::Keys(k, _) = run.ask(i, batch, true)? {
                 return Ok(Some(k));
             }
         }

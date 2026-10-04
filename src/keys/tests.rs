@@ -948,34 +948,113 @@ fn transient_source_gives_up_after_60s_without_an_answer() {
     assert_eq!(calls.len(), 2, "no attempt after the Stop");
 }
 
-/// LK16. KS-27 (evidence: the HD DVD book is withdrawn; the flag model is UNVERIFIED): a
-/// single declared key is applied best-effort; several refuse (E7022).
+/// LK16. `[HD]` §4.3: an HD DVD EVOBU names its Title Key by the CPI's `TITLE_KEY_PTR`, so
+/// every key a source gives is held under its entry number, whatever the file declares, and
+/// proven on decrypted packs; a key that opens no pack refuses (E7013).
 #[test]
-fn hddvd_single_key_best_effort_multi_key_refuses() {
-    // DirImage lays out a BDMV or VIDEO_TS tree; the EVO is found under /HVDVD_TS.
-    let files = [
-        BdFile::new("HVDVD_TS/FEATURE.EVO", 30, Some(K1)),
-        BdFile::new("BDMV/index.bdmv", 1, None),
-    ];
-    for (declared, ok) in [(1, true), (2, false)] {
+fn hddvd_title_keys_are_held_by_entry_and_proven_on_packs() {
+    for (declared, held, ok) in [
+        (1, vec![K1], true),
+        (64, vec![WRONG, K1], true),
+        (64, vec![WRONG], false),
+    ] {
+        let ptr = held.len() as u16;
+        let files = [
+            BdFile::new("HVDVD_TS/FEATURE.EVO", 0, None).with_clip(ps_clip_keyed(60, ptr)),
+            BdFile::new("BDMV/index.bdmv", 1, None),
+        ];
         let uk_ro = unit_key_ro(AacsVersion::V10, &vec![[0xEE; 16]; declared], &[1]);
-        let img = encrypted_bd_image(&files, &uk_ro);
+        let mut img = encrypted_bd_image(&files, &uk_ro);
+        encrypt_ps(&mut img, 0, &K1);
         let disc = disc_over(&img, &uk_ro, &[&[0]], DiscFormat::HdDvd);
         let fx = Fx { img, disc };
         let calls = Calls::default();
         let r = resolve(
             &fx,
             KeyScope::Titles(vec![0]),
-            &[Spec::keydb(&[K1], &calls)],
+            &[Spec::keydb(&held, &calls)],
         );
-        if ok {
-            let s = r.unwrap().status();
-            assert!(s.best_effort);
-            assert_eq!(s.keyed, 1);
-        } else {
-            assert_eq!(code(r), E7022);
+        if !ok {
+            assert_eq!(
+                code(r),
+                E7013,
+                "{declared} declared: a wrong key must not pass"
+            );
+            continue;
         }
+        let set = r.unwrap_or_else(|e| panic!("{declared} declared: refused: {e}"));
+        let s = set.status();
+        assert_eq!((s.keyed, s.best_effort), (1, false), "{declared} declared");
+        let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
+        assert_eq!(
+            read(&mut r, &fx, 0, 0, 20).unwrap(),
+            fx.plain(fx.file(0).0, 20),
+            "{declared} declared: decrypted"
+        );
     }
+}
+
+/// A source numbers keys by position among the VTKF's present entries (`UnitKey::idx`); a
+/// key is held under its entry's slot number, which is what `TITLE_KEY_PTR` names.
+#[test]
+fn hddvd_source_key_positions_map_to_vtkf_slots() {
+    // A VTKF with entries 2 and 3 present (slot 1 empty).
+    let mut vtkf = vec![0u8; 2480];
+    vtkf[..12].copy_from_slice(crate::aacs::inf::VTKF_MAGIC);
+    vtkf[0x80 + 0x24] = 0x80;
+    vtkf[0x80 + 2 * 0x24] = 0x80;
+    let files = [
+        BdFile::new("HVDVD_TS/FEATURE.EVO", 0, None).with_clip(ps_clip_keyed(60, 3)),
+        BdFile::new("BDMV/index.bdmv", 1, None),
+    ];
+    let mut img = encrypted_bd_image(&files, &vtkf);
+    encrypt_ps(&mut img, 0, &K1);
+    let disc = disc_over(&img, &vtkf, &[&[0]], DiscFormat::HdDvd);
+    let fx = Fx { img, disc };
+    let calls = Calls::default();
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[WRONG, K1], &calls)],
+    )
+    .expect("position 1 is entry 3");
+    let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
+    assert_eq!(
+        read(&mut r, &fx, 0, 0, 20).unwrap(),
+        fx.plain(fx.file(0).0, 20)
+    );
+}
+
+/// A read that starts mid-EVOBU (no NV_PCK before its first encrypted pack) takes the CPI
+/// from the nearest NV_PCK before it, and a read that continues the last one carries it.
+#[test]
+fn hddvd_read_mid_evobu_finds_the_cpi_before_it() {
+    let files = [
+        BdFile::new("HVDVD_TS/FEATURE.EVO", 0, None).with_clip(ps_clip(60)),
+        BdFile::new("BDMV/index.bdmv", 1, None),
+    ];
+    let uk_ro = unit_key_ro(AacsVersion::V10, &[[0xEE; 16]], &[1]);
+    let mut img = encrypted_bd_image(&files, &uk_ro);
+    encrypt_ps(&mut img, 0, &K1);
+    let disc = disc_over(&img, &uk_ro, &[&[0]], DiscFormat::HdDvd);
+    let fx = Fx { img, disc };
+    let calls = Calls::default();
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[Spec::keydb(&[K1], &calls)],
+    )
+    .unwrap();
+    let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
+    // Units 4..6 start at pack 12, two packs past the NV_PCK at pack 10; then 6..8 follows.
+    assert_eq!(
+        read(&mut r, &fx, 0, 4, 2).unwrap(),
+        fx.plain(fx.unit(0, 4), 2)
+    );
+    assert_eq!(
+        read(&mut r, &fx, 0, 6, 2).unwrap(),
+        fx.plain(fx.unit(0, 6), 2)
+    );
 }
 
 /// An HD DVD copy already in the clear (whole MPEG-PS packs, no scrambling flag) that kept its
@@ -3255,35 +3334,35 @@ const MEDIA_UNITS: u32 = 10;
 // Whole MPEG-PS packs (pack start in every sector, no scrambling flag): an HD DVD feature in
 // the clear.
 fn ps_clip(sectors: usize) -> Vec<u8> {
-    let mut clip = vec![0u8; sectors * 2048];
-    for (i, sector) in clip.chunks_mut(2048).enumerate() {
-        for (j, b) in sector.iter_mut().enumerate() {
-            *b = ((i * 31 + j) % 251) as u8 | 1;
-        }
-        sector[..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
-        sector[20] &= !0x30;
-    }
-    clip
+    ps_clip_keyed(sectors, 1)
 }
 
-// Encrypt every unit of file `f` (MPEG-PS) under `key`, its plain copy kept. A plaintext
-// header byte is varied until the ciphertext carries the PES scrambling flag the reader
-// gates on (that flag lies past the unit's clear seed).
+// An HD DVD clip of whole packs: an NV_PCK every 10 packs whose CPI names Title Key `ptr`,
+// then audio and video packs (`aacs::hddvd` fixtures), all in the clear.
+fn ps_clip_keyed(sectors: usize, ptr: u16) -> Vec<u8> {
+    use crate::aacs::hddvd::tests::{audio_pack, cpi, nav_pack, video_pack};
+    (0..sectors)
+        .flat_map(|i| match i % 10 {
+            0 => nav_pack(&cpi(ptr, i as u32 + 1)),
+            n if n % 3 == 1 => audio_pack(i as u8 | 1),
+            _ => video_pack(i as u8),
+        })
+        .collect()
+}
+
+// Encrypt file `f` (an HD DVD clip) per pack under Title Key `key` (`[HD]` §4.3.2), each pack
+// under the CPI of the NV_PCK before it; the plain copy keeps the clear packs.
 fn encrypt_ps(img: &mut EncryptedBdImage, f: usize, key: &[u8; 16]) {
+    use crate::aacs::hddvd::{PackKind, classify, encrypt_pack};
     let (start, sectors) = img.files[f];
-    for u in 0..sectors / 3 {
-        let at = (start + u * 3) as usize * 2048;
-        let mut plain = img.plain[at..at + ALIGNED_UNIT_LEN].to_vec();
-        let ct = (0..=255u8)
-            .find_map(|t| {
-                plain[24] = t;
-                let mut ct = plain.clone();
-                assert!(encrypt_unit(&mut ct, key));
-                (ct[20] & 0x30 != 0).then_some(ct)
-            })
-            .expect("a flagged ciphertext");
-        img.plain[at..at + ALIGNED_UNIT_LEN].copy_from_slice(&plain);
-        img.image[at..at + ALIGNED_UNIT_LEN].copy_from_slice(&ct);
+    let mut cpi = None;
+    for s in 0..sectors as usize {
+        let at = (start as usize + s) * 2048;
+        let pack = &mut img.image[at..at + 2048];
+        match classify(pack) {
+            PackKind::Nav(c) => cpi = c,
+            _ => encrypt_pack(pack, key, &cpi.expect("an NV_PCK leads the clip")),
+        }
     }
 }
 
