@@ -225,13 +225,20 @@ impl Disc {
                     .map(|&t| (t - dropped_secs).max(0.0))
                     .collect();
                 let in_head = shifted.iter().filter(|&&t| t <= 0.0).count();
+                let skipped = in_head.saturating_sub(1);
+                // Disc text names index the chapter before the head was dropped.
+                let names = dvd_info
+                    .chapter_names
+                    .get(&(ts.vts_number, dvd_title.vts_title_num));
                 let chapters: Vec<Chapter> = shifted
                     .into_iter()
-                    .skip(in_head.saturating_sub(1))
+                    .skip(skipped)
                     .enumerate()
                     .map(|(i, time_secs)| Chapter {
                         time_secs,
-                        name: chapter_name(i),
+                        name: names
+                            .and_then(|n| n.get(skipped + i).cloned().flatten())
+                            .unwrap_or_else(|| chapter_name(i)),
                     })
                     .collect();
 
@@ -1956,6 +1963,38 @@ mod tests {
         assert_eq!(t.chapters[0].name, chapter_name(0));
     }
 
+    /// A chapter named in the VMG text data reaches Chapter.name in place of
+    /// the ordinal.
+    #[test]
+    fn scan_dvd_titles_chapter_names_from_text_data() {
+        let mut disc = MemDisc::new();
+        let txtdt = ifo::build_txtdt_mg(0x11, &[(0x02, b"feature"), (0x04, b"Opening")]);
+        let vmg = ifo::with_txtdt(build_vmg(&[(1, 1, 1)]), &txtdt);
+        let vts = build_vts(0, 0x00, &[], &[], &[(0, 9)], false);
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0[0];
+        assert_eq!(t.chapters.len(), 1);
+        assert_eq!(t.chapters[0].name, "Opening");
+    }
+
     /// Build a VTS with explicit per-cell category bytes and an N-program map.
     /// Returns the IFO bytes. Cells: `(first, last, category, dur_secs)`.
     fn build_vts_cells(
@@ -2263,6 +2302,7 @@ mod tests {
                 set(4, vec![title(1, 5), title(2, 1)]),
                 set(11, vec![title(1, 1)]),
             ],
+            chapter_names: Default::default(),
         };
         let vmg = b"multi_pgc_titles_warn_once_per_disc".to_vec();
         let ((), ev) = crate::testlog::capture(|| {
@@ -2282,6 +2322,7 @@ mod tests {
         // A disc with no split title logs nothing.
         let clear = ifo::DvdInfo {
             title_sets: vec![set(1, vec![title(1, 1)])],
+            chapter_names: Default::default(),
         };
         let ((), ev) = crate::testlog::capture(|| warn_multi_pgc_titles(b"no split", &clear));
         assert!(ev.is_empty(), "{ev:?}");

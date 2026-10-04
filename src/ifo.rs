@@ -18,6 +18,9 @@ use crate::udf::UdfFs;
 #[derive(Debug)]
 pub struct DvdInfo {
     pub title_sets: Vec<DvdTitleSet>,
+    /// Chapter names from the VMG text data, keyed by (vts_number, vts_title_num) and
+    /// indexed by 0-based chapter; `None` where the disc names no chapter.
+    pub chapter_names: std::collections::BTreeMap<(u8, u8), Vec<Option<String>>>,
 }
 
 /// One title set (VTS_XX_0.IFO).
@@ -461,7 +464,11 @@ pub(crate) fn parse_vmg_with(
             "some title sets were omitted from the scan"
         );
     }
-    Ok(DvdInfo { title_sets })
+    let chapter_names = parse_txtdt_chapter_names(vmg_data, tt_srpt_offset);
+    Ok(DvdInfo {
+        title_sets,
+        chapter_names,
+    })
 }
 
 // Maximum TT_SRPT entries honoured (DVD-Video's own 99-title cap). The on-disc count is an
@@ -518,6 +525,159 @@ pub(crate) fn parse_tt_srpt(
     }
 
     Ok(title_set_map)
+}
+
+// ── Text data (chapter names) ───────────────────────────────────────────────
+
+// The text data manager (TXTDT_MG) has no public spec; this layout matches libdvdread's
+// partial structs and a disc dump. VMGI 0xD4 is its sector, relative to VIDEO_TS.IFO.
+const TXTDT_MG_PTR: usize = 0xD4;
+// 12-byte id, u16 reserved, u16 unit count, u32 last byte; then 8-byte unit pointers
+// (u16 language, u8 reserved, u8 charset, u32 start byte from the TXTDT_MG).
+const TXTDT_MG_HDR: usize = 0x14;
+// A unit opens with 204 bytes, then u16 count (two per item), u16 reserved, 8-byte items
+// (u8 kind, 5 bytes, u16 offset from the count) and tab-separated strings.
+const TXTDT_LU_ITEMS: usize = 204;
+const TXTDT_ITEM_TITLE: u8 = 0x02;
+const TXTDT_ITEM_CHAPTER: u8 = 0x04;
+const TXTDT_CHARSET_ISO646: u8 = 0x01;
+const TXTDT_CHARSET_ISO8859_1: u8 = 0x11;
+// Longest name accepted; a missing terminator would otherwise swallow the table.
+const TXTDT_MAX_NAME: usize = 255;
+
+// Chapter names per TT_SRPT title, mapped to (vts_number, vts_title_num). A title
+// whose name count differs from its TT_SRPT chapter count is dropped rather than
+// risk naming the wrong chapters. Never fails: absent or bad text data is no names.
+fn parse_txtdt_chapter_names(
+    vmg: &[u8],
+    tt_srpt_offset: usize,
+) -> std::collections::BTreeMap<(u8, u8), Vec<Option<String>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(text_titles) = txtdt_titles(vmg) else {
+        return out;
+    };
+    let declared = be_u16(vmg, tt_srpt_offset).map_or(0, usize::from);
+    for (i, names) in text_titles
+        .into_iter()
+        .enumerate()
+        .take(declared.min(MAX_TT_SRPT_TITLES))
+    {
+        let e = tt_srpt_offset + 8 + i * 12;
+        let (Ok(chapters), Ok(vts), Ok(ttn)) =
+            (be_u16(vmg, e + 2), byte_at(vmg, e + 6), byte_at(vmg, e + 7))
+        else {
+            break;
+        };
+        if names.len() != usize::from(chapters) {
+            tracing::debug!(
+                target: "freemkv::scan",
+                title = i + 1,
+                chapters,
+                names = names.len(),
+                "dvd text data chapter names do not match the title; ignored"
+            );
+            continue;
+        }
+        if names.iter().any(Option::is_some) {
+            out.entry((vts, ttn)).or_insert(names);
+        }
+    }
+    out
+}
+
+// The first language unit's chapter names, grouped by title in text-data order. Every
+// read is bounded by the TXTDT_MG's own last byte and the IFO length.
+fn txtdt_titles(vmg: &[u8]) -> Option<Vec<Vec<Option<String>>>> {
+    let sector = be_u32(vmg, TXTDT_MG_PTR).ok()?;
+    if sector == 0 {
+        return None;
+    }
+    let mg = (sector as usize).checked_mul(SECTOR_BYTES)?;
+    let last = be_u32(vmg, mg.checked_add(0x10)?).ok()? as usize;
+    let end = mg.checked_add(last)?.saturating_add(1).min(vmg.len());
+    let data = vmg.get(mg..end)?;
+    if be_u16(data, 0x0E).ok()? == 0 {
+        return None;
+    }
+    let charset = byte_at(data, TXTDT_MG_HDR + 3).ok()?;
+    let lu = be_u32(data, TXTDT_MG_HDR + 4).ok()? as usize;
+    let base = lu.checked_add(TXTDT_LU_ITEMS)?;
+    let items = usize::from(be_u16(data, base).ok()?) / 2;
+
+    let mut titles: Vec<Vec<Option<String>>> = Vec::new();
+    for i in 0..items {
+        let item = base + 4 + i * 8;
+        let (Ok(kind), Ok(off)) = (byte_at(data, item), be_u16(data, item + 6)) else {
+            break;
+        };
+        match kind {
+            TXTDT_ITEM_TITLE => titles.push(Vec::new()),
+            TXTDT_ITEM_CHAPTER => {
+                if let Some(t) = titles.last_mut() {
+                    t.push(txtdt_name(data, base + usize::from(off), charset));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(titles)
+}
+
+// One tab- or NUL-terminated name. Unknown charsets pass only plain ASCII; empty,
+// overlong or control-bearing names are `None` so the caller keeps its fallback.
+fn txtdt_name(data: &[u8], at: usize, charset: u8) -> Option<String> {
+    let raw = data.get(at..)?;
+    let raw = &raw[..raw
+        .iter()
+        .position(|&b| b == b'\t' || b == 0)
+        .unwrap_or(raw.len())];
+    if raw.len() > TXTDT_MAX_NAME {
+        return None;
+    }
+    let latin1 = matches!(charset, TXTDT_CHARSET_ISO646 | TXTDT_CHARSET_ISO8859_1);
+    if !latin1 && !raw.is_ascii() {
+        return None;
+    }
+    let name: String = raw.iter().map(|&b| char::from(b)).collect();
+    if name.chars().any(char::is_control) {
+        return None;
+    }
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+// Builds a one-language TXTDT_MG of `(kind, text)` items in the layout parsed above.
+#[cfg(test)]
+pub(crate) fn build_txtdt_mg(charset: u8, items: &[(u8, &[u8])]) -> Vec<u8> {
+    let lu = TXTDT_MG_HDR + 8;
+    let base = lu + TXTDT_LU_ITEMS;
+    let mut d = vec![0u8; base + 4 + items.len() * 8];
+    d[0x0E..0x10].copy_from_slice(&1u16.to_be_bytes());
+    d[TXTDT_MG_HDR + 3] = charset;
+    d[TXTDT_MG_HDR + 4..TXTDT_MG_HDR + 8].copy_from_slice(&(lu as u32).to_be_bytes());
+    d[base..base + 2].copy_from_slice(&(items.len() as u16 * 2).to_be_bytes());
+    for (i, (kind, text)) in items.iter().enumerate() {
+        let item = base + 4 + i * 8;
+        let off = (d.len() - base) as u16;
+        d[item] = *kind;
+        d[item + 4] = 0x30;
+        d[item + 6..item + 8].copy_from_slice(&off.to_be_bytes());
+        d.extend_from_slice(text);
+        d.push(b'\t');
+    }
+    let last = (d.len() - 1) as u32;
+    d[0x10..0x14].copy_from_slice(&last.to_be_bytes());
+    d
+}
+
+// Appends `txtdt` to a VMG at the next sector boundary and points 0xD4 at it.
+#[cfg(test)]
+pub(crate) fn with_txtdt(mut vmg: Vec<u8>, txtdt: &[u8]) -> Vec<u8> {
+    let sector = vmg.len().div_ceil(SECTOR_BYTES);
+    vmg.resize(sector * SECTOR_BYTES, 0);
+    vmg[TXTDT_MG_PTR..TXTDT_MG_PTR + 4].copy_from_slice(&(sector as u32).to_be_bytes());
+    vmg.extend_from_slice(txtdt);
+    vmg
 }
 
 // ── VTS parser ──────────────────────────────────────────────────────────────
@@ -2666,6 +2826,137 @@ mod tests {
         v
     }
 
+    const TX_DISC: u8 = 0x01;
+    const TX_TITLE: u8 = 0x02;
+    const TX_CHAPTER: u8 = 0x04;
+
+    fn names(v: &[Option<&str>]) -> Vec<Option<String>> {
+        v.iter().map(|n| n.map(str::to_string)).collect()
+    }
+
+    /// Text-data chapter names map onto TT_SRPT titles in order, keyed by
+    /// (vts, vts_title_num); the disc name and unknown item kinds are skipped.
+    #[test]
+    fn txtdt_chapter_names_map_to_tt_srpt_titles() {
+        let vmg = vmg_with_tt_srpt(1, &[(3, 1, 1), (2, 2, 1)]);
+        let txtdt = build_txtdt_mg(
+            TXTDT_CHARSET_ISO8859_1,
+            &[
+                (TX_DISC, b"disc1"),
+                (0x08, b"authoring tag"),
+                (TX_TITLE, b"feature"),
+                (TX_CHAPTER, b"1_opening"),
+                (TX_CHAPTER, b" 1_show "),
+                (TX_CHAPTER, b"END"),
+                (TX_TITLE, b"extra"),
+                (TX_CHAPTER, b"Caf\xe9"),
+                (TX_CHAPTER, b"Chapter 2"),
+            ],
+        );
+        let vmg = with_txtdt(vmg, &txtdt);
+        let map = parse_txtdt_chapter_names(&vmg, SECTOR_BYTES);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map[&(1, 1)],
+            names(&[Some("1_opening"), Some("1_show"), Some("END")])
+        );
+        assert_eq!(map[&(2, 1)], names(&[Some("Café"), Some("Chapter 2")]));
+    }
+
+    /// Empty, control-bearing, overlong or wrong-charset names are `None` (numeric
+    /// fallback); a title whose name count differs from its chapters is dropped.
+    #[test]
+    fn txtdt_garbled_names_fall_back() {
+        let long = vec![b'x'; TXTDT_MAX_NAME + 1];
+        let vmg = vmg_with_tt_srpt(1, &[(5, 1, 1), (3, 1, 2), (1, 1, 3)]);
+        let items: &[(u8, &[u8])] = &[
+            (TX_TITLE, b"t1"),
+            (TX_CHAPTER, b""),
+            (TX_CHAPTER, b"bell\x07"),
+            (TX_CHAPTER, b"c1\x85"),
+            (TX_CHAPTER, &long),
+            (TX_CHAPTER, b"ok"),
+            (TX_TITLE, b"t2"),
+            (TX_CHAPTER, b"only one of three"),
+            (TX_TITLE, b"t3"),
+            (TX_CHAPTER, b"   "),
+        ];
+        let latin1 = with_txtdt(vmg.clone(), &build_txtdt_mg(TXTDT_CHARSET_ISO8859_1, items));
+        let map = parse_txtdt_chapter_names(&latin1, SECTOR_BYTES);
+        assert_eq!(map.len(), 1, "t2 mismatched, t3 has no usable name");
+        assert_eq!(map[&(1, 1)], names(&[None, None, None, None, Some("ok")]));
+
+        // Shift JIS (0x12) is not decoded: only plain ASCII survives.
+        let sjis = with_txtdt(
+            vmg_with_tt_srpt(1, &[(2, 1, 1)]),
+            &build_txtdt_mg(
+                0x12,
+                &[
+                    (TX_TITLE, b"t"),
+                    (TX_CHAPTER, b"\x83e"),
+                    (TX_CHAPTER, b"ascii"),
+                ],
+            ),
+        );
+        let map = parse_txtdt_chapter_names(&sjis, SECTOR_BYTES);
+        assert_eq!(map[&(1, 1)], names(&[None, Some("ascii")]));
+    }
+
+    /// No text data, bad pointers, bad lengths and truncation yield no names and
+    /// never read out of bounds or panic.
+    #[test]
+    fn txtdt_bad_offsets_and_lengths_are_bounded() {
+        let vmg = vmg_with_tt_srpt(1, &[(2, 1, 1)]);
+        let txtdt = build_txtdt_mg(
+            TXTDT_CHARSET_ISO646,
+            &[(TX_TITLE, b"t"), (TX_CHAPTER, b"a"), (TX_CHAPTER, b"b")],
+        );
+        let good = with_txtdt(vmg.clone(), &txtdt);
+        let mg = be_u32(&good, TXTDT_MG_PTR).unwrap() as usize * SECTOR_BYTES;
+        assert_eq!(parse_txtdt_chapter_names(&good, SECTOR_BYTES).len(), 1);
+        assert!(parse_txtdt_chapter_names(&vmg, SECTOR_BYTES).is_empty());
+
+        let put32 = |at: usize, v: u32| {
+            let mut d = good.clone();
+            d[at..at + 4].copy_from_slice(&v.to_be_bytes());
+            d
+        };
+        let lu = mg + TXTDT_MG_HDR + 8;
+        let base = lu + TXTDT_LU_ITEMS;
+        let cases = [
+            ("mg past end", put32(TXTDT_MG_PTR, 1000)),
+            ("mg huge", put32(TXTDT_MG_PTR, u32::MAX)),
+            ("last byte short", put32(mg + 0x10, 0x20)),
+            ("last byte huge", put32(mg + 0x10, u32::MAX)),
+            ("no units", put32(mg + 0x0C, 0)),
+            ("unit huge", put32(mg + TXTDT_MG_HDR + 4, u32::MAX)),
+            ("item count huge", put32(base, 0xFFFF_0000)),
+            (
+                "string offset past end",
+                put32(base + 4 + 8 + 4, 0x0000_FFFF),
+            ),
+        ];
+        for (name, d) in cases {
+            let map = parse_txtdt_chapter_names(&d, SECTOR_BYTES);
+            if let Some(n) = map.get(&(1, 1)) {
+                assert_eq!(n.len(), 2, "{name}");
+            }
+        }
+        assert!(
+            parse_txtdt_chapter_names(&put32(TXTDT_MG_PTR, 0), SECTOR_BYTES).is_empty(),
+            "a zero pointer means no text data"
+        );
+        // Every truncation and every single-byte corruption of the table.
+        for len in 0..good.len() {
+            parse_txtdt_chapter_names(&good[..len], SECTOR_BYTES);
+        }
+        for at in mg..good.len() {
+            let mut d = good.clone();
+            d[at] = 0xFF;
+            parse_txtdt_chapter_names(&d, SECTOR_BYTES);
+        }
+    }
+
     #[test]
     fn tt_srpt_groups_titles_by_their_title_set() {
         // Three titles: two in VTS 1, one in VTS 2 — the ordinary shape.
@@ -3136,6 +3427,20 @@ mod tests {
             let r = parse_vmg_with(&mut disc, &udf, Some(&v));
             assert!(matches!(r, Err(Error::IfoParse)), "{name}: {r:?}");
         }
+    }
+
+    /// parse_vmg_with carries the text-data chapter names into DvdInfo.
+    #[test]
+    fn parse_vmg_with_reads_txtdt_chapter_names() {
+        let vts = build_vts_ifo(1, 1, &one_pgc(), None);
+        let (mut disc, udf) = video_ts_disc(vec![("VTS_01_0.IFO", vts)]);
+        let txtdt = build_txtdt_mg(
+            TXTDT_CHARSET_ISO646,
+            &[(TX_TITLE, b"main"), (TX_CHAPTER, b"intro")],
+        );
+        let vmg = with_txtdt(vmg_at_sector(3, &[(1, 1, 1)]), &txtdt);
+        let info = parse_vmg_with(&mut disc, &udf, Some(&vmg)).expect("vmg parses");
+        assert_eq!(info.chapter_names[&(1, 1)], names(&[Some("intro")]));
     }
 
     // Reader that reports a halt once armed.

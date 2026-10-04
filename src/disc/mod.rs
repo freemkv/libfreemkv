@@ -491,9 +491,9 @@ pub enum ColorSpace {
 pub struct Chapter {
     /// Chapter start time in seconds
     pub time_secs: f64,
-    /// Chapter name — a bare 1-based index ("1", "2", …). The library
-    /// emits no localized prose; consuming apps prepend any "Chapter "
-    /// prefix in the user's language.
+    /// Chapter name — the disc's own name when it carries one (DVD text
+    /// data), else a bare 1-based index ("1", "2", …). The library emits
+    /// no localized prose; apps prepend any "Chapter " prefix to ordinals.
     pub name: String,
 }
 
