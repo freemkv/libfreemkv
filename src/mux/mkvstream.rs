@@ -894,7 +894,7 @@ impl MkvStream {
                 // Only Blu-ray marks share the PES clock (see `TimelineContinuity::with_clips`).
                 let in_ns = match self.disc_title.content_format {
                     crate::disc::ContentFormat::BdTs => self.disc_title.clips.first(),
-                    crate::disc::ContentFormat::MpegPs => None,
+                    crate::disc::ContentFormat::MpegPs | crate::disc::ContentFormat::DvdPs => None,
                 }
                 .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
                 if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {

@@ -320,7 +320,7 @@ impl Disc {
                     streams,
                     chapters,
                     extents,
-                    content_format: ContentFormat::MpegPs,
+                    content_format: ContentFormat::DvdPs,
                     codec_privates: Vec::new(),
                 });
             }
@@ -1307,7 +1307,7 @@ mod tests {
         // playlist field format VTS_XX_title.VOB; title_number is 1.
         assert_eq!(t.playlist, "VTS_01_1.VOB");
         assert_eq!(t.playlist_id, 1);
-        assert_eq!(t.content_format, ContentFormat::MpegPs);
+        assert_eq!(t.content_format, ContentFormat::DvdPs);
     }
 
     // Regression: vob_start must come from Title VOBS (0xC4), not menu VOBS (0xC0) -- else a

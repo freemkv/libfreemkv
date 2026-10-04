@@ -86,9 +86,20 @@ pub struct Disc {
 pub enum ContentFormat {
     /// Blu-ray BD Transport Stream (192-byte packets)
     BdTs,
-    /// MPEG-2 Program Stream — DVD (`.vob`) and HD-DVD (`.evo`). For AACS content
-    /// this selects the PS-aware encrypted-flag / structural checks.
+    /// MPEG-2 Program Stream: HD-DVD (`.evo`) and plain program-stream files. For AACS
+    /// content this selects the PS-aware encrypted-flag / structural checks.
     MpegPs,
+    /// The program stream of a DVD-Video title (`.vob`), set only by the DVD scan: the same
+    /// container as [`Self::MpegPs`], plus what is DVD's alone (CSS, DVD navigation packs,
+    /// extents that are IFO cells). No other source gets the DVD-only stages.
+    DvdPs,
+}
+
+impl ContentFormat {
+    /// Whether the sectors hold an MPEG-2 program stream (DVD or not).
+    pub fn is_program_stream(self) -> bool {
+        matches!(self, Self::MpegPs | Self::DvdPs)
+    }
 }
 
 /// Disc format.
@@ -2484,7 +2495,7 @@ impl Disc {
             let (dvd_titles, nav, region) = Self::scan_dvd_titles(reader, &udf_fs, halt)?;
             dvd_nav_feature = nav;
             dvd_region = Some(region);
-            (dvd_titles, ContentFormat::MpegPs)
+            (dvd_titles, ContentFormat::DvdPs)
         } else {
             (Vec::new(), ContentFormat::BdTs)
         };
@@ -2647,7 +2658,7 @@ impl Disc {
     ) {
         let mut cache = dvd_forced_probe::DvdForcedProbeCache::default();
         for title in titles.iter_mut() {
-            if title.content_format == ContentFormat::MpegPs {
+            if title.content_format == ContentFormat::DvdPs {
                 dvd_forced_probe::probe_and_set_forced(reader, title, &mut cache, halt);
             }
         }
@@ -3924,6 +3935,42 @@ mod tests {
         assert!(
             lbas.iter().all(|&l| l < 5000),
             "the MpegPs title's extent (LBA 5000) must never be read: {lbas:?}"
+        );
+    }
+
+    // The DVD forced-subtitle probe is DVD-only: a `DvdPs` title (LBA 0) is probed, an HD DVD
+    // `MpegPs` title carrying the same VobSub stream (LBA 5000) is never read.
+    #[test]
+    fn probe_forced_subtitles_for_dvd_titles_skips_hddvd() {
+        let vobsub = |content_format, start_lba| DiscTitle {
+            content_format,
+            streams: vec![Stream::Subtitle(SubtitleStream {
+                pid: 0xBD20,
+                codec: Codec::DvdSub,
+                language: "eng".into(),
+                forced: false,
+                qualifier: LabelQualifier::None,
+                codec_data: None,
+            })],
+            extents: vec![Extent {
+                start_lba,
+                sector_count: 4,
+            }],
+            ..DiscTitle::empty()
+        };
+        let mut titles = vec![
+            vobsub(ContentFormat::DvdPs, 0),
+            vobsub(ContentFormat::MpegPs, 5000),
+        ];
+        let mut reader = ForcedProbeSpyReader {
+            lbas: std::cell::RefCell::new(Vec::new()),
+        };
+        Disc::probe_forced_subtitles_for_dvd_titles(&mut reader, &mut titles, None);
+        let lbas = reader.lbas.borrow();
+        assert!(!lbas.is_empty(), "the DVD title is probed");
+        assert!(
+            lbas.iter().all(|&l| l < 5000),
+            "HD DVD extent read: {lbas:?}"
         );
     }
 

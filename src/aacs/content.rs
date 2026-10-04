@@ -55,7 +55,7 @@ pub fn aacs_unit_encrypted(unit: &[u8], format: crate::disc::ContentFormat) -> b
     use crate::disc::ContentFormat;
     match format {
         ContentFormat::BdTs => unit.len() >= ALIGNED_UNIT_LEN && (unit[0] & 0xC0) != 0,
-        ContentFormat::MpegPs => any_pack_scrambled(unit),
+        ContentFormat::MpegPs | ContentFormat::DvdPs => any_pack_scrambled(unit),
     }
 }
 
@@ -77,7 +77,7 @@ pub fn aacs_unit_seed_encrypted(unit: &[u8], format: crate::disc::ContentFormat)
     use crate::disc::ContentFormat;
     match format {
         ContentFormat::BdTs => unit.first().is_some_and(|b| b & 0xC0 != 0),
-        ContentFormat::MpegPs => any_pack_scrambled(unit),
+        ContentFormat::MpegPs | ContentFormat::DvdPs => any_pack_scrambled(unit),
     }
 }
 
@@ -149,7 +149,7 @@ const KEY_PROOF_PACKETS: usize = 4;
 pub fn is_clean(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     match format {
         crate::disc::ContentFormat::BdTs => is_clean_ts(unit),
-        crate::disc::ContentFormat::MpegPs => is_clean_ps(unit),
+        crate::disc::ContentFormat::MpegPs | crate::disc::ContentFormat::DvdPs => is_clean_ps(unit),
     }
 }
 

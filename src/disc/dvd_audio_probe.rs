@@ -87,8 +87,8 @@ pub fn probe_and_remap<S: SectorSource + ?Sized>(
     if !tracing::enabled!(target: "freemkv::diag", tracing::Level::DEBUG) {
         return;
     }
-    // Only DVD (MPEG-PS) titles carry private_stream_1 AC-3 sub-streams.
-    if title.content_format != crate::disc::ContentFormat::MpegPs {
+    // Only DVD-Video titles (`DvdPs`) carry these private_stream_1 AC-3 sub-streams.
+    if title.content_format != crate::disc::ContentFormat::DvdPs {
         return;
     }
     // Nothing to report unless there is at least one AC-3 audio stream.
@@ -339,7 +339,7 @@ mod tests {
                 start_lba: 0,
                 sector_count: 2,
             }],
-            content_format: ContentFormat::MpegPs,
+            content_format: ContentFormat::DvdPs,
             codec_privates: vec![None],
         };
         let ((), ev) = crate::testlog::capture(|| {

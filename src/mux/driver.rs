@@ -2957,6 +2957,24 @@ mod tests {
         }
     }
 
+    // The keyless AACS ring is the Blu-ray transport stream's: neither program-stream format
+    // (HD DVD's `.evo`, a DVD's `.vob`) gets one, so neither is read through AACS checks here.
+    #[test]
+    fn keyless_ring_is_bdts_only() {
+        let title = DiscTitle::empty();
+        let opts = MuxOptions::default();
+        for format in [
+            crate::disc::ContentFormat::MpegPs,
+            crate::disc::ContentFormat::DvdPs,
+        ] {
+            assert!(
+                keyless_ring(&title, format, None, &opts).is_none(),
+                "{format:?}"
+            );
+        }
+        assert!(keyless_ring(&title, crate::disc::ContentFormat::BdTs, None, &opts).is_some());
+    }
+
     #[test]
     fn session_mux_keys_uses_none_for_dvd() {
         // DVD: must be None so the pipeline cracks the correct per-title key,

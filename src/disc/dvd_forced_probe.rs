@@ -481,7 +481,7 @@ mod tests {
 
     fn probed(sectors: &[Vec<u8>], pids: &[u16], halt: Option<&crate::halt::Halt>) -> Vec<bool> {
         let mut title = DiscTitle {
-            content_format: crate::disc::ContentFormat::MpegPs,
+            content_format: crate::disc::ContentFormat::DvdPs,
             streams: pids.iter().map(|&p| vobsub(p)).collect(),
             extents: vec![Extent {
                 start_lba: 0,

@@ -122,7 +122,9 @@ impl PipelinedPesStream {
                     .then(super::au_assembly::SecondFieldMerge::default)
             })
             .collect();
-        let vobu_nav = (title.content_format == crate::disc::ContentFormat::MpegPs
+        // DVD navigation is the DVD scan's decision (`DvdPs`): an HD DVD `.evo` has its own
+        // pack layout, and an `mpg://` file is one extent, not a cell per extent.
+        let vobu_nav = (title.content_format == crate::disc::ContentFormat::DvdPs
             && !title.extents.is_empty())
         .then(|| super::ps::VobuNav::new(&title.extents));
         Self {
@@ -637,6 +639,117 @@ mod tests {
             data,
             discontinuity: false,
         }
+    }
+
+    // Three VOBUs of three different cells (VOB 1 cells 1 and 2, VOB 2 cell 1) in one
+    // extent, on one continuous clock, muxed under `format`: the video payloads that come out.
+    fn three_cell_feed(
+        format: crate::disc::ContentFormat,
+        clips: Vec<crate::disc::Clip>,
+        extents: Vec<crate::disc::Extent>,
+    ) -> Vec<Vec<u8>> {
+        let mut title = DiscTitle::empty();
+        title.content_format = format;
+        title.clips = clips;
+        title.extents = extents;
+        title.streams.push(crate::disc::Stream::Video(VideoStream {
+            pid: crate::mux::ps::DVD_VIDEO_PID,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            crate::mux::ps::DVD_VIDEO_PID,
+            Box::new(CountingParser {
+                per_pes: 1,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let (mut stream, tx) = make_stream(
+            title,
+            parsers,
+            vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)],
+        );
+        let at = |sector: u64| Some(crate::pes::SourcePos::at_byte(sector * 2048));
+        let packet = |sector, stream_id, data: Vec<u8>, pts| PsPacket {
+            source: at(sector),
+            stream_id,
+            sub_stream_id: None,
+            pts,
+            dts: None,
+            data,
+        };
+        let mut batch = Vec::new();
+        for (i, (vob, cell)) in [(1u16, 1u8), (1, 2), (2, 1)].into_iter().enumerate() {
+            let sector = i as u64 * 4;
+            let (start, end) = (i as u32 * 900, (i as u32 + 1) * 900);
+            let mut pci = vec![0u8; 21];
+            pci[13..17].copy_from_slice(&start.to_be_bytes());
+            pci[17..21].copy_from_slice(&end.to_be_bytes());
+            let mut dsi = vec![0u8; 29];
+            dsi[0] = 0x01;
+            dsi[25..27].copy_from_slice(&vob.to_be_bytes());
+            dsi[28] = cell;
+            batch.push(packet(sector, 0xBF, pci, None));
+            batch.push(packet(sector, 0xBF, dsi, None));
+            let video = vec![0x00, 0x00, 0x01, 0xB3, i as u8];
+            batch.push(packet(
+                sector + 1,
+                0xE0,
+                video,
+                Some(u64::from(start) + 100),
+            ));
+        }
+        tx.send(DemuxBatch::Ps(batch)).unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+        let mut out = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            out.push(f.data);
+        }
+        out
+    }
+
+    // DVD navigation is the DVD scan's decision: an `mpg://` file (one extent, the whole file)
+    // and an HD DVD title (its `.evo` clips) are program streams too, and lose no VOBU to it.
+    #[test]
+    fn dvd_navigation_runs_only_on_dvd_titles() {
+        let whole = |sectors| crate::disc::Extent {
+            start_lba: 0,
+            sector_count: sectors,
+        };
+        let all: Vec<Vec<u8>> = (0..3).map(|i| vec![0x00, 0x00, 0x01, 0xB3, i]).collect();
+        let mpg = three_cell_feed(crate::disc::ContentFormat::MpegPs, vec![], vec![whole(12)]);
+        assert_eq!(mpg, all, "an mpg:// file keeps every cell");
+        let evo = crate::disc::Clip {
+            clip_id: "FEATURE_1".into(),
+            in_time: 0,
+            out_time: 0,
+            duration_secs: 0.0,
+            source_packets: 0,
+            feed_span: None,
+        };
+        let hddvd = three_cell_feed(
+            crate::disc::ContentFormat::MpegPs,
+            vec![evo],
+            vec![
+                whole(6),
+                crate::disc::Extent {
+                    start_lba: 6,
+                    sector_count: 6,
+                },
+            ],
+        );
+        assert_eq!(hddvd, all, "an HD DVD title keeps every VOBU");
+        // The control: a DVD title read as this one extent keeps the cell it opens with.
+        let dvd = three_cell_feed(crate::disc::ContentFormat::DvdPs, vec![], vec![whole(12)]);
+        assert_eq!(dvd, all[..1]);
     }
 
     /// LP11: a reader blocked on the demux channel returns `Halted` once the op's
