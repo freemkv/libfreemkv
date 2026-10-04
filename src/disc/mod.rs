@@ -2251,21 +2251,30 @@ impl Disc {
             |p| udf_fs.read_file(reader, p),
         )?;
         let mkb = Self::read_mkb_content(reader, udf_fs)?;
-        let version = Self::read_aacs_version(reader, udf_fs, &mkb);
+        let version = Self::read_aacs_version(reader, udf_fs, &mkb)?;
         Ok((inf, mkb, version))
     }
 
     // AACS major version driving the Unit_Key_RO.inf parse stride: the content certificate,
-    // then the MKB type, then index.bdmv, through the shared `resolve_aacs_version`.
-    fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs, mkb: &[u8]) -> u8 {
-        let cert_major = crate::aacs::read_first(
+    // then the MKB type, then index.bdmv, through the shared `resolve_aacs_version`. `Err` only
+    // for a Stop.
+    fn read_aacs_version(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        mkb: &[u8],
+    ) -> Result<u8> {
+        let cert = crate::aacs::read_first(
             &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::ContentCert),
             |p| udf_fs.read_file(reader, p),
-        )
-        .ok()
-        .as_deref()
-        .and_then(crate::aacs::inf::parse_content_cert)
-        .map(|c| c.version.major());
+        );
+        if matches!(cert, Err(Error::Halted)) {
+            return Err(Error::Halted);
+        }
+        let cert_major = cert
+            .ok()
+            .as_deref()
+            .and_then(crate::aacs::inf::parse_content_cert)
+            .map(|c| c.version.major());
         if cert_major.is_none() {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -2274,8 +2283,8 @@ impl Disc {
                  or index.bdmv"
             );
         }
-        let index = encrypt::index_is_uhd(udf_fs, reader);
-        crate::aacs::mkb::resolve_aacs_version(cert_major, mkb, index).major()
+        let index = encrypt::index_is_uhd(udf_fs, reader)?;
+        Ok(crate::aacs::mkb::resolve_aacs_version(cert_major, mkb, index).major())
     }
 
     // Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding. Reads a bounded,
