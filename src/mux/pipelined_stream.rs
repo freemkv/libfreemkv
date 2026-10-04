@@ -43,6 +43,8 @@ pub struct PipelinedPesStream {
     /// are expected on every disc; instead of a per-packet WARN they're tallied
     /// and summarised once at EOF.
     dropped_nav_packets: u64,
+    /// DVD: keeps each cell's own VOBUs and joins the VOBs' clocks into one timeline.
+    vobu_nav: Option<super::ps::VobuNav>,
     /// Packets of MPEG-2 audio extension streams (`0xD0|n`) with no declared extension track,
     /// reported once at EOF (see `ps::warn_undeclared_extensions`).
     mpeg_extension_packets: [u64; 8],
@@ -120,6 +122,9 @@ impl PipelinedPesStream {
                     .then(super::au_assembly::SecondFieldMerge::default)
             })
             .collect();
+        let vobu_nav = (title.content_format == crate::disc::ContentFormat::MpegPs
+            && !title.extents.is_empty())
+        .then(|| super::ps::VobuNav::new(&title.extents));
         Self {
             title,
             parsers,
@@ -131,6 +136,7 @@ impl PipelinedPesStream {
             failed: None,
             skip_parse: false,
             dropped_nav_packets: 0,
+            vobu_nav,
             mpeg_extension_packets: [0; 8],
             dropped_ps: Default::default(),
             resync,
@@ -274,7 +280,12 @@ impl PipelinedPesStream {
     }
 
     fn consume_ps(&mut self, packets: Vec<super::ps::PsPacket>) {
-        for ps in packets {
+        for mut ps in packets {
+            if let Some(nav) = self.vobu_nav.as_mut()
+                && !nav.admit(&mut ps)
+            {
+                continue;
+            }
             if let Some(id) = self.video_stream_id
                 && (0xE0..=0xEF).contains(&ps.stream_id)
                 && ps.stream_id != id
@@ -381,6 +392,14 @@ impl PipelinedPesStream {
                             "dropped {} DVD navigation packets (private_stream_2/0xBF) — expected, carry no elementary stream",
                             self.dropped_nav_packets
                         );
+                    }
+                    if let Some(n) = self
+                        .vobu_nav
+                        .as_ref()
+                        .map(|g| g.dropped_vobus)
+                        .filter(|&n| n > 0)
+                    {
+                        tracing::info!(target: "mux", vobus = n, "left out VOBUs interleaved from another program");
                     }
                     super::ps::warn_undeclared_extensions(&self.mpeg_extension_packets);
                     self.dropped_ps.report();

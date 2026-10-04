@@ -144,6 +144,122 @@ impl DroppedPs {
     }
 }
 
+/// Reads a DVD title the way its navigation packs say to play it.
+///
+/// A DVD cell is a sector range, and in an interleaved block that range also holds the units of
+/// another program (a second language version, say). Every VOBU opens with a navigation pack
+/// naming its VOB and cell; a cell's first sector is its own first VOBU, so the first one read
+/// in each extent names the cell, and any later VOBU naming another belongs to the other program.
+///
+/// The same pack gives the VOBU's start and end time. Each VOB runs its own clock, so where a
+/// kept VOBU does not start where the last one ended, every later packet is shifted to close
+/// the jump: the title plays as one timeline, on every track at once.
+#[derive(Debug, Default)]
+pub(crate) struct VobuNav {
+    // Feed byte offset at which each extent ends, in read order.
+    ends: Vec<u64>,
+    extent: usize,
+    cell: Option<(u16, u8)>,
+    keep: bool,
+    // The current VOBU's start/end time from its PCI packet, until its DSI decides it is kept.
+    pci: Option<(i64, i64)>,
+    // Where the last kept VOBU ended, in shifted time, and the shift in force (90 kHz).
+    end: Option<i64>,
+    shift: i64,
+    pub(crate) dropped_vobus: u64,
+    pub(crate) joins: u64,
+}
+
+// A jump smaller than this (1 ms) is rounding, not a new clock.
+const JOIN_SLACK_TICKS: i64 = 90;
+
+impl VobuNav {
+    /// Navigation for a title read as `extents`, back to back.
+    pub(crate) fn new(extents: &[crate::disc::Extent]) -> Self {
+        let mut end = 0u64;
+        let ends = extents
+            .iter()
+            .map(|e| {
+                end += e.sector_count as u64 * 2048;
+                end
+            })
+            .collect();
+        VobuNav {
+            ends,
+            keep: true,
+            ..Default::default()
+        }
+    }
+
+    /// Whether `ps` belongs to the cell being read; a kept packet is moved onto the title's
+    /// timeline. Packets without a source position pass untouched.
+    pub(crate) fn admit(&mut self, ps: &mut PsPacket) -> bool {
+        let Some(at) = ps.source.map(|s| s.byte) else {
+            return true;
+        };
+        while self.ends.get(self.extent).is_some_and(|&end| at >= end) {
+            self.extent += 1;
+            self.cell = None;
+            self.keep = true;
+        }
+        if ps.is_nav() {
+            match ps.data.first() {
+                Some(0x00) => self.pci = pci_times(&ps.data),
+                Some(0x01) => self.on_dsi(&ps.data),
+                _ => {}
+            }
+            return self.keep;
+        }
+        if self.keep && self.shift != 0 {
+            let moved = |t: u64| (t as i64).saturating_add(self.shift).max(0) as u64;
+            ps.pts = ps.pts.map(moved);
+            ps.dts = ps.dts.map(moved);
+        }
+        self.keep
+    }
+
+    fn on_dsi(&mut self, dsi: &[u8]) {
+        let Some(id) = dsi_cell(dsi) else {
+            return;
+        };
+        let cell = *self.cell.get_or_insert(id);
+        self.keep = id == cell;
+        if !self.keep {
+            self.dropped_vobus += 1;
+            return;
+        }
+        let Some((start, end)) = self.pci.take() else {
+            return;
+        };
+        if let Some(prev) = self.end
+            && (start + self.shift - prev).abs() > JOIN_SLACK_TICKS
+        {
+            self.shift = prev - start;
+            self.joins += 1;
+        }
+        self.end = Some(end + self.shift);
+    }
+}
+
+// The VOBU start and end presentation times a PCI packet gives (90 kHz).
+fn pci_times(payload: &[u8]) -> Option<(i64, i64)> {
+    // Substream 0x00, then PCI_GI: LBN (4), category (2), reserved (2), UOP control (4),
+    // start time (4), end time (4).
+    let word = |o: usize| Some(u32::from_be_bytes(payload.get(o..o + 4)?.try_into().ok()?) as i64);
+    let (start, end) = (word(13)?, word(17)?);
+    (end > start).then_some((start, end))
+}
+
+// The (VOB id, cell id) a DSI packet's general information names.
+fn dsi_cell(payload: &[u8]) -> Option<(u16, u8)> {
+    // Substream 0x01, then DSI_GI: SCR, LBN, VOBU end and three reference ends (4 bytes each),
+    // VOB id (2), a reserved byte and the cell id.
+    if payload.first() != Some(&0x01) || payload.len() < 29 {
+        return None;
+    }
+    Some((u16::from_be_bytes([payload[25], payload[26]]), payload[28]))
+}
+
 /// Reports, once at end of stream, MPEG-2 audio extension packets (`0xD0|n`, index `n`) that
 /// had no declared extension track (the IFO did not say coding mode 3) and were left out.
 pub(crate) fn warn_undeclared_extensions(packets: &[u64; 8]) {
@@ -1236,6 +1352,112 @@ mod tests {
             data: vec![0xAA],
             source: None,
         }
+    }
+
+    // A video packet at feed byte `at` with presentation time `pts` (90 kHz).
+    fn video(at: u64, pts: u64) -> PsPacket {
+        let mut p = mk(0xE0, None);
+        p.pts = Some(pts);
+        p.source = Some(crate::pes::SourcePos::at_byte(at));
+        p
+    }
+
+    // The PCI and DSI packets of a navigation pack at `at`, for a VOBU of `cell` timed
+    // `start..end`.
+    fn nav_pack(at: u64, cell: (u16, u8), start: u32, end: u32) -> [PsPacket; 2] {
+        let mut pci = mk(PRIVATE_STREAM_2, None);
+        pci.data = vec![0u8; 21];
+        pci.data[13..17].copy_from_slice(&start.to_be_bytes());
+        pci.data[17..21].copy_from_slice(&end.to_be_bytes());
+        let mut dsi = mk(PRIVATE_STREAM_2, None);
+        dsi.data = vec![0u8; 29];
+        dsi.data[0] = 0x01;
+        dsi.data[25..27].copy_from_slice(&cell.0.to_be_bytes());
+        dsi.data[28] = cell.1;
+        for p in [&mut pci, &mut dsi] {
+            p.source = Some(crate::pes::SourcePos::at_byte(at));
+        }
+        [pci, dsi]
+    }
+
+    // Feed `packets` through `nav`, returning the PTS of each kept non-navigation packet.
+    fn kept(nav: &mut VobuNav, packets: Vec<PsPacket>) -> Vec<u64> {
+        let mut out = Vec::new();
+        for mut p in packets {
+            if nav.admit(&mut p) && !p.is_nav() {
+                out.extend(p.pts);
+            }
+        }
+        out
+    }
+
+    const SECTOR: u64 = 2048;
+
+    #[test]
+    fn vobu_nav_keeps_only_the_cell_each_extent_opens_with() {
+        let extents = [
+            crate::disc::Extent {
+                start_lba: 0,
+                sector_count: 10,
+            },
+            crate::disc::Extent {
+                start_lba: 50,
+                sector_count: 10,
+            },
+        ];
+        let mut nav = VobuNav::new(&extents);
+        let s = |n: u64| n * SECTOR;
+        let mut packets = Vec::new();
+        // Extent 1 is cell (7, 2), with a unit of (8, 1) woven in.
+        packets.extend(nav_pack(s(0), (7, 2), 0, 900));
+        packets.push(video(s(1), 100));
+        packets.extend(nav_pack(s(3), (8, 1), 50_000, 50_900));
+        packets.push(video(s(4), 50_100));
+        packets.extend(nav_pack(s(6), (7, 2), 900, 1_800));
+        packets.push(video(s(7), 1_000));
+        // Extent 2 opens with (8, 1): that is now the cell being read.
+        packets.extend(nav_pack(s(10), (8, 1), 1_800, 2_700));
+        packets.push(video(s(11), 1_900));
+        packets.extend(nav_pack(s(12), (7, 2), 2_700, 3_600));
+        packets.push(video(s(13), 2_800));
+        assert_eq!(kept(&mut nav, packets), vec![100, 1_000, 1_900]);
+        assert_eq!(nav.dropped_vobus, 2);
+        assert_eq!(nav.joins, 0);
+        // A packet the demuxer could not place passes untouched.
+        let mut loose = mk(0xE0, None);
+        assert!(nav.admit(&mut loose));
+    }
+
+    #[test]
+    fn vobu_nav_joins_each_vob_clock_onto_the_last() {
+        // One cell per extent, as a title is read: VOB 4's cell, then VOB 5's.
+        let cells = [
+            crate::disc::Extent {
+                start_lba: 0,
+                sector_count: 2,
+            },
+            crate::disc::Extent {
+                start_lba: 2,
+                sector_count: 10,
+            },
+        ];
+        let mut nav = VobuNav::new(&cells);
+        let s = |n: u64| n * SECTOR;
+        let mut packets = Vec::new();
+        // VOB 4 runs 0.1 s .. 126.6 s; VOB 5 restarts its clock at 0.07 s.
+        packets.extend(nav_pack(s(0), (4, 1), 9_000, 11_394_000));
+        packets.push(video(s(1), 11_390_000));
+        packets.extend(nav_pack(s(2), (5, 1), 6_300, 60_300));
+        packets.push(video(s(3), 6_300));
+        packets.push(video(s(4), 1_000)); // audio that leads its video in the new VOB
+        packets.extend(nav_pack(s(5), (5, 1), 60_300, 114_300));
+        packets.push(video(s(6), 60_300));
+        let shift = 11_394_000 - 6_300;
+        assert_eq!(
+            kept(&mut nav, packets),
+            vec![11_390_000, 6_300 + shift, 1_000 + shift, 60_300 + shift]
+        );
+        assert_eq!(nav.joins, 1);
     }
 
     #[test]
