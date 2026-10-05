@@ -179,10 +179,9 @@ static int registry_entry_bsd_name(io_registry_entry_t entry, char *buf, size_t 
     return ok;
 }
 
-// Empty optical drives have a service node but no IOMedia node, hence
-// no BSD diskN name. Use the service's IOKit registry ID as an opaque selector
-// until media appears. It is process/boot-local, which is sufficient for the
-// list-then-open GUI flow.
+// Optical services outlive their IOMedia nodes, which disappear for an empty
+// tray and during exclusive access. Use the service registry ID as the stable
+// selector throughout insertion, ripping and ejection (until unplug/reboot).
 static int registry_id_selector(io_registry_entry_t entry, char *buf, size_t buflen) {
     uint64_t registry_id = 0;
     if (IORegistryEntryGetRegistryEntryID(entry, &registry_id) != KERN_SUCCESS) return 0;
@@ -864,9 +863,10 @@ static int visit_list(io_service_t svc, void *ctx) {
     memset(info, 0, sizeof(*info));
 
     bdsvc_device_info(svc, info);
-    if (!bdsvc_to_bsd_name(svc, info->device_selector, sizeof(info->device_selector))) {
-        registry_id_selector(svc, info->device_selector, sizeof(info->device_selector));
-    }
+    // IOMedia (and its diskN name) disappears during exclusive access. The
+    // optical service survives: always use its ID so a busy drive cannot be
+    // enumerated as a second, apparently empty drive after opening it.
+    registry_id_selector(svc, info->device_selector, sizeof(info->device_selector));
     if (info->device_selector[0]) lc->count++;
     return lc->count >= lc->max ? 2 : 0;
 }

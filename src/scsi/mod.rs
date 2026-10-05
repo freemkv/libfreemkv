@@ -561,8 +561,8 @@ pub(crate) fn open_with(device: &Path, halt: &crate::halt::Halt) -> Result<Box<d
 /// no firmware reset, no init.
 #[derive(Debug, Clone)]
 pub struct DriveInfo {
-    /// Platform device path: `/dev/sgN` (Linux), `/dev/diskN` or an opaque
-    /// `ioreg:<id>` selector for an empty optical drive (macOS), `\\.\CdRomN`
+    /// Platform device path: `/dev/sgN` (Linux), a stable optical-service
+    /// `ioreg:<id>` selector (macOS), `\\.\CdRomN`
     /// (Windows).
     pub path: String,
     /// SCSI INQUIRY vendor identifier (e.g. `"HL-DT-ST"`).

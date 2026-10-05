@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- macOS optical-drive enumeration keeps the same IOKit service selector with or without mounted media, so exclusive access during a rip does not turn one drive into two identities.
+
 ## [1.8.0] — 2026-10-05
 
 ### Breaking
