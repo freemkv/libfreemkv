@@ -261,19 +261,26 @@ impl ScsiTransport for MacScsiTransport {
 // ── Drive enumeration (registry-based, no exclusive access) ──────────────
 
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
-    let mut buf = [ShimDriveInfo {
+    let empty = ShimDriveInfo {
         device_selector: [0; 32],
         vendor: [0; 32],
         model: [0; 48],
         firmware: [0; 16],
-    }; 8];
-
-    let count = unsafe { shim_list_drives(buf.as_mut_ptr(), buf.len() as i32) };
-
-    buf.iter()
-        .take((count as usize).min(buf.len()))
-        .filter_map(drive_info_from_shim)
-        .collect()
+    };
+    // The shim stops at the buffer size; a full buffer means there may be more.
+    let mut capacity = 16usize;
+    loop {
+        let mut buf = vec![empty; capacity];
+        let count = unsafe { shim_list_drives(buf.as_mut_ptr(), buf.len() as i32) }.max(0) as usize;
+        if count < capacity || capacity >= 4096 {
+            return buf
+                .iter()
+                .take(count.min(capacity))
+                .filter_map(drive_info_from_shim)
+                .collect();
+        }
+        capacity *= 2;
+    }
 }
 
 fn drive_info_from_shim(info: &ShimDriveInfo) -> Option<super::DriveInfo> {

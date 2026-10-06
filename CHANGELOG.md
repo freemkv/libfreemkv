@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Drive listing enumerates instead of guessing device numbers. Windows lists every `CdRomN` from `QueryDosDeviceW` plus optical drive letters (previously only `CdRom0`–`15`), retries INQUIRY with 36 bytes for strict USB bridges, and logs skipped devices. Linux also lists optical `sr` devices that have no `sg` node (the `sg` module is not loaded) and, without sysfs, reads `/dev` instead of probing `sg0`–`15`. macOS no longer stops at 8 drives.
 - macOS CLI/GUI/server transport diagnostics include selected IOKit service, plug-in metadata, interface initialization stages, exclusive-access attempts and cleanup results.
 
 - macOS optical-drive enumeration keeps the same IOKit service selector with or without mounted media, so exclusive access during a rip does not turn one drive into two identities.

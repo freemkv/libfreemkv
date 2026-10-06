@@ -547,8 +547,6 @@ const SCSI_TYPE_OPTICAL: &str = "5";
 /// Maximum sg index probed in the fallback path when sysfs is unavailable.
 /// Linux assigns `/dev/sgN` sequentially per host adapter; 16 covers any
 /// realistic homelab (typical PERC + USB optical = ≤8 nodes).
-const SG_FALLBACK_MAX: u8 = 16;
-
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     let mut out = Vec::new();
     let (names, type_filtered) = enumerate_sg_names();
@@ -615,49 +613,77 @@ fn pick_identity(live: String, sysfs: &str) -> String {
 /// `/sys/class/scsi_generic/sgN/device/{vendor,model,rev}`. Empty strings
 /// when sysfs is unavailable (minimal container, non-Linux filesystem).
 fn sysfs_identity(name: &str) -> (String, String, String) {
+    let class = if name.starts_with("sr") {
+        "block"
+    } else {
+        "scsi_generic"
+    };
     let read = |field: &str| -> String {
-        std::fs::read_to_string(format!("/sys/class/scsi_generic/{name}/device/{field}"))
+        std::fs::read_to_string(format!("/sys/class/{class}/{name}/device/{field}"))
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     };
     (read("vendor"), read("model"), read("rev"))
 }
 
-// `sg*` names via `/sys/class/scsi_generic/`, filtered to type 5 (optical), and
-// whether that filter applied: false for the unfiltered `sg0..15` fallback when
-// sysfs is unreadable. Sorted so caller iteration is deterministic.
+// Optical device names from the kernel's own lists, and whether they are already
+// type-filtered. `sg*` from `/sys/class/scsi_generic/` (type 5); plus optical
+// `sr*` block devices with no sg node (the `sg` module is not loaded), which
+// accept SG_IO directly. Without sysfs, every `/dev/sg*` node is returned
+// unfiltered for the caller's INQUIRY check. Sorted for deterministic order.
 pub(crate) fn enumerate_sg_names() -> (Vec<String>, bool) {
+    let optical = |device: &str| {
+        std::fs::read_to_string(format!("{device}/type"))
+            .is_ok_and(|t| t.trim() == SCSI_TYPE_OPTICAL)
+    };
     let mut names = Vec::new();
-    let mut type_filtered = true;
-    if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") {
+    let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") else {
+        let mut names = dev_nodes("sg");
+        names.sort_by_key(|name| node_number(name));
+        return (names, false);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // A non-optical or unreadable `type` (teardown race) is skipped.
+        if name.starts_with("sg") && optical(&format!("/sys/class/scsi_generic/{name}/device")) {
+            names.push(name);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("sg") {
-                continue;
-            }
-            let type_path = format!("/sys/class/scsi_generic/{name}/device/type");
-            // By design: only type-5 (optical) sg nodes are collected. A
-            // non-optical or unreadable `type` file (teardown race,
-            // restricted sysfs) is silently skipped, not a fatal error.
-            match std::fs::read_to_string(&type_path) {
-                Ok(s) if s.trim() == SCSI_TYPE_OPTICAL => names.push(name),
-                Ok(_) => {}  // not optical
-                Err(_) => {} // type file unreadable
-            }
-        }
-    } else {
-        // Sysfs missing: brute-force probe, unfiltered — callers must check
-        // the INQUIRY peripheral type themselves.
-        type_filtered = false;
-        for i in 0..SG_FALLBACK_MAX {
-            let name = format!("sg{i}");
-            if std::path::Path::new(&format!("/dev/{name}")).exists() {
+            let device = format!("/sys/class/block/{name}/device");
+            let has_sg = std::fs::read_dir(format!("{device}/scsi_generic"))
+                .is_ok_and(|mut e| e.next().is_some());
+            if name.starts_with("sr") && !has_sg && optical(&device) {
                 names.push(name);
             }
         }
     }
-    names.sort();
-    (names, type_filtered)
+    names.sort_by_key(|name| (name.starts_with("sr"), node_number(name)));
+    (names, true)
+}
+
+/// `/dev` entries named `<prefix><digits>`.
+fn dev_nodes(prefix: &str) -> Vec<String> {
+    std::fs::read_dir("/dev")
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| {
+                    name.strip_prefix(prefix)
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn node_number(name: &str) -> u32 {
+    name.trim_start_matches(|c: char| c.is_ascii_alphabetic())
+        .parse()
+        .unwrap_or(u32::MAX)
 }
 
 /// Send TEST UNIT READY directly — no transport, no reset, no side effects.
@@ -715,3 +741,7 @@ mod open_error_tests;
 #[cfg(test)]
 #[path = "linux_raw_command_cdb_guard_tests.rs"]
 mod raw_command_cdb_guard_tests;
+
+#[cfg(test)]
+#[path = "linux_enumerate_tests.rs"]
+mod enumerate_tests;
