@@ -221,12 +221,13 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.7.7"
+version = "1.8.0"
 dependencies = [
  "aes",
  "base64",
  "num-bigint",
  "num-traits",
+ "pioneer-optical",
  "rand",
  "serde",
  "serde_json",
@@ -317,7 +318,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfreemkv"
-version = "1.7.7"
+version = "1.8.0"
 dependencies = [
  "aes",
  "base64",
@@ -429,6 +430,12 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pioneer-optical"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf5074a27cc39fb664d0b994814ffe8530e3e8590aff0d104723332dbcb1abc4"
 
 [[package]]
 name = "proc-macro2"

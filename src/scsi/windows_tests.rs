@@ -108,3 +108,15 @@ fn windows_ffi_constants_match_sdk() {
     assert_eq!(FILE_ATTRIBUTE_NORMAL, 0x80);
     assert_eq!(INVALID_HANDLE_VALUE, -1);
 }
+
+#[test]
+fn cdrom_names_come_from_the_dos_device_list_without_a_number_limit() {
+    let multi_sz: Vec<u16> =
+        "C:\0CdRom17\0PhysicalDrive0\0CdRom2\0CdRomX\0CdRom\0Volume{1}\0CdRom2\0\0"
+            .encode_utf16()
+            .collect();
+    assert_eq!(cdrom_names_from_multi_sz(&multi_sz), ["CdRom2", "CdRom17"]);
+    assert_eq!(cdrom_number("CdRom17"), Some(17));
+    assert_eq!(cdrom_number("CdRom"), None);
+    assert_eq!(cdrom_number("PhysicalDrive0"), None);
+}

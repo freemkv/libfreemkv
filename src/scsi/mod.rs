@@ -544,8 +544,18 @@ const INQUIRY_MIN_LEN: usize = 36;
 /// Send INQUIRY and parse standard response fields. A reply shorter than the identity
 /// fields is an error, never a blank identity.
 pub fn inquiry(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
-    let cdb = [SCSI_INQUIRY, 0x00, 0x00, 0x00, INQUIRY_ALLOC as u8, 0x00];
-    let mut buf = [0u8; INQUIRY_ALLOC];
+    inquiry_alloc(scsi, INQUIRY_ALLOC)
+}
+
+/// INQUIRY with the standard 36-byte allocation, for bridges that reject longer ones.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn inquiry_standard(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
+    inquiry_alloc(scsi, INQUIRY_MIN_LEN)
+}
+
+fn inquiry_alloc(scsi: &mut dyn ScsiTransport, alloc: usize) -> Result<InquiryResult> {
+    let cdb = [SCSI_INQUIRY, 0x00, 0x00, 0x00, alloc as u8, 0x00];
+    let mut buf = vec![0u8; alloc];
     let r = scsi.execute(
         &cdb,
         DataDirection::FromDevice,

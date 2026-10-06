@@ -15,6 +15,13 @@ const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x4D014;
 /// IOCTL_STORAGE_QUERY_PROPERTY — CTL_CODE(IOCTL_STORAGE_BASE(0x2D),
 /// 0x500, METHOD_BUFFERED(0), FILE_ANY_ACCESS(0)) = 0x002D1400.
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
+/// IOCTL_STORAGE_GET_DEVICE_NUMBER — CTL_CODE(0x2D, 0x420, METHOD_BUFFERED, FILE_ANY_ACCESS).
+const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D1080;
+/// FILE_DEVICE_CD_ROM, the `DeviceType` of an optical drive.
+const FILE_DEVICE_CD_ROM: u32 = 0x02;
+/// GetDriveTypeW result for an optical drive letter.
+const DRIVE_CDROM: u32 = 5;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 /// STORAGE_PROPERTY_ID::StorageAdapterProperty.
 const STORAGE_ADAPTER_PROPERTY: u32 = 1;
 /// STORAGE_QUERY_TYPE::PropertyStandardQuery.
@@ -101,6 +108,15 @@ struct StorageAdapterDescriptor {
     BusMinorVersion: u16,
 }
 
+/// `STORAGE_DEVICE_NUMBER` (winioctl.h).
+#[repr(C)]
+#[allow(non_snake_case)]
+struct StorageDeviceNumber {
+    DeviceType: u32,
+    DeviceNumber: u32,
+    PartitionNumber: u32,
+}
+
 // ── Windows FFI ────────────────────────────────────────────────────────────
 
 unsafe extern "system" {
@@ -117,6 +133,12 @@ unsafe extern "system" {
     fn CloseHandle(hObject: isize) -> i32;
 
     fn GetLastError() -> u32;
+
+    fn QueryDosDeviceW(lpDeviceName: *const u16, lpTargetPath: *mut u16, ucchMax: u32) -> u32;
+
+    fn GetLogicalDrives() -> u32;
+
+    fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
 
     fn DeviceIoControl(
         hDevice: isize,
@@ -215,43 +237,138 @@ impl SptiTransport {
     }
 }
 
-/// Enumerate optical drives on Windows: probe `\\.\CdRom0..15`, falling back to
-/// drive letters `D..Z` only if none match, INQUIRY each, and keep the optical
-/// ones (peripheral device type 0x05).
-///
-/// Self-contained at the SCSI layer via `scsi::open` + `scsi::inquiry` (as the
-/// Linux backend is), with no dependency on the `rip`-gated `drive`/`identity`
-/// modules — `scsi` builds without `rip` (freemkv-firmware), where the old
-/// `crate::drive::windows::find_drives()` delegation failed to compile.
+/// Enumerate optical drives on Windows without guessing device numbers: every
+/// `CdRomN` the object manager knows (from `QueryDosDeviceW`, so any N), plus
+/// any optical drive letter whose device is not already listed. Each candidate
+/// must answer INQUIRY as an optical peripheral (type 0x05).
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
-    fn probe(path: &str, out: &mut Vec<super::DriveInfo>) {
-        let Ok(mut transport) = crate::scsi::open(Path::new(path)) else {
-            return;
-        };
-        let Ok(r) = super::inquiry(transport.as_mut()) else {
-            return;
-        };
-        if super::is_optical_peripheral(&r.raw) {
-            out.push(super::DriveInfo {
-                path: normalize_device_path(path),
-                vendor: r.vendor_id,
-                model: r.model,
-                firmware: r.firmware,
-            });
+    let names = cdrom_device_names();
+    let listed: Vec<u32> = names.iter().filter_map(|name| cdrom_number(name)).collect();
+    let mut candidates: Vec<String> = names
+        .into_iter()
+        .map(|name| format!("\\\\.\\{name}"))
+        .collect();
+    for letter in optical_drive_letters() {
+        let path = format!("\\\\.\\{letter}:");
+        match device_number(&path) {
+            Some(n) if listed.contains(&n) => {}
+            _ => candidates.push(path),
         }
     }
 
     let mut drives = Vec::new();
-    for i in 0..16 {
-        probe(&format!("\\\\.\\CdRom{}", i), &mut drives);
-    }
-    // Only fall back to drive letters if the CdRom scan found nothing.
-    if drives.is_empty() {
-        for letter in b'D'..=b'Z' {
-            probe(&format!("{}:", letter as char), &mut drives);
+    for path in candidates {
+        match probe(&path) {
+            Ok(Some(drive)) => drives.push(drive),
+            Ok(None) => tracing::info!(path = %path, "skipping non-optical device"),
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "skipping optical device that did not answer")
+            }
         }
     }
     drives
+}
+
+fn probe(path: &str) -> Result<Option<super::DriveInfo>> {
+    let mut transport = crate::scsi::open(Path::new(path))?;
+    let r = match super::inquiry(transport.as_mut()) {
+        Ok(r) => r,
+        // Some USB bridges reject a non-standard allocation length.
+        Err(_) => super::inquiry_standard(transport.as_mut())?,
+    };
+    Ok(
+        super::is_optical_peripheral(&r.raw).then(|| super::DriveInfo {
+            path: normalize_device_path(path),
+            vendor: r.vendor_id,
+            model: r.model,
+            firmware: r.firmware,
+        }),
+    )
+}
+
+/// Every `CdRomN` DOS device name, sorted by N.
+fn cdrom_device_names() -> Vec<String> {
+    let mut buf = vec![0u16; 64 * 1024];
+    loop {
+        let len = unsafe { QueryDosDeviceW(std::ptr::null(), buf.as_mut_ptr(), buf.len() as u32) };
+        if len != 0 {
+            return cdrom_names_from_multi_sz(&buf[..len as usize]);
+        }
+        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || buf.len() >= 16 * 1024 * 1024 {
+            tracing::warn!("QueryDosDeviceW failed; no CdRom devices listed");
+            return Vec::new();
+        }
+        buf.resize(buf.len() * 4, 0);
+    }
+}
+
+/// Pick the `CdRomN` names out of a `QueryDosDeviceW` multi-string.
+fn cdrom_names_from_multi_sz(multi_sz: &[u16]) -> Vec<String> {
+    let mut names: Vec<String> = multi_sz
+        .split(|&c| c == 0)
+        .map(String::from_utf16_lossy)
+        .filter(|name| cdrom_number(name).is_some())
+        .collect();
+    names.sort_by_key(|name| cdrom_number(name));
+    names.dedup();
+    names
+}
+
+fn cdrom_number(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("CdRom")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Drive letters Windows reports as optical.
+fn optical_drive_letters() -> Vec<char> {
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u32)
+        .filter(|bit| mask & (1 << bit) != 0)
+        .map(|bit| (b'A' + bit as u8) as char)
+        .filter(|letter| {
+            let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain([0]).collect();
+            unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_CDROM }
+        })
+        .collect()
+}
+
+/// The `CdRomN` number behind a device path, when Windows reports one.
+fn device_number(path: &str) -> Option<u32> {
+    let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+    // Zero access rights: querying the device number needs no read/write access.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut number: StorageDeviceNumber = unsafe { std::mem::zeroed() };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            std::ptr::null_mut(),
+            0,
+            (&mut number as *mut StorageDeviceNumber).cast(),
+            std::mem::size_of::<StorageDeviceNumber>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    (ok != 0 && number.DeviceType == FILE_DEVICE_CD_ROM).then_some(number.DeviceNumber)
 }
 
 /// TEST UNIT READY probe on Windows. No in-library recovery: the answer is
