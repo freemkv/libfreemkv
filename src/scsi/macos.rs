@@ -13,6 +13,19 @@ use crate::halt::Halt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// Native calls run on the operation thread, retaining its diagnostic subscriber.
+#[unsafe(no_mangle)]
+extern "C" fn freemkv_macos_diagnostic(message: *const std::ffi::c_char) {
+    if message.is_null() {
+        return;
+    }
+    // Never unwind through the C ABI, including if a subscriber panics.
+    let _ = std::panic::catch_unwind(|| {
+        let message = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy();
+        tracing::debug!(target: "freemkv::scsi::macos", %message, "macOS transport");
+    });
+}
+
 const K_SENSE_DATA_SIZE: usize = 32;
 
 /// Max CDB length the SCSI commands this library issues ever use. An

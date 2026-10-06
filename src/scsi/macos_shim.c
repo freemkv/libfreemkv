@@ -17,6 +17,65 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <mach/mach_error.h>
+#include <libproc.h>
+#include <sys/xattr.h>
+
+extern void freemkv_macos_diagnostic(const char *message);
+
+static void diagnostic(const char *format, ...) {
+    char message[2048];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    freemkv_macos_diagnostic(message);
+}
+
+static void diagnostic_launch(void) {
+    char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    int length = proc_pidpath(getpid(), path, sizeof(path));
+    diagnostic("executable=%s path_result=%d", path, length);
+    if (length > 0) {
+        const char *attributes[] = { "com.apple.quarantine", "com.apple.provenance" };
+        for (unsigned i = 0; i < sizeof(attributes) / sizeof(attributes[0]); i++) {
+            errno = 0;
+            ssize_t size = getxattr(path, attributes[i], NULL, 0, 0, 0);
+            int error = errno;
+            diagnostic("executable attribute=%s size=%lld errno=%d state=%s", attributes[i],
+                (long long)size, error, size >= 0 ? "present" : error == ENOATTR ? "absent" : "unavailable");
+        }
+    }
+    memset(path, 0, sizeof(path));
+    length = proc_pidpath(getppid(), path, sizeof(path));
+    diagnostic("parent_pid=%d executable=%s path_result=%d", getppid(), path, length);
+}
+
+static void diagnostic_result(const char *stage, IOReturn result) {
+    diagnostic("stage=%s result=0x%08x description=%s", stage,
+        (unsigned)result, mach_error_string(result));
+}
+
+static void diagnostic_service(io_service_t service) {
+    io_name_t name = {0}, cls = {0};
+    io_string_t path = {0};
+    uint64_t registry_id = 0;
+    IORegistryEntryGetName(service, name);
+    IOObjectGetClass(service, cls);
+    IORegistryEntryGetPath(service, kIOServicePlane, path);
+    IORegistryEntryGetRegistryEntryID(service, &registry_id);
+    diagnostic("selected registry_id=%" PRIu64 " name=%s class=%s path=%s",
+        registry_id, name, cls, path);
+    CFTypeRef types = IORegistryEntryCreateCFProperty(service,
+        CFSTR("IOCFPlugInTypes"), kCFAllocatorDefault, 0);
+    CFStringRef description = types ? CFCopyDescription(types) : NULL;
+    char text[1024] = {0};
+    if (description) CFStringGetCString(description, text, sizeof(text), kCFStringEncodingUTF8);
+    diagnostic("IOCFPlugInTypes=%s", types ? text : "missing");
+    if (description) CFRelease(description);
+    if (types) CFRelease(types);
+}
 
 extern char **environ;
 
@@ -584,6 +643,8 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     // mmc/plugin mid-setup. Released before the self-locking da_hold (5 s wait).
     pthread_mutex_lock(&g_handle_lock);
     g_last_open_kr = 0;
+    diagnostic("open selector=%s pid=%d euid=%d", selector, getpid(), geteuid());
+    diagnostic_launch();
 
     // A Stop before the open does nothing at all: no unmount is started.
     if (shim_cancelled(cancel)) {
@@ -625,9 +686,13 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         if (svc) strlcpy(bsd_name, selector, sizeof(bsd_name));
     }
     if (!svc) {
+        diagnostic("stage=resolve_service result=not_found");
         pthread_mutex_unlock(&g_handle_lock);
         return -1;
     }
+
+    diagnostic_service(svc);
+    diagnostic("resolved BSD name=%s; empty means no media node to unmount/claim", bsd_name);
 
     // Unmount via diskutil, invoked directly with posix_spawn (no shell) so the
     // BSD device name is a discrete argv element and never shell syntax. Only a
@@ -647,9 +712,12 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         }
     }
 
+    diagnostic("stage=IOCreatePlugInInterfaceForService requested=kIOMMCDeviceUserClientTypeID interface=kIOCFPlugInInterfaceID");
     kr = IOCreatePlugInInterfaceForService(svc,
         kIOMMCDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
         &g_handle.plugin, &score);
+    diagnostic_result("IOCreatePlugInInterfaceForService", kr);
+    diagnostic("plugin_present=%d score=%d", g_handle.plugin != NULL, (int)score);
     IOObjectRelease(svc);
 
     if (kr != KERN_SUCCESS || !g_handle.plugin) {
@@ -660,19 +728,21 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
 
     hr = (*g_handle.plugin)->QueryInterface(g_handle.plugin,
         CFUUIDGetUUIDBytes(kIOMMCDeviceInterfaceID), (LPVOID *)&g_handle.mmc);
+    diagnostic("stage=QueryInterface requested=kIOMMCDeviceInterfaceID HRESULT=0x%08x interface_present=%d", (unsigned)hr, g_handle.mmc != NULL);
     if (hr != S_OK || !g_handle.mmc) {
         g_last_open_kr = (int32_t)hr;
-        IODestroyPlugInInterface(g_handle.plugin);
+        diagnostic_result("IODestroyPlugInInterface", IODestroyPlugInInterface(g_handle.plugin));
         g_handle.plugin = NULL;
         pthread_mutex_unlock(&g_handle_lock);
         return -3;
     }
 
     g_handle.scsi = (*g_handle.mmc)->GetSCSITaskDeviceInterface(g_handle.mmc);
+    diagnostic("stage=GetSCSITaskDeviceInterface interface_present=%d", g_handle.scsi != NULL);
     if (!g_handle.scsi) {
         g_last_open_kr = (int32_t)kIOReturnNoDevice;
         (*g_handle.mmc)->Release(g_handle.mmc);
-        IODestroyPlugInInterface(g_handle.plugin);
+        diagnostic_result("IODestroyPlugInInterface", IODestroyPlugInInterface(g_handle.plugin));
         g_handle.mmc = NULL;
         g_handle.plugin = NULL;
         pthread_mutex_unlock(&g_handle_lock);
@@ -681,7 +751,9 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
 
     int cancelled = 0;
     for (int retry = 0; retry < 10; retry++) {
+        diagnostic("stage=ObtainExclusiveAccess attempt=%d", retry + 1);
         kr = (*g_handle.scsi)->ObtainExclusiveAccess(g_handle.scsi);
+        diagnostic_result("ObtainExclusiveAccess", kr);
         if (kr == kIOReturnSuccess) break;
         if (sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) { cancelled = 1; break; }
     }
@@ -689,7 +761,7 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
         g_last_open_kr = (int32_t)kr;
         (*g_handle.scsi)->Release(g_handle.scsi);
         (*g_handle.mmc)->Release(g_handle.mmc);
-        IODestroyPlugInInterface(g_handle.plugin);
+        diagnostic_result("IODestroyPlugInInterface", IODestroyPlugInInterface(g_handle.plugin));
         g_handle.scsi = NULL;
         g_handle.mmc = NULL;
         g_handle.plugin = NULL;
@@ -727,7 +799,8 @@ void shim_close(void) {
     da_release(); // takes g_handle_lock on its own; keep it out of the region below
     pthread_mutex_lock(&g_handle_lock);
     if (g_handle.exclusive && g_handle.scsi) {
-        (*g_handle.scsi)->ReleaseExclusiveAccess(g_handle.scsi);
+        diagnostic_result("ReleaseExclusiveAccess",
+            (*g_handle.scsi)->ReleaseExclusiveAccess(g_handle.scsi));
     }
     if (g_handle.scsi) {
         (*g_handle.scsi)->Release(g_handle.scsi);
@@ -738,7 +811,7 @@ void shim_close(void) {
         g_handle.mmc = NULL;
     }
     if (g_handle.plugin) {
-        IODestroyPlugInInterface(g_handle.plugin);
+        diagnostic_result("IODestroyPlugInInterface", IODestroyPlugInInterface(g_handle.plugin));
         g_handle.plugin = NULL;
     }
     g_handle.exclusive = 0;

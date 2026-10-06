@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- macOS CLI/GUI/server transport diagnostics include selected IOKit service, plug-in metadata, interface initialization stages, exclusive-access attempts and cleanup results.
+
 - macOS optical-drive enumeration keeps the same IOKit service selector with or without mounted media, so exclusive access during a rip does not turn one drive into two identities.
 
 ## [1.8.0] — 2026-10-05
