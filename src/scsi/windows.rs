@@ -108,13 +108,12 @@ struct StorageAdapterDescriptor {
     BusMinorVersion: u16,
 }
 
-/// `STORAGE_DEVICE_NUMBER` (winioctl.h).
+/// `STORAGE_DEVICE_NUMBER` (winioctl.h): DeviceType, DeviceNumber, PartitionNumber.
 #[repr(C)]
-#[allow(non_snake_case)]
 struct StorageDeviceNumber {
-    DeviceType: u32,
-    DeviceNumber: u32,
-    PartitionNumber: u32,
+    device_type: u32,
+    device_number: u32,
+    _partition_number: u32,
 }
 
 // ── Windows FFI ────────────────────────────────────────────────────────────
@@ -368,7 +367,7 @@ fn device_number(path: &str) -> Option<u32> {
         )
     };
     unsafe { CloseHandle(handle) };
-    (ok != 0 && number.DeviceType == FILE_DEVICE_CD_ROM).then_some(number.DeviceNumber)
+    (ok != 0 && number.device_type == FILE_DEVICE_CD_ROM).then_some(number.device_number)
 }
 
 /// TEST UNIT READY probe on Windows. No in-library recovery: the answer is

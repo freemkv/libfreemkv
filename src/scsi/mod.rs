@@ -548,7 +548,7 @@ pub fn inquiry(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
 }
 
 /// INQUIRY with the standard 36-byte allocation, for bridges that reject longer ones.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 pub(crate) fn inquiry_standard(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
     inquiry_alloc(scsi, INQUIRY_MIN_LEN)
 }
