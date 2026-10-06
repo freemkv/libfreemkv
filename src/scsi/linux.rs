@@ -626,11 +626,9 @@ fn sysfs_identity(name: &str) -> (String, String, String) {
     (read("vendor"), read("model"), read("rev"))
 }
 
-// Optical device names from the kernel's own lists, and whether they are already
-// type-filtered. `sg*` from `/sys/class/scsi_generic/` (type 5); plus optical
-// `sr*` block devices with no sg node (the `sg` module is not loaded), which
-// accept SG_IO directly. Without sysfs, every `/dev/sg*` node is returned
-// unfiltered for the caller's INQUIRY check. Sorted for deterministic order.
+// Optical names from the kernel's lists, and whether they are type-filtered: type-5 `sg*`
+// plus `sr*` with no sg node (SG_IO works on it). Without sysfs, every `/dev/sg*` node,
+// unfiltered for the caller's INQUIRY check.
 pub(crate) fn enumerate_sg_names() -> (Vec<String>, bool) {
     let optical = |device: &str| {
         std::fs::read_to_string(format!("{device}/type"))
