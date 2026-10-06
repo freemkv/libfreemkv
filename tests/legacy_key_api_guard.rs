@@ -31,7 +31,15 @@ fn allowed(rel: &str) -> bool {
         || rel.starts_with("src/aacs/")
         || rel == "src/decrypt.rs"
         || rel == "src/sector/decrypting.rs"
+        || TEST_SIDE_FILES.contains(&rel)
 }
+
+/// The `#[cfg(test)]` side files of the allow-path modules above (`#[path]` tests).
+const TEST_SIDE_FILES: [&str; 3] = [
+    "src/decrypt_tests.rs",
+    "src/decrypt_spec_guards_tests.rs",
+    "src/sector/decrypting_tests.rs",
+];
 
 /// `src` with every comment blanked (newlines kept), and a copy with string and char
 /// literal contents blanked too; both keep `src`'s char positions.
@@ -250,6 +258,8 @@ fn the_structural_guard_skips_comments_and_keeps_its_allow_path() {
         "src/aacs/content.rs",
         "src/decrypt.rs",
         "src/sector/decrypting.rs",
+        "src/decrypt_tests.rs",
+        "src/sector/decrypting_tests.rs",
     ] {
         assert!(hits(rel, code).is_empty(), "{rel} is on the allow-path");
     }
