@@ -1,0 +1,1355 @@
+use super::*;
+use crate::disc::{
+    AudioChannels, AudioStream, Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat, LabelPurpose,
+    Resolution, SampleRate, VideoStream,
+};
+use crate::mux::demux_thread::{DemuxBatch, DemuxThread};
+use crate::mux::ps::PsPacket;
+use crate::mux::ts::PesPacket;
+use crossbeam_channel::{Sender, bounded};
+
+// Real, cleanly-exiting DemuxThread whose own receiver is discarded — it
+// exists only to satisfy new()'s ownership. Tests drive the SEPARATE
+// demux_rx channel independently to inject any DemuxBatch sequence.
+fn dummy_demux_thread() -> DemuxThread {
+    let (_pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(1);
+    let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(2);
+    // No TS/PS demuxer; the worker just drains (nothing) and exits Eof.
+    let (dt, _own_rx) =
+        DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), &crate::ctx::Ctx::default(), None, None)
+            .expect("spawn");
+    dt
+}
+
+/// Assemble a `PipelinedPesStream` over a caller-controlled demux channel.
+/// Returns the stream plus the `Sender` so the test drives batches/EOF.
+fn make_stream(
+    title: DiscTitle,
+    parsers: Vec<(u16, Box<dyn CodecParser>)>,
+    pid_to_track: Vec<(u16, usize)>,
+) -> (PipelinedPesStream, Sender<DemuxBatch>) {
+    let (tx, rx) = bounded::<DemuxBatch>(8);
+    let stream = PipelinedPesStream::new(dummy_demux_thread(), rx, title, parsers, pid_to_track);
+    (stream, tx)
+}
+
+/// A parser that emits exactly `n` frames per PES, with a fixed
+/// codec_private. Lets tests assert routing/flush without depending on a
+/// real codec's byte parsing.
+struct CountingParser {
+    per_pes: usize,
+    flush_n: usize,
+    cp: Option<Vec<u8>>,
+}
+impl CodecParser for CountingParser {
+    fn parse(&mut self, pes: &PesPacket) -> Vec<super::super::codec::Frame> {
+        (0..self.per_pes)
+            .map(|i| super::super::codec::Frame {
+                coding: None,
+                source: None,
+                pts_ns: pes.pts.unwrap_or(0) + i as i64,
+                keyframe: i == 0,
+                discontinuity: false,
+                data: pes.data.clone(),
+                duration_ns: None,
+            })
+            .collect()
+    }
+    fn flush(&mut self) -> Vec<super::super::codec::Frame> {
+        (0..self.flush_n)
+            .map(|_| super::super::codec::Frame {
+                coding: None,
+                source: None,
+                pts_ns: 0,
+                keyframe: false,
+                discontinuity: false,
+                data: vec![0xEE],
+                duration_ns: None,
+            })
+            .collect()
+    }
+    fn codec_private(&self) -> Option<Vec<u8>> {
+        self.cp.clone()
+    }
+}
+
+fn ts_pes(pid: u16, data: Vec<u8>) -> PesPacket {
+    PesPacket {
+        source: None,
+        pid,
+        pts: Some(90_000),
+        dts: None,
+        data,
+        discontinuity: false,
+    }
+}
+
+// Three VOBUs of three different cells (VOB 1 cells 1 and 2, VOB 2 cell 1) in one
+// extent, on one continuous clock, muxed under `format`: the video payloads that come out.
+fn three_cell_feed(
+    format: crate::disc::ContentFormat,
+    clips: Vec<crate::disc::Clip>,
+    extents: Vec<crate::disc::Extent>,
+) -> Vec<Vec<u8>> {
+    let mut title = DiscTitle::empty();
+    title.content_format = format;
+    title.clips = clips;
+    title.extents = extents;
+    title.streams.push(crate::disc::Stream::Video(VideoStream {
+        pid: crate::mux::ps::DVD_VIDEO_PID,
+        codec: Codec::Mpeg2,
+        resolution: Resolution::R480i,
+        frame_rate: FrameRate::F29_97,
+        hdr: HdrFormat::Sdr,
+        color_space: ColorSpace::Bt709,
+        display_aspect: None,
+        secondary: false,
+        label: String::new(),
+        measured_cicp: None,
+    }));
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        crate::mux::ps::DVD_VIDEO_PID,
+        Box::new(CountingParser {
+            per_pes: 1,
+            flush_n: 0,
+            cp: None,
+        }),
+    )];
+    let (mut stream, tx) = make_stream(
+        title,
+        parsers,
+        vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)],
+    );
+    let at = |sector: u64| Some(crate::pes::SourcePos::at_byte(sector * 2048));
+    let packet = |sector, stream_id, data: Vec<u8>, pts| PsPacket {
+        source: at(sector),
+        stream_id,
+        sub_stream_id: None,
+        pts,
+        dts: None,
+        data,
+    };
+    let mut batch = Vec::new();
+    for (i, (vob, cell)) in [(1u16, 1u8), (1, 2), (2, 1)].into_iter().enumerate() {
+        let sector = i as u64 * 4;
+        let (start, end) = (i as u32 * 900, (i as u32 + 1) * 900);
+        let mut pci = vec![0u8; 21];
+        pci[13..17].copy_from_slice(&start.to_be_bytes());
+        pci[17..21].copy_from_slice(&end.to_be_bytes());
+        let mut dsi = vec![0u8; 29];
+        dsi[0] = 0x01;
+        dsi[25..27].copy_from_slice(&vob.to_be_bytes());
+        dsi[28] = cell;
+        batch.push(packet(sector, 0xBF, pci, None));
+        batch.push(packet(sector, 0xBF, dsi, None));
+        let video = vec![0x00, 0x00, 0x01, 0xB3, i as u8];
+        batch.push(packet(
+            sector + 1,
+            0xE0,
+            video,
+            Some(u64::from(start) + 100),
+        ));
+    }
+    tx.send(DemuxBatch::Ps(batch)).unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+    let mut out = Vec::new();
+    while let Some(f) = stream.read().unwrap() {
+        out.push(f.data);
+    }
+    out
+}
+
+// DVD navigation is the DVD scan's decision: an `mpg://` file (one extent, the whole file)
+// and an HD DVD title (its `.evo` clips) are program streams too, and lose no VOBU to it.
+#[test]
+fn dvd_navigation_runs_only_on_dvd_titles() {
+    let whole = |sectors| crate::disc::Extent {
+        start_lba: 0,
+        sector_count: sectors,
+    };
+    let all: Vec<Vec<u8>> = (0..3).map(|i| vec![0x00, 0x00, 0x01, 0xB3, i]).collect();
+    let mpg = three_cell_feed(crate::disc::ContentFormat::MpegPs, vec![], vec![whole(12)]);
+    assert_eq!(mpg, all, "an mpg:// file keeps every cell");
+    let evo = crate::disc::Clip {
+        clip_id: "FEATURE_1".into(),
+        in_time: 0,
+        out_time: 0,
+        duration_secs: 0.0,
+        source_packets: 0,
+        feed_span: None,
+    };
+    let hddvd = three_cell_feed(
+        crate::disc::ContentFormat::MpegPs,
+        vec![evo],
+        vec![
+            whole(6),
+            crate::disc::Extent {
+                start_lba: 6,
+                sector_count: 6,
+            },
+        ],
+    );
+    assert_eq!(hddvd, all, "an HD DVD title keeps every VOBU");
+    // The control: a DVD title read as this one extent keeps the cell it opens with.
+    let dvd = three_cell_feed(crate::disc::ContentFormat::DvdPs, vec![], vec![whole(12)]);
+    assert_eq!(dvd, all[..1]);
+}
+
+/// LP11: a reader blocked on the demux channel returns `Halted` once the op's
+/// token is cancelled, with the demux worker still alive (no batch, no EOF).
+#[test]
+fn pipelined_stream_cancel_unblocks_reader() {
+    let (stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+    let halt = crate::halt::Halt::new();
+    let mut stream = stream.with_ctx(&crate::ctx::Ctx::new(halt.clone()));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = started_tx.send(());
+        let _ = done_tx.send(stream.read().map(|f| f.is_some()));
+    });
+    // Cancel after the reader thread starts; a cancel that lands before it
+    // blocks must still end the read, so the order cannot flake.
+    started_rx.recv().unwrap();
+    halt.cancel();
+    let r = done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("a cancel must unblock the reader within a slice");
+    let err = r.expect_err("a stop is not a frame or EOF");
+    assert!(crate::error::is_halt(&err), "{err}");
+    drop(tx);
+}
+
+/// LP11 on the highway: a Stop mid-stream through a real demux worker yields
+/// `Err(Halted)`, never `Ok(None)` (a truncated container finalised as complete),
+/// and an `Eof` that raced the Stop is `Halted` too.
+#[test]
+fn highway_stop_mid_stream_is_halted_never_eof() {
+    let halt = crate::halt::Halt::new();
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(8);
+    let (dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rec_tx,
+        (),
+        &crate::ctx::Ctx::new(halt.clone()),
+        None,
+        None,
+    )
+    .expect("spawn");
+    let mut stream = PipelinedPesStream::new(dt, rx, DiscTitle::empty(), vec![], vec![])
+        .with_ctx(&crate::ctx::Ctx::new(halt.clone()));
+    pf_tx.send(Ok(vec![0u8; 188])).unwrap();
+    halt.cancel();
+    // The halted prefetcher closes its channel.
+    drop(pf_tx);
+    let mut outcome = None;
+    for _ in 0..16 {
+        match stream.read() {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("a Stop must never read as a clean end of stream"),
+            Err(e) => {
+                outcome = Some(e);
+                break;
+            }
+        }
+    }
+    let e = outcome.expect("the Stop surfaced");
+    assert!(crate::error::is_halt(&e), "{e}");
+
+    let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+    let halt = crate::halt::Halt::new();
+    stream = stream.with_ctx(&crate::ctx::Ctx::new(halt.clone()));
+    halt.cancel();
+    tx.send(DemuxBatch::Eof).unwrap();
+    let e = stream.read().expect_err("an Eof after a Stop is not clean");
+    assert!(crate::error::is_halt(&e), "{e}");
+}
+
+// CLEAN EOF: explicit Eof sentinel → consumer returns Ok(None) and stays
+// Ok(None) on subsequent reads.
+#[test]
+fn eof_sentinel_yields_clean_none() {
+    let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+    tx.send(DemuxBatch::Eof).unwrap();
+    assert!(stream.read().unwrap().is_none(), "Eof → Ok(None)");
+    // The eof flag latches: a further read is still Ok(None), not an error.
+    assert!(stream.read().unwrap().is_none());
+}
+
+// BARE DISCONNECT (no Eof/Err sentinel) = worker panic. Consumer must
+// surface DemuxThreadPanicked, never a silent clean Ok(None) — the
+// truncation guard the module doc promises.
+#[test]
+fn bare_disconnect_is_error_not_silent_eof() {
+    let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+    drop(tx); // sender gone, no Eof sent → RecvError on the consumer side
+    let err = stream.read().expect_err("bare disconnect must be an error");
+    // E_DEMUX_THREAD_PANICKED (9013) maps to ErrorKind::Other.
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    let e = crate::error::Error::DemuxThreadPanicked;
+    assert!(
+        err.to_string().contains(&e.code().to_string()),
+        "error must carry the DemuxThreadPanicked code, got: {err}"
+    );
+}
+
+/// A `DemuxBatch::Err` from the worker (underlying reader error) is
+/// terminal and must propagate to the caller verbatim, not be masked as
+/// EOF.
+#[test]
+fn demux_err_propagates() {
+    let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+    tx.send(DemuxBatch::Err(std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied,
+    )))
+    .unwrap();
+    let err = stream.read().expect_err("Err batch must propagate");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+// The worker exits after a terminal error; a later read repeats that error, not
+// a misleading "demux thread panicked".
+#[test]
+fn a_read_after_a_terminal_error_repeats_it() {
+    let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+    let disc_read = crate::error::Error::DiscRead {
+        sector: 7,
+        status: Some(0x02),
+        sense: None,
+    };
+    tx.send(DemuxBatch::Err(disc_read.into())).unwrap();
+    drop(tx);
+    for _ in 0..2 {
+        let err = stream.read().expect_err("terminal error");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some(crate::error::E_DISC_READ),
+            "got {err}"
+        );
+    }
+}
+
+/// consume_ts must route a PES to the track mapped to its PID and emit
+/// the parser's frames in order. A PES whose PID is NOT in pid_to_track
+/// must be dropped (no frame), never mis-attributed to another track.
+#[test]
+fn ts_routing_maps_pid_to_track_and_drops_untracked() {
+    let title = DiscTitle::empty();
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1100,
+        Box::new(CountingParser {
+            per_pes: 2,
+            flush_n: 0,
+            cp: None,
+        }),
+    )];
+    let pid_to_track = vec![(0x1100u16, 3usize)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    // One tracked PES (PID 0x1100) and one untracked (PID 0x2222).
+    tx.send(DemuxBatch::Ts(vec![
+        ts_pes(0x1100, vec![0xAA, 0xBB]),
+        ts_pes(0x2222, vec![0xCC]),
+    ]))
+    .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    // Tracked PES → 2 frames on track 3, in order; untracked → nothing.
+    let f0 = stream.read().unwrap().expect("frame 0");
+    assert_eq!(f0.track, 3, "routed to the PID's mapped track");
+    assert_eq!(f0.data, vec![0xAA, 0xBB]);
+    let f1 = stream.read().unwrap().expect("frame 1");
+    assert_eq!(f1.track, 3);
+    // Only the two frames from the tracked PES exist, then clean EOF.
+    assert!(
+        stream.read().unwrap().is_none(),
+        "untracked PES dropped, EOF"
+    );
+}
+
+/// A parser that emits exactly one frame per PES, marking it a keyframe iff
+/// the PES payload's first byte is `b'K'`. Lets a test script a precise
+/// keyframe/inter-frame sequence to exercise the B1 resync gate.
+struct KeyframeParser;
+impl CodecParser for KeyframeParser {
+    fn parse(&mut self, pes: &PesPacket) -> Vec<super::super::codec::Frame> {
+        vec![super::super::codec::Frame {
+            coding: None,
+            source: None,
+            pts_ns: pes.pts.unwrap_or(0),
+            keyframe: pes.data.first() == Some(&b'K'),
+            // Propagate so the B1 gate can be driven end-to-end in tests.
+            discontinuity: pes.discontinuity,
+            data: pes.data.clone(),
+            duration_ns: None,
+        }]
+    }
+    fn flush(&mut self) -> Vec<super::super::codec::Frame> {
+        vec![]
+    }
+    fn codec_private(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+fn ts_pes_disc(pid: u16, data: Vec<u8>, discontinuity: bool) -> PesPacket {
+    PesPacket {
+        source: None,
+        pid,
+        pts: Some(90_000),
+        dts: None,
+        data,
+        discontinuity,
+    }
+}
+
+// B1 end-to-end: after a TS discontinuity on a VIDEO track, drop every
+// inter-coded frame until the next keyframe so no dangling-reference frame
+// reaches the muxer; the stream resumes cleanly at that keyframe.
+#[test]
+fn b1_video_drops_to_keyframe_after_discontinuity() {
+    let title = video_title(false); // one HEVC video stream, PID 0x1011
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(0x1011, Box::new(KeyframeParser))];
+    let pid_to_track = vec![(0x1011u16, 0usize)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    // K0,P1 clean → emit. P2 carries the gap (inter frame referencing the
+    // lost data) → arms the gate; P2,P3 drop. K4 is the next keyframe →
+    // resync + emit. P5 then admits cleanly.
+    tx.send(DemuxBatch::Ts(vec![
+        ts_pes_disc(0x1011, b"K0".to_vec(), false),
+        ts_pes_disc(0x1011, b"P1".to_vec(), false),
+        ts_pes_disc(0x1011, b"P2".to_vec(), true),
+        ts_pes_disc(0x1011, b"P3".to_vec(), false),
+        ts_pes_disc(0x1011, b"K4".to_vec(), false),
+        ts_pes_disc(0x1011, b"P5".to_vec(), false),
+    ]))
+    .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    let mut emitted = Vec::new();
+    while let Some(f) = stream.read().unwrap() {
+        emitted.push(f.data);
+    }
+    // P2 (gap) and P3 (still no keyframe) are dropped; the rest survive in
+    // order. Crucially the FIRST frame after the gap that we emit is the
+    // keyframe K4 — never a dangling-reference inter frame.
+    assert_eq!(
+        emitted,
+        vec![
+            b"K0".to_vec(),
+            b"P1".to_vec(),
+            b"K4".to_vec(),
+            b"P5".to_vec()
+        ],
+        "post-gap inter frames dropped, stream resumes at the keyframe"
+    );
+}
+
+/// A parser that holds one inter frame, flagged discontinuous, until flush.
+struct HeldDanglingParser;
+impl CodecParser for HeldDanglingParser {
+    fn parse(&mut self, _: &PesPacket) -> Vec<super::super::codec::Frame> {
+        vec![]
+    }
+    fn flush(&mut self) -> Vec<super::super::codec::Frame> {
+        vec![super::super::codec::Frame {
+            coding: None,
+            source: None,
+            pts_ns: 0,
+            keyframe: false,
+            discontinuity: true,
+            data: b"P".to_vec(),
+            duration_ns: None,
+        }]
+    }
+    fn codec_private(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+// B1 at EOF: a final inter frame held by the parser and flagged discontinuous goes
+// through the same gate: it is dropped and counted, not written with dangling references.
+#[test]
+fn b1_gate_applies_to_the_frame_flushed_at_eof() {
+    let title = video_title(false);
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(0x1011, Box::new(HeldDanglingParser))];
+    let (mut stream, tx) = make_stream(title, parsers, vec![(0x1011u16, 0usize)]);
+    tx.send(DemuxBatch::Ts(vec![ts_pes(0x1011, vec![1])]))
+        .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+    assert!(
+        stream.read().unwrap().is_none(),
+        "the dangling frame is dropped"
+    );
+    assert_eq!(stream.errors(), 1, "and counted");
+}
+
+/// Counterpart to B1: a discontinuity on a NON-video track must NOT drop
+/// frames — audio/subtitle access units are independent, so the gate admits
+/// every frame the parser still produces.
+#[test]
+fn b1_audio_does_not_drop_on_discontinuity() {
+    let mut title = DiscTitle::empty();
+    title.streams.push(crate::disc::Stream::Audio(AudioStream {
+        pid: 0x1100,
+        codec: Codec::Ac3,
+        channels: AudioChannels::Surround51,
+        language: "eng".into(),
+        sample_rate: SampleRate::S48,
+        secondary: false,
+        purpose: LabelPurpose::Normal,
+        label: String::new(),
+    }));
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(0x1100, Box::new(KeyframeParser))];
+    let pid_to_track = vec![(0x1100u16, 0usize)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    tx.send(DemuxBatch::Ts(vec![
+        ts_pes_disc(0x1100, b"a0".to_vec(), false),
+        ts_pes_disc(0x1100, b"a1".to_vec(), true), // gap — but audio is independent
+        ts_pes_disc(0x1100, b"a2".to_vec(), false),
+    ]))
+    .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    let mut emitted = Vec::new();
+    while let Some(f) = stream.read().unwrap() {
+        emitted.push(f.data);
+    }
+    assert_eq!(
+        emitted,
+        vec![b"a0".to_vec(), b"a1".to_vec(), b"a2".to_vec()],
+        "audio frames are never dropped on a discontinuity"
+    );
+}
+
+// At EOF the consumer must call flush() on every parser and emit the
+// buffered tail — a held final AU (e.g. DTS-HD) must not be dropped.
+#[test]
+fn flush_tail_emitted_at_eof() {
+    let title = DiscTitle::empty();
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1100,
+        Box::new(CountingParser {
+            per_pes: 0, // parse emits nothing; everything comes from flush
+            flush_n: 1,
+            cp: None,
+        }),
+    )];
+    let pid_to_track = vec![(0x1100u16, 0usize)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    tx.send(DemuxBatch::Ts(vec![ts_pes(0x1100, vec![0x01])]))
+        .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    // No frames from parse; the single flush() frame must surface at EOF.
+    let tail = stream.read().unwrap().expect("flush tail frame at EOF");
+    assert_eq!(tail.track, 0);
+    assert_eq!(tail.data, vec![0xEE], "flush() tail, not dropped");
+    assert!(stream.read().unwrap().is_none());
+}
+
+/// A flush parser whose PID is not in pid_to_track must be skipped at EOF
+/// (the `continue` guard) — no panic, no frame attributed to a phantom
+/// track.
+#[test]
+fn flush_skips_parser_with_unmapped_pid() {
+    let title = DiscTitle::empty();
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x9999, // PID present as a parser but absent from pid_to_track
+        Box::new(CountingParser {
+            per_pes: 0,
+            flush_n: 5,
+            cp: None,
+        }),
+    )];
+    let pid_to_track = vec![]; // nothing mapped
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+    tx.send(DemuxBatch::Eof).unwrap();
+    // The unmapped parser's 5 flush frames must be discarded, not emitted.
+    assert!(
+        stream.read().unwrap().is_none(),
+        "flush frames for an unmapped PID are skipped"
+    );
+}
+
+fn ext_packet(stream_id: u8, data: Vec<u8>) -> PsPacket {
+    PsPacket {
+        source: None,
+        stream_id,
+        sub_stream_id: None,
+        pts: Some(90_000),
+        dts: None,
+        data,
+    }
+}
+
+/// Extension packets (`0xD0|n`) with no declared extension track are counted and
+/// reported once at EOF (tag=mp2.extension), not WARNed per packet.
+#[test]
+fn undeclared_extension_packets_are_reported_once_at_eof() {
+    let (mut stream, tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+    let batch = vec![
+        ext_packet(0xD1, vec![0x7F, 0xF0]),
+        ext_packet(0xD1, vec![0x7F, 0xF0]),
+        ext_packet(0xD5, vec![0x7F, 0xF0]),
+    ];
+    tx.send(DemuxBatch::Ps(batch)).unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+    let (frame, ev) = crate::testlog::capture(|| stream.read().unwrap());
+    assert!(frame.is_none());
+    let msgs: Vec<&str> = ev
+        .iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .map(|e| e.message())
+        .collect();
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert!(
+        msgs[0].contains("tag=mp2.extension stream_id=0xd1 packets=2"),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs[1].contains("tag=mp2.extension stream_id=0xd5 packets=1"),
+        "{msgs:?}"
+    );
+}
+
+/// A declared extension track (IFO coding mode 3) routes `0xD0|n` to its own track, each
+/// PES whole: 13818-3 `ext_frame`s are not Layer II frames (2nd ed. §2.5.2.10 "ext_syncword -
+/// A 12 bit string '0111 1111 1111'").
+#[test]
+fn declared_extension_track_carries_each_pes_whole() {
+    let mut title = DiscTitle::empty();
+    let ext = crate::disc::AudioStream {
+        pid: 0x00D1,
+        codec: Codec::Mp2,
+        channels: crate::disc::AudioChannels::Unknown,
+        language: "eng".into(),
+        sample_rate: crate::disc::SampleRate::S48,
+        secondary: false,
+        purpose: crate::disc::LabelPurpose::Normal,
+        label: crate::disc::MP2_EXTENSION_LABEL.into(),
+    };
+    title.streams.push(crate::disc::Stream::Audio(ext));
+    // The canonical builder both read paths use picks the parser.
+    let (parsers, pid_to_track, _, _) =
+        super::super::resolve::build_demux_state(&title, crate::disc::ContentFormat::MpegPs);
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+    // Bytes that look like a Layer II header (0xFFF sync, 256 kbit/s, 48 kHz) must neither
+    // split an ext PES nor be held back as the start of a longer frame.
+    let first = vec![0x7F, 0xF0, 0x12, 0xFF, 0xFD, 0xC4, 0x00, 0x34, 0x56];
+    let second = vec![0xFF, 0xFD, 0xC4, 0x00, 0x7F, 0xF0, 0x12];
+    tx.send(DemuxBatch::Ps(vec![
+        ext_packet(0xD1, first.clone()),
+        ext_packet(0xD1, second.clone()),
+    ]))
+    .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+    let mut got = Vec::new();
+    while let Some(f) = stream.read().unwrap() {
+        got.push((f.track, f.data));
+    }
+    assert_eq!(got, vec![(0, first), (0, second)]);
+}
+
+// consume_ps routes by the REAL DVD PID (via PsPacket::dvd_pid), e.g.
+// stream_id 0xBD sub-id 0x80 → PID 0xBD80. Unmappable (stream_id, sub_id)
+// is dropped, never mis-routed.
+#[test]
+fn ps_routing_uses_dvd_pid_and_drops_unmappable() {
+    let title = DiscTitle::empty();
+    // PID for AC-3 sub-id 0x80 is 0xBD00 | 0x80 = 0xBD80.
+    let counting = || -> Box<dyn CodecParser> {
+        Box::new(CountingParser {
+            per_pes: 1,
+            flush_n: 0,
+            cp: None,
+        })
+    };
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> =
+        vec![(0xBD80, counting()), (0x00C1, counting())];
+    let pid_to_track = vec![(0xBD80u16, 1usize), (0x00C1, 2)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    let mappable = PsPacket {
+        source: None,
+        stream_id: 0xBD,
+        sub_stream_id: Some(0x80),
+        pts: Some(90_000),
+        dts: None,
+        data: vec![0x12, 0x34],
+    };
+    // stream_id 0xC8: MPEG audio past DVD's 8 streams has no DVD PID → dropped.
+    let unmappable = PsPacket {
+        source: None,
+        stream_id: 0xC8,
+        sub_stream_id: None,
+        pts: None,
+        dts: None,
+        data: vec![0xFF],
+    };
+    // MPEG audio stream 1 (PES id 0xC1) routes to PID 0xC1, the scanner's MP2 PID.
+    let mp2 = PsPacket {
+        source: None,
+        stream_id: 0xC1,
+        sub_stream_id: None,
+        pts: Some(90_000),
+        dts: None,
+        data: vec![0x56],
+    };
+    tx.send(DemuxBatch::Ps(vec![mappable, unmappable, mp2]))
+        .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    let f = stream.read().unwrap().expect("one routed PS frame");
+    assert_eq!(f.track, 1, "routed by dvd_pid to track 1");
+    assert_eq!(f.data, vec![0x12, 0x34]);
+    let f = stream.read().unwrap().expect("routed MP2 frame");
+    assert_eq!((f.track, f.data), (2, vec![0x56]));
+    assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
+}
+
+// Frames the B1 gates dropped count as errors (as on the live DiscStream), but
+// are not lost read bytes: lost_bytes stays the blanked-unit total.
+#[test]
+fn errors_include_frames_the_resync_gate_dropped() {
+    use crate::pes::PesSource as _;
+    let (mut stream, _tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+    stream.resync.push(super::super::resync::ResyncGate::new());
+    let gate = stream.resync.last_mut().unwrap();
+    assert!(!gate.admit(true, true, false));
+    assert!(!gate.admit(true, false, false));
+    assert!(gate.admit(true, false, true));
+    assert_eq!(stream.errors(), 2, "dropped frames survive the resync");
+    assert_eq!(stream.lost_bytes(), 0, "no read bytes were lost");
+}
+
+// PS packets with no track (a deselected / undeclared stream, or no DVD PID) warn
+// once per stream id, not once per packet; the per-id tally goes out at EOF.
+#[test]
+fn dropped_ps_packets_warn_once_per_stream() {
+    let (mut stream, tx) = make_stream(DiscTitle::empty(), Vec::new(), Vec::new());
+    let pkt = |stream_id, sub_stream_id| PsPacket {
+        source: None,
+        stream_id,
+        sub_stream_id,
+        pts: None,
+        dts: None,
+        data: vec![0x0B, 0x77],
+    };
+    let mut batch = Vec::new();
+    for _ in 0..40 {
+        batch.push(pkt(0xBD, Some(0x81))); // unmapped PID 0xBD81
+        batch.push(pkt(0xBD, Some(0x82))); // unmapped PID 0xBD82
+        batch.push(pkt(0xC8, None)); // no DVD PID
+    }
+    tx.send(DemuxBatch::Ps(batch)).unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+    let (_, ev) = crate::testlog::capture(|| while stream.read().unwrap().is_some() {});
+    let warns = ev
+        .iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .count();
+    assert_eq!(warns, 3, "one WARN per dropped stream id, got {warns}");
+    let tally = ev
+        .iter()
+        .filter(|e| e.message().contains("packets=40"))
+        .count();
+    assert_eq!(tally, 3, "each stream's drop count is reported at EOF");
+}
+
+// Design §2.3 "Reader side (L3)" (MPG2-7): one AUD per field splits a PAFF field pair
+// into two AUs, the second with no PES PTS; it is merged back into its first field, so
+// the IR frame is the field pair and never a PTS-0 frame.
+#[test]
+fn a_pts_less_second_field_merges_into_its_first() {
+    use crate::mux::decode_ts::test_es::{H264Sps, h264_slice};
+    let sps = H264Sps {
+        frame_mbs_only: false,
+        ..H264Sps::default()
+    };
+    let mut title = DiscTitle::empty();
+    title.streams.push(crate::disc::Stream::Video(VideoStream {
+        pid: crate::mux::ps::DVD_VIDEO_PID,
+        codec: Codec::H264,
+        resolution: Resolution::R1080i,
+        frame_rate: FrameRate::F29_97,
+        hdr: HdrFormat::Sdr,
+        color_space: ColorSpace::Bt709,
+        display_aspect: None,
+        secondary: false,
+        label: String::new(),
+        measured_cicp: None,
+    }));
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        crate::mux::ps::DVD_VIDEO_PID,
+        Box::new(CountingParser {
+            per_pes: 1,
+            flush_n: 0,
+            cp: None,
+        }),
+    )];
+    let (mut stream, tx) = make_stream(
+        title,
+        parsers,
+        vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)],
+    );
+    let annexb = |nals: Vec<Vec<u8>>| {
+        let mut v = vec![0, 0, 1, 0x09, 0xF0];
+        for n in nals {
+            v.extend_from_slice(&[0, 0, 1]);
+            v.extend(n);
+        }
+        v
+    };
+    let au = [
+        annexb(vec![sps.nal(), h264_slice(&sps, true, 0, 0, Some(false))]),
+        annexb(vec![h264_slice(&sps, true, 0, 0, Some(true))]),
+        annexb(vec![h264_slice(&sps, false, 0, 1, Some(false))]),
+        annexb(vec![h264_slice(&sps, false, 0, 1, Some(true))]),
+        // A frame picture with no PES PTS is its own AU, never merged.
+        annexb(vec![h264_slice(&sps, false, 0, 2, None)]),
+    ];
+    let frag = |pts, data: &[u8]| PsPacket {
+        source: None,
+        stream_id: 0xE0,
+        sub_stream_id: None,
+        pts,
+        dts: None,
+        data: data.to_vec(),
+    };
+    tx.send(DemuxBatch::Ps(vec![
+        frag(Some(9_000), &au[0]),
+        frag(None, &au[1]),
+        frag(Some(12_003), &au[2]),
+        frag(None, &au[3]),
+        frag(None, &au[4]),
+    ]))
+    .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+    let mut out = Vec::new();
+    let mut pts = Vec::new();
+    while let Some(f) = stream.read().unwrap() {
+        out.push(f.data);
+        pts.push(f.pts);
+    }
+    assert_eq!(
+        out,
+        vec![
+            [au[0].clone(), au[1].clone()].concat(),
+            [au[2].clone(), au[3].clone()].concat(),
+            au[4].clone()
+        ]
+    );
+    // A merged pair keeps its FIRST field's PTS; only the PTS-less frame reads 0.
+    assert_eq!(pts, [9_000, 12_003, 0]);
+}
+
+// Single-video-stream title on `codec` + CountingParser; feeds three 0xE0
+// PS fragments forming TWO AUD-delimited AUs (only AU-start has a PTS).
+// Returns every emitted frame.
+fn run_ps_fragments(codec: Codec) -> Vec<crate::pes::PesFrame> {
+    let mut title = DiscTitle::empty();
+    title.streams.push(crate::disc::Stream::Video(VideoStream {
+        pid: crate::mux::ps::DVD_VIDEO_PID,
+        codec,
+        resolution: Resolution::R1080p,
+        frame_rate: FrameRate::F23_976,
+        hdr: HdrFormat::Sdr,
+        color_space: ColorSpace::Bt709,
+        display_aspect: None,
+        secondary: false,
+        label: String::new(),
+        measured_cicp: None,
+    }));
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        crate::mux::ps::DVD_VIDEO_PID,
+        Box::new(CountingParser {
+            per_pes: 1,
+            flush_n: 0,
+            cp: None,
+        }),
+    )];
+    let pid_to_track = vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    let frag = |pts, data: &[u8]| PsPacket {
+        source: None,
+        stream_id: 0xE0,
+        sub_stream_id: None,
+        pts,
+        dts: None,
+        data: data.to_vec(),
+    };
+    tx.send(DemuxBatch::Ps(vec![
+        frag(Some(9_000), &[0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xAA]), // AU1: AUD + slice head
+        frag(None, &[0xBB, 0xCC]),                                      // AU1: slice tail (no PTS)
+        frag(Some(18_000), &[0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xDD]), // AU2 opener (AUD closes AU1)
+    ]))
+    .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    let mut out = Vec::new();
+    while let Some(f) = stream.read().unwrap() {
+        out.push(f);
+    }
+    out
+}
+
+// PS-path integration: fragmented H.264 AU (only first fragment has PTS)
+// must be REJOINED into one AU-complete PES with the AU-START pts, not
+// per-fragment frames at pts 0 (the HD-DVD truncation bug).
+#[test]
+fn ps_h264_au_split_across_fragments_reassembles_to_one_frame() {
+    let frames = run_ps_fragments(Codec::H264);
+    assert_eq!(
+        frames.len(),
+        2,
+        "3 fragments → 2 access units, not 3 frames"
+    );
+    assert_eq!(frames[0].track, 0);
+    assert_eq!(
+        frames[0].data,
+        vec![0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xAA, 0xBB, 0xCC],
+        "AU1 = fragment1 + fragment2 rejoined"
+    );
+    assert_eq!(
+        frames[0].pts, 9_000,
+        "AU carries its START pts, not the mid-fragment None→0"
+    );
+    assert_eq!(
+        frames[1].data,
+        vec![0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xDD],
+        "AU2 flushed at EOF (no following boundary)"
+    );
+    assert_eq!(frames[1].pts, 18_000);
+}
+
+// Contrast: self-framing MPEG-2 uses a Passthrough assembler — the same
+// three fragments pass straight through as three frames, proving
+// reassembly is gated by codec.
+#[test]
+fn ps_self_framing_codec_is_not_reassembled() {
+    let frames = run_ps_fragments(Codec::Mpeg2);
+    assert_eq!(
+        frames.len(),
+        3,
+        "MPEG-2 passthrough: one frame per fragment"
+    );
+    assert_eq!(frames[0].pts, 9_000);
+    assert_eq!(
+        frames[1].pts, 0,
+        "mid-fragment has no PTS under passthrough"
+    );
+    assert_eq!(frames[2].pts, 18_000);
+}
+
+// A batch with no trackable packets must not end the stream early —
+// pump_one_batch loops to the next batch (skip first, deliver second).
+#[test]
+fn empty_batch_does_not_end_stream_early() {
+    let title = DiscTitle::empty();
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1100,
+        Box::new(CountingParser {
+            per_pes: 1,
+            flush_n: 0,
+            cp: None,
+        }),
+    )];
+    let pid_to_track = vec![(0x1100u16, 0usize)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    // First batch: only an untracked PID → yields zero frames.
+    tx.send(DemuxBatch::Ts(vec![ts_pes(0x4444, vec![0x00])]))
+        .unwrap();
+    // Second batch: tracked PID → one frame.
+    tx.send(DemuxBatch::Ts(vec![ts_pes(0x1100, vec![0x55])]))
+        .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    let f = stream.read().unwrap().expect("frame from the second batch");
+    assert_eq!(f.data, vec![0x55], "did not stop on the empty first batch");
+}
+
+fn video_title(secondary: bool) -> DiscTitle {
+    let mut t = DiscTitle::empty();
+    t.streams.push(crate::disc::Stream::Video(VideoStream {
+        pid: 0x1011,
+        codec: Codec::Hevc,
+        resolution: Resolution::R2160p,
+        frame_rate: FrameRate::F23_976,
+        hdr: HdrFormat::Hdr10,
+        color_space: ColorSpace::Bt2020,
+        display_aspect: None,
+        secondary,
+        label: String::new(),
+        measured_cicp: None,
+    }));
+    t
+}
+
+/// headers_ready() is false for a PRIMARY video track until its parser
+/// produces codec_private — MKV can't write the container header without
+/// init data, so the consumer must keep buffering.
+#[test]
+fn headers_not_ready_when_primary_video_lacks_codec_private() {
+    let title = video_title(false);
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1011,
+        Box::new(CountingParser {
+            per_pes: 0,
+            flush_n: 0,
+            cp: None, // no codec_private yet
+        }),
+    )];
+    let pid_to_track = vec![(0x1011u16, 0usize)];
+    let (stream, _tx) = make_stream(title, parsers, pid_to_track);
+    assert!(
+        !stream.headers_ready(),
+        "primary video w/o codec_private not ready"
+    );
+}
+
+/// headers_ready() flips true once the primary video parser exposes
+/// codec_private.
+#[test]
+fn headers_ready_when_primary_video_has_codec_private() {
+    let title = video_title(false);
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1011,
+        Box::new(CountingParser {
+            per_pes: 0,
+            flush_n: 0,
+            cp: Some(vec![0x01, 0x02, 0x03]),
+        }),
+    )];
+    let pid_to_track = vec![(0x1011u16, 0usize)];
+    let (stream, _tx) = make_stream(title, parsers, pid_to_track);
+    assert!(stream.headers_ready(), "codec_private present → ready");
+    // codec_private(track) resolves track→PID→parser and returns the data.
+    assert_eq!(
+        stream.codec_private(0).as_deref(),
+        Some(&[0x01, 0x02, 0x03][..])
+    );
+}
+
+/// A SECONDARY video track without codec_private must NOT block
+/// headers_ready() — the `!v.secondary` guard means PiP/secondary video
+/// is exempt from the init-data gate.
+#[test]
+fn headers_ready_ignores_secondary_video_without_codec_private() {
+    let title = video_title(true); // secondary = true
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1011,
+        Box::new(CountingParser {
+            per_pes: 0,
+            flush_n: 0,
+            cp: None,
+        }),
+    )];
+    let pid_to_track = vec![(0x1011u16, 0usize)];
+    let (stream, _tx) = make_stream(title, parsers, pid_to_track);
+    assert!(
+        stream.headers_ready(),
+        "secondary video is exempt from the codec_private gate"
+    );
+}
+
+/// A codec whose ES carries no init data (FLAC, Opus) keeps the CodecPrivate
+/// the source header supplied (FMKV `m2ts://`) when its parser has none.
+#[test]
+fn codec_private_falls_back_to_the_source_title() {
+    let mut title = video_title(false);
+    title.codec_privates = vec![Some(b"fLaC".to_vec())];
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1011,
+        Box::new(CountingParser {
+            per_pes: 0,
+            flush_n: 0,
+            cp: None,
+        }),
+    )];
+    let (stream, _tx) = make_stream(title, parsers, vec![(0x1011u16, 0usize)]);
+    assert_eq!(stream.codec_private(0).as_deref(), Some(&b"fLaC"[..]));
+}
+
+/// codec_private(track) returns None for a track index not present in
+/// pid_to_track — no panic, no wrong-track data.
+#[test]
+fn codec_private_none_for_unmapped_track() {
+    let (stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+    assert_eq!(stream.codec_private(7), None);
+}
+
+/// An audio-only title (no video streams) is always headers_ready — the
+/// codec_private gate only applies to primary video.
+#[test]
+fn headers_ready_true_for_audio_only_title() {
+    let mut title = DiscTitle::empty();
+    title.streams.push(crate::disc::Stream::Audio(AudioStream {
+        pid: 0x1100,
+        codec: Codec::Ac3,
+        channels: AudioChannels::Surround51,
+        language: "eng".into(),
+        sample_rate: SampleRate::S48,
+        secondary: false,
+        purpose: LabelPurpose::Normal,
+        label: String::new(),
+    }));
+    let (stream, _tx) = make_stream(title, vec![], vec![]);
+    assert!(stream.headers_ready(), "no video → always ready");
+}
+
+// --- AAC AudioSpecificConfig must exist before headers are finalised ---
+
+fn aac_audio(pid: u16) -> crate::disc::Stream {
+    crate::disc::Stream::Audio(AudioStream {
+        pid,
+        codec: Codec::Aac,
+        channels: AudioChannels::Stereo,
+        language: "eng".into(),
+        sample_rate: SampleRate::S44_1,
+        secondary: false,
+        purpose: LabelPurpose::Normal,
+        label: String::new(),
+    })
+}
+
+/// Valid AAC-LC 44.1 kHz stereo ADTS frame (ASC = 0x12 0x10).
+fn adts(payload: usize) -> Vec<u8> {
+    let len = 7 + payload;
+    let mut f = vec![0u8; len];
+    f[..3].copy_from_slice(&[0xFF, 0xF1, 0x50]);
+    f[3] = 0x80 | ((len >> 11) & 3) as u8;
+    f[4] = ((len >> 3) & 0xFF) as u8;
+    f[5] = (((len & 7) << 5) as u8) | 0x1F;
+    f[6] = 0xFC;
+    f
+}
+
+fn pes_at(pid: u16, data: Vec<u8>, pts: i64) -> PesPacket {
+    PesPacket {
+        pts: Some(pts),
+        ..ts_pes(pid, data)
+    }
+}
+
+fn video_plus_aac() -> (PipelinedPesStream, Sender<DemuxBatch>) {
+    let mut title = video_title(false);
+    title.streams.push(aac_audio(0x1100));
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![
+        (
+            0x1011,
+            Box::new(CountingParser {
+                per_pes: 1,
+                flush_n: 0,
+                cp: Some(vec![1]),
+            }),
+        ),
+        (
+            0x1100,
+            Box::new(super::super::codec::adts::AdtsParser::new()),
+        ),
+    ];
+    make_stream(title, parsers, vec![(0x1011, 0), (0x1100, 1)])
+}
+
+// Video-first TS: the video config resolves before any AAC frame. Finalising
+// then wrote A_AAC with no CodecPrivate over header-stripped frames.
+#[test]
+fn headers_wait_for_aac_config_when_video_arrives_first() {
+    let (mut stream, tx) = video_plus_aac();
+    tx.send(DemuxBatch::Ts(vec![pes_at(0x1011, vec![0; 8], 90_000)]))
+        .unwrap();
+    assert_eq!(stream.read().unwrap().map(|f| f.track), Some(0));
+    assert!(
+        !stream.headers_ready(),
+        "AAC track has no AudioSpecificConfig yet"
+    );
+    tx.send(DemuxBatch::Ts(vec![pes_at(0x1100, adts(16), 90_000)]))
+        .unwrap();
+    assert_eq!(stream.read().unwrap().map(|f| f.track), Some(1));
+    assert!(stream.headers_ready());
+    assert_eq!(stream.codec_private(1), Some(vec![0x12, 0x10]));
+}
+
+// A mid-stream AAC config change must be visible per track, not only in
+// the parser.
+#[test]
+fn mid_stream_aac_config_change_is_reported_per_track() {
+    let (mut stream, tx) = video_plus_aac();
+    let mut surround = adts(16);
+    surround[2] |= 1; // channel_configuration = 6
+    surround[3] = (surround[3] & 0x3F) | (2 << 6);
+    tx.send(DemuxBatch::Ts(vec![
+        pes_at(0x1100, adts(16), 0),
+        pes_at(0x1100, surround, 1920),
+    ]))
+    .unwrap();
+    assert!(stream.read().unwrap().is_some());
+    assert!(stream.read().unwrap().is_some());
+    assert_eq!(stream.config_changes(), vec![(1, 1)]);
+}
+
+#[test]
+fn audio_only_aac_title_waits_for_config() {
+    let mut title = DiscTitle::empty();
+    title.streams.push(aac_audio(0x1100));
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+        0x1100,
+        Box::new(super::super::codec::adts::AdtsParser::new()),
+    )];
+    let (mut stream, tx) = make_stream(title, parsers, vec![(0x1100, 0)]);
+    assert!(!stream.headers_ready(), "no AAC frame yet → no ASC");
+    tx.send(DemuxBatch::Ts(vec![pes_at(0x1100, adts(16), 0)]))
+        .unwrap();
+    assert!(stream.read().unwrap().is_some());
+    assert!(stream.headers_ready());
+}
+
+// An AAC track that never yields a frame must not stall the header pump
+// until the buffer cap: the wait is bounded by source time and by EOF.
+#[test]
+fn silent_aac_track_stops_blocking_headers_after_the_wait_bound() {
+    let (mut stream, tx) = video_plus_aac();
+    // CountingParser passes PES pts through as ns: 1 s steps.
+    for sec in 0..5i64 {
+        tx.send(DemuxBatch::Ts(vec![pes_at(
+            0x1011,
+            vec![0; 8],
+            sec * 1_000_000_000,
+        )]))
+        .unwrap();
+        stream.read().unwrap();
+        assert!(!stream.headers_ready(), "{sec} s: still waiting");
+    }
+    tx.send(DemuxBatch::Ts(vec![pes_at(
+        0x1011,
+        vec![0; 8],
+        5_000_000_000,
+    )]))
+    .unwrap();
+    stream.read().unwrap();
+    assert!(stream.headers_ready(), "wait bound reached");
+    assert_eq!(stream.codec_private(1), None);
+}
+
+#[test]
+fn silent_aac_track_does_not_block_headers_at_eof() {
+    let (mut stream, tx) = video_plus_aac();
+    tx.send(DemuxBatch::Ts(vec![pes_at(0x1011, vec![0; 8], 0)]))
+        .unwrap();
+    tx.send(DemuxBatch::Eof).unwrap();
+    stream.read().unwrap();
+    assert!(!stream.headers_ready());
+    assert!(stream.read().unwrap().is_none());
+    assert!(stream.headers_ready(), "EOF: no AAC frame will ever come");
+}
+
+// --- DVD highway: keyframe flag must survive the PS → parser → frame path ---
+
+/// Build a minimal MPEG-2 720x480/29.97 sequence header.
+fn m2_seq_header() -> Vec<u8> {
+    let (w, h, aspect, fr): (u16, u16, u8, u8) = (720, 480, 2, 4);
+    let mut hdr = vec![0x00, 0x00, 0x01, 0xB3u8];
+    hdr.push((w >> 4) as u8);
+    hdr.push((((w & 0x0F) as u8) << 4) | (((h >> 8) & 0x0F) as u8));
+    hdr.push((h & 0xFF) as u8);
+    hdr.push((aspect << 4) | (fr & 0x0F));
+    hdr.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x00]);
+    hdr
+}
+fn m2_gop() -> Vec<u8> {
+    vec![0x00, 0x00, 0x01, 0xB8u8, 0x00, 0x00, 0x00, 0x00]
+}
+/// Frame-picture AU: picture header (coding_type, temporal_reference) +
+/// coding extension (frame picture, 2 fields) + slice.
+fn m2_pic(coding_type: u8, tr: u16) -> Vec<u8> {
+    let b4 = ((tr >> 2) & 0xFF) as u8;
+    let b5 = (((tr & 0x03) as u8) << 6) | ((coding_type & 0x07) << 3);
+    let mut au = vec![0x00, 0x00, 0x01, 0x00u8, b4, b5, 0x00, 0x00];
+    au.extend_from_slice(&[0x00, 0x00, 0x01, 0xB5u8, 0x80, 0x00, 0x03, 0x00, 0x80]);
+    au.extend_from_slice(&[0xAA; 32]);
+    au
+}
+
+// DVD seek-index regression at the HIGHWAY level (PsDemuxer → PipelinedPesStream → frame
+// out). Keyframe flag/duration must survive so the muxer's cluster/cue logic fires.
+#[test]
+fn dvd_highway_preserves_video_keyframe_and_duration() {
+    use crate::mux::codec::mpeg2::Mpeg2Parser;
+
+    let mut title = DiscTitle::empty();
+    title.streams.push(crate::disc::Stream::Video(VideoStream {
+        pid: crate::mux::ps::DVD_VIDEO_PID,
+        codec: Codec::Mpeg2,
+        resolution: Resolution::R480i,
+        frame_rate: FrameRate::F29_97,
+        hdr: HdrFormat::Sdr,
+        color_space: ColorSpace::Bt709,
+        display_aspect: Some((4, 3)),
+        secondary: false,
+        label: String::new(),
+        measured_cicp: None,
+    }));
+    let parsers: Vec<(u16, Box<dyn CodecParser>)> =
+        vec![(crate::mux::ps::DVD_VIDEO_PID, Box::new(Mpeg2Parser::new()))];
+    let pid_to_track = vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)];
+    let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+    // 6 GOPs × 12 frames, each GOP one PS batch with one PTS-stamped video
+    // PES (stream_id 0xE0 → DVD_VIDEO_PID). Decode order I + P/B.
+    let field_ns = 1_000_000_000i64 * 1001 / 30000 / 2;
+    let frame_ns = 2 * field_ns;
+    let gop_len = 12u16;
+    for g in 0..6i64 {
+        let mut es = m2_seq_header();
+        es.extend_from_slice(&m2_gop());
+        es.extend_from_slice(&m2_pic(1, 0)); // I-frame, keyframe
+        for tr in 1..gop_len {
+            let ct = if tr % 3 == 0 { 2 } else { 3 };
+            es.extend_from_slice(&m2_pic(ct, tr));
+        }
+        let gop_pts = (g * gop_len as i64 * frame_ns * 90_000 / 1_000_000_000) as u64;
+        tx.send(DemuxBatch::Ps(vec![PsPacket {
+            source: None,
+            stream_id: 0xE0,
+            sub_stream_id: None,
+            pts: Some(gop_pts),
+            dts: None,
+            data: es,
+        }]))
+        .unwrap();
+    }
+    tx.send(DemuxBatch::Eof).unwrap();
+
+    // Drain every frame THROUGH the highway's read().
+    let mut frames = Vec::new();
+    while let Some(f) = stream.read().unwrap() {
+        frames.push(f);
+    }
+
+    assert!(!frames.is_empty(), "highway produced no frames");
+    let keyframes = frames.iter().filter(|f| f.keyframe).count();
+    let dur_some = frames.iter().filter(|f| f.duration_ns.is_some()).count();
+    assert_eq!(
+        keyframes, 6,
+        "the 6 GOP-opening I-frames must arrive as keyframes THROUGH the \
+             highway (one per GOP); got {keyframes} — if 0, the keyframe flag \
+             is being lost in the pipelined path and the DVD seek index dies"
+    );
+    assert_eq!(
+        dur_some,
+        frames.len(),
+        "every DVD VFR frame must carry its duration through the highway \
+             (BlockGroup path)"
+    );
+    assert!(
+        frames.iter().all(|f| f.track == 0),
+        "video routed to track 0 (cluster/cue open requires track 0)"
+    );
+}

@@ -1,0 +1,1256 @@
+use super::super::crypto::aes_ecb_decrypt;
+use super::*;
+use aes::cipher::BlockCipherEncrypt; // test fixtures build ciphertext directly
+
+// [`encrypt_unit`] must be the exact inverse of [`decrypt_unit`]: dropping
+// the trailing `⊕ header` from either's Block Key derivation, or swapping
+// `AACS_IV` for zeroes in one, must make this test fail.
+#[test]
+fn encrypt_unit_is_the_exact_inverse_of_decrypt_unit() {
+    let key = [0x3Cu8; 16];
+    // Content with no all-zero packets: every byte position exercised.
+    let mut clear: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+        .map(|i| (i * 7 % 251 + 1) as u8)
+        .collect();
+    // The encrypted flag belongs to the caller and must be set BEFORE the
+    // crypto, since bytes 0..16 are the key seed.
+    clear[0] |= 0xC0;
+
+    let mut unit = clear.clone();
+    assert!(
+        encrypt_unit(&mut unit, &key),
+        "a full-length unit must encrypt"
+    );
+    assert_ne!(
+        unit[16..],
+        clear[16..],
+        "the payload must actually be enciphered"
+    );
+    assert_eq!(
+        unit[..16],
+        clear[..16],
+        "the 16-byte seed stays plaintext on disc"
+    );
+
+    decrypt_unit(&mut unit, &key);
+    assert_eq!(unit, clear, "round trip must be byte-exact");
+}
+
+// A too-short slice must SAY so (return false), not silently no-op: the
+// caller has already set the encrypted flag by contract (flag-before-crypto),
+// so a silent failure would leave a unit flagged encrypted but still plaintext.
+#[test]
+fn encrypt_unit_reports_a_slice_too_short_to_encrypt() {
+    let key = [0x11u8; 16];
+    let mut short = vec![0u8; ALIGNED_UNIT_LEN - 1];
+    short[0] |= 0xC0; // the caller already flagged it encrypted
+    let before = short.clone();
+    assert!(
+        !encrypt_unit(&mut short, &key),
+        "a short slice must report false, not silently succeed"
+    );
+    assert_eq!(
+        short, before,
+        "a refused encrypt must leave the buffer untouched"
+    );
+
+    // Exactly ALIGNED_UNIT_LEN is the boundary and must succeed.
+    let mut exact = vec![0u8; ALIGNED_UNIT_LEN];
+    exact[0] |= 0xC0;
+    assert!(encrypt_unit(&mut exact, &key), "a full unit must encrypt");
+}
+
+// Pins the deliberate padding asymmetry: `decrypt_unit` zeroes all-zero-ON-DISC
+// packets, but an all-zero PLAINTEXT packet enciphers to non-zero bytes, so
+// it's never mistaken for padding and still round-trips exactly.
+#[test]
+fn encrypt_unit_round_trips_all_zero_plaintext_packets() {
+    let key = [0xA5u8; 16];
+    let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
+    clear[0] |= 0xC0; // flag before crypto
+    // Give packet 0 some content; leave every later packet entirely zero.
+    for (i, b) in clear[16..192].iter_mut().enumerate() {
+        *b = (i % 255 + 1) as u8;
+    }
+
+    let mut unit = clear.clone();
+    assert!(
+        encrypt_unit(&mut unit, &key),
+        "a full-length unit must encrypt"
+    );
+    // No later packet may encipher to all-zero, or decrypt would treat it as
+    // source padding and the asymmetry would bite.
+    for p in 1..ALIGNED_UNIT_LEN / BD_SOURCE_PACKET_BYTES {
+        let off = p * BD_SOURCE_PACKET_BYTES;
+        assert!(
+            unit[off..off + BD_SOURCE_PACKET_BYTES]
+                .iter()
+                .any(|&b| b != 0),
+            "packet {p} enciphered to all-zero, which decrypt reads as padding"
+        );
+    }
+
+    decrypt_unit(&mut unit, &key);
+    assert_eq!(unit, clear, "zero-payload packets must round trip exactly");
+}
+
+#[test]
+fn test_aes_ecb_roundtrip() {
+    let key = [
+        0x15u8, 0x66, 0x5F, 0x98, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+        0x0C,
+    ];
+    let plain = [0x41u8; 16];
+    let enc = aes_ecb_encrypt(&key, &plain);
+    let dec = aes_ecb_decrypt(&key, &enc);
+    assert_eq!(dec, plain);
+}
+
+#[test]
+fn is_unit_aligned_relative_to_base() {
+    // Aligned at the base and every 3 sectors above it; misaligned between.
+    assert!(is_unit_aligned(100, 100), "base itself is aligned");
+    assert!(is_unit_aligned(103, 100), "one unit past base is aligned");
+    assert!(is_unit_aligned(106, 100));
+    assert!(!is_unit_aligned(101, 100));
+    assert!(!is_unit_aligned(102, 100));
+    // Non-3-aligned base: alignment is RELATIVE to the base, not absolute.
+    assert!(is_unit_aligned(101, 101), "non-3-aligned base is aligned");
+    assert!(is_unit_aligned(104, 101));
+    assert!(!is_unit_aligned(102, 101));
+}
+
+#[test]
+fn is_unit_aligned_lba_below_base_is_well_defined() {
+    // Latent-trap contract (rc.5.2 audit #5): if `lba < unit_base` the result must
+    // be well-defined, NOT `wrapping_sub` underflow (2^32 ≡ 1 mod 3 falsely
+    // reports alignment). `saturating_sub` clamps to 0, a unit boundary.
+    assert!(
+        is_unit_aligned(99, 100),
+        "lba just below base must not wrap"
+    );
+    assert!(is_unit_aligned(98, 100));
+    assert!(is_unit_aligned(0, 100));
+    // The specific wrapping_sub trap value: unit_base - 1. With wrapping_sub
+    // this is 0xFFFF_FFFF % 3 == 0 → falsely "aligned" by underflow; with
+    // saturating_sub it is genuinely 0 → aligned, for the right reason.
+    assert!(is_unit_aligned(u32::MAX, u32::MAX)); // base == lba, trivially aligned
+    assert!(
+        is_unit_aligned(0, u32::MAX),
+        "max base, lba 0 must saturate to 0"
+    );
+}
+
+#[test]
+fn clear_unit_is_not_flagged_encrypted() {
+    // `decrypt_unit` is PURE (applies the key unconditionally); "leave a clear
+    // unit untouched" lives at the caller's gate. A clear TS unit (CPI bits
+    // clear, syncs intact) must report NOT-encrypted so the caller skips decrypt_unit.
+    let ts = crate::disc::ContentFormat::BdTs;
+    let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < ALIGNED_UNIT_LEN {
+        unit[off] = TS_SYNC;
+        off += BD_SOURCE_PACKET_BYTES;
+    }
+    assert!(crate::aacs::content::is_clean(
+        &unit,
+        crate::disc::ContentFormat::BdTs
+    ));
+    assert!(
+        !aacs_unit_encrypted(&unit, ts),
+        "byte-0 CPI clear ⇒ not flagged encrypted"
+    );
+    assert!(
+        !aacs_unit_needs_decrypt(&unit, ts),
+        "a clear unit needs no decrypt ⇒ caller skips decrypt_unit"
+    );
+}
+
+#[test]
+fn ts_packet_total_no_off_by_one() {
+    // Max sync count = stride positions visited (offset 4, 196, ...) = len/192,
+    // NOT (len-4)/192+1. For the 6144-byte unit, offsets 4..=5956 → 32 positions.
+    let unit = vec![0u8; ALIGNED_UNIT_LEN];
+    assert_eq!(ts_packet_total(&unit), 32);
+    // Confirm the loop visits exactly that many stride positions.
+    let visited = (4..ALIGNED_UNIT_LEN)
+        .step_by(BD_SOURCE_PACKET_BYTES)
+        .count();
+    assert_eq!(visited, ts_packet_total(&unit));
+}
+
+#[test]
+fn is_clean_min4_proof_floor() {
+    // ONE rule: clean iff `synced >= min(E, 4)` over ENCRYPTED (non-padding)
+    // packets — E>4 needs any 4, E<=4 needs all present. Build NON-ZERO payloads
+    // so every packet counts toward E; place syncs among packets 1..31 (0 skipped).
+    let unit_with = |synced: usize| {
+        let mut unit: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+            .map(|i| ((i * 7 + 1) as u8) | 1)
+            .collect();
+        // Scrub any accidental 0x47 at a sync position, then place exactly
+        // `synced` real syncs in packets 1.. (skip packet 0).
+        let mut off = BD_SOURCE_PACKET_BYTES + 4;
+        let mut placed = 0;
+        while off < ALIGNED_UNIT_LEN {
+            unit[off] = if placed < synced { TS_SYNC } else { 0x46 };
+            placed += 1;
+            off += BD_SOURCE_PACKET_BYTES;
+        }
+        unit
+    };
+    // E = 31 content packets (all non-zero) → threshold min(31,4) = 4.
+    assert!(
+        !crate::aacs::content::is_clean(&unit_with(3), crate::disc::ContentFormat::BdTs),
+        "3 synced of a well-populated unit is below the proof floor → not clean"
+    );
+    assert!(
+        crate::aacs::content::is_clean(&unit_with(4), crate::disc::ContentFormat::BdTs),
+        "4 synced proves the key opened it, even with many bad-encoded packets"
+    );
+    // The old >50% majority would have called `unit_with(4)` scrambled (4/31
+    // < half) — that false-flag was the mux key-server storm. min(E,4) fixes it.
+}
+
+#[test]
+fn scramble_detection_extremes() {
+    // A fully-clear unit (every packet synced) is clean; a fully-scrambled
+    // unit (non-zero ciphertext, NO syncs) is not. (An all-zero buffer is
+    // empty padding — E==0 — which `is_clean` treats as clean, NOT scrambled.)
+    let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < ALIGNED_UNIT_LEN {
+        clear[off] = TS_SYNC;
+        off += BD_SOURCE_PACKET_BYTES;
+    }
+    assert!(
+        crate::aacs::content::is_clean(&clear, crate::disc::ContentFormat::BdTs),
+        "fully-clear unit → clean"
+    );
+
+    // Real scrambled ciphertext: non-zero everywhere, no 0x47 at any sync slot.
+    let mut scrambled: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+        .map(|i| ((i * 13 + 3) as u8) | 1)
+        .collect();
+    let mut off = 4;
+    while off < ALIGNED_UNIT_LEN {
+        if scrambled[off] == TS_SYNC {
+            scrambled[off] = 0x46;
+        }
+        off += BD_SOURCE_PACKET_BYTES;
+    }
+    assert!(
+        !crate::aacs::content::is_clean(&scrambled, crate::disc::ContentFormat::BdTs),
+        "non-zero body with no syncs → scrambled"
+    );
+}
+
+#[test]
+fn test_aes_cbc_roundtrip() {
+    let key = [
+        0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        0x00,
+    ];
+    let original = vec![0x42u8; 128]; // 8 blocks
+    let mut data = original.clone();
+
+    // Encrypt with the REAL production primitive. This test previously defined a
+    // local `fn aes_cbc_encrypt` that SHADOWED it, round-tripping a copy of the
+    // algorithm against itself — a mutation to the shipped function couldn't fail it.
+    aes_cbc_encrypt(&key, &mut data);
+    assert_ne!(data, original); // should be different after encrypt
+
+    super::aes_cbc_decrypt(&key, &mut data);
+    assert_eq!(data, original); // should match after roundtrip
+}
+
+#[test]
+fn test_decrypt_unit_synthetic() {
+    // Build a fake 6144-byte aligned unit with known TS sync pattern,
+    // encrypt it with the AACS algorithm, then decrypt and verify.
+    let unit_key = [0xAAu8; 16];
+
+    // Build plaintext unit with TS sync bytes every 192 bytes starting at offset 4
+    let mut plain = vec![0u8; ALIGNED_UNIT_LEN];
+    let mut offset = 4;
+    while offset < ALIGNED_UNIT_LEN {
+        plain[offset] = TS_SYNC;
+        offset += BD_SOURCE_PACKET_BYTES;
+    }
+    // Flag the unit encrypted via the CPI bits (byte 0) — the authoritative
+    // gate `decrypt_unit` now consults. Set before key derivation so the
+    // recovered plaintext header matches.
+    plain[0] |= 0xC0;
+
+    // Now encrypt bytes 16..6143 using the AACS algorithm (reverse of decrypt)
+    let header: [u8; 16] = plain[..16].try_into().unwrap();
+    let derived = aes_ecb_encrypt(&unit_key, &header);
+    let mut encrypt_key = [0u8; 16];
+    for i in 0..16 {
+        encrypt_key[i] = derived[i] ^ header[i];
+    }
+
+    // CBC encrypt bytes 16..6143
+    let cipher = Aes128::new(&encrypt_key.into());
+    let mut prev = AACS_IV;
+    let num_blocks = (ALIGNED_UNIT_LEN - 16) / 16;
+    for i in 0..num_blocks {
+        let off = 16 + i * 16;
+        for j in 0..16 {
+            plain[off + j] ^= prev[j];
+        }
+        let mut chunk = [0u8; 16];
+        chunk.copy_from_slice(&plain[off..off + 16]);
+        let mut block: Array<u8, _> = chunk.into();
+        cipher.encrypt_block(&mut block);
+        plain[off..off + 16].copy_from_slice(&block);
+        prev.copy_from_slice(&plain[off..off + 16]);
+    }
+
+    // Now plain contains encrypted data. Decrypt it.
+    let mut unit = plain;
+    assert!(!crate::aacs::content::is_clean(
+        &unit,
+        crate::disc::ContentFormat::BdTs
+    ));
+    decrypt_unit(&mut unit, &unit_key);
+    assert!(crate::aacs::content::is_clean(
+        &unit,
+        crate::disc::ContentFormat::BdTs
+    )); // decrypted: TS syncs restored
+
+    // Verify TS sync bytes
+    let mut count = 0;
+    let mut off = 4;
+    while off < ALIGNED_UNIT_LEN {
+        if unit[off] == TS_SYNC {
+            count += 1;
+        }
+        off += BD_SOURCE_PACKET_BYTES;
+    }
+    // Assert against the single canonical packet count, not the old
+    // `(len - 4) / 192 + 1` form that `ts_packet_total` corrected away from.
+    assert_eq!(count, ts_packet_total(&unit));
+}
+
+// ── Helpers for the hardening tests below ──────────────────────────────
+
+// Encrypt an aligned unit so [`decrypt_unit`] with the same `unit_key`
+// recovers the plaintext — the test-fixture wrapper around `encrypt_unit`.
+fn aacs_encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
+    // Delegate to the module-scope `pub(crate)` helper (the single encrypt
+    // implementation, shared with the mux `driver.rs` decrypt test).
+    unit[0] |= 0xC0;
+    assert!(
+        super::encrypt_unit(unit, unit_key),
+        "a full-length unit must encrypt"
+    );
+}
+
+/// Build a clear aligned unit with TS sync bytes at offset 4 + k*192.
+fn clear_unit() -> Vec<u8> {
+    let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < ALIGNED_UNIT_LEN {
+        unit[off] = TS_SYNC;
+        off += BD_SOURCE_PACKET_BYTES;
+    }
+    unit
+}
+
+// ── Padding-aware IsDecryptable (fragment-tail recovery) ───────────────
+// A fragment can end mid-unit, zero-padded to the next fragment. `decrypt_unit`
+// must accept a zero tail (padding) but REJECT a non-zero tail (misread/wrong key).
+
+/// Encrypt a full clear unit under `unit_key`, then overwrite the tail (from
+/// packet `keep` onward) with `fill`. `0x00` models disc fragment padding; a
+/// non-zero `fill` models a corrupt/misread tail.
+fn tail_filled_unit(unit_key: &[u8; 16], keep_pkts: usize, fill: u8) -> Vec<u8> {
+    let mut unit = clear_unit();
+    aacs_encrypt_unit(&mut unit, unit_key);
+    for b in unit[keep_pkts * BD_SOURCE_PACKET_BYTES..].iter_mut() {
+        *b = fill;
+    }
+    unit
+}
+
+#[test]
+fn decryptable_full_content_unit_under_correct_key() {
+    let key = [0x5Au8; 16];
+    let mut unit = clear_unit();
+    aacs_encrypt_unit(&mut unit, &key);
+    decrypt_unit(&mut unit, &key);
+    assert_eq!(
+        ts_sync_count(&unit),
+        32,
+        "the right key recovered the plaintext (all 32 syncs restored)"
+    );
+}
+
+#[test]
+fn fragment_tail_with_source_zero_pad_is_decryptable() {
+    // 11 real content packets, then source-zero padding (a real-disc fragment shape).
+    let key = [0x5Au8; 16];
+    let mut unit = tail_filled_unit(&key, 11, 0x00);
+    decrypt_unit(&mut unit, &key);
+    for p in 0..11 {
+        assert_eq!(
+            unit[p * BD_SOURCE_PACKET_BYTES + 4],
+            TS_SYNC,
+            "content pkt {p} restored its sync"
+        );
+    }
+    // Padding emitted as clean zeros, not decrypted garbage.
+    for p in 11..32 {
+        let off = p * BD_SOURCE_PACKET_BYTES;
+        assert!(
+            unit[off..off + BD_SOURCE_PACKET_BYTES]
+                .iter()
+                .all(|&b| b == 0),
+            "padding pkt {p} zeroed"
+        );
+    }
+}
+
+#[test]
+fn fragment_tail_with_nonzero_garbage_decrypts_the_real_prefix() {
+    // Same shape, but the tail is NON-zero garbage. The crypto still recovers
+    // the 11 real packets; the muxer drops the garbage tail on sync-loss (a
+    // genuine bad sector is caught by the read layer/mapfile, never TS structure).
+    let key = [0x5Au8; 16];
+    let mut unit = tail_filled_unit(&key, 11, 0xC3);
+    decrypt_unit(&mut unit, &key);
+    for p in 0..11 {
+        assert_eq!(
+            unit[p * BD_SOURCE_PACKET_BYTES + 4],
+            TS_SYNC,
+            "real content pkt {p} decrypted"
+        );
+    }
+}
+
+// ── Defect-tolerant "did a key OPEN this unit?" verdict ─────────────────
+// Authored-bad-packet bug: one non-conforming packet made OLD strict acceptance
+// reject the whole unit, destroying good video. Must ACCEPT and pass defects verbatim.
+
+/// Build a unit that decrypts to 32 content packets, with `defect_pkts`
+/// marked authored-bad (a non-`0x47` at the sync position + non-zero payload
+/// so they count as genuine content, not padding), encrypted under `key`.
+fn unit_with_defects(key: &[u8; 16], defect_pkts: &[usize]) -> Vec<u8> {
+    let mut unit = clear_unit();
+    for &p in defect_pkts {
+        let off = p * BD_SOURCE_PACKET_BYTES;
+        unit[off + 4] = 0x80; // NOT a TS sync
+        unit[off + 5] = 0xAB; // non-zero payload => real content, not padding
+    }
+    aacs_encrypt_unit(&mut unit, key);
+    unit
+}
+
+// A post-decrypt-looking unit for [`is_clean_ts`]: `e` encrypted content
+// packets (non-zero payload) starting at packet 1 (0 is skipped, its sync
+// lives in the clear seed), `synced` of them carrying `0x47`; CPI set iff `cpi`.
+fn decrypted_shape(e: usize, synced: usize, cpi: bool) -> Vec<u8> {
+    let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+    for i in 0..e {
+        let off = (i + 1) * BD_SOURCE_PACKET_BYTES; // packets 1.. (skip seed pkt 0)
+        u[off + 5] = 0xAB; // non-zero payload => counted as content
+        u[off + 4] = if i < synced { TS_SYNC } else { 0x80 };
+    }
+    if cpi {
+        u[0] |= 0xC0;
+    }
+    u
+}
+
+#[test]
+fn single_authored_bad_packet_still_decrypts_and_passes_verbatim() {
+    // 1 defective content packet in an otherwise-perfect unit (the real case).
+    let key = [0x5Au8; 16];
+    let mut unit = unit_with_defects(&key, &[17]);
+    decrypt_unit(&mut unit, &key);
+    let off = 17 * BD_SOURCE_PACKET_BYTES;
+    assert_eq!(
+        unit[off + 4],
+        0x80,
+        "defect packet's bytes pass through VERBATIM (no null-fill, no zeroing)"
+    );
+    assert_eq!(unit[off + 5], 0xAB, "defect payload untouched");
+    for p in 0..32 {
+        if p == 17 {
+            continue;
+        }
+        assert_eq!(
+            unit[p * BD_SOURCE_PACKET_BYTES + 4],
+            TS_SYNC,
+            "every other packet restored its sync (pkt {p})"
+        );
+    }
+}
+
+#[test]
+fn several_defect_packets_decrypt_the_good_ones() {
+    // Ground truth: the right key recovers every non-defect packet's sync; the
+    // authored-bad packets pass through verbatim (the muxer drops them).
+    let key = [0x33u8; 16];
+    let defects = [3usize, 9, 17, 24, 30];
+    let mut unit = unit_with_defects(&key, &defects);
+    decrypt_unit(&mut unit, &key);
+    for p in 0..32 {
+        if defects.contains(&p) {
+            continue;
+        }
+        assert_eq!(
+            unit[p * BD_SOURCE_PACKET_BYTES + 4],
+            TS_SYNC,
+            "non-defect pkt {p} decrypted"
+        );
+    }
+}
+
+#[test]
+fn wrong_key_does_not_recover_the_plaintext() {
+    // Ground truth: a wrong key produces bytes that are NOT the plaintext.
+    let clear = clear_unit();
+    let mut unit = clear.clone();
+    aacs_encrypt_unit(&mut unit, &[0x5Au8; 16]);
+    decrypt_unit(&mut unit, &[0x22u8; 16]);
+    assert_ne!(unit, clear, "a wrong key does not recover the plaintext");
+}
+
+#[test]
+fn key_proof_floor_is_four_synced_on_a_full_unit() {
+    // ABSOLUTE proof floor: >=4 synced ENCRYPTED packets opens a full unit;
+    // <4 does not — regardless of how many others are bad-encoded.
+    assert!(
+        is_clean_ts(&decrypted_shape(31, 4, false)),
+        "4 synced -> opened"
+    );
+    assert!(
+        !is_clean_ts(&decrypted_shape(31, 3, false)),
+        "3 synced -> below the proof floor -> not opened"
+    );
+}
+
+#[test]
+fn all_padding_unit_is_trivially_opened() {
+    // CPI set but every packet is source-zero padding: nothing to decrypt.
+    assert!(is_clean_ts(&decrypted_shape(0, 0, true)));
+}
+
+#[test]
+fn is_clean_dispatches_by_container_format() {
+    use crate::aacs::hddvd::tests::{audio_pack, cpi, video_pack};
+    use crate::aacs::hddvd::{decrypt_pack, encrypt_pack};
+    use crate::disc::ContentFormat;
+    let kt = [0x24u8; 16];
+    let c = cpi(1, 9);
+    let ps: Vec<u8> = [audio_pack(1), video_pack(2), audio_pack(3)].concat();
+    assert!(
+        is_clean(&ps, ContentFormat::MpegPs),
+        "clean PS opens for MpegPs"
+    );
+    assert!(
+        !is_clean(&ps, ContentFormat::BdTs),
+        "PS content has no 0x47 TS syncs -> not clean as TS"
+    );
+
+    // A wrong key clears the flags but garbles bytes 128.. of every pack: rejected,
+    // though every pack still starts `00 00 01 BA` (it is in the clear head).
+    let mut wrong = ps.clone();
+    for p in wrong.chunks_mut(SECTOR_BYTES) {
+        encrypt_pack(p, &kt, &c);
+        decrypt_pack(p, &[0x25; 16], &c);
+        assert_eq!(p[..4], [0x00, 0x00, 0x01, 0xBA]);
+    }
+    assert!(
+        !is_clean(&wrong, ContentFormat::MpegPs),
+        "garbled encrypted packs -> wrong key rejected"
+    );
+
+    // A clean BD Transport-Stream unit opens for BdTs, not MpegPs.
+    let ts = decrypted_shape(31, 31, false);
+    assert!(
+        is_clean(&ts, ContentFormat::BdTs),
+        "clean TS opens for BdTs"
+    );
+    assert!(
+        !is_clean(&ts, ContentFormat::MpegPs),
+        "TS content has no `00 00 01 BA` packs -> not clean as PS"
+    );
+}
+
+#[test]
+fn ps_container_encrypt_detection_is_per_pack_and_idempotent() {
+    use crate::aacs::hddvd::tests::{audio_pack, cpi, nav_pack, video_pack};
+    use crate::aacs::hddvd::{decrypt_pack, encrypt_pack};
+    use crate::disc::ContentFormat;
+    let ps = ContentFormat::MpegPs;
+    let kt = [0x24u8; 16];
+    let c = cpi(1, 9);
+
+    // An NV_PCK leads the unit: its byte 20 is the system header's rate_bound, so the
+    // first pack alone says "clear" while the two packs after it are encrypted.
+    let clear: Vec<u8> = [nav_pack(&c), audio_pack(1), video_pack(2)].concat();
+    assert!(
+        !aacs_unit_encrypted(&clear, ps),
+        "no pack flagged => not encrypted"
+    );
+    let mut enc = clear.clone();
+    for p in enc.chunks_mut(SECTOR_BYTES).skip(1) {
+        encrypt_pack(p, &kt, &c);
+    }
+    assert_eq!(enc[..SECTOR_BYTES], clear[..SECTOR_BYTES]);
+    assert!(
+        aacs_unit_encrypted(&enc, ps),
+        "a flagged later pack => encrypted"
+    );
+    assert!(aacs_unit_needs_decrypt(&enc, ps));
+    // Only the last pack encrypted, cut short: the fragment still reads encrypted.
+    let mut tail = clear.clone();
+    encrypt_pack(&mut tail[2 * SECTOR_BYTES..], &kt, &c);
+    assert!(aacs_unit_seed_encrypted(&tail[..2 * SECTOR_BYTES + 21], ps));
+    assert!(!aacs_unit_seed_encrypted(
+        &tail[..2 * SECTOR_BYTES + 20],
+        ps
+    ));
+
+    // Decrypted: the flags are cleared and the payload checks out (idempotent).
+    let mut dec = enc.clone();
+    for p in dec.chunks_mut(SECTOR_BYTES).skip(1) {
+        decrypt_pack(p, &kt, &c);
+    }
+    assert_eq!(dec, clear);
+    assert!(!aacs_unit_encrypted(&dec, ps));
+    assert!(!aacs_unit_needs_decrypt(&dec, ps));
+}
+
+#[test]
+fn sparse_tail_needs_all_present_packets_min_e_4() {
+    // End-of-clip fragment tail: `min(E,4)` scales to existing packets, so a
+    // sparse unit needs ALL its (few) encrypted packets. Wrong key gives 0 (no
+    // hole), and a valid 1-packet tail is never false-rejected.
+    assert!(
+        is_clean_ts(&decrypted_shape(1, 1, false)),
+        "E=1: the one packet syncs -> open"
+    );
+    assert!(
+        !is_clean_ts(&decrypted_shape(1, 0, false)),
+        "E=1: 0 synced (wrong key) -> not"
+    );
+    assert!(
+        is_clean_ts(&decrypted_shape(3, 3, false)),
+        "E=3: all 3 sync -> open"
+    );
+    assert!(
+        !is_clean_ts(&decrypted_shape(3, 2, false)),
+        "E=3: min(3,4)=3 -> 2 synced is not enough"
+    );
+    // The threshold boundary: E=4 needs all 4 (min(4,4)=4); E=5 needs only 4
+    // of 5 (min(5,4)=4) — the transition from "need all E" to "need exactly 4".
+    assert!(
+        is_clean_ts(&decrypted_shape(4, 4, false)),
+        "E=4: 4/4 -> open"
+    );
+    assert!(
+        !is_clean_ts(&decrypted_shape(4, 3, false)),
+        "E=4: 3/4 -> below min(4,4)=4"
+    );
+    assert!(
+        is_clean_ts(&decrypted_shape(5, 4, false)),
+        "E=5: 4/5 -> open (min(5,4)=4, the floor caps at 4)"
+    );
+    assert!(
+        !is_clean_ts(&decrypted_shape(5, 3, false)),
+        "E=5: 3/5 -> below the 4 floor"
+    );
+}
+
+#[test]
+fn fragment_tail_padding_plus_one_defect_still_decrypts() {
+    // Both tolerances at once: source-zero padding tail EXCLUDED, and the one
+    // authored-bad packet in the real prefix TOLERATED. 20 real packets
+    // (pkt 5 defective) => 19/20 synced => opened; padding emitted as zeros.
+    let key = [0x5Au8; 16];
+    let mut unit = clear_unit();
+    let off = 5 * BD_SOURCE_PACKET_BYTES;
+    unit[off + 4] = 0x80; // defect inside the real content
+    unit[off + 5] = 0xAB;
+    for b in unit[20 * BD_SOURCE_PACKET_BYTES..].iter_mut() {
+        *b = 0; // source-zero padding tail (packets 20..32)
+    }
+    aacs_encrypt_unit(&mut unit, &key);
+    decrypt_unit(&mut unit, &key);
+    assert_eq!(
+        unit[off + 4],
+        0x80,
+        "the defect packet passes through verbatim"
+    );
+    for p in 20..32 {
+        let o = p * BD_SOURCE_PACKET_BYTES;
+        assert!(
+            unit[o..o + BD_SOURCE_PACKET_BYTES].iter().all(|&b| b == 0),
+            "padding pkt {p} emitted as clean zeros"
+        );
+    }
+}
+
+#[test]
+fn wrong_key_full_unit_does_not_recover_plaintext() {
+    let clear = clear_unit();
+    let mut unit = clear.clone();
+    aacs_encrypt_unit(&mut unit, &[0x11u8; 16]);
+    decrypt_unit(&mut unit, &[0x22u8; 16]);
+    assert_ne!(
+        unit, clear,
+        "a wrong key on a full content unit does not recover the plaintext"
+    );
+}
+
+#[test]
+fn cpi_clear_unit_reports_not_encrypted() {
+    // CPI-clear (plaintext) unit: the caller's gate `aacs_unit_encrypted`
+    // reports NOT-encrypted, so it is never handed to the now-pure
+    // `decrypt_unit` (which would otherwise corrupt it by applying a key).
+    let unit = clear_unit(); // byte 0 high bits clear
+    assert!(
+        !aacs_unit_encrypted(&unit, crate::disc::ContentFormat::BdTs),
+        "CPI-clear ⇒ caller does not decrypt it"
+    );
+}
+
+// ── AES-ECB KAT (FIPS-197 Appendix C.1) ────────────────────────────────
+
+#[test]
+fn aes_ecb_matches_fips197_known_answer() {
+    // FIPS-197 Appendix C.1 AES-128 KAT (key/plaintext/ciphertext = code arrays
+    // below: key 000102..0f, pt 001122..ff, ct 69c4e0..5a).
+    // Pins the AES primitive against a published vector.
+    let key = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F,
+    ];
+    let pt = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        0xFF,
+    ];
+    let expected = [
+        0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4, 0xC5,
+        0x5A,
+    ];
+    assert_eq!(aes_ecb_encrypt(&key, &pt), expected);
+    // And decrypt is the exact inverse.
+    assert_eq!(aes_ecb_decrypt(&key, &expected), pt);
+}
+
+// ── decrypt_bus: one key schedule per unit, not one per sector ─────────
+
+// Regression pin on production decrypt_bus_sectors: one key schedule per unit, not per sector.
+#[test]
+fn decrypt_bus_expands_the_read_data_key_once_per_unit() {
+    use crate::aacs::crypto::KEY_EXPANSIONS;
+    let mut unit = clear_unit();
+    let rdk = [0x4Eu8; 16];
+    KEY_EXPANSIONS.with(|c| c.set(0));
+    decrypt_bus_sectors(&mut unit, &rdk);
+    let n = KEY_EXPANSIONS.with(|c| c.get());
+    assert_eq!(
+        n, 1,
+        "one aligned unit under one read_data_key must expand the schedule \
+             exactly once, not once per 2048-byte sector"
+    );
+}
+
+// The single-expansion refactor must stay byte-identical: bus encryption
+// (`[C]` §4.2) covers bytes 16..2048 of each sector, so a round trip
+// sector-by-sector through the forward direction must recover exactly.
+#[test]
+fn decrypt_bus_roundtrips_every_sector_region() {
+    let rdk = [0x91u8; 16];
+    let original = clear_unit();
+    let mut unit = original.clone();
+    // Forward direction, region by region — the inverse of decrypt_bus.
+    for start in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
+        crate::aacs::crypto::aes_cbc_encrypt(&rdk, &mut unit[start + 16..start + SECTOR_BYTES]);
+    }
+    assert_ne!(
+        &unit[16..64],
+        &original[16..64],
+        "the forward direction must have changed the bytes"
+    );
+    decrypt_bus(&mut unit, &rdk);
+    assert_eq!(
+        unit.as_slice(),
+        original.as_slice(),
+        "decrypt_bus must invert the per-sector bus encryption exactly"
+    );
+}
+
+// Full round trip through the SHARED `encrypt_bus` seam (the exact inverse
+// used by the decrypt.rs end-to-end tests): clear -> bus-encrypt -> bus-
+// decrypt must recover byte-for-byte, and the payload must actually change.
+#[test]
+fn encrypt_bus_is_the_exact_inverse_of_decrypt_bus() {
+    let rdk = [0x3Cu8; 16];
+    let original = clear_unit();
+    let mut unit = original.clone();
+    encrypt_bus(&mut unit, &rdk);
+    assert_ne!(
+        &unit[16..SECTOR_BYTES],
+        &original[16..SECTOR_BYTES],
+        "bus encryption must encipher the per-sector payload"
+    );
+    decrypt_bus(&mut unit, &rdk);
+    assert_eq!(
+        unit, original,
+        "bus encrypt/decrypt must round-trip exactly"
+    );
+}
+
+// Bus encryption covers ONLY bytes 16..2048 of each 2048-byte sector; the
+// first 16 bytes are the plaintext seed and `decrypt_bus` must never touch
+// them. Pins the "skip first 16 bytes" contract per sector.
+#[test]
+fn decrypt_bus_leaves_each_sector_seed_untouched() {
+    let rdk = [0x6Du8; 16];
+    let mut unit = clear_unit();
+    encrypt_bus(&mut unit, &rdk);
+    // Snapshot each sector's 16-byte seed as it arrives from the drive.
+    let seeds: Vec<[u8; 16]> = (0..ALIGNED_UNIT_LEN)
+        .step_by(SECTOR_BYTES)
+        .map(|s| unit[s..s + 16].try_into().unwrap())
+        .collect();
+    decrypt_bus(&mut unit, &rdk);
+    for (i, s) in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES).enumerate() {
+        assert_eq!(
+            &unit[s..s + 16],
+            &seeds[i],
+            "decrypt_bus must leave sector {i}'s 16-byte seed byte-for-byte"
+        );
+    }
+}
+
+// A wrong read_data_key must NOT recover the bus-encrypted region — the
+// ground truth that the key genuinely drives the transform.
+#[test]
+fn decrypt_bus_wrong_read_data_key_does_not_recover() {
+    let original = clear_unit();
+    let mut unit = original.clone();
+    encrypt_bus(&mut unit, &[0x91u8; 16]);
+    decrypt_bus(&mut unit, &[0x22u8; 16]); // wrong rdk
+    assert_ne!(
+        &unit[16..SECTOR_BYTES],
+        &original[16..SECTOR_BYTES],
+        "a wrong read_data_key must not recover the bus-encrypted region"
+    );
+}
+
+// A buffer whose length is not a whole number of sectors: `decrypt_bus`
+// processes only the WHOLE sectors and leaves the partial trailing sector
+// byte-for-byte (the `sector_start + SECTOR_BYTES > len` break).
+#[test]
+fn decrypt_bus_skips_a_partial_trailing_sector() {
+    let rdk = [0x5Cu8; 16];
+    let mut full = clear_unit();
+    encrypt_bus(&mut full, &rdk);
+    // Two whole sectors + a 100-byte fragment of the third.
+    let mut buf = full[..2 * SECTOR_BYTES + 100].to_vec();
+    let tail_before = buf[2 * SECTOR_BYTES..].to_vec();
+    decrypt_bus(&mut buf, &rdk);
+    let clear = clear_unit();
+    assert_eq!(
+        buf[..2 * SECTOR_BYTES],
+        clear[..2 * SECTOR_BYTES],
+        "the two whole sectors must bus-decrypt back to clear"
+    );
+    assert_eq!(
+        buf[2 * SECTOR_BYTES..],
+        tail_before[..],
+        "the partial trailing sector must be left untouched"
+    );
+}
+
+// ── CBC decrypt: first-block uses fixed AACS IV ────────────────────────
+
+// The published `iv0` bytes (`[C]` §2.1.2), INDEPENDENT of `crypto::AACS_IV`.
+const IV0_PUBLISHED: [u8; 16] = [
+    0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
+];
+
+/// Pins the fixed AACS CBC IV (`[C]` §2.1.2 `iv0`) against a literal, so a
+/// change to `crypto::AACS_IV` fails HERE rather than silently shipping.
+#[test]
+fn aacs_iv_matches_published_iv0() {
+    assert_eq!(
+        AACS_IV, IV0_PUBLISHED,
+        "the fixed AACS CBC IV must be the published iv0"
+    );
+}
+
+#[test]
+fn cbc_decrypt_first_block_xors_aacs_iv() {
+    // CBC: P[0] = AES-D(K, C[0]) XOR IV, IV being the fixed AACS constant. The
+    // fixture is built from the PUBLISHED iv0 literal (not `AACS_IV`), so swapping
+    // AACS_IV for [0u8;16] makes the recovered block wrong — proving block 0's IV.
+    let key = [0x24u8; 16];
+    let plain = [0x5Au8; 16];
+    // Forward CBC for one block: C = AES-E(K, P XOR IV).
+    let mut x = plain;
+    for j in 0..16 {
+        x[j] ^= IV0_PUBLISHED[j];
+    }
+    let ct = aes_ecb_encrypt(&key, &x);
+    let mut buf = ct;
+    aes_cbc_decrypt(&key, &mut buf);
+    assert_eq!(buf, plain, "block-0 CBC must XOR the fixed AACS IV");
+}
+
+// ── CBC decrypt KAT (NIST SP 800-38A F.2.2, AES-128-CBC) ───────────────
+
+#[test]
+fn aes_cbc_decrypt_matches_nist_sp800_38a_f2_2() {
+    // NIST SP 800-38A F.2.2 (CBC-AES128.Decrypt) KAT (vectors = code arrays below).
+    // `aes_cbc_decrypt` hardwires iv0 for block 0: blocks 1..=3 pin reverse-order
+    // chaining; block 0 = NIST_PT[0] XOR NIST_IV XOR the `IV0_PUBLISHED` literal.
+    let key = [
+        0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F,
+        0x3C,
+    ];
+    let nist_iv = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F,
+    ];
+    // Byte arrays kept narrow (≤14 bytes/line) so the secret-scanner's
+    // 32-nibble-per-line heuristic doesn't flag these published vectors as
+    // key material (same layout the existing FIPS-197 / CMAC KATs use).
+    let ciphertext: [u8; 64] = [
+        0x76, 0x49, 0xAB, 0xAC, 0x81, 0x19, 0xB2, 0x46, 0xCE, 0xE9, 0x8E, 0x9B, 0x12, 0xE9, 0x19,
+        0x7D, 0x50, 0x86, 0xCB, 0x9B, 0x50, 0x72, 0x19, 0xEE, 0x95, 0xDB, 0x11, 0x3A, 0x91, 0x76,
+        0x78, 0xB2, 0x73, 0xBE, 0xD6, 0xB8, 0xE3, 0xC1, 0x74, 0x3B, 0x71, 0x16, 0xE6, 0x9E, 0x22,
+        0x22, 0x95, 0x16, 0x3F, 0xF1, 0xCA, 0xA1, 0x68, 0x1F, 0xAC, 0x09, 0x12, 0x0E, 0xCA, 0x30,
+        0x75, 0x86, 0xE1, 0xA7,
+    ];
+    let nist_plaintext: [u8; 64] = [
+        0x6B, 0xC1, 0xBE, 0xE2, 0x2E, 0x40, 0x9F, 0x96, 0xE9, 0x3D, 0x7E, 0x11, 0x73, 0x93, 0x17,
+        0x2A, 0xAE, 0x2D, 0x8A, 0x57, 0x1E, 0x03, 0xAC, 0x9C, 0x9E, 0xB7, 0x6F, 0xAC, 0x45, 0xAF,
+        0x8E, 0x51, 0x30, 0xC8, 0x1C, 0x46, 0xA3, 0x5C, 0xE4, 0x11, 0xE5, 0xFB, 0xC1, 0x19, 0x1A,
+        0x0A, 0x52, 0xEF, 0xF6, 0x9F, 0x24, 0x45, 0xDF, 0x4F, 0x9B, 0x17, 0xAD, 0x2B, 0x41, 0x7B,
+        0xE6, 0x6C, 0x37, 0x10,
+    ];
+
+    let mut buf = ciphertext;
+    aes_cbc_decrypt(&key, &mut buf);
+
+    // Blocks 1..=3: exact match against the published NIST plaintext.
+    assert_eq!(
+        &buf[16..64],
+        &nist_plaintext[16..64],
+        "CBC chaining (blocks 1..3) must match NIST SP 800-38A F.2.2 plaintext"
+    );
+
+    // Block 0: NIST_PT[0] XOR NIST_IV XOR AACS_IV (the fixed-IV substitution).
+    let mut expected_block0 = [0u8; 16];
+    for i in 0..16 {
+        expected_block0[i] = nist_plaintext[i] ^ nist_iv[i] ^ IV0_PUBLISHED[i];
+    }
+    assert_eq!(
+        &buf[0..16],
+        &expected_block0,
+        "block-0 plaintext must equal NIST PT XOR NIST IV XOR AACS_IV (fixed-IV path)"
+    );
+}
+
+// ── decrypt_unit: full round trip restores TS syncs ────────────────────
+
+#[test]
+fn decrypt_unit_roundtrip_restores_all_syncs() {
+    // Encrypt a clear unit, confirm it reads as scrambled, then decrypt
+    // and confirm every TS sync byte at the 192-byte stride is restored.
+    let unit_key = [0x37u8; 16];
+    let mut unit = clear_unit();
+    aacs_encrypt_unit(&mut unit, &unit_key);
+    assert!(
+        !crate::aacs::content::is_clean(&unit, crate::disc::ContentFormat::BdTs),
+        "encrypted unit must look scrambled"
+    );
+
+    decrypt_unit(&mut unit, &unit_key);
+    // All 32 stride positions carry sync after decrypt.
+    assert_eq!(ts_sync_count(&unit), ts_packet_total(&unit));
+    assert!(crate::aacs::content::is_clean(
+        &unit,
+        crate::disc::ContentFormat::BdTs
+    ));
+}
+
+#[test]
+fn decrypt_unit_wrong_key_does_not_recover_plaintext() {
+    // A wrong unit key leaves the body scrambled — the plaintext is NOT
+    // recovered. Grounds the brute-force gate: a bad key must not look right.
+    let good = [0x11u8; 16];
+    let bad = [0x22u8; 16];
+    let clear = clear_unit();
+    let mut unit = clear.clone();
+    aacs_encrypt_unit(&mut unit, &good);
+    decrypt_unit(&mut unit, &bad);
+    assert_ne!(unit, clear, "a wrong key does not recover the plaintext");
+}
+
+#[test]
+fn decrypt_unit_ignores_short_unit() {
+    // unit.len() < ALIGNED_UNIT_LEN → no-op (no panic on the 16.. slice).
+    let mut short = vec![0u8; ALIGNED_UNIT_LEN - 1];
+    let before = short.clone();
+    decrypt_unit(&mut short, &[0u8; 16]);
+    assert_eq!(short, before, "a short unit is left untouched (no panic)");
+}
+
+#[test]
+fn decrypt_unit_only_touches_bytes_16_onward() {
+    // The first 16 bytes are the plaintext TP_extra header and must be
+    // left untouched by decrypt (only unit[16..] is CBC-processed).
+    let unit_key = [0x9Au8; 16];
+    let mut clear = clear_unit();
+    // Put a distinctive header so we can confirm it survives. Byte 0 carries
+    // both CPI bits (0xE0) so it is stable under the fixture's `|= 0xC0`.
+    clear[..16].copy_from_slice(&[
+        0xE0, 0xA1, 0xA2, 0xA3, 0x47, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+        0xAF,
+    ]);
+    let header_before: [u8; 16] = clear[..16].try_into().unwrap();
+    let mut unit = clear;
+    aacs_encrypt_unit(&mut unit, &unit_key);
+    // Encryption also leaves the header untouched (only 16.. is encrypted).
+    assert_eq!(&unit[..16], &header_before);
+    decrypt_unit(&mut unit, &unit_key);
+    assert_eq!(
+        &unit[..16],
+        &header_before,
+        "header bytes must be preserved"
+    );
+}
+
+// ── CPI gate: the authoritative encrypted-vs-clear decision ────────────
+
+#[test]
+fn cpi_gate_set_flag_decrypts_and_needs_decrypt_is_idempotent() {
+    // A CPI-set encrypted unit decrypts with the right key. CPI lives in the
+    // plaintext header, so `aacs_unit_encrypted` stays true after decryption, but
+    // `aacs_unit_needs_decrypt` flips false (syncs restored) — re-decrypt is idempotent.
+    let ts = crate::disc::ContentFormat::BdTs;
+    let key = [0x5au8; 16];
+    let mut unit = clear_unit();
+    aacs_encrypt_unit(&mut unit, &key); // sets CPI + scrambles body
+    assert!(aacs_unit_encrypted(&unit, ts), "CPI set");
+    assert!(
+        aacs_unit_needs_decrypt(&unit, ts),
+        "flagged + still scrambled"
+    );
+
+    decrypt_unit(&mut unit, &key);
+    assert!(
+        aacs_unit_encrypted(&unit, ts),
+        "CPI bits live in the preserved header ⇒ still set post-decrypt"
+    );
+    assert!(
+        !aacs_unit_needs_decrypt(&unit, ts),
+        "syncs restored ⇒ no further decrypt attempt (idempotent re-decrypt)"
+    );
+}
+
+// ── bus decryption (AACS 2.0 / UHD) ────────────────────────────────────
+
+#[test]
+fn decrypt_bus_roundtrips_per_sector_skipping_first_16_bytes() {
+    // Bus encryption CBC-encrypts bytes 16..2048 of EACH 2048-byte sector (3 per
+    // aligned unit), leaving the first 16 plaintext. Confirm decrypt_bus inverts the
+    // forward transform and leaves each sector's first 16 bytes untouched.
+    let rdk = [0x13u8; 16];
+    let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+    // Fill with a recognisable pattern.
+    for (i, b) in unit.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let plain = unit.clone();
+
+    // Forward: CBC-encrypt unit[s+16 .. s+2048] per sector under AACS IV.
+    let cipher = Aes128::new(&rdk.into());
+    for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
+        let mut prev = AACS_IV;
+        let body = s + 16;
+        let end = s + SECTOR_BYTES;
+        let nblocks = (end - body) / 16;
+        for i in 0..nblocks {
+            let off = body + i * 16;
+            for j in 0..16 {
+                unit[off + j] ^= prev[j];
+            }
+            let mut chunk = [0u8; 16];
+            chunk.copy_from_slice(&unit[off..off + 16]);
+            let mut blk: Array<u8, _> = chunk.into();
+            cipher.encrypt_block(&mut blk);
+            unit[off..off + 16].copy_from_slice(&blk);
+            prev.copy_from_slice(&unit[off..off + 16]);
+        }
+    }
+    assert_ne!(unit, plain, "forward bus-encrypt must change the body");
+
+    decrypt_bus(&mut unit, &rdk);
+    assert_eq!(
+        unit, plain,
+        "decrypt_bus must invert per-sector bus encrypt"
+    );
+    // Each sector's first 16 bytes equal the original (never touched).
+    for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
+        assert_eq!(&unit[s..s + 16], &plain[s..s + 16]);
+    }
+}
+
+// The CPI clear is BD-TS only: an HD DVD program-stream unit has no TP_extra_header and
+// its byte 0 of each 192-byte stride is payload.
+#[test]
+fn clear_copy_permission_indicator_masks_bdts_and_leaves_mpegps_alone() {
+    let before = vec![0xFFu8; ALIGNED_UNIT_LEN];
+    let mut ps = before.clone();
+    clear_copy_permission_indicator(&mut ps, crate::disc::ContentFormat::MpegPs);
+    assert_eq!(ps, before);
+    let mut ts = before.clone();
+    clear_copy_permission_indicator(&mut ts, crate::disc::ContentFormat::BdTs);
+    for (i, b) in ts.iter().enumerate() {
+        let want = if i % BD_SOURCE_PACKET_BYTES == 0 {
+            0x3F
+        } else {
+            0xFF
+        };
+        assert_eq!(*b, want, "byte {i}");
+    }
+}
+
+// ── is_clean / ts_sync_count edge cases ────────────────────────────────
+
+#[test]
+fn is_clean_ts_short_buffers_are_judged_on_content() {
+    // No length guard: a short buffer is judged over the packets it holds.
+    // All-zero (or empty) has no content packets, so it is clean.
+    for len in [0, ALIGNED_UNIT_LEN - 1] {
+        assert!(crate::aacs::content::is_clean(
+            &vec![0u8; len],
+            crate::disc::ContentFormat::BdTs
+        ));
+    }
+    // Non-zero payload without a sync byte in a 1-short buffer is NOT clean.
+    let mut noisy = vec![0u8; ALIGNED_UNIT_LEN - 1];
+    noisy[192 + 4] = 0x00;
+    noisy[192 + 5] = 0x55;
+    assert!(!crate::aacs::content::is_clean(
+        &noisy,
+        crate::disc::ContentFormat::BdTs
+    ));
+    noisy[192 + 4] = TS_SYNC;
+    assert!(crate::aacs::content::is_clean(
+        &noisy,
+        crate::disc::ContentFormat::BdTs
+    ));
+}
+
+#[test]
+fn ts_sync_count_only_samples_the_192_byte_stride() {
+    // A 0x47 placed OFF the stride (e.g. offset 5) must not be counted —
+    // the detector samples exactly offset 4, 196, 388, ... A mutation that
+    // scanned every byte would over-count and misclassify scrambled units.
+    let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+    unit[5] = TS_SYNC; // off-stride
+    unit[197] = TS_SYNC; // off-stride
+    assert_eq!(ts_sync_count(&unit), 0, "off-stride 0x47 must not count");
+    unit[4] = TS_SYNC; // on-stride
+    assert_eq!(ts_sync_count(&unit), 1);
+}
+
+// ── the encrypted-flag readers ────────────────────────────────────────
+
+// Guards a truncated fragment from being emitted as clear; reads ONLY the two CPI bits
+// (`[BD]` §3.10.2, byte 0 bits 6-7).
+#[test]
+fn aacs_unit_seed_encrypted_reads_only_the_two_cpi_bits() {
+    use crate::disc::ContentFormat::BdTs;
+
+    // CPI bits clear → NOT encrypted, whatever the ATS bits say.
+    for ats in 0u8..=0x3F {
+        assert!(
+            !aacs_unit_seed_encrypted(&[ats], BdTs),
+            "byte0={ats:#04x} has both CPI bits clear → not encrypted"
+        );
+    }
+
+    // Either CPI bit set → encrypted, whatever the ATS bits say.
+    for &cpi in &[0x40u8, 0x80, 0xC0] {
+        assert!(
+            aacs_unit_seed_encrypted(&[cpi], BdTs),
+            "byte0={cpi:#04x} has a CPI bit set → encrypted"
+        );
+        assert!(
+            aacs_unit_seed_encrypted(&[cpi | 0x3F], BdTs),
+            "ATS bits must not change the answer"
+        );
+    }
+
+    // Too short to hold the flag → false rather than a panic.
+    assert!(!aacs_unit_seed_encrypted(&[], BdTs));
+}
+
+/// The MpegPs (HD-DVD `.evo`) side reads `PES_scrambling_control` from the PES header,
+/// and a fragment too short to hold it reads clear rather than panic.
+#[test]
+fn aacs_unit_seed_encrypted_reads_the_ps_scramble_flag_or_says_clear() {
+    use crate::aacs::hddvd::tests::video_pack;
+    use crate::disc::ContentFormat::MpegPs;
+
+    let mut frag = video_pack(1)[..21].to_vec();
+    assert!(!aacs_unit_seed_encrypted(&frag, MpegPs), "flag bits zero");
+    frag[20] |= 0x10;
+    assert!(aacs_unit_seed_encrypted(&frag, MpegPs), "flag bits 01");
+    // Bits outside the mask are not the scrambling control.
+    frag[20] = 0x80 | 0x0F;
+    assert!(!aacs_unit_seed_encrypted(&frag, MpegPs), "outside the mask");
+    frag[20] |= 0x10;
+    // A fragment that stops short of the flag byte is not classifiable.
+    assert!(!aacs_unit_seed_encrypted(&frag[..20], MpegPs));
+}
+
+// `aacs_unit_encrypted` requires a WHOLE 6144-byte unit: on anything shorter
+// the flag byte isn't guaranteed to be the unit's, so it must answer `false`
+// and defer to `aacs_unit_seed_encrypted` for partial units.
+#[test]
+fn aacs_unit_encrypted_requires_a_whole_aligned_unit() {
+    use crate::disc::ContentFormat::BdTs;
+
+    // A short buffer whose byte 0 has the CPI bits set is still NOT a unit.
+    let mut short = vec![0u8; ALIGNED_UNIT_LEN - 1];
+    short[0] = 0xC0;
+    assert!(
+        !aacs_unit_encrypted(&short, BdTs),
+        "a sub-unit buffer must not be classified"
+    );
+    assert!(!aacs_unit_encrypted(&[], BdTs), "empty must not index");
+
+    // Exactly one aligned unit IS classified.
+    let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+    unit[0] = 0xC0;
+    assert!(
+        aacs_unit_encrypted(&unit, BdTs),
+        "a full unit with CPI set is encrypted"
+    );
+    unit[0] = 0x00;
+    assert!(!aacs_unit_encrypted(&unit, BdTs), "CPI clear is not");
+}
+
+#[test]
+fn ts_packet_total_for_various_lengths() {
+    // total = len / 192 (BD-TS packet size). Pin a few lengths.
+    assert_eq!(ts_packet_total(&[0u8; 192]), 1);
+    assert_eq!(ts_packet_total(&[0u8; 384]), 2);
+    assert_eq!(ts_packet_total(&[0u8; 191]), 0);
+    // 6144 = 32 packets.
+    assert_eq!(ts_packet_total(&[0u8; ALIGNED_UNIT_LEN]), 32);
+}

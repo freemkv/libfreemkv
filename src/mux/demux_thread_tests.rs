@@ -1,0 +1,561 @@
+use super::*;
+use crate::halt::Halt;
+use crossbeam_channel::bounded;
+use std::time::Duration;
+
+// Build one 192-byte BD-TS packet on `pid` carrying a complete PES
+// (00 00 01 E0 start, hdr_len 0, `payload` as ES), stuffing-padded so
+// `payload` is exact (BD-TS: sync 0x47 at TS offset 0, i.e. BD off 4).
+fn bdts_pes_packet(pid: u16, payload: &[u8]) -> Vec<u8> {
+    const SYNC: u8 = 0x47;
+    use crate::consts::TS_PAYLOAD_BYTES;
+    let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+    pes.extend_from_slice(payload);
+    assert!(pes.len() <= TS_PAYLOAD_BYTES);
+    let mut pkt = vec![0u8; 192];
+    pkt[4] = SYNC;
+    pkt[5] = (((pid >> 8) as u8) & 0x1F) | 0x40; // PUSI
+    pkt[6] = (pid & 0xFF) as u8;
+    let pad = TS_PAYLOAD_BYTES - pes.len();
+    if pad == 0 {
+        pkt[7] = 0x10; // payload only
+        pkt[8..8 + pes.len()].copy_from_slice(&pes);
+    } else {
+        pkt[7] = 0x30; // AF + payload
+        let af_field_len = pad - 1;
+        pkt[8] = af_field_len as u8;
+        if af_field_len >= 1 {
+            pkt[9] = 0x00; // flags
+            for b in pkt.iter_mut().skip(10).take(af_field_len - 1) {
+                *b = 0xFF;
+            }
+        }
+        let off = 8 + pad;
+        pkt[off..off + pes.len()].copy_from_slice(&pes);
+    }
+    pkt
+}
+
+/// Drain a receiver into a Vec, blocking up to `budget` total.
+fn collect_batches(rx: &Receiver<DemuxBatch>, budget: Duration) -> Vec<DemuxBatch> {
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(b) => {
+                let is_terminal = matches!(b, DemuxBatch::Eof | DemuxBatch::Err(_));
+                out.push(b);
+                if is_terminal {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+#[test]
+fn clean_eof_sentinel_sent_after_input_exhausted() {
+    // The worker must send exactly one Eof as its LAST message on a
+    // normal end-of-stream so the consumer can distinguish clean
+    // completion from a panic (which drops tx without Eof).
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let pid = 0x1011;
+    let ts = super::super::ts::TsDemuxer::new(&[pid]);
+    let (_dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+
+    pf_tx.send(Ok(bdts_pes_packet(pid, &[0xDE, 0xAD]))).unwrap();
+    drop(pf_tx); // producer done → EOF
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    // Last batch must be the Eof sentinel.
+    assert!(
+        matches!(batches.last(), Some(DemuxBatch::Eof)),
+        "stream must terminate with the Eof sentinel"
+    );
+    // The PES bytes must surface before EOF (the demuxer holds the PES
+    // until flush at EOF since there's no following PUSI).
+    let saw_pes = batches.iter().any(|b| match b {
+        DemuxBatch::Ts(p) => p.iter().any(|pes| pes.data == vec![0xDE, 0xAD]),
+        _ => false,
+    });
+    assert!(saw_pes, "the demuxed PES must be delivered");
+}
+
+#[test]
+fn flush_tail_emitted_before_eof() {
+    // A PES with no trailing PUSI is only completed by flush() at EOF.
+    // The worker must flush after the producer disconnects, emitting the
+    // tail PES BEFORE the Eof sentinel — never dropping the last frame.
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let pid = 0x1011;
+    let ts = super::super::ts::TsDemuxer::new(&[pid]);
+    let (_dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+
+    pf_tx
+        .send(Ok(bdts_pes_packet(pid, &[0x11, 0x22, 0x33])))
+        .unwrap();
+    drop(pf_tx);
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    // Find the tail PES and the Eof; tail must precede Eof.
+    let pes_idx = batches.iter().position(
+        |b| matches!(b, DemuxBatch::Ts(p) if p.iter().any(|x| x.data == vec![0x11, 0x22, 0x33])),
+    );
+    let eof_idx = batches.iter().position(|b| matches!(b, DemuxBatch::Eof));
+    assert!(pes_idx.is_some(), "flushed tail PES delivered");
+    assert!(eof_idx.is_some(), "Eof delivered");
+    assert!(pes_idx.unwrap() < eof_idx.unwrap(), "tail before Eof");
+}
+
+/// LP11 / L096 on the highway: a Stop is `Err(Halted)`, never the clean `Eof`
+/// sentinel, whether the worker sees the cancel itself or the halted prefetcher
+/// closes its channel first.
+#[test]
+fn halt_cancellation_sends_halted_not_eof() {
+    let batches = |close_first: bool| {
+        let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+        let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+        let halt = Halt::new();
+        // Without the close the worker only sees the cancel at its loop-top check, and
+        // it blocks in recv() once past it, so raise the flag before it can start.
+        if !close_first {
+            halt.cancel();
+        }
+        let ts = super::super::ts::TsDemuxer::new(&[0x1011]);
+        let (dt, rx) = DemuxThread::spawn_zero_copy(
+            pf_rx,
+            rc_tx,
+            (),
+            &crate::ctx::Ctx::new(halt.clone()),
+            Some(ts),
+            None,
+        )
+        .unwrap();
+        if close_first {
+            halt.cancel();
+            drop(pf_tx);
+            let b = collect_batches(&rx, Duration::from_secs(5));
+            drop(rx);
+            drop(dt);
+            b
+        } else {
+            let b = collect_batches(&rx, Duration::from_secs(5));
+            drop(pf_tx);
+            drop(rx);
+            drop(dt);
+            b
+        }
+    };
+    for close_first in [false, true] {
+        let b = batches(close_first);
+        assert!(
+            matches!(b.last(), Some(DemuxBatch::Err(e)) if crate::error::is_halt(e)),
+            "close_first={close_first}: a Stop is Halted"
+        );
+        assert!(!b.iter().any(|x| matches!(x, DemuxBatch::Eof)), "no Eof");
+    }
+}
+
+#[test]
+fn ts_pes_source_offsets_advance_across_buffers() {
+    // Each buffer is fed at the running byte offset, so a PES cut from the second
+    // buffer is stamped 192, not 0.
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let pid = 0x1011;
+    let ts = super::super::ts::TsDemuxer::new(&[pid]);
+    let (_dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+    pf_tx.send(Ok(bdts_pes_packet(pid, &[0x01]))).unwrap();
+    let mut second = bdts_pes_packet(pid, &[0x02]);
+    second[7] |= 1; // next CC: a same-CC packet is a duplicate
+    pf_tx.send(Ok(second)).unwrap();
+    drop(pf_tx);
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    let srcs: Vec<u64> = batches
+        .iter()
+        .filter_map(|b| match b {
+            DemuxBatch::Ts(p) => Some(p),
+            _ => None,
+        })
+        .flatten()
+        .map(|p| p.source.expect("stamped").byte)
+        .collect();
+    assert_eq!(srcs, vec![0, 192]);
+}
+
+#[test]
+fn upstream_error_is_propagated_as_err_terminal() {
+    // An error from the prefetch channel must be forwarded as a terminal
+    // DemuxBatch::Err — the worker then returns (no Eof after an error).
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let ts = super::super::ts::TsDemuxer::new(&[0x1011]);
+    let (_dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+
+    pf_tx.send(Err(std::io::Error::other("boom"))).unwrap();
+    drop(pf_tx);
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    assert!(
+        matches!(batches.last(), Some(DemuxBatch::Err(_))),
+        "upstream error must terminate the stream with Err"
+    );
+    // No Eof must follow an Err (the worker returns immediately).
+    assert!(
+        !batches.iter().any(|b| matches!(b, DemuxBatch::Eof)),
+        "Err is terminal; no Eof after it"
+    );
+}
+
+#[test]
+fn buffers_are_recycled_to_producer() {
+    // The worker must return each consumed buffer to recycle_tx so the
+    // producer can re-fill it (the zero-copy pool contract). Verify a
+    // fed buffer comes back on the recycle channel.
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, rc_rx) = bounded::<Vec<u8>>(4);
+    let pid = 0x1011;
+    let ts = super::super::ts::TsDemuxer::new(&[pid]);
+    let (_dt, _rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+
+    pf_tx.send(Ok(bdts_pes_packet(pid, &[0xAA]))).unwrap();
+    let recycled = rc_rx.recv_timeout(Duration::from_secs(5));
+    assert!(recycled.is_ok(), "consumed buffer must be recycled");
+    assert_eq!(recycled.unwrap().len(), 192, "the original buffer returned");
+    drop(pf_tx);
+}
+
+#[test]
+fn ps_path_demuxes_and_eofs() {
+    // The PS branch must demux MPEG-2 Program Stream input and also send
+    // the Eof sentinel on clean exit. Feed a complete PES + program-end
+    // delimiter so the PsDemuxer emits it without waiting for flush.
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let ps = super::super::ps::PsDemuxer::new();
+    let (_dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        None,
+        Some(ps),
+    )
+    .unwrap();
+
+    // PES (video 0xE0, bounded length 5) + program-end delimiter.
+    let mut buf = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x77, 0x88,
+    ];
+    buf.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]); // program end
+    pf_tx.send(Ok(buf)).unwrap();
+    drop(pf_tx);
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    assert!(
+        matches!(batches.last(), Some(DemuxBatch::Eof)),
+        "PS path sends Eof"
+    );
+    let saw = batches.iter().any(|b| match b {
+        DemuxBatch::Ps(p) => p.iter().any(|x| x.data == vec![0x77, 0x88]),
+        _ => false,
+    });
+    assert!(saw, "PS PES must be demuxed and delivered");
+}
+
+// A PS input commonly ends with no program-end code: the last PES is only completed by
+// flush() and must still be delivered, before the Eof, and every PES is stamped with its
+// position in the whole input, across buffers.
+#[test]
+fn ps_tail_without_a_program_end_is_flushed_with_its_source() {
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let ps = super::super::ps::PsDemuxer::new();
+    let (_dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        None,
+        Some(ps),
+    )
+    .unwrap();
+
+    // A bounded PES (11 bytes), then, in the next buffer, an unbounded one.
+    let first = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x77, 0x88,
+    ];
+    let second = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x99, 0xAA,
+    ];
+    pf_tx.send(Ok(first.clone())).unwrap();
+    pf_tx.send(Ok(second)).unwrap();
+    drop(pf_tx);
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    assert!(matches!(batches.last(), Some(DemuxBatch::Eof)));
+    let got: Vec<(Vec<u8>, u64)> = batches
+        .iter()
+        .filter_map(|b| match b {
+            DemuxBatch::Ps(p) => Some(p),
+            _ => None,
+        })
+        .flatten()
+        .map(|x| (x.data.clone(), x.source.expect("stamped").byte))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (vec![0x77, 0x88], 0),
+            (vec![0x99, 0xAA], first.len() as u64)
+        ]
+    );
+}
+
+#[test]
+fn no_demuxer_configured_still_recycles_and_eofs() {
+    // With neither ts nor ps set, the worker must still recycle buffers
+    // and terminate with Eof — also forward an empty batch per buffer for disconnect detection.
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, rc_rx) = bounded::<Vec<u8>>(4);
+    let (_dt, rx) =
+        DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), &crate::ctx::Ctx::default(), None, None)
+            .unwrap();
+
+    pf_tx.send(Ok(vec![0u8; 192])).unwrap();
+    assert!(
+        rc_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "buffer recycled"
+    );
+    drop(pf_tx);
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    // The no-demuxer branch now forwards an empty Ts batch per buffer for
+    // early consumer-disconnect detection (same rationale as the ts/ps
+    // branches), then the Eof sentinel.
+    assert_eq!(
+        batches.len(),
+        2,
+        "empty Ts disconnect-probe batch, then Eof"
+    );
+    assert!(matches!(batches[0], DemuxBatch::Ts(ref v) if v.is_empty()));
+    assert!(matches!(batches[1], DemuxBatch::Eof));
+}
+
+#[test]
+fn empty_batches_are_forwarded_for_disconnect_detection() {
+    // The worker forwards every batch, including empty ones, so disconnect is
+    // detected promptly via `send()`. Only the explicit `Eof` sentinel ends the
+    // stream, so a no-PES buffer produces an empty Ts batch followed by Eof.
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let pid = 0x1011;
+    let ts = super::super::ts::TsDemuxer::new(&[pid]);
+    let (_dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+
+    // A non-PUSI packet on a tracked PID with header_remaining 0 and no
+    // active PES: process_packet pushes nothing (asm inactive), so feed
+    // returns empty and flush also returns empty.
+    const SYNC: u8 = 0x47;
+    let mut pkt = vec![0u8; 192];
+    pkt[4] = SYNC;
+    pkt[5] = ((pid >> 8) as u8) & 0x1F; // no PUSI
+    pkt[6] = (pid & 0xFF) as u8;
+    pkt[7] = 0x10; // payload only
+    pf_tx.send(Ok(pkt)).unwrap();
+    drop(pf_tx);
+
+    let batches = collect_batches(&rx, Duration::from_secs(5));
+    assert_eq!(batches.len(), 2, "empty Ts batch forwarded, then Eof");
+    assert!(matches!(batches[0], DemuxBatch::Ts(ref v) if v.is_empty()));
+    assert!(matches!(batches[1], DemuxBatch::Eof));
+}
+
+// Regression: worker must detect consumer disconnect even when every batch is empty, else
+// it reads the rest of the title before exiting (join() blocking for minutes). The
+// producer never ends here, so only the always-send probe lets the worker exit.
+#[test]
+fn worker_exits_promptly_on_consumer_drop_during_empty_batches() {
+    let tracked_pid = 0x1011u16;
+    let untracked_pid = 0x0100u16;
+    const SYNC: u8 = 0x47;
+    // A non-PUSI packet on an untracked PID: TsDemuxer.feed() returns empty every call.
+    let mut empty_pkt = vec![0u8; 192];
+    empty_pkt[4] = SYNC;
+    empty_pkt[5] = ((untracked_pid >> 8) as u8) & 0x1F; // no PUSI
+    empty_pkt[6] = (untracked_pid & 0xFF) as u8;
+    empty_pkt[7] = 0x10; // payload only
+
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(4);
+    let ts = super::super::ts::TsDemuxer::new(&[tracked_pid]);
+    let (dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+    // An endless producer: it stops only once the worker is gone.
+    std::thread::spawn(move || while pf_tx.send(Ok(empty_pkt.clone())).is_ok() {});
+    drop(rx);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(dt); // joins the worker
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker must exit after consumer drop during empty batches");
+}
+
+// PipelinedPesStream must drop its receiver before this handle (field order):
+// a worker blocked on the full channel then exits instead of deadlocking.
+#[test]
+fn dropping_a_stream_with_a_blocked_worker_does_not_hang() {
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(16);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(16);
+    let pid = 0x1011;
+    let ts = super::super::ts::TsDemuxer::new(&[pid]);
+    let (dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::default(),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+    for i in 0..8u8 {
+        let mut chunk = bdts_pes_packet(pid, &[i]);
+        chunk.extend(bdts_pes_packet(pid, &[i, i]));
+        pf_tx.send(Ok(chunk)).unwrap();
+    }
+    drop(pf_tx);
+    // Wait (polling, no fixed sleep) until the worker has filled its output.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !rx.is_full() {
+        assert!(std::time::Instant::now() < deadline, "channel never filled");
+        std::thread::yield_now();
+    }
+    let stream = super::super::pipelined_stream::PipelinedPesStream::new(
+        dt,
+        rx,
+        crate::disc::DiscTitle::empty(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(stream);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("drop must not deadlock on the blocked demux worker");
+}
+
+/// LP10: a worker blocked on its full output channel, then a cancel. With the
+/// consumer still attached and more input pending, the cancel alone ends the worker:
+/// it sends `Halted` after at most the batches already in flight, then exits.
+#[test]
+fn a_cancel_ends_a_worker_blocked_on_a_full_channel() {
+    let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(16);
+    let (rc_tx, _rc_rx) = bounded::<Vec<u8>>(16);
+    let pid = 0x1011;
+    let ts = super::super::ts::TsDemuxer::new(&[pid]);
+    let halt = Halt::new();
+    let (dt, rx) = DemuxThread::spawn_zero_copy(
+        pf_rx,
+        rc_tx,
+        (),
+        &crate::ctx::Ctx::new(halt.clone()),
+        Some(ts),
+        None,
+    )
+    .unwrap();
+    // Rebound after `dt` so a failing assert drops the input first (no hung join).
+    let pf_tx = pf_tx;
+    for i in 0..16u8 {
+        pf_tx.send(Ok(bdts_pes_packet(pid, &[i]))).unwrap();
+    }
+    // Wait (polling, no fixed sleep) until the output channel is full.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !rx.is_full() {
+        assert!(std::time::Instant::now() < deadline, "channel never filled");
+        std::thread::yield_now();
+    }
+    halt.cancel();
+    let batches = collect_batches(&rx, Duration::from_secs(10));
+    assert!(
+        matches!(batches.last(), Some(DemuxBatch::Err(e)) if crate::error::is_halt(e)),
+        "the cancel must end the worker with Halted"
+    );
+    assert!(
+        batches.len() <= DEMUX_CHANNEL_DEPTH + 2,
+        "no input read after the cancel: {} batches",
+        batches.len()
+    );
+    drop(rx);
+    drop(dt); // the worker has exited: joins at once
+}

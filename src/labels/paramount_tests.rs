@@ -1,0 +1,690 @@
+use super::*;
+
+fn hint_id(doc: &str) -> Option<u16> {
+    feature_hint(doc).and_then(|h| h.playlist_id)
+}
+
+// Tier 1 ranks exact `Feature` names by duration, not document order.
+#[test]
+fn exact_feature_tier_prefers_the_longest_duration() {
+    let doc = r#"
+            <playlist name="Feature" id="00001" duration="600" aud="eng"/>
+            <playlist name="Feature" id="00002" duration="7000" aud="eng"/>
+        "#;
+    assert_eq!(hint_id(doc), Some(2));
+}
+
+// A zero-audio exact `Feature` still wins over an audio-bearing extra: its id feeds the hint.
+#[test]
+fn zero_audio_exact_feature_is_still_selected() {
+    let doc = r#"
+            <playlist name="Feature" id="00800"/>
+            <playlist name="Bonus" id="00900" aud="eng,fra"/>
+        "#;
+    assert_eq!(hint_id(doc), Some(800));
+}
+
+// With equal audio counts, tier 3 breaks the tie by the longer duration.
+#[test]
+fn most_audio_tier_breaks_a_tie_by_longer_duration() {
+    let doc = r#"
+            <playlist name="Menu" id="00001" duration="600" aud="eng,fra"/>
+            <playlist name="Other" id="00002" duration="7000" aud="eng,fra"/>
+        "#;
+    assert_eq!(hint_id(doc), Some(2));
+}
+
+// Exactly the minimum feature length is a feature; one second less is a decoy.
+#[test]
+fn minimum_feature_length_is_inclusive() {
+    let doc = |secs: u64| format!(r#"<playlist name="Feature" id="00800" duration="{secs}"/>"#);
+    assert_eq!(hint_id(&doc(60)), Some(800));
+    assert_eq!(hint_id(&doc(59)), None);
+}
+
+// Every duration attribute spelling arms the sub-minute decoy guard.
+#[test]
+fn every_duration_attribute_spelling_is_honoured() {
+    for key in ["duration", "durs", "dur", "runtime", "length", "len"] {
+        let doc = format!(
+            r#"<playlist name="Feature" id="00001" {key}="10"/>
+                   <playlist name="Feature" id="00800" {key}="7000"/>"#
+        );
+        assert_eq!(hint_id(&doc), Some(800), "{key}");
+    }
+}
+
+// Immunity pin, section-boundary half.
+#[test]
+fn a_playlists_stream_list_cannot_run_into_the_next_playlist() {
+    let doc = r#"
+            <playlist name="Feature" aud="eng,fra" sub="eng,spa" forced_sub="0,1"/>
+            <playlist name="Bonus" aud="deu,ita,jpn" sub="deu,ita,jpn"/>
+        "#;
+    let feature = find_feature_playlist(doc).expect("feature playlist found");
+    let labels = labels_from_feature(feature);
+    let got: Vec<(StreamLabelType, u16, &str)> = labels
+        .iter()
+        .map(|l| (l.stream_type, l.stream_number, l.language.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (StreamLabelType::Audio, 1, "eng"),
+            (StreamLabelType::Audio, 2, "fra"),
+            (StreamLabelType::Subtitle, 1, "eng"),
+            (StreamLabelType::Subtitle, 2, "spa"),
+        ],
+        "the CSV's own cells are the whole stream list"
+    );
+
+    // Same document with the feature element left unterminated.
+    let unterminated = r#"
+            <playlist name="Feature" aud="eng,fra">
+            <playlist name="Bonus" aud="deu,ita,jpn"/>
+        "#;
+    assert!(
+        find_feature_playlist(unterminated).is_none(),
+        "a missing element boundary truncates the walk, never extends it"
+    );
+}
+
+// Replaces a flaky wall-clock test.
+#[test]
+fn bounding_the_parse_does_not_change_a_legitimate_playlist() {
+    // Three real indices, then far more entries than can address a cell.
+    const OVERSIZED: usize = MAX_COM_INDICES + 10_000;
+    let mut feature = String::from(r#"<playlist name="Feature" sub=""#);
+    feature.push_str(&"eng,".repeat(8));
+    feature.pop();
+    feature.push_str(r#"" sub_com1_idx="0,2,4,"#);
+    feature.push_str(&"9999999,".repeat(OVERSIZED));
+    feature.pop();
+    feature.push_str(r#"" />"#);
+
+    let labels = labels_from_feature(&feature);
+
+    // The fixture's real indices still decide the purposes: bounding the
+    // parse must not change what a legitimate playlist means.
+    assert_eq!(labels.len(), 8);
+    assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
+    assert_eq!(labels[1].purpose, LabelPurpose::Normal);
+    assert_eq!(labels[2].purpose, LabelPurpose::Commentary);
+    assert_eq!(labels[3].purpose, LabelPurpose::Normal);
+    assert_eq!(labels[4].purpose, LabelPurpose::Commentary);
+}
+
+// The set REFUSES unaddressable indices. DISTINCT values on purpose — a `HashSet` collapses
+// repeats, so only distinct entries can prove the filter exists.
+#[test]
+fn distinct_unaddressable_indices_are_refused_not_stored() {
+    let hostile: String = (MAX_COM_INDICES..MAX_COM_INDICES + 50_000)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let set = com_indices(Some(hostile));
+    assert!(
+        set.is_empty(),
+        "kept {} unaddressable indices — the parse is still unbounded",
+        set.len()
+    );
+    // The addressable ones are still kept.
+    assert_eq!(com_indices(Some("0,2,4".to_string())).len(), 3);
+}
+
+// `forced_sub` is bounded too, and read through `forced_subs` rather than the labels for
+// the same reason as the tests above.
+#[test]
+fn forced_sub_cells_past_the_last_addressable_one_are_not_parsed() {
+    let hostile = "0,".repeat(MAX_COM_INDICES + 50_000);
+    let cells = forced_subs(Some(hostile));
+    assert_eq!(
+        cells.len(),
+        MAX_COM_INDICES,
+        "parsed {} cells — the forced_sub parse is still unbounded",
+        cells.len()
+    );
+}
+
+/// Bounding it must not change what a legitimate playlist means: the
+/// cells that CAN address a stream still classify exactly as before.
+#[test]
+fn bounding_forced_sub_leaves_the_addressable_cells_alone() {
+    let cells = forced_subs(Some("0,1,3,2".to_string()));
+    assert_eq!(
+        cells,
+        vec![
+            ForcedSub::None,
+            ForcedSub::ContainsForcedSegments,
+            ForcedSub::ForcedNarrative,
+            ForcedSub::ForcedNarrative,
+        ]
+    );
+}
+
+// An index that cannot address any cell is dropped rather than STORED. Asserted through
+// `com_indices`, not the labels.
+#[test]
+fn an_index_that_cannot_address_any_cell_is_not_retained() {
+    let set = com_indices(Some(format!(
+        "1,{},{}",
+        MAX_COM_INDICES,
+        MAX_COM_INDICES + 1
+    )));
+    assert_eq!(
+        set.len(),
+        1,
+        "only the addressable index belongs in the set, got {set:?}"
+    );
+    assert!(set.contains(&1));
+}
+
+/// Headroom: the BD STN_table admits at most 32 PG streams per playlist,
+/// and a real `sub_com1_idx` lists a handful of commentary tracks. The set
+/// must behave identically to the old scan on real-shaped input.
+#[test]
+fn commentary_indices_still_match_on_real_shaped_input() {
+    let feature = r#"<playlist name="Feature" sub="eng,eng,zho,ces,dan" sub_com1_idx="1,3" />"#;
+    let labels = labels_from_feature(feature);
+    let purposes: Vec<LabelPurpose> = labels.iter().map(|l| l.purpose).collect();
+    assert_eq!(
+        purposes,
+        vec![
+            LabelPurpose::Normal,
+            LabelPurpose::Commentary,
+            LabelPurpose::Normal,
+            LabelPurpose::Commentary,
+            LabelPurpose::Normal,
+        ]
+    );
+}
+
+fn audio(labels: &[StreamLabel]) -> Vec<&StreamLabel> {
+    labels
+        .iter()
+        .filter(|l| l.stream_type == StreamLabelType::Audio)
+        .collect()
+}
+
+fn subs(labels: &[StreamLabel]) -> Vec<&StreamLabel> {
+    labels
+        .iter()
+        .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+        .collect()
+}
+
+// An empty CSV cell carries nothing to label but still OCCUPIES its STN slot, so it must
+// not renumber the slots behind it.
+#[test]
+fn empty_csv_slot_still_occupies_its_stn_slot() {
+    // Audio: slot 2 is empty; `fra` is STN slot 3 and is the commentary
+    // the vendor pointed at with the 0-based CSV index 2.
+    let feature = r#"<playlist name="Feature" aud="eng,,fra" aud_com1_idx="2" />"#;
+    let labels = labels_from_feature(feature);
+    let a = audio(&labels);
+    assert_eq!(a.len(), 2, "the empty slot carries no label");
+    assert_eq!(a[0].language, "eng");
+    assert_eq!(a[0].stream_number, 1);
+    assert_eq!(a[1].language, "fra");
+    assert_eq!(
+        a[1].stream_number, 3,
+        "an empty CSV cell occupies STN slot 2, so `fra` is slot 3"
+    );
+    assert_eq!(a[1].purpose, LabelPurpose::Commentary);
+
+    // Subtitles: same shape, and the consequence is a misplaced forced
+    // flag. `forced_sub` index 2 is the forced-narrative track; with the
+    // empty slot renumbered away it would be written onto STN slot 2.
+    let feature = r#"<playlist name="Feature" sub="eng,,fra" forced_sub="0,0,3" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s.len(), 2);
+    assert_eq!(s[0].language, "eng");
+    assert_eq!(s[0].stream_number, 1);
+    assert_eq!(s[0].qualifier, LabelQualifier::None);
+    assert_eq!(s[1].language, "fra");
+    assert_eq!(
+        s[1].stream_number, 3,
+        "the forced marker belongs to STN slot 3, not slot 2"
+    );
+    assert_eq!(s[1].qualifier, LabelQualifier::Forced);
+}
+
+#[test]
+fn empty_middle_slot_carries_no_label_but_keeps_its_slot() {
+    // aud="eng,,fra": the empty middle cell yields no label — there is
+    // nothing to label — but it still owns STN slot 2, so `fra` is slot
+    // 3. (This test previously asserted 2, pinning the renumbering bug.)
+    let feature = r#"<playlist name="Feature" aud="eng,,fra" />"#;
+    let labels = labels_from_feature(feature);
+    let a = audio(&labels);
+    assert_eq!(a.len(), 2);
+    assert_eq!(a[0].language, "eng");
+    assert_eq!(a[0].stream_number, 1);
+    assert_eq!(a[1].language, "fra");
+    assert_eq!(a[1].stream_number, 3);
+}
+
+#[test]
+fn aud_com1_idx_trimmed_and_multivalue() {
+    // Whitespace and multi-value lists must both resolve; com index is
+    // positional against the raw CSV, so with an empty slot at position 1,
+    // " 2 " marks 'fra' (CSV index 2, STN slot 3) as commentary.
+    let feature = r#"<playlist aud="eng,,fra" aud_com1_idx=" 2 " />"#;
+    let labels = labels_from_feature(feature);
+    let a = audio(&labels);
+    assert_eq!(a.len(), 2);
+    assert_eq!(a[1].language, "fra");
+    assert_eq!(a[1].purpose, LabelPurpose::Commentary);
+    assert_eq!(a[0].purpose, LabelPurpose::Normal);
+}
+
+#[test]
+fn forced_sub_aligns_with_raw_csv_index() {
+    // sub="eng,eng,zho,ces" forced_sub="0,0,0,3": the forced marker is
+    // positional on the raw CSV, so 'ces' (index 3) is forced; its
+    // stream_number is its 1-based cell position, 4.
+    let feature = r#"<playlist sub="eng,eng,zho,ces" forced_sub="0,0,0,3" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s.len(), 4);
+    assert_eq!(s[3].language, "ces");
+    assert_eq!(s[3].qualifier, LabelQualifier::Forced);
+    assert_eq!(s[3].stream_number, 4);
+}
+
+#[test]
+fn find_feature_skips_empty_audio_slot_playlist() {
+    // A playlist of all-empty audio slots must not outscore a real
+    // two-language feature.
+    let xml = r#"
+            <playlist name="Junk" aud=",,,,," />
+            <playlist name="Movie" aud="eng,fra" />
+        "#;
+    let feature = find_feature_playlist(xml).expect("a feature is found");
+    assert!(feature.contains(r#"name="Movie""#));
+}
+
+// ── Additional hardening tests ─────────────────────────────────────────
+
+/// Spec: `name="Feature"` (case-insensitive) wins immediately.
+/// Mutation: use case-sensitive equality → "feature" (lowercase) not found.
+#[test]
+fn find_feature_name_match_case_insensitive() {
+    let xml = r#"<playlist name="feature" aud="eng" />"#;
+    let feature = find_feature_playlist(xml).expect("found");
+    assert!(feature.contains("eng"));
+}
+
+/// Spec: when no name="Feature" present, most audio slots wins.
+/// Mutation: use first playlist instead of max-audio-count → wrong playlist chosen.
+#[test]
+fn find_feature_selects_most_audio_streams() {
+    let xml = r#"
+            <playlist name="Preview" aud="eng" />
+            <playlist name="MainMovie" aud="eng,fra,spa,deu" />
+            <playlist name="Short" aud="eng,fra" />
+        "#;
+    let feature = find_feature_playlist(xml).expect("found");
+    assert!(feature.contains(r#"name="MainMovie""#));
+}
+
+// Spec: stream_number is the cell's own 1-based CSV position, since
+// empty cells are slots too. Mutation: count only non-empty cells →
+// every label behind an empty cell shifts one slot forward.
+#[test]
+fn audio_stream_numbering_uses_raw_csv_slot_position() {
+    let feature = r#"<playlist name="Feature" aud="eng,,fra,,spa" />"#;
+    let labels = labels_from_feature(feature);
+    let a = audio(&labels);
+    assert_eq!(a.len(), 3);
+    assert_eq!(a[0].language, "eng");
+    assert_eq!(a[0].stream_number, 1);
+    assert_eq!(a[1].language, "fra");
+    assert_eq!(a[1].stream_number, 3);
+    assert_eq!(a[2].language, "spa");
+    assert_eq!(a[2].stream_number, 5);
+}
+
+/// Spec: forced subtitle at the last position with gaps in between.
+/// raw CSV index 4 means the last subtitle (5th entry) is forced.
+/// Mutation: use stream_number (dense) instead of raw index → wrong subtitle forced.
+#[test]
+fn forced_sub_uses_raw_csv_index_with_gaps() {
+    // sub="eng,,fra,,spa" forced_sub="0,0,0,0,3"
+    // raw CSV index 4 = "spa", i.e. STN slot 5.
+    let feature = r#"<playlist name="Feature" sub="eng,,fra,,spa" forced_sub="0,0,0,0,3" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s.len(), 3);
+    assert_eq!(s[0].language, "eng");
+    assert_eq!(s[0].qualifier, LabelQualifier::None);
+    assert_eq!(s[1].language, "fra");
+    assert_eq!(s[1].qualifier, LabelQualifier::None);
+    assert_eq!(s[2].language, "spa");
+    assert_eq!(s[2].qualifier, LabelQualifier::Forced);
+    assert_eq!(s[2].stream_number, 5);
+}
+
+// Spec: aud_com1_idx is positional against the raw CSV, so an empty
+// gap before the index does not shift what's labeled commentary.
+// Mutation: use stream_number instead of raw CSV index.
+#[test]
+fn audio_commentary_index_raw_csv_position() {
+    // aud="eng,,fra,spa" aud_com1_idx="2" → CSV index 2 = "fra",
+    // which is STN slot 3.
+    let feature = r#"<playlist name="Feature" aud="eng,,fra,spa" aud_com1_idx="2" />"#;
+    let labels = labels_from_feature(feature);
+    let a = audio(&labels);
+    assert_eq!(a.len(), 3);
+    assert_eq!(a[1].language, "fra");
+    assert_eq!(a[1].stream_number, 3);
+    assert_eq!(a[1].purpose, LabelPurpose::Commentary);
+    assert_eq!(a[0].purpose, LabelPurpose::Normal);
+    assert_eq!(a[2].purpose, LabelPurpose::Normal);
+}
+
+/// Spec: sub_com1_idx can be a comma-separated list with multiple values.
+/// Mutation: only parse the first value → multi-commentary subtitles missed.
+#[test]
+fn subtitle_commentary_multiple_indices() {
+    let feature = r#"<playlist name="Feature" sub="eng,fra,spa,deu" sub_com1_idx="2,3" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s.len(), 4);
+    assert_eq!(s[0].purpose, LabelPurpose::Normal);
+    assert_eq!(s[1].purpose, LabelPurpose::Normal);
+    assert_eq!(s[2].purpose, LabelPurpose::Commentary); // index 2
+    assert_eq!(s[3].purpose, LabelPurpose::Commentary); // index 3
+}
+
+/// Spec: an absent `aud` attribute means no audio labels are emitted.
+/// Mutation: default aud to "*" instead of None → spurious labels generated.
+#[test]
+fn feature_without_aud_attr_yields_no_audio_labels() {
+    // Only subtitle data; no aud= attribute.
+    let feature = r#"<playlist name="Feature" sub="eng,fra" />"#;
+    let labels = labels_from_feature(feature);
+    let a = audio(&labels);
+    assert!(a.is_empty(), "no audio labels when aud is absent");
+    let s = subs(&labels);
+    assert_eq!(s.len(), 2);
+}
+
+/// Spec: an absent `sub` attribute means no subtitle labels are emitted.
+/// Mutation: default sub to "*" → spurious labels generated.
+#[test]
+fn feature_without_sub_attr_yields_no_subtitle_labels() {
+    let feature = r#"<playlist name="Feature" aud="eng" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert!(s.is_empty(), "no subtitle labels when sub is absent");
+}
+
+/// Spec: audio stream_number is the cell's 1-based position and never
+/// wraps; past the u16 space the parser stops emitting.
+/// Mutation: cast `i + 1` to u16 → stream numbers wrap to 0, skipping apply.
+#[test]
+fn audio_stream_number_never_wraps() {
+    // 65535 tracks is impossible on a real disc but must not panic/produce 0.
+    // 300 slots is sufficient to exercise the number-assignment logic
+    // via labels_from_feature without building the full 65535-entry CSV.
+    let aud: String = (0..300).map(|_| "eng").collect::<Vec<_>>().join(",");
+    let feature = format!(r#"<playlist name="Feature" aud="{}" />"#, aud);
+    let labels = labels_from_feature(&feature);
+    assert_eq!(labels.len(), 300);
+    // Numbers must be strictly increasing, never 0.
+    let mut last = 0u16;
+    for l in &labels {
+        if let Some(t) = l.stream_number.checked_sub(last) {
+            assert!(t > 0, "stream_number must be strictly increasing");
+        }
+        last = l.stream_number;
+    }
+    assert_eq!(last, 300);
+}
+
+/// Spec: past the u16 STN space both audio and sub stop emitting; the last
+/// number is u16::MAX and none wraps to 0. Mutation: `as u16` cast → wrap.
+#[test]
+fn stream_numbers_stop_at_u16_max_on_audio_and_sub() {
+    let cells = vec!["eng"; u16::MAX as usize + 2].join(",");
+    let feature = format!(r#"<playlist name="Feature" aud="{cells}" sub="{cells}" />"#);
+    let labels = labels_from_feature(&feature);
+    let max = u16::MAX as usize;
+    for (kind, ls) in [("aud", audio(&labels)), ("sub", subs(&labels))] {
+        assert_eq!(ls.len(), max, "{kind}: cells past u16::MAX are dropped");
+        assert_eq!(ls[max - 1].stream_number, u16::MAX, "{kind}");
+        assert!(
+            ls.iter().all(|l| l.stream_number != 0),
+            "{kind}: no wrap to 0"
+        );
+    }
+}
+
+/// Spec: a `forced_sub` cell with surrounding whitespace still classifies.
+/// Mutation: drop the `trim()` → " 3 " falls through to the unrecognised
+/// arm and the disc's forced-narrative track loses its label.
+#[test]
+fn forced_sub_cells_are_trimmed_before_classification() {
+    let feature = r#"<playlist name="Feature" sub="eng,fra,spa" forced_sub="0, 3 , 1 " />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s[0].qualifier, LabelQualifier::None);
+    assert_eq!(s[1].qualifier, LabelQualifier::Forced);
+    assert_eq!(s[2].qualifier, LabelQualifier::None);
+}
+
+// `forced_sub` is an enumeration; `1` means "full dialogue track that also carries forced
+// signs", NOT "this track is forced".
+#[test]
+fn a_contains_forced_segments_cell_is_not_a_forced_track() {
+    let feature = r#"<playlist name="Feature" sub="eng,ces,deu" forced_sub="0,1,1" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s.len(), 3);
+    assert!(
+        s.iter().all(|l| l.qualifier == LabelQualifier::None),
+        "a `1` marks a full track containing forced signs, not a forced track"
+    );
+}
+
+// `2` and `3` are the cells that DO name a dedicated forced-narrative track, and the old
+// boolean reading discarded both.
+#[test]
+fn a_dedicated_forced_narrative_cell_is_a_forced_track() {
+    // The measured shape: full tracks first, their forced companions in
+    // trailing slots of the same languages.
+    let feature = r#"<playlist name="Feature" sub="eng,cat,jpn,cat,jpn" forced_sub="0,0,0,2,3" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s.len(), 5);
+    assert_eq!(s[1].qualifier, LabelQualifier::None, "the full cat track");
+    assert_eq!(s[2].qualifier, LabelQualifier::None, "the full jpn track");
+    assert_eq!(s[3].qualifier, LabelQualifier::Forced, "cat forced slot");
+    assert_eq!(s[3].stream_number, 4);
+    assert_eq!(s[4].qualifier, LabelQualifier::Forced, "jpn forced slot");
+    assert_eq!(s[4].stream_number, 5);
+}
+
+// An unrecognised cell must fall to NOT forced — asserting forced is the expensive mistake.
+// Mutation: `_ => ForcedNarrative`, or treating "any non-zero" as forced.
+#[test]
+fn an_unrecognised_forced_sub_cell_is_not_forced() {
+    let feature = r#"<playlist name="Feature" sub="eng,fra,spa,ita" forced_sub="4,x,,-1" />"#;
+    let labels = labels_from_feature(feature);
+    let s = subs(&labels);
+    assert_eq!(s.len(), 4);
+    assert!(s.iter().all(|l| l.qualifier == LabelQualifier::None));
+    // ...and so must a cell the CSV simply does not reach.
+    let feature = r#"<playlist name="Feature" sub="eng,fra" forced_sub="0" />"#;
+    let labels = labels_from_feature(feature);
+    assert_eq!(subs(&labels)[1].qualifier, LabelQualifier::None);
+}
+
+/// Spec: `find_feature_playlist` returns None when XML has no `<playlist>` elements.
+/// Mutation: return a default struct instead of None → downstream code mislabels.
+#[test]
+fn find_feature_returns_none_on_empty_xml() {
+    assert!(find_feature_playlist("").is_none());
+    assert!(find_feature_playlist("<root />").is_none());
+}
+
+// The feature hint's id and filename are derived from ONE parsed number, so
+// they always name the same playlist (canonical 5-digit NNNNN.mpls), and a
+// playlist with no numeric id yields no hint rather than a half-hint.
+#[test]
+fn feature_hint_id_and_filename_agree() {
+    let feature = r#"<playlist name="Feature" id="00222" duration="7000" />"#;
+    let h = element_hint(feature).expect("a numeric id yields a hint");
+    assert_eq!(h.playlist_id, Some(222));
+    assert_eq!(h.filename.as_deref(), Some("00222.mpls"));
+    assert!(h.matches(222, "00222.mpls"), "the two fields agree");
+
+    // No id / non-numeric id → no hint (not a filename-only half-hint).
+    assert!(element_hint(r#"<playlist name="Feature" />"#).is_none());
+    assert!(element_hint(r#"<playlist id="menu" />"#).is_none());
+}
+
+// Spec: on a tie in audio-slot count, the FIRST playlist wins. Mutation: `count >
+// best_aud_count` -> `count >= best_aud_count` lets a later tie silently displace it.
+#[test]
+fn find_feature_first_wins_on_audio_count_tie() {
+    let xml = r#"
+            <playlist name="A" aud="eng,fra" />
+            <playlist name="B" aud="deu,spa" />
+        "#;
+    let feature = find_feature_playlist(xml).expect("a feature is found");
+    assert!(
+        feature.contains(r#"name="A""#),
+        "first playlist must win a tie, got: {feature}"
+    );
+}
+
+// Sony SM3 UHD regression: `_Start_Angle` (id 00243, 2s) shares the
+// feature's audio slots and comes first — `/feature/i` matching prefers the
+// `_Feature` playlist (the sub-minute guard is pinned separately below).
+#[test]
+fn feature_selection_rejects_start_angle_decoy() {
+    let xml = r#"
+            <playlist name="_Start_Angle" id="00243" aud="eng,fra,spa" duration="2" />
+            <playlist name="_Feature"     id="00800" aud="eng,fra,spa" duration="7000" />
+            <playlist name="Feature_A"    id="00801" aud="eng,fra,spa" duration="7000" />
+        "#;
+    let feature = find_feature_playlist(xml).expect("a feature is found");
+    assert!(
+        !feature.contains("_Start_Angle"),
+        "the 2-second angle decoy must never be the feature: {feature}"
+    );
+    // Tie between the two /feature/i playlists → first wins (_Feature, 00800).
+    let h = feature_hint(xml).expect("hint");
+    assert_eq!(h.playlist_id, Some(800));
+    assert_eq!(h.filename.as_deref(), Some("00800.mpls"));
+}
+
+// Among /feature/i playlists, the longest duration wins — not document order.
+#[test]
+fn feature_like_longest_duration_wins() {
+    let xml = r#"
+            <playlist name="_Feature"  id="00800" aud="eng,fra" duration="6000" />
+            <playlist name="Feature_B" id="00802" aud="eng,fra" duration="8000" />
+        "#;
+    let h = feature_hint(xml).expect("hint");
+    assert_eq!(
+        h.playlist_id,
+        Some(802),
+        "the longer /feature/i playlist wins"
+    );
+}
+
+// The sub-minute guard also applies when the ONLY /feature/i playlist is a
+// decoy: it is rejected and selection falls through to the real feature.
+#[test]
+fn sub_minute_feature_name_is_rejected() {
+    let xml = r#"
+            <playlist name="Feature_B"       id="00050" aud="eng,fra,spa" duration="30" />
+            <playlist name="MainMovie"       id="00800" aud="eng,fra,spa" duration="7000" />
+        "#;
+    let feature = find_feature_playlist(xml).expect("a feature is found");
+    // Feature_B names the feature but is sub-minute → rejected; tier 3 picks
+    // MainMovie (equal audio, far longer duration).
+    assert!(feature.contains(r#"id="00800""#), "got {feature}");
+}
+
+// "Featurette"/"Bonus_Features" are not the word "feature": the most-audio
+// tier must still pick the real feature.
+#[test]
+fn featurette_names_do_not_match_the_feature_tier() {
+    for name in ["Featurette", "Bonus_Features", "FeatureCommentary"] {
+        let xml = format!(
+            r#"<playlist name="MainMovie" id="00800" aud="eng,fra,spa,deu" duration="7000"/>
+                <playlist name="{name}" id="00100" aud="eng" duration="900"/>"#
+        );
+        let h = feature_hint(&xml).expect("hint");
+        assert_eq!(h.playlist_id, Some(800), "{name}");
+    }
+}
+
+// "feature" as a camelCase word counts; a compound with an extras word does not.
+#[test]
+fn feature_word_matching_handles_camel_case_and_extras() {
+    for name in [
+        "MainFeature",
+        "FeatureFilm",
+        "TheatricalFeature",
+        "ExtendedFeature",
+        "_Feature",
+        "Feature_A",
+    ] {
+        assert!(names_feature(name), "{name}");
+    }
+    for name in [
+        "Feature_Trailer",
+        "FeatureCommentary",
+        "BonusFeature",
+        "Featurette",
+        "Feature_Promo",
+        "FeaturePreview",
+        "Feature_Making",
+        "FeatureDeletedScenes",
+        "BehindTheFeature",
+        "FeatureInterview",
+        "FeatureRecap",
+        "SneakFeature",
+    ] {
+        assert!(!names_feature(name), "{name}");
+    }
+}
+
+// The sub-minute guard in the exact name="Feature" tier: a lone 2 s exact
+// "Feature" is skipped and selection falls through to the real feature.
+#[test]
+fn sub_minute_exact_feature_is_rejected() {
+    let xml = r#"
+            <playlist name="Feature"   id="00243" aud="eng,fra,spa" duration="2" />
+            <playlist name="MainMovie" id="00800" aud="eng,fra,spa" duration="7000" />
+        "#;
+    assert_eq!(feature_hint(xml).and_then(|h| h.playlist_id), Some(800));
+}
+
+// An id above u16::MAX yields no hint at all, never a filename-only half-hint.
+#[test]
+fn feature_hint_rejects_an_id_above_u16() {
+    let xml = r#"<playlist name="Feature" id="70000" aud="eng" duration="7000" />"#;
+    assert_eq!(feature_hint(xml), None);
+}
+
+// Duration attribute reading: several key spellings, digits only, zero → None.
+#[test]
+fn playlist_duration_reads_known_attrs() {
+    assert_eq!(
+        playlist_duration_secs(r#"<playlist duration="7000" />"#),
+        Some(7000)
+    );
+    assert_eq!(
+        playlist_duration_secs(r#"<playlist durs="7628" />"#),
+        Some(7628)
+    );
+    assert_eq!(playlist_duration_secs(r#"<playlist dur="0" />"#), None);
+    assert_eq!(playlist_duration_secs(r#"<playlist name="x" />"#), None);
+}

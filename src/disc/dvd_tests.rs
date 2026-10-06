@@ -1,0 +1,2345 @@
+use super::*;
+use crate::sector::SectorSource;
+use std::collections::HashMap;
+
+// In-memory disc + minimal UDF image (single physical partition,
+// metadata_start == partition_start). Offsets cited against
+// udf.rs::read_filesystem / ECMA-167.
+
+const PART_START: u32 = 3000;
+
+struct MemDisc {
+    sectors: HashMap<u32, [u8; 2048]>,
+}
+impl MemDisc {
+    fn new() -> Self {
+        Self {
+            sectors: HashMap::new(),
+        }
+    }
+    fn put(&mut self, lba: u32, data: [u8; 2048]) {
+        self.sectors.insert(lba, data);
+    }
+    fn put_bytes(&mut self, lba: u32, bytes: &[u8]) {
+        for (i, chunk) in bytes.chunks(2048).enumerate() {
+            let mut s = [0u8; 2048];
+            s[..chunk.len()].copy_from_slice(chunk);
+            self.put(lba + i as u32, s);
+        }
+    }
+}
+impl SectorSource for MemDisc {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> crate::error::Result<usize> {
+        let need = count as usize * 2048;
+        for i in 0..count as u32 {
+            let off = i as usize * 2048;
+            let s = self.sectors.get(&(lba + i)).copied().unwrap_or([0u8; 2048]);
+            buf[off..off + 2048].copy_from_slice(&s);
+        }
+        Ok(need)
+    }
+}
+
+/// Extended File Entry ICB (tag 266) with one Short AD. info_length@56,
+/// l_ea@208, l_ad@212, AD len(4)@216 | lba(4)@220.
+fn build_file_icb(size: u32, data_lba: u32) -> [u8; 2048] {
+    let mut s = [0u8; 2048];
+    s[0..2].copy_from_slice(&266u16.to_le_bytes());
+    s[56..64].copy_from_slice(&(size as u64).to_le_bytes());
+    s[208..212].copy_from_slice(&0u32.to_le_bytes());
+    s[212..216].copy_from_slice(&8u32.to_le_bytes());
+    s[216..220].copy_from_slice(&(size & 0x3FFF_FFFF).to_le_bytes());
+    s[220..224].copy_from_slice(&data_lba.to_le_bytes());
+    s
+}
+
+/// One FID (tag 257). file_chars@18, l_fi@19, ICB LBA@24, l_iu@36,
+/// name@(38). Name compression-id 8 (ASCII).
+fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent: bool) {
+    let start = buf.len();
+    let name_field: Vec<u8> = if is_parent {
+        Vec::new()
+    } else {
+        let mut v = vec![0x08u8];
+        v.extend_from_slice(name.as_bytes());
+        v
+    };
+    let mut fid = vec![0u8; 38];
+    fid[0..2].copy_from_slice(&257u16.to_le_bytes());
+    let mut fc = 0u8;
+    if is_dir {
+        fc |= 0x02;
+    }
+    if is_parent {
+        fc |= 0x08;
+    }
+    fid[18] = fc;
+    fid[19] = name_field.len() as u8;
+    fid[24..28].copy_from_slice(&icb_lba.to_le_bytes());
+    fid[36..38].copy_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&fid);
+    buf.extend_from_slice(&name_field);
+    let used = buf.len() - start;
+    buf.resize(start + ((used + 3) & !3), 0);
+}
+
+struct FileSpec {
+    name: String,
+    icb_lba: u32,
+    data_lba: u32,
+    contents: Vec<u8>,
+}
+
+fn build_udf_skeleton(disc: &mut MemDisc, root_icb_lba: u32) {
+    let mut avdp = [0u8; 2048];
+    avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+    disc.put(256, avdp);
+    let mut pd = [0u8; 2048];
+    pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+    pd[188..192].copy_from_slice(&PART_START.to_le_bytes());
+    disc.put(32, pd);
+    let mut lvd = [0u8; 2048];
+    lvd[0..2].copy_from_slice(&6u16.to_le_bytes());
+    lvd[268..272].copy_from_slice(&1u32.to_le_bytes());
+    disc.put(33, lvd);
+    let mut td = [0u8; 2048];
+    td[0..2].copy_from_slice(&8u16.to_le_bytes());
+    disc.put(34, td);
+    let mut fsd = [0u8; 2048];
+    fsd[0..2].copy_from_slice(&256u16.to_le_bytes());
+    fsd[404..408].copy_from_slice(&root_icb_lba.to_le_bytes());
+    disc.put(PART_START, fsd);
+}
+
+/// Build a UDF tree with a single VIDEO_TS directory holding the given
+/// files, and return the navigable UdfFs over `disc`.
+fn build_video_ts_fs(disc: &mut MemDisc, files: &[FileSpec]) -> crate::udf::UdfFs {
+    let mut fids = Vec::new();
+    push_fid(&mut fids, "", 50, true, true);
+    for f in files {
+        push_fid(&mut fids, &f.name, f.icb_lba, false, false);
+        disc.put(
+            PART_START + f.icb_lba,
+            build_file_icb(f.contents.len() as u32, f.data_lba),
+        );
+        disc.put_bytes(PART_START + f.data_lba, &f.contents);
+    }
+    // VIDEO_TS dir ICB + data.
+    disc.put(PART_START + 50, build_file_icb(fids.len() as u32, 51));
+    disc.put_bytes(PART_START + 51, &fids);
+    // Root dir referencing VIDEO_TS.
+    let mut root_fids = Vec::new();
+    push_fid(&mut root_fids, "", 10, true, true);
+    push_fid(&mut root_fids, "VIDEO_TS", 50, true, false);
+    disc.put(PART_START + 10, build_file_icb(root_fids.len() as u32, 11));
+    disc.put_bytes(PART_START + 11, &root_fids);
+    build_udf_skeleton(disc, 10);
+    crate::udf::read_filesystem(disc).expect("fs")
+}
+
+// IFO builders (DVD-Video spec, offsets per ifo.rs). VIDEO_TS.IFO layout.
+fn build_vmg(
+    titles: &[(
+        u16, /*chapters*/
+        u8,  /*vts*/
+        u8,  /*vts_title*/
+    )],
+) -> Vec<u8> {
+    // Put TT_SRPT at sector 1 (offset 2048).
+    let tt_srpt_sector = 1u32;
+    let mut d = vec![0u8; 2 * 2048];
+    d[0..12].copy_from_slice(b"DVDVIDEO-VMG");
+    d[0xC4..0xC8].copy_from_slice(&tt_srpt_sector.to_be_bytes());
+    let base = tt_srpt_sector as usize * 2048;
+    d[base..base + 2].copy_from_slice(&(titles.len() as u16).to_be_bytes());
+    for (i, (chapters, vts, vts_title)) in titles.iter().enumerate() {
+        let e = base + 8 + i * 12;
+        d[e + 2..e + 4].copy_from_slice(&chapters.to_be_bytes());
+        d[e + 6] = *vts;
+        d[e + 7] = *vts_title;
+    }
+    d
+}
+
+/// Cell playback info entry (24 bytes): category byte@0, BCD time@4..8,
+/// first_sector(u32 BE)@8, last_sector(u32 BE)@20.
+fn write_cell(buf: &mut [u8], off: usize, first_sector: u32, last_sector: u32) {
+    buf[off + 8..off + 12].copy_from_slice(&first_sector.to_be_bytes());
+    buf[off + 20..off + 24].copy_from_slice(&last_sector.to_be_bytes());
+}
+
+/// Like [`write_cell`] but also stamps the cell-category byte (`+0`) so a
+/// test can build a leading scene-index / interleaved-angle sub-block cell.
+fn write_cell_cat(buf: &mut [u8], off: usize, first: u32, last: u32, category: u8) {
+    write_cell(buf, off, first, last);
+    buf[off] = category;
+}
+
+// VTS_XX_0.IFO + PGCIT + PGC layout (offsets, vtstt_vobs vs vtsm_vobs).
+#[allow(clippy::too_many_arguments)]
+fn build_vts(
+    vob_start: u32,
+    video_b0: u8,
+    audio: &[(
+        u8,      /*b0 coding/sr*/
+        u8,      /*b1 channels*/
+        [u8; 2], /*lang*/
+    )],
+    subs: &[[u8; 2]],
+    cells: &[(u32, u32)],
+    palette_nonzero: bool,
+) -> Vec<u8> {
+    // Total file: header sector(s) + PGCIT at sector 2.
+    let pgcit_sector = 2u32;
+    let mut d = vec![0u8; 4 * 2048];
+    d[0..12].copy_from_slice(b"DVDVIDEO-VTS");
+    d[0xC4..0xC8].copy_from_slice(&vob_start.to_be_bytes()); // vtstt_vobs (Title VOBS)
+    d[0xCC..0xD0].copy_from_slice(&pgcit_sector.to_be_bytes());
+    d[0x200] = video_b0;
+    d[0x202..0x204].copy_from_slice(&(audio.len() as u16).to_be_bytes());
+    for (i, (b0, b1, lang)) in audio.iter().enumerate() {
+        let a = 0x204 + i * 8;
+        d[a] = *b0;
+        d[a + 1] = *b1;
+        d[a + 2] = lang[0];
+        d[a + 3] = lang[1];
+    }
+    d[0x254..0x256].copy_from_slice(&(subs.len() as u16).to_be_bytes());
+    for (i, lang) in subs.iter().enumerate() {
+        let s = 0x256 + i * 6;
+        d[s + 2] = lang[0];
+        d[s + 3] = lang[1];
+    }
+
+    // PGCIT: one PGC.
+    let pg = pgcit_sector as usize * 2048;
+    d[pg..pg + 2].copy_from_slice(&1u16.to_be_bytes()); // num_pgcs = 1
+    // PGC info entry 0 at pg+8; PGC byte offset (rel to PGCIT) at +4.
+    let pgc_rel: u32 = 0x100; // PGC body 256 bytes into the PGCIT
+    d[pg + 8 + 4..pg + 8 + 8].copy_from_slice(&pgc_rel.to_be_bytes());
+    let pgc = pg + pgc_rel as usize;
+    // Ensure room for PGC (needs >= 0xEA past pgc, plus cell table).
+    d[pgc + 0x02] = 1; // nr_of_programs
+    d[pgc + 0x03] = cells.len() as u8; // nr_of_cells
+    // BCD playback time 00:00:30:00 → 30 s, frame-rate bits 0b01 (25fps)
+    // not needed; keep simple 30s. BCD: hh,mm,ss,frame|rate.
+    d[pgc + 0x04] = 0x00;
+    d[pgc + 0x05] = 0x00;
+    d[pgc + 0x06] = 0x30; // 30 seconds BCD
+    d[pgc + 0x07] = 0b0100_0000; // rate bits = 01 (25fps); 0 frames
+    // pgm map ptr @0xE6, cell playback ptr @0xE8 (rel to PGC start).
+    let cell_tbl_rel: u16 = 0xF0;
+    let pgm_map_rel: u16 = 0xEC;
+    d[pgc + 0xE6..pgc + 0xE8].copy_from_slice(&pgm_map_rel.to_be_bytes());
+    d[pgc + 0xE8..pgc + 0xEA].copy_from_slice(&cell_tbl_rel.to_be_bytes());
+    // Program map: program 0 → first cell 1.
+    d[pgc + pgm_map_rel as usize] = 1;
+    // Cell playback table.
+    let cell_base = pgc + cell_tbl_rel as usize;
+    for (i, (first, last)) in cells.iter().enumerate() {
+        write_cell(&mut d, cell_base + i * 24, *first, *last);
+    }
+    // Palette at PGC+0xA4: 16 × [pad,Y,Cb,Cr]. Non-zero if requested.
+    if palette_nonzero {
+        d[pgc + 0xA4 + 1] = 0x40; // Y of color 0
+    }
+    // SPST_CTL: every declared subpicture present, all four ids = its ordinal.
+    let ordinal: Vec<u32> = (0..subs.len() as u32)
+        .map(|i| 0x8000_0000 | (i << 24) | (i << 16) | (i << 8) | i)
+        .collect();
+    set_spst(&mut d, &ordinal);
+    let ast: Vec<u16> = (0..audio.len() as u16).map(|i| 0x8000 | (i << 8)).collect();
+    set_ast(&mut d, &ast);
+    d
+}
+
+// Overwrites build_vts's PGC_AST_CTL (PGC+0x0C, 8 x u16 BE).
+fn set_ast(vts: &mut [u8], ctl: &[u16]) {
+    let at = 2 * 2048 + 0x100 + 0x0C;
+    for (i, c) in ctl.iter().enumerate() {
+        vts[at + i * 2..at + i * 2 + 2].copy_from_slice(&c.to_be_bytes());
+    }
+}
+
+// Scans a one-VTS disc and returns its first title's (pid, language) audio tracks.
+fn scan_audio(vts: Vec<u8>) -> (Vec<(u16, String)>, Vec<String>) {
+    let mut disc = MemDisc::new();
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: build_vmg(&[(1, 1, 1)]),
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let (t, ev) = crate::testlog::capture(|| {
+        Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0
+    });
+    let audio = t[0]
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Audio(a) => Some((a.pid, a.language.clone())),
+            _ => None,
+        })
+        .collect();
+    (audio, diag_lines(&ev))
+}
+
+const AC3_6CH: (u8, u8) = (0x00, 0x05);
+const DTS_6CH: (u8, u8) = (0xC0, 0x05);
+const MP2_2CH: (u8, u8) = (0x40, 0x01);
+
+fn aud(c: (u8, u8), lang: &[u8; 2]) -> (u8, u8, [u8; 2]) {
+    (c.0, c.1, *lang)
+}
+
+/// L084b: the physical audio stream number comes from PGC_AST_CTL, not the logical
+/// position. This is per spec; do not change without a spec citation proving otherwise.
+#[test]
+fn scan_dvd_titles_audio_uses_ast_ctl_stream_number() {
+    let mut vts = build_vts(0, 0x00, &[aud(AC3_6CH, b"en")], &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0x8100]);
+    // vm_get_audio_stream: "streamN = (...audio_control[audioN] >> 8) & 0x07;" = 1 -> 0x81.
+    assert_eq!(scan_audio(vts).0, vec![(0xBD81, "eng".to_string())]);
+}
+
+/// Codec base + AST_CTL number per libdvdnav; reserved bits 14-11 are masked off.
+#[test]
+fn scan_dvd_titles_audio_ast_ctl_codec_base_and_mask() {
+    let audio = [aud(DTS_6CH, b"en"), aud(AC3_6CH, b"fr")];
+    let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0xFA00, 0x8300]);
+    // "& 0x07" drops bits 14-11: DTS 2 -> VLC "0x88 -> 0x8f"; AC-3 3 -> "0x80 -> 0x87".
+    assert_eq!(
+        scan_audio(vts).0,
+        vec![(0xBD8A, "eng".to_string()), (0xBD83, "fra".to_string())]
+    );
+}
+
+/// A stream AST_CTL marks absent gets no track (spec); a repeated physical id keeps the
+/// first (freemkv policy, not a spec rule: two tracks cannot share one PID).
+#[test]
+fn scan_dvd_titles_audio_skips_absent_and_duplicate() {
+    let audio = [
+        aud(AC3_6CH, b"en"),
+        aud(AC3_6CH, b"fr"),
+        aud(AC3_6CH, b"de"),
+    ];
+    let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0x0000, 0x8200, 0x8200]);
+    let (tracks, diag) = scan_audio(vts);
+    // mpucoder PGC_AST_CTL: "1 = stream available" is clear for entry 0.
+    assert_eq!(tracks, vec![(0xBD82, "fra".to_string())]);
+    assert!(
+        diag.iter().any(|m| m.contains("tag=dvd.astctl")
+            && m.contains("id=0xBD82 kept=\"fra\" dropped=\"deu\"")),
+        "{diag:?}"
+    );
+}
+
+/// No AST_CTL entry present at all: keep every declared stream on its positional id
+/// rather than rip silently, and trace it. freemkv policy, not a spec rule: libdvdnav's
+/// vm_get_audio_stream returns "streamN = -1" (no stream) here.
+#[test]
+fn scan_dvd_titles_audio_all_absent_falls_back_to_position() {
+    let audio = [aud(AC3_6CH, b"en"), aud(DTS_6CH, b"fr")];
+    let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0, 0]);
+    let (tracks, diag) = scan_audio(vts);
+    assert_eq!(
+        tracks,
+        vec![(0xBD80, "eng".to_string()), (0xBD89, "fra".to_string())]
+    );
+    assert!(
+        diag.iter().any(|m| m.contains("tag=dvd.astctl")
+            && m.contains("declared=2 present=0 -> positional routing")),
+        "{diag:?}"
+    );
+}
+
+/// MPEG audio rides its own PES id 0xC0|n, with n from AST_CTL like every other codec.
+/// This is per spec; do not change without a spec citation proving otherwise.
+#[test]
+fn scan_dvd_titles_mp2_audio_routes_by_ast_to_pes_id() {
+    let audio = [aud(MP2_2CH, b"en"), aud(MP2_2CH, b"fr")];
+    let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0x0000, 0x8300]);
+    // mpucoder PGC_AST_CTL: "Stream number (MPEG audio) or Substream number (all others)";
+    // PES: "0xC0 - 0xDF MPEG-1 or MPEG-2 audio stream number x xxxx".
+    assert_eq!(scan_audio(vts).0, vec![(0x00C3, "fra".to_string())]);
+}
+
+// Scans a one-title disc whose IFO declares one MP2 stream (b0, b1), muxes `frame` as its
+// first audio frame, and returns the MKV Tracks/Audio/Channels value.
+fn scanned_mp2_mkv_channels(b0: u8, b1: u8, frame: &[u8]) -> u8 {
+    use crate::mux::mkv::{MkvMuxer, MkvTrack};
+    let t = &scan_title(build_vts(
+        0,
+        0x00,
+        &[aud((b0, b1), b"en")],
+        &[],
+        &[(0, 9)],
+        false,
+    ));
+    let tracks: Vec<MkvTrack> = t
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Video(v) => Some(MkvTrack::video(v)),
+            Stream::Audio(a) => Some(MkvTrack::audio(a)),
+            _ => None,
+        })
+        .collect();
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut m = MkvMuxer::new(&mut out, &tracks, None, 0.0, &[]).unwrap();
+    m.write_frame(0, 0, true, &[1, 2], None, None).unwrap();
+    // A count above nch commits after RUN_FRAMES CRC-valid frames in a row.
+    for _ in 0..crate::mux::codec::mp2_channels::RUN_FRAMES {
+        m.write_frame(1, 0, false, frame, None, None).unwrap();
+    }
+    m.finish().unwrap();
+    let d = out.into_inner();
+    let at = d
+        .windows(4)
+        .position(|w| w == [0x16, 0x54, 0xAE, 0x6B])
+        .expect("Tracks");
+    let ch = at
+        + d[at..]
+            .windows(2)
+            .position(|w| w == [0x9F, 0x81])
+            .expect("Channels");
+    d[ch + 2]
+}
+
+fn scan_title(vts: Vec<u8>) -> DiscTitle {
+    let mut disc = MemDisc::new();
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: build_vmg(&[(1, 1, 1)]),
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0
+        .remove(0)
+}
+
+/// Scan to MKV: IFO coding mode 3 declares 6 channels ("channels-1" = 5); the stored 0xC0
+/// base has an extension stream, so the track holds the stereo base only.
+#[test]
+fn scan_to_mkv_mp2_mode3_with_extension_stream_is_stereo() {
+    use crate::mux::codec::mp2_channels::tests::{MC_3_2_LFE, Mc, STEREO_256, Spec, write};
+    let f = write(Spec {
+        mc: Some(Mc {
+            ext: true,
+            ..MC_3_2_LFE
+        }),
+        ..STEREO_256
+    })
+    .0;
+    // mpucoder IFO: coding mode "3 Mpeg-2ext", byte 1 bits 2-0 "channels-1".
+    assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 2);
+}
+
+/// Scan to MKV with the multichannel data stored in the base frame.
+/// This is per spec; do not change without a spec citation proving otherwise.
+#[test]
+fn scan_to_mkv_mp2_mode3_without_extension_stream_keeps_5_1() {
+    use crate::mux::codec::mp2_channels::tests::{MC_3_2_LFE, STEREO_256, Spec, write};
+    let f = write(Spec {
+        mc: Some(MC_3_2_LFE),
+        ..STEREO_256
+    })
+    .0;
+    // 13818-3 §2.5.2.13: "'0' no extension stream present" with 3/2 + LFE.
+    assert_eq!(scanned_mp2_mkv_channels(0x60, 0x05, &f), 6);
+}
+
+// (pid, language, is_mp2_extension) of every audio track of a one-title disc.
+fn scanned_audio(vts: Vec<u8>) -> Vec<(u16, String, bool)> {
+    scan_title(vts)
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Audio(a) => Some((a.pid, a.language.clone(), a.is_mp2_extension())),
+            _ => None,
+        })
+        .collect()
+}
+
+const MP2_EXT_51: (u8, u8) = (0x60, 0x05); // coding mode 3, 6 channels declared
+
+/// IFO coding mode 3 ("3 Mpeg-2ext"; EP0867877A2 "011b MPEG-2 with extension bitstream")
+/// declares the extension stream `0xD0|n` right after its base `0xC0|n`, n from AST_CTL.
+/// This is per spec; do not change without a spec citation proving otherwise.
+#[test]
+fn mode_3_mp2_declares_its_extension_track_after_the_base() {
+    let audio = [aud(MP2_EXT_51, b"en"), aud(MP2_2CH, b"fr")];
+    let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0x8300, 0x8100]);
+    assert_eq!(
+        scanned_audio(vts),
+        vec![
+            (0x00C3, "eng".to_string(), false),
+            (0x00D3, "eng".to_string(), true),
+            // "010b MPEG-1 or MPEG-2 without extension bit stream": no extension track.
+            (0x00C1, "fra".to_string(), false),
+        ]
+    );
+}
+
+/// A stream AST_CTL marks absent declares neither its base nor its extension.
+#[test]
+fn absent_mode_3_stream_declares_no_extension_either() {
+    let audio = [aud(MP2_EXT_51, b"en"), aud(MP2_2CH, b"fr")];
+    let mut vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0x0000, 0x8000]);
+    assert_eq!(scanned_audio(vts), vec![(0x00C0, "fra".to_string(), false)]);
+}
+
+/// An unknown coding mode has no route: a unique placeholder PID 0xBD00 + i, never
+/// colliding with a sibling.
+#[test]
+fn scan_dvd_titles_unknown_audio_codec_gets_distinct_placeholder() {
+    let unknown = (0x20u8, 0x01u8); // coding_mode 1: reserved
+    let audio = [aud(unknown, b"en"), aud(unknown, b"fr")];
+    let vts = build_vts(0, 0x00, &audio, &[], &[(0, 9)], false);
+    let pids: Vec<u16> = scan_audio(vts).0.iter().map(|t| t.0).collect();
+    assert_eq!(pids, vec![0xBD00, 0xBD01]);
+}
+
+/// Per-title diag line with the ROUTED id, not the VTS-level positional one.
+#[test]
+fn scan_dvd_titles_logs_routed_audio_id_per_title() {
+    let mut vts = build_vts(0, 0x00, &[aud(AC3_6CH, b"en")], &[], &[(0, 9)], false);
+    set_ast(&mut vts, &[0x8100]);
+    let diag = scan_audio(vts).1;
+    assert!(
+        diag.iter().any(|m| m.contains("tag=dvd.aroute")
+            && m.contains("title=1 idx=0")
+            && m.contains("ast=0x8100 pid=0xBD81")),
+        "{diag:?}"
+    );
+}
+
+// Overwrites build_vts's PGC_SPST_CTL (PGC+0x1C, 32 x u32 BE).
+fn set_spst(vts: &mut [u8], ctl: &[u32]) {
+    let at = 2 * 2048 + 0x100 + 0x1C;
+    for (i, c) in ctl.iter().enumerate() {
+        vts[at + i * 4..at + i * 4 + 4].copy_from_slice(&c.to_be_bytes());
+    }
+}
+
+// Scans a one-VTS disc and returns its first title's (pid, language) subtitles.
+fn scan_subs(vts: Vec<u8>) -> Vec<(u16, String)> {
+    let mut disc = MemDisc::new();
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: build_vmg(&[(1, 1, 1)]),
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0;
+    t[0].streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Subtitle(s) => Some((s.pid, s.language.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+const NTSC_16X9: u8 = 0x0C;
+
+/// L084: an anamorphic title carries wide/letterbox/pan-scan variants per language, so the
+/// wide sub-stream id comes from SPST_CTL, not the ordinal. This is per spec; do not
+/// change without a spec citation proving otherwise.
+#[test]
+fn scan_dvd_titles_anamorphic_subtitles_use_spst_wide_id() {
+    let mut vts = build_vts(0, NTSC_16X9, &[], &[*b"en", *b"fr"], &[(0, 9)], true);
+    // mpucoder PGC_SPST_CTL bytes: "Stream number for 4:3", "for wide", "for letterbox",
+    // "for pan&scan".
+    set_spst(&mut vts, &[0x8000_0102, 0x8003_0405]);
+    // vm_get_subp_stream "mode == 0 - widescreen": "subp_control[subpN] >> 16) & 0x1f".
+    assert_eq!(
+        scan_subs(vts),
+        vec![(0x20, "eng".to_string()), (0x23, "fra".to_string())],
+        "French must route to its wide sub-stream 0x23, not ordinal 0x21"
+    );
+}
+
+/// A 4:3 title uses SPST_CTL's 4:3 field (byte 0 bits 4-0).
+#[test]
+fn scan_dvd_titles_4x3_subtitles_use_spst_4x3_id() {
+    let mut vts = build_vts(0, 0x00, &[], &[*b"en", *b"de"], &[(0, 9)], true);
+    set_spst(&mut vts, &[0x8500_0000, 0x8200_0000]);
+    // vm_get_subp_stream "if(source_aspect == 0) /* 4:3 */": "subp_control[subpN] >> 24".
+    assert_eq!(
+        scan_subs(vts),
+        vec![(0x25, "eng".to_string()), (0x22, "deu".to_string())]
+    );
+}
+
+/// A subpicture stream SPST_CTL marks absent gets no track (spec); two logical streams on
+/// one physical id keep the first (freemkv policy, not a spec rule).
+#[test]
+fn scan_dvd_titles_skips_absent_and_duplicate_subpictures() {
+    let subs = [*b"en", *b"es", *b"it"];
+    let mut vts = build_vts(0, NTSC_16X9, &[], &subs, &[(0, 9)], true);
+    set_spst(&mut vts, &[0x0000_0000, 0x8001_0100, 0x8001_0100]);
+    let (subs, ev) = crate::testlog::capture(|| scan_subs(vts));
+    // ifo_print: "subp_control[i] & 0x80000000) { /* The 'is present' bit */" is clear.
+    assert_eq!(subs, vec![(0x21, "spa".to_string())]);
+    assert!(
+        diag_lines(&ev)
+            .iter()
+            .any(|m| m.contains("tag=dvd.spstctl")
+                && m.contains("id=0x21 kept=\"spa\" dropped=\"ita\"")),
+        "{:?}",
+        diag_lines(&ev)
+    );
+}
+
+fn diag_lines(ev: &[crate::testlog::CapturedEvent]) -> Vec<String> {
+    ev.iter()
+        .filter(|e| e.target == "freemkv::diag")
+        .map(|e| e.message().to_string())
+        .collect()
+}
+
+/// Every declared subpicture absent from the PGC: no tracks, and a diag line says so.
+#[test]
+fn scan_dvd_titles_all_subpictures_absent_is_traced() {
+    let mut vts = build_vts(0, NTSC_16X9, &[], &[*b"en", *b"fr"], &[(0, 9)], true);
+    set_spst(&mut vts, &[0, 0]);
+    let (subs, ev) = crate::testlog::capture(|| scan_subs(vts));
+    assert!(subs.is_empty());
+    assert!(
+        diag_lines(&ev)
+            .iter()
+            .any(|m| m.contains("tag=dvd.spstctl") && m.contains("declared=2 present=0")),
+        "{:?}",
+        diag_lines(&ev)
+    );
+}
+
+// Tests. HaltingReader fails every read at/above halt_at with Error::Halted, mimicking a
+// live drive after a Stop.
+struct HaltingReader<'a> {
+    inner: &'a mut MemDisc,
+    halt_at: u32,
+}
+impl SectorSource for HaltingReader<'_> {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> crate::error::Result<usize> {
+        if lba >= self.halt_at {
+            return Err(crate::error::Error::Halted);
+        }
+        self.inner.read_sectors(lba, count, buf, recovery)
+    }
+}
+
+// A drive Stop must surface as Err(Error::Halted), not a truncated/empty scan. Regression:
+// two prior swallow sites (parse_vmg placeholder entry; scan_dvd_titles's Err(_) =>
+// Vec::new()).
+#[test]
+fn halted_ifo_read_is_not_reported_as_a_shorter_disc() {
+    // Two title sets; only the second title set's CONTENT read is halted.
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+    let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+    let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts1,
+            },
+            FileSpec {
+                name: "VTS_02_0.IFO".into(),
+                icb_lba: 64,
+                data_lba: 7000,
+                contents: vts2,
+            },
+        ],
+    );
+    // Sanity: both title sets enumerate when nothing is cancelled, so a
+    // short list below can only be the cancel.
+    assert_eq!(
+        Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0
+            .len(),
+        2,
+        "fixture must offer two title sets"
+    );
+
+    let mut reader = HaltingReader {
+        inner: &mut disc,
+        halt_at: PART_START + 7000, // VTS_02_0.IFO's data extent
+    };
+    let res = Disc::scan_dvd_titles(&mut reader, &udf, None);
+    assert!(
+        matches!(res, Err(crate::error::Error::Halted)),
+        "a cancelled title-set read must surface as a cancelled scan, not \
+             as a disc with fewer titles; got {:?}",
+        res.map(|(ts, _, _)| ts.iter().map(|t| t.playlist.clone()).collect::<Vec<_>>())
+    );
+
+    // The same cancel one level up: VIDEO_TS.IFO itself. This is the
+    // `Err(_) => Vec::new()` path — a cancel that used to report a DVD as
+    // carrying no titles whatsoever.
+    let mut reader = HaltingReader {
+        inner: &mut disc,
+        halt_at: PART_START + 5000,
+    };
+    let res = Disc::scan_dvd_titles(&mut reader, &udf, None);
+    assert!(
+        matches!(res, Err(crate::error::Error::Halted)),
+        "a cancelled VMG read must surface as a cancelled scan, not as an \
+             empty disc; got {:?}",
+        res.map(|(ts, _, _)| ts.len())
+    );
+}
+
+/// scan_dvd_titles returns empty when VIDEO_TS.IFO can't be parsed
+/// (dvd.rs: `parse_vmg(...) Err → return Vec::new()`). Never panics.
+#[test]
+fn scan_dvd_titles_no_ifo_is_empty() {
+    let mut disc = MemDisc::new();
+    // VIDEO_TS exists but VIDEO_TS.IFO is missing.
+    let udf = build_video_ts_fs(&mut disc, &[]);
+    assert!(
+        Disc::scan_dvd_titles(&mut disc, &udf, None)
+            .expect("scan")
+            .0
+            .is_empty()
+    );
+}
+
+/// Single VTS, single title, one cell. Extent absolute LBA =
+/// vob_start + cell.first_sector (dvd.rs); sector_count = last - first
+/// + 1 (inclusive range); size_bytes = sectors * 2048 (DVD sector).
+#[test]
+fn scan_dvd_titles_single_cell_extent_math() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]); // 1 chapter, VTS 1, title 1
+    // vob_start 1000; one cell sectors [10..=109] → 100 sectors.
+    let vts = build_vts(
+        1000,
+        0x00, // NTSC, 4:3
+        &[],
+        &[],
+        &[(10, 109)],
+        false,
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0;
+    assert_eq!(titles.len(), 1);
+    let t = &titles[0];
+    assert_eq!(t.extents.len(), 1);
+    // absolute start = ifo_lba + vtstt_vobs(1000) + first_sector(10).
+    // The IFO file sits at PART_START(3000) + data_lba(6000) = 9000, so
+    // 9000 + 1000 + 10 = 10010.
+    assert_eq!(t.extents[0].start_lba, 10010);
+    // inclusive: 109 - 10 + 1 = 100 sectors.
+    assert_eq!(t.extents[0].sector_count, 100);
+    // DVD sector = 2048 bytes.
+    assert_eq!(t.size_bytes, 100 * 2048);
+    // playlist field format VTS_XX_title.VOB; title_number is 1.
+    assert_eq!(t.playlist, "VTS_01_1.VOB");
+    assert_eq!(t.playlist_id, 1);
+    assert_eq!(t.content_format, ContentFormat::DvdPs);
+}
+
+// Regression: vob_start must come from Title VOBS (0xC4), not menu VOBS (0xC0) -- else a
+// per-title menu prepends and the rip opens on the wrong frame.
+#[test]
+fn scan_dvd_titles_uses_title_vobs_not_menu_vobs() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    // vtstt_vobs (title) = 3640; cell 0 first_sector = 0.
+    let mut vts = build_vts(3640, 0x00, &[], &[], &[(0, 99)], false);
+    // Stamp a bogus vtsm_vobs (menu) at 0xC0 — the wrong pointer the bug
+    // used. It must be ignored.
+    vts[0xC0..0xC4].copy_from_slice(&44u32.to_be_bytes());
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0;
+    assert_eq!(titles.len(), 1);
+    let t = &titles[0];
+    assert_eq!(t.extents.len(), 1);
+    // ifo_lba(9000) + vtstt_vobs(3640) + first_sector(0) = 12640 — built
+    // from the Title VOBS (0xC4), NOT the menu VOBS (0xC0). The IFO file is
+    // at PART_START(3000) + data_lba(6000) = 9000.
+    assert_eq!(
+        t.extents[0].start_lba, 12640,
+        "extent must start at ifo_lba + vtstt_vobs (0xC4), not vtsm_vobs (0xC0)"
+    );
+    // Must not resolve from the menu VOBS (would be 9000 + 44 = 9044), nor
+    // use the raw IFO-relative vtstt_vobs (3640) without the absolute base.
+    assert_ne!(t.extents[0].start_lba, 9044, "must not use the menu VOBS");
+    assert_ne!(
+        t.extents[0].start_lba, 3640,
+        "must add the IFO's absolute disc LBA, not use the raw relative value"
+    );
+}
+
+// ABSOLUTE-REBASE regression: start_lba must sum THREE distinct, non- overlapping terms
+// (ifo_lba + vtstt_vobs + cell first_sector), not just two.
+#[test]
+fn scan_dvd_titles_extent_is_absolute_three_term_sum() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    // vtstt_vobs (Title VOBS, 0xC4) = 700; one cell first_sector = 33.
+    let vts = build_vts(700, 0x00, &[], &[], &[(33, 132)], false);
+    // IFO data at data_lba 6000 → absolute ifo_lba = PART_START(3000) + 6000.
+    let ifo_lba = PART_START + 6000; // 9000
+    let vtstt_vobs = 700u32;
+    let first_sector = 33u32;
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    assert_eq!(t.extents.len(), 1);
+    let got = t.extents[0].start_lba;
+    // The one correct answer: all three terms summed (9000 + 700 + 33).
+    assert_eq!(
+        got,
+        ifo_lba + vtstt_vobs + first_sector,
+        "extent start must be file_start_lba(IFO) + vtstt_vobs + cell.first_sector"
+    );
+    // Each wrong two-term combination must be rejected:
+    assert_ne!(
+        got,
+        vtstt_vobs + first_sector,
+        "must not use the bare relative vtstt_vobs (missing the IFO's absolute LBA)"
+    );
+    assert_ne!(
+        got,
+        ifo_lba + first_sector,
+        "must not drop vtstt_vobs (the Title VOBS pointer)"
+    );
+    assert_ne!(
+        got,
+        ifo_lba + vtstt_vobs,
+        "must not drop the cell's first_sector offset"
+    );
+}
+
+/// Multi-cell title: extents preserve cell order and each maps to its
+/// own (vob_start + first .. last) range. mux reads cells in order.
+#[test]
+fn scan_dvd_titles_multi_cell_extents_in_order() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(2, 1, 1)]);
+    let vts = build_vts(
+        500,
+        0x00,
+        &[],
+        &[],
+        &[(0, 99), (200, 299)], // two cells
+        false,
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    assert_eq!(t.extents.len(), 2);
+    assert_eq!(t.extents[0].start_lba, 9500); // ifo_lba(9000) + 500 + 0
+    assert_eq!(t.extents[0].sector_count, 100);
+    assert_eq!(t.extents[1].start_lba, 9700); // ifo_lba(9000) + 500 + 200
+    assert_eq!(t.extents[1].sector_count, 100);
+    assert_eq!(t.size_bytes, 200 * 2048);
+}
+
+/// PAL video standard (b0 low bits == 1) sets FrameRate::F25; NTSC sets
+/// F29_97 (dvd.rs match on ts.video.standard). The video PID is the
+/// fixed DVD MPEG-PS video stream id 0xE0.
+#[test]
+fn scan_dvd_titles_pal_frame_rate_and_video_pid() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    let vts = build_vts(
+        0,
+        crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_PAL, crate::ifo::ASPECT_16X9),
+        &[],
+        &[],
+        &[(0, 9)],
+        false,
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    let v = t
+        .streams
+        .iter()
+        .find_map(|s| match s {
+            Stream::Video(v) => Some(v),
+            _ => None,
+        })
+        .expect("video stream");
+    assert_eq!(v.pid, 0xE0, "DVD video PID is fixed 0xE0");
+    assert_eq!(v.frame_rate, FrameRate::F25, "PAL → 25 fps");
+    assert_eq!(v.resolution, Resolution::R576i, "PAL → 576i");
+    assert_eq!(
+        v.color_space,
+        ColorSpace::Bt470bg,
+        "PAL DVD is SD BT.470BG, not BT.709"
+    );
+    assert_eq!(
+        v.display_aspect,
+        Some((16, 9)),
+        "ASPECT_16X9 IFO byte must map to a 16:9 display aspect"
+    );
+}
+
+/// NTSC DVD video is SD SMPTE-170M colorimetry (not BT.709). Mirror of the
+/// PAL test with `VIDEO_FORMAT_NTSC` → 480i / 29.97 / SMPTE-170M.
+#[test]
+fn scan_dvd_titles_ntsc_color_is_smpte170m() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    let vts = build_vts(
+        0,
+        crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_NTSC, crate::ifo::ASPECT_4X3),
+        &[],
+        &[],
+        &[(0, 9)],
+        false,
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    let v = t
+        .streams
+        .iter()
+        .find_map(|s| match s {
+            Stream::Video(v) => Some(v),
+            _ => None,
+        })
+        .expect("video stream");
+    assert_eq!(v.frame_rate, FrameRate::F29_97, "NTSC → 29.97 fps");
+    assert_eq!(v.resolution, Resolution::R480i, "NTSC → 480i");
+    assert_eq!(
+        v.color_space,
+        ColorSpace::Smpte170m,
+        "NTSC DVD is SD SMPTE-170M, not BT.709"
+    );
+    assert_eq!(
+        v.display_aspect,
+        Some((4, 3)),
+        "ASPECT_4X3 IFO byte must map to a 4:3 display aspect"
+    );
+}
+
+/// AC-3 audio gets sub_stream_id 0x80 → PID routed via dvd_audio_pid
+/// (dvd.rs uses `a.sub_stream_id.and_then(dvd_audio_pid)`). A mixed
+/// AC-3 + DTS title must NOT collide: AC-3 → 0x80 base, DTS → 0x88 base.
+#[test]
+fn scan_dvd_titles_mixed_audio_codecs_distinct_pids() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    // audio b0: coding_mode = (b0>>5)&7 (AC-3=0->0x00, DTS=6->0xC0). b1 channels nibble
+    // = (channels-1) in bits 2-0 (5.1=0x05, 2.0=0x01). Old fixture used 0x10/0x50
+    // (both -> 1ch), a placeholder that passed even with broken channel handling.
+    let vts = build_vts(
+        0,
+        0x00,
+        &[(0x00, 0x05, *b"en"), (0xC0, 0x01, *b"fr")], // AC-3 5.1 eng, DTS 2.0 fra
+        &[],
+        &[(0, 9)],
+        false,
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    let audios: Vec<_> = t
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Audio(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(audios.len(), 2);
+    assert_eq!(audios[0].codec, Codec::Ac3);
+    assert_eq!(audios[0].language, "eng");
+    assert_eq!(audios[1].codec, Codec::Dts);
+    // Real channel layouts survive the scan (not a 1ch placeholder): the
+    // AC-3 is 5.1 (6ch), the DTS is 2.0 (2ch).
+    assert_eq!(
+        audios[0].channels.count(),
+        6,
+        "AC-3 5.1 nibble must decode to 6 channels"
+    );
+    assert_eq!(
+        audios[1].channels.count(),
+        2,
+        "DTS 2.0 nibble must decode to 2 channels"
+    );
+    // PIDs route via the positional sub-id table: AC-3 @ pos 0 -> 0x80 -> 0xBD80, DTS @
+    // pos 1 -> 0x89 -> 0xBD89 (shared audio-stream number in the low nibble, NOT a
+    // per-codec ordinal). Distinct AND the exact canonical wire PIDs the demux routes on.
+    assert_eq!(audios[0].pid, 0xBD80, "AC-3 @ pos 0 → 0xBD80");
+    assert_eq!(audios[1].pid, 0xBD89, "DTS @ pos 1 → 0xBD89");
+    assert_ne!(audios[0].pid, audios[1].pid);
+}
+
+// LPCM (coding_mode 4) at audio pos 1 must route to 0xBDA1, not the AC-3 space.
+#[test]
+fn scan_dvd_titles_lpcm_routes_to_a0_pid_range() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    // b0 coding_mode = (b0 >> 5) & 7. LPCM = 4 → b0 = 4<<5 = 0x80.
+    // b1 channels nibble: 2.0 stereo LPCM → (2-1)=1 → 0x01. Plus an AC-3 5.1
+    // so we prove the two land in disjoint PID spaces (0xBD8x vs 0xBDAx).
+    let vts = build_vts(
+        0,
+        0x00,
+        &[(0x00, 0x05, *b"en"), (0x80, 0x01, *b"fr")], // AC-3 5.1 eng, LPCM 2.0 fra
+        &[],
+        &[(0, 9)],
+        false,
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    let audios: Vec<_> = t
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Audio(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(audios.len(), 2);
+    assert_eq!(audios[0].codec, Codec::Ac3);
+    assert_eq!(audios[1].codec, Codec::Lpcm, "coding_mode 4 → LPCM");
+    assert_eq!(audios[0].pid, 0xBD80, "AC-3 @ pos 0 → 0xBD80");
+    assert_eq!(
+        audios[1].pid, 0xBDA1,
+        "LPCM @ pos 1 → 0xBDA1 (the 0xA0 sub-id range | position), NOT the AC-3 space"
+    );
+    assert_eq!(
+        audios[1].channels.count(),
+        2,
+        "LPCM 2.0 nibble must decode to 2 channels"
+    );
+}
+
+// A multi-subtitle VTS must emit one Subtitle per entry, distinct PIDs.
+#[test]
+fn scan_dvd_titles_multiple_vobsub_tracks_distinct_pids() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    let vts = build_vts(
+        0,
+        0x00,
+        &[],
+        &[*b"en", *b"fr", *b"de"], // three VobSub tracks
+        &[(0, 9)],
+        true, // non-zero palette → codec_data on every track
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    let subs: Vec<_> = t
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Subtitle(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(subs.len(), 3, "three VobSub tracks must all surface");
+    // Languages preserved in order.
+    assert_eq!(
+        subs.iter().map(|s| s.language.as_str()).collect::<Vec<_>>(),
+        vec!["eng", "fra", "deu"]
+    );
+    // PIDs are 0x20 + ordinal, all distinct.
+    let pids: Vec<u16> = subs.iter().map(|s| s.pid).collect();
+    assert_eq!(pids, vec![0x20, 0x21, 0x22], "VobSub PID = 0x20 + ordinal");
+    // Every track carries the palette codec_data.
+    for s in &subs {
+        assert_eq!(s.codec, Codec::DvdSub);
+        assert!(
+            s.codec_data.is_some(),
+            "each VobSub track shares the PGC palette codec_data"
+        );
+    }
+}
+
+/// Subtitle streams map to Codec::DvdSub with palette codec_data when a
+/// non-zero palette is present (dvd.rs builds codec_data from
+/// dvd_title.palette). VobSub sub-id 0x20+i.
+#[test]
+fn scan_dvd_titles_subtitle_palette_codec_data() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    let vts = build_vts(
+        0,
+        0x00,
+        &[],
+        &[*b"en"],
+        &[(0, 9)],
+        true, // non-zero palette
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    let sub = t
+        .streams
+        .iter()
+        .find_map(|s| match s {
+            Stream::Subtitle(s) => Some(s),
+            _ => None,
+        })
+        .expect("subtitle stream");
+    assert_eq!(sub.codec, Codec::DvdSub);
+    assert_eq!(sub.language, "eng");
+    assert!(
+        sub.codec_data.is_some(),
+        "non-zero palette must yield codec_data"
+    );
+    let idx = String::from_utf8(sub.codec_data.clone().expect("codec_data")).expect("utf8");
+    assert!(
+        idx.starts_with("size: 720x480\npalette: "),
+        "the .idx carries the NTSC coded frame size, then the palette: {idx:?}"
+    );
+}
+
+/// Multiple titles in one VTS each become their own DiscTitle with a
+/// monotonically increasing title_number / playlist_id (dvd.rs
+/// `title_number += 1` per dvd_title). Both share the VTS streams.
+#[test]
+fn scan_dvd_titles_numbering_increments_per_title() {
+    let mut disc = MemDisc::new();
+    // Two titles in VTS 1 (nums 1,2): pgc_index = vts_title-1 needs >=2 PGC entries, but
+    // build_vts only emits 1, so the second title's PGC index (1) exceeds num_pgcs (1)
+    // and is skipped. Use two separate VTS sets instead to exercise numbering.
+    let vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+    let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+    let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts1,
+            },
+            FileSpec {
+                name: "VTS_02_0.IFO".into(),
+                icb_lba: 64,
+                data_lba: 7000,
+                contents: vts2,
+            },
+        ],
+    );
+    let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0;
+    assert_eq!(titles.len(), 2);
+    // title_number is a running counter across all title sets.
+    assert_eq!(titles[0].playlist_id, 1);
+    assert_eq!(titles[1].playlist_id, 2);
+    assert_eq!(titles[0].playlist, "VTS_01_1.VOB");
+    assert_eq!(titles[1].playlist, "VTS_02_2.VOB");
+    // Distinct vob_start → distinct extents.
+    // VTS_01 IFO @ PART_START(3000)+6000=9000; VTS_02 IFO @ 3000+7000=10000.
+    assert_eq!(titles[0].extents[0].start_lba, 9100); // 9000 + 100
+    assert_eq!(titles[1].extents[0].start_lba, 10200); // 10000 + 200
+}
+
+// Stamps a First-Play PGC with an unconditional JumpTT ttn pre-command.
+fn stamp_first_play_jumptt(vmg: &mut [u8], ttn: u8) {
+    const FP_PGC_PTR: usize = 0x84; // u32 byte offset of the First-Play PGC
+    const CMD_TBL_PTR: usize = 0xE4; // u16 cmd-table offset (rel to PGC)
+    let fp_pgc: u32 = 0x200;
+    let cmd_tbl_rel: u16 = 0x100;
+    vmg[FP_PGC_PTR..FP_PGC_PTR + 4].copy_from_slice(&fp_pgc.to_be_bytes());
+    let pgc = fp_pgc as usize;
+    vmg[pgc + CMD_TBL_PTR..pgc + CMD_TBL_PTR + 2].copy_from_slice(&cmd_tbl_rel.to_be_bytes());
+    let tbl = pgc + cmd_tbl_rel as usize;
+    vmg[tbl..tbl + 2].copy_from_slice(&1u16.to_be_bytes()); // nr_of_pre = 1
+    // JumpTT command (type 1, direct=1, cmd=2): ttn in byte 5.
+    vmg[tbl + 8..tbl + 16].copy_from_slice(&[0x30, 0x02, 0, 0, 0, ttn, 0, 0]);
+}
+
+// First-Play nav promotion (issue #40): resolve_main_title's (vtsn, vts_ttn) must join to
+// the running title_number and surface as nav_feature.
+#[test]
+fn scan_dvd_titles_nav_promotes_first_play_target() {
+    let mut disc = MemDisc::new();
+    // TT_SRPT: title 1 → VTS 1 (in-set title 1); title 2 → VTS 2 (in-set 1).
+    let mut vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+    stamp_first_play_jumptt(&mut vmg, 2); // First-Play → JumpTT title 2
+    let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+    let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts1,
+            },
+            FileSpec {
+                name: "VTS_02_0.IFO".into(),
+                icb_lba: 64,
+                data_lba: 7000,
+                contents: vts2,
+            },
+        ],
+    );
+    let (titles, nav_feature, _) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+    assert_eq!(titles.len(), 2);
+    // Sanity: the resolver reached the branch with the VTS-2 target.
+    assert_eq!(
+        crate::dvdnav::resolve_main_title(&mut disc, &udf, None),
+        Some(crate::dvdnav::nav::ResolvedTitle {
+            title: 2,
+            vtsn: 2,
+            vts_ttn: 1,
+        })
+    );
+    // The promotion mapped that target to the second scanned title.
+    assert_eq!(nav_feature, Some(2));
+    assert_eq!(titles[1].playlist_id, 2);
+}
+
+// The nav target joins on the VTS number AND the in-set title number: VTS 2 also has an
+// in-set title 1, which must not take the promotion from VTS 1's.
+#[test]
+fn scan_dvd_titles_nav_target_is_matched_by_vts_number() {
+    let mut disc = MemDisc::new();
+    let mut vmg = build_vmg(&[(1, 1, 1), (1, 2, 1)]);
+    stamp_first_play_jumptt(&mut vmg, 1);
+    let vts1 = build_vts(100, 0x00, &[], &[], &[(0, 9)], false);
+    let vts2 = build_vts(200, 0x00, &[], &[], &[(0, 19)], false);
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts1,
+            },
+            FileSpec {
+                name: "VTS_02_0.IFO".into(),
+                icb_lba: 64,
+                data_lba: 7000,
+                contents: vts2,
+            },
+        ],
+    );
+    let (titles, nav_feature, _) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+    assert_eq!(titles.len(), 2);
+    assert_eq!(nav_feature, Some(1));
+}
+
+fn one_title_dvd(disc: &mut MemDisc) -> udf::UdfFs {
+    build_video_ts_fs(
+        disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: build_vmg(&[(1, 1, 1)]),
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: build_vts(0, 0x00, &[], &[], &[(0, 9)], false),
+            },
+        ],
+    )
+}
+
+// A Stop raised before the scan, or during its last reads, is `Halted`, never a list.
+#[test]
+fn scan_dvd_titles_honours_the_halt_token() {
+    struct CancellingReader<'a> {
+        inner: &'a mut MemDisc,
+        halt: crate::halt::Halt,
+        reads: u32,
+    }
+    impl SectorSource for CancellingReader<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.reads += 1;
+            if lba >= PART_START + 6000 {
+                self.halt.cancel();
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+    let mut disc = MemDisc::new();
+    let udf = one_title_dvd(&mut disc);
+    let halt = crate::halt::Halt::new();
+    halt.cancel();
+    let mut reader = CancellingReader {
+        inner: &mut disc,
+        halt: halt.clone(),
+        reads: 0,
+    };
+    let res = Disc::scan_dvd_titles(&mut reader, &udf, Some(&halt));
+    assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
+    assert_eq!(reader.reads, 0, "a cancelled scan reads nothing");
+
+    let halt = crate::halt::Halt::new();
+    let mut reader = CancellingReader {
+        inner: &mut disc,
+        halt: halt.clone(),
+        reads: 0,
+    };
+    let res = Disc::scan_dvd_titles(&mut reader, &udf, Some(&halt));
+    assert!(matches!(res, Err(crate::error::Error::Halted)), "{res:?}");
+}
+
+/// chapter_times from the IFO become Chapter entries with ordinal
+/// names (dvd.rs maps chapter_times → Chapter{time_secs, chapter_name}).
+#[test]
+fn scan_dvd_titles_chapters_present() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    let vts = build_vts(0, 0x00, &[], &[], &[(0, 9)], false);
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    // One program in the program map → one chapter time (0.0 for the
+    // first program). Name is the ordinal from chapter_name(0).
+    assert_eq!(t.chapters.len(), 1);
+    assert_eq!(t.chapters[0].name, chapter_name(0));
+}
+
+// A navigation pack at `lba` whose interleaved unit ends `end_rel` sectors on and whose
+// next unit starts `next_rel` on.
+fn nav_pack(disc: &mut MemDisc, lba: u32, end_rel: u32, next_rel: u32) {
+    let mut s = [0u8; 2048];
+    s[..4].copy_from_slice(&[0, 0, 1, 0xBA]);
+    s[0x400..0x404].copy_from_slice(&[0, 0, 1, 0xBF]);
+    s[0x406] = 0x01;
+    s[super::DSI_ILVU_EA..super::DSI_ILVU_EA + 4].copy_from_slice(&end_rel.to_be_bytes());
+    s[super::DSI_NEXT_ILVU_SA..super::DSI_NEXT_ILVU_SA + 4]
+        .copy_from_slice(&next_rel.to_be_bytes());
+    disc.put(lba, s);
+}
+
+fn icell(first: u32, last: u32) -> ifo::DvdCell {
+    ifo::DvdCell {
+        first_sector: first,
+        last_sector: last,
+        category: 0x04,
+        duration_secs: 0.0,
+    }
+}
+
+// An interleaved cell reads only its own units, following each unit's pack to the next;
+// both end-of-chain spellings stop the walk.
+#[test]
+fn an_interleaved_cell_reads_only_its_own_units() {
+    for end_marker in [0x7FFF_FFFF, 0xFFFF_FFFF] {
+        let mut disc = MemDisc::new();
+        let vob = 1000;
+        nav_pack(&mut disc, vob + 100, 9, 30); // unit 100..=109, next at 130
+        nav_pack(&mut disc, vob + 130, 4, 20); // unit 130..=134, next at 150
+        nav_pack(&mut disc, vob + 150, 9, end_marker); // unit 150..=159, last
+        let units = super::interleaved_units(&mut disc, vob, &icell(100, 159), None)
+            .unwrap()
+            .unwrap();
+        let spans: Vec<(u32, u32)> = units
+            .iter()
+            .map(|e| (e.start_lba, e.sector_count))
+            .collect();
+        assert_eq!(spans, vec![(1100, 10), (1130, 5), (1150, 10)]);
+    }
+}
+
+// A unit that runs past the cell is cut at the cell's end; a sector that is no navigation
+// pack leaves the caller the whole range.
+#[test]
+fn an_interleaved_cell_unit_walk_stays_inside_the_cell() {
+    let mut disc = MemDisc::new();
+    nav_pack(&mut disc, 100, 50, 0x7FFF_FFFF);
+    let units = super::interleaved_units(&mut disc, 0, &icell(100, 120), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!((units[0].start_lba, units[0].sector_count), (100, 21));
+    assert!(
+        super::interleaved_units(&mut disc, 0, &icell(500, 600), None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+// A source that reads `inner`, cancels `halt` after `cancel_after` reads, and answers a
+// read at or past `short_from` with Ok(0) and the buffer untouched.
+struct WalkReader<'a> {
+    inner: &'a mut MemDisc,
+    halt: crate::halt::Halt,
+    cancel_after: u32,
+    short_from: u32,
+    reads: u32,
+}
+impl SectorSource for WalkReader<'_> {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> crate::error::Result<usize> {
+        self.reads += 1;
+        if self.reads >= self.cancel_after {
+            self.halt.cancel();
+        }
+        if lba >= self.short_from {
+            return Ok(0);
+        }
+        self.inner.read_sectors(lba, count, buf, recovery)
+    }
+}
+
+fn three_unit_chain() -> MemDisc {
+    let mut disc = MemDisc::new();
+    nav_pack(&mut disc, 100, 9, 30);
+    nav_pack(&mut disc, 130, 4, 20);
+    nav_pack(&mut disc, 150, 9, 0xFFFF_FFFF);
+    disc
+}
+
+// A Stop during the unit walk ends it as Halted, whether raised between reads or by the
+// drive's own read; neither is mistaken for an unreadable chain.
+#[test]
+fn an_interleaved_unit_walk_stops_on_halt() {
+    let mut disc = three_unit_chain();
+    let halt = crate::halt::Halt::new();
+    let mut reader = WalkReader {
+        inner: &mut disc,
+        halt: halt.clone(),
+        cancel_after: 1,
+        short_from: u32::MAX,
+        reads: 0,
+    };
+    let walk = super::interleaved_units(&mut reader, 0, &icell(100, 159), Some(&halt));
+    assert!(matches!(walk, Err(Error::Halted)), "{walk:?}");
+    assert_eq!(reader.reads, 1, "no read after the Stop");
+
+    let mut disc = three_unit_chain();
+    let mut drive = HaltingReader {
+        inner: &mut disc,
+        halt_at: 130,
+    };
+    let walk = super::interleaved_units(&mut drive, 0, &icell(100, 159), None);
+    assert!(matches!(walk, Err(Error::Halted)), "{walk:?}");
+}
+
+// A read that returns short leaves the last pack in the buffer: the walk gives the cell
+// back whole rather than reparse it as the next unit.
+#[test]
+fn a_short_read_in_the_unit_walk_is_unreadable() {
+    let mut disc = three_unit_chain();
+    let mut reader = WalkReader {
+        inner: &mut disc,
+        halt: crate::halt::Halt::new(),
+        cancel_after: u32::MAX,
+        short_from: 130,
+        reads: 0,
+    };
+    let walk = super::interleaved_units(&mut reader, 0, &icell(100, 159), None);
+    assert!(matches!(walk, Ok(None)), "{walk:?}");
+}
+
+// A cell spanning the whole sector space whose first unit claims all of it: no overflow.
+#[test]
+fn an_interleaved_unit_spanning_every_sector_does_not_overflow() {
+    let mut disc = MemDisc::new();
+    nav_pack(&mut disc, 0, u32::MAX, 0xFFFF_FFFF);
+    let walk = super::interleaved_units(&mut disc, 0, &icell(0, u32::MAX), None);
+    assert!(matches!(walk, Ok(None)), "{walk:?}");
+}
+
+/// A chapter named in the VMG text data reaches Chapter.name in place of
+/// the ordinal.
+#[test]
+fn scan_dvd_titles_chapter_names_from_text_data() {
+    let mut disc = MemDisc::new();
+    let txtdt = ifo::build_txtdt_mg(0x11, &[(0x02, b"feature"), (0x04, b"Opening")]);
+    let vmg = ifo::with_txtdt(build_vmg(&[(1, 1, 1)]), &txtdt);
+    let vts = build_vts(0, 0x00, &[], &[], &[(0, 9)], false);
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    assert_eq!(t.chapters.len(), 1);
+    assert_eq!(t.chapters[0].name, "Opening");
+}
+
+/// Build a VTS with explicit per-cell category bytes and an N-program map.
+/// Returns the IFO bytes. Cells: `(first, last, category, dur_secs)`.
+fn build_vts_cells(
+    vob_start: u32,
+    video_b0: u8,
+    cells: &[(u32, u32, u8, u8 /*BCD seconds*/)],
+    program_first_cells: &[u8],
+) -> Vec<u8> {
+    let pgcit_sector = 2u32;
+    let mut d = vec![0u8; 4 * 2048];
+    d[0..12].copy_from_slice(b"DVDVIDEO-VTS");
+    d[0xC4..0xC8].copy_from_slice(&vob_start.to_be_bytes()); // vtstt_vobs (Title VOBS)
+    d[0xCC..0xD0].copy_from_slice(&pgcit_sector.to_be_bytes());
+    d[0x200] = video_b0;
+    // no audio / subs
+    let pg = pgcit_sector as usize * 2048;
+    d[pg..pg + 2].copy_from_slice(&1u16.to_be_bytes());
+    let pgc_rel: u32 = 0x100;
+    d[pg + 8 + 4..pg + 8 + 8].copy_from_slice(&pgc_rel.to_be_bytes());
+    let pgc = pg + pgc_rel as usize;
+    d[pgc + 0x02] = program_first_cells.len() as u8; // nr_of_programs
+    d[pgc + 0x03] = cells.len() as u8; // nr_of_cells
+    // Leave PGC-level BCD time zero → duration recomputed from cells.
+    let cell_tbl_rel: u16 = 0xF0;
+    let pgm_map_rel: u16 = 0xEC;
+    d[pgc + 0xE6..pgc + 0xE8].copy_from_slice(&pgm_map_rel.to_be_bytes());
+    d[pgc + 0xE8..pgc + 0xEA].copy_from_slice(&cell_tbl_rel.to_be_bytes());
+    for (i, &fc) in program_first_cells.iter().enumerate() {
+        d[pgc + pgm_map_rel as usize + i] = fc;
+    }
+    let cell_base = pgc + cell_tbl_rel as usize;
+    for (i, (first, last, cat, secs)) in cells.iter().enumerate() {
+        let off = cell_base + i * 24;
+        write_cell_cat(&mut d, off, *first, *last, *cat);
+        d[off + 6] = *secs; // BCD seconds in the cell time field
+    }
+    d
+}
+
+// A leading interleaved-angle sub-block cell (category 0x90) must be dropped from muxed
+// extents; chapter marks never counted its time.
+#[test]
+fn scan_dvd_titles_drops_leading_scene_index_cell() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(2, 1, 1)]);
+    // Cell 0: leading scene-index/angle sub-block (cat 0x90), 5s, sectors 0..9.
+    // Cell 1: feature start (cat 0x00), 59s, 100..199. Cell 2: feature, 59s, 300..399.
+    // Programs: prog0 -> cell 1 (feature start), prog1 -> cell 3.
+    let vts = build_vts_cells(
+        1000,
+        0x00,
+        &[
+            (0, 9, 0x90, 0x05),
+            (100, 199, 0x00, 0x59),
+            (300, 399, 0x00, 0x59),
+        ],
+        &[1, 3],
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    // The leading 0x90 cell is dropped: 2 feature extents, not 3.
+    assert_eq!(t.extents.len(), 2, "leading angle sub-block cell dropped");
+    // First extent starts at the feature cell (vob 1000 + 100), not at 1000+0.
+    assert_eq!(t.extents[0].start_lba, 9000 + 1000 + 100); // ifo_lba + vtstt + first
+    assert_eq!(t.extents[1].start_lba, 9000 + 1000 + 300);
+    // The 0x90 head cell is an angle piece, which chapter timing gives no time: program 0
+    // starts at 0 and program 1 at cell 3 = dur(cell1) = 59s.
+    assert_eq!(t.chapters.len(), 2);
+    assert!(
+        (t.chapters[0].time_secs - 0.0).abs() < 0.01,
+        "ch0 at 0, got {}",
+        t.chapters[0].time_secs
+    );
+    assert!(
+        (t.chapters[1].time_secs - 59.0).abs() < 0.01,
+        "ch1 at 59s, got {}",
+        t.chapters[1].time_secs
+    );
+}
+
+/// Conservative guard end-to-end: a normal feature (every cell category
+/// 0x00) is muxed in full — the filter drops nothing and chapters are
+/// unshifted. This is the plain-single-angle-feature case.
+#[test]
+fn scan_dvd_titles_plain_feature_untouched() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(2, 1, 1)]);
+    let vts = build_vts_cells(
+        1000,
+        crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_PAL, crate::ifo::ASPECT_16X9),
+        &[(0, 99, 0x00, 0x30), (200, 299, 0x00, 0x30)],
+        &[1, 2],
+    );
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let t = &Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0[0];
+    // Nothing dropped: both cells become extents, starting at the very head.
+    assert_eq!(t.extents.len(), 2);
+    assert_eq!(t.extents[0].start_lba, 9000 + 1000); // ifo_lba + vtstt + 0, head intact
+    assert_eq!(t.extents[1].start_lba, 9000 + 1200);
+    // Chapter 0 stays at 0.0 (no shift).
+    assert!((t.chapters[0].time_secs - 0.0).abs() < 0.01);
+}
+
+// Positional MP2 routes to PES ids 0xC0|i (not the old never-fed 0xBD00 + i).
+#[test]
+fn scan_dvd_titles_mp2_audio_routes_to_pes_ids() {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    // coding_mode bits are b0>>5 & 0x7; mode 2 = MPEG-1 Layer II (Mp2).
+    // b0 = 0b010_00000 = 0x40. b1 = 0 (mono, sample rate 48k).
+    let audio = [(0x40u8, 0x00u8, [0u8, 0u8]), (0x40u8, 0x00u8, [0u8, 0u8])];
+    let vts = build_vts(1000, 0x00, &audio, &[], &[(10, 109)], false);
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let titles = Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0;
+    let t = &titles[0];
+    let audio_pids: Vec<u16> = t
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Audio(a) => Some(a.pid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(audio_pids, vec![0x00C0u16, 0x00C1u16]);
+}
+
+fn scan_cells(cells: &[(u32, u32, u8, u8)], programs: &[u8], nchap: u16) -> DiscTitle {
+    scan_vts(build_vts_cells(1000, 0x00, cells, programs), nchap)
+}
+
+fn scan_vts(vts: Vec<u8>, nchap: u16) -> DiscTitle {
+    scan_vts_named(vts, nchap, &[])
+}
+
+// `scan_vts` with VMG text data naming the title's chapters `names` (none: no text data).
+fn scan_vts_named(vts: Vec<u8>, nchap: u16, names: &[&[u8]]) -> DiscTitle {
+    let mut disc = MemDisc::new();
+    let mut vmg = build_vmg(&[(nchap, 1, 1)]);
+    if !names.is_empty() {
+        let mut items: Vec<(u8, &[u8])> = vec![(0x02, b"feature")];
+        items.extend(names.iter().map(|n| (0x04, *n)));
+        vmg = ifo::with_txtdt(vmg, &ifo::build_txtdt_mg(0x11, &items));
+    }
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0
+        .remove(0)
+}
+
+// Adds a VTS_PTT_SRPT to a `build_vts_cells` IFO: title 1's chapters, (PGCN, PGN) each.
+fn with_ptt(mut vts: Vec<u8>, parts: &[(u16, u16)]) -> Vec<u8> {
+    let at = 3 * 2048;
+    vts[0xC8..0xCC].copy_from_slice(&3u32.to_be_bytes());
+    vts[at..at + 2].copy_from_slice(&1u16.to_be_bytes());
+    let last = (12 + parts.len() * 4 - 1) as u32;
+    vts[at + 4..at + 8].copy_from_slice(&last.to_be_bytes());
+    vts[at + 8..at + 12].copy_from_slice(&12u32.to_be_bytes());
+    for (i, (pgcn, pgn)) in parts.iter().enumerate() {
+        let e = at + 12 + i * 4;
+        vts[e..e + 2].copy_from_slice(&pgcn.to_be_bytes());
+        vts[e + 2..e + 4].copy_from_slice(&pgn.to_be_bytes());
+    }
+    vts
+}
+
+fn names(t: &DiscTitle) -> Vec<&str> {
+    t.chapters.iter().map(|c| c.name.as_str()).collect()
+}
+
+const FOUR_CELLS: [(u32, u32, u8, u8); 4] = [
+    (0, 99, 0x00, 0x10),
+    (100, 199, 0x00, 0x10),
+    (200, 299, 0x00, 0x10),
+    (300, 399, 0x00, 0x10),
+];
+
+// Chapter names follow the part-of-title table: two named chapters starting at programs
+// 1 and 3 name those marks, and the marks between keep their ordinals.
+#[test]
+fn scan_dvd_titles_names_the_program_each_chapter_starts_at() {
+    let vts = with_ptt(
+        build_vts_cells(1000, 0x00, &FOUR_CELLS, &[1, 2, 3, 4]),
+        &[(1, 1), (1, 3)],
+    );
+    let t = scan_vts_named(vts, 2, &[b"Opening", b"Finale"]);
+    assert_eq!(names(&t), ["Opening", "2", "Finale", "4"]);
+}
+
+// A chapter in another PGC, or two on one program, cannot be placed: no names.
+#[test]
+fn scan_dvd_titles_drops_names_it_cannot_place() {
+    for parts in [[(1, 1), (2, 1)], [(1, 2), (1, 2)]] {
+        let vts = with_ptt(
+            build_vts_cells(1000, 0x00, &FOUR_CELLS, &[1, 2, 3, 4]),
+            &parts,
+        );
+        let t = scan_vts_named(vts, 2, &[b"Opening", b"Finale"]);
+        assert_eq!(names(&t), ["1", "2", "3", "4"], "{parts:?}");
+    }
+}
+
+// Names index the marks from before the head collapsed: the first kept mark is program 3.
+#[test]
+fn scan_dvd_titles_names_skip_the_collapsed_head() {
+    let cells = [
+        (0, 9, 0x90, 0x05),
+        (10, 19, 0x90, 0x05),
+        (100, 199, 0x00, 0x20),
+        (300, 399, 0x00, 0x20),
+    ];
+    let parts = [(1, 1), (1, 2), (1, 3), (1, 4)];
+    let vts = with_ptt(build_vts_cells(1000, 0x00, &cells, &[1, 2, 3, 4]), &parts);
+    let t = scan_vts_named(vts, 4, &[b"Logo", b"Index", b"Main", b"End"]);
+    assert_eq!(names(&t), ["Main", "End"]);
+}
+
+// Sets the PGC playback time (BCD seconds) of a `build_vts_cells` IFO.
+fn with_pgc_secs(mut vts: Vec<u8>, bcd_secs: u8) -> Vec<u8> {
+    vts[2 * 2048 + 0x100 + 6] = bcd_secs;
+    vts
+}
+
+// The PGC's own playback time counts an angle block once: the dropped leading angle
+// pieces are not in it, so nothing comes off it, and the last chapter mark stays inside.
+#[test]
+fn scan_dvd_titles_pgc_time_is_not_cut_by_the_dropped_head() {
+    let cells = [
+        (0, 9, 0x90, 0x05),
+        (10, 19, 0x90, 0x05),
+        (100, 199, 0x00, 0x20),
+        (300, 399, 0x00, 0x20),
+    ];
+    let vts = with_pgc_secs(build_vts_cells(1000, 0x00, &cells, &[3, 4]), 0x40);
+    let t = scan_vts(vts, 2);
+    assert!(
+        (t.duration_secs - 40.0).abs() < 0.01,
+        "got {}",
+        t.duration_secs
+    );
+    assert!((t.chapters[1].time_secs - 20.0).abs() < 0.01);
+}
+
+// With no PGC time, the duration summed from cells leaves out an angle block's other
+// angles wherever the block sits, as the chapter marks do.
+#[test]
+fn scan_dvd_titles_cell_sum_counts_an_angle_block_once() {
+    let t = scan_cells(
+        &[
+            (0, 99, 0x00, 0x20),
+            (100, 199, 0x50, 0x10),
+            (200, 299, 0x90, 0x10),
+            (300, 399, 0xD0, 0x10),
+            (400, 499, 0x00, 0x20),
+        ],
+        &[1, 5],
+        2,
+    );
+    assert!(
+        (t.duration_secs - 50.0).abs() < 0.01,
+        "got {}",
+        t.duration_secs
+    );
+    assert!((t.chapters[1].time_secs - 30.0).abs() < 0.01);
+    assert_eq!(t.extents.len(), 3, "one angle of the block is read");
+}
+
+// The dropped head adds no time to the duration, and head chapters collapse to one mark at 0.
+#[test]
+fn scan_dvd_titles_dropped_head_adjusts_duration_and_chapters() {
+    let t = scan_cells(
+        &[
+            (0, 9, 0x90, 0x05),
+            (10, 19, 0x90, 0x05),
+            (100, 199, 0x00, 0x20),
+            (300, 399, 0x00, 0x20),
+        ],
+        &[1, 2, 3, 4],
+        4,
+    );
+    assert!(
+        (t.duration_secs - 40.0).abs() < 0.01,
+        "got {}",
+        t.duration_secs
+    );
+    let times: Vec<f64> = t.chapters.iter().map(|c| c.time_secs).collect();
+    assert_eq!(times.iter().filter(|&&x| x <= 0.0).count(), 1, "{times:?}");
+    assert_eq!(t.chapters[0].name, "1");
+}
+
+// VIDEO_TS / VTS IFOs are garbage or real, BUPs are garbage or real.
+fn scan_ifo_bup(ifo_ok: bool, bup_ok: bool) -> Result<Vec<DiscTitle>> {
+    let mut disc = MemDisc::new();
+    let vmg = build_vmg(&[(1, 1, 1)]);
+    let vts = build_vts_cells(1000, 0x00, &[(0, 99, 0x00, 0x10)], &[1]);
+    let pick = |ok: bool, good: &Vec<u8>| if ok { good.clone() } else { vec![0x55; 4096] };
+    let spec = |name: &str, icb_lba, data_lba, contents| FileSpec {
+        name: name.into(),
+        icb_lba,
+        data_lba,
+        contents,
+    };
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            spec("VIDEO_TS.IFO", 60, 5000, pick(ifo_ok, &vmg)),
+            spec("VTS_01_0.IFO", 62, 6000, pick(ifo_ok, &vts)),
+            spec("VIDEO_TS.BUP", 64, 7000, pick(bup_ok, &vmg)),
+            spec("VTS_01_0.BUP", 66, 8000, pick(bup_ok, &vts)),
+        ],
+    );
+    Disc::scan_dvd_titles(&mut disc, &udf, None).map(|r| r.0)
+}
+
+// A bad IFO falls back to its BUP; VOBs stay anchored at the IFO's own LBA.
+#[test]
+fn scan_dvd_titles_bad_ifo_uses_bup() {
+    let good = scan_ifo_bup(true, false).expect("good ifo");
+    let bup = scan_ifo_bup(false, true).expect("bup");
+    assert_eq!(bup.len(), 1);
+    assert_eq!(bup[0].extents[0].start_lba, good[0].extents[0].start_lba);
+}
+
+// IFO and BUP both bad: no titles, not a scan error (base behaviour).
+#[test]
+fn scan_dvd_titles_bad_ifo_and_bup_is_empty() {
+    assert_eq!(scan_ifo_bup(false, false).expect("no error").len(), 0);
+}
+
+fn title(vts_title_num: u8, pgcs: usize) -> ifo::DvdTitle {
+    ifo::DvdTitle {
+        chapters: 1,
+        duration_secs: 1.0,
+        cells: Vec::new(),
+        chapter_times: Vec::new(),
+        palette: None,
+        ast_ctl: [0; 8],
+        spst_ctl: [0; 32],
+        vts_title_num,
+        pgcs,
+        ptt_programs: None,
+    }
+}
+
+// A rip scans its disc more than once: the split-title warning is one line per disc,
+// naming every split title, and a rescan of the same disc logs it at debug only.
+#[test]
+fn multi_pgc_titles_warn_once_per_disc() {
+    let set = |n: u8, titles: Vec<ifo::DvdTitle>| ifo::DvdTitleSet {
+        vts_number: n,
+        vob_start_sector: 0,
+        video: ifo::DvdVideoAttr {
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            aspect: ifo::DvdAspect::R16x9,
+            standard: ifo::TvSystem::Ntsc,
+        },
+        audio_streams: Vec::new(),
+        subtitle_streams: Vec::new(),
+        titles,
+    };
+    let info = ifo::DvdInfo {
+        title_sets: vec![
+            set(3, vec![title(1, 8)]),
+            set(4, vec![title(1, 5), title(2, 1)]),
+            set(11, vec![title(1, 1)]),
+        ],
+        chapter_names: Default::default(),
+        region_mask: 0,
+    };
+    let vmg = b"multi_pgc_titles_warn_once_per_disc".to_vec();
+    let ((), ev) = crate::testlog::capture(|| {
+        warn_multi_pgc_titles(&vmg, &info);
+        warn_multi_pgc_titles(&vmg, &info);
+        warn_multi_pgc_titles(&vmg, &info);
+    });
+    let warns: Vec<_> = ev
+        .iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .collect();
+    assert_eq!(warns.len(), 1, "{ev:?}");
+    assert_eq!(
+        warns[0].field("titles"),
+        Some("VTS 3 title 1 (8 PGCs), VTS 4 title 1 (5 PGCs)")
+    );
+    // A disc with no split title logs nothing.
+    let clear = ifo::DvdInfo {
+        title_sets: vec![set(1, vec![title(1, 1)])],
+        chapter_names: Default::default(),
+        region_mask: 0,
+    };
+    let ((), ev) = crate::testlog::capture(|| warn_multi_pgc_titles(b"no split", &clear));
+    assert!(ev.is_empty(), "{ev:?}");
+}
+
+#[test]
+fn dvd_region_decodes_the_prohibited_region_mask() {
+    assert_eq!(dvd_region(0x00), DiscRegion::Free);
+    // Only bit 0 clear: playable in region 1 alone.
+    assert_eq!(dvd_region(0xFE), DiscRegion::Dvd(vec![1]));
+    assert_eq!(dvd_region(0xFD), DiscRegion::Dvd(vec![2]));
+    assert_eq!(dvd_region(0xF2), DiscRegion::Dvd(vec![1, 3, 4]));
+    assert_eq!(dvd_region(0x01), DiscRegion::Dvd(vec![2, 3, 4, 5, 6, 7, 8]));
+    assert_eq!(dvd_region(0xFF), DiscRegion::Dvd(vec![]));
+}
+
+#[test]
+fn audio_code_extension_maps_to_purpose() {
+    assert_eq!(audio_purpose(0), LabelPurpose::Normal);
+    assert_eq!(audio_purpose(1), LabelPurpose::Normal);
+    assert_eq!(audio_purpose(2), LabelPurpose::Descriptive);
+    assert_eq!(audio_purpose(3), LabelPurpose::Commentary);
+    assert_eq!(audio_purpose(4), LabelPurpose::Commentary);
+    assert_eq!(audio_purpose(5), LabelPurpose::Normal);
+}
+
+#[test]
+fn subpicture_code_extension_maps_to_forced_and_qualifier() {
+    let none = (false, LabelQualifier::None);
+    let sdh = (false, LabelQualifier::Sdh);
+    for (ext, want) in [
+        (0, none),
+        (1, none),
+        (2, none),
+        (3, none),
+        (5, sdh),
+        (6, sdh),
+        (7, sdh),
+        (9, (true, LabelQualifier::Forced)),
+        (13, none),
+        (14, none),
+        (15, none),
+    ] {
+        assert_eq!(subpicture_label(ext), want, "code extension {ext}");
+    }
+}
+
+// Scans a one-VTS disc built from `vmg` and `vts`, keeping every result.
+fn scan_disc(vmg: Vec<u8>, vts: Vec<u8>) -> (Vec<DiscTitle>, DiscRegion) {
+    let mut disc = MemDisc::new();
+    let udf = build_video_ts_fs(
+        &mut disc,
+        &[
+            FileSpec {
+                name: "VIDEO_TS.IFO".into(),
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vmg,
+            },
+            FileSpec {
+                name: "VTS_01_0.IFO".into(),
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: vts,
+            },
+        ],
+    );
+    let (titles, _, region) = Disc::scan_dvd_titles(&mut disc, &udf, None).expect("scan");
+    (titles, region)
+}
+
+#[test]
+fn scan_dvd_titles_reports_the_vmg_region() {
+    let vts = || build_vts(0, 0x00, &[], &[], &[(0, 9)], false);
+    assert_eq!(
+        scan_disc(build_vmg(&[(1, 1, 1)]), vts()).1,
+        DiscRegion::Free
+    );
+    let mut vmg = build_vmg(&[(1, 1, 1)]);
+    vmg[0x23] = 0xFD;
+    assert_eq!(scan_disc(vmg, vts()).1, DiscRegion::Dvd(vec![2]));
+}
+
+// The code extension belongs to the LOGICAL stream, so its label must follow the
+// AST_CTL / SPST_CTL routing to whichever physical stream that logical stream plays.
+#[test]
+fn scan_dvd_titles_code_extension_labels_follow_the_routed_stream() {
+    let audio = [aud(AC3_6CH, b"en"), aud(AC3_6CH, b"en")];
+    let mut vts = build_vts(0, 0x00, &audio, &[*b"de", *b"de"], &[(0, 9)], false);
+    vts[0x204 + 8 + 5] = 3; // logical audio 1: director's comments
+    vts[0x256 + 6 + 5] = 9; // logical subpicture 1: forced
+    set_ast(&mut vts, &[0x8100, 0x8000]);
+    set_spst(&mut vts, &[0x8100_0000, 0x8000_0000]);
+    let (titles, _) = scan_disc(build_vmg(&[(1, 1, 1)]), vts);
+    let mut audio = Vec::new();
+    let mut subs = Vec::new();
+    for s in &titles[0].streams {
+        match s {
+            Stream::Audio(a) => audio.push((a.pid, a.purpose)),
+            Stream::Subtitle(s) => subs.push((s.pid, s.forced, s.qualifier)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        audio,
+        vec![
+            (0xBD81, LabelPurpose::Normal),
+            (0xBD80, LabelPurpose::Commentary)
+        ]
+    );
+    assert_eq!(
+        subs,
+        vec![
+            (0x21, false, LabelQualifier::None),
+            (0x20, true, LabelQualifier::Forced)
+        ]
+    );
+}

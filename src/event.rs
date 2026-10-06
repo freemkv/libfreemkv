@@ -62,12 +62,5 @@ impl<F: Fn(&Event<'_>) + Send + Sync> Events for F {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Shrunk != Probed: distinct meanings (error vs. recovery), must not compare equal.
-    #[test]
-    fn batch_size_reason_variants_are_not_equal() {
-        assert_ne!(BatchSizeReason::Shrunk, BatchSizeReason::Probed);
-    }
-}
+#[path = "event_tests.rs"]
+mod tests;

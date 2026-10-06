@@ -1,0 +1,1556 @@
+use super::*;
+
+// --- Pack header detection ---
+
+#[test]
+fn detect_pack_header() {
+    let mut demuxer = PsDemuxer::new();
+
+    // MPEG-2 pack header: 14 bytes, stuffing_length = 0
+    let mut pack = vec![
+        0x00, 0x00, 0x01, 0xBA, // start code
+        0x44, 0x00, 0x04, 0x00, 0x04, 0x01, // SCR (6 bytes)
+        0x01, 0x89, 0xC3, // mux_rate (3 bytes)
+        0xF8, // stuffing_length = 0 (lower 3 bits)
+    ];
+
+    // Follow with a PES packet so we have a delimiter
+    pack.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xE0, // video stream
+        0x00, 0x08, // length = 8
+        0x80, 0x00, 0x00, // flags: no PTS/DTS, header_data_length = 0
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, // payload (5 bytes)
+    ]);
+
+    let packets = demuxer.feed(&pack);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].stream_id, 0xE0);
+    assert_eq!(packets[0].data, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+}
+
+#[test]
+fn pack_header_with_stuffing() {
+    let mut demuxer = PsDemuxer::new();
+
+    // Pack header with 3 stuffing bytes
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
+        0xFB, // stuffing_length = 3
+        0xFF, 0xFF, 0xFF, // stuffing bytes
+    ];
+
+    // Followed by a PES packet
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xC0, // audio stream
+        0x00, 0x05, // length = 5
+        0x80, 0x00, 0x00, // flags: no PTS, header_data_len=0
+        0x11, 0x22, // payload
+    ]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].stream_id, 0xC0);
+    assert_eq!(packets[0].data, vec![0x11, 0x22]);
+}
+
+// --- PES header + PTS parsing ---
+
+#[test]
+fn pes_header_with_pts() {
+    let mut demuxer = PsDemuxer::new();
+
+    // PTS = 90000 (1 second at 90kHz), encoded via encode_pts with prefix 0x20;
+    // expected 5 bytes are 0x21,0x00,0x0B,0xBF,0x21 (marker bits set in bytes 0/2/4).
+
+    let pts_bytes = encode_pts(90000, 0x20);
+
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xE0, // video stream
+        0x00, 0x0D, // length = 13
+        0x80, 0x80, 0x05, // flags: PTS only, header_data_len=5
+    ];
+    data.extend_from_slice(&pts_bytes);
+    data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00]); // payload
+
+    // Add a delimiter
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]); // program end
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].stream_id, 0xE0);
+    assert_eq!(packets[0].pts, Some(90000));
+    assert!(packets[0].dts.is_none());
+    assert_eq!(packets[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00]);
+}
+
+#[test]
+fn pes_header_with_pts_and_dts() {
+    let mut demuxer = PsDemuxer::new();
+
+    let pts_bytes = encode_pts(180000, 0x30); // PTS marker = 0x30
+    let dts_bytes = encode_pts(90000, 0x10); // DTS marker = 0x10
+
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x11, // length = 17
+        0x80, 0xC0, 0x0A, // flags: PTS+DTS, header_data_len=10
+    ];
+    data.extend_from_slice(&pts_bytes);
+    data.extend_from_slice(&dts_bytes);
+    data.extend_from_slice(&[0xCA, 0xFE]); // payload
+
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].pts, Some(180000));
+    assert_eq!(packets[0].dts, Some(90000));
+}
+
+// --- Private stream 1 sub-stream extraction ---
+
+#[test]
+fn private_stream_1_ac3_substream() {
+    let mut demuxer = PsDemuxer::new();
+
+    // AC3 sub-header: sub_id(1) + frame_count(1) + access_unit_ptr(2) = 4 bytes
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBD, // private stream 1
+        0x00, 0x0B, // length = 11
+        0x80, 0x00, 0x00, // no PTS, header_data_len=0
+        0x80, // sub-stream ID: AC3 stream 0
+        0x01, 0x00, 0x02, // frame_count + access_unit_ptr (sub-header bytes)
+        0xAA, 0xBB, 0xCC, 0xDD, // AC3 payload
+    ];
+
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].stream_id, 0xBD);
+    assert_eq!(packets[0].sub_stream_id, Some(0x80));
+    assert_eq!(packets[0].data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+}
+
+#[test]
+fn private_stream_1_dts_substream() {
+    let mut demuxer = PsDemuxer::new();
+
+    // DTS sub-header: sub_id(1) + frame_count(1) + access_unit_ptr(2) = 4 bytes
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBD, 0x00, 0x09, // length = 9
+        0x80, 0x00, 0x00, // no PTS, header_data_len=0
+        0x88, // sub-stream ID: DTS stream 0
+        0x01, 0x00, 0x00, // sub-header (frame_count + access_unit_ptr)
+        0x11, 0x22,
+    ];
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].sub_stream_id, Some(0x88));
+    assert_eq!(packets[0].data, vec![0x11, 0x22]);
+}
+
+#[test]
+fn private_stream_1_subtitle_substream() {
+    let mut demuxer = PsDemuxer::new();
+
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBD, 0x00, 0x06, 0x80, 0x00, 0x00,
+        0x20, // sub-stream ID: subtitle stream 0
+        0xFF, 0xFE,
+    ];
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].sub_stream_id, Some(0x20));
+}
+
+#[test]
+fn private_stream_1_lpcm_substream() {
+    let mut demuxer = PsDemuxer::new();
+
+    // LPCM sub-header: sub_id(1) + frames(1) + ptr(2) + emphasis(1) + quant_freq(1) + channels(1) = 7 bytes
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBD, 0x00, 0x0C, // length = 12
+        0x80, 0x00, 0x00, // no PTS, header_data_len=0
+        0xA0, // sub-stream ID: LPCM stream 0
+        0x01, 0x00, 0x00, // frames + first_access_unit ptr (stripped)
+        0x00, 0x00, 0x00, // audio header (kept for the LPCM parser)
+        0x01, 0x02, // LPCM payload
+    ];
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].sub_stream_id, Some(0xA0));
+    // The 3-byte audio header (quant/rate/channels) stays for the LPCM parser.
+    assert_eq!(packets[0].data, vec![0x00, 0x00, 0x00, 0x01, 0x02]);
+}
+
+// --- Incremental feeding ---
+
+#[test]
+fn incremental_feed() {
+    let mut demuxer = PsDemuxer::new();
+
+    let mut full = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x06, // length = 6
+        0x80, 0x00, 0x00, // no PTS, header_data_len=0
+        0xAA, 0xBB, 0xCC,
+    ];
+    full.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    // Feed in two halves
+    let mid = full.len() / 2;
+    let p1 = demuxer.feed(&full[..mid]);
+    assert!(p1.is_empty(), "first half should not produce packets");
+
+    let p2 = demuxer.feed(&full[mid..]);
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].data, vec![0xAA, 0xBB, 0xCC]);
+}
+
+#[test]
+fn flush_emits_trailing_unbounded_video_pes() {
+    let mut demuxer = PsDemuxer::new();
+    // Unbounded (length 0) video PES with no trailing start code — the
+    // common EOF case. feed() must not emit it (awaiting a delimiter),
+    // but flush() must emit the tail rather than discarding it.
+    let data = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, // video, length 0 (unbounded)
+        0x80, 0x00, 0x00, // no PTS, header_data_len = 0
+        0xAA, 0xBB, 0xCC, 0xDD,
+    ];
+    let fed = demuxer.feed(&data);
+    assert!(fed.is_empty(), "unbounded PES not emitted until delimited");
+    let flushed = demuxer.flush();
+    assert_eq!(flushed.len(), 1, "flush emits the trailing PES");
+    assert_eq!(flushed[0].stream_id, 0xE0);
+    assert_eq!(flushed[0].data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+}
+
+// --- Multiple PES packets ---
+
+#[test]
+fn multiple_pes_packets() {
+    let mut demuxer = PsDemuxer::new();
+
+    let mut data = Vec::new();
+
+    // First PES: video
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x11, 0x22,
+    ]);
+
+    // Second PES: audio
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x33, 0x44,
+    ]);
+
+    // Delimiter
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 2);
+    assert_eq!(packets[0].stream_id, 0xE0);
+    assert_eq!(packets[1].stream_id, 0xC0);
+}
+
+// --- unbounded (length-0) video PES framing ---
+
+#[test]
+fn unbounded_video_pes_not_cut_by_embedded_start_codes() {
+    // A length-0 video PES whose ES payload has embedded MPEG start codes (picture,
+    // slice, GOP, sequence) must be delimited by the NEXT PS-layer boundary (here a
+    // program-end 0xB9), not by the first embedded 00 00 01 inside the payload.
+    let mut demuxer = PsDemuxer::new();
+
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xE0, // video stream
+        0x00, 0x00, // length = 0 (unbounded)
+        0x80, 0x00, 0x00, // flags: no PTS, header_data_len = 0
+    ];
+    // ES payload with embedded MPEG-2 start codes.
+    let payload = [
+        0x00, 0x00, 0x01, 0xB3, // sequence header
+        0x11, 0x22, 0x00, 0x00, 0x01, 0x00, // picture start code
+        0x33, 0x44, 0x00, 0x00, 0x01, 0x01, // slice
+        0x55, 0x66,
+    ];
+    data.extend_from_slice(&payload);
+    // PS-layer boundary that closes the unbounded PES.
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 1, "one PES, not several payload fragments");
+    assert_eq!(packets[0].stream_id, 0xE0);
+    // The whole ES payload survives — none of it discarded as bogus units.
+    assert_eq!(packets[0].data, payload.to_vec());
+}
+
+#[test]
+fn unbounded_video_pes_waits_for_boundary() {
+    // Without a following PS-layer boundary the unbounded PES is held
+    // (waiting for more data), not emitted truncated.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0xAA, 0xBB]); // picture SC, no PS boundary
+    let packets = demuxer.feed(&data);
+    assert!(packets.is_empty(), "no PS boundary yet → hold the PES");
+}
+
+#[test]
+fn input_with_no_start_code_at_all_is_bounded() {
+    // An extent with no 00 00 01 start code — zero-filled VOB, or AACS ciphertext
+    // probed raw (see src/disc/hddvd.rs) — must not accumulate. The whole-title feed
+    // in src/mux/disc.rs would otherwise grow the buffer to title size (~90 GB UHD).
+    let mut demuxer = PsDemuxer::new();
+    let chunk = vec![0u8; 1024 * 1024];
+    for _ in 0..(MAX_PS_BUFFER / chunk.len() + 8) {
+        assert!(demuxer.feed(&chunk).is_empty(), "no start code → no PES");
+    }
+    assert!(
+        demuxer.buffer.len() <= MAX_PS_BUFFER,
+        "buffer grew to {} with no start code ever seen (cap {})",
+        demuxer.buffer.len(),
+        MAX_PS_BUFFER
+    );
+    // Nothing in a start-code-free buffer can ever begin a unit except a
+    // 2-byte 00 00 prefix, so the retained tail is tiny.
+    assert!(
+        demuxer.buffer.len() <= 2,
+        "start-code-free tail retained {} bytes",
+        demuxer.buffer.len()
+    );
+}
+
+#[test]
+fn start_code_split_across_feeds_still_parses() {
+    // The start-code-free trim must keep the 2 bytes that can be the
+    // prefix of a start code straddling a feed boundary.
+    let mut demuxer = PsDemuxer::new();
+    assert!(demuxer.feed(&[0xFF, 0xFF, 0x00, 0x00]).is_empty());
+    let mut rest = vec![0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00, 0xAA, 0xBB];
+    rest.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]); // PS-layer boundary
+    let packets = demuxer.feed(&rest);
+    assert_eq!(packets.len(), 1, "split start code must still be found");
+    assert_eq!(packets[0].stream_id, 0xE0);
+    assert_eq!(packets[0].data, vec![0xAA, 0xBB]);
+}
+
+#[test]
+fn unbounded_video_pes_over_cap_is_force_flushed() {
+    // A corrupt unbounded PES followed by endless non-boundary bytes must not grow
+    // the buffer without limit. This feeds a real start code first, exercising only
+    // the in-PES cap; no-start-code path → `input_with_no_start_code_at_all_is_bounded`.
+    let mut demuxer = PsDemuxer::new();
+    let header = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+    let packets = demuxer.feed(&header);
+    assert!(packets.is_empty());
+    // Feed >MAX_PS_BUFFER of bytes containing no PS-layer boundary.
+    let chunk = vec![0x55u8; 1024 * 1024];
+    let mut emitted = 0;
+    for _ in 0..(MAX_PS_BUFFER / chunk.len() + 4) {
+        emitted += demuxer.feed(&chunk).len();
+    }
+    assert!(
+        demuxer.buffer.len() <= MAX_PS_BUFFER + chunk.len(),
+        "buffer grew to {} (cap {})",
+        demuxer.buffer.len(),
+        MAX_PS_BUFFER
+    );
+    // The force-flush emits the over-long PES rather than accumulating it.
+    assert!(emitted >= 1, "over-cap unbounded PES is force-flushed");
+}
+
+// --- PTS parsing edge cases ---
+
+#[test]
+fn pts_zero() {
+    // PTS = 0 encoded
+    let pts = parse_pts(&encode_pts(0, 0x20));
+    assert_eq!(pts, Some(0));
+}
+
+#[test]
+fn pts_large_value() {
+    // Test a large PTS value (close to 33-bit max)
+    let val: u64 = (1 << 32) - 1; // 0xFFFFFFFF
+    let encoded = encode_pts(val, 0x20);
+    let decoded = parse_pts(&encoded);
+    assert_eq!(decoded, Some(val));
+}
+
+// --- DVD PID mapping (track-routing collision regression) ---
+
+fn mk(stream_id: u8, sub: Option<u8>) -> PsPacket {
+    PsPacket {
+        stream_id,
+        sub_stream_id: sub,
+        pts: None,
+        dts: None,
+        data: vec![0xAA],
+        source: None,
+    }
+}
+
+// A video packet at feed byte `at` with presentation time `pts` (90 kHz).
+fn video(at: u64, pts: u64) -> PsPacket {
+    let mut p = mk(0xE0, None);
+    p.pts = Some(pts);
+    p.source = Some(crate::pes::SourcePos::at_byte(at));
+    p
+}
+
+// The PCI and DSI packets of a navigation pack at `at`, for a VOBU of `cell` timed
+// `start..end`.
+fn nav_pack(at: u64, cell: (u16, u8), start: u32, end: u32) -> [PsPacket; 2] {
+    let mut pci = mk(PRIVATE_STREAM_2, None);
+    pci.data = vec![0u8; 21];
+    pci.data[13..17].copy_from_slice(&start.to_be_bytes());
+    pci.data[17..21].copy_from_slice(&end.to_be_bytes());
+    let mut dsi = mk(PRIVATE_STREAM_2, None);
+    dsi.data = vec![0u8; 29];
+    dsi.data[0] = 0x01;
+    dsi.data[25..27].copy_from_slice(&cell.0.to_be_bytes());
+    dsi.data[28] = cell.1;
+    for p in [&mut pci, &mut dsi] {
+        p.source = Some(crate::pes::SourcePos::at_byte(at));
+    }
+    [pci, dsi]
+}
+
+// Feed `packets` through `nav`, returning the PTS of each kept non-navigation packet.
+fn kept(nav: &mut VobuNav, packets: Vec<PsPacket>) -> Vec<u64> {
+    let mut out = Vec::new();
+    for mut p in packets {
+        if nav.admit(&mut p) && !p.is_nav() {
+            out.extend(p.pts);
+        }
+    }
+    out
+}
+
+const SECTOR: u64 = 2048;
+
+#[test]
+fn vobu_nav_keeps_only_the_cell_each_extent_opens_with() {
+    let extents = [
+        crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 10,
+        },
+        crate::disc::Extent {
+            start_lba: 50,
+            sector_count: 10,
+        },
+    ];
+    let mut nav = VobuNav::new(&extents);
+    let s = |n: u64| n * SECTOR;
+    let mut packets = Vec::new();
+    // Extent 1 is cell (7, 2), with a unit of (8, 1) woven in.
+    packets.extend(nav_pack(s(0), (7, 2), 0, 900));
+    packets.push(video(s(1), 100));
+    packets.extend(nav_pack(s(3), (8, 1), 50_000, 50_900));
+    packets.push(video(s(4), 50_100));
+    packets.extend(nav_pack(s(6), (7, 2), 900, 1_800));
+    packets.push(video(s(7), 1_000));
+    // Extent 2 opens with (8, 1): that is now the cell being read.
+    packets.extend(nav_pack(s(10), (8, 1), 1_800, 2_700));
+    packets.push(video(s(11), 1_900));
+    packets.extend(nav_pack(s(12), (7, 2), 2_700, 3_600));
+    packets.push(video(s(13), 2_800));
+    assert_eq!(kept(&mut nav, packets), vec![100, 1_000, 1_900]);
+    assert_eq!(nav.dropped_vobus, 2);
+    assert_eq!(nav.joins, 0);
+    // A packet the demuxer could not place passes untouched.
+    let mut loose = mk(0xE0, None);
+    assert!(nav.admit(&mut loose));
+}
+
+#[test]
+fn vobu_nav_joins_each_vob_clock_onto_the_last() {
+    // One cell per extent, as a title is read: VOB 4's cell, then VOB 5's.
+    let cells = [
+        crate::disc::Extent {
+            start_lba: 0,
+            sector_count: 2,
+        },
+        crate::disc::Extent {
+            start_lba: 2,
+            sector_count: 10,
+        },
+    ];
+    let mut nav = VobuNav::new(&cells);
+    let s = |n: u64| n * SECTOR;
+    let mut packets = Vec::new();
+    // VOB 4 runs 0.1 s .. 126.6 s; VOB 5 restarts its clock at 0.07 s.
+    packets.extend(nav_pack(s(0), (4, 1), 9_000, 11_394_000));
+    packets.push(video(s(1), 11_390_000));
+    packets.extend(nav_pack(s(2), (5, 1), 6_300, 60_300));
+    packets.push(video(s(3), 6_300));
+    packets.push(video(s(4), 1_000)); // audio that leads its video in the new VOB
+    packets.extend(nav_pack(s(5), (5, 1), 60_300, 114_300));
+    packets.push(video(s(6), 60_300));
+    let shift = 11_394_000 - 6_300;
+    assert_eq!(
+        kept(&mut nav, packets),
+        vec![11_390_000, 6_300 + shift, 1_000 + shift, 60_300 + shift]
+    );
+    assert_eq!(nav.joins, 1);
+}
+
+#[test]
+fn parse_extended_stream_id_extracts_stream_id_extension() {
+    // SHAUN's VC-1 video PES: stream_id 0xFD, flags2=0x01 (PES_extension only),
+    // header_data_length=3. Minimal well-formed variant: ext_flags=0x01
+    // (PES_extension_flag_2), field_len=0x81, stream_id_extension=0x55. Payload is ES.
+    let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+    let opt = [0x01u8, 0x81, 0x55];
+    let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let len = (3 + opt.len() + es.len()) as u16;
+    pkt.extend_from_slice(&len.to_be_bytes());
+    pkt.extend_from_slice(&[0x80, 0x01, opt.len() as u8]);
+    pkt.extend_from_slice(&opt);
+    pkt.extend_from_slice(&es);
+
+    let parsed = parse_pes_packet(&pkt).expect("parses");
+    assert_eq!(parsed.stream_id, EXTENDED_STREAM_ID);
+    assert_eq!(
+        parsed.sub_stream_id,
+        Some(0x55),
+        "stream_id_extension extracted from PES extension"
+    );
+    // ES is the payload verbatim — no leading sub-header byte stripped.
+    assert_eq!(parsed.data, es);
+    // Routes to the extended-stream-id PID space.
+    assert_eq!(parsed.dvd_pid(), Some(hddvd_extended_pid(0x55)));
+    assert_eq!(parsed.dvd_pid(), Some(0xFD55));
+}
+
+#[test]
+fn parse_extended_stream_id_skips_pts_and_dts_before_the_extension() {
+    // Common real case: an AU-opening 0xFD VC-1 PES carries PTS (often DTS) in the
+    // optional-header region, which the parser must SKIP (PTS +5, DTS +5) to reach
+    // PES_extension → stream_id_extension. An off-by-one here silently misroutes video.
+    let build = |flags2: u8, skip: usize| {
+        let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+        // optional region: `skip` bytes (PTS/DTS placeholders) then
+        // ext_flags=0x01, field_len=0x81, stream_id_extension=0x55.
+        let mut opt = vec![0xFFu8; skip];
+        opt.extend_from_slice(&[0x01, 0x81, 0x55]);
+        let es = [0xDEu8, 0xAD];
+        let len = (3 + opt.len() + es.len()) as u16;
+        pkt.extend_from_slice(&len.to_be_bytes());
+        // flags1=0x80, flags2, header_data_length = optional region length.
+        pkt.extend_from_slice(&[0x80, flags2, opt.len() as u8]);
+        pkt.extend_from_slice(&opt);
+        pkt.extend_from_slice(&es);
+        pkt
+    };
+    // PTS present (pts_dts bits = 10 → flags2 0x80) + PES_extension (0x01).
+    let pts_only = parse_pes_packet(&build(0x81, 5)).expect("parses");
+    assert_eq!(
+        pts_only.sub_stream_id,
+        Some(0x55),
+        "extension found after skipping a 5-byte PTS"
+    );
+    // PTS+DTS present (pts_dts bits = 11 → flags2 0xC0) + PES_extension.
+    let pts_dts = parse_pes_packet(&build(0xC1, 10)).expect("parses");
+    assert_eq!(
+        pts_dts.sub_stream_id,
+        Some(0x55),
+        "extension found after skipping a 10-byte PTS+DTS"
+    );
+}
+
+#[test]
+fn parse_extended_stream_id_without_extension_yields_no_sub_id() {
+    // A 0xFD PES that declares no PES_extension (flags2=0x00) can't carry a
+    // stream_id_extension → sub_stream_id None, and dvd_pid falls through.
+    let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+    let es = [0x11u8, 0x22];
+    let len = (3 + es.len()) as u16;
+    pkt.extend_from_slice(&len.to_be_bytes());
+    pkt.extend_from_slice(&[0x80, 0x00, 0x00]);
+    pkt.extend_from_slice(&es);
+
+    let parsed = parse_pes_packet(&pkt).expect("parses");
+    assert_eq!(parsed.sub_stream_id, None);
+    assert_eq!(parsed.dvd_pid(), None);
+    assert_eq!(parsed.data, es);
+}
+
+/// Inference (US5987417 "1100 0***b or 1101 0***b"): extension `0xD0|n` routes to PID
+/// `0x00D0|n` and pairs with base `0xC0|n`.
+#[test]
+fn extension_packets_route_and_pair_by_stream_number() {
+    for n in 0..8u8 {
+        assert_eq!(mk(0xD0 | n, None).dvd_pid(), Some(0x00D0 | u16::from(n)));
+        assert_eq!(
+            dvd_mpeg_audio_extension_base(0x00D0 | u16::from(n)),
+            Some(0x00C0 | u16::from(n))
+        );
+    }
+    assert_eq!(mk(0xD8, None).dvd_pid(), None);
+    assert_eq!(mk(0xCF, None).dvd_pid(), None);
+    assert_eq!(dvd_mpeg_audio_extension_base(0x00C1), None);
+    assert_eq!(dvd_mpeg_audio_extension_base(0x00D8), None);
+    assert_eq!(dvd_mpeg_audio_extension_base(0xBDD0), None);
+}
+
+#[test]
+fn dvd_pid_matches_scanner_assignment() {
+    // Video → 0xE0 (matches dvd.rs VideoStream pid).
+    assert_eq!(mk(0xE0, None).dvd_pid(), Some(DVD_VIDEO_PID));
+    // PID = 0xBD00 | sub_stream_id — unique per sub-id, no collision.
+    assert_eq!(mk(0xBD, Some(0x80)).dvd_pid(), Some(0xBD80)); // AC-3 #0
+    assert_eq!(mk(0xBD, Some(0x81)).dvd_pid(), Some(0xBD81)); // AC-3 #1
+    assert_eq!(mk(0xBD, Some(0x88)).dvd_pid(), Some(0xBD88)); // DTS  #0
+    assert_eq!(mk(0xBD, Some(0xA0)).dvd_pid(), Some(0xBDA0)); // LPCM #0
+    // VobSub subtitle 0x20/0x21 → 0x20 / 0x21 (identity).
+    assert_eq!(mk(0xBD, Some(0x20)).dvd_pid(), Some(0x20));
+    assert_eq!(mk(0xBD, Some(0x21)).dvd_pid(), Some(0x21));
+    // MPEG audio stream n (PES id 0xC0|n) → PID = its stream id, DVD's 8 streams only.
+    assert_eq!(mk(0xC0, None).dvd_pid(), Some(0xC0));
+    assert_eq!(mk(0xC7, None).dvd_pid(), Some(0xC7));
+    assert_eq!(mk(0xC8, None).dvd_pid(), None);
+    assert_eq!(mk(0xD8, None).dvd_pid(), None); // past DVD's 8 audio streams
+    // Unmappable: private stream 2, bogus sub-id.
+    assert_eq!(mk(0xBF, None).dvd_pid(), None);
+    assert_eq!(mk(0xBD, Some(0x10)).dvd_pid(), None);
+}
+
+#[test]
+fn mixed_codec_audio_does_not_collide() {
+    // Core regression: a title mixing AC-3 (0x80), DTS (0x88) and LPCM (0xA0) audio.
+    // The old per-codec relative arithmetic mapped all three to 0xBD00; they must now
+    // get distinct PIDs matching what dvd.rs assigns from the same dvd_audio_pid().
+    let ac3 = mk(0xBD, Some(0x80)).dvd_pid().unwrap();
+    let dts = mk(0xBD, Some(0x88)).dvd_pid().unwrap();
+    let lpcm = mk(0xBD, Some(0xA0)).dvd_pid().unwrap();
+    assert_ne!(ac3, dts, "AC-3 and DTS must not collide");
+    assert_ne!(ac3, lpcm, "AC-3 and LPCM must not collide");
+    assert_ne!(dts, lpcm, "DTS and LPCM must not collide");
+
+    // Scanner side uses the same table; build a pid_to_track for a
+    // mixed-codec title [video, AC-3, DTS, LPCM, sub] and route every
+    // PS packet to its own distinct track.
+    let pid_to_track: Vec<(u16, usize)> = vec![
+        (DVD_VIDEO_PID, 0),
+        (dvd_audio_pid(0x80).unwrap(), 1),
+        (dvd_audio_pid(0x88).unwrap(), 2),
+        (dvd_audio_pid(0xA0).unwrap(), 3),
+        (dvd_subtitle_pid(0x20).unwrap(), 4),
+    ];
+    let route = |p: PsPacket| -> Option<usize> {
+        let pid = p.dvd_pid()?;
+        pid_to_track
+            .iter()
+            .find(|(x, _)| *x == pid)
+            .map(|(_, t)| *t)
+    };
+    assert_eq!(route(mk(0xE0, None)), Some(0));
+    assert_eq!(route(mk(0xBD, Some(0x80))), Some(1)); // AC-3 → its own track
+    assert_eq!(route(mk(0xBD, Some(0x88))), Some(2)); // DTS  → its own track
+    assert_eq!(route(mk(0xBD, Some(0xA0))), Some(3)); // LPCM → its own track
+    assert_eq!(route(mk(0xBD, Some(0x20))), Some(4)); // sub  → its own track
+}
+
+#[test]
+fn subtitle_does_not_collide_with_audio_track() {
+    // Subtitle sub-id 0x20 routes to its own subtitle PID (0x20),
+    // distinct from any audio PID (0xBD80+).
+    let audio0 = mk(0xBD, Some(0x80)).dvd_pid().unwrap(); // 0xBD80
+    let sub0 = mk(0xBD, Some(0x20)).dvd_pid().unwrap(); // 0x20
+    assert_ne!(
+        audio0, sub0,
+        "subtitle sub-id 0x20 must NOT map to the audio PID"
+    );
+
+    let pid_to_track: Vec<(u16, usize)> = vec![
+        (DVD_VIDEO_PID, 0),
+        (dvd_audio_pid(0x80).unwrap(), 1),
+        (dvd_audio_pid(0x81).unwrap(), 2),
+        (dvd_subtitle_pid(0x20).unwrap(), 3),
+        (dvd_subtitle_pid(0x21).unwrap(), 4),
+    ];
+    let route = |p: PsPacket| -> Option<usize> {
+        let pid = p.dvd_pid()?;
+        pid_to_track
+            .iter()
+            .find(|(x, _)| *x == pid)
+            .map(|(_, t)| *t)
+    };
+    assert_eq!(route(mk(0xE0, None)), Some(0));
+    assert_eq!(route(mk(0xBD, Some(0x80))), Some(1));
+    assert_eq!(route(mk(0xBD, Some(0x81))), Some(2));
+    assert_eq!(route(mk(0xBD, Some(0x20))), Some(3)); // sub0 → track 3, NOT 1
+    assert_eq!(route(mk(0xBD, Some(0x21))), Some(4)); // sub1 → track 4, NOT 2
+}
+
+// --- Helper: encode PTS for tests ---
+
+fn encode_pts(pts: u64, marker_prefix: u8) -> [u8; 5] {
+    let mut buf = [0u8; 5];
+    buf[0] = marker_prefix | (((pts >> 30) as u8) & 0x07) << 1 | 1;
+    buf[1] = ((pts >> 22) & 0xFF) as u8;
+    buf[2] = (((pts >> 15) & 0x7F) as u8) << 1 | 1;
+    buf[3] = ((pts >> 7) & 0xFF) as u8;
+    buf[4] = (((pts) & 0x7F) as u8) << 1 | 1;
+    buf
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Added hardening tests
+// ════════════════════════════════════════════════════════════════════
+
+/// Program-end start code (00 00 01 B9) — used as a delimiter so a
+/// bounded or unbounded PES preceding it is fully framed.
+const PROGRAM_END: [u8; 4] = [0x00, 0x00, 0x01, 0xB9];
+
+// ── parse_pts: full 33-bit field round trip (ISO 13818-1 Table 2-17) ──
+
+#[test]
+fn parse_pts_max_33bit() {
+    // The PTS field is exactly 33 bits; 2^33-1 must round-trip — a
+    // truncated shift/mask would lose the top bits.
+    let max = (1u64 << 33) - 1;
+    assert_eq!(parse_pts(&encode_pts(max, 0x20)), Some(max));
+}
+
+#[test]
+fn parse_pts_rejects_bad_marker_bits() {
+    // A timestamp with any marker bit (bit 0 of bytes 0/2/4) cleared is
+    // malformed and must be rejected, matching ts.rs::parse_timestamp.
+    let mut buf = encode_pts(90000, 0x20);
+    assert!(parse_pts(&buf).is_some());
+    buf[0] &= !0x01;
+    assert_eq!(parse_pts(&buf), None);
+    let mut buf = encode_pts(90000, 0x20);
+    buf[2] &= !0x01;
+    assert_eq!(parse_pts(&buf), None);
+    let mut buf = encode_pts(90000, 0x20);
+    buf[4] &= !0x01;
+    assert_eq!(parse_pts(&buf), None);
+}
+
+// ── pack header (0xBA) framing ────────────────────────────────────────
+
+#[test]
+fn pack_header_waits_for_full_14_bytes() {
+    // A pack header needs 14 bytes (MPEG-2). A buffer with only the
+    // start code + a few bytes must NOT advance past it — the demuxer
+    // waits for more data rather than misframing.
+    let mut demuxer = PsDemuxer::new();
+    // 00 00 01 BA then only 6 of the 10 remaining pack bytes.
+    let partial = vec![0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01];
+    let p = demuxer.feed(&partial);
+    assert!(p.is_empty());
+    // Now supply the rest of the pack (stuffing=0) plus a PES + delimiter.
+    let mut rest = vec![0x01, 0x89, 0xC3, 0xF8]; // mux_rate(3) + stuffing byte
+    rest.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0xAB, 0xCD,
+    ]);
+    rest.extend_from_slice(&PROGRAM_END);
+    let p2 = demuxer.feed(&rest);
+    assert_eq!(p2.len(), 1, "PES after a now-complete pack header parses");
+    assert_eq!(p2[0].data, vec![0xAB, 0xCD]);
+}
+
+#[test]
+fn pack_header_stuffing_length_consumed() {
+    // pack_stuffing_length = low 3 bits of byte 13 (ISO 13818-1 §2.5.3.4); skip
+    // exactly 14 + stuffing bytes. The stuffing holds a DECOY PES start code
+    // (00 00 01 E0…): under-consuming it re-syncs onto the decoy and emits a bogus PES.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
+        0xFD, // stuffing_length = 5 (low 3 bits of 0xFD = 0b101)
+        // 5 stuffing bytes containing a decoy PES start code.
+        0x00, 0x00, 0x01, 0xE0, 0xDE,
+    ];
+    // Real PES carries 0x11 0x22; the decoy (if mis-parsed) would carry
+    // garbage with a different/short payload.
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x11, 0x22,
+    ]);
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1, "exactly the real PES; the decoy was skipped");
+    assert_eq!(p[0].data, vec![0x11, 0x22]);
+}
+
+// ── system header (0xBB) framing ──────────────────────────────────────
+
+#[test]
+fn system_header_length_skipped() {
+    // System header: 00 00 01 BB [header_length:2] body. The demuxer
+    // must skip 6 + header_length bytes (ISO 13818-1 §2.5.3.5), even
+    // though the body contains bytes that look like PES IDs.
+    let mut demuxer = PsDemuxer::new();
+    let body = [0x00, 0x00, 0x01, 0xE0, 0xFF, 0xFF]; // decoy PES-looking bytes
+    let mut data = vec![0x00, 0x00, 0x01, 0xBB];
+    data.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    data.extend_from_slice(&body);
+    // Real PES after the system header.
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x33, 0x44,
+    ]);
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(
+        p.len(),
+        1,
+        "decoy bytes inside system header not parsed as PES"
+    );
+    assert_eq!(p[0].stream_id, 0xC0);
+    assert_eq!(p[0].data, vec![0x33, 0x44]);
+}
+
+#[test]
+fn system_header_waits_for_full_body() {
+    // System header declaring a body longer than buffered must not
+    // advance — wait for more data.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xBB, 0x00, 0x20]; // len=32
+    data.extend_from_slice(&[0xAA; 4]); // only 4 of 32 body bytes
+    assert!(demuxer.feed(&data).is_empty());
+}
+
+// ── PES length / boundary handling ────────────────────────────────────
+
+#[test]
+fn bounded_pes_waits_for_full_declared_length() {
+    // A PES with a non-zero PES_packet_length must not be emitted until
+    // all 6 + length bytes are buffered — never emit a short frame.
+    let mut demuxer = PsDemuxer::new();
+    // length = 5 → total 11 bytes, supply only 9.
+    let head = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00];
+    assert!(demuxer.feed(&head).is_empty());
+    // supply the remaining 2 payload bytes.
+    let p = demuxer.feed(&[0xEE, 0xFF]);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].data, vec![0xEE, 0xFF]);
+}
+
+#[test]
+fn padding_stream_0xbe_is_dropped() {
+    // Padding stream (0xBE) carries no ES (ISO 13818-1 Table 2-22) and
+    // must produce no PsPacket — only the real PES survives.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xBE, 0x00, 0x04, 0xFF, 0xFF, 0xFF, 0xFF];
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x01, 0x02,
+    ]);
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1, "padding stream dropped; only real PES emitted");
+    assert_eq!(p[0].stream_id, 0xE0);
+}
+
+#[test]
+fn private_stream_2_0xbf_has_no_pes_extension() {
+    // private_stream_2 (0xBF) carries no standard PES header extension
+    // (ISO 13818-1 Table 2-22): the bytes after the 6-byte prefix are
+    // raw payload, NOT flags/header_data_length. No PTS, no sub-stream.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xBF, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].stream_id, 0xBF);
+    assert_eq!(p[0].pts, None, "0xBF carries no PTS");
+    assert_eq!(p[0].sub_stream_id, None);
+    assert_eq!(p[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+// `is_nav()` separates the one expected-unmappable DVD stream (private_stream_2 nav packs)
+// from any other `dvd_pid() == None`, which is an unexpected lost stream.
+#[test]
+fn only_private_stream_2_is_navigation_and_never_a_routable_stream() {
+    // Demux a program stream carrying, in order: a navigation pack, MPEG-2
+    // video, an AC-3 audio substream, and an MPEG audio stream (a track, NOT
+    // navigation).
+    let mut demuxer = PsDemuxer::new();
+    let mut data = Vec::new();
+    // private_stream_2: no PES extension, payload follows the 6-byte prefix.
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xBF, 0x00, 0x02, 0x00, 0x01]);
+    // video 0xE0
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x11, 0x22,
+    ]);
+    // private_stream_1 with AC-3 sub-stream 0x80 (4 bytes of substream header
+    // follow the sub-id on DVD).
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xBD, 0x00, 0x0A, 0x80, 0x00, 0x00, 0x80, 0x01, 0x00, 0x03, 0x00, 0xAA,
+        0xBB,
+    ]);
+    // MPEG audio 0xC0
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x33, 0x44,
+    ]);
+    data.extend_from_slice(&PROGRAM_END);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(packets.len(), 4, "four PES packets demuxed");
+
+    let nav: Vec<u8> = packets
+        .iter()
+        .filter(|p| p.is_nav())
+        .map(|p| p.stream_id)
+        .collect();
+    assert_eq!(
+        nav,
+        vec![0xBF],
+        "exactly the private_stream_2 pack is navigation"
+    );
+
+    for p in &packets {
+        if p.is_nav() {
+            assert_eq!(
+                p.dvd_pid(),
+                None,
+                "a navigation pack must not also route to a track"
+            );
+        }
+    }
+    // The MPEG-audio packet is a real track: it routes, and is never navigation.
+    let mpa = packets.iter().find(|p| p.stream_id == 0xC0).unwrap();
+    assert_eq!(mpa.dvd_pid(), Some(0xC0), "MPEG audio routes by its PES id");
+    assert!(!mpa.is_nav());
+}
+
+#[test]
+fn unknown_start_code_is_skipped_not_parsed() {
+    // A start code with an ID outside the known PS-layer set
+    // (e.g. 0xB0, reserved) must be skipped 4 bytes and not derail
+    // the following real PES.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xB0]; // unknown/reserved code
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x9A, 0xBC,
+    ]);
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].data, vec![0x9A, 0xBC]);
+}
+
+// ── private_stream_1 sub-header skip lengths ──────────────────────────
+
+#[test]
+fn private_stream_1_unknown_subid_skips_one_byte() {
+    // For a private_stream_1 sub-id outside the AC3/DTS/LPCM ranges the
+    // skip is 1 (just the sub-id byte). All remaining bytes are ES.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBD, 0x00, 0x06, 0x80, 0x00, 0x00, //
+        0x70, // sub-id outside known ranges → skip 1
+        0x55, 0x66,
+    ];
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].sub_stream_id, Some(0x70));
+    assert_eq!(p[0].data, vec![0x55, 0x66], "only sub-id byte skipped");
+}
+
+#[test]
+fn private_stream_1_short_payload_does_not_underflow_skip() {
+    // If the sub-header skip exceeds the payload length, `skip.min(len)`
+    // clamps so ES is empty rather than panicking on an out-of-range
+    // slice. AC3 skip is 4 but only 2 payload bytes present.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBD, 0x00, 0x04, 0x80, 0x00, 0x00, //
+        0x80, // AC3 sub-id, skip=4
+        0x01, // only 1 byte after sub-id (total payload 2 < skip 4)
+    ];
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].sub_stream_id, Some(0x80));
+    assert!(
+        p[0].data.is_empty(),
+        "clamped skip yields empty ES, no panic"
+    );
+}
+
+// ── dvd_audio_pid / dvd_subtitle_pid range boundaries ─────────────────
+
+#[test]
+fn dvd_audio_pid_range_boundaries() {
+    // AC3/DTS audio sub-ids 0x80..=0x8F and LPCM 0xA0..=0xA7 map to
+    // 0xBD00|sub. Just-outside values must return None.
+    assert_eq!(dvd_audio_pid(0x80), Some(0xBD80));
+    assert_eq!(dvd_audio_pid(0x8F), Some(0xBD8F));
+    assert_eq!(dvd_audio_pid(0xA0), Some(0xBDA0));
+    assert_eq!(dvd_audio_pid(0xA7), Some(0xBDA7));
+    // Boundaries just outside the ranges.
+    assert_eq!(dvd_audio_pid(0x7F), None);
+    assert_eq!(dvd_audio_pid(0x90), None);
+    assert_eq!(dvd_audio_pid(0x9F), None);
+    assert_eq!(dvd_audio_pid(0xA8), None);
+}
+
+#[test]
+fn hddvd_ddplus_substream_maps_to_bd_pid() {
+    // HD-DVD Dolby Digital Plus sub-ids 0xC0..=0xC7 map to 0xBD00|sub,
+    // distinct per track and disjoint from the DVD audio space. A DVD never
+    // emits these, so the range is purely additive.
+    assert_eq!(dvd_audio_pid(0xC0), Some(0xBDC0));
+    assert_eq!(dvd_audio_pid(0xC3), Some(0xBDC3));
+    assert_eq!(dvd_audio_pid(0xC7), Some(0xBDC7));
+    // Just outside the range.
+    assert_eq!(dvd_audio_pid(0xBF), None);
+    // G17: the whole E-AC-3 sub-id range 0xC0..=0xCF (mpg:// allocates 0xC8..).
+    assert_eq!(dvd_audio_pid(0xC8), Some(0xBDC8));
+    assert_eq!(dvd_audio_pid(0xCF), Some(0xBDCF));
+    assert_eq!(dvd_audio_pid(0xD0), None);
+    assert_eq!(mk(0xBD, Some(0xCA)).dvd_pid(), Some(0xBDCA));
+    // …and its 4-byte sub-header is stripped like 0xC0's.
+    let pes = [
+        0, 0, 1, 0xBD, 0, 14, 0x81, 0x80, 5, 0x21, 0, 1, 0, 1, 0xCA, 1, 0, 1, 0x0B, 0x77,
+    ];
+    let mut d = PsDemuxer::new();
+    let mut ps = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
+    ps.extend_from_slice(&pes);
+    let got: Vec<_> = d.feed(&ps).into_iter().chain(d.flush()).collect();
+    assert_eq!(got[0].data, vec![0x0B, 0x77], "sub-header stripped");
+    // Four DD+ tracks (as seen on a real disc) get four distinct PIDs.
+    let pids: Vec<u16> = (0xC0u8..=0xC3).map(|s| dvd_audio_pid(s).unwrap()).collect();
+    assert_eq!(pids, vec![0xBDC0, 0xBDC1, 0xBDC2, 0xBDC3]);
+    // And route through dvd_pid on a private_stream_1 packet.
+    assert_eq!(mk(0xBD, Some(0xC0)).dvd_pid(), Some(0xBDC0));
+    assert_eq!(mk(0xBD, Some(0xC3)).dvd_pid(), Some(0xBDC3));
+}
+
+#[test]
+fn hddvd_ddplus_pes_strips_4byte_subheader_to_syncword() {
+    // A private_stream_1 PES carrying DD+ (sub-id 0xC0) has a 4-byte sub-header
+    // (sub_id + num_frames(1) + access_unit_ptr(2)); the demuxer must strip exactly
+    // those 4 so es_data begins at the E-AC-3 payload (0x0B77 syncword right after).
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xBD, // private stream 1
+        0x00, 0x0B, // PES_packet_length = 11 (flags2 + hdl1 + 8 payload)
+        0x80, 0x00, 0x00, // no PTS, header_data_len = 0
+        0xC0, // sub-stream id: DD+ track 0
+        0x01, 0x00, 0x00, // num_frames(1) + access_unit_ptr(2)
+        0x0B, 0x77, 0xDE, 0xAD, // E-AC-3 syncword + payload
+    ];
+    data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].sub_stream_id, Some(0xC0));
+    assert_eq!(
+        p[0].data,
+        vec![0x0B, 0x77, 0xDE, 0xAD],
+        "4-byte DD+ sub-header stripped; es_data starts at the syncword"
+    );
+}
+
+#[test]
+fn dvd_subtitle_pid_range_boundaries() {
+    // VobSub subtitle sub-ids 0x20..=0x3F map to the identity PID.
+    assert_eq!(dvd_subtitle_pid(0x20), Some(0x20));
+    assert_eq!(dvd_subtitle_pid(0x3F), Some(0x3F));
+    assert_eq!(dvd_subtitle_pid(0x1F), None);
+    assert_eq!(dvd_subtitle_pid(0x40), None);
+}
+
+#[test]
+fn dvd_pid_all_video_stream_ids_map_to_video() {
+    // ISO 13818-1: 0xE0..=0xEF are all video streams. DVD collapses
+    // them onto the single canonical video PID.
+    for sid in 0xE0u8..=0xEF {
+        assert_eq!(
+            mk(sid, None).dvd_pid(),
+            Some(DVD_VIDEO_PID),
+            "stream_id {sid:#04x} must map to video"
+        );
+    }
+}
+
+// ── flushing semantics ────────────────────────────────────────────────
+
+#[test]
+fn flush_discards_incomplete_bounded_pes() {
+    // A bounded PES short of its declared length is genuinely incomplete
+    // and must be DROPPED at flush — not emitted with a truncated payload.
+    let mut demuxer = PsDemuxer::new();
+    // length=10 but only 2 payload bytes supplied.
+    let head = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x0A, 0x80, 0x00, 0x00, 0xAA, 0xBB,
+    ];
+    assert!(demuxer.feed(&head).is_empty());
+    let flushed = demuxer.flush();
+    assert!(
+        flushed.is_empty(),
+        "incomplete bounded PES must not be emitted on flush"
+    );
+}
+
+#[test]
+fn pes_header_data_length_skips_pts_when_flag_unset() {
+    // If pts_dts_flags == 0 the 5 "PTS" bytes after the fixed header are
+    // ES, not a timestamp. A PES with header_data_length=0 and no PTS
+    // flag must surface no PTS and keep all payload bytes.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x06, 0x80, 0x00, 0x00, 0x21, 0x00, 0x01,
+    ];
+    // 0x21 0x00 0x01 look like the start of a PTS field but must NOT be
+    // parsed as one (flags2 = 0x00 ⇒ no PTS).
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].pts, None);
+    assert_eq!(p[0].data, vec![0x21, 0x00, 0x01]);
+}
+
+#[test]
+fn unbounded_video_pes_framed_by_next_pes_not_embedded_audio_code() {
+    // An unbounded (length 0) video PES must be delimited by the next PS-layer unit.
+    // A following AUDIO PES (0xC0) is a valid boundary, so the video ES keeps its
+    // embedded 00 00 01 00 picture code but stops at the audio PES start.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+    let video_payload = [0x11, 0x00, 0x00, 0x01, 0x00, 0x22]; // embedded picture SC
+    data.extend_from_slice(&video_payload);
+    // Next PS-layer unit: an audio PES (bounded).
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x99, 0x88,
+    ]);
+    data.extend_from_slice(&PROGRAM_END);
+    let p = demuxer.feed(&data);
+    assert_eq!(p.len(), 2, "video PES + audio PES");
+    assert_eq!(p[0].stream_id, 0xE0);
+    assert_eq!(
+        p[0].data, video_payload,
+        "video ES keeps its embedded start code, stops at the audio PES"
+    );
+    assert_eq!(p[1].stream_id, 0xC0);
+    assert_eq!(p[1].data, vec![0x99, 0x88]);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Mutation-gap hardening (mux-ts pass)
+// ════════════════════════════════════════════════════════════════════
+
+/// Pins `MAX_PS_BUFFER` against a literal computed independently, so a mutated expression
+/// in its definition can't hide behind self-referential assertions.
+#[test]
+fn max_ps_buffer_has_the_documented_value() {
+    assert_eq!(MAX_PS_BUFFER, 4 * 1024 * 1024);
+}
+
+// Pack-header framing must accept an EXACT fit, not wait for data that will never come;
+// preceded by an unrelated start code so `sc != 0`.
+#[test]
+fn pack_header_exact_fit_is_consumed_not_awaited() {
+    // Case 1: mandatory 14 bytes, no stuffing, nothing else buffered.
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xB0]; // unknown SC -> sc == 4 below
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
+        0xF8, // stuffing_length = 0
+    ]);
+    assert!(demuxer.feed(&data).is_empty(), "a pack yields no PES");
+    assert!(
+        demuxer.buffer.is_empty(),
+        "an exact-fit pack (no stuffing) must be fully consumed, not held \
+             waiting for bytes that will never arrive"
+    );
+
+    // Case 2: with 3 stuffing bytes — exercises `pack_len = 14 + stuffing`
+    // at a non-zero `sc`, where a `+` -> `*` mutation diverges sharply
+    // from the correct sum.
+    let mut demuxer2 = PsDemuxer::new();
+    let mut data2 = vec![0x00, 0x00, 0x01, 0xB0];
+    data2.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
+        0xFB, // stuffing_length = 3
+        0xFF, 0xFF, 0xFF,
+    ]);
+    assert!(demuxer2.feed(&data2).is_empty());
+    assert!(
+        demuxer2.buffer.is_empty(),
+        "an exact-fit pack WITH stuffing must be fully consumed"
+    );
+}
+
+// System-header framing needs exactly `6 + header_length` bytes; at `header_length == 0`
+// both boundary checks coincide at `len == 6`.
+#[test]
+fn system_header_zero_length_exact_fit_is_consumed_not_awaited() {
+    let mut demuxer = PsDemuxer::new();
+    let data = vec![0x00, 0x00, 0x01, 0xBB, 0x00, 0x00]; // header_length = 0
+    assert!(demuxer.feed(&data).is_empty());
+    assert!(
+        demuxer.buffer.is_empty(),
+        "a zero-length system header, fully present, must not be held awaiting more data"
+    );
+}
+
+// `header_len` is 16-bit big-endian; a `<<`->`>>` mutation would misread 300 (0x012C) as
+// just 44. A decoy start code at the offset that misread length would resume at must stay
+// buried.
+#[test]
+fn system_header_length_high_byte_is_not_dropped() {
+    let mut demuxer = PsDemuxer::new();
+    let mut data = vec![0x00, 0x00, 0x01, 0xBB, 0x01, 0x2C]; // header_length = 300
+    let mut body = vec![0xCCu8; 300];
+    // Decoy PES start code at body offset 44 -> absolute offset 50,
+    // exactly where a misread length of 44 (0x2C) would resume scanning
+    // (6 + 44 == 50).
+    let decoy = [
+        0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x99, 0x99,
+    ];
+    body[44..44 + decoy.len()].copy_from_slice(&decoy);
+    data.extend_from_slice(&body);
+    // The real PES follows the full (306-byte) system header.
+    data.extend_from_slice(&[
+        0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x77, 0x88,
+    ]);
+    data.extend_from_slice(&PROGRAM_END);
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(
+        packets.len(),
+        1,
+        "the decoy start code embedded in the system header body must stay \
+             buried in the skipped body, not surface as a second PES"
+    );
+    assert_eq!(packets[0].data, vec![0x77, 0x88]);
+}
+
+// `sc + 3 >= data.len()` must stay an ADDITION: `+`->`-` at `sc == 0` underflows and panics
+// on a bare trailing start code.
+#[test]
+fn find_ps_boundary_handles_a_bare_start_code_at_the_buffer_head() {
+    assert_eq!(
+        find_ps_boundary(&[0x00, 0x00, 0x01], 0),
+        (None, 0),
+        "an undecided trailing start code is not proved boundary-free"
+    );
+}
+
+// An unbounded PES's boundary search must not restart at the PES header on every feed
+// (quadratic work). `boundary_bytes_scanned` measures the work bound directly.
+#[test]
+fn an_unterminated_pes_is_not_rescanned_from_its_header_every_feed() {
+    const CHUNKS: usize = 256;
+    const CHUNK: usize = 4096;
+
+    let mut demuxer = PsDemuxer::new();
+    // Unbounded PES header (length 0), then payload that carries no start
+    // code at all, so no PS-layer boundary is ever found.
+    demuxer.feed(&[0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00]);
+    for _ in 0..CHUNKS {
+        assert!(
+            demuxer.feed(&[0xFFu8; CHUNK]).is_empty(),
+            "no boundary yet, so no PES can be emitted"
+        );
+    }
+
+    let fed = (CHUNKS * CHUNK) as u64;
+    assert!(
+        demuxer.boundary_bytes_scanned <= 2 * fed,
+        "boundary search examined {} bytes over {fed} bytes of payload — \
+             the scan must advance with the buffer, not restart at the PES header",
+        demuxer.boundary_bytes_scanned
+    );
+
+    // ...and the cursor must not have cost correctness: the PES still ends
+    // at the pack header that finally arrives, with its whole payload.
+    let pack = [
+        0x00,
+        0x00,
+        0x01,
+        PACK_HEADER_ID,
+        0x44,
+        0x00,
+        0x04,
+        0x00,
+        0x04,
+        0x01,
+        0x00,
+        0x00,
+        0x03,
+        0xF8,
+    ];
+    let packets = demuxer.feed(&pack);
+    assert_eq!(packets.len(), 1, "the pack header terminates the PES");
+    assert_eq!(
+        packets[0].data.len(),
+        CHUNKS * CHUNK,
+        "the whole accumulated payload belongs to the PES"
+    );
+}
+
+// The resume cursor is a buffer offset and must be rebased on drain — the only test where a
+// drain happens while the cursor is live, so both halves of the rebase arithmetic get
+// exercised.
+#[test]
+fn a_resume_cursor_survives_the_drain_of_units_ahead_of_the_unbounded_pes() {
+    // Payload fed in the SAME chunk that opens the PES. Large enough that
+    // re-scanning it is unmistakable in `boundary_bytes_scanned`, and it is
+    // the exact span the un-rebased `pes_at` mutant re-examines.
+    const PAYLOAD: usize = 64 * 1024;
+
+    // A 14-byte MPEG-2 pack header with pack_stuffing_length 0.
+    const PACK: [u8; 14] = [
+        0x00,
+        0x00,
+        0x01,
+        PACK_HEADER_ID,
+        0x44,
+        0x00,
+        0x04,
+        0x00,
+        0x04,
+        0x01,
+        0x00,
+        0x00,
+        0x03,
+        0xF8,
+    ];
+    // A length-BOUNDED PES — a complete unit, so the loop consumes it and
+    // `pos` advances past it before breaking on the unbounded PES.
+    const BOUNDED_PES: [u8; 11] = [
+        0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0xAA, 0xBB,
+    ];
+    // The unbounded (length-0) video PES whose scan must be resumed.
+    const OPEN_PES: [u8; 9] = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+    // Bytes drained ahead of the unbounded PES on the first feed — the
+    // `pos` the cursor must be rebased by.
+    const DRAINED: usize = PACK.len() + BOUNDED_PES.len();
+
+    let mut demuxer = PsDemuxer::new();
+    let mut first = PACK.to_vec();
+    first.extend_from_slice(&BOUNDED_PES);
+    first.extend_from_slice(&OPEN_PES);
+    first.extend_from_slice(&[0xFFu8; PAYLOAD]);
+    let head = demuxer.feed(&first);
+    assert_eq!(
+        head.len(),
+        1,
+        "the bounded PES ahead of the open one is emitted immediately, \
+             which is what makes the buffer drain with a cursor live"
+    );
+
+    // The terminating pack arrives at the head of the next feed — i.e.
+    // within `DRAINED` bytes of where the previous scan stopped, which is
+    // precisely the window an un-rebased `searched_to` skips over.
+    assert!(
+        PACK.len() <= DRAINED,
+        "the terminating pack must fit inside the window a stale \
+             `searched_to` would skip, or the mutant survives"
+    );
+    let packets = demuxer.feed(&PACK);
+    assert_eq!(
+        packets.len(),
+        1,
+        "the pack header terminates the open PES; a scan resumed past it \
+             never sees it and the PES runs on"
+    );
+    assert_eq!(
+        packets[0].data.len(),
+        PAYLOAD,
+        "exactly the payload fed belongs to the PES"
+    );
+
+    // Work bound: the payload is proved boundary-free ONCE. Re-scanning it
+    // after the drain roughly doubles this.
+    assert!(
+        demuxer.boundary_bytes_scanned <= (PAYLOAD + 1024) as u64,
+        "boundary search examined {} bytes over {PAYLOAD} bytes of payload — \
+             a cursor left un-rebased across the drain never matches the PES's \
+             new offset, so the scan restarts at the header",
+        demuxer.boundary_bytes_scanned
+    );
+}
+
+/// The boundary-ID check is a 4-way `||`; a mutant that turns the FIRST
+/// `||` into `&&` makes a lone pack-header start code (which can never
+/// also equal `SYSTEM_HEADER_ID`) fail to register as a boundary at all.
+#[test]
+fn find_ps_boundary_recognises_a_lone_pack_header() {
+    let data = [0x00, 0x00, 0x01, PACK_HEADER_ID, 0xAA];
+    assert_eq!(
+        find_ps_boundary(&data, 0),
+        (Some(0), 0),
+        "a pack header start code alone must register as a PS-layer boundary"
+    );
+}
+
+// Arms EVERY optional PES-header/PES_extension field at once with a known byte count, so a
+// single mutated `pos +=` skip anywhere in the walk to `stream_id_extension` lands on the
+// wrong byte.
+#[test]
+fn parse_stream_id_extension_walks_every_optional_field_to_the_right_offset() {
+    // flags2: PTS/DTS absent (00), ESCR/ES_rate/DSM_trick_mode/
+    // additional_copy_info/PES_CRC all present, PES_extension present.
+    let flags2 = 0x20 | 0x10 | 0x08 | 0x04 | 0x02 | 0x01; // 0x3F
+    let mut opt = Vec::new();
+    opt.extend_from_slice(&[0u8; 6]); // ESCR
+    opt.extend_from_slice(&[0u8; 3]); // ES_rate
+    opt.push(0); // DSM_trick_mode
+    opt.push(0); // additional_copy_info
+    opt.extend_from_slice(&[0u8; 2]); // PES_CRC
+    // PES_extension: every optional sub-field present + extension_flag_2.
+    let ext_flags = 0x80 | 0x40 | 0x20 | 0x10 | 0x01;
+    opt.push(ext_flags);
+    opt.extend_from_slice(&[0u8; 16]); // PES_private_data
+    opt.push(2); // pack_header_field length
+    opt.extend_from_slice(&[0u8; 2]); // pack_header_field data
+    opt.extend_from_slice(&[0u8; 2]); // program_packet_sequence_counter
+    opt.extend_from_slice(&[0u8; 2]); // P-STD_buffer
+    opt.push(0x81); // PES_extension_field_length (marker + 7 bits, value unused)
+    opt.push(0x55); // stream_id_extension (top bit clear)
+
+    let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+    let es = [0xDEu8, 0xAD];
+    let len = (3 + opt.len() + es.len()) as u16;
+    pkt.extend_from_slice(&len.to_be_bytes());
+    pkt.extend_from_slice(&[0x80, flags2, opt.len() as u8]);
+    pkt.extend_from_slice(&opt);
+    pkt.extend_from_slice(&es);
+
+    let parsed = parse_pes_packet(&pkt).expect("parses");
+    assert_eq!(
+        parsed.sub_stream_id,
+        Some(0x55),
+        "stream_id_extension reached correctly after walking every optional field"
+    );
+    assert_eq!(parsed.data, es);
+}
+
+// A length-bounded PES must be emitted the moment its declared length is EXACTLY satisfied,
+// not held back — a `>=` vs `>` boundary-check bug would misclassify an exact fit as "not
+// enough data".
+#[test]
+fn length_bounded_pes_exact_fit_is_emitted_not_awaited() {
+    let mut demuxer = PsDemuxer::new();
+    let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+    let mut data = vec![0x00, 0x00, 0x01, 0xC0]; // audio stream id
+    let pes_packet_len = (3 + payload.len()) as u16; // flags+header_len byte + payload
+    data.extend_from_slice(&pes_packet_len.to_be_bytes());
+    data.extend_from_slice(&[0x80, 0x00, 0x00]); // no PTS/DTS, header_data_len = 0
+    data.extend_from_slice(&payload);
+    assert_eq!(data.len(), 6 + pes_packet_len as usize, "sanity: exact fit");
+
+    let packets = demuxer.feed(&data);
+    assert_eq!(
+        packets.len(),
+        1,
+        "an exact-fit length-bounded PES must be emitted immediately, \
+             not held awaiting a byte that will never come"
+    );
+    assert_eq!(packets[0].data, payload);
+    assert!(
+        demuxer.buffer.is_empty(),
+        "the exact-fit PES must be fully consumed, leaving nothing buffered"
+    );
+}
+
+// ── MPEG-1 system streams (ISO/IEC 11172-1; mpg-output-design v5 §4 step 1, J6) ──
+
+// An 11172-1 pack header: '0010', SCR (3+15+15 bits with markers), mux_rate.
+fn mpeg1_pack(scr: u64) -> Vec<u8> {
+    let mut p = vec![0, 0, 1, 0xBA];
+    p.push(0x21 | (((scr >> 30) & 7) << 1) as u8);
+    p.push((scr >> 22) as u8);
+    p.push(0x01 | (((scr >> 15) & 0x7F) << 1) as u8);
+    p.push((scr >> 7) as u8);
+    p.push(0x01 | ((scr & 0x7F) << 1) as u8);
+    p.extend_from_slice(&[0x80, 0x1B, 0x83]);
+    p
+}
+
+// An 11172-1 packet: stuffing, the STD buffer field, then one timestamp form.
+fn mpeg1_packet(id: u8, ts: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut body = vec![0xFF, 0xFF, 0x40 | 0x20, 0x2E];
+    body.extend_from_slice(ts);
+    body.extend_from_slice(payload);
+    let mut p = vec![0, 0, 1, id];
+    p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    p.extend(body);
+    p
+}
+
+fn ts5(prefix: u8, t: u64) -> [u8; 5] {
+    [
+        (prefix << 4) | 1 | (((t >> 29) & 0x0E) as u8),
+        (t >> 22) as u8,
+        1 | (((t >> 14) & 0xFE) as u8),
+        (t >> 7) as u8,
+        1 | (((t << 1) & 0xFE) as u8),
+    ]
+}
+
+// Design §4 step 1: "'0010' → ISO/IEC 11172-1 §2.4.3.2 pack header … 12 bytes, no stuffing
+// field"; the PES form "'0010' + PTS", "'0011' + PTS + '0001' + DTS", "'0000 1111'".
+#[test]
+fn mpeg1_packs_and_packets_parse() {
+    let mut s = mpeg1_pack(90_000);
+    s.extend(mpeg1_packet(0xC0, &ts5(0b0010, 3_600), &[0xFF, 0xFD, 1, 2]));
+    s.extend(mpeg1_packet(
+        0xE0,
+        &[&ts5(0b0011, 7_200)[..], &ts5(0b0001, 3_600)[..]].concat(),
+        &[0, 0, 1, 0xB3, 9],
+    ));
+    s.extend(mpeg1_packet(0xC0, &[0x0F], &[7, 8]));
+    s.extend_from_slice(&[0, 0, 1, 0xB9]);
+    let mut d = PsDemuxer::new();
+    let got: Vec<PsPacket> = d.feed(&s).into_iter().chain(d.flush()).collect();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert_eq!(
+        (got[0].stream_id, got[0].pts, got[0].data.clone()),
+        (0xC0, Some(3_600), vec![0xFF, 0xFD, 1, 2])
+    );
+    assert_eq!((got[1].pts, got[1].dts), (Some(7_200), Some(3_600)));
+    assert_eq!(got[1].data, vec![0, 0, 1, 0xB3, 9]);
+    assert_eq!((got[2].pts, got[2].data.clone()), (None, vec![7, 8]));
+}
+
+// Design §4 step 1: the layout is chosen "per pack … from the marker bits"; anything else
+// is a lost sync, resynced on the next start code.
+#[test]
+fn pack_forms_switch_per_pack_and_a_bad_marker_resyncs() {
+    let mut s = mpeg1_pack(0);
+    s.extend(mpeg1_packet(0xC0, &ts5(0b0010, 100), &[1]));
+    // A garbage "pack" whose marker bits are neither '01' nor '0010'.
+    s.extend_from_slice(&[0, 0, 1, 0xBA, 0xC0, 0, 0, 0]);
+    // An MPEG-2 pack, then an MPEG-2 PES.
+    s.extend_from_slice(&[0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8]);
+    let mut p2 = vec![0, 0, 1, 0xC0, 0, 9, 0x80, 0x80, 5];
+    p2.extend_from_slice(&ts5(0b0010, 200));
+    p2.push(2);
+    s.extend(p2);
+    let mut d = PsDemuxer::new();
+    let got: Vec<PsPacket> = d.feed(&s).into_iter().chain(d.flush()).collect();
+    let v: Vec<(Option<u64>, Vec<u8>)> = got.iter().map(|p| (p.pts, p.data.clone())).collect();
+    assert_eq!(v, vec![(Some(100), vec![1]), (Some(200), vec![2])]);
+}
+
+// Design §4 step 3: the program stream map (0xBC) is kept for the scan, and skipped by its
+// length so its bytes are never mistaken for packets.
+#[test]
+fn the_program_stream_map_is_kept_and_skipped() {
+    let mut psm = vec![0, 0, 1, 0xBC, 0, 10, 0xE0, 0xFF, 0, 0, 0, 0, 0, 0, 1, 0xC0];
+    let crc = [0u8; 0];
+    psm.extend_from_slice(&crc);
+    let mut s = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
+    s.extend_from_slice(&psm);
+    let mut d = PsDemuxer::new();
+    assert!(
+        d.feed(&s).is_empty(),
+        "the map's `00 00 01 C0` is not a packet"
+    );
+    assert_eq!(d.psm(), Some(&psm[..]));
+}

@@ -138,7 +138,7 @@ fn every_drive_cdb_goes_through_exec() {
 #[test]
 fn no_raw_execute_outside_dispatch() {
     let src = include_str!("mod.rs");
-    let body = &src[..src.find("#[cfg(test)]\nmod halt_tests").unwrap()];
+    let body = src;
     let raw = body.matches(".execute(").count();
     assert_eq!(raw, 1, "only `dispatch` calls the transport's execute");
     let id = include_str!("../identity.rs");

@@ -1,0 +1,1021 @@
+use super::*;
+use crate::error::Result;
+
+/// Synthetic SectorSource that yields a deterministic byte
+/// pattern keyed by LBA. Used to verify the decorator's
+/// pass-through behaviour for `DecryptKeys::None`.
+struct PatternedSource {
+    capacity: u32,
+}
+
+impl PatternedSource {
+    fn fill(lba: u32, count: u16, buf: &mut [u8]) {
+        let bytes = count as usize * 2048;
+        for (i, slot) in buf[..bytes].iter_mut().enumerate() {
+            let abs = lba as u64 * 2048 + i as u64;
+            *slot = ((abs.wrapping_mul(2654435761) >> 16) & 0xff) as u8;
+        }
+    }
+}
+
+impl SectorSource for PatternedSource {
+    fn capacity_sectors(&self) -> u32 {
+        self.capacity
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        Self::fill(lba, count, buf);
+        Ok(count as usize * 2048)
+    }
+}
+
+// N8: an uncrackable scrambled stream's E7023 is a verdict: a retry refuses again without
+// a second crack scan (D3).
+#[test]
+fn a_css_refusal_is_kept_for_the_retry() {
+    let mut pack: Vec<u8> = (0..2048u32)
+        .map(|i| (i as u8).wrapping_mul(7) ^ 0x3C)
+        .collect();
+    pack[0x14] = 0x10;
+    crate::css::dvd_pack_header(&mut pack, 0xE0);
+    crate::css::lfsr::scramble_sector(&[0x11, 0x22, 0x33, 0x44, 0x55], &mut pack);
+    let src = crate::test_util::MemSource::new(pack.repeat(4));
+    let opts = StageOptions {
+        raw: false,
+        keys: None,
+        ctx: Default::default(),
+    };
+    let mut stage = DecryptingSectorSource::new(src, Keying::detect(opts));
+    let scans = crate::css::CRACK_SCANS.with(|n| n.get());
+    let mut buf = vec![0u8; 2048];
+    for _ in 0..2 {
+        let e = stage.read_sectors(0, 1, &mut buf, false).unwrap_err();
+        assert_eq!(e.code(), crate::error::E_CSS_KEY_MISSING);
+    }
+    assert_eq!(crate::css::CRACK_SCANS.with(|n| n.get()), scans + 1);
+}
+
+// Stale CPI is cleared only on clear TS: ciphertext that keeps a few syncs (the `is_clean`
+// proof floor) stays flagged, while damaged packets do not hide a clear unit.
+#[test]
+fn stale_cpi_needs_half_the_packets_synced() {
+    use crate::aacs::content::ALIGNED_UNIT_LEN;
+    use crate::sector::stage::clear_ts;
+    let pkt = crate::consts::BD_SOURCE_PACKET_BYTES;
+    let mut unit: Vec<u8> = (0..ALIGNED_UNIT_LEN)
+        .map(|i| (i * 13 + 5) as u8 | 1)
+        .collect();
+    for p in unit.chunks_mut(pkt) {
+        p[0] |= 0xC0;
+        p[4] = 0x47;
+    }
+    assert!(clear_ts(&unit));
+    assert!(clear_ts(&unit[..20 * pkt]), "a clear partial tail");
+    // Review #2: ten damaged packets of 31 leave a clear unit clear.
+    for p in unit.chunks_mut(pkt).skip(1).take(10) {
+        p[4] = 0x9D;
+    }
+    assert!(clear_ts(&unit), "ten damaged packets");
+    for (i, p) in unit.chunks_mut(pkt).enumerate().skip(1) {
+        p[4] = if i < 5 { 0x47 } else { 0x9D };
+    }
+    assert!(crate::aacs::content::is_clean(
+        &unit,
+        crate::disc::ContentFormat::BdTs
+    ));
+    assert!(!clear_ts(&unit), "four synced packets are not clear TS");
+}
+
+// A DecryptingSectorSource must relay its inner source's unmapped list.
+#[test]
+fn decrypting_source_forwards_unmapped_stream_files() {
+    use crate::sector::bus_removal::test_support::{Reports, m2ts1};
+    let w = DecryptingSectorSource::new(Reports(vec![m2ts1()]), DecryptKeys::None);
+    crate::sector::bus_removal::test_support::assert_forwards(w);
+}
+
+#[test]
+fn passthrough_with_no_keys() {
+    let src = PatternedSource { capacity: 16 };
+    let mut wrapped = DecryptingSectorSource::new(src, DecryptKeys::None);
+
+    // capacity_sectors delegates.
+    assert_eq!(wrapped.capacity_sectors(), 16);
+
+    let mut got = vec![0u8; 4 * 2048];
+    let n = wrapped.read_sectors(3, 4, &mut got, false).unwrap();
+    assert_eq!(n, 4 * 2048);
+
+    let mut expected = vec![0u8; 4 * 2048];
+    PatternedSource::fill(3, 4, &mut expected);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn passthrough_set_speed_delegates() {
+    struct SpeedRecorder {
+        last: Option<u16>,
+    }
+    impl SectorSource for SpeedRecorder {
+        fn capacity_sectors(&self) -> u32 {
+            0
+        }
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            Ok(0)
+        }
+        fn set_speed(&mut self, kbs: u16) {
+            self.last = Some(kbs);
+        }
+    }
+
+    let mut wrapped = DecryptingSectorSource::new(SpeedRecorder { last: None }, DecryptKeys::None);
+    wrapped.set_speed(7200);
+    assert_eq!(wrapped.inner().last, Some(7200));
+}
+
+// Additional coverage:
+
+use std::sync::{Arc, Mutex};
+
+// Fills the full span with a CSS-scrambled-flagged sector but reports a
+// shorter read (`report_n`); with a CSS key, only `buf[..report_n]` must
+// be descrambled — bytes beyond it must stay exactly as filled.
+struct ShortReportSource {
+    report_n: usize,
+}
+impl ShortReportSource {
+    fn fill_one(buf: &mut [u8]) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29).wrapping_add(3);
+        }
+        // A real DVD-Video pack header, or `is_scrambled_pack` skips the sector.
+        buf[0x14] = 0x30; // scramble-control bits set → flags == 0x03
+        crate::css::dvd_pack_header(buf, 0xE0);
+    }
+}
+impl SectorSource for ShortReportSource {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        for s in 0..count as usize {
+            Self::fill_one(&mut buf[s * 2048..(s + 1) * 2048]);
+        }
+        Ok(self.report_n)
+    }
+}
+
+/// Records the (lba, count, recovery) the decorator forwarded.
+struct ArgRecorder {
+    calls: Arc<Mutex<Vec<(u32, u16, bool)>>>,
+}
+impl SectorSource for ArgRecorder {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> Result<usize> {
+        self.calls.lock().unwrap().push((lba, count, recovery));
+        let bytes = count as usize * 2048;
+        buf[..bytes].fill(0);
+        Ok(bytes)
+    }
+}
+
+// A source whose read errors — the decorator must propagate it and NOT
+// call decrypt afterward (over an unwritten buffer, at best wasted work,
+// at worst a panic for a missing AACS key).
+struct FailingSource;
+impl SectorSource for FailingSource {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        _count: u16,
+        _buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        Err(crate::error::Error::IoError {
+            source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+        })
+    }
+}
+
+// CSS is a no-op when the mode-2 subheader byte 0x14 scramble-control
+// bits are clear (`css::lfsr::descramble_sector` early-returns on
+// `flags == 0`), so the decorator must hand bytes back unchanged.
+#[test]
+fn css_unscrambled_sector_passes_through() {
+    struct FixedSector {
+        template: [u8; 2048],
+    }
+    impl SectorSource for FixedSector {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            let bytes = count as usize * 2048;
+            for s in 0..count as usize {
+                buf[s * 2048..(s + 1) * 2048].copy_from_slice(&self.template);
+            }
+            Ok(bytes)
+        }
+    }
+
+    let mut template = [0u8; 2048];
+    for (i, b) in template.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(13).wrapping_add(7);
+    }
+    // Byte 0x14: clear the scramble-control bits (bits 4-5) so the
+    // descrambler treats the sector as already in the clear.
+    template[0x14] = 0x00;
+    let expected = template;
+
+    let mut wrapped = DecryptingSectorSource::new(
+        FixedSector { template },
+        DecryptKeys::Css {
+            title_key: [0x11, 0x22, 0x33, 0x44, 0x55],
+        },
+    );
+    let mut got = [0u8; 2048];
+    let n = wrapped.read_sectors(0, 1, &mut got, false).unwrap();
+    assert_eq!(n, 2048);
+    assert_eq!(
+        got, expected,
+        "unscrambled CSS sector (flags=0) must pass through untouched"
+    );
+}
+
+// Decorator must decrypt only the reported `n` bytes, never full `buf`.
+// With a CSS-flagged sector but n=0, the whole buffer must come back
+// exactly as filled (`decrypt_sectors(&mut buf[..n], ...)`).
+#[test]
+fn decrypt_span_bounded_by_reported_n() {
+    // Inner fills a CSS-scrambled-FLAGGED sector but reports n=0, so the
+    // decrypt span is empty and the buffer must come back byte-identical.
+    // A whole-`buf` decrypt would clear the scramble bits / XOR the data.
+    let mut wrapped = DecryptingSectorSource::new(
+        ShortReportSource { report_n: 0 },
+        DecryptKeys::Css {
+            title_key: [1, 2, 3, 4, 5],
+        },
+    );
+    let mut expected = vec![0u8; 2048];
+    ShortReportSource::fill_one(&mut expected);
+
+    let mut got = vec![0u8; 2048];
+    let n = wrapped.read_sectors(5, 1, &mut got, false).unwrap();
+    assert_eq!(n, 0, "decorator must return the inner source's n");
+    assert_eq!(
+        got, expected,
+        "with n=0 the decrypt span is empty; buffer must be untouched"
+    );
+    // Belt-and-braces: the scramble flag bits must still be set
+    // (a whole-buf descramble would have cleared them).
+    assert_eq!(got[0x14] & 0x30, 0x30, "scramble flags must remain set");
+}
+
+/// lba / count / recovery must be forwarded to the inner source
+/// verbatim. Grounding: `read_sectors` calls
+/// `self.inner.read_sectors(lba, count, buf, recovery)`.
+#[test]
+fn args_forwarded_verbatim() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut wrapped = DecryptingSectorSource::new(
+        ArgRecorder {
+            calls: calls.clone(),
+        },
+        DecryptKeys::None,
+    );
+    let mut buf = vec![0u8; 2 * 2048];
+    wrapped.read_sectors(12345, 2, &mut buf, true).unwrap();
+    wrapped.read_sectors(0, 1, &mut buf, false).unwrap();
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![(12345, 2, true), (0, 1, false)],
+        "lba/count/recovery must pass through unchanged"
+    );
+}
+
+// Records the fua flag of every read; the default read_sectors_fua drops it.
+struct FuaProbe {
+    fua: Vec<bool>,
+}
+impl SectorSource for FuaProbe {
+    fn read_sectors(&mut self, _: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+        let n = count as usize * 2048;
+        buf[..n].fill(0);
+        Ok(n)
+    }
+    fn read_sectors_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
+        self.fua.push(fua);
+        self.read_sectors(lba, count, buf, recovery)
+    }
+}
+
+// Pass-N FUA recovery must reach the drive through the decrypting decorator.
+#[test]
+fn read_sectors_fua_forwards_fua_to_the_inner_source() {
+    let mut d = DecryptingSectorSource::new(FuaProbe { fua: vec![] }, DecryptKeys::None);
+    let mut buf = vec![0u8; 2048];
+    d.read_sectors_fua(0, 1, &mut buf, true, true).unwrap();
+    d.read_sectors_fua(0, 1, &mut buf, true, false).unwrap();
+    assert_eq!(d.inner().fua, [true, false]);
+}
+
+// The decorator reports its inner's answer, not a constant: over a prefetcher it is false.
+#[test]
+fn random_access_follows_the_inner_source() {
+    let _serial = crate::sector::prefetched::holder_test_lock();
+    let ext = vec![crate::disc::Extent {
+        start_lba: 0,
+        sector_count: 6,
+    }];
+    let inner = ArgRecorder {
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let pf = crate::sector::PrefetchedSectorSource::new(inner, ext, 3, &crate::ctx::Ctx::default())
+        .unwrap();
+    let d = DecryptingSectorSource::new(pf, DecryptKeys::None);
+    assert!(!d.random_access());
+    let d = DecryptingSectorSource::new(FuaProbe { fua: vec![] }, DecryptKeys::None);
+    assert!(d.random_access());
+}
+
+/// A read error from the inner source must propagate unchanged.
+/// Grounding: the `?` on the inner read in `read_sectors`.
+#[test]
+fn inner_read_error_propagates() {
+    let mut wrapped = DecryptingSectorSource::new(FailingSource, DecryptKeys::None);
+    let mut buf = vec![0u8; 2048];
+    let r = wrapped.read_sectors(0, 1, &mut buf, false);
+    let err = r.expect_err("inner error must propagate");
+    let io: std::io::Error = err.into();
+    assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+}
+
+// AACS reaching decrypt without an installed key map must fail loud
+// (DecryptFailed), not silently return still-encrypted bytes — even with an
+// empty key pool (the map-only model: no map ⇒ always an error).
+#[test]
+fn aacs_without_key_map_and_empty_pool_errors() {
+    let src = PatternedSource { capacity: 16 };
+    let mut wrapped = DecryptingSectorSource::new(
+        src,
+        DecryptKeys::Aacs {
+            unit_keys: Vec::new(),
+            format: crate::disc::ContentFormat::BdTs,
+        },
+    );
+    // On the unit grid, so the alignment gate passes and the mapless arm answers.
+    wrapped.set_unit_base(0);
+    let mut buf = vec![0u8; 2048];
+    let r = wrapped.read_sectors(0, 1, &mut buf, false);
+    let err = r.expect_err("missing unit key must error, not pass through encrypted");
+    assert_eq!(
+        err.code(),
+        crate::error::Error::DecryptFailed.code(),
+        "must surface DecryptFailed"
+    );
+}
+
+// Yields one clear AACS aligned unit (6144 bytes = 3 sectors) with TS
+// sync bytes at the BD-TS stride; `is_clean` reports it unscrambled, so
+// decrypt reaches the per-unit closure — isolating key LOOKUP failures.
+struct ClearUnitSource;
+impl SectorSource for ClearUnitSource {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        let bytes = count as usize * 2048;
+        buf[..bytes].fill(0);
+        // BD-TS sync byte at offset 4 of every 192-byte packet.
+        let mut off = 4usize;
+        while off < bytes {
+            buf[off] = 0x47;
+            off += 192;
+        }
+        Ok(bytes)
+    }
+}
+
+// set_keys must replace the active keys mid-life. Uses a CSS-scrambled
+// sector: under CSS the descrambler XORs data and clears scramble flags;
+// under None bytes pass through — flipping keys must change which runs.
+#[test]
+fn set_keys_swaps_active_keys() {
+    struct ScrambledSector {
+        template: [u8; 2048],
+    }
+    impl SectorSource for ScrambledSector {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            let bytes = count as usize * 2048;
+            for s in 0..count as usize {
+                buf[s * 2048..(s + 1) * 2048].copy_from_slice(&self.template);
+            }
+            Ok(bytes)
+        }
+    }
+
+    // Build a sector flagged as scrambled (bits 4-5 of byte 0x14
+    // set) with non-zero payload so the keystream XOR is visible.
+    let mut template = [0u8; 2048];
+    for (i, b) in template.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(29).wrapping_add(3);
+    }
+    // Real scrambled DVD sectors are MPEG-2 PS packs; the scramble policy
+    // requires the pack start code as well as the flag bits.
+    template[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+    template[4] = 0x44; // '01': a 13818-1 pack
+    template[0x0D] = 0xF8; // pack_stuffing_length 0
+    template[0x14] = 0x30; // scramble bits (4-5) set → flags == 0x03
+    crate::css::dvd_pack_header(&mut template, 0xE0);
+    let pristine = template;
+
+    // Start with None → pass-through (no descramble, flags stay set).
+    let mut wrapped = DecryptingSectorSource::new(ScrambledSector { template }, DecryptKeys::None);
+    let mut got = [0u8; 2048];
+    wrapped.read_sectors(0, 1, &mut got, false).unwrap();
+    assert_eq!(
+        got, pristine,
+        "None keys must pass the sector through unchanged"
+    );
+    assert_eq!(
+        got[0x14] & 0x30,
+        0x30,
+        "None must leave the scramble flags set"
+    );
+
+    // Swap to a CSS key: now the descrambler runs and must clear the
+    // scramble flags (and XOR the data region), so the bytes differ.
+    wrapped.set_keys(DecryptKeys::Css {
+        title_key: [0xa1, 0xb2, 0xc3, 0xd4, 0xe5],
+    });
+    let mut got2 = [0u8; 2048];
+    wrapped.read_sectors(0, 1, &mut got2, false).unwrap();
+    assert_eq!(
+        got2[0x14] & 0x30,
+        0x00,
+        "CSS descramble must clear the scramble-control bits"
+    );
+    assert_ne!(
+        &got2[128..2048],
+        &pristine[128..2048],
+        "CSS descramble must alter the encrypted data region"
+    );
+}
+
+// Unit-alignment guard is AACS-only; a CSS read (per-sector, stateless)
+// must not be gated on a 3-sector boundary — lba 1 must read fine. Guard
+// is inside `matches!(self.keys, DecryptKeys::Aacs { .. })`.
+#[test]
+fn css_start_lba_not_unit_gated() {
+    let mut wrapped = DecryptingSectorSource::new(
+        ClearUnitSource,
+        DecryptKeys::Css {
+            title_key: [0u8; 5],
+        },
+    );
+    let mut buf = vec![0u8; 2048];
+    // lba 1 (not a multiple of 3) must succeed under CSS — no AACS gate.
+    let n = wrapped.read_sectors(1, 1, &mut buf, false).unwrap();
+    assert_eq!(n, 2048, "CSS reads must not be unit-alignment gated");
+}
+
+// The clear 6144-byte AACS unit `encrypt_aacs_unit` encrypts: zeroes
+// except TS sync 0x47 at the BD-TS stride and CPI bits on byte 0. Exposed
+// separately so decrypt tests can assert byte-exact plaintext recovery.
+fn clear_aacs_unit() -> Vec<u8> {
+    let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < unit.len() {
+        unit[off] = 0x47;
+        off += 192;
+    }
+    // CPI bits on byte 0 so it reads as encrypted; set before key derivation.
+    unit[0] |= 0xC0;
+    unit
+}
+
+/// Build a clear 6144-byte AACS unit (TS syncs at the BD-TS stride) then
+/// encrypt it under `unit_key` so `aacs::content::decrypt_unit` recovers it.
+fn encrypt_aacs_unit(unit_key: &[u8; 16]) -> Vec<u8> {
+    let mut unit = clear_aacs_unit();
+    assert!(
+        crate::aacs::content::encrypt_unit(&mut unit, unit_key),
+        "a full-length unit must encrypt"
+    );
+    unit
+}
+
+/// `into_inner` / `inner` / `inner_mut` must hand back the original
+/// source unchanged. Grounding: the accessor methods.
+#[test]
+fn inner_accessors_round_trip() {
+    let src = PatternedSource { capacity: 42 };
+    let mut wrapped = DecryptingSectorSource::new(src, DecryptKeys::None);
+    assert_eq!(wrapped.inner().capacity_sectors(), 42);
+    assert_eq!(wrapped.inner_mut().capacity_sectors(), 42);
+    let recovered = wrapped.into_inner();
+    assert_eq!(recovered.capacity_sectors(), 42);
+}
+
+/// Source that returns a fixed unit's bytes for any read.
+struct FixedUnit {
+    unit: Vec<u8>,
+}
+impl SectorSource for FixedUnit {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        let bytes = count as usize * 2048;
+        buf[..bytes].copy_from_slice(&self.unit);
+        Ok(bytes)
+    }
+}
+
+// End-to-end AACS: an encrypted unit read through the decorator with a
+// matching AacsKeyMap comes back as the known plaintext — the shipping
+// mapped-decrypt path, previously covered only via the deleted reactive path.
+#[test]
+fn aacs_decorator_decrypts_encrypted_unit_via_map() {
+    let key = [0x5Au8; 16];
+    let unit = encrypt_aacs_unit(&key);
+    let src = FixedUnit { unit };
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+        0,
+        u32::MAX,
+        0,
+    )]));
+    let mut dec = DecryptingSectorSource::new(src, Keying::ring(keys, map, None));
+    dec.set_unit_base(0);
+    let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+    let n = dec.read_sectors(0, 3, &mut buf, false).unwrap();
+    assert_eq!(n, crate::aacs::content::ALIGNED_UNIT_LEN);
+    // The plaintext is fully known, so assert byte-exact recovery rather than
+    // spot-checking the TS syncs: checking only 0x47 at the 192-byte stride let
+    // corruption anywhere in the other 6112 bytes pass undetected.
+    assert_eq!(
+        buf,
+        crate::aacs::content::cpi_cleared(clear_aacs_unit()),
+        "the decrypted unit must equal the known plaintext byte-for-byte"
+    );
+}
+
+/// An AACS decorator built WITHOUT a key map must fail loud on the first unit —
+/// the map is mandatory for AACS (it decrypts only via the mapped path). Guards
+/// the class of bug the TrueHD probe shipped (a mapless AACS `DecryptingSectorSource`).
+#[test]
+fn aacs_decorator_without_map_fails_loud() {
+    let key = [0x5Au8; 16];
+    let unit = encrypt_aacs_unit(&key);
+    let src = FixedUnit { unit };
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let mut dec = DecryptingSectorSource::new(src, keys); // no key map
+    dec.set_unit_base(0);
+    let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+    let err = dec
+        .read_sectors(0, 3, &mut buf, false)
+        .expect_err("AACS decorator with no key map must fail loud");
+    assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
+}
+
+// `with_content_ranges` contract: an encrypted unit whose LBA is OUTSIDE the
+// disc's content extents passes through untouched (never decrypted). Before the
+// fix the mapped path ignored the content map, so this unit was decrypted.
+#[test]
+fn content_ranges_pass_through_units_outside_encrypted_extents() {
+    let key = [0x5Au8; 16];
+    let unit = encrypt_aacs_unit(&key);
+    let ciphertext = unit.clone();
+    let src = FixedUnit { unit };
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+        0,
+        u32::MAX,
+        0,
+    )]));
+    // Content covers a DIFFERENT extent (LBA 300..303); LBA 0 is outside it.
+    let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(300u32, 3u32)].into_boxed_slice());
+    let mut dec =
+        DecryptingSectorSource::new(src, Keying::ring(keys, map, None)).with_content_ranges(ranges);
+    let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+    let n = dec.read_sectors(0, 3, &mut buf, false).unwrap();
+    assert_eq!(n, crate::aacs::content::ALIGNED_UNIT_LEN);
+    assert_eq!(
+        buf, ciphertext,
+        "a unit outside the content extents must pass through untouched"
+    );
+}
+
+// With content ranges set, a NON-aligned read that touches no content extent is
+// clear filesystem — it must NOT trip the AACS unit-alignment gate (which would
+// otherwise fail loud for any AACS read at a misaligned LBA).
+#[test]
+fn content_ranges_exempt_out_of_content_read_from_alignment_gate() {
+    let src = PatternedSource { capacity: 16 };
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, [0u8; 16])],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(300, 303, 0)]));
+    let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(300u32, 3u32)].into_boxed_slice());
+    let mut dec =
+        DecryptingSectorSource::new(src, Keying::ring(keys, map, None)).with_content_ranges(ranges);
+    let mut buf = vec![0u8; 2048];
+    // LBA 1 is misaligned AND outside content → passes through, no DecryptFailed.
+    let n = dec
+        .read_sectors(1, 1, &mut buf, false)
+        .expect("a misaligned clear read outside content must not be gated");
+    assert_eq!(n, 2048);
+    let mut expected = vec![0u8; 2048];
+    PatternedSource::fill(1, 1, &mut expected);
+    assert_eq!(buf, expected, "clear out-of-content bytes pass through");
+}
+
+// Records whether the inner source was read at all.
+struct CountingSource(Arc<std::sync::atomic::AtomicUsize>);
+impl SectorSource for CountingSource {
+    fn read_sectors(&mut self, _l: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = c as usize * 2048;
+        b[..n].fill(0);
+        Ok(n)
+    }
+}
+
+// The AACS unit-alignment gate rejects a misaligned content read BEFORE the
+// inner read (misaligned units would silently mis-decrypt), measured from
+// `unit_base`, not absolute LBA 0.
+#[test]
+fn aacs_alignment_gate_rejects_misaligned_reads_relative_to_unit_base() {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, [0u8; 16])],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map = std::sync::Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+        0,
+        u32::MAX,
+        0,
+    )]));
+    let mut dec =
+        DecryptingSectorSource::new(CountingSource(reads.clone()), Keying::ring(keys, map, None));
+    dec.set_unit_base(0);
+    let mut buf = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+    let err = dec
+        .read_sectors(1, 3, &mut buf, false)
+        .expect_err("LBA 1 is misaligned against base 0");
+    assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "rejected before touching the drive"
+    );
+
+    // Base 1: LBA 4 is aligned (4 - 1 = 3), LBA 3 is not.
+    dec.set_unit_base(1);
+    dec.read_sectors(4, 3, &mut buf, false)
+        .expect("aligned relative to unit_base");
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(dec.read_sectors(3, 3, &mut buf, false).is_err());
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// A file whose first sector is LBA 1001 (1001 % 3 == 2): two encrypted units on
+// its own grid (1001, 1004), zeroes elsewhere.
+struct MisalignedFile(Vec<u8>);
+const FILE_LBA: u32 = 1001;
+impl SectorSource for MisalignedFile {
+    fn read_sectors(&mut self, lba: u32, c: u16, b: &mut [u8], _r: bool) -> Result<usize> {
+        for i in 0..c as usize {
+            let rel = (lba as usize + i).wrapping_sub(FILE_LBA as usize) * 2048;
+            let dst = &mut b[i * 2048..(i + 1) * 2048];
+            match self.0.get(rel..rel + 2048) {
+                Some(src) => dst.copy_from_slice(src),
+                None => dst.fill(0),
+            }
+        }
+        Ok(c as usize * 2048)
+    }
+}
+
+fn misaligned_file_source() -> DecryptingSectorSource<MisalignedFile> {
+    let key = [0x5Au8; 16];
+    let mut data = encrypt_aacs_unit(&key);
+    data.extend(encrypt_aacs_unit(&key));
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map = Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+        FILE_LBA,
+        FILE_LBA + 6,
+        0,
+    )]));
+    DecryptingSectorSource::new(MisalignedFile(data), Keying::ring(keys, map, None))
+        .with_content_ranges(Arc::from(vec![(FILE_LBA, 6u32)]))
+}
+
+// No default grid: an AACS content read before any `set_unit_base` fails loud,
+// never decrypts on the disc-LBA-0 grid (1002 % 3 == 0 once passed the gate).
+#[test]
+fn aacs_content_read_without_unit_base_fails_loud() {
+    let mut dec = misaligned_file_source();
+    let mut buf = vec![0u8; 2 * crate::aacs::content::ALIGNED_UNIT_LEN];
+    let r = dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false);
+    assert!(
+        matches!(r, Err(crate::error::Error::DecryptFailed)),
+        "no unit base must be DecryptFailed, got {r:?}"
+    );
+}
+
+// A wrong explicit base (disc grid) cuts chunks across real units: a flagged chunk's seed
+// has no TS sync at byte 4, so no key opens it. Like any damaged unit it is blanked and
+// counted, never E7013 (1.7.7 muxed through; "multi pass shouldn't error").
+#[test]
+fn aacs_read_on_wrong_unit_grid_is_blanked_not_e7013() {
+    let mut dec = misaligned_file_source();
+    let mut buf = vec![0u8; 2 * crate::aacs::content::ALIGNED_UNIT_LEN];
+    dec.set_unit_base(FILE_LBA + 1);
+    let mut raw = vec![0u8; buf.len()];
+    dec.inner_mut()
+        .read_sectors(FILE_LBA + 1, 6, &mut raw, false)
+        .unwrap();
+    let flagged: Vec<usize> = (0..2).filter(|&u| raw[u * 6144] & 0xC0 != 0).collect();
+    assert!(
+        !flagged.is_empty(),
+        "the fixture cuts at least one flagged chunk"
+    );
+    dec.read_sectors(FILE_LBA + 1, 6, &mut buf, false)
+        .expect("an off-grid read is blanked, never E7013");
+    for &u in &flagged {
+        assert!(
+            buf[u * 6144..(u + 1) * 6144].iter().all(|&b| b == 0),
+            "unit {u} blanked"
+        );
+    }
+    assert_eq!(dec.blanked_units(), flagged.len() as u64);
+
+    // The file's own grid decrypts both units byte-exact.
+    dec.set_unit_base(FILE_LBA);
+    dec.read_sectors(FILE_LBA, 6, &mut buf, false)
+        .expect("file-grid read decrypts");
+    let mut want = clear_aacs_unit();
+    want.extend(clear_aacs_unit());
+    assert_eq!(buf, crate::aacs::content::cpi_cleared(want));
+}
+
+// A file at FILE_LBA of `units` units under one key; `damaged` units have a garbage seed.
+fn damaged_file_source(units: u32, damaged: &[u32]) -> DecryptingSectorSource<MisalignedFile> {
+    let key = [0x5Au8; 16];
+    let mut data = Vec::new();
+    for u in 0..units {
+        let mut unit = encrypt_aacs_unit(&key);
+        if damaged.contains(&u) {
+            crate::test_util::damage_unit_seed(&mut unit);
+        }
+        data.extend(unit);
+    }
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let end = FILE_LBA + units * 3;
+    let map = Arc::new(crate::decrypt::AacsKeyMap::from_ranges(vec![(
+        FILE_LBA, end, 0,
+    )]));
+    let mut dec = DecryptingSectorSource::new(MisalignedFile(data), Keying::ring(keys, map, None));
+    dec.set_unit_base(FILE_LBA);
+    dec
+}
+
+// Read `units` units from unit `from` of the damaged file.
+fn read_units(
+    dec: &mut DecryptingSectorSource<MisalignedFile>,
+    from: u32,
+    units: u32,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; units as usize * crate::aacs::content::ALIGNED_UNIT_LEN];
+    dec.read_sectors(FILE_LBA + from * 3, (units * 3) as u16, &mut buf, false)?;
+    Ok(buf)
+}
+
+/// A lone unit whose seed is damaged, among units that decrypt on the grid, is a hole
+/// (zeros), never E7013. KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is
+/// used as the seed for calculating the Block Key." — no key opens a damaged seed.
+#[test]
+fn a_damaged_unit_seed_on_the_grid_is_a_hole() {
+    assert!(
+        crate::spec::keys::KS_4_SEED
+            .text
+            .contains("used as the seed")
+    );
+    let mut dec = damaged_file_source(3, &[1]);
+    let buf = read_units(&mut dec, 0, 3).expect("read damage is not a key failure");
+    let clear = crate::aacs::content::cpi_cleared(clear_aacs_unit());
+    let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+    assert_eq!(&buf[..ul], &clear[..]);
+    assert!(
+        buf[ul..2 * ul].iter().all(|&b| b == 0),
+        "the damaged unit is a hole"
+    );
+    assert_eq!(&buf[2 * ul..], &clear[..]);
+    assert_eq!(dec.blanked_units(), 1);
+}
+
+/// A blanked unit reaches the run: its loss counter and one `UnitBlanked` at the read's
+/// LBA; a read with no damage reports nothing.
+#[test]
+fn blanked_units_are_reported_to_the_run() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let ctx =
+        crate::ctx::Ctx::default().with_events(Arc::new(move |e: &crate::event::Event<'_>| {
+            if let crate::event::Event::UnitBlanked { lba, units } = e {
+                sink.lock().unwrap().push((*lba, *units));
+            }
+        }));
+    let mut dec = damaged_file_source(4, &[1, 2]);
+    dec.observe(&ctx);
+    read_units(&mut dec, 0, 1).expect("intact unit");
+    assert!(seen.lock().unwrap().is_empty(), "no damage, no event");
+    assert_eq!(ctx.stats.snapshot().units_blanked, 0);
+    read_units(&mut dec, 1, 2).expect("a damage cluster is blanked");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(u64::from(FILE_LBA) + 3, 2)],
+        "one event: the read's LBA and the unit count"
+    );
+    assert_eq!(ctx.stats.snapshot().units_blanked, 2);
+}
+
+/// A cluster of damaged units is blanked and counted however it is read: alone, first,
+/// with no intact unit around it. KS-2 [BD] §3.10.1: "Each MPEG source packet consists of
+/// the TP_extra_header (4 bytes) and an MPEG Transport packet".
+#[test]
+fn a_cluster_of_damaged_units_is_blanked_and_counted() {
+    assert!(
+        crate::spec::keys::KS_2_ALIGNED_UNIT
+            .text
+            .contains("TP_extra_header (4 bytes)")
+    );
+    let mut dec = damaged_file_source(4, &[1, 2]);
+    let buf = read_units(&mut dec, 1, 2).expect("a damage cluster is blanked, never E7013");
+    assert_eq!(dec.blanked_units(), 2);
+    assert!(buf.iter().all(|&b| b == 0), "both damaged units are holes");
+}
+
+/// A sweep's zero run need not be unit-aligned. A unit whose tail sectors are zero keeps
+/// its seed: its head sector decrypts and the zeros stay zeros. A unit whose head sector is
+/// zero lost its seed (KS-4 [BD] §3.10.1: "The first 16 bytes of each Aligned Unit is used
+/// as the seed"), so its ciphertext rest is a hole too — never E7013, never ciphertext out.
+#[test]
+fn partial_zero_units_at_both_edges_of_a_run_are_holes() {
+    let mut dec = damaged_file_source(4, &[]);
+    dec.inner_mut().0[4 * 2048..7 * 2048].fill(0); // unit 1 sectors 1-2, unit 2 sector 0
+    let buf = read_units(&mut dec, 0, 4).expect("a partial zero run is read damage");
+    let clear = crate::aacs::content::cpi_cleared(clear_aacs_unit());
+    let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+    assert_eq!(&buf[..ul], &clear[..]);
+    // Packets 0-9 lie wholly in unit 1's intact head sector (10 × 192 = 1920 bytes).
+    assert_eq!(
+        &buf[ul..ul + 1920],
+        &clear[..1920],
+        "the kept head decrypts"
+    );
+    assert!(
+        buf[ul + 2112..2 * ul].iter().all(|&b| b == 0),
+        "its zero tail stays zero"
+    );
+    assert!(
+        buf[2 * ul..3 * ul].iter().all(|&b| b == 0),
+        "a lost seed is a hole"
+    );
+    assert_eq!(&buf[3 * ul..], &clear[..]);
+    assert_eq!(
+        dec.blanked_units(),
+        1,
+        "the lost-seed unit; the kept head is not blanked"
+    );
+}
+
+// An FMTS Even-phase segment of `units` units under `key`, the map pointing at `map_key`;
+// units in `garbled` read back with a garbage head that kept the CPI flag and TS sync.
+fn fmts_file_source(
+    units: u32,
+    garbled: &[u32],
+    key: [u8; 16],
+    map_key: [u8; 16],
+) -> DecryptingSectorSource<MisalignedFile> {
+    let mut data = Vec::new();
+    for u in 0..units {
+        let mut unit = encrypt_aacs_unit(&key);
+        if garbled.contains(&u) {
+            crate::test_util::damage_unit_seed(&mut unit);
+            unit[4] = 0x47;
+        }
+        data.extend(unit);
+    }
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, map_key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let end = FILE_LBA + units * 3;
+    let map = crate::decrypt::AacsKeyMap::from_ranges_phased(vec![(
+        FILE_LBA,
+        end,
+        0,
+        crate::decrypt::Phase::Even,
+    )]);
+    let mut dec = DecryptingSectorSource::new(
+        MisalignedFile(data),
+        Keying::ring(keys, Arc::new(map), None),
+    );
+    dec.set_unit_base(FILE_LBA);
+    dec
+}
+
+/// A lone FMTS unit that fails the correct-phase verify (a garbled head that kept its
+/// sync) is damage: blanked and counted, never E7013, read with its segment or alone.
+/// KS-3 [BD] §3.10.1: "A new CBC cipher chain is started for each Aligned Unit".
+#[test]
+fn a_lone_fmts_verify_failure_is_blanked_never_e7013() {
+    let key = [0x5Au8; 16];
+    let mut dec = fmts_file_source(4, &[2], key, key);
+    let buf = read_units(&mut dec, 0, 4).expect("damage, not E7013");
+    let ul = crate::aacs::content::ALIGNED_UNIT_LEN;
+    let fmt = crate::disc::ContentFormat::BdTs;
+    assert!(
+        crate::aacs::content::is_clean(&buf[..ul], fmt),
+        "unit 0 decrypts"
+    );
+    assert!(
+        buf[2 * ul..3 * ul].iter().all(|&b| b == 0),
+        "unit 2 blanked"
+    );
+    assert_eq!(dec.blanked_units(), 1);
+    let alone = read_units(&mut dec, 2, 1).expect("alone, still damage");
+    assert!(alone.iter().all(|&b| b == 0));
+    assert_eq!(dec.blanked_units(), 2);
+}
+
+/// A wrong FMTS key fails every unit it keys: that stops E7013, never a blank.
+#[test]
+fn a_wrong_fmts_key_still_stops_e7013() {
+    let mut dec = fmts_file_source(4, &[], [0x5Au8; 16], [0xCCu8; 16]);
+    assert!(matches!(
+        read_units(&mut dec, 0, 4),
+        Err(crate::error::Error::DecryptFailed)
+    ));
+}

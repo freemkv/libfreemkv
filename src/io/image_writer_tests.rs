@@ -1,0 +1,264 @@
+use super::*;
+use crate::error::Result as FmResult;
+
+/// A source that yields a deterministic byte per sector, so the written
+/// image can be checked positionally rather than just by length.
+struct PatternSource {
+    sectors: u32,
+    /// Sectors after which `read_sectors` reports a short read.
+    short_after: Option<u32>,
+}
+
+impl SectorSource for PatternSource {
+    fn capacity_sectors(&self) -> u32 {
+        self.sectors
+    }
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> FmResult<usize> {
+        let want = count as usize * SECTOR_BYTES;
+        if self.short_after.is_some_and(|after| lba >= after) {
+            return Ok(want - 1);
+        }
+        for s in 0..count as usize {
+            let byte = ((lba as usize + s) % 251) as u8;
+            buf[s * SECTOR_BYTES..(s + 1) * SECTOR_BYTES].fill(byte);
+        }
+        Ok(want)
+    }
+}
+
+// `lba`s from `file` hold the same encrypted AACS unit, on the file's own grid.
+struct AacsFileImage {
+    file: u32,
+    unit: Vec<u8>,
+}
+
+impl SectorSource for AacsFileImage {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> FmResult<usize> {
+        for i in 0..count as usize {
+            let sector = &mut buf[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES];
+            let s = lba + i as u32;
+            match s.checked_sub(self.file).filter(|&o| o < 30) {
+                Some(o) => {
+                    let k = (o % 3) as usize * SECTOR_BYTES;
+                    sector.copy_from_slice(&self.unit[k..k + SECTOR_BYTES]);
+                }
+                None => sector.fill(0),
+            }
+        }
+        Ok(count as usize * SECTOR_BYTES)
+    }
+}
+
+fn clear_aacs_unit() -> Vec<u8> {
+    let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+    for off in (4..unit.len()).step_by(192) {
+        unit[off] = 0x47;
+    }
+    unit[0] |= 0xC0;
+    unit
+}
+
+// Batches are not whole AACS units: an unwrapped AACS decrypting source fails
+// loud at the first misaligned batch that touches content, never ships ciphertext.
+#[test]
+fn write_image_over_an_unwrapped_aacs_source_fails_loud_at_a_misaligned_batch() {
+    use crate::decrypt::{DecryptKeys, Phase};
+    use std::sync::Arc;
+    let key = [0x5A; 16];
+    let mut unit = clear_aacs_unit();
+    assert!(crate::aacs::content::encrypt_unit(&mut unit, &key));
+    let src = AacsFileImage { file: 3000, unit };
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map = crate::keys::test_key_map(vec![(3000, 3030, 0, Phase::All)]);
+    let dec = crate::sector::DecryptingSectorSource::new(src, keys);
+    let mut dec = crate::keys::test_keyed_source(dec, map)
+        .with_content_ranges(Arc::from(vec![(3000u32, 30u32)]));
+    dec.set_unit_base(0); // file grid (3000 % 3 == 0): fails loud past the no-base gate
+    let dest = tmp("aacs-batch");
+    let r = write_image(&mut dec, &dest, 3100, &Ctx::default());
+    let _ = std::fs::remove_file(&dest);
+    let e = r.expect_err("batch 2048 is off the unit grid and touches content");
+    assert_eq!(e.code(), Error::DecryptFailed.code());
+}
+
+fn tmp(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("fmkv-image-writer-{name}-{}", std::process::id()));
+    p
+}
+
+// A failed copy must not leave a truncated image at the final name.
+#[test]
+fn failed_copy_removes_the_incomplete_image() {
+    let td = tempfile::tempdir().unwrap();
+    let dest = td.path().join("bad.iso");
+    let mut src = PatternSource {
+        sectors: 4096,
+        short_after: Some(2048),
+    };
+    let r = write_image(&mut src, &dest, 4096, &Ctx::default());
+    assert!(matches!(r, Err(Error::ShortImageRead { .. })), "{r:?}");
+    assert!(!dest.exists(), "truncated image left at the final name");
+}
+
+// A failing parent-directory fsync must fail write_image, not report Ok.
+#[test]
+fn failed_parent_directory_fsync_is_an_error() {
+    let td = tempfile::tempdir().unwrap();
+    let mut src = PatternSource {
+        sectors: 4,
+        short_after: None,
+    };
+    let res = write_image_with(
+        &mut src,
+        &td.path().join("x.iso"),
+        4,
+        &Ctx::default(),
+        |_| Err(std::io::Error::from(std::io::ErrorKind::Other)),
+    );
+    assert!(matches!(res, Err(Error::IoError { .. })), "{res:?}");
+}
+
+/// The written image is byte-for-byte what the source presented, at the
+/// right offsets — not merely the right length.
+#[test]
+fn writes_every_sector_in_order() {
+    let dest = tmp("order");
+    let mut src = PatternSource {
+        sectors: 5000,
+        short_after: None,
+    };
+    let n = write_image(&mut src, &dest, 5000, &Ctx::default()).expect("write");
+    assert_eq!(n, 5000 * SECTOR_BYTES as u64);
+
+    let data = std::fs::read(&dest).expect("read back");
+    assert_eq!(data.len(), 5000 * SECTOR_BYTES);
+    // Spot-check across batch boundaries (BATCH_SECTORS = 2048): the last
+    // sector of batch 0, the first of batch 1, and the final sector.
+    for lba in [0usize, 2047, 2048, 4095, 4096, 4999] {
+        let want = (lba % 251) as u8;
+        assert_eq!(
+            data[lba * SECTOR_BYTES],
+            want,
+            "sector {lba} head byte wrong — batching lost or duplicated a sector"
+        );
+        assert_eq!(
+            data[(lba + 1) * SECTOR_BYTES - 1],
+            want,
+            "sector {lba} tail"
+        );
+    }
+    let _ = std::fs::remove_file(&dest);
+}
+
+/// A tail shorter than a full batch must still be written whole — the
+/// classic off-by-one when `total_sectors` is not a batch multiple.
+#[test]
+fn writes_a_partial_final_batch() {
+    let dest = tmp("tail");
+    let mut src = PatternSource {
+        sectors: 2049,
+        short_after: None,
+    };
+    let n = write_image(&mut src, &dest, 2049, &Ctx::default()).expect("write");
+    assert_eq!(n, 2049 * SECTOR_BYTES as u64);
+    assert_eq!(
+        std::fs::metadata(&dest).expect("stat").len(),
+        2049 * SECTOR_BYTES as u64
+    );
+    let _ = std::fs::remove_file(&dest);
+}
+
+/// A short read is an error. Zero-filling would yield an image that looks
+/// complete and is not — the single worst outcome for an archival copy.
+#[test]
+fn short_read_is_an_error_not_a_zero_fill() {
+    let dest = tmp("short");
+    let mut src = PatternSource {
+        sectors: 4096,
+        short_after: Some(2048),
+    };
+    let err = write_image(&mut src, &dest, 4096, &Ctx::default()).expect_err("must fail");
+    assert!(
+        matches!(err, Error::ShortImageRead { lba: 2048, .. }),
+        "got {err:?}"
+    );
+    let _ = std::fs::remove_file(&dest);
+}
+
+/// Cancellation stops the run and reports it, rather than finishing quietly
+/// or reporting success on a partial image.
+#[test]
+fn cancellation_halts_and_reports() {
+    let dest = tmp("halt");
+    let mut src = PatternSource {
+        sectors: 100_000,
+        short_after: None,
+    };
+    let halt = crate::halt::Halt::new();
+    halt.cancel();
+    let err =
+        write_image(&mut src, &dest, 100_000, &Ctx::new(halt.clone())).expect_err("must halt");
+    assert!(matches!(err, Error::Halted), "got {err:?}");
+    assert!(dest.exists(), "a halt must keep the partial image");
+    let _ = std::fs::remove_file(&dest);
+}
+
+/// Progress is cumulative and monotonic, and its final value equals the
+/// returned byte count — a front-end that trusts the callback must not end
+/// up disagreeing with the return value.
+#[test]
+fn progress_is_cumulative_and_ends_at_the_total() {
+    let dest = tmp("progress");
+    let mut src = PatternSource {
+        sectors: 5000,
+        short_after: None,
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let rec = seen.clone();
+    let ctx = Ctx::default().with_events(std::sync::Arc::new(move |e: &Event<'_>| {
+        if let Event::BytesWritten { bytes, total } = *e {
+            assert_eq!(total, 5000 * SECTOR_BYTES as u64);
+            rec.lock().unwrap().push(bytes);
+        }
+    }));
+    let n = write_image(&mut src, &dest, 5000, &ctx).expect("write");
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.windows(2).all(|w| w[1] > w[0]),
+        "not monotonic: {seen:?}"
+    );
+    assert_eq!(*seen.last().expect("at least one event"), n);
+    let _ = std::fs::remove_file(&dest);
+}
+
+/// A zero-sector source is a caller error, not a zero-byte image: an empty
+/// ISO is never what anyone wanted, and failing here names the problem.
+#[test]
+fn zero_sectors_is_an_error() {
+    let dest = tmp("empty");
+    let mut src = PatternSource {
+        sectors: 0,
+        short_after: None,
+    };
+    let err = write_image(&mut src, &dest, 0, &Ctx::default()).expect_err("must fail");
+    assert!(matches!(err, Error::EmptyImage), "got {err:?}");
+    // The destination must not have been created — a failed run leaves no
+    // stub for a later run to mistake for output.
+    assert!(!dest.exists(), "empty run created a file");
+}

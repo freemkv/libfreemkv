@@ -1,0 +1,765 @@
+use super::*;
+
+const AUD: &[u8] = &[0x00, 0x00, 0x01, 0x09]; // H.264 access-unit delimiter
+
+fn au(payload: u8, len: usize) -> Vec<u8> {
+    let mut v = AUD.to_vec();
+    v.extend(std::iter::repeat_n(payload, len));
+    v
+}
+
+#[test]
+fn self_framing_codecs_pass_through_each_fragment_unchanged() {
+    // MPEG-2 (self-reassembles in its parser) and audio (syncword resync) run
+    // through a Passthrough assembler: every fragment emerges immediately as
+    // one unit with its own timing — byte-identical to today's path.
+    for codec in [Codec::Mpeg2, Codec::Ac3Plus, Codec::Dts, Codec::Lpcm] {
+        let mut a = AuAssembler::for_codec(codec);
+        let out = a.push(&[1, 2, 3, 4], Some(42), None, None, false);
+        assert_eq!(
+            out.len(),
+            1,
+            "{codec:?} passes each fragment straight through"
+        );
+        assert_eq!(out[0].data, vec![1, 2, 3, 4]);
+        assert_eq!(out[0].pts, Some(42));
+        assert!(a.flush().is_empty(), "passthrough buffers nothing");
+    }
+}
+
+#[test]
+fn video_codecs_reassemble_across_fragments() {
+    // H.264 buffers: one fragment is NOT a complete AU on its own.
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    assert!(
+        a.push(&[0, 0, 1, 0x09, 0xAB], Some(1), None, None, false)
+            .is_empty(),
+        "holds an AU until the next boundary"
+    );
+}
+
+#[test]
+fn one_au_split_across_fragments_reassembles_with_start_pts() {
+    // A single AU (AUD + 100 bytes) arrives as three fragments; only the
+    // first carries a PTS. It must emit exactly ONE AU with that PTS.
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    let full = au(0xAB, 100);
+    assert!(
+        a.push(&full[..40], Some(9000), None, None, false)
+            .is_empty()
+    );
+    assert!(a.push(&full[40..80], None, None, None, false).is_empty());
+    assert!(a.push(&full[80..], None, None, None, false).is_empty());
+    let out = a.flush();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].pts,
+        Some(9000),
+        "AU carries its START pts, not 0/None"
+    );
+    assert_eq!(out[0].data, full);
+}
+
+#[test]
+fn two_aus_emit_when_the_second_boundary_arrives() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    let au1 = au(0x11, 50);
+    let au2 = au(0x22, 60);
+    let mut buf = au1.clone();
+    buf.extend_from_slice(&au2);
+    // AU1 + AU2's opening AUD → AU1 completes, tagged pts1.
+    let out = a.push(&buf[..au1.len() + 4], Some(1000), None, None, false);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].data, au1);
+    assert_eq!(out[0].pts, Some(1000));
+    a.push(&buf[au1.len() + 4..], None, None, None, false);
+    let out2 = a.flush();
+    assert_eq!(out2.len(), 1);
+    assert_eq!(out2[0].data, au2);
+}
+
+#[test]
+fn au_merges_pts_and_source_from_different_fragments() {
+    // One fragment may carry the source stamp while a later fragment of the same
+    // AU carries the PTS; the AU must keep both, not just the front mark's field.
+    let src = crate::pes::SourcePos::at_byte(4242);
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    let full = au(0xAB, 80);
+    // Fragment 1: source only, no PTS.
+    assert!(a.push(&full[..30], None, None, Some(src), false).is_empty());
+    // Fragment 2 (same AU): PTS only, no source.
+    assert!(
+        a.push(&full[30..], Some(9000), None, None, false)
+            .is_empty()
+    );
+    let out = a.flush();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].pts, Some(9000), "PTS from the 2nd fragment retained");
+    assert_eq!(
+        out[0].source.map(|s| s.byte),
+        Some(4242),
+        "source from the 1st fragment retained"
+    );
+}
+
+#[test]
+fn discontinuity_flag_attaches_to_the_au_it_opens() {
+    // A discontinuity-flagged fragment opens AU2; that flag must land on AU2,
+    // not AU1 (the B1 resync gate keys off it).
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    let au1 = au(0x11, 30);
+    let au2 = au(0x22, 30);
+    a.push(&au1, Some(1), None, None, false);
+    // AU2 arrives flagged; its opening AUD completes AU1 first.
+    let out = a.push(&au2, Some(2), None, None, true);
+    assert_eq!(out.len(), 1, "AU1 completes when AU2's boundary arrives");
+    assert!(!out[0].discontinuity, "AU1 is NOT the discontinuity");
+    let out2 = a.flush();
+    assert_eq!(out2.len(), 1);
+    assert!(out2[0].discontinuity, "AU2 carries the discontinuity");
+}
+
+#[test]
+fn leading_bytes_before_first_au_are_discarded() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    let mut buf = vec![0xFF, 0xFF, 0xFF, 0xFF];
+    buf.extend_from_slice(&au(0x33, 20));
+    a.push(&buf, Some(500), None, None, false);
+    let out = a.flush();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].data, au(0x33, 20), "leading junk dropped, AU intact");
+}
+
+// ── VC-1 AU grouping ──────────────────────────────────────────────────
+
+fn bdu(ty: u8, payload: u8, len: usize) -> Vec<u8> {
+    let mut v = vec![0x00, 0x00, 0x01, ty];
+    v.extend(std::iter::repeat_n(payload, len));
+    v
+}
+
+#[test]
+fn vc1_i_frame_keeps_its_preceding_seq_and_entry_headers() {
+    // A plain 0x0D split would strand the seq/entry headers on the following
+    // P-frame's AU (a decode bug); VC-1 mode must group them with the I-frame.
+    let mut a = AuAssembler::for_codec(Codec::Vc1);
+    let mut iframe = bdu(VC1_SEQ, 0xAA, 8);
+    iframe.extend(bdu(VC1_ENTRY, 0xBB, 6));
+    iframe.extend(bdu(VC1_FRAME, 0xCC, 20)); // frame + slice bytes
+    let pframe = bdu(VC1_FRAME, 0xDD, 15);
+
+    // Feed the I-frame; it stays open until the P-frame's boundary arrives.
+    assert!(a.push(&iframe, Some(9000), None, None, false).is_empty());
+    let out = a.push(&pframe, Some(9376), None, None, false);
+    assert_eq!(out.len(), 1, "I-frame AU completes at the P-frame boundary");
+    assert_eq!(out[0].data, iframe, "I-frame AU retains seq+entry+frame");
+    assert_eq!(out[0].pts, Some(9000));
+
+    let tail = a.flush();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].data, pframe, "P-frame is its own AU");
+    assert_eq!(tail[0].pts, Some(9376));
+}
+
+#[test]
+fn vc1_consecutive_frames_split_one_per_au() {
+    // Back-to-back frames with no headers between them each form their own AU.
+    let mut a = AuAssembler::for_codec(Codec::Vc1);
+    let f1 = bdu(VC1_FRAME, 0x11, 30);
+    let f2 = bdu(VC1_FRAME, 0x22, 40);
+    let mut both = f1.clone();
+    both.extend_from_slice(&f2);
+    both.extend(bdu(VC1_FRAME, 0x33, 4)); // opening boundary of a 3rd frame
+    let out = a.push(&both, Some(1), None, None, false);
+    assert_eq!(out.len(), 2, "two complete frames emit");
+    assert_eq!(out[0].data, f1);
+    assert_eq!(out[1].data, f2);
+}
+
+#[test]
+fn vc1_entry_point_without_seq_header_still_groups_with_frame() {
+    // Mid-GOP open points can carry an entry-point header with no sequence
+    // header; it must still attach to the frame that follows it.
+    let mut a = AuAssembler::for_codec(Codec::Vc1);
+    let mut au = bdu(VC1_ENTRY, 0xEE, 5);
+    au.extend(bdu(VC1_FRAME, 0xFF, 12));
+    let mut done = a.push(&au, Some(500), None, None, false);
+    // Next frame's opening boundary closes the entry+frame AU.
+    done.extend(a.push(&bdu(VC1_FRAME, 0x00, 4), None, None, None, false));
+    done.extend(a.flush());
+    assert_eq!(done.len(), 2);
+    assert_eq!(done[0].data, au, "entry+frame grouped");
+    assert_eq!(done[0].pts, Some(500));
+}
+
+// ── MPEG-2 AU grouping ────────────────────────────────────────────────
+
+#[test]
+fn mpeg2_keeps_seq_and_gop_headers_with_their_picture() {
+    // A GOP-opening AU is [seq 0xB3][gop 0xB8][picture 0x00][slices]; the next
+    // picture (no headers) is its own AU. The seq/GOP headers must stay with
+    // the picture they introduce, not glue onto the previous AU.
+    let mut a = AuAssembler::mpeg2();
+    let mut gop = bdu(MP2_SEQ, 0xAA, 10);
+    gop.extend(bdu(MP2_GOP, 0xBB, 8));
+    gop.extend(bdu(MP2_PICTURE, 0xCC, 20)); // picture + slice bytes
+    let pic2 = bdu(MP2_PICTURE, 0xDD, 15);
+
+    assert!(a.push(&gop, Some(9000), None, None, false).is_empty());
+    let out = a.push(&pic2, Some(9376), None, None, false);
+    assert_eq!(
+        out.len(),
+        1,
+        "first AU completes at the next picture boundary"
+    );
+    assert_eq!(out[0].data, gop, "AU retains seq + GOP + picture");
+    assert_eq!(out[0].pts, Some(9000));
+
+    let tail = a.flush();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].data, pic2, "second picture is its own AU");
+    assert_eq!(tail[0].pts, Some(9376));
+}
+
+#[test]
+fn a_pts_fragment_opened_inside_a_picture_times_the_picture_commencing_in_it() {
+    // Pictures packed back to back: each PES opens 5 bytes into the previous
+    // picture and its PTS is the next picture's. Read as the previous one's, every
+    // later picture took its successor's PTS.
+    let pics: Vec<Vec<u8>> = (0..3u8).map(|i| bdu(MP2_PICTURE, 0x10 + i, 20)).collect();
+    let stream = pics.concat();
+    let mut a = AuAssembler::mpeg2();
+    let mut out = a.push(&stream[..5], Some(100), None, None, false);
+    out.extend(a.push(&stream[5..29], Some(200), None, None, false));
+    out.extend(a.push(&stream[29..53], Some(300), None, None, false));
+    out.extend(a.push(&stream[53..], None, None, None, false));
+    out.extend(a.flush());
+    let pts: Vec<_> = out.iter().map(|au| au.pts).collect();
+    assert_eq!(pts, [Some(100), Some(200), Some(300)]);
+    assert_eq!(
+        out.iter().map(|au| au.data.clone()).collect::<Vec<_>>(),
+        pics
+    );
+}
+
+#[test]
+fn a_pre_sync_fragment_times_the_first_access_unit_commencing_in_it() {
+    let mut a = AuAssembler::mpeg2();
+    let mut frag = vec![0xFF; 6];
+    frag.extend(bdu(MP2_PICTURE, 0x11, 10));
+    let mut out = a.push(&frag, Some(700), None, None, false);
+    out.extend(a.push(&bdu(MP2_PICTURE, 0x22, 10), Some(800), None, None, false));
+    out.extend(a.flush());
+    assert_eq!(
+        out.iter().map(|au| au.pts).collect::<Vec<_>>(),
+        [Some(700), Some(800)]
+    );
+}
+
+#[test]
+fn mpeg2_slice_codes_are_not_au_boundaries() {
+    // Slice start codes (0x01..=0xAF) inside a picture must not split the AU.
+    let mut a = AuAssembler::mpeg2();
+    let mut pic = bdu(MP2_PICTURE, 0x11, 4);
+    pic.extend(bdu(0x01, 0x22, 10)); // slice 1
+    pic.extend(bdu(0xAF, 0x33, 10)); // slice 175 (max slice code)
+    let next = bdu(MP2_PICTURE, 0x44, 4); // opening boundary of the next AU
+    let out = a.push(&[pic.clone(), next].concat(), Some(1), None, None, false);
+    assert_eq!(out.len(), 1, "slices stay inside the one picture AU");
+    assert_eq!(out[0].data, pic, "AU spans the picture and all its slices");
+}
+
+#[test]
+fn mpeg2_reassembles_one_picture_split_across_fragments() {
+    // A picture split across three PES fragments; only the first carries a PTS.
+    let mut a = AuAssembler::mpeg2();
+    let full = bdu(MP2_PICTURE, 0xEE, 100);
+    assert!(a.push(&full[..40], Some(500), None, None, false).is_empty());
+    assert!(a.push(&full[40..80], None, None, None, false).is_empty());
+    assert!(a.push(&full[80..], None, None, None, false).is_empty());
+    let out = a.flush();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].pts, Some(500), "AU carries its START pts");
+    assert_eq!(out[0].data, full);
+}
+
+/// Split `stream` into fragments of `frag` bytes, push them through the given
+/// assembler mode, and return the reassembled AU byte-payloads.
+fn reassemble_with(mut a: AuAssembler, stream: &[u8], frag: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < stream.len() {
+        let end = (i + frag).min(stream.len());
+        for au in a.push(&stream[i..end], None, None, None, false) {
+            out.push(au.data);
+        }
+        i = end;
+    }
+    for au in a.flush() {
+        out.push(au.data);
+    }
+    out
+}
+
+#[test]
+fn resumable_boundary_matches_from_scratch_across_all_fragmentations() {
+    // The incremental scan_pos cursor must match a whole-buffer rescan at every
+    // fragment granularity, from 1 byte at a time up to whole (O(n) vs O(n^2)).
+    let h264 = {
+        let mut s = au(0x11, 40); // AU1 (AUD + payload)
+        s.extend(au(0x22, 70)); // AU2
+        s.extend(au(0x33, 25)); // AU3
+        s
+    };
+    let vc1 = {
+        let mut s = bdu(VC1_SEQ, 0xAA, 8);
+        s.extend(bdu(VC1_ENTRY, 0xBB, 6));
+        s.extend(bdu(VC1_FRAME, 0xCC, 50)); // I-frame AU
+        s.extend(bdu(VC1_FRAME, 0xDD, 30)); // P-frame AU
+        s.extend(bdu(VC1_FRAME, 0xEE, 20)); // P-frame AU
+        s
+    };
+    let mpeg2 = {
+        let mut s = bdu(MP2_SEQ, 0xAA, 10);
+        s.extend(bdu(MP2_GOP, 0xBB, 8));
+        s.extend(bdu(MP2_PICTURE, 0xCC, 60)); // GOP-opening picture AU
+        s.extend(bdu(MP2_PICTURE, 0xDD, 40)); // picture AU
+        s
+    };
+    // (label, stream, assembler factory). MPEG-2 uses the dedicated mpeg2()
+    // assembler (Mode::Mpeg2); the AUD/VC-1 codecs use for_codec().
+    type MakeAsm = fn() -> AuAssembler;
+    let cases: [(&str, &[u8], MakeAsm); 3] = [
+        ("h264", &h264, || AuAssembler::for_codec(Codec::H264)),
+        ("vc1", &vc1, || AuAssembler::for_codec(Codec::Vc1)),
+        ("mpeg2", &mpeg2, AuAssembler::mpeg2),
+    ];
+    for (label, stream, make) in cases {
+        let whole = reassemble_with(make(), stream, stream.len());
+        assert!(!whole.is_empty(), "{label}: baseline produced AUs");
+        for frag in 1..=stream.len() {
+            let got = reassemble_with(make(), stream, frag);
+            assert_eq!(
+                got, whole,
+                "{label}: fragmented at {frag} differs from whole-buffer reassembly"
+            );
+        }
+    }
+}
+
+#[test]
+fn marks_deques_stay_bounded_on_zero_length_timed_fragments() {
+    // A run of zero-length fragments that each carry a PTS (or a
+    // discontinuity) grows no buffer bytes, so the buf-size cap never prunes
+    // the mark deques. The MAX_MARKS backstop must bound them regardless.
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    for i in 0..(MAX_MARKS * 2) {
+        a.push(&[], Some(i as i64), None, None, true);
+    }
+    assert!(
+        a.marks.len() <= MAX_MARKS,
+        "marks bounded at MAX_MARKS, got {}",
+        a.marks.len()
+    );
+    assert!(
+        a.disc_marks.len() <= MAX_MARKS,
+        "disc_marks bounded at MAX_MARKS, got {}",
+        a.disc_marks.len()
+    );
+}
+
+// The 8 MiB backstop discards a start-code-free run; the AU that eventually emits MUST be
+// marked discontinuous, or the resync gate never arms and a broken picture goes out
+// silently.
+#[test]
+fn a_backstop_discard_marks_the_next_au_discontinuous() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+
+    // A clean AU first, so there IS a prior AU to be discontinuous from.
+    let first = au(0x11, 64);
+    let mut stream = first.clone();
+    stream.extend_from_slice(AUD);
+    let out = a.push(&stream, Some(1000), None, None, false);
+    assert_eq!(out.len(), 1, "the first AU emits normally");
+    assert!(
+        !out[0].discontinuity,
+        "an ordinary AU at the head of a clean run is continuous"
+    );
+
+    // The first over-cap run still has a delimiter at buf[0], so it force-flushes
+    // as an over-long AU with nothing lost. Only once no opener remains does the
+    // backstop discard bytes, which is what this test covers.
+    let junk = vec![0xAB; MAX_AU_BUFFER + 4096];
+    a.push(&junk, Some(2000), None, None, false);
+    a.push(&junk, Some(2100), None, None, false);
+
+    // Resync: a fresh AU, followed by the delimiter that closes it.
+    let mut resumed = au(0x22, 64);
+    resumed.extend_from_slice(AUD);
+    let out = a.push(&resumed, Some(3000), None, None, false);
+
+    let au2 = out
+        .iter()
+        .find(|x| x.data.contains(&0x22))
+        .expect("the post-gap AU must emit");
+    assert!(
+        au2.discontinuity,
+        "the AU following an 8 MiB backstop discard follows a gap and must \
+             say so; without the flag the resync gate never arms and a picture \
+             with dangling references is emitted as if it were sound"
+    );
+}
+
+// The opposite case: bytes ahead of the FIRST delimiter predate sync and have no prior AU
+// to be discontinuous from, so retiring the marks there is right.
+#[test]
+fn a_stream_start_trim_does_not_mark_the_first_au_discontinuous() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+
+    // Junk BEFORE the first delimiter — a partial AU from before sync.
+    // Small enough that the backstop never fires; this is the a0 > 0 path.
+    let mut stream = vec![0xCD; 512];
+    stream.extend_from_slice(&au(0x33, 64));
+    stream.extend_from_slice(AUD);
+
+    let out = a.push(&stream, Some(1000), None, None, false);
+    let first = out.first().expect("the first synced AU must emit");
+    assert!(
+        !first.discontinuity,
+        "trimming pre-sync bytes at stream start is not a gap in the \
+             stream; flagging it would drop the opening GOP of every title"
+    );
+}
+
+// A source-signalled discontinuity reaches the AU it opens: the `disc_marks` path, distinct
+// from the sticky `pending_gap` the backstop sets. Deliberately kept separate from that
+// test.
+#[test]
+fn a_source_signalled_discontinuity_reaches_the_au_it_opens() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+
+    // A clean AU first, so there is a prior AU and the gate has somewhere
+    // to be discontinuous FROM.
+    let mut first = au(0x11, 64);
+    first.extend_from_slice(AUD);
+    let out = a.push(&first, Some(1000), None, None, false);
+    assert_eq!(out.len(), 1);
+    assert!(!out[0].discontinuity, "a clean run is continuous");
+
+    // The source flags this fragment as following a gap. It carries the
+    // body of the next AU and its closing delimiter, so it is emitted
+    // rather than discarded — the mark must ride through to it.
+    let mut second = au(0x22, 64);
+    second.extend_from_slice(AUD);
+    let out = a.push(&second, Some(2000), None, None, true);
+
+    let au2 = out
+        .iter()
+        .find(|x| x.data.contains(&0x22))
+        .expect("the flagged AU must emit");
+    assert!(
+        au2.discontinuity,
+        "a discontinuity the SOURCE signalled must reach the AU whose bytes \
+             carried it; this is the disc_marks path and no other test drives it"
+    );
+}
+
+#[test]
+fn over_cap_without_boundary_force_flushes() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    let big = au(0x44, MAX_AU_BUFFER + 16);
+    let emitted = a.push(&big, Some(1), None, None, false);
+    assert!(
+        !emitted.is_empty(),
+        "over-cap AU is force-flushed, not buffered forever"
+    );
+}
+
+// MEASURED: a drained AU must be HANDED the accumulation buffer's allocation, not copied.
+// The emitted `Vec`'s data pointer must equal the buffer's own pointer.
+#[test]
+fn drained_au_takes_over_the_buffer_allocation_without_copying() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    // An AU large enough that the buffer's capacity is not >2x its size (the
+    // small-AU copy path exists so a small frame cannot carry an oversized
+    // idle allocation downstream).
+    let au1 = au(0x11, 400 * 1024);
+    let au2 = au(0x22, 400 * 1024);
+    let mut stream = au1.clone();
+    stream.extend_from_slice(&au2);
+
+    // Push everything except the final byte of AU2's delimiter, so no AU has
+    // been emitted yet but the buffer holds the whole of AU1.
+    a.push(&stream[..au1.len() + 3], Some(1), None, None, false);
+    let before = a.buf.as_ptr();
+    let cap_before = a.buf.capacity();
+    let out = a.push(
+        &stream[au1.len() + 3..au1.len() + 4],
+        None,
+        None,
+        None,
+        false,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].data, au1,
+        "handover must preserve the AU bytes exactly"
+    );
+    assert_eq!(
+        out[0].data.as_ptr(),
+        before,
+        "the emitted AU must own the buffer's allocation (no whole-frame copy)"
+    );
+    // Must not pin to the old capacity, or `buf` becomes a permanent high-water
+    // mark sending every later smaller AU down the copy path (see
+    // `handover_survives_a_large_au_instead_of_copying_every_later_one`).
+    assert!(
+        a.buf.capacity() >= au1.len(),
+        "replacement buffer must fit another AU of this size: {} < {}",
+        a.buf.capacity(),
+        au1.len()
+    );
+    assert!(
+        a.buf.capacity() <= cap_before,
+        "replacement buffer must never EXCEED the old capacity"
+    );
+    assert_eq!(a.buf.len(), 4, "the buffer holds only AU2's delimiter tail");
+}
+
+// MEASURED: `take_front`'s copy fallback must not become permanent — one copy is expected
+// right after a size step down; a per-frame copy forever is the bug.
+#[test]
+fn handover_survives_a_large_au_instead_of_copying_every_later_one() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+    // BD-TS aligns one AU per PES, so each `push` carries about one AU. One large
+    // AU (IDR) is followed by smaller ones (P/B); each push includes the next
+    // AU's opener so the previous one closes.
+    const SMALL: usize = 64 * 1024;
+    let mut pending = au(0x11, 2 * 1024 * 1024);
+    for i in 0..20u8 {
+        let next = au(0x30 + i, SMALL);
+        // Append the next AU's 4-byte opener to close `pending`, push, and
+        // carry the rest of `next` forward.
+        pending.extend_from_slice(&next[..4]);
+        a.push(&pending, Some(1), None, None, false);
+        pending = next[4..].to_vec();
+    }
+    let hits = a.copy_path_hits;
+    assert!(
+        hits <= 2,
+        "the copy fallback must re-arm the handover, not fire for every AU \
+             after a large one: {hits} copies over 20 access units"
+    );
+}
+
+// AU-opener detection pinned to normative byte values (drift check). The offset must be the
+// real start code position, never a fixed 0, which would glue pre-sync junk onto an AU.
+#[test]
+fn au_opener_from_locates_the_real_start_code_per_codec() {
+    // Junk that contains a start-code PREFIX but no opener suffix, so a
+    // scanner that stopped at `00 00 01` alone would answer wrongly.
+    let junk: &[u8] = &[0xFF, 0x00, 0x00, 0x01, 0x67, 0xAA];
+    let cases: &[(Mode, u8, &str)] = &[
+        // ISO/IEC 14496-10 §7.4.1: nal_unit_type 9 = access unit delimiter,
+        // and nal_ref_idc shall be 0 for it, so the header byte is 0x09.
+        (Mode::StartCode(0x09), 0x09, "H.264 AUD"),
+        // ITU-T H.265 §7.4.2.2: nal_unit_type 35 = AUD_NUT. The first NAL
+        // header byte is forbidden_zero_bit(1) | nal_unit_type(6) |
+        // nuh_layer_id MSB(1) = (35 << 1) = 0x46 on the base layer.
+        (Mode::StartCode(0x46), 0x46, "HEVC AUD"),
+        // SMPTE 421M Annex E BDU types.
+        (Mode::Vc1, VC1_SEQ, "VC-1 sequence header"),
+        (Mode::Vc1, VC1_ENTRY, "VC-1 entry point"),
+        (Mode::Vc1, VC1_FRAME, "VC-1 frame"),
+        // ISO/IEC 13818-2 §6.2.1 Table 6-1 start code values.
+        (Mode::Mpeg2, MP2_PICTURE, "MPEG-2 picture"),
+        (Mode::Mpeg2, MP2_SEQ, "MPEG-2 sequence header"),
+        (Mode::Mpeg2, MP2_GOP, "MPEG-2 GOP header"),
+    ];
+    for &(mode, code, what) in cases {
+        let mut buf = junk.to_vec();
+        buf.extend_from_slice(&[0x00, 0x00, 0x01, code, 0x5A]);
+        assert_eq!(
+            au_opener_from(mode, &buf, 0),
+            Some(junk.len()),
+            "{what}: opener must be found at the start code, not at 0"
+        );
+        // `from` must actually skip: searching past the only opener finds none.
+        assert_eq!(
+            au_opener_from(mode, &buf, junk.len() + 1),
+            None,
+            "{what}: the resume cursor must be honoured"
+        );
+    }
+}
+
+/// Start codes that are NOT access-unit openers must not be reported as one.
+/// Treating a slice or an extension header as an AU start splits one coded
+/// picture into several frames, each missing its picture header.
+#[test]
+fn non_opening_start_codes_are_not_au_openers() {
+    // ISO/IEC 13818-2 Table 6-1: slice (0x01..=0xAF), user data (0xB2),
+    // extension (0xB5), sequence end (0xB7) all appear INSIDE an access unit.
+    for code in [0x01u8, 0xAF, 0xB2, 0xB5, 0xB7] {
+        let buf = [0x00, 0x00, 0x01, code, 0x11, 0x22];
+        assert_eq!(
+            au_opener_from(Mode::Mpeg2, &buf, 0),
+            None,
+            "MPEG-2 start code {code:#04x} must not open an access unit"
+        );
+    }
+    // SMPTE 421M: slice (0x0B) and field (0x0C) BDUs belong to the frame
+    // already in progress; end-of-sequence (0x0A) opens nothing.
+    for code in [0x0Au8, 0x0B, 0x0C] {
+        let buf = [0x00, 0x00, 0x01, code, 0x11, 0x22];
+        assert_eq!(
+            au_opener_from(Mode::Vc1, &buf, 0),
+            None,
+            "VC-1 BDU {code:#04x} must not open an access unit"
+        );
+    }
+    // H.264: an SPS (7) / PPS (8) / IDR slice (5) is not the AU DELIMITER the
+    // StartCode mode splits on.
+    for code in [0x05u8, 0x67, 0x68] {
+        let buf = [0x00, 0x00, 0x01, code, 0x11, 0x22];
+        assert_eq!(au_opener_from(Mode::StartCode(0x09), &buf, 0), None);
+    }
+    // Passthrough never frames — the codec self-frames.
+    assert_eq!(
+        au_opener_from(Mode::Passthrough, &[0, 0, 1, 0x09, 0xAA], 0),
+        None
+    );
+}
+
+/// `au_opener_resumable` must return the true offset AND advance
+/// `opener_pos` only over bytes that cannot hide a straddling start code.
+/// A constant `Some(0)` short-circuits both.
+#[test]
+fn au_opener_resumable_reports_the_real_offset_and_resumes_safely() {
+    let mut a = AuAssembler::for_codec(Codec::H264);
+
+    // A junk run with no opener: None, and the cursor parks 3 bytes back so a
+    // start code split across the append boundary is still found.
+    a.buf.extend_from_slice(&[0xFFu8; 32]);
+    assert_eq!(a.au_opener_resumable(), None, "no opener in a junk run");
+    assert_eq!(
+        a.opener_pos, 29,
+        "resume 3 bytes back for a straddling code"
+    );
+
+    // Now append a start code that STRADDLES the previous end: the first three
+    // bytes of `00 00 01 09` land at offsets 29..32.
+    a.buf.truncate(29);
+    a.buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x09, 0x77]);
+    assert_eq!(
+        a.au_opener_resumable(),
+        Some(29),
+        "a start code straddling the previous scan end must still be found"
+    );
+}
+
+// After pre-sync bytes are discarded, the emitted AU must take the timing of the fragment
+// that ACTUALLY opened it, not the discarded junk's.
+#[test]
+fn discarded_pre_sync_marks_do_not_time_the_first_access_unit() {
+    let src = |b: u64| SourcePos {
+        byte: b,
+        ..Default::default()
+    };
+    let mut a = AuAssembler::for_codec(Codec::H264);
+
+    // Fragment 1: pre-sync junk, no start code. Carries its own PTS/source.
+    assert!(
+        a.push(&[0xFFu8; 24], Some(1_000), Some(900), Some(src(11)), false)
+            .is_empty()
+    );
+    // Fragment 2: the first real AU opener, with the timing that belongs to it.
+    assert!(
+        a.push(
+            &au(0x33, 40),
+            Some(2_000),
+            Some(1_900),
+            Some(src(22)),
+            false
+        )
+        .is_empty()
+    );
+    // Fragment 3: a second AU, closing the first.
+    let out = a.push(
+        &au(0x44, 40),
+        Some(3_000),
+        Some(2_900),
+        Some(src(33)),
+        false,
+    );
+
+    assert_eq!(out.len(), 1, "the first AU closes on the second opener");
+    assert_eq!(out[0].data, au(0x33, 40), "junk discarded, AU intact");
+    assert_eq!(
+        out[0].pts,
+        Some(2_000),
+        "the AU must take the opening fragment's PTS, not the discarded junk's"
+    );
+    assert_eq!(out[0].dts, Some(1_900), "same for DTS");
+    assert_eq!(
+        out[0].source.map(|s| s.byte),
+        Some(22),
+        "same for the source position used by the recovery map"
+    );
+
+    let tail = a.flush();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].pts, Some(3_000), "the second AU keeps its own PTS");
+}
+
+// `for_codec` decides whether a stream is REASSEMBLED or passed through;
+// getting it wrong is silent corruption. Each mode is identified
+// BEHAVIOURALLY so the case cannot pass by matching a constant.
+#[test]
+fn for_codec_routes_each_video_codec_to_its_reassembly_mode() {
+    // Buffering codecs: a stream split mid-AU must NOT emit until the second
+    // AU's opener arrives, and must then emit the FIRST AU whole.
+    let buffering: &[(Codec, u8)] = &[
+        (Codec::H264, 0x09), // ISO/IEC 14496-10 §7.4.1 AUD
+        (Codec::Hevc, 0x46), // ITU-T H.265 §7.4.2.2 AUD_NUT, (35 << 1)
+    ];
+    for &(codec, marker) in buffering {
+        let mut a = AuAssembler::for_codec(codec);
+        let mut unit = vec![0x00, 0x00, 0x01, marker];
+        unit.extend(std::iter::repeat_n(0x5Au8, 30));
+        // First half of AU 1: nothing complete yet.
+        assert!(
+            a.push(&unit[..20], Some(1), None, None, false).is_empty(),
+            "{codec:?} must buffer a partial access unit, not emit it"
+        );
+        assert!(
+            a.push(&unit[20..], None, None, None, false).is_empty(),
+            "{codec:?} must hold AU 1 until the next opener"
+        );
+        // AU 2's opener closes AU 1.
+        let out = a.push(&unit, Some(2), None, None, false);
+        assert_eq!(out.len(), 1, "{codec:?} emits exactly one AU");
+        assert_eq!(out[0].data, unit, "{codec:?} reassembles AU 1 whole");
+        assert_eq!(out[0].pts, Some(1), "{codec:?} carries the AU-start PTS");
+    }
+
+    // VC-1 buffers too, on its own boundary rule (no single AU delimiter).
+    let mut a = AuAssembler::for_codec(Codec::Vc1);
+    let frame = bdu(VC1_FRAME, 0x77, 30);
+    assert!(a.push(&frame, Some(1), None, None, false).is_empty());
+    assert_eq!(
+        a.push(&frame, Some(2), None, None, false).len(),
+        1,
+        "VC-1 emits AU 1 when the next frame BDU opens AU 2"
+    );
+
+    // Self-framing codecs pass each fragment through immediately — the same
+    // half-AU input that the buffering modes held back comes straight out.
+    for codec in [Codec::Mpeg2, Codec::Ac3, Codec::TrueHd, Codec::Pgs] {
+        let mut a = AuAssembler::for_codec(codec);
+        let out = a.push(&[0x00, 0x00, 0x01, 0x09, 0xAA], Some(7), None, None, false);
+        assert_eq!(out.len(), 1, "{codec:?} must pass through, not buffer");
+        assert_eq!(out[0].pts, Some(7));
+        assert!(a.flush().is_empty(), "{codec:?} buffers nothing at EOF");
+    }
+}

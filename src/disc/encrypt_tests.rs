@@ -1,0 +1,1200 @@
+use super::*;
+use crate::aacs;
+use crate::sector::SectorSource;
+use std::collections::HashMap;
+
+/// `HandshakeResult` carries the Volume ID and the AACS 2.0 bus (read-data)
+/// key; `Debug` must redact both. Sentinel 213 (0xD5).
+#[test]
+fn handshake_result_debug_is_redacted() {
+    let hs = HandshakeResult {
+        volume_id: [0xD5; 16],
+        read_data_key: Some([0xD5; 16]),
+        read_data_key_err: None,
+        drive_unlocked: false,
+    };
+    let d = format!("{hs:?}");
+    assert!(
+        !d.contains("213"),
+        "HandshakeResult leaked VID/bus key: {d}"
+    );
+    assert!(
+        d.contains("redacted"),
+        "HandshakeResult missing marker: {d}"
+    );
+}
+
+// In-memory disc + minimal UDF image with a single physical partition
+// (metadata_start == partition_start), per udf.rs::read_filesystem / ECMA-167.
+
+const PART_START: u32 = 4000;
+
+struct MemDisc {
+    sectors: HashMap<u32, [u8; 2048]>,
+}
+impl MemDisc {
+    fn new() -> Self {
+        Self {
+            sectors: HashMap::new(),
+        }
+    }
+    fn put(&mut self, lba: u32, data: [u8; 2048]) {
+        self.sectors.insert(lba, data);
+    }
+    fn put_bytes(&mut self, lba: u32, bytes: &[u8]) {
+        for (i, chunk) in bytes.chunks(2048).enumerate() {
+            let mut s = [0u8; 2048];
+            s[..chunk.len()].copy_from_slice(chunk);
+            self.put(lba + i as u32, s);
+        }
+    }
+}
+impl SectorSource for MemDisc {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        let need = count as usize * 2048;
+        for i in 0..count as u32 {
+            let off = i as usize * 2048;
+            let s = self.sectors.get(&(lba + i)).copied().unwrap_or([0u8; 2048]);
+            buf[off..off + 2048].copy_from_slice(&s);
+        }
+        Ok(need)
+    }
+}
+
+/// Extended File Entry ICB (tag 266) with one Short AD.
+fn build_file_icb(size: u32, data_lba: u32) -> [u8; 2048] {
+    let mut s = [0u8; 2048];
+    s[0..2].copy_from_slice(&266u16.to_le_bytes());
+    s[56..64].copy_from_slice(&(size as u64).to_le_bytes());
+    s[208..212].copy_from_slice(&0u32.to_le_bytes());
+    s[212..216].copy_from_slice(&8u32.to_le_bytes());
+    s[216..220].copy_from_slice(&(size & 0x3FFF_FFFF).to_le_bytes());
+    s[220..224].copy_from_slice(&data_lba.to_le_bytes());
+    s
+}
+
+fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent: bool) {
+    let start = buf.len();
+    let name_field: Vec<u8> = if is_parent {
+        Vec::new()
+    } else {
+        let mut v = vec![0x08u8];
+        v.extend_from_slice(name.as_bytes());
+        v
+    };
+    let mut fid = vec![0u8; 38];
+    fid[0..2].copy_from_slice(&257u16.to_le_bytes());
+    let mut fc = 0u8;
+    if is_dir {
+        fc |= 0x02;
+    }
+    if is_parent {
+        fc |= 0x08;
+    }
+    fid[18] = fc;
+    fid[19] = name_field.len() as u8;
+    fid[24..28].copy_from_slice(&icb_lba.to_le_bytes());
+    fid[36..38].copy_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&fid);
+    buf.extend_from_slice(&name_field);
+    let used = buf.len() - start;
+    buf.resize(start + ((used + 3) & !3), 0);
+}
+
+struct AacsFile {
+    name: &'static str,
+    icb_lba: u32,
+    data_lba: u32,
+    contents: Vec<u8>,
+}
+
+fn build_udf_skeleton(disc: &mut MemDisc, root_icb_lba: u32) {
+    let mut avdp = [0u8; 2048];
+    avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+    disc.put(256, avdp);
+    let mut pd = [0u8; 2048];
+    pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+    pd[188..192].copy_from_slice(&PART_START.to_le_bytes());
+    disc.put(32, pd);
+    let mut lvd = [0u8; 2048];
+    lvd[0..2].copy_from_slice(&6u16.to_le_bytes());
+    lvd[268..272].copy_from_slice(&1u32.to_le_bytes());
+    disc.put(33, lvd);
+    let mut td = [0u8; 2048];
+    td[0..2].copy_from_slice(&8u16.to_le_bytes());
+    disc.put(34, td);
+    let mut fsd = [0u8; 2048];
+    fsd[0..2].copy_from_slice(&256u16.to_le_bytes());
+    fsd[404..408].copy_from_slice(&root_icb_lba.to_le_bytes());
+    disc.put(PART_START, fsd);
+}
+
+/// Build a UDF tree with a single /AACS directory holding the given
+/// files. Returns the navigable UdfFs over `disc`.
+fn build_aacs_fs(disc: &mut MemDisc, files: &[AacsFile]) -> udf::UdfFs {
+    build_aacs_fs_with_index(disc, files, None)
+}
+
+// As `build_aacs_fs`, plus `/BDMV/index.bdmv` holding `index` when given.
+fn build_aacs_fs_with_index(
+    disc: &mut MemDisc,
+    files: &[AacsFile],
+    index: Option<&[u8]>,
+) -> udf::UdfFs {
+    let mut aacs_fids = Vec::new();
+    push_fid(&mut aacs_fids, "", 50, true, true);
+    for f in files {
+        push_fid(&mut aacs_fids, f.name, f.icb_lba, false, false);
+        disc.put(
+            PART_START + f.icb_lba,
+            build_file_icb(f.contents.len() as u32, f.data_lba),
+        );
+        disc.put_bytes(PART_START + f.data_lba, &f.contents);
+    }
+    disc.put(PART_START + 50, build_file_icb(aacs_fids.len() as u32, 51));
+    disc.put_bytes(PART_START + 51, &aacs_fids);
+    // Root referencing AACS.
+    let mut root_fids = Vec::new();
+    push_fid(&mut root_fids, "", 10, true, true);
+    push_fid(&mut root_fids, "AACS", 50, true, false);
+    if let Some(index) = index {
+        let mut bdmv_fids = Vec::new();
+        push_fid(&mut bdmv_fids, "", 70, true, true);
+        push_fid(&mut bdmv_fids, "index.bdmv", 72, false, false);
+        disc.put(PART_START + 72, build_file_icb(index.len() as u32, 7000));
+        disc.put_bytes(PART_START + 7000, index);
+        disc.put(PART_START + 70, build_file_icb(bdmv_fids.len() as u32, 71));
+        disc.put_bytes(PART_START + 71, &bdmv_fids);
+        push_fid(&mut root_fids, "BDMV", 70, true, false);
+    }
+    disc.put(PART_START + 10, build_file_icb(root_fids.len() as u32, 11));
+    disc.put_bytes(PART_START + 11, &root_fids);
+    build_udf_skeleton(disc, 10);
+    udf::read_filesystem(disc).expect("fs")
+}
+
+/// A content certificate: type byte@0 (0x00 = V10, 0x10 = V20),
+/// bus_encryption bit7@1, cc_id@14..20 (aacs/inf.rs parse_content_cert,
+/// which requires ≥20 bytes and reads the bus flag from `data[1] >> 7`).
+fn build_content_cert(cert_type: u8, bus_encryption: bool) -> Vec<u8> {
+    let mut v = vec![0u8; 20];
+    v[0] = cert_type;
+    v[1] = if bus_encryption { 0x80 } else { 0x00 };
+    v
+}
+
+// One Type-and-Version record (type 0x10), version BE u32 @ offset 8, then trailing zero
+// padding.
+fn build_mkb(version: u32, pad_to: usize) -> Vec<u8> {
+    let mut v = Vec::new();
+    // Type 0x10 record, length 16 (>= 12 so version is read).
+    v.push(0x10);
+    v.extend_from_slice(&[0x00, 0x00, 0x10]); // rec_len = 16 (3-byte BE)
+    v.extend_from_slice(&[0u8; 4]); // bytes 4..8 reserved
+    v.extend_from_slice(&version.to_be_bytes()); // version @ rec+8
+    v.extend_from_slice(&[0u8; 4]); // pad record body to 16
+    debug_assert_eq!(v.len(), 16);
+    // Trailing zero padding (the "fixed-region" allocation).
+    v.resize(pad_to, 0);
+    v
+}
+
+// ---------------------------------------------------------------
+// Tests: capture + verdict (the keys-free state)
+// ---------------------------------------------------------------
+
+fn from_for(bus: &BusOutcome) -> CaptureFrom {
+    match bus {
+        BusOutcome::FileOrIso => CaptureFrom::Image,
+        _ => CaptureFrom::Live,
+    }
+}
+
+/// The keys-free state a scan keeps for `bus`, or the recorded error when there is none.
+fn vid_only(
+    udf: &udf::UdfFs,
+    reader: &mut dyn SectorSource,
+    bus: &BusOutcome,
+) -> Result<AacsState> {
+    let cap = capture(reader, udf, from_for(bus))?;
+    let (state, err) = resolve_aacs(cap, bus);
+    state.ok_or_else(|| err.unwrap_or(Error::AacsNoKeys))
+}
+
+// A Stop while reading index.bdmv (the stride's last resort, and the UHD check of a live
+// disc with no cert) ends the capture as Halted, not as an unknown index.
+#[test]
+fn a_stop_reading_the_index_is_halted() {
+    struct StopAt<'a>(&'a mut MemDisc, u32);
+    impl SectorSource for StopAt<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            if lba == self.1 {
+                return Err(Error::Halted);
+            }
+            self.0.read_sectors(lba, count, buf, recovery)
+        }
+    }
+    for from in [CaptureFrom::Image, CaptureFrom::Live] {
+        let mut disc = MemDisc::new();
+        let uk = AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: vec![0xAB; 32],
+        };
+        let udf = build_aacs_fs_with_index(&mut disc, &[uk], Some(b"INDX0300"));
+        let mut reader = StopAt(&mut disc, PART_START + 7000);
+        let cap = capture(&mut reader, &udf, from);
+        assert!(
+            matches!(cap, Err(Error::Halted)),
+            "live: {}",
+            from == CaptureFrom::Live
+        );
+    }
+}
+
+/// Missing Unit_Key_RO.inf (and its DUPLICATE) → Error::AacsNoKeys
+/// (encrypt.rs `.map_err(|_| Error::AacsNoKeys)`). Never panics.
+#[test]
+fn vid_only_missing_unit_key_ro_errors() {
+    let mut disc = MemDisc::new();
+    // AACS dir exists but has no Unit_Key_RO.inf.
+    let udf = build_aacs_fs(&mut disc, &[]);
+    let err = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso)
+        .expect_err("missing Unit_Key_RO must error");
+    assert!(matches!(err, Error::AacsNoKeys));
+}
+
+/// A V10 content cert (type 0x00, bus_encryption off) → version 1,
+/// bus_encryption false (encrypt.rs version match: Some(V10) → 1).
+#[test]
+fn vid_only_v10_cert_sets_version_1() {
+    let mut disc = MemDisc::new();
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[
+            AacsFile {
+                name: "Unit_Key_RO.inf",
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vec![0xAB; 32],
+            },
+            AacsFile {
+                name: "Content000.cer",
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: build_content_cert(0x00, false),
+            },
+        ],
+    );
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    assert_eq!(st.version, 1, "V10 cert → AACS version 1");
+    assert!(!st.bus_encryption);
+}
+
+/// A V20 content cert (type != 0x00) → version 2 (encrypt.rs Some(_) → 2).
+#[test]
+fn vid_only_v20_cert_sets_version_2() {
+    let mut disc = MemDisc::new();
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[
+            AacsFile {
+                name: "Unit_Key_RO.inf",
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vec![0xAB; 32],
+            },
+            AacsFile {
+                name: "Content000.cer",
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: build_content_cert(0x10, true),
+            },
+        ],
+    );
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    assert_eq!(st.version, 2, "V20 cert → AACS version 2");
+    assert!(st.bus_encryption, "cert bus_encryption bit must propagate");
+}
+
+// No content cert: the stride version comes from the shared resolver, so an INDX0200
+// index makes it a BD (major 1) rather than the UHD default.
+#[test]
+fn vid_only_no_cert_takes_the_version_from_index_bdmv() {
+    let mut disc = MemDisc::new();
+    let uk = [AacsFile {
+        name: "Unit_Key_RO.inf",
+        icb_lba: 60,
+        data_lba: 5000,
+        contents: vec![0xAB; 32],
+    }];
+    let udf = build_aacs_fs_with_index(&mut disc, &uk, Some(b"INDX0200"));
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    assert_eq!(st.version, aacs::mkb::AACS_MAJOR_BD);
+}
+
+// No content cert, MKB or index → version defaults to UHD (major 2), matching
+// read_aacs_version (audit #4). bus_encryption false (unreadable → off).
+#[test]
+fn vid_only_no_cert_defaults_version_uhd() {
+    let mut disc = MemDisc::new();
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: vec![0xAB; 32],
+        }],
+    );
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    assert_eq!(
+        st.version,
+        aacs::mkb::AACS_MAJOR_UHD,
+        "no cert → default UHD (major 2)"
+    );
+    assert!(!st.bus_encryption);
+}
+
+/// disc_hash is SHA1 of the Unit_Key_RO.inf bytes, hex with 0x prefix
+/// and uppercase (aacs::inf::disc_hash + disc_hash_hex). The state's
+/// disc_hash must match independently computing it over the same bytes.
+#[test]
+fn vid_only_disc_hash_is_sha1_of_unit_key_ro() {
+    let mut disc = MemDisc::new();
+    let uk = vec![0x42u8; 100];
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: uk.clone(),
+        }],
+    );
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    let expected = aacs::inf::disc_hash_hex(&aacs::inf::disc_hash(&uk));
+    assert_eq!(st.disc_hash, expected);
+    assert!(st.disc_hash.starts_with("0x"));
+    // uk_ro must be stashed verbatim for the external resolver.
+    assert_eq!(st.uk_ro, uk);
+}
+
+/// The MKB is trimmed to its real record length, NOT left as the full
+/// fixed-region zero-pad (encrypt.rs `mkb_bytes.truncate(mkb_content_len)`).
+/// A 16-byte record + 5000 bytes of padding must trim to 16.
+#[test]
+fn vid_only_trims_mkb_padding() {
+    let mut disc = MemDisc::new();
+    let mkb = build_mkb(77, 5000); // record + 4984 pad bytes
+    assert_eq!(mkb.len(), 5000);
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[
+            AacsFile {
+                name: "Unit_Key_RO.inf",
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vec![0xAB; 32],
+            },
+            AacsFile {
+                name: "MKB_RO.inf",
+                icb_lba: 62,
+                data_lba: 7000,
+                contents: mkb.clone(),
+            },
+        ],
+    );
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    // Real record stream is the single 16-byte type-0x10 record.
+    assert_eq!(
+        st.mkb.len(),
+        aacs::mkb::mkb_content_len(&mkb),
+        "MKB must be trimmed to record-stream length, not the zero-pad"
+    );
+    assert_eq!(st.mkb.len(), 16);
+    // Version comes from the type-0x10 record body @ offset 8.
+    assert_eq!(st.mkb_version, Some(77));
+}
+
+/// With no MKB file present, mkb is empty and mkb_version is None
+/// (encrypt.rs `.unwrap_or_default()` → empty Vec; mkb_version(&[]) None).
+#[test]
+fn vid_only_no_mkb_is_empty() {
+    let mut disc = MemDisc::new();
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: vec![0xAB; 32],
+        }],
+    );
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    assert!(st.mkb.is_empty());
+    assert_eq!(st.mkb_version, None);
+}
+
+/// A supplied handshake's volume_id propagates onto the AacsState
+/// (encrypt.rs `handshake.map(|h| h.volume_id)`).
+#[test]
+fn vid_only_propagates_handshake_vid() {
+    let mut disc = MemDisc::new();
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: vec![0xAB; 32],
+        }],
+    );
+    let vid = [0x11u8; 16];
+    let rdk = [0x22u8; 16];
+    let hs = HandshakeResult {
+        volume_id: vid,
+        read_data_key: Some(rdk),
+        read_data_key_err: None,
+        drive_unlocked: false,
+    };
+    let st = vid_only(&udf, &mut disc, &BusOutcome::Handshake(hs)).expect("state");
+    assert_eq!(st.volume_id, vid);
+    // The bus key no longer propagates onto AacsState — it feeds the drive's
+    // single de-bus point via the handshake, not a decrypt-time field.
+}
+
+// OEM bus-key gate: a bus-encrypted disc on a LIVE drive with no
+// read_data_key is blocked (AacsBusKeyUnavailable); three
+// non-regressing cases must still succeed.
+
+fn disc_with_cert(cert_type: u8, bus_encryption: bool) -> (MemDisc, udf::UdfFs) {
+    let mut disc = MemDisc::new();
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[
+            AacsFile {
+                name: "Unit_Key_RO.inf",
+                icb_lba: 60,
+                data_lba: 5000,
+                contents: vec![0xAB; 32],
+            },
+            AacsFile {
+                name: "Content000.cer",
+                icb_lba: 62,
+                data_lba: 6000,
+                contents: build_content_cert(cert_type, bus_encryption),
+            },
+        ],
+    );
+    (disc, udf)
+}
+
+/// Live-drive (handshake Some) + bus_encryption cert + NO read_data_key: the
+/// state is kept for triage, and the policy records AacsBusKeyUnavailable —
+/// the wrong-keys guard (a VID-only/OEM handshake cannot remove bus encryption).
+#[test]
+fn vid_only_bus_encrypted_live_drive_without_rdk_is_blocked() {
+    let (mut disc, udf) = disc_with_cert(0x10, true);
+    let hs = hs_with(false, None);
+    let src = BusOutcome::Handshake(hs);
+    let st = vid_only(&udf, &mut disc, &src).expect("metadata kept");
+    assert!(matches!(
+        super::aacs_verdict(st.bus_encryption, &src),
+        Some(Error::AacsBusKeyUnavailable)
+    ));
+}
+
+/// Live-drive + bus_encryption cert + read_data_key PRESENT → Ok (the cert
+/// handshake produced the bus key, as required).
+#[test]
+fn vid_only_bus_encrypted_live_drive_with_rdk_ok() {
+    let (mut disc, udf) = disc_with_cert(0x10, true);
+    let hs = HandshakeResult {
+        volume_id: [0x11u8; 16],
+        read_data_key: Some([0x22u8; 16]),
+        read_data_key_err: None,
+        drive_unlocked: false,
+    };
+    let st = vid_only(&udf, &mut disc, &BusOutcome::Handshake(hs)).expect("bus key present → ok");
+    assert!(st.bus_encryption);
+}
+
+/// Finding: `is_drive_unlocker(matched)` on the cert route was provably always
+/// false — `run_bus` dispatches ONLY the disc-keyed AACS/DVD unlockers, never a
+/// firmware/drive unlocker — so a cert handshake's `drive_unlocked` is always
+/// false and bus removal there is credited solely via `read_data_key`. The
+/// GENUINE drive-unlock case (drive_unlocked:true, NO read_data_key) is the
+/// OEM/VID-only path, and the bus-key gate MUST credit it rather than
+/// hard-error `AacsBusKeyUnavailable`.
+#[test]
+fn drive_unlock_without_read_data_key_removes_bus_encryption() {
+    // The cert route can never observe a firmware/drive unlocker: the only names
+    // `run_bus` can return ("AACS"/"DVD"/"") classify as NOT a drive unlock, so
+    // the replaced `is_drive_unlocker(matched)` was always false.
+    for name in ["AACS", "DVD", ""] {
+        assert!(
+            !crate::unlock_bridge::is_drive_unlocker(name),
+            "the disc-keyed cert route can never credit a drive unlock ({name:?})"
+        );
+    }
+    // The real case: a bus-encrypted disc unlocked AT THE DRIVE (drive_unlocked)
+    // with no cert read_data_key must resolve OK, not AacsBusKeyUnavailable.
+    let (mut disc, udf) = disc_with_cert(0x10, true);
+    let hs = HandshakeResult {
+        volume_id: [0x11u8; 16],
+        read_data_key: None,
+        read_data_key_err: None,
+        drive_unlocked: true,
+    };
+    let st = vid_only(&udf, &mut disc, &BusOutcome::Handshake(hs))
+        .expect("a drive-unlocked disc removes bus encryption even without a read_data_key");
+    assert!(st.bus_encryption);
+}
+
+// Fail safe: a cert that reads but does not parse (unknown type byte) may
+// declare bus encryption, so a live drive without a Read Data Key refuses keys.
+#[test]
+fn vid_only_unparseable_cert_is_treated_as_bus_encrypted() {
+    let (mut disc, udf) = disc_with_cert(0x55, false);
+    let hs = hs_with(false, None);
+    let src = BusOutcome::Handshake(hs);
+    let st = vid_only(&udf, &mut disc, &src).expect("metadata kept");
+    assert!(st.bus_encryption);
+    assert!(matches!(
+        super::aacs_verdict(st.bus_encryption, &src),
+        Some(Error::AacsBusKeyUnavailable)
+    ));
+}
+
+// No cert on a live drive without a Read Data Key: refuse keys only when the
+// disc is positively UHD (index.bdmv version "0300"); a BD ("0200") resolves.
+// A FAILED live handshake is still a live drive (must not fail open).
+#[test]
+fn vid_only_missing_cert_refuses_only_on_a_known_uhd_disc() {
+    let uk = [AacsFile {
+        name: "Unit_Key_RO.inf",
+        icb_lba: 60,
+        data_lba: 5000,
+        contents: vec![0xAB; 32],
+    }];
+    let mut uhd = MemDisc::new();
+    let udf = build_aacs_fs_with_index(&mut uhd, &uk, Some(b"INDX0300"));
+    for src in [
+        BusOutcome::Handshake(hs_with(false, None)),
+        BusOutcome::Failed(Error::AacsHostCertRejected),
+    ] {
+        let st = vid_only(&udf, &mut uhd, &src).expect("state");
+        assert!(
+            st.bus_encryption,
+            "UHD live drive must assume bus encryption"
+        );
+        let err = super::aacs_verdict(st.bus_encryption, &src);
+        let want = match src {
+            BusOutcome::Failed(_) => crate::error::E_AACS_HOST_CERT_REJECTED,
+            _ => crate::error::E_AACS_BUS_KEY_UNAVAILABLE,
+        };
+        assert_eq!(err.map(|e| e.code()), Some(want));
+    }
+    let iso = vid_only(&udf, &mut uhd, &BusOutcome::FileOrIso).expect("ISO");
+    assert!(super::aacs_verdict(iso.bus_encryption, &BusOutcome::FileOrIso).is_none());
+    for index in [Some(&b"INDX0200"[..]), None] {
+        let mut bd = MemDisc::new();
+        let udf = build_aacs_fs_with_index(&mut bd, &uk, index);
+        let src = BusOutcome::Handshake(hs_with(false, None));
+        let st = vid_only(&udf, &mut bd, &src).expect("state");
+        assert!(
+            super::aacs_verdict(st.bus_encryption, &src).is_none(),
+            "BD / unknown must resolve: {index:?}"
+        );
+    }
+}
+
+/// ISO scan (handshake None) of a bus_encryption disc → Ok. Bus encryption
+/// was already removed at read time; the gate must NOT fire without a
+/// handshake (no UHD-ISO-mux regression).
+#[test]
+fn vid_only_bus_encrypted_iso_no_handshake_ok() {
+    let (mut disc, udf) = disc_with_cert(0x10, true);
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("ISO bus disc → ok");
+    assert!(st.bus_encryption);
+}
+
+/// Live drive whose cert handshake FAILED (handshake None + error) on a bus-encrypted
+/// disc: bus encryption was never removed, so this is not the file/ISO case. The
+/// handshake error must surface as `aacs_error`, alongside the non-secret metadata.
+#[test]
+fn failed_live_handshake_on_bus_encrypted_disc_surfaces_handshake_error() {
+    let (mut disc, udf) = disc_with_cert(0x10, true);
+    let hs_err = Error::AacsNoHostCert {
+        path: "<no host cert>".into(),
+    };
+    let scanned = finish_disc(&mut disc, udf, BusOutcome::Failed(hs_err));
+    // Non-secret triage metadata survives; no keys, so nothing claims decryptability.
+    let a = scanned.aacs.as_ref().expect("AACS metadata kept");
+    assert!(!a.disc_hash.is_empty(), "disc hash must survive");
+    assert_eq!(a.version, 2);
+    assert!(a.bus_encryption);
+    assert!(matches!(
+        scanned.decrypt_keys(),
+        crate::decrypt::DecryptKeys::None
+    ));
+    assert!(
+        matches!(scanned.aacs_error, Some(Error::AacsNoHostCert { .. })),
+        "handshake error must be preserved, got {:?}",
+        scanned.aacs_error
+    );
+}
+
+// Capture a synthetic AACS disc and `finish` it with the given bus outcome.
+fn finish_disc(disc: &mut MemDisc, udf: udf::UdfFs, bus: BusOutcome) -> Disc {
+    let cap = capture(disc, &udf, from_for(&bus)).expect("capture");
+    Disc::finish(
+        disc,
+        10_000,
+        udf,
+        Some((cap, bus)),
+        &ScanOptions::default(),
+        None,
+    )
+    .expect("scan")
+}
+
+// Scan a synthetic AACS disc with the given handshake outcome.
+fn scan_cert_disc(
+    cert_type: u8,
+    bus: bool,
+    hs: Option<HandshakeResult>,
+    hs_err: Option<Error>,
+) -> Disc {
+    let (mut disc, udf) = disc_with_cert(cert_type, bus);
+    let outcome = match (hs, hs_err) {
+        (Some(h), _) => BusOutcome::Handshake(h),
+        (None, Some(e)) => BusOutcome::Failed(e),
+        (None, None) => BusOutcome::FileOrIso,
+    };
+    finish_disc(&mut disc, udf, outcome)
+}
+
+fn no_host_cert() -> Option<Error> {
+    Some(Error::AacsNoHostCert {
+        path: "<no host cert>".into(),
+    })
+}
+
+/// The unlocker matrix must not credit the AACS route when its handshake failed.
+#[test]
+fn unlocker_matrix_aacs_requires_a_working_handshake() {
+    let drive = crate::drive::Drive::from_transport_for_test(Box::new(NullScsi));
+    let aacs_did_work = |d: &Disc| {
+        d.unlocker_matrix(&drive)
+            .into_iter()
+            .find(|(n, _)| *n == "AACS")
+            .map(|(_, w)| w)
+    };
+    let failed = scan_cert_disc(0x10, true, None, no_host_cert());
+    assert_eq!(aacs_did_work(&failed), Some(false));
+    let failed_bus_off = scan_cert_disc(0x00, false, None, no_host_cert());
+    assert_eq!(aacs_did_work(&failed_bus_off), Some(false));
+    let ok = scan_cert_disc(0x10, true, Some(hs_with(false, Some([0x22; 16]))), None);
+    assert_eq!(aacs_did_work(&ok), Some(true));
+}
+
+/// AACS 1.0 (bus off): a failed handshake does not block keys, so it is not recorded;
+/// the gate keeps answering NoDiscKey (7022) and key-source failures can be stamped.
+#[test]
+fn failed_handshake_not_recorded_on_aacs10_disc() {
+    let d = scan_cert_disc(0x00, false, None, no_host_cert());
+    assert!(d.aacs.is_some());
+    assert!(d.aacs_error.is_none(), "{:?}", d.aacs_error);
+    let e = gate(&d).expect_err("no key");
+    assert_eq!(e.code(), crate::error::E_NO_DISC_KEY);
+}
+
+/// A handshake with no bus key and no drive unlock keeps the metadata and
+/// reports AacsBusKeyUnavailable.
+#[test]
+fn handshake_without_bus_key_keeps_metadata_and_reports_error() {
+    let d = scan_cert_disc(0x10, true, Some(hs_with(false, None)), None);
+    let a = d.aacs.as_ref().expect("metadata kept");
+    assert!(!a.disc_hash.is_empty());
+    assert!(matches!(d.aacs_error, Some(Error::AacsBusKeyUnavailable)));
+}
+
+// The public decrypt gate with no key set.
+fn gate(d: &Disc) -> Result<()> {
+    crate::keys::check_decryptable(d, false, None, &crate::keys::KeyScope::WholeDisc)
+}
+
+/// The decrypt gate reports the handshake reason, not a generic NoDiscKey.
+#[test]
+fn decrypt_gate_passes_handshake_errors_through() {
+    let d = scan_cert_disc(0x10, true, None, no_host_cert());
+    let e = gate(&d).expect_err("no key");
+    assert_eq!(e.code(), crate::error::E_AACS_NO_HOST_CERT);
+    let d = scan_cert_disc(0x10, true, None, Some(Error::AacsHostCertRejected));
+    let e = gate(&d).expect_err("no key");
+    assert_eq!(e.code(), crate::error::E_AACS_HOST_CERT_REJECTED);
+}
+
+struct NullScsi;
+impl crate::scsi::ScsiTransport for NullScsi {
+    fn execute(
+        &mut self,
+        _cdb: &[u8],
+        _dir: crate::scsi::DataDirection,
+        _buf: &mut [u8],
+        _timeout_ms: u32,
+    ) -> Result<crate::scsi::ScsiResult> {
+        Ok(crate::scsi::ScsiResult {
+            status: 0,
+            sense: [0u8; 32],
+            bytes_transferred: 0,
+        })
+    }
+}
+
+/// A firmware-unlocked drive with no VID lifted the bus barrier (Unlocker contract):
+/// no error, unlike a failed handshake. An image source (FileOrIso) likewise.
+#[test]
+fn firmware_unlocked_and_image_sources_report_no_bus_error() {
+    for bus in [BusOutcome::FirmwareUnlocked, BusOutcome::FileOrIso] {
+        let (mut disc, udf) = disc_with_cert(0x10, true);
+        let scanned = finish_disc(&mut disc, udf, bus);
+        assert!(scanned.aacs.is_some());
+        assert!(scanned.aacs_error.is_none(), "{:?}", scanned.aacs_error);
+    }
+}
+
+/// AACS 1.0 BD (V10 cert, bus_encryption off) on a live drive with NO
+/// read_data_key → Ok. read_data_key is legitimately absent for AACS 1.0;
+/// the gate must NOT fire when bus_encryption is false.
+#[test]
+fn vid_only_aacs10_live_drive_without_rdk_ok() {
+    let (mut disc, udf) = disc_with_cert(0x00, false);
+    let hs = HandshakeResult {
+        volume_id: [0x11u8; 16],
+        read_data_key: None,
+        read_data_key_err: None,
+        drive_unlocked: false,
+    };
+    let st = vid_only(&udf, &mut disc, &BusOutcome::Handshake(hs)).expect("AACS 1.0 → ok");
+    assert!(!st.bus_encryption);
+}
+
+/// With NO handshake, volume_id defaults to all-zero (encrypt.rs
+/// `.unwrap_or([0u8; 16])`) and read_data_key is None.
+#[test]
+fn vid_only_no_handshake_zero_vid() {
+    let mut disc = MemDisc::new();
+    let udf = build_aacs_fs(
+        &mut disc,
+        &[AacsFile {
+            name: "Unit_Key_RO.inf",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: vec![0xAB; 32],
+        }],
+    );
+    let st = vid_only(&udf, &mut disc, &BusOutcome::FileOrIso).expect("state");
+    assert_eq!(st.volume_id, [0u8; 16]);
+}
+
+/// `handshake_has_volume_id` treats an all-zero Volume ID as absent and
+/// any non-zero Volume ID as present.
+#[test]
+fn handshake_has_volume_id_reports_presence_not_absence() {
+    let with_vid = HandshakeResult {
+        volume_id: [0x11u8; 16],
+        read_data_key: None,
+        read_data_key_err: None,
+        drive_unlocked: false,
+    };
+    assert!(
+        super::handshake_has_volume_id(&with_vid),
+        "a non-zero Volume ID must report as PRESENT"
+    );
+
+    let without = HandshakeResult {
+        volume_id: [0u8; 16],
+        ..with_vid
+    };
+    assert!(
+        !super::handshake_has_volume_id(&without),
+        "an all-zero Volume ID is the absent case"
+    );
+
+    // One bit of difference is still a VID: the check is != all-zero, not a
+    // heuristic about how much of it looks populated.
+    let mut barely = [0u8; 16];
+    barely[15] = 1;
+    assert!(
+        super::handshake_has_volume_id(&HandshakeResult {
+            volume_id: barely,
+            ..with_vid
+        }),
+        "any non-zero byte makes a Volume ID present"
+    );
+}
+
+/// The policy: a handshake error always wins; otherwise bus encryption left in
+/// place is AacsBusKeyUnavailable; otherwise no error.
+#[test]
+fn aacs_verdict_policy() {
+    use super::{BusOutcome as B, aacs_verdict as verdict};
+    assert!(matches!(
+        verdict(true, &B::Handshake(hs_with(false, None))),
+        Some(Error::AacsBusKeyUnavailable)
+    ));
+    assert!(verdict(true, &B::Handshake(hs_with(false, Some([0x22; 16])))).is_none());
+    assert!(verdict(true, &B::Handshake(hs_with(true, None))).is_none());
+    assert!(verdict(true, &B::FileOrIso).is_none());
+    assert!(verdict(true, &B::FirmwareUnlocked).is_none());
+    assert!(matches!(
+        verdict(true, &B::Failed(Error::AacsHostCertRejected)),
+        Some(Error::AacsHostCertRejected)
+    ));
+    // Bus off: a failed handshake blocks nothing, so it is not recorded.
+    assert!(verdict(false, &B::Failed(Error::AacsHostCertRejected)).is_none());
+}
+
+// Tests: read_vid_oem and collect_host_certs coverage notes.
+
+fn fake_cert(tag: u8) -> aacs::types::HostCert {
+    aacs::types::HostCert {
+        private_key: [tag; 20],
+        certificate: vec![tag; 92],
+        private_key_v2: None,
+        certificate_v2: None,
+    }
+}
+
+/// A minimal in-test KeySource that yields no keys but a fixed cert list.
+struct CertSource(Vec<aacs::types::HostCert>);
+impl crate::KeySource for CertSource {
+    fn get_unit_keys(
+        &self,
+        _ctx: &dyn crate::keysource::ResolveCtx,
+    ) -> Result<Vec<crate::aacs::types::UnitKey>> {
+        Ok(Vec::new())
+    }
+    fn host_certs(&self, _mkb: Option<u32>) -> Vec<aacs::types::HostCert> {
+        self.0.clone()
+    }
+}
+
+#[test]
+fn collect_host_certs_empty_when_no_credentials_no_sources() {
+    let opts = ScanOptions::default();
+    assert!(Disc::collect_host_certs(&opts, None).is_empty());
+}
+
+/// A transport that counts every SCSI command issued (via a shared counter
+/// that outlives the drive, so the count can be read before `Drive::drop`'s
+/// tray-unlock cleanup runs). Returns a benign CHECK CONDITION.
+struct CountingTransport(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl crate::scsi::ScsiTransport for CountingTransport {
+    fn execute(
+        &mut self,
+        _cdb: &[u8],
+        _direction: crate::scsi::DataDirection,
+        _data: &mut [u8],
+        _timeout_ms: u32,
+    ) -> crate::Result<crate::scsi::ScsiResult> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::scsi::ScsiResult {
+            status: 2,
+            bytes_transferred: 0,
+            sense: [0u8; 32],
+        })
+    }
+}
+
+/// Anti-poison guard: when a FIRMWARE unlocker claimed the drive at init()
+/// but stashed no Volume ID, `do_handshake_cert` returns `(None, None)`
+/// WITHOUT running the AACS host-cert handshake — whose REPORT KEY AGID cycle
+/// would poison the drive so every later bare `0xAD` VID read aborts until the
+/// medium is reloaded. An unlocker that is picked does not fall through to
+/// another. Red-before-green: without the guard, the cert route's MKB read
+/// fires and the SCSI count is non-zero.
+#[test]
+fn firmware_claimed_no_vid_skips_cert_handshake_and_issues_no_scsi() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let scsi_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(CountingTransport(
+        scsi_count.clone(),
+    )));
+    drive.set_unlocker_name_for_test("freemkv");
+    let opts = ScanOptions::default();
+    let r = Disc::do_handshake_cert(&mut drive, &opts);
+    // Read the count BEFORE `drive` drops (Drop::cleanup issues a tray-unlock).
+    assert_eq!(
+        scsi_count.load(SeqCst),
+        0,
+        "the guard must issue NO SCSI on a firmware-claimed drive with no VID"
+    );
+    assert!(
+        matches!(r, Ok(CertRoute::FirmwareUnlocked)),
+        "a firmware unlocker with no VID is a claim, not an error — a key source may still supply the key"
+    );
+}
+
+#[test]
+fn collect_host_certs_from_credentials_only() {
+    let opts = ScanOptions {
+        credentials: Some(crate::DriveCredentials {
+            host_certs: vec![fake_cert(1)],
+        }),
+        ..Default::default()
+    };
+    let certs = Disc::collect_host_certs(&opts, None);
+    assert_eq!(certs.len(), 1);
+    assert_eq!(certs[0].private_key, [1u8; 20]);
+}
+
+#[test]
+fn collect_host_certs_from_key_source_only() {
+    let opts = ScanOptions {
+        key_sources: vec![Box::new(CertSource(vec![fake_cert(2)]))],
+        ..Default::default()
+    };
+    let certs = Disc::collect_host_certs(&opts, None);
+    assert_eq!(certs.len(), 1);
+    assert_eq!(certs[0].private_key, [2u8; 20]);
+}
+
+/// The two routes union: a cert in credentials AND one in a key source both
+/// reach the handshake.
+#[test]
+fn collect_host_certs_unions_credentials_and_sources() {
+    let opts = ScanOptions {
+        credentials: Some(crate::DriveCredentials {
+            host_certs: vec![fake_cert(1)],
+        }),
+        key_sources: vec![
+            Box::new(CertSource(vec![fake_cert(2)])),
+            Box::new(CertSource(vec![])), // a source with no cert (e.g. online stub)
+            Box::new(CertSource(vec![fake_cert(3)])),
+        ],
+        ..Default::default()
+    };
+    let mut tags: Vec<u8> = Disc::collect_host_certs(&opts, None)
+        .iter()
+        .map(|c| c.private_key[0])
+        .collect();
+    tags.sort_unstable();
+    assert_eq!(tags, vec![1, 2, 3]);
+}
+
+// Cert-route outcome mapping: a dead bus is split out (it aborts the scan), every
+// other failure maps to a recorded Error and a trace step. No English in either.
+#[test]
+fn unlock_errors_split_transport_from_recorded_failures() {
+    use freemkv_unlock::UnlockError as U;
+    assert_eq!(CertFail::from(U::Transport), CertFail::Transport);
+    let recorded = |u: U| match CertFail::from(u) {
+        CertFail::Other(f) => f,
+        CertFail::Transport => panic!("only Transport is a dead bus"),
+    };
+    // All-broken cert list (never reached the drive) is its own error —
+    // distinct from truly having no cert to offer at all.
+    assert!(matches!(
+        unlock_error_to_error(recorded(U::NoUsableHostCert)),
+        Error::AacsNoUsableHostCert
+    ));
+    match unlock_error_to_error(CertUnlockFailure::NoHostCert) {
+        Error::AacsNoHostCert { path } => assert_eq!(path, "<no host cert>"),
+        other => panic!("expected AacsNoHostCert, got {other:?}"),
+    }
+    assert!(matches!(
+        unlock_error_to_error(recorded(U::VidUnavailable)),
+        Error::AacsVidUnavailable
+    ));
+    for u in [U::HandshakeRejected, U::NotApplicable] {
+        assert!(matches!(
+            unlock_error_to_error(recorded(u)),
+            Error::AacsHostCertRejected
+        ));
+    }
+}
+
+#[test]
+fn cert_unlock_outcome_maps_to_structured_trace_step() {
+    use crate::aacs::trace::UnlockOutcome;
+    assert_eq!(
+        cert_unlock_outcome(CertUnlockFailure::NoHostCert),
+        UnlockOutcome::NoUsableHostCert { mkb: None }
+    );
+    assert_eq!(
+        cert_unlock_outcome(CertUnlockFailure::VidUnavailable),
+        UnlockOutcome::VidUnavailable
+    );
+    assert_eq!(
+        cert_unlock_outcome(CertUnlockFailure::Rejected),
+        UnlockOutcome::HandshakeRejected
+    );
+}
+
+// ---------------------------------------------------------------
+// Tests: do_handshake_cert route selection (OEM VID vs cert)
+// ---------------------------------------------------------------
+
+/// OEM-VID short-circuit: when an unlocker stashed the disc's Volume ID at
+/// `init()` (`oem_vid` is `Some`), `do_handshake_cert` returns that VID and
+/// SKIPS the AACS host-cert handshake entirely — no SCSI is issued (contrast
+/// the cert route, which reads the MKB). The result credits `drive_unlocked`
+/// (bus encryption removed AT THE DRIVE) but carries NO `read_data_key`: the
+/// AACS-2.0 "VID served, but no bus key from this path" case the bus-key gate
+/// must later surface. Red-before-green: without the short-circuit the cert
+/// route fires and the SCSI count is non-zero.
+#[test]
+fn oem_vid_short_circuits_cert_handshake_with_drive_unlocked_and_no_rdk() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let scsi_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(CountingTransport(
+        scsi_count.clone(),
+    )));
+    let vid = [0x7Au8; 16];
+    drive.set_oem_vid_for_test(vid);
+    let opts = ScanOptions::default();
+    let r = Disc::do_handshake_cert(&mut drive, &opts);
+    // Read the count BEFORE `drive` drops (Drop::cleanup issues a tray-unlock).
+    assert_eq!(
+        scsi_count.load(SeqCst),
+        0,
+        "the OEM-VID short-circuit must issue NO SCSI (the cert route is skipped)"
+    );
+    let Ok(CertRoute::Handshake(hs)) = r else {
+        panic!("an OEM VID is a success, not an error");
+    };
+    assert_eq!(hs.volume_id, vid, "the stashed OEM VID must propagate");
+    assert!(
+        hs.drive_unlocked,
+        "an OEM VID means the drive is unlocked at the drive (firmware)"
+    );
+    assert_eq!(
+        hs.read_data_key, None,
+        "the OEM/VID-only path never produces a read_data_key"
+    );
+    assert_eq!(
+        hs.read_data_key_err, None,
+        "None here is 'not attempted', not a read failure — no error code"
+    );
+}
+
+/// With no unlocker and no host cert the cert route runs host-side only: no SCSI
+/// (no drive MKB read), folding to AacsNoHostCert. The AKE itself is pinned by
+/// `scan_order_tests::no_unlocker_runs_cert_route_and_issues_ake`.
+#[test]
+fn no_unlocker_and_no_cert_issues_no_scsi() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let scsi_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(CountingTransport(
+        scsi_count.clone(),
+    )));
+    let r = Disc::do_handshake_cert(&mut drive, &ScanOptions::default());
+    assert_eq!(scsi_count.load(SeqCst), 0);
+    assert!(matches!(
+        r,
+        Err(CertFail::Other(CertUnlockFailure::NoHostCert))
+    ));
+}
+
+// ---------------------------------------------------------------
+// Tests: bus_encryption_removed — the single source of truth
+// ---------------------------------------------------------------
+
+fn hs_with(drive_unlocked: bool, rdk: Option<[u8; 16]>) -> HandshakeResult {
+    HandshakeResult {
+        volume_id: [0x11u8; 16],
+        read_data_key: rdk,
+        read_data_key_err: None,
+        drive_unlocked,
+    }
+}
+
+/// `bus_encryption_removed` is the single gate; one case per `BusSource`.
+#[test]
+fn bus_encryption_removed_covers_all_paths() {
+    use super::{BusSource as B, bus_encryption_removed as removed};
+    let plain = hs_with(false, None);
+    let rdk = hs_with(false, Some([0x22u8; 16]));
+    let unlocked = hs_with(true, None);
+    let both = hs_with(true, Some([0x22u8; 16]));
+
+    // Never bus-encrypted: nothing to remove, whatever the source.
+    for src in [
+        B::FileOrIso,
+        B::HandshakeFailed,
+        B::FirmwareUnlocked,
+        B::Handshake(&plain),
+    ] {
+        assert!(removed(false, src));
+    }
+    // Bus-encrypted:
+    assert!(removed(true, B::FileOrIso), "image: clear at read time");
+    assert!(
+        removed(true, B::FirmwareUnlocked),
+        "unlocker lifted the barrier"
+    );
+    assert!(
+        !removed(true, B::HandshakeFailed),
+        "failed handshake removes nothing"
+    );
+    assert!(removed(true, B::Handshake(&rdk)), "AKE bus key");
+    assert!(
+        removed(true, B::Handshake(&unlocked)),
+        "removed at the drive"
+    );
+    assert!(removed(true, B::Handshake(&both)));
+    assert!(!removed(true, B::Handshake(&plain)), "wrong-keys guard");
+}
+
+#[test]
+fn bus_outcome_source_encodes_each_route() {
+    use super::{BusOutcome as O, BusSource as B};
+    assert!(matches!(
+        O::Handshake(hs_with(false, None)).source(),
+        B::Handshake(_)
+    ));
+    assert!(matches!(
+        O::Failed(Error::AacsHostCertRejected).source(),
+        B::HandshakeFailed
+    ));
+    assert!(matches!(O::FirmwareUnlocked.source(), B::FirmwareUnlocked));
+    assert!(matches!(O::FileOrIso.source(), B::FileOrIso));
+}
+
+/// A handshake that carries a VID but `read_data_key: None` must still surface
+/// the VID onto the state. On a non-bus-encrypted disc (so the bus-key gate
+/// does not fire) the VID propagates; the bus key itself no longer lives on
+/// AacsState — it feeds the drive's single de-bus point via the handshake.
+#[test]
+fn vid_only_surfaces_vid_with_absent_read_data_key() {
+    let (mut disc, udf) = disc_with_cert(0x00, false); // V10, bus off
+    let vid = [0x33u8; 16];
+    let hs = HandshakeResult {
+        volume_id: vid,
+        read_data_key: None,
+        read_data_key_err: None,
+        drive_unlocked: false,
+    };
+    let st = vid_only(&udf, &mut disc, &BusOutcome::Handshake(hs)).expect("state");
+    assert_eq!(
+        st.volume_id, vid,
+        "the VID must propagate even without an RDK"
+    );
+}

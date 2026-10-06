@@ -1,0 +1,266 @@
+use super::*;
+use crate::pes::{PesSink as _, PesSource as _};
+
+// The pub type keeps the auto traits it had when it held Stdin/Stdout.
+#[test]
+fn stdio_stream_is_send_and_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<StdioStream>();
+}
+
+fn title_with_codec_privates() -> DiscTitle {
+    use crate::disc::{Codec, Stream, VideoStream};
+    let mut t = DiscTitle::empty();
+    t.playlist = "StdioTitle".into();
+    t.streams.push(Stream::Video(VideoStream {
+        pid: 0x1011,
+        codec: Codec::Hevc,
+        resolution: crate::disc::Resolution::R2160p,
+        frame_rate: crate::disc::FrameRate::F23_976,
+        hdr: crate::disc::HdrFormat::Hdr10,
+        color_space: crate::disc::ColorSpace::Bt2020,
+        display_aspect: None,
+        secondary: false,
+        label: String::new(),
+        measured_cicp: None,
+    }));
+    // Index 0 = the video stream's codec init data.
+    t.codec_privates = vec![Some(vec![0xDE, 0xAD, 0xBE, 0xEF])];
+    t
+}
+
+// write() on an input stream must error StreamReadOnly without touching
+// stdin/stdout (writer.is_none() guard short-circuits header logic),
+// not silently discard frames.
+#[test]
+fn write_on_input_stream_is_read_only_error() {
+    let mut s = StdioStream::input();
+    let frame = crate::pes::PesFrame {
+        discard_padding_ns: 0,
+        coding: None,
+        source: None,
+        track: 0,
+        pts: 0,
+        keyframe: true,
+        data: vec![1, 2, 3],
+        duration_ns: None,
+    };
+    let err = s.write(&frame).expect_err("write on input must error");
+    // E_STREAM_READ_ONLY (9000) maps to Unsupported.
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+}
+
+// read() on an output stream must error StreamWriteOnly;
+// ensure_header_read is a no-op when reader is None, so this
+// never blocks on real stdin.
+#[test]
+fn read_on_output_stream_is_write_only_error() {
+    let mut s = StdioStream::output(&DiscTitle::empty());
+    let err = s.read().expect_err("read on output must error");
+    // E_STREAM_WRITE_ONLY (9001) maps to Unsupported.
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+}
+
+// The write side has the title up front, so headers_ready() must be
+// true immediately — the MKV writer starts the container header
+// without waiting for a (nonexistent) read-side header parse.
+#[test]
+fn output_headers_ready_immediately() {
+    let s = StdioStream::output(&DiscTitle::empty());
+    assert!(s.headers_ready(), "write side is always header-ready");
+}
+
+// A fresh input side has not parsed any header yet, so headers_ready()
+// must be false; claiming readiness early would starve the MKV
+// writer of codec init data.
+#[test]
+fn input_not_header_ready_before_any_read() {
+    let s = StdioStream::input();
+    assert!(
+        !s.headers_ready(),
+        "read side not ready until header parsed"
+    );
+}
+
+/// codec_private(track) on the write side returns the title's own
+/// codec_private for that track (single source of truth = the title).
+#[test]
+fn output_codec_private_comes_from_title() {
+    let s = StdioStream::output(&title_with_codec_privates());
+    assert_eq!(
+        s.codec_private(0).as_deref(),
+        Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]),
+        "track 0 codec_private must mirror title.codec_privates[0]"
+    );
+    // Out-of-range track → None (no panic, no wrong-track data).
+    assert_eq!(s.codec_private(99), None);
+}
+
+/// A fresh input stream defaults to an empty title until a header is
+/// parsed — info() must not invent stream metadata.
+#[test]
+fn input_default_title_is_empty() {
+    let s = StdioStream::input();
+    assert!(s.info().streams.is_empty());
+    assert_eq!(s.codec_private(0), None);
+}
+
+fn frame(data: &[u8]) -> crate::pes::PesFrame {
+    crate::pes::PesFrame {
+        discard_padding_ns: 0,
+        coding: None,
+        source: None,
+        track: 0,
+        pts: 7,
+        keyframe: true,
+        data: data.to_vec(),
+        duration_ns: None,
+    }
+}
+
+fn reader(bytes: Vec<u8>) -> StdioStream {
+    StdioStream::from_reader(Box::new(io::Cursor::new(bytes)))
+}
+
+fn code(e: &io::Error) -> Option<u16> {
+    crate::error::error_code(e)
+}
+
+#[derive(Clone, Default)]
+struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl Write for Shared {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// Write side -> read side over the FMKV wire: header parsed on the first read (title,
+// codec_private, timing), headers_ready only after it, timing frozen once written.
+#[test]
+fn header_round_trips_and_gates_readiness() {
+    let out = Shared::default();
+    let mut w = StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+    let timing = crate::pes::TrackTiming {
+        codec_delay_ns: 5,
+        seek_preroll_ns: 9,
+    };
+    w.set_track_timing(0, timing).unwrap();
+    w.write(&frame(&[1, 2, 3])).unwrap();
+    let e = w.set_track_timing(0, timing).unwrap_err();
+    assert_eq!(code(&e), Some(crate::error::E_STREAM_HEADER_WRITTEN));
+    w.finish().unwrap();
+
+    let mut r = reader(out.0.lock().unwrap().clone());
+    assert!(!r.headers_ready());
+    let f = r.read().unwrap().unwrap();
+    assert_eq!((f.pts, f.data), (7, vec![1, 2, 3]));
+    assert!(r.headers_ready());
+    assert_eq!(r.info().playlist, "StdioTitle");
+    assert_eq!(r.codec_private(0), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    assert_eq!(r.track_timing(0), timing);
+    assert!(r.read().unwrap().is_none());
+}
+
+// A zero-frame title still puts the header on the wire: the reader sees the title.
+#[test]
+fn finish_without_frames_still_writes_the_header() {
+    let out = Shared::default();
+    let mut w = StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+    w.finish().unwrap();
+    let mut r = reader(out.0.lock().unwrap().clone());
+    r.prime().unwrap();
+    assert_eq!(r.info().playlist, "StdioTitle");
+    assert!(r.read().unwrap().is_none());
+}
+
+// Frame framing follows the header: with no timing set (v1) frames carry no padding field
+// and read back whole; with a timing set (v2) the DiscardPadding survives.
+#[test]
+fn frame_padding_follows_the_header_version() {
+    let round_trip = |timed: bool, padding: i64| {
+        let out = Shared::default();
+        let mut w = StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+        if timed {
+            let timing = crate::pes::TrackTiming {
+                codec_delay_ns: 5,
+                seek_preroll_ns: 9,
+            };
+            w.set_track_timing(0, timing).unwrap();
+        }
+        let mut f = frame(&[1, 2, 3]);
+        f.discard_padding_ns = padding;
+        w.write(&f).unwrap();
+        w.write(&frame(&[4, 5])).unwrap();
+        w.finish().unwrap();
+        let mut r = reader(out.0.lock().unwrap().clone());
+        let a = r.read().unwrap().unwrap();
+        let b = r.read().unwrap().unwrap();
+        assert!(r.read().unwrap().is_none());
+        (a.discard_padding_ns, a.data, b.data)
+    };
+    assert_eq!(round_trip(false, 0), (0, vec![1, 2, 3], vec![4, 5]));
+    assert_eq!(
+        round_trip(true, -2_500_000),
+        (-2_500_000, vec![1, 2, 3], vec![4, 5])
+    );
+}
+
+// prime() reads the header up front: info() is the stream's title before any frame,
+// and the first read still returns the first frame.
+#[test]
+fn prime_reads_the_header_before_the_first_frame() {
+    let out = Shared::default();
+    let mut w = StdioStream::from_writer(&title_with_codec_privates(), Box::new(out.clone()));
+    w.write(&frame(&[1, 2, 3])).unwrap();
+    w.finish().unwrap();
+
+    let mut r = reader(out.0.lock().unwrap().clone());
+    assert_eq!(r.info().streams.len(), 0);
+    r.prime().unwrap();
+    assert_eq!(r.info().playlist, "StdioTitle");
+    assert_eq!(
+        r.info().streams.len(),
+        title_with_codec_privates().streams.len()
+    );
+    let f = r.read().unwrap().unwrap();
+    assert_eq!(f.data, vec![1, 2, 3]);
+}
+
+// A zero-byte stdin is a clean headerless end, and never header-ready.
+#[test]
+fn empty_input_is_clean_eof_not_ready() {
+    let mut r = reader(Vec::new());
+    assert!(r.read().unwrap().is_none());
+    assert!(!r.headers_ready(), "no header was parsed");
+}
+
+// Bytes that are not an FMKV header were consumed from a non-rewindable stream, so the
+// frames after them cannot be aligned: NoMetadata, not a misread frame.
+#[test]
+fn non_fmkv_input_is_no_metadata() {
+    for lead in [&[0x00u8][..], b"FMKX\0\x01\0\0"] {
+        let mut bytes = lead.to_vec();
+        frame(&[4, 5]).serialize(&mut bytes).unwrap();
+        let e = reader(bytes).read().unwrap_err();
+        assert_eq!(code(&e), Some(crate::error::E_NO_METADATA), "{lead:?}");
+    }
+}
+
+// A header that failed mid-way is not skipped on a retry: the next read must not parse
+// the rest of the header region as frames.
+#[test]
+fn failed_header_is_not_retried_as_frames() {
+    let mut bytes = b"FMKV\0\x01\0\0".to_vec();
+    bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // over the JSON size cap
+    frame(&[4, 5]).serialize(&mut bytes).unwrap();
+    let mut r = reader(bytes);
+    assert_eq!(
+        code(&r.read().unwrap_err()),
+        Some(crate::error::E_NO_METADATA)
+    );
+    assert!(r.read().is_err(), "retry must not yield a frame");
+}
