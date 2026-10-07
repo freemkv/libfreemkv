@@ -50,7 +50,7 @@
 //! `--features keyproof`, where the symbol is intentionally present).
 
 /// With `keyproof` OFF, `aacs::content::unit_key_opens` must not exist:
-/// ```compile_fail
+/// ```compile_fail,E0425
 /// libfreemkv::aacs::content::unit_key_opens(
 ///     &[0u8; 6144], &[0u8; 16], libfreemkv::disc::ContentFormat::BdTs);
 /// ```

@@ -1301,3 +1301,109 @@ fn ts_unit_key_opens_matches_decrypt_unit_then_is_clean() {
         );
     }
 }
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// A flagged, encrypted BD-TS unit whose packets mix synced content, header-only and
+/// zero-sync packets, zero-ciphertext padding and stray corruption, as seeded by `state`.
+fn mixed_encrypted_unit(state: &mut u64, key: &[u8; 16]) -> Vec<u8> {
+    const PKT: usize = BD_SOURCE_PACKET_BYTES;
+    let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+    let mut kinds = Vec::new();
+    for p in 0..ALIGNED_UNIT_LEN / PKT {
+        let off = p * PKT;
+        let kind = xorshift(state) % 5;
+        kinds.push(kind);
+        match kind {
+            0 | 1 => {
+                unit[off + 4] = TS_SYNC;
+                for b in &mut unit[off + 5..off + PKT] {
+                    *b = xorshift(state) as u8;
+                }
+            }
+            2 => unit[off + 4] = TS_SYNC,
+            3 => unit[off + 4 + 1 + (xorshift(state) as usize % (PKT - 5))] = 1,
+            _ => {}
+        }
+    }
+    aacs_encrypt_unit(&mut unit, key);
+    for (p, &kind) in kinds.iter().enumerate().skip(1) {
+        if kind == 4 && xorshift(state).is_multiple_of(2) {
+            unit[p * PKT..(p + 1) * PKT].fill(0);
+        }
+    }
+    if xorshift(state).is_multiple_of(4) {
+        let i = 16 + xorshift(state) as usize % (ALIGNED_UNIT_LEN - 16);
+        unit[i] ^= 1 + xorshift(state) as u8 % 255;
+    }
+    unit
+}
+
+// Seeded differential: the fast path's packet counts and verdict match `decrypt_unit`'s over
+// padding, header-only and zero-sync packets and corruption, for right and wrong keys.
+#[test]
+fn ts_unit_key_opens_matches_the_full_path_on_mixed_units() {
+    let fmt = crate::disc::ContentFormat::BdTs;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..400 {
+        let mut right = [0u8; 16];
+        right
+            .iter_mut()
+            .for_each(|b| *b = xorshift(&mut state) as u8);
+        let enc = mixed_encrypted_unit(&mut state, &right);
+        let mut wrong = right;
+        wrong[xorshift(&mut state) as usize % 16] ^= 0x80;
+        for key in [right, wrong] {
+            let mut full = enc.clone();
+            decrypt_unit(&mut full, &key);
+            assert_eq!(ts_unit_key_proof(&enc, &key), ts_packet_counts(&full));
+            assert_eq!(ts_unit_key_opens(&enc, &key), is_clean(&full, fmt));
+        }
+    }
+}
+
+#[cfg(feature = "keyproof")]
+#[test]
+fn unit_key_opens_answers_only_for_a_provable_encrypted_bd_ts_unit() {
+    use crate::disc::ContentFormat::{BdTs, MpegPs};
+    let right = [0x5Au8; 16];
+    let mut enc = clear_unit();
+    for (i, b) in enc.iter_mut().enumerate() {
+        if i % BD_SOURCE_PACKET_BYTES > 4 {
+            *b = (i as u8).wrapping_mul(7) | 1;
+        }
+    }
+    aacs_encrypt_unit(&mut enc, &right);
+    assert!(unit_key_opens(&enc, &right, BdTs));
+    for n in 0..64u8 {
+        assert!(!unit_key_opens(&enc, &[n; 16], BdTs), "wrong key {n}");
+    }
+    assert!(
+        !unit_key_opens(&enc, &right, MpegPs),
+        "only BD-TS is answered"
+    );
+    let mut clear_flag = enc.clone();
+    clear_flag[0] &= 0x3F;
+    assert!(!unit_key_opens(&clear_flag, &right, BdTs), "a clear unit");
+    for len in [0, 383, ALIGNED_UNIT_LEN - 1] {
+        assert!(!unit_key_opens(&enc[..len], &right, BdTs), "{len} bytes");
+    }
+    let mut zero = vec![0u8; ALIGNED_UNIT_LEN];
+    zero[0] = 0xC0;
+    assert!(
+        !unit_key_opens(&zero, &right, BdTs),
+        "no content proves nothing"
+    );
+    // Three content packets, the rest zero-ciphertext padding: too little to prove a key.
+    let mut thin = enc.clone();
+    thin[4 * BD_SOURCE_PACKET_BYTES..].fill(0);
+    assert!(
+        !unit_key_opens(&thin, &right, BdTs),
+        "below the proof floor"
+    );
+}

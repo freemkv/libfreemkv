@@ -156,6 +156,12 @@ pub fn is_clean(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
 // Structural "does this unit carry enough valid MPEG-TS to prove a key opened it?" (the mux's
 // key-selection/verify signal): synced >= min(E, KEY_PROOF_PACKETS) over non-padding packets.
 fn is_clean_ts(unit: &[u8]) -> bool {
+    let (content, synced) = ts_packet_counts(unit);
+    content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
+}
+
+// `(content, synced)`: non-padding packets after packet 0, and those whose sync byte is 0x47.
+fn ts_packet_counts(unit: &[u8]) -> (usize, usize) {
     const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
     let limit = ALIGNED_UNIT_LEN.min(unit.len());
     let mut content = 0usize;
@@ -173,13 +179,14 @@ fn is_clean_ts(unit: &[u8]) -> bool {
         }
         off += PKT;
     }
-    content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
+    (content, synced)
 }
 
-/// Does `unit_key` open this encrypted AACS aligned `unit`? One bit, never plaintext.
-/// BD-TS 6144-byte units take the decrypt-less TS-sync check (`ts_unit_key_opens`, only
-/// the proof blocks are touched); Program-Stream and other lengths fall back to the full
-/// [`decrypt_unit`] + [`is_clean`].
+/// Does `unit_key` open this encrypted BD-TS aligned `unit`? One bit, never plaintext.
+/// `true` only for a whole 6144-byte unit flagged encrypted whose plaintext would carry
+/// at least `KEY_PROOF_PACKETS` content packets, all synced: anything else proves nothing
+/// and is `false` (other formats, short or clear units, too little content). A wrong key
+/// passes about once in 10^5 units, so confirm a match on several units.
 ///
 /// Behind the `keyproof` feature so the default public API still cannot decrypt AACS: a
 /// key oracle, not a decryptor (KU §2.2; see `keys::public_api_cannot_decrypt_aacs`).
@@ -190,24 +197,31 @@ pub fn unit_key_opens(
     format: crate::disc::ContentFormat,
 ) -> bool {
     use crate::disc::ContentFormat;
-    if matches!(format, ContentFormat::BdTs) && unit.len() == ALIGNED_UNIT_LEN {
-        return ts_unit_key_opens(unit, unit_key);
+    if !matches!(format, ContentFormat::BdTs)
+        || unit.len() != ALIGNED_UNIT_LEN
+        || !aacs_unit_encrypted(unit, format)
+    {
+        return false;
     }
-    // PS / non-standard length: full decrypt into a scratch copy, then structural check.
-    let mut scratch = unit.to_vec();
-    decrypt_unit(&mut scratch, unit_key);
-    is_clean(&scratch, format)
+    let (content, synced) = ts_unit_key_proof(unit, unit_key);
+    content >= KEY_PROOF_PACKETS && synced >= KEY_PROOF_PACKETS
 }
 
-/// BD-TS fast path of `unit_key_opens`: the same verdict as `decrypt_unit` +
-/// `is_clean(BdTs)` from one AES block per source packet. CBC decrypts any block alone
+/// [`is_clean_ts`]'s verdict for `decrypt_unit(unit, unit_key)`, from the packet counts of
+/// `ts_unit_key_proof`.
+#[cfg(test)]
+fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
+    let (content, synced) = ts_unit_key_proof(unit, unit_key);
+    content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
+}
+
+/// The `(content, synced)` counts `ts_packet_counts` would see after `decrypt_unit`, from
+/// one AES block per source packet. CBC decrypts any block alone
 /// (`P[i] = AES_dec(C[i]) ⊕ C[i-1]`), and packet heads sit at block-aligned offsets ≥ 192.
 /// Packet 0 is skipped (its sync byte is in the clear seed), as are all-zero padding
-/// packets, which `decrypt_unit` zeroes. Verdict mirrors [`is_clean_ts`]:
-/// `synced >= min(content, KEY_PROOF_PACKETS)`. `dead_code` is allowed so the
-/// equivalence test covers it without `keyproof`.
-#[allow(dead_code)]
-fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
+/// packets, which `decrypt_unit` zeroes.
+#[cfg(any(test, feature = "keyproof"))]
+fn ts_unit_key_proof(unit: &[u8], unit_key: &[u8; 16]) -> (usize, usize) {
     use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
     use aes::{Aes128, Block};
     const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
@@ -223,7 +237,7 @@ fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
         *b ^= s;
     }
     let cipher = Aes128::new(&bk);
-    // Plaintext of the 16-byte block at `o` (o ≥ 32, so C[i-1] is ciphertext).
+    // Plaintext of the 16-byte block at `o` (o ≥ 192, so C[i-1] is ciphertext).
     let plain = |o: usize| {
         let mut b = block_at(o);
         cipher.decrypt_block(&mut b);
@@ -268,7 +282,7 @@ fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
             _ => content += 1,
         }
     }
-    content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
+    (content, synced)
 }
 
 /// Count the MPEG-TS sync bytes (`0x47`) present at the BD-TS packet stride
