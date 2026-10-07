@@ -82,6 +82,8 @@ jobs:
         working-directory: libfreemkv
       - run: cargo +stable clippy --all-targets -- -D warnings
         working-directory: libfreemkv
+      - run: cargo +stable clippy --all-targets --features keyproof -- -D warnings
+        working-directory: libfreemkv
 
   test:
     needs: resolve-msrv
@@ -106,6 +108,9 @@ jobs:
         working-directory: libfreemkv
       # `--tests` skips doctests; the keys compile_fail doctests enforce spec LK19.
       - run: cargo test --doc
+        working-directory: libfreemkv
+      # `keyproof` is off by default, so its oracle compiles and is tested only here.
+      - run: cargo test --lib --features keyproof aacs::content
         working-directory: libfreemkv
 
   # The memory orderings in `scsi::fd_handoff` (and `halt`) compile to the same instructions

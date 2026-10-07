@@ -1255,11 +1255,8 @@ fn ts_packet_total_for_various_lengths() {
     assert_eq!(ts_packet_total(&[0u8; ALIGNED_UNIT_LEN]), 32);
 }
 
-// The decrypt-less BD-TS fast path `ts_unit_key_opens` (the brute's hot reject,
-// moved down from kdb) must return the EXACT same verdict as the full
-// `decrypt_unit` + `is_clean(BdTs)`, for the RIGHT key and for wrong keys alike —
-// or `unit_key_opens` would silently disagree with a real decrypt. This pins the
-// two together so a change to either side can't desync them.
+// The decrypt-less BD-TS path `ts_unit_key_opens` returns the same verdict as
+// `decrypt_unit` + `is_clean(BdTs)` for the right key and wrong keys alike.
 #[test]
 fn ts_unit_key_opens_matches_decrypt_unit_then_is_clean() {
     let fmt = crate::disc::ContentFormat::BdTs;
@@ -1284,7 +1281,10 @@ fn ts_unit_key_opens_matches_decrypt_unit_then_is_clean() {
         is_clean(&u, fmt)
     };
 
-    assert!(full(&right), "sanity: the right key opens via the full path");
+    assert!(
+        full(&right),
+        "sanity: the right key opens via the full path"
+    );
     assert_eq!(
         ts_unit_key_opens(&enc, &right),
         full(&right),

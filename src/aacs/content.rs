@@ -176,20 +176,19 @@ fn is_clean_ts(unit: &[u8]) -> bool {
     content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
 }
 
-/// Does `unit_key` open this encrypted AACS aligned `unit`? Returns one bit —
-/// key right or wrong — and NEVER plaintext. The single authoritative answer to
-/// "did this candidate key prove out against a sample unit", shared by the mux's
-/// key selection/verify and by an offline key-resolver (kdb's `/decode`). BD-TS
-/// 6144-byte units take the decrypt-less TS-sync fast reject ([`ts_unit_key_opens`],
-/// only the proof blocks are touched); Program-Stream and non-standard lengths
-/// fall back to the full [`decrypt_unit`] + [`is_clean`].
+/// Does `unit_key` open this encrypted AACS aligned `unit`? One bit, never plaintext.
+/// BD-TS 6144-byte units take the decrypt-less TS-sync check (`ts_unit_key_opens`, only
+/// the proof blocks are touched); Program-Stream and other lengths fall back to the full
+/// [`decrypt_unit`] + [`is_clean`].
 ///
-/// Gated behind the `keyproof` feature so the DEFAULT public API still cannot
-/// decrypt AACS — this is a key→content ORACLE (one bit), not a decryptor, and
-/// it is a private-consumer seam, not part of the open surface
-/// (KU §2.2; see `keys::public_api_cannot_decrypt_aacs`).
+/// Behind the `keyproof` feature so the default public API still cannot decrypt AACS: a
+/// key oracle, not a decryptor (KU §2.2; see `keys::public_api_cannot_decrypt_aacs`).
 #[cfg(feature = "keyproof")]
-pub fn unit_key_opens(unit: &[u8], unit_key: &[u8; 16], format: crate::disc::ContentFormat) -> bool {
+pub fn unit_key_opens(
+    unit: &[u8],
+    unit_key: &[u8; 16],
+    format: crate::disc::ContentFormat,
+) -> bool {
     use crate::disc::ContentFormat;
     if matches!(format, ContentFormat::BdTs) && unit.len() == ALIGNED_UNIT_LEN {
         return ts_unit_key_opens(unit, unit_key);
@@ -200,16 +199,13 @@ pub fn unit_key_opens(unit: &[u8], unit_key: &[u8; 16], format: crate::disc::Con
     is_clean(&scratch, format)
 }
 
-/// BD-TS fast path of [`unit_key_opens`]: the SAME verdict as `decrypt_unit` +
-/// `is_clean(BdTs)`, from one AES block per source packet instead of the whole
-/// 383-block CBC chain — the hot path of a 100k-candidate brute. CBC decrypts
-/// any block alone (`P[i] = AES_dec(C[i]) ⊕ C[i-1]`); packet heads sit at 192-byte
-/// (block-aligned) offsets ≥ 192, so `C[i-1]` is always real ciphertext. Packet 0
-/// is skipped: its sync byte lives in the clear 16-byte seed and proves nothing.
-/// `decrypt_unit` zeroes all-zero-ciphertext (padding) packets, so those are
-/// skipped here identically. Verdict mirrors [`is_clean_ts`]:
-/// `synced >= min(content, KEY_PROOF_PACKETS)`. `#[allow(dead_code)]` so the
-/// equivalence test covers it even in a build without `keyproof`.
+/// BD-TS fast path of `unit_key_opens`: the same verdict as `decrypt_unit` +
+/// `is_clean(BdTs)` from one AES block per source packet. CBC decrypts any block alone
+/// (`P[i] = AES_dec(C[i]) ⊕ C[i-1]`), and packet heads sit at block-aligned offsets ≥ 192.
+/// Packet 0 is skipped (its sync byte is in the clear seed), as are all-zero padding
+/// packets, which `decrypt_unit` zeroes. Verdict mirrors [`is_clean_ts`]:
+/// `synced >= min(content, KEY_PROOF_PACKETS)`. `dead_code` is allowed so the
+/// equivalence test covers it without `keyproof`.
 #[allow(dead_code)]
 fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
     use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
@@ -217,7 +213,8 @@ fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
     const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
     const NPKT: usize = ALIGNED_UNIT_LEN / PKT;
     debug_assert_eq!(unit.len(), ALIGNED_UNIT_LEN);
-    let block_at = |o: usize| -> Block { Array::try_from(&unit[o..o + 16]).expect("16-byte block") };
+    let block_at =
+        |o: usize| -> Block { Array::try_from(&unit[o..o + 16]).expect("16-byte block") };
 
     // Block key = AES-128E(unit_key, seed) ⊕ seed — `decrypt_unit`'s derivation.
     let mut bk = block_at(0);
