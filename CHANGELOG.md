@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.8.2] — Unreleased
 
 - Key lookup trusts the disc's declared CPS units: samples from each unit instead of 32 reads from every stream file (a 46-file UHD over USB: ~95 s → ~1.5 s). Each source is asked once; a disc no key opens is refused at once. FMTS discs included.
 - Key evidence reads the filesystem in batches, not one command per sector (~1 s less).
