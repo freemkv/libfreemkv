@@ -184,6 +184,10 @@ fn normalize_device_path(path: &str) -> String {
     if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
         return format!("\\\\.\\{}", trimmed);
     }
+    // A bare drive letter (`E`) is that drive, as `E:` is.
+    if trimmed.len() == 1 && trimmed.as_bytes()[0].is_ascii_alphabetic() {
+        return format!("\\\\.\\{trimmed}:");
+    }
     format!("\\\\.\\{}", path)
 }
 

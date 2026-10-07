@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Windows: a bare drive letter (`E`) opens that drive, as `E:` does; it was opened as `\\.\E`, which does not exist (E1000).
+
 ## [1.8.1] — 2026-10-07
 
 - `DriveInfo::display_name` is the name the OS shows users: the drive letter (`E:`) on Windows, `/dev/srN` on Linux and `diskN` on macOS while a disc is mounted; it equals `path` when the OS has no name. `path` remains the selector to open. Windows lists lettered drives in letter order, then unlettered drives by `CdRomN`.

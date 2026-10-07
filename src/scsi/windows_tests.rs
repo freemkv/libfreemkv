@@ -6,6 +6,8 @@ fn normalize_device_path_maps_drive_forms_to_the_volume_path() {
     assert_eq!(normalize_device_path("D:"), r"\\.\D:");
     assert_eq!(normalize_device_path(r"D:\"), r"\\.\D:");
     assert_eq!(normalize_device_path(r"\\.\D:"), r"\\.\D:");
+    assert_eq!(normalize_device_path("E"), r"\\.\E:");
+    assert_eq!(normalize_device_path("e"), r"\\.\e:");
     assert_eq!(normalize_device_path(r"\\.\CdRom0"), r"\\.\CdRom0");
     assert_eq!(normalize_device_path("CdRom0"), r"\\.\CdRom0");
 }
