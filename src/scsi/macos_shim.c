@@ -197,6 +197,7 @@ typedef struct {
     char vendor[32];
     char model[48];
     char firmware[16];
+    char bsd_name[32];
 } ShimDriveInfo;
 
 // ── Global handle (single-drive, same as before) ──────────────────────────
@@ -940,6 +941,8 @@ static int visit_list(io_service_t svc, void *ctx) {
     // optical service survives: always use its ID so a busy drive cannot be
     // enumerated as a second, apparently empty drive after opening it.
     registry_id_selector(svc, info->device_selector, sizeof(info->device_selector));
+    // Only present while a disc is mounted; the drive's user-visible name.
+    bdsvc_to_bsd_name(svc, info->bsd_name, sizeof(info->bsd_name));
     if (info->device_selector[0]) lc->count++;
     return lc->count >= lc->max ? 2 : 0;
 }

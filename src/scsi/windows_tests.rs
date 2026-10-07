@@ -120,3 +120,42 @@ fn cdrom_names_come_from_the_dos_device_list_without_a_number_limit() {
     assert_eq!(cdrom_number("CdRom"), None);
     assert_eq!(cdrom_number("PhysicalDrive0"), None);
 }
+
+// Explorer's letter is the name; the `CdRomN` path stays the selector.
+#[test]
+fn display_name_is_the_drive_letter_for_its_cdrom_device() {
+    let letters = [('D', Some(0)), ('E', Some(3))];
+    assert_eq!(display_name(r"\\.\CdRom3", &letters), "E:");
+    assert_eq!(display_name(r"\\.\CdRom0", &letters), "D:");
+    // A letter-only candidate is opened by its letter.
+    assert_eq!(display_name(r"\\.\F:", &letters), "F:");
+}
+
+#[test]
+fn display_name_without_a_letter_is_the_path() {
+    let letters = [('D', Some(0)), ('E', None)];
+    assert_eq!(display_name(r"\\.\CdRom2", &letters), r"\\.\CdRom2");
+}
+
+#[test]
+fn candidates_add_only_letters_without_a_listed_cdrom() {
+    let names = vec!["CdRom0".to_string(), "CdRom3".to_string()];
+    let letters = [('D', Some(0)), ('E', Some(7)), ('F', None)];
+    assert_eq!(
+        candidate_paths(names, &letters),
+        [r"\\.\CdRom0", r"\\.\CdRom3", r"\\.\E:", r"\\.\F:"]
+    );
+}
+
+#[test]
+fn drives_sort_by_letter_then_unlettered_cdrom_number() {
+    let mut drives = [
+        (r"\\.\CdRom10", r"\\.\CdRom10"),
+        (r"\\.\CdRom0", "F:"),
+        (r"\\.\CdRom2", r"\\.\CdRom2"),
+        (r"\\.\CdRom5", "D:"),
+    ];
+    drives.sort_by_key(|(path, name)| sort_key(path, name));
+    let names: Vec<_> = drives.iter().map(|(_, name)| *name).collect();
+    assert_eq!(names, ["D:", "F:", r"\\.\CdRom2", r"\\.\CdRom10"]);
+}

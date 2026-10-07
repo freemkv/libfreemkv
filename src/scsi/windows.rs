@@ -242,30 +242,75 @@ impl SptiTransport {
 /// must answer INQUIRY as an optical peripheral (type 0x05).
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     let names = cdrom_device_names();
-    let listed: Vec<u32> = names.iter().filter_map(|name| cdrom_number(name)).collect();
-    let mut candidates: Vec<String> = names
+    let letters: Vec<(char, Option<u32>)> = optical_drive_letters()
         .into_iter()
-        .map(|name| format!("\\\\.\\{name}"))
+        .map(|letter| (letter, device_number(&format!("\\\\.\\{letter}:"))))
         .collect();
-    for letter in optical_drive_letters() {
-        let path = format!("\\\\.\\{letter}:");
-        match device_number(&path) {
-            Some(n) if listed.contains(&n) => {}
-            _ => candidates.push(path),
-        }
-    }
 
     let mut drives = Vec::new();
-    for path in candidates {
+    for path in candidate_paths(names, &letters) {
         match probe(&path) {
-            Ok(Some(drive)) => drives.push(drive),
+            Ok(Some(mut drive)) => {
+                drive.display_name = display_name(&drive.path, &letters);
+                drives.push(drive);
+            }
             Ok(None) => tracing::info!(path = %path, "skipping non-optical device"),
             Err(e) => {
                 tracing::warn!(path = %path, error = %e, "skipping optical device that did not answer")
             }
         }
     }
+    drives.sort_by_key(|drive| sort_key(&drive.path, &drive.display_name));
     drives
+}
+
+/// Every `CdRomN` device, plus each optical letter whose `CdRomN` is not among them.
+fn candidate_paths(names: Vec<String>, letters: &[(char, Option<u32>)]) -> Vec<String> {
+    let listed: Vec<u32> = names.iter().filter_map(|name| cdrom_number(name)).collect();
+    let mut candidates: Vec<String> = names
+        .into_iter()
+        .map(|name| format!("\\\\.\\{name}"))
+        .collect();
+    for (letter, number) in letters {
+        if !number.is_some_and(|n| listed.contains(&n)) {
+            candidates.push(format!("\\\\.\\{letter}:"));
+        }
+    }
+    candidates
+}
+
+/// The drive letter Explorer shows for `path` (`E:`), else `path` itself.
+fn display_name(path: &str, letters: &[(char, Option<u32>)]) -> String {
+    let device = path.strip_prefix("\\\\.\\").unwrap_or(path);
+    let letter = match cdrom_number(device) {
+        Some(n) => letters
+            .iter()
+            .find(|(_, number)| *number == Some(n))
+            .map(|(letter, _)| *letter),
+        None => drive_letter(device),
+    };
+    letter.map_or_else(|| path.to_string(), |letter| format!("{letter}:"))
+}
+
+fn drive_letter(device: &str) -> Option<char> {
+    let mut chars = device.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(letter), Some(':'), None) if letter.is_ascii_alphabetic() => Some(letter),
+        _ => None,
+    }
+}
+
+/// Lettered drives in letter order, then the rest by `CdRomN`.
+fn sort_key(path: &str, display_name: &str) -> (bool, u32, String) {
+    if display_name != path {
+        return (false, 0, display_name.to_string());
+    }
+    let device = path.strip_prefix("\\\\.\\").unwrap_or(path);
+    (
+        true,
+        cdrom_number(device).unwrap_or(u32::MAX),
+        path.to_string(),
+    )
 }
 
 fn probe(path: &str) -> Result<Option<super::DriveInfo>> {
@@ -278,6 +323,7 @@ fn probe(path: &str) -> Result<Option<super::DriveInfo>> {
     Ok(
         super::is_optical_peripheral(&r.raw).then(|| super::DriveInfo {
             path: normalize_device_path(path),
+            display_name: normalize_device_path(path),
             vendor: r.vendor_id,
             model: r.model,
             firmware: r.firmware,

@@ -52,6 +52,7 @@ fn shim_drive(selector: &[u8], vendor: &[u8], model: &[u8], firmware: &[u8]) -> 
         vendor: [0; 32],
         model: [0; 48],
         firmware: [0; 16],
+        bsd_name: [0; 32],
     };
     info.device_selector[..selector.len()].copy_from_slice(selector);
     info.vendor[..vendor.len()].copy_from_slice(vendor);
@@ -80,9 +81,19 @@ fn shim_drive_record_keeps_empty_tray_registry_selector() {
     );
     let mapped = drive_info_from_shim(&info).expect("registry selector");
     assert_eq!(mapped.path, "ioreg:18446744073709551615");
+    assert_eq!(mapped.display_name, "ioreg:18446744073709551615");
     assert_eq!(mapped.vendor, "HL-DT-ST");
     assert_eq!(mapped.model, "BD-RE BU40N");
     assert_eq!(mapped.firmware, "1.03");
+}
+
+#[test]
+fn shim_drive_record_shows_mounted_bsd_name_but_keeps_registry_selector() {
+    let mut info = shim_drive(b"ioreg:4295000001", b"HL-DT-ST", b"BD-RE BU40N", b"1.03");
+    info.bsd_name[..5].copy_from_slice(b"disk4");
+    let mapped = drive_info_from_shim(&info).expect("registry selector");
+    assert_eq!(mapped.path, "ioreg:4295000001");
+    assert_eq!(mapped.display_name, "disk4");
 }
 
 #[test]

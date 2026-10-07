@@ -443,6 +443,10 @@ pub struct DriveInfo {
     /// `ioreg:<id>` selector (macOS), `\\.\CdRomN`
     /// (Windows).
     pub path: String,
+    /// The name the OS shows users: a drive letter like `E:` (Windows),
+    /// `/dev/srN` (Linux), `diskN` (macOS, only while a disc is mounted).
+    /// Equals [`path`](Self::path) when the OS has no name for the drive.
+    pub display_name: String,
     /// SCSI INQUIRY vendor identifier (e.g. `"HL-DT-ST"`).
     pub vendor: String,
     /// SCSI INQUIRY product identifier (e.g. `"BD-RE BU40N"`).

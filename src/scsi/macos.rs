@@ -44,6 +44,7 @@ struct ShimDriveInfo {
     vendor: [u8; 32],
     model: [u8; 48],
     firmware: [u8; 16],
+    bsd_name: [u8; 32],
 }
 
 // shim_open_exclusive's result when the cancel byte was set (`SHIM_CANCELLED` in the shim).
@@ -266,6 +267,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
         vendor: [0; 32],
         model: [0; 48],
         firmware: [0; 16],
+        bsd_name: [0; 32],
     };
     // The shim stops at the buffer size; a full buffer means there may be more.
     let mut capacity = 16usize;
@@ -288,8 +290,15 @@ fn drive_info_from_shim(info: &ShimDriveInfo) -> Option<super::DriveInfo> {
     if selector.is_empty() {
         return None;
     }
+    let path = device_path_for_selector(selector);
+    let bsd_name = cstr_to_str(&info.bsd_name);
     Some(super::DriveInfo {
-        path: device_path_for_selector(selector),
+        display_name: if bsd_name.is_empty() {
+            path.clone()
+        } else {
+            bsd_name.to_string()
+        },
+        path,
         vendor: cstr_to_str(&info.vendor).to_string(),
         model: cstr_to_str(&info.model).to_string(),
         firmware: cstr_to_str(&info.firmware).to_string(),

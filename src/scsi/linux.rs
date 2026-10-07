@@ -560,6 +560,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
         // probe time, stashed under `.../sgN/device/`. Survives even when
         // the drive is wedged below the USB bridge and our INQUIRY times out.
         let (sysfs_vendor, sysfs_model, sysfs_firmware) = sysfs_identity(&name);
+        let display_name = display_name(std::path::Path::new(SG_CLASS), &name, &path);
 
         // INQUIRY-only probe — open transport, run INQUIRY, drop. No
         // identify, no init, no firmware reset preamble's secondary
@@ -580,6 +581,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
         let info = match probed {
             Ok(Ok(r)) => super::DriveInfo {
                 path: path.clone(),
+                display_name,
                 vendor: pick_identity(r.vendor_id, &sysfs_vendor),
                 model: pick_identity(r.model, &sysfs_model),
                 firmware: pick_identity(r.firmware, &sysfs_firmware),
@@ -588,6 +590,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
             // listed from what sysfs knows, so autorip reports it, not an unplug.
             _ => super::DriveInfo {
                 path: path.clone(),
+                display_name,
                 vendor: sysfs_vendor,
                 model: sysfs_model,
                 firmware: sysfs_firmware,
@@ -607,6 +610,23 @@ fn pick_identity(live: String, sysfs: &str) -> String {
     } else {
         live
     }
+}
+
+const SG_CLASS: &str = "/sys/class/scsi_generic";
+
+/// The `/dev/srN` users know for `sgN`, from `<sg_class>/sgN/device/block/`;
+/// `path` when the node is already `srN` or sysfs has no block device for it.
+fn display_name(sg_class: &std::path::Path, name: &str, path: &str) -> String {
+    if name.starts_with("sr") {
+        return path.to_string();
+    }
+    std::fs::read_dir(sg_class.join(name).join("device/block"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|block| block.starts_with("sr"))
+        .map_or_else(|| path.to_string(), |sr| format!("/dev/{sr}"))
 }
 
 /// Read the kernel's cached INQUIRY identity strings for `sgN` from
