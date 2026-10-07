@@ -377,6 +377,16 @@ pub(crate) fn pieces(
 /// raw (never decrypted) source the evidence describes. Random access is required.
 pub struct Sampler<'a> {
     reader: &'a mut dyn SectorSource,
+    stats: ReadStats,
+}
+
+/// Read accounting for the sampler's units: how long key acquisition spent on the drive.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ReadStats {
+    pub(crate) reads: u32,
+    pub(crate) faults: u32,
+    pub(crate) total: std::time::Duration,
+    pub(crate) slowest: std::time::Duration,
 }
 
 /// A sampled unit: `Enc` ciphertext, `Clear`, or a `Fault` (a soft read error).
@@ -389,7 +399,14 @@ pub(crate) enum Sample {
 impl<'a> Sampler<'a> {
     /// A sampler over the raw source `reader`.
     pub fn new(reader: &'a mut dyn SectorSource) -> Self {
-        Sampler { reader }
+        Sampler {
+            reader,
+            stats: ReadStats::default(),
+        }
+    }
+
+    pub(crate) fn stats(&self) -> ReadStats {
+        self.stats
     }
 
     pub(crate) fn source(&mut self) -> &mut dyn SectorSource {
@@ -399,7 +416,17 @@ impl<'a> Sampler<'a> {
     // The aligned unit at `lba`, or `None` on a short or failed read. A Stop, a gone source
     // or a transport failure is `Err`: not a soft fault.
     pub(crate) fn unit(&mut self, lba: u32) -> Result<Option<Vec<u8>>> {
-        read_unit(self.reader, lba)
+        let t0 = std::time::Instant::now();
+        let r = read_unit(self.reader, lba);
+        let took = t0.elapsed();
+        self.stats.reads += 1;
+        self.stats.total += took;
+        self.stats.slowest = self.stats.slowest.max(took);
+        if matches!(r, Ok(None)) {
+            self.stats.faults += 1;
+        }
+        tracing::trace!(target: "freemkv::keys", lba, took_ms = took.as_millis() as u64, "sample unit read");
+        r
     }
 
     // Up to 32 units on `p`'s grid (KU §2.3 step 7), skipping FMTS segment units, each
@@ -425,10 +452,66 @@ impl<'a> Sampler<'a> {
         Ok((units, out))
     }
 
+    // The first encrypted unit on `p`'s probe grid, stopping there: a stream file sits in one
+    // CPS unit (KS-10), so one unit names its key. (grid units, the unit, soft faults seen).
+    pub(crate) fn first_encrypted(
+        &mut self,
+        p: &Piece,
+        segments: &[(u32, u32)],
+        format: ContentFormat,
+        detector: Detector,
+        halt: &Halt,
+    ) -> Result<(u64, Option<Vec<u8>>, usize)> {
+        let (units, lbas) = probe_lbas(p, segments);
+        let mut faults = 0;
+        for lba in lbas {
+            halt.check()?;
+            match self.unit(lba)? {
+                Some(u) if detector.unit_encrypted(&u, format) => {
+                    return Ok((units, Some(u), faults));
+                }
+                Some(_) => {}
+                None => faults += 1,
+            }
+        }
+        Ok((units, None, faults))
+    }
+
+    // Up to `n` encrypted units on `p`'s probe grid: enough ciphertext to ask a source for a
+    // unit the first request left unopened.
+    pub(crate) fn encrypted_units(
+        &mut self,
+        p: &Piece,
+        segments: &[(u32, u32)],
+        format: ContentFormat,
+        detector: Detector,
+        halt: &Halt,
+        n: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let (_, lbas) = probe_lbas(p, segments);
+        let mut out = Vec::new();
+        for lba in lbas {
+            if out.len() >= n {
+                break;
+            }
+            halt.check()?;
+            if let Some(u) = self.unit(lba)?
+                && detector.unit_encrypted(&u, format)
+            {
+                out.push(u);
+            }
+        }
+        Ok(out)
+    }
+
     // Up to `n` encrypted units spread over the main feature.
     pub(crate) fn main_samples(&mut self, main: Option<&MainTitle>, n: usize) -> Vec<Vec<u8>> {
-        main.map(|m| crate::keysource::encrypted_units_in(self.reader, &m.extents, m.format, n))
-            .unwrap_or_default()
+        let t0 = std::time::Instant::now();
+        let out = main
+            .map(|m| crate::keysource::encrypted_units_in(self.reader, &m.extents, m.format, n))
+            .unwrap_or_default();
+        tracing::info!(target: "freemkv::keys", phase = "main_samples", wanted = n, got = out.len(), elapsed_ms = t0.elapsed().as_millis() as u64, "main-title samples read");
+        out
     }
 }
 

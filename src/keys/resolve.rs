@@ -487,6 +487,48 @@ struct Scoped<'e> {
 // clip is in scope, and each piece probed by the format's own detector.
 fn probe_scope<'e>(ev: &'e KeyEvidence, sampler: &mut Sampler, halt: &Halt) -> Result<Scoped<'e>> {
     let mut ps: Vec<Probed> = ev.pieces.iter().cloned().map(Probed::new).collect();
+    let (layout, clip) = scope_layout(ev);
+    let segments: Vec<(u32, u32)> = layout
+        .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
+        .unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let before = sampler.stats();
+    for p in &mut ps {
+        let tp = std::time::Instant::now();
+        let reads_before = sampler.stats().reads;
+        probe(sampler, p, &segments, ev.container, ev.detector, halt)?;
+        tracing::debug!(
+            target: "freemkv::keys",
+            phase = "probe_piece",
+            piece = p.id(),
+            units = p.units,
+            reads = sampler.stats().reads - reads_before,
+            enc = p.enc.len(),
+            faults = p.faults,
+            elapsed_ms = tp.elapsed().as_millis() as u64,
+            "piece probed"
+        );
+    }
+    let after = sampler.stats();
+    let reads = after.reads - before.reads;
+    let read_ms = (after.total - before.total).as_millis() as u64;
+    tracing::info!(
+        target: "freemkv::keys",
+        phase = "probe_scope",
+        pieces = ps.len(),
+        reads,
+        faults = after.faults - before.faults,
+        read_ms,
+        avg_read_ms = read_ms.checked_div(u64::from(reads)).unwrap_or(0),
+        slowest_read_ms = after.slowest.as_millis() as u64,
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "sampled every piece before asking a key source"
+    );
+    Ok(Scoped { ps, layout, clip })
+}
+
+// The forensic layout when its clip is in scope (KU §2.3 step 6), and that clip. Reads nothing.
+fn scope_layout(ev: &KeyEvidence) -> (Option<&super::fmts::Layout>, Vec<(u32, u32)>) {
     let layout = ev.fmts.as_ref();
     let clip: Vec<(u32, u32)> = layout
         .map(|l| {
@@ -497,16 +539,294 @@ fn probe_scope<'e>(ev: &'e KeyEvidence, sampler: &mut Sampler, halt: &Halt) -> R
         })
         .unwrap_or_default();
     let layout = layout.filter(|_| {
-        ps.iter()
+        ev.pieces
+            .iter()
             .any(|p| p.ranges().any(|(s, e)| overlaps(&clip, s, e)))
     });
+    (layout, clip)
+}
+
+// KS-14 [BD] §3.9.3: one declared CPS unit is one Unit Key for every stream file, so the disc
+// is trusted as declared: the main title's samples ask the sources once, and the key that
+// opens them keys every piece in scope. No per-piece probing (32 reads a piece: minutes of
+// seeks on a many-clip disc). `None` (no ciphertext found, or no key opens it) falls back to
+// the probed path, which decides clear content and refusals.
+fn resolve_one_unit(
+    ev: &KeyEvidence,
+    sampler: &mut Sampler,
+    disc_hash: &str,
+    seed: Option<&KeyRing>,
+    run: &mut Run,
+) -> Result<Option<Inner>> {
+    let samples = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS);
+    if samples.is_empty() {
+        return Ok(None);
+    }
+    // Two opened samples prove a key (rule 1), or the one when only one was found.
+    let need = samples.len().min(2);
+    let opener = |run: &Run| {
+        (0..run.pool.len())
+            .find(|&slot| samples.iter().filter(|u| run.opens(u, slot)).count() >= need)
+    };
+    let mut slot = opener(run);
+    // Sample-independent sources (a local keydb) before those that need the samples.
+    let mut order: Vec<usize> = (0..run.sources.len()).collect();
+    order.sort_by_key(|&i| run.sources[i].answer_depends_on_samples());
+    let mut tried: Vec<usize> = Vec::new();
+    run.check_halt()?;
+    for i in order {
+        if slot.is_some() {
+            break;
+        }
+        // Too little ciphertext to ask with unambiguously (KU step 9.2): the probed path decides.
+        if run.sources[i].answer_depends_on_samples() && samples.len() < MIN_SAMPLE_UNITS {
+            continue;
+        }
+        run.check_halt()?;
+        if let Asked::Keys(k, _) = run.ask(i, &samples, false)? {
+            let who = run.sources[i].label();
+            run.add_keys(&k, who);
+            slot = opener(run);
+        }
+        tried.push(i);
+    }
+    let Some(slot) = slot else {
+        // Encrypted, sources asked, no key held at all: one declared unit means nothing in
+        // scope can be keyed, so refuse now rather than probe every piece to the same end.
+        if !tried.is_empty() && run.pool.is_empty() {
+            let failure = run.first_failure.take();
+            return Err(failure.unwrap_or_else(|| missing_error(&ev.scope, disc_hash)));
+        }
+        // Asked already: the probed path never asks these sources again.
+        for i in tried {
+            run.dead[i] = true;
+        }
+        return Ok(None);
+    };
+    let (layout, clip) = scope_layout(ev);
+    let ps: Vec<Probed> = ev
+        .pieces
+        .iter()
+        .cloned()
+        .map(|piece| {
+            let mut p = Probed::new(piece);
+            p.units = p.piece.grid().iter().map(|g| g.1).sum();
+            p.verdict = if p.units == 0 {
+                Verdict::Clear
+            } else {
+                Verdict::Keyed(slot)
+            };
+            p
+        })
+        .collect();
+    tracing::info!(
+        target: "freemkv::keys",
+        phase = "one_cps_unit",
+        pieces = ps.len(),
+        samples = samples.len(),
+        "one CPS unit declared: every piece keyed by the key that opens the main title"
+    );
+    let mut inner = aacs_inner(run);
+    inner.no_stream_files = ev.no_stream_files;
+    let forensic = match layout {
+        None => None,
+        Some(l) => Some(resolve_forensic(sampler, l, seed, run, ev.container)?),
+    };
+    build(&mut inner, &ps, layout, forensic, run, clip);
+    Ok(Some(inner))
+}
+
+// Several declared CPS units: each stream file sits in exactly one (KS-10), so one encrypted
+// unit per piece (the first its probe grid finds) names its key. The main title's samples ask
+// first; pieces no held key opens then ask with their own units, at most `n_decl` requests.
+// `None` (a piece unreadable, or one no key opens) falls back to the probed path.
+fn resolve_per_unit(
+    ev: &KeyEvidence,
+    sampler: &mut Sampler,
+    disc_hash: &str,
+    seed: Option<&KeyRing>,
+    run: &mut Run,
+    n_decl: usize,
+) -> Result<Option<Inner>> {
+    let (layout, clip) = scope_layout(ev);
     let segments: Vec<(u32, u32)> = layout
         .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
         .unwrap_or_default();
-    for p in &mut ps {
-        probe(sampler, p, &segments, ev.container, ev.detector, halt)?;
+    let mut ps: Vec<Probed> = Vec::with_capacity(ev.pieces.len());
+    for piece in &ev.pieces {
+        let mut p = Probed::new(piece.clone());
+        let (units, unit, faults) =
+            sampler.first_encrypted(&p.piece, &segments, ev.container, ev.detector, run.halt)?;
+        p.units = units;
+        p.faults = faults;
+        match unit {
+            Some(u) => p.enc.push(u),
+            // Faults with no ciphertext found: not trusted, the probed path decides.
+            None if faults > 0 => return Ok(None),
+            None => p.verdict = Verdict::Clear,
+        }
+        ps.push(p);
     }
-    Ok(Scoped { ps, layout, clip })
+    let opened = |run: &Run, p: &Probed| -> Option<usize> {
+        p.enc
+            .first()
+            .and_then(|u| (0..run.pool.len()).find(|&s| run.opens(u, s)))
+    };
+    let unopened = |run: &Run, ps: &[Probed]| -> Vec<usize> {
+        (0..ps.len())
+            .filter(|&i| ps[i].verdict == Verdict::Ask && opened(run, &ps[i]).is_none())
+            .collect()
+    };
+    let mut tried: Vec<usize> = Vec::new();
+    // Sample-independent sources (a local keydb) give their whole answer once.
+    if !unopened(run, &ps).is_empty() {
+        let main = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS);
+        for i in 0..run.sources.len() {
+            if run.sources[i].answer_depends_on_samples() {
+                continue;
+            }
+            run.check_halt()?;
+            let asked = run.ask(i, &main, false)?;
+            if !matches!(asked, Asked::Skipped) {
+                tried.push(i);
+            }
+            if let Asked::Keys(k, _) = asked {
+                let who = run.sources[i].label();
+                run.add_keys(&k, who);
+            }
+        }
+    }
+    // Then, largest piece first, each still-unopened unit asks the sample-dependent sources
+    // with enough of its own ciphertext (topped up from pieces of the same title, KS-10), at
+    // most `n_decl` requests. One answer may open many pieces. A source that answers with no
+    // key has none for this disc: it is not asked again.
+    let mut budget = n_decl;
+    let mut thin: Vec<usize> = Vec::new();
+    let mut gave_up: Vec<usize> = Vec::new();
+    loop {
+        let mut todo: Vec<usize> = unopened(run, &ps)
+            .into_iter()
+            .filter(|i| !thin.contains(i) && !gave_up.contains(i))
+            .collect();
+        let live: Vec<usize> = (0..run.sources.len())
+            .filter(|&i| run.sources[i].answer_depends_on_samples() && !run.dead[i])
+            .collect();
+        if todo.is_empty() || budget == 0 || live.is_empty() {
+            break;
+        }
+        todo.sort_by_key(|&i| (std::cmp::Reverse(ps[i].piece.rank), ps[i].id()));
+        let lead = todo[0];
+        let mut samples = sampler.encrypted_units(
+            &ps[lead].piece,
+            &segments,
+            ev.container,
+            ev.detector,
+            run.halt,
+            MIN_SAMPLE_UNITS,
+        )?;
+        for &j in &todo[1..] {
+            if samples.len() >= MIN_SAMPLE_UNITS {
+                break;
+            }
+            if ps[j]
+                .piece
+                .titles
+                .iter()
+                .any(|t| ps[lead].piece.titles.contains(t))
+            {
+                let more = sampler.encrypted_units(
+                    &ps[j].piece,
+                    &segments,
+                    ev.container,
+                    ev.detector,
+                    run.halt,
+                    MIN_SAMPLE_UNITS - samples.len(),
+                )?;
+                samples.extend(more);
+            }
+        }
+        if samples.len() < MIN_SAMPLE_UNITS {
+            // Too little ciphertext to ask with (KU step 9.2): proven on arrival instead.
+            thin.push(lead);
+            continue;
+        }
+        budget -= 1;
+        for &i in &live {
+            run.check_halt()?;
+            let asked = run.ask(i, &samples, false)?;
+            if !matches!(asked, Asked::Skipped) && !tried.contains(&i) {
+                tried.push(i);
+            }
+            match asked {
+                Asked::Keys(k, _) => {
+                    let who = run.sources[i].label();
+                    run.add_keys(&k, who);
+                    if opened(run, &ps[lead]).is_some() {
+                        break;
+                    }
+                }
+                Asked::Empty => run.dead[i] = true,
+                Asked::Failed | Asked::Skipped => {}
+            }
+        }
+        if opened(run, &ps[lead]).is_none() {
+            gave_up.push(lead);
+        }
+    }
+    // Every unit's sample was sent: a piece no held key opens has no key to find.
+    let whole_with_keys =
+        ev.scope == KeyScope::WholeDisc && !run.pool.is_empty() && run.first_failure.is_none();
+    for (idx, p) in ps.iter_mut().enumerate() {
+        if p.verdict == Verdict::Ask {
+            match opened(run, p) {
+                Some(slot) => p.verdict = Verdict::Keyed(slot),
+                None if thin.contains(&idx) => p.verdict = Verdict::Lazy(None),
+                // Not asked at all (too little ciphertext): the probed path decides.
+                None if tried.is_empty() => {
+                    for &i in &tried {
+                        run.dead[i] = true;
+                    }
+                    return Ok(None);
+                }
+                // A whole-disc copy blanks it while other pieces are usable (as the probed path).
+                None if whole_with_keys => {
+                    tracing::warn!(target: "freemkv::keys", lba = p.id(), "no held key opens this stream file: it will be blanked in the image");
+                    p.verdict = Verdict::Lazy(None);
+                }
+                None => {
+                    let lba = p.id();
+                    let failure = run.first_failure.take();
+                    let err = failure.unwrap_or_else(|| missing_error(&ev.scope, disc_hash));
+                    tracing::error!(target: "freemkv::keys", lba, code = err.code(), "a stream file in scope has no key; refusing before any output");
+                    return Err(err);
+                }
+            }
+        }
+    }
+    // KU §2.7: an empty pool on an encrypted scope is the keyless case.
+    if run.pool.is_empty() && ps.iter().any(|p| matches!(p.verdict, Verdict::Lazy(_))) {
+        let failure = run.first_failure.take();
+        return Err(failure.unwrap_or_else(|| missing_error(&ev.scope, disc_hash)));
+    }
+    if whole_with_keys && !ps.iter().any(|p| matches!(p.verdict, Verdict::Keyed(_))) {
+        let failure = run.first_failure.take();
+        return Err(failure.unwrap_or_else(|| missing_error(&ev.scope, disc_hash)));
+    }
+    tracing::info!(
+        target: "freemkv::keys",
+        phase = "per_cps_unit",
+        declared = n_decl,
+        pieces = ps.len(),
+        "each piece keyed by the key that opens its one sampled unit"
+    );
+    let mut inner = aacs_inner(run);
+    inner.no_stream_files = ev.no_stream_files;
+    let forensic = match layout {
+        None => None,
+        Some(l) => Some(resolve_forensic(sampler, l, seed, run, ev.container)?),
+    };
+    build(&mut inner, &ps, layout, forensic, run, clip);
+    Ok(Some(inner))
 }
 
 // The one encryption decision, every AACS format and source (CSS makes it on its scramble
@@ -520,6 +840,17 @@ fn decide(
     seed: Option<&KeyRing>,
     run: &mut Run,
 ) -> Result<Inner> {
+    // A forensic layout in scope keeps the probed path: its segments follow their own rules.
+    if ev.detector == Detector::Verified && scope_layout(ev).0.is_none() {
+        let trusted = match n_decl {
+            Some(1) => resolve_one_unit(ev, sampler, disc_hash, seed, run)?,
+            Some(n) if n > 1 => resolve_per_unit(ev, sampler, disc_hash, seed, run, n)?,
+            _ => None,
+        };
+        if let Some(inner) = trusted {
+            return Ok(inner);
+        }
+    }
     let scoped = probe_scope(ev, sampler, run.halt)?;
     if in_clear(&scoped, sampler, ev.container, run.halt)? {
         tracing::info!(target: "freemkv::keys", pieces = scoped.ps.len(), "content in the clear: no key source asked");

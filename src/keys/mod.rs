@@ -362,8 +362,13 @@ impl KeyRing {
         opts: AcquireOptions,
         ctx: &Ctx,
     ) -> Result<KeyResolution> {
+        let t0 = std::time::Instant::now();
         let ev = KeyEvidence::from_disc(disc, reader, scope, ctx)?;
-        Self::acquire(&ev, &mut Sampler::new(reader), sources, opts, ctx)
+        tracing::info!(target: "freemkv::keys", phase = "evidence", pieces = ev.pieces.len(), elapsed_ms = t0.elapsed().as_millis() as u64, "key evidence read from the disc");
+        let t1 = std::time::Instant::now();
+        let r = Self::acquire(&ev, &mut Sampler::new(reader), sources, opts, ctx);
+        tracing::info!(target: "freemkv::keys", phase = "acquire", ok = r.is_ok(), elapsed_ms = t1.elapsed().as_millis() as u64, "key acquisition finished");
+        r
     }
 
     /// A set holding no keys: for a raw copy, or a disc with no AACS.

@@ -580,11 +580,11 @@ fn single_declared_unit_wrong_key_refuses_e7013() {
     assert_eq!(code(r), E7013);
 }
 
-/// LK4 (J22). KS-14: with one declared CPS unit, a key proven on one piece keys a Lazy
-/// piece only when it opens every read probe of it. A piece with no readable probe stays
-/// Lazy with that key as its candidate ("never guessed") and is proven on first read.
+/// LK4. KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number of CPS Units
+/// on the disc". One declared unit is trusted: the key that opens the main title keys every
+/// piece, including one with no readable unit at resolve, which reads under it once healed.
 #[test]
-fn single_declared_unit_keys_lazy_pieces() {
+fn single_declared_unit_keys_every_piece() {
     let fx = fixture(
         &[stream(1, 10, Some(K1)), stream(2, 10, Some(K1))],
         1,
@@ -603,20 +603,14 @@ fn single_declared_unit_keys_lazy_pieces() {
         &FakeClock::default(),
     )
     .unwrap();
-    assert_eq!(
-        set.lazy(),
-        &[(b, b + n)],
-        "no probe of B read: Lazy, never keyed blind"
+    assert!(
+        set.lazy().is_empty(),
+        "the declared unit keys B without reading it"
     );
-    assert_eq!(set.status().keyed, 1);
+    assert_eq!(set.status().keyed, 2);
     src.heal();
     let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
-    assert_eq!(
-        set.proof_cache().get(b),
-        Some(Proof::Proven(0)),
-        "K1 first, proven on read"
-    );
 }
 
 /// LK5 (K-1). KS-14, KS-10: the count of held keys never decides coverage. Two declared,
@@ -782,7 +776,11 @@ fn small_piece_borrows_or_goes_lazy_never_missing() {
     )
     .unwrap();
     assert_eq!(calls.of("online").len(), 1, "S and T ask once, together");
-    assert_eq!(calls.of("online")[0].samples, 9);
+    assert_eq!(
+        calls.of("online")[0].samples,
+        crate::keysource::MIN_SAMPLE_UNITS,
+        "exactly the minimum: no unit read beyond it"
+    );
     let (u, n) = fx.file(3);
     assert_eq!(
         set.lazy(),
@@ -818,10 +816,10 @@ fn playlist_pieces_share_a_cps_unit_for_borrowing() {
     assert_eq!(code(set), E7022);
 }
 
-/// J21 (OQ-L2-1) guard. A piece where exactly one probe read and opened is Lazy with that
-/// key as its first candidate — never keyed from one probe — and is proven on read.
+/// KS-10 [BD] §3.9.2: a stream file sits in one CPS unit, so with several declared units one
+/// readable unit of a piece names its key: the piece is keyed by it and reads.
 #[test]
-fn one_opened_probe_is_lazy_never_keyed() {
+fn one_sampled_unit_keys_its_piece_on_a_multi_unit_disc() {
     let fx = fixture(
         &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
         2,
@@ -840,15 +838,15 @@ fn one_opened_probe_is_lazy_never_keyed() {
         &FakeClock::default(),
     )
     .unwrap();
-    assert_eq!(set.lazy(), &[(b, b + n)]);
-    assert_eq!(set.status().keyed, 1);
+    assert!(set.lazy().is_empty());
+    assert_eq!(set.status().keyed, 2);
     src.heal();
     let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
 }
 
-/// LK22. A sample-independent source (a keydb) is asked once per resolve; an online source
-/// once per unopened piece (N-KU10).
+/// LK22. A sample-independent source (a keydb) is asked once per resolve, and an online
+/// source once with one unit of every unopened piece: neither is asked again on a refusal.
 #[test]
 fn sample_independent_source_asked_once() {
     let files: Vec<BdFile> = (1..=5).map(|i| stream(i, 10, Some(K2))).collect();
@@ -861,7 +859,7 @@ fn sample_independent_source_asked_once() {
     );
     assert_eq!(code(r), E7032);
     assert_eq!(calls.of("keydb").len(), 1);
-    assert_eq!(calls.of("online").len(), 5);
+    assert_eq!(calls.of("online").len(), 1);
 }
 
 /// LK23a (J13, J15). A source that gives no answer (transport class) for 20 s of simulated
@@ -1252,7 +1250,8 @@ fn stop_during_resolve_builds_no_set() {
     let fx = two_units();
     let halt = Halt::new();
     let mut src = fx.source();
-    src.halt_after = Some((halt.clone(), Arc::new(Mutex::new(40))));
+    // Stopped on the first read: before any source is asked.
+    src.halt_after = Some((halt.clone(), Arc::new(Mutex::new(1))));
     let calls = Calls::default();
     let opts = AcquireOptions {
         ..Default::default()
@@ -2359,33 +2358,26 @@ fn whole_disc_status_counts_keyed_files_without_titles() {
     assert_eq!((s.keyed, s.proven, s.lazy), (1, 1, 0), "{s:?}");
 }
 
-/// KU §2.3 step 10 (review item 4). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits)
-/// indicates the number of CPS Units on the disc". The n_decl == 1 rule keys only Lazy
-/// pieces no other held key opened: a piece whose one readable probe another key opened
-/// stays Lazy with that candidate, never keyed with the proven key over it.
+/// KS-14 [BD] §3.9.3. One declared unit: the key that opens the main title is the disc's key,
+/// so every piece is keyed by it and asked for once, whatever other keys a source returns.
 #[test]
-fn single_unit_rule_never_overrides_a_piece_another_key_opened() {
+fn single_declared_unit_keys_every_piece_with_the_main_titles_key() {
     let fx = fixture(
-        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
+        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K1))],
         1,
         &[&[0, 1]],
     );
-    let (b, n) = fx.file(1);
-    let src = fx.source();
-    src.kill(b + 3, b + n); // only B's first unit reads, and K2 opens it
+    let (b, _) = fx.file(1);
     let calls = Calls::default();
-    let set = resolve_with(
+    let set = resolve(
         &fx,
-        &mut src.clone(),
         KeyScope::Titles(vec![0]),
-        &[Spec::keydb(&[K1, K2], &calls)],
-        AcquireOptions::default(),
-        &FakeClock::default(),
+        &[Spec::keydb(&[K2, K1], &calls)],
     )
     .unwrap();
-    assert_eq!(set.lazy(), &[(b, b + n)], "B stays Lazy (candidate K2)");
-    src.heal();
-    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
+    assert_eq!((set.status().keyed, set.lazy()), (2, &[][..]));
+    assert_eq!(calls.of("keydb").len(), 1);
+    let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
 }
 
@@ -2404,13 +2396,11 @@ fn unopenable_unit_stops_after_one_side_read() {
     assert_eq!(reads.len(), 2, "then one side read");
 }
 
-/// KU §2.3 step 10 under invariant 2, "never guessed" (J22, review r2 M1). KS-14 [BD]
-/// §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number of CPS Units on the disc".
-/// With one declared unit, a Lazy piece is keyed by the proven key only if that key opens
-/// every `Enc` probe of it: (a) probes no held key opens, (b) probes opened by two keys.
+/// KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number of CPS Units on
+/// the disc". The declaration is trusted: with one unit no piece is probed, so even a piece
+/// the disc puts under another key is keyed with the main title's key, the source asked once.
 #[test]
-fn single_unit_rule_keys_only_pieces_the_proven_key_opens() {
-    // (a) B's three units are under K2, which no source holds.
+fn single_declared_unit_is_trusted_without_probing_each_piece() {
     let fx = fixture(
         &[stream(1, 10, Some(K1)), stream(2, 3, Some(K2))],
         1,
@@ -2423,51 +2413,8 @@ fn single_unit_rule_keys_only_pieces_the_proven_key_opens() {
         &[Spec::keydb(&[K1], &calls)],
     )
     .unwrap();
-    let (b, n) = fx.file(1);
-    assert_eq!(
-        (set.status().keyed, set.lazy()),
-        (1, &[(b, b + n)][..]),
-        "(a)"
-    );
-    let mut r = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
-    assert_eq!(
-        code(read(&mut r, &fx, 1, 0, 3)),
-        E7022,
-        "(a) never K1 over K2's ciphertext"
-    );
-
-    // (b) B's only readable probes: unit 0 opens under K1, unit 5 under K2.
-    let mut fx = fixture(
-        &[stream(1, 10, Some(K1)), stream(2, 10, Some(K2))],
-        1,
-        &[&[0, 1]],
-    );
-    fx.reencrypt(1, 0, &K1);
-    let (b, n) = fx.file(1);
-    let src = fx.source();
-    src.kill(fx.unit(1, 1), fx.unit(1, 5));
-    src.kill(fx.unit(1, 6), b + n);
-    let set = resolve_with(
-        &fx,
-        &mut src.clone(),
-        KeyScope::Titles(vec![0]),
-        &[Spec::keydb(&[K1, K2], &calls)],
-        AcquireOptions::default(),
-        &FakeClock::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        (set.status().keyed, set.lazy()),
-        (1, &[(b, b + n)][..]),
-        "(b)"
-    );
-    src.heal();
-    let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
-    assert_eq!(
-        code(read(&mut r, &fx, 1, 0, 10)),
-        E7022,
-        "(b) two keys: a conflict"
-    );
+    assert_eq!((set.status().keyed, set.lazy()), (2, &[][..]));
+    assert_eq!(calls.of("keydb").len(), 1);
 }
 
 /// KU §3.1 (review r2 M3): a keyless set over a title whose extents overlap (one inside
@@ -2529,14 +2476,12 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
     }
 }
 
-/// J22 (review r3). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits) indicates the number
-/// of CPS Units on the disc". A piece whose every probe faulted has no evidence: with one
-/// declared unit it stays Lazy (the proven key its candidate), so a readable unit under a
-/// key no source holds stops with E7022, never decrypted under the proven key.
+/// KS-14 [BD] §3.9.3. A piece with no readable unit at resolve is keyed by the one declared
+/// unit's key without being read, and reads under it once healed.
 #[test]
-fn single_unit_rule_never_keys_a_piece_with_no_readable_probe() {
+fn single_declared_unit_keys_an_unreadable_piece_without_reading_it() {
     let fx = fixture(
-        &[stream(1, 10, Some(K1)), stream(2, 3, Some(K2))],
+        &[stream(1, 10, Some(K1)), stream(2, 3, Some(K1))],
         1,
         &[&[0, 1]],
     );
@@ -2553,14 +2498,10 @@ fn single_unit_rule_never_keys_a_piece_with_no_readable_probe() {
         &FakeClock::default(),
     )
     .unwrap();
-    assert_eq!((set.status().keyed, set.lazy()), (1, &[(b, b + n)][..]));
+    assert_eq!((set.status().keyed, set.lazy()), (2, &[][..]));
     src.heal();
     let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
-    assert_eq!(
-        code(read(&mut r, &fx, 1, 0, 3)),
-        E7022,
-        "never K1 over K2's ciphertext"
-    );
+    assert_eq!(read(&mut r, &fx, 1, 0, 3).unwrap(), fx.plain(b, 3));
 }
 
 /// KS-1 [BD] §3.10.1: "encryption is applied to every Aligned Unit in the file" — each clip
@@ -2609,12 +2550,11 @@ fn keyless_session_set_fits_a_disc_without_a_captured_hash() {
     assert!(set.is_for(&fx.disc.media_id()));
 }
 
-/// J22 with J21 parity (review r4). KS-14 [BD] §3.9.3: "Num_of_CPS_Unit field (16 bits)
-/// indicates the number of CPS Units on the disc". Step 10 keys on no less evidence than step
-/// 9: one opened probe of a piece longer than one unit is not proof, so the piece stays Lazy
-/// with the proven key as candidate; a one-unit piece's one opened probe keys it.
+/// KS-14 [BD] §3.9.3: one declared unit keys every piece from the main title's samples: a
+/// piece with one readable unit of ten, and a one-unit piece, are keyed alike, and the only
+/// source is asked once.
 #[test]
-fn single_unit_rule_needs_two_probes_unless_one_unit_long() {
+fn single_declared_unit_needs_no_probe_of_each_piece() {
     let fx = fixture(
         &[
             stream(1, 10, Some(K1)),
@@ -2626,7 +2566,7 @@ fn single_unit_rule_needs_two_probes_unless_one_unit_long() {
     );
     let (b, n) = fx.file(1);
     let src = fx.source();
-    src.kill(b + 3, b + n); // one of B's ten probes reads
+    src.kill(b + 3, b + n);
     let calls = Calls::default();
     let set = resolve_with(
         &fx,
@@ -2637,16 +2577,12 @@ fn single_unit_rule_needs_two_probes_unless_one_unit_long() {
         &FakeClock::default(),
     )
     .unwrap();
-    assert_eq!(
-        set.lazy(),
-        &[(b, b + n)],
-        "one probe of ten: Lazy, not keyed"
-    );
-    assert_eq!(set.status().keyed, 2, "A and the one-unit C");
+    assert!(set.lazy().is_empty());
+    assert_eq!(set.status().keyed, 3);
+    assert_eq!(calls.of("keydb").len(), 1);
     src.heal();
     let mut r = set.title_reader(&fx.disc, 0, src).unwrap();
     assert_eq!(read(&mut r, &fx, 1, 0, 10).unwrap(), fx.plain(b, 10));
-    assert_eq!(set.proof_cache().get(b), Some(Proof::Proven(0)));
 }
 
 // ── J23: would the disc's VID help? ────────────────────────────────────────
