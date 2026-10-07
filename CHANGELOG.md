@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [1.8.1] — Unreleased
 
 - `DriveInfo::display_name` is the name the OS shows users: the drive letter (`E:`) on Windows, `/dev/srN` on Linux and `diskN` on macOS while a disc is mounted; it equals `path` when the OS has no name. `path` remains the selector to open. Windows lists lettered drives in letter order, then unlettered drives by `CdRomN`.
 - Drive listing enumerates instead of guessing device numbers. Windows lists every `CdRomN` from `QueryDosDeviceW` plus optical drive letters (previously only `CdRom0`–`15`), retries INQUIRY with 36 bytes for strict USB bridges, and logs skipped devices. Linux also lists optical `sr` devices that have no `sg` node (the `sg` module is not loaded) and, without sysfs, reads `/dev` instead of probing `sg0`–`15`. macOS no longer stops at 8 drives.
