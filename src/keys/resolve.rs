@@ -551,12 +551,12 @@ fn scope_layout(ev: &KeyEvidence) -> (Option<&super::fmts::Layout>, Vec<(u32, u3
     (layout, clip)
 }
 
-// KS-14 [BD] §3.9.3: one declared CPS unit is one Unit Key for every stream file, so the disc
-// is trusted as declared: the main title's samples ask the sources once, and the key that
-// opens them keys every piece in scope. No per-piece probing (32 reads a piece: minutes of
-// seeks on a many-clip disc). FMTS segment units are never samples; the segments are keyed
-// by their forensic set. `None` (no ciphertext found, or no key opens it) falls back to the
-// probed path, which decides clear content and refusals.
+/// KS-14 [BD] §3.9.3: one declared CPS unit is one Unit Key for every stream file, so the disc
+/// is trusted as declared: the main title's samples ask the sources once, and the key that
+/// opens them keys every piece in scope. No per-piece probing (32 reads a piece: minutes of
+/// seeks on a many-clip disc). FMTS segment units are never samples; the segments are keyed
+/// by their forensic set. `None` (no ciphertext found, or no key opens it) falls back to the
+/// probed path, which decides clear content and refusals.
 fn resolve_one_unit(
     ev: &KeyEvidence,
     sampler: &mut Sampler,
@@ -643,12 +643,12 @@ fn resolve_one_unit(
     Ok(Some(inner))
 }
 
-// Several declared CPS units: each stream file sits in exactly one (KS-10), so one encrypted
-// unit per piece (the first its probe grid finds, FMTS segment units skipped) names its key.
-// The main title's samples ask first; pieces no held key opens then ask with their own units,
-// at most `n_decl` requests. Every piece read clear and so do the forensic segments in scope:
-// content in the clear, no source asked. `None` (a piece unreadable, or one no key opens)
-// falls back to the probed path.
+/// Several declared CPS units: each stream file sits in exactly one (KS-10), so one encrypted
+/// unit per piece (the first its probe grid finds, FMTS segment units skipped) names its key.
+/// The main title's samples ask first; pieces no held key opens then ask with their own units,
+/// at most `n_decl` requests. Every piece read clear and so do the forensic segments in scope:
+/// content in the clear, no source asked. `None` (a piece unreadable, or one no key opens)
+/// falls back to the probed path.
 fn resolve_per_unit(
     ev: &KeyEvidence,
     sampler: &mut Sampler,
@@ -715,9 +715,8 @@ fn resolve_per_unit(
             }
         }
     }
-    // Then, largest piece first, each still-unopened unit asks the sample-dependent sources
-    // with enough of its own ciphertext (topped up from pieces of the same title, KS-10), at
-    // most `n_decl` requests. One answer may open many pieces. A source that answers with no
+    // Largest piece first, each unopened unit asks with its own ciphertext (topped up from
+    // its title's pieces, KS-10), at most `n_decl` requests. A source that answers with no
     // key has none for this disc: it is not asked again.
     let mut budget = n_decl;
     let mut thin: Vec<usize> = Vec::new();

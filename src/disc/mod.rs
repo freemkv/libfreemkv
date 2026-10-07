@@ -1778,12 +1778,12 @@ impl DiscId {
     }
 }
 
-// Whether a live scan parses the file at `path` (absolute, any case), so the metadata
-// prefetch bulk-loads it. On a BD tree only what the scan reads: the nav and clip files,
-// BD-J objects, jar archives and the config files the labels read beside them, META XML,
-// and the AACS files the capture reads first. Not /BDMV/BACKUP, BD-J image assets,
-// /AACS/DUPLICATE or the other AACS files: a fallback read of one still works, unprefetched.
-// Any other tree (DVD, HD DVD) keeps every file.
+/// Whether a live scan parses the file at `path` (absolute, any case), so the metadata
+/// prefetch bulk-loads it. On a BD tree only what the scan reads: the nav and clip files,
+/// BD-J objects, jar archives and the config files the labels read beside them, META XML,
+/// and the AACS files the capture reads first. Not /BDMV/BACKUP, BD-J image assets,
+/// /AACS/DUPLICATE or the other AACS files: a fallback read of one still works, unprefetched.
+/// Any other tree (DVD, HD DVD) keeps every file.
 pub(crate) fn scan_parses(bd: bool, path: &str) -> bool {
     if !bd {
         return true;
@@ -2339,10 +2339,10 @@ impl Disc {
         Ok(crate::aacs::mkb::resolve_aacs_version(cert_major, mkb, index).major())
     }
 
-    // Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding. Reads a bounded
-    // prefix (4 MiB holds a real MKB, ~4 MB on a UHD) and walks the record headers: a stream
-    // the prefix cuts is re-read with room for the record it cuts, never returned short. Also
-    // avoids the read_file MAX_FILE_BYTES cap.
+    /// Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding. Reads a bounded
+    /// prefix (4 MiB holds a real MKB, ~4 MB on a UHD) and walks the record headers: a stream
+    /// the prefix cuts is re-read with room for the record it cuts, never returned short. Also
+    /// avoids the read_file MAX_FILE_BYTES cap.
     fn read_mkb_content(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Result<Vec<u8>> {
         const START_BYTES: usize = 4 * 1024 * 1024;
         const MAX_BYTES: usize = 64 * 1024 * 1024;

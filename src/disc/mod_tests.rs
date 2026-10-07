@@ -5867,10 +5867,10 @@ fn read_capacity_rejects_a_short_transfer_instead_of_reporting_one_sector() {
     ));
 }
 
-// The scan's metadata prefetch on a BD tree loads only what the scan parses: nav, clip,
-// BD-J object, jar, META XML, the label config files beside the jars and the primary AACS
-// files. Backups, duplicates, image assets and unread AACS files stay on the disc (a
-// fallback read of one still works, unprefetched). Other trees keep every file.
+/// The scan's metadata prefetch on a BD tree loads only what the scan parses: nav, clip,
+/// BD-J object, jar, META XML, the label config files beside the jars and the primary AACS
+/// files. Backups, duplicates, image assets and unread AACS files stay on the disc (a
+/// fallback read of one still works, unprefetched). Other trees keep every file.
 #[test]
 fn scan_prefetches_only_the_files_a_bd_scan_parses() {
     for p in [
