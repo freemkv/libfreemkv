@@ -176,6 +176,104 @@ fn is_clean_ts(unit: &[u8]) -> bool {
     content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
 }
 
+/// Does `unit_key` open this encrypted AACS aligned `unit`? Returns one bit —
+/// key right or wrong — and NEVER plaintext. The single authoritative answer to
+/// "did this candidate key prove out against a sample unit", shared by the mux's
+/// key selection/verify and by an offline key-resolver (kdb's `/decode`). BD-TS
+/// 6144-byte units take the decrypt-less TS-sync fast reject ([`ts_unit_key_opens`],
+/// only the proof blocks are touched); Program-Stream and non-standard lengths
+/// fall back to the full [`decrypt_unit`] + [`is_clean`].
+///
+/// Gated behind the `keyproof` feature so the DEFAULT public API still cannot
+/// decrypt AACS — this is a key→content ORACLE (one bit), not a decryptor, and
+/// it is a private-consumer seam, not part of the open surface
+/// (KU §2.2; see `keys::public_api_cannot_decrypt_aacs`).
+#[cfg(feature = "keyproof")]
+pub fn unit_key_opens(unit: &[u8], unit_key: &[u8; 16], format: crate::disc::ContentFormat) -> bool {
+    use crate::disc::ContentFormat;
+    if matches!(format, ContentFormat::BdTs) && unit.len() == ALIGNED_UNIT_LEN {
+        return ts_unit_key_opens(unit, unit_key);
+    }
+    // PS / non-standard length: full decrypt into a scratch copy, then structural check.
+    let mut scratch = unit.to_vec();
+    decrypt_unit(&mut scratch, unit_key);
+    is_clean(&scratch, format)
+}
+
+/// BD-TS fast path of [`unit_key_opens`]: the SAME verdict as `decrypt_unit` +
+/// `is_clean(BdTs)`, from one AES block per source packet instead of the whole
+/// 383-block CBC chain — the hot path of a 100k-candidate brute. CBC decrypts
+/// any block alone (`P[i] = AES_dec(C[i]) ⊕ C[i-1]`); packet heads sit at 192-byte
+/// (block-aligned) offsets ≥ 192, so `C[i-1]` is always real ciphertext. Packet 0
+/// is skipped: its sync byte lives in the clear 16-byte seed and proves nothing.
+/// `decrypt_unit` zeroes all-zero-ciphertext (padding) packets, so those are
+/// skipped here identically. Verdict mirrors [`is_clean_ts`]:
+/// `synced >= min(content, KEY_PROOF_PACKETS)`. `#[allow(dead_code)]` so the
+/// equivalence test covers it even in a build without `keyproof`.
+#[allow(dead_code)]
+fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
+    use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+    use aes::{Aes128, Block};
+    const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
+    const NPKT: usize = ALIGNED_UNIT_LEN / PKT;
+    debug_assert_eq!(unit.len(), ALIGNED_UNIT_LEN);
+    let block_at = |o: usize| -> Block { Array::try_from(&unit[o..o + 16]).expect("16-byte block") };
+
+    // Block key = AES-128E(unit_key, seed) ⊕ seed — `decrypt_unit`'s derivation.
+    let mut bk = block_at(0);
+    Aes128::new(&(*unit_key).into()).encrypt_block(&mut bk);
+    for (b, s) in bk.iter_mut().zip(&unit[..16]) {
+        *b ^= s;
+    }
+    let cipher = Aes128::new(&bk);
+    // Plaintext of the 16-byte block at `o` (o ≥ 32, so C[i-1] is ciphertext).
+    let plain = |o: usize| {
+        let mut b = block_at(o);
+        cipher.decrypt_block(&mut b);
+        for (x, c) in b.iter_mut().zip(&unit[o - 16..o]) {
+            *x ^= c;
+        }
+        b
+    };
+
+    // Batch the head block of every non-padding packet (the backend pipelines it).
+    let mut offs = [0usize; NPKT];
+    let mut heads = [Block::default(); NPKT];
+    let mut n = 0;
+    for p in 1..NPKT {
+        let off = p * PKT;
+        if unit[off..off + PKT].iter().all(|&b| b == 0) {
+            continue; // padding — decrypt_unit restores it to zeros: not content
+        }
+        offs[n] = off;
+        heads[n] = block_at(off);
+        n += 1;
+    }
+    cipher.decrypt_blocks(&mut heads[..n]);
+
+    let (mut content, mut synced) = (0usize, 0usize);
+    for (head, &off) in heads[..n].iter().zip(&offs[..n]) {
+        match head[4] ^ unit[off - 16 + 4] {
+            TS_SYNC => {
+                content += 1;
+                synced += 1;
+            }
+            0 => {
+                // Sync byte decrypted to 0x00: content only if the rest of the
+                // payload isn't all zero too.
+                let first = plain(off);
+                let nonzero = first[4..].iter().any(|&b| b != 0)
+                    || (1..PKT / 16).any(|j| plain(off + 16 * j).iter().any(|&b| b != 0));
+                if nonzero {
+                    content += 1;
+                }
+            }
+            _ => content += 1,
+        }
+    }
+    content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
+}
+
 /// Count the MPEG-TS sync bytes (`0x47`) present at the BD-TS packet stride
 /// (offset 4 and every 192 bytes after — 4-byte TP_extra_header + 188-byte
 /// TS packet). A clear or correctly-decrypted m2ts unit shows ~one per

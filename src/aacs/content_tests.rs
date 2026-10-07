@@ -1254,3 +1254,50 @@ fn ts_packet_total_for_various_lengths() {
     // 6144 = 32 packets.
     assert_eq!(ts_packet_total(&[0u8; ALIGNED_UNIT_LEN]), 32);
 }
+
+// The decrypt-less BD-TS fast path `ts_unit_key_opens` (the brute's hot reject,
+// moved down from kdb) must return the EXACT same verdict as the full
+// `decrypt_unit` + `is_clean(BdTs)`, for the RIGHT key and for wrong keys alike —
+// or `unit_key_opens` would silently disagree with a real decrypt. This pins the
+// two together so a change to either side can't desync them.
+#[test]
+fn ts_unit_key_opens_matches_decrypt_unit_then_is_clean() {
+    let fmt = crate::disc::ContentFormat::BdTs;
+    // A content unit: TS sync at each packet's offset 4 + non-zero payload (so no
+    // packet is all-zero ciphertext padding once encrypted).
+    let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < ALIGNED_UNIT_LEN {
+        clear[off] = TS_SYNC;
+        for j in 1..(BD_SOURCE_PACKET_BYTES - 4) {
+            clear[off + j] = (j as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        off += BD_SOURCE_PACKET_BYTES;
+    }
+    let right = [0x5Au8; 16];
+    let mut enc = clear.clone();
+    aacs_encrypt_unit(&mut enc, &right);
+
+    let full = |key: &[u8; 16]| -> bool {
+        let mut u = enc.clone();
+        decrypt_unit(&mut u, key);
+        is_clean(&u, fmt)
+    };
+
+    assert!(full(&right), "sanity: the right key opens via the full path");
+    assert_eq!(
+        ts_unit_key_opens(&enc, &right),
+        full(&right),
+        "fast path must agree with decrypt+is_clean for the RIGHT key"
+    );
+    for n in 0..64u8 {
+        let mut wrong = [0u8; 16];
+        wrong[0] = n.wrapping_add(1);
+        wrong[15] = n ^ 0xA5;
+        assert_eq!(
+            ts_unit_key_opens(&enc, &wrong),
+            full(&wrong),
+            "fast path disagreed with decrypt+is_clean for wrong key {n}"
+        );
+    }
+}

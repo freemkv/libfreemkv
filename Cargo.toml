@@ -56,6 +56,12 @@ rip = [
 # `test-util`: `libfreemkv::test_util` fixtures for consumers' tests (dev-dependency
 # only; never in a release build). Implies the rip tree the fixtures build on.
 test-util = ["rip"]
+# `keyproof`: exposes `aacs::content::unit_key_opens` — a data-free key→content
+# ORACLE (one bit, never plaintext) for a PRIVATE offline key-resolver (kdb).
+# NOT in `default`, so the open public API still cannot decrypt AACS (KU §2.2;
+# the `keys::public_api_cannot_decrypt_aacs` guard pins its absence by default).
+# Needs the `rip` crypto tree (`aes`).
+keyproof = ["rip"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }

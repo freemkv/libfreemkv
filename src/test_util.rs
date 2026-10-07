@@ -12,7 +12,7 @@
 //! - [`synthetic_bd_clip`]: a muxable clear BD-TS clip (MPEG-2 + two AC-3) for goldens.
 //! - [`FakeTransport`]: a scripted drive with a state model for Stop tests (stop §5.0).
 
-use crate::aacs::content::{ALIGNED_UNIT_LEN, encrypt_unit};
+use crate::aacs::content::ALIGNED_UNIT_LEN;
 use crate::aacs::mkb::AacsVersion;
 use crate::consts::{BD_SOURCE_PACKET_BYTES, SECTOR_BYTES};
 use crate::disc::AacsState;
@@ -410,6 +410,15 @@ impl<S: SectorSource> SectorSource for CountingSource<S> {
 /// test-side door to the unit decrypt, so no consumer test needs the internal one.
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     crate::aacs::content::decrypt_unit(unit, unit_key)
+}
+
+/// Encrypt one 6144-byte aligned unit in place with a CPS unit key — the exact
+/// inverse of [`decrypt_unit`]. The test-side door for building ciphertext
+/// fixtures, so no consumer test needs the internal one. Returns `false` if the
+/// slice is too short to encrypt.
+#[must_use]
+pub fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
+    crate::aacs::content::encrypt_unit(unit, unit_key)
 }
 
 /// Overwrite the first sector of an aligned unit with garbage that keeps the encrypted flag

@@ -22,3 +22,4 @@ CLAUDE.md
 # cargo-mutants working output: large, machine-specific, never committed
 mutants.out/
 mutants.out.old/
+.cargo/config.toml
