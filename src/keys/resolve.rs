@@ -551,7 +551,7 @@ fn scope_layout(ev: &KeyEvidence) -> (Option<&super::fmts::Layout>, Vec<(u32, u3
     (layout, clip)
 }
 
-/// KS-14 [BD] §3.9.3: one declared CPS unit is one Unit Key for every stream file, so the disc
+/// KS-14 \[BD\] §3.9.3: one declared CPS unit is one Unit Key for every stream file, so the disc
 /// is trusted as declared: the main title's samples ask the sources once, and the key that
 /// opens them keys every piece in scope. No per-piece probing (32 reads a piece: minutes of
 /// seeks on a many-clip disc). FMTS segment units are never samples; the segments are keyed
