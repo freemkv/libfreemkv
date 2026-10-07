@@ -247,6 +247,28 @@ pub fn mkb_content_len(mkb: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
+/// How far a prefix `buf` of an MKB file shows its record stream, walking the record
+/// headers (4 bytes: type + BE24 length) as [`mkb_content_len`] does. `Ok(end)`: the walk
+/// stopped on a header inside `buf` (the `00 000000` end marker, padding, or a header that
+/// frames no record), so the stream ends at `end`. `Err(need)`: a record, or the header
+/// after it, runs past `buf`; the stream needs at least `need` bytes to be seen.
+pub(crate) fn mkb_prefix_end(buf: &[u8]) -> std::result::Result<usize, usize> {
+    let mut pos = 0usize;
+    loop {
+        let Some(head) = buf.get(pos..pos + 4) else {
+            return Err(pos + 4);
+        };
+        let rec_len = ((head[1] as usize) << 16) | ((head[2] as usize) << 8) | (head[3] as usize);
+        if (head[0] == 0 && rec_len == 0) || rec_len < 4 {
+            return Ok(pos);
+        }
+        if pos + rec_len > buf.len() {
+            return Err(pos + rec_len + 4);
+        }
+        pos += rec_len;
+    }
+}
+
 /// Trim an MKB's trailing fixed-region padding to its real content length —
 /// but ONLY when [`mkb_content_len`] actually found one. It returns 0 for an
 /// MKB whose first record cannot be parsed; truncating to 0 in that case would

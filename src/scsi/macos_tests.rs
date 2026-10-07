@@ -145,8 +145,8 @@ fn presence_probe_does_not_open_a_transport() {
     );
     assert!(
         elapsed < std::time::Duration::from_millis(250),
-        "probe took {elapsed:?}: the transport path's unconditional 500 ms \
-             post-unmount sleep means this budget can only be met without it"
+        "probe took {elapsed:?}: it must answer without opening the transport \
+             (force-unmount, exclusive-access retries)"
     );
     assert_eq!(
         OPEN.load(Ordering::Acquire),
@@ -297,7 +297,7 @@ fn shim_selftest_wait_slice_is_the_library_wait_slice() {
     assert_eq!(Duration::from_millis(slice as u64), WAIT_SLICE);
 }
 
-/// §2.9 M2: the settle and ObtainExclusiveAccess retry sleeps end within a slice of a cancel.
+/// §2.9 M2: the ObtainExclusiveAccess retry sleep ends within a slice of a cancel.
 #[test]
 fn shim_selftest_cancel_ends_the_settle_sleep() {
     let (rc, wake) = cancel_during(|c| unsafe { shim_selftest_sleep(LONG_MS, c) });
@@ -442,7 +442,7 @@ fn shim_selftest_cancelled_open_is_halted() {
 }
 
 /// A selector that is not an optical drive is refused before anything is unmounted: the
-/// open fails at once (no 500 ms settle sleep, no diskutil) and releases the lock.
+/// open fails at once (no diskutil) and releases the lock.
 #[test]
 fn open_of_a_non_optical_selector_is_refused_before_any_unmount() {
     let _globals = shim_globals();
@@ -455,7 +455,7 @@ fn open_of_a_non_optical_selector_is_refused_before_any_unmount() {
     );
     assert!(
         t0.elapsed() < Duration::from_millis(450),
-        "refusal took {:?}: the post-unmount settle sleep ran",
+        "refusal took {:?}: it waited on an unmount",
         t0.elapsed()
     );
     assert!(
@@ -464,48 +464,75 @@ fn open_of_a_non_optical_selector_is_refused_before_any_unmount() {
     );
 }
 
-/// §2.9 M2 end to end: a resolved drive's open hands its token to the unmount and 500 ms
-/// settle waits. The unmount of a missing disk ends at once, so the cancel lands in the settle.
+/// §2.9 M2 end to end: a resolved drive's open hands its token to the unmount, so a Stop
+/// raised before the open ends it `Halted` before the drive is claimed (the unmount's wait,
+/// or the check as it returns, sees the token).
 #[test]
 fn shim_selftest_cancel_mid_open_is_halted() {
-    struct FakeOptical;
-    impl Drop for FakeOptical {
-        fn drop(&mut self) {
-            unsafe { shim_selftest_fake_optical(0) };
-        }
-    }
     let _globals = shim_globals();
-    unsafe { shim_selftest_fake_optical(1) };
-    let _fake = FakeOptical;
-    let (r, wake) = {
-        let halt = Halt::new();
-        let canceller = {
-            let halt = halt.clone();
-            thread::spawn(move || {
-                thread::sleep(CANCEL_AFTER);
-                let at = Instant::now();
-                halt.cancel();
-                at
-            })
-        };
-        let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &halt);
-        let returned = Instant::now();
-        let cancelled_at = canceller.join().expect("canceller thread");
-        (r, returned.saturating_duration_since(cancelled_at))
-    };
+    let _fake = FakeOptical::on();
+    let halt = Halt::new();
+    halt.cancel();
+    let t0 = Instant::now();
+    let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &halt);
     assert!(
         matches!(r, Err(Error::Halted)),
         "expected Halted, got {:?}",
         r.err()
     );
     assert!(
-        wake <= WAKE_BOUND,
-        "open returned {wake:?} after the cancel"
+        t0.elapsed() <= WAKE_BOUND,
+        "cancelled open took {:?}",
+        t0.elapsed()
     );
     assert!(
         !OPEN.load(Ordering::Acquire),
         "a cancelled open left OPEN held"
     );
+}
+
+/// A resolved drive's open goes straight from the unmount to claiming the drive: no fixed
+/// settle sleep after `diskutil` (a drive not yet released is waited for by the
+/// ObtainExclusiveAccess retries). The fake optical service is no MMC device, so the open
+/// fails at the plugin, well inside the 500 ms the settle sleep alone used to cost.
+#[test]
+fn shim_selftest_open_has_no_post_unmount_settle() {
+    let _globals = shim_globals();
+    let _fake = FakeOptical::on();
+    let t0 = Instant::now();
+    let r = MacScsiTransport::open(Path::new("/dev/freemkv-no-such-device"), &Halt::new());
+    let took = t0.elapsed();
+    assert!(r.is_err(), "the fake optical service is no MMC device");
+    assert!(
+        !matches!(r, Err(Error::Halted)),
+        "nothing cancelled the open: {:?}",
+        r.err()
+    );
+    assert!(
+        took < Duration::from_millis(450),
+        "open took {took:?}: a settle sleep ran after the unmount"
+    );
+    assert!(
+        !OPEN.load(Ordering::Acquire),
+        "a failed open left OPEN held"
+    );
+}
+
+// The shim resolves any selector to a stand-in optical service while held; off on drop
+// (panic included).
+struct FakeOptical;
+
+impl FakeOptical {
+    fn on() -> Self {
+        unsafe { shim_selftest_fake_optical(1) };
+        FakeOptical
+    }
+}
+
+impl Drop for FakeOptical {
+    fn drop(&mut self) {
+        unsafe { shim_selftest_fake_optical(0) };
+    }
 }
 
 /// §2.9 M1: "`timeout_ms` is passed through to the shim", reaching the task unchanged.

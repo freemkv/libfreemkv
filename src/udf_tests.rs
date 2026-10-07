@@ -1792,6 +1792,68 @@ fn metadata_sector_ranges_covers_the_structure_and_each_small_files_extents() {
     );
 }
 
+// `metadata_sector_ranges_for`: `wanted` sees each file's absolute path; a file it refuses gets no range, neither its
+// data nor its File Entry, and its File Entry is never read.
+#[test]
+fn metadata_sector_ranges_leave_out_the_files_wanted_refuses() {
+    const PART: u32 = 1000;
+    let fs = UdfFs {
+        root: DirEntry {
+            name: String::new(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![DirEntry {
+                name: "BDMV".to_string(),
+                is_dir: true,
+                meta_lba: 1,
+                size: 0,
+                entries: vec![
+                    file_entry("index.bdmv", 10, 2048),
+                    DirEntry {
+                        name: "BACKUP".to_string(),
+                        is_dir: true,
+                        meta_lba: 2,
+                        size: 0,
+                        entries: vec![file_entry("index.bdmv", 20, 2048)],
+                    },
+                ],
+            }],
+        },
+        volume_id: String::new(),
+        partition_start: PART,
+        meta: MetaMap::contiguous(PART),
+        metadata_sectors: 4,
+    };
+    struct Reads(MapReader, Vec<u32>);
+    impl SectorSource for Reads {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            self.1.push(lba);
+            self.0.read_sectors(lba, n, buf, r)
+        }
+    }
+    let mut reader = Reads(MapReader::new(), Vec::new());
+    reader.0.put(PART + 10, build_efe(2048, &[(0, 2048, 500)]));
+    reader.0.put(PART + 20, build_efe(2048, &[(0, 2048, 600)]));
+    let seen = std::cell::RefCell::new(Vec::new());
+    let ranges = fs
+        .metadata_sector_ranges_for(&mut reader, &|p| {
+            seen.borrow_mut().push(p.to_string());
+            !p.contains("/BACKUP/")
+        })
+        .expect("the plan is built");
+    assert_eq!(
+        *seen.borrow(),
+        ["/BDMV/index.bdmv", "/BDMV/BACKUP/index.bdmv"]
+    );
+    assert_eq!(ranges, vec![(0, 1004), (1010, 1), (1500, 1)]);
+    assert!(
+        !reader.1.contains(&(PART + 20)),
+        "the refused file's File Entry was read: {:?}",
+        reader.1
+    );
+}
+
 #[test]
 fn prefetch_huge_count_is_capped() {
     // A disc-controlled sector count far exceeding the 8192-sector cap must

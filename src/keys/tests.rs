@@ -220,6 +220,8 @@ impl SectorSource for NoSeek {
 struct Call {
     who: &'static str,
     samples: usize,
+    // The sample units the request carried.
+    units: Vec<Vec<u8>>,
     vid: Option<[u8; 16]>,
     forensic: bool,
     at: Duration,
@@ -333,6 +335,7 @@ impl Fake {
         self.spec.calls.0.lock().unwrap().push(Call {
             who: self.spec.who,
             samples: samples.len(),
+            units: samples.clone(),
             vid: ctx.vid().map(|v| v.0),
             forensic,
             at,
@@ -1807,12 +1810,17 @@ fn decrypting_reader_sits_below_the_prefetcher() {
 // with an index-1 segment over units 0..16 and an index-2 segment over units 20..36. Our
 // phase is Even (F1 / F2); odd segment units are the alternate variant (ALT).
 fn fmts_fixture() -> Fx {
+    fmts_fixture_keyed(Some(K1), 2)
+}
+
+// `fmts_fixture` with file 0 under `key` (`None`: clear), declaring `declared` CPS units.
+fn fmts_fixture_keyed(key: Option<[u8; 16]>, declared: usize) -> Fx {
     let files = [
-        stream(1, 10, Some(K1)),
+        stream(1, 10, key),
         BdFile::new("BDMV/STREAM/00002.fmts", 180, Some(K2)),
         BdFile::new("AACS/IndividualSegment.tbl", 1, None),
     ];
-    let mut fx = fixture(&files, 2, &[&[0], &[1], &[0, 1]]);
+    let mut fx = fixture(&files, declared, &[&[0], &[1], &[0, 1]]);
     fx.disc.format = DiscFormat::Fmts;
     let segs = [(1u16, 0u32, 16u32), (2, 20, 36)];
     let mut tbl = Vec::new();
@@ -1835,6 +1843,132 @@ fn fmts_fixture() -> Fx {
         }
     }
     fx
+}
+
+/// Key evidence reads the filesystem as the scan does, batched with the metadata partition
+/// prefetched: a few commands where the direct walk sent one per sector, and the same
+/// pieces and forensic layout.
+#[test]
+fn evidence_reads_the_filesystem_in_batched_commands() {
+    let fx = fmts_fixture();
+    let ctx = crate::ctx::Ctx::new(Halt::new());
+    let mut batched = CountingSource::new(fx.source());
+    let log = batched.log();
+    let ev = KeyEvidence::from_disc(&fx.disc, &mut batched, KeyScope::WholeDisc, &ctx).unwrap();
+
+    // The direct walk the evidence used to make, on the raw source.
+    let mut direct = CountingSource::new(fx.source());
+    let direct_log = direct.log();
+    let fs = crate::udf::read_filesystem(&mut direct).unwrap();
+    let files = crate::whole_disc::content_files_in(&fs, &mut direct).unwrap();
+    let layout = super::fmts::layout(&fs, &mut direct)
+        .unwrap()
+        .expect("FMTS");
+    let all: Vec<usize> = (0..fx.disc.titles.len()).collect();
+
+    assert_eq!(
+        ev.pieces,
+        super::evidence::pieces(&fx.disc, &files, &all, true)
+    );
+    let fmts = ev.fmts.as_ref().expect("the forensic layout");
+    assert_eq!(fmts.ranges, layout.ranges);
+    assert_eq!(fmts.clip, layout.clip);
+    assert!(
+        direct_log.reads().iter().all(|&(_, n)| n == 1),
+        "the direct walk reads a sector per command"
+    );
+    assert!(
+        log.count() * 3 <= direct_log.count(),
+        "{} commands for the evidence, the direct walk {}",
+        log.count(),
+        direct_log.count()
+    );
+}
+
+/// KS-25, KS-26 (evidence): an FMTS segment unit carries a forensic key, not the unit key, so
+/// the main title's samples skip the segments; the forensic clip's base units are sampled.
+#[test]
+fn main_samples_skip_forensic_segment_units() {
+    let fx = fmts_fixture();
+    let mut src = fx.source();
+    let fs = crate::udf::read_filesystem(&mut src).unwrap();
+    let layout = super::fmts::layout(&fs, &mut src).unwrap().expect("FMTS");
+    let segments: Vec<(u32, u32)> = layout.ranges.iter().map(|&(s, e, _)| (s, e)).collect();
+    let (c, n) = fx.file(1);
+    let main = super::evidence::MainTitle {
+        extents: vec![Extent {
+            start_lba: c,
+            sector_count: n,
+        }],
+        format: ContentFormat::BdTs,
+    };
+    let mut sampler = Sampler::new(&mut src);
+    let skipped = sampler.main_samples(Some(&main), 32, &segments);
+    assert!(skipped.len() >= crate::keysource::MIN_SAMPLE_UNITS);
+    assert!(
+        skipped.iter().all(|u| opens(u, &K2)),
+        "every sample is a base unit of the clip"
+    );
+    let all = sampler.main_samples(Some(&main), 32, &[]);
+    assert!(
+        all.iter().any(|u| !opens(u, &K2)),
+        "the clip's segments are sampled when not skipped"
+    );
+}
+
+/// KS-14 [BD] §3.9.3 on an FMTS disc: one declared unit is trusted, no piece probed unit by
+/// unit. The main title's samples (its ciphertext is the forensic clip's), none from a
+/// forensic segment, ask the source once; its key keys the pieces and the forensic set keys
+/// the segments: the clip reads, the alternate phase still ciphertext.
+#[test]
+fn fmts_one_declared_unit_is_keyed_from_the_main_titles_base_units() {
+    let fx = fmts_fixture_keyed(None, 1);
+    let calls = Calls::default();
+    let mut src = CountingSource::new(fx.source());
+    let log = src.log();
+    let set = resolve_with(
+        &fx,
+        &mut src,
+        KeyScope::Titles(vec![2]),
+        &[fmts_online(&calls)],
+        AcquireOptions::default(),
+        &FakeClock::default(),
+    )
+    .unwrap();
+    // One-unit reads are the forensic anchor's and phase probes', all inside the segments.
+    let segments = [
+        (fx.unit(1, 0), fx.unit(1, 16)),
+        (fx.unit(1, 20), fx.unit(1, 36)),
+    ];
+    assert!(
+        log.reads()
+            .iter()
+            .filter(|r| r.1 == 3)
+            .all(|&(lba, _)| segments.iter().any(|&(s, e)| (s..e).contains(&lba))),
+        "a piece was probed unit by unit: {:?}",
+        log.reads()
+    );
+    let unit_calls: Vec<Call> = calls
+        .of("online")
+        .into_iter()
+        .filter(|c| !c.forensic)
+        .collect();
+    assert_eq!(unit_calls.len(), 1, "one unit-key request");
+    assert!(unit_calls[0].samples >= crate::keysource::MIN_SAMPLE_UNITS);
+    assert!(
+        unit_calls[0].units.iter().all(|u| opens(u, &K2)),
+        "no forensic segment unit is a unit-key sample"
+    );
+    assert_eq!(set.status().keyed, 2);
+    assert_eq!(set.status().forensic, ForensicState::Resolved);
+    let mut r = set.title_reader(&fx.disc, 2, fx.source()).unwrap();
+    let got = read(&mut r, &fx, 1, 0, 60).unwrap();
+    let plain = fx.plain(fx.file(1).0, 60);
+    for u in 0..60usize {
+        let range = u * ALIGNED_UNIT_LEN..(u + 1) * ALIGNED_UNIT_LEN;
+        let alternate = (u < 16 || (20..36).contains(&u)) && u % 2 == 1;
+        assert_eq!(got[range.clone()] == plain[range], !alternate, "unit {u}");
+    }
 }
 
 /// A present but unparseable segment table is a refusal, never "not FMTS" (which would rip

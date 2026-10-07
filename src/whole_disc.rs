@@ -28,15 +28,9 @@ pub fn raw_whole_disc_reader<S: SectorSource>(reader: S) -> WholeDiscReader<S> {
     )
 }
 
-// Every AACS content file's extents, one entry per file (contiguous extents joined):
+// Every AACS content file's extents in `fs`, one entry per file (contiguous extents joined):
 // `/BDMV/STREAM` (m2ts before SSIF, which re-lists them) or else HD DVD `/HVDVD_TS/*.EVO`.
-// An unreadable UDF or unmappable file fails loud: it would otherwise ship as ciphertext.
-pub(crate) fn content_files(reader: &mut dyn SectorSource) -> Result<Vec<Vec<(u32, u32)>>> {
-    let fs = crate::udf::read_filesystem(reader)?;
-    content_files_in(&fs, reader)
-}
-
-// `content_files` over an already-read filesystem.
+// An unmappable file fails loud: it would otherwise ship as ciphertext.
 pub(crate) fn content_files_in(
     fs: &crate::udf::UdfFs,
     reader: &mut dyn SectorSource,

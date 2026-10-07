@@ -345,6 +345,17 @@ impl UdfFs {
     /// `STREAM` directories (case-insensitive) are not descended, and files over 50 MB are
     /// skipped.
     pub fn metadata_sector_ranges(&self, reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
+        self.metadata_sector_ranges_for(reader, &|_| true)
+    }
+
+    /// [`Self::metadata_sector_ranges`] over the files `wanted` accepts, by absolute path
+    /// (e.g. `/BDMV/PLAYLIST/00000.mpls`): a file it refuses gets no range and its File Entry
+    /// is not read. The live scan's prefetch plan.
+    pub(crate) fn metadata_sector_ranges_for(
+        &self,
+        reader: &mut dyn SectorSource,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
         // UDF structure: sector 0 through end of metadata partition
@@ -363,7 +374,15 @@ impl UdfFs {
 
         // Walk tree, collect ranges for each metadata file
         let mut seen = HashSet::new();
-        self.collect_file_ranges(reader, &self.root, &mut ranges, &mut seen)?;
+        let mut path = String::new();
+        self.collect_file_ranges(
+            reader,
+            &self.root,
+            &mut path,
+            wanted,
+            &mut ranges,
+            &mut seen,
+        )?;
 
         // Merge overlapping/adjacent ranges and sort
         ranges.sort_by_key(|r| r.0);
@@ -442,52 +461,74 @@ impl UdfFs {
             .collect()
     }
 
+    // `path` is `entry`'s absolute path ("" for the root), restored on return.
     fn collect_file_ranges(
         &self,
         reader: &mut dyn SectorSource,
         entry: &DirEntry,
+        path: &mut String,
+        wanted: &dyn Fn(&str) -> bool,
         ranges: &mut Vec<(u32, u32)>,
         seen: &mut HashSet<u32>,
     ) -> Result<()> {
         for child in &entry.entries {
-            if child.is_dir {
-                // Only skip STREAM — those are the multi-GB video files
-                if child.name.eq_ignore_ascii_case("STREAM") {
-                    continue;
-                }
-                self.collect_file_ranges(reader, child, ranges, seen)?;
-            } else {
-                // Include the ICB sector itself (in metadata partition)
-                ranges.push((self.meta_to_abs(child.meta_lba)?, 1));
+            let at = path.len();
+            path.push('/');
+            path.push_str(&child.name);
+            let r = self.collect_child_ranges(reader, child, path, wanted, ranges, seen);
+            path.truncate(at);
+            r?;
+        }
+        Ok(())
+    }
 
-                // Include file data — skip only truly huge files (MKB_RO.inf = 134MB)
-                if child.size > MAX_CACHED_FILE_BYTES {
-                    continue;
-                }
-
-                // Push every extent (a fragmented AACS cert / MPLS / CLPI spans several);
-                // entries can share one ICB, so read its extents once.
-                if !seen.insert(child.meta_lba) {
-                    continue;
-                }
-                match self.read_icb_extents(reader, child.meta_lba) {
-                    Err(Error::Halted) => return Err(Error::Halted),
-                    Err(_) => {}
-                    Ok(extents) => {
-                        for ext in extents {
-                            // An unrecorded extent holds nothing to cache.
-                            if !ext.recorded {
-                                continue;
-                            }
-                            let Some(abs_start) = self.partition_start.checked_add(ext.lba) else {
-                                continue;
-                            };
-                            let sector_count = (ext.len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
-                            ranges.push((abs_start, sector_count));
-                        }
-                        compact_ranges(ranges, self.meta.start())?;
+    fn collect_child_ranges(
+        &self,
+        reader: &mut dyn SectorSource,
+        child: &DirEntry,
+        path: &mut String,
+        wanted: &dyn Fn(&str) -> bool,
+        ranges: &mut Vec<(u32, u32)>,
+        seen: &mut HashSet<u32>,
+    ) -> Result<()> {
+        if child.is_dir {
+            // Only skip STREAM — those are the multi-GB video files
+            if child.name.eq_ignore_ascii_case("STREAM") {
+                return Ok(());
+            }
+            return self.collect_file_ranges(reader, child, path, wanted, ranges, seen);
+        }
+        // A file the scan never reads is not prefetched (nor its File Entry read).
+        if !wanted(path) {
+            return Ok(());
+        }
+        // Include the ICB sector itself (in metadata partition)
+        ranges.push((self.meta_to_abs(child.meta_lba)?, 1));
+        // Include file data — skip only truly huge files (MKB_RO.inf = 134MB)
+        if child.size > MAX_CACHED_FILE_BYTES {
+            return Ok(());
+        }
+        // Push every extent (a fragmented AACS cert / MPLS / CLPI spans several);
+        // entries can share one ICB, so read its extents once.
+        if !seen.insert(child.meta_lba) {
+            return Ok(());
+        }
+        match self.read_icb_extents(reader, child.meta_lba) {
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => {}
+            Ok(extents) => {
+                for ext in extents {
+                    // An unrecorded extent holds nothing to cache.
+                    if !ext.recorded {
+                        continue;
                     }
+                    let Some(abs_start) = self.partition_start.checked_add(ext.lba) else {
+                        continue;
+                    };
+                    let sector_count = (ext.len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
+                    ranges.push((abs_start, sector_count));
                 }
+                compact_ranges(ranges, self.meta.start())?;
             }
         }
         Ok(())

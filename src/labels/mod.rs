@@ -1277,6 +1277,20 @@ pub(crate) fn find_jar_file(udf: &UdfFs, filename: &str) -> Option<String> {
     jar_file_paths(udf, filename).into_iter().next()
 }
 
+/// The files the labels read from a BDMV/JAR subdirectory (`read_jar_file`, Deluxe's
+/// `config.xml`): the scan's metadata prefetch loads these and none of the subdirectory's
+/// image assets. A name missing here still reads, unprefetched.
+pub(crate) const JAR_DIR_FILES: &[&str] = &[
+    "config.xml",
+    "playlists.xml",
+    "language_streams.txt",
+    "menu_base.prop",
+    "bluray_project.bin",
+    "streamproperties.xml",
+    "playbackconfig.xml",
+    "dcx.xml",
+];
+
 /// Read a file from any BDMV/JAR subdirectory by filename; the first copy
 /// that reads successfully and is non-empty wins.
 pub(crate) fn read_jar_file(
@@ -1284,6 +1298,12 @@ pub(crate) fn read_jar_file(
     udf: &UdfFs,
     filename: &str,
 ) -> Option<Vec<u8>> {
+    debug_assert!(
+        JAR_DIR_FILES
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(filename)),
+        "{filename} is read by a label: list it in JAR_DIR_FILES so the scan prefetches it"
+    );
     jar_file_paths(udf, filename)
         .into_iter()
         .find_map(|path| udf.read_file(reader, &path).ok().filter(|d| !d.is_empty()))

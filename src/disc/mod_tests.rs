@@ -1337,6 +1337,86 @@ fn read_mkb_content_grows_prefix_past_16mib_when_records_run_longer() {
     );
 }
 
+// An MKB_RO.inf holding `mkb` (zero-padded to `file_len`) at LBA 1000 of a bare UDF tree.
+fn mkb_disc(mut mkb: Vec<u8>, file_len: usize) -> (crate::udf::fixture::MemDisc, udf::UdfFs) {
+    use crate::udf::fixture::*;
+    mkb.resize(file_len, 0);
+    let mut disc = MemDisc::new();
+    let root = DirSpec {
+        name: String::new(),
+        icb_lba: 10,
+        dir_data_lba: 11,
+        files: Vec::new(),
+        subdirs: vec![DirSpec {
+            name: "AACS".into(),
+            icb_lba: 12,
+            dir_data_lba: 13,
+            files: vec![file_with("MKB_RO.inf", 14, 1000, mkb, true)],
+            subdirs: vec![],
+        }],
+    };
+    build_udf_skeleton(&mut disc, 10);
+    lay_dir(&mut disc, &root);
+    let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+    (disc, udf)
+}
+
+// An MKB record stream: `lens` records (header included) of filler, then the end marker.
+fn mkb_stream(lens: &[usize]) -> Vec<u8> {
+    let mut mkb = Vec::new();
+    for &len in lens {
+        mkb.extend_from_slice(&[0x04, (len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        mkb.resize(mkb.len() + len - 4, 0xAA);
+    }
+    mkb.extend_from_slice(&[0, 0, 0, 0]);
+    mkb
+}
+
+// Counts the sectors read off the wrapped source.
+struct SectorCount<'a>(&'a mut crate::udf::fixture::MemDisc, u64);
+
+impl SectorSource for SectorCount<'_> {
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+        self.1 += u64::from(count);
+        self.0.read_sectors(lba, count, buf, r)
+    }
+}
+
+// A real-sized MKB (3,809,272 bytes of records on a live UHD, in a ~128 MiB padded file) is
+// read from a 4 MiB prefix, not 16 MiB, and returned byte for byte.
+#[test]
+fn read_mkb_content_reads_a_4mib_prefix_for_a_real_sized_mkb() {
+    let records = [12, 3_809_272 - 12 - 4];
+    let stream = mkb_stream(&records);
+    assert_eq!(stream.len(), 3_809_272);
+    let (mut disc, udf) = mkb_disc(stream.clone(), 20 * 1024 * 1024);
+    let mut src = SectorCount(&mut disc, 0);
+    let got = Disc::read_mkb_content(&mut src, &udf).expect("mkb");
+    assert_eq!(
+        got,
+        stream[..stream.len() - 4],
+        "the record stream, byte for byte"
+    );
+    let data_sectors = (4 * 1024 * 1024 / 2048) as u64;
+    assert!(
+        src.1 <= data_sectors + 4,
+        "read {} sectors: more than the 4 MiB prefix and the File Entry",
+        src.1
+    );
+}
+
+// A record the 4 MiB prefix cuts is read whole: the walk asks for the bytes it needs and the
+// prefix grows, rather than returning the stream up to the cut record.
+#[test]
+fn read_mkb_content_rereads_a_record_the_prefix_cuts() {
+    const MIB: usize = 1024 * 1024;
+    let stream = mkb_stream(&[3 * MIB, 3 * MIB]);
+    let (mut disc, udf) = mkb_disc(stream.clone(), 20 * MIB);
+    let got = Disc::read_mkb_content(&mut disc, &udf).expect("mkb");
+    assert_eq!(got.len(), 6 * MIB, "both records, not the first alone");
+    assert_eq!(got, stream[..6 * MIB]);
+}
+
 // ── identify(): AACS-directory encrypted gate (finding 6) ──────────────
 // A ScsiTransport serving a synthetic UDF image through real READ(10),
 // so Disc::identify is exercised end-to-end, not mocked itself.
@@ -5785,4 +5865,54 @@ fn read_capacity_rejects_a_short_transfer_instead_of_reporting_one_sector() {
         Disc::read_capacity(&mut drive),
         Err(crate::error::Error::DiscCapacityMalformed)
     ));
+}
+
+// The scan's metadata prefetch on a BD tree loads only what the scan parses: nav, clip,
+// BD-J object, jar, META XML, the label config files beside the jars and the primary AACS
+// files. Backups, duplicates, image assets and unread AACS files stay on the disc (a
+// fallback read of one still works, unprefetched). Other trees keep every file.
+#[test]
+fn scan_prefetches_only_the_files_a_bd_scan_parses() {
+    for p in [
+        "/BDMV/index.bdmv",
+        "/BDMV/MovieObject.bdmv",
+        "/BDMV/PLAYLIST/00800.mpls",
+        "/BDMV/CLIPINF/00055.clpi",
+        "/BDMV/BDJO/00000.bdjo",
+        "/BDMV/META/DL/bdmt_eng.xml",
+        "/BDMV/JAR/00000.jar",
+        "/BDMV/JAR/00001/config.xml",
+        "/BDMV/JAR/00002/DCX.XML",
+        "/AACS/Unit_Key_RO.inf",
+        "/AACS/Content000.cer",
+        "/AACS/Content001.cer",
+        "/AACS/MKB_RO.inf",
+        "/aacs/unit_key_ro.inf",
+    ] {
+        assert!(scan_parses(true, p), "{p} is parsed: prefetch it");
+    }
+    for p in [
+        "/BDMV/BACKUP/index.bdmv",
+        "/BDMV/BACKUP/PLAYLIST/00800.mpls",
+        "/BDMV/JAR/00001/menu_bg.png",
+        "/BDMV/JAR/00001/sub/config.xml",
+        "/BDMV/META/DL/bdmt_eng_thumb.jpg",
+        "/BDMV/AUXDATA/sound.bdmv",
+        "/BDMV/PLAYLIST/x/00800.mpls",
+        "/AACS/DUPLICATE/Unit_Key_RO.inf",
+        "/AACS/DUPLICATE/Content000.cer",
+        "/AACS/ContentHash000.tbl",
+        "/AACS/ContentRevocation.lst",
+        "/AACS/CPSUnit00001.cci",
+        "/CERTIFICATE/id.bdmv",
+    ] {
+        assert!(!scan_parses(true, p), "{p} is not parsed: leave it");
+    }
+    for p in [
+        "/VIDEO_TS/VIDEO_TS.IFO",
+        "/HVDVD_TS/FEATURE.MAP",
+        "/AACS/DUPLICATE/x",
+    ] {
+        assert!(scan_parses(false, p), "{p}: a non-BD tree keeps every file");
+    }
 }

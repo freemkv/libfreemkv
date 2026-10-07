@@ -387,6 +387,18 @@ pub(crate) fn encrypted_units_in(
     format: crate::disc::ContentFormat,
     n: usize,
 ) -> Vec<Vec<u8>> {
+    encrypted_units_outside(reader, extents, format, n, &[])
+}
+
+// `encrypted_units_in` taking no unit that touches a `skip` range `[start, end)` (FMTS
+// forensic segments: their units carry a forensic key, not the unit key).
+pub(crate) fn encrypted_units_outside(
+    reader: &mut dyn crate::sector::SectorSource,
+    extents: &[crate::disc::Extent],
+    format: crate::disc::ContentFormat,
+    n: usize,
+    skip: &[(u32, u32)],
+) -> Vec<Vec<u8>> {
     use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
     const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
     // Probe several evenly-spaced points across EACH extent, not just midpoint
@@ -441,6 +453,11 @@ pub(crate) fn encrypted_units_in(
                     break;
                 }
                 let u = &buf[o..o + ALIGNED_UNIT_LEN];
+                let at = lba as u64 + (i as u64) * ALIGNED_UNIT_SECTORS as u64;
+                let end = at + ALIGNED_UNIT_SECTORS as u64;
+                if skip.iter().any(|&(s, e)| (s as u64) < end && at < e as u64) {
+                    continue;
+                }
                 if aacs_unit_encrypted(u, format) {
                     out.push(u.to_vec());
                     if out.len() >= n {

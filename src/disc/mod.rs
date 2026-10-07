@@ -1778,6 +1778,56 @@ impl DiscId {
     }
 }
 
+// Whether a live scan parses the file at `path` (absolute, any case), so the metadata
+// prefetch bulk-loads it. On a BD tree only what the scan reads: the nav and clip files,
+// BD-J objects, jar archives and the config files the labels read beside them, META XML,
+// and the AACS files the capture reads first. Not /BDMV/BACKUP, BD-J image assets,
+// /AACS/DUPLICATE or the other AACS files: a fallback read of one still works, unprefetched.
+// Any other tree (DVD, HD DVD) keeps every file.
+pub(crate) fn scan_parses(bd: bool, path: &str) -> bool {
+    if !bd {
+        return true;
+    }
+    let p = path.to_ascii_uppercase();
+    let in_dir = |dir: &str| {
+        p.strip_prefix(dir)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .filter(|name| !name.contains('/'))
+    };
+    if let Some(name) = in_dir("/BDMV") {
+        return matches!(name, "INDEX.BDMV" | "MOVIEOBJECT.BDMV");
+    }
+    if ["/BDMV/PLAYLIST", "/BDMV/CLIPINF", "/BDMV/BDJO"]
+        .iter()
+        .any(|d| in_dir(d).is_some())
+    {
+        return true;
+    }
+    if p.starts_with("/BDMV/META/") {
+        return p.ends_with(".XML");
+    }
+    if let Some(name) = in_dir("/BDMV/JAR") {
+        return name.ends_with(".JAR");
+    }
+    if let Some(rest) = p.strip_prefix("/BDMV/JAR/") {
+        // A jar subdirectory's own files: only those a label reads.
+        return rest.split_once('/').is_some_and(|(_, name)| {
+            !name.contains('/')
+                && crate::labels::JAR_DIR_FILES
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(name))
+        });
+    }
+    [
+        crate::aacs::PATH_UNIT_KEY_RO,
+        crate::aacs::PATH_CONTENT_CERT,
+        crate::aacs::PATH_CONTENT_CERT_ALT,
+        crate::aacs::PATH_MKB_RO,
+    ]
+    .iter()
+    .any(|f| f.eq_ignore_ascii_case(path))
+}
+
 impl Disc {
     /// Fast disc identification — reads only UDF metadata for name and format.
     /// No AACS handshake, no playlist parsing, no CLPI, no labels.
@@ -1957,8 +2007,10 @@ impl Disc {
         tracing::info!(target: "freemkv::scan", "phase: reading UDF filesystem");
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
         tracing::info!(target: "freemkv::scan", capacity, "phase: UDF read");
-        // Pre-read small files (AACS, MPLS, CLPI, META, *.bdmv): one command each otherwise.
-        match udf_fs.metadata_sector_ranges(&mut buffered) {
+        // Pre-read the small files the scan parses (AACS, MPLS, CLPI, META, *.bdmv): one
+        // command each otherwise.
+        let bd = udf_fs.find_dir("/BDMV").is_some();
+        match udf_fs.metadata_sector_ranges_for(&mut buffered, &|p| scan_parses(bd, p)) {
             Ok(ranges) => buffered.prefetch_ranges(&ranges)?,
             Err(Error::Halted) => return Err(Error::Halted),
             Err(_) => {} // prefetch is optional
@@ -2287,11 +2339,12 @@ impl Disc {
         Ok(crate::aacs::mkb::resolve_aacs_version(cert_major, mkb, index).major())
     }
 
-    // Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding. Reads a bounded,
-    // growing prefix instead, avoiding both the padding read and the read_file MAX_FILE_BYTES
-    // cap.
+    // Reads the AACS MKB's real record stream — NOT its ~128 MiB zero padding. Reads a bounded
+    // prefix (4 MiB holds a real MKB, ~4 MB on a UHD) and walks the record headers: a stream
+    // the prefix cuts is re-read with room for the record it cuts, never returned short. Also
+    // avoids the read_file MAX_FILE_BYTES cap.
     fn read_mkb_content(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Result<Vec<u8>> {
-        const START_BYTES: usize = 16 * 1024 * 1024;
+        const START_BYTES: usize = 4 * 1024 * 1024;
         const MAX_BYTES: usize = 64 * 1024 * 1024;
         let mut want = START_BYTES;
         loop {
@@ -2299,17 +2352,20 @@ impl Disc {
                 &crate::aacs::role_paths(udf_fs, crate::aacs::AacsRole::Mkb),
                 |p| udf_fs.read_file_prefix(reader, p, want),
             )?;
-            let n = crate::aacs::mkb::mkb_content_len(&buf);
-            // `n` strictly inside `buf` or `buf` shorter than `want` means the
-            // whole content is captured; otherwise records may run past the
-            // prefix — grow and retry, bounded by MAX_BYTES.
-            if (n > 0 && n < buf.len()) || buf.len() < want || want >= MAX_BYTES {
+            // The stream ends inside `buf`, or `buf` is the whole file, or the cap is
+            // reached: done. An unparseable first record (end 0) grows as before.
+            let need = match crate::aacs::mkb::mkb_prefix_end(&buf) {
+                Ok(n) if n > 0 => None,
+                Ok(_) => Some(0),
+                Err(need) => Some(need),
+            };
+            let Some(need) = need.filter(|_| buf.len() >= want && want < MAX_BYTES) else {
                 // The prefix buffer is sized for the padded file; release the unused capacity.
                 let mut mkb = crate::aacs::mkb::trim_mkb(buf);
                 mkb.shrink_to_fit();
                 return Ok(mkb);
-            }
-            want = (want * 2).min(MAX_BYTES);
+            };
+            want = (want * 2).max(need).min(MAX_BYTES);
         }
     }
 
@@ -3336,7 +3392,7 @@ fn random_u64() -> u64 {
 }
 
 const MAX_BATCH_SECTORS: u16 = 510;
-const DEFAULT_BATCH_SECTORS_OPTICAL: u16 = 60;
+pub(crate) const DEFAULT_BATCH_SECTORS_OPTICAL: u16 = 60;
 const DEFAULT_BATCH_SECTORS_BLOCK: u16 = 8192;
 const MIN_BATCH_SECTORS: u16 = 3;
 

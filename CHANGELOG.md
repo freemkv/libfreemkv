@@ -2,8 +2,11 @@
 
 ## [Unreleased]
 
-- Key acquisition trusts the disc's declared CPS units. With one declared unit, the main title's samples ask the key sources once and the key that opens them keys every stream file, with no per-file probing: 1.8.0 first read up to 32 units from every file (about 1,500 seeks, ~95 s on a 46-file UHD over USB; now ~3 s). With several declared units, one encrypted unit per file goes into a single request. A source is never asked twice, and when every unit's samples were sent and no key opens a file, it is refused at once (blanked in a whole-disc copy) instead of probed. A disc with an FMTS forensic layout in scope keeps the probed path.
-- Key acquisition logs its timings: evidence read, per-piece probe reads (count, average and slowest), main-title samples, total.
+- Key lookup trusts the disc's declared CPS units: samples from each unit instead of 32 reads from every stream file (a 46-file UHD over USB: ~95 s → ~1.5 s). Each source is asked once; a disc no key opens is refused at once. FMTS discs included.
+- Key evidence reads the filesystem in batches, not one command per sector (~1 s less).
+- The live scan prefetches only the files it parses (~22 MB less on a UHD) and reads the MKB from a 4 MiB prefix, not 16 MiB; the MKB bytes are unchanged.
+- macOS: opening a drive no longer waits a fixed 500 ms after unmounting.
+- Key acquisition logs its phase timings.
 - Windows: a bare drive letter (`E`) opens that drive, as `E:` does; it was opened as `\\.\E`, which does not exist (E1000).
 - Linux: a bare node name (`sg3`, `sr0`) opens `/dev/sg3` / `/dev/sr0`; it was opened relative to the current directory.
 

@@ -87,7 +87,7 @@ extern char **environ;
 #define SHIM_WAIT_SLICE_MS 20
 // diskutil unmount budget; a wedged unmount is killed so open() still returns (§2.9).
 #define SHIM_DISKUTIL_BUDGET_MS 20000
-// Settle time after the unmount, and between ObtainExclusiveAccess retries.
+// Wait between ObtainExclusiveAccess retries (the unmount not yet released).
 #define SHIM_SETTLE_MS 500
 // DiskArbitration claim wait, so a wedged DA can't hang open().
 #define SHIM_DA_CLAIM_MS 5000
@@ -699,14 +699,17 @@ int shim_open_exclusive(const char *selector, const volatile uint8_t *cancel) {
     // BSD device name is a discrete argv element and never shell syntax. Only a
     // name confirmed to belong to an optical drive above reaches this point. A
     // killed unmount is fine: ObtainExclusiveAccess below is the real gate (-5).
+    // No settle sleep after it: a drive not yet released is waited for by the
+    // ObtainExclusiveAccess retry loop, so a prompt unmount costs no fixed delay.
     if (bsd_name[0]) {
         char *const argv[] = {
             "diskutil", "unmountDisk", "force", bsd_name, NULL
         };
-        // On cancel run_and_reap has killed and reaped diskutil (§2.9 M2).
+        // On cancel run_and_reap has killed and reaped diskutil (§2.9 M2); a cancel that
+        // lands as the unmount ends still stops the open before the drive is claimed.
         if (run_and_reap("/usr/sbin/diskutil", argv, SHIM_DISKUTIL_BUDGET_MS, cancel, NULL)
                 == SHIM_CANCELLED
-            || sliced_sleep(SHIM_SETTLE_MS, cancel) == SHIM_CANCELLED) {
+            || shim_cancelled(cancel)) {
             IOObjectRelease(svc);
             pthread_mutex_unlock(&g_handle_lock);
             return SHIM_CANCELLED;

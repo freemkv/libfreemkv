@@ -295,3 +295,32 @@ fn aacs_version_from_major_only_bd_is_v10() {
         assert_eq!(AacsVersion::from_major(m).unit_key_stride(), 64);
     }
 }
+
+// `mkb_prefix_end`: the stream ends inside the prefix only where the walk stops on a header
+// the prefix holds; a record or header cut by the prefix asks for the bytes it needs.
+#[test]
+fn prefix_end_finds_the_end_marker_or_names_the_bytes_still_needed() {
+    let a = rec(0x10, &[0u8; 8]); // 12 bytes
+    let b = rec(0x04, &[0xAA; 100]); // 104 bytes
+    let mut mkb = [a.clone(), b.clone()].concat();
+    let content = mkb.len();
+    mkb.extend_from_slice(&[0, 0, 0, 0]);
+    mkb.resize(content + 64, 0);
+    // Whole stream and its end marker seen: the end, equal to `mkb_content_len`.
+    assert_eq!(mkb_prefix_end(&mkb), Ok(content));
+    assert_eq!(mkb_content_len(&mkb), content);
+    // The prefix cuts record `b`: its end plus the next header are needed. The record
+    // walk alone stops early here, at the end of `a`.
+    let cut = &mkb[..a.len() + 50];
+    assert_eq!(mkb_prefix_end(cut), Err(content + 4));
+    assert_eq!(mkb_content_len(cut), a.len());
+    // The prefix ends exactly after `b`, or inside the header after it: that header.
+    assert_eq!(mkb_prefix_end(&mkb[..content]), Err(content + 4));
+    assert_eq!(mkb_prefix_end(&mkb[..content + 2]), Err(content + 4));
+    // A header that frames no record ends the stream where it stands.
+    let mut bad = a.clone();
+    bad.extend_from_slice(&[0x04, 0, 0, 2]);
+    assert_eq!(mkb_prefix_end(&bad), Ok(a.len()));
+    assert_eq!(mkb_prefix_end(&[0x04, 0, 0, 2]), Ok(0));
+    assert_eq!(mkb_prefix_end(&[]), Err(4));
+}

@@ -488,9 +488,7 @@ struct Scoped<'e> {
 fn probe_scope<'e>(ev: &'e KeyEvidence, sampler: &mut Sampler, halt: &Halt) -> Result<Scoped<'e>> {
     let mut ps: Vec<Probed> = ev.pieces.iter().cloned().map(Probed::new).collect();
     let (layout, clip) = scope_layout(ev);
-    let segments: Vec<(u32, u32)> = layout
-        .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
-        .unwrap_or_default();
+    let segments = layout_segments(layout);
     let t0 = std::time::Instant::now();
     let before = sampler.stats();
     for p in &mut ps {
@@ -527,6 +525,13 @@ fn probe_scope<'e>(ev: &'e KeyEvidence, sampler: &mut Sampler, halt: &Halt) -> R
     Ok(Scoped { ps, layout, clip })
 }
 
+// The forensic segments' sectors, sorted and merged: no unit there is a unit-key sample.
+fn layout_segments(layout: Option<&super::fmts::Layout>) -> Vec<(u32, u32)> {
+    layout
+        .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
+        .unwrap_or_default()
+}
+
 // The forensic layout when its clip is in scope (KU §2.3 step 6), and that clip. Reads nothing.
 fn scope_layout(ev: &KeyEvidence) -> (Option<&super::fmts::Layout>, Vec<(u32, u32)>) {
     let layout = ev.fmts.as_ref();
@@ -549,8 +554,9 @@ fn scope_layout(ev: &KeyEvidence) -> (Option<&super::fmts::Layout>, Vec<(u32, u3
 // KS-14 [BD] §3.9.3: one declared CPS unit is one Unit Key for every stream file, so the disc
 // is trusted as declared: the main title's samples ask the sources once, and the key that
 // opens them keys every piece in scope. No per-piece probing (32 reads a piece: minutes of
-// seeks on a many-clip disc). `None` (no ciphertext found, or no key opens it) falls back to
-// the probed path, which decides clear content and refusals.
+// seeks on a many-clip disc). FMTS segment units are never samples; the segments are keyed
+// by their forensic set. `None` (no ciphertext found, or no key opens it) falls back to the
+// probed path, which decides clear content and refusals.
 fn resolve_one_unit(
     ev: &KeyEvidence,
     sampler: &mut Sampler,
@@ -558,7 +564,9 @@ fn resolve_one_unit(
     seed: Option<&KeyRing>,
     run: &mut Run,
 ) -> Result<Option<Inner>> {
-    let samples = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS);
+    let (layout, clip) = scope_layout(ev);
+    let samples =
+        sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS, &layout_segments(layout));
     if samples.is_empty() {
         return Ok(None);
     }
@@ -603,7 +611,6 @@ fn resolve_one_unit(
         }
         return Ok(None);
     };
-    let (layout, clip) = scope_layout(ev);
     let ps: Vec<Probed> = ev
         .pieces
         .iter()
@@ -637,9 +644,11 @@ fn resolve_one_unit(
 }
 
 // Several declared CPS units: each stream file sits in exactly one (KS-10), so one encrypted
-// unit per piece (the first its probe grid finds) names its key. The main title's samples ask
-// first; pieces no held key opens then ask with their own units, at most `n_decl` requests.
-// `None` (a piece unreadable, or one no key opens) falls back to the probed path.
+// unit per piece (the first its probe grid finds, FMTS segment units skipped) names its key.
+// The main title's samples ask first; pieces no held key opens then ask with their own units,
+// at most `n_decl` requests. Every piece read clear and so do the forensic segments in scope:
+// content in the clear, no source asked. `None` (a piece unreadable, or one no key opens)
+// falls back to the probed path.
 fn resolve_per_unit(
     ev: &KeyEvidence,
     sampler: &mut Sampler,
@@ -649,9 +658,7 @@ fn resolve_per_unit(
     n_decl: usize,
 ) -> Result<Option<Inner>> {
     let (layout, clip) = scope_layout(ev);
-    let segments: Vec<(u32, u32)> = layout
-        .map(|l| sorted_ranges(l.ranges.iter().map(|&(s, e, _)| (s, e)).collect()))
-        .unwrap_or_default();
+    let segments = layout_segments(layout);
     let mut ps: Vec<Probed> = Vec::with_capacity(ev.pieces.len());
     for piece in &ev.pieces {
         let mut p = Probed::new(piece.clone());
@@ -667,6 +674,18 @@ fn resolve_per_unit(
         }
         ps.push(p);
     }
+    // The one encryption decision (`in_clear`): pieces and forensic segments in the clear ask
+    // no source, forensic keys included.
+    if let Some(l) = layout
+        && ps.iter().all(|p| p.verdict == Verdict::Clear)
+        && super::fmts::segments_clear(sampler.source(), l, ev.container, run.halt)?
+    {
+        tracing::info!(target: "freemkv::keys", pieces = ps.len(), "content and forensic segments in the clear: no key source asked");
+        let mut inner = aacs_inner(run);
+        inner.no_stream_files = ev.no_stream_files;
+        build(&mut inner, &ps, None, None, run, Vec::new());
+        return Ok(Some(inner));
+    }
     let opened = |run: &Run, p: &Probed| -> Option<usize> {
         p.enc
             .first()
@@ -680,7 +699,7 @@ fn resolve_per_unit(
     let mut tried: Vec<usize> = Vec::new();
     // Sample-independent sources (a local keydb) give their whole answer once.
     if !unopened(run, &ps).is_empty() {
-        let main = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS);
+        let main = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS, &segments);
         for i in 0..run.sources.len() {
             if run.sources[i].answer_depends_on_samples() {
                 continue;
@@ -840,8 +859,8 @@ fn decide(
     seed: Option<&KeyRing>,
     run: &mut Run,
 ) -> Result<Inner> {
-    // A forensic layout in scope keeps the probed path: its segments follow their own rules.
-    if ev.detector == Detector::Verified && scope_layout(ev).0.is_none() {
+    // BD/UHD, FMTS included: trusted as declared (segment units are never unit-key samples).
+    if ev.detector == Detector::Verified {
         let trusted = match n_decl {
             Some(1) => resolve_one_unit(ev, sampler, disc_hash, seed, run)?,
             Some(n) if n > 1 => resolve_per_unit(ev, sampler, disc_hash, seed, run, n)?,
@@ -915,7 +934,7 @@ fn resolve_hddvd(
         .unwrap_or_default();
     let mut origin = (!keys.is_empty()).then_some("seed");
     if keys.is_empty() {
-        let samples = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS);
+        let samples = sampler.main_samples(ev.main.as_ref(), MIN_SAMPLE_UNITS, &[]);
         for i in 0..run.sources.len() {
             if let Asked::Keys(k, idx) = run.ask(i, &samples, false)? {
                 let nums = idx.iter().map(|&i| title_key_number(ev, i));

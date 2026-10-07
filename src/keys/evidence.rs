@@ -232,24 +232,13 @@ impl KeyEvidence {
             volume_label: inputs.volume_label,
         });
         let whole = ev.scope == KeyScope::WholeDisc;
-        if ev.detector == Detector::PerPack {
-            // Listed whatever the declared count: acquisition judges a copy in the clear from
-            // its pieces before it refuses a multi-key HD DVD.
-            let files = match crate::whole_disc::content_files(reader) {
-                Ok(f) => f,
-                Err(e) if whole => return Err(e),
-                Err(e) => {
-                    tracing::warn!(target: "freemkv::keys", error = %e, "no HD DVD file list: keying title extents");
-                    Vec::new()
-                }
-            };
-            ev.no_stream_files = files.is_empty();
-            ev.pieces = pieces(disc, &files, &sel, whole);
-            return Ok(ev);
-        }
+        // The filesystem the scan already read, re-read as the scan reads it: batched, with
+        // the metadata partition prefetched, so the tree walk and every stream file's File
+        // Entry cost a few commands, not one per sector.
+        let mut buffered = crate::udf::BufferedSectorReader::new(reader, FS_BATCH_SECTORS);
         // An unreadable filesystem fails a whole-disc copy (it would otherwise ship
         // ciphertext); a title rip keys its title extents instead.
-        let fs = match crate::udf::read_filesystem(reader) {
+        let fs = match buffered_filesystem(&mut buffered) {
             Ok(fs) => Some(fs),
             Err(e) if whole => return Err(e),
             Err(e) => {
@@ -258,7 +247,7 @@ impl KeyEvidence {
             }
         };
         let files = match &fs {
-            Some(fs) => match crate::whole_disc::content_files_in(fs, reader) {
+            Some(fs) => match crate::whole_disc::content_files_in(fs, &mut buffered) {
                 Ok(f) => f,
                 Err(e) if whole => return Err(e),
                 Err(e) => {
@@ -270,12 +259,28 @@ impl KeyEvidence {
         };
         ev.no_stream_files = files.is_empty();
         ev.pieces = pieces(disc, &files, &sel, whole);
-        ev.fmts = match &fs {
-            Some(fs) => super::fmts::layout(fs, reader)?,
-            None => None,
-        };
+        // HD DVD: listed whatever the declared count (acquisition judges a copy in the clear
+        // from its pieces before it refuses a multi-key HD DVD); it has no forensic layout.
+        if ev.detector != Detector::PerPack {
+            ev.fmts = match &fs {
+                Some(fs) => super::fmts::layout(fs, &mut buffered)?,
+                None => None,
+            };
+        }
         Ok(ev)
     }
+}
+
+/// Sectors per batched read of the filesystem: the optical default the scan uses.
+const FS_BATCH_SECTORS: u16 = crate::disc::DEFAULT_BATCH_SECTORS_OPTICAL;
+
+// The UDF tree, then the metadata partition (every directory and File Entry) prefetched.
+fn buffered_filesystem<S: SectorSource + ?Sized>(
+    reader: &mut crate::udf::BufferedSectorReader<'_, S>,
+) -> Result<crate::udf::UdfFs> {
+    let fs = crate::udf::read_filesystem(reader)?;
+    reader.prefetch(fs.metadata_start(), fs.metadata_sectors())?;
+    Ok(fs)
 }
 
 pub(crate) fn sorted_ranges(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
@@ -504,11 +509,25 @@ impl<'a> Sampler<'a> {
         Ok(out)
     }
 
-    // Up to `n` encrypted units spread over the main feature.
-    pub(crate) fn main_samples(&mut self, main: Option<&MainTitle>, n: usize) -> Vec<Vec<u8>> {
+    // Up to `n` encrypted units spread over the main feature, none from an FMTS segment
+    // (`segments`: its units carry a forensic key, not the unit key).
+    pub(crate) fn main_samples(
+        &mut self,
+        main: Option<&MainTitle>,
+        n: usize,
+        segments: &[(u32, u32)],
+    ) -> Vec<Vec<u8>> {
         let t0 = std::time::Instant::now();
         let out = main
-            .map(|m| crate::keysource::encrypted_units_in(self.reader, &m.extents, m.format, n))
+            .map(|m| {
+                crate::keysource::encrypted_units_outside(
+                    self.reader,
+                    &m.extents,
+                    m.format,
+                    n,
+                    segments,
+                )
+            })
             .unwrap_or_default();
         tracing::info!(target: "freemkv::keys", phase = "main_samples", wanted = n, got = out.len(), elapsed_ms = t0.elapsed().as_millis() as u64, "main-title samples read");
         out
