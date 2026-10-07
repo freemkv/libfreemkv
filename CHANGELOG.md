@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Windows: a bare drive letter (`E`) opens that drive, as `E:` does; it was opened as `\\.\E`, which does not exist (E1000).
+- Linux: a bare node name (`sg3`, `sr0`) opens `/dev/sg3` / `/dev/sr0`; it was opened relative to the current directory.
 
 ## [1.8.1] — 2026-10-07
 

@@ -235,6 +235,14 @@ impl SgIoTransport {
     /// Resolve /dev/sr* -> /dev/sg* via sysfs. If already sg, returns as-is.
     /// Falls back to the original path if resolution fails.
     fn resolve_to_sg(device: &Path) -> std::path::PathBuf {
+        // A bare node name (`sr0`, `sg3`) is that node under /dev, as `/dev/sr0` is.
+        let dev_path;
+        let device = if device.parent() == Some(Path::new("")) {
+            dev_path = Path::new("/dev").join(device);
+            dev_path.as_path()
+        } else {
+            device
+        };
         let dev_name = match device.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => return device.to_path_buf(),

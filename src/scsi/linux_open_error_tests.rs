@@ -10,3 +10,19 @@ fn open_errno_maps_to_its_real_cause() {
     assert!(matches!(map(libc::EMFILE), Error::IoError { .. }));
     assert!(matches!(map(libc::EBUSY), Error::IoError { .. }));
 }
+
+#[test]
+fn a_bare_node_name_opens_under_dev() {
+    assert_eq!(
+        SgIoTransport::resolve_to_sg(Path::new("sg3")),
+        Path::new("/dev/sg3")
+    );
+    assert_eq!(
+        SgIoTransport::resolve_to_sg(Path::new("/dev/sg3")),
+        Path::new("/dev/sg3")
+    );
+    assert_eq!(
+        SgIoTransport::resolve_to_sg(Path::new("./sg3")),
+        Path::new("./sg3")
+    );
+}
