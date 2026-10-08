@@ -1,6 +1,6 @@
 [package]
 name = "libfreemkv"
-version = "1.8.1"
+version = "1.8.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -152,7 +152,7 @@ harness = false
 # freemkv-unlock is off crates.io: resolve it from its GIT TAG. Consumers carry
 # the same patch; a gitignored .cargo/config.toml overrides it to a local path.
 [patch.crates-io]
-freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.8.1" }
+freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.8.2" }
 
 [lints.rust]
 # `loom` is set by RUSTFLAGS for the model checker above, never by a feature.
