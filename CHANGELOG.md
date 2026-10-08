@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.3] — 2026-10-08
+
+### Changed
+
+- Carry the 1.8.3 unified release version; no independent runtime changes.
+
 ## [1.8.2] — 2026-10-08
 
 - New non-default `keyproof` feature: `aacs::content::unit_key_opens(unit, key, format)` answers whether a key opens an encrypted BD-TS aligned unit (one bit, never plaintext). It is `false` for anything that proves nothing (other formats, short or clear units, fewer than four content packets); a wrong key passes about once in 10^5 units, so confirm a match on several. `test_util::encrypt_unit` builds ciphertext fixtures. The default build is unchanged.
