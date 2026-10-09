@@ -12,7 +12,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       FREEMKV_FFMPEG_ARTIFACT_DIR: ${{ github.workspace }}/ffmpeg-artifacts
     steps:
@@ -35,7 +35,7 @@ jobs:
         with:
           workspaces: libfreemkv
       - name: Install software encoders and decoders
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Record tool versions
         run: |
           mkdir -p "$FREEMKV_FFMPEG_ARTIFACT_DIR"
