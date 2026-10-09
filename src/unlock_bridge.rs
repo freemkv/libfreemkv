@@ -197,7 +197,7 @@ fn run(
     ("", Ok(None))
 }
 
-/// Drive-prep: run the FIRMWARE unlockers (freemkv / LD / Renesas), which
+/// Drive-prep: run the FIRMWARE unlockers (freemkv, including Pioneer runtime / LD), which
 /// key off the drive rather than the disc, so `kind` is `Unknown` and they need
 /// no certs. Each removes bus encryption at the drive and reads the OEM Volume
 /// ID best-effort.
@@ -216,7 +216,6 @@ fn firmware_unlockers() -> Vec<Box<dyn fu::Unlocker>> {
     vec![
         Box::new(fu::FreemkvUnlocker::new()),
         Box::new(fu::LdUnlocker::new()),
-        Box::new(fu::Renesas::new()),
     ]
 }
 

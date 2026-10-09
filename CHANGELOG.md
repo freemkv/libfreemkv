@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Carry the 1.8.3 unified release version; no independent runtime changes.
+- Route preinstalled freemkv firmware and Pioneer runtime installation through the shared freemkv unlocker, removing the duplicate Renesas dispatcher entry.
 
 ## [1.8.2] — 2026-10-08
 

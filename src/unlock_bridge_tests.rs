@@ -33,12 +33,12 @@ fn adapt(e: impl FnMut() -> crate::error::Error + Send + 'static) -> fu::scsi::S
 fn unlocker_names_are_derived_from_the_real_unlockers() {
     assert_eq!(
         unlocker_names(),
-        vec!["freemkv", "LD", "Renesas", "AACS", "DVD"],
+        vec!["freemkv", "LD", "AACS", "DVD"],
         "the matrix is the firmware set then the disc set, in dispatch order"
     );
     // Split point: the leading names are exactly the firmware set.
     let fw: Vec<&str> = firmware_unlockers().iter().map(|u| u.name()).collect();
-    assert_eq!(fw, vec!["freemkv", "LD", "Renesas"]);
+    assert_eq!(fw, vec!["freemkv", "LD"]);
 }
 
 // `is_drive_unlocker` classifies a matched unlocker name against the real
