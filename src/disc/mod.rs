@@ -3405,9 +3405,14 @@ fn null_mapfile_dir() -> std::path::PathBuf {
 }
 
 fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    let b = {
+        let mut b = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b
+    };
+    #[cfg(not(unix))]
+    let b = std::fs::DirBuilder::new();
     b.create(path)
 }
 
