@@ -239,6 +239,7 @@ fn dvd_menu_binary_unsupported_navigation_and_partial_tables_hold_for_review() {
             _ => unreachable!(),
         }
         let titles = scan(vmg, vts, vob);
+        assert_eq!(titles.len(), 8, "case {case}: titles must still be scanned");
         assert!(
             titles
                 .iter()
