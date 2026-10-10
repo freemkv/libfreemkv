@@ -392,29 +392,14 @@ fn title_cells(vts: &[u8], ttn: u8) -> Option<Cells> {
 // Exact ordered cell vectors only. Every other reachable unique standalone program must
 // occur once in the play-all partition. Multiple decompositions or play-alls are review.
 fn partition(groups: &[Cells]) -> Option<Vec<usize>> {
+    let prefixes = super::selection_partition::Prefixes::new(groups)?;
     let mut answer = None;
-    for (whole, sequence) in groups.iter().enumerate() {
-        let mut at = 0;
-        let mut order = Vec::new();
-        while at < sequence.len() {
-            let matches: Vec<_> = groups
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| *i != whole && !order.contains(i) && sequence[at..].starts_with(c))
-                .collect();
-            // Prefix ambiguity is deliberately rejected instead of searching for a preferred cut.
-            if matches.len() != 1 {
-                break;
-            }
-            let (i, c) = matches[0];
-            order.push(i);
-            at += c.len();
-        }
-        if at == sequence.len() && order.len() >= 2 && order.len() + 1 == groups.len() {
-            if answer.is_some() {
-                return None;
-            }
-            answer = Some(order);
+    for whole in 0..groups.len() {
+        if let Some(order) = prefixes.decompose(whole)
+            && order.len() + 1 == groups.len()
+            && answer.replace(order).is_some()
+        {
+            return None;
         }
     }
     answer
