@@ -238,7 +238,14 @@ impl UdfFs {
         // the ICB (AD type 3), with no out-of-line extents. Honor that before the extent
         // path, which would otherwise misparse embedded bytes as ADs and hard-error.
         if let Some(mut inline) = self.read_inline_data(reader, entry.meta_lba)? {
-            let want = (entry.size as usize).min(limit);
+            let want = usize::try_from(entry.size).unwrap_or(usize::MAX).min(limit);
+            if inline.len() < want {
+                return Err(Error::DiscRead {
+                    sector: u64::from(self.meta_to_abs(entry.meta_lba)?),
+                    status: None,
+                    sense: None,
+                });
+            }
             if inline.len() > want {
                 inline.truncate(want);
             }

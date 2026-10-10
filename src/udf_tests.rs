@@ -1502,6 +1502,38 @@ fn read_file_prefix_caps_embedded_data_at_the_requested_length() {
 }
 
 #[test]
+fn short_embedded_file_only_satisfies_prefixes_present_in_the_payload() {
+    for tag in [261, 266] {
+        for l_ea in [0, 24] {
+            let payload = [0x5a; 8];
+            let mut reader = MapReader::new();
+            reader.put(5, build_inline_icb_tagged(tag, l_ea, 64, &payload));
+            let fs = fs_with_file(5, 64);
+            for limit in [0, 1, 8] {
+                assert_eq!(
+                    fs.read_file_prefix(&mut reader, "/F", limit).unwrap(),
+                    payload[..limit],
+                    "tag {tag}, attributes {l_ea}, prefix {limit}"
+                );
+            }
+            for limit in [9, 64, 65, usize::MAX] {
+                assert!(
+                    matches!(
+                        fs.read_file_prefix(&mut reader, "/F", limit),
+                        Err(Error::DiscRead { .. })
+                    ),
+                    "tag {tag}, attributes {l_ea}, prefix {limit} must reject missing bytes"
+                );
+            }
+            assert!(matches!(
+                fs.read_file(&mut reader, "/F"),
+                Err(Error::DiscRead { .. })
+            ));
+        }
+    }
+}
+
+#[test]
 fn file_start_lba_descends_only_through_directories_that_match_the_path() {
     // Each path component must match a child that is BOTH a directory AND
     // named for it. Matching either alone walks into the first directory

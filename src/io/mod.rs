@@ -13,6 +13,7 @@ pub mod file_sector_source;
 mod flush;
 pub mod fsync;
 pub mod image_writer;
+pub mod publish;
 mod writeback;
 mod writeback_file;
 

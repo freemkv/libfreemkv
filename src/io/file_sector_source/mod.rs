@@ -3,7 +3,7 @@
 //! readahead policy handle prefetch instead of an app-level buffer.
 //!
 //! Issues a platform "sequential access" hint on open, prefetches the
-//! next window after each read, and periodically evicts the consumed
+//! next window (batched on macOS), and periodically evicts the consumed
 //! byte range via `posix_fadvise(DONTNEED)` to bound page-cache pressure.
 
 #[cfg(target_os = "linux")]
@@ -78,6 +78,8 @@ pub struct FileSectorSource {
     /// `Some(file length)` for [`open_padded`](Self::open_padded): a partial tail sector is
     /// read, zero-filled to 2048 bytes.
     padded_len: Option<u64>,
+    #[cfg(target_os = "macos")]
+    prefetch_window: macos::PrefetchWindow,
 }
 
 impl FileSectorSource {
@@ -87,8 +89,8 @@ impl FileSectorSource {
     /// LBA address space (~8 TB).
     ///
     /// Issues the platform's "sequential access expected" hint on the
-    /// fd (Linux `posix_fadvise(SEQUENTIAL)`, macOS `fcntl(F_RDADVISE)`,
-    /// Windows no-op) so the kernel's readahead widens.
+    /// fd (Linux `posix_fadvise(SEQUENTIAL)`, other platforms no-op).
+    /// macOS read advice is deferred until a stream has been observed.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::IoError { source: e })?;
         let len = file
@@ -114,6 +116,8 @@ impl FileSectorSource {
             drop_window: (0, 0),
             drop_chunk_bytes: read_drop_chunk_bytes(),
             padded_len: None,
+            #[cfg(target_os = "macos")]
+            prefetch_window: macos::PrefetchWindow::default(),
         })
     }
 
@@ -181,9 +185,17 @@ impl SectorSource for FileSectorSource {
         }
         out[real..bytes].fill(0);
 
-        // Queue the next batch's read before the caller processes what we returned.
-        // readahead() is non-blocking; the kernel pulls pages into cache while the
-        // consumer runs, so the next read_sectors call hits a warm cache.
+        // Amortize macOS advice over a stream, not every 2 KiB metadata sector.
+        #[cfg(target_os = "macos")]
+        if let Some((start, len)) = self.prefetch_window.after_read(
+            offset,
+            real as u64,
+            self.padded_len
+                .unwrap_or(self.capacity as u64 * SECTOR_BYTES_U64),
+        ) {
+            platform::prefetch(&self.file, start, len);
+        }
+        #[cfg(not(target_os = "macos"))]
         platform::prefetch(&self.file, offset + bytes as u64, bytes as u64);
 
         // Periodic page-cache eviction on the read side: an 85 GB streaming ISO

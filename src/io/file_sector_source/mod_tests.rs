@@ -2,6 +2,69 @@ use super::*;
 use std::io::Write;
 use tempfile::tempdir;
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "read-only timing probe; requires FREEMKV_READONLY_ISO_BENCH"]
+fn benchmark_readonly_iso_sector_advice() {
+    let path = std::env::var_os("FREEMKV_READONLY_ISO_BENCH").expect("explicit ISO path required");
+    let path = Path::new(&path);
+    let mut reference = File::open(path).unwrap();
+    let mut source = FileSectorSource::open(path).unwrap();
+    let start_lba = 512 * 1024 * 1024 / SECTOR_BYTES;
+    for mode in ["plain", "per-sector-advice", "batched-source", "plain"] {
+        let started = std::time::Instant::now();
+        let mut sectors = 0;
+        let mut buffer = [0u8; SECTOR_BYTES];
+        for n in 0..64 {
+            let lba = (start_lba + n) as u32;
+            if mode == "batched-source" {
+                source.read_sectors(lba, 1, &mut buffer, false).unwrap();
+                let mut expected = [0u8; SECTOR_BYTES];
+                reference
+                    .seek(SeekFrom::Start(lba as u64 * SECTOR_BYTES_U64))
+                    .unwrap();
+                reference.read_exact(&mut expected).unwrap();
+                assert_eq!(buffer, expected);
+            } else {
+                reference
+                    .seek(SeekFrom::Start(lba as u64 * SECTOR_BYTES_U64))
+                    .unwrap();
+                reference.read_exact(&mut buffer).unwrap();
+                if mode == "per-sector-advice" {
+                    platform::prefetch(
+                        &reference,
+                        (lba as u64 + 1) * SECTOR_BYTES_U64,
+                        SECTOR_BYTES_U64,
+                    );
+                }
+            }
+            sectors += 1;
+            if started.elapsed() > std::time::Duration::from_secs(5) {
+                break;
+            }
+        }
+        eprintln!("{mode}: {sectors} sectors in {:?}", started.elapsed());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_reads_feed_the_batched_prefetch_window() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("advice.iso");
+    make_iso(&path, 1024);
+    let mut src = FileSectorSource::open(&path).unwrap();
+    let mut out = [0u8; SECTOR_BYTES];
+    src.read_sectors(0, 1, &mut out, false).unwrap();
+    let mib = 1024 * 1024;
+    assert_eq!(
+        src.prefetch_window
+            .after_read(SECTOR_BYTES_U64, mib - SECTOR_BYTES_U64, 2 * mib),
+        Some((mib, mib)),
+        "the first real read must contribute to the contiguous window"
+    );
+}
+
 // The DONTNEED window must cover the bytes actually read. It used to start at
 // offset 0 and advance by byte count, so a read stream beginning deep in the
 // image (every title) evicted pages it never read.

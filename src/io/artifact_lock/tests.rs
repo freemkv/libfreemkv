@@ -12,6 +12,39 @@ use std::time::Instant;
 const WINDOW: Duration = Duration::from_secs(1);
 const SLACK: Duration = Duration::from_secs(2);
 
+#[test]
+fn public_file_identity_recognizes_hard_links_not_equal_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("source.iso");
+    let alias = dir.path().join("alias.mkv");
+    let separate = dir.path().join("separate.iso");
+    std::fs::write(&original, b"same bytes").unwrap();
+    std::fs::write(&separate, b"same bytes").unwrap();
+    std::fs::hard_link(&original, &alias).unwrap();
+    assert_eq!(
+        file_identity(&original).unwrap(),
+        file_identity(&alias).unwrap()
+    );
+    assert_ne!(
+        file_identity(&original).unwrap(),
+        file_identity(&separate).unwrap()
+    );
+    assert!(file_identity(&dir.path().join("missing")).is_err());
+}
+
+#[test]
+fn public_identity_tracks_directory_renames_and_detects_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("parent");
+    let retained = temp.path().join("retained");
+    std::fs::create_dir(&directory).unwrap();
+    let original = file_identity(&directory).unwrap();
+    std::fs::rename(&directory, &retained).unwrap();
+    assert_eq!(file_identity(&retained).unwrap(), original);
+    std::fs::create_dir(&directory).unwrap();
+    assert_ne!(file_identity(&directory).unwrap(), original);
+}
+
 fn artifact() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("Movie.iso");

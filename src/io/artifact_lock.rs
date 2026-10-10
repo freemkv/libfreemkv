@@ -23,6 +23,12 @@ use std::time::{Duration, SystemTime};
 /// T10: the lock wait fails after this long with no change in the holder's output.
 pub const ARTIFACT_LOCK_WINDOW: Duration = Duration::from_secs(30);
 
+/// Filesystem identity for alias detection: device/inode on Unix, volume/file
+/// index on Windows. This identifies a file, not its contents or a stable disc ID.
+pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
+    os::path_id(path)
+}
+
 /// The sidecar for the artifact whose final name is `final_path`: `<final>.lock`.
 pub fn lock_path(final_path: &Path) -> PathBuf {
     with_suffix(final_path, ".lock")
@@ -274,6 +280,7 @@ mod os {
     use std::path::Path;
 
     const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x1 | 0x2 | 0x4;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
     const ERROR_ACCESS_DENIED: i32 = 5;
@@ -376,6 +383,9 @@ mod os {
         let f = std::fs::OpenOptions::new()
             .access_mode(0)
             .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+            // Directory identity guards use the same volume/file-index query.
+            // This flag permits opening directories and does not change file IDs.
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(p)?;
         handle_id(&f)
     }
