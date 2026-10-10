@@ -120,3 +120,14 @@ fn condition_unknown_operands_and_invalid_ops_fail_closed() {
         assert_eq!(r.condition(cmp(op, true, 1, 0)), None);
     }
 }
+
+#[test]
+fn after_wait_clears_gprms_and_highlight_only() {
+    let mut r = Registers::default();
+    r.gprm[0] = Some(3);
+    r.sprm[1] = Some(2);
+    r.sprm[8] = Some(1024);
+    let w = r.after_wait();
+    assert!(w.gprm.iter().all(Option::is_none));
+    assert_eq!((w.sprm[1], w.sprm[8]), (Some(2), None));
+}

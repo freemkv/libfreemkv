@@ -213,10 +213,11 @@ pub(super) fn produce(
     if c[3] != 0 {
         let cmd = required(pgc.cell.get(usize::from(c[3]) - 1))?;
         for (_, state) in &states {
-            let outcomes = trace::run(std::slice::from_ref(cmd), state.registers.clone())?;
+            let waited = state.registers.after_wait();
+            let outcomes = trace::run(std::slice::from_ref(cmd), waited.clone())?;
             if outcomes
                 .iter()
-                .any(|o| o.flow != Flow::TopProgram || o.registers != state.registers)
+                .any(|o| o.flow != Flow::TopProgram || o.registers != waited)
             {
                 return Err(Reason::UnsupportedNavigation.into());
             }
@@ -270,7 +271,7 @@ pub(super) fn produce(
         let mut launches = Vec::new();
         let mut is_menu = false;
         for (_, state) in &states {
-            let mut registers = state.registers.clone();
+            let mut registers = state.registers.after_wait();
             registers.sprm[8] = Some(((button + 1) as u16) << 10);
             for mut o in trace::run(std::slice::from_ref(&step), registers)? {
                 let mut prefix = state.steps.clone();
@@ -345,7 +346,7 @@ pub(super) fn produce(
                     return Err(Reason::AmbiguousNavigation.into());
                 }
                 audio = Some(stream);
-                for post in trace::run(&target_pgc.post, o.registers)? {
+                for post in trace::run(&target_pgc.post, Registers::default())? {
                     if post.flow != Flow::ReturnMenu {
                         return Err(Reason::UnprovenPresentation.into());
                     }

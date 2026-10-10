@@ -9,6 +9,16 @@ pub(super) struct Registers {
     pub sprm: [Option<u16>; 24],
 }
 impl Registers {
+    /// Values that may be stale after the player waits: a GPRM may be in counter
+    /// mode set outside the trace, and the user moves the highlight (SPRM 8).
+    pub fn after_wait(&self) -> Self {
+        let mut r = Self {
+            gprm: [None; 16],
+            sprm: self.sprm,
+        };
+        r.sprm[8] = None;
+        r
+    }
     fn read(&self, reg: u8) -> Option<u16> {
         match reg {
             0..=15 => self.gprm[reg as usize],

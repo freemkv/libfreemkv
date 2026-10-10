@@ -724,7 +724,7 @@ fn real_dvd_root_launch_validation() {
     }
     for (button, expected) in [(0, 1), (1, 2)] {
         for (_, state) in &roots {
-            let mut registers = state.registers.clone();
+            let mut registers = state.registers.after_wait();
             registers.sprm[8] = Some(((button + 1) as u16) << 10);
             let step = crate::disc::DvdLaunchStep {
                 vts: 1,
@@ -822,4 +822,68 @@ fn real_dvd_root_launch_validation() {
         assert_eq!(t.selection_evidence.episodes, EpisodeEvidence::Unknown);
     }
     eprintln!("read_bytes={}", reader.bytes);
+}
+
+#[test]
+fn menu_set_gprm_is_unknown_when_button_activates() {
+    let (vmg, mut vts, mut vob) = fixture();
+    let dispatch = pgc(
+        None,
+        &[
+            [0, 0xa1, 0, 0, 0, 3, 0, 3],
+            [0x30, 5, 0, 1, 0, 1, 0, 0],
+            [0x30, 5, 0, 1, 0, 2, 0, 0],
+        ],
+        &[],
+    );
+    // Root pre-command sets GPRM0 before the user acts; it may be a counter.
+    let menus = table(
+        &[
+            (0x83, pgc(Some((0, 0)), &[[0x71, 0, 0, 0, 0, 3, 0, 0]], &[])),
+            (0, dispatch),
+        ],
+        true,
+    );
+    insert(&mut vts, 0xd0, 3, &menus);
+    for g in 0..2 {
+        let at = 141 + 46 + (g * 18 + 1) * 18 + 10;
+        vob[at..at + 8].copy_from_slice(&[0x20, 4, 0, 0, 0, 0, 0, 2]);
+    }
+    assert!(
+        scan(&vmg, &vts, &vob)
+            .iter()
+            .all(|t| t.selection_evidence.dvd_launch
+                == DvdLaunchEvidence::Review(DvdLaunchReviewReason::AmbiguousNavigation))
+    );
+}
+
+#[test]
+fn title_post_command_registers_do_not_survive_playback() {
+    let (vmg, mut vts, vob) = fixture();
+    let ret = [0x30, 8, 0, 0, 0, 0x42, 0, 0];
+    let post2 = [
+        [0, 0xa1, 0, 0, 0, 3, 0, 3],
+        [0x30, 5, 0, 1, 0, 1, 0, 0],
+        ret,
+    ];
+    let titles = table(
+        &[
+            (
+                0,
+                pgc(Some((10, 19)), &[[0x51, 0, 0, 0x80, 0, 0, 0, 0]], &[ret]),
+            ),
+            (
+                0,
+                pgc(Some((30, 39)), &[[0x51, 0, 0, 0x81, 0, 0, 0, 0]], &post2),
+            ),
+        ],
+        false,
+    );
+    insert(&mut vts, 0xcc, 2, &titles);
+    assert!(
+        scan(&vmg, &vts, &vob)
+            .iter()
+            .all(|t| t.selection_evidence.dvd_launch
+                == DvdLaunchEvidence::Review(DvdLaunchReviewReason::UnprovenPresentation))
+    );
 }
