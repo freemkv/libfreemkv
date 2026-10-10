@@ -332,6 +332,9 @@ pub const E_STREAM_LANGUAGE_UNKNOWN: u16 = 9083;
 pub const E_REMUX_TARGET_EXISTS: u16 = 9084;
 /// A mux was opened with a zero read batch (`MuxOptions::default()`), which reads nothing.
 pub const E_MUX_BATCH_SECTORS_ZERO: u16 = 9085;
+/// The engine's automatic title selection needs review: the disc's evidence does not prove
+/// one choice. Nothing was ripped; the user must choose titles explicitly.
+pub const E_SELECTION_REVIEW_REQUIRED: u16 = 9086;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -975,6 +978,11 @@ pub enum Error {
     RemuxTargetExists {
         path: String,
     },
+    /// See [`E_SELECTION_REVIEW_REQUIRED`]. `reason` is the engine's stable review key
+    /// (e.g. "missing-episode-roster"), like [`Error::TimedOut`]'s `op`.
+    SelectionReviewRequired {
+        reason: &'static str,
+    },
 }
 
 /// Why a finished remux output failed read-back ([`Error::RemuxVerifyFailed`]).
@@ -1152,6 +1160,7 @@ impl Error {
             Error::StreamLanguageUnknown { .. } => E_STREAM_LANGUAGE_UNKNOWN,
             Error::RemuxTargetExists { .. } => E_REMUX_TARGET_EXISTS,
             Error::MuxBatchSectorsZero => E_MUX_BATCH_SECTORS_ZERO,
+            Error::SelectionReviewRequired { .. } => E_SELECTION_REVIEW_REQUIRED,
         }
     }
 }
@@ -1337,6 +1346,7 @@ impl std::fmt::Display for Error {
             Error::TimedOut { op } | Error::WorkerLost { op } => {
                 write!(f, "E{}: {op}", self.code())
             }
+            Error::SelectionReviewRequired { reason } => write!(f, "E{}: {reason}", self.code()),
             Error::BusStreamUnmapped { files } => {
                 write!(f, "E{}: {}", self.code(), files.escape_debug())
             }
@@ -1495,9 +1505,10 @@ impl From<Error> for std::io::Error {
             E_TIMED_OUT => std::io::ErrorKind::TimedOut,
             // Remux/engine codes keep the kinds their io::Error texts carried.
             E_REMUX_VERIFY_FAILED | E_STAGED_COPY_SIZE_MISMATCH => std::io::ErrorKind::InvalidData,
-            E_REMUX_STAGING_INVALID | E_STREAM_LANGUAGE_UNKNOWN | E_MUX_BATCH_SECTORS_ZERO => {
-                std::io::ErrorKind::InvalidInput
-            }
+            E_REMUX_STAGING_INVALID
+            | E_STREAM_LANGUAGE_UNKNOWN
+            | E_MUX_BATCH_SECTORS_ZERO
+            | E_SELECTION_REVIEW_REQUIRED => std::io::ErrorKind::InvalidInput,
             E_REMUX_TARGET_EXISTS => std::io::ErrorKind::AlreadyExists,
             _ => std::io::ErrorKind::Other,
         };

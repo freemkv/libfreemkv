@@ -909,6 +909,14 @@ fn engine_remux_codes_display_and_kind() {
             "E9085",
             ErrorKind::InvalidInput,
         ),
+        (
+            Error::SelectionReviewRequired {
+                reason: "missing-presentation-language",
+            },
+            9086,
+            "E9086: missing-presentation-language",
+            ErrorKind::InvalidInput,
+        ),
     ];
     for (e, code, shown, kind) in cases {
         assert_eq!(e.code(), code, "{e:?}");
