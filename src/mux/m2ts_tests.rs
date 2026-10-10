@@ -9,6 +9,7 @@ const VIDEO_PID: u16 = 0x1011;
 
 fn make_title() -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: String::new(),
         playlist_id: 0,
         duration_secs: 0.0,

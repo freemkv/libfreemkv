@@ -114,6 +114,7 @@ fn connect_first_falls_through_a_dead_address() {
 
 fn sample_title() -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "NetworkTest".into(),
         playlist_id: 1,
         duration_secs: 3600.0,

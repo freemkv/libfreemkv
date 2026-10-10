@@ -171,6 +171,7 @@ fn merged_labels_order_by_slot_then_stream() {
 #[test]
 fn ordinal_binding_needs_a_stated_subtitle_language() {
     let mut title = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "00800.mpls".into(),
         playlist_id: 800,
         duration_secs: 7200.0,

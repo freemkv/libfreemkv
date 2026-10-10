@@ -158,6 +158,7 @@ impl crate::sector::SectorSource for ScriptedSource {
 
 fn title_at(start_lba: u32, units: u32) -> crate::disc::DiscTitle {
     crate::disc::DiscTitle {
+        selection_evidence: Default::default(),
         playlist: String::new(),
         playlist_id: 0,
         duration_secs: 0.0,
@@ -297,6 +298,7 @@ fn read_encrypted_units_finds_scrambled_content_off_the_midpoint() {
         total_units,
     };
     let title = crate::disc::DiscTitle {
+        selection_evidence: Default::default(),
         playlist: String::new(),
         playlist_id: 0,
         duration_secs: 0.0,
@@ -376,6 +378,7 @@ fn read_encrypted_units_selects_by_cpi_not_ts_sync() {
         total_units,
     };
     let title = crate::disc::DiscTitle {
+        selection_evidence: Default::default(),
         playlist: String::new(),
         playlist_id: 0,
         duration_secs: 0.0,
@@ -529,6 +532,7 @@ impl crate::sector::SectorSource for AllEncryptedSource {
 
 fn title_with_extents(extents: Vec<crate::disc::Extent>) -> crate::disc::DiscTitle {
     crate::disc::DiscTitle {
+        selection_evidence: Default::default(),
         playlist: String::new(),
         playlist_id: 0,
         duration_secs: 0.0,

@@ -164,6 +164,33 @@ fn parses_apps_with_cache_items_playlists_profiles_names_and_params() {
         assert_eq!(apps[0].initial_class, "com.studio.Helper");
         assert_eq!(apps[1].jar_ids(), vec!["00000", "00001"]);
         assert_eq!(apps[1].initial_class, "com.studio.MainXlet");
+        assert_eq!(apps[0].parameters, vec![b'p'; param_bytes]);
+        assert_eq!(apps[1].parameters, vec![b'p'; param_bytes]);
+    }
+}
+
+#[test]
+fn preserves_parameter_bytes_and_rejects_a_truncated_parameter_block() {
+    let mut bytes = build_bdjo_with(
+        &[AppSpec {
+            control_code: 1,
+            base_dir: "00002",
+            classpath_extension: "",
+            initial_class: "Main",
+        }],
+        &Extras {
+            param_bytes: 4,
+            ..Default::default()
+        },
+    );
+    let end = bytes.len() - 1; // final alignment byte
+    bytes[end - 4..end].copy_from_slice(&[0, 0xff, 0x80, b'=']);
+    assert_eq!(parse(&bytes).unwrap()[0].parameters, [0, 0xff, 0x80, b'=']);
+    for cut in 0..bytes.len() {
+        assert!(
+            parse(&bytes[..cut]).is_none(),
+            "accepted truncation at {cut}"
+        );
     }
 }
 
@@ -278,6 +305,7 @@ fn jar_ids_dedups_and_skips_empties() {
         base_directory: "00000".into(),
         classpath_extension: "00000;;00003; ".into(),
         initial_class: "X".into(),
+        parameters: Vec::new(),
     };
     assert_eq!(a.jar_ids(), vec!["00000", "00003"]);
 }

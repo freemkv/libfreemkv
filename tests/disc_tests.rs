@@ -154,6 +154,7 @@ fn title_with_video(
     content_format: ContentFormat,
 ) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "00800.mpls".into(),
         playlist_id: 800,
         duration_secs: 7200.0,

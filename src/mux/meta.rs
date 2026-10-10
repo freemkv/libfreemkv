@@ -366,6 +366,7 @@ impl M2tsMeta {
             .collect();
 
         DiscTitle {
+            selection_evidence: Default::default(),
             playlist: self.title.clone(),
             playlist_id: 0,
             duration_secs: self.duration,

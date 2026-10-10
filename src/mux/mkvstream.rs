@@ -1773,6 +1773,7 @@ fn parse_mkv_header(r: &mut impl Read, want_chapters: bool) -> io::Result<MkvHea
         last_cue_secs: None,
     };
     let disc_title = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: title,
         duration_secs: duration_secs.unwrap_or(0.0),
         streams,

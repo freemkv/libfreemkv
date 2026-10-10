@@ -36,6 +36,21 @@ pub(crate) fn resolve_feature(
     .flatten()
 }
 
+/// Return a complete static authored-program roster, or `None` when the disc
+/// needs unsupported navigation semantics (BD-J, conditionals, buttons, etc.).
+pub(crate) fn resolve_unconditional_roster(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+) -> Option<Vec<u16>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let index = index::parse(&udf.read_file(reader, "/BDMV/index.bdmv").ok()?)?;
+        let mobjs = mobj::parse(&udf.read_file(reader, "/BDMV/MovieObject.bdmv").ok()?)?;
+        vm::resolve_unconditional_roster(&index, &mobjs)
+    }))
+    .ok()
+    .flatten()
+}
+
 fn resolve_inner(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,

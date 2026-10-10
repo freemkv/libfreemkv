@@ -104,3 +104,109 @@ fn resolve_feature_abstains_on_malformed_index() {
 
     assert_eq!(resolve_feature(&mut disc, &udf, |id| id == 11), None);
 }
+
+#[test]
+fn unconditional_roster_reports_all_immediate_playlists() {
+    let first = cmd((1 << 5) | 2, 0x80, 0, 0, 101, 0);
+    let second = cmd((1 << 5) | 2, 0x80, 0, 0, 102, 0);
+    let mobj_bytes = build_mobj(&[&[first, second]]);
+    let index_bytes = build_index(hdmv_obj(0));
+    let mut disc = MemDisc::new();
+    let bdmv = DirSpec {
+        name: "BDMV".into(),
+        icb_lba: 12,
+        dir_data_lba: 13,
+        files: vec![
+            file_with("index.bdmv", 14, 500, index_bytes, true),
+            file_with("MovieObject.bdmv", 15, 600, mobj_bytes, true),
+        ],
+        subdirs: vec![],
+    };
+    let root = DirSpec {
+        name: String::new(),
+        icb_lba: 10,
+        dir_data_lba: 11,
+        files: Vec::new(),
+        subdirs: vec![bdmv],
+    };
+    build_udf_skeleton(&mut disc, 10);
+    lay_dir(&mut disc, &root);
+    let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+    assert_eq!(
+        resolve_unconditional_roster(&mut disc, &udf),
+        Some(vec![101, 102])
+    );
+}
+
+#[test]
+fn unconditional_roster_rejects_conditional_commands() {
+    let compare = cmd((2 << 5) | 1, 0x80, 0, 0, 0, 0);
+    let mobj_bytes = build_mobj(&[&[compare]]);
+    let index_bytes = build_index(hdmv_obj(0));
+    let mut disc = MemDisc::new();
+    let bdmv = DirSpec {
+        name: "BDMV".into(),
+        icb_lba: 12,
+        dir_data_lba: 13,
+        files: vec![
+            file_with("index.bdmv", 14, 500, index_bytes, true),
+            file_with("MovieObject.bdmv", 15, 600, mobj_bytes, true),
+        ],
+        subdirs: vec![],
+    };
+    let root = DirSpec {
+        name: String::new(),
+        icb_lba: 10,
+        dir_data_lba: 11,
+        files: Vec::new(),
+        subdirs: vec![bdmv],
+    };
+    build_udf_skeleton(&mut disc, 10);
+    lay_dir(&mut disc, &root);
+    let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+    assert_eq!(resolve_unconditional_roster(&mut disc, &udf), None);
+}
+
+#[test]
+fn unconditional_roster_rejects_partial_playlist_commands() {
+    let partial = cmd((1 << 5) | 2, 0x81, 0, 0, 101, 7);
+    let bytes = build_mobj(&[&[partial, cmd((1 << 5) | 2, 0x80, 0, 0, 102, 0)]]);
+    let index = index::parse(&build_index(hdmv_obj(0))).unwrap();
+    let objects = mobj::parse(&bytes).unwrap();
+    assert_eq!(vm::resolve_unconditional_roster(&index, &objects), None);
+}
+
+#[test]
+fn unconditional_roster_rejects_cycles_and_unknown_groups() {
+    let loop_cmd = cmd(1 << 5, 0x81, 0, 0, 0, 0);
+    let index = index::parse(&build_index(hdmv_obj(0))).unwrap();
+    let objects = mobj::parse(&build_mobj(&[&[loop_cmd]])).unwrap();
+    assert_eq!(vm::resolve_unconditional_roster(&index, &objects), None);
+
+    let unknown = cmd((1 << 5) | (3 << 3), 0x80, 0, 0, 0, 0);
+    let objects = mobj::parse(&build_mobj(&[&[unknown]])).unwrap();
+    assert_eq!(vm::resolve_unconditional_roster(&index, &objects), None);
+}
+
+#[test]
+fn unconditional_roster_rejects_out_of_bounds_jump_after_playback() {
+    let first = cmd((1 << 5) | 2, 0x80, 0, 0, 101, 0);
+    let second = cmd((1 << 5) | 2, 0x80, 0, 0, 102, 0);
+    let index = index::parse(&build_index(hdmv_obj(0))).unwrap();
+    for target in [3, 100, u32::MAX] {
+        let jump = cmd(1 << 5, 0x81, 0, 0, target, 0);
+        let objects = mobj::parse(&build_mobj(&[&[first, second, jump]])).unwrap();
+        assert_eq!(vm::resolve_unconditional_roster(&index, &objects), None);
+    }
+}
+
+#[test]
+fn unconditional_roster_rejects_invalid_play_operand_count() {
+    let index = index::parse(&build_index(hdmv_obj(0))).unwrap();
+    for operands in [0, 2, 3] {
+        let first = cmd((operands << 5) | 2, 0xc0, 0, 0, 101, 0);
+        let second = cmd((1 << 5) | 2, 0x80, 0, 0, 102, 0);
+        let objects = mobj::parse(&build_mobj(&[&[first, second]])).unwrap();
+        assert_eq!(vm::resolve_unconditional_roster(&index, &objects), None);
+    }
+}

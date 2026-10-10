@@ -1,10 +1,11 @@
 //! Minimal, read-only parser for `/BDMV/BDJO/*.bdjo` — the BD-J Object files.
 //!
-//! Only the Application Management Table (AMT) is decoded, and only the four
+//! Only the Application Management Table (AMT) is decoded, including the
 //! fields the issue #45 Tier-2 menu-walk needs from each application record:
 //! its `application_control_code` (1 = AUTOSTART), `base_directory`,
 //! `classpath_extension`, and `initial_class` (the Xlet's fully-qualified class
-//! name). Everything else in the file is skipped by width.
+//! name). Raw application parameters are retained for consumers that must
+//! resolve configuration overrides. Other fields are skipped by width.
 //!
 //! Layout follows the published BD-J Object (BDJO) file format: a fixed 48-byte
 //! header (8-byte magic+version, then a 40-byte section-address table that real
@@ -31,6 +32,9 @@ pub(crate) struct BdjoApp {
     /// `initial_class` — the autostart Xlet's fully-qualified class name
     /// (e.g. "com.foxbd.StandardMenuXlet").
     pub initial_class: String,
+    /// Raw application-parameter block, without its length byte or padding.
+    /// A consumer must decode and validate it before trusting default config.
+    pub parameters: Vec<u8>,
 }
 
 impl BdjoApp {
@@ -148,7 +152,10 @@ fn parse_app(r: &mut BitReader<'_>) -> Option<BdjoApp> {
 
     // application_parameters: u8 data_length, that many bytes, word-aligned.
     let params_len = r.read(8)? as usize;
-    r.skip(params_len * 8)?;
+    let mut parameters = Vec::with_capacity(params_len);
+    for _ in 0..params_len {
+        parameters.push(r.read(8)? as u8);
+    }
     if params_len.is_multiple_of(2) {
         r.skip(8)?;
     }
@@ -158,6 +165,7 @@ fn parse_app(r: &mut BitReader<'_>) -> Option<BdjoApp> {
         base_directory,
         classpath_extension,
         initial_class,
+        parameters,
     })
 }
 

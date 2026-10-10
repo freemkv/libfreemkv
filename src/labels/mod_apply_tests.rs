@@ -45,6 +45,7 @@ fn video() -> Stream {
 
 fn title_with(streams: Vec<Stream>) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "00800.mpls".into(),
         playlist_id: 800,
         duration_secs: 7200.0,
@@ -62,6 +63,7 @@ fn title_with(streams: Vec<Stream>) -> DiscTitle {
 /// cross-playlist binding, where two playlists cover the same clip.
 fn title_on_clip(playlist: &str, clip_id: &str, streams: Vec<Stream>) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: playlist.into(),
         clips: vec![crate::disc::Clip {
             feed_span: None,
@@ -1245,6 +1247,7 @@ fn a_vendor_qualifier_does_not_leak_onto_a_featurettes_own_stream() {
 /// PID facts are harvested from.
 fn title_on_clips(playlist: &str, clip_ids: &[&str], streams: Vec<Stream>) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: playlist.into(),
         clips: clip_ids
             .iter()

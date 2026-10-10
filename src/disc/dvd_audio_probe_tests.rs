@@ -204,6 +204,7 @@ fn probe_never_overrides_the_ast_ctl_route() {
     let mut bytes = ps_ac3(0x80, 7, true); // 5.1 this PGC does not play
     bytes.extend(ps_ac3(0x81, 2, false)); // the AST_CTL-routed stream, really 2.0
     let mut title = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "00001.ifo".into(),
         playlist_id: 1,
         duration_secs: 60.0,

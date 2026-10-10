@@ -7,6 +7,7 @@ use std::io::{Cursor, Write};
 
 fn sample_disc_title() -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "Test Movie".into(),
         playlist_id: 0,
         duration_secs: 7200.0,
@@ -433,6 +434,7 @@ fn meta_codec_roundtrip() {
     }
 
     let dt = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "Codec Test".into(),
         playlist_id: 0,
         duration_secs: 100.0,
@@ -468,6 +470,7 @@ fn meta_codec_roundtrip() {
 #[test]
 fn meta_empty_streams() {
     let dt = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "Empty".into(),
         playlist_id: 0,
         duration_secs: 0.0,
@@ -490,6 +493,7 @@ fn meta_empty_streams() {
 #[test]
 fn meta_all_stream_types() {
     let dt = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "Full".into(),
         playlist_id: 0,
         duration_secs: 3600.0,
@@ -634,6 +638,7 @@ fn mkvstream_roundtrip_bdts() {
     // phase, but an audio-only title skips codec scanning and streams EBML output immediately.
 
     let dt = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "Audio Only".into(),
         playlist_id: 0,
         duration_secs: 60.0,
@@ -684,6 +689,7 @@ fn mkvstream_roundtrip_bdts() {
 #[test]
 fn mkvstream_meta_preserves_all_streams() {
     let dt = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "Stream Test".into(),
         playlist_id: 0,
         duration_secs: 3600.0,
@@ -785,6 +791,7 @@ fn mkvstream_meta_preserves_all_streams() {
 fn mkvstream_e2e_h264_produces_valid_mkv() {
     // Construct a DiscTitle with one H.264 video stream
     let dt = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "H264 Test".into(),
         playlist_id: 0,
         duration_secs: 10.0,

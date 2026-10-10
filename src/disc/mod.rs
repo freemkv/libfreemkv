@@ -12,12 +12,21 @@ mod bluray;
 mod dvd;
 pub(crate) mod dvd_audio_probe;
 pub(crate) mod dvd_forced_probe;
+mod dvd_menu;
 mod encrypt;
 pub(crate) use encrypt::handshake_class_error;
 mod extract;
 mod hddvd;
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
+mod selection;
+mod selection_dvd;
+pub use selection_dvd::{DvdLaunchEvidence, DvdLaunchReviewReason, DvdLaunchRoute, DvdLaunchStep};
+mod selection_hdmv;
+mod selection_onq;
+pub use selection::{
+    EpisodeEvidence, MovieSelectionBasis, NavigationSource, TitleSelectionEvidence,
+};
 #[cfg(test)]
 pub(crate) mod scan_order_tests;
 
@@ -152,6 +161,8 @@ pub enum BdRegion {
 /// A title (one MPLS playlist).
 #[derive(Debug, Clone)]
 pub struct DiscTitle {
+    /// Authored selection observations; unknown for synthetic or unsupported sources.
+    pub selection_evidence: TitleSelectionEvidence,
     /// Playlist filename (e.g. "00800.mpls")
     pub playlist: String,
     /// Playlist number (e.g. 800)
@@ -1574,6 +1585,7 @@ impl DiscTitle {
     /// Empty DiscTitle with no streams.
     pub fn empty() -> Self {
         Self {
+            selection_evidence: TitleSelectionEvidence::default(),
             playlist: String::new(),
             playlist_id: 0,
             duration_secs: 0.0,
@@ -2905,6 +2917,27 @@ impl Disc {
         nav_feature: Option<u16>,
     ) {
         let ranks = Self::rank_titles(titles, hint, nav_feature);
+        for (title, rank) in titles.iter_mut().zip(&ranks) {
+            let navigation = (nav_feature == Some(title.playlist_id)).then_some(
+                if title.content_format == ContentFormat::DvdPs {
+                    NavigationSource::DvdFirstPlay
+                } else {
+                    NavigationSource::HdmvFirstPlay
+                },
+            );
+            title.selection_evidence.navigation = navigation;
+            title.selection_evidence.authoring_hint =
+                hint.is_some_and(|h| h.matches(title.playlist_id, &title.playlist));
+            title.selection_evidence.movie_basis = if rank.nav {
+                navigation
+                    .map(MovieSelectionBasis::Navigation)
+                    .unwrap_or_default()
+            } else if rank.authoring {
+                MovieSelectionBasis::AuthoringHint
+            } else {
+                MovieSelectionBasis::CanonicalFallback
+            };
+        }
         let mut decorated: Vec<(TitleRank, DiscTitle)> =
             ranks.into_iter().zip(std::mem::take(titles)).collect();
         decorated

@@ -2,6 +2,9 @@ use super::*;
 use crate::sector::SectorSource;
 use std::collections::HashMap;
 
+#[path = "dvd_menu_tests.rs"]
+mod menu_tests;
+
 // In-memory disc + minimal UDF image (single physical partition,
 // metadata_start == partition_start). Offsets cited against
 // udf.rs::read_filesystem / ECMA-167.

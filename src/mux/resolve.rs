@@ -1137,6 +1137,7 @@ fn build_ps_pipeline(
         .ok_or_else(|| -> io::Error { crate::error::Error::NoStreams.into() })?;
     let streams = scan.streams;
     let mut title = DiscTitle {
+        selection_evidence: Default::default(),
         playlist: path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())

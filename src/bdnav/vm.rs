@@ -139,6 +139,62 @@ pub(crate) fn resolve(
     run(&mut vm, start, is_feature)
 }
 
+/// A complete, static authored-program roster. This deliberately does not model
+/// IG buttons, BD-J, conditional VM state, or title jumps.
+pub(crate) fn resolve_unconditional_roster(
+    index: &Index,
+    mobjs: &[MovieObject],
+) -> Option<Vec<u16>> {
+    let obj_id = match index.first_play {
+        PlaybackObj::Hdmv { id_ref } if (id_ref as usize) < mobjs.len() => id_ref as usize,
+        _ => return None,
+    };
+    let mut pc = 0usize;
+    let mut visited = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    let mut complete = false;
+    for _ in 0..MAX_STEPS {
+        if !visited.insert((obj_id, pc)) {
+            return None;
+        }
+        let obj = mobjs.get(obj_id)?;
+        let c = *obj.cmds.get(pc)?;
+        if c.op_cnt > 0 && !c.imm_op1 {
+            return None;
+        }
+        if c.op_cnt > 1 && !c.imm_op2 {
+            return None;
+        }
+        match c.grp {
+            0 if c.sub_grp == 0 && c.branch_opt == 0x01 && c.op_cnt == 1 => {
+                pc = usize::try_from(c.dst).ok()?;
+                if pc >= obj.cmds.len() {
+                    return None;
+                }
+            }
+            0 if c.sub_grp == 2 && c.branch_opt == 0 && c.op_cnt == 1 => {
+                let id = u16::try_from(c.dst).ok()?;
+                if !seen.insert(id) {
+                    return None;
+                }
+                targets.push(id);
+                pc += 1;
+            }
+            0 if c.sub_grp == 0 && c.branch_opt == 0x02 && c.op_cnt == 0 => {
+                complete = true;
+                break;
+            }
+            _ => return None,
+        }
+        if pc >= obj.cmds.len() {
+            complete = true;
+            break;
+        }
+    }
+    (complete && targets.len() >= 2).then_some(targets)
+}
+
 fn run(vm: &mut Vm, mut obj_id: usize, is_feature: &dyn Fn(u16) -> bool) -> Option<u16> {
     let mut pc = 0usize;
     let mut steps = 0usize;

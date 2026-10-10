@@ -29,6 +29,7 @@ impl SectorSource for ZeroReader {
 
 fn pgs_title(pid: u16, vendor_forced: bool) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: String::new(),
         playlist_id: 0,
         duration_secs: 0.0,

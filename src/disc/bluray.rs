@@ -72,6 +72,8 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
+        super::selection_hdmv::annotate(reader, udf_fs, &mut titles);
+        super::selection_onq::annotate(reader, udf_fs, halt, &mut titles)?;
         Ok(titles)
     }
 
@@ -460,6 +462,7 @@ impl Disc {
         let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
 
         Ok(Some(DiscTitle {
+            selection_evidence: Default::default(),
             playlist: filename.to_string(),
             playlist_id,
             duration_secs,

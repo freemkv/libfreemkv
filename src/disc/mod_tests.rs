@@ -1025,6 +1025,7 @@ fn windows_path_not_sysfs_probeable() {
 /// Helper: build a DiscTitle with a single video stream at the given resolution.
 fn title_with_video(codec: Codec, resolution: Resolution) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "00800.mpls".into(),
         playlist_id: 800,
         duration_secs: 7200.0,
@@ -1541,6 +1542,7 @@ fn identify_reports_unencrypted_when_no_aacs_dir_exists() {
 fn canonical_title_order_picks_largest_feature() {
     fn title_sized(size_bytes: u64, duration_secs: f64, n_clips: usize) -> DiscTitle {
         DiscTitle {
+            selection_evidence: Default::default(),
             playlist: String::new(),
             playlist_id: 0,
             duration_secs,
@@ -1648,6 +1650,7 @@ fn canonical_title_order_keys_names_every_sort_key_including_the_tiebreak() {
 /// A BD title carrying video, `id`, `dur`/`size`, and the given clip ids.
 fn bd_title(playlist: &str, id: u16, dur: f64, size: u64, clip_ids: &[&str]) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: playlist.into(),
         playlist_id: id,
         duration_secs: dur,
@@ -2164,6 +2167,76 @@ fn nav_feature_promotes_navigated_title_over_larger() {
     let mut titles = vec![generic, navigated];
     Disc::sort_titles_by_main_feature(&mut titles, capacity, None, None);
     assert_eq!(titles[0].playlist_id, 1);
+}
+
+#[test]
+fn selection_evidence_keeps_movie_navigation_without_inventing_episode_roster() {
+    for (format, source) in [
+        (ContentFormat::BdTs, NavigationSource::HdmvFirstPlay),
+        (ContentFormat::DvdPs, NavigationSource::DvdFirstPlay),
+    ] {
+        let mut selected = bd_title("00222.mpls", 222, 6000.0, 40_000_000_000, &["00222"]);
+        selected.content_format = format;
+        let other = bd_title("00001.mpls", 1, 8000.0, 80_000_000_000, &["00001"]);
+        let mut titles = vec![other, selected];
+        Disc::sort_titles_by_main_feature(&mut titles, 100_000_000_000, None, Some(222));
+        assert_eq!(titles[0].playlist_id, 222);
+        assert_eq!(titles[0].selection_evidence.navigation, Some(source));
+        assert_eq!(
+            titles[0].selection_evidence.movie_basis,
+            MovieSelectionBasis::Navigation(source)
+        );
+        assert!(
+            titles
+                .iter()
+                .all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown)
+        );
+        let copied = titles[0].clone();
+        assert_eq!(copied.selection_evidence, titles[0].selection_evidence);
+        Disc::sort_titles_by_main_feature(&mut titles, 100_000_000_000, None, None);
+        assert_eq!(titles[0].playlist_id, 1);
+        assert!(
+            titles
+                .iter()
+                .all(|t| t.selection_evidence == TitleSelectionEvidence::default())
+        );
+    }
+}
+
+#[test]
+fn selection_evidence_keeps_rejected_observations_separate_from_movie_ranking() {
+    let mut titles = vec![
+        bd_title("00001.mpls", 1, 8000.0, 80_000_000_000, &["00001"]),
+        bd_title("00222.mpls", 222, 60.0, 1_000_000, &["00222"]),
+    ];
+    let hint = crate::labels::FeaturePlaylistHint::for_playlist(222);
+    Disc::sort_titles_by_main_feature(&mut titles, 100_000_000_000, Some(&hint), Some(222));
+    assert_eq!(titles[0].playlist_id, 1);
+    let rejected = &titles[1].selection_evidence;
+    assert_eq!(rejected.navigation, Some(NavigationSource::HdmvFirstPlay));
+    assert!(rejected.authoring_hint);
+    assert_eq!(rejected.movie_basis, MovieSelectionBasis::CanonicalFallback);
+    assert_eq!(rejected.episodes, EpisodeEvidence::Unknown);
+}
+
+#[test]
+fn selection_evidence_authoring_hint_stays_a_hint_and_survives_sorting() {
+    let mut titles = vec![
+        bd_title("00001.mpls", 1, 8000.0, 80_000_000_000, &["00001"]),
+        bd_title("00222.mpls", 222, 6000.0, 40_000_000_000, &["00222"]),
+    ];
+    let hint = crate::labels::FeaturePlaylistHint::for_playlist(222);
+    Disc::sort_titles_by_main_feature(&mut titles, 100_000_000_000, Some(&hint), None);
+    assert_eq!(titles[0].playlist_id, 222);
+    assert!(titles[0].selection_evidence.authoring_hint);
+    assert_eq!(
+        titles[0].selection_evidence.movie_basis,
+        MovieSelectionBasis::AuthoringHint
+    );
+    assert_eq!(
+        titles[0].selection_evidence.episodes,
+        EpisodeEvidence::Unknown
+    );
 }
 
 /// A nav result pointing at a STREAMLESS title is ignored (the `nav-feature`

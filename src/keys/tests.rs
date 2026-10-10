@@ -104,6 +104,7 @@ fn disc_over(
                 })
                 .collect();
             DiscTitle {
+                selection_evidence: Default::default(),
                 playlist: format!("{t:05}.mpls"),
                 size_bytes: extents.iter().map(|e| e.sector_count as u64 * 2048).sum(),
                 extents,
