@@ -77,6 +77,19 @@ fn pgcs(table: &[u8]) -> Option<Vec<&[u8]>> {
         .collect()
 }
 
+fn scanned_cells(title: &DiscTitle) -> Option<Cells> {
+    title
+        .extents
+        .iter()
+        .map(|e| {
+            Some((
+                e.start_lba,
+                e.start_lba.checked_add(e.sector_count.checked_sub(1)?)?,
+            ))
+        })
+        .collect()
+}
+
 fn commands(pgc: &[u8]) -> Option<(Commands, Commands)> {
     let at = u16_at(pgc, 0xe4)?;
     if at == 0 {
@@ -502,16 +515,7 @@ fn produce(
                 .map(|(a, b)| Some((base.checked_add(a)?, base.checked_add(b)?)))
                 .collect(),
         )?;
-        let scanned: Option<Cells> = titles[i]
-            .extents
-            .iter()
-            .map(|e| {
-                Some((
-                    e.start_lba,
-                    e.start_lba.checked_add(e.sector_count.checked_sub(1)?)?,
-                ))
-            })
-            .collect();
+        let scanned = scanned_cells(&titles[i]);
         if scanned.as_ref() != Some(&absolute) {
             return Err(Error::IfoParse);
         }
@@ -527,10 +531,12 @@ fn produce(
     let order = need(partition(&groups))?;
     let title_count = titles.len();
     for (i, title) in titles.iter_mut().enumerate() {
-        let ordinal = title_group
-            .iter()
-            .find(|(t, _)| *t == i)
-            .and_then(|(_, g)| order.iter().position(|x| x == g));
+        let group = match title_group.iter().find(|(t, _)| *t == i) {
+            Some((_, g)) => Some(*g),
+            // An unreachable exact presentation alias shares its member's ordinal.
+            None => scanned_cells(title).and_then(|c| groups.iter().position(|g| *g == c)),
+        };
+        let ordinal = group.and_then(|g| order.iter().position(|x| *x == g));
         title.selection_evidence.episodes = EpisodeEvidence::Authored {
             roster: format!("dvd-vmgm-static-playall-partition-v1:vts-{vtsn}"),
             title_count,

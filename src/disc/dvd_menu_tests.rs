@@ -202,6 +202,26 @@ fn dvd_menu_binary_nonsequential_pg_playback_mode_is_not_roster() {
 }
 
 #[test]
+fn dvd_menu_binary_unreachable_exact_alias_shares_member_ordinal() {
+    for (last, member) in [(109, true), (108, false)] {
+        let (vmg, mut vts, vob) = fixture();
+        let at =
+            4096 + u32::from_be_bytes(vts[4096 + 12 + 7 * 8..][..4].try_into().unwrap()) as usize;
+        let body = pgc(&[(100, last)], 0x40);
+        vts[at..at + body.len()].copy_from_slice(&body);
+        let titles = scan(vmg, vts, vob);
+        assert!(!titles[7].selection_evidence.dvd_menu_reachable);
+        let EpisodeEvidence::Authored {
+            member: m, ordinal, ..
+        } = titles[7].selection_evidence.episodes
+        else {
+            panic!("roster expected");
+        };
+        assert_eq!((m, ordinal), (member, member.then_some(1)));
+    }
+}
+
+#[test]
 fn dvd_menu_binary_unsupported_navigation_and_partial_tables_hold_for_review() {
     for case in 0..10 {
         let (mut vmg, mut vts, mut vob) = fixture();
