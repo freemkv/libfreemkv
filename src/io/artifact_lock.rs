@@ -10,6 +10,10 @@
 //!
 //! Acquire = open read-write, exclusive lock, then check the open file is still the one
 //! the path names (the holder deletes the sidecar only while holding it), else retry.
+//! On Unix that check also writes a per-acquisition token into the locked file and reads
+//! it back by path: inode numbers can follow names (smbfs), and a deleted sidecar's fd
+//! then compares equal to a recreated one. Holders in one process also exclude each
+//! other through a process-wide set: smbfs `flock` does not exclude two fds of one process.
 //! The wait is halt-aware and stall-based: it fails `TimedOut { op: "artifact_lock" }`
 //! (E9073) only after 30 s in which neither the `.partial` nor a watched file changed.
 
@@ -47,6 +51,42 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
 pub struct ArtifactLock {
     file: File,
     path: PathBuf,
+    claim: Claim,
+}
+
+// This process's held sidecars, by absolute path with a canonical parent.
+static HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Debug)]
+struct Claim(PathBuf);
+
+impl Claim {
+    fn take(key: &Path) -> Option<Claim> {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if held.iter().any(|p| p == key) {
+            return None;
+        }
+        held.push(key.to_path_buf());
+        Some(Claim(key.to_path_buf()))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p| p != &self.0);
+    }
+}
+
+fn claim_key(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map_or_else(|_| absolute.clone(), |parent| parent.join(name)),
+        _ => absolute,
+    }
 }
 
 impl ArtifactLock {
@@ -71,9 +111,14 @@ impl ArtifactLock {
         halt: &Halt,
         window: Duration,
     ) -> Result<ArtifactLock> {
-        Self::acquire_ids(final_path, watch, halt, window, &|f, p| {
-            (os::file_id(f), os::path_id(p))
-        })
+        Self::acquire_ids(
+            final_path,
+            watch,
+            halt,
+            window,
+            &|f, p| (os::file_id(f), os::path_id(p)),
+            &os::try_lock_exclusive,
+        )
     }
 
     // `acquire_within` with the identity check as a parameter (tests inject ESTALE and
@@ -84,9 +129,18 @@ impl ArtifactLock {
         halt: &Halt,
         window: Duration,
         ids: &Ids<'_>,
+        lock: &Lock<'_>,
     ) -> Result<ArtifactLock> {
         let path = lock_path(final_path);
         let mut wait = LockWait::new(final_path, watch, window);
+        let key = claim_key(&path);
+        let claim = loop {
+            halt.check()?;
+            match Claim::take(&key) {
+                Some(claim) => break claim,
+                None => wait.slice(halt, &io::Error::from(io::ErrorKind::WouldBlock))?,
+            }
+        };
         loop {
             halt.check()?;
             let file = match os::open_rw(&path) {
@@ -100,13 +154,18 @@ impl ArtifactLock {
             };
             // SS-8 flock(2): "Only one process may hold an exclusive lock for a given file at
             // a given time." SS-10 LockFileEx: LOCKFILE_EXCLUSIVE_LOCK, FAIL_IMMEDIATELY.
-            while !os::try_lock_exclusive(&file).map_err(|source| Error::IoError { source })? {
+            while !lock(&file).map_err(|source| Error::IoError { source })? {
                 wait.slice(halt, &io::Error::from(io::ErrorKind::WouldBlock))?;
             }
             // SS-9 XBD <sys/stat.h>: "A file identity is uniquely determined by the combination
             // of st_dev and st_ino." SS-10: "the identifier … and the volume serial number".
             let retry = match ids(&file, &path) {
-                (Ok(held), Ok(named)) if held == named => return Ok(ArtifactLock { file, path }),
+                (Ok(held), Ok(named)) if held == named => match os::names_this_file(&file, &path) {
+                    Ok(true) => return Ok(ArtifactLock { file, path, claim }),
+                    Ok(false) => io::Error::other("the sidecar was replaced"),
+                    Err(e) if os::id_retryable(&e) => e,
+                    Err(e) => return Err(Error::IoError { source: e }),
+                },
                 // The holder deleted it while we waited: we hold an unlinked file.
                 (Ok(_), Ok(_)) => io::Error::other("the sidecar was replaced"),
                 // §2.5: ENOENT/ESTALE from `fstat` or `stat` (another client deleted it).
@@ -130,7 +189,7 @@ impl ArtifactLock {
     ///
     /// [`Error::IoError`] if the file exists but cannot be removed.
     pub fn delete(self) -> Result<()> {
-        let ArtifactLock { file, path } = self;
+        let ArtifactLock { file, path, claim } = self;
         let removed = match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -138,12 +197,15 @@ impl ArtifactLock {
         };
         // Released only now: nobody can lock the path between the check and the unlink.
         drop(file);
+        drop(claim);
         removed
     }
 }
 
 // (the open file's identity, the path's identity).
 type Ids<'a> = dyn Fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64, u64)>) + 'a;
+// The OS exclusive try-lock (tests model filesystems where it does not exclude).
+type Lock<'a> = dyn Fn(&File) -> io::Result<bool> + 'a;
 
 // The T10 wait between lock attempts: halt-aware, failing only after `window` with no
 // change in any watched file.
@@ -258,6 +320,27 @@ mod os {
     pub(super) fn path_id(p: &Path) -> io::Result<(u64, u64)> {
         let m = std::fs::metadata(p)?;
         Ok((m.dev(), m.ino()))
+    }
+
+    // Only a file's lock holder writes it, so reading our fresh token back by path
+    // proves the path names the file we locked, whatever its inode number says.
+    pub(super) fn names_this_file(f: &File, p: &Path) -> io::Result<bool> {
+        use std::io::Read;
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let token = format!("{}:{nanos}:{sequence}\n", std::process::id());
+        f.set_len(0)?;
+        f.write_all_at(token.as_bytes(), 0)?;
+        let mut named = Vec::with_capacity(token.len() + 1);
+        File::open(p)?
+            .take(token.len() as u64 + 1)
+            .read_to_end(&mut named)?;
+        Ok(named == token.as_bytes())
     }
 
     // Gone (ENOENT), or deleted by another NFS client (ESTALE): retry.
@@ -388,6 +471,11 @@ mod os {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(p)?;
         handle_id(&f)
+    }
+
+    // File indexes are real here, and an exclusive LockFileEx would block the read-back.
+    pub(super) fn names_this_file(_f: &File, _p: &Path) -> io::Result<bool> {
+        Ok(true)
     }
 
     pub(super) fn id_retryable(e: &io::Error) -> bool {

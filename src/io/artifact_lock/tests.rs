@@ -169,6 +169,77 @@ fn artifact_lock_rechecks_identity_after_the_holder_deletes() {
     drop(waiter.join().unwrap());
 }
 
+// smbfs against Samba's fruit:zero_file_id=yes derives inode numbers from the name:
+// a deleted sidecar's open fd and a recreated one compare equal.
+type IdPair = (io::Result<(u64, u64)>, io::Result<(u64, u64)>);
+
+fn name_derived(_: &File, p: &Path) -> IdPair {
+    use std::hash::{Hash, Hasher};
+    let mut name = std::collections::hash_map::DefaultHasher::new();
+    p.hash(&mut name);
+    (Ok((1, name.finish())), Ok((1, name.finish())))
+}
+
+#[test]
+#[cfg(unix)]
+fn a_deleted_sidecar_fd_does_not_name_a_recreated_one() {
+    let (_dir, out) = artifact();
+    let path = lock_path(&out);
+    let old = os::open_rw(&path).unwrap();
+    assert!(os::names_this_file(&old, &path).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    assert!(os::names_this_file(&old, &path).is_err_and(|e| os::id_retryable(&e)));
+    let new = os::open_rw(&path).unwrap();
+    assert!(!os::names_this_file(&old, &path).unwrap());
+    assert!(os::names_this_file(&new, &path).unwrap());
+}
+
+#[test]
+#[cfg(unix)]
+fn name_derived_ids_cannot_admit_a_waiter_holding_the_deleted_sidecar() {
+    let (_dir, out) = artifact();
+    let take = |out: &Path, window| {
+        ArtifactLock::acquire_ids(
+            out,
+            &[],
+            &Halt::new(),
+            window,
+            &name_derived,
+            &os::try_lock_exclusive,
+        )
+    };
+    let holder = take(&out, WINDOW).expect("first taker");
+    let (out2, got) = (out.clone(), Arc::new(AtomicBool::new(false)));
+    let flag = got.clone();
+    let waiter = thread::spawn(move || {
+        let lock = ArtifactLock::acquire_ids(
+            &out2,
+            &[],
+            &Halt::new(),
+            Duration::from_secs(10),
+            &name_derived,
+            &os::try_lock_exclusive,
+        )
+        .expect("second taker");
+        flag.store(true, Ordering::SeqCst);
+        thread::sleep(WINDOW * 2);
+        lock
+    });
+    thread::sleep(WINDOW / 2);
+    holder.delete().expect("deleted while held");
+    let t = Instant::now();
+    while !got.load(Ordering::SeqCst) {
+        assert!(t.elapsed() < SLACK * 5, "the waiter never took the lock");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let third = take(&out, Duration::from_millis(100));
+    assert!(
+        matches!(third, Err(Error::TimedOut { .. })),
+        "two holders: the waiter kept the deleted sidecar: {third:?}"
+    );
+    drop(waiter.join().unwrap());
+}
+
 /// §2.5 lifetime: "Deleted on success … and on Discard, both while holding it. Kept
 /// after Stop, a failure or a crash, where it guards the resumable artifact."
 #[test]
@@ -281,7 +352,14 @@ fn persistent_identity_mismatch_times_out_not_spins() {
         (Ok((1, 1)), Ok((1, 2)))
     };
     let t = Instant::now();
-    let r = ArtifactLock::acquire_ids(&out, &[], &Halt::new(), WINDOW, &ids);
+    let r = ArtifactLock::acquire_ids(
+        &out,
+        &[],
+        &Halt::new(),
+        WINDOW,
+        &ids,
+        &os::try_lock_exclusive,
+    );
     let took = t.elapsed();
     assert!(
         matches!(
@@ -318,7 +396,81 @@ fn estale_from_fstat_retries() {
             (os::file_id(f), os::path_id(p))
         }
     };
-    let lock = ArtifactLock::acquire_ids(&out, &[], &Halt::new(), WINDOW, &ids);
+    let lock = ArtifactLock::acquire_ids(
+        &out,
+        &[],
+        &Halt::new(),
+        WINDOW,
+        &ids,
+        &os::try_lock_exclusive,
+    );
     assert!(lock.is_ok(), "{lock:?}");
     assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry, then held");
+}
+
+// Probed live: on macOS smbfs a second fd in the same process takes flock(LOCK_EX)
+// while the first holds it. One process must still admit one holder.
+#[test]
+fn an_os_lock_that_never_excludes_still_admits_one_holder_per_process() {
+    let (_dir, out) = artifact();
+    let real_ids = |f: &File, p: &Path| (os::file_id(f), os::path_id(p));
+    let take = |window| {
+        ArtifactLock::acquire_ids(&out, &[], &Halt::new(), window, &real_ids, &|_| Ok(true))
+    };
+    let holder = take(WINDOW).expect("first taker");
+    let second = take(Duration::from_millis(100));
+    assert!(
+        matches!(second, Err(Error::TimedOut { .. })),
+        "two holders in one process: {second:?}"
+    );
+    holder.delete().unwrap();
+    take(WINDOW).expect("free again after delete");
+}
+
+// LIVE: FREEMKV_LIVE_SMB_DIR=/Volumes/media cargo test --lib live_smb_artifact_lock
+// -- --ignored --nocapture. Uses a scratch directory it always removes.
+#[test]
+#[cfg(unix)]
+#[ignore = "needs FREEMKV_LIVE_SMB_DIR on a network share"]
+fn live_smb_artifact_lock_recreated_sidecar_has_one_holder() {
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let removed = std::fs::remove_dir_all(&self.0);
+            eprintln!("live: removed {} -> {removed:?}", self.0.display());
+        }
+    }
+    let Some(share) = std::env::var_os("FREEMKV_LIVE_SMB_DIR") else {
+        return;
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let scratch = Scratch(Path::new(&share).join(format!(".fmkv-lock-{nonce:x}")));
+    std::fs::create_dir(&scratch.0).unwrap();
+    let out = scratch.0.join("Movie.mkv");
+    let holder = take(&out, WINDOW).expect("first taker");
+    let (out2, got) = (out.clone(), Arc::new(AtomicBool::new(false)));
+    let flag = got.clone();
+    let waiter = thread::spawn(move || {
+        let lock = take(&out2, Duration::from_secs(30)).expect("second taker");
+        flag.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(5));
+        lock
+    });
+    thread::sleep(Duration::from_secs(2));
+    holder.delete().expect("deleted while held");
+    let t = Instant::now();
+    while !got.load(Ordering::SeqCst) {
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "the waiter never took the lock"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let third = take(&out, Duration::from_millis(500));
+    eprintln!("live: third taker while the waiter holds -> {third:?}");
+    assert!(matches!(third, Err(Error::TimedOut { .. })), "{third:?}");
+    waiter.join().unwrap().delete().unwrap();
 }
