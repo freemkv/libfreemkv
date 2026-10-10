@@ -215,6 +215,22 @@ mod tests {
     }
 
     #[test]
+    fn success_moves_bytes_and_leaves_no_stray() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"payload").unwrap();
+        no_replace(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+        assert!(!src.exists());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["dst"]);
+    }
+
+    #[test]
     fn failed_publication_retains_source() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
