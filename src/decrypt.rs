@@ -2,7 +2,7 @@
 //! from disc scanning; handles AACS 1.0/2.0 and CSS transparently, and
 //! the caller never sees encrypted data unless explicitly bypassed.
 //!
-//! AACS aligned units decrypt independently, so buffers of at least [`PARALLEL_MIN_UNITS`]
+//! AACS aligned units decrypt independently, so buffers of at least `PARALLEL_MIN_UNITS`
 //! units parallelize across a rayon pool; smaller buffers use the serial path. Thread count
 //! resolves from [`set_decrypt_threads`], else `FREEMKV_THREADS`, else all cores (capped at
 //! [`MAX_THREADS`]).
@@ -840,7 +840,7 @@ pub fn decrypt_sectors(
 /// and `content_ranges` are therefore inert here — retained only so the wrapper
 /// signature stays stable for the `DecryptingSectorSource` dispatch. The mapped
 /// AACS path honours content extents via
-/// [`decrypt_sectors_mapped_in_content`]. Prefer [`decrypt_sectors`] in new code.
+/// `decrypt_sectors_mapped_in_content`. Prefer [`decrypt_sectors`] in new code.
 pub fn decrypt_sectors_in_content(
     buf: &mut [u8],
     keys: &mut DecryptKeys,

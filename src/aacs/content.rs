@@ -143,8 +143,8 @@ const KEY_PROOF_PACKETS: usize = 4;
 /// read VERIFY. AACS has no cryptographic "did the key work" answer (no MAC), so
 /// a key is proven STRUCTURALLY: its plaintext must look like valid content for
 /// the disc's container. This dispatches to the right container check by
-/// `format` — BD/UHD/FMTS are Transport Stream ([`is_clean_ts`]); HD-DVD `.evo`
-/// is Program Stream ([`is_clean_ps`]). NOT a decryption verdict: a correct key
+/// `format` — BD/UHD/FMTS are Transport Stream (`is_clean_ts`); HD-DVD `.evo`
+/// is Program Stream (`is_clean_ps`). NOT a decryption verdict: a correct key
 /// can decrypt structurally-broken content, which is the muxer's concern.
 pub fn is_clean(unit: &[u8], format: crate::disc::ContentFormat) -> bool {
     match format {

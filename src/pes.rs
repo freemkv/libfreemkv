@@ -66,7 +66,7 @@ pub struct PesFrame {
     /// Codec-agnostic per-picture coding info (field order / type / pulldown),
     /// set by the video parser; `None` for audio/subtitle frames, codecs that
     /// do not yet fill it, and the deserialize hop. The muxer reads it through
-    /// the [`crate::mux::codec::PictureInfo`] accessors to stamp `FieldOrder` /
+    /// the `crate::mux::codec::PictureInfo` accessors to stamp `FieldOrder` /
     /// `DefaultDuration` — never re-deriving from the bitstream.
     pub coding: Option<crate::mux::codec::PictureInfo>,
 }

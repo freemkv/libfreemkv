@@ -118,7 +118,7 @@ pub enum DiscFormat {
     Uhd,
     /// UHD Blu-ray with AACS 2.1 FMTS content — the main feature is a `.fmts`
     /// clip (M2TS transport stream plus interleaved forensic variant segments).
-    /// A BD-tree disc (enumerated by [`Disc::scan_bluray_titles`]); distinct
+    /// A BD-tree disc (enumerated by `Disc::scan_bluray_titles`); distinct
     /// from [`DiscFormat::Uhd`] only in the container + AACS generation.
     Fmts,
     /// Standard Blu-ray (1080p/1080i)
@@ -215,7 +215,7 @@ pub struct Clip {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TitleRank {
     /// The disc's own HDMV navigation (played like a real player by the
-    /// [`crate::bdnav`] VM) reaches this video-bearing title as the feature —
+    /// `crate::bdnav` VM) reaches this video-bearing title as the feature —
     /// the authoritative `nav-feature` signal, above `authoring`.
     pub nav: bool,
     /// The disc's authoring names this (video-bearing, non-composite,

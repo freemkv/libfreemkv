@@ -786,7 +786,7 @@ impl UdfFs {
 
     /// If the ICB at `meta_lba` stores its data inline (embedded, AD type 3),
     /// return the embedded bytes; `Ok(None)` for the normal extent-backed case.
-    /// Public wrapper over [`read_inline_data`](Self::read_inline_data) so the
+    /// Public wrapper over `read_inline_data` so the
     /// per-file tree extractor can honor inline nav files without re-walking a
     /// path. The caller trims to the entry's declared `size`.
     pub fn inline_data_at(

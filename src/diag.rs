@@ -357,7 +357,7 @@ pub(crate) fn dump_mkv_track(track_number: u64, track: &crate::mux::mkv::MkvTrac
 // first few seconds per track while bounding the side file to a few MB.
 const OPENING_FRAMES_PER_TRACK: usize = 100;
 
-/// Captures the first [`OPENING_FRAMES_PER_TRACK`] coded frames of EACH track to
+/// Captures the first `OPENING_FRAMES_PER_TRACK` coded frames of EACH track to
 /// a side file (`<output>.opening.bin`) and logs a per-frame summary line, so an
 /// opening-GOP / menu / mid-GOP-open issue is diagnosable from a future log +
 /// side file WITHOUT the disc. Gated to `--log-level 3`: constructed only when

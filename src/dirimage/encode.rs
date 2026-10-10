@@ -1,6 +1,6 @@
 //! ECMA-167 / UDF 1.02 descriptor encoder.
 //!
-//! Turns a [`Layout`](super::layout::Layout) — a directory tree with every
+//! Turns a [`Layout`] — a directory tree with every
 //! ICB, directory-data and file-data block already assigned — into the set
 //! of metadata sectors a real UDF volume would carry. A pure function from
 //! layout to sectors; nothing here touches the filesystem.

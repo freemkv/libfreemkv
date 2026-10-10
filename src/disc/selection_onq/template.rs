@@ -289,7 +289,7 @@ pub(super) struct PlaybackThunk {
 
 /// Reviewed straight-line role: zero locals, push positive row, push screen
 /// function reference, call with exactly one argument, return. Every byte is
-/// consumed. Stack contract is [] -> [row] -> [row,callee] -> [] -> return.
+/// consumed. Stack contract is `[] -> [row] -> [row,callee] -> [] -> return`.
 pub(super) fn playback_thunk(body: &[u8]) -> Result<PlaybackThunk> {
     if body.len() != 11
         || body[0] != 0

@@ -50,7 +50,7 @@ pub(crate) fn variant_data_record(records: &[MkbRecord]) -> Option<&[u8]> {
 }
 
 /// 16-byte Nonce for `Kvn = AES-G(Kp, Nonce)` — the trailing 16 bytes of the
-/// `0x2d` record ([`variant_data_record`]).
+/// `0x2d` record (`variant_data_record`).
 ///
 /// The Nonce-at-tail placement is consistent across both reference MKBs (the
 /// leading `body-16` bytes form the `VARIANTS` table exactly), but head-vs-tail

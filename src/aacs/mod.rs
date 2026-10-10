@@ -33,7 +33,7 @@ pub const PATH_MKB_RW: &str = "/AACS/MKB_RW.inf";
 pub const PATH_CONTENT_CERT: &str = "/AACS/Content000.cer";
 pub const PATH_CONTENT_CERT_ALT: &str = "/AACS/Content001.cer";
 
-/// An AACS key-input role. [`role_paths`] maps it to an ordered candidate path
+/// An AACS key-input role. `role_paths` maps it to an ordered candidate path
 /// list (BD/UHD constants, then the discovered HD DVD files).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AacsRole {

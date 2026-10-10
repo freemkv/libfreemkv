@@ -4,7 +4,7 @@
 //! [`file_durable`] fsyncs a file's contents + metadata, opened read+write so the flush also
 //! succeeds on Windows.
 //!
-//! Per the crate convention (see [`crate::io::writeback_file`]), platform
+//! Per the crate convention (see `crate::io::writeback_file`), platform
 //! dispatch happens once here via cfg-gated `mod` decls — no inline `#[cfg]`.
 
 use std::io;

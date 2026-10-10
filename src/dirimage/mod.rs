@@ -3,7 +3,7 @@
 //! A user's extracted disc has files but no sectors, and everything above
 //! the sector layer in this crate reads through a [`SectorSource`].
 //! [`DirImage`] supplies one by synthesizing a real, minimal UDF 1.02 volume:
-//! metadata is encoded into RAM by [`encode`], data sectors map to on-demand
+//! metadata is encoded into RAM by `encode`, data sectors map to on-demand
 //! file reads. 3D/SSIF folders are rejected up front
 //! ([`Error::DirImageSsifUnsupported`]).
 

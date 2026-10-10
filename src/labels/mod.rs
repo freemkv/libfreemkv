@@ -45,7 +45,7 @@ pub(crate) use bdmt::{display_text, is_placeholder_title};
 /// unrelated `.m2ts` files both open their first audio at 0x1100 — so the clip
 /// is part of the identity, not decoration.
 ///
-/// This is the same key [`apply_labels`] already binds anchor facts through, so
+/// This is the same key `apply_labels` already binds anchor facts through, so
 /// a label that carries one needs no ordinal, no sequence and no guess.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamId {

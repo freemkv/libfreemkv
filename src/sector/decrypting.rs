@@ -17,7 +17,7 @@ use super::SectorSource;
 /// Decorator: read from `inner`, then run the configured
 /// AACS / CSS decrypt over the bytes that landed in `buf`.
 ///
-/// AACS decrypts EXCLUSIVELY through the installed [`key_map`](Self::key_map)
+/// AACS decrypts EXCLUSIVELY through the installed `key_map`
 /// (one key per CPS unit / segment, resolved up front); CSS self-descrambles on
 /// its per-sector scramble flag; [`DecryptKeys::None`] is a pass-through.
 pub struct DecryptingSectorSource<S: SectorSource> {

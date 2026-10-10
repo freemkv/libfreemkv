@@ -272,7 +272,7 @@ pub(crate) fn codec_name(coding_type: u8) -> &'static str {
 }
 
 /// Build the final `codec_hint`. For audio streams, optionally
-/// append " <channels>" and/or " <rate>" suffixes. Sample rate is
+/// append `" <channels>"` and/or `" <rate>"` suffixes. Sample rate is
 /// only spelled out for non-48k (the universal default).
 fn build_codec_hint(label_type: StreamLabelType, entry: &crate::mpls::StreamEntry) -> String {
     let base = codec_name(entry.coding_type);

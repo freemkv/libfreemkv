@@ -1,6 +1,6 @@
 //! `PipelinedPesStream` — the read-side of the freemkv mux highway.
 //!
-//! Given a [`crate::mux::demux_thread::DemuxThread`] and a set of codec
+//! Given a `crate::mux::demux_thread::DemuxThread` and a set of codec
 //! parsers, this struct implements [`crate::pes::PesSource`] by running codec
 //! parse on the caller's thread and emitting `PesFrame`s one at a time.
 //!
@@ -19,7 +19,7 @@ use crossbeam_channel::Receiver;
 use std::io;
 
 /// Stream impl that consumes pre-demuxed `PesPacket` batches from a
-/// [`DemuxThread`] and runs codec parse on the caller's thread.
+/// `DemuxThread` and runs codec parse on the caller's thread.
 pub struct PipelinedPesStream {
     title: DiscTitle,
     parsers: Vec<(u16, Box<dyn CodecParser>)>,

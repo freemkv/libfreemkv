@@ -2,7 +2,7 @@
 //!
 //! The filesystem enumeration and decryption are entirely reused:
 //! [`udf::read_filesystem`] yields the recursive [`UdfFs`] tree (BD and DVD
-//! alike), and [`DecryptingSectorSource`](crate::sector::DecryptingSectorSource)
+//! alike), and [`DecryptingSectorSource`]
 //! applies AACS / CSS in-place. This module is the focused per-file producer:
 //! tree walk, host-path mapping + sanitization, per-VTS CSS key grouping,
 //! decrypt-and-stream-to-disk, sparse-gap handling, and truncate + rename.

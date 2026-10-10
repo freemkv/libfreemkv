@@ -1,4 +1,4 @@
-//! CSS content cipher (constants in [`super::tables`]). Two table-driven
+//! CSS content cipher (constants in `super::tables`). Two table-driven
 //! linear-feedback circuits:
 //! - **LFSR1** — 17-bit register seeded from `key[0..2] XOR seed[0..2]`,
 //!   stepped through `TAB2`/`TAB3`/`TAB5`.

@@ -63,7 +63,7 @@ fn resolve_read_drop_chunk(mib: Option<u64>) -> u64 {
 /// SectorSource backed by a file (ISO image). Every `read_sectors`
 /// call is a direct `seek + read_exact` against the underlying file
 /// — kernel readahead handles prefetch, and every
-/// [`READ_DROP_CHUNK_BYTES_DEFAULT`] bytes of consumed data the
+/// `READ_DROP_CHUNK_BYTES_DEFAULT` bytes of consumed data the
 /// platform's `DONTNEED` hook drops the consumed window from the
 /// page cache to bound memory pressure.
 pub struct FileSectorSource {

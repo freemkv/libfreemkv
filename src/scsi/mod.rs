@@ -166,7 +166,7 @@ mod sense_family_tests;
 
 /// Decoded SPC-4 sense triple — the precise reason a SCSI command failed.
 ///
-/// Returned by [`parse_sense`] and embedded inside [`Error::ScsiError`]
+/// Returned by `parse_sense` and embedded inside [`Error::ScsiError`]
 /// (`sense: Option<ScsiSense>`). Predicate methods (`is_medium_error`,
 /// `is_unit_attention`, `is_marginal`, …) read more fluently than raw
 /// `sense_key` comparisons at call sites.

@@ -2,7 +2,7 @@
 //!
 //! A `Drive` is opened from a device path, identifies itself via INQUIRY,
 //! optionally unlocks/initializes via the `freemkv-unlock` dispatch
-//! (through [`crate::unlock_bridge`]), and reads sectors.
+//! (through `crate::unlock_bridge`), and reads sectors.
 
 pub fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
@@ -1117,9 +1117,9 @@ impl Drive {
     /// Read sectors from the disc. Single-shot — no inline retries, no
     /// SCSI reset.
     ///
-    /// `recovery=true` uses [`crate::scsi::READ_RECOVERY_TIMEOUT_MS`] (60 s, matches sg_dd) for
+    /// `recovery=true` uses `crate::scsi::READ_RECOVERY_TIMEOUT_MS` (60 s, matches sg_dd) for
     /// the `freemkv_engine::recovery::patch` pass; `recovery=false` uses
-    /// [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for `freemkv_engine::recovery::copy`'s fast
+    /// `crate::scsi::READ_TIMEOUT_MS` (10 s) for `freemkv_engine::recovery::copy`'s fast
     /// skip-forward sweep. On any failure returns `Err(DiscRead)` immediately; orchestration
     /// handles retry policy.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
@@ -1742,7 +1742,7 @@ fn is_read_class(cdb: &[u8]) -> bool {
     )
 }
 
-/// Structured outcome of [`resolve_device`] — a machine-readable signal
+/// Structured outcome of `resolve_device` — a machine-readable signal
 /// (no English prose) the application layer can render however it likes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceResolution {

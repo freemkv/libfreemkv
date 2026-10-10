@@ -546,7 +546,7 @@ impl std::fmt::Debug for ResolvedChain {
 /// Runs the deterministic derivation DOWNWARD to the disc's terminal unit keys:
 /// `DK → MK → VUK → UKs`, `PK → MK → VUK → UKs`, `MK → VUK → UKs`,
 /// `VUK → UKs`, or `UK → itself`, parsing `Unit_Key_RO.inf` at `version` (from
-/// [`resolve_aacs_version`](crate::aacs::mkb::resolve_aacs_version), the resolver the scan
+/// [`resolve_aacs_version`], the resolver the scan
 /// uses) so a multi-CPS disc yields all its unit keys at the right stride.
 ///
 /// PURE DERIVATION: no sampling, no validation, no position recovery. Returns `None` only when
