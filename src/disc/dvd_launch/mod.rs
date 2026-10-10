@@ -1,4 +1,4 @@
-//! Bounded root-menu launch traces. Selection policy does not consume these yet.
+//! Bounded root-menu launch traces. Advisory evidence; engine selection consumes verified roots.
 
 mod audio;
 mod ifo;
