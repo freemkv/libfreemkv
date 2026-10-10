@@ -32,6 +32,15 @@ fn normalize(error: io::Error) -> io::Error {
     error
 }
 
+// renameat2 reports EINVAL when the filesystem lacks RENAME_NOREPLACE.
+#[cfg(any(target_os = "linux", test))]
+fn renameat2_error(err: io::Error) -> io::Error {
+    if err.raw_os_error() == Some(libc::EINVAL) {
+        return io::Error::new(io::ErrorKind::Unsupported, err);
+    }
+    err
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn native(source: &Path, target: &Path) -> io::Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -56,6 +65,9 @@ fn native(source: &Path, target: &Path) -> io::Result<()> {
     if result == 0 {
         Ok(())
     } else {
+        #[cfg(target_os = "linux")]
+        return Err(renameat2_error(io::Error::last_os_error()));
+        #[cfg(not(target_os = "linux"))]
         Err(io::Error::last_os_error())
     }
 }
@@ -191,6 +203,15 @@ mod tests {
                 Some(code)
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renameat2_einval_means_unsupported() {
+        let e = renameat2_error(io::Error::from_raw_os_error(libc::EINVAL));
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        let e = renameat2_error(io::Error::from_raw_os_error(libc::EEXIST));
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]
