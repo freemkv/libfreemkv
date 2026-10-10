@@ -33,7 +33,7 @@ fn normalize(error: io::Error) -> io::Error {
 }
 
 // renameat2 reports EINVAL when the filesystem lacks RENAME_NOREPLACE.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn renameat2_error(err: io::Error) -> io::Error {
     if err.raw_os_error() == Some(libc::EINVAL) {
         return io::Error::new(io::ErrorKind::Unsupported, err);
