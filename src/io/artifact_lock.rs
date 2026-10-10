@@ -10,6 +10,9 @@
 //!
 //! Acquire = open read-write, exclusive lock, then check the open file is still the one
 //! the path names (the holder deletes the sidecar only while holding it), else retry.
+//! On Unix that check also writes a per-acquisition token into the locked file and reads
+//! it back by path: inode numbers can follow names (smbfs), and a deleted sidecar's fd
+//! then compares equal to a recreated one.
 //! The wait is halt-aware and stall-based: it fails `TimedOut { op: "artifact_lock" }`
 //! (E9073) only after 30 s in which neither the `.partial` nor a watched file changed.
 
@@ -106,7 +109,12 @@ impl ArtifactLock {
             // SS-9 XBD <sys/stat.h>: "A file identity is uniquely determined by the combination
             // of st_dev and st_ino." SS-10: "the identifier … and the volume serial number".
             let retry = match ids(&file, &path) {
-                (Ok(held), Ok(named)) if held == named => return Ok(ArtifactLock { file, path }),
+                (Ok(held), Ok(named)) if held == named => match os::names_this_file(&file, &path) {
+                    Ok(true) => return Ok(ArtifactLock { file, path }),
+                    Ok(false) => io::Error::other("the sidecar was replaced"),
+                    Err(e) if os::id_retryable(&e) => e,
+                    Err(e) => return Err(Error::IoError { source: e }),
+                },
                 // The holder deleted it while we waited: we hold an unlinked file.
                 (Ok(_), Ok(_)) => io::Error::other("the sidecar was replaced"),
                 // §2.5: ENOENT/ESTALE from `fstat` or `stat` (another client deleted it).
@@ -260,6 +268,27 @@ mod os {
         Ok((m.dev(), m.ino()))
     }
 
+    // Only a file's lock holder writes it, so reading our fresh token back by path
+    // proves the path names the file we locked, whatever its inode number says.
+    pub(super) fn names_this_file(f: &File, p: &Path) -> io::Result<bool> {
+        use std::io::Read;
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let token = format!("{}:{nanos}:{sequence}\n", std::process::id());
+        f.set_len(0)?;
+        f.write_all_at(token.as_bytes(), 0)?;
+        let mut named = Vec::with_capacity(token.len() + 1);
+        File::open(p)?
+            .take(token.len() as u64 + 1)
+            .read_to_end(&mut named)?;
+        Ok(named == token.as_bytes())
+    }
+
     // Gone (ENOENT), or deleted by another NFS client (ESTALE): retry.
     pub(super) fn id_retryable(e: &io::Error) -> bool {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -388,6 +417,11 @@ mod os {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(p)?;
         handle_id(&f)
+    }
+
+    // File indexes are real here, and an exclusive LockFileEx would block the read-back.
+    pub(super) fn names_this_file(_f: &File, _p: &Path) -> io::Result<bool> {
+        Ok(true)
     }
 
     pub(super) fn id_retryable(e: &io::Error) -> bool {
