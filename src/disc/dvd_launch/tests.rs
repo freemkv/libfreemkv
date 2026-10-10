@@ -538,6 +538,39 @@ fn strict_interleave_rejects_early_end_clipping_wrong_identity_and_overlap() {
 }
 
 #[test]
+fn interleave_navigation_pack_sync_and_identity_bytes_each_gate_the_walk() {
+    let mut m = Memory::default();
+    let mut good = vec![0; 2048];
+    good[..4].copy_from_slice(&[0, 0, 1, 0xba]);
+    good[4] = 0x44;
+    good[0x400..0x407].copy_from_slice(&[0, 0, 1, 0xbf, 3, 0xfa, 1]);
+    long(&mut good, 0x407 + 4, 10);
+    word(&mut good, 0x407 + 24, 1);
+    good[0x407 + 27] = 1;
+    long(&mut good, 0x407 + 34, 19);
+    long(&mut good, 0x407 + 38, 0x7fff_ffff);
+    let walk = |m: &mut Memory| super::interleave::walk(m, 100, 10, 29, &[0, 1, 0, 1], &mut 8);
+    m.put(110, &good);
+    assert!(walk(&mut m).is_ok());
+    let mut cases: Vec<(&str, usize, u8)> = vec![
+        ("pack start code", 3, 0xbb),
+        ("pack header marker", 4, 0x04),
+        ("nav pack address", 0x407 + 7, 11),
+        ("angle byte", 0x407 + 27, 2),
+        ("position high byte", 0x407 + 24, 1),
+    ];
+    for k in 0..7 {
+        cases.push(("pci substream marker", 0x400 + k, 0x55));
+    }
+    for (name, at, value) in cases {
+        let mut b = good.clone();
+        b[at] = value;
+        m.put(110, &b);
+        assert!(walk(&mut m).is_err(), "{name} mutation accepted");
+    }
+}
+
+#[test]
 fn unresolved_register_and_partial_title_targets_never_publish_roots() {
     let (vmg, vts, vob) = fixture();
     for replacement in [
