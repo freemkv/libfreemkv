@@ -188,6 +188,20 @@ fn dvd_menu_binary_reachability_without_exact_partition_is_not_roster() {
 }
 
 #[test]
+fn dvd_menu_binary_nonsequential_pg_playback_mode_is_not_roster() {
+    let (vmg, mut vts, vob) = fixture();
+    let at = 4096 + u32::from_be_bytes(vts[4156..4160].try_into().unwrap()) as usize;
+    vts[at + 0xa2] = 1; // PG playback mode: not sequential
+    let titles = scan(vmg, vts, vob);
+    assert_eq!(titles.len(), 8);
+    assert!(
+        titles
+            .iter()
+            .all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown)
+    );
+}
+
+#[test]
 fn dvd_menu_binary_unsupported_navigation_and_partial_tables_hold_for_review() {
     for case in 0..10 {
         let (mut vmg, mut vts, mut vob) = fixture();

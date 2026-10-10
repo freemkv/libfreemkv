@@ -99,12 +99,13 @@ fn commands(pgc: &[u8]) -> Option<(Commands, Commands)> {
 fn cells(pgc: &[u8]) -> Option<Cells> {
     let programs = *pgc.get(2)? as usize;
     let count = *pgc.get(3)? as usize;
-    // No random/shuffle playback, chained PGC, restricted operations or cell commands.
+    // No random/shuffle playback (0xa2), chained PGC, restricted operations or cell commands.
     if programs == 0
         || count == 0
         || programs > count
         || pgc.get(8..12)? != [0; 4]
         || pgc.get(0x9c..0xa2)? != [0; 6]
+        || *pgc.get(0xa2)? != 0
         || *pgc.get(0xa3)? != 0
     {
         return None;
@@ -554,8 +555,8 @@ pub(super) fn annotate(
     };
     match produce(&mut reader, fs, vmg, addresses, titles) {
         Err(Error::Halted) => return Err(Error::Halted),
-        Err(_) => {
-            tracing::debug!(target:"freemkv::scan", "dvd: static menu/full-title partition unproven; episode selection needs review")
+        Err(error) => {
+            tracing::debug!(target:"freemkv::scan", ?error, "dvd: static menu/full-title partition unproven; episode selection needs review")
         }
         Ok(()) => {}
     }
