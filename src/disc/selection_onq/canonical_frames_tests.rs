@@ -167,9 +167,9 @@ fn actual_canonical_normal_stack_envelope() {
             .authored_file(std::str::from_utf8(path).unwrap())
             .unwrap();
         let table = qcs::parse(&data).unwrap();
-        if !table
+        if table
             .program
-            .is_some_and(|body| template::table_program(body).is_ok())
+            .is_none_or(|body| template::table_program(body).is_err())
         {
             continue;
         }
