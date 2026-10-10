@@ -22,8 +22,6 @@ pub mod profile;
 mod selection;
 mod selection_dvd;
 pub use selection_dvd::{DvdLaunchEvidence, DvdLaunchReviewReason, DvdLaunchRoute, DvdLaunchStep};
-mod selection_hdmv;
-mod selection_onq;
 mod selection_partition;
 pub use selection::{
     EpisodeEvidence, MovieSelectionBasis, NavigationSource, TitleSelectionEvidence,

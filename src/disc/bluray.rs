@@ -72,8 +72,7 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        super::selection_hdmv::annotate(reader, udf_fs, &mut titles);
-        super::selection_onq::annotate(reader, udf_fs, halt, &mut titles)?;
+        super::selection_partition::annotate(&mut titles);
         Ok(titles)
     }
 
