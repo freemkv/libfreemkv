@@ -148,39 +148,47 @@ impl<'u> PesOutput<'u> {
                 // Wrap in `WritebackFile` (bounded-cache) so a UHD mux to slow/
                 // network staging avoids dirty-page bursts. BufWriter coalesces
                 // small EBML writes; Linux fallocate(KEEP_SIZE) cuts fragmentation.
-                let writer: Box<dyn super::WriteSeek + Send> =
-                    Box::new(std::io::BufWriter::with_capacity(
-                        IO_BUF_SIZE,
-                        writeback_file(path, title.size_bytes, flush)?,
-                    ));
-                Ok(Box::new(MkvStream::create(writer, title, Some(path))?))
+                created(path, || {
+                    let writer: Box<dyn super::WriteSeek + Send> =
+                        Box::new(std::io::BufWriter::with_capacity(
+                            IO_BUF_SIZE,
+                            writeback_file(path, title.size_bytes, flush)?,
+                        ));
+                    Ok(Box::new(MkvStream::create(writer, title, Some(path))?))
+                })
             }
             PesOutput::Mp4(path) => {
                 validate_file_path(path, "mp4")?;
                 // Bounded-cache writeback (like mkv://); the mdat backpatch is an ordinary
                 // seek WritebackFile handles. BufWriter coalesces moov writes.
-                let writer = std::io::BufWriter::with_capacity(
-                    IO_BUF_SIZE,
-                    writeback_file(path, title.size_bytes, flush)?,
-                );
-                Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
+                created(path, || {
+                    let writer = std::io::BufWriter::with_capacity(
+                        IO_BUF_SIZE,
+                        writeback_file(path, title.size_bytes, flush)?,
+                    );
+                    Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
+                })
             }
             PesOutput::Mpg(path) => {
                 validate_file_path(path, "mpg")?;
                 // Streaming pack writer, no seeks: the bounded-cache writeback as for mkv://.
-                let writer = std::io::BufWriter::with_capacity(
-                    IO_BUF_SIZE,
-                    writeback_file(path, title.size_bytes, flush)?,
-                );
-                Ok(Box::new(super::mpg::MpgSink::create(writer, title)?))
+                created(path, || {
+                    let writer = std::io::BufWriter::with_capacity(
+                        IO_BUF_SIZE,
+                        writeback_file(path, title.size_bytes, flush)?,
+                    );
+                    Ok(Box::new(super::mpg::MpgSink::create(writer, title)?))
+                })
             }
             PesOutput::M2ts(path) => {
                 validate_file_path(path, "m2ts")?;
-                let writer = std::io::BufWriter::with_capacity(
-                    IO_BUF_SIZE,
-                    writeback_file(path, title.size_bytes, flush)?,
-                );
-                Ok(Box::new(M2tsStream::create(writer, title)?))
+                created(path, || {
+                    let writer = std::io::BufWriter::with_capacity(
+                        IO_BUF_SIZE,
+                        writeback_file(path, title.size_bytes, flush)?,
+                    );
+                    Ok(Box::new(M2tsStream::create(writer, title)?))
+                })
             }
             PesOutput::Network(addr) => {
                 // `NetworkStream::connect` refuses only unspecified/multicast/
@@ -209,26 +217,60 @@ impl<'u> PesOutput<'u> {
             // never `path`, which previously broke reproducibility.
             PesOutput::Fvi(path) => {
                 validate_file_path(path, "fvi")?;
-                Ok(Box::new(super::fvi_sink::FviSink::create(
-                    path,
-                    title,
-                    source.cloned().unwrap_or_default(),
-                )?))
+                created(path, || {
+                    Ok(Box::new(super::fvi_sink::FviSink::create(
+                        path,
+                        title,
+                        source.cloned().unwrap_or_default(),
+                    )?))
+                })
             }
             // `chapters://`/`json://` write title metadata at construction and
             // ignore the PES stream (see `meta_sink`).
             PesOutput::Chapters(path) => {
                 validate_file_path(path, "chapters")?;
-                Ok(Box::new(super::meta_sink::ChaptersSink::create(
-                    path, title,
-                )?))
+                created(path, || {
+                    Ok(Box::new(super::meta_sink::ChaptersSink::create(
+                        path, title,
+                    )?))
+                })
             }
             PesOutput::Json(path) => {
                 validate_file_path(path, "json")?;
-                Ok(Box::new(super::meta_sink::JsonSink::create(path, title)?))
+                created(path, || {
+                    Ok(Box::new(super::meta_sink::JsonSink::create(path, title)?))
+                })
             }
         }
     }
+}
+
+// Opens a file output's sink with `open`. A file absent before (claimed by create_new) that
+// the open then fails to fill is removed, while the path still names it; a file that was
+// already there is never removed.
+fn created(
+    path: &Path,
+    open: impl FnOnce() -> io::Result<Box<dyn PesSink>>,
+) -> io::Result<Box<dyn PesSink>> {
+    use crate::io::artifact_lock::file_identity;
+    let ours = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => file_identity(path).ok(),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+        Err(e) => return Err(e),
+    };
+    let sink = open();
+    if sink.is_err()
+        && let Some(id) = ours
+        && file_identity(path).ok() == Some(id)
+        && let Err(e) = std::fs::remove_file(path)
+    {
+        tracing::warn!(target: "mux", error = %e, "a failed output's new file could not be removed");
+    }
+    sink
 }
 
 // A file output's bounded-cache writer, sharing `flush` when given.
@@ -256,3 +298,7 @@ fn demux_sink_output(
     }
     Ok(Box::new(DemuxSink::create(dir, title, &opts)?))
 }
+
+#[cfg(test)]
+#[path = "pes_output_tests.rs"]
+mod tests;
