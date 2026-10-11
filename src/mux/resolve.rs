@@ -94,33 +94,13 @@ pub enum StreamUrl {
 impl StreamUrl {
     /// The scheme name (e.g. "disc", "mkv", "null").
     pub fn scheme(&self) -> &str {
-        match self {
-            StreamUrl::Disc { .. } => "disc",
-            StreamUrl::M2ts { .. } => "m2ts",
-            StreamUrl::Mkv { .. } => "mkv",
-            StreamUrl::Mp4 { .. } => "mp4",
-            StreamUrl::Mpg { .. } => "mpg",
-            StreamUrl::Network { .. } => "network",
-            StreamUrl::Stdio => "stdio",
-            StreamUrl::Iso { .. } => "iso",
-            StreamUrl::Dir { .. } => "dir",
-            StreamUrl::Null => "null",
-            StreamUrl::Demux { .. } => "demux",
-            StreamUrl::Video { .. } => "video",
-            StreamUrl::Audio { .. } => "audio",
-            StreamUrl::Sub { .. } => "sub",
-            StreamUrl::Fvi { .. } => "fvi",
-            StreamUrl::Chapters { .. } => "chapters",
-            StreamUrl::Json { .. } => "json",
-            StreamUrl::Unknown { .. } => "unknown",
-        }
+        self.info().name
     }
 
-    /// The path/address component, or empty string for scheme-only URLs.
-    pub fn path_str(&self) -> &str {
+    /// The filesystem file or folder this URL names; `None` for a device, an address, a
+    /// scheme-only URL or an unknown one.
+    pub fn path(&self) -> Option<&Path> {
         match self {
-            StreamUrl::Disc { device: Some(p) } => p.to_str().unwrap_or(""),
-            StreamUrl::Disc { device: None } => "",
             StreamUrl::M2ts { path }
             | StreamUrl::Mkv { path }
             | StreamUrl::Mp4 { path }
@@ -133,10 +113,22 @@ impl StreamUrl {
             | StreamUrl::Sub { dir: path }
             | StreamUrl::Fvi { path }
             | StreamUrl::Chapters { path }
-            | StreamUrl::Json { path } => path.to_str().unwrap_or(""),
+            | StreamUrl::Json { path } => Some(path),
+            StreamUrl::Disc { .. }
+            | StreamUrl::Network { .. }
+            | StreamUrl::Stdio
+            | StreamUrl::Null
+            | StreamUrl::Unknown { .. } => None,
+        }
+    }
+
+    /// The path/address component, or empty string for scheme-only URLs.
+    pub fn path_str(&self) -> &str {
+        match self {
+            StreamUrl::Disc { device } => device.as_deref().and_then(Path::to_str).unwrap_or(""),
             StreamUrl::Network { addr } => addr,
-            StreamUrl::Stdio | StreamUrl::Null => "",
             StreamUrl::Unknown { raw } => raw,
+            _ => self.path().and_then(Path::to_str).unwrap_or(""),
         }
     }
 
@@ -146,14 +138,12 @@ impl StreamUrl {
     ///
     /// `dir://` joined in 1.6.1 via a synthesized UDF volume (`crate::dirimage`).
     ///
-    /// NOT the same predicate as the CLI's `engine::is_disc_source`, which
-    /// means "is a live drive" and drives tray/eject behaviour. That one must
-    /// never gain `Dir` — a directory routed down the live-drive rip path
-    /// would open, lock and eject a drive that has nothing to do with it.
+    /// NOT the CLI's live-drive `engine::is_disc_source`: a `dir://` routed down the
+    /// live-drive rip path would open, lock and eject an unrelated drive.
     pub fn is_disc_source(&self) -> bool {
         matches!(
-            self,
-            StreamUrl::Disc { .. } | StreamUrl::Iso { .. } | StreamUrl::Dir { .. }
+            self.info().source,
+            Some(super::scheme::SourceKind::Drive | super::scheme::SourceKind::Image)
         )
     }
 }
@@ -463,7 +453,6 @@ fn open_container(
             }
             Ok(Box::new(stdio))
         }
-        StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
         // `mp4://` flows to every sink (mkv://, audio://, json://, …).
         StreamUrl::Mp4 { ref path } => {
@@ -479,24 +468,17 @@ fn open_container(
             validate_file_path(path, "mpg")?;
             Ok(Box::new(build_ps_pipeline(path, opts, ctx)?))
         }
-        // `demux://` is an output-only sink (per-track ES files); never a source.
-        StreamUrl::Demux { .. }
-        | StreamUrl::Video { .. }
-        | StreamUrl::Audio { .. }
-        | StreamUrl::Sub { .. }
-        | StreamUrl::Chapters { .. }
-        | StreamUrl::Json { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
-        // `fvi://` is an output-only sink (per-picture video index); never a source.
-        StreamUrl::Fvi { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
-        StreamUrl::Disc { .. } | StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => {
-            Err(crate::error::Error::StreamUrlInvalid {
-                url: url.to_string(),
-            }
-            .into())
-        }
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
+        // An output-only scheme is never a source; a drive or an image is not a container.
+        ref other if other.info().source.is_none() => {
+            Err(crate::error::Error::StreamWriteOnly.into())
+        }
+        _ => Err(crate::error::Error::StreamUrlInvalid {
+            url: url.to_string(),
+        }
+        .into()),
     }
 }
 
@@ -759,12 +741,6 @@ pub(crate) fn output_with(
         }
         StreamUrl::Stdio => Ok(Box::new(StdioStream::output(title))),
         StreamUrl::Null => Ok(Box::new(NullStream::new(title))),
-        StreamUrl::Disc { .. } => Err(crate::error::Error::StreamReadOnly.into()),
-        // `iso://` and `dir://` are block outputs, not PES sinks: a whole-disc copy writes
-        // them (`crate::io::open_block_sink`, `Disc::extract_tree`).
-        StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => {
-            Err(crate::error::Error::StreamReadOnly.into())
-        }
         // `demux://` with default options. The CLI constructs `DemuxSink`
         // directly (with parsed flags) before reaching here; this arm
         // covers the bare `output()` call with the default option set.
@@ -816,6 +792,9 @@ pub(crate) fn output_with(
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
+        // Not a PES sink: `disc://` is input only; `iso://`/`dir://` are written whole-disc
+        // (`crate::io::open_block_sink`, `crate::io::open_tree_sink`).
+        _ => Err(crate::error::Error::StreamReadOnly.into()),
     }
 }
 

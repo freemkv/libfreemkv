@@ -18,6 +18,7 @@
 pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
+mod scheme;
 pub mod select;
 mod selected;
 pub mod source;
@@ -91,6 +92,7 @@ pub use network::{NetworkStream, is_blocked_ip};
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
 pub use resolve::{InputOptions, SinkCaps, StreamUrl, disc_root_of, input, output, parse_url};
+pub use scheme::{SchemeInfo, SinkKind, SourceKind, UrlTarget};
 pub use stdio::StdioStream;
 
 use std::io::{Seek, Write};

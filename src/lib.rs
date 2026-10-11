@@ -244,6 +244,8 @@ pub use mux::{
 };
 #[cfg(feature = "rip")]
 pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
+#[cfg(feature = "rip")]
+pub use mux::{SchemeInfo, SinkKind, SourceKind, UrlTarget};
 
 // ─── Lower-level surfaces ───────────────────────────────────────────────────
 // `ScsiTransport` is the platform trait Drive uses, exposed for out-of-tree

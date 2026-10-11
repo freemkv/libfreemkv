@@ -132,23 +132,14 @@ pub fn open_source(url: &str, mut probe: ScanOptions, ctx: &Ctx) -> Result<Sourc
                 disc,
             }
         }
-        StreamUrl::M2ts { .. }
-        | StreamUrl::Mkv { .. }
-        | StreamUrl::Mp4 { .. }
-        | StreamUrl::Mpg { .. }
-        | StreamUrl::Network { .. }
-        | StreamUrl::Stdio => Origin::Stream {
-            url: url.to_string(),
-        },
-        StreamUrl::Null
-        | StreamUrl::Demux { .. }
-        | StreamUrl::Video { .. }
-        | StreamUrl::Audio { .. }
-        | StreamUrl::Sub { .. }
-        | StreamUrl::Fvi { .. }
-        | StreamUrl::Chapters { .. }
-        | StreamUrl::Json { .. } => return Err(Error::StreamWriteOnly),
         StreamUrl::Unknown { raw } => return Err(Error::StreamUrlInvalid { url: raw }),
+        // A drive or an image opened above; a container or the wire opens when read.
+        other => match other.info().source {
+            Some(_) => Origin::Stream {
+                url: url.to_string(),
+            },
+            None => return Err(Error::StreamWriteOnly),
+        },
     };
     Ok(Source { origin })
 }

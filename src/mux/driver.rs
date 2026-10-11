@@ -29,28 +29,10 @@ use super::source::ScannedTitle;
 use super::source::{Origin, Source};
 use super::videomap::{Medium, SourceInfo};
 
-// The source medium a parsed input URL denotes, used only for provenance. Exhaustive, so a
-// new scheme must be placed; sink-only schemes never reach here and take the `File` default.
+// The source medium a parsed input URL denotes, used only for provenance; a sink-only
+// scheme never reaches here and takes the `File` default.
 pub(crate) fn url_medium(parsed: &StreamUrl) -> Medium {
-    match parsed {
-        StreamUrl::Disc { .. } => Medium::Disc,
-        // `dir://` is an image-level source: a UDF volume synthesized over the folder.
-        StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => Medium::Iso,
-        StreamUrl::Mkv { .. }
-        | StreamUrl::M2ts { .. }
-        | StreamUrl::Mp4 { .. }
-        | StreamUrl::Mpg { .. } => Medium::File,
-        StreamUrl::Network { .. } | StreamUrl::Stdio => Medium::Stream,
-        StreamUrl::Null
-        | StreamUrl::Demux { .. }
-        | StreamUrl::Video { .. }
-        | StreamUrl::Audio { .. }
-        | StreamUrl::Sub { .. }
-        | StreamUrl::Fvi { .. }
-        | StreamUrl::Chapters { .. }
-        | StreamUrl::Json { .. }
-        | StreamUrl::Unknown { .. } => Medium::File,
-    }
+    parsed.info().medium
 }
 
 // Ceiling on bytes buffered while waiting for `headers_ready()`, so a damaged title whose
