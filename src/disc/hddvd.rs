@@ -794,7 +794,10 @@ fn compose_xpl_titles(
             })
             .collect();
         titles.push(DiscTitle {
-            selection_evidence: Default::default(),
+            selection_evidence: TitleSelectionEvidence {
+                segments: ContentSegment::from_clips(&parts),
+                ..Default::default()
+            },
             // Language-neutral identifier (no user-facing English in the library):
             // matches the UDF `TITLE_*` volume-label style. Apps localize display.
             playlist: if t.name.is_empty() {
@@ -1000,7 +1003,10 @@ impl Disc {
             }
             let streams = probes.streams(reader, &extents, halt)?;
             titles.push(DiscTitle {
-                selection_evidence: Default::default(),
+                selection_evidence: TitleSelectionEvidence {
+                    segments: ContentSegment::from_clips(&parts),
+                    ..Default::default()
+                },
                 playlist: "FEATURE".to_string(),
                 playlist_id: next_id,
                 duration_secs: 0.0,
@@ -1036,6 +1042,7 @@ impl Disc {
                 .map(|(base, _)| base.to_string())
                 .unwrap_or_else(|| orig.clone());
             titles.push(DiscTitle {
+                // An untimed clip has no exact content segments.
                 selection_evidence: Default::default(),
                 playlist: orig.clone(),
                 playlist_id: next_id,

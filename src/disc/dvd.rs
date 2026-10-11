@@ -351,7 +351,10 @@ impl Disc {
 
                 title_addresses.push((ts.vts_number, dvd_title.vts_title_num));
                 titles.push(DiscTitle {
-                    selection_evidence: Default::default(),
+                    selection_evidence: TitleSelectionEvidence {
+                        segments: ContentSegment::from_cell_extents(&extents),
+                        ..Default::default()
+                    },
                     playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
                     playlist_id: title_number,
                     // The dropped head is angle pieces, which the title time already leaves out.

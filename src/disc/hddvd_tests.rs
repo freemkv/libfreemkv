@@ -63,6 +63,12 @@ fn scan_hddvd_titles_enumerates_evo_extents() {
         feature.clips[0].clip_id, "FEATURE",
         "clip_id drops the extension"
     );
+    // An untimed .evo title has no exact content segments.
+    assert!(
+        titles
+            .iter()
+            .all(|t| t.selection_evidence.segments.is_empty())
+    );
 }
 
 // ── VTI playlist parsing + feature composition ────────────────────────
@@ -1962,6 +1968,10 @@ fn compose_xpl_titles_sums_sizes_and_computes_in_out_times() {
         "second clip's duration is also end - begin: got {}",
         t.clips[1].duration_secs
     );
+    let segments: Vec<_> = (t.selection_evidence.segments.iter())
+        .map(|s| (s.unit.as_str(), s.start, s.end))
+        .collect();
+    assert_eq!(segments, [("A", 90_000, 225_000), ("B", 225_000, 405_000)]);
 }
 
 // size_bytes sums DISC-DECLARED clip sizes, uncross-checked against real extents, so two

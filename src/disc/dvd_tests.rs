@@ -978,6 +978,11 @@ fn scan_dvd_titles_multi_cell_extents_in_order() {
     assert_eq!(t.extents[1].start_lba, 9700); // ifo_lba(9000) + 500 + 200
     assert_eq!(t.extents[1].sector_count, 100);
     assert_eq!(t.size_bytes, 200 * 2048);
+    // Content segments are the cells' sector ranges, in play order.
+    let segments: Vec<_> = (t.selection_evidence.segments.iter())
+        .map(|s| (s.unit.as_str(), s.start, s.end))
+        .collect();
+    assert_eq!(segments, [("", 9500, 9600), ("", 9700, 9800)]);
 }
 
 /// PAL video standard (b0 low bits == 1) sets FrameRate::F25; NTSC sets
