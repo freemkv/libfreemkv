@@ -4,7 +4,7 @@
 
 ### Added
 
-- `TitleSelectionEvidence::segments`: each title's authored content in play order as format-neutral `ContentSegment { unit, start, end }` spans, so callers can compare titles without knowing the disc format. Blu-ray, UHD and HD DVD playlists give one segment per clip (its in/out ticks); DVD gives one per cell extent (its sectors). It is empty when the content can't be described exactly. `ContentSegment::from_clips` and `ContentSegment::from_cell_extents` build them.
+- `TitleSelectionEvidence::segments`: each title's authored content in play order as format-neutral `ContentSegment { unit, start, end }` spans, so callers can compare titles without knowing the disc format. Blu-ray and UHD playlists give one segment per clip (its in/out ticks); HD DVD gives one per clip from its `clipTimeBegin` and the title-timeline length, and none when a clip lacks `clipTimeBegin`; DVD gives one per cell extent (its sectors). It is empty when the content can't be described exactly. `ContentSegment::from_clips` and `ContentSegment::from_cell_extents` build them.
 
 ### Changed
 
