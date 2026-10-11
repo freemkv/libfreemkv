@@ -2360,3 +2360,17 @@ fn title_reach_without_a_readable_part_list_is_unknown() {
     assert!(title_reach(&data, 0, 1, None).is_none());
     assert!(title_reach(&data, 0, 1, Some(&[])).is_none());
 }
+
+// A duplicate entry for one VTS title keeps every warning flag either entry sets.
+#[test]
+fn tt_srpt_duplicate_entries_keep_each_entrys_flags() {
+    let mut data = tt_srpt_bytes(3, &[(1, 1, 1), (1, 1, 2), (1, 1, 1)]);
+    data[8 + 24] = TT_MULTI_OR_RANDOM_PGC | TT_BUTTON_JUMPS;
+    let table = parse_tt_srpt(&data, 0).unwrap();
+    assert_eq!(
+        table.playback.get(&(1, 1)),
+        Some(&(TT_MULTI_OR_RANDOM_PGC | TT_BUTTON_JUMPS))
+    );
+    assert_eq!(table.titles.get(&1).map(Vec::len), Some(2));
+    assert!(table.complete);
+}

@@ -541,7 +541,8 @@ pub(crate) const MAX_TT_SRPT_TITLES: usize = 99;
 pub(crate) struct TtSrpt {
     /// Per title set, each title's (chapter_count, vts_title_number).
     pub titles: std::collections::BTreeMap<u8, Vec<(u16, u8)>>,
-    /// Each title's playback type byte, keyed (vts_number, vts_title_num).
+    /// Each title's playback type byte, keyed (vts_number, vts_title_num); duplicate
+    /// entries' bytes are OR-ed, so no entry's warning flag is lost.
     pub playback: std::collections::BTreeMap<(u8, u8), u8>,
     /// Every declared entry was read and kept: none past the cap or the table, none
     /// naming title set or title 0. A duplicate entry loses nothing.
@@ -549,7 +550,7 @@ pub(crate) struct TtSrpt {
 }
 
 // Parses the VMG TT_SRPT. Clamps the declared entry count to MAX_TT_SRPT_TITLES and drops
-// duplicate (vts_number, vts_title_num) pairs; the first entry's playback type wins.
+// duplicate (vts_number, vts_title_num) pairs, OR-ing their playback type flags.
 pub(crate) fn parse_tt_srpt(vmg_data: &[u8], tt_srpt_offset: usize) -> Result<TtSrpt> {
     let num_titles = be_u16(vmg_data, tt_srpt_offset)? as usize;
     let mut complete = num_titles <= MAX_TT_SRPT_TITLES;
@@ -585,10 +586,12 @@ pub(crate) fn parse_tt_srpt(vmg_data: &[u8], tt_srpt_offset: usize) -> Result<Tt
             complete = false;
             continue; // invalid
         }
-        if playback.contains_key(&(vts_number, vts_title_num)) {
-            continue; // duplicate entry for the same VTS title
+        // A duplicate entry for the same VTS title adds only its warning flags.
+        let duplicate = playback.contains_key(&(vts_number, vts_title_num));
+        *playback.entry((vts_number, vts_title_num)).or_insert(0) |= vmg_data[base];
+        if duplicate {
+            continue;
         }
-        playback.insert((vts_number, vts_title_num), vmg_data[base]);
 
         title_set_map
             .entry(vts_number)
