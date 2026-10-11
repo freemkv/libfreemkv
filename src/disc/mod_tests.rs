@@ -3323,7 +3323,7 @@ fn key_source_failure_is_not_reported_as_a_missing_disc_key() {
 }
 
 // Encrypted with neither AACS nor CSS state (the title-key file unread): refuse, keeping
-// a key-service verdict, never pass the ciphertext through.
+// E7031 when the key file was unreadable, else NoDiscKey; never pass ciphertext through.
 #[test]
 fn disc_gate_encrypted_without_state_refuses() {
     let mut disc = make_test_disc(1000, "BD");
@@ -3336,17 +3336,24 @@ fn disc_gate_encrypted_without_state_refuses() {
         matches!(err, crate::error::Error::NoDiscKey { ref disc_hash } if disc_hash.is_empty())
     );
     assert_eq!(err.code(), miss.code());
-    disc.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
+    disc.aacs_error = Some(crate::error::Error::AacsKeyFileUnreadable);
     assert_eq!(
         gate(&disc, false).expect_err("must error").code(),
-        miss.code()
-    );
-    disc.aacs_error = Some(crate::error::Error::KeyServiceRateLimited);
-    assert_eq!(
-        gate(&disc, false).expect_err("must error").code(),
-        crate::error::E_KEY_SERVICE_RATE_LIMITED
+        crate::error::Error::AacsKeyFileUnreadable.code()
     );
     assert!(gate(&disc, true).is_ok(), "--raw is exempt");
+}
+
+// Per-title keys (a DVD cracked later) with a stray AACS dir and no key file: not refused.
+#[test]
+fn disc_gate_dvd_per_title_keys_without_state_proceeds() {
+    let mut disc = make_test_disc(1000, "DVD");
+    disc.format = DiscFormat::Dvd;
+    disc.encrypted = true;
+    assert!(disc.keys_per_title());
+    assert!(gate(&disc, false).is_ok());
+    disc.aacs_error = Some(crate::error::Error::AacsKeyFileUnreadable);
+    assert!(gate(&disc, false).is_ok());
 }
 
 /// A genuinely unencrypted disc has `None` keys legitimately — the gate keys off

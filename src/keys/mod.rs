@@ -903,8 +903,17 @@ pub(crate) fn disc_gate(disc: &Disc, raw: bool) -> Result<()> {
     }
     // Encrypted with neither state (the title-key file unread): refuse, a key-service
     // failure keeping its own verdict ("retry / fix the token", not "no key").
-    if disc.encrypted {
-        return Err(key_service_or_no_key(disc));
+    // Per-title keys (DVD CSS) are cracked later, so a stray AACS dir there is not refused.
+    if disc.encrypted && !disc.keys_per_title() {
+        return Err(match disc.aacs_error {
+            Some(Error::KeyServiceUnavailable) => Error::KeyServiceUnavailable,
+            Some(Error::KeyServiceUnauthorized) => Error::KeyServiceUnauthorized,
+            Some(Error::KeyServiceRateLimited) => Error::KeyServiceRateLimited,
+            Some(_) => Error::AacsKeyFileUnreadable,
+            None => Error::NoDiscKey {
+                disc_hash: String::new(),
+            },
+        });
     }
     Ok(())
 }
