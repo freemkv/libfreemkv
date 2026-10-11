@@ -713,6 +713,102 @@ fn unlocker_matrix_aacs_requires_a_working_handshake() {
     assert_eq!(aacs_did_work(&ok), Some(true));
 }
 
+// The "Unlocker:" line both apps print is the first did-work entry of the matrix,
+// i.e. `bus_route`. One test per route, plus none.
+fn matrix_and_route(d: &Disc, drive: &crate::drive::Drive) -> (Vec<bool>, Option<BusRoute>) {
+    let names: Vec<_> = d
+        .unlocker_matrix(drive)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(names, ["freemkv", "LD", "AACS", "DVD"]);
+    let did: Vec<_> = d
+        .unlocker_matrix(drive)
+        .into_iter()
+        .map(|(_, w)| w)
+        .collect();
+    (did, d.bus_route(drive))
+}
+
+#[test]
+fn bus_route_firmware_unlocker_named_by_what_ran() {
+    let ok = scan_cert_disc(0x10, true, Some(hs_with(true, None)), None);
+    for (name, did) in [
+        ("freemkv", [true, false, false, false]),
+        ("LD", [false, true, false, false]),
+    ] {
+        let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(NullScsi));
+        drive.set_unlocker_name_for_test(name);
+        let (matrix, route) = matrix_and_route(&ok, &drive);
+        assert_eq!(
+            matrix, did,
+            "{name}: a firmware route excludes the cert route"
+        );
+        assert_eq!(route, Some(BusRoute::Firmware(name)));
+        assert_eq!(route.map(BusRoute::name), Some(name));
+    }
+}
+
+#[test]
+fn bus_route_host_cert_on_a_stock_drive() {
+    let drive = crate::drive::Drive::from_transport_for_test(Box::new(NullScsi));
+    let ok = scan_cert_disc(0x10, true, Some(hs_with(false, Some([0x22; 16]))), None);
+    let (matrix, route) = matrix_and_route(&ok, &drive);
+    assert_eq!(matrix, [false, false, true, false]);
+    assert_eq!(route, Some(BusRoute::HostCert));
+    assert_eq!(BusRoute::HostCert.name(), "AACS");
+}
+
+#[test]
+fn bus_route_css_auth_for_a_dvd() {
+    let mut dvd = scan_cert_disc(0x10, true, None, no_host_cert());
+    dvd.format = DiscFormat::Dvd;
+    let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(NullScsi));
+    let (matrix, route) = matrix_and_route(&dvd, &drive);
+    assert_eq!(matrix, [false, false, false, true]);
+    assert_eq!(route, Some(BusRoute::CssAuth));
+    assert_eq!(BusRoute::CssAuth.name(), "DVD");
+    // A firmware-unlocked drive still runs CSS auth; the firmware route is reported.
+    drive.set_unlocker_name_for_test("freemkv");
+    let (matrix, route) = matrix_and_route(&dvd, &drive);
+    assert_eq!(matrix, [true, false, false, true]);
+    assert_eq!(route, Some(BusRoute::Firmware("freemkv")));
+}
+
+#[test]
+fn bus_route_none_when_nothing_did_work() {
+    let drive = crate::drive::Drive::from_transport_for_test(Box::new(NullScsi));
+    let failed = scan_cert_disc(0x10, true, None, no_host_cert());
+    let (matrix, route) = matrix_and_route(&failed, &drive);
+    assert_eq!(matrix, [false; 4]);
+    assert_eq!(route, None);
+}
+
+// Identity vs runtime: `claimed_by` answers from the DriveId via the unlock
+// crate's `claims`; `unlocked_by` only from what init recorded.
+#[test]
+fn claimed_by_is_the_identity_fact_and_unlocked_by_the_runtime_one() {
+    let mut drive = crate::drive::Drive::from_transport_for_test(Box::new(NullScsi));
+    assert_eq!(drive.claimed_by(), None);
+    assert!(!drive.has_profile());
+    assert_eq!(drive.platform_name(), "Unknown");
+    let catalog = freemkv_unlock::ld::profiles().expect("bundled catalog parses");
+    let p = &catalog.mt1959_b[0].identity;
+    let id = &mut drive.drive_id;
+    id.vendor_id = p.vendor_id.clone();
+    id.product_id = p.product_id.clone();
+    id.product_revision = p.product_revision.clone();
+    id.vendor_specific = p.vendor_specific.clone();
+    id.firmware_date = p.firmware_date.clone();
+    assert_eq!(drive.claimed_by(), Some("LD"));
+    assert!(drive.has_profile());
+    assert_eq!(drive.unlocked_by(), None, "claiming is not unlocking");
+    assert_eq!(drive.platform_name(), "LD");
+    drive.set_unlocker_name_for_test("freemkv");
+    assert_eq!(drive.unlocked_by(), Some("freemkv"));
+    assert_eq!(drive.platform_name(), "freemkv", "what ran wins");
+}
+
 /// AACS 1.0 (bus off): a failed handshake does not block keys, so it is not recorded;
 /// the gate keeps answering NoDiscKey (7022) and key-source failures can be stamped.
 #[test]

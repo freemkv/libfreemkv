@@ -204,7 +204,7 @@ pub use aacs::trace::KeyOrigin;
 pub use dirimage::DirImage;
 #[cfg(feature = "rip")]
 pub use disc::{
-    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
+    AacsState, AudioChannels, AudioStream, BusRoute, Clip, Codec, ColorSpace, ContentFormat, Disc,
     DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
     FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, Resolution, SampleRate,
     ScanOptions, Stream, SubtitleStream, VideoStream,

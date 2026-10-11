@@ -32,8 +32,13 @@ fn adapt(e: impl FnMut() -> crate::error::Error + Send + 'static) -> fu::scsi::S
 #[test]
 fn unlocker_names_are_derived_from_the_real_unlockers() {
     assert_eq!(
-        unlocker_names(),
-        vec!["freemkv", "LD", "AACS", "DVD"],
+        unlocker_routes(),
+        vec![
+            ("freemkv", BusRoute::Firmware("freemkv")),
+            ("LD", BusRoute::Firmware("LD")),
+            ("AACS", BusRoute::HostCert),
+            ("DVD", BusRoute::CssAuth),
+        ],
         "the matrix is the firmware set then the disc set, in dispatch order"
     );
     // Split point: the leading names are exactly the firmware set.
@@ -53,7 +58,7 @@ fn is_drive_unlocker_credits_only_the_firmware_set() {
             u.name()
         );
     }
-    for u in disc_unlockers(Vec::new()) {
+    for (u, _) in disc_unlockers(Vec::new()) {
         assert!(
             !is_drive_unlocker(u.name()),
             "{} is disc-keyed, not a drive unlock",

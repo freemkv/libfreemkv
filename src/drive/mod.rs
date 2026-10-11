@@ -103,21 +103,16 @@ pub struct Drive {
     /// Name of the unlocker that handled this drive at `init()`, if any matched.
     /// `None` means no unlocker matched and the drive runs in stock mode
     /// (host-cert AACS handshake carries discs).
-    unlocker_name: Option<String>,
+    unlocked_by: Option<&'static str>,
     /// The OEM Volume ID the matching unlocker returned from `unlock()` at
     /// `init()`, stashed for the AACS handshake phase (which reads it via
     /// [`Drive::oem_vid`] instead of a separate VID read). `None` when no
     /// unlocker matched or the matching unlocker produced no VID — the cert
     /// handshake then acquires the VID.
     oem_vid: Option<[u8; 16]>,
-    /// True once `init()` has run (whether or not an unlocker matched).
-    init_ran: bool,
     /// `lock_tray` was called and no `unlock_tray` since: only then does Drop
     /// send ALLOW (never clear a lock another process holds).
     tray_locked: bool,
-    /// Lazily-computed registry-match name for `platform_name()`'s `&str`
-    /// return before `init()` has run.
-    matched_name_cache: std::sync::OnceLock<String>,
     pub drive_id: DriveId,
     device_path: String,
     /// The op token every CDB is checked against (§2.2).
@@ -253,11 +248,9 @@ impl Drive {
     fn bare(scsi: Box<dyn ScsiTransport>, device_path: String, slot: Slot) -> Self {
         Drive {
             scsi,
-            unlocker_name: None,
+            unlocked_by: None,
             oem_vid: None,
-            init_ran: false,
             tray_locked: false,
-            matched_name_cache: std::sync::OnceLock::new(),
             drive_id: DriveId {
                 vendor_id: String::new(),
                 product_id: String::new(),
@@ -347,8 +340,8 @@ impl Drive {
     /// Test-only: mark the drive as claimed by a named firmware unlocker at
     /// init(), so the do_handshake_cert anti-poison guard can be exercised.
     #[cfg(test)]
-    pub(crate) fn set_unlocker_name_for_test(&mut self, name: &str) {
-        self.unlocker_name = Some(name.to_string());
+    pub(crate) fn set_unlocker_name_for_test(&mut self, name: &'static str) {
+        self.unlocked_by = Some(name);
     }
 
     /// Test-only: stash the OEM Volume ID a matching unlocker would have
@@ -565,20 +558,30 @@ impl Drive {
         }
     }
 
-    /// Whether an unlocker claims this drive by identity (i.e. it can be
-    /// unlocked at drive-prep). Queried via `freemkv-unlock`; does not require
-    /// `init()` to have run.
-    pub fn has_profile(&self) -> bool {
-        crate::unlock_bridge::unlocker_name(&self.drive_id).is_some()
+    /// The firmware unlocker that claims this drive by identity (the first in
+    /// dispatch order), or `None`. A pure lookup: no drive I/O, and `init()`
+    /// need not have run. The identity fact; see [`unlocked_by`](Self::unlocked_by).
+    pub fn claimed_by(&self) -> Option<&'static str> {
+        crate::unlock_bridge::claimed_by(&self.drive_id)
     }
 
-    /// The name of the drive unlocker that ACTUALLY unlocked this drive at
-    /// `init()`, or `None` if none applied (unsupported drive, or the unlock
-    /// failed). Distinct from [`has_profile`](Self::has_profile), which reports
-    /// only an identity match: this is the runtime outcome. Apps render it in the
-    /// user-facing unlocker report.
+    /// The firmware unlocker that ACTUALLY unlocked this drive at `init()`, or
+    /// `None` if none applied (unsupported drive, or the unlock failed). The
+    /// runtime fact; see [`claimed_by`](Self::claimed_by).
+    pub fn unlocked_by(&self) -> Option<&'static str> {
+        self.unlocked_by
+    }
+
+    /// Whether an unlocker claims this drive by identity:
+    /// [`claimed_by`](Self::claimed_by)`.is_some()`.
+    pub fn has_profile(&self) -> bool {
+        self.claimed_by().is_some()
+    }
+
+    /// The unlocker that unlocked this drive at `init()`.
+    #[deprecated(note = "use unlocked_by")]
     pub fn unlocker_name(&self) -> Option<&str> {
-        self.unlocker_name.as_deref()
+        self.unlocked_by
     }
 
     // The OEM Volume ID a matching unlocker returned at Drive::init, if any.
@@ -798,19 +801,12 @@ impl Drive {
         }
     }
 
-    /// Name of the unlocker handling this drive. After `init()` this is the
-    /// unlocker that ran; before `init()` it reflects the unlocker match by
-    /// identity. `"Unknown"` when no unlocker matches.
+    /// Name of the unlocker handling this drive: [`unlocked_by`](Self::unlocked_by),
+    /// else [`claimed_by`](Self::claimed_by), else `"Unknown"`.
     pub fn platform_name(&self) -> &str {
-        if let Some(ref n) = self.unlocker_name {
-            return n;
-        }
-        // Cache the unlocker match so we can hand out a `&str` borrow.
-        self.matched_name_cache.get_or_init(|| {
-            crate::unlock_bridge::unlocker_name(&self.drive_id)
-                .map(str::to_string)
-                .unwrap_or_else(|| "Unknown".to_string())
-        })
+        self.unlocked_by
+            .or_else(|| self.claimed_by())
+            .unwrap_or("Unknown")
     }
 
     pub fn device_path(&self) -> &str {
@@ -867,7 +863,6 @@ impl Drive {
         // Drive-prep runs for EVERY disc, DVD INCLUDED — drive features are
         // disc-independent; AACS/CSS handshakes run LATER, gated on disc kind. A
         // transport fault aborts init (v1.1.0 invariant); other errors fall through.
-        self.init_ran = true;
         let drive_id = self.drive_id.clone();
         let (matched, unlock_res) = crate::unlock_bridge::run_features(self, &drive_id);
         // §2.3 reclassification: a Stop is `Halted` before any other result mapping, so
@@ -876,7 +871,7 @@ impl Drive {
         let r: Result<()> = match unlock_res {
             Ok(Some(unlocked)) => {
                 // Record which firmware unlocker ran, not the id-only lookup.
-                self.unlocker_name = Some(matched.to_string());
+                self.unlocked_by = Some(matched);
                 // Stash the OEM Volume ID (best-effort: a transient miss leaves
                 // the drive unlocked with no VID). do_handshake_cert reads `oem_vid()`.
                 if let Some(vid) = unlocked.vid {
@@ -906,7 +901,7 @@ impl Drive {
             target: "freemkv::drive",
             phase = "init",
             ok = r.is_ok(),
-            unlocker = self.unlocker_name.as_deref().unwrap_or("none"),
+            unlocker = self.unlocked_by.unwrap_or("none"),
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "end"
         );
@@ -1091,27 +1086,22 @@ impl Drive {
         }
     }
 
+    /// Whether an unlocker unlocked this drive at `init()`.
+    #[deprecated(note = "use unlocked_by().is_some()")]
     pub fn is_ready(&self) -> bool {
-        // Ready once init() has run and an unlocker handled the drive.
-        self.init_ran && self.unlocker_name.is_some()
+        self.unlocked_by.is_some()
     }
 
-    /// Whether libfreemkv should take the OEM extended-access read path.
-    ///
-    /// True when an unlocker claims this drive by identity. Such an unlocker
-    /// unlocks *drive functionality* — drive unlock, OEM VID retrieval, and other
-    /// vendor capabilities. When one matches, libfreemkv routes both `unlock` and
-    /// OEM VID through it (VID via the OEM path is decoupled from the host cert +
-    /// HRL). This mirrors [`Self::has_profile`] — the honest signal is "an
-    /// unlocker claims this drive" — rather than the old const `false`.
+    /// Whether an unlocker claims this drive by identity.
+    #[deprecated(note = "use claimed_by().is_some()")]
     pub fn has_unlocker(&self) -> bool {
-        crate::unlock_bridge::unlocker_name(&self.drive_id).is_some()
+        self.claimed_by().is_some()
     }
 
-    /// Deprecated alias of [`Self::has_unlocker`].
-    #[deprecated(note = "use has_unlocker")]
+    /// Whether an unlocker claims this drive by identity.
+    #[deprecated(note = "use claimed_by().is_some()")]
     pub fn is_unlocked(&self) -> bool {
-        self.has_unlocker()
+        self.claimed_by().is_some()
     }
 
     /// Read sectors from the disc. Single-shot — no inline retries, no

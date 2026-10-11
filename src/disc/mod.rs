@@ -110,6 +110,30 @@ impl ContentFormat {
     }
 }
 
+/// How a live disc's bus barrier was removed: by the drive's firmware unlocker
+/// at `init()`, the AACS host-certificate handshake, or CSS bus authentication.
+/// See [`Disc::bus_route`]; [`BusRoute::name`] is the registered unlocker's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BusRoute {
+    /// The named firmware unlocker unlocked the drive.
+    Firmware(&'static str),
+    /// The AACS host-certificate handshake.
+    HostCert,
+    /// CSS bus authentication (DVD).
+    CssAuth,
+}
+
+impl BusRoute {
+    /// The name of the registered unlocker that provides this route.
+    pub fn name(self) -> &'static str {
+        crate::unlock_bridge::unlocker_routes()
+            .into_iter()
+            .find(|(_, route)| *route == self)
+            .map_or("", |(name, _)| name)
+    }
+}
+
 /// Disc format.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DiscFormat {
@@ -2038,7 +2062,7 @@ impl Disc {
             let bus = if !dvd {
                 tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
                 encrypt::aacs_bus_step(buffered.inner_mut(), opts)?
-            } else if buffered.inner_mut().unlocker_name().is_some() {
+            } else if buffered.inner_mut().unlocked_by().is_some() {
                 encrypt::BusOutcome::FirmwareUnlocked
             } else {
                 encrypt::BusOutcome::FileOrIso
@@ -3234,46 +3258,46 @@ impl Disc {
     /// unlocker's name + whether it actually **did work this rip** — i.e. ran
     /// and accomplished its job, NOT merely "matched the disc kind".
     /// Registry-driven names so the CLI and autorip render an identical
-    /// report. On a drive taken by the firmware bus-unlock route, the AACS
-    /// host-cert unlocker never runs — it "matched" but did nothing, so
-    /// `did-work` reports `AACS: no`, and a *stock* drive on the cert route
-    /// instead reports `LD: no, AACS: yes` — the real diagnostic.
+    /// report. On a drive taken by a firmware route the AACS host-cert unlocker
+    /// never runs, so it reports `no`; a *stock* drive on the cert route instead
+    /// reports `LD: no, AACS: yes` — the real diagnostic.
     pub fn unlocker_matrix(&self, drive: &crate::Drive) -> Vec<(&'static str, bool)> {
-        // The firmware unlocker that ran (recorded on init): "freemkv", "LD", or "Renesas" —
-        // mutually exclusive per drive.
-        let prep = drive.unlocker_name();
-        // Every firmware / vendor-CDB route (freemkv Raw Read, LD, Renesas/Pioneer vendor open)
-        // removes bus encryption AT THE DRIVE — clear content, no host cert.
-        let fw_removed_bus = matches!(prep, Some("freemkv") | Some("LD") | Some("Renesas"));
-        crate::unlock_bridge::unlocker_names()
+        crate::unlock_bridge::unlocker_routes()
             .into_iter()
-            .map(|name| {
-                let did_work = match name {
-                    // Each firmware unlocker did work iff it was the one that ran.
-                    "freemkv" => prep == Some("freemkv"),
-                    "LD" => prep == Some("LD"),
-                    "Renesas" => prep == Some("Renesas"),
-                    // The AACS host-cert route did work only when NO firmware route
-                    // ran, its handshake yielded a VID, and no handshake error stands.
-                    "AACS" => {
-                        self.aacs.as_ref().is_some_and(|a| a.volume_id != [0u8; 16])
-                            && !fw_removed_bus
-                            && self
-                                .aacs_error
-                                .as_ref()
-                                .is_none_or(|e| encrypt::handshake_class_error(e).is_none())
-                    }
-                    // DVD read-unlock (CSS bus-auth) runs for EVERY DVD during scan
-                    // and isn't tracked separately, so this reports the MEDIUM
-                    // engaged, not a per-rip success bit — failures surface downstream.
-                    "DVD" => self.format == DiscFormat::Dvd,
-                    // A newly-registered unlocker with no runtime signal wired
-                    // here yet: report `no` rather than guess.
-                    _ => false,
-                };
-                (name, did_work)
-            })
+            .map(|(name, route)| (name, self.route_did_work(route, drive)))
             .collect()
+    }
+
+    /// The route that removed this disc's bus barrier on `drive`: the first
+    /// unlocker in the [`unlocker_matrix`](Self::unlocker_matrix) that did
+    /// work, or `None` when none did.
+    pub fn bus_route(&self, drive: &crate::Drive) -> Option<BusRoute> {
+        crate::unlock_bridge::unlocker_routes()
+            .into_iter()
+            .map(|(_, route)| route)
+            .find(|route| self.route_did_work(*route, drive))
+    }
+
+    // Whether `route` did work for this disc, from what init and scan recorded.
+    fn route_did_work(&self, route: BusRoute, drive: &crate::Drive) -> bool {
+        match route {
+            // Only a firmware unlocker sets `unlocked_by` (at init), and it removes
+            // bus encryption AT THE DRIVE — clear content, no host cert.
+            BusRoute::Firmware(name) => drive.unlocked_by() == Some(name),
+            // Did work only when NO firmware route ran, its handshake yielded a VID,
+            // and no handshake error stands.
+            BusRoute::HostCert => {
+                self.aacs.as_ref().is_some_and(|a| a.volume_id != [0u8; 16])
+                    && drive.unlocked_by().is_none()
+                    && self
+                        .aacs_error
+                        .as_ref()
+                        .is_none_or(|e| encrypt::handshake_class_error(e).is_none())
+            }
+            // CSS bus-auth runs for EVERY DVD during scan and isn't tracked
+            // separately: this reports the MEDIUM engaged, not a per-rip success.
+            BusRoute::CssAuth => self.format == DiscFormat::Dvd,
+        }
     }
 
     /// The public AACS inputs for this disc, for a [`crate::KeySource`] to look
