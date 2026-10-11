@@ -2361,11 +2361,13 @@ fn title_reach_without_a_readable_part_list_is_unknown() {
     assert!(title_reach(&data, 0, 1, 0, Some(&[])).is_none());
 }
 
-// A duplicate entry for one VTS title keeps every warning flag either entry sets.
+// A duplicate entry for one VTS title keeps every warning flag either entry sets: one
+// flag on the first entry, another on the later one (neither first- nor last-wins passes).
 #[test]
 fn tt_srpt_duplicate_entries_keep_each_entrys_flags() {
     let mut data = tt_srpt_bytes(3, &[(1, 1, 1), (1, 1, 2), (1, 1, 1)]);
-    data[8 + 24] = TT_MULTI_OR_RANDOM_PGC | TT_BUTTON_JUMPS;
+    data[8] = TT_MULTI_OR_RANDOM_PGC;
+    data[8 + 24] = TT_BUTTON_JUMPS;
     let table = parse_tt_srpt(&data, 0).unwrap();
     assert_eq!(
         table.playback.get(&(1, 1)),
@@ -2496,4 +2498,35 @@ fn title_reach_past_the_beyond_cap_is_unknown() {
     assert_eq!(reach.beyond.len(), within * 255);
     let (data, parts) = wide_pgcs(within + 2, 1000);
     assert!(title_reach(&data, 0, within + 2, 0, Some(&parts)).is_none());
+}
+
+/// Round-5 tests LOW: a later part, or a NextPGCN, naming a PGC past the table bounds
+/// nothing, even where bytes past the SRP table parse as an entry.
+#[test]
+fn title_reach_naming_a_pgc_past_the_table_is_unknown() {
+    // Three PGCs in the data, but a table of two: PGC 3 is past it.
+    let mut data = build_pgcit(&[reach_pgc(0, 0), reach_pgc(100, 0), reach_pgc(200, 0)]);
+    data[0..2].copy_from_slice(&2u16.to_be_bytes());
+    let two_parts: &[(u16, u16)] = &[(1, 1), (2, 1)];
+    assert!(title_reach(&data, 0, 2, 0, Some(two_parts)).is_some());
+    let past: &[(u16, u16)] = &[(1, 1), (3, 1)];
+    assert!(title_reach(&data, 0, 2, 0, Some(past)).is_none());
+    assert!(
+        title_reach(&data, 0, 3, 0, Some(past)).is_some(),
+        "in a table of 3"
+    );
+    let mut chained = build_pgcit(&[reach_pgc(0, 3), reach_pgc(100, 0), reach_pgc(200, 0)]);
+    chained[0..2].copy_from_slice(&2u16.to_be_bytes());
+    assert!(title_reach(&chained, 0, 2, 0, Some(PART_1)).is_none());
+    assert!(title_reach(&chained, 0, 3, 0, Some(PART_1)).is_some());
+}
+
+/// Round-5 tests LOW: a part naming PGCN 0 names no PGC: unknown.
+#[test]
+fn title_reach_with_a_part_naming_pgc_0_is_unknown() {
+    let data = build_pgcit(&[reach_pgc(0, 0), reach_pgc(100, 0)]);
+    let two_parts: &[(u16, u16)] = &[(1, 1), (2, 1)];
+    assert!(title_reach(&data, 0, 2, 0, Some(two_parts)).is_some());
+    let zero: &[(u16, u16)] = &[(1, 1), (0, 1)];
+    assert!(title_reach(&data, 0, 2, 0, Some(zero)).is_none());
 }
