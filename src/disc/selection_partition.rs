@@ -56,12 +56,6 @@ impl<'a, T: Eq + Hash> Prefixes<'a, T> {
 
 /// Annotate every title from one proven play-all partition, or leave all Unknown.
 pub(super) fn annotate(titles: &mut [DiscTitle]) {
-    if titles
-        .iter()
-        .any(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown)
-    {
-        return;
-    }
     let Some((roster, ordinals)) = partition(titles) else {
         tracing::debug!(
             target: "freemkv::scan",

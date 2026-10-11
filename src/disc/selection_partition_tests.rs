@@ -309,25 +309,6 @@ fn clip_cap_is_unknown() {
 }
 
 #[test]
-fn existing_episode_evidence_is_left_alone() {
-    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
-    let prior = EpisodeEvidence::Authored {
-        roster: "other".into(),
-        title_count: titles.len(),
-        ordinal: None,
-    };
-    for t in &mut titles {
-        t.selection_evidence.episodes = prior.clone();
-    }
-    let titles = run(titles);
-    assert!(
-        titles
-            .iter()
-            .all(|t| t.selection_evidence.episodes == prior)
-    );
-}
-
-#[test]
 fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
     let groups = vec![vec![1, 2], vec![1], vec![2], vec![]];
     assert!(Prefixes::new(&groups).is_none());
