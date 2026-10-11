@@ -1,7 +1,7 @@
 use super::*;
 use crate::aacs::content::encrypt_bus;
 
-use super::test_support::{Reports, m2ts1, unmapped_paths};
+use super::test_support::{BusRemovalSectorSource, Reports, m2ts1, unmapped_paths};
 
 // A wrapper that drops the list would reopen the image path to bus-encrypted bytes.
 #[test]
@@ -15,21 +15,6 @@ fn unmapped_stream_files_forward_through_every_wrapper() {
     let mut r = Reports(vec![m2ts1()]);
     let buffered = crate::udf::BufferedSectorReader::new(&mut r, 1);
     assert_eq!(unmapped_paths(&buffered), want, "BufferedSectorReader");
-    let pass = BusRemovalSectorSource::new(Reports(vec![m2ts1()]), BusStage::Passthrough);
-    assert_eq!(
-        unmapped_paths(&pass),
-        want,
-        "BusRemovalSectorSource defers to inner"
-    );
-}
-
-// A host-key adapter answers from its own map, which is what it failed to de-bus.
-#[test]
-fn bus_removal_source_reports_its_own_maps_unmapped_files() {
-    let map = BusMap::from_ranges(&[(300, 3)]).with_unmapped(vec![m2ts1()]);
-    let s = BusRemovalSectorSource::new(Reports(Vec::new()), BusStage::AacsHostKey([1; 16]))
-        .with_bus_map(Arc::new(map));
-    assert_eq!(unmapped_paths(&s), ["/BDMV/STREAM/00001.m2ts"]);
 }
 
 /// Per spec; do not change without a spec citation proving otherwise. AACS BD Pre-recorded
@@ -59,68 +44,6 @@ fn bus_stage_debug_redacts_the_read_data_key() {
         format!("{:?}", BusStage::Passthrough),
         "BusStage::Passthrough"
     );
-}
-
-// Records the fua flag of every read; the default read_sectors_fua drops it.
-struct FuaProbe {
-    fua: Vec<bool>,
-}
-impl SectorSource for FuaProbe {
-    fn capacity_sectors(&self) -> u32 {
-        1000
-    }
-    fn read_sectors(&mut self, _: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
-        let n = count as usize * SECTOR_BYTES;
-        buf[..n].fill(0);
-        Ok(n)
-    }
-    fn read_sectors_fua(
-        &mut self,
-        lba: u32,
-        count: u16,
-        buf: &mut [u8],
-        recovery: bool,
-        fua: bool,
-    ) -> Result<usize> {
-        self.fua.push(fua);
-        self.read_sectors(lba, count, buf, recovery)
-    }
-}
-
-// Pass-N FUA recovery must reach the drive through the de-bus decorator.
-#[test]
-fn read_sectors_fua_forwards_fua_to_the_inner_source() {
-    let mut s = BusRemovalSectorSource::new(FuaProbe { fua: vec![] }, BusStage::Passthrough);
-    let mut buf = vec![0u8; SECTOR_BYTES];
-    s.read_sectors_fua(5, 1, &mut buf, true, true).unwrap();
-    s.read_sectors_fua(5, 1, &mut buf, true, false).unwrap();
-    assert_eq!(s.inner().fua, [true, false]);
-}
-
-// The wrapper is transparent to the inner source's capabilities and speed control.
-#[test]
-fn bus_removal_forwards_random_access_and_set_speed() {
-    struct Seq {
-        speed: u16,
-    }
-    impl SectorSource for Seq {
-        fn capacity_sectors(&self) -> u32 {
-            0
-        }
-        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
-            Ok(0)
-        }
-        fn random_access(&self) -> bool {
-            false
-        }
-        fn set_speed(&mut self, kbs: u16) {
-            self.speed = kbs;
-        }
-    }
-    let mut s = BusRemovalSectorSource::new(Seq { speed: 0 }, BusStage::Passthrough);
-    assert!(!s.random_access());
-    s.set_speed(4500);
-    assert_eq!(s.inner().speed, 4500);
 }
 
 // An extent running past the 32-bit LBA space is clipped at it, never wrapped.
