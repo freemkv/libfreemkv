@@ -82,8 +82,9 @@ pub struct DvdTitle {
     /// The program (PGN) each chapter (part of title) starts at, from VTS_PTT_SRPT. `None`
     /// when the table does not hold the title; empty when a chapter lies in another PGC.
     pub ptt_programs: Option<Vec<u16>>,
-    /// The PGC plays its cells in order and stops: sequential playback mode (PGC+0xA2)
-    /// and no next-PGC chain (PGC+0x9C). Random, shuffle and chained PGCs do not.
+    /// The PGC plays its cells in order and stops: sequential playback mode (PGC+0xA2),
+    /// no next-PGC chain (PGC+0x9C), and commands that only pick its entry point or end
+    /// the title. Random, shuffle, chained and branching PGCs do not.
     pub sequential: bool,
     /// The cell table runs past the IFO: `cells` holds only the leading cells.
     pub truncated: bool,
@@ -1183,7 +1184,7 @@ pub(crate) fn parse_pgcit(
             .checked_add(pgc_byte_offset)
             .ok_or(Error::IfoParse)?;
 
-        match parse_pgc(data, pgc_abs, chapter_count) {
+        match parse_title_pgc(data, pgc_abs, chapter_count, pgcs == 1) {
             Ok(mut title) => {
                 // Stamp the REAL title number so downstream nav joins survive a
                 // dropped sibling PGC (position in `titles` is not vts_title_num).
@@ -1386,51 +1387,105 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         ptt_programs: None,
         sequential: byte_at(data, pgc_offset + 0xA2)? == 0
             && be_u16(data, pgc_offset + 0x9C)? == 0
-            && commands_keep_cell_order(data, pgc_offset),
+            && command_flow_in_order(data, pgc_offset) == Some(false),
         truncated,
     })
 }
 
-/// Whether the PGC's commands (table at PGC+0xE4: pre, post and cell counts, last byte,
-/// then 8-byte commands) leave its cells to play once, in order. Any link, jump or call
-/// in a pre or cell command may skip or leave them; a post command may only end the
-/// title (Exit, or a jump/call to a menu). An unreadable table is not proof.
-fn commands_keep_cell_order(data: &[u8], pgc_offset: usize) -> bool {
-    use crate::dvdnav::vmcmd::{Instr, decode};
-    let Ok(rel) = be_u16(data, pgc_offset + 0xE4) else {
-        return false;
-    };
-    if rel == 0 {
-        return true;
+// As `parse_pgc`, but a pre-command LinkPTTN keeps `sequential` when `one_pgc_title`.
+fn parse_title_pgc(
+    data: &[u8],
+    pgc_offset: usize,
+    chapters: u16,
+    one_pgc_title: bool,
+) -> Result<DvdTitle> {
+    let mut title = parse_pgc(data, pgc_offset, chapters)?;
+    if one_pgc_title && !title.sequential {
+        title.sequential = byte_at(data, pgc_offset + 0xA2)? == 0
+            && be_u16(data, pgc_offset + 0x9C)? == 0
+            && command_flow_in_order(data, pgc_offset).is_some();
     }
-    let table = pgc_offset + usize::from(rel);
-    let count = |at| be_u16(data, table + at).map(usize::from);
-    let (Ok(pre), Ok(post), Ok(cell)) = (count(0), count(2), count(4)) else {
-        return false;
-    };
-    let Some(cmds) = data.get(table + 8..table + 8 + (pre + post + cell) * 8) else {
-        return false;
-    };
-    cmds.as_chunks::<8>().0.iter().enumerate().all(|(i, raw)| {
-        let cmd = decode(raw);
-        let post_cmd = (pre..pre + post).contains(&i);
-        match cmd.instr {
-            // Type 1 sub-commands the decoder does not model also read as Nop.
-            Instr::Nop => raw[0] >> 5 != 1 || raw[1] & 0x0F == 0,
-            Instr::Break
-            | Instr::Goto { .. }
-            | Instr::SetGprm { .. }
-            | Instr::SetGprmMd { .. }
-            | Instr::SetSystem => !cmd.link,
-            Instr::Exit
-            | Instr::JumpSsFp
-            | Instr::JumpSsVmgm { .. }
-            | Instr::JumpSsVtsm { .. }
-            | Instr::JumpSsVmgmPgc { .. }
-            | Instr::CallSs { .. } => post_cmd,
-            _ => false,
+    Ok(title)
+}
+
+// Where a PGC command can send playback.
+#[derive(Clone, Copy, PartialEq)]
+enum Flow {
+    /// Stays on the command list or the current cell.
+    Stays,
+    /// Picks the entry point within this PGC (LinkPGN, LinkCN, LinkTopC, LinkTopPG).
+    EntersPgc,
+    /// LinkPTTN: within this PGC only when the title is this one PGC.
+    EntersPart,
+    /// Ends the title: Exit, or a jump or call to a menu.
+    EndsTitle,
+    /// Anything else, including commands this decoder cannot classify.
+    Leaves,
+}
+
+// libdvdnav link codes (byte1 low nibble; LinkSub's target in byte7 bits 4-0).
+fn link_flow(code: u8, sub: u8) -> Flow {
+    match (code, sub & 0x1F) {
+        (0, _) | (1, 0) => Flow::Stays,
+        (1, 1 | 5) | (6 | 7, _) => Flow::EntersPgc,
+        (5, _) => Flow::EntersPart,
+        _ => Flow::Leaves,
+    }
+}
+
+fn command_flow(raw: &[u8; 8]) -> Flow {
+    let code = raw[1] & 0x0F;
+    match (raw[0] >> 5, raw[0] >> 4 & 1) {
+        (0, _) => Flow::Stays,
+        (1, 1) => match code {
+            1 | 6 | 8 => Flow::EndsTitle,
+            _ => Flow::Leaves,
+        },
+        (1, _) | (2 | 3, _) => link_flow(code, raw[7]),
+        _ => Flow::Leaves,
+    }
+}
+
+/// `Some(links_by_part)` when the PGC's commands (table at PGC+0xE4: pre, post, cell
+/// counts, last byte, 8-byte commands) play its cells once, in order: pre commands may
+/// only pick the entry point, post commands may only end the title, and the cell
+/// commands its cells run may not move playback. `None` otherwise or when unreadable.
+fn command_flow_in_order(data: &[u8], pgc_offset: usize) -> Option<bool> {
+    let rel = usize::from(be_u16(data, pgc_offset + 0xE4).ok()?);
+    if rel == 0 {
+        return Some(false);
+    }
+    let table = pgc_offset + rel;
+    let count = |at| be_u16(data, table + at).ok().map(usize::from);
+    let (pre, post, cell) = (count(0)?, count(2)?, count(4)?);
+    let cmds = data.get(table + 8..table + 8 + (pre + post + cell) * 8)?;
+    let cmds = cmds.as_chunks::<8>().0;
+    let mut by_part = false;
+    for raw in &cmds[..pre] {
+        match command_flow(raw) {
+            Flow::Stays | Flow::EntersPgc => {}
+            Flow::EntersPart => by_part = true,
+            Flow::EndsTitle | Flow::Leaves => return None,
         }
-    })
+    }
+    let post_ok = |raw| matches!(command_flow(raw), Flow::Stays | Flow::EndsTitle);
+    if !cmds[pre..pre + post].iter().all(post_ok) {
+        return None;
+    }
+    // Each cell names its command by number (cell playback byte 3, 0 = none).
+    let num_cells = usize::from(byte_at(data, pgc_offset + 0x03).ok()?);
+    let cell_base = pgc_offset + usize::from(be_u16(data, pgc_offset + 0xE8).ok()?);
+    for i in 0..num_cells {
+        let Some(&n) = data.get(cell_base + i * 24 + 3) else {
+            break;
+        };
+        if n != 0
+            && cmds[pre + post..].get(usize::from(n) - 1).map(command_flow) != Some(Flow::Stays)
+        {
+            return None;
+        }
+    }
+    Some(by_part)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

@@ -512,3 +512,48 @@ fn undescribable_title_elsewhere_does_not_block_a_roster() {
     let titles = run(titles);
     assert_roster(&titles, "bd-playall-partition-v1:10", &[(1, 0), (2, 1)]);
 }
+
+// Episodes and their play-all lost their segments; the extras and their play-all kept
+// theirs. The undescribed play-all is longer than the extras one, so it may be the real one.
+#[test]
+fn longer_undescribed_title_holds_an_extras_roster() {
+    let episodes = [(100, 199), (200, 299), (300, 399)];
+    let extras = [(1000, 1009), (1100, 1109), (1200, 1209)];
+    let mut titles: Vec<_> = (episodes.iter().enumerate())
+        .map(|(i, &c)| dvd(i as u16 + 1, &[c]))
+        .collect();
+    titles.push(dvd(10, &episodes));
+    for t in &mut titles {
+        t.selection_evidence.segments.clear();
+    }
+    titles.extend((extras.iter().enumerate()).map(|(i, &c)| dvd(i as u16 + 11, &[c])));
+    titles.push(dvd(20, &extras));
+    assert_unknown(&run_dvd(titles.clone()));
+    // Shorter undescribed titles leave the extras partition standing.
+    titles.truncate(3);
+    titles.extend((extras.iter().enumerate()).map(|(i, &c)| dvd(i as u16 + 11, &[c])));
+    titles.push(dvd(20, &extras));
+    for t in &mut titles[..3] {
+        t.extents[0].sector_count = 5;
+    }
+    let titles = run_dvd(titles);
+    assert_roster(
+        &titles,
+        "dvd-playall-partition-v1:20",
+        &[(11, 0), (12, 1), (13, 2)],
+    );
+}
+
+// The same by running time, for an undescribed title with no sectors recorded.
+#[test]
+fn longer_undescribed_title_by_duration_holds_the_roster() {
+    let mut titles = episodes();
+    titles.push(secs(
+        10,
+        &[("00001", 0, 2700), ("00002", 0, 2700), ("00003", 0, 2700)],
+    ));
+    let mut feature = secs(30, &[("00030", 0, 9000)]);
+    feature.selection_evidence.segments.clear();
+    titles.push(feature);
+    assert_unknown(&run(titles));
+}

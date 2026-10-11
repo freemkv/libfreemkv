@@ -2658,6 +2658,10 @@ fn with_commands(vts: &mut [u8], pgc: usize, pre: &[[u8; 8]], post: &[[u8; 8]], 
     for (i, c) in pre.iter().chain(post).chain(cell).enumerate() {
         vts[TABLE + 8 + i * 8..TABLE + 16 + i * 8].copy_from_slice(c);
     }
+    // Cell i runs cell command i (cell_cmd_nr, cell playback byte 3).
+    for i in 0..cell.len() {
+        vts[pgc + 240 + i * 24 + 3] = i as u8 + 1;
+    }
 }
 
 fn playall_with_commands(pre: &[[u8; 8]], post: &[[u8; 8]], cell: &[[u8; 8]]) -> Vec<DiscTitle> {
@@ -2710,4 +2714,94 @@ fn an_interleaved_cell_read_whole_has_no_segments() {
     );
     assert!(titles[6].selection_evidence.segments.is_empty());
     assert_no_dvd_roster(&titles);
+}
+
+// Chapter-select ladders only pick where the title's own cells start.
+fn link_pttn(n: u8) -> [u8; 8] {
+    [0x20, 0x05, 0, 0, 0, 0, 0, n]
+}
+
+// `if gprm0 != n goto <next rung>` then `LinkPTTN n`, as Greenland's VTS 2 PGC 1.
+fn pttn_ladder(rungs: u8) -> Vec<[u8; 8]> {
+    let mut cmds = vec![SET_GPRM1_5];
+    for n in 1..=rungs {
+        let next = 2 + 2 * n + 1;
+        cmds.push([0x00, 0xb1, 0, 0, 0, n, 0, next]);
+        cmds.push(link_pttn(n));
+    }
+    cmds.push([0x00, 0x02, 0, 0, 0, 0, 0, 0]); // Break
+    cmds
+}
+
+// `if gprm0 == n LinkPGN n`, as The Silence of the Lambs' VTS 3 PGC 1.
+fn pgn_ladder(rungs: u8) -> Vec<[u8; 8]> {
+    let mut cmds: Vec<_> = (1..=rungs)
+        .map(|n| [0x20, 0xa6, 0, 0, 0, n, 0, n])
+        .collect();
+    cmds.push([0x00, 0xa2, 0, 0, 0, 0, 0, 0]); // conditional Break
+    cmds
+}
+
+#[test]
+fn chapter_select_ladders_keep_segments_and_the_roster() {
+    let link_cn_2 = [0x20, 0x07, 0, 0, 0, 0, 0, 2];
+    let top_cell = [0x20, 0x01, 0, 0, 0, 0, 0, 1];
+    let top_pg = [0x20, 0x01, 0, 0, 0, 0, 0, 5];
+    let set_no_link = [0x71, 0x01, 0, 1, 0, 5, 0, 0]; // SetGPRM, LinkNoLink
+    for (pre, cell) in [
+        (pttn_ladder(20), vec![]),
+        (pgn_ladder(31), vec![]),
+        (vec![link_cn_2, top_cell, top_pg], vec![]),
+        (vec![set_no_link], vec![set_no_link]),
+    ] {
+        let titles = playall_with_commands(&pre, &[CALL_SS_VTSM_ROOT], &cell);
+        assert!(!titles[6].selection_evidence.segments.is_empty(), "{pre:?}");
+        assert!(
+            (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown),
+            "{pre:?}"
+        );
+    }
+}
+
+#[test]
+fn pre_commands_that_leave_the_pgc_still_have_no_segments() {
+    let tail_pgc = [0x20, 0x01, 0, 0, 0, 0, 0, 13];
+    let go_up_pgc = [0x20, 0x01, 0, 0, 0, 0, 0, 12];
+    let jump_vts_ptt = [0x30, 0x05, 0, 1, 0, 1, 0, 0];
+    for pre in [
+        LINK_PGCN_8,
+        tail_pgc,
+        go_up_pgc,
+        jump_vts_ptt,
+        JUMP_TT_8,
+        CALL_SS_VTSM_ROOT,
+    ] {
+        let titles = playall_with_commands(&[pre], &[], &[]);
+        assert!(titles[6].selection_evidence.segments.is_empty(), "{pre:?}");
+        assert_no_dvd_roster(&titles);
+    }
+    // A same-PGC link in a CELL command skips or repeats cells mid-play.
+    let titles = playall_with_commands(&[], &[], &[[0x20, 0x06, 0, 0, 0, 0, 0, 1]]);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+}
+
+// LinkPTTN stays in the PGC only when the title is that one PGC.
+#[test]
+fn a_part_link_in_a_title_without_a_part_table_has_no_segments() {
+    let (mut vts, at) = alternates_vts();
+    with_commands(&mut vts, at[6], &pttn_ladder(2), &[], &[]);
+    vts[0xc8..0xcc].copy_from_slice(&0u32.to_be_bytes()); // no VTS_PTT_SRPT
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+}
+
+// A cell command no cell runs never executes.
+#[test]
+fn an_unreferenced_cell_command_keeps_segments() {
+    let (mut vts, at) = alternates_vts();
+    with_commands(&mut vts, at[6], &[], &[], &[LINK_PGCN_8]);
+    vts[at[6] + 240 + 3] = 0;
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert!(!titles[6].selection_evidence.segments.is_empty());
 }
