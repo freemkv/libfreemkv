@@ -5989,3 +5989,10 @@ fn scan_prefetches_only_the_files_a_bd_scan_parses() {
         assert!(scan_parses(false, p), "{p}: a non-BD tree keeps every file");
     }
 }
+
+#[test]
+fn only_hd_dvd_program_streams_key_aacs_per_pack() {
+    assert!(ContentFormat::MpegPs.aacs_per_pack());
+    assert!(!ContentFormat::BdTs.aacs_per_pack());
+    assert!(!ContentFormat::DvdPs.aacs_per_pack());
+}
