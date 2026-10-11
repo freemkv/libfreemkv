@@ -359,6 +359,8 @@ struct XplClip {
     evo: String,
     begin_secs: f64,
     end_secs: f64,
+    /// `clipTimeBegin`: where the clip's own media starts, in seconds.
+    clip_begin_secs: Option<f64>,
 }
 
 /// One `<Title>` from the XPL: number, display name, total duration, its clips
@@ -626,10 +628,14 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
                 .attribute("titleTimeEnd")
                 .and_then(|s| parse_timecode(s, time_base))
                 .unwrap_or(begin_secs);
+            let clip_begin_secs = c
+                .attribute("clipTimeBegin")
+                .and_then(|s| parse_timecode(s, time_base));
             clips.push(XplClip {
                 evo,
                 begin_secs,
                 end_secs,
+                clip_begin_secs,
             });
         }
         if clips.is_empty() {
@@ -755,6 +761,8 @@ fn compose_xpl_titles(
         let mut extents = Vec::new();
         let mut size_bytes = 0u64;
         let mut parts = Vec::new();
+        // The clip's own range, not the title timeline; None if any clip lacks it.
+        let mut own_range: Option<Vec<Clip>> = Some(Vec::new());
         // A crafted clip list can name the same `.evo` any number of times.
         // Mirrors bluray.rs's `seen_clips.insert(...)` gate: push a clip's
         // extents/size only the first time its `.evo` key is seen.
@@ -767,13 +775,26 @@ fn compose_xpl_titles(
                 extents.extend_from_slice(exts);
                 size_bytes = size_bytes.saturating_add(*size);
             }
+            let clip_id = orig
+                .rsplit_once('.')
+                .map(|(b, _)| b)
+                .unwrap_or(orig)
+                .to_string();
+            let ticks = |secs: f64| (secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32;
+            match (own_range.as_mut(), c.clip_begin_secs) {
+                (Some(v), Some(cb)) => v.push(Clip {
+                    feed_span: None,
+                    clip_id: clip_id.clone(),
+                    in_time: ticks(cb),
+                    out_time: ticks(cb + (c.end_secs - c.begin_secs).max(0.0)),
+                    duration_secs: 0.0,
+                    source_packets: 0,
+                }),
+                _ => own_range = None,
+            }
             parts.push(Clip {
                 feed_span: None,
-                clip_id: orig
-                    .rsplit_once('.')
-                    .map(|(b, _)| b)
-                    .unwrap_or(orig)
-                    .to_string(),
+                clip_id,
                 in_time: (c.begin_secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32,
                 out_time: (c.end_secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32,
                 duration_secs: (c.end_secs - c.begin_secs).max(0.0),
@@ -794,7 +815,13 @@ fn compose_xpl_titles(
             })
             .collect();
         titles.push(DiscTitle {
-            selection_evidence: Default::default(),
+            selection_evidence: TitleSelectionEvidence {
+                segments: own_range
+                    .as_deref()
+                    .map(ContentSegment::from_clips)
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
             // Language-neutral identifier (no user-facing English in the library):
             // matches the UDF `TITLE_*` volume-label style. Apps localize display.
             playlist: if t.name.is_empty() {
@@ -1000,6 +1027,7 @@ impl Disc {
             }
             let streams = probes.streams(reader, &extents, halt)?;
             titles.push(DiscTitle {
+                // An untimed clip has no exact content segments.
                 selection_evidence: Default::default(),
                 playlist: "FEATURE".to_string(),
                 playlist_id: next_id,
@@ -1036,6 +1064,7 @@ impl Disc {
                 .map(|(base, _)| base.to_string())
                 .unwrap_or_else(|| orig.clone());
             titles.push(DiscTitle {
+                // An untimed clip has no exact content segments.
                 selection_evidence: Default::default(),
                 playlist: orig.clone(),
                 playlist_id: next_id,

@@ -20,11 +20,9 @@ mod hddvd;
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
 mod selection;
-mod selection_dvd;
-pub use selection_dvd::{DvdLaunchEvidence, DvdLaunchReviewReason, DvdLaunchRoute, DvdLaunchStep};
 mod selection_partition;
 pub use selection::{
-    EpisodeEvidence, MovieSelectionBasis, NavigationSource, TitleSelectionEvidence,
+    ContentSegment, EpisodeEvidence, MovieSelectionBasis, NavigationSource, TitleSelectionEvidence,
 };
 #[cfg(test)]
 pub(crate) mod scan_order_tests;

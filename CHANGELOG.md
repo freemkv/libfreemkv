@@ -2,9 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- `TitleSelectionEvidence::segments`: each title's authored content in play order as format-neutral `ContentSegment { unit, start, end }` spans, so callers can compare titles without knowing the disc format. Blu-ray and UHD playlists give one segment per clip (its in/out ticks); HD DVD gives one per clip from its `clipTimeBegin` and the title-timeline length, and none when a clip lacks `clipTimeBegin`; DVD gives one per cell extent (its sectors). It is empty when the content can't be described exactly. `ContentSegment::from_clips` and `ContentSegment::from_cell_extents` build them.
+
 ### Changed
 
 - Blu-ray episode rosters (`EpisodeEvidence::Authored`) now come from the play-all playlist instead of menu navigation: when the longest playlist is exactly the concatenation of other playlists (same clips, same in/out times), those playlists are the episodes in that order, and exact duplicates share an ordinal. Every title stays `Unknown` when the cut is ambiguous, nested or competing, when a short recap/logo sits inside the play-all, when the only play-all is an extras reel, or when there is no play-all. Roster label: `bd-playall-partition-v1:<playlist>`. This replaces the onQ menu certificate (`onq-uhd-v1`) and the HDMV First-Play roster (`hdmv-unconditional-playall-v1`): Blue Planet II UHD now gets a roster; Planet Earth II UHD disc 2 keeps the same one.
+
+### Removed
+
+- The unreleased DVD root-menu launch tracer: `TitleSelectionEvidence::dvd_launch` and the `DvdLaunchEvidence`, `DvdLaunchReviewReason`, `DvdLaunchRoute` and `DvdLaunchStep` types are gone. Most DVDs could not be traced, so it marked every title for review; per-title audio languages are already in each title's streams. The DVD static-menu episode roster is unchanged.
 
 ## [1.8.3] — 2026-10-08
 

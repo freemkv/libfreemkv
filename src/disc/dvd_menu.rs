@@ -21,9 +21,6 @@ const FILE_LIMIT: usize = 8 * 1024 * 1024;
 type Cells = Vec<(u32, u32)>;
 type Commands = Vec<[u8; 8]>;
 
-#[path = "dvd_launch/mod.rs"]
-mod launch;
-
 fn u16_at(b: &[u8], at: usize) -> Option<usize> {
     Some(u16::from_be_bytes(b.get(at..at.checked_add(2)?)?.try_into().ok()?) as usize)
 }
@@ -554,7 +551,6 @@ pub(super) fn annotate(
     if halt.is_some_and(Halt::is_cancelled) {
         return Err(Error::Halted);
     }
-    launch::annotate(&mut reader, fs, vmg, addresses, titles)?;
     Ok(())
 }
 

@@ -911,10 +911,10 @@ fn engine_remux_codes_display_and_kind() {
         ),
         (
             Error::SelectionReviewRequired {
-                reason: "missing-presentation-language",
+                reason: "missing-episode-roster",
             },
             9086,
-            "E9086: missing-presentation-language",
+            "E9086: missing-episode-roster",
             ErrorKind::InvalidInput,
         ),
     ];

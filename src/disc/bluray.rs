@@ -461,7 +461,10 @@ impl Disc {
         let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
 
         Ok(Some(DiscTitle {
-            selection_evidence: Default::default(),
+            selection_evidence: TitleSelectionEvidence {
+                segments: ContentSegment::from_clips(&clips),
+                ..Default::default()
+            },
             playlist: filename.to_string(),
             playlist_id,
             duration_secs,

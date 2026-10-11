@@ -63,6 +63,12 @@ fn scan_hddvd_titles_enumerates_evo_extents() {
         feature.clips[0].clip_id, "FEATURE",
         "clip_id drops the extension"
     );
+    // An untimed .evo title has no exact content segments.
+    assert!(
+        titles
+            .iter()
+            .all(|t| t.selection_evidence.segments.is_empty())
+    );
 }
 
 // ── VTI playlist parsing + feature composition ────────────────────────
@@ -1502,6 +1508,7 @@ fn compose_xpl_titles_drops_a_title_naming_an_absent_clip() {
         evo: evo.to_string(),
         begin_secs: b,
         end_secs: e,
+        clip_begin_secs: None,
     };
     let xpl_titles = vec![XplTitle {
         number: 1,
@@ -1762,6 +1769,7 @@ fn compose_xpl_titles_clamps_a_reversed_clip_duration_and_names_by_number() {
             evo: "a.evo".to_string(),
             begin_secs: 9.0,
             end_secs: 5.0,
+            clip_begin_secs: None,
         }],
         chapters: vec![],
     }];
@@ -1857,11 +1865,13 @@ fn compose_xpl_titles_drops_a_title_naming_an_unusable_clip() {
                 evo: "a.evo".to_string(),
                 begin_secs: 0.0,
                 end_secs: 10.0,
+                clip_begin_secs: None,
             },
             XplClip {
                 evo: "b.evo".to_string(),
                 begin_secs: 10.0,
                 end_secs: 20.0,
+                clip_begin_secs: None,
             },
         ],
         chapters: vec![],
@@ -1921,11 +1931,13 @@ fn compose_xpl_titles_sums_sizes_and_computes_in_out_times() {
                 evo: "a.evo".to_string(),
                 begin_secs: 2.0,
                 end_secs: 5.0,
+                clip_begin_secs: Some(100.0),
             },
             XplClip {
                 evo: "b.evo".to_string(),
                 begin_secs: 5.0,
                 end_secs: 9.0,
+                clip_begin_secs: Some(0.0),
             },
         ],
         chapters: vec![],
@@ -1962,6 +1974,67 @@ fn compose_xpl_titles_sums_sizes_and_computes_in_out_times() {
         "second clip's duration is also end - begin: got {}",
         t.clips[1].duration_secs
     );
+    let segments: Vec<_> = (t.selection_evidence.segments.iter())
+        .map(|s| (s.unit.as_str(), s.start, s.end))
+        .collect();
+    assert_eq!(
+        segments,
+        [("A", 4_500_000, 4_635_000), ("B", 0, 180_000)],
+        "segments use the clip's own range, not the title timeline"
+    );
+}
+
+// Without clipTimeBegin the clip's own range is unknown: no segments, not timeline guesses.
+#[test]
+fn compose_xpl_titles_leaves_segments_empty_without_clip_time_begin() {
+    let clip_extents: std::collections::BTreeMap<String, (String, u64, Vec<Extent>)> = [(
+        "a.evo".to_string(),
+        (
+            "A.EVO".to_string(),
+            1000u64,
+            vec![Extent {
+                start_lba: 1,
+                sector_count: 1,
+            }],
+        ),
+    )]
+    .into_iter()
+    .collect();
+    let xpl_titles = vec![XplTitle {
+        number: 1,
+        name: "T".to_string(),
+        duration_secs: 10.0,
+        clips: vec![XplClip {
+            evo: "a.evo".to_string(),
+            begin_secs: 2.0,
+            end_secs: 5.0,
+            clip_begin_secs: None,
+        }],
+        chapters: vec![],
+    }];
+    let mut disc = MemDisc::new();
+    let titles = compose_xpl_titles(
+        &mut disc,
+        &xpl_titles,
+        &clip_extents,
+        &std::collections::HashSet::new(),
+        None,
+    )
+    .expect("compose");
+    assert_eq!(titles.len(), 1);
+    assert!(titles[0].selection_evidence.segments.is_empty());
+}
+
+#[test]
+fn parse_xpl_titles_reads_clip_time_begin() {
+    let xpl = r#"<Playlist><TitleSet timeBase="60fps">
+            <Title titleNumber="1" titleDuration="00:00:10:00">
+              <PrimaryAudioVideoClip titleTimeBegin="00:00:05:00" titleTimeEnd="00:00:10:00" clipTimeBegin="00:01:00:00" src="file:///x/A.MAP"/>
+              <PrimaryAudioVideoClip titleTimeBegin="00:00:10:00" titleTimeEnd="00:00:12:00" src="file:///x/B.MAP"/>
+            </Title></TitleSet></Playlist>"#;
+    let titles = parse_xpl_titles(xpl.as_bytes());
+    assert!((titles[0].clips[0].clip_begin_secs.unwrap_or(-1.0) - 60.0 * 1.001).abs() < 1e-6);
+    assert_eq!(titles[0].clips[1].clip_begin_secs, None);
 }
 
 // size_bytes sums DISC-DECLARED clip sizes, uncross-checked against real extents, so two
@@ -2003,11 +2076,13 @@ fn compose_xpl_titles_saturates_absurd_disc_declared_clip_sizes() {
                 evo: "a.evo".to_string(),
                 begin_secs: 0.0,
                 end_secs: 5.0,
+                clip_begin_secs: None,
             },
             XplClip {
                 evo: "b.evo".to_string(),
                 begin_secs: 5.0,
                 end_secs: 10.0,
+                clip_begin_secs: None,
             },
         ],
         chapters: vec![],
@@ -2064,6 +2139,7 @@ fn compose_xpl_titles_dedups_repeated_clip_references_by_evo() {
             evo: "a.evo".to_string(),
             begin_secs: i as f64,
             end_secs: i as f64 + 1.0,
+            clip_begin_secs: None,
         })
         .collect();
     let xpl_titles = vec![XplTitle {
@@ -2142,16 +2218,19 @@ fn compose_xpl_titles_resolves_all_distinct_clips_despite_dedup() {
                 evo: "a.evo".to_string(),
                 begin_secs: 0.0,
                 end_secs: 5.0,
+                clip_begin_secs: None,
             },
             XplClip {
                 evo: "b.evo".to_string(),
                 begin_secs: 5.0,
                 end_secs: 15.0,
+                clip_begin_secs: None,
             },
             XplClip {
                 evo: "c.evo".to_string(),
                 begin_secs: 15.0,
                 end_secs: 30.0,
+                clip_begin_secs: None,
             },
         ],
         chapters: vec![],

@@ -528,6 +528,14 @@ fn parse_playlist_dedups_repeated_clip_extents_and_size() {
     assert_eq!(t.clips.len(), 2, "each PlayItem still gets a Clip entry");
     assert_eq!(t.clips[0].clip_id, "00001");
     assert_eq!(t.clips[1].clip_id, "00001");
+    // Content segments follow the PlayItems, in order, in clip ticks.
+    let segments: Vec<_> = (t.selection_evidence.segments.iter())
+        .map(|s| (s.unit.as_str(), s.start, s.end))
+        .collect();
+    assert_eq!(
+        segments,
+        [("00001", 0, 2_700_000), ("00001", 2_700_000, 5_400_000)]
+    );
 }
 
 // A CLPI with no packet count (cut short) still sizes the clip, from its extents.
