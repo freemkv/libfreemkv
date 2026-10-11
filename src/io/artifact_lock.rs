@@ -121,8 +121,6 @@ impl ArtifactLock {
         )
     }
 
-    // `acquire_within` with the identity check as a parameter (tests inject ESTALE and
-    // a lasting mismatch): `ids` is (the open file's id, the path's id).
     fn acquire_ids(
         final_path: &Path,
         watch: &[&Path],
@@ -131,6 +129,24 @@ impl ArtifactLock {
         ids: &Ids<'_>,
         lock: &Lock<'_>,
     ) -> Result<ArtifactLock> {
+        let hooks = Hooks {
+            ids,
+            lock,
+            names: &os::names_this_file,
+        };
+        Self::acquire_full(final_path, watch, halt, window, &hooks)
+    }
+
+    // `acquire_within` with the identity check as a parameter (tests inject ESTALE and
+    // a lasting mismatch): `ids` is (the open file's id, the path's id).
+    fn acquire_full(
+        final_path: &Path,
+        watch: &[&Path],
+        halt: &Halt,
+        window: Duration,
+        hooks: &Hooks<'_>,
+    ) -> Result<ArtifactLock> {
+        let Hooks { ids, lock, names } = *hooks;
         let path = lock_path(final_path);
         let mut wait = LockWait::new(final_path, watch, window);
         let key = claim_key(&path);
@@ -160,7 +176,7 @@ impl ArtifactLock {
             // SS-9 XBD <sys/stat.h>: "A file identity is uniquely determined by the combination
             // of st_dev and st_ino." SS-10: "the identifier … and the volume serial number".
             let retry = match ids(&file, &path) {
-                (Ok(held), Ok(named)) if held == named => match os::names_this_file(&file, &path) {
+                (Ok(held), Ok(named)) if held == named => match names(&file, &path) {
                     Ok(true) => return Ok(ArtifactLock { file, path, claim }),
                     Ok(false) => io::Error::other("the sidecar was replaced"),
                     Err(e) if os::id_retryable(&e) => e,
@@ -205,6 +221,15 @@ impl ArtifactLock {
 // (the open file's identity, the path's identity).
 type Ids<'a> = dyn Fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64, u64)>) + 'a;
 // The OS exclusive try-lock (tests model filesystems where it does not exclude).
+// The injectable checks of one acquire.
+struct Hooks<'a> {
+    ids: &'a Ids<'a>,
+    lock: &'a Lock<'a>,
+    names: &'a Names<'a>,
+}
+
+// Whether the path names the locked file (the token proof; tests inject its IO).
+type Names<'a> = dyn Fn(&File, &Path) -> io::Result<bool> + 'a;
 type Lock<'a> = dyn Fn(&File) -> io::Result<bool> + 'a;
 
 // The T10 wait between lock attempts: halt-aware, failing only after `window` with no
@@ -325,8 +350,46 @@ mod os {
     // Only a file's lock holder writes it, so reading our fresh token back by path
     // proves the path names the file we locked, whatever its inode number says.
     pub(super) fn names_this_file(f: &File, p: &Path) -> io::Result<bool> {
-        use std::io::Read;
+        names_with(f, p, &write_token, &read_back)
+    }
+
+    fn write_token(f: &File, token: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+        f.set_len(0)?;
+        f.write_all_at(token, 0)
+    }
+
+    fn read_back(p: &Path, max: u64) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut named = Vec::new();
+        File::open(p)?.take(max).read_to_end(&mut named)?;
+        Ok(named)
+    }
+
+    // The token proof is unavailable (full or read-only volume; CIFS refuses a second fd
+    // read under our own lock): the caller has already matched dev/ino, as in 1.8.3.
+    // Name-derived-inode filesystems that also refuse the token degrade to that check.
+    fn token_unavailable(e: &io::Error) -> bool {
+        !id_retryable(e)
+    }
+
+    fn read_conflict(e: &io::Error) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if matches!(
+            e.raw_os_error(),
+            Some(libc::EACCES | libc::EAGAIN | libc::EBUSY | libc::EPERM)
+        ) {
+            return true;
+        }
+        e.kind() == io::ErrorKind::PermissionDenied
+    }
+
+    pub(super) fn names_with(
+        f: &File,
+        p: &Path,
+        write: &dyn Fn(&File, &[u8]) -> io::Result<()>,
+        read: &dyn Fn(&Path, u64) -> io::Result<Vec<u8>>,
+    ) -> io::Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
@@ -334,13 +397,16 @@ mod os {
             .map_or(0, |d| d.as_nanos());
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let token = format!("{}:{nanos}:{sequence}\n", std::process::id());
-        f.set_len(0)?;
-        f.write_all_at(token.as_bytes(), 0)?;
-        let mut named = Vec::with_capacity(token.len() + 1);
-        File::open(p)?
-            .take(token.len() as u64 + 1)
-            .read_to_end(&mut named)?;
-        Ok(named == token.as_bytes())
+        match write(f, token.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if token_unavailable(&e) => return Ok(true),
+            Err(e) => return Err(e),
+        }
+        match read(p, token.len() as u64 + 1) {
+            Ok(named) => Ok(named == token.as_bytes()),
+            Err(e) if read_conflict(&e) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     // Gone (ENOENT), or deleted by another NFS client (ESTALE): retry.

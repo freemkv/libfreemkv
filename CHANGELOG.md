@@ -37,6 +37,11 @@
 - `sector::bus_removal::BusRemovalSectorSource`: `Drive` is the single de-bus point; the other `bus_removal` items remain.
 - `drive::DeviceResolution`, whose resolver was never wired.
 
+### Fixed
+
+- `ArtifactLock` acquisition works on Linux CIFS shares (where reading the sidecar back under our own lock is refused) and on full or read-only volumes (where the token write fails): both fall back to the device/inode match 1.8.3 used instead of failing the acquire.
+- The `io::publish::no_replace` claim fallback reports the real OS error when its re-check fails, and removes its own empty placeholder instead of leaving it at the final name. If the placeholder cannot be removed, the error carries the new `Fault::ClaimLeft` so it is not mistaken for an existing artifact. The Windows NUL-path error no longer carries prose.
+
 ## [1.8.3] — 2026-10-08
 
 ### Changed

@@ -135,40 +135,6 @@ fn artifact_lock_cancel_during_wait_is_halted() {
     assert!(t.elapsed() <= SLACK, "{:?}", t.elapsed());
 }
 
-/// §2.5 acquire loop (the unlink race): the holder deletes the sidecar while holding it;
-/// a waiter locked on the old, unlinked file re-checks identity and retries, so it ends
-/// up holding the file the path names — which a third taker then cannot lock.
-#[test]
-fn artifact_lock_rechecks_identity_after_the_holder_deletes() {
-    let (_dir, out) = artifact();
-    let holder = take(&out, WINDOW).expect("first taker");
-    let (out2, got) = (out.clone(), Arc::new(AtomicBool::new(false)));
-    let flag = got.clone();
-    let waiter = thread::spawn(move || {
-        let lock = take(&out2, Duration::from_secs(10)).expect("second taker");
-        flag.store(true, Ordering::SeqCst);
-        thread::sleep(WINDOW * 2);
-        lock
-    });
-    thread::sleep(WINDOW / 2);
-    holder.delete().expect("deleted while held");
-    let t = Instant::now();
-    while !got.load(Ordering::SeqCst) {
-        assert!(t.elapsed() < SLACK * 5, "the waiter never took the lock");
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        lock_path(&out).exists(),
-        "the waiter re-created the sidecar"
-    );
-    let third = take(&out, Duration::from_millis(100));
-    assert!(
-        matches!(third, Err(Error::TimedOut { .. })),
-        "the waiter holds the file the path names: {third:?}"
-    );
-    drop(waiter.join().unwrap());
-}
-
 // smbfs against Samba's fruit:zero_file_id=yes derives inode numbers from the name:
 // a deleted sidecar's open fd and a recreated one compare equal.
 #[cfg(unix)]
@@ -196,50 +162,248 @@ fn a_deleted_sidecar_fd_does_not_name_a_recreated_one() {
     assert!(os::names_this_file(&new, &path).unwrap());
 }
 
+// Cross-process holder: this binary re-run on `child_helper`, which locks in its own
+// process and obeys stdin lines. "hold" prints CHILD:held; "replace" also deletes and
+// retakes the sidecar after "go" (CHILD:replaced), keeping the old inode open.
+#[test]
+fn child_helper() {
+    use std::io::BufRead;
+    let Some(dir) = std::env::var_os("FREEMKV_LOCK_CHILD_DIR") else {
+        return;
+    };
+    let out = Path::new(&dir).join("Movie.iso");
+    let mode = std::env::var("FREEMKV_LOCK_CHILD_MODE").unwrap_or_default();
+    let say = |m: &str| {
+        println!("CHILD:{m}");
+        io::stdout().flush().unwrap();
+    };
+    let mut lines = io::stdin().lock().lines();
+    let lock = take(&out, WINDOW).expect("child takes the lock");
+    say("held");
+    if mode == "replace" {
+        lines.next();
+        // Holding the old inode open keeps its number from being reused by the new file.
+        let _old = os::open_rw(&lock_path(&out)).unwrap();
+        lock.delete().unwrap();
+        let _new = take(&out, WINDOW).expect("child retakes");
+        say("replaced");
+        lines.next();
+    } else {
+        lines.next();
+        drop(lock);
+    }
+}
+
+struct Child {
+    proc: std::process::Child,
+    out: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Child {
+    fn spawn(dir: &Path, mode: &str) -> Child {
+        let mut proc = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "io::artifact_lock::tests::child_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("FREEMKV_LOCK_CHILD_DIR", dir)
+            .env("FREEMKV_LOCK_CHILD_MODE", mode)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = std::io::BufReader::new(proc.stdout.take().unwrap());
+        Child { proc, out }
+    }
+    fn wait_for(&mut self, marker: &str) {
+        use std::io::BufRead;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(self.out.read_line(&mut line).unwrap() > 0, "child died");
+            if line.trim_end().ends_with(&format!("CHILD:{marker}")) {
+                return;
+            }
+        }
+    }
+    fn send(&mut self) {
+        let stdin = self.proc.stdin.as_mut().unwrap();
+        stdin.write_all(b"go\n").unwrap();
+        stdin.flush().unwrap();
+    }
+    fn finish(mut self) {
+        self.send();
+        assert!(self.proc.wait().unwrap().success());
+    }
+}
+
+/// The OS lock excludes another process: with a child holding the sidecar, the parent's
+/// acquire waits out its window, and takes the lock once the child has exited.
+#[test]
+fn a_lock_held_by_another_process_excludes_this_one() {
+    let (dir, out) = artifact();
+    let mut child = Child::spawn(dir.path(), "hold");
+    child.wait_for("held");
+    let t = Instant::now();
+    let r = take(&out, Duration::from_millis(300));
+    assert!(
+        matches!(r, Err(Error::TimedOut { .. })),
+        "taken while another process holds it: {r:?}"
+    );
+    assert!(t.elapsed() >= Duration::from_millis(300));
+    child.finish();
+    take(&out, WINDOW).expect("free once the holder exited");
+}
+
+// A waiter blocked on the old file must, once it is unlocked, see it no longer names
+// the path and wait for the new holder; `ids` is the identity check under test.
+type IdFn = fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64, u64)>);
+
+fn waiter_must_not_keep_a_replaced_sidecar(ids: IdFn) {
+    let (dir, out) = artifact();
+    let mut child = Child::spawn(dir.path(), "replace");
+    child.wait_for("held");
+    let reached = std::sync::atomic::AtomicUsize::new(0);
+    let counted = |f: &File, p: &Path| {
+        reached.fetch_add(1, Ordering::SeqCst);
+        ids(f, p)
+    };
+    let done = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let lock = ArtifactLock::acquire_ids(
+                &out,
+                &[],
+                &Halt::new(),
+                Duration::from_secs(20),
+                &counted,
+                &os::try_lock_exclusive,
+            )
+            .expect("waiter takes the lock after the child exits");
+            done.store(true, Ordering::SeqCst);
+            lock
+        });
+        thread::sleep(Duration::from_millis(300));
+        child.send();
+        child.wait_for("replaced");
+        // The old file is unlocked now, so the waiter reaches the identity check.
+        let t = Instant::now();
+        while reached.load(Ordering::SeqCst) == 0 {
+            assert!(
+                t.elapsed() < SLACK * 5,
+                "the waiter never reached the check"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the waiter holds the deleted sidecar while the child holds the new one"
+        );
+        child.finish();
+        drop(waiter.join().unwrap());
+    });
+}
+
+/// §2.5 acquire loop (the unlink race), real inode numbers.
+#[test]
+fn artifact_lock_rechecks_identity_after_the_holder_deletes() {
+    waiter_must_not_keep_a_replaced_sidecar(|f, p| (os::file_id(f), os::path_id(p)));
+}
+
 #[test]
 #[cfg(unix)]
 fn name_derived_ids_cannot_admit_a_waiter_holding_the_deleted_sidecar() {
+    waiter_must_not_keep_a_replaced_sidecar(name_derived);
+}
+
+// Token proof unavailable: the acquire falls back to the dev/ino match already made.
+#[cfg(unix)]
+fn acquire_with_token_io(
+    write: &dyn Fn(&File, &[u8]) -> io::Result<()>,
+    read: &dyn Fn(&Path, u64) -> io::Result<Vec<u8>>,
+) -> (Result<ArtifactLock>, usize) {
     let (_dir, out) = artifact();
-    let take = |out: &Path, window| {
-        ArtifactLock::acquire_ids(
-            out,
-            &[],
-            &Halt::new(),
-            window,
-            &name_derived,
-            &os::try_lock_exclusive,
-        )
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let names = |f: &File, p: &Path| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        os::names_with(f, p, write, read)
     };
-    let holder = take(&out, WINDOW).expect("first taker");
-    let (out2, got) = (out.clone(), Arc::new(AtomicBool::new(false)));
-    let flag = got.clone();
-    let waiter = thread::spawn(move || {
-        let lock = ArtifactLock::acquire_ids(
-            &out2,
-            &[],
-            &Halt::new(),
-            Duration::from_secs(10),
-            &name_derived,
-            &os::try_lock_exclusive,
-        )
-        .expect("second taker");
-        flag.store(true, Ordering::SeqCst);
-        thread::sleep(WINDOW * 2);
-        lock
-    });
-    thread::sleep(WINDOW / 2);
-    holder.delete().expect("deleted while held");
-    let t = Instant::now();
-    while !got.load(Ordering::SeqCst) {
-        assert!(t.elapsed() < SLACK * 5, "the waiter never took the lock");
-        thread::sleep(Duration::from_millis(5));
+    let hooks = Hooks {
+        ids: &|f, p| (os::file_id(f), os::path_id(p)),
+        lock: &os::try_lock_exclusive,
+        names: &names,
+    };
+    let r = ArtifactLock::acquire_full(&out, &[], &Halt::new(), WINDOW, &hooks);
+    (r, calls.load(Ordering::SeqCst))
+}
+
+#[cfg(unix)]
+fn real_write(f: &File, token: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.set_len(0)?;
+    f.write_all_at(token, 0)
+}
+
+#[cfg(unix)]
+fn real_read(p: &Path, max: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut v = Vec::new();
+    File::open(p)?.take(max).read_to_end(&mut v)?;
+    Ok(v)
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_failing_token_write_falls_back_to_the_inode_match() {
+    for code in [libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EIO] {
+        let write = |_: &File, _: &[u8]| Err(io::Error::from_raw_os_error(code));
+        let (r, calls) = acquire_with_token_io(&write, &real_read);
+        assert!(r.is_ok(), "errno {code}: {r:?}");
+        assert_eq!(calls, 1, "errno {code}: no retry");
     }
-    let third = take(&out, Duration::from_millis(100));
-    assert!(
-        matches!(third, Err(Error::TimedOut { .. })),
-        "two holders: the waiter kept the deleted sidecar: {third:?}"
-    );
-    drop(waiter.join().unwrap());
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_read_back_refused_by_our_own_lock_falls_back_to_the_inode_match() {
+    for code in [libc::EACCES, libc::EAGAIN, libc::EBUSY, libc::EPERM] {
+        let read = |_: &Path, _: u64| Err(io::Error::from_raw_os_error(code));
+        let (r, calls) = acquire_with_token_io(&real_write, &read);
+        assert!(r.is_ok(), "errno {code}: {r:?}");
+        assert_eq!(calls, 1, "errno {code}: no retry");
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn enoent_and_estale_on_the_token_io_still_retry() {
+    for code in [libc::ENOENT, libc::ESTALE] {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let write = |f: &File, t: &[u8]| {
+            if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(io::Error::from_raw_os_error(code))
+            } else {
+                real_write(f, t)
+            }
+        };
+        let (r, calls) = acquire_with_token_io(&write, &real_read);
+        assert!(r.is_ok(), "write errno {code}: {r:?}");
+        assert_eq!(calls, 2, "write errno {code}: one retry");
+        let m = std::sync::atomic::AtomicUsize::new(0);
+        let read = |p: &Path, max: u64| {
+            if m.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(io::Error::from_raw_os_error(code))
+            } else {
+                real_read(p, max)
+            }
+        };
+        let (r, calls) = acquire_with_token_io(&real_write, &read);
+        assert!(r.is_ok(), "read errno {code}: {r:?}");
+        assert_eq!(calls, 2, "read errno {code}: one retry");
+    }
 }
 
 /// §2.5 lifetime: "Deleted on success … and on Discard, both while holding it. Kept
