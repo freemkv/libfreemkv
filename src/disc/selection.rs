@@ -71,7 +71,21 @@ impl ContentSegment {
 }
 
 /// Authored content segments and episode-roster membership, attached to stable title identity.
+/// It may gain fields: outside this crate, start from `Default` and set them.
+///
+/// ```
+/// let mut evidence = libfreemkv::disc::TitleSelectionEvidence::default();
+/// evidence.segments.clear();
+/// ```
+///
+/// ```compile_fail
+/// let evidence = libfreemkv::disc::TitleSelectionEvidence {
+///     segments: Vec::new(),
+///     episodes: Default::default(),
+/// };
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TitleSelectionEvidence {
     /// Authored content in play order; empty when the backend cannot describe it exactly.
     pub segments: Vec<ContentSegment>,
