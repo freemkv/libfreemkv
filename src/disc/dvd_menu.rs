@@ -466,9 +466,6 @@ fn produce(
             reachable.push(i);
         }
     }
-    for &i in &reachable {
-        titles[i].selection_evidence.dvd_menu_reachable = true;
-    }
     // This first slice deliberately excludes cross-VTS/title-chain navigation.
     let vtsn = need(addresses.first())?.0;
     if vtsn == 0 || addresses.iter().any(|a| a.0 != vtsn) {

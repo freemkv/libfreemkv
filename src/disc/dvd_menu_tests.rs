@@ -150,7 +150,6 @@ fn dvd_menu_binary_partition_six_alternates_three_uneven_episodes() {
     let titles = scan(vmg, vts, vob);
     assert_eq!(titles.len(), 8);
     for (i, title) in titles.iter().enumerate() {
-        assert_eq!(title.selection_evidence.dvd_menu_reachable, i < 7);
         assert!(matches!(&title.selection_evidence.episodes,
             EpisodeEvidence::Authored {title_count:8,member,..} if *member == (i<6)));
         assert_eq!(
@@ -179,7 +178,6 @@ fn dvd_menu_binary_reachability_without_exact_partition_is_not_roster() {
     // Play-all's first authored interval no longer matches either standalone alias.
     long(&mut vts, at + 240 + 20, 238);
     let titles = scan(vmg, vts, vob);
-    assert!(titles[0].selection_evidence.dvd_menu_reachable);
     assert!(
         titles
             .iter()
@@ -210,7 +208,6 @@ fn dvd_menu_binary_unreachable_exact_alias_shares_member_ordinal() {
         let body = pgc(&[(100, last)], 0x40);
         vts[at..at + body.len()].copy_from_slice(&body);
         let titles = scan(vmg, vts, vob);
-        assert!(!titles[7].selection_evidence.dvd_menu_reachable);
         let EpisodeEvidence::Authored {
             member: m, ordinal, ..
         } = titles[7].selection_evidence.episodes
