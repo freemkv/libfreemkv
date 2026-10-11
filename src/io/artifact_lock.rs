@@ -526,10 +526,27 @@ mod os {
         e
     }
 
-    fn read_back(p: &Path, max: u64) -> io::Result<Vec<u8>> {
+    // Opened without following a symlink or blocking on a FIFO, as publish's re-check:
+    // anything but a regular file at the path is not our sidecar, so it holds no token.
+    pub(super) fn read_back(p: &Path, max: u64) -> io::Result<Vec<u8>> {
         use std::io::Read;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        );
+        let file = match options.open(p) {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Vec::new()),
+            opened => opened?,
+        };
+        if !file.metadata()?.is_file() {
+            return Ok(Vec::new());
+        }
         let mut named = Vec::new();
-        File::open(p)?.take(max).read_to_end(&mut named)?;
+        file.take(max).read_to_end(&mut named)?;
         Ok(named)
     }
 

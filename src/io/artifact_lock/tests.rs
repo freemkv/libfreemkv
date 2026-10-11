@@ -1218,3 +1218,51 @@ fn a_sidecar_fstat_failure_is_an_io_error_not_a_holder() {
     assert!(r.is_ok(), "{r:?}");
     assert_eq!(n.load(Ordering::SeqCst), 2);
 }
+
+/// Round-4 LOW: a FIFO or symlink renamed over the sidecar after it was locked neither
+/// blocks the token read-back nor passes it.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_fifo_or_symlink_over_the_sidecar_never_blocks_the_read_back() {
+    use std::os::unix::ffi::OsStrExt;
+    type Swap = fn(&Path, &Path);
+    let swaps: [(&str, Swap); 2] = [
+        ("fifo", |dir, path| {
+            let fifo = dir.join("fifo");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            std::fs::rename(&fifo, path).unwrap();
+        }),
+        ("symlink", |dir, path| {
+            // A copy of the sidecar, token included, reached through a symlink.
+            let copy = dir.join("copy");
+            std::fs::copy(path, &copy).unwrap();
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&copy, &link).unwrap();
+            std::fs::rename(&link, path).unwrap();
+        }),
+    ];
+    for (kind, swap) in swaps {
+        let (dir, out) = artifact();
+        let path = lock_path(&out);
+        let f = os::open_rw(&path).unwrap();
+        assert!(os::try_lock_exclusive(&f).unwrap());
+        let dir = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let write = |f: &File, token: &[u8]| {
+                os::write_token(f, token)?;
+                swap(&dir, &path);
+                Ok(())
+            };
+            let read = |p: &Path, max: u64| os::read_back(p, max);
+            let r = os::names_with(&f, &path, &write, &read, &os::try_lock_exclusive);
+            let _ = tx.send(format!("{r:?}"));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{kind}: the read-back blocked"));
+        assert!(r.starts_with("Ok(Retry("), "{kind}: {r}");
+    }
+}
