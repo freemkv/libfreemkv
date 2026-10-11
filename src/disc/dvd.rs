@@ -374,7 +374,7 @@ impl Disc {
                         // cut and guessed titles do not play just these cells in this order.
                         segments: match dvd_title.sequential
                             && dvd_title.mapped
-                            && dvd_title.pgcs <= 1
+                            && dvd_title.pgcs == 1
                             && one_sequential_pgc
                             && !buttons_jump
                             && !dvd_title.truncated

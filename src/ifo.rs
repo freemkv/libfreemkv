@@ -78,8 +78,8 @@ pub struct DvdTitle {
     /// resolution joins on the REAL title number rather than the position in the
     /// titles vec, which desyncs when a sibling PGC is dropped as unparseable.
     pub vts_title_num: u8,
-    /// Distinct PGCs this title's part-of-title entries point at. Only the first is read,
-    /// so a title with more is missing the rest.
+    /// Distinct PGCs this title's part-of-title entries point at; 0 when its part list
+    /// cannot be read. Only the first is read, so a title with more is missing the rest.
     pub pgcs: usize,
     /// The program (PGN) each chapter (part of title) starts at, from VTS_PTT_SRPT. `None`
     /// when the table does not hold the title; empty when a chapter lies in another PGC.
@@ -1104,8 +1104,8 @@ fn ptt_srpt_parts(data: &[u8], ptt_offset: usize, ttn: u8) -> Option<Vec<(u16, u
     Some(parts)
 }
 
-// Distinct PGCs title `ttn`'s part-of-title entries point at. A title split across
-// PGCs (one per chapter) is read from its first PGC only; the caller warns on > 1.
+// Distinct PGCs title `ttn`'s part-of-title entries point at, 0 when unreadable. A title
+// split across PGCs is read from its first PGC only; the caller warns on > 1.
 fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
     let mut pgcns: Vec<u16> = ptt_srpt_parts(data, ptt_offset, ttn)
         .unwrap_or_default()

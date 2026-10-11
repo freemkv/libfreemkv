@@ -2991,3 +2991,22 @@ fn a_cut_title_elsewhere_marks_the_dvd_scan_incomplete() {
         .expect("the partition logs why it proved nothing");
     assert_eq!(held.field("complete"), Some("false"));
 }
+
+// ── Round 4: unreadable part lists, what an undescribed title can play ──
+
+// Title 8 (the last) keeps a readable first part, but VTS_PTT_SRPT's last byte runs past the
+// IFO, so the rest of its part list cannot be read.
+fn with_unreadable_last_parts(vts: &mut [u8]) {
+    vts[2052..2056].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes());
+}
+
+/// Round-4 MEDIUM: an unreadable part list proves no PGC count, so no segments.
+#[test]
+fn a_title_whose_part_list_is_unreadable_has_no_segments() {
+    let (mut vts, _) = alternates_vts();
+    with_unreadable_last_parts(&mut vts);
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert_eq!(titles.len(), 8);
+    assert!(titles[7].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+}
