@@ -1003,7 +1003,6 @@ fn extract(
     (labels, feature_playlist)
 }
 
-// The structural-evidence result among the parsed candidates, if any.
 /// Whether a chosen parser's labels get the MPLS floor merged in: every
 /// non-structural result (a structural one IS the floor). Shared by `extract()`
 /// and `analyze()` so the two merges cannot drift.
@@ -1011,6 +1010,7 @@ fn floors_with_mpls(evidence: EvidenceKind) -> bool {
     evidence != EvidenceKind::Structural
 }
 
+// The structural-evidence result among the parsed candidates, if any.
 fn structural_floor<'a>(results: &'a [(&'static str, ParseResult)]) -> Option<&'a ParseResult> {
     results
         .iter()

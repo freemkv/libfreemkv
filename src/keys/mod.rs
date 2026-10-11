@@ -871,12 +871,11 @@ pub fn check_decryptable(
 }
 
 /// The disc-wide gate with no AACS set: `Ok` for a clear disc or a cracked CSS disc, else
-/// the typed refusal. `raw` always passes. An AACS disc, or an encrypted one whose AACS
-/// state was never read, refuses with the scan's key-service failure (an AACS disc also
-/// its handshake failure) when it recorded one, else `NoDiscKey`. An encrypted disc with
-/// neither AACS nor CSS state refuses with the recorded key-service failure, else
-/// `AacsKeyFileUnreadable` (E7031) for any other recorded AACS error, else an empty-hash
-/// `NoDiscKey`; per-title-key discs (DVD CSS) pass.
+/// the typed refusal. `raw` always passes. An AACS disc (`aacs` set) refuses with the
+/// scan's handshake or key-service failure when it recorded one, else `NoDiscKey`. An
+/// encrypted disc with neither AACS nor CSS state (`aacs` unset) refuses with the recorded
+/// key-service failure, else `AacsKeyFileUnreadable` (E7031) when any other error was
+/// recorded, else an empty-hash `NoDiscKey`; per-title-key discs (DVD CSS) pass.
 pub(crate) fn disc_gate(disc: &Disc, raw: bool) -> Result<()> {
     if raw {
         return Ok(());
