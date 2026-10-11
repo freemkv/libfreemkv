@@ -1,8 +1,6 @@
 //! AACS bus-encryption removal for sector streams.
 //!
-//! The live `Drive` already removes bus encryption. Do not wrap it in this
-//! adapter: applying the transform twice corrupts content. This adapter is for
-//! other sources and tests, using the same [`BusMap`] gate.
+//! The live `Drive` is the single de-bus point (`Drive::set_bus_stage`).
 //! [`BusStage::Passthrough`] leaves sectors untouched; [`BusStage::AacsHostKey`]
 //! applies the host key obtained through the AACS handshake.
 //!
@@ -403,118 +401,6 @@ impl std::fmt::Debug for BusStage {
             BusStage::Passthrough => write!(f, "BusStage::Passthrough"),
             BusStage::AacsHostKey(_) => write!(f, "BusStage::AacsHostKey([redacted])"),
         }
-    }
-}
-
-/// Decorator: read from `inner`, then remove AACS bus encryption from the bytes
-/// that landed in `buf` when the [`BusStage`] carries a host key. A
-/// [`BusStage::Passthrough`] stream is a zero-cost pass-through.
-pub struct BusRemovalSectorSource<S: SectorSource> {
-    inner: S,
-    stage: BusStage,
-    /// `None` = caller reads content-only, so every sector is de-bussed;
-    /// `Some` = whole-disc reader gated by a [`BusMap`].
-    gate: Option<BusGate>,
-}
-
-impl<S: SectorSource> BusRemovalSectorSource<S> {
-    /// Wrap `inner` with the bus stage decided by the unlock result.
-    pub fn new(inner: S, stage: BusStage) -> Self {
-        Self {
-            inner,
-            stage,
-            gate: None,
-        }
-    }
-
-    /// Gate de-bussing with `map`; sectors outside it pass through untouched.
-    pub fn with_bus_map(mut self, map: Arc<BusMap>) -> Self {
-        self.gate = Some(BusGate::new(map));
-        self
-    }
-
-    /// [`with_bus_map`](Self::with_bus_map) over plain ranges, each treated
-    /// as one unit-aligned stream file.
-    pub fn with_content_ranges(self, ranges: Arc<[(u32, u32)]>) -> Self {
-        self.with_bus_map(Arc::new(BusMap::from_ranges(&ranges)))
-    }
-
-    /// `&mut` counterpart of [`with_content_ranges`](Self::with_content_ranges),
-    /// for readers that build the stream before the content map is known.
-    pub fn set_content_ranges(&mut self, ranges: Arc<[(u32, u32)]>) {
-        self.gate = Some(BusGate::new(Arc::new(BusMap::from_ranges(&ranges))));
-    }
-
-    /// Borrow the inner source (tests / introspection).
-    pub fn inner(&self) -> &S {
-        &self.inner
-    }
-
-    /// Mutable borrow of the inner source.
-    pub fn inner_mut(&mut self) -> &mut S {
-        &mut self.inner
-    }
-
-    /// Consume the decorator and return the underlying source.
-    pub fn into_inner(self) -> S {
-        self.inner
-    }
-}
-
-impl<S: SectorSource> SectorSource for BusRemovalSectorSource<S> {
-    fn capacity_sectors(&self) -> u32 {
-        self.inner.capacity_sectors()
-    }
-
-    fn read_sectors(
-        &mut self,
-        lba: u32,
-        count: u16,
-        buf: &mut [u8],
-        recovery: bool,
-    ) -> Result<usize> {
-        self.read_sectors_fua(lba, count, buf, recovery, false)
-    }
-
-    fn read_sectors_fua(
-        &mut self,
-        lba: u32,
-        count: u16,
-        buf: &mut [u8],
-        recovery: bool,
-        fua: bool,
-    ) -> Result<usize> {
-        let n = self
-            .inner
-            .read_sectors_fua(lba, count, buf, recovery, fua)?;
-        if let BusStage::AacsHostKey(rdk) = self.stage.clone() {
-            let mut gate = self.gate.take();
-            let inner = &mut self.inner;
-            debus_read(gate.as_mut(), &mut buf[..n], &rdk, lba, &mut |h| {
-                let mut s = [0u8; SECTOR_BYTES];
-                match inner.read_sectors_fua(h, 1, &mut s, false, false) {
-                    Ok(got) if got >= SECTOR_BYTES => Some(s[0]),
-                    _ => None,
-                }
-            });
-            self.gate = gate;
-        }
-        Ok(n)
-    }
-
-    fn set_speed(&mut self, kbs: u16) {
-        self.inner.set_speed(kbs)
-    }
-
-    fn unmapped_stream_files(&self) -> &[UnmappedStreamFile] {
-        match (&self.stage, &self.gate) {
-            (BusStage::AacsHostKey(_), Some(g)) => g.map().unmapped(),
-            _ => self.inner.unmapped_stream_files(),
-        }
-    }
-
-    fn random_access(&self) -> bool {
-        self.inner.random_access()
     }
 }
 

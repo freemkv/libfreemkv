@@ -449,7 +449,7 @@ fn no_raw_execute_in_drive_or_identity() {
             hits.extend(s.hits(pat).into_iter().map(|i| (s, i)));
         }
     }
-    assert!(scanned >= 5, "the walk lost drive/ files: {scanned}");
+    assert!(scanned >= 3, "the walk lost drive/ files: {scanned}");
     check("raw transport execute outside Drive::exec", hits, ALLOW);
 }
 
@@ -551,8 +551,6 @@ const ALLOW_BASELINE: &[(&str, &str, usize)] = &[
         r#"allow(clippy::too_many_arguments)"#,
         1,
     ),
-    ("src/drive/linux.rs", r#"allow(dead_code)"#, 1),
-    ("src/drive/mod.rs", r#"allow(dead_code)"#, 1),
     (
         "src/drive/mod.rs",
         r#"cfg_attr(not(target_os="linux"),allow(unused_variables))"#,

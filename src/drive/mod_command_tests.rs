@@ -2139,7 +2139,7 @@ fn init_without_unlocker_is_ok_oem_fallback() {
         "no-match init must succeed (OEM fallback)"
     );
     assert!(
-        !d.is_ready(),
+        d.unlocked_by().is_none(),
         "no unlocker ran → not in unlocked-ready state"
     );
 }

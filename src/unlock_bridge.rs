@@ -3,6 +3,7 @@
 //! assembles the unlocker list and runs each one's `unlock()` until one claims
 //! the drive. libfreemkv names no individual unlocker — it only calls this bridge.
 
+use crate::disc::BusRoute;
 use freemkv_unlock as fu;
 
 /// Map libfreemkv's drive identity to the unlock contract's `DriveId`.
@@ -16,11 +17,14 @@ fn to_fu_drive_id(drive_id: &crate::identity::DriveId) -> fu::DriveId {
     }
 }
 
-/// Name of the unlocker that claims this drive by identity (drive-info "is this
-/// drive supported?" display), or `None`. A pure lookup — does NOT touch the
-/// drive or unlock anything.
-pub(crate) fn unlocker_name(drive_id: &crate::identity::DriveId) -> Option<&'static str> {
-    fu::unlocker_name(&to_fu_drive_id(drive_id))
+/// Name of the first firmware unlocker, in dispatch order, that claims this
+/// drive by identity, or `None`. A pure lookup — does NOT touch the drive.
+pub(crate) fn claimed_by(drive_id: &crate::identity::DriveId) -> Option<&'static str> {
+    let id = to_fu_drive_id(drive_id);
+    firmware_unlockers()
+        .into_iter()
+        .find(|u| u.claims(&id))
+        .map(|u| u.name())
 }
 
 /// The unlock crate's transport over a [`Drive`](crate::drive::Drive) (stop design
@@ -219,13 +223,16 @@ fn firmware_unlockers() -> Vec<Box<dyn fu::Unlocker>> {
     ]
 }
 
-// The DISC-keyed unlockers, in dispatch order. `host_certs` are injected into
-// the AACS unlocker here (the one place certs enter); pass an empty slice when
-// only the names are wanted.
-fn disc_unlockers(host_certs: Vec<fu::HostCert>) -> Vec<Box<dyn fu::Unlocker>> {
+// The DISC-keyed unlockers in dispatch order, each with the bus route it
+// provides. `host_certs` are injected into the AACS unlocker here (the one
+// place certs enter); pass an empty Vec when only names/routes are wanted.
+fn disc_unlockers(host_certs: Vec<fu::HostCert>) -> Vec<(Box<dyn fu::Unlocker>, BusRoute)> {
     vec![
-        Box::new(fu::AacsUnlocker::new(host_certs)),
-        Box::new(fu::DvdUnlocker::new()),
+        (
+            Box::new(fu::AacsUnlocker::new(host_certs)),
+            BusRoute::HostCert,
+        ),
+        (Box::new(fu::DvdUnlocker::new()), BusRoute::CssAuth),
     ]
 }
 
@@ -253,18 +260,25 @@ pub(crate) fn run_bus(
     kind: fu::DiscKind,
     host_certs: &[fu::HostCert],
 ) -> Dispatch {
-    run(disc_unlockers(host_certs.to_vec()), drive, drive_id, kind)
+    let unlockers = disc_unlockers(host_certs.to_vec());
+    run(
+        unlockers.into_iter().map(|(u, _)| u).collect(),
+        drive,
+        drive_id,
+        kind,
+    )
 }
 
-// The unlocker names, in dispatch order, for the user-facing unlocker matrix.
-// Derived from the real unlocker instances' `.name()` — firmware set then disc
-// set — so the matrix can never drift from what actually dispatches.
-pub(crate) fn unlocker_names() -> Vec<&'static str> {
-    firmware_unlockers()
-        .iter()
-        .chain(disc_unlockers(Vec::new()).iter())
-        .map(|u| u.name())
-        .collect()
+// Every registered unlocker's name and the bus route it provides, in dispatch
+// order (firmware set, then disc set), from the real instances.
+pub(crate) fn unlocker_routes() -> Vec<(&'static str, BusRoute)> {
+    let firmware = firmware_unlockers()
+        .into_iter()
+        .map(|u| (u.name(), BusRoute::Firmware(u.name())));
+    let disc = disc_unlockers(Vec::new())
+        .into_iter()
+        .map(|(u, route)| (u.name(), route));
+    firmware.chain(disc).collect()
 }
 
 #[cfg(test)]

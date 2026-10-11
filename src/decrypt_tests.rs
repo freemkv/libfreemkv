@@ -674,7 +674,7 @@ impl crate::sector::SectorSource for WireSource {
 #[test]
 fn bus_removal_then_mapped_unit_decrypt_recovers_plaintext_end_to_end() {
     use crate::sector::SectorSource;
-    use crate::sector::bus_removal::{BusRemovalSectorSource, BusStage};
+    use crate::sector::bus_removal::{BusStage, test_support::BusRemovalSectorSource};
 
     let unit_key = [0x5Au8; 16];
     let rdk = [0x91u8; 16];
@@ -721,7 +721,7 @@ fn bus_removal_then_mapped_unit_decrypt_recovers_plaintext_end_to_end() {
 #[test]
 fn without_bus_removal_mapped_unit_decrypt_cannot_clear_bus_encrypted_content() {
     use crate::sector::SectorSource;
-    use crate::sector::bus_removal::{BusRemovalSectorSource, BusStage};
+    use crate::sector::bus_removal::{BusStage, test_support::BusRemovalSectorSource};
 
     let unit_key = [0x5Au8; 16];
     let rdk = [0x91u8; 16];

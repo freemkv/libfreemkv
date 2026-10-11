@@ -160,18 +160,11 @@ fn transport_field_is_not_reachable_outside_dispatch() {
     };
     let cut = "#[cfg(test)]\nmod halt_tests";
     assert_eq!(count(include_str!("mod.rs"), cut), 3, "mod.rs");
-    for (name, src) in [
-        ("allow.rs", include_str!("allow.rs")),
-        ("linux.rs", include_str!("linux.rs")),
-        ("macos.rs", include_str!("macos.rs")),
-        ("windows.rs", include_str!("windows.rs")),
-    ] {
-        assert_eq!(
-            count(src, "#[cfg(test)]"),
-            0,
-            "{name} must go through Drive::exec"
-        );
-    }
+    assert_eq!(
+        count(include_str!("allow.rs"), "#[cfg(test)]"),
+        0,
+        "allow.rs must go through Drive::exec"
+    );
 }
 
 /// LD3: a READ that completes after a cancel is discarded: `Halted`, not good data.

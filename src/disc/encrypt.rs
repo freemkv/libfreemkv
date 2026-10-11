@@ -522,7 +522,7 @@ impl Disc {
         }
         // A firmware-claimed drive with no VID stays that way: the cert route's REPORT
         // KEY AGID cycle would poison it (see the guard test).
-        if let Some(unlocker) = session.unlocker_name() {
+        if let Some(unlocker) = session.unlocked_by() {
             tracing::debug!(
                 target: "freemkv::disc",
                 phase = "firmware_unlocked_no_vid",
