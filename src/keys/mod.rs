@@ -871,8 +871,9 @@ pub fn check_decryptable(
 }
 
 /// The disc-wide gate with no AACS set: `Ok` for a clear disc or a cracked CSS disc, else
-/// the typed refusal. `raw` always passes. An AACS disc refuses with the scan's
-/// handshake or key-service failure when it recorded one, else `NoDiscKey`.
+/// the typed refusal. `raw` always passes. An AACS disc, or an encrypted one whose AACS
+/// state was never read, refuses with the scan's key-service failure (an AACS disc also
+/// its handshake failure) when it recorded one, else `NoDiscKey`.
 pub(crate) fn disc_gate(disc: &Disc, raw: bool) -> Result<()> {
     if raw {
         return Ok(());
@@ -895,17 +896,27 @@ pub(crate) fn disc_gate(disc: &Disc, raw: bool) -> Result<()> {
         {
             return Err(e);
         }
-        return Err(match disc.aacs_error {
-            Some(Error::KeyServiceUnavailable) => Error::KeyServiceUnavailable,
-            Some(Error::KeyServiceUnauthorized) => Error::KeyServiceUnauthorized,
-            Some(Error::KeyServiceRateLimited) => Error::KeyServiceRateLimited,
-            _ => Error::NoDiscKey {
-                disc_hash: disc.aacs_disc_hash(),
-            },
-        });
+        return Err(key_service_or_no_key(disc));
     }
     if disc.css.is_some() {
         return Err(Error::CssKeyMissing);
     }
+    // Encrypted with neither state (the title-key file unread): refuse, a key-service
+    // failure keeping its own verdict ("retry / fix the token", not "no key").
+    if disc.encrypted {
+        return Err(key_service_or_no_key(disc));
+    }
     Ok(())
+}
+
+// A key-service failure the scan recorded, else `NoDiscKey` for the disc's hash.
+fn key_service_or_no_key(disc: &Disc) -> Error {
+    match disc.aacs_error {
+        Some(Error::KeyServiceUnavailable) => Error::KeyServiceUnavailable,
+        Some(Error::KeyServiceUnauthorized) => Error::KeyServiceUnauthorized,
+        Some(Error::KeyServiceRateLimited) => Error::KeyServiceRateLimited,
+        _ => Error::NoDiscKey {
+            disc_hash: disc.aacs_disc_hash(),
+        },
+    }
 }

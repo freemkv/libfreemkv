@@ -20,6 +20,8 @@ mod format;
 mod hddvd;
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
+mod protection;
+pub use protection::ProtectionLabel;
 mod selection;
 mod selection_partition;
 pub use selection::{
@@ -3270,7 +3272,7 @@ impl Disc {
             // Did work only when NO firmware route ran, its handshake yielded a VID,
             // and no handshake error stands.
             BusRoute::HostCert => {
-                self.aacs.as_ref().is_some_and(|a| a.volume_id != [0u8; 16])
+                self.aacs_volume_id().is_some()
                     && drive.unlocked_by().is_none()
                     && self
                         .aacs_error

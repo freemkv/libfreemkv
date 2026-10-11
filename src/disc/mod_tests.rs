@@ -3322,6 +3322,33 @@ fn key_source_failure_is_not_reported_as_a_missing_disc_key() {
     }
 }
 
+// Encrypted with neither AACS nor CSS state (the title-key file unread): refuse, keeping
+// a key-service verdict, never pass the ciphertext through.
+#[test]
+fn disc_gate_encrypted_without_state_refuses() {
+    let mut disc = make_test_disc(1000, "BD");
+    disc.encrypted = true;
+    let miss = crate::error::Error::NoDiscKey {
+        disc_hash: String::new(),
+    };
+    let err = gate(&disc, false).expect_err("encrypted without state must error");
+    assert!(
+        matches!(err, crate::error::Error::NoDiscKey { ref disc_hash } if disc_hash.is_empty())
+    );
+    assert_eq!(err.code(), miss.code());
+    disc.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
+    assert_eq!(
+        gate(&disc, false).expect_err("must error").code(),
+        miss.code()
+    );
+    disc.aacs_error = Some(crate::error::Error::KeyServiceRateLimited);
+    assert_eq!(
+        gate(&disc, false).expect_err("must error").code(),
+        crate::error::E_KEY_SERVICE_RATE_LIMITED
+    );
+    assert!(gate(&disc, true).is_ok(), "--raw is exempt");
+}
+
 /// A genuinely unencrypted disc has `None` keys legitimately — the gate keys off
 /// the scan-captured disc state, never the keys, so it must not false-error.
 #[test]
