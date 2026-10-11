@@ -1,5 +1,6 @@
 //! DVD title scanning — IFO parsing, stream mapping, VOB extent building.
 
+use super::selection_partition::Reach;
 use super::*;
 use crate::ifo;
 use crate::sector::SectorSource;
@@ -141,6 +142,7 @@ impl Disc {
         let mut nav_feature: Option<u16> = None;
 
         let mut titles = Vec::new();
+        let mut reach = Vec::new();
         let mut title_number: u16 = 0;
         // Cleared when a title's cells are cut short: the cut title could prove a smaller
         // roster than the disc authored.
@@ -355,17 +357,26 @@ impl Disc {
                     .collect();
 
                 complete &= !dvd_title.truncated;
-                let one_sequential_pgc = dvd_info
+                let playback = dvd_info
                     .title_playback
-                    .get(&(ts.vts_number, dvd_title.vts_title_num))
-                    .is_some_and(|t| t & ifo::TT_MULTI_OR_RANDOM_PGC == 0);
+                    .get(&(ts.vts_number, dvd_title.vts_title_num));
+                let one_sequential_pgc =
+                    playback.is_some_and(|t| t & ifo::TT_MULTI_OR_RANDOM_PGC == 0);
+                // Highlight buttons that jump can take playback anywhere.
+                let buttons_jump = playback.is_none_or(|t| t & ifo::TT_BUTTON_JUMPS != 0);
+                reach.push(match dvd_title.reach {
+                    Some((secs, sectors)) if !buttons_jump => Reach::AtMost { secs, sectors },
+                    _ => Reach::Unknown,
+                });
                 titles.push(DiscTitle {
                     selection_evidence: TitleSelectionEvidence {
-                        // Random, shuffle, chained, multi-PGC, branching and cut titles do
-                        // not play just these cells in this order.
+                        // Random, shuffle, chained, multi-PGC, branching, button-jumping,
+                        // cut and guessed titles do not play just these cells in this order.
                         segments: match dvd_title.sequential
+                            && dvd_title.mapped
                             && dvd_title.pgcs <= 1
                             && one_sequential_pgc
+                            && !buttons_jump
                             && !dvd_title.truncated
                             && exact
                         {
@@ -396,7 +407,12 @@ impl Disc {
             return Err(Error::Halted);
         }
         warn_multi_pgc_titles(&vmg_bytes, &dvd_info);
-        super::selection_partition::annotate(&mut titles, "dvd-playall-partition-v1", complete);
+        super::selection_partition::annotate(
+            &mut titles,
+            "dvd-playall-partition-v1",
+            complete,
+            &reach,
+        );
         Ok((titles, nav_feature, dvd_region(dvd_info.region_mask)))
     }
 }
