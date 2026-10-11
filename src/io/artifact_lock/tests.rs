@@ -1176,6 +1176,10 @@ fn failed_proof_slices_back_off_and_count_until_a_holder() {
     assert!(backed_off >= Duration::from_millis(400), "{backed_off:?}");
     wait.slice(&halt, &e, Cause::Holder).unwrap();
     assert_eq!(wait.lost, 0);
+    // Round-6 tests NIT: a vanishing sidecar is no failed proof either: no backoff.
+    wait.slice(&halt, &e, Cause::Proof).unwrap();
+    wait.slice(&halt, &e, Cause::Vanished).unwrap();
+    assert_eq!(wait.lost, 0);
 }
 
 /// Round-3 tests NIT: production write_token marks an ftruncate the filesystem can't do
@@ -1278,7 +1282,7 @@ fn a_fifo_or_symlink_over_the_sidecar_never_blocks_the_read_back() {
     }
 }
 
-/// Round-4 tests LOW: a holder (or failed-proof) wait between faults resets the run, so
+/// Round-4 tests LOW: a holder (failed-proof, vanishing) wait between faults resets the run, so
 /// only FAULT_REPEATS faults in a row, with no holder seen, end the acquire.
 #[test]
 fn a_holder_wait_resets_the_fault_run() {
@@ -1290,7 +1294,7 @@ fn a_holder_wait_resets_the_fault_run() {
     assert!(!fail(&mut wait, FAULT_REPEATS - 1));
     wait.slice(&halt, &e, Cause::Fault).unwrap();
     assert!(fail(&mut wait, 1), "a fault slice keeps the run");
-    for cause in [Cause::Holder, Cause::Proof] {
+    for cause in [Cause::Holder, Cause::Proof, Cause::Vanished] {
         wait.slice(&halt, &e, cause).unwrap();
         assert!(!fail(&mut wait, FAULT_REPEATS - 1));
         assert!(fail(&mut wait, 1));
@@ -1336,4 +1340,37 @@ fn a_socket_over_the_sidecar_holds_no_token() {
     let path = dir.path().join("s.lock");
     let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
     assert_eq!(os::read_back(&path, 64).unwrap(), Vec::<u8>::new());
+    // Round-6 LOW: the acquire's own open of a socket sidecar is waited out like a holder.
+    let (_dir, out) = artifact();
+    let _socket = std::os::unix::net::UnixListener::bind(lock_path(&out)).unwrap();
+    let window = Duration::from_millis(200);
+    let (r, events) = crate::testlog::capture(|| take(&out, window));
+    assert!(matches!(r, Err(Error::TimedOut { .. })), "{r:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message().contains("another process holds")),
+    );
+}
+
+/// Round-6 LOW/NIT: ENXIO or EOPNOTSUPP from opening a regular sidecar (FUSE, a network
+/// filesystem) stays an error; from a path gone before the lstat it is no token, a retry.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn an_open_refusal_is_no_token_only_for_a_non_regular_file() {
+    let (_dir, out) = artifact();
+    let path = lock_path(&out);
+    std::fs::write(&path, b"x").unwrap();
+    let gone = out.with_extension("gone");
+    for errno in [libc::ENXIO, libc::EOPNOTSUPP] {
+        let refuse = |_: &std::fs::OpenOptions, _: &Path| Err(io::Error::from_raw_os_error(errno));
+        let r = os::read_back_via(&path, 64, &refuse);
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(errno), "regular");
+        assert_eq!(os::read_back_via(&gone, 64, &refuse).unwrap(), b"", "gone");
+        let e = io::Error::from_raw_os_error(errno);
+        assert!(!os::open_retryable(&e, &path), "regular");
+        assert!(os::open_retryable(&e, &gone), "gone");
+    }
+    let eio = io::Error::from_raw_os_error(libc::EIO);
+    assert!(!os::open_retryable(&eio, &gone));
 }

@@ -96,7 +96,7 @@ fn claim_key(path: &Path) -> PathBuf {
 
 impl ArtifactLock {
     /// Take the sidecar lock for `final_path`, waiting while another process holds it
-    /// (or a symlink or second hard link sits at the sidecar, which is never written).
+    /// (or a symlink, socket or second hard link sits at the sidecar: never written).
     /// Progress is a change in the size or mtime of `<final>.partial` or any `watch` path.
     ///
     /// # Errors
@@ -178,8 +178,8 @@ impl ArtifactLock {
             let file = match os::open_rw(&path) {
                 Ok(f) => f,
                 // Windows: a delete-pending sidecar refuses the open; the holder is leaving.
-                // Unix: a symlink there is foreign, waited out like a holder.
-                Err(e) if os::open_retryable(&e) => {
+                // Unix: a symlink or socket there is foreign, waited out like a holder.
+                Err(e) if os::open_retryable(&e, &path) => {
                     wait.slice(halt, &e, Cause::Holder)?;
                     continue;
                 }
@@ -444,11 +444,19 @@ mod os {
         options.open(p)
     }
 
-    pub(super) fn open_retryable(_e: &io::Error) -> bool {
+    pub(super) fn open_retryable(_e: &io::Error, _p: &Path) -> bool {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        return _e.raw_os_error() == Some(libc::ELOOP);
+        return _e.raw_os_error() == Some(libc::ELOOP) || not_regular_refusal(_e, _p);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         false
+    }
+
+    // A socket refuses an open (Linux ENXIO, macOS EOPNOTSUPP), as may a regular file on
+    // FUSE or a network filesystem, which stays an error. Gone before the lstat: a retry.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn not_regular_refusal(e: &io::Error, p: &Path) -> bool {
+        matches!(e.raw_os_error(), Some(libc::ENXIO | libc::EOPNOTSUPP))
+            && std::fs::symlink_metadata(p).map_or_else(|l| id_retryable(&l), |m| !m.is_file())
     }
 
     // Not a sidecar this lock may write: not a regular file, or linked under another name
@@ -541,6 +549,15 @@ mod os {
     // Opened without following a symlink or blocking on a FIFO, as publish's re-check:
     // anything but a regular file at the path is not our sidecar, so it holds no token.
     pub(super) fn read_back(p: &Path, max: u64) -> io::Result<Vec<u8>> {
+        read_back_via(p, max, &|options, p| options.open(p))
+    }
+
+    // `read_back` with the open as a parameter (tests inject its refusal).
+    pub(super) fn read_back_via(
+        p: &Path,
+        max: u64,
+        open: &dyn Fn(&std::fs::OpenOptions, &Path) -> io::Result<File>,
+    ) -> io::Result<Vec<u8>> {
         use std::io::Read;
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
@@ -549,17 +566,12 @@ mod os {
             &mut options,
             libc::O_NOFOLLOW | libc::O_NONBLOCK,
         );
-        let file = match options.open(p) {
+        let file = match open(&options, p) {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Vec::new()),
-            // A socket refuses the open (Linux ENXIO, macOS EOPNOTSUPP): no token either.
+            // A socket refusing the open holds no token either.
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Err(e)
-                if matches!(e.raw_os_error(), Some(libc::ENXIO | libc::EOPNOTSUPP))
-                    && std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_file()) =>
-            {
-                return Ok(Vec::new());
-            }
+            Err(e) if not_regular_refusal(&e, p) => return Ok(Vec::new()),
             opened => opened?,
         };
         if !file.metadata()?.is_file() {
@@ -786,7 +798,7 @@ mod os {
 
     // A delete-pending file refuses the open with ERROR_ACCESS_DENIED, which a real
     // permission error also returns: retry, and let T10 surface a lasting one (§2.5).
-    pub(super) fn open_retryable(e: &io::Error) -> bool {
+    pub(super) fn open_retryable(e: &io::Error, _p: &Path) -> bool {
         e.raw_os_error() == Some(ERROR_ACCESS_DENIED)
     }
 
