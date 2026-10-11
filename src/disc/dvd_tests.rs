@@ -3082,3 +3082,22 @@ fn an_undescribed_title_reading_roster_cells_past_its_first_pgc_holds_the_roster
         assert_no_dvd_roster(&titles);
     }
 }
+
+/// Round-4 tests MEDIUM: an undescribed title whose NextPGCN loops plays without end, so
+/// it holds the roster though each PGC it plays is short.
+#[test]
+fn an_undescribed_title_that_loops_holds_the_dvd_roster() {
+    let has_roster = |titles: &[DiscTitle]| {
+        (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown)
+    };
+    // Title 7 is not one sequential PGC in TT_SRPT: undescribed, but bounded and short.
+    let mut vmg = seven_titles_vmg();
+    vmg[2048 + 8 + 6 * 12] = 0x40;
+    let (titles, _) = scan_disc(vmg.clone(), extras_programs(vec![(700, 709)]).0);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!(has_roster(&titles), "control: a short undescribed title");
+    let (mut looping, at) = extras_programs(vec![(700, 709)]);
+    looping[at[6] + 0x9c..at[6] + 0x9e].copy_from_slice(&7u16.to_be_bytes());
+    let (titles, _) = scan_disc(vmg, looping);
+    assert_no_dvd_roster(&titles);
+}

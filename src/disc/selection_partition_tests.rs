@@ -619,3 +619,36 @@ fn an_undescribed_title_overlapping_the_roster_past_its_extents_holds_it() {
         &[(11, 0), (12, 1), (13, 2)],
     );
 }
+
+/// Round-4 tests LOW: a reach longer in time alone, or in sectors alone, than the
+/// 100 s, 30-sector play-all holds the roster.
+#[test]
+fn a_reach_longer_by_time_or_by_sectors_alone_holds_the_roster() {
+    let extras = [(1000, 1009), (1100, 1109), (1200, 1209)];
+    let mut titles: Vec<_> = (extras.iter().enumerate())
+        .map(|(i, &c)| dvd(i as u16 + 11, &[c]))
+        .collect();
+    let mut playall = dvd(20, &extras);
+    playall.duration_secs = 100.0;
+    titles.push(playall);
+    let mut first_pgc = dvd(1, &[(100, 104)]);
+    first_pgc.selection_evidence.segments.clear();
+    titles.insert(0, first_pgc);
+    let with = |secs, sectors| {
+        let mut titles = titles.clone();
+        let reach = [Reach::AtMost {
+            secs,
+            sectors,
+            beyond: Vec::new(),
+        }];
+        annotate(&mut titles, "dvd-playall-partition-v1", true, &reach);
+        titles
+    };
+    assert_unknown(&with(150.0, 10));
+    assert_unknown(&with(50.0, 40));
+    assert_roster(
+        &with(50.0, 10),
+        "dvd-playall-partition-v1:20",
+        &[(11, 0), (12, 1), (13, 2)],
+    );
+}

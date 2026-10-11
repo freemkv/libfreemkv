@@ -2374,3 +2374,90 @@ fn tt_srpt_duplicate_entries_keep_each_entrys_flags() {
     assert_eq!(table.titles.get(&1).map(Vec::len), Some(2));
     assert!(table.complete);
 }
+
+// A one-cell, one-program PGC of 10 s at `first`, chaining to `next` (1-based, 0 = none).
+fn reach_pgc(first: u32, next: u16) -> Vec<u8> {
+    let mut pgc = build_pgc(
+        bcd_secs(10),
+        &[(0x00, bcd_secs(10), first, first + 9)],
+        &[1],
+        None,
+    );
+    pgc[0x9C..0x9E].copy_from_slice(&next.to_be_bytes());
+    pgc
+}
+
+// Appends a command table holding `pre` as pre commands.
+fn with_pre(mut pgc: Vec<u8>, pre: &[[u8; 8]]) -> Vec<u8> {
+    let rel = pgc.len();
+    pgc[0xE4..0xE6].copy_from_slice(&(rel as u16).to_be_bytes());
+    pgc.extend_from_slice(&(pre.len() as u16).to_be_bytes());
+    pgc.extend_from_slice(&[0, 0, 0, 0]);
+    pgc.extend_from_slice(&((8 + pre.len() * 8 - 1) as u16).to_be_bytes());
+    pre.iter().for_each(|c| pgc.extend_from_slice(c));
+    pgc
+}
+
+const PART_1: &[(u16, u16)] = &[(1, 1)];
+
+/// Round-4 tests MEDIUM: a NextPGCN chain that loops plays without end: unknown.
+#[test]
+fn title_reach_of_a_looping_chain_is_unknown() {
+    let chain = build_pgcit(&[reach_pgc(0, 2), reach_pgc(100, 0)]);
+    let reach = title_reach(&chain, 0, 2, 0, Some(PART_1)).expect("acyclic");
+    assert_eq!(reach.sectors, 20);
+    assert_eq!(reach.beyond, [(100, 109)]);
+    for pgcs in [
+        vec![reach_pgc(0, 2), reach_pgc(100, 1)],
+        vec![reach_pgc(0, 1)],
+    ] {
+        let data = build_pgcit(&pgcs);
+        assert!(title_reach(&data, 0, pgcs.len(), 0, Some(PART_1)).is_none());
+    }
+}
+
+/// Round-4 tests MEDIUM: a LinkPTTN in a title of several PGCs can jump between them.
+#[test]
+fn title_reach_with_part_links_across_pgcs_is_unknown() {
+    // `if gprm0 != 1 goto 3`, LinkPTTN 2, Break: a conditional chapter-select rung.
+    let ladder = [
+        [0x00, 0xb1, 0, 0, 0, 1, 0, 3],
+        [0x20, 0x05, 0, 0, 0, 0, 0, 2],
+        [0x00, 0x02, 0, 0, 0, 0, 0, 0],
+    ];
+    let two_parts: &[(u16, u16)] = &[(1, 1), (2, 1)];
+    let plain = build_pgcit(&[reach_pgc(0, 0), reach_pgc(100, 0)]);
+    assert!(title_reach(&plain, 0, 2, 0, Some(two_parts)).is_some());
+    let linked = build_pgcit(&[with_pre(reach_pgc(0, 0), &ladder), reach_pgc(100, 0)]);
+    assert!(
+        title_reach(&linked, 0, 2, 0, Some(PART_1)).is_some(),
+        "one PGC"
+    );
+    assert!(title_reach(&linked, 0, 2, 0, Some(two_parts)).is_none());
+}
+
+/// Round-4 tests MEDIUM: a random or cut PGC anywhere in the chain bounds nothing.
+#[test]
+fn title_reach_through_a_random_or_cut_pgc_is_unknown() {
+    let mut random = reach_pgc(100, 0);
+    random[0xA2] = 1;
+    let data = build_pgcit(&[reach_pgc(0, 2), random]);
+    assert!(title_reach(&data, 0, 2, 0, Some(PART_1)).is_none());
+    let mut data = build_pgcit(&[reach_pgc(0, 2), reach_pgc(100, 0)]);
+    assert!(title_reach(&data, 0, 2, 0, Some(PART_1)).is_some());
+    data.truncate(data.len() - 10); // into the chained PGC's only cell
+    assert!(title_reach(&data, 0, 2, 0, Some(PART_1)).is_none());
+}
+
+/// Round-4 tests MEDIUM: a chain past MAX_REACH_PGCS (256) is unknown.
+#[test]
+fn title_reach_past_256_pgcs_is_unknown() {
+    let chain = |n: usize| {
+        let pgcs: Vec<_> = (0..n)
+            .map(|i| reach_pgc(i as u32 * 10, if i + 1 < n { i as u16 + 2 } else { 0 }))
+            .collect();
+        build_pgcit(&pgcs)
+    };
+    assert!(title_reach(&chain(256), 0, 256, 0, Some(PART_1)).is_some());
+    assert!(title_reach(&chain(257), 0, 257, 0, Some(PART_1)).is_none());
+}
