@@ -519,7 +519,6 @@ fn produce(
         title.selection_evidence.episodes = EpisodeEvidence::Authored {
             roster: format!("dvd-vmgm-static-playall-partition-v1:vts-{vtsn}"),
             title_count,
-            member: ordinal.is_some(),
             ordinal,
         };
     }

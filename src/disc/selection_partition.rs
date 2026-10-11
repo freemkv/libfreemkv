@@ -74,7 +74,6 @@ pub(super) fn annotate(titles: &mut [DiscTitle]) {
         title.selection_evidence.episodes = EpisodeEvidence::Authored {
             roster: roster.clone(),
             title_count,
-            member: ordinal.is_some(),
             ordinal,
         };
     }

@@ -17,10 +17,9 @@ pub enum EpisodeEvidence {
     Authored {
         roster: String,
         title_count: usize,
-        member: bool,
-        /// Zero-based authored program order. Required for members, absent for
-        /// nonmembers. Exact presentation aliases share one ordinal; distinct
-        /// programs occupy contiguous ordinals starting at zero.
+        /// Zero-based authored program order; `None` outside the roster. Exact
+        /// presentation aliases share one ordinal; distinct programs occupy
+        /// contiguous ordinals starting at zero.
         ordinal: Option<usize>,
     },
 }

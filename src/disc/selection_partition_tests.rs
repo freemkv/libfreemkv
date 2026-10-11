@@ -76,7 +76,6 @@ fn assert_roster(titles: &[DiscTitle], roster: &str, members: &[(u16, usize)]) {
             EpisodeEvidence::Authored {
                 roster: roster.into(),
                 title_count: titles.len(),
-                member: ordinal.is_some(),
                 ordinal,
             },
             "{}",
@@ -315,7 +314,6 @@ fn existing_episode_evidence_is_left_alone() {
     let prior = EpisodeEvidence::Authored {
         roster: "other".into(),
         title_count: titles.len(),
-        member: false,
         ordinal: None,
     };
     for t in &mut titles {

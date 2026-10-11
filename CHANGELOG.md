@@ -14,6 +14,7 @@
 
 - The unreleased DVD root-menu launch tracer: `TitleSelectionEvidence::dvd_launch` and the `DvdLaunchEvidence`, `DvdLaunchReviewReason`, `DvdLaunchRoute` and `DvdLaunchStep` types are gone. Most DVDs could not be traced, so it marked every title for review; per-title audio languages are already in each title's streams. The DVD static-menu episode roster is unchanged.
 - `NavigationSource`, `MovieSelectionBasis` and the `TitleSelectionEvidence` fields `navigation`, `authoring_hint`, `dvd_menu_reachable` and `movie_basis`. Nothing read them; main-feature ranking is unchanged and `titles[0]` is still the pick.
+- `EpisodeEvidence::Authored::member`: it always equalled `ordinal.is_some()`; read `ordinal` instead.
 
 ## [1.8.3] — 2026-10-08
 

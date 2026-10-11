@@ -151,7 +151,7 @@ fn dvd_menu_binary_partition_six_alternates_three_uneven_episodes() {
     assert_eq!(titles.len(), 8);
     for (i, title) in titles.iter().enumerate() {
         assert!(matches!(&title.selection_evidence.episodes,
-            EpisodeEvidence::Authored {title_count:8,member,..} if *member == (i<6)));
+            EpisodeEvidence::Authored {title_count:8,ordinal,..} if ordinal.is_some() == (i<6)));
         assert_eq!(
             match title.selection_evidence.episodes {
                 EpisodeEvidence::Authored { ordinal, .. } => ordinal,
@@ -208,13 +208,11 @@ fn dvd_menu_binary_unreachable_exact_alias_shares_member_ordinal() {
         let body = pgc(&[(100, last)], 0x40);
         vts[at..at + body.len()].copy_from_slice(&body);
         let titles = scan(vmg, vts, vob);
-        let EpisodeEvidence::Authored {
-            member: m, ordinal, ..
-        } = titles[7].selection_evidence.episodes
+        let EpisodeEvidence::Authored { ordinal, .. } = titles[7].selection_evidence.episodes
         else {
             panic!("roster expected");
         };
-        assert_eq!((m, ordinal), (member, member.then_some(1)));
+        assert_eq!(ordinal, member.then_some(1));
     }
 }
 
