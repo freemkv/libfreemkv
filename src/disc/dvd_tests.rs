@@ -2458,3 +2458,37 @@ fn dvd_nonsequential_playback_has_no_segments_and_no_roster() {
     assert!(!titles[0].selection_evidence.segments.is_empty());
     assert!((titles.iter()).all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown));
 }
+
+#[test]
+fn dvd_chained_next_pgc_has_no_segments_and_no_roster() {
+    let vmg = build_vmg(&(1..=8).map(|n| (1, 1, n)).collect::<Vec<_>>());
+    let (mut vts, at) = alternates_vts();
+    vts[at[6] + 0x9c..at[6] + 0x9e].copy_from_slice(&8u16.to_be_bytes()); // next PGCN
+    let (titles, _) = scan_disc(vmg, vts);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+    assert!((titles.iter()).all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown));
+}
+
+#[test]
+fn dvd_title_spanning_two_pgcs_has_no_segments_and_no_roster() {
+    let vmg = build_vmg(&(1..=8).map(|n| (1, 1, n)).collect::<Vec<_>>());
+    let (mut vts, _) = alternates_vts();
+    // Title 7 gains a second part-of-title entry, in PGC 8; title 8 moves one entry on.
+    let table = 2048;
+    let part8 = u32::from_be_bytes(
+        vts[table + 8 + 7 * 4..table + 12 + 7 * 4]
+            .try_into()
+            .unwrap(),
+    );
+    let part8 = part8 as usize;
+    vts[table + part8 + 4..table + part8 + 6].copy_from_slice(&8u16.to_be_bytes());
+    vts[table + part8 + 6..table + part8 + 8].copy_from_slice(&1u16.to_be_bytes());
+    vts[table + 8 + 7 * 4..table + 12 + 7 * 4].copy_from_slice(&(part8 as u32 + 4).to_be_bytes());
+    let last = u32::from_be_bytes(vts[table + 4..table + 8].try_into().unwrap());
+    vts[table + 4..table + 8].copy_from_slice(&(last + 4).to_be_bytes());
+    let (titles, _) = scan_disc(vmg, vts);
+    assert_eq!(titles.len(), 8);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!((titles.iter()).all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown));
+}

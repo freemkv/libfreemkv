@@ -350,8 +350,9 @@ impl Disc {
 
                 titles.push(DiscTitle {
                     selection_evidence: TitleSelectionEvidence {
-                        // Random and shuffle PGCs do not play their cells in this order.
-                        segments: match dvd_title.sequential {
+                        // Random, shuffle, chained and multi-PGC titles do not play just
+                        // these cells in this order.
+                        segments: match dvd_title.sequential && dvd_title.pgcs <= 1 {
                             true => ContentSegment::from_cell_extents(&extents),
                             false => Vec::new(),
                         },

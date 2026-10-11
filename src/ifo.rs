@@ -73,8 +73,8 @@ pub struct DvdTitle {
     /// The program (PGN) each chapter (part of title) starts at, from VTS_PTT_SRPT. `None`
     /// when the table does not hold the title; empty when a chapter lies in another PGC.
     pub ptt_programs: Option<Vec<u16>>,
-    /// PGC playback mode (PGC+0xA2) is sequential. Random and shuffle PGCs play
-    /// their programs out of cell order.
+    /// The PGC plays its cells in order and stops: sequential playback mode (PGC+0xA2)
+    /// and no next-PGC chain (PGC+0x9C). Random, shuffle and chained PGCs do not.
     pub sequential: bool,
 }
 
@@ -1342,7 +1342,7 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         vts_title_num: 0,
         pgcs: 0,
         ptt_programs: None,
-        sequential: byte_at(data, pgc_offset + 0xA2)? == 0,
+        sequential: byte_at(data, pgc_offset + 0xA2)? == 0 && be_u16(data, pgc_offset + 0x9C)? == 0,
     })
 }
 
