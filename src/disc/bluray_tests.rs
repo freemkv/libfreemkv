@@ -72,11 +72,16 @@ fn build_mpls(
     stream_entries: &[Vec<u8>],
     marks: &[MarkSpec],
 ) -> Vec<u8> {
-    let playlist_start: u32 = 40;
+    let playlist_start: u32 = 58;
     let mut buf = Vec::new();
     buf.extend_from_slice(b"MPLS0200"); // type+version
     buf.extend_from_slice(&playlist_start.to_be_bytes()); // [8..12]
     buf.extend_from_slice(&[0u8; 28]); // mark_start placeholder + pad to 40
+    // AppInfoPlayList: length(4) = 14, reserved(1), PlayList_playback_type(1) = 1
+    // (sequential), playback_count(2), UO_mask(8), flags(2).
+    buf.extend_from_slice(&14u32.to_be_bytes());
+    buf.extend_from_slice(&[0, 1]);
+    buf.extend_from_slice(&[0u8; 12]);
 
     // PlayList section: length(4) + reserved(2) + num_play_items(2)
     // + num_sub_paths(2) header.
@@ -2704,4 +2709,244 @@ fn read_meta_title_prefers_english_then_falls_back_to_first() {
         title_of(&["bdmt_fra.xml", "bdmt_deu.xml"]).as_deref(),
         Some("T-bdmt_fra.xml")
     );
+}
+
+// ---------------------------------------------------------------
+// Tests: the play-all roster over a whole scan
+// ---------------------------------------------------------------
+
+const EPISODE_TICKS: u32 = 1200 * 45000;
+
+fn episode_items(clips: &[&[u8; 5]]) -> Vec<PiSpec> {
+    (clips.iter())
+        .map(|&&clip_id| PiSpec {
+            clip_id,
+            in_time: 0,
+            out_time: EPISODE_TICKS,
+        })
+        .collect()
+}
+
+fn episode_mpls(clips: &[&[u8; 5]]) -> Vec<u8> {
+    build_mpls(&episode_items(clips), (0, 0, 0, 0, 0, 0, 0, 0), &[], &[])
+}
+
+// The play-all 00800 over clips 00001-00003; one playlist per clip (00001-00003).
+fn episode_playlists() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("00001.mpls", episode_mpls(&[b"00001"])),
+        ("00002.mpls", episode_mpls(&[b"00002"])),
+        ("00003.mpls", episode_mpls(&[b"00003"])),
+        ("00800.mpls", episode_mpls(&[b"00001", b"00002", b"00003"])),
+    ]
+}
+
+// Clips 00001-00003 on disc and `playlists` in PLAYLIST; playlist i's bytes sit at
+// partition LBA `30000 + 100 * i`.
+fn episodes_bd_fs(disc: &mut MemDisc, playlists: &[(&str, Vec<u8>)]) -> udf::UdfFs {
+    let mut streams = Vec::new();
+    let mut clipinf = Vec::new();
+    for n in 1..=3u32 {
+        let name = format!("{n:05}");
+        let m2ts = format!("{name}.m2ts");
+        streams.push(file(&m2ts, 100 + n, 5000 * n, 1000 * 2048, true));
+        let clpi = build_clpi(4000);
+        clipinf.push(file_with(
+            &format!("{name}.clpi"),
+            110 + n,
+            20000 + n,
+            clpi,
+            false,
+        ));
+    }
+    let files = (playlists.iter().enumerate())
+        .map(|(i, (name, bytes))| {
+            let i = i as u32;
+            file_with(name, 120 + i, 30000 + 100 * i, bytes.clone(), false)
+        })
+        .collect();
+    let dir = |name: &str, icb_lba, files, subdirs| DirSpec {
+        name: name.to_string(),
+        icb_lba,
+        dir_data_lba: icb_lba + 1,
+        files,
+        subdirs,
+    };
+    let bdmv = dir(
+        "BDMV",
+        20,
+        vec![],
+        vec![
+            dir("STREAM", 22, streams, vec![]),
+            dir("CLIPINF", 24, clipinf, vec![]),
+            dir("PLAYLIST", 26, files, vec![]),
+        ],
+    );
+    build_udf_skeleton(disc, 10);
+    lay_dir(disc, &dir("", 10, vec![], vec![bdmv]));
+    udf::read_filesystem(disc).expect("fs")
+}
+
+fn scan_episodes(playlists: &[(&str, Vec<u8>)]) -> Vec<DiscTitle> {
+    let mut disc = MemDisc::new();
+    let udf = episodes_bd_fs(&mut disc, playlists);
+    Disc::scan_bluray_titles(&mut disc, &udf, None).expect("scan")
+}
+
+// (playlist id, ordinal) for each title of the 00800 roster; None when not Authored by it.
+fn bd_roster(titles: &[DiscTitle]) -> Option<Vec<(u16, Option<usize>)>> {
+    (titles.iter())
+        .map(|t| match &t.selection_evidence.episodes {
+            EpisodeEvidence::Authored {
+                roster,
+                title_count,
+                ordinal,
+            } if roster == "bd-playall-partition-v1:800" && *title_count == titles.len() => {
+                Some((t.playlist_id, *ordinal))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_no_roster(titles: &[DiscTitle]) {
+    for t in titles {
+        assert_eq!(
+            t.selection_evidence.episodes,
+            EpisodeEvidence::Unknown,
+            "{}",
+            t.playlist
+        );
+    }
+}
+
+#[test]
+fn scan_bluray_titles_annotates_the_playall_roster() {
+    let titles = scan_episodes(&episode_playlists());
+    assert_eq!(
+        bd_roster(&titles),
+        Some(vec![(1, Some(0)), (2, Some(1)), (3, Some(2)), (800, None)])
+    );
+}
+
+// A short menu playlist is filtered on purpose, not lost: it does not hold the roster.
+#[test]
+fn a_short_playlist_does_not_hold_the_bd_roster() {
+    let mut playlists = episode_playlists();
+    let menu = build_mpls(
+        &[PiSpec {
+            clip_id: *b"00001",
+            in_time: 0,
+            out_time: 5 * 45000,
+        }],
+        (0, 0, 0, 0, 0, 0, 0, 0),
+        &[],
+        &[],
+    );
+    playlists.push(("00900.mpls", menu));
+    let titles = scan_episodes(&playlists);
+    assert_eq!(titles.len(), 4);
+    assert!(bd_roster(&titles).is_some());
+}
+
+// A playlist that cannot be read could be a competing play-all: no roster.
+#[test]
+fn an_unreadable_playlist_holds_the_bd_roster() {
+    struct Failing<'a>(&'a mut MemDisc, u32);
+    impl SectorSource for Failing<'_> {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], rec: bool) -> Result<usize> {
+            if lba == self.1 {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(0x02),
+                    sense: None,
+                });
+            }
+            self.0.read_sectors(lba, n, buf, rec)
+        }
+    }
+    let mut playlists = episode_playlists();
+    playlists.push(("00900.mpls", episode_mpls(&[b"00001", b"00002"])));
+    let mut disc = MemDisc::new();
+    let udf = episodes_bd_fs(&mut disc, &playlists);
+    let mut reader = Failing(&mut disc, PART_START + 30400); // 00900.mpls
+    let titles = Disc::scan_bluray_titles(&mut reader, &udf, None).expect("scan");
+    assert_eq!(titles.len(), 4);
+    assert_no_roster(&titles);
+}
+
+#[test]
+fn an_unparseable_playlist_holds_the_bd_roster() {
+    let mut playlists = episode_playlists();
+    playlists.push(("00900.mpls", b"MPLS0200 not a playlist".to_vec()));
+    let titles = scan_episodes(&playlists);
+    assert_eq!(titles.len(), 4);
+    assert_no_roster(&titles);
+}
+
+#[test]
+fn a_playlist_naming_a_missing_clip_holds_the_bd_roster() {
+    let mut playlists = episode_playlists();
+    playlists.push(("00900.mpls", episode_mpls(&[b"00001", b"00009"])));
+    let titles = scan_episodes(&playlists);
+    assert_eq!(titles.len(), 4);
+    assert_no_roster(&titles);
+}
+
+// Cut inside the play-all's third PlayItem: what is left, [00001, 00002], would
+// otherwise prove a two-episode roster that leaves episode 3 out.
+fn truncated_playall() -> Vec<u8> {
+    let full = episode_mpls(&[b"00001", b"00002", b"00003"]);
+    let two = episode_mpls(&[b"00001", b"00002"]);
+    let mark_start = u32::from_be_bytes(two[12..16].try_into().unwrap()) as usize;
+    full[..mark_start + 10].to_vec()
+}
+
+#[test]
+fn a_truncated_playlist_has_no_segments() {
+    let mut disc = MemDisc::new();
+    let udf = episodes_bd_fs(&mut disc, &[]);
+    let t = Disc::parse_playlist(&mut disc, &udf, "00800.mpls", &truncated_playall())
+        .expect("scan")
+        .expect("title");
+    assert_eq!(t.clips.len(), 2, "the items before the damage are kept");
+    assert!(t.selection_evidence.segments.is_empty());
+}
+
+#[test]
+fn a_truncated_playlist_holds_the_bd_roster() {
+    let mut playlists = episode_playlists();
+    playlists[3].1 = truncated_playall();
+    let titles = scan_episodes(&playlists);
+    assert_eq!(titles.len(), 4);
+    assert_no_roster(&titles);
+}
+
+// PlayList_playback_type 2 (random) and 3 (shuffle) do not play the items in order.
+#[test]
+fn a_random_or_shuffle_playlist_has_no_segments() {
+    let mut disc = MemDisc::new();
+    let udf = episodes_bd_fs(&mut disc, &[]);
+    for (kind, described) in [(1u8, true), (2, false), (3, false), (0, false)] {
+        let mut mpls = episode_mpls(&[b"00001", b"00002"]);
+        mpls[45] = kind;
+        let t = Disc::parse_playlist(&mut disc, &udf, "00800.mpls", &mpls)
+            .expect("scan")
+            .expect("title");
+        assert_eq!(t.clips.len(), 2);
+        assert_eq!(
+            !t.selection_evidence.segments.is_empty(),
+            described,
+            "playback type {kind}"
+        );
+    }
+}
+
+#[test]
+fn a_shuffle_playall_is_no_wrapper() {
+    let mut playlists = episode_playlists();
+    playlists[3].1[45] = 3;
+    let titles = scan_episodes(&playlists);
+    assert_eq!(titles.len(), 4);
+    assert_no_roster(&titles);
 }

@@ -20,6 +20,12 @@ pub(crate) struct Playlist {
     pub streams: Vec<StreamEntry>,
     /// Playlist marks (chapter points, etc.)
     pub marks: Vec<PlaylistMark>,
+    /// AppInfoPlayList PlayList_playback_type (byte 45): 1 sequential, 2 random,
+    /// 3 shuffle. `None` when the header has no AppInfoPlayList before the PlayList.
+    pub playback_type: Option<u8>,
+    /// A PlayItem was dropped or the list was cut short: `play_items` is not the
+    /// whole playlist.
+    pub truncated: bool,
 }
 
 /// A playlist mark entry from the PlayListMark section.
@@ -97,7 +103,7 @@ pub struct StreamEntry {
 ///
 /// `data` is the raw contents of a `BDMV/PLAYLIST/*.mpls` file. Returns
 /// [`Error::MplsParse`] on a malformed header, or when truncation leaves no play item;
-/// a truncated item list keeps the items before the damage (warned).
+/// a truncated item list keeps the items before the damage (warned, `truncated`).
 ///
 /// Note: [`Playlist::streams`] is extracted ONLY from the first play
 /// item's STN table. Multi-item playlists whose later items carry a
@@ -119,6 +125,11 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         return Err(Error::MplsParse);
     }
 
+    // AppInfoPlayList sits at byte 40: length(4), reserved(1), playback type(1).
+    let playback_type = (playlist_start >= 46
+        && u32::from_be_bytes([data[40], data[41], data[42], data[43]]) >= 2)
+        .then(|| data[45]);
+
     let pl = &data[playlist_start..];
     let num_play_items = u16::from_be_bytes([pl[6], pl[7]]) as usize;
 
@@ -129,6 +140,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     let mut streams = Vec::new();
     let mut pos = 10;
     let mut truncated = false;
+    let mut dropped = false;
 
     for item_idx in 0..num_play_items {
         // A truncated item ends the list; the items parsed so far are kept.
@@ -150,6 +162,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                 item_length,
                 "play item too short to read; it is dropped from the playlist"
             );
+            dropped = true;
             pos += 2 + item_length;
             continue;
         }
@@ -349,6 +362,8 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         play_items,
         streams,
         marks,
+        playback_type,
+        truncated: truncated || dropped,
     })
 }
 
@@ -362,6 +377,11 @@ fn stn_entry_unreadable(kind: &str) {
 }
 
 impl Playlist {
+    /// The items play once each, in order, with none missing.
+    pub fn plays_in_order(&self) -> bool {
+        self.playback_type == Some(1) && !self.truncated
+    }
+
     /// Total play-item running time in 45 kHz ticks (out_time - in_time, summed).
     pub fn duration_ticks(&self) -> u64 {
         self.play_items

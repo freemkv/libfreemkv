@@ -52,6 +52,8 @@ fn playlist_on(clip_id: &str, streams: Vec<StreamEntry>) -> Playlist {
         }],
         streams,
         marks: Vec::new(),
+        playback_type: Some(1),
+        truncated: false,
     }
 }
 

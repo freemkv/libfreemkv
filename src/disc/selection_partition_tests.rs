@@ -91,7 +91,7 @@ fn assert_roster(titles: &[DiscTitle], roster: &str, members: &[(u16, usize)]) {
 }
 
 fn run(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "bd-playall-partition-v1");
+    annotate(&mut titles, "bd-playall-partition-v1", true);
     titles
 }
 
@@ -314,6 +314,34 @@ fn clip_cap_is_unknown() {
     assert_unknown(&run(titles));
 }
 
+// Exactly at either cap the partition still runs; the `+ 1` tests above are past it.
+fn blue_planet_ii_roster(titles: &[DiscTitle]) {
+    let members = [(166, 0), (147, 0), (167, 1), (148, 1)];
+    assert_roster(titles, "bd-playall-partition-v1:163", &members);
+}
+
+#[test]
+fn title_cap_itself_keeps_the_roster() {
+    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let pad = u16::try_from(MAX_TITLES - titles.len()).unwrap();
+    titles.extend((1000..1000 + pad).map(short_extra));
+    assert_eq!(titles.len(), MAX_TITLES);
+    blue_planet_ii_roster(&run(titles));
+}
+
+#[test]
+fn clip_cap_itself_keeps_the_roster() {
+    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let used: usize = titles.iter().map(|t| t.clips.len()).sum();
+    let menu = format!("00014:524280-2710839*{}", MAX_SEGMENTS - used);
+    titles.push(scanned(&format!("00162 | {menu}")));
+    let total: usize = (titles.iter())
+        .map(|t| t.selection_evidence.segments.len())
+        .sum();
+    assert_eq!(total, MAX_SEGMENTS);
+    blue_planet_ii_roster(&run(titles));
+}
+
 #[test]
 fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
     let groups = vec![vec![1, 2], vec![1], vec![2], vec![]];
@@ -326,7 +354,7 @@ fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
 }
 
 fn run_dvd(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "dvd-playall-partition-v1");
+    annotate(&mut titles, "dvd-playall-partition-v1", true);
     titles
 }
 

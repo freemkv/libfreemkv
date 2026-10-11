@@ -380,7 +380,7 @@ impl Disc {
             return Err(Error::Halted);
         }
         warn_multi_pgc_titles(&vmg_bytes, &dvd_info);
-        super::selection_partition::annotate(&mut titles, "dvd-playall-partition-v1");
+        super::selection_partition::annotate(&mut titles, "dvd-playall-partition-v1", true);
         Ok((titles, nav_feature, dvd_region(dvd_info.region_mask)))
     }
 }

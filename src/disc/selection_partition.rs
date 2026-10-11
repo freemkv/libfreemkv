@@ -57,11 +57,14 @@ impl<'a, T: Eq + Hash> Prefixes<'a, T> {
 
 /// Annotate every title from one proven play-all partition, or leave all Unknown.
 /// `producer` names the calling scanner's roster, e.g. `bd-playall-partition-v1`.
-pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str) {
-    let Some((wrapper, ordinals)) = partition(titles) else {
+/// `complete` is false when the scanner dropped or cut a title it should have
+/// described: the missing one could compete with any partition of the rest.
+pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str, complete: bool) {
+    let Some((wrapper, ordinals)) = complete.then(|| partition(titles)).flatten() else {
         tracing::debug!(
             target: "freemkv::scan",
             producer,
+            complete,
             "no unique play-all partition; episode selection needs review"
         );
         return;
