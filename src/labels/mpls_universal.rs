@@ -78,7 +78,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // MPLS gives language + codec but never editorial info. Low confidence
     // means framework parsers always win when they match; MPLS is only
     // chosen when nothing else fired — the universal-fallback role we want.
-    Some(ParseResult::low(labels))
+    Some(ParseResult::low(labels).structural())
 }
 
 // Converts stream entries into StreamLabels; identity is (clip, PID).
