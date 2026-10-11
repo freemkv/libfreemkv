@@ -73,6 +73,8 @@ pub const E_IMAGE_SCOPED: u16 = 6022;
 /// An HD-DVD `ADV_OBJ/VPLST*.XPL` playlist exceeds the parser's size cap. Logged by
 /// `disc::hddvd`, which then falls back to the per-clip heuristic; no [`Error`] variant.
 pub const E_XPL_TOO_LARGE: u16 = 6023;
+/// A BD+ conversion table does not parse: truncated, or over the 4 MiB cap.
+pub const E_BDPLUS_TABLE_INVALID: u16 = 6024;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -538,6 +540,11 @@ pub enum Error {
     /// identifier (e.g. `"status_char"`, `"hex"`); not a translatable
     /// English message.
     MapfileInvalid {
+        kind: &'static str,
+    },
+    /// See [`E_BDPLUS_TABLE_INVALID`]. `kind` is a stable identifier (`"truncated"`,
+    /// `"too_large"`).
+    BdPlusTableInvalid {
         kind: &'static str,
     },
     /// The image a mapfile describes is shorter than the mapfile's own total
@@ -1053,6 +1060,7 @@ impl Error {
             Error::NoStreams => E_NO_STREAMS,
             Error::SelectionPidUnknown { .. } => E_SELECTION_PID_UNKNOWN,
             Error::MapfileInvalid { .. } => E_MAPFILE_INVALID,
+            Error::BdPlusTableInvalid { .. } => E_BDPLUS_TABLE_INVALID,
             Error::ImageTruncated { .. } => E_IMAGE_TRUNCATED,
             Error::ImageEndsBeforeRead { .. } => E_IMAGE_ENDS_BEFORE_READ,
             Error::BusStreamUnmapped { .. } => E_BUS_STREAM_UNMAPPED,
@@ -1186,7 +1194,7 @@ impl std::fmt::Display for Error {
             Error::PlatformNotImplemented { platform } => {
                 write!(f, "E{}: {}", self.code(), platform)
             }
-            Error::MapfileInvalid { kind } => {
+            Error::MapfileInvalid { kind } | Error::BdPlusTableInvalid { kind } => {
                 write!(f, "E{}: {}", self.code(), kind)
             }
             Error::UnsupportedDrive {

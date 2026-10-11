@@ -508,6 +508,7 @@ fn build_iso_pipeline_empty_extents_clean_eof() {
         ContentFormat::BdTs,
         false,
         &crate::ctx::Ctx::default(),
+        None,
     )
     .expect("pipeline builds");
     let first = stream.read().expect("read must not error on clean EOF");
@@ -548,6 +549,7 @@ fn build_iso_pipeline_delivers_one_frame_then_eof() {
         ContentFormat::BdTs,
         false,
         &crate::ctx::Ctx::default(),
+        None,
     )
     .expect("pipeline builds");
 
@@ -639,6 +641,7 @@ fn build_iso_pipeline_pruned_title_drops_unselected_pid_frames() {
         ContentFormat::BdTs,
         false,
         &crate::ctx::Ctx::default(),
+        None,
     )
     .expect("pipeline builds");
 
@@ -678,6 +681,7 @@ fn build_iso_pipeline_zero_batch_rejected() {
         ContentFormat::BdTs,
         false,
         &crate::ctx::Ctx::default(),
+        None,
     );
     assert!(res.is_err(), "zero batch_sectors must be rejected");
 }
@@ -718,6 +722,7 @@ fn build_iso_pipeline_dvd_none_keys_scrambled_hard_fails() {
         ContentFormat::DvdPs,
         false,
         &crate::ctx::Ctx::default(),
+        None,
     );
     assert!(
         res.is_err(),

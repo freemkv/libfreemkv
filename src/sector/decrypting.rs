@@ -64,6 +64,9 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// HD DVD: the sector after the last read and the CPI in force there, so a read that
     /// continues it decrypts the packs before its first NV_PCK.
     hd_cpi: Option<(u32, Option<crate::aacs::hddvd::Cpi>)>,
+    /// BD+ patches written over every read once decrypted and damage-blanked: title
+    /// readers only, never a whole-disc image.
+    bdplus: Option<Arc<crate::bdplus::DiscFixups>>,
 }
 
 // HD DVD: how far back a read that starts mid-EVOBU looks for the NV_PCK leading it, and in
@@ -168,6 +171,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             watch_css: false,
             refused: false,
             hd_cpi: None,
+            bdplus: None,
         };
         match keying.into().0 {
             KeyingKind::Keys(keys) => s.keys = keys,
@@ -191,6 +195,11 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     pub(crate) fn keyed_for_test(mut self, map: Arc<crate::decrypt::AacsKeyMap>) -> Self {
         self.key_map = Some(map);
         self
+    }
+
+    /// Patch every read with `fixups` (a resolved BD+ table) after decryption.
+    pub(crate) fn set_bdplus(&mut self, fixups: Arc<crate::bdplus::DiscFixups>) {
+        self.bdplus = Some(fixups);
     }
 
     /// Report each blanked unit to `ctx` too: an `UnitBlanked` event and its loss counter.
@@ -348,6 +357,32 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
+        let n = self.read_decrypted(lba, count, buf, recovery, fua)?;
+        if let Some(fixups) = &self.bdplus {
+            fixups.apply(lba, &mut buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn set_speed(&mut self, kbs: u16) {
+        self.inner.set_speed(kbs)
+    }
+
+    fn set_unit_base(&mut self, lba: u32) {
+        self.unit_base = Some(lba);
+    }
+}
+
+impl<S: SectorSource> DecryptingSectorSource<S> {
+    // One read: inner read, damage blanking, arrival proof, decrypt.
+    fn read_decrypted(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
         if self.refused {
             return Err(crate::error::Error::CssKeyMissing);
         }
@@ -432,14 +467,6 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // (misalignment, or mapless AACS here — a bug) fails loud; broken TS is the muxer's concern.
         Self::decrypt_buf(&mut buf[..n], &mut self.keys, lba, content_ref)?;
         Ok(n)
-    }
-
-    fn set_speed(&mut self, kbs: u16) {
-        self.inner.set_speed(kbs)
-    }
-
-    fn set_unit_base(&mut self, lba: u32) {
-        self.unit_base = Some(lba);
     }
 }
 

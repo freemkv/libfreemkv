@@ -351,6 +351,7 @@ fn clear_disc() -> Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: crate::disc::ContentFormat::BdTs,
     }
 }

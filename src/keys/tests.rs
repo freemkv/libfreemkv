@@ -133,6 +133,7 @@ fn disc_over(
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: if format == DiscFormat::HdDvd {
             ContentFormat::MpegPs
         } else {
@@ -1106,7 +1107,7 @@ fn drain_keyed_image<S: SectorSource + Send + 'static>(
     let policy = crate::sector::read_stage::ReadPolicy::Image { batch: 30 };
     let ctx = crate::ctx::Ctx::default();
     let mut stream =
-        crate::mux::resolve::build_keyed_pipeline(src, title, set, policy, &ctx).unwrap();
+        crate::mux::resolve::build_keyed_pipeline(src, title, set, policy, &ctx, None).unwrap();
     loop {
         match stream.read() {
             Ok(Some(_)) => continue,
@@ -2458,6 +2459,7 @@ fn live_stream_stops_on_an_unkeyed_piece_without_recovery() {
             &set,
             policy,
             &crate::ctx::Ctx::default(),
+            None,
         )
         .unwrap();
         let got = loop {
@@ -2585,6 +2587,7 @@ fn keyless_set_over_overlapping_extents_stops_e7022() {
             &set,
             policy,
             &crate::ctx::Ctx::default(),
+            None,
         )
         .unwrap();
         // Start past the inner extent: its first read is unit 4 of the outer one.

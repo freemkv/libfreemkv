@@ -2383,6 +2383,7 @@ fn disc_capacity_gb() {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: ContentFormat::BdTs,
     };
     let gb = disc.capacity_gb();
@@ -2416,6 +2417,7 @@ fn image_read_sectors_rejects_zero_capacity() {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: ContentFormat::BdTs,
     };
     assert_eq!(disc.image_read_sectors().expect("nonzero"), 12_219_392);
@@ -2541,6 +2543,7 @@ fn read_capacity_retrying_gives_up_as_zero_and_that_blocks_imaging() {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: ContentFormat::BdTs,
     };
     assert!(
@@ -3152,6 +3155,7 @@ fn make_test_disc(sectors: u32, name: &str) -> Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: ContentFormat::BdTs,
     }
 }

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- BD+ detection, resolution and repair (`bdplus`). A BD+ disc ripped with AACS alone decodes with glitches where its clips were mastered damaged; libfreemkv now sees it, and repairs it when a conversion table is available.
+  - Detection: the scan sets `Disc::bdplus: Option<BdPlusInfo>` when `BDSVM/00000.svm` exists: the header of `00000.svm` (`SvmHeader`: raw bytes, `magic_ok`, the five uninterpreted bytes at 0x08, date, payload length, `is_well_formed()`), every `.svm` in `BDSVM/` and `BDSVM/BACKUP/` with its size (`has_backup()`, `has_extra_svm()`), and the stream files' disc extents (internal). `estimated_generation()` is the libbdplus date bucket (0-16, never 12): a heuristic for display and reports, not a disc field; nothing branches on it. `Disc::read_structure_files` (`info --share`) adds the 24-byte header of each `BDSVM/*.svm`.
+  - Tables: `ConversionTable::parse_activated` / `parse_delivered` read the libbdplus `convtab.bin` layout (`ClipTable`, `Segment`, `Entry`, `EntryKind`); `ClipTable::patches()` gives the 5-byte `Patch`es in offset order as a `PatchSet`, rejecting malformed entries one by one (offset outside 8..=187, unsorted) and leaving encrypted segments out. Forensic entries apply by the segment mask, or always in an activated table. `apply_patches` writes patches into any buffer of a clip, straddles included.
+  - Sources: `ConversionTableSource` (`name`, `lookup(&BdPlusDiscId)`) is the seam a future VM-based resolver plugs into. `NoTables` has none; `TableDir` reads `<dir>/<disc hash>.bin`, `<dir>/<Volume ID>/convtab.bin` or `<dir>/<Media Key>.bin`. `BdPlusDiscId::of(&disc)` carries the KEYDB disc hash and, when known, the Volume ID (`with_media_key` adds a Media Key; `Debug` redacts both).
+  - Resolution: `BdPlusResolution::resolve(&disc, &[sources])` (`None` for a non-BD+ disc; `resolve_id`, `from_table`) yields `BdPlusStatus::Unresolved` or `Resolved { source, clips, entries }`; `patches_applied()` counts patches written. Attach it with `Source::with_bdplus`.
+  - Repair: every title read (all mux sinks, from a drive, an image, a folder or a raw reader) is patched after AACS decryption and damage blanking, by disc byte address, so seeks, resumes, retries, multi-extent clips and any batch size patch alike. Whole-disc images (`iso://` copies, `dir://` extracts) are never patched: an image stays a faithful copy and is repaired when a title is muxed from it. `--raw` muxes are never patched. A patch in a packet whose TS sync is gone (a blanked unit) is skipped.
+  - Signals: `Event::BdPlusResolved { source, clips, entries }` or `Event::BdPlusUnresolved { info }`, once per mux before reading. With no resolution attached, a disc, image or folder source whose scan found BD+ reports `BdPlusUnresolved` and muxes byte-for-byte as before. No mux is refused.
+- `E_BDPLUS_TABLE_INVALID` (E6024) / `Error::BdPlusTableInvalid { kind }`: a conversion table that is truncated or over 4 MiB (io kind `InvalidData`).
+
+### Changed
+
+- **Breaking:** `Disc` gains public field `bdplus`; struct-literal builds must set it (`None`).
+
 ## [1.8.4] — 2026-10-11
 
 ### Added

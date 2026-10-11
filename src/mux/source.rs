@@ -60,6 +60,8 @@ fn disc_name(d: &Disc) -> String {
 /// An opened input: where PES frames come from, and the layout probed from it.
 pub struct Source<'a> {
     pub(crate) origin: Origin<'a>,
+    // The caller's BD+ resolution (`with_bdplus`).
+    pub(crate) bdplus: Option<crate::bdplus::BdPlusResolution>,
 }
 
 pub(crate) enum Origin<'a> {
@@ -72,7 +74,7 @@ pub(crate) enum Origin<'a> {
         path: PathBuf,
         folder: bool,
         reader: Box<dyn SectorSource>,
-        disc: Disc,
+        disc: Box<Disc>,
     },
     // An image file read with a title the caller scanned elsewhere (J14): opened at read
     // time, never rescanned.
@@ -119,7 +121,7 @@ pub fn open_source(url: &str, mut probe: ScanOptions, ctx: &Ctx) -> Result<Sourc
                 path,
                 folder: false,
                 reader,
-                disc,
+                disc: Box::new(disc),
             }
         }
         StreamUrl::Dir { path } => {
@@ -129,7 +131,7 @@ pub fn open_source(url: &str, mut probe: ScanOptions, ctx: &Ctx) -> Result<Sourc
                 path,
                 folder: true,
                 reader,
-                disc,
+                disc: Box::new(disc),
             }
         }
         StreamUrl::Unknown { raw } => return Err(Error::StreamUrlInvalid { url: raw }),
@@ -141,7 +143,7 @@ pub fn open_source(url: &str, mut probe: ScanOptions, ctx: &Ctx) -> Result<Sourc
             None => return Err(Error::StreamWriteOnly),
         },
     };
-    Ok(Source { origin })
+    Ok(Source::of(origin))
 }
 
 /// The one image probe (`iso://` file or `dir://` folder): scan the image, and judge a
@@ -166,32 +168,44 @@ pub(crate) fn probe_image(
 }
 
 impl<'a> Source<'a> {
+    pub(crate) fn of(origin: Origin<'a>) -> Self {
+        Source {
+            origin,
+            bdplus: None,
+        }
+    }
+
+    /// Patch this source's titles with `resolution` (resolved for the disc this source
+    /// reads, sector for sector), and report it as `Event::BdPlusResolved` or
+    /// `BdPlusUnresolved`. Without one, a disc, image or folder whose scan found BD+
+    /// reports `BdPlusUnresolved`; a container or stream input ignores it. A resolution
+    /// for another disc than this source's scanned one is ignored (logged). `--raw`
+    /// muxes are never patched.
+    pub fn with_bdplus(mut self, resolution: crate::bdplus::BdPlusResolution) -> Self {
+        self.bdplus = Some(resolution);
+        self
+    }
+
     /// A live drive the caller opened and scanned; the session stays the caller's, so it
     /// still locks, ejects and finishes the tray. Its drive is staged as the reader here.
     pub fn from_session(session: &'a mut DiscSession) -> Source<'a> {
-        Source {
-            origin: Origin::Session(session),
-        }
+        Source::of(Origin::Session(session))
     }
 
     /// The image file at `path` read with a title the caller already scanned (the drive's,
     /// J14): it is never rescanned, so a sweep's unread filesystem sectors do not matter.
     /// The mux reads this one title whatever `MuxOptions::title_index` says.
     pub fn from_image(path: &Path, title: ScannedTitle) -> Source<'static> {
-        Source {
-            origin: Origin::Prescanned {
-                path: path.to_path_buf(),
-                title,
-            },
-        }
+        Source::of(Origin::Prescanned {
+            path: path.to_path_buf(),
+            title,
+        })
     }
 
     /// A raw live reader the caller holds, with the title scanned off it (read like
     /// [`Self::from_image`]'s, whatever `MuxOptions::title_index` says).
     pub fn from_reader(reader: Box<dyn SectorSource>, title: ScannedTitle) -> Source<'static> {
-        Source {
-            origin: Origin::Live { reader, title },
-        }
+        Source::of(Origin::Live { reader, title })
     }
 
     /// The probed layout: the scanned disc for `disc://`, `iso://`, `dir://` and the
@@ -227,7 +241,7 @@ impl<'a> Source<'a> {
     /// (`iso://`, `dir://`). `None` for every other input.
     pub fn into_image(self) -> Option<(Disc, Box<dyn SectorSource>)> {
         match self.origin {
-            Origin::Image { reader, disc, .. } => Some((disc, reader)),
+            Origin::Image { reader, disc, .. } => Some((*disc, reader)),
             _ => None,
         }
     }

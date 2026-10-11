@@ -180,6 +180,7 @@ fn run_to_fvi(image: Vec<u8>, title: DiscTitle, path: &std::path::Path) {
         ContentFormat::MpegPs,
         false,
         &crate::ctx::Ctx::default(),
+        None,
     )
     .expect("pipeline builds");
 

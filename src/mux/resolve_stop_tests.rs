@@ -19,7 +19,7 @@ where
     if folder {
         crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)?;
     }
-    image_input_scanned(reader, disc, opts, ctx)
+    image_input_scanned(reader, disc, opts, ctx, None)
 }
 use crate::pes::PesSource as _;
 use crate::sector::SectorSource;

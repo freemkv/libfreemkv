@@ -71,6 +71,8 @@ pub mod aacs;
 #[cfg(feature = "rip")]
 pub(crate) mod bdnav;
 #[cfg(feature = "rip")]
+pub mod bdplus;
+#[cfg(feature = "rip")]
 pub(crate) mod clpi;
 #[cfg(feature = "rip")]
 pub mod consts;

@@ -1076,6 +1076,7 @@ fn aacs_session_disc(title: DiscTitle) -> crate::disc::Disc {
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: crate::ContentFormat::BdTs,
     }
 }
@@ -1914,6 +1915,7 @@ fn disc_with_css(format: crate::disc::DiscFormat) -> crate::disc::Disc {
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: crate::disc::ContentFormat::MpegPs,
     }
 }

@@ -85,6 +85,9 @@ pub struct Disc {
     pub css_error: Option<crate::error::Error>,
     /// Content format (BD transport stream vs DVD program stream)
     pub content_format: ContentFormat,
+    /// BD+ found on the disc (`BDSVM/00000.svm` present); `None` otherwise. A BD+ title
+    /// muxed without a resolved table may show glitches: see [`crate::bdplus`].
+    pub bdplus: Option<crate::bdplus::BdPlusInfo>,
 }
 
 /// Content format — determines how sectors are interpreted downstream.
@@ -2421,14 +2424,13 @@ impl Disc {
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
-    /// Read a disc's **structure metadata** for diagnostics — `(relative_path,
-    /// bytes)` for each present index file that drives title enumeration and
-    /// main-feature selection: `BDMV/index.bdmv`, `MovieObject.bdmv`,
-    /// `PLAYLIST/*.mpls`, `CLIPINF/*.clpi`, `BDJO/*.bdjo`, `META/DL/*.xml`, DVD
-    /// `VIDEO_TS/*.IFO`. No audio/video essence and no AACS keys are read, so the
-    /// result is safe to share in a bug report (a few hundred KB); missing files
-    /// are skipped. Capped at 8192 files / 64 MiB; unsafe disc names are dropped; a
-    /// Stop returns [`Error::Halted`]. Powers `freemkv info … --share` (issue #45).
+    /// Read a disc's **structure metadata** for diagnostics — `(relative_path, bytes)` for
+    /// each present file that drives title enumeration and main-feature selection
+    /// (`BDMV/index.bdmv`, `MovieObject.bdmv`, `PLAYLIST/*.mpls`, `CLIPINF/*.clpi`,
+    /// `BDJO/*.bdjo`, `META/DL/*.xml`, DVD `VIDEO_TS/*.IFO`), plus the 24-byte header only of
+    /// each `BDSVM/*.svm` (BD+). No essence and no AACS keys, so it is safe to share in a bug
+    /// report; missing files are skipped. Capped at 8192 files / 64 MiB; unsafe names are
+    /// dropped; a Stop returns [`Error::Halted`]. Powers `freemkv info … --share` (#45).
     pub fn read_structure_files(reader: &mut dyn SectorSource) -> Result<Vec<(String, Vec<u8>)>> {
         // Aggregate caps: a crafted image can list thousands of large files.
         const MAX_FILES: usize = 8192;
@@ -2474,6 +2476,12 @@ impl Disc {
         ] {
             wanted.extend(list(dir, &|n: &str| n.to_ascii_lowercase().ends_with(ext)));
         }
+        let svm = list("BDSVM", &|n: &str| n.to_ascii_lowercase().ends_with(".svm"));
+        let header = crate::bdplus::SVM_HEADER_LEN as u64;
+        wanted.extend(
+            svm.into_iter()
+                .map(|(rel, size, icb)| (rel, size.min(header), icb)),
+        );
 
         let mut out: Vec<(String, Vec<u8>)> = Vec::new();
         let mut total: u64 = 0;
@@ -2488,12 +2496,17 @@ impl Disc {
                 omitted += 1;
                 continue;
             }
-            // Bounded by the declared size, so a lying ICB cannot exceed the budget.
-            let read = FileReadAhead::new(reader, &udf_fs, icb).and_then(|mut ra| {
-                udf_fs.read_file_prefix(&mut ra, &format!("/{rel}"), size as usize)
-            });
+            // Bounded by the declared size, so a lying ICB cannot exceed the budget. An SVM
+            // header is one sector: no read-ahead into its 20 MB file.
+            let path = format!("/{rel}");
+            let read = match rel.starts_with("BDSVM/") {
+                true => udf_fs.read_file_prefix(reader, &path, size as usize),
+                false => FileReadAhead::new(reader, &udf_fs, icb)
+                    .and_then(|mut ra| udf_fs.read_file_prefix(&mut ra, &path, size as usize)),
+            };
             match read {
-                Ok(bytes) => {
+                Ok(mut bytes) => {
+                    bytes.truncate(size as usize);
                     total += bytes.len() as u64;
                     out.push((rel, bytes));
                 }
@@ -2662,6 +2675,7 @@ impl Disc {
         // runs bus-auth. The reader-based crack is NOT run here: on a CSS disc it would
         // fail ~50,000 sectors one-by-one.
         let css = None;
+        let bdplus = crate::bdplus::detect(reader, &udf_fs)?;
 
         tracing::info!(
             target: "freemkv::scan",
@@ -2688,6 +2702,7 @@ impl Disc {
             // which set this when they observe scrambled-but-uncracked content.
             css_error: None,
             content_format,
+            bdplus,
         };
 
         // Structured scan diagnostic block (--log-level 3): emits per-title/stream/

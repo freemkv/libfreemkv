@@ -16,6 +16,7 @@ fn disc(format: DiscFormat) -> Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: ContentFormat::BdTs,
     }
 }

@@ -3,6 +3,7 @@
 //! A stage emits through [`Ctx::events`](crate::Ctx); a consumer implements [`Events`] once
 //! and matches the variants it renders. Data only: no display logic, no English text.
 
+use crate::bdplus::BdPlusInfo;
 use crate::disc::DiscTitle;
 use crate::progress::PassProgress;
 
@@ -36,6 +37,17 @@ pub enum Event<'a> {
     OutputOpened {
         title: &'a DiscTitle,
         file: Option<(u64, u64)>,
+    },
+    /// The title being muxed is on a BD+ disc and no conversion table resolved: it passes
+    /// through unpatched and may show glitches. Emitted once, before reading.
+    BdPlusUnresolved { info: &'a BdPlusInfo },
+    /// The title being muxed is patched with the conversion table from `source`, `entries`
+    /// entries over `clips` clips of the disc. Emitted once, before reading; the patches
+    /// written are counted by `BdPlusResolution::patches_applied`.
+    BdPlusResolved {
+        source: &'a str,
+        clips: usize,
+        entries: usize,
     },
 }
 

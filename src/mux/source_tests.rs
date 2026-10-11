@@ -17,19 +17,18 @@ fn disc(volume_id: &str, meta_title: Option<&str>) -> Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: crate::disc::ContentFormat::MpegPs,
     }
 }
 
 fn image(d: Disc, folder: bool) -> Source<'static> {
-    Source {
-        origin: Origin::Image {
-            path: PathBuf::from("x"),
-            folder,
-            reader: Box::new(crate::test_util::MemSource::new(vec![0u8; 2048])),
-            disc: d,
-        },
-    }
+    Source::of(Origin::Image {
+        path: PathBuf::from("x"),
+        folder,
+        reader: Box::new(crate::test_util::MemSource::new(vec![0u8; 2048])),
+        disc: Box::new(d),
+    })
 }
 
 // An image and its extracted folder name a title alike: the folder's volume id is its

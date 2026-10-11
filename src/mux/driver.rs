@@ -22,7 +22,7 @@ use crate::sector::{FileSectorSource, SectorSource};
 use crate::session::DiscSession;
 
 use super::pes_output::PesOutput;
-use super::resolve::{InputOptions, StreamUrl, build_iso_pipeline, parse_url};
+use super::resolve::{Fixups, InputOptions, StreamUrl, build_iso_pipeline, parse_url};
 #[cfg(test)]
 use super::source::ScannedTitle;
 use super::source::{Origin, Source};
@@ -188,6 +188,7 @@ pub(crate) fn open_pes(
     ctx: &Ctx,
 ) -> std::io::Result<Box<dyn PesSource>> {
     let set = keys.filter(|s| s.is_aacs() && !opts.raw);
+    let bdplus = bdplus_fixups(&source, opts, ctx);
     let idx = opts.title_index;
     let input_opts = || InputOptions {
         title_index: Some(idx),
@@ -199,9 +200,10 @@ pub(crate) fn open_pes(
         Origin::Stream { url } => super::resolve::open_stream_url(&url, &input_opts(), ctx),
         Origin::Image { reader, disc, .. } => Ok(Box::new(super::resolve::image_input_scanned(
             reader,
-            disc,
+            *disc,
             &input_opts(),
             ctx,
+            bdplus,
         )?)),
         Origin::Prescanned { path, title: t } => {
             let (title, format) = (t.title, t.format);
@@ -219,6 +221,7 @@ pub(crate) fn open_pes(
                     set,
                     opts.batch_sectors,
                     ctx,
+                    bdplus,
                 )?)),
                 None => Ok(Box::new(build_iso_pipeline(
                     reader,
@@ -228,6 +231,7 @@ pub(crate) fn open_pes(
                     format,
                     opts.raw,
                     ctx,
+                    bdplus,
                 )?)),
             }
         }
@@ -237,20 +241,54 @@ pub(crate) fn open_pes(
             match set.or(keyless.as_ref()) {
                 Some(set) => {
                     let title = live_keyed_title(&*reader, title, set, opts)?;
-                    live_keyed(reader, title, set, opts, ctx)
+                    live_keyed(reader, title, set, opts, ctx, bdplus)
                 }
                 None => {
                     let mut title = title;
                     opts.selection
                         .apply(&mut title)
                         .map_err(std::io::Error::from)?;
-                    live_unkeyed(reader, title, format, DecryptKeys::None, opts, ctx)
+                    live_unkeyed(reader, title, format, DecryptKeys::None, opts, ctx, bdplus)
                 }
             }
         }
-        Origin::Session(session) => session_pes(session, set, opts, ctx),
-        Origin::Drive(mut session) => session_pes(&mut session, set, opts, ctx),
+        Origin::Session(session) => session_pes(session, set, opts, ctx, bdplus),
+        Origin::Drive(mut session) => session_pes(&mut session, set, opts, ctx, bdplus),
     }
+}
+
+// The BD+ patches for this mux, reported once as `BdPlusResolved` / `BdPlusUnresolved`: the
+// caller's resolution, else an unresolved one when the scanned layout found BD+. A raw mux,
+// a container or stream input, and a non-BD+ disc get neither.
+pub(crate) fn bdplus_fixups(source: &Source, opts: &MuxOptions, ctx: &Ctx) -> Fixups {
+    use crate::bdplus::{BdPlusResolution, BdPlusStatus};
+    if opts.raw || matches!(source.origin, Origin::Stream { .. }) {
+        return None;
+    }
+    let layout = source.layout();
+    let detected =
+        || layout.and_then(|d| Some(BdPlusResolution::unresolved(d, d.bdplus.as_ref()?)));
+    let res = match (&source.bdplus, layout) {
+        (Some(r), Some(d)) if !r.is_for(d) => {
+            tracing::error!(target: "freemkv::bdplus", "BD+ resolution is for another disc; not applied");
+            detected()
+        }
+        (Some(r), _) => Some(r.clone()),
+        (None, _) => detected(),
+    }?;
+    match res.status() {
+        BdPlusStatus::Resolved {
+            source,
+            clips,
+            entries,
+        } => ctx.emit(Event::BdPlusResolved {
+            source,
+            clips: *clips,
+            entries: *entries,
+        }),
+        _ => ctx.emit(Event::BdPlusUnresolved { info: res.info() }),
+    }
+    res.fixups()
 }
 
 // Title `idx` of a scanned layout, and the layout's container format.
@@ -285,6 +323,7 @@ fn session_pes(
     set: Option<&crate::keys::KeyRing>,
     opts: &MuxOptions,
     ctx: &Ctx,
+    bdplus: Fixups,
 ) -> std::io::Result<Box<dyn PesSource>> {
     let idx = opts.title_index;
     let path = session.device_path().to_string();
@@ -330,7 +369,7 @@ fn session_pes(
             let staged = session.staged_reader().ok_or_else(not_ready)?;
             let title = live_keyed_title(staged, title, set, opts)?;
             let reader = session.take_reader().ok_or_else(not_ready)?;
-            live_keyed(reader, title, set, opts, ctx)
+            live_keyed(reader, title, set, opts, ctx, bdplus)
         }
         None => {
             let mut title = title;
@@ -338,7 +377,7 @@ fn session_pes(
                 .apply(&mut title)
                 .map_err(std::io::Error::from)?;
             let reader = session.take_reader().ok_or_else(not_ready)?;
-            live_unkeyed(reader, title, format, keys, opts, ctx)
+            live_unkeyed(reader, title, format, keys, opts, ctx, bdplus)
         }
     }
 }
@@ -352,16 +391,15 @@ fn live_unkeyed(
     keys: DecryptKeys,
     opts: &MuxOptions,
     ctx: &Ctx,
+    bdplus: Fixups,
 ) -> std::io::Result<Box<dyn PesSource>> {
     let keys = if opts.raw { DecryptKeys::None } else { keys };
+    let read = super::resolve::TitleRead {
+        policy: live_policy(opts),
+        bdplus,
+    };
     Ok(Box::new(super::resolve::build_sector_pipeline(
-        reader,
-        title,
-        keys,
-        live_policy(opts),
-        format,
-        opts.raw,
-        ctx,
+        reader, title, keys, read, format, opts.raw, ctx,
     )?))
 }
 
@@ -400,6 +438,7 @@ fn live_keyed(
     set: &crate::keys::KeyRing,
     opts: &MuxOptions,
     ctx: &Ctx,
+    bdplus: Fixups,
 ) -> std::io::Result<Box<dyn PesSource>> {
     Ok(Box::new(super::resolve::build_keyed_pipeline(
         reader,
@@ -407,6 +446,7 @@ fn live_keyed(
         set,
         live_policy(opts),
         ctx,
+        bdplus,
     )?))
 }
 

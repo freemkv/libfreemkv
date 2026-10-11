@@ -25,6 +25,7 @@ fn pieces(files: &[Vec<(u32, u32)>], title_extents: &[(u32, u32)]) -> Vec<Vec<Un
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        bdplus: None,
         content_format: crate::ContentFormat::BdTs,
     };
     crate::keys::whole_disc_pieces(&disc, files)

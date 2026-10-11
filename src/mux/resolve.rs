@@ -15,6 +15,9 @@ use crate::sector::stage::Stage;
 use std::io;
 use std::path::{Path, PathBuf};
 
+// A resolved BD+ table's patches for a title read (`None`: no patching).
+pub(crate) type Fixups = Option<std::sync::Arc<crate::bdplus::DiscFixups>>;
+
 /// I/O buffer size for file streams.
 pub(crate) const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
 
@@ -488,12 +491,13 @@ pub(crate) fn image_input_scanned<S>(
     mut disc: crate::disc::Disc,
     opts: &InputOptions,
     ctx: &crate::ctx::Ctx,
+    bdplus: Fixups,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
 {
     if let Some(set) = opts.keys.as_ref().filter(|s| s.is_aacs() && !opts.raw) {
-        return keyed_image_input(reader, disc, opts, set, ctx);
+        return keyed_image_input(reader, disc, opts, set, ctx, bdplus);
     }
     // Pre-flight decrypt gate: fails fast on a scrambled-but-uncracked CSS disc or an
     // AACS disc with no key set (else muxes garbage). Per-title CSS is checked below.
@@ -534,6 +538,7 @@ where
         format,
         opts.raw,
         ctx,
+        bdplus,
     )?;
     Ok(stream)
 }
@@ -546,6 +551,7 @@ fn keyed_image_input<S>(
     opts: &InputOptions,
     set: &crate::keys::KeyRing,
     ctx: &crate::ctx::Ctx,
+    bdplus: Fixups,
 ) -> io::Result<PipelinedPesStream>
 where
     S: SectorSource + Send + 'static,
@@ -568,7 +574,7 @@ where
         .apply(&mut disc.titles[idx])
         .map_err(|e| -> io::Error { e.into() })?;
     let title = disc.titles[idx].clone();
-    build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, ctx)
+    build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, ctx, bdplus)
 }
 
 /// What an output scheme can take (pipeline design §2.2 sink caps): the one table the mux
@@ -679,25 +685,35 @@ pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     format: ContentFormat,
     raw: bool,
     ctx: &crate::ctx::Ctx,
+    bdplus: Fixups,
 ) -> io::Result<PipelinedPesStream> {
     let policy = crate::sector::read_stage::ReadPolicy::Image {
         batch: batch_sectors,
     };
-    build_sector_pipeline(reader, title, keys, policy, format, raw, ctx)
+    let read = TitleRead { policy, bdplus };
+    build_sector_pipeline(reader, title, keys, read, format, raw, ctx)
 }
 
-/// A sector source's title mux with no AACS key set, under the Read stage's `policy`
+/// How a title's sectors are read below the demux: the Read stage's `policy`, and the BD+
+/// patches applied after decryption.
+pub(crate) struct TitleRead {
+    pub(crate) policy: crate::sector::read_stage::ReadPolicy,
+    pub(crate) bdplus: Fixups,
+}
+
+/// A sector source's title mux with no AACS key set, under the Read stage's policy
 /// (an image's fixed batches, or a live drive's adaptive, recovering reads): the title's
-/// CSS key cracked (unless `raw`), then decrypt → prefetch → demux → parse.
+/// CSS key cracked (unless `raw`), then decrypt → BD+ patch → prefetch → demux → parse.
 pub(crate) fn build_sector_pipeline<S: SectorSource + Send + 'static>(
     mut reader: S,
     title: DiscTitle,
     mut keys: crate::decrypt::DecryptKeys,
-    policy: crate::sector::read_stage::ReadPolicy,
+    read: TitleRead,
     format: ContentFormat,
     raw: bool,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
+    let TitleRead { policy, bdplus } = read;
     let batch_sectors = policy.batch();
     let extents = title.extents.clone();
     // CSS (DVD) key resolution — shared per-title step. A `None`/MPEG-PS
@@ -727,6 +743,7 @@ pub(crate) fn build_sector_pipeline<S: SectorSource + Send + 'static>(
         policy,
         unit_align,
         format,
+        bdplus,
     };
     iso_pipeline_tail(decrypting, plan, title, ctx)
 }
@@ -739,6 +756,7 @@ struct IsoPlan {
     policy: crate::sector::read_stage::ReadPolicy,
     unit_align: u16,
     format: ContentFormat,
+    bdplus: Fixups,
 }
 
 /// The ISO title mux over a [`KeyRing`](crate::keys::KeyRing) (KU §3.1): the
@@ -751,6 +769,7 @@ pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
     set: &crate::keys::KeyRing,
     batch_sectors: u16,
     ctx: &crate::ctx::Ctx,
+    bdplus: Fixups,
 ) -> io::Result<PipelinedPesStream> {
     let cap = reader.capacity_sectors();
     if (cap != 0 && set.capacity() != 0 && cap != set.capacity())
@@ -762,7 +781,7 @@ pub(crate) fn build_iso_pipeline_keyed<S: SectorSource + Send + 'static>(
     let policy = crate::sector::read_stage::ReadPolicy::Image {
         batch: batch_sectors,
     };
-    build_keyed_pipeline(reader, title, set, policy, ctx)
+    build_keyed_pipeline(reader, title, set, policy, ctx, bdplus)
 }
 
 /// A sector source's title mux over a key set (its map and on-arrival proof, KU §3.1),
@@ -773,6 +792,7 @@ pub(crate) fn build_keyed_pipeline<S: SectorSource + Send + 'static>(
     set: &crate::keys::KeyRing,
     policy: crate::sector::read_stage::ReadPolicy,
     ctx: &crate::ctx::Ctx,
+    bdplus: Fixups,
 ) -> io::Result<PipelinedPesStream> {
     let full_extents = title.extents.clone();
     let ranges: Vec<(u32, u32)> = full_extents
@@ -795,6 +815,7 @@ pub(crate) fn build_keyed_pipeline<S: SectorSource + Send + 'static>(
         policy,
         unit_align: AACS_UNIT_SECTORS,
         format: set.content_format(),
+        bdplus,
     };
     iso_pipeline_tail(decrypting, plan, title, ctx)
 }
@@ -812,6 +833,7 @@ fn iso_pipeline_tail(
         policy,
         unit_align,
         format,
+        bdplus,
     } = plan;
     // The plan and clip feed spans must describe the SAME bytes: if the plan
     // drops alternate-phase units, frames drift out of place near a join —
@@ -835,6 +857,10 @@ fn iso_pipeline_tail(
     crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
     decrypting.clear_unit_base();
     decrypting.observe(ctx);
+    // After the probe above: BD+ patches only the title's bytes as they are read.
+    if let Some(fixups) = bdplus {
+        decrypting.set_bdplus(fixups);
+    }
     let blanked = decrypting.blanked_counter();
 
     let (prefetched, read_loss) = crate::sector::PrefetchedSectorSource::with_policy(
@@ -956,6 +982,7 @@ fn build_ps_pipeline(
         },
         unit_align: 1,
         format: ContentFormat::MpegPs,
+        bdplus: None,
     };
     iso_pipeline_tail(stage, plan, title, ctx).map(|p| p.with_video_stream_id(scan.video_id))
 }
