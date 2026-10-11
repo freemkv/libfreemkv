@@ -4,18 +4,38 @@
 
 ### Added
 
-- `TitleSelectionEvidence::segments`: each title's authored content in play order as format-neutral `ContentSegment { unit, start, end }` spans, so callers can compare titles without knowing the disc format. Blu-ray and UHD playlists give one segment per clip (its in/out ticks); HD DVD gives one per clip from its `clipTimeBegin` and the title-timeline length, and none when a clip lacks `clipTimeBegin`; DVD gives one per cell extent (its sectors). It is empty when the content can't be described exactly. `ContentSegment::from_clips` and `ContentSegment::from_cell_extents` build them.
+- `DiscTitle::selection_evidence: TitleSelectionEvidence`: what the disc authored about each title, for callers choosing a main feature or episodes. `segments` is the title's content in play order as format-neutral `ContentSegment { unit, start, end }` spans, so titles compare without knowing the disc format: Blu-ray and UHD give one per clip (its in/out ticks); HD DVD one per clip from its `clipTimeBegin` and the title-timeline length (none when a clip lacks it); DVD one per cell extent (its sectors). It is empty when the content can't be described exactly: DVD titles that play in random or shuffle order, chain to another PGC or span several PGCs carry none. `ContentSegment::from_clips` and `from_cell_extents` build them.
+- `TitleSelectionEvidence::episodes: EpisodeEvidence`: `Authored { roster, title_count, ordinal }` when the longest title is exactly the concatenation of other titles (the play-all partition, over clip segments on Blu-ray/UHD and cell sectors on DVD; labels `bd-playall-partition-v1:<playlist>`, `dvd-playall-partition-v1:<title>`), else `Unknown`. Exact duplicates share an ordinal. Every title stays `Unknown` when the cut is ambiguous, nested or competing, when a short recap or shared intro sits inside the play-all, when the only play-all is an extras reel, or when there is none; and when a title that can't be described (no segments) reads sectors the roster uses, the roster is held. It is not a TV classification: a movie DVD authored as chapter titles plus a full-length title gets a roster too, so Episodes still needs user intent or TV metadata.
+- `E_SELECTION_REVIEW_REQUIRED` (E9086) / `Error::SelectionReviewRequired`: a title selection that disc evidence doesn't settle and that needs review (io kind `InvalidInput`).
+- `BusRoute` (`HostCert`, `CssAuth`, `Firmware(name)`; `#[non_exhaustive]`, `name()`) and `Disc::bus_route(&Drive)`: how the disc's bus was opened, i.e. the unlocker that did work.
+- `Drive::claimed_by()` (the first firmware unlocker that claims the drive by identity; pure lookup, no I/O) and `Drive::unlocked_by()` (the one that unlocked it at `init()`).
+- `ProtectionLabel` and `Disc` methods that read the protection fields in one place: `intrinsic_id`, `aacs_volume_id`, `needs_key_lookup`, `keys_per_title`, `protection_label`, `protection_failure`.
+- `DiscFormat::{id, layers, ecc_block_sectors, default_region}`: the format's static facts in one place; `id()` returns the slugs a server persists (`"fmts"` for FMTS).
+- `Clip::marks_on_pes_clock`: set by the Blu-ray scanner when the clip's in/out marks are on the PES clock; the timeline and MKV origin read it instead of the content format.
+- `StreamUrl::info()` returns the scheme's `SchemeInfo { name, source, sink, target, medium }` from one const table (`SourceKind`, `SinkKind`, `UrlTarget`, all `#[non_exhaustive]`; `SchemeInfo::by_name`, `is_track_output`, `is_scheme_only_sink`), and `StreamUrl::path() -> Option<&Path>`.
+- `labels::EvidenceKind` (`Structural`, `Authored`; `#[non_exhaustive]`), `ParseResult::evidence` and `ParseResult::structural()`: gap-fill classifies labels by how they were obtained, not by parser name.
+- `io::publish::no_replace(source, target)`: atomic publication that never overwrites an existing target, with `io::publish::Fault` (`#[non_exhaustive]`) naming why the Unix claim fallback refused. `io::artifact_lock::file_identity(path)` gives the (device, inode) / (volume, file index) pair used for alias detection.
 
 ### Changed
 
-- Blu-ray episode rosters (`EpisodeEvidence::Authored`) now come from the play-all playlist instead of menu navigation: when the longest playlist is exactly the concatenation of other playlists (same clips, same in/out times), those playlists are the episodes in that order, and exact duplicates share an ordinal. Every title stays `Unknown` when the cut is ambiguous, nested or competing, when a short recap/logo sits inside the play-all, when the only play-all is an extras reel, or when there is no play-all. Roster label: `bd-playall-partition-v1:<playlist>`. This replaces the onQ menu certificate (`onq-uhd-v1`) and the HDMV First-Play roster (`hdmv-unconditional-playall-v1`): Blue Planet II UHD now gets a roster; Planet Earth II UHD disc 2 keeps the same one.
-- DVD episode rosters come from the same play-all partition, over each title's cell sectors (roster label `dvd-playall-partition-v1:<title>`), instead of the static root-menu walk (`dvd-vmgm-static-playall-partition-v1`), which needed a menu shape almost no disc has. A DVD with a play-all title that exactly concatenates other titles now gets a roster whatever its menu or First-Play; that includes movie DVDs authored as chapter titles plus a full-length title, so Episodes still needs user intent or TV metadata. The same guards apply as on Blu-ray, so a shared intro repeated inside the play-all, or a member much shorter than its share, leaves every title `Unknown` (the menu walk accepted both). A title whose PGC plays in random or shuffle order has no `segments`.
+- **Breaking:** `ParseResult` gains public field `evidence` and `Clip` gains `marks_on_pes_clock`; `DiscTitle` gains `selection_evidence`. Struct-literal builds must name them.
+- `Drive::has_unlocker()` and `Drive::platform_name()` follow `Unlocker::claims`: the first firmware unlocker that claims the drive is reported, so a Renesas profile is no longer reported as LD (latent with the bundled catalog). `Drive::unlocked_by()` is what `init()` ran.
+- The disc gate refuses an encrypted disc whose AACS state was never read; E7031 (`E_AACS_KEY_FILE_UNREADABLE`) when the key file was unreadable. Discs that key per title are spared, and an ISO's content is re-judged when it is encrypted without AACS state.
+- `find_drive` takes its candidates from `scsi::list_drives` on every OS, replacing the per-OS enumeration; unresponsive or non-optical entries still fail the open and are skipped.
+- Publishing a finished file falls back to a hard link and then to an exclusive claim when the filesystem rejects the native no-replace rename (macOS smbfs against Samba rejected both, so every delivery failed after the copy). A renameat2 `EINVAL` on Linux is treated as unsupported. The published size is verified afterwards.
+- `ArtifactLock` excludes holders within one process: a second lock on the same target waits (halt-aware, same stall window) even where the filesystem lets one process take `flock` twice (smbfs).
+- The mp4 plan is container-neutral: `FitReport` / `SkipReason` from `mux`, with the `mp4://` fit and final reports built from them.
+
+### Deprecated
+
+- `Drive::unlocker_name` (use `unlocked_by`), `Drive::is_ready` (use `unlocked_by().is_some()`) and `Drive::has_unlocker` (use `claimed_by().is_some()`). `Drive::is_unlocked` stays deprecated and now means `claimed_by().is_some()`, not `has_unlocker`.
+- `Mp4SkipReason` and `Mp4FitReport` are deprecated aliases of `mux::SkipReason` and `mux::FitReport`.
 
 ### Removed
 
-- The unreleased DVD root-menu launch tracer: `TitleSelectionEvidence::dvd_launch` and the `DvdLaunchEvidence`, `DvdLaunchReviewReason`, `DvdLaunchRoute` and `DvdLaunchStep` types are gone. Most DVDs could not be traced, so it marked every title for review; per-title audio languages are already in each title's streams.
-- `NavigationSource`, `MovieSelectionBasis` and the `TitleSelectionEvidence` fields `navigation`, `authoring_hint`, `dvd_menu_reachable` and `movie_basis`. Nothing read them; main-feature ranking is unchanged and `titles[0]` is still the pick.
-- `EpisodeEvidence::Authored::member`: it always equalled `ordinal.is_some()`; read `ordinal` instead.
+- `keys::Detector` (and its re-export): the content container answers how the medium flags encrypted content.
+- `sector::bus_removal::BusRemovalSectorSource`: `Drive` is the single de-bus point; the other `bus_removal` items remain.
+- `drive::DeviceResolution`, whose resolver was never wired.
 
 ## [1.8.3] — 2026-10-08
 

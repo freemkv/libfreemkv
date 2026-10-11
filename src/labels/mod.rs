@@ -223,6 +223,7 @@ pub(crate) fn stated_duration_secs(element: &str, keys: &[&str]) -> Option<u64> 
 /// disc format fields (stream tables, codec ids) and form the gap-fill floor;
 /// `Authored` labels are read from authored metadata (menus, manifests, art).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvidenceKind {
     Structural,
     Authored,

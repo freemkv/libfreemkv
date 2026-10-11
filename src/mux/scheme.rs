@@ -6,6 +6,7 @@ use super::videomap::Medium;
 
 /// How a scheme opens as an input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SourceKind {
     /// A live optical drive (`disc://`).
     Drive,
@@ -19,6 +20,7 @@ pub enum SourceKind {
 
 /// How a scheme opens as an output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SinkKind {
     /// A PES sink, opened by [`super::output`].
     Pes,
@@ -30,6 +32,7 @@ pub enum SinkKind {
 
 /// What the part of the URL after `scheme://` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UrlTarget {
     /// One filesystem file.
     File,

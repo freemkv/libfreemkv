@@ -171,8 +171,10 @@ fn artifact_lock_rechecks_identity_after_the_holder_deletes() {
 
 // smbfs against Samba's fruit:zero_file_id=yes derives inode numbers from the name:
 // a deleted sidecar's open fd and a recreated one compare equal.
+#[cfg(unix)]
 type IdPair = (io::Result<(u64, u64)>, io::Result<(u64, u64)>);
 
+#[cfg(unix)]
 fn name_derived(_: &File, p: &Path) -> IdPair {
     use std::hash::{Hash, Hasher};
     let mut name = std::collections::hash_map::DefaultHasher::new();
