@@ -41,8 +41,9 @@ pub enum Fault {
     SizeMismatch,
     /// Our zero-length claim was not proven removed: the target name may hold an empty
     /// placeholder, not a published artifact. The error's kind is `Other` (not
-    /// retryable until the placeholder is cleared); its source is an OS error, or
-    /// `EEXIST` when the file at the name is a different empty file.
+    /// retryable until the placeholder is cleared); its source is the OS error that stopped
+    /// the publish, or `EEXIST` when a successful re-check finds a different empty file
+    /// at the name.
     ClaimLeft,
 }
 

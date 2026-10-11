@@ -1353,6 +1353,16 @@ fn a_socket_over_the_sidecar_holds_no_token() {
     );
 }
 
+/// A directory at the sidecar path is waited out like a holder, never an IO error.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_directory_over_the_sidecar_is_waited_out() {
+    let (_dir, out) = artifact();
+    std::fs::create_dir(lock_path(&out)).unwrap();
+    let r = take(&out, Duration::from_millis(200));
+    assert!(matches!(r, Err(Error::TimedOut { .. })), "{r:?}");
+}
+
 /// Round-6 LOW/NIT: ENXIO or EOPNOTSUPP from opening a regular sidecar (FUSE, a network
 /// filesystem) stays an error; from a path gone before the lstat it is no token, a retry.
 #[test]

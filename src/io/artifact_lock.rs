@@ -451,12 +451,14 @@ mod os {
         false
     }
 
-    // A socket refuses an open (Linux ENXIO, macOS EOPNOTSUPP), as may a regular file on
+    // A socket refuses an open (Linux ENXIO, macOS EOPNOTSUPP), a directory EISDIR; so may a regular file on
     // FUSE or a network filesystem, which stays an error. Gone before the lstat: a retry.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn not_regular_refusal(e: &io::Error, p: &Path) -> bool {
-        matches!(e.raw_os_error(), Some(libc::ENXIO | libc::EOPNOTSUPP))
-            && std::fs::symlink_metadata(p).map_or_else(|l| id_retryable(&l), |m| !m.is_file())
+        matches!(
+            e.raw_os_error(),
+            Some(libc::ENXIO | libc::EOPNOTSUPP | libc::EISDIR)
+        ) && std::fs::symlink_metadata(p).map_or_else(|l| id_retryable(&l), |m| !m.is_file())
     }
 
     // Not a sidecar this lock may write: not a regular file, or linked under another name

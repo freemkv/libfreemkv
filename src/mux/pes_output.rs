@@ -289,7 +289,13 @@ fn created_then(
 
 // The identity of the regular file `path` names, read without following a symlink.
 fn regular_identity(path: &Path) -> Option<(u64, u64)> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) => {
+            tracing::warn!(target: "mux", error = %e, "a failed output's new file is kept: its identity could not be read");
+            return None;
+        }
+    };
     if !meta.file_type().is_file() {
         return None;
     }
