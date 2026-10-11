@@ -11,10 +11,11 @@ use super::Disc;
 use crate::decrypt::DecryptKeys;
 use crate::error::{Error, Result};
 use crate::io::tree_sink::TreeSink;
+#[cfg(all(test, unix))]
+use crate::io::tree_sink::available_space;
 #[cfg(test)]
 use crate::io::tree_sink::{
-    available_space, dir_is_case_insensitive, probe_case_insensitive, sanitize_component,
-    unique_probe_token,
+    dir_is_case_insensitive, probe_case_insensitive, sanitize_component, unique_probe_token,
 };
 use crate::sector::{DecryptingSectorSource, SectorSource};
 use crate::udf::{self, DirEntry, UdfFs};
