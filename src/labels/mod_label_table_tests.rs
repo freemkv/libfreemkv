@@ -296,6 +296,64 @@ fn extract_merges_the_mpls_floor_into_a_framework_winner() {
     assert_eq!(hint.and_then(|h| h.playlist_id), Some(800));
 }
 
+// `extract()` and `analyze()` merge the MPLS floor under one predicate: an Authored winner
+// gets the floor in both, a Structural winner (MPLS itself) gets no extra merge in either.
+#[test]
+fn extract_and_analyze_merge_the_mpls_floor_identically() {
+    let dcx = br#"<dcx><disc>
+            <playlist id="00800" name="feature" durs="7000"><audio id="01" lang="eng"/></playlist>
+        </disc></dcx>"#;
+    for authored in [true, false] {
+        let jar = if authored {
+            vec![dir(
+                "JAR",
+                30,
+                vec![],
+                vec![dir(
+                    "00000",
+                    40,
+                    vec![file_with("dcx.xml", 100, 2000, dcx.to_vec(), true)],
+                    vec![],
+                )],
+            )]
+        } else {
+            vec![]
+        };
+        let mut subdirs = jar;
+        subdirs.push(dir(
+            "PLAYLIST",
+            50,
+            vec![file_with(
+                "00800.mpls",
+                101,
+                3000,
+                mpls_bytes(b"00001", 0x1100),
+                true,
+            )],
+            vec![],
+        ));
+        let (mut disc, udf) = open(dir("", 10, vec![], vec![dir("BDMV", 20, vec![], subdirs)]));
+        let (extracted, _) = extract(&mut disc, &udf);
+        let analysis = analyze(&mut disc, &udf);
+        let ids = |ls: &[StreamLabel]| ls.iter().map(|l| l.stream_id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&analysis.labels),
+            ids(&extracted),
+            "authored={authored}: analyze and extract merge the same labels"
+        );
+        let floored = extracted.iter().any(|l| l.stream_id.is_some());
+        assert!(
+            floored,
+            "authored={authored}: the MPLS stream label is present"
+        );
+        assert_eq!(
+            analysis.gap_fill_added,
+            usize::from(authored),
+            "authored={authored}"
+        );
+    }
+}
+
 // The first copy of a manifest that reads non-empty wins; names match without case.
 #[test]
 fn read_jar_file_skips_empty_copies_and_matches_names_without_case() {

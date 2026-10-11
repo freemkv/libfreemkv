@@ -1958,6 +1958,10 @@ fn compose_xpl_titles_sums_sizes_and_computes_in_out_times() {
     assert_eq!(titles.len(), 1);
     let t = &titles[0];
     assert_eq!(t.size_bytes, 3000, "clip sizes summed, not multiplied");
+    assert!(
+        t.clips.iter().all(|c| !c.marks_on_pes_clock),
+        "HD DVD XPL clip times are not on the PES clock"
+    );
     assert_eq!(
         t.clips[0].in_time,
         (2.0f64 * 45000.0) as u32,

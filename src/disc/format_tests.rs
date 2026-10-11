@@ -40,9 +40,9 @@ fn layers_follow_the_format_capacity() {
 }
 
 #[test]
-fn ecc_block_is_32_for_bd_family_and_16_for_dvd_family() {
+fn ecc_block_is_32_except_dvd() {
     let got: Vec<u16> = ALL.iter().map(|f| f.ecc_block_sectors()).collect();
-    assert_eq!(got, [32, 32, 32, 16, 16, 32]);
+    assert_eq!(got, [32, 32, 32, 32, 16, 32]);
 }
 
 #[test]

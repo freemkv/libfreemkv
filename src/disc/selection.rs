@@ -1,4 +1,5 @@
-//! Selection provenance survives sorting and copying individual titles.
+//! Selection evidence (authored content segments and episode-roster membership)
+//! survives sorting and copying individual titles.
 
 /// Membership in a verified authored standalone-program roster for Episodes mode.
 /// Producer: the play-all partition (the longest title's segments exactly concatenate
@@ -7,6 +8,7 @@
 /// choose Episodes from user intent or TV metadata. `Unknown` means no roster was
 /// proven: Episodes must hold for review, not guess.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EpisodeEvidence {
     #[default]
     Unknown,
@@ -68,7 +70,7 @@ impl ContentSegment {
     }
 }
 
-/// Observations and accepted ranking evidence, attached to stable title identity.
+/// Authored content segments and episode-roster membership, attached to stable title identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TitleSelectionEvidence {
     /// Authored content in play order; empty when the backend cannot describe it exactly.

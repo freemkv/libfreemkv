@@ -994,13 +994,20 @@ fn extract(
     // The MPLS floor: framework parsers under-yield on multi-track discs, only
     // shipping editorial labels for "interesting" streams (Atmos, SDH). MPLS
     // names every stream a playlist references (parsed once, in the loop above).
-    if evidence != EvidenceKind::Structural
+    if floors_with_mpls(evidence)
         && let Some(floor) = structural_floor(&candidates)
     {
         merge_mpls_floor(&mut labels, &floor.labels);
     }
 
     (labels, feature_playlist)
+}
+
+/// Whether a chosen parser's labels get the MPLS floor merged in: every
+/// non-structural result (a structural one IS the floor). Shared by `extract()`
+/// and `analyze()` so the two merges cannot drift.
+fn floors_with_mpls(evidence: EvidenceKind) -> bool {
+    evidence != EvidenceKind::Structural
 }
 
 // The structural-evidence result among the parsed candidates, if any.
@@ -1117,7 +1124,7 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
 
     // The MPLS floor: same merge as `extract()`. Skipped when MPLS was itself
     // the chosen parser (its labels ARE the labels).
-    let gap_fill_added = if chosen_evidence == Some(EvidenceKind::Authored) {
+    let gap_fill_added = if chosen_evidence.is_some_and(floors_with_mpls) {
         let before = labels.len();
         // The registry loop above already parsed MPLS; reuse that result.
         if let Some(floor) = structural_floor(&all_results) {

@@ -431,6 +431,10 @@ fn parse_playlist_single_clip_size_and_extent() {
     assert_eq!(t.extents[0].start_lba, PART_START + 5000);
     assert_eq!(t.extents[0].sector_count, 1000);
     assert_eq!(t.clips.len(), 1);
+    assert!(
+        t.clips[0].marks_on_pes_clock,
+        "MPLS in/out times are on the PES clock"
+    );
     assert_eq!(t.clips[0].source_packets, 4000);
 }
 

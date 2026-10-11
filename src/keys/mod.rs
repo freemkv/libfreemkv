@@ -871,9 +871,11 @@ pub fn check_decryptable(
 }
 
 /// The disc-wide gate with no AACS set: `Ok` for a clear disc or a cracked CSS disc, else
-/// the typed refusal. `raw` always passes. An AACS disc, or an encrypted one whose AACS
-/// state was never read, refuses with the scan's key-service failure (an AACS disc also
-/// its handshake failure) when it recorded one, else `NoDiscKey`.
+/// the typed refusal. `raw` always passes. An AACS disc (`aacs` set) refuses with the
+/// scan's handshake or key-service failure when it recorded one, else `NoDiscKey`. An
+/// encrypted disc with neither AACS nor CSS state (`aacs` unset) refuses with the recorded
+/// key-service failure, else `AacsKeyFileUnreadable` (E7031) when any other error was
+/// recorded, else an empty-hash `NoDiscKey`; per-title-key discs (DVD CSS) pass.
 pub(crate) fn disc_gate(disc: &Disc, raw: bool) -> Result<()> {
     if raw {
         return Ok(());
@@ -905,27 +907,32 @@ pub(crate) fn disc_gate(disc: &Disc, raw: bool) -> Result<()> {
     // failure keeping its own verdict ("retry / fix the token", not "no key").
     // Per-title keys (DVD CSS) are cracked later, so a stray AACS dir there is not refused.
     if disc.encrypted && !disc.keys_per_title() {
-        return Err(match disc.aacs_error {
-            Some(Error::KeyServiceUnavailable) => Error::KeyServiceUnavailable,
-            Some(Error::KeyServiceUnauthorized) => Error::KeyServiceUnauthorized,
-            Some(Error::KeyServiceRateLimited) => Error::KeyServiceRateLimited,
-            Some(_) => Error::AacsKeyFileUnreadable,
-            None => Error::NoDiscKey {
-                disc_hash: String::new(),
-            },
-        });
+        return Err(recorded_key_service_error(disc).unwrap_or_else(|| {
+            if disc.aacs_error.is_some() {
+                Error::AacsKeyFileUnreadable
+            } else {
+                Error::NoDiscKey {
+                    disc_hash: String::new(),
+                }
+            }
+        }));
     }
     Ok(())
 }
 
 // A key-service failure the scan recorded, else `NoDiscKey` for the disc's hash.
 fn key_service_or_no_key(disc: &Disc) -> Error {
+    recorded_key_service_error(disc).unwrap_or_else(|| Error::NoDiscKey {
+        disc_hash: disc.aacs_disc_hash(),
+    })
+}
+
+/// The one list of key-service failures a scan can record on the disc.
+fn recorded_key_service_error(disc: &Disc) -> Option<Error> {
     match disc.aacs_error {
-        Some(Error::KeyServiceUnavailable) => Error::KeyServiceUnavailable,
-        Some(Error::KeyServiceUnauthorized) => Error::KeyServiceUnauthorized,
-        Some(Error::KeyServiceRateLimited) => Error::KeyServiceRateLimited,
-        _ => Error::NoDiscKey {
-            disc_hash: disc.aacs_disc_hash(),
-        },
+        Some(Error::KeyServiceUnavailable) => Some(Error::KeyServiceUnavailable),
+        Some(Error::KeyServiceUnauthorized) => Some(Error::KeyServiceUnauthorized),
+        Some(Error::KeyServiceRateLimited) => Some(Error::KeyServiceRateLimited),
+        _ => None,
     }
 }

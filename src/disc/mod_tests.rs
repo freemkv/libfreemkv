@@ -3277,6 +3277,34 @@ fn disc_gate_encrypted_without_state_refuses() {
     assert!(gate(&disc, true).is_ok(), "--raw is exempt");
 }
 
+// A key-service failure recorded with no AACS state keeps its own verdict, never E7031.
+#[test]
+fn disc_gate_encrypted_without_state_keeps_key_service_errors() {
+    use crate::error::Error;
+    for (rec, want) in [
+        (
+            Error::KeyServiceUnavailable,
+            Error::KeyServiceUnavailable.code(),
+        ),
+        (
+            Error::KeyServiceUnauthorized,
+            Error::KeyServiceUnauthorized.code(),
+        ),
+        (
+            Error::KeyServiceRateLimited,
+            Error::KeyServiceRateLimited.code(),
+        ),
+    ] {
+        let mut disc = make_test_disc(1000, "BD");
+        disc.encrypted = true;
+        assert!(disc.aacs.is_none());
+        disc.aacs_error = Some(rec);
+        let code = gate(&disc, false).expect_err("must error").code();
+        assert_eq!(code, want);
+        assert_ne!(code, Error::AacsKeyFileUnreadable.code());
+    }
+}
+
 // Per-title keys (a DVD cracked later) with a stray AACS dir and no key file: not refused.
 #[test]
 fn disc_gate_dvd_per_title_keys_without_state_proceeds() {
