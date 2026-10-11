@@ -79,6 +79,22 @@ fn interleaved_units(
 // Chapter (part of title) names moved onto the `programs` program marks: each part names the
 // program it starts at. `None` when that is not one name per program at most (a part in
 // another PGC, two parts on one program, a part past the marks).
+// A cell's VOB-relative sectors `first..=last` as read from the VOB at `vob_start`,
+// saturating: the one rule for extents and reach ranges, which the roster compares.
+fn cell_extent(vob_start: u32, first: u32, last: u32) -> Extent {
+    Extent {
+        start_lba: vob_start.saturating_add(first),
+        sector_count: last.saturating_sub(first).saturating_add(1),
+    }
+}
+
+// `cell_extent` as a half-open `[start, end)` sector range.
+fn cell_range(vob_start: u32, first: u32, last: u32) -> (u64, u64) {
+    let e = cell_extent(vob_start, first, last);
+    let start = u64::from(e.start_lba);
+    (start, start + u64::from(e.sector_count))
+}
+
 fn program_names(
     names: &[Option<String>],
     title: &ifo::DvdTitle,
@@ -242,13 +258,8 @@ impl Disc {
                     if category.is_secondary_block_piece() {
                         continue;
                     }
-                    let whole = Extent {
-                        start_lba: ts.vob_start_sector.saturating_add(cell.first_sector),
-                        sector_count: cell
-                            .last_sector
-                            .saturating_sub(cell.first_sector)
-                            .saturating_add(1),
-                    };
+                    let whole =
+                        cell_extent(ts.vob_start_sector, cell.first_sector, cell.last_sector);
                     if !category.interleaved {
                         extents.push(whole);
                         continue;
@@ -369,10 +380,7 @@ impl Disc {
                         secs: r.secs,
                         sectors: r.sectors,
                         beyond: (r.beyond.iter())
-                            .map(|&(first, last)| {
-                                let start = u64::from(ts.vob_start_sector) + u64::from(first);
-                                (start, start + u64::from(last.saturating_sub(first)) + 1)
-                            })
+                            .map(|&(first, last)| cell_range(ts.vob_start_sector, first, last))
                             .collect(),
                     },
                     _ => Reach::Unknown,

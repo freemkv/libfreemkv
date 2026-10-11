@@ -3101,3 +3101,21 @@ fn an_undescribed_title_that_loops_holds_the_dvd_roster() {
     let (titles, _) = scan_disc(vmg, looping);
     assert_no_dvd_roster(&titles);
 }
+
+/// Round-5 craft LOW: a cell past u32 sectors maps to the same range as an extent
+/// (saturating), so `beyond` and the roster's extents can still intersect.
+#[test]
+fn a_beyond_cell_range_matches_its_extent_at_overflow() {
+    let extent_range = |e: Extent| {
+        let start = u64::from(e.start_lba);
+        (start, start + u64::from(e.sector_count))
+    };
+    for (vob_start, first, last) in [(1000, 10, 109), (u32::MAX - 5, 10, 20), (0, 0, u32::MAX)] {
+        assert_eq!(
+            cell_range(vob_start, first, last),
+            extent_range(cell_extent(vob_start, first, last)),
+            "{vob_start} {first} {last}"
+        );
+    }
+    assert_eq!(cell_range(1000, 10, 109), (1010, 1110));
+}
