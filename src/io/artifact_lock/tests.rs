@@ -3,7 +3,6 @@
 
 use super::*;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
@@ -148,26 +147,36 @@ fn name_derived(_: &File, p: &Path) -> IdPair {
     (Ok((1, name.finish())), Ok((1, name.finish())))
 }
 
+#[cfg(unix)]
+fn proof(f: &File, p: &Path) -> Proof {
+    os::names_this_file(f, p, &os::try_lock_exclusive).unwrap()
+}
+
 #[test]
 #[cfg(unix)]
 fn a_deleted_sidecar_fd_does_not_name_a_recreated_one() {
     let (_dir, out) = artifact();
     let path = lock_path(&out);
     let old = os::open_rw(&path).unwrap();
-    assert!(os::names_this_file(&old, &path).unwrap());
+    assert!(matches!(proof(&old, &path), Proof::Ours));
     std::fs::remove_file(&path).unwrap();
-    assert!(os::names_this_file(&old, &path).is_err_and(|e| os::id_retryable(&e)));
+    assert!(matches!(proof(&old, &path), Proof::Retry(e) if os::id_retryable(&e)));
     let new = os::open_rw(&path).unwrap();
-    assert!(!os::names_this_file(&old, &path).unwrap());
-    assert!(os::names_this_file(&new, &path).unwrap());
+    assert!(matches!(proof(&old, &path), Proof::Retry(_)));
+    assert!(matches!(proof(&new, &path), Proof::Ours));
 }
 
-// Cross-process holder: this binary re-run on `child_helper`, which locks in its own
-// process and obeys stdin lines. "hold" prints CHILD:held; "replace" also deletes and
-// retakes the sidecar after "go" (CHILD:replaced), keeping the old inode open.
+// Cross-process holder: this binary re-run on `child_helper` (with CHILD_MARKER), which
+// locks in its own process and obeys stdin lines. "hold" prints CHILD:held; "replace"
+// also deletes and retakes the sidecar after "go" (CHILD:replaced).
+const CHILD_MARKER: &str = "freemkv-lock-child";
+
 #[test]
 fn child_helper() {
     use std::io::BufRead;
+    if !std::env::args().any(|a| a == CHILD_MARKER) {
+        return;
+    }
     let Some(dir) = std::env::var_os("FREEMKV_LOCK_CHILD_DIR") else {
         return;
     };
@@ -182,7 +191,9 @@ fn child_helper() {
     say("held");
     if mode == "replace" {
         lines.next();
-        // Holding the old inode open keeps its number from being reused by the new file.
+        // Unix: holding the old inode keeps its number from the new file. Not on Windows,
+        // where an open handle leaves the deleted name pending and the retake waits.
+        #[cfg(unix)]
         let _old = os::open_rw(&lock_path(&out)).unwrap();
         lock.delete().unwrap();
         let _new = take(&out, WINDOW).expect("child retakes");
@@ -194,17 +205,34 @@ fn child_helper() {
     }
 }
 
+// A target runner (emulator, remote) may not run this binary as a local child.
+fn cross_process() -> bool {
+    let runner = std::env::vars_os().find(|(k, _)| {
+        let k = k.to_string_lossy();
+        k.starts_with("CARGO_TARGET_") && k.ends_with("_RUNNER")
+    });
+    if let Some((k, _)) = &runner {
+        eprintln!(
+            "SKIP cross-process lock test: {} is set",
+            k.to_string_lossy()
+        );
+    }
+    runner.is_none()
+}
+
 struct Child {
     proc: std::process::Child,
-    out: std::io::BufReader<std::process::ChildStdout>,
+    lines: std::sync::mpsc::Receiver<String>,
 }
 
 impl Child {
     fn spawn(dir: &Path, mode: &str) -> Child {
+        use std::io::BufRead;
         let mut proc = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "io::artifact_lock::tests::child_helper",
+                CHILD_MARKER,
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -215,16 +243,25 @@ impl Child {
             .spawn()
             .unwrap();
         let out = std::io::BufReader::new(proc.stdout.take().unwrap());
-        Child { proc, out }
+        let (tx, lines) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for line in out.lines().map_while(io::Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Child { proc, lines }
     }
     fn wait_for(&mut self, marker: &str) {
-        use std::io::BufRead;
-        let mut line = String::new();
+        let want = format!("CHILD:{marker}");
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            line.clear();
-            assert!(self.out.read_line(&mut line).unwrap() > 0, "child died");
-            if line.trim_end().ends_with(&format!("CHILD:{marker}")) {
-                return;
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) if line.trim_end().ends_with(&want) => return,
+                Ok(_) => {}
+                Err(e) => panic!("child never printed {want}: {e}"),
             }
         }
     }
@@ -239,10 +276,23 @@ impl Child {
     }
 }
 
+// A failed test must not leave a child holding the lock (or blocked on stdin).
+impl Drop for Child {
+    fn drop(&mut self) {
+        if !matches!(self.proc.try_wait(), Ok(Some(_))) {
+            let _ = self.proc.kill();
+            let _ = self.proc.wait();
+        }
+    }
+}
+
 /// The OS lock excludes another process: with a child holding the sidecar, the parent's
 /// acquire waits out its window, and takes the lock once the child has exited.
 #[test]
 fn a_lock_held_by_another_process_excludes_this_one() {
+    if !cross_process() {
+        return;
+    }
     let (dir, out) = artifact();
     let mut child = Child::spawn(dir.path(), "hold");
     child.wait_for("held");
@@ -262,6 +312,15 @@ fn a_lock_held_by_another_process_excludes_this_one() {
 type IdFn = fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64, u64)>);
 
 fn waiter_must_not_keep_a_replaced_sidecar(ids: IdFn) {
+    waiter_must_not_keep_a_replaced_sidecar_with(ids, &os::names_this_file);
+}
+
+type SyncNames<'a> = dyn Fn(&File, &Path, &Lock<'_>) -> io::Result<Proof> + Sync + 'a;
+
+fn waiter_must_not_keep_a_replaced_sidecar_with(ids: IdFn, names: &SyncNames<'_>) {
+    if !cross_process() {
+        return;
+    }
     let (dir, out) = artifact();
     let mut child = Child::spawn(dir.path(), "replace");
     child.wait_for("held");
@@ -273,13 +332,17 @@ fn waiter_must_not_keep_a_replaced_sidecar(ids: IdFn) {
     let done = AtomicBool::new(false);
     thread::scope(|scope| {
         let waiter = scope.spawn(|| {
-            let lock = ArtifactLock::acquire_ids(
+            let hooks = Hooks {
+                ids: &counted,
+                lock: &os::try_lock_exclusive,
+                names,
+            };
+            let lock = ArtifactLock::acquire_full(
                 &out,
                 &[],
                 &Halt::new(),
                 Duration::from_secs(20),
-                &counted,
-                &os::try_lock_exclusive,
+                &hooks,
             )
             .expect("waiter takes the lock after the child exits");
             done.store(true, Ordering::SeqCst);
@@ -319,6 +382,29 @@ fn name_derived_ids_cannot_admit_a_waiter_holding_the_deleted_sidecar() {
     waiter_must_not_keep_a_replaced_sidecar(name_derived);
 }
 
+// SMB/CIFS mandatory byte-range locks: a read by path is refused while any fd holds
+// the exclusive lock, ours or another process's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_refused_while_locked(p: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let probe = File::open(p)?;
+    if !os::try_lock_exclusive(&probe)? {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    drop(probe);
+    real_read(p, max)
+}
+
+/// Review B1: a waiter holding the deleted sidecar (name-derived ids) whose read-back
+/// is refused by the new holder's lock must not take that refusal as proof.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_read_back_refused_by_another_holders_lock_is_not_proof() {
+    let names = |f: &File, p: &Path, relock: &Lock<'_>| {
+        os::names_with(f, p, &real_write, &read_refused_while_locked, relock)
+    };
+    waiter_must_not_keep_a_replaced_sidecar_with(name_derived, &names);
+}
+
 // Token proof unavailable: the acquire falls back to the dev/ino match already made.
 #[cfg(unix)]
 fn acquire_with_token_io(
@@ -326,17 +412,26 @@ fn acquire_with_token_io(
     read: &dyn Fn(&Path, u64) -> io::Result<Vec<u8>>,
 ) -> (Result<ArtifactLock>, usize) {
     let (_dir, out) = artifact();
+    acquire_at_with_token_io(&out, write, read)
+}
+
+#[cfg(unix)]
+fn acquire_at_with_token_io(
+    out: &Path,
+    write: &dyn Fn(&File, &[u8]) -> io::Result<()>,
+    read: &dyn Fn(&Path, u64) -> io::Result<Vec<u8>>,
+) -> (Result<ArtifactLock>, usize) {
     let calls = std::sync::atomic::AtomicUsize::new(0);
-    let names = |f: &File, p: &Path| {
+    let names = |f: &File, p: &Path, relock: &Lock<'_>| {
         calls.fetch_add(1, Ordering::SeqCst);
-        os::names_with(f, p, write, read)
+        os::names_with(f, p, write, read, relock)
     };
     let hooks = Hooks {
         ids: &|f, p| (os::file_id(f), os::path_id(p)),
         lock: &os::try_lock_exclusive,
         names: &names,
     };
-    let r = ArtifactLock::acquire_full(&out, &[], &Halt::new(), WINDOW, &hooks);
+    let r = ArtifactLock::acquire_full(out, &[], &Halt::new(), WINDOW, &hooks);
     (r, calls.load(Ordering::SeqCst))
 }
 
@@ -357,8 +452,8 @@ fn real_read(p: &Path, max: u64) -> io::Result<Vec<u8>> {
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn a_failing_token_write_falls_back_to_the_inode_match() {
-    for code in [libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EIO] {
+fn a_token_write_refused_for_space_falls_back_to_the_inode_match() {
+    for code in [libc::ENOSPC, libc::EDQUOT, libc::EFBIG] {
         let write = |_: &File, _: &[u8]| Err(io::Error::from_raw_os_error(code));
         let (r, calls) = acquire_with_token_io(&write, &real_read);
         assert!(r.is_ok(), "errno {code}: {r:?}");
@@ -366,15 +461,129 @@ fn a_failing_token_write_falls_back_to_the_inode_match() {
     }
 }
 
+/// Review S1: a stale handle to a replaced sidecar fails the write with these; they
+/// leave the identity unproven, so the acquire retries instead of admitting.
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn a_read_back_refused_by_our_own_lock_falls_back_to_the_inode_match() {
-    for code in [libc::EACCES, libc::EAGAIN, libc::EBUSY, libc::EPERM] {
-        let read = |_: &Path, _: u64| Err(io::Error::from_raw_os_error(code));
-        let (r, calls) = acquire_with_token_io(&real_write, &read);
+fn a_token_write_failing_like_a_stale_handle_retries() {
+    let stale = [
+        libc::EBADF,
+        libc::EACCES,
+        libc::EPERM,
+        libc::ENOTCONN,
+        libc::ETIMEDOUT,
+        libc::EIO,
+    ];
+    for code in stale {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let write = |f: &File, t: &[u8]| {
+            if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(io::Error::from_raw_os_error(code))
+            } else {
+                real_write(f, t)
+            }
+        };
+        let (r, calls) = acquire_with_token_io(&write, &real_read);
         assert!(r.is_ok(), "errno {code}: {r:?}");
-        assert_eq!(calls, 1, "errno {code}: no retry");
+        assert_eq!(calls, 2, "errno {code}: one retry");
     }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn any_other_token_write_error_fails_the_acquire() {
+    let write = |_: &File, _: &[u8]| Err(io::Error::from_raw_os_error(libc::EINVAL));
+    let (r, calls) = acquire_with_token_io(&write, &real_read);
+    assert!(
+        matches!(&r, Err(Error::IoError { source }) if source.raw_os_error() == Some(libc::EINVAL)),
+        "{r:?}"
+    );
+    assert_eq!(calls, 1);
+}
+
+/// CIFS refuses the read-back under our own lock: released, the path reads our token,
+/// and the relock admits us on the first attempt, holding the lock.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_read_back_refused_only_by_our_own_lock_is_proved_unlocked() {
+    let (_dir, out) = artifact();
+    let (r, calls) = acquire_at_with_token_io(&out, &real_write, &read_refused_while_locked);
+    let lock = r.expect("admitted");
+    assert_eq!(calls, 1, "no retry");
+    let other = os::open_rw(lock.path()).unwrap();
+    assert!(!os::try_lock_exclusive(&other).unwrap(), "the lock is held");
+}
+
+// Our fd locked on a deleted sidecar; the recreated one at the path, locked by `other`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn orphan_and_new_holder(path: &Path) -> (File, File) {
+    let orphan = os::open_rw(path).unwrap();
+    assert!(os::try_lock_exclusive(&orphan).unwrap());
+    std::fs::remove_file(path).unwrap();
+    let other = os::open_rw(path).unwrap();
+    assert!(os::try_lock_exclusive(&other).unwrap());
+    (orphan, other)
+}
+
+/// Review B1, in one process: a refusal that persists with our lock released is the
+/// other holder's, so it is not proof; and every refusal code takes that path.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_read_back_refused_by_another_holder_retries() {
+    for code in [libc::EACCES, libc::EAGAIN, libc::EBUSY, libc::EPERM] {
+        let (_dir, out) = artifact();
+        let path = lock_path(&out);
+        let (orphan, _other) = orphan_and_new_holder(&path);
+        let read = |p: &Path, max: u64| {
+            read_refused_while_locked(p, max).map_err(|e| match e.raw_os_error() {
+                Some(libc::EACCES) => io::Error::from_raw_os_error(code),
+                _ => e,
+            })
+        };
+        let r = os::names_with(&orphan, &path, &real_write, &read, &os::try_lock_exclusive);
+        assert!(matches!(r, Ok(Proof::Retry(_))), "errno {code}: {r:?}");
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
+    let (_dir, out) = artifact();
+    let path = lock_path(&out);
+    type Relock = Box<dyn Fn(&File) -> io::Result<bool>>;
+    let foreign = path.clone();
+    let cases: [(&str, Relock); 3] = [
+        ("relock refused", Box::new(|_| Ok(false))),
+        (
+            "relock error",
+            Box::new(|_| Err(io::Error::from_raw_os_error(libc::ENOLCK))),
+        ),
+        (
+            "another acquirer wrote the file while ours was released",
+            Box::new(move |f| {
+                std::fs::write(&foreign, b"another:token\n").unwrap();
+                os::try_lock_exclusive(f)
+            }),
+        ),
+    ];
+    for (case, relock) in cases {
+        let f = os::open_rw(&path).unwrap();
+        assert!(os::try_lock_exclusive(&f).unwrap());
+        let r = os::names_with(&f, &path, &real_write, &read_refused_while_locked, &*relock);
+        assert!(matches!(r, Ok(Proof::Retry(_))), "{case}: {r:?}");
+    }
+    let mismatch = std::cell::Cell::new(0);
+    let read = |p: &Path, max: u64| {
+        mismatch.set(mismatch.get() + 1);
+        match mismatch.get() {
+            1 => Err(io::Error::from_raw_os_error(libc::EACCES)),
+            _ => real_read(p, max).map(|_| b"someone:else\n".to_vec()),
+        }
+    };
+    let f = os::open_rw(&path).unwrap();
+    assert!(os::try_lock_exclusive(&f).unwrap());
+    let r = os::names_with(&f, &path, &real_write, &read, &os::try_lock_exclusive);
+    assert!(matches!(r, Ok(Proof::Retry(_))), "token mismatch: {r:?}");
 }
 
 #[test]
@@ -617,7 +826,7 @@ fn live_smb_artifact_lock_recreated_sidecar_has_one_holder() {
     std::fs::create_dir(&scratch.0).unwrap();
     let out = scratch.0.join("Movie.mkv");
     let holder = take(&out, WINDOW).expect("first taker");
-    let (out2, got) = (out.clone(), Arc::new(AtomicBool::new(false)));
+    let (out2, got) = (out.clone(), std::sync::Arc::new(AtomicBool::new(false)));
     let flag = got.clone();
     let waiter = thread::spawn(move || {
         let lock = take(&out2, Duration::from_secs(30)).expect("second taker");

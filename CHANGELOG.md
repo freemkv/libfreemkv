@@ -39,8 +39,8 @@
 
 ### Fixed
 
-- `ArtifactLock` acquisition works on Linux CIFS shares (where reading the sidecar back under our own lock is refused) and on full or read-only volumes (where the token write fails): both fall back to the device/inode match 1.8.3 used instead of failing the acquire.
-- The `io::publish::no_replace` claim fallback reports the real OS error when its re-check fails, and removes its own empty placeholder instead of leaving it at the final name. If the placeholder cannot be removed, the error carries the new `Fault::ClaimLeft` so it is not mistaken for an existing artifact. The Windows NUL-path error no longer carries prose.
+- `ArtifactLock` acquisition works on Linux CIFS shares, where reading the sidecar back is refused while any handle holds its lock: the acquirer releases its lock, reads its token back by path, and retakes the lock only if the token is still there, so a refusal caused by another holder of a recreated sidecar is retried, never taken as proof. When the token write fails for lack of space (ENOSPC, EDQUOT, EFBIG) the acquire falls back to the device/inode match 1.8.3 used; write errors typical of a stale handle (EBADF, EACCES, EPERM, ENOTCONN, ETIMEDOUT, EIO) retry, and any other write error fails the acquire.
+- The `io::publish::no_replace` claim fallback reports the real OS error when its re-check fails, and removes its own empty placeholder when lstat proves it is still ours. When the placeholder may remain at the final name (it could not be removed or proven ours), the error carries the new `Fault::ClaimLeft`, with the OS error (errno included) as its source, so it is not mistaken for an existing artifact. The Windows NUL-path error no longer carries prose.
 
 ## [1.8.3] — 2026-10-08
 
