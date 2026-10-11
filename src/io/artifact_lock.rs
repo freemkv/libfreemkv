@@ -11,9 +11,9 @@
 //! Acquire = open read-write, exclusive lock, then check the open file is still the one
 //! the path names (the holder deletes the sidecar only while holding it), else retry.
 //! On Unix that check also writes a per-acquisition token into the locked file and reads
-//! it back by path: inode numbers can follow names (smbfs), and a deleted sidecar's fd
-//! then compares equal to a recreated one. Holders in one process also exclude each
-//! other through a process-wide set: smbfs `flock` does not exclude two fds of one process.
+//! it back by path (inode numbers can follow names on smbfs); a read refused by a lock is
+//! re-read with ours released, and the inode match re-checked after the relock. Holders
+//! in one process exclude each other through a process-wide set (smbfs `flock` does not).
 //! The wait is halt-aware and stall-based: it fails `TimedOut { op: "artifact_lock" }`
 //! (E9073) only after 30 s in which neither the `.partial` nor a watched file changed.
 
@@ -131,6 +131,23 @@ impl ArtifactLock {
         ids: &Ids<'_>,
         lock: &Lock<'_>,
     ) -> Result<ArtifactLock> {
+        let hooks = Hooks {
+            ids,
+            lock,
+            names: &os::names_this_file,
+        };
+        Self::acquire_full(final_path, watch, halt, window, &hooks)
+    }
+
+    // `acquire_ids` with every injectable check, the token proof included.
+    fn acquire_full(
+        final_path: &Path,
+        watch: &[&Path],
+        halt: &Halt,
+        window: Duration,
+        hooks: &Hooks<'_>,
+    ) -> Result<ArtifactLock> {
+        let Hooks { ids, lock, names } = *hooks;
         let path = lock_path(final_path);
         let mut wait = LockWait::new(final_path, watch, window);
         let key = claim_key(&path);
@@ -138,7 +155,11 @@ impl ArtifactLock {
             halt.check()?;
             match Claim::take(&key) {
                 Some(claim) => break claim,
-                None => wait.slice(halt, &io::Error::from(io::ErrorKind::WouldBlock))?,
+                None => wait.slice(
+                    halt,
+                    &io::Error::from(io::ErrorKind::WouldBlock),
+                    Cause::Holder,
+                )?,
             }
         };
         loop {
@@ -147,7 +168,7 @@ impl ArtifactLock {
                 Ok(f) => f,
                 // Windows: a delete-pending sidecar refuses the open; the holder is leaving.
                 Err(e) if os::open_retryable(&e) => {
-                    wait.slice(halt, &e)?;
+                    wait.slice(halt, &e, Cause::Holder)?;
                     continue;
                 }
                 Err(e) => return Err(Error::IoError { source: e }),
@@ -155,26 +176,28 @@ impl ArtifactLock {
             // SS-8 flock(2): "Only one process may hold an exclusive lock for a given file at
             // a given time." SS-10 LockFileEx: LOCKFILE_EXCLUSIVE_LOCK, FAIL_IMMEDIATELY.
             while !lock(&file).map_err(|source| Error::IoError { source })? {
-                wait.slice(halt, &io::Error::from(io::ErrorKind::WouldBlock))?;
+                wait.slice(
+                    halt,
+                    &io::Error::from(io::ErrorKind::WouldBlock),
+                    Cause::Holder,
+                )?;
             }
-            // SS-9 XBD <sys/stat.h>: "A file identity is uniquely determined by the combination
-            // of st_dev and st_ino." SS-10: "the identifier … and the volume serial number".
-            let retry = match ids(&file, &path) {
-                (Ok(held), Ok(named)) if held == named => match os::names_this_file(&file, &path) {
-                    Ok(true) => return Ok(ArtifactLock { file, path, claim }),
-                    Ok(false) => io::Error::other("the sidecar was replaced"),
-                    Err(e) if os::id_retryable(&e) => e,
-                    Err(e) => return Err(Error::IoError { source: e }),
-                },
-                // The holder deleted it while we waited: we hold an unlinked file.
-                (Ok(_), Ok(_)) => io::Error::other("the sidecar was replaced"),
-                // §2.5: ENOENT/ESTALE from `fstat` or `stat` (another client deleted it).
-                (Err(e), _) | (_, Err(e)) if os::id_retryable(&e) => e,
-                (Err(e), _) | (_, Err(e)) => return Err(Error::IoError { source: e }),
+            // The token proof may release and retake the lock, and a peer outside it (1.8.3)
+            // may replace the sidecar meanwhile: the inode match must hold after it too.
+            let mut proof = same_file(ids, &file, &path)?;
+            if let Proof::Ours = proof {
+                proof = names(&file, &path, lock).map_err(|source| Error::IoError { source })?;
+                if let Proof::Ours = proof {
+                    proof = same_file(ids, &file, &path)?;
+                }
+            }
+            let retry = match proof {
+                Proof::Ours => return Ok(ArtifactLock { file, path, claim }),
+                Proof::Retry(e) => e,
             };
             // A retry is a wait like any other: halt-aware, and under T10 (never a spin).
             drop(file);
-            wait.slice(halt, &retry)?;
+            wait.slice(halt, &retry, Cause::Proof)?;
         }
     }
 
@@ -206,6 +229,48 @@ impl ArtifactLock {
 type Ids<'a> = dyn Fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64, u64)>) + 'a;
 // The OS exclusive try-lock (tests model filesystems where it does not exclude).
 type Lock<'a> = dyn Fn(&File) -> io::Result<bool> + 'a;
+// Whether the path names the locked file (the token proof; tests inject its IO). It may
+// release and retake the lock through the given try-lock.
+type Names<'a> = dyn Fn(&File, &Path, &Lock<'_>) -> io::Result<Proof> + 'a;
+
+// The injectable checks of one acquire.
+struct Hooks<'a> {
+    ids: &'a Ids<'a>,
+    lock: &'a Lock<'a>,
+    names: &'a Names<'a>,
+}
+
+// Whether the locked file is the one the path names, by identity.
+fn same_file(ids: &Ids<'_>, file: &File, path: &Path) -> Result<Proof> {
+    // SS-9 XBD <sys/stat.h>: "A file identity is uniquely determined by the combination
+    // of st_dev and st_ino." SS-10: "the identifier … and the volume serial number".
+    Ok(match ids(file, path) {
+        (Ok(held), Ok(named)) if held == named => Proof::Ours,
+        // The holder deleted it while we waited: we hold an unlinked file.
+        (Ok(_), Ok(_)) => Proof::Retry(replaced()),
+        // §2.5: ENOENT/ESTALE from `fstat` or `stat` (another client deleted it).
+        (Err(e), _) | (_, Err(e)) if os::id_retryable(&e) => Proof::Retry(e),
+        (Err(e), _) | (_, Err(e)) => return Err(Error::IoError { source: e }),
+    })
+}
+
+// What a wait slice waits out: another holder, or a lock whose proof failed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    Holder,
+    Proof,
+}
+
+// The token proof's verdict; `Retry` carries the OS answer logged if the wait expires.
+#[derive(Debug)]
+enum Proof {
+    Ours,
+    Retry(io::Error),
+}
+
+fn replaced() -> io::Error {
+    io::Error::other("the sidecar was replaced")
+}
 
 // The T10 wait between lock attempts: halt-aware, failing only after `window` with no
 // change in any watched file.
@@ -214,6 +279,8 @@ struct LockWait {
     seen: Vec<Option<(u64, Option<SystemTime>)>>,
     progress: Liveness,
     timer: StallTimer,
+    // Consecutive failed proofs, which widen the random backoff.
+    lost: u32,
 }
 
 impl LockWait {
@@ -228,30 +295,55 @@ impl LockWait {
             seen,
             progress,
             timer,
+            lost: 0,
         }
     }
 
     // One `WAIT_SLICE`: `Halted` on a Stop, `TimedOut` once the window passes with no
-    // change. `last` is the OS answer that made us wait (logged on expiry).
-    fn slice(&mut self, halt: &Halt, last: &io::Error) -> Result<()> {
+    // change. `last` is the OS answer that made us wait (logged on expiry). After a failed
+    // proof a random backoff follows, so two acquirers that keep colliding drift apart.
+    fn slice(&mut self, halt: &Halt, last: &io::Error, cause: Cause) -> Result<()> {
         let now = signatures(&self.watched);
         if now != self.seen {
             self.seen = now;
             self.progress.bump();
         }
         if self.timer.poll(&self.progress) == Stall::Expired {
-            tracing::warn!(
-                target: "freemkv::io",
-                phase = "artifact_lock",
-                last_os_error = %last,
-                "another process holds the artifact lock and its output has not changed"
-            );
+            match cause {
+                Cause::Holder => tracing::warn!(
+                    target: "freemkv::io",
+                    phase = "artifact_lock",
+                    last_os_error = %last,
+                    "another process holds the artifact lock and its output has not changed"
+                ),
+                Cause::Proof => tracing::warn!(
+                    target: "freemkv::io",
+                    phase = "artifact_lock",
+                    last_os_error = %last,
+                    "the artifact lock was taken but never proved to be the sidecar its path names"
+                ),
+            }
             return Err(Error::TimedOut {
                 op: "artifact_lock",
             });
         }
-        halt.wait(WAIT_SLICE)
+        self.lost = match cause {
+            Cause::Holder => 0,
+            Cause::Proof => self.lost.saturating_add(1),
+        };
+        halt.wait(WAIT_SLICE + backoff(self.lost))
     }
+}
+
+// Uniform in [0, WAIT_SLICE · 2^min(lost, 3)) after `lost` failed proofs; none before.
+fn backoff(lost: u32) -> Duration {
+    use std::hash::BuildHasher;
+    if lost == 0 {
+        return Duration::ZERO;
+    }
+    let span = WAIT_SLICE.as_micros() as u64 * (1 << lost.min(3));
+    let random = std::collections::hash_map::RandomState::new().hash_one(lost);
+    Duration::from_micros(random % span)
 }
 
 // Size and mtime of each path, read by path (a path `stat` follows a rename).
@@ -268,6 +360,7 @@ fn signatures(paths: &[PathBuf]) -> Vec<Option<(u64, Option<SystemTime>)>> {
 
 #[cfg(unix)]
 mod os {
+    use super::{Lock, Proof, replaced};
     use std::fs::File;
     use std::io;
     use std::os::unix::fs::MetadataExt;
@@ -322,11 +415,126 @@ mod os {
         Ok((m.dev(), m.ino()))
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn unlock(f: &File) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        loop {
+            // SAFETY: the fd is open for the whole call (it is borrowed from `f`).
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) } == 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn unlock(_f: &File) -> io::Result<()> {
+        Ok(())
+    }
+
     // Only a file's lock holder writes it, so reading our fresh token back by path
     // proves the path names the file we locked, whatever its inode number says.
-    pub(super) fn names_this_file(f: &File, p: &Path) -> io::Result<bool> {
-        use std::io::Read;
+    pub(super) fn names_this_file(f: &File, p: &Path, relock: &Lock<'_>) -> io::Result<Proof> {
+        names_with(f, p, &write_token, &read_back, relock)
+    }
+
+    fn write_token(f: &File, token: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+        f.set_len(0).map_err(truncate_error)?;
+        f.write_all_at(token, 0)
+    }
+
+    // A filesystem without ftruncate (FUSE: EINVAL, EOPNOTSUPP, ENOSYS) cannot hold the
+    // token; marked `Unsupported` so the proof falls back as for a full volume.
+    pub(super) fn truncate_error(e: io::Error) -> io::Error {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        // ENOTSUP and EOPNOTSUPP are one value on Linux, two on macOS.
+        if e.raw_os_error().is_some_and(|c| {
+            [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOTSUP, libc::ENOSYS].contains(&c)
+        }) {
+            return io::Error::new(io::ErrorKind::Unsupported, e);
+        }
+        e
+    }
+
+    fn read_back(p: &Path, max: u64) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut named = Vec::new();
+        File::open(p)?.take(max).read_to_end(&mut named)?;
+        Ok(named)
+    }
+
+    // Our own fd's contents, which only a lock holder writes.
+    fn read_held(f: &File, max: usize) -> io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut held = vec![0; max];
+        let mut n = 0;
+        while n < max {
+            match f.read_at(&mut held[n..], n as u64) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        held.truncate(n);
+        Ok(held)
+    }
+
+    // No room for the token (full volume, quota, size limit) or no ftruncate: the caller
+    // has already matched dev/ino, as in 1.8.3. Name-derived-inode filesystems rely on that.
+    fn token_unavailable(e: &io::Error) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if matches!(
+            e.raw_os_error(),
+            Some(libc::ENOSPC | libc::EDQUOT | libc::EFBIG)
+        ) {
+            return true;
+        }
+        e.kind() == io::ErrorKind::Unsupported && e.raw_os_error().is_none()
+    }
+
+    // A stale handle to a replaced or unreachable file fails IO this way: unproven, retry.
+    fn identity_uncertain(e: &io::Error) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if matches!(
+            e.raw_os_error(),
+            Some(
+                libc::EBADF
+                    | libc::EACCES
+                    | libc::EPERM
+                    | libc::ENOTCONN
+                    | libc::ETIMEDOUT
+                    | libc::EIO
+            )
+        ) {
+            return true;
+        }
+        id_retryable(e)
+    }
+
+    // SMB/CIFS mandatory byte-range locks refuse a read while any fd holds the lock.
+    fn read_conflict(e: &io::Error) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if matches!(
+            e.raw_os_error(),
+            Some(libc::EACCES | libc::EAGAIN | libc::EBUSY | libc::EPERM)
+        ) {
+            return true;
+        }
+        e.kind() == io::ErrorKind::PermissionDenied
+    }
+
+    pub(super) fn names_with(
+        f: &File,
+        p: &Path,
+        write: &dyn Fn(&File, &[u8]) -> io::Result<()>,
+        read: &dyn Fn(&Path, u64) -> io::Result<Vec<u8>>,
+        relock: &Lock<'_>,
+    ) -> io::Result<Proof> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
@@ -334,13 +542,53 @@ mod os {
             .map_or(0, |d| d.as_nanos());
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let token = format!("{}:{nanos}:{sequence}\n", std::process::id());
-        f.set_len(0)?;
-        f.write_all_at(token.as_bytes(), 0)?;
-        let mut named = Vec::with_capacity(token.len() + 1);
-        File::open(p)?
-            .take(token.len() as u64 + 1)
-            .read_to_end(&mut named)?;
-        Ok(named == token.as_bytes())
+        let token = token.as_bytes();
+        let max = token.len() as u64 + 1;
+        match write(f, token) {
+            Ok(()) => {}
+            Err(e) if token_unavailable(&e) => return Ok(Proof::Ours),
+            Err(e) if identity_uncertain(&e) => return Ok(Proof::Retry(e)),
+            Err(e) => return Err(e),
+        }
+        match read(p, max) {
+            Ok(named) if named == token => Ok(Proof::Ours),
+            Ok(_) => Ok(Proof::Retry(replaced())),
+            Err(e) if read_conflict(&e) => prove_unlocked(f, p, token, read, relock),
+            Err(e) if identity_uncertain(&e) => Ok(Proof::Retry(e)),
+            Err(e) => Err(e),
+        }
+    }
+
+    // The refusal may be another holder's lock on a recreated sidecar. With ours released,
+    // our token by path proves the path names our file; still finding it in the file
+    // after the relock proves no other acquirer took the file in between.
+    fn prove_unlocked(
+        f: &File,
+        p: &Path,
+        token: &[u8],
+        read: &dyn Fn(&Path, u64) -> io::Result<Vec<u8>>,
+        relock: &Lock<'_>,
+    ) -> io::Result<Proof> {
+        let max = token.len() as u64 + 1;
+        if let Err(e) = unlock(f) {
+            return Ok(Proof::Retry(e));
+        }
+        match read(p, max) {
+            Ok(named) if named == token => {}
+            Ok(_) => return Ok(Proof::Retry(replaced())),
+            Err(e) if read_conflict(&e) || identity_uncertain(&e) => return Ok(Proof::Retry(e)),
+            Err(e) => return Err(e),
+        }
+        match relock(f) {
+            Ok(true) => {}
+            Ok(false) => return Ok(Proof::Retry(io::ErrorKind::WouldBlock.into())),
+            Err(e) => return Ok(Proof::Retry(e)),
+        }
+        match read_held(f, token.len() + 1) {
+            Ok(held) if held == token => Ok(Proof::Ours),
+            Ok(_) => Ok(Proof::Retry(replaced())),
+            Err(e) => Ok(Proof::Retry(e)),
+        }
     }
 
     // Gone (ENOENT), or deleted by another NFS client (ESTALE): retry.
@@ -355,6 +603,7 @@ mod os {
 
 #[cfg(windows)]
 mod os {
+    use super::{Lock, Proof};
     use std::ffi::c_void;
     use std::fs::File;
     use std::io;
@@ -474,8 +723,8 @@ mod os {
     }
 
     // File indexes are real here, and an exclusive LockFileEx would block the read-back.
-    pub(super) fn names_this_file(_f: &File, _p: &Path) -> io::Result<bool> {
-        Ok(true)
+    pub(super) fn names_this_file(_f: &File, _p: &Path, _relock: &Lock<'_>) -> io::Result<Proof> {
+        Ok(Proof::Ours)
     }
 
     pub(super) fn id_retryable(e: &io::Error) -> bool {

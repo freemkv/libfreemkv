@@ -37,6 +37,11 @@
 - `sector::bus_removal::BusRemovalSectorSource`: `Drive` is the single de-bus point; the other `bus_removal` items remain.
 - `drive::DeviceResolution`, whose resolver was never wired.
 
+### Fixed
+
+- `ArtifactLock` acquisition works on Linux CIFS shares, where reading the sidecar back is refused while any handle holds its lock: the acquirer releases its lock, reads its token back by path, and retakes the lock only if the token is still there, then re-checks the device/inode match, so neither a refusal caused by another holder of a recreated sidecar nor a sidecar replaced while the lock was released is taken as proof. A failed proof is followed by a random backoff, so two acquirers cannot keep colliding, and a wait that expires because the proof kept failing is logged as such rather than as another holder. When the token cannot be written for lack of space (ENOSPC, EDQUOT, EFBIG) or ftruncate is unsupported (EINVAL, EOPNOTSUPP, ENOSYS, as on FUSE) the acquire falls back to the device/inode match 1.8.3 used; token write or read errors typical of a stale handle (EBADF, EACCES, EPERM, ENOTCONN, ETIMEDOUT, EIO) retry, and any other error fails the acquire.
+- The `io::publish::no_replace` claim fallback reports the real OS error when its re-check fails, and removes its own empty placeholder when lstat proves it is still ours. When the placeholder may remain at the final name (it could not be removed or proven ours), the error carries the new `Fault::ClaimLeft`, with the OS error (errno included) as its source, so it is not mistaken for an existing artifact; a placeholder found gone is `Fault::ClaimChanged`, likewise carrying the OS error. The Windows NUL-path error no longer carries prose.
+
 ## [1.8.3] — 2026-10-08
 
 ### Changed
