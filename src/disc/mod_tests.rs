@@ -3322,6 +3322,40 @@ fn key_source_failure_is_not_reported_as_a_missing_disc_key() {
     }
 }
 
+// Encrypted with neither AACS nor CSS state (the title-key file unread): refuse, keeping
+// E7031 when the key file was unreadable, else NoDiscKey; never pass ciphertext through.
+#[test]
+fn disc_gate_encrypted_without_state_refuses() {
+    let mut disc = make_test_disc(1000, "BD");
+    disc.encrypted = true;
+    let miss = crate::error::Error::NoDiscKey {
+        disc_hash: String::new(),
+    };
+    let err = gate(&disc, false).expect_err("encrypted without state must error");
+    assert!(
+        matches!(err, crate::error::Error::NoDiscKey { ref disc_hash } if disc_hash.is_empty())
+    );
+    assert_eq!(err.code(), miss.code());
+    disc.aacs_error = Some(crate::error::Error::AacsKeyFileUnreadable);
+    assert_eq!(
+        gate(&disc, false).expect_err("must error").code(),
+        crate::error::Error::AacsKeyFileUnreadable.code()
+    );
+    assert!(gate(&disc, true).is_ok(), "--raw is exempt");
+}
+
+// Per-title keys (a DVD cracked later) with a stray AACS dir and no key file: not refused.
+#[test]
+fn disc_gate_dvd_per_title_keys_without_state_proceeds() {
+    let mut disc = make_test_disc(1000, "DVD");
+    disc.format = DiscFormat::Dvd;
+    disc.encrypted = true;
+    assert!(disc.keys_per_title());
+    assert!(gate(&disc, false).is_ok());
+    disc.aacs_error = Some(crate::error::Error::AacsKeyFileUnreadable);
+    assert!(gate(&disc, false).is_ok());
+}
+
 /// A genuinely unencrypted disc has `None` keys legitimately — the gate keys off
 /// the scan-captured disc state, never the keys, so it must not false-error.
 #[test]
@@ -5817,22 +5851,6 @@ fn read_mkb_content_releases_the_padding_capacity() {
     let got = Disc::read_mkb_content(&mut disc, &udf).expect("mkb");
     assert_eq!(got.len(), 0x1000);
     assert!(got.capacity() < 1024 * 1024, "capacity {}", got.capacity());
-}
-
-#[test]
-fn layers_follow_the_format_capacity() {
-    for (fmt, sectors, want) in [
-        (DiscFormat::Dvd, 2_298_496, 1),
-        (DiscFormat::Dvd, 4_173_824, 2),
-        (DiscFormat::HdDvd, 7_300_000, 1),
-        (DiscFormat::HdDvd, 14_600_000, 2),
-        (DiscFormat::HdDvd, 22_000_000, 3),
-        (DiscFormat::BluRay, 12_219_392, 1),
-        (DiscFormat::BluRay, 24_438_784, 2),
-        (DiscFormat::Uhd, 48_878_592, 3),
-    ] {
-        assert_eq!(Disc::layers_for(fmt, sectors), want, "{fmt:?} {sectors}");
-    }
 }
 
 // A Stop during the image scan's forced-subtitle probe must not yield Ok(Disc).

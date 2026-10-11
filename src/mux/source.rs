@@ -168,7 +168,7 @@ pub(crate) fn probe_image(
     };
     let cap = reader.capacity_sectors();
     let mut disc = Disc::scan_image(&mut reader, cap, probe)?;
-    if folder {
+    if folder || (disc.encrypted && disc.aacs.is_none()) {
         crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc)?;
     }
     Ok((disc, reader))

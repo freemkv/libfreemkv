@@ -120,8 +120,8 @@ pub struct SubtitleTrack {
     pub name: String,
 }
 
-/// Container family as a compact, stable id. Kept here (not on [`DiscFormat`])
-/// because it is a serialization concern of this view.
+/// Container family as a compact, stable id. Same as [`DiscFormat::id`] except FMTS,
+/// which this public serialized view has always written as `"uhd_fmts"`.
 fn format_id(format: DiscFormat) -> &'static str {
     match format {
         DiscFormat::Uhd => "uhd",

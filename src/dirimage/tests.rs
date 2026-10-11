@@ -788,6 +788,21 @@ fn both_doors_agree_on_a_clear_folder_that_kept_its_aacs_directory() {
     drop(stream);
 }
 
+// An ISO probe runs the same verdict when encrypted with no AACS state (key file stripped):
+// clear content is judged decrypted, scrambled content keeps the verdict.
+#[test]
+fn an_encrypted_verdict_without_aacs_state_is_rejudged_from_content() {
+    for (scrambled, want) in [(false, false), (true, true)] {
+        let s = playable_bdmv("noaacsstate", scrambled);
+        let (mut disc, mut reader) =
+            crate::session::scan_dir(s.path(), crate::disc::ScanOptions::default()).unwrap();
+        disc.encrypted = true;
+        disc.aacs = None;
+        crate::session::apply_folder_encryption_verdict(&mut reader, &mut disc).unwrap();
+        assert_eq!(disc.encrypted, want);
+    }
+}
+
 // HP3: the `Url` arm reports read progress like every other arm (it used to pass no events).
 #[test]
 fn a_dir_url_mux_reports_read_progress_to_the_ctx() {

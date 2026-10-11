@@ -42,10 +42,7 @@ impl Disc {
             }),
             capacity: self.capacity_sectors,
             format: self.format,
-            vid_fingerprint: aacs
-                .map(|a| a.volume_id)
-                .filter(|v| *v != [0u8; 16])
-                .map(|v| super::vid_fp(&v)),
+            vid_fingerprint: self.aacs_volume_id().map(|v| super::vid_fp(&v)),
         }
     }
 }
