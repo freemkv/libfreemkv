@@ -1296,3 +1296,44 @@ fn a_holder_wait_resets_the_fault_run() {
         assert!(fail(&mut wait, 1));
     }
 }
+
+/// Round-5 NIT: a sidecar whose fstat keeps failing gone or stale before any lock is
+/// taken expires as a vanishing sidecar, never as a lock taken but unproven.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_sidecar_that_keeps_vanishing_is_not_reported_as_unproven() {
+    let (_dir, out) = artifact();
+    let ids = |f: &File, p: &Path| (os::file_id(f), os::path_id(p));
+    let gone = |_: &File| Err(io::Error::from_raw_os_error(libc::ESTALE));
+    let hooks = Hooks {
+        stat: &gone,
+        ids: &ids,
+        lock: &os::try_lock_exclusive,
+        names: &os::names_this_file,
+    };
+    let window = Duration::from_millis(200);
+    let (r, events) = crate::testlog::capture(|| {
+        ArtifactLock::acquire_full(&out, &[], &Halt::new(), window, &hooks)
+    });
+    assert!(matches!(r, Err(Error::TimedOut { .. })), "{r:?}");
+    let messages: Vec<_> = events.iter().map(|e| e.message().to_string()).collect();
+    assert!(
+        !messages.iter().any(|m| m.contains("never proved")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("vanish")),
+        "{messages:?}"
+    );
+}
+
+/// Round-5 NIT: a Unix-domain socket at the sidecar path (its open fails) holds no token,
+/// as any other non-regular file: a retry, never an IO error.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_socket_over_the_sidecar_holds_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.lock");
+    let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    assert_eq!(os::read_back(&path, 64).unwrap(), Vec::<u8>::new());
+}
