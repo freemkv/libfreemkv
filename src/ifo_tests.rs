@@ -2461,3 +2461,39 @@ fn title_reach_past_256_pgcs_is_unknown() {
     assert!(title_reach(&chain(256), 0, 256, 0, Some(PART_1)).is_some());
     assert!(title_reach(&chain(257), 0, 257, 0, Some(PART_1)).is_none());
 }
+
+// `n` PGCs of 255 one-sector cells each, every PGC at `first + i * stride` (stride 0:
+// all alike); the parts name each PGC once.
+fn wide_pgcs(n: usize, stride: u32) -> (Vec<u8>, Vec<(u16, u16)>) {
+    let pgcs: Vec<_> = (0..n as u32)
+        .map(|i| {
+            let cells: Vec<_> = (0..255u32)
+                .map(|c| (0x00, bcd_secs(1), i * stride + c * 2, i * stride + c * 2))
+                .collect();
+            build_pgc(bcd_secs(1), &cells, &[1], None)
+        })
+        .collect();
+    let parts = (1..=n as u16).map(|p| (p, 1)).collect();
+    (build_pgcit(&pgcs), parts)
+}
+
+/// Round-5 correctness LOW: PGCs that repeat one cell list add each range to `beyond`
+/// once, so a small hostile IFO cannot multiply it.
+#[test]
+fn title_reach_keeps_each_beyond_range_once() {
+    let (data, parts) = wide_pgcs(256, 0);
+    let reach = title_reach(&data, 0, 256, 0, Some(&parts)).expect("bounded");
+    assert_eq!(reach.beyond.len(), 255);
+}
+
+/// Round-5 correctness LOW: past MAX_REACH_CELLS distinct ranges beyond its own PGC, a
+/// title's reach is unknown (fail closed).
+#[test]
+fn title_reach_past_the_beyond_cap_is_unknown() {
+    let within = MAX_REACH_CELLS / 255;
+    let (data, parts) = wide_pgcs(within + 1, 1000);
+    let reach = title_reach(&data, 0, within + 1, 0, Some(&parts)).expect("within the cap");
+    assert_eq!(reach.beyond.len(), within * 255);
+    let (data, parts) = wide_pgcs(within + 2, 1000);
+    assert!(title_reach(&data, 0, within + 2, 0, Some(&parts)).is_none());
+}
