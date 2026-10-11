@@ -522,6 +522,11 @@ fn acquire_with_token_io(
     acquire_at_with_token_io(&out, write, read)
 }
 
+// Far past any sum of slices and backoffs these runs take: their outcome is decided by
+// attempt counts, never by the clock.
+#[cfg(unix)]
+const TOKEN_WINDOW: Duration = Duration::from_secs(10);
+
 #[cfg(unix)]
 fn acquire_at_with_token_io(
     out: &Path,
@@ -539,7 +544,7 @@ fn acquire_at_with_token_io(
         lock: &os::try_lock_exclusive,
         names: &names,
     };
-    let r = ArtifactLock::acquire_full(out, &[], &Halt::new(), WINDOW, &hooks);
+    let r = ArtifactLock::acquire_full(out, &[], &Halt::new(), TOKEN_WINDOW, &hooks);
     (r, calls.load(Ordering::SeqCst))
 }
 
@@ -690,6 +695,8 @@ fn a_sidecar_replaced_during_the_unlocked_proof_is_not_ours() {
     );
 }
 
+/// Round-4 tests LOW: a second holder taking the lock is contention (`Retry`); a lock
+/// error is the sidecar's fault (`Fault`, counted toward FAULT_REPEATS).
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
@@ -697,11 +704,13 @@ fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
     let path = lock_path(&out);
     type Relock = Box<dyn Fn(&File) -> io::Result<bool>>;
     let foreign = path.clone();
-    let cases: [(&str, Relock); 3] = [
-        ("relock refused", Box::new(|_| Ok(false))),
+    // (case, relock, whether the verdict is a fault rather than a retry)
+    let cases: [(&str, Relock, bool); 3] = [
+        ("relock refused", Box::new(|_| Ok(false)), false),
         (
             "relock error",
             Box::new(|_| Err(io::Error::from_raw_os_error(libc::ENOLCK))),
+            true,
         ),
         (
             "another acquirer wrote the file while ours was released",
@@ -709,16 +718,20 @@ fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
                 std::fs::write(&foreign, b"another:token\n").unwrap();
                 os::try_lock_exclusive(f)
             }),
+            false,
         ),
     ];
-    for (case, relock) in cases {
+    for (case, relock, fault) in cases {
         let f = os::open_rw(&path).unwrap();
         assert!(os::try_lock_exclusive(&f).unwrap());
         let r = os::names_with(&f, &path, &real_write, &read_refused_while_locked, &*relock);
-        assert!(
-            matches!(r, Ok(Proof::Retry(_) | Proof::Fault(_))),
-            "{case}: {r:?}"
-        );
+        match fault {
+            true => assert!(
+                matches!(&r, Ok(Proof::Fault(e)) if e.raw_os_error() == Some(libc::ENOLCK)),
+                "{case}: {r:?}"
+            ),
+            false => assert!(matches!(r, Ok(Proof::Retry(_))), "{case}: {r:?}"),
+        }
     }
     let mismatch = std::cell::Cell::new(0);
     let read = |p: &Path, max: u64| {
@@ -1125,14 +1138,12 @@ fn a_persistent_token_fault_fails_with_its_io_error() {
         (&real_write, &timed_out, libc::ETIMEDOUT),
     ];
     for (write, read, code) in cases {
-        let t = Instant::now();
         let (r, calls) = acquire_with_token_io(write, read);
         assert!(
             matches!(&r, Err(Error::IoError { source }) if source.raw_os_error() == Some(code)),
             "errno {code}: {r:?}"
         );
-        assert!(calls < 10, "errno {code}: {calls} attempts");
-        assert!(t.elapsed() < WINDOW / 2, "errno {code}: {:?}", t.elapsed());
+        assert_eq!(calls, FAULT_REPEATS as usize, "errno {code}");
     }
     // Faults that differ from one attempt to the next are not one lasting fault.
     let n = std::sync::atomic::AtomicUsize::new(0);
@@ -1264,5 +1275,24 @@ fn a_fifo_or_symlink_over_the_sidecar_never_blocks_the_read_back() {
             .recv_timeout(Duration::from_secs(10))
             .unwrap_or_else(|_| panic!("{kind}: the read-back blocked"));
         assert!(r.starts_with("Ok(Retry("), "{kind}: {r}");
+    }
+}
+
+/// Round-4 tests LOW: a holder (or failed-proof) wait between faults resets the run, so
+/// only FAULT_REPEATS faults in a row, with no holder seen, end the acquire.
+#[test]
+fn a_holder_wait_resets_the_fault_run() {
+    let (_dir, out) = artifact();
+    let mut wait = LockWait::new(&out, &[], Duration::from_secs(60));
+    let halt = Halt::new();
+    let e = io::Error::from(io::ErrorKind::TimedOut);
+    let fail = |wait: &mut LockWait, n: u32| (0..n).map(|_| wait.persists(&e)).any(|p| p);
+    assert!(!fail(&mut wait, FAULT_REPEATS - 1));
+    wait.slice(&halt, &e, Cause::Fault).unwrap();
+    assert!(fail(&mut wait, 1), "a fault slice keeps the run");
+    for cause in [Cause::Holder, Cause::Proof] {
+        wait.slice(&halt, &e, cause).unwrap();
+        assert!(!fail(&mut wait, FAULT_REPEATS - 1));
+        assert!(fail(&mut wait, 1));
     }
 }
