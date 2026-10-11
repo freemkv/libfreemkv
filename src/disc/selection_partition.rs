@@ -55,11 +55,17 @@ impl<'a, T: Eq + Hash> Prefixes<'a, T> {
     }
 }
 
-/// The most a title can play, for the rule that no undescribed title outlasts the play-all.
-#[derive(Clone, Copy, Debug)]
+/// The most a title can play, for the rules that no undescribed title outlasts the
+/// play-all or reads its sectors.
+#[derive(Clone, Debug)]
 pub(super) enum Reach {
-    /// At most this long and this many sectors.
-    AtMost { secs: f64, sectors: u64 },
+    /// At most this long and this many sectors, reading its extents and `beyond`
+    /// (half-open sector ranges).
+    AtMost {
+        secs: f64,
+        sectors: u64,
+        beyond: Vec<(u64, u64)>,
+    },
     /// Unbounded or unknown: it could be the longer play-all.
     Unknown,
 }
@@ -178,8 +184,8 @@ fn partition(titles: &[DiscTitle], reach: &[Reach]) -> Option<(u16, Vec<Option<u
             return None;
         }
     }
-    // A title the scanner could not describe, yet reading the roster's sectors, may be a
-    // longer or competing play-all: no roster can be proven.
+    // A title the scanner could not describe, yet reading the roster's sectors anywhere it
+    // can play, may be a longer or competing play-all: no roster can be proven.
     let mut read: Vec<(u64, u64)> = Vec::new();
     for (title, group) in titles.iter().zip(&group_of) {
         if group.is_some_and(|g| g == wrapper || order.contains(&g)) {
@@ -194,11 +200,16 @@ fn partition(titles: &[DiscTitle], reach: &[Reach]) -> Option<(u16, Vec<Option<u
             _ => merged.push((start, end)),
         }
     }
-    let blocked = titles
-        .iter()
+    let blocked = (titles.iter().enumerate())
         .zip(&group_of)
         .filter(|(_, group)| group.is_none())
-        .flat_map(|(title, _)| sector_ranges(title))
+        .flat_map(|((i, title), _)| {
+            let beyond = match reach.get(i) {
+                Some(Reach::AtMost { beyond, .. }) => &beyond[..],
+                _ => &[],
+            };
+            sector_ranges(title).chain(beyond.iter().copied())
+        })
         .any(|(start, end)| {
             let at = merged.partition_point(|r| r.0 < end);
             at > 0 && merged[at - 1].1 > start
@@ -224,9 +235,9 @@ fn partition(titles: &[DiscTitle], reach: &[Reach]) -> Option<(u16, Vec<Option<u
             shortest.1.min(sectors(title)),
         );
     }
-    let longer = |i: usize, t: &DiscTitle| match reach.get(i).copied() {
+    let longer = |i: usize, t: &DiscTitle| match reach.get(i) {
         None => t.duration_secs > shortest.0 || sectors(t) > shortest.1,
-        Some(Reach::AtMost { secs, sectors }) => secs > shortest.0 || sectors > shortest.1,
+        Some(Reach::AtMost { secs, sectors, .. }) => *secs > shortest.0 || *sectors > shortest.1,
         Some(Reach::Unknown) => true,
     };
     if (titles.iter().enumerate())

@@ -2356,9 +2356,9 @@ fn command_flow_fails_closed_on_what_it_cannot_read() {
 fn title_reach_without_a_readable_part_list_is_unknown() {
     let pgc = build_pgc(bcd_secs(30), &[(0x00, bcd_secs(30), 0, 9)], &[1], None);
     let data = build_pgcit(&[pgc]);
-    assert!(title_reach(&data, 0, 1, Some(&[(1, 1)])).is_some());
-    assert!(title_reach(&data, 0, 1, None).is_none());
-    assert!(title_reach(&data, 0, 1, Some(&[])).is_none());
+    assert!(title_reach(&data, 0, 1, 0, Some(&[(1, 1)])).is_some());
+    assert!(title_reach(&data, 0, 1, 0, None).is_none());
+    assert!(title_reach(&data, 0, 1, 0, Some(&[])).is_none());
 }
 
 // A duplicate entry for one VTS title keeps every warning flag either entry sets.

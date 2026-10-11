@@ -92,10 +92,22 @@ pub struct DvdTitle {
     pub truncated: bool,
     /// The title's PGC is the one VTS_PTT_SRPT names, not a 1:1 guess.
     pub mapped: bool,
-    /// The most the title can play, `(seconds, sectors)`: every PGC its parts name and
-    /// their next-PGC chains, once each. `None` when that bounds nothing (loops, branches,
-    /// random play, a cut table, a guessed PGC, an unreadable part list).
-    pub reach: Option<(f64, u64)>,
+    /// The most the title can play: every PGC its parts name and their next-PGC chains,
+    /// once each. `None` when that bounds nothing (loops, branches, random play, a cut
+    /// table, a guessed PGC, an unreadable part list).
+    pub reach: Option<DvdReach>,
+}
+
+/// Everything a title can play, as [`DvdTitle::reach`] bounds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DvdReach {
+    /// Playback time in seconds.
+    pub secs: f64,
+    /// Sectors read, an angle block counted once.
+    pub sectors: u64,
+    /// VOB-relative `(first, last)` sectors of every cell in a PGC other than the title's
+    /// own, whose cells alone `cells` holds.
+    pub beyond: Vec<(u32, u32)>,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -1125,13 +1137,14 @@ const MAX_REACH_PGCS: usize = 256;
 
 // `DvdTitle::reach`: the PGCs the parts name (none read: unknown) and their NextPGCN
 // chains, each in cell order (PGC mode 0), uncut, with commands that never leave it, the
-// chains acyclic, and no part links between PGCs.
+// chains acyclic, and no part links between PGCs. `own` is the title's PGC (0-based).
 fn title_reach(
     data: &[u8],
     pgcit_offset: usize,
     num_pgcs: usize,
+    own: usize,
     parts: Option<&[(u16, u16)]>,
-) -> Option<(f64, u64)> {
+) -> Option<DvdReach> {
     let mut pgcs: Vec<usize> = (parts.filter(|parts| !parts.is_empty())?.iter())
         .map(|&(pgcn, _)| usize::from(pgcn).checked_sub(1))
         .collect::<Option<_>>()?;
@@ -1139,6 +1152,7 @@ fn title_reach(
     pgcs.dedup();
     let mut next = std::collections::HashMap::new();
     let (mut secs, mut sectors, mut by_part) = (0.0, 0u64, false);
+    let mut beyond = Vec::new();
     let mut i = 0;
     while let Some(&pgc) = pgcs.get(i) {
         i += 1;
@@ -1160,6 +1174,9 @@ fn title_reach(
         }
         next.insert(pgc, to);
         secs += title.duration_secs;
+        if pgc != own {
+            beyond.extend(title.cells.iter().map(|c| (c.first_sector, c.last_sector)));
+        }
         for cell in &title.cells {
             if !CellCategory::decode(cell.category).is_secondary_block_piece() {
                 let span = cell.last_sector.saturating_sub(cell.first_sector);
@@ -1180,7 +1197,11 @@ fn title_reach(
         }
         done.extend(path);
     }
-    (pgcs.len() == 1 || !by_part).then_some((secs, sectors))
+    (pgcs.len() == 1 || !by_part).then_some(DvdReach {
+        secs,
+        sectors,
+        beyond,
+    })
 }
 
 /// Parse VTS_PGCIT (Program Chain Information Table) to extract titles.
@@ -1226,8 +1247,9 @@ pub(crate) fn parse_pgcit(
         // Warned once per disc by the DVD scan, which sees every title set.
         let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
         let parts = ptt_srpt_parts(data, ptt_offset, vts_title_num);
-        let reach =
-            mapped.and_then(|_| title_reach(data, pgcit_offset, num_pgcs.into(), parts.as_deref()));
+        let reach = mapped.and_then(|own| {
+            title_reach(data, pgcit_offset, num_pgcs.into(), own, parts.as_deref())
+        });
         // The program each chapter starts at, when every chapter lies in this PGC.
         let ptt_programs = parts.map(|parts| {
             match parts

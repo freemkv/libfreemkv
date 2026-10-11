@@ -3021,3 +3021,63 @@ fn a_title_whose_part_list_is_unreadable_holds_the_dvd_roster() {
     assert_eq!(titles.len(), 8);
     assert_no_dvd_roster(&titles);
 }
+
+// Episodes E1-E4 (100 sectors each), their two-minute play-all, a logo as title 6, and a
+// PGC 7 playing `after` that no title starts at.
+fn logo_then(after: Vec<(u32, u32)>) -> (Vec<u8>, Vec<usize>) {
+    let e = [(1000, 1099), (2000, 2099), (3000, 3099), (4000, 4099)];
+    let (mut vts, at) = programs_vts(&[
+        vec![e[0]],
+        vec![e[1]],
+        vec![e[2]],
+        vec![e[3]],
+        e.to_vec(),
+        vec![(700, 709)],
+        after,
+    ]);
+    vts[at[4] + 5] = 0x02;
+    vts[at[4] + 6] = 0x00;
+    (vts, at)
+}
+
+fn six_titles_vmg() -> Vec<u8> {
+    build_vmg(&(1..=6).map(|n| (1, 1, n)).collect::<Vec<_>>())
+}
+
+// Title 6 plays PGC 7 after its logo: chained by NextPGCN, or as its second part.
+fn logo_cases(after: Vec<(u32, u32)>) -> Vec<(&'static str, Vec<u8>)> {
+    let (mut chained, at) = logo_then(after.clone());
+    chained[at[5] + 0x9c..at[5] + 0x9e].copy_from_slice(&7u16.to_be_bytes());
+    let (mut split, _) = logo_then(after);
+    split[2056 + 6 * 4..2060 + 6 * 4].copy_from_slice(&64u32.to_be_bytes());
+    split[2048 + 64..2048 + 66].copy_from_slice(&7u16.to_be_bytes());
+    split[2048 + 66..2048 + 68].copy_from_slice(&1u16.to_be_bytes());
+    split[2052..2056].copy_from_slice(&67u32.to_be_bytes());
+    vec![("chained", chained), ("split", split)]
+}
+
+/// Round-4 MEDIUM: an undescribed title whose later PGC replays roster cells overlaps the
+/// roster, though its first PGC (its extents) does not: the roster is held.
+#[test]
+fn an_undescribed_title_reading_roster_cells_past_its_first_pgc_holds_the_roster() {
+    let has_roster = |titles: &[DiscTitle]| {
+        (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown)
+    };
+    let (titles, _) = scan_disc(six_titles_vmg(), logo_then(vec![(800, 809)]).0);
+    assert!(has_roster(&titles), "control: the play-all proves a roster");
+    for (case, vts) in logo_cases(vec![(800, 809)]) {
+        let (titles, _) = scan_disc(six_titles_vmg(), vts);
+        assert!(titles[5].selection_evidence.segments.is_empty(), "{case}");
+        assert!(
+            has_roster(&titles),
+            "{case}: its own sectors overlap nothing"
+        );
+    }
+    for (case, vts) in logo_cases(vec![(2000, 2099), (1000, 1099), (3000, 3099)]) {
+        let (titles, _) = scan_disc(six_titles_vmg(), vts);
+        assert_eq!(titles.len(), 6, "{case}");
+        assert!(titles[5].selection_evidence.segments.is_empty(), "{case}");
+        assert_eq!(titles[5].extents.len(), 1, "{case}: its first PGC is read");
+        assert_no_dvd_roster(&titles);
+    }
+}
