@@ -249,23 +249,40 @@ impl<'u> PesOutput<'u> {
 // handle) and failed to fill is removed while the path names it, never via a symlink. A second
 // writer that opened the same name shares that inode and cannot be told apart.
 fn created(path: &Path, open: impl FnOnce() -> io::Result<Opened>) -> io::Result<Opened> {
+    created_then(path, || {}, open)
+}
+
+// `created` with `made` run once the file is created (tests swap the path there).
+fn created_then(
+    path: &Path,
+    made: impl FnOnce(),
+    open: impl FnOnce() -> io::Result<Opened>,
+) -> io::Result<Opened> {
     use crate::io::artifact_lock::file_identity_of;
     let ours = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
     {
-        Ok(file) => file_identity_of(&file).ok(),
+        Ok(file) => {
+            made();
+            Some(file_identity_of(&file))
+        }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
         Err(e) => return Err(e),
     };
     let sink = open();
-    if sink.is_err()
-        && let Some(id) = ours
-        && regular_identity(path) == Some(id)
-        && let Err(e) = std::fs::remove_file(path)
-    {
-        tracing::warn!(target: "mux", error = %e, "a failed output's new file could not be removed");
+    match ours {
+        Some(Ok(id)) if sink.is_err() && regular_identity(path) == Some(id) => {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!(target: "mux", error = %e, "a failed output's new file could not be removed");
+            }
+        }
+        // Not provably ours without its identity: kept, never removed by name alone.
+        Some(Err(e)) if sink.is_err() => {
+            tracing::warn!(target: "mux", error = %e, "a failed output's new file is kept: its identity could not be read");
+        }
+        _ => {}
     }
     sink
 }

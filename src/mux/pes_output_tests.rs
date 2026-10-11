@@ -70,3 +70,19 @@ fn a_failed_open_keeps_a_symlink_to_the_created_file() {
     let link = std::fs::symlink_metadata(&path).expect("symlink kept");
     assert!(link.file_type().is_symlink());
 }
+
+/// Round-6 tests LOW: the created file's identity comes from its handle, so another file
+/// renamed in right after the create is never taken for ours and removed.
+#[test]
+fn a_failed_open_keeps_a_file_renamed_in_before_the_identity_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.mkv");
+    let other = dir.path().join("other.mkv");
+    let swap = || {
+        std::fs::write(&other, b"theirs").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+    };
+    let r = created_then(&path, swap, || Err(io::ErrorKind::Other.into()));
+    assert!(r.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+}
