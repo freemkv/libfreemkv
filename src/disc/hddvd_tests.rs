@@ -1045,7 +1045,9 @@ fn nested_title_xpl(nesting: usize, clips: usize, chapters: usize) -> String {
         xpl.push_str("<Title>");
     }
     for _ in 0..clips {
-        xpl.push_str(r#"<PrimaryAudioVideoClip src="A.EVO"/>"#);
+        xpl.push_str(
+            r#"<PrimaryAudioVideoClip titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:01:00" src="A.EVO"/>"#,
+        );
     }
     for _ in 0..chapters {
         xpl.push_str(r#"<Chapter titleTimeBegin="00:00:01:00"/>"#);
@@ -2844,4 +2846,29 @@ fn parse_xpl_titles_marks_a_title_with_a_clip_naming_no_evo() {
     assert_eq!(titles[0].clips.len(), 1);
     assert!(!titles[0].complete);
     assert!(titles[1].complete);
+}
+
+/// Round-3 LOW: a clip whose titleTimeBegin or titleTimeEnd is missing or unparseable
+/// has no exact length, so its title is incomplete (no segments).
+#[test]
+fn parse_xpl_titles_marks_a_title_with_a_clip_lacking_title_times() {
+    let clip = |times: &str| {
+        format!(
+            r#"<Playlist><TitleSet timeBase="60fps"><Title titleNumber="1" titleDuration="00:00:10:00">
+              <PrimaryAudioVideoClip {times} clipTimeBegin="00:00:00:00" src="file:///x/A.MAP"/>
+            </Title></TitleSet></Playlist>"#
+        )
+    };
+    let whole = r#"titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:05:00""#;
+    assert!(parse_xpl_titles(clip(whole).as_bytes())[0].complete);
+    for times in [
+        r#"titleTimeBegin="00:00:00:00""#,
+        r#"titleTimeEnd="00:00:05:00""#,
+        r#"titleTimeBegin="00:00:xx:00" titleTimeEnd="00:00:05:00""#,
+        r#"titleTimeBegin="00:00:00:00" titleTimeEnd="bad""#,
+    ] {
+        let titles = parse_xpl_titles(clip(times).as_bytes());
+        assert_eq!(titles[0].clips.len(), 1, "{times}");
+        assert!(!titles[0].complete, "{times}");
+    }
 }
