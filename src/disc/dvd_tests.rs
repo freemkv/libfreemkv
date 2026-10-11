@@ -3106,16 +3106,35 @@ fn an_undescribed_title_that_loops_holds_the_dvd_roster() {
 /// (saturating), so `beyond` and the roster's extents can still intersect.
 #[test]
 fn a_beyond_cell_range_matches_its_extent_at_overflow() {
-    let extent_range = |e: Extent| {
-        let start = u64::from(e.start_lba);
-        (start, start + u64::from(e.sector_count))
-    };
-    for (vob_start, first, last) in [(1000, 10, 109), (u32::MAX - 5, 10, 20), (0, 0, u32::MAX)] {
-        assert_eq!(
-            cell_range(vob_start, first, last),
-            extent_range(cell_extent(vob_start, first, last)),
-            "{vob_start} {first} {last}"
-        );
-    }
+    let max = u64::from(u32::MAX);
     assert_eq!(cell_range(1000, 10, 109), (1010, 1110));
+    assert_eq!(cell_range(u32::MAX - 5, 10, 20), (max, max + 11));
+    assert_eq!(cell_range(0, 0, u32::MAX), (0, max));
+    let e = cell_extent(u32::MAX - 5, 10, 20);
+    assert_eq!((e.start_lba, e.sector_count), (u32::MAX, 11));
+}
+
+/// Round-6 tests LOW: the scanner maps `beyond` by the extents' rule: past u32 sectors a
+/// later PGC replaying an episode's cell still overlaps its (saturated) extent.
+#[test]
+fn a_beyond_cell_past_u32_sectors_still_holds_the_roster() {
+    let has_roster = |titles: &[DiscTitle]| {
+        (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown)
+    };
+    // VOBs moved to u32::MAX - 3500: episode E4 (cells 4000-4099) starts past u32.
+    let (titles, _) = scan_disc(six_titles_vmg(), logo_then(vec![(800, 809)]).0);
+    let ifo_lba = titles[0].extents[0].start_lba - 1000 - 100;
+    let high = |mut vts: Vec<u8>| {
+        vts[0xc4..0xc8].copy_from_slice(&(u32::MAX - 3500 - ifo_lba).to_be_bytes());
+        vts
+    };
+    let (titles, _) = scan_disc(six_titles_vmg(), high(logo_then(vec![(800, 809)]).0));
+    assert_eq!(titles[2].extents[0].start_lba, u32::MAX - 500);
+    assert_eq!(titles[3].extents[0].start_lba, u32::MAX, "E4 saturates");
+    assert!(has_roster(&titles), "control: the play-all proves a roster");
+    for (case, vts) in logo_cases(vec![(4000, 4099)]) {
+        let (titles, _) = scan_disc(six_titles_vmg(), high(vts));
+        assert!(titles[5].selection_evidence.segments.is_empty(), "{case}");
+        assert_no_dvd_roster(&titles);
+    }
 }

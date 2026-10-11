@@ -2488,16 +2488,43 @@ fn title_reach_keeps_each_beyond_range_once() {
     assert_eq!(reach.beyond.len(), 255);
 }
 
+// The title's own PGC, then one PGC per count of that many one-sector cells, all at
+// distinct sectors; the parts name every PGC.
+fn pgcs_beyond(counts: &[u32]) -> (Vec<u8>, Vec<(u16, u16)>) {
+    let mut pgcs = vec![reach_pgc(0, 0)];
+    for (i, &n) in (1u32..).zip(counts) {
+        let cells: Vec<_> = (0..n)
+            .map(|c| (0x00, bcd_secs(1), i * 1000 + c * 2, i * 1000 + c * 2))
+            .collect();
+        pgcs.push(build_pgc(bcd_secs(1), &cells, &[1], None));
+    }
+    let parts = (1..=pgcs.len() as u16).map(|p| (p, 1)).collect();
+    (build_pgcit(&pgcs), parts)
+}
+
 /// Round-5 correctness LOW: past MAX_REACH_CELLS distinct ranges beyond its own PGC, a
-/// title's reach is unknown (fail closed).
+/// title's reach is unknown (fail closed). Round-6 tests LOW: 1024 is in, 1025 out.
 #[test]
 fn title_reach_past_the_beyond_cap_is_unknown() {
-    let within = MAX_REACH_CELLS / 255;
-    let (data, parts) = wide_pgcs(within + 1, 1000);
-    let reach = title_reach(&data, 0, within + 1, 0, Some(&parts)).expect("within the cap");
-    assert_eq!(reach.beyond.len(), within * 255);
-    let (data, parts) = wide_pgcs(within + 2, 1000);
-    assert!(title_reach(&data, 0, within + 2, 0, Some(&parts)).is_none());
+    let (data, parts) = pgcs_beyond(&[255, 255, 255, 255, 4]);
+    let reach = title_reach(&data, 0, 6, 0, Some(&parts)).expect("within the cap");
+    assert_eq!(reach.beyond.len(), 1024);
+    let (data, parts) = pgcs_beyond(&[255, 255, 255, 255, 5]);
+    assert!(title_reach(&data, 0, 6, 0, Some(&parts)).is_none());
+}
+
+/// Round-6 craft NIT: a title's reach counts a cell's sectors by the extents' rule
+/// (saturating at u32::MAX), so the roster compares like with like.
+#[test]
+fn title_reach_counts_cell_sectors_as_extents_do() {
+    let whole = build_pgc(
+        bcd_secs(10),
+        &[(0x00, bcd_secs(10), 0, u32::MAX)],
+        &[1],
+        None,
+    );
+    let reach = title_reach(&build_pgcit(&[whole]), 0, 1, 0, Some(PART_1)).expect("bounded");
+    assert_eq!(reach.sectors, u64::from(u32::MAX));
 }
 
 /// Round-5 tests LOW: a later part, or a NextPGCN, naming a PGC past the table bounds

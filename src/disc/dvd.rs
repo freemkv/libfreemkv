@@ -76,15 +76,12 @@ fn interleaved_units(
     Ok((!units.is_empty()).then_some(units))
 }
 
-// Chapter (part of title) names moved onto the `programs` program marks: each part names the
-// program it starts at. `None` when that is not one name per program at most (a part in
-// another PGC, two parts on one program, a part past the marks).
 // A cell's VOB-relative sectors `first..=last` as read from the VOB at `vob_start`,
 // saturating: the one rule for extents and reach ranges, which the roster compares.
 fn cell_extent(vob_start: u32, first: u32, last: u32) -> Extent {
     Extent {
         start_lba: vob_start.saturating_add(first),
-        sector_count: last.saturating_sub(first).saturating_add(1),
+        sector_count: ifo::cell_sectors(first, last),
     }
 }
 
@@ -95,6 +92,9 @@ fn cell_range(vob_start: u32, first: u32, last: u32) -> (u64, u64) {
     (start, start + u64::from(e.sector_count))
 }
 
+// Chapter (part of title) names moved onto the `programs` program marks: each part names the
+// program it starts at. `None` when that is not one name per program at most (a part in
+// another PGC, two parts on one program, a part past the marks).
 fn program_names(
     names: &[Option<String>],
     title: &ifo::DvdTitle,
