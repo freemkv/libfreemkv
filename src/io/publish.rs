@@ -882,6 +882,25 @@ mod tests {
         }
     }
 
+    /// Round-4 tests LOW: an unreadable claim identity is reported left, carrying the fstat
+    /// errno, even when the re-check itself succeeds.
+    #[test]
+    #[cfg(unix)]
+    fn an_unknown_claim_identity_with_a_good_recheck_is_reported_as_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = pair(dir.path());
+        let steps = Fake {
+            no_claim_id: true,
+            ..Fake::claim_only()
+        };
+        let error = publish_with(&src, &dst, &steps).unwrap_err();
+        assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft));
+        assert_eq!(errno(&error), Some(libc::EIO), "the fstat errno");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0, "kept");
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload");
+    }
+
     // Swaps the target for a different empty file: made before the swap, so its inode
     // can never be the claim's recycled one.
     #[cfg(unix)]
