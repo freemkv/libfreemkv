@@ -8,6 +8,7 @@
 //! One video track plus every audio track with a clean MP4 mapping; codecs MP4
 //! can't carry are **excluded, never silently dropped** — [`fit_report`] says why.
 
+use super::fit::{FitReport, SkipReason};
 use crate::disc::{Codec, DiscTitle, Stream as DiscStream};
 use crate::pes::{PesFrame, PesSink};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -119,7 +120,7 @@ struct Track {
     /// 1-based MP4 track_ID.
     track_id: u32,
     /// `title.streams` index this track was built from — the identity
-    /// `Mp4FitReport` speaks in, so a track dropped at `finish()` can be named
+    /// `FitReport` speaks in, so a track dropped at `finish()` can be named
     /// in [`Mp4Sink::final_report`].
     stream_idx: usize,
     codec: Codec,
@@ -137,63 +138,12 @@ struct Track {
     samples: Vec<Sample>,
 }
 
-/// Why a stream was excluded from an `mp4://` mux (for the never-silent report).
-///
-/// Marked `#[non_exhaustive]`: new reasons appear as the writer learns to
-/// distinguish more of them, so downstream must not match exhaustively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Mp4SkipReason {
-    /// A subtitle track — MP4 carries only text subs; disc subs are bitmap.
-    BitmapSubtitle,
-    /// An audio codec with no MP4 mapping here (TrueHD, LPCM, …). AC-3/E-AC-3 and
-    /// DTS/DTS-HD ARE mapped and carried.
-    UnmappableAudio,
-    /// A secondary/dependent video view (e.g. MVC 3D right eye).
-    SecondaryVideo,
-    /// A primary video track whose codec this MP4 writer can't carry
-    /// (only HEVC/H.264 are supported — e.g. VC-1, MPEG-2, AV1).
-    UnmappableVideo,
-    /// A DVD MPEG-2 multichannel extension track
-    /// ([`AudioStream::is_mp2_extension`](crate::disc::AudioStream::is_mp2_extension)): MP4
-    /// has no mapping for ISO/IEC 13818-3 extension frames. A *post-mux* reason: reported
-    /// only once the track's packets arrived.
-    Mp2Extension,
-    /// Planned as carried, but the stream delivered no sample at all, so
-    /// `finish()` dropped the track rather than write an empty `trak`.
-    /// A *post-mux* reason: [`fit_report`] cannot predict it, only
-    /// [`Mp4Sink::final_report`] reports it.
-    NoSamples,
-    /// Planned as carried, and samples DID reach `mdat`, but no frame yielded a
-    /// parseable audio sample entry, so the track could not be described in
-    /// `stsd` and `finish()` dropped it (its bytes stay in `mdat`, unreferenced).
-    /// A *post-mux* reason — see [`Mp4Sink::final_report`].
-    UndescribableAudio,
-}
-
-/// The plan for an `mp4://` mux of `title`: which streams are carried and which
-/// are excluded (with the reason). The CLI prints the exclusions so a lossy
-/// export is never silent; the sink applies the same predicate.
-///
-/// [`fit_report`] returns the PRE-mux plan, which is a prediction: two of its
-/// inclusions can still fail at `finish()` (a stream that delivers no sample, an
-/// audio stream no frame of which yields a parseable sample entry). Ask
-/// [`Mp4Sink::final_report`] after `finish()` for what the file actually
-/// contains — the plan alone is not a statement about the output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mp4FitReport {
-    /// `title.streams` indices that will be muxed.
-    pub included: Vec<usize>,
-    /// Excluded `(stream index, reason)`.
-    pub skipped: Vec<(usize, Mp4SkipReason)>,
-}
-
 /// Compute the fit plan without opening a file. Video: the first primary
 /// HEVC/H.264 track. Audio: every track `audio::audio_fits` carries — the Dolby
 /// family (AC-3 / E-AC-3), DTS (core / DTS-HD HRA / DTS-HD MA), AAC and MPEG audio. Everything
 /// else is skipped with a reason, except a DVD MPEG-2 multichannel extension track, which
 /// only [`Mp4Sink::final_report`] lists, and only once its packets arrived.
-pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
+pub fn fit_report(title: &DiscTitle) -> FitReport {
     let mut included = Vec::new();
     let mut skipped = Vec::new();
     let mut have_video = false;
@@ -201,16 +151,16 @@ pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
         match s {
             DiscStream::Video(v) => {
                 if v.is_mvc_dependent() {
-                    skipped.push((i, Mp4SkipReason::SecondaryVideo));
+                    skipped.push((i, SkipReason::SecondaryVideo));
                 } else if !have_video && matches!(v.codec, Codec::Hevc | Codec::H264) {
                     included.push(i);
                     have_video = true;
                 } else if have_video {
                     // A second primary video (after one was already carried).
-                    skipped.push((i, Mp4SkipReason::SecondaryVideo));
+                    skipped.push((i, SkipReason::SecondaryVideo));
                 } else {
                     // First primary video, but an unsupported codec (VC-1/MPEG-2/AV1).
-                    skipped.push((i, Mp4SkipReason::UnmappableVideo));
+                    skipped.push((i, SkipReason::UnmappableVideo));
                 }
             }
             // Not planned either way: IFO coding mode 3 only declares it. The sink reports it
@@ -222,13 +172,13 @@ pub fn fit_report(title: &DiscTitle) -> Mp4FitReport {
                 if audio::audio_fits(a.codec) && described {
                     included.push(i);
                 } else {
-                    skipped.push((i, Mp4SkipReason::UnmappableAudio));
+                    skipped.push((i, SkipReason::UnmappableAudio));
                 }
             }
-            DiscStream::Subtitle(_) => skipped.push((i, Mp4SkipReason::BitmapSubtitle)),
+            DiscStream::Subtitle(_) => skipped.push((i, SkipReason::BitmapSubtitle)),
         }
     }
-    Mp4FitReport { included, skipped }
+    FitReport { included, skipped }
 }
 
 /// Pack an ISO 639-2 language ("eng") into the 15-bit mdhd form (bit 15 = 0,
@@ -266,10 +216,10 @@ pub struct Mp4Sink<W: Write + Seek> {
     finished: bool,
     /// The create-time (pre-mux) plan, kept so [`Self::final_report`] can hand
     /// back a report that matches the FILE rather than the prediction.
-    plan: Mp4FitReport,
+    plan: FitReport,
     /// Streams the plan promised that `finish()` actually dropped, with why, plus MPEG-2
     /// extension tracks whose packets arrived (the plan never lists those).
-    dropped: Vec<(usize, Mp4SkipReason)>,
+    dropped: Vec<(usize, SkipReason)>,
     /// MPEG-2 multichannel extension tracks (no MP4 mapping), reported once packets arrive.
     excluded: super::ps::UnstoredExtensions,
     /// Clip-join PTS correction, shared with the MKV muxer and the demux sink: a
@@ -394,10 +344,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
             finished: false,
             plan: report,
             excluded: super::ps::UnstoredExtensions::new(title, "MP4"),
-            timeline: crate::mux::timeline::TimelineContinuity::with_clips(
-                &title.clips,
-                title.content_format,
-            ),
+            timeline: crate::mux::timeline::TimelineContinuity::with_clips(&title.clips),
             ref_video,
             frames_mapped: 0,
             dropped: Vec::new(),
@@ -407,18 +354,18 @@ impl<W: Write + Seek> Mp4Sink<W> {
     /// What the file ACTUALLY contains, in the same shape as the pre-mux
     /// [`fit_report`] plan. Before `finish()` it equals that plan; after
     /// `finish()` every track the writer had to drop has moved from `included`
-    /// into `skipped` with a post-mux reason ([`Mp4SkipReason::NoSamples`],
-    /// [`Mp4SkipReason::UndescribableAudio`], [`Mp4SkipReason::Mp2Extension`]).
+    /// into `skipped` with a post-mux reason ([`SkipReason::NoSamples`],
+    /// [`SkipReason::UndescribableAudio`], [`SkipReason::Mp2Extension`]).
     ///
     /// Call this after `finish()`, not the pre-mux plan, before reporting what was written: the
     /// plan is only a prediction and can still list a stream `finish()` had to drop.
-    pub fn final_report(&self) -> Mp4FitReport {
+    pub fn final_report(&self) -> FitReport {
         let mut included = self.plan.included.clone();
         included.retain(|i| !self.dropped.iter().any(|(d, _)| d == i));
         let mut skipped = self.plan.skipped.clone();
         skipped.extend(self.dropped.iter().copied());
         skipped.sort_by_key(|&(i, _)| i);
-        Mp4FitReport { included, skipped }
+        FitReport { included, skipped }
     }
 
     /// Assemble the `moov` box from every track's sample tables.
@@ -459,8 +406,7 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
         }
         if self.excluded.drop_frame(frame.track) {
             if !self.dropped.iter().any(|&(i, _)| i == frame.track) {
-                self.dropped
-                    .push((frame.track, Mp4SkipReason::Mp2Extension));
+                self.dropped.push((frame.track, SkipReason::Mp2Extension));
             }
             return Ok(());
         }
@@ -561,7 +507,7 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
                     codec = ?t.codec,
                     "mp4: track received no samples, dropping it (see final_report)"
                 );
-                dropped.push((t.stream_idx, Mp4SkipReason::NoSamples));
+                dropped.push((t.stream_idx, SkipReason::NoSamples));
             }
             kept
         });
@@ -578,7 +524,7 @@ impl<W: Write + Seek + Send> PesSink for Mp4Sink<W> {
                     "mp4: no audio frame yielded a parseable sample entry, dropping track \
                      (see final_report)"
                 );
-                dropped.push((t.stream_idx, Mp4SkipReason::UndescribableAudio));
+                dropped.push((t.stream_idx, SkipReason::UndescribableAudio));
             }
             describable
         });

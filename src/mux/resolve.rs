@@ -5,11 +5,10 @@
 //! Every input scheme, `disc://` included, opens through [`super::source::open_source`];
 //! [`input`] is that plus the PES stream of one title.
 
+use super::MkvStream;
 use super::network::NetworkStream;
-use super::null::NullStream;
 use super::pipelined_stream::PipelinedPesStream;
 use super::stdio::StdioStream;
-use super::{M2tsStream, MkvStream};
 use crate::disc::{ContentFormat, DiscTitle};
 use crate::sector::SectorSource;
 use crate::sector::stage::Stage;
@@ -17,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// I/O buffer size for file streams.
-const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
+pub(crate) const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// File-backed ISO mux read size. Empirically optimal for the CLI: 16 MiB;
 /// 32 MiB regressed from cache pressure and longer per-batch latency.
@@ -94,33 +93,13 @@ pub enum StreamUrl {
 impl StreamUrl {
     /// The scheme name (e.g. "disc", "mkv", "null").
     pub fn scheme(&self) -> &str {
-        match self {
-            StreamUrl::Disc { .. } => "disc",
-            StreamUrl::M2ts { .. } => "m2ts",
-            StreamUrl::Mkv { .. } => "mkv",
-            StreamUrl::Mp4 { .. } => "mp4",
-            StreamUrl::Mpg { .. } => "mpg",
-            StreamUrl::Network { .. } => "network",
-            StreamUrl::Stdio => "stdio",
-            StreamUrl::Iso { .. } => "iso",
-            StreamUrl::Dir { .. } => "dir",
-            StreamUrl::Null => "null",
-            StreamUrl::Demux { .. } => "demux",
-            StreamUrl::Video { .. } => "video",
-            StreamUrl::Audio { .. } => "audio",
-            StreamUrl::Sub { .. } => "sub",
-            StreamUrl::Fvi { .. } => "fvi",
-            StreamUrl::Chapters { .. } => "chapters",
-            StreamUrl::Json { .. } => "json",
-            StreamUrl::Unknown { .. } => "unknown",
-        }
+        self.info().name
     }
 
-    /// The path/address component, or empty string for scheme-only URLs.
-    pub fn path_str(&self) -> &str {
+    /// The filesystem file or folder this URL names; `None` for a device, an address, a
+    /// scheme-only URL or an unknown one.
+    pub fn path(&self) -> Option<&Path> {
         match self {
-            StreamUrl::Disc { device: Some(p) } => p.to_str().unwrap_or(""),
-            StreamUrl::Disc { device: None } => "",
             StreamUrl::M2ts { path }
             | StreamUrl::Mkv { path }
             | StreamUrl::Mp4 { path }
@@ -133,10 +112,22 @@ impl StreamUrl {
             | StreamUrl::Sub { dir: path }
             | StreamUrl::Fvi { path }
             | StreamUrl::Chapters { path }
-            | StreamUrl::Json { path } => path.to_str().unwrap_or(""),
+            | StreamUrl::Json { path } => Some(path),
+            StreamUrl::Disc { .. }
+            | StreamUrl::Network { .. }
+            | StreamUrl::Stdio
+            | StreamUrl::Null
+            | StreamUrl::Unknown { .. } => None,
+        }
+    }
+
+    /// The path/address component, or empty string for scheme-only URLs.
+    pub fn path_str(&self) -> &str {
+        match self {
+            StreamUrl::Disc { device } => device.as_deref().and_then(Path::to_str).unwrap_or(""),
             StreamUrl::Network { addr } => addr,
-            StreamUrl::Stdio | StreamUrl::Null => "",
             StreamUrl::Unknown { raw } => raw,
+            _ => self.path().and_then(Path::to_str).unwrap_or(""),
         }
     }
 
@@ -146,14 +137,12 @@ impl StreamUrl {
     ///
     /// `dir://` joined in 1.6.1 via a synthesized UDF volume (`crate::dirimage`).
     ///
-    /// NOT the same predicate as the CLI's `engine::is_disc_source`, which
-    /// means "is a live drive" and drives tray/eject behaviour. That one must
-    /// never gain `Dir` — a directory routed down the live-drive rip path
-    /// would open, lock and eject a drive that has nothing to do with it.
+    /// NOT the CLI's live-drive `engine::is_disc_source`: a `dir://` routed down the
+    /// live-drive rip path would open, lock and eject an unrelated drive.
     pub fn is_disc_source(&self) -> bool {
         matches!(
-            self,
-            StreamUrl::Disc { .. } | StreamUrl::Iso { .. } | StreamUrl::Dir { .. }
+            self.info().source,
+            Some(super::scheme::SourceKind::Drive | super::scheme::SourceKind::Image)
         )
     }
 }
@@ -264,7 +253,7 @@ pub fn parse_url(url: &str) -> StreamUrl {
 }
 
 /// Validate that a file path is non-empty and has a filename component.
-fn validate_file_path(path: &Path, scheme: &str) -> io::Result<()> {
+pub(crate) fn validate_file_path(path: &Path, scheme: &str) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(crate::error::Error::StreamUrlMissingPath {
             scheme: scheme.to_string(),
@@ -281,7 +270,7 @@ fn validate_file_path(path: &Path, scheme: &str) -> io::Result<()> {
 }
 
 /// Validate that a network address has host:port format.
-fn validate_network_addr(addr: &str) -> io::Result<()> {
+pub(crate) fn validate_network_addr(addr: &str) -> io::Result<()> {
     if addr.is_empty() {
         return Err(crate::error::Error::StreamUrlMissingPath {
             scheme: "network".to_string(),
@@ -463,7 +452,6 @@ fn open_container(
             }
             Ok(Box::new(stdio))
         }
-        StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `mp4://` as a source: demux a progressive MP4 back into PES frames, so
         // `mp4://` flows to every sink (mkv://, audio://, json://, …).
         StreamUrl::Mp4 { ref path } => {
@@ -479,24 +467,17 @@ fn open_container(
             validate_file_path(path, "mpg")?;
             Ok(Box::new(build_ps_pipeline(path, opts, ctx)?))
         }
-        // `demux://` is an output-only sink (per-track ES files); never a source.
-        StreamUrl::Demux { .. }
-        | StreamUrl::Video { .. }
-        | StreamUrl::Audio { .. }
-        | StreamUrl::Sub { .. }
-        | StreamUrl::Chapters { .. }
-        | StreamUrl::Json { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
-        // `fvi://` is an output-only sink (per-picture video index); never a source.
-        StreamUrl::Fvi { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
-        StreamUrl::Disc { .. } | StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => {
-            Err(crate::error::Error::StreamUrlInvalid {
-                url: url.to_string(),
-            }
-            .into())
-        }
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
+        // An output-only scheme is never a source; a drive or an image is not a container.
+        ref other if other.info().source.is_none() => {
+            Err(crate::error::Error::StreamWriteOnly.into())
+        }
+        _ => Err(crate::error::Error::StreamUrlInvalid {
+            url: url.to_string(),
+        }
+        .into()),
     }
 }
 
@@ -590,34 +571,6 @@ where
     build_iso_pipeline_keyed(reader, title, set, ISO_MUX_BATCH_SECTORS, ctx)
 }
 
-// A `DemuxSink` over `dir`, its base name seeded from the playlist name.
-fn demux_sink_output(
-    dir: &std::path::Path,
-    title: &DiscTitle,
-    mut opts: super::demux_sink::DemuxOptions,
-) -> io::Result<Box<dyn crate::pes::PesSink>> {
-    if !title.playlist.is_empty() {
-        opts.base = title.playlist.clone();
-    }
-    Ok(Box::new(super::demux_sink::DemuxSink::create(
-        dir, title, &opts,
-    )?))
-}
-
-// `video://`/`audio://`/`sub://`: a `demux://` restricted to one track class, no chapters sidecar.
-fn track_sink_output(
-    dir: &std::path::Path,
-    title: &DiscTitle,
-    kind: super::demux_sink::TrackKind,
-) -> io::Result<Box<dyn crate::pes::PesSink>> {
-    let opts = super::demux_sink::DemuxOptions {
-        kind_filter: Some(kind),
-        export_chapters: false,
-        ..Default::default()
-    };
-    demux_sink_output(dir, title, opts)
-}
-
 /// What an output scheme can take (pipeline design §2.2 sink caps): the one table the mux
 /// consults, instead of matching on schemes in the pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -633,35 +586,7 @@ pub struct SinkCaps {
 impl SinkCaps {
     /// The caps of the output scheme `url`.
     pub fn of(url: &StreamUrl) -> SinkCaps {
-        let full = SinkCaps {
-            needs_frames: true,
-            carries_mp2_extensions: true,
-        };
-        match url {
-            StreamUrl::Chapters { .. } | StreamUrl::Json { .. } => SinkCaps {
-                needs_frames: false,
-                ..full
-            },
-            StreamUrl::Mkv { .. }
-            | StreamUrl::Mp4 { .. }
-            | StreamUrl::M2ts { .. }
-            | StreamUrl::Demux { .. }
-            | StreamUrl::Audio { .. } => SinkCaps {
-                carries_mp2_extensions: false,
-                ..full
-            },
-            StreamUrl::Mpg { .. }
-            | StreamUrl::Network { .. }
-            | StreamUrl::Stdio
-            | StreamUrl::Null
-            | StreamUrl::Video { .. }
-            | StreamUrl::Sub { .. }
-            | StreamUrl::Fvi { .. }
-            | StreamUrl::Disc { .. }
-            | StreamUrl::Iso { .. }
-            | StreamUrl::Dir { .. }
-            | StreamUrl::Unknown { .. } => full,
-        }
+        super::pes_output::PesOutput::caps_of(url)
     }
 }
 
@@ -687,20 +612,6 @@ pub(crate) struct OutputFlush<'a> {
     pub(crate) halt: &'a crate::halt::Halt,
 }
 
-// A file output's bounded-cache writer, sharing `flush` when given.
-fn writeback_file(
-    path: &Path,
-    size_hint: u64,
-    flush: Option<&OutputFlush>,
-) -> io::Result<crate::io::WritebackFile> {
-    let mut w = crate::io::WritebackFile::create_with_size_hint(path, size_hint)?;
-    if let Some(f) = flush {
-        w.set_flush_progress(f.progress.clone());
-        w.set_halt(f.halt.clone());
-    }
-    Ok(w)
-}
-
 // [`output`], with the file outputs sharing `flush` (the mux driver's path).
 pub(crate) fn output_with(
     url: &str,
@@ -708,115 +619,8 @@ pub(crate) fn output_with(
     source: Option<&super::videomap::SourceInfo>,
     flush: Option<OutputFlush>,
 ) -> io::Result<Box<dyn crate::pes::PesSink>> {
-    let flush = flush.as_ref();
     let parsed = parse_url(url);
-    match parsed {
-        StreamUrl::Mkv { ref path } => {
-            validate_file_path(path, "mkv")?;
-            // Wrap in `WritebackFile` (bounded-cache) so a UHD mux to slow/
-            // network staging avoids dirty-page bursts. BufWriter coalesces
-            // small EBML writes; Linux fallocate(KEEP_SIZE) cuts fragmentation.
-            let writer: Box<dyn super::WriteSeek + Send> =
-                Box::new(std::io::BufWriter::with_capacity(
-                    IO_BUF_SIZE,
-                    writeback_file(path, title.size_bytes, flush)?,
-                ));
-            Ok(Box::new(MkvStream::create(writer, title, Some(path))?))
-        }
-        StreamUrl::Mp4 { ref path } => {
-            validate_file_path(path, "mp4")?;
-            // Bounded-cache writeback (like mkv://) avoids dirty-page bursts
-            // on slow/network staging; the mdat backpatch is an ordinary
-            // seek WritebackFile handles. BufWriter coalesces moov writes.
-            let writer = std::io::BufWriter::with_capacity(
-                IO_BUF_SIZE,
-                writeback_file(path, title.size_bytes, flush)?,
-            );
-            Ok(Box::new(super::mp4::Mp4Sink::create(writer, title)?))
-        }
-        StreamUrl::Mpg { ref path } => {
-            validate_file_path(path, "mpg")?;
-            // Streaming pack writer, no seeks: the bounded-cache writeback as for mkv://.
-            let writer = std::io::BufWriter::with_capacity(
-                IO_BUF_SIZE,
-                writeback_file(path, title.size_bytes, flush)?,
-            );
-            Ok(Box::new(super::mpg::MpgSink::create(writer, title)?))
-        }
-        StreamUrl::M2ts { ref path } => {
-            validate_file_path(path, "m2ts")?;
-            let writer = std::io::BufWriter::with_capacity(
-                IO_BUF_SIZE,
-                writeback_file(path, title.size_bytes, flush)?,
-            );
-            Ok(Box::new(M2tsStream::create(writer, title)?))
-        }
-        StreamUrl::Network { ref addr } => {
-            // `NetworkStream::connect` refuses only unspecified/multicast/
-            // broadcast targets; LAN and loopback hosts are allowed.
-            validate_network_addr(addr)?;
-            Ok(Box::new(NetworkStream::connect(addr)?.meta(title)))
-        }
-        StreamUrl::Stdio => Ok(Box::new(StdioStream::output(title))),
-        StreamUrl::Null => Ok(Box::new(NullStream::new(title))),
-        StreamUrl::Disc { .. } => Err(crate::error::Error::StreamReadOnly.into()),
-        // `iso://` and `dir://` are block outputs, not PES sinks: a whole-disc copy writes
-        // them (`crate::io::open_block_sink`, `Disc::extract_tree`).
-        StreamUrl::Iso { .. } | StreamUrl::Dir { .. } => {
-            Err(crate::error::Error::StreamReadOnly.into())
-        }
-        // `demux://` with default options. The CLI constructs `DemuxSink`
-        // directly (with parsed flags) before reaching here; this arm
-        // covers the bare `output()` call with the default option set.
-        StreamUrl::Demux { ref dir } => {
-            validate_file_path(dir, "demux")?;
-            // Full `--demux/--naming/--delay/--container/--chapters` flags
-            // are parsed in the CLI, which builds `DemuxSink` directly. This
-            // bare arm uses defaults but seeds `base` from the playlist name.
-            demux_sink_output(dir, title, super::demux_sink::DemuxOptions::default())
-        }
-        // `video://`, `audio://`, `sub://` are `demux://` restricted to one
-        // track class. No chapters sidecar (that's a `demux://`/`chapters://`
-        // concern).
-        StreamUrl::Video { ref dir } => {
-            validate_file_path(dir, "video")?;
-            track_sink_output(dir, title, super::demux_sink::TrackKind::Video)
-        }
-        StreamUrl::Audio { ref dir } => {
-            validate_file_path(dir, "audio")?;
-            track_sink_output(dir, title, super::demux_sink::TrackKind::Audio)
-        }
-        StreamUrl::Sub { ref dir } => {
-            validate_file_path(dir, "sub")?;
-            track_sink_output(dir, title, super::demux_sink::TrackKind::Subtitle)
-        }
-        // `fvi://` writes the per-picture video index. The header's `source` describes the
-        // INPUT, from caller-supplied `source` — never `path`, which previously broke
-        // reproducibility.
-        StreamUrl::Fvi { ref path } => {
-            validate_file_path(path, "fvi")?;
-            Ok(Box::new(super::fvi_sink::FviSink::create(
-                path,
-                title,
-                source.cloned().unwrap_or_default(),
-            )?))
-        }
-        // `chapters://`/`json://` write title metadata at construction and
-        // ignore the PES stream (see `meta_sink`).
-        StreamUrl::Chapters { ref path } => {
-            validate_file_path(path, "chapters")?;
-            Ok(Box::new(super::meta_sink::ChaptersSink::create(
-                path, title,
-            )?))
-        }
-        StreamUrl::Json { ref path } => {
-            validate_file_path(path, "json")?;
-            Ok(Box::new(super::meta_sink::JsonSink::create(path, title)?))
-        }
-        StreamUrl::Unknown { ref raw } => {
-            Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
-        }
-    }
+    super::pes_output::PesOutput::of(&parsed)?.open(title, source, flush.as_ref())
 }
 
 // Demuxer-side state derived from a `DiscTitle`: codec parser table (by PID),

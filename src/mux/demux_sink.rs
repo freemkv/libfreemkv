@@ -771,7 +771,7 @@ impl DemuxSink {
             ref_video_track,
             video_tracks,
             ref_first_pts_ns: None,
-            timeline: TimelineContinuity::with_clips(&title.clips, title.content_format),
+            timeline: TimelineContinuity::with_clips(&title.clips),
             finished: false,
             frames_mapped: 0,
             excluded,

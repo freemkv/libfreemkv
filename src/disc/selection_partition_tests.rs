@@ -11,6 +11,7 @@ fn title(id: u16, clips: &[(&str, u32, u32)]) -> DiscTitle {
     let clips: Vec<_> = clips
         .iter()
         .map(|&(clip, in_time, out_time)| Clip {
+            marks_on_pes_clock: true,
             clip_id: clip.into(),
             in_time,
             out_time,

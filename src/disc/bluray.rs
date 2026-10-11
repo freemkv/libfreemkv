@@ -299,6 +299,7 @@ impl Disc {
 
             clips.push(Clip {
                 feed_span: spans.get(&play_item.clip_id).copied(),
+                marks_on_pes_clock: true,
                 clip_id: play_item.clip_id.clone(),
                 in_time: play_item.in_time,
                 out_time: play_item.out_time,

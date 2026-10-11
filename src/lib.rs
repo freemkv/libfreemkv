@@ -242,8 +242,19 @@ pub use mux::{Medium, SourceInfo};
 pub use mux::{
     MkvProbe, MkvProbeTrack, MkvTrackKind, parse_freemkv_version, probe_mkv, probe_mkv_with_cues,
 };
+/// Why a stream was excluded from an `mp4://` mux: the container-neutral [`SkipReason`].
 #[cfg(feature = "rip")]
-pub use mux::{Mp4FitReport, Mp4Sink, Mp4SkipReason, mp4_fit_report};
+#[deprecated(note = "use SkipReason")]
+pub type Mp4SkipReason = mux::SkipReason;
+/// The plan for an `mp4://` mux: the container-neutral [`FitReport`]. A pre-mux plan is a
+/// prediction; [`Mp4Sink::final_report`] says what the file holds after `finish()`.
+#[cfg(feature = "rip")]
+#[deprecated(note = "use FitReport")]
+pub type Mp4FitReport = mux::FitReport;
+#[cfg(feature = "rip")]
+pub use mux::{Mp4Sink, mp4_fit_report};
+#[cfg(feature = "rip")]
+pub use mux::{SchemeInfo, SinkKind, SourceKind, UrlTarget};
 
 // ─── Lower-level surfaces ───────────────────────────────────────────────────
 // `ScsiTransport` is the platform trait Drive uses, exposed for out-of-tree

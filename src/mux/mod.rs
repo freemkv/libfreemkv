@@ -18,6 +18,7 @@
 pub mod driver;
 pub mod pipelined_stream;
 pub mod resolve;
+mod scheme;
 pub mod select;
 mod selected;
 pub mod source;
@@ -56,6 +57,7 @@ pub(crate) mod mp4;
 pub(crate) mod mpg;
 pub(crate) mod network;
 pub(crate) mod null;
+pub(crate) mod pes_output;
 pub(crate) mod ps;
 pub(crate) mod resync;
 pub(crate) mod stdio;
@@ -82,15 +84,23 @@ pub use mkvstream::{
 };
 pub use source::{ScannedTitle, Source, open_source};
 pub use videomap::{Medium, SourceInfo};
+/// Why a stream was excluded from an `mp4://` mux: the container-neutral [`SkipReason`].
+#[deprecated(note = "use SkipReason")]
+pub type Mp4SkipReason = fit::SkipReason;
+/// The plan for an `mp4://` mux: the container-neutral [`FitReport`]. A pre-mux plan is a
+/// prediction; [`Mp4Sink::final_report`] says what the file holds after `finish()`.
+#[deprecated(note = "use FitReport")]
+pub type Mp4FitReport = fit::FitReport;
 // `Mp4Sink` is public so a caller driving the sink can ask `final_report()` what
 // the finished file contains — the pre-mux `mp4_fit_report` is only a prediction,
 // and two of its inclusions can still be dropped at `finish()`.
-pub use mp4::{Mp4FitReport, Mp4Sink, Mp4SkipReason, fit_report as mp4_fit_report};
+pub use mp4::{Mp4Sink, fit_report as mp4_fit_report};
 pub use mpg::MpgSink;
 pub use network::{NetworkStream, is_blocked_ip};
 pub use null::NullStream;
 pub use pipelined_stream::PipelinedPesStream;
 pub use resolve::{InputOptions, SinkCaps, StreamUrl, disc_root_of, input, output, parse_url};
+pub use scheme::{SchemeInfo, SinkKind, SourceKind, UrlTarget};
 pub use stdio::StdioStream;
 
 use std::io::{Seek, Write};

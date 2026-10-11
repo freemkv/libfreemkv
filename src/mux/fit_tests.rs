@@ -1,7 +1,7 @@
 use super::*;
 use crate::disc::{
-    AudioChannels, AudioStream, ColorSpace, FrameRate, HdrFormat, LabelPurpose, LabelQualifier,
-    Resolution, SampleRate, SubtitleStream, VideoStream,
+    AudioChannels, AudioStream, Codec, ColorSpace, FrameRate, HdrFormat, LabelPurpose,
+    LabelQualifier, Resolution, SampleRate, SubtitleStream, VideoStream,
 };
 use crate::mux::resolve::parse_url;
 
@@ -120,9 +120,7 @@ fn mp4_is_the_mp4_plan_through_the_wrapper() {
     ]);
     let mp4 = super::super::mp4::fit_report(&t);
     let r = fit_report(&parse_url("mp4:///o/x.mp4"), &t);
-    assert_eq!(r.included, mp4.included);
-    let want: Vec<(usize, SkipReason)> = mp4.skipped.iter().map(|&(i, s)| (i, s.into())).collect();
-    assert_eq!(r.skipped, want);
+    assert_eq!(r, mp4);
     assert_eq!(
         r.skipped,
         vec![

@@ -233,6 +233,9 @@ pub struct Clip {
     /// source byte offset (`PesFrame::source`) — which falls in exactly one
     /// clip's span — is used for assignment instead of timestamps alone.
     pub feed_span: Option<(u64, u64)>,
+    /// The in/out marks run on the clock the clip's PES timestamps run on, so a mux can cut
+    /// at them. Only the Blu-ray scanner sets it (PlayItem marks share the 45 kHz PTS clock).
+    pub marks_on_pes_clock: bool,
 }
 
 /// Per-title classification for [`Disc::main_feature_order`]. All three fields

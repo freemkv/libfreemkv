@@ -375,6 +375,16 @@ pub(crate) fn is_mappable(s: &crate::disc::Stream) -> bool {
     }
 }
 
+// The pre-mux plan's reason `mkv://` leaves stream `s` out: no Matroska CodecID.
+pub(crate) fn fit_refusal(s: &crate::disc::Stream) -> Option<super::fit::SkipReason> {
+    use super::fit::SkipReason;
+    (!is_mappable(s)).then_some(match s {
+        crate::disc::Stream::Video(_) => SkipReason::UnmappableVideo,
+        crate::disc::Stream::Audio(_) => SkipReason::UnmappableAudio,
+        crate::disc::Stream::Subtitle(_) => SkipReason::UnmappableSubtitle,
+    })
+}
+
 // Test shorthands for [`MkvTrack::from_stream`] on a stream known to be mappable.
 #[cfg(test)]
 impl MkvTrack {
@@ -1463,13 +1473,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// Drive seam correction from the title's PlayItem marks instead of inferring it from PTS
     /// jumps. Each clip is placed at the sum of the earlier clips' durations, so output runs
     /// exactly as long as the playlist says. No-op for fewer than two clips or without usable
-    /// marks — DVD, HD-DVD and file sources keep the inference path.
-    pub(crate) fn set_clips(
-        &mut self,
-        clips: &[crate::disc::Clip],
-        content_format: crate::disc::ContentFormat,
-    ) {
-        self.continuity = TimelineContinuity::with_clips(clips, content_format);
+    /// marks on the PES clock: DVD, HD-DVD and file sources keep the inference path.
+    pub(crate) fn set_clips(&mut self, clips: &[crate::disc::Clip]) {
+        self.continuity = TimelineContinuity::with_clips(clips);
     }
 
     /// Write a single frame. `duration_ns = Some` emits a `BlockGroup` with

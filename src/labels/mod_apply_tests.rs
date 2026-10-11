@@ -66,6 +66,7 @@ fn title_on_clip(playlist: &str, clip_id: &str, streams: Vec<Stream>) -> DiscTit
         selection_evidence: Default::default(),
         playlist: playlist.into(),
         clips: vec![crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: clip_id.into(),
             in_time: 0,
@@ -1252,6 +1253,7 @@ fn title_on_clips(playlist: &str, clip_ids: &[&str], streams: Vec<Stream>) -> Di
         clips: clip_ids
             .iter()
             .map(|id| crate::disc::Clip {
+                marks_on_pes_clock: true,
                 feed_span: None,
                 clip_id: (*id).into(),
                 in_time: 0,

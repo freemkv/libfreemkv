@@ -285,6 +285,7 @@ fn a_clip_split_across_two_play_items_keeps_both_halves() {
     // One file, one span. Two PlayItems: [0s,10s) then [10s,20s).
     const SPAN: (u64, u64) = (0, 4_000_000);
     let mk = |in_t: u32, out_t: u32| crate::disc::Clip {
+        marks_on_pes_clock: true,
         feed_span: Some(SPAN),
         clip_id: "00001".into(),
         in_time: in_t,
@@ -334,6 +335,7 @@ fn pic(keyframe: bool) -> SeamPic {
 fn the_in_mark_never_keeps_a_picture_whose_reference_it_dropped() {
     const F: i64 = 41_708_333; // one 23.976 fps frame (ns)
     let clips = vec![crate::disc::Clip {
+        marks_on_pes_clock: true,
         feed_span: Some((0, 1_000_000)),
         clip_id: "00001".into(),
         in_time: 45_000, // IN = 1 s, mid-GOP
@@ -360,6 +362,7 @@ fn the_in_mark_never_keeps_a_picture_whose_reference_it_dropped() {
 /// pictures in decode order returning which were kept.
 fn place_run(pics: &[(i64, bool, CodingType)]) -> (Vec<bool>, u64) {
     let clips = vec![crate::disc::Clip {
+        marks_on_pes_clock: true,
         feed_span: Some((0, 1_000_000)),
         clip_id: "00001".into(),
         in_time: 45_000,
@@ -578,6 +581,7 @@ fn a_nine_hundred_clip_title_resolves_every_frame_correctly() {
     const CLIP_BYTES: u64 = 5_000_000;
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
+            marks_on_pes_clock: true,
             clip_id: format!("{i:05}"),
             in_time: i * CLIP_TICKS,
             out_time: (i + 1) * CLIP_TICKS,
@@ -632,6 +636,7 @@ fn one_clip_file_behind_every_play_item_is_not_distinguishable_by_byte() {
     const SEG: u32 = 600 * 45_000; // 10 min per sub-range
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
+            marks_on_pes_clock: true,
             clip_id: "00001".to_string(), // the SAME file every time
             in_time: i * SEG,
             out_time: (i + 1) * SEG,
@@ -680,6 +685,7 @@ fn marks_that_do_not_advance_are_placed_by_provenance() {
     const CLIP_BYTES: u64 = 4_000_000_000;
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
+            marks_on_pes_clock: true,
             clip_id: format!("{i:05}"),
             in_time: 0,
             out_time: SEG,
@@ -719,6 +725,7 @@ fn marks_that_do_not_advance_are_still_refused_without_spans() {
     const SEG: u32 = 600 * 45_000;
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
+            marks_on_pes_clock: true,
             clip_id: format!("{i:05}"),
             in_time: 0,
             out_time: SEG,
@@ -738,6 +745,7 @@ fn a_restarting_clock_table_without_spans_is_still_refused() {
     const CLIP_TICKS: u32 = 600 * 45_000;
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
+            marks_on_pes_clock: true,
             clip_id: format!("{i:05}"),
             in_time: 0,
             out_time: CLIP_TICKS,
@@ -774,6 +782,7 @@ fn seamless_branching_clips() -> Vec<crate::disc::Clip> {
         .iter()
         .enumerate()
         .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: format!("{i:05}"),
             in_time,
@@ -902,7 +911,7 @@ fn seam_plan_places_a_lagging_passive_frame_in_the_previous_clip() {
 #[test]
 fn map_under_a_seam_plan_tracks_offset_and_frontier() {
     let clips = seamless_branching_clips();
-    let mut tc = TimelineContinuity::with_clips(&clips, crate::disc::ContentFormat::BdTs);
+    let mut tc = TimelineContinuity::with_clips(&clips);
     assert!(tc.seams.is_some(), "a multi-clip title must get a plan");
 
     let c0_in = mpls_ticks_to_ns(clips[0].in_time);
@@ -1062,15 +1071,21 @@ fn each_track_crosses_a_join_on_its_own_frame() {
     );
 }
 
-// Only Blu-ray gets a mark-driven plan: HD-DVD/DVD marks are not PES-clock positions.
+// Only marks on the PES clock (Blu-ray's) get a mark-driven plan: HD-DVD/DVD marks are not.
 #[test]
 fn only_blu_ray_gets_a_mark_driven_plan() {
     let clips = seamless_branching_clips();
-    let bd = TimelineContinuity::with_clips(&clips, crate::disc::ContentFormat::BdTs);
+    let bd = TimelineContinuity::with_clips(&clips);
     assert!(bd.seams.is_some(), "Blu-ray marks are PES-clock positions");
 
-    // The same table under the program-stream formats (DVD, HD-DVD).
-    let ps = TimelineContinuity::with_clips(&clips, crate::disc::ContentFormat::MpegPs);
+    // The same table with its marks on another clock (DVD, HD-DVD).
+    let off_clock: Vec<crate::disc::Clip> = (clips.iter().cloned())
+        .map(|c| crate::disc::Clip {
+            marks_on_pes_clock: false,
+            ..c
+        })
+        .collect();
+    let ps = TimelineContinuity::with_clips(&off_clock);
     assert!(
         ps.seams.is_none(),
         "DVD and HD-DVD must keep the inference path"
@@ -1082,6 +1097,7 @@ fn only_blu_ray_gets_a_mark_driven_plan() {
         .iter()
         .enumerate()
         .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+            marks_on_pes_clock: false,
             feed_span: None,
             clip_id: format!("{i}"),
             in_time,
@@ -1095,10 +1111,8 @@ fn only_blu_ray_gets_a_mark_driven_plan() {
         "fixture: the shared-clock check does NOT reject this table"
     );
     assert!(
-        TimelineContinuity::with_clips(&hddvd, crate::disc::ContentFormat::MpegPs)
-            .seams
-            .is_none(),
-        "so the format gate is what keeps HD-DVD off the plan"
+        TimelineContinuity::with_clips(&hddvd).seams.is_none(),
+        "so the clock marker is what keeps HD-DVD off the plan"
     );
 }
 
@@ -1136,6 +1150,7 @@ fn a_restarting_clock_falls_back_to_inference() {
             .iter()
             .enumerate()
             .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+                marks_on_pes_clock: true,
                 feed_span: None,
                 clip_id: format!("{i}"),
                 in_time,
@@ -1173,6 +1188,7 @@ fn contiguous_clips_produce_a_constant_offset() {
         .iter()
         .enumerate()
         .map(|(i, &(in_time, out_time))| crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: format!("{i}"),
             in_time,
