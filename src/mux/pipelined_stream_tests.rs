@@ -171,7 +171,7 @@ fn dvd_navigation_runs_only_on_dvd_titles() {
     let mpg = three_cell_feed(crate::disc::ContentFormat::MpegPs, vec![], vec![whole(12)]);
     assert_eq!(mpg, all, "an mpg:// file keeps every cell");
     let evo = crate::disc::Clip {
-        marks_on_pes_clock: true,
+        marks_on_pes_clock: false,
         clip_id: "FEATURE_1".into(),
         in_time: 0,
         out_time: 0,

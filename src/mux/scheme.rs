@@ -3,7 +3,6 @@
 
 use super::resolve::StreamUrl;
 use super::videomap::Medium;
-use crate::disc::CodecKind;
 
 /// How a scheme opens as an input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +45,7 @@ pub enum UrlTarget {
 
 /// The static facts of one scheme (see [`StreamUrl::info`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SchemeInfo {
     /// The scheme name, without `://`.
     pub name: &'static str,
@@ -57,8 +57,6 @@ pub struct SchemeInfo {
     pub target: UrlTarget,
     /// The provenance medium it records as a source ([`Medium::File`] for an output-only one).
     pub medium: Medium,
-    /// The one track class a per-track output keeps; `None` keeps every class.
-    pub track_filter: Option<CodecKind>,
 }
 
 const fn info(
@@ -74,21 +72,17 @@ const fn info(
         sink,
         target,
         medium,
-        track_filter: None,
     }
 }
 
-const fn tracks(name: &'static str, kind: Option<CodecKind>) -> SchemeInfo {
-    SchemeInfo {
-        track_filter: kind,
-        ..info(
-            name,
-            None,
-            Some(SinkKind::Pes),
-            UrlTarget::Dir,
-            Medium::File,
-        )
-    }
+const fn tracks(name: &'static str) -> SchemeInfo {
+    info(
+        name,
+        None,
+        Some(SinkKind::Pes),
+        UrlTarget::Dir,
+        Medium::File,
+    )
 }
 
 const fn sink(name: &'static str, target: UrlTarget) -> SchemeInfo {
@@ -144,10 +138,10 @@ const MPG: SchemeInfo = container("mpg");
 const NETWORK: SchemeInfo = wire("network", UrlTarget::Address);
 const STDIO: SchemeInfo = wire("stdio", UrlTarget::None);
 const NULL: SchemeInfo = sink("null", UrlTarget::None);
-const DEMUX: SchemeInfo = tracks("demux", None);
-const VIDEO: SchemeInfo = tracks("video", Some(CodecKind::Video));
-const AUDIO: SchemeInfo = tracks("audio", Some(CodecKind::Audio));
-const SUB: SchemeInfo = tracks("sub", Some(CodecKind::Subtitle));
+const DEMUX: SchemeInfo = tracks("demux");
+const VIDEO: SchemeInfo = tracks("video");
+const AUDIO: SchemeInfo = tracks("audio");
+const SUB: SchemeInfo = tracks("sub");
 const FVI: SchemeInfo = sink("fvi", UrlTarget::File);
 const CHAPTERS: SchemeInfo = sink("chapters", UrlTarget::File);
 const JSON: SchemeInfo = sink("json", UrlTarget::File);

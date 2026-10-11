@@ -2,8 +2,8 @@
 //! disk via direct `seek + read_exact`, letting the kernel's own
 //! readahead policy handle prefetch instead of an app-level buffer.
 //!
-//! Issues a platform "sequential access" hint on open, prefetches the
-//! next window (batched on macOS), and periodically evicts the consumed
+//! Issues a sequential hint on open (Linux only; a no-op elsewhere),
+//! prefetches the next window (batched on macOS), and periodically evicts the consumed
 //! byte range via `posix_fadvise(DONTNEED)` to bound page-cache pressure.
 
 #[cfg(target_os = "linux")]
