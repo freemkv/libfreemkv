@@ -2896,10 +2896,11 @@ fn a_navigation_timer_has_no_segments_and_no_roster() {
     }
 }
 
-/// Round-3 LOW: a pre command that always skips the first program or cell plays less
-/// than the PGC; only conditional entry links (chapter-select ladders) keep segments.
+/// Round-3 LOW: an unconditional entry link keeps segments only when it names program 1
+/// or cell 1 itself (LinkPGN 1, LinkCN 1). Any other, LinkPTTN 1 included (where part 1
+/// starts is not resolved here), fails closed; conditional ladders keep segments.
 #[test]
-fn an_unconditional_entry_link_past_the_start_has_no_segments() {
+fn an_unconditional_entry_link_not_naming_the_first_program_or_cell_has_no_segments() {
     let link_pgn = |n| [0x20, 0x06, 0, 0, 0, 0, 0, n];
     let link_cn = |n| [0x20, 0x07, 0, 0, 0, 0, 0, n];
     let goto_3_unless_1 = [0x00, 0xb1, 0, 0, 0, 1, 0, 3];
@@ -2908,7 +2909,7 @@ fn an_unconditional_entry_link_past_the_start_has_no_segments() {
         vec![link_cn(2)],
         vec![[0x20, 0x01, 0, 0, 0, 0, 0, 1]], // LinkTopC
         vec![[0x20, 0x01, 0, 0, 0, 0, 0, 5]], // LinkTopPG
-        vec![link_pttn(1)],
+        vec![link_pttn(1)], // part 1 starts at program 1, yet unresolved: fails closed
         vec![[0x71, 0x06, 0, 1, 0, 5, 0, 2]], // SetGPRM, then LinkPGN 2
         // Both paths reach the LinkPGN 2 on line 3.
         vec![goto_3_unless_1, SET_GPRM1_5, link_pgn(2)],
