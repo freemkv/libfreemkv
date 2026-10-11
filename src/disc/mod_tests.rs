@@ -5819,22 +5819,6 @@ fn read_mkb_content_releases_the_padding_capacity() {
     assert!(got.capacity() < 1024 * 1024, "capacity {}", got.capacity());
 }
 
-#[test]
-fn layers_follow_the_format_capacity() {
-    for (fmt, sectors, want) in [
-        (DiscFormat::Dvd, 2_298_496, 1),
-        (DiscFormat::Dvd, 4_173_824, 2),
-        (DiscFormat::HdDvd, 7_300_000, 1),
-        (DiscFormat::HdDvd, 14_600_000, 2),
-        (DiscFormat::HdDvd, 22_000_000, 3),
-        (DiscFormat::BluRay, 12_219_392, 1),
-        (DiscFormat::BluRay, 24_438_784, 2),
-        (DiscFormat::Uhd, 48_878_592, 3),
-    ] {
-        assert_eq!(Disc::layers_for(fmt, sectors), want, "{fmt:?} {sectors}");
-    }
-}
-
 // A Stop during the image scan's forced-subtitle probe must not yield Ok(Disc).
 #[test]
 fn scan_image_stopped_during_forced_probe_is_halted() {

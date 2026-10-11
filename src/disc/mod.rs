@@ -16,6 +16,7 @@ mod dvd_menu;
 mod encrypt;
 pub(crate) use encrypt::handshake_class_error;
 mod extract;
+mod format;
 mod hddvd;
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
@@ -1882,7 +1883,7 @@ impl Disc {
         let encrypted = aacs_dir_present(&udf_fs)
             && (format != DiscFormat::HdDvd
                 || hddvd::hddvd_content_scrambled(&mut buffered, &udf_fs) != Some(false));
-        let layers = Self::layers_for(format, capacity);
+        let layers = format.layers(capacity);
 
         Ok(DiscId {
             volume_id: udf_fs.volume_id,
@@ -1892,24 +1893,6 @@ impl Disc {
             encrypted,
             layers,
         })
-    }
-
-    // Layer count inferred from capacity against the format's per-layer size.
-    fn layers_for(format: DiscFormat, capacity: u32) -> u8 {
-        // Upper sector bounds of (1, 2) layers; above the second is 3 (BD-100, HD DVD TL).
-        let (one, two) = match format {
-            DiscFormat::Dvd => (2_400_000, u32::MAX),
-            DiscFormat::HdDvd => (8_000_000, 16_000_000),
-            DiscFormat::BluRay | DiscFormat::Uhd | DiscFormat::Fmts => (12_500_000, 40_000_000),
-            DiscFormat::Unknown => (12_500_000, u32::MAX),
-        };
-        if capacity <= one {
-            1
-        } else if capacity <= two {
-            2
-        } else {
-            3
-        }
     }
 
     /// Disc capacity in GB
@@ -2670,12 +2653,8 @@ impl Disc {
         // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD), layers and
         //    region: the DVD's VMG mask, region-free UHD, otherwise not statically recorded.
         let format = Self::detect_disc_format(reader, &udf_fs, &titles);
-        let layers = Self::layers_for(format, capacity);
-        let region = match (dvd_region, format) {
-            (Some(region), _) => region,
-            (None, DiscFormat::Uhd | DiscFormat::Fmts) => DiscRegion::Free,
-            (None, _) => DiscRegion::Unknown,
-        };
+        let layers = format.layers(capacity);
+        let region = dvd_region.unwrap_or_else(|| format.default_region());
 
         // 6. CSS: `scan_image` cracks the title key after this returns and `scan_live` only
         // runs bus-auth. The reader-based crack is NOT run here: on a CSS disc it would
