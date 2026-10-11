@@ -83,6 +83,18 @@ fn repeats(presentation: &[usize]) -> bool {
     !presentation.iter().all(|i| seen.insert(*i))
 }
 
+// Non-empty sector ranges a title reads, as half-open `[start, end)`.
+fn sector_ranges(title: &DiscTitle) -> impl Iterator<Item = (u64, u64)> + '_ {
+    title
+        .extents
+        .iter()
+        .filter(|e| e.sector_count > 0)
+        .map(|e| {
+            let start = u64::from(e.start_lba);
+            (start, start + u64::from(e.sector_count))
+        })
+}
+
 // Lowest wrapper title id and per-title member ordinal.
 fn partition(titles: &[DiscTitle]) -> Option<(u16, Vec<Option<usize>>)> {
     fn segments(t: &DiscTitle) -> &[ContentSegment] {
@@ -152,6 +164,34 @@ fn partition(titles: &[DiscTitle]) -> Option<(u16, Vec<Option<usize>>)> {
         {
             return None;
         }
+    }
+    // A title the scanner could not describe, yet reading the roster's sectors, may be a
+    // longer or competing play-all: no roster can be proven.
+    let mut read: Vec<(u64, u64)> = Vec::new();
+    for (title, group) in titles.iter().zip(&group_of) {
+        if group.is_some_and(|g| g == wrapper || order.contains(&g)) {
+            read.extend(sector_ranges(title));
+        }
+    }
+    read.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in read {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let blocked = titles
+        .iter()
+        .zip(&group_of)
+        .filter(|(_, group)| group.is_none())
+        .flat_map(|(title, _)| sector_ranges(title))
+        .any(|(start, end)| {
+            let at = merged.partition_point(|r| r.0 < end);
+            at > 0 && merged[at - 1].1 > start
+        });
+    if blocked {
+        return None;
     }
     // A recap, logo or diary inside the play-all would shift every later ordinal.
     let total: u128 = order.iter().map(|&g| u128::from(group_ticks[g])).sum();

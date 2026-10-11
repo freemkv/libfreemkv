@@ -406,3 +406,80 @@ fn dvd_title_without_segments_is_no_member() {
     titles[6].selection_evidence.segments.clear();
     assert_unknown(&run_dvd(titles));
 }
+
+// Sector ranges for a title, as the scanners record what it reads.
+fn reading(mut t: DiscTitle, ranges: &[(u32, u32)]) -> DiscTitle {
+    t.extents = ranges
+        .iter()
+        .map(|&(start_lba, sector_count)| crate::disc::Extent {
+            start_lba,
+            sector_count,
+        })
+        .collect();
+    t
+}
+
+// Four episodes at sectors 100.., playlist 10 over the first two.
+fn four_episodes_with_head() -> Vec<DiscTitle> {
+    let mut titles: Vec<_> = (1..=4u32)
+        .map(|n| {
+            let clip = format!("{n:05}");
+            let ep = secs(n as u16, &[(clip.as_str(), 0, 2700)]);
+            reading(ep, &[(n * 100, 50)])
+        })
+        .collect();
+    titles.push(reading(
+        secs(10, &[("00001", 0, 2700), ("00002", 0, 2700)]),
+        &[(100, 50), (200, 50)],
+    ));
+    titles
+}
+
+#[test]
+fn bd_undescribable_playall_over_the_members_is_unknown() {
+    let mut titles = four_episodes_with_head();
+    // A zero-length final clip makes the longest playlist undescribable.
+    titles.push(reading(
+        secs(
+            20,
+            &[
+                ("00001", 0, 2700),
+                ("00002", 0, 2700),
+                ("00003", 0, 2700),
+                ("00004", 0, 2700),
+                ("00009", 5, 5),
+            ],
+        ),
+        &[(100, 50), (200, 50), (300, 50), (400, 50)],
+    ));
+    assert!(titles[5].selection_evidence.segments.is_empty());
+    assert_unknown(&run(titles));
+}
+
+#[test]
+fn dvd_undescribable_playall_over_the_members_is_unknown() {
+    let cells = [(100, 149), (200, 249), (300, 349), (400, 449)];
+    let mut titles: Vec<_> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| dvd(i as u16 + 1, &[c]))
+        .collect();
+    titles.push(dvd(10, &[cells[0], cells[1]]));
+    // Random or shuffle play-all: segments withheld, extents still read.
+    let mut playall = dvd(20, &cells);
+    playall.selection_evidence.segments.clear();
+    titles.push(playall);
+    assert_unknown(&run_dvd(titles));
+}
+
+#[test]
+fn undescribable_title_elsewhere_does_not_block_a_roster() {
+    let mut titles = four_episodes_with_head();
+    titles.push(reading(
+        secs(30, &[("00030", 7, 7)]),
+        &[(9000, 20), (9100, 20)],
+    ));
+    titles.push(secs(31, &[("00031", 7, 7)]));
+    let titles = run(titles);
+    assert_roster(&titles, "bd-playall-partition-v1:10", &[(1, 0), (2, 1)]);
+}
