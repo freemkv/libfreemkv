@@ -36,3 +36,37 @@ fn a_sink_that_opens_keeps_its_file() {
         .unwrap();
     assert!(std::fs::metadata(&path).unwrap().len() > 0);
 }
+
+/// Round-5 tests LOW: another file renamed in at the path between create and the failure
+/// is not the file we created, so it is kept.
+#[test]
+fn a_failed_open_keeps_another_file_renamed_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.mkv");
+    let other = dir.path().join("other.mkv");
+    let r = created(&path, || {
+        std::fs::write(&other, b"theirs").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        Err(io::ErrorKind::Other.into())
+    });
+    assert!(r.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+}
+
+/// Round-5 security LOW: a symlink at the path is never taken for our file, even one
+/// that resolves to it.
+#[cfg(unix)]
+#[test]
+fn a_failed_open_keeps_a_symlink_to_the_created_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.mkv");
+    let moved = dir.path().join("moved.mkv");
+    let r = created(&path, || {
+        std::fs::rename(&path, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &path).unwrap();
+        Err(io::ErrorKind::Other.into())
+    });
+    assert!(r.is_err());
+    let link = std::fs::symlink_metadata(&path).expect("symlink kept");
+    assert!(link.file_type().is_symlink());
+}

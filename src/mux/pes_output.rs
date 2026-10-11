@@ -245,29 +245,44 @@ impl<'u> PesOutput<'u> {
     }
 }
 
-// Opens a file output's sink with `open`. A file absent before (claimed by create_new) that
-// the open then fails to fill is removed, while the path still names it; a file that was
-// already there is never removed.
+// Opens a file output's sink with `open`. A file it created (create_new, identity from that
+// handle) and failed to fill is removed while the path names it, never via a symlink. A second
+// writer that opened the same name shares that inode and cannot be told apart.
 fn created(path: &Path, open: impl FnOnce() -> io::Result<Opened>) -> io::Result<Opened> {
-    use crate::io::artifact_lock::file_identity;
+    use crate::io::artifact_lock::file_identity_of;
     let ours = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
     {
-        Ok(_) => file_identity(path).ok(),
+        Ok(file) => file_identity_of(&file).ok(),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
         Err(e) => return Err(e),
     };
     let sink = open();
     if sink.is_err()
         && let Some(id) = ours
-        && file_identity(path).ok() == Some(id)
+        && regular_identity(path) == Some(id)
         && let Err(e) = std::fs::remove_file(path)
     {
         tracing::warn!(target: "mux", error = %e, "a failed output's new file could not be removed");
     }
     sink
+}
+
+// The identity of the regular file `path` names, read without following a symlink.
+fn regular_identity(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    crate::io::artifact_lock::file_identity(path).ok()
 }
 
 // A file output's bounded-cache writer, sharing `flush` when given, and its identity.
