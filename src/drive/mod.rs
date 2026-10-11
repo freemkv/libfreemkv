@@ -18,28 +18,9 @@ pub fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     }
 }
 
-// Per-platform discovery helpers (the `pub(crate)` `find_drives` /
-// equivalents). Crate-public so `scsi/{linux,macos,windows}.rs` can
-// reuse the existing enumeration logic when shaping `DriveInfo`.
-#[cfg(target_os = "linux")]
-pub(crate) mod linux;
-#[cfg(target_os = "macos")]
-pub(crate) mod macos;
-#[cfg(windows)]
-pub(crate) mod windows;
-
 pub(crate) mod allow;
 #[cfg(test)]
 mod stop_tests;
-
-// Pick the platform module ONCE, here, so the cross-platform entry points below
-// dispatch through `platform::…` with no per-function `#[cfg]` in their bodies.
-#[cfg(target_os = "linux")]
-pub(crate) use linux as platform;
-#[cfg(target_os = "macos")]
-pub(crate) use macos as platform;
-#[cfg(windows)]
-pub(crate) use windows as platform;
 
 use crate::error::{Error, Result};
 use crate::halt::{Halt, Liveness};
@@ -1581,15 +1562,7 @@ impl SectorSource for Drive {
 /// opened if none report a disc. Only one drive is held open at a time. For
 /// just listing drives without opening, use `scsi::list_drives()` instead.
 pub fn find_drive() -> Option<Drive> {
-    #[cfg(target_os = "macos")]
-    let candidates = crate::scsi::list_drives()
-        .into_iter()
-        .map(|info| info.path)
-        .collect::<Vec<_>>();
-
-    #[cfg(not(target_os = "macos"))]
-    let candidates = platform::candidate_paths();
-
+    let candidates = crate::scsi::list_drives().into_iter().map(|info| info.path);
     select_drive_with_media(candidates, |path| {
         match Drive::open(std::path::Path::new(path)) {
             Ok(drive) if drive.drive_id.is_optical() => Some(drive),
@@ -1730,27 +1703,6 @@ fn is_read_class(cdb: &[u8]) -> bool {
         cdb.first(),
         Some(&(crate::scsi::SCSI_READ_10 | 0xA8 | 0x88 | 0xBE | 0xB9))
     )
-}
-
-/// Structured outcome of `resolve_device` — a machine-readable signal
-/// (no English prose) the application layer can render however it likes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceResolution {
-    /// Path resolved directly to a SCSI-generic device; no substitution.
-    Direct,
-    /// A `/dev/sr*` block path was substituted with the matching
-    /// `/dev/sg*` SCSI-generic device for raw access (Linux only).
-    SrToSg,
-    /// A `/dev/sr*` block path was given but no matching `/dev/sg*`
-    /// device could be found; the original path is returned (Linux only).
-    SrNoSgMatch,
-}
-
-// Resolve a device path to its raw SCSI device; returns the resolved path plus a
-// DeviceResolution signal. Staged, not yet wired — allow(dead_code) is deliberate.
-#[allow(dead_code)]
-pub(crate) fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
-    platform::resolve_device(path)
 }
 
 #[cfg(test)]
