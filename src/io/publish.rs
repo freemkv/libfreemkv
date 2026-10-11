@@ -65,7 +65,7 @@ struct Faulted {
 #[cfg(unix)]
 impl fmt::Display for Faulted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.fault, self.source)
+        self.fault.fmt(f)
     }
 }
 
@@ -77,10 +77,13 @@ impl std::error::Error for Faulted {
 }
 
 #[cfg(unix)]
-fn claim_left(source: io::Error) -> io::Error {
-    let kind = source.kind();
-    let fault = Fault::ClaimLeft;
+fn faulted(kind: io::ErrorKind, fault: Fault, source: io::Error) -> io::Error {
     io::Error::new(kind, Faulted { fault, source })
+}
+
+#[cfg(unix)]
+fn claim_left(source: io::Error) -> io::Error {
+    faulted(source.kind(), Fault::ClaimLeft, source)
 }
 
 impl fmt::Display for Fault {
@@ -211,17 +214,30 @@ fn claim_then_rename(source: &Path, target: &Path, steps: &impl Steps) -> io::Re
             // The re-check itself failed: not a claim change. Remove our placeholder only
             // if lstat proves it is the empty file we created; unless that removal worked
             // or lstat proved it gone or foreign, it may be left (module docs: residual).
-            let cleared = match steps.lstat(target) {
-                Err(m) if m.kind() == io::ErrorKind::NotFound => true,
-                Ok(m) if !m.is_file() || m.len() != 0 => true,
-                Ok(m) if ours.is_some_and(|id| id != (m.dev(), m.ino())) => true,
+            let gone = |e| faulted(io::ErrorKind::ResourceBusy, Fault::ClaimChanged, e);
+            let (left, why) = match steps.lstat(target) {
+                Err(m) if m.kind() == io::ErrorKind::NotFound => return Err(gone(e)),
+                Ok(m) if !m.is_file() || m.len() != 0 => return Err(normalize(e)),
+                Ok(m) if ours.is_some_and(|id| id != (m.dev(), m.ino())) => {
+                    return Err(normalize(e));
+                }
                 Ok(_) if ours.is_some() => match steps.remove(target) {
-                    Ok(()) => true,
-                    Err(r) => r.kind() == io::ErrorKind::NotFound,
+                    Ok(()) => return Err(normalize(e)),
+                    Err(r) if r.kind() == io::ErrorKind::NotFound => return Err(gone(e)),
+                    Err(r) => (r, "remove"),
                 },
-                _ => false,
+                Ok(_) => (io::Error::other("unknown claim identity"), "fstat"),
+                Err(m) => (m, "lstat"),
             };
-            return Err(if cleared { normalize(e) } else { claim_left(e) });
+            tracing::warn!(
+                target: "freemkv::io",
+                phase = "publish_claim",
+                recheck_error = %e,
+                step = why,
+                step_error = %left,
+                "the publish claim may be left at the target name"
+            );
+            return Err(claim_left(e));
         }
     }
     match steps.remove(target) {
@@ -824,20 +840,50 @@ mod tests {
         }
     }
 
+    /// Re-review nit 6: a claim found gone after a failed re-check (by lstat, or by the
+    /// unlink) changed, as when the re-check itself finds it gone; the errno is kept.
     #[test]
     #[cfg(unix)]
-    fn a_failed_recheck_with_the_claim_gone_is_the_plain_error() {
+    fn a_failed_recheck_with_the_claim_gone_is_claim_changed() {
+        for remove in [None, Some(libc::ENOENT)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (src, dst) = pair(dir.path());
+            let vanish: Hook = Box::new(|p| std::fs::remove_file(p).unwrap());
+            let steps = Fake {
+                fresh: Some(libc::EIO),
+                claimed: remove.is_none().then_some(vanish),
+                remove,
+                ..Fake::claim_only()
+            };
+            let error = publish_with(&src, &dst, &steps).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ResourceBusy, "{remove:?}");
+            assert_eq!(Fault::of(&error), Some(Fault::ClaimChanged), "{remove:?}");
+            assert_eq!(errno(&error), Some(libc::EIO), "{remove:?}");
+            assert_eq!(std::fs::read(&src).unwrap(), b"payload");
+        }
+    }
+
+    /// Re-review nit 6: a possibly-left claim logs the step error it discards, and the
+    /// error's Display names the fault without repeating its source.
+    #[test]
+    #[cfg(unix)]
+    fn a_left_claim_logs_the_discarded_errno_once() {
         let dir = tempfile::tempdir().unwrap();
         let (src, dst) = pair(dir.path());
         let steps = Fake {
             fresh: Some(libc::EIO),
-            claimed: Some(Box::new(|p| std::fs::remove_file(p).unwrap())),
+            remove: Some(libc::EBUSY),
             ..Fake::claim_only()
         };
-        let error = publish_with(&src, &dst, &steps).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EIO));
-        assert_eq!(Fault::of(&error), None);
-        assert_eq!(names(dir.path()), ["src"]);
+        let (r, events) = crate::testlog::capture(|| publish_with(&src, &dst, &steps));
+        let error = r.unwrap_err();
+        assert_eq!(error.to_string(), "publish_claim_left");
+        let busy = io::Error::from_raw_os_error(libc::EBUSY).to_string();
+        let logged = events
+            .iter()
+            .find(|e| e.field("step") == Some("remove"))
+            .expect("the discarded removal error is logged");
+        assert_eq!(logged.field("step_error"), Some(busy.as_str()));
     }
 
     // Documented residual window: on a local filesystem the final rename is an

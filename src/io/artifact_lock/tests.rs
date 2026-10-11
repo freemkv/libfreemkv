@@ -186,6 +186,13 @@ fn child_helper() {
         println!("CHILD:{m}");
         io::stdout().flush().unwrap();
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if mode == "cifs" {
+        say("ready");
+        cifs_rounds(&out);
+        say("done");
+        return;
+    }
     let mut lines = io::stdin().lock().lines();
     let lock = take(&out, WINDOW).expect("child takes the lock");
     say("held");
@@ -269,6 +276,10 @@ impl Child {
         let stdin = self.proc.stdin.as_mut().unwrap();
         stdin.write_all(b"go\n").unwrap();
         stdin.flush().unwrap();
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn exits_ok(mut self) {
+        assert!(self.proc.wait().unwrap().success());
     }
     fn finish(mut self) {
         self.send();
@@ -386,12 +397,32 @@ fn name_derived_ids_cannot_admit_a_waiter_holding_the_deleted_sidecar() {
 // the exclusive lock, ours or another process's.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_refused_while_locked(p: &Path, max: u64) -> io::Result<Vec<u8>> {
-    let probe = File::open(p)?;
-    if !os::try_lock_exclusive(&probe)? {
+    if flock_held(p)? {
         return Err(io::Error::from_raw_os_error(libc::EACCES));
     }
-    drop(probe);
     real_read(p, max)
+}
+
+// macOS F_GETLK reports a flock without taking one (probed: l_type F_WRLCK, l_pid -1).
+#[cfg(target_os = "macos")]
+fn flock_held(p: &Path) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let f = File::open(p)?;
+    // SAFETY: all-zero is a valid `struct flock`.
+    let mut query: libc::flock = unsafe { std::mem::zeroed() };
+    query.l_type = libc::F_WRLCK as _;
+    query.l_whence = libc::SEEK_SET as _;
+    // SAFETY: the fd is open for the call and `query` is a valid in/out pointer.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut query) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(query.l_type != libc::F_UNLCK as libc::c_short)
+}
+
+// Linux keeps flock and fcntl locks apart, so no query sees a flock: a probe takes it.
+#[cfg(target_os = "linux")]
+fn flock_held(p: &Path) -> io::Result<bool> {
+    Ok(!os::try_lock_exclusive(&File::open(p)?)?)
 }
 
 /// Review B1: a waiter holding the deleted sidecar (name-derived ids) whose read-back
@@ -403,6 +434,47 @@ fn a_read_back_refused_by_another_holders_lock_is_not_proof() {
         os::names_with(f, p, &real_write, &read_refused_while_locked, relock)
     };
     waiter_must_not_keep_a_replaced_sidecar_with(name_derived, &names);
+}
+
+// Acquire and briefly hold the sidecar, many times, every read-back refused under a lock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cifs_rounds(out: &Path) {
+    let slow = |p: &Path, max: u64| {
+        thread::sleep(Duration::from_millis(5));
+        read_refused_while_locked(p, max)
+    };
+    let names =
+        |f: &File, p: &Path, relock: &Lock<'_>| os::names_with(f, p, &real_write, &slow, relock);
+    let hooks = Hooks {
+        ids: &|f, p| (os::file_id(f), os::path_id(p)),
+        lock: &os::try_lock_exclusive,
+        names: &names,
+    };
+    for round in 0..30 {
+        let window = Duration::from_secs(3);
+        let lock = ArtifactLock::acquire_full(out, &[], &Halt::new(), window, &hooks)
+            .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+        thread::sleep(Duration::from_millis(2));
+        drop(lock);
+    }
+}
+
+/// Re-review S2: two processes on the CIFS model, each acquiring through the unlock
+/// window, both keep making progress (no livelock into a spurious E9073).
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn two_cifs_acquirers_both_make_progress() {
+    if !cross_process() {
+        return;
+    }
+    let (dir, out) = artifact();
+    let mut child = Child::spawn(dir.path(), "cifs");
+    child.wait_for("ready");
+    let t = Instant::now();
+    cifs_rounds(&out);
+    child.wait_for("done");
+    child.exits_ok();
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
 }
 
 // Token proof unavailable: the acquire falls back to the dev/ino match already made.
@@ -545,6 +617,42 @@ fn a_read_back_refused_by_another_holder_retries() {
     }
 }
 
+/// Re-review S1: a peer outside the token protocol (1.8.3, a no-token fallback admit)
+/// deletes, recreates and locks the sidecar inside our unlock window. The relock lands on
+/// the orphan with our token intact; only re-checking the inode match refuses it.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_sidecar_replaced_during_the_unlocked_proof_is_not_ours() {
+    let (_dir, out) = artifact();
+    let path = lock_path(&out);
+    let peer = std::sync::Mutex::new(None::<File>);
+    let swapped = AtomicBool::new(false);
+    let relock = |f: &File| {
+        if !swapped.swap(true, Ordering::SeqCst) {
+            std::fs::remove_file(&path).unwrap();
+            let new = os::open_rw(&path).unwrap();
+            assert!(os::try_lock_exclusive(&new).unwrap());
+            *peer.lock().unwrap() = Some(new);
+        }
+        os::try_lock_exclusive(f)
+    };
+    let names = |f: &File, p: &Path, _: &Lock<'_>| {
+        os::names_with(f, p, &real_write, &read_refused_while_locked, &relock)
+    };
+    let hooks = Hooks {
+        ids: &|f, p| (os::file_id(f), os::path_id(p)),
+        lock: &os::try_lock_exclusive,
+        names: &names,
+    };
+    let window = Duration::from_millis(300);
+    let r = ArtifactLock::acquire_full(&out, &[], &Halt::new(), window, &hooks);
+    assert!(swapped.load(Ordering::SeqCst), "the proof never relocked");
+    assert!(
+        matches!(r, Err(Error::TimedOut { .. })),
+        "admitted on the deleted orphan while a peer holds the new sidecar: {r:?}"
+    );
+}
+
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
@@ -613,6 +721,95 @@ fn enoent_and_estale_on_the_token_io_still_retry() {
         assert!(r.is_ok(), "read errno {code}: {r:?}");
         assert_eq!(calls, 2, "read errno {code}: one retry");
     }
+}
+
+/// Re-review nit 5: the path read fails like a stale handle (as the write side does), on
+/// the first read or the one made with our lock released: retry, never fail the acquire.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_token_read_failing_like_a_stale_handle_retries() {
+    for code in [libc::EBADF, libc::ENOTCONN, libc::ETIMEDOUT, libc::EIO] {
+        for refusals in [0, 1] {
+            let n = std::sync::atomic::AtomicUsize::new(0);
+            let read = |p: &Path, max: u64| match n.fetch_add(1, Ordering::SeqCst) {
+                i if i < refusals => Err(io::Error::from_raw_os_error(libc::EACCES)),
+                i if i == refusals => Err(io::Error::from_raw_os_error(code)),
+                _ => real_read(p, max),
+            };
+            let (r, calls) = acquire_with_token_io(&real_write, &read);
+            assert!(r.is_ok(), "errno {code} after {refusals} refusals: {r:?}");
+            assert_eq!(
+                calls, 2,
+                "errno {code} after {refusals} refusals: one retry"
+            );
+        }
+    }
+}
+
+/// Re-review nit 5: no ftruncate (FUSE) falls back to the inode match as 1.8.3 did; the
+/// same errno from the write itself still fails the acquire.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_token_truncate_unsupported_falls_back_to_the_inode_match() {
+    for code in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+        let write =
+            |_: &File, _: &[u8]| Err(os::truncate_error(io::Error::from_raw_os_error(code)));
+        let (r, calls) = acquire_with_token_io(&write, &real_read);
+        assert!(r.is_ok(), "errno {code}: {r:?}");
+        assert_eq!(calls, 1, "errno {code}: no retry");
+    }
+    let eio = os::truncate_error(io::Error::from_raw_os_error(libc::EIO));
+    assert_eq!(
+        eio.raw_os_error(),
+        Some(libc::EIO),
+        "other errors pass through"
+    );
+}
+
+/// Re-review S2: after a failed proof the wait adds a random backoff, widening with
+/// consecutive failures, so colliding acquirers drift apart.
+#[test]
+fn the_backoff_after_a_failed_proof_is_random_and_bounded() {
+    assert_eq!(backoff(0), Duration::ZERO);
+    for lost in 1..6u32 {
+        let span = WAIT_SLICE * (1 << lost.min(3));
+        let draws: Vec<_> = (0..32).map(|_| backoff(lost)).collect();
+        assert!(draws.iter().all(|d| *d < span), "{lost}: {draws:?}");
+        assert!(draws.iter().any(|d| *d != draws[0]), "{lost}: not random");
+    }
+}
+
+/// Re-review nit 5: a wait that expires because the proof kept failing says so, rather
+/// than blaming another holder.
+#[test]
+fn an_expiry_names_a_failing_proof_apart_from_a_holder() {
+    let (_dir, out) = artifact();
+    let real_ids = |f: &File, p: &Path| (os::file_id(f), os::path_id(p));
+    let never = |_: &File, _: &Path, _: &Lock<'_>| Ok(Proof::Retry(replaced()));
+    let hooks = Hooks {
+        ids: &real_ids,
+        lock: &os::try_lock_exclusive,
+        names: &never,
+    };
+    let window = Duration::from_millis(200);
+    let (r, events) = crate::testlog::capture(|| {
+        ArtifactLock::acquire_full(&out, &[], &Halt::new(), window, &hooks)
+    });
+    assert!(matches!(r, Err(Error::TimedOut { .. })), "{r:?}");
+    let messages: Vec<_> = events.iter().map(|e| e.message().to_string()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("never proved")),
+        "{messages:?}"
+    );
+    assert!(!messages.iter().any(|m| m.contains("another process")));
+    let _holder = take(&out, WINDOW).expect("holder");
+    let (r, events) = crate::testlog::capture(|| take(&out, window));
+    assert!(matches!(r, Err(Error::TimedOut { .. })), "{r:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message().contains("another process holds"))
+    );
 }
 
 /// §2.5 lifetime: "Deleted on success … and on Discard, both while holding it. Kept
@@ -780,7 +977,8 @@ fn estale_from_fstat_retries() {
         &os::try_lock_exclusive,
     );
     assert!(lock.is_ok(), "{lock:?}");
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry, then held");
+    // One retry, then held: that attempt checks the ids before and after the token proof.
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "one retry, then held");
 }
 
 // Probed live: on macOS smbfs a second fd in the same process takes flock(LOCK_EX)
