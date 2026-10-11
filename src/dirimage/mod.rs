@@ -11,14 +11,7 @@ mod encode;
 mod layout;
 
 use crate::error::{Error, Result};
-#[cfg(target_os = "linux")]
-use crate::io::file_sector_source::linux::drop_window;
-#[cfg(target_os = "macos")]
-use crate::io::file_sector_source::macos::drop_window;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use crate::io::file_sector_source::other::drop_window;
-#[cfg(target_os = "windows")]
-use crate::io::file_sector_source::windows::drop_window;
+use crate::io::file_sector_source::platform::drop_window;
 use crate::sector::SectorSource;
 use encode::{MetaSectors, SECTOR};
 use std::fs::File;
