@@ -40,7 +40,7 @@ impl ContentSegment {
         clips
             .iter()
             .map(|clip| {
-                (!clip.clip_id.trim().is_empty() && clip.in_time < clip.out_time).then(|| Self {
+                (!clip.clip_id.is_empty() && clip.in_time < clip.out_time).then(|| Self {
                     unit: clip.clip_id.clone(),
                     start: clip.in_time.into(),
                     end: clip.out_time.into(),
