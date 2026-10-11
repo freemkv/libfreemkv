@@ -383,6 +383,33 @@ fn parse_truncated_play_item_keeps_the_items_before_it() {
     let playlist = parse(cut).expect("damage must not drop the parsed items");
     assert_eq!(playlist.play_items.len(), 1);
     assert_eq!(playlist.play_items[0].clip_id, "00001");
+    assert!(playlist.truncated && !playlist.plays_in_order());
+}
+
+// AppInfoPlayList (byte 40) carries PlayList_playback_type at byte 45; a PlayList
+// starting before byte 46 leaves no room for it.
+#[test]
+fn parse_reads_the_playlist_playback_type() {
+    let flat = build_mpls(&[(b"00001", 1, 0, 4500000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
+    assert_eq!(parse(&flat).unwrap().playback_type, None);
+    // Same playlist behind an 18-byte AppInfoPlayList.
+    let mut data = flat[..40].to_vec();
+    data[8..12].copy_from_slice(&58u32.to_be_bytes());
+    data.extend_from_slice(&14u32.to_be_bytes());
+    data.extend_from_slice(&[0, 2]);
+    data.extend_from_slice(&[0; 12]);
+    data.extend_from_slice(&flat[40..]);
+    let mark_start = u32::from_be_bytes(data[12..16].try_into().unwrap());
+    if mark_start != 0 {
+        data[12..16].copy_from_slice(&(mark_start + 18).to_be_bytes());
+    }
+    let random = parse(&data).unwrap();
+    assert_eq!(random.playback_type, Some(2));
+    assert_eq!(random.play_items.len(), 1);
+    assert!(!random.plays_in_order());
+    data[45] = 1;
+    let sequential = parse(&data).unwrap();
+    assert!(!sequential.truncated && sequential.plays_in_order());
 }
 
 #[test]
@@ -1033,7 +1060,8 @@ fn short_play_item_skipped_cursor_advances() {
     buf[pl_start..pl_start + 4].copy_from_slice(&pl_len.to_be_bytes());
 
     let pl = parse(&buf).expect("should parse with a short leading item");
-    // Only the valid second item is retained.
+    // Only the valid second item is retained, and the list is marked incomplete.
+    assert!(pl.truncated);
     assert_eq!(pl.play_items.len(), 1);
     assert_eq!(pl.play_items[0].clip_id, "00009");
     assert_eq!(pl.play_items[0].in_time, 90000);
@@ -1424,6 +1452,8 @@ fn duration_ticks_sums_and_saturates_inverted_items() {
         play_items: vec![pi(10, 110), pi(500, 100), pi(0, 50)],
         streams: vec![],
         marks: vec![],
+        playback_type: Some(1),
+        truncated: false,
     };
     assert_eq!(pl.duration_ticks(), 150);
 }

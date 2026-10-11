@@ -91,7 +91,7 @@ fn assert_roster(titles: &[DiscTitle], roster: &str, members: &[(u16, usize)]) {
 }
 
 fn run(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "bd-playall-partition-v1");
+    annotate(&mut titles, "bd-playall-partition-v1", true);
     titles
 }
 
@@ -314,6 +314,34 @@ fn clip_cap_is_unknown() {
     assert_unknown(&run(titles));
 }
 
+// Exactly at either cap the partition still runs; the `+ 1` tests above are past it.
+fn blue_planet_ii_roster(titles: &[DiscTitle]) {
+    let members = [(166, 0), (147, 0), (167, 1), (148, 1)];
+    assert_roster(titles, "bd-playall-partition-v1:163", &members);
+}
+
+#[test]
+fn title_cap_itself_keeps_the_roster() {
+    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let pad = u16::try_from(MAX_TITLES - titles.len()).unwrap();
+    titles.extend((1000..1000 + pad).map(short_extra));
+    assert_eq!(titles.len(), MAX_TITLES);
+    blue_planet_ii_roster(&run(titles));
+}
+
+#[test]
+fn clip_cap_itself_keeps_the_roster() {
+    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let used: usize = titles.iter().map(|t| t.clips.len()).sum();
+    let menu = format!("00014:524280-2710839*{}", MAX_SEGMENTS - used);
+    titles.push(scanned(&format!("00162 | {menu}")));
+    let total: usize = (titles.iter())
+        .map(|t| t.selection_evidence.segments.len())
+        .sum();
+    assert_eq!(total, MAX_SEGMENTS);
+    blue_planet_ii_roster(&run(titles));
+}
+
 #[test]
 fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
     let groups = vec![vec![1, 2], vec![1], vec![2], vec![]];
@@ -326,7 +354,7 @@ fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
 }
 
 fn run_dvd(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "dvd-playall-partition-v1");
+    annotate(&mut titles, "dvd-playall-partition-v1", true);
     titles
 }
 
@@ -483,4 +511,49 @@ fn undescribable_title_elsewhere_does_not_block_a_roster() {
     titles.push(secs(31, &[("00031", 7, 7)]));
     let titles = run(titles);
     assert_roster(&titles, "bd-playall-partition-v1:10", &[(1, 0), (2, 1)]);
+}
+
+// Episodes and their play-all lost their segments; the extras and their play-all kept
+// theirs. The undescribed play-all is longer than the extras one, so it may be the real one.
+#[test]
+fn longer_undescribed_title_holds_an_extras_roster() {
+    let episodes = [(100, 199), (200, 299), (300, 399)];
+    let extras = [(1000, 1009), (1100, 1109), (1200, 1209)];
+    let mut titles: Vec<_> = (episodes.iter().enumerate())
+        .map(|(i, &c)| dvd(i as u16 + 1, &[c]))
+        .collect();
+    titles.push(dvd(10, &episodes));
+    for t in &mut titles {
+        t.selection_evidence.segments.clear();
+    }
+    titles.extend((extras.iter().enumerate()).map(|(i, &c)| dvd(i as u16 + 11, &[c])));
+    titles.push(dvd(20, &extras));
+    assert_unknown(&run_dvd(titles.clone()));
+    // Shorter undescribed titles leave the extras partition standing.
+    titles.truncate(3);
+    titles.extend((extras.iter().enumerate()).map(|(i, &c)| dvd(i as u16 + 11, &[c])));
+    titles.push(dvd(20, &extras));
+    for t in &mut titles[..3] {
+        t.extents[0].sector_count = 5;
+    }
+    let titles = run_dvd(titles);
+    assert_roster(
+        &titles,
+        "dvd-playall-partition-v1:20",
+        &[(11, 0), (12, 1), (13, 2)],
+    );
+}
+
+// The same by running time, for an undescribed title with no sectors recorded.
+#[test]
+fn longer_undescribed_title_by_duration_holds_the_roster() {
+    let mut titles = episodes();
+    titles.push(secs(
+        10,
+        &[("00001", 0, 2700), ("00002", 0, 2700), ("00003", 0, 2700)],
+    ));
+    let mut feature = secs(30, &[("00030", 0, 9000)]);
+    feature.selection_evidence.segments.clear();
+    titles.push(feature);
+    assert_unknown(&run(titles));
 }

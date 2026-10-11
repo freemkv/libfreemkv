@@ -25,7 +25,16 @@ pub struct DvdInfo {
     /// does NOT play in region n+1 (libdvdread ifo_print.c; mpucoder "byte1=prohibited region
     /// mask"). 0x00 is region-free.
     pub region_mask: u8,
+    /// Each TT_SRPT title's playback type byte, keyed (vts_number, vts_title_num).
+    pub title_playback: std::collections::BTreeMap<(u8, u8), u8>,
+    /// Every title TT_SRPT declares was read: none lost to a cut table, an unusable
+    /// title set or an unparseable PGC.
+    pub complete: bool,
 }
+
+/// TT_SRPT title playback type bit 6, libdvdread ifo_types.h `playback_type_t`
+/// `multi_or_random_pgc_title` ("0: one sequential pgc title"), read MSB first.
+pub(crate) const TT_MULTI_OR_RANDOM_PGC: u8 = 0x40;
 
 /// One title set (VTS_XX_0.IFO).
 #[derive(Debug)]
@@ -73,9 +82,12 @@ pub struct DvdTitle {
     /// The program (PGN) each chapter (part of title) starts at, from VTS_PTT_SRPT. `None`
     /// when the table does not hold the title; empty when a chapter lies in another PGC.
     pub ptt_programs: Option<Vec<u16>>,
-    /// The PGC plays its cells in order and stops: sequential playback mode (PGC+0xA2)
-    /// and no next-PGC chain (PGC+0x9C). Random, shuffle and chained PGCs do not.
+    /// The PGC plays its cells in order and stops: sequential playback mode (PGC+0xA2),
+    /// no next-PGC chain (PGC+0x9C), and commands that only pick its entry point or end
+    /// the title. Random, shuffle, chained and branching PGCs do not.
     pub sequential: bool,
+    /// The cell table runs past the IFO: `cells` holds only the leading cells.
+    pub truncated: bool,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -457,13 +469,17 @@ pub(crate) fn parse_vmg_with(
     }
 
     let title_set_map = parse_tt_srpt(vmg_data, tt_srpt_offset)?;
+    let (title_playback, mut complete) = tt_srpt_playback(vmg_data, tt_srpt_offset);
 
     // Parse each VTS IFO
     let mut title_sets = Vec::new();
     let mut skipped = 0usize;
     for (&vts_number, titles_info) in &title_set_map {
         match parse_vts(reader, udf, vts_number, titles_info) {
-            Ok(ts) => title_sets.push(ts),
+            Ok(ts) => {
+                complete &= ts.titles.len() >= titles_info.len();
+                title_sets.push(ts)
+            }
             // Halted means the drive itself stopped, not that this title set is a
             // placeholder — once set, every later parse_vts call also fails, so
             // swallowing it here would silently truncate the scan. Propagate it.
@@ -473,6 +489,7 @@ pub(crate) fn parse_vmg_with(
                 // aren't really there, so one failure isn't fatal — but it must not
                 // be silent, since swallowing it can hide many dropped titles.
                 skipped += 1;
+                complete = false;
                 tracing::warn!(
                     target: "freemkv::scan",
                     vts = vts_number,
@@ -499,7 +516,32 @@ pub(crate) fn parse_vmg_with(
         title_sets,
         chapter_names,
         region_mask: vmg_data[VMG_REGION_MASK_OFFSET],
+        title_playback,
+        complete,
     })
+}
+
+// Each TT_SRPT entry's playback type (first entry wins, as in `parse_tt_srpt`), and
+// whether every declared entry was within the DVD-Video cap and the table.
+fn tt_srpt_playback(
+    vmg_data: &[u8],
+    tt_srpt_offset: usize,
+) -> (std::collections::BTreeMap<(u8, u8), u8>, bool) {
+    let mut types = std::collections::BTreeMap::new();
+    let Ok(declared) = be_u16(vmg_data, tt_srpt_offset) else {
+        return (types, false);
+    };
+    let declared = usize::from(declared);
+    let mut complete = declared <= MAX_TT_SRPT_TITLES;
+    for i in 0..declared.min(MAX_TT_SRPT_TITLES) {
+        let base = tt_srpt_offset + 8 + i * 12;
+        let Some(entry) = vmg_data.get(base..base + 12) else {
+            complete = false;
+            break;
+        };
+        types.entry((entry[6], entry[7])).or_insert(entry[0]);
+    }
+    (types, complete)
 }
 
 // Maximum TT_SRPT entries honoured (DVD-Video's own 99-title cap). The on-disc count is an
@@ -1142,7 +1184,7 @@ pub(crate) fn parse_pgcit(
             .checked_add(pgc_byte_offset)
             .ok_or(Error::IfoParse)?;
 
-        match parse_pgc(data, pgc_abs, chapter_count) {
+        match parse_title_pgc(data, pgc_abs, chapter_count, pgcs == 1) {
             Ok(mut title) => {
                 // Stamp the REAL title number so downstream nav joins survive a
                 // dropped sibling PGC (position in `titles` is not vts_title_num).
@@ -1221,7 +1263,8 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         }
     }
 
-    if cells.len() < num_cells {
+    let truncated = cells.len() < num_cells;
+    if truncated {
         tracing::warn!(
             target: "freemkv::scan",
             declared = num_cells,
@@ -1342,8 +1385,107 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         vts_title_num: 0,
         pgcs: 0,
         ptt_programs: None,
-        sequential: byte_at(data, pgc_offset + 0xA2)? == 0 && be_u16(data, pgc_offset + 0x9C)? == 0,
+        sequential: byte_at(data, pgc_offset + 0xA2)? == 0
+            && be_u16(data, pgc_offset + 0x9C)? == 0
+            && command_flow_in_order(data, pgc_offset) == Some(false),
+        truncated,
     })
+}
+
+// As `parse_pgc`, but a pre-command LinkPTTN keeps `sequential` when `one_pgc_title`.
+fn parse_title_pgc(
+    data: &[u8],
+    pgc_offset: usize,
+    chapters: u16,
+    one_pgc_title: bool,
+) -> Result<DvdTitle> {
+    let mut title = parse_pgc(data, pgc_offset, chapters)?;
+    if one_pgc_title && !title.sequential {
+        title.sequential = byte_at(data, pgc_offset + 0xA2)? == 0
+            && be_u16(data, pgc_offset + 0x9C)? == 0
+            && command_flow_in_order(data, pgc_offset).is_some();
+    }
+    Ok(title)
+}
+
+// Where a PGC command can send playback.
+#[derive(Clone, Copy, PartialEq)]
+enum Flow {
+    /// Stays on the command list or the current cell.
+    Stays,
+    /// Picks the entry point within this PGC (LinkPGN, LinkCN, LinkTopC, LinkTopPG).
+    EntersPgc,
+    /// LinkPTTN: within this PGC only when the title is this one PGC.
+    EntersPart,
+    /// Ends the title: Exit, or a jump or call to a menu.
+    EndsTitle,
+    /// Anything else, including commands this decoder cannot classify.
+    Leaves,
+}
+
+// libdvdnav link codes (byte1 low nibble; LinkSub's target in byte7 bits 4-0).
+fn link_flow(code: u8, sub: u8) -> Flow {
+    match (code, sub & 0x1F) {
+        (0, _) | (1, 0) => Flow::Stays,
+        (1, 1 | 5) | (6 | 7, _) => Flow::EntersPgc,
+        (5, _) => Flow::EntersPart,
+        _ => Flow::Leaves,
+    }
+}
+
+fn command_flow(raw: &[u8; 8]) -> Flow {
+    let code = raw[1] & 0x0F;
+    match (raw[0] >> 5, raw[0] >> 4 & 1) {
+        (0, _) => Flow::Stays,
+        (1, 1) => match code {
+            1 | 6 | 8 => Flow::EndsTitle,
+            _ => Flow::Leaves,
+        },
+        (1, _) | (2 | 3, _) => link_flow(code, raw[7]),
+        _ => Flow::Leaves,
+    }
+}
+
+/// `Some(links_by_part)` when the PGC's commands (table at PGC+0xE4: pre, post, cell
+/// counts, last byte, 8-byte commands) play its cells once, in order: pre commands may
+/// only pick the entry point, post commands may only end the title, and the cell
+/// commands its cells run may not move playback. `None` otherwise or when unreadable.
+fn command_flow_in_order(data: &[u8], pgc_offset: usize) -> Option<bool> {
+    let rel = usize::from(be_u16(data, pgc_offset + 0xE4).ok()?);
+    if rel == 0 {
+        return Some(false);
+    }
+    let table = pgc_offset + rel;
+    let count = |at| be_u16(data, table + at).ok().map(usize::from);
+    let (pre, post, cell) = (count(0)?, count(2)?, count(4)?);
+    let cmds = data.get(table + 8..table + 8 + (pre + post + cell) * 8)?;
+    let cmds = cmds.as_chunks::<8>().0;
+    let mut by_part = false;
+    for raw in &cmds[..pre] {
+        match command_flow(raw) {
+            Flow::Stays | Flow::EntersPgc => {}
+            Flow::EntersPart => by_part = true,
+            Flow::EndsTitle | Flow::Leaves => return None,
+        }
+    }
+    let post_ok = |raw| matches!(command_flow(raw), Flow::Stays | Flow::EndsTitle);
+    if !cmds[pre..pre + post].iter().all(post_ok) {
+        return None;
+    }
+    // Each cell names its command by number (cell playback byte 3, 0 = none).
+    let num_cells = usize::from(byte_at(data, pgc_offset + 0x03).ok()?);
+    let cell_base = pgc_offset + usize::from(be_u16(data, pgc_offset + 0xE8).ok()?);
+    for i in 0..num_cells {
+        let Some(&n) = data.get(cell_base + i * 24 + 3) else {
+            break;
+        };
+        if n != 0
+            && cmds[pre + post..].get(usize::from(n) - 1).map(command_flow) != Some(Flow::Stays)
+        {
+            return None;
+        }
+    }
+    Some(by_part)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

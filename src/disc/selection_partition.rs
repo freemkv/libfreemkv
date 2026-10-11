@@ -57,11 +57,14 @@ impl<'a, T: Eq + Hash> Prefixes<'a, T> {
 
 /// Annotate every title from one proven play-all partition, or leave all Unknown.
 /// `producer` names the calling scanner's roster, e.g. `bd-playall-partition-v1`.
-pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str) {
-    let Some((wrapper, ordinals)) = partition(titles) else {
+/// `complete` is false when the scanner dropped or cut a title it should have
+/// described: the missing one could compete with any partition of the rest.
+pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str, complete: bool) {
+    let Some((wrapper, ordinals)) = complete.then(|| partition(titles)).flatten() else {
         tracing::debug!(
             target: "freemkv::scan",
             producer,
+            complete,
             "no unique play-all partition; episode selection needs review"
         );
         return;
@@ -191,6 +194,32 @@ fn partition(titles: &[DiscTitle]) -> Option<(u16, Vec<Option<usize>>)> {
             at > 0 && merged[at - 1].1 > start
         });
     if blocked {
+        return None;
+    }
+    // Nor may an undescribed title be longer, by time or sectors, than the play-all:
+    // it could be the real play-all beside an extras one.
+    let sectors = |t: &DiscTitle| {
+        sector_ranges(t)
+            .map(|(start, end)| end - start)
+            .sum::<u64>()
+    };
+    let mut shortest = (f64::INFINITY, u64::MAX);
+    for (title, _) in titles
+        .iter()
+        .zip(&group_of)
+        .filter(|(_, g)| **g == Some(wrapper))
+    {
+        shortest = (
+            shortest.0.min(title.duration_secs),
+            shortest.1.min(sectors(title)),
+        );
+    }
+    let longer = |t: &DiscTitle| t.duration_secs > shortest.0 || sectors(t) > shortest.1;
+    if titles
+        .iter()
+        .zip(&group_of)
+        .any(|(t, g)| g.is_none() && longer(t))
+    {
         return None;
     }
     // A recap, logo or diary inside the play-all would shift every later ordinal.

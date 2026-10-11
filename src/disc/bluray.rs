@@ -26,6 +26,9 @@ impl Disc {
         // clip_id -> packet count, shared across playlists so each .clpi is read once per scan.
         let mut clip_pkts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        // Cleared when a playlist that should be a title is lost or cut: any roster over
+        // the rest is unproven.
+        let mut complete = true;
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
             for entry in &playlist_dir.entries {
                 if halt.is_some_and(|h| h.is_cancelled()) {
@@ -44,8 +47,9 @@ impl Disc {
                         Err(Error::Halted) => return Err(Error::Halted),
                         // Every other read failure keeps the pre-existing
                         // best-effort skip: one unreadable playlist is not a
-                        // reason to abandon the disc.
+                        // reason to abandon the disc, but it holds the roster.
                         Err(e) => {
+                            complete = false;
                             tracing::warn!(
                                 target: "freemkv::disc",
                                 playlist = ?entry.name,
@@ -60,6 +64,7 @@ impl Disc {
                         &entry.name,
                         &mpls_data,
                         &mut clip_pkts,
+                        &mut complete,
                     )? {
                         titles.push(title);
                     }
@@ -72,12 +77,13 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        super::selection_partition::annotate(&mut titles, "bd-playall-partition-v1");
+        super::selection_partition::annotate(&mut titles, "bd-playall-partition-v1", complete);
         Ok(titles)
     }
 
     // Parse one MPLS playlist into a DiscTitle. `Ok(None)` covers both benign misses
     // (unparseable, sub-30s) and deliberate drops; `Err` (only Halted) means the scan is over.
+    // The test entry point discards the completeness `parse_playlist_memo` reports.
     #[cfg(test)]
     pub(super) fn parse_playlist(
         reader: &mut dyn SectorSource,
@@ -86,17 +92,19 @@ impl Disc {
         data: &[u8],
     ) -> Result<Option<DiscTitle>> {
         let mut clip_pkts = std::collections::HashMap::new();
-        Self::parse_playlist_memo(reader, udf_fs, filename, data, &mut clip_pkts)
+        Self::parse_playlist_memo(reader, udf_fs, filename, data, &mut clip_pkts, &mut true)
     }
 
     // As `parse_playlist`, with a caller-owned clip_id -> packet-count memo. Failures are never
-    // inserted, so a transient .clpi error is retried by the next playlist.
+    // inserted, so a transient .clpi error is retried by the next playlist. Clears `complete`
+    // when the playlist is unparseable, truncated or drops a clip; a sub-30s one is no loss.
     pub(super) fn parse_playlist_memo(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         filename: &str,
         data: &[u8],
         clip_pkts: &mut std::collections::HashMap<String, u32>,
+        complete: &mut bool,
     ) -> Result<Option<DiscTitle>> {
         let parsed = match mpls::parse(data) {
             Ok(p) => p,
@@ -104,10 +112,29 @@ impl Disc {
                 // Real code, matching the CLPI path: a malformed playlist is
                 // dropped, but never silently.
                 tracing::warn!(target: "freemkv::disc", playlist = ?filename, "E{}", e.code());
+                *complete = false;
                 return Ok(None);
             }
         };
+        if parsed.truncated {
+            *complete = false;
+        }
+        let title = Self::describe_playlist(reader, udf_fs, filename, &parsed, clip_pkts)?;
+        // Below 30 s is filtered on purpose; any other miss lost a title.
+        if title.is_none() && parsed.duration_ticks() as f64 / MPLS_TICKS_PER_SEC >= MIN_TITLE_SECS
+        {
+            *complete = false;
+        }
+        Ok(title)
+    }
 
+    fn describe_playlist(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        filename: &str,
+        parsed: &mpls::Playlist,
+        clip_pkts: &mut std::collections::HashMap<String, u32>,
+    ) -> Result<Option<DiscTitle>> {
         // Calculate duration from play items
         let duration_ticks: u64 = parsed
             .play_items
@@ -463,7 +490,11 @@ impl Disc {
 
         Ok(Some(DiscTitle {
             selection_evidence: TitleSelectionEvidence {
-                segments: ContentSegment::from_clips(&clips),
+                // Random, shuffle and cut playlists do not play exactly these items in order.
+                segments: match parsed.plays_in_order() {
+                    true => ContentSegment::from_clips(&clips),
+                    false => Vec::new(),
+                },
                 ..Default::default()
             },
             playlist: filename.to_string(),

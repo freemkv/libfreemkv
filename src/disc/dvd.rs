@@ -142,6 +142,9 @@ impl Disc {
 
         let mut titles = Vec::new();
         let mut title_number: u16 = 0;
+        // Cleared when a title's cells are cut short: the cut title could prove a smaller
+        // roster than the disc authored.
+        let mut complete = dvd_info.complete;
 
         for ts in &dvd_info.title_sets {
             // Diagnostic dump (--log-level 3): IFO video/audio attrs for this
@@ -230,6 +233,8 @@ impl Disc {
                 // block reads its first angle only; an interleaved cell reads its own unit chain,
                 // since its range also holds another program's units.
                 let mut extents: Vec<Extent> = Vec::new();
+                // A cell read whole for want of its unit chain is a read plan, not exact content.
+                let mut exact = true;
                 for cell in &dvd_title.cells[feature_start..] {
                     let category = ifo::CellCategory::decode(cell.category);
                     if category.is_secondary_block_piece() {
@@ -257,6 +262,7 @@ impl Disc {
                                 "dvd: interleaved cell's unit chain unreadable; reading its whole range"
                             );
                             extents.push(whole);
+                            exact = false;
                         }
                     }
                 }
@@ -348,11 +354,21 @@ impl Disc {
                     })
                     .collect();
 
+                complete &= !dvd_title.truncated;
+                let one_sequential_pgc = dvd_info
+                    .title_playback
+                    .get(&(ts.vts_number, dvd_title.vts_title_num))
+                    .is_some_and(|t| t & ifo::TT_MULTI_OR_RANDOM_PGC == 0);
                 titles.push(DiscTitle {
                     selection_evidence: TitleSelectionEvidence {
-                        // Random, shuffle, chained and multi-PGC titles do not play just
-                        // these cells in this order.
-                        segments: match dvd_title.sequential && dvd_title.pgcs <= 1 {
+                        // Random, shuffle, chained, multi-PGC, branching and cut titles do
+                        // not play just these cells in this order.
+                        segments: match dvd_title.sequential
+                            && dvd_title.pgcs <= 1
+                            && one_sequential_pgc
+                            && !dvd_title.truncated
+                            && exact
+                        {
                             true => ContentSegment::from_cell_extents(&extents),
                             false => Vec::new(),
                         },
@@ -380,7 +396,7 @@ impl Disc {
             return Err(Error::Halted);
         }
         warn_multi_pgc_titles(&vmg_bytes, &dvd_info);
-        super::selection_partition::annotate(&mut titles, "dvd-playall-partition-v1");
+        super::selection_partition::annotate(&mut titles, "dvd-playall-partition-v1", complete);
         Ok((titles, nav_feature, dvd_region(dvd_info.region_mask)))
     }
 }
