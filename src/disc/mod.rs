@@ -12,7 +12,6 @@ mod bluray;
 mod dvd;
 pub(crate) mod dvd_audio_probe;
 pub(crate) mod dvd_forced_probe;
-mod dvd_menu;
 mod encrypt;
 pub(crate) use encrypt::handshake_class_error;
 mod extract;

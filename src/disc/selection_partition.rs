@@ -1,26 +1,27 @@
-//! Blu-ray play-all partition evidence, independent of HDMV and BD-J navigation.
+//! Play-all partition evidence over each title's content segments, for any format and
+//! independent of menu navigation.
 //!
-//! One play-all playlist must be the exact concatenation of standalone playlists
-//! (exact clip id and in/out ticks). Ambiguous, competing, nested or implausible
-//! partitions leave every title Unknown. This proves an authored program partition,
-//! NOT TV semantics; Unknown is a review hold for Episodes, never a fallback.
+//! One play-all title must be the exact concatenation of standalone titles (exact
+//! segments). Ambiguous, competing, nested or implausible partitions leave every
+//! title Unknown. This proves an authored program partition, NOT TV semantics;
+//! Unknown is a review hold for Episodes, never a fallback.
 
-use super::{DiscTitle, EpisodeEvidence};
+use super::{ContentSegment, DiscTitle, EpisodeEvidence};
 use std::collections::HashMap;
 use std::hash::Hash;
 
 const MAX_TITLES: usize = 4096;
-const MAX_CLIPS: usize = 65_536;
+const MAX_SEGMENTS: usize = 65_536;
 
-/// Greedy unique-prefix decomposition shared by the DVD menu and BD play-all producers.
-pub(super) struct Prefixes<'a, T> {
+// Greedy unique-prefix decomposition of one group into others.
+struct Prefixes<'a, T> {
     groups: &'a [Vec<T>],
     by_first: HashMap<&'a T, Vec<usize>>,
 }
 
 impl<'a, T: Eq + Hash> Prefixes<'a, T> {
     /// `None` when any group is empty: an empty program would match everywhere.
-    pub(super) fn new(groups: &'a [Vec<T>]) -> Option<Self> {
+    fn new(groups: &'a [Vec<T>]) -> Option<Self> {
         let mut by_first: HashMap<&T, Vec<usize>> = HashMap::new();
         for (i, group) in groups.iter().enumerate() {
             by_first.entry(group.first()?).or_default().push(i);
@@ -30,7 +31,7 @@ impl<'a, T: Eq + Hash> Prefixes<'a, T> {
 
     /// Split `groups[whole]` into at least two OTHER groups, each used once, where
     /// exactly one unused group is a prefix of the remainder at every position.
-    pub(super) fn decompose(&self, whole: usize) -> Option<Vec<usize>> {
+    fn decompose(&self, whole: usize) -> Option<Vec<usize>> {
         let sequence = self.groups.get(whole)?;
         let mut used = vec![false; self.groups.len()];
         let mut order = Vec::new();
@@ -55,14 +56,17 @@ impl<'a, T: Eq + Hash> Prefixes<'a, T> {
 }
 
 /// Annotate every title from one proven play-all partition, or leave all Unknown.
-pub(super) fn annotate(titles: &mut [DiscTitle]) {
-    let Some((roster, ordinals)) = partition(titles) else {
+/// `producer` names the calling scanner's roster, e.g. `bd-playall-partition-v1`.
+pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str) {
+    let Some((wrapper, ordinals)) = partition(titles) else {
         tracing::debug!(
             target: "freemkv::scan",
-            "bd: no unique play-all partition; episode selection needs review"
+            producer,
+            "no unique play-all partition; episode selection needs review"
         );
         return;
     };
+    let roster = format!("{producer}:{wrapper}");
     let title_count = titles.len();
     for (title, ordinal) in titles.iter_mut().zip(ordinals) {
         title.selection_evidence.episodes = EpisodeEvidence::Authored {
@@ -79,26 +83,27 @@ fn repeats(presentation: &[usize]) -> bool {
     !presentation.iter().all(|i| seen.insert(*i))
 }
 
-// Roster label and per-title member ordinal.
-fn partition(titles: &[DiscTitle]) -> Option<(String, Vec<Option<usize>>)> {
-    if titles.len() > MAX_TITLES || titles.iter().map(|t| t.clips.len()).sum::<usize>() > MAX_CLIPS
+// Lowest wrapper title id and per-title member ordinal.
+fn partition(titles: &[DiscTitle]) -> Option<(u16, Vec<Option<usize>>)> {
+    fn segments(t: &DiscTitle) -> &[ContentSegment] {
+        &t.selection_evidence.segments
+    }
+    if titles.len() > MAX_TITLES
+        || titles.iter().map(|t| segments(t).len()).sum::<usize>() > MAX_SEGMENTS
     {
         return None;
     }
-    // Exact (clip, in, out) intervals interned to ids so presentations compare as integers.
+    // Exact segments interned to ids so presentations compare as integers.
     let mut ids = HashMap::new();
     let mut raw = Vec::with_capacity(titles.len());
     let mut ticks = Vec::with_capacity(titles.len());
     for title in titles {
-        let mut presentation = Vec::with_capacity(title.clips.len());
+        let mut presentation = Vec::with_capacity(segments(title).len());
         let mut sum = 0u64;
-        for c in &title.clips {
+        for segment in segments(title) {
             let next = ids.len();
-            presentation.push(
-                *ids.entry((c.clip_id.as_str(), c.in_time, c.out_time))
-                    .or_insert(next),
-            );
-            sum += u64::from(c.out_time.saturating_sub(c.in_time));
+            presentation.push(*ids.entry(segment).or_insert(next));
+            sum = sum.saturating_add(segment.end.saturating_sub(segment.start));
         }
         raw.push(presentation);
         ticks.push(sum);
@@ -109,11 +114,7 @@ fn partition(titles: &[DiscTitle]) -> Option<(String, Vec<Option<usize>>)> {
     let mut group_ticks = Vec::new();
     let mut group_of = Vec::with_capacity(titles.len());
     for (i, title) in titles.iter().enumerate() {
-        let valid = !title.clips.is_empty()
-            && title
-                .clips
-                .iter()
-                .all(|c| !c.clip_id.is_empty() && c.in_time < c.out_time);
+        let valid = !segments(title).is_empty() && segments(title).iter().all(|s| s.start < s.end);
         group_of.push(valid.then(|| {
             *index.entry(&raw[i]).or_insert_with(|| {
                 groups.push(raw[i].clone());
@@ -153,11 +154,11 @@ fn partition(titles: &[DiscTitle]) -> Option<(String, Vec<Option<usize>>)> {
         }
     }
     // A recap, logo or diary inside the play-all would shift every later ordinal.
-    let total: u64 = order.iter().map(|&g| group_ticks[g]).sum();
-    let n = order.len() as u64;
+    let total: u128 = order.iter().map(|&g| u128::from(group_ticks[g])).sum();
+    let n = order.len() as u128;
     if order
         .iter()
-        .any(|&g| u128::from(group_ticks[g]) * 2 * u128::from(n) < u128::from(total))
+        .any(|&g| u128::from(group_ticks[g]) * 2 * n < total)
     {
         return None;
     }
@@ -171,7 +172,7 @@ fn partition(titles: &[DiscTitle]) -> Option<(String, Vec<Option<usize>>)> {
         .iter()
         .map(|g| g.and_then(|g| order.iter().position(|&o| o == g)))
         .collect();
-    Some((format!("bd-playall-partition-v1:{first}"), ordinals))
+    Some((first, ordinals))
 }
 
 #[cfg(test)]

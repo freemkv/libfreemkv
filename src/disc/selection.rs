@@ -1,12 +1,11 @@
 //! Selection provenance survives sorting and copying individual titles.
 
 /// Membership in a verified authored standalone-program roster for Episodes mode.
-/// Producers: the DVD static-menu play-all partition and the Blu-ray play-all partition
-/// (the longest playlist exactly concatenates other playlists), not navigation code.
-/// This is not a semantic TV classification: movie chapter titles can have the same
-/// structure. The caller must choose Episodes from user intent or TV metadata.
-/// `Unknown` means no roster was proven: Episodes must hold for review, not guess.
-/// First-Play and movie hints alone are insufficient.
+/// Producer: the play-all partition (the longest title's segments exactly concatenate
+/// other titles'), on DVD and Blu-ray, not navigation code. This is not a semantic TV
+/// classification: movie chapter titles can have the same structure. The caller must
+/// choose Episodes from user intent or TV metadata. `Unknown` means no roster was
+/// proven: Episodes must hold for review, not guess.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EpisodeEvidence {
     #[default]
