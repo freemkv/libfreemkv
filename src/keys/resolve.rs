@@ -1,6 +1,6 @@
 //! [`KeyRing::acquire`] (KU §2.3): pieces, probes, sources, verdicts, over [`KeyEvidence`].
 
-use super::evidence::{Detector, KeyEvidence, Piece, Sample, Sampler, sorted_ranges};
+use super::evidence::{KeyEvidence, Piece, Sample, Sampler, sorted_ranges};
 use super::{
     AcquireOptions, ArrivalPiece, ForensicState, Inner, KeyResolution, KeyRing, KeyScope,
     ProofCache, overlaps,
@@ -337,10 +337,9 @@ fn probe(
     p: &mut Probed,
     segments: &[(u32, u32)],
     format: ContentFormat,
-    detector: Detector,
     halt: &Halt,
 ) -> Result<()> {
-    let (units, samples) = sampler.probe(&p.piece, segments, format, detector, halt)?;
+    let (units, samples) = sampler.probe(&p.piece, segments, format, halt)?;
     p.units = units;
     for s in samples {
         match s {
@@ -484,7 +483,7 @@ struct Scoped<'e> {
 }
 
 // KU §2.3 steps 5–7, every AACS format: the evidence's pieces, the forensic layout when its
-// clip is in scope, and each piece probed by the format's own detector.
+// clip is in scope, and each piece probed by its container's own encrypted test.
 fn probe_scope<'e>(ev: &'e KeyEvidence, sampler: &mut Sampler, halt: &Halt) -> Result<Scoped<'e>> {
     let mut ps: Vec<Probed> = ev.pieces.iter().cloned().map(Probed::new).collect();
     let (layout, clip) = scope_layout(ev);
@@ -494,7 +493,7 @@ fn probe_scope<'e>(ev: &'e KeyEvidence, sampler: &mut Sampler, halt: &Halt) -> R
     for p in &mut ps {
         let tp = std::time::Instant::now();
         let reads_before = sampler.stats().reads;
-        probe(sampler, p, &segments, ev.container, ev.detector, halt)?;
+        probe(sampler, p, &segments, ev.container, halt)?;
         tracing::debug!(
             target: "freemkv::keys",
             phase = "probe_piece",
@@ -663,7 +662,7 @@ fn resolve_per_unit(
     for piece in &ev.pieces {
         let mut p = Probed::new(piece.clone());
         let (units, unit, faults) =
-            sampler.first_encrypted(&p.piece, &segments, ev.container, ev.detector, run.halt)?;
+            sampler.first_encrypted(&p.piece, &segments, ev.container, run.halt)?;
         p.units = units;
         p.faults = faults;
         match unit {
@@ -738,7 +737,6 @@ fn resolve_per_unit(
             &ps[lead].piece,
             &segments,
             ev.container,
-            ev.detector,
             run.halt,
             MIN_SAMPLE_UNITS,
         )?;
@@ -756,7 +754,6 @@ fn resolve_per_unit(
                     &ps[j].piece,
                     &segments,
                     ev.container,
-                    ev.detector,
                     run.halt,
                     MIN_SAMPLE_UNITS - samples.len(),
                 )?;
@@ -859,7 +856,7 @@ fn decide(
     run: &mut Run,
 ) -> Result<Inner> {
     // BD/UHD, FMTS included: trusted as declared (segment units are never unit-key samples).
-    if ev.detector == Detector::Verified {
+    if !ev.container.aacs_per_pack() {
         let trusted = match n_decl {
             Some(1) => resolve_one_unit(ev, sampler, disc_hash, seed, run)?,
             Some(n) if n > 1 => resolve_per_unit(ev, sampler, disc_hash, seed, run, n)?,
@@ -885,9 +882,10 @@ fn decide(
         build(&mut inner, &ps, None, None, run, Vec::new());
         return Ok(inner);
     }
-    match ev.detector {
-        Detector::PerPack => resolve_hddvd(ev, sampler, disc_hash, seed, run),
-        Detector::Verified => resolve_bd(ev, scoped, sampler, disc_hash, n_decl, seed, run),
+    if ev.container.aacs_per_pack() {
+        resolve_hddvd(ev, sampler, disc_hash, seed, run)
+    } else {
+        resolve_bd(ev, scoped, sampler, disc_hash, n_decl, seed, run)
     }
 }
 

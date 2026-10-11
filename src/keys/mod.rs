@@ -25,7 +25,7 @@ mod resolve;
 mod tests;
 
 pub(crate) use arrival::Arrival;
-pub use evidence::{Detector, KeyEvidence, MediaId, Piece, Sampler};
+pub use evidence::{KeyEvidence, MediaId, Piece, Sampler};
 #[cfg(test)]
 pub(crate) use resolve::whole_disc_pieces;
 

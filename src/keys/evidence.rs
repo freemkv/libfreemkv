@@ -50,24 +50,6 @@ impl Disc {
     }
 }
 
-/// How the medium flags its encrypted content and how a key is proven (design X-10).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Detector {
-    /// BD/UHD CPI flags: keys are proven on ciphertext units.
-    Verified,
-    /// HD DVD: each pack's `PES_scrambling_control` (`[HD]` §4.3.2). Keys are numbered by the
-    /// CPI's `TITLE_KEY_PTR` and proven on decrypted packs, per EVOBU.
-    PerPack,
-}
-
-impl Detector {
-    // The format's own test of one aligned unit, feeding the one encryption decision
-    // (`resolve::acquire`): the CPI flag, or any pack flagged scrambled.
-    pub(crate) fn unit_encrypted(self, unit: &[u8], format: ContentFormat) -> bool {
-        crate::aacs::content::aacs_unit_encrypted(unit, format)
-    }
-}
-
 /// One unit of key proof (design §2.2): a stream file, a title extent no file covers, or a
 /// whole loose file. Spans are sectors `(start, count, unit anchor)`, sorted pieces by
 /// first sector.
@@ -134,7 +116,7 @@ pub(crate) struct MainTitle {
 
 /// What a source can tell key acquisition (design §2.6), scoped to what the rip decrypts:
 /// the medium's identity and AACS structures, the pieces in scope, the main feature, the
-/// detector and the forensic layout. Holds key material (the title-key file, MKB, VID), so
+/// container and the forensic layout. Holds key material (the title-key file, MKB, VID), so
 /// its `Debug` redacts them.
 pub struct KeyEvidence {
     pub(crate) scope: KeyScope,
@@ -144,7 +126,6 @@ pub struct KeyEvidence {
     // No stream file was listed (no `/BDMV/STREAM` or `/HVDVD_TS`, or an empty one).
     pub(crate) no_stream_files: bool,
     pub(crate) main: Option<MainTitle>,
-    pub(crate) detector: Detector,
     pub(crate) container: ContentFormat,
     pub(crate) fmts: Option<super::fmts::Layout>,
 }
@@ -156,7 +137,6 @@ impl std::fmt::Debug for KeyEvidence {
             .field("media", &self.media)
             .field("aacs", &self.aacs.as_ref().map(|_| "<redacted>"))
             .field("pieces", &self.pieces.len())
-            .field("detector", &self.detector)
             .field("container", &self.container)
             .field("fmts", &self.fmts.is_some())
             .finish()
@@ -200,10 +180,6 @@ impl KeyEvidence {
                 extents: t.extents.clone(),
                 format: t.content_format,
             }),
-            detector: match disc.format {
-                DiscFormat::HdDvd => Detector::PerPack,
-                _ => Detector::Verified,
-            },
             container: disc.content_format,
             fmts: None,
         };
@@ -261,7 +237,7 @@ impl KeyEvidence {
         ev.pieces = pieces(disc, &files, &sel, whole);
         // HD DVD: listed whatever the declared count (acquisition judges a copy in the clear
         // from its pieces before it refuses a multi-key HD DVD); it has no forensic layout.
-        if ev.detector != Detector::PerPack {
+        if !ev.container.aacs_per_pack() {
             ev.fmts = match &fs {
                 Some(fs) => super::fmts::layout(fs, &mut buffered)?,
                 None => None,
@@ -435,13 +411,12 @@ impl<'a> Sampler<'a> {
     }
 
     // Up to 32 units on `p`'s grid (KU §2.3 step 7), skipping FMTS segment units, each
-    // judged by `detector`.
+    // judged by the container's own encrypted test.
     pub(crate) fn probe(
         &mut self,
         p: &Piece,
         segments: &[(u32, u32)],
         format: ContentFormat,
-        detector: Detector,
         halt: &Halt,
     ) -> Result<(u64, Vec<Sample>)> {
         let (units, lbas) = probe_lbas(p, segments);
@@ -449,7 +424,7 @@ impl<'a> Sampler<'a> {
         for lba in lbas {
             halt.check()?;
             out.push(match self.unit(lba)? {
-                Some(u) if detector.unit_encrypted(&u, format) => Sample::Enc(u),
+                Some(u) if crate::aacs::content::aacs_unit_encrypted(&u, format) => Sample::Enc(u),
                 Some(_) => Sample::Clear,
                 None => Sample::Fault,
             });
@@ -464,7 +439,6 @@ impl<'a> Sampler<'a> {
         p: &Piece,
         segments: &[(u32, u32)],
         format: ContentFormat,
-        detector: Detector,
         halt: &Halt,
     ) -> Result<(u64, Option<Vec<u8>>, usize)> {
         let (units, lbas) = probe_lbas(p, segments);
@@ -472,7 +446,7 @@ impl<'a> Sampler<'a> {
         for lba in lbas {
             halt.check()?;
             match self.unit(lba)? {
-                Some(u) if detector.unit_encrypted(&u, format) => {
+                Some(u) if crate::aacs::content::aacs_unit_encrypted(&u, format) => {
                     return Ok((units, Some(u), faults));
                 }
                 Some(_) => {}
@@ -489,7 +463,6 @@ impl<'a> Sampler<'a> {
         p: &Piece,
         segments: &[(u32, u32)],
         format: ContentFormat,
-        detector: Detector,
         halt: &Halt,
         n: usize,
     ) -> Result<Vec<Vec<u8>>> {
@@ -501,7 +474,7 @@ impl<'a> Sampler<'a> {
             }
             halt.check()?;
             if let Some(u) = self.unit(lba)?
-                && detector.unit_encrypted(&u, format)
+                && crate::aacs::content::aacs_unit_encrypted(&u, format)
             {
                 out.push(u);
             }

@@ -108,6 +108,12 @@ impl ContentFormat {
     pub fn is_program_stream(self) -> bool {
         matches!(self, Self::MpegPs | Self::DvdPs)
     }
+
+    // HD DVD's AACS (`.evo`): keys numbered per pack by the CPI's TITLE_KEY_PTR and
+    // proven on decrypted packs (`[HD]` §4.3.2), not on BD's CPI-flagged units.
+    pub(crate) fn aacs_per_pack(self) -> bool {
+        self == Self::MpegPs
+    }
 }
 
 /// How a live disc's bus barrier was removed: by the drive's firmware unlocker
