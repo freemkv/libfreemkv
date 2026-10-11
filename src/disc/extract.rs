@@ -214,8 +214,7 @@ impl Disc {
         // CSS per-VTS key cache, consulted for every DVD-Video layout: a scrambled VTS is
         // found from its content and cracked, a clear one passes. A live drive scan never
         // records a disc-wide CSS key (BUG-1), so the scan's verdict cannot gate this.
-        let is_css = matches!(base_keys, DecryptKeys::Css { .. })
-            || (self.format == crate::disc::DiscFormat::Dvd && self.aacs.is_none());
+        let is_css = matches!(base_keys, DecryptKeys::Css { .. }) || self.keys_per_title();
         let mut vts_keys: std::collections::HashMap<String, DecryptKeys> =
             std::collections::HashMap::new();
 
