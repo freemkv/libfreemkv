@@ -41,7 +41,8 @@ pub enum Fault {
     SizeMismatch,
     /// Our zero-length claim was not proven removed: the target name may hold an empty
     /// placeholder, not a published artifact. The error's kind is `Other` (not
-    /// retryable until the placeholder is cleared); its source is the OS error.
+    /// retryable until the placeholder is cleared); its source is an OS error, or
+    /// `EEXIST` when the file at the name is a different empty file.
     ClaimLeft,
 }
 
@@ -958,11 +959,16 @@ mod tests {
             })),
             ..Fake::claim_only()
         };
-        let error = publish_with(&src, &dst, &steps).unwrap_err();
+        let (r, events) = crate::testlog::capture(|| publish_with(&src, &dst, &steps));
+        let error = r.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft));
-        // Round-5 LOW: the source is an OS error, not prose.
+        // Round-5 LOW: the source is an OS error, not prose, and the path logs via left().
         assert_eq!(errno(&error), Some(libc::EEXIST), "an OS error source");
+        assert!(
+            events.iter().any(|e| e.field("step") == Some("identity")),
+            "the left claim is logged"
+        );
         assert_eq!(ino(&dst), swapped.get(), "the other file is kept");
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0);
         assert_eq!(std::fs::read(&src).unwrap(), b"payload");

@@ -1137,6 +1137,11 @@ const MAX_REACH_PGCS: usize = 256;
 // Distinct `beyond` ranges a title's reach may hold; past this it is unknown.
 const MAX_REACH_CELLS: usize = 4 * MAX_REACH_PGCS;
 
+// A cell's sector count, `first..=last` saturating: the one rule for extents and reach.
+pub(crate) fn cell_sectors(first: u32, last: u32) -> u32 {
+    last.saturating_sub(first).saturating_add(1)
+}
+
 // `DvdTitle::reach`: the PGCs the parts name (none read: unknown) and their NextPGCN
 // chains, each in cell order (PGC mode 0), uncut, with commands that never leave it, the
 // chains acyclic, and no part links between PGCs. `own` is the title's PGC (0-based).
@@ -1186,8 +1191,8 @@ fn title_reach(
         }
         for cell in &title.cells {
             if !CellCategory::decode(cell.category).is_secondary_block_piece() {
-                let span = cell.last_sector.saturating_sub(cell.first_sector);
-                sectors = sectors.saturating_add(u64::from(span) + 1);
+                let n = cell_sectors(cell.first_sector, cell.last_sector);
+                sectors = sectors.saturating_add(u64::from(n));
             }
         }
     }
