@@ -93,8 +93,8 @@ pub struct DvdTitle {
     /// The title's PGC is the one VTS_PTT_SRPT names, not a 1:1 guess.
     pub mapped: bool,
     /// The most the title can play: every PGC its parts name and their next-PGC chains,
-    /// once each. `None` when that bounds nothing (loops, branches, random play, a cut
-    /// table, a guessed PGC, an unreadable part list).
+    /// once each. `None` when that bounds nothing (loops, branches, random play, a cut table,
+    /// a guessed PGC, an unreadable part list, over 1024 cells outside its own PGC).
     pub reach: Option<DvdReach>,
 }
 
@@ -106,7 +106,7 @@ pub struct DvdReach {
     /// Sectors read, an angle block counted once.
     pub sectors: u64,
     /// VOB-relative `(first, last)` sectors of every cell in a PGC other than the title's
-    /// own, whose cells alone `cells` holds.
+    /// own, whose cells alone `cells` holds: sorted, each range once.
     pub beyond: Vec<(u32, u32)>,
 }
 
@@ -1134,6 +1134,8 @@ fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
 
 // PGCs a title's reach may span; past this it is unknown (bounds hostile chains).
 const MAX_REACH_PGCS: usize = 256;
+// Distinct `beyond` ranges a title's reach may hold; past this it is unknown.
+const MAX_REACH_CELLS: usize = 4 * MAX_REACH_PGCS;
 
 // `DvdTitle::reach`: the PGCs the parts name (none read: unknown) and their NextPGCN
 // chains, each in cell order (PGC mode 0), uncut, with commands that never leave it, the
@@ -1176,6 +1178,11 @@ fn title_reach(
         secs += title.duration_secs;
         if pgc != own {
             beyond.extend(title.cells.iter().map(|c| (c.first_sector, c.last_sector)));
+            beyond.sort_unstable();
+            beyond.dedup();
+            if beyond.len() > MAX_REACH_CELLS {
+                return None;
+            }
         }
         for cell in &title.cells {
             if !CellCategory::decode(cell.category).is_secondary_block_piece() {

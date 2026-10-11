@@ -195,7 +195,7 @@ impl ArtifactLock {
                 // As in `same_file`: gone or stale retries, any other fstat error fails.
                 Err(e) if os::id_retryable(&e) => {
                     drop(file);
-                    wait.slice(halt, &e, Cause::Proof)?;
+                    wait.slice(halt, &e, Cause::Vanished)?;
                     continue;
                 }
                 Err(e) => return Err(Error::IoError { source: e }),
@@ -289,11 +289,12 @@ fn same_file(ids: &Ids<'_>, file: &File, path: &Path) -> Result<Proof> {
     })
 }
 
-// What a wait slice waits out: another holder, or a lock whose proof failed (`Fault`: on
-// an IO error that is no sign of another holder).
+// What a wait slice waits out: another holder, a sidecar gone before it was locked, or a
+// lock whose proof failed (`Fault`: on an IO error that is no sign of another holder).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cause {
     Holder,
+    Vanished,
     Proof,
     Fault,
 }
@@ -374,6 +375,12 @@ impl LockWait {
                     last_os_error = %last,
                     "another process holds the artifact lock and its output has not changed"
                 ),
+                Cause::Vanished => tracing::warn!(
+                    target: "freemkv::io",
+                    phase = "artifact_lock",
+                    last_os_error = %last,
+                    "the artifact lock's sidecar kept vanishing before it could be locked"
+                ),
                 Cause::Proof | Cause::Fault => tracing::warn!(
                     target: "freemkv::io",
                     phase = "artifact_lock",
@@ -389,7 +396,7 @@ impl LockWait {
             self.fault = None;
         }
         self.lost = match cause {
-            Cause::Holder => 0,
+            Cause::Holder | Cause::Vanished => 0,
             Cause::Proof | Cause::Fault => self.lost.saturating_add(1),
         };
         halt.wait(WAIT_SLICE + backoff(self.lost))
@@ -545,6 +552,14 @@ mod os {
         let file = match options.open(p) {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Vec::new()),
+            // A socket refuses the open (Linux ENXIO, macOS EOPNOTSUPP): no token either.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Err(e)
+                if matches!(e.raw_os_error(), Some(libc::ENXIO | libc::EOPNOTSUPP))
+                    && std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_file()) =>
+            {
+                return Ok(Vec::new());
+            }
             opened => opened?,
         };
         if !file.metadata()?.is_file() {

@@ -216,8 +216,14 @@ fn claim_then_rename(source: &Path, target: &Path, steps: &impl Steps) -> io::Re
     match steps.fresh(target) {
         Ok(claim) if is_ours(&claim) => {}
         // An empty file of another id may be ours on unstable inode numbers: never removed.
+        // The name is taken by a file we cannot release, hence EEXIST as the OS error.
         Ok(claim) if claim.is_file() && claim.len() == 0 => {
-            return Err(claim_left(io::Error::other("claim identity differs")));
+            let taken = io::Error::from_raw_os_error(libc::EEXIST);
+            return Err(left(
+                taken,
+                "identity",
+                io::Error::other("claim identity differs"),
+            ));
         }
         Ok(_) => return Err(busy(Fault::ClaimChanged)),
         // Gone, or swapped for a symlink (O_NOFOLLOW refuses it): the claim changed.
@@ -955,6 +961,8 @@ mod tests {
         let error = publish_with(&src, &dst, &steps).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft));
+        // Round-5 LOW: the source is an OS error, not prose.
+        assert_eq!(errno(&error), Some(libc::EEXIST), "an OS error source");
         assert_eq!(ino(&dst), swapped.get(), "the other file is kept");
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0);
         assert_eq!(std::fs::read(&src).unwrap(), b"payload");
