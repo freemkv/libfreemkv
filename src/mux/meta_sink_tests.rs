@@ -361,6 +361,7 @@ fn json_per_kind_cursors_and_title_fields() {
     t.content_format = ContentFormat::BdTs;
     t.playlist_id = 801;
     t.clips = vec![Clip {
+        marks_on_pes_clock: true,
         feed_span: None,
         clip_id: "00007".into(),
         in_time: 0,

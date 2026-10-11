@@ -266,10 +266,7 @@ impl M2tsStream {
             muxer,
             route,
             excluded,
-            timeline: super::timeline::TimelineContinuity::with_clips(
-                &title.clips,
-                title.content_format,
-            ),
+            timeline: super::timeline::TimelineContinuity::with_clips(&title.clips),
             ref_video,
             frames_mapped: 0,
         })

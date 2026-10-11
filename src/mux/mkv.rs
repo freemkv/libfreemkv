@@ -1473,13 +1473,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// Drive seam correction from the title's PlayItem marks instead of inferring it from PTS
     /// jumps. Each clip is placed at the sum of the earlier clips' durations, so output runs
     /// exactly as long as the playlist says. No-op for fewer than two clips or without usable
-    /// marks — DVD, HD-DVD and file sources keep the inference path.
-    pub(crate) fn set_clips(
-        &mut self,
-        clips: &[crate::disc::Clip],
-        content_format: crate::disc::ContentFormat,
-    ) {
-        self.continuity = TimelineContinuity::with_clips(clips, content_format);
+    /// marks on the PES clock: DVD, HD-DVD and file sources keep the inference path.
+    pub(crate) fn set_clips(&mut self, clips: &[crate::disc::Clip]) {
+        self.continuity = TimelineContinuity::with_clips(clips);
     }
 
     /// Write a single frame. `duration_ns = Some` emits a `BlockGroup` with

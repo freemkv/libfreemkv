@@ -322,10 +322,7 @@ impl<W: Write + Send> MpgSink<W> {
             writer: Some(writer),
             mux: None,
             excluded,
-            timeline: crate::mux::timeline::TimelineContinuity::with_clips(
-                &title.clips,
-                title.content_format,
-            ),
+            timeline: crate::mux::timeline::TimelineContinuity::with_clips(&title.clips),
             origin_saturated: 0,
             frames: 0,
             finished: false,

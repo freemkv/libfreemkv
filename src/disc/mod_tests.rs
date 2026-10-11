@@ -1091,6 +1091,7 @@ fn title_with(playlist: &str, duration_secs: f64, size_bytes: u64, n_clips: usiz
     t.size_bytes = size_bytes;
     t.clips = (0..n_clips)
         .map(|i| Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: format!("{i:05}"),
             in_time: 0,
@@ -1549,6 +1550,7 @@ fn canonical_title_order_picks_largest_feature() {
             size_bytes,
             clips: (0..n_clips)
                 .map(|i| Clip {
+                    marks_on_pes_clock: true,
                     feed_span: None,
                     clip_id: format!("{i:05}"),
                     in_time: 0,
@@ -1658,6 +1660,7 @@ fn bd_title(playlist: &str, id: u16, dur: f64, size: u64, clip_ids: &[&str]) -> 
         clips: clip_ids
             .iter()
             .map(|c| Clip {
+                marks_on_pes_clock: true,
                 feed_span: None,
                 clip_id: (*c).into(),
                 in_time: 0,

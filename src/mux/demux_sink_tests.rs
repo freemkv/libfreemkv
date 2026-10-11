@@ -1053,6 +1053,7 @@ fn a_demux_export_the_seam_plan_emptied_fails() {
     // covering 100s..200s and 200s..300s in 45 kHz ticks.
     title.clips = vec![
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00000".into(),
             in_time: 100 * 45_000,
@@ -1061,6 +1062,7 @@ fn a_demux_export_the_seam_plan_emptied_fails() {
             source_packets: 0,
         },
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00001".into(),
             in_time: 200 * 45_000,
@@ -1105,6 +1107,7 @@ fn a_demux_export_the_seam_plan_mostly_emptied_fails() {
     let mut title = title_with(vec![video_stream(Codec::H264)], vec![None]);
     title.clips = vec![
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00000".into(),
             in_time: 100 * 45_000,
@@ -1113,6 +1116,7 @@ fn a_demux_export_the_seam_plan_mostly_emptied_fails() {
             source_packets: 0,
         },
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00001".into(),
             in_time: 200 * 45_000,
@@ -1175,6 +1179,7 @@ fn a_filtered_export_ignores_drops_on_non_persisted_tracks() {
     );
     title.clips = vec![
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00000".into(),
             in_time: 100 * 45_000,
@@ -1183,6 +1188,7 @@ fn a_filtered_export_ignores_drops_on_non_persisted_tracks() {
             source_packets: 0,
         },
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00001".into(),
             in_time: 200 * 45_000,
@@ -1266,6 +1272,7 @@ fn a_filtered_export_whose_persisted_track_was_emptied_fails() {
     );
     title.clips = (0..2u32)
         .map(|i| crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: format!("0000{i}"),
             in_time: (100 + 100 * i) * 45_000,

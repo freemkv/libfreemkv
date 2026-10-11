@@ -2720,6 +2720,7 @@ fn no_track0_keyframe_yields_error_not_empty_file() {
 #[test]
 fn seam_plan_dropping_most_frames_fails_the_mux() {
     let clip = |id: &str, secs: u32| crate::disc::Clip {
+        marks_on_pes_clock: true,
         feed_span: None,
         clip_id: id.into(),
         in_time: secs * 45_000,
@@ -2737,7 +2738,7 @@ fn seam_plan_dropping_most_frames_fails_the_mux() {
             &[],
         )
         .unwrap();
-        m.set_clips(&clips, crate::disc::ContentFormat::BdTs);
+        m.set_clips(&clips);
         // 0 s and 1 s sit before the first IN mark: both dropped.
         for pts in [0, 1_000_000_000].iter().chain(kept) {
             let _ = m.write_frame(0, *pts, true, &[0x01; 16], None, None);
@@ -2776,6 +2777,7 @@ fn a_title_the_seam_plan_emptied_is_not_reported_as_a_skippable_stub() {
     // every frame below sits far before the first IN, so the plan drops them all.
     let clips = [
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00000".into(),
             in_time: 100 * 45_000,
@@ -2784,6 +2786,7 @@ fn a_title_the_seam_plan_emptied_is_not_reported_as_a_skippable_stub() {
             source_packets: 0,
         },
         crate::disc::Clip {
+            marks_on_pes_clock: true,
             feed_span: None,
             clip_id: "00001".into(),
             in_time: 200 * 45_000,
@@ -2793,7 +2796,7 @@ fn a_title_the_seam_plan_emptied_is_not_reported_as_a_skippable_stub() {
         },
     ];
     let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &tracks, None, 100.0, &[]).unwrap();
-    muxer.set_clips(&clips, crate::disc::ContentFormat::BdTs);
+    muxer.set_clips(&clips);
     // 0s and 1s — both before the clip's IN mark.
     let _ = muxer.write_frame(0, 0, true, &[0x01; 16], None, None);
     let _ = muxer.write_frame(0, 1_000_000_000, true, &[0x02; 16], None, None);

@@ -344,10 +344,7 @@ impl<W: Write + Seek> Mp4Sink<W> {
             finished: false,
             plan: report,
             excluded: super::ps::UnstoredExtensions::new(title, "MP4"),
-            timeline: crate::mux::timeline::TimelineContinuity::with_clips(
-                &title.clips,
-                title.content_format,
-            ),
+            timeline: crate::mux::timeline::TimelineContinuity::with_clips(&title.clips),
             ref_video,
             frames_mapped: 0,
             dropped: Vec::new(),

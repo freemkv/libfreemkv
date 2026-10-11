@@ -516,16 +516,13 @@ impl TimelineContinuity {
 
     // Corrector driven by a title's PlayItem marks where they exist, else `Self::new`'s
     // inference.
-    pub(crate) fn with_clips(
-        clips: &[crate::disc::Clip],
-        content_format: crate::disc::ContentFormat,
-    ) -> Self {
-        // Only Blu-ray: its PlayItem IN/OUT share the 45 kHz clock the PES PTS runs on.
-        // HD-DVD/DVD marks come from a different clock (XPL times, cell tables) — a
-        // plan from those would drop content the PTS wasn't measured against, so they keep inference.
-        let seams = match content_format {
-            crate::disc::ContentFormat::BdTs => SeamPlan::from_clips(clips),
-            crate::disc::ContentFormat::MpegPs | crate::disc::ContentFormat::DvdPs => None,
+    pub(crate) fn with_clips(clips: &[crate::disc::Clip]) -> Self {
+        // Only marks on the PES clock plan seams: marks on another clock (HD DVD XPL times)
+        // would drop content the PTS wasn't measured against, so those keep inference.
+        let seams = if clips.iter().all(|c| c.marks_on_pes_clock) {
+            SeamPlan::from_clips(clips)
+        } else {
+            None
         };
         Self {
             epoch_offsets: Vec::new(),

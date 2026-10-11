@@ -804,7 +804,7 @@ impl MkvStream {
             &self.disc_title.chapters,
         )?;
         // Seam correction from the playlist's marks where the title has them.
-        muxer.set_clips(&self.disc_title.clips, self.disc_title.content_format);
+        muxer.set_clips(&self.disc_title.clips);
         muxer.set_origin_lead_ns(pending.origin_lead_ns, pending.dropped_pre_origin);
         if let Some(path) = &pending.opening_capture_path {
             muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
@@ -891,12 +891,10 @@ impl MkvStream {
             // audio already buffered while its parser assembled the opening GOP.
             // Replaying the audio first made the muxer drop that entire prefix.
             if use_coding && frame.keyframe {
-                // Only Blu-ray marks share the PES clock (see `TimelineContinuity::with_clips`).
-                let in_ns = match self.disc_title.content_format {
-                    crate::disc::ContentFormat::BdTs => self.disc_title.clips.first(),
-                    crate::disc::ContentFormat::MpegPs | crate::disc::ContentFormat::DvdPs => None,
-                }
-                .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
+                // Only marks on the PES clock place the origin (see `TimelineContinuity::with_clips`).
+                let in_ns = (self.disc_title.clips.first())
+                    .filter(|c| c.marks_on_pes_clock)
+                    .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
                 if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
                     p.set_origin(frame.pts, in_ns);
                     let mut f = frame.clone();

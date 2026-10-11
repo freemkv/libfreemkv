@@ -3865,6 +3865,7 @@ fn an_mpeg_ps_origin_ignores_clip_marks_and_squashes_nothing() {
     let mut t = three_track_title();
     t.content_format = crate::disc::ContentFormat::MpegPs;
     t.clips = vec![crate::disc::Clip {
+        marks_on_pes_clock: false,
         clip_id: String::new(),
         in_time: 36_000,
         out_time: 450_000,
@@ -3891,6 +3892,7 @@ fn a_bd_frame_before_the_clip_in_is_dropped_without_a_seam_plan() {
     let mut t = three_track_title();
     t.content_format = crate::disc::ContentFormat::BdTs;
     t.clips = vec![crate::disc::Clip {
+        marks_on_pes_clock: true,
         clip_id: String::new(),
         in_time: 36_000,
         out_time: 0,

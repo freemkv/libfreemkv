@@ -3,6 +3,7 @@ use crate::disc::{Clip, Extent};
 
 fn clip(id: &str, in_time: u32, out_time: u32) -> Clip {
     Clip {
+        marks_on_pes_clock: true,
         clip_id: id.into(),
         in_time,
         out_time,

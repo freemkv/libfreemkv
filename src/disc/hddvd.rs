@@ -784,6 +784,7 @@ fn compose_xpl_titles(
             match (own_range.as_mut(), c.clip_begin_secs) {
                 (Some(v), Some(cb)) => v.push(Clip {
                     feed_span: None,
+                    marks_on_pes_clock: false,
                     clip_id: clip_id.clone(),
                     in_time: ticks(cb),
                     out_time: ticks(cb + (c.end_secs - c.begin_secs).max(0.0)),
@@ -794,6 +795,7 @@ fn compose_xpl_titles(
             }
             parts.push(Clip {
                 feed_span: None,
+                marks_on_pes_clock: false,
                 clip_id,
                 in_time: (c.begin_secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32,
                 out_time: (c.end_secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32,
@@ -1013,6 +1015,7 @@ impl Disc {
                     size_bytes = size_bytes.saturating_add(*size);
                     parts.push(Clip {
                         feed_span: None,
+                        marks_on_pes_clock: false,
                         clip_id: orig
                             .rsplit_once('.')
                             .map(|(b, _)| b)
@@ -1072,6 +1075,7 @@ impl Disc {
                 size_bytes: *size,
                 clips: vec![Clip {
                     feed_span: None,
+                    marks_on_pes_clock: false,
                     clip_id,
                     in_time: 0,
                     out_time: 0,
