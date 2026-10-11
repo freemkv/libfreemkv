@@ -473,6 +473,32 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
     }
 
+    // The no-replace rename's EINVAL (NFS, FUSE without rename2) engages the fallbacks.
+    #[test]
+    #[cfg(unix)]
+    fn a_renameat2_einval_falls_back_to_the_link_and_the_claim() {
+        struct Einval(Fake);
+        impl Steps for Einval {
+            fn native(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Err(renameat2_error(io::Error::from_raw_os_error(libc::EINVAL)))
+            }
+            fn link(&self, source: &Path, target: &Path) -> io::Result<()> {
+                self.0.link(source, target)
+            }
+        }
+        for link in [None, Some(libc::ENOTSUP)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (src, dst) = pair(dir.path());
+            let steps = Einval(Fake {
+                link,
+                ..Fake::default()
+            });
+            publish_with(&src, &dst, &steps).unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), b"payload", "{link:?}");
+            assert_eq!(names(dir.path()), ["dst"], "{link:?}");
+        }
+    }
+
     #[test]
     fn success_moves_bytes_and_leaves_no_stray() {
         let dir = tempfile::tempdir().unwrap();
