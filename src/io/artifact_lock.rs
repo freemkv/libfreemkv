@@ -200,6 +200,7 @@ impl ArtifactLock {
             let (retry, cause) = match proof {
                 Proof::Ours => return Ok(ArtifactLock { file, path, claim }),
                 Proof::Retry(e) => (e, Cause::Proof),
+                #[cfg(unix)]
                 Proof::Fault(e) => (e, Cause::Fault),
             };
             // A retry is a wait like any other: halt-aware, and under T10 (never a spin).
@@ -280,7 +281,7 @@ enum Proof {
     Ours,
     Retry(io::Error),
     // Windows proves by file index alone: no token IO to fail.
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg(unix)]
     Fault(io::Error),
 }
 
