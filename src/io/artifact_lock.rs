@@ -98,7 +98,7 @@ impl ArtifactLock {
     ///
     /// [`Error::Halted`] on a Stop; [`Error::TimedOut`] `{ op: "artifact_lock" }` after
     /// [`ARTIFACT_LOCK_WINDOW`] with no progress (Windows: also a permission failure);
-    /// [`Error::IoError`] when the sidecar cannot be opened or locked, or its token IO
+    /// [`Error::IoError`] when the sidecar cannot be opened, examined or locked, or its token IO
     /// fails the same way on several fresh attempts in a row with no holder seen.
     pub fn acquire(final_path: &Path, watch: &[&Path], halt: &Halt) -> Result<ArtifactLock> {
         Self::acquire_within(final_path, watch, halt, ARTIFACT_LOCK_WINDOW)
@@ -132,6 +132,7 @@ impl ArtifactLock {
         lock: &Lock<'_>,
     ) -> Result<ArtifactLock> {
         let hooks = Hooks {
+            stat: &|f| f.metadata(),
             ids,
             lock,
             names: &os::names_this_file,
@@ -147,7 +148,12 @@ impl ArtifactLock {
         window: Duration,
         hooks: &Hooks<'_>,
     ) -> Result<ArtifactLock> {
-        let Hooks { ids, lock, names } = *hooks;
+        let Hooks {
+            stat,
+            ids,
+            lock,
+            names,
+        } = *hooks;
         let path = lock_path(final_path);
         let mut wait = LockWait::new(final_path, watch, window);
         let key = claim_key(&path);
@@ -174,10 +180,20 @@ impl ArtifactLock {
                 }
                 Err(e) => return Err(Error::IoError { source: e }),
             };
-            if let Some(e) = os::foreign(&file) {
-                drop(file);
-                wait.slice(halt, &e, Cause::Holder)?;
-                continue;
+            match os::foreign(&file, stat) {
+                Ok(None) => {}
+                Ok(Some(e)) => {
+                    drop(file);
+                    wait.slice(halt, &e, Cause::Holder)?;
+                    continue;
+                }
+                // As in `same_file`: gone or stale retries, any other fstat error fails.
+                Err(e) if os::id_retryable(&e) => {
+                    drop(file);
+                    wait.slice(halt, &e, Cause::Proof)?;
+                    continue;
+                }
+                Err(e) => return Err(Error::IoError { source: e }),
             }
             // SS-8 flock(2): "Only one process may hold an exclusive lock for a given file at
             // a given time." SS-10 LockFileEx: LOCKFILE_EXCLUSIVE_LOCK, FAIL_IMMEDIATELY.
@@ -236,6 +252,8 @@ impl ArtifactLock {
     }
 }
 
+// The open sidecar's fstat (tests inject its failure).
+type Stat<'a> = dyn Fn(&File) -> io::Result<std::fs::Metadata> + 'a;
 // (the open file's identity, the path's identity).
 type Ids<'a> = dyn Fn(&File, &Path) -> (io::Result<(u64, u64)>, io::Result<(u64, u64)>) + 'a;
 // The OS exclusive try-lock (tests model filesystems where it does not exclude).
@@ -246,6 +264,7 @@ type Names<'a> = dyn Fn(&File, &Path, &Lock<'_>) -> io::Result<Proof> + 'a;
 
 // The injectable checks of one acquire.
 struct Hooks<'a> {
+    stat: &'a Stat<'a>,
     ids: &'a Ids<'a>,
     lock: &'a Lock<'a>,
     names: &'a Names<'a>,
@@ -397,7 +416,7 @@ fn signatures(paths: &[PathBuf]) -> Vec<Option<(u64, Option<SystemTime>)>> {
 
 #[cfg(unix)]
 mod os {
-    use super::{Lock, Proof, replaced};
+    use super::{Lock, Proof, Stat, replaced};
     use std::fs::File;
     use std::io;
     use std::os::unix::fs::MetadataExt;
@@ -421,13 +440,11 @@ mod os {
     }
 
     // Not a sidecar this lock may write: not a regular file, or linked under another name
-    // too (the token would truncate that file).
-    pub(super) fn foreign(f: &File) -> Option<io::Error> {
-        match f.metadata() {
-            Ok(m) if m.is_file() && m.nlink() <= 1 => None,
-            Ok(_) => Some(io::Error::other("the sidecar is not a lone regular file")),
-            Err(e) => Some(e),
-        }
+    // too (the token would truncate that file). `Err` when its fstat fails.
+    pub(super) fn foreign(f: &File, stat: &Stat<'_>) -> io::Result<Option<io::Error>> {
+        let m = stat(f)?;
+        Ok((!m.is_file() || m.nlink() > 1)
+            .then(|| io::Error::other("the sidecar is not a lone regular file")))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -662,7 +679,7 @@ mod os {
 
 #[cfg(windows)]
 mod os {
-    use super::{Lock, Proof};
+    use super::{Lock, Proof, Stat};
     use std::ffi::c_void;
     use std::fs::File;
     use std::io;
@@ -726,8 +743,8 @@ mod os {
             .open(p)
     }
 
-    pub(super) fn foreign(_f: &File) -> Option<io::Error> {
-        None
+    pub(super) fn foreign(_f: &File, _stat: &Stat<'_>) -> io::Result<Option<io::Error>> {
+        Ok(None)
     }
 
     // A delete-pending file refuses the open with ERROR_ACCESS_DENIED, which a real

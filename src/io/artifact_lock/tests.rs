@@ -373,6 +373,7 @@ fn waiter_must_not_keep_a_replaced_sidecar_with(ids: IdFn, names: &SyncNames<'_>
     thread::scope(|scope| {
         let waiter = scope.spawn(|| {
             let hooks = Hooks {
+                stat: &|f| f.metadata(),
                 ids: &counted,
                 lock: &lock,
                 names,
@@ -479,6 +480,7 @@ fn cifs_rounds(out: &Path) {
     let names =
         |f: &File, p: &Path, relock: &Lock<'_>| os::names_with(f, p, &real_write, &slow, relock);
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &|f, p| (os::file_id(f), os::path_id(p)),
         lock: &os::try_lock_exclusive,
         names: &names,
@@ -532,6 +534,7 @@ fn acquire_at_with_token_io(
         os::names_with(f, p, write, read, relock)
     };
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &|f, p| (os::file_id(f), os::path_id(p)),
         lock: &os::try_lock_exclusive,
         names: &names,
@@ -673,6 +676,7 @@ fn a_sidecar_replaced_during_the_unlocked_proof_is_not_ours() {
         os::names_with(f, p, &real_write, &read_refused_while_locked, &relock)
     };
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &|f, p| (os::file_id(f), os::path_id(p)),
         lock: &os::try_lock_exclusive,
         names: &names,
@@ -823,6 +827,7 @@ fn an_expiry_names_a_failing_proof_apart_from_a_holder() {
     let real_ids = |f: &File, p: &Path| (os::file_id(f), os::path_id(p));
     let never = |_: &File, _: &Path, _: &Lock<'_>| Ok(Proof::Retry(replaced()));
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &real_ids,
         lock: &os::try_lock_exclusive,
         names: &never,
@@ -1176,4 +1181,40 @@ fn write_token_marks_an_unsupported_truncate() {
         None,
         "wrapped, so token_unavailable takes it"
     );
+}
+
+/// Round-4 LOW: an fstat failing on the freshly opened sidecar is an IO fault, as in the
+/// identity check: `IoError` at once, never waited out as a holder until T10.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_sidecar_fstat_failure_is_an_io_error_not_a_holder() {
+    let (_dir, out) = artifact();
+    let ids = |f: &File, p: &Path| (os::file_id(f), os::path_id(p));
+    let eio = |_: &File| Err(io::Error::from_raw_os_error(libc::EIO));
+    let hooks = Hooks {
+        stat: &eio,
+        ids: &ids,
+        lock: &os::try_lock_exclusive,
+        names: &os::names_this_file,
+    };
+    let t = Instant::now();
+    let r = ArtifactLock::acquire_full(&out, &[], &Halt::new(), WINDOW, &hooks);
+    assert!(
+        matches!(&r, Err(Error::IoError { source }) if source.raw_os_error() == Some(libc::EIO)),
+        "{r:?}"
+    );
+    assert!(t.elapsed() < WINDOW / 2, "{:?}", t.elapsed());
+    // Gone or stale (another client deleted it) retries, as the identity check does.
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    let once = |f: &File| match n.fetch_add(1, Ordering::SeqCst) {
+        0 => Err(io::Error::from(io::ErrorKind::NotFound)),
+        _ => f.metadata(),
+    };
+    let hooks = Hooks {
+        stat: &once,
+        ..hooks
+    };
+    let r = ArtifactLock::acquire_full(&out, &[], &Halt::new(), WINDOW, &hooks);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(n.load(Ordering::SeqCst), 2);
 }
