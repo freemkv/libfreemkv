@@ -7,6 +7,10 @@ use crate::mux::codec::coding::{CodingType, Mpeg2Coding};
 use crate::mux::videomap::Medium;
 use crate::pes::SourcePos;
 
+fn fvi_at(path: &std::path::Path, title: &DiscTitle, source: SourceInfo) -> io::Result<FviSink> {
+    Ok(FviSink::create(File::create(path)?, title, source))
+}
+
 fn mpeg2_title() -> DiscTitle {
     let mut t = DiscTitle::empty();
     t.streams = vec![DiscStream::Video(VideoStream {
@@ -113,7 +117,7 @@ fn a_failed_finish_is_not_reported_ok_on_retry() {
 fn record_numbers_stay_contiguous_across_interleaved_audio() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.fvi");
-    let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
+    let mut sink = fvi_at(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
     sink.write(&vframe(0, Some(i_pic()), None)).unwrap();
     sink.write(&vframe(1, None, None)).unwrap();
     sink.write(&vframe(0, Some(i_pic()), None)).unwrap();
@@ -153,7 +157,7 @@ fn header_carries_playlist_volume_id_and_picture_count_when_known() {
 fn sink_writes_header_and_only_video_records() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("movie.fvi");
-    let mut sink = FviSink::create(
+    let mut sink = fvi_at(
         &path,
         &mpeg2_title(),
         SourceInfo {
@@ -219,7 +223,7 @@ fn secondary_video_stream_is_not_indexed() {
         v.secondary = true;
     }
     title.streams.push(second);
-    let mut sink = FviSink::create(&path, &title, SourceInfo::default()).unwrap();
+    let mut sink = fvi_at(&path, &title, SourceInfo::default()).unwrap();
     sink.write(&vframe(0, Some(i_pic()), Some(SourcePos::at_byte(0))))
         .unwrap();
     sink.write(&vframe(1, Some(i_pic()), Some(SourcePos::at_byte(2048))))
@@ -233,7 +237,7 @@ fn secondary_video_stream_is_not_indexed() {
 fn empty_title_still_emits_valid_header() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("empty.fvi");
-    let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
+    let mut sink = fvi_at(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
     sink.finish().unwrap(); // no frames
     let text = std::fs::read_to_string(&path).unwrap();
     assert_eq!(text.lines().count(), 1, "header only");
@@ -246,7 +250,7 @@ fn extension_jsonl_is_still_json_lines() {
     // Output is always JSON Lines regardless of extension (one format today).
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("idx.jsonl");
-    let mut sink = FviSink::create(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
+    let mut sink = fvi_at(&path, &mpeg2_title(), SourceInfo::default()).unwrap();
     sink.write(&vframe(0, Some(i_pic()), None)).unwrap();
     sink.finish().unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
@@ -262,7 +266,7 @@ fn codec_agnostic_non_mpeg2_records() {
     // pts populated, and NO mpeg2-only field members.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("uhd.fvi");
-    let mut sink = FviSink::create(
+    let mut sink = fvi_at(
         &path,
         &hevc_title(),
         SourceInfo {

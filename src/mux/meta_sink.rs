@@ -93,10 +93,11 @@ pub struct ChaptersSink {
 }
 
 impl ChaptersSink {
-    pub fn create(path: &Path, title: &DiscTitle) -> io::Result<Self> {
+    /// Writes the chapters to `file`, open at `path` (whose extension picks the format).
+    pub fn create(mut file: File, path: &Path, title: &DiscTitle) -> io::Result<Self> {
         let ext = path.extension().and_then(|e| e.to_str());
         let content = chapters_content(&title.chapters, ext);
-        File::create(path)?.write_all(content.as_bytes())?;
+        file.write_all(content.as_bytes())?;
         Ok(Self {
             title: title.clone(),
         })
@@ -271,13 +272,13 @@ pub struct JsonSink {
 }
 
 impl JsonSink {
-    pub fn create(path: &Path, title: &DiscTitle) -> io::Result<Self> {
+    /// Writes the title's metadata to `f`, its destination.
+    pub fn create(mut f: File, title: &DiscTitle) -> io::Result<Self> {
         // Infallible in practice, but propagate rather than silently write "{}".
         // `NoMetadata` (E9008), not `MkvInvalid` — the latter's skippable-stub
         // ruling would wrongly swallow a real encode failure as an empty nav stub.
         let doc = serde_json::to_string_pretty(&title_json(title))
             .map_err(|_| crate::error::Error::NoMetadata)?;
-        let mut f = File::create(path)?;
         f.write_all(doc.as_bytes())?;
         f.write_all(b"\n")?;
         Ok(Self {

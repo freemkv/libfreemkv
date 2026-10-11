@@ -603,7 +603,9 @@ pub fn output(
     source: Option<&super::videomap::SourceInfo>,
 ) -> io::Result<Box<dyn crate::pes::PesSink>> {
     let parsed = parse_url(url);
-    super::pes_output::PesOutput::of(&parsed)?.open(title, source, None)
+    Ok(super::pes_output::PesOutput::of(&parsed)?
+        .open(title, source, None)?
+        .0)
 }
 
 /// What a file output shares with the mux (§2.10): the flush counters (the consumer's

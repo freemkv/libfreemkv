@@ -529,8 +529,12 @@ fn drive_mux(
                 stream.lost_bytes(),
             ));
         }
-        let mut sink = CountingStream::new(dest?.open(&out_title, source, None)?);
-        ctx.emit(Event::OutputOpened { title: &out_title });
+        let (sink, file) = dest?.open(&out_title, source, None)?;
+        let mut sink = CountingStream::new(sink);
+        ctx.emit(Event::OutputOpened {
+            title: &out_title,
+            file,
+        });
         sink.finish()?;
         return Ok(MuxOutcome {
             completed: true,
@@ -657,7 +661,7 @@ fn drive_mux(
         progress: &flush,
         halt,
     };
-    let mut output_stream = open_output(dest, &out_title, source, out_flush)?;
+    let (mut output_stream, file) = open_output(dest, &out_title, source, out_flush)?;
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
@@ -671,7 +675,10 @@ fn drive_mux(
         }));
     }
     if refused.is_empty() {
-        ctx.emit(Event::OutputOpened { title: &out_title });
+        ctx.emit(Event::OutputOpened {
+            title: &out_title,
+            file,
+        });
     } else {
         let mut opened = out_title.clone();
         let keep = |i: &usize| !refused.contains(i);
@@ -683,7 +690,10 @@ fn drive_mux(
             .filter(keep)
             .map(|i| out_title.codec_privates[i].clone())
             .collect();
-        ctx.emit(Event::OutputOpened { title: &opened });
+        ctx.emit(Event::OutputOpened {
+            title: &opened,
+            file,
+        });
     }
     let output_stream = CountingStream::new(output_stream);
 
@@ -947,10 +957,10 @@ fn open_output(
     title: &DiscTitle,
     source: Option<&SourceInfo>,
     flush: super::resolve::OutputFlush<'_>,
-) -> std::io::Result<Box<dyn PesSink>> {
+) -> std::io::Result<super::pes_output::Opened> {
     #[cfg(test)]
     if let Some(sink) = tests::TEST_SINK.with(|s| s.borrow_mut().take()) {
-        return Ok(sink);
+        return Ok((sink, None));
     }
     dest?.open(title, source, Some(&flush))
 }

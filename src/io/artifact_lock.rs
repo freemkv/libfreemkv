@@ -33,6 +33,11 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     os::path_id(path)
 }
 
+/// [`file_identity`] of an open file, read from its handle (fstat), not its path.
+pub fn file_identity_of(file: &File) -> io::Result<(u64, u64)> {
+    os::file_id(file)
+}
+
 /// The sidecar for the artifact whose final name is `final_path`: `<final>.lock`.
 pub fn lock_path(final_path: &Path) -> PathBuf {
     with_suffix(final_path, ".lock")

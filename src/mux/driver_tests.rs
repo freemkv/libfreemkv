@@ -366,7 +366,7 @@ fn truehd_labels_complete_from_the_stream_for_every_sink() {
         let seen: Arc<std::sync::Mutex<Option<DiscTitle>>> = Arc::default();
         let got = seen.clone();
         let ctx = Ctx::default().with_events(Arc::new(move |e: &Event<'_>| {
-            if let Event::OutputOpened { title } = e {
+            if let Event::OutputOpened { title, .. } = e {
                 *got.lock().unwrap() = Some((*title).clone());
             }
         }));
@@ -1537,15 +1537,36 @@ impl crate::pes::PesSink for LpcmSource {
     }
 }
 
-/// Keeps the title of `OutputOpened`.
+/// Keeps the title (and the file identity) of `OutputOpened`.
 #[derive(Default)]
-struct TitleSpy(std::sync::Mutex<Option<DiscTitle>>);
+struct TitleSpy(
+    std::sync::Mutex<Option<DiscTitle>>,
+    std::sync::Mutex<Option<Option<(u64, u64)>>>,
+);
 impl crate::event::Events for TitleSpy {
     fn event(&self, e: &Event<'_>) {
-        if let Event::OutputOpened { title } = *e {
+        if let Event::OutputOpened { title, file } = *e {
             *self.0.lock().unwrap() = Some(title.clone());
+            *self.1.lock().unwrap() = Some(file);
         }
     }
+}
+
+/// Round-5 (engine): `OutputOpened` names the file the sink opened, by its handle's
+/// identity; a sink with no file names none.
+#[test]
+fn output_opened_carries_the_opened_files_identity() {
+    use crate::disc::{AudioChannels, SampleRate};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.mkv");
+    let new_src = || LpcmSource::new(AudioChannels::Surround51, SampleRate::S48, None);
+    let spy = Arc::new(TitleSpy::default());
+    run(new_src(), &format!("mkv://{}", path.display()), &spy);
+    let want = crate::io::artifact_lock::file_identity(&path).unwrap();
+    assert_eq!(*spy.1.lock().unwrap(), Some(Some(want)));
+    let spy = Arc::new(TitleSpy::default());
+    run(new_src(), "null://", &spy);
+    assert_eq!(*spy.1.lock().unwrap(), Some(None));
 }
 
 fn run(src: LpcmSource, url: &str, spy: &Arc<TitleSpy>) -> MuxOutcome {
@@ -2937,7 +2958,7 @@ fn the_selection_prunes_every_arm() {
             selection: sel.clone(),
             ..clear_opts(raw)
         };
-        let spy = Arc::new(TitleSpy(std::sync::Mutex::new(None)));
+        let spy = Arc::new(TitleSpy::default());
         mux_with_keys(
             src,
             None,

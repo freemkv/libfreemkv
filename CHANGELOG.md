@@ -19,6 +19,7 @@
 ### Changed
 
 - **Breaking:** `ParseResult` gains public field `evidence` and `Clip` gains `marks_on_pes_clock`; `DiscTitle` gains `selection_evidence`. Struct-literal builds must name them.
+- **Breaking:** `Event::OutputOpened` gains `file: Option<(u64, u64)>`, the identity of the file the sink opened, read from its handle with the new `io::artifact_lock::file_identity_of(&File)` (device/inode on Unix, volume serial/file index on Windows); `None` for a non-file sink (network, stdio, null, demux directories) or when that fstat fails. Consumers no longer need to stat the destination by path. Patterns naming the variant's fields must add `file` or `..`, and literals must set it.
 - `Drive::has_unlocker()` and `Drive::platform_name()` follow `Unlocker::claims`: the first firmware unlocker that claims the drive is reported, so a Renesas profile is no longer reported as LD (latent with the bundled catalog). `Drive::unlocked_by()` is what `init()` ran.
 - The disc gate refuses an encrypted disc whose AACS state was never read; E7031 (`E_AACS_KEY_FILE_UNREADABLE`) when the key file was unreadable. Discs that key per title are spared, and an ISO's content is re-judged when it is encrypted without AACS state.
 - `find_drive` takes its candidates from `scsi::list_drives` on every OS, replacing the per-OS enumeration; unresponsive or non-optical entries still fail the open and are skipped.
