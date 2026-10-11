@@ -219,6 +219,15 @@ pub(crate) fn stated_duration_secs(element: &str, keys: &[&str]) -> Option<u64> 
     })
 }
 
+/// How a parser's labels were obtained. `Structural` labels are derived from
+/// disc format fields (stream tables, codec ids) and form the gap-fill floor;
+/// `Authored` labels are read from authored metadata (menus, manifests, art).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceKind {
+    Structural,
+    Authored,
+}
+
 /// Successful parser result. `None` from `parse()` still means "this
 /// isn't my disc" (no labels at all); `Some(ParseResult { labels, .. })`
 /// with `labels.is_empty()` is also a "no labels" case but reachable
@@ -227,6 +236,8 @@ pub(crate) fn stated_duration_secs(element: &str, keys: &[&str]) -> Option<u64> 
 pub struct ParseResult {
     pub labels: Vec<StreamLabel>,
     pub confidence: Confidence,
+    /// Whether these labels come from disc structure or authored metadata.
+    pub evidence: EvidenceKind,
     /// The disc's authoring-named feature playlist, when this parser read it
     /// from the menu metadata. `None` for parsers that don't expose one.
     pub feature_playlist: Option<FeaturePlaylistHint>,
@@ -239,6 +250,7 @@ impl ParseResult {
         ParseResult {
             labels,
             confidence: Confidence::High,
+            evidence: EvidenceKind::Authored,
             feature_playlist: None,
         }
     }
@@ -248,6 +260,7 @@ impl ParseResult {
         ParseResult {
             labels,
             confidence: Confidence::Medium,
+            evidence: EvidenceKind::Authored,
             feature_playlist: None,
         }
     }
@@ -259,8 +272,15 @@ impl ParseResult {
         ParseResult {
             labels,
             confidence: Confidence::Low,
+            evidence: EvidenceKind::Authored,
             feature_playlist: None,
         }
+    }
+
+    /// Mark these labels as structure-derived (the gap-fill floor kind).
+    pub fn structural(mut self) -> Self {
+        self.evidence = EvidenceKind::Structural;
+        self
     }
 }
 
@@ -954,7 +974,7 @@ fn extract(
     // past bug where the LAST equal-confidence parser won instead of the first.
     // Array order encodes trust (hand-vetted parsers before generic BD-J ones).
     let best = select_result(&candidates).map(|(n, r)| (*n, r.clone()));
-    let (name, mut labels, feature_playlist) = match best {
+    let (_, evidence, mut labels, feature_playlist) = match best {
         Some((n, r)) => {
             tracing::info!(
                 parser = n,
@@ -962,7 +982,7 @@ fn extract(
                 label_count = r.labels.len(),
                 "label parser selected",
             );
-            (n, r.labels, r.feature_playlist)
+            (n, r.evidence, r.labels, r.feature_playlist)
         }
         None => {
             tracing::info!("no label parser matched");
@@ -973,13 +993,21 @@ fn extract(
     // The MPLS floor: framework parsers under-yield on multi-track discs, only
     // shipping editorial labels for "interesting" streams (Atmos, SDH). MPLS
     // names every stream a playlist references (parsed once, in the loop above).
-    if name != "mpls_universal"
-        && let Some((_, mpls_result)) = candidates.iter().find(|(n, _)| *n == "mpls_universal")
+    if evidence != EvidenceKind::Structural
+        && let Some(floor) = structural_floor(&candidates)
     {
-        merge_mpls_floor(&mut labels, &mpls_result.labels);
+        merge_mpls_floor(&mut labels, &floor.labels);
     }
 
     (labels, feature_playlist)
+}
+
+// The structural-evidence result among the parsed candidates, if any.
+fn structural_floor<'a>(results: &'a [(&'static str, ParseResult)]) -> Option<&'a ParseResult> {
+    results
+        .iter()
+        .map(|(_, r)| r)
+        .find(|r| r.evidence == EvidenceKind::Structural)
 }
 
 // Merge the MPLS-derived floor into a framework list. Nothing is merged BY slot (the lists
@@ -1076,18 +1104,23 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
     // with first-in-array-order winning on a confidence tie.
     let chosen = select_result(&all_results);
 
-    let (parser, confidence, mut labels) = match chosen {
-        Some((name, r)) => (Some(*name), Some(r.confidence), r.labels.clone()),
-        None => (None, None, Vec::new()),
+    let (parser, confidence, chosen_evidence, mut labels) = match chosen {
+        Some((name, r)) => (
+            Some(*name),
+            Some(r.confidence),
+            Some(r.evidence),
+            r.labels.clone(),
+        ),
+        None => (None, None, None, Vec::new()),
     };
 
     // The MPLS floor: same merge as `extract()`. Skipped when MPLS was itself
     // the chosen parser (its labels ARE the labels).
-    let gap_fill_added = if parser.is_some() && parser != Some("mpls_universal") {
+    let gap_fill_added = if chosen_evidence == Some(EvidenceKind::Authored) {
         let before = labels.len();
         // The registry loop above already parsed MPLS; reuse that result.
-        if let Some((_, mpls_result)) = all_results.iter().find(|(n, _)| *n == "mpls_universal") {
-            merge_mpls_floor(&mut labels, &mpls_result.labels);
+        if let Some(floor) = structural_floor(&all_results) {
+            merge_mpls_floor(&mut labels, &floor.labels);
         }
         labels.len().saturating_sub(before)
     } else {

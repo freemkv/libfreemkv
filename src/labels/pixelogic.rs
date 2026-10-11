@@ -6,8 +6,8 @@
 //! Token format: `{lang}_{codec?}_{purpose?}_{region?}_`
 
 use super::{
-    Confidence, LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, text,
-    vocab,
+    Confidence, EvidenceKind, LabelPurpose, LabelQualifier, ParseResult, StreamLabel,
+    StreamLabelType, text, vocab,
 };
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
@@ -111,6 +111,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     Some(ParseResult {
         labels,
         confidence,
+        evidence: EvidenceKind::Authored,
         feature_playlist: None,
     })
 }

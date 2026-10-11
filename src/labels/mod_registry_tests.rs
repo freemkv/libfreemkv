@@ -132,6 +132,7 @@ fn result(conf: Confidence) -> ParseResult {
     ParseResult {
         labels: vec![one_label()],
         confidence: conf,
+        evidence: EvidenceKind::Authored,
         feature_playlist: None,
     }
 }
@@ -190,6 +191,7 @@ fn select_result_skips_empty_and_handles_none() {
     let empty = ParseResult {
         labels: Vec::new(),
         confidence: Confidence::High,
+        evidence: EvidenceKind::Authored,
         feature_playlist: None,
     };
     // High-confidence but empty must be skipped in favour of a

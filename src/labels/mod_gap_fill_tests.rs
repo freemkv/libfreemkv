@@ -165,3 +165,23 @@ fn sort_groups_audio_before_subtitle_and_vendor_before_named() {
         ]
     );
 }
+
+// The floor is chosen by evidence kind, never by parser name.
+#[test]
+fn floor_is_selected_by_evidence_kind_not_name() {
+    let floor = derived(StreamLabelType::Audio, "00001", 0x1100, 1, "eng", "TrueHD");
+    let authored = ParseResult::high(vec![label(StreamLabelType::Audio, 1, "fra", "AC-3")]);
+    let results = vec![
+        ("house", authored),
+        ("renamed_floor", ParseResult::low(vec![floor]).structural()),
+    ];
+    let found = structural_floor(&results).expect("structural result found");
+    assert_eq!(found.evidence, EvidenceKind::Structural);
+    let mut labels = results[0].1.labels.clone();
+    merge_mpls_floor(&mut labels, &found.labels);
+    assert_eq!(labels.len(), 2);
+
+    // A registry holding only Authored results has no floor, whatever the names.
+    let none = vec![("mpls_universal", ParseResult::low(Vec::new()))];
+    assert!(structural_floor(&none).is_none());
+}
