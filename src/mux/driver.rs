@@ -21,9 +21,8 @@ use crate::pes::{CountingStream, PesFrame, PesSink, PesSource};
 use crate::sector::{FileSectorSource, SectorSource};
 use crate::session::DiscSession;
 
-use super::resolve::{
-    InputOptions, SinkCaps, StreamUrl, build_iso_pipeline, output, output_with, parse_url,
-};
+use super::pes_output::PesOutput;
+use super::resolve::{InputOptions, StreamUrl, build_iso_pipeline, parse_url};
 #[cfg(test)]
 use super::source::ScannedTitle;
 use super::source::{Origin, Source};
@@ -505,7 +504,11 @@ fn drive_mux(
         out_title.playlist = name.to_string();
     }
 
-    let caps = SinkCaps::of(&parse_url(dest_url));
+    let parsed_dest = parse_url(dest_url);
+    let dest = PesOutput::of(&parsed_dest);
+    let caps = dest
+        .as_ref()
+        .map_or(super::pes_output::FULL, PesOutput::caps);
     let mut buffered: Vec<PesFrame> = Vec::new();
     let mut buffered_bytes: usize = 0;
 
@@ -526,7 +529,7 @@ fn drive_mux(
                 stream.lost_bytes(),
             ));
         }
-        let mut sink = CountingStream::new(output(dest_url, &out_title, source)?);
+        let mut sink = CountingStream::new(dest?.open(&out_title, source, None)?);
         ctx.emit(Event::OutputOpened { title: &out_title });
         sink.finish()?;
         return Ok(MuxOutcome {
@@ -654,7 +657,7 @@ fn drive_mux(
         progress: &flush,
         halt,
     };
-    let mut output_stream = open_output(dest_url, &out_title, source, out_flush)?;
+    let mut output_stream = open_output(dest, &out_title, source, out_flush)?;
     for track in 0..num_streams {
         output_stream.set_track_timing(track, stream.track_timing(track))?;
     }
@@ -940,7 +943,7 @@ fn complete_truehd(
 
 // The sink for `dest_url`; a test may substitute its own (thread-local seam).
 fn open_output(
-    dest_url: &str,
+    dest: Result<PesOutput<'_>, Error>,
     title: &DiscTitle,
     source: Option<&SourceInfo>,
     flush: super::resolve::OutputFlush<'_>,
@@ -949,7 +952,7 @@ fn open_output(
     if let Some(sink) = tests::TEST_SINK.with(|s| s.borrow_mut().take()) {
         return Ok(sink);
     }
-    output_with(dest_url, title, source, Some(flush))
+    dest?.open(title, source, Some(&flush))
 }
 
 // What the write consumer hands back once the container is finalised.

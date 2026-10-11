@@ -9,9 +9,9 @@
 //! [`Mp4Sink::final_report`](super::mp4::Mp4Sink::final_report), never here: a
 //! declared-only extension track is never planned out (J23).
 
-use super::mp4::Mp4SkipReason;
+use super::demux_sink::TrackKind;
 use super::resolve::StreamUrl;
-use crate::disc::{Codec, DiscTitle, Stream};
+use crate::disc::{DiscTitle, Stream};
 
 /// Why a stream is left out of a mux, for the never-silent note.
 ///
@@ -40,20 +40,6 @@ pub enum SkipReason {
     UndescribableAudio,
 }
 
-impl From<Mp4SkipReason> for SkipReason {
-    fn from(r: Mp4SkipReason) -> Self {
-        match r {
-            Mp4SkipReason::BitmapSubtitle => SkipReason::BitmapSubtitle,
-            Mp4SkipReason::UnmappableAudio => SkipReason::UnmappableAudio,
-            Mp4SkipReason::SecondaryVideo => SkipReason::SecondaryVideo,
-            Mp4SkipReason::UnmappableVideo => SkipReason::UnmappableVideo,
-            Mp4SkipReason::Mp2Extension => SkipReason::Mp2Extension,
-            Mp4SkipReason::NoSamples => SkipReason::NoSamples,
-            Mp4SkipReason::UndescribableAudio => SkipReason::UndescribableAudio,
-        }
-    }
-}
-
 /// The pre-mux plan for muxing `title` to one destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FitReport {
@@ -68,16 +54,20 @@ pub struct FitReport {
 /// in neither: whether it is lost is known only once its packets arrive (J23).
 /// `mkv://` skips only codecs Matroska has no CodecID for; the FMKV wire skips nothing.
 pub fn fit_report(dest: &StreamUrl, title: &DiscTitle) -> FitReport {
-    if let StreamUrl::Mpg { .. } = dest {
-        return super::mpg::plan(title).report;
+    match super::pes_output::PesOutput::of(dest) {
+        Ok(out) => out.fit(title),
+        // Not a PES output: nothing to refuse.
+        Err(_) => keep_fit(title, None, |_| None),
     }
-    if let StreamUrl::Mp4 { .. } = dest {
-        let r = super::mp4::fit_report(title);
-        return FitReport {
-            included: r.included,
-            skipped: r.skipped.into_iter().map(|(i, s)| (i, s.into())).collect(),
-        };
-    }
+}
+
+// The plan of a sink that keeps every stream of class `class` (`None`: all) that `refuse`
+// gives no reason for; a declared-only MPEG-2 extension track is in neither list (J23).
+pub(crate) fn keep_fit(
+    title: &DiscTitle,
+    class: Option<TrackKind>,
+    refuse: impl Fn(usize) -> Option<SkipReason>,
+) -> FitReport {
     let mut report = FitReport {
         included: Vec::new(),
         skipped: Vec::new(),
@@ -86,36 +76,15 @@ pub fn fit_report(dest: &StreamUrl, title: &DiscTitle) -> FitReport {
         if matches!(s, Stream::Audio(a) if a.is_mp2_extension()) {
             continue;
         }
-        let class_kept = match dest {
-            StreamUrl::Video { .. } => matches!(s, Stream::Video(_)),
-            StreamUrl::Audio { .. } => matches!(s, Stream::Audio(_)),
-            StreamUrl::Sub { .. } => matches!(s, Stream::Subtitle(_)),
-            _ => true,
+        let kind = match s {
+            Stream::Video(_) => TrackKind::Video,
+            Stream::Audio(_) => TrackKind::Audio,
+            Stream::Subtitle(_) => TrackKind::Subtitle,
         };
-        if !class_kept {
+        if class.is_some_and(|c| c != kind) {
             continue;
         }
-        let refused = match (dest, s) {
-            (StreamUrl::M2ts { .. }, Stream::Audio(a)) if a.codec == Codec::Aac => {
-                let cp = title.codec_privates.get(i).and_then(|c| c.as_deref());
-                super::m2ts::aac_adts_template(cp)
-                    .is_none()
-                    .then_some(SkipReason::UnmappableAudio)
-            }
-            (StreamUrl::M2ts { .. }, Stream::Audio(a)) if a.codec == Codec::Lpcm => {
-                let cp = title.codec_privates.get(i).and_then(|c| c.as_deref());
-                super::m2ts::lpcm_bd_header(a, cp)
-                    .is_none()
-                    .then_some(SkipReason::UnmappableAudio)
-            }
-            (StreamUrl::Mkv { .. }, s) if !super::mkv::is_mappable(s) => Some(match s {
-                Stream::Video(_) => SkipReason::UnmappableVideo,
-                Stream::Audio(_) => SkipReason::UnmappableAudio,
-                Stream::Subtitle(_) => SkipReason::UnmappableSubtitle,
-            }),
-            _ => None,
-        };
-        match refused {
+        match refuse(i) {
             Some(r) => report.skipped.push((i, r)),
             None => report.included.push(i),
         }

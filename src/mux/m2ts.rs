@@ -13,7 +13,7 @@ use std::io::{self, Write};
 
 /// The BD LPCM header an `m2ts://` sink re-packs an LPCM track with, or `None` when BD
 /// LPCM cannot carry its layout/rate and `create` leaves the track out. Shared with the
-/// pre-mux plan ([`super::fit::fit_report`]) so the two cannot disagree.
+/// pre-mux plan ([`fit_refusal`]) so the two cannot disagree.
 pub(crate) fn lpcm_bd_header(a: &crate::disc::AudioStream, cp: Option<&[u8]>) -> Option<[u8; 2]> {
     let src = cp.and_then(super::codec::lpcm::layout_byte);
     let depth = super::codec::lpcm::output_depth(cp);
@@ -24,6 +24,21 @@ pub(crate) fn lpcm_bd_header(a: &crate::disc::AudioStream, cp: Option<&[u8]>) ->
 /// AudioSpecificConfig is missing or not signallable in ADTS and `create` leaves it out.
 pub(crate) fn aac_adts_template(cp: Option<&[u8]>) -> Option<[u8; 7]> {
     cp.and_then(super::codec::adts::adts_template)
+}
+
+// The pre-mux plan's reason `m2ts://` leaves stream `i` of `title` out: an AAC or LPCM
+// track `create` cannot re-frame (the same predicates it applies).
+pub(crate) fn fit_refusal(title: &DiscTitle, i: usize) -> Option<super::fit::SkipReason> {
+    let DiscStream::Audio(a) = title.streams.get(i)? else {
+        return None;
+    };
+    let cp = title.codec_privates.get(i).and_then(|c| c.as_deref());
+    let carried = match a.codec {
+        crate::disc::Codec::Aac => aac_adts_template(cp).is_some(),
+        crate::disc::Codec::Lpcm => lpcm_bd_header(a, cp).is_some(),
+        _ => true,
+    };
+    (!carried).then_some(super::fit::SkipReason::UnmappableAudio)
 }
 
 // PMT stream_type (13818-1 Table 2-34; BD-ROM HDMV types under the HDMV registration);

@@ -375,6 +375,16 @@ pub(crate) fn is_mappable(s: &crate::disc::Stream) -> bool {
     }
 }
 
+// The pre-mux plan's reason `mkv://` leaves stream `s` out: no Matroska CodecID.
+pub(crate) fn fit_refusal(s: &crate::disc::Stream) -> Option<super::fit::SkipReason> {
+    use super::fit::SkipReason;
+    (!is_mappable(s)).then_some(match s {
+        crate::disc::Stream::Video(_) => SkipReason::UnmappableVideo,
+        crate::disc::Stream::Audio(_) => SkipReason::UnmappableAudio,
+        crate::disc::Stream::Subtitle(_) => SkipReason::UnmappableSubtitle,
+    })
+}
+
 // Test shorthands for [`MkvTrack::from_stream`] on a stream known to be mappable.
 #[cfg(test)]
 impl MkvTrack {

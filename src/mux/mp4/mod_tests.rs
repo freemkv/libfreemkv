@@ -73,7 +73,7 @@ fn fit_report_includes_aac_only_with_a_describable_config() {
     );
     let r = fit_report(&t);
     assert_eq!(r.included, vec![0, 1, 4]);
-    let skip = Mp4SkipReason::UnmappableAudio;
+    let skip = SkipReason::UnmappableAudio;
     assert_eq!(r.skipped, vec![(2, skip), (3, skip)]);
 }
 
@@ -92,8 +92,8 @@ fn fit_report_includes_video_and_dolby_only() {
     let r = fit_report(&t);
     assert_eq!(r.included, vec![0, 2, 3], "video + AC3 + EAC3");
     // TrueHD (unmappable audio) and PGS (bitmap subtitle) are skipped.
-    assert!(r.skipped.contains(&(1, Mp4SkipReason::UnmappableAudio)));
-    assert!(r.skipped.contains(&(4, Mp4SkipReason::BitmapSubtitle)));
+    assert!(r.skipped.contains(&(1, SkipReason::UnmappableAudio)));
+    assert!(r.skipped.contains(&(4, SkipReason::BitmapSubtitle)));
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn fit_report_labels_unsupported_primary_video() {
         vec![None, None],
     );
     let r = fit_report(&t);
-    assert!(r.skipped.contains(&(0, Mp4SkipReason::UnmappableVideo)));
+    assert!(r.skipped.contains(&(0, SkipReason::UnmappableVideo)));
     assert_eq!(r.included, vec![1], "only the AC-3 audio is carried");
 }
 
@@ -259,7 +259,7 @@ fn mp2_extension_is_reported_only_once_its_packets_arrive() {
     assert_eq!(s.undelivered_streams(), vec![1]);
     assert_eq!(
         s.final_report().skipped,
-        vec![(1, Mp4SkipReason::Mp2Extension)]
+        vec![(1, SkipReason::Mp2Extension)]
     );
 }
 
@@ -364,7 +364,7 @@ fn dropped_audio_track_is_reported_not_just_logged() {
     assert!(
         actual
             .skipped
-            .contains(&(1, Mp4SkipReason::UndescribableAudio)),
+            .contains(&(1, SkipReason::UndescribableAudio)),
         "the dropped audio stream must appear as skipped with its reason: {:?}",
         actual.skipped
     );
@@ -399,7 +399,7 @@ fn mvhd_next_track_id_exceeds_every_retained_track_id() {
     assert!(
         s.final_report()
             .skipped
-            .contains(&(1, Mp4SkipReason::NoSamples))
+            .contains(&(1, SkipReason::NoSamples))
     );
     let retained_ids: Vec<u32> = s.tracks.iter().map(|t| t.track_id).collect();
     assert_eq!(retained_ids, vec![1, 3]);
