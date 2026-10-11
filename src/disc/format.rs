@@ -36,12 +36,18 @@ impl DiscFormat {
         }
     }
 
-    /// Sectors in one ECC block: 32 (64 KiB) for the Blu-ray family and unknown
-    /// media, 16 (32 KiB) for DVD and HD DVD.
+    /// Sectors in one ECC block: 32 (64 KiB) for the Blu-ray family, HD DVD and unknown
+    /// media, 16 (32 KiB) for DVD only.
+    // HD DVD-ROM (DVD Forum Part 1) forms an ECC block from 32 data frames (64 KB), twice
+    // DVD's 16; cf. US 7979776 / US 7161889. The engine's v1.8.3 table said 16 (a bug).
     pub fn ecc_block_sectors(self) -> u16 {
         match self {
-            DiscFormat::Uhd | DiscFormat::Fmts | DiscFormat::BluRay | DiscFormat::Unknown => 32,
-            DiscFormat::Dvd | DiscFormat::HdDvd => 16,
+            DiscFormat::Uhd
+            | DiscFormat::Fmts
+            | DiscFormat::BluRay
+            | DiscFormat::HdDvd
+            | DiscFormat::Unknown => 32,
+            DiscFormat::Dvd => 16,
         }
     }
 

@@ -826,6 +826,44 @@ fn a_dir_url_mux_reports_read_progress_to_the_ctx() {
     );
 }
 
+// An ISO (folder=false) of a decrypted BD that kept `AACS/` but lost its key file scans
+// encrypted with no AACS state; `probe_image` must re-judge it from content (the
+// `folder || iso` condition) so it muxes clear rather than refusing NoDiscKey/E7031.
+#[test]
+fn an_iso_of_a_clear_bd_with_a_stripped_key_file_probes_clear() {
+    use crate::sector::SectorSource;
+    let s = playable_bdmv("isostripped", false);
+    s.file("AACS/MKB_RO.inf", &[0u8; 64]);
+    let mut img = DirImage::open(s.path()).unwrap();
+    let cap = img.capacity_sectors();
+    let iso = Scratch::new("isostripped-out");
+    let iso_path = iso.path().join("disc.iso");
+    let mut out = std::fs::File::create(&iso_path).unwrap();
+    let mut buf = vec![0u8; 64 * 2048];
+    let mut lba = 0u32;
+    while lba < cap {
+        let n = (cap - lba).min(64);
+        let b = &mut buf[..n as usize * 2048];
+        img.read_sectors(lba, n as u16, b, false).unwrap();
+        out.write_all(b).unwrap();
+        lba += n;
+    }
+    drop(out);
+
+    let probe = crate::disc::ScanOptions::default();
+    let mut raw = crate::io::file_sector_source::FileSectorSource::open(&iso_path).unwrap();
+    let raw_cap = raw.capacity_sectors();
+    let before = crate::disc::Disc::scan_image(&mut raw, raw_cap, &probe).unwrap();
+    assert!(
+        before.encrypted && before.aacs.is_none(),
+        "fixture must scan encrypted with no AACS state"
+    );
+
+    let (disc, _reader) = crate::mux::source::probe_image(&iso_path, false, &probe).unwrap();
+    assert!(!disc.encrypted, "clear content overrides the tree shape");
+    crate::keys::disc_gate(&disc, false).expect("a clear ISO passes the gate");
+}
+
 // The other verdict, same door: a truly scrambled folder with no key is refused before any
 // output with the standard no-key code (E7022), never muxed as ciphertext.
 #[test]

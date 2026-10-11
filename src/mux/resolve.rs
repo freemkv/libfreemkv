@@ -602,7 +602,8 @@ pub fn output(
     title: &crate::disc::DiscTitle,
     source: Option<&super::videomap::SourceInfo>,
 ) -> io::Result<Box<dyn crate::pes::PesSink>> {
-    output_with(url, title, source, None)
+    let parsed = parse_url(url);
+    super::pes_output::PesOutput::of(&parsed)?.open(title, source, None)
 }
 
 /// What a file output shares with the mux (§2.10): the flush counters (the consumer's
@@ -610,17 +611,6 @@ pub fn output(
 pub(crate) struct OutputFlush<'a> {
     pub(crate) progress: &'a crate::io::FlushProgress,
     pub(crate) halt: &'a crate::halt::Halt,
-}
-
-// [`output`], with the file outputs sharing `flush` (the mux driver's path).
-pub(crate) fn output_with(
-    url: &str,
-    title: &crate::disc::DiscTitle,
-    source: Option<&super::videomap::SourceInfo>,
-    flush: Option<OutputFlush>,
-) -> io::Result<Box<dyn crate::pes::PesSink>> {
-    let parsed = parse_url(url);
-    super::pes_output::PesOutput::of(&parsed)?.open(title, source, flush.as_ref())
 }
 
 // Demuxer-side state derived from a `DiscTitle`: codec parser table (by PID),

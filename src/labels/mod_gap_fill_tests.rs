@@ -185,3 +185,9 @@ fn floor_is_selected_by_evidence_kind_not_name() {
     let none = vec![("mpls_universal", ParseResult::low(Vec::new()))];
     assert!(structural_floor(&none).is_none());
 }
+
+#[test]
+fn mpls_floor_applies_to_authored_only_in_extract_and_analyze() {
+    assert!(floors_with_mpls(EvidenceKind::Authored));
+    assert!(!floors_with_mpls(EvidenceKind::Structural));
+}
