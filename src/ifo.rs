@@ -35,6 +35,8 @@ pub struct DvdInfo {
 /// TT_SRPT title playback type bit 6, libdvdread ifo_types.h `playback_type_t`
 /// `multi_or_random_pgc_title` ("0: one sequential pgc title"), read MSB first.
 pub(crate) const TT_MULTI_OR_RANDOM_PGC: u8 = 0x40;
+/// Bit 3, `jlc_exists_in_button_cmd`: the title's highlight buttons jump, link or call.
+pub(crate) const TT_BUTTON_JUMPS: u8 = 0x08;
 
 /// One title set (VTS_XX_0.IFO).
 #[derive(Debug)]
@@ -88,6 +90,12 @@ pub struct DvdTitle {
     pub sequential: bool,
     /// The cell table runs past the IFO: `cells` holds only the leading cells.
     pub truncated: bool,
+    /// The title's PGC is the one VTS_PTT_SRPT names, not a 1:1 guess.
+    pub mapped: bool,
+    /// The most the title can play, `(seconds, sectors)`: every PGC its parts name and
+    /// their next-PGC chains, once each. `None` when that bounds nothing (loops, branches,
+    /// random play, a cut table, a guessed PGC).
+    pub reach: Option<(f64, u64)>,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -468,8 +476,11 @@ pub(crate) fn parse_vmg_with(
         return Err(Error::IfoParse);
     }
 
-    let title_set_map = parse_tt_srpt(vmg_data, tt_srpt_offset)?;
-    let (title_playback, mut complete) = tt_srpt_playback(vmg_data, tt_srpt_offset);
+    let TtSrpt {
+        titles: title_set_map,
+        playback: title_playback,
+        mut complete,
+    } = parse_tt_srpt(vmg_data, tt_srpt_offset)?;
 
     // Parse each VTS IFO
     let mut title_sets = Vec::new();
@@ -521,42 +532,27 @@ pub(crate) fn parse_vmg_with(
     })
 }
 
-// Each TT_SRPT entry's playback type (first entry wins, as in `parse_tt_srpt`), and
-// whether every declared entry was within the DVD-Video cap and the table.
-fn tt_srpt_playback(
-    vmg_data: &[u8],
-    tt_srpt_offset: usize,
-) -> (std::collections::BTreeMap<(u8, u8), u8>, bool) {
-    let mut types = std::collections::BTreeMap::new();
-    let Ok(declared) = be_u16(vmg_data, tt_srpt_offset) else {
-        return (types, false);
-    };
-    let declared = usize::from(declared);
-    let mut complete = declared <= MAX_TT_SRPT_TITLES;
-    for i in 0..declared.min(MAX_TT_SRPT_TITLES) {
-        let base = tt_srpt_offset + 8 + i * 12;
-        let Some(entry) = vmg_data.get(base..base + 12) else {
-            complete = false;
-            break;
-        };
-        types.entry((entry[6], entry[7])).or_insert(entry[0]);
-    }
-    (types, complete)
-}
-
 // Maximum TT_SRPT entries honoured (DVD-Video's own 99-title cap). The on-disc count is an
 // untrusted u16; without this, a crafted IFO could declare 65535 entries and blow up memory
 // re-parsing PGCs.
 pub(crate) const MAX_TT_SRPT_TITLES: usize = 99;
 
-// Parses the VMG TT_SRPT into a per-title-set map of (chapter_count, vts_title_number). Clamps
-// the declared entry count to MAX_TT_SRPT_TITLES and drops duplicate (vts_number,
-// vts_title_num) pairs.
-pub(crate) fn parse_tt_srpt(
-    vmg_data: &[u8],
-    tt_srpt_offset: usize,
-) -> Result<std::collections::BTreeMap<u8, Vec<(u16, u8)>>> {
+/// The VMG title table, in one walk.
+pub(crate) struct TtSrpt {
+    /// Per title set, each title's (chapter_count, vts_title_number).
+    pub titles: std::collections::BTreeMap<u8, Vec<(u16, u8)>>,
+    /// Each title's playback type byte, keyed (vts_number, vts_title_num).
+    pub playback: std::collections::BTreeMap<(u8, u8), u8>,
+    /// Every declared entry was read and kept: none past the cap or the table, none
+    /// naming title set or title 0. A duplicate entry loses nothing.
+    pub complete: bool,
+}
+
+// Parses the VMG TT_SRPT. Clamps the declared entry count to MAX_TT_SRPT_TITLES and drops
+// duplicate (vts_number, vts_title_num) pairs; the first entry's playback type wins.
+pub(crate) fn parse_tt_srpt(vmg_data: &[u8], tt_srpt_offset: usize) -> Result<TtSrpt> {
     let num_titles = be_u16(vmg_data, tt_srpt_offset)? as usize;
+    let mut complete = num_titles <= MAX_TT_SRPT_TITLES;
     if num_titles > MAX_TT_SRPT_TITLES {
         tracing::warn!(
             target: "freemkv::scan",
@@ -571,11 +567,12 @@ pub(crate) fn parse_tt_srpt(
     let entries_start = tt_srpt_offset + 8;
     let mut title_set_map: std::collections::BTreeMap<u8, Vec<(u16, u8)>> =
         std::collections::BTreeMap::new();
-    let mut seen: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+    let mut playback = std::collections::BTreeMap::new();
 
     for i in 0..num_titles {
         let base = entries_start + i * 12;
         if base + 12 > vmg_data.len() {
+            complete = false;
             break; // truncated — parse what we can
         }
 
@@ -585,11 +582,13 @@ pub(crate) fn parse_tt_srpt(
 
         // Both numbers are 1-based; a 0 title number would alias title 1's PGC.
         if vts_number == 0 || vts_title_num == 0 {
+            complete = false;
             continue; // invalid
         }
-        if !seen.insert((vts_number, vts_title_num)) {
+        if playback.contains_key(&(vts_number, vts_title_num)) {
             continue; // duplicate entry for the same VTS title
         }
+        playback.insert((vts_number, vts_title_num), vmg_data[base]);
 
         title_set_map
             .entry(vts_number)
@@ -597,7 +596,11 @@ pub(crate) fn parse_tt_srpt(
             .push((num_chapters, vts_title_num));
     }
 
-    Ok(title_set_map)
+    Ok(TtSrpt {
+        titles: title_set_map,
+        playback,
+        complete,
+    })
 }
 
 // ── Text data (chapter names) ───────────────────────────────────────────────
@@ -1114,6 +1117,73 @@ fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
     pgcns.len()
 }
 
+// PGCs a title's reach may span; past this it is unknown (bounds hostile chains).
+const MAX_REACH_PGCS: usize = 256;
+
+// `DvdTitle::reach`: the PGCs the parts name (else `first`, 0-based) and their NextPGCN
+// chains, each in cell order (PGC mode 0), uncut, with commands that never leave it, the
+// chains acyclic, and no part links between PGCs.
+fn title_reach(
+    data: &[u8],
+    pgcit_offset: usize,
+    num_pgcs: usize,
+    first: usize,
+    parts: Option<&[(u16, u16)]>,
+) -> Option<(f64, u64)> {
+    let mut pgcs: Vec<usize> = match parts {
+        Some(parts) if !parts.is_empty() => (parts.iter())
+            .map(|&(pgcn, _)| usize::from(pgcn).checked_sub(1))
+            .collect::<Option<_>>()?,
+        _ => vec![first],
+    };
+    pgcs.sort_unstable();
+    pgcs.dedup();
+    let mut next = std::collections::HashMap::new();
+    let (mut secs, mut sectors, mut by_part) = (0.0, 0u64, false);
+    let mut i = 0;
+    while let Some(&pgc) = pgcs.get(i) {
+        i += 1;
+        if pgc >= num_pgcs || pgcs.len() > MAX_REACH_PGCS {
+            return None;
+        }
+        let entry = pgcit_offset.checked_add(8 + pgc * 8)?;
+        let offset = pgcit_offset.checked_add(be_u32(data, entry + 4).ok()? as usize)?;
+        let title = parse_pgc(data, offset, 0).ok()?;
+        by_part |= command_flow_in_order(data, offset)?;
+        if title.truncated || byte_at(data, offset + 0xA2).ok()? != 0 {
+            return None;
+        }
+        let to = usize::from(be_u16(data, offset + 0x9C).ok()?).checked_sub(1);
+        if let Some(to) = to
+            && !pgcs.contains(&to)
+        {
+            pgcs.push(to);
+        }
+        next.insert(pgc, to);
+        secs += title.duration_secs;
+        for cell in &title.cells {
+            if !CellCategory::decode(cell.category).is_secondary_block_piece() {
+                let span = cell.last_sector.saturating_sub(cell.first_sector);
+                sectors = sectors.saturating_add(u64::from(span) + 1);
+            }
+        }
+    }
+    // A chain that loops plays without end.
+    let mut done = std::collections::HashSet::new();
+    for &start in &pgcs {
+        let mut path = std::collections::HashSet::new();
+        let mut at = Some(start);
+        while let Some(pgc) = at.filter(|p| !done.contains(p)) {
+            if !path.insert(pgc) {
+                return None;
+            }
+            at = next.get(&pgc).copied().flatten();
+        }
+        done.extend(path);
+    }
+    (pgcs.len() == 1 || !by_part).then_some((secs, sectors))
+}
+
 /// Parse VTS_PGCIT (Program Chain Information Table) to extract titles.
 /// `ptt_offset` is the VTS_PTT_SRPT byte offset (0 = absent).
 pub(crate) fn parse_pgcit(
@@ -1138,11 +1208,11 @@ pub(crate) fn parse_pgcit(
     let mut skipped = 0usize;
 
     for &(chapter_count, vts_title_num) in titles_info {
-        // TTN -> PGC goes through PTT_SRPT; without it (or when its PGCN is past the
-        // table) assume 1:1 (TTN is 1-based).
-        let pgc_index = ptt_srpt_pgc_index(data, ptt_offset, vts_title_num)
-            .filter(|&i| i < num_pgcs as usize)
-            .unwrap_or(vts_title_num.saturating_sub(1) as usize);
+        // TTN -> PGC goes through PTT_SRPT (mandatory in VTSI). When it does not name a PGC
+        // in the table, the title is still listed 1:1 (TTN is 1-based), but unproven.
+        let mapped =
+            ptt_srpt_pgc_index(data, ptt_offset, vts_title_num).filter(|&i| i < num_pgcs as usize);
+        let pgc_index = mapped.unwrap_or(vts_title_num.saturating_sub(1) as usize);
         if pgc_index >= num_pgcs as usize {
             skipped += 1;
             tracing::warn!(
@@ -1156,13 +1226,19 @@ pub(crate) fn parse_pgcit(
 
         // Warned once per disc by the DVD scan, which sees every title set.
         let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
+        let parts = ptt_srpt_parts(data, ptt_offset, vts_title_num);
+        let reach = mapped.and_then(|first| {
+            title_reach(data, pgcit_offset, num_pgcs.into(), first, parts.as_deref())
+        });
         // The program each chapter starts at, when every chapter lies in this PGC.
-        let ptt_programs = ptt_srpt_parts(data, ptt_offset, vts_title_num).map(|parts| match parts
-            .iter()
-            .all(|&(pgcn, _)| usize::from(pgcn) == pgc_index + 1)
-        {
-            true => parts.into_iter().map(|(_, pgn)| pgn).collect(),
-            false => Vec::new(),
+        let ptt_programs = parts.map(|parts| {
+            match parts
+                .iter()
+                .all(|&(pgcn, _)| usize::from(pgcn) == pgc_index + 1)
+            {
+                true => parts.into_iter().map(|(_, pgn)| pgn).collect(),
+                false => Vec::new(),
+            }
         });
 
         let entry_offset = entries_start + pgc_index * 8;
@@ -1191,6 +1267,8 @@ pub(crate) fn parse_pgcit(
                 title.vts_title_num = vts_title_num;
                 title.pgcs = pgcs;
                 title.ptt_programs = ptt_programs;
+                title.mapped = mapped.is_some();
+                title.reach = reach;
                 titles.push(title);
             }
             Err(e) => {
@@ -1385,6 +1463,8 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         vts_title_num: 0,
         pgcs: 0,
         ptt_programs: None,
+        mapped: false,
+        reach: None,
         sequential: byte_at(data, pgc_offset + 0xA2)? == 0
             && be_u16(data, pgc_offset + 0x9C)? == 0
             && command_flow_in_order(data, pgc_offset) == Some(false),
@@ -1441,6 +1521,8 @@ fn command_flow(raw: &[u8; 8]) -> Flow {
             1 | 6 | 8 => Flow::EndsTitle,
             _ => Flow::Leaves,
         },
+        // SetNVTMR (set op 2): when the timer runs out, playback goes to another PGC.
+        (2, _) if raw[0] & 0x0F == 2 => Flow::Leaves,
         (1, _) | (2 | 3, _) => link_flow(code, raw[7]),
         _ => Flow::Leaves,
     }
@@ -1448,8 +1530,9 @@ fn command_flow(raw: &[u8; 8]) -> Flow {
 
 /// `Some(links_by_part)` when the PGC's commands (table at PGC+0xE4: pre, post, cell
 /// counts, last byte, 8-byte commands) play its cells once, in order: pre commands may
-/// only pick the entry point, post commands may only end the title, and the cell
-/// commands its cells run may not move playback. `None` otherwise or when unreadable.
+/// only pick the entry point, with some path through them starting at the first cell,
+/// post commands may only end the title, and the cell commands its cells run may not
+/// move playback. `None` otherwise or when unreadable.
 fn command_flow_in_order(data: &[u8], pgc_offset: usize) -> Option<bool> {
     let rel = usize::from(be_u16(data, pgc_offset + 0xE4).ok()?);
     if rel == 0 {
@@ -1467,6 +1550,9 @@ fn command_flow_in_order(data: &[u8], pgc_offset: usize) -> Option<bool> {
             Flow::EntersPart => by_part = true,
             Flow::EndsTitle | Flow::Leaves => return None,
         }
+    }
+    if !may_start_at_first_cell(&cmds[..pre]) {
+        return None;
     }
     let post_ok = |raw| matches!(command_flow(raw), Flow::Stays | Flow::EndsTitle);
     if !cmds[pre..pre + post].iter().all(post_ok) {
@@ -1486,6 +1572,45 @@ fn command_flow_in_order(data: &[u8], pgc_offset: usize) -> Option<bool> {
         }
     }
     Some(by_part)
+}
+
+// Whether some path through the pre commands ends them without an entry link, or links to
+// program or cell 1. A conditional (compare op, byte1 bits 6-4) link may not be taken; an
+// unconditional one is. Special commands: Goto line (byte 7; 0 continues), Break, SetTmpPML.
+fn may_start_at_first_cell(pre: &[[u8; 8]]) -> bool {
+    let mut seen = vec![false; pre.len()];
+    let mut todo = vec![0usize];
+    while let Some(i) = todo.pop() {
+        let Some(raw) = pre.get(i) else {
+            return true;
+        };
+        if std::mem::replace(&mut seen[i], true) {
+            continue;
+        }
+        let conditional = raw[1] & 0x70 != 0;
+        let line = usize::from(raw[7]);
+        match (raw[0] >> 5, raw[1] & 0x0F) {
+            (0, 2) => return true,
+            (0, 1 | 3) => {
+                todo.push(line.checked_sub(1).unwrap_or(i + 1));
+                if conditional || raw[1] & 0x0F == 3 {
+                    todo.push(i + 1);
+                }
+            }
+            (_, link) => match command_flow(raw) {
+                Flow::EntersPgc | Flow::EntersPart => {
+                    if matches!((link, raw[7]), (6, 1 | 0x81) | (7, 1)) {
+                        return true;
+                    }
+                    if conditional {
+                        todo.push(i + 1);
+                    }
+                }
+                _ => todo.push(i + 1),
+            },
+        }
+    }
+    false
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

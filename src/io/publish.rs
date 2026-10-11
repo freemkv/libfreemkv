@@ -2,8 +2,9 @@
 //!
 //! Ladder: native no-replace rename; on a capability error, Unix tries
 //! link()+unlink (atomic on Linux NFS/CIFS), then an O_EXCL claim that is
-//! closed, re-checked through a fresh O_NOFOLLOW open as our zero-length file,
-//! removed, and replaced by `rename` (smbfs, FAT, FUSE). Windows stops at native.
+//! closed, re-checked through a fresh non-blocking O_NOFOLLOW open as our
+//! zero-length file (its dev/ino), removed, and replaced by `rename` (smbfs,
+//! FAT, FUSE). Windows stops at native.
 //!
 //! Residual window of the claim step: a file a foreign actor creates between
 //! the re-check and the rename is deleted (macOS smbfs deletes the target by
@@ -22,7 +23,8 @@ use std::{fmt, io, path::Path};
 /// reconcile identities before retrying. Directory durability is the caller's job.
 /// A successful hard-link publication may retain the source if unlink fails;
 /// callers must tolerate that recoverable duplicate. Retryable contention in
-/// the Unix claim fallback is `ResourceBusy` carrying a [`Fault`].
+/// the Unix claim fallback is `ResourceBusy` carrying a [`Fault`];
+/// [`Fault::ClaimLeft`] is `Other`, as no retry succeeds while the placeholder stays.
 pub fn no_replace(source: &Path, target: &Path) -> io::Result<()> {
     publish_with(source, target, &System)
 }
@@ -38,7 +40,8 @@ pub enum Fault {
     /// The renamed target is not a regular file of the source's size.
     SizeMismatch,
     /// Our zero-length claim was not proven removed: the target name may hold an empty
-    /// placeholder, not a published artifact. The error's source is the OS error.
+    /// placeholder, not a published artifact. The error's kind is `Other` (not
+    /// retryable until the placeholder is cleared); its source is the OS error.
     ClaimLeft,
 }
 
@@ -83,7 +86,7 @@ fn faulted(kind: io::ErrorKind, fault: Fault, source: io::Error) -> io::Error {
 
 #[cfg(unix)]
 fn claim_left(source: io::Error) -> io::Error {
-    faulted(source.kind(), Fault::ClaimLeft, source)
+    faulted(io::ErrorKind::Other, Fault::ClaimLeft, source)
 }
 
 impl fmt::Display for Fault {
@@ -106,13 +109,14 @@ trait Steps {
     fn link(&self, source: &Path, target: &Path) -> io::Result<()> {
         std::fs::hard_link(source, target)
     }
-    // The fresh no-follow open and stat that re-checks the claim.
+    // The fresh no-follow open and fstat that re-checks the claim. Non-blocking, so a
+    // FIFO at the name opens at once; callers require a regular file.
     #[cfg(unix)]
     fn fresh(&self, path: &Path) -> io::Result<std::fs::Metadata> {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .and_then(|file| file.metadata())
     }
@@ -199,12 +203,18 @@ fn claim_then_rename(source: &Path, target: &Path, steps: &impl Steps) -> io::Re
         .custom_flags(libc::O_NOFOLLOW)
         .open(target)
         .map_err(normalize)?;
-    let ours = steps.claim_id(&handle).ok();
+    let ours = steps.claim_id(&handle);
     drop(handle);
     steps.claimed(target);
+    let ours = match ours {
+        Ok(id) => id,
+        // Our claim can't be told from another empty file: never removed.
+        Err(e) => return Err(left(e, "fstat", io::Error::other("unknown claim identity"))),
+    };
+    let is_ours = |m: &std::fs::Metadata| m.is_file() && m.len() == 0 && (m.dev(), m.ino()) == ours;
     // Every handle is closed before removal: an open file would be silly-renamed.
     match steps.fresh(target) {
-        Ok(claim) if claim.is_file() && claim.len() == 0 => {}
+        Ok(claim) if is_ours(&claim) => {}
         Ok(_) => return Err(busy(Fault::ClaimChanged)),
         // Gone, or swapped for a symlink (O_NOFOLLOW refuses it): the claim changed.
         Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
@@ -212,32 +222,20 @@ fn claim_then_rename(source: &Path, target: &Path, steps: &impl Steps) -> io::Re
         }
         Err(e) => {
             // The re-check itself failed: not a claim change. Remove our placeholder only
-            // if lstat proves it is the empty file we created; unless that removal worked
-            // or lstat proved it gone or foreign, it may be left (module docs: residual).
+            // if lstat proves it is the empty file we created; an empty file of another id
+            // (or ours, on unstable inode numbers) is never removed and may be left.
             let gone = |e| faulted(io::ErrorKind::ResourceBusy, Fault::ClaimChanged, e);
-            let (left, why) = match steps.lstat(target) {
-                Err(m) if m.kind() == io::ErrorKind::NotFound => return Err(gone(e)),
-                Ok(m) if !m.is_file() || m.len() != 0 => return Err(normalize(e)),
-                Ok(m) if ours.is_some_and(|id| id != (m.dev(), m.ino())) => {
-                    return Err(normalize(e));
-                }
-                Ok(_) if ours.is_some() => match steps.remove(target) {
-                    Ok(()) => return Err(normalize(e)),
-                    Err(r) if r.kind() == io::ErrorKind::NotFound => return Err(gone(e)),
-                    Err(r) => (r, "remove"),
+            return Err(match steps.lstat(target) {
+                Err(m) if m.kind() == io::ErrorKind::NotFound => gone(e),
+                Ok(m) if !m.is_file() || m.len() != 0 => normalize(e),
+                Ok(m) if is_ours(&m) => match steps.remove(target) {
+                    Ok(()) => normalize(e),
+                    Err(r) if r.kind() == io::ErrorKind::NotFound => gone(e),
+                    Err(r) => left(e, "remove", r),
                 },
-                Ok(_) => (io::Error::other("unknown claim identity"), "fstat"),
-                Err(m) => (m, "lstat"),
-            };
-            tracing::warn!(
-                target: "freemkv::io",
-                phase = "publish_claim",
-                recheck_error = %e,
-                step = why,
-                step_error = %left,
-                "the publish claim may be left at the target name"
-            );
-            return Err(claim_left(e));
+                Ok(_) => left(e, "identity", io::Error::other("claim identity differs")),
+                Err(m) => left(e, "lstat", m),
+            });
         }
     }
     match steps.remove(target) {
@@ -261,6 +259,20 @@ fn claim_then_rename(source: &Path, target: &Path, steps: &impl Steps) -> io::Re
         ));
     }
     Ok(())
+}
+
+// The claim may be left at the target: `step` failed with `discarded` (logged).
+#[cfg(unix)]
+fn left(error: io::Error, step: &str, discarded: io::Error) -> io::Error {
+    tracing::warn!(
+        target: "freemkv::io",
+        phase = "publish_claim",
+        error = %error,
+        step,
+        step_error = %discarded,
+        "the publish claim may be left at the target name"
+    );
+    claim_left(error)
 }
 
 #[cfg(unix)]
@@ -459,6 +471,32 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::Unsupported);
         let e = renameat2_error(io::Error::from_raw_os_error(libc::EEXIST));
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    // The no-replace rename's EINVAL (NFS, FUSE without rename2) engages the fallbacks.
+    #[test]
+    #[cfg(unix)]
+    fn a_renameat2_einval_falls_back_to_the_link_and_the_claim() {
+        struct Einval(Fake);
+        impl Steps for Einval {
+            fn native(&self, _: &Path, _: &Path) -> io::Result<()> {
+                Err(renameat2_error(io::Error::from_raw_os_error(libc::EINVAL)))
+            }
+            fn link(&self, source: &Path, target: &Path) -> io::Result<()> {
+                self.0.link(source, target)
+            }
+        }
+        for link in [None, Some(libc::ENOTSUP)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (src, dst) = pair(dir.path());
+            let steps = Einval(Fake {
+                link,
+                ..Fake::default()
+            });
+            publish_with(&src, &dst, &steps).unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), b"payload", "{link:?}");
+            assert_eq!(names(dir.path()), ["dst"], "{link:?}");
+        }
     }
 
     #[test]
@@ -801,8 +839,8 @@ mod tests {
             let error = publish_with(&src, &dst, &steps).unwrap_err();
             assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft), "{fresh:?}");
             assert_eq!(errno(&error), Some(carried), "{fresh:?}: errno kept");
-            let kind = io::Error::from_raw_os_error(carried).kind();
-            assert_eq!(error.kind(), kind, "{fresh:?}");
+            // Never the retryable-contention kind, even for EBUSY: a retry hits the placeholder.
+            assert_eq!(error.kind(), io::ErrorKind::Other, "{fresh:?}");
             assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0, "placeholder");
             assert_eq!(std::fs::read(&src).unwrap(), b"payload");
         }
@@ -834,10 +872,107 @@ mod tests {
             let error = publish_with(&src, &dst, &steps).unwrap_err();
             assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft), "case {index}");
             assert_eq!(errno(&error), Some(libc::EIO), "case {index}");
-            assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
+            assert_eq!(error.kind(), io::ErrorKind::Other, "case {index}");
             assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0, "case {index}");
             assert_eq!(std::fs::read(&src).unwrap(), b"payload");
         }
+    }
+
+    // Swaps the target for a different empty file: made before the swap, so its inode
+    // can never be the claim's recycled one.
+    #[cfg(unix)]
+    fn swap_in_empty(target: &Path) {
+        let other = target.with_extension("other");
+        std::fs::File::create(&other).unwrap();
+        std::fs::rename(&other, target).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn ino(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// Round-3 tests MEDIUM: after a failed re-check, an empty file that lstat shows is not
+    /// our claim (another inode) is never removed, and the target is reported as left.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_recheck_never_removes_another_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = pair(dir.path());
+        let steps = Fake {
+            fresh: Some(libc::EIO),
+            claimed: Some(Box::new(swap_in_empty)),
+            ..Fake::claim_only()
+        };
+        let error = publish_with(&src, &dst, &steps).unwrap_err();
+        assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft));
+        assert_eq!(errno(&error), Some(libc::EIO));
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0, "kept");
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload");
+    }
+
+    /// Round-3 LOW: a successful re-check also compares the claim's identity, so another
+    /// writer's empty file is never deleted and published over.
+    #[test]
+    #[cfg(unix)]
+    fn a_recheck_never_takes_another_empty_file_for_the_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = pair(dir.path());
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = swapped.clone();
+        let steps = Fake {
+            claimed: Some(Box::new(move |p| {
+                swap_in_empty(p);
+                seen.set(ino(p));
+            })),
+            ..Fake::claim_only()
+        };
+        let error = publish_with(&src, &dst, &steps).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
+        assert_eq!(Fault::of(&error), Some(Fault::ClaimChanged));
+        assert_eq!(ino(&dst), swapped.get(), "the other file is kept");
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0);
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload");
+    }
+
+    /// Round-3 LOW: a FIFO swapped in for the claim neither blocks the re-check open nor
+    /// passes it.
+    #[test]
+    #[cfg(unix)]
+    fn a_fifo_swapped_in_for_the_claim_never_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = pair(dir.path());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s, d) = (src.clone(), dst.clone());
+        std::thread::spawn(move || {
+            let steps = Fake {
+                claimed: Some(Box::new(|p| {
+                    use std::os::unix::ffi::OsStrExt;
+                    std::fs::remove_file(p).unwrap();
+                    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: a valid NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+                })),
+                ..Fake::claim_only()
+            };
+            let _ = tx.send(publish_with(&s, &d, &steps).map_err(|e| (e.kind(), Fault::of(&e))));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the re-check blocked on a FIFO");
+        assert_eq!(
+            result,
+            Err((io::ErrorKind::ResourceBusy, Some(Fault::ClaimChanged)))
+        );
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload");
     }
 
     /// Re-review nit 6: a claim found gone after a failed re-check (by lstat, or by the

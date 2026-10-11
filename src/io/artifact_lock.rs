@@ -90,16 +90,16 @@ fn claim_key(path: &Path) -> PathBuf {
 }
 
 impl ArtifactLock {
-    /// Take the sidecar lock for `final_path`, waiting while another process holds it.
-    /// The holder's progress is a change in the size or mtime of `<final>.partial` or of
-    /// any `watch` path (e.g. the mapfile), read by path on each poll (T10).
+    /// Take the sidecar lock for `final_path`, waiting while another process holds it
+    /// (or a symlink or second hard link sits at the sidecar, which is never written).
+    /// Progress is a change in the size or mtime of `<final>.partial` or any `watch` path.
     ///
     /// # Errors
     ///
-    /// [`Error::Halted`] on a Stop (within one [`WAIT_SLICE`]);
-    /// [`Error::TimedOut`] `{ op: "artifact_lock" }` after [`ARTIFACT_LOCK_WINDOW`] with
-    /// no progress (on Windows also the surface of a permission failure);
-    /// [`Error::IoError`] when the sidecar cannot be opened or locked.
+    /// [`Error::Halted`] on a Stop; [`Error::TimedOut`] `{ op: "artifact_lock" }` after
+    /// [`ARTIFACT_LOCK_WINDOW`] with no progress (Windows: also a permission failure);
+    /// [`Error::IoError`] when the sidecar cannot be opened or locked, or its token IO
+    /// fails the same way on several fresh attempts in a row with no holder seen.
     pub fn acquire(final_path: &Path, watch: &[&Path], halt: &Halt) -> Result<ArtifactLock> {
         Self::acquire_within(final_path, watch, halt, ARTIFACT_LOCK_WINDOW)
     }
@@ -167,12 +167,18 @@ impl ArtifactLock {
             let file = match os::open_rw(&path) {
                 Ok(f) => f,
                 // Windows: a delete-pending sidecar refuses the open; the holder is leaving.
+                // Unix: a symlink there is foreign, waited out like a holder.
                 Err(e) if os::open_retryable(&e) => {
                     wait.slice(halt, &e, Cause::Holder)?;
                     continue;
                 }
                 Err(e) => return Err(Error::IoError { source: e }),
             };
+            if let Some(e) = os::foreign(&file) {
+                drop(file);
+                wait.slice(halt, &e, Cause::Holder)?;
+                continue;
+            }
             // SS-8 flock(2): "Only one process may hold an exclusive lock for a given file at
             // a given time." SS-10 LockFileEx: LOCKFILE_EXCLUSIVE_LOCK, FAIL_IMMEDIATELY.
             while !lock(&file).map_err(|source| Error::IoError { source })? {
@@ -191,13 +197,18 @@ impl ArtifactLock {
                     proof = same_file(ids, &file, &path)?;
                 }
             }
-            let retry = match proof {
+            let (retry, cause) = match proof {
                 Proof::Ours => return Ok(ArtifactLock { file, path, claim }),
-                Proof::Retry(e) => e,
+                Proof::Retry(e) => (e, Cause::Proof),
+                #[cfg(unix)]
+                Proof::Fault(e) => (e, Cause::Fault),
             };
             // A retry is a wait like any other: halt-aware, and under T10 (never a spin).
             drop(file);
-            wait.slice(halt, &retry, Cause::Proof)?;
+            if cause == Cause::Fault && wait.persists(&retry) {
+                return Err(Error::IoError { source: retry });
+            }
+            wait.slice(halt, &retry, cause)?;
         }
     }
 
@@ -254,19 +265,28 @@ fn same_file(ids: &Ids<'_>, file: &File, path: &Path) -> Result<Proof> {
     })
 }
 
-// What a wait slice waits out: another holder, or a lock whose proof failed.
+// What a wait slice waits out: another holder, or a lock whose proof failed (`Fault`: on
+// an IO error that is no sign of another holder).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cause {
     Holder,
     Proof,
+    Fault,
 }
 
-// The token proof's verdict; `Retry` carries the OS answer logged if the wait expires.
+// The token proof's verdict; the error is the OS answer logged if the wait expires.
+// `Fault` is an IO failure no other holder explains: retried, unless it persists.
 #[derive(Debug)]
 enum Proof {
     Ours,
     Retry(io::Error),
+    // Windows proves by file index alone: no token IO to fail.
+    #[cfg(unix)]
+    Fault(io::Error),
 }
+
+// Fresh attempts in a row failing with one IO error, no holder seen, that end the wait.
+const FAULT_REPEATS: u32 = 5;
 
 fn replaced() -> io::Error {
     io::Error::other("the sidecar was replaced")
@@ -281,6 +301,8 @@ struct LockWait {
     timer: StallTimer,
     // Consecutive failed proofs, which widen the random backoff.
     lost: u32,
+    // The last fault (errno, kind) and how many attempts in a row it failed.
+    fault: Option<((Option<i32>, io::ErrorKind), u32)>,
 }
 
 impl LockWait {
@@ -296,7 +318,19 @@ impl LockWait {
             progress,
             timer,
             lost: 0,
+            fault: None,
         }
+    }
+
+    // Records a fault; true once the same one failed FAULT_REPEATS attempts in a row.
+    fn persists(&mut self, e: &io::Error) -> bool {
+        let key = (e.raw_os_error(), e.kind());
+        let runs = match self.fault {
+            Some((last, runs)) if last == key => runs + 1,
+            _ => 1,
+        };
+        self.fault = Some((key, runs));
+        runs >= FAULT_REPEATS
     }
 
     // One `WAIT_SLICE`: `Halted` on a Stop, `TimedOut` once the window passes with no
@@ -316,7 +350,7 @@ impl LockWait {
                     last_os_error = %last,
                     "another process holds the artifact lock and its output has not changed"
                 ),
-                Cause::Proof => tracing::warn!(
+                Cause::Proof | Cause::Fault => tracing::warn!(
                     target: "freemkv::io",
                     phase = "artifact_lock",
                     last_os_error = %last,
@@ -327,9 +361,12 @@ impl LockWait {
                 op: "artifact_lock",
             });
         }
+        if cause != Cause::Fault {
+            self.fault = None;
+        }
         self.lost = match cause {
             Cause::Holder => 0,
-            Cause::Proof => self.lost.saturating_add(1),
+            Cause::Proof | Cause::Fault => self.lost.saturating_add(1),
         };
         halt.wait(WAIT_SLICE + backoff(self.lost))
     }
@@ -367,18 +404,30 @@ mod os {
     use std::path::Path;
 
     // Read-write, always: an NFS client emulates flock as a byte-range lock, which needs
-    // the file open for writing (SS-8).
+    // the file open for writing (SS-8). Never through a symlink (ELOOP).
     pub(super) fn open_rw(p: &Path) -> io::Result<File> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(p)
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+        options.open(p)
     }
 
     pub(super) fn open_retryable(_e: &io::Error) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return _e.raw_os_error() == Some(libc::ELOOP);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         false
+    }
+
+    // Not a sidecar this lock may write: not a regular file, or linked under another name
+    // too (the token would truncate that file).
+    pub(super) fn foreign(f: &File) -> Option<io::Error> {
+        match f.metadata() {
+            Ok(m) if m.is_file() && m.nlink() <= 1 => None,
+            Ok(_) => Some(io::Error::other("the sidecar is not a lone regular file")),
+            Err(e) => Some(e),
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -441,7 +490,7 @@ mod os {
         names_with(f, p, &write_token, &read_back, relock)
     }
 
-    fn write_token(f: &File, token: &[u8]) -> io::Result<()> {
+    pub(super) fn write_token(f: &File, token: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         f.set_len(0).map_err(truncate_error)?;
         f.write_all_at(token, 0)
@@ -547,15 +596,23 @@ mod os {
         match write(f, token) {
             Ok(()) => {}
             Err(e) if token_unavailable(&e) => return Ok(Proof::Ours),
-            Err(e) if identity_uncertain(&e) => return Ok(Proof::Retry(e)),
+            Err(e) if identity_uncertain(&e) => return Ok(uncertain(e)),
             Err(e) => return Err(e),
         }
         match read(p, max) {
             Ok(named) if named == token => Ok(Proof::Ours),
             Ok(_) => Ok(Proof::Retry(replaced())),
             Err(e) if read_conflict(&e) => prove_unlocked(f, p, token, read, relock),
-            Err(e) if identity_uncertain(&e) => Ok(Proof::Retry(e)),
+            Err(e) if identity_uncertain(&e) => Ok(uncertain(e)),
             Err(e) => Err(e),
+        }
+    }
+
+    // A gone or stale file means another holder replaced it; any other error is a fault.
+    fn uncertain(e: io::Error) -> Proof {
+        match id_retryable(&e) {
+            true => Proof::Retry(e),
+            false => Proof::Fault(e),
         }
     }
 
@@ -571,23 +628,25 @@ mod os {
     ) -> io::Result<Proof> {
         let max = token.len() as u64 + 1;
         if let Err(e) = unlock(f) {
-            return Ok(Proof::Retry(e));
+            return Ok(Proof::Fault(e));
         }
         match read(p, max) {
             Ok(named) if named == token => {}
             Ok(_) => return Ok(Proof::Retry(replaced())),
-            Err(e) if read_conflict(&e) || identity_uncertain(&e) => return Ok(Proof::Retry(e)),
+            // Still refused with ours released: another holder's lock.
+            Err(e) if read_conflict(&e) => return Ok(Proof::Retry(e)),
+            Err(e) if identity_uncertain(&e) => return Ok(uncertain(e)),
             Err(e) => return Err(e),
         }
         match relock(f) {
             Ok(true) => {}
             Ok(false) => return Ok(Proof::Retry(io::ErrorKind::WouldBlock.into())),
-            Err(e) => return Ok(Proof::Retry(e)),
+            Err(e) => return Ok(Proof::Fault(e)),
         }
         match read_held(f, token.len() + 1) {
             Ok(held) if held == token => Ok(Proof::Ours),
             Ok(_) => Ok(Proof::Retry(replaced())),
-            Err(e) => Ok(Proof::Retry(e)),
+            Err(e) => Ok(Proof::Fault(e)),
         }
     }
 
@@ -665,6 +724,10 @@ mod os {
             .truncate(false)
             .share_mode(FILE_SHARE_READ_WRITE_DELETE)
             .open(p)
+    }
+
+    pub(super) fn foreign(_f: &File) -> Option<io::Error> {
+        None
     }
 
     // A delete-pending file refuses the open with ERROR_ACCESS_DENIED, which a real

@@ -2745,15 +2745,16 @@ fn episode_playlists() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-// Clips 00001-00003 on disc and `playlists` in PLAYLIST; playlist i's bytes sit at
-// partition LBA `30000 + 100 * i`.
+// Clips 00001-00004 on disc (00004 in no episode) and `playlists` in PLAYLIST;
+// playlist i's bytes sit at partition LBA `30000 + 100 * i`.
 fn episodes_bd_fs(disc: &mut MemDisc, playlists: &[(&str, Vec<u8>)]) -> udf::UdfFs {
     let mut streams = Vec::new();
     let mut clipinf = Vec::new();
-    for n in 1..=3u32 {
+    for n in 1..=4u32 {
         let name = format!("{n:05}");
         let m2ts = format!("{name}.m2ts");
-        streams.push(file(&m2ts, 100 + n, 5000 * n, 1000 * 2048, true));
+        let lba = if n == 4 { 40000 } else { 5000 * n };
+        streams.push(file(&m2ts, 100 + n, lba, 1000 * 2048, true));
         let clpi = build_clpi(4000);
         clipinf.push(file_with(
             &format!("{name}.clpi"),
@@ -2900,8 +2901,13 @@ fn a_playlist_naming_a_missing_clip_holds_the_bd_roster() {
 // Cut inside the play-all's third PlayItem: what is left, [00001, 00002], would
 // otherwise prove a two-episode roster that leaves episode 3 out.
 fn truncated_playall() -> Vec<u8> {
-    let full = episode_mpls(&[b"00001", b"00002", b"00003"]);
-    let two = episode_mpls(&[b"00001", b"00002"]);
+    truncated_after_two([b"00001", b"00002", b"00003"])
+}
+
+// A three-item playlist cut inside its third PlayItem.
+fn truncated_after_two(clips: [&[u8; 5]; 3]) -> Vec<u8> {
+    let full = episode_mpls(&clips);
+    let two = episode_mpls(&clips[..2]);
     let mark_start = u32::from_be_bytes(two[12..16].try_into().unwrap()) as usize;
     full[..mark_start + 10].to_vec()
 }
@@ -2923,6 +2929,20 @@ fn a_truncated_playlist_holds_the_bd_roster() {
     playlists[3].1 = truncated_playall();
     let titles = scan_episodes(&playlists);
     assert_eq!(titles.len(), 4);
+    assert_no_roster(&titles);
+}
+
+/// Round-3 tests LOW: a competing playlist cut short, its surviving items on a clip no
+/// roster title reads and shorter than the play-all: only the lost playlist holds the roster.
+#[test]
+fn a_truncated_playlist_elsewhere_holds_the_bd_roster() {
+    let mut playlists = episode_playlists();
+    playlists.push(("00900.mpls", truncated_after_two([b"00004"; 3])));
+    let titles = scan_episodes(&playlists);
+    assert_eq!(titles.len(), 5);
+    let cut = titles.iter().find(|t| t.playlist_id == 900).expect("kept");
+    assert!(cut.selection_evidence.segments.is_empty());
+    assert!(cut.duration_secs < 3.0 * 1200.0);
     assert_no_roster(&titles);
 }
 

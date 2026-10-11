@@ -371,7 +371,8 @@ struct XplTitle {
     duration_secs: f64,
     clips: Vec<XplClip>,
     chapters: Vec<f64>,
-    /// Every clip element was kept: none past the per-title cap or naming no `.evo`.
+    /// Every clip element was kept whole: none past the per-title cap, naming no `.evo`
+    /// or lacking a title time.
     complete: bool,
 }
 
@@ -609,7 +610,7 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .unwrap_or(0.0);
 
         let mut clips = Vec::new();
-        // False once a clip element is cut by the cap or names no `.evo`.
+        // False once a clip element is cut by the cap, names no `.evo` or lacks a title time.
         let mut complete = true;
         for c in tnode
             .descendants()
@@ -626,14 +627,16 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
                 complete = false;
                 continue;
             };
-            let begin_secs = c
+            let begin = c
                 .attribute("titleTimeBegin")
-                .and_then(|s| parse_timecode(s, time_base))
-                .unwrap_or(0.0);
-            let end_secs = c
+                .and_then(|s| parse_timecode(s, time_base));
+            let end = c
                 .attribute("titleTimeEnd")
-                .and_then(|s| parse_timecode(s, time_base))
-                .unwrap_or(begin_secs);
+                .and_then(|s| parse_timecode(s, time_base));
+            // Without both title times the clip's length is a guess: no exact segments.
+            complete &= begin.is_some() && end.is_some();
+            let begin_secs = begin.unwrap_or(0.0);
+            let end_secs = end.unwrap_or(begin_secs);
             let clip_begin_secs = c
                 .attribute("clipTimeBegin")
                 .and_then(|s| parse_timecode(s, time_base));

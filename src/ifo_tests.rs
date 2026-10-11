@@ -24,7 +24,7 @@ fn tt_srpt_title_count_is_capped_and_deduplicated() {
         .map(|i| (5u16, (i % 255) as u8 + 1, ((i / 255) % 255) as u8 + 1))
         .collect();
     let data = tt_srpt_bytes(u16::MAX, &entries);
-    let map = parse_tt_srpt(&data, 0).expect("well-formed TT_SRPT");
+    let map = parse_tt_srpt(&data, 0).expect("well-formed TT_SRPT").titles;
     let total: usize = map.values().map(|v| v.len()).sum();
     // Asserted against the DVD-Video max as a LITERAL, not MAX_TT_SRPT_TITLES:
     // comparing to the constant under test would pass vacuously if that constant
@@ -38,7 +38,9 @@ fn tt_srpt_title_count_is_capped_and_deduplicated() {
     // times is one title, not many. Kept separate from the cap assertion
     // above so neither guard can mask the other.
     let dupes = vec![(5u16, 1u8, 1u8); u16::MAX as usize];
-    let dup_map = parse_tt_srpt(&tt_srpt_bytes(u16::MAX, &dupes), 0).expect("well-formed TT_SRPT");
+    let dup_map = parse_tt_srpt(&tt_srpt_bytes(u16::MAX, &dupes), 0)
+        .expect("well-formed TT_SRPT")
+        .titles;
     assert_eq!(
         dup_map.get(&1).map(Vec::len),
         Some(1),
@@ -49,17 +51,22 @@ fn tt_srpt_title_count_is_capped_and_deduplicated() {
 // The playback type per title, and whether the table held every declared title.
 #[test]
 fn tt_srpt_playback_reads_each_type_and_flags_a_lost_entry() {
+    let complete = |data: &[u8]| parse_tt_srpt(data, 0).unwrap().complete;
     let mut data = tt_srpt_bytes(2, &[(1, 1, 1), (1, 1, 2)]);
     data[8 + 12] = TT_MULTI_OR_RANDOM_PGC;
-    let (types, complete) = tt_srpt_playback(&data, 0);
-    assert!(complete);
-    assert_eq!(types.get(&(1, 1)), Some(&0));
-    assert_eq!(types.get(&(1, 2)), Some(&TT_MULTI_OR_RANDOM_PGC));
+    let table = parse_tt_srpt(&data, 0).unwrap();
+    assert!(table.complete);
+    assert_eq!(table.playback.get(&(1, 1)), Some(&0));
+    assert_eq!(table.playback.get(&(1, 2)), Some(&TT_MULTI_OR_RANDOM_PGC));
     // Cut inside the second entry, or declaring more than the format allows.
-    assert!(!tt_srpt_playback(&data[..8 + 18], 0).1);
+    assert!(!complete(&data[..8 + 18]));
     let entries = vec![(1, 1, 1); 100];
-    assert!(tt_srpt_playback(&tt_srpt_bytes(99, &entries), 0).1);
-    assert!(!tt_srpt_playback(&tt_srpt_bytes(100, &entries), 0).1);
+    assert!(complete(&tt_srpt_bytes(99, &entries)));
+    assert!(!complete(&tt_srpt_bytes(100, &entries)));
+    // A dropped entry (title set or title 0) is lost; a duplicate is not.
+    assert!(!complete(&tt_srpt_bytes(2, &[(1, 1, 1), (1, 1, 0)])));
+    assert!(!complete(&tt_srpt_bytes(2, &[(1, 1, 1), (1, 0, 2)])));
+    assert!(complete(&tt_srpt_bytes(2, &[(1, 1, 1), (1, 1, 1)])));
 }
 
 #[test]
@@ -70,7 +77,7 @@ fn tt_srpt_admits_a_full_99_title_disc() {
         .map(|i| (3u16, if i < 50 { 1 } else { 2 }, i + 1))
         .collect();
     let data = tt_srpt_bytes(99, &entries);
-    let map = parse_tt_srpt(&data, 0).expect("well-formed TT_SRPT");
+    let map = parse_tt_srpt(&data, 0).expect("well-formed TT_SRPT").titles;
     let total: usize = map.values().map(|v| v.len()).sum();
     assert_eq!(total, 99, "a full 99-title disc must survive the cap");
     assert_eq!(map.get(&1).map(Vec::len), Some(50));
@@ -1006,6 +1013,8 @@ fn feature_filter_noop_on_plain_feature() {
         ptt_programs: None,
         sequential: true,
         truncated: false,
+        mapped: true,
+        reach: None,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert_eq!(t.feature_cells().len(), 3);
@@ -1034,6 +1043,8 @@ fn feature_filter_drops_leading_secondary_block_cells() {
         ptt_programs: None,
         sequential: true,
         truncated: false,
+        mapped: true,
+        reach: None,
     };
     assert_eq!(t.feature_start_cell(), 2);
     let fc = t.feature_cells();
@@ -1058,6 +1069,8 @@ fn feature_filter_never_empties_title() {
         ptt_programs: None,
         sequential: true,
         truncated: false,
+        mapped: true,
+        reach: None,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert_eq!(t.feature_cells().len(), 2);
@@ -1079,6 +1092,8 @@ fn feature_filter_empty_cells() {
         ptt_programs: None,
         sequential: true,
         truncated: false,
+        mapped: true,
+        reach: None,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert!(t.feature_cells().is_empty());
@@ -1585,7 +1600,7 @@ fn pgcit_entry_past_end_is_skipped_not_an_error() {
 #[test]
 fn tt_srpt_chapter_count_read_from_entry_offset_2() {
     let data = tt_srpt_bytes(3, &[(7, 1, 1), (13, 1, 2), (0x0102, 2, 1)]);
-    let map = parse_tt_srpt(&data, 0).unwrap();
+    let map = parse_tt_srpt(&data, 0).unwrap().titles;
     assert_eq!(map[&1], vec![(7u16, 1u8), (13, 2)]);
     assert_eq!(map[&2], vec![(0x0102u16, 1u8)]);
 }
@@ -1775,7 +1790,9 @@ fn txtdt_bad_offsets_and_lengths_are_bounded() {
 fn tt_srpt_groups_titles_by_their_title_set() {
     // Three titles: two in VTS 1, one in VTS 2 — the ordinary shape.
     let vmg = vmg_with_tt_srpt(1, &[(12, 1, 1), (5, 1, 2), (20, 2, 1)]);
-    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES)
+        .expect("parse")
+        .titles;
     assert_eq!(map.len(), 2, "two title sets");
     assert_eq!(
         map[&1],
@@ -1793,12 +1810,15 @@ fn tt_srpt_pointer_is_a_sector_offset_not_a_byte_offset() {
     for sector in [1u32, 2, 5] {
         let vmg = vmg_with_tt_srpt(sector, &[(3, 1, 1)]);
         let at_sector = parse_tt_srpt(&vmg, sector as usize * crate::consts::SECTOR_BYTES)
-            .expect("reading at the sector offset works");
+            .expect("reading at the sector offset works")
+            .titles;
         assert_eq!(at_sector[&1], vec![(3, 1)], "sector {sector}");
         // Reading the same pointer as a BYTE offset lands 1/2048th of the way
         // in and yields a different table without erroring — silently wrong
         // titles, which is how dropped titles looked like a scan difference.
-        let as_bytes = parse_tt_srpt(&vmg, sector as usize).expect("does not error");
+        let as_bytes = parse_tt_srpt(&vmg, sector as usize)
+            .expect("does not error")
+            .titles;
         assert_ne!(
             as_bytes, at_sector,
             "sector {sector}: a byte-offset read must not coincidentally \
@@ -1811,7 +1831,9 @@ fn tt_srpt_pointer_is_a_sector_offset_not_a_byte_offset() {
 #[test]
 fn tt_srpt_skips_entries_with_no_title_set() {
     let vmg = vmg_with_tt_srpt(1, &[(9, 0, 1), (4, 3, 1)]);
-    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES)
+        .expect("parse")
+        .titles;
     assert_eq!(map.len(), 1, "the vts=0 entry is dropped");
     assert_eq!(map[&3], vec![(4, 1)]);
 }
@@ -1821,7 +1843,9 @@ fn tt_srpt_skips_entries_with_no_title_set() {
 #[test]
 fn tt_srpt_collapses_a_duplicate_title() {
     let vmg = vmg_with_tt_srpt(1, &[(7, 2, 1), (7, 2, 1), (8, 2, 2)]);
-    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES)
+        .expect("parse")
+        .titles;
     assert_eq!(
         map[&2],
         vec![(7, 1), (8, 2)],
@@ -1835,7 +1859,9 @@ fn tt_srpt_collapses_a_duplicate_title() {
 fn tt_srpt_truncated_keeps_the_entries_it_can_read() {
     let mut vmg = vmg_with_tt_srpt(1, &[(1, 1, 1), (2, 2, 1), (3, 3, 1)]);
     vmg.truncate(crate::consts::SECTOR_BYTES + 8 + 12 + 6); // 1 whole entry + a fragment
-    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES)
+        .expect("parse")
+        .titles;
     assert_eq!(map.len(), 1, "the complete entry survives");
     assert_eq!(map[&1], vec![(1, 1)]);
 }
@@ -1856,7 +1882,7 @@ fn tt_srpt_clamps_an_absurd_declared_title_count() {
     let off = crate::consts::SECTOR_BYTES;
     vmg[off..off + 2].copy_from_slice(&u16::MAX.to_be_bytes());
 
-    let map = parse_tt_srpt(&vmg, off).expect("parse");
+    let map = parse_tt_srpt(&vmg, off).expect("parse").titles;
     let total: usize = map.values().map(|v| v.len()).sum();
     assert!(
         total <= MAX_TT_SRPT_TITLES,
@@ -1871,7 +1897,9 @@ fn tt_srpt_clamps_an_absurd_declared_title_count() {
 #[test]
 fn tt_srpt_skips_title_number_zero() {
     let vmg = vmg_with_tt_srpt(1, &[(9, 1, 0), (4, 1, 1)]);
-    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES).expect("parse");
+    let map = parse_tt_srpt(&vmg, crate::consts::SECTOR_BYTES)
+        .expect("parse")
+        .titles;
     assert_eq!(map[&1], vec![(4, 1)], "the title-number-0 entry is dropped");
 }
 
@@ -2295,4 +2323,28 @@ fn parse_vmg_with_propagates_halted() {
     let vmg = vmg_at_sector(1, &[(5, 1, 1)]);
     let r = parse_vmg_with(&mut reader, &udf, Some(&vmg));
     assert!(matches!(r, Err(Error::Halted)), "got {r:?}");
+}
+
+/// Round-3 tests LOW: a command table or cell command the IFO does not hold is never
+/// read as "no commands".
+#[test]
+fn command_flow_fails_closed_on_what_it_cannot_read() {
+    // A PGC at 0 with one cell (table at 0x140) and a command table at 0x100 holding
+    // `cell` cell commands (all NOP); its cell runs command `n`.
+    let pgc = |table: u16, pre: u16, cell: u16, n: u8| {
+        let mut d = vec![0u8; 0x200];
+        d[3] = 1;
+        d[0xE4..0xE6].copy_from_slice(&table.to_be_bytes());
+        d[0xE8..0xEA].copy_from_slice(&0x140u16.to_be_bytes());
+        d[0x100..0x102].copy_from_slice(&pre.to_be_bytes());
+        d[0x104..0x106].copy_from_slice(&cell.to_be_bytes());
+        d[0x143] = n;
+        d
+    };
+    assert_eq!(command_flow_in_order(&pgc(0x100, 1, 1, 1), 0), Some(false));
+    // Counts that run the commands past the IFO, or a table whose counts lie past it.
+    assert_eq!(command_flow_in_order(&pgc(0x100, 100, 1, 1), 0), None);
+    assert_eq!(command_flow_in_order(&pgc(0x1FE, 0, 0, 0), 0), None);
+    // The cell runs command 2 of a one-command list.
+    assert_eq!(command_flow_in_order(&pgc(0x100, 1, 1, 2), 0), None);
 }

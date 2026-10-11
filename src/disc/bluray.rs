@@ -77,13 +77,14 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        super::selection_partition::annotate(&mut titles, "bd-playall-partition-v1", complete);
+        // A playlist's duration and clips are all it plays: no `Reach` bounds are needed.
+        super::selection_partition::annotate(&mut titles, "bd-playall-partition-v1", complete, &[]);
         Ok(titles)
     }
 
-    // Parse one MPLS playlist into a DiscTitle. `Ok(None)` covers both benign misses
-    // (unparseable, sub-30s) and deliberate drops; `Err` (only Halted) means the scan is over.
-    // The test entry point discards the completeness `parse_playlist_memo` reports.
+    // Parse one MPLS playlist into a DiscTitle. `Ok(None)` is the benign sub-30s miss or a
+    // lost playlist (unparseable, or a drop, which the memo variant reports as incomplete);
+    // `Err` (only Halted) ends the scan. This test entry point discards the completeness.
     #[cfg(test)]
     pub(super) fn parse_playlist(
         reader: &mut dyn SectorSource,

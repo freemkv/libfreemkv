@@ -91,7 +91,7 @@ fn assert_roster(titles: &[DiscTitle], roster: &str, members: &[(u16, usize)]) {
 }
 
 fn run(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "bd-playall-partition-v1", true);
+    annotate(&mut titles, "bd-playall-partition-v1", true, &[]);
     titles
 }
 
@@ -354,7 +354,7 @@ fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
 }
 
 fn run_dvd(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "dvd-playall-partition-v1", true);
+    annotate(&mut titles, "dvd-playall-partition-v1", true, &[]);
     titles
 }
 
@@ -556,4 +556,33 @@ fn longer_undescribed_title_by_duration_holds_the_roster() {
     feature.selection_evidence.segments.clear();
     titles.push(feature);
     assert_unknown(&run(titles));
+}
+
+// An undescribed title is measured by all it can play: a short first PGC whose reach is
+// longer, or unknown, holds the extras roster; a reach within it does not.
+#[test]
+fn an_undescribed_title_is_measured_by_its_reach() {
+    let extras = [(1000, 1009), (1100, 1109), (1200, 1209)];
+    let mut titles: Vec<_> = (extras.iter().enumerate())
+        .map(|(i, &c)| dvd(i as u16 + 11, &[c]))
+        .collect();
+    titles.push(dvd(20, &extras));
+    let mut first_pgc = dvd(1, &[(100, 104)]);
+    first_pgc.selection_evidence.segments.clear();
+    titles.insert(0, first_pgc);
+    let with = |reach: &[Reach]| {
+        let mut titles = titles.clone();
+        annotate(&mut titles, "dvd-playall-partition-v1", true, reach);
+        titles
+    };
+    let at_most = |secs, sectors| Reach::AtMost { secs, sectors };
+    assert_unknown(&with(&[Reach::Unknown]));
+    assert_unknown(&with(&[at_most(0.0, 200)]));
+    for reach in [&[][..], &[at_most(0.0, 30)]] {
+        assert_roster(
+            &with(reach),
+            "dvd-playall-partition-v1:20",
+            &[(11, 0), (12, 1), (13, 2)],
+        );
+    }
 }

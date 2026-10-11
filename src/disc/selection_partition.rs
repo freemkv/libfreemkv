@@ -55,12 +55,22 @@ impl<'a, T: Eq + Hash> Prefixes<'a, T> {
     }
 }
 
+/// The most a title can play, for the rule that no undescribed title outlasts the play-all.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Reach {
+    /// At most this long and this many sectors.
+    AtMost { secs: f64, sectors: u64 },
+    /// Unbounded or unknown: it could be the longer play-all.
+    Unknown,
+}
+
 /// Annotate every title from one proven play-all partition, or leave all Unknown.
 /// `producer` names the calling scanner's roster, e.g. `bd-playall-partition-v1`.
 /// `complete` is false when the scanner dropped or cut a title it should have
 /// described: the missing one could compete with any partition of the rest.
-pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str, complete: bool) {
-    let Some((wrapper, ordinals)) = complete.then(|| partition(titles)).flatten() else {
+/// `reach[i]` bounds title `i`; a title past its end plays its duration and extents.
+pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str, complete: bool, reach: &[Reach]) {
+    let Some((wrapper, ordinals)) = complete.then(|| partition(titles, reach)).flatten() else {
         tracing::debug!(
             target: "freemkv::scan",
             producer,
@@ -99,7 +109,7 @@ fn sector_ranges(title: &DiscTitle) -> impl Iterator<Item = (u64, u64)> + '_ {
 }
 
 // Lowest wrapper title id and per-title member ordinal.
-fn partition(titles: &[DiscTitle]) -> Option<(u16, Vec<Option<usize>>)> {
+fn partition(titles: &[DiscTitle], reach: &[Reach]) -> Option<(u16, Vec<Option<usize>>)> {
     fn segments(t: &DiscTitle) -> &[ContentSegment] {
         &t.selection_evidence.segments
     }
@@ -196,8 +206,8 @@ fn partition(titles: &[DiscTitle]) -> Option<(u16, Vec<Option<usize>>)> {
     if blocked {
         return None;
     }
-    // Nor may an undescribed title be longer, by time or sectors, than the play-all:
-    // it could be the real play-all beside an extras one.
+    // Nor may an undescribed title play longer, by time or sectors, than the play-all
+    // (all it can play, not what was read of it): it could be the real one beside extras.
     let sectors = |t: &DiscTitle| {
         sector_ranges(t)
             .map(|(start, end)| end - start)
@@ -214,11 +224,14 @@ fn partition(titles: &[DiscTitle]) -> Option<(u16, Vec<Option<usize>>)> {
             shortest.1.min(sectors(title)),
         );
     }
-    let longer = |t: &DiscTitle| t.duration_secs > shortest.0 || sectors(t) > shortest.1;
-    if titles
-        .iter()
+    let longer = |i: usize, t: &DiscTitle| match reach.get(i).copied() {
+        None => t.duration_secs > shortest.0 || sectors(t) > shortest.1,
+        Some(Reach::AtMost { secs, sectors }) => secs > shortest.0 || sectors > shortest.1,
+        Some(Reach::Unknown) => true,
+    };
+    if (titles.iter().enumerate())
         .zip(&group_of)
-        .any(|(t, g)| g.is_none() && longer(t))
+        .any(|((i, t), g)| g.is_none() && longer(i, t))
     {
         return None;
     }

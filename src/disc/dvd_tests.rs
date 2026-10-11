@@ -941,13 +941,16 @@ fn scan_dvd_titles_extent_is_absolute_three_term_sum() {
 fn scan_dvd_titles_multi_cell_extents_in_order() {
     let mut disc = MemDisc::new();
     let vmg = build_vmg(&[(2, 1, 1)]);
-    let vts = build_vts(
-        500,
-        0x00,
-        &[],
-        &[],
-        &[(0, 99), (200, 299)], // two cells
-        false,
+    let vts = with_ptt(
+        build_vts(
+            500,
+            0x00,
+            &[],
+            &[],
+            &[(0, 99), (200, 299)], // two cells
+            false,
+        ),
+        &[(1, 1)],
     );
     let udf = build_video_ts_fs(
         &mut disc,
@@ -2183,6 +2186,8 @@ fn title(vts_title_num: u8, pgcs: usize) -> ifo::DvdTitle {
         ptt_programs: None,
         sequential: true,
         truncated: false,
+        mapped: true,
+        reach: None,
     }
 }
 
@@ -2725,7 +2730,7 @@ fn link_pttn(n: u8) -> [u8; 8] {
 fn pttn_ladder(rungs: u8) -> Vec<[u8; 8]> {
     let mut cmds = vec![SET_GPRM1_5];
     for n in 1..=rungs {
-        let next = 2 + 2 * n + 1;
+        let next = 2 * n + 2; // the next rung's goto
         cmds.push([0x00, 0xb1, 0, 0, 0, n, 0, next]);
         cmds.push(link_pttn(n));
     }
@@ -2744,9 +2749,10 @@ fn pgn_ladder(rungs: u8) -> Vec<[u8; 8]> {
 
 #[test]
 fn chapter_select_ladders_keep_segments_and_the_roster() {
-    let link_cn_2 = [0x20, 0x07, 0, 0, 0, 0, 0, 2];
-    let top_cell = [0x20, 0x01, 0, 0, 0, 0, 0, 1];
-    let top_pg = [0x20, 0x01, 0, 0, 0, 0, 0, 5];
+    // `if gprm0 == n` LinkCN 2, LinkTopC, LinkTopPG.
+    let link_cn_2 = [0x20, 0xa7, 0, 0, 0, 1, 0, 2];
+    let top_cell = [0x20, 0xa1, 0, 0, 0, 2, 0, 1];
+    let top_pg = [0x20, 0xa1, 0, 0, 0, 3, 0, 5];
     let set_no_link = [0x71, 0x01, 0, 1, 0, 5, 0, 0]; // SetGPRM, LinkNoLink
     for (pre, cell) in [
         (pttn_ladder(20), vec![]),
@@ -2785,15 +2791,16 @@ fn pre_commands_that_leave_the_pgc_still_have_no_segments() {
     assert!(titles[6].selection_evidence.segments.is_empty());
 }
 
-// LinkPTTN stays in the PGC only when the title is that one PGC.
+// Without VTS_PTT_SRPT (mandatory) every title's PGC is a 1:1 guess: none has segments.
 #[test]
-fn a_part_link_in_a_title_without_a_part_table_has_no_segments() {
+fn a_title_set_without_a_part_table_has_no_segments() {
     let (mut vts, at) = alternates_vts();
     with_commands(&mut vts, at[6], &pttn_ladder(2), &[], &[]);
     vts[0xc8..0xcc].copy_from_slice(&0u32.to_be_bytes()); // no VTS_PTT_SRPT
     let (titles, _) = scan_disc(eight_titles_vmg(), vts);
-    assert!(titles[6].selection_evidence.segments.is_empty());
-    assert!(!titles[0].selection_evidence.segments.is_empty());
+    assert_eq!(titles.len(), 8);
+    assert!((titles.iter()).all(|t| t.selection_evidence.segments.is_empty()));
+    assert_no_dvd_roster(&titles);
 }
 
 // A cell command no cell runs never executes.
@@ -2804,4 +2811,183 @@ fn an_unreferenced_cell_command_keeps_segments() {
     vts[at[6] + 240 + 3] = 0;
     let (titles, _) = scan_disc(eight_titles_vmg(), vts);
     assert!(!titles[6].selection_evidence.segments.is_empty());
+}
+
+// ── Round 3: what an undescribed title can play, entry links, timers and lost entries ──
+
+// Episodes E1, E2 (100 sectors each), extras X1-X3 (40 each), the extras' 120-sector
+// play-all, and a seventh title playing PGC 7.
+fn extras_programs(seventh: Vec<(u32, u32)>) -> (Vec<u8>, Vec<usize>) {
+    programs_vts(&[
+        vec![(1000, 1099)],
+        vec![(2000, 2099)],
+        vec![(400, 439)],
+        vec![(500, 539)],
+        vec![(600, 639)],
+        vec![(400, 439), (500, 539), (600, 639)],
+        seventh,
+    ])
+}
+
+fn seven_titles_vmg() -> Vec<u8> {
+    build_vmg(&(1..=7).map(|n| (1, 1, n)).collect::<Vec<_>>())
+}
+
+// Title 7's parts are PGCs 1 and 2, the episodes: a play-all split across PGCs.
+fn with_episode_parts(vts: &mut [u8]) {
+    let part = 2048 + 8 + 7 * 4 + 6 * 4;
+    for (k, pgcn) in [1u16, 2].into_iter().enumerate() {
+        vts[part + k * 4..part + k * 4 + 2].copy_from_slice(&pgcn.to_be_bytes());
+        vts[part + k * 4 + 2..part + k * 4 + 4].copy_from_slice(&1u16.to_be_bytes());
+    }
+    vts[2052..2056].copy_from_slice(&((8 + 7 * 8 + 4 - 1) as u32).to_be_bytes());
+}
+
+/// Round-3 MEDIUM: the episode play-all, undescribed because it spans or chains PGCs or
+/// branches, is measured by everything it plays, not its first PGC: longer than the extras
+/// reel (or of unknown length), it holds that reel's roster.
+#[test]
+fn an_undescribed_playall_longer_than_an_extras_reel_holds_the_dvd_roster() {
+    let (titles, _) = scan_disc(seven_titles_vmg(), extras_programs(vec![(700, 709)]).0);
+    assert!(
+        (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown),
+        "control: the extras reel alone proves a roster"
+    );
+    let (mut split, _) = extras_programs(vec![(700, 709)]);
+    with_episode_parts(&mut split);
+    let (mut chained, at) = extras_programs(vec![(1000, 1099)]);
+    chained[at[6] + 0x9c..at[6] + 0x9e].copy_from_slice(&2u16.to_be_bytes());
+    let (mut branching, at) = extras_programs(vec![(1000, 1099)]);
+    with_commands(
+        &mut branching,
+        at[6],
+        &[],
+        &[[0x20, 0x04, 0, 0, 0, 0, 0, 2]],
+        &[],
+    );
+    for (case, vts) in [
+        ("split", split),
+        ("chained", chained),
+        ("branching", branching),
+    ] {
+        let (titles, _) = scan_disc(seven_titles_vmg(), vts);
+        assert_eq!(titles.len(), 7, "{case}");
+        assert!(titles[6].selection_evidence.segments.is_empty(), "{case}");
+        assert_eq!(titles[6].extents.len(), 1, "{case}: its first PGC is read");
+        assert_no_dvd_roster(&titles);
+    }
+}
+
+// SetNVTMR (system set op 2): when the timer runs out, playback goes to another PGC.
+const SET_NVTMR_300_PGC_8: [u8; 8] = [0x52, 0x00, 0x01, 0x2C, 0, 0, 0, 8];
+
+#[test]
+fn a_navigation_timer_has_no_segments_and_no_roster() {
+    let timer = [SET_NVTMR_300_PGC_8];
+    for (pre, post, cell) in [
+        (&timer[..], &[][..], &[][..]),
+        (&[], &timer, &[]),
+        (&[], &[], &timer),
+    ] {
+        let titles = playall_with_commands(pre, post, cell);
+        let case = format!("pre {pre:?} post {post:?} cell {cell:?}");
+        assert!(titles[6].selection_evidence.segments.is_empty(), "{case}");
+        assert_no_dvd_roster(&titles);
+    }
+}
+
+/// Round-3 LOW: a pre command that always skips the first program or cell plays less
+/// than the PGC; only conditional entry links (chapter-select ladders) keep segments.
+#[test]
+fn an_unconditional_entry_link_past_the_start_has_no_segments() {
+    let link_pgn = |n| [0x20, 0x06, 0, 0, 0, 0, 0, n];
+    let link_cn = |n| [0x20, 0x07, 0, 0, 0, 0, 0, n];
+    let goto_3_unless_1 = [0x00, 0xb1, 0, 0, 0, 1, 0, 3];
+    for pre in [
+        vec![link_pgn(2)],
+        vec![link_cn(2)],
+        vec![[0x20, 0x01, 0, 0, 0, 0, 0, 1]], // LinkTopC
+        vec![[0x20, 0x01, 0, 0, 0, 0, 0, 5]], // LinkTopPG
+        vec![link_pttn(1)],
+        vec![[0x71, 0x06, 0, 1, 0, 5, 0, 2]], // SetGPRM, then LinkPGN 2
+        // Both paths reach the LinkPGN 2 on line 3.
+        vec![goto_3_unless_1, SET_GPRM1_5, link_pgn(2)],
+    ] {
+        let titles = playall_with_commands(&pre, &[], &[]);
+        assert!(titles[6].selection_evidence.segments.is_empty(), "{pre:?}");
+        assert_no_dvd_roster(&titles);
+    }
+    for pre in [
+        vec![link_pgn(1)],
+        vec![link_cn(1)],
+        vec![goto_3_unless_1, link_pgn(2)],
+    ] {
+        let titles = playall_with_commands(&pre, &[], &[]);
+        assert!(!titles[6].selection_evidence.segments.is_empty(), "{pre:?}");
+        assert!(
+            (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown),
+            "{pre:?}"
+        );
+    }
+}
+
+// TT_SRPT playback type bit 3 (libdvdread `jlc_exists_in_button_cmd`): highlight buttons
+// in the title's stream may jump elsewhere, which no IFO command shows.
+#[test]
+fn a_title_with_button_commands_has_no_segments_and_no_roster() {
+    for title in [6, 7] {
+        let mut vmg = eight_titles_vmg();
+        vmg[2048 + 8 + title * 12] = 0x08;
+        let (titles, _) = scan_disc(vmg, alternates_vts().0);
+        assert!(
+            titles[title].selection_evidence.segments.is_empty(),
+            "{title}"
+        );
+        assert!(!titles[0].selection_evidence.segments.is_empty(), "{title}");
+        assert_no_dvd_roster(&titles);
+    }
+}
+
+// Title 8's part names PGC 99, past the table: its PGC would only be a 1:1 guess.
+#[test]
+fn a_title_whose_part_names_no_pgc_has_no_segments_and_holds_the_roster() {
+    let (mut vts, _) = alternates_vts();
+    let entry = 2048 + 8 + 7 * 4;
+    let part8 = u32::from_be_bytes(vts[entry..entry + 4].try_into().unwrap()) as usize;
+    vts[2048 + part8..2048 + part8 + 2].copy_from_slice(&99u16.to_be_bytes());
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert_eq!(titles.len(), 8);
+    assert!(titles[7].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+    assert_no_dvd_roster(&titles);
+}
+
+// A TT_SRPT entry naming title 0 is dropped: a title the scan lost.
+#[test]
+fn a_tt_srpt_entry_without_a_title_number_holds_the_dvd_roster() {
+    let vmg = build_vmg(
+        &(1..=8)
+            .map(|n| (1, 1, n))
+            .chain([(1, 1, 0)])
+            .collect::<Vec<_>>(),
+    );
+    let (titles, _) = scan_disc(vmg, alternates_vts().0);
+    assert_eq!(titles.len(), 8);
+    assert_no_dvd_roster(&titles);
+}
+
+/// Round-3 tests LOW: a title whose cell table is cut, away from the play-all, marks the
+/// scan incomplete (read from the partition's log: its unknown length holds the roster too).
+#[test]
+fn a_cut_title_elsewhere_marks_the_dvd_scan_incomplete() {
+    let (mut vts, at) = alternates_vts();
+    vts.truncate(at[7] + 240 + 10);
+    let ((titles, _), events) = crate::testlog::capture(|| scan_disc(eight_titles_vmg(), vts));
+    assert_eq!(titles.len(), 8);
+    assert!(!titles[6].selection_evidence.segments.is_empty());
+    let held = events
+        .iter()
+        .find(|e| e.field("producer") == Some("dvd-playall-partition-v1"))
+        .expect("the partition logs why it proved nothing");
+    assert_eq!(held.field("complete"), Some("false"));
 }
