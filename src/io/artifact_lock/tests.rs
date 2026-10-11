@@ -168,7 +168,7 @@ fn a_deleted_sidecar_fd_does_not_name_a_recreated_one() {
 
 // Cross-process holder: this binary re-run on `child_helper` (with CHILD_MARKER), which
 // locks in its own process and obeys stdin lines. "hold" prints CHILD:held; "replace"
-// also deletes and retakes the sidecar after "go" (CHILD:replaced).
+// also deletes and retakes the sidecar after "go" (CHILD:replaced); "probe" tries once.
 const CHILD_MARKER: &str = "freemkv-lock-child";
 
 #[test]
@@ -191,6 +191,15 @@ fn child_helper() {
         say("ready");
         cifs_rounds(&out);
         say("done");
+        return;
+    }
+    if mode == "probe" {
+        let probe = take(&out, Duration::from_millis(500));
+        say(match probe {
+            Ok(_) => "took",
+            Err(Error::TimedOut { .. }) => "timed-out",
+            Err(_) => "failed",
+        });
         return;
     }
     let mut lines = io::stdin().lock().lines();
@@ -272,6 +281,20 @@ impl Child {
             }
         }
     }
+    // The next CHILD:<marker> the child prints.
+    #[cfg(unix)]
+    fn next_marker(&mut self) -> String {
+        loop {
+            match self.lines.recv_timeout(Duration::from_secs(20)) {
+                Ok(line) => {
+                    if let Some((_, marker)) = line.split_once("CHILD:") {
+                        return marker.trim_end().to_string();
+                    }
+                }
+                Err(e) => panic!("child printed no marker: {e}"),
+            }
+        }
+    }
     fn send(&mut self) {
         let stdin = self.proc.stdin.as_mut().unwrap();
         stdin.write_all(b"go\n").unwrap();
@@ -340,12 +363,18 @@ fn waiter_must_not_keep_a_replaced_sidecar_with(ids: IdFn, names: &SyncNames<'_>
         reached.fetch_add(1, Ordering::SeqCst);
         ids(f, p)
     };
+    // The waiter retries the lock on the fd it opened, so one refusal means it holds the old file.
+    let tried = std::sync::atomic::AtomicUsize::new(0);
+    let lock = |f: &File| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        os::try_lock_exclusive(f)
+    };
     let done = AtomicBool::new(false);
     thread::scope(|scope| {
         let waiter = scope.spawn(|| {
             let hooks = Hooks {
                 ids: &counted,
-                lock: &os::try_lock_exclusive,
+                lock: &lock,
                 names,
             };
             let lock = ArtifactLock::acquire_full(
@@ -359,7 +388,11 @@ fn waiter_must_not_keep_a_replaced_sidecar_with(ids: IdFn, names: &SyncNames<'_>
             done.store(true, Ordering::SeqCst);
             lock
         });
-        thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        while tried.load(Ordering::SeqCst) == 0 {
+            assert!(t.elapsed() < SLACK * 5, "the waiter never tried the lock");
+            thread::sleep(Duration::from_millis(5));
+        }
         child.send();
         child.wait_for("replaced");
         // The old file is unlocked now, so the waiter reaches the identity check.
@@ -678,7 +711,10 @@ fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
         let f = os::open_rw(&path).unwrap();
         assert!(os::try_lock_exclusive(&f).unwrap());
         let r = os::names_with(&f, &path, &real_write, &read_refused_while_locked, &*relock);
-        assert!(matches!(r, Ok(Proof::Retry(_))), "{case}: {r:?}");
+        assert!(
+            matches!(r, Ok(Proof::Retry(_) | Proof::Fault(_))),
+            "{case}: {r:?}"
+        );
     }
     let mismatch = std::cell::Cell::new(0);
     let read = |p: &Path, max: u64| {
@@ -1022,7 +1058,7 @@ fn live_smb_artifact_lock_recreated_sidecar_has_one_holder() {
         .as_nanos();
     let scratch = Scratch(Path::new(&share).join(format!(".fmkv-lock-{nonce:x}")));
     std::fs::create_dir(&scratch.0).unwrap();
-    let out = scratch.0.join("Movie.mkv");
+    let out = scratch.0.join("Movie.iso");
     let holder = take(&out, WINDOW).expect("first taker");
     let (out2, got) = (out.clone(), std::sync::Arc::new(AtomicBool::new(false)));
     let flag = got.clone();
@@ -1042,8 +1078,102 @@ fn live_smb_artifact_lock_recreated_sidecar_has_one_holder() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    let third = take(&out, Duration::from_millis(500));
-    eprintln!("live: third taker while the waiter holds -> {third:?}");
-    assert!(matches!(third, Err(Error::TimedOut { .. })), "{third:?}");
+    // In another process: an in-process taker would only meet the HELD set.
+    let third = Child::spawn(&scratch.0, "probe").next_marker();
+    eprintln!("live: third taker (child process) while the waiter holds -> {third}");
+    assert_eq!(third, "timed-out");
     waiter.join().unwrap().delete().unwrap();
+}
+
+/// Round-3 LOW: a symlink or a second hard link at `<final>.lock` is foreign: the acquire
+/// waits it out and never truncates or writes the file it reaches.
+#[test]
+#[cfg(unix)]
+fn a_linked_sidecar_is_never_written() {
+    type Link = fn(&Path, &Path) -> io::Result<()>;
+    let links: [(&str, Link); 2] = [
+        ("symlink", |v, l| std::os::unix::fs::symlink(v, l)),
+        ("hard link", |v, l| std::fs::hard_link(v, l)),
+    ];
+    for (kind, link) in links {
+        let (dir, out) = artifact();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        link(&victim, &lock_path(&out)).unwrap();
+        let r = take(&out, Duration::from_millis(300));
+        assert!(matches!(r, Err(Error::TimedOut { .. })), "{kind}: {r:?}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "{kind}");
+    }
+}
+
+/// Round-3 LOW: token IO failing the same way on every fresh attempt, with no holder
+/// seen, is the sidecar's own fault: `IoError` with that errno, long before T10.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_persistent_token_fault_fails_with_its_io_error() {
+    let eio = |_: &File, _: &[u8]| Err(io::Error::from_raw_os_error(libc::EIO));
+    let timed_out = |_: &Path, _: u64| Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+    type Write<'a> = &'a dyn Fn(&File, &[u8]) -> io::Result<()>;
+    type Read<'a> = &'a dyn Fn(&Path, u64) -> io::Result<Vec<u8>>;
+    let cases: [(Write, Read, i32); 2] = [
+        (&eio, &real_read, libc::EIO),
+        (&real_write, &timed_out, libc::ETIMEDOUT),
+    ];
+    for (write, read, code) in cases {
+        let t = Instant::now();
+        let (r, calls) = acquire_with_token_io(write, read);
+        assert!(
+            matches!(&r, Err(Error::IoError { source }) if source.raw_os_error() == Some(code)),
+            "errno {code}: {r:?}"
+        );
+        assert!(calls < 10, "errno {code}: {calls} attempts");
+        assert!(t.elapsed() < WINDOW / 2, "errno {code}: {:?}", t.elapsed());
+    }
+    // Faults that differ from one attempt to the next are not one lasting fault.
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    let alternating = |f: &File, t: &[u8]| match n.fetch_add(1, Ordering::SeqCst) {
+        i if i < 8 => Err(io::Error::from_raw_os_error(
+            [libc::EIO, libc::EACCES][i % 2],
+        )),
+        _ => real_write(f, t),
+    };
+    let (r, calls) = acquire_with_token_io(&alternating, &real_read);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(calls, 9);
+}
+
+/// Round-3 tests LOW: each failed proof's slice waits WAIT_SLICE plus a backoff that
+/// widens as failures accumulate; a holder's slice resets the count.
+#[test]
+fn failed_proof_slices_back_off_and_count_until_a_holder() {
+    let (_dir, out) = artifact();
+    let mut wait = LockWait::new(&out, &[], Duration::from_secs(60));
+    let halt = Halt::new();
+    let e = replaced();
+    let t = Instant::now();
+    for n in 1..=20 {
+        wait.slice(&halt, &e, Cause::Proof).unwrap();
+        assert_eq!(wait.lost, n);
+    }
+    // Mean backoff over these 20 slices is about 1.3 s; 400 ms is ~5 sigma below it.
+    let backed_off = t.elapsed().saturating_sub(WAIT_SLICE * 20);
+    assert!(backed_off >= Duration::from_millis(400), "{backed_off:?}");
+    wait.slice(&halt, &e, Cause::Holder).unwrap();
+    assert_eq!(wait.lost, 0);
+}
+
+/// Round-3 tests NIT: production write_token marks an ftruncate the filesystem can't do
+/// (EINVAL here, from a read-only fd) as unsupported, so the proof falls back.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_token_marks_an_unsupported_truncate() {
+    let (_dir, out) = artifact();
+    std::fs::write(&out, b"").unwrap();
+    let e = os::write_token(&File::open(&out).unwrap(), b"t").unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e:?}");
+    assert_eq!(
+        e.raw_os_error(),
+        None,
+        "wrapped, so token_unavailable takes it"
+    );
 }
