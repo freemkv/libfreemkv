@@ -25,7 +25,16 @@ pub struct DvdInfo {
     /// does NOT play in region n+1 (libdvdread ifo_print.c; mpucoder "byte1=prohibited region
     /// mask"). 0x00 is region-free.
     pub region_mask: u8,
+    /// Each TT_SRPT title's playback type byte, keyed (vts_number, vts_title_num).
+    pub title_playback: std::collections::BTreeMap<(u8, u8), u8>,
+    /// Every title TT_SRPT declares was read: none lost to a cut table, an unusable
+    /// title set or an unparseable PGC.
+    pub complete: bool,
 }
+
+/// TT_SRPT title playback type bit 6, libdvdread ifo_types.h `playback_type_t`
+/// `multi_or_random_pgc_title` ("0: one sequential pgc title"), read MSB first.
+pub(crate) const TT_MULTI_OR_RANDOM_PGC: u8 = 0x40;
 
 /// One title set (VTS_XX_0.IFO).
 #[derive(Debug)]
@@ -76,6 +85,8 @@ pub struct DvdTitle {
     /// The PGC plays its cells in order and stops: sequential playback mode (PGC+0xA2)
     /// and no next-PGC chain (PGC+0x9C). Random, shuffle and chained PGCs do not.
     pub sequential: bool,
+    /// The cell table runs past the IFO: `cells` holds only the leading cells.
+    pub truncated: bool,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -457,13 +468,17 @@ pub(crate) fn parse_vmg_with(
     }
 
     let title_set_map = parse_tt_srpt(vmg_data, tt_srpt_offset)?;
+    let (title_playback, mut complete) = tt_srpt_playback(vmg_data, tt_srpt_offset);
 
     // Parse each VTS IFO
     let mut title_sets = Vec::new();
     let mut skipped = 0usize;
     for (&vts_number, titles_info) in &title_set_map {
         match parse_vts(reader, udf, vts_number, titles_info) {
-            Ok(ts) => title_sets.push(ts),
+            Ok(ts) => {
+                complete &= ts.titles.len() >= titles_info.len();
+                title_sets.push(ts)
+            }
             // Halted means the drive itself stopped, not that this title set is a
             // placeholder — once set, every later parse_vts call also fails, so
             // swallowing it here would silently truncate the scan. Propagate it.
@@ -473,6 +488,7 @@ pub(crate) fn parse_vmg_with(
                 // aren't really there, so one failure isn't fatal — but it must not
                 // be silent, since swallowing it can hide many dropped titles.
                 skipped += 1;
+                complete = false;
                 tracing::warn!(
                     target: "freemkv::scan",
                     vts = vts_number,
@@ -499,7 +515,32 @@ pub(crate) fn parse_vmg_with(
         title_sets,
         chapter_names,
         region_mask: vmg_data[VMG_REGION_MASK_OFFSET],
+        title_playback,
+        complete,
     })
+}
+
+// Each TT_SRPT entry's playback type (first entry wins, as in `parse_tt_srpt`), and
+// whether every declared entry was within the DVD-Video cap and the table.
+fn tt_srpt_playback(
+    vmg_data: &[u8],
+    tt_srpt_offset: usize,
+) -> (std::collections::BTreeMap<(u8, u8), u8>, bool) {
+    let mut types = std::collections::BTreeMap::new();
+    let Ok(declared) = be_u16(vmg_data, tt_srpt_offset) else {
+        return (types, false);
+    };
+    let declared = usize::from(declared);
+    let mut complete = declared <= MAX_TT_SRPT_TITLES;
+    for i in 0..declared.min(MAX_TT_SRPT_TITLES) {
+        let base = tt_srpt_offset + 8 + i * 12;
+        let Some(entry) = vmg_data.get(base..base + 12) else {
+            complete = false;
+            break;
+        };
+        types.entry((entry[6], entry[7])).or_insert(entry[0]);
+    }
+    (types, complete)
 }
 
 // Maximum TT_SRPT entries honoured (DVD-Video's own 99-title cap). The on-disc count is an
@@ -1221,7 +1262,8 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         }
     }
 
-    if cells.len() < num_cells {
+    let truncated = cells.len() < num_cells;
+    if truncated {
         tracing::warn!(
             target: "freemkv::scan",
             declared = num_cells,
@@ -1342,7 +1384,52 @@ pub(crate) fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result
         vts_title_num: 0,
         pgcs: 0,
         ptt_programs: None,
-        sequential: byte_at(data, pgc_offset + 0xA2)? == 0 && be_u16(data, pgc_offset + 0x9C)? == 0,
+        sequential: byte_at(data, pgc_offset + 0xA2)? == 0
+            && be_u16(data, pgc_offset + 0x9C)? == 0
+            && commands_keep_cell_order(data, pgc_offset),
+        truncated,
+    })
+}
+
+/// Whether the PGC's commands (table at PGC+0xE4: pre, post and cell counts, last byte,
+/// then 8-byte commands) leave its cells to play once, in order. Any link, jump or call
+/// in a pre or cell command may skip or leave them; a post command may only end the
+/// title (Exit, or a jump/call to a menu). An unreadable table is not proof.
+fn commands_keep_cell_order(data: &[u8], pgc_offset: usize) -> bool {
+    use crate::dvdnav::vmcmd::{Instr, decode};
+    let Ok(rel) = be_u16(data, pgc_offset + 0xE4) else {
+        return false;
+    };
+    if rel == 0 {
+        return true;
+    }
+    let table = pgc_offset + usize::from(rel);
+    let count = |at| be_u16(data, table + at).map(usize::from);
+    let (Ok(pre), Ok(post), Ok(cell)) = (count(0), count(2), count(4)) else {
+        return false;
+    };
+    let Some(cmds) = data.get(table + 8..table + 8 + (pre + post + cell) * 8) else {
+        return false;
+    };
+    cmds.as_chunks::<8>().0.iter().enumerate().all(|(i, raw)| {
+        let cmd = decode(raw);
+        let post_cmd = (pre..pre + post).contains(&i);
+        match cmd.instr {
+            // Type 1 sub-commands the decoder does not model also read as Nop.
+            Instr::Nop => raw[0] >> 5 != 1 || raw[1] & 0x0F == 0,
+            Instr::Break
+            | Instr::Goto { .. }
+            | Instr::SetGprm { .. }
+            | Instr::SetGprmMd { .. }
+            | Instr::SetSystem => !cmd.link,
+            Instr::Exit
+            | Instr::JumpSsFp
+            | Instr::JumpSsVmgm { .. }
+            | Instr::JumpSsVtsm { .. }
+            | Instr::JumpSsVmgmPgc { .. }
+            | Instr::CallSs { .. } => post_cmd,
+            _ => false,
+        }
     })
 }
 

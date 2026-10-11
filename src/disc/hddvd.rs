@@ -371,6 +371,8 @@ struct XplTitle {
     duration_secs: f64,
     clips: Vec<XplClip>,
     chapters: Vec<f64>,
+    /// Every clip element was kept: none past the per-title cap or naming no `.evo`.
+    complete: bool,
 }
 
 /// Parse an `HH:MM:SS:FF` (or `MM:SS:FF`) title timecode, `FF` in `time_base`
@@ -607,6 +609,8 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .unwrap_or(0.0);
 
         let mut clips = Vec::new();
+        // False once a clip element is cut by the cap or names no `.evo`.
+        let mut complete = true;
         for c in tnode
             .descendants()
             .filter(|n| local(n, "PrimaryAudioVideoClip"))
@@ -615,9 +619,11 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             // `children()`, is needed to reach wrapped clips, but that also
             // means nested `<Title>`s multiply hits, so `break` bounds the walk.
             if clips.len() >= MAX_XPL_CLIPS_PER_TITLE {
+                complete = false;
                 break;
             }
             let Some(evo) = c.attribute("src").and_then(evo_from_src) else {
+                complete = false;
                 continue;
             };
             let begin_secs = c
@@ -660,6 +666,7 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             duration_secs,
             clips,
             chapters,
+            complete,
         });
     }
     titles
@@ -761,8 +768,9 @@ fn compose_xpl_titles(
         let mut extents = Vec::new();
         let mut size_bytes = 0u64;
         let mut parts = Vec::new();
-        // The clip's own range, not the title timeline; None if any clip lacks it.
-        let mut own_range: Option<Vec<Clip>> = Some(Vec::new());
+        // The clip's own range, not the title timeline; None if any clip lacks it or the
+        // playlist's clip list for this title was not kept whole.
+        let mut own_range: Option<Vec<Clip>> = t.complete.then(Vec::new);
         // A crafted clip list can name the same `.evo` any number of times.
         // Mirrors bluray.rs's `seen_clips.insert(...)` gate: push a clip's
         // extents/size only the first time its `.evo` key is seen.

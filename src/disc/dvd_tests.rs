@@ -2182,6 +2182,7 @@ fn title(vts_title_num: u8, pgcs: usize) -> ifo::DvdTitle {
         pgcs,
         ptt_programs: None,
         sequential: true,
+        truncated: false,
     }
 }
 
@@ -2210,6 +2211,8 @@ fn multi_pgc_titles_warn_once_per_disc() {
         ],
         chapter_names: Default::default(),
         region_mask: 0,
+        title_playback: Default::default(),
+        complete: true,
     };
     let vmg = b"multi_pgc_titles_warn_once_per_disc".to_vec();
     let ((), ev) = crate::testlog::capture(|| {
@@ -2231,6 +2234,8 @@ fn multi_pgc_titles_warn_once_per_disc() {
         title_sets: vec![set(1, vec![title(1, 1)])],
         chapter_names: Default::default(),
         region_mask: 0,
+        title_playback: Default::default(),
+        complete: true,
     };
     let ((), ev) = crate::testlog::capture(|| warn_multi_pgc_titles(b"no split", &clear));
     assert!(ev.is_empty(), "{ev:?}");
@@ -2491,4 +2496,218 @@ fn dvd_title_spanning_two_pgcs_has_no_segments_and_no_roster() {
     assert_eq!(titles.len(), 8);
     assert!(titles[6].selection_evidence.segments.is_empty());
     assert!((titles.iter()).all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown));
+}
+
+// ── Roster completeness: anything the scan lost or could not follow holds the roster ──
+
+fn eight_titles_vmg() -> Vec<u8> {
+    build_vmg(&(1..=8).map(|n| (1, 1, n)).collect::<Vec<_>>())
+}
+
+fn assert_no_dvd_roster(titles: &[DiscTitle]) {
+    for t in titles {
+        assert_eq!(
+            t.selection_evidence.episodes,
+            EpisodeEvidence::Unknown,
+            "{}",
+            t.playlist
+        );
+    }
+}
+
+// Scans VIDEO_TS.IFO plus `files`, laid out one per 1000 sectors from 6000.
+fn scan_files(vmg: Vec<u8>, files: Vec<(&str, Vec<u8>)>) -> Vec<DiscTitle> {
+    let mut disc = MemDisc::new();
+    let mut specs = vec![FileSpec {
+        name: "VIDEO_TS.IFO".into(),
+        icb_lba: 60,
+        data_lba: 5000,
+        contents: vmg,
+    }];
+    for (i, (name, contents)) in files.into_iter().enumerate() {
+        specs.push(FileSpec {
+            name: name.into(),
+            icb_lba: 62 + 2 * i as u32,
+            data_lba: 6000 + 1000 * i as u32,
+            contents,
+        });
+    }
+    let udf = build_video_ts_fs(&mut disc, &specs);
+    Disc::scan_dvd_titles(&mut disc, &udf, None)
+        .expect("scan")
+        .0
+}
+
+// A title set whose IFO and BUP are both unusable could hold a competing play-all.
+#[test]
+fn a_lost_title_set_holds_the_dvd_roster() {
+    let mut vmg = build_vmg(
+        &(1..=8)
+            .map(|n| (1, 1, n))
+            .chain([(1, 2, 1)])
+            .collect::<Vec<_>>(),
+    );
+    vmg.truncate(4096);
+    let titles = scan_files(
+        vmg,
+        vec![
+            ("VTS_01_0.IFO", alternates_vts().0),
+            ("VTS_02_0.IFO", vec![0x55; 4096]),
+            ("VTS_02_0.BUP", vec![0x55; 4096]),
+        ],
+    );
+    assert_eq!(titles.len(), 8);
+    assert_no_dvd_roster(&titles);
+}
+
+// TT_SRPT declares a ninth title whose PGC lies past the PGC table.
+#[test]
+fn a_title_past_the_pgc_table_holds_the_dvd_roster() {
+    let vmg = build_vmg(&(1..=9).map(|n| (1, 1, n)).collect::<Vec<_>>());
+    let (titles, _) = scan_disc(vmg, alternates_vts().0);
+    assert_eq!(titles.len(), 8);
+    assert_no_dvd_roster(&titles);
+}
+
+// Title 8's PGC offset points outside the IFO, so its PGC does not parse.
+#[test]
+fn an_unparseable_pgc_holds_the_dvd_roster() {
+    let (mut vts, _) = alternates_vts();
+    vts[4108 + 7 * 8..4112 + 7 * 8].copy_from_slice(&0x8000u32.to_be_bytes());
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert_eq!(titles.len(), 7);
+    assert_no_dvd_roster(&titles);
+}
+
+// Three episodes and their play-all, the play-all last so its cell table can be cut.
+fn playall_last_vts() -> (Vec<u8>, Vec<usize>) {
+    programs_vts(&[
+        vec![(100, 129)],
+        vec![(200, 239)],
+        vec![(300, 319)],
+        vec![(100, 129), (200, 239), (300, 319)],
+    ])
+}
+
+fn four_titles_vmg() -> Vec<u8> {
+    build_vmg(&(1..=4).map(|n| (1, 1, n)).collect::<Vec<_>>())
+}
+
+#[test]
+fn dvd_playall_last_fixture_has_a_roster() {
+    let (titles, _) = scan_disc(four_titles_vmg(), playall_last_vts().0);
+    assert!(
+        (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown),
+        "{titles:?}"
+    );
+}
+
+// The IFO ends inside the play-all's third cell: [ep1, ep2] alone would prove a
+// two-episode roster that leaves episode 3 out.
+#[test]
+fn a_truncated_cell_table_has_no_segments_and_holds_the_dvd_roster() {
+    let (mut vts, at) = playall_last_vts();
+    vts.truncate(at[3] + 240 + 2 * 24 + 10);
+    let (titles, _) = scan_disc(four_titles_vmg(), vts);
+    assert_eq!(titles.len(), 4);
+    assert_eq!(titles[3].extents.len(), 2, "the leading cells are kept");
+    assert!(titles[3].selection_evidence.segments.is_empty());
+    assert_no_dvd_roster(&titles);
+}
+
+#[test]
+fn parse_pgc_flags_a_cut_cell_table() {
+    let (vts, at) = playall_last_vts();
+    let whole = ifo::parse_pgc(&vts, at[3], 1).expect("pgc");
+    assert!(!whole.truncated);
+    let cut = &vts[..at[3] + 240 + 2 * 24 + 10];
+    let t = ifo::parse_pgc(cut, at[3], 1).expect("pgc");
+    assert_eq!(t.cells.len(), 2);
+    assert!(t.truncated);
+}
+
+// TT_SRPT title playback type bit 6 (libdvdread `multi_or_random_pgc_title`).
+#[test]
+fn a_title_not_one_sequential_pgc_has_no_segments_and_no_roster() {
+    let mut vmg = eight_titles_vmg();
+    vmg[2048 + 8 + 6 * 12] = 0x40; // title 7, the play-all
+    let (titles, _) = scan_disc(vmg, alternates_vts().0);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+    assert_no_dvd_roster(&titles);
+}
+
+const LINK_PGCN_8: [u8; 8] = [0x20, 0x04, 0, 0, 0, 0, 0, 8];
+const JUMP_TT_8: [u8; 8] = [0x30, 0x02, 0, 0, 0, 8, 0, 0];
+const CALL_SS_VTSM_ROOT: [u8; 8] = [0x30, 0x08, 0, 0, 1, 0x83, 0, 0];
+const EXIT: [u8; 8] = [0x30, 0x01, 0, 0, 0, 0, 0, 0];
+const SET_GPRM1_5: [u8; 8] = [0x71, 0x00, 0, 1, 0, 5, 0, 0];
+// SetGPRM with a trailing LinkPGCN 8.
+const SET_GPRM1_5_LINK: [u8; 8] = [0x71, 0x04, 0, 1, 0, 5, 0, 8];
+
+// Gives the PGC at `pgc` a command table at IFO byte 9000.
+fn with_commands(vts: &mut [u8], pgc: usize, pre: &[[u8; 8]], post: &[[u8; 8]], cell: &[[u8; 8]]) {
+    const TABLE: usize = 9000;
+    let rel = (TABLE - pgc) as u16;
+    vts[pgc + 0xe4..pgc + 0xe6].copy_from_slice(&rel.to_be_bytes());
+    let n = pre.len() + post.len() + cell.len();
+    vts[TABLE..TABLE + 2].copy_from_slice(&(pre.len() as u16).to_be_bytes());
+    vts[TABLE + 2..TABLE + 4].copy_from_slice(&(post.len() as u16).to_be_bytes());
+    vts[TABLE + 4..TABLE + 6].copy_from_slice(&(cell.len() as u16).to_be_bytes());
+    vts[TABLE + 6..TABLE + 8].copy_from_slice(&((8 + n * 8 - 1) as u16).to_be_bytes());
+    for (i, c) in pre.iter().chain(post).chain(cell).enumerate() {
+        vts[TABLE + 8 + i * 8..TABLE + 16 + i * 8].copy_from_slice(c);
+    }
+}
+
+fn playall_with_commands(pre: &[[u8; 8]], post: &[[u8; 8]], cell: &[[u8; 8]]) -> Vec<DiscTitle> {
+    let (mut vts, at) = alternates_vts();
+    with_commands(&mut vts, at[6], pre, post, cell);
+    scan_disc(eight_titles_vmg(), vts).0
+}
+
+#[test]
+fn a_playall_that_links_or_jumps_on_has_no_segments_and_no_roster() {
+    for (pre, post, cell) in [
+        (&[][..], &[LINK_PGCN_8][..], &[][..]),
+        (&[], &[JUMP_TT_8], &[]),
+        (&[], &[SET_GPRM1_5_LINK], &[]),
+        (&[JUMP_TT_8], &[], &[]),
+        (&[CALL_SS_VTSM_ROOT], &[], &[]),
+        (&[], &[], &[LINK_PGCN_8]),
+        (&[], &[], &[CALL_SS_VTSM_ROOT]),
+        (&[], &[], &[[0x80, 0, 0, 0, 0, 0, 0, 0]]), // type 4: set and link
+    ] {
+        let titles = playall_with_commands(pre, post, cell);
+        let case = format!("pre {pre:?} post {post:?} cell {cell:?}");
+        assert!(titles[6].selection_evidence.segments.is_empty(), "{case}");
+        assert_no_dvd_roster(&titles);
+    }
+}
+
+// Ending the title for a menu or a stop, and setting registers, keep the cells in order.
+#[test]
+fn a_playall_that_returns_to_the_menu_keeps_its_roster() {
+    let titles = playall_with_commands(
+        &[SET_GPRM1_5],
+        &[SET_GPRM1_5, CALL_SS_VTSM_ROOT, EXIT],
+        &[SET_GPRM1_5],
+    );
+    assert!(!titles[6].selection_evidence.segments.is_empty());
+    assert!((titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown));
+}
+
+// An interleaved cell whose unit chain can't be followed is read whole: not exact content.
+#[test]
+fn an_interleaved_cell_read_whole_has_no_segments() {
+    let (mut vts, at) = alternates_vts();
+    vts[at[6] + 240 + 24] = 0x04; // the play-all's second cell is interleaved
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert_eq!(
+        titles[6].extents.len(),
+        3,
+        "the whole cell range is still read"
+    );
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert_no_dvd_roster(&titles);
 }

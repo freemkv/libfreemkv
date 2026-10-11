@@ -46,6 +46,22 @@ fn tt_srpt_title_count_is_capped_and_deduplicated() {
     );
 }
 
+// The playback type per title, and whether the table held every declared title.
+#[test]
+fn tt_srpt_playback_reads_each_type_and_flags_a_lost_entry() {
+    let mut data = tt_srpt_bytes(2, &[(1, 1, 1), (1, 1, 2)]);
+    data[8 + 12] = TT_MULTI_OR_RANDOM_PGC;
+    let (types, complete) = tt_srpt_playback(&data, 0);
+    assert!(complete);
+    assert_eq!(types.get(&(1, 1)), Some(&0));
+    assert_eq!(types.get(&(1, 2)), Some(&TT_MULTI_OR_RANDOM_PGC));
+    // Cut inside the second entry, or declaring more than the format allows.
+    assert!(!tt_srpt_playback(&data[..8 + 18], 0).1);
+    let entries = vec![(1, 1, 1); 100];
+    assert!(tt_srpt_playback(&tt_srpt_bytes(99, &entries), 0).1);
+    assert!(!tt_srpt_playback(&tt_srpt_bytes(100, &entries), 0).1);
+}
+
 #[test]
 fn tt_srpt_admits_a_full_99_title_disc() {
     // The DVD-Video maximum must still parse in full: 99 distinct titles
@@ -989,6 +1005,7 @@ fn feature_filter_noop_on_plain_feature() {
         pgcs: 1,
         ptt_programs: None,
         sequential: true,
+        truncated: false,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert_eq!(t.feature_cells().len(), 3);
@@ -1016,6 +1033,7 @@ fn feature_filter_drops_leading_secondary_block_cells() {
         pgcs: 1,
         ptt_programs: None,
         sequential: true,
+        truncated: false,
     };
     assert_eq!(t.feature_start_cell(), 2);
     let fc = t.feature_cells();
@@ -1039,6 +1057,7 @@ fn feature_filter_never_empties_title() {
         pgcs: 1,
         ptt_programs: None,
         sequential: true,
+        truncated: false,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert_eq!(t.feature_cells().len(), 2);
@@ -1059,6 +1078,7 @@ fn feature_filter_empty_cells() {
         pgcs: 1,
         ptt_programs: None,
         sequential: true,
+        truncated: false,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert!(t.feature_cells().is_empty());

@@ -1516,6 +1516,7 @@ fn compose_xpl_titles_drops_a_title_naming_an_absent_clip() {
         duration_secs: 20.0,
         clips: vec![clip("a.evo", 0.0, 10.0), clip("gone.evo", 10.0, 20.0)],
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(
@@ -1772,6 +1773,7 @@ fn compose_xpl_titles_clamps_a_reversed_clip_duration_and_names_by_number() {
             clip_begin_secs: None,
         }],
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(
@@ -1875,6 +1877,7 @@ fn compose_xpl_titles_drops_a_title_naming_an_unusable_clip() {
             },
         ],
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(&mut disc, &xpl_titles, &clip_extents, &unusable, None)
@@ -1941,6 +1944,7 @@ fn compose_xpl_titles_sums_sizes_and_computes_in_out_times() {
             },
         ],
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(
@@ -2011,6 +2015,7 @@ fn compose_xpl_titles_leaves_segments_empty_without_clip_time_begin() {
             clip_begin_secs: None,
         }],
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(
@@ -2086,6 +2091,7 @@ fn compose_xpl_titles_saturates_absurd_disc_declared_clip_sizes() {
             },
         ],
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(
@@ -2148,6 +2154,7 @@ fn compose_xpl_titles_dedups_repeated_clip_references_by_evo() {
         duration_secs: REPEATS as f64,
         clips,
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(
@@ -2234,6 +2241,7 @@ fn compose_xpl_titles_resolves_all_distinct_clips_despite_dedup() {
             },
         ],
         chapters: vec![],
+        complete: true,
     }];
     let mut disc = MemDisc::new();
     let titles = compose_xpl_titles(
@@ -2742,4 +2750,94 @@ fn scan_hddvd_titles_keeps_every_clip_of_a_realistic_disc() {
         4,
         "a real disc's clips must survive the cap untouched"
     );
+}
+
+// ── Exact content segments need the whole clip list ──
+
+fn two_clip_extents() -> BTreeMap<String, (String, u64, Vec<Extent>)> {
+    [("a.evo", "A.EVO", 1), ("b.evo", "B.EVO", 2)]
+        .into_iter()
+        .map(|(key, name, lba)| {
+            let extent = Extent {
+                start_lba: lba,
+                sector_count: 1,
+            };
+            (key.to_string(), (name.to_string(), 1000u64, vec![extent]))
+        })
+        .collect()
+}
+
+fn xpl_clip(evo: &str, begin_secs: f64, clip_begin_secs: Option<f64>) -> XplClip {
+    XplClip {
+        evo: evo.to_string(),
+        begin_secs,
+        end_secs: begin_secs + 3.0,
+        clip_begin_secs,
+    }
+}
+
+fn composed_segments(clips: Vec<XplClip>, complete: bool) -> Vec<ContentSegment> {
+    let xpl_titles = vec![XplTitle {
+        number: 1,
+        name: "T".to_string(),
+        duration_secs: 10.0,
+        clips,
+        chapters: vec![],
+        complete,
+    }];
+    let mut disc = MemDisc::new();
+    let set = std::collections::HashSet::new();
+    let titles = compose_xpl_titles(&mut disc, &xpl_titles, &two_clip_extents(), &set, None)
+        .expect("compose");
+    assert_eq!(titles.len(), 1);
+    titles[0].selection_evidence.segments.clone()
+}
+
+// One clip without clipTimeBegin leaves the whole title undescribed, not just that clip.
+#[test]
+fn compose_xpl_titles_leaves_segments_empty_when_one_clip_lacks_clip_time_begin() {
+    let both = vec![
+        xpl_clip("a.evo", 0.0, Some(0.0)),
+        xpl_clip("b.evo", 3.0, Some(0.0)),
+    ];
+    assert_eq!(composed_segments(both, true).len(), 2);
+    let partial = vec![
+        xpl_clip("a.evo", 0.0, Some(0.0)),
+        xpl_clip("b.evo", 3.0, None),
+    ];
+    assert!(composed_segments(partial, true).is_empty());
+}
+
+#[test]
+fn compose_xpl_titles_leaves_segments_empty_for_an_incomplete_clip_list() {
+    let both = vec![
+        xpl_clip("a.evo", 0.0, Some(0.0)),
+        xpl_clip("b.evo", 3.0, Some(0.0)),
+    ];
+    assert!(composed_segments(both, false).is_empty());
+}
+
+#[test]
+fn parse_xpl_titles_marks_a_title_cut_at_the_clip_cap() {
+    let at_cap = parse_xpl_titles(nested_title_xpl(1, MAX_XPL_CLIPS_PER_TITLE, 0).as_bytes());
+    assert!(at_cap[0].complete);
+    let past = parse_xpl_titles(nested_title_xpl(1, MAX_XPL_CLIPS_PER_TITLE + 1, 0).as_bytes());
+    assert_eq!(past[0].clips.len(), MAX_XPL_CLIPS_PER_TITLE);
+    assert!(!past[0].complete);
+}
+
+#[test]
+fn parse_xpl_titles_marks_a_title_with_a_clip_naming_no_evo() {
+    let xpl = r#"<Playlist><TitleSet timeBase="60fps">
+            <Title titleNumber="1" titleDuration="00:00:10:00">
+              <PrimaryAudioVideoClip titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:05:00" clipTimeBegin="00:00:00:00" src="file:///x/A.MAP"/>
+              <PrimaryAudioVideoClip titleTimeBegin="00:00:05:00" titleTimeEnd="00:00:10:00" clipTimeBegin="00:00:00:00" src="file:///x/"/>
+            </Title>
+            <Title titleNumber="2" titleDuration="00:00:05:00">
+              <PrimaryAudioVideoClip titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:05:00" clipTimeBegin="00:00:00:00" src="file:///x/A.MAP"/>
+            </Title></TitleSet></Playlist>"#;
+    let titles = parse_xpl_titles(xpl.as_bytes());
+    assert_eq!(titles[0].clips.len(), 1);
+    assert!(!titles[0].complete);
+    assert!(titles[1].complete);
 }
