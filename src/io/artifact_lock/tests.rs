@@ -1286,7 +1286,7 @@ fn a_holder_wait_resets_the_fault_run() {
     let mut wait = LockWait::new(&out, &[], Duration::from_secs(60));
     let halt = Halt::new();
     let e = io::Error::from(io::ErrorKind::TimedOut);
-    let fail = |wait: &mut LockWait, n: u32| (0..n).map(|_| wait.persists(&e)).any(|p| p);
+    let fail = |wait: &mut LockWait, n: u32| (0..n).any(|_| wait.persists(&e));
     assert!(!fail(&mut wait, FAULT_REPEATS - 1));
     wait.slice(&halt, &e, Cause::Fault).unwrap();
     assert!(fail(&mut wait, 1), "a fault slice keeps the run");
