@@ -3010,3 +3010,14 @@ fn a_title_whose_part_list_is_unreadable_has_no_segments() {
     assert!(titles[7].selection_evidence.segments.is_empty());
     assert!(!titles[0].selection_evidence.segments.is_empty());
 }
+
+/// Round-4 MEDIUM: an unreadable part list bounds nothing the title can play, so the
+/// undescribed title holds the roster rather than being measured by its first PGC.
+#[test]
+fn a_title_whose_part_list_is_unreadable_holds_the_dvd_roster() {
+    let (mut vts, _) = alternates_vts();
+    with_unreadable_last_parts(&mut vts);
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert_eq!(titles.len(), 8);
+    assert_no_dvd_roster(&titles);
+}

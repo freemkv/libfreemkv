@@ -2348,3 +2348,15 @@ fn command_flow_fails_closed_on_what_it_cannot_read() {
     // The cell runs command 2 of a one-command list.
     assert_eq!(command_flow_in_order(&pgc(0x100, 1, 1, 2), 0), None);
 }
+
+// ── Title reach ──────────────────────────────────────────────────────
+
+// A title whose part list is unreadable or empty spans unknown PGCs: its reach is unknown.
+#[test]
+fn title_reach_without_a_readable_part_list_is_unknown() {
+    let pgc = build_pgc(bcd_secs(30), &[(0x00, bcd_secs(30), 0, 9)], &[1], None);
+    let data = build_pgcit(&[pgc]);
+    assert!(title_reach(&data, 0, 1, Some(&[(1, 1)])).is_some());
+    assert!(title_reach(&data, 0, 1, None).is_none());
+    assert!(title_reach(&data, 0, 1, Some(&[])).is_none());
+}

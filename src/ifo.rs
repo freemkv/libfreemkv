@@ -94,7 +94,7 @@ pub struct DvdTitle {
     pub mapped: bool,
     /// The most the title can play, `(seconds, sectors)`: every PGC its parts name and
     /// their next-PGC chains, once each. `None` when that bounds nothing (loops, branches,
-    /// random play, a cut table, a guessed PGC).
+    /// random play, a cut table, a guessed PGC, an unreadable part list).
     pub reach: Option<(f64, u64)>,
 }
 
@@ -1120,22 +1120,18 @@ fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
 // PGCs a title's reach may span; past this it is unknown (bounds hostile chains).
 const MAX_REACH_PGCS: usize = 256;
 
-// `DvdTitle::reach`: the PGCs the parts name (else `first`, 0-based) and their NextPGCN
+// `DvdTitle::reach`: the PGCs the parts name (none read: unknown) and their NextPGCN
 // chains, each in cell order (PGC mode 0), uncut, with commands that never leave it, the
 // chains acyclic, and no part links between PGCs.
 fn title_reach(
     data: &[u8],
     pgcit_offset: usize,
     num_pgcs: usize,
-    first: usize,
     parts: Option<&[(u16, u16)]>,
 ) -> Option<(f64, u64)> {
-    let mut pgcs: Vec<usize> = match parts {
-        Some(parts) if !parts.is_empty() => (parts.iter())
-            .map(|&(pgcn, _)| usize::from(pgcn).checked_sub(1))
-            .collect::<Option<_>>()?,
-        _ => vec![first],
-    };
+    let mut pgcs: Vec<usize> = (parts.filter(|parts| !parts.is_empty())?.iter())
+        .map(|&(pgcn, _)| usize::from(pgcn).checked_sub(1))
+        .collect::<Option<_>>()?;
     pgcs.sort_unstable();
     pgcs.dedup();
     let mut next = std::collections::HashMap::new();
@@ -1227,9 +1223,8 @@ pub(crate) fn parse_pgcit(
         // Warned once per disc by the DVD scan, which sees every title set.
         let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
         let parts = ptt_srpt_parts(data, ptt_offset, vts_title_num);
-        let reach = mapped.and_then(|first| {
-            title_reach(data, pgcit_offset, num_pgcs.into(), first, parts.as_deref())
-        });
+        let reach =
+            mapped.and_then(|_| title_reach(data, pgcit_offset, num_pgcs.into(), parts.as_deref()));
         // The program each chapter starts at, when every chapter lies in this PGC.
         let ptt_programs = parts.map(|parts| {
             match parts
