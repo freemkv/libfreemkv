@@ -15,7 +15,6 @@ use crate::mux::videomap::{
 use crate::pes::{PesFrame, PesSink};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
 
 /// Write the FVI header row into `w`.
 fn write_fvi_header(w: &mut dyn Write, h: &MapHeader) -> io::Result<()> {
@@ -122,17 +121,16 @@ pub struct FviSink {
 }
 
 impl FviSink {
-    /// Create the sink at `path`, assembling the header from `title`'s primary
-    /// video stream.
+    /// Create the sink writing `file`, its destination, assembling the header from `title`'s
+    /// primary video stream.
     ///
     /// `source` records where the index was built FROM — the input medium, URL, title index and
     /// (when known) playlist / volume id. It is carried verbatim into the header's `source`
-    /// object, which describes the INPUT, never `path` (the destination this sink writes). A
-    /// caller with no provenance to declare passes `SourceInfo::default()`; the empty members
-    /// are then omitted from the header rather than guessed.
-    pub fn create(path: &Path, title: &DiscTitle, source: SourceInfo) -> io::Result<Self> {
-        let file = File::create(path)?;
-        Ok(Self::with_writer(Box::new(file), title, source))
+    /// object, which describes the INPUT, never the destination this sink writes. A caller
+    /// with no provenance to declare passes `SourceInfo::default()`; the empty members are
+    /// then omitted from the header rather than guessed.
+    pub fn create(file: File, title: &DiscTitle, source: SourceInfo) -> Self {
+        Self::with_writer(Box::new(file), title, source)
     }
 
     fn with_writer(w: Box<dyn Write + Send>, title: &DiscTitle, source: SourceInfo) -> Self {

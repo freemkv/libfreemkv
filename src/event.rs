@@ -30,7 +30,13 @@ pub enum Event<'a> {
     BytesDurable { bytes: u64, total: u64 },
     /// The output opened for `title` as it will be written: streams the sink refused are
     /// left out (indices compact); `MuxOutcome::undelivered_streams` keeps source indices.
-    OutputOpened { title: &'a DiscTitle },
+    /// `file` is the opened file's identity, read from the sink's handle
+    /// ([`file_identity_of`](crate::io::artifact_lock::file_identity_of)); `None` for a
+    /// non-file sink or when that fstat failed.
+    OutputOpened {
+        title: &'a DiscTitle,
+        file: Option<(u64, u64)>,
+    },
 }
 
 /// Why the adaptive batch sizer changed size.

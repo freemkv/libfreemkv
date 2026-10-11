@@ -1,7 +1,6 @@
 mkv outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
 mkv out o.mkv = 58232 bytes sha256:b25ee88e8f6935e99acf42fd476cc71d
 mp4 refused = E9048
-mp4 out o.mp4 = 0 bytes sha256:e3b0c44298fc1c149afbf4c8996fb924
 mpg outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]
 mpg out o.mpg = 206852 bytes sha256:1fb67e840822afec9eab312490f39458
 m2ts outcome = completed=true opened=true bytes=54504 errors=0 lost=0 streams=3 undelivered=[]

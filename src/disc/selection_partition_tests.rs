@@ -575,7 +575,11 @@ fn an_undescribed_title_is_measured_by_its_reach() {
         annotate(&mut titles, "dvd-playall-partition-v1", true, reach);
         titles
     };
-    let at_most = |secs, sectors| Reach::AtMost { secs, sectors };
+    let at_most = |secs, sectors| Reach::AtMost {
+        secs,
+        sectors,
+        beyond: Vec::new(),
+    };
     assert_unknown(&with(&[Reach::Unknown]));
     assert_unknown(&with(&[at_most(0.0, 200)]));
     for reach in [&[][..], &[at_most(0.0, 30)]] {
@@ -585,4 +589,66 @@ fn an_undescribed_title_is_measured_by_its_reach() {
             &[(11, 0), (12, 1), (13, 2)],
         );
     }
+}
+
+// An undescribed title's reach past its extents counts for the overlap rule too.
+#[test]
+fn an_undescribed_title_overlapping_the_roster_past_its_extents_holds_it() {
+    let extras = [(1000, 1009), (1100, 1109), (1200, 1209)];
+    let mut titles: Vec<_> = (extras.iter().enumerate())
+        .map(|(i, &c)| dvd(i as u16 + 11, &[c]))
+        .collect();
+    titles.push(dvd(20, &extras));
+    let mut first_pgc = dvd(1, &[(100, 104)]);
+    first_pgc.selection_evidence.segments.clear();
+    titles.insert(0, first_pgc);
+    let with = |beyond: Vec<(u64, u64)>| {
+        let mut titles = titles.clone();
+        let reach = [Reach::AtMost {
+            secs: 0.0,
+            sectors: 20,
+            beyond,
+        }];
+        annotate(&mut titles, "dvd-playall-partition-v1", true, &reach);
+        titles
+    };
+    assert_unknown(&with(vec![(1105, 1115)]));
+    assert_roster(
+        &with(vec![(1110, 1120)]),
+        "dvd-playall-partition-v1:20",
+        &[(11, 0), (12, 1), (13, 2)],
+    );
+}
+
+/// Round-4 tests LOW: a reach longer in time alone, or in sectors alone, than the
+/// 100 s, 30-sector play-all holds the roster.
+#[test]
+fn a_reach_longer_by_time_or_by_sectors_alone_holds_the_roster() {
+    let extras = [(1000, 1009), (1100, 1109), (1200, 1209)];
+    let mut titles: Vec<_> = (extras.iter().enumerate())
+        .map(|(i, &c)| dvd(i as u16 + 11, &[c]))
+        .collect();
+    let mut playall = dvd(20, &extras);
+    playall.duration_secs = 100.0;
+    titles.push(playall);
+    let mut first_pgc = dvd(1, &[(100, 104)]);
+    first_pgc.selection_evidence.segments.clear();
+    titles.insert(0, first_pgc);
+    let with = |secs, sectors| {
+        let mut titles = titles.clone();
+        let reach = [Reach::AtMost {
+            secs,
+            sectors,
+            beyond: Vec::new(),
+        }];
+        annotate(&mut titles, "dvd-playall-partition-v1", true, &reach);
+        titles
+    };
+    assert_unknown(&with(150.0, 10));
+    assert_unknown(&with(50.0, 40));
+    assert_roster(
+        &with(50.0, 10),
+        "dvd-playall-partition-v1:20",
+        &[(11, 0), (12, 1), (13, 2)],
+    );
 }

@@ -200,6 +200,11 @@ impl WritebackFile {
         }
     }
 
+    /// The wrapped file's identity, from its handle (see `file_identity_of`).
+    pub(crate) fn identity(&self) -> io::Result<(u64, u64)> {
+        crate::io::artifact_lock::file_identity_of(&self.file)
+    }
+
     /// Create a new file at `path` (truncating any existing contents)
     /// and wrap it. Convenience for the common
     /// `File::create(path)` + `WritebackFile::new(file)` pair so callers

@@ -610,7 +610,8 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             .unwrap_or(0.0);
 
         let mut clips = Vec::new();
-        // False once a clip element is cut by the cap, names no `.evo` or lacks a title time.
+        // False once a clip element is cut by the cap, names no `.evo` or lacks a title time
+        // (or ends at or before its begin).
         let mut complete = true;
         for c in tnode
             .descendants()
@@ -633,8 +634,8 @@ fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
             let end = c
                 .attribute("titleTimeEnd")
                 .and_then(|s| parse_timecode(s, time_base));
-            // Without both title times the clip's length is a guess: no exact segments.
-            complete &= begin.is_some() && end.is_some();
+            // Without both title times, the end after the begin, the clip's length is a guess.
+            complete &= matches!((begin, end), (Some(b), Some(e)) if e > b);
             let begin_secs = begin.unwrap_or(0.0);
             let end_secs = end.unwrap_or(begin_secs);
             let clip_begin_secs = c

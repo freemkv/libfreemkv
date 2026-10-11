@@ -373,6 +373,7 @@ fn waiter_must_not_keep_a_replaced_sidecar_with(ids: IdFn, names: &SyncNames<'_>
     thread::scope(|scope| {
         let waiter = scope.spawn(|| {
             let hooks = Hooks {
+                stat: &|f| f.metadata(),
                 ids: &counted,
                 lock: &lock,
                 names,
@@ -479,6 +480,7 @@ fn cifs_rounds(out: &Path) {
     let names =
         |f: &File, p: &Path, relock: &Lock<'_>| os::names_with(f, p, &real_write, &slow, relock);
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &|f, p| (os::file_id(f), os::path_id(p)),
         lock: &os::try_lock_exclusive,
         names: &names,
@@ -520,6 +522,11 @@ fn acquire_with_token_io(
     acquire_at_with_token_io(&out, write, read)
 }
 
+// Far past any sum of slices and backoffs these runs take: their outcome is decided by
+// attempt counts, never by the clock.
+#[cfg(unix)]
+const TOKEN_WINDOW: Duration = Duration::from_secs(10);
+
 #[cfg(unix)]
 fn acquire_at_with_token_io(
     out: &Path,
@@ -532,11 +539,12 @@ fn acquire_at_with_token_io(
         os::names_with(f, p, write, read, relock)
     };
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &|f, p| (os::file_id(f), os::path_id(p)),
         lock: &os::try_lock_exclusive,
         names: &names,
     };
-    let r = ArtifactLock::acquire_full(out, &[], &Halt::new(), WINDOW, &hooks);
+    let r = ArtifactLock::acquire_full(out, &[], &Halt::new(), TOKEN_WINDOW, &hooks);
     (r, calls.load(Ordering::SeqCst))
 }
 
@@ -673,6 +681,7 @@ fn a_sidecar_replaced_during_the_unlocked_proof_is_not_ours() {
         os::names_with(f, p, &real_write, &read_refused_while_locked, &relock)
     };
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &|f, p| (os::file_id(f), os::path_id(p)),
         lock: &os::try_lock_exclusive,
         names: &names,
@@ -686,6 +695,8 @@ fn a_sidecar_replaced_during_the_unlocked_proof_is_not_ours() {
     );
 }
 
+/// Round-4 tests LOW: a second holder taking the lock is contention (`Retry`); a lock
+/// error is the sidecar's fault (`Fault`, counted toward FAULT_REPEATS).
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
@@ -693,11 +704,13 @@ fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
     let path = lock_path(&out);
     type Relock = Box<dyn Fn(&File) -> io::Result<bool>>;
     let foreign = path.clone();
-    let cases: [(&str, Relock); 3] = [
-        ("relock refused", Box::new(|_| Ok(false))),
+    // (case, relock, whether the verdict is a fault rather than a retry)
+    let cases: [(&str, Relock, bool); 3] = [
+        ("relock refused", Box::new(|_| Ok(false)), false),
         (
             "relock error",
             Box::new(|_| Err(io::Error::from_raw_os_error(libc::ENOLCK))),
+            true,
         ),
         (
             "another acquirer wrote the file while ours was released",
@@ -705,16 +718,20 @@ fn the_unlocked_proof_retries_unless_relock_and_token_both_hold() {
                 std::fs::write(&foreign, b"another:token\n").unwrap();
                 os::try_lock_exclusive(f)
             }),
+            false,
         ),
     ];
-    for (case, relock) in cases {
+    for (case, relock, fault) in cases {
         let f = os::open_rw(&path).unwrap();
         assert!(os::try_lock_exclusive(&f).unwrap());
         let r = os::names_with(&f, &path, &real_write, &read_refused_while_locked, &*relock);
-        assert!(
-            matches!(r, Ok(Proof::Retry(_) | Proof::Fault(_))),
-            "{case}: {r:?}"
-        );
+        match fault {
+            true => assert!(
+                matches!(&r, Ok(Proof::Fault(e)) if e.raw_os_error() == Some(libc::ENOLCK)),
+                "{case}: {r:?}"
+            ),
+            false => assert!(matches!(r, Ok(Proof::Retry(_))), "{case}: {r:?}"),
+        }
     }
     let mismatch = std::cell::Cell::new(0);
     let read = |p: &Path, max: u64| {
@@ -823,6 +840,7 @@ fn an_expiry_names_a_failing_proof_apart_from_a_holder() {
     let real_ids = |f: &File, p: &Path| (os::file_id(f), os::path_id(p));
     let never = |_: &File, _: &Path, _: &Lock<'_>| Ok(Proof::Retry(replaced()));
     let hooks = Hooks {
+        stat: &|f| f.metadata(),
         ids: &real_ids,
         lock: &os::try_lock_exclusive,
         names: &never,
@@ -1120,14 +1138,12 @@ fn a_persistent_token_fault_fails_with_its_io_error() {
         (&real_write, &timed_out, libc::ETIMEDOUT),
     ];
     for (write, read, code) in cases {
-        let t = Instant::now();
         let (r, calls) = acquire_with_token_io(write, read);
         assert!(
             matches!(&r, Err(Error::IoError { source }) if source.raw_os_error() == Some(code)),
             "errno {code}: {r:?}"
         );
-        assert!(calls < 10, "errno {code}: {calls} attempts");
-        assert!(t.elapsed() < WINDOW / 2, "errno {code}: {:?}", t.elapsed());
+        assert_eq!(calls, FAULT_REPEATS as usize, "errno {code}");
     }
     // Faults that differ from one attempt to the next are not one lasting fault.
     let n = std::sync::atomic::AtomicUsize::new(0);
@@ -1176,4 +1192,107 @@ fn write_token_marks_an_unsupported_truncate() {
         None,
         "wrapped, so token_unavailable takes it"
     );
+}
+
+/// Round-4 LOW: an fstat failing on the freshly opened sidecar is an IO fault, as in the
+/// identity check: `IoError` at once, never waited out as a holder until T10.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_sidecar_fstat_failure_is_an_io_error_not_a_holder() {
+    let (_dir, out) = artifact();
+    let ids = |f: &File, p: &Path| (os::file_id(f), os::path_id(p));
+    let eio = |_: &File| Err(io::Error::from_raw_os_error(libc::EIO));
+    let hooks = Hooks {
+        stat: &eio,
+        ids: &ids,
+        lock: &os::try_lock_exclusive,
+        names: &os::names_this_file,
+    };
+    let t = Instant::now();
+    let r = ArtifactLock::acquire_full(&out, &[], &Halt::new(), WINDOW, &hooks);
+    assert!(
+        matches!(&r, Err(Error::IoError { source }) if source.raw_os_error() == Some(libc::EIO)),
+        "{r:?}"
+    );
+    assert!(t.elapsed() < WINDOW / 2, "{:?}", t.elapsed());
+    // Gone or stale (another client deleted it) retries, as the identity check does.
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    let once = |f: &File| match n.fetch_add(1, Ordering::SeqCst) {
+        0 => Err(io::Error::from(io::ErrorKind::NotFound)),
+        _ => f.metadata(),
+    };
+    let hooks = Hooks {
+        stat: &once,
+        ..hooks
+    };
+    let r = ArtifactLock::acquire_full(&out, &[], &Halt::new(), WINDOW, &hooks);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(n.load(Ordering::SeqCst), 2);
+}
+
+/// Round-4 LOW: a FIFO or symlink renamed over the sidecar after it was locked neither
+/// blocks the token read-back nor passes it.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_fifo_or_symlink_over_the_sidecar_never_blocks_the_read_back() {
+    use std::os::unix::ffi::OsStrExt;
+    type Swap = fn(&Path, &Path);
+    let swaps: [(&str, Swap); 2] = [
+        ("fifo", |dir, path| {
+            let fifo = dir.join("fifo");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            std::fs::rename(&fifo, path).unwrap();
+        }),
+        ("symlink", |dir, path| {
+            // A copy of the sidecar, token included, reached through a symlink.
+            let copy = dir.join("copy");
+            std::fs::copy(path, &copy).unwrap();
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&copy, &link).unwrap();
+            std::fs::rename(&link, path).unwrap();
+        }),
+    ];
+    for (kind, swap) in swaps {
+        let (dir, out) = artifact();
+        let path = lock_path(&out);
+        let f = os::open_rw(&path).unwrap();
+        assert!(os::try_lock_exclusive(&f).unwrap());
+        let dir = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let write = |f: &File, token: &[u8]| {
+                os::write_token(f, token)?;
+                swap(&dir, &path);
+                Ok(())
+            };
+            let read = |p: &Path, max: u64| os::read_back(p, max);
+            let r = os::names_with(&f, &path, &write, &read, &os::try_lock_exclusive);
+            let _ = tx.send(format!("{r:?}"));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{kind}: the read-back blocked"));
+        assert!(r.starts_with("Ok(Retry("), "{kind}: {r}");
+    }
+}
+
+/// Round-4 tests LOW: a holder (or failed-proof) wait between faults resets the run, so
+/// only FAULT_REPEATS faults in a row, with no holder seen, end the acquire.
+#[test]
+fn a_holder_wait_resets_the_fault_run() {
+    let (_dir, out) = artifact();
+    let mut wait = LockWait::new(&out, &[], Duration::from_secs(60));
+    let halt = Halt::new();
+    let e = io::Error::from(io::ErrorKind::TimedOut);
+    let fail = |wait: &mut LockWait, n: u32| (0..n).any(|_| wait.persists(&e));
+    assert!(!fail(&mut wait, FAULT_REPEATS - 1));
+    wait.slice(&halt, &e, Cause::Fault).unwrap();
+    assert!(fail(&mut wait, 1), "a fault slice keeps the run");
+    for cause in [Cause::Holder, Cause::Proof] {
+        wait.slice(&halt, &e, cause).unwrap();
+        assert!(!fail(&mut wait, FAULT_REPEATS - 1));
+        assert!(fail(&mut wait, 1));
+    }
 }

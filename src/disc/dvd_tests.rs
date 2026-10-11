@@ -2896,10 +2896,11 @@ fn a_navigation_timer_has_no_segments_and_no_roster() {
     }
 }
 
-/// Round-3 LOW: a pre command that always skips the first program or cell plays less
-/// than the PGC; only conditional entry links (chapter-select ladders) keep segments.
+/// Round-3 LOW: an unconditional entry link keeps segments only when it names program 1
+/// or cell 1 itself (LinkPGN 1, LinkCN 1). Any other, LinkPTTN 1 included (where part 1
+/// starts is not resolved here), fails closed; conditional ladders keep segments.
 #[test]
-fn an_unconditional_entry_link_past_the_start_has_no_segments() {
+fn an_unconditional_entry_link_not_naming_the_first_program_or_cell_has_no_segments() {
     let link_pgn = |n| [0x20, 0x06, 0, 0, 0, 0, 0, n];
     let link_cn = |n| [0x20, 0x07, 0, 0, 0, 0, 0, n];
     let goto_3_unless_1 = [0x00, 0xb1, 0, 0, 0, 1, 0, 3];
@@ -2908,7 +2909,7 @@ fn an_unconditional_entry_link_past_the_start_has_no_segments() {
         vec![link_cn(2)],
         vec![[0x20, 0x01, 0, 0, 0, 0, 0, 1]], // LinkTopC
         vec![[0x20, 0x01, 0, 0, 0, 0, 0, 5]], // LinkTopPG
-        vec![link_pttn(1)],
+        vec![link_pttn(1)], // part 1 starts at program 1, yet unresolved: fails closed
         vec![[0x71, 0x06, 0, 1, 0, 5, 0, 2]], // SetGPRM, then LinkPGN 2
         // Both paths reach the LinkPGN 2 on line 3.
         vec![goto_3_unless_1, SET_GPRM1_5, link_pgn(2)],
@@ -2990,4 +2991,113 @@ fn a_cut_title_elsewhere_marks_the_dvd_scan_incomplete() {
         .find(|e| e.field("producer") == Some("dvd-playall-partition-v1"))
         .expect("the partition logs why it proved nothing");
     assert_eq!(held.field("complete"), Some("false"));
+}
+
+// ── Round 4: unreadable part lists, what an undescribed title can play ──
+
+// Title 8 (the last) keeps a readable first part, but VTS_PTT_SRPT's last byte runs past the
+// IFO, so the rest of its part list cannot be read.
+fn with_unreadable_last_parts(vts: &mut [u8]) {
+    vts[2052..2056].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes());
+}
+
+/// Round-4 MEDIUM: an unreadable part list proves no PGC count, so no segments.
+#[test]
+fn a_title_whose_part_list_is_unreadable_has_no_segments() {
+    let (mut vts, _) = alternates_vts();
+    with_unreadable_last_parts(&mut vts);
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert_eq!(titles.len(), 8);
+    assert!(titles[7].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+}
+
+/// Round-4 MEDIUM: an unreadable part list bounds nothing the title can play, so the
+/// undescribed title holds the roster rather than being measured by its first PGC.
+#[test]
+fn a_title_whose_part_list_is_unreadable_holds_the_dvd_roster() {
+    let (mut vts, _) = alternates_vts();
+    with_unreadable_last_parts(&mut vts);
+    let (titles, _) = scan_disc(eight_titles_vmg(), vts);
+    assert_eq!(titles.len(), 8);
+    assert_no_dvd_roster(&titles);
+}
+
+// Episodes E1-E4 (100 sectors each), their two-minute play-all, a logo as title 6, and a
+// PGC 7 playing `after` that no title starts at.
+fn logo_then(after: Vec<(u32, u32)>) -> (Vec<u8>, Vec<usize>) {
+    let e = [(1000, 1099), (2000, 2099), (3000, 3099), (4000, 4099)];
+    let (mut vts, at) = programs_vts(&[
+        vec![e[0]],
+        vec![e[1]],
+        vec![e[2]],
+        vec![e[3]],
+        e.to_vec(),
+        vec![(700, 709)],
+        after,
+    ]);
+    vts[at[4] + 5] = 0x02;
+    vts[at[4] + 6] = 0x00;
+    (vts, at)
+}
+
+fn six_titles_vmg() -> Vec<u8> {
+    build_vmg(&(1..=6).map(|n| (1, 1, n)).collect::<Vec<_>>())
+}
+
+// Title 6 plays PGC 7 after its logo: chained by NextPGCN, or as its second part.
+fn logo_cases(after: Vec<(u32, u32)>) -> Vec<(&'static str, Vec<u8>)> {
+    let (mut chained, at) = logo_then(after.clone());
+    chained[at[5] + 0x9c..at[5] + 0x9e].copy_from_slice(&7u16.to_be_bytes());
+    let (mut split, _) = logo_then(after);
+    split[2056 + 6 * 4..2060 + 6 * 4].copy_from_slice(&64u32.to_be_bytes());
+    split[2048 + 64..2048 + 66].copy_from_slice(&7u16.to_be_bytes());
+    split[2048 + 66..2048 + 68].copy_from_slice(&1u16.to_be_bytes());
+    split[2052..2056].copy_from_slice(&67u32.to_be_bytes());
+    vec![("chained", chained), ("split", split)]
+}
+
+/// Round-4 MEDIUM: an undescribed title whose later PGC replays roster cells overlaps the
+/// roster, though its first PGC (its extents) does not: the roster is held.
+#[test]
+fn an_undescribed_title_reading_roster_cells_past_its_first_pgc_holds_the_roster() {
+    let has_roster = |titles: &[DiscTitle]| {
+        (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown)
+    };
+    let (titles, _) = scan_disc(six_titles_vmg(), logo_then(vec![(800, 809)]).0);
+    assert!(has_roster(&titles), "control: the play-all proves a roster");
+    for (case, vts) in logo_cases(vec![(800, 809)]) {
+        let (titles, _) = scan_disc(six_titles_vmg(), vts);
+        assert!(titles[5].selection_evidence.segments.is_empty(), "{case}");
+        assert!(
+            has_roster(&titles),
+            "{case}: its own sectors overlap nothing"
+        );
+    }
+    for (case, vts) in logo_cases(vec![(2000, 2099), (1000, 1099), (3000, 3099)]) {
+        let (titles, _) = scan_disc(six_titles_vmg(), vts);
+        assert_eq!(titles.len(), 6, "{case}");
+        assert!(titles[5].selection_evidence.segments.is_empty(), "{case}");
+        assert_eq!(titles[5].extents.len(), 1, "{case}: its first PGC is read");
+        assert_no_dvd_roster(&titles);
+    }
+}
+
+/// Round-4 tests MEDIUM: an undescribed title whose NextPGCN loops plays without end, so
+/// it holds the roster though each PGC it plays is short.
+#[test]
+fn an_undescribed_title_that_loops_holds_the_dvd_roster() {
+    let has_roster = |titles: &[DiscTitle]| {
+        (titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown)
+    };
+    // Title 7 is not one sequential PGC in TT_SRPT: undescribed, but bounded and short.
+    let mut vmg = seven_titles_vmg();
+    vmg[2048 + 8 + 6 * 12] = 0x40;
+    let (titles, _) = scan_disc(vmg.clone(), extras_programs(vec![(700, 709)]).0);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!(has_roster(&titles), "control: a short undescribed title");
+    let (mut looping, at) = extras_programs(vec![(700, 709)]);
+    looping[at[6] + 0x9c..at[6] + 0x9e].copy_from_slice(&7u16.to_be_bytes());
+    let (titles, _) = scan_disc(vmg, looping);
+    assert_no_dvd_roster(&titles);
 }

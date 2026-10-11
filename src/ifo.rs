@@ -78,8 +78,8 @@ pub struct DvdTitle {
     /// resolution joins on the REAL title number rather than the position in the
     /// titles vec, which desyncs when a sibling PGC is dropped as unparseable.
     pub vts_title_num: u8,
-    /// Distinct PGCs this title's part-of-title entries point at. Only the first is read,
-    /// so a title with more is missing the rest.
+    /// Distinct PGCs this title's part-of-title entries point at; 0 when its part list
+    /// cannot be read. Only the first is read, so a title with more is missing the rest.
     pub pgcs: usize,
     /// The program (PGN) each chapter (part of title) starts at, from VTS_PTT_SRPT. `None`
     /// when the table does not hold the title; empty when a chapter lies in another PGC.
@@ -92,10 +92,22 @@ pub struct DvdTitle {
     pub truncated: bool,
     /// The title's PGC is the one VTS_PTT_SRPT names, not a 1:1 guess.
     pub mapped: bool,
-    /// The most the title can play, `(seconds, sectors)`: every PGC its parts name and
-    /// their next-PGC chains, once each. `None` when that bounds nothing (loops, branches,
-    /// random play, a cut table, a guessed PGC).
-    pub reach: Option<(f64, u64)>,
+    /// The most the title can play: every PGC its parts name and their next-PGC chains,
+    /// once each. `None` when that bounds nothing (loops, branches, random play, a cut
+    /// table, a guessed PGC, an unreadable part list).
+    pub reach: Option<DvdReach>,
+}
+
+/// Everything a title can play, as [`DvdTitle::reach`] bounds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DvdReach {
+    /// Playback time in seconds.
+    pub secs: f64,
+    /// Sectors read, an angle block counted once.
+    pub sectors: u64,
+    /// VOB-relative `(first, last)` sectors of every cell in a PGC other than the title's
+    /// own, whose cells alone `cells` holds.
+    pub beyond: Vec<(u32, u32)>,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -541,7 +553,8 @@ pub(crate) const MAX_TT_SRPT_TITLES: usize = 99;
 pub(crate) struct TtSrpt {
     /// Per title set, each title's (chapter_count, vts_title_number).
     pub titles: std::collections::BTreeMap<u8, Vec<(u16, u8)>>,
-    /// Each title's playback type byte, keyed (vts_number, vts_title_num).
+    /// Each title's playback type byte, keyed (vts_number, vts_title_num); duplicate
+    /// entries' bytes are OR-ed, so no entry's warning flag is lost.
     pub playback: std::collections::BTreeMap<(u8, u8), u8>,
     /// Every declared entry was read and kept: none past the cap or the table, none
     /// naming title set or title 0. A duplicate entry loses nothing.
@@ -549,7 +562,7 @@ pub(crate) struct TtSrpt {
 }
 
 // Parses the VMG TT_SRPT. Clamps the declared entry count to MAX_TT_SRPT_TITLES and drops
-// duplicate (vts_number, vts_title_num) pairs; the first entry's playback type wins.
+// duplicate (vts_number, vts_title_num) pairs, OR-ing their playback type flags.
 pub(crate) fn parse_tt_srpt(vmg_data: &[u8], tt_srpt_offset: usize) -> Result<TtSrpt> {
     let num_titles = be_u16(vmg_data, tt_srpt_offset)? as usize;
     let mut complete = num_titles <= MAX_TT_SRPT_TITLES;
@@ -585,10 +598,12 @@ pub(crate) fn parse_tt_srpt(vmg_data: &[u8], tt_srpt_offset: usize) -> Result<Tt
             complete = false;
             continue; // invalid
         }
-        if playback.contains_key(&(vts_number, vts_title_num)) {
-            continue; // duplicate entry for the same VTS title
+        // A duplicate entry for the same VTS title adds only its warning flags.
+        let duplicate = playback.contains_key(&(vts_number, vts_title_num));
+        *playback.entry((vts_number, vts_title_num)).or_insert(0) |= vmg_data[base];
+        if duplicate {
+            continue;
         }
-        playback.insert((vts_number, vts_title_num), vmg_data[base]);
 
         title_set_map
             .entry(vts_number)
@@ -1104,8 +1119,8 @@ fn ptt_srpt_parts(data: &[u8], ptt_offset: usize, ttn: u8) -> Option<Vec<(u16, u
     Some(parts)
 }
 
-// Distinct PGCs title `ttn`'s part-of-title entries point at. A title split across
-// PGCs (one per chapter) is read from its first PGC only; the caller warns on > 1.
+// Distinct PGCs title `ttn`'s part-of-title entries point at, 0 when unreadable. A title
+// split across PGCs is read from its first PGC only; the caller warns on > 1.
 fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
     let mut pgcns: Vec<u16> = ptt_srpt_parts(data, ptt_offset, ttn)
         .unwrap_or_default()
@@ -1120,26 +1135,24 @@ fn ptt_srpt_pgc_count(data: &[u8], ptt_offset: usize, ttn: u8) -> usize {
 // PGCs a title's reach may span; past this it is unknown (bounds hostile chains).
 const MAX_REACH_PGCS: usize = 256;
 
-// `DvdTitle::reach`: the PGCs the parts name (else `first`, 0-based) and their NextPGCN
+// `DvdTitle::reach`: the PGCs the parts name (none read: unknown) and their NextPGCN
 // chains, each in cell order (PGC mode 0), uncut, with commands that never leave it, the
-// chains acyclic, and no part links between PGCs.
+// chains acyclic, and no part links between PGCs. `own` is the title's PGC (0-based).
 fn title_reach(
     data: &[u8],
     pgcit_offset: usize,
     num_pgcs: usize,
-    first: usize,
+    own: usize,
     parts: Option<&[(u16, u16)]>,
-) -> Option<(f64, u64)> {
-    let mut pgcs: Vec<usize> = match parts {
-        Some(parts) if !parts.is_empty() => (parts.iter())
-            .map(|&(pgcn, _)| usize::from(pgcn).checked_sub(1))
-            .collect::<Option<_>>()?,
-        _ => vec![first],
-    };
+) -> Option<DvdReach> {
+    let mut pgcs: Vec<usize> = (parts.filter(|parts| !parts.is_empty())?.iter())
+        .map(|&(pgcn, _)| usize::from(pgcn).checked_sub(1))
+        .collect::<Option<_>>()?;
     pgcs.sort_unstable();
     pgcs.dedup();
     let mut next = std::collections::HashMap::new();
     let (mut secs, mut sectors, mut by_part) = (0.0, 0u64, false);
+    let mut beyond = Vec::new();
     let mut i = 0;
     while let Some(&pgc) = pgcs.get(i) {
         i += 1;
@@ -1161,6 +1174,9 @@ fn title_reach(
         }
         next.insert(pgc, to);
         secs += title.duration_secs;
+        if pgc != own {
+            beyond.extend(title.cells.iter().map(|c| (c.first_sector, c.last_sector)));
+        }
         for cell in &title.cells {
             if !CellCategory::decode(cell.category).is_secondary_block_piece() {
                 let span = cell.last_sector.saturating_sub(cell.first_sector);
@@ -1181,7 +1197,11 @@ fn title_reach(
         }
         done.extend(path);
     }
-    (pgcs.len() == 1 || !by_part).then_some((secs, sectors))
+    (pgcs.len() == 1 || !by_part).then_some(DvdReach {
+        secs,
+        sectors,
+        beyond,
+    })
 }
 
 /// Parse VTS_PGCIT (Program Chain Information Table) to extract titles.
@@ -1227,8 +1247,8 @@ pub(crate) fn parse_pgcit(
         // Warned once per disc by the DVD scan, which sees every title set.
         let pgcs = ptt_srpt_pgc_count(data, ptt_offset, vts_title_num);
         let parts = ptt_srpt_parts(data, ptt_offset, vts_title_num);
-        let reach = mapped.and_then(|first| {
-            title_reach(data, pgcit_offset, num_pgcs.into(), first, parts.as_deref())
+        let reach = mapped.and_then(|own| {
+            title_reach(data, pgcit_offset, num_pgcs.into(), own, parts.as_deref())
         });
         // The program each chapter starts at, when every chapter lies in this PGC.
         let ptt_programs = parts.map(|parts| {

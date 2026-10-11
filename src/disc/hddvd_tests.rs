@@ -2866,6 +2866,9 @@ fn parse_xpl_titles_marks_a_title_with_a_clip_lacking_title_times() {
         r#"titleTimeEnd="00:00:05:00""#,
         r#"titleTimeBegin="00:00:xx:00" titleTimeEnd="00:00:05:00""#,
         r#"titleTimeBegin="00:00:00:00" titleTimeEnd="bad""#,
+        // Round-4 LOW: an end at or before the begin is garbled too.
+        r#"titleTimeBegin="00:10:00:00" titleTimeEnd="00:05:00:00""#,
+        r#"titleTimeBegin="00:00:05:00" titleTimeEnd="00:00:05:00""#,
     ] {
         let titles = parse_xpl_titles(clip(times).as_bytes());
         assert_eq!(titles[0].clips.len(), 1, "{times}");

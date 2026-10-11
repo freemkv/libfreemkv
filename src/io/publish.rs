@@ -215,6 +215,10 @@ fn claim_then_rename(source: &Path, target: &Path, steps: &impl Steps) -> io::Re
     // Every handle is closed before removal: an open file would be silly-renamed.
     match steps.fresh(target) {
         Ok(claim) if is_ours(&claim) => {}
+        // An empty file of another id may be ours on unstable inode numbers: never removed.
+        Ok(claim) if claim.is_file() && claim.len() == 0 => {
+            return Err(claim_left(io::Error::other("claim identity differs")));
+        }
         Ok(_) => return Err(busy(Fault::ClaimChanged)),
         // Gone, or swapped for a symlink (O_NOFOLLOW refuses it): the claim changed.
         Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
@@ -878,6 +882,25 @@ mod tests {
         }
     }
 
+    /// Round-4 tests LOW: an unreadable claim identity is reported left, carrying the fstat
+    /// errno, even when the re-check itself succeeds.
+    #[test]
+    #[cfg(unix)]
+    fn an_unknown_claim_identity_with_a_good_recheck_is_reported_as_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = pair(dir.path());
+        let steps = Fake {
+            no_claim_id: true,
+            ..Fake::claim_only()
+        };
+        let error = publish_with(&src, &dst, &steps).unwrap_err();
+        assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft));
+        assert_eq!(errno(&error), Some(libc::EIO), "the fstat errno");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0, "kept");
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload");
+    }
+
     // Swaps the target for a different empty file: made before the swap, so its inode
     // can never be the claim's recycled one.
     #[cfg(unix)]
@@ -913,7 +936,8 @@ mod tests {
     }
 
     /// Round-3 LOW: a successful re-check also compares the claim's identity, so another
-    /// writer's empty file is never deleted and published over.
+    /// writer's empty file is never deleted and published over. Round-4 LOW: on unstable
+    /// inode numbers that file may be our claim, so it is reported left, not contention.
     #[test]
     #[cfg(unix)]
     fn a_recheck_never_takes_another_empty_file_for_the_claim() {
@@ -929,8 +953,8 @@ mod tests {
             ..Fake::claim_only()
         };
         let error = publish_with(&src, &dst, &steps).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
-        assert_eq!(Fault::of(&error), Some(Fault::ClaimChanged));
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(Fault::of(&error), Some(Fault::ClaimLeft));
         assert_eq!(ino(&dst), swapped.get(), "the other file is kept");
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0);
         assert_eq!(std::fs::read(&src).unwrap(), b"payload");

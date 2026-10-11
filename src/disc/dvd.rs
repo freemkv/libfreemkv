@@ -364,8 +364,17 @@ impl Disc {
                     playback.is_some_and(|t| t & ifo::TT_MULTI_OR_RANDOM_PGC == 0);
                 // Highlight buttons that jump can take playback anywhere.
                 let buttons_jump = playback.is_none_or(|t| t & ifo::TT_BUTTON_JUMPS != 0);
-                reach.push(match dvd_title.reach {
-                    Some((secs, sectors)) if !buttons_jump => Reach::AtMost { secs, sectors },
+                reach.push(match &dvd_title.reach {
+                    Some(r) if !buttons_jump => Reach::AtMost {
+                        secs: r.secs,
+                        sectors: r.sectors,
+                        beyond: (r.beyond.iter())
+                            .map(|&(first, last)| {
+                                let start = u64::from(ts.vob_start_sector) + u64::from(first);
+                                (start, start + u64::from(last.saturating_sub(first)) + 1)
+                            })
+                            .collect(),
+                    },
                     _ => Reach::Unknown,
                 });
                 titles.push(DiscTitle {
@@ -374,7 +383,7 @@ impl Disc {
                         // cut and guessed titles do not play just these cells in this order.
                         segments: match dvd_title.sequential
                             && dvd_title.mapped
-                            && dvd_title.pgcs <= 1
+                            && dvd_title.pgcs == 1
                             && one_sequential_pgc
                             && !buttons_jump
                             && !dvd_title.truncated

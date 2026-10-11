@@ -399,12 +399,12 @@ fn chapters_and_json_create_write_readable_files() {
         ("c.xml", "<Chapters>"),
     ] {
         let path = dir.path().join(name);
-        ChaptersSink::create(&path, &t).unwrap();
+        ChaptersSink::create(File::create(&path).unwrap(), &path, &t).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(marker), "{name}: {text}");
     }
     let path = dir.path().join("t.json");
-    JsonSink::create(&path, &t).unwrap();
+    JsonSink::create(File::create(&path).unwrap(), &t).unwrap();
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(v["playlist"], "MAIN");
