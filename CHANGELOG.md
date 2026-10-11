@@ -9,10 +9,13 @@
 ### Changed
 
 - Blu-ray episode rosters (`EpisodeEvidence::Authored`) now come from the play-all playlist instead of menu navigation: when the longest playlist is exactly the concatenation of other playlists (same clips, same in/out times), those playlists are the episodes in that order, and exact duplicates share an ordinal. Every title stays `Unknown` when the cut is ambiguous, nested or competing, when a short recap/logo sits inside the play-all, when the only play-all is an extras reel, or when there is no play-all. Roster label: `bd-playall-partition-v1:<playlist>`. This replaces the onQ menu certificate (`onq-uhd-v1`) and the HDMV First-Play roster (`hdmv-unconditional-playall-v1`): Blue Planet II UHD now gets a roster; Planet Earth II UHD disc 2 keeps the same one.
+- DVD episode rosters come from the same play-all partition, over each title's cell sectors (roster label `dvd-playall-partition-v1:<title>`), instead of the static root-menu walk (`dvd-vmgm-static-playall-partition-v1`), which needed a menu shape almost no disc has. A DVD with a play-all title that exactly concatenates other titles now gets a roster whatever its menu or First-Play; that includes movie DVDs authored as chapter titles plus a full-length title, so Episodes still needs user intent or TV metadata. The same guards apply as on Blu-ray, so a shared intro repeated inside the play-all, or a member much shorter than its share, leaves every title `Unknown` (the menu walk accepted both). A title whose PGC plays in random or shuffle order has no `segments`.
 
 ### Removed
 
-- The unreleased DVD root-menu launch tracer: `TitleSelectionEvidence::dvd_launch` and the `DvdLaunchEvidence`, `DvdLaunchReviewReason`, `DvdLaunchRoute` and `DvdLaunchStep` types are gone. Most DVDs could not be traced, so it marked every title for review; per-title audio languages are already in each title's streams. The DVD static-menu episode roster is unchanged.
+- The unreleased DVD root-menu launch tracer: `TitleSelectionEvidence::dvd_launch` and the `DvdLaunchEvidence`, `DvdLaunchReviewReason`, `DvdLaunchRoute` and `DvdLaunchStep` types are gone. Most DVDs could not be traced, so it marked every title for review; per-title audio languages are already in each title's streams.
+- `NavigationSource`, `MovieSelectionBasis` and the `TitleSelectionEvidence` fields `navigation`, `authoring_hint`, `dvd_menu_reachable` and `movie_basis`. Nothing read them; main-feature ranking is unchanged and `titles[0]` is still the pick.
+- `EpisodeEvidence::Authored::member`: it always equalled `ordinal.is_some()`; read `ordinal` instead.
 
 ## [1.8.3] — 2026-10-08
 

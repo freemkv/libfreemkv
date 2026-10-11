@@ -72,7 +72,7 @@ impl Disc {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        super::selection_partition::annotate(&mut titles);
+        super::selection_partition::annotate(&mut titles, "bd-playall-partition-v1");
         Ok(titles)
     }
 

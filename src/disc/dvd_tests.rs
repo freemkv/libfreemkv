@@ -2,9 +2,6 @@ use super::*;
 use crate::sector::SectorSource;
 use std::collections::HashMap;
 
-#[path = "dvd_menu_tests.rs"]
-mod menu_tests;
-
 // In-memory disc + minimal UDF image (single physical partition,
 // metadata_start == partition_start). Offsets cited against
 // udf.rs::read_filesystem / ECMA-167.
@@ -2184,6 +2181,7 @@ fn title(vts_title_num: u8, pgcs: usize) -> ifo::DvdTitle {
         vts_title_num,
         pgcs,
         ptt_programs: None,
+        sequential: true,
     }
 }
 
@@ -2350,4 +2348,147 @@ fn scan_dvd_titles_code_extension_labels_follow_the_routed_stream() {
             (0x20, true, LabelQualifier::Forced)
         ]
     );
+}
+
+// One sequential single-program PGC playing `cells` in order.
+fn program_pgc(cells: &[(u32, u32)]) -> Vec<u8> {
+    let n = cells.len();
+    let mut b = vec![0; 240 + n * 28];
+    b[2] = 1;
+    b[3] = n as u8;
+    b[6] = 0x30;
+    b[7] = 0x40;
+    b[0xe6..0xe8].copy_from_slice(&236u16.to_be_bytes());
+    b[0xe8..0xea].copy_from_slice(&240u16.to_be_bytes());
+    b[0xea..0xec].copy_from_slice(&((240 + n * 24) as u16).to_be_bytes());
+    b[236] = 1;
+    for (i, &(first, last)) in cells.iter().enumerate() {
+        write_cell(&mut b, 240 + i * 24, first, last);
+        b[240 + i * 24 + 6] = 0x30;
+        b[240 + i * 24 + 7] = 0x40;
+    }
+    b
+}
+
+// VTS 1 whose title i is PGC i + 1, playing `programs[i]`. Returns the IFO and each PGC's offset.
+fn programs_vts(programs: &[Vec<(u32, u32)>]) -> (Vec<u8>, Vec<usize>) {
+    let n = programs.len();
+    let mut vts = vec![0; 5 * 2048];
+    vts[..12].copy_from_slice(b"DVDVIDEO-VTS");
+    vts[0xc4..0xc8].copy_from_slice(&100u32.to_be_bytes());
+    vts[0xc8..0xcc].copy_from_slice(&1u32.to_be_bytes());
+    vts[0xcc..0xd0].copy_from_slice(&2u32.to_be_bytes());
+    vts[2048..2050].copy_from_slice(&(n as u16).to_be_bytes());
+    vts[2052..2056].copy_from_slice(&((8 + n * 8 - 1) as u32).to_be_bytes());
+    vts[4096..4098].copy_from_slice(&(n as u16).to_be_bytes());
+    let mut offset = 8 + n * 8;
+    let mut at = Vec::new();
+    for (i, cells) in programs.iter().enumerate() {
+        let part = 8 + n * 4 + i * 4;
+        vts[2056 + i * 4..2060 + i * 4].copy_from_slice(&(part as u32).to_be_bytes());
+        vts[2048 + part..2050 + part].copy_from_slice(&(i as u16 + 1).to_be_bytes());
+        vts[2050 + part..2052 + part].copy_from_slice(&1u16.to_be_bytes());
+        vts[4108 + i * 8..4112 + i * 8].copy_from_slice(&(offset as u32).to_be_bytes());
+        let body = program_pgc(cells);
+        vts[4096 + offset..4096 + offset + body.len()].copy_from_slice(&body);
+        at.push(4096 + offset);
+        offset += body.len();
+    }
+    vts[4100..4104].copy_from_slice(&((offset - 1) as u32).to_be_bytes());
+    (vts, at)
+}
+
+// Six language alternates of three uneven programs, their play-all and an unrelated title.
+fn alternates_vts() -> (Vec<u8>, Vec<usize>) {
+    programs_vts(&[
+        vec![(100, 129)],
+        vec![(100, 129)],
+        vec![(200, 239)],
+        vec![(200, 239)],
+        vec![(300, 319)],
+        vec![(300, 319)],
+        vec![(200, 239), (100, 129), (300, 319)],
+        vec![(900, 939)],
+    ])
+}
+
+fn ordinals(titles: &[DiscTitle]) -> Vec<Option<usize>> {
+    titles
+        .iter()
+        .map(|t| match &t.selection_evidence.episodes {
+            EpisodeEvidence::Authored {
+                roster,
+                title_count: 8,
+                ordinal,
+            } if roster == "dvd-playall-partition-v1:7" => *ordinal,
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn dvd_playall_partitions_into_the_alternates_without_any_menu() {
+    let vmg = build_vmg(&(1..=8).map(|n| (1, 1, n)).collect::<Vec<_>>());
+    let (titles, _) = scan_disc(vmg, alternates_vts().0);
+    assert_eq!(titles.len(), 8);
+    assert_eq!(
+        ordinals(&titles),
+        [
+            Some(1),
+            Some(1),
+            Some(0),
+            Some(0),
+            Some(2),
+            Some(2),
+            None,
+            None
+        ]
+    );
+    assert!((titles.iter()).all(|t| t.selection_evidence.episodes != EpisodeEvidence::Unknown));
+}
+
+#[test]
+fn dvd_nonsequential_playback_has_no_segments_and_no_roster() {
+    let vmg = build_vmg(&(1..=8).map(|n| (1, 1, n)).collect::<Vec<_>>());
+    let (mut vts, at) = alternates_vts();
+    vts[at[6] + 0xa2] = 1; // PG playback mode: random, not cell order
+    let (titles, _) = scan_disc(vmg, vts);
+    assert_eq!(titles.len(), 8);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+    assert!((titles.iter()).all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown));
+}
+
+#[test]
+fn dvd_chained_next_pgc_has_no_segments_and_no_roster() {
+    let vmg = build_vmg(&(1..=8).map(|n| (1, 1, n)).collect::<Vec<_>>());
+    let (mut vts, at) = alternates_vts();
+    vts[at[6] + 0x9c..at[6] + 0x9e].copy_from_slice(&8u16.to_be_bytes()); // next PGCN
+    let (titles, _) = scan_disc(vmg, vts);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!(!titles[0].selection_evidence.segments.is_empty());
+    assert!((titles.iter()).all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown));
+}
+
+#[test]
+fn dvd_title_spanning_two_pgcs_has_no_segments_and_no_roster() {
+    let vmg = build_vmg(&(1..=8).map(|n| (1, 1, n)).collect::<Vec<_>>());
+    let (mut vts, _) = alternates_vts();
+    // Title 7 gains a second part-of-title entry, in PGC 8; title 8 moves one entry on.
+    let table = 2048;
+    let part8 = u32::from_be_bytes(
+        vts[table + 8 + 7 * 4..table + 12 + 7 * 4]
+            .try_into()
+            .unwrap(),
+    );
+    let part8 = part8 as usize;
+    vts[table + part8 + 4..table + part8 + 6].copy_from_slice(&8u16.to_be_bytes());
+    vts[table + part8 + 6..table + part8 + 8].copy_from_slice(&1u16.to_be_bytes());
+    vts[table + 8 + 7 * 4..table + 12 + 7 * 4].copy_from_slice(&(part8 as u32 + 4).to_be_bytes());
+    let last = u32::from_be_bytes(vts[table + 4..table + 8].try_into().unwrap());
+    vts[table + 4..table + 8].copy_from_slice(&(last + 4).to_be_bytes());
+    let (titles, _) = scan_disc(vmg, vts);
+    assert_eq!(titles.len(), 8);
+    assert!(titles[6].selection_evidence.segments.is_empty());
+    assert!((titles.iter()).all(|t| t.selection_evidence.episodes == EpisodeEvidence::Unknown));
 }

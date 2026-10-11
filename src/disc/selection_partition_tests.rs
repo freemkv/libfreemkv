@@ -1,5 +1,5 @@
 use super::*;
-use crate::disc::{Clip, ContentFormat};
+use crate::disc::{Clip, ContentFormat, ContentSegment};
 
 const TICKS: u32 = 45_000;
 
@@ -8,23 +8,28 @@ fn title(id: u16, clips: &[(&str, u32, u32)]) -> DiscTitle {
         .iter()
         .map(|c| u64::from(c.2.saturating_sub(c.1)))
         .sum();
+    let clips: Vec<_> = clips
+        .iter()
+        .map(|&(clip, in_time, out_time)| Clip {
+            clip_id: clip.into(),
+            in_time,
+            out_time,
+            duration_secs: f64::from(out_time.saturating_sub(in_time)) / f64::from(TICKS),
+            source_packets: 0,
+            feed_span: None,
+        })
+        .collect();
+    // As the Blu-ray scanner describes a playlist.
     DiscTitle {
-        selection_evidence: Default::default(),
+        selection_evidence: crate::disc::TitleSelectionEvidence {
+            segments: ContentSegment::from_clips(&clips),
+            ..Default::default()
+        },
         playlist: format!("{id:05}.mpls"),
         playlist_id: id,
         duration_secs: ticks as f64 / f64::from(TICKS),
         size_bytes: 1000,
-        clips: clips
-            .iter()
-            .map(|&(clip, in_time, out_time)| Clip {
-                clip_id: clip.into(),
-                in_time,
-                out_time,
-                duration_secs: f64::from(out_time.saturating_sub(in_time)) / f64::from(TICKS),
-                source_packets: 0,
-                feed_span: None,
-            })
-            .collect(),
+        clips,
         streams: vec![],
         chapters: vec![],
         extents: vec![],
@@ -76,7 +81,6 @@ fn assert_roster(titles: &[DiscTitle], roster: &str, members: &[(u16, usize)]) {
             EpisodeEvidence::Authored {
                 roster: roster.into(),
                 title_count: titles.len(),
-                member: ordinal.is_some(),
                 ordinal,
             },
             "{}",
@@ -86,7 +90,7 @@ fn assert_roster(titles: &[DiscTitle], roster: &str, members: &[(u16, usize)]) {
 }
 
 fn run(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles);
+    annotate(&mut titles, "bd-playall-partition-v1");
     titles
 }
 
@@ -304,29 +308,9 @@ fn title_cap_is_unknown() {
 fn clip_cap_is_unknown() {
     let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
     let used: usize = titles.iter().map(|t| t.clips.len()).sum();
-    let menu = format!("00014:524280-2710839*{}", MAX_CLIPS + 1 - used);
+    let menu = format!("00014:524280-2710839*{}", MAX_SEGMENTS + 1 - used);
     titles.push(scanned(&format!("00162 | {menu}")));
     assert_unknown(&run(titles));
-}
-
-#[test]
-fn existing_episode_evidence_is_left_alone() {
-    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
-    let prior = EpisodeEvidence::Authored {
-        roster: "other".into(),
-        title_count: titles.len(),
-        member: false,
-        ordinal: None,
-    };
-    for t in &mut titles {
-        t.selection_evidence.episodes = prior.clone();
-    }
-    let titles = run(titles);
-    assert!(
-        titles
-            .iter()
-            .all(|t| t.selection_evidence.episodes == prior)
-    );
 }
 
 #[test]
@@ -338,4 +322,164 @@ fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
     assert_eq!(prefixes.decompose(0), Some(vec![1, 2]));
     assert_eq!(prefixes.decompose(1), None);
     assert_eq!(prefixes.decompose(9), None);
+}
+
+fn run_dvd(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
+    annotate(&mut titles, "dvd-playall-partition-v1");
+    titles
+}
+
+// A DVD title as its scanner describes it: cell sector ranges, no clips.
+fn dvd(id: u16, cells: &[(u32, u32)]) -> DiscTitle {
+    let extents: Vec<_> = cells
+        .iter()
+        .map(|&(first, last)| crate::disc::Extent {
+            start_lba: first,
+            sector_count: last - first + 1,
+        })
+        .collect();
+    DiscTitle {
+        selection_evidence: crate::disc::TitleSelectionEvidence {
+            segments: ContentSegment::from_cell_extents(&extents),
+            ..Default::default()
+        },
+        playlist: format!("VTS_01_{id}.VOB"),
+        playlist_id: id,
+        extents,
+        content_format: ContentFormat::DvdPs,
+        ..title(id, &[])
+    }
+}
+
+// Six language alternates of three uneven programs, their play-all and an unrelated title.
+fn dvd_alternates(cut: &[(u32, u32)]) -> Vec<DiscTitle> {
+    let [a, b, c] = [cut[0], cut[1], cut[2]];
+    vec![
+        dvd(1, &[a]),
+        dvd(2, &[a]),
+        dvd(3, &[b]),
+        dvd(4, &[b]),
+        dvd(5, &[c]),
+        dvd(6, &[c]),
+        dvd(7, &[b, a, c]),
+        dvd(8, &[(900, 939)]),
+    ]
+}
+
+#[test]
+fn dvd_cells_partition_like_clips() {
+    let titles = run_dvd(dvd_alternates(&[(100, 129), (200, 239), (300, 319)]));
+    assert_roster(
+        &titles,
+        "dvd-playall-partition-v1:7",
+        &[(3, 0), (4, 0), (1, 1), (2, 1), (5, 2), (6, 2)],
+    );
+}
+
+#[test]
+fn dvd_member_far_shorter_than_its_share_is_unknown() {
+    assert_unknown(&run_dvd(dvd_alternates(&[
+        (100, 109),
+        (200, 239),
+        (300, 301),
+    ])));
+}
+
+#[test]
+fn dvd_shared_intro_is_a_repeat_so_unknown() {
+    let intro = (50, 59);
+    let titles = vec![
+        dvd(1, &[intro, (100, 129)]),
+        dvd(2, &[intro, (200, 239)]),
+        dvd(3, &[intro, (300, 319)]),
+        dvd(
+            7,
+            &[intro, (200, 239), intro, (100, 129), intro, (300, 319)],
+        ),
+    ];
+    assert_unknown(&run_dvd(titles));
+}
+
+#[test]
+fn dvd_title_without_segments_is_no_member() {
+    let mut titles = dvd_alternates(&[(100, 129), (200, 239), (300, 319)]);
+    titles[6].selection_evidence.segments.clear();
+    assert_unknown(&run_dvd(titles));
+}
+
+// Sector ranges for a title, as the scanners record what it reads.
+fn reading(mut t: DiscTitle, ranges: &[(u32, u32)]) -> DiscTitle {
+    t.extents = ranges
+        .iter()
+        .map(|&(start_lba, sector_count)| crate::disc::Extent {
+            start_lba,
+            sector_count,
+        })
+        .collect();
+    t
+}
+
+// Four episodes at sectors 100.., playlist 10 over the first two.
+fn four_episodes_with_head() -> Vec<DiscTitle> {
+    let mut titles: Vec<_> = (1..=4u32)
+        .map(|n| {
+            let clip = format!("{n:05}");
+            let ep = secs(n as u16, &[(clip.as_str(), 0, 2700)]);
+            reading(ep, &[(n * 100, 50)])
+        })
+        .collect();
+    titles.push(reading(
+        secs(10, &[("00001", 0, 2700), ("00002", 0, 2700)]),
+        &[(100, 50), (200, 50)],
+    ));
+    titles
+}
+
+#[test]
+fn bd_undescribable_playall_over_the_members_is_unknown() {
+    let mut titles = four_episodes_with_head();
+    // A zero-length final clip makes the longest playlist undescribable.
+    titles.push(reading(
+        secs(
+            20,
+            &[
+                ("00001", 0, 2700),
+                ("00002", 0, 2700),
+                ("00003", 0, 2700),
+                ("00004", 0, 2700),
+                ("00009", 5, 5),
+            ],
+        ),
+        &[(100, 50), (200, 50), (300, 50), (400, 50)],
+    ));
+    assert!(titles[5].selection_evidence.segments.is_empty());
+    assert_unknown(&run(titles));
+}
+
+#[test]
+fn dvd_undescribable_playall_over_the_members_is_unknown() {
+    let cells = [(100, 149), (200, 249), (300, 349), (400, 449)];
+    let mut titles: Vec<_> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| dvd(i as u16 + 1, &[c]))
+        .collect();
+    titles.push(dvd(10, &[cells[0], cells[1]]));
+    // Random or shuffle play-all: segments withheld, extents still read.
+    let mut playall = dvd(20, &cells);
+    playall.selection_evidence.segments.clear();
+    titles.push(playall);
+    assert_unknown(&run_dvd(titles));
+}
+
+#[test]
+fn undescribable_title_elsewhere_does_not_block_a_roster() {
+    let mut titles = four_episodes_with_head();
+    titles.push(reading(
+        secs(30, &[("00030", 7, 7)]),
+        &[(9000, 20), (9100, 20)],
+    ));
+    titles.push(secs(31, &[("00031", 7, 7)]));
+    let titles = run(titles);
+    assert_roster(&titles, "bd-playall-partition-v1:10", &[(1, 0), (2, 1)]);
 }

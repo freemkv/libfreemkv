@@ -1,29 +1,11 @@
 //! Selection provenance survives sorting and copying individual titles.
 
-/// Navigation program that selected a movie candidate, not an episode roster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NavigationSource {
-    HdmvFirstPlay,
-    DvdFirstPlay,
-}
-
-/// Why the existing movie-ranking policy accepted a title.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum MovieSelectionBasis {
-    #[default]
-    CanonicalFallback,
-    Navigation(NavigationSource),
-    /// May include JAR locator/duration scoring; not proof of reachability.
-    AuthoringHint,
-}
-
 /// Membership in a verified authored standalone-program roster for Episodes mode.
-/// Producers: the DVD static-menu play-all partition and the Blu-ray play-all partition
-/// (the longest playlist exactly concatenates other playlists), not navigation code.
-/// This is not a semantic TV classification: movie chapter titles can have the same
-/// structure. The caller must choose Episodes from user intent or TV metadata.
-/// `Unknown` means no roster was proven: Episodes must hold for review, not guess.
-/// First-Play and movie hints alone are insufficient.
+/// Producer: the play-all partition (the longest title's segments exactly concatenate
+/// other titles'), on DVD and Blu-ray, not navigation code. This is not a semantic TV
+/// classification: movie chapter titles can have the same structure. The caller must
+/// choose Episodes from user intent or TV metadata. `Unknown` means no roster was
+/// proven: Episodes must hold for review, not guess.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EpisodeEvidence {
     #[default]
@@ -34,10 +16,9 @@ pub enum EpisodeEvidence {
     Authored {
         roster: String,
         title_count: usize,
-        member: bool,
-        /// Zero-based authored program order. Required for members, absent for
-        /// nonmembers. Exact presentation aliases share one ordinal; distinct
-        /// programs occupy contiguous ordinals starting at zero.
+        /// Zero-based authored program order; `None` outside the roster. Exact
+        /// presentation aliases share one ordinal; distinct programs occupy
+        /// contiguous ordinals starting at zero.
         ordinal: Option<usize>,
     },
 }
@@ -59,7 +40,7 @@ impl ContentSegment {
         clips
             .iter()
             .map(|clip| {
-                (!clip.clip_id.trim().is_empty() && clip.in_time < clip.out_time).then(|| Self {
+                (!clip.clip_id.is_empty() && clip.in_time < clip.out_time).then(|| Self {
                     unit: clip.clip_id.clone(),
                     start: clip.in_time.into(),
                     end: clip.out_time.into(),
@@ -92,13 +73,6 @@ impl ContentSegment {
 pub struct TitleSelectionEvidence {
     /// Authored content in play order; empty when the backend cannot describe it exactly.
     pub segments: Vec<ContentSegment>,
-    /// Observed static DVD menu target. Reachability alone is NOT episode proof.
-    pub dvd_menu_reachable: bool,
-    /// Raw First-Play result; movie plausibility guards may reject it for ranking.
-    pub navigation: Option<NavigationSource>,
-    /// Raw label/framework/JAR hint; never a complete episode roster.
-    pub authoring_hint: bool,
-    pub movie_basis: MovieSelectionBasis,
     pub episodes: EpisodeEvidence,
 }
 

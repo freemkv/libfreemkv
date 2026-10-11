@@ -141,7 +141,6 @@ impl Disc {
         let mut nav_feature: Option<u16> = None;
 
         let mut titles = Vec::new();
-        let mut title_addresses = Vec::new();
         let mut title_number: u16 = 0;
 
         for ts in &dvd_info.title_sets {
@@ -349,10 +348,14 @@ impl Disc {
                     })
                     .collect();
 
-                title_addresses.push((ts.vts_number, dvd_title.vts_title_num));
                 titles.push(DiscTitle {
                     selection_evidence: TitleSelectionEvidence {
-                        segments: ContentSegment::from_cell_extents(&extents),
+                        // Random, shuffle, chained and multi-PGC titles do not play just
+                        // these cells in this order.
+                        segments: match dvd_title.sequential && dvd_title.pgcs <= 1 {
+                            true => ContentSegment::from_cell_extents(&extents),
+                            false => Vec::new(),
+                        },
                         ..Default::default()
                     },
                     playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
@@ -377,14 +380,7 @@ impl Disc {
             return Err(Error::Halted);
         }
         warn_multi_pgc_titles(&vmg_bytes, &dvd_info);
-        super::dvd_menu::annotate(
-            reader,
-            udf_fs,
-            &vmg_bytes,
-            &title_addresses,
-            &mut titles,
-            halt,
-        )?;
+        super::selection_partition::annotate(&mut titles, "dvd-playall-partition-v1");
         Ok((titles, nav_feature, dvd_region(dvd_info.region_mask)))
     }
 }

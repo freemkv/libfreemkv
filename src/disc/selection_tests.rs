@@ -27,7 +27,7 @@ fn clips_describe_content_only_when_every_item_is_exact() {
         spans(&segments),
         [("00002", 90, 900), ("00001", 0, u64::from(u32::MAX))]
     );
-    for bad in [clip(" ", 0, 9), clip("00003", 9, 9), clip("00003", 9, 1)] {
+    for bad in [clip("", 0, 9), clip("00003", 9, 9), clip("00003", 9, 1)] {
         assert!(ContentSegment::from_clips(&[clips[0].clone(), bad]).is_empty());
     }
 }

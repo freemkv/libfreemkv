@@ -988,6 +988,7 @@ fn feature_filter_noop_on_plain_feature() {
         vts_title_num: 0,
         pgcs: 1,
         ptt_programs: None,
+        sequential: true,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert_eq!(t.feature_cells().len(), 3);
@@ -1014,6 +1015,7 @@ fn feature_filter_drops_leading_secondary_block_cells() {
         vts_title_num: 0,
         pgcs: 1,
         ptt_programs: None,
+        sequential: true,
     };
     assert_eq!(t.feature_start_cell(), 2);
     let fc = t.feature_cells();
@@ -1036,6 +1038,7 @@ fn feature_filter_never_empties_title() {
         vts_title_num: 0,
         pgcs: 1,
         ptt_programs: None,
+        sequential: true,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert_eq!(t.feature_cells().len(), 2);
@@ -1055,6 +1058,7 @@ fn feature_filter_empty_cells() {
         vts_title_num: 0,
         pgcs: 1,
         ptt_programs: None,
+        sequential: true,
     };
     assert_eq!(t.feature_start_cell(), 0);
     assert!(t.feature_cells().is_empty());
