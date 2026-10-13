@@ -2,7 +2,7 @@
 //! independent of menu navigation.
 //!
 //! One play-all title must be the exact concatenation of standalone titles (exact
-//! segments). Ambiguous, competing, nested or implausible partitions leave every
+//! segments, save an out-point within the scanner's `end_slack`). Ambiguous, competing, nested or implausible partitions leave every
 //! title Unknown. This proves an authored program partition, NOT TV semantics;
 //! Unknown is a review hold for Episodes, never a fallback.
 
@@ -75,8 +75,19 @@ pub(super) enum Reach {
 /// `complete` is false when the scanner dropped or cut a title it should have
 /// described: the missing one could compete with any partition of the rest.
 /// `reach[i]` bounds title `i`; a title past its end plays its duration and extents.
-pub(super) fn annotate(titles: &mut [DiscTitle], producer: &str, complete: bool, reach: &[Reach]) {
-    let Some((wrapper, ordinals)) = complete.then(|| partition(titles, reach)).flatten() else {
+/// `end_slack` is how far apart (in segment units) two out-points of one piece may be and
+/// still be the same piece; 0 compares exactly.
+pub(super) fn annotate(
+    titles: &mut [DiscTitle],
+    producer: &str,
+    complete: bool,
+    reach: &[Reach],
+    end_slack: u64,
+) {
+    let Some((wrapper, ordinals)) = complete
+        .then(|| partition(titles, reach, end_slack))
+        .flatten()
+    else {
         tracing::debug!(
             target: "freemkv::scan",
             producer,
@@ -114,8 +125,49 @@ fn sector_ranges(title: &DiscTitle) -> impl Iterator<Item = (u64, u64)> + '_ {
         })
 }
 
+// Each segment's out-point for comparison: the lowest of its run of out-points from the
+// same unit and in-point when consecutive ones are at most `slack` apart and the whole
+// run spans no more than `slack` (a play-all piece trimmed a few frames off a
+// standalone episode). A wider chain could join two real cuts, so it stays exact.
+fn slack_ends<'a>(
+    segments: impl Iterator<Item = &'a ContentSegment>,
+    slack: u64,
+) -> HashMap<&'a ContentSegment, u64> {
+    let mut out = HashMap::new();
+    if slack == 0 {
+        return out;
+    }
+    let mut by_start: HashMap<(&str, u64), Vec<&ContentSegment>> = HashMap::new();
+    for segment in segments {
+        by_start
+            .entry((segment.unit.as_str(), segment.start))
+            .or_default()
+            .push(segment);
+    }
+    for mut run in by_start.into_values() {
+        run.sort_unstable_by_key(|s| s.end);
+        run.dedup();
+        let mut from = 0;
+        for i in 1..=run.len() {
+            if i < run.len() && run[i].end - run[i - 1].end <= slack {
+                continue;
+            }
+            let chain = &run[from..i];
+            if chain.len() > 1 && chain[chain.len() - 1].end - chain[0].end <= slack {
+                out.extend(chain.iter().map(|s| (*s, chain[0].end)));
+            }
+            from = i;
+        }
+    }
+    out
+}
+
 // Lowest wrapper title id and per-title member ordinal.
-fn partition(titles: &[DiscTitle], reach: &[Reach]) -> Option<(u16, Vec<Option<usize>>)> {
+fn partition(
+    titles: &[DiscTitle],
+    reach: &[Reach],
+    end_slack: u64,
+) -> Option<(u16, Vec<Option<usize>>)> {
     fn segments(t: &DiscTitle) -> &[ContentSegment] {
         &t.selection_evidence.segments
     }
@@ -124,7 +176,9 @@ fn partition(titles: &[DiscTitle], reach: &[Reach]) -> Option<(u16, Vec<Option<u
     {
         return None;
     }
-    // Exact segments interned to ids so presentations compare as integers.
+    // Segments interned to ids so presentations compare as integers; an out-point within
+    // `end_slack` of another piece's from the same in-point shares its id.
+    let ends = slack_ends(titles.iter().flat_map(segments), end_slack);
     let mut ids = HashMap::new();
     let mut raw = Vec::with_capacity(titles.len());
     let mut ticks = Vec::with_capacity(titles.len());
@@ -133,7 +187,9 @@ fn partition(titles: &[DiscTitle], reach: &[Reach]) -> Option<(u16, Vec<Option<u
         let mut sum = 0u64;
         for segment in segments(title) {
             let next = ids.len();
-            presentation.push(*ids.entry(segment).or_insert(next));
+            let end = ends.get(segment).copied().unwrap_or(segment.end);
+            let key = (segment.unit.as_str(), segment.start, end);
+            presentation.push(*ids.entry(key).or_insert(next));
             sum = sum.saturating_add(segment.end.saturating_sub(segment.start));
         }
         raw.push(presentation);

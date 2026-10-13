@@ -429,6 +429,7 @@ impl Disc {
             "dvd-playall-partition-v1",
             complete,
             &reach,
+            0, // Cell extents are sectors: an authored piece matches exactly.
         );
         Ok((titles, nav_feature, dvd_region(dvd_info.region_mask)))
     }

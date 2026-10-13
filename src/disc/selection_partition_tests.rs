@@ -91,12 +91,18 @@ fn assert_roster(titles: &[DiscTitle], roster: &str, members: &[(u16, usize)]) {
 }
 
 fn run(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "bd-playall-partition-v1", true, &[]);
+    annotate(
+        &mut titles,
+        "bd-playall-partition-v1",
+        true,
+        &[],
+        u64::from(TICKS),
+    );
     titles
 }
 
-// Planet Earth II UHD disc 2, scanned with libfreemkv dev 99c306ad (title order as scanned).
-const PLANET_EARTH_II_D2: &[&str] = &[
+// A three-episode UHD disc, scanned with libfreemkv dev 99c306ad (title order as scanned).
+const THREE_EPISODE_UHD: &[&str] = &[
     "00163 | 00058:524280-143808671 00059:524280-139681423 00060:524280-141473838",
     "00147 | 00058:524280-143930667",
     "00166 | 00058:524280-143808671",
@@ -116,8 +122,30 @@ const PLANET_EARTH_II_D2: &[&str] = &[
     "00161 | 00022:524280-1875629",
 ];
 
-// Blue Planet II UHD, a different onQ build whose menu program the old certificate rejected.
-const BLUE_PLANET_II: &[&str] = &[
+// Another pressing of the same disc (read from its mounted BDMV): the
+// play-all's first piece ends 9384 ticks (~0.21 s) past standalone 00166.
+const THREE_EPISODE_UHD_TRIMMED: &[&str] = &[
+    "00097 | 00021:524280-1875629",
+    "00098 | 00022:524280-1875629",
+    "00099 | 00014:524280-2707085*100",
+    "00147 | 00058:524280-146171656",
+    "00148 | 00059:524280-139369861",
+    "00149 | 00060:524280-147513622",
+    "00150 | 00061:524280-1875629",
+    "00153 | 00064:524280-1875629",
+    "00154 | 00065:524280-1875629",
+    "00155 | 00066:524280-1875629",
+    "00156 | 00067:524280-1875629",
+    "00161 | 00022:524280-1875629",
+    "00162 | 00014:524280-2707085*301",
+    "00163 | 00058:524280-138686679 00059:524280-139180297 00060:524280-139561303",
+    "00166 | 00058:524280-138677295",
+    "00167 | 00059:524280-139180297",
+    "00168 | 00060:524280-139561303",
+];
+
+// A two-episode UHD disc, a different onQ build whose menu program the old certificate rejected.
+const TWO_EPISODE_UHD: &[&str] = &[
     "00148 | 00059:524280-144195307",
     "00167 | 00059:524280-144195307",
     "00147 | 00058:524280-140910775",
@@ -128,8 +156,8 @@ const BLUE_PLANET_II: &[&str] = &[
 ];
 
 #[test]
-fn planet_earth_ii_feature_playlist_partitions_into_three_episodes() {
-    let titles = run(PLANET_EARTH_II_D2.iter().map(|l| scanned(l)).collect());
+fn three_episode_feature_playlist_partitions_into_three_episodes() {
+    let titles = run(THREE_EPISODE_UHD.iter().map(|l| scanned(l)).collect());
     // 00149 is an exact alias of 00168; 00147/00148 differ at the out-point.
     assert_roster(
         &titles,
@@ -139,8 +167,22 @@ fn planet_earth_ii_feature_playlist_partitions_into_three_episodes() {
 }
 
 #[test]
-fn blue_planet_ii_feature_playlist_partitions_into_two_aliased_episodes() {
-    let titles = run(BLUE_PLANET_II.iter().map(|l| scanned(l)).collect());
+fn a_play_all_piece_trimmed_by_frames_still_partitions() {
+    let titles = run(THREE_EPISODE_UHD_TRIMMED
+        .iter()
+        .map(|l| scanned(l))
+        .collect());
+    // 00147/00148/00149 are longer cuts of the same clips, minutes past the out-point.
+    assert_roster(
+        &titles,
+        "bd-playall-partition-v1:163",
+        &[(166, 0), (167, 1), (168, 2)],
+    );
+}
+
+#[test]
+fn two_episode_feature_playlist_partitions_into_two_aliased_episodes() {
+    let titles = run(TWO_EPISODE_UHD.iter().map(|l| scanned(l)).collect());
     assert_roster(
         &titles,
         "bd-playall-partition-v1:163",
@@ -150,7 +192,7 @@ fn blue_planet_ii_feature_playlist_partitions_into_two_aliased_episodes() {
 
 #[test]
 fn roster_label_names_the_lowest_aliased_wrapper_playlist() {
-    let mut lines: Vec<_> = BLUE_PLANET_II.to_vec();
+    let mut lines: Vec<_> = TWO_EPISODE_UHD.to_vec();
     lines.push("00170 | 00058:524280-140910775 00059:524280-144195307");
     lines.push("00009 | 00058:524280-140910775 00059:524280-144195307");
     let titles = run(lines.iter().map(|l| scanned(l)).collect());
@@ -288,7 +330,7 @@ fn invalid_member_presentation_is_unknown() {
     assert_unknown(&run(titles));
 }
 
-// Padding that leaves Blue Planet II's partition intact.
+// Padding that leaves the two-episode disc's partition intact.
 fn short_extra(id: u16) -> DiscTitle {
     title(
         id,
@@ -298,7 +340,7 @@ fn short_extra(id: u16) -> DiscTitle {
 
 #[test]
 fn title_cap_is_unknown() {
-    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let mut titles: Vec<_> = TWO_EPISODE_UHD.iter().map(|l| scanned(l)).collect();
     let pad = u16::try_from(MAX_TITLES + 1 - titles.len()).unwrap();
     titles.extend((1000..1000 + pad).map(short_extra));
     assert_eq!(titles.len(), MAX_TITLES + 1);
@@ -307,7 +349,7 @@ fn title_cap_is_unknown() {
 
 #[test]
 fn clip_cap_is_unknown() {
-    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let mut titles: Vec<_> = TWO_EPISODE_UHD.iter().map(|l| scanned(l)).collect();
     let used: usize = titles.iter().map(|t| t.clips.len()).sum();
     let menu = format!("00014:524280-2710839*{}", MAX_SEGMENTS + 1 - used);
     titles.push(scanned(&format!("00162 | {menu}")));
@@ -315,23 +357,23 @@ fn clip_cap_is_unknown() {
 }
 
 // Exactly at either cap the partition still runs; the `+ 1` tests above are past it.
-fn blue_planet_ii_roster(titles: &[DiscTitle]) {
+fn two_episode_roster(titles: &[DiscTitle]) {
     let members = [(166, 0), (147, 0), (167, 1), (148, 1)];
     assert_roster(titles, "bd-playall-partition-v1:163", &members);
 }
 
 #[test]
 fn title_cap_itself_keeps_the_roster() {
-    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let mut titles: Vec<_> = TWO_EPISODE_UHD.iter().map(|l| scanned(l)).collect();
     let pad = u16::try_from(MAX_TITLES - titles.len()).unwrap();
     titles.extend((1000..1000 + pad).map(short_extra));
     assert_eq!(titles.len(), MAX_TITLES);
-    blue_planet_ii_roster(&run(titles));
+    two_episode_roster(&run(titles));
 }
 
 #[test]
 fn clip_cap_itself_keeps_the_roster() {
-    let mut titles: Vec<_> = BLUE_PLANET_II.iter().map(|l| scanned(l)).collect();
+    let mut titles: Vec<_> = TWO_EPISODE_UHD.iter().map(|l| scanned(l)).collect();
     let used: usize = titles.iter().map(|t| t.clips.len()).sum();
     let menu = format!("00014:524280-2710839*{}", MAX_SEGMENTS - used);
     titles.push(scanned(&format!("00162 | {menu}")));
@@ -339,7 +381,7 @@ fn clip_cap_itself_keeps_the_roster() {
         .map(|t| t.selection_evidence.segments.len())
         .sum();
     assert_eq!(total, MAX_SEGMENTS);
-    blue_planet_ii_roster(&run(titles));
+    two_episode_roster(&run(titles));
 }
 
 #[test]
@@ -354,7 +396,7 @@ fn shared_prefixes_reject_empty_groups_and_self_decomposition() {
 }
 
 fn run_dvd(mut titles: Vec<DiscTitle>) -> Vec<DiscTitle> {
-    annotate(&mut titles, "dvd-playall-partition-v1", true, &[]);
+    annotate(&mut titles, "dvd-playall-partition-v1", true, &[], 0);
     titles
 }
 
@@ -572,7 +614,7 @@ fn an_undescribed_title_is_measured_by_its_reach() {
     titles.insert(0, first_pgc);
     let with = |reach: &[Reach]| {
         let mut titles = titles.clone();
-        annotate(&mut titles, "dvd-playall-partition-v1", true, reach);
+        annotate(&mut titles, "dvd-playall-partition-v1", true, reach, 0);
         titles
     };
     let at_most = |secs, sectors| Reach::AtMost {
@@ -609,7 +651,7 @@ fn an_undescribed_title_overlapping_the_roster_past_its_extents_holds_it() {
             sectors: 20,
             beyond,
         }];
-        annotate(&mut titles, "dvd-playall-partition-v1", true, &reach);
+        annotate(&mut titles, "dvd-playall-partition-v1", true, &reach, 0);
         titles
     };
     assert_unknown(&with(vec![(1105, 1115)]));
@@ -641,7 +683,7 @@ fn a_reach_longer_by_time_or_by_sectors_alone_holds_the_roster() {
             sectors,
             beyond: Vec::new(),
         }];
-        annotate(&mut titles, "dvd-playall-partition-v1", true, &reach);
+        annotate(&mut titles, "dvd-playall-partition-v1", true, &reach, 0);
         titles
     };
     assert_unknown(&with(150.0, 10));
@@ -651,4 +693,40 @@ fn a_reach_longer_by_time_or_by_sectors_alone_holds_the_roster() {
         "dvd-playall-partition-v1:20",
         &[(11, 0), (12, 1), (13, 2)],
     );
+}
+
+// A two-piece play-all whose first piece ends `over` ticks past standalone title 2's.
+fn trimmed_play_all(over: u32) -> Vec<DiscTitle> {
+    let end = 3000 * TICKS;
+    vec![
+        title(1, &[("a", 0, end + over), ("b", 0, end)]),
+        title(2, &[("a", 0, end)]),
+        title(3, &[("b", 0, end)]),
+    ]
+}
+
+#[test]
+fn an_out_point_within_the_slack_is_the_same_piece() {
+    let titles = run(trimmed_play_all(TICKS / 2));
+    assert_roster(&titles, "bd-playall-partition-v1:1", &[(2, 0), (3, 1)]);
+}
+
+#[test]
+fn an_out_point_past_the_slack_is_another_program() {
+    assert_unknown(&run(trimmed_play_all(2 * TICKS)));
+}
+
+// Out-points 0.6 s apart chain past the slack: no one of them is proven the same piece.
+#[test]
+fn a_chain_of_near_out_points_wider_than_the_slack_stays_exact() {
+    let mut titles = trimmed_play_all(TICKS * 6 / 10);
+    titles.push(title(4, &[("a", 0, 3000 * TICKS + TICKS * 12 / 10)]));
+    assert_unknown(&run(titles));
+}
+
+#[test]
+fn dvd_sectors_have_no_slack() {
+    let mut titles = trimmed_play_all(1);
+    annotate(&mut titles, "dvd-playall-partition-v1", true, &[], 0);
+    assert_unknown(&titles);
 }

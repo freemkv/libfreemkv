@@ -13,6 +13,9 @@ const CLIP_STREAM_EXTS: [&str; 3] = ["m2ts", "fmts", "ssif"];
 // MPLS/CLPI timestamps tick at 45 kHz; playlists shorter than this are menus/stubs.
 const MPLS_TICKS_PER_SEC: f64 = 45000.0;
 const MIN_TITLE_SECS: f64 = 30.0;
+// How far a play-all piece's out-point may sit from the standalone episode's and still be
+// it: one second, about a GOP, where authoring trims an episode at a play-all join.
+const PLAY_ALL_END_SLACK_TICKS: u64 = 45_000;
 
 impl Disc {
     // Scan Blu-ray titles from MPLS playlists. `halt` is polled between playlists and once more
@@ -78,7 +81,13 @@ impl Disc {
             return Err(Error::Halted);
         }
         // A playlist's duration and clips are all it plays: no `Reach` bounds are needed.
-        super::selection_partition::annotate(&mut titles, "bd-playall-partition-v1", complete, &[]);
+        super::selection_partition::annotate(
+            &mut titles,
+            "bd-playall-partition-v1",
+            complete,
+            &[],
+            PLAY_ALL_END_SLACK_TICKS,
+        );
         Ok(titles)
     }
 

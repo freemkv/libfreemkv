@@ -40,6 +40,10 @@
 - `sector::bus_removal::BusRemovalSectorSource`: `Drive` is the single de-bus point; the other `bus_removal` items remain.
 - `drive::DeviceResolution`, whose resolver was never wired.
 
+### Fixed
+
+- Blu-ray/UHD play-all partition: a play-all piece whose out-point sits within one second (45,000 ticks, about a GOP) of the standalone episode's, from the same clip and in-point, is that episode. One pressing trims its first episode 9,384 ticks (~0.21 s) inside the play-all, which left every title `Unknown` and held Episodes as E9086. Out-points that chain wider than the second stay exact; DVD cell sectors still match exactly.
+
 ## [1.8.3] — 2026-10-08
 
 ### Changed
