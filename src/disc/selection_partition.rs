@@ -125,10 +125,9 @@ fn sector_ranges(title: &DiscTitle) -> impl Iterator<Item = (u64, u64)> + '_ {
         })
 }
 
-// Each segment's out-point for comparison: the lowest of its run of out-points from the
-// same unit and in-point when consecutive ones are at most `slack` apart and the whole
-// run spans no more than `slack` (a play-all piece trimmed a few frames off a
-// standalone episode). A wider chain could join two real cuts, so it stays exact.
+// Out-points from one unit and in-point that all lie within `slack` compare as their lowest
+// (a play-all piece trimmed a few frames off its episode). A wider chain could join two
+// real cuts, so it stays exact.
 fn slack_ends<'a>(
     segments: impl Iterator<Item = &'a ContentSegment>,
     slack: u64,
