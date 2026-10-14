@@ -96,6 +96,33 @@ pub(crate) fn take_recovered_fd(slot: &AtomicI32) -> Option<i32> {
     taken(slot.swap(EMPTY, Ordering::Acquire))
 }
 
+/// [`take_recovered_fd`], waiting up to `budget` while `pending` reopen threads
+/// are still running. `None` once none is pending (and none published) or the
+/// budget is spent. A reopen thread publishes first and decrements `pending` after.
+pub(crate) fn await_recovered_fd(
+    slot: &AtomicI32,
+    pending: &std::sync::atomic::AtomicUsize,
+    budget: std::time::Duration,
+) -> Option<i32> {
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Some(fd) = take_recovered_fd(slot) {
+            return Some(fd);
+        }
+        if pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            // Re-check: the last thread may have published just before it decremented.
+            return take_recovered_fd(slot);
+        }
+        if t0.elapsed() >= budget {
+            return None;
+        }
+        std::thread::sleep(RECOVERY_POLL.min(budget));
+    }
+}
+
+// How often a command waiting on a reopen re-checks the slot.
+const RECOVERY_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Publish a freshly opened fd from a recovery thread. Returns the fd the
 /// **caller** must now close, or `None` if it was handed off:
 ///

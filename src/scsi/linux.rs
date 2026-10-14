@@ -7,8 +7,9 @@
 //! detached threads, see `fd_handoff`), so the fd is NOT stable across one.
 
 use super::fd_handoff::{
-    AtomicBool, AtomicI32, DropUnlock, claim_for_teardown, drop_unlock_fd, drop_unlock_plan,
-    publish_recovered_fd, release_recovery_slot, reserve_recovery_slot, take_recovered_fd,
+    AtomicBool, AtomicI32, DropUnlock, await_recovered_fd, claim_for_teardown, drop_unlock_fd,
+    drop_unlock_plan, publish_recovered_fd, release_recovery_slot, reserve_recovery_slot,
+    take_recovered_fd,
 };
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -92,6 +93,8 @@ pub struct SgIoTransport {
     /// that publishes after that point sees it and closes its own fd, since
     /// nothing will ever drain the slot again.
     dead: Arc<AtomicBool>,
+    /// Reopen threads still running; the next command waits on them, not ENODEV.
+    reopen_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// The last command's sense-key specific progress indication (§2.11).
     last_progress: Option<u16>,
 }
@@ -117,6 +120,7 @@ impl SgIoTransport {
             prevent_held: false,
             allow_transport_failed: false,
             dead: Arc::new(AtomicBool::new(false)),
+            reopen_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_progress: None,
         })
     }
@@ -362,9 +366,26 @@ impl ScsiTransport for SgIoTransport {
             }
             self.fd = recovered;
         } else if self.fd < 0 {
-            return Err(Error::DeviceNotFound {
-                path: self.device_path.display().to_string(),
-            });
+            // A transport fault reopens on a thread: wait for it (up to this
+            // command's timeout) rather than fail the next command as an unplug.
+            let budget = std::time::Duration::from_millis(u64::from(super::effective_timeout_ms(
+                timeout_ms,
+            )));
+            match await_recovered_fd(&self.fd_recovery, &self.reopen_pending, budget) {
+                Some(recovered) => self.fd = recovered,
+                None => {
+                    tracing::warn!(
+                        target: "freemkv::scsi",
+                        opcode,
+                        device = %self.device_path.display(),
+                        waited_ms = exec_t0.elapsed().as_millis() as u64,
+                        "no device handle after a transport fault; the reopen did not complete"
+                    );
+                    return Err(Error::DeviceNotFound {
+                        path: self.device_path.display().to_string(),
+                    });
+                }
+            }
         }
 
         if data.len() > u32::MAX as usize {
@@ -401,7 +422,7 @@ impl ScsiTransport for SgIoTransport {
 
         if ret < 0 {
             let errno = std::io::Error::last_os_error();
-            tracing::trace!(
+            tracing::warn!(
                 target: "freemkv::scsi",
                 phase = "ioctl_err",
                 opcode = opcode,
@@ -417,13 +438,14 @@ impl ScsiTransport for SgIoTransport {
         // Mask DRIVER_SENSE (0x08) first — it only flags sense-present.
         let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
         if hdr.host_status != 0 || driver_status_real != 0 {
-            tracing::trace!(
+            tracing::warn!(
                 target: "freemkv::scsi",
                 phase = "transport_err",
                 opcode = opcode,
                 host_status = hdr.host_status,
                 driver_status = hdr.driver_status,
                 status = hdr.status,
+                timeout_ms = hdr.timeout,
                 exec_elapsed_ms,
                 "transport-level failure (timeout / bridge wedge)"
             );
@@ -462,6 +484,9 @@ impl ScsiTransport for SgIoTransport {
             let reopened_async = reserve_recovery_slot(&RECOVERY_THREADS, MAX_RECOVERY_THREADS)
                 && {
                     let thread_path = path.clone();
+                    let pending = self.reopen_pending.clone();
+                    pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let thread_pending = pending.clone();
                     let spawned = std::thread::Builder::new().spawn(move || {
                         let new_fd = Self::reopen_fd(&thread_path);
                         if new_fd >= 0 {
@@ -472,9 +497,12 @@ impl ScsiTransport for SgIoTransport {
                                 unsafe { libc::close(orphan) };
                             }
                         }
+                        // After the publish: a waiter that sees zero re-checks the slot.
+                        thread_pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         release_recovery_slot(&RECOVERY_THREADS);
                     });
                     if spawned.is_err() {
+                        pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         release_recovery_slot(&RECOVERY_THREADS);
                     }
                     spawned.is_ok()

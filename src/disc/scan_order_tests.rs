@@ -495,29 +495,27 @@ fn bus_disc_failed_handshake_lists_titles_one_error_refuses_keys() {
     ));
 }
 
+// A transport fault mid-AKE is a failed handshake, as in 1.7 (BU40N field report): the
+// scan completes and a key source may still supply the key.
 #[test]
-fn transport_fault_mid_ake_aborts_scan() {
+fn transport_fault_mid_ake_is_a_failed_handshake() {
     for bee in [true, false] {
         let mut rig = Rig::new(bd_disc(Some(bee)), |t| t.fault_on = Some(is_send_host_cert));
-        let r = Disc::scan(&mut rig.drive, &with_hc());
+        let (r, ev) = crate::testlog::capture(|| Disc::scan(&mut rig.drive, &with_hc()));
+        let d = r.unwrap_or_else(|e| panic!("bee={bee}: {e:?}"));
+        assert!(!d.titles.is_empty(), "bee={bee}");
         assert!(
-            matches!(
-                r,
-                Err(Error::ScsiError {
-                    status: 0xFF,
-                    sense: None,
-                    ..
-                })
-            ),
-            "bee={bee}: {:?}",
-            r.map(|d| d.aacs_error)
+            ev.iter().any(|e| e.level == tracing::Level::WARN
+                && e.field("phase") == Some("cert_handshake_transport_fault")),
+            "bee={bee}: {ev:?}"
         );
-        let cdbs = rig.cdbs();
-        let fault = cdbs
-            .iter()
-            .position(|c| is_send_host_cert(c))
-            .expect("fault");
-        assert!(!cdbs[fault..].iter().any(|c| is_read10(c)), "bee={bee}");
+        if bee {
+            assert!(
+                matches!(d.aacs_error, Some(Error::AacsHostCertRejected)),
+                "{:?}",
+                d.aacs_error
+            );
+        }
     }
 }
 

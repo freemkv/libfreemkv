@@ -278,3 +278,60 @@ fn concurrent_teardown_and_publish_close_each_fd_exactly_once() {
         );
     }
 }
+
+// ── A command waiting on a pending reopen ──────────────────────────────
+
+/// The BU40N field failure: the command right after a transport fault ran before
+/// the reopen thread published, found no fd, and failed as "device not found".
+#[test]
+fn await_recovered_fd_waits_for_a_pending_reopen() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let (s, d) = slot();
+    let (s, d) = (Arc::new(s), Arc::new(d));
+    let pending = Arc::new(AtomicUsize::new(1));
+    let (s1, d1, p1) = (Arc::clone(&s), Arc::clone(&d), Arc::clone(&pending));
+    let reopen = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(publish_recovered_fd(&s1, &d1, 9), None);
+        p1.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    });
+    let got = await_recovered_fd(&s, &pending, std::time::Duration::from_secs(5));
+    reopen.join().unwrap();
+    assert_eq!(got, Some(9));
+}
+
+#[test]
+fn await_recovered_fd_returns_at_once_with_no_reopen_pending() {
+    let (s, _) = slot();
+    let pending = std::sync::atomic::AtomicUsize::new(0);
+    let t0 = std::time::Instant::now();
+    assert_eq!(
+        await_recovered_fd(&s, &pending, std::time::Duration::from_secs(5)),
+        None
+    );
+    assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn await_recovered_fd_takes_an_fd_published_by_a_finished_reopen() {
+    let (s, d) = slot();
+    assert_eq!(publish_recovered_fd(&s, &d, 4), None);
+    let pending = std::sync::atomic::AtomicUsize::new(0);
+    assert_eq!(
+        await_recovered_fd(&s, &pending, std::time::Duration::ZERO),
+        Some(4)
+    );
+}
+
+#[test]
+fn await_recovered_fd_gives_up_after_its_budget() {
+    let (s, _) = slot();
+    let pending = std::sync::atomic::AtomicUsize::new(1);
+    let t0 = std::time::Instant::now();
+    assert_eq!(
+        await_recovered_fd(&s, &pending, std::time::Duration::from_millis(30)),
+        None
+    );
+    assert!(t0.elapsed() >= std::time::Duration::from_millis(30));
+}

@@ -1095,7 +1095,7 @@ fn collect_host_certs_unions_credentials_and_sources() {
     assert_eq!(tags, vec![1, 2, 3]);
 }
 
-// Cert-route outcome mapping: a dead bus is split out (it aborts the scan), every
+// Cert-route outcome mapping: a dead bus is split out (logged at warn), every
 // other failure maps to a recorded Error and a trace step. No English in either.
 #[test]
 fn unlock_errors_split_transport_from_recorded_failures() {

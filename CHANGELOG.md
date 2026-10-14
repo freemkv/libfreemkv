@@ -42,6 +42,10 @@
 
 ### Fixed
 
+- Linux: the command after a transport fault waits for the background reopen of the device (up to its own timeout) instead of failing at once as `DeviceNotFound` (E1000). Transport faults and failed `SG_IO` ioctls are logged at warn.
+- A transport fault during the AACS host-certificate handshake no longer aborts the scan: as in 1.7, it is a failed handshake (logged at warn) and a key source may still supply the disc's key. A Stop during the handshake is still `Halted`.
+- An unlocker command that fails at the transport is logged at warn with its opcode and the underlying error, and `Drive::init` logs which unlocker aborted.
+
 - Blu-ray/UHD play-all partition: a play-all piece whose out-point sits within one second (45,000 ticks, about a GOP) of the standalone episode's, from the same clip and in-point, is that episode. One pressing trims its first episode 9,384 ticks (~0.21 s) inside the play-all, which left every title `Unknown` and held Episodes as E9086. Out-points that chain wider than the second stay exact; DVD cell sectors still match exactly.
 
 ## [1.8.3] — 2026-10-08

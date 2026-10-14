@@ -864,6 +864,13 @@ impl Drive {
             // the AACS cert route runs later at the handshake phase.
             Ok(None) => Ok(()),
             Err(freemkv_unlock::UnlockError::Transport) => {
+                // The faulting command and its real error were logged by the unlock adapter.
+                tracing::warn!(
+                    target: "freemkv::drive",
+                    phase = "init",
+                    unlocker = matched,
+                    "firmware unlock aborted on a transport fault; the drive is not unlocked"
+                );
                 Err(crate::unlock_bridge::unlock_transport_error())
             }
             Err(_) => Ok(()),

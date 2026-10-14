@@ -58,8 +58,10 @@ fn to_lib_dir(dir: fu::scsi::DataDirection) -> crate::scsi::DataDirection {
     }
 }
 
-// libfreemkv's result → the unlock crate's. `Halted` is a refusal (0xFF).
+// libfreemkv's result → the unlock crate's. `Halted` is a refusal (0xFF). A fault the
+// unlocker will read as a dead bus is logged here, the only place its real cause is known.
 fn to_fu_result(
+    cdb: &[u8],
     r: crate::error::Result<crate::scsi::ScsiResult>,
 ) -> fu::scsi::Result<fu::scsi::ScsiResult> {
     match r {
@@ -82,6 +84,14 @@ fn to_fu_result(
                 }
                 _ => (crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE, None),
             };
+            if status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && sense.is_none() {
+                tracing::warn!(
+                    target: "freemkv::unlock",
+                    opcode = cdb.first().copied().unwrap_or(0),
+                    error = %e,
+                    "unlocker command failed at the transport"
+                );
+            }
             let sense_buf = sense.map(|s| {
                 let mut b = [0u8; 32];
                 b[2] = s.sense_key & 0x0F;
@@ -106,11 +116,14 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
         timeout_ms: u32,
     ) -> fu::scsi::Result<fu::scsi::ScsiResult> {
         let d = to_lib_dir(dir);
-        to_fu_result(if self.critical > 0 {
-            self.drive.exec_uncancellable(cdb, d, data, timeout_ms)
-        } else {
-            self.drive.exec(cdb, d, data, timeout_ms)
-        })
+        to_fu_result(
+            cdb,
+            if self.critical > 0 {
+                self.drive.exec_uncancellable(cdb, d, data, timeout_ms)
+            } else {
+                self.drive.exec(cdb, d, data, timeout_ms)
+            },
+        )
     }
 
     fn pause(&mut self, d: std::time::Duration) -> fu::scsi::Result<()> {
@@ -142,6 +155,7 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
             crate::drive::CleanupCtx::Plain
         };
         to_fu_result(
+            cdb,
             self.drive
                 .exec_cleanup(cdb, to_lib_dir(dir), data, timeout_ms, ctx),
         )

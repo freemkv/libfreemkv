@@ -39,3 +39,27 @@ fn timeout_does_not_kill_transport() {
     assert_ne!(transport.fd, -1, "fd valid after recovery");
     assert_ne!(transport.fd, fd_before, "fd fresh after recovery");
 }
+
+// BU40N field report: the command right after a transport fault ran before the reopen
+// thread published and failed as an unplug (E1000). It must wait for the reopen.
+#[test]
+fn execute_waits_for_a_pending_reopen() {
+    let mut transport = SgIoTransport::open(Path::new("/dev/null")).expect("open /dev/null");
+    let fd = std::mem::replace(&mut transport.fd, -1);
+    transport
+        .reopen_pending
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let (slot, dead) = (transport.fd_recovery.clone(), transport.dead.clone());
+    let pending = transport.reopen_pending.clone();
+    let reopen = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(publish_recovered_fd(&slot, &dead, fd), None);
+        pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    });
+    let tur = [0x00, 0, 0, 0, 0, 0];
+    let r = transport.execute(&tur, DataDirection::None, &mut [], 5_000);
+    reopen.join().unwrap();
+    // /dev/null refuses SG_IO: an ioctl error proves the command ran on the reopened fd.
+    assert!(matches!(r, Err(Error::IoError { .. })), "got {r:?}");
+    assert_eq!(transport.fd, fd);
+}

@@ -467,8 +467,9 @@ pub(super) fn bus_step_guard<T>(
     Ok(r)
 }
 
-// The AACS bus step of a live scan, run after the AACS files are captured. A dead bus
-// aborts like `Drive::init`, and a Stop during the AKE is `Halted`.
+// The AACS bus step of a live scan, run after the AACS files are captured. A Stop during
+// the AKE is `Halted`; a transport fault is a failed handshake (as in 1.7): a key source
+// may still supply the key, and a truly dead bus fails the reads that follow.
 pub(super) fn aacs_bus_step(
     session: &mut crate::drive::Drive,
     opts: &ScanOptions,
@@ -485,7 +486,14 @@ pub(super) fn aacs_bus_step(
     match r {
         Ok(CertRoute::Handshake(h)) => Ok(BusOutcome::Handshake(h)),
         Ok(CertRoute::FirmwareUnlocked) => Ok(BusOutcome::FirmwareUnlocked),
-        Err(CertFail::Transport) => Err(crate::unlock_bridge::unlock_transport_error()),
+        Err(CertFail::Transport) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "cert_handshake_transport_fault",
+                "AACS cert handshake hit a transport fault; continuing without its Volume ID — a key source may still supply this disc's key."
+            );
+            Ok(BusOutcome::Failed(Error::AacsHostCertRejected))
+        }
         Err(CertFail::Other(f)) => {
             tracing::info!(
                 target: "freemkv::disc",
