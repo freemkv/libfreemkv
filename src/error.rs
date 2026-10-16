@@ -73,6 +73,8 @@ pub const E_IMAGE_SCOPED: u16 = 6022;
 /// An HD-DVD `ADV_OBJ/VPLST*.XPL` playlist exceeds the parser's size cap. Logged by
 /// `disc::hddvd`, which then falls back to the per-clip heuristic; no [`Error`] variant.
 pub const E_XPL_TOO_LARGE: u16 = 6023;
+/// Invalid/truncated BD+ SVM section framing.
+pub const E_SVM_PARSE: u16 = 6024;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -439,6 +441,9 @@ pub enum Error {
     Halted,
     MplsParse,
     ClpiParse,
+    SvmParse {
+        offset: usize,
+    },
     UdfNotFound {
         path: String,
     },
@@ -1036,6 +1041,7 @@ impl Error {
             Error::Halted => E_HALTED,
             Error::MplsParse => E_MPLS_PARSE,
             Error::ClpiParse => E_CLPI_PARSE,
+            Error::SvmParse { .. } => E_SVM_PARSE,
             Error::UdfNotFound { .. } => E_UDF_NOT_FOUND,
             Error::UdfUnrecordedExtent { .. } => E_UDF_UNRECORDED_EXTENT,
             Error::UdfNotFilesystem => E_UDF_NOT_FILESYSTEM,
@@ -1189,6 +1195,7 @@ impl std::fmt::Display for Error {
             Error::MapfileInvalid { kind } => {
                 write!(f, "E{}: {}", self.code(), kind)
             }
+            Error::SvmParse { offset } => write!(f, "E{}: {}", self.code(), offset),
             Error::UnsupportedDrive {
                 vendor_id,
                 product_id,
