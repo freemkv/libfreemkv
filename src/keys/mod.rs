@@ -92,7 +92,7 @@ pub struct AcquireOptions<'a> {
 /// The outcome of [`KeyRing::acquire`]: the ring, plus the per-source walk.
 pub struct KeyResolution {
     /// Opaque BD+ records acquired alongside the keys; no downstream interpretation.
-    pub bdp: Vec<Vec<u8>>,
+    pub bdp: Vec<crate::keysource::BdPlusRecord>,
     pub keys: KeyRing,
     pub trace: ResolutionTrace,
 }

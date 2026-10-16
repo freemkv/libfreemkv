@@ -107,7 +107,7 @@ enum Asked {
 
 // The state of one `resolve` run.
 struct Run<'a> {
-    bdp: Vec<Vec<u8>>,
+    bdp: Vec<crate::keysource::BdPlusRecord>,
     halt: &'a Halt,
     // The op's progress: busy around each source call (stop design §2.1 item 2).
     progress: Option<&'a Liveness>,
@@ -187,7 +187,7 @@ impl Run<'_> {
                 // Bound the aggregate too: a run may ask more than one source/piece.
                 let mut companion = r.bdp;
                 companion.retain(|record| !self.bdp.contains(record));
-                let bytes: usize = self.bdp.iter().chain(&companion).map(Vec::len).sum();
+                let bytes: usize = self.bdp.iter().chain(&companion).map(crate::keysource::BdPlusRecord::byte_len).sum();
                 if self.bdp.len() + companion.len() > 256 || bytes > 8 * 1024 * 1024 {
                     tracing::warn!(target: "freemkv::keys", "BD+ companion budget exceeded; keeping keys without this companion set");
                 } else if !r.keys.is_empty() {

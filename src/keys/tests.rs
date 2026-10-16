@@ -500,7 +500,10 @@ fn svm_context_and_bdp_records_survive_key_resolution() {
             assert_eq!(ctx.svm(), Some([0, 255, 128].as_slice()));
             Ok(crate::keysource::UnitKeyResolution {
                 keys: vec![UnitKey::new(0, K1)],
-                bdp: vec![vec![0, 255, 128]],
+                bdp: vec![crate::keysource::BdPlusRecord {
+                    selector: b"generic006".to_vec(),
+                    responses: vec![Some(vec![0, 255, 128]), None, Some(vec![])],
+                }],
                 ..Default::default()
             })
         }
@@ -525,7 +528,13 @@ fn svm_context_and_bdp_records_survive_key_resolution() {
         &FakeClock::default(),
     )
     .unwrap();
-    assert_eq!(result.bdp, vec![vec![0, 255, 128]]);
+    assert_eq!(
+        result.bdp,
+        vec![crate::keysource::BdPlusRecord {
+            selector: b"generic006".to_vec(),
+            responses: vec![Some(vec![0, 255, 128]), None, Some(vec![])]
+        }]
+    );
     assert_eq!(result.keys.status().keyed, 1);
 }
 

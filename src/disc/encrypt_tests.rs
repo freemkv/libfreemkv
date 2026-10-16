@@ -144,7 +144,9 @@ fn build_aacs_fs(disc: &mut MemDisc, files: &[AacsFile]) -> udf::UdfFs {
 #[test]
 fn primary_svm_capture_is_optional_bounded_and_verbatim() {
     let mut disc = MemDisc::new();
-    let data = vec![0, 255, 128, 42];
+    // Real primary files can be padded to 20 MiB, despite a much smaller code image.
+    let mut data = vec![0; 20 * 1024 * 1024];
+    data[..4].copy_from_slice(&[0, 255, 128, 42]);
     let mut fs = build_aacs_fs(
         &mut disc,
         &[AacsFile {
@@ -189,7 +191,7 @@ fn primary_svm_capture_is_optional_bounded_and_verbatim() {
         .find(|e| e.name == "00001.svm")
         .unwrap();
     entry.name = "0000.svm".into();
-    entry.size = 4 * 1024 * 1024 + 1;
+    entry.size = 64 * 1024 * 1024 + 1;
     assert!(capture_svm(&mut disc, &fs).unwrap().is_none());
 }
 

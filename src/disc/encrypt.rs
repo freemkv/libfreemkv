@@ -165,7 +165,9 @@ fn capture_svm(
     reader: &mut dyn SectorSource,
     fs: &udf::UdfFs,
 ) -> Result<Option<std::sync::Arc<[u8]>>> {
-    const MAX_SVM_BYTES: usize = 4 * 1024 * 1024;
+    // Primary SVM files can include padding beyond the declared code image
+    // (Cast Away is 20 MiB). Preserve raw bytes without interpreting the format.
+    const MAX_SVM_BYTES: usize = 64 * 1024 * 1024;
     let Some(dir) = fs.find_dir("/BDSVM") else {
         return Ok(None);
     };

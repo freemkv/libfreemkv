@@ -268,6 +268,30 @@ impl ResolveCtx for DiscInputsCtx<'_> {
     }
 }
 
+/// A selected BD+ record and its ordered decoded responses. No FUT semantics
+/// are inferred. The seven response indices use the online protocol's fixed
+/// profile; `None` is missing, `Some(vec![])` is a successful empty response.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BdPlusRecord {
+    pub selector: Vec<u8>,
+    pub responses: Vec<Option<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for BdPlusRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BdPlusRecord")
+            .field("selector", &"<redacted>")
+            .field("responses", &self.responses.len())
+            .finish()
+    }
+}
+
+impl BdPlusRecord {
+    pub(crate) fn byte_len(&self) -> usize {
+        self.selector.len() + self.responses.iter().flatten().map(Vec::len).sum::<usize>()
+    }
+}
+
 /// The de-conflated result of a source's unit-key resolution: the keys it
 /// produced (empty when none) PLUS why it produced them — so a caller can tell
 /// a genuine "no entry for this disc" from a MATCHED disc that yielded no
@@ -276,7 +300,7 @@ impl ResolveCtx for DiscInputsCtx<'_> {
 #[derive(Clone, Default)]
 pub struct UnitKeyResolution {
     /// Opaque binary BD+ records returned for this request; empty on no match.
-    pub bdp: Vec<Vec<u8>>,
+    pub bdp: Vec<BdPlusRecord>,
     /// Terminal Unit Keys produced (empty = this source yielded none).
     pub keys: Vec<UnitKey>,
     /// The source matched this disc in its store (by hash / VID), even if it
