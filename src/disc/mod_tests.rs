@@ -916,6 +916,7 @@ fn byte_offset_in_title_saturates_the_extent_end() {
 #[test]
 fn aacs_state_and_key_debug_are_redacted() {
     let st = AacsState {
+        svm: None,
         version: 2,
         bus_encryption: true,
         mkb_version: Some(77),
@@ -3159,6 +3160,7 @@ fn make_test_disc(sectors: u32, name: &str) -> Disc {
 /// An AACS state with every capture field inert (no keys live on `AacsState`, KU §2.2).
 fn aacs_empty() -> AacsState {
     AacsState {
+        svm: None,
         version: 2,
         bus_encryption: true,
         mkb_version: None,
@@ -5529,12 +5531,14 @@ fn aacs_disc_hash_is_the_captured_hash_without_its_0x_prefix() {
         "no AACS state => no disc to name"
     );
     disc.aacs = Some(AacsState {
+        svm: None,
         disc_hash: format!("0x{SHA1}"),
         ..aacs_empty()
     });
     assert_eq!(disc.aacs_disc_hash(), SHA1);
     // Already bare (no prefix) passes through unchanged, never re-stripped.
     disc.aacs = Some(AacsState {
+        svm: None,
         disc_hash: SHA1.to_string(),
         ..aacs_empty()
     });

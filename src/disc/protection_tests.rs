@@ -22,6 +22,7 @@ fn disc(format: DiscFormat) -> Disc {
 
 fn aacs(version: u8, disc_hash: &str, volume_id: [u8; 16]) -> AacsState {
     AacsState {
+        svm: None,
         version,
         bus_encryption: true,
         mkb_version: None,

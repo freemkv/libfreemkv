@@ -73,6 +73,9 @@ impl DecodeSampleSet {
 /// see the impl below.
 #[derive(Clone)]
 pub struct DiscInputs {
+    /// Optional primary BD+ VM image, shared across resolver attempts.
+    /// Sources own any protocol-specific identity derivation.
+    pub svm: Option<std::sync::Arc<[u8]>>,
     /// SHA-1 of `Unit_Key_RO.inf`, `0x`-prefixed hex. The value a keydb keys
     /// its per-disc entries by, and a key server identifies the disc with.
     pub disc_hash: String,
@@ -130,6 +133,10 @@ impl std::fmt::Debug for DiscInputs {
 /// scan-time [`DiscInputs`]; the trait keeps the lazy signature so a future
 /// implementation can fetch on demand without a source-API break.)
 pub trait ResolveCtx {
+    /// Raw primary BD+ VM image, when captured. Never sent implicitly.
+    fn svm(&self) -> Option<&[u8]> {
+        None
+    }
     /// SHA-1 of `Unit_Key_RO.inf`, `0x`-prefixed hex — the per-disc lookup key.
     fn disc_hash(&self) -> &str;
     /// The disc's human title (UDF/ISO volume identifier), when captured.
@@ -225,6 +232,9 @@ impl<'a> DiscInputsCtx<'a> {
 }
 
 impl ResolveCtx for DiscInputsCtx<'_> {
+    fn svm(&self) -> Option<&[u8]> {
+        self.inner.svm.as_deref()
+    }
     fn disc_hash(&self) -> &str {
         &self.inner.disc_hash
     }
@@ -263,8 +273,10 @@ impl ResolveCtx for DiscInputsCtx<'_> {
 /// a genuine "no entry for this disc" from a MATCHED disc that yielded no
 /// derivable key. The bare `Vec` of [`KeySource::get_unit_keys`] cannot make
 /// that distinction; [`KeySource::resolve_unit_keys`] carries it.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct UnitKeyResolution {
+    /// Opaque binary BD+ records returned for this request; empty on no match.
+    pub bdp: Vec<Vec<u8>>,
     /// Terminal Unit Keys produced (empty = this source yielded none).
     pub keys: Vec<UnitKey>,
     /// The source matched this disc in its store (by hash / VID), even if it
@@ -286,6 +298,20 @@ pub struct UnitKeyResolution {
     pub store_entries: Option<usize>,
 }
 
+impl std::fmt::Debug for UnitKeyResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnitKeyResolution")
+            .field("keys", &self.keys)
+            .field("bdp", &"<redacted>")
+            .field("bdp_records", &self.bdp.len())
+            .field("matched", &self.matched)
+            .field("miss_path", &self.miss_path)
+            .field("matched_entry", &self.matched_entry)
+            .field("store_entries", &self.store_entries)
+            .finish()
+    }
+}
+
 /// A key source: an adapter over a backing store that resolves a disc's terminal
 /// Unit Keys.
 ///
@@ -295,6 +321,13 @@ pub struct UnitKeyResolution {
 /// [`get_unit_keys`](Self::get_unit_keys) (base per-CPS-unit),
 /// [`get_fmts_indexes`](Self::get_fmts_indexes) (AACS 2.1 forensic set).
 pub trait KeySource {
+    /// Rich forensic response, retaining companion records from the same call.
+    fn resolve_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<UnitKeyResolution, Error> {
+        Ok(UnitKeyResolution {
+            keys: self.get_fmts_indexes(ctx)?,
+            ..Default::default()
+        })
+    }
     /// Resolve this disc's base per-CPS-unit Unit Keys from this source. An empty
     /// `Vec` is a genuine "no key here"; `Err` is a source failure.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error>;

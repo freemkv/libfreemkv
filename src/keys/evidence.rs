@@ -95,6 +95,7 @@ impl Piece {
 
 // The AACS structures a source supplied. Key material: never printed.
 pub(crate) struct AacsEvidence {
+    pub(crate) svm: Option<std::sync::Arc<[u8]>>,
     pub(crate) version: u8,
     pub(crate) mkb: Vec<u8>,
     pub(crate) unit_key_ro: Vec<u8>,
@@ -197,6 +198,7 @@ impl KeyEvidence {
         };
         let n_declared = disc.declared_cps_units();
         ev.aacs = Some(AacsEvidence {
+            svm: inputs.svm,
             version: inputs.version,
             mkb: inputs.mkb,
             unit_key_ro: inputs.unit_key_ro,

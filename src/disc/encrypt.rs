@@ -159,8 +159,41 @@ fn disc_is_uhd(udf_fs: &udf::UdfFs, reader: &mut dyn SectorSource) -> Result<boo
         .is_some_and(|g| matches!(g, AacsVersion::V20 | AacsVersion::V21)))
 }
 
+/// Capture only the primary BD+ VM, with no server-specific interpretation.
+/// Secondary VMs are not substitutes for the primary image.
+fn capture_svm(
+    reader: &mut dyn SectorSource,
+    fs: &udf::UdfFs,
+) -> Result<Option<std::sync::Arc<[u8]>>> {
+    const MAX_SVM_BYTES: usize = 4 * 1024 * 1024;
+    let Some(dir) = fs.find_dir("/BDSVM") else {
+        return Ok(None);
+    };
+    let primary = ["00000.svm", "0000.svm"].iter().find_map(|name| {
+        dir.entries
+            .iter()
+            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(name))
+    });
+    let Some(entry) = primary else {
+        return Ok(None);
+    };
+    if entry.size > MAX_SVM_BYTES as u64 {
+        tracing::warn!(target: "freemkv::scan", "primary SVM exceeds capture limit; skipping BD+");
+        return Ok(None);
+    }
+    match fs.read_file_prefix(reader, &format!("/BDSVM/{}", entry.name), MAX_SVM_BYTES) {
+        Ok(bytes) => Ok(Some(bytes.into())),
+        Err(Error::Halted) => Err(Error::Halted),
+        Err(e) => {
+            tracing::warn!(target: "freemkv::scan", error_code = e.code(), "primary SVM unreadable; skipping BD+");
+            Ok(None)
+        }
+    }
+}
+
 /// A disc's AACS files, read before any AACS command is sent to the drive.
 pub(super) struct AacsCapture {
+    pub(super) svm: Option<std::sync::Arc<[u8]>>,
     /// `Unit_Key_RO.inf`, or why neither copy could be read.
     pub(super) uk_ro: Result<Vec<u8>>,
     /// The content cert's BEE flag; `None` when the cert is missing or unparseable.
@@ -248,6 +281,7 @@ pub(super) fn capture(
         aacs::mkb::resolve_aacs_version(cc.as_ref().map(|c| c.version.major()), &mkb, index)
             .major();
     Ok(AacsCapture {
+        svm: capture_svm(reader, udf_fs)?,
         uk_ro,
         cert_bee: cc.map(|c| c.bus_encryption),
         bus_encryption,
@@ -269,6 +303,7 @@ pub(super) fn resolve_aacs(
         Ok(uk_ro) => {
             let dh = aacs::inf::disc_hash(&uk_ro);
             let state = AacsState {
+                svm: cap.svm,
                 version: cap.version,
                 bus_encryption: cap.bus_encryption,
                 mkb_version,

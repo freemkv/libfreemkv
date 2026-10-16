@@ -486,6 +486,49 @@ fn resolve(fx: &Fx, scope: KeyScope, specs: &[Spec]) -> Result<KeyRing> {
     )
 }
 
+#[test]
+fn svm_context_and_bdp_records_survive_key_resolution() {
+    struct Companion;
+    impl KeySource for Companion {
+        fn get_unit_keys(&self, _: &dyn ResolveCtx) -> Result<Vec<UnitKey>> {
+            panic!("rich resolution must retain companion data")
+        }
+        fn resolve_unit_keys(
+            &self,
+            ctx: &dyn ResolveCtx,
+        ) -> Result<crate::keysource::UnitKeyResolution> {
+            assert_eq!(ctx.svm(), Some([0, 255, 128].as_slice()));
+            Ok(crate::keysource::UnitKeyResolution {
+                keys: vec![UnitKey::new(0, K1)],
+                bdp: vec![vec![0, 255, 128]],
+                ..Default::default()
+            })
+        }
+        fn label(&self) -> &'static str {
+            "companion"
+        }
+    }
+    let mut fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
+    fx.disc.aacs.as_mut().unwrap().svm = Some(std::sync::Arc::from([0, 255, 128]));
+    let mut reader = fx.source();
+    let ctx = crate::ctx::Ctx::new(Halt::new());
+    let ev =
+        KeyEvidence::from_disc(&fx.disc, &mut reader, KeyScope::Titles(vec![0]), &ctx).unwrap();
+    let factory: crate::session::KeySourceFactory =
+        std::sync::Arc::new(|| vec![Box::new(Companion)]);
+    let result = super::resolve::acquire(
+        &ev,
+        &mut Sampler::new(&mut reader),
+        &factory,
+        AcquireOptions::default(),
+        &ctx,
+        &FakeClock::default(),
+    )
+    .unwrap();
+    assert_eq!(result.bdp, vec![vec![0, 255, 128]]);
+    assert_eq!(result.keys.status().keyed, 1);
+}
+
 fn code<T>(r: Result<T>) -> u16 {
     match r {
         Ok(_) => panic!("expected a refusal, got Ok"),

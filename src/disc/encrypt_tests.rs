@@ -141,6 +141,58 @@ fn build_aacs_fs(disc: &mut MemDisc, files: &[AacsFile]) -> udf::UdfFs {
     build_aacs_fs_with_index(disc, files, None)
 }
 
+#[test]
+fn primary_svm_capture_is_optional_bounded_and_verbatim() {
+    let mut disc = MemDisc::new();
+    let data = vec![0, 255, 128, 42];
+    let mut fs = build_aacs_fs(
+        &mut disc,
+        &[AacsFile {
+            name: "00000.svm",
+            icb_lba: 60,
+            data_lba: 5000,
+            contents: data.clone(),
+        }],
+    );
+    assert!(capture_svm(&mut disc, &fs).unwrap().is_none());
+    fs.root
+        .entries
+        .iter_mut()
+        .find(|e| e.name == "AACS")
+        .unwrap()
+        .name = "BDSVM".into();
+    assert_eq!(capture_svm(&mut disc, &fs).unwrap().unwrap().as_ref(), data);
+    let dir = fs
+        .root
+        .entries
+        .iter_mut()
+        .find(|e| e.name == "BDSVM")
+        .unwrap();
+    dir.entries
+        .iter_mut()
+        .find(|e| e.name == "00000.svm")
+        .unwrap()
+        .name = "00001.svm".into();
+    assert!(
+        capture_svm(&mut disc, &fs).unwrap().is_none(),
+        "secondary VM is not a primary"
+    );
+    let dir = fs
+        .root
+        .entries
+        .iter_mut()
+        .find(|e| e.name == "BDSVM")
+        .unwrap();
+    let entry = dir
+        .entries
+        .iter_mut()
+        .find(|e| e.name == "00001.svm")
+        .unwrap();
+    entry.name = "0000.svm".into();
+    entry.size = 4 * 1024 * 1024 + 1;
+    assert!(capture_svm(&mut disc, &fs).unwrap().is_none());
+}
+
 // As `build_aacs_fs`, plus `/BDMV/index.bdmv` holding `index` when given.
 fn build_aacs_fs_with_index(
     disc: &mut MemDisc,

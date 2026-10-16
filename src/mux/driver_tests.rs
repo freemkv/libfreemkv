@@ -1064,6 +1064,7 @@ fn aacs_session_disc(title: DiscTitle) -> crate::disc::Disc {
         titles: vec![title],
         region: crate::disc::DiscRegion::Free,
         aacs: Some(crate::disc::AacsState {
+            svm: None,
             version: crate::aacs::mkb::AACS_MAJOR_UHD,
             bus_encryption: false,
             mkb_version: None,

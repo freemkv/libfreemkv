@@ -76,6 +76,7 @@ pub struct AacsStateBuilder {
 pub fn aacs_state() -> AacsStateBuilder {
     AacsStateBuilder {
         state: AacsState {
+            svm: None,
             version: 1,
             bus_encryption: false,
             mkb_version: None,

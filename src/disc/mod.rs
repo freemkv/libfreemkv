@@ -1701,6 +1701,8 @@ impl DiscTitle {
 
 /// AACS decryption state for a disc.
 pub struct AacsState {
+    /// Optional raw primary BD+ VM image. No server-specific interpretation.
+    pub svm: Option<std::sync::Arc<[u8]>>,
     /// AACS version (1 or 2)
     pub version: u8,
     /// Whether bus encryption is enabled (always true for AACS 2.0 / UHD)
@@ -3270,6 +3272,7 @@ impl Disc {
     /// identity plus the on-disc AACS structures.
     pub fn inputs(&self) -> Option<crate::keysource::DiscInputs> {
         self.aacs.as_ref().map(|a| crate::keysource::DiscInputs {
+            svm: a.svm.clone(),
             disc_hash: a.disc_hash.clone(),
             volume_id: a.volume_id,
             version: a.version,

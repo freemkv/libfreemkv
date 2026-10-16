@@ -151,7 +151,7 @@ fn hits(rel: &str, src: &str) -> Vec<(usize, &'static str)> {
     let (code, bare) = lex(src);
     let mut exempt = fn_spans(&bare, |n| rel == "src/test_util.rs" && n == "decrypt_unit");
     exempt.extend(fn_spans(&bare, |n| {
-        rel == "src/keysource.rs" && n == "resolve_unit_keys"
+        rel == "src/keysource.rs" && matches!(n, "resolve_unit_keys" | "resolve_fmts_indexes")
     }));
     let inside = |k: usize| exempt.iter().any(|&(a, b)| a <= k && k < b);
     let helper: Vec<char> = "test_util::".chars().collect();
@@ -291,6 +291,16 @@ fn the_structural_guard_skips_comments_and_keeps_its_allow_path() {
         "the trait op's own default"
     );
     let other = "fn other(&self, c: &C) -> R { self.get_unit_keys(c) }\n";
+    let forensic = "fn resolve_fmts_indexes(&self, c: &C) -> R { self.get_fmts_indexes(c) }\n";
+    assert!(
+        hits("src/keysource.rs", forensic).is_empty(),
+        "rich forensic trait default"
+    );
+    assert_eq!(
+        hits("src/session.rs", forensic).len(),
+        1,
+        "no external legacy calls"
+    );
     assert_eq!(hits("src/keysource.rs", other).len(), 1, "only that fn");
     assert_eq!(
         hits("src/session.rs", forward).len(),

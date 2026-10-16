@@ -107,6 +107,7 @@ enum Asked {
 
 // The state of one `resolve` run.
 struct Run<'a> {
+    bdp: Vec<Vec<u8>>,
     halt: &'a Halt,
     // The op's progress: busy around each source call (stop design §2.1 item 2).
     progress: Option<&'a Liveness>,
@@ -178,13 +179,27 @@ impl Run<'_> {
             // moves no CDB, so it is busy for the idle-only T29 probe.
             let busy = self.progress.map(Liveness::busy);
             let answer = if forensic {
-                src.get_fmts_indexes(&ctx).map(|k| (k, None))
+                src.resolve_fmts_indexes(&ctx)
             } else {
-                src.resolve_unit_keys(&ctx).map(|r| {
-                    let info = (r.matched, r.matched_entry, r.store_entries, r.miss_path);
-                    (r.keys, Some(info))
-                })
-            };
+                src.resolve_unit_keys(&ctx)
+            }
+            .map(|r| {
+                // Bound the aggregate too: a run may ask more than one source/piece.
+                let mut companion = r.bdp;
+                companion.retain(|record| !self.bdp.contains(record));
+                let bytes: usize = self.bdp.iter().chain(&companion).map(Vec::len).sum();
+                if self.bdp.len() + companion.len() > 256 || bytes > 8 * 1024 * 1024 {
+                    tracing::warn!(target: "freemkv::keys", "BD+ companion budget exceeded; keeping keys without this companion set");
+                } else if !r.keys.is_empty() {
+                    for record in companion {
+                        if !self.bdp.contains(&record) {
+                            self.bdp.push(record);
+                        }
+                    }
+                }
+                let info = (r.matched, r.matched_entry, r.store_entries, r.miss_path);
+                (r.keys, (!forensic).then_some(info))
+            });
             drop(busy);
             match answer {
                 Ok((keys, info)) => {
@@ -374,6 +389,7 @@ pub(crate) fn acquire(
     // Step 1: not AACS, or nothing decrypted: no source call.
     let (Some(aacs), false) = (ev.aacs.as_ref(), ev.scope == KeyScope::None) else {
         return Ok(KeyResolution {
+            bdp: Vec::new(),
             keys: KeyRing::none(),
             trace: ResolutionTrace::new(),
         });
@@ -395,6 +411,7 @@ pub(crate) fn acquire(
     // Step 4: the VID, in memory only.
     let vid = aacs.vid.or(opts.vid).or(seed.and_then(|s| s.0.vid));
     let inputs = DiscInputs {
+        svm: aacs.svm.clone(),
         disc_hash: disc_hash.clone(),
         volume_id: vid.unwrap_or([0u8; 16]),
         version: aacs.version,
@@ -407,6 +424,7 @@ pub(crate) fn acquire(
     let n_src = built.len();
     let vid_consumer = built.iter().any(|s| s.uses_vid());
     let mut run = Run {
+        bdp: Vec::new(),
         halt,
         progress: opts.liveness,
         clock,
@@ -461,6 +479,7 @@ pub(crate) fn acquire(
         "keys: resolved up front"
     );
     Ok(KeyResolution {
+        bdp: run.bdp,
         keys: KeyRing(Arc::new(inner)),
         trace,
     })

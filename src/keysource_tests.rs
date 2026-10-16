@@ -90,6 +90,7 @@ fn disc_inputs_ctx_maps_fields() {
     uk_ro[80..96].copy_from_slice(&key_bytes);
 
     let inputs = DiscInputs {
+        svm: Some(std::sync::Arc::from([0, 255, 128])),
         disc_hash: "0xABC".into(),
         volume_id: [0u8; 16],
         version: crate::aacs::mkb::AACS_MAJOR_BD,
@@ -101,6 +102,11 @@ fn disc_inputs_ctx_maps_fields() {
 
     // Zero VID → None.
     let ctx = DiscInputsCtx::new(&inputs);
+    assert_eq!(ctx.svm(), Some([0, 255, 128].as_slice()));
+    assert!(std::sync::Arc::ptr_eq(
+        inputs.svm.as_ref().unwrap(),
+        inputs.clone().svm.as_ref().unwrap()
+    ));
     assert_eq!(ctx.disc_hash(), "0xABC");
     assert_eq!(ctx.title(), Some("TITLE_X"));
     assert!(ctx.vid().is_none(), "all-zero VID is the no-VID sentinel");
@@ -235,6 +241,7 @@ fn read_encrypted_units_saturates_lba_near_u32_max() {
 
 fn empty_inputs() -> DiscInputs {
     DiscInputs {
+        svm: None,
         disc_hash: String::new(),
         volume_id: [0u8; 16],
         version: crate::aacs::mkb::AACS_MAJOR_UHD,
@@ -429,6 +436,7 @@ fn disc_inputs_ctx_parses_unit_keys_at_the_version_stride() {
     inf[key1_v20_at..key1_v20_at + 16].fill(0x20);
 
     let base = DiscInputs {
+        svm: None,
         disc_hash: String::new(),
         volume_id: [0u8; 16],
         version: AACS_MAJOR_UHD,
@@ -439,6 +447,7 @@ fn disc_inputs_ctx_parses_unit_keys_at_the_version_stride() {
     };
     let k20 = DiscInputsCtx::new(&base).enc_title_keys().unwrap().to_vec();
     let v10_inputs = DiscInputs {
+        svm: None,
         version: AACS_MAJOR_BD,
         ..base.clone()
     };
@@ -462,6 +471,7 @@ fn disc_inputs_ctx_parses_unit_keys_at_the_version_stride() {
 #[test]
 fn disc_inputs_debug_is_redacted() {
     let inputs = DiscInputs {
+        svm: None,
         disc_hash: "0xAA".into(),
         volume_id: [0xD5; 16],
         version: 2,

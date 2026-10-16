@@ -324,6 +324,7 @@ fn aacs_disc() -> Disc {
     let mut d = clear_disc();
     d.encrypted = true;
     d.aacs = Some(crate::disc::AacsState {
+        svm: None,
         version: 1,
         bus_encryption: false,
         mkb_version: None,
