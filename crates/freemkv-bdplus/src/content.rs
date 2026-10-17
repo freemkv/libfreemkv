@@ -4,15 +4,18 @@
 //! reader addressed by numeric `BDSVM/<name>.svm` identifier and parsed
 //! section index. Section numbers are the on-disc 2 MiB stride indexes used by
 //! the existing `Svm` parser, not FUT segment numbers.
+//! The [content-code file patent] specifies the corresponding call as file
+//! number, 2 MiB block, byte offset, requested length and VM destination.
+//!
+//! [content-code file patent]: ../docs/us20070186110_bdplus_contentcode_files.pdf "upstream: https://patentimages.storage.googleapis.com/33/21/df/172424b8f85488/US20070186110A1.pdf"
 
 use super::{BdPlusError, BdPlusResult, Svm};
 use std::collections::BTreeMap;
 
 /// Supply the declared body of a section from a numbered SVM file.
 ///
-/// Implementations do not seek within or alter the original file; the engine
-/// writes a bounded prefix into VM memory according to the content code's
-/// requested length.
+/// Implementations return the verified block body; the engine applies the
+/// requested within-block offset and bounded length before writing VM memory.
 pub trait BdPlusContent {
     fn section_body(&self, name: u32, section: u32) -> BdPlusResult<&[u8]>;
 }

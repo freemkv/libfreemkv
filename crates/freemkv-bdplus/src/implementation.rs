@@ -131,8 +131,8 @@ pub const HOST_SERVICES: &[HostService] = &[
     service(
         0x540,
         "load content code",
-        ImplementationState::Partial,
-        Some("nonzero content offsets and complete filename contract"),
+        ImplementationState::Implemented,
+        None,
     ),
     service(0x550, "media check", ImplementationState::Implemented, None),
     service(
@@ -150,8 +150,8 @@ pub const HOST_SERVICES: &[HostService] = &[
     service(
         0x8010,
         "diagnostic log",
-        ImplementationState::Stub,
-        Some("bounded observer interface"),
+        ImplementationState::Implemented,
+        None,
     ),
 ];
 

@@ -76,8 +76,6 @@ pub enum BdPlusError {
     NoContentReader,
     /// A requested content section is not available in the attached reader.
     MissingContent { name: u32, section: u32 },
-    /// The requested content offset has no verified implementation yet.
-    UnsupportedContentOffset { offset: u32 },
     /// A trap was issued in an event where its ABI does not allow it.
     TrapNotPermittedInEvent { trap_id: u32 },
 }

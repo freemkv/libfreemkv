@@ -36,6 +36,9 @@ pub enum PlayerOperation {
         device: u32,
         question: u32,
     },
+    DiagnosticLog {
+        message: Vec<u8>,
+    },
     Memory {
         address: u32,
         length: usize,
@@ -79,6 +82,7 @@ impl PlayerRequest {
 pub enum PlayerMaterial {
     ApplicationAcknowledged,
     ApplicationValue(u32),
+    DiagnosticAcknowledged,
     UnwrappedAesKey([u8; 16]),
     Discovery(Vec<u8>),
     Memory(Vec<u8>),
@@ -204,6 +208,9 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 ) | (
                     PlayerOperation::Discovery { .. },
                     PlayerMaterial::Discovery(_)
+                ) | (
+                    PlayerOperation::DiagnosticLog { .. },
+                    PlayerMaterial::DiagnosticAcknowledged
                 ) | (PlayerOperation::Memory { .. }, PlayerMaterial::Memory(_))
                     | (PlayerOperation::MediaRead { .. }, PlayerMaterial::Media(_))
                     | (PlayerOperation::MediaKey, PlayerMaterial::MediaKey(_))
@@ -486,10 +493,6 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 Ok(Service::Status(OK))
             }
             0x540 => {
-                // Nonzero offset behavior still requires reference checks.
-                if args[2] != 0 {
-                    return Err(BdPlusError::UnsupportedContentOffset { offset: args[2] });
-                }
                 match self.vm.event() {
                     Some(BdPlusEvent::Start)
                     | Some(BdPlusEvent::Shutdown)
@@ -502,6 +505,9 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                         as usize;
                 let content = self.content.as_ref().ok_or(BdPlusError::NoContentReader)?;
                 let body = content.section_body(name, section)?;
+                let Some(body) = body.get(args[2] as usize..) else {
+                    return Ok(Service::Status(INVALID));
+                };
                 let actual = body.len().min(capacity);
                 self.vm.memory().read(destination, actual)?;
                 self.vm.memory_mut().write(destination, &body[..actual])?;
@@ -610,6 +616,14 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 Ok(Service::Status(OK))
             }
             0x550 => self.media_check(args),
+            0x8010 => {
+                let message = self.vm.memory().read(args[0], args[1] as usize)?.to_vec();
+                match self.player_reply.as_ref() {
+                    Some(PlayerMaterial::DiagnosticAcknowledged) => Ok(Service::Status(OK)),
+                    Some(PlayerMaterial::Unsupported) => Ok(Service::Status(INVALID)),
+                    _ => Ok(Service::Need(PlayerOperation::DiagnosticLog { message })),
+                }
+            }
             _ => Err(BdPlusError::UnsupportedTrap { trap_id: trap, pc }),
         }
     }

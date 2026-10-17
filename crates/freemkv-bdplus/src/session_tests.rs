@@ -471,21 +471,45 @@ fn media_check_requests_disc_bytes_and_hashes_complete_blocks() {
 }
 
 #[test]
-fn unknown_content_offset_does_not_silently_load_the_wrong_range() {
-    let mut session = session(&[0xe400_0540]);
+fn load_content_code_applies_the_documented_within_block_offset() {
+    let mut session = session(&[0xe400_0540, 0xe400_0010]);
     session.begin_event(BdPlusEvent::Start).unwrap();
-    arguments(&mut session, &[0, 0, 16, 0x280, 0x300]);
+    arguments(&mut session, &[0, 0, 6, 0x280, 0x300]);
     let mut content = BdPlusContentLibrary::default();
     content.insert(0, secondary_svm(b"wrong-prefix-data"));
     session.set_content(content);
     session.vm.memory_mut().store_u32(0x280, 4);
-    session.vm.memory_mut().store_u32(0x300, 0x1234_5678);
     assert_eq!(
-        session.run(10, &Halt::new()),
-        Err(BdPlusError::UnsupportedContentOffset { offset: 16 })
+        session.run(10, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
     );
-    assert_eq!(session.vm.memory().load_u32(0x300), 0x1234_5678);
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), b"pref");
     assert_eq!(session.vm.memory().load_u32(0x280), 4);
+}
+
+#[test]
+fn diagnostic_log_is_an_explicit_observer_boundary() {
+    let mut session = session(&[0xe400_8010, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    session.vm.memory_mut().write(0x300, b"hello").unwrap();
+    arguments(&mut session, &[0x300, 5]);
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(10, &Halt::new()).unwrap()
+    else {
+        panic!("expected diagnostic observer request");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::DiagnosticLog {
+            message: b"hello".to_vec(),
+        }
+    );
+    session
+        .provide_player_material(request.id(), PlayerMaterial::DiagnosticAcknowledged)
+        .unwrap();
+    assert_eq!(
+        session.run(10, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
 }
 
 fn secondary_svm(body: &[u8]) -> Svm {
