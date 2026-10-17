@@ -235,9 +235,7 @@ fn load_content_code_without_reader_or_missing_file_fails_without_consuming_trap
 fn load_content_code_refused_outside_permitted_events() {
     let mut session = session(&[0xe400_0540, 0xe400_0010]);
     session.set_content(BdPlusContentLibrary::default());
-    session
-        .begin_event(BdPlusEvent::ApplicationLayer { arg: 0, value: 0 })
-        .unwrap();
+    session.begin_event(BdPlusEvent::ApplicationLayer).unwrap();
     arguments(&mut session, &[1, 0, 0, 0x280, 0x300]);
     session.vm.memory_mut().store_u32(0x280, 8);
     assert_eq!(

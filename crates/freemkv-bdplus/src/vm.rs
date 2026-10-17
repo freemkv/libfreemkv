@@ -27,21 +27,9 @@ pub enum VmBoundary {
 pub enum BdPlusEvent {
     Start,
     Shutdown,
-    PlaybackFile { title: u32, clip_id: u32 },
-    ApplicationLayer { arg: u32, value: u32 },
+    TitleInit { title: u32 },
+    ApplicationLayer,
     ComputeSp { clip_id: u32, segment: u32 },
-}
-
-impl BdPlusEvent {
-    fn mailbox(self) -> [u32; 4] {
-        match self {
-            Self::Start => [0, 0, 0, 0],
-            Self::Shutdown => [0x10, 0, 0, 0],
-            Self::PlaybackFile { title, clip_id } => [0x110, title, clip_id, 0],
-            Self::ApplicationLayer { arg, value } => [0x210, arg, value, 0],
-            Self::ComputeSp { clip_id, segment } => [0x220, 0, clip_id, segment],
-        }
-    }
 }
 
 /// Integer CPU state, without HTTP, filesystem, player secrets or trap policy.
@@ -132,8 +120,31 @@ impl BdPlusVm {
     }
 
     fn set_event_fields(&mut self, event: BdPlusEvent) {
-        for (index, value) in event.mailbox().into_iter().enumerate() {
-            self.memory.store_u32(index as u32 * 4, value);
+        match event {
+            BdPlusEvent::Start => {
+                self.memory.store_u32(0, 0);
+                self.memory.store_u32(4, 0);
+            }
+            BdPlusEvent::Shutdown => {
+                self.memory.store_u32(0, 0x10);
+                self.memory.store_u32(4, 0);
+            }
+            BdPlusEvent::TitleInit { title } => {
+                self.memory.store_u32(0, 0x110);
+                self.memory.store_u32(4, 0);
+                self.memory.store_u32(8, title);
+            }
+            BdPlusEvent::ApplicationLayer => {
+                self.memory.store_u32(0, 0x210);
+                self.memory.store_u32(4, 0);
+                self.memory.store_u32(8, 1);
+            }
+            BdPlusEvent::ComputeSp { clip_id, segment } => {
+                self.memory.store_u32(0, 0x220);
+                self.memory.store_u32(4, 0);
+                self.memory.store_u32(8, clip_id);
+                self.memory.store_u32(12, segment);
+            }
         }
         if matches!(event, BdPlusEvent::ComputeSp { .. }) {
             self.memory.store_u32(0x20, 0);

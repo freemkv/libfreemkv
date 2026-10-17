@@ -124,6 +124,18 @@ fn events_preserve_machine_state_and_finish_does_not_erase_outputs() {
 }
 
 #[test]
+fn title_init_writes_only_the_verified_mailbox_argument() {
+    let image = program(&[0xe400_0010]);
+    let mut vm = BdPlusVm::load(&image).unwrap();
+    vm.memory_mut().store_u32(12, 0xfeed_beef);
+    vm.begin_event(BdPlusEvent::TitleInit { title: 7 }).unwrap();
+    assert_eq!(vm.memory().load_u32(0), 0x110);
+    assert_eq!(vm.memory().load_u32(4), 0);
+    assert_eq!(vm.memory().load_u32(8), 7);
+    assert_eq!(vm.memory().load_u32(12), 0xfeed_beef);
+}
+
+#[test]
 fn watchdog_yields_and_resets_without_discarding_machine_state() {
     let image = program(&[0xb3ff_fffc]);
     let mut vm = BdPlusVm::load(&image).unwrap();

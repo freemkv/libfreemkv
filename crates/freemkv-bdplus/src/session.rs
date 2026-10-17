@@ -286,7 +286,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 match self.vm.event() {
                     Some(BdPlusEvent::Start)
                     | Some(BdPlusEvent::Shutdown)
-                    | Some(BdPlusEvent::PlaybackFile { .. }) => {}
+                    | Some(BdPlusEvent::TitleInit { .. }) => {}
                     _ => return Err(BdPlusError::TrapNotPermittedInEvent { trap_id: trap }),
                 }
                 let (name, section, len_ptr, destination) = (args[0], args[1], args[3], args[4]);
