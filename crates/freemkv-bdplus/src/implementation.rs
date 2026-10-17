@@ -56,8 +56,8 @@ pub const HOST_SERVICES: &[HostService] = &[
     service(
         0x120,
         "private-key signature",
-        ImplementationState::Stub,
-        Some("message construction, key selectors and 40-byte result ABI"),
+        ImplementationState::Partial,
+        Some("control-word binding of optional execution and disc context"),
     ),
     service(
         0x130,

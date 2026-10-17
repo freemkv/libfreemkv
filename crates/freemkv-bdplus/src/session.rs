@@ -46,6 +46,11 @@ pub enum PlayerOperation {
         length: usize,
     },
     MediaKey,
+    PrivateKeySign {
+        key_id: u32,
+        control_word: u32,
+        message: Vec<u8>,
+    },
     Random {
         length: usize,
     },
@@ -79,6 +84,7 @@ pub enum PlayerMaterial {
     Memory(Vec<u8>),
     Media(Vec<u8>),
     MediaKey([u8; 16]),
+    Signature([u8; 40]),
     Random(Vec<u8>),
     VolumeId([u8; 16]),
     Unsupported,
@@ -201,6 +207,10 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 ) | (PlayerOperation::Memory { .. }, PlayerMaterial::Memory(_))
                     | (PlayerOperation::MediaRead { .. }, PlayerMaterial::Media(_))
                     | (PlayerOperation::MediaKey, PlayerMaterial::MediaKey(_))
+                    | (
+                        PlayerOperation::PrivateKeySign { .. },
+                        PlayerMaterial::Signature(_)
+                    )
                     | (PlayerOperation::Random { .. }, PlayerMaterial::Random(_))
                     | (PlayerOperation::VolumeId, PlayerMaterial::VolumeId(_))
             );
@@ -305,6 +315,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 Ok(Service::Status(OK))
             }
             0x110 => self.aes([args[0], args[1], args[2], args[3], args[4]]),
+            0x120 => self.private_key([args[0], args[1], args[2], args[3], args[4]]),
             0x130 => {
                 let length = args[1] as usize;
                 self.vm.memory().read(args[0], length)?;
@@ -697,6 +708,45 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             }
             _ => return Ok(Service::Status(INVALID)),
         }
+        Ok(Service::Status(OK))
+    }
+
+    fn private_key(&mut self, args: [u32; 5]) -> BdPlusResult<Service> {
+        const SIGNATURE_SIZE: usize = 40;
+        const MAX_MESSAGE_SIZE: usize = 0x20_000;
+
+        if !matches!(
+            self.vm.event(),
+            Some(BdPlusEvent::Start)
+                | Some(BdPlusEvent::Shutdown)
+                | Some(BdPlusEvent::TitleInit { .. })
+        ) {
+            return Err(BdPlusError::TrapNotPermittedInEvent { trap_id: 0x120 });
+        }
+        let (key_id, destination, source, length, control_word) =
+            (args[0], args[1], args[2], args[3], args[4]);
+        if key_id > 1 || length as usize > MAX_MESSAGE_SIZE {
+            return Ok(Service::Status(INVALID));
+        }
+        let output = checked_range(destination, SIGNATURE_SIZE)?;
+        let input = checked_range(source, length as usize)?;
+        self.vm.memory().read(destination, SIGNATURE_SIZE)?;
+        let message = self.vm.memory().read(source, length as usize)?.to_vec();
+        if ranges_overlap(&output, &input) {
+            return Ok(Service::Status(INVALID));
+        }
+        let signature = match self.player_reply.as_ref() {
+            Some(PlayerMaterial::Signature(signature)) => signature,
+            Some(PlayerMaterial::Unsupported) => return Ok(Service::Status(INVALID)),
+            _ => {
+                return Ok(Service::Need(PlayerOperation::PrivateKeySign {
+                    key_id,
+                    control_word,
+                    message,
+                }));
+            }
+        };
+        self.vm.memory_mut().write(destination, signature)?;
         Ok(Service::Status(OK))
     }
 

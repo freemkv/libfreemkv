@@ -253,6 +253,38 @@ fn random_trap_requests_exact_external_entropy_without_mutating_early() {
 }
 
 #[test]
+fn private_key_signing_is_a_typed_player_capability() {
+    let mut session = session(&[0xe400_0120, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[1, 0x400, 0x500, 4, 0x1122_3344]);
+    session.vm.memory_mut().write(0x500, b"test").unwrap();
+    session.vm.memory_mut().write(0x400, &[0xaa; 40]).unwrap();
+
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(10, &Halt::new()).unwrap()
+    else {
+        panic!("expected private-key request");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::PrivateKeySign {
+            key_id: 1,
+            control_word: 0x1122_3344,
+            message: b"test".to_vec(),
+        }
+    );
+    assert_eq!(session.vm.memory().read(0x400, 40).unwrap(), &[0xaa; 40]);
+
+    session
+        .provide_player_material(request.id(), PlayerMaterial::Signature([0x5a; 40]))
+        .unwrap();
+    assert_eq!(
+        session.run(10, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(session.vm.memory().read(0x400, 40).unwrap(), &[0x5a; 40]);
+}
+
+#[test]
 fn sha1_block_hashes_into_the_vm_context_region() {
     let mut session = session(&[0xe400_0140, 0xe400_0010]);
     session.begin_event(BdPlusEvent::Start).unwrap();
