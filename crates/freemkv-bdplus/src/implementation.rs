@@ -134,12 +134,7 @@ pub const HOST_SERVICES: &[HostService] = &[
         ImplementationState::Partial,
         Some("nonzero content offsets and complete filename contract"),
     ),
-    service(
-        0x550,
-        "media check",
-        ImplementationState::Stub,
-        Some("disc-file reader capability and digest output contract"),
-    ),
+    service(0x550, "media check", ImplementationState::Implemented, None),
     service(
         0x560,
         "run native",

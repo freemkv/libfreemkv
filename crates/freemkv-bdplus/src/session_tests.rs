@@ -395,6 +395,50 @@ fn application_register_exchange_is_event_scoped() {
 }
 
 #[test]
+fn media_check_requests_disc_bytes_and_hashes_complete_blocks() {
+    let mut session = session(&[0xe400_0550, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    let path = b"BDMV/STREAM/00000.m2ts";
+    session.vm.memory_mut().write(0x300, path).unwrap();
+    session.vm.memory_mut().store_u32(0x280, 0x400);
+    session.vm.memory_mut().write(0x800, &[0xaa; 40]).unwrap();
+    arguments(
+        &mut session,
+        &[0x300, path.len() as u32, 1, 2, 0x280, 0x800],
+    );
+
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(10, &Halt::new()).unwrap()
+    else {
+        panic!("expected semantic media read");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::MediaRead {
+            path: path.to_vec(),
+            offset: 0x1_0000_0002,
+            length: 0x400,
+        }
+    );
+    assert_eq!(session.vm.memory().read(0x800, 40).unwrap(), &[0xaa; 40]);
+
+    session
+        .provide_player_material(request.id(), PlayerMaterial::Media(vec![b'a'; 0x200]))
+        .unwrap();
+    assert_eq!(
+        session.run(10, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(session.vm.memory().load_u32(0x280), 0x200);
+    assert_eq!(
+        session.vm.memory().read(0x800, 20).unwrap(),
+        [
+            0x16, 0x45, 0x57, 0xfa, 0xcb, 0x73, 0x92, 0x98, 0x75, 0x16, 0x8c, 0x1e, 0x92, 0xca,
+            0xf0, 0x9b, 0xb6, 0x06, 0x45, 0x64,
+        ]
+    );
+}
+
+#[test]
 fn unknown_content_offset_does_not_silently_load_the_wrong_range() {
     let mut session = session(&[0xe400_0540]);
     session.begin_event(BdPlusEvent::Start).unwrap();

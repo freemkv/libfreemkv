@@ -30,7 +30,7 @@ enum PreparationPhase {
 }
 
 /// A preparation slice either made progress, needs material, or produced a FUT.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreparationBoundary {
     EventFinished(BdPlusEvent),
     NeedPlayerMaterial(PlayerRequest),

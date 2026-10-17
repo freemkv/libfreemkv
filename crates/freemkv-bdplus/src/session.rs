@@ -20,32 +20,52 @@ const INVALID: u32 = 0x8000_0001;
 const TOO_LARGE: u32 = 0x8000_0002;
 
 /// Missing semantic capability; IDs/ranges contain no secret values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlayerOperation {
-    AesKey { key_id: u32 },
-    ApplicationRead { register: u32 },
-    ApplicationWrite { register: u32, value: u32 },
-    Discovery { device: u32, question: u32 },
-    Memory { address: u32, length: usize },
+    AesKey {
+        key_id: u32,
+    },
+    ApplicationRead {
+        register: u32,
+    },
+    ApplicationWrite {
+        register: u32,
+        value: u32,
+    },
+    Discovery {
+        device: u32,
+        question: u32,
+    },
+    Memory {
+        address: u32,
+        length: usize,
+    },
+    MediaRead {
+        path: Vec<u8>,
+        offset: u64,
+        length: usize,
+    },
     MediaKey,
-    Random { length: usize },
+    Random {
+        length: usize,
+    },
     VolumeId,
 }
 
 /// A stable request handle for material acquired outside VM execution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerRequest {
     id: u64,
     operation: PlayerOperation,
 }
 
 impl PlayerRequest {
-    pub fn id(self) -> u64 {
+    pub fn id(&self) -> u64 {
         self.id
     }
 
-    pub fn operation(self) -> PlayerOperation {
-        self.operation
+    pub fn operation(&self) -> PlayerOperation {
+        self.operation.clone()
     }
 }
 
@@ -57,13 +77,14 @@ pub enum PlayerMaterial {
     UnwrappedAesKey([u8; 16]),
     Discovery(Vec<u8>),
     Memory(Vec<u8>),
+    Media(Vec<u8>),
     MediaKey([u8; 16]),
     Random(Vec<u8>),
     VolumeId([u8; 16]),
     Unsupported,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionBoundary {
     FinishedEvent(BdPlusEvent),
     NeedPlayerMaterial(PlayerRequest),
@@ -149,7 +170,10 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
         request_id: u64,
         material: PlayerMaterial,
     ) -> BdPlusResult<()> {
-        let request = self.player_request.ok_or(BdPlusError::NoPendingTrap)?;
+        let request = self
+            .player_request
+            .as_ref()
+            .ok_or(BdPlusError::NoPendingTrap)?;
         if request.id != request_id {
             return Err(BdPlusError::PlayerRequestMismatch {
                 expected: request.id,
@@ -161,7 +185,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
         }
         let compatible = matches!(material, PlayerMaterial::Unsupported)
             || matches!(
-                (request.operation, &material),
+                (&request.operation, &material),
                 (
                     PlayerOperation::AesKey { .. },
                     PlayerMaterial::UnwrappedAesKey(_)
@@ -175,6 +199,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                     PlayerOperation::Discovery { .. },
                     PlayerMaterial::Discovery(_)
                 ) | (PlayerOperation::Memory { .. }, PlayerMaterial::Memory(_))
+                    | (PlayerOperation::MediaRead { .. }, PlayerMaterial::Media(_))
                     | (PlayerOperation::MediaKey, PlayerMaterial::MediaKey(_))
                     | (PlayerOperation::Random { .. }, PlayerMaterial::Random(_))
                     | (PlayerOperation::VolumeId, PlayerMaterial::VolumeId(_))
@@ -242,12 +267,12 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                     self.player_reply = None;
                 }
                 Service::Need(operation) => {
-                    let request = match self.player_request {
+                    let request = match self.player_request.as_ref() {
                         Some(request) => {
                             if request.operation != operation {
                                 return Err(BdPlusError::PlayerReplyType);
                             }
-                            request
+                            request.clone()
                         }
                         None => {
                             let request = PlayerRequest {
@@ -255,7 +280,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                                 operation,
                             };
                             self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-                            self.player_request = Some(request);
+                            self.player_request = Some(request.clone());
                             request
                         }
                     };
@@ -266,7 +291,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
     }
 
     fn service(&mut self, trap: u32, pc: u32) -> BdPlusResult<Service> {
-        let args: [u32; 5] = std::array::from_fn(|i| self.vm.argument(i as u8));
+        let args: [u32; 6] = std::array::from_fn(|i| self.vm.argument(i as u8));
         match trap {
             0x20 => {
                 if args[0] != 0 {
@@ -279,7 +304,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 }
                 Ok(Service::Status(OK))
             }
-            0x110 => self.aes(args),
+            0x110 => self.aes([args[0], args[1], args[2], args[3], args[4]]),
             0x130 => {
                 let length = args[1] as usize;
                 self.vm.memory().read(args[0], length)?;
@@ -293,7 +318,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 self.vm.memory_mut().write(args[0], bytes)?;
                 Ok(Service::Status(OK))
             }
-            0x140 => self.sha1(args),
+            0x140 => self.sha1([args[0], args[1], args[2], args[3], args[4]]),
             0x210 => {
                 let length = match (args[2] as usize).checked_mul(4) {
                     Some(length) => length,
@@ -573,6 +598,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 self.vm.memory_mut().write(destination, bytes)?;
                 Ok(Service::Status(OK))
             }
+            0x550 => self.media_check(args),
             _ => Err(BdPlusError::UnsupportedTrap { trap_id: trap, pc }),
         }
     }
@@ -671,6 +697,64 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             }
             _ => return Ok(Service::Status(INVALID)),
         }
+        Ok(Service::Status(OK))
+    }
+
+    fn media_check(&mut self, args: [u32; 6]) -> BdPlusResult<Service> {
+        const BLOCK_SIZE: usize = 0x200;
+        const DIGEST_SIZE: usize = 20;
+        const MAX_LENGTH: usize = 0x20_0000;
+
+        if !matches!(self.vm.event(), Some(BdPlusEvent::Start)) {
+            return Err(BdPlusError::TrapNotPermittedInEvent { trap_id: 0x550 });
+        }
+        let (path_address, path_length, offset_high, offset_low, length_address, destination) =
+            (args[0], args[1], args[2], args[3], args[4], args[5]);
+        if path_length == 0 || path_length > 0x400 || length_address & 3 != 0 {
+            return Ok(Service::Status(INVALID));
+        }
+        let requested = self.vm.memory().load_u32(length_address) as usize;
+        if requested > MAX_LENGTH {
+            return Ok(Service::Status(TOO_LARGE));
+        }
+        if !requested.is_multiple_of(BLOCK_SIZE) {
+            return Ok(Service::Status(INVALID));
+        }
+        let digest_capacity = requested / BLOCK_SIZE * DIGEST_SIZE;
+        self.vm.memory().read(length_address, 4)?;
+        self.vm.memory().read(destination, digest_capacity)?;
+        let path = self
+            .vm
+            .memory()
+            .read(path_address, path_length as usize)?
+            .to_vec();
+        let offset = (u64::from(offset_high) << 32) | u64::from(offset_low);
+        let bytes = match self.player_reply.as_ref() {
+            Some(PlayerMaterial::Media(bytes))
+                if bytes.len() <= requested && bytes.len() % BLOCK_SIZE == 0 =>
+            {
+                bytes
+            }
+            Some(PlayerMaterial::Media(_)) | Some(PlayerMaterial::Unsupported) => {
+                return Ok(Service::Status(INVALID));
+            }
+            _ => {
+                return Ok(Service::Need(PlayerOperation::MediaRead {
+                    path,
+                    offset,
+                    length: requested,
+                }));
+            }
+        };
+
+        let mut digests = Vec::with_capacity(bytes.len() / BLOCK_SIZE * DIGEST_SIZE);
+        for block in bytes.as_chunks::<BLOCK_SIZE>().0 {
+            digests.extend_from_slice(&Sha1::digest(block));
+        }
+        self.vm.memory_mut().write(destination, &digests)?;
+        self.vm
+            .memory_mut()
+            .store_u32(length_address, bytes.len() as u32);
         Ok(Service::Status(OK))
     }
 }
