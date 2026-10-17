@@ -9,8 +9,8 @@
 //! and [security-check content-code patent]. This is NOT a VM executor, signature
 //! verifier, instruction decoder, or FUT parser.
 //!
-//! [BDSVM content-code patent]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
-//! [security-check content-code patent]: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf
+//! [BDSVM content-code patent]: ../docs/us8625967_bdplus_segment_secret_parameters.pdf "upstream: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf"
+//! [security-check content-code patent]: ../docs/us8424101_bdplus_security_check_contentcode.pdf "upstream: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf"
 //!
 //! Preserve unknown fields and alignment bytes verbatim. In particular, the
 //! `0xaa` fill used by an online ID algorithm is NOT SVM file padding and does

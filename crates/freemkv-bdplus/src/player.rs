@@ -8,8 +8,8 @@
 //! corroborated by an [authorized-player detection patent] and a distinct
 //! [player-specific content-code patent].
 //!
-//! [authorized-player detection patent]: https://patentimages.storage.googleapis.com/e1/ed/76/60bc2755f94e9e/US20100169663A1.pdf
-//! [player-specific content-code patent]: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf
+//! [authorized-player detection patent]: ../docs/us20100169663_authorized_players_bdplus.pdf "upstream: https://patentimages.storage.googleapis.com/e1/ed/76/60bc2755f94e9e/US20100169663A1.pdf"
+//! [player-specific content-code patent]: ../docs/us8424101_bdplus_security_check_contentcode.pdf "upstream: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf"
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -12,10 +12,10 @@
 //! treated as a complete VM specification. The [BD+ licensing announcement]
 //! establishes the administered specification and conformance program.
 //!
-//! [BD-ROM content-protection overview]: https://i.dell.com/sites/content/business/solutions/whitepapers/en/documents/wp-2006-brcp.pdf
-//! [BDSVM content-code patent]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
-//! [player-security-check patent]: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf
-//! [BD+ licensing announcement]: https://www.bdplusllc.com/news
+//! [BD-ROM content-protection overview]: ../docs/dell_bd-rom_content_protection_2006.pdf "upstream: https://i.dell.com/sites/content/business/solutions/whitepapers/en/documents/wp-2006-brcp.pdf"
+//! [BDSVM content-code patent]: ../docs/us8625967_bdplus_segment_secret_parameters.pdf "upstream: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf"
+//! [player-security-check patent]: ../docs/us8424101_bdplus_security_check_contentcode.pdf "upstream: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf"
+//! [BD+ licensing announcement]: ../docs/bdplusllc_news_2007.html "upstream: https://www.bdplusllc.com/news"
 
 mod content;
 mod crypto;

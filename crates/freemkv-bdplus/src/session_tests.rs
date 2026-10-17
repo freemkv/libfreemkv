@@ -253,6 +253,41 @@ fn random_trap_requests_exact_external_entropy_without_mutating_early() {
 }
 
 #[test]
+fn sha1_block_hashes_into_the_vm_context_region() {
+    let mut session = session(&[0xe400_0140, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[0x400, 0x700, 3, 3]);
+    session.vm.memory_mut().write(0x700, b"abc").unwrap();
+
+    assert_eq!(
+        session.run(10, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(
+        session.vm.memory().read(0x400, 20).unwrap(),
+        [
+            0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+            0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
+        ]
+    );
+}
+
+#[test]
+fn sha1_stream_state_survives_across_host_calls() {
+    let mut session = session(&[0xe400_0010]);
+    session.vm.memory_mut().write(0x700, b"abcdef").unwrap();
+    session.sha1([0x400, 0x700, 3, 1, 0]).unwrap();
+    session.sha1([0x400, 0x703, 3, 2, 0]).unwrap();
+    assert_eq!(
+        session.vm.memory().read(0x400, 20).unwrap(),
+        [
+            0x1f, 0x8a, 0xc1, 0x0f, 0x23, 0xc5, 0xb5, 0xbc, 0x11, 0x67, 0xbd, 0xa8, 0x4b, 0x83,
+            0x3e, 0x5c, 0x05, 0x7a, 0x77, 0xd2,
+        ]
+    );
+}
+
+#[test]
 fn discovery_ram_reads_only_modeled_player_memory() {
     let mut session = session(&[0xe400_0530, 0xe400_0010]);
     session.begin_event(BdPlusEvent::Start).unwrap();

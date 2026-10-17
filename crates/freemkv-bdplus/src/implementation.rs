@@ -6,8 +6,8 @@
 //! established.  Public architecture evidence comes from the [BDSVM patent]
 //! and the [player-verification patent].
 //!
-//! [BDSVM patent]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
-//! [player-verification patent]: https://patentimages.storage.googleapis.com/f5/4e/3b/67d458e8a13c92/JP2008198272A.pdf
+//! [BDSVM patent]: ../docs/us8625967_bdplus_segment_secret_parameters.pdf "upstream: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf"
+//! [player-verification patent]: ../docs/jp2008198272_bdplus_discoveryram_privatekey.pdf "upstream: https://patentimages.storage.googleapis.com/f5/4e/3b/67d458e8a13c92/JP2008198272A.pdf"
 
 /// Current implementation state of one externally observable VM service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,8 +68,8 @@ pub const HOST_SERVICES: &[HostService] = &[
     service(
         0x140,
         "SHA-1",
-        ImplementationState::Stub,
-        Some("stream state and operation selectors"),
+        ImplementationState::Partial,
+        Some("exact observable intermediate context serialization"),
     ),
     service(
         0x210,

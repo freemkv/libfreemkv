@@ -5,8 +5,8 @@
 //! explicit; a separate [BD+ Security VM and BD-J patent] corroborates that
 //! communication channel while leaving its detailed protection rules unspecified.
 //!
-//! [BDSVM content-code patent]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
-//! [BD+ Security VM and BD-J patent]: https://patentimages.storage.googleapis.com/67/98/54/4ed1397d632ec3/JP2018147536A.pdf
+//! [BDSVM content-code patent]: ../docs/us8625967_bdplus_segment_secret_parameters.pdf "upstream: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf"
+//! [BD+ Security VM and BD-J patent]: ../docs/jp2018147536_bdplus_security_vm_bdj.pdf "upstream: https://patentimages.storage.googleapis.com/67/98/54/4ed1397d632ec3/JP2018147536A.pdf"
 
 use super::{
     BdPlusError, BdPlusEvent, BdPlusPlayer, BdPlusResult, BdPlusSession, Halt, PlayerRequest,

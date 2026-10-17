@@ -7,11 +7,11 @@
 //! publications are architectural cross-checks; they do not by themselves
 //! establish the BD+ ABI.
 //!
-//! [masked FUT entries]: https://patentimages.storage.googleapis.com/d0/d2/b1/c3bb5fb225ac97/KR20070058288A.pdf
-//! [media transforms]: https://patentimages.storage.googleapis.com/5e/dd/22/1ceccd7eef9801/KR20080012724A.pdf
-//! [per-clip fix-up tables]: https://patentimages.storage.googleapis.com/92/4c/d2/65b68762374f23/KR20080027347A.pdf
-//! [FUT blocks and forensic marks]: https://patentimages.storage.googleapis.com/ea/98/9b/3e356f6aa8f139/US8042188.pdf
-//! [per-segment secret parameters]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
+//! [masked FUT entries]: ../docs/kr20070058288_bdplus_fut_descrambling.pdf "upstream: https://patentimages.storage.googleapis.com/d0/d2/b1/c3bb5fb225ac97/KR20070058288A.pdf"
+//! [media transforms]: ../docs/kr20080012724_bdplus_fixup_media_transform.pdf "upstream: https://patentimages.storage.googleapis.com/5e/dd/22/1ceccd7eef9801/KR20080012724A.pdf"
+//! [per-clip fix-up tables]: ../docs/kr20080027347_bdplus_contentcode_fixuptables.pdf "upstream: https://patentimages.storage.googleapis.com/92/4c/d2/65b68762374f23/KR20080027347A.pdf"
+//! [FUT blocks and forensic marks]: ../docs/us8042188_bdplus_fut_forensic_marks.pdf "upstream: https://patentimages.storage.googleapis.com/ea/98/9b/3e356f6aa8f139/US8042188.pdf"
+//! [per-segment secret parameters]: ../docs/us8625967_bdplus_segment_secret_parameters.pdf "upstream: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf"
 
 use super::{BdPlusError, BdPlusResult};
 use std::collections::BTreeMap;

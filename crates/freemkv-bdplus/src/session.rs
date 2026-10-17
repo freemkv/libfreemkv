@@ -5,13 +5,15 @@
 //! Device discovery, private-key operations, DiscoveryRAM and Security VM / application
 //! register exchange are described together in a [player-verification patent].
 //!
-//! [player-verification patent]: https://patentimages.storage.googleapis.com/f5/4e/3b/67d458e8a13c92/JP2008198272A.pdf
+//! [player-verification patent]: ../docs/jp2008198272_bdplus_discoveryram_privatekey.pdf "upstream: https://patentimages.storage.googleapis.com/f5/4e/3b/67d458e8a13c92/JP2008198272A.pdf"
 
 use super::{
     BdPlusContent, BdPlusDiscContext, BdPlusError, BdPlusEvent, BdPlusFixupTable, BdPlusPlayer,
     BdPlusResult, BdPlusVm, PlayerReply, Svm, VmBoundary,
 };
 use crate::Halt;
+use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 
 const OK: u32 = 0;
 const INVALID: u32 = 0x8000_0001;
@@ -80,6 +82,7 @@ pub struct BdPlusSession<P> {
     player_reply: Option<PlayerMaterial>,
     next_request_id: u64,
     table: Option<BdPlusFixupTable>,
+    sha1: HashMap<u32, Sha1>,
 }
 
 impl<P> std::fmt::Debug for BdPlusSession<P> {
@@ -103,6 +106,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             player_reply: None,
             next_request_id: 1,
             table: None,
+            sha1: HashMap::new(),
         })
     }
 
@@ -289,6 +293,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 self.vm.memory_mut().write(args[0], bytes)?;
                 Ok(Service::Status(OK))
             }
+            0x140 => self.sha1(args),
             0x210 => {
                 let length = match (args[2] as usize).checked_mul(4) {
                     Some(length) => length,
@@ -619,6 +624,53 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             output.extend_from_slice(&decoded);
         }
         self.vm.memory_mut().write(args[0], &output)?;
+        Ok(Service::Status(OK))
+    }
+
+    fn sha1(&mut self, args: [u32; 5]) -> BdPlusResult<Service> {
+        const CONTEXT_SIZE: usize = 0x200;
+        const UPDATE: u32 = 0;
+        const INIT: u32 = 1;
+        const FINAL: u32 = 2;
+        const BLOCK: u32 = 3;
+
+        let (context, source, length, operation) = (args[0], args[1], args[2], args[3]);
+        if context & 3 != 0 {
+            return Ok(Service::Status(INVALID));
+        }
+        let context_range = checked_range(context, CONTEXT_SIZE)?;
+        let source_range = checked_range(source, length as usize)?;
+        self.vm.memory().read(context, CONTEXT_SIZE)?;
+        let input = self.vm.memory().read(source, length as usize)?.to_vec();
+        if ranges_overlap(&context_range, &source_range) {
+            return Ok(Service::Status(INVALID));
+        }
+
+        match operation {
+            INIT => {
+                self.vm
+                    .memory_mut()
+                    .read_mut(context, CONTEXT_SIZE)?
+                    .fill(0);
+                let mut state = Sha1::new();
+                state.update(&input);
+                self.sha1.insert(context, state);
+            }
+            UPDATE => {
+                self.sha1.entry(context).or_default().update(&input);
+            }
+            FINAL => {
+                let mut state = self.sha1.remove(&context).unwrap_or_default();
+                state.update(&input);
+                let digest = state.finalize();
+                self.vm.memory_mut().write(context, &digest)?;
+            }
+            BLOCK => {
+                let digest = Sha1::digest(input);
+                self.vm.memory_mut().write(context, &digest)?;
+            }
+            _ => return Ok(Service::Status(INVALID)),
+        }
         Ok(Service::Status(OK))
     }
 }
