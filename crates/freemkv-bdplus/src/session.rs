@@ -40,6 +40,7 @@ pub enum PlayerOperation {
     Discovery {
         device: u32,
         question: u32,
+        capacity: usize,
     },
     DiagnosticLog {
         message: Vec<u8>,
@@ -539,6 +540,8 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             }
             0x520 => {
                 let (device, question) = (args[0], args[1]);
+                let capacity = self.vm.memory().read(args[3], 4)?;
+                let capacity = u32::from_be_bytes(capacity.try_into().unwrap()) as usize;
                 // Discovery(1,3) is synthesized from the disc context, not
                 // stored in the profile: year/month/day/hour/min/sec/centi at
                 // offset 0, 16-byte VID at offset 24, static tail trailing.
@@ -583,12 +586,11 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                             return Ok(Service::Need(PlayerOperation::Discovery {
                                 device,
                                 question,
+                                capacity,
                             }));
                         }
                     }
                 };
-                let capacity = self.vm.memory().read(args[3], 4)?;
-                let capacity = u32::from_be_bytes(capacity.try_into().unwrap()) as usize;
                 if bytes.len() > capacity {
                     return Ok(Service::Status(INVALID));
                 }

@@ -41,6 +41,7 @@ fn missing_material_preserves_the_trap_then_resumes_after_provisioning() {
         PlayerOperation::Discovery {
             device: 1,
             question: 1,
+            capacity: 4,
         }
     );
     let position = session.vm.instructions();
@@ -292,10 +293,7 @@ fn aes_player_key_request_carries_wrapped_key_and_rejects_invalid_ids() {
 
     let mut overlap = session(&[0xe400_0110, 0]);
     overlap.begin_event(BdPlusEvent::Start).unwrap();
-    arguments(
-        &mut overlap,
-        &[0x308, 0x300, 1, 0x340, 0xfff1_0001],
-    );
+    arguments(&mut overlap, &[0x308, 0x300, 1, 0x340, 0xfff1_0001]);
     assert_eq!(
         overlap.run(1, &Halt::new()).unwrap(),
         SessionBoundary::Yield
@@ -777,7 +775,8 @@ fn cast_away_session_reaches_first_missing_discovery_without_network() {
         request.operation(),
         PlayerOperation::Discovery {
             device: 1,
-            question: 1
+            question: 1,
+            capacity: 320,
         }
     );
     assert_eq!(session.vm.instructions(), 840);
