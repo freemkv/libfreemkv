@@ -120,7 +120,7 @@ pub const HOST_SERVICES: &[HostService] = &[
         0x520,
         "device discovery",
         ImplementationState::Partial,
-        Some("complete question schemas and dynamic clock fields"),
+        Some("dynamic clock and player-environment field semantics"),
     ),
     service(
         0x530,

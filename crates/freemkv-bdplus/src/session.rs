@@ -41,6 +41,7 @@ pub enum PlayerOperation {
         device: u32,
         question: u32,
         capacity: usize,
+        response_length: usize,
     },
     DiagnosticLog {
         message: Vec<u8>,
@@ -542,6 +543,12 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 let (device, question) = (args[0], args[1]);
                 let capacity = self.vm.memory().read(args[3], 4)?;
                 let capacity = u32::from_be_bytes(capacity.try_into().unwrap()) as usize;
+                let Some(response_length) = discovery_response_length(device, question) else {
+                    return Ok(Service::Status(INVALID));
+                };
+                if capacity < response_length {
+                    return Ok(Service::Status(INVALID));
+                }
                 // Discovery(1,3) is synthesized from the disc context, not
                 // stored in the profile: year/month/day/hour/min/sec/centi at
                 // offset 0, 16-byte VID at offset 24, static tail trailing.
@@ -587,11 +594,12 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                                 device,
                                 question,
                                 capacity,
+                                response_length,
                             }));
                         }
                     }
                 };
-                if bytes.len() > capacity {
+                if bytes.len() != response_length {
                     return Ok(Service::Status(INVALID));
                 }
                 self.vm.memory().read(args[2], bytes.len())?;
@@ -963,6 +971,16 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             .memory_mut()
             .store_u32(length_address, bytes.len() as u32);
         Ok(Service::Status(OK))
+    }
+}
+
+const fn discovery_response_length(device: u32, question: u32) -> Option<usize> {
+    match (device, question) {
+        (1, 1) => Some(284),
+        (1, 2) => Some(292),
+        (1, 3) => Some(60),
+        (2, 0 | 1) => Some(128),
+        _ => None,
     }
 }
 

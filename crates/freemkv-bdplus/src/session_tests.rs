@@ -30,7 +30,7 @@ fn missing_material_preserves_the_trap_then_resumes_after_provisioning() {
     let mut session = session(&[0xe400_0520, 0xe400_0010]);
     session.begin_event(BdPlusEvent::Start).unwrap();
     arguments(&mut session, &[1, 1, 0x300, 0x280]);
-    session.vm.memory_mut().store_u32(0x280, 4);
+    session.vm.memory_mut().store_u32(0x280, 320);
     session.vm.memory_mut().store_u32(0x300, 0xaaaa_aaaa);
     let boundary = session.run(100, &Halt::new()).unwrap();
     let SessionBoundary::NeedPlayerMaterial(request) = boundary else {
@@ -41,7 +41,8 @@ fn missing_material_preserves_the_trap_then_resumes_after_provisioning() {
         PlayerOperation::Discovery {
             device: 1,
             question: 1,
-            capacity: 4,
+            capacity: 320,
+            response_length: 284,
         }
     );
     let position = session.vm.instructions();
@@ -51,13 +52,15 @@ fn missing_material_preserves_the_trap_then_resumes_after_provisioning() {
     );
     assert_eq!(session.vm.instructions(), position);
     assert_eq!(session.vm.memory().load_u32(0x300), 0xaaaa_aaaa);
-    session.player_mut().set_discovery(1, 1, vec![1, 2, 3]);
+    let mut discovery = vec![0; 284];
+    discovery[..3].copy_from_slice(&[1, 2, 3]);
+    session.player_mut().set_discovery(1, 1, discovery);
     assert_eq!(
         session.run(100, &Halt::new()).unwrap(),
         SessionBoundary::FinishedEvent(BdPlusEvent::Start)
     );
-    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1, 2, 3, 0xaa]);
-    assert_eq!(session.vm.memory().load_u32(0x280), 3);
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1, 2, 3, 0]);
+    assert_eq!(session.vm.memory().load_u32(0x280), 284);
     assert_eq!(session.vm.instructions(), position + 1);
 }
 
@@ -66,7 +69,7 @@ fn external_reply_is_bound_to_the_pending_request_and_resumes_once() {
     let mut session = session(&[0xe400_0520, 0xe400_0010]);
     session.begin_event(BdPlusEvent::Start).unwrap();
     arguments(&mut session, &[1, 1, 0x300, 0x280]);
-    session.vm.memory_mut().store_u32(0x280, 4);
+    session.vm.memory_mut().store_u32(0x280, 284);
 
     let SessionBoundary::NeedPlayerMaterial(request) = session.run(100, &Halt::new()).unwrap()
     else {
@@ -85,7 +88,7 @@ fn external_reply_is_bound_to_the_pending_request_and_resumes_once() {
         Err(BdPlusError::PlayerReplyType)
     );
     session
-        .provide_player_material(request.id(), PlayerMaterial::Discovery(vec![1, 2, 3]))
+        .provide_player_material(request.id(), PlayerMaterial::Discovery(vec![1; 284]))
         .unwrap();
     assert_eq!(
         session.provide_player_material(request.id(), PlayerMaterial::Discovery(vec![4, 5, 6]),),
@@ -97,11 +100,37 @@ fn external_reply_is_bound_to_the_pending_request_and_resumes_once() {
         session.run(100, &Halt::new()).unwrap(),
         SessionBoundary::FinishedEvent(BdPlusEvent::Start)
     );
-    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1, 2, 3, 0]);
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1; 4]);
     assert_eq!(
         session.provide_player_material(request.id(), PlayerMaterial::Discovery(vec![7, 8, 9]),),
         Err(BdPlusError::NoPendingTrap)
     );
+}
+
+#[test]
+fn discovery_rejects_unknown_questions_short_capacity_and_wrong_record_size() {
+    for (device, question, capacity) in [(1, 4, 320), (2, 2, 128), (1, 1, 283)] {
+        let mut rejected = session(&[0xe400_0520, 0xe400_0010]);
+        rejected.begin_event(BdPlusEvent::Start).unwrap();
+        arguments(&mut rejected, &[device, question, 0x300, 0x280]);
+        rejected.vm.memory_mut().store_u32(0x280, capacity);
+        assert_eq!(
+            rejected.run(100, &Halt::new()).unwrap(),
+            SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+        );
+        assert_eq!(rejected.vm.registers()[1], 0x8000_0001);
+    }
+
+    let mut wrong_size = session(&[0xe400_0520, 0xe400_0010]);
+    wrong_size.player_mut().set_discovery(2, 0, vec![0; 127]);
+    wrong_size.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut wrong_size, &[2, 0, 0x300, 0x280]);
+    wrong_size.vm.memory_mut().store_u32(0x280, 128);
+    assert_eq!(
+        wrong_size.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(wrong_size.vm.registers()[1], 0x8000_0001);
 }
 
 #[test]
@@ -777,6 +806,7 @@ fn cast_away_session_reaches_first_missing_discovery_without_network() {
             device: 1,
             question: 1,
             capacity: 320,
+            response_length: 284,
         }
     );
     assert_eq!(session.vm.instructions(), 840);
