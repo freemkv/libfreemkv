@@ -5,7 +5,7 @@
 //!
 //! Architecture and repair behavior are cross-checked against independent public
 //! descriptions, including Dell's [BD-ROM content-protection overview], a
-//! [contemporaneous BD+ VM description], and the detailed [fix-up-table patent].
+//! [contemporaneous BD+ VM description], and a detailed [secure-VM/FUT patent analogue].
 //! These describe the system around the independently implemented observable ABI;
 //! none is treated as a complete VM specification.
 //! Period context is also cross-checked against the [BD+ licensing announcement],
@@ -14,7 +14,7 @@
 //!
 //! [BD-ROM content-protection overview]: https://i.dell.com/sites/content/business/solutions/whitepapers/en/documents/wp-2006-brcp.pdf
 //! [contemporaneous BD+ VM description]: https://www.cdrinfo.com/d7/node/14545
-//! [fix-up-table patent]: https://patentimages.storage.googleapis.com/b1/23/c9/89589f92009492/US7917964.pdf
+//! [secure-VM/FUT patent analogue]: https://patentimages.storage.googleapis.com/b1/23/c9/89589f92009492/US7917964.pdf
 //! [BD+ licensing announcement]: https://www.bdplusllc.com/news
 //! [Thomson security newsletter]: https://cetinkayakoc.net/news/TheSecurityNewsletter-Thomson2007No5.pdf
 //! [independent security analysis]: https://central.bac-lac.gc.ca/.item?app=Library&id=TC-OWTU-3718&oclc_number=1033163995&op=pdf
