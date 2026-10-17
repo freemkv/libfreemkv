@@ -21,6 +21,10 @@ pub enum BdPlusError {
     PlayerReplyType,
     /// The pending player request already has a reply awaiting consumption.
     PlayerReplyAlreadySupplied { request_id: u64 },
+    /// The authored title sequence completed without submitting a FUT.
+    PreparationEndedWithoutTable,
+    /// The session finished a different event than preparation started.
+    PreparationEventMismatch,
     /// Another event is still executing.
     EventInProgress,
     /// No event is executing.
