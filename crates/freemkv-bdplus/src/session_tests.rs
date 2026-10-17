@@ -1,6 +1,6 @@
 use super::*;
 use crate::Halt;
-use crate::{BdPlusContentLibrary, BdPlusPlayerProfile};
+use crate::{BdPlusContentLibrary, BdPlusPlayerProfile, BdPlusTimestamp};
 
 fn session(words: &[u32]) -> BdPlusSession<BdPlusPlayerProfile> {
     let length = 0x1000 + words.len() * 4;
@@ -100,6 +100,39 @@ fn external_reply_is_bound_to_the_pending_request_and_resumes_once() {
         session.provide_player_material(request.id(), PlayerMaterial::Discovery(vec![7, 8, 9]),),
         Err(BdPlusError::NoPendingTrap)
     );
+}
+
+#[test]
+fn dynamic_discovery_requests_the_aacs_volume_id_semantically() {
+    let mut session = session(&[0xe400_0520, 0xe400_0010]);
+    session.set_disc_context(BdPlusDiscContext {
+        timestamp: Some(BdPlusTimestamp {
+            year: 2026,
+            month: 10,
+            day: 16,
+            ..Default::default()
+        }),
+        discovery_environment: Some([0x22; 16]),
+        discovery_tail: Some([0x33; 20]),
+        ..Default::default()
+    });
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[1, 3, 0x300, 0x280]);
+    session.vm.memory_mut().store_u32(0x280, 60);
+
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(100, &Halt::new()).unwrap()
+    else {
+        panic!("expected volume-ID request");
+    };
+    assert_eq!(request.operation(), PlayerOperation::VolumeId);
+    session
+        .provide_player_material(request.id(), PlayerMaterial::VolumeId([0x44; 16]))
+        .unwrap();
+    assert_eq!(
+        session.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(session.vm.memory().read(0x318, 16).unwrap(), &[0x44; 16]);
 }
 
 #[test]

@@ -8,6 +8,8 @@
 //! [contemporaneous BD+ VM description], and a detailed [secure-VM/FUT patent analogue].
 //! These describe the system around the independently implemented observable ABI;
 //! none is treated as a complete VM specification.
+//! A later [BDSVM content-code patent] explicitly describes the on-disc BDSVM
+//! files, player/content code categories, per-segment parameters and repair flow.
 //! Period context is also cross-checked against the [BD+ licensing announcement],
 //! [Thomson security newsletter], [independent security analysis], and a later
 //! [BD+/AACS protection patent].
@@ -15,6 +17,7 @@
 //! [BD-ROM content-protection overview]: https://i.dell.com/sites/content/business/solutions/whitepapers/en/documents/wp-2006-brcp.pdf
 //! [contemporaneous BD+ VM description]: https://www.cdrinfo.com/d7/node/14545
 //! [secure-VM/FUT patent analogue]: https://patentimages.storage.googleapis.com/b1/23/c9/89589f92009492/US7917964.pdf
+//! [BDSVM content-code patent]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
 //! [BD+ licensing announcement]: https://www.bdplusllc.com/news
 //! [Thomson security newsletter]: https://cetinkayakoc.net/news/TheSecurityNewsletter-Thomson2007No5.pdf
 //! [independent security analysis]: https://central.bac-lac.gc.ca/.item?app=Library&id=TC-OWTU-3718&oclc_number=1033163995&op=pdf

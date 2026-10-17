@@ -21,6 +21,7 @@ pub enum PlayerOperation {
     Memory { address: u32, length: usize },
     MediaKey,
     Random { length: usize },
+    VolumeId,
 }
 
 /// A stable request handle for material acquired outside VM execution.
@@ -48,6 +49,7 @@ pub enum PlayerMaterial {
     Memory(Vec<u8>),
     MediaKey([u8; 16]),
     Random(Vec<u8>),
+    VolumeId([u8; 16]),
     Unsupported,
 }
 
@@ -157,6 +159,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 ) | (PlayerOperation::Memory { .. }, PlayerMaterial::Memory(_))
                     | (PlayerOperation::MediaKey, PlayerMaterial::MediaKey(_))
                     | (PlayerOperation::Random { .. }, PlayerMaterial::Random(_))
+                    | (PlayerOperation::VolumeId, PlayerMaterial::VolumeId(_))
             );
         if !compatible {
             return Err(BdPlusError::PlayerReplyType);
@@ -414,7 +417,24 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 // stored in the profile: year/month/day/hour/min/sec/centi at
                 // offset 0, 16-byte VID at offset 24, static tail trailing.
                 let synthesized_1_3 = if device == 1 && question == 3 {
-                    self.disc.as_ref().and_then(|disc| disc.discovery_record())
+                    if let Some(PlayerMaterial::VolumeId(volume_id)) = self.player_reply.take() {
+                        self.disc.get_or_insert_with(Default::default).volume_id = Some(volume_id);
+                        self.player_request = None;
+                    }
+                    let volume_id = match self.player_reply.as_ref() {
+                        Some(PlayerMaterial::Unsupported) => {
+                            return Ok(Service::Status(INVALID));
+                        }
+                        _ => self.disc.as_ref().and_then(|disc| disc.volume_id),
+                    };
+                    let Some(volume_id) = volume_id else {
+                        return Ok(Service::Need(PlayerOperation::VolumeId));
+                    };
+                    self.disc.as_ref().and_then(|disc| {
+                        let mut context = disc.clone();
+                        context.volume_id = Some(volume_id);
+                        context.discovery_record()
+                    })
                 } else {
                     None
                 };
