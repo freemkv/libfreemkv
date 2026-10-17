@@ -15,6 +15,8 @@ uncited research material. The upstream URL remains in the Rust citation.
 | `kr20080027347_bdplus_contentcode_fixuptables.pdf` | `0662d4e503a6b122f2a3f7458d7434f25b8d7dd034e9cdb43bbc136a374043dd` |
 | `us20100169663_authorized_players_bdplus.pdf` | `20da77fb86a88cc3d7d8108e612143d054b780fe4c15917aa24f4c8bd9b85254` |
 | `us20070186110_bdplus_contentcode_files.pdf` | `393fda3f46e6194cd31becdb19b2df085cc50dc2012a8d9a0c6b8f6654cedc29` |
+| `us20100241855_bdplus_secure_execution_fixup.pdf` | `e842f1c5ae886db2ecc55fcc91b179c2ed60dda49e11abd6bbf47e7da057cfce` |
 | `us8042188_bdplus_fut_forensic_marks.pdf` | `5d330d126075cb5f7b0559658c9194393e2bc40f49b775c73491a62b37ecfcf7` |
 | `us8424101_bdplus_security_check_contentcode.pdf` | `a19ca8a2b682bca67346fb6f5a4bdb37e3038345f3450c2347aca34aede1995a` |
 | `us8625967_bdplus_segment_secret_parameters.pdf` | `c20987fea5650fd38217ca6d0f59ed76636589a2872e5a6d010422a47286871b` |
+| `vidangel_2016_schumann_declaration_bdplus.pdf` | `e5bf518fa3e68f74efa736e462a609fa363e85607d63e9e9327defb28bb2d42a` |

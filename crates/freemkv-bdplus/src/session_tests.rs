@@ -254,6 +254,67 @@ fn random_trap_requests_exact_external_entropy_without_mutating_early() {
 }
 
 #[test]
+fn aes_player_key_request_carries_wrapped_key_and_rejects_invalid_ids() {
+    let mut aes = session(&[0xe400_0110, 0]);
+    aes.player_mut().declare_aes_key(4);
+    aes.begin_event(BdPlusEvent::Start).unwrap();
+    let wrapped_key = [0x44; 16];
+    let ciphertext = [0x22; 16];
+    arguments(&mut aes, &[0x300, 0x320, 1, 0x340, 4]);
+    aes.vm.memory_mut().write(0x320, &ciphertext).unwrap();
+    aes.vm.memory_mut().write(0x340, &wrapped_key).unwrap();
+    let SessionBoundary::NeedPlayerMaterial(request) = aes.run(1, &Halt::new()).unwrap() else {
+        panic!("expected AES-key request");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::AesKey {
+            key_id: 4,
+            wrapped_key,
+        }
+    );
+    aes.provide_player_material(request.id(), PlayerMaterial::UnwrappedAesKey([0; 16]))
+        .unwrap();
+    assert_eq!(aes.run(1, &Halt::new()).unwrap(), SessionBoundary::Yield);
+    assert_eq!(
+        aes.vm.memory().read(0x300, 16).unwrap(),
+        crate::crypto::aes_ecb_decrypt(&[0; 16], &ciphertext)
+    );
+
+    let mut invalid = session(&[0xe400_0110, 0]);
+    invalid.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut invalid, &[0x300, 0x320, 1, 0x340, 7]);
+    assert_eq!(
+        invalid.run(1, &Halt::new()).unwrap(),
+        SessionBoundary::Yield
+    );
+    assert_eq!(invalid.vm.registers()[1], 0x8000_0001);
+
+    let mut overlap = session(&[0xe400_0110, 0]);
+    overlap.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(
+        &mut overlap,
+        &[0x308, 0x300, 1, 0x340, 0xfff1_0001],
+    );
+    assert_eq!(
+        overlap.run(1, &Halt::new()).unwrap(),
+        SessionBoundary::Yield
+    );
+    assert_eq!(overlap.vm.registers()[1], 0x8000_0001);
+}
+
+#[test]
+fn aes_is_scoped_to_start_shutdown_and_title_events() {
+    let mut session = session(&[0xe400_0110, 0]);
+    session.begin_event(BdPlusEvent::ApplicationLayer).unwrap();
+    arguments(&mut session, &[0x300, 0x320, 0, 0x340, 0xfff1_0000]);
+    assert_eq!(
+        session.run(1, &Halt::new()),
+        Err(BdPlusError::TrapNotPermittedInEvent { trap_id: 0x110 })
+    );
+}
+
+#[test]
 fn private_key_signing_is_a_typed_player_capability() {
     let mut session = session(&[0xe400_0120, 0xe400_0010]);
     session.begin_event(BdPlusEvent::Start).unwrap();

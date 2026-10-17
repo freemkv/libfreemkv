@@ -4,8 +4,11 @@
 //! after the application provisions it, run retries the same host operation.
 //! Device discovery, private-key operations, DiscoveryRAM and Security VM / application
 //! register exchange are described together in a [player-verification patent].
+//! A separate [secure-execution patent] explicitly illustrates the BD+ AES
+//! split: ordinary ECB work surrounds a protected player-key unwrap.
 //!
 //! [player-verification patent]: ../docs/jp2008198272_bdplus_discoveryram_privatekey.pdf "upstream: https://patentimages.storage.googleapis.com/f5/4e/3b/67d458e8a13c92/JP2008198272A.pdf"
+//! [secure-execution patent]: ../docs/us20100241855_bdplus_secure_execution_fixup.pdf "upstream: https://patentimages.storage.googleapis.com/5e/f1/fc/fb0a718c511e94/US20100241855A1.pdf"
 
 use super::{
     BdPlusContent, BdPlusDiscContext, BdPlusError, BdPlusEvent, BdPlusFixupTable, BdPlusPlayer,
@@ -25,6 +28,7 @@ const TOO_LARGE: u32 = 0x8000_0002;
 pub enum PlayerOperation {
     AesKey {
         key_id: u32,
+        wrapped_key: [u8; 16],
     },
     ApplicationRead {
         register: u32,
@@ -646,12 +650,29 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
     }
 
     fn aes(&mut self, args: [u32; 5]) -> BdPlusResult<Service> {
+        if !matches!(
+            self.vm.event(),
+            Some(BdPlusEvent::Start)
+                | Some(BdPlusEvent::Shutdown)
+                | Some(BdPlusEvent::TitleInit { .. })
+        ) {
+            return Err(BdPlusError::TrapNotPermittedInEvent { trap_id: 0x110 });
+        }
+        let op = args[4];
+        if !matches!(op, 0..=6 | 0xfff1_0000..=0xfff1_0002) {
+            return Ok(Service::Status(INVALID));
+        }
         let length = (args[2] as usize)
             .checked_mul(16)
             .ok_or(BdPlusError::OffsetOverflow)?;
+        let destination_range = checked_range(args[0], length)?;
+        let source_range = checked_range(args[1], length)?;
+        if args[0] != args[1] && ranges_overlap(&destination_range, &source_range) {
+            return Ok(Service::Status(INVALID));
+        }
         let source = self.vm.memory().read(args[1], length)?.to_vec();
         self.vm.memory().read(args[0], length)?;
-        let op = args[4];
+        self.vm.memory().read(args[3], 16)?;
         let key: [u8; 16] = if op == 0xfff1_0002 {
             match self.player_reply.as_ref() {
                 Some(PlayerMaterial::MediaKey(key)) => *key,
@@ -676,7 +697,10 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                         PlayerReply::Ready(key) => key,
                         PlayerReply::Unsupported => return Ok(Service::Status(INVALID)),
                         PlayerReply::Missing => {
-                            return Ok(Service::Need(PlayerOperation::AesKey { key_id: op }));
+                            return Ok(Service::Need(PlayerOperation::AesKey {
+                                key_id: op,
+                                wrapped_key: supplied,
+                            }));
                         }
                     },
                 }

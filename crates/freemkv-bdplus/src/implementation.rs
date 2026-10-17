@@ -51,7 +51,7 @@ pub const HOST_SERVICES: &[HostService] = &[
         0x110,
         "AES",
         ImplementationState::Partial,
-        Some("complete key-ID and mode matrix"),
+        Some("confirm protected-key provider variants across later generations"),
     ),
     service(
         0x120,
