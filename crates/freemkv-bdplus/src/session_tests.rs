@@ -220,6 +220,38 @@ fn random_trap_requests_exact_external_entropy_without_mutating_early() {
 }
 
 #[test]
+fn discovery_ram_reads_only_modeled_player_memory() {
+    let mut session = session(&[0xe400_0530, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[0x1234_5000, 0x300, 4]);
+    session
+        .vm
+        .memory_mut()
+        .write(0x300, &[0xaa, 0xaa, 0xaa, 0xaa])
+        .unwrap();
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(100, &Halt::new()).unwrap()
+    else {
+        panic!("expected modeled-memory request");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::Memory {
+            address: 0x1234_5000,
+            length: 4,
+        }
+    );
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [0xaa; 4]);
+    session
+        .provide_player_material(request.id(), PlayerMaterial::Memory(vec![1, 2, 3, 4]))
+        .unwrap();
+    assert_eq!(
+        session.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1, 2, 3, 4]);
+}
+
+#[test]
 fn unsupported_host_operation_fails_explicitly_and_remains_pending() {
     let mut session = session(&[0xe400_0570]);
     session.begin_event(BdPlusEvent::Start).unwrap();

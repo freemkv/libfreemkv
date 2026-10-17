@@ -11,6 +11,7 @@ use crate::Halt;
 
 const OK: u32 = 0;
 const INVALID: u32 = 0x8000_0001;
+const TOO_LARGE: u32 = 0x8000_0002;
 
 /// Missing semantic capability; IDs/ranges contain no secret values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,6 +451,43 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 self.vm
                     .memory_mut()
                     .write(args[3], &(bytes.len() as u32).to_be_bytes())?;
+                Ok(Service::Status(OK))
+            }
+            0x530 => {
+                let (address, destination, length) = (args[0], args[1], args[2] as usize);
+                if length > 0x20_0000 {
+                    return Ok(Service::Status(TOO_LARGE));
+                }
+                self.vm.memory().read(destination, length)?;
+                if address.checked_add(args[2]).is_none() {
+                    return Ok(Service::Status(INVALID));
+                }
+                if length == 0 {
+                    return Ok(Service::Status(OK));
+                }
+                let bytes: &[u8] = if matches!(
+                    self.player_reply,
+                    Some(PlayerMaterial::Memory(_)) | Some(PlayerMaterial::Unsupported)
+                ) {
+                    match self.player_reply.as_ref() {
+                        Some(PlayerMaterial::Memory(bytes)) if bytes.len() == length => bytes,
+                        Some(PlayerMaterial::Memory(_)) | Some(PlayerMaterial::Unsupported) => {
+                            return Ok(Service::Status(INVALID));
+                        }
+                        _ => return Err(BdPlusError::PlayerReplyType),
+                    }
+                } else {
+                    match self.player.memory(address, length) {
+                        PlayerReply::Ready(bytes) if bytes.len() == length => bytes,
+                        PlayerReply::Ready(_) | PlayerReply::Unsupported => {
+                            return Ok(Service::Status(INVALID));
+                        }
+                        PlayerReply::Missing => {
+                            return Ok(Service::Need(PlayerOperation::Memory { address, length }));
+                        }
+                    }
+                };
+                self.vm.memory_mut().write(destination, bytes)?;
                 Ok(Service::Status(OK))
             }
             _ => Err(BdPlusError::UnsupportedTrap { trap_id: trap, pc }),
