@@ -1,6 +1,7 @@
 use super::*;
 use crate::Halt;
-use crate::{BdPlusContentLibrary, BdPlusPlayerProfile, BdPlusTimestamp};
+use crate::{BdPlusContentLibrary, BdPlusPlayerProfile, BdPlusTimestamp, SLOT_IMAGE_SIZE};
+use sha1::{Digest, Sha1};
 
 fn session(words: &[u32]) -> BdPlusSession<BdPlusPlayerProfile> {
     let length = 0x1000 + words.len() * 4;
@@ -573,6 +574,129 @@ fn load_content_code_refused_outside_permitted_events() {
     assert_eq!(
         session.run(10, &Halt::new()),
         Err(BdPlusError::TrapNotPermittedInEvent { trap_id: 0x540 }),
+    );
+}
+
+#[test]
+fn new_slot_allocation_requests_volume_id_and_exports_the_persistent_image() {
+    let mut session = session(&[0xe400_0410, 0]);
+    session.set_slot_storage(BdPlusSlotStorage::default());
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[u32::MAX, 0]);
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(1, &Halt::new()).unwrap() else {
+        panic!("expected volume-ID request");
+    };
+    assert_eq!(request.operation(), PlayerOperation::VolumeId);
+    session
+        .provide_player_material(request.id(), PlayerMaterial::VolumeId([0x5a; 16]))
+        .unwrap();
+    assert_eq!(
+        session.run(1, &Halt::new()).unwrap(),
+        SessionBoundary::Yield
+    );
+    assert_eq!(session.vm.registers()[1], 499);
+    let record = session.slot_storage().unwrap().record(499).unwrap();
+    assert_eq!(record[..16], [0x5a; 16]);
+    assert_eq!(record[16..32], [0x5a; 16]);
+    assert_eq!(record[32..], [0; 224]);
+    assert_eq!(
+        session.slot_storage().unwrap().to_image().len(),
+        SLOT_IMAGE_SIZE
+    );
+}
+
+#[test]
+fn slot_attach_authenticates_the_call_site_and_instruction_filter() {
+    let words: [u32; 2] = [0xe400_0410, 0];
+    let mut image = vec![0; SLOT_IMAGE_SIZE];
+    let entry: Vec<u8> = words
+        .iter()
+        .flat_map(|word| word.to_be_bytes())
+        .chain(std::iter::repeat_n(0, 8))
+        .collect();
+    let mut input = Vec::new();
+    input.extend_from_slice(&0x1000_u32.to_be_bytes());
+    input.extend_from_slice(&0_u32.to_be_bytes());
+    input.extend_from_slice(&entry);
+    input.extend_from_slice(&entry[..8]);
+    let first = Sha1::digest(&input);
+    let digest = Sha1::digest(first);
+    image[7 * SLOT_SIZE + 48..7 * SLOT_SIZE + 68].copy_from_slice(&digest);
+
+    let mut accepted = session(&words);
+    accepted.set_slot_storage(BdPlusSlotStorage::from_image(&image).unwrap());
+    accepted.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut accepted, &[7, 2]);
+    assert_eq!(
+        accepted.run(1, &Halt::new()).unwrap(),
+        SessionBoundary::Yield
+    );
+    assert_eq!(accepted.vm.registers()[1], 0);
+
+    image[7 * SLOT_SIZE + 48] ^= 1;
+    let mut rejected = session(&words);
+    rejected.set_slot_storage(BdPlusSlotStorage::from_image(&image).unwrap());
+    rejected.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut rejected, &[7, 2]);
+    assert_eq!(
+        rejected.run(1, &Halt::new()).unwrap(),
+        SessionBoundary::Yield
+    );
+    assert_eq!(rejected.vm.registers()[1], 0x8000_0001);
+}
+
+#[test]
+fn slot_read_redacts_unattached_authorization_hash_and_write_is_field_scoped() {
+    let mut image = vec![0; SLOT_IMAGE_SIZE];
+    image[SLOT_SIZE..SLOT_SIZE + 16].fill(0x11);
+    image[SLOT_SIZE + 48..SLOT_SIZE + 68].fill(0x22);
+    let storage = BdPlusSlotStorage::from_image(&image).unwrap();
+
+    let mut read = session(&[0xe400_0420, 0]);
+    read.set_slot_storage(storage);
+    read.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut read, &[0x400, 1]);
+    assert_eq!(read.run(1, &Halt::new()).unwrap(), SessionBoundary::Yield);
+    assert_eq!(read.vm.memory().read(0x400, 16).unwrap(), [0x11; 16]);
+    assert_eq!(read.vm.memory().read(0x430, 20).unwrap(), [0; 20]);
+
+    let mut write = session(&[0xe400_0430, 0]);
+    write.set_slot_storage(BdPlusSlotStorage::default());
+    write.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut write, &[0x400]);
+    let mut update = [0; SLOT_SIZE];
+    update[16..68].fill(0x44);
+    update[76..].fill(0x66);
+    write.vm.memory_mut().write(0x400, &update).unwrap();
+    assert_eq!(write.run(1, &Halt::new()).unwrap(), SessionBoundary::Yield);
+    let stored = write.slot_storage().unwrap().record(0).unwrap();
+    assert_eq!(stored[16..68], [0x44; 52]);
+    assert_eq!(stored[72..76], 1_u32.to_be_bytes());
+    assert_eq!(stored[76..], [0x66; 180]);
+}
+
+#[test]
+fn missing_slot_storage_is_an_explicit_resumable_input() {
+    let mut session = session(&[0xe400_0420, 0]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[0x400, 0]);
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(1, &Halt::new()).unwrap() else {
+        panic!("expected slot-storage request");
+    };
+    assert_eq!(request.operation(), PlayerOperation::SlotStorage);
+    session
+        .provide_player_material(
+            request.id(),
+            PlayerMaterial::SlotStorage(BdPlusSlotStorage::default()),
+        )
+        .unwrap();
+    assert_eq!(
+        session.run(1, &Halt::new()).unwrap(),
+        SessionBoundary::Yield
+    );
+    assert_eq!(
+        session.vm.memory().read(0x400, SLOT_SIZE).unwrap(),
+        [0; SLOT_SIZE]
     );
 }
 

@@ -33,6 +33,8 @@ pub enum BdPlusError {
     RegisterIndex { index: usize },
     /// A modeled player RAM range overlaps an installed region.
     PlayerMemoryOverlap { address: u32 },
+    /// A persistent player-slot image has the wrong serialized length.
+    SlotImageLength { length: usize },
     /// A trap is outside the currently implemented host ABI.
     UnsupportedTrap { trap_id: u32, pc: u32 },
     /// Further submissions require verified merge semantics before publication.

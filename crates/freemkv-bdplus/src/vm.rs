@@ -90,6 +90,9 @@ impl BdPlusVm {
     pub fn pc(&self) -> u32 {
         self.pc
     }
+    pub fn instruction_filter(&self) -> u32 {
+        self.filter
+    }
     pub fn instructions(&self) -> u64 {
         self.instructions
     }

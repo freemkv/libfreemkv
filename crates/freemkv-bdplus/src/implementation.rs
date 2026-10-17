@@ -95,20 +95,20 @@ pub const HOST_SERVICES: &[HostService] = &[
     service(
         0x410,
         "attach code slot",
-        ImplementationState::Stub,
-        Some("slot state and instruction-filter contract"),
+        ImplementationState::Partial,
+        Some("allocation exhaustion and generation-specific status semantics"),
     ),
     service(
         0x420,
         "read code slot",
-        ImplementationState::Stub,
-        Some("serialized slot record layout"),
+        ImplementationState::Partial,
+        Some("record layout requires primary-source or oracle confirmation"),
     ),
     service(
         0x430,
         "write code slot",
-        ImplementationState::Stub,
-        Some("serialized slot record layout and mutation rules"),
+        ImplementationState::Partial,
+        Some("mutation rules require primary-source or oracle confirmation"),
     ),
     service(
         0x510,

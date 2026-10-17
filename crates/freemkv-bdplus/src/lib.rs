@@ -28,6 +28,7 @@ mod memory;
 mod player;
 mod preparation;
 mod session;
+mod slot;
 mod svm;
 mod vm;
 
@@ -41,5 +42,6 @@ pub use memory::BdPlusMemory;
 pub use player::{BdPlusPlayer, BdPlusPlayerProfile, PlayerReply};
 pub use preparation::{BdPlusPreparation, PreparationBoundary};
 pub use session::{BdPlusSession, PlayerMaterial, PlayerOperation, PlayerRequest, SessionBoundary};
+pub use slot::{BdPlusSlotStorage, SLOT_COUNT, SLOT_IMAGE_SIZE, SLOT_SIZE};
 pub use svm::{Svm, SvmBody, SvmDate, SvmHeader, SvmSection};
 pub use vm::{BdPlusEvent, BdPlusVm, VmBoundary};

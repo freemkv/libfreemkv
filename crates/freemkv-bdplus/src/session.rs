@@ -12,6 +12,7 @@ use super::{
     BdPlusResult, BdPlusVm, PlayerReply, Svm, VmBoundary,
 };
 use crate::Halt;
+use crate::slot::{BdPlusSlotStorage, SLOT_COUNT, SLOT_SIZE, SlotSession};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 
@@ -57,6 +58,7 @@ pub enum PlayerOperation {
     Random {
         length: usize,
     },
+    SlotStorage,
     VolumeId,
 }
 
@@ -90,6 +92,7 @@ pub enum PlayerMaterial {
     MediaKey([u8; 16]),
     Signature([u8; 40]),
     Random(Vec<u8>),
+    SlotStorage(BdPlusSlotStorage),
     VolumeId([u8; 16]),
     Unsupported,
 }
@@ -114,6 +117,7 @@ pub struct BdPlusSession<P> {
     next_request_id: u64,
     table: Option<BdPlusFixupTable>,
     sha1: HashMap<u32, Sha1>,
+    slots: Option<SlotSession>,
 }
 
 impl<P> std::fmt::Debug for BdPlusSession<P> {
@@ -138,6 +142,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             next_request_id: 1,
             table: None,
             sha1: HashMap::new(),
+            slots: None,
         })
     }
 
@@ -169,6 +174,14 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
     }
     pub fn fixup_table(&self) -> Option<&BdPlusFixupTable> {
         self.table.as_ref()
+    }
+    /// Replace the provider-owned persistent player-slot image.
+    pub fn set_slot_storage(&mut self, storage: BdPlusSlotStorage) {
+        self.slots = Some(SlotSession::new(storage));
+    }
+    /// Inspect the current image; persist it after the session if desired.
+    pub fn slot_storage(&self) -> Option<&BdPlusSlotStorage> {
+        self.slots.as_ref().map(|slots| &slots.storage)
     }
     pub fn begin_event(&mut self, event: BdPlusEvent) -> BdPlusResult<()> {
         self.vm.begin_event(event)
@@ -219,6 +232,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                         PlayerMaterial::Signature(_)
                     )
                     | (PlayerOperation::Random { .. }, PlayerMaterial::Random(_))
+                    | (PlayerOperation::SlotStorage, PlayerMaterial::SlotStorage(_))
                     | (PlayerOperation::VolumeId, PlayerMaterial::VolumeId(_))
             );
         if !compatible {
@@ -448,6 +462,9 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                     .fill(args[1] as u8);
                 Ok(Service::Status(OK))
             }
+            0x410 => self.slot_attach(args[0], args[1], pc),
+            0x420 => self.slot_read(args[0], args[1]),
+            0x430 => self.slot_write(args[0]),
             0x510 => {
                 if !matches!(
                     self.vm.event(),
@@ -676,6 +693,106 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
         }
         self.vm.memory_mut().write(args[0], &output)?;
         Ok(Service::Status(OK))
+    }
+
+    fn slot_attach(&mut self, slot: u32, code_words: u32, pc: u32) -> BdPlusResult<Service> {
+        if let Some(service) = self.provision_slot_storage() {
+            return Ok(service);
+        }
+        let Some(slots) = self.slots.as_mut() else {
+            return Ok(Service::Need(PlayerOperation::SlotStorage));
+        };
+        slots.reset_attachment();
+        if slot == u32::MAX {
+            if let Some(PlayerMaterial::VolumeId(volume_id)) = self.player_reply.take() {
+                self.disc.get_or_insert_with(Default::default).volume_id = Some(volume_id);
+                self.player_request = None;
+            }
+            let volume_id = match self.player_reply.as_ref() {
+                Some(PlayerMaterial::Unsupported) => return Ok(Service::Status(INVALID)),
+                _ => self.disc.as_ref().and_then(|disc| disc.volume_id),
+            };
+            let Some(volume_id) = volume_id else {
+                return Ok(Service::Need(PlayerOperation::VolumeId));
+            };
+            return Ok(Service::Status(
+                slots.allocate(volume_id).unwrap_or(INVALID),
+            ));
+        }
+        let Ok(index) = usize::try_from(slot) else {
+            return Ok(Service::Status(INVALID));
+        };
+        if index >= SLOT_COUNT {
+            return Ok(Service::Status(INVALID));
+        }
+        let Some(code_length) = (code_words as usize).checked_mul(4) else {
+            return Ok(Service::Status(INVALID));
+        };
+        let code = self.vm.memory().read(pc, code_length)?;
+        let entry = self.vm.memory().read(0x1000, 16)?;
+        let mut hash = Sha1::new();
+        hash.update(pc.to_be_bytes());
+        hash.update(self.vm.instruction_filter().to_be_bytes());
+        hash.update(entry);
+        hash.update(code);
+        let first = hash.finalize();
+        let digest: [u8; 20] = Sha1::digest(first).into();
+        Ok(Service::Status(if slots.authenticate(index, &digest) {
+            OK
+        } else {
+            INVALID
+        }))
+    }
+
+    fn slot_read(&mut self, destination: u32, slot: u32) -> BdPlusResult<Service> {
+        if let Some(service) = self.provision_slot_storage() {
+            return Ok(service);
+        }
+        let Some(slots) = self.slots.as_ref() else {
+            return Ok(Service::Need(PlayerOperation::SlotStorage));
+        };
+        if slot == u32::MAX {
+            self.vm
+                .memory_mut()
+                .write(destination, &slots.status_bytes())?;
+            return Ok(Service::Status(OK));
+        }
+        let Ok(index) = usize::try_from(slot) else {
+            return Ok(Service::Status(INVALID));
+        };
+        let Some(record) = slots.read(index) else {
+            return Ok(Service::Status(INVALID));
+        };
+        self.vm.memory_mut().write(destination, &record)?;
+        Ok(Service::Status(OK))
+    }
+
+    fn slot_write(&mut self, source: u32) -> BdPlusResult<Service> {
+        if let Some(service) = self.provision_slot_storage() {
+            return Ok(service);
+        }
+        let Some(slots) = self.slots.as_mut() else {
+            return Ok(Service::Need(PlayerOperation::SlotStorage));
+        };
+        let mut record = [0; SLOT_SIZE];
+        record.copy_from_slice(self.vm.memory().read(source, SLOT_SIZE)?);
+        slots.write_attached(&record);
+        Ok(Service::Status(OK))
+    }
+
+    fn provision_slot_storage(&mut self) -> Option<Service> {
+        if self.slots.is_some() {
+            return None;
+        }
+        match self.player_reply.take() {
+            Some(PlayerMaterial::SlotStorage(storage)) => {
+                self.slots = Some(SlotSession::new(storage));
+                self.player_request = None;
+                None
+            }
+            Some(PlayerMaterial::Unsupported) => Some(Service::Status(INVALID)),
+            _ => Some(Service::Need(PlayerOperation::SlotStorage)),
+        }
     }
 
     fn sha1(&mut self, args: [u32; 5]) -> BdPlusResult<Service> {
