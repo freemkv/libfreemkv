@@ -1,4 +1,10 @@
 //! Resumable disc preparation using the observed BD+ title lifecycle.
+//!
+//! Later lifecycle work keeps the Security VM/application boundary explicit;
+//! a public [BD+ Security VM and BD-J patent] corroborates that communication
+//! channel while leaving its detailed protection rules unspecified.
+//!
+//! [BD+ Security VM and BD-J patent]: https://patentimages.storage.googleapis.com/67/98/54/4ed1397d632ec3/JP2018147536A.pdf
 
 use super::{
     BdPlusError, BdPlusEvent, BdPlusPlayer, BdPlusResult, BdPlusSession, Halt, PlayerRequest,
@@ -103,9 +109,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             SessionBoundary::NeedPlayerMaterial(request) => {
                 Ok(PreparationBoundary::NeedPlayerMaterial(request))
             }
-            SessionBoundary::Watchdog | SessionBoundary::Yield => {
-                Ok(PreparationBoundary::Yield)
-            }
+            SessionBoundary::Watchdog | SessionBoundary::Yield => Ok(PreparationBoundary::Yield),
         }
     }
 }

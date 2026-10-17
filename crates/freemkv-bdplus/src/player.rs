@@ -3,6 +3,11 @@
 //! Profiles are provisioned by the application. The VM never performs network
 //! calls or guesses missing keys. Unsupported key IDs and supported-but-missing
 //! material are distinct so content code can probe player capabilities normally.
+//!
+//! The separation between disc content code and replaceable player identity is
+//! corroborated by the [authorized-player detection patent].
+//!
+//! [authorized-player detection patent]: https://patentimages.storage.googleapis.com/e1/ed/76/60bc2755f94e9e/US20100169663A1.pdf
 
 use std::collections::{BTreeMap, BTreeSet};
 

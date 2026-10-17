@@ -19,6 +19,7 @@ pub enum PlayerOperation {
     Discovery { device: u32, question: u32 },
     Memory { address: u32, length: usize },
     MediaKey,
+    Random { length: usize },
 }
 
 /// A stable request handle for material acquired outside VM execution.
@@ -45,6 +46,7 @@ pub enum PlayerMaterial {
     Discovery(Vec<u8>),
     Memory(Vec<u8>),
     MediaKey([u8; 16]),
+    Random(Vec<u8>),
     Unsupported,
 }
 
@@ -153,6 +155,7 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                     PlayerMaterial::Discovery(_)
                 ) | (PlayerOperation::Memory { .. }, PlayerMaterial::Memory(_))
                     | (PlayerOperation::MediaKey, PlayerMaterial::MediaKey(_))
+                    | (PlayerOperation::Random { .. }, PlayerMaterial::Random(_))
             );
         if !compatible {
             return Err(BdPlusError::PlayerReplyType);
@@ -255,6 +258,89 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 Ok(Service::Status(OK))
             }
             0x110 => self.aes(args),
+            0x130 => {
+                let length = args[1] as usize;
+                self.vm.memory().read(args[0], length)?;
+                let bytes = match self.player_reply.as_ref() {
+                    Some(PlayerMaterial::Random(bytes)) if bytes.len() == length => bytes,
+                    Some(PlayerMaterial::Random(_)) | Some(PlayerMaterial::Unsupported) => {
+                        return Ok(Service::Status(INVALID));
+                    }
+                    _ => return Ok(Service::Need(PlayerOperation::Random { length })),
+                };
+                self.vm.memory_mut().write(args[0], bytes)?;
+                Ok(Service::Status(OK))
+            }
+            0x210 => {
+                let length = match (args[2] as usize).checked_mul(4) {
+                    Some(length) => length,
+                    None => return Ok(Service::Status(INVALID)),
+                };
+                if args[0] & 3 != 0 || args[1] & 3 != 0 {
+                    return Ok(Service::Status(INVALID));
+                }
+                let destination_range = checked_range(args[0], length)?;
+                let source_range = checked_range(args[1], length)?;
+                if args[0] != args[1] && ranges_overlap(&destination_range, &source_range) {
+                    return Ok(Service::Status(INVALID));
+                }
+                let source = self.vm.memory().read(args[1], length)?.to_vec();
+                let destination = self.vm.memory_mut().read_mut(args[0], length)?;
+                let mut carry = 0_u64;
+                for index in (0..length).step_by(4).rev() {
+                    let left = u32::from_be_bytes([
+                        destination[index],
+                        destination[index + 1],
+                        destination[index + 2],
+                        destination[index + 3],
+                    ]);
+                    let right = u32::from_be_bytes([
+                        source[index],
+                        source[index + 1],
+                        source[index + 2],
+                        source[index + 3],
+                    ]);
+                    let sum = u64::from(left) + u64::from(right) + carry;
+                    destination[index..index + 4].copy_from_slice(&(sum as u32).to_be_bytes());
+                    carry = sum >> 32;
+                }
+                Ok(Service::Status(carry as u32))
+            }
+            0x220 => {
+                let source_length = match (args[2] as usize).checked_mul(4) {
+                    Some(length) => length,
+                    None => return Ok(Service::Status(INVALID)),
+                };
+                let destination_length = match source_length.checked_add(4) {
+                    Some(length) => length,
+                    None => return Ok(Service::Status(INVALID)),
+                };
+                if args[0] & 3 != 0 || args[1] & 3 != 0 {
+                    return Ok(Service::Status(INVALID));
+                }
+                let destination_range = checked_range(args[0], destination_length)?;
+                let source_range = checked_range(args[1], source_length)?;
+                if ranges_overlap(&destination_range, &source_range) {
+                    return Ok(Service::Status(INVALID));
+                }
+                let source = self.vm.memory().read(args[1], source_length)?.to_vec();
+                let destination = self.vm.memory_mut().read_mut(args[0], destination_length)?;
+                let mut carry = 0_u64;
+                for source_index in (0..source_length).step_by(4).rev() {
+                    let value = u32::from_be_bytes([
+                        source[source_index],
+                        source[source_index + 1],
+                        source[source_index + 2],
+                        source[source_index + 3],
+                    ]);
+                    let product = u64::from(value) * u64::from(args[3]) + carry;
+                    destination[source_index + 4..source_index + 8]
+                        .copy_from_slice(&(product as u32).to_be_bytes());
+                    carry = product >> 32;
+                }
+                destination[..4].copy_from_slice(&(carry as u32).to_be_bytes());
+                Ok(Service::Status(OK))
+            }
             0x230 => {
                 let length = (args[2] as usize)
                     .checked_mul(4)
@@ -269,6 +355,24 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             0x310 => {
                 let bytes = self.vm.memory().read(args[1], args[2] as usize)?.to_vec();
                 self.vm.memory_mut().write(args[0], &bytes)?;
+                Ok(Service::Status(OK))
+            }
+            0x320 => {
+                if args[4] & 3 != 0 {
+                    return Ok(Service::Status(INVALID));
+                }
+                let region = self.vm.memory().read(args[0], args[1] as usize)?;
+                let needle = self.vm.memory().read(args[2], args[3] as usize)?;
+                self.vm.memory().read(args[4], 4)?;
+                let found = if needle.is_empty() || region.len() < needle.len() {
+                    0
+                } else {
+                    region
+                        .windows(needle.len())
+                        .position(|candidate| candidate == needle)
+                        .map_or(0, |offset| args[0] + offset as u32)
+                };
+                self.vm.memory_mut().store_u32(args[4], found);
                 Ok(Service::Status(OK))
             }
             0x330 => {
@@ -406,6 +510,18 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
 enum Service {
     Status(u32),
     Need(PlayerOperation),
+}
+
+fn checked_range(address: u32, length: usize) -> BdPlusResult<std::ops::Range<usize>> {
+    let start = address as usize;
+    let end = start
+        .checked_add(length)
+        .ok_or(BdPlusError::OffsetOverflow)?;
+    Ok(start..end)
+}
+
+fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
 }
 
 #[cfg(test)]

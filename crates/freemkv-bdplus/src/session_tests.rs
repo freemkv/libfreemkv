@@ -134,6 +134,92 @@ fn table_submission_and_compute_sp_share_the_same_vm() {
 }
 
 #[test]
+fn arithmetic_traps_use_big_endian_words_and_report_carry() {
+    let mut add = session(&[0xe400_0210, 0xe400_0010]);
+    add.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut add, &[0x300, 0x320, 2]);
+    add.vm
+        .memory_mut()
+        .write(0x300, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+        .unwrap();
+    add.vm
+        .memory_mut()
+        .write(0x320, &[0, 0, 0, 0, 0, 0, 0, 1])
+        .unwrap();
+    assert_eq!(
+        add.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(add.vm.registers()[1], 1);
+    assert_eq!(add.vm.memory().read(0x300, 8).unwrap(), [0; 8]);
+
+    let mut multiply = session(&[0xe400_0220, 0xe400_0010]);
+    multiply.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut multiply, &[0x300, 0x320, 2, 2]);
+    multiply
+        .vm
+        .memory_mut()
+        .write(0x320, &[0x80, 0, 0, 0, 0, 0, 0, 1])
+        .unwrap();
+    assert_eq!(
+        multiply.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(
+        multiply.vm.memory().read(0x300, 12).unwrap(),
+        [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]
+    );
+}
+
+#[test]
+fn memory_search_returns_the_first_virtual_address_or_zero() {
+    let mut found = session(&[0xe400_0320, 0xe400_0010]);
+    found.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut found, &[0x300, 8, 0x320, 3, 0x340]);
+    found.vm.memory_mut().write(0x300, b"ababacab").unwrap();
+    found.vm.memory_mut().write(0x320, b"aba").unwrap();
+    assert_eq!(
+        found.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(found.vm.memory().load_u32(0x340), 0x300);
+
+    let mut absent = session(&[0xe400_0320, 0xe400_0010]);
+    absent.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut absent, &[0x300, 8, 0x320, 3, 0x340]);
+    absent.vm.memory_mut().write(0x300, b"ababacab").unwrap();
+    absent.vm.memory_mut().write(0x320, b"xyz").unwrap();
+    absent.run(100, &Halt::new()).unwrap();
+    assert_eq!(absent.vm.memory().load_u32(0x340), 0);
+}
+
+#[test]
+fn random_trap_requests_exact_external_entropy_without_mutating_early() {
+    let mut session = session(&[0xe400_0130, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[0x300, 4]);
+    session
+        .vm
+        .memory_mut()
+        .write(0x300, &[0xaa, 0xaa, 0xaa, 0xaa])
+        .unwrap();
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(100, &Halt::new()).unwrap()
+    else {
+        panic!("expected entropy request");
+    };
+    assert_eq!(request.operation(), PlayerOperation::Random { length: 4 });
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [0xaa; 4]);
+    session
+        .provide_player_material(request.id(), PlayerMaterial::Random(vec![1, 2, 3, 4]))
+        .unwrap();
+    assert_eq!(
+        session.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1, 2, 3, 4]);
+}
+
+#[test]
 fn unsupported_host_operation_fails_explicitly_and_remains_pending() {
     let mut session = session(&[0xe400_0570]);
     session.begin_event(BdPlusEvent::Start).unwrap();

@@ -1,5 +1,14 @@
 //! BD+ conversion-table decoding and immutable M2TS repairs.
 //! Submitted descriptors remain encoded until ComputeSP supplies their key/mask.
+//!
+//! The table model is cross-checked across related publications describing
+//! [masked FUT entries], [media transforms], [per-clip fix-up tables], and the
+//! detailed English [patent family member].
+//!
+//! [masked FUT entries]: https://patentimages.storage.googleapis.com/d0/d2/b1/c3bb5fb225ac97/KR20070058288A.pdf
+//! [media transforms]: https://patentimages.storage.googleapis.com/5e/dd/22/1ceccd7eef9801/KR20080012724A.pdf
+//! [per-clip fix-up tables]: https://patentimages.storage.googleapis.com/92/4c/d2/65b68762374f23/KR20080027347A.pdf
+//! [patent family member]: https://patentimages.storage.googleapis.com/b1/23/c9/89589f92009492/US7917964.pdf
 
 use super::{BdPlusError, BdPlusResult};
 use std::collections::BTreeMap;

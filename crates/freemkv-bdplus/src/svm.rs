@@ -3,10 +3,12 @@
 //! Sections start every 2 MiB. Each contains a 24-byte `BDSVM_CC` header,
 //! its declared body, a 40-byte opaque trailer, and alignment bytes. The final
 //! section may end after its trailer without filling the complete 2 MiB slot.
-//! Offsets/date/section addressing agree with VideoLAN libbdplus's `loader.c`
-//! and `TRAP_LoadContentCode`; trailer boundaries are corroborated by captured
-//! SVMs and the native-compatible SVQ identity path. This is NOT a VM executor,
-//! signature verifier, instruction decoder, or FUT parser.
+//! Trailer boundaries and section addressing are corroborated by captured SVMs.
+//! VideoLAN's [BD+ research overview] independently documents the on-disc
+//! content-code role. This is NOT a VM executor, signature verifier, instruction
+//! decoder, or FUT parser.
+//!
+//! [BD+ research overview]: https://images.videolan.org/developers/libbdplus.html
 //!
 //! Preserve unknown fields and alignment bytes verbatim. In particular, the
 //! `0xaa` fill used by an online ID algorithm is NOT SVM file padding and does
