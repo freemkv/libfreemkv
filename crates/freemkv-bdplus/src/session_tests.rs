@@ -298,19 +298,65 @@ fn unsupported_host_operation_fails_explicitly_and_remains_pending() {
 }
 
 #[test]
-fn application_handshake_without_an_application_host_cannot_report_success() {
+fn application_register_write_is_a_resumable_host_operation() {
+    let mut session = session(&[0xe400_0510, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::ApplicationLayer).unwrap();
+    arguments(&mut session, &[0, 1, 0x300]);
+    session.vm.memory_mut().store_u32(0x300, 0x1234_5678);
+
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(10, &Halt::new()).unwrap()
+    else {
+        panic!("expected application-register write");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::ApplicationWrite {
+            register: 0,
+            value: 0x1234_5678,
+        }
+    );
+    session
+        .provide_player_material(request.id(), PlayerMaterial::ApplicationAcknowledged)
+        .unwrap();
+    assert_eq!(
+        session.run(10, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::ApplicationLayer)
+    );
+}
+
+#[test]
+fn application_register_read_is_a_resumable_host_operation() {
+    let mut session = session(&[0xe400_0510, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::ApplicationLayer).unwrap();
+    arguments(&mut session, &[1, 0, 0x300]);
+
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(10, &Halt::new()).unwrap()
+    else {
+        panic!("expected application-register read");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::ApplicationRead { register: 1 }
+    );
+    session
+        .provide_player_material(request.id(), PlayerMaterial::ApplicationValue(0x89ab_cdef))
+        .unwrap();
+    assert_eq!(
+        session.run(10, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::ApplicationLayer)
+    );
+    assert_eq!(session.vm.memory().load_u32(0x300), 0x89ab_cdef);
+}
+
+#[test]
+fn application_register_exchange_is_event_scoped() {
     let mut session = session(&[0xe400_0510]);
     session.begin_event(BdPlusEvent::Start).unwrap();
-    arguments(&mut session, &[0, 0, 0x300]);
-    session.vm.memory_mut().store_u32(0x300, 0x1234_5678);
-    let expected = Err(BdPlusError::UnsupportedTrap {
-        trap_id: 0x510,
-        pc: 0x1000,
-    });
-    assert_eq!(session.run(10, &Halt::new()), expected);
-    assert_eq!(session.run(10, &Halt::new()), expected);
-    assert_eq!(session.vm.memory().load_u32(0x300), 0x1234_5678);
-    assert_eq!(session.vm.instructions(), 1);
+    arguments(&mut session, &[0, 1, 0x300]);
+    assert_eq!(
+        session.run(10, &Halt::new()),
+        Err(BdPlusError::TrapNotPermittedInEvent { trap_id: 0x510 })
+    );
 }
 
 #[test]

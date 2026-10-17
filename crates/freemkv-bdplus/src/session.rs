@@ -2,6 +2,10 @@
 //!
 //! No network calls occur here. Missing material leaves the trap pending;
 //! after the application provisions it, run retries the same host operation.
+//! Device discovery, private-key operations, DiscoveryRAM and Security VM / application
+//! register exchange are described together in a [player-verification patent].
+//!
+//! [player-verification patent]: https://patentimages.storage.googleapis.com/f5/4e/3b/67d458e8a13c92/JP2008198272A.pdf
 
 use super::{
     BdPlusContent, BdPlusDiscContext, BdPlusError, BdPlusEvent, BdPlusFixupTable, BdPlusPlayer,
@@ -17,6 +21,8 @@ const TOO_LARGE: u32 = 0x8000_0002;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayerOperation {
     AesKey { key_id: u32 },
+    ApplicationRead { register: u32 },
+    ApplicationWrite { register: u32, value: u32 },
     Discovery { device: u32, question: u32 },
     Memory { address: u32, length: usize },
     MediaKey,
@@ -44,6 +50,8 @@ impl PlayerRequest {
 /// Owned semantic result supplied by an application-side provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlayerMaterial {
+    ApplicationAcknowledged,
+    ApplicationValue(u32),
     UnwrappedAesKey([u8; 16]),
     Discovery(Vec<u8>),
     Memory(Vec<u8>),
@@ -153,6 +161,12 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 (
                     PlayerOperation::AesKey { .. },
                     PlayerMaterial::UnwrappedAesKey(_)
+                ) | (
+                    PlayerOperation::ApplicationRead { .. },
+                    PlayerMaterial::ApplicationValue(_)
+                ) | (
+                    PlayerOperation::ApplicationWrite { .. },
+                    PlayerMaterial::ApplicationAcknowledged
                 ) | (
                     PlayerOperation::Discovery { .. },
                     PlayerMaterial::Discovery(_)
@@ -384,6 +398,50 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                     .memory_mut()
                     .read_mut(args[0], args[2] as usize)?
                     .fill(args[1] as u8);
+                Ok(Service::Status(OK))
+            }
+            0x510 => {
+                if !matches!(
+                    self.vm.event(),
+                    Some(BdPlusEvent::ApplicationLayer) | Some(BdPlusEvent::ComputeSp { .. })
+                ) {
+                    return Err(BdPlusError::TrapNotPermittedInEvent { trap_id: trap });
+                }
+                let (register, operation, address) = (args[0], args[1], args[2]);
+                let valid = match register {
+                    0 => operation == 1,
+                    1 => operation == 0,
+                    2 => operation <= 1,
+                    _ => false,
+                };
+                if !valid || address & 3 != 0 {
+                    return Ok(Service::Status(INVALID));
+                }
+                self.vm.memory().read(address, 4)?;
+                if operation == 0 {
+                    let value = match self.player_reply.as_ref() {
+                        Some(PlayerMaterial::ApplicationValue(value)) => *value,
+                        Some(PlayerMaterial::Unsupported) => return Ok(Service::Status(INVALID)),
+                        _ => {
+                            return Ok(Service::Need(PlayerOperation::ApplicationRead {
+                                register,
+                            }));
+                        }
+                    };
+                    self.vm.memory_mut().store_u32(address, value);
+                } else {
+                    let value = self.vm.memory().load_u32(address);
+                    match self.player_reply.as_ref() {
+                        Some(PlayerMaterial::ApplicationAcknowledged) => {}
+                        Some(PlayerMaterial::Unsupported) => return Ok(Service::Status(INVALID)),
+                        _ => {
+                            return Ok(Service::Need(PlayerOperation::ApplicationWrite {
+                                register,
+                                value,
+                            }));
+                        }
+                    }
+                }
                 Ok(Service::Status(OK))
             }
             0x540 => {
