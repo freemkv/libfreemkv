@@ -1,15 +1,17 @@
 //! BD+ conversion-table decoding and immutable M2TS repairs.
 //! Submitted descriptors remain encoded until ComputeSP supplies their key/mask.
 //!
-//! The table model is cross-checked against related patent publications describing
-//! [masked FUT entries], [media transforms], [per-clip fix-up tables], and a
-//! detailed English [secure-VM/FUT analogue]. These publications are architectural
-//! cross-checks; they do not by themselves establish the BD+ ABI.
+//! The table model is cross-checked against patent publications describing
+//! [masked FUT entries], [media transforms], [per-clip fix-up tables], detailed
+//! [FUT blocks and forensic marks], and [per-segment secret parameters]. These
+//! publications are architectural cross-checks; they do not by themselves
+//! establish the BD+ ABI.
 //!
 //! [masked FUT entries]: https://patentimages.storage.googleapis.com/d0/d2/b1/c3bb5fb225ac97/KR20070058288A.pdf
 //! [media transforms]: https://patentimages.storage.googleapis.com/5e/dd/22/1ceccd7eef9801/KR20080012724A.pdf
 //! [per-clip fix-up tables]: https://patentimages.storage.googleapis.com/92/4c/d2/65b68762374f23/KR20080027347A.pdf
-//! [secure-VM/FUT analogue]: https://patentimages.storage.googleapis.com/b1/23/c9/89589f92009492/US7917964.pdf
+//! [FUT blocks and forensic marks]: https://patentimages.storage.googleapis.com/ea/98/9b/3e356f6aa8f139/US8042188.pdf
+//! [per-segment secret parameters]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
 
 use super::{BdPlusError, BdPlusResult};
 use std::collections::BTreeMap;

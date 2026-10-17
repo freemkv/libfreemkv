@@ -5,9 +5,11 @@
 //! material are distinct so content code can probe player capabilities normally.
 //!
 //! The separation between disc content code and replaceable player identity is
-//! corroborated by the [authorized-player detection patent].
+//! corroborated by an [authorized-player detection patent] and a distinct
+//! [player-specific content-code patent].
 //!
 //! [authorized-player detection patent]: https://patentimages.storage.googleapis.com/e1/ed/76/60bc2755f94e9e/US20100169663A1.pdf
+//! [player-specific content-code patent]: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf
 
 use std::collections::{BTreeMap, BTreeSet};
 

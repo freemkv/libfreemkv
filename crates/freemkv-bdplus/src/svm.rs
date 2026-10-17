@@ -4,11 +4,13 @@
 //! its declared body, a 40-byte opaque trailer, and alignment bytes. The final
 //! section may end after its trailer without filling the complete 2 MiB slot.
 //! Trailer boundaries and section addressing are corroborated by captured SVMs.
-//! VideoLAN's [BD+ research overview] independently documents the on-disc
-//! content-code role. This is NOT a VM executor, signature verifier, instruction
-//! decoder, or FUT parser.
+//! The on-disc `BDSVM` directory, numbered `.svm` files, content-code blocks and
+//! signatures are independently described by the [BDSVM content-code patent]
+//! and [security-check content-code patent]. This is NOT a VM executor, signature
+//! verifier, instruction decoder, or FUT parser.
 //!
-//! [BD+ research overview]: https://images.videolan.org/developers/libbdplus.html
+//! [BDSVM content-code patent]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
+//! [security-check content-code patent]: https://patentimages.storage.googleapis.com/09/a3/1a/b8884b8530f95b/US8424101.pdf
 //!
 //! Preserve unknown fields and alignment bytes verbatim. In particular, the
 //! `0xaa` fill used by an online ID algorithm is NOT SVM file padding and does

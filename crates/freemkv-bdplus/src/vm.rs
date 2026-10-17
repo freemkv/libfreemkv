@@ -160,10 +160,9 @@ impl BdPlusVm {
 
     /// End the current event at a pending Finished trap; retain mailbox output.
     ///
-    /// A `Finished` fired while idle (event already cleared) is a no-op per
-    /// libbdplus' `trap_Finished`: it drops the pending trap and leaves PC
-    /// alone, since the content code is already in its idle loop. Returns
-    /// `None` in that case so the session can observe the idle Finished.
+    /// A `Finished` fired while no event is active drops the pending trap and
+    /// leaves PC alone, since the content code is already in its idle loop.
+    /// Returns `None` so the session can observe the idle completion.
     pub fn finish_event(&mut self) -> BdPlusResult<Option<BdPlusEvent>> {
         if self.pending_trap != Some(0x10) {
             return Err(BdPlusError::NoPendingTrap);

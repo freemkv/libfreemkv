@@ -1,9 +1,11 @@
 //! Resumable disc preparation using the observed BD+ title lifecycle.
 //!
-//! Later lifecycle work keeps the Security VM/application boundary explicit;
-//! a public [BD+ Security VM and BD-J patent] corroborates that communication
-//! channel while leaving its detailed protection rules unspecified.
+//! A [BDSVM content-code patent] describes startup and title-initialization
+//! routines. Later lifecycle work keeps the Security VM/application boundary
+//! explicit; a separate [BD+ Security VM and BD-J patent] corroborates that
+//! communication channel while leaving its detailed protection rules unspecified.
 //!
+//! [BDSVM content-code patent]: https://patentimages.storage.googleapis.com/aa/30/8e/7e223065e263a8/US8625967.pdf
 //! [BD+ Security VM and BD-J patent]: https://patentimages.storage.googleapis.com/67/98/54/4ed1397d632ec3/JP2018147536A.pdf
 
 use super::{
