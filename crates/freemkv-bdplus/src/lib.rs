@@ -22,6 +22,6 @@ pub use fixup::{BdPlusFixupTable, BdPlusPatch, BdPlusPatchSet};
 pub use halt::Halt;
 pub use memory::BdPlusMemory;
 pub use player::{BdPlusPlayer, BdPlusPlayerProfile, PlayerReply};
-pub use session::{BdPlusSession, PlayerOperation, SessionBoundary};
+pub use session::{BdPlusSession, PlayerMaterial, PlayerOperation, PlayerRequest, SessionBoundary};
 pub use svm::{Svm, SvmBody, SvmDate, SvmHeader, SvmSection};
 pub use vm::{BdPlusEvent, BdPlusVm, VmBoundary};

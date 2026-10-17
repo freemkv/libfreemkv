@@ -31,13 +31,22 @@ fn missing_material_preserves_the_trap_then_resumes_after_provisioning() {
     arguments(&mut session, &[1, 1, 0x300, 0x280]);
     session.vm.memory_mut().store_u32(0x280, 4);
     session.vm.memory_mut().store_u32(0x300, 0xaaaa_aaaa);
-    let expected = SessionBoundary::NeedPlayerMaterial(PlayerOperation::Discovery {
-        device: 1,
-        question: 1,
-    });
-    assert_eq!(session.run(100, &Halt::new()).unwrap(), expected);
+    let boundary = session.run(100, &Halt::new()).unwrap();
+    let SessionBoundary::NeedPlayerMaterial(request) = boundary else {
+        panic!("expected player request, got {boundary:?}");
+    };
+    assert_eq!(
+        request.operation(),
+        PlayerOperation::Discovery {
+            device: 1,
+            question: 1,
+        }
+    );
     let position = session.vm.instructions();
-    assert_eq!(session.run(100, &Halt::new()).unwrap(), expected);
+    assert_eq!(
+        session.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::NeedPlayerMaterial(request)
+    );
     assert_eq!(session.vm.instructions(), position);
     assert_eq!(session.vm.memory().load_u32(0x300), 0xaaaa_aaaa);
     session.player_mut().set_discovery(1, 1, vec![1, 2, 3]);
@@ -48,6 +57,49 @@ fn missing_material_preserves_the_trap_then_resumes_after_provisioning() {
     assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1, 2, 3, 0xaa]);
     assert_eq!(session.vm.memory().load_u32(0x280), 3);
     assert_eq!(session.vm.instructions(), position + 1);
+}
+
+#[test]
+fn external_reply_is_bound_to_the_pending_request_and_resumes_once() {
+    let mut session = session(&[0xe400_0520, 0xe400_0010]);
+    session.begin_event(BdPlusEvent::Start).unwrap();
+    arguments(&mut session, &[1, 1, 0x300, 0x280]);
+    session.vm.memory_mut().store_u32(0x280, 4);
+
+    let SessionBoundary::NeedPlayerMaterial(request) = session.run(100, &Halt::new()).unwrap()
+    else {
+        panic!("expected player request");
+    };
+    assert_eq!(
+        session
+            .provide_player_material(request.id() + 1, PlayerMaterial::Discovery(vec![1, 2, 3]),),
+        Err(BdPlusError::PlayerRequestMismatch {
+            expected: request.id(),
+            supplied: request.id() + 1,
+        })
+    );
+    assert_eq!(
+        session.provide_player_material(request.id(), PlayerMaterial::MediaKey([0; 16])),
+        Err(BdPlusError::PlayerReplyType)
+    );
+    session
+        .provide_player_material(request.id(), PlayerMaterial::Discovery(vec![1, 2, 3]))
+        .unwrap();
+    assert_eq!(
+        session.provide_player_material(request.id(), PlayerMaterial::Discovery(vec![4, 5, 6]),),
+        Err(BdPlusError::PlayerReplyAlreadySupplied {
+            request_id: request.id(),
+        })
+    );
+    assert_eq!(
+        session.run(100, &Halt::new()).unwrap(),
+        SessionBoundary::FinishedEvent(BdPlusEvent::Start)
+    );
+    assert_eq!(session.vm.memory().read(0x300, 4).unwrap(), [1, 2, 3, 0]);
+    assert_eq!(
+        session.provide_player_material(request.id(), PlayerMaterial::Discovery(vec![7, 8, 9]),),
+        Err(BdPlusError::NoPendingTrap)
+    );
 }
 
 #[test]
@@ -202,12 +254,16 @@ fn cast_away_session_reaches_first_missing_discovery_without_network() {
     let svm = Svm::parse(bytes).unwrap();
     let mut session = BdPlusSession::new(&svm, BdPlusPlayerProfile::default()).unwrap();
     session.begin_event(BdPlusEvent::Start).unwrap();
+    let boundary = session.run(10000, &Halt::new()).unwrap();
+    let SessionBoundary::NeedPlayerMaterial(request) = boundary else {
+        panic!("expected player request, got {boundary:?}");
+    };
     assert_eq!(
-        session.run(10000, &Halt::new()).unwrap(),
-        SessionBoundary::NeedPlayerMaterial(PlayerOperation::Discovery {
+        request.operation(),
+        PlayerOperation::Discovery {
             device: 1,
             question: 1
-        })
+        }
     );
     assert_eq!(session.vm.instructions(), 840);
 }

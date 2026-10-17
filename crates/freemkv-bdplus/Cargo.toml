@@ -8,4 +8,4 @@ description = "Independent Rust BD+ execution and stream repair engine"
 publish = false
 
 [dependencies]
-aes = "0.9"
+aes = "0.8.4"

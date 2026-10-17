@@ -15,6 +15,12 @@ pub enum BdPlusError {
     PendingTrap { trap_id: u32 },
     /// There is no pending trap to satisfy.
     NoPendingTrap,
+    /// A player reply does not belong to the request currently awaiting input.
+    PlayerRequestMismatch { expected: u64, supplied: u64 },
+    /// A player reply has the wrong semantic shape for the pending operation.
+    PlayerReplyType,
+    /// The pending player request already has a reply awaiting consumption.
+    PlayerReplyAlreadySupplied { request_id: u64 },
     /// Another event is still executing.
     EventInProgress,
     /// No event is executing.

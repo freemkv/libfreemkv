@@ -19,9 +19,11 @@ fn main() {
         session.vm().pc(),
         session.fixup_table().is_some()
     );
-    if let SessionBoundary::NeedPlayerMaterial(freemkv_bdplus::PlayerOperation::Discovery {
-        ..
-    }) = boundary
+    if let SessionBoundary::NeedPlayerMaterial(request) = boundary
+        && matches!(
+            request.operation(),
+            freemkv_bdplus::PlayerOperation::Discovery { .. }
+        )
     {
         let capacity_pointer = session.vm().argument(3);
         println!(

@@ -21,10 +21,37 @@ pub enum PlayerOperation {
     MediaKey,
 }
 
+/// A stable request handle for material acquired outside VM execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayerRequest {
+    id: u64,
+    operation: PlayerOperation,
+}
+
+impl PlayerRequest {
+    pub fn id(self) -> u64 {
+        self.id
+    }
+
+    pub fn operation(self) -> PlayerOperation {
+        self.operation
+    }
+}
+
+/// Owned semantic result supplied by an application-side provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlayerMaterial {
+    UnwrappedAesKey([u8; 16]),
+    Discovery(Vec<u8>),
+    Memory(Vec<u8>),
+    MediaKey([u8; 16]),
+    Unsupported,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionBoundary {
     FinishedEvent(BdPlusEvent),
-    NeedPlayerMaterial(PlayerOperation),
+    NeedPlayerMaterial(PlayerRequest),
     Watchdog,
     Yield,
 }
@@ -36,6 +63,9 @@ pub struct BdPlusSession<P> {
     content: Option<Box<dyn BdPlusContent + Send + Sync>>,
     disc: Option<BdPlusDiscContext>,
     pending: Option<(u32, u32)>,
+    player_request: Option<PlayerRequest>,
+    player_reply: Option<PlayerMaterial>,
+    next_request_id: u64,
     table: Option<BdPlusFixupTable>,
 }
 
@@ -56,6 +86,9 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
             content: None,
             disc: None,
             pending: None,
+            player_request: None,
+            player_reply: None,
+            next_request_id: 1,
             table: None,
         })
     }
@@ -91,6 +124,41 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
     }
     pub fn begin_event(&mut self, event: BdPlusEvent) -> BdPlusResult<()> {
         self.vm.begin_event(event)
+    }
+
+    /// Bind an owned provider reply to the exact request that produced it.
+    pub fn provide_player_material(
+        &mut self,
+        request_id: u64,
+        material: PlayerMaterial,
+    ) -> BdPlusResult<()> {
+        let request = self.player_request.ok_or(BdPlusError::NoPendingTrap)?;
+        if request.id != request_id {
+            return Err(BdPlusError::PlayerRequestMismatch {
+                expected: request.id,
+                supplied: request_id,
+            });
+        }
+        if self.player_reply.is_some() {
+            return Err(BdPlusError::PlayerReplyAlreadySupplied { request_id });
+        }
+        let compatible = matches!(material, PlayerMaterial::Unsupported)
+            || matches!(
+                (request.operation, &material),
+                (
+                    PlayerOperation::AesKey { .. },
+                    PlayerMaterial::UnwrappedAesKey(_)
+                ) | (
+                    PlayerOperation::Discovery { .. },
+                    PlayerMaterial::Discovery(_)
+                ) | (PlayerOperation::Memory { .. }, PlayerMaterial::Memory(_))
+                    | (PlayerOperation::MediaKey, PlayerMaterial::MediaKey(_))
+            );
+        if !compatible {
+            return Err(BdPlusError::PlayerReplyType);
+        }
+        self.player_reply = Some(material);
+        Ok(())
     }
 
     /// Run a bounded slice, preserving the current instruction/trap on a miss.
@@ -145,9 +213,28 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 Service::Status(status) => {
                     self.vm.resume_trap(Some(status))?;
                     self.pending = None;
+                    self.player_request = None;
+                    self.player_reply = None;
                 }
                 Service::Need(operation) => {
-                    return Ok(SessionBoundary::NeedPlayerMaterial(operation));
+                    let request = match self.player_request {
+                        Some(request) => {
+                            if request.operation != operation {
+                                return Err(BdPlusError::PlayerReplyType);
+                            }
+                            request
+                        }
+                        None => {
+                            let request = PlayerRequest {
+                                id: self.next_request_id,
+                                operation,
+                            };
+                            self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+                            self.player_request = Some(request);
+                            request
+                        }
+                    };
+                    return Ok(SessionBoundary::NeedPlayerMaterial(request));
                 }
             }
         }
@@ -228,6 +315,15 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
                 };
                 let bytes: &[u8] = if let Some(ref record) = synthesized_1_3 {
                     record
+                } else if matches!(
+                    self.player_reply,
+                    Some(PlayerMaterial::Discovery(_)) | Some(PlayerMaterial::Unsupported)
+                ) {
+                    match self.player_reply.as_ref() {
+                        Some(PlayerMaterial::Discovery(bytes)) => bytes.as_slice(),
+                        Some(PlayerMaterial::Unsupported) => return Ok(Service::Status(INVALID)),
+                        _ => return Err(BdPlusError::PlayerReplyType),
+                    }
                 } else {
                     match self.player.discovery(device, question) {
                         PlayerReply::Ready(bytes) => bytes,
@@ -264,24 +360,32 @@ impl<P: BdPlusPlayer> BdPlusSession<P> {
         self.vm.memory().read(args[0], length)?;
         let op = args[4];
         let key: [u8; 16] = if op == 0xfff1_0002 {
-            match self.disc.as_ref() {
-                Some(BdPlusDiscContext {
-                    media_key: Some(key),
-                    ..
-                }) => *key,
-                _ => return Ok(Service::Need(PlayerOperation::MediaKey)),
+            match self.player_reply.as_ref() {
+                Some(PlayerMaterial::MediaKey(key)) => *key,
+                Some(PlayerMaterial::Unsupported) => return Ok(Service::Status(INVALID)),
+                _ => match self.disc.as_ref() {
+                    Some(BdPlusDiscContext {
+                        media_key: Some(key),
+                        ..
+                    }) => *key,
+                    _ => return Ok(Service::Need(PlayerOperation::MediaKey)),
+                },
             }
         } else {
             let supplied: [u8; 16] = self.vm.memory().read(args[3], 16)?.try_into().unwrap();
             if matches!(op, 0xfff1_0000 | 0xfff1_0001) {
                 supplied
             } else {
-                match self.player.unwrap_aes_key(op, &supplied) {
-                    PlayerReply::Ready(key) => key,
-                    PlayerReply::Unsupported => return Ok(Service::Status(INVALID)),
-                    PlayerReply::Missing => {
-                        return Ok(Service::Need(PlayerOperation::AesKey { key_id: op }));
-                    }
+                match self.player_reply.as_ref() {
+                    Some(PlayerMaterial::UnwrappedAesKey(key)) => *key,
+                    Some(PlayerMaterial::Unsupported) => return Ok(Service::Status(INVALID)),
+                    _ => match self.player.unwrap_aes_key(op, &supplied) {
+                        PlayerReply::Ready(key) => key,
+                        PlayerReply::Unsupported => return Ok(Service::Status(INVALID)),
+                        PlayerReply::Missing => {
+                            return Ok(Service::Need(PlayerOperation::AesKey { key_id: op }));
+                        }
+                    },
                 }
             }
         };
