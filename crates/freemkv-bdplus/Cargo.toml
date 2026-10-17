@@ -1,0 +1,11 @@
+[package]
+name = "freemkv-bdplus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Independent Rust BD+ execution and stream repair engine"
+publish = false
+
+[dependencies]
+aes = "0.9"
