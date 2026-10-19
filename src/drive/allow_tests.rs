@@ -15,29 +15,22 @@ fn release(agid: u8) -> [u8; 12] {
 
 /// LD4 `exec_cleanup_allow_list`: one case per §2.4 row, and one refusal per row.
 /// Per evidence SS-7 (AGID) and per the §2.4 table; do not change without a design
-/// revision.
+/// revision. Row 1 was revised for #75: ALLOW is always legal, locked or not.
 #[test]
 fn exec_cleanup_allow_list() {
     let none = Ledger::default();
-    let locked = Ledger {
-        tray_locked: true,
-        agids: 0,
-    };
-    let agid2 = Ledger {
-        tray_locked: false,
-        agids: 1 << 2,
-    };
+    let agid2 = Ledger { agids: 1 << 2 };
     use CleanupCtx::*;
-    // Row 1: ALLOW iff tray_locked.
-    assert!(allowed_after_cancel(&ALLOW, locked, Plain));
-    assert!(!allowed_after_cancel(&ALLOW, none, Plain));
+    // Row 1: ALLOW always (it only releases), whoever locked the tray; never PREVENT.
+    assert!(allowed_after_cancel(&ALLOW, none, Plain));
+    assert!(allowed_after_cancel(&ALLOW, agid2, FinishEject));
     assert!(
-        !allowed_after_cancel(&PREVENT, locked, Plain),
+        !allowed_after_cancel(&PREVENT, none, Plain),
         "never PREVENT"
     );
     // Row 2: LoEj only inside finish(Eject).
     assert!(allowed_after_cancel(&EJECT, none, FinishEject));
-    assert!(!allowed_after_cancel(&EJECT, locked, Plain));
+    assert!(!allowed_after_cancel(&EJECT, none, Plain));
     assert!(!allowed_after_cancel(&START, none, FinishEject), "LoEj=0");
     // LoEj=1 with Start=1 loads the tray: not an eject.
     let load = [0x1B, 0, 0, 0, 0x03, 0];
@@ -48,7 +41,7 @@ fn exec_cleanup_allow_list() {
     assert!(!allowed_after_cancel(&release(2), none, Plain));
     // Row 4: any CDB inside a pre-cancel critical section.
     assert!(allowed_after_cancel(&READ, none, Critical));
-    assert!(!allowed_after_cancel(&READ, locked, Plain));
+    assert!(!allowed_after_cancel(&READ, none, Plain));
     assert!(!allowed_after_cancel(&READ, agid2, FinishEject));
 }
 

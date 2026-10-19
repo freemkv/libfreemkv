@@ -15,11 +15,11 @@ pub(crate) const REPORT_KEY: u8 = 0xA4;
 /// REPORT KEY key format 3Fh: invalidate the AGID in CDB byte 10 bits 7-6.
 pub(crate) const KEY_FORMAT_INVALIDATE_AGID: u8 = 0x3F;
 
-/// What the Drive holds that a clean-up CDB may release (§2.2 "Ledger").
+/// What the Drive holds that a clean-up CDB may release (§2.2 "Ledger"). The tray
+/// is not in it: an ALLOW is always legal (it only releases, and 1.7 sent one on
+/// every close), so it never depends on who locked the tray.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Ledger {
-    /// This Drive sent PREVENT and has not sent ALLOW since.
-    pub tray_locked: bool,
     /// Bit `n` set: AGID `n` was allocated through this Drive and not yet invalidated.
     pub agids: u8,
 }
@@ -27,7 +27,7 @@ pub(crate) struct Ledger {
 /// Where a clean-up CDB is issued from; each widens the list by one §2.4 row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CleanupCtx {
-    /// `Drop`, `unlock_tray`, an unlocker's `execute_cleanup`: the ledger rows only.
+    /// `Drop`, `unlock_tray`, an unlocker's `execute_cleanup`: ALLOW and the ledger rows only.
     Plain,
     /// Inside `DiscSession::finish(Finish::Eject)`: also START STOP UNIT with LoEj=1.
     FinishEject,
@@ -63,7 +63,7 @@ pub(crate) fn allowed_after_cancel(cdb: &[u8], ledger: Ledger, ctx: CleanupCtx) 
         return true;
     }
     if is_allow(cdb) {
-        return ledger.tray_locked;
+        return true;
     }
     if is_eject(cdb) {
         return ctx == CleanupCtx::FinishEject;

@@ -40,9 +40,10 @@ fn after_cancel(fake: &FakeHandle) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// LSe1 (§2.4 row 2, SS-6): `finish(Eject)` after a Stop sends "ALLOW (if locked), then
-/// START STOP LoEj; no other CDB". SS-6 MMC-6 Table 633: "1 0 Eject the disc if
-/// permitted." — so the ALLOW comes first.
+/// LSe1 (§2.4 row 2, SS-6): `finish(Eject)` after a Stop sends "ALLOW, then START STOP
+/// LoEj; no other CDB". SS-6 MMC-6 Table 633: "1 0 Eject the disc if permitted." — so
+/// the ALLOW comes first, locked by this session or not (#75: a lock the drive or an
+/// earlier handle left must not block the eject).
 #[test]
 fn finish_eject_after_cancel_allowed() {
     for locked in [true, false] {
@@ -58,11 +59,7 @@ fn finish_eject_after_cancel_allowed() {
         s.finish(Finish::Eject)
             .expect("an eject after a Stop is allowed");
         let after = after_cancel(&fake);
-        let want: &[fn(&[u8]) -> bool] = if locked {
-            &[is_allow, is_eject]
-        } else {
-            &[is_eject]
-        };
+        let want: &[fn(&[u8]) -> bool] = &[is_allow, is_eject];
         assert_eq!(after.len(), want.len(), "locked={locked}: {after:02x?}");
         assert!(
             after.iter().zip(want).all(|(c, p)| p(c)),
@@ -161,12 +158,13 @@ fn open_with_stop_during_bring_up_is_halted() {
     let t = t.cancel_on(nth(1), &h).watch(&h);
     let r = session_over(t, &h);
     assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
+    let cdbs = fake.cdbs();
     assert_eq!(
-        fake.log().len(),
-        1,
-        "no CDB after the Stop: {:02x?}",
-        fake.cdbs()
+        cdbs.len(),
+        2,
+        "after the Stop only the close's ALLOW: {cdbs:02x?}"
     );
+    assert!(is_allow(&cdbs[1]), "{cdbs:02x?}");
     assert_eq!(fake.live_handles(), 0);
 }
 
@@ -175,13 +173,20 @@ fn open_with_stop_during_bring_up_is_halted() {
 #[test]
 fn open_with_final_check() {
     let (t, dry) = FakeTransport::new();
-    session_over(t, &Halt::new()).expect("dry run");
+    let s = session_over(t, &Halt::new()).expect("dry run");
     let last = dry.log().len();
+    drop(s);
     let h = Halt::new();
     let (t, fake) = FakeTransport::new();
     let r = session_over(t.cancel_on(nth(last), &h), &h);
     assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
-    assert_eq!(fake.log().len(), last);
+    let cdbs = fake.cdbs();
+    assert_eq!(
+        cdbs.len(),
+        last + 1,
+        "bring-up, then the close's ALLOW: {cdbs:02x?}"
+    );
+    assert!(is_allow(&cdbs[last]), "{cdbs:02x?}");
 }
 
 /// Guard: `open` (no op token) keeps today's advisory bring-up and has no token.
@@ -310,8 +315,9 @@ fn from_drive_reads_then_ejects_on_the_held_handle() {
     );
     h.cancel();
     s.finish(Finish::Eject).expect("eject on the held handle");
-    assert_eq!(after_cancel(&fake).len(), 1, "{:02x?}", after_cancel(&fake));
-    assert!(is_eject(&after_cancel(&fake)[0]));
+    let after = after_cancel(&fake);
+    assert_eq!(after.len(), 2, "{after:02x?}");
+    assert!(is_allow(&after[0]) && is_eject(&after[1]), "{after:02x?}");
     assert_eq!(fake.live_handles(), 0, "the handle is closed");
 }
 

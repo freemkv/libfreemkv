@@ -5,12 +5,18 @@ struct Idle;
 impl ScsiTransport for Idle {
     fn execute(
         &mut self,
-        _: &[u8],
+        cdb: &[u8],
         _: crate::scsi::DataDirection,
         _: &mut [u8],
         _: u32,
     ) -> Result<crate::scsi::ScsiResult> {
-        unreachable!("pause issues no CDB")
+        // The close's ALLOW is the only CDB; pause itself issues none.
+        assert_eq!(cdb, [0x1E, 0, 0, 0, 0, 0], "pause issues no CDB");
+        Ok(crate::scsi::ScsiResult {
+            status: 0,
+            bytes_transferred: 0,
+            sense: [0u8; 32],
+        })
     }
 }
 

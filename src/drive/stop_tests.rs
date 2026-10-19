@@ -130,7 +130,12 @@ fn every_drive_cdb_goes_through_exec() {
         Err(Error::Halted)
     ));
     assert!(d.init().is_err());
-    assert!(fake.log().is_empty(), "{:02x?}", fake.cdbs());
+    // eject's ALLOW is the one clean-up CDB a Stop leaves legal (§2.4 row 1, #75).
+    assert_eq!(
+        fake.cdbs(),
+        vec![vec![0x1E, 0, 0, 0, 0, 0]],
+        "only the ALLOW"
+    );
 }
 
 /// LD2 (structural): no raw transport call outside `Drive::dispatch` in drive/mod.rs,
@@ -204,8 +209,8 @@ fn read_class_covers_every_read_opcode() {
     assert!(!is_read_class(&[]));
 }
 
-/// LD4 (Drive half): `exec_cleanup` admits the ALLOW for a tray this Drive locked
-/// and refuses anything else after a cancel.
+/// LD4 (Drive half): after a cancel `exec_cleanup` admits an ALLOW, locked or not,
+/// and refuses anything else outside the ledger.
 #[test]
 fn exec_cleanup_follows_the_drive_ledger() {
     let allow = [0x1E, 0, 0, 0, 0, 0];
@@ -221,8 +226,11 @@ fn exec_cleanup_follows_the_drive_ledger() {
         5_000,
         CleanupCtx::Plain,
     );
-    assert!(matches!(r, Err(Error::Halted)), "never locked: refused");
-    assert!(fake.log().is_empty());
+    assert!(
+        r.is_ok(),
+        "ALLOW is legal after a cancel, locked or not (#75): {r:?}"
+    );
+    assert_eq!(fake.log().len(), 1);
 
     let h = Halt::new();
     let (t, fake) = FakeTransport::new();
@@ -290,7 +298,7 @@ fn agid_ledger_set_and_clear() {
     assert_eq!(d.ledger().agids, 0, "a failed allocation holds nothing");
 }
 
-/// LD6: `lock_tray` after a cancel sends no PREVENT and leaves the tray unlocked.
+/// LD6: `lock_tray` after a cancel sends no PREVENT; the close still sends its ALLOW.
 #[test]
 fn lock_tray_after_cancel_sends_nothing() {
     let h = Halt::new();
@@ -298,9 +306,14 @@ fn lock_tray_after_cancel_sends_nothing() {
     let mut d = Drive::from_transport_with(Box::new(t.watch(&h)), &h);
     h.cancel();
     d.lock_tray();
-    assert!(!d.ledger().tray_locked);
+    assert!(!fake.tray_locked());
     drop(d);
-    assert!(fake.log().is_empty(), "no PREVENT, and so no ALLOW on drop");
+    let log: Vec<_> = fake.log().into_iter().map(|c| c.cdb).collect();
+    assert_eq!(
+        log,
+        vec![vec![0x1E, 0, 0, 0, 0, 0]],
+        "no PREVENT, one ALLOW on drop"
+    );
 }
 
 /// LD7 (GUARD): a locked Drive dropped after a cancel issues exactly one ALLOW.
@@ -431,43 +444,82 @@ fn wait_ready_stop_during_poll_and_start_unit() {
     }
 }
 
-/// LD11a (GUARD, T5): transport failures broken by a drive answer every few polls,
-/// for more than the dead-bus budget, never count as a dead bus.
+/// LD11a (GUARD, T5, #75): a single transport hiccup is ridden out — silence for the
+/// budget, then one re-check that the drive answers — and each later hiccup gets the
+/// same single re-check, never a burst of polls into the faulted bus.
 #[test]
-fn dead_bus_budget_resets_on_any_answer() {
-    let budget = Duration::from_secs(1);
-    // Polls are at least 10 ms apart, so 150 polls outlast the budget.
-    let mut n = 0u32;
+fn transport_hiccup_settles_then_rechecks_once() {
+    let budget = MS(200);
+    // fault, answer, fault, answer, ready: two hiccups, each followed by a drive answer.
+    let calls: Arc<Mutex<Vec<Instant>>> = Arc::default();
+    let c2 = calls.clone();
     let t = Script::new(move |_, d| {
-        n += 1;
-        if n >= 150 {
-            return good(d);
+        let mut c = c2.lock().unwrap();
+        c.push(Instant::now());
+        match c.len() {
+            1 | 3 => Err(fault()),
+            2 | 4 => Err(not_ready(0x04, 0x01)),
+            _ => good(d),
         }
-        if n.is_multiple_of(5) {
-            return Err(not_ready(0x04, 0x01));
-        }
+    });
+    let mut d = Drive::from_transport(Box::new(t));
+    let r = d.wait_ready_with(timing(Duration::from_secs(60), budget));
+    assert!(r.is_ok(), "{r:?}");
+    let c = calls.lock().unwrap();
+    assert_eq!(c.len(), 5, "one re-check per hiccup, nothing more");
+    for i in [0, 2] {
+        assert!(
+            c[i + 1] - c[i] >= budget,
+            "no command for the budget after the fault at TUR {}",
+            i + 1
+        );
+    }
+}
+
+/// LD11b / G5 (GUARD, #75): a fault, the silence, then a second fault is a dead bus:
+/// exactly two TURs reach the faulted bus (1.8.4 sent one every 500 ms for 5 s+).
+#[test]
+fn dead_bus_fails_on_the_recheck() {
+    let budget = MS(100);
+    let calls: Arc<Mutex<Vec<Instant>>> = Arc::default();
+    let c2 = calls.clone();
+    let t = Script::new(move |_, _| {
+        c2.lock().unwrap().push(Instant::now());
         Err(fault())
     });
     let mut d = Drive::from_transport(Box::new(t));
-    let t0 = Instant::now();
     let r = d.wait_ready_with(timing(Duration::from_secs(60), budget));
-    assert!(r.is_ok(), "{r:?}");
-    assert!(t0.elapsed() > budget, "the run outlasted the budget");
-}
-
-/// LD11b / G5 (GUARD): an unbroken run of transport failures for the budget is a
-/// dead bus, surfaced as the transport failure.
-#[test]
-fn dead_bus_unbroken_run_fails() {
-    let t = Script::new(|_, _| Err(fault()));
-    let mut d = Drive::from_transport(Box::new(t));
-    let t0 = Instant::now();
-    let r = d.wait_ready_with(timing(Duration::from_secs(60), MS(100)));
     assert!(
         matches!(&r, Err(e) if e.is_scsi_transport_failure()),
         "{r:?}"
     );
-    assert!(t0.elapsed() < Duration::from_secs(1));
+    let c = calls.lock().unwrap();
+    assert_eq!(c.len(), 2, "the fault and one re-check");
+    assert!(c[1] - c[0] >= budget, "silence before the re-check");
+}
+
+/// LD11c (GUARD, #75): a Stop during the post-fault silence ends the wait as `Halted`
+/// with no further command.
+#[test]
+fn stop_during_post_fault_silence_sends_nothing() {
+    let h = Halt::new();
+    let (t, fake) = FakeTransport::new();
+    let t = t.with_inner(Box::new(Script::new(|_, _| Err(fault()))));
+    let mut d = Drive::from_transport_with(Box::new(t), &h);
+    let h2 = h.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(MS(100));
+        h2.cancel();
+    });
+    let r = d.wait_ready_with(timing(Duration::from_secs(60), Duration::from_secs(30)));
+    stopper.join().unwrap();
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    assert_eq!(
+        fake.log().len(),
+        1,
+        "only the faulted TUR: {:?}",
+        fake.log()
+    );
 }
 
 /// LD12a: 04/01 with a progress indication rising every 0.25 × window for 3 windows,
@@ -605,7 +657,10 @@ fn wait_ready_terminal_answers_unchanged() {
     let slow = timing(Duration::from_secs(60), MS(5_000));
     let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let p2 = polls.clone();
-    let t = Script::new(move |_, _| {
+    let t = Script::new(move |c, d| {
+        if c[0] != SCSI_TEST_UNIT_READY {
+            return good(d); // the close's ALLOW
+        }
         p2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(not_ready(0x3A, 0x00))
     });

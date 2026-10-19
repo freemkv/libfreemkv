@@ -1545,8 +1545,8 @@ fn wait_ready_breaks_out_on_a_dead_bus() {
     );
 }
 
-// One bus hiccup (DID_TIME_OUT, then the Linux fd-reopen gap) during spin-up
-// must not abort the poll: the next TUR on the recovered fd succeeds.
+// One bus hiccup (DID_TIME_OUT) during spin-up must not abort the poll: after the
+// silent settle, the one re-check on the recovered fd succeeds.
 #[test]
 fn wait_ready_rides_out_a_transient_transport_failure() {
     struct Hiccup(usize);
@@ -1565,9 +1565,6 @@ fn wait_ready_rides_out_a_transient_transport_failure() {
                     status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
                     sense: None,
                 }),
-                2 => Err(Error::DeviceNotFound {
-                    path: "/dev/sg0".into(),
-                }),
                 _ => Ok(ScsiResult {
                     status: 0,
                     bytes_transferred: 0,
@@ -1577,7 +1574,7 @@ fn wait_ready_rides_out_a_transient_transport_failure() {
         }
     }
     let mut d = Drive::from_transport_for_test(Box::new(Hiccup(0)));
-    let r = d.wait_ready();
+    let r = d.wait_ready_with(FAST_SETTLE);
     assert!(
         r.is_ok(),
         "a transient transport failure must not abort wait_ready: {r:?}"
@@ -1615,17 +1612,29 @@ impl ScsiTransport for FlakyBus {
     }
 }
 
-// The dead-bus budget is TIME, not a count: several quick transport
-// failures within it (a bridge reset storm) must still ride through.
+// #75: a fault storm is not polled through. 1.8.0-1.8.4 rode out 4 quick failures
+// by polling the faulted bridge every 500 ms, which wedged a USB BU40N; now the
+// re-check after the settle is the last TUR it gets.
 #[test]
-fn wait_ready_tolerates_quick_transport_failures_within_the_budget() {
+fn wait_ready_does_not_poll_through_a_fault_storm() {
     let mut d = Drive::from_transport_for_test(Box::new(FlakyBus {
         fails: 4,
         delay: std::time::Duration::ZERO,
     }));
-    let r = d.wait_ready();
-    assert!(r.is_ok(), "4 fast failures (~2 s) are within budget: {r:?}");
+    let r = d.wait_ready_with(FAST_SETTLE);
+    assert!(
+        matches!(&r, Err(e) if e.is_scsi_transport_failure()),
+        "two faults in a row are a dead bus: {r:?}"
+    );
 }
+
+// Production polling with a 50 ms post-fault settle, so these run fast.
+const FAST_SETTLE: WaitReadyTiming = WaitReadyTiming {
+    poll: std::time::Duration::from_millis(500),
+    window: std::time::Duration::from_secs(60),
+    dead_bus: std::time::Duration::from_millis(50),
+    ceiling: std::time::Duration::from_secs(600),
+};
 
 // TUR answers NOT READY with `sense` until a START STOP UNIT (START=1)
 // arrives, then `after_start` more times, then GOOD. Counts the STARTs.
@@ -1841,9 +1850,8 @@ fn wait_ready_fails_fast_on_an_unplugged_drive() {
     );
 }
 
-// Slow failing TURs: the verdict comes when the run has lasted the 5 s budget
-// past the first failure's completion. With 1.2 s failures + 0.5 s backoff
-// that is exactly the 4th failure, so any count rule (2, 3, ...) shows up.
+// Slow failing TURs: the fault, the silent settle, then one re-check that also
+// fails ends the wait. However slow each failure is, only two TURs are sent.
 #[test]
 fn wait_ready_bounds_slow_transport_failures_by_elapsed_time() {
     struct SlowDeadBus(Arc<std::sync::atomic::AtomicUsize>);
@@ -1866,15 +1874,15 @@ fn wait_ready_bounds_slow_transport_failures_by_elapsed_time() {
     }
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut d = Drive::from_transport_for_test(Box::new(SlowDeadBus(calls.clone())));
-    let r = d.wait_ready();
+    let r = d.wait_ready_with(FAST_SETTLE);
     assert!(
         matches!(&r, Err(e) if e.is_scsi_transport_failure()),
         "{r:?}"
     );
     assert_eq!(
         calls.load(Ordering::Relaxed),
-        4,
-        "gives up on the first failure completing >= 5 s after the first"
+        2,
+        "the fault and one re-check"
     );
 }
 
@@ -2167,31 +2175,42 @@ fn set_speed_sends_set_cd_speed_cdb_with_be_speed() {
     assert_eq!(&c[2..4], &[0x12, 0x34], "read speed big-endian");
 }
 
-// Dropping a drive must not clear a tray lock it never took: find_drive opens
-// and drops candidates, and another process may hold the PREVENT.
+// #75: closing a drive always leaves it ejectable, as 1.7 did. 1.8.0-1.8.4 sent ALLOW
+// on Drop only if that Drive had sent PREVENT; the server never does, so a lock held
+// by the drive (or left by an earlier handle) survived every close and only a power
+// cycle freed the tray. One ALLOW per close; none after an accepted unlock_tray.
 #[test]
-fn drop_unlocks_the_tray_only_if_this_drive_locked_it() {
-    let seq = |f: &dyn Fn(&mut Drive)| {
+fn drop_always_leaves_the_tray_unlocked() {
+    let seq = |ok: bool, f: &dyn Fn(&mut Drive)| {
         let cdbs = Arc::new(Mutex::new(Vec::new()));
         let mut d = Drive::from_transport_for_test(Box::new(SequenceTransport {
             cdbs: cdbs.clone(),
-            ok: true,
+            ok,
         }));
         f(&mut d);
         cdbs.lock().unwrap().clear();
         drop(d);
         cdbs.lock().unwrap().clone()
     };
-    assert!(seq(&|_| {}).is_empty(), "never locked: Drop sends nothing");
-    let after_lock = seq(&|d| d.lock_tray());
-    assert_eq!(after_lock.len(), 1, "locked: Drop unlocks {after_lock:?}");
-    assert_eq!(after_lock[0][0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
-    assert_eq!(after_lock[0][4], 0x00, "ALLOW");
-    let unlocked = seq(&|d| {
+    let is_allow = |c: &Vec<u8>| c[0] == SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL && c[4] == 0x00;
+    let never_locked = seq(true, &|_| {});
+    assert_eq!(never_locked.len(), 1, "never locked: {never_locked:02x?}");
+    assert!(is_allow(&never_locked[0]), "{never_locked:02x?}");
+    let after_lock = seq(true, &|d| d.lock_tray());
+    assert_eq!(after_lock.len(), 1, "locked: {after_lock:02x?}");
+    assert!(is_allow(&after_lock[0]), "{after_lock:02x?}");
+    let unlocked = seq(true, &|d| {
         d.lock_tray();
         d.unlock_tray();
     });
-    assert!(unlocked.is_empty(), "already unlocked: {unlocked:?}");
+    assert!(unlocked.is_empty(), "accepted unlock: {unlocked:02x?}");
+    // An unlock the drive refused is retried once on close.
+    let refused = seq(false, &|d| {
+        d.lock_tray();
+        d.unlock_tray();
+    });
+    assert_eq!(refused.len(), 1, "refused unlock: {refused:02x?}");
+    assert!(is_allow(&refused[0]), "{refused:02x?}");
 }
 
 #[test]

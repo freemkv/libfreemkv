@@ -656,9 +656,14 @@ pub mod diag {
         }
     }
 
-    // Debug panic when `what` could block (`d > 0`) inside a scope.
+    // Debug panic when `what` could block (`d > 0`) inside a scope. Not while already
+    // unwinding: a second panic aborts, and Drop's clean-up (the close-time ALLOW) runs then.
     pub(crate) fn assert_may_block(what: &str, d: Duration) {
-        if cfg!(debug_assertions) && !d.is_zero() && NoBlockingScope::active() {
+        if cfg!(debug_assertions)
+            && !d.is_zero()
+            && NoBlockingScope::active()
+            && !std::thread::panicking()
+        {
             panic!("{what} under NoBlockingScope");
         }
     }

@@ -59,6 +59,7 @@ struct State {
     allow: Vec<Pred>,
     cancel_on: Vec<(Pred, Halt)>,
     ledger: Ledger,
+    tray_locked: bool,
     live: usize,
     released: u64,
 }
@@ -101,6 +102,7 @@ impl FakeTransport {
                 allow: Vec::new(),
                 cancel_on: Vec::new(),
                 ledger: Ledger::default(),
+                tray_locked: false,
                 live: 1,
                 released: 0,
             }),
@@ -215,7 +217,7 @@ impl FakeHandle {
 
     /// The tray lock as the fake drive sees it.
     pub fn tray_locked(&self) -> bool {
-        self.0.lock().ledger.tray_locked
+        self.0.lock().tray_locked
     }
 
     /// AGIDs the fake drive holds (bit `n` = AGID `n`).
@@ -393,6 +395,9 @@ impl ScsiTransport for FakeTransport {
             }
         };
         let mut st = self.shared.lock();
+        if cdb.first() == Some(&allow::PREVENT_ALLOW) && r.is_ok() {
+            st.tray_locked = cdb.get(4).is_some_and(|b| b & 1 == 1);
+        }
         note_ledger(&mut st.ledger, cdb, data, r.is_ok());
         for (pred, halt) in &st.cancel_on {
             if pred(cdb) {
@@ -407,18 +412,15 @@ impl ScsiTransport for FakeTransport {
     }
 }
 
-// The fake drive's own tray and AGID state, from the CDBs it answered.
+// The fake drive's own AGID state, from the CDBs it answered.
 fn note_ledger(l: &mut Ledger, cdb: &[u8], resp: &[u8], ok: bool) {
-    match cdb.first() {
-        Some(&allow::PREVENT_ALLOW) if ok => l.tray_locked = cdb.get(4).is_some_and(|b| b & 1 == 1),
-        Some(&allow::REPORT_KEY) if cdb.len() >= 11 => {
-            if let Some(agid) = allow::invalidated_agid(cdb) {
-                l.agids &= !(1 << agid);
-            } else if cdb[10] & 0x3F == 0 && ok && resp.len() > 7 {
-                l.agids |= 1 << (resp[7] >> 6);
-            }
-        }
-        _ => {}
+    if cdb.first() != Some(&allow::REPORT_KEY) || cdb.len() < 11 {
+        return;
+    }
+    if let Some(agid) = allow::invalidated_agid(cdb) {
+        l.agids &= !(1 << agid);
+    } else if cdb[10] & 0x3F == 0 && ok && resp.len() > 7 {
+        l.agids |= 1 << (resp[7] >> 6);
     }
 }
 

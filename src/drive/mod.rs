@@ -91,9 +91,11 @@ pub struct Drive {
     /// unlocker matched or the matching unlocker produced no VID — the cert
     /// handshake then acquires the VID.
     oem_vid: Option<[u8; 16]>,
-    /// `lock_tray` was called and no `unlock_tray` since: only then does Drop
-    /// send ALLOW (never clear a lock another process holds).
-    tray_locked: bool,
+    /// The last tray command this Drive sent was an ALLOW the drive accepted. Until
+    /// then Drop sends one ALLOW, whoever locked the tray: as in 1.7, closing a drive
+    /// always leaves it ejectable (#75: a drive left locked after a failed rip could
+    /// only be freed by a power cycle).
+    tray_released: bool,
     pub drive_id: DriveId,
     device_path: String,
     /// The op token every CDB is checked against (§2.2).
@@ -231,7 +233,7 @@ impl Drive {
             scsi,
             unlocked_by: None,
             oem_vid: None,
-            tray_locked: false,
+            tray_released: false,
             drive_id: DriveId {
                 vendor_id: String::new(),
                 product_id: String::new(),
@@ -420,10 +422,7 @@ impl Drive {
 
     /// The §2.2 ledger: what a post-cancel clean-up CDB may release.
     pub(crate) fn ledger(&self) -> allow::Ledger {
-        allow::Ledger {
-            tray_locked: self.tray_locked,
-            agids: self.agids,
-        }
+        allow::Ledger { agids: self.agids }
     }
 
     // A Detached exec: a bug in debug; in release, one warning, then uncancellable.
@@ -507,12 +506,12 @@ impl Drive {
         r
     }
 
-    // §2.2 ledger: an ALLOW that reached the drive ends this Drive's claim on the tray
-    // (so it is sent once); a successful REPORT KEY key format 0 allocates the AGID in
+    // §2.2 ledger: an ALLOW the drive accepted releases the tray (so Drop need not send
+    // another), a PREVENT re-arms it; a successful REPORT KEY key format 0 allocates the AGID in
     // response byte 7 bits 7-6; key format 3Fh invalidates the AGID in byte 10 bits 7-6.
     fn note_ledger(&mut self, cdb: &[u8], resp: &[u8], ok: bool) {
-        if cdb.first() == Some(&allow::PREVENT_ALLOW) && cdb.get(4).is_some_and(|b| b & 1 == 0) {
-            self.tray_locked = false;
+        if cdb.first() == Some(&allow::PREVENT_ALLOW) {
+            self.tray_released = ok && cdb.get(4).is_some_and(|b| b & 1 == 0);
         }
         // SS-7 (evidence, not spec) libaacs mmc.c: "*agid = (buf[7] & 0xff) >> 6;" on
         // allocation, and "cmd[10] = (agid << 6) | (format & 0x3f);" names the AGID.
@@ -534,7 +533,7 @@ impl Drive {
 
     /// Shared cleanup — called by Drop (and thus by close).
     fn cleanup(&mut self) {
-        if self.tray_locked {
+        if !self.tray_released {
             self.unlock_tray();
         }
     }
@@ -575,7 +574,9 @@ impl Drive {
     /// answers GOOD. Fails with `DeviceNotReady` after 60 s without progress
     /// (§2.11): an answer not yet seen in this wait, or a rising progress indicator;
     /// or after an absolute 10 min ceiling, however much progress it shows.
-    /// A Stop interrupts between polls; a dead bus fails after 5 s of failures.
+    /// A Stop interrupts between polls. A transport fault is answered with 5 s of
+    /// silence and one re-check, never further polling: a second fault in a row is a
+    /// dead bus and fails at once (a just-faulted USB bridge must be left alone).
     pub fn wait_ready(&mut self) -> Result<()> {
         self.wait_ready_with(WaitReadyTiming::PRODUCTION)
     }
@@ -593,8 +594,8 @@ impl Drive {
         let mut stall = crate::halt::StallTimer::new(timing.window, &moved);
         let mut seen: Vec<Option<(u8, u8, u8)>> = Vec::new();
         let mut best: Option<u16> = None;
-        // (when the first failure of the current run completed, failures in it)
-        let mut failing: Option<(std::time::Instant, u32)> = None;
+        // The last TUR failed at the transport (cleared by any drive answer).
+        let mut faulted = false;
         let mut start_sent = false;
         // Consecutive 3Ah answers, and whether 04/01 (a disc being identified) was seen.
         let (mut empty_run, mut becoming_ready_seen) = (0u32, false);
@@ -620,19 +621,23 @@ impl Drive {
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                // T5: transport failures (DID_TIME_OUT/DID_RESET, fd<0 DeviceNotFound) may be
-                // a hiccup; a run of 2+ lasting the budget past the first one's completion
-                // is a dead bus. Any drive answer ends the run.
+                // T5: a transport failure (DID_TIME_OUT/DID_RESET, fd<0 DeviceNotFound) may
+                // be a hiccup, but polling a faulted bridge is what wedges it. Send nothing
+                // for the dead-bus budget, then re-check once; a second fault in a row is a
+                // dead bus. Any drive answer clears it.
                 Err(e) if e.is_scsi_transport_failure() => {
                     empty_run = 0;
-                    let (since, n) = failing.get_or_insert((std::time::Instant::now(), 0));
-                    *n += 1;
-                    if *n >= 2 && since.elapsed() >= timing.dead_bus {
+                    if faulted {
+                        tracing::warn!(target: "freemkv::drive", phase = "wait_ready", error = %e, "transport fault again after settling: the bus is dead, polling stops");
                         return Err(e);
                     }
+                    faulted = true;
+                    tracing::warn!(target: "freemkv::drive", phase = "wait_ready", error = %e, settle_ms = timing.dead_bus.as_millis() as u64, "transport fault: settling with no commands, then one re-check");
+                    self.pause(timing.dead_bus)?;
+                    continue;
                 }
                 Err(e) => {
-                    failing = None;
+                    faulted = false;
                     let sense = e.scsi_sense().map(|s| (s.sense_key, s.asc, s.ascq));
                     // §2.11: a new answer in this wait is progress; the same one, or two
                     // known ones alternating, is not.
@@ -1351,9 +1356,8 @@ impl Drive {
         if self.is_halted() {
             return;
         }
-        self.tray_locked = true;
         match self.exec(&prevent, crate::scsi::DataDirection::None, &mut buf, 5_000) {
-            Err(Error::Halted) => self.tray_locked = false,
+            Err(Error::Halted) => {}
             Err(e) => {
                 tracing::warn!(target: "freemkv::drive", error = %e, "PREVENT MEDIUM REMOVAL failed")
             }
@@ -1361,8 +1365,8 @@ impl Drive {
         }
     }
 
-    /// Unlock the tray so the user can manually eject the disc. A clean-up CDB: after
-    /// a Stop it is still sent if this Drive locked the tray (§2.4).
+    /// Unlock the tray so the user can manually eject the disc. A clean-up CDB: it is
+    /// still sent after a Stop (§2.4), and Drop sends it again if the drive refused it.
     pub fn unlock_tray(&mut self) {
         // SS-5 MMC-6 Table 329: Persistent 0, Prevent 0 = "Prevent State shall be cleared (Unlocked)".
         let allow = [
@@ -1374,7 +1378,6 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 0];
-        // Checked against the ledger as it stands, then cleared: exactly one ALLOW.
         let r = self.exec_cleanup(
             &allow,
             crate::scsi::DataDirection::None,
@@ -1382,7 +1385,6 @@ impl Drive {
             5_000,
             CleanupCtx::Plain,
         );
-        self.tray_locked = false;
         // Best-effort (the tray-unlock is advisory), but a failure is worth a warn!
         // rather than a silent `let _`: a stuck PREVENT lock is a real symptom the
         // operator otherwise never sees until the tray won't open.
@@ -1673,8 +1675,8 @@ pub(crate) fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> R
 // wait_ready reports the empty drive (~5 s of polling).
 const WAIT_READY_MAX_EMPTY_POLLS: u32 = 10;
 
-// How long an unbroken run of transport-class TUR failures may last, from the
-// first one's completion, before wait_ready calls the bus dead.
+// How long wait_ready leaves a bus alone after a transport-class TUR failure before
+// its one re-check.
 const WAIT_READY_DEAD_BUS_BUDGET: Duration = Duration::from_secs(5);
 
 // Absolute wait_ready ceiling: a drive cycling fresh answers can't re-arm the window forever.
@@ -1687,7 +1689,7 @@ pub(crate) struct WaitReadyTiming {
     pub poll: Duration,
     /// T6: give up after this long with no progress.
     pub window: Duration,
-    /// T5: an unbroken run of transport failures this long is a dead bus.
+    /// T5: the silence after a transport failure before the one re-check.
     pub dead_bus: Duration,
     /// Absolute cap on the whole wait, however the drive's answers vary.
     pub ceiling: Duration,
