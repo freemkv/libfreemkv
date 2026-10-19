@@ -130,8 +130,9 @@ impl DiscSession {
     /// the only hard failure here), then runs `wait_ready` → `init` →
     /// `probe_disc`. Those three are ADVISORY exactly as every consumer treated
     /// them: a failure is logged via `tracing` and discarded — the later
-    /// [`Self::scan`] is the authoritative gate. No scan, no identify, no key
-    /// resolution runs here.
+    /// [`Self::scan`] is the authoritative gate. A `wait_ready` that ends on a
+    /// transport fault skips `init` and `probe_disc`, so a faulted drive is sent
+    /// nothing more here. No scan, no identify, no key resolution runs here.
     pub fn open(target: DeviceTarget, spec: KeySpec) -> Result<DiscSession> {
         let drive = match target {
             DeviceTarget::Path(ref path) => Drive::open(path)?,
@@ -185,7 +186,8 @@ impl DiscSession {
     }
 
     // `wait_ready` → `init` → `probe_disc`, advisory. Under an op token (`open_with`) a
-    // Stop is the one failure that is not advisory.
+    // Stop is the one failure that is not advisory. #75: a `wait_ready` that ends on a
+    // transport fault skips the rest, since commanding a just-faulted USB drive can wedge it.
     pub(crate) fn bring_up(
         mut drive: Drive,
         spec: KeySpec,
@@ -204,6 +206,16 @@ impl DiscSession {
             match run(&mut drive) {
                 // Stop is always honoured: dropping `drive` closes the handle.
                 Err(Error::Halted) if halt.is_some() => return Err(Error::Halted),
+                Err(e) if step == "wait_ready" && e.is_scsi_transport_failure() => {
+                    tracing::warn!(
+                        target: "freemkv::drive",
+                        phase = "bring_up",
+                        error = %e,
+                        skipped = "init, probe_disc",
+                        "wait_ready ended on a transport fault: sending the drive nothing more during bring-up"
+                    );
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!(target: "freemkv::session", step, error = %e, "advisory bring-up step failed (continuing)")
                 }

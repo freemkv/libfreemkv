@@ -331,3 +331,55 @@ fn source_mut_follows_the_staged_reader() {
     let _reader = s.take_reader();
     assert!(s.source_mut().is_none());
 }
+
+/// #75: `wait_ready` that ends on a dead bus (a fault, the silence, a second fault)
+/// skips `init` and `probe_disc`: no unlock, SET CD SPEED or MODE SELECT reaches the
+/// drive that just faulted, under an op token or not. The session still opens.
+#[test]
+fn bring_up_after_a_dead_bus_sends_nothing_more() {
+    use crate::test_util::FakeMode;
+    for token in [true, false] {
+        let h = Halt::new();
+        let (t, fake) = FakeTransport::new();
+        let t = t.rule(|c| c[0] == 0x00, FakeMode::Fault);
+        let mut drive = if token {
+            Drive::from_transport_with(Box::new(t), &h)
+        } else {
+            Drive::from_transport(Box::new(t))
+        };
+        drive.scale_time_for_test(1_000); // the 5 s silence runs as 5 ms
+        let t0 = std::time::Instant::now();
+        let s = DiscSession::bring_up(drive, KeySpec::default(), token.then(|| h.clone()))
+            .expect("the bring-up is advisory");
+        assert!(t0.elapsed() >= Duration::from_millis(5), "token={token}");
+        assert_eq!(
+            fake.cdbs(),
+            vec![vec![0u8; 6]; 2],
+            "token={token}: the faulted TUR and its one re-check, then nothing"
+        );
+        drop(s);
+    }
+}
+
+/// #75 guard: a Stop during the post-fault silence still ends the bring-up `Halted`,
+/// with only the close's ALLOW after the faulted TUR.
+#[test]
+fn stop_during_bring_up_fault_silence_is_halted() {
+    use crate::test_util::FakeMode;
+    let h = Halt::new();
+    let (t, fake) = FakeTransport::new();
+    let t = t.rule(|c| c[0] == 0x00, FakeMode::Fault).watch(&h);
+    let drive = Drive::from_transport_with(Box::new(t), &h);
+    let h2 = h.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        h2.cancel();
+    });
+    let r = DiscSession::bring_up(drive, KeySpec::default(), Some(h.clone()));
+    stopper.join().unwrap();
+    assert!(matches!(r, Err(Error::Halted)), "{:?}", r.err());
+    let cdbs = fake.cdbs();
+    assert_eq!(cdbs.len(), 2, "{cdbs:02x?}");
+    assert_eq!(cdbs[0], vec![0u8; 6]);
+    assert!(is_allow(&cdbs[1]), "{cdbs:02x?}");
+}

@@ -104,6 +104,9 @@ pub struct Drive {
     progress: Option<Liveness>,
     /// AGIDs allocated through this Drive and not yet invalidated (§2.2 ledger).
     agids: u8,
+    /// Commands that failed at the transport through [`Drive::dispatch`]; `init`
+    /// compares it across the unlock to leave a just-faulted drive alone (#75).
+    transport_faults: u64,
     /// The SINGLE AACS bus-encryption removal point. Decided ONCE from the
     /// unlock/handshake result during [`crate::disc::Disc::scan`] and applied on
     /// every read below this drive, so every reader above (sampler, mux, sweep,
@@ -126,6 +129,9 @@ pub struct Drive {
     /// errors propagate as before).
     #[cfg(target_os = "linux")]
     block_dev_fd: Option<std::os::unix::io::RawFd>,
+    /// Test-only: every [`Drive::pause`] lasts `1 / time_scale` of the asked time.
+    #[cfg(test)]
+    time_scale: u32,
 }
 
 /// Which token a Drive checks every CDB against (stop design §2.2).
@@ -248,11 +254,20 @@ impl Drive {
             slot,
             progress: None,
             agids: 0,
+            transport_faults: 0,
             bus_stage: crate::sector::bus_removal::BusStage::Passthrough,
             bus_gate: None,
             #[cfg(target_os = "linux")]
             block_dev_fd: None,
+            #[cfg(test)]
+            time_scale: 1,
         }
+    }
+
+    // Test-only: run every pause (wait_ready's, an unlocker's) `divisor` times faster.
+    #[cfg(test)]
+    pub(crate) fn scale_time_for_test(&mut self, divisor: u32) {
+        self.time_scale = divisor.max(1);
     }
 
     /// Set the SINGLE AACS bus-removal stage for this drive, decided once from
@@ -414,6 +429,8 @@ impl Drive {
 
     /// Wait `d` on the attached token: `Err(Halted)` within one slice of a Stop.
     pub(crate) fn pause(&self, d: Duration) -> Result<()> {
+        #[cfg(test)]
+        let d = d / self.time_scale;
         match self.slot.token() {
             Some(t) => t.wait(d),
             None => Halt::new().wait(d),
@@ -503,6 +520,9 @@ impl Drive {
             p.bump();
         }
         self.note_ledger(cdb, buf, r.is_ok());
+        if r.as_ref().is_err_and(Error::is_scsi_transport_failure) {
+            self.transport_faults += 1;
+        }
         r
     }
 
@@ -850,7 +870,9 @@ impl Drive {
         // disc-independent; AACS/CSS handshakes run LATER, gated on disc kind. A
         // transport fault aborts init (v1.1.0 invariant); other errors fall through.
         let drive_id = self.drive_id.clone();
+        let faults_before = self.transport_faults;
         let (matched, unlock_res) = crate::unlock_bridge::run_features(self, &drive_id);
+        let unlock_faults = self.transport_faults - faults_before;
         // §2.3 reclassification: a Stop is `Halted` before any other result mapping, so
         // the refused CDBs it caused never read as a dead bus.
         self.check_token()?;
@@ -880,10 +902,21 @@ impl Drive {
             }
             Err(_) => Ok(()),
         };
-        // Raise to max read speed UNCONDITIONALLY whenever the bus is alive, for
-        // ANY disc type — DVD included, and even a stock-mode drive with no
-        // firmware unlocker still wants it. Best-effort: failure must NOT fail the rip.
-        if r.is_ok() {
+        // Raise to max read speed whenever the bus is alive, for ANY disc type — DVD
+        // included, and even a stock-mode drive with no firmware unlocker still wants
+        // it. Best-effort: failure must NOT fail the rip. #75: not after a transport
+        // fault during the unlock, even one the unlocker rode out: these commands into
+        // a just-faulted USB drive can wedge it, and the drive's defaults still read.
+        if r.is_ok() && unlock_faults > 0 {
+            tracing::warn!(
+                target: "freemkv::drive",
+                phase = "init",
+                unlocker = matched,
+                transport_faults = unlock_faults,
+                skipped = "SET CD SPEED, MODE SELECT",
+                "transport fault during the unlock: leaving the drive's speed and error-recovery defaults"
+            );
+        } else if r.is_ok() {
             self.set_speed(Self::SPEED_MAX_KBPS);
             // Ask the drive to REPORT recovered/marginal reads instead of silently
             // committing best-effort data as GOOD (the dirty-disc "passed-clean-but-

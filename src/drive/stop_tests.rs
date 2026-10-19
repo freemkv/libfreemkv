@@ -839,3 +839,116 @@ fn asc_ascq_classification_table() {
         assert_eq!(got, want, "{row}");
     }
 }
+
+/// What the LD drive in [`ld_init_with_a_calibration_fault`] does after its fault.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AfterFault {
+    /// The bus recovers and the drive still answers unlocked.
+    StillUnlocked,
+    /// The bus recovers but the drive lost the firmware (no unlock markers).
+    LostFirmware,
+}
+
+/// Every CDB with the time it reached the drive.
+type TimedLog = Vec<(Instant, Vec<u8>)>;
+
+/// `Drive::init` on a catalogued LD (MT1959) drive whose first speed-calibration
+/// probe faults at the transport. Returns init's result, the drive, and every CDB
+/// with the time it reached the drive. Pauses run 1000× faster.
+fn ld_init_with_a_calibration_fault(after: AfterFault) -> (Result<()>, Drive, TimedLog, Vec<u8>) {
+    let fu_id = freemkv_unlock::DriveId {
+        vendor_id: "HL-DT-ST".into(),
+        product_revision: "1.01".into(),
+        vendor_specific: "NM00100".into(),
+        firmware_date: "211711202000".into(),
+        ..Default::default()
+    };
+    let m = freemkv_unlock::ld::profile(&fu_id).expect("a bundled LD profile");
+    let sig = m.profile.signature;
+    // The fixture profile's OEM VID read: READ BUFFER sub-command 10h, 36 bytes.
+    let vid_cdb = vec![0x3C, 0x01, 0x44, 0x10, 0xE1, 0xED, 0x00, 0x00, 0x24, 0x00];
+    let log: Arc<Mutex<TimedLog>> = Arc::default();
+    let (l2, vid2) = (log.clone(), vid_cdb.clone());
+    let mut faulted = false;
+    let t = Script::new(move |c, d| {
+        l2.lock().unwrap().push((Instant::now(), c.to_vec()));
+        d.fill(0);
+        let unlock_read = c[0] == 0x3C && matches!(c[2], 0x44 | 0x77) && c[3] == 0 && c[8] == 64;
+        if c[0] == 0x3C && c[3] == 0x14 && !faulted {
+            faulted = true;
+            return Err(fault());
+        }
+        if unlock_read {
+            d[0..4].copy_from_slice(&sig);
+            if !(faulted && after == AfterFault::LostFirmware) {
+                d[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
+                d[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
+            }
+        } else if c == vid2.as_slice() {
+            d[..3].copy_from_slice(&[0x00, 0x22, 0x00]);
+            d[4..20].fill(0x5A);
+        }
+        good(d)
+    });
+    let mut d = Drive::from_transport(Box::new(t));
+    d.drive_id.vendor_id = fu_id.vendor_id.clone();
+    d.drive_id.product_revision = fu_id.product_revision.clone();
+    d.drive_id.vendor_specific = fu_id.vendor_specific.clone();
+    d.drive_id.firmware_date = fu_id.firmware_date.clone();
+    d.scale_time_for_test(1_000);
+    let r = d.init();
+    let log = log.lock().unwrap().clone();
+    (r, d, log, vid_cdb)
+}
+
+/// #75: after a transport fault during the unlock, `init` sends no SET CD SPEED and no
+/// MODE SENSE / MODE SELECT. The drive gets the unlocker's silence (5 s, scaled) and
+/// its one re-confirm read (plus the VID read when the unlock held), then nothing.
+#[test]
+fn init_after_an_unlock_fault_skips_speed_and_mode_select() {
+    for after in [AfterFault::StillUnlocked, AfterFault::LostFirmware] {
+        let (r, d, log, vid_cdb) = ld_init_with_a_calibration_fault(after);
+        r.unwrap_or_else(|e| panic!("{after:?}: {e:?}"));
+        let at = log
+            .iter()
+            .position(|(_, c)| c[0] == 0x3C && c[3] == 0x14)
+            .expect("calibration ran");
+        let rest: Vec<String> = log[at + 1..]
+            .iter()
+            .map(|(_, c)| match c {
+                c if c[0] == 0x3C && c[3] == 0 && c[8] == 64 => "unlock".into(),
+                c if *c == vid_cdb => "vid".into(),
+                c => format!("{c:02X?}"),
+            })
+            .collect();
+        let want: &[&str] = match after {
+            AfterFault::StillUnlocked => &["unlock", "vid"],
+            AfterFault::LostFirmware => &["unlock"],
+        };
+        assert_eq!(rest, want, "{after:?}: nothing after the re-confirm");
+        assert!(
+            log[at + 1].0 - log[at].0 >= MS(5),
+            "{after:?}: silence before the re-confirm"
+        );
+        let unlocked = (after == AfterFault::StillUnlocked).then_some("LD");
+        assert_eq!(d.unlocked_by(), unlocked, "{after:?}");
+    }
+}
+
+/// #75 guard: an init with no transport fault still raises the speed and asks for
+/// recovered-error reporting.
+#[test]
+fn init_without_a_fault_still_sets_speed_and_error_reporting() {
+    let log: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let l2 = log.clone();
+    let t = Script::new(move |c, d| {
+        l2.lock().unwrap().push(c[0]);
+        d.fill(0);
+        good(d)
+    });
+    let mut d = Drive::from_transport(Box::new(t));
+    d.init().expect("init");
+    let ops = log.lock().unwrap().clone();
+    assert!(ops.contains(&0xBB), "SET CD SPEED: {ops:02x?}");
+    assert!(ops.contains(&0x5A), "MODE SENSE: {ops:02x?}");
+}
