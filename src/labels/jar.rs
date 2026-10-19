@@ -92,19 +92,32 @@ where
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
     for entry in jar_dir.entries.iter().filter(|e| is_jar(e)) {
         let path = format!("/BDMV/JAR/{}", entry.name);
-        let src: Option<Box<dyn ReadSeek + '_>> = if entry.size <= in_memory_max {
+        let src: Option<(Box<dyn ReadSeek + '_>, Option<u64>)> = if entry.size <= in_memory_max {
             udf.read_file(reader, &path)
                 .ok()
-                .map(|b| Box::new(Cursor::new(b)) as Box<dyn ReadSeek>)
+                .map(|b| (Box::new(Cursor::new(b)) as Box<dyn ReadSeek>, None))
         } else {
             udf.extents_abs_at(reader, entry.meta_lba)
                 .ok()
                 .filter(|x| x.iter().all(|e| e.recorded || e.len == 0))
                 .map(|x| x.iter().map(|e| (e.lba, e.len as u64)).collect())
                 .map(|x| ExtentReader::new(&mut *reader, x, entry.size))
-                .and_then(|mut r| r.has_zip_tail().then(|| Box::new(r) as Box<dyn ReadSeek>))
+                .and_then(|mut r| {
+                    let offset = r.zip_tail_offset()?;
+                    Some((Box::new(r) as Box<dyn ReadSeek>, Some(offset)))
+                })
         };
-        let mut archive = src.and_then(|s| ZipArchive::new(s).ok());
+        // zip 9's offset detection reads the whole file: a jar on disc gets the offset
+        // its EOCD already gave, so opening it reads only the central directory.
+        let mut archive = src.and_then(|(s, offset)| match offset {
+            Some(at) => {
+                let known = zip::read::Config {
+                    archive_offset: zip::read::ArchiveOffset::Known(at),
+                };
+                ZipArchive::with_config(known, s).ok()
+            }
+            None => ZipArchive::new(s).ok(),
+        });
         if let Some(r) = f(&entry.name, archive.as_mut()) {
             return Some(r);
         }
@@ -148,15 +161,19 @@ impl<'a> ExtentReader<'a> {
         }
     }
 
-    /// Whether the tail holds a consistent EOCD: comment within the file and a CDFH
+    /// Where the archive starts, if the tail holds a consistent EOCD: comment within the file and a CDFH
     /// signature at `cd_offset` or at `eocd - cd_size` (prepended data). Checked before
     /// the zip reader's backward search (which rescans the whole file on a bad EOCD),
-    /// so a damaged jar costs a few bounded reads. Leaves the tail cached.
-    pub fn has_zip_tail(&mut self) -> bool {
-        self.find_eocd().is_some() && self.seek(SeekFrom::Start(0)).is_ok()
+    /// so a damaged jar costs a few bounded reads. Leaves the tail cached. `Some` is
+    /// where the archive starts (the prepended bytes): given it, a zip reader reads
+    /// only the central directory.
+    pub fn zip_tail_offset(&mut self) -> Option<u64> {
+        let offset = self.find_eocd()?;
+        self.seek(SeekFrom::Start(0)).ok()?;
+        Some(offset)
     }
 
-    // Offset of the last EOCD in the tail that passes the consistency checks.
+    // The archive offset from the last EOCD in the tail that passes the consistency checks.
     fn find_eocd(&mut self) -> Option<u64> {
         let n = self.size.min(EOCD_SEARCH);
         let tail_start = self.size - n;
@@ -179,12 +196,18 @@ impl<'a> ExtentReader<'a> {
                 continue;
             }
             let at_offset = cd_offset + cd_size <= eocd;
-            if (at_offset && self.cdfh_at(cd_offset, &tail, tail_start))
-                || (cd_size <= eocd && self.cdfh_at(eocd - cd_size, &tail, tail_start))
-            {
-                self.cache_span(tail_start)?;
-                return Some(eocd);
-            }
+            let offset = if at_offset && self.cdfh_at(cd_offset, &tail, tail_start) {
+                0
+            } else if cd_size <= eocd && self.cdfh_at(eocd - cd_size, &tail, tail_start) {
+                match (eocd - cd_size).checked_sub(cd_offset) {
+                    Some(prepended) => prepended,
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            self.cache_span(tail_start)?;
+            return Some(offset);
         }
         None
     }
@@ -322,7 +345,9 @@ impl Seek for ExtentReader<'_> {
 /// (e.g. `has_path_prefix(archive, "com/dbp/")` for dbp,
 /// `has_path_prefix(archive, "com/bydeluxe/")` for Deluxe).
 pub fn has_path_prefix<Z: Read + Seek>(archive: &ZipArchive<Z>, prefix: &str) -> bool {
-    archive.file_names().any(|n| n.starts_with(prefix))
+    archive
+        .file_names()
+        .any(|n| n.is_ok_and(|n| n.starts_with(prefix)))
 }
 
 // Jars up to this size are read whole by `any_jar_has_prefix` (one chunk); larger ones
@@ -454,7 +479,7 @@ fn try_each_entry<Z: Read + Seek, R>(
     };
     for i in 0..archive.len() {
         match archive.name_for_index(i) {
-            Some(n) if want(n) => {}
+            Some(Ok(n)) if want(&n) => {}
             _ => continue,
         }
         if *budget == 0 {
@@ -464,7 +489,10 @@ fn try_each_entry<Z: Read + Seek, R>(
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name().to_string();
+        // A name that is not valid text names no entry a parser looks for.
+        let Ok(name) = entry.name().map(|n| n.into_owned()) else {
+            continue;
+        };
         let mut bytes = Vec::new();
         let read = entry
             .take(cap.min(budget.saturating_add(1)))

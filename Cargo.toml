@@ -73,7 +73,7 @@ aes = { version = "0.9", optional = true }
 # Resolved by the git-tag [patch.crates-io] below (re-pinned by
 # release-orchestrate.yml); local dev patches it to ../freemkv-unlock.
 freemkv-unlock = { version = "1.8", optional = true }
-zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 # zlib for Matroska ContentCompression (mkvmerge compresses S_VOBSUB by default); the
 # same backend `zip` already pulls in.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
