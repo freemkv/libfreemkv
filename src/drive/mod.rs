@@ -641,10 +641,9 @@ impl Drive {
                     return Ok(());
                 }
                 Err(Error::Halted) => return Err(Error::Halted),
-                // T5: a transport failure (DID_TIME_OUT/DID_RESET, fd<0 DeviceNotFound) may
-                // be a hiccup, but polling a faulted bridge is what wedges it. Send nothing
-                // for the dead-bus budget, then re-check once; a second fault in a row is a
-                // dead bus. Any drive answer clears it.
+                // T5: a transport failure may be a hiccup, but polling a faulted bridge
+                // wedges it (#75): silence for the dead-bus budget, then one re-check; a
+                // second fault in a row is a dead bus. Any drive answer clears it.
                 Err(e) if e.is_scsi_transport_failure() => {
                     empty_run = 0;
                     if faulted {
@@ -902,11 +901,9 @@ impl Drive {
             }
             Err(_) => Ok(()),
         };
-        // Raise to max read speed whenever the bus is alive, for ANY disc type — DVD
-        // included, and even a stock-mode drive with no firmware unlocker still wants
-        // it. Best-effort: failure must NOT fail the rip. #75: not after a transport
-        // fault during the unlock, even one the unlocker rode out: these commands into
-        // a just-faulted USB drive can wedge it, and the drive's defaults still read.
+        // Max read speed and recovered-error reporting for any disc, best-effort. #75: not
+        // after a transport fault during the unlock, even one the unlocker rode out: these
+        // commands can wedge a just-faulted USB drive, and its defaults still read.
         if r.is_ok() && unlock_faults > 0 {
             tracing::warn!(
                 target: "freemkv::drive",

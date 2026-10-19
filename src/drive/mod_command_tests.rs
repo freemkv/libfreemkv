@@ -2175,10 +2175,10 @@ fn set_speed_sends_set_cd_speed_cdb_with_be_speed() {
     assert_eq!(&c[2..4], &[0x12, 0x34], "read speed big-endian");
 }
 
-// #75: closing a drive always leaves it ejectable, as 1.7 did. 1.8.0-1.8.4 sent ALLOW
-// on Drop only if that Drive had sent PREVENT; the server never does, so a lock held
-// by the drive (or left by an earlier handle) survived every close and only a power
-// cycle freed the tray. One ALLOW per close; none after an accepted unlock_tray.
+/// #75: closing a drive always leaves it ejectable, as 1.7 did. 1.8.0-1.8.4 sent ALLOW
+/// on Drop only if that Drive had sent PREVENT; the server never does, so a lock held
+/// by the drive (or left by an earlier handle) survived every close and only a power
+/// cycle freed the tray. One ALLOW per close; none after an accepted unlock_tray.
 #[test]
 fn drop_always_leaves_the_tray_unlocked() {
     let seq = |ok: bool, f: &dyn Fn(&mut Drive)| {
