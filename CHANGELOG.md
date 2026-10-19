@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.8.5] — 2026-10-19
+
+### Added
+
+- `disc_presence_probe` and `PresenceProbe { presence, medium_changed }`: the presence, plus whether the drive reported a medium change (UNIT ATTENTION 28h) while answering it, so a poll loop sees a disc swapped between two polls. `disc_presence` is unchanged on top of it.
+
+### Fixed
+
+- A disc image staged for an MKV rip holds the UDF Metadata File's own File Entry, so it re-scans; images staged by 1.8.0–1.8.4 without it mount too, through the File Set Descriptor (their resume mux failed with E6013, #75).
+- `wait_ready` leaves a faulted bus alone: after a transport fault it sends nothing for 5 s, then re-checks once; a second fault in a row is a dead bus (#75).
+- `DiscSession` bring-up skips `init` and `probe_disc` when `wait_ready` ends on a transport fault, and `init` sends no SET CD SPEED or MODE SELECT after a transport fault during the unlock (#75).
+- Closing a `Drive` sends ALLOW MEDIUM REMOVAL unless the drive already accepted one, so a tray locked by the drive or an earlier handle is left ejectable, as in 1.7; an ALLOW is legal after a Stop whoever locked the tray (#75).
+- zip 9, for RUSTSEC-2026-0367, -0368 and -0369; a jar on disc still opens reading only its central directory.
+
 ## [1.8.4] — 2026-10-11
 
 ### Added
