@@ -741,7 +741,7 @@ fn node_number(name: &str) -> u32 {
 }
 
 /// Send TEST UNIT READY directly — no transport, no reset, no side effects.
-pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
+pub(super) fn disc_presence(path: &Path) -> Result<super::PresenceProbe> {
     let device = SgIoTransport::resolve_to_sg(path);
     let fd = SgIoTransport::open_fd(&device);
     if fd < 0 {

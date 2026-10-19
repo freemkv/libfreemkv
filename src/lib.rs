@@ -264,8 +264,8 @@ pub use mux::select::{PidFilter, StreamSelection};
 #[cfg(feature = "rip")]
 pub use mux::{MuxOptions, MuxOutcome, ScannedTitle, Source, mux_url, mux_with_keys, open_source};
 pub use scsi::{
-    DiscPresence, DriveInfo, ScsiSense, ScsiTransport, SenseFamily, disc_presence, drive_has_disc,
-    list_drives,
+    DiscPresence, DriveInfo, PresenceProbe, ScsiSense, ScsiTransport, SenseFamily, disc_presence,
+    disc_presence_probe, drive_has_disc, list_drives,
 };
 #[cfg(feature = "rip")]
 pub use sector::{DecryptingSectorSource, FileSectorSource, PrefetchedSectorSource, SectorSource};

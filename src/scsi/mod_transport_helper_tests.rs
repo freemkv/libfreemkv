@@ -25,7 +25,7 @@ fn presence(replies: Vec<Result<()>>) -> (Result<DiscPresence>, usize) {
         calls += 1;
         replies.next().unwrap_or(Ok(()))
     });
-    (r, calls)
+    (r.map(|p| p.presence), calls)
 }
 
 fn one(sense_key: u8, asc: u8, ascq: u8) -> Result<DiscPresence> {
@@ -254,4 +254,25 @@ fn get_config_010c_returns_the_whole_descriptor() {
         t.0,
         [SCSI_GET_CONFIGURATION, 0x02, 0x01, 0x0C, 0, 0, 0, 0, 28, 0]
     );
+}
+
+// #75: a 06/28 (medium may have changed) re-polled away is still reported, so a poll
+// loop sees a disc swapped between two polls; other attentions are not a change.
+#[test]
+fn tur_disc_presence_reports_a_medium_change_it_re_polled() {
+    let probe = |replies: Vec<Result<()>>| {
+        let mut replies = replies.into_iter();
+        tur_disc_presence(|| replies.next().unwrap_or(Ok(()))).expect("answered")
+    };
+    let ua = |asc| tur_err(6, asc, 0);
+    let swapped = probe(vec![ua(0x29), ua(0x28), Ok(())]);
+    assert_eq!(swapped.presence, DiscPresence::Present);
+    assert!(swapped.medium_changed, "28h among the attentions");
+    let settling = probe(vec![ua(0x28), tur_err(2, 4, 1)]);
+    assert!(settling.medium_changed && settling.presence == DiscPresence::Settling);
+    assert!(
+        !probe(vec![ua(0x29), Ok(())]).medium_changed,
+        "a reset is not a change"
+    );
+    assert!(!probe(vec![Ok(())]).medium_changed);
 }

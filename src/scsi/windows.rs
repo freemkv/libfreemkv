@@ -422,7 +422,7 @@ fn device_number(path: &str) -> Option<u32> {
 
 /// TEST UNIT READY probe on Windows. No in-library recovery: the answer is
 /// classified by [`super::tur_disc_presence`].
-pub(super) fn disc_presence(path: &Path) -> Result<super::DiscPresence> {
+pub(super) fn disc_presence(path: &Path) -> Result<super::PresenceProbe> {
     let mut transport = SptiTransport::open(path)?;
     let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
     super::tur_disc_presence(|| {

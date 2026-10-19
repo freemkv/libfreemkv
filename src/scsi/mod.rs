@@ -496,6 +496,25 @@ pub fn list_drives() -> Vec<DriveInfo> {
 /// == SCSI_STATUS_TRANSPORT_FAILURE` and `sense: None`, no bus/USB reset, no retry. Other
 /// non-NOT-READY sense is also `Err`.
 pub fn disc_presence(path: &Path) -> Result<DiscPresence> {
+    disc_presence_probe(path).map(|p| p.presence)
+}
+
+/// One [`disc_presence_probe`]: the presence, and whether the drive reported a
+/// medium change (UNIT ATTENTION 28h) while answering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PresenceProbe {
+    pub presence: DiscPresence,
+    /// SPC-4 ASC 28h, NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED, was among
+    /// the UNIT ATTENTIONs re-polled: the disc may have been swapped since the drive's
+    /// last command, even when it reads as present now. Always `false` on macOS.
+    pub medium_changed: bool,
+}
+
+/// [`disc_presence`], also telling whether the drive reported a medium change, so a
+/// poll loop sees a disc swapped between two polls (#75: an eject and re-insert after
+/// a fault must start the disc again).
+pub fn disc_presence_probe(path: &Path) -> Result<PresenceProbe> {
     #[cfg(target_os = "linux")]
     {
         linux::disc_presence(path)
@@ -503,7 +522,10 @@ pub fn disc_presence(path: &Path) -> Result<DiscPresence> {
 
     #[cfg(target_os = "macos")]
     {
-        macos::disc_presence(path)
+        macos::disc_presence(path).map(|presence| PresenceProbe {
+            presence,
+            medium_changed: false,
+        })
     }
 
     #[cfg(target_os = "windows")]
@@ -733,26 +755,41 @@ impl DiscPresence {
     }
 }
 
-/// [`DiscPresence`] from TEST UNIT READY, `tur` issuing one TUR (Ok = GOOD).
-/// UNIT ATTENTIONs are re-polled (up to 4); non-NOT-READY sense is `Err`.
+/// [`PresenceProbe`] from TEST UNIT READY, `tur` issuing one TUR (Ok = GOOD).
+/// UNIT ATTENTIONs are re-polled (up to 4), a 28h among them noted as a medium
+/// change; non-NOT-READY sense is `Err`.
 #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
-pub(crate) fn tur_disc_presence(mut tur: impl FnMut() -> Result<()>) -> Result<DiscPresence> {
+pub(crate) fn tur_disc_presence(mut tur: impl FnMut() -> Result<()>) -> Result<PresenceProbe> {
     const MAX_ATTENTION_RETRIES: u32 = 4;
     let mut retries = 0;
+    let mut medium_changed = false;
     loop {
-        let Err(e) = tur() else {
-            return Ok(DiscPresence::Present);
+        let presence = match tur() {
+            Ok(()) => DiscPresence::Present,
+            Err(e) => {
+                let Some(s) = e.scsi_sense().copied() else {
+                    return Err(e);
+                };
+                match s.sense_key {
+                    SENSE_KEY_NOT_READY => not_ready_presence(s.asc, s.ascq),
+                    SENSE_KEY_UNIT_ATTENTION if retries < MAX_ATTENTION_RETRIES => {
+                        retries += 1;
+                        medium_changed |= s.asc == ASC_MEDIUM_MAY_HAVE_CHANGED;
+                        continue;
+                    }
+                    _ => return Err(e),
+                }
+            }
         };
-        let Some(s) = e.scsi_sense().copied() else {
-            return Err(e);
-        };
-        match s.sense_key {
-            SENSE_KEY_NOT_READY => return Ok(not_ready_presence(s.asc, s.ascq)),
-            SENSE_KEY_UNIT_ATTENTION if retries < MAX_ATTENTION_RETRIES => retries += 1,
-            _ => return Err(e),
-        }
+        return Ok(PresenceProbe {
+            presence,
+            medium_changed,
+        });
     }
 }
+
+// SPC-4 ASC 28h: NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED.
+const ASC_MEDIUM_MAY_HAVE_CHANGED: u8 = 0x28;
 
 // NOT READY ASC/ASCQ -> presence, derived from MMC-6 Tables F.3 / F.10.
 fn not_ready_presence(asc: u8, ascq: u8) -> DiscPresence {
