@@ -241,7 +241,8 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.8.5"
+version = "1.8.4"
+source = "git+https://github.com/freemkv/freemkv-unlock?tag=v1.8.4#5a09422c6a8aba667879e569bddaf1f0624ed3c3"
 dependencies = [
  "aes",
  "anyhow",
