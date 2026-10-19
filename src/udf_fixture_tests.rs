@@ -21,6 +21,19 @@ impl MemDisc {
     fn put(&mut self, lba: u32, data: [u8; 2048]) {
         self.sectors.insert(lba, data);
     }
+    /// A copy holding only the sectors inside `ranges` (`(lba, sectors)`): what an image
+    /// staged with that scope holds, everything else reading as zeroes.
+    pub(crate) fn scoped(&self, ranges: &[(u32, u32)]) -> Self {
+        let inside = |lba: u32| ranges.iter().any(|&(s, n)| lba >= s && lba - s < n);
+        Self {
+            sectors: self
+                .sectors
+                .iter()
+                .filter(|(lba, _)| inside(**lba))
+                .map(|(&lba, s)| (lba, *s))
+                .collect(),
+        }
+    }
     /// Write arbitrary-length bytes at `lba`, split across 2048-byte sectors.
     pub(crate) fn put_bytes(&mut self, lba: u32, bytes: &[u8]) {
         for (i, chunk) in bytes.chunks(2048).enumerate() {

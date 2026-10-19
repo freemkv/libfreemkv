@@ -5975,3 +5975,72 @@ fn only_hd_dvd_program_streams_key_aacs_per_pack() {
     assert!(!ContentFormat::BdTs.aacs_per_pack());
     assert!(!ContentFormat::DvdPs.aacs_per_pack());
 }
+
+// Reads `inner` only inside `scope`; zeroes elsewhere, as an image staged with it.
+struct Scoped<'a> {
+    inner: &'a mut dyn SectorSource,
+    scope: Vec<(u32, u32)>,
+}
+impl SectorSource for Scoped<'_> {
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+        let n = self.inner.read_sectors(lba, count, buf, r)?;
+        for (i, s) in buf[..n].as_chunks_mut::<2048>().0.iter_mut().enumerate() {
+            let at = lba + i as u32;
+            if !self.scope.iter().any(|&(s, c)| at >= s && at - s < c) {
+                s.fill(0);
+            }
+        }
+        Ok(n)
+    }
+    fn capacity_sectors(&self) -> u32 {
+        self.inner.capacity_sectors()
+    }
+}
+
+/// #75 on a real disc: `FREEMKV_TEST_ISO=<BD/UHD .iso> cargo test -- --ignored
+/// staged_real_iso`. The main title staged for an MKV rip re-scans to the same titles,
+/// and so does a 1.8.4 staging that left out the Metadata File Entry.
+#[test]
+#[ignore = "needs FREEMKV_TEST_ISO"]
+fn staged_real_iso_rescans_to_the_same_titles() {
+    let path = std::env::var("FREEMKV_TEST_ISO").expect("FREEMKV_TEST_ISO");
+    let mut iso = crate::FileSectorSource::open(std::path::Path::new(&path)).expect("open");
+    let cap = iso.capacity_sectors();
+    let opts = ScanOptions::default();
+    let disc = Disc::scan_image(&mut iso, cap, &opts).expect("full scan");
+    let main = disc
+        .titles
+        .iter()
+        .position(|t| disc.main_title().is_some_and(|m| std::ptr::eq(m, t)))
+        .expect("a main title");
+    let scope = disc.mkv_staging_ranges(&mut iso, &[main]).expect("scope");
+    let fe = crate::udf::read_filesystem(&mut iso)
+        .expect("udf")
+        .partition_start();
+    let old_scope: Vec<(u32, u32)> = scope
+        .iter()
+        .flat_map(|&(s, n)| {
+            if fe >= s && fe - s < n {
+                vec![(s, fe - s), (fe + 1, s + n - fe - 1)]
+            } else {
+                vec![(s, n)]
+            }
+        })
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    let names = |d: &Disc| {
+        d.titles
+            .iter()
+            .map(|t| t.duration_secs as u64)
+            .collect::<Vec<_>>()
+    };
+    for (label, scope) in [("1.8.5 scope", scope), ("1.8.4 scope", old_scope)] {
+        let mut staged = Scoped {
+            inner: &mut iso,
+            scope,
+        };
+        let again = Disc::scan_image(&mut staged, cap, &opts)
+            .unwrap_or_else(|e| panic!("{label}: the staged image re-scans: {e:?}"));
+        assert_eq!(names(&again), names(&disc), "{label}");
+    }
+}

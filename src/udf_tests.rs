@@ -281,6 +281,7 @@ fn fs_with(part_start: u32, meta_start: u32, root: DirEntry) -> UdfFs {
         partition_start: part_start,
         meta: MetaMap::contiguous(meta_start),
         metadata_sectors: 0,
+        meta_file_lba: None,
     }
 }
 
@@ -677,6 +678,7 @@ fn fs_with_file(meta_lba: u32, size: u64) -> UdfFs {
         partition_start: 0,
         meta: MetaMap::contiguous(0),
         metadata_sectors: 0,
+        meta_file_lba: None,
     }
 }
 
@@ -1786,6 +1788,7 @@ fn metadata_sector_ranges_covers_the_structure_and_each_small_files_extents() {
         partition_start: PART,
         meta: MetaMap::contiguous(PART),
         metadata_sectors: 4,
+        meta_file_lba: None,
     };
 
     let mut reader = MapReader::new();
@@ -1856,6 +1859,7 @@ fn metadata_sector_ranges_leave_out_the_files_wanted_refuses() {
         partition_start: PART,
         meta: MetaMap::contiguous(PART),
         metadata_sectors: 4,
+        meta_file_lba: None,
     };
     struct Reads(MapReader, Vec<u32>);
     impl SectorSource for Reads {
@@ -2538,6 +2542,75 @@ fn a_read_fault_locating_the_metadata_file_is_not_reported_as_a_non_udf_disc() {
         ),
         other => panic!("expected a read error, got {other:?}"),
     }
+}
+
+// The tree a scan sees, by name and size, for comparing two mounts of one volume.
+fn tree_of(e: &DirEntry) -> Vec<(String, bool, u64)> {
+    let mut out = vec![(e.name.clone(), e.is_dir, e.size)];
+    for c in &e.entries {
+        out.extend(tree_of(c));
+    }
+    out
+}
+
+/// #75: an image staged with `non_stream_ranges` re-scans to the same filesystem. The
+/// Metadata File's own File Entry was left out of the scope, so the staged image read
+/// zeroes there, found no metadata partition and failed as E6013 on every resume mux.
+#[test]
+fn a_staged_image_rescans_to_the_same_filesystem() {
+    let spec = MetaVol {
+        meta_file_loc: 0,
+        meta_fe_at: 0,
+        meta_pos: 32,
+        ..conformant_meta_vol()
+    };
+    let (mut disc, meta_start) = build_meta_vol(&spec);
+    let fs = super::read_filesystem(&mut disc).expect("the full volume mounts");
+    let scope = fs.non_stream_ranges(&mut disc).expect("scope");
+    assert!(
+        scope
+            .iter()
+            .any(|&(s, n)| fixture::PART_START >= s && fixture::PART_START - s < n),
+        "the Metadata File Entry is staged: {scope:?}"
+    );
+    let mut staged = disc.scoped(&scope);
+    let again = super::read_filesystem(&mut staged).expect("the staged image mounts");
+    assert_eq!(again.metadata_start(), meta_start);
+    assert_eq!(tree_of(&again.root), tree_of(&fs.root));
+}
+
+/// #75: images already staged by 1.8.0-1.8.4 lack that File Entry. An all-zero (never
+/// recorded) one falls back to the File Set Descriptor, found by its tag location, so
+/// those stagings still mux instead of needing the disc again.
+#[test]
+fn an_unrecorded_metadata_file_entry_is_found_through_the_fsd() {
+    let spec = MetaVol {
+        meta_file_loc: 0,
+        meta_fe_at: 0,
+        meta_pos: 32,
+        ..conformant_meta_vol()
+    };
+    let (mut disc, meta_start) = build_meta_vol(&spec);
+    let fs = super::read_filesystem(&mut disc).expect("the full volume mounts");
+    let scope: Vec<_> = fs
+        .non_stream_ranges(&mut disc)
+        .expect("scope")
+        .into_iter()
+        .flat_map(|(s, n)| {
+            // The 1.8.4 scope: everything but the Metadata File Entry.
+            let pe = fixture::PART_START;
+            if pe >= s && pe - s < n {
+                vec![(s, pe - s), (pe + 1, s + n - pe - 1)]
+            } else {
+                vec![(s, n)]
+            }
+        })
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    let mut staged = disc.scoped(&scope);
+    let again = super::read_filesystem(&mut staged).expect("an old staging mounts");
+    assert_eq!(again.metadata_start(), meta_start);
+    assert_eq!(tree_of(&again.root), tree_of(&fs.root));
 }
 
 #[test]

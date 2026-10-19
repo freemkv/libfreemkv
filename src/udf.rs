@@ -62,6 +62,9 @@ pub struct UdfFs {
     meta: MetaMap,
     /// Sectors in the metadata partition's first extent
     metadata_sectors: u32,
+    /// Absolute sector of the Metadata File's own File Entry (UDF 2.50 2.2.10), when
+    /// it was read. A scan reads it first, so a staged image must hold it.
+    meta_file_lba: Option<u32>,
 }
 
 /// Metadata-partition block → absolute sector, through the Metadata File's extents
@@ -410,6 +413,8 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
     ) -> Result<Vec<(u32, u32)>> {
         let mut ranges = vec![(0, self.partition_start)];
+        // #75: without it a staged image's re-scan finds no metadata partition.
+        ranges.extend(self.meta_file_lba.map(|lba| (lba, 1)));
         ranges.push((self.meta.start(), self.metadata_sectors.max(1)));
         ranges.extend(self.meta.0.iter().copied().filter(|&(_, n)| n > 0));
         let stream = self.find_dir("/BDMV/STREAM");
@@ -1022,6 +1027,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // BD-ROM discs (UDF 2.50) use a metadata partition (Type 2 map with "*UDF Metadata Partition")
     // The metadata file is stored at lba=0 of the physical partition
     let mut meta_extents: Vec<(u32, u32)> = Vec::new();
+    let mut meta_file_entry: Option<u32> = None;
     let metadata_start = if num_partition_maps >= 2 {
         let lvd_sec = lvd_sector.ok_or_else(|| {
             sweep_err.take().unwrap_or(Error::DiscRead {
@@ -1083,6 +1089,19 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
                     metadata_size_bytes = first_bytes;
                     let start = extents.first().map_or(partition_start, |e| e.0);
                     meta_extents = extents;
+                    meta_file_entry = Some(meta_file_lba);
+                    start
+                } else if meta_icb.iter().all(|&b| b == 0)
+                    && let Some(start) =
+                        locate_metadata_by_fsd(reader, partition_start, fsd_block.unwrap_or(0))?
+                {
+                    // An all-zero File Entry was never recorded: an image staged by
+                    // 1.8.0-1.8.4 left it out (#75). The partition is found by its FSD.
+                    tracing::warn!(
+                        target: "freemkv::udf",
+                        metadata_start = start,
+                        "Metadata File Entry is unrecorded; metadata partition located by its File Set Descriptor"
+                    );
                     start
                 } else {
                     // Fallback: no metadata partition, use physical partition directly
@@ -1156,7 +1175,46 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
         partition_start,
         meta,
         metadata_sectors,
+        meta_file_lba: meta_file_entry,
     })
+}
+
+// How far past the partition start a staged image's File Set Descriptor is searched for.
+const FSD_SEARCH_SECTORS: u32 = 4096;
+
+// The metadata partition's start, from a File Set Descriptor (tag 256) whose tag location
+// (ECMA-167 3/7.2.8: the descriptor's own logical block) is `fsd_block`; contiguous from
+// there. Only sectors at or after the partition start are searched. `None` if not found.
+fn locate_metadata_by_fsd(
+    reader: &mut dyn SectorSource,
+    partition_start: u32,
+    fsd_block: u32,
+) -> Result<Option<u32>> {
+    const BATCH: u32 = 64;
+    let mut buf = vec![0u8; BATCH as usize * SECTOR_BYTES];
+    let end = partition_start.saturating_add(FSD_SEARCH_SECTORS);
+    let mut lba = partition_start.saturating_add(fsd_block);
+    while lba < end {
+        let n = BATCH.min(end - lba);
+        let bytes = n as usize * SECTOR_BYTES;
+        if reader.read_sectors(lba, n as u16, &mut buf[..bytes], false)? < bytes {
+            return Ok(None);
+        }
+        for (i, s) in buf[..bytes]
+            .as_chunks::<SECTOR_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let tag = u16::from_le_bytes([s[0], s[1]]);
+            let location = u32::from_le_bytes([s[12], s[13], s[14], s[15]]);
+            if tag == 256 && location == fsd_block {
+                return Ok((lba + i as u32).checked_sub(fsd_block));
+            }
+        }
+        lba += n;
+    }
+    Ok(None)
 }
 
 // The Metadata File's recorded extents `(abs_start, sectors)` from its File Entry, plus the
