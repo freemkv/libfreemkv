@@ -64,6 +64,7 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// HD DVD: the sector after the last read and the CPI in force there, so a read that
     /// continues it decrypts the packs before its first NV_PCK.
     hd_cpi: Option<(u32, Option<crate::aacs::hddvd::Cpi>)>,
+    css_titles: Option<crate::css::disc::DiscKeys>,
 }
 
 // HD DVD: how far back a read that starts mid-EVOBU looks for the NV_PCK leading it, and in
@@ -168,6 +169,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             watch_css: false,
             refused: false,
             hd_cpi: None,
+            css_titles: None,
         };
         match keying.into().0 {
             KeyingKind::Keys(keys) => s.keys = keys,
@@ -196,6 +198,23 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// Report each blanked unit to `ctx` too: an `UnitBlanked` event and its loss counter.
     pub(crate) fn observe(&mut self, ctx: &crate::ctx::Ctx) {
         self.ctx = Some(ctx.clone());
+    }
+
+    pub(crate) fn with_disc_css(
+        mut self,
+        disc: &crate::Disc,
+        halt: Option<&crate::Halt>,
+    ) -> Result<Self> {
+        if disc.keys_per_title() || matches!(self.keys, DecryptKeys::Css { .. }) {
+            let fs = crate::udf::read_filesystem(&mut self.inner)?;
+            self.css_titles = Some(crate::css::disc::DiscKeys::new(
+                &fs,
+                &mut self.inner,
+                &self.keys,
+                halt,
+            )?);
+        }
+        Ok(self)
     }
 
     // Reach the verdict and install what it needs. On `Err` the stage stays undecided.
@@ -376,6 +395,10 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
         self.judge_detected(&mut buf[..n])?;
+        if let Some(css) = self.css_titles.as_mut() {
+            css.decrypt(lba, &mut buf[..n], &self.keys)?;
+            return Ok(n);
+        }
 
         // Read damage before any key sees the units: a damaged unit is blanked and counted,
         // never a key verdict (E7013 here, E7022 on arrival). "We rip bad discs."

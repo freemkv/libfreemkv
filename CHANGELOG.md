@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased] — 2026-10-25
+
+### Fixed
+
+- CLI, GUI and server: folder backups preserve navigation and protection metadata. ISO, folder and title reads share decryption, unit alignment and read recovery; clear MPLS, CLPI and menu assets no longer become false damaged data.
+
 ## [1.8.5] — 2026-10-19
 
 ### Added

@@ -592,22 +592,31 @@ impl KeyRing {
         extents: Option<&[(u32, u32)]>,
         stop: StopKind,
         allow_pending: bool,
-    ) -> Result<DecryptingSectorSource<S>> {
+    ) -> Result<WholeDiscReader<S>> {
         let i = &self.0;
         self.gate(inner.random_access(), extents, allow_pending)?;
         let keying =
             crate::sector::Keying::ring(self.decrypt_keys(), self.key_map(), self.arrival(stop));
-        let mut dec = DecryptingSectorSource::new(inner, keying);
-        if self.forensic_pending() && self.touches_clip(extents) {
-            // Pending segments stay ciphertext (never a stop, KU §2.4): outside content.
-            let spans: Vec<(u32, u32)> = i.spans.iter().map(|&(s, n, _)| (s, n)).collect();
-            let content: Vec<(u32, u32)> = crate::whole_disc::subtract_ranges(&spans, &i.segments)
+        let spans: Vec<(u32, u32)> = i.spans.iter().map(|&(s, n, _)| (s, n)).collect();
+        let content = if self.forensic_pending() && self.touches_clip(extents) {
+            crate::whole_disc::subtract_ranges(&spans, &i.segments)
                 .into_iter()
                 .map(|(s, e)| (s, e - s))
-                .collect();
-            dec = dec.with_content_ranges(Arc::from(crate::whole_disc::merge_ranges(content)));
-        }
-        Ok(dec)
+                .collect()
+        } else {
+            spans
+        };
+        let dec = DecryptingSectorSource::new(inner, keying)
+            .with_content_ranges(Arc::from(crate::whole_disc::merge_ranges(content)));
+        Ok(
+            crate::whole_disc::UnitAligned::new(dec, i.spans.clone()).with_unit_size(
+                if self.content_format() == crate::disc::ContentFormat::BdTs {
+                    3
+                } else {
+                    1
+                },
+            ),
+        )
     }
 
     // A set holding no key over `title` (KU §3.1: "`keys` must be `Some` for AACS"): every
@@ -732,7 +741,7 @@ impl KeyRing {
         disc: &Disc,
         idx: usize,
         inner: S,
-    ) -> Result<DecryptingSectorSource<S>> {
+    ) -> Result<WholeDiscReader<S>> {
         if !self.is_for(&disc.media_id()) {
             return Err(Self::caller_bug("key set is not for this disc"));
         }
@@ -744,7 +753,17 @@ impl KeyRing {
             if !inner.random_access() {
                 return Err(Self::caller_bug("decrypting reader over a prefetcher"));
             }
-            return Ok(DecryptingSectorSource::new(inner, disc.decrypt_keys()));
+            return crate::whole_disc::prepare_title(
+                inner,
+                &title.extents,
+                disc.decrypt_keys(),
+                crate::sector::read_stage::ReadPolicy::Image {
+                    batch: crate::sector::read_stage::READ_BATCH_SECTORS as u16,
+                },
+                disc.content_format,
+                false,
+                &crate::ctx::Ctx::default(),
+            );
         }
         if !self.covers(&KeyScope::Titles(vec![idx])) {
             return Err(Self::caller_bug("title outside the key set's scope"));
@@ -776,12 +795,13 @@ impl KeyRing {
         if !self.is_for(&disc.media_id()) {
             return Err(Self::caller_bug("key set is not for this disc"));
         }
-        let mut content = disc.encrypted_content_ranges();
+        let content = disc.encrypted_content_ranges();
         if !self.0.aacs {
             if !inner.random_access() {
                 return Err(Self::caller_bug("decrypting reader over a prefetcher"));
             }
-            let mut dec = DecryptingSectorSource::new(inner, disc.decrypt_keys());
+            let mut dec = DecryptingSectorSource::new(inner, disc.decrypt_keys())
+                .with_disc_css(disc, halt)?;
             if !content.is_empty() {
                 dec = dec.with_content_ranges(Arc::from(content));
             }
@@ -799,16 +819,7 @@ impl KeyRing {
             };
             return Err(Error::UdfNotFound { path: path.into() });
         }
-        let mut dec = self.decrypting(inner, None, StopKind::Image, false)?;
-        content.extend(self.0.spans.iter().map(|&(s, n, _)| (s, n)));
-        let content = crate::whole_disc::merge_ranges(content);
-        if !content.is_empty() {
-            dec = dec.with_content_ranges(Arc::from(content));
-        }
-        Ok(crate::whole_disc::UnitAligned::new(
-            dec,
-            self.0.spans.clone(),
-        ))
+        self.decrypting(inner, None, StopKind::Image, false)
     }
 }
 

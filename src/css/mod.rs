@@ -15,6 +15,7 @@
 //! }
 //! ```
 
+pub(crate) mod disc;
 pub mod keyless;
 pub mod lfsr;
 pub(crate) mod tables;

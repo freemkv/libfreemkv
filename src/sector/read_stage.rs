@@ -8,6 +8,7 @@
 //! gives a unit that still fails one full ECC recovery read, then zero-fills and counts it
 //! (`skip_errors`) or fails the read.
 
+use crate::consts::SECTOR_BYTES;
 use crate::ctx::Ctx;
 use crate::disc::Extent;
 use crate::drive::extract_scsi_context;
@@ -30,6 +31,8 @@ pub enum ReadPolicy {
     /// An image or file: `batch`-sector reads in whole decrypt units (an extent tail shorter
     /// than one unit is one read); any read error ends the run.
     Image { batch: u16 },
+    /// Bounded retry and unit recovery, with unreadable bytes zero-filled and counted.
+    Recover { batch: u16 },
     /// A live drive: adaptive batches from `batch` down, one ECC recovery read for a unit
     /// that still fails, then a zero-filled, counted unit (`skip_errors`) or a `DiscRead`.
     Live { batch: u16, skip_errors: bool },
@@ -39,7 +42,9 @@ impl ReadPolicy {
     /// The preferred read batch, in sectors.
     pub fn batch(&self) -> u16 {
         match *self {
-            ReadPolicy::Image { batch } | ReadPolicy::Live { batch, .. } => batch,
+            ReadPolicy::Image { batch }
+            | ReadPolicy::Recover { batch }
+            | ReadPolicy::Live { batch, .. } => batch,
         }
     }
 }
@@ -143,7 +148,13 @@ impl AdaptiveBatch {
 
 // The key set's on-arrival loud stop: E7022 (a title) or E7032 (an image or folder).
 fn is_key_stop(e: &Error) -> bool {
-    matches!(e, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing)
+    matches!(
+        e,
+        Error::NoDiscKey { .. }
+            | Error::WholeDiscKeyMissing
+            | Error::CssKeyMissing
+            | Error::CssNoDiscKey
+    )
 }
 
 /// One title's extent walk under a [`ReadPolicy`]: each [`next`](Self::next) fills a buffer
@@ -247,6 +258,19 @@ impl ExtentWalk {
         match self.policy {
             ReadPolicy::Image { batch } => {
                 self.next_image(reader, buf, lba, remaining, ext_sectors, batch)
+            }
+            ReadPolicy::Recover { batch } => {
+                self.ctx.halt.check()?;
+                let sectors = whole_unit_batch(remaining.min(u32::from(batch)));
+                let bytes = sectors as usize * SECTOR;
+                buf.resize(bytes, 0);
+                let lost = read_batch_narrowed(reader, lba, sectors, buf)?;
+                if lost > 0 {
+                    self.skip(lba, lost);
+                }
+                self.read_progress(bytes);
+                self.advance(sectors, ext_sectors);
+                Ok(true)
             }
             ReadPolicy::Live { skip_errors, .. } => {
                 self.next_live(reader, buf, lba, remaining, ext_sectors, skip_errors)
@@ -463,3 +487,143 @@ impl ExtentWalk {
 #[cfg(test)]
 #[path = "read_stage_tests.rs"]
 mod live_tests;
+
+/// Content reads are issued in multiples of the AACS aligned unit (3 sectors) so the
+/// decrypt step always sees whole units.
+pub(crate) const AACS_UNIT_SECTORS: u32 = crate::aacs::content::ALIGNED_UNIT_SECTORS;
+/// Read batch in sectors for content streaming (a throughput knob, not a
+/// correctness one). A multiple of 3 so AACS units stay whole.
+pub(crate) const READ_BATCH_SECTORS: u32 = 1536; // 3 MiB, multiple of 3
+/// Bounded per-extent retries on a read that fails before a recorded hole.
+pub(crate) const READ_RETRIES: u32 = 3;
+/// Failed unit reads (one attempt each) per batch after which the rest is zero-filled unread.
+pub(crate) const MAX_FAILED_UNIT_READS: u32 = 4;
+/// Drive error granularity: a BD ECC cluster (32 sectors), also a whole number of DVD
+/// ECC blocks (16). After a bad unit, reading resumes past this boundary.
+pub(crate) const ECC_BLOCK_SECTORS: u64 = 32;
+
+// Sizes the next FILE-ANCHORED content read in whole AACS units, capped at READ_BATCH_SECTORS,
+// rounded DOWN to 3-sector units unless it's the extent's final tail.
+pub(crate) fn whole_unit_batch(remaining: u32) -> u32 {
+    let mut batch = remaining.min(READ_BATCH_SECTORS);
+    if batch >= AACS_UNIT_SECTORS && batch < remaining {
+        batch -= batch % AACS_UNIT_SECTORS;
+    }
+    batch
+}
+
+// Reads a batch (one retry); if it fails, re-reads it one AACS unit at a time, once each. A
+// media-bad unit zero-fills, unread, up to the first unit at/after its ECC block's end; past
+// MAX_FAILED_UNIT_READS the rest is zero-filled; an undecryptable unit loses only itself. Returns zero-filled bytes; Err = stop/key set.
+pub(crate) fn read_batch_narrowed<S: SectorSource + ?Sized>(
+    dec: &mut S,
+    lba: u32,
+    count: u32,
+    buf: &mut [u8],
+) -> Result<u64> {
+    if count > 0 && lba.checked_add(count - 1).is_none() {
+        buf.fill(0);
+        return Ok(buf.len() as u64);
+    }
+    if count <= AACS_UNIT_SECTORS {
+        if read_batch(dec, lba, count, buf)? {
+            return Ok(0);
+        }
+        buf.fill(0);
+        return Ok(buf.len() as u64);
+    }
+    if read_tries(dec, lba, count, buf, 1)? == Tried::Good {
+        return Ok(0);
+    }
+    let mut lost = 0u64;
+    let mut off = 0u32;
+    let mut failed = 0u32;
+    while off < count {
+        let n = AACS_UNIT_SECTORS.min(count - off);
+        let unit = &mut buf[off as usize * SECTOR_BYTES..(off + n) as usize * SECTOR_BYTES];
+        let tried = read_tries(dec, lba + off, n, unit, 0)?;
+        if tried == Tried::Good {
+            off += n;
+            continue;
+        }
+        failed += 1;
+        if tried == Tried::Undecryptable {
+            unit.fill(0);
+            lost += unit.len() as u64;
+            off += n;
+            if failed >= MAX_FAILED_UNIT_READS {
+                buf[off as usize * SECTOR_BYTES..count as usize * SECTOR_BYTES].fill(0);
+                lost += u64::from(count - off) * SECTOR_BYTES as u64;
+                off = count;
+            }
+            continue;
+        }
+        // End of the ECC block holding the unit's last sector (a straddled boundary skips
+        // the later block), rounded up to a unit start; the rest when over budget.
+        let end = u64::from(lba) + u64::from(off + n);
+        let gap = (end.div_ceil(ECC_BLOCK_SECTORS) * ECC_BLOCK_SECTORS - end) as u32;
+        let next = if failed >= MAX_FAILED_UNIT_READS {
+            count
+        } else {
+            (off + n + gap.div_ceil(AACS_UNIT_SECTORS) * AACS_UNIT_SECTORS).min(count)
+        };
+        let hole = &mut buf[off as usize * SECTOR_BYTES..next as usize * SECTOR_BYTES];
+        hole.fill(0);
+        lost += hole.len() as u64;
+        off = next;
+    }
+    Ok(lost)
+}
+
+// One batch with bounded retries; Ok(false) = hole. Short reads retry; DecryptFailed
+// holes at once (never succeeds). The only Err is `Halted` (a user Stop).
+pub(crate) fn read_batch<S: SectorSource + ?Sized>(
+    dec: &mut S,
+    lba: u32,
+    count: u32,
+    buf: &mut [u8],
+) -> Result<bool> {
+    Ok(read_tries(dec, lba, count, buf, READ_RETRIES)? == Tried::Good)
+}
+
+#[derive(PartialEq)]
+pub(crate) enum Tried {
+    Good,
+    // Media/read failure: the drive lost the whole ECC block.
+    Media,
+    // Read fine but the unit cannot be decrypted; the next unit may still be fine.
+    Undecryptable,
+}
+
+pub(crate) fn read_tries<S: SectorSource + ?Sized>(
+    dec: &mut S,
+    lba: u32,
+    count: u32,
+    buf: &mut [u8],
+    retries: u32,
+) -> Result<Tried> {
+    let mut attempt = 0;
+    loop {
+        let last = attempt >= retries;
+        match dec.read_sectors(lba, count as u16, buf, true) {
+            Ok(n) if n >= buf.len() => return Ok(Tried::Good),
+            Ok(_) if last => return Ok(Tried::Media),
+            Ok(_) => {}
+            Err(Error::Halted) => return Err(Error::Halted),
+            // The key set's loud stop (KU §2.4): never a hole, the run stops `.partial`.
+            Err(
+                e @ (Error::WholeDiscKeyMissing
+                | Error::NoDiscKey { .. }
+                | Error::CssKeyMissing
+                | Error::CssNoDiscKey),
+            ) => return Err(e),
+            // A dead bus or gone source is not a hole: zero-filling the rest of the tree
+            // would finalize every remaining file as complete (the Read stage's rule too).
+            Err(e) if e.is_scsi_transport_failure() || e.is_source_terminated() => return Err(e),
+            Err(Error::DecryptFailed) => return Ok(Tried::Undecryptable),
+            Err(_) if last => return Ok(Tried::Media),
+            Err(_) => {}
+        }
+        attempt += 1;
+    }
+}

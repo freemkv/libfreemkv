@@ -2,12 +2,14 @@ resolve-whole status = KeySetStatus { proven: 2, declared: Some(2), keyed: 2, cl
 copy written = 8466432
 copy image = 8466432 bytes sha256:98778a03e8af5deb127b504109f70589
 copy blanked = 0
-extract result = good=73728 unreadable=0 complete=true halted=false files=[("BDMV/STREAM/00001.m2ts", 36864, 0, true), ("BDMV/STREAM/00002.m2ts", 36864, 0, true)]
+extract result = good=73904 unreadable=0 complete=true halted=false files=[("AACS/Unit_Key_RO.inf", 176, 0, true), ("BDMV/STREAM/00001.m2ts", 36864, 0, true), ("BDMV/STREAM/00002.m2ts", 36864, 0, true)]
+extract out AACS/Unit_Key_RO.inf = 176 bytes sha256:082f4ba6afd92f29513cb435f292ae0b
 extract out BDMV/STREAM/00001.m2ts = 36864 bytes sha256:368a55d7eca3e25f6af377a6f1aec041
 extract out BDMV/STREAM/00002.m2ts = 36864 bytes sha256:368a55d7eca3e25f6af377a6f1aec041
 copy-raw written = 8466432
 copy-raw image = 8466432 bytes sha256:f0856c74bf5c9f7b6822186cafcaf1d6
-extract-raw result = good=73728 unreadable=0 complete=true halted=false files=[("BDMV/STREAM/00001.m2ts", 36864, 0, true), ("BDMV/STREAM/00002.m2ts", 36864, 0, true)]
+extract-raw result = good=73904 unreadable=0 complete=true halted=false files=[("AACS/Unit_Key_RO.inf", 176, 0, true), ("BDMV/STREAM/00001.m2ts", 36864, 0, true), ("BDMV/STREAM/00002.m2ts", 36864, 0, true)]
+extract-raw out AACS/Unit_Key_RO.inf = 176 bytes sha256:082f4ba6afd92f29513cb435f292ae0b
 extract-raw out BDMV/STREAM/00001.m2ts = 36864 bytes sha256:375559f987f4f85e585d39abe6eb12fa
 extract-raw out BDMV/STREAM/00002.m2ts = 36864 bytes sha256:2d895155c02331f792c4fca0bfb881ea
 resolve-title status = KeySetStatus { proven: 2, declared: Some(2), keyed: 2, clear: 0, lazy: 0, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }

@@ -363,9 +363,9 @@ fn read_out(dir: &Path, rel: &str) -> Option<Vec<u8>> {
 
 /// BDMV extraction: STREAM/*.m2ts written decrypted (here clear via
 /// None keys), nav (index.bdmv / MovieObject.bdmv / PLAYLIST / CLIPINF)
-/// verbatim, and the top-level AACS/ directory stripped entirely.
+/// verbatim, including the original AACS and CERTIFICATE directories.
 #[test]
-fn bdmv_extracts_streams_and_nav_and_strips_aacs() {
+fn bdmv_extract_preserves_protection_metadata() {
     let m2ts = vec![0xABu8; 3 * 2048]; // one AACS unit's worth
     let index = b"INDEX-NAV".to_vec();
     let movieobj = b"MOVIEOBJECT-NAV".to_vec();
@@ -412,10 +412,17 @@ fn bdmv_extracts_streams_and_nav_and_strips_aacs() {
                 ],
             },
             DirSpec {
+                name: "CERTIFICATE".to_string(),
+                icb_lba: 70,
+                dir_data_lba: 71,
+                files: vec![file("id.bdmv", 72, 73, b"BDJ-DISC-ID".to_vec(), false)],
+                subdirs: vec![],
+            },
+            DirSpec {
                 name: "AACS".to_string(),
                 icb_lba: 60,
                 dir_data_lba: 61,
-                files: vec![file("Unit_Key_RO.inf", 62, 63, aacs_inf, false)],
+                files: vec![file("Unit_Key_RO.inf", 62, 63, aacs_inf.clone(), false)],
                 subdirs: vec![],
             },
         ],
@@ -443,16 +450,18 @@ fn bdmv_extracts_streams_and_nav_and_strips_aacs() {
     );
     assert_eq!(read_out(out.path(), "BDMV/PLAYLIST/00000.mpls"), Some(mpls));
     assert_eq!(read_out(out.path(), "BDMV/CLIPINF/00001.clpi"), Some(clpi));
-    // AACS/ stripped: neither the dir nor its file exists.
-    assert!(!out.path().join("AACS").exists(), "AACS/ must be stripped");
+    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), Some(aacs_inf));
+    assert_eq!(
+        read_out(out.path(), "CERTIFICATE/id.bdmv"),
+        Some(b"BDJ-DISC-ID".to_vec())
+    );
     assert!(res.complete, "clean extraction is complete");
     assert_eq!(res.bytes_lost(), 0);
 }
 
-/// An HD DVD's `X!` AACS dir is stripped like BD's `AACS/`, so the decrypted
-/// folder does not rescan as AACS-encrypted.
+/// Preserve HD DVD's discovered AACS directory and its original file bytes.
 #[test]
-fn hddvd_extract_strips_the_aacs_dir() {
+fn hddvd_extract_preserves_the_aacs_dir() {
     let evo = vec![0x5Au8; 3 * 2048];
     let root = DirSpec {
         name: String::new(),
@@ -491,7 +500,8 @@ fn hddvd_extract_strips_the_aacs_dir() {
     )
     .expect("extract");
     assert_eq!(read_out(out.path(), "HVDVD_TS/MAIN.EVO"), Some(evo));
-    assert!(!out.path().join("AAC!").exists(), "AAC!/ must be stripped");
+    assert_eq!(read_out(out.path(), "AAC!/MKBROM.AACS"), Some(vec![1; 64]));
+    assert_eq!(read_out(out.path(), "AAC!/VTKF000.AACS"), Some(vec![2; 64]));
 }
 
 /// VIDEO_TS extraction writes VOBs + IFO/BUP. Here the content is clear
@@ -1277,6 +1287,27 @@ fn css_two_vts_groups_do_not_cross_contaminate_keys() {
         "VTS_02 must descramble under its OWN cracked key, not VTS_01's"
     );
     assert!(res.complete);
+
+    // The same upstream key routing must work for an image, then a folder.
+    let cap = disc.sectors.keys().max().copied().unwrap() + 1;
+    let image = out.path().join("dvd.iso");
+    let mut prepared = crate::keys::KeyRing::none()
+        .whole_disc_reader(&d, &mut disc as &mut dyn SectorSource, None)
+        .unwrap();
+    crate::write_image(&mut prepared, &image, cap, &crate::ctx::Ctx::default()).unwrap();
+    let mut image_reader = crate::io::file_sector_source::FileSectorSource::open(&image).unwrap();
+    let chained = out.path().join("chained");
+    let result = d
+        .extract_tree(
+            &mut image_reader,
+            &chained,
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .unwrap();
+    assert!(result.complete);
+    assert_eq!(read_out(&chained, "VIDEO_TS/VTS_01_1.VOB"), Some(expect_1));
+    assert_eq!(read_out(&chained, "VIDEO_TS/VTS_02_1.VOB"), Some(expect_2));
 }
 
 // A VTS that IS scrambled but whose key could not be recovered must FAIL, not borrow
@@ -1382,14 +1413,15 @@ fn borrowed_forwards_unmapped_stream_files() {
         &Error::UdfAdChainTooLong,
     );
     let mut r = Reports(vec![file]);
-    assert_eq!(paths(&Borrowed(&mut r)), ["/BDMV/STREAM/00001.m2ts"]);
+    assert_eq!(
+        paths(&(&mut r as &mut dyn SectorSource)),
+        ["/BDMV/STREAM/00001.m2ts"]
+    );
 }
 
-// `Borrowed` must forward every `SectorSource` method to the wrapped
-// `&mut dyn SectorSource` verbatim; calling on a concrete `Borrowed`
-// value exercises the forwarding body via static, not vtable, dispatch.
+// The shared borrowed-sector-source implementation forwards the transport contract.
 #[test]
-fn borrowed_forwards_every_sector_source_call() {
+fn borrowed_sector_source_forwards_every_call() {
     struct Recorder {
         capacity: u32,
         last_speed: Option<u16>,
@@ -1425,7 +1457,7 @@ fn borrowed_forwards_every_sector_source_call() {
         last_unit_base: None,
     };
     {
-        let mut b = Borrowed(&mut inner);
+        let b: &mut dyn SectorSource = &mut inner;
         assert_eq!(b.capacity_sectors(), 42, "capacity_sectors must forward");
         b.set_speed(7200);
         b.set_unit_base(1234);
@@ -2063,7 +2095,6 @@ fn plan_tree_folds_case_only_when_told_the_volume_is_insensitive() {
             &fs.root,
             Path::new(""),
             "",
-            true,
             &mut sink,
             &[],
             &mut files,
@@ -2152,7 +2183,7 @@ fn a_transport_failure_stops_the_file_instead_of_zero_filling() {
     let len = 4 * SECTOR_BYTES as u32;
     let pf = PlannedFile {
         host_rel: PathBuf::from("a.m2ts"),
-        disc_name: "a.m2ts".into(),
+
         size: len as u64,
         inline: None,
         extents: vec![crate::udf::AbsExtent {
@@ -2164,7 +2195,10 @@ fn a_transport_failure_stops_the_file_instead_of_zero_filling() {
     };
     let out = TmpDir::new("dead_bus");
     std::fs::create_dir_all(out.path()).unwrap();
-    let mut dec = DecryptingSectorSource::new(DeadBus, DecryptKeys::None);
+    let mut dec = crate::whole_disc::UnitAligned::new(
+        DecryptingSectorSource::new(DeadBus, DecryptKeys::None),
+        Vec::new(),
+    );
     let (mut done, mut bad) = (0u64, 0u64);
     let r = extract_one_file(
         &mut dec,
@@ -2201,7 +2235,7 @@ fn extent_running_past_u32_max_holes_instead_of_wrapping() {
     let len = 1600 * SECTOR_BYTES as u32;
     let pf = PlannedFile {
         host_rel: PathBuf::from("big.bin"),
-        disc_name: "big.bin".into(),
+
         size: len as u64,
         inline: None,
         extents: vec![crate::udf::AbsExtent {
@@ -2213,7 +2247,10 @@ fn extent_running_past_u32_max_holes_instead_of_wrapping() {
     };
     let out = TmpDir::new("lba_overflow");
     std::fs::create_dir_all(out.path()).unwrap();
-    let mut dec = DecryptingSectorSource::new(AllBad(Vec::new()), DecryptKeys::None);
+    let mut dec = crate::whole_disc::UnitAligned::new(
+        DecryptingSectorSource::new(AllBad(Vec::new()), DecryptKeys::None),
+        Vec::new(),
+    );
     let (mut done, mut bad) = (0u64, 0u64);
     let (fr, halted) = extract_one_file(
         &mut dec,
@@ -2410,7 +2447,7 @@ fn short_read_is_not_counted_as_a_good_batch() {
 fn planned(size: u64, inline: Option<Vec<u8>>, extents: Vec<crate::udf::AbsExtent>) -> PlannedFile {
     PlannedFile {
         host_rel: PathBuf::from("f.bin"),
-        disc_name: "f.bin".into(),
+
         size,
         inline,
         extents,
@@ -2438,7 +2475,10 @@ fn bad_sector_holes_its_ecc_block_not_the_batch() {
     );
     let out = TmpDir::new("narrow");
     std::fs::create_dir_all(out.path()).unwrap();
-    let mut dec = DecryptingSectorSource::new(m, DecryptKeys::None);
+    let mut dec = crate::whole_disc::UnitAligned::new(
+        DecryptingSectorSource::new(m, DecryptKeys::None),
+        Vec::new(),
+    );
     let (mut done, mut bad) = (0u64, 0u64);
     let (fr, _) = extract_one_file(
         &mut dec,
@@ -2504,7 +2544,10 @@ fn narrowed(bad: fn(u32) -> bool, fail_first: u32) -> (u64, u32, u32, Vec<u8>) {
         calls: 0,
         fails: 0,
     };
-    let mut dec = DecryptingSectorSource::new(src, DecryptKeys::None);
+    let mut dec = crate::whole_disc::UnitAligned::new(
+        DecryptingSectorSource::new(src, DecryptKeys::None),
+        Vec::new(),
+    );
     let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_BYTES];
     let lost = read_batch_narrowed(&mut dec, 1000, READ_BATCH_SECTORS, &mut buf).unwrap();
     (lost, dec.inner().calls, dec.inner().fails, buf)
@@ -2620,7 +2663,10 @@ fn undercovered_extents_count_the_gap_as_unreadable() {
     );
     let out = TmpDir::new("undercover");
     std::fs::create_dir_all(out.path()).unwrap();
-    let mut dec = DecryptingSectorSource::new(m, DecryptKeys::None);
+    let mut dec = crate::whole_disc::UnitAligned::new(
+        DecryptingSectorSource::new(m, DecryptKeys::None),
+        Vec::new(),
+    );
     let (mut done, mut bad) = (0u64, 0u64);
     let (fr, _) = extract_one_file(
         &mut dec,
@@ -2644,7 +2690,10 @@ fn short_inline_data_counts_the_gap_as_unreadable() {
     let pf = planned(5000, Some(vec![7u8; 100]), Vec::new());
     let out = TmpDir::new("inline_short");
     std::fs::create_dir_all(out.path()).unwrap();
-    let mut dec = DecryptingSectorSource::new(MemDisc::new(), DecryptKeys::None);
+    let mut dec = crate::whole_disc::UnitAligned::new(
+        DecryptingSectorSource::new(MemDisc::new(), DecryptKeys::None),
+        Vec::new(),
+    );
     let (mut done, mut bad) = (0u64, 0u64);
     let (fr, _) = extract_one_file(
         &mut dec,

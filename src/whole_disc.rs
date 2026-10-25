@@ -16,7 +16,35 @@ pub(crate) const UNIT: u64 =
 const PROBES: u64 = 32;
 
 /// The decrypting reader a whole-disc copy reads through.
-pub type WholeDiscReader<S> = UnitAligned<DecryptingSectorSource<S>>;
+pub type PreparedReader<S> = UnitAligned<DecryptingSectorSource<S>>;
+/// Compatibility name for the prepared reader used by image copies.
+pub type WholeDiscReader<S> = PreparedReader<S>;
+
+// Compose a selected clear/CSS sector input using the same prepared-reader contract.
+// Called before prefetch/demux; output adapters receive no decryption configuration.
+pub(crate) fn prepare_title<S: SectorSource>(
+    mut reader: S,
+    extents: &[crate::disc::Extent],
+    mut keys: crate::decrypt::DecryptKeys,
+    policy: crate::sector::read_stage::ReadPolicy,
+    format: crate::disc::ContentFormat,
+    raw: bool,
+    ctx: &crate::ctx::Ctx,
+) -> Result<PreparedReader<S>> {
+    crate::css::resolve_dvd_title_key(
+        &mut reader,
+        extents,
+        &mut keys,
+        policy.batch(),
+        format,
+        raw,
+        Some(&ctx.halt),
+    )?;
+    if raw {
+        keys = crate::decrypt::DecryptKeys::None;
+    }
+    Ok(UnitAligned::new(DecryptingSectorSource::new(reader, keys), Vec::new()).with_policy(policy))
+}
 
 /// The whole-disc reader for a raw (`--raw`) copy. It never decrypts: AACS ciphertext and
 /// CSS-scrambled sectors pass through byte for byte. A decrypting copy reads through
@@ -166,6 +194,8 @@ pub struct UnitAligned<S> {
     inner: S,
     spans: Vec<UnitSpan>,
     scratch: Vec<u8>,
+    policy: crate::sector::read_stage::ReadPolicy,
+    unit: u64,
 }
 
 impl<S: SectorSource> UnitAligned<S> {
@@ -174,7 +204,37 @@ impl<S: SectorSource> UnitAligned<S> {
             inner,
             spans,
             scratch: Vec::new(),
+            unit: UNIT,
+            policy: crate::sector::read_stage::ReadPolicy::Recover {
+                batch: crate::sector::read_stage::READ_BATCH_SECTORS as u16,
+            },
         }
+    }
+
+    pub(crate) fn with_unit_size(mut self, unit: u64) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    pub(crate) fn alignment(&self) -> u16 {
+        if self.spans.is_empty() {
+            1
+        } else {
+            self.unit as u16
+        }
+    }
+
+    pub(crate) fn with_policy(mut self, policy: crate::sector::read_stage::ReadPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub(crate) fn walk(
+        &self,
+        extents: Vec<crate::disc::Extent>,
+        ctx: &crate::ctx::Ctx,
+    ) -> Result<crate::sector::read_stage::ExtentWalk> {
+        crate::sector::read_stage::ExtentWalk::new(extents, self.policy, self.alignment(), ctx)
     }
 
     /// Where a block of sectors `[start, end)` should end so consecutive blocks tile each
@@ -183,7 +243,7 @@ impl<S: SectorSource> UnitAligned<S> {
     pub fn unit_block_end(&self, start: u64, end: u64) -> u64 {
         match span_at(&self.spans, end) {
             Some((s, _, anchor)) if end > anchor => {
-                let head = anchor + (end - anchor) / UNIT * UNIT;
+                let head = anchor + (end - anchor) / self.unit * self.unit;
                 if head > start && head >= s as u64 {
                     head
                 } else {
@@ -200,6 +260,16 @@ impl<S: SectorSource> UnitAligned<crate::sector::DecryptingSectorSource<S>> {
     /// [`DecryptingSectorSource::blanked_units`](crate::sector::DecryptingSectorSource::blanked_units)).
     pub fn blanked_units(&self) -> u64 {
         self.inner.blanked_units()
+    }
+    #[cfg(test)]
+    pub(crate) fn inner(&self) -> &S {
+        self.inner.inner()
+    }
+    pub(crate) fn observe(&mut self, ctx: &crate::ctx::Ctx) {
+        self.inner.observe(ctx);
+    }
+    pub(crate) fn blanked_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.inner.blanked_counter()
     }
 }
 
@@ -260,14 +330,16 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
                 continue;
             };
             let (s, e) = (s as u64, s as u64 + n as u64);
-            let a0 = anchor + (cur - anchor) / UNIT * UNIT;
+            let a0 = anchor + (cur - anchor) / self.unit * self.unit;
             if a0 < s {
                 // The unit straddles a non-contiguous extent boundary: undecryptable here.
                 return Err(Error::DecryptFailed);
             }
             // Capped so the widened read still fits one u16-count request.
-            let piece_end = end.min(e).min(a0 + (u16::MAX as u64 / UNIT - 1) * UNIT);
-            let a1 = e.min(a0 + (piece_end - a0).div_ceil(UNIT) * UNIT);
+            let piece_end = end
+                .min(e)
+                .min(a0 + (u16::MAX as u64 / self.unit - 1) * self.unit);
+            let a1 = e.min(a0 + (piece_end - a0).div_ceil(self.unit) * self.unit);
             let len = (a1 - a0) as usize * crate::consts::SECTOR_BYTES;
             self.scratch.resize(len, 0);
             self.inner.set_unit_base(a0 as u32);

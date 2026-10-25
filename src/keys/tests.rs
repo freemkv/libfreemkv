@@ -494,13 +494,7 @@ fn code<T>(r: Result<T>) -> u16 {
 }
 
 // Read `units` units of file `i` from unit `u` through `r` (anchored at the file start).
-fn read<S: SectorSource>(
-    r: &mut DecryptingSectorSource<S>,
-    fx: &Fx,
-    i: usize,
-    u: u32,
-    units: u32,
-) -> Result<Vec<u8>> {
+fn read<S: SectorSource>(r: &mut S, fx: &Fx, i: usize, u: u32, units: u32) -> Result<Vec<u8>> {
     r.set_unit_base(fx.file(i).0);
     let mut buf = vec![0u8; units as usize * ALIGNED_UNIT_LEN];
     let n = r.read_sectors(fx.unit(i, u), (units * 3) as u16, &mut buf, true)?;
@@ -1154,10 +1148,10 @@ fn hddvd_clear_title_reads_a_sub_unit_extent_tail() {
     );
 }
 
-/// A sub-unit extent tail that is the head of an encrypted unit cannot be decrypted: the
-/// mux refuses it (E7013) rather than pass its ciphertext on as clear.
+/// A title may end inside a complete on-disc unit: decrypt the complete unit upstream,
+/// then return only the selected bytes. Never pass the encrypted fragment to the mux.
 #[test]
-fn an_encrypted_sub_unit_extent_tail_is_refused() {
+fn an_encrypted_sub_unit_selection_is_decrypted_and_clipped() {
     let mut fx = fixture(&[stream(1, 10, Some(K1))], 1, &[&[0]]);
     let calls = Calls::default();
     let set = resolve(
@@ -1167,9 +1161,18 @@ fn an_encrypted_sub_unit_extent_tail_is_refused() {
     )
     .unwrap();
     fx.disc.titles[0].extents[0].sector_count = 29;
-    let err = drain_keyed_image(fx.source(), fx.disc.titles[0].clone(), &set)
-        .expect_err("an encrypted fragment must not pass as clear");
-    assert_eq!(crate::error_code(&err), Some(E7013), "{err}");
+    let mut reader = set.title_reader(&fx.disc, 0, fx.source()).unwrap();
+    let mut buf = vec![0xA5; 29 * 2048 + 16];
+    assert_eq!(
+        reader
+            .read_sectors(fx.file(0).0, 29, &mut buf, true)
+            .unwrap(),
+        29 * 2048
+    );
+    assert_eq!(&buf[..29 * 2048], &fx.plain(fx.file(0).0, 10)[..29 * 2048]);
+    assert_eq!(&buf[29 * 2048..], &[0xA5; 16]);
+    drain_keyed_image(fx.source(), fx.disc.titles[0].clone(), &set)
+        .expect("the mux reads the same clipped plaintext");
 }
 
 /// An HD DVD set's unit spans stay in LBA order across fragmented and interleaved pieces:
@@ -3592,4 +3595,167 @@ fn fmts_in_the_clear_asks_no_source_encrypted_segments_are_keyed() {
         "encrypted segments ask for the forensic set"
     );
     assert_eq!(set.status().forensic, ForensicState::Resolved);
+}
+
+// Navigation headers start with bytes that resemble AACS scramble flags. They are
+// filesystem data, so an encrypted-disc folder copy must preserve them verbatim.
+#[test]
+fn extract_tree_preserves_navigation_larger_than_two_sectors() {
+    for stream_key in [Some(K1), None] {
+        let mut playlist = vec![0x31; 2 * ALIGNED_UNIT_LEN];
+        playlist[..8].copy_from_slice(b"MPLS0300");
+        let mut clipinfo = vec![0x32; ALIGNED_UNIT_LEN];
+        clipinfo[..8].copy_from_slice(b"HDMV0300");
+        let mut image = vec![0x25; 2 * ALIGNED_UNIT_LEN];
+        image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let mut jar = vec![0x26; ALIGNED_UNIT_LEN];
+        jar[..4].copy_from_slice(b"PK\x03\x04");
+        let fx = fixture(
+            &[
+                stream(1, 10, stream_key),
+                BdFile::new("BDMV/JAR/assets/menu.png", 0, None).with_clip(image.clone()),
+                BdFile::new("BDMV/JAR/00000.jar", 0, None).with_clip(jar.clone()),
+                BdFile::new("BDMV/PLAYLIST/00000.mpls", 0, None).with_clip(playlist.clone()),
+                BdFile::new("BDMV/CLIPINF/00001.clpi", 0, None).with_clip(clipinfo.clone()),
+            ],
+            1,
+            &[&[0]],
+        );
+        let calls = Calls::default();
+        let set = resolve(&fx, KeyScope::WholeDisc, &[Spec::keydb(&[K1], &calls)]).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let result = fx
+            .disc
+            .extract_tree(
+                &mut fx.source(),
+                dest.path(),
+                &crate::disc::ExtractOptions {
+                    keys: Some(&set),
+                    ..Default::default()
+                },
+                &crate::ctx::Ctx::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.bytes_lost(),
+            0,
+            "clear navigation must not be zero-filled as undecryptable"
+        );
+        assert!(result.complete);
+        assert_eq!(
+            std::fs::read(dest.path().join("BDMV/JAR/assets/menu.png")).unwrap(),
+            image
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("BDMV/JAR/00000.jar")).unwrap(),
+            jar
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("BDMV/PLAYLIST/00000.mpls")).unwrap(),
+            playlist
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("BDMV/CLIPINF/00001.clpi")).unwrap(),
+            clipinfo
+        );
+        assert_eq!(
+            masked(&std::fs::read(dest.path().join("BDMV/STREAM/00001.m2ts")).unwrap()),
+            fx.plain(fx.file(0).0, 10)
+        );
+    }
+}
+
+// Equivalent chains must produce identical file trees, including metadata. A clear
+// intermediate ISO must not need another key lookup or change decryption decisions.
+#[test]
+fn direct_folder_matches_decrypted_iso_to_folder_and_raw_is_unchanged() {
+    fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(
+            root: &std::path::Path,
+            at: &std::path::Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+    let (img, disc) = scannable_image();
+    let calls = Calls::default();
+    let sources = factory(&[Spec::keydb(&[K1], &calls)]);
+    let ctx = crate::ctx::Ctx::default();
+    let set = KeyRing::acquire_for_disc(
+        &disc,
+        &mut MemSource::new(img.image.clone()),
+        KeyScope::WholeDisc,
+        &sources,
+        AcquireOptions::default(),
+        &ctx,
+    )
+    .unwrap()
+    .keys;
+    let dir = tempfile::tempdir().unwrap();
+    let direct = dir.path().join("direct");
+    let result = disc
+        .extract_tree(
+            &mut MemSource::new(img.image.clone()),
+            &direct,
+            &crate::disc::ExtractOptions {
+                keys: Some(&set),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap();
+    assert!(result.complete);
+    assert_eq!(result.bytes_lost(), 0);
+    let iso = dir.path().join("clear.iso");
+    let mut reader = set
+        .whole_disc_reader(&disc, MemSource::new(img.image.clone()), None)
+        .unwrap();
+    crate::write_image(&mut reader, &iso, disc.capacity_sectors, &ctx).unwrap();
+    let asked = calls.len();
+    let (clear_disc, mut reader) =
+        crate::session::scan_iso(&iso, crate::disc::ScanOptions::default()).unwrap();
+    let clear = KeyRing::acquire_for_disc(
+        &clear_disc,
+        reader.as_mut(),
+        KeyScope::WholeDisc,
+        &sources,
+        AcquireOptions::default(),
+        &ctx,
+    )
+    .unwrap()
+    .keys;
+    assert_eq!(calls.len(), asked, "clear content must not fetch keys");
+    let chained = dir.path().join("chained");
+    let result = clear_disc
+        .extract_tree(
+            reader.as_mut(),
+            &chained,
+            &crate::disc::ExtractOptions {
+                keys: Some(&clear),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap();
+    assert!(result.complete);
+    assert_eq!(result.bytes_lost(), 0);
+    assert_eq!(tree(&direct), tree(&chained));
+    let raw = dir.path().join("raw.iso");
+    let mut reader = crate::whole_disc::raw_whole_disc_reader(MemSource::new(img.image.clone()));
+    crate::write_image(&mut reader, &raw, disc.capacity_sectors, &ctx).unwrap();
+    assert_eq!(std::fs::read(raw).unwrap(), img.image);
 }

@@ -2,8 +2,7 @@
 //! A block sink takes sectors; a tree sink takes the disc's files, one at a time, and lays
 //! them out as the decrypted folder: host-safe names, no two disc paths on one host file,
 //! each file written `<name>.partial` and published by rename once whole. The disc's
-//! `AACS/`, `CERTIFICATE/` and HD DVD AACS directories are not part of a decrypted tree
-//! (X-8): the sink drops them. [`open_tree_sink`] opens one from a URL.
+//! original directories and metadata are preserved. [`open_tree_sink`] opens one from a URL.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
@@ -60,12 +59,6 @@ impl TreeSink {
     pub(crate) fn with_case_insensitive(mut self, yes: bool) -> Self {
         self.case_insensitive = yes;
         self
-    }
-
-    /// Whether a top-level disc entry belongs in the decrypted tree (X-8): the AACS and
-    /// certificate directories (and HD DVD's discovered AACS directory, `aacs_dir`) do not.
-    pub(crate) fn keeps_top_level(name: &str, aacs_dir: bool) -> bool {
-        !(name.eq_ignore_ascii_case("AACS") || name.eq_ignore_ascii_case("CERTIFICATE") || aacs_dir)
     }
 
     /// Claim the host path for disc entry `disc_path` (named `name`) under `parent`: the

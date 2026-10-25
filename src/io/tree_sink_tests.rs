@@ -37,11 +37,3 @@ fn an_unlistable_target_is_refused_not_treated_as_empty() {
         assert!(matches!(r, Err(Error::DirWriteFailed { .. })));
     }
 }
-
-#[test]
-fn the_aacs_directories_are_not_part_of_the_tree() {
-    assert!(!TreeSink::keeps_top_level("AACS", false));
-    assert!(!TreeSink::keeps_top_level("certificate", false));
-    assert!(!TreeSink::keeps_top_level("X!", true));
-    assert!(TreeSink::keeps_top_level("BDMV", false));
-}

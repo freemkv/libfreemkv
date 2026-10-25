@@ -690,42 +690,29 @@ pub(crate) fn build_iso_pipeline<S: SectorSource + Send + 'static>(
 /// (an image's fixed batches, or a live drive's adaptive, recovering reads): the title's
 /// CSS key cracked (unless `raw`), then decrypt → prefetch → demux → parse.
 pub(crate) fn build_sector_pipeline<S: SectorSource + Send + 'static>(
-    mut reader: S,
+    reader: S,
     title: DiscTitle,
-    mut keys: crate::decrypt::DecryptKeys,
+    keys: crate::decrypt::DecryptKeys,
     policy: crate::sector::read_stage::ReadPolicy,
     format: ContentFormat,
     raw: bool,
     ctx: &crate::ctx::Ctx,
 ) -> io::Result<PipelinedPesStream> {
-    let batch_sectors = policy.batch();
     let extents = title.extents.clone();
-    // CSS (DVD) key resolution — shared per-title step. A `None`/MPEG-PS
-    // title cracks its own key; `raw` skips it. A Stop interrupts the crack scan.
-    crate::css::resolve_dvd_title_key(
-        &mut reader,
+    let full_extents = extents.clone();
+    let decrypting = crate::whole_disc::prepare_title(
+        Box::new(reader) as Box<dyn SectorSource>,
         &extents,
-        &mut keys,
-        batch_sectors,
+        keys,
+        policy,
         format,
         raw,
-        Some(&ctx.halt),
+        ctx,
     )?;
-    // Unit alignment is an AACS concept (whole 3-sector units); forcing it
-    // on CSS/unencrypted (per-2048-byte-sector) would reject any extent
-    // whose sector count isn't a multiple of 3.
-    let unit_align: u16 = match &keys {
-        crate::decrypt::DecryptKeys::Aacs { .. } => AACS_UNIT_SECTORS,
-        _ => 1,
-    };
-    let full_extents = extents.clone();
-    let decrypting =
-        crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     let plan = IsoPlan {
         extents,
         full_extents,
         policy,
-        unit_align,
         format,
     };
     iso_pipeline_tail(decrypting, plan, title, ctx)
@@ -737,7 +724,6 @@ struct IsoPlan {
     extents: Vec<crate::disc::Extent>,
     full_extents: Vec<crate::disc::Extent>,
     policy: crate::sector::read_stage::ReadPolicy,
-    unit_align: u16,
     format: ContentFormat,
 }
 
@@ -793,7 +779,6 @@ pub(crate) fn build_keyed_pipeline<S: SectorSource + Send + 'static>(
             .read_plan(&full_extents, u32::from(AACS_UNIT_SECTORS)),
         full_extents,
         policy,
-        unit_align: AACS_UNIT_SECTORS,
         format: set.content_format(),
     };
     iso_pipeline_tail(decrypting, plan, title, ctx)
@@ -801,7 +786,7 @@ pub(crate) fn build_keyed_pipeline<S: SectorSource + Send + 'static>(
 
 // The shared tail of the ISO title mux: decrypting reader → prefetcher → demux → parse.
 fn iso_pipeline_tail(
-    mut decrypting: crate::sector::DecryptingSectorSource<Box<dyn SectorSource>>,
+    mut decrypting: crate::whole_disc::PreparedReader<Box<dyn SectorSource>>,
     plan: IsoPlan,
     title: DiscTitle,
     ctx: &crate::ctx::Ctx,
@@ -810,7 +795,6 @@ fn iso_pipeline_tail(
         extents,
         full_extents,
         policy,
-        unit_align,
         format,
     } = plan;
     // The plan and clip feed spans must describe the SAME bytes: if the plan
@@ -833,12 +817,13 @@ fn iso_pipeline_tail(
         }
     }
     crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
-    decrypting.clear_unit_base();
+    decrypting = decrypting.with_policy(policy);
     decrypting.observe(ctx);
     let blanked = decrypting.blanked_counter();
 
+    let alignment = decrypting.alignment();
     let (prefetched, read_loss) = crate::sector::PrefetchedSectorSource::with_policy(
-        decrypting, extents, policy, unit_align, ctx,
+        decrypting, extents, policy, alignment, ctx,
     )
     .map_err(|e| -> io::Error { e.into() })?;
     let (rx, recycle_tx, shell) = prefetched.into_channels();
@@ -954,10 +939,15 @@ fn build_ps_pipeline(
         policy: crate::sector::read_stage::ReadPolicy::Image {
             batch: PS_MUX_BATCH_SECTORS,
         },
-        unit_align: 1,
         format: ContentFormat::MpegPs,
     };
-    iso_pipeline_tail(stage, plan, title, ctx).map(|p| p.with_video_stream_id(scan.video_id))
+    iso_pipeline_tail(
+        crate::whole_disc::UnitAligned::new(stage, Vec::new()),
+        plan,
+        title,
+        ctx,
+    )
+    .map(|p| p.with_video_stream_id(scan.video_id))
 }
 
 // Sectors in one AACS aligned unit: the `unit_align` of every keyed read plan.

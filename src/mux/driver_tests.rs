@@ -2694,19 +2694,18 @@ fn an_extent_starting_inside_a_damage_cluster_muxes_through() {
     );
 }
 
-/// Units read off their file's grid look like damage (a flagged seed without TS sync): as
-/// in 1.7.7 the mux carries on, never E7013 — here blanked and counted as loss, on ISO and
-/// live alike. The second extent starts 2 sectors off the grid.
+/// A selection starting inside an intact encrypted unit uses the same alignment
+/// stage as an image copy: it must not manufacture loss on either ISO or live input.
 #[test]
-fn an_off_grid_extent_is_blanked_never_e7013_on_iso_and_live() {
+fn an_off_grid_selection_uses_shared_alignment_on_iso_and_live() {
     let [iso, live] = mux_both(9, &[(0, 9), (11, 15)], 64, |_| {});
     let (iso, live) = (
         iso.expect("iso: never E7013"),
         live.expect("live: never E7013"),
     );
-    assert!(
-        iso.lost_bytes > 0,
-        "the flagged off-grid chunks are counted"
+    assert_eq!(
+        iso.lost_bytes, 0,
+        "an intact on-disc unit is not damaged by selecting its tail"
     );
     assert_eq!(
         iso.lost_bytes, live.lost_bytes,
