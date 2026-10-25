@@ -2,7 +2,7 @@
 //!
 //! The filesystem enumeration and decryption are entirely reused:
 //! [`udf::read_filesystem`] yields the recursive [`UdfFs`] tree (BD and DVD
-//! alike), and [`DecryptingSectorSource`]
+//! alike), and [`DecryptingSectorSource`](crate::sector::DecryptingSectorSource)
 //! applies AACS / CSS in-place. This module is the focused per-file producer:
 //! tree walk, host-path mapping, sparse-gap handling and file publication.
 //! Decryption, alignment and read recovery belong to the prepared reader and Read stage.

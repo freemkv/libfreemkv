@@ -206,7 +206,12 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         halt: Option<&crate::Halt>,
     ) -> Result<Self> {
         if disc.keys_per_title() || matches!(self.keys, DecryptKeys::Css { .. }) {
-            let fs = crate::udf::read_filesystem(&mut self.inner)?;
+            let fs = match crate::udf::read_filesystem(&mut self.inner) {
+                Ok(fs) => fs,
+                // A sector stream without a filesystem still uses its existing CSS key.
+                Err(crate::error::Error::UdfNotFilesystem) => return Ok(self),
+                Err(e) => return Err(e),
+            };
             self.css_titles = Some(crate::css::disc::DiscKeys::new(
                 &fs,
                 &mut self.inner,
