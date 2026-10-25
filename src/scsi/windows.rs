@@ -492,6 +492,19 @@ fn query_adapter_descriptor(handle: isize) -> (usize, u32) {
                 + std::mem::size_of::<u32>();
     let alignment_mask = if align_valid { desc.AlignmentMask } else { 0 };
 
+    let bus_end =
+        std::mem::offset_of!(StorageAdapterDescriptor, BusType) + std::mem::size_of::<u32>();
+    let bus_valid = ok != 0 && bytes_returned as usize >= bus_end && desc.Size as usize >= bus_end;
+    tracing::debug!(
+        target: "freemkv::scsi",
+        descriptor_bytes = bytes_returned,
+        descriptor_ok = ok != 0,
+        bus_type = ?bus_valid.then_some(desc.BusType),
+        maximum_transfer_bytes = max_transfer,
+        alignment_mask,
+        "Windows storage adapter metadata (bus type is the adapter-reported path, not proof of bridge identity)"
+    );
+
     (max_transfer, alignment_mask)
 }
 
@@ -598,11 +611,32 @@ impl ScsiTransport for SptiTransport {
             )
         };
 
+        let last_error = if ok == 0 {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
+        // Preserve driver output even on CHECK CONDITION. The returned length
+        // may be unchanged from the request; it does not prove wire acceptance.
+        tracing::debug!(
+            target: "freemkv::scsi",
+            ioctl = "SCSI_PASS_THROUGH_DIRECT",
+            ioctl_ok = ok != 0,
+            win32_error = last_error,
+            ioctl_returned_bytes = bytes_returned,
+            scsi_status = sptwb.spt.ScsiStatus,
+            direction = ?direction,
+            requested_bytes = data.len(),
+            returned_data_transfer_length = sptwb.spt.DataTransferLength,
+            alignment_mask = mask,
+            bounced = needs_bounce,
+            "Windows SCSI driver response (reported length is not proof of device acceptance)"
+        );
+
         if ok == 0 {
             // Capture the Win32 error before returning — this hot path used
             // to omit it, collapsing struct-layout bugs, access-denied, and
             // a genuinely wedged drive into the same status-0xFF with no log.
-            let last_error = unsafe { GetLastError() };
             tracing::warn!(
                 target: "freemkv::scsi",
                 opcode = cdb.first().copied().unwrap_or(0),
