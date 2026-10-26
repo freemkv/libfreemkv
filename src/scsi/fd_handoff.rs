@@ -99,24 +99,35 @@ pub(crate) fn take_recovered_fd(slot: &AtomicI32) -> Option<i32> {
 /// [`take_recovered_fd`], waiting up to `budget` while `pending` reopen threads
 /// are still running. `None` once none is pending (and none published) or the
 /// budget is spent. A reopen thread publishes first and decrements `pending` after.
+/// An operation token interrupts the userspace wait with `Halted`; cancellation
+/// is checked before claiming an fd, leaving it available for transport teardown.
 pub(crate) fn await_recovered_fd(
     slot: &AtomicI32,
     pending: &std::sync::atomic::AtomicUsize,
     budget: std::time::Duration,
-) -> Option<i32> {
+    halt: Option<&crate::halt::Halt>,
+) -> crate::error::Result<Option<i32>> {
     let t0 = std::time::Instant::now();
     loop {
+        if let Some(halt) = halt {
+            halt.check()?;
+        }
         if let Some(fd) = take_recovered_fd(slot) {
-            return Some(fd);
+            return Ok(Some(fd));
         }
         if pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
             // Re-check: the last thread may have published just before it decremented.
-            return take_recovered_fd(slot);
+            return Ok(take_recovered_fd(slot));
         }
         if t0.elapsed() >= budget {
-            return None;
+            return Ok(None);
         }
-        std::thread::sleep(RECOVERY_POLL.min(budget));
+        let slice = RECOVERY_POLL.min(budget.saturating_sub(t0.elapsed()));
+        if let Some(halt) = halt {
+            halt.wait(slice)?;
+        } else {
+            std::thread::sleep(slice);
+        }
     }
 }
 
