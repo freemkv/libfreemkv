@@ -27,6 +27,14 @@ struct Span {
     offset: usize,
 }
 
+struct InlineOwner {
+    meta_lba: u32,
+    sector: [u8; SECTOR_BYTES],
+    descriptor_end: usize,
+}
+
+type DirectoryBytes = (Vec<u8>, Vec<Span>, u32, Option<InlineOwner>);
+
 fn bad_sector(lba: u32) -> Error {
     Error::DiscRead {
         sector: lba as u64,
@@ -65,7 +73,7 @@ fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize)> {
 }
 
 impl UdfFs {
-    /// Patch the on-disc FID only; payload bytes and UDF allocation never move.
+    /// Patch FID names and descriptor checksums; payload bytes and allocation never move.
     /// The same prepared reader feeds both ISO writing and folder extraction.
     pub(crate) fn name_patches(
         &self,
@@ -73,6 +81,7 @@ impl UdfFs {
         rules: &[NameRule],
     ) -> Result<Vec<SectorBytePatch>> {
         let mut all = Vec::new();
+        let mut inline_owners: Vec<InlineOwner> = Vec::new();
         for &rule in rules {
             let Some(dir) = self.find_dir(rule.dir) else {
                 continue;
@@ -95,7 +104,9 @@ impl UdfFs {
                     host: format!("{}/{}", rule.dir, rule.to),
                 });
             }
-            let (data, spans, icb_lba) = self.directory_bytes(reader, dir.meta_lba)?;
+            let (data, spans, icb_lba, inline_owner) =
+                self.directory_bytes(reader, dir.meta_lba)?;
+            let first_patch = all.len();
             let mut pos = 0;
             let mut found = 0;
             while pos + 38 <= data.len() {
@@ -166,6 +177,48 @@ impl UdfFs {
             if found != 1 {
                 return Err(bad_sector(icb_lba));
             }
+            if all.len() > first_patch
+                && let Some(owner) = inline_owner
+                && !inline_owners.iter().any(|o| o.meta_lba == owner.meta_lba)
+            {
+                inline_owners.push(owner);
+            }
+        }
+        // Embedded FIDs are part of their FE/EFE descriptor body. Finalize its
+        // tag only after every rule, so its CRC includes all child edits.
+        for owner in inline_owners {
+            let icb_lba = self.meta_to_abs(owner.meta_lba)?;
+            let crc_len = u16::from_le_bytes([owner.sector[10], owner.sector[11]]) as usize;
+            // ECMA-167 permits an omitted CRC. Preserve that policy, as well as
+            // shorter declared coverage, rather than repairing/expanding it.
+            if crc_len == 0 {
+                continue;
+            }
+            let crc_end = 16 + crc_len;
+            if crc_end > owner.descriptor_end || crc_end > SECTOR_BYTES {
+                return Err(bad_sector(icb_lba));
+            }
+            let mut final_sector = owner.sector;
+            for patch in all.iter().filter(|patch| patch.lba == icb_lba) {
+                final_sector[patch.offset] = patch.value;
+            }
+            let crc = descriptor_crc16(&final_sector[16..crc_end]);
+            final_sector[8..10].copy_from_slice(&crc.to_le_bytes());
+            final_sector[4] = final_sector[..16]
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 4)
+                .map(|(_, byte)| *byte as u32)
+                .sum::<u32>() as u8;
+            for offset in [4, 8, 9] {
+                if owner.sector[offset] != final_sector[offset] {
+                    all.push(SectorBytePatch {
+                        lba: icb_lba,
+                        offset,
+                        value: final_sector[offset],
+                    });
+                }
+            }
         }
         all.sort_by_key(|p| (p.lba, p.offset));
         Ok(all)
@@ -175,7 +228,7 @@ impl UdfFs {
         &self,
         reader: &mut dyn SectorSource,
         meta_lba: u32,
-    ) -> Result<(Vec<u8>, Vec<Span>, u32)> {
+    ) -> Result<DirectoryBytes> {
         let icb_lba = self.meta_to_abs(meta_lba)?;
         let mut icb = [0u8; SECTOR_BYTES];
         read_sector(reader, icb_lba, &mut icb)?;
@@ -212,6 +265,11 @@ impl UdfFs {
                     offset: ad_at,
                 }],
                 icb_lba,
+                Some(InlineOwner {
+                    meta_lba,
+                    sector: icb,
+                    descriptor_end: end,
+                }),
             ));
         }
 
@@ -243,7 +301,7 @@ impl UdfFs {
                 }
             }
         }
-        Ok((data, spans, icb_lba))
+        Ok((data, spans, icb_lba, None))
     }
 }
 
@@ -258,6 +316,304 @@ mod tests {
         from: "Unit_Key_RO.inf",
         to: "Unit_Key_RO.bak",
     }];
+
+    const TWO_RULES: &[NameRule] = &[
+        RULE[0],
+        NameRule {
+            dir: "/AACS",
+            from: "MKB_RO.inf",
+            to: "MKB_RO.bak",
+        },
+    ];
+
+    // Polynomial long division with explicit zero augmentation, independent of
+    // the production byte-at-a-time CRC implementation.
+    fn oracle_crc(bytes: &[u8]) -> u16 {
+        let mut remainder = 0u32;
+        for bit in bytes
+            .iter()
+            .flat_map(|byte| (0..8).rev().map(move |bit| (byte >> bit) & 1))
+            .chain(std::iter::repeat_n(0, 16))
+        {
+            remainder = (remainder << 1) | u32::from(bit);
+            if remainder & 0x10000 != 0 {
+                remainder ^= 0x11021;
+            }
+        }
+        remainder as u16
+    }
+
+    fn oracle_finish(bytes: &mut [u8], end: usize) {
+        bytes[10..12].copy_from_slice(&((end - 16) as u16).to_le_bytes());
+        let crc = oracle_crc(&bytes[16..end]);
+        bytes[8..10].copy_from_slice(&crc.to_le_bytes());
+        bytes[4] = bytes[..16]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 4)
+            .fold(0u8, |sum, (_, byte)| sum.wrapping_add(*byte));
+    }
+
+    fn assert_descriptor_valid(bytes: &[u8]) {
+        let crc_len = u16::from_le_bytes(bytes[10..12].try_into().unwrap()) as usize;
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            oracle_crc(&bytes[16..16 + crc_len]),
+            "descriptor CRC must cover the final bytes"
+        );
+        assert_eq!(
+            bytes[4],
+            bytes[..16]
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 4)
+                .fold(0u8, |sum, (_, byte)| sum.wrapping_add(*byte)),
+            "descriptor tag checksum"
+        );
+    }
+
+    struct RenameFixture {
+        image: Vec<u8>,
+        owner_lba: u32,
+        data_at: usize,
+        data_len: usize,
+        fid_lengths: Vec<usize>,
+    }
+
+    fn rename_fixture(inline_tag: Option<u16>) -> RenameFixture {
+        assert_eq!(oracle_crc(b"123456789"), 0x31c3);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("AACS")).unwrap();
+        std::fs::create_dir(temp.path().join("BDMV")).unwrap();
+        for name in ["Unit_Key_RO.inf", "MKB_RO.inf", "other.dat"] {
+            std::fs::write(temp.path().join("AACS").join(name), name.as_bytes()).unwrap();
+        }
+        let mut raw = DirImage::open(temp.path()).unwrap();
+        let fs = super::super::read_filesystem(&mut raw).unwrap();
+        let meta_lba = fs.find_dir("/AACS").unwrap().meta_lba;
+        let (mut data, _, owner_lba, _) = fs.directory_bytes(&mut raw, meta_lba).unwrap();
+        let mut image = vec![0; raw.capacity_sectors() as usize * SECTOR_BYTES];
+        for (lba, sector) in image.chunks_mut(SECTOR_BYTES).enumerate() {
+            raw.read_sectors(lba as u32, 1, sector, false).unwrap();
+        }
+        let mut fid_lengths = Vec::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            let name_len = data[pos + 19] as usize;
+            let iu_len = u16::from_le_bytes(data[pos + 36..pos + 38].try_into().unwrap()) as usize;
+            let len = (38 + iu_len + name_len + 3) & !3;
+            fid_lengths.push(len);
+            if inline_tag.is_some() {
+                data[pos + 12..pos + 16].copy_from_slice(&meta_lba.to_le_bytes());
+                oracle_finish(&mut data[pos..pos + len], 38 + iu_len + name_len);
+            }
+            assert_descriptor_valid(&data[pos..pos + len]);
+            pos += len;
+        }
+        let data_at = if let Some(tag) = inline_tag {
+            let owner_at = owner_lba as usize * SECTOR_BYTES;
+            let owner = &mut image[owner_at..owner_at + SECTOR_BYTES];
+            let mut inline = [0u8; SECTOR_BYTES];
+            inline[..64].copy_from_slice(&owner[..64]);
+            inline[0..2].copy_from_slice(&tag.to_le_bytes());
+            inline[34..36].copy_from_slice(&3u16.to_le_bytes());
+            if tag == 266 {
+                inline[64..72].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            }
+            let ea_at = if tag == 261 { 168 } else { 208 };
+            let ea_start = ea_at + 8;
+            let ad_at = ea_start + 24;
+            let end = ad_at + data.len();
+            inline[ea_at..ea_at + 4].copy_from_slice(&24u32.to_le_bytes());
+            inline[ea_at + 4..ea_at + 8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            let ea = &mut inline[ea_start..ad_at];
+            ea[0..2].copy_from_slice(&262u16.to_le_bytes());
+            ea[2..4].copy_from_slice(&3u16.to_le_bytes());
+            ea[12..16].copy_from_slice(&meta_lba.to_le_bytes());
+            ea[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+            ea[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+            oracle_finish(ea, 24);
+            inline[ad_at..end].copy_from_slice(&data);
+            // Bytes beyond the descriptor are deliberately nonzero, and must
+            // neither enter its CRC nor be changed by the rename.
+            inline[end..].fill(0xa5);
+            oracle_finish(&mut inline, end);
+            owner.copy_from_slice(&inline);
+            assert_descriptor_valid(owner);
+            owner_at + ad_at
+        } else {
+            let extents = fs.read_icb_extents(&mut raw, meta_lba).unwrap();
+            assert_eq!(extents.len(), 1);
+            fs.meta_to_abs(extents[0].lba).unwrap() as usize * SECTOR_BYTES
+        };
+        RenameFixture {
+            image,
+            owner_lba,
+            data_at,
+            data_len: data.len(),
+            fid_lengths,
+        }
+    }
+
+    fn assert_rename_integrity(inline_tag: Option<u16>) {
+        let fixture = rename_fixture(inline_tag);
+        let mut raw = crate::test_util::MemSource::new(fixture.image.clone());
+        let fs = super::super::read_filesystem(&mut raw).unwrap();
+        let patches = fs.name_patches(&mut raw, TWO_RULES).unwrap();
+        assert!(!patches.is_empty());
+        let mut prepared =
+            crate::whole_disc::UnitAligned::new(raw, Vec::new()).with_name_patches(patches.clone());
+        let mut output = vec![0; fixture.image.len()];
+        for (lba, sector) in output.chunks_mut(SECTOR_BYTES).enumerate() {
+            prepared.read_sectors(lba as u32, 1, sector, false).unwrap();
+        }
+        let owner_at = fixture.owner_lba as usize * SECTOR_BYTES;
+        let owner = &output[owner_at..owner_at + SECTOR_BYTES];
+        assert_descriptor_valid(owner);
+        let mut expected = fixture.image.clone();
+        let mut pos = fixture.data_at;
+        for &len in &fixture.fid_lengths {
+            assert_descriptor_valid(&output[pos..pos + len]);
+            let name_len = expected[pos + 19] as usize;
+            let iu_len =
+                u16::from_le_bytes(expected[pos + 36..pos + 38].try_into().unwrap()) as usize;
+            let name_at = pos + 38 + iu_len;
+            if let Some(rule) = TWO_RULES
+                .iter()
+                .find(|rule| parse_udf_name(&expected[name_at..name_at + name_len]) == rule.from)
+            {
+                expected[name_at + 1..name_at + name_len].copy_from_slice(rule.to.as_bytes());
+                let end = 16
+                    + u16::from_le_bytes(expected[pos + 10..pos + 12].try_into().unwrap()) as usize;
+                oracle_finish(&mut expected[pos..pos + len], end);
+            }
+            pos += len;
+        }
+        assert_eq!(pos, fixture.data_at + fixture.data_len);
+        if inline_tag.is_some() {
+            let end = fixture.data_at + fixture.data_len - owner_at;
+            oracle_finish(&mut expected[owner_at..owner_at + SECTOR_BYTES], end);
+        } else {
+            assert_eq!(owner, &fixture.image[owner_at..owner_at + SECTOR_BYTES]);
+            assert!(patches.iter().all(|patch| patch.lba != fixture.owner_lba));
+        }
+        assert_eq!(
+            output, expected,
+            "only names and required checksums may change"
+        );
+        let renamed = super::super::read_filesystem(&mut prepared).unwrap();
+        for rule in TWO_RULES {
+            assert_eq!(
+                renamed
+                    .read_file(&mut prepared, &format!("/AACS/{}", rule.to))
+                    .unwrap(),
+                rule.from.as_bytes()
+            );
+        }
+        assert_eq!(
+            renamed.read_file(&mut prepared, "/AACS/other.dat").unwrap(),
+            b"other.dat"
+        );
+        let mut raw = crate::whole_disc::UnitAligned::new(
+            crate::test_util::MemSource::new(fixture.image.clone()),
+            Vec::new(),
+        );
+        for (lba, original) in fixture.image.chunks(SECTOR_BYTES).enumerate() {
+            let mut sector = [0; SECTOR_BYTES];
+            raw.read_sectors(lba as u32, 1, &mut sector, false).unwrap();
+            assert_eq!(sector.as_slice(), original, "raw bytes must stay unchanged");
+        }
+    }
+
+    #[test]
+    fn inline_fe_crc_covers_two_final_renames() {
+        assert_rename_integrity(Some(261));
+    }
+
+    #[test]
+    fn inline_efe_crc_covers_two_final_renames() {
+        assert_rename_integrity(Some(266));
+    }
+
+    #[test]
+    fn extent_backed_rename_leaves_owner_unchanged() {
+        assert_rename_integrity(None);
+    }
+
+    #[test]
+    fn inline_owner_invalid_crc_bounds_fail_only_for_an_actual_rename() {
+        for tag in [261, 266] {
+            let fixture = rename_fixture(Some(tag));
+            let owner_at = fixture.owner_lba as usize * SECTOR_BYTES;
+            let end = fixture.data_at + fixture.data_len - owner_at;
+            // First runs past the declared descriptor, second past the sector.
+            for crc_len in [end - 16 + 1, SECTOR_BYTES] {
+                let mut image = fixture.image.clone();
+                image[owner_at + 10..owner_at + 12]
+                    .copy_from_slice(&(crc_len as u16).to_le_bytes());
+                let mut raw = crate::test_util::MemSource::new(image);
+                let fs = super::super::read_filesystem(&mut raw).unwrap();
+                assert!(fs.name_patches(&mut raw, &[]).unwrap().is_empty());
+                let absent = [NameRule {
+                    from: "missing.inf",
+                    ..RULE[0]
+                }];
+                assert!(fs.name_patches(&mut raw, &absent).unwrap().is_empty());
+                assert!(matches!(
+                    fs.name_patches(&mut raw, TWO_RULES),
+                    Err(Error::DiscRead { sector, .. }) if sector == fixture.owner_lba as u64
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn inline_owner_zero_crc_length_stays_omitted() {
+        for tag in [261, 266] {
+            let fixture = rename_fixture(Some(tag));
+            let owner_at = fixture.owner_lba as usize * SECTOR_BYTES;
+            let mut image = fixture.image.clone();
+            oracle_finish(&mut image[owner_at..owner_at + SECTOR_BYTES], 16);
+            let mut raw = crate::test_util::MemSource::new(image.clone());
+            let fs = super::super::read_filesystem(&mut raw).unwrap();
+            let patches = fs.name_patches(&mut raw, TWO_RULES).unwrap();
+            for patch in patches {
+                image[patch.lba as usize * SECTOR_BYTES + patch.offset] = patch.value;
+            }
+            assert_eq!(&image[owner_at + 8..owner_at + 12], &[0, 0, 0, 0]);
+            assert_descriptor_valid(&image[owner_at..owner_at + SECTOR_BYTES]);
+        }
+    }
+
+    #[test]
+    fn inline_owner_short_crc_coverage_is_preserved() {
+        for tag in [261, 266] {
+            let fixture = rename_fixture(Some(tag));
+            let owner_at = fixture.owner_lba as usize * SECTOR_BYTES;
+            let data_at = fixture.data_at - owner_at;
+            // Cover just the unchanged parent FID, then a prefix ending inside
+            // the first renamed name. Preserve both short declared intervals.
+            for end in [
+                data_at + fixture.fid_lengths[0],
+                data_at + fixture.fid_lengths[0] + 47,
+            ] {
+                assert!(end < data_at + fixture.data_len);
+                let mut image = fixture.image.clone();
+                oracle_finish(&mut image[owner_at..owner_at + SECTOR_BYTES], end);
+                let mut raw = crate::test_util::MemSource::new(image.clone());
+                let fs = super::super::read_filesystem(&mut raw).unwrap();
+                let patches = fs.name_patches(&mut raw, TWO_RULES).unwrap();
+                for patch in patches {
+                    image[patch.lba as usize * SECTOR_BYTES + patch.offset] = patch.value;
+                }
+                assert_eq!(
+                    u16::from_le_bytes(image[owner_at + 10..owner_at + 12].try_into().unwrap()),
+                    (end - 16) as u16
+                );
+                assert_descriptor_valid(&image[owner_at..owner_at + SECTOR_BYTES]);
+            }
+        }
+    }
 
     #[test]
     fn one_udf_fid_rename_serves_iso_and_folder_views_without_changing_payload() {
