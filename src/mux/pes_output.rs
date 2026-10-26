@@ -245,7 +245,7 @@ impl<'u> PesOutput<'u> {
     }
 }
 
-// Failed sink creation: best-effort unlink after a no-follow identity observation of the
+// Failed sink creation: best-effort unlink after regular-file and identity checks of the
 // create_new file. Replacement between observation and unlink can be removed; another
 // writer sharing our inode cannot be distinguished.
 fn created(path: &Path, open: impl FnOnce() -> io::Result<Opened>) -> io::Result<Opened> {
