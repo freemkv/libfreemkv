@@ -55,11 +55,9 @@ struct Timestamp {
 /// NOT here; they are served from the backing files.
 pub(super) type MetaSectors = BTreeMap<u32, Box<[u8; SECTOR]>>;
 
-// ECMA-167 7.2.4 descriptor-tag CRC: polynomial 0x1021, initial value ZERO,
-// no reflection, no final XOR (CRC-16/XMODEM, check 0x31C3) — NOT
-// CCITT-FALSE (seeds 0xFFFF), which would fail a conformant driver.
-// ECMA-167 3/7.2 descriptor tag over buf[0..16]. tag_loc: ABSOLUTE for volume-space
-// descriptors, PARTITION-RELATIVE inside the partition; desc_len incl. tag.
+// ECMA-167 descriptor CRC is CRC-16/XMODEM (zero seed, no reflection/XOR), not CCITT-FALSE.
+// The tag covers buf[0..16]; tag_loc is absolute in volume space and partition-relative
+// inside the partition. desc_len includes the tag.
 fn finish_tag(buf: &mut [u8], tag_id: u16, tag_loc: u32, desc_len: usize) {
     buf[0..2].copy_from_slice(&tag_id.to_le_bytes());
     buf[2..4].copy_from_slice(&DESC_VERSION.to_le_bytes());
