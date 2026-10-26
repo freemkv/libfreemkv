@@ -401,7 +401,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
         self.judge_detected(&mut buf[..n])?;
         if let Some(css) = self.css_titles.as_mut() {
-            css.decrypt(lba, &mut buf[..n], &self.keys)?;
+            css.decrypt(lba, &mut buf[..n], &mut self.keys)?;
             return Ok(n);
         }
 

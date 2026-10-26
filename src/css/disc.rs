@@ -84,28 +84,38 @@ impl DiscKeys {
         Ok(Self { groups })
     }
 
+    // Preserve first-match ownership when damaged metadata has overlapping spans.
+    fn group_at(&self, at: u64) -> Option<usize> {
+        self.groups.iter().position(|g| {
+            g.spans.iter().any(|e| {
+                at >= u64::from(e.start_lba)
+                    && at < u64::from(e.start_lba) + u64::from(e.sector_count)
+            })
+        })
+    }
+
     pub(crate) fn decrypt(
         &mut self,
         lba: u32,
         buf: &mut [u8],
-        fallback: &DecryptKeys,
+        fallback: &mut DecryptKeys,
     ) -> Result<()> {
-        for (offset, sector) in buf.chunks_mut(2048).enumerate() {
-            if sector.len() != 2048 || super::scrambled_at(sector).is_none() {
-                continue;
+        let sectors = buf.len() / 2048;
+        let mut start = 0;
+        while start < sectors {
+            let owner = self.group_at(u64::from(lba) + start as u64);
+            let mut end = start + 1;
+            // Clear sectors belong to the same run: the CSS seam self-gates and
+            // keeps its bounded retry cadence until the owner changes.
+            while end < sectors && self.group_at(u64::from(lba) + end as u64) == owner {
+                end += 1;
             }
-            let at = u64::from(lba) + offset as u64;
-            let group = self.groups.iter_mut().find(|g| {
-                g.spans.iter().any(|e| {
-                    at >= u64::from(e.start_lba)
-                        && at < u64::from(e.start_lba) + u64::from(e.sector_count)
-                })
-            });
-            let mut keys = match group {
-                None => fallback.clone(),
-                Some(group) => group.keys.clone(),
+            let keys = match owner {
+                Some(index) => &mut self.groups[index].keys,
+                None => &mut *fallback,
             };
-            crate::decrypt::decrypt_sectors(sector, &mut keys, 0)?;
+            crate::decrypt::decrypt_sectors(&mut buf[start * 2048..end * 2048], keys, 0)?;
+            start = end;
         }
         Ok(())
     }
@@ -125,18 +135,22 @@ pub(crate) fn vts_group_of(name: &str) -> Option<String> {
     }
 }
 
-/// True for a CSS-scrambled title VOB (`VTS_xx_1.VOB`..`_9.VOB`). The menu
-/// VOB `VTS_xx_0.VOB` and the `.IFO`/`.BUP` are clear, so they are excluded
-/// from the per-VTS key crack.
+/// True for a title VOB (`VTS_xx_1.VOB`..`_9.VOB`) used in the initial
+/// per-VTS key crack. Menu VOBs can also be scrambled, but are not initial
+/// title-key crack candidates.
 pub(crate) fn is_title_vob(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
     if !up.ends_with(".VOB") {
         return false;
     }
-    // VTS_xx_y.VOB → y is the part number; 0 = menu (clear), 1..9 = title.
+    // VTS_xx_y.VOB → y is the part number; 0 = menu, 1..9 = title.
     let stem = up.trim_end_matches(".VOB");
     match stem.rsplit_once('_') {
         Some((_, part)) => part.len() == 1 && matches!(part.as_bytes()[0], b'1'..=b'9'),
         None => false,
     }
 }
+
+#[cfg(test)]
+#[path = "disc_tests.rs"]
+mod tests;
