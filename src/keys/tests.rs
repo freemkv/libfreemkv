@@ -15,6 +15,8 @@ use std::cell::Cell;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod clear_names;
+
 const K1: [u8; 16] = *b"\xA1KU-L2 key one!!";
 const K2: [u8; 16] = *b"\xB2KU-L2 key two!!";
 const K3: [u8; 16] = *b"\xC3KU-L2 key 3333!";

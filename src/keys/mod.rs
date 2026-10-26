@@ -796,7 +796,7 @@ impl KeyRing {
             return Err(Self::caller_bug("key set is not for this disc"));
         }
         let content = disc.encrypted_content_ranges();
-        if !self.0.aacs {
+        let reader = if !self.0.aacs {
             if !inner.random_access() {
                 return Err(Self::caller_bug("decrypting reader over a prefetcher"));
             }
@@ -805,26 +805,23 @@ impl KeyRing {
             if !content.is_empty() {
                 dec = dec.with_content_ranges(Arc::from(content));
             }
-            return Ok(crate::whole_disc::UnitAligned::new(dec, Vec::new()));
-        }
-        if !self.covers(&KeyScope::WholeDisc) {
-            return Err(Self::caller_bug("whole disc outside the key set's scope"));
-        }
-        if self.0.no_stream_files && !content.is_empty() {
-            // Titles but no stream file: sweeping would key bare title extents (freemkv#55).
-            tracing::warn!(target: "freemkv::scan", "titles but no AACS content files");
-            let path = match disc.format {
-                DiscFormat::HdDvd => "/HVDVD_TS",
-                _ => "/BDMV/STREAM",
-            };
-            return Err(Error::UdfNotFound { path: path.into() });
-        }
-        crate::whole_disc::prepare_decrypted_names(self.decrypting(
-            inner,
-            None,
-            StopKind::Image,
-            false,
-        )?)
+            crate::whole_disc::UnitAligned::new(dec, Vec::new())
+        } else {
+            if !self.covers(&KeyScope::WholeDisc) {
+                return Err(Self::caller_bug("whole disc outside the key set's scope"));
+            }
+            if self.0.no_stream_files && !content.is_empty() {
+                // Titles but no stream file: sweeping would key bare title extents (freemkv#55).
+                tracing::warn!(target: "freemkv::scan", "titles but no AACS content files");
+                let path = match disc.format {
+                    DiscFormat::HdDvd => "/HVDVD_TS",
+                    _ => "/BDMV/STREAM",
+                };
+                return Err(Error::UdfNotFound { path: path.into() });
+            }
+            self.decrypting(inner, None, StopKind::Image, false)?
+        };
+        crate::whole_disc::prepare_decrypted_names(reader, self.0.aacs)
     }
 }
 
