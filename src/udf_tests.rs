@@ -282,6 +282,7 @@ fn fs_with(part_start: u32, meta_start: u32, root: DirEntry) -> UdfFs {
         meta: MetaMap::contiguous(meta_start),
         metadata_sectors: 0,
         meta_file_lba: None,
+        meta_mirror: None,
     }
 }
 
@@ -679,6 +680,7 @@ fn fs_with_file(meta_lba: u32, size: u64) -> UdfFs {
         meta: MetaMap::contiguous(0),
         metadata_sectors: 0,
         meta_file_lba: None,
+        meta_mirror: None,
     }
 }
 
@@ -1789,6 +1791,7 @@ fn metadata_sector_ranges_covers_the_structure_and_each_small_files_extents() {
         meta: MetaMap::contiguous(PART),
         metadata_sectors: 4,
         meta_file_lba: None,
+        meta_mirror: None,
     };
 
     let mut reader = MapReader::new();
@@ -1860,6 +1863,7 @@ fn metadata_sector_ranges_leave_out_the_files_wanted_refuses() {
         meta: MetaMap::contiguous(PART),
         metadata_sectors: 4,
         meta_file_lba: None,
+        meta_mirror: None,
     };
     struct Reads(MapReader, Vec<u32>);
     impl SectorSource for Reads {

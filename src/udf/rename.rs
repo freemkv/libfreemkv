@@ -25,6 +25,13 @@ struct Span {
     len: usize,
     lba: u32,
     offset: usize,
+    meta_lba: u32,
+}
+
+#[derive(Clone, Copy)]
+struct MetadataBytePatch {
+    meta_lba: u32,
+    patch: SectorBytePatch,
 }
 
 fn bad_sector(lba: u32) -> Error {
@@ -33,6 +40,17 @@ fn bad_sector(lba: u32) -> Error {
         status: None,
         sense: None,
     }
+}
+
+fn read_complete_sector(
+    reader: &mut dyn SectorSource,
+    lba: u32,
+    bytes: &mut [u8; SECTOR_BYTES],
+) -> Result<()> {
+    if reader.read_sectors(lba, 1, bytes, true)? != SECTOR_BYTES {
+        return Err(bad_sector(lba));
+    }
+    Ok(())
 }
 
 fn encoded_like(old: &[u8], replacement: &str, lba: u32) -> Result<Vec<u8>> {
@@ -56,12 +74,12 @@ fn encoded_like(old: &[u8], replacement: &str, lba: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize)> {
+fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize, u32)> {
     let span = spans
         .iter()
         .find(|span| byte >= span.logical && byte < span.logical + span.len)
         .ok_or_else(|| bad_sector(lba))?;
-    Ok((span.lba, span.offset + byte - span.logical))
+    Ok((span.lba, span.offset + byte - span.logical, span.meta_lba))
 }
 
 impl UdfFs {
@@ -150,11 +168,14 @@ impl UdfFs {
                         data[pos..pos + covered_len].iter().zip(&fid).enumerate()
                     {
                         if before != after {
-                            let (lba, offset) = location(&spans, pos + i, icb_lba)?;
-                            all.push(SectorBytePatch {
-                                lba,
-                                offset,
-                                value: after,
+                            let (lba, offset, meta_lba) = location(&spans, pos + i, icb_lba)?;
+                            all.push(MetadataBytePatch {
+                                meta_lba,
+                                patch: SectorBytePatch {
+                                    lba,
+                                    offset,
+                                    value: after,
+                                },
                             });
                         }
                     }
@@ -167,7 +188,60 @@ impl UdfFs {
                 return Err(bad_sector(icb_lba));
             }
         }
+        self.project_metadata_patches(reader, all)
+    }
+
+    fn project_metadata_patches(
+        &self,
+        reader: &mut dyn SectorSource,
+        patches: Vec<MetadataBytePatch>,
+    ) -> Result<Vec<SectorBytePatch>> {
+        let mut all: Vec<_> = patches.iter().map(|p| p.patch).collect();
+        if !patches.is_empty()
+            && let Some(mirror) = self.meta_mirror.filter(|mirror| mirror.duplicated)
+        {
+            let fe_lba = self
+                .partition_start
+                .checked_add(mirror.location)
+                .ok_or_else(|| bad_sector(self.partition_start))?;
+            let mut fe = [0u8; SECTOR_BYTES];
+            read_complete_sector(reader, fe_lba, &mut fe)?;
+            let (extents, _) =
+                super::decode_metadata_file_extents(&fe, self.partition_start, fe_lba, true)?;
+            let map = super::MetaMap(extents);
+            let mut ordered = patches;
+            ordered.sort_by_key(|p| p.meta_lba);
+            let mut previous = None;
+            let mut mirror_lba = 0;
+            for p in ordered {
+                if previous != Some(p.meta_lba) {
+                    mirror_lba = map.to_abs_bounded(p.meta_lba)?;
+                    let main_lba = self.meta_to_abs(p.meta_lba)?;
+                    let mut main = [0u8; SECTOR_BYTES];
+                    let mut copy = [0u8; SECTOR_BYTES];
+                    read_complete_sector(reader, main_lba, &mut main)?;
+                    read_complete_sector(reader, mirror_lba, &mut copy)?;
+                    if main != copy {
+                        return Err(bad_sector(mirror_lba));
+                    }
+                    previous = Some(p.meta_lba);
+                }
+                all.push(SectorBytePatch {
+                    lba: mirror_lba,
+                    ..p.patch
+                });
+            }
+        }
         all.sort_by_key(|p| (p.lba, p.offset));
+        for pair in all.windows(2) {
+            if pair[0].lba == pair[1].lba
+                && pair[0].offset == pair[1].offset
+                && pair[0].value != pair[1].value
+            {
+                return Err(bad_sector(pair[0].lba));
+            }
+        }
+        all.dedup();
         Ok(all)
     }
 
@@ -210,6 +284,7 @@ impl UdfFs {
                     len: ad_len,
                     lba: icb_lba,
                     offset: ad_at,
+                    meta_lba,
                 }],
                 icb_lba,
             ));
@@ -235,6 +310,10 @@ impl UdfFs {
                     len,
                     lba,
                     offset: 0,
+                    meta_lba: extent
+                        .lba
+                        .checked_add(index as u32)
+                        .ok_or_else(|| bad_sector(icb_lba))?,
                 });
                 data.extend_from_slice(&sector[..len]);
                 left -= len;
@@ -313,3 +392,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "rename/mirror_tests.rs"]
+mod mirror_tests;
