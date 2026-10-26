@@ -44,7 +44,7 @@ const MAX_STRUCT_SECTORS: u32 = 32_768;
 
 // Cap on range tuples collected by one tree walk; real discs need a few thousand. Bounds the
 // memory a crafted extent chain shared by many entries can force.
-const MAX_WALK_RANGES: usize = 65_536;
+pub(crate) const MAX_WALK_RANGES: usize = 65_536;
 
 // Cap on one contiguous `prefetch` (16 MiB), so a disc-controlled length can't drive a huge alloc.
 const MAX_PREFETCH_RUN_SECTORS: u32 = 8192;

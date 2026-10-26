@@ -39,7 +39,6 @@ fn disc_keys(spans: &[&[(u32, u32)]]) -> DiscKeys {
                         sector_count,
                     })
                     .collect(),
-                crack: Vec::new(),
                 keys: keys(A),
             })
             .collect(),
