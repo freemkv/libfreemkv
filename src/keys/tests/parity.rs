@@ -61,17 +61,42 @@ fn copy_image(g: &mut Golden, tag: &str, fx: &Fx, reader: &mut dyn SectorSource)
     }
 }
 
-fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&KeyRing>, src: Faulty) {
+fn extract(g: &mut Golden, tag: &str, fx: &Fx, keys: Option<&KeyRing>, src: Faulty, raw: bool) {
     let dest = tempfile::tempdir().unwrap();
     let opts = crate::disc::ExtractOptions {
         keys,
         ..Default::default()
     };
     let mut src = src;
-    match fx
-        .disc
-        .extract_tree(&mut src, dest.path(), &opts, &crate::ctx::Ctx::default())
-    {
+    let ctx = crate::ctx::Ctx::default();
+    let result = if raw {
+        // Omitting keys from extract_tree still requests decrypted filesystem names.
+        let mut original = src.clone();
+        let fs = crate::udf::read_filesystem(&mut original).unwrap();
+        let mut reader = crate::whole_disc::raw_whole_disc_reader(src);
+        let mut sink = crate::io::tree_sink::TreeSink::create(dest.path(), false).unwrap();
+        let result = fx.disc.extract_into(&mut reader, &mut sink, &ctx);
+        if let Ok(result) = &result {
+            for file in &result.files {
+                if file.complete && file.bytes_unreadable == 0 {
+                    let path = file
+                        .path
+                        .to_str()
+                        .unwrap()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    assert_eq!(
+                        std::fs::read(dest.path().join(&file.path)).unwrap(),
+                        fs.read_file(&mut original, &path).unwrap(),
+                        "{path} must retain its raw source bytes"
+                    );
+                }
+            }
+        }
+        result
+    } else {
+        fx.disc.extract_tree(&mut src, dest.path(), &opts, &ctx)
+    };
+    match result {
         Ok(r) => {
             g.kv(
                 &format!("{tag} result"),
@@ -193,11 +218,11 @@ fn image_cell(name: &str, fx: &Fx, pool: &[[u8; 16]], dead: Option<(u32, u32)>) 
                 g.kv("copy", format_args!("refused E{}", e.code()));
             }
         }
-        extract(&mut g, "extract", fx, Some(set), src());
+        extract(&mut g, "extract", fx, Some(set), src(), false);
     }
     let mut raw = crate::whole_disc::raw_whole_disc_reader(src());
     copy_image(&mut g, "copy-raw", fx, &mut raw);
-    extract(&mut g, "extract-raw", fx, None, src());
+    extract(&mut g, "extract-raw", fx, None, src(), true);
     let titles = resolve_with(
         fx,
         &mut fx.source(),
@@ -380,7 +405,7 @@ fn parity_image_hddvd_clear() {
         g.kv("resolve-whole status", format_args!("{:?}", set.status()));
         let mut w = set.whole_disc_reader(&fx.disc, fx.source(), None).unwrap();
         copy_image(&mut g, "copy", &fx, &mut w);
-        extract(&mut g, "extract", &fx, Some(&set), fx.source());
+        extract(&mut g, "extract", &fx, Some(&set), fx.source(), false);
     }
     g.check();
 }
@@ -420,7 +445,7 @@ fn dvd_fx(live: bool) -> (Fx, Vec<u8>, Vec<u8>) {
 fn parity_image_dvd_css_multi_vts() {
     let (fx, _, _) = dvd_fx(false);
     let mut g = golden("parity_image_dvd_css_multi_vts");
-    extract(&mut g, "extract", &fx, None, fx.source());
+    extract(&mut g, "extract", &fx, None, fx.source(), false);
     g.check();
 }
 

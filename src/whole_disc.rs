@@ -28,8 +28,18 @@ const DECRYPTED_NAME_RULES: &[crate::udf::NameRule] = &[crate::udf::NameRule {
 
 pub(crate) fn prepare_decrypted_names<S: SectorSource>(
     mut reader: PreparedReader<S>,
+    require_udf: bool,
 ) -> Result<PreparedReader<S>> {
-    let fs = crate::udf::read_filesystem(&mut reader)?;
+    // Clear/CSS readers also accept generic sector sources. Only a known positive
+    // capacity can rule out the anchor at LBA 256; zero means unknown.
+    if !require_udf && matches!(reader.capacity_sectors(), 1..=256) {
+        return Ok(reader);
+    }
+    let fs = match crate::udf::read_filesystem(&mut reader) {
+        Ok(fs) => fs,
+        Err(Error::UdfNotFilesystem) if !require_udf => return Ok(reader),
+        Err(e) => return Err(e),
+    };
     let patches = fs.name_patches(&mut reader, DECRYPTED_NAME_RULES)?;
     Ok(reader.with_name_patches(patches))
 }
