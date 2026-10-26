@@ -155,8 +155,9 @@ fn no_raw_execute_outside_dispatch() {
     );
 }
 
-/// LD2 (structural): the transport field is touched only by its three known uses in
-/// drive/mod.rs (dispatch, sense progress, max transfer) and by no sibling submodule.
+/// LD2 (structural): transport preparation and execution stay inside dispatch;
+/// only sense progress and max transfer may access it elsewhere in drive/mod.rs.
+/// No sibling submodule may reach the transport field.
 #[test]
 fn transport_field_is_not_reachable_outside_dispatch() {
     let count = |src: &str, cut: &str| {
@@ -164,7 +165,21 @@ fn transport_field_is_not_reachable_outside_dispatch() {
         src[..end].matches("self.scsi.").count()
     };
     let cut = "#[cfg(test)]\nmod halt_tests";
-    assert_eq!(count(include_str!("mod.rs"), cut), 3, "mod.rs");
+    let src = include_str!("mod.rs");
+    assert_eq!(count(src, cut), 4, "mod.rs");
+    let dispatch = src.split("    fn dispatch(").nth(1).unwrap();
+    let dispatch = dispatch.split("    fn note_ledger(").next().unwrap();
+    assert_eq!(
+        dispatch.matches("self.scsi.").count(),
+        2,
+        "prepare and execute only"
+    );
+    assert_eq!(src.matches(".prepare(").count(), 1, "one preparation seam");
+    assert_eq!(
+        dispatch.matches(".prepare(").count(),
+        1,
+        "preparation stays inside dispatch"
+    );
     assert_eq!(
         count(include_str!("allow.rs"), "#[cfg(test)]"),
         0,
@@ -951,4 +966,134 @@ fn init_without_a_fault_still_sets_speed_and_error_reporting() {
     let ops = log.lock().unwrap().clone();
     assert!(ops.contains(&0xBB), "SET CD SPEED: {ops:02x?}");
     assert!(ops.contains(&0x5A), "MODE SENSE: {ops:02x?}");
+}
+
+// Cancel in userspace preparation: the final check must cover every opcode,
+// including non-READ commands which have no completion check.
+struct StopInPreparation {
+    halt: Halt,
+    progress: crate::halt::Liveness,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+impl ScsiTransport for StopInPreparation {
+    fn prepare(&mut self, _: u32, halt: Option<&Halt>) -> Result<()> {
+        assert!(self.progress.is_busy(), "busy while preparing transport");
+        self.calls.lock().unwrap().push(if halt.is_some() {
+            "prepare cancellable"
+        } else {
+            "prepare raw"
+        });
+        self.halt.cancel();
+        Ok(())
+    }
+    fn execute(
+        &mut self,
+        _: &[u8],
+        _: DataDirection,
+        data: &mut [u8],
+        _: u32,
+    ) -> Result<ScsiResult> {
+        assert!(self.progress.is_busy());
+        self.calls.lock().unwrap().push("execute");
+        good(data)
+    }
+}
+
+#[test]
+fn recovery_stop_during_preparation_prevents_ordinary_and_disallowed_cleanup_dispatch() {
+    for cleanup in [false, true] {
+        let h = Halt::new();
+        let p = crate::halt::Liveness::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let t = StopInPreparation {
+            halt: h.clone(),
+            progress: p.clone(),
+            calls: calls.clone(),
+        };
+        let mut d = Drive::from_transport_with(Box::new(t), &h);
+        d.attach_progress(&p);
+        let r = if cleanup {
+            d.exec_cleanup(&TUR, DataDirection::None, &mut [], 5_000, CleanupCtx::Plain)
+        } else {
+            d.exec(&TUR, DataDirection::None, &mut [], 5_000)
+        };
+        assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen, ["prepare cancellable"]);
+        assert!(!p.is_busy());
+        assert_eq!(p.get(), 1, "preparation completion counted once");
+    }
+}
+
+#[test]
+fn recovery_stop_keeps_critical_and_permitted_cleanup_token_free() {
+    for cleanup in [false, true] {
+        let h = Halt::new();
+        let p = crate::halt::Liveness::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let t = StopInPreparation {
+            halt: h.clone(),
+            progress: p.clone(),
+            calls: calls.clone(),
+        };
+        let mut d = Drive::from_transport_with(Box::new(t), &h);
+        d.attach_progress(&p);
+        h.cancel();
+        let r = if cleanup {
+            d.exec_cleanup(
+                &[0x1e, 0, 0, 0, 0, 0],
+                DataDirection::None,
+                &mut [],
+                5_000,
+                CleanupCtx::Plain,
+            )
+        } else {
+            d.exec_uncancellable(&TUR, DataDirection::None, &mut [], 5_000)
+        };
+        assert!(r.is_ok(), "{r:?}");
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen, ["prepare raw", "execute"]);
+        assert!(!p.is_busy());
+        assert_eq!(p.get(), 1);
+    }
+}
+
+#[test]
+fn recovery_stop_before_dispatch_keeps_agid_available_for_cleanup() {
+    let h = Halt::new();
+    let p = crate::halt::Liveness::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let t = StopInPreparation {
+        halt: h.clone(),
+        progress: p.clone(),
+        calls: calls.clone(),
+    };
+    let mut d = Drive::from_transport_with(Box::new(t), &h);
+    d.attach_progress(&p);
+    // An already allocated AGID remains ours until an invalidation is attempted.
+    d.agids = 1;
+    let mut invalidate = [0; 12];
+    invalidate[0] = allow::REPORT_KEY;
+    invalidate[10] = allow::KEY_FORMAT_INVALIDATE_AGID;
+    let r = d.exec(&invalidate, DataDirection::None, &mut [], 5_000);
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    assert_eq!(
+        d.ledger().agids,
+        1,
+        "nothing was dispatched to release the AGID"
+    );
+    let r = d.exec_cleanup(
+        &invalidate,
+        DataDirection::None,
+        &mut [],
+        5_000,
+        CleanupCtx::Plain,
+    );
+    assert!(
+        r.is_ok(),
+        "the still-held AGID can be released after Stop: {r:?}"
+    );
+    assert_eq!(d.ledger().agids, 0);
+    let seen = calls.lock().unwrap().clone();
+    assert_eq!(seen, ["prepare cancellable", "prepare raw", "execute"]);
 }

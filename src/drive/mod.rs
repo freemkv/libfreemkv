@@ -462,11 +462,12 @@ impl Drive {
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
         crate::halt::diag::assert_may_block("Drive::exec", Duration::MAX);
-        match self.slot.token() {
+        let token = self.slot.token().cloned();
+        match &token {
             None => self.on_detached_exec(),
             Some(t) => t.check()?,
         }
-        let r = self.dispatch(cdb, dir, buf, timeout_ms);
+        let r = self.dispatch(cdb, dir, buf, timeout_ms, token.as_ref());
         if is_read_class(cdb) {
             self.check_token()?;
         }
@@ -483,7 +484,7 @@ impl Drive {
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
         crate::halt::diag::assert_may_block("Drive::exec_uncancellable", Duration::MAX);
-        self.dispatch(cdb, dir, buf, timeout_ms)
+        self.dispatch(cdb, dir, buf, timeout_ms, None)
     }
 
     /// A clean-up CDB (§2.4): runs as usual until a cancel, then only if the
@@ -498,13 +499,19 @@ impl Drive {
         ctx: CleanupCtx,
     ) -> Result<crate::scsi::ScsiResult> {
         crate::halt::diag::assert_may_block("Drive::exec_cleanup", Duration::MAX);
-        if self.is_halted() && !allow::allowed_after_cancel(cdb, self.ledger(), ctx) {
+        let allowed = allow::allowed_after_cancel(cdb, self.ledger(), ctx);
+        if self.is_halted() && !allowed {
             return Err(Error::Halted);
         }
-        self.dispatch(cdb, dir, buf, timeout_ms)
+        let token = if allowed {
+            None
+        } else {
+            self.slot.token().cloned()
+        };
+        self.dispatch(cdb, dir, buf, timeout_ms, token.as_ref())
     }
 
-    // The one call into the transport: progress is busy while the CDB is in flight
+    // The one call into the transport: progress is busy during preparation and dispatch
     // and bumped on its completion, and the AGID ledger follows REPORT KEY.
     fn dispatch(
         &mut self,
@@ -512,14 +519,27 @@ impl Drive {
         dir: crate::scsi::DataDirection,
         buf: &mut [u8],
         timeout_ms: u32,
+        token: Option<&Halt>,
     ) -> Result<crate::scsi::ScsiResult> {
         let busy = self.progress.as_ref().map(Liveness::busy);
-        let r = self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms);
+        let mut dispatched = false;
+        let r = (|| {
+            self.scsi.as_mut().prepare(timeout_ms, token)?;
+            // Preparation can wait for recovery; Stop during that wait must
+            // prevent every ordinary CDB, including non-READ commands.
+            if let Some(token) = token {
+                token.check()?;
+            }
+            dispatched = true;
+            self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms)
+        })();
         drop(busy);
         if let Some(p) = &self.progress {
             p.bump();
         }
-        self.note_ledger(cdb, buf, r.is_ok());
+        if dispatched {
+            self.note_ledger(cdb, buf, r.is_ok());
+        }
         if r.as_ref().is_err_and(Error::is_scsi_transport_failure) {
             self.transport_faults += 1;
         }

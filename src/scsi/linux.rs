@@ -100,6 +100,46 @@ pub struct SgIoTransport {
 }
 
 impl SgIoTransport {
+    // Shared by cancellable Drive preparation and token-free raw execution.
+    // Once claimed, an fd immediately becomes transport-owned, even if Stop
+    // races publication; Drive performs the final check before SG_IO dispatch.
+    fn prepare_fd(&mut self, timeout_ms: u32, halt: Option<&crate::halt::Halt>) -> Result<()> {
+        if let Some(halt) = halt {
+            halt.check()?;
+        }
+        let t0 = std::time::Instant::now();
+        // Check if a background recovery has produced a new fd.
+        if let Some(recovered) = take_recovered_fd(&self.fd_recovery) {
+            // Close the old fd if it's still valid.
+            if self.fd >= 0 {
+                unsafe { libc::close(self.fd) };
+            }
+            self.fd = recovered;
+        } else if self.fd < 0 {
+            // A transport fault reopens on a thread: wait for it (up to this
+            // command's timeout) rather than fail the next command as an unplug.
+            let budget = std::time::Duration::from_millis(u64::from(super::effective_timeout_ms(
+                timeout_ms,
+            )));
+            match await_recovered_fd(&self.fd_recovery, &self.reopen_pending, budget, halt)? {
+                Some(recovered) => self.fd = recovered,
+                None => {
+                    tracing::warn!(
+                        target: "freemkv::scsi",
+                        device = %self.device_path.display(),
+                        waited_ms = t0.elapsed().as_millis() as u64,
+                        "no device handle after a transport fault; the reopen did not complete"
+                    );
+                    return Err(Error::DeviceNotFound {
+                        path: self.device_path.display().to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Open a SCSI device for use.
     pub fn open(device: &Path) -> Result<Self> {
         Self::open_with_errno(device).map_err(|(e, _)| e)
@@ -322,6 +362,10 @@ impl Drop for SgIoTransport {
 }
 
 impl ScsiTransport for SgIoTransport {
+    fn prepare(&mut self, timeout_ms: u32, halt: Option<&crate::halt::Halt>) -> Result<()> {
+        self.prepare_fd(timeout_ms, halt)
+    }
+
     fn last_sense_progress(&self) -> Option<u16> {
         self.last_progress
     }
@@ -358,35 +402,8 @@ impl ScsiTransport for SgIoTransport {
             "SgIoTransport::execute"
         );
 
-        // Check if a background recovery has produced a new fd.
-        if let Some(recovered) = take_recovered_fd(&self.fd_recovery) {
-            // Close the old fd if it's still valid.
-            if self.fd >= 0 {
-                unsafe { libc::close(self.fd) };
-            }
-            self.fd = recovered;
-        } else if self.fd < 0 {
-            // A transport fault reopens on a thread: wait for it (up to this
-            // command's timeout) rather than fail the next command as an unplug.
-            let budget = std::time::Duration::from_millis(u64::from(super::effective_timeout_ms(
-                timeout_ms,
-            )));
-            match await_recovered_fd(&self.fd_recovery, &self.reopen_pending, budget) {
-                Some(recovered) => self.fd = recovered,
-                None => {
-                    tracing::warn!(
-                        target: "freemkv::scsi",
-                        opcode,
-                        device = %self.device_path.display(),
-                        waited_ms = exec_t0.elapsed().as_millis() as u64,
-                        "no device handle after a transport fault; the reopen did not complete"
-                    );
-                    return Err(Error::DeviceNotFound {
-                        path: self.device_path.display().to_string(),
-                    });
-                }
-            }
-        }
+        // Direct raw callers intentionally wait without an operation token.
+        self.prepare_fd(timeout_ms, None)?;
 
         if data.len() > u32::MAX as usize {
             return Err(Error::ScsiError {

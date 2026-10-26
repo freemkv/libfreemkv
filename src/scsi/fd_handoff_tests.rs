@@ -296,7 +296,7 @@ fn await_recovered_fd_waits_for_a_pending_reopen() {
         assert_eq!(publish_recovered_fd(&s1, &d1, 9), None);
         p1.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     });
-    let got = await_recovered_fd(&s, &pending, std::time::Duration::from_secs(5));
+    let got = await_recovered_fd(&s, &pending, std::time::Duration::from_secs(5), None).unwrap();
     reopen.join().unwrap();
     assert_eq!(got, Some(9));
 }
@@ -307,7 +307,7 @@ fn await_recovered_fd_returns_at_once_with_no_reopen_pending() {
     let pending = std::sync::atomic::AtomicUsize::new(0);
     let t0 = std::time::Instant::now();
     assert_eq!(
-        await_recovered_fd(&s, &pending, std::time::Duration::from_secs(5)),
+        await_recovered_fd(&s, &pending, std::time::Duration::from_secs(5), None).unwrap(),
         None
     );
     assert!(t0.elapsed() < std::time::Duration::from_secs(1));
@@ -319,7 +319,7 @@ fn await_recovered_fd_takes_an_fd_published_by_a_finished_reopen() {
     assert_eq!(publish_recovered_fd(&s, &d, 4), None);
     let pending = std::sync::atomic::AtomicUsize::new(0);
     assert_eq!(
-        await_recovered_fd(&s, &pending, std::time::Duration::ZERO),
+        await_recovered_fd(&s, &pending, std::time::Duration::ZERO, None).unwrap(),
         Some(4)
     );
 }
@@ -330,8 +330,135 @@ fn await_recovered_fd_gives_up_after_its_budget() {
     let pending = std::sync::atomic::AtomicUsize::new(1);
     let t0 = std::time::Instant::now();
     assert_eq!(
-        await_recovered_fd(&s, &pending, std::time::Duration::from_millis(30)),
+        await_recovered_fd(&s, &pending, std::time::Duration::from_millis(30), None).unwrap(),
         None
     );
     assert!(t0.elapsed() >= std::time::Duration::from_millis(30));
+}
+
+#[test]
+fn recovery_stop_interrupts_pending_wait_without_dispatch_or_consuming_late_fd() {
+    use crate::halt::{Halt, WAIT_SLICE};
+    use std::sync::atomic::{AtomicUsize, Ordering::Acquire};
+    use std::time::{Duration, Instant};
+    let (s, d) = slot();
+    let pending = AtomicUsize::new(1);
+    let h = Halt::new();
+    let dispatches = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (s, pending, token, dispatches) = (&s, &pending, &h, &dispatches);
+        let waiter = scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            let r = await_recovered_fd(s, pending, Duration::from_millis(300), Some(token));
+            if matches!(r, Ok(Some(_))) {
+                dispatches.fetch_add(1, Ordering::AcqRel);
+            }
+            r
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(WAIT_SLICE);
+        let cancelled = Instant::now();
+        h.cancel();
+        let r = waiter.join().unwrap();
+        assert!(matches!(r, Err(crate::Error::Halted)), "{r:?}");
+        assert!(
+            cancelled.elapsed() < WAIT_SLICE * 3,
+            "cancel took {:?}",
+            cancelled.elapsed()
+        );
+    });
+    assert_eq!(dispatches.load(Acquire), 0);
+    assert_eq!(publish_recovered_fd(&s, &d, 9), None);
+    assert_eq!(claim_for_teardown(&s, &d), Some(9));
+    assert_eq!(claim_for_teardown(&s, &d), None);
+}
+
+#[test]
+fn recovery_stop_leaves_an_already_published_fd_for_teardown() {
+    let (s, d) = slot();
+    let pending = std::sync::atomic::AtomicUsize::new(0);
+    let h = crate::halt::Halt::new();
+    assert_eq!(publish_recovered_fd(&s, &d, 9), None);
+    h.cancel();
+    let r = await_recovered_fd(&s, &pending, std::time::Duration::ZERO, Some(&h));
+    assert!(matches!(r, Err(crate::Error::Halted)), "{r:?}");
+    assert_eq!(claim_for_teardown(&s, &d), Some(9));
+    assert_eq!(claim_for_teardown(&s, &d), None);
+}
+
+#[test]
+fn recovery_stop_racing_publication_keeps_exactly_one_fd_owner() {
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
+    for _ in 0..100 {
+        let (s, d) = slot();
+        let pending = AtomicUsize::new(1);
+        let h = crate::halt::Halt::new();
+        let start = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let (slot_ref, pending_ref, token, start2) = (&s, &pending, &h, &start);
+            let waiter = scope.spawn(move || {
+                start2.wait();
+                await_recovered_fd(
+                    slot_ref,
+                    pending_ref,
+                    std::time::Duration::from_secs(1),
+                    Some(token),
+                )
+            });
+            start.wait();
+            h.cancel();
+            let publisher_close = publish_recovered_fd(&s, &d, 9);
+            pending.store(0, std::sync::atomic::Ordering::Release);
+            let transport_close = match waiter.join().unwrap() {
+                Ok(fd) => fd,
+                Err(crate::Error::Halted) => None,
+                r => panic!("unexpected wait result: {r:?}"),
+            };
+            let teardown_close = claim_for_teardown(&s, &d);
+            assert_eq!(
+                publisher_close.is_some() as usize
+                    + transport_close.is_some() as usize
+                    + teardown_close.is_some() as usize,
+                1
+            );
+            assert_eq!(claim_for_teardown(&s, &d), None);
+        });
+    }
+}
+
+#[test]
+fn recovery_stop_uncancelled_token_preserves_ready_timeout_and_no_pending() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Release};
+    use std::time::{Duration, Instant};
+    let (s, d) = slot();
+    let pending = AtomicUsize::new(0);
+    let halt = crate::halt::Halt::new();
+    assert_eq!(publish_recovered_fd(&s, &d, 9), None);
+    assert_eq!(
+        await_recovered_fd(&s, &pending, Duration::ZERO, Some(&halt)).unwrap(),
+        Some(9)
+    );
+    let start = Instant::now();
+    assert_eq!(
+        await_recovered_fd(&s, &pending, Duration::from_secs(5), Some(&halt)).unwrap(),
+        None
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "no pending reopen waits for no budget"
+    );
+    pending.store(1, Release);
+    let start = Instant::now();
+    assert_eq!(
+        await_recovered_fd(&s, &pending, Duration::from_millis(30), Some(&halt)).unwrap(),
+        None
+    );
+    assert!(start.elapsed() >= Duration::from_millis(30));
+    assert_eq!(
+        claim_for_teardown(&s, &d),
+        None,
+        "successful caller owns the fd"
+    );
 }

@@ -369,6 +369,13 @@ pub struct ScsiResult {
 
 /// Low-level SCSI transport — one implementation per platform.
 pub trait ScsiTransport: Send {
+    /// Prepare userspace transport state before dispatch. Operation callers may
+    /// supply a token so waits can stop before any hardware command is issued.
+    /// Raw execution and permitted post-cancel work use no token.
+    fn prepare(&mut self, _timeout_ms: u32, _halt: Option<&crate::halt::Halt>) -> Result<()> {
+        Ok(())
+    }
+
     fn execute(
         &mut self,
         cdb: &[u8],
