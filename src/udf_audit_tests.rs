@@ -89,6 +89,7 @@ fn fs_of(meta_start: u32, metadata_sectors: u32, entries: Vec<DirEntry>) -> UdfF
         meta: MetaMap::contiguous(meta_start),
         metadata_sectors,
         meta_file_lba: None,
+        meta_mirror: None,
     }
 }
 

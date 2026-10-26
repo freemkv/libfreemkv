@@ -84,6 +84,14 @@ pub struct UdfFs {
     /// Absolute sector of the Metadata File's own File Entry (UDF 2.50 2.2.10), when
     /// it was read. A scan reads it first, so a staged image must hold it.
     meta_file_lba: Option<u32>,
+    /// Declared physical-partition mirror locator; opened only for a duplicated rename.
+    meta_mirror: Option<MetadataMirror>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetadataMirror {
+    location: u32,
+    duplicated: bool,
 }
 
 /// Metadata-partition block → absolute sector, through the Metadata File's extents
@@ -99,6 +107,25 @@ impl MetaMap {
 
     fn start(&self) -> u32 {
         self.0.first().map_or(0, |e| e.0)
+    }
+
+    // A write target must be backed by recorded sectors, including in the last extent.
+    fn to_abs_bounded(&self, mut rel: u32) -> Result<u32> {
+        for &(start, sectors) in &self.0 {
+            if rel < sectors {
+                return start.checked_add(rel).ok_or(Error::DiscRead {
+                    sector: start as u64,
+                    status: None,
+                    sense: None,
+                });
+            }
+            rel -= sectors;
+        }
+        Err(Error::DiscRead {
+            sector: self.start() as u64,
+            status: None,
+            sense: None,
+        })
     }
 
     fn to_abs(&self, rel: u32) -> Result<u32> {
@@ -1047,6 +1074,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // The metadata file is stored at lba=0 of the physical partition
     let mut meta_extents: Vec<(u32, u32)> = Vec::new();
     let mut meta_file_entry: Option<u32> = None;
+    let mut meta_mirror = None;
     let metadata_start = if num_partition_maps >= 2 {
         let lvd_sec = lvd_sector.ok_or_else(|| {
             sweep_err.take().unwrap_or(Error::DiscRead {
@@ -1072,6 +1100,18 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
                 // Type 2 = metadata partition. UDF 2.50 2.2.10 records the Metadata
                 // File's location in the map (offset 40), not always block 0; trusted
                 // only when type ID reads "*UDF Metadata Partition" (block 0 still tried as fallback).
+                // Keep the relative locator even if adding the partition would overflow.
+                if metadata_partition_map(&lvd, pm2_map) {
+                    meta_mirror = Some(MetadataMirror {
+                        location: u32::from_le_bytes([
+                            lvd[pm2_map + 44],
+                            lvd[pm2_map + 45],
+                            lvd[pm2_map + 46],
+                            lvd[pm2_map + 47],
+                        ]),
+                        duplicated: lvd[pm2_map + 58] & 1 != 0,
+                    });
+                }
                 let recorded = metadata_file_location(&lvd, pm2_map)
                     .and_then(|loc| partition_start.checked_add(loc));
                 let mut meta_file_lba = partition_start;
@@ -1195,6 +1235,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
         meta,
         metadata_sectors,
         meta_file_lba: meta_file_entry,
+        meta_mirror,
     })
 }
 
@@ -1243,25 +1284,65 @@ fn metadata_file_extents(
     partition_start: u32,
     fe_lba: u32,
 ) -> Result<(Vec<(u32, u32)>, u32)> {
+    decode_metadata_file_extents(fe, partition_start, fe_lba, false)
+}
+
+// The read path keeps its historical permissive prefix; write targets require declared
+// AD bounds and full recorded sectors within the file's information length.
+fn decode_metadata_file_extents(
+    fe: &[u8; SECTOR_BYTES],
+    partition_start: u32,
+    fe_lba: u32,
+    bounded: bool,
+) -> Result<(Vec<(u32, u32)>, u32)> {
     let bad = Error::DiscRead {
         sector: fe_lba as u64,
         status: None,
         sense: None,
     };
-    let l_ea = u32::from_le_bytes([fe[208], fe[209], fe[210], fe[211]]) as usize;
-    let l_ad = u32::from_le_bytes([fe[212], fe[213], fe[214], fe[215]]) as usize;
-    let ad_size = match fe[34] & 0x07 {
-        1 => 16,
-        2 => 20,
-        3 => return Err(bad), // embedded: no extents at all
-        _ => 8,
+    let ea_at = if bounded {
+        match u16::from_le_bytes([fe[0], fe[1]]) {
+            261 => 168,
+            266 => 208,
+            _ => return Err(bad),
+        }
+    } else {
+        208
     };
-    let ad_off = 216 + l_ea;
-    if ad_off + ad_size > fe.len() {
+    let l_ea =
+        u32::from_le_bytes([fe[ea_at], fe[ea_at + 1], fe[ea_at + 2], fe[ea_at + 3]]) as usize;
+    let l_ad =
+        u32::from_le_bytes([fe[ea_at + 4], fe[ea_at + 5], fe[ea_at + 6], fe[ea_at + 7]]) as usize;
+    let ad_type = fe[34] & 0x07;
+    let ad_size = match ad_type {
+        0 => 8,
+        1 => 16,
+        2 if !bounded => 20,
+        3 => return Err(bad),
+        _ if !bounded => 8,
+        _ => return Err(bad),
+    };
+    let Some(ad_off) = (ea_at + 8usize).checked_add(l_ea) else {
+        return Err(bad);
+    };
+    if ad_off.checked_add(ad_size).is_none_or(|end| end > fe.len()) {
         return Err(bad);
     }
-    // At least the first AD, as before L_AD was honoured.
-    let n = (l_ad / ad_size).clamp(1, (fe.len() - ad_off) / ad_size);
+    let n = if bounded {
+        if l_ad == 0
+            || !l_ad.is_multiple_of(ad_size)
+            || ad_off.checked_add(l_ad).is_none_or(|end| end > fe.len())
+        {
+            return Err(bad);
+        }
+        l_ad / ad_size
+    } else {
+        // At least the first AD, as before L_AD was honoured.
+        (l_ad / ad_size).clamp(1, (fe.len() - ad_off) / ad_size)
+    };
+    let mut remaining = u64::from_le_bytes([
+        fe[56], fe[57], fe[58], fe[59], fe[60], fe[61], fe[62], fe[63],
+    ]) / SECTOR_BYTES as u64;
     let mut extents = Vec::new();
     let mut first_bytes = 0;
     for i in 0..n {
@@ -1294,7 +1375,23 @@ fn metadata_file_extents(
         if i == 0 {
             first_bytes = len;
         }
-        extents.push((abs, len.div_ceil(SECTOR_BYTES as u32)));
+        if bounded {
+            // Long ADs here address the physical partition (map zero).
+            if ad_type == 1 && fe[o + 8..o + 10] != [0, 0] {
+                break;
+            }
+            let sectors = (u64::from(len / SECTOR_BYTES as u32).min(remaining)) as u32;
+            if sectors == 0 {
+                break;
+            }
+            extents.push((abs, sectors));
+            remaining -= u64::from(sectors);
+            if !len.is_multiple_of(SECTOR_BYTES as u32) || remaining == 0 {
+                break;
+            }
+        } else {
+            extents.push((abs, len.div_ceil(SECTOR_BYTES as u32)));
+        }
     }
     Ok((extents, first_bytes))
 }
@@ -1317,6 +1414,10 @@ fn metadata_file_location(lvd: &[u8; SECTOR_BYTES], map: usize) -> Option<u32> {
         lvd[map + 42],
         lvd[map + 43],
     ]))
+}
+
+fn metadata_partition_map(lvd: &[u8; SECTOR_BYTES], map: usize) -> bool {
+    metadata_file_location(lvd, map).is_some() && lvd[map] == 2 && lvd[map + 1] == 64
 }
 
 /// Maximum directory nesting depth followed when building the tree.

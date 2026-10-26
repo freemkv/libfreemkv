@@ -25,6 +25,13 @@ struct Span {
     len: usize,
     lba: u32,
     offset: usize,
+    meta_lba: u32,
+}
+
+#[derive(Clone, Copy)]
+struct MetadataBytePatch {
+    meta_lba: u32,
+    patch: SectorBytePatch,
 }
 
 struct InlineOwner {
@@ -41,6 +48,17 @@ fn bad_sector(lba: u32) -> Error {
         status: None,
         sense: None,
     }
+}
+
+fn read_complete_sector(
+    reader: &mut dyn SectorSource,
+    lba: u32,
+    bytes: &mut [u8; SECTOR_BYTES],
+) -> Result<()> {
+    if reader.read_sectors(lba, 1, bytes, true)? != SECTOR_BYTES {
+        return Err(bad_sector(lba));
+    }
+    Ok(())
 }
 
 fn encoded_like(old: &[u8], replacement: &str, lba: u32) -> Result<Vec<u8>> {
@@ -64,12 +82,12 @@ fn encoded_like(old: &[u8], replacement: &str, lba: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize)> {
+fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize, u32)> {
     let span = spans
         .iter()
         .find(|span| byte >= span.logical && byte < span.logical + span.len)
         .ok_or_else(|| bad_sector(lba))?;
-    Ok((span.lba, span.offset + byte - span.logical))
+    Ok((span.lba, span.offset + byte - span.logical, span.meta_lba))
 }
 
 impl UdfFs {
@@ -161,11 +179,14 @@ impl UdfFs {
                         data[pos..pos + covered_len].iter().zip(&fid).enumerate()
                     {
                         if before != after {
-                            let (lba, offset) = location(&spans, pos + i, icb_lba)?;
-                            all.push(SectorBytePatch {
-                                lba,
-                                offset,
-                                value: after,
+                            let (lba, offset, meta_lba) = location(&spans, pos + i, icb_lba)?;
+                            all.push(MetadataBytePatch {
+                                meta_lba,
+                                patch: SectorBytePatch {
+                                    lba,
+                                    offset,
+                                    value: after,
+                                },
                             });
                         }
                     }
@@ -199,8 +220,8 @@ impl UdfFs {
                 return Err(bad_sector(icb_lba));
             }
             let mut final_sector = owner.sector;
-            for patch in all.iter().filter(|patch| patch.lba == icb_lba) {
-                final_sector[patch.offset] = patch.value;
+            for patch in all.iter().filter(|patch| patch.meta_lba == owner.meta_lba) {
+                final_sector[patch.patch.offset] = patch.patch.value;
             }
             let crc = descriptor_crc16(&final_sector[16..crc_end]);
             final_sector[8..10].copy_from_slice(&crc.to_le_bytes());
@@ -212,15 +233,71 @@ impl UdfFs {
                 .sum::<u32>() as u8;
             for offset in [4, 8, 9] {
                 if owner.sector[offset] != final_sector[offset] {
-                    all.push(SectorBytePatch {
-                        lba: icb_lba,
-                        offset,
-                        value: final_sector[offset],
+                    all.push(MetadataBytePatch {
+                        meta_lba: owner.meta_lba,
+                        patch: SectorBytePatch {
+                            lba: icb_lba,
+                            offset,
+                            value: final_sector[offset],
+                        },
                     });
                 }
             }
         }
+        self.project_metadata_patches(reader, all)
+    }
+
+    fn project_metadata_patches(
+        &self,
+        reader: &mut dyn SectorSource,
+        patches: Vec<MetadataBytePatch>,
+    ) -> Result<Vec<SectorBytePatch>> {
+        let mut all: Vec<_> = patches.iter().map(|p| p.patch).collect();
+        if !patches.is_empty()
+            && let Some(mirror) = self.meta_mirror.filter(|mirror| mirror.duplicated)
+        {
+            let fe_lba = self
+                .partition_start
+                .checked_add(mirror.location)
+                .ok_or_else(|| bad_sector(self.partition_start))?;
+            let mut fe = [0u8; SECTOR_BYTES];
+            read_complete_sector(reader, fe_lba, &mut fe)?;
+            let (extents, _) =
+                super::decode_metadata_file_extents(&fe, self.partition_start, fe_lba, true)?;
+            let map = super::MetaMap(extents);
+            let mut ordered = patches;
+            ordered.sort_by_key(|p| p.meta_lba);
+            let mut previous = None;
+            let mut mirror_lba = 0;
+            for p in ordered {
+                if previous != Some(p.meta_lba) {
+                    mirror_lba = map.to_abs_bounded(p.meta_lba)?;
+                    let main_lba = self.meta_to_abs(p.meta_lba)?;
+                    let mut main = [0u8; SECTOR_BYTES];
+                    let mut copy = [0u8; SECTOR_BYTES];
+                    read_complete_sector(reader, main_lba, &mut main)?;
+                    read_complete_sector(reader, mirror_lba, &mut copy)?;
+                    if main != copy {
+                        return Err(bad_sector(mirror_lba));
+                    }
+                    previous = Some(p.meta_lba);
+                }
+                all.push(SectorBytePatch {
+                    lba: mirror_lba,
+                    ..p.patch
+                });
+            }
+        }
         all.sort_by_key(|p| (p.lba, p.offset));
+        for pair in all.windows(2) {
+            if pair[0].lba == pair[1].lba
+                && pair[0].offset == pair[1].offset
+                && pair[0].value != pair[1].value
+            {
+                return Err(bad_sector(pair[0].lba));
+            }
+        }
+        all.dedup();
         Ok(all)
     }
 
@@ -263,6 +340,7 @@ impl UdfFs {
                     len: ad_len,
                     lba: icb_lba,
                     offset: ad_at,
+                    meta_lba,
                 }],
                 icb_lba,
                 Some(InlineOwner {
@@ -294,6 +372,10 @@ impl UdfFs {
                     len,
                     lba,
                     offset: 0,
+                    meta_lba: extent
+                        .lba
+                        .checked_add(index as u32)
+                        .ok_or_else(|| bad_sector(icb_lba))?,
                 });
                 data.extend_from_slice(&sector[..len]);
                 left -= len;
@@ -841,6 +923,174 @@ mod tests {
         }
     }
 
+    // Independent allocation layouts: the main boundary is at block 32,
+    // while the duplicate has boundaries at both blocks 16 and 32.
+    fn mirror_block(logical: u32) -> u32 {
+        match logical {
+            0..16 => 1500 + logical,
+            16..32 => 2300 + logical - 16,
+            _ => 2500 + logical - 32,
+        }
+    }
+
+    fn duplicate_metadata(disc: &mut super::super::fixture::MemDisc) {
+        use super::super::fixture::build_file_icb_ads;
+
+        let mut lvd = [0; SECTOR_BYTES];
+        read_sector(disc, 33, &mut lvd).unwrap();
+        lvd[490..494].copy_from_slice(&1u32.to_le_bytes());
+        lvd[504] = 1;
+        disc.put_bytes(33, &lvd);
+        disc.put_bytes(
+            129,
+            &build_file_icb_ads(
+                &[
+                    (1500 - 128, 16 * 2048),
+                    (2300 - 128, 16 * 2048),
+                    (2500 - 128, 32 * 2048),
+                ],
+                false,
+            ),
+        );
+        for logical in 0..64 {
+            let main = if logical < 32 {
+                512 + logical
+            } else {
+                2048 + logical - 32
+            };
+            let mut bytes = [0; SECTOR_BYTES];
+            read_sector(disc, main, &mut bytes).unwrap();
+            disc.put_bytes(mirror_block(logical), &bytes);
+        }
+    }
+
+    #[test]
+    fn duplicated_inline_fe_and_efe_finalize_both_rules_before_projection() {
+        use super::super::fixture::build_file_icb;
+
+        for tag in [261u16, 266] {
+            let (mut disc, _) = mapped_directory(2048, false);
+            let mut data = fid("", 1, 0x0a, 3);
+            let mut lengths = vec![data.len()];
+            for (name, icb) in [(RULE[0].from, 4), (TWO_RULES[1].from, 6), ("other.dat", 5)] {
+                let child = fid(name, icb, 0, 3);
+                lengths.push(child.len());
+                data.extend(child);
+            }
+            let mut owner = build_file_icb(data.len() as u64, 31, false);
+            owner[..2].copy_from_slice(&tag.to_le_bytes());
+            owner[12..16].copy_from_slice(&3u32.to_le_bytes());
+            owner[34..36].copy_from_slice(&3u16.to_le_bytes());
+            let ea_at = if tag == 261 { 168 } else { 208 };
+            let data_at = ea_at + 8 + 24;
+            let end = data_at + data.len();
+            owner[ea_at..ea_at + 4].copy_from_slice(&24u32.to_le_bytes());
+            owner[ea_at + 4..ea_at + 8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            owner[ea_at + 8..data_at].fill(0x5a);
+            owner[data_at..end].copy_from_slice(&data);
+            owner[end..].fill(0xa5);
+            oracle_finish(&mut owner, end);
+            disc.put_bytes(515, &owner);
+            disc.put_bytes(518, &build_file_icb(10, 2802 - 128, false));
+            disc.put_bytes(2802, b"mkb secret");
+            duplicate_metadata(&mut disc);
+            let original = image(&mut disc);
+            let fs = super::super::read_filesystem(&mut disc).unwrap();
+            let patches = fs.name_patches(&mut disc, TWO_RULES).unwrap();
+            let mut output =
+                crate::whole_disc::UnitAligned::new(disc.scoped(&[(0, 3072)]), Vec::new())
+                    .with_name_patches(patches);
+            let changed = image(&mut output);
+            let mut expected = original.clone();
+            let mut expected_owner = owner;
+            let mut pos = data_at + lengths[0];
+            for (rule, &len) in TWO_RULES.iter().zip(&lengths[1..]) {
+                expected_owner[pos + 39..pos + 39 + rule.to.len()]
+                    .copy_from_slice(rule.to.as_bytes());
+                oracle_finish(&mut expected_owner[pos..pos + len], len);
+                pos += len;
+            }
+            oracle_finish(&mut expected_owner, end);
+            for lba in [515, mirror_block(3)] {
+                let at = lba as usize * SECTOR_BYTES;
+                expected[at..at + SECTOR_BYTES].copy_from_slice(&expected_owner);
+                assert_descriptor_valid(&changed[at..at + SECTOR_BYTES]);
+                assert_eq!(&changed[at + 12..at + 16], &3u32.to_le_bytes());
+                let mut pos = at + data_at;
+                for &len in &lengths {
+                    assert_descriptor_valid(&changed[pos..pos + len]);
+                    assert_eq!(&changed[pos + 12..pos + 16], &3u32.to_le_bytes());
+                    pos += len;
+                }
+            }
+            assert_eq!(
+                changed, expected,
+                "only both names and child/parent tags may change"
+            );
+            let renamed = super::super::read_filesystem(&mut output).unwrap();
+            for (name, payload) in [
+                (RULE[0].to, b"key payload".as_slice()),
+                (TWO_RULES[1].to, b"mkb secret".as_slice()),
+                ("other.dat", b"unrelated".as_slice()),
+            ] {
+                assert_eq!(
+                    renamed
+                        .read_file(&mut output, &format!("/AACS/{name}"))
+                        .unwrap(),
+                    payload
+                );
+            }
+            assert_eq!(
+                image(&mut crate::whole_disc::raw_whole_disc_reader(disc)),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn duplicated_fragmented_cross_boundary_fid_preserves_decoy_and_logical_tags() {
+        let (mut disc, target) = mapped_directory(2048, true);
+        duplicate_metadata(&mut disc);
+        let original = image(&mut disc);
+        let fs = super::super::read_filesystem(&mut disc).unwrap();
+        let patches = fs.name_patches(&mut disc, RULE).unwrap();
+        for lba in [543, 2048, mirror_block(31), mirror_block(32)] {
+            assert!(patches.iter().any(|patch| patch.lba == lba));
+        }
+        let mut output = crate::whole_disc::UnitAligned::new(disc.scoped(&[(0, 3072)]), Vec::new())
+            .with_name_patches(patches);
+        let changed = image(&mut output);
+        let mut expected = original.clone();
+        let renamed_fid = fid(RULE[0].to, 4, 0, 31);
+        for pair in [[543, 2048], [mirror_block(31), mirror_block(32)]] {
+            for (i, &byte) in renamed_fid.iter().enumerate() {
+                let logical = target + i;
+                expected[pair[logical / SECTOR_BYTES] as usize * SECTOR_BYTES
+                    + logical % SECTOR_BYTES] = byte;
+            }
+            let mut directory = changed[pair[0] as usize * SECTOR_BYTES..][..SECTOR_BYTES].to_vec();
+            directory
+                .extend_from_slice(&changed[pair[1] as usize * SECTOR_BYTES..][..SECTOR_BYTES]);
+            assert_descriptor_valid(&directory[target..target + renamed_fid.len()]);
+            assert_eq!(&directory[target + 12..target + 16], &31u32.to_le_bytes());
+        }
+        assert_eq!(
+            changed, expected,
+            "decoy, payload and unrelated metadata must stay exact"
+        );
+        let renamed = super::super::read_filesystem(&mut output).unwrap();
+        assert_eq!(
+            renamed
+                .read_file(&mut output, "/AACS/Unit_Key_RO.bak")
+                .unwrap(),
+            b"key payload"
+        );
+        assert_eq!(
+            image(&mut crate::whole_disc::raw_whole_disc_reader(disc)),
+            original
+        );
+    }
+
     #[test]
     fn one_udf_fid_rename_serves_iso_and_folder_views_without_changing_payload() {
         let temp = tempfile::tempdir().unwrap();
@@ -895,3 +1145,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "rename/mirror_tests.rs"]
+mod mirror_tests;
