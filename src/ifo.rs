@@ -1546,6 +1546,8 @@ fn link_flow(code: u8, sub: u8) -> Flow {
 }
 
 fn command_flow(raw: &[u8; 8]) -> Flow {
+    #[cfg(test)]
+    tests::COMMAND_INSPECTIONS.with(|count| count.set(count.get() + 1));
     let code = raw[1] & 0x0F;
     match (raw[0] >> 5, raw[0] >> 4 & 1) {
         (0, _) => Flow::Stays,
@@ -1573,7 +1575,11 @@ fn command_flow_in_order(data: &[u8], pgc_offset: usize) -> Option<bool> {
     let table = pgc_offset + rel;
     let count = |at| be_u16(data, table + at).ok().map(usize::from);
     let (pre, post, cell) = (count(0)?, count(2)?, count(4)?);
-    let cmds = data.get(table + 8..table + 8 + (pre + post + cell) * 8)?;
+    let total = pre + post + cell;
+    if total > 255 {
+        return None;
+    }
+    let cmds = data.get(table + 8..table + 8 + total * 8)?;
     let cmds = cmds.as_chunks::<8>().0;
     let mut by_part = false;
     for raw in &cmds[..pre] {

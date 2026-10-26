@@ -2557,3 +2557,177 @@ fn title_reach_with_a_part_naming_pgc_0_is_unknown() {
     let zero: &[(u16, u16)] = &[(1, 1), (0, 1)];
     assert!(title_reach(&data, 0, 2, 0, Some(zero)).is_none());
 }
+
+thread_local! {
+    // Local to each test thread so parallel IFO tests cannot affect the work oracle.
+    pub(super) static COMMAND_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn count_command_inspections<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    COMMAND_INSPECTIONS.with(|count| count.set(0));
+    let result = f();
+    (result, COMMAND_INSPECTIONS.with(std::cell::Cell::get))
+}
+
+// Complete NOP command tables: rejection must not be caused by missing command bytes.
+fn with_command_counts(mut pgc: Vec<u8>, pre: u16, post: u16, cell: u16) -> Vec<u8> {
+    let table = pgc.len();
+    pgc[0xE4..0xE6].copy_from_slice(&(table as u16).to_be_bytes());
+    for count in [pre, post, cell, 0] {
+        pgc.extend_from_slice(&count.to_be_bytes());
+    }
+    pgc.resize(
+        table + 8 + (usize::from(pre) + usize::from(post) + usize::from(cell)) * 8,
+        0,
+    );
+    pgc
+}
+
+#[test]
+fn command_work_bound_rejects_oversized_tables_before_inspection() {
+    for (pre, post, cell) in [
+        (256, 0, 0),
+        (128, 128, 0),
+        (128, 127, 1),
+        (0, 0, 256),
+        (u16::MAX, 0, 0),
+    ] {
+        let pgc = with_command_counts(reach_pgc(0, 0), pre, post, cell);
+        assert_eq!(
+            count_command_inspections(|| command_flow_in_order(&pgc, 0)),
+            (None, 0),
+            "pre={pre}, post={post}, cell={cell} must be unknown without command work"
+        );
+    }
+}
+
+#[test]
+fn command_work_bound_accepts_255_and_preserves_last_byte_tolerance() {
+    for last_byte in [0u16, 1, 2047] {
+        let mut pgc = with_command_counts(reach_pgc(0, 0), 255, 0, 0);
+        let table = usize::from(be_u16(&pgc, 0xE4).unwrap());
+        pgc[table + 6..table + 8].copy_from_slice(&last_byte.to_be_bytes());
+        assert_eq!(
+            count_command_inspections(|| command_flow_in_order(&pgc, 0)),
+            (Some(false), 510),
+            "a complete 255-command table keeps its historical last_byte tolerance"
+        );
+    }
+    // Mixed partitions total 255; the cell actually references the last partition.
+    let mut pgc = with_command_counts(reach_pgc(0, 0), 128, 126, 1);
+    let cell_base = usize::from(be_u16(&pgc, 0xE8).unwrap());
+    pgc[cell_base + 3] = 1;
+    assert_eq!(
+        count_command_inspections(|| command_flow_in_order(&pgc, 0)),
+        (Some(false), 383)
+    );
+    // A leaving command in the referenced cell partition must still be inspected.
+    let table = usize::from(be_u16(&pgc, 0xE4).unwrap());
+    pgc[table + 8 + 254 * 8] = 0x20;
+    pgc[table + 8 + 254 * 8 + 1] = 2;
+    assert_eq!(command_flow_in_order(&pgc, 0), None);
+    assert_eq!(
+        command_flow_in_order(&with_command_counts(reach_pgc(0, 0), 0, 0, 0), 0),
+        Some(false)
+    );
+}
+
+#[test]
+fn command_work_bound_keeps_title_metadata_and_one_pgc_fallback_unproven() {
+    let parse = |pre| {
+        let pgc = with_command_counts(reach_pgc(100, 0), pre, 0, 0);
+        let mut data = build_pgcit(&[pgc]);
+        let ptt = data.len();
+        data.extend_from_slice(&build_ptt_srpt(&[1, 1]));
+        let before = data.clone();
+        let (mut titles, visits) = count_command_inspections(|| {
+            parse_pgcit(&data, 0, ptt, &[(1, 2)]).expect("readable PGC stays listed")
+        });
+        assert_eq!(data, before, "scan must not alter source bytes");
+        assert_eq!(titles.len(), 1);
+        (titles.remove(0), visits)
+    };
+    let (bounded, bounded_visits) = parse(255);
+    let (oversized, oversized_visits) = parse(256);
+    assert!(bounded_visits > 0);
+    assert_eq!(oversized_visits, 0);
+    assert!(bounded.reach.is_some());
+    assert!(bounded.sequential);
+    assert!(oversized.reach.is_none());
+    assert!(
+        !oversized.sequential,
+        "one-PGC fallback must also stay unproven"
+    );
+    assert_eq!(oversized.vts_title_num, 2);
+    assert_eq!(oversized.vts_title_num, bounded.vts_title_num);
+    assert_eq!(oversized.duration_secs, 10.01);
+    assert_eq!(oversized.duration_secs, bounded.duration_secs);
+    assert_eq!(oversized.chapters, 1);
+    assert_eq!(oversized.chapters, bounded.chapters);
+    assert_eq!(oversized.chapter_times, bounded.chapter_times);
+    assert_eq!(oversized.pgcs, 1);
+    assert_eq!(oversized.pgcs, bounded.pgcs);
+    assert_eq!(oversized.ptt_programs, bounded.ptt_programs);
+    assert_eq!(oversized.mapped, bounded.mapped);
+    assert_eq!(oversized.palette, bounded.palette);
+    assert_eq!(oversized.ast_ctl, bounded.ast_ctl);
+    assert_eq!(oversized.spst_ctl, bounded.spst_ctl);
+    assert_eq!(oversized.truncated, bounded.truncated);
+    assert!(!oversized.truncated);
+    assert_eq!(oversized.cells.len(), 1);
+    assert_eq!(oversized.cells[0].first_sector, 100);
+    assert_eq!(oversized.cells[0].last_sector, 109);
+    assert_eq!(oversized.cells.len(), bounded.cells.len());
+    for (actual, expected) in oversized.cells.iter().zip(&bounded.cells) {
+        assert_eq!(actual.first_sector, expected.first_sector);
+        assert_eq!(actual.last_sector, expected.last_sector);
+        assert_eq!(actual.category, expected.category);
+        assert_eq!(actual.duration_secs, expected.duration_secs);
+    }
+}
+
+#[test]
+fn command_work_bound_shared_256_pgc_table_keeps_all_99_titles() {
+    // All 256 PGC headers point forward at the same complete command table.
+    // Program/cell records are shared too, keeping every relative pointer in u16.
+    let entries_end = 8 + 256 * 8;
+    let programs = entries_end + 256 * 0xEA;
+    let cells = programs + 1;
+    let table = cells + 24;
+    let template = reach_pgc(0, 0);
+    let mut data = vec![0u8; table];
+    data[..2].copy_from_slice(&256u16.to_be_bytes());
+    data[programs..table].copy_from_slice(&template[0xEA..]);
+    for i in 0..256 {
+        let pgc = entries_end + i * 0xEA;
+        data[12 + i * 8..16 + i * 8].copy_from_slice(&(pgc as u32).to_be_bytes());
+        data[pgc..pgc + 0xEA].copy_from_slice(&template[..0xEA]);
+        let next = if i < 255 { i as u16 + 2 } else { 0 };
+        data[pgc + 0x9C..pgc + 0x9E].copy_from_slice(&next.to_be_bytes());
+        for (pointer, target) in [(0xE4, table), (0xE6, programs), (0xE8, cells)] {
+            let rel = u16::try_from(target - pgc).unwrap();
+            data[pgc + pointer..pgc + pointer + 2].copy_from_slice(&rel.to_be_bytes());
+        }
+    }
+    data.extend_from_slice(&256u16.to_be_bytes());
+    data.resize(table + 8 + 256 * 8, 0);
+    let ptt = data.len();
+    data.extend_from_slice(&build_ptt_srpt(&[1; 99]));
+    let before = data.clone();
+    let info: Vec<_> = (1..=99).map(|ttn| (1, ttn)).collect();
+    let (titles, visits) = count_command_inspections(|| parse_pgcit(&data, 0, ptt, &info).unwrap());
+    assert_eq!(titles.len(), 99);
+    assert_eq!(
+        visits, 0,
+        "shared oversized command table must never be traversed"
+    );
+    for (title, ttn) in titles.iter().zip(1..=99) {
+        assert_eq!(title.vts_title_num, ttn);
+        assert!(title.reach.is_none());
+        assert!(!title.sequential);
+        assert!(title.mapped);
+        assert_eq!(title.cells.len(), 1);
+        assert_eq!(title.chapters, 1);
+    }
+    assert_eq!(data, before);
+}
