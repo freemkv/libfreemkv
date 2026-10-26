@@ -6044,3 +6044,62 @@ fn staged_real_iso_rescans_to_the_same_titles() {
         assert_eq!(names(&again), names(&disc), "{label}");
     }
 }
+
+#[test]
+fn clear_dvd_aliases_scan_and_prepare_whole_disc() {
+    use crate::udf::fixture::*;
+
+    let mut image = MemDisc::new();
+    let aliases = (0..512)
+        .map(|i| {
+            file(
+                &format!("VTS_02_alias{i:04}_1.VOB"),
+                100,
+                10_000,
+                2048,
+                false,
+            )
+        })
+        .collect();
+    let root = DirSpec {
+        name: String::new(),
+        icb_lba: 10,
+        dir_data_lba: 11,
+        files: vec![],
+        subdirs: vec![
+            DirSpec {
+                name: "VIDEO_TS".into(),
+                icb_lba: 50,
+                dir_data_lba: 51,
+                files: vec![
+                    file_with("VIDEO_TS.IFO", 60, 5000, dvd_vmg_bytes(), false),
+                    file_with("VTS_01_0.IFO", 62, 6000, dvd_vts_bytes(1000, 10, 10), false),
+                    file("VTS_01_1.VOB", 64, 7010, 2048, false),
+                ],
+                subdirs: vec![],
+            },
+            DirSpec {
+                name: "ALIASES".into(),
+                icb_lba: 70,
+                dir_data_lba: 200,
+                files: aliases,
+                subdirs: vec![],
+            },
+        ],
+    };
+    build_udf_skeleton(&mut image, 10);
+    lay_dir(&mut image, &root);
+    let disc = Disc::scan_image(&mut image, 50_000, &ScanOptions::default()).unwrap();
+    assert_eq!(disc.format, DiscFormat::Dvd);
+    assert_eq!(disc.titles.len(), 1);
+    assert!(!disc.encrypted);
+    let mut reader = crate::sector::DecryptingSectorSource::new(image, disc.decrypt_keys())
+        .with_disc_css(&disc, None)
+        .expect("clear DVD still prepares the CSS stage");
+    let mut sector = [0xff; 2048];
+    assert_eq!(
+        reader.read_sectors(12_000, 1, &mut sector, false).unwrap(),
+        2048
+    );
+    assert_eq!(sector, [0; 2048]);
+}

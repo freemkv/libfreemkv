@@ -5,14 +5,13 @@ use crate::disc::Extent;
 use crate::error::{Error, Result};
 use crate::halt::Halt;
 use crate::sector::SectorSource;
-use crate::udf::{DirEntry, UdfFs};
-use std::collections::BTreeMap;
+use crate::udf::{DirEntry, MAX_WALK_RANGES, UdfFs};
+use std::collections::{BTreeMap, btree_map::Entry};
 
 const CRACK_BATCH_SECTORS: u16 = 64;
 
 struct Group {
     spans: Vec<Extent>,
-    crack: Vec<Extent>,
     keys: DecryptKeys,
 }
 
@@ -41,33 +40,60 @@ impl DiscKeys {
         let mut files = BTreeMap::new();
         collect(&fs.root, &mut files);
         let mut groups = Vec::new();
+        let mut total_spans = 0;
         for (_, mut files) in files {
             files.sort_by_key(|f| f.name.to_ascii_uppercase());
             let mut group = Group {
                 spans: Vec::new(),
-                crack: Vec::new(),
                 keys: fallback.clone(),
             };
+            let mut crack = Vec::new();
+            let mut seen = BTreeMap::new();
             for entry in files {
-                for extent in fs
-                    .extents_abs_at(reader, entry.meta_lba)?
-                    .into_iter()
-                    .filter(|e| e.recorded)
-                {
-                    let span = Extent {
-                        start_lba: extent.lba,
-                        sector_count: u64::from(extent.len).div_ceil(2048) as u32,
-                    };
-                    if is_title_vob(&entry.name) {
-                        group.crack.push(span);
+                let (range, title_seen) = match seen.entry(entry.meta_lba) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(seen_entry) => {
+                        let start = group.spans.len();
+                        for extent in fs
+                            .extents_abs_at(reader, entry.meta_lba)?
+                            .into_iter()
+                            .filter(|e| e.recorded)
+                        {
+                            // Include other groups' retained spans and this group's
+                            // temporary candidates in the existing UDF walk limit.
+                            if total_spans + crack.len() >= MAX_WALK_RANGES {
+                                return Err(Error::DiscRead {
+                                    sector: u64::from(fs.metadata_start()),
+                                    status: None,
+                                    sense: None,
+                                });
+                            }
+                            group.spans.push(Extent {
+                                start_lba: extent.lba,
+                                sector_count: u64::from(extent.len).div_ceil(2048) as u32,
+                            });
+                            total_spans += 1;
+                        }
+                        seen_entry.insert((start..group.spans.len(), false))
                     }
-                    group.spans.push(span);
+                };
+                // A menu alias may precede a title alias to the same ICB. Add
+                // candidates at its first title alias, preserving crack order.
+                if is_title_vob(&entry.name) && !*title_seen {
+                    if total_spans + crack.len() + range.len() > MAX_WALK_RANGES {
+                        return Err(Error::DiscRead {
+                            sector: u64::from(fs.metadata_start()),
+                            status: None,
+                            sense: None,
+                        });
+                    }
+                    crack.extend_from_slice(&group.spans[range.clone()]);
+                    *title_seen = true;
                 }
             }
-            if !group.crack.is_empty() {
+            if !crack.is_empty() {
                 group.keys =
-                    match super::crack_key_outcome(reader, &group.crack, CRACK_BATCH_SECTORS, halt)
-                    {
+                    match super::crack_key_outcome(reader, &crack, CRACK_BATCH_SECTORS, halt) {
                         super::CrackOutcome::Cracked(state) => DecryptKeys::Css {
                             title_key: state.title_key,
                         },
@@ -140,3 +166,7 @@ pub(crate) fn is_title_vob(name: &str) -> bool {
         None => false,
     }
 }
+
+#[cfg(test)]
+#[path = "disc/budget_tests.rs"]
+mod budget_tests;
