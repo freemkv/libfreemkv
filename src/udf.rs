@@ -1097,10 +1097,9 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
             let pm2_type = lvd[pm2_map]; // Second map type
 
             if pm2_type == 2 {
-                // Type 2 = metadata partition. UDF 2.50 2.2.10 records the Metadata
-                // File's location in the map (offset 40), not always block 0; trusted
-                // only when type ID reads "*UDF Metadata Partition" (block 0 still tried as fallback).
-                // Keep the relative locator even if adding the partition would overflow.
+                // UDF 2.50 2.2.10: trust offset 40 only for "*UDF Metadata Partition";
+                // still try block 0 as fallback. Retain the relative mirror locator
+                // even if adding the physical partition start would overflow.
                 if metadata_partition_map(&lvd, pm2_map) {
                     meta_mirror = Some(MetadataMirror {
                         location: u32::from_le_bytes([
