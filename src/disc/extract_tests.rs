@@ -147,6 +147,14 @@ fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent
     buf.extend_from_slice(&name_field);
     let used = buf.len() - start;
     buf.resize(start + ((used + 3) & !3), 0);
+    // Same-length decrypted-output renames require CRC coverage of the whole FID.
+    let fid = &mut buf[start..];
+    fid[2..4].copy_from_slice(&3u16.to_le_bytes());
+    let crc_len = (fid.len() - 16) as u16;
+    fid[10..12].copy_from_slice(&crc_len.to_le_bytes());
+    let crc = crate::udf::descriptor_crc16(&fid[16..]);
+    fid[8..10].copy_from_slice(&crc.to_le_bytes());
+    fid[4] = fid[..16].iter().copied().fold(0u8, u8::wrapping_add);
 }
 
 fn lay_dir(disc: &mut MemDisc, dir: &DirSpec) {
@@ -450,7 +458,8 @@ fn bdmv_extract_preserves_protection_metadata() {
     );
     assert_eq!(read_out(out.path(), "BDMV/PLAYLIST/00000.mpls"), Some(mpls));
     assert_eq!(read_out(out.path(), "BDMV/CLIPINF/00001.clpi"), Some(clpi));
-    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), Some(aacs_inf));
+    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.bak"), Some(aacs_inf));
+    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), None);
     assert_eq!(
         read_out(out.path(), "CERTIFICATE/id.bdmv"),
         Some(b"BDJ-DISC-ID".to_vec())

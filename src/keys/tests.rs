@@ -15,6 +15,7 @@ use std::cell::Cell;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[path = "tests/clear_names_tests.rs"]
 mod clear_names;
 
 const K1: [u8; 16] = *b"\xA1KU-L2 key one!!";
