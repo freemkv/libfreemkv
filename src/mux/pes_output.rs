@@ -245,9 +245,9 @@ impl<'u> PesOutput<'u> {
     }
 }
 
-// Opens a file output's sink with `open`. A file it created (create_new, identity from that
-// handle) and failed to fill is removed while the path names it, never via a symlink. A second
-// writer that opened the same name shares that inode and cannot be told apart.
+// Failed sink creation: best-effort unlink after a no-follow identity observation of the
+// create_new file. Replacement between observation and unlink can be removed; another
+// writer sharing our inode cannot be distinguished.
 fn created(path: &Path, open: impl FnOnce() -> io::Result<Opened>) -> io::Result<Opened> {
     created_then(path, || {}, open)
 }

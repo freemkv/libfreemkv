@@ -1,4 +1,4 @@
-//! Atomic no-replace publication. Never downgrade to an overwriting rename.
+//! Native/hard-link no-replace publication with a cooperative Unix claim fallback.
 //!
 //! Ladder: native no-replace rename; on a capability error, Unix tries
 //! link()+unlink (atomic on Linux NFS/CIFS), then an O_EXCL claim that is
@@ -18,13 +18,14 @@
 //! and rebind within the publishing call.
 use std::{fmt, io, path::Path};
 
-/// Publish a completed file only if `target` is absent (including symlinks).
-/// No error triggers a destructive fallback. Network errors can be ambiguous:
-/// reconcile identities before retrying. Directory durability is the caller's job.
-/// A successful hard-link publication may retain the source if unlink fails;
-/// callers must tolerate that recoverable duplicate. Retryable contention in
-/// the Unix claim fallback is `ResourceBusy` carrying a [`Fault`];
-/// [`Fault::ClaimLeft`] is `Other`, as no retry succeeds while the placeholder stays.
+/// Native rename or hard link atomically publishes only if `target` is absent, symlinks included.
+/// The Unix claim fallback requires cooperating writers to hold `<target>.lock`;
+/// its documented residual windows can remove or overwrite a foreign replacement.
+/// Network errors can be ambiguous: reconcile identities before retrying.
+/// Directory durability is the caller's job. Hard-link success may retain the source
+/// if unlink fails; tolerate that recoverable duplicate. Unix claim contention is
+/// `ResourceBusy` carrying a [`Fault`]; [`Fault::ClaimLeft`] is `Other`, as retries
+/// cannot succeed while its placeholder stays.
 pub fn no_replace(source: &Path, target: &Path) -> io::Result<()> {
     publish_with(source, target, &System)
 }
