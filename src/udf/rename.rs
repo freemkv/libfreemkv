@@ -221,12 +221,13 @@ impl UdfFs {
             if !extent.recorded {
                 return Err(bad_sector(icb_lba));
             }
-            let base = self.meta_to_abs(extent.lba)?;
             let mut left = extent.len as usize;
             for index in 0..left.div_ceil(SECTOR_BYTES) {
-                let lba = base
+                let rel = extent
+                    .lba
                     .checked_add(index as u32)
-                    .ok_or_else(|| bad_sector(base))?;
+                    .ok_or_else(|| bad_sector(icb_lba))?;
+                let lba = self.meta_to_abs(rel)?;
                 let mut sector = [0u8; SECTOR_BYTES];
                 read_sector(reader, lba, &mut sector)?;
                 let len = left.min(SECTOR_BYTES);
@@ -258,6 +259,231 @@ mod tests {
         from: "Unit_Key_RO.inf",
         to: "Unit_Key_RO.bak",
     }];
+
+    // Polynomial long division, independent of the production CRC implementation.
+    fn crc_oracle(bytes: &[u8]) -> u16 {
+        let mut remainder = 0u32;
+        for &byte in bytes {
+            remainder = (remainder << 8) ^ (u32::from(byte) << 16);
+            for shift in (0..8).rev() {
+                if remainder & (1 << (16 + shift)) != 0 {
+                    remainder ^= 0x1_1021 << shift;
+                }
+            }
+        }
+        remainder as u16
+    }
+
+    fn fid(name: &str, icb: u32, flags: u8, block: u32) -> Vec<u8> {
+        let mut bytes = vec![0; (38 + 1 + name.len() + 3) & !3];
+        bytes[..2].copy_from_slice(&257u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&3u16.to_le_bytes());
+        bytes[12..16].copy_from_slice(&block.to_le_bytes());
+        bytes[18] = flags;
+        bytes[19] = (name.len() + 1) as u8;
+        bytes[20..24].copy_from_slice(&(SECTOR_BYTES as u32).to_le_bytes());
+        bytes[24..28].copy_from_slice(&icb.to_le_bytes());
+        bytes[28..30].copy_from_slice(&1u16.to_le_bytes());
+        bytes[38] = 8;
+        bytes[39..39 + name.len()].copy_from_slice(name.as_bytes());
+        let crc_len = bytes.len() - 16;
+        bytes[10..12].copy_from_slice(&(crc_len as u16).to_le_bytes());
+        let crc = crc_oracle(&bytes[16..]);
+        bytes[8..10].copy_from_slice(&crc.to_le_bytes());
+        bytes[4] = bytes[..16].iter().copied().fold(0u8, u8::wrapping_add);
+        bytes
+    }
+
+    fn mapped_directory(second: u32, crosses: bool) -> (super::super::fixture::MemDisc, usize) {
+        use super::super::fixture::{MemDisc, build_file_icb, build_file_icb_ads};
+
+        let mut disc = MemDisc::new();
+        let mut sector = [0; SECTOR_BYTES];
+        sector[..2].copy_from_slice(&2u16.to_le_bytes());
+        disc.put_bytes(256, &sector);
+        sector.fill(0);
+        sector[..2].copy_from_slice(&5u16.to_le_bytes());
+        sector[188..192].copy_from_slice(&128u32.to_le_bytes());
+        disc.put_bytes(32, &sector);
+        sector.fill(0);
+        sector[..2].copy_from_slice(&6u16.to_le_bytes());
+        sector[268..272].copy_from_slice(&2u32.to_le_bytes());
+        sector[440..442].copy_from_slice(&[1, 6]);
+        sector[446..448].copy_from_slice(&[2, 64]);
+        sector[451..474].copy_from_slice(b"*UDF Metadata Partition");
+        disc.put_bytes(33, &sector);
+        sector.fill(0);
+        sector[..2].copy_from_slice(&8u16.to_le_bytes());
+        disc.put_bytes(34, &sector);
+        disc.put_bytes(
+            128,
+            &build_file_icb_ads(&[(512 - 128, 32 * 2048), (second - 128, 32 * 2048)], false),
+        );
+        sector.fill(0);
+        sector[..2].copy_from_slice(&256u16.to_le_bytes());
+        sector[404..408].copy_from_slice(&1u32.to_le_bytes());
+        disc.put_bytes(512, &sector);
+        let root = fid("AACS", 3, 2, 2);
+        disc.put_bytes(513, &build_file_icb(root.len() as u64, 2, false));
+        disc.put_bytes(514, &root);
+        disc.put_bytes(516, &build_file_icb(11, 2800 - 128, false));
+        disc.put_bytes(517, &build_file_icb(9, 2801 - 128, false));
+        disc.put_bytes(2800, b"key payload");
+        disc.put_bytes(2801, b"unrelated");
+
+        let mut directory = Vec::new();
+        for i in 0..if crosses { 30 } else { 32 } {
+            directory.extend(fid(&format!("padding-{i:017}"), 5, 0, 31));
+        }
+        if crosses {
+            directory.extend(fid(&"x".repeat(37), 5, 0, 31));
+        }
+        let target = directory.len();
+        assert_eq!(target, if crosses { 1996 } else { 2048 });
+        directory.extend(fid("Unit_Key_RO.inf", 4, 0, if crosses { 31 } else { 32 }));
+        disc.put_bytes(515, &build_file_icb(directory.len() as u64, 31, false));
+        disc.put_bytes(543, &directory[..SECTOR_BYTES]);
+        // Both locations contain plausible stale FIDs/tails. The old planner can
+        // succeed while silently modifying the physical gap instead of block 32.
+        disc.put_bytes(544, &directory[SECTOR_BYTES..]);
+        disc.put_bytes(second, &directory[SECTOR_BYTES..]);
+        (disc, target)
+    }
+
+    fn image(reader: &mut dyn SectorSource) -> Vec<u8> {
+        let mut bytes = vec![0; 3072 * SECTOR_BYTES];
+        assert_eq!(
+            reader.read_sectors(0, 3072, &mut bytes, false).unwrap(),
+            bytes.len()
+        );
+        bytes
+    }
+
+    fn mapped_rename(second: u32, crosses: bool) -> Vec<SectorBytePatch> {
+        assert_eq!(crc_oracle(b"123456789"), 0x31c3);
+        let (mut disc, target) = mapped_directory(second, crosses);
+        let before = image(&mut disc);
+        let fs = super::super::read_filesystem(&mut disc).unwrap();
+        assert!(
+            fs.find_dir("/AACS")
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.name == RULE[0].from)
+        );
+        assert!(fs.name_patches(&mut disc, &[]).unwrap().is_empty());
+        let absent = [NameRule {
+            from: "absent.inf",
+            ..RULE[0]
+        }];
+        assert!(fs.name_patches(&mut disc, &absent).unwrap().is_empty());
+        let patches = fs.name_patches(&mut disc, RULE).unwrap();
+        assert!(!patches.is_empty());
+        assert!(
+            patches.iter().any(|p| p.lba == second),
+            "target block 32 must be patched"
+        );
+        assert!(
+            patches
+                .iter()
+                .all(|p| p.lba == second || (crosses && p.lba == 543))
+        );
+
+        let copy = disc.scoped(&[(0, 3072)]);
+        let mut clear = crate::whole_disc::UnitAligned::new(copy, Vec::new())
+            .with_name_patches(patches.clone());
+        let after = image(&mut clear);
+        let mut expected = before.clone();
+        let expected_fid = fid(RULE[0].to, 4, 0, if crosses { 31 } else { 32 });
+        for (i, &byte) in expected_fid.iter().enumerate() {
+            let logical = target + i;
+            let (lba, offset) = if logical < SECTOR_BYTES {
+                (543, logical)
+            } else {
+                (second, logical - SECTOR_BYTES)
+            };
+            expected[lba as usize * SECTOR_BYTES + offset] = byte;
+        }
+        // Full-image equality checks the physical gap, payload, ICBs, unrelated
+        // FIDs, partial-sector padding, and every byte outside the target FID.
+        assert_eq!(after, expected);
+        let mut directory = after[543 * SECTOR_BYTES..544 * SECTOR_BYTES].to_vec();
+        directory.extend_from_slice(
+            &after[second as usize * SECTOR_BYTES..(second as usize + 1) * SECTOR_BYTES],
+        );
+        let changed = &directory[target..target + expected_fid.len()];
+        let crc_len = u16::from_le_bytes([changed[10], changed[11]]) as usize;
+        assert_eq!(
+            u16::from_le_bytes([changed[8], changed[9]]),
+            crc_oracle(&changed[16..16 + crc_len])
+        );
+        assert_eq!(
+            changed[4],
+            changed[..16]
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 4)
+                .fold(0u8, |sum, (_, byte)| sum.wrapping_add(*byte))
+        );
+        assert_eq!(
+            &changed[12..16],
+            &if crosses { 31u32 } else { 32u32 }.to_le_bytes()
+        );
+        let renamed = super::super::read_filesystem(&mut clear).unwrap();
+        assert!(
+            renamed
+                .find_dir("/AACS")
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.name == RULE[0].to)
+        );
+        assert!(
+            !renamed
+                .find_dir("/AACS")
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.name == RULE[0].from)
+        );
+        assert_eq!(
+            renamed
+                .read_file(&mut clear, "/AACS/Unit_Key_RO.bak")
+                .unwrap(),
+            b"key payload"
+        );
+        let mut raw = crate::whole_disc::raw_whole_disc_reader(disc);
+        assert_eq!(
+            image(&mut raw),
+            before,
+            "raw output must retain the original image"
+        );
+        patches
+    }
+
+    #[test]
+    fn fragmented_directory_rename_ignores_wrong_sector_decoy() {
+        mapped_rename(2048, false);
+    }
+
+    #[test]
+    fn fragmented_directory_rename_maps_cross_boundary_fid_and_checksums() {
+        mapped_rename(2048, true);
+    }
+
+    #[test]
+    fn contiguous_directory_rename_has_the_same_relative_patches() {
+        for crosses in [false, true] {
+            let contiguous = mapped_rename(544, crosses);
+            let mut fragmented = mapped_rename(2048, crosses);
+            for patch in &mut fragmented {
+                if patch.lba == 2048 {
+                    patch.lba = 544;
+                }
+            }
+            assert_eq!(fragmented, contiguous);
+        }
+    }
 
     #[test]
     fn one_udf_fid_rename_serves_iso_and_folder_views_without_changing_payload() {
