@@ -253,9 +253,19 @@ jobs:
       # freemkv's app build (`--features gui`) compiles a GTK4 + libadwaita
       # shell, so testing it needs these pkg-config dev headers.
       - name: Install GTK4 + libadwaita development headers (for freemkv)
+        shell: bash
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev build-essential
+          set -euo pipefail
+          helper_path="$RUNNER_TEMP/install-linux-deps.sh"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 60 --retry 2 \
+            --output "$helper_path" \
+            "https://raw.githubusercontent.com/freemkv/freemkv/36fc5d5e7a98837600cb427c6ac86db3d0907582/.github/scripts/install-linux-deps.sh"
+          printf '%s  %s\n' \
+            '7d67a8ce80b491302b5d28be13cb3611949103b3d8a3bc05216c3a3f6e31b832' \
+            "$helper_path" | sha256sum --check --status
+          bash "$helper_path" libgtk-4-dev libadwaita-1-dev build-essential
       # Dependents track the highest supported Rust — build on stable so this job
       # satisfies the highest dependent floor (the library's own lower MSRV, which
       # the `test` job verifies, cannot compile them).
