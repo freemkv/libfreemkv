@@ -20,6 +20,20 @@ pub type PreparedReader<S> = UnitAligned<DecryptingSectorSource<S>>;
 /// Compatibility name for the prepared reader used by image copies.
 pub type WholeDiscReader<S> = PreparedReader<S>;
 
+const DECRYPTED_NAME_RULES: &[crate::udf::NameRule] = &[crate::udf::NameRule {
+    dir: "/AACS",
+    from: "Unit_Key_RO.inf",
+    to: "Unit_Key_RO.bak",
+}];
+
+pub(crate) fn prepare_decrypted_names<S: SectorSource>(
+    mut reader: PreparedReader<S>,
+) -> Result<PreparedReader<S>> {
+    let fs = crate::udf::read_filesystem(&mut reader)?;
+    let patches = fs.name_patches(&mut reader, DECRYPTED_NAME_RULES)?;
+    Ok(reader.with_name_patches(patches))
+}
+
 // Compose a selected clear/CSS sector input using the same prepared-reader contract.
 // Called before prefetch/demux; output adapters receive no decryption configuration.
 pub(crate) fn prepare_title<S: SectorSource>(
@@ -193,6 +207,7 @@ pub(crate) fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 pub struct UnitAligned<S> {
     inner: S,
     spans: Vec<UnitSpan>,
+    name_patches: Vec<crate::udf::SectorBytePatch>,
     scratch: Vec<u8>,
     policy: crate::sector::read_stage::ReadPolicy,
     unit: u64,
@@ -203,6 +218,7 @@ impl<S: SectorSource> UnitAligned<S> {
         Self {
             inner,
             spans,
+            name_patches: Vec::new(),
             scratch: Vec::new(),
             unit: UNIT,
             policy: crate::sector::read_stage::ReadPolicy::Recover {
@@ -226,6 +242,11 @@ impl<S: SectorSource> UnitAligned<S> {
 
     pub(crate) fn with_policy(mut self, policy: crate::sector::read_stage::ReadPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    pub(crate) fn with_name_patches(mut self, patches: Vec<crate::udf::SectorBytePatch>) -> Self {
+        self.name_patches = patches;
         self
     }
 
@@ -303,63 +324,75 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
         recovery: bool,
         fua: bool,
     ) -> Result<usize> {
-        let end = lba as u64 + count as u64;
-        let mut cur = lba as u64;
-        while cur < end {
-            let off = (cur - lba as u64) as usize * crate::consts::SECTOR_BYTES;
-            let Some((s, n, anchor)) = span_at(&self.spans, cur) else {
-                // Outside every content span: a plain read up to the next span.
-                let i = self.spans.partition_point(|&(s, _, _)| s as u64 <= cur);
-                let next = self
-                    .spans
-                    .get(i)
-                    .map_or(end, |&(s, _, _)| end.min(s as u64));
-                let want = (next - cur) as usize * crate::consts::SECTOR_BYTES;
-                self.inner.set_unit_base(cur as u32);
+        let got = (|| -> Result<usize> {
+            let end = lba as u64 + count as u64;
+            let mut cur = lba as u64;
+            while cur < end {
+                let off = (cur - lba as u64) as usize * crate::consts::SECTOR_BYTES;
+                let Some((s, n, anchor)) = span_at(&self.spans, cur) else {
+                    // Outside every content span: a plain read up to the next span.
+                    let i = self.spans.partition_point(|&(s, _, _)| s as u64 <= cur);
+                    let next = self
+                        .spans
+                        .get(i)
+                        .map_or(end, |&(s, _, _)| end.min(s as u64));
+                    let want = (next - cur) as usize * crate::consts::SECTOR_BYTES;
+                    self.inner.set_unit_base(cur as u32);
+                    let got = self.inner.read_sectors_fua(
+                        cur as u32,
+                        (next - cur) as u16,
+                        &mut buf[off..off + want],
+                        recovery,
+                        fua,
+                    )?;
+                    if got < want {
+                        return Ok(off + got);
+                    }
+                    cur = next;
+                    continue;
+                };
+                let (s, e) = (s as u64, s as u64 + n as u64);
+                let a0 = anchor + (cur - anchor) / self.unit * self.unit;
+                if a0 < s {
+                    // The unit straddles a non-contiguous extent boundary: undecryptable here.
+                    return Err(Error::DecryptFailed);
+                }
+                // Capped so the widened read still fits one u16-count request.
+                let piece_end = end
+                    .min(e)
+                    .min(a0 + (u16::MAX as u64 / self.unit - 1) * self.unit);
+                let a1 = e.min(a0 + (piece_end - a0).div_ceil(self.unit) * self.unit);
+                let len = (a1 - a0) as usize * crate::consts::SECTOR_BYTES;
+                self.scratch.resize(len, 0);
+                self.inner.set_unit_base(a0 as u32);
                 let got = self.inner.read_sectors_fua(
-                    cur as u32,
-                    (next - cur) as u16,
-                    &mut buf[off..off + want],
+                    a0 as u32,
+                    (a1 - a0) as u16,
+                    &mut self.scratch[..len],
                     recovery,
                     fua,
                 )?;
-                if got < want {
-                    return Ok(off + got);
+                let skip = (cur - a0) as usize * crate::consts::SECTOR_BYTES;
+                let want = (piece_end - cur) as usize * crate::consts::SECTOR_BYTES;
+                let have = got.saturating_sub(skip).min(want);
+                buf[off..off + have].copy_from_slice(&self.scratch[skip..skip + have]);
+                if have < want {
+                    return Ok(off + have);
                 }
-                cur = next;
-                continue;
-            };
-            let (s, e) = (s as u64, s as u64 + n as u64);
-            let a0 = anchor + (cur - anchor) / self.unit * self.unit;
-            if a0 < s {
-                // The unit straddles a non-contiguous extent boundary: undecryptable here.
-                return Err(Error::DecryptFailed);
+                cur = piece_end;
             }
-            // Capped so the widened read still fits one u16-count request.
-            let piece_end = end
-                .min(e)
-                .min(a0 + (u16::MAX as u64 / self.unit - 1) * self.unit);
-            let a1 = e.min(a0 + (piece_end - a0).div_ceil(self.unit) * self.unit);
-            let len = (a1 - a0) as usize * crate::consts::SECTOR_BYTES;
-            self.scratch.resize(len, 0);
-            self.inner.set_unit_base(a0 as u32);
-            let got = self.inner.read_sectors_fua(
-                a0 as u32,
-                (a1 - a0) as u16,
-                &mut self.scratch[..len],
-                recovery,
-                fua,
-            )?;
-            let skip = (cur - a0) as usize * crate::consts::SECTOR_BYTES;
-            let want = (piece_end - cur) as usize * crate::consts::SECTOR_BYTES;
-            let have = got.saturating_sub(skip).min(want);
-            buf[off..off + have].copy_from_slice(&self.scratch[skip..skip + have]);
-            if have < want {
-                return Ok(off + have);
+            Ok(count as usize * crate::consts::SECTOR_BYTES)
+        })()?;
+        for patch in &self.name_patches {
+            if patch.lba >= lba && (patch.lba as u64) < lba as u64 + count as u64 {
+                let offset =
+                    (patch.lba - lba) as usize * crate::consts::SECTOR_BYTES + patch.offset;
+                if offset < got {
+                    buf[offset] = patch.value;
+                }
             }
-            cur = piece_end;
         }
-        Ok(count as usize * crate::consts::SECTOR_BYTES)
+        Ok(got)
     }
 
     fn set_speed(&mut self, kbs: u16) {

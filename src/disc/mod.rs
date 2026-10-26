@@ -1862,6 +1862,7 @@ pub(crate) fn scan_parses(bd: bool, path: &str) -> bool {
     }
     [
         crate::aacs::PATH_UNIT_KEY_RO,
+        crate::aacs::PATH_UNIT_KEY_RO_DECRYPTED,
         crate::aacs::PATH_CONTENT_CERT,
         crate::aacs::PATH_CONTENT_CERT_ALT,
         crate::aacs::PATH_MKB_RO,

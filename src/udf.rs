@@ -11,6 +11,25 @@ use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 use std::collections::HashSet;
 
+mod rename;
+pub(crate) use rename::{NameRule, SectorBytePatch};
+
+/// ECMA-167 descriptor CRC, shared by UDF authoring and same-length name edits.
+pub(crate) fn descriptor_crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
 // Cap on a single unbounded metadata file read (`read_file`); bounds the allocation a crafted
 // ICB info_length/extent length can force.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;

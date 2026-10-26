@@ -819,7 +819,12 @@ impl KeyRing {
             };
             return Err(Error::UdfNotFound { path: path.into() });
         }
-        self.decrypting(inner, None, StopKind::Image, false)
+        crate::whole_disc::prepare_decrypted_names(self.decrypting(
+            inner,
+            None,
+            StopKind::Image,
+            false,
+        )?)
     }
 }
 

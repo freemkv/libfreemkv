@@ -25,6 +25,7 @@ pub mod variant;
 // candidate list walked by read_first (see role_paths, find_hddvd_aacs_dir).
 /// Primary Unit Key file path.
 pub const PATH_UNIT_KEY_RO: &str = "/AACS/Unit_Key_RO.inf";
+pub const PATH_UNIT_KEY_RO_DECRYPTED: &str = "/AACS/Unit_Key_RO.bak";
 pub const PATH_UNIT_KEY_RO_DUPLICATE: &str = "/AACS/DUPLICATE/Unit_Key_RO.inf";
 pub const PATH_MKB_RO: &str = "/AACS/MKB_RO.inf";
 pub const PATH_MKB_RO_DUPLICATE: &str = "/AACS/DUPLICATE/MKB_RO.inf";
@@ -70,7 +71,11 @@ pub(crate) fn find_hddvd_aacs_dir(udf: &crate::udf::UdfFs) -> Option<&crate::udf
 // appends every VTKF*.AACS found, sorted, since a disc may ship >1 variant.
 pub(crate) fn role_paths(udf: &crate::udf::UdfFs, role: AacsRole) -> Vec<String> {
     let mut v: Vec<String> = match role {
-        AacsRole::UnitKey => vec![PATH_UNIT_KEY_RO, PATH_UNIT_KEY_RO_DUPLICATE],
+        AacsRole::UnitKey => vec![
+            PATH_UNIT_KEY_RO,
+            PATH_UNIT_KEY_RO_DECRYPTED,
+            PATH_UNIT_KEY_RO_DUPLICATE,
+        ],
         AacsRole::Mkb => vec![PATH_MKB_RO, PATH_MKB_RO_DUPLICATE],
         AacsRole::ContentCert => vec![PATH_CONTENT_CERT, PATH_CONTENT_CERT_ALT],
     }

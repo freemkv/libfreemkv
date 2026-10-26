@@ -58,6 +58,31 @@ fn read_first_falls_through_a_primary_disc_read_to_the_duplicate() {
     );
 }
 
+#[test]
+fn renamed_decrypted_unit_key_is_read_before_the_duplicate() {
+    use crate::error::Error;
+    let paths = [
+        super::PATH_UNIT_KEY_RO,
+        super::PATH_UNIT_KEY_RO_DECRYPTED,
+        super::PATH_UNIT_KEY_RO_DUPLICATE,
+    ];
+    let mut tried = Vec::new();
+    let bytes = super::read_first(&paths, |path| {
+        tried.push(path.to_string());
+        if path == super::PATH_UNIT_KEY_RO_DECRYPTED {
+            Ok(vec![0xBA, 0x6B])
+        } else {
+            Err(Error::UdfNotFound { path: path.into() })
+        }
+    })
+    .unwrap();
+    assert_eq!(bytes, [0xBA, 0x6B]);
+    assert_eq!(
+        tried,
+        paths[..2].iter().map(|p| p.to_string()).collect::<Vec<_>>()
+    );
+}
+
 // When every candidate fails to read, the remembered `DiscRead` propagates
 // (more informative than a bare `AacsNoKeys`); a purely absent set yields
 // `AacsNoKeys`.
@@ -172,6 +197,7 @@ fn role_paths_discovers_hddvd_dir_and_globs_all_vtkf_variants() {
         super::role_paths(&udf, super::AacsRole::UnitKey),
         vec![
             super::PATH_UNIT_KEY_RO.to_string(),
+            super::PATH_UNIT_KEY_RO_DECRYPTED.to_string(),
             super::PATH_UNIT_KEY_RO_DUPLICATE.to_string(),
             "/AAC!/VTKF090.AACS".to_string(),
             "/AAC!/VTKF100.AACS".to_string(),
@@ -299,6 +325,7 @@ fn a_bang_suffixed_directory_without_mkbrom_is_not_the_aacs_directory() {
         super::role_paths(&udf, super::AacsRole::UnitKey),
         vec![
             super::PATH_UNIT_KEY_RO.to_string(),
+            super::PATH_UNIT_KEY_RO_DECRYPTED.to_string(),
             super::PATH_UNIT_KEY_RO_DUPLICATE.to_string(),
         ],
         "no HD DVD candidates may be appended from a directory that was \
@@ -337,6 +364,7 @@ fn role_paths_bd_uhd_disc_yields_no_hddvd_candidates() {
         super::role_paths(&udf, super::AacsRole::UnitKey),
         vec![
             super::PATH_UNIT_KEY_RO.to_string(),
+            super::PATH_UNIT_KEY_RO_DECRYPTED.to_string(),
             super::PATH_UNIT_KEY_RO_DUPLICATE.to_string(),
         ]
     );

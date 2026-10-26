@@ -1,0 +1,315 @@
+//! Same-length UDF FID renames for decrypted whole-disc outputs.
+
+use super::{
+    Error, Result, SECTOR_BYTES, SectorSource, UdfFs, descriptor_crc16, parse_udf_name, read_sector,
+};
+
+/// One path policy. FID name lengths must match so ISO sectors and their layout stay fixed.
+#[derive(Clone, Copy)]
+pub(crate) struct NameRule {
+    pub dir: &'static str,
+    pub from: &'static str,
+    pub to: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SectorBytePatch {
+    pub lba: u32,
+    pub offset: usize,
+    pub value: u8,
+}
+
+#[derive(Clone, Copy)]
+struct Span {
+    logical: usize,
+    len: usize,
+    lba: u32,
+    offset: usize,
+}
+
+fn bad_sector(lba: u32) -> Error {
+    Error::DiscRead {
+        sector: lba as u64,
+        status: None,
+        sense: None,
+    }
+}
+
+fn encoded_like(old: &[u8], replacement: &str, lba: u32) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(old.len());
+    match old.first().copied() {
+        Some(8) if replacement.is_ascii() => {
+            out.push(8);
+            out.extend_from_slice(replacement.as_bytes());
+        }
+        Some(16) => {
+            out.push(16);
+            for unit in replacement.encode_utf16() {
+                out.extend_from_slice(&unit.to_be_bytes());
+            }
+        }
+        _ => return Err(bad_sector(lba)),
+    }
+    if out.len() != old.len() {
+        return Err(bad_sector(lba));
+    }
+    Ok(out)
+}
+
+fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize)> {
+    let span = spans
+        .iter()
+        .find(|span| byte >= span.logical && byte < span.logical + span.len)
+        .ok_or_else(|| bad_sector(lba))?;
+    Ok((span.lba, span.offset + byte - span.logical))
+}
+
+impl UdfFs {
+    /// Patch the on-disc FID only; payload bytes and UDF allocation never move.
+    /// The same prepared reader feeds both ISO writing and folder extraction.
+    pub(crate) fn name_patches(
+        &self,
+        reader: &mut dyn SectorSource,
+        rules: &[NameRule],
+    ) -> Result<Vec<SectorBytePatch>> {
+        let mut all = Vec::new();
+        for &rule in rules {
+            let Some(dir) = self.find_dir(rule.dir) else {
+                continue;
+            };
+            let count = dir
+                .entries
+                .iter()
+                .filter(|e| e.name.eq_ignore_ascii_case(rule.from))
+                .count();
+            if count == 0 {
+                continue;
+            }
+            if count != 1
+                || dir
+                    .entries
+                    .iter()
+                    .any(|e| e.name.eq_ignore_ascii_case(rule.to))
+            {
+                return Err(Error::DirNameCollision {
+                    host: format!("{}/{}", rule.dir, rule.to),
+                });
+            }
+            let (data, spans, icb_lba) = self.directory_bytes(reader, dir.meta_lba)?;
+            let mut pos = 0;
+            let mut found = 0;
+            while pos + 38 <= data.len() {
+                let tag = u16::from_le_bytes([data[pos], data[pos + 1]]);
+                if tag == 0 {
+                    break;
+                }
+                if tag != 257 {
+                    return Err(bad_sector(icb_lba));
+                }
+                let flags = data[pos + 18];
+                let name_len = data[pos + 19] as usize;
+                let iu_len = u16::from_le_bytes([data[pos + 36], data[pos + 37]]) as usize;
+                let desc_len = 38usize
+                    .checked_add(iu_len)
+                    .and_then(|n| n.checked_add(name_len))
+                    .ok_or_else(|| bad_sector(icb_lba))?;
+                let end = pos
+                    .checked_add(desc_len)
+                    .ok_or_else(|| bad_sector(icb_lba))?;
+                if end > data.len() {
+                    return Err(bad_sector(icb_lba));
+                }
+                let name_at = 38 + iu_len;
+                let old = &data[pos + name_at..end];
+                if flags & 0x0c == 0 && parse_udf_name(old).eq_ignore_ascii_case(rule.from) {
+                    found += 1;
+                    let crc_len = u16::from_le_bytes([data[pos + 10], data[pos + 11]]) as usize;
+                    let covered_len = 16usize
+                        .checked_add(crc_len)
+                        .ok_or_else(|| bad_sector(icb_lba))?;
+                    let aligned_len = (desc_len + 3) & !3;
+                    if covered_len < desc_len
+                        || covered_len > aligned_len
+                        || pos + covered_len > data.len()
+                    {
+                        return Err(bad_sector(icb_lba));
+                    }
+                    let mut fid = data[pos..pos + covered_len].to_vec();
+                    let replacement = encoded_like(old, rule.to, icb_lba)?;
+                    fid[name_at..name_at + name_len].copy_from_slice(&replacement);
+                    let crc = descriptor_crc16(&fid[16..16 + crc_len]);
+                    fid[8..10].copy_from_slice(&crc.to_le_bytes());
+                    fid[4] = fid
+                        .iter()
+                        .take(16)
+                        .enumerate()
+                        .filter(|(i, _)| *i != 4)
+                        .map(|(_, byte)| *byte as u32)
+                        .sum::<u32>() as u8;
+                    for (i, (&before, &after)) in
+                        data[pos..pos + covered_len].iter().zip(&fid).enumerate()
+                    {
+                        if before != after {
+                            let (lba, offset) = location(&spans, pos + i, icb_lba)?;
+                            all.push(SectorBytePatch {
+                                lba,
+                                offset,
+                                value: after,
+                            });
+                        }
+                    }
+                }
+                pos = pos
+                    .checked_add((desc_len + 3) & !3)
+                    .ok_or_else(|| bad_sector(icb_lba))?;
+            }
+            if found != 1 {
+                return Err(bad_sector(icb_lba));
+            }
+        }
+        all.sort_by_key(|p| (p.lba, p.offset));
+        Ok(all)
+    }
+
+    fn directory_bytes(
+        &self,
+        reader: &mut dyn SectorSource,
+        meta_lba: u32,
+    ) -> Result<(Vec<u8>, Vec<Span>, u32)> {
+        let icb_lba = self.meta_to_abs(meta_lba)?;
+        let mut icb = [0u8; SECTOR_BYTES];
+        read_sector(reader, icb_lba, &mut icb)?;
+        let tag = u16::from_le_bytes([icb[0], icb[1]]);
+        let ea_at = match tag {
+            261 => 168,
+            266 => 208,
+            _ => return Err(bad_sector(icb_lba)),
+        };
+        let ea = u32::from_le_bytes([icb[ea_at], icb[ea_at + 1], icb[ea_at + 2], icb[ea_at + 3]])
+            as usize;
+        let ad_len = u32::from_le_bytes([
+            icb[ea_at + 4],
+            icb[ea_at + 5],
+            icb[ea_at + 6],
+            icb[ea_at + 7],
+        ]) as usize;
+        let ad_at = (ea_at + 8usize)
+            .checked_add(ea)
+            .ok_or_else(|| bad_sector(icb_lba))?;
+        if icb[34] & 7 == 3 {
+            let end = ad_at
+                .checked_add(ad_len)
+                .ok_or_else(|| bad_sector(icb_lba))?;
+            if end > SECTOR_BYTES {
+                return Err(bad_sector(icb_lba));
+            }
+            return Ok((
+                icb[ad_at..end].to_vec(),
+                vec![Span {
+                    logical: 0,
+                    len: ad_len,
+                    lba: icb_lba,
+                    offset: ad_at,
+                }],
+                icb_lba,
+            ));
+        }
+
+        let mut data = Vec::new();
+        let mut spans = Vec::new();
+        for extent in self.read_icb_extents(reader, meta_lba)? {
+            if !extent.recorded {
+                return Err(bad_sector(icb_lba));
+            }
+            let base = self.meta_to_abs(extent.lba)?;
+            let mut left = extent.len as usize;
+            for index in 0..left.div_ceil(SECTOR_BYTES) {
+                let lba = base
+                    .checked_add(index as u32)
+                    .ok_or_else(|| bad_sector(base))?;
+                let mut sector = [0u8; SECTOR_BYTES];
+                read_sector(reader, lba, &mut sector)?;
+                let len = left.min(SECTOR_BYTES);
+                spans.push(Span {
+                    logical: data.len(),
+                    len,
+                    lba,
+                    offset: 0,
+                });
+                data.extend_from_slice(&sector[..len]);
+                left -= len;
+                if data.len() > super::MAX_DIR_BYTES as usize {
+                    return Err(bad_sector(icb_lba));
+                }
+            }
+        }
+        Ok((data, spans, icb_lba))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dirimage::DirImage;
+    use crate::sector::SectorSource;
+
+    const RULE: &[NameRule] = &[NameRule {
+        dir: "/AACS",
+        from: "Unit_Key_RO.inf",
+        to: "Unit_Key_RO.bak",
+    }];
+
+    #[test]
+    fn one_udf_fid_rename_serves_iso_and_folder_views_without_changing_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("AACS")).unwrap();
+        std::fs::create_dir(temp.path().join("BDMV")).unwrap();
+        let key_bytes = b"same content under its new name";
+        std::fs::write(temp.path().join("AACS/Unit_Key_RO.inf"), key_bytes).unwrap();
+        std::fs::write(temp.path().join("AACS/MKB_RO.inf"), b"other file").unwrap();
+        let mut raw = DirImage::open(temp.path()).unwrap();
+        let fs = super::super::read_filesystem(&mut raw).unwrap();
+        let patches = fs.name_patches(&mut raw, RULE).unwrap();
+        assert!(!patches.is_empty());
+        assert!(fs.read_file(&mut raw, "/AACS/Unit_Key_RO.inf").is_ok());
+
+        let mut clear =
+            crate::whole_disc::UnitAligned::new(raw, Vec::new()).with_name_patches(patches.clone());
+        let renamed = super::super::read_filesystem(&mut clear).unwrap();
+        let aacs = renamed.find_dir("/AACS").unwrap();
+        assert!(aacs.entries.iter().any(|e| e.name == "Unit_Key_RO.bak"));
+        assert!(!aacs.entries.iter().any(|e| e.name == "Unit_Key_RO.inf"));
+        assert_eq!(
+            renamed
+                .read_file(&mut clear, "/AACS/Unit_Key_RO.bak")
+                .unwrap(),
+            key_bytes
+        );
+        assert_eq!(
+            renamed.read_file(&mut clear, "/AACS/MKB_RO.inf").unwrap(),
+            b"other file"
+        );
+        let mut sector = [0u8; SECTOR_BYTES];
+        for lba in patches.iter().map(|p| p.lba) {
+            assert_eq!(
+                clear.read_sectors(lba, 1, &mut sector, false).unwrap(),
+                SECTOR_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn a_preexisting_target_refuses_the_rename_before_output() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("AACS")).unwrap();
+        std::fs::create_dir(temp.path().join("BDMV")).unwrap();
+        std::fs::write(temp.path().join("AACS/Unit_Key_RO.inf"), b"original").unwrap();
+        std::fs::write(temp.path().join("AACS/Unit_Key_RO.bak"), b"other").unwrap();
+        let mut raw = DirImage::open(temp.path()).unwrap();
+        let fs = super::super::read_filesystem(&mut raw).unwrap();
+        assert!(matches!(
+            fs.name_patches(&mut raw, RULE),
+            Err(Error::DirNameCollision { .. })
+        ));
+    }
+}
