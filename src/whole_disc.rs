@@ -35,12 +35,11 @@ pub(crate) fn prepare_decrypted_names<S: SectorSource>(
     if !require_udf && matches!(reader.capacity_sectors(), 1..=256) {
         return Ok(reader);
     }
-    let fs = match crate::udf::read_filesystem(&mut reader) {
-        Ok(fs) => fs,
-        Err(Error::UdfNotFilesystem) if !require_udf => return Ok(reader),
-        Err(e) => return Err(e),
+    let patches = match crate::udf::read_name_patches(&mut reader, DECRYPTED_NAME_RULES)? {
+        Some(patches) => patches,
+        None if !require_udf => return Ok(reader),
+        None => return Err(Error::UdfNotFilesystem),
     };
-    let patches = fs.name_patches(&mut reader, DECRYPTED_NAME_RULES)?;
     Ok(reader.with_name_patches(patches))
 }
 

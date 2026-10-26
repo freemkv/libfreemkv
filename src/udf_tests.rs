@@ -786,6 +786,7 @@ fn read_directory_rejects_oversized_dir_before_allocating() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .unwrap_err();
     assert!(matches!(err, Error::DiscRead { .. }));
@@ -808,6 +809,7 @@ fn read_directory_accepts_small_empty_dir() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("small dir parses");
     assert!(dir.entries.is_empty());
@@ -1204,6 +1206,7 @@ fn read_directory_propagates_an_icb_read_failure_instead_of_size_zero() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("dir parses when every sector reads");
     assert_eq!(ok.entries.len(), 1);
@@ -1226,6 +1229,7 @@ fn read_directory_propagates_an_icb_read_failure_instead_of_size_zero() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect_err("an unreadable entry ICB must fail the scan, not report size 0");
     assert!(
@@ -1268,6 +1272,7 @@ fn read_directory_honors_l_iu_offset_for_fid_name() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("dir parses");
     assert_eq!(parsed.entries.len(), 1, "exactly one FID entry");
@@ -1309,6 +1314,7 @@ fn read_directory_skips_parent_fid_entry() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("dir parses");
     assert!(
@@ -2015,6 +2021,7 @@ fn read_directory_budget_exceeded_returns_err() {
         0,
         &mut budget,
         &mut HashSet::new(),
+        true,
     )
     .unwrap_err();
     assert!(
@@ -2059,6 +2066,7 @@ fn read_directory_icb_cycle_does_not_recurse() {
         0,
         &mut 0,
         &mut visited,
+        true,
     )
     .expect("cycle must not blow up");
 
@@ -2091,6 +2099,7 @@ fn read_directory_rejects_an_icb_whose_tag_is_not_a_file_entry() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect_err("a non-File-Entry directory ICB must fail, not read as an empty directory");
     assert!(
@@ -2112,6 +2121,7 @@ fn read_directory_rejects_an_icb_whose_tag_is_not_a_file_entry() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a real Extended File Entry with no FIDs is a genuinely empty directory");
     assert!(dir.entries.is_empty());
@@ -2970,6 +2980,7 @@ fn read_directory_reads_a_plain_file_entry_tag_261_directory_icb() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a File Entry (261) directory ICB is valid and must be readable");
     assert_eq!(child_names(&parsed), vec!["VIDEO_TS.IFO".to_string()]);
@@ -3015,6 +3026,7 @@ fn read_directory_reads_a_directory_whose_fids_are_embedded_in_the_icb() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("an embedded (AD type 3) directory is valid and must be readable");
     assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
@@ -3061,6 +3073,7 @@ fn read_directory_reads_fids_spanning_multiple_allocation_descriptors() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a multi-extent directory must be readable");
     assert_eq!(
@@ -3116,6 +3129,7 @@ fn read_directory_follows_type3_continuation() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a directory with a continuation AD must be readable");
     assert_eq!(
@@ -3169,6 +3183,7 @@ fn read_directory_continuation_skips_aed_header() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("continuation with an AED header must be readable");
     assert_eq!(
@@ -3213,6 +3228,7 @@ fn read_directory_self_cycling_continuation_is_an_error() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect_err("a cyclic AD chain is corruption, like read_icb_extents");
     assert!(matches!(err, Error::UdfAdChainTooLong), "got {err:?}");
@@ -3249,6 +3265,7 @@ fn read_directory_reads_an_extended_ad_directorys_extent_location() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("an extended_ad directory must be readable");
     assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
@@ -3284,6 +3301,7 @@ fn read_directory_reads_a_long_ad_directorys_extent() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a long_ad directory must be readable");
     assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
@@ -3324,6 +3342,7 @@ fn read_directory_masks_type_bits_so_a_zero_length_typed_ad_terminates() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("directory parses");
     assert_eq!(child_names(&parsed), vec!["INDEX.BDMV".to_string()]);
@@ -3361,6 +3380,7 @@ fn read_directory_ignores_fid_bytes_past_the_declared_directory_length() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("dir parses");
     assert_eq!(
@@ -3402,6 +3422,7 @@ fn read_directory_stops_at_a_descriptor_whose_tag_is_not_a_fid() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("damage stops the listing, never fails it");
     assert_eq!(
@@ -3440,6 +3461,7 @@ fn read_directory_keeps_a_fid_name_that_ends_exactly_at_the_buffer_end() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("dir parses");
     assert_eq!(child_names(&parsed), vec!["ENDSATEND".to_string()]);
@@ -3476,6 +3498,7 @@ fn read_directory_stops_instead_of_panicking_when_a_name_runs_past_the_buffer() 
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("damage stops the listing, never fails it");
     assert_eq!(
@@ -3512,6 +3535,7 @@ fn read_directory_admits_a_tree_that_exactly_fills_the_entry_budget() {
         0,
         &mut budget,
         &mut HashSet::new(),
+        true,
     )
     .expect("a tree that exactly reaches the entry budget must still be enumerated");
     assert_eq!(child_names(&parsed), vec!["LAST.M2TS".to_string()]);
@@ -3573,6 +3597,7 @@ fn read_directory_stops_descending_at_the_nesting_cap() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a deep but well-formed chain parses");
 
@@ -3628,6 +3653,7 @@ fn read_directory_advances_past_a_fids_implementation_use_area() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("dir parses");
     assert_eq!(
@@ -3663,6 +3689,7 @@ fn read_directory_reads_an_ad_that_ends_exactly_at_the_icb_sector_end() {
             0,
             &mut 0,
             &mut HashSet::new(),
+            true,
         )
         .unwrap_or_else(|e| panic!("tag {tag}: exact-fit AD must be read: {e:?}"));
         assert_eq!(child_names(&parsed), vec!["TIGHT.CLPI".to_string()]);
@@ -3688,6 +3715,7 @@ fn read_directory_rejects_an_ad_running_past_the_icb_sector() {
             0,
             &mut 0,
             &mut HashSet::new(),
+            true,
         )
         .expect_err("an AD past the end of the ICB sector must fail");
         assert!(
@@ -3722,6 +3750,7 @@ fn read_directory_locates_the_ad_after_a_non_empty_extended_attribute_area() {
             0,
             &mut 0,
             &mut HashSet::new(),
+            true,
         )
         .unwrap_or_else(|e| panic!("tag {tag}: L_EA offset must be honoured: {e:?}"));
         assert_eq!(child_names(&parsed), vec!["WITHEA.MPLS".to_string()]);
@@ -3758,6 +3787,7 @@ fn read_directory_skips_a_deleted_fid_and_never_follows_its_icb() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a deleted FID must not fail the enumeration of its directory");
     assert_eq!(
@@ -3794,6 +3824,7 @@ fn read_directory_reads_every_byte_of_the_short_ad_length_and_location() {
             0,
             &mut 0,
             &mut HashSet::new(),
+            true,
         )
         .unwrap_or_else(|e| panic!("tag {tag}: short_ad must be decoded: {e:?}"));
         assert_eq!(
@@ -3826,6 +3857,7 @@ fn read_directory_rejects_a_length_whose_high_byte_alone_exceeds_the_cap() {
             0,
             &mut 0,
             &mut HashSet::new(),
+            true,
         )
         .expect_err("a 16 MiB directory length must be refused, not read as empty");
         assert!(
@@ -3859,6 +3891,7 @@ fn read_directory_reads_a_directory_exactly_at_the_size_cap() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a directory exactly at the size ceiling must be readable");
     assert_eq!(child_names(&parsed), vec!["00000.M2TS".to_string()]);
@@ -3889,6 +3922,7 @@ fn read_directory_reads_each_sector_of_a_multi_sector_directory_into_its_own_slo
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a two-sector directory parses");
     assert_eq!(child_names(&parsed), vec!["FIRST.CLPI".to_string()]);
@@ -4000,6 +4034,7 @@ fn read_directory_does_not_read_unrecorded_extents_as_fids() {
             0,
             &mut 0,
             &mut HashSet::new(),
+            true,
         )
         .expect("directory with an unrecorded extent parses");
         assert_eq!(
@@ -4044,6 +4079,7 @@ fn read_directory_joins_a_short_non_final_extent_without_padding() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("multi-extent directory parses");
     assert_eq!(
@@ -4085,6 +4121,7 @@ fn read_directory_caps_sector_reads_across_many_tiny_extents() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     );
     assert!(
         res.is_err(),
@@ -4112,6 +4149,7 @@ fn read_directory_rejects_a_continuation_block_that_is_not_an_aed() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     );
     assert!(res.is_err(), "non-AED continuation accepted: {res:?}");
 }
@@ -4251,6 +4289,7 @@ fn read_directory_lists_a_subdirectory_with_a_broken_ad_chain_as_empty() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("a broken subdirectory must not fail the parent");
     assert_eq!(

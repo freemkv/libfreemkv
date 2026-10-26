@@ -970,6 +970,25 @@ fn span_extents(abs: &[AbsExtent]) -> Result<Vec<(u32, u32)>> {
 /// 4. FSD → root directory ICB
 /// 5. Root directory → file tree
 pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
+    read_filesystem_inner(reader, true)
+}
+
+/// Discover name edits without reading leaf File Entries for unused sizes.
+/// Keep the incomplete-size tree private to UDF name planning. `None` means
+/// mounting found no UDF filesystem; patch-planning errors always propagate.
+pub(crate) fn read_name_patches(
+    reader: &mut dyn SectorSource,
+    rules: &[NameRule],
+) -> Result<Option<Vec<SectorBytePatch>>> {
+    let fs = match read_filesystem_inner(reader, false) {
+        Ok(fs) => fs,
+        Err(Error::UdfNotFilesystem) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    fs.name_patches(reader, rules).map(Some)
+}
+
+fn read_filesystem_inner(reader: &mut dyn SectorSource, read_leaf_sizes: bool) -> Result<UdfFs> {
     // Step 1: Anchor Volume Descriptor Pointer at sector 256
     // ECMA-167 §10.2 — always at sector 256
     let mut avdp = [0u8; SECTOR_BYTES];
@@ -1223,6 +1242,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
         0,
         &mut 0usize,
         &mut visited,
+        read_leaf_sizes,
     )?;
 
     let metadata_sectors = (metadata_size_bytes as u64).div_ceil(SECTOR_BYTES_U64) as u32;
@@ -1446,6 +1466,7 @@ fn read_directory(
     depth: u32,
     budget: &mut usize,
     visited: &mut HashSet<u64>,
+    read_leaf_sizes: bool,
 ) -> Result<DirEntry> {
     // Read ICB for this directory
     let icb_abs = meta.to_abs(meta_lba)?;
@@ -1694,10 +1715,14 @@ fn read_directory(
                     });
                 }
 
-                // Read failures must propagate, not become size 0 (indistinguishable
-                // from a real empty file). `read_file_size` still returns Ok(0) for
-                // ICBs that aren't File/Extended File Entry tags (261/266) — genuine zero.
-                let file_size = read_file_size(reader, meta, icb_lba)?;
+                // Avoid consuming unrelated leaf FEs before extraction reads them.
+                // Only name planning omits leaf sizes, kept private to `read_name_patches`.
+                // Directory probes and public full-size reads still propagate failures.
+                let file_size = if read_leaf_sizes || is_dir {
+                    read_file_size(reader, meta, icb_lba)?
+                } else {
+                    0
+                };
 
                 if is_dir && depth < MAX_DIR_DEPTH {
                     // Cycle guard: skip any ICB LBA we have already opened as
@@ -1727,6 +1752,7 @@ fn read_directory(
                             depth + 1,
                             budget,
                             visited,
+                            read_leaf_sizes,
                         ) {
                             // Unfollowable AD chain: lose only this dir, as Linux/libudfread do.
                             Err(e @ Error::UdfAdChainTooLong) => {

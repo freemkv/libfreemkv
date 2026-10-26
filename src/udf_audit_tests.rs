@@ -268,6 +268,7 @@ fn a_corrupt_fid_tag_in_a_subdirectory_lists_it_empty() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     )
     .expect("subdirectory corruption must not fail the walk");
     assert_eq!(root.entries.len(), 1);
@@ -314,6 +315,7 @@ fn directory_walk_caps_sectors_read_across_subdirectories() {
         0,
         &mut 0,
         &mut HashSet::new(),
+        true,
     );
     assert!(res.is_err(), "tree-wide sector budget must trip");
     let data_reads: usize = (100_000..100_000 + MAX_DIR_BYTES / 2048)

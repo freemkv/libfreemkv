@@ -106,11 +106,82 @@ fn clear_whole_disc_names_raw_image_hash_is_unchanged() {
     assert_eq!(raw, fx.img.image);
 }
 
+// Name preparation needs FID names and directory ICBs, never leaf File Entries.
+#[test]
+fn clear_whole_disc_names_preparation_skips_leaf_file_entries() {
+    let fx = clear_fixture(false);
+    let mut raw = fx.img.source();
+    let fs = crate::udf::read_filesystem(&mut raw).unwrap();
+    let patches = fs
+        .name_patches(
+            &mut raw,
+            &[crate::udf::NameRule {
+                dir: "/AACS",
+                from: "Unit_Key_RO.inf",
+                to: "Unit_Key_RO.bak",
+            }],
+        )
+        .unwrap();
+    assert!(!patches.is_empty());
+    let mut directories = vec![fs.metadata_start() + fs.root.meta_lba];
+    let mut leaves = Vec::new();
+    let mut pending = vec![&fs.root];
+    while let Some(dir) = pending.pop() {
+        for entry in &dir.entries {
+            let lba = fs.metadata_start() + entry.meta_lba;
+            if entry.is_dir {
+                directories.push(lba);
+                pending.push(entry);
+            } else {
+                leaves.push(lba);
+            }
+        }
+    }
+    assert_eq!(
+        leaves.len(),
+        2,
+        "stream and AACS metadata are both leaf files"
+    );
+    for &leaf in &leaves {
+        let mut source = ProbeSource::new(fx.img.image.clone(), fx.disc.capacity_sectors);
+        source.fail = Some((leaf, 1));
+        let mut reader = KeyRing::none()
+            .whole_disc_reader(&fx.disc, &mut source as &mut dyn SectorSource, None)
+            .expect("leaf damage must not prevent name preparation");
+        for patch in &patches {
+            let mut sector = [0; 2048];
+            assert_eq!(
+                reader
+                    .read_sectors(patch.lba, 1, &mut sector, true)
+                    .unwrap(),
+                2048
+            );
+            assert_eq!(sector[patch.offset], patch.value);
+        }
+        drop(reader);
+        assert!(directories.iter().all(|lba| source.reads.contains(lba)));
+        assert!(
+            leaves.iter().all(|lba| !source.touched.contains(lba)),
+            "leaf FE reads: {:?}",
+            source.reads
+        );
+
+        // The public reader still loads real file sizes and propagates FE failures.
+        let mut full = ProbeSource::new(fx.img.image.clone(), fx.disc.capacity_sectors);
+        full.fail = Some((leaf, 1));
+        assert!(
+            matches!(crate::udf::read_filesystem(&mut full), Err(Error::DiscRead { sector, .. }) if sector == leaf as u64)
+        );
+        assert!(full.reads.contains(&leaf));
+    }
+}
+
 // Fail a particular metadata read, including the second pass made by name preparation.
 struct ProbeSource {
     inner: MemSource,
     capacity: u32,
     reads: Vec<u32>,
+    touched: std::collections::HashSet<u32>,
     fail: Option<(u32, usize)>,
     halted: bool,
 }
@@ -121,6 +192,7 @@ impl ProbeSource {
             inner: MemSource::new(bytes),
             capacity,
             reads: Vec::new(),
+            touched: std::collections::HashSet::new(),
             fail: None,
             halted: false,
         }
@@ -140,6 +212,7 @@ impl SectorSource for ProbeSource {
         recovery: bool,
     ) -> Result<usize> {
         self.reads.push(lba);
+        self.touched.extend(lba..lba + u32::from(count));
         if self.fail.is_some_and(|(at, hit)| {
             at == lba && self.reads.iter().filter(|&&n| n == at).count() == hit
         }) {
@@ -203,6 +276,9 @@ fn clear_whole_disc_names_metadata_io_and_halt_propagate() {
         (directory, 2, false),
         (directory, 3, false),
         (256, 1, true),
+        (directory, 1, true),
+        (directory, 2, true),
+        (directory, 3, true),
     ] {
         let mut source = ProbeSource::new(fx.img.image.clone(), fx.disc.capacity_sectors);
         source.fail = Some((lba, hit));
