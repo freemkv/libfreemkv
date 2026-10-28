@@ -272,8 +272,8 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// Restrict decrypt to every stream file's extents (e.g.
     /// [`Disc::stream_content_ranges`](crate::Disc::stream_content_ranges),
     /// not the title-only [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
-    /// Units outside pass through untouched, never TS-sync checked. Whole-disc
-    /// readers (sweep / patch) set this; the mux, reading title extents, does not.
+    /// Units outside pass through untouched, never TS-sync checked. Every reader
+    /// built by `KeyRing::decrypting` sets this; a bare decorator reads everything.
     pub fn with_content_ranges(mut self, ranges: Arc<[(u32, u32)]>) -> Self {
         self.content_ranges = Some(ranges);
         self

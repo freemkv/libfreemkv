@@ -82,8 +82,8 @@ impl ExtractResult {
     }
 }
 
-/// One file scheduled for extraction, resolved against the raw reader in the
-/// structure phase (before the reader is moved into the decrypting decorator).
+/// One file scheduled for extraction, resolved against the reader in the
+/// structure phase, before any file data is read.
 struct PlannedFile {
     /// Host-relative path (sanitized, collision-checked).
     host_rel: PathBuf,
@@ -378,8 +378,8 @@ fn extract_one_file<S: SectorSource>(
         complete: false,
     };
 
-    // Inline (ICB-embedded) file: data already in hand, no decrypt path (nav
-    // files are clear). Write verbatim, trimmed to size.
+    // Inline (ICB-embedded) file: data already in hand, never read through the
+    // extent walk (nav files are clear). Write verbatim, trimmed to size.
     if let Some(bytes) = &pf.inline {
         let n = (pf.size as usize).min(bytes.len());
         file.write(&bytes[..n])?;
@@ -459,8 +459,8 @@ fn extract_one_file<S: SectorSource>(
             let remaining = pf.size.saturating_sub(written);
             let usable = chunk_bytes.min(remaining) as usize;
             {
-                // Unreadable ranges were zero-filled by `read_batch_narrowed`; record the
-                // holes and keep going (no abort, no sweep-skip).
+                // Unreadable ranges were zero-filled by the extent walk; record the
+                // holes and keep going (no abort).
                 let lost = lost.min(usable as u64);
                 file.write(&buf[..usable])?;
                 // Damaged AACS units the reader blanked are unreadable, not good bytes.
