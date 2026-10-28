@@ -35,10 +35,27 @@ pub(crate) fn prepare_decrypted_names<S: SectorSource>(
     if !require_udf && matches!(reader.capacity_sectors(), 1..=256) {
         return Ok(reader);
     }
-    let patches = match crate::udf::read_name_patches(&mut reader, DECRYPTED_NAME_RULES)? {
-        Some(patches) => patches,
-        None if !require_udf => return Ok(reader),
-        None => return Err(Error::UdfNotFilesystem),
+    let patches = match crate::udf::read_name_patches(&mut reader, DECRYPTED_NAME_RULES) {
+        Ok(Some(patches)) => patches,
+        Ok(None) if !require_udf => return Ok(reader),
+        Ok(None) => return Err(Error::UdfNotFilesystem),
+        // A Stop, a dead bus or a gone source ends the copy; it is not damaged metadata.
+        Err(e)
+            if matches!(e, Error::Halted)
+                || e.is_scsi_transport_failure()
+                || e.is_source_terminated() =>
+        {
+            return Err(e);
+        }
+        // Damaged or unexpected metadata: copy without the rename, as 1.8.4 did.
+        Err(e) => {
+            tracing::warn!(
+                target: "freemkv::udf",
+                code = e.code(),
+                "decrypted-name rename skipped; image keeps its original names"
+            );
+            return Ok(reader);
+        }
     };
     Ok(reader.with_name_patches(patches))
 }

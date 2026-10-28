@@ -12,6 +12,7 @@ struct Disc {
     inner: MemDisc,
     reads: BTreeSet<u32>,
     denied: BTreeSet<u32>,
+    deny_with: fn(u32) -> Error,
     short: BTreeSet<u32>,
 }
 
@@ -26,7 +27,7 @@ impl SectorSource for Disc {
         for sector in lba..lba + u32::from(count) {
             self.reads.insert(sector);
             if self.denied.contains(&sector) {
-                return Err(bad_sector(sector));
+                return Err((self.deny_with)(sector));
             }
         }
         let bytes = self.inner.read_sectors(lba, count, buf, recovery)?;
@@ -157,6 +158,7 @@ fn fixture(duplicate: bool) -> Disc {
         inner: disc,
         reads: BTreeSet::new(),
         denied: BTreeSet::new(),
+        deny_with: bad_sector,
         short: BTreeSet::new(),
     }
 }
@@ -369,5 +371,81 @@ fn bounded_mirror_decoder_uses_fe_and_efe_short_and_long_allocation_fields() {
             let patches = fs.name_patches(&mut disc, RULES).unwrap();
             assert!(patches.iter().any(|p| p.lba == MIRROR_TARGET));
         }
+    }
+}
+
+fn prepare(disc: Disc) -> (Result<crate::whole_disc::PreparedReader<Disc>>, bool) {
+    let (prepared, events) = crate::testlog::capture(|| {
+        crate::whole_disc::prepare_decrypted_names(
+            crate::whole_disc::raw_whole_disc_reader(disc),
+            true,
+        )
+    });
+    let warned = events
+        .iter()
+        .any(|e| e.target == "freemkv::udf" && e.level == tracing::Level::WARN);
+    (prepared, warned)
+}
+
+// A mirror sector that is unreadable, short or unequal skips the rename (1.8.4's image).
+#[test]
+fn damaged_or_mismatched_mirror_copies_without_the_rename() {
+    for fault in 0..3 {
+        let mut disc = fixture(true);
+        let main = sector(&mut disc, MAIN_TARGET);
+        match fault {
+            0 => {
+                disc.denied.insert(MIRROR_TARGET);
+            }
+            1 => {
+                disc.short.insert(MIRROR_TARGET);
+            }
+            _ => {
+                let mut bytes = sector(&mut disc, MIRROR_TARGET);
+                bytes[1000] = 9;
+                disc.inner.put_bytes(MIRROR_TARGET, &bytes);
+            }
+        }
+        let (prepared, warned) = prepare(disc);
+        let mut prepared = prepared.unwrap_or_else(|e| panic!("fault {fault}: {e:?}"));
+        assert!(warned, "fault {fault}");
+        assert_eq!(sector(&mut prepared, MAIN_TARGET), main, "fault {fault}");
+    }
+}
+
+// An /AACS FID whose CRC length is out of range skips the rename instead of failing.
+#[test]
+fn unexpected_aacs_fid_copies_without_the_rename() {
+    for crc_len in [0u16, u16::MAX] {
+        let mut disc = fixture(false);
+        let mut dir = sector(&mut disc, MAIN_TARGET);
+        dir[50..52].copy_from_slice(&crc_len.to_le_bytes());
+        disc.inner.put_bytes(MAIN_TARGET, &dir);
+        let original = snapshot(&mut disc);
+        let (prepared, warned) = prepare(disc);
+        let mut prepared = prepared.unwrap_or_else(|e| panic!("crc_len {crc_len}: {e:?}"));
+        assert!(warned, "crc_len {crc_len}");
+        assert_eq!(snapshot(&mut prepared), original, "crc_len {crc_len}");
+    }
+}
+
+// A Stop or a dead bus while planning still ends the copy.
+#[test]
+fn halt_and_transport_faults_during_the_rename_still_abort() {
+    fn transport(sector: u32) -> Error {
+        Error::DiscRead {
+            sector: u64::from(sector),
+            status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+            sense: None,
+        }
+    }
+    for deny_with in [transport as fn(u32) -> Error, |_| Error::Halted] {
+        let mut disc = fixture(true);
+        disc.denied.insert(MIRROR_TARGET);
+        disc.deny_with = deny_with;
+        let (prepared, warned) = prepare(disc);
+        let e = prepared.err().expect("fault must abort");
+        assert!(matches!(e, Error::Halted) || e.is_scsi_transport_failure());
+        assert!(!warned);
     }
 }

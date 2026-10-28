@@ -254,18 +254,32 @@ fn clear_whole_disc_names_generic_sources_are_unchanged() {
     }
 }
 
+fn aacs_names(reader: &mut dyn SectorSource) -> Vec<String> {
+    let fs = crate::udf::read_filesystem(reader).unwrap();
+    let mut names: Vec<_> = fs
+        .find_dir("/AACS")
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+// An unreadable anchor is still probed at unknown capacity; as in 1.8.4 it copies through.
 #[test]
-fn clear_whole_disc_names_unknown_capacity_does_not_hide_anchor_failure() {
+fn clear_whole_disc_names_unknown_capacity_probes_a_failing_anchor() {
     let fx = clear_fixture(false);
-    let source = ProbeSource::new(vec![0; 2048], 0);
-    assert!(matches!(
-        KeyRing::none().whole_disc_reader(&fx.disc, source, None),
-        Err(Error::DiscRead { sector: 256, .. })
-    ));
+    let mut source = ProbeSource::new(vec![0; 2048], 0);
+    KeyRing::none()
+        .whole_disc_reader(&fx.disc, &mut source as &mut dyn SectorSource, None)
+        .expect("a damaged anchor must not abort the copy");
+    assert_eq!(source.reads, [256]);
 }
 
 #[test]
-fn clear_whole_disc_names_metadata_io_and_halt_propagate() {
+fn clear_whole_disc_names_metadata_damage_copies_and_halt_propagates() {
     let fx = clear_fixture(false);
     let mut raw = fx.img.source();
     let fs = crate::udf::read_filesystem(&mut raw).unwrap();
@@ -283,38 +297,46 @@ fn clear_whole_disc_names_metadata_io_and_halt_propagate() {
         let mut source = ProbeSource::new(fx.img.image.clone(), fx.disc.capacity_sectors);
         source.fail = Some((lba, hit));
         source.halted = halted;
-        let error = KeyRing::none()
-            .whole_disc_reader(&fx.disc, source, None)
-            .err()
-            .expect("metadata failure must propagate");
-        match error {
-            Error::Halted if halted => {}
-            Error::DiscRead { sector, .. } if !halted => assert_eq!(sector, lba as u64),
-            other => panic!("unexpected metadata error: {other:?}"),
+        let got = KeyRing::none().whole_disc_reader(&fx.disc, source, None);
+        match got {
+            Err(Error::Halted) if halted => {}
+            Ok(_) if !halted => {}
+            Err(other) => panic!("unexpected metadata error: {other:?}"),
+            Ok(_) => panic!("a Stop must end the copy"),
         }
     }
 }
 
 #[test]
-fn clear_whole_disc_names_malformed_directory_propagates() {
+fn clear_whole_disc_names_malformed_directory_keeps_original_names() {
     let fx = clear_fixture(false);
     let mut raw = fx.img.source();
     let fs = crate::udf::read_filesystem(&mut raw).unwrap();
     let directory = fs.metadata_start() + fs.find_dir("/AACS").unwrap().meta_lba;
     let mut bytes = fx.img.image.clone();
     bytes[directory as usize * 2048..directory as usize * 2048 + 2].fill(0);
-    assert!(
-        matches!(KeyRing::none().whole_disc_reader(&fx.disc, MemSource::new(bytes), None), Err(Error::DiscRead { sector, .. }) if sector == directory as u64)
-    );
+    let mut reader = KeyRing::none()
+        .whole_disc_reader(&fx.disc, MemSource::new(bytes.clone()), None)
+        .expect("a malformed directory must not abort the copy");
+    let mut got = vec![0; bytes.len()];
+    for lba in 0..(bytes.len() / 2048) as u32 {
+        reader
+            .read_sectors(lba, 1, &mut got[lba as usize * 2048..][..2048], false)
+            .unwrap();
+    }
+    assert_eq!(got, bytes);
 }
 
 #[test]
-fn clear_whole_disc_names_collision_is_refused() {
+fn clear_whole_disc_names_collision_keeps_both_names() {
     let fx = clear_fixture(true);
-    assert!(matches!(
-        KeyRing::none().whole_disc_reader(&fx.disc, fx.img.source(), None),
-        Err(Error::DirNameCollision { .. })
-    ));
+    let mut reader = KeyRing::none()
+        .whole_disc_reader(&fx.disc, fx.img.source(), None)
+        .expect("a pre-existing target must not abort the copy");
+    assert_eq!(
+        aacs_names(&mut reader),
+        ["Unit_Key_RO.bak", "Unit_Key_RO.inf"]
+    );
 }
 
 #[test]
