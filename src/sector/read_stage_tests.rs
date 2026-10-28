@@ -770,6 +770,42 @@ fn key_stop_or_dead_source_on_recovery_read_aborts_even_with_skip_errors() {
     }
 }
 
+// The CSS key stops abort on the recovery read too, never zero-filled under skip_errors.
+#[test]
+fn css_key_stop_on_recovery_read_aborts_even_with_skip_errors() {
+    type MkErr = fn() -> crate::error::Error;
+    let cases: [(&str, MkErr); 2] = [
+        ("CssKeyMissing", || crate::error::Error::CssKeyMissing),
+        ("CssNoDiscKey", || crate::error::Error::CssNoDiscKey),
+    ];
+    for (name, rec_err) in cases {
+        let mut stream = LiveRead::new(
+            Box::new(RecoveryErrReader {
+                bad_sector: 4,
+                rec_err,
+            }),
+            synthetic_title(10),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+            false,
+            &crate::ctx::Ctx::default(),
+        )
+        .unwrap();
+        stream.skip_errors = true;
+        let mut res = Ok(true);
+        for _ in 0..1000 {
+            res = stream.fill_extents();
+            if !matches!(res, Ok(true)) {
+                break;
+            }
+        }
+        assert!(res.is_err(), "{name} must abort, got {res:?}");
+        assert_eq!(stream.errors, 0, "{name}: must not count as a skip");
+        assert_eq!(stream.lost_bytes, 0, "{name}: must not zero-fill");
+    }
+}
+
 // Regression: a USB-bridge transport crash (0xFF) during a single-pass
 // disc://->mkv:// rip must ABORT immediately, even under skip_errors=true
 // — mirrors the multipass sweep's short-circuit; exactly one read issued.
