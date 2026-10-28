@@ -153,9 +153,14 @@ impl UdfFs {
                 if flags & 0x0c == 0 && parse_udf_name(old).eq_ignore_ascii_case(rule.from) {
                     found += 1;
                     let crc_len = u16::from_le_bytes([data[pos + 10], data[pos + 11]]) as usize;
-                    let covered_len = 16usize
-                        .checked_add(crc_len)
-                        .ok_or_else(|| bad_sector(icb_lba))?;
+                    // CRC length 0: no CRC to recompute; only the name bytes change.
+                    let covered_len = if crc_len == 0 {
+                        desc_len
+                    } else {
+                        16usize
+                            .checked_add(crc_len)
+                            .ok_or_else(|| bad_sector(icb_lba))?
+                    };
                     let aligned_len = (desc_len + 3) & !3;
                     if covered_len < desc_len
                         || covered_len > aligned_len
@@ -166,15 +171,17 @@ impl UdfFs {
                     let mut fid = data[pos..pos + covered_len].to_vec();
                     let replacement = encoded_like(old, rule.to, icb_lba)?;
                     fid[name_at..name_at + name_len].copy_from_slice(&replacement);
-                    let crc = descriptor_crc16(&fid[16..16 + crc_len]);
-                    fid[8..10].copy_from_slice(&crc.to_le_bytes());
-                    fid[4] = fid
-                        .iter()
-                        .take(16)
-                        .enumerate()
-                        .filter(|(i, _)| *i != 4)
-                        .map(|(_, byte)| *byte as u32)
-                        .sum::<u32>() as u8;
+                    if crc_len != 0 {
+                        let crc = descriptor_crc16(&fid[16..16 + crc_len]);
+                        fid[8..10].copy_from_slice(&crc.to_le_bytes());
+                        fid[4] = fid
+                            .iter()
+                            .take(16)
+                            .enumerate()
+                            .filter(|(i, _)| *i != 4)
+                            .map(|(_, byte)| *byte as u32)
+                            .sum::<u32>() as u8;
+                    }
                     for (i, (&before, &after)) in
                         data[pos..pos + covered_len].iter().zip(&fid).enumerate()
                     {

@@ -416,17 +416,31 @@ fn damaged_or_mismatched_mirror_copies_without_the_rename() {
 // An /AACS FID whose CRC length is out of range skips the rename instead of failing.
 #[test]
 fn unexpected_aacs_fid_copies_without_the_rename() {
-    for crc_len in [0u16, u16::MAX] {
-        let mut disc = fixture(false);
-        let mut dir = sector(&mut disc, MAIN_TARGET);
-        dir[50..52].copy_from_slice(&crc_len.to_le_bytes());
-        disc.inner.put_bytes(MAIN_TARGET, &dir);
-        let original = snapshot(&mut disc);
-        let (prepared, warned) = prepare(disc);
-        let mut prepared = prepared.unwrap_or_else(|e| panic!("crc_len {crc_len}: {e:?}"));
-        assert!(warned, "crc_len {crc_len}");
-        assert_eq!(snapshot(&mut prepared), original, "crc_len {crc_len}");
-    }
+    let mut disc = fixture(false);
+    let mut dir = sector(&mut disc, MAIN_TARGET);
+    dir[50..52].copy_from_slice(&u16::MAX.to_le_bytes());
+    disc.inner.put_bytes(MAIN_TARGET, &dir);
+    let original = snapshot(&mut disc);
+    let (prepared, warned) = prepare(disc);
+    let mut prepared = prepared.unwrap();
+    assert!(warned);
+    assert_eq!(snapshot(&mut prepared), original);
+}
+
+// CRC length 0 means no CRC to recompute: the rename proceeds, CRC bytes stay as they were.
+#[test]
+fn aacs_fid_with_no_crc_is_renamed_and_its_crc_bytes_kept() {
+    let mut disc = fixture(false);
+    let mut dir = sector(&mut disc, MAIN_TARGET);
+    dir[50..52].copy_from_slice(&0u16.to_le_bytes());
+    disc.inner.put_bytes(MAIN_TARGET, &dir);
+    let (prepared, warned) = prepare(disc);
+    let mut prepared = prepared.unwrap();
+    assert!(!warned);
+    let after = sector(&mut prepared, MAIN_TARGET);
+    assert_eq!(&after[40 + 51..40 + 54], b"bak");
+    assert_eq!(&after[40 + 8..40 + 12], &dir[40 + 8..40 + 12]);
+    assert_eq!(&after[..40 + 51], &dir[..40 + 51]);
 }
 
 // A Stop or a dead bus while planning still ends the copy.
