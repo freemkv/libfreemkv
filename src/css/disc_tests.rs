@@ -240,3 +240,27 @@ fn prepared_whole_disc_fallback_recovery_survives_sectors() {
 fn prepared_whole_disc_fallback_recovery_survives_reads() {
     prepared_reader(false, false);
 }
+
+// Runs must equal first-match ownership sector by sector, for overlapping and adjacent spans.
+#[test]
+fn owner_runs_match_first_match_ownership() {
+    let css = disc_keys(&[
+        &[(10, 5), (30, 3)],
+        &[(12, 10), (40, 2)],
+        &[(22, 4), (26, 4), (33, 1)],
+        &[(5, 30), (60, 1)],
+    ]);
+    for lba in 0..70u32 {
+        for len in 1..40usize {
+            let mut expect = Vec::new();
+            for i in 0..len {
+                let o = css.group_at(u64::from(lba) + i as u64);
+                match expect.last_mut() {
+                    Some((_, e, last)) if *last == o => *e = i + 1,
+                    _ => expect.push((i, i + 1, o)),
+                }
+            }
+            assert_eq!(css.runs(lba, len), expect, "lba {lba} len {len}");
+        }
+    }
+}

@@ -120,28 +120,65 @@ impl DiscKeys {
         })
     }
 
+    // Owner of `at` and the first later LBA where it could change: the end of the
+    // owner's covering span, or the start of any span a first-match owner would beat.
+    fn owner_until(&self, at: u64) -> (Option<usize>, u64) {
+        let owner = self.group_at(at);
+        let mut limit = u64::MAX;
+        for (i, g) in self.groups.iter().enumerate() {
+            if owner.is_some_and(|o| i > o) {
+                break;
+            }
+            for e in &g.spans {
+                let (s, n) = (u64::from(e.start_lba), u64::from(e.sector_count));
+                if s > at {
+                    limit = limit.min(s);
+                } else if owner == Some(i) && at < s + n {
+                    limit = limit.min(s + n);
+                }
+            }
+        }
+        (owner, limit)
+    }
+
+    // Maximal runs `(start, end, owner)` of consecutive sectors with one owner.
+    fn runs(&self, lba: u32, sectors: usize) -> Vec<(usize, usize, Option<usize>)> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < sectors {
+            let (owner, mut limit) = self.owner_until(u64::from(lba) + start as u64);
+            let mut end;
+            loop {
+                end = (limit - u64::from(lba)).min(sectors as u64) as usize;
+                if end >= sectors {
+                    break;
+                }
+                let (o, l) = self.owner_until(u64::from(lba) + end as u64);
+                if o != owner {
+                    break;
+                }
+                limit = l;
+            }
+            out.push((start, end, owner));
+            start = end;
+        }
+        out
+    }
+
     pub(crate) fn decrypt(
         &mut self,
         lba: u32,
         buf: &mut [u8],
         fallback: &mut DecryptKeys,
     ) -> Result<()> {
-        let sectors = buf.len() / 2048;
-        let mut start = 0;
-        while start < sectors {
-            let owner = self.group_at(u64::from(lba) + start as u64);
-            let mut end = start + 1;
-            // Clear sectors belong to the same run: the CSS seam self-gates and
-            // keeps its bounded retry cadence until the owner changes.
-            while end < sectors && self.group_at(u64::from(lba) + end as u64) == owner {
-                end += 1;
-            }
+        // Clear sectors belong to the same run: the CSS seam self-gates and
+        // keeps its bounded retry cadence until the owner changes.
+        for (start, end, owner) in self.runs(lba, buf.len() / 2048) {
             let keys = match owner {
                 Some(index) => &mut self.groups[index].keys,
                 None => &mut *fallback,
             };
             crate::decrypt::decrypt_sectors(&mut buf[start * 2048..end * 2048], keys, 0)?;
-            start = end;
         }
         Ok(())
     }
