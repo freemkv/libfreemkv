@@ -350,7 +350,7 @@ fn recovery_stop_interrupts_pending_wait_without_dispatch_or_consuming_late_fd()
         let (s, pending, token, dispatches) = (&s, &pending, &h, &dispatches);
         let waiter = scope.spawn(move || {
             started_tx.send(()).unwrap();
-            let r = await_recovered_fd(s, pending, Duration::from_millis(300), Some(token));
+            let r = await_recovered_fd(s, pending, Duration::from_secs(5), Some(token));
             if matches!(r, Ok(Some(_))) {
                 dispatches.fetch_add(1, Ordering::AcqRel);
             }
@@ -362,8 +362,9 @@ fn recovery_stop_interrupts_pending_wait_without_dispatch_or_consuming_late_fd()
         h.cancel();
         let r = waiter.join().unwrap();
         assert!(matches!(r, Err(crate::Error::Halted)), "{r:?}");
+        // Loose for a loaded runner, far below the 5 s wait an ignored cancel would run.
         assert!(
-            cancelled.elapsed() < WAIT_SLICE * 3,
+            cancelled.elapsed() < Duration::from_secs(1),
             "cancel took {:?}",
             cancelled.elapsed()
         );
