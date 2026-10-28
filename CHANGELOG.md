@@ -1,10 +1,13 @@
 # Changelog
 
-## [Unreleased] — 2026-10-25
+## [1.8.6] — UNRELEASED
 
 ### Fixed
 
 - CLI, GUI and server: folder backups preserve navigation and protection metadata. ISO, folder and title reads share decryption, unit alignment and read recovery; clear MPLS, CLPI and menu assets no longer become false damaged data.
+- Decrypted ISO and folder backups rename `/AACS/Unit_Key_RO.inf` to `Unit_Key_RO.bak`. When the disc's UDF metadata or its mirror is damaged or unexpected, the backup is still written with its original names and a warning, as in 1.8.4, instead of failing; a Stop or a dead bus still ends it.
+- Malformed DVD navigation command tables and CSS extent collection are bounded; recovered CSS keys survive across whole-disc reads.
+- Linux: Stop is observed while waiting for transport recovery. Windows: failed SCSI transfers record the adapter and error.
 
 ## [1.8.5] — 2026-10-19
 
