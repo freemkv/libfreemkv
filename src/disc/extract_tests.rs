@@ -2760,3 +2760,105 @@ fn duplicate_identical_names_collide() {
         .expect_err("duplicate names must collide");
     assert!(matches!(err, Error::DirNameCollision { .. }));
 }
+
+// ── Decrypted names on the host ───────────────────────────────────────
+
+const NAMES_KEY: [u8; 16] = *b"\x3Cextract names!!";
+
+// Fails every read of `deny`, a media fault the rename planner can see.
+struct Deny {
+    inner: crate::test_util::MemSource,
+    deny: u32,
+}
+
+impl SectorSource for Deny {
+    fn capacity_sectors(&self) -> u32 {
+        self.inner.capacity_sectors()
+    }
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+        if (lba..lba + count as u32).contains(&self.deny) {
+            return Err(Error::DiscRead {
+                sector: self.deny as u64,
+                status: None,
+                sense: None,
+            });
+        }
+        self.inner.read_sectors(lba, count, buf, r)
+    }
+}
+
+// An AACS disc with a duplicated metadata mirror whose `/AACS` mirror sector is unreadable.
+fn names_extract(collision: bool, ctx: &crate::ctx::Ctx) -> (TmpDir, ExtractResult) {
+    use crate::test_util::BdFile;
+    let mut files = vec![BdFile::new("BDMV/STREAM/00001.m2ts", 3, Some(NAMES_KEY))];
+    if collision {
+        files.push(BdFile::new("AACS/Unit_Key_RO.bak", 1, None));
+    }
+    let (img, layout) = crate::test_util::mirrored_aacs_image(&files, b"UK-RO");
+    let mut d = aacs_disc();
+    d.capacity_sectors = (img.image.len() / SECTOR_BYTES) as u32;
+    let (s, n) = img.files[0];
+    let set = crate::keys::KeyRing::keyed_for_test(&d, NAMES_KEY, &[(s, s + n)]);
+    let mut src = Deny {
+        inner: img.source(),
+        deny: layout.mirror_of(layout.aacs_dir),
+    };
+    let out = TmpDir::new("names");
+    let opts = ExtractOptions {
+        keys: Some(&set),
+        ..Default::default()
+    };
+    let res = d.extract_tree(&mut src, out.path(), &opts, ctx).unwrap();
+    (out, res)
+}
+
+// The read view can't rebuild the mirror, so the host file is renamed after extraction.
+#[test]
+fn a_folder_whose_mirror_needs_rebuilding_is_renamed_on_the_host() {
+    let (out, res) = names_extract(false, &crate::ctx::Ctx::default());
+    assert!(res.complete);
+    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), None);
+    assert_eq!(
+        read_out(out.path(), "AACS/Unit_Key_RO.bak"),
+        Some(b"UK-RO".to_vec())
+    );
+    assert_eq!(
+        res.names,
+        Some(crate::whole_disc::DecryptedNames::Renamed {
+            mirror_sectors_restored: 0
+        })
+    );
+}
+
+#[test]
+fn a_folder_with_both_names_keeps_them_as_a_collision() {
+    let (out, res) = names_extract(true, &crate::ctx::Ctx::default());
+    assert!(read_out(out.path(), "AACS/Unit_Key_RO.inf").is_some());
+    assert!(read_out(out.path(), "AACS/Unit_Key_RO.bak").is_some());
+    assert_eq!(
+        res.names,
+        Some(crate::whole_disc::DecryptedNames::Kept {
+            cause: crate::whole_disc::NamesKept::Collision
+        })
+    );
+}
+
+// A stopped tree is never touched.
+#[test]
+fn a_halted_folder_is_not_renamed() {
+    let halt = crate::halt::Halt::new();
+    let stop = halt.clone();
+    let ctx = crate::ctx::Ctx::new(halt).with_events(std::sync::Arc::new(
+        move |e: &crate::event::Event<'_>| {
+            if let crate::event::Event::Pass(p) = e
+                && p.work_done == p.work_total
+            {
+                stop.cancel();
+            }
+        },
+    ));
+    let (out, res) = names_extract(false, &ctx);
+    assert!(res.halted);
+    assert_eq!(res.names, None);
+    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.bak"), None);
+}

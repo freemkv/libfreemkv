@@ -19,6 +19,21 @@ pub(crate) struct SectorBytePatch {
     pub value: u8,
 }
 
+/// A rename's byte patches, plus mirror sectors rebuilt whole from main.
+#[derive(Debug, Default)]
+pub(crate) struct NamePlan {
+    pub patches: Vec<SectorBytePatch>,
+    /// `(mirror lba, main's bytes)` for an unreadable, short or blank mirror sector;
+    /// `patches` apply on top.
+    pub fills: Vec<(u32, Box<[u8; SECTOR_BYTES]>)>,
+}
+
+impl NamePlan {
+    pub fn is_empty(&self) -> bool {
+        self.patches.is_empty() && self.fills.is_empty()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Span {
     logical: usize,
@@ -93,11 +108,11 @@ fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize, u32)> 
 impl UdfFs {
     /// Patch FID names and descriptor checksums; payload bytes and allocation never move.
     /// The same prepared reader feeds both ISO writing and folder extraction.
-    pub(crate) fn name_patches(
+    pub(crate) fn name_plan(
         &self,
         reader: &mut dyn SectorSource,
         rules: &[NameRule],
-    ) -> Result<Vec<SectorBytePatch>> {
+    ) -> Result<NamePlan> {
         let mut all = Vec::new();
         let mut inline_owners: Vec<InlineOwner> = Vec::new();
         for &rule in rules {
@@ -254,12 +269,25 @@ impl UdfFs {
         self.project_metadata_patches(reader, all)
     }
 
+    // The byte-patch view of `name_plan`; a plan needing fills panics.
+    #[cfg(test)]
+    pub(crate) fn name_patches(
+        &self,
+        reader: &mut dyn SectorSource,
+        rules: &[NameRule],
+    ) -> Result<Vec<SectorBytePatch>> {
+        let plan = self.name_plan(reader, rules)?;
+        assert!(plan.fills.is_empty(), "plan needs mirror fills");
+        Ok(plan.patches)
+    }
+
     fn project_metadata_patches(
         &self,
         reader: &mut dyn SectorSource,
         patches: Vec<MetadataBytePatch>,
-    ) -> Result<Vec<SectorBytePatch>> {
+    ) -> Result<NamePlan> {
         let mut all: Vec<_> = patches.iter().map(|p| p.patch).collect();
+        let mut fills = Vec::new();
         if !patches.is_empty()
             && let Some(mirror) = self.meta_mirror.filter(|mirror| mirror.duplicated)
         {
@@ -283,8 +311,16 @@ impl UdfFs {
                     let mut main = [0u8; SECTOR_BYTES];
                     let mut copy = [0u8; SECTOR_BYTES];
                     read_complete_sector(reader, main_lba, &mut main)?;
-                    read_complete_sector(reader, mirror_lba, &mut copy)?;
-                    if main != copy {
+                    // A lost or blanked mirror sector is rebuilt from main; two readable
+                    // copies that disagree are not repaired.
+                    let lost = match read_complete_sector(reader, mirror_lba, &mut copy) {
+                        Err(e) if crate::whole_disc::fatal(&e) => return Err(e),
+                        Err(_) => true,
+                        Ok(()) => copy.iter().all(|&b| b == 0) && main.iter().any(|&b| b != 0),
+                    };
+                    if lost {
+                        fills.push((mirror_lba, Box::new(main)));
+                    } else if main != copy {
                         return Err(bad_sector(mirror_lba));
                     }
                     previous = Some(p.meta_lba);
@@ -305,7 +341,10 @@ impl UdfFs {
             }
         }
         all.dedup();
-        Ok(all)
+        Ok(NamePlan {
+            patches: all,
+            fills,
+        })
     }
 
     fn directory_bytes(

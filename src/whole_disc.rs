@@ -20,11 +20,21 @@ pub type PreparedReader<S> = UnitAligned<DecryptingSectorSource<S>>;
 /// Compatibility name for the prepared reader used by image copies.
 pub type WholeDiscReader<S> = PreparedReader<S>;
 
-const DECRYPTED_NAME_RULES: &[crate::udf::NameRule] = &[crate::udf::NameRule {
+mod image_names;
+pub use image_names::{
+    DecryptedNames, ImageNames, Masked, NamesKept, check_image_names, plan_image_names,
+};
+
+pub(crate) const DECRYPTED_NAME_RULES: &[crate::udf::NameRule] = &[crate::udf::NameRule {
     dir: "/AACS",
     from: "Unit_Key_RO.inf",
     to: "Unit_Key_RO.bak",
 }];
+
+// A Stop, a dead bus or a gone source ends the copy; it is not damaged metadata.
+pub(crate) fn fatal(e: &Error) -> bool {
+    matches!(e, Error::Halted) || e.is_scsi_transport_failure() || e.is_source_terminated()
+}
 
 pub(crate) fn prepare_decrypted_names<S: SectorSource>(
     mut reader: PreparedReader<S>,
@@ -35,18 +45,11 @@ pub(crate) fn prepare_decrypted_names<S: SectorSource>(
     if !require_udf && matches!(reader.capacity_sectors(), 1..=256) {
         return Ok(reader);
     }
-    let patches = match crate::udf::read_name_patches(&mut reader, DECRYPTED_NAME_RULES) {
-        Ok(Some(patches)) => patches,
+    let plan = match crate::udf::read_name_patches(&mut reader, DECRYPTED_NAME_RULES) {
+        Ok(Some(plan)) => plan,
         Ok(None) if !require_udf => return Ok(reader),
         Ok(None) => return Err(Error::UdfNotFilesystem),
-        // A Stop, a dead bus or a gone source ends the copy; it is not damaged metadata.
-        Err(e)
-            if matches!(e, Error::Halted)
-                || e.is_scsi_transport_failure()
-                || e.is_source_terminated() =>
-        {
-            return Err(e);
-        }
+        Err(e) if fatal(&e) => return Err(e),
         // Damaged or unexpected metadata: copy without the rename, as 1.8.4 did.
         Err(e) => {
             tracing::warn!(
@@ -57,7 +60,16 @@ pub(crate) fn prepare_decrypted_names<S: SectorSource>(
             return Ok(reader);
         }
     };
-    Ok(reader.with_name_patches(patches))
+    // Mirror fills are whole-sector writes; a read view only patches bytes.
+    if !plan.fills.is_empty() {
+        tracing::warn!(
+            target: "freemkv::udf",
+            sector = plan.fills[0].0,
+            "decrypted-name rename skipped; the metadata mirror needs rebuilding"
+        );
+        return Ok(reader);
+    }
+    Ok(reader.with_name_patches(plan.patches))
 }
 
 // Compose a selected clear/CSS sector input using the same prepared-reader contract.
@@ -314,6 +326,9 @@ impl<S: SectorSource> UnitAligned<crate::sector::DecryptingSectorSource<S>> {
     }
     pub(crate) fn observe(&mut self, ctx: &crate::ctx::Ctx) {
         self.inner.observe(ctx);
+    }
+    pub(crate) fn decrypts_aacs(&self) -> bool {
+        self.inner.decrypts_aacs()
     }
     pub(crate) fn blanked_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.inner.blanked_counter()

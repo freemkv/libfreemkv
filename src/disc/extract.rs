@@ -72,6 +72,9 @@ pub struct ExtractResult {
     pub complete: bool,
     /// True when the run stopped early on an interrupt / progress halt.
     pub halted: bool,
+    /// What the copy did with `AACS/Unit_Key_RO.inf`; `None` for a halted run or a disc
+    /// without one.
+    pub names: Option<crate::whole_disc::DecryptedNames>,
 }
 
 impl ExtractResult {
@@ -229,6 +232,17 @@ impl Disc {
             }
         }
 
+        // Only a decrypted AACS copy renames. `/AACS` sits at the root, so its host path
+        // is its own (unchanged) name.
+        if !result.halted
+            && self.aacs.is_some()
+            && reader.decrypts_aacs()
+            && let Some(rel) = dirs
+                .iter()
+                .find(|d| d.as_os_str().eq_ignore_ascii_case("AACS"))
+        {
+            result.names = host_names(&fs, &sink.dest().join(rel));
+        }
         result.complete = !result.halted
             && result.bytes_unreadable == 0
             && result.files.iter().all(|f| f.complete);
@@ -301,13 +315,7 @@ fn plan_tree(
                     unmapped: false,
                 }),
                 // A Stop, a dead bus or a gone source ends the run; it is not a damaged entry.
-                Err(e)
-                    if matches!(e, Error::Halted)
-                        || e.is_scsi_transport_failure()
-                        || e.is_source_terminated() =>
-                {
-                    return Err(e);
-                }
+                Err(e) if crate::whole_disc::fatal(&e) => return Err(e),
                 // A damaged File Entry loses that one file, not the tree around it.
                 Err(e) => {
                     tracing::warn!(
@@ -329,6 +337,45 @@ fn plan_tree(
         }
     }
     Ok(())
+}
+
+// The decrypted names in the extracted `/AACS` at `host`. A read view that could not
+// rename (its mirror needs rebuilding) left `.inf`: rename it here unless the disc has `.bak`.
+fn host_names(fs: &UdfFs, host: &Path) -> Option<crate::whole_disc::DecryptedNames> {
+    use crate::whole_disc::{DecryptedNames, NamesKept};
+    let rule = crate::whole_disc::DECRYPTED_NAME_RULES[0];
+    let disc_has_bak = fs
+        .find_dir(rule.dir)?
+        .entries
+        .iter()
+        .any(|e| e.name.eq_ignore_ascii_case(rule.to));
+    let listed = |name: &str| {
+        std::fs::read_dir(host).ok()?.flatten().find_map(|e| {
+            let n = e.file_name();
+            n.to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                .then_some(n)
+        })
+    };
+    if let Some(inf) = listed(rule.from)
+        && !disc_has_bak
+        && listed(rule.to).is_none()
+        && let Err(e) = std::fs::rename(host.join(inf), host.join(rule.to))
+    {
+        tracing::warn!(target: "freemkv::extract", error = %e, "Unit_Key_RO.inf rename failed");
+    }
+    match (listed(rule.from).is_some(), listed(rule.to).is_some()) {
+        (true, _) if disc_has_bak => Some(DecryptedNames::Kept {
+            cause: NamesKept::Collision,
+        }),
+        (true, _) => Some(DecryptedNames::Kept {
+            cause: NamesKept::Unexpected,
+        }),
+        (false, true) => Some(DecryptedNames::Renamed {
+            mirror_sectors_restored: 0,
+        }),
+        (false, false) => None,
+    }
 }
 
 // Accounts a file with no locatable data (an unreadable File Entry, or a bus-encrypted stream

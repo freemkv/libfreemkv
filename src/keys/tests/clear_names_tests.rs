@@ -349,3 +349,21 @@ fn clear_whole_disc_names_aacs_preparation_stays_strict() {
         Err(Error::UdfNotFilesystem)
     ));
 }
+
+// An ISO copy reads the disc's own names; it renames once after the copy.
+#[test]
+fn whole_disc_reader_keeping_names_reads_the_original_names() {
+    let fx = clear_fixture(false);
+    let mut reader = KeyRing::none()
+        .whole_disc_reader_keeping_names(&fx.disc, fx.img.source(), None)
+        .unwrap();
+    let fs = crate::udf::read_filesystem(&mut reader).unwrap();
+    let names: Vec<_> = fs
+        .find_dir("/AACS")
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["Unit_Key_RO.inf"]);
+}

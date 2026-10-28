@@ -195,6 +195,11 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         self
     }
 
+    /// Whether AACS units decrypt through a key ring's map (not a raw or clear reader).
+    pub(crate) fn decrypts_aacs(&self) -> bool {
+        self.key_map.is_some()
+    }
+
     /// Report each blanked unit to `ctx` too: an `UnitBlanked` event and its loss counter.
     pub(crate) fn observe(&mut self, ctx: &crate::ctx::Ctx) {
         self.ctx = Some(ctx.clone());

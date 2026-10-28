@@ -12,7 +12,7 @@ use crate::sector::SectorSource;
 use std::collections::HashSet;
 
 mod rename;
-pub(crate) use rename::{NameRule, SectorBytePatch};
+pub(crate) use rename::{NamePlan, NameRule, SectorBytePatch};
 
 /// ECMA-167 descriptor CRC, shared by UDF authoring and same-length name edits.
 pub(crate) fn descriptor_crc16(data: &[u8]) -> u16 {
@@ -979,16 +979,19 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
 pub(crate) fn read_name_patches(
     reader: &mut dyn SectorSource,
     rules: &[NameRule],
-) -> Result<Option<Vec<SectorBytePatch>>> {
+) -> Result<Option<NamePlan>> {
     let fs = match read_filesystem_inner(reader, false) {
         Ok(fs) => fs,
         Err(Error::UdfNotFilesystem) => return Ok(None),
         Err(e) => return Err(e),
     };
-    fs.name_patches(reader, rules).map(Some)
+    fs.name_plan(reader, rules).map(Some)
 }
 
-fn read_filesystem_inner(reader: &mut dyn SectorSource, read_leaf_sizes: bool) -> Result<UdfFs> {
+pub(crate) fn read_filesystem_inner(
+    reader: &mut dyn SectorSource,
+    read_leaf_sizes: bool,
+) -> Result<UdfFs> {
     // Step 1: Anchor Volume Descriptor Pointer at sector 256
     // ECMA-167 §10.2 — always at sector 256
     let mut avdp = [0u8; SECTOR_BYTES];

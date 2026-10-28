@@ -232,7 +232,7 @@ fn shared_mirror_data_does_not_open_or_patch_its_file_entry() {
 
 #[test]
 fn duplicate_mirror_failures_never_return_a_main_only_plan() {
-    for fault in 0..12 {
+    for fault in [0, 1, 2, 4, 5, 6, 7, 8, 10, 11] {
         let mut disc = fixture(true);
         match fault {
             0 => {
@@ -246,9 +246,6 @@ fn duplicate_mirror_failures_never_return_a_main_only_plan() {
             2 => {
                 disc.inner
                     .put_bytes(MIRROR_FE, &fixture::build_file_icb(32 * 2048, 3000, false));
-            }
-            3 => {
-                disc.denied.insert(MIRROR_TARGET);
             }
             4 => {
                 let mut bytes = sector(&mut disc, MIRROR_TARGET);
@@ -273,9 +270,6 @@ fn duplicate_mirror_failures_never_return_a_main_only_plan() {
             }
             8 => {
                 disc.short.insert(MIRROR_FE);
-            }
-            9 => {
-                disc.short.insert(MIRROR_TARGET);
             }
             10 => {
                 let mut fe = sector(&mut disc, MIRROR_FE);
@@ -315,6 +309,71 @@ fn duplicate_mirror_failures_never_return_a_main_only_plan() {
             original
         );
     }
+}
+
+// The plan's final bytes for `lba`: its fill (or the source sector), then its patches.
+fn planned(plan: &NamePlan, disc: &mut Disc, lba: u32) -> [u8; SECTOR_BYTES] {
+    let mut bytes = match plan.fills.iter().find(|(at, _)| *at == lba) {
+        Some((_, fill)) => **fill,
+        None => sector(&mut disc.inner, lba),
+    };
+    for p in plan.patches.iter().filter(|p| p.lba == lba) {
+        bytes[p.offset] = p.value;
+    }
+    bytes
+}
+
+fn assert_mirror_filled(mut disc: Disc) {
+    let main = sector(&mut disc.inner, MAIN_TARGET);
+    let fs = crate::udf::read_filesystem(&mut disc).unwrap();
+    let plan = fs.name_plan(&mut disc, RULES).unwrap();
+    assert_eq!(plan.fills.len(), 1);
+    assert_eq!(plan.fills[0].0, MIRROR_TARGET);
+    assert_eq!(*plan.fills[0].1, main);
+    for lba in [MAIN_TARGET, MIRROR_TARGET] {
+        assert!(
+            plan.patches.iter().any(|p| p.lba == lba),
+            "patches at {lba}"
+        );
+    }
+    let renamed = planned(&plan, &mut disc, MAIN_TARGET);
+    assert_eq!(&renamed[79..94], b"Unit_Key_RO.bak");
+    check_tag(&renamed, 40, 32);
+    assert_eq!(planned(&plan, &mut disc, MIRROR_TARGET), renamed);
+}
+
+#[test]
+fn unreadable_mirror_sector_is_planned_from_main_and_filled() {
+    let mut disc = fixture(true);
+    disc.denied.insert(MIRROR_TARGET);
+    assert_mirror_filled(disc);
+}
+
+#[test]
+fn short_mirror_sector_is_filled() {
+    let mut disc = fixture(true);
+    disc.short.insert(MIRROR_TARGET);
+    assert_mirror_filled(disc);
+}
+
+// An all-zero mirror sector is what an earlier copy blanked, not a second opinion.
+#[test]
+fn blank_mirror_sector_is_filled() {
+    let mut disc = fixture(true);
+    disc.inner.put_bytes(MIRROR_TARGET, &[0; SECTOR_BYTES]);
+    assert_mirror_filled(disc);
+}
+
+// Main is never rebuilt from the mirror: an unreadable main sector refuses the plan.
+#[test]
+fn unreadable_main_directory_refuses() {
+    let mut disc = fixture(true);
+    let fs = crate::udf::read_filesystem(&mut disc).unwrap();
+    disc.denied.insert(MAIN_TARGET);
+    assert!(matches!(
+        fs.name_plan(&mut disc, RULES),
+        Err(Error::DiscRead { .. })
+    ));
 }
 
 #[test]

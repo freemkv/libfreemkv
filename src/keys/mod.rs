@@ -789,6 +789,18 @@ impl KeyRing {
         inner: S,
         halt: Option<&Halt>,
     ) -> Result<WholeDiscReader<S>> {
+        let reader = self.whole_disc_reader_keeping_names(disc, inner, halt)?;
+        crate::whole_disc::prepare_decrypted_names(reader, self.0.aacs)
+    }
+
+    /// [`whole_disc_reader`](Self::whole_disc_reader) without the decrypted-name rename, for
+    /// an ISO renamed once after its copy ([`plan_image_names`](crate::whole_disc::plan_image_names)).
+    pub fn whole_disc_reader_keeping_names<S: SectorSource>(
+        &self,
+        disc: &Disc,
+        inner: S,
+        halt: Option<&Halt>,
+    ) -> Result<WholeDiscReader<S>> {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
@@ -796,7 +808,7 @@ impl KeyRing {
             return Err(Self::caller_bug("key set is not for this disc"));
         }
         let content = disc.encrypted_content_ranges();
-        let reader = if !self.0.aacs {
+        Ok(if !self.0.aacs {
             if !inner.random_access() {
                 return Err(Self::caller_bug("decrypting reader over a prefetcher"));
             }
@@ -820,8 +832,7 @@ impl KeyRing {
                 return Err(Error::UdfNotFound { path: path.into() });
             }
             self.decrypting(inner, None, StopKind::Image, false)?
-        };
-        crate::whole_disc::prepare_decrypted_names(reader, self.0.aacs)
+        })
     }
 }
 

@@ -440,6 +440,10 @@ pub use golden::{BLESS_ENV, Golden};
 mod media;
 pub use media::{CLIP_AUDIO_PIDS, CLIP_VIDEO_PID, synthetic_bd_clip};
 
+#[path = "test_util_mirror.rs"]
+mod mirror;
+pub use mirror::{MetadataMirrorLayout, add_metadata_mirror, mirrored_aacs_image};
+
 #[path = "test_util_fake.rs"]
 mod fake;
 pub use fake::{FakeCdb, FakeHandle, FakeMode, FakeTransport};

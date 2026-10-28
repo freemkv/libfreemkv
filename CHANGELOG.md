@@ -2,7 +2,13 @@
 
 ## [1.8.6] — UNRELEASED
 
+### Added
+
+- `whole_disc::plan_image_names` and `check_image_names`, so an ISO copy can rename `Unit_Key_RO.inf` once after it finishes instead of in each rescue pass: the plan returns the final bytes of every touched sector, reading the mapfile's unfinished ranges as unreadable through `whole_disc::Masked`. `KeyRing::whole_disc_reader_keeping_names` is the whole-disc reader without the rename. `DecryptedNames` (`Renamed { mirror_sectors_restored }`, `Kept { cause }`) and `NamesKept` (`Damaged`, `Collision`, `Unexpected`; `from_plan_error`), both `#[non_exhaustive]`, report the outcome, also as `ExtractResult::names` for a decrypted AACS folder.
+
 ### Fixed
+
+- An unreadable, short or blanked UDF metadata mirror sector no longer stops the decrypted-name rename: an ISO plan rebuilds it whole from the main copy, and a folder copy renames `AACS/Unit_Key_RO.inf` on the host after extraction. Two readable copies that differ still keep the original names.
 
 - CLI, GUI and server: folder backups preserve navigation and protection metadata. ISO, folder and title reads share decryption, unit alignment and read recovery; clear MPLS, CLPI and menu assets no longer become false damaged data.
 - Decrypted ISO and folder backups rename `/AACS/Unit_Key_RO.inf` to `Unit_Key_RO.bak`. When the disc's UDF metadata or its mirror is damaged or unexpected, the backup is still written with its original names and a warning, as in 1.8.4, instead of failing; a Stop or a dead bus still ends it.
