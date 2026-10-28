@@ -2789,6 +2789,17 @@ impl SectorSource for Deny {
 
 // An AACS disc with a duplicated metadata mirror whose `/AACS` mirror sector is unreadable.
 fn names_extract(collision: bool, ctx: &crate::ctx::Ctx) -> (TmpDir, ExtractResult) {
+    let out = TmpDir::new("names");
+    let res = names_extract_into(collision, ctx, out.path(), false);
+    (out, res)
+}
+
+fn names_extract_into(
+    collision: bool,
+    ctx: &crate::ctx::Ctx,
+    out: &Path,
+    force: bool,
+) -> ExtractResult {
     use crate::test_util::BdFile;
     let mut files = vec![BdFile::new("BDMV/STREAM/00001.m2ts", 3, Some(NAMES_KEY))];
     if collision {
@@ -2803,13 +2814,11 @@ fn names_extract(collision: bool, ctx: &crate::ctx::Ctx) -> (TmpDir, ExtractResu
         inner: img.source(),
         deny: layout.mirror_of(layout.aacs_dir),
     };
-    let out = TmpDir::new("names");
     let opts = ExtractOptions {
         keys: Some(&set),
-        ..Default::default()
+        force,
     };
-    let res = d.extract_tree(&mut src, out.path(), &opts, ctx).unwrap();
-    (out, res)
+    d.extract_tree(&mut src, out, &opts, ctx).unwrap()
 }
 
 // The read view can't rebuild the mirror, so the host file is renamed after extraction.
@@ -2861,4 +2870,44 @@ fn a_halted_folder_is_not_renamed() {
     assert!(res.halted);
     assert_eq!(res.names, None);
     assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.bak"), None);
+}
+
+// A forced re-extract over this tool's earlier folder replaces its own `.bak`.
+#[test]
+fn a_forced_re_extract_replaces_its_earlier_bak() {
+    let out = TmpDir::new("names-again");
+    let ctx = crate::ctx::Ctx::default();
+    names_extract_into(false, &ctx, out.path(), false);
+    let res = names_extract_into(false, &ctx, out.path(), true);
+    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), None);
+    assert_eq!(
+        read_out(out.path(), "AACS/Unit_Key_RO.bak"),
+        Some(b"UK-RO".to_vec())
+    );
+    assert_eq!(
+        res.names,
+        Some(crate::whole_disc::DecryptedNames::Renamed {
+            mirror_sectors_restored: 0
+        })
+    );
+}
+
+// An unlistable host `/AACS` is not "no names" on an AACS disc.
+#[test]
+fn an_unlistable_host_aacs_folder_is_kept_unexpected() {
+    let files = [crate::test_util::BdFile::new(
+        "BDMV/STREAM/00001.m2ts",
+        3,
+        Some(NAMES_KEY),
+    )];
+    let (img, _) = crate::test_util::mirrored_aacs_image(&files, b"UK-RO");
+    let mut src = img.source();
+    let fs = crate::udf::read_filesystem(&mut src).unwrap();
+    let out = TmpDir::new("names-missing");
+    assert_eq!(
+        super::host_names(&fs, &out.path().join("AACS")),
+        Some(crate::whole_disc::DecryptedNames::Kept {
+            cause: crate::whole_disc::NamesKept::Unexpected
+        })
+    );
 }

@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- An unreadable, short or blanked UDF metadata mirror sector no longer stops the decrypted-name rename: an ISO plan rebuilds it whole from the main copy, and a folder copy renames `AACS/Unit_Key_RO.inf` on the host after extraction. Two readable copies that differ still keep the original names.
+- An unreadable, short or blanked UDF metadata mirror sector no longer stops the decrypted-name rename: an ISO plan rebuilds it whole from the main copy, and a folder copy renames `AACS/Unit_Key_RO.inf` on the host after extraction. Two readable copies that differ, or a mirror the host cannot read (an I/O error, a truncated image), still keep the original names. A forced folder re-extract replaces the `Unit_Key_RO.bak` an earlier extract left.
 
 - CLI, GUI and server: folder backups preserve navigation and protection metadata. ISO, folder and title reads share decryption, unit alignment and read recovery; clear MPLS, CLPI and menu assets no longer become false damaged data.
 - Decrypted ISO and folder backups rename `/AACS/Unit_Key_RO.inf` to `Unit_Key_RO.bak`. When the disc's UDF metadata or its mirror is damaged or unexpected, the backup is still written with its original names and a warning, as in 1.8.4, instead of failing; a Stop or a dead bus still ends it.

@@ -522,3 +522,27 @@ fn halt_and_transport_faults_during_the_rename_still_abort() {
         assert!(!warned);
     }
 }
+
+// Only an unreadable sector is rebuilt: a host I/O error or a truncated image refuses.
+#[test]
+fn a_mirror_host_io_error_refuses_instead_of_filling() {
+    fn eio(_: u32) -> Error {
+        Error::IoError {
+            source: std::io::Error::other("EIO"),
+        }
+    }
+    fn ends(lba: u32) -> Error {
+        Error::ImageEndsBeforeRead {
+            lba,
+            have: 0,
+            want: 1,
+        }
+    }
+    for deny_with in [eio as fn(u32) -> Error, ends] {
+        let mut disc = fixture(true);
+        let fs = crate::udf::read_filesystem(&mut disc).unwrap();
+        disc.denied.insert(MIRROR_TARGET);
+        disc.deny_with = deny_with;
+        assert!(fs.name_plan(&mut disc, RULES).is_err());
+    }
+}

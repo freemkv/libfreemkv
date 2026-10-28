@@ -20,6 +20,7 @@ use crate::io::tree_sink::{
 };
 use crate::sector::SectorSource;
 use crate::udf::{self, DirEntry, UdfFs};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
@@ -339,8 +340,9 @@ fn plan_tree(
     Ok(())
 }
 
-// The decrypted names in the extracted `/AACS` at `host`. A read view that could not
-// rename (its mirror needs rebuilding) left `.inf`: rename it here unless the disc has `.bak`.
+// The decrypted names in the extracted `/AACS` at `host`. A read view that could not rename
+// (its mirror needs rebuilding) left `.inf`: rename it here unless the disc has `.bak`. A host
+// `.bak` then is this tool's own from an earlier extract, so it is replaced.
 fn host_names(fs: &UdfFs, host: &Path) -> Option<crate::whole_disc::DecryptedNames> {
     use crate::whole_disc::{DecryptedNames, NamesKept};
     let rule = crate::whole_disc::DECRYPTED_NAME_RULES[0];
@@ -349,32 +351,38 @@ fn host_names(fs: &UdfFs, host: &Path) -> Option<crate::whole_disc::DecryptedNam
         .entries
         .iter()
         .any(|e| e.name.eq_ignore_ascii_case(rule.to));
-    let listed = |name: &str| {
-        std::fs::read_dir(host).ok()?.flatten().find_map(|e| {
-            let n = e.file_name();
-            n.to_str()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                .then_some(n)
-        })
+    let kept = |cause| Some(DecryptedNames::Kept { cause });
+    let listed = || -> std::io::Result<(Option<OsString>, Option<OsString>)> {
+        let mut found = (None, None);
+        for e in std::fs::read_dir(host)? {
+            let n = e?.file_name();
+            match n.to_str() {
+                Some(s) if s.eq_ignore_ascii_case(rule.from) => found.0 = Some(n),
+                Some(s) if s.eq_ignore_ascii_case(rule.to) => found.1 = Some(n),
+                _ => {}
+            }
+        }
+        Ok(found)
     };
-    if let Some(inf) = listed(rule.from)
+    let Ok((inf, bak)) = listed() else {
+        return kept(NamesKept::Unexpected);
+    };
+    if let Some(inf) = inf
         && !disc_has_bak
-        && listed(rule.to).is_none()
-        && let Err(e) = std::fs::rename(host.join(inf), host.join(rule.to))
     {
-        tracing::warn!(target: "freemkv::extract", error = %e, "Unit_Key_RO.inf rename failed");
+        let to = bak.unwrap_or_else(|| rule.to.into());
+        if let Err(e) = std::fs::rename(host.join(inf), host.join(to)) {
+            tracing::warn!(target: "freemkv::extract", error = %e, "Unit_Key_RO.inf rename failed");
+        }
     }
-    match (listed(rule.from).is_some(), listed(rule.to).is_some()) {
-        (true, _) if disc_has_bak => Some(DecryptedNames::Kept {
-            cause: NamesKept::Collision,
-        }),
-        (true, _) => Some(DecryptedNames::Kept {
-            cause: NamesKept::Unexpected,
-        }),
-        (false, true) => Some(DecryptedNames::Renamed {
+    match listed() {
+        Err(_) => kept(NamesKept::Unexpected),
+        Ok((Some(_), _)) if disc_has_bak => kept(NamesKept::Collision),
+        Ok((Some(_), _)) => kept(NamesKept::Unexpected),
+        Ok((None, Some(_))) => Some(DecryptedNames::Renamed {
             mirror_sectors_restored: 0,
         }),
-        (false, false) => None,
+        Ok((None, None)) => None,
     }
 }
 

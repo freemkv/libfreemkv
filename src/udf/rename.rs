@@ -311,11 +311,12 @@ impl UdfFs {
                     let mut main = [0u8; SECTOR_BYTES];
                     let mut copy = [0u8; SECTOR_BYTES];
                     read_complete_sector(reader, main_lba, &mut main)?;
-                    // A lost or blanked mirror sector is rebuilt from main; two readable
-                    // copies that disagree are not repaired.
+                    // An unreadable (DiscRead, masked or short) or blanked mirror sector is
+                    // rebuilt from main; other errors and two readable copies that disagree are not.
                     let lost = match read_complete_sector(reader, mirror_lba, &mut copy) {
                         Err(e) if crate::whole_disc::fatal(&e) => return Err(e),
-                        Err(_) => true,
+                        Err(Error::DiscRead { .. }) => true,
+                        Err(e) => return Err(e),
                         Ok(()) => copy.iter().all(|&b| b == 0) && main.iter().any(|&b| b != 0),
                     };
                     if lost {
