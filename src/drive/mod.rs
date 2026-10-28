@@ -1631,6 +1631,9 @@ pub fn find_drive() -> Option<Drive> {
                     path,
                     "skipping non-optical SCSI device during drive selection"
                 );
+                // No tray to release: Drop must not send ALLOW to a disk or tape.
+                let mut drive = drive;
+                drive.tray_released = true;
                 drop(drive);
                 None
             }
