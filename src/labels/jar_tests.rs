@@ -415,6 +415,51 @@ fn framework_detect_reads_only_the_central_directory() {
     }
 }
 
+// A jar with bytes prepended still detects in place: the EOCD gives the archive offset.
+#[test]
+fn framework_detect_reads_only_the_central_directory_of_a_jar_with_prepended_bytes() {
+    use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+    use std::io::Write as _;
+    let mut zipped = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(Cursor::new(&mut zipped));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("assets/bg.png", opts).expect("start_file");
+        w.write_all(&vec![0x5Au8; 1024 * 1024]).expect("write");
+        w.start_file("com/dbp/B.class", opts).expect("start_file");
+        w.write_all(MINIMAL_CLASS).expect("write");
+        w.finish().expect("finish");
+    }
+    let mut buf = vec![0xA5u8; 1000];
+    buf.extend_from_slice(&zipped);
+    let dir = |name: &str, icb, files, subdirs| DirSpec {
+        name: name.to_string(),
+        icb_lba: icb,
+        dir_data_lba: icb + 1,
+        files,
+        subdirs,
+    };
+    let jar_dir = dir(
+        "JAR",
+        30,
+        vec![file_with("00000.jar", 32, 4000, buf, true)],
+        vec![],
+    );
+    let root = dir("", 10, vec![], vec![dir("BDMV", 20, vec![], vec![jar_dir])]);
+    let mut disc = MemDisc::new();
+    build_udf_skeleton(&mut disc, 10);
+    lay_dir(&mut disc, &root);
+    let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+    let mut counting = Counting(&mut disc, 0);
+    assert!(super::super::dbp::detect(&mut counting, &udf));
+    assert!(
+        counting.1 < 128,
+        "read {} sectors of a 512-sector jar",
+        counting.1
+    );
+}
+
 // A large jar whose tail the in-place check rejects (EOCD comment length overruns
 // the file's ZIP64 sizes) but the zip reader opens still detects, as via `for_each_jar`.
 #[test]
