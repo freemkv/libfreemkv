@@ -151,3 +151,37 @@ fn masked_sectors_read_as_errors_not_zeros() {
     ));
     assert!(src.read_sectors(296, 4, &mut buf, true).is_ok());
 }
+
+// Main renamed, mirror still the original: a torn image is never reported renamed.
+#[test]
+fn a_main_renamed_over_an_original_mirror_is_kept_unexpected() {
+    let iso = iso(false);
+    let main = iso.layout.aacs_dir;
+    let mirror = iso.layout.mirror_of(main);
+    let original = sector(&iso.path, mirror);
+    let plan = plan_image_names(&iso.path, &[]).unwrap().expect("a rename");
+    write(&iso.path, &plan);
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&iso.path)
+            .unwrap();
+        file.seek(SeekFrom::Start(mirror as u64 * SECTOR_BYTES as u64))
+            .unwrap();
+        file.write_all(&original).unwrap();
+    }
+    assert_eq!(
+        check_image_names(&iso.path, &[], true),
+        Some(DecryptedNames::Kept {
+            cause: NamesKept::Unexpected
+        })
+    );
+    // An unreadable mirror is not a second opinion.
+    assert_eq!(
+        check_image_names(&iso.path, &[(mirror, 1)], true),
+        Some(DecryptedNames::Renamed {
+            mirror_sectors_restored: 0
+        })
+    );
+}

@@ -143,7 +143,8 @@ pub fn plan_image_names(path: &Path, unreadable: &[(u32, u32)]) -> Result<Option
 
 /// Whether the ISO at `path` lists `Unit_Key_RO.bak` or `.inf`; `None` when it has no
 /// `/AACS` names. An unmountable image is `Kept { Damaged }` only for an `aacs` disc.
-/// `Renamed` reports `mirror_sectors_restored: 0`; the writer knows its own count.
+/// `Renamed` needs a readable metadata mirror to agree with main, and reports
+/// `mirror_sectors_restored: 0`; the writer knows its own count.
 pub fn check_image_names(
     path: &Path,
     unreadable: &[(u32, u32)],
@@ -170,9 +171,21 @@ pub fn check_image_names(
             Err(e) => kept(NamesKept::from_plan_error(&e, unreadable)),
             Ok(_) => kept(NamesKept::Unexpected),
         },
-        (false, true) => Some(DecryptedNames::Renamed {
-            mirror_sectors_restored: 0,
-        }),
+        // Renamed on main: the reverse plan reads the mirror, and refuses two readable
+        // copies that differ (a mirror still listing `.inf`).
+        (false, true) => {
+            let back = crate::udf::NameRule {
+                dir: rule.dir,
+                from: rule.to,
+                to: rule.from,
+            };
+            match fs.name_plan(&mut src, &[back]) {
+                Ok(_) => Some(DecryptedNames::Renamed {
+                    mirror_sectors_restored: 0,
+                }),
+                Err(_) => kept(NamesKept::Unexpected),
+            }
+        }
         (false, false) => None,
     }
 }
