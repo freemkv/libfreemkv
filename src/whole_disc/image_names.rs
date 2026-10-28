@@ -183,7 +183,7 @@ pub fn check_image_names(
                 Ok(_) => Some(DecryptedNames::Renamed {
                     mirror_sectors_restored: 0,
                 }),
-                Err(_) => kept(NamesKept::Unexpected),
+                Err(e) => kept(NamesKept::from_plan_error(&e, unreadable)),
             }
         }
         (false, false) => None,

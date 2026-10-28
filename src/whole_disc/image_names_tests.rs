@@ -185,3 +185,18 @@ fn a_main_renamed_over_an_original_mirror_is_kept_unexpected() {
         })
     );
 }
+
+// A reverse check that can't read the mirror's File Entry blames the damage, not the image.
+#[test]
+fn a_renamed_main_with_an_unreadable_mirror_entry_is_kept_damaged() {
+    let iso = iso(false);
+    let plan = plan_image_names(&iso.path, &[]).unwrap().expect("a rename");
+    write(&iso.path, &plan);
+    let mirror_fe = iso.layout.mirror - 1;
+    assert_eq!(
+        check_image_names(&iso.path, &[(mirror_fe, 1)], true),
+        Some(DecryptedNames::Kept {
+            cause: NamesKept::Damaged
+        })
+    );
+}
