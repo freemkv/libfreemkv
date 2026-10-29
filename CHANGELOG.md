@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.7] — UNRELEASED
+
+### Added
+
+- `DriveInfo::name`, `label`, `display` and `list_line`, the one way to name a drive: the OS name (`E:`, `/dev/srN`, `diskN`; the device path when it has none) and `VENDOR MODEL (rev FW)`, as `E:  HL-DT-ST BD-RE BU40N (rev 1.04)`, with control characters replaced. `drive_info(path)` gives the same for an already-open drive.
+
 ## [1.8.6] — 2026-10-29
 
 ### Added

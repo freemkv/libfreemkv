@@ -104,6 +104,10 @@ pub(crate) fn sense_for_status(status: u8, sense: &[u8], sb_len_wr: u8) -> Optio
 }
 
 #[cfg(test)]
+#[path = "mod_drive_name_tests.rs"]
+mod drive_name_tests;
+
+#[cfg(test)]
 #[path = "mod_transport_arg_tests.rs"]
 mod transport_arg_tests;
 
@@ -460,6 +464,61 @@ pub struct DriveInfo {
     pub model: String,
     /// SCSI INQUIRY firmware revision (e.g. `"1.04"`).
     pub firmware: String,
+}
+
+/// Replace control characters in a drive-supplied string, so a hostile device or bridge
+/// cannot emit escape sequences to a terminal through its INQUIRY identity.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
+impl DriveInfo {
+    /// The name the OS shows users (`E:`, `/dev/sr1`, `disk4`); the device
+    /// [`path`](Self::path) when the OS has none.
+    pub fn name(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.path
+        } else {
+            &self.display_name
+        }
+    }
+
+    /// `"VENDOR MODEL (rev FW)"`, control characters replaced.
+    pub fn label(&self) -> String {
+        format!(
+            "{} {} (rev {})",
+            printable(&self.vendor),
+            printable(&self.model),
+            printable(&self.firmware)
+        )
+    }
+
+    /// `"{name}  {label}"` (two spaces): the name and model, which tell identical drives apart.
+    pub fn display(&self) -> String {
+        format!("{}  {}", self.name(), self.label())
+    }
+
+    /// One listing line: [`display`](Self::display), plus the device path when it differs
+    /// from the name.
+    pub fn list_line(&self) -> String {
+        if self.name() == self.path {
+            self.display()
+        } else {
+            format!("{}  {}", self.display(), self.path)
+        }
+    }
+}
+
+/// The enumerated [`DriveInfo`] for `path`, which may be a device path or the OS name, so an
+/// already-open drive can be shown the same way as in a listing. `None` when no
+/// enumerated drive matches. This re-runs [`list_drives`] (identity and OS-name lookups,
+/// no disc I/O and no exclusive access).
+pub fn drive_info(path: &str) -> Option<DriveInfo> {
+    list_drives()
+        .into_iter()
+        .find(|d| d.path == path || d.display_name == path)
 }
 
 /// Enumerate optical drives present on the system.
