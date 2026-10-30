@@ -500,6 +500,11 @@ fn aacs_fid_with_no_crc_is_renamed_and_its_crc_bytes_kept() {
     let mut disc = fixture(false);
     let mut dir = sector(&mut disc, ROOT_MAIN);
     dir[50..52].copy_from_slice(&0u16.to_le_bytes());
+    dir[44] = dir[40..56]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 4)
+        .fold(0u8, |sum, (_, &b)| sum.wrapping_add(b));
     disc.inner.put_bytes(ROOT_MAIN, &dir);
     let (prepared, warned) = prepare(disc);
     let mut prepared = prepared.unwrap();
@@ -637,4 +642,34 @@ fn a_root_mirror_that_differs_from_main_refuses() {
         fs.name_plan(&mut disc, FOLDER),
         Err(Error::DiscRead { .. })
     ));
+}
+
+// A root `AACS` FID whose own CRC or tag checksum is already wrong is damaged metadata: the
+// rename refuses rather than writing fresh checksums over it.
+#[test]
+fn a_root_fid_with_a_bad_crc_or_checksum_is_refused() {
+    for fault in ["crc", "checksum", "covered byte"] {
+        let mut disc = fixture(true);
+        let mut dir = sector(&mut disc, ROOT_MAIN);
+        match fault {
+            "crc" => {
+                dir[48] ^= 0x5a;
+                let sum = dir[40..56]
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != 4)
+                    .fold(0u8, |sum, (_, &b)| sum.wrapping_add(b));
+                dir[44] = sum;
+            }
+            "checksum" => dir[44] ^= 1,
+            _ => dir[40 + 20] ^= 1,
+        }
+        disc.inner.put_bytes(ROOT_MAIN, &dir);
+        disc.inner.put_bytes(ROOT_MIRROR, &dir);
+        let fs = crate::udf::read_filesystem(&mut disc).unwrap();
+        assert!(
+            matches!(fs.name_plan(&mut disc, FOLDER), Err(Error::DiscRead { .. })),
+            "{fault}"
+        );
+    }
 }

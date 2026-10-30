@@ -380,8 +380,19 @@ fn host_names(
         // `to` is the earlier one; else the view renamed, and a host `from` is.
         let stale = if disc_from { to.clone() } else { from.clone() };
         let fresh = if disc_from { from.clone() } else { to.clone() };
-        if let (Some(stale), Some(fresh)) = (stale, fresh) {
-            if earlier_copy(&dest.join(&stale), &dest.join(&fresh)) {
+        let disc = fs.find_dir(&format!("/{}", if disc_from { rule.from } else { rule.to }));
+        if let (Some(fresh), Some(disc)) = (&fresh, disc) {
+            drop_1_8_6_bak(&dest.join(fresh), disc);
+        }
+        if let (Some(stale), Some(fresh), Some(disc)) = (stale, fresh, disc) {
+            let whole = !files.iter().any(|f| {
+                f.path
+                    .components()
+                    .next()
+                    .is_some_and(|c| c.as_os_str().eq_ignore_ascii_case(&fresh))
+                    && (f.bytes_unreadable > 0 || !f.complete)
+            });
+            if whole && earlier_copy(&dest.join(&stale), &dest.join(&fresh), disc) {
                 if let Err(e) = std::fs::remove_dir_all(dest.join(&stale)) {
                     tracing::warn!(target: "freemkv::extract", error = %e, "earlier folder not removed");
                 }
@@ -413,38 +424,89 @@ fn host_names(
     }
 }
 
-// Whether every entry under `stale` is one `fresh` has (same kind, case-folded): an earlier
-// extract of this disc, counting a fresh file's `.partial` and 1.8.6's `Unit_Key_RO.bak` for
-// `Unit_Key_RO.inf`. A link or an unlisted entry is not.
-fn earlier_copy(stale: &Path, fresh: &Path) -> bool {
-    let list = |dir: &Path| -> std::io::Result<Vec<(String, bool, PathBuf)>> {
-        let mut out = Vec::new();
-        for e in std::fs::read_dir(dir)? {
-            let e = e?;
-            let kind = e.file_type()?;
-            let name = e.file_name().to_str().map(str::to_ascii_lowercase);
-            match name {
-                Some(name) if !kind.is_symlink() => out.push((name, kind.is_dir(), e.path())),
-                _ => return Err(std::io::Error::other("not this tool's")),
-            }
-        }
-        Ok(out)
+// Files the OS drops into any folder it shows; never this disc's, never a reason to keep one.
+const OS_DROPPINGS: [&str; 3] = [".ds_store", "thumbs.db", "desktop.ini"];
+
+// The disc entry and host path in `fresh` (extracted from `disc`) that stale entry `name`
+// stands for: the same name, or 1.8.6's `Unit_Key_RO.bak` for `Unit_Key_RO.inf`.
+fn counterpart<'a>(
+    disc: &'a DirEntry,
+    fresh: &Path,
+    name: &str,
+) -> Option<(&'a DirEntry, PathBuf)> {
+    let name = if name.eq_ignore_ascii_case("Unit_Key_RO.bak") {
+        "Unit_Key_RO.inf"
+    } else {
+        name
     };
-    let (Ok(stale), Ok(fresh)) = (list(stale), list(fresh)) else {
+    let entry = disc
+        .entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(name))?;
+    let host = std::fs::read_dir(fresh)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&entry.name))
+        })?;
+    Some((entry, host.path()))
+}
+
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+// Whether `stale` is an earlier extract of this disc: every entry is one the disc's folder
+// `disc` lists (OS droppings aside), and every file holds the bytes of its freshly extracted
+// twin under `fresh`. A link, an unlisted name or different bytes is someone else's.
+fn earlier_copy(stale: &Path, fresh: &Path, disc: &DirEntry) -> bool {
+    let Ok(entries) = std::fs::read_dir(stale) else {
         return false;
     };
-    stale.iter().all(|(name, dir, path)| {
-        let base = name.strip_suffix(".partial").unwrap_or(name);
-        let base = if base == "unit_key_ro.bak" {
-            "unit_key_ro.inf"
-        } else {
-            base
+    entries.into_iter().all(|e| {
+        let Ok(e) = e else { return false };
+        let (Ok(kind), Some(name)) = (e.file_type(), e.file_name().to_str().map(String::from))
+        else {
+            return false;
         };
-        fresh
-            .iter()
-            .find(|(n, d, _)| n == base && d == dir)
-            .is_some_and(|(_, _, twin)| !dir || earlier_copy(path, twin))
+        if kind.is_file() && OS_DROPPINGS.contains(&name.to_ascii_lowercase().as_str()) {
+            return true;
+        }
+        match counterpart(disc, fresh, &name) {
+            Some((entry, twin)) if kind.is_dir() && entry.is_dir => {
+                earlier_copy(&e.path(), &twin, entry)
+            }
+            Some((entry, twin)) if kind.is_file() && !entry.is_dir => same_bytes(&e.path(), &twin),
+            _ => false,
+        }
     })
+}
+
+// A 1.8.6 extract's `Unit_Key_RO.bak` left in the fresh folder beside the key file it was
+// renamed from: dropped when the disc has no `.bak` and its bytes are the key file's.
+fn drop_1_8_6_bak(fresh: &Path, disc: &DirEntry) {
+    let lists = |n: &str| disc.entries.iter().any(|e| e.name.eq_ignore_ascii_case(n));
+    if lists("Unit_Key_RO.bak") || !lists("Unit_Key_RO.inf") {
+        return;
+    }
+    let Some(bak) = std::fs::read_dir(fresh).ok().and_then(|d| {
+        d.filter_map(|e| e.ok()).find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case("Unit_Key_RO.bak"))
+        })
+    }) else {
+        return;
+    };
+    if let Some((_, inf)) = counterpart(disc, fresh, "Unit_Key_RO.inf")
+        && bak.file_type().is_ok_and(|t| t.is_file())
+        && same_bytes(&bak.path(), &inf)
+        && let Err(e) = std::fs::remove_file(bak.path())
+    {
+        tracing::warn!(target: "freemkv::extract", error = %e, "1.8.6 Unit_Key_RO.bak not removed");
+    }
 }
 
 // Point each result path under top-level folder `from` at `to`.

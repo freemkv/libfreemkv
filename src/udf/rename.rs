@@ -99,6 +99,25 @@ fn encoded_like(old: &[u8], replacement: &str, lba: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn tag_checksum(tag: &[u8]) -> u8 {
+    tag[..16]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 4)
+        .fold(0u8, |sum, (_, byte)| sum.wrapping_add(*byte))
+}
+
+// A descriptor's existing tag checksum, and its CRC when it declares one (`crc_len` bytes from
+// 16). Rewriting the checksums of a corrupt descriptor would vouch for garbage.
+fn tag_intact(bytes: &[u8], crc_len: usize) -> bool {
+    bytes.len() >= 16
+        && bytes[4] == tag_checksum(bytes)
+        && (crc_len == 0
+            || (bytes.len() >= 16 + crc_len
+                && u16::from_le_bytes([bytes[8], bytes[9]])
+                    == descriptor_crc16(&bytes[16..16 + crc_len])))
+}
+
 fn location(spans: &[Span], byte: usize, lba: u32) -> Result<(u32, usize, u32)> {
     let span = spans
         .iter()
@@ -188,6 +207,9 @@ impl UdfFs {
                         return Err(bad_sector(icb_lba));
                     }
                     let mut fid = data[pos..pos + covered_len].to_vec();
+                    if !tag_intact(&fid, crc_len) {
+                        return Err(bad_sector(icb_lba));
+                    }
                     let replacement = encoded_like(old, rule.to, icb_lba)?;
                     fid[name_at..name_at + name_len].copy_from_slice(&replacement);
                     if crc_len != 0 {
@@ -236,14 +258,17 @@ impl UdfFs {
         for owner in inline_owners {
             let icb_lba = self.meta_to_abs(owner.meta_lba)?;
             let crc_len = u16::from_le_bytes([owner.sector[10], owner.sector[11]]) as usize;
+            let crc_end = 16 + crc_len;
+            if crc_end > owner.descriptor_end
+                || crc_end > SECTOR_BYTES
+                || !tag_intact(&owner.sector, crc_len)
+            {
+                return Err(bad_sector(icb_lba));
+            }
             // ECMA-167 permits an omitted CRC. Preserve that policy, as well as
             // shorter declared coverage, rather than repairing/expanding it.
             if crc_len == 0 {
                 continue;
-            }
-            let crc_end = 16 + crc_len;
-            if crc_end > owner.descriptor_end || crc_end > SECTOR_BYTES {
-                return Err(bad_sector(icb_lba));
             }
             let mut final_sector = owner.sector;
             for patch in all.iter().filter(|patch| patch.meta_lba == owner.meta_lba) {
@@ -961,6 +986,40 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // An inline root whose own FE/EFE CRC or checksum is already wrong is refused, never
+    // given fresh checksums over damaged bytes.
+    #[test]
+    fn an_inline_root_with_a_bad_descriptor_crc_is_refused() {
+        for tag in [261, 266] {
+            for fault in ["crc", "checksum"] {
+                let fixture = rename_fixture_at("/", Some(tag));
+                let owner_at = fixture.owner_lba as usize * SECTOR_BYTES;
+                let mut image = fixture.image.clone();
+                let owner = &mut image[owner_at..owner_at + SECTOR_BYTES];
+                match fault {
+                    "crc" => {
+                        owner[8] ^= 0x5a;
+                        owner[4] = owner[..16]
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != 4)
+                            .fold(0u8, |sum, (_, byte)| sum.wrapping_add(*byte));
+                    }
+                    _ => owner[4] ^= 1,
+                }
+                let mut raw = crate::test_util::MemSource::new(image);
+                let fs = super::super::read_filesystem(&mut raw).unwrap();
+                assert!(
+                    matches!(
+                        fs.name_patches(&mut raw, FOLDER),
+                        Err(Error::DiscRead { sector, .. }) if sector == fixture.owner_lba as u64
+                    ),
+                    "tag {tag} {fault}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2770,6 +2770,7 @@ const NAMES_KEY: [u8; 16] = *b"\x3Cextract names!!";
 struct Deny {
     inner: crate::test_util::MemSource,
     deny: u32,
+    also: Option<u32>,
 }
 
 impl SectorSource for Deny {
@@ -2777,9 +2778,13 @@ impl SectorSource for Deny {
         self.inner.capacity_sectors()
     }
     fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
-        if (lba..lba + count as u32).contains(&self.deny) {
+        if let Some(at) = [Some(self.deny), self.also]
+            .into_iter()
+            .flatten()
+            .find(|at| (lba..lba + count as u32).contains(at))
+        {
             return Err(Error::DiscRead {
-                sector: self.deny as u64,
+                sector: at as u64,
                 status: None,
                 sense: None,
             });
@@ -2813,6 +2818,18 @@ fn names_extract_with(
     force: bool,
     deny_mirror: bool,
 ) -> ExtractResult {
+    names_extract_damaged(collision, ctx, out, force, deny_mirror, false)
+}
+
+// `damage_key_file`: the key file's first data sector is unreadable too.
+fn names_extract_damaged(
+    collision: bool,
+    ctx: &crate::ctx::Ctx,
+    out: &Path,
+    force: bool,
+    deny_mirror: bool,
+    damage_key_file: bool,
+) -> ExtractResult {
     use crate::test_util::BdFile;
     let mut files = vec![BdFile::new("BDMV/STREAM/00001.m2ts", 3, Some(NAMES_KEY))];
     if collision {
@@ -2830,6 +2847,11 @@ fn names_extract_with(
         } else {
             u32::MAX
         },
+        also: damage_key_file.then(|| {
+            let mut src = img.source();
+            let fs = crate::udf::read_filesystem(&mut src).unwrap();
+            fs.file_extents(&mut src, "/AACS/Unit_Key_RO.inf").unwrap()[0].0
+        }),
     };
     let opts = ExtractOptions {
         keys: Some(&set),
@@ -2979,4 +3001,86 @@ fn an_unlistable_host_folder_is_kept_unexpected() {
         super::host_names(&fs, &out.path().join("missing"), &mut Vec::new()),
         kept(crate::whole_disc::NamesKept::Unexpected)
     );
+}
+
+// A forced extract into a folder holding another disc's AACS files (same names, other bytes)
+// deletes nothing: the copy keeps `AACS`.
+#[test]
+fn a_forced_extract_over_another_discs_aacs_files_deletes_nothing() {
+    for view_renames in [false, true] {
+        let out = TmpDir::new("names-other-disc");
+        // The folder the extract does not write itself is the other disc's.
+        let other = if view_renames { "AACS" } else { "SCAA" };
+        std::fs::create_dir_all(out.path().join(other)).unwrap();
+        std::fs::write(out.path().join(other).join("Unit_Key_RO.inf"), b"DISC-B").unwrap();
+        let res = names_extract_with(
+            false,
+            &crate::ctx::Ctx::default(),
+            out.path(),
+            true,
+            !view_renames,
+        );
+        assert_eq!(
+            read_out(out.path(), &format!("{other}/Unit_Key_RO.inf")),
+            Some(b"DISC-B".to_vec()),
+            "view_renames={view_renames}"
+        );
+        assert_eq!(res.names, kept(crate::whole_disc::NamesKept::Collision));
+    }
+}
+
+// A 1.8.6 `.bak` with the key file's bytes, under a fresh folder the view kept as `AACS`, is
+// this tool's own: dropped. One with other bytes is not touched.
+#[test]
+fn a_1_8_6_bak_beside_the_fresh_key_file_is_dropped_only_when_equal() {
+    for (bak, dropped) in [(&b"UK-RO"[..], true), (&b"OTHER"[..], false)] {
+        let out = TmpDir::new("names-bak");
+        std::fs::create_dir_all(out.path().join("AACS")).unwrap();
+        std::fs::write(out.path().join("AACS/Unit_Key_RO.bak"), bak).unwrap();
+        let res = names_extract_into(false, &crate::ctx::Ctx::default(), out.path(), true);
+        assert_eq!(res.names, renamed());
+        assert_eq!(
+            read_out(out.path(), "SCAA/Unit_Key_RO.inf"),
+            Some(b"UK-RO".to_vec())
+        );
+        assert_eq!(
+            read_out(out.path(), "SCAA/Unit_Key_RO.bak").is_none(),
+            dropped,
+            "{bak:?}"
+        );
+    }
+}
+
+// Finder/Explorer droppings in an earlier folder of ours do not make it foreign.
+#[test]
+fn an_earlier_scaa_with_os_droppings_is_still_replaced() {
+    let out = TmpDir::new("names-junk");
+    let ctx = crate::ctx::Ctx::default();
+    names_extract_into(false, &ctx, out.path(), false);
+    for junk in [".DS_Store", "Thumbs.db", "desktop.ini"] {
+        std::fs::write(out.path().join("SCAA").join(junk), b"x").unwrap();
+    }
+    let res = names_extract_into(false, &ctx, out.path(), true);
+    assert_eq!(res.names, renamed());
+    assert!(!out.path().join("AACS").exists());
+    assert!(!out.path().join("SCAA/.DS_Store").exists());
+}
+
+// A damaged fresh folder never replaces the earlier one.
+#[test]
+fn a_damaged_fresh_folder_keeps_the_earlier_one() {
+    let out = TmpDir::new("names-damaged");
+    // Empty: nothing in it but would-be ours.
+    std::fs::create_dir_all(out.path().join("AACS")).unwrap();
+    let res = names_extract_damaged(
+        false,
+        &crate::ctx::Ctx::default(),
+        out.path(),
+        true,
+        false,
+        true,
+    );
+    assert!(res.bytes_unreadable > 0);
+    assert!(out.path().join("AACS").is_dir());
+    assert_eq!(res.names, kept(crate::whole_disc::NamesKept::Collision));
 }
