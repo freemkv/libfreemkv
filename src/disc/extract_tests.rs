@@ -458,8 +458,9 @@ fn bdmv_extract_preserves_protection_metadata() {
     );
     assert_eq!(read_out(out.path(), "BDMV/PLAYLIST/00000.mpls"), Some(mpls));
     assert_eq!(read_out(out.path(), "BDMV/CLIPINF/00001.clpi"), Some(clpi));
-    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.bak"), Some(aacs_inf));
-    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), None);
+    // The AACS folder is renamed, its files kept as they are.
+    assert_eq!(read_out(out.path(), "SCAA/Unit_Key_RO.inf"), Some(aacs_inf));
+    assert!(!out.path().join("AACS").exists());
     assert_eq!(
         read_out(out.path(), "CERTIFICATE/id.bdmv"),
         Some(b"BDJ-DISC-ID".to_vec())
@@ -2787,7 +2788,8 @@ impl SectorSource for Deny {
     }
 }
 
-// An AACS disc with a duplicated metadata mirror whose `/AACS` mirror sector is unreadable.
+// An AACS disc with a duplicated metadata mirror whose root mirror sector is unreadable, so
+// the read view cannot rename and the tree is extracted with its `AACS` folder.
 fn names_extract(collision: bool, ctx: &crate::ctx::Ctx) -> (TmpDir, ExtractResult) {
     let out = TmpDir::new("names");
     let res = names_extract_into(collision, ctx, out.path(), false);
@@ -2800,10 +2802,21 @@ fn names_extract_into(
     out: &Path,
     force: bool,
 ) -> ExtractResult {
+    names_extract_with(collision, ctx, out, force, true)
+}
+
+// `deny_mirror: false` leaves the mirror readable: the read view renames the folder itself.
+fn names_extract_with(
+    collision: bool,
+    ctx: &crate::ctx::Ctx,
+    out: &Path,
+    force: bool,
+    deny_mirror: bool,
+) -> ExtractResult {
     use crate::test_util::BdFile;
     let mut files = vec![BdFile::new("BDMV/STREAM/00001.m2ts", 3, Some(NAMES_KEY))];
     if collision {
-        files.push(BdFile::new("AACS/Unit_Key_RO.bak", 1, None));
+        files.push(BdFile::new("SCAA/disc.dat", 1, None));
     }
     let (img, layout) = crate::test_util::mirrored_aacs_image(&files, b"UK-RO");
     let mut d = aacs_disc();
@@ -2812,7 +2825,11 @@ fn names_extract_into(
     let set = crate::keys::KeyRing::keyed_for_test(&d, NAMES_KEY, &[(s, s + n)]);
     let mut src = Deny {
         inner: img.source(),
-        deny: layout.mirror_of(layout.aacs_dir),
+        deny: if deny_mirror {
+            layout.mirror_of(layout.root_dir)
+        } else {
+            u32::MAX
+        },
     };
     let opts = ExtractOptions {
         keys: Some(&set),
@@ -2821,35 +2838,61 @@ fn names_extract_into(
     d.extract_tree(&mut src, out, &opts, ctx).unwrap()
 }
 
-// The read view can't rebuild the mirror, so the host file is renamed after extraction.
+fn renamed() -> Option<crate::whole_disc::DecryptedNames> {
+    Some(crate::whole_disc::DecryptedNames::Renamed {
+        mirror_sectors_restored: 0,
+    })
+}
+
+fn kept(cause: crate::whole_disc::NamesKept) -> Option<crate::whole_disc::DecryptedNames> {
+    Some(crate::whole_disc::DecryptedNames::Kept { cause })
+}
+
+fn paths(res: &ExtractResult) -> Vec<String> {
+    res.files
+        .iter()
+        .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+// The read view renames the root FID: the folder is extracted as `SCAA`, its files OEM.
+#[test]
+fn a_readable_folder_is_extracted_as_scaa() {
+    let out = TmpDir::new("names-view");
+    let res = names_extract_with(false, &crate::ctx::Ctx::default(), out.path(), false, false);
+    assert!(res.complete);
+    assert!(!out.path().join("AACS").exists());
+    assert_eq!(
+        read_out(out.path(), "SCAA/Unit_Key_RO.inf"),
+        Some(b"UK-RO".to_vec())
+    );
+    assert_eq!(res.names, renamed());
+    assert!(paths(&res).contains(&"SCAA/Unit_Key_RO.inf".to_string()));
+}
+
+// The read view can't rebuild the mirror, so the host folder is renamed after extraction,
+// and the result names the files where they now are.
 #[test]
 fn a_folder_whose_mirror_needs_rebuilding_is_renamed_on_the_host() {
     let (out, res) = names_extract(false, &crate::ctx::Ctx::default());
     assert!(res.complete);
-    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), None);
+    assert!(!out.path().join("AACS").exists());
     assert_eq!(
-        read_out(out.path(), "AACS/Unit_Key_RO.bak"),
+        read_out(out.path(), "SCAA/Unit_Key_RO.inf"),
         Some(b"UK-RO".to_vec())
     );
-    assert_eq!(
-        res.names,
-        Some(crate::whole_disc::DecryptedNames::Renamed {
-            mirror_sectors_restored: 0
-        })
-    );
+    assert_eq!(res.names, renamed());
+    let p = paths(&res);
+    assert!(p.contains(&"SCAA/Unit_Key_RO.inf".to_string()), "{p:?}");
+    assert!(!p.iter().any(|p| p.starts_with("AACS/")), "{p:?}");
 }
 
 #[test]
-fn a_folder_with_both_names_keeps_them_as_a_collision() {
+fn a_folder_whose_disc_has_scaa_keeps_aacs_as_a_collision() {
     let (out, res) = names_extract(true, &crate::ctx::Ctx::default());
     assert!(read_out(out.path(), "AACS/Unit_Key_RO.inf").is_some());
-    assert!(read_out(out.path(), "AACS/Unit_Key_RO.bak").is_some());
-    assert_eq!(
-        res.names,
-        Some(crate::whole_disc::DecryptedNames::Kept {
-            cause: crate::whole_disc::NamesKept::Collision
-        })
-    );
+    assert!(read_out(out.path(), "SCAA/disc.dat").is_some());
+    assert_eq!(res.names, kept(crate::whole_disc::NamesKept::Collision));
 }
 
 // A stopped tree is never touched.
@@ -2869,32 +2912,60 @@ fn a_halted_folder_is_not_renamed() {
     let (out, res) = names_extract(false, &ctx);
     assert!(res.halted);
     assert_eq!(res.names, None);
-    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.bak"), None);
+    assert!(!out.path().join("SCAA").exists());
 }
 
-// A forced re-extract over this tool's earlier folder replaces its own `.bak`.
+// A forced re-extract over this tool's earlier folder replaces its own `SCAA`.
 #[test]
-fn a_forced_re_extract_replaces_its_earlier_bak() {
+fn a_forced_re_extract_replaces_its_earlier_scaa() {
     let out = TmpDir::new("names-again");
     let ctx = crate::ctx::Ctx::default();
     names_extract_into(false, &ctx, out.path(), false);
+    assert!(out.path().join("SCAA").is_dir());
     let res = names_extract_into(false, &ctx, out.path(), true);
-    assert_eq!(read_out(out.path(), "AACS/Unit_Key_RO.inf"), None);
+    assert!(!out.path().join("AACS").exists());
     assert_eq!(
-        read_out(out.path(), "AACS/Unit_Key_RO.bak"),
+        read_out(out.path(), "SCAA/Unit_Key_RO.inf"),
         Some(b"UK-RO".to_vec())
     );
-    assert_eq!(
-        res.names,
-        Some(crate::whole_disc::DecryptedNames::Renamed {
-            mirror_sectors_restored: 0
-        })
-    );
+    assert_eq!(res.names, renamed());
 }
 
-// An unlistable host `/AACS` is not "no names" on an AACS disc.
+// An `SCAA` the disc does not have and this tool did not write (a file the disc's AACS folder
+// lacks) is never deleted: the copy keeps `AACS`.
 #[test]
-fn an_unlistable_host_aacs_folder_is_kept_unexpected() {
+fn a_foreign_scaa_folder_on_the_host_is_kept_as_a_collision() {
+    let out = TmpDir::new("names-foreign");
+    std::fs::create_dir_all(out.path().join("SCAA")).unwrap();
+    std::fs::write(out.path().join("SCAA/mine.txt"), b"keep me").unwrap();
+    let res = names_extract_into(false, &crate::ctx::Ctx::default(), out.path(), true);
+    assert_eq!(
+        read_out(out.path(), "SCAA/mine.txt"),
+        Some(b"keep me".to_vec())
+    );
+    assert!(read_out(out.path(), "AACS/Unit_Key_RO.inf").is_some());
+    assert_eq!(res.names, kept(crate::whole_disc::NamesKept::Collision));
+}
+
+// A 1.8.6 folder (`AACS/Unit_Key_RO.bak`) re-extracted by force: the view renames the folder,
+// and the earlier `AACS`, holding only this disc's files, is this tool's own and goes.
+#[test]
+fn a_forced_re_extract_over_a_1_8_6_folder_drops_its_old_aacs() {
+    let out = TmpDir::new("names-186");
+    std::fs::create_dir_all(out.path().join("AACS")).unwrap();
+    std::fs::write(out.path().join("AACS/Unit_Key_RO.bak"), b"UK-RO").unwrap();
+    let res = names_extract_with(false, &crate::ctx::Ctx::default(), out.path(), true, false);
+    assert!(!out.path().join("AACS").exists());
+    assert_eq!(
+        read_out(out.path(), "SCAA/Unit_Key_RO.inf"),
+        Some(b"UK-RO".to_vec())
+    );
+    assert_eq!(res.names, renamed());
+}
+
+// An unlistable host folder is not "no names" on an AACS disc.
+#[test]
+fn an_unlistable_host_folder_is_kept_unexpected() {
     let files = [crate::test_util::BdFile::new(
         "BDMV/STREAM/00001.m2ts",
         3,
@@ -2905,9 +2976,7 @@ fn an_unlistable_host_aacs_folder_is_kept_unexpected() {
     let fs = crate::udf::read_filesystem(&mut src).unwrap();
     let out = TmpDir::new("names-missing");
     assert_eq!(
-        super::host_names(&fs, &out.path().join("AACS")),
-        Some(crate::whole_disc::DecryptedNames::Kept {
-            cause: crate::whole_disc::NamesKept::Unexpected
-        })
+        super::host_names(&fs, &out.path().join("missing"), &mut Vec::new()),
+        kept(crate::whole_disc::NamesKept::Unexpected)
     );
 }

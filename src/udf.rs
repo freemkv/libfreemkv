@@ -219,12 +219,11 @@ impl UdfFs {
         self.metadata_sectors
     }
 
-    /// Find a directory by path (e.g. "/BDMV/PLAYLIST").
+    /// Find a directory by path (e.g. "/BDMV/PLAYLIST"); `/` is the root.
     /// Path matching is case-insensitive.
     pub fn find_dir(&self, path: &str) -> Option<&DirEntry> {
-        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
-        for part in &parts {
+        for part in path.split('/').filter(|p| !p.is_empty()) {
             current = current
                 .entries
                 .iter()

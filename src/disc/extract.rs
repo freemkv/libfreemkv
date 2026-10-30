@@ -73,8 +73,8 @@ pub struct ExtractResult {
     pub complete: bool,
     /// True when the run stopped early on an interrupt / progress halt.
     pub halted: bool,
-    /// What the copy did with `AACS/Unit_Key_RO.inf`; `None` for a halted run or a disc
-    /// without one.
+    /// What the copy did with its root `AACS` folder (renamed `SCAA`, or kept); `None` for
+    /// a halted run or a disc without one.
     pub names: Option<crate::whole_disc::DecryptedNames>,
 }
 
@@ -233,16 +233,9 @@ impl Disc {
             }
         }
 
-        // Only a decrypted AACS copy renames. `/AACS` sits at the root, so its host path
-        // is its own (unchanged) name.
-        if !result.halted
-            && self.aacs.is_some()
-            && reader.decrypts_aacs()
-            && let Some(rel) = dirs
-                .iter()
-                .find(|d| d.as_os_str().eq_ignore_ascii_case("AACS"))
-        {
-            result.names = host_names(&fs, &sink.dest().join(rel));
+        // Only a decrypted AACS copy renames.
+        if !result.halted && self.aacs.is_some() && reader.decrypts_aacs() {
+            result.names = host_names(&fs, sink.dest(), &mut result.files);
         }
         result.complete = !result.halted
             && result.bytes_unreadable == 0
@@ -340,22 +333,35 @@ fn plan_tree(
     Ok(())
 }
 
-// The decrypted names in the extracted `/AACS` at `host`. A read view that could not rename
-// (its mirror needs rebuilding) left `.inf`: rename it here unless the disc has `.bak`. A host
-// `.bak` then is this tool's own from an earlier extract, so it is replaced.
-fn host_names(fs: &UdfFs, host: &Path) -> Option<crate::whole_disc::DecryptedNames> {
+// The root folder names at `dest`. A read view `fs` that could not rename (mirror needs
+// rebuilding) extracted `AACS`: renamed here, `files` following. A second folder is replaced
+// only if it is an earlier extract of this disc (`earlier_copy`); else the copy keeps `AACS`.
+fn host_names(
+    fs: &UdfFs,
+    dest: &Path,
+    files: &mut [FileResult],
+) -> Option<crate::whole_disc::DecryptedNames> {
     use crate::whole_disc::{DecryptedNames, NamesKept};
     let rule = crate::whole_disc::DECRYPTED_NAME_RULES[0];
-    let disc_has_bak = fs
-        .find_dir(rule.dir)?
-        .entries
-        .iter()
-        .any(|e| e.name.eq_ignore_ascii_case(rule.to));
+    let on_disc = |name: &str| {
+        fs.root
+            .entries
+            .iter()
+            .any(|e| e.is_dir && e.name.eq_ignore_ascii_case(name))
+    };
+    let (disc_from, disc_to) = (on_disc(rule.from), on_disc(rule.to));
+    if !disc_from && !disc_to {
+        return None;
+    }
     let kept = |cause| Some(DecryptedNames::Kept { cause });
     let listed = || -> std::io::Result<(Option<OsString>, Option<OsString>)> {
         let mut found = (None, None);
-        for e in std::fs::read_dir(host)? {
-            let n = e?.file_name();
+        for e in std::fs::read_dir(dest)? {
+            let e = e?;
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let n = e.file_name();
             match n.to_str() {
                 Some(s) if s.eq_ignore_ascii_case(rule.from) => found.0 = Some(n),
                 Some(s) if s.eq_ignore_ascii_case(rule.to) => found.1 = Some(n),
@@ -364,25 +370,93 @@ fn host_names(fs: &UdfFs, host: &Path) -> Option<crate::whole_disc::DecryptedNam
         }
         Ok(found)
     };
-    let Ok((inf, bak)) = listed() else {
+    let Ok((from, to)) = listed() else {
         return kept(NamesKept::Unexpected);
     };
-    if let Some(inf) = inf
-        && !disc_has_bak
-    {
-        let to = bak.unwrap_or_else(|| rule.to.into());
-        if let Err(e) = std::fs::rename(host.join(inf), host.join(to)) {
-            tracing::warn!(target: "freemkv::extract", error = %e, "Unit_Key_RO.inf rename failed");
+    // The view lists both only when the disc itself has both: its rename was refused.
+    let mut collision = disc_from && disc_to;
+    if !collision {
+        // `disc_from`: the view kept `AACS`, so the extracted folder is `from` and a host
+        // `to` is the earlier one; else the view renamed, and a host `from` is.
+        let stale = if disc_from { to.clone() } else { from.clone() };
+        let fresh = if disc_from { from.clone() } else { to.clone() };
+        if let (Some(stale), Some(fresh)) = (stale, fresh) {
+            if earlier_copy(&dest.join(&stale), &dest.join(&fresh)) {
+                if let Err(e) = std::fs::remove_dir_all(dest.join(&stale)) {
+                    tracing::warn!(target: "freemkv::extract", error = %e, "earlier folder not removed");
+                }
+            } else {
+                collision = true;
+            }
+        }
+        if !collision
+            && disc_from
+            && let Some(from) = &from
+            && !dest.join(rule.to).exists()
+        {
+            match std::fs::rename(dest.join(from), dest.join(rule.to)) {
+                Ok(()) => rehome(files, from, rule.to),
+                Err(e) => {
+                    tracing::warn!(target: "freemkv::extract", error = %e, "AACS folder rename failed")
+                }
+            }
         }
     }
     match listed() {
         Err(_) => kept(NamesKept::Unexpected),
-        Ok((Some(_), _)) if disc_has_bak => kept(NamesKept::Collision),
+        Ok((Some(_), _)) if collision => kept(NamesKept::Collision),
         Ok((Some(_), _)) => kept(NamesKept::Unexpected),
         Ok((None, Some(_))) => Some(DecryptedNames::Renamed {
             mirror_sectors_restored: 0,
         }),
         Ok((None, None)) => None,
+    }
+}
+
+// Whether every entry under `stale` is one `fresh` has (same kind, case-folded): an earlier
+// extract of this disc, counting a fresh file's `.partial` and 1.8.6's `Unit_Key_RO.bak` for
+// `Unit_Key_RO.inf`. A link or an unlisted entry is not.
+fn earlier_copy(stale: &Path, fresh: &Path) -> bool {
+    let list = |dir: &Path| -> std::io::Result<Vec<(String, bool, PathBuf)>> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            let kind = e.file_type()?;
+            let name = e.file_name().to_str().map(str::to_ascii_lowercase);
+            match name {
+                Some(name) if !kind.is_symlink() => out.push((name, kind.is_dir(), e.path())),
+                _ => return Err(std::io::Error::other("not this tool's")),
+            }
+        }
+        Ok(out)
+    };
+    let (Ok(stale), Ok(fresh)) = (list(stale), list(fresh)) else {
+        return false;
+    };
+    stale.iter().all(|(name, dir, path)| {
+        let base = name.strip_suffix(".partial").unwrap_or(name);
+        let base = if base == "unit_key_ro.bak" {
+            "unit_key_ro.inf"
+        } else {
+            base
+        };
+        fresh
+            .iter()
+            .find(|(n, d, _)| n == base && d == dir)
+            .is_some_and(|(_, _, twin)| !dir || earlier_copy(path, twin))
+    })
+}
+
+// Point each result path under top-level folder `from` at `to`.
+fn rehome(files: &mut [FileResult], from: &OsString, to: &str) {
+    for f in files {
+        let mut parts = f.path.components();
+        if parts
+            .next()
+            .is_some_and(|c| c.as_os_str().eq_ignore_ascii_case(from))
+        {
+            f.path = Path::new(to).join(parts.as_path());
+        }
     }
 }
 

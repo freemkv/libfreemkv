@@ -7,6 +7,10 @@ const MAIN_TARGET: u32 = PART_START + 2048;
 const MIRROR_FE: u32 = PART_START + 10;
 const MIRROR_TARGET: u32 = PART_START + 3500 + 16;
 const END: u32 = 5600;
+// The root directory's FIDs (`AACS`), logical block 3, in each copy.
+const ROOT_MAIN: u32 = MAIN + 3;
+const ROOT_MIRROR: u32 = PART_START + 3000 + 3;
+const FOLDER: &[NameRule] = crate::whole_disc::DECRYPTED_NAME_RULES;
 
 struct Disc {
     inner: MemDisc,
@@ -116,6 +120,10 @@ fn fixture(duplicate: bool) -> Disc {
         if logical == 32 {
             tag(&mut data, 38, logical);
             tag(&mut data[40..], 54, logical);
+        }
+        if logical == 3 {
+            tag(&mut data, 38, logical);
+            tag(&mut data[40..], 43, logical);
         }
         let main = if logical < 32 {
             MAIN + logical
@@ -446,39 +454,39 @@ fn prepare(disc: Disc) -> (Result<crate::whole_disc::PreparedReader<Disc>>, bool
     (prepared, warned)
 }
 
-// A mirror sector that is unreadable, short or unequal skips the rename (1.8.4's image).
+// A root mirror sector that is unreadable, short or unequal skips the rename (1.8.4's image).
 #[test]
 fn damaged_or_mismatched_mirror_copies_without_the_rename() {
     for fault in 0..3 {
         let mut disc = fixture(true);
-        let main = sector(&mut disc, MAIN_TARGET);
+        let main = sector(&mut disc, ROOT_MAIN);
         match fault {
             0 => {
-                disc.denied.insert(MIRROR_TARGET);
+                disc.denied.insert(ROOT_MIRROR);
             }
             1 => {
-                disc.short.insert(MIRROR_TARGET);
+                disc.short.insert(ROOT_MIRROR);
             }
             _ => {
-                let mut bytes = sector(&mut disc, MIRROR_TARGET);
+                let mut bytes = sector(&mut disc, ROOT_MIRROR);
                 bytes[1000] = 9;
-                disc.inner.put_bytes(MIRROR_TARGET, &bytes);
+                disc.inner.put_bytes(ROOT_MIRROR, &bytes);
             }
         }
         let (prepared, warned) = prepare(disc);
         let mut prepared = prepared.unwrap_or_else(|e| panic!("fault {fault}: {e:?}"));
         assert!(warned, "fault {fault}");
-        assert_eq!(sector(&mut prepared, MAIN_TARGET), main, "fault {fault}");
+        assert_eq!(sector(&mut prepared, ROOT_MAIN), main, "fault {fault}");
     }
 }
 
-// An /AACS FID whose CRC length is out of range skips the rename instead of failing.
+// A root `AACS` FID whose CRC length is out of range skips the rename instead of failing.
 #[test]
 fn unexpected_aacs_fid_copies_without_the_rename() {
     let mut disc = fixture(false);
-    let mut dir = sector(&mut disc, MAIN_TARGET);
+    let mut dir = sector(&mut disc, ROOT_MAIN);
     dir[50..52].copy_from_slice(&u16::MAX.to_le_bytes());
-    disc.inner.put_bytes(MAIN_TARGET, &dir);
+    disc.inner.put_bytes(ROOT_MAIN, &dir);
     let original = snapshot(&mut disc);
     let (prepared, warned) = prepare(disc);
     let mut prepared = prepared.unwrap();
@@ -490,16 +498,17 @@ fn unexpected_aacs_fid_copies_without_the_rename() {
 #[test]
 fn aacs_fid_with_no_crc_is_renamed_and_its_crc_bytes_kept() {
     let mut disc = fixture(false);
-    let mut dir = sector(&mut disc, MAIN_TARGET);
+    let mut dir = sector(&mut disc, ROOT_MAIN);
     dir[50..52].copy_from_slice(&0u16.to_le_bytes());
-    disc.inner.put_bytes(MAIN_TARGET, &dir);
+    disc.inner.put_bytes(ROOT_MAIN, &dir);
     let (prepared, warned) = prepare(disc);
     let mut prepared = prepared.unwrap();
     assert!(!warned);
-    let after = sector(&mut prepared, MAIN_TARGET);
-    assert_eq!(&after[40 + 51..40 + 54], b"bak");
+    let after = sector(&mut prepared, ROOT_MAIN);
+    assert_eq!(&after[79..83], b"SCAA");
     assert_eq!(&after[40 + 8..40 + 12], &dir[40 + 8..40 + 12]);
-    assert_eq!(&after[..40 + 51], &dir[..40 + 51]);
+    assert_eq!(&after[..79], &dir[..79]);
+    assert_eq!(&after[83..], &dir[83..]);
 }
 
 // A Stop or a dead bus while planning still ends the copy.
@@ -514,7 +523,7 @@ fn halt_and_transport_faults_during_the_rename_still_abort() {
     }
     for deny_with in [transport as fn(u32) -> Error, |_| Error::Halted] {
         let mut disc = fixture(true);
-        disc.denied.insert(MIRROR_TARGET);
+        disc.denied.insert(ROOT_MIRROR);
         disc.deny_with = deny_with;
         let (prepared, warned) = prepare(disc);
         let e = prepared.err().expect("fault must abort");
@@ -545,4 +554,87 @@ fn a_mirror_host_io_error_refuses_instead_of_filling() {
         disc.deny_with = deny_with;
         assert!(fs.name_plan(&mut disc, RULES).is_err());
     }
+}
+
+// The product rule edits the root directory's `AACS` FID in main and in the duplicate mirror,
+// each at its own extent mapping; the AACS folder's own sectors never change.
+#[test]
+fn root_folder_rename_projects_to_the_duplicate_mirror() {
+    let mut disc = fixture(true);
+    let original = snapshot(&mut disc);
+    let fs = crate::udf::read_filesystem(&mut disc).unwrap();
+    let patches = fs.name_patches(&mut disc, FOLDER).unwrap();
+    for lba in [ROOT_MAIN, ROOT_MIRROR] {
+        assert!(patches.iter().any(|p| p.lba == lba), "patches at {lba}");
+    }
+    let mut output =
+        crate::whole_disc::UnitAligned::new(disc, Vec::new()).with_name_patches(patches);
+    let changed = snapshot(&mut output);
+    for lba in [ROOT_MAIN, ROOT_MIRROR] {
+        let bytes = &changed[lba as usize * SECTOR_BYTES..][..SECTOR_BYTES];
+        assert_eq!(&bytes[79..83], b"SCAA");
+        assert_eq!(bytes[40 + 18] & 0x02, 0x02, "still a directory FID");
+        check_tag(bytes, 0, 3);
+        check_tag(bytes, 40, 3);
+    }
+    for (index, (&before, &after)) in original.iter().zip(&changed).enumerate() {
+        if before != after {
+            let lba = (index / SECTOR_BYTES) as u32;
+            let offset = index % SECTOR_BYTES;
+            assert!([ROOT_MAIN, ROOT_MIRROR].contains(&lba), "edit at {lba}");
+            assert!(
+                [44, 48, 49, 79, 80, 81, 82].contains(&offset),
+                "unexpected edit at {lba}:{offset}"
+            );
+        }
+    }
+    let renamed = crate::udf::read_filesystem(&mut output).unwrap();
+    assert!(renamed.find_dir("/AACS").is_none());
+    assert_eq!(
+        renamed
+            .read_file(&mut output, "/SCAA/Unit_Key_RO.inf")
+            .unwrap(),
+        b"payload"
+    );
+}
+
+fn assert_root_mirror_filled(mut disc: Disc) {
+    let main = sector(&mut disc.inner, ROOT_MAIN);
+    let fs = crate::udf::read_filesystem(&mut disc).unwrap();
+    let plan = fs.name_plan(&mut disc, FOLDER).unwrap();
+    assert_eq!(plan.fills.len(), 1);
+    assert_eq!(plan.fills[0].0, ROOT_MIRROR);
+    assert_eq!(*plan.fills[0].1, main);
+    let renamed = planned(&plan, &mut disc, ROOT_MAIN);
+    assert_eq!(&renamed[79..83], b"SCAA");
+    check_tag(&renamed, 40, 3);
+    assert_eq!(planned(&plan, &mut disc, ROOT_MIRROR), renamed);
+}
+
+#[test]
+fn unreadable_root_mirror_sector_is_filled_from_main() {
+    let mut disc = fixture(true);
+    disc.denied.insert(ROOT_MIRROR);
+    assert_root_mirror_filled(disc);
+}
+
+#[test]
+fn blank_root_mirror_sector_is_filled_from_main() {
+    let mut disc = fixture(true);
+    disc.inner.put_bytes(ROOT_MIRROR, &[0; SECTOR_BYTES]);
+    assert_root_mirror_filled(disc);
+}
+
+// Two readable root copies that disagree are not repaired.
+#[test]
+fn a_root_mirror_that_differs_from_main_refuses() {
+    let mut disc = fixture(true);
+    let mut bytes = sector(&mut disc, ROOT_MIRROR);
+    bytes[1000] = 9;
+    disc.inner.put_bytes(ROOT_MIRROR, &bytes);
+    let fs = crate::udf::read_filesystem(&mut disc).unwrap();
+    assert!(matches!(
+        fs.name_plan(&mut disc, FOLDER),
+        Err(Error::DiscRead { .. })
+    ));
 }

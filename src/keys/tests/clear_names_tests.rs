@@ -5,7 +5,7 @@ use super::*;
 fn clear_fixture(collision: bool) -> Fx {
     let mut files = vec![stream(1, 2, None)];
     if collision {
-        files.push(BdFile::new("AACS/Unit_Key_RO.bak", 3, None));
+        files.push(BdFile::new("SCAA/disc.dat", 3, None));
     }
     let mut fx = fixture(&files, 1, &[&[0]]);
     fx.disc.aacs = None;
@@ -28,17 +28,18 @@ fn clear_whole_disc_names_sector_view_preserves_payload() {
         .whole_disc_reader(&fx.disc, fx.img.source(), None)
         .unwrap();
     let renamed = crate::udf::read_filesystem(&mut reader).unwrap();
+    assert_eq!(root_names(&mut reader), ["BDMV", "SCAA"]);
     let names: Vec<_> = renamed
-        .find_dir("/AACS")
+        .find_dir("/SCAA")
         .unwrap()
         .entries
         .iter()
         .map(|entry| entry.name.as_str())
         .collect();
-    assert_eq!(names, ["Unit_Key_RO.bak"]);
+    assert_eq!(names, ["Unit_Key_RO.inf"]);
     assert_eq!(
         renamed
-            .read_file(&mut reader, "/AACS/Unit_Key_RO.bak")
+            .read_file(&mut reader, "/SCAA/Unit_Key_RO.inf")
             .unwrap(),
         metadata
     );
@@ -75,9 +76,9 @@ fn clear_whole_disc_names_extraction_preserves_payload() {
     assert!(result.complete);
     assert_eq!(result.bytes_lost(), 0);
     assert_eq!(result.files.len(), 2);
-    assert!(!dest.path().join("AACS/Unit_Key_RO.inf").exists());
+    assert!(!dest.path().join("AACS").exists());
     assert_eq!(
-        std::fs::read(dest.path().join("AACS/Unit_Key_RO.bak")).unwrap(),
+        std::fs::read(dest.path().join("SCAA/Unit_Key_RO.inf")).unwrap(),
         metadata
     );
     assert_eq!(
@@ -113,14 +114,7 @@ fn clear_whole_disc_names_preparation_skips_leaf_file_entries() {
     let mut raw = fx.img.source();
     let fs = crate::udf::read_filesystem(&mut raw).unwrap();
     let patches = fs
-        .name_patches(
-            &mut raw,
-            &[crate::udf::NameRule {
-                dir: "/AACS",
-                from: "Unit_Key_RO.inf",
-                to: "Unit_Key_RO.bak",
-            }],
-        )
+        .name_patches(&mut raw, crate::whole_disc::DECRYPTED_NAME_RULES)
         .unwrap();
     assert!(!patches.is_empty());
     let mut directories = vec![fs.metadata_start() + fs.root.meta_lba];
@@ -254,15 +248,9 @@ fn clear_whole_disc_names_generic_sources_are_unchanged() {
     }
 }
 
-fn aacs_names(reader: &mut dyn SectorSource) -> Vec<String> {
+fn root_names(reader: &mut dyn SectorSource) -> Vec<String> {
     let fs = crate::udf::read_filesystem(reader).unwrap();
-    let mut names: Vec<_> = fs
-        .find_dir("/AACS")
-        .unwrap()
-        .entries
-        .iter()
-        .map(|entry| entry.name.clone())
-        .collect();
+    let mut names: Vec<_> = fs.root.entries.iter().map(|e| e.name.clone()).collect();
     names.sort();
     names
 }
@@ -283,7 +271,7 @@ fn clear_whole_disc_names_metadata_damage_copies_and_halt_propagates() {
     let fx = clear_fixture(false);
     let mut raw = fx.img.source();
     let fs = crate::udf::read_filesystem(&mut raw).unwrap();
-    let directory = fs.metadata_start() + fs.find_dir("/AACS").unwrap().meta_lba;
+    let directory = fs.metadata_start() + fs.root.meta_lba;
     for (lba, hit, halted) in [
         (256, 1, false),
         (directory, 1, false),
@@ -312,7 +300,7 @@ fn clear_whole_disc_names_malformed_directory_keeps_original_names() {
     let fx = clear_fixture(false);
     let mut raw = fx.img.source();
     let fs = crate::udf::read_filesystem(&mut raw).unwrap();
-    let directory = fs.metadata_start() + fs.find_dir("/AACS").unwrap().meta_lba;
+    let directory = fs.metadata_start() + fs.root.meta_lba;
     let mut bytes = fx.img.image.clone();
     bytes[directory as usize * 2048..directory as usize * 2048 + 2].fill(0);
     let mut reader = KeyRing::none()
@@ -333,10 +321,7 @@ fn clear_whole_disc_names_collision_keeps_both_names() {
     let mut reader = KeyRing::none()
         .whole_disc_reader(&fx.disc, fx.img.source(), None)
         .expect("a pre-existing target must not abort the copy");
-    assert_eq!(
-        aacs_names(&mut reader),
-        ["Unit_Key_RO.bak", "Unit_Key_RO.inf"]
-    );
+    assert_eq!(root_names(&mut reader), ["AACS", "BDMV", "SCAA"]);
 }
 
 #[test]
@@ -357,6 +342,7 @@ fn whole_disc_reader_keeping_names_reads_the_original_names() {
     let mut reader = KeyRing::none()
         .whole_disc_reader_keeping_names(&fx.disc, fx.img.source(), None)
         .unwrap();
+    assert_eq!(root_names(&mut reader), ["AACS", "BDMV"]);
     let fs = crate::udf::read_filesystem(&mut reader).unwrap();
     let names: Vec<_> = fs
         .find_dir("/AACS")

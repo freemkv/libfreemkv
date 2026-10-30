@@ -1,4 +1,5 @@
-//! The decrypted-name rename for a finished ISO. Rescue passes copy the disc's own names;
+//! The decrypted-name rename (root folder `AACS` → `SCAA`) for a finished ISO. Rescue passes
+//! copy the disc's own names;
 //! the caller renames once at the end from [`plan_image_names`], so sectors written by
 //! different passes never mix renamed and original metadata.
 
@@ -8,24 +9,25 @@ use crate::error::{Error, Result};
 use crate::sector::{FileSectorSource, SectorSource};
 use std::path::Path;
 
-/// What a decrypted copy did with `AACS/Unit_Key_RO.inf`.
+/// What a decrypted copy did with its root `AACS` folder. The AACS files themselves are
+/// never changed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecryptedNames {
-    /// The copy lists `Unit_Key_RO.bak` and no `.inf`. `mirror_sectors_restored` counts
+    /// The copy's root lists `SCAA` and no `AACS`. `mirror_sectors_restored` counts
     /// metadata mirror sectors rebuilt from the main copy.
     Renamed { mirror_sectors_restored: u32 },
-    /// The copy keeps `Unit_Key_RO.inf`; its content is still decrypted.
+    /// The copy keeps its `AACS` folder; its content is still decrypted.
     Kept { cause: NamesKept },
 }
 
-/// Why a copy keeps `Unit_Key_RO.inf`.
+/// Why a copy keeps its `AACS` folder.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamesKept {
-    /// Its directory could not be read; a run that reads it can rename it.
+    /// The root directory could not be read; a run that reads it can rename the folder.
     Damaged,
-    /// The disc already has a `Unit_Key_RO.bak`.
+    /// The disc (or, for a folder, the host) already has an `SCAA`.
     Collision,
     /// Metadata the rename does not handle, or a write that did not take.
     Unexpected,
@@ -109,8 +111,9 @@ impl<S: SectorSource> SectorSource for Masked<S> {
     }
 }
 
-/// Plan the decrypted-name rename of the ISO at `path`, reading `unreadable` `(start, count)`
-/// ranges as errors. `None` when there is nothing to rename. Never writes.
+/// Plan the decrypted-name rename (root `AACS` → `SCAA`) of the ISO at `path`, reading
+/// `unreadable` `(start, count)` ranges as errors. `None` when there is nothing to rename:
+/// no `AACS` folder, or already renamed. Never writes.
 pub fn plan_image_names(path: &Path, unreadable: &[(u32, u32)]) -> Result<Option<ImageNames>> {
     let mut src = Masked::new(FileSectorSource::open(path)?, unreadable);
     let plan = match crate::udf::read_name_patches(&mut src, DECRYPTED_NAME_RULES)? {
@@ -141,8 +144,9 @@ pub fn plan_image_names(path: &Path, unreadable: &[(u32, u32)]) -> Result<Option
     Ok(Some(ImageNames { sectors, restored }))
 }
 
-/// Whether the ISO at `path` lists `Unit_Key_RO.bak` or `.inf`; `None` when it has no
-/// `/AACS` names. An unmountable image is `Kept { Damaged }` only for an `aacs` disc.
+/// Whether the ISO at `path` has renamed its root `AACS` folder: `SCAA` and no `AACS` is
+/// `Renamed`, a listed `AACS` is `Kept`, neither is `None` (no AACS folder). An unmountable
+/// image is `Kept { Damaged }` only for an `aacs` disc.
 /// `Renamed` needs a readable metadata mirror to agree with main, and reports
 /// `mirror_sectors_restored: 0`; the writer knows its own count.
 pub fn check_image_names(
@@ -172,7 +176,7 @@ pub fn check_image_names(
             Ok(_) => kept(NamesKept::Unexpected),
         },
         // Renamed on main: the reverse plan reads the mirror, and refuses two readable
-        // copies that differ (a mirror still listing `.inf`).
+        // copies that differ (a mirror still listing `AACS`).
         (false, true) => {
             let back = crate::udf::NameRule {
                 dir: rule.dir,

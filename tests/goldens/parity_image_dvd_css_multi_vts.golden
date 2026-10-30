@@ -1,4 +1,4 @@
-extract result = good=860288 unreadable=0 complete=true halted=false files=[("AACS/Unit_Key_RO.bak", 128, 0, true), ("VIDEO_TS/VTS_01_1.VOB", 430080, 0, true), ("VIDEO_TS/VTS_02_1.VOB", 430080, 0, true)]
-extract out AACS/Unit_Key_RO.bak = 128 bytes sha256:2568ec8a00418bee22a0320619cc480c
+extract result = good=860288 unreadable=0 complete=true halted=false files=[("SCAA/Unit_Key_RO.inf", 128, 0, true), ("VIDEO_TS/VTS_01_1.VOB", 430080, 0, true), ("VIDEO_TS/VTS_02_1.VOB", 430080, 0, true)]
+extract out SCAA/Unit_Key_RO.inf = 128 bytes sha256:2568ec8a00418bee22a0320619cc480c
 extract out VIDEO_TS/VTS_01_1.VOB = 430080 bytes sha256:4f62f2019c87c5183c7015aeebdbf241
 extract out VIDEO_TS/VTS_02_1.VOB = 430080 bytes sha256:4f62f2019c87c5183c7015aeebdbf241

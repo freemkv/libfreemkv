@@ -14,6 +14,8 @@ pub struct MetadataMirrorLayout {
     pub blocks: u32,
     /// The main sector holding `/AACS`'s file identifiers.
     pub aacs_dir: u32,
+    /// The main sector holding the root directory's file identifiers (`AACS`, `BDMV`).
+    pub root_dir: u32,
 }
 
 impl MetadataMirrorLayout {
@@ -31,6 +33,7 @@ pub fn add_metadata_mirror(img: &mut EncryptedBdImage) -> MetadataMirrorLayout {
     let main = fs.partition_start();
     let aacs = fs.find_dir("/AACS").expect("fixture /AACS");
     let aacs_dir = fs.extents_abs_at(&mut src, aacs.meta_lba).expect("/AACS")[0].lba;
+    let root_dir = fs.extents_abs_at(&mut src, fs.root.meta_lba).expect("root")[0].lba;
     // DirImage lays every metadata block before any file data.
     let inf = fs
         .file_extents(&mut src, "/AACS/Unit_Key_RO.inf")
@@ -57,6 +60,25 @@ pub fn add_metadata_mirror(img: &mut EncryptedBdImage) -> MetadataMirrorLayout {
         mirror,
         blocks,
         aacs_dir,
+        root_dir,
+    }
+}
+
+/// Rename `/AACS/Unit_Key_RO.inf` to `Unit_Key_RO.bak` in `image` (main and mirror, with
+/// their checksums) as a 1.8.6 decrypted copy did.
+pub fn rename_key_file_like_1_8_6(image: &mut [u8]) {
+    let rule = [crate::udf::NameRule {
+        dir: "/AACS",
+        from: "Unit_Key_RO.inf",
+        to: "Unit_Key_RO.bak",
+    }];
+    let mut src = MemSource::new(image.to_vec());
+    let plan = crate::udf::read_name_patches(&mut src, &rule)
+        .expect("fixture UDF")
+        .expect("a UDF image");
+    assert!(plan.fills.is_empty() && !plan.patches.is_empty());
+    for p in plan.patches {
+        image[p.lba as usize * SECTOR_BYTES + p.offset] = p.value;
     }
 }
 

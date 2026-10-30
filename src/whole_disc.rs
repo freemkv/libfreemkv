@@ -25,10 +25,13 @@ pub use image_names::{
     DecryptedNames, ImageNames, Masked, NamesKept, check_image_names, plan_image_names,
 };
 
+// A decrypted copy renames its root `AACS` folder to `SCAA` (same length, so no sector or
+// layout moves); every AACS file inside stays byte for byte as the disc has it. With no
+// `AACS` folder, libaacs/libbluray (VLC) don't treat the decrypted copy as encrypted.
 pub(crate) const DECRYPTED_NAME_RULES: &[crate::udf::NameRule] = &[crate::udf::NameRule {
-    dir: "/AACS",
-    from: "Unit_Key_RO.inf",
-    to: "Unit_Key_RO.bak",
+    dir: "/",
+    from: "AACS",
+    to: "SCAA",
 }];
 
 // A Stop, a dead bus or a gone source ends the copy; it is not damaged metadata.

@@ -6,6 +6,11 @@
 
 - `DriveInfo::name`, `label`, `display` and `list_line`, the one way to name a drive: the OS name (`E:`, `/dev/srN`, `diskN`; the device path when it has none) and `VENDOR MODEL (rev FW)`, as `E:  HL-DT-ST BD-RE BU40N (rev 1.04)`, with control characters replaced. `drive_info(path)` gives the same for an already-open drive.
 
+### Changed
+
+- Decrypted ISO and folder copies rename the root `AACS` folder to `SCAA` instead of renaming `AACS/Unit_Key_RO.inf` to `Unit_Key_RO.bak`; every AACS file stays byte-identical to the disc. With no `AACS` folder, libaacs/libbluray (VLC) no longer treat the decrypted copy as encrypted. `plan_image_names`, `check_image_names`, `ExtractResult::names`, `DecryptedNames` and `NamesKept` keep their shape and now describe the folder: `Renamed` when the root lists `SCAA` and not `AACS`, `Kept { Collision }` when the disc already has an `SCAA` (for a folder, also a host `SCAA` this tool did not write). A copy a 1.8.6 run renamed (`AACS/Unit_Key_RO.bak`) gets the folder rename and keeps its `.bak`.
+- A folder copy whose read view could not rename the folder renames it on the host; a forced re-extract replaces an earlier `SCAA` (or a 1.8.6 `AACS`) folder only when it holds nothing but this disc's AACS files. `ExtractResult::files` paths follow a host rename. `UdfFs::find_dir("/")` returns the root.
+
 ## [1.8.6] — 2026-10-29
 
 ### Added

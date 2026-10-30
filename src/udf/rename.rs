@@ -4,7 +4,9 @@ use super::{
     Error, Result, SECTOR_BYTES, SectorSource, UdfFs, descriptor_crc16, parse_udf_name, read_sector,
 };
 
-/// One path policy. FID name lengths must match so ISO sectors and their layout stay fixed.
+/// One path policy: rename the entry `from` (a file or a directory FID) in directory `dir`
+/// (`/` is the root) to `to`. FID name lengths must match so ISO sectors and their layout
+/// stay fixed.
 #[derive(Clone, Copy)]
 pub(crate) struct NameRule {
     pub dir: &'static str,
@@ -165,6 +167,8 @@ impl UdfFs {
                 }
                 let name_at = 38 + iu_len;
                 let old = &data[pos + name_at..end];
+                // Skip deleted (0x04) and parent (0x08) FIDs; a directory (0x02) renames
+                // like a file, since only its FID's name bytes change.
                 if flags & 0x0c == 0 && parse_udf_name(old).eq_ignore_ascii_case(rule.from) {
                     found += 1;
                     let crc_len = u16::from_le_bytes([data[pos + 10], data[pos + 11]]) as usize;
@@ -736,6 +740,11 @@ mod tests {
     }
 
     fn rename_fixture(inline_tag: Option<u16>) -> RenameFixture {
+        rename_fixture_at("/AACS", inline_tag)
+    }
+
+    // The fixture with directory `dir` (`/AACS` or the root `/`) inline or extent-backed.
+    fn rename_fixture_at(dir: &str, inline_tag: Option<u16>) -> RenameFixture {
         assert_eq!(oracle_crc(b"123456789"), 0x31c3);
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("AACS")).unwrap();
@@ -745,7 +754,7 @@ mod tests {
         }
         let mut raw = DirImage::open(temp.path()).unwrap();
         let fs = super::super::read_filesystem(&mut raw).unwrap();
-        let meta_lba = fs.find_dir("/AACS").unwrap().meta_lba;
+        let meta_lba = fs.find_dir(dir).unwrap().meta_lba;
         let (mut data, _, owner_lba, _) = fs.directory_bytes(&mut raw, meta_lba).unwrap();
         let mut image = vec![0; raw.capacity_sectors() as usize * SECTOR_BYTES];
         for (lba, sector) in image.chunks_mut(SECTOR_BYTES).enumerate() {
@@ -878,6 +887,126 @@ mod tests {
             raw.read_sectors(lba as u32, 1, &mut sector, false).unwrap();
             assert_eq!(sector.as_slice(), original, "raw bytes must stay unchanged");
         }
+    }
+
+    const FOLDER: &[NameRule] = crate::whole_disc::DECRYPTED_NAME_RULES;
+
+    // The product rule renames the root directory's `AACS` FID (a directory, bit 0x02) to
+    // `SCAA`: only that name and the checksums covering it change; every AACS file, OEM,
+    // reads back under `/SCAA`.
+    fn assert_root_folder_rename(inline_tag: Option<u16>) {
+        assert_eq!(
+            (FOLDER[0].dir, FOLDER[0].from, FOLDER[0].to),
+            ("/", "AACS", "SCAA")
+        );
+        let fixture = rename_fixture_at("/", inline_tag);
+        let mut raw = crate::test_util::MemSource::new(fixture.image.clone());
+        let fs = super::super::read_filesystem(&mut raw).unwrap();
+        assert_eq!(fs.find_dir("/").unwrap().meta_lba, fs.root.meta_lba);
+        let patches = fs.name_patches(&mut raw, FOLDER).unwrap();
+        assert!(!patches.is_empty());
+        let mut prepared =
+            crate::whole_disc::UnitAligned::new(raw, Vec::new()).with_name_patches(patches.clone());
+        let mut output = vec![0; fixture.image.len()];
+        for (lba, sector) in output.chunks_mut(SECTOR_BYTES).enumerate() {
+            prepared.read_sectors(lba as u32, 1, sector, false).unwrap();
+        }
+        let owner_at = fixture.owner_lba as usize * SECTOR_BYTES;
+        assert_descriptor_valid(&output[owner_at..owner_at + SECTOR_BYTES]);
+        let mut expected = fixture.image.clone();
+        let mut pos = fixture.data_at;
+        let mut renamed_dirs = 0;
+        for &len in &fixture.fid_lengths {
+            assert_descriptor_valid(&output[pos..pos + len]);
+            let name_len = expected[pos + 19] as usize;
+            let iu_len =
+                u16::from_le_bytes(expected[pos + 36..pos + 38].try_into().unwrap()) as usize;
+            let name_at = pos + 38 + iu_len;
+            if parse_udf_name(&expected[name_at..name_at + name_len]) == "AACS" {
+                assert_eq!(expected[pos + 18] & 0x02, 0x02, "AACS is a directory FID");
+                renamed_dirs += 1;
+                expected[name_at + 1..name_at + name_len].copy_from_slice(b"SCAA");
+                let end = 16
+                    + u16::from_le_bytes(expected[pos + 10..pos + 12].try_into().unwrap()) as usize;
+                oracle_finish(&mut expected[pos..pos + len], end);
+            }
+            pos += len;
+        }
+        assert_eq!(renamed_dirs, 1);
+        if inline_tag.is_some() {
+            let end = fixture.data_at + fixture.data_len - owner_at;
+            oracle_finish(&mut expected[owner_at..owner_at + SECTOR_BYTES], end);
+        } else {
+            assert!(patches.iter().all(|patch| patch.lba != fixture.owner_lba));
+        }
+        assert_eq!(
+            output, expected,
+            "only the folder name and required checksums may change"
+        );
+        let renamed = super::super::read_filesystem(&mut prepared).unwrap();
+        assert!(renamed.find_dir("/AACS").is_none());
+        assert!(renamed.find_dir("/BDMV").is_some());
+        for name in ["Unit_Key_RO.inf", "MKB_RO.inf", "other.dat"] {
+            assert_eq!(
+                renamed
+                    .read_file(&mut prepared, &format!("/SCAA/{name}"))
+                    .unwrap(),
+                name.as_bytes()
+            );
+        }
+        // Done once, the rename has nothing left to do.
+        assert!(
+            renamed
+                .name_patches(&mut prepared, FOLDER)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn root_folder_rename_in_an_extent_backed_root() {
+        assert_root_folder_rename(None);
+    }
+
+    #[test]
+    fn root_folder_rename_in_an_inline_fe_root() {
+        assert_root_folder_rename(Some(261));
+    }
+
+    #[test]
+    fn root_folder_rename_in_an_inline_efe_root() {
+        assert_root_folder_rename(Some(266));
+    }
+
+    // A root that already lists `SCAA` keeps `AACS`: the rename never makes two folders one.
+    #[test]
+    fn a_root_with_an_scaa_folder_refuses_the_folder_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        for dir in ["AACS", "SCAA", "BDMV"] {
+            std::fs::create_dir(temp.path().join(dir)).unwrap();
+        }
+        std::fs::write(temp.path().join("AACS/Unit_Key_RO.inf"), b"original").unwrap();
+        let mut raw = DirImage::open(temp.path()).unwrap();
+        let fs = super::super::read_filesystem(&mut raw).unwrap();
+        assert!(matches!(
+            fs.name_patches(&mut raw, FOLDER),
+            Err(Error::DirNameCollision { .. })
+        ));
+    }
+
+    // `/` names the root, the directory the folder rule edits; a root without `AACS` has no rename.
+    #[test]
+    fn find_dir_of_the_root_is_the_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("BDMV")).unwrap();
+        let mut raw = DirImage::open(temp.path()).unwrap();
+        let fs = super::super::read_filesystem(&mut raw).unwrap();
+        for path in ["/", ""] {
+            let root = fs.find_dir(path).expect("root");
+            assert_eq!(root.meta_lba, fs.root.meta_lba);
+            assert!(root.entries.iter().any(|e| e.name == "BDMV"));
+        }
+        assert!(fs.name_patches(&mut raw, FOLDER).unwrap().is_empty());
     }
 
     #[test]
