@@ -264,3 +264,104 @@ fn owner_runs_match_first_match_ownership() {
         }
     }
 }
+
+const C: [u8; 5] = [0x13, 0x9D, 0x51, 0x6A, 0x2C];
+
+// A whole-disc copy keys each VOB file from its own sectors: VIDEO_TS.VOB, a menu VOB and
+// the title VOBs each under a different key, every one led by a crib-less pack only its own
+// key opens; a clear menu passes through untouched. Live (no scanned key) and image alike.
+fn per_file_keys(scanned: Option<[u8; 5]>) {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("VIDEO_TS");
+    std::fs::create_dir(&video).unwrap();
+    let scrambled = |key: &[u8; 5]| {
+        let (w1, p1) = sector(key, false);
+        let (w2, p2) = sector(key, true);
+        ([w1, w2].concat(), [p1, p2].concat())
+    };
+    let (_, clear) = sector(&A, false);
+    assert!(crate::css::scrambled_at(&clear).is_none());
+    let clear = [clear.clone(), clear].concat();
+    let files = [
+        ("VIDEO_TS.VOB", scrambled(&C)),
+        ("VTS_01_0.VOB", scrambled(&B)),
+        ("VTS_01_1.VOB", scrambled(&A)),
+        ("VTS_02_0.VOB", (clear.clone(), clear)),
+    ];
+    for (name, (wire, _)) in &files {
+        std::fs::write(video.join(name), wire).unwrap();
+    }
+    let mut image = crate::DirImage::open(dir.path()).unwrap();
+    let fs = crate::udf::read_filesystem(&mut image).unwrap();
+    let at: Vec<u32> = files
+        .iter()
+        .map(|(name, _)| {
+            fs.file_extents(&mut image, &format!("/VIDEO_TS/{name}"))
+                .unwrap()[0]
+                .0
+        })
+        .collect();
+    let disc = crate::Disc {
+        volume_id: String::new(),
+        meta_title: None,
+        format: crate::DiscFormat::Dvd,
+        capacity_sectors: image.capacity_sectors(),
+        capacity_bytes: u64::from(image.capacity_sectors()) * 2048,
+        layers: 1,
+        titles: Vec::new(),
+        region: crate::disc::DiscRegion::Free,
+        aacs: None,
+        css: scanned.map(|title_key| crate::css::CssState {
+            title_key,
+            crack_span: None,
+        }),
+        encrypted: true,
+        aacs_error: None,
+        css_error: None,
+        content_format: crate::ContentFormat::MpegPs,
+    };
+    let mut reader = crate::keys::KeyRing::none()
+        .whole_disc_reader(&disc, image, None)
+        .unwrap();
+    for ((name, (_, plain)), lba) in files.iter().zip(at) {
+        let mut buf = vec![0; plain.len()];
+        reader.read_sectors(lba, 2, &mut buf, false).unwrap();
+        assert!(
+            buf.chunks(2048)
+                .all(|s| crate::css::scrambled_at(s).is_none()),
+            "{name} still scrambled"
+        );
+        assert!(buf == *plain, "{name} not decrypted under its own key");
+    }
+}
+
+#[test]
+fn whole_disc_live_keys_every_vob_from_its_own_sectors() {
+    per_file_keys(None);
+}
+
+#[test]
+fn whole_disc_image_keys_every_vob_from_its_own_sectors() {
+    per_file_keys(Some(A));
+}
+
+// A file whose crack saw only clear sectors keys a later scrambled pack from its own crib,
+// and refuses one no crib opens rather than pass it through scrambled.
+#[test]
+fn clear_verdict_group_cracks_or_refuses_a_later_scrambled_pack() {
+    let mut css = disc_keys(&[&[(10, 2)]]);
+    css.groups[0].keys = DecryptKeys::None;
+    let (w1, p1) = sector(&B, false);
+    let (w2, p2) = sector(&B, true);
+    let mut buf = [w1, w2].concat();
+    css.decrypt(10, &mut buf, &mut DecryptKeys::None).unwrap();
+    assert_eq!(buf, [p1, p2].concat());
+
+    let mut css = disc_keys(&[&[(10, 1)]]);
+    css.groups[0].keys = DecryptKeys::None;
+    let (mut wire, _) = sector(&B, false);
+    assert!(matches!(
+        css.decrypt(10, &mut wire, &mut DecryptKeys::None),
+        Err(Error::CssKeyMissing)
+    ));
+}

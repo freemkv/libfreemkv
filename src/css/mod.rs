@@ -329,14 +329,7 @@ fn crack_key_scan(
                         // or an unencrypted title falsely reports E7023.
                         if let Some(at) = scrambled_at(sect) {
                             saw_scrambled = true;
-                            // A stuffed pack's flags sit past 0x14 (m1); a DVD-Video pack's never do.
-                            let key = if at == 0x14 {
-                                keyless::crack_title_key(sect)
-                            } else {
-                                let mut copy = sect.to_vec();
-                                with_flags_at_0x14(&mut copy, at, |c| keyless::crack_title_key(c))
-                            };
-                            if let Some(key) = key {
+                            if let Some(key) = crack_pack_at(sect, at) {
                                 return CrackOutcome::Cracked(CssState {
                                     title_key: key,
                                     crack_span,
@@ -382,6 +375,32 @@ fn crack_key_scan(
     } else {
         CrackOutcome::Unencrypted
     }
+}
+
+// The title key of one scrambled pack whose flags sit at `at`, when its crib cracks it.
+fn crack_pack_at(sect: &[u8], at: usize) -> Option<[u8; 5]> {
+    // A stuffed pack's flags sit past 0x14 (m1); a DVD-Video pack's never do.
+    if at == 0x14 {
+        keyless::crack_title_key(sect)
+    } else {
+        let mut copy = sect.to_vec();
+        with_flags_at_0x14(&mut copy, at, |c| keyless::crack_title_key(c))
+    }
+}
+
+/// The scramble state of `buf`'s 2048-byte sectors: `None` when none is a scrambled pack,
+/// else the first title key any scrambled pack's crib cracks (`Some(None)`: none cracked).
+pub(crate) fn crack_buffer(buf: &[u8]) -> Option<Option<[u8; 5]>> {
+    let mut scrambled = false;
+    for sect in buf.as_chunks::<2048>().0 {
+        if let Some(at) = scrambled_at(sect) {
+            scrambled = true;
+            if let Some(key) = crack_pack_at(sect, at) {
+                return Some(Some(key));
+            }
+        }
+    }
+    scrambled.then_some(None)
 }
 
 /// Descramble a single CSS-encrypted sector in place.

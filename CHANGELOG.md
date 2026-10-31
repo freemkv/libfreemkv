@@ -6,6 +6,7 @@
 
 - `Drive::set_speed` also sends SET STREAMING before SET CD SPEED. DVD and BD drives take their read speed from it, and many ignore SET CD SPEED for DVD media, which left video DVDs at the drive's slow default.
 - A scan logs the read speed the drive reports (GET PERFORMANCE) after setting it, so a drive that stays slow is visible in the log; a drive that rejects SET STREAMING is logged as a warning.
+- Decrypted DVD ISO and folder copies descramble every VOB, menus included. Each VOB file is keyed from its own sectors: `VIDEO_TS.VOB`, each `VTS_xx_0.VOB` menu and each title set's `VTS_xx_1..9.VOB` get their own CSS key. Before, `VIDEO_TS.VOB` from a live drive was copied still scrambled (players needed libdvdcss to open the ISO), and a menu VOB took its title set's key. A VOB whose scrambled sectors yield no key stops the copy with `CssKeyMissing` instead of passing them through. The DVD whole-disc content map now covers every VOB, not just the titles.
 
 ## [1.8.7] — 2026-10-31
 

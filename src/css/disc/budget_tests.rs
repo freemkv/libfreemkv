@@ -87,7 +87,7 @@ fn many_aliases_expand_a_terminating_icb_once() {
     let (fs, mut disc) = parsed_with(files, |disc| long_chain(disc, 100));
     assert_eq!(fs.root.entries.len(), 512);
     assert!(fs.root.entries.iter().all(|entry| entry.size == 300 * 2048));
-    let keys = DiscKeys::new(&fs, &mut disc, &DecryptKeys::None, None).unwrap();
+    let keys = DiscKeys::new(&fs, &mut disc, None).unwrap();
     assert_eq!(keys.groups.len(), 1);
     let icb_reads = disc
         .reads
@@ -123,7 +123,7 @@ fn fragmented_files(
 }
 
 fn assert_budget_error(fs: &UdfFs, disc: &mut CountingDisc) {
-    let result = DiscKeys::new(fs, disc, &DecryptKeys::None, None);
+    let result = DiscKeys::new(fs, disc, None);
     assert!(
         matches!(result, Err(Error::DiscRead { sector, status: None, sense: None }) if sector == u64::from(PART_START)),
         "aggregate extent budget must fail with a metadata DiscRead error"
@@ -160,7 +160,7 @@ fn aliases_preserve_title_eligibility_and_title_traversal_order() {
         ],
     ] {
         let (fs, mut disc) = parsed(files);
-        let keys = DiscKeys::new(&fs, &mut disc, &DecryptKeys::None, None).unwrap();
+        let keys = DiscKeys::new(&fs, &mut disc, None).unwrap();
         let data_reads: Vec<_> = disc
             .reads
             .iter()
@@ -176,7 +176,7 @@ fn aliases_preserve_title_eligibility_and_title_traversal_order() {
 #[test]
 fn small_fragmented_clear_dvd_keeps_all_spans() {
     let (fs, mut disc) = parsed(fragmented_files(2, 3, true));
-    let keys = DiscKeys::new(&fs, &mut disc, &DecryptKeys::None, None).unwrap();
+    let keys = DiscKeys::new(&fs, &mut disc, None).unwrap();
     assert_eq!(keys.groups.len(), 2);
     assert!(keys.groups.iter().all(|group| group.spans.len() == 600));
     assert!(
@@ -191,7 +191,7 @@ fn temporary_candidates_are_released_between_groups() {
     // 40,000 retained spans + the active group's 20,000 candidates fit.
     // Keeping the previous group's candidates too would exceed the cap.
     let (fs, mut disc) = parsed(fragmented_files(2, 100, true));
-    let keys = DiscKeys::new(&fs, &mut disc, &DecryptKeys::None, None).unwrap();
+    let keys = DiscKeys::new(&fs, &mut disc, None).unwrap();
     assert_eq!(keys.groups.len(), 2);
     assert!(keys.groups.iter().all(|group| group.spans.len() == 20_000));
 }

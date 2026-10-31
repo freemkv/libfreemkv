@@ -807,18 +807,17 @@ impl KeyRing {
         if !self.is_for(&disc.media_id()) {
             return Err(Self::caller_bug("key set is not for this disc"));
         }
-        let content = disc.encrypted_content_ranges();
         Ok(if !self.0.aacs {
             if !inner.random_access() {
                 return Err(Self::caller_bug("decrypting reader over a prefetcher"));
             }
-            let mut dec = DecryptingSectorSource::new(inner, disc.decrypt_keys())
+            // The DVD content map is every VOB's extents (menus too), set by `with_disc_css`:
+            // the title-only `encrypted_content_ranges` would leave menu VOBs out.
+            let dec = DecryptingSectorSource::new(inner, disc.decrypt_keys())
                 .with_disc_css(disc, halt)?;
-            if !content.is_empty() {
-                dec = dec.with_content_ranges(Arc::from(content));
-            }
             crate::whole_disc::UnitAligned::new(dec, Vec::new())
         } else {
+            let content = disc.encrypted_content_ranges();
             if !self.covers(&KeyScope::WholeDisc) {
                 return Err(Self::caller_bug("whole disc outside the key set's scope"));
             }

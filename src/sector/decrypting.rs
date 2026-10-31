@@ -217,12 +217,12 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
                 Err(crate::error::Error::UdfNotFilesystem) => return Ok(self),
                 Err(e) => return Err(e),
             };
-            self.css_titles = Some(crate::css::disc::DiscKeys::new(
-                &fs,
-                &mut self.inner,
-                &self.keys,
-                halt,
-            )?);
+            let titles = crate::css::disc::DiscKeys::new(&fs, &mut self.inner, halt)?;
+            let content = titles.content_ranges();
+            if !content.is_empty() {
+                self.content_ranges = Some(Arc::from(content));
+            }
+            self.css_titles = Some(titles);
         }
         Ok(self)
     }

@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::halt::Halt;
 use crate::sector::SectorSource;
 use crate::udf::{DirEntry, MAX_WALK_RANGES, UdfFs};
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet};
 
 const CRACK_BATCH_SECTORS: u16 = 64;
 
@@ -20,20 +20,22 @@ pub(crate) struct DiscKeys {
 }
 
 impl DiscKeys {
+    /// One key group per VOB file set, each cracked from its own scrambled sectors: a VTS's
+    /// title VOBs (`VTS_xx_1..9`) share one, its menu VOB (`VTS_xx_0`) and `VIDEO_TS.VOB` each
+    /// have their own (CSS keys each file separately). Title groups come first, so a span
+    /// two files claim belongs to the title. A group whose crack finds scrambled sectors but
+    /// no key refuses (`CssKeyMissing`): another file's key is never applied to it.
     pub(crate) fn new(
         fs: &UdfFs,
         reader: &mut dyn SectorSource,
-        fallback: &DecryptKeys,
         halt: Option<&Halt>,
     ) -> Result<Self> {
-        fn collect<'a>(dir: &'a DirEntry, out: &mut BTreeMap<String, Vec<&'a DirEntry>>) {
+        fn collect<'a>(dir: &'a DirEntry, out: &mut BTreeMap<(u8, String), Vec<&'a DirEntry>>) {
             for entry in &dir.entries {
                 if entry.is_dir {
                     collect(entry, out);
-                } else if entry.name.to_ascii_uppercase().ends_with(".VOB")
-                    && let Some(vts) = vts_group_of(&entry.name)
-                {
-                    out.entry(vts).or_default().push(entry);
+                } else if let Some(key) = vob_group_of(&entry.name) {
+                    out.entry(key).or_default().push(entry);
                 }
             }
         }
@@ -41,55 +43,43 @@ impl DiscKeys {
         collect(&fs.root, &mut files);
         let mut groups = Vec::new();
         let mut total_spans = 0;
+        // ICBs already owned: an alias (any name, any group) adds no second owner.
+        let mut seen = BTreeSet::new();
         for (_, mut files) in files {
             files.sort_by_key(|f| f.name.to_ascii_uppercase());
             let mut group = Group {
                 spans: Vec::new(),
-                keys: fallback.clone(),
+                keys: DecryptKeys::None,
             };
             let mut crack = Vec::new();
-            let mut seen = BTreeMap::new();
             for entry in files {
-                let (range, title_seen) = match seen.entry(entry.meta_lba) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(seen_entry) => {
-                        let start = group.spans.len();
-                        for extent in fs
-                            .extents_abs_at(reader, entry.meta_lba)?
-                            .into_iter()
-                            .filter(|e| e.recorded)
-                        {
-                            // Include other groups' retained spans and this group's
-                            // temporary candidates in the existing UDF walk limit.
-                            if total_spans + crack.len() >= MAX_WALK_RANGES {
-                                return Err(Error::DiscRead {
-                                    sector: u64::from(fs.metadata_start()),
-                                    status: None,
-                                    sense: None,
-                                });
-                            }
-                            group.spans.push(Extent {
-                                start_lba: extent.lba,
-                                sector_count: u64::from(extent.len).div_ceil(2048) as u32,
-                            });
-                            total_spans += 1;
-                        }
-                        seen_entry.insert((start..group.spans.len(), false))
-                    }
-                };
-                // A menu alias may precede a title alias to the same ICB. Add
-                // candidates at its first title alias, preserving crack order.
-                if is_title_vob(&entry.name) && !*title_seen {
-                    if total_spans + crack.len() + range.len() > MAX_WALK_RANGES {
-                        return Err(Error::DiscRead {
-                            sector: u64::from(fs.metadata_start()),
-                            status: None,
-                            sense: None,
-                        });
-                    }
-                    crack.extend_from_slice(&group.spans[range.clone()]);
-                    *title_seen = true;
+                if !seen.insert(entry.meta_lba) {
+                    continue;
                 }
+                let start = group.spans.len();
+                for extent in fs
+                    .extents_abs_at(reader, entry.meta_lba)?
+                    .into_iter()
+                    .filter(|e| e.recorded)
+                {
+                    // Include other groups' retained spans and this group's
+                    // temporary candidates in the existing UDF walk limit.
+                    if total_spans + crack.len() >= MAX_WALK_RANGES {
+                        return Err(budget_error(fs));
+                    }
+                    group.spans.push(Extent {
+                        start_lba: extent.lba,
+                        sector_count: u64::from(extent.len).div_ceil(2048) as u32,
+                    });
+                    total_spans += 1;
+                }
+                if total_spans + crack.len() + (group.spans.len() - start) > MAX_WALK_RANGES {
+                    return Err(budget_error(fs));
+                }
+                crack.extend_from_slice(&group.spans[start..]);
+            }
+            if group.spans.is_empty() {
+                continue;
             }
             if !crack.is_empty() {
                 group.keys =
@@ -97,7 +87,9 @@ impl DiscKeys {
                         super::CrackOutcome::Cracked(state) => DecryptKeys::Css {
                             title_key: state.title_key,
                         },
-                        super::CrackOutcome::Unencrypted => fallback.clone(),
+                        // Clear so far: a scrambled sector read later is cracked from
+                        // itself or refused (see `decrypt`), never keyed by another file.
+                        super::CrackOutcome::Unencrypted => DecryptKeys::None,
                         super::CrackOutcome::Halted => return Err(Error::Halted),
                         super::CrackOutcome::ScrambledUncracked => {
                             return Err(Error::CssKeyMissing);
@@ -108,6 +100,21 @@ impl DiscKeys {
             groups.push(group);
         }
         Ok(Self { groups })
+    }
+
+    /// Every VOB file's sectors as sorted, merged `(start_lba, sector_count)` ranges:
+    /// the DVD whole-disc content map (menus included, unlike the title-only
+    /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
+    pub(crate) fn content_ranges(&self) -> Vec<(u32, u32)> {
+        let mut ranges: Vec<_> = self
+            .groups
+            .iter()
+            .flat_map(|g| &g.spans)
+            .filter(|e| e.sector_count > 0)
+            .map(|e| (e.start_lba, e.sector_count))
+            .collect();
+        ranges.sort_by_key(|r| r.0);
+        crate::udf::merge_ranges(&ranges)
     }
 
     // Preserve first-match ownership when damaged metadata has overlapping spans.
@@ -178,10 +185,42 @@ impl DiscKeys {
                 Some(index) => &mut self.groups[index].keys,
                 None => &mut *fallback,
             };
+            // A file whose crack saw only clear sectors: a scrambled pack now is keyed
+            // from its own crib, else refused rather than passed through scrambled.
+            if owner.is_some() && matches!(keys, DecryptKeys::None) {
+                match super::crack_buffer(&buf[start * 2048..end * 2048]) {
+                    None => {}
+                    Some(Some(title_key)) => *keys = DecryptKeys::Css { title_key },
+                    Some(None) => return Err(Error::CssKeyMissing),
+                }
+            }
             crate::decrypt::decrypt_sectors(&mut buf[start * 2048..end * 2048], keys, 0)?;
         }
         Ok(())
     }
+}
+
+// The UDF walk limit's refusal, as a metadata read failure.
+fn budget_error(fs: &UdfFs) -> Error {
+    Error::DiscRead {
+        sector: u64::from(fs.metadata_start()),
+        status: None,
+        sense: None,
+    }
+}
+
+// A VOB's key group, ordered titles, then menus, then `VIDEO_TS.VOB`; `None` for any
+// other file.
+fn vob_group_of(name: &str) -> Option<(u8, String)> {
+    let up = name.to_ascii_uppercase();
+    if !up.ends_with(".VOB") {
+        return None;
+    }
+    if up == "VIDEO_TS.VOB" {
+        return Some((2, up));
+    }
+    let vts = vts_group_of(&up)?;
+    Some((u8::from(!is_title_vob(&up)), vts))
 }
 
 /// DVD VTS group key for a `VTS_xx_*` file name, else `None`. e.g.
