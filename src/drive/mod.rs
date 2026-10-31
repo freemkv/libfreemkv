@@ -1386,7 +1386,7 @@ impl Drive {
         if let Err(e) =
             self.scsi_execute(&cdb, crate::scsi::DataDirection::ToDevice, &mut desc, 5_000)
         {
-            tracing::debug!(target: "freemkv::drive", error = %e, "SET STREAMING not accepted");
+            tracing::warn!(target: "freemkv::drive", error = %e, "SET STREAMING not accepted");
         }
         let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
         let mut dummy = [0u8; 0];
@@ -1394,6 +1394,22 @@ impl Drive {
         {
             tracing::warn!(target: "freemkv::drive", error = %e, "SET CD SPEED failed");
         }
+    }
+
+    /// The read speed (KB/s) the drive reports for the loaded disc, via GET PERFORMANCE;
+    /// `None` when unsupported. Logged once per scan so a drive that stays slow (DVD
+    /// riplock) is visible.
+    pub fn read_speed_kbs(&mut self) -> Option<u32> {
+        let cdb = crate::scsi::build_get_performance();
+        let mut buf = [0u8; 24];
+        self.scsi_execute(
+            &cdb,
+            crate::scsi::DataDirection::FromDevice,
+            &mut buf,
+            5_000,
+        )
+        .ok()?;
+        crate::scsi::parse_get_performance(&buf)
     }
 
     /// Lock the tray so the disc cannot be ejected during a rip. After a Stop it

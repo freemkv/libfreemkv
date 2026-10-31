@@ -106,3 +106,20 @@ fn set_streaming_asks_for_max_read_speed_over_the_whole_disc() {
         "slowest the drive allows"
     );
 }
+
+#[test]
+fn get_performance_reads_the_end_speed_of_the_first_descriptor() {
+    let cdb = build_get_performance();
+    assert_eq!(cdb[0], SCSI_GET_PERFORMANCE);
+    assert_eq!(cdb[9], 1, "one descriptor");
+    assert_eq!(cdb[10], 0, "Type 0: performance");
+    let mut buf = [0u8; 24];
+    buf[20..24].copy_from_slice(&22_160u32.to_be_bytes()); // 16x DVD
+    assert_eq!(parse_get_performance(&buf), Some(22_160));
+    assert_eq!(
+        parse_get_performance(&[0u8; 24]),
+        None,
+        "zero speed = unknown"
+    );
+    assert_eq!(parse_get_performance(&[0u8; 10]), None, "short reply");
+}

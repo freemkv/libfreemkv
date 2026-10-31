@@ -35,6 +35,7 @@ pub const SCSI_READ_TOC: u8 = 0x43;
 pub const SCSI_GET_CONFIGURATION: u8 = 0x46;
 pub const SCSI_SET_CD_SPEED: u8 = 0xBB;
 pub const SCSI_SET_STREAMING: u8 = 0xB6;
+pub const SCSI_GET_PERFORMANCE: u8 = 0xAC;
 pub const SCSI_SEND_KEY: u8 = 0xA3;
 pub const SCSI_REPORT_KEY: u8 = 0xA4;
 pub const SCSI_READ_12: u8 = 0xA8;
@@ -755,6 +756,20 @@ pub fn build_set_streaming(read_speed: u16) -> ([u8; 12], [u8; 28]) {
     d[20..24].copy_from_slice(&kbs.to_be_bytes());
     d[24..28].copy_from_slice(&1000u32.to_be_bytes());
     (cdb, d)
+}
+
+/// Build a GET PERFORMANCE CDB asking for the nominal read performance (Type 0), one
+/// descriptor.
+pub fn build_get_performance() -> [u8; 12] {
+    [SCSI_GET_PERFORMANCE, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+}
+
+/// The end-of-range read speed (KB/s) from a GET PERFORMANCE reply: 8-byte header, then
+/// 16-byte descriptors of start LBA, start speed, end LBA, end speed.
+pub fn parse_get_performance(buf: &[u8]) -> Option<u32> {
+    let d = buf.get(8..24)?;
+    let kbs = u32::from_be_bytes(d[12..16].try_into().ok()?);
+    (kbs > 0).then_some(kbs)
 }
 
 /// Build a SET CD SPEED CDB.

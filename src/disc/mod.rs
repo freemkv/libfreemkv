@@ -2024,6 +2024,12 @@ impl Disc {
         let dvd = session.disc_is_dvd();
         // Max read speed; removes riplock on DVD.
         session.set_speed(Drive::SPEED_MAX_KBPS);
+        match session.read_speed_kbs() {
+            Some(kbs) => {
+                tracing::info!(target: "freemkv::drive", read_kbs = kbs, dvd, "drive read speed")
+            }
+            None => tracing::info!(target: "freemkv::drive", dvd, "drive read speed not reported"),
+        }
         // CSS bus-auth before any read, else the UDF prefetch hits scrambled VOB extents.
         if dvd {
             Self::css_bus_step(session)?;
