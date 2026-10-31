@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.8] — UNRELEASED
+
+### Fixed
+
+- `Drive::set_speed` also sends SET STREAMING before SET CD SPEED. DVD and BD drives take their read speed from it, and many ignore SET CD SPEED for DVD media, which left video DVDs at the drive's slow default.
+
 ## [1.8.7] — 2026-10-31
 
 ### Added

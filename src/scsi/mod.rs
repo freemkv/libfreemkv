@@ -34,6 +34,7 @@ pub const SCSI_READ_BUFFER: u8 = 0x3C;
 pub const SCSI_READ_TOC: u8 = 0x43;
 pub const SCSI_GET_CONFIGURATION: u8 = 0x46;
 pub const SCSI_SET_CD_SPEED: u8 = 0xBB;
+pub const SCSI_SET_STREAMING: u8 = 0xB6;
 pub const SCSI_SEND_KEY: u8 = 0xA3;
 pub const SCSI_REPORT_KEY: u8 = 0xA4;
 pub const SCSI_READ_12: u8 = 0xA8;
@@ -735,6 +736,25 @@ pub fn build_read_buffer(mode: u8, buffer_id: u8, offset: u32, length: u32) -> [
         length as u8,
         0x00,
     ]
+}
+
+/// Build a SET STREAMING CDB and its performance descriptor (MMC Type 0). DVD and BD
+/// drives take their read speed from this; many ignore SET CD SPEED for DVD media,
+/// which leaves a video DVD at the drive's slow default (riplock).
+pub fn build_set_streaming(read_speed: u16) -> ([u8; 12], [u8; 28]) {
+    let cdb = [SCSI_SET_STREAMING, 0, 0, 0, 0, 0, 0, 0, 0, 0, 28, 0];
+    let kbs: u32 = if read_speed == 0xFFFF {
+        u32::MAX
+    } else {
+        read_speed.max(1) as u32
+    };
+    let mut d = [0u8; 28];
+    d[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // end LBA: the whole disc
+    d[12..16].copy_from_slice(&kbs.to_be_bytes()); // read size (KB) ...
+    d[16..20].copy_from_slice(&1000u32.to_be_bytes()); // ... per 1000 ms
+    d[20..24].copy_from_slice(&kbs.to_be_bytes());
+    d[24..28].copy_from_slice(&1000u32.to_be_bytes());
+    (cdb, d)
 }
 
 /// Build a SET CD SPEED CDB.

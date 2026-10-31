@@ -89,3 +89,20 @@ fn set_cd_speed_zero_means_drive_default() {
     assert_eq!(cdb[2], 0x00);
     assert_eq!(cdb[3], 0x00);
 }
+
+#[test]
+fn set_streaming_asks_for_max_read_speed_over_the_whole_disc() {
+    let (cdb, d) = build_set_streaming(0xFFFF);
+    assert_eq!(cdb[0], SCSI_SET_STREAMING);
+    assert_eq!(&cdb[9..11], &[0, 28], "parameter list length");
+    assert_eq!(&d[4..8], &[0; 4], "start LBA 0");
+    assert_eq!(&d[8..12], &[0xFF; 4], "end LBA: whole disc");
+    assert_eq!(&d[12..16], &[0xFF; 4], "max read size");
+    assert_eq!(u32::from_be_bytes(d[16..20].try_into().unwrap()), 1000);
+    let (_, slow) = build_set_streaming(0);
+    assert_eq!(
+        u32::from_be_bytes(slow[12..16].try_into().unwrap()),
+        1,
+        "slowest the drive allows"
+    );
+}

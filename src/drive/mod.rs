@@ -1381,6 +1381,13 @@ impl Drive {
     pub const SPEED_MAX_KBPS: u16 = 0xFFFF;
 
     pub fn set_speed(&mut self, speed_kbs: u16) {
+        // SET STREAMING first: DVD and BD drives honour it where they ignore SET CD SPEED.
+        let (cdb, mut desc) = crate::scsi::build_set_streaming(speed_kbs);
+        if let Err(e) =
+            self.scsi_execute(&cdb, crate::scsi::DataDirection::ToDevice, &mut desc, 5_000)
+        {
+            tracing::debug!(target: "freemkv::drive", error = %e, "SET STREAMING not accepted");
+        }
         let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
         let mut dummy = [0u8; 0];
         if let Err(e) = self.scsi_execute(&cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000)

@@ -2382,3 +2382,24 @@ fn read_capacity_zero_last_lba_is_one_sector() {
     let buf = [0, 0, 0, 0, 0, 0, 0, 0];
     assert_eq!(decode_read_capacity(&buf, 8).unwrap(), 1);
 }
+
+/// DVD drives keep their slow default (riplock) unless asked through SET STREAMING;
+/// SET CD SPEED alone is ignored for DVD media by many drives.
+#[test]
+fn set_speed_sends_set_streaming_then_set_cd_speed() {
+    let cdbs = Arc::new(Mutex::new(Vec::new()));
+    let mut d = Drive::from_transport_for_test(Box::new(SequenceTransport {
+        cdbs: cdbs.clone(),
+        ok: true,
+    }));
+    cdbs.lock().unwrap().clear();
+    d.set_speed(Drive::SPEED_MAX_KBPS);
+    let sent: Vec<u8> = cdbs.lock().unwrap().iter().map(|c| c[0]).collect();
+    assert_eq!(
+        sent,
+        [
+            crate::scsi::SCSI_SET_STREAMING,
+            crate::scsi::SCSI_SET_CD_SPEED
+        ]
+    );
+}
