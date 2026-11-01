@@ -32,7 +32,7 @@ jobs:
   # the MSRV read `needs.resolve-msrv.outputs.v` from Cargo.toml's rust-version;
   # clippy (cross-lint) runs on stable instead.
   resolve-msrv:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, 'bump version')) }}
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, 'bump version')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -123,7 +123,7 @@ jobs:
   # Independent decoder/remux verification uses generated media and belongs
   # on qa, alongside the release suite. Also runnable manually on a branch.
   ffmpeg-validation:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, 'bump version')) }}
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, 'bump version')) }}
     uses: ./.github/workflows/ffmpeg-validation.yml
     permissions:
       contents: read
@@ -132,7 +132,7 @@ jobs:
   # the target it compiles for. Linting solely on the dev machine's host
   # target is how a lint that CI rejects reaches a push.
   cross-lint:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, 'bump version')) }}
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, 'bump version')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
