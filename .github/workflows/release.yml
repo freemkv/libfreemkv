@@ -46,7 +46,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Cargo.lock is now committed (issue #15), but --locked is still omitted:
       # the sibling path-patch layout resolves the freemkv crates as path
       # packages, which --locked can't satisfy.
