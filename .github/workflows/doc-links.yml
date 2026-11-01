@@ -4,7 +4,10 @@ name: doc-links
 # libfreemkv deps freemkv-unlock by version (git-tag override), so the reusable
 # checks it out as a sibling and path-patches it, and resolves the toolchain
 # from rust-version.
-on: [push, pull_request]
+on:
+  push:
+    branches: [dev]
+  pull_request:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

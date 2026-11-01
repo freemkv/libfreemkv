@@ -2,10 +2,9 @@ name: CI
 
 on:
   push:
-    # dev -> qa -> main. `dev` is where work lands and is pushed to often: these
-    # are the FAST checks. `qa` runs these plus the expensive suite in qa.yml.
-    # `main` only moves at release time, to a commit already green on qa.
-    branches: [main, dev, qa]
+    # dev only: qa gets the exact commit dev already passed (qa.yml adds the
+    # release-candidate checks), and main only ever receives the release commit.
+    branches: [dev]
   pull_request:
 
 # Rapid dev pushes supersede their own in-progress runs instead of stacking.
@@ -18,6 +17,7 @@ jobs:
   # that builds AT the MSRV consumes needs.resolve-msrv.outputs.v so the floor
   # cannot drift. clippy and `consumers` deliberately run on `stable`.
   resolve-msrv:
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -32,6 +32,7 @@ jobs:
   # fails on main (and PRs to main); warns elsewhere so an in-progress branch
   # whose entry isn't written yet is not blocked.
   changelog:
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -152,6 +153,7 @@ jobs:
         working-directory: libfreemkv
 
   deny:
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -228,6 +230,7 @@ jobs:
   # fails a dependent's tests, which is the shape worth catching. This caught an
   # engine fixture break the moment it landed, so it stays on the dev fast lane.
   consumers:
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
