@@ -1395,8 +1395,8 @@ fn a_scrambled_vts_that_cannot_be_cracked_fails_instead_of_borrowing_a_key() {
                  not a silent extract under another VTS's key",
         );
     assert!(
-        matches!(err, Error::CssKeyMissing),
-        "expected CssKeyMissing, got {err:?}"
+        matches!(err, Error::WholeDiscKeyMissing),
+        "expected WholeDiscKeyMissing, got {err:?}"
     );
 }
 

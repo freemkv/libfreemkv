@@ -1,5 +1,6 @@
 //! DVD title-key selection for the shared sector decryption stage.
 
+use super::verify::{Verdict, verify_key};
 use crate::decrypt::DecryptKeys;
 use crate::disc::Extent;
 use crate::error::{Error, Result};
@@ -13,6 +14,12 @@ const CRACK_BATCH_SECTORS: u16 = 64;
 struct Group {
     spans: Vec<Extent>,
     keys: DecryptKeys,
+    // The group's first file, as logged when its key is borrowed or refused.
+    name: String,
+    // VTS number (0 for `VIDEO_TS.VOB`): candidate keys are tried nearest VTS first.
+    vts: u8,
+    // The group whose key is the obvious one to test first: a menu's title set.
+    relative: Option<usize>,
 }
 
 pub(crate) struct DiscKeys {
@@ -20,11 +27,15 @@ pub(crate) struct DiscKeys {
 }
 
 impl DiscKeys {
-    /// One key group per VOB file set, each cracked from its own scrambled sectors: a VTS's
-    /// title VOBs (`VTS_xx_1..9`) share one, its menu VOB (`VTS_xx_0`) and `VIDEO_TS.VOB` each
-    /// have their own (CSS keys each file separately). Title groups come first, so a span
-    /// two files claim belongs to the title. A group whose crack finds scrambled sectors but
-    /// no key refuses (`CssKeyMissing`): another file's key is never applied to it.
+    /// One key group per VOB file set: a VTS's title VOBs (`VTS_xx_1..9`) share one, its menu
+    /// VOB (`VTS_xx_0`) and `VIDEO_TS.VOB` each have their own (CSS keys each file
+    /// separately). Title groups come first, so a span two files claim belongs to the title,
+    /// and title keys are known before the menus are keyed. Each group takes, in order:
+    /// 1. its obvious key (a menu's title-set key), when that key verifies on its packs;
+    /// 2. its own cracked key;
+    /// 3. any other recovered key that verifies, nearest VTS first.
+    ///
+    /// Scrambled sectors none of these opens refuse the copy (`WholeDiscKeyMissing`).
     pub(crate) fn new(
         fs: &UdfFs,
         reader: &mut dyn SectorSource,
@@ -41,15 +52,28 @@ impl DiscKeys {
         }
         let mut files = BTreeMap::new();
         collect(&fs.root, &mut files);
-        let mut groups = Vec::new();
+        let mut groups: Vec<Group> = Vec::new();
+        let mut titles = BTreeMap::new();
         let mut total_spans = 0;
         // ICBs already owned: an alias (any name, any group) adds no second owner.
         let mut seen = BTreeSet::new();
-        for (_, mut files) in files {
+        for ((kind, set), mut files) in files {
             files.sort_by_key(|f| f.name.to_ascii_uppercase());
             let mut group = Group {
                 spans: Vec::new(),
                 keys: DecryptKeys::None,
+                name: files
+                    .first()
+                    .map_or_else(String::new, |f| f.name.to_ascii_uppercase()),
+                vts: set
+                    .strip_prefix("VTS_")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+                relative: if kind == 1 {
+                    titles.get(&set).copied()
+                } else {
+                    None
+                },
             };
             let mut crack = Vec::new();
             for entry in files {
@@ -82,20 +106,10 @@ impl DiscKeys {
                 continue;
             }
             if !crack.is_empty() {
-                group.keys =
-                    match super::crack_key_outcome(reader, &crack, CRACK_BATCH_SECTORS, halt) {
-                        super::CrackOutcome::Cracked(state) => DecryptKeys::Css {
-                            title_key: state.title_key,
-                        },
-                        // Clear so far: a scrambled sector read later is cracked from
-                        // itself or refused (see `decrypt`), never keyed by another file.
-                        super::CrackOutcome::Unencrypted => DecryptKeys::None,
-                        super::CrackOutcome::Halted => return Err(Error::Halted),
-                        super::CrackOutcome::ScrambledUncracked => {
-                            return Err(Error::CssKeyMissing);
-                        }
-                        super::CrackOutcome::Unreadable(e) => return Err(e),
-                    };
+                group.keys = key_group(&groups, &group, reader, &crack, halt)?;
+            }
+            if kind == 0 {
+                titles.insert(set, groups.len());
             }
             groups.push(group);
         }
@@ -181,22 +195,201 @@ impl DiscKeys {
         // Clear sectors belong to the same run: the CSS seam self-gates and
         // keeps its bounded retry cadence until the owner changes.
         for (start, end, owner) in self.runs(lba, buf.len() / 2048) {
+            // A file whose crack saw only clear sectors: a scrambled pack now is keyed from
+            // its own crib, else by a recovered key that verifies on the packs in hand, else
+            // refused rather than passed through scrambled.
+            if let Some(index) = owner
+                && matches!(self.groups[index].keys, DecryptKeys::None)
+            {
+                let run = &buf[start * 2048..end * 2048];
+                match super::crack_buffer(run) {
+                    None => {}
+                    Some(Some(title_key)) => {
+                        self.groups[index].keys = DecryptKeys::Css { title_key };
+                    }
+                    Some(None) => {
+                        let group = &self.groups[index];
+                        let found = candidates(&self.groups, group, &[])
+                            .into_iter()
+                            .find(|k| verify_key(k, run.chunks(2048)) == Verdict::Pass);
+                        let Some(title_key) = found else {
+                            return Err(refuse(group));
+                        };
+                        tracing::info!(
+                            target: "freemkv::css",
+                            file = %group.name,
+                            "css: scrambled packs keyed with a verified key from another file"
+                        );
+                        self.groups[index].keys = DecryptKeys::Css { title_key };
+                    }
+                }
+            }
             let keys = match owner {
                 Some(index) => &mut self.groups[index].keys,
                 None => &mut *fallback,
             };
-            // A file whose crack saw only clear sectors: a scrambled pack now is keyed
-            // from its own crib, else refused rather than passed through scrambled.
-            if owner.is_some() && matches!(keys, DecryptKeys::None) {
-                match super::crack_buffer(&buf[start * 2048..end * 2048]) {
-                    None => {}
-                    Some(Some(title_key)) => *keys = DecryptKeys::Css { title_key },
-                    Some(None) => return Err(Error::CssKeyMissing),
-                }
-            }
             crate::decrypt::decrypt_sectors(&mut buf[start * 2048..end * 2048], keys, 0)?;
         }
         Ok(())
+    }
+}
+
+// Sample batches spread across a group's spans when verifying a borrowed key.
+const SAMPLE_BATCHES: u32 = 8;
+
+// A group's key: its obvious key if it verifies, its own crack, else another recovered key
+// that verifies (see `DiscKeys::new`).
+fn key_group(
+    groups: &[Group],
+    group: &Group,
+    reader: &mut dyn SectorSource,
+    crack: &[Extent],
+    halt: Option<&Halt>,
+) -> Result<DecryptKeys> {
+    let obvious = group
+        .relative
+        .and_then(|r| css_key(&groups[r].keys))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut sample = None;
+    if let Some(key) = obvious.first() {
+        let s = sample_scrambled(reader, crack, halt)?;
+        if verify_key(key, s.chunks(2048)) == Verdict::Pass {
+            tracing::info!(
+                target: "freemkv::css",
+                file = %group.name,
+                from = %groups[group.relative.unwrap_or_default()].name,
+                "css: keyed with its title set's key, verified on its own sectors"
+            );
+            return Ok(DecryptKeys::Css { title_key: *key });
+        }
+        sample = Some(s);
+    }
+    match super::crack_key_outcome(reader, crack, CRACK_BATCH_SECTORS, halt) {
+        super::CrackOutcome::Cracked(state) => Ok(DecryptKeys::Css {
+            title_key: state.title_key,
+        }),
+        // Clear so far: a scrambled sector read later is keyed then (see `decrypt`).
+        super::CrackOutcome::Unencrypted => Ok(DecryptKeys::None),
+        super::CrackOutcome::Halted => Err(Error::Halted),
+        super::CrackOutcome::Unreadable(e) => Err(e),
+        super::CrackOutcome::ScrambledUncracked => {
+            let sample = match sample {
+                Some(s) => s,
+                None => sample_scrambled(reader, crack, halt)?,
+            };
+            for key in candidates(groups, group, &obvious) {
+                if verify_key(&key, sample.chunks(2048)) == Verdict::Pass {
+                    tracing::info!(
+                        target: "freemkv::css",
+                        file = %group.name,
+                        "css: no key cracked; keyed with another file's key, verified on its own sectors"
+                    );
+                    return Ok(DecryptKeys::Css { title_key: key });
+                }
+            }
+            Err(refuse(group))
+        }
+    }
+}
+
+fn css_key(keys: &DecryptKeys) -> Option<[u8; 5]> {
+    match keys {
+        DecryptKeys::Css { title_key } => Some(*title_key),
+        _ => None,
+    }
+}
+
+// Keys to test on `group`'s packs: its relative's, then every other group's nearest VTS
+// first, once each, leaving out `tested`.
+fn candidates(groups: &[Group], group: &Group, tested: &[[u8; 5]]) -> Vec<[u8; 5]> {
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&i| {
+        (
+            Some(i) != group.relative,
+            groups[i].vts.abs_diff(group.vts),
+            groups[i].vts,
+            i,
+        )
+    });
+    let mut out: Vec<[u8; 5]> = Vec::new();
+    for key in order.into_iter().filter_map(|i| css_key(&groups[i].keys)) {
+        if !tested.contains(&key) && !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+// The refusal for a file's scrambled sectors no recovered key opens.
+fn refuse(group: &Group) -> Error {
+    tracing::warn!(
+        target: "freemkv::css",
+        file = %group.name,
+        "css: scrambled sectors yield no key and no recovered key verifies on them"
+    );
+    Error::WholeDiscKeyMissing
+}
+
+// Scrambled packs from up to `SAMPLE_BATCHES` batches spread evenly across `spans` (every
+// sector of a small group). A Stop halts; a read error is propagated only when no batch
+// could be read, as the crack does, and a CSS-locked one is no read error.
+fn sample_scrambled(
+    reader: &mut dyn SectorSource,
+    spans: &[Extent],
+    halt: Option<&Halt>,
+) -> Result<Vec<u8>> {
+    let batch = u32::from(CRACK_BATCH_SECTORS);
+    let total: u64 = spans.iter().map(|e| u64::from(e.sector_count)).sum();
+    let mut starts = Vec::new();
+    if total <= u64::from(batch * SAMPLE_BATCHES) {
+        starts.extend((0..total).step_by(batch as usize));
+    } else {
+        let room = total - u64::from(batch);
+        starts.extend(
+            (0..u64::from(SAMPLE_BATCHES)).map(|k| k * room / u64::from(SAMPLE_BATCHES - 1)),
+        );
+    }
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; batch as usize * 2048];
+    let (mut read, mut first_err) = (false, None);
+    for at in starts {
+        if halt.is_some_and(|h| h.is_cancelled()) {
+            return Err(Error::Halted);
+        }
+        // The span holding offset `at`, and how far into it.
+        let mut off = at;
+        let Some(span) = spans.iter().find(|e| {
+            let hit = off < u64::from(e.sector_count);
+            if !hit {
+                off -= u64::from(e.sector_count);
+            }
+            hit
+        }) else {
+            continue;
+        };
+        let n = (u64::from(span.sector_count) - off).min(u64::from(batch)) as u32;
+        let lba = span.start_lba.saturating_add(off as u32);
+        match reader.read_sectors(lba, n as u16, &mut buf[..n as usize * 2048], true) {
+            Ok(got) => {
+                read = true;
+                let usable = (got / 2048).min(n as usize);
+                for s in buf[..usable * 2048].chunks(2048) {
+                    if super::scrambled_at(s).is_some() {
+                        out.extend_from_slice(s);
+                    }
+                }
+            }
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(e) if e.scsi_sense().is_some_and(|s| s.is_css_locked()) => {}
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) if !read => Err(e),
+        _ => Ok(out),
     }
 }
 

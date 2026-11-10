@@ -40,6 +40,9 @@ fn disc_keys(spans: &[&[(u32, u32)]]) -> DiscKeys {
                     })
                     .collect(),
                 keys: keys(A),
+                name: String::new(),
+                vts: 0,
+                relative: None,
             })
             .collect(),
     }
@@ -348,7 +351,7 @@ fn whole_disc_image_keys_every_vob_from_its_own_sectors() {
 }
 
 // A file whose crack saw only clear sectors keys a later scrambled pack from its own crib,
-// and refuses one no crib opens rather than pass it through scrambled.
+// and refuses one no crib or verified key opens rather than pass it through scrambled.
 #[test]
 fn clear_verdict_group_cracks_or_refuses_a_later_scrambled_pack() {
     let mut css = disc_keys(&[&[(10, 2)]]);
@@ -364,7 +367,7 @@ fn clear_verdict_group_cracks_or_refuses_a_later_scrambled_pack() {
     let (mut wire, _) = sector(&B, false);
     assert!(matches!(
         css.decrypt(10, &mut wire, &mut DecryptKeys::None),
-        Err(Error::CssKeyMissing)
+        Err(Error::WholeDiscKeyMissing)
     ));
 }
 
@@ -456,10 +459,7 @@ fn whole_disc_menu_under_an_unknown_key_is_refused() {
         ("VTS_02_1.VOB", bw, bp),
         ("VTS_02_0.VOB", mw, mp),
     ]);
-    assert!(
-        matches!(r, Err(Error::CssKeyMissing | Error::WholeDiscKeyMissing)),
-        "{r:?}"
-    );
+    assert!(matches!(r, Err(Error::WholeDiscKeyMissing)), "{r:?}");
 }
 
 // Read time: a group whose crack saw only clear sectors meets crib-less scrambled packs;

@@ -19,6 +19,7 @@ pub(crate) mod disc;
 pub mod keyless;
 pub mod lfsr;
 pub(crate) mod tables;
+pub(crate) mod verify;
 
 use crate::disc::Extent;
 use crate::sector::SectorSource;

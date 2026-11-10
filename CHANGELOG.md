@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.9] — UNRELEASED
+
+### Fixed
+
+- A decrypted DVD ISO or folder copy no longer stops with `CssKeyMissing` (E7023) when a VOB's scrambled sectors carry no crib to crack, as on discs whose `VTS_xx_0.VOB` menu shares its title set's key. Each VOB file set tries, in order: its obvious key (a menu's title-set key), its own cracked key, then every other key recovered on the disc, nearest title set first. A borrowed key is used only once it verifies on the file's own scrambled sectors (decrypted padding-packet, AC-3/DTS sync word and MPEG video start-code structure the clear headers predict). Scrambled sectors no key opens refuse the copy with `WholeDiscKeyMissing` (E7032), and the file is named in the warning log; the same order applies to a scrambled pack met later in a file whose scan saw only clear sectors.
+
 ## [1.8.8] — 2026-11-01
 
 ### Fixed
