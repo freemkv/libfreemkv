@@ -530,6 +530,64 @@ pub(crate) fn dvd_pack_header(sector: &mut [u8], stream_id: u8) {
     sector[0x14] = 0x80 | (sector[0x14] & 0x30);
 }
 
+/// Test fixture: `n` crib-less scrambled packs whose plaintext carries the structure a key can
+/// be verified against, as `(wire, plain)`. Even packs are MPEG-2 video (aligned PES opening
+/// with a sequence header, a picture and a slice start code past 0x80, a padding packet at
+/// 0x700); odd packs are AC-3 (substream header pointing at a `0B 77` frame at 0x300). Every
+/// other byte is non-zero noise from `seed`, so no stray start code or periodic run appears.
+#[cfg(test)]
+pub(crate) fn checkable_sectors(key: &[u8; 5], n: usize, seed: u32) -> (Vec<u8>, Vec<u8>) {
+    let mut state = seed.wrapping_mul(2_654_435_761).max(1);
+    let mut noise = move || loop {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let b = (state >> 7) as u8;
+        if b != 0 {
+            return b;
+        }
+    };
+    let (mut wire, mut plain) = (Vec::new(), Vec::new());
+    for i in 0..n {
+        let mut s = vec![0u8; 2048];
+        s.iter_mut().for_each(|b| *b = noise());
+        s[0x14] = 0;
+        let video = i % 2 == 0;
+        dvd_pack_header(
+            &mut s,
+            if video {
+                0xE0
+            } else {
+                crate::consts::pes_stream_id::PRIVATE_STREAM_1
+            },
+        );
+        s[0x15..0x17].fill(0); // no PTS/DTS, empty header: payload at 0x17
+        if video {
+            s[0x14] |= 0x04; // data_alignment_indicator
+            s[0x12..0x14].copy_from_slice(&(0x700u16 - 0x14).to_be_bytes());
+            s[0x17..0x1B].copy_from_slice(&[0, 0, 1, 0xB3]);
+            s[0x200..0x204].copy_from_slice(&[0, 0, 1, 0x00]);
+            s[0x400..0x404].copy_from_slice(&[0, 0, 1, 0x01]);
+            s[0x700..0x704].copy_from_slice(&[0, 0, 1, 0xBE]);
+            s[0x704..0x706].copy_from_slice(&(0x800u16 - 0x706).to_be_bytes());
+            s[0x706..].fill(0xFF);
+        } else {
+            s[0x17..0x1B].copy_from_slice(&[0x80, 0x01, 0x02, 0xE6]); // AU at 0x1A + 0x2E6
+            s[0x300..0x302].copy_from_slice(&[0x0B, 0x77]);
+        }
+        let mut w = s.clone();
+        lfsr::scramble_sector(key, &mut w);
+        assert!(scrambled_at(&w).is_some());
+        assert!(
+            keyless::attack_crib(&w).is_none(),
+            "fixture pack {i} has a crib"
+        );
+        wire.extend_from_slice(&w);
+        plain.extend_from_slice(&s);
+    }
+    (wire, plain)
+}
+
 #[cfg(test)]
 #[allow(deprecated)] // this module exercises crack_key itself, deliberately
 #[path = "mod_tests.rs"]

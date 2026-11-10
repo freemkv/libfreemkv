@@ -367,3 +367,108 @@ fn clear_verdict_group_cracks_or_refuses_a_later_scrambled_pack() {
         Err(Error::CssKeyMissing)
     ));
 }
+
+// A whole-disc copy of `files` (name, wire, plain) read back through the decrypting reader:
+// `Err` when the reader refuses, else every file must come back as its plaintext.
+fn whole_disc_copy(files: &[(&str, Vec<u8>, Vec<u8>)]) -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("VIDEO_TS");
+    std::fs::create_dir(&video).unwrap();
+    for (name, wire, _) in files {
+        std::fs::write(video.join(name), wire).unwrap();
+    }
+    let mut image = crate::DirImage::open(dir.path()).unwrap();
+    let fs = crate::udf::read_filesystem(&mut image).unwrap();
+    let at: Vec<u32> = files
+        .iter()
+        .map(|(name, ..)| {
+            fs.file_extents(&mut image, &format!("/VIDEO_TS/{name}"))
+                .unwrap()[0]
+                .0
+        })
+        .collect();
+    let disc = crate::Disc {
+        volume_id: String::new(),
+        meta_title: None,
+        format: crate::DiscFormat::Dvd,
+        capacity_sectors: image.capacity_sectors(),
+        capacity_bytes: u64::from(image.capacity_sectors()) * 2048,
+        layers: 1,
+        titles: Vec::new(),
+        region: crate::disc::DiscRegion::Free,
+        aacs: None,
+        css: None,
+        encrypted: true,
+        aacs_error: None,
+        css_error: None,
+        layer_map: None,
+        content_format: crate::ContentFormat::MpegPs,
+    };
+    let mut reader = crate::keys::KeyRing::none().whole_disc_reader(&disc, image, None)?;
+    for ((name, _, plain), lba) in files.iter().zip(at) {
+        let mut buf = vec![0; plain.len()];
+        reader.read_sectors(lba, (plain.len() / 2048) as u16, &mut buf, false)?;
+        assert!(buf == *plain, "{name} not decrypted");
+    }
+    Ok(())
+}
+
+// A title VOB under `key`: one crib pack (so it cracks) then checkable packs.
+fn title_vob(key: &[u8; 5], seed: u32) -> (Vec<u8>, Vec<u8>) {
+    let (w, p) = sector(key, true);
+    let (cw, cp) = crate::css::checkable_sectors(key, 6, seed);
+    ([w, cw].concat(), [p, cp].concat())
+}
+
+// The reported disc: a menu VOB with no crib, scrambled with its title set's key, is keyed
+// with that key once the key verifies on the menu's own packs (DVD Decryptor's "Using
+// decryption key from File: VTS_04_1.VOB").
+#[test]
+fn whole_disc_menu_without_crib_takes_its_title_sets_key() {
+    let (tw, tp) = title_vob(&A, 1);
+    let (mw, mp) = crate::css::checkable_sectors(&A, 8, 2);
+    whole_disc_copy(&[("VTS_01_1.VOB", tw, tp), ("VTS_01_0.VOB", mw, mp)]).unwrap();
+}
+
+// A crib-less menu under another title set's key is keyed with that key once it verifies.
+#[test]
+fn whole_disc_menu_without_crib_takes_another_title_sets_verified_key() {
+    let (aw, ap) = title_vob(&A, 1);
+    let (bw, bp) = title_vob(&B, 2);
+    let (mw, mp) = crate::css::checkable_sectors(&A, 8, 3);
+    whole_disc_copy(&[
+        ("VTS_01_1.VOB", aw, ap),
+        ("VTS_02_1.VOB", bw, bp),
+        ("VTS_02_0.VOB", mw, mp),
+    ])
+    .unwrap();
+}
+
+// A crib-less menu under a key no file on the disc has is refused, never copied scrambled
+// or under a key that does not verify.
+#[test]
+fn whole_disc_menu_under_an_unknown_key_is_refused() {
+    let (aw, ap) = title_vob(&A, 1);
+    let (bw, bp) = title_vob(&B, 2);
+    let (mw, mp) = crate::css::checkable_sectors(&C, 8, 3);
+    let r = whole_disc_copy(&[
+        ("VTS_01_1.VOB", aw, ap),
+        ("VTS_02_1.VOB", bw, bp),
+        ("VTS_02_0.VOB", mw, mp),
+    ]);
+    assert!(
+        matches!(r, Err(Error::CssKeyMissing | Error::WholeDiscKeyMissing)),
+        "{r:?}"
+    );
+}
+
+// Read time: a group whose crack saw only clear sectors meets crib-less scrambled packs;
+// another group's key that verifies on them opens them.
+#[test]
+fn clear_verdict_group_takes_a_verified_key_at_read_time() {
+    let mut css = disc_keys(&[&[(10, 1)], &[(20, 8)]]);
+    css.groups[1].keys = DecryptKeys::None;
+    let (mut buf, plain) = crate::css::checkable_sectors(&A, 8, 4);
+    css.decrypt(20, &mut buf, &mut DecryptKeys::None).unwrap();
+    assert!(buf == plain);
+}
