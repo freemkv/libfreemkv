@@ -20,6 +20,7 @@ fn test_disc() -> Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: ContentFormat::BdTs,
     }
 }

@@ -17,6 +17,8 @@ pub(crate) use encrypt::handshake_class_error;
 mod extract;
 mod format;
 mod hddvd;
+mod layer_map;
+pub use layer_map::{LayerMap, TrackPath, imgburn_dvd_descriptor, parse_bd_di, parse_dvd_pfi};
 pub(crate) mod pgs_forced_probe;
 pub mod profile;
 mod protection;
@@ -54,8 +56,12 @@ pub struct Disc {
     pub capacity_sectors: u32,
     /// Disc capacity in bytes
     pub capacity_bytes: u64,
-    /// Number of layers (1 = single, 2 = dual)
+    /// Number of layers (1 = single, 2 = dual): the drive's count when `layer_map` is
+    /// set, else estimated from capacity ([`DiscFormat::layers`])
     pub layers: u8,
+    /// Drive-reported layer layout (READ DISC STRUCTURE 00h); None for image input or
+    /// when the drive did not answer
+    pub layer_map: Option<LayerMap>,
     /// Titles in main-feature order: `titles[0]` is the selected main feature (nav or
     /// authoring pick first, else largest physical size), not necessarily the longest
     pub titles: Vec<DiscTitle>,
@@ -2067,7 +2073,17 @@ impl Disc {
         } else {
             None
         };
-        Self::live_finish(buffered, capacity, udf_fs, aacs, opts)
+        let mut disc = Self::live_finish(buffered, capacity, udf_fs, aacs, opts)?;
+        // The drive's own layer count (and DVD-family break) overrides the capacity
+        // estimate; no answer keeps the estimate.
+        if disc.format != DiscFormat::Unknown {
+            let dvd_family = matches!(disc.format, DiscFormat::Dvd | DiscFormat::HdDvd);
+            if let Some(m) = layer_map::read(session, dvd_family, disc.capacity_sectors) {
+                disc.layers = m.layers;
+                disc.layer_map = Some(m);
+            }
+        }
+        Ok(disc)
     }
 
     // `finish` over the live reader, then the drive's bus wiring from the bus outcome.
@@ -2694,6 +2710,7 @@ impl Disc {
             // CSS crack runs AFTER scan_with returns (in `scan` / `scan_image`),
             // which set this when they observe scrambled-but-uncracked content.
             css_error: None,
+            layer_map: None,
             content_format,
         };
 

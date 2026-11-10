@@ -17,6 +17,7 @@ fn disc(volume_id: &str, meta_title: Option<&str>) -> Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: crate::disc::ContentFormat::MpegPs,
     }
 }

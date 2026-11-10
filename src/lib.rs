@@ -206,8 +206,9 @@ pub use dirimage::DirImage;
 pub use disc::{
     AacsState, AudioChannels, AudioStream, BusRoute, Clip, Codec, ColorSpace, ContentFormat, Disc,
     DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
-    FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, ProtectionLabel, Resolution,
-    SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
+    FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, LayerMap, ProtectionLabel,
+    Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, TrackPath, VideoStream,
+    imgburn_dvd_descriptor,
 };
 #[cfg(feature = "rip")]
 pub use keysource::{DiscInputs, KeySource, read_encrypted_units};

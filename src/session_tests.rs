@@ -118,6 +118,7 @@ fn aacs_disc() -> Disc {
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: crate::ContentFormat::BdTs,
     }
 }

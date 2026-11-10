@@ -200,6 +200,7 @@ fn prepared_reader(grouped: bool, same_read: bool) {
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: crate::ContentFormat::MpegPs,
     };
     let mut reader = crate::keys::KeyRing::none()
@@ -318,6 +319,7 @@ fn per_file_keys(scanned: Option<[u8; 5]>) {
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: crate::ContentFormat::MpegPs,
     };
     let mut reader = crate::keys::KeyRing::none()

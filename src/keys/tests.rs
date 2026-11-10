@@ -136,6 +136,7 @@ fn disc_over(
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: if format == DiscFormat::HdDvd {
             ContentFormat::MpegPs
         } else {
