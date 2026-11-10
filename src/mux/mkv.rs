@@ -766,7 +766,8 @@ const CODEC_PRIVATE_RESERVE: usize = 16;
 struct ChannelFixup {
     /// Absolute file offset of the 1-byte Channels value in the Tracks element.
     value_offset: u64,
-    /// Channel count the IFO claimed (already written at `value_offset`).
+    /// Channel count the IFO claimed (already written at `value_offset`); 0 when unknown and
+    /// the Matroska default of 1 was written as a placeholder (DTS only).
     claimed: u8,
     /// True once the first frame has been parsed and the value finalised.
     corrected: bool,
@@ -781,6 +782,8 @@ enum ChannelSource {
     // Not gated on IFO coding mode 3: mode 2 is "MPEG-1 or MPEG-2 without extension bit stream"
     // (EP0867877A2), i.e. ext '0' multichannel; §2.5.3.1's mandatory CRC-check is the gate.
     MpegLayerII(super::codec::mp2_channels::ChannelTracker),
+    /// DTS-HD extension substream total, else core `AMODE` + `LFF` + XCh.
+    Dts,
 }
 
 /// Deferred PGS forced-subtitle detection state for one PGS subtitle track.
@@ -1305,21 +1308,27 @@ impl<W: Write + Seek> MkvMuxer<W> {
             if track.track_type == ebml::TRACK_TYPE_AUDIO && track.sample_rate > 0.0 {
                 let aud_pos = ebml::start_master(&mut writer, ebml::AUDIO)?;
                 ebml::write_float(&mut writer, ebml::SAMPLING_FREQUENCY, track.sample_rate)?;
-                // Omit Channels when unknown (0) — Matroska defaults it to 1
-                // rather than us fabricating a 6-channel count.
-                if track.channels > 0 {
-                    // Capture the offset of the 1-byte Channels value so an AC-3 or MP2 track
-                    // can correct it from its bitstream (the IFO count is unreliable); written
-                    // explicitly so the in-place single-byte rewrite stays valid.
+                let source = match track.codec_id {
+                    ebml::CODEC_AC3 => Some(ChannelSource::Ac3),
+                    ebml::CODEC_MP2 => Some(ChannelSource::MpegLayerII(Default::default())),
+                    ebml::CODEC_DTS => Some(ChannelSource::Dts),
+                    _ => None,
+                };
+                // Omit Channels when unknown (0), which Matroska reads as 1, rather than
+                // fabricate a count. DTS-HD from a Blu-ray playlist has none, so DTS writes
+                // that default as a placeholder for the first frame to correct.
+                let channels = match (track.channels, &source) {
+                    (0, Some(ChannelSource::Dts)) => 1,
+                    (n, _) => n,
+                };
+                if channels > 0 {
+                    // Capture the offset of the 1-byte Channels value so an AC-3, MP2 or DTS
+                    // track can correct it from its bitstream (the IFO count is unreliable);
+                    // written explicitly so the in-place single-byte rewrite stays valid.
                     ebml::write_id(&mut writer, ebml::CHANNELS)?;
                     ebml::write_size(&mut writer, 1)?;
                     let value_offset = writer.stream_position()?;
-                    writer.write_all(&[track.channels])?;
-                    let source = match track.codec_id {
-                        ebml::CODEC_AC3 => Some(ChannelSource::Ac3),
-                        ebml::CODEC_MP2 => Some(ChannelSource::MpegLayerII(Default::default())),
-                        _ => None,
-                    };
+                    writer.write_all(&[channels])?;
                     if let Some(source) = source {
                         channel_fixups.insert(
                             i,
@@ -1863,6 +1872,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 // A frame that proves nothing leaves the IFO value in place; the tracker settles
                 // on the first verified frame or after its bounded look (never on a failure).
                 ChannelSource::MpegLayerII(t) => t.observe(data),
+                ChannelSource::Dts => super::codec::dts::au_channels(data),
             };
             // None: frame too short or no valid header; keep the IFO value, retry next frame.
             if let Some(actual) = actual {
@@ -1926,10 +1936,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if actual == claimed {
             return Ok(());
         }
-        tracing::warn!(
-            target: "mux",
-            "audio track {track}: IFO claimed {claimed} channels but the stored bitstream carries {actual}; trusting the bitstream",
-        );
+        // An unknown count (DTS placeholder) is filled in, not contradicted.
+        if claimed > 0 {
+            tracing::warn!(
+                target: "mux",
+                "audio track {track}: IFO claimed {claimed} channels but the stored bitstream carries {actual}; trusting the bitstream",
+            );
+        }
         let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(offset))?;
         self.writer.write_all(&[actual])?;
@@ -1947,7 +1960,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ChannelSource::MpegLayerII(t) => {
                     t.finish().map(|n| (i, f.value_offset, f.claimed, n))
                 }
-                ChannelSource::Ac3 => None,
+                ChannelSource::Ac3 | ChannelSource::Dts => None,
             })
             .collect();
         for (track, offset, claimed, actual) in pending {

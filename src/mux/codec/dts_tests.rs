@@ -1885,3 +1885,178 @@ fn a_self_contained_access_unit_carries_its_own_packets_source() {
     assert!(!frames.is_empty());
     assert_eq!(frames[0].source.map(|s| s.byte), Some(4_242));
 }
+
+// --- au_channels: Matroska Channels from the bitstream ---
+
+// MSB-first bit writer for building headers field by field.
+#[derive(Default)]
+struct Bits {
+    data: Vec<u8>,
+    bit: usize,
+}
+
+impl Bits {
+    fn put(&mut self, width: u32, value: u32) -> &mut Self {
+        for i in (0..width).rev() {
+            if self.bit.is_multiple_of(8) {
+                self.data.push(0);
+            }
+            if (value >> i) & 1 == 1 {
+                *self.data.last_mut().unwrap() |= 0x80 >> (self.bit % 8);
+            }
+            self.bit += 1;
+        }
+        self
+    }
+}
+
+// Overwrite `width` bits of `data` starting at bit `at` (MSB-first).
+fn set_bits(data: &mut [u8], at: usize, width: u32, value: u32) {
+    for i in 0..width as usize {
+        let mask = 0x80u8 >> ((at + i) % 8);
+        if (value >> (width as usize - 1 - i)) & 1 == 1 {
+            data[(at + i) / 8] |= mask;
+        } else {
+            data[(at + i) / 8] &= !mask;
+        }
+    }
+}
+
+// An EXSS (index `index`) whose first asset declares `total` channels, with every optional
+// field the walk skips: timecode, two presentations, mixing metadata, asset type, language
+// and info text. Size fields are not read by the walk and stay 0.
+fn exss_with_total(index: u32, total: u32) -> Vec<u8> {
+    let mut b = Bits::default();
+    b.put(32, u32::from_be_bytes(DTS_HD_EXT_SYNC))
+        .put(8, 0) // user defined
+        .put(2, index) // nExtSSIndex
+        .put(1, 0) // short header: 8-bit header size, 16-bit sizes
+        .put(8, 0)
+        .put(16, 0)
+        .put(1, 1) // static fields present
+        .put(2, 2) // reference clock: 48 kHz
+        .put(3, 0) // 512 samples
+        .put(1, 1) // timecode present
+        .put(32, 0) // timecode
+        .put(4, 0)
+        .put(3, 1) // two presentations
+        .put(3, 1) // two assets
+        .put(index + 1, 1) // presentation 0: EXSS 0 active
+        .put(index + 1, (1 << (index + 1)) - 1); // presentation 1: every EXSS active
+    for _ in 0..(1 + index + 1) {
+        b.put(8, 1); // nuActiveAssetMask per active EXSS
+    }
+    b.put(1, 1) // mixing metadata
+        .put(2, 0)
+        .put(2, 1) // 8-bit speaker masks
+        .put(2, 1) // two mix configurations
+        .put(8, 0x0F)
+        .put(8, 0xFF)
+        .put(16, 0) // nuAssetFsize, asset 0
+        .put(16, 0) // nuAssetFsize, asset 1
+        .put(9, 0) // descriptor size
+        .put(3, 0) // asset index
+        .put(1, 1) // asset type
+        .put(4, 0)
+        .put(1, 1) // language "eng"
+        .put(24, 0x656E67)
+        .put(1, 1) // two bytes of info text
+        .put(10, 1)
+        .put(16, 0)
+        .put(5, 23) // 24-bit
+        .put(4, 13) // max sample rate code
+        .put(8, total - 1);
+    b.data
+}
+
+/// A DTS access unit: a 96-byte core frame with the given `AMODE`, `LFF` and XCh flag,
+/// followed by an EXSS declaring `exss_total` channels when given.
+pub(crate) fn dts_au(amode: u32, lff: u32, xch: bool, exss_total: Option<u32>) -> Vec<u8> {
+    let mut au = make_dts_core(96);
+    let header = SYNCWORD_BYTES * 8;
+    set_bits(&mut au, header + 28, 6, amode);
+    set_bits(&mut au, header + 48, 3, DTS_EXT_AUDIO_XCH);
+    set_bits(&mut au, header + 51, 1, u32::from(xch));
+    set_bits(&mut au, header + 53, 2, lff);
+    if let Some(total) = exss_total {
+        au.extend(exss_with_total(0, total));
+    }
+    au
+}
+
+// An access unit from real headers (FFmpeg FATE dcadec-suite): the core header zero-padded to
+// its declared size, then the start of the extension substream (empty when there is none).
+fn au_from_headers(core: &str, exss: &str) -> Vec<u8> {
+    let hex = |s: &str| -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    };
+    let mut au = hex(core);
+    au.resize(dts_core_frame_size(&au), 0);
+    au.extend(hex(exss));
+    au
+}
+
+#[test]
+fn au_channels_counts_core_amode_lfe_and_xch() {
+    assert_eq!(au_channels(&dts_au(9, 1, false, None)), Some(6)); // 5.1
+    assert_eq!(au_channels(&dts_au(2, 0, false, None)), Some(2)); // 2.0
+    assert_eq!(au_channels(&dts_au(0, 0, false, None)), Some(1)); // mono
+    assert_eq!(au_channels(&dts_au(9, 2, true, None)), Some(7)); // DTS-ES 6.1
+    assert_eq!(au_channels(&dts_au(15, 1, false, None)), Some(9)); // 8 + LFE
+    // XCh is EXT_AUDIO_ID 0 only when the extension flag is set; X96 (2) adds nothing.
+    let mut x96 = dts_au(9, 1, true, None);
+    set_bits(&mut x96, SYNCWORD_BYTES * 8 + 48, 3, 2);
+    assert_eq!(au_channels(&x96), Some(6));
+    assert_eq!(
+        au_channels(&dts_au(9, DTS_LFE_FLAG_INVALID, false, None)),
+        None
+    );
+    assert_eq!(au_channels(&dts_au(16, 1, false, None)), None); // reserved AMODE
+    assert_eq!(au_channels(&[0u8; 16]), None);
+    assert_eq!(au_channels(&DTS_CORE_SYNC), None);
+}
+
+#[test]
+fn au_channels_prefers_the_exss_total_over_the_core() {
+    // DTS-HD MA 7.1 carries a 5.1 core; the extension substream has the full count.
+    assert_eq!(au_channels(&dts_au(9, 1, false, Some(8))), Some(8));
+    // An access unit without a core (DTS Express), and a non-zero EXSS index whose masks
+    // are wider.
+    assert_eq!(au_channels(&exss_with_total(0, 2)), Some(2));
+    assert_eq!(au_channels(&exss_with_total(2, 8)), Some(8));
+}
+
+#[test]
+fn au_channels_uses_the_core_when_the_exss_has_no_static_fields() {
+    let mut au = dts_au(9, 1, false, Some(8));
+    // bStaticFieldsPresent: after sync (32), user bits (8), index (2), size type (1) and the
+    // short header/frame sizes (8 + 16).
+    set_bits(&mut au, 96 * 8 + 67, 1, 0);
+    assert_eq!(au_channels(&au), Some(6));
+    // A truncated EXSS header also falls back to the core.
+    let mut cut = dts_au(9, 1, false, Some(8));
+    cut.truncate(96 + 12);
+    assert_eq!(au_channels(&cut), Some(6));
+}
+
+#[test]
+fn au_channels_reads_real_dts_hd_and_dts_es_headers() {
+    // xll_71_24_48_768_0: DTS-HD MA 7.1 over a 5.1 core.
+    let ma71 = au_from_headers(
+        "7ffe8001fc3c3ff275e0053b80098c63",
+        "645820250003e00e7800808014c1c05f01ee84b0040200a7000000002000719d41a2954700c35311",
+    );
+    assert_eq!(au_channels(&ma71), Some(8));
+    // xll_51_24_48_768: DTS-HD MA 5.1.
+    let ma51 = au_from_headers(
+        "7ffe8001fc3c3ff275e2053b80098c63",
+        "645820250003e00af80080800dc1a05f0169e0080400de00000000200000519f41a2954700c2ee03",
+    );
+    assert_eq!(au_channels(&ma51), Some(6));
+    // xch_61_24_48_768: DTS-ES 6.1, a 5.1 core plus an XCh rear centre, no EXSS.
+    let es61 = au_from_headers("7ffe8001fc3c3ff275e0153b40098c63", "");
+    assert_eq!(au_channels(&es61), Some(7));
+}

@@ -4459,6 +4459,53 @@ fn ac3_channels_corrected_from_bitstream_acmod() {
     );
 }
 
+// Tracks/Audio/Channels after one frame, for an audio track of `codec` declared with
+// `declared` channels; `None` when the element is omitted.
+fn channels_written(codec: &'static str, declared: u8, frame: &[u8]) -> Option<u8> {
+    let mut audio = make_audio_track();
+    audio.codec_id = codec;
+    audio.channels = declared;
+    let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+    let writer = SharedWriter(shared.clone());
+    let mut muxer = MkvMuxer::new(writer, &[make_video_track(), audio], None, 0.0, &[]).unwrap();
+    muxer.write_frame(0, 0, true, &[1, 2], None, None).unwrap();
+    muxer.write_frame(1, 0, false, frame, None, None).unwrap();
+    muxer.finish().unwrap();
+    let data = shared.lock().unwrap().clone().into_inner();
+    let (start, size) = segment_children(&data)
+        .into_iter()
+        .find_map(|(id, off, sz)| (id == ebml::TRACKS).then_some((off, sz as usize)))
+        .expect("Tracks element present");
+    let tracks = &data[start..start + size];
+    find_id(tracks, ebml::CHANNELS).map(|ch| tracks[ch + 2])
+}
+
+#[test]
+fn dts_channels_come_from_the_bitstream() {
+    use super::super::codec::dts::tests::dts_au;
+    // Blu-ray playlists describe DTS-HD as "stereo + multichannel": the count arrives
+    // unknown (0) and was omitted, which Matroska reads as 1.
+    let hd_7_1 = dts_au(9, 1, false, Some(8)); // 5.1 core + EXSS total of 8
+    assert_eq!(channels_written(ebml::CODEC_DTS, 0, &hd_7_1), Some(8));
+    // M2TS declares the 5.1 core's 6 for a 7.1 stream; DTS-ES 6.1 gains its XCh channel.
+    assert_eq!(channels_written(ebml::CODEC_DTS, 6, &hd_7_1), Some(8));
+    let es_6_1 = dts_au(9, 2, true, None);
+    assert_eq!(channels_written(ebml::CODEC_DTS, 6, &es_6_1), Some(7));
+    // A matching count is left alone.
+    let core_5_1 = dts_au(9, 1, false, None);
+    assert_eq!(channels_written(ebml::CODEC_DTS, 6, &core_5_1), Some(6));
+}
+
+#[test]
+fn dts_channels_unreadable_frame_keeps_the_declared_or_default_count() {
+    // Unknown count: the placeholder is the Matroska default, as omitting it was.
+    assert_eq!(channels_written(ebml::CODEC_DTS, 0, &[0u8; 16]), Some(1));
+    assert_eq!(channels_written(ebml::CODEC_DTS, 6, &[0u8; 16]), Some(6));
+    // AC-3 with an unknown count still omits the element.
+    let ac3 = [0x0B, 0x77, 0x00, 0x00, 0x00, 8 << 3, 0x40, 0x00];
+    assert_eq!(channels_written(ebml::CODEC_AC3, 0, &ac3), None);
+}
+
 #[test]
 fn dolby_vision_track_emits_block_addition_mapping() {
     // A DV track (dv_config set) must emit BlockAdditionMapping (0x41E4)

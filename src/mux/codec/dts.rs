@@ -934,6 +934,95 @@ fn core_header_drop_reason(au: &[u8]) -> Option<DropReason> {
     None
 }
 
+// Channels per core AMODE, before the LFE (ETSI TS 102 114 Table 5-4).
+const DTS_AMODE_CHANNELS: [u8; DTS_AMODE_COUNT as usize] =
+    [1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 6, 6, 6, 7, 8, 8];
+// Core EXT_AUDIO_ID of the XCh extension: one discrete rear-centre channel (DTS-ES 6.1).
+const DTS_EXT_AUDIO_XCH: u32 = 0;
+
+// Channel count of one access unit, for Matroska Channels: the first EXSS asset's
+// `nuTotalNumChs` when present (DTS-HD 7.1 carries a 5.1 core), else the core header.
+// `None` when neither can be read.
+pub(crate) fn au_channels(au: &[u8]) -> Option<u8> {
+    if au.starts_with(&DTS_HD_EXT_SYNC) {
+        return exss_total_channels(au);
+    }
+    if !au.starts_with(&DTS_CORE_SYNC) {
+        return None;
+    }
+    au.get(exss_start(au, dts_core_frame_size(au))..)
+        .filter(|ext| ext.starts_with(&DTS_HD_EXT_SYNC))
+        .and_then(exss_total_channels)
+        .or_else(|| core_channels(au))
+}
+
+// Core count: AMODE channels, plus the LFE (LFF) and an XCh rear centre.
+fn core_channels(au: &[u8]) -> Option<u8> {
+    let mut r = BitReader::new(au.get(SYNCWORD_BYTES..)?);
+    r.skip_bits(1 + 5 + 1 + 7 + 14)?; // FTYPE, SHORT, CPF, NBLKS, FSIZE
+    let amode = r.read_bits(6)? as usize;
+    r.skip_bits(4 + 5 + 1 + 4)?; // SFREQ, RATE, reserved, DYNF/TIMEF/AUXF/HDCD
+    let ext_audio_id = r.read_bits(3)?;
+    let ext_audio = r.read_bit()? == 1;
+    r.skip_bits(1)?; // ASPF
+    let lff = r.read_bits(2)?;
+    if lff == DTS_LFE_FLAG_INVALID {
+        return None;
+    }
+    let xch = ext_audio && ext_audio_id == DTS_EXT_AUDIO_XCH;
+    Some(DTS_AMODE_CHANNELS.get(amode)? + u8::from(lff != 0) + u8::from(xch))
+}
+
+// `nuTotalNumChs` of the first asset of an EXSS (`buf` begins with DTS_HD_EXT_SYNC), walking
+// the header as FFmpeg's `ff_dca_exss_parse` does. `None` without static fields.
+fn exss_total_channels(buf: &[u8]) -> Option<u8> {
+    let mut r = BitReader::new(buf.get(SYNCWORD_BYTES..)?);
+    r.skip_bits(EXSS_USER_DEFINED_BITS)?;
+    let exss_index = r.read_bits(EXSS_INDEX_BITS)?;
+    let (hbits, fbits) = if r.read_bits(EXSS_HEADER_SIZE_TYPE_BITS)? == EXSS_HEADER_SIZE_TYPE_LONG {
+        (EXSS_HDRSIZE_BITS_LONG, EXSS_FSIZE_BITS_LONG)
+    } else {
+        (EXSS_HDRSIZE_BITS_SHORT, EXSS_FSIZE_BITS_SHORT)
+    };
+    r.skip_bits(hbits + fbits)?;
+    if r.read_bit()? == 0 {
+        return None; // bStaticFieldsPresent
+    }
+    r.skip_bits(2 + 3)?; // nuRefClockCode, nuExSSFrameDurationCode
+    if r.read_bit()? == 1 {
+        r.skip_bits(36)?; // nuTimeStamp, nLSB
+    }
+    let presentations = r.read_bits(3)? + 1;
+    let assets = r.read_bits(3)? + 1;
+    // One 8-bit nuActiveAssetMask per EXSS set in each presentation's nuActiveExSSMask.
+    let mut active_masks = 0;
+    for _ in 0..presentations {
+        active_masks += r.read_bits(exss_index + 1)?.count_ones();
+    }
+    r.skip_bits(active_masks * 8)?;
+    if r.read_bit()? == 1 {
+        // Mixing metadata: adjustment level, speaker-mask width, configs and their masks.
+        r.skip_bits(2)?;
+        let mask_bits = (r.read_bits(2)? + 1) * 4;
+        let configs = r.read_bits(2)? + 1;
+        r.skip_bits(configs * mask_bits)?;
+    }
+    r.skip_bits(assets * fbits)?; // nuAssetFsize
+    r.skip_bits(9 + 3)?; // first descriptor: nuAssetDescriptFsize, nuAssetIndex
+    if r.read_bit()? == 1 {
+        r.skip_bits(4)?; // nuAssetTypeDescriptor
+    }
+    if r.read_bit()? == 1 {
+        r.skip_bits(24)?; // LanguageDescriptor
+    }
+    if r.read_bit()? == 1 {
+        let text_bytes = r.read_bits(10)? + 1;
+        r.skip_bits(text_bytes * 8)?; // nuInfoTextString
+    }
+    r.skip_bits(5 + 4)?; // nuBitResolution, nuMaxSampleRate
+    u8::try_from(r.read_bits(8)? + 1).ok()
+}
+
 #[cfg(test)]
 #[path = "dts_tests.rs"]
-mod tests;
+pub(crate) mod tests;
