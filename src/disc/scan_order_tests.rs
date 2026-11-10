@@ -36,8 +36,9 @@ type Pred = fn(&[u8]) -> bool;
 type ReadFail = Box<dyn Fn(u32, u16, &[Vec<u8>]) -> Option<Error> + Send>;
 type HaltOn = Box<dyn Fn(&[u8]) -> bool + Send>;
 
+// AACS READ DISC STRUCTURE formats are 80h..86h (MMC-6 Table 383); 00h is the layer read.
 fn is_aacs_cdb(c: &[u8]) -> bool {
-    matches!(c[0], 0xA3 | 0xA4 | 0xAD)
+    matches!(c[0], 0xA3 | 0xA4) || (c[0] == 0xAD && c[7] >= 0x80)
 }
 fn is_read10(c: &[u8]) -> bool {
     c[0] == crate::scsi::SCSI_READ_10
@@ -608,7 +609,8 @@ fn dvd_with_aacs_dir_records_missing_key_file_without_aacs_scsi() {
         "{:?}",
         d.aacs_error
     );
-    let aacs_class = |c: &[u8]| c[0] == 0xAD || (matches!(c[0], 0xA3 | 0xA4) && c[7] == 0x02);
+    let aacs_class =
+        |c: &[u8]| (c[0] == 0xAD && c[7] >= 0x80) || (matches!(c[0], 0xA3 | 0xA4) && c[7] == 0x02);
     assert_eq!(rig.count(aacs_class), 0, "{:02x?}", rig.cdbs());
 }
 
@@ -815,7 +817,7 @@ fn no_unlocker_runs_cert_route_and_issues_ake() {
     let mut rig = Rig::new(bd_disc(Some(true)), |_| {});
     let d = Disc::scan(&mut rig.drive, &with_hc()).expect("scan");
     assert!(rig.count(is_aacs_agid_alloc) >= 1 && rig.count(is_send_host_cert) >= 1);
-    assert_eq!(rig.count(|c| c[0] == 0xAD), 0);
+    assert_eq!(rig.count(|c| c[0] == 0xAD && c[7] >= 0x80), 0);
     assert!(matches!(d.aacs_error, Some(Error::AacsHostCertRejected)));
 }
 

@@ -1,30 +1,17 @@
-//! CSS title-key verification: does a key that was not cracked from these sectors open them?
+//! CSS title-key verification: does a key not cracked from these sectors open them? Copies of
+//! scrambled packs are descrambled and checked against structure fixed by the clear bytes before
+//! 0x80 or by MPEG syntax:
 //!
-//! A candidate key descrambles copies of scrambled packs, and the plaintext is checked against
-//! structure whose expected value comes from the clear bytes before 0x80 or from MPEG syntax:
+//! - **Next packet** (13818-1 §2.5.3): a PES whose clear length ends at or past 0x80 inside the
+//!   pack must be followed by `00 00 01` with `stream_id` ≥ 0xBC and a length that fits.
+//! - **AC-3 / DTS** (private stream 1): a frame the clear `first_access_unit_pointer` (counted
+//!   from the field's last byte) places at or past 0x80 opens with `0B 77` / `7F FE 80 01`.
+//! - **MPEG video** (13818-2 Table 6-1): every decrypted start code has a valid value; with
+//!   `data_alignment_indicator` a payload starting at or past 0x80 opens with one.
+//! - **Crib** ([`keyless::attack_crib`]): a match passes; a mismatch is no verdict.
 //!
-//! - **Next packet** (any stream; ISO 13818-1 §2.5.3, DVD-Video 2048-byte packs): when the
-//!   clear `PES_packet_length` ends the PES at or past 0x80 and before the pack's end, a packet
-//!   start code (`00 00 01`, `stream_id` ≥ 0xBC, usually a padding packet) must follow there,
-//!   and its own length must fit in the pack.
-//! - **AC-3 / DTS** (private stream 1, DVD-Video substreams 0x80..0x87 / 0x88..0x8F): the clear
-//!   substream header gives `number_of_frame_headers` and `first_access_unit_pointer`, counted
-//!   from the pointer field's last byte. A frame starting at or past 0x80 must open with the
-//!   sync word, AC-3 `0B 77` (ETSI TS 102 366 §4.4.1), DTS `7F FE 80 01`.
-//! - **MPEG video** (`E0..EF`; ISO 13818-2 Table 6-1): every start code in the decrypted PES
-//!   payload must have a valid value (not reserved 0xB0/0xB1/0xB6, not a system code
-//!   0xB9..0xFF). With `data_alignment_indicator` set (13818-1 §2.4.3.7, alignment type 01) a
-//!   payload starting at or past 0x80 must open with a start code.
-//! - **Crib** ([`keyless::attack_crib`]): a match passes; a mismatch is no verdict, since a
-//!   crib is a prediction and often wrong on menus.
-//!
-//! Sub-picture and LPCM packs carry no such check beyond the next-packet one.
-//!
-//! False accept: a wrong key leaves pseudo-random plaintext. A check passes on it with at most
-//! about 1e-4 (a valid start code somewhere in ~1900 video bytes: 1900 × 2^-24 × 0.84); the
-//! others are 2^-16 (AC-3) or far less. A pass needs [`MIN_PASSES`] passing checks and no
-//! failing one, so a wrong key is accepted with probability below about 1e-16, and in practice
-//! far less: most packs it would pass on also carry a check it fails.
+//! A wrong key passes one check with at most ~1e-4 (video start code); a pass needs
+//! [`MIN_PASSES`] passing checks and none failing, so false accept is below ~1e-16.
 
 use super::{keyless, lfsr, scrambled_at, with_flags_at_0x14};
 
