@@ -934,11 +934,14 @@ impl Drive {
                 "transport fault during the unlock: leaving the drive's speed and error-recovery defaults"
             );
         } else if r.is_ok() {
+            let faults_before = self.transport_faults;
             self.set_speed(Self::SPEED_MAX_KBPS);
             // Ask the drive to REPORT recovered/marginal reads instead of silently
             // committing best-effort data as GOOD (the dirty-disc "passed-clean-but-
             // decodes-with-errors" trap). Best-effort: unsupported drives keep defaults.
-            self.enable_recovered_error_reporting();
+            if self.transport_faults == faults_before {
+                self.enable_recovered_error_reporting();
+            }
         }
         tracing::info!(
             target: "freemkv::drive",
@@ -1387,6 +1390,10 @@ impl Drive {
             self.scsi_execute(&cdb, crate::scsi::DataDirection::ToDevice, &mut desc, 5_000)
         {
             tracing::warn!(target: "freemkv::drive", error = %e, "SET STREAMING not accepted");
+            // #75: nothing more to a bus that just faulted.
+            if e.is_scsi_transport_failure() {
+                return;
+            }
         }
         let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
         let mut dummy = [0u8; 0];

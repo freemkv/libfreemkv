@@ -968,6 +968,29 @@ fn init_without_a_fault_still_sets_speed_and_error_reporting() {
     assert!(ops.contains(&0x5A), "MODE SENSE: {ops:02x?}");
 }
 
+/// #75: SET STREAMING ending on a transport fault is the drive's last command in `init`:
+/// no SET CD SPEED and no MODE SENSE / MODE SELECT follow it.
+#[test]
+fn init_sends_nothing_after_set_streaming_hits_a_transport_fault() {
+    let log: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let l2 = log.clone();
+    let t = Script::new(move |c, d| {
+        l2.lock().unwrap().push(c[0]);
+        d.fill(0);
+        if c[0] == crate::scsi::SCSI_SET_STREAMING {
+            return Err(fault());
+        }
+        good(d)
+    });
+    let mut d = Drive::from_transport(Box::new(t));
+    d.init().expect("init");
+    let ops = log.lock().unwrap().clone();
+    let at = (ops.iter())
+        .position(|&op| op == crate::scsi::SCSI_SET_STREAMING)
+        .expect("SET STREAMING sent");
+    assert!(ops[at + 1..].is_empty(), "after the fault: {ops:02x?}");
+}
+
 // Cancel in userspace preparation: the final check must cover every opcode,
 // including non-READ commands which have no completion check.
 struct StopInPreparation {
