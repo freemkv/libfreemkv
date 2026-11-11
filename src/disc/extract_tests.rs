@@ -3085,3 +3085,149 @@ fn a_damaged_fresh_folder_keeps_the_earlier_one() {
     assert!(out.path().join("AACS").is_dir());
     assert_eq!(res.names, kept(crate::whole_disc::NamesKept::Collision));
 }
+
+// A live DVD whose one VOB set is `files` (name, data LBA, contents).
+fn live_dvd(files: Vec<FileSpec>) -> (MemDisc, Disc) {
+    let root = DirSpec {
+        name: String::new(),
+        icb_lba: 10,
+        dir_data_lba: 11,
+        files: Vec::new(),
+        subdirs: vec![DirSpec {
+            name: "VIDEO_TS".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files,
+            subdirs: vec![],
+        }],
+    };
+    let mut d = clear_disc();
+    d.format = crate::disc::DiscFormat::Dvd;
+    d.content_format = crate::disc::ContentFormat::MpegPs;
+    (build_disc(root), d)
+}
+
+// A clear VOB set whose key sample is unreadable copies with zero-filled, counted holes
+// and a warning, as the v1.8.3 image copy did; it never aborts the copy.
+#[test]
+fn a_clear_vob_set_with_an_unreadable_key_sample_copies_with_holes() {
+    let vob = vec![0x5Au8; 4 * 2048];
+    let (mut disc, d) = live_dvd(vec![file("VTS_01_1.VOB", 30, 5000, vob.clone(), false)]);
+    for i in 0..4u32 {
+        disc.bad.insert(PART_START + 5000 + i);
+    }
+    let out = TmpDir::new("css_clear_unreadable");
+    let (res, ev) = crate::testlog::capture(|| {
+        d.extract_tree(
+            &mut disc,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
+    });
+    let res = res.expect("an unreadable key sample does not abort a clear copy");
+    let got = read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB").expect("vob");
+    assert_eq!(got.len(), vob.len());
+    assert!(
+        got.iter().all(|&b| b == 0),
+        "the bad sectors are zero-filled"
+    );
+    assert_eq!(res.bytes_unreadable, vob.len() as u64);
+    assert!(!res.complete);
+    assert!(
+        ev.iter().any(|e| e.level == tracing::Level::WARN
+            && e.target == "freemkv::css"
+            && e.field("file") == Some("VTS_01_1.VOB")),
+        "{ev:?}"
+    );
+}
+
+// Fails the first read touching `lbas`, then reads `disc`: the key sample is lost, the copy
+// later reads every sector.
+struct FirstReadFails {
+    disc: MemDisc,
+    lbas: std::ops::Range<u32>,
+    armed: bool,
+}
+
+impl SectorSource for FirstReadFails {
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+        if self.armed && lba < self.lbas.end && self.lbas.start < lba + u32::from(count) {
+            self.armed = false;
+            return Err(Error::DiscRead {
+                sector: u64::from(lba),
+                status: None,
+                sense: None,
+            });
+        }
+        self.disc.read_sectors(lba, count, buf, r)
+    }
+}
+
+// No key was proven from an unreadable sample, so a scrambled pack the copy then reads, which
+// no crib or recovered key opens, is refused rather than written scrambled.
+#[test]
+fn a_scrambled_vob_set_with_no_proven_key_is_still_refused() {
+    let mut pack = vec![0u8; 2048];
+    pack[0x14] = 0x10;
+    crate::css::dvd_pack_header(&mut pack, 0xE0);
+    for (i, b) in pack.iter_mut().enumerate().skip(0x59) {
+        *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+    }
+    assert!(crate::css::scrambled_at(&pack).is_some());
+    let (disc, d) = live_dvd(vec![file("VTS_01_1.VOB", 30, 5000, pack, false)]);
+    let at = PART_START + 5000;
+    let mut src = FirstReadFails {
+        disc,
+        lbas: at..at + 1,
+        armed: true,
+    };
+    let out = TmpDir::new("css_scrambled_unproven");
+    let err = d
+        .extract_tree(
+            &mut src,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .expect_err("scrambled packs with no proven key are refused");
+    assert!(matches!(err, Error::WholeDiscKeyMissing), "{err:?}");
+}
+
+// A menu whose title set cracked but whose own sample is unreadable proves no key either: it
+// copies as counted holes, the title set still descrambled.
+#[test]
+fn an_unreadable_menu_sample_copies_with_holes_beside_its_cracked_title_set() {
+    let title_key = [0x42u8, 0x13, 0x37, 0xBE, 0xEF];
+    let mut plain = vec![0u8; 2048];
+    plain[0x14] = 0x10;
+    crate::css::dvd_pack_header(&mut plain, 0xE0);
+    for (i, b) in plain.iter_mut().enumerate().skip(0x59) {
+        *b = (0xA0u8.wrapping_add((i % 8) as u8)) ^ 0x5A;
+    }
+    plain[0x54..0x59].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
+    let mut scrambled = plain.clone();
+    lfsr::scramble_sector(&title_key, &mut scrambled);
+    let menu = vec![0x5Au8; 2 * 2048];
+    let (mut disc, d) = live_dvd(vec![
+        file("VTS_01_0.VOB", 30, 6000, menu.clone(), false),
+        file("VTS_01_1.VOB", 32, 5000, scrambled, false),
+    ]);
+    disc.bad.extend([PART_START + 6000, PART_START + 6001]);
+    let out = TmpDir::new("css_menu_unreadable");
+    let res = d
+        .extract_tree(
+            &mut disc,
+            out.path(),
+            &ExtractOptions::default(),
+            &crate::ctx::Ctx::default(),
+        )
+        .expect("an unreadable menu does not abort the copy");
+    let mut expect = plain;
+    expect[0x14] = 0x80;
+    assert_eq!(read_out(out.path(), "VIDEO_TS/VTS_01_1.VOB"), Some(expect));
+    let got = read_out(out.path(), "VIDEO_TS/VTS_01_0.VOB").expect("menu");
+    assert_eq!(got.len(), menu.len());
+    assert!(got.iter().all(|&b| b == 0));
+    assert_eq!(res.bytes_unreadable, menu.len() as u64);
+}

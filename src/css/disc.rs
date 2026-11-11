@@ -253,17 +253,21 @@ fn key_group(
         .collect::<Vec<_>>();
     let mut sample = None;
     if let Some(key) = obvious.first() {
-        let s = sample_scrambled(reader, crack, halt)?;
-        if verify_key(key, s.chunks(2048)) == Verdict::Pass {
-            tracing::info!(
-                target: "freemkv::css",
-                file = %group.name,
-                from = %groups[group.relative.unwrap_or_default()].name,
-                "css: keyed with its title set's key, verified on its own sectors"
-            );
-            return Ok(DecryptKeys::Css { title_key: *key });
+        match sample_scrambled(reader, crack, halt) {
+            Ok(s) if verify_key(key, s.chunks(2048)) == Verdict::Pass => {
+                tracing::info!(
+                    target: "freemkv::css",
+                    file = %group.name,
+                    from = %groups[group.relative.unwrap_or_default()].name,
+                    "css: keyed with its title set's key, verified on its own sectors"
+                );
+                return Ok(DecryptKeys::Css { title_key: *key });
+            }
+            Ok(s) => sample = Some(s),
+            Err(Error::Halted) => return Err(Error::Halted),
+            // An unreadable sample proves no key: the crack below decides.
+            Err(_) => {}
         }
-        sample = Some(s);
     }
     match super::crack_key_outcome(reader, crack, CRACK_BATCH_SECTORS, halt) {
         super::CrackOutcome::Cracked(state) => Ok(DecryptKeys::Css {
@@ -272,7 +276,17 @@ fn key_group(
         // Clear so far: a scrambled sector read later is keyed then (see `decrypt`).
         super::CrackOutcome::Unencrypted => Ok(DecryptKeys::None),
         super::CrackOutcome::Halted => Err(Error::Halted),
-        super::CrackOutcome::Unreadable(e) => Err(e),
+        // Too little read to prove a key: degrade like a clear verdict; damage stays a
+        // counted hole, and `decrypt` still keys or refuses any scrambled pack it reads.
+        super::CrackOutcome::Unreadable(e) => {
+            tracing::warn!(
+                target: "freemkv::css",
+                file = %group.name,
+                code = e.code(),
+                "css: key sample unreadable; scrambled packs are keyed or refused when read"
+            );
+            Ok(DecryptKeys::None)
+        }
         super::CrackOutcome::ScrambledUncracked => {
             let sample = match sample {
                 Some(s) => s,
