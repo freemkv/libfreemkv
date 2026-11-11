@@ -2877,6 +2877,66 @@ fn negative_pts_audio_after_keyframe_does_not_wrap() {
     }
 }
 
+// VC-1 is stored as `V_MS/VFW/FOURCC`, whose block timestamps players read as decode
+// timestamps (ffmpeg `ms_compat`, mpv `block_dts`). Blocks in decode order must carry
+// increasing timestamps, and a B-frame, decoded when it is shown, keeps its PTS.
+#[test]
+fn vc1_blocks_carry_increasing_decode_timestamps() {
+    const F: i64 = 41_708_333; // 1001/24000 s
+    let mut vc1 = make_video_track();
+    vc1.codec_id = ebml::CODEC_VC1;
+    let tracks = [vc1, make_audio_track()];
+    let key = vec![0, 0, 1, 0x0F, 0xC0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0D, 0xC0];
+    let pic = vec![0, 0, 1, 0x0D, 0x00];
+    // (PTS in frames, is B-frame), in decode order: I P B B P B B.
+    let video = [
+        (10, false),
+        (13, false),
+        (11, true),
+        (12, true),
+        (16, false),
+        (14, true),
+        (15, true),
+    ];
+    let audio_pts = |i: i64| (10 + i) * F + F / 2;
+    let mut frames: Vec<DurFrame> = Vec::new();
+    for (i, &(n, _)) in video.iter().enumerate() {
+        let data = if i == 0 { key.clone() } else { pic.clone() };
+        frames.push((0, n * F, i == 0, data, None));
+        frames.push((1, audio_pts(i as i64), true, vec![0xAA; 8], None));
+    }
+    let data = mux_with_durations(&tracks, &frames);
+    let blocks: Vec<(u64, i64)> = all_simple_block_tracks(&data)
+        .into_iter()
+        .zip(all_block_timestamps(&data).into_iter().map(|(_, _, ts)| ts))
+        .collect();
+    let track_ts = |track: u64| -> Vec<i64> {
+        blocks
+            .iter()
+            .filter(|(t, _)| *t == track)
+            .map(|&(_, ts)| ts)
+            .collect()
+    };
+    let (video_ts, audio_ts) = (track_ts(1), track_ts(2));
+    assert_eq!(video_ts.len(), video.len());
+    assert_eq!(audio_ts.len(), video.len());
+    assert!(
+        video_ts.windows(2).all(|w| w[0] < w[1]),
+        "VC-1 blocks must increase in decode order: {video_ts:?}"
+    );
+    // Against the first audio block (A/V offset in 0.1 ms ticks, ±1 for rounding): a
+    // B-frame sits at its PTS, an anchor before it.
+    let ticks = |ns: i64| ns / 100_000;
+    for (&(n, b_frame), &ts) in video.iter().zip(&video_ts) {
+        let at_pts = audio_ts[0] + ticks(n * F) - ticks(audio_pts(0));
+        if b_frame {
+            assert!((ts - at_pts).abs() <= 1, "B-frame at {ts}, PTS at {at_pts}");
+        } else {
+            assert!(ts <= at_pts + 1, "anchor at {ts} after its PTS {at_pts}");
+        }
+    }
+}
+
 #[test]
 fn track_vint_encodes_one_two_and_three_byte_forms() {
     // 1-byte form for track numbers < 0x80, high bit set.
