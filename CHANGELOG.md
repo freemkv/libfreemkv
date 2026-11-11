@@ -2,8 +2,13 @@
 
 ## [1.8.9] — UNRELEASED
 
+### Added
+
+- `Disc::layer_map` (`LayerMap`, `TrackPath`): after a live scan, the layer count the drive reports (READ DISC STRUCTURE format 00h) replaces the capacity estimate in `Disc::layers`; a DVD or HD DVD also gives its track path and layer break. Image input, or a drive that refuses or answers nothing parsable, keeps the estimate and leaves it `None`. `disc::parse_dvd_pfi` and `disc::parse_bd_di` parse the answers, and `imgburn_dvd_descriptor` writes an ImgBurn `.dvd` layer-break file (#81).
+
 ### Fixed
 
+- An MKV's DTS `Channels` matches the stream (#82). A Blu-ray playlist leaves a DTS-HD track's count unknown, which was omitted and read as 1, and a 7.1 or 6.1 stream from M2TS kept its 5.1 core's 6. The first readable access unit now sets it: the extension substream's total channel count when present, else the core's channels, LFE and DTS-ES rear centre.
 - A decrypted DVD ISO or folder copy no longer stops with `CssKeyMissing` (E7023) when a VOB's scrambled sectors carry no crib to crack, as on discs whose `VTS_xx_0.VOB` menu shares its title set's key. Each VOB file set tries, in order: its obvious key (a menu's title-set key), its own cracked key, then every other key recovered on the disc, nearest title set first. A borrowed key is used only once it verifies on the file's own scrambled sectors (decrypted padding-packet, AC-3/DTS sync word and MPEG video start-code structure the clear headers predict). Scrambled sectors no key opens refuse the copy with `WholeDiscKeyMissing` (E7032), and the file is named in the warning log; the same order applies to a scrambled pack met later in a file whose scan saw only clear sectors.
 
 ## [1.8.8] — 2026-11-01
