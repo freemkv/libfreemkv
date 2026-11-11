@@ -1926,13 +1926,19 @@ fn set_bits(data: &mut [u8], at: usize, width: u32, value: u32) {
 // field the walk skips: timecode, two presentations, mixing metadata, asset type, language
 // and info text. Size fields are not read by the walk and stay 0.
 fn exss_with_total(index: u32, total: u32) -> Vec<u8> {
+    exss_header(index, false, total)
+}
+
+// As `exss_with_total`, with a long (`wide`: 12-bit header size, 20-bit sizes) header.
+fn exss_header(index: u32, wide: bool, total: u32) -> Vec<u8> {
+    let fbits = if wide { 20 } else { 16 };
     let mut b = Bits::default();
     b.put(32, u32::from_be_bytes(DTS_HD_EXT_SYNC))
         .put(8, 0) // user defined
         .put(2, index) // nExtSSIndex
-        .put(1, 0) // short header: 8-bit header size, 16-bit sizes
-        .put(8, 0)
-        .put(16, 0)
+        .put(1, u32::from(wide))
+        .put(if wide { 12 } else { 8 }, 0)
+        .put(fbits, 0)
         .put(1, 1) // static fields present
         .put(2, 2) // reference clock: 48 kHz
         .put(3, 0) // 512 samples
@@ -1952,8 +1958,8 @@ fn exss_with_total(index: u32, total: u32) -> Vec<u8> {
         .put(2, 1) // two mix configurations
         .put(8, 0x0F)
         .put(8, 0xFF)
-        .put(16, 0) // nuAssetFsize, asset 0
-        .put(16, 0) // nuAssetFsize, asset 1
+        .put(fbits, 0) // nuAssetFsize, asset 0
+        .put(fbits, 0) // nuAssetFsize, asset 1
         .put(9, 0) // descriptor size
         .put(3, 0) // asset index
         .put(1, 1) // asset type
@@ -2059,4 +2065,53 @@ fn au_channels_reads_real_dts_hd_and_dts_es_headers() {
     // xch_61_24_48_768: DTS-ES 6.1, a 5.1 core plus an XCh rear centre, no EXSS.
     let es61 = au_from_headers("7ffe8001fc3c3ff275e0153b40098c63", "");
     assert_eq!(au_channels(&es61), Some(7));
+}
+
+// A long EXSS header widens the header-size and every size field the walk skips.
+#[test]
+fn au_channels_walks_a_long_exss_header() {
+    assert_eq!(au_channels(&exss_header(0, true, 8)), Some(8));
+    assert_eq!(au_channels(&exss_header(1, true, 6)), Some(6));
+}
+
+// nuTotalNumChs + 1 of 256 fits no Channels byte: the core count stands, else nothing.
+#[test]
+fn au_channels_rejects_an_exss_total_past_255() {
+    assert_eq!(au_channels(&exss_with_total(0, 255)), Some(255));
+    assert_eq!(au_channels(&exss_with_total(0, 256)), None);
+    let mut au = dts_au(9, 1, false, None);
+    au.extend(exss_with_total(0, 256));
+    assert_eq!(au_channels(&au), Some(6));
+}
+
+#[test]
+fn au_channels_of_an_exss_alone_without_static_fields_is_none() {
+    let mut exss = exss_with_total(0, 8);
+    set_bits(&mut exss, 67, 1, 0);
+    assert_eq!(au_channels(&exss), None);
+    // Too short to hold a header at all.
+    assert_eq!(au_channels(&DTS_HD_EXT_SYNC), None);
+}
+
+// A core followed by bytes without the EXSS sync word keeps the core count, even when the
+// rest would parse as an EXSS header.
+#[test]
+fn au_channels_ignores_trailing_bytes_that_are_no_exss() {
+    let mut au = dts_au(2, 0, false, None);
+    let mut fake = exss_with_total(0, 8);
+    fake[..4].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    au.extend(fake);
+    assert_eq!(au_channels(&au), Some(2));
+}
+
+// A core whose size is not a multiple of 4 may be padded up to an aligned EXSS.
+#[test]
+fn au_channels_finds_an_exss_after_core_padding() {
+    let mut au = make_dts_core(94);
+    let header = SYNCWORD_BYTES * 8;
+    set_bits(&mut au, header + 28, 6, 9);
+    set_bits(&mut au, header + 53, 2, 1);
+    au.extend([0, 0]);
+    au.extend(exss_with_total(0, 8));
+    assert_eq!(au_channels(&au), Some(8));
 }

@@ -4462,6 +4462,11 @@ fn ac3_channels_corrected_from_bitstream_acmod() {
 // Tracks/Audio/Channels after one frame, for an audio track of `codec` declared with
 // `declared` channels; `None` when the element is omitted.
 fn channels_written(codec: &'static str, declared: u8, frame: &[u8]) -> Option<u8> {
+    channels_after(codec, declared, &[frame])
+}
+
+// As `channels_written`, after each of `frames` in turn.
+fn channels_after(codec: &'static str, declared: u8, frames: &[&[u8]]) -> Option<u8> {
     let mut audio = make_audio_track();
     audio.codec_id = codec;
     audio.channels = declared;
@@ -4469,7 +4474,10 @@ fn channels_written(codec: &'static str, declared: u8, frame: &[u8]) -> Option<u
     let writer = SharedWriter(shared.clone());
     let mut muxer = MkvMuxer::new(writer, &[make_video_track(), audio], None, 0.0, &[]).unwrap();
     muxer.write_frame(0, 0, true, &[1, 2], None, None).unwrap();
-    muxer.write_frame(1, 0, false, frame, None, None).unwrap();
+    for (i, frame) in frames.iter().enumerate() {
+        let pts = i as i64 * 32_000_000;
+        muxer.write_frame(1, pts, false, frame, None, None).unwrap();
+    }
     muxer.finish().unwrap();
     let data = shared.lock().unwrap().clone().into_inner();
     let (start, size) = segment_children(&data)
@@ -4494,6 +4502,46 @@ fn dts_channels_come_from_the_bitstream() {
     // A matching count is left alone.
     let core_5_1 = dts_au(9, 1, false, None);
     assert_eq!(channels_written(ebml::CODEC_DTS, 6, &core_5_1), Some(6));
+}
+
+// An unreadable first frame leaves the count open: the first readable one sets it, and
+// a later frame cannot change it.
+#[test]
+fn dts_channels_come_from_the_first_readable_frame() {
+    use super::super::codec::dts::tests::dts_au;
+    let hd_7_1 = dts_au(9, 1, false, Some(8));
+    let stereo = dts_au(2, 0, false, None);
+    let junk = [0u8; 16];
+    assert_eq!(
+        channels_after(ebml::CODEC_DTS, 0, &[&junk, &hd_7_1]),
+        Some(8)
+    );
+    assert_eq!(
+        channels_after(ebml::CODEC_DTS, 6, &[&junk, &junk, &stereo]),
+        Some(2)
+    );
+    assert_eq!(
+        channels_after(ebml::CODEC_DTS, 0, &[&hd_7_1, &stereo]),
+        Some(8)
+    );
+}
+
+// Filling in an unknown count is no contradiction: only a declared count that the
+// bitstream disagrees with is warned about.
+#[test]
+fn dts_channels_warn_only_when_a_declared_count_is_wrong() {
+    use super::super::codec::dts::tests::dts_au;
+    let hd_7_1 = dts_au(9, 1, false, Some(8));
+    let warns = |declared| {
+        let (got, ev) =
+            crate::testlog::capture(|| channels_written(ebml::CODEC_DTS, declared, &hd_7_1));
+        assert_eq!(got, Some(8));
+        ev.iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message().contains("IFO claimed"))
+            .count()
+    };
+    assert_eq!(warns(0), 0);
+    assert_eq!(warns(6), 1);
 }
 
 #[test]
