@@ -101,3 +101,46 @@ fn imgburn_descriptor_is_break_then_image_name() {
         "LayerBreak=2084960\r\nMovie.iso\r\n"
     );
 }
+
+// The break must lie strictly inside the disc.
+#[test]
+fn break_at_capacity_is_dropped_one_below_is_kept() {
+    let m = parse_dvd_pfi(&pfi(0x31, 0x30000, 0, 0x30000 + CAP - 1), CAP).unwrap();
+    assert_eq!(m.layer_break, None);
+    let m = parse_dvd_pfi(&pfi(0x31, 0x30000, 0, 0x30000 + CAP - 2), CAP).unwrap();
+    assert_eq!(m.layer_break, Some(CAP - 1));
+    // A one-sector layer 0 is a break of 1.
+    let m = parse_dvd_pfi(&pfi(0x31, 0x30000, 0, 0x30000), CAP).unwrap();
+    assert_eq!(m.layer_break, Some(1));
+}
+
+// The answer needs the 4-byte header and PFI bytes 0..16, and a length field saying so.
+#[test]
+fn pfi_length_boundaries() {
+    let mut b = pfi(0x31, 0x30000, 0, 0x30000 + 99);
+    b[0..2].copy_from_slice(&18u16.to_be_bytes());
+    assert_eq!(parse_dvd_pfi(&b[..20], CAP).unwrap().layer_break, Some(100));
+    assert_eq!(parse_dvd_pfi(&b[..19], CAP), None);
+    b[0..2].copy_from_slice(&17u16.to_be_bytes());
+    assert_eq!(parse_dvd_pfi(&b[..20], CAP), None);
+}
+
+// Each sector field's first byte is reserved: only its low 24 bits address a sector.
+#[test]
+fn pfi_sector_fields_read_24_bits() {
+    let m = parse_dvd_pfi(&pfi(0x31, 0x0003_0000, 0, 0xFF03_0000 + 99), CAP).unwrap();
+    assert_eq!(m.layer_break, Some(100));
+    let m = parse_dvd_pfi(&pfi(0x21, 0xFF03_0000, 0x0003_0000 + 99, 0), CAP).unwrap();
+    assert_eq!(m.layer_break, Some(100));
+}
+
+#[test]
+fn bd_di_length_signature_and_count_boundaries() {
+    let full = di(b"BDW", 4);
+    assert_eq!(parse_bd_di(&full).unwrap().layers, 4, "BDXL quad layer");
+    assert_eq!(parse_bd_di(&full[..17]).unwrap().layers, 4);
+    assert_eq!(parse_bd_di(&full[..16]), None);
+    let mut bad_sig = di(b"BDO", 2);
+    bad_sig[5] = b'X';
+    assert_eq!(parse_bd_di(&bad_sig), None);
+}

@@ -89,6 +89,8 @@ struct AkeMemTransport {
     halt_on: Option<HaltOn>,
     halt: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     mkb_pack: Option<Vec<u8>>,
+    // READ DISC STRUCTURE format 00h's answer (layer layout); zeros when None.
+    layer_answer: Option<Vec<u8>>,
 }
 
 impl crate::scsi::ScsiTransport for AkeMemTransport {
@@ -126,6 +128,11 @@ impl crate::scsi::ScsiTransport for AkeMemTransport {
             }
             0x46 if data.len() >= 8 => data[6..8].copy_from_slice(&self.profile.to_be_bytes()),
             0xA3 if is_send_host_cert(cdb) => return Err(check(5, 0x6F, 0, 0xA3)),
+            0xAD if cdb[7] == 0x00 => {
+                if let Some(a) = &self.layer_answer {
+                    data[..a.len()].copy_from_slice(a);
+                }
+            }
             0xAD if cdb[7] == 0x83 => {
                 if let Some(m) = &self.mkb_pack {
                     data[..2].copy_from_slice(&((m.len() + 2) as u16).to_be_bytes());
@@ -280,6 +287,7 @@ impl Rig {
             halt_on: None,
             halt: halt.clone(),
             mkb_pack: Some(mkb_gen(70)),
+            layer_answer: None,
         };
         f(&mut t);
         let drive = Drive::from_transport_for_test(Box::new(t));
@@ -855,6 +863,7 @@ fn ake(mem: MemDisc, profile: u16) -> AkeMemTransport {
         halt_on: None,
         halt: Arc::default(),
         mkb_pack: Some(mkb_gen(70)),
+        layer_answer: None,
     }
 }
 
@@ -1140,4 +1149,107 @@ fn session_scan_with_follows_the_alias_rule() {
     let mut attached = session_over(t, Some(&op));
     let d = attached.scan_with(with_halt(&alias));
     assert!(d.is_ok(), "the attached op token wins over the alias");
+}
+
+fn is_layer_read(c: &[u8]) -> bool {
+    c[0] == 0xAD && c[7] == 0x00
+}
+
+// The one layer read: READ DISC STRUCTURE format 00h, layer 0, for `media`, 4100 bytes.
+fn layer_read_cdb(rig: &Rig, media: u8) {
+    let reads: Vec<_> = rig
+        .cdbs()
+        .into_iter()
+        .filter(|c| is_layer_read(c))
+        .collect();
+    assert_eq!(reads.len(), 1, "{reads:02x?}");
+    let c = &reads[0];
+    assert_eq!((c[1], c[6]), (media, 0), "{c:02x?}");
+    assert_eq!(u16::from_be_bytes([c[8], c[9]]), 4100);
+}
+
+#[test]
+fn live_bd_scan_takes_the_drives_layer_count() {
+    let mut di = vec![0u8; 4100];
+    di[..2].copy_from_slice(&4098u16.to_be_bytes());
+    di[4..6].copy_from_slice(b"DI");
+    di[12..15].copy_from_slice(b"BDO");
+    di[16] = 0x21;
+    let mut rig = Rig::new(bd_disc(None), |t| t.layer_answer = Some(di));
+    let d = Disc::scan(&mut rig.drive, &ScanOptions::default()).expect("scan");
+    layer_read_cdb(&rig, 0x01);
+    assert_eq!(
+        d.layer_map,
+        Some(LayerMap {
+            layers: 2,
+            layer_break: None,
+            track_path: None
+        })
+    );
+    assert_eq!(
+        d.layers, 2,
+        "the drive's count overrides the capacity estimate"
+    );
+}
+
+#[test]
+fn live_dvd_scan_takes_the_drives_layer_break() {
+    let mut pfi = vec![0u8; 4 + 2048];
+    pfi[..2].copy_from_slice(&2050u16.to_be_bytes());
+    pfi[6] = 0x31; // two layers, opposite track path
+    pfi[8..12].copy_from_slice(&0x30000u32.to_be_bytes());
+    pfi[16..20].copy_from_slice(&(0x30000u32 + 4_999).to_be_bytes());
+    let mut rig = Rig::new(dvd_disc(), |t| {
+        t.profile = 0x0010;
+        t.layer_answer = Some(pfi);
+    });
+    let d = Disc::scan(&mut rig.drive, &ScanOptions::default()).expect("scan");
+    assert_eq!(d.format, DiscFormat::Dvd);
+    layer_read_cdb(&rig, 0x00);
+    assert_eq!(d.layers, 2);
+    let m = d.layer_map.expect("layer map");
+    assert_eq!(
+        (m.layer_break, m.track_path),
+        (Some(5_000), Some(TrackPath::Opposite))
+    );
+}
+
+// A drive that refuses the layer read, or answers nothing parsable, leaves the estimate.
+#[test]
+fn live_scan_keeps_the_layer_estimate_without_a_drive_answer() {
+    let mut rig = Rig::new(bd_disc(None), |t| t.fault_on = Some(is_layer_read));
+    let d = Disc::scan(&mut rig.drive, &ScanOptions::default()).expect("scan");
+    assert_eq!(
+        (d.layer_map, d.layers),
+        (None, d.format.layers(d.capacity_sectors))
+    );
+    let mut rig = Rig::new(bd_disc(None), |_| {});
+    let d = Disc::scan(&mut rig.drive, &ScanOptions::default()).expect("scan");
+    layer_read_cdb(&rig, 0x01);
+    assert_eq!(
+        (d.layer_map, d.layers),
+        (None, d.format.layers(d.capacity_sectors))
+    );
+}
+
+// A disc of no known format sends no layer read.
+#[test]
+fn live_scan_of_an_unknown_format_sends_no_layer_read() {
+    let mut mem = MemDisc::new();
+    build_udf_skeleton(&mut mem, 10);
+    lay_dir(
+        &mut mem,
+        &DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![],
+        },
+    );
+    let mut rig = Rig::new(mem, |_| {});
+    let d = Disc::scan(&mut rig.drive, &ScanOptions::default()).expect("scan");
+    assert_eq!(d.format, DiscFormat::Unknown);
+    assert_eq!(rig.count(is_layer_read), 0);
+    assert_eq!(d.layer_map, None);
 }

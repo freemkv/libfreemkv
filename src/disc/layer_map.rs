@@ -109,7 +109,7 @@ pub fn parse_dvd_pfi(buf: &[u8], capacity: u32) -> Option<LayerMap> {
     let layer_break = last_l0
         .checked_sub(start)
         .map(|n| n + 1)
-        .filter(|&b| b > 0 && b < capacity);
+        .filter(|&b| b < capacity);
     Some(LayerMap {
         layers,
         layer_break,
