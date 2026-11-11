@@ -604,9 +604,9 @@ fn extract_one_file<S: SectorSource>(
             let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES_U64);
             let hole_bytes = (sectors * SECTOR_BYTES_U64).min(pf.size.saturating_sub(written));
             let mut left = hole_bytes;
-            for b in buf.iter_mut() {
-                *b = 0;
-            }
+            // Full-size zeros: the walk leaves `buf` at its last read's length.
+            buf.clear();
+            buf.resize(READ_BATCH_SECTORS as usize * SECTOR_BYTES, 0);
             while left > 0 {
                 let n = left.min(buf.len() as u64) as usize;
                 file.write(&buf[..n])?;
