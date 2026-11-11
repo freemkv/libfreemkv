@@ -1253,3 +1253,14 @@ fn live_scan_of_an_unknown_format_sends_no_layer_read() {
     assert_eq!(rig.count(is_layer_read), 0);
     assert_eq!(d.layer_map, None);
 }
+
+// Image input has no drive to ask: the capacity estimate stands.
+#[test]
+fn image_scan_has_no_layer_map() {
+    let mut mem = bd_disc(None);
+    let d = Disc::scan_image(&mut mem, 9_999, &ScanOptions::default()).expect("scan");
+    assert_eq!(
+        (d.layer_map, d.layers),
+        (None, d.format.layers(d.capacity_sectors))
+    );
+}
