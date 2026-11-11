@@ -215,13 +215,7 @@ impl UdfFs {
                     if crc_len != 0 {
                         let crc = descriptor_crc16(&fid[16..16 + crc_len]);
                         fid[8..10].copy_from_slice(&crc.to_le_bytes());
-                        fid[4] = fid
-                            .iter()
-                            .take(16)
-                            .enumerate()
-                            .filter(|(i, _)| *i != 4)
-                            .map(|(_, byte)| *byte as u32)
-                            .sum::<u32>() as u8;
+                        fid[4] = tag_checksum(&fid);
                     }
                     for (i, (&before, &after)) in
                         data[pos..pos + covered_len].iter().zip(&fid).enumerate()
@@ -276,12 +270,7 @@ impl UdfFs {
             }
             let crc = descriptor_crc16(&final_sector[16..crc_end]);
             final_sector[8..10].copy_from_slice(&crc.to_le_bytes());
-            final_sector[4] = final_sector[..16]
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != 4)
-                .map(|(_, byte)| *byte as u32)
-                .sum::<u32>() as u8;
+            final_sector[4] = tag_checksum(&final_sector);
             for offset in [4, 8, 9] {
                 if owner.sector[offset] != final_sector[offset] {
                     all.push(MetadataBytePatch {
