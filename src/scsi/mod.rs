@@ -759,9 +759,9 @@ pub fn build_set_streaming(read_speed: u16) -> ([u8; 12], [u8; 28]) {
 }
 
 /// Build a GET PERFORMANCE CDB asking for the nominal read performance (Type 0), one
-/// descriptor.
+/// descriptor. Data Type 10h: Tolerance 10b, the only value MMC defines.
 pub fn build_get_performance() -> [u8; 12] {
-    [SCSI_GET_PERFORMANCE, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+    [SCSI_GET_PERFORMANCE, 0x10, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
 }
 
 /// The end-of-range read speed (KB/s) from a GET PERFORMANCE reply: 8-byte header, then

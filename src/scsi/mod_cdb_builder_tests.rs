@@ -111,6 +111,8 @@ fn set_streaming_asks_for_max_read_speed_over_the_whole_disc() {
 fn get_performance_reads_the_end_speed_of_the_first_descriptor() {
     let cdb = build_get_performance();
     assert_eq!(cdb[0], SCSI_GET_PERFORMANCE);
+    // MMC-6 Table 294: Tolerance 10b (the only defined value), read, nominal.
+    assert_eq!(cdb[1], 0x10, "Data Type");
     assert_eq!(cdb[9], 1, "one descriptor");
     assert_eq!(cdb[10], 0, "Type 0: performance");
     let mut buf = [0u8; 24];
