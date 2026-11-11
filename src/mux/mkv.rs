@@ -7,6 +7,7 @@
 use super::ebml;
 // Clip-boundary timeline-continuity corrector — shared verbatim with the
 // `demux://` sink.
+use super::decode_ts::DtsDeriver;
 use super::timeline::TimelineContinuity;
 use crate::disc::{
     AudioStream, Chapter, Codec, CodecKind, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
@@ -576,6 +577,102 @@ struct SeekPositionFixup {
     value_offset: u64, // absolute file offset of the 8-byte SeekPosition value
 }
 
+// How long, in PTS span or bytes, blocks wait for a VC-1 track's DTS start-up window
+// before it resolves over what it holds (as `tsmux` caps its hold).
+const DTS_HOLD_CAP_NS: i64 = 1_000_000_000;
+const DTS_HOLD_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+// The deriver's tick domain starts this many 90 kHz ticks before a track's first frame,
+// so the start-up DTS (one frame before the first PTS) is never clamped at 0.
+const DTS_ORIGIN_HEADROOM_TICKS: i64 = 90_000;
+
+/// Decode timestamps for a VC-1 track. Its `V_MS/VFW/FOURCC` blocks carry the DTS:
+/// ffmpeg and mpv read a VfW block timestamp as a DTS, and mkvmerge writes the PES DTS.
+struct VfwDts {
+    deriver: DtsDeriver,
+    /// 90 kHz tick the deriver's domain counts from, set at the first frame.
+    origin: Option<i64>,
+}
+
+impl VfwDts {
+    fn new(codec_private: Option<&[u8]>) -> Self {
+        Self {
+            deriver: DtsDeriver::for_codec(Codec::Vc1, codec_private),
+            origin: None,
+        }
+    }
+
+    // Feed one kept frame, in decode order, at its PTS on the mapped timeline.
+    fn push(&mut self, pts_ns: i64, es: &[u8]) {
+        let ticks = super::codec::ns_to_ticks(pts_ns);
+        let origin = *self.origin.get_or_insert(ticks - DTS_ORIGIN_HEADROOM_TICKS);
+        self.deriver.push(ticks - origin, es);
+    }
+
+    // The block timestamp of the oldest pushed frame: its DTS, or `pts_ns` when the DTS
+    // equals the PTS.
+    fn pop_ns(&mut self, pts_ns: i64) -> i64 {
+        let dts = self.deriver.pop();
+        debug_assert!(
+            dts.is_some(),
+            "a block is written only once its DTS is resolved"
+        );
+        match (dts.flatten(), self.origin) {
+            (Some(dts), Some(origin)) => super::codec::pts_to_ns(dts + origin),
+            _ => pts_ns,
+        }
+    }
+}
+
+/// One kept frame on the mapped timeline, as `write_block` writes it.
+#[derive(Clone, Copy)]
+struct KeptFrame<'a> {
+    track_idx: usize,
+    pts_ns: i64,
+    keyframe: bool,
+    data: &'a [u8],
+    duration_ns: Option<u64>,
+    block_additional: Option<&'a [u8]>,
+    discard_padding_ns: i64,
+}
+
+/// A kept frame waiting, in arrival order, for a VC-1 track's DTS start-up window.
+struct HeldBlock {
+    track_idx: usize,
+    pts_ns: i64,
+    keyframe: bool,
+    data: Vec<u8>,
+    duration_ns: Option<u64>,
+    block_additional: Option<Vec<u8>>,
+    discard_padding_ns: i64,
+}
+
+impl HeldBlock {
+    fn new(f: KeptFrame<'_>) -> Self {
+        Self {
+            track_idx: f.track_idx,
+            pts_ns: f.pts_ns,
+            keyframe: f.keyframe,
+            data: f.data.to_vec(),
+            duration_ns: f.duration_ns,
+            block_additional: f.block_additional.map(<[u8]>::to_vec),
+            discard_padding_ns: f.discard_padding_ns,
+        }
+    }
+
+    fn frame(&self) -> KeptFrame<'_> {
+        KeptFrame {
+            track_idx: self.track_idx,
+            pts_ns: self.pts_ns,
+            keyframe: self.keyframe,
+            data: &self.data,
+            duration_ns: self.duration_ns,
+            block_additional: self.block_additional.as_deref(),
+            discard_padding_ns: self.discard_padding_ns,
+        }
+    }
+}
+
 /// MKV muxer. Call write_frame() for each frame, then finish() at the end.
 pub struct MkvMuxer<W: Write + Seek> {
     writer: W,
@@ -711,6 +808,13 @@ pub struct MkvMuxer<W: Write + Seek> {
     codec_private_reserves: std::collections::HashMap<usize, u64>,
     /// Per MPEG-2 video track: the DefaultDuration measured from the kept frames.
     frame_rate_fixups: std::collections::HashMap<usize, FrameRateFixup>,
+    /// Per track: the DTS deriver of a VC-1 track, whose block timestamps are DTS.
+    vfw_dts: Vec<Option<VfwDts>>,
+    /// Kept blocks of every track, in arrival order, while a VC-1 start-up window is open.
+    dts_hold: std::collections::VecDeque<HeldBlock>,
+    dts_hold_bytes: usize,
+    /// Lowest and highest PTS in `dts_hold`, for `DTS_HOLD_CAP_NS`.
+    dts_hold_span: Option<(i64, i64)>,
 }
 
 // Deferred DefaultDuration correction for an MPEG-2 video track: the header holds the
@@ -1422,6 +1526,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
             opening_capture: None,
             codec_private_reserves,
             frame_rate_fixups,
+            vfw_dts: tracks
+                .iter()
+                .map(|t| {
+                    (t.codec_id == ebml::CODEC_VC1).then(|| VfwDts::new(t.codec_private.as_deref()))
+                })
+                .collect(),
+            dts_hold: std::collections::VecDeque::new(),
+            dts_hold_bytes: 0,
+            dts_hold_span: None,
         })
     }
 
@@ -1639,7 +1752,76 @@ impl<W: Write + Seek> MkvMuxer<W> {
             f.min_pts_ns = f.min_pts_ns.min(pts_ns);
             f.max_pts_ns = f.max_pts_ns.max(pts_ns);
         }
-        let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
+
+        if let Some(v) = self.vfw_dts.get_mut(track_idx).and_then(Option::as_mut) {
+            v.push(pts_ns, data);
+        }
+        let frame = KeptFrame {
+            track_idx,
+            pts_ns,
+            keyframe,
+            data,
+            duration_ns,
+            block_additional,
+            discard_padding_ns,
+        };
+        if self.dts_hold.is_empty() && !self.dts_pending() {
+            return self.write_block(frame);
+        }
+        self.dts_hold_bytes += data.len();
+        let (lo, hi) = self.dts_hold_span.unwrap_or((pts_ns, pts_ns));
+        self.dts_hold_span = Some((lo.min(pts_ns), hi.max(pts_ns)));
+        self.dts_hold.push_back(HeldBlock::new(frame));
+        let span = self.dts_hold_span.map_or(0, |(lo, hi)| hi - lo);
+        if self.dts_pending()
+            && (span > DTS_HOLD_CAP_NS || self.dts_hold_bytes > DTS_HOLD_CAP_BYTES)
+        {
+            for v in self.vfw_dts.iter_mut().flatten() {
+                v.deriver.release_cap();
+            }
+        }
+        if self.dts_pending() {
+            return Ok(());
+        }
+        self.drain_dts_hold()
+    }
+
+    fn dts_pending(&self) -> bool {
+        self.vfw_dts.iter().flatten().any(|v| v.deriver.pending())
+    }
+
+    // The block timestamp for `track_idx`'s next kept frame: a VC-1 track's DTS, else its PTS.
+    fn block_ns(&mut self, track_idx: usize, pts_ns: i64) -> i64 {
+        match self.vfw_dts.get_mut(track_idx).and_then(Option::as_mut) {
+            Some(v) => v.pop_ns(pts_ns),
+            None => pts_ns,
+        }
+    }
+
+    // Replay the held blocks through the unchanged write path, in arrival order.
+    fn drain_dts_hold(&mut self) -> io::Result<()> {
+        self.dts_hold_bytes = 0;
+        self.dts_hold_span = None;
+        while let Some(h) = self.dts_hold.pop_front() {
+            self.write_block(h.frame())?;
+        }
+        Ok(())
+    }
+
+    // Write one kept frame as a block, at its DTS on a VC-1 track and its PTS otherwise.
+    fn write_block(&mut self, frame: KeptFrame<'_>) -> io::Result<()> {
+        let KeptFrame {
+            track_idx,
+            pts_ns,
+            keyframe,
+            data,
+            duration_ns,
+            block_additional,
+            discard_padding_ns,
+        } = frame;
+        let block_ns = self.block_ns(track_idx, pts_ns);
+        let is_video = self.track_is_video.get(track_idx).copied().unwrap_or(false);
+        let raw_ticks = block_ns / TIMESTAMP_SCALE_NS;
 
         // Clusters normally open on a video keyframe so Cues resolve to a seekable
         // IDR. For an audio/subtitle-only title (no video track) fall back to track
@@ -1951,6 +2133,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
     }
 
     pub(crate) fn finish(mut self) -> io::Result<()> {
+        // A VC-1 start-up window still open at the end resolves over the frames it has.
+        for v in self.vfw_dts.iter_mut().flatten() {
+            v.deriver.finish();
+        }
+        self.drain_dts_hold()?;
         // An MP2 track shorter than the tracker's look settles on its base count now.
         let pending: Vec<(usize, u64, u8, u8)> = self
             .channel_fixups
