@@ -38,7 +38,8 @@ pub enum Fault {
     ClaimChanged,
     /// Another file took the target between releasing the claim and renaming.
     TargetRaced,
-    /// The renamed target is not a regular file of the source's size.
+    /// The renamed target is not a regular file of the source's size, or could not be
+    /// re-opened to check (the error's source is then the OS error).
     SizeMismatch,
     /// Our zero-length claim was not proven removed: the target name may hold an empty
     /// placeholder, not a published artifact. The error's kind is `Other` (not
@@ -264,7 +265,10 @@ fn claim_then_rename(source: &Path, target: &Path, steps: &impl Steps) -> io::Re
         }
         Err(e) => return Err(normalize(e)),
     }
-    let published = steps.fresh(target)?;
+    // Published: a re-check that cannot open the target is a mismatch, not a failed publish.
+    let published = steps
+        .fresh(target)
+        .map_err(|e| faulted(io::ErrorKind::InvalidData, Fault::SizeMismatch, e))?;
     if !published.is_file() || published.len() != size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1127,6 +1131,28 @@ mod tests {
         assert_eq!(Fault::of(&error), Some(Fault::SizeMismatch));
         assert_ne!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&dst).unwrap(), b"shadowed");
+    }
+
+    // The rename published, so a re-check open that fails afterwards is no plain failure.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_post_publish_check_is_a_size_mismatch_that_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = pair(dir.path());
+        let moved = dir.path().join("moved");
+        let m = moved.clone();
+        let steps = Fake {
+            rename: Some(Box::new(move |s, t| {
+                std::fs::rename(s, &m)?;
+                std::os::unix::fs::symlink(&m, t)
+            })),
+            ..Fake::claim_only()
+        };
+        let error = publish_with(&src, &dst, &steps).unwrap_err();
+        assert_eq!(Fault::of(&error), Some(Fault::SizeMismatch), "{error:?}");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&moved).unwrap(), b"payload");
+        assert!(std::fs::symlink_metadata(&dst).is_ok());
     }
 
     #[test]
