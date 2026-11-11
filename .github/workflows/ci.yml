@@ -173,57 +173,6 @@ jobs:
       - run: cargo deny --all-features check advisories bans licenses sources
         working-directory: libfreemkv
 
-  # dev is the FAST lane: the platform jobs run on qa/main only (qa.yml also
-  # covers macOS/Windows). `if` SKIPS (does not queue) so a never-scheduled job
-  # can't block the release gate.
-  check-macos:
-    needs: resolve-msrv
-    if: github.ref_name == 'qa' || github.ref_name == 'main'
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: freemkv-unlock
-          patch: freemkv-unlock
-          self: libfreemkv
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: libfreemkv
-      - run: cargo check
-        working-directory: libfreemkv
-
-  check-windows:
-    needs: resolve-msrv
-    if: github.ref_name == 'qa' || github.ref_name == 'main'
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          path: libfreemkv
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: freemkv-unlock
-          patch: freemkv-unlock
-          self: libfreemkv
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: libfreemkv
-      # Build the tests: forces full codegen of the Windows-only SPTI transport
-      # (src/scsi/windows.rs), which never compiles on Linux/macOS dev hosts.
-      - run: cargo build --tests
-        working-directory: libfreemkv
-
   # Did this change break anything downstream? libfreemkv sits below all four
   # dependents; a break here is worth strictly more than anywhere else. Runs
   # their suites (not just check) — a behavioural change keeps signatures but
