@@ -120,7 +120,8 @@ fn check_pack(s: &[u8; 2048], at: usize) -> Option<(usize, bool)> {
             {
                 return Some((0, false));
             }
-            // Start codes whose value byte is decrypted (a clear one proves nothing).
+            // Start codes whose value byte is decrypted can fail a key; only one wholly past
+            // the clear bytes counts towards it (a clear prefix holds under any key).
             let from = payload.max(CLEAR - 3);
             let mut found = false;
             for i in from..pes_end.saturating_sub(3) {
@@ -128,7 +129,7 @@ fn check_pack(s: &[u8; 2048], at: usize) -> Option<(usize, bool)> {
                     if !valid(s[i + 3]) {
                         return Some((0, false));
                     }
-                    found = true;
+                    found |= i >= CLEAR;
                 }
             }
             if found {

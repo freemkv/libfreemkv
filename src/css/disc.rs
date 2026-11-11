@@ -331,9 +331,9 @@ fn refuse(group: &Group) -> Error {
     Error::WholeDiscKeyMissing
 }
 
-// Scrambled packs from up to `SAMPLE_BATCHES` batches spread evenly across `spans` (every
-// sector of a small group). A Stop halts; a read error is propagated only when no batch
-// could be read, as the crack does, and a CSS-locked one is no read error.
+// Scrambled packs from every sector of a small group, span by span, else from
+// `SAMPLE_BATCHES` batches spread evenly across `spans`. A Stop halts; a read error is
+// propagated only when no batch could be read, as the crack does; a CSS-locked one is none.
 fn sample_scrambled(
     reader: &mut dyn SectorSource,
     spans: &[Extent],
@@ -341,35 +341,40 @@ fn sample_scrambled(
 ) -> Result<Vec<u8>> {
     let batch = u32::from(CRACK_BATCH_SECTORS);
     let total: u64 = spans.iter().map(|e| u64::from(e.sector_count)).sum();
-    let mut starts = Vec::new();
+    // `(lba, sectors)` reads, none crossing out of its span.
+    let mut reads = Vec::new();
     if total <= u64::from(batch * SAMPLE_BATCHES) {
-        starts.extend((0..total).step_by(batch as usize));
+        for span in spans {
+            for off in (0..span.sector_count).step_by(batch as usize) {
+                let n = (span.sector_count - off).min(batch);
+                reads.push((span.start_lba.saturating_add(off), n));
+            }
+        }
     } else {
         let room = total - u64::from(batch);
-        starts.extend(
-            (0..u64::from(SAMPLE_BATCHES)).map(|k| k * room / u64::from(SAMPLE_BATCHES - 1)),
-        );
+        for k in 0..u64::from(SAMPLE_BATCHES) {
+            // The span holding offset `off`, and how far into it.
+            let mut off = k * room / u64::from(SAMPLE_BATCHES - 1);
+            let Some(span) = spans.iter().find(|e| {
+                let hit = off < u64::from(e.sector_count);
+                if !hit {
+                    off -= u64::from(e.sector_count);
+                }
+                hit
+            }) else {
+                continue;
+            };
+            let n = (u64::from(span.sector_count) - off).min(u64::from(batch)) as u32;
+            reads.push((span.start_lba.saturating_add(off as u32), n));
+        }
     }
     let mut out = Vec::new();
     let mut buf = vec![0u8; batch as usize * 2048];
     let (mut read, mut first_err) = (false, None);
-    for at in starts {
+    for (lba, n) in reads {
         if halt.is_some_and(|h| h.is_cancelled()) {
             return Err(Error::Halted);
         }
-        // The span holding offset `at`, and how far into it.
-        let mut off = at;
-        let Some(span) = spans.iter().find(|e| {
-            let hit = off < u64::from(e.sector_count);
-            if !hit {
-                off -= u64::from(e.sector_count);
-            }
-            hit
-        }) else {
-            continue;
-        };
-        let n = (u64::from(span.sector_count) - off).min(u64::from(batch)) as u32;
-        let lba = span.start_lba.saturating_add(off as u32);
         match reader.read_sectors(lba, n as u16, &mut buf[..n as usize * 2048], true) {
             Ok(got) => {
                 read = true;

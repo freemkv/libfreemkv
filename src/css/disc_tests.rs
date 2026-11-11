@@ -472,3 +472,272 @@ fn clear_verdict_group_takes_a_verified_key_at_read_time() {
     css.decrypt(20, &mut buf, &mut DecryptKeys::None).unwrap();
     assert!(buf == plain);
 }
+
+// A source of `n` scrambled packs, one per LBA, logging each read; `fail` picks the reads
+// that error instead.
+struct SampleSource {
+    image: Vec<u8>,
+    reads: Vec<(u32, u16)>,
+    fail: fn(u32) -> Option<Error>,
+}
+
+impl SampleSource {
+    fn new(n: usize, fail: fn(u32) -> Option<Error>) -> Self {
+        let (wire, _) = sector(&A, false);
+        Self {
+            image: wire.repeat(n),
+            reads: Vec::new(),
+            fail,
+        }
+    }
+}
+
+impl SectorSource for SampleSource {
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+        self.reads.push((lba, count));
+        if let Some(e) = (self.fail)(lba) {
+            return Err(e);
+        }
+        let (at, n) = (lba as usize * 2048, usize::from(count) * 2048);
+        buf[..n].copy_from_slice(&self.image[at..at + n]);
+        Ok(n)
+    }
+}
+
+fn spans(list: &[(u32, u32)]) -> Vec<Extent> {
+    list.iter()
+        .map(|&(start_lba, sector_count)| Extent {
+            start_lba,
+            sector_count,
+        })
+        .collect()
+}
+
+fn never(_: u32) -> Option<Error> {
+    None
+}
+
+// A group within SAMPLE_BATCHES batches is sampled whole, every span from its first sector.
+#[test]
+fn sample_reads_every_sector_of_a_small_group() {
+    let mut src = SampleSource::new(400, never);
+    let got = sample_scrambled(&mut src, &spans(&[(100, 10), (200, 100), (350, 1)]), None);
+    assert_eq!(got.unwrap().len(), 111 * 2048, "{:?}", src.reads);
+    assert_eq!(src.reads, [(100, 10), (200, 64), (264, 36), (350, 1)]);
+}
+
+// A larger group: SAMPLE_BATCHES batches from its first sector to its last, none crossing
+// out of its span.
+#[test]
+fn sample_spreads_batches_across_a_large_groups_spans() {
+    let mut src = SampleSource::new(2000, never);
+    let set = spans(&[(0, 700), (800, 900)]);
+    let got = sample_scrambled(&mut src, &set, None).unwrap();
+    let reads = src.reads;
+    assert_eq!(reads.len() as u32, SAMPLE_BATCHES, "{reads:?}");
+    assert_eq!(reads[0], (0, 64));
+    assert_eq!(reads.last(), Some(&(1636, 64)));
+    assert!(reads.iter().any(|&(lba, _)| lba < 700) && reads.iter().any(|&(lba, _)| lba >= 800));
+    for &(lba, n) in &reads {
+        let end = lba + u32::from(n);
+        assert!(
+            set.iter()
+                .any(|e| lba >= e.start_lba && end <= e.start_lba + e.sector_count)
+        );
+    }
+    let sectors: usize = reads.iter().map(|&(_, n)| usize::from(n)).sum();
+    assert_eq!(got.len(), sectors * 2048);
+}
+
+#[test]
+fn sample_keeps_only_scrambled_packs() {
+    let mut src = SampleSource::new(4, never);
+    src.image[2048..4096].fill(0);
+    let got = sample_scrambled(&mut src, &spans(&[(0, 4)]), None).unwrap();
+    assert_eq!(got.len(), 3 * 2048);
+}
+
+fn disc_read(lba: u32) -> Error {
+    Error::DiscRead {
+        sector: u64::from(lba),
+        status: None,
+        sense: None,
+    }
+}
+
+// A read error fails the sample only when no batch could be read; a CSS-locked read is
+// no error; a Stop, polled or returned by a later read, halts.
+#[test]
+fn sample_read_errors_locked_reads_and_halt() {
+    let mut src = SampleSource::new(2000, |lba| Some(disc_read(lba)));
+    let r = sample_scrambled(&mut src, &spans(&[(0, 2000)]), None);
+    assert!(matches!(r, Err(Error::DiscRead { .. })), "{r:?}");
+
+    let mut src = SampleSource::new(2000, |lba| (lba > 0).then(|| disc_read(lba)));
+    let got = sample_scrambled(&mut src, &spans(&[(0, 2000)]), None).unwrap();
+    assert_eq!(got.len(), 64 * 2048);
+
+    let mut src = SampleSource::new(2000, |lba| {
+        Some(Error::DiscRead {
+            sector: u64::from(lba),
+            status: Some(2),
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: 0x05,
+                asc: 0x6F,
+                ascq: 0x03,
+            }),
+        })
+    });
+    let got = sample_scrambled(&mut src, &spans(&[(0, 2000)]), None).unwrap();
+    assert!(got.is_empty());
+
+    let mut src = SampleSource::new(2000, |lba| (lba > 0).then_some(Error::Halted));
+    let r = sample_scrambled(&mut src, &spans(&[(0, 2000)]), None);
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+
+    let halt = Halt::new();
+    halt.cancel();
+    let mut src = SampleSource::new(2000, never);
+    let r = sample_scrambled(&mut src, &spans(&[(0, 2000)]), Some(&halt));
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    assert!(src.reads.is_empty());
+}
+
+fn group(vts: u8, key: Option<[u8; 5]>) -> Group {
+    Group {
+        spans: Vec::new(),
+        keys: key.map_or(DecryptKeys::None, keys),
+        name: String::new(),
+        vts,
+        relative: None,
+    }
+}
+
+// Candidates: the relative's key, then nearest VTS first (ties to the lower VTS), each key
+// once, none already tested and none from a group without a key.
+#[test]
+fn candidates_try_the_relative_then_the_nearest_vts_once_each() {
+    const D: [u8; 5] = [0xD0; 5];
+    const E: [u8; 5] = [0xE0; 5];
+    let groups = vec![
+        group(1, Some(A)),
+        group(5, Some(D)),
+        group(3, Some(B)),
+        group(0, Some(E)),
+        group(2, Some(A)),
+        group(4, None),
+    ];
+    let mut me = group(4, None);
+    assert_eq!(candidates(&groups, &me, &[]), [B, D, A, E]);
+    assert_eq!(candidates(&groups, &me, &[B, E]), [D, A]);
+    me.relative = Some(0);
+    assert_eq!(candidates(&groups, &me, &[]), [A, B, D, E]);
+}
+
+// DiscKeys::new over a folder of `files` (name, wire).
+fn disc_keys_of(files: &[(&str, Vec<u8>)]) -> Result<DiscKeys> {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("VIDEO_TS");
+    std::fs::create_dir(&video).unwrap();
+    for (name, wire) in files {
+        std::fs::write(video.join(name), wire).unwrap();
+    }
+    let mut image = crate::DirImage::open(dir.path()).unwrap();
+    let fs = crate::udf::read_filesystem(&mut image).unwrap();
+    DiscKeys::new(&fs, &mut image, None)
+}
+
+// Titles first, then menus (each pointing at its title set), then VIDEO_TS.VOB.
+#[test]
+fn groups_record_their_name_vts_and_title_set() {
+    let clear = vec![0u8; 2048];
+    let css = disc_keys_of(&[
+        ("VIDEO_TS.VOB", clear.clone()),
+        ("VTS_01_0.VOB", clear.clone()),
+        ("VTS_01_1.VOB", clear.clone()),
+        ("VTS_01_2.VOB", clear.clone()),
+        ("VTS_12_0.VOB", clear.clone()),
+        ("VTS_12_1.VOB", clear.clone()),
+        ("VTS_13_0.VOB", clear),
+    ])
+    .unwrap();
+    let got: Vec<_> = css
+        .groups
+        .iter()
+        .map(|g| (g.name.as_str(), g.vts, g.relative, g.spans.len()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("VTS_01_1.VOB", 1, None, 2),
+            ("VTS_12_1.VOB", 12, None, 1),
+            ("VTS_01_0.VOB", 1, Some(0), 1),
+            ("VTS_12_0.VOB", 12, Some(1), 1),
+            ("VTS_13_0.VOB", 13, None, 1),
+            ("VIDEO_TS.VOB", 0, None, 1),
+        ]
+    );
+}
+
+// A menu with its own crib keeps its own key when the title set's key does not verify on it.
+#[test]
+fn whole_disc_menu_with_its_own_crib_keeps_its_own_key() {
+    let (tw, tp) = title_vob(&A, 1);
+    let (w1, p1) = sector(&B, true);
+    let (w2, p2) = sector(&B, false);
+    whole_disc_copy(&[
+        ("VTS_01_1.VOB", tw, tp),
+        ("VTS_01_0.VOB", [w1, w2].concat(), [p1, p2].concat()),
+    ])
+    .unwrap();
+}
+
+// A crib-less VIDEO_TS.VOB, and a crib-less title set, take a recovered key that verifies.
+#[test]
+fn whole_disc_crib_less_video_ts_and_title_set_take_a_verified_key() {
+    let (aw, ap) = title_vob(&A, 1);
+    let (vw, vp) = crate::css::checkable_sectors(&A, 8, 5);
+    let (tw, tp) = crate::css::checkable_sectors(&A, 8, 6);
+    whole_disc_copy(&[
+        ("VTS_01_1.VOB", aw, ap),
+        ("VTS_02_1.VOB", tw, tp),
+        ("VIDEO_TS.VOB", vw, vp),
+    ])
+    .unwrap();
+}
+
+// The title set's key is the obvious one, yet it must verify: on menu packs it cannot be
+// checked against (and that no other key opens) the copy is refused, naming the file.
+#[test]
+fn whole_disc_menu_never_takes_an_unverified_title_set_key() {
+    let (tw, tp) = title_vob(&A, 1);
+    let (w1, p1) = sector(&C, false);
+    let (w2, p2) = sector(&C, false);
+    let (r, ev) = crate::testlog::capture(|| {
+        whole_disc_copy(&[
+            ("VTS_01_1.VOB", tw, tp),
+            ("VTS_01_0.VOB", [w1, w2].concat(), [p1, p2].concat()),
+        ])
+    });
+    assert!(matches!(r, Err(Error::WholeDiscKeyMissing)), "{r:?}");
+    // The refusal names the file.
+    assert!(
+        ev.iter().any(|e| e.level == tracing::Level::WARN
+            && e.target == "freemkv::css"
+            && e.field("file") == Some("VTS_01_0.VOB")),
+        "{ev:?}"
+    );
+}
+
+// Read time: another group's key that cannot be checked on the packs in hand is no key.
+#[test]
+fn clear_verdict_group_refuses_an_unverified_key_at_read_time() {
+    let mut css = disc_keys(&[&[(10, 1)], &[(20, 2)]]);
+    css.groups[1].keys = DecryptKeys::None;
+    let (w1, _) = sector(&C, false);
+    let (w2, _) = sector(&C, false);
+    let mut buf = [w1, w2].concat();
+    let r = css.decrypt(20, &mut buf, &mut DecryptKeys::None);
+    assert!(matches!(r, Err(Error::WholeDiscKeyMissing)), "{r:?}");
+    assert!(matches!(css.groups[1].keys, DecryptKeys::None));
+}
