@@ -468,14 +468,6 @@ pub struct DriveInfo {
     pub firmware: String,
 }
 
-/// Replace control characters in a drive-supplied string, so a hostile device or bridge
-/// cannot emit escape sequences to a terminal through its INQUIRY identity.
-fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect()
-}
-
 impl DriveInfo {
     /// The name the OS shows users (`E:`, `/dev/sr1`, `disk4`); the device
     /// [`path`](Self::path) when the OS has none.
@@ -484,31 +476,6 @@ impl DriveInfo {
             &self.path
         } else {
             &self.display_name
-        }
-    }
-
-    /// `"VENDOR MODEL (rev FW)"`, control characters replaced.
-    pub fn label(&self) -> String {
-        format!(
-            "{} {} (rev {})",
-            printable(&self.vendor),
-            printable(&self.model),
-            printable(&self.firmware)
-        )
-    }
-
-    /// `"{name}  {label}"` (two spaces): the name and model, which tell identical drives apart.
-    pub fn display(&self) -> String {
-        format!("{}  {}", self.name(), self.label())
-    }
-
-    /// One listing line: [`display`](Self::display), plus the device path when it differs
-    /// from the name.
-    pub fn list_line(&self) -> String {
-        if self.name() == self.path {
-            self.display()
-        } else {
-            format!("{}  {}", self.display(), self.path)
         }
     }
 }

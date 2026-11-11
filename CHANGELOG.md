@@ -12,6 +12,10 @@
 - A decrypted DVD ISO or folder copy no longer stops with `CssKeyMissing` (E7023) when a VOB's scrambled sectors carry no crib to crack, as on discs whose `VTS_xx_0.VOB` menu shares its title set's key. Each VOB file set tries, in order: its obvious key (a menu's title-set key), its own cracked key, then every other key recovered on the disc, nearest title set first. A borrowed key is used only once it verifies on the file's own scrambled sectors (decrypted padding-packet, AC-3/DTS sync word and MPEG video start-code structure the clear headers predict). Scrambled sectors no key opens refuse the copy with `WholeDiscKeyMissing` (E7032), and the file is named in the warning log; the same order applies to a scrambled pack met later in a file whose scan saw only clear sectors.
 - A decrypted DVD ISO or folder copy no longer stops on a read error when the sectors sampled to key a VOB file set are mostly unreadable. The set is copied like one whose sample was clear: unreadable sectors become counted zero-filled holes and the file is named in a warning, while any scrambled pack read later is still keyed from its own sectors or a verified key, or refused with `WholeDiscKeyMissing` (E7032). A clear DVD with a damaged VOB copies again as it did in 1.8.3.
 
+### Removed
+
+- `DriveInfo::label`, `display` and `list_line`. The library ships no English, and these built a readable line with the word "rev" in it. Front ends format the line from `DriveInfo::name` and the `vendor`, `model` and `firmware` fields (freemkv keeps the 1.8.7 form, `E:  HL-DT-ST BD-RE BU40N (rev 1.04)`).
+
 ## [1.8.8] — 2026-11-01
 
 ### Fixed
