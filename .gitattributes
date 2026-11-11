@@ -1,0 +1,2 @@
+# Source-text tests search .rs files for LF-delimited markers.
+*.rs text eol=lf
