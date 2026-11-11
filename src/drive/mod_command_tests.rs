@@ -2239,9 +2239,9 @@ fn unlock_tray_sends_prevent_with_removal_bit_clear() {
     assert_eq!(c[4], 0x00, "PREVENT bit clear (unlocked)");
 }
 
-// SET CD SPEED and PREVENT/ALLOW MEDIUM REMOVAL are best-effort: a CHECK
-// CONDITION or a transport failure still issues the CDB, never fails the
-// rip, and a failed unlock is warned about (a stuck PREVENT is a real symptom).
+// Speed and tray control are best-effort: neither fails the rip, a failed unlock
+// warns (a stuck PREVENT is a real symptom), and per #75 a SET STREAMING that
+// faults the bus is followed by no SET CD SPEED.
 #[test]
 fn set_speed_and_tray_control_swallow_rejection_and_transport_failure() {
     for status in [0x02, crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE] {
@@ -2251,10 +2251,15 @@ fn set_speed_and_tray_control_swallow_rejection_and_transport_failure() {
             timeouts: _to,
         } = recording(TransportOutcome::Scsi(status, None));
         d.set_speed(0x1234);
+        let expected = if status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE {
+            crate::scsi::SCSI_SET_STREAMING
+        } else {
+            crate::scsi::SCSI_SET_CD_SPEED
+        };
         assert_eq!(
             cdb.lock().unwrap()[0],
-            crate::scsi::SCSI_SET_CD_SPEED,
-            "SET CD SPEED still issued despite status {status:#x}"
+            expected,
+            "last speed CDB after status {status:#x}"
         );
         d.lock_tray();
         assert_eq!(cdb.lock().unwrap()[0], SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL);
