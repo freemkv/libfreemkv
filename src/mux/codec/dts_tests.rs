@@ -1990,7 +1990,7 @@ pub(crate) fn dts_au(amode: u32, lff: u32, xch: bool, exss_total: Option<u32>) -
     au
 }
 
-// An access unit from real headers (FFmpeg FATE dcadec-suite): the core header zero-padded to
+// An access unit from real headers (public DTS-HD test streams): the core header zero-padded to
 // its declared size, then the start of the extension substream (empty when there is none).
 fn au_from_headers(core: &str, exss: &str) -> Vec<u8> {
     let hex = |s: &str| -> Vec<u8> {

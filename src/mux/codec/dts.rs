@@ -974,7 +974,7 @@ fn core_channels(au: &[u8]) -> Option<u8> {
 }
 
 // `nuTotalNumChs` of the first asset of an EXSS (`buf` begins with DTS_HD_EXT_SYNC), walking
-// the header as FFmpeg's `ff_dca_exss_parse` does. `None` without static fields.
+// the ExSS header and asset descriptor as ETSI TS 102 114 lays them out. `None` without static fields.
 fn exss_total_channels(buf: &[u8]) -> Option<u8> {
     let mut r = BitReader::new(buf.get(SYNCWORD_BYTES..)?);
     r.skip_bits(EXSS_USER_DEFINED_BITS)?;
