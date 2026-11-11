@@ -26,3 +26,34 @@ fn display_name_falls_back_to_the_path() {
     std::fs::create_dir_all(class.path().join("sr0/device/block/sr0")).unwrap();
     assert_eq!(display_name(class.path(), "sr0", "/dev/sr0"), "/dev/sr0");
 }
+
+fn write_type(device: &std::path::Path, scsi_type: &str) {
+    std::fs::create_dir_all(device).unwrap();
+    std::fs::write(device.join("type"), scsi_type).unwrap();
+}
+
+#[test]
+fn sr_drives_are_listed_while_the_sg_module_is_not_loaded() {
+    let sys = tempfile::tempdir().unwrap();
+    let dev = tempfile::tempdir().unwrap();
+    // No scsi_generic class: only block devices, one optical and one disk.
+    write_type(&sys.path().join("block/sr0/device"), "5\n");
+    write_type(&sys.path().join("block/sda/device"), "0\n");
+    assert_eq!(
+        enumerate_sg_names(sys.path(), dev.path()),
+        (vec!["sr0".to_string()], true)
+    );
+}
+
+#[test]
+fn sg_nodes_in_dev_are_listed_unfiltered_without_sysfs() {
+    let sys = tempfile::tempdir().unwrap();
+    let dev = tempfile::tempdir().unwrap();
+    for node in ["sg10", "sg2", "sr0", "sg", "sgx"] {
+        std::fs::write(dev.path().join(node), "").unwrap();
+    }
+    assert_eq!(
+        enumerate_sg_names(sys.path(), dev.path()),
+        (vec!["sg2".to_string(), "sg10".to_string()], false)
+    );
+}

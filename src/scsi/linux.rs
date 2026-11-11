@@ -602,7 +602,7 @@ const SCSI_TYPE_OPTICAL: &str = "5";
 /// realistic homelab (typical PERC + USB optical = ≤8 nodes).
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     let mut out = Vec::new();
-    let (names, type_filtered) = enumerate_sg_names();
+    let (names, type_filtered) = enumerate_sg_names(Path::new("/sys/class"), Path::new("/dev"));
     for name in names {
         let path = format!("/dev/{name}");
         if !std::path::Path::new(&path).exists() {
@@ -699,45 +699,50 @@ fn sysfs_identity(name: &str) -> (String, String, String) {
     (read("vendor"), read("model"), read("rev"))
 }
 
-// Optical names from the kernel's lists, and whether they are type-filtered: type-5 `sg*`
-// plus `sr*` with no sg node (SG_IO works on it). Without sysfs, every `/dev/sg*` node,
-// unfiltered for the caller's INQUIRY check.
-pub(crate) fn enumerate_sg_names() -> (Vec<String>, bool) {
-    let optical = |device: &str| {
-        std::fs::read_to_string(format!("{device}/type"))
-            .is_ok_and(|t| t.trim() == SCSI_TYPE_OPTICAL)
+// Optical names from the kernel's lists under `sys_class`, and whether they are
+// type-filtered: type-5 `sg*` plus `sr*` with no sg node (SG_IO works on it). The
+// scsi_generic class is missing while the `sg` module is not loaded; then only `sr*`
+// is listed. Without sysfs, every `sg*` node in `dev`, unfiltered for the caller's
+// INQUIRY check.
+pub(crate) fn enumerate_sg_names(sys_class: &Path, dev: &Path) -> (Vec<String>, bool) {
+    let optical = |device: &Path| {
+        std::fs::read_to_string(device.join("type")).is_ok_and(|t| t.trim() == SCSI_TYPE_OPTICAL)
     };
-    let mut names = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/sys/class/scsi_generic") else {
-        let mut names = dev_nodes("sg");
+    let sg_class = sys_class.join("scsi_generic");
+    let block_class = sys_class.join("block");
+    let (sg_entries, block_entries) = (
+        std::fs::read_dir(&sg_class),
+        std::fs::read_dir(&block_class),
+    );
+    if sg_entries.is_err() && block_entries.is_err() {
+        let mut names = dev_nodes(dev, "sg");
         names.sort_by_key(|name| node_number(name));
         return (names, false);
-    };
-    for entry in entries.flatten() {
+    }
+    let mut names = Vec::new();
+    for entry in sg_entries.into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // A non-optical or unreadable `type` (teardown race) is skipped.
-        if name.starts_with("sg") && optical(&format!("/sys/class/scsi_generic/{name}/device")) {
+        if name.starts_with("sg") && optical(&sg_class.join(&name).join("device")) {
             names.push(name);
         }
     }
-    if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let device = format!("/sys/class/block/{name}/device");
-            let has_sg = std::fs::read_dir(format!("{device}/scsi_generic"))
-                .is_ok_and(|mut e| e.next().is_some());
-            if name.starts_with("sr") && !has_sg && optical(&device) {
-                names.push(name);
-            }
+    for entry in block_entries.into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let device = block_class.join(&name).join("device");
+        let has_sg =
+            std::fs::read_dir(device.join("scsi_generic")).is_ok_and(|mut e| e.next().is_some());
+        if name.starts_with("sr") && !has_sg && optical(&device) {
+            names.push(name);
         }
     }
     names.sort_by_key(|name| (name.starts_with("sr"), node_number(name)));
     (names, true)
 }
 
-/// `/dev` entries named `<prefix><digits>`.
-fn dev_nodes(prefix: &str) -> Vec<String> {
-    std::fs::read_dir("/dev")
+/// `dev` entries named `<prefix><digits>`.
+fn dev_nodes(dev: &Path, prefix: &str) -> Vec<String> {
+    std::fs::read_dir(dev)
         .map(|entries| {
             entries
                 .flatten()
