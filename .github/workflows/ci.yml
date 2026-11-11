@@ -28,9 +28,9 @@ jobs:
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
 
-  # main may never carry a released version without a CHANGELOG.md entry. Hard-
-  # fails on main (and PRs to main); warns elsewhere so an in-progress branch
-  # whose entry isn't written yet is not blocked.
+  # main may never carry a released version without a CHANGELOG.md entry.
+  # Hard-fails only on PRs targeting main (pushes to main no longer run this
+  # workflow); warns on dev pushes so an unwritten entry doesn't block work.
   changelog:
     if: "${{ !(github.event_name == 'push' && github.ref_type == 'branch' && github.event.commits[0] != null && github.event.commits[1] == null && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, ': bump version')) }}"
     runs-on: ubuntu-latest
