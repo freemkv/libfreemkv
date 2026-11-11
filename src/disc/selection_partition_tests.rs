@@ -555,6 +555,19 @@ fn undescribable_title_elsewhere_does_not_block_a_roster() {
     assert_roster(&titles, "bd-playall-partition-v1:10", &[(1, 0), (2, 1)]);
 }
 
+// Shorter than the play-all, but reading an episode's sectors: it could be a competing
+// play-all over some episodes, so no roster.
+#[test]
+fn a_shorter_undescribed_title_over_roster_sectors_is_unknown() {
+    let mut titles = four_episodes_with_head();
+    titles.push(reading(
+        secs(30, &[("00002", 0, 1000), ("00009", 5, 5)]),
+        &[(200, 20)],
+    ));
+    assert!(titles[5].selection_evidence.segments.is_empty());
+    assert_unknown(&run(titles));
+}
+
 // Episodes and their play-all lost their segments; the extras and their play-all kept
 // theirs. The undescribed play-all is longer than the extras one, so it may be the real one.
 #[test]

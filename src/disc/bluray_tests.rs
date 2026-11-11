@@ -2834,6 +2834,20 @@ fn scan_bluray_titles_annotates_the_playall_roster() {
     );
 }
 
+// A play-all piece trimmed 0.2 s short of its standalone episode is still that episode.
+#[test]
+fn a_trimmed_playall_piece_keeps_the_bd_roster() {
+    let mut playlists = episode_playlists();
+    let mut items = episode_items(&[b"00001", b"00002", b"00003"]);
+    items[1].out_time -= 9384;
+    playlists[3].1 = build_mpls(&items, (0, 0, 0, 0, 0, 0, 0, 0), &[], &[]);
+    let titles = scan_episodes(&playlists);
+    assert_eq!(
+        bd_roster(&titles),
+        Some(vec![(1, Some(0)), (2, Some(1)), (3, Some(2)), (800, None)])
+    );
+}
+
 // A short menu playlist is filtered on purpose, not lost: it does not hold the roster.
 #[test]
 fn a_short_playlist_does_not_hold_the_bd_roster() {
